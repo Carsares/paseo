@@ -92,3 +92,38 @@ describe("overlay registration lifecycle", () => {
     expect(observed).toEqual([["Enter"], []]);
   });
 });
+
+describe("passive selection controls", () => {
+  it("handles keys without blocking Find and yields to an active overlay", () => {
+    const registry = createOverlayRegistry();
+    const calls: string[] = [];
+    const removeModal = registry.register({
+      getLayer: () => 20,
+      getKeys: () => ["Escape"],
+      onKeyDown: () => {
+        calls.push("modal");
+        return true;
+      },
+    });
+    const removeQuote = registry.register({
+      passive: true,
+      getLayer: () => 100,
+      getKeys: () => ["Escape", "Enter"],
+      onKeyDown: () => {
+        calls.push("quote");
+        return true;
+      },
+    });
+    expect(registry.hasActive()).toBe(true);
+    expect(registry.dispatch(keyEvent("Escape"))).toBe(true);
+    expect(calls).toEqual(["modal"]);
+    removeModal();
+    expect(registry.hasActive()).toBe(false);
+    expect(registry.getKeys()).toEqual(["Escape", "Enter"]);
+    expect(registry.dispatch(keyEvent("Enter"))).toBe(true);
+    expect(calls).toEqual(["modal", "quote"]);
+    removeQuote();
+    expect(registry.getTop()).toBeUndefined();
+    expect(registry.dispatch(keyEvent("Enter"))).toBe(false);
+  });
+});

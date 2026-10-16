@@ -11,4 +11,6 @@ export interface OverlayRegistration {
   onKeyDown(event: KeyboardInputEvent): boolean;
   restoreFocusRef?: RefObject<unknown>;
   manageFocus?: boolean;
+  /** Selection controls handle keys only without an active overlay, and leave Find available. */
+  passive?: boolean;
 }

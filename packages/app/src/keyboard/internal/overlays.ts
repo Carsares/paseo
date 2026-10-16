@@ -6,6 +6,7 @@ export interface KeyboardInputEvent extends KeyboardShortcutInput {
   stopPropagation(): void;
 }
 export interface OverlayEntry {
+  passive?: boolean;
   getLayer(): number;
   getKeys(): readonly string[];
   onKeyDown(event: KeyboardInputEvent): boolean;
@@ -17,7 +18,10 @@ export function createOverlayRegistry() {
     for (const listener of listeners) listener();
   };
   function getTop(): OverlayEntry | undefined {
-    return entries.reduce<OverlayEntry | undefined>(
+    const candidates = entries.some((entry) => !entry.passive)
+      ? entries.filter((entry) => !entry.passive)
+      : entries;
+    return candidates.reduce<OverlayEntry | undefined>(
       (top, entry) => (!top || entry.getLayer() >= top.getLayer() ? entry : top),
       undefined,
     );
@@ -25,7 +29,7 @@ export function createOverlayRegistry() {
   return {
     getTop,
     getKeys: () => getTop()?.getKeys() ?? [],
-    hasActive: () => entries.length > 0,
+    hasActive: () => entries.some((entry) => !entry.passive),
     subscribe(listener: () => void) {
       listeners.add(listener);
       return () => {

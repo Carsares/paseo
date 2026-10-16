@@ -9,10 +9,11 @@ export function useOverlayRegistration(input: OverlayRegistration) {
   useLayoutEffect(() => {
     if (!input.active) return;
     return overlays.register({
+      passive: input.passive,
       getLayer: () => current.current.layer,
       getKeys: () => current.current.keys,
       onKeyDown: (event) => current.current.onKeyDown(event),
     });
-  }, [input.active]);
+  }, [input.active, input.passive]);
   return setScope;
 }
