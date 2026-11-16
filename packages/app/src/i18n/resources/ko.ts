@@ -2517,6 +2517,11 @@ export const ko: TranslationResources = {
         label: "추론 항상 펼치기",
         description: "에이전트의 사고 및 추론 블록을 기본적으로 모두 펼쳐 표시합니다.",
       },
+      showAgentInteractions: {
+        label: "하위 에이전트 상호작용 표시",
+        description:
+          "기본적으로 하위 에이전트의 작업 할당, 응답, 알림은 숨기고 주 에이전트의 응답은 표시합니다. 켜면 모든 상호작용을 볼 수 있습니다.",
+      },
       chatDisplay: {
         label: "채팅 표시",
         description: "채팅에 표시할 에이전트 작업의 양",

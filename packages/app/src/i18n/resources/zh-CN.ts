@@ -2476,6 +2476,10 @@ export const zhCN: TranslationResources = {
         label: "始终展开推理过程",
         description: "默认情况下完全展开 AI 的思考和推理过程",
       },
+      showAgentInteractions: {
+        label: "显示子 agent 交互",
+        description: "默认隐藏子 agent 的派发、回复与通知，保留主 agent 回复。开启后查看完整交互。",
+      },
       chatDisplay: {
         label: "聊天显示",
         description: "聊天中显示多少智能体的工作",

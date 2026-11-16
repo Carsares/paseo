@@ -155,6 +155,52 @@ describe("whole-message Markdown presentation", () => {
 });
 
 describe("stream presentation through installed plugins", () => {
+  it("hides interactions before plugins and restores them in an explicit detail view", () => {
+    const interaction = toolCall("dispatch", "Task");
+    if (interaction.payload.source !== "agent") throw new Error("Expected agent tool");
+    interaction.payload.data.provider = "claude";
+    const first = {
+      kind: "assistant_message" as const,
+      id: "reply-first",
+      messageId: "reply",
+      turnId: "turn",
+      text: "Before ",
+      timestamp: new Date(1000),
+      timelineCursor: { epoch: "epoch", seq: 1 },
+    };
+    const last = {
+      ...first,
+      id: "reply-last",
+      text: "after",
+      timestamp: new Date(2000),
+      timelineCursor: { epoch: "epoch", seq: 3 },
+    };
+    const input = {
+      ...presentationOptions,
+      transform: installedTransform(installProbe("tool_call")),
+      tail: [first, interaction, last],
+      head: [],
+    };
+    const present = createStreamPresentation();
+    const hidden = present(input);
+    expect(hidden.sourceTail).toEqual([
+      { ...first, text: "Before after", timelineCursor: last.timelineCursor },
+    ]);
+    expect(pluginData(hidden.tail)).toEqual([]);
+    expect(hidden.hiddenItemIds.has(interaction.id)).toBe(true);
+    expect(hidden.readingRowReplacements.get(interaction.id)).toBe("reply-first");
+
+    const shown = present({ ...input, showAgentInteractions: true });
+    expect(shown.sourceTail).toEqual([first, interaction, last]);
+    expect(pluginData(shown.tail)).toMatchObject([{ name: "Task" }]);
+    expect(shown.hiddenItemIds.size).toBe(0);
+    const pluginRow = shown.tail.find((item) => item.kind === "plugin");
+    expect(pluginRow).toBeDefined();
+
+    const hiddenAgain = present(input);
+    expect(hiddenAgain.readingRowReplacements.get(pluginRow!.id)).toBe("reply-first");
+  });
+
   it("offers every source tool call to an installed transformer in Overview mode", () => {
     const calls = [toolCall("call-1", "bash"), toolCall("call-2", "read")];
     const rendered = createStreamPresentation()({
@@ -770,6 +816,7 @@ it("presents received agent messages as attributed bubbles with the original tur
   };
   const result = createStreamPresentation()({
     ...presentationOptions,
+    showAgentInteractions: true,
     transform: undefined,
     tail: [call],
     head: [],
@@ -890,3 +937,155 @@ it.each([false, true])(
     expect(opened.groupsByHostId.size).toBe(0);
   },
 );
+
+describe("interaction reading positions through display projections", () => {
+  const timestamp = new Date("2026-11-16T00:00:00Z");
+  const reply: StreamItem = {
+    kind: "assistant_message",
+    id: "reply",
+    messageId: "reply-message",
+    turnId: "turn",
+    text: "Before ",
+    timestamp,
+  };
+  const interaction = toolCall("dispatch", "paseo.send_agent_prompt");
+  const allCards: TimelineItemTransform = ({ sourceId }) => [
+    {
+      type: "plugin",
+      pluginId: "cards",
+      id: sourceId,
+      kind: "card",
+      version: 1,
+      data: {},
+    },
+  ];
+
+  it("maps old plugin rows and merged fragments to the current visible plugin host", () => {
+    const fragment = { ...reply, id: "fragment", text: "after" };
+    const tail = [reply, interaction, fragment];
+    const present = createStreamPresentation();
+    const input = {
+      ...presentationOptions,
+      tail,
+      head: [],
+      transform: allCards,
+      display: "full" as const,
+    };
+    const shown = present({ ...input, showAgentInteractions: true });
+    expect(ids(shown.tail)).toEqual(["cards/reply", "cards/tool-dispatch", "cards/fragment"]);
+    const hidden = present(input);
+    expect(ids(hidden.tail)).toEqual(["cards/reply"]);
+    for (const id of ["cards/tool-dispatch", "cards/fragment", "tool-dispatch", "fragment"]) {
+      expect(hidden.readingRowReplacements.get(id)).toBe("cards/reply");
+    }
+    expect(hidden.readingRowReplacements.get("cards/reply")).toBeUndefined();
+  });
+
+  it.each(["collapseToolCalls", "collapseTurns"] as const)(
+    "follows hidden interactions into the current %s host",
+    (display) => {
+      const prompt: StreamItem = { kind: "user_message", id: "prompt", text: "Check", timestamp };
+      const finalReply: StreamItem = { ...reply, id: "final", text: "Done" };
+      const tools = [toolCall("one", "Bash"), toolCall("two", "Bash")];
+      const transform: TimelineItemTransform = (input) => {
+        if (input.sourceId !== interaction.id) return undefined;
+        return allCards(input);
+      };
+      const input = {
+        ...presentationOptions,
+        transform,
+        tail: [prompt, ...tools, interaction, finalReply],
+        head: [],
+        display,
+        isTurnActive: false,
+      };
+      const present = createStreamPresentation();
+      present({ ...input, display: "full", showAgentInteractions: true });
+      const hidden = present(input);
+      const expectedHost = display === "collapseTurns" ? "prompt" : "tool-one";
+      expect(hidden.readingRowReplacements.get("cards/tool-dispatch")).toBe(expectedHost);
+      expect(hidden.readingRowReplacements.get("tool-dispatch")).toBe(expectedHost);
+      expect(ids(hidden.tail)).toContain(expectedHost);
+      const expanded = present({
+        ...input,
+        display: "collapseTurns",
+        expandedTurnHostIds: new Set(["prompt"]),
+      });
+      expect(expanded.readingRowReplacements.get("tool-dispatch")).toBe("tool-two");
+      expect(expanded.readingRowReplacements.get("tool-two")).toBeUndefined();
+    },
+  );
+
+  it("maps a hidden interaction through a plugin work row into a folded or expanded turn", () => {
+    const prompt: StreamItem = { kind: "user_message", id: "prompt", text: "Check", timestamp };
+    const preliminary = { ...reply, id: "preliminary", messageId: "first-message" };
+    const finalReply = { ...reply, id: "final", messageId: "last-message", text: "Done" };
+    const transform: TimelineItemTransform = (input) => {
+      if (input.item.type === "user_message") return undefined;
+      return allCards(input);
+    };
+    const input = {
+      ...presentationOptions,
+      transform,
+      tail: [prompt, preliminary, interaction, finalReply],
+      head: [],
+      display: "collapseTurns" as const,
+      isTurnActive: false,
+    };
+    const present = createStreamPresentation();
+    present({ ...input, display: "full", showAgentInteractions: true });
+    const folded = present(input);
+    expect(folded.readingRowReplacements.get("cards/tool-dispatch")).toBe("prompt");
+    const expanded = present({ ...input, expandedTurnHostIds: new Set(["prompt"]) });
+    expect(expanded.readingRowReplacements.get("tool-dispatch")).toBe("cards/preliminary");
+    expect(expanded.readingRowReplacements.get("cards/preliminary")).toBeUndefined();
+    expect(expanded.turns.nestedItemIds.has("cards/preliminary")).toBe(true);
+  });
+
+  it("resolves plugin changes to real rows and never returns a removed target", () => {
+    const input = {
+      ...presentationOptions,
+      tail: [reply, interaction],
+      head: [],
+      display: "full" as const,
+    };
+    const present = createStreamPresentation();
+    present({ ...input, transform: undefined });
+    const plugin = present({ ...input, transform: allCards });
+    expect(plugin.readingRowReplacements.get("reply")).toBe("cards/reply");
+    const native = present({ ...input, transform: undefined });
+    expect(native.readingRowReplacements.get("cards/reply")).toBe("reply");
+    const removed = present({ ...input, transform: () => [] });
+    expect(removed.tail).toEqual([]);
+    expect(removed.readingRowReplacements.get("tool-dispatch")).toBeUndefined();
+    expect(removed.readingRowReplacements.get("reply")).toBeUndefined();
+  });
+
+  it("does not rebuild retained row identities on live text updates", () => {
+    let historyIdReads = 0;
+    const first: StreamItem = {
+      ...reply,
+      id: "history",
+      messageId: "old-message",
+      turnId: "old-turn",
+    };
+    Object.defineProperty(first, "id", {
+      get() {
+        historyIdReads++;
+        return "history";
+      },
+    });
+    const tail = [first, { ...reply, id: "boundary", messageId: "boundary-message" }];
+    const present = createStreamPresentation();
+    const input = { ...presentationOptions, tail, transform: undefined, display: "full" as const };
+    const initial = present({ ...input, head: [{ ...reply, text: "A" }] });
+    const firstReads = historyIdReads;
+    const grown = present({ ...input, head: [{ ...reply, text: "AB" }] });
+    expect(grown.tail).toBe(initial.tail);
+    expect(historyIdReads).toBe(firstReads);
+  });
+
+  function ids(items: StreamItem[]): string[] {
+    return items.map((item) => item.id);
+  }
+});

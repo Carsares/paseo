@@ -80,6 +80,47 @@ it("loads an older location and searches a response merged across suppressed tas
   }
 });
 
+it("uses a merged message's ending cursor to deduplicate cross-interaction search hits", async () => {
+  const merged = {
+    ...message(3, "first target and second target"),
+    id: "message-first",
+  };
+  const loaded: number[] = [];
+  const revealed: string[] = [];
+  const model = new ChatFindModel({
+    async search() {
+      return response([
+        { seq: 1, role: "assistant" },
+        { seq: 3, role: "assistant" },
+      ]);
+    },
+    async load(_epoch, seq) {
+      loaded.push(seq);
+      model.updateHistory("epoch", [merged]);
+    },
+    async reveal(id, _query, occurrence) {
+      revealed.push(id);
+      return { count: 2, occurrence: occurrence < 0 ? 1 : occurrence };
+    },
+    clear() {},
+  });
+  try {
+    model.updateHistory("epoch", [merged]);
+    model.open();
+    model.setQuery("target");
+    await expect.poll(() => model.getSnapshot().phase).toBe("ready");
+    expect(loaded).toEqual([1]);
+    expect(revealed).toEqual(["message-first"]);
+    expect(model.getSnapshot()).toMatchObject({ selectedItemId: "message-first", count: 2 });
+    model.next();
+    await expect.poll(() => model.getSnapshot().occurrence).toBe(1);
+    expect(loaded).toEqual([1]);
+    expect(revealed).toEqual(["message-first", "message-first"]);
+  } finally {
+    model.close();
+  }
+});
+
 it("skips a source-only candidate and highlights a displayed match", async () => {
   const revealed: string[] = [];
   const model = new ChatFindModel({

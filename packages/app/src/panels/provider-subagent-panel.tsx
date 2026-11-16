@@ -265,6 +265,7 @@ function ProviderSubagentPanel() {
           onOpenWorkspaceFile={openFileInWorkspace}
           readOnly
           historyPagination={historyPagination}
+          showAgentInteractions
           bottomOverlayTailClearance={childTrackClearance.tail}
           bottomOverlayControlClearance={childTrackClearance.controls}
         />

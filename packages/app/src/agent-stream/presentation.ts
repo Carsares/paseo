@@ -9,9 +9,10 @@ import {
   type ToolCallDetailLevel,
   type ToolCallDetailProjection,
 } from "@/tool-calls/detail-level/projection";
-import type { StreamItem, UserMessageItem } from "@/types/stream";
+import { getStreamItemMessageId, type StreamItem, type UserMessageItem } from "@/types/stream";
 import { collapseTurns, type TurnCollapse } from "./turn-collapse/model";
 import type { ReadingRowReplacements } from "./reading-anchor";
+import { createAgentInteractionProjection, type HiddenItemIds } from "./agent-interactions";
 
 interface PresentationInput {
   tail: StreamItem[];
@@ -23,9 +24,15 @@ interface PresentationInput {
   expandedTurnHostIds: ReadonlySet<string>;
   isTurnActive: boolean;
   activeTurnId?: string | null;
+  /** Main chats hide agent lifecycle rows by default; detail panes pass true explicitly. */
+  showAgentInteractions?: boolean;
 }
 
 export interface StreamPresentation extends ToolCallDetailProjection {
+  /** Source rows after interaction filtering, before plugins and display grouping. */
+  sourceTail: StreamItem[];
+  sourceHead: StreamItem[];
+  hiddenItemIds: HiddenItemIds;
   turns: Omit<TurnCollapse, "tail">;
   readingRowReplacements: ReadingRowReplacements;
 }
@@ -45,6 +52,72 @@ function groupedRowHosts(
   return hosts;
 }
 
+interface RowIdentities {
+  rowIdBySourceId: ReadonlyMap<string, string>;
+  sourceIdByRowId: ReadonlyMap<string, string>;
+}
+
+interface StreamRowIdentities {
+  tail: RowIdentities;
+  head: RowIdentities;
+}
+
+function createRowIdentityIndex() {
+  let source: StreamItem[] | undefined;
+  let identities: RowIdentities | undefined;
+  return (rows: StreamItem[]): RowIdentities => {
+    if (source === rows && identities) return identities;
+    const rowIdBySourceId = new Map<string, string>();
+    const sourceIdByRowId = new Map<string, string>();
+    for (const item of rows) {
+      const sourceId = getStreamItemMessageId(item);
+      // A plugin can split one source into several rows. Enter at the first row.
+      if (!rowIdBySourceId.has(sourceId)) rowIdBySourceId.set(sourceId, item.id);
+      sourceIdByRowId.set(item.id, sourceId);
+    }
+    source = rows;
+    identities = { rowIdBySourceId, sourceIdByRowId };
+    return identities;
+  };
+}
+
+function sourceIdForRow(rows: StreamRowIdentities | undefined, id: string): string | undefined {
+  return rows?.head.sourceIdByRowId.get(id) ?? rows?.tail.sourceIdByRowId.get(id);
+}
+
+function rowIdForSource(rows: StreamRowIdentities, id: string): string | undefined {
+  return rows.head.rowIdBySourceId.get(id) ?? rows.tail.rowIdBySourceId.get(id);
+}
+
+interface ReadingProjectionInput {
+  previous: StreamRowIdentities | undefined;
+  displayed: StreamRowIdentities;
+  beforeGrouping: StreamRowIdentities;
+  interactions: ReadingRowReplacements;
+  groups: ReadingRowReplacements;
+  turns: StreamPresentation["turns"];
+}
+
+function readingRowReplacements(input: ReadingProjectionInput): ReadingRowReplacements {
+  return {
+    get(id) {
+      if (sourceIdForRow(input.displayed, id) !== undefined) return undefined;
+      const sourceId =
+        sourceIdForRow(input.previous, id) ?? sourceIdForRow(input.beforeGrouping, id) ?? id;
+      const interactionHost = input.interactions.get(sourceId) ?? sourceId;
+      const currentRow = rowIdForSource(input.beforeGrouping, interactionHost) ?? interactionHost;
+      // Expanded turns render individual calls; their earlier group must not capture them.
+      const groupHost = input.turns.nestedItemIds.has(currentRow)
+        ? currentRow
+        : (input.groups.get(currentRow) ?? currentRow);
+      const foldedHost = input.turns.hostIdByHiddenRowId.get(groupHost) ?? groupHost;
+      const target = rowIdForSource(input.displayed, foldedHost) ?? foldedHost;
+      const targetExists = sourceIdForRow(input.displayed, target) !== undefined;
+      return target !== id && targetExists ? target : undefined;
+    },
+  };
+}
+
 const NO_COLLAPSED_TURNS: StreamPresentation["turns"] = collapseTurns({
   tail: [],
   isLatestTurnOpen: false,
@@ -55,6 +128,7 @@ const NO_COLLAPSED_TURNS: StreamPresentation["turns"] = collapseTurns({
 
 /** Source messages reach plugins before display projection. */
 export function createStreamPresentation() {
+  const projectAgentInteractions = createAgentInteractionProjection();
   const userMessageCache = new WeakMap<UserMessageItem, UserMessageItem>();
 
   function presentUserMessage(item: UserMessageItem): UserMessageItem {
@@ -84,6 +158,11 @@ export function createStreamPresentation() {
   let collapsedIsLatestTurnOpen = false;
   let collapsedExpandedHostIds: ReadonlySet<string> | undefined;
   let collapsed: TurnCollapse | undefined;
+  const indexHistory = createRowIdentityIndex();
+  const indexHead = createRowIdentityIndex();
+  const indexDisplayedTail = createRowIdentityIndex();
+  const indexDisplayedHead = createRowIdentityIndex();
+  let previousDisplayedRows: StreamRowIdentities | undefined;
 
   function presentRows(item: StreamItem): StreamItem[] {
     if (item.kind === "tool_call" && item.payload.source === "agent") {
@@ -108,7 +187,10 @@ export function createStreamPresentation() {
   function collapse(
     projection: ToolCallDetailProjection,
     input: PresentationInput,
-  ): Omit<StreamPresentation, "readingRowReplacements"> {
+  ): Omit<
+    StreamPresentation,
+    "readingRowReplacements" | "sourceTail" | "sourceHead" | "hiddenItemIds"
+  > {
     if (input.display !== "collapseTurns") {
       return { ...projection, turns: NO_COLLAPSED_TURNS };
     }
@@ -160,17 +242,27 @@ export function createStreamPresentation() {
   }
 
   return (input: PresentationInput): StreamPresentation => {
+    // Interaction rows are removed before plugin transforms, tool grouping, and turn folding.
+    // Keep the source projection alongside the display projection so search and the outline
+    // use the same ungrouped filtered timeline.
+    const interactionProjection = projectAgentInteractions({
+      tail: input.tail,
+      head: input.head,
+      showAgentInteractions: input.showAgentInteractions,
+    });
+    const sourceTail = interactionProjection.tail;
+    const sourceHead = interactionProjection.head;
     const level: ToolCallDetailLevel = input.display === "full" ? "detailed" : "overview";
     // Retained history is not reprojected or regrouped on each live text update.
-    if (historySource !== input.tail || historyTransform !== input.transform) {
-      historyRows = projectPluginTimelineItems(input.tail, input.transform).flatMap<StreamItem>(
+    if (historySource !== sourceTail || historyTransform !== input.transform) {
+      historyRows = projectPluginTimelineItems(sourceTail, input.transform).flatMap<StreamItem>(
         (item) => presentRows(item),
       );
-      historySource = input.tail;
+      historySource = sourceTail;
       historyTransform = input.transform;
     }
     const head: StreamItem[] = [];
-    for (const item of projectPluginTimelineItems(input.head, input.transform, "streaming")) {
+    for (const item of projectPluginTimelineItems(sourceHead, input.transform, "streaming")) {
       const blocks = presentRows(item);
       head.push(...blocks);
     }
@@ -203,19 +295,26 @@ export function createStreamPresentation() {
       projection.groupsByHostId,
     );
     const retainedGroupHosts = historyGroupHosts;
+    const beforeGrouping = { tail: indexHistory(historyRows), head: indexHead(head) };
+    const displayed = {
+      tail: indexDisplayedTail(result.tail),
+      head: indexDisplayedHead(result.head),
+    };
+    const replacements = readingRowReplacements({
+      previous: previousDisplayedRows,
+      displayed,
+      beforeGrouping,
+      interactions: interactionProjection.readingRowReplacements,
+      groups: { get: (id) => liveGroupHosts.get(id) ?? retainedGroupHosts.get(id) },
+      turns: result.turns,
+    });
+    previousDisplayedRows = displayed;
     return {
       ...result,
-      readingRowReplacements: {
-        get(id) {
-          if (result.turns.nestedItemIds.has(id)) return undefined;
-          const groupHost = liveGroupHosts.get(id) ?? retainedGroupHosts.get(id) ?? id;
-          return (
-            result.turns.hostIdByHiddenRowId.get(id) ??
-            result.turns.hostIdByHiddenRowId.get(groupHost) ??
-            (groupHost === id ? undefined : groupHost)
-          );
-        },
-      },
+      sourceTail,
+      sourceHead,
+      hiddenItemIds: interactionProjection.hiddenItemIds,
+      readingRowReplacements: replacements,
     };
   };
 }

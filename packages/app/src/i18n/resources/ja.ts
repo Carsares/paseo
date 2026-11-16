@@ -2526,6 +2526,11 @@ export const ja: TranslationResources = {
         label: "常に思考プロセスを展開",
         description: "デフォルトでAIのエージェント思考・推論ブロックを完全に展開して表示します",
       },
+      showAgentInteractions: {
+        label: "サブエージェントのやり取りを表示",
+        description:
+          "既定ではサブエージェントへの依頼、返信、通知を非表示にし、メインエージェントの返信を表示します。オンにするとすべてのやり取りを表示します。",
+      },
       chatDisplay: {
         label: "チャットの表示",
         description: "チャットに表示するエージェントの作業量",

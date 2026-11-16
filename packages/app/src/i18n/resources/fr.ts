@@ -2558,6 +2558,11 @@ export const fr: TranslationResources = {
         label: "Toujours afficher le raisonnement",
         description: "Afficher par défaut le raisonnement de l’agent entièrement déplié",
       },
+      showAgentInteractions: {
+        label: "Afficher les interactions des sous-agents",
+        description:
+          "Les missions, réponses et notifications des sous-agents sont masquées par défaut ; les réponses de l’agent principal restent visibles. Activez cette option pour voir toutes les interactions.",
+      },
       chatDisplay: {
         label: "Affichage du chat",
         description: "La part du travail de l’agent affichée dans le chat",

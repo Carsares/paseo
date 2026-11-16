@@ -44,6 +44,67 @@ function makeDeps(
 }
 
 describe("loadAppSettingsFromStorage", () => {
+  it("hides subagent interactions on a new installation", async () => {
+    const deps = makeDeps();
+
+    const settings = await loadAppSettingsFromStorage(deps);
+
+    expect(settings.showAgentInteractions).toBe(false);
+    expect(settings.chatDisplay).toBe("collapseTurns");
+    expect(settings.autoExpandReasoning).toBe(false);
+    expect(JSON.parse(deps.storage.entries.get(APP_SETTINGS_KEY) ?? "null")).toMatchObject({
+      showAgentInteractions: false,
+    });
+  });
+
+  it.each([APP_SETTINGS_KEY, LEGACY_SETTINGS_KEY])(
+    "hides subagent interactions when %s predates the preference",
+    async (storageKey) => {
+      const deps = makeDeps({
+        storage: createInMemoryKeyValueStorage({
+          [storageKey]: JSON.stringify({ chatDisplay: "full", autoExpandReasoning: true }),
+        }),
+      });
+
+      expect(await loadSettingsFromStorage(deps)).toMatchObject({
+        showAgentInteractions: false,
+        chatDisplay: "full",
+        autoExpandReasoning: true,
+      });
+    },
+  );
+
+  it.each([true, false])("reads an explicit subagent interaction choice of %s", async (value) => {
+    const deps = makeDeps({
+      storage: createInMemoryKeyValueStorage({
+        [APP_SETTINGS_KEY]: JSON.stringify({ showAgentInteractions: value }),
+      }),
+    });
+
+    expect((await loadAppSettingsFromStorage(deps)).showAgentInteractions).toBe(value);
+  });
+
+  it.each([null, "true", "false", 0, 1, [], {}])(
+    "hides subagent interactions for invalid stored value %j without resetting other choices",
+    async (showAgentInteractions) => {
+      const deps = makeDeps({
+        storage: createInMemoryKeyValueStorage({
+          [APP_SETTINGS_KEY]: JSON.stringify({
+            showAgentInteractions,
+            chatDisplay: "collapseToolCalls",
+            autoExpandReasoning: true,
+          }),
+        }),
+      });
+
+      expect(await loadAppSettingsFromStorage(deps)).toMatchObject({
+        showAgentInteractions: false,
+        chatDisplay: "collapseToolCalls",
+        autoExpandReasoning: true,
+      });
+    },
+  );
+
   it("persists file panel associations, including panels absent from this host", async () => {
     const deps = makeDeps();
     const queryClient = new QueryClient();
@@ -565,6 +626,42 @@ describe("loadAppSettingsFromStorage", () => {
 });
 
 describe("saveAppSettings", () => {
+  it.each([true, false])(
+    "retains subagent interaction choice %s after reopening without changing other settings",
+    async (showAgentInteractions) => {
+      const deps = makeDeps({
+        storage: createInMemoryKeyValueStorage({
+          [APP_SETTINGS_KEY]: JSON.stringify({
+            ...DEFAULT_CLIENT_SETTINGS,
+            showAgentInteractions: !showAgentInteractions,
+            chatDisplay: "full",
+            autoExpandReasoning: true,
+          }),
+        }),
+      });
+      const before = await loadAppSettingsFromStorage(deps);
+      const queryClient = new QueryClient();
+
+      await saveAppSettings({ queryClient, updates: { showAgentInteractions }, deps });
+
+      const expected = { ...before, showAgentInteractions };
+      expect(queryClient.getQueryData(APP_SETTINGS_QUERY_KEY)).toEqual(expected);
+      expect(JSON.parse(deps.storage.entries.get(APP_SETTINGS_KEY) ?? "null")).toEqual(expected);
+      const reopenedDeps = makeDeps({ storage: deps.storage });
+      expect(await loadAppSettingsFromStorage(reopenedDeps)).toEqual(expected);
+
+      await saveAppSettings({
+        queryClient: new QueryClient(),
+        updates: { language: "zh-CN" },
+        deps: reopenedDeps,
+      });
+      expect(await loadAppSettingsFromStorage(reopenedDeps)).toEqual({
+        ...expected,
+        language: "zh-CN",
+      });
+    },
+  );
+
   it("applies consecutive functional updates to the latest cached settings", async () => {
     const deps = makeDeps();
     const queryClient = new QueryClient();

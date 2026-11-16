@@ -2559,6 +2559,11 @@ export const es: TranslationResources = {
         description:
           "Mostrar los bloques de pensamiento y razonamiento del agente totalmente expandidos de forma predeterminada",
       },
+      showAgentInteractions: {
+        label: "Mostrar interacciones de subagentes",
+        description:
+          "Las asignaciones, respuestas y notificaciones de subagentes se ocultan por defecto; las respuestas del agente principal se conservan. Activa esta opción para ver todas las interacciones.",
+      },
       chatDisplay: {
         label: "Visualización del chat",
         description: "Cuánto del trabajo del agente muestra el chat",

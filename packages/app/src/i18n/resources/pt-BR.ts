@@ -2541,6 +2541,11 @@ export const ptBR: TranslationResources = {
         description:
           "Mostrar os blocos de pensamento e raciocínio do agente totalmente expandidos por padrão",
       },
+      showAgentInteractions: {
+        label: "Mostrar interações de subagentes",
+        description:
+          "Tarefas enviadas, respostas e notificações de subagentes ficam ocultas por padrão; as respostas do agente principal permanecem. Ative para ver todas as interações.",
+      },
       chatDisplay: {
         label: "Exibição do chat",
         description: "Quanto do trabalho do agente o chat mostra",

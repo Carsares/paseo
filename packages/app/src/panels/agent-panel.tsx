@@ -1215,6 +1215,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       {showsComposer ? null : <SheetAgentFacts serverId={serverId} agentId={agentId} />}
       <RenderProfile id={`AgentStreamSection:${agentId}`}>
         <AgentStreamSection
+          parentAgentId={parentAgentId}
           streamViewRef={streamViewRef}
           serverId={serverId}
           agentId={agentId}
@@ -1387,6 +1388,7 @@ function SheetAgentFacts({ serverId, agentId }: { serverId: string; agentId: str
 }
 
 const AgentStreamSection = memo(function AgentStreamSection({
+  parentAgentId,
   streamViewRef,
   serverId,
   agentId,
@@ -1401,6 +1403,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
   quoteTarget,
   onOpenWorkspaceFile,
 }: {
+  parentAgentId: string | null;
   streamViewRef: React.RefObject<AgentStreamViewHandle | null>;
   serverId: string;
   agentId?: string;
@@ -1509,6 +1512,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
         toast={toast}
         pendingMessageSubmissions={pendingMessageSubmissions}
         turnPresentation={turnPresentation}
+        showAgentInteractions={parentAgentId !== null ? true : undefined}
         onOpenWorkspaceFile={onOpenWorkspaceFile}
       />
     </ComposerQuoteProvider>

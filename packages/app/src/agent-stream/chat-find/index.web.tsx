@@ -60,6 +60,7 @@ export function ChatFind({
   viewportRef,
   revealLoadedMessage,
   visibleMessageIds,
+  projectionKey,
   children,
 }: ChatFindProps) {
   const { t } = useTranslation();
@@ -97,6 +98,9 @@ export function ChatFind({
   useEffect(() => {
     model.updateHistory(epoch, items);
   }, [model, epoch, items]);
+  useEffect(() => {
+    model.close();
+  }, [model, projectionKey]);
   useEffect(() => () => model.close(), [model]);
   useEffect(() => {
     if (!active) model.close();

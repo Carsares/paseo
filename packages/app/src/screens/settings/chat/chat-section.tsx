@@ -33,6 +33,10 @@ export function ChatSection() {
     (autoExpandReasoning: boolean) => void updateSettings({ autoExpandReasoning }),
     [updateSettings],
   );
+  const changeShowAgentInteractions = useCallback(
+    (showAgentInteractions: boolean) => void updateSettings({ showAgentInteractions }),
+    [updateSettings],
+  );
   const changeChatOutline = useCallback(
     (chatOutlineEnabled: boolean) => void updateSettings({ chatOutlineEnabled }),
     [updateSettings],
@@ -47,6 +51,12 @@ export function ChatSection() {
             hint={t("settings.general.autoExpandReasoning.description")}
             value={settings.autoExpandReasoning}
             onValueChange={changeAutoExpandReasoning}
+          />
+          <SettingsSwitch
+            label={t("settings.general.showAgentInteractions.label")}
+            hint={t("settings.general.showAgentInteractions.description")}
+            value={settings.showAgentInteractions}
+            onValueChange={changeShowAgentInteractions}
           />
           <SettingsSelect
             label={t("settings.general.chatDisplay.label")}

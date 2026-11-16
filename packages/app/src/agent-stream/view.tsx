@@ -261,6 +261,8 @@ export interface AgentStreamViewProps {
   toast?: ToastApi | null;
   onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
   readOnly?: boolean;
+  /** Detail panes opt into the complete interaction transcript. */
+  showAgentInteractions?: boolean;
   historyPagination?: {
     hasOlder: boolean;
     isLoadingOlder: boolean;
@@ -358,12 +360,17 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       toast,
       onOpenWorkspaceFile,
       readOnly = false,
+      showAgentInteractions: showAgentInteractionsOverride,
       historyPagination,
     },
     ref,
   ) {
     const { t } = useTranslation();
     const autoExpandReasoning = useSettings((settings) => settings.autoExpandReasoning);
+    const configuredShowAgentInteractions = useSettings(
+      (settings) => settings.showAgentInteractions,
+    );
+    const showAgentInteractions = showAgentInteractionsOverride ?? configuredShowAgentInteractions;
     const chatDisplay = useSettings((settings) => settings.chatDisplay);
     const chatOutlineEnabled = useSettings((settings) => settings.chatOutlineEnabled);
     const contentMaxWidth = useSettings(resolveContentMaxWidth);
@@ -537,6 +544,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           expandedTurnHostIds,
           isTurnActive,
           activeTurnId: effectiveTurnPresentation.turnId,
+          showAgentInteractions,
         }),
       [
         presentStream,
@@ -548,6 +556,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         expandedTurnHostIds,
         isTurnActive,
         effectiveTurnPresentation.turnId,
+        showAgentInteractions,
       ],
     );
     const {
@@ -621,8 +630,8 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       agentId,
       serverId: resolvedServerId,
       timelineEpoch,
-      tail: effectiveStreamItems,
-      head: effectiveStreamHead,
+      tail: presentation.sourceTail,
+      head: presentation.sourceHead,
       enabled: supportsChatOutline && chatOutlineEnabled,
       viewportRef,
       onJumpError: handleTimelineHistoryLoadError,
@@ -1159,8 +1168,8 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     );
 
     const findItems = useMemo(
-      () => [...effectiveStreamItems, ...(effectiveStreamHead ?? [])],
-      [effectiveStreamItems, effectiveStreamHead],
+      () => [...presentation.sourceTail, ...presentation.sourceHead],
+      [presentation.sourceHead, presentation.sourceTail],
     );
     return (
       <ChatFind
@@ -1168,6 +1177,9 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         serverId={resolvedServerId}
         epoch={timelineEpoch}
         items={findItems}
+        projectionKey={
+          showAgentInteractions ? "agent-interactions-shown" : "agent-interactions-hidden"
+        }
         viewportRef={viewportRef}
         revealLoadedMessage={revealLoadedMessage}
         visibleMessageIds={mountedMessageIds}
@@ -1350,6 +1362,9 @@ function agentStreamViewPropsEqual(
   if (left.toast !== right.toast) reasons.push("toast");
   if (left.onOpenWorkspaceFile !== right.onOpenWorkspaceFile) reasons.push("onOpenWorkspaceFile");
   if (left.readOnly !== right.readOnly) reasons.push("readOnly");
+  if (left.showAgentInteractions !== right.showAgentInteractions) {
+    reasons.push("showAgentInteractions");
+  }
   if (!historyPaginationPropsEqual(left.historyPagination, right.historyPagination)) {
     reasons.push("historyPagination");
   }
