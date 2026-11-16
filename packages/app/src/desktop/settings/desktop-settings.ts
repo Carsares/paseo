@@ -13,6 +13,7 @@ const DESKTOP_SETTINGS_QUERY_KEY = ["desktop-settings"] as const;
 
 export interface DesktopSettings {
   releaseChannel: ReleaseChannel;
+  officialUpdatesEnabled: boolean;
   notifications: {
     playSound: boolean;
   };
@@ -24,12 +25,14 @@ export interface DesktopSettings {
 
 export interface DesktopSettingsPatch {
   releaseChannel?: ReleaseChannel;
+  officialUpdatesEnabled?: boolean;
   notifications?: Partial<DesktopSettings["notifications"]>;
   daemon?: Partial<DesktopSettings["daemon"]>;
 }
 
 export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   releaseChannel: "stable",
+  officialUpdatesEnabled: false,
   notifications: {
     playSound: true,
   },
@@ -156,6 +159,7 @@ function parseDesktopSettings(raw: unknown): DesktopSettings {
 
   return {
     releaseChannel: record.releaseChannel === "beta" ? "beta" : "stable",
+    officialUpdatesEnabled: record.officialUpdatesEnabled === true,
     notifications: {
       playSound:
         typeof notifications.playSound === "boolean"
@@ -181,6 +185,7 @@ function mergeDesktopSettings(
 ): DesktopSettings {
   return {
     releaseChannel: updates.releaseChannel ?? current.releaseChannel,
+    officialUpdatesEnabled: updates.officialUpdatesEnabled ?? current.officialUpdatesEnabled,
     notifications: {
       ...current.notifications,
       ...updates.notifications,
@@ -195,6 +200,9 @@ function mergeDesktopSettings(
 function normalizePatch(updates: DesktopSettingsPatch): Record<string, unknown> {
   return {
     ...(updates.releaseChannel ? { releaseChannel: updates.releaseChannel } : {}),
+    ...(typeof updates.officialUpdatesEnabled === "boolean"
+      ? { officialUpdatesEnabled: updates.officialUpdatesEnabled }
+      : {}),
     ...(updates.notifications ? { notifications: updates.notifications } : {}),
     ...(updates.daemon ? { daemon: updates.daemon } : {}),
   };

@@ -83,6 +83,8 @@ import { DesktopNotificationsSection } from "@/desktop/components/desktop-notifi
 import { BrowserDataSection } from "@/desktop/browser/settings/browser-data-section";
 import { IntegrationsSection } from "@/desktop/components/integrations-section";
 import { isElectronRuntime } from "@/desktop/host";
+import { Switch } from "@/components/ui/switch";
+import { useDesktopSettings } from "@/desktop/settings/desktop-settings";
 import { useDesktopAppUpdater } from "@/desktop/updates/use-desktop-app-updater";
 import { formatVersionWithPrefix } from "@/desktop/updates/desktop-updates";
 import { resolveAppVersion } from "@/utils/app-version";
@@ -620,11 +622,41 @@ function getUpdateButtonLabel(
   return t("settings.about.updates.update");
 }
 
+function OfficialUpdatesRow() {
+  const { t } = useTranslation();
+  const { settings, updateSettings, isLoading, isSaving, error } = useDesktopSettings();
+  const toggle = useCallback(
+    (officialUpdatesEnabled: boolean) => {
+      void updateSettings({ officialUpdatesEnabled }).catch(() => {
+        // useDesktopSettings reports save failures and restores the previous value.
+      });
+    },
+    [updateSettings],
+  );
+  return (
+    <View style={[settingsStyles.row, settingsStyles.rowBorder]}>
+      <View style={settingsStyles.rowContent}>
+        <Text style={settingsStyles.rowTitle}>{t("settings.about.officialUpdates.label")}</Text>
+        <Text style={settingsStyles.rowHint}>
+          {t("settings.about.officialUpdates.description")}
+        </Text>
+      </View>
+      <Switch
+        value={settings.officialUpdatesEnabled}
+        onValueChange={toggle}
+        disabled={isLoading || isSaving || Boolean(error)}
+        accessibilityLabel={t("settings.about.officialUpdates.label")}
+      />
+    </View>
+  );
+}
+
 function DesktopAppUpdateRow() {
   const { t } = useTranslation();
   const { settings, updateSettings } = useSettings();
   const {
     isDesktopApp,
+    updatesEnabled,
     statusText,
     availableUpdate,
     errorMessage,
@@ -731,19 +763,20 @@ function DesktopAppUpdateRow() {
           <Button
             variant="outline"
             onPress={handleCheckForUpdates}
-            disabled={isChecking || isInstalling}
+            disabled={!updatesEnabled || isChecking || isInstalling}
           >
             {isChecking ? t("settings.about.updates.checking") : t("settings.about.updates.check")}
           </Button>
           <Button
             variant="default"
             onPress={handleInstallUpdate}
-            disabled={isChecking || isInstalling || !isUpdateReady}
+            disabled={!updatesEnabled || isChecking || isInstalling || !isUpdateReady}
           >
             {getUpdateButtonLabel(t, isInstalling, readyUpdateVersion)}
           </Button>
         </View>
       </View>
+      <OfficialUpdatesRow />
     </>
   );
 }

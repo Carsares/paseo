@@ -2627,6 +2627,12 @@ export const es: TranslationResources = {
         stable: "Stable",
         beta: "Beta",
       },
+      officialUpdates: {
+        label: "Permitir actualizaciones oficiales",
+        description:
+          "Buscar, descargar e instalar versiones oficiales. Reemplazan las versiones personalizadas.",
+        disabled: "Las actualizaciones oficiales están desactivadas.",
+      },
       updates: {
         label: "Actualizaciones de aplicaciones",
         readyToInstall: "Listo para instalar:{{version}}",

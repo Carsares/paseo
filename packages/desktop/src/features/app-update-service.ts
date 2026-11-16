@@ -77,6 +77,7 @@ export interface AppUpdateService {
 export interface AppUpdateServiceDeps {
   runtime: AppUpdateRuntime;
   isPackaged(): boolean;
+  isUpdatesEnabled(): Promise<boolean>;
   now(): number;
   bucket(): Promise<number>;
   reportCheckError?(error: unknown): void;
@@ -105,7 +106,7 @@ function buildCheckResult(input: {
 }
 
 async function performQuitAndInstall(
-  runtime: AppUpdateRuntime,
+  deps: AppUpdateServiceDeps,
   {
     targetVersion,
     onBeforeQuit,
@@ -115,13 +116,16 @@ async function performQuitAndInstall(
     onBeforeQuit?: () => Promise<void>;
     restart: boolean;
   },
-): Promise<void> {
+): Promise<boolean> {
+  if (!(await deps.isUpdatesEnabled())) return false;
   if (onBeforeQuit) await onBeforeQuit();
-  runtime.quitAndInstall({
+  if (!(await deps.isUpdatesEnabled())) return false;
+  deps.runtime.quitAndInstall({
     targetVersion,
     isSilent: !restart,
     isForceRunAfter: restart,
   });
+  return true;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -146,6 +150,16 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
   let preparationError: { version: string; message: string } | null = null;
   let preparingUpdateVersion: string | null = null;
   let checkQueue: Promise<void> = Promise.resolve();
+
+  function disabledCheckResult(currentVersion: string): AppUpdateCheckResult {
+    clearUpdateState();
+    return buildCheckResult({
+      currentVersion,
+      hasUpdate: false,
+      readyToInstall: false,
+      errorMessage: "Official updates are disabled.",
+    });
+  }
 
   function isReadyToInstallVersion(version: string): boolean {
     return downloadedUpdateVersion === version;
@@ -185,6 +199,7 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     deps.runtime.configure({
       releaseChannel,
       shouldAdmitUpdate: async (info) => {
+        if (!(await deps.isUpdatesEnabled())) return false;
         const parsed = rolloutManifestSchema.parse(info);
         return shouldAdmitAppUpdate({
           channel: releaseChannel,
@@ -255,10 +270,12 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     }
 
     return runCheckExclusively(async () => {
+      if (!(await deps.isUpdatesEnabled())) return disabledCheckResult(currentVersion);
       configureRuntime(releaseChannel, intent);
 
       try {
         const result = await deps.runtime.checkForUpdates();
+        if (!(await deps.isUpdatesEnabled())) return disabledCheckResult(currentVersion);
         if (!result || !result.updateInfo) {
           clearUpdateState();
           return buildCheckResult({
@@ -362,6 +379,7 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     signal?: AbortSignal,
   ): Promise<"ready" | "aborted" | "superseded"> {
     while (!isReadyToInstallVersion(readyVersion)) {
+      if (!(await deps.isUpdatesEnabled())) return "aborted";
       if (signal?.aborted) return "aborted";
       if (cachedUpdateInfo?.version !== readyVersion) return "superseded";
 
@@ -418,15 +436,17 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     }
 
     if (isReadyToInstallVersion(readyVersion)) {
-      await performQuitAndInstall(deps.runtime, {
+      const installed = await performQuitAndInstall(deps, {
         targetVersion: readyVersion,
         onBeforeQuit,
         restart,
       });
       return {
-        installed: true,
+        installed,
         version: readyVersion,
-        message: "Update downloaded. The app will restart shortly.",
+        message: installed
+          ? "Update downloaded. The app will restart shortly."
+          : "Official updates are disabled.",
       };
     }
 
@@ -442,16 +462,18 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
           message: "A newer update was found and will be installed later.",
         };
       }
-      await performQuitAndInstall(deps.runtime, {
+      const installed = await performQuitAndInstall(deps, {
         targetVersion: readyVersion,
         onBeforeQuit,
         restart,
       });
 
       return {
-        installed: true,
+        installed,
         version: readyVersion,
-        message: "Update downloaded. The app will restart shortly.",
+        message: installed
+          ? "Update downloaded. The app will restart shortly."
+          : "Official updates are disabled.",
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

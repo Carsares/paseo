@@ -2628,6 +2628,12 @@ export const fr: TranslationResources = {
         stable: "Stable",
         beta: "Bêta",
       },
+      officialUpdates: {
+        label: "Autoriser les mises à jour officielles",
+        description:
+          "Rechercher, télécharger et installer les versions officielles. Elles remplacent les versions personnalisées.",
+        disabled: "Les mises à jour officielles sont désactivées.",
+      },
       updates: {
         label: "Mises à jour de l’application",
         readyToInstall: "Prête à installer : {{version}}",

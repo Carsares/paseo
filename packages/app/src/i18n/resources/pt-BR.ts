@@ -2609,6 +2609,12 @@ export const ptBR: TranslationResources = {
         stable: "Stable",
         beta: "Beta",
       },
+      officialUpdates: {
+        label: "Permitir atualizações oficiais",
+        description:
+          "Verificar, baixar e instalar versões oficiais. Elas substituem as versões personalizadas.",
+        disabled: "As atualizações oficiais estão desativadas.",
+      },
       updates: {
         label: "Atualizações do app",
         readyToInstall: "Pronta para instalar: {{version}}",

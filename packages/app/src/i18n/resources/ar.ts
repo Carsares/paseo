@@ -2607,6 +2607,11 @@ export const ar: TranslationResources = {
         stable: "Stable",
         beta: "Beta",
       },
+      officialUpdates: {
+        label: "السماح بالتحديثات الرسمية",
+        description: "البحث عن الإصدارات الرسمية وتنزيلها وتثبيتها. تحل محل الإصدارات المخصصة.",
+        disabled: "التحديثات الرسمية معطلة.",
+      },
       updates: {
         label: "تحديثات التطبيق",
         readyToInstall: "جاهز للتثبيت:{{version}}",

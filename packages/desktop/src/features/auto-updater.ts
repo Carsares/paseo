@@ -5,6 +5,7 @@ import { app } from "electron";
 import { UUID } from "builder-util-runtime";
 import log from "electron-log/main";
 import { autoUpdater } from "electron-updater";
+import { getDesktopSettingsStore } from "../settings/desktop-settings-electron.js";
 import {
   createAppUpdateService,
   type AppUpdateCheckResult,
@@ -140,11 +141,16 @@ export function shouldInstallAppUpdateOnQuit(input: {
   return !(input.platform === "linux" && input.isAppImage);
 }
 
+async function isOfficialUpdatesEnabled(): Promise<boolean> {
+  return (await getDesktopSettingsStore().get()).officialUpdatesEnabled;
+}
+
 class ElectronAppUpdateRuntime implements AppUpdateRuntime {
   private configured = false;
 
   configure(input: AppUpdateRuntimeConfiguration): void {
-    autoUpdater.autoDownload = true;
+    // Download explicitly so a setting change during a network check is respected.
+    autoUpdater.autoDownload = false;
     autoUpdater.autoRunAppAfterInstall = true;
     // Paseo revalidates the current manifest before explicitly installing on quit.
     // Electron's built-in handler would install an older download without checking
@@ -196,6 +202,10 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
     try {
       const result = await autoUpdater.checkForUpdates();
       if (!result) return null;
+      if (result.isUpdateAvailable) {
+        // electron-updater reports download failures through its error event.
+        void this.downloadUpdate(result.updateInfo.version).catch(() => undefined);
+      }
       return {
         isUpdateAvailable: result.isUpdateAvailable,
         updateInfo: result.updateInfo as RuntimeUpdateInfo,
@@ -206,7 +216,8 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
     }
   }
 
-  downloadUpdate(targetVersion: string): Promise<unknown> {
+  async downloadUpdate(targetVersion: string): Promise<unknown> {
+    if (!(await isOfficialUpdatesEnabled())) return;
     updateLifecycleLog.downloadRequested(targetVersion);
     return autoUpdater.downloadUpdate();
   }
@@ -224,6 +235,7 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
 
 const appUpdateService = createAppUpdateService({
   runtime: new ElectronAppUpdateRuntime(),
+  isUpdatesEnabled: isOfficialUpdatesEnabled,
   isPackaged: () => app.isPackaged,
   now: () => Date.now(),
   bucket: async () => bucketFromStagingUserId(await getStagingUserId()),

@@ -2,12 +2,14 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { UUID } from "builder-util-runtime";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { autoUpdaterMock } = vi.hoisted(() => {
+const { autoUpdaterMock, settingsMock } = vi.hoisted(() => {
   const handlers = new Map<string, (value: unknown) => void>();
   return {
+    settingsMock: { officialUpdatesEnabled: true },
     autoUpdaterMock: {
+      autoDownload: true,
       handlers,
       logger: {
         debug: vi.fn(),
@@ -24,6 +26,10 @@ const { autoUpdaterMock } = vi.hoisted(() => {
     },
   };
 });
+
+vi.mock("../settings/desktop-settings-electron.js", () => ({
+  getDesktopSettingsStore: () => ({ get: async () => settingsMock }),
+}));
 
 vi.mock("electron", () => ({
   app: {
@@ -47,6 +53,41 @@ import {
 } from "./auto-updater";
 
 describe("checkForAppUpdate", () => {
+  afterEach(() => {
+    settingsMock.officialUpdatesEnabled = true;
+  });
+
+  it("prevents an in-flight check from automatically downloading after disabling updates", async () => {
+    const downloads = autoUpdaterMock.downloadUpdate.mock.calls.length;
+    autoUpdaterMock.checkForUpdates.mockImplementationOnce(async () => {
+      settingsMock.officialUpdatesEnabled = false;
+      return { isUpdateAvailable: true, updateInfo: { version: "1.2.4" } };
+    });
+    const result = await checkForAppUpdate({
+      currentVersion: "1.2.3",
+      releaseChannel: "stable",
+      intent: "manual",
+    });
+    expect(result.hasUpdate).toBe(false);
+    expect(autoUpdaterMock.autoDownload).toBe(false);
+    expect(autoUpdaterMock.downloadUpdate.mock.calls).toHaveLength(downloads);
+  });
+
+  it("starts a background download when official updates are enabled", async () => {
+    const downloads = autoUpdaterMock.downloadUpdate.mock.calls.length;
+    autoUpdaterMock.checkForUpdates.mockResolvedValueOnce({
+      isUpdateAvailable: true,
+      updateInfo: { version: "1.2.4" },
+    });
+    const result = await checkForAppUpdate({
+      currentVersion: "1.2.3",
+      releaseChannel: "stable",
+      intent: "manual",
+    });
+    expect(result.hasUpdate).toBe(true);
+    expect(autoUpdaterMock.downloadUpdate.mock.calls).toHaveLength(downloads + 1);
+  });
+
   it("treats an unpublished channel manifest as an unavailable update", async () => {
     const error = Object.assign(new Error("Cannot find latest-mac.yml"), {
       code: "ERR_UPDATER_CHANNEL_FILE_NOT_FOUND",

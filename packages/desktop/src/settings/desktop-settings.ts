@@ -8,6 +8,7 @@ import type { AppReleaseChannel } from "../features/auto-updater.js";
 
 export interface DesktopSettings {
   releaseChannel: AppReleaseChannel;
+  officialUpdatesEnabled: boolean;
   notifications: {
     playSound: boolean;
   };
@@ -19,6 +20,7 @@ export interface DesktopSettings {
 
 interface DesktopSettingsPatch {
   releaseChannel?: AppReleaseChannel;
+  officialUpdatesEnabled?: boolean;
   notifications?: Partial<DesktopSettings["notifications"]>;
   daemon?: Partial<DesktopSettings["daemon"]>;
 }
@@ -31,6 +33,7 @@ export interface DesktopSettingsStore {
 
 export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   releaseChannel: "stable",
+  officialUpdatesEnabled: false,
   notifications: {
     playSound: true,
   },
@@ -60,6 +63,7 @@ const DaemonSchema = z
 const DesktopSettingsSchema = z
   .looseObject({
     releaseChannel: ReleaseChannelSchema.catch(DEFAULT_DESKTOP_SETTINGS.releaseChannel),
+    officialUpdatesEnabled: z.boolean().catch(false),
     notifications: NotificationsSchema,
     daemon: DaemonSchema,
   })
@@ -106,6 +110,7 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 function buildDefaultSettings(): StoredDesktopSettings {
   return {
     releaseChannel: DEFAULT_DESKTOP_SETTINGS.releaseChannel,
+    officialUpdatesEnabled: DEFAULT_DESKTOP_SETTINGS.officialUpdatesEnabled,
     notifications: { ...DEFAULT_DESKTOP_SETTINGS.notifications },
     daemon: { ...DEFAULT_DESKTOP_SETTINGS.daemon },
   };
@@ -125,6 +130,7 @@ function buildDefaultDocument(): PersistedDesktopSettingsDocument {
 function toDesktopSettings(stored: StoredDesktopSettings): DesktopSettings {
   return {
     releaseChannel: stored.releaseChannel,
+    officialUpdatesEnabled: stored.officialUpdatesEnabled,
     notifications: { playSound: stored.notifications.playSound },
     daemon: {
       manageBuiltInDaemon: stored.daemon.manageBuiltInDaemon,
@@ -139,6 +145,10 @@ function coerceDesktopSettingsPatch(input: unknown): DesktopSettingsPatch {
   }
 
   const patch: DesktopSettingsPatch = {};
+  const officialUpdatesEnabled = coerceBoolean(input.officialUpdatesEnabled);
+  if (officialUpdatesEnabled !== null) {
+    patch.officialUpdatesEnabled = officialUpdatesEnabled;
+  }
   const releaseChannel = coerceReleaseChannel(input.releaseChannel);
   if (releaseChannel) {
     patch.releaseChannel = releaseChannel;
@@ -197,6 +207,7 @@ function mergeDesktopSettings(
   return {
     ...current,
     releaseChannel: patch.releaseChannel ?? current.releaseChannel,
+    officialUpdatesEnabled: patch.officialUpdatesEnabled ?? current.officialUpdatesEnabled,
     notifications: { ...current.notifications, ...patch.notifications },
     daemon: { ...current.daemon, ...patch.daemon },
   };

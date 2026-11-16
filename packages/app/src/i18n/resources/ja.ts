@@ -2594,6 +2594,12 @@ export const ja: TranslationResources = {
         stable: "安定版",
         beta: "ベータ",
       },
+      officialUpdates: {
+        label: "公式アップデートを許可",
+        description:
+          "公式版の確認、ダウンロード、インストールを許可します。カスタム版は上書きされます。",
+        disabled: "公式アップデートは無効です。",
+      },
       updates: {
         label: "アプリの更新",
         readyToInstall: "インストール準備完了: {{version}}",

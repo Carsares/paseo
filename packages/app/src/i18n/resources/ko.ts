@@ -2585,6 +2585,11 @@ export const ko: TranslationResources = {
         stable: "안정",
         beta: "베타",
       },
+      officialUpdates: {
+        label: "공식 업데이트 허용",
+        description: "공식 버전을 확인하고 다운로드 및 설치합니다. 사용자 지정 버전을 대체합니다.",
+        disabled: "공식 업데이트가 비활성화되었습니다.",
+      },
       updates: {
         label: "앱 업데이트",
         readyToInstall: "설치 준비됨: {{version}}",

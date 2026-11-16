@@ -29,6 +29,16 @@ the titlebar row. Production builds leave the variable unset and show no label.
 
 `npm run dev` is only a shorthand for `npm run dev:server`. Keep `127.0.0.1:6767` for the packaged app and production-style `~/.paseo` state.
 
+## Custom desktop builds
+
+This fork defaults **Settings → About → Allow official updates** to off, including
+when upgrading an existing settings file. Official releases replace the custom
+application, so enable this only when switching back to upstream builds. The
+switch blocks both manual and automatic checks/downloads and installation on quit.
+A download started before disabling may finish, but it cannot be installed while
+the switch is off. The preference belongs to the desktop installation, not the
+connected host; it does not control updates of separately installed servers.
+
 ## Nix desktop package
 
 The flake exposes `packages.<system>.desktop` on Linux and macOS:

@@ -20,6 +20,39 @@ function settingsFilePath(userDataPath: string): string {
 describe("desktop-settings", () => {
   const directories = new Set<string>();
 
+  it.each([undefined, "true", null, 1])(
+    "disables official updates for missing or invalid values: %s",
+    async (value) => {
+      const userDataPath = await createTempUserDataDir();
+      directories.add(userDataPath);
+      await writeFile(
+        settingsFilePath(userDataPath),
+        JSON.stringify({
+          version: 1,
+          settings: { releaseChannel: "beta", officialUpdatesEnabled: value },
+        }),
+      );
+      const store = createDesktopSettingsStore({ userDataPath });
+      expect((await store.get()).officialUpdatesEnabled).toBe(false);
+      expect((await store.patch({ notifications: { playSound: false } })).releaseChannel).toBe(
+        "beta",
+      );
+    },
+  );
+
+  it("persists both official update choices without a legacy migration overriding them", async () => {
+    const userDataPath = await createTempUserDataDir();
+    directories.add(userDataPath);
+    for (const officialUpdatesEnabled of [true, false]) {
+      await createDesktopSettingsStore({ userDataPath }).patch({ officialUpdatesEnabled });
+      const reloaded = createDesktopSettingsStore({ userDataPath });
+      await reloaded.migrateLegacyRendererSettings({ releaseChannel: "beta" });
+      expect((await reloaded.get()).officialUpdatesEnabled).toBe(officialUpdatesEnabled);
+      await reloaded.patch({ officialUpdatesEnabled: "true" });
+      expect((await reloaded.get()).officialUpdatesEnabled).toBe(officialUpdatesEnabled);
+    }
+  });
+
   afterEach(async () => {
     await Promise.all(
       [...directories].map(async (directory) => {
@@ -80,6 +113,7 @@ describe("desktop-settings", () => {
     const settings = await store.get();
 
     expect(settings).toEqual({
+      officialUpdatesEnabled: false,
       releaseChannel: "stable",
       notifications: { playSound: true },
       daemon: {
@@ -102,6 +136,7 @@ describe("desktop-settings", () => {
     const files = await readdir(userDataPath);
 
     expect(next).toEqual({
+      officialUpdatesEnabled: false,
       releaseChannel: "beta",
       notifications: { playSound: true },
       daemon: {
@@ -269,6 +304,7 @@ describe("desktop-settings", () => {
     });
 
     expect(migrated).toEqual({
+      officialUpdatesEnabled: false,
       releaseChannel: "beta",
       notifications: { playSound: true },
       daemon: {
@@ -314,6 +350,7 @@ describe("desktop-settings", () => {
     expect(persisted.futureDocumentKey).toBe("kept");
     expect(persisted.settings.releaseChannel).toBe("beta");
     expect(next).toEqual({
+      officialUpdatesEnabled: false,
       releaseChannel: "beta",
       notifications: { playSound: false },
       daemon: { manageBuiltInDaemon: true, keepRunningAfterQuit: false },

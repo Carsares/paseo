@@ -16,12 +16,14 @@ import {
   formatStatusText,
   type DesktopAppUpdateStatus,
 } from "@/desktop/updates/desktop-app-updater";
+import { i18n } from "@/i18n/i18next";
 import { formatMessageTimestamp } from "@/utils/time";
 
 export type { DesktopAppUpdateStatus };
 
 export interface UseDesktopAppUpdaterReturn {
   isDesktopApp: boolean;
+  updatesEnabled: boolean;
   status: DesktopAppUpdateStatus;
   statusText: string;
   availableUpdate: DesktopAppUpdateCheckResult | null;
@@ -38,7 +40,8 @@ export interface UseDesktopAppUpdaterReturn {
 
 export function useDesktopAppUpdater(): UseDesktopAppUpdaterReturn {
   const isDesktopApp = shouldShowDesktopUpdateSection();
-  const { settings: desktopSettings } = useDesktopSettings();
+  const { settings: desktopSettings, isLoading, error } = useDesktopSettings();
+  const updatesEnabled = !isLoading && !error && desktopSettings.officialUpdatesEnabled;
   const releaseChannel = desktopSettings.releaseChannel;
   const reportError = useDesktopIpcErrorReporter();
 
@@ -63,7 +66,7 @@ export function useDesktopAppUpdater(): UseDesktopAppUpdaterReturn {
 
   const checkForUpdates = useCallback(
     async (options: { intent?: DesktopAppUpdateCheckIntent; silent?: boolean } = {}) => {
-      if (!isDesktopApp) {
+      if (!isDesktopApp || !updatesEnabled) {
         return null;
       }
       return updater.checkForUpdates({
@@ -72,25 +75,25 @@ export function useDesktopAppUpdater(): UseDesktopAppUpdaterReturn {
         silent: options.silent,
       });
     },
-    [isDesktopApp, releaseChannel, updater],
+    [isDesktopApp, updatesEnabled, releaseChannel, updater],
   );
 
   const installUpdate = useCallback(async () => {
-    if (!isDesktopApp) {
+    if (!isDesktopApp || !updatesEnabled) {
       return null;
     }
     return updater.installUpdate({ releaseChannel });
-  }, [isDesktopApp, releaseChannel, updater]);
+  }, [isDesktopApp, updatesEnabled, releaseChannel, updater]);
 
   useEffect(() => {
-    if (!isDesktopApp) {
+    if (!isDesktopApp || !updatesEnabled) {
       return;
     }
     void checkForUpdates({ intent: "automatic", silent: true });
-  }, [checkForUpdates, isDesktopApp]);
+  }, [checkForUpdates, isDesktopApp, updatesEnabled]);
 
   useEffect(() => {
-    if (!isDesktopApp || snapshot.status !== "pending") {
+    if (!isDesktopApp || !updatesEnabled || snapshot.status !== "pending") {
       return undefined;
     }
 
@@ -101,21 +104,24 @@ export function useDesktopAppUpdater(): UseDesktopAppUpdaterReturn {
     return () => {
       clearInterval(intervalId);
     };
-  }, [checkForUpdates, isDesktopApp, snapshot.status]);
+  }, [checkForUpdates, isDesktopApp, updatesEnabled, snapshot.status]);
 
   return {
     isDesktopApp,
-    status: snapshot.status,
-    statusText: formatStatusText({
-      status: snapshot.status,
-      availableUpdate: snapshot.availableUpdate,
-      installMessage: snapshot.installMessage,
-      lastCheckedAt: snapshot.lastCheckedAt,
-      formatVersion: formatVersionWithPrefix,
-      formatLastCheckedAt: (timestamp) => formatMessageTimestamp(new Date(timestamp)),
-    }),
-    availableUpdate: snapshot.availableUpdate,
-    errorMessage: snapshot.errorMessage,
+    updatesEnabled,
+    status: updatesEnabled ? snapshot.status : "idle",
+    statusText: updatesEnabled
+      ? formatStatusText({
+          status: snapshot.status,
+          availableUpdate: snapshot.availableUpdate,
+          installMessage: snapshot.installMessage,
+          lastCheckedAt: snapshot.lastCheckedAt,
+          formatVersion: formatVersionWithPrefix,
+          formatLastCheckedAt: (timestamp) => formatMessageTimestamp(new Date(timestamp)),
+        })
+      : i18n.t("settings.about.officialUpdates.disabled"),
+    availableUpdate: updatesEnabled ? snapshot.availableUpdate : null,
+    errorMessage: updatesEnabled ? snapshot.errorMessage : null,
     lastCheckedAt: snapshot.lastCheckedAt,
     isChecking: snapshot.isChecking,
     isInstalling: snapshot.isInstalling,

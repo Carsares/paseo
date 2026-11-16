@@ -151,11 +151,16 @@ class FakeAppUpdateRuntime implements AppUpdateRuntime {
   }
 }
 
-function createService(input?: { now?: () => number; bucket?: () => Promise<number> }) {
+function createService(input?: {
+  now?: () => number;
+  bucket?: () => Promise<number>;
+  isUpdatesEnabled?: () => Promise<boolean>;
+}) {
   const runtime = new FakeAppUpdateRuntime();
   const service = createAppUpdateService({
     runtime,
     isPackaged: () => true,
+    isUpdatesEnabled: input?.isUpdatesEnabled ?? (async () => true),
     now: input?.now ?? (() => Date.parse("2026-04-28T12:00:00.000Z")),
     bucket: input?.bucket ?? (async () => 0.99),
   });
@@ -169,6 +174,81 @@ const rolledOutUpdate = {
 };
 
 describe("app update service", () => {
+  it("blocks manual and automatic checks and installs while disabled, then allows re-enabling", async () => {
+    let enabled = false;
+    const { runtime, service } = createService({ isUpdatesEnabled: async () => enabled });
+    const input = { currentVersion: "1.2.3", releaseChannel: "stable" as const };
+    runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
+    for (const intent of ["automatic", "manual"] as const) {
+      expect((await service.checkForAppUpdate({ ...input, intent })).hasUpdate).toBe(false);
+    }
+    expect((await service.downloadAndInstallUpdate(input)).installed).toBe(false);
+    expect(
+      await service.installUpdateOnQuit({ ...input, signal: new AbortController().signal }),
+    ).toBe(false);
+    expect(runtime.checkCount).toBe(0);
+    expect(runtime.downloadCallCount).toBe(0);
+    expect(runtime.installedVersions).toEqual([]);
+    enabled = true;
+    expect((await service.downloadAndInstallUpdate(input)).installed).toBe(true);
+    expect(runtime.installedVersions).toEqual(["1.2.4"]);
+  });
+
+  it("does not install an already downloaded update after the setting is disabled", async () => {
+    let enabled = true;
+    const { runtime, service } = createService({ isUpdatesEnabled: async () => enabled });
+    const input = { currentVersion: "1.2.3", releaseChannel: "stable" as const };
+    runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
+    await service.checkForAppUpdate({ ...input, intent: "manual" });
+    runtime.finishUpdateDownload(rolledOutUpdate);
+    enabled = false;
+    expect(
+      await service.installUpdateOnQuit({ ...input, signal: new AbortController().signal }),
+    ).toBe(false);
+    expect(runtime.checkCount).toBe(1);
+    expect(runtime.installedVersions).toEqual([]);
+  });
+
+  it("discards a check result when updates are disabled during the request", async () => {
+    let enabled = true;
+    const { runtime, service } = createService({ isUpdatesEnabled: async () => enabled });
+    const deferred = runtime.deferNextCheck();
+    const pending = service.checkForAppUpdate({
+      currentVersion: "1.2.3",
+      releaseChannel: "stable",
+      intent: "manual",
+    });
+    await expect.poll(() => runtime.checkCount).toBe(1);
+    enabled = false;
+    deferred.resolve({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
+    expect((await pending).hasUpdate).toBe(false);
+    expect(runtime.downloadCallCount).toBe(0);
+  });
+
+  it("does not install when disabled during a download or before quitting", async () => {
+    let enabled = true;
+    const { runtime, service } = createService({ isUpdatesEnabled: async () => enabled });
+    const input = { currentVersion: "1.2.3", releaseChannel: "stable" as const };
+    runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
+    await service.checkForAppUpdate({ ...input, intent: "manual" });
+    const download = runtime.beginUpdateDownload(rolledOutUpdate);
+    runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
+    const pending = service.downloadAndInstallUpdate(input);
+    await expect.poll(() => runtime.downloadCallCount).toBe(1);
+    enabled = false;
+    download.resolve();
+    expect((await pending).installed).toBe(false);
+    expect(runtime.installedVersions).toEqual([]);
+
+    enabled = true;
+    runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
+    const result = await service.downloadAndInstallUpdate(input, async () => {
+      enabled = false;
+    });
+    expect(result.installed).toBe(false);
+    expect(runtime.installedVersions).toEqual([]);
+  });
+
   it("does not expose automatic stable updates before the user is admitted to rollout", async () => {
     const { runtime, service } = createService();
     runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
@@ -296,8 +376,7 @@ describe("app update service", () => {
       intent: "manual",
     });
 
-    await Promise.resolve();
-    expect(runtime.checkCount).toBe(1);
+    await expect.poll(() => runtime.checkCount).toBe(1);
 
     automaticCheck.resolve({ isUpdateAvailable: false, updateInfo: rolledOutUpdate });
     await automaticPending;

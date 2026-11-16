@@ -2702,6 +2702,11 @@ export const en = {
         stable: "Stable",
         beta: "Beta",
       },
+      officialUpdates: {
+        label: "Allow official updates",
+        description: "Check, download, and install official releases. These replace custom builds.",
+        disabled: "Official updates are disabled.",
+      },
       updates: {
         label: "App updates",
         readyToInstall: "Ready to install: {{version}}",

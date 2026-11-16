@@ -752,6 +752,7 @@ describe("loadSettingsFromStorage", () => {
     const desktop = createFakeDesktopBridge({
       isElectron: true,
       settings: {
+        officialUpdatesEnabled: false,
         releaseChannel: "beta",
         notifications: { playSound: true },
         daemon: { manageBuiltInDaemon: false, keepRunningAfterQuit: true },

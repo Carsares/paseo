@@ -2543,6 +2543,11 @@ export const zhCN: TranslationResources = {
         stable: "Stable",
         beta: "Beta",
       },
+      officialUpdates: {
+        label: "允许官方更新",
+        description: "允许检查、下载和安装官方版本，更新会覆盖自定义版本。",
+        disabled: "已禁用官方更新。",
+      },
       updates: {
         label: "应用更新",
         readyToInstall: "可安装：{{version}}",
