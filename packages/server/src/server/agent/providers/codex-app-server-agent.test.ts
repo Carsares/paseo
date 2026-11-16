@@ -8624,3 +8624,126 @@ describe("legacy empty additions", () => {
     expect(item.detail.unifiedDiff).toContain("diff --git a/second.txt b/second.txt");
   });
 });
+
+describe("Codex failed reply retraction", () => {
+  test.each(["delta", "started", "divergent"])(
+    "run returns corrected text and history after %s replacement",
+    async (replacement) => {
+      const session = createSession();
+      vi.spyOn(session, "startTurn").mockImplementation(async () => {
+        const notify = (method: string, params: Record<string, unknown>) =>
+          asInternals(session).handleNotification(method, params);
+        await notify("item/agentMessage/delta", { itemId: "progress", delta: "Checking" });
+        await notify("item/completed", {
+          item: { id: "progress", type: "agentMessage", text: "Checking" },
+        });
+        await notify("item/agentMessage/delta", { itemId: "reply", delta: "Wrong start" });
+        if (replacement !== "divergent") {
+          await notify("error", { willRetry: true, error: { message: "Reconnecting..." } });
+          if (replacement === "delta") {
+            await notify("item/agentMessage/delta", { itemId: "reply", delta: "Correct" });
+          } else {
+            await notify("item/started", { item: { id: "reply", type: "agentMessage", text: "" } });
+          }
+        }
+        await notify("item/completed", {
+          item: { id: "reply", type: "agentMessage", text: "Correct answer" },
+        });
+        await notify("turn/completed", { turn: { id: "turn", status: "completed" } });
+        return { turnId: "test-turn" };
+      });
+      const result = await session.run("Question");
+      expect(result.finalText).toBe("Correct answer");
+      const messages = result.timeline.filter((item) => item.type === "assistant_message");
+      expect(messages.map((item) => item.text).join("")).not.toContain("Wrong start");
+      expect(messages[0]).toMatchObject({ messageId: "progress", text: "Checking" });
+      await session.close();
+    },
+  );
+
+  test("retracts only unfinished root replies across five retries", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const notify = (method: string, params: Record<string, unknown>) =>
+      asInternals(session).handleNotification(method, { threadId: "test-thread", ...params });
+    await notify("item/agentMessage/delta", { itemId: "progress", delta: "Checking files." });
+    await notify("item/completed", {
+      item: { id: "progress", type: "agentMessage", text: "Checking files." },
+    });
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      await notify("item/agentMessage/delta", { itemId: `failed-${attempt}`, delta: "Incomplete" });
+      await notify("error", { willRetry: true, error: { message: "Reconnecting..." } });
+      // A late completion from the abandoned response must not restore its text.
+      await notify("item/completed", {
+        item: { id: `failed-${attempt}`, type: "agentMessage", text: "Incomplete" },
+      });
+    }
+    await notify("item/agentMessage/delta", { itemId: "final", delta: "Final answer" });
+    await notify("item/completed", {
+      item: { id: "final", type: "agentMessage", text: "Final answer" },
+    });
+    await notify("turn/completed", { turn: { id: "turn", status: "completed" } });
+    const retractions = events.filter((event) => event.type === "assistant_messages_removed");
+    expect(retractions).toEqual(
+      Array.from({ length: 5 }, (_, index) => ({
+        type: "assistant_messages_removed",
+        provider: "codex",
+        turnId: "test-turn",
+        messageIds: [`failed-${index + 1}`],
+      })),
+    );
+    expect(
+      events.filter(
+        (event) => event.type === "timeline" && event.item.type === "assistant_message",
+      ),
+    ).toHaveLength(7);
+    await session.close();
+  });
+
+  test("retracts an exhausted retry and accepts a reused item id", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const notify = (method: string, params: Record<string, unknown>) =>
+      asInternals(session).handleNotification(method, params);
+    await notify("item/agentMessage/delta", { itemId: "reply", delta: "Failed start" });
+    await notify("error", { willRetry: true, error: { message: "Reconnecting..." } });
+    await notify("item/agentMessage/delta", { itemId: "reply", delta: "Failed again" });
+    await notify("error", { willRetry: false, error: { message: "Retries exhausted" } });
+    await notify("turn/completed", {
+      turn: { id: "turn", status: "failed", error: { message: "Retries exhausted" } },
+    });
+    expect(events.filter((event) => event.type === "assistant_messages_removed")).toHaveLength(2);
+    expect(events.at(-1)).toMatchObject({ type: "turn_failed" });
+    await session.close();
+  });
+
+  test("replaces a divergent final reply instead of appending it to streamed text", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    await asInternals(session).handleNotification("item/agentMessage/delta", {
+      itemId: "reply",
+      delta: "Wrong start",
+    });
+    await asInternals(session).handleNotification("item/completed", {
+      item: { id: "reply", type: "agentMessage", text: "Correct answer" },
+    });
+    expect(events.slice(1)).toEqual([
+      {
+        type: "assistant_messages_removed",
+        provider: "codex",
+        turnId: "test-turn",
+        messageIds: ["reply"],
+      },
+      {
+        type: "timeline",
+        provider: "codex",
+        turnId: "test-turn",
+        item: { type: "assistant_message", messageId: "reply", text: "Correct answer" },
+      },
+    ]);
+    await session.close();
+  });
+});

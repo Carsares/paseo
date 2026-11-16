@@ -38,6 +38,44 @@ class FakeTurnRunner {
 }
 
 describe("runProviderTurn", () => {
+  test("removes failed chunks and restores retained text before cancellation", async () => {
+    const runner = new FakeTurnRunner("turn-1", "session-1", () => {
+      for (const [messageId, text] of [
+        ["progress", "Checked"],
+        ["failed", "Bad"],
+      ])
+        runner.emit({
+          type: "timeline",
+          provider: "codex",
+          turnId: "turn-1",
+          item: { type: "assistant_message", messageId, text },
+        });
+      runner.emit({
+        type: "assistant_messages_removed",
+        provider: "codex",
+        turnId: "other",
+        messageIds: ["progress"],
+      });
+      runner.emit({
+        type: "assistant_messages_removed",
+        provider: "codex",
+        turnId: "turn-1",
+        messageIds: ["failed"],
+      });
+      runner.emit({ type: "turn_canceled", provider: "codex", turnId: "turn-1" });
+    });
+    const result = await runProviderTurn({
+      prompt: "hi",
+      startTurn: (prompt, options) => runner.startTurn(prompt, options),
+      subscribe: (callback) => runner.subscribe(callback),
+      getSessionId: () => runner.getSessionId(),
+    });
+    expect(result.finalText).toBe("Checked");
+    expect(result.timeline).toEqual([
+      { type: "assistant_message", messageId: "progress", text: "Checked" },
+    ]);
+  });
+
   test("buffers events emitted before startTurn returns", async () => {
     const runner = new FakeTurnRunner("turn-1", "session-1", () => {
       runner.emit({

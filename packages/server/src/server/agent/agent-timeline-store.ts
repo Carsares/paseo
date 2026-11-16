@@ -53,6 +53,25 @@ export class InMemoryAgentTimelineStore {
     this.states.delete(agentId);
   }
 
+  removeAssistantMessages(agentId: string, turnId: string, messageIds: readonly string[]): boolean {
+    const state = this.requireState(agentId);
+    const ids = new Set(messageIds);
+    const previous = state.projection.getRows();
+    const rows = previous.filter(
+      (row) =>
+        !(
+          row.turnId === turnId &&
+          row.item.type === "assistant_message" &&
+          row.item.messageId !== undefined &&
+          ids.has(row.item.messageId)
+        ),
+    );
+    if (rows.length === previous.length) return false;
+    // Keep sequence numbers monotonic; a new epoch invalidates clients' old rows and cursors.
+    this.initialize(agentId, { rows, nextSeq: state.nextSeq });
+    return true;
+  }
+
   getItems(agentId: string): AgentTimelineItem[] {
     return this.requireState(agentId)
       .projection.getRows()

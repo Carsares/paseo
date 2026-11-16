@@ -7,6 +7,65 @@ import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 
 describe("InMemoryAgentTimelineStore", () => {
+  it("retracts merged failed replies only in their turn and invalidates old cursors", () => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("agent", { epoch: "before" });
+    store.append(
+      "agent",
+      { type: "assistant_message", messageId: "reply", text: "Earlier" },
+      { turnId: "old" },
+    );
+    store.append("agent", { type: "user_message", text: "Question" }, { turnId: "current" });
+    store.append(
+      "agent",
+      { type: "assistant_message", messageId: "progress", text: "Checking" },
+      { turnId: "current" },
+    );
+    store.append(
+      "agent",
+      { type: "assistant_message", messageId: "reply", text: "Bad" },
+      { turnId: "current" },
+    );
+    store.append(
+      "agent",
+      { type: "assistant_message", messageId: "reply", text: " fragment" },
+      { turnId: "current" },
+    );
+    const retained = store.getRows("agent").slice(0, 3);
+    expect(store.removeAssistantMessages("agent", "current", ["reply"])).toBe(true);
+    expect(store.getRows("agent")).toEqual(retained);
+    const epoch = store.getEpoch("agent");
+    expect(epoch).not.toBe("before");
+    expect(
+      store.fetch("agent", { direction: "after", cursor: { epoch: "before", seq: 5 } }),
+    ).toMatchObject({ reset: true, staleCursor: true, rows: retained });
+    expect(store.removeAssistantMessages("agent", "current", ["reply"])).toBe(false);
+    expect(store.getEpoch("agent")).toBe(epoch);
+    expect(
+      store.append(
+        "agent",
+        { type: "assistant_message", messageId: "reply", text: "Final" },
+        { turnId: "current" },
+      ).seq,
+    ).toBe(6);
+    expect(store.getLastAssistantMessage("agent")).toBe("Final");
+  });
+
+  it("preserves sequence allocation when retracting the only reply", () => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("agent");
+    store.append(
+      "agent",
+      { type: "assistant_message", messageId: "reply", text: "Bad" },
+      { turnId: "turn" },
+    );
+    expect(store.removeAssistantMessages("agent", "turn", ["reply"])).toBe(true);
+    expect(store.getRows("agent")).toEqual([]);
+    expect(
+      store.append("agent", { type: "assistant_message", text: "Final" }, { turnId: "turn" }).seq,
+    ).toBe(2);
+  });
+
   it("resets stale forward cursors to complete available turns", () => {
     const store = new InMemoryAgentTimelineStore();
     store.initialize("agent", { epoch: "current" });

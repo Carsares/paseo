@@ -3645,6 +3645,8 @@ export class CodexAppServerAgentSession implements AgentSession {
   private pendingPermissionHandlers = new Map<string, CodexPendingPermissionHandler>();
   private resolvedPermissionRequests = new Set<string>();
   private pendingAgentMessages = new Map<string, string>();
+  private pendingRootAgentMessageIds = new Set<string>();
+  private discardedRootAgentMessageIds = new Set<string>();
   private pendingReasoning = new Map<string, string[]>();
   private pendingCommandOutputDeltas = new Map<string, string[]>();
   private pendingFileChangeOutputDeltas = new Map<string, string[]>();
@@ -4557,7 +4559,16 @@ export class CodexAppServerAgentSession implements AgentSession {
       prompt,
       runOptions: options,
       startTurn: (p, o) => this.startTurn(p, o),
-      subscribe: (callback) => this.subscribe(callback),
+      subscribe: (callback) =>
+        this.subscribe((event) => {
+          if (event.type === "assistant_messages_removed") {
+            // The runner replays the retained items through the reducer after a correction.
+            currentAssistantMessageId = null;
+            currentAssistantMessageHasBoundary = false;
+            hasAssistantMessage = false;
+          }
+          callback(event);
+        }),
       getSessionId: async () => (await this.getRuntimeInfo()).sessionId ?? "",
       reduceFinalText: ({ current, item }) => {
         if (item.type === "assistant_message") {
@@ -6527,6 +6538,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     normalizedItemType: string | undefined,
     itemId: string | undefined,
   ): boolean {
+    if (timelineItem.type === "assistant_message" && itemId) {
+      if (this.discardedRootAgentMessageIds.has(itemId)) return true;
+      this.pendingRootAgentMessageIds.delete(itemId);
+    }
     // For commandExecution items, codex/event/exec_command_* is authoritative.
     if (timelineItem.type === "tool_call" && normalizedItemType === "commandExecution") {
       const callId = timelineItem.callId || itemId;
@@ -6555,6 +6570,8 @@ export class CodexAppServerAgentSession implements AgentSession {
         this.emitSubAgentActivityUpdate(subAgentCallId, "running");
         return;
       }
+      this.pendingRootAgentMessageIds.add(parsed.itemId);
+      this.discardedRootAgentMessageIds.delete(parsed.itemId);
       const isFirstDeltaForItem = prev.length === 0;
       this.emitEvent({
         type: "timeline",
@@ -6682,6 +6699,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.terminalProcessIdsByTurnId.delete(this.currentTurnId);
     }
     if (parsed.status === "failed") {
+      this.retractPendingRootAssistantMessages();
       const error = parsed.errorMessage ?? "Codex turn failed";
       this.settleStreamRetry({ status: "failed", error });
       this.emitEvent({ type: "turn_failed", provider: CODEX_PROVIDER, error });
@@ -6712,6 +6730,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private handleTurnErrorNotification(
     parsed: Extract<ParsedCodexNotification, { kind: "turn_error" }>,
   ): void {
+    this.retractPendingRootAssistantMessages();
     // A final error is followed by `turn/completed`, which reports it as the turn's failure.
     if (!parsed.willRetry) {
       return;
@@ -6726,6 +6745,17 @@ export class CodexAppServerAgentSession implements AgentSession {
       provider: CODEX_PROVIDER,
       item: mapCodexStreamRetryToStatusLine(this.activeStreamRetry, { status: "running" }),
     });
+  }
+
+  private retractPendingRootAssistantMessages(): void {
+    const messageIds = [...this.pendingRootAgentMessageIds];
+    if (messageIds.length === 0) return;
+    for (const id of messageIds) {
+      this.pendingAgentMessages.delete(id);
+      this.discardedRootAgentMessageIds.add(id);
+    }
+    this.pendingRootAgentMessageIds.clear();
+    this.emitEvent({ type: "assistant_messages_removed", provider: CODEX_PROVIDER, messageIds });
   }
 
   private handleWarningNotification(
@@ -6764,6 +6794,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.emittedExecCommandStartedCallIds.clear();
     this.emittedExecCommandCompletedCallIds.clear();
     this.pendingAgentMessages.clear();
+    this.pendingRootAgentMessageIds.clear();
+    this.discardedRootAgentMessageIds.clear();
     this.pendingReasoning.clear();
     this.pendingCommandOutputDeltas.clear();
     this.pendingFileChangeOutputDeltas.clear();
@@ -7251,6 +7283,17 @@ export class CodexAppServerAgentSession implements AgentSession {
     timelineItem: Extract<AgentTimelineItem, { type: "assistant_message" | "reasoning" }>,
     streamedText: string,
   ): void {
+    if (
+      timelineItem.type === "assistant_message" &&
+      timelineItem.messageId &&
+      !timelineItem.text.startsWith(streamedText)
+    ) {
+      this.emitEvent({
+        type: "assistant_messages_removed",
+        provider: CODEX_PROVIDER,
+        messageIds: [timelineItem.messageId],
+      });
+    }
     const item = this.buildMissingFinalTextSuffix(timelineItem, streamedText);
     if (item) this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item });
   }
@@ -7306,6 +7349,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     const childSubAgentCallId = this.getSubAgentCallIdForThread(parsed.threadId);
+    this.allowRestartedRootAssistantMessage(parsed.item, childSubAgentCallId);
     if (
       childSubAgentCallId &&
       parsed.threadId &&
@@ -7409,6 +7453,18 @@ export class CodexAppServerAgentSession implements AgentSession {
     const item = clientMessageId ? { ...timelineItem, clientMessageId } : timelineItem;
     this.activeClientMessageId = null;
     this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item });
+  }
+
+  private allowRestartedRootAssistantMessage(
+    item: { id?: string; type?: string },
+    childSubAgentCallId: string | null,
+  ): void {
+    if (
+      !childSubAgentCallId &&
+      item.id &&
+      normalizeCodexThreadItemType(item.type) === "agentMessage"
+    )
+      this.discardedRootAgentMessageIds.delete(item.id);
   }
 
   private warnUnknownNotificationMethod(method: string, params: unknown): void {

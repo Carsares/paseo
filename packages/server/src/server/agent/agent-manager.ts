@@ -597,6 +597,7 @@ function attachManagedTurnIdentity(
       const turnId = agent.activeForegroundTurnId ?? agent.activeTurnId ?? undefined;
       return turnId ? { event: { ...event, turnId }, turnId } : { event, turnId };
     }
+    case "assistant_messages_removed":
     case "timeline": {
       // Live provider items belong to the foreground turn that owns their dispatch.
       // Provider history deliberately keeps absent IDs because it has no daemon turn identity.
@@ -850,6 +851,7 @@ export class AgentManager {
   private readonly idFactory: () => string;
   private readonly registry?: AgentStorage;
   private readonly durableTimelineStore?: AgentTimelineStore;
+  private readonly durableTimelineWriteTails = new Map<string, Promise<void>>();
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
@@ -5092,6 +5094,11 @@ export class AgentManager {
       this.agentStreamCoalescer.flushFor(agent.id);
     }
 
+    if (event.type === "assistant_messages_removed") {
+      await this.removeAssistantMessages(agent.id, event);
+      return false;
+    }
+
     let terminalDisposition: ActiveTurnTerminalDisposition = "untracked";
     if (isTurnTerminalEvent(event)) {
       terminalDisposition = this.applyActiveTurnTerminal(
@@ -5318,6 +5325,26 @@ export class AgentManager {
     if (handle) {
       agent.persistence = normalizePersistenceForConfig(handle, agent.config);
     }
+  }
+
+  private async removeAssistantMessages(
+    agentId: string,
+    event: Extract<AgentStreamEvent, { type: "assistant_messages_removed" }>,
+  ): Promise<void> {
+    const { turnId, messageIds } = event;
+    if (!turnId || messageIds.length === 0) return;
+    const store = this.durableTimelineStore;
+    if (store) {
+      await this.writeDurableTimeline(agentId, () =>
+        store.removeAssistantMessages(agentId, turnId, messageIds),
+      );
+    }
+    if (!this.timelineStore.removeAssistantMessages(agentId, turnId, messageIds)) return;
+    this.dispatch({
+      type: "timeline_replacement",
+      agentId,
+      epoch: this.timelineStore.getEpoch(agentId),
+    });
   }
 
   private async onStreamTimelineEvent(params: {
@@ -5824,12 +5851,15 @@ export class AgentManager {
     if (!this.durableTimelineStore) {
       return;
     }
-    const task = this.durableTimelineStore.bulkInsert(agentId, [row]).catch((err) => {
-      this.logger.error(
-        { err, agentId, seq: row.seq, itemType: row.item.type },
-        "Failed to append timeline row to durable store",
-      );
-    });
+    const store = this.durableTimelineStore;
+    const task = this.writeDurableTimeline(agentId, () => store.bulkInsert(agentId, [row])).catch(
+      (err) => {
+        this.logger.error(
+          { err, agentId, seq: row.seq, itemType: row.item.type },
+          "Failed to append timeline row to durable store",
+        );
+      },
+    );
     this.trackBackgroundTask(task);
   }
 
@@ -5840,24 +5870,45 @@ export class AgentManager {
     if (!this.durableTimelineStore || rows.length === 0) {
       return;
     }
-    const task = this.durableTimelineStore.bulkInsert(agentId, rows).catch((err) => {
-      this.logger.error(
-        { err, agentId, rowCount: rows.length },
-        "Failed to seed durable timeline store",
-      );
-    });
+    const store = this.durableTimelineStore;
+    const task = this.writeDurableTimeline(agentId, () => store.bulkInsert(agentId, rows)).catch(
+      (err) => {
+        this.logger.error(
+          { err, agentId, rowCount: rows.length },
+          "Failed to seed durable timeline store",
+        );
+      },
+    );
     this.trackBackgroundTask(task);
   }
 
   private enqueueDurableTimelineUpdate(agentId: string, row: AgentTimelineRow): void {
     if (!this.durableTimelineStore) return;
-    const task = this.durableTimelineStore.updateCommittedRow(agentId, row).catch((err) => {
+    const store = this.durableTimelineStore;
+    const task = this.writeDurableTimeline(agentId, () =>
+      store.updateCommittedRow(agentId, row),
+    ).catch((err) => {
       this.logger.error(
         { err, agentId, seq: row.seq, itemType: row.item.type },
         "Failed to enrich durable timeline row",
       );
     });
     this.trackBackgroundTask(task);
+  }
+
+  private writeDurableTimeline(agentId: string, write: () => Promise<void>): Promise<void> {
+    // Retractions must follow every buffered append, or a delayed write resurrects failed text.
+    const operation = (this.durableTimelineWriteTails.get(agentId) ?? Promise.resolve()).then(
+      write,
+    );
+    const settled = operation.catch(() => {});
+    this.durableTimelineWriteTails.set(agentId, settled);
+    void settled.then(() => {
+      if (this.durableTimelineWriteTails.get(agentId) === settled)
+        this.durableTimelineWriteTails.delete(agentId);
+      return undefined;
+    });
+    return operation;
   }
 
   private trackBackgroundTask(task: Promise<void>): void {

@@ -179,6 +179,15 @@ class RecordingTimelineStore implements AgentTimelineStore {
     }
   }
 
+  async removeAssistantMessages(
+    agentId: string,
+    turnId: string,
+    messageIds: readonly string[],
+  ): Promise<void> {
+    this.ensure(agentId);
+    this.memory.removeAssistantMessages(agentId, turnId, messageIds);
+  }
+
   async updateCommittedRow(agentId: string, row: AgentTimelineRow): Promise<void> {
     this.ensure(agentId);
     const rows = this.memory.getRows(agentId);
@@ -761,6 +770,86 @@ test("a completed OpenCode model switch does not depend on another session read"
     await manager.closeAgent(agent.id);
     await manager.flush();
     await client.shutdown();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("retracts buffered failed replies after pending durable writes and broadcasts a replacement", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-retraction-"));
+  const releaseWrite = deferred<void>();
+  const writeStarted = deferred<void>();
+  class DelayedTimelineStore extends RecordingTimelineStore {
+    override async bulkInsert(agentId: string, rows: readonly AgentTimelineRow[]): Promise<void> {
+      if (
+        rows.some((row) => row.item.type === "assistant_message" && row.item.messageId === "failed")
+      ) {
+        writeStarted.resolve();
+        await releaseWrite.promise;
+      }
+      await super.bulkInsert(agentId, rows);
+    }
+  }
+  const store = new DelayedTimelineStore();
+  const client = new SessionRecordingAgentClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    durableTimelineStore: store,
+    logger,
+  });
+  const events: AgentManagerEvent[] = [];
+  manager.subscribe((event) => events.push(event), { replayState: false });
+  let agentId: string | undefined;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const session = client.sessions[0];
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId: "retry-turn" });
+    for (const [messageId, text] of [
+      ["progress", "Checking"],
+      ["failed", "Bad"],
+      ["failed", " fragment"],
+    ]) {
+      session.pushEvent({
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", messageId, text },
+      });
+    }
+    session.pushEvent({
+      type: "assistant_messages_removed",
+      provider: "codex",
+      messageIds: ["failed"],
+    });
+    session.pushEvent({
+      type: "timeline",
+      provider: "codex",
+      item: { type: "assistant_message", messageId: "final", text: "Final" },
+    });
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "retry-turn" });
+    await writeStarted.promise;
+    releaseWrite.resolve();
+    await manager.flush();
+    const rows = await manager.getTimelineRows(agent.id);
+    expect(rows.map((row) => row.item)).toEqual([
+      { type: "assistant_message", messageId: "progress", text: "Checking" },
+      { type: "assistant_message", messageId: "final", text: "Final" },
+    ]);
+    expect((await store.getCommittedRows(agent.id)).map((row) => row.item)).toEqual(
+      rows.map((row) => row.item),
+    );
+    expect(events.filter((event) => event.type === "timeline_replacement")).toHaveLength(1);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "agent_stream" && event.event.type === "assistant_messages_removed",
+      ),
+    ).toBe(false);
+  } finally {
+    releaseWrite.resolve();
+    if (agentId) await manager.closeAgent(agentId);
+    await manager.flush();
     rmSync(workdir, { recursive: true, force: true });
   }
 });

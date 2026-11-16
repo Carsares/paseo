@@ -54,6 +54,16 @@ export async function runProviderTurn({
       finalText = reduceFinalText({ current: finalText, item: event.item });
       return;
     }
+    if (event.type === "assistant_messages_removed") {
+      const removedIds = new Set(event.messageIds);
+      for (let index = timeline.length - 1; index >= 0; index--) {
+        const item = timeline[index];
+        if (item.type === "assistant_message" && item.messageId && removedIds.has(item.messageId))
+          timeline.splice(index, 1);
+      }
+      finalText = timeline.reduce((current, item) => reduceFinalText({ current, item }), "");
+      return;
+    }
     if (event.type === "turn_completed") {
       usage = event.usage;
       settled = true;

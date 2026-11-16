@@ -446,6 +446,13 @@ export type AgentStreamEvent =
       turnId?: string;
     }
   | { type: "turn_canceled"; provider: AgentProvider; reason: string; turnId?: string }
+  // Internal provider correction; the manager publishes the existing timeline invalidation.
+  | {
+      type: "assistant_messages_removed";
+      provider: AgentProvider;
+      messageIds: string[];
+      turnId?: string;
+    }
   | {
       type: "timeline";
       item: AgentTimelineItem;
