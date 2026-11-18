@@ -5662,6 +5662,74 @@ describe("Codex app-server provider", () => {
     });
   });
 
+  test("settles legacy wait and close results on the original child cards during replay", async () => {
+    const session = createSession();
+    const childThreadIds = ["finished-child", "closed-child", "active-child"];
+    const items = [
+      ...childThreadIds.map((id) => ({
+        type: "collabAgentToolCall",
+        id: `spawn-${id}`,
+        tool: "spawnAgent",
+        status: "completed",
+        prompt: `Task for ${id}`,
+        receiverThreadIds: [id],
+        agentsStates: { [id]: { status: "pendingInit", message: null } },
+      })),
+      {
+        type: "collabAgentToolCall",
+        id: "wait-for-children",
+        tool: "wait",
+        status: "completed",
+        prompt: null,
+        receiverThreadIds: ["finished-child", "active-child"],
+        agentsStates: {
+          "finished-child": { status: "completed", message: "Done" },
+          "active-child": { status: "running", message: null },
+        },
+      },
+      ...[
+        { id: "closed-child", status: "completed", childStatus: "running" },
+        { id: "finished-child", status: "failed", childStatus: "notFound" },
+      ].map(({ id, status, childStatus }, i) => ({
+        type: "collabAgentToolCall",
+        id: `close-${i}`,
+        tool: "closeAgent",
+        status,
+        prompt: null,
+        receiverThreadIds: [id],
+        agentsStates: { [id]: { status: childStatus, message: null } },
+      })),
+    ];
+    session.client = {
+      request: vi.fn(async (_method: string, params: { threadId: string }) => ({
+        thread: { turns: params.threadId === "test-thread" ? [{ items }] : [] },
+      })),
+    };
+
+    const history = await Array.fromAsync(session.streamHistory());
+    const expected = [
+      { id: "finished-child", status: "completed" },
+      { id: "closed-child", status: "canceled" },
+      { id: "active-child", status: "running" },
+    ];
+    expect(
+      history.flatMap((event) =>
+        event.type === "provider_subagent" && event.event.type === "upsert" ? [event.event] : [],
+      ),
+    ).toMatchObject(expected.map(({ id, status }) => ({ id, status, toolCallId: `spawn-${id}` })));
+    expect(
+      history.flatMap((event) =>
+        event.type === "timeline" && event.item.type === "tool_call" ? [event.item] : [],
+      ),
+    ).toMatchObject(
+      expected.map(({ id, status }) => ({
+        callId: `spawn-${id}`,
+        status,
+        detail: { type: "sub_agent", description: `Task for ${id}` },
+      })),
+    );
+  });
+
   test("restores nested MultiAgentV2 ownership from persisted child threads", async () => {
     const session = createSession();
     session.client = {

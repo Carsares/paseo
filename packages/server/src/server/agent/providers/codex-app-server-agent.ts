@@ -2031,6 +2031,51 @@ function readCodexHistoricalSubAgentThreadIds(item: unknown): string[] {
   );
 }
 
+function resolveHistoricalCollabAgentStatus(
+  currentStatus: ToolCallTimelineItem["status"],
+  childStatus: unknown,
+  closed: boolean,
+): "completed" | "canceled" | undefined {
+  if (childStatus === "completed") return "completed";
+  if (isTerminalSubAgentStatus(currentStatus)) return undefined;
+  if (closed || childStatus === "shutdown") return "canceled";
+  return undefined;
+}
+
+function applyHistoricalCollabAgentResult(
+  item: unknown,
+  timeline: PersistedTimelineEntry[],
+  subAgentTimelineIndexByThreadId: ReadonlyMap<string, number>,
+): void {
+  const record = toObjectRecord(item);
+  if (!record || typeof record.type !== "string") return;
+  if (normalizeCodexThreadItemType(record.type) !== "collabAgentToolCall") return;
+
+  const { tool, status, receiverThreadIds } = record;
+  if (tool !== "wait" && tool !== "closeAgent") return;
+  if (status !== "completed" && (tool !== "wait" || status !== "failed")) return;
+  if (!Array.isArray(receiverThreadIds)) return;
+
+  // Wait and close records have a null prompt. Their outcomes belong to the original launch card.
+  const agentStates = toObjectRecord(record.agentsStates);
+  for (const threadId of receiverThreadIds) {
+    if (typeof threadId !== "string") continue;
+    const index = subAgentTimelineIndexByThreadId.get(threadId);
+    if (index === undefined) continue;
+    const entry = timeline[index];
+    if (entry?.item.type !== "tool_call" || entry.item.detail.type !== "sub_agent") continue;
+
+    const nextStatus = resolveHistoricalCollabAgentStatus(
+      entry.item.status,
+      toObjectRecord(agentStates?.[threadId])?.status,
+      tool === "closeAgent",
+    );
+    if (nextStatus) {
+      timeline[index] = { ...entry, item: { ...entry.item, status: nextStatus, error: null } };
+    }
+  }
+}
+
 function codexImageOutputFromResult(result: unknown): ProviderImageOutput | null {
   if (typeof result === "string") {
     const trimmed = result.trim();
@@ -2208,6 +2253,7 @@ async function projectCodexThreadHistory(
   const { timeline, subAgentTimelineIndexByThreadId } = projection;
   for await (const row of readCodexThreadHistory(params.client, params.threadId)) {
     const { item } = row;
+    applyHistoricalCollabAgentResult(item, timeline, subAgentTimelineIndexByThreadId);
     const historicalSubAgentActivity = readCodexSubAgentActivity(item);
     if (historicalSubAgentActivity) {
       const existingIndex = subAgentTimelineIndexByThreadId.get(
