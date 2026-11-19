@@ -12,6 +12,12 @@ import {
   waitForAgentRunStartWithTimeout,
 } from "./agent/agent-prompt.js";
 import { createToolHosts } from "./agent/host-operations/index.js";
+import type {
+  FinishRegistration,
+  FinishSubscriptions,
+} from "./agent/finish-subscriptions/index.js";
+import { parseAgentMessages } from "./agent/agent-messages/envelope.js";
+import { registerParentFinishSubscription } from "./agent/create-agent/create.js";
 import { HOST_ROUTE_OPCODE } from "@getpaseo/protocol/binary-frames/index";
 import { DaemonLinkEndpoint, VirtualHostSocket } from "./connected-hosts/index.js";
 import { ConnectedHosts } from "./connected-hosts/index.js";
@@ -708,6 +714,7 @@ export class VoiceAssistantWebSocketServer {
     pluginRuntime?: SessionOptions["pluginRuntime"],
     orchestrationSkills?: SessionOptions["orchestrationSkills"],
     workspaceLabelService?: WorkspaceLabelService,
+    private readonly finishSubscriptions?: FinishSubscriptions,
   ) {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
@@ -729,6 +736,20 @@ export class VoiceAssistantWebSocketServer {
     this.agentStorage = agentStorage;
     this.agentMessages = createAgentMessageDelivery({
       dispatch: async (batch) => {
+        // A completion can wake a module lead after its previous turn reported
+        // to Main Control. Watch the new turn so its follow-up also goes upward.
+        const texts =
+          typeof batch.prompt === "string"
+            ? [batch.prompt]
+            : batch.prompt.flatMap((block) => (block.type === "text" ? [block.text] : []));
+        const shouldReportUpward = texts.some((text) =>
+          parseAgentMessages(text)?.some(
+            ({ source }) =>
+              source?.kind === "agent-notification" && source.event !== "permission-required",
+          ),
+        );
+        let registration: FinishRegistration | undefined;
+        let dispatched = false;
         const { disposition } = await sendPreparedPromptToAgent({
           agentManager,
           agentStorage,
@@ -739,8 +760,34 @@ export class VoiceAssistantWebSocketServer {
           clearPendingPermissions: batch.clearPendingPermissions,
           unarchive: batch.unarchive,
           runOptions: { clientMessageId: batch.messageIds[0] },
-          onDispatch: batch.onDispatch,
+          beforeDispatch: shouldReportUpward
+            ? async () => {
+                registration = await registerParentFinishSubscription({
+                  agentId: batch.recipientId,
+                  serverId,
+                  agentManager,
+                  agentStorage,
+                  finishSubscriptions,
+                });
+              }
+            : undefined,
+          onDispatch: (started) => {
+            if (started !== "out_of_band") {
+              dispatched = true;
+              registration?.accept();
+            }
+            batch.onDispatch(started);
+          },
           logger: this.logger,
+        }).finally(async () => {
+          if (!dispatched) {
+            await registration?.reject().catch((error) => {
+              this.logger.warn(
+                { err: error, agentId: batch.recipientId },
+                "Failed to reject parent finish subscription",
+              );
+            });
+          }
         });
         if (disposition === "turn_started")
           await waitForAgentRunStartWithTimeout(agentManager, batch.recipientId);
@@ -1679,6 +1726,7 @@ export class VoiceAssistantWebSocketServer {
       agentStorage: this.agentStorage,
       messageReceipts: this.messageReceipts,
       agentMessages: this.agentMessages,
+      finishSubscriptions: this.finishSubscriptions,
       creationService: this.creationService,
       projectRegistry: this.projectRegistry,
       workspaceRegistry: this.workspaceRegistry,
@@ -2031,6 +2079,8 @@ export class VoiceAssistantWebSocketServer {
         usageSetting: true,
         usageSources: true,
         ownedSubscriptions: true,
+        // COMPAT(agentHierarchyControl): added in v0.16.0, remove gate after 2027-05-19.
+        agentHierarchyControl: true,
         providerOptionControls: true,
         entityMetadata: true,
         diffSubscription: true,

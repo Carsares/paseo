@@ -1,4 +1,4 @@
-import type { FinishSubscriptions } from "../finish-subscriptions/index.js";
+import type { FinishRegistration, FinishSubscriptions } from "../finish-subscriptions/index.js";
 import type { AgentPromptSource } from "../agent-messages/index.js";
 import type { Logger } from "pino";
 
@@ -28,6 +28,14 @@ import {
 } from "./intent.js";
 import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { foldFeatureValues, type LegacyFeatureValues } from "../option-controls.js";
+import {
+  getParentAddressFromLabels,
+  getParentAgentIdFromLabels,
+  MAIN_PRIOR_MODE_ID_LABEL,
+  PARENT_AGENT_ID_LABEL,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
+import { readAgentHierarchyPath, validateCanSpawnChild } from "../hierarchy-policy.js";
 
 /** How a workspace this creation makes inherits its creator's visibility. */
 interface McpWorkspaceIntent {
@@ -57,6 +65,7 @@ export type EnsureWorkspaceForCreate = (
 
 export interface CreateAgentFromSessionInput {
   kind: "session";
+  callerAgentId?: string;
   onAgentReady?: (agent: ManagedAgent) => Promise<void>;
   agentId?: string;
   /** Wire configs from older clients can still carry `featureValues`; they are folded on entry. */
@@ -134,6 +143,33 @@ export type BoundCreateAgentCommand = (
   input: CreateAgentCommandInput,
 ) => Promise<CreateAgentCommandResult>;
 
+export async function registerParentFinishSubscription({
+  agentId,
+  serverId,
+  agentManager,
+  agentStorage,
+  finishSubscriptions,
+}: {
+  agentId: string;
+  serverId?: string;
+  agentManager: Pick<AgentManager, "getAgent">;
+  agentStorage: Pick<AgentStorage, "get">;
+  finishSubscriptions?: FinishSubscriptions;
+}): Promise<FinishRegistration | undefined> {
+  if (!finishSubscriptions) return;
+  const agent = agentManager.getAgent(agentId) ?? (await agentStorage.get(agentId));
+  const parentId = getParentAgentIdFromLabels(agent?.labels);
+  if (!parentId || parentId === agentId) return;
+  if (serverId && getParentAddressFromLabels(agent?.labels, serverId)?.serverId !== serverId)
+    return;
+  const storedParent = await agentStorage.get(parentId);
+  if (storedParent ? storedParent.archivedAt : !agentManager.getAgent(parentId)) return;
+  return finishSubscriptions.register(
+    { childAgentId: agentId, callerAgentId: parentId, requireParentOwnership: true },
+    true,
+  );
+}
+
 function requireResolvedWorkspaceId(workspaceId: string | undefined): string {
   if (!workspaceId) {
     throw new Error("createAgentCommand requires a resolved workspaceId");
@@ -174,11 +210,16 @@ export async function createAgentCommand(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentCommandInput,
 ): Promise<CreateAgentCommandResult> {
+  if (input.callerAgentId) await validateCreateCaller(dependencies, input.callerAgentId);
   const resolved =
     input.kind === "session"
       ? await resolveSessionCreateAgent(dependencies, input)
       : await resolveMcpCreateAgent(dependencies, input);
 
+  if (resolved.createOptions.labels) {
+    delete resolved.createOptions.labels[WORKSPACE_ROLE_LABEL];
+    delete resolved.createOptions.labels[MAIN_PRIOR_MODE_ID_LABEL];
+  }
   const snapshot = await dependencies.agentManager.createAgent(
     resolved.config,
     input.kind === "session" ? input.agentId : undefined,
@@ -193,29 +234,24 @@ export async function createAgentCommand(
   if (input.kind === "mcp") {
     input.onCreated?.({ agentId: snapshot.id, createdWorktree: resolved.createdWorktree ?? null });
   }
-  const notification =
-    input.kind === "mcp" &&
-    input.notifyOnFinish &&
-    input.callerAgentId &&
-    resolved.prompt !== undefined
-      ? await requireFinishSubscriptions(dependencies).register(
-          {
-            childAgentId: snapshot.id,
-            callerAgentId: input.callerAgentId,
-            requireParentOwnership: !(input.detached ?? false),
-          },
-          true,
-        )
-      : undefined;
-
   if (resolved.prompt !== undefined) {
+    const notification = await registerInitialPromptFinish(dependencies, input, snapshot.id);
+    const rejectNotification = async () => {
+      await notification?.reject().catch((rejectError) => {
+        dependencies.logger.warn(
+          { err: rejectError, agentId: snapshot.id },
+          "Failed to remove rejected finish subscription",
+        );
+      });
+    };
     const sendResult = await sendInitialPrompt(dependencies, resolved, snapshot).catch(
       async (error) => {
-        await notification?.reject();
+        await rejectNotification();
         throw error;
       },
     );
-    notification?.accept();
+    if (sendResult.started) notification?.accept();
+    else await rejectNotification();
     initialPromptStarted = sendResult.started;
     liveSnapshot = sendResult.liveSnapshot;
     initialPromptError = sendResult.error ?? null;
@@ -228,6 +264,39 @@ export async function createAgentCommand(
     initialPromptError,
     ...(resolved.createdWorktree ? { createdWorktree: resolved.createdWorktree } : {}),
   };
+}
+
+async function validateCreateCaller(
+  dependencies: CreateAgentCommandDependencies,
+  callerAgentId: string,
+): Promise<void> {
+  const path = await readAgentHierarchyPath(callerAgentId, async (id) => {
+    const stored = await dependencies.agentStorage.get(id);
+    return stored?.archivedAt ? stored : (dependencies.agentManager.getAgent(id) ?? stored);
+  });
+  const parent = path.get(callerAgentId);
+  if (!parent) throw new Error(`Parent agent ${callerAgentId} not found`);
+  validateCanSpawnChild(parent, (id) => path.get(id));
+}
+
+function registerInitialPromptFinish(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentCommandInput,
+  childAgentId: string,
+): Promise<FinishRegistration> | undefined {
+  if (!input.callerAgentId || (input.kind === "mcp" && !input.notifyOnFinish)) return;
+  const subscriptions =
+    input.kind === "mcp"
+      ? requireFinishSubscriptions(dependencies)
+      : dependencies.finishSubscriptions;
+  return subscriptions?.register(
+    {
+      childAgentId,
+      callerAgentId: input.callerAgentId,
+      requireParentOwnership: input.kind === "session" || !input.detached,
+    },
+    true,
+  );
 }
 
 async function resolveSessionCreateAgent(
@@ -264,7 +333,10 @@ async function resolveSessionCreateAgent(
   return {
     config: sessionConfig,
     createOptions: {
-      labels: input.labels,
+      labels: {
+        ...input.labels,
+        ...(input.callerAgentId ? { [PARENT_AGENT_ID_LABEL]: input.callerAgentId } : {}),
+      },
       metadata: input.metadata,
       initialPrompt: trimmedPrompt,
       env: input.env,

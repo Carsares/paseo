@@ -1,8 +1,8 @@
 import { workspaceTabSwitcherPopoverLayout } from "../workspace-tab-layout";
-import { memo, useCallback, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useContext, useMemo, useRef, useState } from "react";
 import { Keyboard, Pressable, Text, View } from "react-native";
 import { useTranslation } from "react-i18next";
-import { SquarePen, SquareTerminal } from "lucide-react-native";
+import { Crown, SquarePen, SquareTerminal } from "lucide-react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { Button } from "@/components/ui/button";
 import { Combobox, type ComboboxOption } from "@/components/ui/combobox";
@@ -16,6 +16,9 @@ import { useFilePanelOpenWithMenu } from "@/file-panels";
 import { MobileTabTrailingAccessory } from "@/screens/workspace/workspace-tab-trailing-accessory";
 import {
   buildWorkspaceTabMenuEntries,
+  getWorkspaceTabHierarchyLabels,
+  isWorkspaceMainTab,
+  WorkspaceMainTabContext,
   type WorkspaceTabMenuLabels,
 } from "@/screens/workspace/workspace-tab-menu";
 import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-types";
@@ -26,6 +29,13 @@ import {
 
 // The trigger draws at 32pt beside its island neighbours, so only vertical slop is free.
 const TAB_SWITCHER_TRIGGER_HIT_SLOP = { top: 8, bottom: 8 } as const;
+
+function withMainTabBadge(
+  presentation: WorkspaceTabPresentation,
+  badge: string,
+): WorkspaceTabPresentation {
+  return { ...presentation, icon: Crown, label: `${presentation.label} [${badge}]` };
+}
 
 function getFallbackTabOptionLabel(
   tab: WorkspaceTabDescriptor,
@@ -153,6 +163,7 @@ function MobileWorkspaceTabOption({
   tab,
   tabIndex,
   tabCount,
+  mainTabIndex,
   normalizedServerId,
   normalizedWorkspaceId,
   selected,
@@ -172,6 +183,7 @@ function MobileWorkspaceTabOption({
   tab: WorkspaceTabDescriptor;
   tabIndex: number;
   tabCount: number;
+  mainTabIndex: number;
   normalizedServerId: string;
   normalizedWorkspaceId: string;
   selected: boolean;
@@ -188,7 +200,13 @@ function MobileWorkspaceTabOption({
   onCloseTabsBelow: (tabId: string) => Promise<void> | void;
   onCloseOtherTabs: (tabId: string) => Promise<void> | void;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const mainTab = useContext(WorkspaceMainTabContext);
+  const isMain = isWorkspaceMainTab(tab, mainTab?.mainAgentId);
+  const hierarchyLabels = useMemo(
+    () => getWorkspaceTabHierarchyLabels(i18n.language),
+    [i18n.language],
+  );
   const tabMenuLabels = useMemo<WorkspaceTabMenuLabels>(
     () => ({
       copyResumeCommand: t("workspace.tabs.menu.copyResumeCommand"),
@@ -229,6 +247,9 @@ function MobileWorkspaceTabOption({
         tab,
         index: tabIndex,
         tabCount,
+        mainTabIndex,
+        hierarchyActions: mainTab?.actionsForTab(tab),
+        hierarchyLabels,
         menuTestIDBase,
         onCopyResumeCommand,
         onCopyAgentId,
@@ -246,6 +267,9 @@ function MobileWorkspaceTabOption({
     [
       canMoveAgentToWorkspace,
       handleMoveAgentToWorkspace,
+      hierarchyLabels,
+      mainTab,
+      mainTabIndex,
       menuTestIDBase,
       onCloseOtherTabs,
       onCloseTab,
@@ -298,14 +322,14 @@ function MobileWorkspaceTabOption({
   const renderPresentation = useCallback(
     (presentation: WorkspaceTabPresentation) => (
       <WorkspaceTabOptionRow
-        presentation={presentation}
+        presentation={isMain ? withMainTabBadge(presentation, hierarchyLabels.badge) : presentation}
         selected={selected}
         active={active}
         onPress={onPress}
         trailingAccessory={trailingAccessory}
       />
     ),
-    [selected, active, onPress, trailingAccessory],
+    [selected, active, onPress, trailingAccessory, isMain, hierarchyLabels.badge],
   );
 
   return (
@@ -341,6 +365,8 @@ export const MobileWorkspaceTabSwitcher = memo(function MobileWorkspaceTabSwitch
   onCloseOtherTabs,
 }: MobileWorkspaceTabSwitcherProps) {
   const { t } = useTranslation();
+  const mainAgentId = useContext(WorkspaceMainTabContext)?.mainAgentId;
+  const mainTabIndex = tabs.findIndex((tab) => isWorkspaceMainTab(tab, mainAgentId));
   const tabFallbackLabels = useMemo(
     () => ({
       newTab: t("workspace.tabs.actions.newTab"),
@@ -446,6 +472,7 @@ export const MobileWorkspaceTabSwitcher = memo(function MobileWorkspaceTabSwitch
           tab={tab}
           tabIndex={tabIndex}
           tabCount={tabs.length}
+          mainTabIndex={mainTabIndex}
           normalizedServerId={normalizedServerId}
           normalizedWorkspaceId={normalizedWorkspaceId}
           selected={selected}
@@ -468,6 +495,7 @@ export const MobileWorkspaceTabSwitcher = memo(function MobileWorkspaceTabSwitch
       tabByKey,
       tabIndexByKey,
       tabs.length,
+      mainTabIndex,
       normalizedServerId,
       normalizedWorkspaceId,
       onCopyResumeCommand,

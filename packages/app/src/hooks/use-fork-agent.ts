@@ -4,11 +4,13 @@ import type {
   AgentForkContextOptions,
   DaemonClient,
 } from "@getpaseo/client/internal/daemon-client";
+import { isMainControlAgent, type AgentLabelSource } from "@getpaseo/protocol/agent-labels";
 import type { WorkspaceComposerAttachment } from "@/attachments/types";
 import type { AssistantForkTarget } from "@/components/assistant-fork-menu";
 import type { ToastApi } from "@/components/toast-host";
 import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
 import { useStableEvent } from "@/hooks/use-stable-event";
+import { useSettings, type OpenInSidePanePreferences } from "@/hooks/use-settings";
 import { useHostFeature } from "@/runtime/host-features";
 import { generateDraftId } from "@/stores/draft-keys";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
@@ -20,7 +22,12 @@ import {
 import { useWorkspaceDraftSubmissionStore } from "@/stores/workspace-draft-submission-store";
 import { toErrorMessage } from "@/utils/error-messages";
 import { buildNewWorkspaceRoute } from "@/utils/host-routes";
-import type { WorkspaceDraftTabSetup, WorkspaceTabTarget } from "@/workspace-tabs/model";
+import {
+  buildWorkspaceTabPersistenceKey,
+  type WorkspaceDraftTabSetup,
+  type WorkspaceTabTarget,
+} from "@/workspace-tabs/model";
+import { openPreferredWorkspaceTarget } from "@/workspace-tabs/open-beside";
 
 /**
  * The subset of an agent record that a fork needs in order to seed the new
@@ -53,8 +60,9 @@ export type ForkAgentBoundary = Pick<
 
 export interface ForkAgentRequest {
   agentId: string;
-  agent: ForkAgentSource;
+  agent: ForkAgentSource & AgentLabelSource;
   workspaceId?: string;
+  parentTabId?: string;
   target: AssistantForkTarget;
   boundary?: ForkAgentBoundary;
 }
@@ -119,11 +127,127 @@ function buildForkDraftSetup(agent: ForkAgentSource): WorkspaceDraftTabSetup | u
   };
 }
 
+const MAIN_CONTROL_CLAUDE_DISALLOWED_TOOLS = new Set([
+  "Edit",
+  "MultiEdit",
+  "Write",
+  "NotebookEdit",
+  "Bash",
+]);
+
+function stripMainControlReadOnlyProviderOptions(
+  providerOptions: Record<string, unknown>,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...providerOptions };
+  if (next.sandbox_mode === "read-only") {
+    delete next.sandbox_mode;
+  }
+  if (next.approval_policy === "never") {
+    delete next.approval_policy;
+  }
+  if (Array.isArray(next.disallowedTools)) {
+    const remaining = next.disallowedTools.filter(
+      (tool) => typeof tool !== "string" || !MAIN_CONTROL_CLAUDE_DISALLOWED_TOOLS.has(tool),
+    );
+    if (remaining.length > 0) {
+      next.disallowedTools = remaining;
+    } else {
+      delete next.disallowedTools;
+    }
+  }
+  return next;
+}
+
+export function buildSubagentDraftSetup(
+  agent: ForkAgentSource & AgentLabelSource,
+  parentAgentId: string,
+): WorkspaceDraftTabSetup | undefined {
+  const normalizedParentId = parentAgentId.trim();
+  if (!normalizedParentId) return undefined;
+  const setup = buildForkDraftSetup(agent);
+  if (!setup) return undefined;
+  const fromMainControl = isMainControlAgent(agent);
+  return {
+    ...setup,
+    parentAgentId: normalizedParentId,
+    modeId: fromMainControl && setup.modeId === "read-only" ? null : setup.modeId,
+    providerOptions: fromMainControl
+      ? stripMainControlReadOnlyProviderOptions(setup.providerOptions)
+      : setup.providerOptions,
+  };
+}
+
 function buildForkDraftTabTarget(
   setup: WorkspaceDraftTabSetup | undefined,
   draftId: string,
 ): WorkspaceTabTarget {
   return setup ? { kind: "draft", draftId, setup } : { kind: "draft", draftId };
+}
+
+function openForkDraftInWorkspace(input: {
+  serverId: string;
+  workspaceId: string;
+  draftTarget: WorkspaceTabTarget;
+  parentTabId?: string;
+  target: "tab" | "subagent";
+  preferences: OpenInSidePanePreferences;
+}) {
+  const { serverId, workspaceId, draftTarget, parentTabId, target, preferences } = input;
+  if (target === "subagent") {
+    const tabId = openPreferredWorkspaceTarget({
+      workspaceKey: buildWorkspaceTabPersistenceKey({ serverId, workspaceId }),
+      target: draftTarget,
+      source: "subagents",
+      preferences,
+      parentTabId,
+    });
+    if (tabId) return;
+  }
+  navigateToWorkspace({ serverId, workspaceId, target: draftTarget });
+}
+
+function resolveForkDraftSetup(input: {
+  target: AssistantForkTarget;
+  agent: ForkAgentSource & AgentLabelSource;
+  agentId: string;
+  unavailableMessage: string;
+}): WorkspaceDraftTabSetup | undefined {
+  if (input.target !== "subagent") {
+    return buildForkDraftSetup(input.agent);
+  }
+  const setup = buildSubagentDraftSetup(input.agent, input.agentId);
+  if (!setup) {
+    throw new Error(input.unavailableMessage);
+  }
+  return setup;
+}
+
+function openForkDraftInNewWorkspace(input: {
+  router: ReturnType<typeof useRouter>;
+  serverId: string;
+  draftId: string;
+  agent: ForkAgentSource;
+  draftSetup: WorkspaceDraftTabSetup | undefined;
+}) {
+  const { router, serverId, draftId, agent, draftSetup } = input;
+  const sourceDirectory =
+    agent.projectPlacement?.checkout?.cwd?.trim() || agent.cwd.trim() || undefined;
+  if (draftSetup) {
+    useWorkspaceDraftSubmissionStore.getState().setDraftSetup({
+      draftId,
+      setup: draftSetup,
+      sourceDirectory,
+    });
+  }
+  router.push(
+    buildNewWorkspaceRoute({
+      serverId,
+      sourceDirectory,
+      displayName: agent.projectPlacement?.projectName,
+      projectId: agent.projectPlacement?.projectKey,
+      draftId,
+    }),
+  );
 }
 
 /**
@@ -140,17 +264,26 @@ export function useForkAgent(
   const router = useRouter();
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
   const supportsAgentForkContext = useHostFeature(serverId, "agentForkContext") && !readOnly;
+  const supportsAgentHierarchyControl = useHostFeature(serverId, "agentHierarchyControl");
+  const openInSidePane = useSettings((settings) => settings.openInSidePane);
 
-  return useStableEvent(async ({ agentId, agent, workspaceId, target, boundary }) => {
+  return useStableEvent(async ({ agentId, agent, workspaceId, parentTabId, target, boundary }) => {
     try {
-      if (!supportsAgentForkContext) {
+      const canForkTarget =
+        supportsAgentForkContext && (target !== "subagent" || supportsAgentHierarchyControl);
+      if (!canForkTarget) {
         toast?.error(t("message.actions.forkUnavailable"));
         return;
       }
       if (!client) {
         throw new Error(t("workspace.terminal.hostDisconnected"));
       }
-      const draftSetup = buildForkDraftSetup(agent);
+      const draftSetup = resolveForkDraftSetup({
+        target,
+        agent,
+        agentId,
+        unavailableMessage: t("message.actions.forkUnavailable"),
+      });
       const prepareForkDraft = async () => {
         const draftId = generateDraftId();
         const payload = await client.buildAgentForkContext(agentId, boundary);
@@ -168,38 +301,24 @@ export function useForkAgent(
         return draftId;
       };
 
-      if (target === "tab") {
+      if (target !== "workspace") {
         if (!workspaceId) {
           throw new Error(t("message.actions.forkMissingWorkspace"));
         }
         const draftId = await prepareForkDraft();
-        navigateToWorkspace({
+        openForkDraftInWorkspace({
           serverId,
           workspaceId,
-          target: buildForkDraftTabTarget(draftSetup, draftId),
+          draftTarget: buildForkDraftTabTarget(draftSetup, draftId),
+          parentTabId,
+          target,
+          preferences: openInSidePane,
         });
         return;
       }
 
       const draftId = await prepareForkDraft();
-      const sourceDirectory =
-        agent.projectPlacement?.checkout?.cwd?.trim() || agent.cwd.trim() || undefined;
-      if (draftSetup) {
-        useWorkspaceDraftSubmissionStore.getState().setDraftSetup({
-          draftId,
-          setup: draftSetup,
-          sourceDirectory,
-        });
-      }
-      router.push(
-        buildNewWorkspaceRoute({
-          serverId,
-          sourceDirectory,
-          displayName: agent.projectPlacement?.projectName,
-          projectId: agent.projectPlacement?.projectKey,
-          draftId,
-        }),
-      );
+      openForkDraftInNewWorkspace({ router, serverId, draftId, agent, draftSetup });
     } catch (error) {
       toast?.error(toErrorMessage(error) || t("message.actions.forkFailed"));
     }

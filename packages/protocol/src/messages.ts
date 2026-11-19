@@ -2279,6 +2279,43 @@ export const AgentMoveToWorkspaceResponseMessageSchema = z.object({
   }),
 });
 
+export const AgentSetMainRequestMessageSchema = z.object({
+  type: z.literal("agent.set_main.request"),
+  agentId: z.string(),
+  enabled: z.boolean(),
+  requestId: z.string(),
+});
+
+export const AgentSetMainResponseMessageSchema = z.object({
+  type: z.literal("agent.set_main.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    accepted: z.boolean(),
+    enabled: z.boolean(),
+    workspaceId: z.string().nullable(),
+    error: z.string().nullable(),
+  }),
+});
+
+export const AgentSetParentRequestMessageSchema = z.object({
+  type: z.literal("agent.set_parent.request"),
+  agentId: z.string(),
+  parentAgentId: z.string(),
+  requestId: z.string(),
+});
+
+export const AgentSetParentResponseMessageSchema = z.object({
+  type: z.literal("agent.set_parent.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    parentAgentId: z.string().nullable(),
+    accepted: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const AgentRewindModeSchema = z.enum(["conversation", "files", "both"]);
 
 export const AgentRewindRequestMessageSchema = z.object({
@@ -3686,6 +3723,8 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   AgentConfigApplyRequestMessageSchema,
   AgentDetachRequestMessageSchema,
   AgentMoveToWorkspaceRequestMessageSchema,
+  AgentSetMainRequestMessageSchema,
+  AgentSetParentRequestMessageSchema,
   AgentRewindRequestMessageSchema,
   AgentPermissionResponseMessageSchema,
   DiffSubscribeRequestSchema,
@@ -4101,6 +4140,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentDetach: z.boolean().optional(),
         // COMPAT(agentMoveToWorkspace): added in v0.16.0, remove gate after 2027-05-19.
         agentMoveToWorkspace: z.boolean().optional(),
+        // COMPAT(agentHierarchyControl): added in v0.16.0, remove gate after 2027-05-19.
+        agentHierarchyControl: z.boolean().optional(),
         // COMPAT(agentThinkingUpdate): added in v0.2.4, remove gate after 2027-01-28.
         agentThinkingUpdate: z.boolean().optional(),
         // COMPAT(daemonDiagnostics): added in v0.1.100, remove gate after 2026-12-25 once daemon floor >= v0.1.100.
@@ -7616,6 +7657,8 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentConfigApplyResponseMessageSchema,
   AgentDetachResponseMessageSchema,
   AgentMoveToWorkspaceResponseMessageSchema,
+  AgentSetMainResponseMessageSchema,
+  AgentSetParentResponseMessageSchema,
   AgentRewindResponseMessageSchema,
   UpdateAgentResponseMessageSchema,
   ProjectRenameResponseSchema,
@@ -7829,6 +7872,8 @@ export type AgentDetachResponseMessage = z.infer<typeof AgentDetachResponseMessa
 export type AgentMoveToWorkspaceResponseMessage = z.infer<
   typeof AgentMoveToWorkspaceResponseMessageSchema
 >;
+export type AgentSetMainResponseMessage = z.infer<typeof AgentSetMainResponseMessageSchema>;
+export type AgentSetParentResponseMessage = z.infer<typeof AgentSetParentResponseMessageSchema>;
 export type AgentRewindResponseMessage = z.infer<typeof AgentRewindResponseMessageSchema>;
 export type UpdateAgentResponseMessage = z.infer<typeof UpdateAgentResponseMessageSchema>;
 export type ProjectRenameResponse = z.infer<typeof ProjectRenameResponseSchema>;
@@ -8017,6 +8062,8 @@ export type AgentDetachRequestMessage = z.infer<typeof AgentDetachRequestMessage
 export type AgentMoveToWorkspaceRequestMessage = z.infer<
   typeof AgentMoveToWorkspaceRequestMessageSchema
 >;
+export type AgentSetMainRequestMessage = z.infer<typeof AgentSetMainRequestMessageSchema>;
+export type AgentSetParentRequestMessage = z.infer<typeof AgentSetParentRequestMessageSchema>;
 export type AgentPermissionResponseMessage = z.infer<typeof AgentPermissionResponseMessageSchema>;
 export type CheckoutStatusRequest = z.infer<typeof CheckoutStatusRequestSchema>;
 export type CheckoutStatusResponse = z.infer<typeof CheckoutStatusResponseSchema>;

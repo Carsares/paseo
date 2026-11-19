@@ -6316,6 +6316,129 @@ describe("moving an agent to a workspace", () => {
   );
 });
 
+describe("agent hierarchy control", () => {
+  async function connectHierarchyClient() {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "clsk_unit_test",
+      logger: createMockLogger(),
+      reconnect: { enabled: false },
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    mock.triggerOpen({ features: { agentHierarchyControl: true } });
+    await connecting;
+    return { client, mock };
+  }
+
+  test.each([
+    { accepted: true, enabled: true, workspaceId: "ws-1", error: null, expectedError: null },
+    { accepted: true, enabled: false, workspaceId: null, error: null, expectedError: null },
+    {
+      accepted: false,
+      enabled: false,
+      workspaceId: null,
+      error: "Main control already assigned",
+      expectedError: "Main control already assigned",
+    },
+    {
+      accepted: false,
+      enabled: false,
+      workspaceId: null,
+      error: null,
+      expectedError: "setAgentMainControl rejected",
+    },
+  ])(
+    "sets main control with accepted=$accepted, enabled=$enabled, error=$error",
+    async ({ accepted, enabled, workspaceId, error, expectedError }) => {
+      const { client, mock } = await connectHierarchyClient();
+      const requestedEnabled = !accepted || enabled;
+      const result = client.setAgentMainControl("agent-1", requestedEnabled);
+
+      expect(mock.sent).toHaveLength(1);
+      const request = parseSentFrame(mock.sent[0]);
+      expect(request).toEqual({
+        type: "agent.set_main.request",
+        agentId: "agent-1",
+        enabled: requestedEnabled,
+        requestId: expect.any(String),
+      });
+
+      mock.triggerMessage(
+        wrapSessionMessage({
+          type: "agent.set_main.response",
+          payload: {
+            requestId: request.requestId,
+            agentId: "agent-1",
+            accepted,
+            enabled,
+            workspaceId,
+            error,
+          },
+        }),
+      );
+
+      if (expectedError === null) {
+        await expect(result).resolves.toEqual({ enabled, workspaceId });
+      } else {
+        await expect(result).rejects.toThrow(expectedError);
+      }
+    },
+  );
+
+  test.each([
+    { accepted: true, parentAgentId: "parent-agent", error: null, expectedError: null },
+    {
+      accepted: false,
+      parentAgentId: "old-parent",
+      error: "Parent unavailable",
+      expectedError: "Parent unavailable",
+    },
+    {
+      accepted: true,
+      parentAgentId: null,
+      error: null,
+      expectedError: "setAgentParent rejected",
+    },
+  ])(
+    "sets the parent with accepted=$accepted and parentAgentId=$parentAgentId",
+    async ({ accepted, parentAgentId, error, expectedError }) => {
+      const { client, mock } = await connectHierarchyClient();
+      const result = client.setAgentParent("agent-1", "parent-agent");
+
+      expect(mock.sent).toHaveLength(1);
+      const request = parseSentFrame(mock.sent[0]);
+      expect(request).toEqual({
+        type: "agent.set_parent.request",
+        agentId: "agent-1",
+        parentAgentId: "parent-agent",
+        requestId: expect.any(String),
+      });
+
+      mock.triggerMessage(
+        wrapSessionMessage({
+          type: "agent.set_parent.response",
+          payload: {
+            requestId: request.requestId,
+            agentId: "agent-1",
+            accepted,
+            parentAgentId,
+            error,
+          },
+        }),
+      );
+
+      if (expectedError === null) {
+        await expect(result).resolves.toEqual({ parentAgentId });
+      } else {
+        await expect(result).rejects.toThrow(expectedError);
+      }
+    },
+  );
+});
+
 test("sends active-scoped fetch_agents_request", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

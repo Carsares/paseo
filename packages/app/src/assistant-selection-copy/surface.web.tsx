@@ -1,25 +1,16 @@
-import {
-  useCallback,
-  useRef,
-  type ClipboardEvent,
-  type CSSProperties,
-  type ReactNode,
-} from "react";
-import { View, type StyleProp, type ViewStyle } from "react-native";
+import { useCallback, useRef, type ClipboardEvent, type CSSProperties } from "react";
+import { View } from "react-native";
 import { createAssistantSelectionClipboardContent } from "./content.web";
 import { useComposerQuote } from "./composer-quote";
 import { AssistantSelectionQuote } from "./quote.web";
-
-interface AssistantSelectionCopySurfaceProps {
-  children: ReactNode;
-  style?: StyleProp<ViewStyle>;
-}
+import type { AssistantSelectionCopySurfaceProps } from "./surface";
 
 const DISPLAY_CONTENTS: CSSProperties = { display: "contents" };
 
 export function AssistantSelectionCopySurface({
   children,
   style,
+  onSpawnSubagentFromSelection,
 }: AssistantSelectionCopySurfaceProps) {
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const composerQuote = useComposerQuote();
@@ -37,8 +28,12 @@ export function AssistantSelectionCopySurface({
   return (
     <div ref={surfaceRef} onCopy={handleCopy} style={DISPLAY_CONTENTS}>
       <View style={style}>{children}</View>
-      {composerQuote ? (
-        <AssistantSelectionQuote streamRef={surfaceRef} onQuote={composerQuote.addQuote} />
+      {composerQuote || onSpawnSubagentFromSelection ? (
+        <AssistantSelectionQuote
+          streamRef={surfaceRef}
+          onQuote={composerQuote?.addQuote}
+          onSpawnSubagentFromSelection={onSpawnSubagentFromSelection}
+        />
       ) : null}
     </div>
   );

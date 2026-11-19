@@ -16,11 +16,17 @@ import {
   type AgentLifecycleStatus,
 } from "@getpaseo/protocol/agent-lifecycle";
 import {
+  getMainPriorModeIdFromLabels,
   getParentAgentIdFromLabels,
   hasOpenAgentTab,
   isDelegatedAgent,
+  isMainControlAgentLabels,
   isOpenAgentTabLabel,
+  MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
+  PARENT_SERVER_ID_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import type { Logger } from "pino";
 import type { ToolPolicy } from "@getpaseo/protocol/agent-types";
@@ -106,7 +112,18 @@ import {
 } from "./runtime-mcp-config.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import type { PaseoToolCatalogFactory } from "./tools/types.js";
-import { isPaseoToolPolicyEnabled } from "./paseo-tool-policy.js";
+import { isPaseoToolPolicyEnabled, resolveAgentPaseoToolPolicy } from "./paseo-tool-policy.js";
+import {
+  applyMainControlReadOnlyConfig,
+  buildHierarchyAppendSystemPrompt,
+  computeAgentDepth,
+  type HierarchyAgent,
+  isMainControlWritePermissionBlocked,
+  MAIN_CONTROL_WRITE_DENIAL,
+  REMOTE_HIERARCHY_DEPTH_LABEL,
+  validateCanSpawnChild,
+  validateSetAgentParent,
+} from "./hierarchy-policy.js";
 import {
   ProviderSubagentStore,
   type ProviderSubagentDescriptor,
@@ -220,6 +237,24 @@ interface NormalizeConfigOptions {
   env?: Record<string, string>;
   /** Defaults to interactive. A history load reads persisted state and runs nothing. */
   purpose?: AgentResumePurpose;
+}
+
+interface PrepareSessionConfigOptions extends NormalizeConfigOptions {
+  labels?: Record<string, string>;
+}
+
+interface AgentRelationshipUpdate {
+  record: StoredAgentRecord;
+  live: boolean;
+}
+
+interface AgentParentUpdate extends AgentRelationshipUpdate {
+  previousParentAgentId: string | null;
+  wasRunning: boolean;
+}
+
+interface WorkspaceHierarchyAgent extends HierarchyAgent {
+  workspaceId?: string;
 }
 
 interface TimeoutOptions {
@@ -947,6 +982,7 @@ export class AgentManager {
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private readonly paseoToolPolicies = new Map<string, ProviderPaseoToolsPolicy | undefined>();
+  private hierarchyMutationTail = Promise.resolve();
   private readonly resolvePaseoToolPolicy: (
     provider: AgentProvider,
   ) => ProviderPaseoToolsPolicy | undefined;
@@ -1124,6 +1160,45 @@ export class AgentManager {
 
   getPaseoToolPolicy(agentId: string): ProviderPaseoToolsPolicy | undefined {
     return this.paseoToolPolicies.get(agentId);
+  }
+
+  private async readHierarchyAgents() {
+    const records = (await this.registry?.listActive()) ?? [];
+    const agents = new Map<string, WorkspaceHierarchyAgent>(
+      records.map((record) => [record.id, { ...record, lifecycle: record.lastStatus }]),
+    );
+    for (const agent of this.agents.values()) {
+      if (agent.internal) continue;
+      const record = agents.get(agent.id);
+      if (!record && agent.session && this.historySessions.has(agent.session)) continue;
+      agents.set(agent.id, {
+        id: agent.id,
+        workspaceId: agent.workspaceId,
+        labels: agent.labels,
+        title: record?.title ?? agent.config.title,
+        lifecycle: agent.lifecycle,
+      });
+    }
+    return agents;
+  }
+
+  private basePaseoToolPolicy(provider: AgentProvider): ProviderPaseoToolsPolicy | undefined {
+    return this.paseoToolsEnabled ? this.resolvePaseoToolPolicy(provider) : { enabled: false };
+  }
+
+  private refreshHierarchyToolPolicies(
+    hierarchy: Awaited<ReturnType<AgentManager["readHierarchyAgents"]>>,
+  ): void {
+    for (const agent of this.agents.values()) {
+      this.paseoToolPolicies.set(
+        agent.id,
+        resolveAgentPaseoToolPolicy(
+          this.basePaseoToolPolicy(agent.provider),
+          agent,
+          computeAgentDepth(agent.id, (id) => hierarchy.get(id)),
+        ),
+      );
+    }
   }
 
   /**
@@ -1559,10 +1634,21 @@ export class AgentManager {
     options: CreateAgentOptions,
   ): Promise<ManagedAgent> {
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
-    return this.trackAgentRegistrationOperation(
+    const createInLifecycleLane = () =>
       this.runLifecycleMutation(resolvedAgentId, () =>
         this.createAgentInternal(config, resolvedAgentId, options),
-      ),
+      );
+    const parentId = getParentAgentIdFromLabels(options.labels);
+    return this.trackAgentRegistrationOperation(
+      parentId
+        ? this.runHierarchyMutation(async () => {
+            const hierarchy = await this.readHierarchyAgents();
+            const parent = hierarchy.get(parentId) ?? (await this.registry?.get(parentId));
+            // A connected host can supply a parent address that is absent from local storage.
+            if (parent) validateCanSpawnChild(parent, (id) => hierarchy.get(id));
+            return createInLifecycleLane();
+          })
+        : createInLifecycleLane(),
     );
   }
 
@@ -1627,7 +1713,7 @@ export class AgentManager {
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       config,
       resolvedAgentId,
-      { env: options?.env },
+      { env: options.env, labels: options.labels },
     );
     this.requireEnabledProvider(storedConfig.provider);
     const client = await this.requireAvailableClient({
@@ -1652,7 +1738,10 @@ export class AgentManager {
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     const createOptions = this.buildCreateSessionOptions(options);
-    const launchedOptions = this.launchOptionsFor({ client, own: storedConfig.providerOptions });
+    const launchedOptions = this.launchOptionsFor({
+      client,
+      own: providerLaunchConfig.providerOptions,
+    });
     const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
     await this.requireExternalMcpSupport(session, providerLaunchConfig, launchContext);
     const agent = await this.registerSession(session, storedConfig, resolvedAgentId, {
@@ -1759,7 +1848,7 @@ export class AgentManager {
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       mergedConfig,
       resolvedAgentId,
-      { purpose, env: launchEnv },
+      { purpose, env: launchEnv, labels: record?.labels ?? options?.labels },
     );
     const client = this.requireClient(handle.provider);
     const available = await client.isAvailable();
@@ -1785,7 +1874,10 @@ export class AgentManager {
       },
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const launchedOptions = this.launchOptionsFor({ client, own: storedConfig.providerOptions });
+    const launchedOptions = this.launchOptionsFor({
+      client,
+      own: providerLaunchConfig.providerOptions,
+    });
     const session = await client.resumeSession(
       handle,
       providerLaunchConfig,
@@ -1799,7 +1891,9 @@ export class AgentManager {
       ...options,
       // The caller read its metadata and attention before this turn in the lane; a setMetadata
       // or attention clear queued ahead of it has saved a newer record, the one the open hooks saw.
-      ...(record ? { metadata: record.metadata, attention: extractAttention(record) } : {}),
+      ...(record
+        ? { labels: record.labels, metadata: record.metadata, attention: extractAttention(record) }
+        : {}),
       workspaceId,
       launchEnv,
       persistence: handle,
@@ -1839,7 +1933,7 @@ export class AgentManager {
         cwd: input.cwd,
       },
       resolvedAgentId,
-      { resolveDefaultModel: false },
+      { resolveDefaultModel: false, labels: input.labels },
     );
     this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
     const launchContext = await this.buildLaunchContext(
@@ -1856,7 +1950,10 @@ export class AgentManager {
       },
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-    const launchedOptions = this.launchOptionsFor({ client, own: storedConfig.providerOptions });
+    const launchedOptions = this.launchOptionsFor({
+      client,
+      own: providerLaunchConfig.providerOptions,
+    });
     const imported = await client.importSession(
       {
         providerHandleId: input.providerHandleId,
@@ -1923,7 +2020,13 @@ export class AgentManager {
   private async reloadAgentSessionInternal(
     agentId: string,
     overrides?: Partial<AgentSessionConfig>,
-    options?: { rehydrateFromDisk?: boolean },
+    {
+      rehydrateFromDisk = false,
+      hierarchyLabels,
+    }: {
+      rehydrateFromDisk?: boolean;
+      hierarchyLabels?: Record<string, string>;
+    } = {},
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
@@ -1931,7 +2034,6 @@ export class AgentManager {
       await this.cancelAgentRunBefore(agentId, "reload");
       existing = this.requireSessionAgent(agentId);
     }
-    const rehydrateFromDisk = options?.rehydrateFromDisk ?? false;
     const preservedHistoryPrimed = existing.historyPrimed;
     const preservedLastUsage = existing.lastUsage;
     const preservedLastError = existing.lastError;
@@ -1944,10 +2046,11 @@ export class AgentManager {
       ...overrides,
       provider,
     } as AgentSessionConfig;
+    const labels = hierarchyLabels ?? existing.labels;
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       refreshConfig,
       agentId,
-      { env: existing.launchEnv },
+      { env: existing.launchEnv, labels },
     );
     const hadPreviousPaseoToolPolicy = this.paseoToolPolicies.has(agentId);
     const previousPaseoToolPolicy = this.paseoToolPolicies.get(agentId);
@@ -1963,7 +2066,7 @@ export class AgentManager {
         workspaceId: existing.workspaceId,
         title: await this.resolveInitialPersistedTitle(agentId, existing.config, null),
         background: existing.background,
-        labels: existing.labels,
+        labels,
         metadata: existing.metadata,
       },
     );
@@ -1985,11 +2088,15 @@ export class AgentManager {
       this.cancelRunningProviderSubagents(agentId);
       this.clearBackgroundWork(agentId);
       closedExisting = this.prepareAgentForClosure(existing, "agent reloaded");
+      this.applyReloadedHierarchy(closedExisting, storedConfig, hierarchyLabels);
       await this.persistSnapshot(closedExisting);
       this.assertAcceptingAgentRegistrations();
 
       this.paseoToolPolicies.set(agentId, paseoToolPolicy);
-      const launchedOptions = this.launchOptionsFor({ client, own: storedConfig.providerOptions });
+      const launchedOptions = this.launchOptionsFor({
+        client,
+        own: providerLaunchConfig.providerOptions,
+      });
       session = handle
         ? await client.resumeSession(handle, providerLaunchConfig, launchContext)
         : await client.createSession(providerLaunchConfig, launchContext);
@@ -2009,7 +2116,7 @@ export class AgentManager {
       handedToRegistration = true;
       return this.registerSession(session, storedConfig, agentId, {
         launchedOptions,
-        labels: existing.labels,
+        labels,
         metadata: existing.metadata,
         workspaceId: existing.workspaceId,
         owner: existing.owner,
@@ -2018,7 +2125,7 @@ export class AgentManager {
         createdAt: existing.createdAt,
         updatedAt: existing.updatedAt,
         lastUserMessageAt: existing.lastUserMessageAt,
-        historyPrimed: rehydrateFromDisk ? false : preservedHistoryPrimed,
+        historyPrimed: !rehydrateFromDisk && preservedHistoryPrimed,
         lastUsage: preservedLastUsage,
         lastError: preservedLastError,
         attention: preservedAttention,
@@ -2037,16 +2144,46 @@ export class AgentManager {
     } finally {
       if (!handedToRegistration) {
         this.detachPluginTools(agentId);
-        if (hadPreviousPaseoToolPolicy) {
-          this.paseoToolPolicies.set(agentId, previousPaseoToolPolicy);
-        } else {
-          this.paseoToolPolicies.delete(agentId);
-        }
-        if (session) {
-          await this.closeUnregisteredSession(session);
-        }
+        await this.cleanUpReload(
+          agentId,
+          session,
+          hadPreviousPaseoToolPolicy,
+          previousPaseoToolPolicy,
+          closedExisting,
+          hierarchyLabels,
+        );
       }
     }
+  }
+
+  private applyReloadedHierarchy(
+    agent: ManagedAgentClosed,
+    config: AgentSessionConfig,
+    labels?: Record<string, string>,
+  ): void {
+    if (!labels) return;
+    agent.labels = labels;
+    agent.config = config;
+    agent.currentModeId = config.modeId ?? null;
+    if (agent.runtimeInfo)
+      agent.runtimeInfo = { ...agent.runtimeInfo, modeId: agent.currentModeId };
+    this.touchUpdatedAt(agent);
+  }
+
+  private async cleanUpReload(
+    agentId: string,
+    session: AgentSession | undefined,
+    hadPreviousPolicy: boolean,
+    previousPolicy: ProviderPaseoToolsPolicy | undefined,
+    closedExisting?: ManagedAgentClosed,
+    hierarchyLabels?: Record<string, string>,
+  ): Promise<void> {
+    if (hadPreviousPolicy && !(closedExisting && hierarchyLabels)) {
+      this.paseoToolPolicies.set(agentId, previousPolicy);
+    } else {
+      this.paseoToolPolicies.delete(agentId);
+    }
+    if (session) await this.closeUnregisteredSession(session);
   }
 
   private async closeReloadedSession(session: AgentSession, agentId: string): Promise<void> {
@@ -2495,6 +2632,13 @@ export class AgentManager {
   async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {
     return this.runLifecycleMutation(agentId, async () => {
       const agent = await this.ensureInteractiveSessionUnlocked(agentId);
+      if (
+        isMainControlAgentLabels(agent.labels) &&
+        this.adapterOf(agent.provider) === "codex" &&
+        modeId !== "read-only"
+      ) {
+        throw new Error(MAIN_CONTROL_WRITE_DENIAL);
+      }
       const notice = (await agent.session.setMode(modeId)) ?? null;
       await this.drainSessionEvents(agentId);
       const currentMode = (await agent.session.getCurrentMode()) ?? modeId;
@@ -2579,6 +2723,15 @@ export class AgentManager {
     return this.runLifecycleMutation(agentId, async () => {
       const agent = await this.ensureInteractiveSessionUnlocked(agentId);
       const patch = this.convertLegacyOptions(agent.provider, requested);
+      if (isMainControlAgentLabels(agent.labels)) {
+        const adapter = this.adapterOf(agent.provider);
+        if (
+          (adapter === "codex" && ("sandbox_mode" in patch || "approval_policy" in patch)) ||
+          (adapter === "claude" && "disallowedTools" in patch)
+        ) {
+          throw new Error(MAIN_CONTROL_WRITE_DENIAL);
+        }
+      }
       let ended: ProviderOptionsPatch = {};
       let sent: ProviderOptionsPatch = {};
       if (Object.keys(patch).length > 0) {
@@ -2779,6 +2932,200 @@ export class AgentManager {
     return nextRecord;
   }
 
+  async setAgentMainControl(agentId: string, enabled: boolean): Promise<AgentRelationshipUpdate> {
+    return this.runHierarchyMutation(async () => {
+      const registry = this.requireRegistry();
+      const hierarchy = await this.readHierarchyAgents();
+      const agent = hierarchy.get(agentId);
+      const targetRecord = await registry.get(agentId);
+      if (!agent || !targetRecord || agent.archivedAt || targetRecord.archivedAt) {
+        throw new Error("Agent is missing or archived.");
+      }
+      if (enabled) {
+        const targetWorkspaceId = agent.workspaceId ?? targetRecord.workspaceId;
+        if (
+          !targetWorkspaceId ||
+          getParentAgentIdFromLabels(agent.labels) ||
+          getParentAgentIdFromLabels(targetRecord.labels)
+        ) {
+          throw new Error("Only a workspace root agent can be Main Control.");
+        }
+        for (const other of hierarchy.values()) {
+          if (
+            other.id !== agentId &&
+            other.workspaceId === targetWorkspaceId &&
+            isMainControlAgentLabels(other.labels)
+          ) {
+            await this.runLifecycleMutation(other.id, async () => {
+              const record = await registry.get(other.id);
+              if (
+                record &&
+                !record.archivedAt &&
+                record.workspaceId === targetWorkspaceId &&
+                isMainControlAgentLabels(record.labels)
+              ) {
+                await this.writeMainControlRole(other.id, false);
+              }
+            });
+          }
+        }
+      }
+      return this.runLifecycleMutation(agentId, async () => {
+        if (enabled) {
+          const current = this.agents.get(agentId);
+          const record = await registry.get(agentId);
+          if (!record || record.archivedAt) throw new Error("Agent is missing or archived.");
+          if (
+            !(current?.workspaceId ?? record.workspaceId) ||
+            getParentAgentIdFromLabels(current?.labels ?? record.labels)
+          ) {
+            throw new Error("Only a workspace root agent can be Main Control.");
+          }
+        }
+        return this.writeMainControlRole(agentId, enabled);
+      });
+    });
+  }
+
+  private async writeMainControlRole(
+    agentId: string,
+    enabled: boolean,
+  ): Promise<AgentRelationshipUpdate> {
+    const registry = this.requireRegistry();
+    const record = await registry.get(agentId);
+    if (!record || record.archivedAt) throw new Error("Agent is missing or archived.");
+    const current = this.agents.get(agentId);
+    if (isMainControlAgentLabels(record.labels) === enabled) {
+      return { record, live: Boolean(current) };
+    }
+
+    const currentMode = current?.currentModeId ?? record.lastModeId ?? record.config?.modeId;
+    const priorMode = getMainPriorModeIdFromLabels(record.labels);
+    const labels = applyRecordPatch(current?.labels ?? record.labels, {
+      [WORKSPACE_ROLE_LABEL]: enabled ? WORKSPACE_MAIN_ROLE : null,
+      [MAIN_PRIOR_MODE_ID_LABEL]: enabled ? currentMode?.trim() || null : null,
+    });
+    const modeId = this.resolveMainControlMode({
+      enabled,
+      provider: record.provider,
+      currentMode,
+      priorMode,
+    });
+    if (current) {
+      return this.reloadWithMainControlRole(agentId, { labels, modeId, enabled });
+    }
+
+    const next: StoredAgentRecord = {
+      ...record,
+      labels,
+      config: { ...record.config, modeId },
+      lastModeId: modeId ?? null,
+      runtimeInfo: record.runtimeInfo
+        ? { ...record.runtimeInfo, modeId: modeId ?? null }
+        : undefined,
+      updatedAt: this.nextStoredUpdatedAt(record),
+    };
+    await registry.upsert(next);
+    this.paseoToolPolicies.delete(agentId);
+    this.dispatchStoredAgentState(next);
+    return { record: next, live: false };
+  }
+
+  private resolveMainControlMode({
+    enabled,
+    provider,
+    currentMode,
+    priorMode,
+  }: {
+    enabled: boolean;
+    provider: AgentProvider;
+    currentMode: string | null | undefined;
+    priorMode: string | null;
+  }): string | undefined {
+    if (this.adapterOf(provider) === "codex") {
+      return enabled ? "read-only" : (priorMode ?? undefined);
+    }
+    if (!enabled && priorMode) return priorMode;
+    return currentMode ?? undefined;
+  }
+
+  private async reloadWithMainControlRole(
+    agentId: string,
+    {
+      labels,
+      modeId,
+      enabled,
+    }: { labels: Record<string, string>; modeId?: string; enabled: boolean },
+  ): Promise<AgentRelationshipUpdate> {
+    try {
+      await this.trackAgentRegistrationOperation(
+        this.reloadAgentSessionInternal(agentId, { modeId }, { hierarchyLabels: labels }),
+      );
+    } catch (error) {
+      const committed = await this.requireRegistry().get(agentId);
+      if (
+        this.agents.has(agentId) ||
+        !committed ||
+        isMainControlAgentLabels(committed.labels) !== enabled
+      ) {
+        throw error;
+      }
+      this.logger.warn({ err: error, agentId }, "Agent will reopen with its new role on demand");
+      return { record: committed, live: false };
+    }
+    const record = await this.requireRegistry().get(agentId);
+    if (!record) throw new Error(`Agent not found after updating Main Control: ${agentId}`);
+    return { record, live: true };
+  }
+
+  async setAgentParent(
+    agentId: string,
+    parentAgentId: string,
+    serverId?: string,
+  ): Promise<AgentParentUpdate> {
+    return this.runHierarchyMutation(() =>
+      this.runLifecycleMutation(agentId, async () => {
+        const hierarchy = await this.readHierarchyAgents();
+        const agent = hierarchy.get(agentId);
+        const parentAgent = hierarchy.get(parentAgentId);
+        if (!agent || !parentAgent) throw new Error("Agent or parent is missing or archived.");
+        if (!agent.workspaceId || agent.workspaceId !== parentAgent.workspaceId) {
+          throw new Error("An agent and its new parent must belong to the same workspace.");
+        }
+        validateSetAgentParent({
+          agent,
+          parentAgent,
+          readAgent: (id) => hierarchy.get(id),
+          listActiveAgents: () => hierarchy.values(),
+        });
+        const previousParentAgentId = getParentAgentIdFromLabels(agent.labels);
+        const wasRunning = this.agents.get(agentId)?.lifecycle === "running";
+        const { record, live } = await this.writeLabels(agentId, {
+          [PARENT_AGENT_ID_LABEL]: parentAgentId,
+          [PARENT_SERVER_ID_LABEL]: serverId ?? null,
+          [REMOTE_HIERARCHY_DEPTH_LABEL]: null,
+        });
+        if (!record) throw new Error(`Agent not found after changing parent: ${agentId}`);
+        if (!live) {
+          this.paseoToolPolicies.delete(agentId);
+          if (!record.internal) this.dispatchStoredAgentState(record);
+        }
+        hierarchy.set(agentId, { ...agent, labels: record.labels });
+        this.refreshHierarchyToolPolicies(hierarchy);
+        return { record, live, previousParentAgentId, wasRunning };
+      }),
+    );
+  }
+
+  private runHierarchyMutation<T>(mutation: () => Promise<T>): Promise<T> {
+    const result = this.hierarchyMutationTail.then(mutation);
+    this.hierarchyMutationTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   async detachAgent(agentId: string): Promise<{
     record: StoredAgentRecord;
     live: boolean;
@@ -2809,6 +3156,7 @@ export class AgentManager {
       if (!record) {
         throw new Error(`Agent not found in storage after detach: ${agentId}`);
       }
+      if (this.agents.size > 0) this.refreshHierarchyToolPolicies(await this.readHierarchyAgents());
       return { record, live: true, previousParentAgentId };
     }
 
@@ -2825,6 +3173,8 @@ export class AgentManager {
     if (!result.record) {
       throw new Error(`Agent not found in storage after detach: ${agentId}`);
     }
+    this.paseoToolPolicies.delete(agentId);
+    if (this.agents.size > 0) this.refreshHierarchyToolPolicies(await this.readHierarchyAgents());
     return { record: result.record, live: false, previousParentAgentId };
   }
 
@@ -2913,6 +3263,8 @@ export class AgentManager {
       this.moveToWorkspaceReceipts.set(receiptKey, result);
     }
     if (liveAgent) this.emitState(liveAgent, { persist: false });
+    else this.paseoToolPolicies.delete(agentId);
+    if (this.agents.size > 0) this.refreshHierarchyToolPolicies(await this.readHierarchyAgents());
     return result;
   }
 
@@ -4104,6 +4456,15 @@ export class AgentManager {
     response: AgentPermissionResponse,
   ): Promise<AgentPermissionResult | void> {
     const agent = this.requireAgent(agentId);
+    const request = agent.pendingPermissions.get(requestId);
+    if (
+      response.behavior === "allow" &&
+      request &&
+      isMainControlAgentLabels(agent.labels) &&
+      isMainControlWritePermissionBlocked(request)
+    ) {
+      throw new Error(MAIN_CONTROL_WRITE_DENIAL);
+    }
     if (agent.inFlightPermissionResponses.has(requestId)) {
       throw new Error("A response to this permission request is already being submitted");
     }
@@ -5612,7 +5973,7 @@ export class AgentManager {
         this.onStreamTurnStarted({ agent, eventTurnId, isForegroundEvent, flags });
         return undefined;
       case "permission_requested":
-        this.onStreamPermissionRequested(agent, event);
+        this.onStreamPermissionRequested(agent, event, options, flags);
         return undefined;
       case "permission_resolved":
         this.onStreamPermissionResolved({ agent, event, options, flags });
@@ -5851,7 +6212,25 @@ export class AgentManager {
   private onStreamPermissionRequested(
     agent: ActiveManagedAgent,
     event: Extract<AgentStreamEvent, { type: "permission_requested" }>,
+    options: HandleStreamEventOptions | undefined,
+    flags: StreamEventFlags,
   ): void {
+    if (
+      !options?.fromHistory &&
+      isMainControlAgentLabels(agent.labels) &&
+      isMainControlWritePermissionBlocked(event.request)
+    ) {
+      flags.shouldDispatchEvent = false;
+      flags.shouldNotifyWaiters = false;
+      agent.pendingPermissions.set(event.request.id, event.request);
+      void this.respondToPermission(agent.id, event.request.id, {
+        behavior: "deny",
+        message: MAIN_CONTROL_WRITE_DENIAL,
+      }).catch((err) =>
+        this.logger.warn({ err, agentId: agent.id }, "Could not deny write permission"),
+      );
+      return;
+    }
     const hadPendingPermissions = agent.pendingPermissions.size > 0;
     agent.pendingPermissions.set(event.request.id, event.request);
     this.refreshSessionPersistence(agent);
@@ -6487,19 +6866,51 @@ export class AgentManager {
   private async prepareSessionConfig(
     config: AgentSessionConfig,
     agentId: string,
-    options: NormalizeConfigOptions = {},
+    options: PrepareSessionConfigOptions = {},
   ): Promise<PreparedSessionConfig> {
-    const storedConfig = await this.normalizeConfig(stripInternalPaseoMcpServer(config), {
+    let storedConfig = await this.normalizeConfig(stripInternalPaseoMcpServer(config), {
       env: options.env,
       purpose: options.purpose,
       resolveDefaultModel: options.resolveDefaultModel,
     });
-    const paseoToolPolicy = this.paseoToolsEnabled
-      ? this.resolvePaseoToolPolicy(storedConfig.provider)
-      : { enabled: false };
+    const hierarchy = await this.readHierarchyAgents();
+    const agent = { id: agentId, labels: options.labels };
+    const readAgent = (id: string) => (id === agentId ? agent : hierarchy.get(id));
+    const depth = computeAgentDepth(agentId, readAgent);
+    const hierarchyPrompt = buildHierarchyAppendSystemPrompt({
+      agent,
+      readAgent,
+      listActiveAgents: () => hierarchy.values(),
+    });
+    const adapter = this.adapterOf(storedConfig.provider);
+    const mainControl = isMainControlAgentLabels(agent.labels);
+    if (mainControl && adapter === "codex") storedConfig = { ...storedConfig, modeId: "read-only" };
+    const effectiveDisallowedTools =
+      mainControl && adapter === "claude"
+        ? this.effectiveOptionsFor(storedConfig.provider, storedConfig.providerOptions)
+            .disallowedTools
+        : undefined;
+    const restrictedConfig = applyMainControlReadOnlyConfig(
+      effectiveDisallowedTools === undefined
+        ? storedConfig
+        : {
+            ...storedConfig,
+            providerOptions: {
+              ...storedConfig.providerOptions,
+              disallowedTools: effectiveDisallowedTools,
+            },
+          },
+      agent.labels,
+      adapter,
+    );
+    const paseoToolPolicy = resolveAgentPaseoToolPolicy(
+      this.basePaseoToolPolicy(storedConfig.provider),
+      agent,
+      depth,
+    );
     const launchConfig = this.applyDaemonAppendSystemPrompt(
       withRuntimePaseoMcpServer({
-        config: storedConfig,
+        config: restrictedConfig,
         agentId,
         mcpBaseUrl:
           this.paseoToolsEnabled && isPaseoToolPolicyEnabled(paseoToolPolicy)
@@ -6507,12 +6918,18 @@ export class AgentManager {
             : null,
         mcpAuthToken: this.mcpAuthToken,
       }),
+      hierarchyPrompt,
     );
     return { storedConfig, launchConfig, paseoToolPolicy };
   }
 
-  private applyDaemonAppendSystemPrompt(config: AgentSessionConfig): AgentSessionConfig {
-    const daemonAppendSystemPrompt = this.appendSystemPrompt.trim();
+  private applyDaemonAppendSystemPrompt(
+    config: AgentSessionConfig,
+    hierarchyPrompt: string,
+  ): AgentSessionConfig {
+    const daemonAppendSystemPrompt = [this.appendSystemPrompt.trim(), hierarchyPrompt]
+      .filter(Boolean)
+      .join("\n\n");
     const next = { ...config };
     delete next.daemonAppendSystemPrompt;
 

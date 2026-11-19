@@ -1,5 +1,14 @@
 import { describe, expect, test } from "vitest";
 import {
+  getMainPriorModeIdFromLabels,
+  isMainControlAgent,
+  isMainControlAgentLabels,
+  MAIN_PRIOR_MODE_ID_LABEL,
+  resolveAgentHierarchyDepth,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
+} from "./agent-labels.js";
+import {
   AgentTimelineItemPayloadSchema,
   SendAgentMessageRequestSchema,
   FileExplorerRequestSchema,
@@ -399,6 +408,98 @@ describe("agent move to workspace RPC", () => {
         ?.features?.agentMoveToWorkspace,
     ).toBe(true);
     expect(parseServerInfoStatusPayload(serverInfo)).toMatchObject(serverInfo);
+  });
+});
+
+describe("agent hierarchy control RPCs", () => {
+  test.each([
+    { type: "agent.set_main.request", enabled: false },
+    { type: "agent.set_parent.request", parentAgentId: "parent-agent" },
+  ])("parses $type through the session union", (fields) => {
+    const request = { agentId: "agent-1", requestId: "req-1", ...fields };
+
+    expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+    expect(
+      SessionInboundMessageSchema.safeParse({ ...request, requestId: undefined }).success,
+    ).toBe(false);
+  });
+
+  test.each([
+    {
+      type: "agent.set_main.response",
+      payload: { accepted: true, enabled: false, workspaceId: null, error: null },
+    },
+    {
+      type: "agent.set_parent.response",
+      payload: { accepted: false, parentAgentId: null, error: "Parent unavailable" },
+    },
+  ])("parses $type through both outbound validators", ({ type, payload }) => {
+    const response = {
+      type,
+      payload: { agentId: "agent-1", requestId: "req-1", ...payload },
+    };
+    const envelope = { type: "session", message: response };
+
+    expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
+    expect(validateWSOutboundMessage(envelope)).toEqual({ success: true, data: envelope });
+  });
+
+  test("parses server info with and without the hierarchy control feature flag", () => {
+    const serverInfo = { status: "server_info", serverId: "srv-test" };
+    const withFeature = { ...serverInfo, features: { agentHierarchyControl: true } };
+
+    expect(parseServerInfoStatusPayload(withFeature)?.features?.agentHierarchyControl).toBe(true);
+    expect(parseServerInfoStatusPayload(serverInfo)).toMatchObject(serverInfo);
+    expect(
+      parseServerInfoStatusPayload(serverInfo)?.features?.agentHierarchyControl,
+    ).toBeUndefined();
+    const envelope = { type: "session", message: { type: "status", payload: withFeature } };
+    expect(validateWSOutboundMessage(envelope)).toMatchObject({ success: true, data: envelope });
+  });
+});
+
+describe("agent hierarchy labels", () => {
+  test("recognizes the main control role only when the workspace role matches", () => {
+    expect(isMainControlAgentLabels({ [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE })).toBe(true);
+    expect(isMainControlAgentLabels(undefined)).toBe(false);
+    expect(isMainControlAgent({ labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE } })).toBe(
+      true,
+    );
+    expect(isMainControlAgent({ labels: { [WORKSPACE_ROLE_LABEL]: "worker" } })).toBe(false);
+    expect(isMainControlAgent({ labels: null })).toBe(false);
+  });
+
+  test("reads a trimmed prior mode ID and ignores blank or invalid labels", () => {
+    expect(getMainPriorModeIdFromLabels({ [MAIN_PRIOR_MODE_ID_LABEL]: "  default  " })).toBe(
+      "default",
+    );
+    expect(getMainPriorModeIdFromLabels({ [MAIN_PRIOR_MODE_ID_LABEL]: "   " })).toBeNull();
+    expect(getMainPriorModeIdFromLabels({ [MAIN_PRIOR_MODE_ID_LABEL]: 42 })).toBeNull();
+    expect(getMainPriorModeIdFromLabels(undefined)).toBeNull();
+  });
+
+  test("counts parent links and stops at the hop limit", () => {
+    const parents = new Map([
+      ["child", "root"],
+      ["grandchild", "child"],
+    ]);
+    const getParentId = (id: string) => parents.get(id);
+
+    expect(resolveAgentHierarchyDepth("root", getParentId)).toBe(0);
+    expect(resolveAgentHierarchyDepth("child", getParentId)).toBe(1);
+    expect(resolveAgentHierarchyDepth("grandchild", getParentId)).toBe(2);
+    expect(resolveAgentHierarchyDepth("grandchild", getParentId, 1)).toBe(1);
+    expect(resolveAgentHierarchyDepth("0", (id) => String(Number(id) + 1))).toBe(10);
+  });
+
+  test("stops before counting an agent twice in a cycle", () => {
+    const getParentId = (id: string) => (id === "first" ? "second" : "first");
+
+    expect(resolveAgentHierarchyDepth("first", getParentId)).toBe(1);
+    expect(resolveAgentHierarchyDepth("self", () => "self")).toBe(0);
+    expect(resolveAgentHierarchyDepth("self", () => " self ")).toBe(0);
+    expect(resolveAgentHierarchyDepth("root", () => "")).toBe(0);
+    expect(resolveAgentHierarchyDepth("root", () => "   ")).toBe(0);
   });
 });
 

@@ -81,6 +81,10 @@ import {
   waitForAgentRunStartWithTimeout,
   unarchiveAgentState,
 } from "./agent/agent-prompt.js";
+import type {
+  FinishRegistration,
+  FinishSubscriptions,
+} from "./agent/finish-subscriptions/index.js";
 import {
   resolveCreateAgentTitles,
   resolveFirstAgentPromptTitle,
@@ -131,7 +135,10 @@ import type {
   AgentTimelineFetchResult,
   ManagedAgent,
 } from "./agent/agent-manager.js";
-import { createAgentCommand } from "./agent/create-agent/create.js";
+import {
+  createAgentCommand,
+  registerParentFinishSubscription,
+} from "./agent/create-agent/create.js";
 import {
   inheritAgentBackground,
   inheritWorkspaceBackground,
@@ -550,6 +557,7 @@ export interface SessionOptions {
   agentStorage: AgentStorage;
   messageReceipts: Pick<MessageReceipts, "send">;
   agentMessages: AgentMessageDelivery;
+  finishSubscriptions?: FinishSubscriptions;
   creationService: Pick<CreationService, "create" | "subscribe">;
   projectRegistry: ProjectRegistry;
   workspaceRegistry: WorkspaceRegistry;
@@ -929,6 +937,7 @@ export class Session {
   private readonly workspaceScripts: WorkspaceScriptsService;
   private readonly messageReceipts: Pick<MessageReceipts, "send">;
   private readonly agentMessages: AgentMessageDelivery;
+  private readonly finishSubscriptions?: FinishSubscriptions;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
   private readonly creationService: Pick<CreationService, "create" | "subscribe">;
 
@@ -1017,6 +1026,7 @@ export class Session {
     this.paseoHome = paseoHome;
     this.messageReceipts = options.messageReceipts;
     this.agentMessages = options.agentMessages;
+    this.finishSubscriptions = options.finishSubscriptions;
     this.creationService = options.creationService;
     this.projectIcons = new ProjectIconReader(paseoHome);
     this.worktreesRoot = worktreesRoot;
@@ -3156,6 +3166,10 @@ export class Session {
     switch (msg.type) {
       case "agent.detach.request":
         return this.handleDetachAgentRequest(msg.agentId, msg.requestId);
+      case "agent.set_main.request":
+        return this.handleSetAgentMainRequest(msg);
+      case "agent.set_parent.request":
+        return this.handleSetAgentParentRequest(msg);
       case "agent.move_to_workspace.request":
         return this.handleMoveAgentToWorkspaceRequest(
           msg.agentId,
@@ -3829,6 +3843,77 @@ export class Session {
     }
 
     return { agentId, archivedAt };
+  }
+
+  private async handleSetAgentMainRequest(
+    request: Extract<SessionInboundMessage, { type: "agent.set_main.request" }>,
+  ): Promise<void> {
+    const { agentId, requestId, enabled } = request;
+    let workspaceId: string | null = null;
+    let failure: string | null = null;
+    try {
+      const result = await this.agentManager.setAgentMainControl(agentId, enabled);
+      workspaceId = result.record.workspaceId ?? null;
+      if (workspaceId) await this.emitWorkspaceUpdateForWorkspaceId(workspaceId);
+    } catch (error) {
+      failure = getErrorMessageOr(error, "Failed to change Main Control");
+      this.sessionLogger.warn({ err: error, agentId, requestId }, "Failed to change Main Control");
+    }
+    this.emit({
+      type: "agent.set_main.response",
+      payload: {
+        requestId,
+        agentId,
+        enabled,
+        workspaceId,
+        accepted: failure === null,
+        error: failure,
+      },
+    });
+  }
+
+  private async handleSetAgentParentRequest(
+    request: Extract<SessionInboundMessage, { type: "agent.set_parent.request" }>,
+  ): Promise<void> {
+    const { agentId, parentAgentId, requestId } = request;
+    let failure: string | null = null;
+    try {
+      const result = await this.agentManager.setAgentParent(agentId, parentAgentId, this.serverId);
+      if (!result.live) await this.agentUpdates.emitStoredRecord(result.record);
+      if (result.wasRunning || this.agentManager.getAgent(agentId)?.lifecycle === "running") {
+        await this.finishSubscriptions?.register(
+          { childAgentId: agentId, callerAgentId: parentAgentId, requireParentOwnership: true },
+          false,
+        );
+      }
+      const affected = new Set<string>();
+      if (result.record.workspaceId) affected.add(result.record.workspaceId);
+      if (result.previousParentAgentId) {
+        const workspaceId = await this.resolveDelegationRootWorkspaceId(
+          result.previousParentAgentId,
+        );
+        if (workspaceId) affected.add(workspaceId);
+      }
+      const rootWorkspaceId = await this.resolveDelegationRootWorkspaceId(parentAgentId);
+      if (rootWorkspaceId) affected.add(rootWorkspaceId);
+      await this.emitWorkspaceUpdatesForWorkspaceIds(affected);
+    } catch (error) {
+      failure = getErrorMessageOr(error, "Failed to change agent parent");
+      this.sessionLogger.warn(
+        { err: error, agentId, parentAgentId, requestId },
+        "Failed to change agent parent",
+      );
+    }
+    this.emit({
+      type: "agent.set_parent.response",
+      payload: {
+        requestId,
+        agentId,
+        parentAgentId: failure === null ? parentAgentId : null,
+        accepted: failure === null,
+        error: failure,
+      },
+    });
   }
 
   private async handleDetachAgentRequest(agentId: string, requestId: string): Promise<void> {
@@ -4828,9 +4913,7 @@ export class Session {
     const prompt = buildAgentPrompt(promptText, images, attachments);
 
     try {
-      await sendPromptToAgent({
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
+      await this.sendHumanPrompt({
         agentId,
         prompt,
         messageId,
@@ -4838,7 +4921,6 @@ export class Session {
         // A typed or spoken message from the human answers any permission the
         // agent is blocked on.
         clearPendingPermissions: true,
-        logger: this.sessionLogger,
       });
       return { ok: true };
     } catch (error) {
@@ -4847,6 +4929,50 @@ export class Session {
         ok: false,
         error: error instanceof Error ? error.message : String(error),
       };
+    }
+  }
+
+  private async sendHumanPrompt(
+    params: Omit<
+      Parameters<typeof sendPromptToAgent>[0],
+      "agentManager" | "agentStorage" | "logger"
+    >,
+  ): ReturnType<typeof sendPromptToAgent> {
+    let registration: FinishRegistration | undefined;
+    let dispatched = false;
+    try {
+      return await sendPromptToAgent({
+        ...params,
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+        beforeDispatch: async () => {
+          registration = await registerParentFinishSubscription({
+            agentId: params.agentId,
+            serverId: this.serverId,
+            agentManager: this.agentManager,
+            agentStorage: this.agentStorage,
+            finishSubscriptions: this.finishSubscriptions,
+          });
+          await params.beforeDispatch?.();
+        },
+        onDispatch: (disposition) => {
+          if (disposition !== "out_of_band") {
+            dispatched = true;
+            registration?.accept();
+          }
+          params.onDispatch?.(disposition);
+        },
+      });
+    } finally {
+      if (!dispatched) {
+        await registration?.reject().catch((error) => {
+          this.sessionLogger.warn(
+            { err: error, agentId: params.agentId },
+            "Failed to reject parent finish subscription",
+          );
+        });
+      }
     }
   }
 
@@ -5241,6 +5367,7 @@ export class Session {
         {
           agentManager: this.agentManager,
           agentStorage: this.agentStorage,
+          finishSubscriptions: this.finishSubscriptions,
           logger: this.sessionLogger,
           paseoHome: this.paseoHome,
           worktreesRoot: this.worktreesRoot,
@@ -5248,6 +5375,7 @@ export class Session {
         },
         {
           kind: "session",
+          callerAgentId: msg.callerAgentId,
           onAgentReady: async (agent) => {
             createdAgentId = agent.id;
             await onAgentReady?.(await this.buildAgentPayload(agent));
@@ -9484,9 +9612,7 @@ export class Session {
           await receipt.dispatched;
           return;
         }
-        const result = await sendPromptToAgent({
-          agentManager: this.agentManager,
-          agentStorage: this.agentStorage,
+        const result = await this.sendHumanPrompt({
           agentId,
           prompt,
           messageId: msg.messageId,
@@ -9494,7 +9620,6 @@ export class Session {
           sessionMode: msg.sessionMode,
           clearPendingPermissions: true,
           beforeDispatch,
-          logger: this.sessionLogger,
         });
         if (result.disposition === "turn_started") {
           await waitForAgentRunStartWithTimeout(

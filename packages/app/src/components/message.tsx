@@ -2,7 +2,11 @@ import { useDisclosureHold } from "@/agent-stream/disclosure";
 import { MessagePreview, MessageSender } from "@/components/user-message";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { getAgentAttachmentPillContent } from "@/attachments/attachment-pill-content";
-import { AssistantForkMenu, type AssistantForkTarget } from "@/components/assistant-fork-menu";
+import {
+  AllowSubagentForkContext,
+  AssistantForkMenu,
+  type AssistantForkTarget,
+} from "@/components/assistant-fork-menu";
 import { AttachmentLightbox, type ImageLightboxSource } from "@/components/attachment-lightbox";
 import {
   AttachmentFrame,
@@ -639,6 +643,7 @@ export const AssistantTurnFooter = memo(function AssistantTurnFooter({
   onFork,
 }: AssistantTurnFooterProps) {
   const { t } = useTranslation();
+  const allowSubagentFork = React.useContext(AllowSubagentForkContext);
   const [hovered, setHovered] = useState(false);
   const [pressedReveal, setPressedReveal] = useState(false);
   const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -697,7 +702,9 @@ export const AssistantTurnFooter = memo(function AssistantTurnFooter({
               containerStyle={assistantTurnFooterStylesheet.copyButton}
             />
           ) : null}
-          {canFork ? <AssistantForkMenu onFork={handleFork} /> : null}
+          {canFork ? (
+            <AssistantForkMenu onFork={handleFork} allowSubagentFork={allowSubagentFork} />
+          ) : null}
         </View>
       ) : null}
       {primaryLabel ? (

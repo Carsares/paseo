@@ -3716,6 +3716,37 @@ export class DaemonClient {
     return { workspaceId: payload.workspaceId };
   }
 
+  async setAgentMainControl(
+    agentId: string,
+    enabled: boolean,
+  ): Promise<{ enabled: boolean; workspaceId: string | null }> {
+    const payload = await this.sendNamespacedCorrelatedSessionRequest<"agent.set_main.response">({
+      message: {
+        type: "agent.set_main.request",
+        agentId,
+        enabled,
+      },
+    });
+    if (!payload.accepted) {
+      throw new Error(payload.error ?? "setAgentMainControl rejected");
+    }
+    return { enabled: payload.enabled, workspaceId: payload.workspaceId };
+  }
+
+  async setAgentParent(agentId: string, parentAgentId: string): Promise<{ parentAgentId: string }> {
+    const payload = await this.sendNamespacedCorrelatedSessionRequest<"agent.set_parent.response">({
+      message: {
+        type: "agent.set_parent.request",
+        agentId,
+        parentAgentId,
+      },
+    });
+    if (!payload.accepted || !payload.parentAgentId) {
+      throw new Error(payload.error ?? "setAgentParent rejected");
+    }
+    return { parentAgentId: payload.parentAgentId };
+  }
+
   async updateAgent(
     agentId: string,
     updates: { name?: string; labels?: Record<string, string> },

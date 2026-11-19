@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState } from "react";
+import { createContext, memo, useCallback, useContext, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
 import { Split } from "lucide-react-native";
@@ -12,10 +12,14 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 
-export type AssistantForkTarget = "tab" | "workspace";
+export type AssistantForkTarget = "subagent" | "tab" | "workspace";
+
+// The stream's completed and in-flight turn footers share the source agent's eligibility.
+export const AllowSubagentForkContext = createContext(false);
 
 interface AssistantForkMenuProps {
   onFork: (target: AssistantForkTarget) => Promise<void> | void;
+  allowSubagentFork?: boolean;
   testID?: string;
 }
 
@@ -26,9 +30,12 @@ const foregroundMutedColorMapping = (theme: Theme) => ({ color: theme.colors.for
 
 export const AssistantForkMenu = memo(function AssistantForkMenu({
   onFork,
+  allowSubagentFork,
   testID = "assistant-fork-menu",
 }: AssistantForkMenuProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const streamAllowsSubagentFork = useContext(AllowSubagentForkContext);
+  const showSubagentFork = allowSubagentFork ?? streamAllowsSubagentFork;
   const [isOpen, setIsOpen] = useState(false);
   const [pendingTarget, setPendingTarget] = useState<AssistantForkTarget | null>(null);
   const isLocked = pendingTarget !== null;
@@ -98,6 +105,18 @@ export const AssistantForkMenu = memo(function AssistantForkMenu({
         {tooltipContent}
       </Tooltip>
       <DropdownMenuContent align="start" minWidth={220} side="bottom" testID={`${testID}-content`}>
+        {showSubagentFork ? (
+          <DropdownMenuItem
+            closeOnSelect={false}
+            disabled={isLocked && pendingTarget !== "subagent"}
+            leading={forkIcon}
+            onSelect={handleSelect("subagent")}
+            status={pendingTarget === "subagent" ? "pending" : undefined}
+            testID={`${testID}-subagent`}
+          >
+            {i18n.language?.startsWith("zh") ? "分叉为子会话" : "Fork as subagent"}
+          </DropdownMenuItem>
+        ) : null}
         <DropdownMenuItem
           closeOnSelect={false}
           disabled={isLocked && pendingTarget !== "tab"}

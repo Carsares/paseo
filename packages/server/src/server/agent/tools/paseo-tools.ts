@@ -117,6 +117,23 @@ import {
 } from "./types.js";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import { isPaseoToolEnabled } from "../paseo-tool-policy.js";
+import {
+  applyHierarchyPaseoToolPolicy,
+  computeAgentDepth,
+  readAgentHierarchyPath,
+  REMOTE_HIERARCHY_DEPTH_LABEL,
+  requiresSingleHopOrchestration,
+  validateCanSpawnChild,
+  validateSingleHopOrchestration,
+  type HierarchyAgent,
+} from "../hierarchy-policy.js";
+import {
+  getParentAddressFromLabels,
+  MAIN_PRIOR_MODE_ID_LABEL,
+  PARENT_AGENT_ID_LABEL,
+  PARENT_SERVER_ID_LABEL,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 
 export interface PaseoToolHostDependencies {
   agentMessages?: () => AgentMessageDelivery;
@@ -739,6 +756,91 @@ function createToolCatalog(
       listAgents: (args, context) => localHostOperations.get("list_agents")!(args, context),
     },
   });
+  const orchestrationTools = new Set([
+    "send_agent_prompt",
+    "update_agent",
+    "cancel_agent",
+    "archive_agent",
+    "kill_agent",
+    "set_agent_mode",
+    "respond_to_permission",
+  ]);
+  const readHierarchyAgent = async (id: string) => {
+    const stored = await agentStorage.get(id);
+    return stored?.archivedAt ? stored : (agentManager.getAgent(id) ?? stored);
+  };
+
+  async function readOrchestrationTarget(
+    targetId: string,
+    destination: string,
+    localServer: string,
+    context: PaseoToolExecutionContext,
+  ): Promise<HierarchyAgent | null> {
+    let target: HierarchyAgent | null =
+      destination === localServer ? await readHierarchyAgent(targetId) : null;
+    if (destination !== localServer) {
+      const response = await hostResolver.use(destination, (host) =>
+        host.getStatus({ agentId: targetId }, context),
+      );
+      const parsed = z
+        .object({
+          snapshot: z.object({ id: z.string(), labels: z.record(z.string(), z.string()) }),
+        })
+        .safeParse(response.structuredContent);
+      target = parsed.success ? parsed.data.snapshot : null;
+    }
+    return getParentAddressFromLabels(target?.labels, destination)?.serverId === localServer
+      ? target
+      : null;
+  }
+
+  async function checkHierarchy(
+    name: string,
+    args: { agentId?: string; serverId?: string },
+    context: PaseoToolExecutionContext,
+  ): Promise<number> {
+    if (!callerAgentId) return 0;
+    const path = await readAgentHierarchyPath(callerAgentId, readHierarchyAgent);
+    const caller = path.get(callerAgentId);
+    const read = (id: string) => path.get(id);
+    const depth = computeAgentDepth(callerAgentId, read);
+    if (name === "create_agent" && caller) validateCanSpawnChild(caller, read);
+    if (
+      !isPaseoToolEnabled(applyHierarchyPaseoToolPolicy(undefined, caller?.labels, depth), name)
+    ) {
+      throw new PaseoToolInputError(`Paseo tool is disabled for your hierarchy role: ${name}`);
+    }
+    const localServer = options.serverId ?? "self";
+    const destination = args.serverId ?? localServer;
+    const targetsSelf = args.agentId === callerAgentId && destination === localServer;
+    if (name === "set_agent_mode") {
+      if (targetsSelf) return depth;
+      if (depth >= 2) {
+        throw new PaseoToolInputError("Level-2 subagents can only change their own mode.");
+      }
+    }
+    if (name === "respond_to_permission" && depth >= 2 && !targetsSelf) {
+      throw new PaseoToolInputError(
+        "Level-2 subagents cannot respond to permission requests for other agents.",
+      );
+    }
+    if (
+      !args.agentId ||
+      !orchestrationTools.has(name) ||
+      !requiresSingleHopOrchestration(callerAgentId, read)
+    )
+      return depth;
+
+    const targetId = args.agentId;
+    const target = await readOrchestrationTarget(targetId, destination, localServer, context);
+    validateSingleHopOrchestration({
+      callerAgentId,
+      targetAgentId: targetId,
+      readAgent: (id) => (id === targetId && id !== callerAgentId ? target : path.get(id)),
+    });
+    return depth;
+  }
+
   const registerTool = (
     name: string,
     config: PaseoToolConfig,
@@ -769,6 +871,13 @@ function createToolCatalog(
       };
       handler = async ({ serverId, ...input }, context) => {
         const destination = serverId ?? options.serverId;
+        const depth = await checkHierarchy(name, { ...input, serverId }, context);
+        if (name === "create_agent" && callerAgentId && destination !== options.serverId) {
+          input.labels = {
+            ...input.labels,
+            [REMOTE_HIERARCHY_DEPTH_LABEL]: String(depth + 1),
+          };
+        }
         const remoteNotification = await prepareRemoteNotification(name, destination, input);
         try {
           const response = await hostResolver.use(serverId, (host) =>
@@ -803,6 +912,12 @@ function createToolCatalog(
             structuredContent: failure,
           };
         }
+      };
+    } else {
+      const run = handler;
+      handler = async (input, context) => {
+        await checkHierarchy(name, input, context);
+        return run(input, context);
       };
     }
     tools.set(name, {
@@ -2304,6 +2419,18 @@ function createToolCatalog(
       },
     },
     async ({ agentId, name, labels, settings }) => {
+      if (
+        labels &&
+        [
+          PARENT_AGENT_ID_LABEL,
+          PARENT_SERVER_ID_LABEL,
+          WORKSPACE_ROLE_LABEL,
+          MAIN_PRIOR_MODE_ID_LABEL,
+          REMOTE_HIERARCHY_DEPTH_LABEL,
+        ].some((label) => label in labels)
+      ) {
+        throw new PaseoToolInputError("Change agent hierarchy through the workspace controls.");
+      }
       if (settings?.modeId !== undefined) {
         await agentManager.setAgentMode(agentId, settings.modeId);
       }

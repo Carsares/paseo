@@ -1,9 +1,80 @@
 import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-types";
+import { createContext } from "react";
 import { i18n } from "@/i18n/i18next";
 import { encodeFilePathForPathSegment, encodeWorkspaceIdForPathSegment } from "@/utils/host-routes";
 import { buildDeterministicWorkspaceTabId } from "@/workspace-tabs/identity";
 
 export type WorkspaceTabMenuSurface = "desktop" | "mobile";
+
+interface WorkspaceHierarchyActions {
+  isMain: boolean;
+  pending: boolean;
+  setMain: (enabled: boolean) => void;
+  attachToMain?: () => void;
+}
+
+export const WorkspaceMainTabContext = createContext<{
+  mainAgentId: string | null;
+  actionsForTab: (tab: WorkspaceTabDescriptor) => WorkspaceHierarchyActions | undefined;
+} | null>(null);
+
+export function isWorkspaceMainTab(
+  tab: Pick<WorkspaceTabDescriptor, "target">,
+  mainAgentId: string | null | undefined,
+): boolean {
+  return tab.target.kind === "agent" && tab.target.agentId === mainAgentId;
+}
+
+export function getWorkspaceTabHierarchyLabels(language = i18n.language) {
+  return language?.startsWith("zh")
+    ? {
+        badge: "主控",
+        setMain: "设为主标签页",
+        unsetMain: "取消主标签页",
+        attach: "挂载到主标签页",
+        archiveTitle: "归档主标签页？",
+        archiveMessage: "此主控会话下还有未归档的子会话。确定要归档主控会话吗？",
+        attachUnavailable: "此会话现在无法挂载到主标签页。",
+        updateFailed: "未能更新主标签页。",
+      }
+    : {
+        badge: "Main",
+        setMain: "Set as main tab",
+        unsetMain: "Unset main tab",
+        attach: "Attach to main tab",
+        archiveTitle: "Archive main tab?",
+        archiveMessage:
+          "This main agent still has unarchived descendants. Archive the main agent anyway?",
+        attachUnavailable: "This agent can no longer be attached to the main tab.",
+        updateFailed: "Could not update the main tab.",
+      };
+}
+
+export function pinWorkspaceMainTabIds(
+  tabIds: readonly string[],
+  mainTabId: string | null | undefined,
+): string[] {
+  if (!mainTabId) return [...tabIds];
+  const index = tabIds.indexOf(mainTabId);
+  if (index <= 0) return [...tabIds];
+  return [mainTabId, ...tabIds.filter((id) => id !== mainTabId)];
+}
+
+export function getWorkspaceBulkCloseTargets(
+  tabs: WorkspaceTabDescriptor[],
+  tabId: string,
+  direction: "before" | "after" | "others",
+  mainAgentId: string | null,
+): WorkspaceTabDescriptor[] {
+  const index = tabs.findIndex((tab) => tab.tabId === tabId);
+  if (index < 0) return [];
+  return tabs.filter((tab, candidateIndex) => {
+    if (isWorkspaceMainTab(tab, mainAgentId)) return false;
+    if (direction === "before") return candidateIndex < index;
+    if (direction === "after") return candidateIndex > index;
+    return candidateIndex !== index;
+  });
+}
 
 export interface WorkspaceTabMenuLabels {
   copyResumeCommand: string;
@@ -74,6 +145,9 @@ interface BuildWorkspaceTabMenuEntriesInput {
   tab: WorkspaceTabDescriptor;
   index: number;
   tabCount: number;
+  mainTabIndex?: number;
+  hierarchyActions?: WorkspaceHierarchyActions;
+  hierarchyLabels?: ReturnType<typeof getWorkspaceTabHierarchyLabels>;
   menuTestIDBase: string;
   onCopyResumeCommand: (agentId: string) => Promise<void> | void;
   onCopyAgentId: (agentId: string) => Promise<void> | void;
@@ -93,6 +167,9 @@ interface BuildWorkspaceDesktopTabActionsInput {
   tab: WorkspaceTabDescriptor;
   index: number;
   tabCount: number;
+  mainTabIndex?: number;
+  hierarchyActions?: WorkspaceHierarchyActions;
+  hierarchyLabels?: ReturnType<typeof getWorkspaceTabHierarchyLabels>;
   onCopyResumeCommand: (agentId: string) => Promise<void> | void;
   onCopyAgentId: (agentId: string) => Promise<void> | void;
   onCopyTerminalId: (terminalId: string) => Promise<void> | void;
@@ -180,6 +257,8 @@ export function buildWorkspaceTabMenuEntries(
     tab,
     index,
     tabCount,
+    mainTabIndex = -1,
+    hierarchyActions,
     menuTestIDBase,
     onCopyResumeCommand,
     onCopyAgentId,
@@ -194,9 +273,8 @@ export function buildWorkspaceTabMenuEntries(
     onCloseOtherTabs,
   } = input;
   const labels = input.labels ?? DEFAULT_WORKSPACE_TAB_MENU_LABELS;
-  const isFirstTab = index === 0;
-  const isLastTab = index === tabCount - 1;
-  const isOnlyTab = tabCount <= 1;
+  const hasCloseableTabBefore = index > Number(mainTabIndex >= 0 && mainTabIndex < index);
+  const hasCloseableTabAfter = tabCount - index - 1 > Number(mainTabIndex > index);
   const entries: WorkspaceTabMenuEntry[] = [];
 
   if (tab.target.kind === "agent") {
@@ -222,6 +300,29 @@ export function buildWorkspaceTabMenuEntries(
         void onCopyAgentId(agentId);
       },
     });
+  }
+
+  if (tab.target.kind === "agent" && hierarchyActions) {
+    const hierarchyLabels = input.hierarchyLabels ?? getWorkspaceTabHierarchyLabels();
+    const { isMain, pending, setMain, attachToMain } = hierarchyActions;
+    entries.push({
+      kind: "item",
+      key: "toggle-main-tab",
+      label: isMain ? hierarchyLabels.unsetMain : hierarchyLabels.setMain,
+      disabled: pending,
+      testID: `${menuTestIDBase}-toggle-main-tab`,
+      onSelect: () => setMain(!isMain),
+    });
+    if (!isMain && attachToMain) {
+      entries.push({
+        kind: "item",
+        key: "attach-to-main-tab",
+        label: hierarchyLabels.attach,
+        disabled: pending,
+        testID: `${menuTestIDBase}-attach-to-main-tab`,
+        onSelect: attachToMain,
+      });
+    }
   }
 
   if (tab.target.kind === "terminal") {
@@ -276,7 +377,7 @@ export function buildWorkspaceTabMenuEntries(
     key: "close-before",
     label: buildCloseBeforeLabel(surface, labels),
     icon: "arrow-left-to-line",
-    disabled: isFirstTab,
+    disabled: !hasCloseableTabBefore,
     testID: `${menuTestIDBase}-${buildCloseBeforeTestIDSuffix(surface)}`,
     onSelect: () => {
       void onCloseTabsBefore(tab.tabId);
@@ -287,7 +388,7 @@ export function buildWorkspaceTabMenuEntries(
     key: "close-after",
     label: buildCloseAfterLabel(surface, labels),
     icon: "arrow-right-to-line",
-    disabled: isLastTab,
+    disabled: !hasCloseableTabAfter,
     testID: `${menuTestIDBase}-${buildCloseAfterTestIDSuffix(surface)}`,
     onSelect: () => {
       void onCloseTabsAfter(tab.tabId);
@@ -298,7 +399,7 @@ export function buildWorkspaceTabMenuEntries(
     key: "close-others",
     label: labels.closeOthers,
     icon: "copy-x",
-    disabled: isOnlyTab,
+    disabled: !hasCloseableTabBefore && !hasCloseableTabAfter,
     testID: `${menuTestIDBase}-close-others`,
     onSelect: () => {
       void onCloseOtherTabs(tab.tabId);
@@ -355,6 +456,9 @@ export function buildWorkspaceDesktopTabActions(
       tab: input.tab,
       index: input.index,
       tabCount: input.tabCount,
+      mainTabIndex: input.mainTabIndex,
+      hierarchyActions: input.hierarchyActions,
+      hierarchyLabels: input.hierarchyLabels,
       menuTestIDBase: contextMenuTestId,
       onCopyResumeCommand: input.onCopyResumeCommand,
       onCopyAgentId: input.onCopyAgentId,

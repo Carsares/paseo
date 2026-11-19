@@ -25,7 +25,7 @@ import {
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { SheetHostScope } from "@/components/ui/isolated-bottom-sheet-modal";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
-import { getOpenAgentTabLabel } from "@getpaseo/protocol/agent-labels";
+import { getOpenAgentTabLabel, isMainControlAgent } from "@getpaseo/protocol/agent-labels";
 import {
   memo,
   useCallback,
@@ -34,6 +34,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ContextType,
   type ReactElement,
   type ReactNode,
 } from "react";
@@ -88,12 +89,17 @@ import {
 } from "@/workspace-tabs/open-beside";
 import { openWorkspacePullRequest } from "@/workspace-tabs/open-supporting-view";
 import { traceInstant } from "@/performance/native-trace";
-import { useSessionStore, type WorkspaceDescriptor } from "@/stores/session-store";
+import {
+  useSessionStore,
+  type SessionState,
+  type WorkspaceDescriptor,
+} from "@/stores/session-store";
 import {
   canDismissPaneInLayout,
   collectAllTabs,
   DEFAULT_PANE_ID,
   findPaneById,
+  findPaneContainingTab,
   getFocusedBrowserId,
   FOCUSED_PANE_PLACEMENT,
   selectExplorerSidebarPaneId,
@@ -146,6 +152,20 @@ import { buildProviderCommand } from "@/utils/provider-command-templates";
 import { generateDraftId } from "@/stores/draft-keys";
 import { resolveWorkspaceRouteId } from "@/utils/workspace-identity";
 import { useOpenAgentTabLabels } from "@/subagents/use-open-agent-tab-labels";
+import {
+  canAdoptTabUnderMainAgent,
+  createWorkspaceHierarchyTabStateSelector,
+  findWorkspaceMainAgentId,
+  hasUnarchivedWorkspaceDescendants,
+  isWorkspaceRootAgent,
+} from "@/subagents/main-control-tree/select-tree";
+import {
+  getWorkspaceBulkCloseTargets,
+  getWorkspaceTabHierarchyLabels,
+  isWorkspaceMainTab,
+  pinWorkspaceMainTabIds,
+  WorkspaceMainTabContext,
+} from "./workspace-tab-menu";
 import { WorkspaceTabPresentationResolver } from "@/screens/workspace/workspace-tab-presentation";
 import {
   useWorkspaceTabRename,
@@ -786,15 +806,21 @@ function WorkspaceContentProviders({
   children,
   workspaceKey,
   sheetPaneHost,
+  mainTab,
 }: {
   children: ReactNode;
   workspaceKey: string | null;
   sheetPaneHost: SheetPaneHost | null;
+  mainTab: ContextType<typeof WorkspaceMainTabContext>;
 }) {
   return (
     <WorkspaceFocusProvider workspaceKey={workspaceKey}>
       <DiffDocumentWorkspaceCacheProvider>
-        <SheetPaneHostProvider value={sheetPaneHost}>{children}</SheetPaneHostProvider>
+        <SheetPaneHostProvider value={sheetPaneHost}>
+          <WorkspaceMainTabContext.Provider value={mainTab}>
+            {children}
+          </WorkspaceMainTabContext.Provider>
+        </SheetPaneHostProvider>
       </DiffDocumentWorkspaceCacheProvider>
     </WorkspaceFocusProvider>
   );
@@ -1055,7 +1081,11 @@ function WorkspaceScreenContent({
   workspaceId,
   isRouteFocused,
 }: WorkspaceScreenContentProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const hierarchyLabels = useMemo(
+    () => getWorkspaceTabHierarchyLabels(i18n.language),
+    [i18n.language],
+  );
   const _insets = useSafeAreaInsets();
   const workspaceActionsInBar =
     resolveWorkspaceActionPlacement(useWindowLayout()) === "vertical-bar";
@@ -1365,6 +1395,17 @@ function WorkspaceScreenContent({
     () => (workspaceLayout ? collectAllTabs(workspaceLayout.root) : EMPTY_UI_TABS),
     [workspaceLayout],
   );
+  const selectHierarchyTabState = useMemo(
+    () =>
+      createWorkspaceHierarchyTabStateSelector({
+        serverId: normalizedServerId,
+        workspaceId: normalizedWorkspaceId,
+      }),
+    [normalizedServerId, normalizedWorkspaceId],
+  );
+  const hierarchyTabState = useSessionStore(selectHierarchyTabState);
+  const supportsHierarchyControl = useHostFeature(normalizedServerId, "agentHierarchyControl");
+  const mainAgentId = hierarchyTabState.mainAgentId;
   useOpenAgentTabLabels({
     client,
     serverId: normalizedServerId,
@@ -1606,6 +1647,21 @@ function WorkspaceScreenContent({
 
   const activeTabId = focusedPaneTabState.activeTabId;
   const activeTab = focusedPaneTabState.activeTab;
+
+  // Keep the stored pane order aligned with the rail, drag targets, and bulk close actions.
+  useLayoutEffect(() => {
+    if (!isRouteFocused || !persistenceKey || !mainAgentId) return;
+    const mainTab = uiTabs.find((tab) => isWorkspaceMainTab(tab, mainAgentId));
+    const layout = useWorkspaceLayoutStore.getState().layoutByWorkspace[persistenceKey];
+    if (!mainTab || !layout) return;
+    const pane = findPaneContainingTab(layout.root, mainTab.tabId);
+    if (!pane || pane.tabIds.indexOf(mainTab.tabId) <= 0) return;
+    reorderWorkspaceTabsInPane(
+      persistenceKey,
+      pane.id,
+      pinWorkspaceMainTabIds(pane.tabIds, mainTab.tabId),
+    );
+  }, [isRouteFocused, mainAgentId, persistenceKey, reorderWorkspaceTabsInPane, uiTabs]);
 
   const tabs = useMemo<WorkspaceTabDescriptor[]>(
     () => focusedPaneTabState.tabs.map((tab) => tab.descriptor),
@@ -1992,6 +2048,29 @@ function WorkspaceScreenContent({
     ],
   );
 
+  const confirmArchiveAgentTab = useCallback(
+    (session: SessionState | undefined, agentId: string) => {
+      const agent = session?.agents.get(agentId);
+      if (!session || !agent) return true;
+      const hasMainDescendants =
+        isMainControlAgent(agent) &&
+        hasUnarchivedWorkspaceDescendants(session, agentId, normalizedWorkspaceId);
+      if (!hasMainDescendants && agent.status !== "running") return true;
+      return confirmDialog({
+        title: hasMainDescendants
+          ? hierarchyLabels.archiveTitle
+          : t("workspace.tabs.confirmations.archiveRunningAgentTitle"),
+        message: hasMainDescendants
+          ? hierarchyLabels.archiveMessage
+          : t("workspace.tabs.confirmations.archiveRunningAgentMessage"),
+        confirmLabel: t("workspace.tabs.confirmations.archive"),
+        cancelLabel: t("workspace.tabs.confirmations.cancel"),
+        destructive: true,
+      });
+    },
+    [hierarchyLabels, normalizedWorkspaceId, t],
+  );
+
   const handleCloseAgentTab = useCallback(
     async (input: { tabId: string; agentId: string }) => {
       const { tabId, agentId } = input;
@@ -2000,20 +2079,12 @@ function WorkspaceScreenContent({
           return;
         }
 
-        const agent =
-          useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId) ?? null;
+        const session = useSessionStore.getState().sessions[normalizedServerId];
+        const agent = session?.agents.get(agentId) ?? null;
         let closePolicy = resolveCloseAgentTabPolicy(agent);
-        const isRunning = agent?.status === "running";
-
-        if (isRunning && closePolicy.kind === "archive-on-close") {
-          const confirmed = await confirmDialog({
-            title: t("workspace.tabs.confirmations.archiveRunningAgentTitle"),
-            message: t("workspace.tabs.confirmations.archiveRunningAgentMessage"),
-            confirmLabel: t("workspace.tabs.confirmations.archive"),
-            cancelLabel: t("workspace.tabs.confirmations.cancel"),
-            destructive: true,
-          });
-          if (!confirmed) {
+        if (closePolicy.kind === "archive-on-close") {
+          const confirmation = confirmArchiveAgentTab(session, agentId);
+          if (confirmation !== true && !(await confirmation)) {
             return;
           }
         }
@@ -2059,11 +2130,96 @@ function WorkspaceScreenContent({
       archiveAgent,
       closeTab,
       closeWorkspaceTabWithCleanup,
+      confirmArchiveAgentTab,
       normalizedServerId,
       persistenceKey,
       t,
       toast,
     ],
+  );
+
+  const handleMainTabAction = useCallback(
+    async (tabId: string, agentId: string, action: { enabled: boolean } | { attach: true }) => {
+      await closeTab(tabId, async () => {
+        const session = useSessionStore.getState().sessions[normalizedServerId];
+        const agent = session?.agents.get(agentId);
+        if (!session?.client) {
+          toast.error(t("common.errors.daemonClientUnavailable"));
+          return;
+        }
+        if (
+          session.serverInfo?.features?.agentHierarchyControl !== true ||
+          !isWorkspaceRootAgent(agent, normalizedWorkspaceId)
+        ) {
+          toast.error(hierarchyLabels.updateFailed);
+          return;
+        }
+        const sessionClient = session.client;
+        try {
+          if ("enabled" in action) {
+            await sessionClient.setAgentMainControl(agentId, action.enabled);
+            return;
+          }
+          const currentMainId = findWorkspaceMainAgentId(session, normalizedWorkspaceId);
+          if (
+            !currentMainId ||
+            !canAdoptTabUnderMainAgent({ session, agentId, mainAgentId: currentMainId })
+          ) {
+            toast.error(hierarchyLabels.attachUnavailable);
+            return;
+          }
+          await sessionClient.setAgentParent(agentId, currentMainId);
+          // The RPC succeeded even if the updated agent has not reached the session store yet.
+          // Close the view directly so stale root metadata cannot route this through archive.
+          closeWorkspaceTabWithCleanup({ tabId, target: { kind: "agent", agentId } });
+          setHoveredCloseTabKey((current) => (current === tabId ? null : current));
+          // Clear any open-tab label written if agent_update arrived just before the tab closed.
+          void getOrCreateClientId()
+            .then((clientId) =>
+              sessionClient.updateAgent(agentId, {
+                labels: { [getOpenAgentTabLabel(clientId)]: "false" },
+              }),
+            )
+            .catch(() => {});
+        } catch (error) {
+          const message = hierarchyLabels.updateFailed;
+          toast.error(error instanceof Error ? `${message} ${error.message}` : message);
+        }
+      });
+    },
+    [
+      closeTab,
+      closeWorkspaceTabWithCleanup,
+      hierarchyLabels,
+      normalizedServerId,
+      normalizedWorkspaceId,
+      t,
+      toast,
+    ],
+  );
+
+  const mainTabContext = useMemo<NonNullable<ContextType<typeof WorkspaceMainTabContext>>>(
+    () => ({
+      mainAgentId,
+      actionsForTab: (tab) => {
+        if (!supportsHierarchyControl || tab.target.kind !== "agent") return;
+        const { agentId } = tab.target;
+        if (!hierarchyTabState.rootAgentIds.has(agentId)) return;
+        return {
+          isMain: agentId === mainAgentId,
+          pending: closingTabIds.has(tab.tabId),
+          setMain: (enabled) => {
+            void handleMainTabAction(tab.tabId, agentId, { enabled });
+          },
+          attachToMain: hierarchyTabState.adoptableAgentIds.has(agentId)
+            ? () => {
+                void handleMainTabAction(tab.tabId, agentId, { attach: true });
+              }
+            : undefined,
+        };
+      },
+    }),
+    [closingTabIds, handleMainTabAction, hierarchyTabState, mainAgentId, supportsHierarchyControl],
   );
 
   const handleClosePassiveTab = useCallback(
@@ -2291,10 +2447,20 @@ function WorkspaceScreenContent({
         return true;
       }
 
+      const session = useSessionStore.getState().sessions[normalizedServerId];
       const groups = classifyBulkClosableTabs(tabsToClose, (agentId) => {
-        const agent = useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId);
+        const agent = session?.agents?.get(agentId);
         return resolveCloseAgentTabPolicy(agent).kind === "layout-only" ? "layout-only" : "archive";
       });
+      const hasMainWithDescendants =
+        session !== undefined &&
+        groups.archiveAgentTabs.some(({ agentId }) => {
+          const agent = session.agents.get(agentId);
+          return (
+            Boolean(agent && isMainControlAgent(agent)) &&
+            hasUnarchivedWorkspaceDescendants(session, agentId, normalizedWorkspaceId)
+          );
+        });
       const modifiedCount = tabsToClose.filter(
         (tab) =>
           getPanelInstanceAttributes({
@@ -2304,12 +2470,18 @@ function WorkspaceScreenContent({
           }).modified,
       ).length;
       const bulkMessage = buildBulkCloseConfirmationMessage(groups, bulkCloseConfirmationLabels);
+      const confirmationParts = [bulkMessage];
+      if (hasMainWithDescendants) {
+        confirmationParts.push(hierarchyLabels.archiveMessage);
+      }
+      if (modifiedCount > 0) {
+        confirmationParts.push(
+          t("workspace.tabs.confirmations.bulkUnsaved", { count: modifiedCount }),
+        );
+      }
       const confirmed = await confirmDialog({
         title,
-        message:
-          modifiedCount > 0
-            ? `${bulkMessage}\n\n${t("workspace.tabs.confirmations.bulkUnsaved", { count: modifiedCount })}`
-            : bulkMessage,
+        message: confirmationParts.join("\n\n"),
         confirmLabel: t("workspace.tabs.confirmations.close"),
         cancelLabel: t("workspace.tabs.confirmations.cancel"),
         destructive: true,
@@ -2358,6 +2530,7 @@ function WorkspaceScreenContent({
       client,
       closeTab,
       closeWorkspaceTabWithCleanup,
+      hierarchyLabels,
       normalizedServerId,
       normalizedWorkspaceId,
       persistenceKey,
@@ -2367,17 +2540,13 @@ function WorkspaceScreenContent({
 
   const handleCloseTabsToLeftInPane = useCallback(
     async (tabId: string, paneTabs: WorkspaceTabDescriptor[]) => {
-      const index = paneTabs.findIndex((tab) => tab.tabId === tabId);
-      if (index < 0) {
-        return;
-      }
       await handleBulkCloseTabs({
-        tabsToClose: paneTabs.slice(0, index),
+        tabsToClose: getWorkspaceBulkCloseTargets(paneTabs, tabId, "before", mainAgentId),
         title: t("workspace.tabs.confirmations.closeTabsLeftTitle"),
         logLabel: "to the left",
       });
     },
-    [handleBulkCloseTabs, t],
+    [handleBulkCloseTabs, mainAgentId, t],
   );
 
   const handleCloseTabsToLeft = useCallback(
@@ -2389,17 +2558,13 @@ function WorkspaceScreenContent({
 
   const handleCloseTabsToRightInPane = useCallback(
     async (tabId: string, paneTabs: WorkspaceTabDescriptor[]) => {
-      const index = paneTabs.findIndex((tab) => tab.tabId === tabId);
-      if (index < 0) {
-        return;
-      }
       await handleBulkCloseTabs({
-        tabsToClose: paneTabs.slice(index + 1),
+        tabsToClose: getWorkspaceBulkCloseTargets(paneTabs, tabId, "after", mainAgentId),
         title: t("workspace.tabs.confirmations.closeTabsRightTitle"),
         logLabel: "to the right",
       });
     },
-    [handleBulkCloseTabs, t],
+    [handleBulkCloseTabs, mainAgentId, t],
   );
 
   const handleCloseTabsToRight = useCallback(
@@ -2411,14 +2576,13 @@ function WorkspaceScreenContent({
 
   const handleCloseOtherTabsInPane = useCallback(
     async (tabId: string, paneTabs: WorkspaceTabDescriptor[]) => {
-      const tabsToClose = paneTabs.filter((tab) => tab.tabId !== tabId);
       await handleBulkCloseTabs({
-        tabsToClose,
+        tabsToClose: getWorkspaceBulkCloseTargets(paneTabs, tabId, "others", mainAgentId),
         title: t("workspace.tabs.confirmations.closeOtherTabsTitle"),
         logLabel: "from close other tabs",
       });
     },
-    [handleBulkCloseTabs, t],
+    [handleBulkCloseTabs, mainAgentId, t],
   );
 
   const handleCloseOtherTabs = useCallback(
@@ -3199,9 +3363,16 @@ function WorkspaceScreenContent({
       if (!persistenceKey) {
         return;
       }
-      reorderWorkspaceTabsInPane(persistenceKey, paneId, tabIds);
+      const mainTab = mainAgentId
+        ? uiTabs.find((tab) => isWorkspaceMainTab(tab, mainAgentId))
+        : null;
+      reorderWorkspaceTabsInPane(
+        persistenceKey,
+        paneId,
+        pinWorkspaceMainTabIds(tabIds, mainTab?.tabId),
+      );
     },
-    [persistenceKey, reorderWorkspaceTabsInPane],
+    [mainAgentId, persistenceKey, reorderWorkspaceTabsInPane, uiTabs],
   );
 
   const handleReorderTabsInFocusedPane = useCallback(
@@ -3896,6 +4067,7 @@ function WorkspaceScreenContent({
       key={persistenceKey}
       workspaceKey={persistenceKey}
       sheetPaneHost={sheetPaneHost}
+      mainTab={mainTabContext}
     >
       <WorkspaceMarkdownLinks
         workspace={workspaceDescriptor}

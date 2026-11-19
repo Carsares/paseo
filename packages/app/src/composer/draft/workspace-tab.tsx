@@ -1,5 +1,6 @@
 import type { ComposerOptionControls } from "@/agent-controls/option-controls";
 import { useCallback, useEffect, useMemo, useRef } from "react";
+import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { Keyboard, StyleSheet as RNStyleSheet, Text, View } from "react-native";
 import { useTranslation } from "react-i18next";
@@ -17,10 +18,12 @@ import { useDraftAgentCreateFlow, type DraftCreateAttempt } from "@/composer/dra
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { buildWorkspaceDraftAgentConfig } from "@/screens/workspace/workspace-draft-agent-config";
 import { buildDraftStoreKey } from "@/stores/draft-keys";
+import { flushDraftPersistStorage } from "@/stores/draft-store";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
 import type { Agent } from "@/stores/session-store";
 import { useWorkspaceFields } from "@/stores/session-store-hooks";
 import { useWorkspaceDraftSubmissionStore } from "@/stores/workspace-draft-submission-store";
+import { collectAllTabs, useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
 import { useAgentControlCommandCenterActions } from "@/command-center/agent-control-registration";
 import { encodeImages } from "@/utils/encode-images";
 import { shouldAutoFocusWorkspaceDraftComposer } from "@/screens/workspace/workspace-draft-pane-focus";
@@ -48,6 +51,7 @@ import {
 import { openWorkspaceChanges } from "@/workspace-tabs/open-supporting-view";
 import { useSettings } from "@/hooks/use-settings";
 import { draftCreationKey } from "@/composer/draft/creation-key";
+import { ParentAgentPill } from "@/subagents/parent";
 
 interface AutoSubmitConfig {
   provider: string;
@@ -90,6 +94,11 @@ function resolveDraftModeIdOverride(input: {
   return {};
 }
 
+function normalizeParentAgentId(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
 function resolveDraftModeId(input: {
   autoSubmitConfig: AutoSubmitConfig | null;
   effectiveModeId: string;
@@ -104,14 +113,15 @@ function resolveDraftModeId(input: {
   return null;
 }
 
-async function submitDraftCreateRequest(input: {
+export async function submitDraftCreateRequest(input: {
   draftId: string;
+  parentAgentId?: string | null;
   attempt: { clientMessageId: string };
   text: string;
   images?: UserMessageImageAttachment[];
   attachments?: unknown;
   cwd: string;
-  client: DaemonClient | null;
+  client: Pick<DaemonClient, "createAgent"> | null;
   workspaceDirectory: string | null;
   workspaceId: string | null;
   autoSubmitConfig: AutoSubmitConfig | null;
@@ -135,6 +145,7 @@ async function submitDraftCreateRequest(input: {
     client,
     workspaceDirectory,
     workspaceId,
+    parentAgentId,
     autoSubmitConfig,
     composerState,
   } = input;
@@ -165,14 +176,16 @@ async function submitDraftCreateRequest(input: {
 
   const attachmentsArray = Array.isArray(attachments) ? attachments : undefined;
   const imagesData = await encodeImages(images);
+  const callerAgentId = normalizeParentAgentId(parentAgentId);
   const request = {
     config,
     workspaceId,
+    ...(callerAgentId ? { callerAgentId } : {}),
     initialPrompt: text,
     clientMessageId: attempt.clientMessageId,
     ...(Object.keys(composerState.metadata).length > 0 ? { metadata: composerState.metadata } : {}),
-    ...(imagesData && imagesData.length > 0 ? { images: imagesData } : {}),
-    ...(attachmentsArray && attachmentsArray.length > 0 ? { attachments: attachmentsArray } : {}),
+    ...(imagesData?.length ? { images: imagesData } : {}),
+    ...(attachmentsArray?.length ? { attachments: attachmentsArray } : {}),
   };
   const result = await client.createAgent({
     ...request,
@@ -189,6 +202,7 @@ function buildDraftAgentSnapshot(input: {
   attempt: { timestamp: Date };
   serverId: string;
   tabId: string;
+  parentAgentId?: string | null;
   workspaceDirectory: string | null;
   autoSubmitConfig: AutoSubmitConfig | null;
   composerState: {
@@ -200,7 +214,15 @@ function buildDraftAgentSnapshot(input: {
   };
   selectModelMessage: string;
 }): Agent {
-  const { attempt, serverId, tabId, workspaceDirectory, autoSubmitConfig, composerState } = input;
+  const {
+    attempt,
+    serverId,
+    tabId,
+    parentAgentId,
+    workspaceDirectory,
+    autoSubmitConfig,
+    composerState,
+  } = input;
   invariant(workspaceDirectory, "Workspace directory is required");
   const now = attempt.timestamp;
   const model = autoSubmitConfig?.model ?? (composerState.effectiveModelId || null);
@@ -214,6 +236,7 @@ function buildDraftAgentSnapshot(input: {
   if (!provider) {
     throw new Error(input.selectModelMessage);
   }
+  const normalizedParentAgentId = normalizeParentAgentId(parentAgentId);
   return {
     serverId,
     id: tabId,
@@ -236,9 +259,48 @@ function buildDraftAgentSnapshot(input: {
     options: composerState.agentControls.optionControls?.options,
     controls: composerState.agentControls.optionControls?.controls,
     thinkingOptionId,
-    parentAgentId: null,
-    labels: {},
+    parentAgentId: normalizedParentAgentId,
+    labels: normalizedParentAgentId ? { [PARENT_AGENT_ID_LABEL]: normalizedParentAgentId } : {},
   };
+}
+
+export function useInitialDraftText(input: {
+  draftKey: string;
+  isHydrated: boolean;
+  initialDraftText: string | null | undefined;
+  textSource: { getSnapshot: () => string };
+  replaceDraftText: (text: string) => void;
+  onInitialized: () => void;
+}) {
+  const { draftKey, isHydrated, initialDraftText, textSource, replaceDraftText, onInitialized } =
+    input;
+  const initializedDraftKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (!isHydrated || !initialDraftText?.trim() || initializedDraftKey.current === draftKey)
+      return;
+    initializedDraftKey.current = draftKey;
+    if (textSource.getSnapshot() === "") replaceDraftText(initialDraftText);
+    onInitialized();
+  }, [draftKey, initialDraftText, isHydrated, onInitialized, replaceDraftText, textSource]);
+}
+
+async function consumeDraftTextSeed(input: {
+  workspaceKey: string | null;
+  tabId: string;
+  draftId: string;
+}) {
+  const { workspaceKey, tabId, draftId } = input;
+  if (!workspaceKey) return;
+  // Save the editable text before removing the seed so deleted text stays deleted on reload.
+  await flushDraftPersistStorage();
+  const layoutStore = useWorkspaceLayoutStore.getState();
+  const layout = layoutStore.layoutByWorkspace[workspaceKey];
+  const target = layout && collectAllTabs(layout.root).find((tab) => tab.tabId === tabId)?.target;
+  if (target?.kind !== "draft" || target.draftId !== draftId || !target.setup?.initialDraftText) {
+    return;
+  }
+  const { initialDraftText: _seed, ...setup } = target.setup;
+  layoutStore.replaceTab(workspaceKey, tabId, { ...target, setup });
 }
 
 function buildDraftInitialValues(input: {
@@ -343,6 +405,22 @@ export function WorkspaceDraftComposer({
   const clearDraftInput = draftInput.clear;
   const replaceDraftText = draftInput.replaceText;
   const setDraftAttachments = draftInput.setAttachments;
+  const parentAgentId = normalizeParentAgentId(draftSetup?.parentAgentId);
+  const handleInitialTextApplied = useCallback(() => {
+    void consumeDraftTextSeed({
+      workspaceKey: buildWorkspaceTabPersistenceKey({ serverId, workspaceId }),
+      tabId,
+      draftId,
+    });
+  }, [draftId, serverId, tabId, workspaceId]);
+  useInitialDraftText({
+    draftKey: draftStoreKey,
+    isHydrated: draftInput.isHydrated,
+    initialDraftText: draftSetup?.initialDraftText,
+    textSource: draftInput.textSource,
+    replaceDraftText,
+    onInitialized: handleInitialTextApplied,
+  });
   const pendingAutoSubmit = useWorkspaceDraftSubmissionStore((state) => {
     const pending = state.pendingByDraftId[draftId] ?? null;
     return pending?.serverId === serverId && pending.workspaceId === workspaceId ? pending : null;
@@ -438,6 +516,7 @@ export function WorkspaceDraftComposer({
           attempt,
           serverId,
           tabId,
+          parentAgentId,
           workspaceDirectory: draftWorkingDirectory,
           autoSubmitConfig,
           composerState,
@@ -450,6 +529,7 @@ export function WorkspaceDraftComposer({
         }
         return submitDraftCreateRequest({
           draftId,
+          parentAgentId,
           attempt,
           text,
           images,
@@ -582,12 +662,12 @@ export function WorkspaceDraftComposer({
           </View>
         </View>
       ) : null}
-      {importPillPress && !isComposerFullscreen ? (
-        <View style={styles.importPillRow}>
-          <View style={styles.importPillContent}>
-            <ComposerImportPill onPress={importPillPress} />
-          </View>
-        </View>
+      {!isComposerFullscreen ? (
+        <DraftComposerPills
+          serverId={serverId}
+          parentAgentId={parentAgentId}
+          onImport={importPillPress}
+        />
       ) : null}
       <Composer
         agentId={tabId}
@@ -618,6 +698,28 @@ export function WorkspaceDraftComposer({
   );
 }
 
+function DraftComposerPills({
+  serverId,
+  parentAgentId,
+  onImport,
+}: {
+  serverId: string;
+  parentAgentId?: string | null;
+  onImport?: (() => void) | null;
+}) {
+  if (!parentAgentId && !onImport) return null;
+  return (
+    <View style={styles.pillRow}>
+      <View style={styles.pillContent}>
+        {parentAgentId ? (
+          <ParentAgentPill serverId={serverId} parentAgentId={parentAgentId} />
+        ) : null}
+        {onImport ? <ComposerImportPill onPress={onImport} /> : null}
+      </View>
+    </View>
+  );
+}
+
 const animatedStaticStyles = RNStyleSheet.create({
   inputAreaWrapper: {
     width: "100%",
@@ -633,7 +735,7 @@ const styles = StyleSheet.create((theme) => ({
     paddingHorizontal: theme.spacing[4],
     alignItems: "center",
   },
-  importPillRow: {
+  pillRow: {
     width: "100%",
     paddingHorizontal: theme.spacing[4],
     paddingTop: {
@@ -646,10 +748,11 @@ const styles = StyleSheet.create((theme) => ({
     },
     alignItems: "center",
   },
-  importPillContent: {
+  pillContent: {
     width: "100%",
     maxWidth: theme.contentMaxWidth,
     flexDirection: "row",
+    gap: theme.spacing[2],
   },
   formError: {
     width: "100%",

@@ -2,6 +2,7 @@ import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { isMainControlAgent } from "@getpaseo/protocol/agent-labels";
 import type { TFunction } from "i18next";
 import { SquarePen } from "lucide-react-native";
 import React, {
@@ -87,6 +88,7 @@ import { type DraftConversation, useDraftTimeline } from "@/composer/draft/timel
 import { AgentTracks } from "@/panels/agent-tracks";
 import { OverlayDismissalScope } from "@/components/ui/overlay-dismissal";
 import { ParentAgentCallout, useParentAgentId } from "@/subagents/parent";
+import { MainControlTreeLayout } from "@/subagents/main-control-tree";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
 import { buildDraftStoreKey, generateDraftId } from "@/stores/draft-keys";
 import {
@@ -1103,6 +1105,10 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   const paneHost = usePaneContext().host;
   const showsComposer = draft !== null || paneHost !== "sheet";
   // The dock lays out fullscreen for the same session the composer edits in.
+  const mainAgentId = useSessionStore((state) => {
+    const agent = resolveChatAgentFromSession(state, serverId, effectiveAgent?.id);
+    return agent && isMainControlAgent(agent) ? agent.id : null;
+  });
   const composerEditingSession = useComposerEditingSession("chat");
   const isComposerFullscreen = useComposerFullscreen(composerEditingSession);
   const hasActiveComposer = !agentState.archivedAt && !isArchivingCurrentAgent;
@@ -1276,24 +1282,28 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     </ChatSurface>
   );
 
+  const chat = (
+    <View style={styles.root}>
+      {dock}
+
+      {isArchivingCurrentAgent ? (
+        <View style={styles.archivingOverlay} testID="agent-archiving-overlay">
+          <ThemedLoadingSpinner size="large" uniProps={foregroundColorMapping} />
+          <Text style={styles.archivingTitle}>{t("agentPanel.states.archivingTitle")}</Text>
+          <Text style={styles.archivingSubtitle}>{t("agentPanel.states.archivingSubtitle")}</Text>
+        </View>
+      ) : null}
+    </View>
+  );
   const content = (
-    <RewindComposerRestoreProvider
+    <ChatAgentReadyFrame
       textSource={agentInputDraft.textSource}
       setText={agentInputDraft.replaceText}
       onRewindComplete={handleRewindComplete}
+      mainAgentId={mainAgentId}
     >
-      <View style={styles.root}>
-        {dock}
-
-        {isArchivingCurrentAgent ? (
-          <View style={styles.archivingOverlay} testID="agent-archiving-overlay">
-            <ThemedLoadingSpinner size="large" uniProps={foregroundColorMapping} />
-            <Text style={styles.archivingTitle}>{t("agentPanel.states.archivingTitle")}</Text>
-            <Text style={styles.archivingSubtitle}>{t("agentPanel.states.archivingSubtitle")}</Text>
-          </View>
-        ) : null}
-      </View>
-    </RewindComposerRestoreProvider>
+      {chat}
+    </ChatAgentReadyFrame>
   );
   return wrapAgentCommandProvider({
     enabled: showsComposer && hasActiveComposer && !draft,
@@ -1303,6 +1313,18 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     children: content,
   });
 });
+
+function ChatAgentReadyFrame({
+  mainAgentId,
+  children,
+  ...rewind
+}: React.ComponentProps<typeof RewindComposerRestoreProvider> & { mainAgentId: string | null }) {
+  return (
+    <RewindComposerRestoreProvider {...rewind}>
+      <MainControlTreeLayout mainAgentId={mainAgentId}>{children}</MainControlTreeLayout>
+    </RewindComposerRestoreProvider>
+  );
+}
 
 function wrapAgentCommandProvider({
   enabled,

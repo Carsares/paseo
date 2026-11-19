@@ -1,0 +1,292 @@
+import {
+  getParentAgentIdFromLabels,
+  isMainControlAgentLabels,
+  resolveAgentHierarchyDepth,
+} from "@getpaseo/protocol/agent-labels";
+import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
+import type { AgentPermissionRequest, AgentSessionConfig } from "./agent-sdk-types.js";
+
+export const MAX_SUBAGENT_DEPTH = 2;
+export const MAIN_CONTROL_WRITE_DENIAL = "Main Control agents are read-only.";
+/** Absolute depth supplied by the parent host when it creates a remote child. */
+export const REMOTE_HIERARCHY_DEPTH_LABEL = "paseo.remote-hierarchy-depth";
+
+export interface HierarchyAgent {
+  id: string;
+  labels?: Record<string, string>;
+  archivedAt?: string | null;
+  title?: string | null;
+  lifecycle?: string;
+}
+
+type ReadAgent = (id: string) => HierarchyAgent | null | undefined;
+type ListActiveAgents = () => Iterable<HierarchyAgent>;
+
+export async function readAgentHierarchyPath(
+  agentId: string,
+  readAgent: (id: string) => Promise<HierarchyAgent | null | undefined>,
+): Promise<ReadonlyMap<string, HierarchyAgent>> {
+  const agents = new Map<string, HierarchyAgent>();
+  let id: string | null = agentId;
+  while (id && !agents.has(id)) {
+    const agent = await readAgent(id);
+    if (!agent) break;
+    agents.set(id, agent);
+    id = getParentAgentIdFromLabels(agent.labels);
+  }
+  return agents;
+}
+
+export function computeAgentDepth(agentId: string, readAgent: ReadAgent): number {
+  let remoteParentDepth = 0;
+  const depth = resolveAgentHierarchyDepth(agentId, (id) => {
+    const labels = readAgent(id)?.labels;
+    const parentId = getParentAgentIdFromLabels(labels);
+    if (parentId && labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] === String(MAX_SUBAGENT_DEPTH)) {
+      // The declared remote child is already Level-2. Count its parent hop and
+      // add the remaining hop, regardless of whether that parent exists locally.
+      remoteParentDepth = 1;
+    }
+    return parentId;
+  });
+  return depth + remoteParentDepth;
+}
+
+export function computeMaxSubtreeDepth(
+  rootAgentId: string,
+  listActiveAgents: ListActiveAgents,
+): number {
+  const children = new Map<string, string[]>();
+  for (const agent of listActiveAgents()) {
+    const parentId = getParentAgentIdFromLabels(agent.labels);
+    if (!parentId || agent.archivedAt) continue;
+    const siblings = children.get(parentId);
+    if (siblings) siblings.push(agent.id);
+    else children.set(parentId, [agent.id]);
+  }
+  const seen = new Set<string>();
+  const pending = [{ id: rootAgentId, depth: 0 }];
+  let maxDepth = 0;
+  while (pending.length) {
+    const { id, depth } = pending.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    maxDepth = Math.max(maxDepth, depth);
+    for (const childId of children.get(id) ?? []) {
+      pending.push({ id: childId, depth: depth + 1 });
+    }
+  }
+  return maxDepth;
+}
+
+export function validateCanSpawnChild(parentAgent: HierarchyAgent, readAgent: ReadAgent): void {
+  if (parentAgent.archivedAt) throw new Error("Archived agents cannot spawn subagents.");
+  if (computeAgentDepth(parentAgent.id, readAgent) >= MAX_SUBAGENT_DEPTH) {
+    throw new Error(
+      "Level-2 subagents cannot spawn nested subagents (maximum hierarchy depth is 3 tiers: Main -> Level-1 -> Level-2).",
+    );
+  }
+}
+
+export function validateSetAgentParent({
+  agent,
+  parentAgent,
+  readAgent,
+  listActiveAgents,
+}: {
+  agent: HierarchyAgent;
+  parentAgent: HierarchyAgent;
+  readAgent: ReadAgent;
+  listActiveAgents: ListActiveAgents;
+}): void {
+  if (agent.id === parentAgent.id) throw new Error("An agent cannot be its own parent.");
+  if (agent.archivedAt || parentAgent.archivedAt) {
+    throw new Error("Cannot reparent an archived agent or attach to an archived parent.");
+  }
+  if (isMainControlAgentLabels(agent.labels)) {
+    throw new Error("Disable Main Control before attaching this agent to a parent.");
+  }
+  const seen = new Set<string>();
+  let ancestorId: string | null = parentAgent.id;
+  while (ancestorId) {
+    if (ancestorId === agent.id || seen.has(ancestorId)) {
+      throw new Error("This parent relationship would create or join a cycle.");
+    }
+    seen.add(ancestorId);
+    ancestorId = getParentAgentIdFromLabels(readAgent(ancestorId)?.labels);
+  }
+  if (
+    computeAgentDepth(parentAgent.id, readAgent) +
+      1 +
+      computeMaxSubtreeDepth(agent.id, listActiveAgents) >
+    MAX_SUBAGENT_DEPTH
+  ) {
+    throw new Error(
+      "This parent relationship would exceed the maximum hierarchy depth of 3 tiers.",
+    );
+  }
+}
+
+export function validateSingleHopOrchestration({
+  callerAgentId,
+  targetAgentId,
+  readAgent,
+}: {
+  callerAgentId: string;
+  targetAgentId: string;
+  readAgent: ReadAgent;
+}): void {
+  const target = readAgent(targetAgentId);
+  if (
+    requiresSingleHopOrchestration(callerAgentId, readAgent) &&
+    getParentAgentIdFromLabels(target?.labels) !== callerAgentId
+  ) {
+    throw new Error(
+      "You can only manage your direct subagents. Coordinate through your direct child.",
+    );
+  }
+}
+
+export function requiresSingleHopOrchestration(
+  callerAgentId: string,
+  readAgent: ReadAgent,
+): boolean {
+  return (
+    isMainControlAgentLabels(readAgent(callerAgentId)?.labels) ||
+    computeAgentDepth(callerAgentId, readAgent) === 1
+  );
+}
+
+const MAIN_CONTROL_DISABLED_TOOLS = [
+  "create_terminal",
+  "send_terminal_keys",
+  "kill_terminal",
+  "start_workspace_script",
+  "stop_workspace_script",
+];
+const LEVEL_TWO_DISABLED_TOOLS = [
+  "create_agent",
+  "send_agent_prompt",
+  "update_agent",
+  "cancel_agent",
+  "archive_agent",
+  "kill_agent",
+];
+
+export function applyHierarchyPaseoToolPolicy(
+  policy: ProviderPaseoToolsPolicy | undefined,
+  labels: HierarchyAgent["labels"],
+  depth: number,
+): ProviderPaseoToolsPolicy | undefined {
+  const disabledTools = [
+    ...(isMainControlAgentLabels(labels) ? MAIN_CONTROL_DISABLED_TOOLS : []),
+    ...(depth >= MAX_SUBAGENT_DEPTH ? LEVEL_TWO_DISABLED_TOOLS : []),
+  ];
+  if (disabledTools.length === 0) return policy;
+  return {
+    ...policy,
+    disabledTools: [...new Set([...(policy?.disabledTools ?? []), ...disabledTools])],
+  };
+}
+
+export function applyMainControlReadOnlyConfig(
+  config: AgentSessionConfig,
+  labels: HierarchyAgent["labels"],
+  provider = config.provider,
+): AgentSessionConfig {
+  if (!isMainControlAgentLabels(labels)) return config;
+  if (provider === "codex") {
+    return {
+      ...config,
+      modeId: "read-only",
+      providerOptions: {
+        ...config.providerOptions,
+        sandbox_mode: "read-only",
+        approval_policy: "never",
+      },
+    };
+  }
+  if (provider === "claude") {
+    const existing = config.providerOptions?.disallowedTools;
+    return {
+      ...config,
+      providerOptions: {
+        ...config.providerOptions,
+        disallowedTools: [
+          ...new Set([
+            ...(Array.isArray(existing) ? existing : []),
+            "Edit",
+            "MultiEdit",
+            "Write",
+            "NotebookEdit",
+            "Bash",
+          ]),
+        ],
+      },
+    };
+  }
+  return config;
+}
+
+export function isMainControlWritePermissionBlocked(
+  request: Pick<AgentPermissionRequest, "kind" | "name" | "detail">,
+): boolean {
+  if (request.detail?.type === "edit" || request.detail?.type === "write") return true;
+  if (request.kind !== "tool") return false;
+  const name = request.name
+    .replace(/([a-z])([A-Z])/g, "$1_$2")
+    .replace(/[-\s]+/g, "_")
+    .toLowerCase()
+    .split(/__|[./:]+/)
+    .at(-1);
+  return /^(?:(?:multi_|notebook_)?edit|(?:file_|filesystem_|fs_)?(?:edit|write|patch)|(?:edit|write|patch|create|delete|remove|move|rename)_file|write_to_file|(?:multi_)?replace_file_content|replace|str_replace_editor|apply_patch|(?:codex_)?file_change)(?:_tool)?$/.test(
+    name ?? "",
+  );
+}
+
+export function buildHierarchyAppendSystemPrompt({
+  agent,
+  readAgent,
+  listActiveAgents,
+}: {
+  agent: HierarchyAgent;
+  readAgent: ReadAgent;
+  listActiveAgents: ListActiveAgents;
+}): string {
+  const parentId = getParentAgentIdFromLabels(agent.labels);
+  const parent = parentId ? readAgent(parentId) : null;
+  let contract: string[];
+  let childRole: string;
+  if (isMainControlAgentLabels(agent.labels)) {
+    contract = [
+      "Role: Workspace Main Control Coordinator. Work strictly read-only. Do not modify files or run builds that alter the workspace.",
+      "Break workspace goals into module tasks and delegate them to Level-1 Sub-Agents with create_agent.",
+      "Coordinate cross-module changes and pacing through direct children with send_agent_prompt and update_agent. Route Level-2 work through its Level-1 lead.",
+      "Summarize reports from your children for the user.",
+    ];
+    childRole = "Level-1";
+  } else if (
+    parent &&
+    !parent.archivedAt &&
+    isMainControlAgentLabels(parent.labels) &&
+    computeAgentDepth(agent.id, readAgent) === 1
+  ) {
+    contract = [
+      `Role: Level-1 Module Lead (Flexible Mode) under Main Control Agent ${parent.id}.`,
+      "Refine the module's requirements, edge cases, and file boundaries. Delegate substantive implementation and independent verification to Level-2 Sub-Agents with create_agent.",
+      "Keep your own edits to small final adjustments and integration. Once verified, finish your turn with a concise summary of outcomes and changed files for your parent.",
+    ];
+    childRole = "Level-2";
+  } else {
+    return "";
+  }
+  const children = [...listActiveAgents()]
+    .filter((child) => !child.archivedAt && getParentAgentIdFromLabels(child.labels) === agent.id)
+    .sort((left, right) => left.id.localeCompare(right.id, "en"))
+    .map(({ id, title, lifecycle }) => ({
+      id,
+      title: title ?? null,
+      status: lifecycle ?? "closed",
+    }));
+  return [...contract, `Direct ${childRole} children: ${JSON.stringify(children)}`].join("\n");
+}

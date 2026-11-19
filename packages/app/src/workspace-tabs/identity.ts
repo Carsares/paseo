@@ -84,6 +84,14 @@ export function normalizeWorkspaceDraftTabSetup(
   if (!provider || !cwd) {
     return undefined;
   }
+  const parentAgentId = trimNonEmpty(
+    typeof record.parentAgentId === "string" ? record.parentAgentId : null,
+  );
+  // Test for content without stripping Markdown whitespace, including the final newline.
+  const initialDraftText =
+    typeof record.initialDraftText === "string" && record.initialDraftText.trim()
+      ? record.initialDraftText
+      : null;
   return {
     provider,
     cwd,
@@ -93,6 +101,8 @@ export function normalizeWorkspaceDraftTabSetup(
       typeof record.thinkingOptionId === "string" ? record.thinkingOptionId : null,
     ),
     providerOptions: isPlainRecord(record.providerOptions) ? { ...record.providerOptions } : {},
+    ...(parentAgentId ? { parentAgentId } : {}),
+    ...(initialDraftText ? { initialDraftText } : {}),
   };
 }
 
@@ -171,6 +181,8 @@ function workspaceDraftTabSetupsEqual(
     left.modeId === right.modeId &&
     left.model === right.model &&
     left.thinkingOptionId === right.thinkingOptionId &&
+    (left.parentAgentId ?? null) === (right.parentAgentId ?? null) &&
+    (left.initialDraftText ?? null) === (right.initialDraftText ?? null) &&
     recordsShallowEqual(left.providerOptions, right.providerOptions)
   );
 }

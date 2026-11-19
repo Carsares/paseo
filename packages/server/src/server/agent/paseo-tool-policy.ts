@@ -1,4 +1,6 @@
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
+import { applyHierarchyPaseoToolPolicy } from "./hierarchy-policy.js";
+import type { HierarchyAgent } from "./hierarchy-policy.js";
 
 interface ProviderPaseoToolSettings {
   paseoTools?: ProviderPaseoToolsPolicy;
@@ -26,4 +28,12 @@ export function isPaseoToolEnabled(
 
 export function isPaseoToolPolicyEnabled(policy: ProviderPaseoToolsPolicy | undefined): boolean {
   return policy?.enabled !== false;
+}
+
+export function resolveAgentPaseoToolPolicy(
+  policy: ProviderPaseoToolsPolicy | undefined,
+  agent: HierarchyAgent | undefined,
+  depth: number,
+): ProviderPaseoToolsPolicy | undefined {
+  return applyHierarchyPaseoToolPolicy(policy, agent?.labels, depth);
 }

@@ -17,25 +17,64 @@ import {
 } from "react-native";
 import { createPortal } from "react-dom";
 import { FadeIn } from "react-native-reanimated";
-import { StyleSheet } from "react-native-unistyles";
-import { TextQuote } from "lucide-react-native";
+import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import { Copy, GitBranch, TextQuote } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import { computePosition, type Alignment, type Rect, type Size } from "@/components/ui/anchor";
 import { Button } from "@/components/ui/button";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  useContextMenu,
+} from "@/components/ui/context-menu";
 import { FloatingSurface, type FloatingSurfaceProps } from "@/components/ui/floating";
 import { EditingTextInput, type EditingTextInputHandle } from "@/components/ui/text-input";
 import { resolveKeyboardFocusScope } from "@/keyboard/focus-scope";
 import { getOverlayRoot, OverlayLayerProvider, useOverlayLayer } from "@/lib/overlay-root";
 import { useOverlayRegistration, type KeyboardInputEvent } from "@/keyboard";
 import { isImeComposingKeyboardEvent } from "@/utils/keyboard-ime";
-import { createAssistantSelectionMarkdown } from "./content.web";
+import { ICON_SIZE, type Theme } from "@/styles/theme";
+import { copyToClipboard } from "@/utils/copy-to-clipboard";
+import type { MarkdownClipboardContent } from "@/utils/rich-clipboard";
+import {
+  createAssistantSelectionClipboardContent,
+  createAssistantSelectionMarkdown,
+} from "./content.web";
 import type { ComposerQuote } from "./composer-quote";
 
 type QuoteState = { phase: "idle" } | { phase: "offered" | "noting"; range: Range; quote: string };
+interface SelectionPassage {
+  range: Range;
+  quote: string;
+}
 
 const IDLE: QuoteState = { phase: "idle" };
 const ANCHOR_OFFSET = 4;
 const FADE_IN = FadeIn.duration(80);
+const SELECTION_MENU_ID = "assistant-selection-context-menu";
+const MenuBranchIcon = withUnistyles(GitBranch);
+const MenuQuoteIcon = withUnistyles(TextQuote);
+const MenuCopyIcon = withUnistyles(Copy);
+const menuIconColor = (theme: Theme) => ({ color: theme.colors.foreground });
+const branchIcon = <MenuBranchIcon size={ICON_SIZE.sm} uniProps={menuIconColor} />;
+const quoteIcon = <MenuQuoteIcon size={ICON_SIZE.sm} uniProps={menuIconColor} />;
+const copyIcon = <MenuCopyIcon size={ICON_SIZE.sm} uniProps={menuIconColor} />;
+
+interface AssistantSelectionQuoteProps {
+  streamRef: RefObject<HTMLElement | null>;
+  onQuote?: (quote: ComposerQuote) => void;
+  onSpawnSubagentFromSelection?: (selectedMarkdown: string) => void;
+}
+
+export function AssistantSelectionQuote(props: AssistantSelectionQuoteProps) {
+  return (
+    <ContextMenu compactMode="popover">
+      <SelectionActions {...props} />
+    </ContextMenu>
+  );
+}
 
 /**
  * Quote for a selection inside one agent message: a Quote button at the end of the
@@ -45,21 +84,31 @@ const FADE_IN = FadeIn.duration(80);
  * The quote is read when the selection settles, so a message that keeps streaming, or
  * a selection the note box takes over, still quotes what was selected.
  */
-export function AssistantSelectionQuote({
+function SelectionActions({
   streamRef,
   onQuote,
-}: {
-  /** The agent's message stream; a selection anywhere else is not this quote's. */
-  streamRef: RefObject<HTMLElement | null>;
-  onQuote: (quote: ComposerQuote) => void;
-}) {
+  onSpawnSubagentFromSelection,
+}: AssistantSelectionQuoteProps) {
+  const { i18n } = useTranslation();
+  const isChinese = i18n.language?.startsWith("zh");
+  const spawnLabel = isChinese ? "新建子会话" : "New subagent";
   const [state, setState] = useState<QuoteState>(IDLE);
+  const [menuSelection, setMenuSelection] = useState<
+    (SelectionPassage & { clipboard: MarkdownClipboardContent }) | null
+  >(null);
   const stateRef = useRef(state);
   const floatingRef = useRef<HTMLElement | null>(null);
+  const { open: menuOpen, setOpen: setMenuOpen, setAnchorRect } = useContextMenu();
+  const menuOpenRef = useRef(menuOpen);
+  menuOpenRef.current = menuOpen;
   const update = useCallback((next: QuoteState) => {
     stateRef.current = next;
     setState(next);
   }, []);
+
+  useEffect(() => {
+    if (!menuOpen) setMenuSelection(null);
+  }, [menuOpen]);
 
   useEffect(() => {
     let pointerDown = false;
@@ -67,29 +116,23 @@ export function AssistantSelectionQuote({
 
     const readSelection = () => {
       frame = 0;
-      if (stateRef.current.phase === "noting") return;
-      const selection = window.getSelection();
-      const range =
-        selection && selection.rangeCount === 1 && !selection.isCollapsed
-          ? selection.getRangeAt(0)
-          : null;
-      const quote =
-        range && streamRef.current?.contains(range.commonAncestorContainer)
-          ? createAssistantSelectionMarkdown(selection)
-          : null;
-      update(range && quote ? { phase: "offered", range: range.cloneRange(), quote } : IDLE);
+      if (stateRef.current.phase === "noting" || menuOpenRef.current) return;
+      const passage = readSelectionPassage(streamRef.current, window.getSelection());
+      update(passage ? { phase: "offered", ...passage } : IDLE);
     };
     const scheduleRead = () => {
       if (!frame) frame = window.requestAnimationFrame(readSelection);
     };
     const handleSelectionChange = () => {
       // A drag settles on pointerup; until then the button would chase the pointer.
-      if (!pointerDown) scheduleRead();
+      if (!pointerDown && !menuOpenRef.current) scheduleRead();
     };
     const handlePointerDown = (event: PointerEvent) => {
+      if (menuOpenRef.current) return;
       if (floatingRef.current?.contains(event.target as Node)) return;
-      pointerDown = true;
       update(IDLE);
+      if (event.button === 2) return;
+      pointerDown = true;
     };
     const handlePointerUp = () => {
       if (!pointerDown) return;
@@ -108,7 +151,67 @@ export function AssistantSelectionQuote({
     };
   }, [streamRef, update]);
 
+  useEffect(() => {
+    const stream = streamRef.current;
+    if (!stream || (!onQuote && !onSpawnSubagentFromSelection)) return;
+    const handleContextMenu = (event: MouseEvent) => {
+      if (event.defaultPrevented) return;
+      if (isEditableContextTarget(event.target)) return;
+      const selection = window.getSelection();
+      const passage = readSelectionPassage(stream, selection);
+      if (!passage) return;
+      if (event.target instanceof Node && !passage.range.intersectsNode(event.target)) return;
+      const clipboard = createAssistantSelectionClipboardContent(selection);
+      if (!clipboard) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      update(IDLE);
+      setMenuSelection({ ...passage, clipboard });
+      setAnchorRect({ x: event.clientX, y: event.clientY, width: 0, height: 0 });
+      setMenuOpen(true);
+    };
+    stream.addEventListener("contextmenu", handleContextMenu);
+    return () => stream.removeEventListener("contextmenu", handleContextMenu);
+  }, [onQuote, onSpawnSubagentFromSelection, setAnchorRect, setMenuOpen, streamRef, update]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = () => setMenuOpen(false);
+    const handleOutsidePointerDown = (event: PointerEvent) => {
+      if (eventTargetElement(event.target)?.closest(`[data-testid="${SELECTION_MENU_ID}"]`)) return;
+      close();
+    };
+    document.addEventListener("pointerdown", handleOutsidePointerDown, true);
+    document.addEventListener("scroll", close, true);
+    return () => {
+      document.removeEventListener("pointerdown", handleOutsidePointerDown, true);
+      document.removeEventListener("scroll", close, true);
+    };
+  }, [menuOpen, setMenuOpen]);
+
   const dismiss = useCallback(() => update(IDLE), [update]);
+  const spawnSubagentFromMenu = useCallback(() => {
+    if (!menuSelection) return;
+    dismiss();
+    onSpawnSubagentFromSelection?.(menuSelection.quote);
+  }, [dismiss, menuSelection, onSpawnSubagentFromSelection]);
+  const quoteFromMenu = useCallback(() => {
+    if (menuSelection) {
+      update({ phase: "noting", range: menuSelection.range, quote: menuSelection.quote });
+    }
+  }, [menuSelection, update]);
+  const copyFromMenu = useCallback(() => {
+    if (!menuSelection) return;
+    dismiss();
+    void writeSelectionClipboard(menuSelection.clipboard);
+  }, [dismiss, menuSelection]);
+  const spawnSubagentFromPill = useCallback(() => {
+    const current = stateRef.current;
+    if (current.phase !== "offered") return;
+    dismiss();
+    onSpawnSubagentFromSelection?.(current.quote);
+  }, [dismiss, onSpawnSubagentFromSelection]);
   const openNote = useCallback(() => {
     const current = stateRef.current;
     if (current.phase === "offered") update({ ...current, phase: "noting" });
@@ -117,7 +220,7 @@ export function AssistantSelectionQuote({
     (note: string) => {
       const current = stateRef.current;
       if (current.phase !== "noting") return;
-      onQuote({ quote: current.quote, note });
+      onQuote?.({ quote: current.quote, note });
       update(IDLE);
     },
     [onQuote, update],
@@ -132,12 +235,46 @@ export function AssistantSelectionQuote({
     selection?.addRange(current.range);
   }, [update]);
 
+  if (menuOpen && menuSelection) {
+    return (
+      <ContextMenuContent offset={0} testID={SELECTION_MENU_ID}>
+        {onSpawnSubagentFromSelection ? (
+          <ContextMenuItem
+            leading={branchIcon}
+            testID={`${SELECTION_MENU_ID}-subagent`}
+            onSelect={spawnSubagentFromMenu}
+          >
+            {spawnLabel}
+          </ContextMenuItem>
+        ) : null}
+        {onQuote ? (
+          <ContextMenuItem
+            leading={quoteIcon}
+            testID={`${SELECTION_MENU_ID}-quote`}
+            onSelect={quoteFromMenu}
+          >
+            {isChinese ? "引用到当前会话" : "Quote in chat"}
+          </ContextMenuItem>
+        ) : null}
+        {onSpawnSubagentFromSelection || onQuote ? <ContextMenuSeparator /> : null}
+        <ContextMenuItem
+          leading={copyIcon}
+          testID={`${SELECTION_MENU_ID}-copy`}
+          onSelect={copyFromMenu}
+        >
+          {isChinese ? "复制" : "Copy"}
+        </ContextMenuItem>
+      </ContextMenuContent>
+    );
+  }
   if (state.phase === "offered") {
     return (
       <QuoteButton
         range={state.range}
         floatingRef={floatingRef}
-        onPress={openNote}
+        onPress={onQuote ? openNote : undefined}
+        spawnLabel={spawnLabel}
+        onSpawnSubagent={onSpawnSubagentFromSelection ? spawnSubagentFromPill : undefined}
         onDismiss={dismiss}
       />
     );
@@ -155,15 +292,79 @@ export function AssistantSelectionQuote({
   return null;
 }
 
+function readSelectionPassage(
+  stream: HTMLElement | null,
+  selection: Selection | null,
+): SelectionPassage | null {
+  if (!stream || !selection || selection.rangeCount !== 1 || selection.isCollapsed) return null;
+  const range = selection.getRangeAt(0);
+  if (!stream.contains(range.commonAncestorContainer)) return null;
+  const quote = createAssistantSelectionMarkdown(selection);
+  return quote ? { range: range.cloneRange(), quote } : null;
+}
+
+function eventTargetElement(target: EventTarget | null): Element | null {
+  if (target instanceof Element) return target;
+  if (target instanceof Node) return target.parentElement;
+  return null;
+}
+
+function isEditableContextTarget(target: EventTarget | null): boolean {
+  const element = eventTargetElement(target);
+  if (!element) return false;
+  if (element instanceof HTMLElement && element.isContentEditable) return true;
+  return Boolean(
+    element.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]'),
+  );
+}
+
+async function writeSelectionClipboard(clipboard: MarkdownClipboardContent): Promise<void> {
+  if (
+    typeof navigator !== "undefined" &&
+    typeof navigator.clipboard?.write === "function" &&
+    typeof ClipboardItem !== "undefined" &&
+    (typeof ClipboardItem.supports !== "function" || ClipboardItem.supports("text/html"))
+  ) {
+    try {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/plain": new Blob([clipboard.plainText], { type: "text/plain" }),
+          "text/html": new Blob([clipboard.html], { type: "text/html" }),
+        }),
+      ]);
+      return;
+    } catch {
+      // Fall through to plain-text clipboard write below.
+    }
+  }
+  if (typeof navigator !== "undefined" && typeof navigator.clipboard?.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(clipboard.plainText);
+      return;
+    } catch {
+      // Fall through to expo-clipboard fallback.
+    }
+  }
+  try {
+    await copyToClipboard(clipboard.plainText);
+  } catch {
+    // Ignore clipboard write denial.
+  }
+}
+
 function QuoteButton({
   range,
   floatingRef,
   onPress,
+  spawnLabel,
+  onSpawnSubagent,
   onDismiss,
 }: {
   range: Range;
   floatingRef: RefObject<HTMLElement | null>;
-  onPress: () => void;
+  onPress?: () => void;
+  spawnLabel: string;
+  onSpawnSubagent?: () => void;
   onDismiss: () => void;
 }) {
   const { t } = useTranslation();
@@ -176,7 +377,7 @@ function QuoteButton({
         return true;
       }
       // Like Escape, this comes before the app's shortcuts, dictation's Enter included.
-      if (isBareEnter(event) && !focusReadsEnter(document.activeElement)) {
+      if (onPress && isBareEnter(event) && !focusReadsEnter(document.activeElement)) {
         event.preventDefault();
         onPress();
         return true;
@@ -211,12 +412,25 @@ function QuoteButton({
       alignment="end"
       layer={layer}
       entering={FADE_IN}
+      style={styles.actionSurface}
       surfaceRef={setSurface}
       testID="assistant-selection-quote"
     >
-      <Button variant="ghost" size="sm" leftIcon={TextQuote} onPress={onPress}>
-        {t("agentStream.quote.action")}
-      </Button>
+      {onPress ? (
+        <Button variant="ghost" size="sm" leftIcon={TextQuote} onPress={onPress}>
+          {t("agentStream.quote.action")}
+        </Button>
+      ) : null}
+      {onSpawnSubagent ? (
+        <Button
+          variant="secondary"
+          size="sm"
+          onPress={onSpawnSubagent}
+          testID="assistant-selection-spawn-subagent"
+        >
+          {spawnLabel}
+        </Button>
+      ) : null}
     </AnchoredSurface>
   );
 }
@@ -471,6 +685,11 @@ function preventDefault(event: Event) {
 }
 
 const styles = StyleSheet.create((theme) => ({
+  actionSurface: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[1],
+  },
   portalOverlay: {
     position: "absolute",
     top: 0,

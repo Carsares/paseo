@@ -9,6 +9,8 @@ export interface WorkspaceDraftTabSetup {
   model: string | null;
   thinkingOptionId: string | null;
   providerOptions: Record<string, unknown>;
+  parentAgentId?: string | null;
+  initialDraftText?: string | null;
 }
 
 export interface WorkspaceWorkingDiffTabTarget {

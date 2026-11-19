@@ -4,6 +4,9 @@ import { fr } from "@/i18n/resources/fr";
 import {
   buildWorkspaceDesktopTabActions,
   buildWorkspaceTabMenuEntries,
+  getWorkspaceBulkCloseTargets,
+  getWorkspaceTabHierarchyLabels,
+  pinWorkspaceMainTabIds,
 } from "@/screens/workspace/workspace-tab-menu";
 import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-types";
 
@@ -15,6 +18,109 @@ function createAgentTab(): WorkspaceTabDescriptor {
     target: { kind: "agent", agentId: "agent-123" },
   };
 }
+
+describe("main tab menu", () => {
+  it.each(["desktop", "mobile"] as const)(
+    "shows the permitted hierarchy actions on %s",
+    (surface) => {
+      const tab = createAgentTab();
+      const setMain = vi.fn();
+      const attachToMain = vi.fn();
+      const input = {
+        surface,
+        tab,
+        index: 1,
+        tabCount: 2,
+        mainTabIndex: 0,
+        menuTestIDBase: "workspace-tab-menu",
+        onCopyResumeCommand: vi.fn(),
+        onCopyAgentId: vi.fn(),
+        onCopyTerminalId: vi.fn(),
+        onCopyFilePath: vi.fn(),
+        onReloadAgent: vi.fn(),
+        onRenameTab: vi.fn(),
+        onCloseTab: vi.fn(),
+        onCloseTabsBefore: vi.fn(),
+        onCloseTabsAfter: vi.fn(),
+        onCloseOtherTabs: vi.fn(),
+        hierarchyLabels: getWorkspaceTabHierarchyLabels("zh-CN"),
+      };
+      const menu = buildWorkspaceTabMenuEntries({
+        ...input,
+        hierarchyActions: { isMain: false, pending: false, setMain, attachToMain },
+      });
+      const toggle = menu.find((entry) => entry.key === "toggle-main-tab");
+      const attach = menu.find((entry) => entry.key === "attach-to-main-tab");
+      expect(toggle).toMatchObject({ label: "设为主标签页", disabled: false });
+      expect(attach).toMatchObject({ label: "挂载到主标签页", disabled: false });
+      if (toggle?.kind !== "item" || attach?.kind !== "item")
+        throw new Error("Missing hierarchy actions");
+      toggle.onSelect();
+      attach.onSelect();
+      expect(setMain).toHaveBeenCalledExactlyOnceWith(true);
+      expect(attachToMain).toHaveBeenCalledOnce();
+      expect(menu.find((entry) => entry.key === "close-before")).toMatchObject({ disabled: true });
+      expect(menu.find((entry) => entry.key === "close-others")).toMatchObject({ disabled: true });
+
+      const mainMenu = buildWorkspaceTabMenuEntries({
+        ...input,
+        index: 0,
+        hierarchyActions: { isMain: true, pending: true, setMain },
+      });
+      expect(mainMenu.find((entry) => entry.key === "toggle-main-tab")).toMatchObject({
+        label: "取消主标签页",
+        disabled: true,
+      });
+      expect(mainMenu.find((entry) => entry.key === "attach-to-main-tab")).toBeUndefined();
+      expect(
+        buildWorkspaceTabMenuEntries(input).find((entry) => entry.key === "toggle-main-tab"),
+      ).toBeUndefined();
+    },
+  );
+
+  it("preserves the pinned tab when closing to either side or all other tabs", () => {
+    const main = createAgentTab();
+    const first: WorkspaceTabDescriptor = {
+      kind: "terminal",
+      key: "first",
+      tabId: "first",
+      target: { kind: "terminal", terminalId: "first" },
+    };
+    const last: WorkspaceTabDescriptor = {
+      kind: "terminal",
+      key: "last",
+      tabId: "last",
+      target: { kind: "terminal", terminalId: "last" },
+    };
+    expect(
+      getWorkspaceBulkCloseTargets([main, first, last], last.tabId, "before", "agent-123"),
+    ).toEqual([first]);
+    expect(
+      getWorkspaceBulkCloseTargets([main, first, last], first.tabId, "others", "agent-123"),
+    ).toEqual([last]);
+    expect(
+      getWorkspaceBulkCloseTargets([first, main, last], first.tabId, "after", "agent-123"),
+    ).toEqual([last]);
+    expect(
+      getWorkspaceBulkCloseTargets([main, first, last], main.tabId, "others", "agent-123"),
+    ).toEqual([first, last]);
+  });
+
+  it("keeps the main tab pinned at index zero across reorders", () => {
+    expect(pinWorkspaceMainTabIds(["first", "main", "last"], "main")).toEqual([
+      "main",
+      "first",
+      "last",
+    ]);
+    expect(pinWorkspaceMainTabIds(["main", "first", "last"], "main")).toEqual([
+      "main",
+      "first",
+      "last",
+    ]);
+    expect(pinWorkspaceMainTabIds(["first", "last"], "main")).toEqual(["first", "last"]);
+    expect(pinWorkspaceMainTabIds(["first", "last"], null)).toEqual(["first", "last"]);
+  });
+});
 
 describe("buildWorkspaceTabMenuEntries", () => {
   it("uses desktop tab ordering labels for desktop menus", () => {

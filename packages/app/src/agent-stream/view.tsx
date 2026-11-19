@@ -28,6 +28,8 @@ import { useMutation } from "@tanstack/react-query";
 import Animated, { FadeIn, FadeOut } from "react-native-reanimated";
 import { Check, ChevronDown, X } from "lucide-react-native";
 import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
+import { openPreferredWorkspaceTarget } from "@/workspace-tabs/open-beside";
+import { AllowSubagentForkContext } from "@/components/assistant-fork-menu";
 import { openExplorerSidebarView } from "@/workspace-tabs/explorer-sidebar";
 import {
   AssistantMessage,
@@ -50,6 +52,10 @@ import type {
   AgentPermissionAction,
   AgentPermissionResponse,
 } from "@getpaseo/protocol/agent-types";
+import {
+  getParentAgentIdFromLabels,
+  resolveAgentHierarchyDepth,
+} from "@getpaseo/protocol/agent-labels";
 import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
 import { useSessionStore } from "@/stores/session-store";
 import { useRevealedText } from "@/hooks/use-revealed-text";
@@ -100,6 +106,7 @@ import {
 } from "./bottom-anchor-controller";
 import { createAssistantImageOccurrenceKey } from "@/assistant-image/acquisition-cache";
 import { AssistantSelectionCopySurface } from "@/assistant-selection-copy/surface";
+import { appendQuoteToDraft } from "@/assistant-selection-copy/composer-quote";
 import { AssistantFileLinkResolverProvider, createInlinePathOpener } from "@/assistant-file-links";
 import { useOpenOutsideWorkspaceFolder } from "@/workspace/open-in-file-manager/outside-folder";
 import {
@@ -110,7 +117,9 @@ import {
 } from "@/workspace/file-open";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useStableEvent } from "@/hooks/use-stable-event";
-import { useForkAgent } from "@/hooks/use-fork-agent";
+import { buildSubagentDraftSetup, useForkAgent } from "@/hooks/use-fork-agent";
+import { useOptionalPaneContext } from "@/panels/pane-context";
+import { generateDraftId } from "@/stores/draft-keys";
 import { isWeb } from "@/constants/platform";
 import type { Theme } from "@/styles/theme";
 import { recordRenderProfileReasons } from "@/utils/render-profiler";
@@ -340,6 +349,111 @@ function ScrollToBottomButton({
   );
 }
 
+const REMOTE_HIERARCHY_DEPTH_LABEL = "paseo.remote-hierarchy-depth";
+
+function useStreamSubagentActions({
+  serverId,
+  agentId,
+  context,
+  toast,
+  readOnly,
+}: {
+  serverId: string;
+  agentId: string;
+  context: AgentScreenAgent;
+  toast?: ToastApi | null;
+  readOnly: boolean;
+}) {
+  const forkAgent = useForkAgent({ serverId, toast, readOnly });
+  const tabId = useOptionalPaneContext()?.tabId;
+  const openInSidePane = useSettings((settings) => settings.openInSidePane);
+  const sourceAgentLabels = useSessionStore((state) => {
+    const session = state.sessions[serverId];
+    return session?.agents.get(agentId)?.labels ?? session?.agentDetails.get(agentId)?.labels;
+  });
+  const canSpawnSubagent = useSessionStore((state) => {
+    const session = state.sessions[serverId];
+    if (session?.serverInfo?.features?.agentHierarchyControl !== true) return false;
+    const getAgent = (id: string) => session.agents.get(id) ?? session.agentDetails.get(id);
+    if (getAgent(agentId)?.archivedAt) return false;
+    let remoteParentDepth = 0;
+    const depth = resolveAgentHierarchyDepth(
+      agentId,
+      (id) => {
+        const entry = getAgent(id);
+        const parentId = getParentAgentIdFromLabels(entry?.labels) ?? entry?.parentAgentId;
+        if (parentId && entry?.labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] === "2") {
+          remoteParentDepth = 1;
+        }
+        return parentId;
+      },
+      2,
+    );
+    return depth + remoteParentDepth < 2;
+  });
+  const allowSubagentFork =
+    canSpawnSubagent && !readOnly && Boolean(context.workspaceId && context.provider);
+  const handleForkAssistantTurn: AssistantTurnForkHandler = useStableEvent(
+    async ({ target, boundary }) => {
+      if (target === "subagent" && !allowSubagentFork) return;
+      await forkAgent({
+        agentId,
+        agent: { ...context, labels: sourceAgentLabels },
+        workspaceId: context.workspaceId,
+        parentTabId: tabId,
+        target,
+        boundary,
+      });
+    },
+  );
+
+  // The in-flight turn forks with no boundary at all: `selectForkContextRows`
+  // projects the whole timeline when neither boundary field is given, so the
+  // fork carries everything up to now, including the response still streaming
+  // in front of the user.
+  const handleForkInFlightTurn: InFlightTurnForkHandler = useStableEvent(async (target) => {
+    if (target === "subagent" && !allowSubagentFork) return;
+    await forkAgent({
+      agentId,
+      agent: { ...context, labels: sourceAgentLabels },
+      workspaceId: context.workspaceId,
+      parentTabId: tabId,
+      target,
+    });
+  });
+  const handleSpawnSubagentFromSelection = useStableEvent((selectedMarkdown: string) => {
+    const { workspaceId } = context;
+    if (!allowSubagentFork || !workspaceId) return;
+    const setup = buildSubagentDraftSetup({ ...context, labels: sourceAgentLabels }, agentId);
+    if (!setup) return;
+
+    const target = {
+      kind: "draft" as const,
+      draftId: generateDraftId(),
+      setup: {
+        ...setup,
+        initialDraftText: appendQuoteToDraft({ draft: "", quote: selectedMarkdown, note: "" }),
+      },
+    };
+    const openedTabId = openPreferredWorkspaceTarget({
+      workspaceKey: buildWorkspaceTabPersistenceKey({ serverId, workspaceId }),
+      target,
+      source: "subagents",
+      preferences: openInSidePane,
+      parentTabId: tabId,
+    });
+    if (!openedTabId) {
+      navigateToWorkspace({ serverId, workspaceId, target });
+    }
+  });
+  return {
+    allowSubagentFork,
+    handleForkAssistantTurn,
+    handleForkInFlightTurn,
+    onSpawnSubagentFromSelection: allowSubagentFork ? handleSpawnSubagentFromSelection : undefined,
+  };
+}
+
 const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamViewProps>(
   function AgentStreamView(
     {
@@ -406,7 +520,12 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       state.sessions[resolvedServerId]?.agentStreamHead?.get(agentId),
     );
     const streamHead = providedStreamHead ?? sessionStreamHead;
-    const forkAgent = useForkAgent({ serverId: resolvedServerId, toast, readOnly });
+    const {
+      allowSubagentFork,
+      handleForkAssistantTurn,
+      handleForkInFlightTurn,
+      onSpawnSubagentFromSelection,
+    } = useStreamSubagentActions({ serverId: resolvedServerId, agentId, context, toast, readOnly });
     const supportsAgentForkContextCursor = useSessionStore(
       (state) =>
         state.sessions[resolvedServerId]?.serverInfo?.features?.agentForkContextCursor === true,
@@ -497,31 +616,6 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
     const handleToolCallOpenFile = useStableEvent((filePath: string) => {
       handleInlinePathPress({ raw: filePath, path: filePath }, "preferred");
-    });
-
-    const handleForkAssistantTurn: AssistantTurnForkHandler = useStableEvent(
-      async ({ target, boundary }) => {
-        await forkAgent({
-          agentId,
-          agent: context,
-          workspaceId: context.workspaceId,
-          target,
-          boundary,
-        });
-      },
-    );
-
-    // The in-flight turn forks with no boundary at all: `selectForkContextRows`
-    // projects the whole timeline when neither boundary field is given, so the
-    // fork carries everything up to now, including the response still streaming
-    // in front of the user.
-    const handleForkInFlightTurn: InFlightTurnForkHandler = useStableEvent(async (target) => {
-      await forkAgent({
-        agentId,
-        agent: context,
-        workspaceId: context.workspaceId,
-        target,
-      });
     });
 
     // Freeze stream presentation while this tab slot is hidden to prevent offscreen
@@ -1185,51 +1279,56 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         visibleMessageIds={mountedMessageIds}
       >
         <ToolCallSheetProvider>
-          <AssistantSelectionCopySurface style={stylesheet.container}>
-            <MessageOuterSpacingProvider disableOuterSpacing>
-              <ToolCallExpansionContext.Provider value={toolCallExpansion}>
-                <UserMessageExpansionContext.Provider value={userMessageExpansion}>
-                  {streamRenderStrategy.render({
-                    readingRowReplacements: presentation.readingRowReplacements,
-                    agentId,
-                    segments: renderModel.segments,
-                    historyRowRevision,
-                    liveHeadRowRevision: expandedToolCallGroups,
-                    boundary,
-                    renderers,
-                    listEmptyComponent,
-                    viewportRef,
-                    routeBottomAnchorRequest,
-                    isAuthoritativeHistoryReady,
-                    isInitialHistoryLoading,
-                    revealInitialHistory,
-                    onNearBottomChange: nearBottom.set,
-                    onReadingPositionChange: handleReadingPositionChange,
-                    onNearHistoryStart: loadOlder,
-                    isLoadingOlderHistory: isLoadingOlder,
-                    hasOlderHistory: hasOlder,
-                    olderHistoryProgressKey: progressKey,
-                    scrollEnabled: streamScrollEnabled,
-                    listStyle: stylesheet.list,
-                    baseListContentContainerStyle: stylesheet.listContentContainer,
-                    forwardListContentContainerStyle: stylesheet.forwardListContentContainer,
-                    contentMaxWidth,
-                  })}
-                </UserMessageExpansionContext.Provider>
-              </ToolCallExpansionContext.Provider>
-            </MessageOuterSpacingProvider>
-            <ChatOutlineRail
-              prompts={chatOutline.prompts}
-              activePrompt={chatOutline.activePrompt}
-              onJumpToPrompt={chatOutline.jumpToPrompt}
-            />
-            <ScrollToBottomButton
-              nearBottom={nearBottom}
-              isTimelineDetached={isTimelineDetached}
-              bottomOffset={scrollToBottomOffset}
-              onPress={scrollToBottom}
-            />
-          </AssistantSelectionCopySurface>
+          <AllowSubagentForkContext.Provider value={allowSubagentFork}>
+            <AssistantSelectionCopySurface
+              style={stylesheet.container}
+              onSpawnSubagentFromSelection={onSpawnSubagentFromSelection}
+            >
+              <MessageOuterSpacingProvider disableOuterSpacing>
+                <ToolCallExpansionContext.Provider value={toolCallExpansion}>
+                  <UserMessageExpansionContext.Provider value={userMessageExpansion}>
+                    {streamRenderStrategy.render({
+                      readingRowReplacements: presentation.readingRowReplacements,
+                      agentId,
+                      segments: renderModel.segments,
+                      historyRowRevision,
+                      liveHeadRowRevision: expandedToolCallGroups,
+                      boundary,
+                      renderers,
+                      listEmptyComponent,
+                      viewportRef,
+                      routeBottomAnchorRequest,
+                      isAuthoritativeHistoryReady,
+                      isInitialHistoryLoading,
+                      revealInitialHistory,
+                      onNearBottomChange: nearBottom.set,
+                      onReadingPositionChange: handleReadingPositionChange,
+                      onNearHistoryStart: loadOlder,
+                      isLoadingOlderHistory: isLoadingOlder,
+                      hasOlderHistory: hasOlder,
+                      olderHistoryProgressKey: progressKey,
+                      scrollEnabled: streamScrollEnabled,
+                      listStyle: stylesheet.list,
+                      baseListContentContainerStyle: stylesheet.listContentContainer,
+                      forwardListContentContainerStyle: stylesheet.forwardListContentContainer,
+                      contentMaxWidth,
+                    })}
+                  </UserMessageExpansionContext.Provider>
+                </ToolCallExpansionContext.Provider>
+              </MessageOuterSpacingProvider>
+              <ChatOutlineRail
+                prompts={chatOutline.prompts}
+                activePrompt={chatOutline.activePrompt}
+                onJumpToPrompt={chatOutline.jumpToPrompt}
+              />
+              <ScrollToBottomButton
+                nearBottom={nearBottom}
+                isTimelineDetached={isTimelineDetached}
+                bottomOffset={scrollToBottomOffset}
+                onPress={scrollToBottom}
+              />
+            </AssistantSelectionCopySurface>
+          </AllowSubagentForkContext.Provider>
         </ToolCallSheetProvider>
       </ChatFind>
     );

@@ -19,6 +19,7 @@ import {
   ArrowLeftToLine,
   ArrowRightToLine,
   Copy,
+  Crown,
   Pencil,
   RotateCw,
   Columns2,
@@ -63,6 +64,9 @@ import {
 import { buildDeterministicWorkspaceTabId } from "@/workspace-tabs/identity";
 import {
   buildWorkspaceDesktopTabActions,
+  getWorkspaceTabHierarchyLabels,
+  isWorkspaceMainTab,
+  WorkspaceMainTabContext,
   type WorkspaceDesktopTabActions,
   type WorkspaceTabMenuEntry,
   type WorkspaceTabMenuLabels,
@@ -1121,6 +1125,7 @@ function ResolvedWorkspaceDesktopTabsRow({
   const [exitFocusModeWidth, setExitFocusModeWidth] = useState<number>(0);
   const tabScrollBoundary = useHorizontalScrollBoundary();
   const measurementCache = useContext(TabMeasurementCache);
+  const mainAgentId = useContext(WorkspaceMainTabContext)?.mainAgentId;
   const [labelMeasurements, setLabelMeasurements] = useState(() => new Map(measurementCache ?? []));
   useLayoutEffect(() => {
     if (!measurementCache) return;
@@ -1322,6 +1327,7 @@ function ResolvedWorkspaceDesktopTabsRow({
 
   const rail: WorkspaceTabRailSurface = host === "explorer" ? "sidebar" : "surface";
   const onSidebar = rail === "sidebar";
+  const mainTabIndex = displayedTabs.findIndex(({ tab }) => isWorkspaceMainTab(tab, mainAgentId));
 
   const renderTab = useCallback(
     ({
@@ -1335,7 +1341,10 @@ function ResolvedWorkspaceDesktopTabsRow({
       const layoutItem = layout.items[index] ?? null;
       const resolvedTabWidth = layoutItem?.width ?? 150;
       const showLabel = layoutItem?.showLabel ?? true;
-      const showDropIndicatorBefore = activeDragTabId !== null && tabDropPreviewIndex === index;
+      const showDropIndicatorBefore =
+        activeDragTabId !== null &&
+        tabDropPreviewIndex === index &&
+        !(index === 0 && mainTabIndex === 0);
       const showDropIndicatorAfter =
         activeDragTabId !== null &&
         tabDropPreviewIndex === displayedTabs.length &&
@@ -1351,6 +1360,7 @@ function ResolvedWorkspaceDesktopTabsRow({
           isDragging={isActive}
           index={index}
           tabCount={displayedTabs.length}
+          mainTabIndex={mainTabIndex}
           onCopyResumeCommand={onCopyResumeCommand}
           onCopyAgentId={onCopyAgentId}
           onCopyTerminalId={onCopyTerminalId}
@@ -1379,6 +1389,7 @@ function ResolvedWorkspaceDesktopTabsRow({
       isFocused,
       layout.closeButtonPolicy,
       layout.items,
+      mainTabIndex,
       normalizedServerId,
       normalizedWorkspaceId,
       onCloseOtherTabs,
@@ -1509,6 +1520,7 @@ function ResolvedDesktopTabChip({
   isDragging,
   index,
   tabCount,
+  mainTabIndex,
   onCopyResumeCommand,
   onCopyAgentId,
   onCopyTerminalId,
@@ -1537,6 +1549,7 @@ function ResolvedDesktopTabChip({
   isDragging: boolean;
   index: number;
   tabCount: number;
+  mainTabIndex: number;
   onCopyResumeCommand: (agentId: string) => Promise<void> | void;
   onCopyAgentId: (agentId: string) => Promise<void> | void;
   onCopyTerminalId: (terminalId: string) => Promise<void> | void;
@@ -1558,8 +1571,17 @@ function ResolvedDesktopTabChip({
   showDropIndicatorBefore: boolean;
   showDropIndicatorAfter: boolean;
 }) {
-  const { t } = useTranslation();
-  const presentation = item.presentation;
+  const { t, i18n } = useTranslation();
+  const mainTab = useContext(WorkspaceMainTabContext);
+  const isMain = isWorkspaceMainTab(item.tab, mainTab?.mainAgentId);
+  const hierarchyLabels = useMemo(
+    () => getWorkspaceTabHierarchyLabels(i18n.language),
+    [i18n.language],
+  );
+  const presentation = useMemo(
+    () => (isMain ? { ...item.presentation, icon: Crown } : item.presentation),
+    [isMain, item.presentation],
+  );
   const targetAgentId = item.tab.target.kind === "agent" ? item.tab.target.agentId : null;
   const canMoveAgentToWorkspace = useCanMoveSubagentToWorkspace(
     serverId,
@@ -1579,6 +1601,9 @@ function ResolvedDesktopTabChip({
         tab: item.tab,
         index,
         tabCount,
+        mainTabIndex,
+        hierarchyActions: mainTab?.actionsForTab(item.tab),
+        hierarchyLabels,
         onCopyResumeCommand,
         onCopyAgentId,
         onCopyTerminalId,
@@ -1597,6 +1622,9 @@ function ResolvedDesktopTabChip({
       handleMoveAgentToWorkspace,
       index,
       item.tab,
+      hierarchyLabels,
+      mainTab,
+      mainTabIndex,
       onCloseOtherTabs,
       onCloseTab,
       onCloseTabsToLeft,
@@ -1612,8 +1640,11 @@ function ResolvedDesktopTabChip({
     ],
   );
 
-  const rawTooltipLabel =
+  const tabTooltipLabel =
     presentation.titleState === "loading" ? t("common.states.loading") : presentation.tooltip;
+  const rawTooltipLabel = isMain
+    ? `${tabTooltipLabel} [${hierarchyLabels.badge}]`
+    : tabTooltipLabel;
   const accessibilityLabel =
     item.tab.target.kind === "agent"
       ? normalizeAgentTooltipTitle(rawTooltipLabel)
