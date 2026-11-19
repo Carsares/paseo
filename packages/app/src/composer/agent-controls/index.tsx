@@ -15,15 +15,10 @@ import { Settings2 } from "lucide-react-native";
 import { readSelectOption, type ComposerOptionControls } from "@/agent-controls/option-controls";
 import { formatThinkingOptionLabel } from "@/agent-controls/labels";
 import { CombinedModelSelector } from "@/components/combined-model-selector";
-import {
-  buildProviderSelectorProviders,
-  buildSelectableProviderSelectorProviders,
-  type ProviderSelectorProvider,
-} from "@/provider-selection/provider-selection";
+import type { ProviderSelectorProvider } from "@/provider-selection/provider-selection";
 import { filterSelectableModels } from "@/provider-selection/model-catalog";
 import { useSessionStore } from "@/stores/session-store";
 import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
-import { resolveProviderDefinition } from "@/utils/provider-definitions";
 import { mergeProviderPreferences, useFormPreferences } from "@/hooks/use-form-preferences";
 import {
   AgentModeControl,
@@ -78,9 +73,15 @@ import {
 } from "@/composer/agent-controls/composer-control";
 import { useAgentControlItems } from "@/composer/agent-controls/control-items";
 import { CompactModelSheet } from "@/composer/agent-controls/model-sheet";
+import {
+  resolveAgentControlsProfileProviders,
+  resolveAgentControlsSelectorProviders,
+  routeAgentModelSelection,
+} from "@/composer/agent-controls/provider-routing";
 import { useComposerSheetBridge } from "@/composer/agent-controls/sheet-bridge";
 import { draftComposerAgent } from "@/composer/draft/composer-agent";
 import { agentComposer } from "@/composer/agent-composer";
+import { useCrossProviderAgentHandoff } from "@/composer/cross-provider-handoff";
 import { composerModelFromHalves } from "@/composer/halves-model";
 import { ComposerModelProvider } from "@/composer/model";
 import { ComposerAgentProvider, useComposerInput } from "@/composer/session";
@@ -97,6 +98,7 @@ import {
   type AgentProfilePicker,
   type AgentProfileSeed,
   type DraftAgentProfileControls,
+  type MaterializedAgentProfile,
 } from "@/agent-profiles";
 import { buildSettingsHostSectionRoute } from "@/utils/host-routes";
 
@@ -392,27 +394,6 @@ function resolveSnapshotModeIds(
     return null;
   }
   return entry.modes.map((mode) => mode.id);
-}
-
-function buildAgentProviderDefinitions(
-  agentProvider: string | undefined,
-  snapshotEntries: ReturnType<typeof useProvidersSnapshot>["entries"],
-): AgentProviderDefinition[] {
-  const definition = agentProvider
-    ? resolveProviderDefinition(agentProvider, snapshotEntries)
-    : undefined;
-  return definition ? [definition] : [];
-}
-
-function buildAgentProviderModels(
-  agentProvider: string | undefined,
-  models: AgentModelDefinition[] | null,
-): Map<string, AgentModelDefinition[]> {
-  const map = new Map<string, AgentModelDefinition[]>();
-  if (agentProvider && models) {
-    map.set(agentProvider, models);
-  }
-  return map;
 }
 
 function densityFolds(density: ComposerControlDensity): boolean {
@@ -1001,7 +982,10 @@ export const AgentControls = memo(function AgentControls({
   const agent = useSessionStore(
     useShallow((state) => selectAgentControlsSlice(state, serverId, agentId)),
   );
+  const agentProvider = agent?.provider;
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
+  const handoff = useCrossProviderAgentHandoff({ serverId, agentId });
+  const { handoffToProvider } = handoff;
   const toast = useToast();
   const modeControl = useLiveAgentModeControl(serverId, agentId);
   const commandCenterModes = toCommandCenterModes(modeControl);
@@ -1016,31 +1000,26 @@ export const AgentControls = memo(function AgentControls({
   } = useProvidersSnapshot(serverId, { cwd: agent?.cwd });
 
   const snapshotSelectedEntry = useMemo(
-    () => resolveProviderSnapshotEntry(snapshotEntries, agent?.provider),
-    [snapshotEntries, agent?.provider],
+    () => resolveProviderSnapshotEntry(snapshotEntries, agentProvider),
+    [snapshotEntries, agentProvider],
   );
 
   const models = filterSelectableModels(snapshotSelectedEntry?.models ?? null);
   const selectedProviderIsLoading = snapshotSelectedEntry?.status === "loading";
 
-  const agentProviderDefinitions = useMemo(
-    () => buildAgentProviderDefinitions(agent?.provider, snapshotEntries),
-    [agent?.provider, snapshotEntries],
-  );
-
-  const agentProviderModels = useMemo(
-    () => buildAgentProviderModels(agent?.provider, models),
-    [agent?.provider, models],
-  );
   const agentModelSelectorProviders = useMemo(() => {
-    if (snapshotSelectedEntry) {
-      return buildSelectableProviderSelectorProviders([snapshotSelectedEntry]);
-    }
-    return buildProviderSelectorProviders({
-      providerDefinitions: agentProviderDefinitions,
-      modelsByProvider: agentProviderModels,
+    const fallbackProviders: ProviderSelectorProvider[] = agentProvider
+      ? [{ id: agentProvider, label: agentProvider, modelSelection: { kind: "loading" } }]
+      : [];
+    return resolveAgentControlsSelectorProviders({
+      canSwitchProvider: handoff.canSwitchProvider,
+      agentProvider,
+      snapshotEntries,
+      snapshotSelectedEntry,
+      fallbackProviders,
+      isConnected: Boolean(client),
     });
-  }, [agentProviderDefinitions, agentProviderModels, snapshotSelectedEntry]);
+  }, [agentProvider, client, handoff.canSwitchProvider, snapshotEntries, snapshotSelectedEntry]);
 
   const modelSelection = resolveAgentModelSelection({
     models,
@@ -1061,7 +1040,6 @@ export const AgentControls = memo(function AgentControls({
     }));
   }, [modelSelection.thinkingOptions]);
 
-  const agentProvider = agent?.provider;
   const activeModelId = modelSelection.activeModelId;
 
   const handleSelectModel = useCallback(
@@ -1085,21 +1063,78 @@ export const AgentControls = memo(function AgentControls({
     },
     [agentId, agentProvider, client, toast, updatePreferences],
   );
+  const handleSelectProviderAndModel = useCallback(
+    (nextProvider: string, modelId: string) => {
+      void routeAgentModelSelection({
+        currentProvider: agentProvider,
+        nextProvider,
+        modelId,
+        selectSameProviderModel: handleSelectModel,
+        handoffToProvider,
+        persistCrossProviderModelPreference: async (provider, selectedModel) => {
+          await updatePreferences((current) =>
+            mergeProviderPreferences({
+              preferences: current,
+              provider,
+              updates: { model: selectedModel || undefined },
+            }),
+          );
+        },
+      }).catch((error) => {
+        console.warn("[AgentControls] persist cross-provider model preference failed", error);
+      });
+    },
+    [agentProvider, handleSelectModel, handoffToProvider, updatePreferences],
+  );
   const handleSelectCommandCenterModel = useCallback(
-    (_provider: AgentProvider, modelId: string) => handleSelectModel(modelId),
-    [handleSelectModel],
+    (provider: AgentProvider, modelId: string) => {
+      if (handoff.canSwitchProvider) {
+        return handleSelectProviderAndModel(provider, modelId);
+      }
+      return handleSelectModel(modelId);
+    },
+    [handleSelectModel, handleSelectProviderAndModel, handoff.canSwitchProvider],
   );
 
-  // A running agent is one provider's process, so only that provider's profiles
-  // can apply to it.
-  const profileProviders = useMemo(() => (agentProvider ? [agentProvider] : []), [agentProvider]);
+  const profileProviders = useMemo(
+    () =>
+      resolveAgentControlsProfileProviders({
+        canSwitchProvider: handoff.canSwitchProvider,
+        agentProvider,
+        snapshotEntries,
+      }),
+    [agentProvider, handoff.canSwitchProvider, snapshotEntries],
+  );
   const profileModeIds = useMemo(
     () => resolveSnapshotModeIds(snapshotSelectedEntry),
     [snapshotSelectedEntry],
   );
+  const handleSwitchProviderProfile = useCallback(
+    (profile: MaterializedAgentProfile) =>
+      handoffToProvider({
+        provider: profile.provider,
+        modelId: profile.modelId || null,
+        modeId: profile.modeId || null,
+        thinkingOptionId: profile.thinkingOptionId || null,
+        providerOptions: profile.options,
+      }),
+    [handoffToProvider],
+  );
   const profileTarget = useMemo<AgentProfileApplyTarget>(
-    () => ({ kind: "agent", agentId, availableModeIds: profileModeIds }),
-    [agentId, profileModeIds],
+    () => ({
+      kind: "agent",
+      agentId,
+      availableModeIds: profileModeIds,
+      currentProvider: agentProvider,
+      onSwitchProvider: handoff.canSwitchProvider ? handleSwitchProviderProfile : undefined,
+    }),
+    [
+      agentId,
+      agentProvider,
+      handoff.canSwitchProvider,
+      handleSwitchProviderProfile,
+      profileModeIds,
+    ],
   );
   const agentProfiles = useAgentProfilePicker({
     serverId,
@@ -1234,8 +1269,12 @@ export const AgentControls = memo(function AgentControls({
   );
 
   const handleModelSelectorOpen = useCallback(() => {
+    if (handoff.canSwitchProvider) {
+      refetchSnapshotIfStale();
+      return;
+    }
     refetchSnapshotIfStale(agentProvider);
-  }, [agentProvider, refetchSnapshotIfStale]);
+  }, [agentProvider, handoff.canSwitchProvider, refetchSnapshotIfStale]);
 
   const handleRetryModelProvider = useCallback(
     (provider: AgentProvider) => {
@@ -1258,6 +1297,9 @@ export const AgentControls = memo(function AgentControls({
         modelOptions={modelOptions}
         selectedModelId={modelSelection.activeModelId ?? undefined}
         onSelectModel={handleSelectModel}
+        onSelectProviderAndModel={
+          handoff.canSwitchProvider ? handleSelectProviderAndModel : undefined
+        }
         agentProfiles={agentProfiles}
         onApplyAgentProfile={agentProfiles?.applyProfile}
         onEditAgentProfiles={handleEditAgentProfiles}

@@ -66,7 +66,7 @@ export interface UseForkAgentInput {
   readOnly?: boolean;
 }
 
-function buildChatHistoryAttachment(input: {
+export function buildChatHistoryAttachment(input: {
   draftId: string;
   serverId: string;
   agentId: string;

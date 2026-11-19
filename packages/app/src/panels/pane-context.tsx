@@ -74,6 +74,10 @@ export function usePaneContext(): PaneContextValue {
   return value;
 }
 
+export function useOptionalPaneContext(): PaneContextValue | null {
+  return useContext(PaneContext);
+}
+
 /** The host of the pane around this component, or null on a screen with no panes. */
 export function usePaneHost(): PaneHost | null {
   return useContext(PaneContext)?.host ?? null;

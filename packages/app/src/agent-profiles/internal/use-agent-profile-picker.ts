@@ -1,5 +1,8 @@
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import type { ProviderSnapshotEntry } from "@getpaseo/protocol/agent-types";
 import { useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import type { ToastApi } from "@/components/toast-host";
 import { mergeCreateAgentSelectionPreferences } from "@/create-agent-preferences/preferences";
 import { useFormPreferences } from "@/hooks/use-form-preferences";
 import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
@@ -21,9 +24,129 @@ export interface DraftAgentProfileControls {
   applyProfile: (profile: MaterializedAgentProfile) => void;
 }
 
+type SwitchProvider = (profile: MaterializedAgentProfile) => Promise<boolean> | boolean | void;
+
 export type AgentProfileApplyTarget =
-  | { kind: "agent"; agentId: string; availableModeIds: readonly string[] | null }
+  | {
+      kind: "agent";
+      agentId: string;
+      availableModeIds: readonly string[] | null;
+      currentProvider?: string;
+      onSwitchProvider?: SwitchProvider;
+    }
   | { kind: "draft"; controls: DraftAgentProfileControls };
+
+interface AgentProfileApplicationInput {
+  target: AgentProfileApplyTarget;
+  resolved: MaterializedAgentProfile;
+  entries: readonly ProviderSnapshotEntry[] | undefined;
+}
+
+type AgentProfileApplication =
+  | { kind: "draft"; controls: DraftAgentProfileControls; profile: MaterializedAgentProfile }
+  | { kind: "agent"; agentId: string; profile: MaterializedAgentProfile }
+  | { kind: "switch-provider"; switchProvider: SwitchProvider; profile: MaterializedAgentProfile };
+
+function resolveTargetProviderModeIds(
+  entries: readonly ProviderSnapshotEntry[] | undefined,
+  provider: string,
+): string[] | null {
+  const targetEntry = entries?.find((entry) => entry.provider === provider);
+  if (targetEntry?.status !== "ready") {
+    return null;
+  }
+  const modes = targetEntry.modes;
+  if (!modes || modes.length === 0) {
+    return null;
+  }
+  return modes.map((mode) => mode.id);
+}
+
+export function resolveAgentProfileApplication({
+  target,
+  resolved,
+  entries,
+}: AgentProfileApplicationInput): AgentProfileApplication | null {
+  if (target.kind === "draft") {
+    return { kind: "draft", controls: target.controls, profile: resolved };
+  }
+
+  const isCrossProvider =
+    Boolean(target.currentProvider) && resolved.provider !== target.currentProvider;
+  if (isCrossProvider) {
+    if (!target.onSwitchProvider) {
+      return null;
+    }
+    const targetModeIds = resolveTargetProviderModeIds(entries, resolved.provider);
+    const reconciled = reconcileMaterializedProfileMode(resolved, targetModeIds) ?? resolved;
+    return {
+      kind: "switch-provider",
+      switchProvider: target.onSwitchProvider,
+      profile: reconciled,
+    };
+  }
+
+  const reconciled = reconcileMaterializedProfileMode(resolved, target.availableModeIds);
+  if (!reconciled) {
+    return null;
+  }
+  return { kind: "agent", agentId: target.agentId, profile: reconciled };
+}
+
+interface ApplyProfileToTargetInput extends AgentProfileApplicationInput {
+  client: Pick<DaemonClient, "applyAgentConfig"> | null;
+  persistSelection: (profile: MaterializedAgentProfile) => void;
+  toast: ToastApi;
+}
+
+export function applyProfileToTarget({
+  target,
+  resolved,
+  entries,
+  client,
+  persistSelection,
+  toast,
+}: ApplyProfileToTargetInput): void | Promise<void> {
+  const application = resolveAgentProfileApplication({ target, resolved, entries });
+  if (!application) {
+    return;
+  }
+  if (application.kind === "draft") {
+    application.controls.applyProfile(application.profile);
+    return;
+  }
+  if (application.kind === "switch-provider") {
+    return applyProviderSwitch(application, persistSelection, toast);
+  }
+
+  persistSelection(application.profile);
+  if (!client) {
+    return;
+  }
+  return client
+    .applyAgentConfig(application.agentId, toAgentConfigApply(application.profile))
+    .then((notice) => showProviderNoticeToast(toast, notice))
+    .catch((error) => {
+      console.warn("[useAgentProfilePicker] applyAgentConfig failed", error);
+      toast.error(toErrorMessage(error));
+    });
+}
+
+async function applyProviderSwitch(
+  { switchProvider, profile }: Extract<AgentProfileApplication, { kind: "switch-provider" }>,
+  persistSelection: ApplyProfileToTargetInput["persistSelection"],
+  toast: ToastApi,
+): Promise<void> {
+  try {
+    const didSwitch = await switchProvider(profile);
+    if (didSwitch !== false) {
+      persistSelection(profile);
+    }
+  } catch (error) {
+    console.warn("[useAgentProfilePicker] switch provider profile failed", error);
+    toast.error(toErrorMessage(error));
+  }
+}
 
 /** Everything the model picker renders for one profile. It never sees the profile itself. */
 export interface AgentProfilePickerRow {
@@ -49,8 +172,8 @@ export interface UseAgentProfilePickerInput {
   /**
    * Providers this composer can actually run; pass a stable reference. A profile
    * naming anything else is hidden rather than shown as a row that cannot do
-   * what it says — a live agent is one provider's process and cannot switch, and
-   * the draft form ignores a provider the host does not offer.
+   * what it says. A live composer can offer another provider if it supports
+   * handing off to a new draft with that provider.
    */
   availableProviders: readonly string[];
   target: AgentProfileApplyTarget;
@@ -133,29 +256,9 @@ export function useAgentProfilePicker(
         return;
       }
       const resolved = materializeAgentProfile(profile);
-
-      if (target.kind === "draft") {
-        target.controls.applyProfile(resolved);
-        return;
-      }
-
-      const reconciled = reconcileMaterializedProfileMode(resolved, target.availableModeIds);
-      if (!reconciled) {
-        return;
-      }
-      persistSelection(reconciled);
-      if (!client) {
-        return;
-      }
-      void client
-        .applyAgentConfig(target.agentId, toAgentConfigApply(reconciled))
-        .then((notice) => showProviderNoticeToast(toast, notice))
-        .catch((error) => {
-          console.warn("[useAgentProfilePicker] applyAgentConfig failed", error);
-          toast.error(toErrorMessage(error));
-        });
+      void applyProfileToTarget({ target, resolved, entries, client, persistSelection, toast });
     },
-    [applicableProfiles, client, persistSelection, target, toast],
+    [applicableProfiles, client, entries, persistSelection, target, toast],
   );
 
   return useMemo(
