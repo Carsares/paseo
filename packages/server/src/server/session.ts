@@ -9361,6 +9361,7 @@ export class Session {
           ? { timelineEpoch: timeline.epoch, cursor: msg.boundaryCursor }
           : null,
         boundaryMessageId: msg.boundaryMessageId,
+        sourceAgentId: msg.agentId,
         agentTitle: agentPayload.title,
         cwd: snapshot.cwd,
       });

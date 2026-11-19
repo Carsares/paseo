@@ -97,6 +97,7 @@ import {
 } from "./agent-run-state.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import { parseAgentMessage, projectAgentMessages } from "./agent-messages/index.js";
+import { extractSubmittedPromptForkContext } from "./agent-messages/envelope.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import {
   PASEO_MCP_SERVER_NAME,
@@ -5938,10 +5939,12 @@ export class AgentManager {
     outcome: "accepted" | "rejected",
     options?: { messageId?: string; providerMessageId?: string; turnId?: string },
   ): void {
+    const forkContext = extractSubmittedPromptForkContext(prompt);
     const items = projectAgentMessages({
       type: "user_message",
       text: submittedPromptText(prompt),
       clientMessageId,
+      ...(forkContext ? { forkContext } : {}),
       ...(options?.messageId ? { messageId: options.messageId } : {}),
     });
     for (const item of items) {

@@ -18,7 +18,9 @@ import {
   removeSentContextAttachments,
   removeWorkspaceAttachmentsMatching,
 } from "./workspace-cleanup";
+import { useOptionalToast } from "@/contexts/toast-api-context";
 import { useClearReviewDraft } from "@/review/store";
+import { openForkSourceAgent } from "@/utils/navigate-to-agent";
 
 interface WorkspaceAttachmentBindingInput {
   normalAttachments: UserComposerAttachment[];
@@ -105,6 +107,8 @@ function useWorkspaceAttachmentBinding({
   workspaceAttachments,
   onOpenWorkspaceAttachment,
 }: WorkspaceAttachmentBindingInput): ComposerWorkspaceAttachmentBinding {
+  const { t } = useTranslation();
+  const toast = useOptionalToast();
   const clearReviewDraft = useClearReviewDraft();
   const [suppressedKeys, setSuppressedKeys] = useState<readonly string[]>([]);
   const workspaceAttachmentKeys = useMemo(
@@ -184,13 +188,27 @@ function useWorkspaceAttachmentBinding({
 
   const openAttachment = useCallback(
     ({ attachment }: OpenWorkspaceAttachmentInput) => {
-      if (!isWorkspaceAttachment(attachment) || attachment.kind !== "review") {
+      if (!isWorkspaceAttachment(attachment)) {
+        return false;
+      }
+      if (attachment.kind === "chat_history") {
+        if (!attachment.source.agentId.trim()) {
+          return false;
+        }
+        void openForkSourceAgent({
+          serverId: attachment.source.serverId,
+          sourceAgentId: attachment.source.agentId,
+          onNotFound: () => toast?.error(t("agentPanel.states.notFound")),
+        });
+        return true;
+      }
+      if (attachment.kind !== "review") {
         return false;
       }
       onOpenWorkspaceAttachment?.(attachment);
       return true;
     },
-    [onOpenWorkspaceAttachment],
+    [onOpenWorkspaceAttachment, t, toast],
   );
 
   const resetSuppression = useCallback(() => {

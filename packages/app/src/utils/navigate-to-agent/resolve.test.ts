@@ -1,8 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   resolveNavigateToAgent,
+  resolveOpenForkSourceAgent,
+  type OpenForkSourceAgentDeps,
   type AgentNavTarget,
   type NavigateToAgentDeps,
+  type NavigateToAgentInput,
 } from "@/utils/navigate-to-agent/resolve";
 import type { NavigateToWorkspaceInput } from "@/stores/navigation-active-workspace-store";
 
@@ -110,5 +113,128 @@ describe("resolveNavigateToAgent", () => {
     expect(route).toBe("/h/server-1/agent/missing-agent");
     expect(hostNavigations).toEqual([{ route: "/h/server-1/agent/missing-agent" }]);
     expect(tabNavigations).toEqual([]);
+  });
+});
+
+describe("resolveOpenForkSourceAgent", () => {
+  function createForkDeps(overrides: Partial<OpenForkSourceAgentDeps> = {}) {
+    const navigations: NavigateToAgentInput[] = [];
+    const fetches: string[] = [];
+    const deps: OpenForkSourceAgentDeps = {
+      readCachedAgent: () => ({ found: false }),
+      navigate: (input) => {
+        navigations.push(input);
+      },
+      ...overrides,
+    };
+    return { deps, navigations, fetches };
+  }
+
+  it("navigates synchronously to a cached agent without fetching", async () => {
+    const fetches: string[] = [];
+    const { deps, navigations } = createForkDeps({
+      readCachedAgent: () => ({ found: true, workspaceId: "workspace-2" }),
+      fetchRemoteAgent: async ({ agentId }) => {
+        fetches.push(agentId);
+        return { found: true };
+      },
+    });
+
+    const pending = resolveOpenForkSourceAgent(
+      { serverId: ` ${SERVER_ID} `, sourceAgentId: ` ${AGENT_ID} ` },
+      deps,
+    );
+
+    expect(navigations).toEqual([
+      {
+        serverId: SERVER_ID,
+        agentId: AGENT_ID,
+        workspaceId: "workspace-2",
+        pin: true,
+        asTab: true,
+      },
+    ]);
+    await expect(pending).resolves.toBe(true);
+    expect(fetches).toEqual([]);
+  });
+
+  it("fetches an uncached agent and navigates with the fetched workspace", async () => {
+    const { deps, navigations } = createForkDeps({
+      fetchRemoteAgent: async () => ({ found: true, workspaceId: "workspace-3" }),
+    });
+
+    await expect(
+      resolveOpenForkSourceAgent({ serverId: SERVER_ID, sourceAgentId: AGENT_ID }, deps),
+    ).resolves.toBe(true);
+
+    expect(navigations).toEqual([
+      {
+        serverId: SERVER_ID,
+        agentId: AGENT_ID,
+        workspaceId: "workspace-3",
+        pin: true,
+        asTab: true,
+      },
+    ]);
+  });
+
+  it("reports not found and stays on the current tab when the agent is missing", async () => {
+    const onNotFound = vi.fn();
+    const { deps, navigations } = createForkDeps({
+      fetchRemoteAgent: async () => ({ found: false }),
+    });
+
+    await expect(
+      resolveOpenForkSourceAgent(
+        { serverId: SERVER_ID, sourceAgentId: AGENT_ID, onNotFound },
+        deps,
+      ),
+    ).resolves.toBe(false);
+
+    expect(onNotFound).toHaveBeenCalledTimes(1);
+    expect(navigations).toEqual([]);
+  });
+
+  it("reports not found when the fetch throws", async () => {
+    const onNotFound = vi.fn();
+    const { deps, navigations } = createForkDeps({
+      fetchRemoteAgent: async () => {
+        throw new Error("boom");
+      },
+    });
+
+    await expect(
+      resolveOpenForkSourceAgent(
+        { serverId: SERVER_ID, sourceAgentId: AGENT_ID, onNotFound },
+        deps,
+      ),
+    ).resolves.toBe(false);
+
+    expect(onNotFound).toHaveBeenCalledTimes(1);
+    expect(navigations).toEqual([]);
+  });
+
+  it("navigates by id when no remote lookup is available", async () => {
+    const { deps, navigations } = createForkDeps();
+
+    await expect(
+      resolveOpenForkSourceAgent({ serverId: SERVER_ID, sourceAgentId: AGENT_ID }, deps),
+    ).resolves.toBe(true);
+
+    expect(navigations).toEqual([
+      { serverId: SERVER_ID, agentId: AGENT_ID, pin: true, asTab: true },
+    ]);
+  });
+
+  it("returns false when serverId or sourceAgentId is blank", async () => {
+    const { deps, navigations } = createForkDeps();
+
+    await expect(
+      resolveOpenForkSourceAgent({ serverId: undefined, sourceAgentId: AGENT_ID }, deps),
+    ).resolves.toBe(false);
+    await expect(
+      resolveOpenForkSourceAgent({ serverId: SERVER_ID, sourceAgentId: "  " }, deps),
+    ).resolves.toBe(false);
+    expect(navigations).toEqual([]);
   });
 });

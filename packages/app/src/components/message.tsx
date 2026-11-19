@@ -17,12 +17,14 @@ import { TaskListRow } from "@/components/task-list-row";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative, isWeb } from "@/constants/platform";
+import { useOptionalToast } from "@/contexts/toast-api-context";
 import { useRevealedText, type MarkdownPhase } from "@/hooks/use-revealed-text";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import { buildToolCallPresentation } from "@/tool-calls/presentation";
 import type { TaskActivity, TodoEntry, UserMessageImageAttachment } from "@/types/stream";
 import { setAssistantMessageHeight } from "@/utils/assistant-message-height-estimate";
+import { openForkSourceAgent } from "@/utils/navigate-to-agent";
 import { isRenderProfileEnabled } from "@/utils/render-profiler";
 import { writeMarkdownToRichClipboard } from "@/utils/rich-clipboard";
 import { getDefaultMarkdownClipboardEnvironment } from "@/utils/rich-clipboard-default-environment";
@@ -370,6 +372,38 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
   },
 }));
 
+interface UserMessageAttachmentFrameProps {
+  attachment: AgentAttachment;
+  serverId: string | undefined;
+}
+
+function UserMessageAttachmentFrame({ attachment, serverId }: UserMessageAttachmentFrameProps) {
+  const { t } = useTranslation();
+  const toast = useOptionalToast();
+  const content = getAgentAttachmentPillContent(attachment, t);
+  // Messages sent before fork context was recorded have no source id and stay read-only.
+  const forkSourceAgentId =
+    attachment.type === "text" && attachment.contextKind === "chat_history"
+      ? attachment.forkContext?.sourceAgentId?.trim()
+      : undefined;
+  const canOpenForkSource = Boolean(forkSourceAgentId && serverId);
+  const handlePress = useCallback(() => {
+    void openForkSourceAgent({
+      serverId,
+      sourceAgentId: forkSourceAgentId,
+      onNotFound: () => toast?.error(t("agentPanel.states.notFound")),
+    });
+  }, [forkSourceAgentId, serverId, t, toast]);
+  return (
+    <AttachmentFrame
+      onPress={canOpenForkSource ? handlePress : undefined}
+      accessibilityLabel={canOpenForkSource ? "Open chat history attachment" : undefined}
+    >
+      <AttachmentLabel icon={content.icon} title={content.title} subtitle={content.subtitle} />
+    </AttachmentFrame>
+  );
+}
+
 interface UserMessageImagePillProps {
   image: UserMessageImageAttachment;
   onOpen: (image: UserMessageImageAttachment) => void;
@@ -495,20 +529,13 @@ export const UserMessage = memo(function UserMessage({
             ) : null}
             {hasAttachments ? (
               <View style={attachmentPreviewContainerStyle}>
-                {attachments.map((attachment, index) => {
-                  const content = getAgentAttachmentPillContent(attachment, t);
-                  return (
-                    <AttachmentFrame
-                      key={`${attachment.type}:${"number" in attachment ? attachment.number : index}`}
-                    >
-                      <AttachmentLabel
-                        icon={content.icon}
-                        title={content.title}
-                        subtitle={content.subtitle}
-                      />
-                    </AttachmentFrame>
-                  );
-                })}
+                {attachments.map((attachment, index) => (
+                  <UserMessageAttachmentFrame
+                    key={`${attachment.type}:${"number" in attachment ? attachment.number : index}`}
+                    attachment={attachment}
+                    serverId={serverId}
+                  />
+                ))}
               </View>
             ) : null}
             {hasText ? (

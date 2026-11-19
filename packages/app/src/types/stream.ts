@@ -4,6 +4,7 @@ import type {
   AgentTimelineItem,
   JsonValue,
   ToolCallDetail,
+  UserMessageForkContext,
 } from "@getpaseo/protocol/agent-types";
 import { timelineItemIdentity } from "@getpaseo/protocol/timeline-identity";
 import type { AgentAttachment, AgentStreamEventPayload } from "@getpaseo/protocol/messages";
@@ -233,6 +234,67 @@ interface UserMessageProductionResult {
   matched: boolean;
 }
 
+type ChatHistoryAttachment = Extract<AgentAttachment, { type: "text" }> & {
+  contextKind: "chat_history";
+};
+
+function isChatHistoryAttachment(attachment: AgentAttachment): attachment is ChatHistoryAttachment {
+  return attachment.type === "text" && attachment.contextKind === "chat_history";
+}
+
+function normalizeForkContext(
+  forkContext: UserMessageForkContext | undefined,
+): UserMessageForkContext | undefined {
+  const sourceAgentId = forkContext?.sourceAgentId?.trim();
+  const boundaryMessageId = forkContext?.boundaryMessageId?.trim();
+  if (!sourceAgentId && !boundaryMessageId) return undefined;
+  return {
+    ...(sourceAgentId ? { sourceAgentId } : {}),
+    ...(boundaryMessageId ? { boundaryMessageId } : {}),
+  };
+}
+
+export function forkContextToChatHistoryAttachments(
+  forkContext: UserMessageForkContext | undefined,
+): AgentAttachment[] | undefined {
+  if (!forkContext) return undefined;
+  const normalizedForkContext = normalizeForkContext(forkContext);
+  return [
+    {
+      type: "text",
+      mimeType: "text/plain",
+      contextKind: "chat_history",
+      title: "Chat history",
+      text: "",
+      ...(normalizedForkContext ? { forkContext: normalizedForkContext } : {}),
+    },
+  ];
+}
+
+// The presenting row wins, except that a chat_history card missing its fork provenance
+// is enriched from the other row, and an absent attachment list falls back to the other row.
+function mergeUserMessageAttachments(
+  presented: AgentAttachment[] | undefined,
+  other: AgentAttachment[] | undefined,
+): AgentAttachment[] | undefined {
+  if (!presented || presented.length === 0) {
+    return other;
+  }
+  const otherForkContext = normalizeForkContext(other?.find(isChatHistoryAttachment)?.forkContext);
+  if (!otherForkContext) {
+    return presented;
+  }
+  let changed = false;
+  const enriched = presented.map((attachment) => {
+    if (!isChatHistoryAttachment(attachment) || normalizeForkContext(attachment.forkContext)) {
+      return attachment;
+    }
+    changed = true;
+    return { ...attachment, forkContext: otherForkContext };
+  });
+  return changed ? enriched : presented;
+}
+
 function produceUserMessage(
   items: StreamItem[],
   incoming: UserMessageItem,
@@ -260,8 +322,10 @@ function produceUserMessage(
     throw new Error("User message upsert matched a non-user row");
   }
   const presentation = presentationPolicy === "incoming" ? incoming : existing;
+  const other = presentation === incoming ? existing : incoming;
   const merged = createUserMessage({
     ...presentation,
+    attachments: mergeUserMessageAttachments(presentation.attachments, other.attachments),
     clientMessageId: incoming.clientMessageId ?? existing.clientMessageId,
     messageId: incoming.messageId ?? existing.messageId,
     timelineCursor: incoming.timelineCursor ?? existing.timelineCursor,
@@ -923,21 +987,24 @@ function appendUserMessage(
   clientMessageId?: string,
   timelineCursor?: TimelinePosition,
   turnId?: string,
+  forkContext?: UserMessageForkContext,
 ): StreamItem[] {
   const { chunk, hasContent } = normalizeChunk(text);
-  if (!hasContent) {
+  const attachments = forkContextToChatHistoryAttachments(forkContext);
+  if (!hasContent && !attachments) {
     return state;
   }
 
-  const chunkSeed = chunk.trim() || chunk;
+  const chunkSeed = hasContent ? chunk.trim() || chunk : "chat_history";
   const nextItem = createUserMessage({
     id: messageId ?? createUniqueTimelineId(state, "user", chunkSeed, timestamp),
     clientMessageId,
     messageId,
     timelineCursor,
     turnId,
-    text: chunk,
+    text: hasContent ? chunk : "",
     timestamp,
+    attachments,
   });
   return upsertUserMessage(state, nextItem);
 }
@@ -1546,6 +1613,7 @@ function reduceTimelineEvent(
         item.clientMessageId,
         timelineCursor,
         event.turnId,
+        item.forkContext,
       );
     case "assistant_message":
       return appendAssistantMessage(
@@ -1887,6 +1955,39 @@ export interface ApplyStreamEventResult {
   acknowledgedClientMessageIds?: string[];
 }
 
+function createCanonicalUserMessage(input: {
+  existing: StreamItem[];
+  item: Extract<AgentTimelineItem, { type: "user_message" }>;
+  turnId: string | undefined;
+  timestamp: Date;
+  timelineCursor?: TimelinePosition;
+}): { canonical: UserMessageItem; hasRenderableContent: boolean } {
+  const { existing, item, turnId, timestamp, timelineCursor } = input;
+  const normalized = normalizeChunk(item.text);
+  const attachments = forkContextToChatHistoryAttachments(item.forkContext);
+  const canonical = createUserMessage({
+    id:
+      item.messageId ??
+      createUniqueTimelineId(
+        existing,
+        "user",
+        normalized.chunk.trim() || "chat_history",
+        timestamp,
+      ),
+    messageId: item.messageId,
+    clientMessageId: item.clientMessageId,
+    turnId,
+    timelineCursor,
+    text: normalized.hasContent ? normalized.chunk : "",
+    timestamp,
+    attachments,
+  });
+  return {
+    canonical,
+    hasRenderableContent: normalized.hasContent || (attachments?.length ?? 0) > 0,
+  };
+}
+
 function applyCanonicalUserMessageEvent(params: {
   tail: StreamItem[];
   head: StreamItem[];
@@ -1897,27 +1998,22 @@ function applyCanonicalUserMessageEvent(params: {
 }): ApplyStreamEventResult | null {
   const { tail, head, event, timestamp, timelineCursor, unmatchedInsert = "tail" } = params;
   if (event.type !== "timeline" || event.item.type !== "user_message") return null;
-  const normalized = normalizeChunk(event.item.text);
 
   const flushedTail = head.length > 0 ? flushHeadToTail(tail, head) : tail;
   const flushedHead = head.length > 0 ? [] : head;
-  const canonical = createUserMessage({
-    id:
-      event.item.messageId ??
-      createUniqueTimelineId([...tail, ...head], "user", normalized.chunk.trim(), timestamp),
-    messageId: event.item.messageId,
-    clientMessageId: event.item.clientMessageId,
+  const { canonical, hasRenderableContent } = createCanonicalUserMessage({
+    existing: [...tail, ...head],
+    item: event.item,
     turnId: event.turnId,
-    timelineCursor,
-    text: normalized.chunk,
     timestamp,
+    timelineCursor,
   });
   if (unmatchedInsert === "head") {
     const reconciled = upsertUserMessageAcrossStream({
       tail,
       head,
       message: canonical,
-      insert: normalized.hasContent ? "head" : "none",
+      insert: hasRenderableContent ? "head" : "none",
       presentation: "existing",
     });
     const reconciledTail = canonical.clientMessageId
@@ -1945,7 +2041,7 @@ function applyCanonicalUserMessageEvent(params: {
           : [],
     };
   }
-  const reconciled = placeCanonicalUserMessageAtTail(flushedTail, canonical, normalized.hasContent);
+  const reconciled = placeCanonicalUserMessageAtTail(flushedTail, canonical, hasRenderableContent);
   const reconciledTail = canonical.clientMessageId
     ? reconcileCanonicalUserTurnMembership(
         reconciled.items,

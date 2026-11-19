@@ -443,6 +443,203 @@ function findToolByCallId(state: StreamItem[], callId: string): AgentToolCallIte
   );
 }
 
+describe("fork context chat history", () => {
+  const forkContext = { sourceAgentId: "agent-src", boundaryMessageId: "msg-1" };
+  const chatHistoryAttachment = {
+    type: "text" as const,
+    mimeType: "text/plain" as const,
+    contextKind: "chat_history" as const,
+    title: "Chat history",
+    text: "",
+    forkContext,
+  };
+
+  function forkedEvent(text: string): AgentStreamEventPayload {
+    return {
+      type: "timeline",
+      provider: "codex",
+      turnId: "turn-fork",
+      item: { type: "user_message", text, messageId: "fork-msg", forkContext },
+    };
+  }
+
+  it.each(["Continue from here", ""])(
+    "hydrates a canonical user message with text %j as a chat history card",
+    (text) => {
+      const result = applyStreamEvent({
+        tail: [],
+        head: [],
+        event: forkedEvent(text),
+        timestamp: new Date("2026-08-15T10:00:00Z"),
+      });
+
+      expect(result.tail).toHaveLength(1);
+      expect(result.tail[0]).toMatchObject({
+        kind: "user_message",
+        messageId: "fork-msg",
+        text,
+        attachments: [chatHistoryAttachment],
+      });
+    },
+  );
+
+  it("renders an attachment-only forked message through the plain reducer", () => {
+    const reduced = reduceStreamUpdate([], forkedEvent(""), new Date("2026-08-15T10:00:00Z"));
+    expect(reduced).toHaveLength(1);
+    expect(reduced[0]).toMatchObject({
+      kind: "user_message",
+      attachments: [chatHistoryAttachment],
+    });
+  });
+
+  it("hydrates a historical fork message with empty forkContext as a read-only chat history card", () => {
+    const historicalEvent: AgentStreamEventPayload = {
+      type: "timeline",
+      provider: "codex",
+      turnId: "turn-fork",
+      item: { type: "user_message", text: "", messageId: "fork-legacy", forkContext: {} },
+    };
+    const expectedAttachment = {
+      type: "text",
+      mimeType: "text/plain",
+      contextKind: "chat_history",
+      title: "Chat history",
+      text: "",
+    };
+
+    const applied = applyStreamEvent({
+      tail: [],
+      head: [],
+      event: historicalEvent,
+      timestamp: new Date("2026-08-15T10:00:00Z"),
+    });
+    expect(applied.tail).toHaveLength(1);
+    expect(applied.tail[0]).toMatchObject({
+      kind: "user_message",
+      messageId: "fork-legacy",
+      text: "",
+      attachments: [expectedAttachment],
+    });
+    if (applied.tail[0]?.kind === "user_message") {
+      expect(applied.tail[0].attachments?.[0]).not.toHaveProperty("forkContext");
+    }
+
+    const reduced = reduceStreamUpdate([], historicalEvent, new Date("2026-08-15T10:00:00Z"));
+    expect(reduced).toHaveLength(1);
+    expect(reduced[0]).toMatchObject({
+      kind: "user_message",
+      messageId: "fork-legacy",
+      text: "",
+      attachments: [expectedAttachment],
+    });
+    if (reduced[0]?.kind === "user_message") {
+      expect(reduced[0].attachments?.[0]).not.toHaveProperty("forkContext");
+    }
+  });
+
+  it("does not render a user message without text or fork context", () => {
+    const result = applyStreamEvent({
+      tail: [],
+      head: [],
+      event: {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "", messageId: "empty" },
+      },
+      timestamp: new Date("2026-08-15T10:00:00Z"),
+    });
+
+    expect(result.tail).toEqual([]);
+  });
+
+  it("keeps fork context when a canonical row reconciles a submitted local message", () => {
+    const local = createUserMessage({
+      clientMessageId: "client-fork",
+      text: "Continue from here",
+      timestamp: new Date("2026-08-15T10:00:00Z"),
+      attachments: [{ ...chatHistoryAttachment, text: "<chat-history-summary>" }],
+    });
+
+    const result = applyStreamEvent({
+      tail: [local],
+      head: [],
+      event: {
+        type: "timeline",
+        provider: "codex",
+        turnId: "turn-fork",
+        item: {
+          type: "user_message",
+          text: "Continue from here",
+          clientMessageId: "client-fork",
+          messageId: "fork-msg",
+          forkContext,
+        },
+      },
+      timestamp: new Date("2026-08-15T10:00:01Z"),
+    });
+
+    expect(result.tail).toHaveLength(1);
+    expect(result.tail[0]).toMatchObject({
+      clientMessageId: "client-fork",
+      messageId: "fork-msg",
+      attachments: [{ contextKind: "chat_history", text: "<chat-history-summary>", forkContext }],
+    });
+  });
+
+  it("adds fork context to a local chat history card that lacks it", () => {
+    const local = createUserMessage({
+      clientMessageId: "client-fork",
+      text: "Continue from here",
+      timestamp: new Date("2026-08-15T10:00:00Z"),
+      attachments: [
+        {
+          type: "text",
+          mimeType: "text/plain",
+          contextKind: "chat_history",
+          title: "Chat history",
+          text: "<chat-history-summary>",
+        },
+      ],
+    });
+    const canonical = createUserMessage({
+      id: "fork-msg",
+      messageId: "fork-msg",
+      clientMessageId: "client-fork",
+      text: "Continue from here",
+      timestamp: new Date("2026-08-15T10:00:01Z"),
+      attachments: [chatHistoryAttachment],
+    });
+
+    const first = upsertUserMessage([local], canonical);
+    const second = upsertUserMessage(first, canonical);
+
+    expect(first[0]).toMatchObject({
+      attachments: [{ text: "<chat-history-summary>", forkContext }],
+    });
+    expect(second).toBe(first);
+    expect(second[0]).toBe(first[0]);
+  });
+
+  it("takes the canonical chat history card when the existing row has no attachments", () => {
+    const cached = createUserMessage({
+      id: "fork-msg",
+      messageId: "fork-msg",
+      text: "Continue from here",
+      timestamp: new Date("2026-08-15T10:00:00Z"),
+    });
+
+    const result = applyStreamEvent({
+      tail: [cached],
+      head: [],
+      event: forkedEvent("Continue from here"),
+      timestamp: new Date("2026-08-15T10:00:01Z"),
+    });
+
+    expect(result.tail).toHaveLength(1);
+    expect(result.tail[0]).toMatchObject({ attachments: [chatHistoryAttachment] });
+  });
+});
+
 describe("stream reducer tool call idempotency", () => {
   it("returns the same detail reference when tool call detail is identical", () => {
     const existing: ToolCallDetail = {

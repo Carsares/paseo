@@ -54,4 +54,28 @@ describe("workspace attachment utilities", () => {
       text: "GitHub pull request comment\n\nLooks good.",
     });
   });
+
+  it("keeps fork context from the chat history source on the submitted attachment", () => {
+    expect(
+      workspaceAttachmentToSubmitAttachment({
+        kind: "chat_history",
+        id: "chat_history:draft-1",
+        attachment: {
+          type: "text",
+          mimeType: "text/plain",
+          contextKind: "chat_history",
+          title: "Chat history",
+          text: "Previous chat.",
+        },
+        source: { serverId: "local", agentId: "agent-1", boundaryMessageId: "message-9" },
+      }),
+    ).toEqual({
+      type: "text",
+      mimeType: "text/plain",
+      contextKind: "chat_history",
+      title: "Chat history",
+      text: "Previous chat.",
+      forkContext: { sourceAgentId: "agent-1", boundaryMessageId: "message-9" },
+    });
+  });
 });

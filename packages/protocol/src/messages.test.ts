@@ -9,6 +9,7 @@ import {
   SessionOutboundMessageSchema,
   WorkspaceProjectDescriptorPayloadSchema,
 } from "./messages.js";
+import { validateWSOutboundMessage } from "./validation/ws-outbound.js";
 
 function workspaceDescriptor(overrides: Record<string, unknown> = {}) {
   return {
@@ -606,6 +607,42 @@ test("agent messages are an optional semantic payload on existing tool rows", ()
       agentMessage: { ...agentMessage, sender: { id: 42 } },
     }).success,
   ).toBe(false);
+});
+
+test("user_message timeline items accept an optional forkContext", () => {
+  const base = { type: "user_message", text: "Hello", messageId: "msg-1" };
+  const withEmpty = { ...base, forkContext: {} };
+  const withContext = {
+    ...base,
+    forkContext: { sourceAgentId: "agent-1", boundaryMessageId: "msg-2" },
+  };
+  expect(AgentTimelineItemPayloadSchema.parse(base)).toEqual(base);
+  expect(AgentTimelineItemPayloadSchema.parse(withEmpty)).toEqual(withEmpty);
+  expect(AgentTimelineItemPayloadSchema.parse(withContext)).toEqual(withContext);
+  expect(
+    AgentTimelineItemPayloadSchema.safeParse({ ...base, forkContext: { sourceAgentId: 1 } })
+      .success,
+  ).toBe(false);
+  expect(
+    validateWSOutboundMessage({
+      type: "session",
+      message: {
+        type: "agent_stream",
+        payload: {
+          agentId: "agent-2",
+          timestamp: "2026-11-19T00:00:00.000Z",
+          event: {
+            type: "timeline",
+            provider: "claude",
+            item: withContext,
+            timestamp: "2026-11-19T00:00:00.000Z",
+            seq: 1,
+            epoch: "epoch-1",
+          },
+        },
+      },
+    }).success,
+  ).toBe(true);
 });
 
 test.each(["all", "base", "uncommitted"] as const)(

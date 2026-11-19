@@ -334,6 +334,104 @@ describe("ReplicaCache", () => {
     expect(restored?.range).toBeNull();
   });
 
+  it("persists a forked user message's chat history card without its summary body", async () => {
+    const storage = new MemoryStorage();
+    const writer = createCache(storage);
+    const forkContext = { sourceAgentId: "agent-src", boundaryMessageId: "msg-1" };
+    const forked: StreamItem = {
+      kind: "user_message",
+      id: "fork-msg",
+      messageId: "fork-msg",
+      text: "Continue from here",
+      timestamp: new Date("2026-07-18T08:01:00.000Z"),
+      timelineCursor: { epoch: "epoch-1", seq: 11 },
+      attachments: [
+        {
+          type: "text",
+          mimeType: "text/plain",
+          contextKind: "chat_history",
+          title: "Chat history",
+          text: "<chat-history-summary>large body</chat-history-summary>",
+          forkContext,
+        },
+      ],
+    };
+    const cached = { ...timeline(), items: [forked, timelineItem()] };
+    writer.commitTimeline(SERVER_ID, "agent-1", cached);
+    await writer.flush();
+
+    expect(requireTimelineRow(storage).payload).not.toContain("chat-history-summary");
+    const restored = await createCache(storage).readTimeline(SERVER_ID, "agent-1");
+    expect(restored?.range).toEqual(cached.range);
+    expect(restored?.items[0]).toEqual({
+      ...forked,
+      attachments: [
+        {
+          type: "text",
+          mimeType: "text/plain",
+          contextKind: "chat_history",
+          title: "Chat history",
+          text: "",
+          forkContext,
+        },
+      ],
+    });
+  });
+
+  it("drops timeline range coverage when a user message has non-chat-history or multiple attachments", async () => {
+    const storage = new MemoryStorage();
+    const writer = createCache(storage);
+    const baseUserMessage = {
+      kind: "user_message" as const,
+      id: "user-msg",
+      messageId: "user-msg",
+      text: "Check this",
+      timestamp: new Date("2026-07-18T08:01:00.000Z"),
+      timelineCursor: { epoch: "epoch-1", seq: 11 },
+    };
+
+    writer.commitTimeline(SERVER_ID, "agent-1", {
+      ...timeline(),
+      items: [
+        {
+          ...baseUserMessage,
+          attachments: [{ type: "text", mimeType: "text/plain", text: "plain snippet" }],
+        },
+        timelineItem(),
+      ],
+    });
+    await writer.flush();
+    expect((await createCache(storage).readTimeline(SERVER_ID, "agent-1"))?.range).toBeNull();
+
+    writer.commitTimeline(SERVER_ID, "agent-1", {
+      ...timeline(),
+      items: [
+        {
+          ...baseUserMessage,
+          attachments: [
+            {
+              type: "text",
+              mimeType: "text/plain",
+              contextKind: "chat_history",
+              title: "Chat history",
+              text: "",
+            },
+            {
+              type: "text",
+              mimeType: "text/plain",
+              contextKind: "chat_history",
+              title: "Chat history",
+              text: "",
+            },
+          ],
+        },
+        timelineItem(),
+      ],
+    });
+    await writer.flush();
+    expect((await createCache(storage).readTimeline(SERVER_ID, "agent-1"))?.range).toBeNull();
+  });
+
   it("preserves workspace parentage and its checkpoint across cache reopen", async () => {
     const storage = new MemoryStorage();
     const writer = createCache(storage);

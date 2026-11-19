@@ -11,6 +11,10 @@ export function useToast(): ToastApi {
   return value;
 }
 
+export function useOptionalToast(): ToastApi | null {
+  return useContext(ToastContext);
+}
+
 export function ToastApiProvider({ api, children }: { api: ToastApi; children: ReactNode }) {
   return <ToastContext.Provider value={api}>{children}</ToastContext.Provider>;
 }

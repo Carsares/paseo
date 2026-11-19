@@ -62,7 +62,20 @@ export function workspaceAttachmentToSubmitAttachment(
     };
   }
   if (attachment.kind === "chat_history") {
-    return attachment.attachment;
+    const forkContext = attachment.attachment.forkContext;
+    const sourceAgentId = attachment.source.agentId.trim() || forkContext?.sourceAgentId?.trim();
+    const boundaryMessageId =
+      attachment.source.boundaryMessageId?.trim() || forkContext?.boundaryMessageId?.trim();
+    if (!sourceAgentId && !boundaryMessageId) {
+      return attachment.attachment;
+    }
+    return {
+      ...attachment.attachment,
+      forkContext: {
+        ...(sourceAgentId ? { sourceAgentId } : {}),
+        ...(boundaryMessageId ? { boundaryMessageId } : {}),
+      },
+    };
   }
   return attachment.kind === "review" ? attachment.attachment : null;
 }

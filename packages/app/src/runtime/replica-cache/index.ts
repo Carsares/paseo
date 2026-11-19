@@ -17,6 +17,7 @@ import {
   type WorkspaceDescriptor,
 } from "@/stores/session-store";
 import {
+  forkContextToChatHistoryAttachments,
   isUnreconciledLocalUserMessage,
   type AgentToolCallData,
   type StreamItem,
@@ -123,6 +124,12 @@ const StoredTimelineItemSchema = z.discriminatedUnion("kind", [
     clientMessageId: z.string().optional(),
     messageId: z.string().optional(),
     text: z.string(),
+    forkContext: z
+      .strictObject({
+        sourceAgentId: z.string().optional(),
+        boundaryMessageId: z.string().optional(),
+      })
+      .optional(),
   }),
   z.strictObject({
     ...TimelineItemBaseShape,
@@ -369,6 +376,9 @@ const StoredTimelineSchema = z.strictObject({
 type StoredAgent = z.infer<typeof StoredAgentSchema>;
 type StoredTimeline = z.infer<typeof StoredTimelineSchema>;
 type StoredTimelineItem = z.infer<typeof StoredTimelineItemSchema>;
+type StoredForkContext = NonNullable<
+  Extract<StoredTimelineItem, { kind: "user_message" }>["forkContext"]
+>;
 type StoredToolCall = Extract<StoredTimelineItem, { kind: "tool_call" }>["item"];
 type StoredWorkspace = z.infer<typeof StoredWorkspaceSchema>;
 type StoredProject = z.infer<typeof StoredProjectSchema>;
@@ -461,17 +471,34 @@ function serializeAgentToolCall(data: AgentToolCallData): StoredToolCall {
   }
 }
 
+function serializeForkContext(item: StreamItem): StoredForkContext | undefined {
+  if (item.kind !== "user_message") return undefined;
+  const chatHistory = item.attachments?.find(
+    (attachment) => attachment.type === "text" && attachment.contextKind === "chat_history",
+  );
+  if (!chatHistory || chatHistory.type !== "text") return undefined;
+  const sourceAgentId = chatHistory.forkContext?.sourceAgentId?.trim();
+  const boundaryMessageId = chatHistory.forkContext?.boundaryMessageId?.trim();
+  return {
+    ...(sourceAgentId ? { sourceAgentId } : {}),
+    ...(boundaryMessageId ? { boundaryMessageId } : {}),
+  };
+}
+
 function serializeTimelineItem(item: StreamItem): StoredTimelineItem | null {
   const base = timelineBase(item);
   switch (item.kind) {
-    case "user_message":
+    case "user_message": {
+      const forkContext = serializeForkContext(item);
       return {
         ...base,
         kind: item.kind,
         ...(item.clientMessageId ? { clientMessageId: item.clientMessageId } : {}),
         ...(item.messageId ? { messageId: item.messageId } : {}),
         text: item.text,
+        ...(forkContext ? { forkContext } : {}),
       };
+    }
     case "assistant_message":
       return {
         ...base,
@@ -557,14 +584,17 @@ function deserializeBuiltinTimelineItem(
     timestamp: new Date(item.timestamp),
   };
   switch (item.kind) {
-    case "user_message":
+    case "user_message": {
+      const attachments = forkContextToChatHistoryAttachments(item.forkContext);
       return {
         ...base,
         kind: item.kind,
         ...(item.clientMessageId ? { clientMessageId: item.clientMessageId } : {}),
         ...(item.messageId ? { messageId: item.messageId } : {}),
         text: item.text,
+        ...(attachments ? { attachments } : {}),
       };
+    }
     case "assistant_message":
       return {
         ...base,
@@ -790,7 +820,13 @@ function serializeProject(project: ProjectDescriptor): StoredProject {
 function isTimelineItemStoredLosslessly(item: StreamItem): boolean {
   switch (item.kind) {
     case "user_message":
-      return (item.images?.length ?? 0) === 0 && (item.attachments?.length ?? 0) === 0;
+      return (
+        (item.images?.length ?? 0) === 0 &&
+        (item.attachments?.length ?? 0) <= 1 &&
+        (item.attachments ?? []).every(
+          (attachment) => attachment.type === "text" && attachment.contextKind === "chat_history",
+        )
+      );
     case "tool_call":
       return item.payload.source === "agent";
     default:

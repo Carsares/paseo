@@ -7,6 +7,7 @@ import type {
   JsonValue,
   ProviderOptions,
   ToolPolicy,
+  UserMessageForkContext,
 } from "@getpaseo/protocol/agent-types";
 import type { AgentMessage } from "@getpaseo/protocol/agent-message";
 import type { AgentAttachment } from "@getpaseo/protocol/messages";
@@ -398,7 +399,13 @@ export interface PluginTimelineItem {
 }
 
 export type AgentTimelineItem =
-  | { type: "user_message"; text: string; messageId?: string; clientMessageId?: string }
+  | {
+      type: "user_message";
+      text: string;
+      messageId?: string;
+      clientMessageId?: string;
+      forkContext?: UserMessageForkContext;
+    }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
   | ToolCallTimelineItem

@@ -1,5 +1,12 @@
 import { expect, test } from "vitest";
-import { createAgentMessageDelivery, parseAgentMessages } from "./index.js";
+import {
+  createAgentMessageDelivery,
+  formatAgentMessage,
+  parseAgentMessages,
+  projectAgentMessages,
+} from "./index.js";
+import { extractSubmittedPromptForkContext } from "./envelope.js";
+import { buildAgentPrompt } from "../prompt-attachments.js";
 import type { AgentPromptInput } from "../agent-sdk-types.js";
 
 function createClock() {
@@ -312,4 +319,120 @@ test("runtime safety sees queued messages until provider dispatch settles", asyn
   release();
   await delivery.close();
   expect(delivery.hasPending("parent")).toBe(false);
+});
+
+const FORK_SUMMARY_WITH_PROVENANCE =
+  "<chat-history-summary>\nChat history from a previous Paseo agent.\nSource agent ID: agent-src-1\nSource agent: Source\nSource directory: /repo\nSource boundary message ID: assistant-1\n\n[User] Hi\n[Assistant] Hello\n</chat-history-summary>";
+const LEGACY_FORK_SUMMARY =
+  "<chat-history-summary>\nChat history from a previous Paseo agent.\nSource agent: Source\n\n[User] Hi\n</chat-history-summary>";
+
+test("provider-replayed fork summary is stripped from the user message and keeps its provenance", () => {
+  expect(
+    projectAgentMessages({
+      type: "user_message",
+      text: `${FORK_SUMMARY_WITH_PROVENANCE}\n\n评估下方案`,
+      messageId: "provider-1",
+    }),
+  ).toEqual([
+    {
+      type: "user_message",
+      text: "评估下方案",
+      messageId: "provider-1",
+      forkContext: { sourceAgentId: "agent-src-1", boundaryMessageId: "assistant-1" },
+    },
+  ]);
+});
+
+test("a fork summary without provenance headers still marks the message as a fork", () => {
+  expect(
+    projectAgentMessages({ type: "user_message", text: `${LEGACY_FORK_SUMMARY}\n\n继续` }),
+  ).toEqual([{ type: "user_message", text: "继续", forkContext: {} }]);
+});
+
+test("an attachment-only fork summary leaves empty user text", () => {
+  expect(
+    projectAgentMessages({ type: "user_message", text: FORK_SUMMARY_WITH_PROVENANCE }),
+  ).toEqual([
+    {
+      type: "user_message",
+      text: "",
+      forkContext: { sourceAgentId: "agent-src-1", boundaryMessageId: "assistant-1" },
+    },
+  ]);
+});
+
+test("repeated fork summaries are all stripped and the first provenance wins", () => {
+  const second = FORK_SUMMARY_WITH_PROVENANCE.replace("agent-src-1", "agent-src-2");
+  const [item] = projectAgentMessages({
+    type: "user_message",
+    text: `${FORK_SUMMARY_WITH_PROVENANCE}\n\n${second}\n\nhello`,
+  });
+  expect(item).toMatchObject({ text: "hello", forkContext: { sourceAgentId: "agent-src-1" } });
+});
+
+test("a fork summary that is not at the start of the message stays user text", () => {
+  const text = `see this\n\n${LEGACY_FORK_SUMMARY}`;
+  expect(projectAgentMessages({ type: "user_message", text })).toEqual([
+    { type: "user_message", text },
+  ]);
+});
+
+test("explicit fork context on the item wins over the one parsed from text", () => {
+  const [item] = projectAgentMessages({
+    type: "user_message",
+    text: `${FORK_SUMMARY_WITH_PROVENANCE}\n\nhi`,
+    forkContext: { sourceAgentId: "explicit" },
+  });
+  expect(item).toMatchObject({
+    text: "hi",
+    forkContext: { sourceAgentId: "explicit", boundaryMessageId: "assistant-1" },
+  });
+});
+
+test("the fork summary of a human message wrapped in a user-message envelope is stripped", () => {
+  const [item] = projectAgentMessages({
+    type: "user_message",
+    text: formatAgentMessage({
+      id: "client-1",
+      source: null,
+      text: `${FORK_SUMMARY_WITH_PROVENANCE}\n\nhi`,
+    }),
+  });
+  expect(item).toMatchObject({
+    type: "user_message",
+    text: "hi",
+    clientMessageId: "client-1",
+    forkContext: { sourceAgentId: "agent-src-1", boundaryMessageId: "assistant-1" },
+  });
+});
+
+test("submitted prompt fork context comes from the chat history attachment", () => {
+  const attachment = {
+    type: "text" as const,
+    mimeType: "text/plain" as const,
+    contextKind: "chat_history",
+    title: "Chat history",
+    text: FORK_SUMMARY_WITH_PROVENANCE,
+  };
+  const prompt = buildAgentPrompt("评估下方案", undefined, [attachment]);
+  expect(extractSubmittedPromptForkContext(prompt)).toEqual({
+    sourceAgentId: "agent-src-1",
+    boundaryMessageId: "assistant-1",
+  });
+  expect(
+    extractSubmittedPromptForkContext(
+      buildAgentPrompt("评估下方案", undefined, [
+        {
+          ...attachment,
+          text: LEGACY_FORK_SUMMARY,
+          forkContext: { sourceAgentId: "from-attachment" },
+        },
+      ]),
+    ),
+  ).toEqual({ sourceAgentId: "from-attachment" });
+  expect(extractSubmittedPromptForkContext(buildAgentPrompt("plain"))).toBeUndefined();
+  expect(extractSubmittedPromptForkContext(FORK_SUMMARY_WITH_PROVENANCE)).toEqual({
+    sourceAgentId: "agent-src-1",
+    boundaryMessageId: "assistant-1",
+  });
 });

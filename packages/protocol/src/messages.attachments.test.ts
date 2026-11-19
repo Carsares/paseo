@@ -7,6 +7,7 @@ import {
   CreatePaseoWorktreeRequestSchema,
   SendAgentMessageRequestSchema,
 } from "./messages.js";
+import { validateWSOutboundMessage } from "./validation/ws-outbound.js";
 
 describe("shared messages attachments", () => {
   it("preserves an optional timeline cursor on fork-context messages", () => {
@@ -308,6 +309,133 @@ describe("shared messages attachments", () => {
         text: "Future client hint",
       },
     ]);
+  });
+
+  it("preserves forkContext only on chat_history text attachments", () => {
+    const forkContext = { sourceAgentId: "agent-src", boundaryMessageId: "msg-1" };
+    const parsed = SendAgentMessageRequestSchema.parse({
+      type: "send_agent_message_request",
+      requestId: "req-fork-context",
+      agentId: "agent-1",
+      text: "Continue",
+      attachments: [
+        {
+          type: "text",
+          mimeType: "text/plain",
+          contextKind: "chat_history",
+          text: "Earlier context",
+          forkContext,
+        },
+        {
+          type: "text",
+          mimeType: "text/plain",
+          contextKind: "chat_history",
+          text: "Empty fork context",
+          forkContext: {},
+        },
+        {
+          type: "text",
+          mimeType: "text/plain",
+          text: "No context kind",
+          forkContext,
+        },
+        {
+          type: "text",
+          mimeType: "text/plain",
+          contextKind: "future_context",
+          text: "Future context kind",
+          forkContext,
+        },
+      ],
+    });
+
+    expect(parsed.attachments).toEqual([
+      {
+        type: "text",
+        mimeType: "text/plain",
+        contextKind: "chat_history",
+        text: "Earlier context",
+        forkContext,
+      },
+      {
+        type: "text",
+        mimeType: "text/plain",
+        contextKind: "chat_history",
+        text: "Empty fork context",
+        forkContext: {},
+      },
+      { type: "text", mimeType: "text/plain", text: "No context kind" },
+      { type: "text", mimeType: "text/plain", text: "Future context kind" },
+    ]);
+  });
+
+  it("accepts an attachment with forkContext on fork-context responses", () => {
+    const forkContext = { sourceAgentId: "agent-src", boundaryMessageId: "msg-1" };
+    const messageWithForkContext = {
+      type: "agent.fork_context.response" as const,
+      payload: {
+        requestId: "fork-2",
+        agentId: "agent-src",
+        attachment: {
+          type: "text" as const,
+          mimeType: "text/plain" as const,
+          contextKind: "chat_history",
+          title: "Chat history",
+          text: "Earlier context",
+          forkContext,
+        },
+        itemCount: 1,
+        boundaryMessageId: "msg-1",
+        error: null,
+      },
+    };
+    const response = AgentForkContextResponseMessageSchema.parse(messageWithForkContext);
+
+    expect(response.payload.attachment).toEqual({
+      type: "text",
+      mimeType: "text/plain",
+      contextKind: "chat_history",
+      title: "Chat history",
+      text: "Earlier context",
+      forkContext,
+    });
+    expect(
+      validateWSOutboundMessage({
+        type: "session",
+        message: messageWithForkContext,
+      }),
+    ).toEqual({
+      success: true,
+      data: {
+        type: "session",
+        message: messageWithForkContext,
+      },
+    });
+    const messageWithoutForkContext = {
+      ...messageWithForkContext,
+      payload: {
+        ...messageWithForkContext.payload,
+        attachment: {
+          type: "text" as const,
+          mimeType: "text/plain" as const,
+          contextKind: "chat_history",
+          title: "Chat history",
+          text: "Earlier context",
+        },
+      },
+    };
+    expect(
+      validateWSOutboundMessage({
+        type: "session",
+        message: messageWithoutForkContext,
+      }),
+    ).toEqual({
+      success: true,
+      data: {
+        type: "session",
+        message: messageWithoutForkContext,
+      },
+    });
   });
 
   it("preserves neutral external-resource presentation on text attachments", () => {

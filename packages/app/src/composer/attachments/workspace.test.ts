@@ -1,11 +1,23 @@
-import { describe, expect, it } from "vitest";
+/**
+ * @vitest-environment jsdom
+ */
+import { renderHook } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkspaceComposerAttachment } from "@/attachments/types";
 import {
   buildDraftWorkspaceAttachmentScopeKey,
   resetWorkspaceAttachmentsStore,
   useWorkspaceAttachmentsStore,
 } from "@/attachments/workspace-attachments-store";
+import { openForkSourceAgent } from "@/utils/navigate-to-agent";
+import { composerWorkspaceAttachment } from "./workspace";
 import { removeSentContextAttachments } from "./workspace-cleanup";
+
+vi.mock("lucide-react-native", () => import("../../../test-stubs/lucide-react-native"));
+vi.mock("react-native-unistyles", () => import("../../../test-stubs/react-native-unistyles"));
+vi.mock("@/utils/navigate-to-agent", () => ({
+  openForkSourceAgent: vi.fn(async () => true),
+}));
 
 function chatHistoryAttachment(): WorkspaceComposerAttachment {
   return {
@@ -68,5 +80,39 @@ describe("workspace composer attachment cleanup", () => {
     removeSentContextAttachments([chatHistory, pullRequestContext, browserElement]);
 
     expect(useWorkspaceAttachmentsStore.getState().attachmentsByScope[scopeKey]).toBeUndefined();
+  });
+});
+
+describe("workspace composer attachment opening", () => {
+  beforeEach(() => {
+    vi.mocked(openForkSourceAgent).mockClear();
+  });
+
+  function renderBinding(workspaceAttachments: WorkspaceComposerAttachment[]) {
+    return renderHook(() =>
+      composerWorkspaceAttachment.useBinding({ normalAttachments: [], workspaceAttachments }),
+    );
+  }
+
+  it("opens the fork source agent when a chat history attachment is opened", () => {
+    const attachment = chatHistoryAttachment();
+    const { result } = renderBinding([attachment]);
+
+    expect(result.current.openAttachment({ attachment })).toBe(true);
+
+    expect(openForkSourceAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ serverId: "local", sourceAgentId: "agent-1" }),
+    );
+  });
+
+  it("does not open anything for a chat history attachment without a source agent", () => {
+    const attachment = chatHistoryAttachment();
+    if (attachment.kind !== "chat_history") throw new Error("expected chat history");
+    const withoutSource = { ...attachment, source: { ...attachment.source, agentId: " " } };
+    const { result } = renderBinding([withoutSource]);
+
+    expect(result.current.openAttachment({ attachment: withoutSource })).toBe(false);
+
+    expect(openForkSourceAgent).not.toHaveBeenCalled();
   });
 });

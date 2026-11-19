@@ -393,8 +393,19 @@ export interface AgentTaskItem {
   activeForm?: string;
 }
 
+export interface UserMessageForkContext {
+  sourceAgentId?: string;
+  boundaryMessageId?: string;
+}
+
 export type AgentTimelineItem =
-  | { type: "user_message"; text: string; messageId?: string; clientMessageId?: string }
+  | {
+      type: "user_message";
+      text: string;
+      messageId?: string;
+      clientMessageId?: string;
+      forkContext?: UserMessageForkContext;
+    }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
   | ToolCallTimelineItem

@@ -600,3 +600,49 @@ it("preserves every message in fork history below the character budget", () => {
     `<chat-history-summary>\nChat history from a previous Paseo agent.\n\n[User] ${text}\n</chat-history-summary>`,
   );
 });
+
+it("records the source agent and boundary message in the fork attachment and its header", () => {
+  const result = buildAgentForkContextAttachment({
+    rows: [
+      row(1, { type: "user_message", text: "Ship the thing" }),
+      row(2, { type: "assistant_message", text: "Done.", messageId: "assistant-1" }),
+    ],
+    boundaryMessageId: "assistant-1",
+    sourceAgentId: "agent-src-1",
+    agentTitle: "Source Agent",
+    cwd: "/repo",
+  });
+  expect(result.attachment.forkContext).toEqual({
+    sourceAgentId: "agent-src-1",
+    boundaryMessageId: "assistant-1",
+  });
+  expect(result.attachment.text).toContain("Source agent ID: agent-src-1");
+  expect(result.attachment.text).toContain("Source boundary message ID: assistant-1");
+});
+
+it("omits fork provenance when neither source agent nor boundary message is known", () => {
+  const result = buildAgentForkContextAttachment({
+    rows: [row(1, { type: "assistant_message", text: "Done." })],
+  });
+  expect(result.attachment).not.toHaveProperty("forkContext");
+  expect(result.attachment.text).not.toContain("Source agent ID:");
+  expect(result.attachment.text).not.toContain("Source boundary message ID:");
+});
+
+it("keeps oversized fork history within 100,000 characters when provenance is present", () => {
+  const result = buildAgentForkContextAttachment({
+    rows: [
+      row(1, { type: "user_message", text: "old-message " + "x".repeat(1_100_000) }),
+      row(2, { type: "assistant_message", messageId: "assistant-1", text: "Latest answer." }),
+    ],
+    boundaryMessageId: "assistant-1",
+    sourceAgentId: "agent-src-1",
+    agentTitle: "T".repeat(200_000),
+    cwd: "/" + "p".repeat(200_000),
+  });
+  expect(result.attachment.text.length).toBeLessThanOrEqual(100_000);
+  expect(result.attachment.text).toContain("Source agent ID: agent-src-1");
+  expect(result.attachment.text).toContain("Source boundary message ID: assistant-1");
+  expect(result.attachment.text).toContain("[Assistant] Latest answer.");
+  expect(result.attachment.text).toMatch(/\n<\/chat-history-summary>$/);
+});

@@ -76,10 +76,24 @@ function buildChatHistoryAttachment(input: {
   if (!input.payload.attachment) {
     throw new Error(input.missingAttachmentMessage);
   }
+  const forkContext = input.payload.attachment.forkContext;
+  const sourceAgentId = input.agentId.trim() || forkContext?.sourceAgentId?.trim();
+  const boundaryMessageId =
+    input.payload.boundaryMessageId?.trim() || forkContext?.boundaryMessageId?.trim();
   return {
     kind: "chat_history",
     id: `chat_history:${input.draftId}`,
-    attachment: input.payload.attachment,
+    attachment: {
+      ...input.payload.attachment,
+      ...(sourceAgentId || boundaryMessageId
+        ? {
+            forkContext: {
+              ...(sourceAgentId ? { sourceAgentId } : {}),
+              ...(boundaryMessageId ? { boundaryMessageId } : {}),
+            },
+          }
+        : {}),
+    },
     source: {
       serverId: input.serverId,
       agentId: input.agentId,

@@ -304,6 +304,7 @@ import type {
   AgentUsage,
   JsonValue,
 } from "./agent-types.js";
+export type { UserMessageForkContext } from "./agent-types.js";
 
 // WebSocket payloads have already crossed JSON serialization. Keeping this as
 // unknown avoids zod-aot's recursive z.json() object-codegen regression.
@@ -755,6 +756,11 @@ const ToolCallTimelineItemPayloadSchema: z.ZodType<ToolCallTimelineItem, unknown
     ToolCallCanceledPayloadSchema,
   ]);
 
+export const UserMessageForkContextSchema = z.object({
+  sourceAgentId: z.string().optional(),
+  boundaryMessageId: z.string().optional(),
+});
+
 // zod-aot 0.20.4 miscompiles this as a nested discriminated union by omitting
 // the inner tool_call branch from the generated outer dispatch.
 export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, unknown> = z.union([
@@ -763,6 +769,7 @@ export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, unknow
     text: z.string(),
     messageId: z.string().optional(),
     clientMessageId: z.string().optional(),
+    forkContext: UserMessageForkContextSchema.optional(),
   }),
   z.object({
     type: z.literal("assistant_message"),
@@ -1256,10 +1263,13 @@ export const TextAttachmentSchema = z
     title: z.string().nullable().optional(),
     text: z.string(),
     externalResource: ExternalResourceAttachmentMetadataSchema.optional(),
+    forkContext: UserMessageForkContextSchema.optional(),
   })
-  .transform(({ contextKind, ...attachment }) => ({
+  .transform(({ contextKind, forkContext, ...attachment }) => ({
     ...attachment,
-    ...(contextKind === "chat_history" ? { contextKind } : {}),
+    ...(contextKind === "chat_history"
+      ? { contextKind, ...(forkContext ? { forkContext } : {}) }
+      : {}),
   }));
 
 export const ReviewAttachmentContextLineSchema = z.object({
