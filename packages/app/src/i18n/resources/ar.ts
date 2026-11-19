@@ -2060,12 +2060,6 @@ export const ar: TranslationResources = {
     pillLabelReadyToReview: "{{count}} جاهزة للمراجعة",
     detachAction: "فصل {{label}}",
     detachTooltip: "فصل الوكيل الفرعي",
-    moveToWorkspaceConfirmTitle: "النقل إلى مساحة عمل جديدة؟",
-    moveToWorkspaceConfirmMessage:
-      "سينفصل {{label}} عن وكيله الرئيسي وسيُفتح كمساحة عمل مستقلة في هذا المشروع.",
-    moveToWorkspaceConfirmFallbackLabel: "هذا الوكيل الفرعي",
-    moveToWorkspaceConfirmAction: "نقل",
-    moveToWorkspaceCancelAction: "إلغاء",
     archiveAction: "أرشيف{{label}}",
     archiveTooltip: "أرشفة الوكيل الفرعي",
     archiveFinishedAction: "أرشفة الوكلاء الفرعيين المكتملين",

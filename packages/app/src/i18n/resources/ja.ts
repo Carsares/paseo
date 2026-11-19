@@ -2081,12 +2081,6 @@ export const ja: TranslationResources = {
     pillLabelReadyToReview: "{{count}} 件レビュー待ち",
     detachAction: "{{label}}を切り離す",
     detachTooltip: "サブエージェントを切り離す",
-    moveToWorkspaceConfirmTitle: "新しいワークスペースへ移動しますか？",
-    moveToWorkspaceConfirmMessage:
-      "{{label}}は親エージェントから切り離され、このプロジェクト内の独立したワークスペースとして開きます。",
-    moveToWorkspaceConfirmFallbackLabel: "このサブエージェント",
-    moveToWorkspaceConfirmAction: "移動",
-    moveToWorkspaceCancelAction: "キャンセル",
     archiveAction: "{{label}}をアーカイブ",
     archiveTooltip: "サブエージェントをアーカイブ",
     archiveFinishedAction: "完了したサブエージェントをアーカイブ",

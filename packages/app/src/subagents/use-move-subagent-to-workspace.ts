@@ -4,7 +4,6 @@ import { useToast } from "@/contexts/toast-context";
 import { i18n } from "@/i18n/i18next";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useSessionStore } from "@/stores/session-store";
-import { confirmDialog } from "@/utils/confirm-dialog";
 import { toErrorMessage } from "@/utils/error-messages";
 import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
 import { requestMoveSubagentToWorkspace } from "./move-subagent-to-workspace";
@@ -50,11 +49,6 @@ export function useMoveSubagentToWorkspace(): (address: AgentAddress) => void {
       void requestMoveSubagentToWorkspace(
         { serverId, subagentId },
         {
-          getSubagent: (id) => {
-            const session = useSessionStore.getState().sessions[serverId];
-            return session?.agents?.get(id) ?? session?.agentDetails?.get(id);
-          },
-          confirm: confirmDialog,
           moveAgentToWorkspace: async ({ serverId: targetServerId, agentId, idempotencyKey }) => {
             const client = useSessionStore.getState().sessions[targetServerId]?.client;
             if (!client) {

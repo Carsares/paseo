@@ -8,7 +8,6 @@ export {
 } from "./use-move-subagent-to-workspace";
 export {
   canMoveSubagentToWorkspace,
-  resolveMoveSubagentToWorkspaceDialog,
   requestMoveSubagentToWorkspace,
 } from "./move-subagent-to-workspace";
 export { resolveCloseAgentTabPolicy, type CloseAgentTabPolicy } from "./close-tab-policy";

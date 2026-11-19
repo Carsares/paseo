@@ -211,23 +211,14 @@ describe("translation resources", () => {
   });
 
   it.each(Object.entries({ ar, es, fr, ja, ko, "pt-BR": ptBR, ru, "zh-CN": zhCN }))(
-    "localizes the move to new workspace action and confirmation in %s",
+    "localizes the move to new workspace action in %s",
     (_locale, resource) => {
-      const keys = [
-        "workspace.tabs.menu.moveToNewWorkspace",
-        "subagents.moveToWorkspaceConfirmTitle",
-        "subagents.moveToWorkspaceConfirmMessage",
-        "subagents.moveToWorkspaceConfirmFallbackLabel",
-        "subagents.moveToWorkspaceConfirmAction",
-        "subagents.moveToWorkspaceCancelAction",
-      ];
+      const key = "workspace.tabs.menu.moveToNewWorkspace";
       const englishStrings = flattenStrings(en);
       const localeStrings = flattenStrings(resource);
-      for (const key of keys) {
-        expect(englishStrings[key], key).toMatch(/\S/);
-        expect(localeStrings[key], key).toMatch(/\S/);
-        expect(localeStrings[key], key).not.toBe(englishStrings[key]);
-      }
+      expect(englishStrings[key], key).toMatch(/\S/);
+      expect(localeStrings[key], key).toMatch(/\S/);
+      expect(localeStrings[key], key).not.toBe(englishStrings[key]);
     },
   );
 

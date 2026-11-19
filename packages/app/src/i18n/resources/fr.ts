@@ -2108,12 +2108,6 @@ export const fr: TranslationResources = {
     pillLabelReadyToReview: "{{count}} à relire",
     detachAction: "Détacher {{label}}",
     detachTooltip: "Détacher le sous-agent",
-    moveToWorkspaceConfirmTitle: "Déplacer vers un nouvel espace de travail ?",
-    moveToWorkspaceConfirmMessage:
-      "{{label}} sera détaché de son agent parent et s’ouvrira dans ce projet en tant qu’espace de travail indépendant.",
-    moveToWorkspaceConfirmFallbackLabel: "Ce sous-agent",
-    moveToWorkspaceConfirmAction: "Déplacer",
-    moveToWorkspaceCancelAction: "Annuler",
     archiveAction: "Archiver {{label}}",
     archiveTooltip: "Archiver le sous-agent",
     archiveFinishedAction: "Archiver les sous-agents terminés",

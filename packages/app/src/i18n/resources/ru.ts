@@ -2094,12 +2094,6 @@ export const ru: TranslationResources = {
     pillLabelReadyToReview: "{{count}} на проверку",
     detachAction: "Отсоединить {{label}}",
     detachTooltip: "Отсоединить субагента",
-    moveToWorkspaceConfirmTitle: "Переместить в новое рабочее пространство?",
-    moveToWorkspaceConfirmMessage:
-      "{{label}} будет отделён от родительского агента и откроется как отдельное рабочее пространство в этом проекте.",
-    moveToWorkspaceConfirmFallbackLabel: "Этот субагент",
-    moveToWorkspaceConfirmAction: "Переместить",
-    moveToWorkspaceCancelAction: "Отмена",
     archiveAction: "Архивировать {{label}}",
     archiveTooltip: "Архивировать субагента",
     archiveFinishedAction: "Архивировать завершенные субагенты",

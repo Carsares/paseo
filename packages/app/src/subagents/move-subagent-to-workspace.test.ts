@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
   canMoveSubagentToWorkspace,
   requestMoveSubagentToWorkspace,
-  resolveMoveSubagentToWorkspaceDialog,
   type MoveSubagentToWorkspaceDeps,
 } from "./move-subagent-to-workspace";
 
@@ -25,31 +24,10 @@ describe("canMoveSubagentToWorkspace", () => {
   });
 });
 
-describe("resolveMoveSubagentToWorkspaceDialog", () => {
-  it("uses the trimmed title and describes what moving does", () => {
-    expect(resolveMoveSubagentToWorkspaceDialog({ title: "  Review branch  " })).toEqual({
-      title: "Move to new workspace?",
-      message:
-        "Review branch will detach from its parent and open as a separate workspace in this project.",
-      confirmLabel: "Move",
-      cancelLabel: "Cancel",
-      destructive: false,
-    });
-  });
-
-  it.each([null, undefined, "   ", " NeW AgEnT "])("uses the fallback for title %s", (title) => {
-    expect(resolveMoveSubagentToWorkspaceDialog({ title }).message).toBe(
-      "This subagent will detach from its parent and open as a separate workspace in this project.",
-    );
-  });
-});
-
 const input = { serverId: "server-1", subagentId: "child-agent" };
 
 function createDeps() {
   return {
-    getSubagent: vi.fn(() => ({ title: "Review branch" })),
-    confirm: vi.fn<MoveSubagentToWorkspaceDeps["confirm"]>().mockResolvedValue(true),
     createIdempotencyKey: vi.fn(() => "move-key"),
     moveAgentToWorkspace: vi
       .fn<MoveSubagentToWorkspaceDeps["moveAgentToWorkspace"]>()
@@ -60,23 +38,12 @@ function createDeps() {
 }
 
 describe("requestMoveSubagentToWorkspace", () => {
-  it("waits for confirmation and opens the workspace returned by the move", async () => {
+  it("moves immediately without confirmation and opens the returned workspace", async () => {
     const deps = createDeps();
-    const confirmation = Promise.withResolvers<boolean>();
-    deps.confirm.mockReturnValueOnce(confirmation.promise);
 
-    const moving = requestMoveSubagentToWorkspace(input, deps);
-    expect(deps.getSubagent).toHaveBeenCalledWith(input.subagentId);
-    expect(deps.confirm).toHaveBeenCalledWith(
-      resolveMoveSubagentToWorkspaceDialog({ title: "Review branch" }),
-    );
-    expect(deps.createIdempotencyKey).not.toHaveBeenCalled();
-    expect(deps.moveAgentToWorkspace).not.toHaveBeenCalled();
-    expect(deps.openMovedWorkspace).not.toHaveBeenCalled();
+    await requestMoveSubagentToWorkspace(input, deps);
 
-    confirmation.resolve(true);
-    await moving;
-
+    expect(deps.createIdempotencyKey).toHaveBeenCalledExactlyOnceWith();
     expect(deps.moveAgentToWorkspace).toHaveBeenCalledExactlyOnceWith({
       serverId: input.serverId,
       agentId: input.subagentId,
@@ -87,18 +54,6 @@ describe("requestMoveSubagentToWorkspace", () => {
       workspaceId: "new-workspace",
       agentId: input.subagentId,
     });
-    expect(deps.reportError).not.toHaveBeenCalled();
-  });
-
-  it("skips the move and navigation if the user cancels", async () => {
-    const deps = createDeps();
-    deps.confirm.mockResolvedValueOnce(false);
-
-    await requestMoveSubagentToWorkspace(input, deps);
-
-    expect(deps.createIdempotencyKey).not.toHaveBeenCalled();
-    expect(deps.moveAgentToWorkspace).not.toHaveBeenCalled();
-    expect(deps.openMovedWorkspace).not.toHaveBeenCalled();
     expect(deps.reportError).not.toHaveBeenCalled();
   });
 
@@ -129,7 +84,6 @@ describe("requestMoveSubagentToWorkspace", () => {
     const moving = requestMoveSubagentToWorkspace(input, deps);
     await navigationStarted.promise;
     await requestMoveSubagentToWorkspace(input, deps);
-    expect(deps.confirm).toHaveBeenCalledTimes(1);
     expect(deps.moveAgentToWorkspace).toHaveBeenCalledTimes(1);
 
     const error = new Error("Could not open workspace");
@@ -138,22 +92,13 @@ describe("requestMoveSubagentToWorkspace", () => {
     expect(deps.reportError).toHaveBeenCalledExactlyOnceWith(error);
   });
 
-  it("suppresses concurrent duplicates through both confirmation and the move", async () => {
+  it("suppresses concurrent duplicates while the move is in flight", async () => {
     const deps = createDeps();
-    const confirmation = Promise.withResolvers<boolean>();
     const move = Promise.withResolvers<{ workspaceId: string }>();
-    deps.confirm.mockReturnValueOnce(confirmation.promise);
     deps.moveAgentToWorkspace.mockReturnValueOnce(move.promise);
 
     const moving = requestMoveSubagentToWorkspace(input, deps);
-    const duplicateDuringConfirmation = requestMoveSubagentToWorkspace(input, deps);
-    expect(deps.confirm).toHaveBeenCalledTimes(1);
-    await duplicateDuringConfirmation;
-
-    confirmation.resolve(true);
-    await confirmation.promise;
     const duplicateDuringMove = requestMoveSubagentToWorkspace(input, deps);
-    expect(deps.confirm).toHaveBeenCalledTimes(1);
     expect(deps.moveAgentToWorkspace).toHaveBeenCalledTimes(1);
     expect(deps.openMovedWorkspace).not.toHaveBeenCalled();
     await duplicateDuringMove;

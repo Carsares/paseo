@@ -2088,12 +2088,6 @@ export const en = {
     pillLabelReadyToReview: "{{count}} ready to review",
     detachAction: "Detach {{label}}",
     detachTooltip: "Detach subagent",
-    moveToWorkspaceConfirmTitle: "Move to new workspace?",
-    moveToWorkspaceConfirmMessage:
-      "{{label}} will detach from its parent and open as a separate workspace in this project.",
-    moveToWorkspaceConfirmFallbackLabel: "This subagent",
-    moveToWorkspaceConfirmAction: "Move",
-    moveToWorkspaceCancelAction: "Cancel",
     archiveAction: "Archive {{label}}",
     archiveTooltip: "Archive subagent",
     archiveFinishedAction: "Archive finished subagents",

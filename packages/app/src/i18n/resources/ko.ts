@@ -2071,12 +2071,6 @@ export const ko: TranslationResources = {
     pillLabelReadyToReview: "{{count}}개 검토 대기",
     detachAction: "{{label}} 분리",
     detachTooltip: "하위 에이전트 분리",
-    moveToWorkspaceConfirmTitle: "새 워크스페이스로 이동할까요?",
-    moveToWorkspaceConfirmMessage:
-      "{{label}}은(는) 상위 에이전트에서 분리되어 이 프로젝트의 독립된 워크스페이스로 열립니다.",
-    moveToWorkspaceConfirmFallbackLabel: "이 하위 에이전트",
-    moveToWorkspaceConfirmAction: "이동",
-    moveToWorkspaceCancelAction: "취소",
     archiveAction: "{{label}} 보관",
     archiveTooltip: "서브에이전트 보관",
     archiveFinishedAction: "완료된 하위 에이전트 보관",
