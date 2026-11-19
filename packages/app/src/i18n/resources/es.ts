@@ -714,6 +714,7 @@ export const es: TranslationResources = {
         closeRight: "Cerrar pestañas a la derecha",
         closeOthers: "Cerrar otras pestañas",
         moveToMain: "Mover al panel principal",
+        moveToNewWorkspace: "Mover a un nuevo espacio de trabajo",
         reloadAgent: "Recargar agente",
         reloadAgentTooltip:
           "Vuelva a cargar el agente para actualizar habilidades, MCP o estado de inicio de sesión.",
@@ -2108,6 +2109,12 @@ export const es: TranslationResources = {
     pillLabelReadyToReview: "{{count}} para revisar",
     detachAction: "Separar {{label}}",
     detachTooltip: "Separar subagente",
+    moveToWorkspaceConfirmTitle: "¿Mover a un nuevo espacio de trabajo?",
+    moveToWorkspaceConfirmMessage:
+      "{{label}} se separará de su agente principal y se abrirá como un espacio de trabajo independiente en este proyecto.",
+    moveToWorkspaceConfirmFallbackLabel: "Este subagente",
+    moveToWorkspaceConfirmAction: "Mover",
+    moveToWorkspaceCancelAction: "Cancelar",
     archiveAction: "Archivo{{label}}",
     archiveTooltip: "Subagente de archivo",
     archiveFinishedAction: "Archivar subagentes finalizados",

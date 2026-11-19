@@ -16,6 +16,7 @@ export interface WorkspaceTabMenuLabels {
   closeLeft: string;
   closeRight: string;
   closeOthers: string;
+  moveToNewWorkspace?: string;
   reloadAgent: string;
   reloadAgentTooltip: string;
   close: string;
@@ -48,6 +49,7 @@ export type WorkspaceTabMenuEntry =
         | "arrow-left-to-line"
         | "arrow-right-to-line"
         | "copy-x"
+        | "external-link"
         | "pencil"
         | "x";
       hint?: string;
@@ -77,6 +79,7 @@ interface BuildWorkspaceTabMenuEntriesInput {
   onCopyAgentId: (agentId: string) => Promise<void> | void;
   onCopyTerminalId: (terminalId: string) => Promise<void> | void;
   onCopyFilePath: (path: string) => Promise<void> | void;
+  onMoveAgentToWorkspace?: (agentId: string) => Promise<void> | void;
   onReloadAgent: (agentId: string) => Promise<void> | void;
   onRenameTab: (tab: WorkspaceTabDescriptor) => void;
   onCloseTab: (tabId: string) => Promise<void> | void;
@@ -94,6 +97,7 @@ interface BuildWorkspaceDesktopTabActionsInput {
   onCopyAgentId: (agentId: string) => Promise<void> | void;
   onCopyTerminalId: (terminalId: string) => Promise<void> | void;
   onCopyFilePath: (path: string) => Promise<void> | void;
+  onMoveAgentToWorkspace?: (agentId: string) => Promise<void> | void;
   onReloadAgent: (agentId: string) => Promise<void> | void;
   onRenameTab: (tab: WorkspaceTabDescriptor) => void;
   onCloseTab: (tabId: string) => Promise<void> | void;
@@ -181,6 +185,7 @@ export function buildWorkspaceTabMenuEntries(
     onCopyAgentId,
     onCopyTerminalId,
     onCopyFilePath,
+    onMoveAgentToWorkspace,
     onReloadAgent,
     onRenameTab,
     onCloseTab,
@@ -301,6 +306,18 @@ export function buildWorkspaceTabMenuEntries(
   });
   if (tab.target.kind === "agent") {
     const { agentId } = tab.target;
+    if (onMoveAgentToWorkspace) {
+      entries.push({
+        kind: "item",
+        key: "move-to-new-workspace",
+        label: labels.moveToNewWorkspace ?? i18n.t("workspace.tabs.menu.moveToNewWorkspace"),
+        icon: "external-link",
+        testID: `${menuTestIDBase}-move-to-new-workspace`,
+        onSelect: () => {
+          void onMoveAgentToWorkspace(agentId);
+        },
+      });
+    }
     entries.push({
       kind: "item",
       key: "reload-agent",
@@ -343,6 +360,7 @@ export function buildWorkspaceDesktopTabActions(
       onCopyAgentId: input.onCopyAgentId,
       onCopyTerminalId: input.onCopyTerminalId,
       onCopyFilePath: input.onCopyFilePath,
+      onMoveAgentToWorkspace: input.onMoveAgentToWorkspace,
       onReloadAgent: input.onReloadAgent,
       onRenameTab: input.onRenameTab,
       onCloseTab: input.onCloseTab,

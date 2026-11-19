@@ -386,8 +386,9 @@ describe("archiveByScope", () => {
     expect(existsSync(worktree.worktreePath)).toBe(false);
   });
 
-  test("workspace scope runs teardown while keeping a directory referenced by a sibling", async () => {
+  test("workspace scope tears down a shared worktree only after its final workspace is archived", async () => {
     const { tempDir, repoDir } = createGitRepo();
+    const teardownLog = path.join(repoDir, "shared-teardown.log");
     writeFileSync(
       path.join(repoDir, "paseo.json"),
       JSON.stringify({
@@ -407,27 +408,55 @@ describe("archiveByScope", () => {
     const worktree = await createPaseoOwnedWorktree(repoDir, paseoHome, "sibling-workspace");
     const workspaceA = "ws-sibling-a";
     const workspaceB = "ws-sibling-b";
+    const workspaceC = "ws-sibling-c";
+    const placement = {
+      cwd: worktree.worktreePath,
+      kind: "worktree",
+      isPaseoOwnedWorktree: true,
+      worktreeRoot: worktree.worktreePath,
+      mainRepoRoot: repoDir,
+    } as const;
 
-    const result = await archiveByScope(
-      createArchiveDeps({
-        paseoHome,
-        activeWorkspaces: [
-          { workspaceId: workspaceA, cwd: worktree.worktreePath, kind: "worktree" },
-          { workspaceId: workspaceB, cwd: worktree.worktreePath, kind: "local_checkout" },
-        ],
-      }),
-      {
-        scope: { kind: "workspace", workspaceId: workspaceA },
-        requestId: "req-sibling-workspace",
-      },
-    );
+    const deps = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [
+        { workspaceId: workspaceA, ...placement },
+        { workspaceId: workspaceB, ...placement },
+      ],
+    });
+    const first = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId: workspaceA },
+      requestId: "req-sibling-workspace-a",
+    });
 
-    assertArchiveResult(result, {
+    assertArchiveResult(first, {
       archivedWorkspaceIds: [workspaceA],
       removedDirectory: false,
     });
     expect(existsSync(worktree.worktreePath)).toBe(true);
-    expect(readFileSync(path.join(repoDir, "shared-teardown.log"), "utf8")).toBe("ok");
+    expect(existsSync(teardownLog)).toBe(false);
+
+    deps.assertWorkspaceAutomationAllowed = async (workspaceId) => {
+      if (workspaceId === workspaceB) {
+        deps.activeWorkspaces.push({ workspaceId: workspaceC, ...placement });
+      }
+    };
+    const second = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId: workspaceB },
+      requestId: "req-sibling-workspace-b",
+    });
+    assertArchiveResult(second, { archivedWorkspaceIds: [workspaceB], removedDirectory: false });
+    expect(existsSync(worktree.worktreePath)).toBe(true);
+    expect(existsSync(teardownLog)).toBe(false);
+
+    const last = await archiveByScope(deps, {
+      scope: { kind: "workspace", workspaceId: workspaceC },
+      requestId: "req-sibling-workspace-c",
+    });
+
+    assertArchiveResult(last, { archivedWorkspaceIds: [workspaceC], removedDirectory: true });
+    expect(existsSync(worktree.worktreePath)).toBe(false);
+    expect(readFileSync(teardownLog, "utf8")).toBe("ok");
   });
 
   test("workspace scope skips teardown while repository automation is blocked", async () => {

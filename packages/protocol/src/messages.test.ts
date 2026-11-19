@@ -363,6 +363,44 @@ describe("agent detach RPC", () => {
   });
 });
 
+describe("agent move to workspace RPC", () => {
+  test.each([{}, { idempotencyKey: "move-1" }])(
+    "parses a move request with optional fields %j",
+    (optionalFields) => {
+      const request = {
+        type: "agent.move_to_workspace.request",
+        agentId: "child-agent",
+        requestId: "req-move",
+        ...optionalFields,
+      };
+
+      expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+    },
+  );
+
+  test.each([
+    { accepted: true, workspaceId: "ws-1", error: null },
+    { accepted: false, workspaceId: null, error: "Agent cannot move" },
+  ])("parses a move response with accepted=$accepted", (result) => {
+    const response = {
+      type: "agent.move_to_workspace.response",
+      payload: { requestId: "req-move", agentId: "child-agent", ...result },
+    };
+
+    expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
+  });
+
+  test("parses server info with and without the move feature flag", () => {
+    const serverInfo = { status: "server_info", serverId: "srv-test" };
+
+    expect(
+      parseServerInfoStatusPayload({ ...serverInfo, features: { agentMoveToWorkspace: true } })
+        ?.features?.agentMoveToWorkspace,
+    ).toBe(true);
+    expect(parseServerInfoStatusPayload(serverInfo)).toMatchObject(serverInfo);
+  });
+});
+
 describe("agent setting action responses", () => {
   test("parses optional provider notices on mode and thinking responses", () => {
     const mode = SessionOutboundMessageSchema.parse({

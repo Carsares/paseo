@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { i18n } from "@/i18n/i18next";
+import { fr } from "@/i18n/resources/fr";
 import {
   buildWorkspaceDesktopTabActions,
   buildWorkspaceTabMenuEntries,
@@ -366,4 +368,104 @@ describe("buildWorkspaceTabMenuEntries", () => {
     expect(agentSeparator?.key).toBe("rename-separator");
     expect(terminalSeparator?.key).toBe("rename-separator");
   });
+});
+
+describe("move to new workspace", () => {
+  const agentTab = createAgentTab();
+  const providerSubagentTab: WorkspaceTabDescriptor = {
+    key: "provider_subagent_123",
+    tabId: "provider_subagent_123",
+    kind: "provider_subagent",
+    target: { kind: "provider_subagent", parentAgentId: "agent-123", subagentId: "child-123" },
+  };
+  const sharedInput = {
+    index: 0,
+    tabCount: 1,
+    onCopyResumeCommand: vi.fn(),
+    onCopyAgentId: vi.fn(),
+    onCopyTerminalId: vi.fn(),
+    onCopyFilePath: vi.fn(),
+    onReloadAgent: vi.fn(),
+    onRenameTab: vi.fn(),
+    onCloseTab: vi.fn(),
+    onCloseOtherTabs: vi.fn(),
+  };
+
+  function buildDesktopMenu(
+    tab: WorkspaceTabDescriptor,
+    onMoveAgentToWorkspace?: (agentId: string) => void,
+  ) {
+    return buildWorkspaceDesktopTabActions({
+      ...sharedInput,
+      tab,
+      onMoveAgentToWorkspace,
+      onCloseTabsToLeft: vi.fn(),
+      onCloseTabsToRight: vi.fn(),
+    }).menuEntries;
+  }
+
+  function buildMobileMenu(
+    tab: WorkspaceTabDescriptor,
+    onMoveAgentToWorkspace?: (agentId: string) => void,
+  ) {
+    return buildWorkspaceTabMenuEntries({
+      ...sharedInput,
+      surface: "mobile",
+      tab,
+      onMoveAgentToWorkspace,
+      menuTestIDBase: `workspace-tab-menu-${tab.tabId}`,
+      onCloseTabsBefore: vi.fn(),
+      onCloseTabsAfter: vi.fn(),
+    });
+  }
+
+  it.each([
+    ["desktop", "workspace-tab-context-agent_123", buildDesktopMenu],
+    ["mobile", "workspace-tab-menu-agent_123", buildMobileMenu],
+  ])("shows the move action for an eligible agent on %s", (_surface, testIDBase, buildMenu) => {
+    const onMoveAgentToWorkspace = vi.fn();
+    const entries = buildMenu(agentTab, onMoveAgentToWorkspace);
+    const moveEntry = entries.find((entry) => entry.key === "move-to-new-workspace");
+    if (moveEntry?.kind !== "item") {
+      throw new Error("Move to new workspace entry missing");
+    }
+
+    expect(moveEntry).toMatchObject({
+      label: "Move to new workspace",
+      icon: "external-link",
+      testID: `${testIDBase}-move-to-new-workspace`,
+    });
+    expect(entries[entries.indexOf(moveEntry) + 1]?.key).toBe("reload-agent");
+    moveEntry.onSelect();
+    expect(onMoveAgentToWorkspace).toHaveBeenCalledExactlyOnceWith("agent-123");
+  });
+
+  it("uses the active language for the default move label", async () => {
+    const previousLanguage = i18n.language;
+    i18n.addResourceBundle("fr", "translation", fr);
+    try {
+      await i18n.changeLanguage("fr");
+      expect(buildDesktopMenu(agentTab, vi.fn())).toContainEqual(
+        expect.objectContaining({
+          key: "move-to-new-workspace",
+          label: fr.workspace.tabs.menu.moveToNewWorkspace,
+        }),
+      );
+    } finally {
+      await i18n.changeLanguage(previousLanguage);
+    }
+  });
+
+  it.each([
+    ["desktop", buildDesktopMenu],
+    ["mobile", buildMobileMenu],
+  ])(
+    "omits the move action without a callback or for provider subagents on %s",
+    (_surface, buildMenu) => {
+      expect(buildMenu(agentTab).map((entry) => entry.key)).not.toContain("move-to-new-workspace");
+      expect(buildMenu(providerSubagentTab, vi.fn()).map((entry) => entry.key)).not.toContain(
+        "move-to-new-workspace",
+      );
+    },
+  );
 });

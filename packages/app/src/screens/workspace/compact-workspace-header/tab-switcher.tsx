@@ -19,6 +19,10 @@ import {
   type WorkspaceTabMenuLabels,
 } from "@/screens/workspace/workspace-tab-menu";
 import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-types";
+import {
+  useCanMoveSubagentToWorkspace,
+  useMoveSubagentToWorkspace,
+} from "@/subagents/use-move-subagent-to-workspace";
 
 // The trigger draws at 32pt beside its island neighbours, so only vertical slop is free.
 const TAB_SWITCHER_TRIGGER_HIT_SLOP = { top: 8, bottom: 8 } as const;
@@ -197,31 +201,68 @@ function MobileWorkspaceTabOption({
       closeLeft: t("workspace.tabs.menu.closeLeft"),
       closeRight: t("workspace.tabs.menu.closeRight"),
       closeOthers: t("workspace.tabs.menu.closeOthers"),
+      moveToNewWorkspace: t("workspace.tabs.menu.moveToNewWorkspace"),
       reloadAgent: t("workspace.tabs.menu.reloadAgent"),
       reloadAgentTooltip: t("workspace.tabs.menu.reloadAgentTooltip"),
       close: t("workspace.tabs.menu.close"),
     }),
     [t],
   );
+  const targetAgentId = tab.target.kind === "agent" ? tab.target.agentId : null;
+  const canMoveAgentToWorkspace = useCanMoveSubagentToWorkspace(
+    normalizedServerId,
+    normalizedWorkspaceId,
+    targetAgentId,
+  );
+  const moveSubagentToWorkspace = useMoveSubagentToWorkspace();
+  const handleMoveAgentToWorkspace = useCallback(
+    (agentId: string) => {
+      moveSubagentToWorkspace({ serverId: normalizedServerId, agentId });
+    },
+    [moveSubagentToWorkspace, normalizedServerId],
+  );
   const menuTestIDBase = `workspace-tab-menu-${tab.tabId}`;
-  const menuEntries = buildWorkspaceTabMenuEntries({
-    surface: "mobile",
-    tab,
-    index: tabIndex,
-    tabCount,
-    menuTestIDBase,
-    onCopyResumeCommand,
-    onCopyAgentId,
-    onCopyTerminalId,
-    onCopyFilePath,
-    onReloadAgent,
-    onRenameTab,
-    onCloseTab,
-    onCloseTabsBefore: onCloseTabsAbove,
-    onCloseTabsAfter: onCloseTabsBelow,
-    onCloseOtherTabs,
-    labels: tabMenuLabels,
-  });
+  const menuEntries = useMemo(
+    () =>
+      buildWorkspaceTabMenuEntries({
+        surface: "mobile",
+        tab,
+        index: tabIndex,
+        tabCount,
+        menuTestIDBase,
+        onCopyResumeCommand,
+        onCopyAgentId,
+        onCopyTerminalId,
+        onCopyFilePath,
+        onMoveAgentToWorkspace: canMoveAgentToWorkspace ? handleMoveAgentToWorkspace : undefined,
+        onReloadAgent,
+        onRenameTab,
+        onCloseTab,
+        onCloseTabsBefore: onCloseTabsAbove,
+        onCloseTabsAfter: onCloseTabsBelow,
+        onCloseOtherTabs,
+        labels: tabMenuLabels,
+      }),
+    [
+      canMoveAgentToWorkspace,
+      handleMoveAgentToWorkspace,
+      menuTestIDBase,
+      onCloseOtherTabs,
+      onCloseTab,
+      onCloseTabsAbove,
+      onCloseTabsBelow,
+      onCopyAgentId,
+      onCopyFilePath,
+      onCopyResumeCommand,
+      onCopyTerminalId,
+      onReloadAgent,
+      onRenameTab,
+      tab,
+      tabCount,
+      tabIndex,
+      tabMenuLabels,
+    ],
+  );
 
   const fallbackLabels = useMemo(
     () => ({

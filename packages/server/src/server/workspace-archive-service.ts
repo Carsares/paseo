@@ -447,6 +447,14 @@ async function maybeRemoveDirectory(
   }
 
   const archivedWorkspaceIdSet = new Set(archivedWorkspaceIds);
+  const isBackingUnreferenced = async () =>
+    isDirectoryUnreferenced(
+      await dependencies.listActiveWorkspaces(),
+      backing.path,
+      archivedWorkspaceIdSet,
+      dependencies,
+    );
+
   const teardownTargets = target.teardownTargets.filter(
     (teardownTarget) =>
       teardownTarget.workspaceId === null || archivedWorkspaceIdSet.has(teardownTarget.workspaceId),
@@ -458,6 +466,8 @@ async function maybeRemoveDirectory(
       teardownTargets,
     );
     for (const teardownTarget of uniqueTeardownTargets(allowedTeardownTargets)) {
+      // Automation checks can yield while another workspace claims this worktree.
+      if (!(await isBackingUnreferenced())) return { removedDirectory: false };
       request.checkpoint();
       await runWorktreeTeardownCommands({
         worktreePath: backing.path,
@@ -476,15 +486,7 @@ async function maybeRemoveDirectory(
     throw error;
   }
 
-  const remainingActive = await dependencies.listActiveWorkspaces();
-  if (
-    !(await isDirectoryUnreferenced(
-      remainingActive,
-      backing.path,
-      new Set(archivedWorkspaceIds),
-      dependencies,
-    ))
-  ) {
+  if (!(await isBackingUnreferenced())) {
     return { removedDirectory: false };
   }
 

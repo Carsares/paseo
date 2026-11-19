@@ -3643,6 +3643,25 @@ export class DaemonClient {
     }
   }
 
+  async moveAgentToWorkspace(
+    agentId: string,
+    options?: { idempotencyKey?: string },
+  ): Promise<{ workspaceId: string }> {
+    const idempotencyKey = options?.idempotencyKey?.trim();
+    const payload =
+      await this.sendNamespacedCorrelatedSessionRequest<"agent.move_to_workspace.response">({
+        message: {
+          type: "agent.move_to_workspace.request",
+          agentId,
+          ...(idempotencyKey ? { idempotencyKey } : {}),
+        },
+      });
+    if (!payload.accepted || !payload.workspaceId) {
+      throw new Error(payload.error ?? "moveAgentToWorkspace rejected");
+    }
+    return { workspaceId: payload.workspaceId };
+  }
+
   async updateAgent(
     agentId: string,
     updates: { name?: string; labels?: Record<string, string> },

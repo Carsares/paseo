@@ -6226,6 +6226,96 @@ test("detaches an agent through the namespaced detach RPC", async () => {
   await expect(promise).resolves.toBeUndefined();
 });
 
+describe("moving an agent to a workspace", () => {
+  function createMoveClient() {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "clsk_unit_test",
+      logger: createMockLogger(),
+      reconnect: { enabled: false },
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
+    return { client, mock };
+  }
+
+  test("sends the trimmed idempotency key and returns the workspace ID", async () => {
+    const { client, mock } = createMoveClient();
+    const connecting = client.connect();
+    mock.triggerOpen({ features: { agentMoveToWorkspace: true } });
+    await connecting;
+
+    const move = client.moveAgentToWorkspace("child-agent", { idempotencyKey: "  move-1  " });
+
+    expect(mock.sent).toHaveLength(1);
+    const request = parseSentFrame(mock.sent[0]);
+    expect(request).toEqual({
+      type: "agent.move_to_workspace.request",
+      agentId: "child-agent",
+      idempotencyKey: "move-1",
+      requestId: expect.any(String),
+    });
+
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "agent.move_to_workspace.response",
+        payload: {
+          requestId: request.requestId,
+          agentId: "child-agent",
+          accepted: true,
+          workspaceId: "ws-1",
+          error: null,
+        },
+      }),
+    );
+
+    await expect(move).resolves.toEqual({ workspaceId: "ws-1" });
+  });
+
+  test.each([
+    {
+      accepted: false,
+      workspaceId: "ws-1",
+      error: "Agent cannot move",
+      expectedError: "Agent cannot move",
+    },
+    {
+      accepted: true,
+      workspaceId: null,
+      error: null,
+      expectedError: "moveAgentToWorkspace rejected",
+    },
+  ])(
+    "throws when accepted=$accepted and workspaceId=$workspaceId",
+    async ({ accepted, workspaceId, error, expectedError }) => {
+      const { client, mock } = createMoveClient();
+      const connecting = client.connect();
+      mock.triggerOpen({ features: { agentMoveToWorkspace: true } });
+      await connecting;
+
+      const move = client.moveAgentToWorkspace("child-agent", { idempotencyKey: "   " });
+      const request = parseSentFrame(mock.sent[0]);
+      expect(request).not.toHaveProperty("idempotencyKey");
+
+      mock.triggerMessage(
+        wrapSessionMessage({
+          type: "agent.move_to_workspace.response",
+          payload: {
+            requestId: request.requestId,
+            agentId: "child-agent",
+            accepted,
+            workspaceId,
+            error,
+          },
+        }),
+      );
+
+      await expect(move).rejects.toThrow(expectedError);
+    },
+  );
+});
+
 test("sends active-scoped fetch_agents_request", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

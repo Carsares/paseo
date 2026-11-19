@@ -4,6 +4,8 @@ import {
   AgentRunCancellationError,
   type AgentRunCancellationResult,
   type ManagedAgent,
+  type MoveSubagentToWorkspaceOptions,
+  type MoveSubagentToWorkspaceResult,
 } from "./agent-manager.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
 import type { AgentProviderNotice } from "./agent-sdk-types.js";
@@ -24,6 +26,10 @@ export interface LifecycleAgentManager {
     live: boolean;
     previousParentAgentId: string | null;
   }>;
+  moveSubagentToWorkspace(
+    agentId: string,
+    options: MoveSubagentToWorkspaceOptions,
+  ): Promise<MoveSubagentToWorkspaceResult>;
   notifyAgentState(agentId: string): void;
   setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null>;
   updateAgentMetadata(
@@ -205,6 +211,19 @@ export async function detachAgentCommand(
     agentId,
     ...result,
   };
+}
+
+export interface MoveAgentToWorkspaceResult extends MoveSubagentToWorkspaceResult {
+  agentId: string;
+}
+
+export async function moveAgentToWorkspaceCommand(
+  dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager">,
+  agentId: string,
+  options: MoveSubagentToWorkspaceOptions,
+): Promise<MoveAgentToWorkspaceResult> {
+  const result = await dependencies.agentManager.moveSubagentToWorkspace(agentId, options);
+  return { agentId, ...result };
 }
 
 export async function setAgentModeCommand(

@@ -1,12 +1,24 @@
-import { describe, expect, test } from "vitest";
-import { getParentAgentIdFromLabels, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import {
+  getOpenAgentTabLabel,
+  getParentAgentIdFromLabels,
+  PARENT_AGENT_ID_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
-import type { StoredAgentRecord } from "./agent-storage.js";
+import { deferred } from "../test-fixtures/reconciliation-registries.js";
+import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
+import { AgentManager, type ManagedAgent } from "./agent-manager.js";
+import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
 import {
   archiveAgentCommand,
   cancelAgentRunCommand,
   detachAgentCommand,
+  moveAgentToWorkspaceCommand,
   setAgentModeCommand,
   updateAgentCommand,
   type LifecycleAgentSnapshot,
@@ -140,6 +152,10 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
       previousParentAgentId,
     };
   }
+
+  readonly moveSubagentToWorkspace: LifecycleAgentManager["moveSubagentToWorkspace"] = async () => {
+    throw new Error("Move requires a real AgentManager in these tests");
+  };
 
   notifyAgentState(agentId: string): void {
     this.notifiedAgentIds.push(agentId);
@@ -351,6 +367,296 @@ describe("agent lifecycle commands", () => {
 
     expect(manager.modeUpdates).toEqual([{ agentId: "agent-1", modeId: "plan" }]);
   });
+});
+
+describe("moveAgentToWorkspaceCommand", () => {
+  const sourceWorkspaceId = "ws-source";
+  const workspaceId = "ws-target";
+  const previousParentAgentId = "parent-agent";
+  const labels = {
+    [PARENT_AGENT_ID_LABEL]: previousParentAgentId,
+    [getOpenAgentTabLabel("client-a")]: "true",
+    [getOpenAgentTabLabel("client-b")]: "true",
+    team: "test",
+  };
+  let cwd: string;
+  let storage: AgentStorage;
+  let manager: AgentManager;
+
+  beforeEach(async () => {
+    cwd = await mkdtemp(join(tmpdir(), "paseo-move-agent-"));
+    storage = new AgentStorage(join(cwd, "agents"), logger);
+    manager = new AgentManager({ registry: storage, logger });
+  });
+
+  afterEach(async () => {
+    try {
+      await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
+      await manager.flush();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  function closedSubagent(): StoredAgentRecord {
+    return { ...storedAgent(randomUUID()), cwd, workspaceId: sourceWorkspaceId, labels };
+  }
+
+  test("moves a running subagent and keeps the same provider session and turn", async () => {
+    const turnStarted = deferred();
+    const finishTurn = deferred();
+    const closeSession = vi.fn(async () => {});
+    manager = new AgentManager({
+      clients: {
+        codex: createTestAgentClient("codex", {
+          beforeTurnComplete: async () => {
+            turnStarted.resolve();
+            await finishTurn.promise;
+          },
+          closeSession,
+        }),
+      },
+      registry: storage,
+      logger,
+    });
+    const agent = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId: sourceWorkspaceId,
+      labels,
+      initialTitle: "  Review notes  ",
+      background: true,
+    });
+    const allocateWorkspace = vi.fn(async () => ({ workspaceId: ` ${workspaceId} ` }));
+    const run = manager.runAgent(agent.id, "Continue the review");
+    try {
+      await Promise.race([turnStarted.promise, run]);
+      expect(manager.getAgent(agent.id)?.lifecycle).toBe("running");
+      await manager.flush();
+      const writeStarted = deferred();
+      const finishWrite = deferred();
+      const applySnapshot = storage.applySnapshot.bind(storage);
+      vi.spyOn(storage, "applySnapshot").mockImplementationOnce(async (snapshot, options) => {
+        writeStarted.resolve();
+        await finishWrite.promise;
+        await applySnapshot(snapshot, options);
+      });
+      const move = moveAgentToWorkspaceCommand({ agentManager: manager }, agent.id, {
+        allocateWorkspace,
+      });
+      try {
+        await Promise.race([writeStarted.promise, move]);
+        manager.notifyAgentState(agent.id);
+      } finally {
+        finishWrite.resolve();
+      }
+      const result = await move;
+      await manager.flush();
+
+      expect(allocateWorkspace).toHaveBeenCalledExactlyOnceWith({
+        agentId: agent.id,
+        cwd,
+        sourceWorkspaceId,
+        title: "Review notes",
+        background: true,
+        previousParentAgentId,
+      });
+      expect(result).toEqual({
+        agentId: agent.id,
+        live: true,
+        sourceWorkspaceId,
+        workspaceId,
+        previousParentAgentId,
+        record: expect.objectContaining({ workspaceId, labels: { team: "test" } }),
+      });
+      expect(manager.getAgent(agent.id)?.session).toBe(agent.session);
+      expect(manager.getAgent(agent.id)).toMatchObject({ lifecycle: "running", workspaceId, cwd });
+      expect(manager.getAgent(agent.id)?.labels).toEqual({ team: "test" });
+      expect(closeSession).not.toHaveBeenCalled();
+      const stored = await storage.get(agent.id);
+      expect(stored).toMatchObject({ workspaceId, labels: { team: "test" } });
+      expect(await storage.listByWorkspaces([sourceWorkspaceId])).toEqual([]);
+      expect(await storage.listByWorkspaces([workspaceId])).toEqual([stored]);
+    } finally {
+      finishTurn.resolve();
+      expect((await run).timeline).not.toHaveLength(0);
+    }
+  });
+
+  test("moves a closed subagent and updates stored workspace membership", async () => {
+    const stored = { ...closedSubagent(), title: "  NEW AGENT  " };
+    await storage.upsert(stored);
+    const allocateWorkspace = vi.fn(async () => ({ workspaceId }));
+
+    const result = await moveAgentToWorkspaceCommand({ agentManager: manager }, stored.id, {
+      allocateWorkspace,
+    });
+
+    expect(allocateWorkspace).toHaveBeenCalledWith(expect.objectContaining({ title: null }));
+    expect(result).toEqual({
+      agentId: stored.id,
+      live: false,
+      sourceWorkspaceId,
+      workspaceId,
+      previousParentAgentId,
+      record: {
+        ...stored,
+        workspaceId,
+        labels: { team: "test" },
+        updatedAt: expect.any(String),
+      },
+    });
+    expect(result.record.updatedAt > stored.updatedAt).toBe(true);
+    expect(manager.getAgent(stored.id)).toBeNull();
+    expect(await storage.get(stored.id)).toEqual(result.record);
+    expect(await storage.listByWorkspaces([sourceWorkspaceId])).toEqual([]);
+    expect(await storage.listByWorkspaces([workspaceId])).toEqual([result.record]);
+  });
+
+  test("rolls back the allocation if a pending deletion skips the closed subagent write", async () => {
+    const stored = closedSubagent();
+    await storage.upsert(stored);
+    const rollback = vi.fn(async () => {});
+
+    await expect(
+      moveAgentToWorkspaceCommand({ agentManager: manager }, stored.id, {
+        allocateWorkspace: async () => {
+          storage.beginDelete(stored.id);
+          return { workspaceId, rollback };
+        },
+      }),
+    ).rejects.toThrow(`Agent move was not persisted: ${stored.id}`);
+
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(await storage.listByWorkspaces([sourceWorkspaceId])).toEqual([stored]);
+    expect(await storage.listByWorkspaces([workspaceId])).toEqual([]);
+  });
+
+  test("replays the committed move and rejects a concurrent request without the key", async () => {
+    const stored = closedSubagent();
+    await storage.upsert(stored);
+    const allocationStarted = deferred();
+    const finishAllocation = deferred();
+    const allocateWorkspace = vi.fn(async () => {
+      allocationStarted.resolve();
+      await finishAllocation.promise;
+      return { workspaceId };
+    });
+    const unexpectedAllocation = vi.fn(async () => ({ workspaceId: "ws-unexpected" }));
+    const move = (idempotencyKey?: string) =>
+      moveAgentToWorkspaceCommand({ agentManager: manager }, stored.id, {
+        idempotencyKey,
+        allocateWorkspace:
+          idempotencyKey === "  move-once  " ? allocateWorkspace : unexpectedAllocation,
+      });
+
+    const first = move("  move-once  ");
+    await Promise.race([allocationStarted.promise, first]);
+    const replay = move("move-once");
+    const withoutKey = expect(move()).rejects.toThrow(`Agent is not a subagent: ${stored.id}`);
+    finishAllocation.resolve();
+
+    const result = await first;
+    await expect(replay).resolves.toEqual(result);
+    await expect(move("move-once")).resolves.toEqual(result);
+    await withoutKey;
+    expect(allocateWorkspace).toHaveBeenCalledTimes(1);
+    expect(unexpectedAllocation).not.toHaveBeenCalled();
+  });
+
+  test("rejects missing, internal, root, archived, and unassigned agents before allocation", async () => {
+    const root = { ...closedSubagent(), labels: {} };
+    const archived = { ...closedSubagent(), archivedAt: "2026-05-10T10:00:00.000Z" };
+    const internal = { ...closedSubagent(), internal: true };
+    const unassigned = { ...closedSubagent(), workspaceId: undefined };
+    const missingId = randomUUID();
+    await storage.upsert(root);
+    await storage.upsert(archived);
+    await storage.upsert(internal);
+    await storage.upsert(unassigned);
+    const allocateWorkspace = vi.fn(async () => ({ workspaceId }));
+    const move = (agentId: string) =>
+      moveAgentToWorkspaceCommand({ agentManager: manager }, agentId, { allocateWorkspace });
+
+    await expect(move(root.id)).rejects.toThrow(`Agent is not a subagent: ${root.id}`);
+    await expect(move(archived.id)).rejects.toThrow(`Agent is archived: ${archived.id}`);
+    await expect(move(internal.id)).rejects.toThrow(`Agent not found: ${internal.id}`);
+    await expect(move(unassigned.id)).rejects.toThrow(`Agent has no workspace: ${unassigned.id}`);
+    await expect(move(missingId)).rejects.toThrow(`Agent not found: ${missingId}`);
+    expect(allocateWorkspace).not.toHaveBeenCalled();
+  });
+
+  test("rolls back the allocation and restores the live agent if persistence fails", async () => {
+    manager = new AgentManager({
+      clients: { codex: createTestAgentClient("codex") },
+      registry: storage,
+      logger,
+    });
+    const agent = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId: sourceWorkspaceId,
+      labels,
+    });
+    await manager.flush();
+    const before = manager.getAgent(agent.id);
+    const stored = await storage.get(agent.id);
+    const failure = new Error("Simulated snapshot write failure");
+    const writeStarted = deferred();
+    const finishWrite = deferred();
+    vi.spyOn(storage, "applySnapshot").mockImplementationOnce(async () => {
+      writeStarted.resolve();
+      await finishWrite.promise;
+      throw failure;
+    });
+    const rollback = vi.fn(async () => {});
+    const stateUpdates: ManagedAgent[] = [];
+    const unsubscribe = manager.subscribe(
+      (event) => {
+        if (event.type === "agent_state") stateUpdates.push(event.agent);
+      },
+      { agentId: agent.id, replayState: false },
+    );
+    const move = moveAgentToWorkspaceCommand({ agentManager: manager }, agent.id, {
+      allocateWorkspace: async () => ({ workspaceId, rollback }),
+    });
+    const rejected = expect(move).rejects.toBe(failure);
+    try {
+      await Promise.race([writeStarted.promise, move]);
+      expect(manager.getAgent(agent.id)).toEqual(before);
+      manager.notifyAgentState(agent.id);
+      expect(stateUpdates).toEqual([{ ...before, updatedAt: expect.any(Date) }]);
+      expect(rollback).not.toHaveBeenCalled();
+    } finally {
+      finishWrite.resolve();
+      unsubscribe();
+      await rejected;
+      await manager.flush();
+    }
+
+    expect(rollback).toHaveBeenCalledTimes(1);
+    const [notified] = stateUpdates;
+    expect(manager.getAgent(agent.id)).toEqual(notified);
+    const updatedAt = notified.updatedAt.toISOString();
+    const expected = { ...stored, updatedAt, lastActivityAt: updatedAt };
+    expect(await storage.get(agent.id)).toEqual(expected);
+    expect(await storage.listByWorkspaces([sourceWorkspaceId])).toEqual([expected]);
+    expect(await storage.listByWorkspaces([workspaceId])).toEqual([]);
+  });
+
+  test.each([" ", ` ${sourceWorkspaceId} `])(
+    "rolls back an allocation that does not identify a different workspace (%j)",
+    async (allocatedId) => {
+      const stored = closedSubagent();
+      await storage.upsert(stored);
+      const rollback = vi.fn(async () => {});
+
+      await expect(
+        moveAgentToWorkspaceCommand({ agentManager: manager }, stored.id, {
+          allocateWorkspace: async () => ({ workspaceId: allocatedId, rollback }),
+        }),
+      ).rejects.toThrow(`Move requires a different workspace: ${stored.id}`);
+
+      expect(rollback).toHaveBeenCalledTimes(1);
+      expect(await storage.get(stored.id)).toEqual(stored);
+    },
+  );
 });
 
 function managedAgent(

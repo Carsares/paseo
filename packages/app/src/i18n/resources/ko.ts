@@ -709,6 +709,7 @@ export const ko: TranslationResources = {
         closeRight: "오른쪽 탭 닫기",
         closeOthers: "다른 탭 닫기",
         moveToMain: "기본 패널로 이동",
+        moveToNewWorkspace: "새 워크스페이스로 이동",
         reloadAgent: "에이전트 다시 로드",
         reloadAgentTooltip:
           "스킬, MCP 또는 로그인 상태를 업데이트하려면 에이전트를 다시 로드하세요.",
@@ -2070,6 +2071,12 @@ export const ko: TranslationResources = {
     pillLabelReadyToReview: "{{count}}개 검토 대기",
     detachAction: "{{label}} 분리",
     detachTooltip: "하위 에이전트 분리",
+    moveToWorkspaceConfirmTitle: "새 워크스페이스로 이동할까요?",
+    moveToWorkspaceConfirmMessage:
+      "{{label}}은(는) 상위 에이전트에서 분리되어 이 프로젝트의 독립된 워크스페이스로 열립니다.",
+    moveToWorkspaceConfirmFallbackLabel: "이 하위 에이전트",
+    moveToWorkspaceConfirmAction: "이동",
+    moveToWorkspaceCancelAction: "취소",
     archiveAction: "{{label}} 보관",
     archiveTooltip: "서브에이전트 보관",
     archiveFinishedAction: "완료된 하위 에이전트 보관",

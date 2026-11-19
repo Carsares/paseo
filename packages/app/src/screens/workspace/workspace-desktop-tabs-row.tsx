@@ -24,6 +24,7 @@ import {
   Columns2,
   Rows2,
   Ellipsis,
+  ExternalLink,
   Maximize,
   Minimize,
   Plus,
@@ -95,6 +96,10 @@ import {
   useHorizontalScrollBoundary,
 } from "@/components/ui/horizontal-scroll-boundary";
 import { useSessionStore } from "@/stores/session-store";
+import {
+  useCanMoveSubagentToWorkspace,
+  useMoveSubagentToWorkspace,
+} from "@/subagents/use-move-subagent-to-workspace";
 
 const DROPDOWN_WIDTH = 220;
 const DEFAULT_INLINE_ADD_BUTTON_RESERVED_WIDTH = 36;
@@ -129,6 +134,7 @@ const AGENT_TOOLTIP_TITLE_MAX_LENGTH = 80;
 const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
 const ThemedX = withUnistyles(X);
 const ThemedCopy = withUnistyles(Copy);
+const ThemedExternalLink = withUnistyles(ExternalLink);
 
 const ThemedRotateCw = withUnistyles(RotateCw);
 const ThemedArrowLeftToLine = withUnistyles(ArrowLeftToLine);
@@ -437,6 +443,8 @@ function TabContextMenuItem({
         return <ThemedArrowRightToLine size={16} uniProps={mutedColorMapping} />;
       case "copy-x":
         return <ThemedCopyX size={16} uniProps={mutedColorMapping} />;
+      case "external-link":
+        return <ThemedExternalLink size={16} uniProps={mutedColorMapping} />;
       case "pencil":
         return <ThemedPencil size={16} uniProps={mutedColorMapping} />;
       case "x":
@@ -1178,6 +1186,7 @@ function ResolvedWorkspaceDesktopTabsRow({
       closeLeft: t("workspace.tabs.menu.closeLeft"),
       closeRight: t("workspace.tabs.menu.closeRight"),
       closeOthers: t("workspace.tabs.menu.closeOthers"),
+      moveToNewWorkspace: t("workspace.tabs.menu.moveToNewWorkspace"),
       reloadAgent: t("workspace.tabs.menu.reloadAgent"),
       reloadAgentTooltip: t("workspace.tabs.menu.reloadAgentTooltip"),
       close: t("workspace.tabs.menu.close"),
@@ -1551,6 +1560,19 @@ function ResolvedDesktopTabChip({
 }) {
   const { t } = useTranslation();
   const presentation = item.presentation;
+  const targetAgentId = item.tab.target.kind === "agent" ? item.tab.target.agentId : null;
+  const canMoveAgentToWorkspace = useCanMoveSubagentToWorkspace(
+    serverId,
+    workspaceId,
+    targetAgentId,
+  );
+  const moveSubagentToWorkspace = useMoveSubagentToWorkspace();
+  const handleMoveAgentToWorkspace = useCallback(
+    (agentId: string) => {
+      moveSubagentToWorkspace({ serverId, agentId });
+    },
+    [moveSubagentToWorkspace, serverId],
+  );
   const resolvedTab = useMemo(
     () =>
       buildWorkspaceDesktopTabActions({
@@ -1561,6 +1583,7 @@ function ResolvedDesktopTabChip({
         onCopyAgentId,
         onCopyTerminalId,
         onCopyFilePath,
+        onMoveAgentToWorkspace: canMoveAgentToWorkspace ? handleMoveAgentToWorkspace : undefined,
         onReloadAgent,
         onRenameTab,
         onCloseTab,
@@ -1570,6 +1593,8 @@ function ResolvedDesktopTabChip({
         labels,
       }),
     [
+      canMoveAgentToWorkspace,
+      handleMoveAgentToWorkspace,
       index,
       item.tab,
       onCloseOtherTabs,

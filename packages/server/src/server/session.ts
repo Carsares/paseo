@@ -144,6 +144,7 @@ import {
   cancelAgentRunCommand,
   closeAgentCommand,
   detachAgentCommand,
+  moveAgentToWorkspaceCommand,
   setAgentModeCommand,
   updateAgentCommand,
 } from "./agent/lifecycle-command.js";
@@ -295,6 +296,27 @@ import {
 } from "./workspace-archive-operations.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
 import { SessionAuthorization, type DaemonPermission } from "./authorization/index.js";
+
+// WorkspaceDirectory tracks what each session displays. Move admission needs to see
+// archive operations from every session sharing the registry.
+interface WorkspaceArchiveActivity {
+  archives: Map<string, Set<object | symbol>>;
+  moves: Map<string, Set<Promise<void>>>;
+}
+
+const workspaceArchiveActivityByRegistry = new WeakMap<
+  WorkspaceRegistry,
+  WorkspaceArchiveActivity
+>();
+const externalWorkspaceArchive = Symbol("external workspace archive");
+
+function getWorkspaceArchiveActivity(registry: WorkspaceRegistry): WorkspaceArchiveActivity {
+  const existing = workspaceArchiveActivityByRegistry.get(registry);
+  if (existing) return existing;
+  const activity = { archives: new Map(), moves: new Map() };
+  workspaceArchiveActivityByRegistry.set(registry, activity);
+  return activity;
+}
 
 function resolveWorkspaceSetupRuntime(
   runtime: WorkspaceSetupRuntime | undefined,
@@ -883,6 +905,7 @@ export class Session {
   private readonly unsubscribeSetupObservation: () => void;
   private readonly workspaceSetupRuntime: WorkspaceSetupRuntime;
   private readonly workspaceArchiveOperations: WorkspaceArchiveOperations;
+  private readonly workspaceArchiveActivity: WorkspaceArchiveActivity;
   private readonly workspaceGitObserver: WorkspaceGitObserverService;
   private readonly workspaceDirectory: WorkspaceDirectory;
   private readonly voiceSessions: VoiceSessions;
@@ -1012,6 +1035,7 @@ export class Session {
     this.agentStorage = agentStorage;
     this.projectRegistry = projectRegistry;
     this.workspaceRegistry = workspaceRegistry;
+    this.workspaceArchiveActivity = getWorkspaceArchiveActivity(workspaceRegistry);
     this.directorySync = resolveDirectorySync(directorySync);
     this.workspaceLabelService = resolveWorkspaceLabelService(workspaceLabelService);
     this.filesystem = filesystem ?? nodeSessionFileSystem;
@@ -1286,7 +1310,7 @@ export class Session {
       emit: (message) => this.emit(message),
       emitAgentRemove: (agentId) => this.agentUpdates.removeAgent(agentId),
       emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-        this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
+        this.emitWorkspaceArchiveUpdates(workspaceIds),
       markWorkspaceArchiving: (workspaceIds, archivingAt) =>
         this.markWorkspaceArchiving(workspaceIds, archivingAt),
       clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
@@ -1664,15 +1688,15 @@ export class Session {
     workspaceIds: Iterable<string>,
     archivingAt: string,
   ): void {
-    this.markWorkspaceArchiving(workspaceIds, archivingAt);
+    this.markWorkspaceArchiving(workspaceIds, archivingAt, externalWorkspaceArchive);
   }
 
   clearWorkspaceArchivingForExternalMutation(workspaceIds: Iterable<string>): void {
-    this.clearWorkspaceArchiving(workspaceIds);
+    this.clearWorkspaceArchiving(workspaceIds, externalWorkspaceArchive);
   }
 
   async emitWorkspaceUpdatesForExternalWorkspaceIds(workspaceIds: Iterable<string>): Promise<void> {
-    await this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds);
+    await this.emitWorkspaceArchiveUpdates(workspaceIds);
   }
 
   async syncWorkspaceGitObserversForExternalWorkspaceIds(
@@ -3120,6 +3144,12 @@ export class Session {
     switch (msg.type) {
       case "agent.detach.request":
         return this.handleDetachAgentRequest(msg.agentId, msg.requestId);
+      case "agent.move_to_workspace.request":
+        return this.handleMoveAgentToWorkspaceRequest(
+          msg.agentId,
+          msg.requestId,
+          msg.idempotencyKey,
+        );
       default:
         return undefined;
     }
@@ -3834,6 +3864,138 @@ export class Session {
     }
   }
 
+  private async handleMoveAgentToWorkspaceRequest(
+    agentId: string,
+    requestId: string,
+    idempotencyKey?: string,
+  ): Promise<void> {
+    let finishMove: (() => void) | undefined;
+    try {
+      const result = await moveAgentToWorkspaceCommand(
+        { agentManager: this.agentManager },
+        agentId,
+        {
+          idempotencyKey,
+          allocateWorkspace: async (source) => {
+            const parentLive = this.agentManager.getAgent(source.previousParentAgentId);
+            const parentStored = parentLive
+              ? null
+              : await this.agentStorage.get(source.previousParentAgentId);
+            const sourceWorkspace = await this.requireMoveSourceWorkspace(source.sourceWorkspaceId);
+            const parentWorkspaceId = (
+              parentLive?.workspaceId ?? parentStored?.workspaceId
+            )?.trim();
+            if (parentWorkspaceId && parentWorkspaceId !== source.sourceWorkspaceId) {
+              throw new Error(`Agent is already in a separate workspace: ${source.agentId}`);
+            }
+
+            finishMove = this.reserveWorkspaceMove(source.sourceWorkspaceId);
+            const created = await this.workspaceProvisioning.createWorkspaceForDirectory(
+              source.cwd,
+              source.title,
+              sourceWorkspace.projectId,
+              { background: Boolean(source.background || sourceWorkspace.background) },
+            );
+            const rollback = async () => {
+              await this.workspaceRegistry.remove(created.workspaceId);
+            };
+            try {
+              // Provisioning awaits checkout and registry work, during which archive can start.
+              await this.requireMoveSourceWorkspace(source.sourceWorkspaceId);
+            } catch (error) {
+              await rollback().catch((rollbackError) => {
+                this.sessionLogger.error(
+                  { err: rollbackError, workspaceId: created.workspaceId },
+                  "Failed to remove workspace after rejected agent move",
+                );
+              });
+              throw error;
+            }
+            return { workspaceId: created.workspaceId, rollback };
+          },
+        },
+      ).finally(() => finishMove?.());
+      const affectedWorkspaceIds = new Set<string>([result.sourceWorkspaceId, result.workspaceId]);
+      const warnUpdateFailure = (error: unknown) =>
+        this.sessionLogger.warn(
+          { err: error, agentId, workspaceId: result.workspaceId, requestId },
+          "Failed to publish agent move update",
+        );
+      if (!result.live) {
+        await this.agentUpdates.emitStoredRecord(result.record).catch(warnUpdateFailure);
+      }
+      const rootWorkspaceId = await this.resolveDelegationRootWorkspaceId(
+        result.previousParentAgentId,
+      ).catch((error) => {
+        warnUpdateFailure(error);
+        return null;
+      });
+      if (rootWorkspaceId) {
+        affectedWorkspaceIds.add(rootWorkspaceId);
+      }
+      await this.emitWorkspaceUpdatesForWorkspaceIds(affectedWorkspaceIds).catch(warnUpdateFailure);
+
+      this.emit({
+        type: "agent.move_to_workspace.response",
+        payload: {
+          requestId,
+          agentId,
+          accepted: true,
+          workspaceId: result.workspaceId,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, agentId, requestId },
+        "Failed to move agent to workspace",
+      );
+      this.emit({
+        type: "agent.move_to_workspace.response",
+        payload: {
+          requestId,
+          agentId,
+          accepted: false,
+          workspaceId: null,
+          error: getErrorMessageOr(error, "Failed to move agent to workspace"),
+        },
+      });
+    }
+  }
+
+  private async requireMoveSourceWorkspace(workspaceId: string): Promise<PersistedWorkspaceRecord> {
+    const workspace = await this.workspaceRegistry.get(workspaceId);
+    if (!workspace) throw new Error(`Workspace not found: ${workspaceId}`);
+    if (workspace.archivedAt) throw new Error(`Workspace is archived: ${workspaceId}`);
+    this.assertWorkspaceNotArchiving(workspaceId);
+    return workspace;
+  }
+
+  private assertWorkspaceNotArchiving(workspaceId: string): void {
+    if (this.workspaceArchiveActivity.archives.has(workspaceId)) {
+      throw new Error(`Workspace is archiving: ${workspaceId}`);
+    }
+  }
+
+  private reserveWorkspaceMove(workspaceId: string): () => void {
+    // Teardown must wait for provisioning to roll back or persistence to commit
+    // before it enumerates the workspace's agents and checks its backing directory.
+    this.assertWorkspaceNotArchiving(workspaceId);
+    const pending = this.workspaceArchiveActivity.moves;
+    const moves = pending.get(workspaceId) ?? new Set<Promise<void>>();
+    let finishMove!: () => void;
+    const done = new Promise<void>((finish) => {
+      finishMove = finish;
+    });
+    moves.add(done);
+    pending.set(workspaceId, moves);
+    return () => {
+      moves.delete(done);
+      if (moves.size === 0) pending.delete(workspaceId);
+      finishMove();
+    };
+  }
+
   private async handleCloseItemsRequest(msg: CloseItemsRequest): Promise<void> {
     const archiveResults = await Promise.allSettled(
       msg.agentIds.map((agentId) => this.archiveAgentForClose(agentId)),
@@ -4136,13 +4298,12 @@ export class Session {
         .filter((workspace) => !workspace.archivedAt)
         .map((workspace) => workspace.workspaceId);
 
-      if (activeWorkspaceIds.length > 0) {
-        this.markWorkspaceArchiving(activeWorkspaceIds, new Date().toISOString());
-        await this.emitWorkspaceUpdatesForWorkspaceIds(activeWorkspaceIds);
-      }
-
       const removedWorkspaceIds: string[] = [];
       try {
+        if (activeWorkspaceIds.length > 0) {
+          this.markWorkspaceArchiving(activeWorkspaceIds, new Date().toISOString());
+          await this.emitWorkspaceArchiveUpdates(activeWorkspaceIds);
+        }
         for (const workspaceId of activeWorkspaceIds) {
           const archivedAt = new Date().toISOString();
           await archiveWorkspaceContents(
@@ -5750,7 +5911,7 @@ export class Session {
           this.archiveWorkspaceRecord(workspaceId, archivedAt),
         emit: (message) => this.emit(message),
         emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-          this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
+          this.emitWorkspaceArchiveUpdates(workspaceIds),
         markWorkspaceArchiving: (workspaceIds, archivingAt) =>
           this.markWorkspaceArchiving(workspaceIds, archivingAt),
         clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
@@ -6387,12 +6548,44 @@ export class Session {
     return this.describeWorkspaceRecord(input.workspace, input.projectRecord);
   }
 
-  markWorkspaceArchiving(workspaceIds: Iterable<string>, archivingAt: string): void {
-    this.workspaceDirectory.markArchiving(workspaceIds, archivingAt);
+  markWorkspaceArchiving(
+    workspaceIds: Iterable<string>,
+    archivingAt: string,
+    source: object | symbol = this,
+  ): void {
+    const ids = Array.from(workspaceIds);
+    for (const id of ids) this.trackWorkspaceArchive(id, source, true);
+    this.workspaceDirectory.markArchiving(ids, archivingAt);
   }
 
-  clearWorkspaceArchiving(workspaceIds: Iterable<string>): void {
-    this.workspaceDirectory.clearArchiving(workspaceIds);
+  clearWorkspaceArchiving(workspaceIds: Iterable<string>, source: object | symbol = this): void {
+    const ids = Array.from(workspaceIds);
+    for (const id of ids) this.trackWorkspaceArchive(id, source, false);
+    this.workspaceDirectory.clearArchiving(ids);
+  }
+
+  private trackWorkspaceArchive(
+    workspaceId: string,
+    source: object | symbol,
+    active: boolean,
+  ): void {
+    const archives = this.workspaceArchiveActivity.archives;
+    const sources = archives.get(workspaceId);
+    if (active) {
+      if (sources) sources.add(source);
+      else archives.set(workspaceId, new Set([source]));
+    } else if (sources) {
+      sources.delete(source);
+      if (sources.size === 0) archives.delete(workspaceId);
+    }
+  }
+
+  private async emitWorkspaceArchiveUpdates(workspaceIds: Iterable<string>): Promise<void> {
+    const ids = Array.from(workspaceIds);
+    const { archives, moves } = this.workspaceArchiveActivity;
+    const pendingMoves = ids.flatMap((id) => (archives.has(id) ? [...(moves.get(id) ?? [])] : []));
+    if (pendingMoves.length > 0) await Promise.all(pendingMoves);
+    await this.emitWorkspaceUpdatesForWorkspaceIds(ids);
   }
 
   private async buildWorkspaceDescriptorMap(options: {
@@ -8147,6 +8340,7 @@ export class Session {
   private async handleArchiveWorkspaceRequest(
     request: Extract<SessionInboundMessage, { type: "archive_workspace_request" }>,
   ): Promise<void> {
+    this.trackWorkspaceArchive(request.workspaceId, request, true);
     try {
       // Claim the archive queue before any await, so an undo sent right behind this request
       // queues after it and cancels it instead of running first.
@@ -8171,7 +8365,7 @@ export class Session {
               archiveWorkspaceRecord: (workspaceId, archivedAt) =>
                 this.archiveWorkspaceRecord(workspaceId, archivedAt),
               emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-                this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds),
+                this.emitWorkspaceArchiveUpdates(workspaceIds),
               markWorkspaceArchiving: (workspaceIds, archivingAt) =>
                 this.markWorkspaceArchiving(workspaceIds, archivingAt),
               clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
@@ -8231,6 +8425,8 @@ export class Session {
           error: message,
         },
       });
+    } finally {
+      this.trackWorkspaceArchive(request.workspaceId, request, false);
     }
   }
 

@@ -364,6 +364,35 @@ export interface CreateAgentOptions {
   background?: boolean;
 }
 
+export interface MoveSubagentToWorkspaceSource {
+  agentId: string;
+  cwd: string;
+  sourceWorkspaceId: string;
+  title: string | null;
+  background: boolean;
+  previousParentAgentId: string;
+}
+
+export interface MoveSubagentToWorkspaceAllocation {
+  workspaceId: string;
+  rollback?: () => Promise<void>;
+}
+
+export interface MoveSubagentToWorkspaceOptions {
+  idempotencyKey?: string;
+  allocateWorkspace: (
+    source: MoveSubagentToWorkspaceSource,
+  ) => Promise<MoveSubagentToWorkspaceAllocation>;
+}
+
+export interface MoveSubagentToWorkspaceResult {
+  record: StoredAgentRecord;
+  live: boolean;
+  sourceWorkspaceId: string;
+  workspaceId: string;
+  previousParentAgentId: string;
+}
+
 export interface AgentManagerOptions {
   pluginLifecycle?: PluginLifecycle;
   /** An internal workspace makes every agent created inside it internal. */
@@ -815,6 +844,42 @@ function detachedAgentLabelPatch(labels: Record<string, string>): AgentLabelPatc
   return patch;
 }
 
+function normalizeSubagentMoveTitle(title: string | null | undefined): string | null {
+  const trimmed = title?.trim();
+  return trimmed && trimmed.toLowerCase() !== "new agent" ? trimmed : null;
+}
+
+function describeSubagentMoveSource(
+  agentId: string,
+  liveAgent: LiveManagedAgent | undefined,
+  storedRecord: StoredAgentRecord | null,
+): MoveSubagentToWorkspaceSource {
+  const current = liveAgent ?? storedRecord;
+  if (!current || current.internal || storedRecord?.internal) {
+    throw new Error(`Agent not found: ${agentId}`);
+  }
+  if (storedRecord?.archivedAt || ("archivedAt" in current && current.archivedAt)) {
+    throw new Error(`Agent is archived: ${agentId}`);
+  }
+  const previousParentAgentId = getParentAgentIdFromLabels(current.labels);
+  if (!previousParentAgentId) {
+    throw new Error(`Agent is not a subagent: ${agentId}`);
+  }
+  const sourceWorkspaceId = (current.workspaceId ?? storedRecord?.workspaceId)?.trim();
+  if (!sourceWorkspaceId) {
+    throw new Error(`Agent has no workspace: ${agentId}`);
+  }
+
+  return {
+    agentId,
+    cwd: current.cwd,
+    sourceWorkspaceId,
+    title: normalizeSubagentMoveTitle(storedRecord?.title ?? liveAgent?.config.title),
+    background: Boolean(current.background || storedRecord?.background),
+    previousParentAgentId,
+  };
+}
+
 /**
  * How long an archived internal agent stays readable by id. Storage plays this
  * role for public agents; internal agents never reach it, and a one-shot helper
@@ -864,6 +929,8 @@ export class AgentManager {
   >();
   private readonly collectingRuntimes = new Set<string>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
+  private readonly moveToWorkspaceReceipts = new Map<string, MoveSubagentToWorkspaceResult>();
+  private readonly pendingSubagentMoveSnapshots = new Map<string, Promise<StoredAgentRecord>>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -2753,6 +2820,110 @@ export class AgentManager {
       throw new Error(`Agent not found in storage after detach: ${agentId}`);
     }
     return { record: result.record, live: false, previousParentAgentId };
+  }
+
+  async moveSubagentToWorkspace(
+    agentId: string,
+    options: MoveSubagentToWorkspaceOptions,
+  ): Promise<MoveSubagentToWorkspaceResult> {
+    return this.runLifecycleMutation(agentId, () =>
+      this.moveSubagentToWorkspaceUnlocked(agentId, options),
+    );
+  }
+
+  private async moveSubagentToWorkspaceUnlocked(
+    agentId: string,
+    options: MoveSubagentToWorkspaceOptions,
+  ): Promise<MoveSubagentToWorkspaceResult> {
+    const trimmedKey = options.idempotencyKey?.trim();
+    const receiptKey = trimmedKey ? JSON.stringify([agentId, trimmedKey]) : null;
+    if (receiptKey) {
+      const receipt = this.moveToWorkspaceReceipts.get(receiptKey);
+      if (receipt) return receipt;
+    }
+
+    const registry = this.requireRegistry();
+    const liveAgent = this.agents.get(agentId);
+    const storedRecord = await registry.get(agentId);
+    const source = describeSubagentMoveSource(agentId, liveAgent, storedRecord);
+    const { sourceWorkspaceId, previousParentAgentId } = source;
+    const allocated = await options.allocateWorkspace(source);
+
+    let workspaceId: string;
+    let record: StoredAgentRecord;
+    try {
+      workspaceId = allocated.workspaceId?.trim();
+      if (!workspaceId || workspaceId === sourceWorkspaceId) {
+        throw new Error(`Move requires a different workspace: ${agentId}`);
+      }
+      if (liveAgent) {
+        record = await this.persistLiveSubagentMove(registry, liveAgent, workspaceId);
+      } else {
+        const stored = storedRecord!;
+        record = {
+          ...stored,
+          workspaceId,
+          labels: applyRecordPatch(stored.labels, detachedAgentLabelPatch(stored.labels)),
+          updatedAt: this.nextStoredUpdatedAt(stored),
+        };
+        await registry.upsert(record);
+        if ((await registry.get(agentId))?.workspaceId !== workspaceId) {
+          throw new Error(`Agent move was not persisted: ${agentId}`);
+        }
+      }
+    } catch (error) {
+      try {
+        await allocated.rollback?.();
+      } catch {
+        // Preserve the error that caused the rollback.
+      }
+      throw error;
+    }
+
+    const result: MoveSubagentToWorkspaceResult = {
+      record,
+      live: Boolean(liveAgent),
+      sourceWorkspaceId,
+      workspaceId,
+      previousParentAgentId,
+    };
+    if (receiptKey) {
+      if (this.moveToWorkspaceReceipts.size >= 256) {
+        const oldest = this.moveToWorkspaceReceipts.keys().next();
+        if (!oldest.done) this.moveToWorkspaceReceipts.delete(oldest.value);
+      }
+      this.moveToWorkspaceReceipts.set(receiptKey, result);
+    }
+    if (liveAgent) this.emitState(liveAgent, { persist: false });
+    return result;
+  }
+
+  private async persistLiveSubagentMove(
+    registry: AgentStorage,
+    agent: LiveManagedAgent,
+    workspaceId: string,
+  ): Promise<StoredAgentRecord> {
+    // Provider events can publish state during the write. Keep the live fields
+    // unchanged until the staged snapshot commits.
+    const labels = applyRecordPatch(agent.labels, detachedAgentLabelPatch(agent.labels));
+    const snapshot = { ...agent, workspaceId, labels };
+    const updatedAt = this.touchUpdatedAt(snapshot);
+    const pending = this.persistSnapshot(snapshot).then(async () => {
+      const record = await registry.get(agent.id);
+      if (record?.workspaceId !== workspaceId) {
+        throw new Error(`Agent move was not persisted: ${agent.id}`);
+      }
+      agent.labels = labels;
+      agent.workspaceId = workspaceId;
+      if (agent.updatedAt < updatedAt) agent.updatedAt = updatedAt;
+      return record;
+    });
+    this.pendingSubagentMoveSnapshots.set(agent.id, pending);
+    try {
+      return await pending;
+    } finally {
+      this.pendingSubagentMoveSnapshots.delete(agent.id);
+    }
   }
 
   notifyAgentState(agentId: string): void {
@@ -4803,6 +4974,10 @@ export class AgentManager {
     if (agent.internal) {
       return;
     }
+    // A provider snapshot written during the move must use the final live
+    // workspace, whether the staged write committed or failed.
+    const pendingMove = this.pendingSubagentMoveSnapshots.get(agent.id);
+    if (pendingMove) await pendingMove.catch(() => undefined);
     await this.registry.applySnapshot(agent, options);
   }
 
