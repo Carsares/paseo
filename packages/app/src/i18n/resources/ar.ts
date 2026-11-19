@@ -2733,6 +2733,12 @@ export const ar: TranslationResources = {
         contentSize: "حجم المحتوى",
         contentSizeHint: "يُستخدم لنص الدردشة وملفات Markdown المعروضة",
         contentSizeAccessibility: "حجم خط المحتوى",
+        contentLineHeight: "ارتفاع سطر المحتوى",
+        contentLineHeightHint: "مضاعف ارتفاع السطر لنص الدردشة وMarkdown المعروض",
+        contentLineHeightAccessibility: "مضاعف ارتفاع سطر المحتوى",
+        contentLetterSpacing: "تباعد الأحرف",
+        contentLetterSpacingHint: "التباعد الأفقي بين الأحرف في الدردشة وMarkdown",
+        contentLetterSpacingAccessibility: "تباعد أحرف المحتوى",
         codeFont: "خط الكود",
         codeFontHint:
           "تستخدم في الكود والاختلافات والمخرجات الطرفية. اتركه فارغًا للإعداد الافتراضي للنظام",
@@ -2748,6 +2754,10 @@ export const ar: TranslationResources = {
         contentWidthAccessibility: "عرض المحتوى بالبكسل",
         reset: "إعادة تعيين",
         resetAccessibility: "إعادة عرض المحتوى إلى الافتراضي",
+        paragraphSpacing: "تباعد الفقرات",
+        paragraphSpacingHint: "المسافة العمودية بين الفقرات والقوائم والكتل",
+        paragraphSpacingAccessibility: "تباعد الفقرات بالبكسل",
+        resetParagraphSpacingAccessibility: "إعادة تباعد الفقرات إلى الافتراضي",
       },
       syntax: {
         title: "بناء الجملة",

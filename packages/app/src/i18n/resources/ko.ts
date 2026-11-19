@@ -2712,6 +2712,12 @@ export const ko: TranslationResources = {
         contentSize: "콘텐츠 크기",
         contentSizeHint: "채팅 텍스트와 렌더링된 Markdown에 사용됩니다",
         contentSizeAccessibility: "콘텐츠 글꼴 크기",
+        contentLineHeight: "콘텐츠 줄 간격",
+        contentLineHeightHint: "채팅 텍스트와 렌더링된 Markdown의 줄 간격 배수",
+        contentLineHeightAccessibility: "콘텐츠 줄 간격 배수",
+        contentLetterSpacing: "글자 간격",
+        contentLetterSpacingHint: "채팅과 Markdown에서 글자 사이의 가로 간격",
+        contentLetterSpacingAccessibility: "콘텐츠 글자 간격",
         codeFont: "코드 글꼴",
         codeFontHint:
           "코드, diff, 터미널 출력에 사용됩니다. 시스템 기본값을 사용하려면 비워 두세요",
@@ -2727,6 +2733,10 @@ export const ko: TranslationResources = {
         contentWidthAccessibility: "콘텐츠 너비(픽셀)",
         reset: "재설정",
         resetAccessibility: "콘텐츠 너비를 기본값으로 재설정",
+        paragraphSpacing: "단락 간격",
+        paragraphSpacingHint: "단락, 목록 및 블록 사이의 세로 간격",
+        paragraphSpacingAccessibility: "단락 간격(픽셀)",
+        resetParagraphSpacingAccessibility: "단락 간격을 기본값으로 재설정",
       },
       syntax: {
         title: "구문",

@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { darkHighlightColors, resolveSyntaxColors } from "@getpaseo/highlight";
-import { DEFAULT_UI_FONT_STACK, REGISTERED_THEMES } from "@/styles/theme";
+import {
+  DEFAULT_CONTENT_LETTER_SPACING,
+  DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER,
+  DEFAULT_UI_FONT_STACK,
+  REGISTERED_THEMES,
+} from "@/styles/theme";
 import { applyAppearance, type AppearanceInput } from "./apply";
 
 // Override the global react-native-unistyles mock (vitest.setup.ts) so that
@@ -36,14 +41,16 @@ interface FakeTheme {
     "3xl": number;
     "4xl": number;
   };
-  lineHeight: { diff: number };
+  lineHeight: { diff: number; content: number };
   contentMaxWidth: number;
+  contentLetterSpacing: number;
+  contentBlockGap: number | null;
   colors: { foreground: string; syntax: Record<string, string> };
 }
 
-function makeFakeTheme(): FakeTheme {
+function makeFakeTheme(colorScheme: "light" | "dark" = "dark"): FakeTheme {
   return {
-    colorScheme: "dark",
+    colorScheme,
     fontFamily: { ui: "seed-ui-stack", mono: "seed-mono-stack" },
     fontSize: {
       code: 12,
@@ -56,8 +63,10 @@ function makeFakeTheme(): FakeTheme {
       "3xl": 22,
       "4xl": 26,
     },
-    lineHeight: { diff: 22 },
+    lineHeight: { diff: 22, content: 24 },
     contentMaxWidth: 820,
+    contentLetterSpacing: 0,
+    contentBlockGap: null,
     colors: { foreground: "#fff", syntax: {} },
   };
 }
@@ -76,9 +85,9 @@ function makeInput(overrides: Partial<AppearanceInput> = {}): AppearanceInput {
 }
 
 // Run a single captured updater (default the first) against a fresh fake theme.
-function runCapturedUpdater(call = 0): FakeTheme {
+function runCapturedUpdater(call = 0, colorScheme: "light" | "dark" = "dark"): FakeTheme {
   const updater = updateTheme.mock.calls[call]?.[1] as unknown as ThemeUpdater;
-  return updater(makeFakeTheme());
+  return updater(makeFakeTheme(colorScheme));
 }
 
 describe("applyAppearance", () => {
@@ -188,6 +197,36 @@ describe("applyAppearance", () => {
 
     expect(runCapturedUpdater().lineHeight.diff).toBe(Math.round(18 * 1.5)); // 27
   });
+
+  it("defaults lineHeight.content, contentLetterSpacing, and contentBlockGap when omitted", () => {
+    applyAppearance(makeInput({ contentFontSize: 16 }));
+
+    const updated = runCapturedUpdater();
+    expect(updated.lineHeight.content).toBe(
+      Math.round(16 * DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER),
+    );
+    expect(updated.contentLetterSpacing).toBe(DEFAULT_CONTENT_LETTER_SPACING);
+    expect(updated.contentBlockGap).toBeNull();
+  });
+
+  it.each(["light", "dark"] as const)(
+    "applies lineHeight.content, contentLetterSpacing, and contentBlockGap to %s themes",
+    (scheme) => {
+      applyAppearance(
+        makeInput({
+          contentFontSize: 15,
+          contentLineHeightMultiplier: 1.85,
+          contentLetterSpacing: 1.25,
+          contentBlockGap: 24,
+        }),
+      );
+
+      const updated = runCapturedUpdater(0, scheme);
+      expect(updated.lineHeight.content).toBe(Math.round(15 * 1.85));
+      expect(updated.contentLetterSpacing).toBe(1.25);
+      expect(updated.contentBlockGap).toBe(24);
+    },
+  );
 
   it("swaps colors.syntax to the resolved palette for the named theme", () => {
     applyAppearance(makeInput({ syntaxTheme: "dracula" }));

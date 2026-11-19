@@ -2737,6 +2737,13 @@ export const ptBR: TranslationResources = {
         contentSize: "Tamanho do conteúdo",
         contentSizeHint: "Usado no texto do chat e no Markdown renderizado",
         contentSizeAccessibility: "Tamanho da fonte do conteúdo",
+        contentLineHeight: "Altura da linha do conteúdo",
+        contentLineHeightHint:
+          "Multiplicador de altura da linha para o texto do chat e o Markdown renderizado",
+        contentLineHeightAccessibility: "Multiplicador de altura da linha do conteúdo",
+        contentLetterSpacing: "Espaçamento entre caracteres",
+        contentLetterSpacingHint: "Espaçamento horizontal entre caracteres no chat e no Markdown",
+        contentLetterSpacingAccessibility: "Espaçamento entre caracteres do conteúdo",
         codeFont: "Fonte de código",
         codeFontHint:
           "Usada em código, diffs e saída do terminal. Deixe vazio para usar o padrão do sistema",
@@ -2752,6 +2759,11 @@ export const ptBR: TranslationResources = {
         contentWidthAccessibility: "Largura do conteúdo em pixels",
         reset: "Redefinir",
         resetAccessibility: "Redefinir a largura do conteúdo",
+        paragraphSpacing: "Espaçamento entre parágrafos",
+        paragraphSpacingHint: "Espaço vertical entre parágrafos, listas e blocos",
+        paragraphSpacingAccessibility: "Espaçamento entre parágrafos em pixels",
+        resetParagraphSpacingAccessibility:
+          "Redefinir o espaçamento entre parágrafos para o padrão",
       },
       syntax: {
         title: "Sintaxe",

@@ -2723,6 +2723,12 @@ export const ja: TranslationResources = {
         contentSize: "コンテンツサイズ",
         contentSizeHint: "チャットテキストとレンダリングされた Markdown に使用されます",
         contentSizeAccessibility: "コンテンツのフォントサイズ",
+        contentLineHeight: "コンテンツの行間",
+        contentLineHeightHint: "チャットテキストとレンダリングされた Markdown の行間倍率",
+        contentLineHeightAccessibility: "コンテンツの行間倍率",
+        contentLetterSpacing: "文字間隔",
+        contentLetterSpacingHint: "チャットと Markdown における文字間の水平間隔",
+        contentLetterSpacingAccessibility: "コンテンツの文字間隔",
         codeFont: "コードフォント",
         codeFontHint:
           "コード、差分、ターミナル出力で使用されます。システムデフォルトにするには空のままにしてください",
@@ -2738,6 +2744,10 @@ export const ja: TranslationResources = {
         contentWidthAccessibility: "コンテンツ幅 (ピクセル)",
         reset: "リセット",
         resetAccessibility: "コンテンツ幅をデフォルトに戻す",
+        paragraphSpacing: "段落の間隔",
+        paragraphSpacingHint: "段落、リスト、ブロック間の縦方向の間隔",
+        paragraphSpacingAccessibility: "段落の間隔 (ピクセル)",
+        resetParagraphSpacingAccessibility: "段落の間隔をデフォルトに戻す",
       },
       syntax: {
         title: "構文ハイライト",

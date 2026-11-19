@@ -23,7 +23,10 @@ import {
   MIN_CONTENT_FONT_SIZE,
   MIN_UI_BASE_FONT_SIZE,
   parseClampedFontSize,
+  parseContentLetterSpacing,
+  parseContentLineHeightMultiplier,
   parseContentMaxWidth,
+  parseContentParagraphSpacing,
   resolveContentMaxWidth,
   sanitizeFontFamily,
   useAppSettings,
@@ -53,6 +56,12 @@ function resolveDefaultStackPlaceholder(t: TFunction, stack: string): string {
 function sizeDraftToOverride(value: string): number | undefined {
   if (value.length === 0) return undefined;
   const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function decimalDraftToOverride(value: string): number | undefined {
+  if (value.length === 0) return undefined;
+  const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
@@ -126,6 +135,8 @@ interface FontSizeRowProps {
   hint: string;
   accessibilityLabel: string;
   draft: string;
+  unit?: string;
+  decimal?: boolean;
   withBorder?: boolean;
   onChangeDraft: (value: string) => void;
   onCommit: () => string;
@@ -136,15 +147,33 @@ function FontSizeRow({
   hint,
   accessibilityLabel,
   draft,
+  unit = "px",
+  decimal = false,
   withBorder = true,
   onChangeDraft,
   onCommit,
 }: FontSizeRowProps) {
   const inputRef = useRef<EditingTextInputHandle>(null);
+  const handleChangeText = useCallback(
+    (value: string) => {
+      const sanitized = value.replace(decimal ? /[^\d.]/g : /[^\d]/g, "");
+      if (sanitized !== value) {
+        inputRef.current?.replaceText(sanitized);
+      }
+      onChangeDraft(sanitized);
+    },
+    [decimal, onChangeDraft],
+  );
   const handleCommit = useCallback(() => {
     const committed = onCommit();
     inputRef.current?.replaceText(committed);
   }, [onCommit]);
+
+  useEffect(() => {
+    if (inputRef.current?.getText() !== draft) {
+      inputRef.current?.replaceText(draft);
+    }
+  }, [draft]);
 
   return (
     <View style={withBorder ? styles.rowWithBorder : settingsStyles.row}>
@@ -156,16 +185,16 @@ function FontSizeRow({
         <TextInput
           ref={inputRef}
           initialValue={draft}
-          onChangeText={onChangeDraft}
+          onChangeText={handleChangeText}
           onBlur={handleCommit}
           onSubmitEditing={handleCommit}
-          keyboardType="number-pad"
-          inputMode="numeric"
+          keyboardType={decimal ? "decimal-pad" : "number-pad"}
+          inputMode={decimal ? "decimal" : "numeric"}
           selectTextOnFocus
           style={styles.sizeInput}
           accessibilityLabel={accessibilityLabel}
         />
-        <Text style={styles.unit}>px</Text>
+        <Text style={styles.unit}>{unit}</Text>
       </View>
     </View>
   );
@@ -231,6 +260,70 @@ function ContentWidthRow({ value, onChange }: ContentWidthRowProps) {
           selectTextOnFocus
           style={styles.widthInput}
           accessibilityLabel={t("settings.appearance.layout.contentWidthAccessibility")}
+        />
+        <Text style={styles.unit}>px</Text>
+      </View>
+    </View>
+  );
+}
+
+interface ParagraphSpacingRowProps {
+  value: AppSettings["contentParagraphSpacing"];
+  onChange: (value: AppSettings["contentParagraphSpacing"]) => void;
+}
+
+function ParagraphSpacingRow({ value, onChange }: ParagraphSpacingRowProps) {
+  const { t } = useTranslation();
+  const spacing = value ?? 16;
+  const input = useRef<EditingTextInputHandle>(null);
+
+  useEffect(() => {
+    input.current?.replaceText(String(spacing));
+  }, [spacing]);
+
+  const commit = useCallback(() => {
+    const next = parseContentParagraphSpacing(input.current?.getText()) ?? spacing;
+    input.current?.replaceText(String(next));
+    // Typing the spacing already in effect keeps following the default.
+    if (next !== spacing) {
+      onChange(next);
+    }
+  }, [onChange, spacing]);
+
+  const reset = useCallback(() => {
+    onChange(null);
+  }, [onChange]);
+
+  return (
+    <View style={styles.rowWithBorder}>
+      <View style={settingsStyles.rowContent}>
+        <Text style={settingsStyles.rowTitle}>
+          {t("settings.appearance.layout.paragraphSpacing")}
+        </Text>
+        <Text style={settingsStyles.rowHint}>
+          {t("settings.appearance.layout.paragraphSpacingHint")}
+        </Text>
+      </View>
+      <View style={styles.sizeField}>
+        {value === null ? null : (
+          <Button
+            variant="ghost"
+            onPress={reset}
+            accessibilityLabel={t("settings.appearance.layout.resetParagraphSpacingAccessibility")}
+          >
+            {t("settings.appearance.layout.reset")}
+          </Button>
+        )}
+        <TextInput
+          ref={input}
+          initialValue={String(spacing)}
+          onBlur={commit}
+          onSubmitEditing={commit}
+          keyboardType="number-pad"
+          inputMode="numeric"
+          selectTextOnFocus
+          style={styles.sizeInput}
+          accessibilityLabel={t("settings.appearance.layout.paragraphSpacingAccessibility")}
         />
         <Text style={styles.unit}>px</Text>
       </View>
@@ -320,6 +413,12 @@ export function AppearanceSection() {
   const [monoFontDraft, setMonoFontDraft] = useState(settings.monoFontFamily);
   const [uiBaseSizeDraft, setUiBaseSizeDraft] = useState(String(settings.uiBaseFontSize));
   const [contentSizeDraft, setContentSizeDraft] = useState(String(settings.contentFontSize));
+  const [contentLineHeightDraft, setContentLineHeightDraft] = useState(
+    String(settings.contentLineHeightMultiplier),
+  );
+  const [contentLetterSpacingDraft, setContentLetterSpacingDraft] = useState(
+    String(settings.contentLetterSpacing),
+  );
   const [codeSizeDraft, setCodeSizeDraft] = useState(String(settings.codeFontSize));
 
   // Resync numeric drafts when the committed value changes elsewhere.
@@ -330,12 +429,25 @@ export function AppearanceSection() {
     setContentSizeDraft(String(settings.contentFontSize));
   }, [settings.contentFontSize]);
   useEffect(() => {
+    setContentLineHeightDraft(String(settings.contentLineHeightMultiplier));
+  }, [settings.contentLineHeightMultiplier]);
+  useEffect(() => {
+    setContentLetterSpacingDraft(String(settings.contentLetterSpacing));
+  }, [settings.contentLetterSpacing]);
+  useEffect(() => {
     setCodeSizeDraft(String(settings.codeFontSize));
   }, [settings.codeFontSize]);
 
   const handleContentMaxWidthChange = useCallback(
     (contentMaxWidth: AppSettings["contentMaxWidth"]) => {
       void updateSettings({ contentMaxWidth });
+    },
+    [updateSettings],
+  );
+
+  const handleContentParagraphSpacingChange = useCallback(
+    (contentParagraphSpacing: AppSettings["contentParagraphSpacing"]) => {
+      void updateSettings({ contentParagraphSpacing });
     },
     [updateSettings],
   );
@@ -391,6 +503,14 @@ export function AppearanceSection() {
     setContentSizeDraft(value.replace(/[^\d]/g, ""));
   }, []);
 
+  const handleContentLineHeightChange = useCallback((value: string) => {
+    setContentLineHeightDraft(value.replace(/[^\d.]/g, ""));
+  }, []);
+
+  const handleContentLetterSpacingChange = useCallback((value: string) => {
+    setContentLetterSpacingDraft(value.replace(/[^\d.]/g, ""));
+  }, []);
+
   const commitUiBaseSize = useCallback(() => {
     const parsed = parseClampedFontSize(uiBaseSizeDraft, {
       min: MIN_UI_BASE_FONT_SIZE,
@@ -430,16 +550,44 @@ export function AppearanceSection() {
     return String(next);
   }, [contentSizeDraft, settings.contentFontSize, updateSettings]);
 
+  const commitContentLineHeight = useCallback(() => {
+    const parsed = parseContentLineHeightMultiplier(contentLineHeightDraft);
+    const next = parsed ?? settings.contentLineHeightMultiplier;
+    setContentLineHeightDraft(String(next));
+    if (next !== settings.contentLineHeightMultiplier) {
+      void updateSettings({ contentLineHeightMultiplier: next });
+    }
+    return String(next);
+  }, [contentLineHeightDraft, settings.contentLineHeightMultiplier, updateSettings]);
+
+  const commitContentLetterSpacing = useCallback(() => {
+    const parsed = parseContentLetterSpacing(contentLetterSpacingDraft);
+    const next = parsed ?? settings.contentLetterSpacing;
+    setContentLetterSpacingDraft(String(next));
+    if (next !== settings.contentLetterSpacing) {
+      void updateSettings({ contentLetterSpacing: next });
+    }
+    return String(next);
+  }, [contentLetterSpacingDraft, settings.contentLetterSpacing, updateSettings]);
+
   // Live-while-typing: the in-progress drafts drive the preview without
   // committing to the global theme. Empty/invalid fields fall back to the
   // theme value inside the preview.
   const previewOverrides = useMemo(
     () => ({
       contentFontSize: sizeDraftToOverride(contentSizeDraft),
+      contentLineHeightMultiplier: decimalDraftToOverride(contentLineHeightDraft),
+      contentLetterSpacing: decimalDraftToOverride(contentLetterSpacingDraft),
       monoFontFamily: monoFontDraft,
       codeFontSize: sizeDraftToOverride(codeSizeDraft),
     }),
-    [codeSizeDraft, contentSizeDraft, monoFontDraft],
+    [
+      codeSizeDraft,
+      contentLetterSpacingDraft,
+      contentLineHeightDraft,
+      contentSizeDraft,
+      monoFontDraft,
+    ],
   );
 
   return (
@@ -481,6 +629,26 @@ export function AppearanceSection() {
             onChangeDraft={handleContentSizeChange}
             onCommit={commitContentSize}
           />
+          <FontSizeRow
+            title={t("settings.appearance.fonts.contentLineHeight")}
+            hint={t("settings.appearance.fonts.contentLineHeightHint")}
+            accessibilityLabel={t("settings.appearance.fonts.contentLineHeightAccessibility")}
+            draft={contentLineHeightDraft}
+            unit="×"
+            decimal
+            onChangeDraft={handleContentLineHeightChange}
+            onCommit={commitContentLineHeight}
+          />
+          <FontSizeRow
+            title={t("settings.appearance.fonts.contentLetterSpacing")}
+            hint={t("settings.appearance.fonts.contentLetterSpacingHint")}
+            accessibilityLabel={t("settings.appearance.fonts.contentLetterSpacingAccessibility")}
+            draft={contentLetterSpacingDraft}
+            unit="px"
+            decimal
+            onChangeDraft={handleContentLetterSpacingChange}
+            onCommit={commitContentLetterSpacing}
+          />
           <FontFamilyRow
             title={t("settings.appearance.fonts.codeFont")}
             hint={t("settings.appearance.fonts.codeFontHint")}
@@ -507,6 +675,10 @@ export function AppearanceSection() {
           <ContentWidthRow
             value={settings.contentMaxWidth}
             onChange={handleContentMaxWidthChange}
+          />
+          <ParagraphSpacingRow
+            value={settings.contentParagraphSpacing}
+            onChange={handleContentParagraphSpacingChange}
           />
         </View>
       </SettingsSection>

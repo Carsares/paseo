@@ -61,6 +61,9 @@ export function appearanceStyleBoundaryKey(theme: Theme): string {
     theme.colors.syntax.meta,
     theme.colors.syntax.heading,
     theme.colors.syntax.link,
+    theme.lineHeight.content,
+    theme.contentLetterSpacing,
+    theme.contentBlockGap ?? "",
   ].join("\u0000");
 }
 

@@ -3,7 +3,7 @@ import { View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { markdownCopyImageSourcesDataSet } from "@/assistant-selection-copy/markup";
 import { isWeb } from "@/constants/platform";
-import { density } from "@/styles/density";
+import { density, resolveDensity } from "@/styles/density";
 
 /** Stacks Markdown blocks rendered as separate views with the same gap the text puts between its blocks. */
 export function MarkdownBlockStack({
@@ -23,6 +23,10 @@ export function MarkdownBlockStack({
   );
 }
 
-const styles = StyleSheet.create({
-  stack: { gap: density.blockGap },
-});
+const styles = StyleSheet.create((theme, rt) => ({
+  stack: {
+    gap:
+      theme.contentBlockGap ??
+      resolveDensity(rt ? { breakpoint: rt.breakpoint } : {}, density.blockGap),
+  },
+}));

@@ -580,8 +580,12 @@ export const FONT_SIZE = {
   "4xl": 26,
 } as const;
 
+export const DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER = 1.6;
+export const DEFAULT_CONTENT_LETTER_SPACING = 0;
+
 export const LINE_HEIGHT = {
   diff: 22,
+  content: Math.round(FONT_SIZE.content * DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER),
 } as const;
 
 export const ICON_SIZE = {
@@ -641,16 +645,18 @@ export const DEFAULT_MONO_FONT_STACK: string = Platform.select({
 // Chat and markdown content column; the appearance updater patches the user's width in.
 export const DEFAULT_CONTENT_MAX_WIDTH = 820;
 
-// `fontSize`, `fontFamily`, `lineHeight`, and `contentMaxWidth` are deliberately widened to plain
-// `number`/`string` (not narrowed by `as const`) so the appearance updater can patch
-// them at runtime via `UnistylesRuntime.updateTheme`. The remaining tokens keep their
-// literal types.
+// `fontSize`, `fontFamily`, `lineHeight`, `contentMaxWidth`, `contentLetterSpacing`, and
+// `contentBlockGap` are deliberately widened to plain `number`/`string` (not narrowed by
+// `as const`) so the appearance updater can patch them at runtime via
+// `UnistylesRuntime.updateTheme`. The remaining tokens keep their literal types.
 interface CommonTheme {
   spacing: typeof SPACING;
   fontSize: Record<keyof typeof FONT_SIZE, number>;
   fontFamily: { ui: string; mono: string };
   lineHeight: Record<keyof typeof LINE_HEIGHT, number>;
   contentMaxWidth: number;
+  contentLetterSpacing: number;
+  contentBlockGap: number | null;
   iconSize: typeof ICON_SIZE;
   fontWeight: typeof FONT_WEIGHT;
   borderRadius: typeof BORDER_RADIUS;
@@ -664,6 +670,8 @@ const commonTheme: CommonTheme = {
   fontFamily: { ui: DEFAULT_UI_FONT_STACK, mono: DEFAULT_MONO_FONT_STACK },
   lineHeight: LINE_HEIGHT,
   contentMaxWidth: DEFAULT_CONTENT_MAX_WIDTH,
+  contentLetterSpacing: DEFAULT_CONTENT_LETTER_SPACING,
+  contentBlockGap: null,
   iconSize: ICON_SIZE,
   fontWeight: FONT_WEIGHT,
   borderRadius: BORDER_RADIUS,

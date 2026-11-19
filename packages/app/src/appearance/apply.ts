@@ -1,6 +1,8 @@
 import { UnistylesRuntime } from "react-native-unistyles";
 import { resolveSyntaxColors, type SyntaxThemeId } from "@getpaseo/highlight";
 import {
+  DEFAULT_CONTENT_LETTER_SPACING,
+  DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER,
   DEFAULT_UI_FONT_STACK,
   DEFAULT_MONO_FONT_STACK,
   FONT_SIZE,
@@ -18,6 +20,9 @@ export interface AppearanceInput {
   contentFontSize: number; // already clamped
   codeFontSize: number; // already clamped
   contentMaxWidth: number; // already clamped, default resolved
+  contentLineHeightMultiplier?: number; // already clamped, defaults to DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER
+  contentLetterSpacing?: number; // already clamped, defaults to DEFAULT_CONTENT_LETTER_SPACING
+  contentBlockGap?: number | null; // already clamped or null, defaults to null
   syntaxTheme: SyntaxThemeId;
 }
 
@@ -64,6 +69,12 @@ export function applyAppearance(input: AppearanceInput): void {
   const ui = input.uiFontFamily.trim() || DEFAULT_UI_FONT_STACK;
   const mono = input.monoFontFamily.trim() || DEFAULT_MONO_FONT_STACK;
   const diffLineHeight = Math.round(input.codeFontSize * 1.5); // couple to code size
+  const contentLineHeight = Math.round(
+    input.contentFontSize *
+      (input.contentLineHeightMultiplier ?? DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER),
+  );
+  const contentLetterSpacing = input.contentLetterSpacing ?? DEFAULT_CONTENT_LETTER_SPACING;
+  const contentBlockGap = input.contentBlockGap ?? null;
   const activeTheme = UnistylesRuntime.themeName;
   // Unistyles web emits after each registry patch. Updating the mounted theme
   // first ensures subscribers receive its new numeric tokens in this render;
@@ -80,7 +91,7 @@ export function applyAppearance(input: AppearanceInput): void {
         input.contentFontSize,
         input.codeFontSize,
       );
-      const lineHeight = { ...t.lineHeight, diff: diffLineHeight };
+      const lineHeight = { ...t.lineHeight, diff: diffLineHeight, content: contentLineHeight };
       if (t.colorScheme === "light") {
         return {
           ...t,
@@ -88,6 +99,8 @@ export function applyAppearance(input: AppearanceInput): void {
           fontSize,
           lineHeight,
           contentMaxWidth: input.contentMaxWidth,
+          contentLetterSpacing,
+          contentBlockGap,
           colors: { ...t.colors, syntax: resolveSyntaxColors(input.syntaxTheme, t.colorScheme) },
         };
       }
@@ -97,6 +110,8 @@ export function applyAppearance(input: AppearanceInput): void {
         fontSize,
         lineHeight,
         contentMaxWidth: input.contentMaxWidth,
+        contentLetterSpacing,
+        contentBlockGap,
         colors: { ...t.colors, syntax: resolveSyntaxColors(input.syntaxTheme, t.colorScheme) },
       };
     });

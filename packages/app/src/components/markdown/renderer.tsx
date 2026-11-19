@@ -35,7 +35,7 @@ const markdownStyle =
     createMarkdownStyles(theme, {
       compact,
       muted,
-      blockGap: resolveDensity(rt, density.blockGap),
+      blockGap: theme.contentBlockGap ?? resolveDensity(rt, density.blockGap),
     });
 const regularStyle = markdownStyle(false);
 const compactStyle = markdownStyle(true);

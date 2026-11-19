@@ -20,6 +20,7 @@ const codeStyle = (theme: Theme) => ({
     color: theme.colors.foreground,
     fontFamily: theme.fontFamily.mono,
     fontSize: theme.fontSize.code,
+    letterSpacing: 0,
   },
   textStyle: { backgroundColor: theme.colors.surface2, padding: 12, borderRadius: 8 },
 });
@@ -45,6 +46,7 @@ function WebLink({ link, anchorProps, children }: LinkRendererProps) {
   const anchorStyle = useMemo(
     () => ({
       ...anchorProps.style,
+      marginInline: 2,
       overflowWrap: "anywhere" as const,
       ...(hovered ? LINK_HOVER_STYLE : null),
     }),

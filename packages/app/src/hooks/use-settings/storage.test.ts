@@ -7,12 +7,23 @@ import {
   DEFAULT_CLIENT_SETTINGS,
   DEFAULT_CODE_FONT_SIZE,
   DEFAULT_CONTENT_FONT_SIZE,
+  DEFAULT_CONTENT_LETTER_SPACING,
+  DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER,
   DEFAULT_UI_BASE_FONT_SIZE,
+  MAX_CONTENT_LETTER_SPACING,
+  MAX_CONTENT_LINE_HEIGHT_MULTIPLIER,
+  MAX_CONTENT_PARAGRAPH_SPACING,
+  MIN_CONTENT_LETTER_SPACING,
+  MIN_CONTENT_LINE_HEIGHT_MULTIPLIER,
+  MIN_CONTENT_PARAGRAPH_SPACING,
   defaultUiBaseFontSize,
   defaultContentFontSize,
   loadAppSettingsFromStorage,
   loadSettingsFromStorage,
   parseClampedFontSize,
+  parseContentLetterSpacing,
+  parseContentLineHeightMultiplier,
+  parseContentParagraphSpacing,
   parseTerminalScrollbackLines,
   resolveContentMaxWidth,
   sanitizeFontFamily,
@@ -1262,6 +1273,138 @@ describe("content max width", () => {
     expect((await load(100_000)).contentMaxWidth).toBe(4000);
     expect((await load(10)).contentMaxWidth).toBe(600);
     expect((await load("wide")).contentMaxWidth).toBeNull();
+  });
+});
+
+describe("content spacing settings", () => {
+  it("defaults line height multiplier, letter spacing, and paragraph spacing when omitted", async () => {
+    const deps = makeDeps({
+      storage: createInMemoryKeyValueStorage({
+        [APP_SETTINGS_KEY]: JSON.stringify({ theme: "dark" }),
+      }),
+    });
+
+    const loaded = await loadAppSettingsFromStorage(deps);
+
+    expect(DEFAULT_CLIENT_SETTINGS.contentLineHeightMultiplier).toBe(
+      DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER,
+    );
+    expect(DEFAULT_CLIENT_SETTINGS.contentLetterSpacing).toBe(DEFAULT_CONTENT_LETTER_SPACING);
+    expect(DEFAULT_CLIENT_SETTINGS.contentParagraphSpacing).toBeNull();
+    expect(loaded.contentLineHeightMultiplier).toBe(1.6);
+    expect(loaded.contentLetterSpacing).toBe(0);
+    expect(loaded.contentParagraphSpacing).toBeNull();
+  });
+
+  it("parses, clamps, and rounds content line height multiplier and letter spacing", () => {
+    expect(parseContentLineHeightMultiplier(0.5)).toBe(MIN_CONTENT_LINE_HEIGHT_MULTIPLIER);
+    expect(parseContentLineHeightMultiplier(5)).toBe(MAX_CONTENT_LINE_HEIGHT_MULTIPLIER);
+    expect(parseContentLineHeightMultiplier("1.756")).toBe(1.76);
+    expect(parseContentLineHeightMultiplier(1.444)).toBe(1.44);
+    expect(parseContentLineHeightMultiplier("")).toBeNull();
+    expect(parseContentLineHeightMultiplier("abc")).toBeNull();
+    expect(parseContentLineHeightMultiplier(Infinity)).toBeNull();
+    expect(parseContentLineHeightMultiplier(null)).toBeNull();
+
+    expect(parseContentLetterSpacing(-1)).toBe(MIN_CONTENT_LETTER_SPACING);
+    expect(parseContentLetterSpacing(-0)).toBe(0);
+    expect(parseContentLetterSpacing(10)).toBe(MAX_CONTENT_LETTER_SPACING);
+    expect(parseContentLetterSpacing("1.236")).toBe(1.24);
+    expect(parseContentLetterSpacing(0.554)).toBe(0.55);
+    expect(parseContentLetterSpacing("   ")).toBeNull();
+    expect(parseContentLetterSpacing("abc")).toBeNull();
+    expect(parseContentLetterSpacing(NaN)).toBeNull();
+
+    expect(parseContentParagraphSpacing(2)).toBe(MIN_CONTENT_PARAGRAPH_SPACING);
+    expect(parseContentParagraphSpacing(100)).toBe(MAX_CONTENT_PARAGRAPH_SPACING);
+    expect(parseContentParagraphSpacing("18.9")).toBe(18);
+    expect(parseContentParagraphSpacing("abc")).toBeNull();
+
+    for (const invalid of [
+      "",
+      "   ",
+      "abc",
+      null,
+      undefined,
+      NaN,
+      Infinity,
+      -Infinity,
+      true,
+      false,
+      {},
+      [],
+      [1],
+    ]) {
+      expect(parseContentLineHeightMultiplier(invalid)).toBeNull();
+      expect(parseContentLetterSpacing(invalid)).toBeNull();
+      expect(parseContentParagraphSpacing(invalid)).toBeNull();
+    }
+  });
+
+  it("clamps stored spacing values and falls back to defaults on invalid entries", async () => {
+    const load = (patch: Record<string, unknown>) =>
+      loadAppSettingsFromStorage(
+        makeDeps({
+          storage: createInMemoryKeyValueStorage({
+            [APP_SETTINGS_KEY]: JSON.stringify(patch),
+          }),
+        }),
+      );
+
+    expect((await load({ contentLineHeightMultiplier: 0.4 })).contentLineHeightMultiplier).toBe(
+      1.2,
+    );
+    expect((await load({ contentLineHeightMultiplier: 4 })).contentLineHeightMultiplier).toBe(2.2);
+    expect((await load({ contentLineHeightMultiplier: 1.736 })).contentLineHeightMultiplier).toBe(
+      1.74,
+    );
+    expect((await load({ contentLineHeightMultiplier: "bad" })).contentLineHeightMultiplier).toBe(
+      DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER,
+    );
+
+    expect((await load({ contentLetterSpacing: -2 })).contentLetterSpacing).toBe(0);
+    expect((await load({ contentLetterSpacing: 9 })).contentLetterSpacing).toBe(4);
+    expect((await load({ contentLetterSpacing: 0.876 })).contentLetterSpacing).toBe(0.88);
+    expect((await load({ contentLetterSpacing: "bad" })).contentLetterSpacing).toBe(
+      DEFAULT_CONTENT_LETTER_SPACING,
+    );
+
+    expect((await load({ contentParagraphSpacing: 2 })).contentParagraphSpacing).toBe(8);
+    expect((await load({ contentParagraphSpacing: 99 })).contentParagraphSpacing).toBe(36);
+    expect((await load({ contentParagraphSpacing: null })).contentParagraphSpacing).toBeNull();
+    expect((await load({ contentParagraphSpacing: "bad" })).contentParagraphSpacing).toBeNull();
+  });
+
+  it("persists content spacing updates and resetting paragraph spacing to null", async () => {
+    const deps = makeDeps();
+    const queryClient = new QueryClient();
+
+    await saveAppSettings({
+      queryClient,
+      updates: {
+        contentLineHeightMultiplier: 1.85,
+        contentLetterSpacing: 1.5,
+        contentParagraphSpacing: 20,
+      },
+      deps,
+    });
+
+    expect(await loadAppSettingsFromStorage(deps)).toMatchObject({
+      contentLineHeightMultiplier: 1.85,
+      contentLetterSpacing: 1.5,
+      contentParagraphSpacing: 20,
+    });
+
+    await saveAppSettings({
+      queryClient,
+      updates: { contentParagraphSpacing: null },
+      deps,
+    });
+
+    const loaded = await loadAppSettingsFromStorage(deps);
+    expect(loaded.contentLineHeightMultiplier).toBe(1.85);
+    expect(loaded.contentLetterSpacing).toBe(1.5);
+    expect(loaded.contentParagraphSpacing).toBeNull();
   });
 });
 

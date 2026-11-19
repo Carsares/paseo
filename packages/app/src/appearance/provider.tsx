@@ -75,6 +75,9 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
       contentFontSize: settings.contentFontSize,
       codeFontSize: settings.codeFontSize,
       contentMaxWidth: resolveContentMaxWidth({ contentMaxWidth: settings.contentMaxWidth }),
+      contentLineHeightMultiplier: settings.contentLineHeightMultiplier,
+      contentLetterSpacing: settings.contentLetterSpacing,
+      contentBlockGap: settings.contentParagraphSpacing,
       syntaxTheme: settings.syntaxTheme,
     });
     setHasAppliedAppearance(true);
@@ -88,6 +91,9 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
     settings.contentFontSize,
     settings.codeFontSize,
     settings.contentMaxWidth,
+    settings.contentLineHeightMultiplier,
+    settings.contentLetterSpacing,
+    settings.contentParagraphSpacing,
     settings.syntaxTheme,
   ]);
 

@@ -1110,6 +1110,44 @@ it("makes the web Markdown container selectable in Safari as well as unprefixed 
   });
 });
 
+it("uses theme.lineHeight.content for regular paragraphs and scales proportionally in compact mode", () => {
+  const theme = {
+    ...darkTheme,
+    fontSize: { ...darkTheme.fontSize, content: 16, base: 14 },
+    lineHeight: { ...darkTheme.lineHeight, content: 32 },
+  };
+  expect(createMarkdownStyles(theme, { blockGap: 16 }).markdownStyle.paragraph?.lineHeight).toBe(
+    32,
+  );
+  expect(
+    createMarkdownStyles(theme, { compact: true, blockGap: 16 }).markdownStyle.paragraph
+      ?.lineHeight,
+  ).toBe(28);
+});
+
+it.each([
+  [4, 4],
+  [6, 4],
+  [12, 6],
+  [16, 8],
+  [24, 12],
+])("scales list.itemSpacing with blockGap (%i -> %i)", (blockGap, expectedItemSpacing) => {
+  const { markdownStyle } = createMarkdownStyles(darkTheme, { blockGap });
+  expect(markdownStyle.list?.itemSpacing).toBe(expectedItemSpacing);
+});
+
+it("includes letterSpacing in web containerStyle only when contentLetterSpacing is non-zero", () => {
+  const defaultResult = createMarkdownStyles(darkTheme, { blockGap: 16 });
+  expect(defaultResult.containerStyle).not.toHaveProperty("letterSpacing");
+
+  const spacedTheme = { ...darkTheme, contentLetterSpacing: 0.4 };
+  expect(createMarkdownStyles(spacedTheme, { blockGap: 16 }).containerStyle).toEqual({
+    userSelect: "text",
+    WebkitUserSelect: "text",
+    letterSpacing: 0.4,
+  });
+});
+
 it.each([false, true])(
   "scales inline code from theme tokens with its surrounding block (compact: %s)",
   (compact) => {

@@ -2758,6 +2758,14 @@ export const fr: TranslationResources = {
         contentSize: "Taille du contenu",
         contentSizeHint: "Utilisée pour le texte de la discussion et le Markdown rendu",
         contentSizeAccessibility: "Taille de police du contenu",
+        contentLineHeight: "Hauteur de ligne du contenu",
+        contentLineHeightHint:
+          "Multiplicateur de hauteur de ligne pour le texte de la discussion et le Markdown rendu",
+        contentLineHeightAccessibility: "Multiplicateur de hauteur de ligne du contenu",
+        contentLetterSpacing: "Espacement des caractères",
+        contentLetterSpacingHint:
+          "Espacement horizontal entre les caractères dans la discussion et le Markdown",
+        contentLetterSpacingAccessibility: "Espacement des caractères du contenu",
         codeFont: "Police du code",
         codeFontHint:
           "Utilisée pour le code, les diffs et la sortie du terminal. Laissez vide pour utiliser la police par défaut du système",
@@ -2774,6 +2782,10 @@ export const fr: TranslationResources = {
         contentWidthAccessibility: "Largeur du contenu en pixels",
         reset: "Réinitialiser",
         resetAccessibility: "Réinitialiser la largeur du contenu",
+        paragraphSpacing: "Espacement des paragraphes",
+        paragraphSpacingHint: "Espace vertical entre les paragraphes, les listes et les blocs",
+        paragraphSpacingAccessibility: "Espacement des paragraphes en pixels",
+        resetParagraphSpacingAccessibility: "Réinitialiser l’espacement des paragraphes par défaut",
       },
       syntax: {
         title: "Syntaxe",

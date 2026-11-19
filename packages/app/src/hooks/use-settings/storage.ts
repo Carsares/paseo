@@ -20,6 +20,8 @@ import {
 } from "@/components/sidebar/display-preferences/row-items";
 import { isNative } from "@/constants/platform";
 import {
+  DEFAULT_CONTENT_LETTER_SPACING,
+  DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER,
   DEFAULT_CONTENT_MAX_WIDTH,
   FONT_SIZE,
   PLUGIN_THEME_PREFERENCE,
@@ -72,9 +74,19 @@ export const DEFAULT_CODE_FONT_SIZE = 12; // == FONT_SIZE.code
 export const MIN_CODE_FONT_SIZE = 9;
 export const MAX_CODE_FONT_SIZE = 22; // line-height 1.5×22=33 stays safe
 export const MAX_FONT_FAMILY_LENGTH = 200;
-export { DEFAULT_CONTENT_MAX_WIDTH };
+export {
+  DEFAULT_CONTENT_LETTER_SPACING,
+  DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER,
+  DEFAULT_CONTENT_MAX_WIDTH,
+};
 export const MIN_CONTENT_MAX_WIDTH = 600;
 export const MAX_CONTENT_MAX_WIDTH = 4000;
+export const MIN_CONTENT_LINE_HEIGHT_MULTIPLIER = 1.2;
+export const MAX_CONTENT_LINE_HEIGHT_MULTIPLIER = 2.2;
+export const MIN_CONTENT_LETTER_SPACING = 0;
+export const MAX_CONTENT_LETTER_SPACING = 4;
+export const MIN_CONTENT_PARAGRAPH_SPACING = 8;
+export const MAX_CONTENT_PARAGRAPH_SPACING = 36;
 
 export interface AppSettings {
   theme: ThemePreference;
@@ -91,6 +103,9 @@ export interface AppSettings {
   codeFontSize: number; // clamped px, default 12
   /** Max width of chat and markdown content in px; null follows the current default. */
   contentMaxWidth: number | null;
+  contentLineHeightMultiplier: number;
+  contentLetterSpacing: number;
+  contentParagraphSpacing: number | null;
   syntaxTheme: SyntaxThemeId; // default "one"
   workspaceTitleSource: WorkspaceTitleSource;
   sidebarWorkspaceTrailing: SidebarWorkspaceTrailing;
@@ -154,6 +169,9 @@ export const DEFAULT_CLIENT_SETTINGS: AppSettings = {
   contentFontSize: DEFAULT_CONTENT_FONT_SIZE,
   codeFontSize: DEFAULT_CODE_FONT_SIZE,
   contentMaxWidth: null,
+  contentLineHeightMultiplier: DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER,
+  contentLetterSpacing: DEFAULT_CONTENT_LETTER_SPACING,
+  contentParagraphSpacing: null,
   syntaxTheme: "one",
   workspaceTitleSource: "title",
   sidebarWorkspaceTrailing: "timestamp",
@@ -249,6 +267,20 @@ const StoredAppSettingsSchema = z
     contentMaxWidth: z
       .null()
       .or(clampedNumber(MIN_CONTENT_MAX_WIDTH, MAX_CONTENT_MAX_WIDTH))
+      .catch(null),
+    contentLineHeightMultiplier: z
+      .unknown()
+      .transform(parseContentLineHeightMultiplier)
+      .pipe(z.number())
+      .catch(DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER),
+    contentLetterSpacing: z
+      .unknown()
+      .transform(parseContentLetterSpacing)
+      .pipe(z.number())
+      .catch(DEFAULT_CONTENT_LETTER_SPACING),
+    contentParagraphSpacing: z
+      .null()
+      .or(clampedNumber(MIN_CONTENT_PARAGRAPH_SPACING, MAX_CONTENT_PARAGRAPH_SPACING))
       .catch(null),
     syntaxTheme: z.string().refine(isSyntaxThemeId).catch("one"),
     workspaceTitleSource: z.enum(["title", "branch"]).catch("title"),
@@ -484,14 +516,29 @@ function pickAppSettingsFromLegacy(legacy: StoredAppSettings): AppSettings {
   };
 }
 
-export function parseTerminalScrollbackLines(value: unknown): number | null {
+function parseFiniteNumber(value: unknown): number | null {
   let numericValue = NaN;
   if (typeof value === "number") {
     numericValue = value;
   } else if (typeof value === "string" && value.trim().length > 0) {
     numericValue = Number(value);
   }
-  if (!Number.isFinite(numericValue)) {
+  return Number.isFinite(numericValue) ? numericValue : null;
+}
+
+function parseClampedDecimal(value: unknown, bounds: { min: number; max: number }): number | null {
+  const numericValue = parseFiniteNumber(value);
+  if (numericValue === null) {
+    return null;
+  }
+  const clamped = Math.min(bounds.max, Math.max(bounds.min, numericValue));
+  const rounded = Math.round(clamped * 100) / 100;
+  return rounded === 0 ? 0 : rounded;
+}
+
+export function parseTerminalScrollbackLines(value: unknown): number | null {
+  const numericValue = parseFiniteNumber(value);
+  if (numericValue === null) {
     return null;
   }
   return Math.min(
@@ -504,6 +551,27 @@ export function parseContentMaxWidth(value: unknown): number | null {
   return parseClampedFontSize(value, { min: MIN_CONTENT_MAX_WIDTH, max: MAX_CONTENT_MAX_WIDTH });
 }
 
+export function parseContentLineHeightMultiplier(value: unknown): number | null {
+  return parseClampedDecimal(value, {
+    min: MIN_CONTENT_LINE_HEIGHT_MULTIPLIER,
+    max: MAX_CONTENT_LINE_HEIGHT_MULTIPLIER,
+  });
+}
+
+export function parseContentLetterSpacing(value: unknown): number | null {
+  return parseClampedDecimal(value, {
+    min: MIN_CONTENT_LETTER_SPACING,
+    max: MAX_CONTENT_LETTER_SPACING,
+  });
+}
+
+export function parseContentParagraphSpacing(value: unknown): number | null {
+  return parseClampedFontSize(value, {
+    min: MIN_CONTENT_PARAGRAPH_SPACING,
+    max: MAX_CONTENT_PARAGRAPH_SPACING,
+  });
+}
+
 export function resolveContentMaxWidth(settings: Pick<AppSettings, "contentMaxWidth">): number {
   return settings.contentMaxWidth ?? DEFAULT_CONTENT_MAX_WIDTH;
 }
@@ -512,13 +580,8 @@ export function parseClampedFontSize(
   value: unknown,
   bounds: { min: number; max: number },
 ): number | null {
-  let numericValue = NaN;
-  if (typeof value === "number") {
-    numericValue = value;
-  } else if (typeof value === "string" && value.trim().length > 0) {
-    numericValue = Number(value);
-  }
-  if (!Number.isFinite(numericValue)) {
+  const numericValue = parseFiniteNumber(value);
+  if (numericValue === null) {
     return null;
   }
   return Math.min(bounds.max, Math.max(bounds.min, Math.floor(numericValue)));

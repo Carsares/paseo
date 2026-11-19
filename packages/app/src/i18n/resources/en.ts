@@ -2828,6 +2828,12 @@ export const en = {
         contentSize: "Content size",
         contentSizeHint: "Used for chat text and rendered Markdown",
         contentSizeAccessibility: "Content font size",
+        contentLineHeight: "Content line height",
+        contentLineHeightHint: "Line height multiplier for chat text and rendered Markdown",
+        contentLineHeightAccessibility: "Content line height multiplier",
+        contentLetterSpacing: "Character spacing",
+        contentLetterSpacingHint: "Horizontal spacing between characters in chat and Markdown",
+        contentLetterSpacingAccessibility: "Content character spacing",
         codeFont: "Code font",
         codeFontHint:
           "Used in code, diffs, and the terminal output. Leave empty for the system default",
@@ -2843,6 +2849,10 @@ export const en = {
         contentWidthAccessibility: "Content width in pixels",
         reset: "Reset",
         resetAccessibility: "Reset content width to default",
+        paragraphSpacing: "Paragraph spacing",
+        paragraphSpacingHint: "Vertical space between paragraphs, lists, and blocks",
+        paragraphSpacingAccessibility: "Paragraph spacing in pixels",
+        resetParagraphSpacingAccessibility: "Reset paragraph spacing to default",
       },
       syntax: {
         title: "Syntax",

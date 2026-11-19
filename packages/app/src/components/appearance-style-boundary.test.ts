@@ -15,6 +15,49 @@ describe("appearanceStyleBoundaryKey", () => {
       appearanceStyleBoundaryKey(darkTheme),
     );
   });
+
+  it("changes when content lineHeight changes without any other appearance token changing", () => {
+    const lineHeightOnlyChange = {
+      ...darkTheme,
+      lineHeight: { ...darkTheme.lineHeight, content: darkTheme.lineHeight.content + 2 },
+    };
+
+    expect(appearanceStyleBoundaryKey(lineHeightOnlyChange)).not.toBe(
+      appearanceStyleBoundaryKey(darkTheme),
+    );
+  });
+
+  it("changes when contentLetterSpacing changes without any other appearance token changing", () => {
+    const letterSpacingOnlyChange = {
+      ...darkTheme,
+      contentLetterSpacing: darkTheme.contentLetterSpacing + 0.5,
+    };
+
+    expect(appearanceStyleBoundaryKey(letterSpacingOnlyChange)).not.toBe(
+      appearanceStyleBoundaryKey(darkTheme),
+    );
+  });
+
+  it("changes when contentBlockGap changes without any other appearance token changing", () => {
+    const zeroGapChange = {
+      ...darkTheme,
+      contentBlockGap: 0,
+    };
+    const explicitGapChange = {
+      ...darkTheme,
+      contentBlockGap: 20,
+    };
+
+    expect(appearanceStyleBoundaryKey(zeroGapChange)).not.toBe(
+      appearanceStyleBoundaryKey(darkTheme),
+    );
+    expect(appearanceStyleBoundaryKey(explicitGapChange)).not.toBe(
+      appearanceStyleBoundaryKey(darkTheme),
+    );
+    expect(appearanceStyleBoundaryKey(explicitGapChange)).not.toBe(
+      appearanceStyleBoundaryKey(zeroGapChange),
+    );
+  });
 });
 
 // This is a placement contract against the production JSX, not a simulated native mount.

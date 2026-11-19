@@ -2744,6 +2744,12 @@ export const ru: TranslationResources = {
         contentSize: "Размер содержимого",
         contentSizeHint: "Используется для текста чата и отображаемого Markdown",
         contentSizeAccessibility: "Размер шрифта содержимого",
+        contentLineHeight: "Межстрочный интервал содержимого",
+        contentLineHeightHint: "Множитель высоты строки для текста чата и отображаемого Markdown",
+        contentLineHeightAccessibility: "Множитель межстрочного интервала содержимого",
+        contentLetterSpacing: "Межбуквенный интервал",
+        contentLetterSpacingHint: "Горизонтальный интервал между символами в чате и Markdown",
+        contentLetterSpacingAccessibility: "Межбуквенный интервал содержимого",
         codeFont: "Шрифт кода",
         codeFontHint:
           "Используется для кода, диффов и вывода терминала. Оставьте поле пустым, чтобы использовать системный шрифт.",
@@ -2759,6 +2765,11 @@ export const ru: TranslationResources = {
         contentWidthAccessibility: "Ширина содержимого в пикселях",
         reset: "Сбросить",
         resetAccessibility: "Сбросить ширину содержимого",
+        paragraphSpacing: "Интервал между абзацами",
+        paragraphSpacingHint: "Вертикальный отступ между абзацами, списками и блоками",
+        paragraphSpacingAccessibility: "Интервал между абзацами в пикселях",
+        resetParagraphSpacingAccessibility:
+          "Сбросить интервал между абзацами к значению по умолчанию",
       },
       syntax: {
         title: "Синтаксис",

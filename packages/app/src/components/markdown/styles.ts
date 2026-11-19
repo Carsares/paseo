@@ -5,6 +5,12 @@ import { isWeb } from "@/constants/platform";
 // iOS Safari needs the prefix to override the gesture host's selection suppression.
 const WEB_CONTAINER = { userSelect: "text", WebkitUserSelect: "text" } as const;
 
+interface MarkdownContainerStyle {
+  readonly userSelect: "text";
+  readonly WebkitUserSelect: "text";
+  readonly letterSpacing?: number;
+}
+
 export function createMarkdownStyles(
   theme: Theme,
   {
@@ -12,14 +18,24 @@ export function createMarkdownStyles(
     muted = false,
     blockGap,
   }: { compact?: boolean; muted?: boolean; blockGap: number },
-): { markdownStyle: MarkdownStyle; selectionColor: string; containerStyle?: typeof WEB_CONTAINER } {
+): {
+  markdownStyle: MarkdownStyle;
+  selectionColor: string;
+  containerStyle?: MarkdownContainerStyle;
+} {
   const fontSize = compact ? theme.fontSize.base : theme.fontSize.content;
+  const contentLineHeight = theme.lineHeight?.content ?? Math.round(theme.fontSize.content * 1.6);
+  const lineHeight = compact
+    ? Math.round(
+        fontSize * (theme.fontSize.content > 0 ? contentLineHeight / theme.fontSize.content : 1.6),
+      )
+    : contentLineHeight;
   // Every block is followed by the same gap; the library drops it after the last block.
   const block = { marginTop: 0, marginBottom: blockGap };
   const paragraph = {
     fontSize,
     fontFamily: theme.fontFamily.ui,
-    lineHeight: Math.round(fontSize * 1.4),
+    lineHeight,
     color: muted ? theme.colors.foregroundMuted : theme.colors.foreground,
     ...block,
   };
@@ -29,8 +45,14 @@ export function createMarkdownStyles(
     lineHeight: Math.round(fontSize * scale * 1.3),
     fontWeight: "bold",
   });
+  let containerStyle: MarkdownContainerStyle | undefined;
+  if (isWeb) {
+    containerStyle = theme.contentLetterSpacing
+      ? { ...WEB_CONTAINER, letterSpacing: theme.contentLetterSpacing }
+      : WEB_CONTAINER;
+  }
   return {
-    containerStyle: isWeb ? WEB_CONTAINER : undefined,
+    containerStyle,
     selectionColor: theme.colors.terminal.selectionBackground,
     markdownStyle: {
       paragraph,
@@ -45,7 +67,7 @@ export function createMarkdownStyles(
         bulletColor: theme.colors.foregroundMuted,
         markerColor: theme.colors.foregroundMuted,
         gapWidth: 7,
-        itemSpacing: 4,
+        itemSpacing: Math.max(4, Math.round(blockGap * 0.5)),
         marginLeft: 20,
       },
       blockquote: {

@@ -2757,6 +2757,13 @@ export const es: TranslationResources = {
         contentSize: "Tamaño de contenido",
         contentSizeHint: "Se usa en el texto del chat y el Markdown renderizado",
         contentSizeAccessibility: "Tamaño de fuente de contenido",
+        contentLineHeight: "Interlineado del contenido",
+        contentLineHeightHint:
+          "Multiplicador de interlineado para el texto del chat y el Markdown renderizado",
+        contentLineHeightAccessibility: "Multiplicador de interlineado del contenido",
+        contentLetterSpacing: "Espaciado entre caracteres",
+        contentLetterSpacingHint: "Espaciado horizontal entre caracteres en el chat y en Markdown",
+        contentLetterSpacingAccessibility: "Espaciado entre caracteres del contenido",
         codeFont: "Fuente de código",
         codeFontHint:
           "Se utiliza en código, diferencias y salida del terminal. Déjelo vacío para el valor predeterminado del sistema.",
@@ -2772,6 +2779,11 @@ export const es: TranslationResources = {
         contentWidthAccessibility: "Ancho del contenido en píxeles",
         reset: "Restablecer",
         resetAccessibility: "Restablecer el ancho del contenido",
+        paragraphSpacing: "Espaciado entre párrafos",
+        paragraphSpacingHint: "Espacio vertical entre párrafos, listas y bloques",
+        paragraphSpacingAccessibility: "Espaciado entre párrafos en píxeles",
+        resetParagraphSpacingAccessibility:
+          "Restablecer el espaciado entre párrafos al valor predeterminado",
       },
       syntax: {
         title: "Sintaxis",

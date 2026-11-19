@@ -7,7 +7,11 @@ import type { HighlightToken } from "@getpaseo/highlight";
 import { isWeb } from "@/constants/platform";
 import { CODE_SURFACE_DATASET } from "@/styles/code-surface";
 import { syntaxTokenStyleFor } from "@/styles/syntax-token-styles";
-import { DEFAULT_MONO_FONT_STACK } from "@/styles/theme";
+import {
+  DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER,
+  DEFAULT_MONO_FONT_STACK,
+  FONT_SIZE,
+} from "@/styles/theme";
 import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import { tokenizeToLines } from "@/utils/highlight-cache";
 import { CHANGED_LINE_INDICES, PREVIEW_AFTER, PREVIEW_BEFORE } from "./preview-snippet";
@@ -28,6 +32,8 @@ type RowType = "context" | "add" | "remove";
 
 interface PreviewOverrides {
   contentFontSize?: number;
+  contentLineHeightMultiplier?: number;
+  contentLetterSpacing?: number;
   monoFontFamily?: string;
   codeFontSize?: number;
 }
@@ -66,9 +72,37 @@ function buildCodeOverride(overrides: PreviewOverrides | undefined): TextStyle {
 }
 
 function buildContentOverride(overrides: PreviewOverrides | undefined): TextStyle {
-  const fontSize = resolveSizeOverride(overrides?.contentFontSize);
-  if (fontSize === undefined) return {};
-  return inlineUnistylesStyle({ fontSize, lineHeight: Math.round(fontSize * 1.4) });
+  if (!overrides) return {};
+  const fontSize = resolveSizeOverride(overrides.contentFontSize);
+  const lineHeightMultiplier = resolveSizeOverride(overrides.contentLineHeightMultiplier);
+  const letterSpacing = resolveSizeOverride(overrides.contentLetterSpacing);
+  if (fontSize === undefined && lineHeightMultiplier === undefined && letterSpacing === undefined) {
+    return {};
+  }
+  const style: TextStyle = {};
+  if (fontSize !== undefined) {
+    style.fontSize = fontSize;
+  }
+  if (fontSize !== undefined || lineHeightMultiplier !== undefined) {
+    const baseFontSize =
+      typeof styles.contentSample.fontSize === "number" && styles.contentSample.fontSize > 0
+        ? styles.contentSample.fontSize
+        : FONT_SIZE.content;
+    const baseLineHeight =
+      typeof styles.contentSample.lineHeight === "number" && styles.contentSample.lineHeight > 0
+        ? styles.contentSample.lineHeight
+        : Math.round(baseFontSize * DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER);
+    const effectiveFontSize = fontSize ?? baseFontSize;
+    const effectiveMultiplier =
+      lineHeightMultiplier !== undefined && lineHeightMultiplier > 0
+        ? lineHeightMultiplier
+        : baseLineHeight / baseFontSize;
+    style.lineHeight = Math.round(effectiveFontSize * effectiveMultiplier);
+  }
+  if (letterSpacing !== undefined) {
+    style.letterSpacing = letterSpacing;
+  }
+  return inlineUnistylesStyle(style);
 }
 
 interface KeyedToken {
@@ -215,7 +249,8 @@ const styles = StyleSheet.create((theme) => ({
   contentSample: {
     color: theme.colors.foreground,
     fontSize: theme.fontSize.content,
-    lineHeight: Math.round(theme.fontSize.content * 1.4),
+    lineHeight: theme.lineHeight.content,
+    letterSpacing: theme.contentLetterSpacing,
     paddingHorizontal: theme.spacing[3],
     paddingBottom: theme.spacing[2],
   },
