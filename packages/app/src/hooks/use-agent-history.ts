@@ -3,7 +3,8 @@ import type {
   FetchAgentHistoryOptions,
   FetchAgentHistoryPageInfo,
 } from "@getpaseo/client/internal/daemon-client";
-import { keepPreviousData, useInfiniteQuery } from "@tanstack/react-query";
+import type { AgentHistorySearchScope } from "@getpaseo/protocol/messages";
+import { hashKey, keepPreviousData, useInfiniteQuery } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { useShallow } from "zustand/shallow";
@@ -13,14 +14,16 @@ import {
   useHostRuntimeConnectionStatuses,
   useHosts,
 } from "@/runtime/host-runtime";
+import {
+  DEFAULT_HISTORY_SORT,
+  resolveHistoryAgentTimestamp,
+  type HistorySortOption,
+} from "@/screens/sessions/history-grouping";
 import { useSessionStore } from "@/stores/session-store";
 import { buildAgentDirectoryState } from "@/utils/agent-directory-sync";
 import { agentHistoryQueryKey, allAgentHistoryQueryKey } from "./agent-history-query-key";
 
 const AGENT_HISTORY_PAGE_LIMIT = 200;
-const AGENT_HISTORY_SORT: NonNullable<FetchAgentHistoryOptions["sort"]> = [
-  { key: "updated_at", direction: "desc" },
-];
 const AGENT_HISTORY_ALL_HOSTS_FAILED_MESSAGE = "No connected hosts could load agent history";
 
 export type AgentHistoryArchiveScope = Exclude<
@@ -40,6 +43,8 @@ export interface AgentHistoryResult {
   /** False when any target host predates search; the screen hides the field. */
   isSearchSupported: boolean;
   isArchiveScopeSupported: boolean;
+  isQueryControlsSupported: boolean;
+  effectiveSort: HistorySortOption;
   /** More sessions matched than the ranked page holds. Narrow the query. */
   isSearchTruncated: boolean;
   /** The agents answer the previous query; the current one is loading (`keepPreviousResults`). */
@@ -87,18 +92,29 @@ interface AgentHistoryBatchPage {
 
 type AgentHistoryCursorByServerId = Record<string, string | null>;
 
-export async function fetchAgentHistoryPage(input: {
-  client: AgentHistoryClient;
-  serverId: string;
-  serverLabel?: string;
-  cursor: string | null;
+interface AgentHistoryControls {
   search?: string;
   archiveScope?: AgentHistoryArchiveScope;
-}): Promise<AgentHistoryPage> {
+  searchScope?: AgentHistorySearchScope;
+  sort?: HistorySortOption;
+}
+
+export async function fetchAgentHistoryPage(
+  input: {
+    client: AgentHistoryClient;
+    serverId: string;
+    serverLabel?: string;
+    cursor: string | null;
+    projectKeys?: readonly string[];
+  } & AgentHistoryControls,
+): Promise<AgentHistoryPage> {
+  const { field, direction } = input.sort ?? DEFAULT_HISTORY_SORT;
   const payload = await input.client.fetchAgentHistory({
     ...(input.search ? { search: input.search } : {}),
     ...(input.archiveScope ? { archiveScope: input.archiveScope } : {}),
-    sort: AGENT_HISTORY_SORT,
+    ...(input.searchScope ? { searchScope: input.searchScope } : {}),
+    ...(input.projectKeys?.length ? { filter: { projectKeys: [...input.projectKeys] } } : {}),
+    sort: [{ key: field, direction }],
     page: input.cursor
       ? { limit: AGENT_HISTORY_PAGE_LIMIT, cursor: input.cursor }
       : { limit: AGENT_HISTORY_PAGE_LIMIT },
@@ -156,8 +172,22 @@ function withCurrentServerLabel(agent: AggregatedAgent, labels: ReadonlyMap<stri
     : agent;
 }
 
-function sortByLatestActivity(agents: AggregatedAgent[]): AggregatedAgent[] {
-  return [...agents].sort((a, b) => b.lastActivityAt.getTime() - a.lastActivityAt.getTime());
+function sortHistoryAgents(agents: AggregatedAgent[], sort: HistorySortOption): AggregatedAgent[] {
+  const preservesLegacyOrder =
+    sort.field === DEFAULT_HISTORY_SORT.field && sort.direction === DEFAULT_HISTORY_SORT.direction;
+  return [...agents].sort((a, b) => {
+    const left = resolveHistoryAgentTimestamp(a, sort.field).getTime();
+    const right = resolveHistoryAgentTimestamp(b, sort.field).getTime();
+    if (Number.isNaN(left) !== Number.isNaN(right)) return Number.isNaN(left) ? 1 : -1;
+    const delta = sort.direction === "asc" ? left - right : right - left;
+    // Preserve daemon order for equal timestamps, including unscoped workspace search.
+    if (delta || preservesLegacyOrder) return delta;
+    const leftKey = `${a.serverId}:${a.id}`;
+    const rightKey = `${b.serverId}:${b.id}`;
+    return (
+      leftKey.localeCompare(rightKey) || (leftKey < rightKey ? -1 : Number(leftKey > rightKey))
+    );
+  });
 }
 
 /**
@@ -198,20 +228,26 @@ function getNextAgentHistoryPageParam(
   return Object.keys(cursorByServerId).length > 0 ? cursorByServerId : null;
 }
 
-export async function fetchAgentHistoryBatch(input: {
-  hosts: readonly AgentHistoryHost[];
-  cursorByServerId: AgentHistoryCursorByServerId | null;
-  search?: string;
-  archiveScope?: AgentHistoryArchiveScope;
-}): Promise<AgentHistoryBatchPage> {
+export async function fetchAgentHistoryBatch(
+  input: {
+    hosts: readonly AgentHistoryHost[];
+    cursorByServerId: AgentHistoryCursorByServerId | null;
+    projectKeysByServer?: ReadonlyMap<string, readonly string[]> | null;
+  } & AgentHistoryControls,
+): Promise<AgentHistoryBatchPage> {
   const cursorByServerId = input.cursorByServerId ?? {};
   const hasCursorFilter = Object.keys(cursorByServerId).length > 0;
-  const hostsToFetch = hasCursorFilter
-    ? input.hosts.filter((host) => Object.hasOwn(cursorByServerId, host.serverId))
-    : input.hosts;
+  const hostsToFetch = input.hosts.flatMap((host) => {
+    if (hasCursorFilter && !Object.hasOwn(cursorByServerId, host.serverId)) return [];
+    const projectKeys = input.projectKeysByServer?.get(host.serverId)?.filter((key) => key.trim());
+    return input.projectKeysByServer && !projectKeys?.length ? [] : [{ host, projectKeys }];
+  });
+  if (input.projectKeysByServer && hostsToFetch.length === 0) {
+    return { agents: [], ancestors: [], pageInfoByServerId: {}, hostErrors: [] };
+  }
 
   const settledPages = await Promise.allSettled(
-    hostsToFetch.map(async (host) => {
+    hostsToFetch.map(async ({ host, projectKeys }) => {
       const page = await fetchAgentHistoryPage({
         client: host.client,
         serverId: host.serverId,
@@ -219,6 +255,9 @@ export async function fetchAgentHistoryBatch(input: {
         cursor: cursorByServerId[host.serverId] ?? null,
         search: input.search,
         archiveScope: input.archiveScope,
+        searchScope: input.searchScope,
+        sort: input.sort,
+        projectKeys,
       });
       return { host, page };
     }),
@@ -235,8 +274,8 @@ export async function fetchAgentHistoryBatch(input: {
     result.status === "rejected"
       ? [
           {
-            serverId: hostsToFetch[index].serverId,
-            serverName: hostsToFetch[index].serverLabel,
+            serverId: hostsToFetch[index].host.serverId,
+            serverName: hostsToFetch[index].host.serverLabel,
           },
         ]
       : [],
@@ -247,7 +286,7 @@ export async function fetchAgentHistoryBatch(input: {
     pages.map(({ host, page }) => [host.serverId, page.pageInfo]),
   );
   return {
-    agents: sortByLatestActivity(agents),
+    agents: sortHistoryAgents(agents, input.sort ?? DEFAULT_HISTORY_SORT),
     ancestors: collectAgentHistoryAncestors(pages.map(({ page }) => page)),
     pageInfoByServerId,
     hostErrors,
@@ -257,19 +296,45 @@ export async function fetchAgentHistoryBatch(input: {
   };
 }
 
-export function useAgentHistory(options: {
-  serverId?: string | null;
-  enabled?: boolean;
-  search?: string;
-  archiveScope?: AgentHistoryArchiveScope;
-  /**
-   * Leave out hosts that predate search, instead of searching no host. For a surface that adds
-   * history matches to other results, where a missing host is not a claim of "no matches".
-   */
-  searchableHostsOnly?: boolean;
-  /** Keep the previous query's results until the next query's arrive. */
-  keepPreviousResults?: boolean;
-}): AgentHistoryResult {
+function buildAgentHistoryQueryOptions(input: {
+  archiveScope: AgentHistoryArchiveScope | undefined;
+  searchScope: AgentHistorySearchScope | undefined;
+  sort: HistorySortOption;
+  projectKeysByServer: ReadonlyMap<string, readonly string[]> | null;
+}) {
+  const { archiveScope, searchScope, sort, projectKeysByServer } = input;
+  const isNonDefaultSort =
+    sort.field !== DEFAULT_HISTORY_SORT.field || sort.direction !== DEFAULT_HISTORY_SORT.direction;
+  return {
+    ...(archiveScope ? { archiveScope } : {}),
+    ...(searchScope ? { searchScope } : {}),
+    ...(isNonDefaultSort ? { sort: `${sort.field}:${sort.direction}` } : {}),
+    ...(projectKeysByServer ? { projectKeys: [...projectKeysByServer] } : {}),
+  };
+}
+
+function resolveAgentHistorySearchScope(
+  search: string,
+  supported: boolean,
+  scope: AgentHistorySearchScope | undefined,
+): AgentHistorySearchScope | undefined {
+  return search && supported && scope !== "all" ? scope : undefined;
+}
+
+export function useAgentHistory(
+  options: {
+    serverId?: string | null;
+    enabled?: boolean;
+    projectKeysByServer?: ReadonlyMap<string, readonly string[]> | null;
+    /**
+     * Leave out hosts that predate search, instead of searching no host. For a surface that adds
+     * history matches to other results, where a missing host is not a claim of "no matches".
+     */
+    searchableHostsOnly?: boolean;
+    /** Keep the previous query's results until the next query's arrive. */
+    keepPreviousResults?: boolean;
+  } & AgentHistoryControls,
+): AgentHistoryResult {
   const { t } = useTranslation();
   const daemons = useHosts();
   const runtime = getHostRuntimeStore();
@@ -337,19 +402,58 @@ export function useAgentHistory(options: {
       [targetServerIds],
     ),
   );
+  // COMPAT(agentHistoryQueryControls): added in v0.16.0, remove gate after 2027-05-19.
+  const isQueryControlsSupported = useSessionStore(
+    useCallback(
+      (state) =>
+        targetServerIds.length > 0 &&
+        targetServerIds.every(
+          (id) => state.sessions[id]?.serverInfo?.features?.agentHistoryQueryControls === true,
+        ),
+      [targetServerIds],
+    ),
+  );
   const effectiveArchiveScope = isArchiveScopeSupported ? options.archiveScope : undefined;
   const search = useMemo(() => {
     const trimmed = options.search?.trim() ?? "";
     return isSearchSupported ? trimmed : "";
   }, [isSearchSupported, options.search]);
-  const queryKey = useMemo(
-    () => [
-      ...(serverId ? agentHistoryQueryKey(serverId) : allAgentHistoryQueryKey(targetServerIds)),
-      search,
-      ...(effectiveArchiveScope ? [{ archiveScope: effectiveArchiveScope }] : []),
-    ],
-    [effectiveArchiveScope, search, serverId, targetServerIds],
+  const effectiveSearchScope = resolveAgentHistorySearchScope(
+    search,
+    isQueryControlsSupported,
+    options.searchScope,
   );
+  const requestedSort = options.sort ?? DEFAULT_HISTORY_SORT;
+  const sortDirection = requestedSort.direction;
+  const sortField =
+    requestedSort.field === "archived_at" &&
+    (!isQueryControlsSupported || effectiveArchiveScope !== "archived")
+      ? "updated_at"
+      : requestedSort.field;
+  const effectiveSort = useMemo<HistorySortOption>(
+    () => ({ field: sortField, direction: sortDirection }),
+    [sortField, sortDirection],
+  );
+  const projectKeysByServer = useMemo(() => {
+    if (options.projectKeysByServer == null) return null;
+    const normalized = new Map<string, string[]>();
+    for (const id of [...options.projectKeysByServer.keys()].sort()) {
+      const keys = [...new Set(options.projectKeysByServer.get(id)?.filter((key) => key.trim()))];
+      if (keys.length > 0) normalized.set(id, keys.sort());
+    }
+    return normalized;
+  }, [options.projectKeysByServer]);
+  const queryOptions = buildAgentHistoryQueryOptions({
+    archiveScope: effectiveArchiveScope,
+    searchScope: effectiveSearchScope,
+    sort: effectiveSort,
+    projectKeysByServer,
+  });
+  const queryKey = [
+    ...(serverId ? agentHistoryQueryKey(serverId) : allAgentHistoryQueryKey(targetServerIds)),
+    search,
+    ...(Object.keys(queryOptions).length > 0 ? [queryOptions] : []),
+  ];
   const serverLabelById = useMemo(
     () => new Map(daemons.map((daemon) => [daemon.serverId, daemon.label])),
     [daemons],
@@ -372,13 +476,9 @@ export function useAgentHistory(options: {
       ? {
           placeholderData: (previousData, previousQuery) => {
             const previousSuffix = previousQuery?.queryKey.at(-1);
-            const previousScope =
-              previousSuffix &&
-              typeof previousSuffix === "object" &&
-              "archiveScope" in previousSuffix
-                ? previousSuffix.archiveScope
-                : undefined;
-            return previousScope === effectiveArchiveScope
+            const previousOptions =
+              previousSuffix && typeof previousSuffix === "object" ? previousSuffix : {};
+            return hashKey([previousOptions]) === hashKey([queryOptions])
               ? keepPreviousData(previousData)
               : undefined;
           },
@@ -395,6 +495,9 @@ export function useAgentHistory(options: {
         cursorByServerId: pageParam,
         search,
         archiveScope: effectiveArchiveScope,
+        searchScope: effectiveSearchScope,
+        sort: effectiveSort,
+        projectKeysByServer,
       });
     },
   });
@@ -441,16 +544,22 @@ export function useAgentHistory(options: {
       ...pages,
     ]);
     return {
-      agents: sortByLatestActivity(matched),
+      agents: sortHistoryAgents(matched, effectiveSort),
       ancestors: parentContext.map((agent) => withCurrentServerLabel(agent, serverLabelById)),
     };
-  }, [data?.pages, effectiveArchiveScope, serverLabelById]);
+  }, [data?.pages, effectiveArchiveScope, effectiveSort, serverLabelById]);
   const isInitialLoad = isLoading && agents.length === 0;
   const isRevalidating = isFetching && !isFetchingNextPage && agents.length > 0;
   const isSearchTruncated = Boolean(search && data?.pages.some((page) => page.isSearchTruncated));
   const hostErrors = useMemo(
-    () => collectAgentHistoryHostErrors({ pages: data?.pages ?? [], unreachableHosts }),
-    [data?.pages, unreachableHosts],
+    () =>
+      collectAgentHistoryHostErrors({
+        pages: data?.pages ?? [],
+        unreachableHosts: projectKeysByServer
+          ? unreachableHosts.filter((host) => projectKeysByServer.has(host.serverId))
+          : unreachableHosts,
+      }),
+    [data?.pages, projectKeysByServer, unreachableHosts],
   );
 
   return {
@@ -464,6 +573,8 @@ export function useAgentHistory(options: {
     isLoadingMore: isFetchingNextPage,
     isSearchSupported,
     isArchiveScopeSupported,
+    isQueryControlsSupported,
+    effectiveSort,
     isSearchTruncated,
     isPreviousResults: isPlaceholderData,
     hostErrors,

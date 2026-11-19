@@ -2044,6 +2044,8 @@ export class VoiceAssistantWebSocketServer {
         backgroundAgents: true,
         // COMPAT(agentHistoryArchiveScope): added in v0.16.0, remove gate after 2027-05-19.
         agentHistoryArchiveScope: true,
+        // COMPAT(agentHistoryQueryControls): added in v0.16.0, remove gate after 2027-05-19.
+        agentHistoryQueryControls: true,
         workspaceBaseBranch: true,
         // COMPAT(directorySync): added in v0.3.x, remove gate after 2027-02-12.
         directorySync: true,

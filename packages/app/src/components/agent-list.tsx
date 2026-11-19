@@ -11,6 +11,7 @@ import { useCallback, useMemo, useState, type ReactElement } from "react";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
 import { ChevronDown, ChevronRight } from "lucide-react-native";
+import type { AgentHistorySearchScope } from "@getpaseo/protocol/messages";
 import { ArchivedBadge } from "@/components/archived-badge";
 import { ProjectIconView } from "@/components/project-icon-view";
 import { useProviderIcon, type ProviderIconProps } from "@/components/provider-icons";
@@ -25,9 +26,13 @@ import { useArchiveAgent } from "@/hooks/use-archive-agent";
 import { useTimeAgo } from "@/hooks/use-time-ago";
 import {
   buildHistoryProjectGroups,
+  DEFAULT_HISTORY_SORT,
   flattenHistoryProjectGroups,
+  resolveHistoryAgentTimestamp,
   type HistoryFlatListItem,
+  type HistoryGroupMode,
   type HistoryProjectGroup,
+  type HistorySortOption,
   type HistoryWorkspaceGroup,
 } from "@/screens/sessions/history-grouping";
 import { useSessionStore } from "@/stores/session-store";
@@ -45,10 +50,29 @@ interface AgentListProps {
   listFooterComponent?: ReactElement | null;
   showHostColumn?: boolean;
   search?: string;
+  searchScope?: AgentHistorySearchScope;
+  sort?: HistorySortOption;
+  groupMode?: HistoryGroupMode;
+  groups?: readonly HistoryProjectGroup[];
+  groupExpansion?: HistoryGroupExpansion & {
+    onToggleProject: GroupToggle;
+    onToggleWorkspace: GroupToggle;
+  };
+}
+
+type GroupToggle = (key: string, expanded: boolean) => void;
+
+export interface HistoryGroupExpansion {
+  projectExpandedOverrides: ReadonlyMap<string, boolean>;
+  workspaceExpandedOverrides: ReadonlyMap<string, boolean>;
 }
 
 const HISTORY_MATCH_OPTIONS = { typoTolerant: true } as const;
 const EMPTY_EXPANDED_OVERRIDES: ReadonlyMap<string, boolean> = new Map();
+export const DEFAULT_HISTORY_GROUP_EXPANSION: HistoryGroupExpansion = {
+  projectExpandedOverrides: EMPTY_EXPANDED_OVERRIDES,
+  workspaceExpandedOverrides: EMPTY_EXPANDED_OVERRIDES,
+};
 const ThemedRefreshControl = withUnistyles(RefreshControl);
 const ThemedChevronRight = withUnistyles(ChevronRight);
 const ThemedChevronDown = withUnistyles(ChevronDown);
@@ -72,79 +96,208 @@ function SessionProviderIcon({
 
 const ThemedSessionProviderIcon = withUnistyles(SessionProviderIcon);
 
-function ProjectHeading({ project, search }: { project: HistoryProjectGroup; search: string }) {
+function projectHeadingStyle({ hovered }: PressableStateCallbackType & { hovered?: boolean }) {
+  return [styles.projectHeading, hovered && styles.rowHovered];
+}
+
+function ProjectHeading({
+  project,
+  search,
+  expanded,
+  onToggle,
+}: {
+  project: HistoryProjectGroup;
+  search: string;
+  expanded: boolean;
+  onToggle: GroupToggle;
+}) {
+  const { t } = useTranslation();
   const { projectName } = project;
   const initial = projectName.trim().charAt(0).toUpperCase() || "?";
+  const count = project.workspaces.length;
+  const Chevron = expanded ? ThemedChevronDown : ThemedChevronRight;
+  const onPress = useCallback(
+    () => onToggle(project.key, !expanded),
+    [onToggle, project.key, expanded],
+  );
+  const accessibilityState = useMemo(() => ({ expanded }), [expanded]);
   return (
-    <View
-      style={styles.projectHeading}
-      accessibilityRole="header"
+    <PressHighlight
+      style={projectHeadingStyle}
+      highlightStyle={styles.rowPressed}
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityState={accessibilityState}
+      aria-expanded={expanded}
+      accessibilityLabel={t(
+        expanded
+          ? "agentList.groups.collapseProjectAccessibility"
+          : "agentList.groups.expandProjectAccessibility",
+        { name: projectName },
+      )}
       testID={`history-project-header-${project.key}`}
     >
-      <ProjectIconView
-        size={18}
-        iconDataUri={null}
-        initial={initial}
-        projectViewKey={project.key}
-        textStyle={styles.projectIconText}
+      <View style={styles.headingLeading}>
+        <Chevron uniProps={chevronProps} />
+        <ProjectIconView
+          size={18}
+          iconDataUri={null}
+          initial={initial}
+          projectViewKey={project.key}
+          textStyle={styles.projectIconText}
+        />
+        <HighlightedText
+          text={projectName}
+          ranges={findHighlightRanges(search, projectName, HISTORY_MATCH_OPTIONS)}
+          style={styles.projectTitle}
+          numberOfLines={1}
+          testID={`history-project-name-${project.key}`}
+        />
+      </View>
+      <GroupMetadata
+        countLabel={t(
+          count === 1 ? "agentList.groups.workspacesOne" : "agentList.groups.workspacesMany",
+          { count },
+        )}
+        date={project.sortTimestamp}
       />
-      <HighlightedText
-        text={projectName}
-        ranges={findHighlightRanges(search, projectName, HISTORY_MATCH_OPTIONS)}
-        style={styles.projectTitle}
-        numberOfLines={1}
-        testID={`history-project-name-${project.key}`}
-      />
-    </View>
+    </PressHighlight>
   );
 }
 
 function WorkspaceHeading({
+  project,
   workspace,
   search,
+  projectSearch,
   showHost,
+  showProjectBadge,
+  expanded,
+  onToggle,
 }: {
+  project: HistoryProjectGroup;
   workspace: HistoryWorkspaceGroup;
   search: string;
+  projectSearch: string;
   showHost: boolean;
+  showProjectBadge: boolean;
+  expanded: boolean;
+  onToggle: GroupToggle;
 }) {
+  const { t } = useTranslation();
   const { workspaceName, branch, serverLabel, isWorkspaceArchived } = workspace;
   const hostLabel = showHost ? serverLabel : "";
+  const count = workspace.rootAgents.reduce(
+    (total, node) => total + node.subagents.length + (node.isAncestorShell ? 0 : 1),
+    0,
+  );
+  const Chevron = expanded ? ThemedChevronDown : ThemedChevronRight;
+  const onPress = useCallback(
+    () => onToggle(workspace.key, !expanded),
+    [onToggle, workspace.key, expanded],
+  );
+  const accessibilityState = useMemo(() => ({ expanded }), [expanded]);
+  const headingStyle = useCallback(
+    ({ hovered }: PressableStateCallbackType & { hovered?: boolean }) => [
+      styles.workspaceHeading,
+      !showProjectBadge && styles.projectWorkspaceHeading,
+      hovered && styles.rowHovered,
+    ],
+    [showProjectBadge],
+  );
   return (
-    <View
-      style={styles.workspaceHeading}
-      accessibilityRole="header"
+    <PressHighlight
+      style={headingStyle}
+      highlightStyle={styles.rowPressed}
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityState={accessibilityState}
+      aria-expanded={expanded}
+      accessibilityLabel={t(
+        expanded
+          ? "agentList.groups.collapseWorkspaceAccessibility"
+          : "agentList.groups.expandWorkspaceAccessibility",
+        { name: workspaceName },
+      )}
       testID={`history-workspace-header-${workspace.key}`}
     >
-      <View style={[styles.workspaceHeadingRow, styles.workspaceNameRow]}>
-        <HighlightedText
-          text={workspaceName}
-          ranges={findHighlightRanges(search, workspaceName, HISTORY_MATCH_OPTIONS)}
-          style={styles.workspaceTitle}
-          numberOfLines={1}
-          testID={`history-workspace-name-${workspace.key}`}
-        />
-        {isWorkspaceArchived ? <ArchivedBadge /> : null}
-      </View>
-      {branch || hostLabel ? (
-        <View style={styles.workspaceHeadingRow}>
-          {branch ? (
+      <View style={styles.headingLeading}>
+        <Chevron uniProps={chevronProps} />
+        <View style={styles.workspaceContent}>
+          <View style={[styles.workspaceHeadingRow, styles.workspaceNameRow]}>
             <HighlightedText
-              text={branch}
-              ranges={findHighlightRanges(search, branch, HISTORY_MATCH_OPTIONS)}
-              style={styles.workspaceMeta}
+              text={workspaceName}
+              ranges={findHighlightRanges(search, workspaceName, HISTORY_MATCH_OPTIONS)}
+              style={styles.workspaceTitle}
               numberOfLines={1}
-              testID={`history-workspace-branch-${workspace.key}`}
+              testID={`history-workspace-name-${workspace.key}`}
             />
-          ) : null}
-          {branch && hostLabel ? <Text style={styles.workspaceMeta}>·</Text> : null}
-          {hostLabel ? (
-            <Text style={styles.workspaceMeta} numberOfLines={1}>
-              {hostLabel}
-            </Text>
+            {isWorkspaceArchived ? <ArchivedBadge /> : null}
+          </View>
+          {showProjectBadge || branch || hostLabel ? (
+            <View style={styles.workspaceHeadingRow}>
+              {showProjectBadge ? (
+                <>
+                  <ProjectIconView
+                    size={16}
+                    iconDataUri={null}
+                    initial={project.projectName.trim().charAt(0).toUpperCase() || "?"}
+                    projectViewKey={project.key}
+                    textStyle={styles.projectIconText}
+                  />
+                  <HighlightedText
+                    text={project.projectName}
+                    ranges={findHighlightRanges(
+                      projectSearch,
+                      project.projectName,
+                      HISTORY_MATCH_OPTIONS,
+                    )}
+                    style={styles.workspaceMeta}
+                    numberOfLines={1}
+                    testID={`history-workspace-project-${workspace.key}`}
+                  />
+                </>
+              ) : null}
+              {showProjectBadge && (branch || hostLabel) ? (
+                <Text style={styles.workspaceMeta}>·</Text>
+              ) : null}
+              {branch ? (
+                <HighlightedText
+                  text={branch}
+                  ranges={findHighlightRanges(search, branch, HISTORY_MATCH_OPTIONS)}
+                  style={styles.workspaceMeta}
+                  numberOfLines={1}
+                  testID={`history-workspace-branch-${workspace.key}`}
+                />
+              ) : null}
+              {branch && hostLabel ? <Text style={styles.workspaceMeta}>·</Text> : null}
+              {hostLabel ? (
+                <Text style={styles.workspaceMeta} numberOfLines={1}>
+                  {hostLabel}
+                </Text>
+              ) : null}
+            </View>
           ) : null}
         </View>
-      ) : null}
+      </View>
+      <GroupMetadata
+        countLabel={t(
+          count === 1 ? "agentList.groups.sessionsOne" : "agentList.groups.sessionsMany",
+          { count },
+        )}
+        date={workspace.sortTimestamp}
+      />
+    </PressHighlight>
+  );
+}
+
+function GroupMetadata({ countLabel, date }: { countLabel: string; date: Date }) {
+  return (
+    <View style={styles.groupMetadata}>
+      <Text style={styles.activityTime} numberOfLines={1}>
+        {countLabel}
+      </Text>
+      <AgentActivityTime date={date} />
     </View>
   );
 }
@@ -158,12 +311,14 @@ function sessionNavigationStyle({ hovered }: PressableStateCallbackType & { hove
 function SessionRow({
   item,
   search,
+  sort,
   onPress,
   onLongPress,
   onToggle,
 }: {
   item: SessionListItem;
   search: string;
+  sort: HistorySortOption;
   onPress: (agent: AggregatedAgent) => void;
   onLongPress: (agent: AggregatedAgent) => void;
   onToggle: (key: string, expanded: boolean) => void;
@@ -207,7 +362,7 @@ function SessionRow({
               variant="warning"
             />
           ) : null}
-          <AgentActivityTime date={agent.lastActivityAt} />
+          <AgentActivityTime date={resolveHistoryAgentTimestamp(agent, sort.field)} />
         </View>
       </PressHighlight>
       {isRoot && item.node.subagents.length > 0 ? (
@@ -289,20 +444,27 @@ export function AgentList({
   listFooterComponent,
   showHostColumn = false,
   search = "",
+  searchScope = "all",
+  sort = DEFAULT_HISTORY_SORT,
+  groupMode = "project",
+  groups: suppliedGroups,
+  groupExpansion,
 }: AgentListProps) {
   const { t } = useTranslation();
   const insets = useSafeAreaInsets();
   const [actionAgent, setActionAgent] = useState<AggregatedAgent | null>(null);
-  const [expansion, setExpansion] = useState({
-    archiveScope,
-    search,
-    overrides: EMPTY_EXPANDED_OVERRIDES,
-  });
-  const isCurrentExpansion = expansion.archiveScope === archiveScope && expansion.search === search;
-  if (!isCurrentExpansion) {
-    setExpansion({ archiveScope, search, overrides: EMPTY_EXPANDED_OVERRIDES });
+  const expansionKey = JSON.stringify([archiveScope, search, searchScope, groupMode]);
+  const initialExpansion = {
+    key: expansionKey,
+    subagents: EMPTY_EXPANDED_OVERRIDES,
+    ...DEFAULT_HISTORY_GROUP_EXPANSION,
+  };
+  const [expansion, setExpansion] = useState(initialExpansion);
+  if (expansion.key !== expansionKey) {
+    setExpansion(initialExpansion);
   }
-  const expandedOverrides = isCurrentExpansion ? expansion.overrides : EMPTY_EXPANDED_OVERRIDES;
+  const localExpansion = expansion.key === expansionKey ? expansion : initialExpansion;
+  const { projectExpandedOverrides, workspaceExpandedOverrides } = groupExpansion ?? localExpansion;
   const { archiveAgent } = useArchiveAgent();
 
   const actionClient = useSessionStore((state) =>
@@ -346,50 +508,113 @@ export function AgentList({
     setActionAgent(null);
   }, [actionAgent, actionClient, archiveAgent]);
 
-  const handleToggle = useCallback((key: string, expanded: boolean) => {
-    setExpansion((current) => {
-      const overrides = new Map(current.overrides);
-      overrides.set(key, expanded);
-      return { ...current, overrides };
-    });
-  }, []);
+  const toggleLocalExpansion = useCallback(
+    (group: "subagents" | keyof HistoryGroupExpansion, key: string, expanded: boolean) => {
+      setExpansion((current) => {
+        const overrides = new Map(current[group]);
+        overrides.set(key, expanded);
+        return { ...current, [group]: overrides };
+      });
+    },
+    [],
+  );
+  const toggleSubagents = useCallback<GroupToggle>(
+    (key, expanded) => toggleLocalExpansion("subagents", key, expanded),
+    [toggleLocalExpansion],
+  );
+  const toggleLocalProject = useCallback<GroupToggle>(
+    (key, expanded) => toggleLocalExpansion("projectExpandedOverrides", key, expanded),
+    [toggleLocalExpansion],
+  );
+  const toggleLocalWorkspace = useCallback<GroupToggle>(
+    (key, expanded) => toggleLocalExpansion("workspaceExpandedOverrides", key, expanded),
+    [toggleLocalExpansion],
+  );
+  const toggleProject = groupExpansion?.onToggleProject ?? toggleLocalProject;
+  const toggleWorkspace = groupExpansion?.onToggleWorkspace ?? toggleLocalWorkspace;
 
   const groups = useMemo(
     () =>
-      buildHistoryProjectGroups({ entries: agents, ancestors, activeWorkspaceIdsByServer, search }),
-    [agents, ancestors, activeWorkspaceIdsByServer, search],
+      suppliedGroups ??
+      buildHistoryProjectGroups({
+        entries: agents,
+        ancestors,
+        activeWorkspaceIdsByServer,
+        search,
+        sort,
+      }),
+    [suppliedGroups, agents, ancestors, activeWorkspaceIdsByServer, search, sort],
   );
   const flatItems = useMemo(
     () =>
       flattenHistoryProjectGroups({
         groups,
         isSearching: search.length > 0,
-        expandedOverrides,
+        expandedOverrides: localExpansion.subagents,
+        projectExpandedOverrides,
+        workspaceExpandedOverrides,
+        groupMode,
+        sort,
       }),
-    [groups, search, expandedOverrides],
+    [
+      groups,
+      search,
+      localExpansion.subagents,
+      projectExpandedOverrides,
+      workspaceExpandedOverrides,
+      groupMode,
+      sort,
+    ],
   );
 
   const renderItem: ListRenderItem<HistoryFlatListItem> = useCallback(
     ({ item }) => {
       if (item.type === "project-header") {
-        return <ProjectHeading project={item.project} search={search} />;
+        return (
+          <ProjectHeading
+            project={item.project}
+            search={searchScope === "all" ? search : ""}
+            expanded={item.expanded}
+            onToggle={toggleProject}
+          />
+        );
       }
       if (item.type === "workspace-header") {
         return (
-          <WorkspaceHeading workspace={item.workspace} search={search} showHost={showHostColumn} />
+          <WorkspaceHeading
+            project={item.project}
+            workspace={item.workspace}
+            search={searchScope === "agent" ? "" : search}
+            projectSearch={searchScope === "all" ? search : ""}
+            showHost={showHostColumn}
+            showProjectBadge={item.showProjectBadge}
+            expanded={item.expanded}
+            onToggle={toggleWorkspace}
+          />
         );
       }
       return (
         <SessionRow
           item={item}
-          search={search}
+          search={searchScope === "workspace" ? "" : search}
+          sort={sort}
           onPress={handleAgentPress}
           onLongPress={handleAgentLongPress}
-          onToggle={handleToggle}
+          onToggle={toggleSubagents}
         />
       );
     },
-    [search, showHostColumn, handleAgentPress, handleAgentLongPress, handleToggle],
+    [
+      search,
+      searchScope,
+      sort,
+      showHostColumn,
+      handleAgentPress,
+      handleAgentLongPress,
+      toggleProject,
+      toggleWorkspace,
+      toggleSubagents,
+    ],
   );
 
   const refreshControl = useMemo(
@@ -476,8 +701,11 @@ const styles = StyleSheet.create((theme) => ({
   projectHeading: {
     flexDirection: "row",
     alignItems: "center",
-    gap: theme.spacing[2],
+    justifyContent: "space-between",
+    gap: theme.spacing[3],
+    minHeight: density.rowHeight,
     paddingHorizontal: theme.spacing[2],
+    borderRadius: theme.borderRadius.lg,
     marginTop: theme.spacing[3],
     marginBottom: theme.spacing[2],
   },
@@ -492,10 +720,29 @@ const styles = StyleSheet.create((theme) => ({
     color: theme.colors.foreground,
   },
   workspaceHeading: {
-    gap: theme.spacing[1],
-    marginStart: theme.spacing[3],
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: theme.spacing[3],
+    minHeight: density.rowHeight,
     paddingHorizontal: theme.spacing[2],
     paddingVertical: theme.spacing[2],
+    borderRadius: theme.borderRadius.lg,
+  },
+  projectWorkspaceHeading: {
+    marginStart: theme.spacing[3],
+  },
+  headingLeading: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+    flex: 1,
+    minWidth: 0,
+  },
+  workspaceContent: {
+    flex: 1,
+    minWidth: 0,
+    gap: theme.spacing[1],
   },
   workspaceHeadingRow: {
     flexDirection: "row",
@@ -515,6 +762,13 @@ const styles = StyleSheet.create((theme) => ({
     flexShrink: 1,
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.sm,
+  },
+  groupMetadata: {
+    flexDirection: { xs: "column", md: "row" },
+    alignItems: { xs: "flex-end", md: "center" },
+    gap: { xs: theme.spacing[0.5], md: theme.spacing[2] },
+    flexShrink: 1,
+    maxWidth: { xs: "42%", md: "50%" },
   },
   sessionRow: {
     flexDirection: "row",

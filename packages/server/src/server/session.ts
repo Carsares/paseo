@@ -394,6 +394,7 @@ function beginAgentDeleteIfSupported(agentStorage: AgentStorage, agentId: string
 }
 
 const FETCH_AGENTS_SORT_KEYS = ["status_priority", "created_at", "updated_at", "title"] as const;
+const FETCH_AGENT_HISTORY_SORT_KEYS = [...FETCH_AGENTS_SORT_KEYS, "archived_at"] as const;
 
 export function resolveWaitForFinishError(options: {
   status: "permission" | "error" | "idle";
@@ -433,6 +434,8 @@ function agentDirectorySearchQuery(request: AgentDirectoryRequestMessage): strin
 }
 type FetchAgentsRequestFilter = NonNullable<FetchAgentsRequestMessage["filter"]>;
 type FetchAgentsRequestSort = NonNullable<FetchAgentsRequestMessage["sort"]>[number];
+type AgentHistorySearchScope = NonNullable<FetchAgentHistoryRequestMessage["searchScope"]>;
+type AgentHistorySortKey = NonNullable<FetchAgentHistoryRequestMessage["sort"]>[number]["key"];
 type FetchAgentsResponsePayload = Extract<
   SessionOutboundMessage,
   { type: "fetch_agents_response" }
@@ -6251,8 +6254,9 @@ export class Session {
     filter: AgentUpdatesFilter | undefined;
     archiveScope: AgentHistoryArchiveScope;
     search?: string;
+    searchScope?: AgentHistorySearchScope;
   }): Promise<FetchAgentsResponseEntry[]> {
-    const { candidates, limit, getPlacement, filter, archiveScope, search } = params;
+    const { candidates, limit, getPlacement, filter, archiveScope, search, searchScope } = params;
     const matchedEntries: FetchAgentsResponseEntry[] = [];
     const batchSize = 25;
     for (
@@ -6285,7 +6289,7 @@ export class Session {
         ) {
           continue;
         }
-        if (search && !matchesAgentHistoryQuery(search, entry)) continue;
+        if (search && !matchesAgentHistoryQuery(search, entry, searchScope ?? "all")) continue;
         matchedEntries.push(entry);
         if (matchedEntries.length > limit) {
           break;
@@ -6369,6 +6373,36 @@ export class Session {
   private async listFetchAgentsEntries(
     request: AgentDirectoryRequestMessage,
     backgroundVisibility: BackgroundVisibility,
+  ) {
+    if (request.type === "fetch_agent_history_request") {
+      const workspaceArchivedAtByWorkspaceId = new Map<string, string>();
+      if (request.sort?.some(({ key }) => key === "archived_at")) {
+        for (const workspace of await this.workspaceRegistry.listAll()) {
+          if (workspace.archivedAt) {
+            workspaceArchivedAtByWorkspaceId.set(workspace.workspaceId, workspace.archivedAt);
+          }
+        }
+      }
+      return this.pageFetchAgentsEntries(
+        request,
+        backgroundVisibility,
+        this.createAgentHistoryPager(workspaceArchivedAtByWorkspaceId),
+        request.sort,
+      );
+    }
+    return this.pageFetchAgentsEntries(
+      request,
+      backgroundVisibility,
+      this.agentsPager,
+      request.sort,
+    );
+  }
+
+  private async pageFetchAgentsEntries<K extends AgentHistorySortKey>(
+    request: AgentDirectoryRequestMessage,
+    backgroundVisibility: BackgroundVisibility,
+    pager: SortablePager<AgentSnapshotPayload, K>,
+    requestedSort: SortSpec<K>[] | undefined,
   ): Promise<{
     entries: FetchAgentsResponseEntry[];
     ancestors?: FetchAgentsResponseEntry[];
@@ -6378,7 +6412,7 @@ export class Session {
     const { archiveScope, filter } = agentDirectoryArchiveOptions(request);
     const isHistory = request.type === "fetch_agent_history_request";
     const scope = request.type === "fetch_agents_request" ? request.scope : undefined;
-    const sort = this.agentsPager.normalizeSort(request.sort);
+    const sort = pager.normalizeSort(requestedSort);
 
     let agents = await this.listAgentPayloads({
       labels: filter?.labels,
@@ -6418,13 +6452,11 @@ export class Session {
 
     const search = agentDirectorySearchQuery(request);
     let candidates = [...agents];
-    candidates.sort((left, right) => this.agentsPager.compare(left, right, sort));
+    candidates.sort((left, right) => pager.compare(left, right, sort));
     const cursorToken = request.page?.cursor;
     if (cursorToken) {
-      const cursor = this.decodeAgentCursor(cursorToken, sort);
-      candidates = candidates.filter(
-        (agent) => this.agentsPager.compareWithCursor(agent, cursor, sort) > 0,
-      );
+      const cursor = this.decodeAgentCursor(pager, cursorToken, sort);
+      candidates = candidates.filter((agent) => pager.compareWithCursor(agent, cursor, sort) > 0);
     }
 
     const limit = request.page?.limit ?? 200;
@@ -6436,13 +6468,14 @@ export class Session {
       filter,
       archiveScope,
       search,
+      searchScope: isHistory ? request.searchScope : undefined,
     });
 
     const pagedEntries = matchedEntries.slice(0, limit);
     const hasMore = matchedEntries.length > limit;
     const nextCursor =
       hasMore && pagedEntries.length > 0
-        ? this.agentsPager.encode(pagedEntries[pagedEntries.length - 1].agent, sort)
+        ? pager.encode(pagedEntries[pagedEntries.length - 1].agent, sort)
         : null;
     const ancestors =
       isHistory && pagedEntries.length > 0
@@ -6472,29 +6505,60 @@ export class Session {
     defaultSort: [{ key: "updated_at", direction: "desc" }],
     label: "fetch_agents",
     getId: (agent) => agent.id,
-    getSortValue: (agent, key): number | string => {
-      switch (key) {
-        case "status_priority":
-          return getAgentStatusPriority({
-            status: agent.status,
-            pendingPermissionCount: agent.pendingPermissions?.length ?? 0,
-            requiresAttention: agent.requiresAttention,
-            attentionReason: agent.attentionReason ?? null,
-            backgroundWork: agent.backgroundWork,
-          });
-        case "created_at":
-          return Date.parse(agent.createdAt);
-        case "updated_at":
-          return Date.parse(agent.updatedAt);
-        case "title":
-          return agent.title?.toLocaleLowerCase() ?? "";
-      }
-    },
+    getSortValue: this.getAgentSortValue,
   });
 
-  private decodeAgentCursor(token: string, sort: SortSpec<FetchAgentsRequestSort["key"]>[]) {
+  private createAgentHistoryPager(workspaceArchivedAtByWorkspaceId: ReadonlyMap<string, string>) {
+    return new SortablePager<AgentSnapshotPayload, AgentHistorySortKey>({
+      validKeys: FETCH_AGENT_HISTORY_SORT_KEYS,
+      defaultSort: [{ key: "updated_at", direction: "desc" }],
+      label: "fetch_agents",
+      getId: (agent) => agent.id,
+      getSortValue: (agent, key) => {
+        if (key !== "archived_at") return this.getAgentSortValue(agent, key);
+        const workspaceArchivedAt = agent.workspaceId
+          ? workspaceArchivedAtByWorkspaceId.get(agent.workspaceId)
+          : undefined;
+        for (const timestamp of [agent.archivedAt, workspaceArchivedAt, agent.updatedAt]) {
+          if (timestamp == null) continue;
+          const parsed = Date.parse(timestamp);
+          if (!Number.isNaN(parsed)) return parsed;
+        }
+        // Keep missing dates before valid dates in ascending order and encodable in cursors.
+        return Number.MIN_SAFE_INTEGER;
+      },
+    });
+  }
+
+  private getAgentSortValue(
+    agent: AgentSnapshotPayload,
+    key: FetchAgentsRequestSort["key"],
+  ): number | string {
+    switch (key) {
+      case "status_priority":
+        return getAgentStatusPriority({
+          status: agent.status,
+          pendingPermissionCount: agent.pendingPermissions?.length ?? 0,
+          requiresAttention: agent.requiresAttention,
+          attentionReason: agent.attentionReason ?? null,
+          backgroundWork: agent.backgroundWork,
+        });
+      case "created_at":
+        return Date.parse(agent.createdAt);
+      case "updated_at":
+        return Date.parse(agent.updatedAt);
+      case "title":
+        return agent.title?.toLocaleLowerCase() ?? "";
+    }
+  }
+
+  private decodeAgentCursor<K extends AgentHistorySortKey>(
+    pager: SortablePager<AgentSnapshotPayload, K>,
+    token: string,
+    sort: SortSpec<K>[],
+  ) {
     try {
-      return this.agentsPager.decode(token, sort);
+      return pager.decode(token, sort);
     } catch (error) {
       if (error instanceof CursorError) {
         throw new SessionRequestError("invalid_cursor", error.message);
@@ -7403,14 +7467,17 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "project.list.request" }>,
   ): Promise<void> {
     try {
+      const records = await this.projectRegistry.list();
+      const visible = request.includeArchived
+        ? records
+        : records.filter((project) => !project.archivedAt);
       const projects = await Promise.all(
-        (await this.projectRegistry.list())
-          .filter((project) => !project.archivedAt)
-          .map((project) => this.buildProjectDescriptor(project)),
+        visible.map((project) => this.buildProjectDescriptor(project)),
       );
-      const synchronized = request.sync
-        ? this.directorySync.synchronizeProjects(projects, request.sync)
-        : null;
+      const synchronized =
+        request.sync && !request.includeArchived
+          ? this.directorySync.synchronizeProjects(projects, request.sync)
+          : null;
       this.emit({
         type: "project.list.response",
         payload: {

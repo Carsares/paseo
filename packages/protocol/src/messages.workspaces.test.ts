@@ -293,8 +293,47 @@ describe("workspace message schemas", () => {
     expect(request.type).toBe("fetch_agent_history_request");
     expect(response.type).toBe("fetch_agent_history_response");
     expect(request).not.toHaveProperty("archiveScope");
+    expect(request).not.toHaveProperty("searchScope");
     expect(response.payload).not.toHaveProperty("ancestors");
     const envelope = { type: "session", message: response };
+    expect(validateWSOutboundMessage(envelope)).toEqual({ success: true, data: envelope });
+  });
+
+  test("parses history query controls without extending active agent sort keys", () => {
+    const request = {
+      type: "fetch_agent_history_request",
+      requestId: "req-history",
+      search: "billing",
+      sort: [{ key: "archived_at", direction: "desc" }],
+    };
+    for (const searchScope of ["all", "workspace", "agent"]) {
+      expect(SessionInboundMessageSchema.parse({ ...request, searchScope })).toEqual({
+        ...request,
+        searchScope,
+      });
+    }
+    expect(
+      SessionInboundMessageSchema.safeParse({ ...request, searchScope: "project" }).success,
+    ).toBe(false);
+    expect(
+      SessionInboundMessageSchema.safeParse({ ...request, type: "fetch_agents_request" }).success,
+    ).toBe(false);
+  });
+
+  test("parses archived project listing and advertises history query controls", () => {
+    const request = { type: "project.list.request", requestId: "req-projects" };
+    expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+    expect(SessionInboundMessageSchema.parse({ ...request, includeArchived: true })).toEqual({
+      ...request,
+      includeArchived: true,
+    });
+    const payload = {
+      status: "server_info",
+      serverId: "host-1",
+      features: { agentHistoryQueryControls: true },
+    };
+    expect(ServerInfoStatusPayloadSchema.parse(payload).features).toEqual(payload.features);
+    const envelope = { type: "session", message: { type: "status", payload } };
     expect(validateWSOutboundMessage(envelope)).toEqual({ success: true, data: envelope });
   });
 

@@ -1452,6 +1452,7 @@ export const FetchWorkspacesRequestMessageSchema = z.object({
 export const ProjectListRequestMessageSchema = z.object({
   type: z.literal("project.list.request"),
   requestId: z.string(),
+  includeArchived: z.boolean().optional(),
   // COMPAT(directorySync): added in v0.3.x, remove optional after 2027-02-12.
   sync: DirectorySyncRequestSchema.optional(),
 });
@@ -1468,19 +1469,32 @@ export const ProjectSuggestionsRequestSchema = z.object({
 export const AgentHistoryArchiveScopeSchema = z.enum(["all", "active", "archived"]);
 export type AgentHistoryArchiveScope = z.infer<typeof AgentHistoryArchiveScopeSchema>;
 
+export const AgentHistorySearchScopeSchema = z.enum(["all", "workspace", "agent"]);
+export type AgentHistorySearchScope = z.infer<typeof AgentHistorySearchScopeSchema>;
+
+export const AgentHistorySortKeySchema = z.enum([
+  "status_priority",
+  "created_at",
+  "updated_at",
+  "archived_at",
+  "title",
+]);
+export type AgentHistorySortKey = z.infer<typeof AgentHistorySortKeySchema>;
+
 export const FetchAgentHistoryRequestMessageSchema = z.object({
   type: z.literal("fetch_agent_history_request"),
   requestId: z.string(),
   // Active and archived scopes classify both the agent and its workspace and override includeArchived.
   archiveScope: AgentHistoryArchiveScopeSchema.optional(),
   filter: AgentDirectoryFilterSchema.optional(),
-  // A free-text filter over agent title, workspace name, branch, and project name.
+  // A free-text filter over the names selected by searchScope, which defaults to "all".
   // Matching rows follow the requested sort and cursor pagination.
   search: z.string().optional(),
+  searchScope: AgentHistorySearchScopeSchema.optional(),
   sort: z
     .array(
       z.object({
-        key: z.enum(["status_priority", "created_at", "updated_at", "title"]),
+        key: AgentHistorySortKeySchema,
         direction: z.enum(["asc", "desc"]),
       }),
     )
@@ -3956,6 +3970,8 @@ export const ServerInfoStatusPayloadSchema = z
         backgroundAgents: z.boolean().optional(),
         // COMPAT(agentHistoryArchiveScope): added in v0.16.0, remove gate after 2027-05-19.
         agentHistoryArchiveScope: z.boolean().optional(),
+        // COMPAT(agentHistoryQueryControls): added in v0.16.0, remove gate after 2027-05-19.
+        agentHistoryQueryControls: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
         connectedHosts: z.boolean().optional(),
         hostMultiplexing: z.boolean().optional(),

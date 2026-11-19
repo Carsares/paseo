@@ -2,7 +2,8 @@
  * @vitest-environment jsdom
  */
 import React from "react";
-import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { FlatListProps } from "react-native";
 import { parentAddressLabels } from "@getpaseo/protocol/agent-labels";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,12 +11,27 @@ import type { AgentHistoryResult } from "@/hooks/use-agent-history";
 import type { AggregatedAgent } from "@/hooks/use-aggregated-agents";
 import { i18n } from "@/i18n/i18next";
 import { SessionsScreen } from "@/screens/sessions-screen";
+import { DEFAULT_HISTORY_SORT } from "@/screens/sessions/history-grouping";
+import type { ProjectDescriptor } from "@/stores/session-store";
+import { buildProjects, type ProjectSummary } from "@/utils/projects";
 import { AgentList } from "./agent-list";
 
 const { archiveAgent, navigateToAgent, useAgentHistory } = vi.hoisted(() => ({
   archiveAgent: vi.fn(async () => {}),
   navigateToAgent: vi.fn(),
   useAgentHistory: vi.fn<typeof import("@/hooks/use-agent-history").useAgentHistory>(),
+}));
+const historyCatalog = vi.hoisted(() => ({
+  hosts: [] as { serverId: string; label: string }[],
+  projects: [] as ProjectSummary[],
+  statuses: new Map(),
+  sessions: {},
+  getClient:
+    vi.fn<
+      (
+        serverId: string,
+      ) => { listProjects: (options: unknown) => Promise<{ projects: ProjectDescriptor[] }> } | null
+    >(),
 }));
 
 vi.mock("@/utils/navigate-to-agent", () => ({ navigateToAgent }));
@@ -24,15 +40,47 @@ vi.mock("@/hooks/use-archive-agent", () => ({ useArchiveAgent: () => ({ archiveA
 vi.mock("@/hooks/use-import-session", () => ({
   useImportSession: () => ({ open: vi.fn(), sheet: null }),
 }));
-vi.mock("@/runtime/host-runtime", () => ({ useHosts: () => [] }));
+vi.mock("@/runtime/host-runtime", () => ({
+  getHostRuntimeStore: () => historyCatalog,
+  useHostRuntimeConnectionStatuses: () => historyCatalog.statuses,
+  useHosts: () => historyCatalog.hosts,
+}));
+vi.mock("@/hooks/use-projects", () => ({
+  useProjects: () => ({ projects: historyCatalog.projects }),
+}));
 vi.mock("expo-router/react-navigation", () => ({ useIsFocused: () => true }));
 vi.mock("expo-router", () => ({ router: { navigate: vi.fn() } }));
 vi.mock("@/components/headers/menu-header", () => ({ MenuHeader: () => null }));
-vi.mock("@/components/hosts/host-filter", () => ({ HostFilter: () => null }));
+vi.mock("@/components/hosts/host-filter", () => ({
+  HostFilter: ({
+    hosts,
+    onSelectHost,
+  }: {
+    hosts: typeof historyCatalog.hosts;
+    onSelectHost: (serverId: string) => void;
+  }) =>
+    React.createElement(
+      React.Fragment,
+      null,
+      hosts.map(({ serverId, label }) =>
+        React.createElement(
+          "button",
+          {
+            type: "button",
+            key: serverId,
+            onClick: () => onSelectHost(serverId),
+          },
+          label,
+        ),
+      ),
+    ),
+}));
 vi.mock("@/components/hosts/host-picker", () => ({ ALL_HOSTS_OPTION_ID: "all" }));
 vi.mock("@/stores/session-store", () => ({
+  normalizeProjectDescriptor: (payload: ProjectDescriptor) => payload,
   useSessionStore: Object.assign(
-    (select: (state: { sessions: object }) => unknown) => select({ sessions: {} }),
+    (select: (state: { sessions: object }) => unknown) =>
+      select({ sessions: historyCatalog.sessions }),
     {
       getState: () => ({ sessions: { host: { client: {} } } }),
     },
@@ -42,6 +90,54 @@ vi.mock("react-native-safe-area-context", () => ({
   useSafeAreaInsets: () => ({ bottom: 0 }),
 }));
 vi.mock("@/components/ui/modal", () => ({ Modal: () => null }));
+// Keep the page tests on the History controls. The menu surfaces load native overlays.
+vi.mock("@/components/ui/dropdown-menu", () => ({
+  DropdownMenu: ({ children }: React.PropsWithChildren) => children,
+  DropdownMenuContent: ({ children }: React.PropsWithChildren) => children,
+  DropdownMenuItem: ({ children, onSelect }: React.PropsWithChildren<{ onSelect: () => void }>) =>
+    React.createElement("button", { type: "button", onClick: onSelect }, children),
+  DropdownMenuLabel: () => null,
+  DropdownMenuSeparator: () => null,
+}));
+vi.mock("@/components/ui/dropdown-trigger", () => ({
+  DropdownTrigger: ({ children, testID }: React.PropsWithChildren<{ testID: string }>) =>
+    React.createElement("button", { type: "button", "data-testid": testID }, children),
+}));
+vi.mock("@/components/ui/combobox", () => ({
+  Combobox: ({
+    children,
+    onOpenChange,
+    onSelect,
+    open,
+    options,
+  }: React.PropsWithChildren<{
+    onOpenChange: (open: boolean) => void;
+    onSelect: (id: string) => void;
+    open: boolean;
+    options: Array<{ id: string; label: string }>;
+  }>) =>
+    open
+      ? React.createElement(
+          React.Fragment,
+          null,
+          children ??
+            options.map(({ id, label }) =>
+              React.createElement(
+                "button",
+                {
+                  type: "button",
+                  key: id,
+                  onClick: () => {
+                    onSelect(id);
+                    onOpenChange(false);
+                  },
+                },
+                label,
+              ),
+            ),
+        )
+      : null,
+}));
 vi.mock("@/components/provider-icons", () => ({
   useProviderIcon: () => () => null,
 }));
@@ -59,6 +155,7 @@ vi.mock("lucide-react-native", () => ({
   ChevronDown: () => null,
   ChevronLeft: () => null,
   ChevronRight: () => null,
+  Folder: () => null,
   Import: () => null,
   Search: () => null,
   X: () => null,
@@ -95,6 +192,7 @@ vi.mock("react-native", async (importOriginal) => {
 const workspaceId = "workspace-id";
 const date = new Date("2026-04-02T10:00:00.000Z");
 const activeWorkspaceIdsByServer = new Map([["host", new Set([workspaceId])]]);
+const createdAscending = { field: "created_at", direction: "asc" } as const;
 
 function agent(id: string, overrides: Partial<AggregatedAgent> = {}): AggregatedAgent {
   return {
@@ -140,6 +238,8 @@ function historyResult(overrides: Partial<AgentHistoryResult>): AgentHistoryResu
     hasMore: false,
     hostErrors: [],
     isArchiveScopeSupported: true,
+    isQueryControlsSupported: false,
+    effectiveSort: DEFAULT_HISTORY_SORT,
     isError: false,
     isInitialLoad: false,
     isLoading: false,
@@ -154,6 +254,15 @@ function historyResult(overrides: Partial<AgentHistoryResult>): AgentHistoryResu
   };
 }
 
+function renderSessions() {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(<SessionsScreen />, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    ),
+  });
+}
+
 describe("AgentList history hierarchy", () => {
   beforeEach(async () => {
     vi.stubGlobal("React", React);
@@ -162,6 +271,11 @@ describe("AgentList history hierarchy", () => {
   });
   afterEach(() => {
     cleanup();
+    historyCatalog.hosts = [];
+    historyCatalog.projects = [];
+    historyCatalog.sessions = {};
+    historyCatalog.statuses.clear();
+    historyCatalog.getClient.mockReset();
     vi.useRealTimers();
     vi.unstubAllGlobals();
   });
@@ -177,6 +291,8 @@ describe("AgentList history hierarchy", () => {
     );
     const project = getByTestId("history-project-header-host:atlas");
     const workspace = getByTestId(`history-workspace-header-host:${workspaceId}`);
+    expect(project.getAttribute("aria-expanded")).toBe("true");
+    expect(workspace.getAttribute("aria-expanded")).toBe("true");
     const parentRow = getByTestId("agent-row-host-root");
     const toggle = getByRole("button", { name: "Show subagents" });
 
@@ -201,6 +317,124 @@ describe("AgentList history hierarchy", () => {
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     expect(queryByTestId("agent-row-host-child")).toBeNull();
     expect(queryByTestId("agent-row-host-other")).toBeNull();
+  });
+
+  it("collapses each heading independently and keeps its count and time visible", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-02T10:02:00.000Z"));
+    const sibling = agent("sibling", { workspaceId: "sibling-workspace" });
+    const { getByRole, getByTestId, queryByTestId } = render(
+      <AgentList
+        agents={[root, child, sibling]}
+        ancestors={[]}
+        activeWorkspaceIdsByServer={activeWorkspaceIdsByServer}
+      />,
+    );
+    const workspaceTestID = `history-workspace-header-host:${workspaceId}`;
+    const workspace = getByTestId(workspaceTestID);
+    fireEvent.click(getByRole("button", { name: "Show subagents" }));
+    expect(getByTestId("agent-row-host-child")).toBeDefined();
+    fireEvent.click(workspace);
+    expect(workspace.getAttribute("aria-expanded")).toBe("false");
+    expect(queryByTestId("agent-row-host-root")).toBeNull();
+    expect(queryByTestId("agent-row-host-child")).toBeNull();
+    expect(getByTestId("agent-row-host-sibling")).toBeDefined();
+    expect(within(workspace).getByText("2 sessions")).toBeDefined();
+    expect(within(workspace).getByText("2m ago")).toBeDefined();
+    fireEvent.click(getByRole("button", { name: "Expand workspace Spring work" }));
+    expect(getByTestId("agent-row-host-root")).toBeDefined();
+
+    const project = getByRole("button", { name: "Collapse project Atlas" });
+    fireEvent.click(project);
+    expect(project.getAttribute("aria-expanded")).toBe("false");
+    expect(queryByTestId(workspaceTestID)).toBeNull();
+    expect(queryByTestId("agent-row-host-sibling")).toBeNull();
+    expect(within(project).getByText("2 workspaces")).toBeDefined();
+    expect(within(project).getByText("2m ago")).toBeDefined();
+    fireEvent.click(getByRole("button", { name: "Expand project Atlas" }));
+    expect(getByTestId(workspaceTestID)).toBeDefined();
+    expect(getByTestId("agent-row-host-root")).toBeDefined();
+  });
+
+  it("streams workspaces across projects using the selected time and shows their owning project", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-02T10:10:00.000Z"));
+    const other = agent("boron", {
+      workspaceId: "boron",
+      createdAt: new Date("2026-04-02T10:05:00.000Z"),
+      lastActivityAt: new Date("2026-04-02T10:09:00.000Z"),
+      projectPlacement: { ...root.projectPlacement!, projectKey: "boron", projectName: "Boron" },
+    });
+    const { getByTestId, queryByTestId } = render(
+      <AgentList
+        agents={[other, root]}
+        ancestors={[]}
+        activeWorkspaceIdsByServer={activeWorkspaceIdsByServer}
+        groupMode="workspace"
+        sort={createdAscending}
+      />,
+    );
+    const first = getByTestId(`history-workspace-header-host:${workspaceId}`);
+    const second = getByTestId("history-workspace-header-host:boron");
+    expect(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(
+      within(first).getByTestId(`history-workspace-project-host:${workspaceId}`).textContent,
+    ).toBe("Atlas");
+    expect(within(second).getByTestId("history-workspace-project-host:boron").textContent).toBe(
+      "Boron",
+    );
+    expect(queryByTestId("history-project-header-host:atlas")).toBeNull();
+    expect(queryByTestId("history-project-header-host:boron")).toBeNull();
+    expect(within(getByTestId("agent-row-host-boron")).getByText("5m ago")).toBeDefined();
+  });
+
+  it("highlights only fields in the selected search scope", () => {
+    const matched = agent("spring", {
+      title: "Spring session",
+      projectPlacement: { ...root.projectPlacement!, projectName: "Spring project" },
+    });
+    const props = {
+      agents: [matched],
+      ancestors: [],
+      activeWorkspaceIdsByServer,
+      search: "spring",
+    };
+    const { getByTestId, rerender } = render(<AgentList {...props} searchScope="workspace" />);
+    const project = getByTestId("history-project-name-host:atlas");
+    const workspace = getByTestId(`history-workspace-name-host:${workspaceId}`);
+    const branch = getByTestId(`history-workspace-branch-host:${workspaceId}`);
+    const title = getByTestId("agent-row-title-host-spring");
+    const isHighlighted = (el: HTMLElement) => Boolean(within(el).queryByText(/^spring$/i));
+    expect([project, workspace, branch, title].map(isHighlighted)).toEqual([
+      false,
+      true,
+      true,
+      false,
+    ]);
+
+    rerender(<AgentList {...props} searchScope="agent" />);
+    expect([project, workspace, branch, title].map(isHighlighted)).toEqual([
+      false,
+      false,
+      false,
+      true,
+    ]);
+
+    rerender(<AgentList {...props} />);
+    expect([project, workspace, branch, title].map(isHighlighted)).toEqual([
+      true,
+      true,
+      true,
+      true,
+    ]);
+
+    const inlineProjectID = `history-workspace-project-host:${workspaceId}`;
+    rerender(<AgentList {...props} groupMode="workspace" />);
+    expect(isHighlighted(getByTestId(inlineProjectID))).toBe(true);
+    rerender(<AgentList {...props} groupMode="workspace" searchScope="workspace" />);
+    expect(isHighlighted(getByTestId(inlineProjectID))).toBe(false);
+    rerender(<AgentList {...props} groupMode="workspace" searchScope="agent" />);
+    expect(isHighlighted(getByTestId(inlineProjectID))).toBe(false);
   });
 
   it("toggles child rows independently and navigates from both session rows", () => {
@@ -268,7 +502,7 @@ describe("AgentList history hierarchy", () => {
     useAgentHistory.mockImplementation(({ archiveScope }) =>
       archiveScope === "archived" ? archived : active,
     );
-    const { getByRole, getByTestId, queryByTestId } = render(<SessionsScreen />);
+    const { getByRole, getByTestId, queryByTestId } = renderSessions();
     const tabs = within(getByTestId("sessions-archive-scope-filter"));
     const archivedTab = tabs.getByTestId("sessions-tab-archived");
     const activeTab = tabs.getByTestId("sessions-tab-active");
@@ -294,7 +528,7 @@ describe("AgentList history hierarchy", () => {
     useAgentHistory.mockImplementation(({ archiveScope }) =>
       archiveScope === "active" ? firstPage : historyResult({}),
     );
-    const { getByRole, getByTestId, queryByTestId, rerender } = render(<SessionsScreen />);
+    const { getByRole, getByTestId, queryByTestId, rerender } = renderSessions();
     fireEvent.click(
       within(getByTestId("sessions-archive-scope-filter")).getByRole("button", { name: "Active" }),
     );
@@ -306,6 +540,175 @@ describe("AgentList history hierarchy", () => {
     expect(queryByTestId("sessions-empty")).toBeNull();
     fireEvent.click(getByRole("button", { name: "Load more" }));
     expect(loadMore).toHaveBeenCalledOnce();
+  });
+
+  it("leaves archive-time sorting when switching to Active and resets collapsed workspaces", () => {
+    useAgentHistory.mockReturnValue(
+      historyResult({ agents: [root], isQueryControlsSupported: true }),
+    );
+    const { getByRole, getByTestId, queryByRole, queryByTestId } = renderSessions();
+    fireEvent.click(getByRole("button", { name: "Archived (oldest)" }));
+    expect(useAgentHistory).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        archiveScope: "archived",
+        sort: { field: "archived_at", direction: "asc" },
+      }),
+    );
+    fireEvent.click(getByRole("button", { name: "Collapse workspace Spring work" }));
+    expect(queryByTestId("agent-row-host-root")).toBeNull();
+
+    fireEvent.click(getByTestId("sessions-tab-active"));
+    expect(getByTestId("agent-row-host-root")).toBeDefined();
+    expect(queryByRole("button", { name: "Archived (oldest)" })).toBeNull();
+    expect(useAgentHistory).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        archiveScope: "active",
+        sort: { field: "updated_at", direction: "asc" },
+      }),
+    );
+  });
+
+  it("expands both levels after a project heading is collapsed", () => {
+    const other = agent("boron", {
+      workspaceId: "boron",
+      projectPlacement: {
+        ...root.projectPlacement!,
+        projectKey: "boron",
+        projectName: "Boron",
+        workspaceName: "Boron work",
+      },
+    });
+    const result = historyResult({ agents: [root, child, other] });
+    useAgentHistory.mockReturnValue(result);
+    const { getByRole, getByTestId, queryByTestId } = renderSessions();
+    const toggleAll = getByTestId("sessions-collapse-all-button");
+
+    fireEvent.click(getByRole("button", { name: "Collapse project Atlas" }));
+    expect(queryByTestId(`history-workspace-header-host:${workspaceId}`)).toBeNull();
+    fireEvent.click(toggleAll);
+    expect(queryByTestId("agent-row-host-boron")).toBeNull();
+    expect(toggleAll.textContent).toBe("Expand all");
+    fireEvent.click(getByRole("button", { name: "Expand project Atlas" }));
+    expect(getByTestId("agent-row-host-root")).toBeDefined();
+    fireEvent.click(getByRole("button", { name: "Collapse project Atlas" }));
+    fireEvent.click(toggleAll);
+    expect(getByTestId("agent-row-host-root")).toBeDefined();
+    expect(getByTestId("agent-row-host-boron")).toBeDefined();
+    expect(toggleAll.textContent).toBe("Collapse all");
+
+    fireEvent.click(toggleAll);
+    expect(getByRole("button", { name: "Expand workspace Spring work" })).toBeDefined();
+    expect(queryByTestId("agent-row-host-root")).toBeNull();
+    fireEvent.click(toggleAll);
+    expect(getByTestId("agent-row-host-root")).toBeDefined();
+  });
+
+  it("keeps observed projects selectable after an empty project result and can clear the filter", () => {
+    const other = agent("boron", {
+      projectPlacement: { ...root.projectPlacement!, projectKey: "boron", projectName: "Boron" },
+    });
+    const unfiltered = historyResult({ agents: [root, other] });
+    const filtered = historyResult({});
+    useAgentHistory.mockImplementation(({ projectKeysByServer }) =>
+      projectKeysByServer ? filtered : unfiltered,
+    );
+    const { getByRole, getByTestId, queryByTestId } = renderSessions();
+    const trigger = getByTestId("sessions-project-filter-trigger");
+    fireEvent.click(trigger);
+    fireEvent.click(getByRole("button", { name: "Atlas" }));
+    expect(useAgentHistory).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        projectKeysByServer: new Map([["host", ["atlas"]]]),
+      }),
+    );
+    const empty = getByTestId("sessions-empty");
+    expect(empty.textContent).toContain("No sessions match");
+    fireEvent.click(trigger);
+    expect(getByRole("button", { name: "Boron" })).toBeDefined();
+    fireEvent.click(getByRole("button", { name: "Boron" }));
+    fireEvent.click(within(empty).getByRole("button", { name: "All projects" }));
+    expect(queryByTestId("sessions-empty")).toBeNull();
+  });
+
+  it("unifies active and archived catalog placements and clears projects outside the selected host", async () => {
+    const activeAtlas: ProjectDescriptor = {
+      projectId: "atlas-active",
+      projectKey: "shared-atlas",
+      projectDisplayName: "Atlas",
+      projectCustomName: "Atlas renamed",
+      projectKind: "git",
+      projectRootPath: "/active/atlas",
+    };
+    const archivedAtlas: ProjectDescriptor = {
+      ...activeAtlas,
+      projectId: "atlas-archived",
+      projectCustomName: null,
+      projectRootPath: "/archive/atlas",
+    };
+    const archivedBoron: ProjectDescriptor = {
+      ...archivedAtlas,
+      projectId: "boron-archived",
+      projectDisplayName: "Boron",
+      projectKey: "shared-boron",
+    };
+    historyCatalog.hosts = [
+      { serverId: "legacy", label: "Legacy Mac" },
+      { serverId: "current", label: "Current Mac" },
+    ];
+    historyCatalog.projects = buildProjects({
+      hosts: [
+        {
+          serverId: "legacy",
+          serverName: "Legacy Mac",
+          isOnline: true,
+          projects: [activeAtlas],
+          workspaces: [],
+        },
+      ],
+    }).projects;
+    historyCatalog.sessions = {
+      legacy: { workspaces: new Map(), serverInfo: { features: {} } },
+      current: {
+        workspaces: new Map(),
+        serverInfo: { features: { agentHistoryQueryControls: true } },
+      },
+    };
+    historyCatalog.statuses.set("legacy", "online");
+    historyCatalog.statuses.set("current", "online");
+    const listProjects = vi.fn(async () => ({ projects: [archivedAtlas, archivedBoron] }));
+    historyCatalog.getClient.mockImplementation((serverId) =>
+      serverId === "current" ? { listProjects } : null,
+    );
+    useAgentHistory.mockReturnValue(historyResult({}));
+
+    const { getByRole, getByTestId, findByRole, queryByRole } = renderSessions();
+    const trigger = getByTestId("sessions-project-filter-trigger");
+    fireEvent.click(trigger);
+    await findByRole("button", { name: "Boron" });
+    expect(listProjects).toHaveBeenCalledExactlyOnceWith({ includeArchived: true });
+    expect(historyCatalog.getClient).toHaveBeenCalledExactlyOnceWith("current");
+    fireEvent.click(getByRole("button", { name: "Atlas renamed" }));
+    expect(useAgentHistory).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        projectKeysByServer: new Map([
+          ["current", ["atlas-archived"]],
+          ["legacy", ["atlas-active"]],
+        ]),
+      }),
+    );
+    fireEvent.click(trigger);
+    fireEvent.click(getByRole("button", { name: "Boron" }));
+    fireEvent.click(getByRole("button", { name: "Legacy Mac" }));
+    await waitFor(() =>
+      expect(useAgentHistory).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          serverId: "legacy",
+          projectKeysByServer: undefined,
+        }),
+      ),
+    );
+    fireEvent.click(trigger);
+    expect(queryByRole("button", { name: "Boron" })).toBeNull();
   });
 
   it("keeps an active ancestor above its archived child and puts the workspace badge on the header", () => {

@@ -17,7 +17,15 @@ import { markAgentArchivedInHistoryCache } from "./use-archive-agent";
 interface HistoryFeatureState {
   sessions: Record<
     string,
-    { serverInfo: { features: { agentHistorySearch: boolean; agentHistoryArchiveScope: boolean } } }
+    {
+      serverInfo: {
+        features: {
+          agentHistorySearch: boolean;
+          agentHistoryArchiveScope: boolean;
+          agentHistoryQueryControls: boolean;
+        };
+      };
+    }
   >;
 }
 
@@ -671,7 +679,11 @@ describe("fetchAgentHistoryPage", () => {
   });
 });
 
-function configureHosts(input: AgentHistoryHost[], scopeSupportedBy: string[]) {
+function configureHosts(
+  input: AgentHistoryHost[],
+  scopeSupportedBy: string[],
+  queryControlsSupportedBy: string[] = [],
+) {
   runtimeHosts = input;
   registeredHosts = input.map(({ serverId, serverLabel }) => ({ serverId, label: serverLabel }));
   featureState = {
@@ -683,6 +695,7 @@ function configureHosts(input: AgentHistoryHost[], scopeSupportedBy: string[]) {
             features: {
               agentHistorySearch: true,
               agentHistoryArchiveScope: scopeSupportedBy.includes(serverId),
+              agentHistoryQueryControls: queryControlsSupportedBy.includes(serverId),
             },
           },
         },
@@ -710,6 +723,153 @@ describe("useAgentHistory archive scope", () => {
   afterEach(() => {
     cleanup();
     configureHosts([], []);
+  });
+
+  it("omits blank search scopes and orders archived results across hosts and pages", async () => {
+    const updatedAt = "2026-04-10T10:00:00.000Z";
+    const entry = (id: string, day: string) =>
+      historyEntry({ id, cwd: "/repo", updatedAt, archivedAt: `2026-04-${day}T10:00:00.000Z` });
+    const primary = createClient([
+      historyPayload({ entries: [] }),
+      historyPayload({ entries: [entry("same", "03")], hasMore: true, nextCursor: "next" }),
+      historyPayload({ entries: [entry("last", "04")] }),
+    ]);
+    const secondary = createClient([
+      historyPayload({ entries: [] }),
+      historyPayload({ entries: [entry("first", "01"), entry("same", "03")] }),
+    ]);
+    const ids = ["server-a", "server-b"];
+    configureHosts(
+      [
+        { serverId: ids[1], serverLabel: "Second", client: secondary },
+        { serverId: ids[0], serverLabel: "First", client: primary },
+      ],
+      ids,
+      ids,
+    );
+    const options = {
+      archiveScope: "archived",
+      searchScope: "workspace",
+      sort: { field: "archived_at", direction: "asc" },
+    } as const;
+    const { queryClient, rerender, result } = renderHistory({ ...options, search: "  " });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.isQueryControlsSupported).toBe(true);
+    expect(primary.calls[0]).not.toHaveProperty("searchScope");
+
+    rerender({ ...options, search: "atlas" });
+    const addresses = () => result.current.agents.map(({ serverId, id }) => `${serverId}:${id}`);
+    await waitFor(() =>
+      expect(addresses()).toEqual(["server-b:first", "server-a:same", "server-b:same"]),
+    );
+    expect(primary.calls[1]).toMatchObject({
+      archiveScope: "archived",
+      search: "atlas",
+      searchScope: "workspace",
+      sort: [{ key: "archived_at", direction: "asc" }],
+    });
+    expect(
+      queryClient.getQueryState([
+        "allAgentHistory",
+        ...ids,
+        "atlas",
+        { archiveScope: "archived", searchScope: "workspace", sort: "archived_at:asc" },
+      ])?.status,
+    ).toBe("success");
+    act(() => result.current.loadMore());
+    await waitFor(() =>
+      expect(addresses()).toEqual([
+        "server-b:first",
+        "server-a:same",
+        "server-b:same",
+        "server-a:last",
+      ]),
+    );
+    expect(primary.calls[2]?.page).toMatchObject({ cursor: "next" });
+    expect(secondary.calls).toHaveLength(2);
+
+    rerender({ ...options, archiveScope: "active", search: "atlas" });
+    await waitFor(() => expect(primary.calls).toHaveLength(4));
+    expect(primary.calls[3]).toMatchObject({
+      archiveScope: "active",
+      searchScope: "workspace",
+      sort: [{ key: "updated_at", direction: "asc" }],
+    });
+    expect(result.current.effectiveSort).toEqual({ field: "updated_at", direction: "asc" });
+  });
+
+  it("uses legacy search and falls back from archive to activity time on mixed hosts", async () => {
+    const primary = createClient([historyPayload({ entries: [] })]);
+    const legacy = createClient([historyPayload({ entries: [] })]);
+    const ids = ["server-a", "server-b"];
+    configureHosts(
+      [
+        { serverId: ids[0], serverLabel: "Current", client: primary },
+        { serverId: ids[1], serverLabel: "Legacy", client: legacy },
+      ],
+      ids,
+      [ids[0]],
+    );
+    const { result, rerender } = renderHistory({
+      search: "atlas",
+      searchScope: "agent",
+      sort: { field: "archived_at", direction: "asc" },
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.isQueryControlsSupported).toBe(false);
+    for (const client of [primary, legacy]) {
+      expect(client.calls[0]).not.toHaveProperty("searchScope");
+      expect(client.calls[0]?.sort).toEqual([{ key: "updated_at", direction: "asc" }]);
+    }
+
+    rerender({ sort: { field: "created_at", direction: "desc" } });
+    await waitFor(() => expect(legacy.calls).toHaveLength(2));
+    expect(legacy.calls[1]?.sort).toEqual([{ key: "created_at", direction: "desc" }]);
+  });
+
+  it("queries only hosts with project keys and treats no eligible hosts as empty", async () => {
+    const primary = createClient([historyPayload({ entries: [] })]);
+    const legacy = createFailingClient();
+    configureHosts(
+      [
+        { serverId: "server-a", serverLabel: "First", client: primary },
+        { serverId: "server-b", serverLabel: "Second", client: legacy },
+      ],
+      ["server-a", "server-b"],
+    );
+    const { result, queryClient, rerender } = renderHistory({
+      projectKeysByServer: new Map([
+        ["server-b", [" "]],
+        ["server-a", ["z", "a", "z", ""]],
+      ]),
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(primary.calls[0]?.filter).toEqual({ projectKeys: ["a", "z"] });
+    expect(legacy.calls).toHaveLength(0);
+
+    rerender({ projectKeysByServer: new Map([["server-a", ["a", "z"]]]) });
+    expect(queryClient.getQueryCache().getAll()).toHaveLength(1);
+
+    rerender({ projectKeysByServer: new Map([["server-b", [" "]]]) });
+    await waitFor(() =>
+      expect(
+        queryClient.getQueryState([
+          "allAgentHistory",
+          "server-a",
+          "server-b",
+          "",
+          { projectKeys: [] },
+        ])?.status,
+      ).toBe("success"),
+    );
+    expect(result.current).toMatchObject({
+      agents: [],
+      hostErrors: [],
+      isError: false,
+      hasMore: false,
+    });
+    expect(primary.calls).toHaveLength(1);
+    expect(legacy.calls).toHaveLength(0);
   });
 
   it("uses separate tab cursors and normalizes and deduplicates parents across pages and hosts", async () => {
@@ -814,18 +974,21 @@ describe("useAgentHistory archive scope", () => {
 
   it("keeps unscoped search on its existing cache keys and shows previous results while a new term loads", async () => {
     const updatedAt = "2026-04-02T10:00:00.000Z";
+    const firstMatches = ["first-z", "first-a"];
     const client = createClient([
-      historyPayload({ entries: [historyEntry({ id: "first", cwd: "/repo", updatedAt })] }),
+      historyPayload({
+        entries: firstMatches.map((id) => historyEntry({ id, cwd: "/repo", updatedAt })),
+      }),
       historyPayload({ entries: [historyEntry({ id: "second", cwd: "/repo", updatedAt })] }),
     ]);
     configureHosts([{ serverId: "server-a", serverLabel: "MacBook", client }], ["server-a"]);
 
     const options = { searchableHostsOnly: true, keepPreviousResults: true };
     const { result, rerender, queryClient } = renderHistory({ ...options, search: "first" });
-    await waitFor(() => expect(result.current.agents.map(getId)).toEqual(["first"]));
+    await waitFor(() => expect(result.current.agents.map(getId)).toEqual(firstMatches));
 
     rerender({ ...options, search: "second" });
-    expect(result.current.agents.map(getId)).toEqual(["first"]);
+    expect(result.current.agents.map(getId)).toEqual(firstMatches);
     expect(result.current.isPreviousResults).toBe(true);
     await waitFor(() => expect(result.current.agents.map(getId)).toEqual(["second"]));
     expect(result.current.isPreviousResults).toBe(false);

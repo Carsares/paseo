@@ -818,6 +818,51 @@ test("project.list.request catches up by sequence on the existing RPC", async ()
   });
 });
 
+test("project.list.request includes archived projects without changing active directory sync", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = createSessionForWorkspaceTests({ onMessage: (message) => emitted.push(message) });
+  const active = createPersistedProjectRecord({
+    projectId: "project-active",
+    rootPath: "/repo/active",
+    kind: "non_git",
+    displayName: "Active",
+    createdAt: "2026-08-12T08:00:00.000Z",
+    updatedAt: "2026-08-12T08:00:00.000Z",
+  });
+  const archived = createPersistedProjectRecord({
+    ...active,
+    projectId: "project-archived",
+    rootPath: "/repo/archived",
+    displayName: "Archived",
+    archivedAt: "2026-08-12T09:00:00.000Z",
+  });
+  session.projectRegistry.list = async () => [active, archived];
+
+  await session.handleMessage({ type: "project.list.request", requestId: "initial", sync: {} });
+  const initial = filterByType(emitted, "project.list.response").at(-1)!.payload;
+  expect(initial.projects.map(({ projectId }) => projectId)).toEqual([active.projectId]);
+  expect(initial.sync).toMatchObject({ mode: "snapshot", headSeq: 1 });
+
+  const sync = { generation: initial.sync!.generation, afterSeq: initial.sync!.headSeq };
+  await session.handleMessage({
+    type: "project.list.request",
+    requestId: "with-archived",
+    includeArchived: true,
+    sync,
+  });
+  const withArchived = filterByType(emitted, "project.list.response").at(-1)!.payload;
+  expect(withArchived.projects.map(({ projectId }) => projectId)).toEqual([
+    active.projectId,
+    archived.projectId,
+  ]);
+  expect(withArchived.sync).toBeUndefined();
+
+  await session.handleMessage({ type: "project.list.request", requestId: "catch-up", sync });
+  const catchUp = filterByType(emitted, "project.list.response").at(-1)!.payload;
+  expect(catchUp.projects).toEqual([]);
+  expect(catchUp.sync).toMatchObject({ mode: "changes", headSeq: 1, removals: [] });
+});
+
 test("agent updates preserve queued live transitions across stored metadata reads", async () => {
   const running = makeManagedAgent({
     id: "agent-coherent",
@@ -3134,6 +3179,7 @@ function makeHistoryAgent(id: string, overrides: Partial<StoredAgentRecord> = {}
 function createHistoryRequest(
   records: StoredAgentRecord[],
   liveAgents: ReturnType<typeof makeManagedAgent>[] = [],
+  workspaceArchivedAt = HISTORY_ARCHIVED_AT,
 ) {
   const emitted: SessionOutboundMessage[] = [];
   const project = createPersistedProjectRecord({
@@ -3154,7 +3200,7 @@ function createHistoryRequest(
       displayName: workspaceId,
       createdAt: HISTORY_DATE,
       updatedAt: HISTORY_DATE,
-      archivedAt: workspaceId === HISTORY_ARCHIVED_WORKSPACE ? HISTORY_ARCHIVED_AT : null,
+      archivedAt: workspaceId === HISTORY_ARCHIVED_WORKSPACE ? workspaceArchivedAt : null,
     }),
   );
   const session = createSessionForWorkspaceTests({
@@ -3170,6 +3216,7 @@ function createHistoryRequest(
     },
   });
   session.projectRegistry.get = async (id) => (id === project.projectId ? project : null);
+  session.workspaceRegistry.listAll = async () => workspaces;
   session.workspaceRegistry.get = async (id) =>
     workspaces.find((workspace) => workspace.workspaceId === id) ?? null;
 
@@ -3229,6 +3276,101 @@ test("fetch_agent_history_request only honors the legacy archive filter for all 
     "archived-agent",
     "archived-workspace",
   ]);
+});
+
+test("fetch_agent_history_request selects workspace names or agent titles by search scope", async () => {
+  const requestHistory = createHistoryRequest([
+    makeHistoryAgent("title-match", { title: HISTORY_ARCHIVED_WORKSPACE }),
+    makeHistoryAgent("workspace-match", {
+      title: "Review billing",
+      workspaceId: HISTORY_ARCHIVED_WORKSPACE,
+    }),
+  ]);
+  const search = HISTORY_ARCHIVED_WORKSPACE;
+
+  const byWorkspace = await requestHistory({ search, searchScope: "workspace" });
+  expect(byWorkspace.entries.map(({ agent }) => agent.id)).toEqual(["workspace-match"]);
+  const byTitle = await requestHistory({ search, searchScope: "agent" });
+  expect(byTitle.entries.map(({ agent }) => agent.id)).toEqual(["title-match"]);
+  const all = await requestHistory({ search });
+  expect(all.entries.map(({ agent }) => agent.id)).toEqual(["title-match", "workspace-match"]);
+});
+
+test.each([
+  {
+    direction: "asc",
+    ids: ["direct-archive", "workspace-a", "workspace-b", "active"],
+  },
+  {
+    direction: "desc",
+    ids: ["active", "workspace-a", "workspace-b", "direct-archive"],
+  },
+] as const)(
+  "fetch_agent_history_request paginates archived_at $direction",
+  async ({ direction, ids }) => {
+    const requestHistory = createHistoryRequest([
+      makeHistoryAgent("workspace-b", { workspaceId: HISTORY_ARCHIVED_WORKSPACE }),
+      makeHistoryAgent("direct-archive", {
+        workspaceId: HISTORY_ARCHIVED_WORKSPACE,
+        archivedAt: "2026-03-03T12:00:00.000Z",
+        updatedAt: "2026-03-07T12:00:00.000Z",
+      }),
+      makeHistoryAgent("active", { updatedAt: "2026-03-06T12:00:00.000Z" }),
+      makeHistoryAgent("workspace-a", {
+        workspaceId: HISTORY_ARCHIVED_WORKSPACE,
+        archivedAt: "invalid timestamp",
+        updatedAt: "2026-03-02T12:00:00.000Z",
+      }),
+    ]);
+    let cursor: string | null = null;
+
+    for (const [index, id] of ids.entries()) {
+      const result = await requestHistory({
+        sort: [{ key: "archived_at", direction }],
+        page: { limit: 1, ...(cursor ? { cursor } : {}) },
+      });
+      expect(result.entries.map(({ agent }) => agent.id)).toEqual([id]);
+      const hasMore = index < ids.length - 1;
+      expect(result.pageInfo).toEqual({
+        nextCursor: hasMore ? expect.any(String) : null,
+        prevCursor: cursor,
+        hasMore,
+      });
+      cursor = result.pageInfo.nextCursor;
+    }
+  },
+);
+
+test("fetch_agent_history_request paginates archived_at with invalid timestamps", async () => {
+  const requestHistory = createHistoryRequest(
+    [
+      makeHistoryAgent("bad-agent-update", {
+        archivedAt: "invalid timestamp",
+        updatedAt: "invalid timestamp",
+      }),
+      makeHistoryAgent("bad-agent-archive", {
+        archivedAt: "invalid timestamp",
+        updatedAt: "2026-03-03T12:00:00.000Z",
+      }),
+      makeHistoryAgent("bad-workspace-archive", {
+        workspaceId: HISTORY_ARCHIVED_WORKSPACE,
+        updatedAt: "2026-03-02T12:00:00.000Z",
+      }),
+    ],
+    [],
+    "invalid timestamp",
+  );
+  let cursor: string | null = null;
+
+  for (const id of ["bad-agent-update", "bad-workspace-archive", "bad-agent-archive"]) {
+    const result = await requestHistory({
+      sort: [{ key: "archived_at", direction: "asc" }],
+      page: { limit: 1, ...(cursor ? { cursor } : {}) },
+    });
+    expect(result.entries.map(({ agent }) => agent.id)).toEqual([id]);
+    cursor = result.pageInfo.nextCursor;
+  }
+  expect(cursor).toBeNull();
 });
 
 test("fetch_agent_history_request returns active ancestors separately from archived pages", async () => {

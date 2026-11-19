@@ -4,8 +4,23 @@ import type { AggregatedAgent } from "@/hooks/use-aggregated-agents";
 import { resolveProjectPlacement } from "@/utils/project-placement";
 import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
 
+export type HistoryGroupMode = "project" | "workspace";
+export type HistoryTimeField = "updated_at" | "created_at" | "archived_at";
+export type HistorySortDirection = "desc" | "asc";
+
+export interface HistorySortOption {
+  readonly field: HistoryTimeField;
+  readonly direction: HistorySortDirection;
+}
+
+export const DEFAULT_HISTORY_SORT: HistorySortOption = {
+  field: "updated_at",
+  direction: "desc",
+};
+
 export interface HistorySubagentNode {
   agent: AggregatedAgent;
+  sortTimestamp: Date;
 }
 
 export interface HistoryRootAgentNode {
@@ -14,10 +29,11 @@ export interface HistoryRootAgentNode {
   agent: AggregatedAgent;
   /** This root provides context for matching descendants and is absent from entries. */
   isAncestorShell: boolean;
-  /** Matching descendants in this workspace, flattened and sorted newest first. */
+  /** Matching descendants in this workspace, flattened in the selected sort order. */
   subagents: HistorySubagentNode[];
   /** Latest visible activity, excluding the root's own activity when it is a shell. */
   latestActivityAt: Date;
+  sortTimestamp: Date;
   /** A descendant was included in the host's search results. */
   hasSearchMatchedSubagent: boolean;
 }
@@ -32,6 +48,7 @@ export interface HistoryWorkspaceGroup {
   branch: string | null;
   isWorkspaceArchived: boolean;
   latestActivityAt: Date;
+  sortTimestamp: Date;
   rootAgents: HistoryRootAgentNode[];
 }
 
@@ -43,16 +60,24 @@ export interface HistoryProjectGroup {
   projectId: string;
   cwd: string;
   latestActivityAt: Date;
+  sortTimestamp: Date;
   workspaces: HistoryWorkspaceGroup[];
 }
 
 export type HistoryFlatListItem =
-  | { type: "project-header"; key: string; project: HistoryProjectGroup }
+  | {
+      type: "project-header";
+      key: string;
+      project: HistoryProjectGroup;
+      expanded: boolean;
+    }
   | {
       type: "workspace-header";
       key: string;
       project: HistoryProjectGroup;
       workspace: HistoryWorkspaceGroup;
+      expanded: boolean;
+      showProjectBadge: boolean;
     }
   | {
       type: "root-agent";
@@ -82,6 +107,46 @@ interface LocalProjectDraft {
   equivalenceKeys: Set<string>;
 }
 
+export function resolveHistoryAgentTimestamp(
+  agent: AggregatedAgent,
+  field: HistoryTimeField,
+): Date {
+  switch (field) {
+    case "updated_at":
+      return agent.lastActivityAt;
+    case "created_at":
+      return agent.createdAt;
+    case "archived_at": {
+      if (agent.archivedAt != null && !Number.isNaN(agent.archivedAt.getTime())) {
+        return agent.archivedAt;
+      }
+      const workspaceArchivedAt = agent.projectPlacement?.workspaceArchivedAt;
+      if (workspaceArchivedAt != null) {
+        const timestamp = Date.parse(workspaceArchivedAt);
+        if (!Number.isNaN(timestamp)) return new Date(timestamp);
+      }
+      return agent.lastActivityAt;
+    }
+  }
+}
+
+function compareTimestamps(left: Date, right: Date, direction: HistorySortDirection): number {
+  const leftTime = left.getTime();
+  const rightTime = right.getTime();
+  // Unknown dates sort last in both directions so they cannot become a group's valid extremum.
+  if (Number.isNaN(leftTime)) return Number.isNaN(rightTime) ? 0 : 1;
+  if (Number.isNaN(rightTime)) return -1;
+  const difference = leftTime - rightTime;
+  return direction === "desc" ? -difference : difference;
+}
+
+function compareKeys(left: string, right: string): number {
+  const order = left.localeCompare(right);
+  if (order !== 0 || left === right) return order;
+  // Distinct identifiers can compare equal under locale collation.
+  return left < right ? -1 : 1;
+}
+
 function agentKey(agent: AggregatedAgent): string {
   return `${agent.serverId}:${agent.id}`;
 }
@@ -95,8 +160,9 @@ function createWorkspaceDraft(input: {
   entry: AggregatedAgent;
   key: string;
   activeIds: ReadonlySet<string> | undefined;
+  sortTimestamp: Date;
 }): WorkspaceDraft {
-  const { entry, key, activeIds } = input;
+  const { entry, key, activeIds, sortTimestamp } = input;
   const { serverId, serverLabel, cwd, lastActivityAt } = entry;
   const placement = resolveProjectPlacement({
     projectPlacement: entry.projectPlacement,
@@ -119,6 +185,7 @@ function createWorkspaceDraft(input: {
           ? workspaceId !== undefined && activeIds !== undefined && !activeIds.has(workspaceId)
           : Boolean(archivedAt),
       latestActivityAt: lastActivityAt,
+      sortTimestamp,
       rootAgents: [],
     },
   };
@@ -163,18 +230,30 @@ function resolveRootAgent(input: {
   return root;
 }
 
-function groupWorkspacesByProject(workspaces: Iterable<WorkspaceDraft>): HistoryProjectGroup[] {
+function groupWorkspacesByProject(
+  workspaces: Iterable<WorkspaceDraft>,
+  direction: HistorySortDirection,
+): HistoryProjectGroup[] {
   const localProjects = new Map<string, LocalProjectDraft>();
   const equivalenceCountsByServer = new Map<string, Map<string, number>>();
 
   for (const { workspace, placement, cwd } of workspaces) {
-    const { serverId, latestActivityAt } = workspace;
+    const { serverId, latestActivityAt, sortTimestamp } = workspace;
     const { projectKey: projectId, projectName } = placement;
     const key = `${serverId}:${projectId}`;
     let localProject = localProjects.get(key);
     if (!localProject) {
       localProject = {
-        project: { key, projectName, serverId, projectId, cwd, latestActivityAt, workspaces: [] },
+        project: {
+          key,
+          projectName,
+          serverId,
+          projectId,
+          cwd,
+          latestActivityAt,
+          sortTimestamp,
+          workspaces: [],
+        },
         equivalenceKeys: new Set(),
       };
       localProjects.set(key, localProject);
@@ -209,18 +288,26 @@ function groupWorkspacesByProject(workspaces: Iterable<WorkspaceDraft>): History
   }
 
   for (const project of projects.values()) {
+    for (const workspace of project.workspaces) {
+      if (compareTimestamps(workspace.latestActivityAt, project.latestActivityAt, "desc") < 0) {
+        project.latestActivityAt = workspace.latestActivityAt;
+      }
+      if (compareTimestamps(workspace.sortTimestamp, project.sortTimestamp, direction) < 0) {
+        project.sortTimestamp = workspace.sortTimestamp;
+      }
+    }
     project.workspaces.sort(
       (left, right) =>
-        right.latestActivityAt.getTime() - left.latestActivityAt.getTime() ||
+        compareTimestamps(left.sortTimestamp, right.sortTimestamp, direction) ||
         left.workspaceName.localeCompare(right.workspaceName) ||
-        left.key.localeCompare(right.key),
+        compareKeys(left.key, right.key),
     );
   }
   return [...projects.values()].sort(
     (left, right) =>
-      right.latestActivityAt.getTime() - left.latestActivityAt.getTime() ||
+      compareTimestamps(left.sortTimestamp, right.sortTimestamp, direction) ||
       left.projectName.localeCompare(right.projectName) ||
-      left.key.localeCompare(right.key),
+      compareKeys(left.key, right.key),
   );
 }
 
@@ -230,7 +317,9 @@ export function buildHistoryProjectGroups(input: {
   ancestors?: readonly AggregatedAgent[];
   activeWorkspaceIdsByServer?: ReadonlyMap<string, ReadonlySet<string>>;
   search?: string;
+  sort?: HistorySortOption;
 }): HistoryProjectGroup[] {
+  const { field, direction } = input.sort ?? DEFAULT_HISTORY_SORT;
   const entriesByKey = new Map(input.entries.map((agent) => [agentKey(agent), agent]));
   const agentsByKey = new Map((input.ancestors ?? []).map((agent) => [agentKey(agent), agent]));
   for (const [key, entry] of entriesByKey) agentsByKey.set(key, entry);
@@ -240,14 +329,15 @@ export function buildHistoryProjectGroups(input: {
   const rootsByAgentKey = new Map<string, AggregatedAgent>();
   const nodesByKey = new Map<string, HistoryRootAgentNode>();
   const workspaces = new Map<string, WorkspaceDraft>();
-  // The first matching entry supplies the most recent activity and workspace metadata.
+  // Keep workspace metadata tied to the latest activity regardless of the selected sort.
   const newestFirst = [...entriesByKey.values()].sort(
     (left, right) =>
-      right.lastActivityAt.getTime() - left.lastActivityAt.getTime() ||
-      agentKey(left).localeCompare(agentKey(right)),
+      compareTimestamps(left.lastActivityAt, right.lastActivityAt, "desc") ||
+      compareKeys(agentKey(left), agentKey(right)),
   );
 
   for (const entry of newestFirst) {
+    const sortTimestamp = resolveHistoryAgentTimestamp(entry, field);
     const key = workspaceKey(entry);
     let draft = workspaces.get(key);
     if (!draft) {
@@ -255,8 +345,11 @@ export function buildHistoryProjectGroups(input: {
         entry,
         key,
         activeIds: input.activeWorkspaceIdsByServer?.get(entry.serverId),
+        sortTimestamp,
       });
       workspaces.set(key, draft);
+    } else if (compareTimestamps(sortTimestamp, draft.workspace.sortTimestamp, direction) < 0) {
+      draft.workspace.sortTimestamp = sortTimestamp;
     }
 
     const root = resolveRootAgent({ entry, agentsByKey, rootsByAgentKey });
@@ -269,67 +362,146 @@ export function buildHistoryProjectGroups(input: {
         isAncestorShell: !entriesByKey.has(rootKey),
         subagents: [],
         latestActivityAt: entry.lastActivityAt,
+        sortTimestamp,
         hasSearchMatchedSubagent: false,
       };
       nodesByKey.set(rootKey, node);
       draft.workspace.rootAgents.push(node);
+    } else if (compareTimestamps(sortTimestamp, node.sortTimestamp, direction) < 0) {
+      node.sortTimestamp = sortTimestamp;
     }
     if (entry !== root) {
-      node.subagents.push({ agent: entry });
+      node.subagents.push({ agent: entry, sortTimestamp });
       node.hasSearchMatchedSubagent = isSearching;
     }
   }
 
   for (const { workspace } of workspaces.values()) {
+    for (const node of workspace.rootAgents) {
+      node.subagents.sort(
+        (left, right) =>
+          compareTimestamps(left.sortTimestamp, right.sortTimestamp, direction) ||
+          compareKeys(agentKey(left.agent), agentKey(right.agent)),
+      );
+    }
     workspace.rootAgents.sort(
       (left, right) =>
-        right.latestActivityAt.getTime() - left.latestActivityAt.getTime() ||
-        left.key.localeCompare(right.key),
+        compareTimestamps(left.sortTimestamp, right.sortTimestamp, direction) ||
+        compareKeys(left.key, right.key),
     );
   }
-  return groupWorkspacesByProject(workspaces.values());
+  return groupWorkspacesByProject(workspaces.values(), direction);
 }
 
 export function flattenHistoryProjectGroups(input: {
   groups: readonly HistoryProjectGroup[];
   expandedOverrides: ReadonlyMap<string, boolean>;
+  projectExpandedOverrides?: ReadonlyMap<string, boolean>;
+  workspaceExpandedOverrides?: ReadonlyMap<string, boolean>;
+  groupMode?: HistoryGroupMode;
+  sort?: HistorySortOption;
   isSearching: boolean;
 }): HistoryFlatListItem[] {
+  const showProjectBadge = input.groupMode === "workspace";
   const items: HistoryFlatListItem[] = [];
-  for (const project of input.groups) {
-    items.push({ type: "project-header", key: `project:${project.key}`, project });
-    for (const workspace of project.workspaces) {
+
+  function appendWorkspace(project: HistoryProjectGroup, workspace: HistoryWorkspaceGroup): void {
+    const workspaceExpanded = input.workspaceExpandedOverrides?.get(workspace.key) ?? true;
+    items.push({
+      type: "workspace-header",
+      key: `workspace:${workspace.key}`,
+      project,
+      workspace,
+      expanded: workspaceExpanded,
+      showProjectBadge,
+    });
+    if (!workspaceExpanded) return;
+
+    for (const node of workspace.rootAgents) {
+      const expanded =
+        input.expandedOverrides.get(node.key) ??
+        (input.isSearching && node.hasSearchMatchedSubagent);
       items.push({
-        type: "workspace-header",
-        key: `workspace:${workspace.key}`,
+        type: "root-agent",
+        key: `root-agent:${node.key}`,
         project,
         workspace,
+        node,
+        expanded,
       });
-      for (const node of workspace.rootAgents) {
-        const expanded =
-          input.expandedOverrides.get(node.key) ??
-          (input.isSearching && node.hasSearchMatchedSubagent);
+      if (!expanded) continue;
+      for (const { agent } of node.subagents) {
         items.push({
-          type: "root-agent",
-          key: `root-agent:${node.key}`,
+          type: "subagent",
+          key: `subagent:${agentKey(agent)}`,
           project,
           workspace,
-          node,
-          expanded,
+          parentKey: node.key,
+          agent,
         });
-        if (!expanded) continue;
-        for (const { agent } of node.subagents) {
-          items.push({
-            type: "subagent",
-            key: `subagent:${agentKey(agent)}`,
-            project,
-            workspace,
-            parentKey: node.key,
-            agent,
-          });
-        }
       }
     }
   }
+
+  if (showProjectBadge) {
+    const { direction } = input.sort ?? DEFAULT_HISTORY_SORT;
+    const workspaces = input.groups.flatMap((project) =>
+      project.workspaces.map((workspace) => ({ project, workspace })),
+    );
+    workspaces.sort(
+      (left, right) =>
+        compareTimestamps(left.workspace.sortTimestamp, right.workspace.sortTimestamp, direction) ||
+        left.workspace.workspaceName.localeCompare(right.workspace.workspaceName) ||
+        left.project.projectName.localeCompare(right.project.projectName) ||
+        compareKeys(left.workspace.key, right.workspace.key),
+    );
+    for (const { project, workspace } of workspaces) {
+      appendWorkspace(project, workspace);
+    }
+    return items;
+  }
+
+  for (const project of input.groups) {
+    const expanded = input.projectExpandedOverrides?.get(project.key) ?? true;
+    items.push({ type: "project-header", key: `project:${project.key}`, project, expanded });
+    if (!expanded) continue;
+    for (const workspace of project.workspaces) {
+      appendWorkspace(project, workspace);
+    }
+  }
   return items;
+}
+
+export function areAllHistoryWorkspacesCollapsed(input: {
+  groups: readonly HistoryProjectGroup[];
+  groupMode?: HistoryGroupMode;
+  projectExpandedOverrides?: ReadonlyMap<string, boolean>;
+  workspaceExpandedOverrides?: ReadonlyMap<string, boolean>;
+}): boolean {
+  let hasWorkspace = false;
+  for (const project of input.groups) {
+    const projectCollapsed =
+      input.groupMode !== "workspace" && input.projectExpandedOverrides?.get(project.key) === false;
+    for (const workspace of project.workspaces) {
+      hasWorkspace = true;
+      if (!projectCollapsed && input.workspaceExpandedOverrides?.get(workspace.key) !== false) {
+        return false;
+      }
+    }
+  }
+  return hasWorkspace;
+}
+
+export function buildAllWorkspacesExpansionMap(
+  groups: readonly HistoryProjectGroup[],
+  expanded: boolean,
+): Map<string, boolean> {
+  const overrides = new Map<string, boolean>();
+  if (expanded) return overrides;
+  for (const project of groups) {
+    for (const workspace of project.workspaces) {
+      overrides.set(workspace.key, false);
+    }
+  }
+  return overrides;
 }

@@ -2934,16 +2934,34 @@ export class DaemonClient {
     });
   }
 
-  async fetchAgentHistory(options?: FetchAgentHistoryOptions): Promise<FetchAgentHistoryPayload> {
+  private requireAgentHistoryCapabilities(options?: FetchAgentHistoryOptions): void {
+    const features = this.lastServerInfoMessage?.features;
     const archiveScope = options?.archiveScope;
     // COMPAT(agentHistoryArchiveScope): added in v0.16.0, remove gate after 2027-05-19.
     if (
       archiveScope !== undefined &&
       archiveScope !== "all" &&
-      this.lastServerInfoMessage?.features?.agentHistoryArchiveScope !== true
+      features?.agentHistoryArchiveScope !== true
     ) {
       throw new Error("Update the host to filter agent history by archive status.");
     }
+    const searchScope = options?.searchScope;
+    const usesArchivedAtSort = options?.sort?.some((entry) => entry.key === "archived_at") === true;
+    // COMPAT(agentHistoryQueryControls): added in v0.16.0, remove gate after 2027-05-19.
+    if (
+      ((searchScope !== undefined && searchScope !== "all") || usesArchivedAtSort) &&
+      features?.agentHistoryQueryControls !== true
+    ) {
+      throw new Error(
+        "Update the host to use agent history search scopes or archive-time sorting.",
+      );
+    }
+  }
+
+  async fetchAgentHistory(options?: FetchAgentHistoryOptions): Promise<FetchAgentHistoryPayload> {
+    this.requireAgentHistoryCapabilities(options);
+    const archiveScope = options?.archiveScope;
+    const searchScope = options?.searchScope;
     if (options?.filter?.includeBackground) this.requireBackgroundWorkspaces();
     const resolvedRequestId = this.createRequestId(options?.requestId);
     const message = SessionInboundMessageSchema.parse({
@@ -2952,6 +2970,7 @@ export class DaemonClient {
       ...(archiveScope !== undefined ? { archiveScope } : {}),
       ...(options?.filter ? { filter: options.filter } : {}),
       ...(options?.search ? { search: options.search } : {}),
+      ...(searchScope !== undefined ? { searchScope } : {}),
       ...(options?.sort ? { sort: options.sort } : {}),
       ...(options?.page ? { page: options.page } : {}),
     });
@@ -3147,11 +3166,20 @@ export class DaemonClient {
   }
 
   async listProjects(options?: string | ProjectListOptions): Promise<ProjectListPayload> {
+    const includeArchived = typeof options === "object" ? options.includeArchived : undefined;
+    // COMPAT(agentHistoryQueryControls): added in v0.16.0, remove gate after 2027-05-19.
+    if (
+      includeArchived === true &&
+      this.lastServerInfoMessage?.features?.agentHistoryQueryControls !== true
+    ) {
+      throw new Error("Update the host to list archived projects.");
+    }
     const requestId = typeof options === "string" ? options : options?.requestId;
     const resolvedRequestId = this.createRequestId(requestId);
     const message = SessionInboundMessageSchema.parse({
       type: "project.list.request",
       requestId: resolvedRequestId,
+      ...(includeArchived !== undefined ? { includeArchived } : {}),
       ...(typeof options === "object" && options.sync ? { sync: options.sync } : {}),
     });
     return this.sendRequest({

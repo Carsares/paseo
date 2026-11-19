@@ -9,6 +9,8 @@ function candidate(input: {
   workspaceName?: string | null;
   branch?: string | null;
   projectName?: string;
+  cwd?: string;
+  worktreeRoot?: string | null;
   updatedAt?: string;
 }): AgentHistorySearchCandidate & { agent: { id: string; updatedAt: string } } {
   const branch = input.branch ?? null;
@@ -23,17 +25,16 @@ function candidate(input: {
       projectName: input.projectName ?? "getpaseo/paseo",
       workspaceName: input.workspaceName ?? null,
       checkout: {
-        cwd: "/tmp/repo",
+        cwd: input.cwd ?? "/tmp/repo",
         isGit: branch !== null,
         currentBranch: branch,
         remoteUrl: null,
-        worktreeRoot: "/tmp/repo",
+        worktreeRoot: input.worktreeRoot === undefined ? "/tmp/repo" : input.worktreeRoot,
         isPaseoOwnedWorktree: false,
         mainRepoRoot: null,
       },
     },
-    // The module only reads the four names; the rest of the payload is the
-    // session's business.
+    // Only the fields read by the search are needed here.
   } as unknown as AgentHistorySearchCandidate & { agent: { id: string; updatedAt: string } };
 }
 
@@ -74,6 +75,50 @@ describe("matchesAgentHistoryQuery", () => {
     expect(matchesAgentHistoryQuery("paseo", candidate({ projectName: "getpaseo/paseo" }))).toBe(
       true,
     );
+  });
+
+  it("matches across names, branch, and checkout basename in all scope", () => {
+    const entry = candidate({
+      title: "entitlements",
+      workspaceName: "billing",
+      branch: "release",
+      projectName: "paseo",
+      worktreeRoot: "/tmp/worktrees/stripe/",
+    });
+    expect(
+      matchesAgentHistoryQuery("entitlements billing release paseo stripe", entry, "all"),
+    ).toBe(true);
+  });
+
+  it("matches workspace name, branch, and worktree basename in workspace scope", () => {
+    const entry = candidate({
+      title: "entitlements",
+      workspaceName: "billing",
+      branch: "release",
+      projectName: "paseo",
+      cwd: "/tmp/nested",
+      worktreeRoot: "C:\\worktrees\\stripe\\",
+    });
+    expect(matchesAgentHistoryQuery("billing release stripe", entry, "workspace")).toBe(true);
+    for (const query of ["entitlements", "paseo", "nested", "worktrees"]) {
+      expect(matchesAgentHistoryQuery(query, entry, "workspace")).toBe(false);
+    }
+    const directory = candidate({ cwd: "/tmp/checkout/", worktreeRoot: null });
+    expect(matchesAgentHistoryQuery("checkout", directory, "workspace")).toBe(true);
+  });
+
+  it("matches only the title in agent scope", () => {
+    const entry = candidate({
+      title: "entitlements",
+      workspaceName: "billing",
+      branch: "release",
+      projectName: "paseo",
+      worktreeRoot: "/tmp/worktrees/stripe",
+    });
+    expect(matchesAgentHistoryQuery("entitlements", entry, "agent")).toBe(true);
+    for (const query of ["billing", "release", "paseo", "stripe"]) {
+      expect(matchesAgentHistoryQuery(query, entry, "agent")).toBe(false);
+    }
   });
 
   it("requires every token to match somewhere", () => {
