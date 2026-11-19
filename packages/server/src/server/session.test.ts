@@ -3,6 +3,7 @@ import {
   type WorkspaceRuntimeStore,
 } from "./workspace-runtime-store/index.js";
 import { createAgentMessageDeliveryStub } from "./test-utils/session-stubs.js";
+import { createTestAgentClient } from "./test-utils/fake-agent-client.js";
 import {
   createMessageReceiptsStub,
   createTestCreationService,
@@ -1568,6 +1569,7 @@ function createStoredAgentRecord(
     attentionReason: overrides.attentionReason,
     attentionTimestamp: overrides.attentionTimestamp,
     internal: overrides.internal,
+    background: overrides.background,
     archivedAt: overrides.archivedAt ?? null,
   };
 }
@@ -1892,6 +1894,7 @@ describe("agent move to workspace RPC", () => {
         paseoHome: cwd,
         agentManager: {
           getAgent: manager.getAgent.bind(manager),
+          listAgents: manager.listAgents.bind(manager),
           archiveSnapshot: manager.archiveSnapshot.bind(manager),
           moveSubagentToWorkspace: manager.moveSubagentToWorkspace.bind(manager),
         },
@@ -1916,6 +1919,7 @@ describe("agent move to workspace RPC", () => {
       messages,
       registry,
       storage,
+      manager,
       project,
       cwd,
       workspaceRegistry,
@@ -2188,12 +2192,17 @@ describe("agent move to workspace RPC", () => {
   });
 
   test.each([
-    ["a root agent", parentId, sourceWorkspaceId, `Agent is not a subagent: ${parentId}`],
     [
-      "a cross-workspace subagent",
+      "a sole root agent (even with same-workspace subagents)",
+      parentId,
+      sourceWorkspaceId,
+      `Cannot move the only root agent in workspace: ${sourceWorkspaceId}`,
+    ],
+    [
+      "a sole cross-workspace subagent",
       childId,
       "parent-workspace",
-      `Agent is already in a separate workspace: ${childId}`,
+      `Cannot move the only root agent in workspace: ${sourceWorkspaceId}`,
     ],
   ])(
     "rejects %s without creating a workspace",
@@ -2219,6 +2228,350 @@ describe("agent move to workspace RPC", () => {
       });
     },
   );
+
+  test("rejects moving a root agent when the only other root agent in the workspace is background or archived", async () => {
+    const { session, messages, registry, storage, cwd } = await setup();
+    await storage.upsert(
+      createStoredAgentRecord({
+        id: "bg-root",
+        cwd,
+        workspaceId: sourceWorkspaceId,
+        background: true,
+      }),
+    );
+    await storage.upsert({
+      ...createStoredAgentRecord({
+        id: "archived-root",
+        cwd,
+        workspaceId: sourceWorkspaceId,
+      }),
+      archivedAt: "2026-01-03T00:00:00.000Z",
+    });
+    const workspacesBefore = await registry.listActive();
+
+    await session.handleMessage({
+      type: "agent.move_to_workspace.request",
+      agentId: parentId,
+      requestId: "move-sole-visible-root",
+    });
+
+    expect(await registry.listActive()).toEqual(workspacesBefore);
+    expect(await storage.get(parentId)).toMatchObject({ workspaceId: sourceWorkspaceId });
+    expect(findByType(messages, "agent.move_to_workspace.response")?.payload).toEqual({
+      requestId: "move-sole-visible-root",
+      agentId: parentId,
+      accepted: false,
+      workspaceId: null,
+      error: `Cannot move the only root agent in workspace: ${sourceWorkspaceId}`,
+    });
+  });
+
+  test("moves a sibling root agent and its same-workspace descendants to a new workspace while leaving the other root", async () => {
+    const { session, messages, registry, storage, project, cwd } = await setup();
+    const siblingRootId = "sibling-root";
+    const siblingLastUserMessageAt = "2026-01-01T12:00:00.000Z";
+    const grandchildId = "grandchild-agent";
+    const parentRecord = (await storage.get(parentId))!;
+    await storage.upsert({
+      ...parentRecord,
+      title: "Root A",
+      labels: {
+        [getOpenAgentTabLabel("client-a")]: "true",
+        team: "alpha",
+      },
+    });
+    await storage.upsert(
+      createStoredAgentRecord({
+        id: grandchildId,
+        cwd,
+        workspaceId: sourceWorkspaceId,
+        labels: {
+          [PARENT_AGENT_ID_LABEL]: childId,
+          [getOpenAgentTabLabel("client-c")]: "true",
+          role: "grandchild",
+        },
+      }),
+    );
+    await storage.upsert(
+      createStoredAgentRecord({
+        id: siblingRootId,
+        cwd,
+        workspaceId: sourceWorkspaceId,
+        title: "Root B",
+        lastUserMessageAt: siblingLastUserMessageAt,
+      }),
+    );
+
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "subscribe-agents",
+      subscribe: { subscriptionId: "agents-sub" },
+    });
+    await session.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: "subscribe-workspaces",
+      subscribe: { subscriptionId: "workspaces-sub" },
+    });
+    messages.length = 0;
+
+    await session.handleMessage({
+      type: "agent.move_to_workspace.request",
+      agentId: parentId,
+      requestId: "move-root-a",
+    });
+
+    const workspaces = await registry.listActive();
+    expect(workspaces).toHaveLength(2);
+    const moved = workspaces.find((workspace) => workspace.workspaceId !== sourceWorkspaceId)!;
+    expect(moved).toMatchObject({ projectId: project.projectId, cwd, title: "Root A" });
+    expect(moved.parentWorkspaceId).toBeUndefined();
+
+    expect(await storage.get(parentId)).toMatchObject({
+      cwd,
+      workspaceId: moved.workspaceId,
+      labels: { team: "alpha" },
+    });
+    expect(await storage.get(childId)).toMatchObject({
+      cwd,
+      workspaceId: moved.workspaceId,
+      labels: { [PARENT_AGENT_ID_LABEL]: parentId, topic: "review" },
+    });
+    expect(await storage.get(grandchildId)).toMatchObject({
+      cwd,
+      workspaceId: moved.workspaceId,
+      labels: { [PARENT_AGENT_ID_LABEL]: childId, role: "grandchild" },
+    });
+    expect(await storage.get(siblingRootId)).toMatchObject({
+      cwd,
+      workspaceId: sourceWorkspaceId,
+    });
+
+    const agentUpdates = messages.filter((message) => message.type === "agent_update");
+    expect(agentUpdates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            kind: "upsert",
+            agent: expect.objectContaining({ id: parentId, workspaceId: moved.workspaceId }),
+          }),
+        }),
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            kind: "upsert",
+            agent: expect.objectContaining({
+              id: childId,
+              workspaceId: moved.workspaceId,
+              labels: { [PARENT_AGENT_ID_LABEL]: parentId, topic: "review" },
+            }),
+          }),
+        }),
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            kind: "upsert",
+            agent: expect.objectContaining({
+              id: grandchildId,
+              workspaceId: moved.workspaceId,
+              labels: { [PARENT_AGENT_ID_LABEL]: childId, role: "grandchild" },
+            }),
+          }),
+        }),
+      ]),
+    );
+    expect(messages.filter((message) => message.type === "workspace_update")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            kind: "upsert",
+            workspace: expect.objectContaining({
+              id: sourceWorkspaceId,
+              lastUserMessageAt: siblingLastUserMessageAt,
+            }),
+          }),
+        }),
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            kind: "upsert",
+            workspace: expect.objectContaining({
+              id: moved.workspaceId,
+              lastUserMessageAt,
+            }),
+          }),
+        }),
+      ]),
+    );
+    expect(findByType(messages, "agent.move_to_workspace.response")?.payload).toEqual({
+      requestId: "move-root-a",
+      agentId: parentId,
+      accepted: true,
+      workspaceId: moved.workspaceId,
+      error: null,
+    });
+
+    // Moving the remaining sole root agent in sourceWorkspaceId is now rejected.
+    messages.length = 0;
+    await session.handleMessage({
+      type: "agent.move_to_workspace.request",
+      agentId: siblingRootId,
+      requestId: "move-remaining-root",
+    });
+    expect(await registry.listActive()).toHaveLength(2);
+    expect(await storage.get(siblingRootId)).toMatchObject({ workspaceId: sourceWorkspaceId });
+    expect(findByType(messages, "agent.move_to_workspace.response")?.payload).toEqual({
+      requestId: "move-remaining-root",
+      agentId: siblingRootId,
+      accepted: false,
+      workspaceId: null,
+      error: `Cannot move the only root agent in workspace: ${sourceWorkspaceId}`,
+    });
+  });
+
+  test("serializes concurrent moves of two sibling root agents so the workspace is never left empty", async () => {
+    const { session, messages, registry, storage, cwd } = await setup();
+    const siblingRootId = "sibling-root";
+    await storage.upsert(
+      createStoredAgentRecord({
+        id: siblingRootId,
+        cwd,
+        workspaceId: sourceWorkspaceId,
+        title: "Root B",
+      }),
+    );
+
+    await Promise.all([
+      session.handleMessage({
+        type: "agent.move_to_workspace.request",
+        agentId: parentId,
+        requestId: "move-a",
+      }),
+      session.handleMessage({
+        type: "agent.move_to_workspace.request",
+        agentId: siblingRootId,
+        requestId: "move-b",
+      }),
+    ]);
+
+    const responses = messages
+      .filter((message) => message.type === "agent.move_to_workspace.response")
+      .map((message) => message.payload);
+    expect(responses).toHaveLength(2);
+    expect(responses.filter((payload) => payload.accepted)).toHaveLength(1);
+    expect(responses.filter((payload) => !payload.accepted)).toEqual([
+      expect.objectContaining({
+        accepted: false,
+        workspaceId: null,
+        error: `Cannot move the only root agent in workspace: ${sourceWorkspaceId}`,
+      }),
+    ]);
+    expect(await registry.listActive()).toHaveLength(2);
+    expect((await storage.listByWorkspaces([sourceWorkspaceId])).length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("allows moving a root agent when the sibling root is live in AgentManager", async () => {
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "paseo-session-live-sibling-")));
+    tempDirs.push(cwd);
+    const logger = pino({ level: "silent" });
+    const storage = new AgentStorage(join(cwd, "agents"), logger);
+    const manager = new AgentManager({
+      clients: { codex: createTestAgentClient("codex") },
+      registry: storage,
+      logger,
+    });
+    const liveOnManager = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId: sourceWorkspaceId,
+      initialTitle: "Live on manager",
+    });
+    await manager.flush();
+    await storage.remove(liveOnManager.id);
+    const rootToMove = createStoredAgentRecord({
+      id: "stored-root",
+      cwd,
+      workspaceId: sourceWorkspaceId,
+      title: "Stored root",
+    });
+    await storage.upsert(rootToMove);
+
+    const registry = new FileBackedWorkspaceRegistry(join(cwd, "workspaces.json"), logger);
+    const project = createPersistedProjectRecord({
+      projectId: "move-project",
+      rootPath: cwd,
+      kind: "non_git",
+      displayName: "Project",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    await registry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId: sourceWorkspaceId,
+        projectId: project.projectId,
+        cwd,
+        kind: "directory",
+        displayName: sourceWorkspaceId,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      paseoHome: cwd,
+      agentManager: {
+        getAgent: manager.getAgent.bind(manager),
+        listAgents: manager.listAgents.bind(manager),
+        archiveSnapshot: manager.archiveSnapshot.bind(manager),
+        moveSubagentToWorkspace: manager.moveSubagentToWorkspace.bind(manager),
+      },
+      agentStorage: {
+        get: storage.get.bind(storage),
+        listActive: storage.listActive.bind(storage),
+        listByWorkspace: (workspaceId: string) => storage.listByWorkspace(workspaceId),
+        listByWorkspaces: storage.listByWorkspaces.bind(storage),
+        lastUserMessageAtByWorkspace: storage.lastUserMessageAtByWorkspace.bind(storage),
+      },
+      workspaceRegistry: {
+        get: vi.fn(registry.get.bind(registry)),
+        listActive: registry.listActive.bind(registry),
+        upsert: registry.upsert.bind(registry),
+        archive: registry.archive.bind(registry),
+        remove: registry.remove.bind(registry),
+      },
+      projectRegistry: {
+        get: vi.fn().mockResolvedValue(project),
+        list: vi.fn().mockResolvedValue([project]),
+      },
+      workspaceGitService: {
+        getCheckout: vi.fn((directory: string) => ({
+          cwd: directory,
+          isGit: false,
+          currentBranch: null,
+          remoteUrl: null,
+          worktreeRoot: null,
+          isPaseoOwnedWorktree: false,
+          mainRepoRoot: null,
+        })),
+      },
+    });
+    sessions.push(session);
+
+    try {
+      await session.handleMessage({
+        type: "agent.move_to_workspace.request",
+        agentId: rootToMove.id,
+        requestId: "move-with-live-sibling",
+      });
+
+      const response = findByType(messages, "agent.move_to_workspace.response")?.payload;
+      expect(response).toMatchObject({
+        requestId: "move-with-live-sibling",
+        agentId: rootToMove.id,
+        accepted: true,
+        error: null,
+      });
+      expect(response?.workspaceId).toBeTruthy();
+      expect(response?.workspaceId).not.toBe(sourceWorkspaceId);
+    } finally {
+      await manager.closeAgent(liveOnManager.id);
+    }
+  });
 });
 
 function createProjectRecord(rootPath: string, archivedAt: string | null = null) {

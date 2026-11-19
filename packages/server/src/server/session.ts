@@ -302,6 +302,7 @@ import { SessionAuthorization, type DaemonPermission } from "./authorization/ind
 interface WorkspaceArchiveActivity {
   archives: Map<string, Set<object | symbol>>;
   moves: Map<string, Set<Promise<void>>>;
+  moveQueues: Map<string, Promise<void>>;
 }
 
 const workspaceArchiveActivityByRegistry = new WeakMap<
@@ -313,7 +314,7 @@ const externalWorkspaceArchive = Symbol("external workspace archive");
 function getWorkspaceArchiveActivity(registry: WorkspaceRegistry): WorkspaceArchiveActivity {
   const existing = workspaceArchiveActivityByRegistry.get(registry);
   if (existing) return existing;
-  const activity = { archives: new Map(), moves: new Map() };
+  const activity = { archives: new Map(), moves: new Map(), moveQueues: new Map() };
   workspaceArchiveActivityByRegistry.set(registry, activity);
   return activity;
 }
@@ -3871,22 +3872,25 @@ export class Session {
   ): Promise<void> {
     let finishMove: (() => void) | undefined;
     try {
-      const result = await moveAgentToWorkspaceCommand(
-        { agentManager: this.agentManager },
-        agentId,
-        {
+      const preMoveAgent =
+        this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
+      const queuedWorkspaceId = preMoveAgent?.workspaceId?.trim() || undefined;
+      const result = await this.withWorkspaceMoveQueue(queuedWorkspaceId, () =>
+        moveAgentToWorkspaceCommand({ agentManager: this.agentManager }, agentId, {
           idempotencyKey,
           allocateWorkspace: async (source) => {
-            const parentLive = this.agentManager.getAgent(source.previousParentAgentId);
-            const parentStored = parentLive
-              ? null
-              : await this.agentStorage.get(source.previousParentAgentId);
             const sourceWorkspace = await this.requireMoveSourceWorkspace(source.sourceWorkspaceId);
-            const parentWorkspaceId = (
-              parentLive?.workspaceId ?? parentStored?.workspaceId
-            )?.trim();
-            if (parentWorkspaceId && parentWorkspaceId !== source.sourceWorkspaceId) {
-              throw new Error(`Agent is already in a separate workspace: ${source.agentId}`);
+            const isSameWorkspaceSubagent = await this.isSameWorkspaceSubagent(
+              source.previousParentAgentId,
+              source.sourceWorkspaceId,
+            );
+            if (
+              !isSameWorkspaceSubagent &&
+              !(await this.hasSiblingWorkspaceRootAgent(source.sourceWorkspaceId, source.agentId))
+            ) {
+              throw new Error(
+                `Cannot move the only root agent in workspace: ${source.sourceWorkspaceId}`,
+              );
             }
 
             finishMove = this.reserveWorkspaceMove(source.sourceWorkspaceId);
@@ -3913,8 +3917,8 @@ export class Session {
             }
             return { workspaceId: created.workspaceId, rollback };
           },
-        },
-      ).finally(() => finishMove?.());
+        }).finally(() => finishMove?.()),
+      );
       const affectedWorkspaceIds = new Set<string>([result.sourceWorkspaceId, result.workspaceId]);
       const warnUpdateFailure = (error: unknown) =>
         this.sessionLogger.warn(
@@ -3924,14 +3928,19 @@ export class Session {
       if (!result.live) {
         await this.agentUpdates.emitStoredRecord(result.record).catch(warnUpdateFailure);
       }
-      const rootWorkspaceId = await this.resolveDelegationRootWorkspaceId(
-        result.previousParentAgentId,
-      ).catch((error) => {
-        warnUpdateFailure(error);
-        return null;
-      });
-      if (rootWorkspaceId) {
-        affectedWorkspaceIds.add(rootWorkspaceId);
+      for (const descendantRecord of result.movedDescendantStoredRecords ?? []) {
+        await this.agentUpdates.emitStoredRecord(descendantRecord).catch(warnUpdateFailure);
+      }
+      if (result.previousParentAgentId) {
+        const rootWorkspaceId = await this.resolveDelegationRootWorkspaceId(
+          result.previousParentAgentId,
+        ).catch((error) => {
+          warnUpdateFailure(error);
+          return null;
+        });
+        if (rootWorkspaceId) {
+          affectedWorkspaceIds.add(rootWorkspaceId);
+        }
       }
       await this.emitWorkspaceUpdatesForWorkspaceIds(affectedWorkspaceIds).catch(warnUpdateFailure);
 
@@ -3961,6 +3970,123 @@ export class Session {
         },
       });
     }
+  }
+
+  private async withWorkspaceMoveQueue<T>(
+    workspaceId: string | undefined,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (!workspaceId) {
+      return operation();
+    }
+    const queues = this.workspaceArchiveActivity.moveQueues;
+    const previous = queues.get(workspaceId);
+    let release!: () => void;
+    const current = new Promise<void>((finish) => {
+      release = finish;
+    });
+    const tail = (previous ?? Promise.resolve()).then(() => current);
+    queues.set(workspaceId, tail);
+    try {
+      if (previous) {
+        await previous;
+      }
+      return await operation();
+    } finally {
+      release();
+      if (queues.get(workspaceId) === tail) {
+        queues.delete(workspaceId);
+      }
+    }
+  }
+
+  private async isSameWorkspaceSubagent(
+    previousParentAgentId: string | null,
+    sourceWorkspaceId: string,
+  ): Promise<boolean> {
+    if (!previousParentAgentId) {
+      return false;
+    }
+    const parentLive = this.agentManager.getAgent(previousParentAgentId);
+    const parentStored = parentLive ? null : await this.agentStorage.get(previousParentAgentId);
+    if (parentStored?.archivedAt) {
+      return false;
+    }
+    const parentWorkspaceId = (parentLive?.workspaceId ?? parentStored?.workspaceId)?.trim();
+    return Boolean(parentWorkspaceId && parentWorkspaceId === sourceWorkspaceId);
+  }
+
+  private async listActiveVisibleAgentsInWorkspace(
+    sourceWorkspaceId: string,
+  ): Promise<Map<string, Record<string, string>>> {
+    const [storedRecords, liveAgents] = [
+      await this.agentStorage.listByWorkspaces([sourceWorkspaceId]),
+      this.agentManager.listAgents(),
+    ];
+    const liveById = new Map(liveAgents.map((agent) => [agent.id, agent]));
+    const candidates = new Map<string, Record<string, string>>();
+
+    for (const record of storedRecords) {
+      if (record.internal || record.archivedAt) {
+        continue;
+      }
+      const live = liveById.get(record.id) ?? this.agentManager.getAgent(record.id);
+      const effective = live ?? record;
+      if (effective.internal || effective.background === true) {
+        continue;
+      }
+      if ((live?.workspaceId ?? record.workspaceId)?.trim() !== sourceWorkspaceId) {
+        continue;
+      }
+      candidates.set(record.id, effective.labels);
+    }
+
+    for (const live of liveAgents) {
+      if (
+        candidates.has(live.id) ||
+        live.internal ||
+        live.background === true ||
+        live.workspaceId?.trim() !== sourceWorkspaceId
+      ) {
+        continue;
+      }
+      const stored = await this.agentStorage.get(live.id);
+      if (!stored?.archivedAt) {
+        candidates.set(live.id, live.labels);
+      }
+    }
+
+    return candidates;
+  }
+
+  private async isWorkspaceRootCandidate(
+    labels: Record<string, string>,
+    sourceWorkspaceId: string,
+  ): Promise<boolean> {
+    const parentId = getParentAgentIdFromLabels(labels);
+    if (!parentId) {
+      return true;
+    }
+    const parent = this.agentManager.getAgent(parentId) ?? (await this.agentStorage.get(parentId));
+    const parentArchived = Boolean(parent && "archivedAt" in parent && parent.archivedAt);
+    const parentWorkspaceId = parent && !parentArchived ? parent.workspaceId?.trim() : undefined;
+    return Boolean(parentWorkspaceId && parentWorkspaceId !== sourceWorkspaceId);
+  }
+
+  private async hasSiblingWorkspaceRootAgent(
+    sourceWorkspaceId: string,
+    excludedAgentId: string,
+  ): Promise<boolean> {
+    const candidates = await this.listActiveVisibleAgentsInWorkspace(sourceWorkspaceId);
+    for (const [candidateId, labels] of candidates) {
+      if (
+        candidateId !== excludedAgentId &&
+        (await this.isWorkspaceRootCandidate(labels, sourceWorkspaceId))
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private async requireMoveSourceWorkspace(workspaceId: string): Promise<PersistedWorkspaceRecord> {

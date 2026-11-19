@@ -370,7 +370,7 @@ export interface MoveSubagentToWorkspaceSource {
   sourceWorkspaceId: string;
   title: string | null;
   background: boolean;
-  previousParentAgentId: string;
+  previousParentAgentId: string | null;
 }
 
 export interface MoveSubagentToWorkspaceAllocation {
@@ -390,7 +390,8 @@ export interface MoveSubagentToWorkspaceResult {
   live: boolean;
   sourceWorkspaceId: string;
   workspaceId: string;
-  previousParentAgentId: string;
+  previousParentAgentId: string | null;
+  movedDescendantStoredRecords?: StoredAgentRecord[];
 }
 
 export interface AgentManagerOptions {
@@ -834,14 +835,21 @@ function shouldDetachFromArchivedParent(
   return isCrossWorkspace || hasOpenAgentTab(child.labels);
 }
 
-function detachedAgentLabelPatch(labels: Record<string, string>): AgentLabelPatch {
-  const patch: AgentLabelPatch = { [PARENT_AGENT_ID_LABEL]: null };
+function clearOpenAgentTabLabelPatch(labels: Record<string, string>): AgentLabelPatch {
+  const patch: AgentLabelPatch = {};
   for (const label of Object.keys(labels)) {
     if (isOpenAgentTabLabel(label)) {
       patch[label] = null;
     }
   }
   return patch;
+}
+
+function detachedAgentLabelPatch(labels: Record<string, string>): AgentLabelPatch {
+  return {
+    ...clearOpenAgentTabLabelPatch(labels),
+    [PARENT_AGENT_ID_LABEL]: null,
+  };
 }
 
 function normalizeSubagentMoveTitle(title: string | null | undefined): string | null {
@@ -861,10 +869,7 @@ function describeSubagentMoveSource(
   if (storedRecord?.archivedAt || ("archivedAt" in current && current.archivedAt)) {
     throw new Error(`Agent is archived: ${agentId}`);
   }
-  const previousParentAgentId = getParentAgentIdFromLabels(current.labels);
-  if (!previousParentAgentId) {
-    throw new Error(`Agent is not a subagent: ${agentId}`);
-  }
+  const previousParentAgentId = getParentAgentIdFromLabels(current.labels) ?? null;
   const sourceWorkspaceId = (current.workspaceId ?? storedRecord?.workspaceId)?.trim();
   if (!sourceWorkspaceId) {
     throw new Error(`Agent has no workspace: ${agentId}`);
@@ -2857,7 +2862,11 @@ export class AgentManager {
         throw new Error(`Move requires a different workspace: ${agentId}`);
       }
       if (liveAgent) {
-        record = await this.persistLiveSubagentMove(registry, liveAgent, workspaceId);
+        const labels = applyRecordPatch(
+          liveAgent.labels,
+          detachedAgentLabelPatch(liveAgent.labels),
+        );
+        record = await this.persistLiveAgentMove(registry, liveAgent, workspaceId, labels);
       } else {
         const stored = storedRecord!;
         record = {
@@ -2880,12 +2889,20 @@ export class AgentManager {
       throw error;
     }
 
+    const movedDescendantStoredRecords = await this.moveSameWorkspaceDescendants(
+      registry,
+      agentId,
+      sourceWorkspaceId,
+      workspaceId,
+    );
+
     const result: MoveSubagentToWorkspaceResult = {
       record,
       live: Boolean(liveAgent),
       sourceWorkspaceId,
       workspaceId,
       previousParentAgentId,
+      ...(movedDescendantStoredRecords.length > 0 ? { movedDescendantStoredRecords } : {}),
     };
     if (receiptKey) {
       if (this.moveToWorkspaceReceipts.size >= 256) {
@@ -2898,14 +2915,132 @@ export class AgentManager {
     return result;
   }
 
-  private async persistLiveSubagentMove(
+  private async collectSameWorkspaceDescendantCandidates(
+    registry: AgentStorage,
+    rootAgentId: string,
+    sourceWorkspaceId: string,
+  ): Promise<Map<string, Record<string, string>>> {
+    const storedInSource = await registry.listByWorkspaces([sourceWorkspaceId]);
+    const candidates = new Map<string, Record<string, string>>();
+    for (const record of storedInSource) {
+      if (record.id === rootAgentId || record.internal || record.archivedAt) {
+        continue;
+      }
+      const live = this.agents.get(record.id);
+      if ((live?.workspaceId ?? record.workspaceId)?.trim() !== sourceWorkspaceId) {
+        continue;
+      }
+      candidates.set(record.id, live?.labels ?? record.labels);
+    }
+    for (const live of this.agents.values()) {
+      if (
+        live.id === rootAgentId ||
+        candidates.has(live.id) ||
+        live.workspaceId?.trim() !== sourceWorkspaceId
+      ) {
+        continue;
+      }
+      const stored = await registry.get(live.id);
+      if (!stored?.archivedAt) {
+        candidates.set(live.id, live.labels);
+      }
+    }
+    return candidates;
+  }
+
+  private async findSameWorkspaceDescendantIds(
+    registry: AgentStorage,
+    rootAgentId: string,
+    sourceWorkspaceId: string,
+  ): Promise<string[]> {
+    const candidates = await this.collectSameWorkspaceDescendantCandidates(
+      registry,
+      rootAgentId,
+      sourceWorkspaceId,
+    );
+    const owners = new Set<string>([rootAgentId]);
+    const descendantIds: string[] = [];
+    let added = true;
+    while (added) {
+      added = false;
+      for (const [candidateId, labels] of candidates) {
+        if (owners.has(candidateId)) {
+          continue;
+        }
+        const parentId = getParentAgentIdFromLabels(labels);
+        if (parentId && owners.has(parentId)) {
+          owners.add(candidateId);
+          descendantIds.push(candidateId);
+          added = true;
+        }
+      }
+    }
+    return descendantIds;
+  }
+
+  private async moveSameWorkspaceDescendants(
+    registry: AgentStorage,
+    rootAgentId: string,
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+  ): Promise<StoredAgentRecord[]> {
+    const descendantIds = await this.findSameWorkspaceDescendantIds(
+      registry,
+      rootAgentId,
+      sourceWorkspaceId,
+    );
+    const movedDescendantStoredRecords: StoredAgentRecord[] = [];
+    for (const childId of descendantIds) {
+      await this.runLifecycleMutation(childId, async () => {
+        const liveChild = this.agents.get(childId);
+        const storedChild = await registry.get(childId);
+        if (!liveChild && !storedChild) {
+          return;
+        }
+        if (storedChild?.archivedAt) {
+          return;
+        }
+        if ((liveChild?.workspaceId ?? storedChild?.workspaceId)?.trim() !== sourceWorkspaceId) {
+          return;
+        }
+        if (liveChild) {
+          if (liveChild.internal) {
+            liveChild.workspaceId = targetWorkspaceId;
+            return;
+          }
+          const labels = applyRecordPatch(
+            liveChild.labels,
+            clearOpenAgentTabLabelPatch(liveChild.labels),
+          );
+          await this.persistLiveAgentMove(registry, liveChild, targetWorkspaceId, labels);
+          this.emitState(liveChild, { persist: false });
+          return;
+        }
+        const stored = storedChild!;
+        const updatedChild: StoredAgentRecord = {
+          ...stored,
+          workspaceId: targetWorkspaceId,
+          labels: applyRecordPatch(stored.labels, clearOpenAgentTabLabelPatch(stored.labels)),
+          updatedAt: this.nextStoredUpdatedAt(stored),
+        };
+        await registry.upsert(updatedChild);
+        const persistedChild = await registry.get(childId);
+        if (persistedChild?.workspaceId === targetWorkspaceId) {
+          movedDescendantStoredRecords.push(persistedChild);
+        }
+      });
+    }
+    return movedDescendantStoredRecords;
+  }
+
+  private async persistLiveAgentMove(
     registry: AgentStorage,
     agent: LiveManagedAgent,
     workspaceId: string,
+    labels: Record<string, string>,
   ): Promise<StoredAgentRecord> {
     // Provider events can publish state during the write. Keep the live fields
     // unchanged until the staged snapshot commits.
-    const labels = applyRecordPatch(agent.labels, detachedAgentLabelPatch(agent.labels));
     const snapshot = { ...agent, workspaceId, labels };
     const updatedAt = this.touchUpdatedAt(snapshot);
     const pending = this.persistSnapshot(snapshot).then(async () => {

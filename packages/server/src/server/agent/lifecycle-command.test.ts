@@ -530,7 +530,7 @@ describe("moveAgentToWorkspaceCommand", () => {
     expect(await storage.listByWorkspaces([workspaceId])).toEqual([]);
   });
 
-  test("replays the committed move and rejects a concurrent request without the key", async () => {
+  test("replays the committed move and passes post-move root state to a concurrent request without the key", async () => {
     const stored = closedSubagent();
     await storage.upsert(stored);
     const allocationStarted = deferred();
@@ -541,17 +541,26 @@ describe("moveAgentToWorkspaceCommand", () => {
       return { workspaceId };
     });
     const unexpectedAllocation = vi.fn(async () => ({ workspaceId: "ws-unexpected" }));
-    const move = (idempotencyKey?: string) =>
+    const rejectSecondMove = vi.fn(async (source: { sourceWorkspaceId: string }) => {
+      throw new Error(`Cannot move the only root agent in workspace: ${source.sourceWorkspaceId}`);
+    });
+    const move = (
+      idempotencyKey?: string,
+      customAllocate: typeof allocateWorkspace = idempotencyKey === "  move-once  "
+        ? allocateWorkspace
+        : unexpectedAllocation,
+    ) =>
       moveAgentToWorkspaceCommand({ agentManager: manager }, stored.id, {
         idempotencyKey,
-        allocateWorkspace:
-          idempotencyKey === "  move-once  " ? allocateWorkspace : unexpectedAllocation,
+        allocateWorkspace: customAllocate,
       });
 
     const first = move("  move-once  ");
     await Promise.race([allocationStarted.promise, first]);
     const replay = move("move-once");
-    const withoutKey = expect(move()).rejects.toThrow(`Agent is not a subagent: ${stored.id}`);
+    const withoutKey = expect(move(undefined, rejectSecondMove)).rejects.toThrow(
+      `Cannot move the only root agent in workspace: ${workspaceId}`,
+    );
     finishAllocation.resolve();
 
     const result = await first;
@@ -560,15 +569,20 @@ describe("moveAgentToWorkspaceCommand", () => {
     await withoutKey;
     expect(allocateWorkspace).toHaveBeenCalledTimes(1);
     expect(unexpectedAllocation).not.toHaveBeenCalled();
+    expect(rejectSecondMove).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: stored.id,
+        sourceWorkspaceId: workspaceId,
+        previousParentAgentId: null,
+      }),
+    );
   });
 
-  test("rejects missing, internal, root, archived, and unassigned agents before allocation", async () => {
-    const root = { ...closedSubagent(), labels: {} };
+  test("rejects missing, internal, archived, and unassigned agents before allocation", async () => {
     const archived = { ...closedSubagent(), archivedAt: "2026-05-10T10:00:00.000Z" };
     const internal = { ...closedSubagent(), internal: true };
     const unassigned = { ...closedSubagent(), workspaceId: undefined };
     const missingId = randomUUID();
-    await storage.upsert(root);
     await storage.upsert(archived);
     await storage.upsert(internal);
     await storage.upsert(unassigned);
@@ -576,12 +590,203 @@ describe("moveAgentToWorkspaceCommand", () => {
     const move = (agentId: string) =>
       moveAgentToWorkspaceCommand({ agentManager: manager }, agentId, { allocateWorkspace });
 
-    await expect(move(root.id)).rejects.toThrow(`Agent is not a subagent: ${root.id}`);
     await expect(move(archived.id)).rejects.toThrow(`Agent is archived: ${archived.id}`);
     await expect(move(internal.id)).rejects.toThrow(`Agent not found: ${internal.id}`);
     await expect(move(unassigned.id)).rejects.toThrow(`Agent has no workspace: ${unassigned.id}`);
     await expect(move(missingId)).rejects.toThrow(`Agent not found: ${missingId}`);
     expect(allocateWorkspace).not.toHaveBeenCalled();
+  });
+
+  test("moves a root agent, clears open-tab labels, and returns previousParentAgentId null", async () => {
+    const root: StoredAgentRecord = {
+      ...storedAgent(randomUUID()),
+      cwd,
+      workspaceId: sourceWorkspaceId,
+      title: "Root task",
+      labels: {
+        [getOpenAgentTabLabel("client-a")]: "true",
+        [getOpenAgentTabLabel("client-b")]: "true",
+        team: "test",
+      },
+    };
+    await storage.upsert(root);
+    const allocateWorkspace = vi.fn(async () => ({ workspaceId }));
+
+    const result = await moveAgentToWorkspaceCommand({ agentManager: manager }, root.id, {
+      allocateWorkspace,
+    });
+
+    expect(allocateWorkspace).toHaveBeenCalledExactlyOnceWith({
+      agentId: root.id,
+      cwd,
+      sourceWorkspaceId,
+      title: "Root task",
+      background: false,
+      previousParentAgentId: null,
+    });
+    expect(result).toEqual({
+      agentId: root.id,
+      live: false,
+      sourceWorkspaceId,
+      workspaceId,
+      previousParentAgentId: null,
+      record: {
+        ...root,
+        workspaceId,
+        labels: { team: "test" },
+        updatedAt: expect.any(String),
+      },
+    });
+    expect(await storage.listByWorkspaces([sourceWorkspaceId])).toEqual([]);
+    expect(await storage.listByWorkspaces([workspaceId])).toEqual([result.record]);
+  });
+
+  test("moves active same-workspace live, stored, and nested descendants while preserving parent labels", async () => {
+    manager = new AgentManager({
+      clients: { codex: createTestAgentClient("codex") },
+      registry: storage,
+      logger,
+    });
+    const root = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId: sourceWorkspaceId,
+      labels: {
+        [getOpenAgentTabLabel("client-a")]: "true",
+        role: "root",
+      },
+      initialTitle: "Root agent",
+    });
+    const liveChild = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId: sourceWorkspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: root.id,
+        [getOpenAgentTabLabel("client-b")]: "true",
+        role: "live-child",
+      },
+    });
+    const internalChild = await manager.createAgent(
+      { provider: "codex", cwd, internal: true },
+      undefined,
+      {
+        workspaceId: sourceWorkspaceId,
+        labels: {
+          [PARENT_AGENT_ID_LABEL]: root.id,
+        },
+      },
+    );
+    const storedChild: StoredAgentRecord = {
+      ...storedAgent(randomUUID()),
+      cwd,
+      workspaceId: sourceWorkspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: root.id,
+        [getOpenAgentTabLabel("client-c")]: "true",
+        role: "stored-child",
+      },
+    };
+    const storedGrandchild: StoredAgentRecord = {
+      ...storedAgent(randomUUID()),
+      cwd,
+      workspaceId: sourceWorkspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: storedChild.id,
+        [getOpenAgentTabLabel("client-d")]: "true",
+        role: "grandchild",
+      },
+    };
+    const crossWorkspaceChild: StoredAgentRecord = {
+      ...storedAgent(randomUUID()),
+      cwd,
+      workspaceId: "ws-other",
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: root.id,
+        role: "cross-workspace",
+      },
+    };
+    const archivedChild: StoredAgentRecord = {
+      ...storedAgent(randomUUID()),
+      cwd,
+      workspaceId: sourceWorkspaceId,
+      archivedAt: "2026-05-10T10:00:00.000Z",
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: root.id,
+        role: "archived",
+      },
+    };
+    const siblingRoot: StoredAgentRecord = {
+      ...storedAgent(randomUUID()),
+      cwd,
+      workspaceId: sourceWorkspaceId,
+      labels: { role: "sibling" },
+    };
+    await Promise.all([
+      manager.flush(),
+      storage.upsert(storedChild),
+      storage.upsert(storedGrandchild),
+      storage.upsert(crossWorkspaceChild),
+      storage.upsert(archivedChild),
+      storage.upsert(siblingRoot),
+    ]);
+
+    const emittedStates: ManagedAgent[] = [];
+    const unsubscribe = manager.subscribe(
+      (event) => {
+        if (event.type === "agent_state") emittedStates.push(event.agent);
+      },
+      { replayState: false },
+    );
+
+    try {
+      const result = await moveAgentToWorkspaceCommand({ agentManager: manager }, root.id, {
+        allocateWorkspace: async () => ({ workspaceId }),
+      });
+      await manager.flush();
+
+      expect(result.previousParentAgentId).toBeNull();
+      expect(result.live).toBe(true);
+      expect(result.record).toMatchObject({ workspaceId, labels: { role: "root" } });
+      expect(result.movedDescendantStoredRecords).toHaveLength(2);
+      expect(result.movedDescendantStoredRecords).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: storedChild.id,
+            workspaceId,
+            labels: { [PARENT_AGENT_ID_LABEL]: root.id, role: "stored-child" },
+          }),
+          expect.objectContaining({
+            id: storedGrandchild.id,
+            workspaceId,
+            labels: { [PARENT_AGENT_ID_LABEL]: storedChild.id, role: "grandchild" },
+          }),
+        ]),
+      );
+
+      expect(manager.getAgent(root.id)).toMatchObject({ workspaceId, labels: { role: "root" } });
+      expect(manager.getAgent(liveChild.id)).toMatchObject({
+        workspaceId,
+        labels: { [PARENT_AGENT_ID_LABEL]: root.id, role: "live-child" },
+      });
+      expect(manager.getAgent(internalChild.id)?.workspaceId).toBe(workspaceId);
+      expect(emittedStates.find((agent) => agent.id === liveChild.id)).toMatchObject({
+        id: liveChild.id,
+        workspaceId,
+        labels: { [PARENT_AGENT_ID_LABEL]: root.id, role: "live-child" },
+      });
+      expect(await storage.get(liveChild.id)).toMatchObject({
+        workspaceId,
+        labels: { [PARENT_AGENT_ID_LABEL]: root.id, role: "live-child" },
+      });
+      expect(await storage.get(crossWorkspaceChild.id)).toEqual(crossWorkspaceChild);
+      expect(await storage.get(archivedChild.id)).toEqual(archivedChild);
+      expect(await storage.get(siblingRoot.id)).toEqual(siblingRoot);
+      expect((await storage.listByWorkspaces([sourceWorkspaceId])).map((r) => r.id)).toEqual([
+        siblingRoot.id,
+      ]);
+      expect((await storage.listByWorkspaces([workspaceId])).map((r) => r.id).sort()).toEqual(
+        [root.id, liveChild.id, storedChild.id, storedGrandchild.id].sort(),
+      );
+    } finally {
+      unsubscribe();
+    }
   });
 
   test("rolls back the allocation and restores the live agent if persistence fails", async () => {
