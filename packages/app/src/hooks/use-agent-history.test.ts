@@ -1,4 +1,10 @@
-import { describe, expect, it } from "vitest";
+/**
+ * @vitest-environment jsdom
+ */
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { createElement, type PropsWithChildren } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   DaemonClient,
   FetchAgentHistoryEntry,
@@ -6,15 +12,41 @@ import type {
 } from "@getpaseo/client/internal/daemon-client";
 import type { AgentHistoryClient, AgentHistoryHost } from "./use-agent-history";
 import { allAgentHistoryQueryKey } from "./agent-history-query-key";
+import { markAgentArchivedInHistoryCache } from "./use-archive-agent";
 
-(
-  globalThis as unknown as {
-    __DEV__: boolean;
-  }
-).__DEV__ = false;
+interface HistoryFeatureState {
+  sessions: Record<
+    string,
+    { serverInfo: { features: { agentHistorySearch: boolean; agentHistoryArchiveScope: boolean } } }
+  >;
+}
 
-const { fetchAgentHistoryBatch, fetchAgentHistoryPage, collectAgentHistoryHostErrors } =
-  await import("./use-agent-history");
+const onlineStatuses = new Map([
+  ["server-a", "online"],
+  ["server-b", "online"],
+]);
+let runtimeHosts: AgentHistoryHost[] = [];
+let registeredHosts: Array<{ serverId: string; label: string }> = [];
+let featureState: HistoryFeatureState = { sessions: {} };
+const runtime = {
+  getClient: (id: string) => runtimeHosts.find(({ serverId }) => serverId === id)?.client,
+};
+vi.mock("@/runtime/host-runtime", () => ({
+  getHostRuntimeStore: () => runtime,
+  useHosts: () => registeredHosts,
+  useHostRuntimeConnectionStatuses: () => onlineStatuses,
+}));
+vi.mock("@/stores/session-store", () => ({
+  useSessionStore: (select: (state: HistoryFeatureState) => unknown) => select(featureState),
+}));
+vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+
+const {
+  fetchAgentHistoryBatch,
+  fetchAgentHistoryPage,
+  collectAgentHistoryHostErrors,
+  useAgentHistory,
+} = await import("./use-agent-history");
 
 type FetchAgentHistory = DaemonClient["fetchAgentHistory"];
 type FetchAgentHistoryResult = Awaited<ReturnType<FetchAgentHistory>>;
@@ -53,6 +85,7 @@ function createFailingClient(): FakeAgentHistoryClient {
 
 function historyPayload(input: {
   entries: FetchAgentHistoryEntry[];
+  ancestors?: FetchAgentHistoryResult["ancestors"];
   hasMore?: boolean;
   nextCursor?: string | null;
   searchTruncated?: boolean;
@@ -60,6 +93,7 @@ function historyPayload(input: {
   return {
     requestId: "req_history",
     entries: input.entries,
+    ...(input.ancestors ? { ancestors: input.ancestors } : {}),
     pageInfo: {
       nextCursor: input.nextCursor ?? null,
       prevCursor: null,
@@ -160,6 +194,7 @@ describe("fetchAgentHistoryPage", () => {
         page: { limit: 200 },
       } satisfies FetchAgentHistoryOptions,
     ]);
+    expect(page.ancestors).toEqual([]);
     expect(page.agents.map((agent) => agent.id)).toEqual(["history-1"]);
     expect(page.pageInfo).toEqual({
       nextCursor: "cursor-2",
@@ -633,5 +668,198 @@ describe("fetchAgentHistoryPage", () => {
         cursorByServerId: null,
       }),
     ).rejects.toThrow("No connected hosts could load agent history");
+  });
+});
+
+function configureHosts(input: AgentHistoryHost[], scopeSupportedBy: string[]) {
+  runtimeHosts = input;
+  registeredHosts = input.map(({ serverId, serverLabel }) => ({ serverId, label: serverLabel }));
+  featureState = {
+    sessions: Object.fromEntries(
+      input.map(({ serverId }) => [
+        serverId,
+        {
+          serverInfo: {
+            features: {
+              agentHistorySearch: true,
+              agentHistoryArchiveScope: scopeSupportedBy.includes(serverId),
+            },
+          },
+        },
+      ]),
+    ),
+  };
+}
+
+function getId(agent: { id: string }) {
+  return agent.id;
+}
+
+function renderHistory(options: Parameters<typeof useAgentHistory>[0]) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  function Wrapper({ children }: PropsWithChildren) {
+    return createElement(QueryClientProvider, { client: queryClient }, children);
+  }
+  return {
+    ...renderHook(useAgentHistory, { initialProps: options, wrapper: Wrapper }),
+    queryClient,
+  };
+}
+
+describe("useAgentHistory archive scope", () => {
+  afterEach(() => {
+    cleanup();
+    configureHosts([], []);
+  });
+
+  it("uses separate tab cursors and normalizes and deduplicates parents across pages and hosts", async () => {
+    const date = "2026-04-02T10:00:00.000Z";
+    const parent = historyEntry({ id: "parent", cwd: "/repo", updatedAt: date, title: "Parent" });
+    const child = historyEntry({ id: "child", cwd: "/repo", updatedAt: date, archivedAt: date });
+    const otherChild = historyEntry({
+      id: "other",
+      cwd: "/repo",
+      updatedAt: date,
+      archivedAt: date,
+    });
+    const primary = createClient([
+      historyPayload({
+        entries: [child],
+        ancestors: [parent],
+        hasMore: true,
+        nextCursor: "archived-next",
+      }),
+      historyPayload({ entries: [otherChild], ancestors: [parent] }),
+      historyPayload({ entries: [parent], hasMore: true, nextCursor: "active-next" }),
+      historyPayload({ entries: [] }),
+    ]);
+    const secondary = createClient([
+      historyPayload({ entries: [child], ancestors: [parent] }),
+      historyPayload({ entries: [] }),
+    ]);
+    configureHosts(
+      [
+        { serverId: "server-a", serverLabel: "MacBook", client: primary },
+        { serverId: "server-b", serverLabel: "Linux box", client: secondary },
+      ],
+      ["server-a", "server-b"],
+    );
+
+    const { result, rerender } = renderHistory({
+      archiveScope: "archived",
+      keepPreviousResults: true,
+    });
+    await waitFor(() => expect(result.current.agents).toHaveLength(2));
+    expect(result.current.isArchiveScopeSupported).toBe(true);
+    expect(result.current.hasMore).toBe(true);
+    act(() => result.current.loadMore());
+    await waitFor(() => expect(result.current.agents).toHaveLength(3));
+    expect(result.current.ancestors).toMatchObject([
+      {
+        id: "parent",
+        serverId: "server-a",
+        serverLabel: "MacBook",
+        title: "Parent",
+        lastActivityAt: new Date(date),
+        archivedAt: null,
+      },
+      { id: "parent", serverId: "server-b", serverLabel: "Linux box" },
+    ]);
+
+    rerender({ archiveScope: "active", keepPreviousResults: true });
+    expect(result.current.agents).toEqual([]);
+    expect(result.current.isPreviousResults).toBe(false);
+    await waitFor(() => expect(result.current.agents.map(getId)).toEqual(["parent"]));
+    expect(result.current.ancestors).toEqual([]);
+    expect(result.current.hasMore).toBe(true);
+    act(() => result.current.loadMore());
+    await waitFor(() => expect(result.current.hasMore).toBe(false));
+    expect(primary.calls).toMatchObject([
+      { archiveScope: "archived", page: { limit: 200 } },
+      { archiveScope: "archived", page: { cursor: "archived-next" } },
+      { archiveScope: "active", page: { limit: 200 } },
+      { archiveScope: "active", page: { cursor: "active-next" } },
+    ]);
+    expect(primary.calls[2]?.page).not.toHaveProperty("cursor");
+    expect(secondary.calls.map(({ archiveScope }) => archiveScope)).toEqual(["archived", "active"]);
+
+    rerender({ archiveScope: "archived" });
+    expect(result.current.agents).toHaveLength(3);
+    expect(result.current.hasMore).toBe(false);
+    expect(primary.calls).toHaveLength(4);
+  });
+
+  it("omits the scope for a mixed fleet and for a caller that does not request one", async () => {
+    const primary = createClient([historyPayload({ entries: [] })]);
+    const legacy = createClient([historyPayload({ entries: [] })]);
+    configureHosts(
+      [
+        { serverId: "server-a", serverLabel: "MacBook", client: primary },
+        { serverId: "server-b", serverLabel: "Legacy host", client: legacy },
+      ],
+      ["server-a"],
+    );
+
+    const { result, rerender } = renderHistory({ archiveScope: "archived" });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+    expect(result.current.isArchiveScopeSupported).toBe(false);
+    expect(primary.calls[0]).not.toHaveProperty("archiveScope");
+    expect(legacy.calls[0]).not.toHaveProperty("archiveScope");
+
+    rerender({ serverId: "server-a" });
+    await waitFor(() => expect(primary.calls).toHaveLength(2));
+    expect(result.current.isArchiveScopeSupported).toBe(true);
+    expect(primary.calls[1]).not.toHaveProperty("archiveScope");
+  });
+
+  it("keeps unscoped search on its existing cache keys and shows previous results while a new term loads", async () => {
+    const updatedAt = "2026-04-02T10:00:00.000Z";
+    const client = createClient([
+      historyPayload({ entries: [historyEntry({ id: "first", cwd: "/repo", updatedAt })] }),
+      historyPayload({ entries: [historyEntry({ id: "second", cwd: "/repo", updatedAt })] }),
+    ]);
+    configureHosts([{ serverId: "server-a", serverLabel: "MacBook", client }], ["server-a"]);
+
+    const options = { searchableHostsOnly: true, keepPreviousResults: true };
+    const { result, rerender, queryClient } = renderHistory({ ...options, search: "first" });
+    await waitFor(() => expect(result.current.agents.map(getId)).toEqual(["first"]));
+
+    rerender({ ...options, search: "second" });
+    expect(result.current.agents.map(getId)).toEqual(["first"]);
+    expect(result.current.isPreviousResults).toBe(true);
+    await waitFor(() => expect(result.current.agents.map(getId)).toEqual(["second"]));
+    expect(result.current.isPreviousResults).toBe(false);
+    expect(
+      queryClient
+        .getQueryCache()
+        .getAll()
+        .map(({ queryKey }) => queryKey),
+    ).toEqual([
+      ["allAgentHistory", "server-a", "first"],
+      ["allAgentHistory", "server-a", "second"],
+    ]);
+    expect(client.calls.map(({ search }) => search)).toEqual(["first", "second"]);
+    for (const call of client.calls) expect(call).not.toHaveProperty("archiveScope");
+  });
+
+  it("keeps an optimistically archived active parent only as context for its children", async () => {
+    const date = "2026-04-02T10:00:00.000Z";
+    const entries = ["parent", "child"].map((id) =>
+      historyEntry({ id, cwd: "/repo", updatedAt: date }),
+    );
+    const client = createClient([historyPayload({ entries })]);
+    configureHosts([{ serverId: "server-a", serverLabel: "MacBook", client }], ["server-a"]);
+    const { result, queryClient } = renderHistory({ serverId: "server-a", archiveScope: "active" });
+    await waitFor(() => expect(result.current.agents).toHaveLength(2));
+
+    act(() => {
+      markAgentArchivedInHistoryCache(queryClient, {
+        serverId: "server-a",
+        agentId: "parent",
+        archivedAt: date,
+      });
+    });
+    await waitFor(() => expect(result.current.agents.map(getId)).toEqual(["child"]));
+    expect(result.current.ancestors).toMatchObject([{ id: "parent", archivedAt: new Date(date) }]);
   });
 });

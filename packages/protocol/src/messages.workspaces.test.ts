@@ -2,12 +2,14 @@ import { z } from "zod";
 import { describe, expect, test } from "vitest";
 import {
   RecentProviderSessionDescriptorPayloadSchema,
+  ServerInfoStatusPayloadSchema,
   SessionInboundMessageSchema,
   SessionOutboundMessageSchema,
   WorkspaceCreateRequestSchema,
   WorkspaceDescriptorPayloadSchema,
   WorkspaceScriptPayloadSchema,
 } from "./messages.js";
+import { validateWSOutboundMessage } from "./validation/ws-outbound.js";
 
 describe("workspace message schemas", () => {
   test("parses mark-unread request and response", () => {
@@ -290,6 +292,96 @@ describe("workspace message schemas", () => {
 
     expect(request.type).toBe("fetch_agent_history_request");
     expect(response.type).toBe("fetch_agent_history_response");
+    expect(request).not.toHaveProperty("archiveScope");
+    expect(response.payload).not.toHaveProperty("ancestors");
+    const envelope = { type: "session", message: response };
+    expect(validateWSOutboundMessage(envelope)).toEqual({ success: true, data: envelope });
+  });
+
+  test("parses history archive scope and validates ancestor placement", () => {
+    const request = { type: "fetch_agent_history_request", requestId: "req-history" };
+    for (const archiveScope of ["all", "active", "archived"]) {
+      expect(SessionInboundMessageSchema.parse({ ...request, archiveScope })).toEqual({
+        ...request,
+        archiveScope,
+      });
+    }
+    expect(
+      SessionInboundMessageSchema.safeParse({ ...request, archiveScope: "closed" }).success,
+    ).toBe(false);
+    const serverInfo = { status: "server_info", serverId: "host-1" };
+    expect(ServerInfoStatusPayloadSchema.parse(serverInfo)).not.toHaveProperty("features");
+    expect(
+      ServerInfoStatusPayloadSchema.parse({
+        ...serverInfo,
+        features: { agentHistoryArchiveScope: true },
+      }).features,
+    ).toMatchObject({ agentHistoryArchiveScope: true });
+
+    const timestamp = "2026-04-04T00:00:00.000Z";
+    const ancestor = {
+      agent: {
+        id: "parent-1",
+        provider: "codex",
+        cwd: "/tmp/repo",
+        model: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        lastUserMessageAt: null,
+        status: "closed",
+        capabilities: {
+          supportsStreaming: true,
+          supportsSessionPersistence: true,
+          supportsDynamicModes: true,
+          supportsMcpServers: true,
+          supportsReasoningStream: true,
+          supportsToolInvocations: true,
+        },
+        currentModeId: null,
+        availableModes: [],
+        pendingPermissions: [],
+        persistence: null,
+        title: null,
+        labels: {},
+      },
+      project: {
+        projectKey: "project-1",
+        projectEquivalenceKey: "repo-1",
+        projectName: "repo",
+        workspaceArchivedAt: timestamp,
+        checkout: {
+          cwd: "/tmp/repo",
+          isGit: false,
+          currentBranch: null,
+          remoteUrl: null,
+          isPaseoOwnedWorktree: false,
+          mainRepoRoot: null,
+        },
+      },
+    };
+    const message = {
+      type: "fetch_agent_history_response",
+      payload: {
+        requestId: "req-history",
+        entries: [],
+        ancestors: [ancestor],
+        pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+      },
+    };
+    expect(SessionOutboundMessageSchema.parse(message)).toMatchObject(message);
+    expect(validateWSOutboundMessage({ type: "session", message })).toMatchObject({
+      success: true,
+      data: { type: "session", message },
+    });
+    expect(
+      validateWSOutboundMessage({
+        type: "session",
+        message: {
+          ...message,
+          payload: { ...message.payload, ancestors: [{ agent: ancestor.agent }] },
+        },
+      }).success,
+    ).toBe(false);
   });
 
   test("parses recent provider session descriptors without legacy handle fields", () => {

@@ -305,7 +305,14 @@ export const ru: TranslationResources = {
   },
   sessions: {
     title: "История",
+    tabs: {
+      archived: "В архиве",
+      active: "Активные",
+    },
     empty: "Сессий пока нет",
+    emptyArchived: "В архиве нет сессий",
+    emptyActive: "Нет активных сессий",
+    emptyHost: "На этом хосте нет сессий",
     noMatches: "Подходящих сессий не найдено",
     tooManyMatches: "Слишком много совпадений — уточните запрос",
     hostLoadFailed: "{{host}}: не удалось загрузить историю",
@@ -317,6 +324,12 @@ export const ru: TranslationResources = {
   },
   agentList: {
     fallbackTitle: "Новая сессия",
+    subagents: {
+      one: "1 субагент",
+      many: "Субагентов: {{count}}",
+      expandAccessibility: "Показать субагентов",
+      collapseAccessibility: "Скрыть субагентов",
+    },
     dateSections: {
       recent: "Недавние",
       today: "Сегодня",

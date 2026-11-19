@@ -2935,11 +2935,21 @@ export class DaemonClient {
   }
 
   async fetchAgentHistory(options?: FetchAgentHistoryOptions): Promise<FetchAgentHistoryPayload> {
+    const archiveScope = options?.archiveScope;
+    // COMPAT(agentHistoryArchiveScope): added in v0.16.0, remove gate after 2027-05-19.
+    if (
+      archiveScope !== undefined &&
+      archiveScope !== "all" &&
+      this.lastServerInfoMessage?.features?.agentHistoryArchiveScope !== true
+    ) {
+      throw new Error("Update the host to filter agent history by archive status.");
+    }
     if (options?.filter?.includeBackground) this.requireBackgroundWorkspaces();
     const resolvedRequestId = this.createRequestId(options?.requestId);
     const message = SessionInboundMessageSchema.parse({
       type: "fetch_agent_history_request",
       requestId: resolvedRequestId,
+      ...(archiveScope !== undefined ? { archiveScope } : {}),
       ...(options?.filter ? { filter: options.filter } : {}),
       ...(options?.search ? { search: options.search } : {}),
       ...(options?.sort ? { sort: options.sort } : {}),

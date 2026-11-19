@@ -305,7 +305,14 @@ export const ptBR: TranslationResources = {
   },
   sessions: {
     title: "Histórico de agentes",
+    tabs: {
+      archived: "Arquivadas",
+      active: "Ativas",
+    },
     empty: "Nenhuma sessão ainda",
+    emptyArchived: "Nenhuma sessão arquivada",
+    emptyActive: "Nenhuma sessão ativa",
+    emptyHost: "Nenhuma sessão neste host",
     noMatches: "Nenhuma sessão corresponde",
     tooManyMatches: "Muitos resultados — refine a busca",
     hostLoadFailed: "{{host}}: Não foi possível carregar o histórico",
@@ -317,6 +324,12 @@ export const ptBR: TranslationResources = {
   },
   agentList: {
     fallbackTitle: "Nova sessão",
+    subagents: {
+      one: "1 subagente",
+      many: "{{count}} subagentes",
+      expandAccessibility: "Mostrar subagentes",
+      collapseAccessibility: "Ocultar subagentes",
+    },
     dateSections: {
       recent: "Recentes",
       today: "Hoje",

@@ -31,7 +31,11 @@ import { Session } from "./session.js";
 import type { SessionOptions } from "./session.js";
 import { OWNER_PERMISSIONS } from "./authorization/index.js";
 import type { AgentUpdatesService } from "./session/agent-updates/agent-updates-service.js";
-import type { AgentSnapshotPayload, SessionOutboundMessage } from "@getpaseo/protocol/messages";
+import type {
+  AgentSnapshotPayload,
+  FetchAgentHistoryRequestMessage,
+  SessionOutboundMessage,
+} from "@getpaseo/protocol/messages";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
 import { createTerminalManager } from "../terminal/terminal-manager.js";
 import { AgentManager, type AgentManagerEvent, type ManagedAgent } from "./agent/agent-manager.js";
@@ -569,6 +573,7 @@ class CreateAgentTestClient implements AgentClient {
 function createSessionForWorkspaceTests(
   options: {
     appVersion?: string | null;
+    serverId?: string;
     onMessage?: (message: SessionOutboundMessage) => void;
     onWorkspaceRecovered?: SessionOptions["onWorkspaceRecovered"];
     workspaceRuntimeStore?: WorkspaceRuntimeStore;
@@ -660,6 +665,7 @@ function createSessionForWorkspaceTests(
       agentMessages: createAgentMessageDeliveryStub(),
       creationService: createTestCreationService(),
       clientId: "test-client",
+      serverId: options.serverId,
       permissions: OWNER_PERMISSIONS,
       appVersion: options.appVersion ?? null,
       onMessage: options.onMessage ?? vi.fn(),
@@ -3106,6 +3112,231 @@ test("fetch_agent_history_request pages archived historical rows separately", as
     },
   ]);
   expect(session.agentUpdates.hasSubscription()).toBe(false);
+});
+
+const HISTORY_DATE = "2026-03-01T12:00:00.000Z";
+const HISTORY_ARCHIVED_AT = "2026-03-05T12:00:00.000Z";
+const HISTORY_WORKSPACE = "ws-history-active";
+const HISTORY_ARCHIVED_WORKSPACE = "ws-history-archived";
+
+function makeHistoryAgent(id: string, overrides: Partial<StoredAgentRecord> = {}) {
+  return {
+    ...makeStoredAgent({
+      id,
+      cwd: REPO_CWD,
+      workspaceId: HISTORY_WORKSPACE,
+      updatedAt: HISTORY_DATE,
+    }),
+    ...overrides,
+  };
+}
+
+function createHistoryRequest(
+  records: StoredAgentRecord[],
+  liveAgents: ReturnType<typeof makeManagedAgent>[] = [],
+) {
+  const emitted: SessionOutboundMessage[] = [];
+  const project = createPersistedProjectRecord({
+    projectId: "proj-history-scope",
+    projectKey: "repo-history-scope",
+    rootPath: REPO_CWD,
+    kind: "non_git",
+    displayName: "history",
+    createdAt: HISTORY_DATE,
+    updatedAt: HISTORY_DATE,
+  });
+  const workspaces = [HISTORY_WORKSPACE, HISTORY_ARCHIVED_WORKSPACE].map((workspaceId) =>
+    createPersistedWorkspaceRecord({
+      workspaceId,
+      projectId: project.projectId,
+      cwd: REPO_CWD,
+      kind: "directory",
+      displayName: workspaceId,
+      createdAt: HISTORY_DATE,
+      updatedAt: HISTORY_DATE,
+      archivedAt: workspaceId === HISTORY_ARCHIVED_WORKSPACE ? HISTORY_ARCHIVED_AT : null,
+    }),
+  );
+  const session = createSessionForWorkspaceTests({
+    serverId: "history-host",
+    onMessage: (message) => emitted.push(message),
+    agentManager: {
+      listAgents: () => liveAgents,
+      getAgent: (id: string) => liveAgents.find((agent) => agent.id === id) ?? null,
+    },
+    agentStorage: {
+      listAll: async () => records,
+      get: async (id: string) => records.find((record) => record.id === id) ?? null,
+    },
+  });
+  session.projectRegistry.get = async (id) => (id === project.projectId ? project : null);
+  session.workspaceRegistry.get = async (id) =>
+    workspaces.find((workspace) => workspace.workspaceId === id) ?? null;
+
+  return async (options: Omit<FetchAgentHistoryRequestMessage, "type" | "requestId">) => {
+    await session.handleMessage({
+      type: "fetch_agent_history_request",
+      requestId: "history",
+      ...options,
+    });
+    const response = emitted.pop();
+    if (response?.type !== "fetch_agent_history_response") {
+      throw new Error(`Expected history response, received ${JSON.stringify(response)}`);
+    }
+    return response.payload;
+  };
+}
+
+test.each([
+  { archiveScope: undefined, ids: ["active", "archived-agent", "archived-workspace"] },
+  { archiveScope: "active", ids: ["active"] },
+  { archiveScope: "archived", ids: ["archived-agent", "archived-workspace"] },
+  { archiveScope: "all", ids: ["active", "archived-agent", "archived-workspace"] },
+] as const)(
+  "fetch_agent_history_request matches $archiveScope agent and workspace archives",
+  async ({ archiveScope, ids }) => {
+    const requestHistory = createHistoryRequest([
+      makeHistoryAgent("active"),
+      makeHistoryAgent("archived-agent", { archivedAt: HISTORY_ARCHIVED_AT }),
+      makeHistoryAgent("archived-workspace", { workspaceId: HISTORY_ARCHIVED_WORKSPACE }),
+    ]);
+
+    const result = await requestHistory(archiveScope ? { archiveScope } : {});
+    expect(result.entries.map(({ agent }) => agent.id)).toEqual(ids);
+    for (const { agent, project } of result.entries) {
+      expect(project).toMatchObject({
+        projectKey: "proj-history-scope",
+        projectEquivalenceKey: "repo-history-scope",
+        workspaceArchivedAt:
+          agent.workspaceId === HISTORY_ARCHIVED_WORKSPACE ? HISTORY_ARCHIVED_AT : null,
+      });
+    }
+  },
+);
+
+test("fetch_agent_history_request only honors the legacy archive filter for all history", async () => {
+  const requestHistory = createHistoryRequest([
+    makeHistoryAgent("archived-agent", { archivedAt: HISTORY_ARCHIVED_AT }),
+    makeHistoryAgent("archived-workspace", { workspaceId: HISTORY_ARCHIVED_WORKSPACE }),
+  ]);
+  const filter = { includeArchived: false };
+
+  const legacy = await requestHistory({ filter });
+  expect(legacy.entries.map(({ agent }) => agent.id)).toEqual(["archived-workspace"]);
+  expect(await requestHistory({ archiveScope: "all", filter })).toEqual(legacy);
+  const archived = await requestHistory({ archiveScope: "archived", filter });
+  expect(archived.entries.map(({ agent }) => agent.id)).toEqual([
+    "archived-agent",
+    "archived-workspace",
+  ]);
+});
+
+test("fetch_agent_history_request returns active ancestors separately from archived pages", async () => {
+  const requestHistory = createHistoryRequest(
+    [
+      makeHistoryAgent("root", { updatedAt: "2026-02-26T12:00:00.000Z" }),
+      makeHistoryAgent("child", {
+        labels: {
+          "paseo.parent-agent-id": "parent",
+          "paseo.parent-server-id": "history-host",
+          topic: "selected",
+        },
+        archivedAt: HISTORY_ARCHIVED_AT,
+      }),
+      makeHistoryAgent("older-sibling", {
+        labels: { "paseo.parent-agent-id": "parent", topic: "selected" },
+        archivedAt: HISTORY_ARCHIVED_AT,
+        updatedAt: "2026-02-28T12:00:00.000Z",
+      }),
+    ],
+    [
+      {
+        ...makeManagedAgent({
+          id: "parent",
+          cwd: REPO_CWD,
+          workspaceId: HISTORY_WORKSPACE,
+          lifecycle: "idle",
+          updatedAt: "2026-02-27T12:00:00.000Z",
+        }),
+        labels: { "paseo.parent-agent-id": "root" },
+      },
+    ],
+  );
+
+  // The label filter excludes both ancestors from the initial directory load.
+  const filters = { archiveScope: "archived", filter: { labels: { topic: "selected" } } } as const;
+  const first = await requestHistory({ ...filters, page: { limit: 1 } });
+  expect(first.entries.map(({ agent }) => agent.id)).toEqual(["child"]);
+  expect(first.ancestors?.map(({ agent }) => [agent.id, agent.archivedAt])).toEqual([
+    ["parent", null],
+    ["root", null],
+  ]);
+  expect(first.ancestors?.[0].agent.status).toBe("idle");
+  expect(first.pageInfo.hasMore).toBe(true);
+  expect(first.pageInfo.nextCursor).toEqual(expect.any(String));
+
+  const second = await requestHistory({
+    ...filters,
+    page: { limit: 1, cursor: first.pageInfo.nextCursor! },
+  });
+  expect(second.entries.map(({ agent }) => agent.id)).toEqual(["older-sibling"]);
+  expect(second.ancestors?.map(({ agent }) => agent.id)).toEqual(["parent", "root"]);
+  expect(second.pageInfo).toEqual({
+    nextCursor: null,
+    prevCursor: first.pageInfo.nextCursor,
+    hasMore: false,
+  });
+});
+
+test.each([
+  { boundary: "in another workspace", parent: { workspaceId: HISTORY_ARCHIVED_WORKSPACE } },
+  { boundary: "on another host", labels: { "paseo.parent-server-id": "other-host" } },
+  { boundary: "internal", parent: { internal: true } },
+  { boundary: "background", parent: { background: true } },
+  { boundary: "using a hidden provider", parent: { provider: "private-provider" } },
+])("fetch_agent_history_request stops at a parent $boundary", async ({ parent, labels }) => {
+  const requestHistory = createHistoryRequest([
+    makeHistoryAgent("root"),
+    makeHistoryAgent("parent", { labels: { "paseo.parent-agent-id": "root" }, ...parent }),
+    makeHistoryAgent("child", {
+      title: "Find this child title",
+      labels: { "paseo.parent-agent-id": "parent", ...labels },
+    }),
+  ]);
+
+  const result = await requestHistory({ search: "Find this child title" });
+  expect(result.entries.map(({ agent }) => agent.id)).toEqual(["child"]);
+  expect(result.ancestors).toBeUndefined();
+});
+
+test("fetch_agent_history_request includes a same-workspace parent outside the title search", async () => {
+  const requestHistory = createHistoryRequest([
+    makeHistoryAgent("parent", { title: "Planning" }),
+    makeHistoryAgent("child", {
+      title: "Implement transfers",
+      labels: { "paseo.parent-agent-id": "parent" },
+    }),
+  ]);
+
+  const result = await requestHistory({ search: "transfers" });
+  expect(result.entries.map(({ agent }) => agent.id)).toEqual(["child"]);
+  expect(result.ancestors?.map(({ agent }) => agent.id)).toEqual(["parent"]);
+  expect(result.pageInfo).toEqual({ nextCursor: null, prevCursor: null, hasMore: false });
+});
+
+test("fetch_agent_history_request stops at a repeated ancestor and returns it once", async () => {
+  const requestHistory = createHistoryRequest([
+    makeHistoryAgent("parent", { labels: { "paseo.parent-agent-id": "child" } }),
+    makeHistoryAgent("child", {
+      title: "Find the child in the cycle",
+      labels: { "paseo.parent-agent-id": "parent" },
+    }),
+  ]);
+
+  const result = await requestHistory({ search: "Find the child" });
+  expect(result.entries.map(({ agent }) => agent.id)).toEqual(["child"]);
+  expect(result.ancestors?.map(({ agent }) => agent.id)).toEqual(["parent"]);
+  expect(result.pageInfo).toEqual({ nextCursor: null, prevCursor: null, hasMore: false });
 });
 
 test("fetch_agent_history_request filters across history and paginates chronologically", async () => {

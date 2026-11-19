@@ -302,7 +302,14 @@ export const ko: TranslationResources = {
   },
   sessions: {
     title: "기록",
+    tabs: {
+      archived: "보관됨",
+      active: "활성",
+    },
     empty: "아직 세션이 없습니다",
+    emptyArchived: "보관된 세션이 없습니다",
+    emptyActive: "활성 세션이 없습니다",
+    emptyHost: "이 호스트에 세션이 없습니다",
     noMatches: "일치하는 세션이 없습니다",
     tooManyMatches: "일치 항목이 너무 많습니다 — 검색 범위를 좁히세요",
     hostLoadFailed: "{{host}}: 기록을 불러오지 못했습니다",
@@ -314,6 +321,12 @@ export const ko: TranslationResources = {
   },
   agentList: {
     fallbackTitle: "새 세션",
+    subagents: {
+      one: "하위 에이전트 1개",
+      many: "하위 에이전트 {{count}}개",
+      expandAccessibility: "하위 에이전트 표시",
+      collapseAccessibility: "하위 에이전트 숨기기",
+    },
     dateSections: {
       recent: "최근",
       today: "오늘",

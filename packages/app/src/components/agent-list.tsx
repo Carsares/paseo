@@ -1,389 +1,327 @@
-import { Modal } from "@/components/ui/modal";
 import {
-  View,
-  Text,
-  Pressable,
-  RefreshControl,
   FlatList,
+  RefreshControl,
+  Text,
+  View,
   type ListRenderItem,
   type PressableStateCallbackType,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useCallback, useMemo, useState, type ReactElement } from "react";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
-import type { TFunction } from "i18next";
+import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
-import { useIsCompactFormFactor } from "@/constants/layout";
-import { useTimeAgo } from "@/hooks/use-time-ago";
-import { type AggregatedAgent } from "@/hooks/use-aggregated-agents";
-import { useSessionStore } from "@/stores/session-store";
-import { ChevronRight } from "lucide-react-native";
-import { useProviderIcon } from "@/components/provider-icons";
-import { navigateToAgent } from "@/utils/navigate-to-agent";
-import { useArchiveAgent } from "@/hooks/use-archive-agent";
-import { HighlightedText } from "@/components/ui/highlighted-text";
+import { ChevronDown, ChevronRight } from "lucide-react-native";
 import { ArchivedBadge } from "@/components/archived-badge";
-import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/status-badge";
+import { ProjectIconView } from "@/components/project-icon-view";
+import { useProviderIcon, type ProviderIconProps } from "@/components/provider-icons";
+import { HighlightedText } from "@/components/ui/highlighted-text";
 import { findHighlightRanges } from "@/components/ui/highlighted-text-segments";
+import { Modal } from "@/components/ui/modal";
+import { PressHighlight } from "@/components/ui/press-highlight";
+import { StatusBadge } from "@/components/ui/status-badge";
+import type { AggregatedAgent } from "@/hooks/use-aggregated-agents";
+import type { AgentHistoryArchiveScope } from "@/hooks/use-agent-history";
+import { useArchiveAgent } from "@/hooks/use-archive-agent";
+import { useTimeAgo } from "@/hooks/use-time-ago";
+import {
+  buildHistoryProjectGroups,
+  flattenHistoryProjectGroups,
+  type HistoryFlatListItem,
+  type HistoryProjectGroup,
+  type HistoryWorkspaceGroup,
+} from "@/screens/sessions/history-grouping";
+import { useSessionStore } from "@/stores/session-store";
+import { density, densityIconProps } from "@/styles/density";
+import type { Theme } from "@/styles/theme";
+import { navigateToAgent } from "@/utils/navigate-to-agent";
 
 interface AgentListProps {
   agents: AggregatedAgent[];
-  showCheckoutInfo?: boolean;
+  ancestors: AggregatedAgent[];
+  archiveScope?: AgentHistoryArchiveScope;
+  activeWorkspaceIdsByServer: ReadonlyMap<string, ReadonlySet<string>>;
   isRefreshing?: boolean;
   onRefresh?: () => void;
-  selectedAgentId?: string;
-  onAgentSelect?: () => void;
   listFooterComponent?: ReactElement | null;
-  showAttentionIndicator?: boolean;
   showHostColumn?: boolean;
   search?: string;
 }
 
-type DateSectionKey = "today" | "yesterday" | "thisWeek" | "thisMonth" | "older";
-
-const DATE_SECTION_ORDER = [
-  "today",
-  "yesterday",
-  "thisWeek",
-  "thisMonth",
-  "older",
-] as const satisfies readonly DateSectionKey[];
-
 const HISTORY_MATCH_OPTIONS = { typoTolerant: true } as const;
+const EMPTY_EXPANDED_OVERRIDES: ReadonlyMap<string, boolean> = new Map();
+const ThemedRefreshControl = withUnistyles(RefreshControl);
+const ThemedChevronRight = withUnistyles(ChevronRight);
+const ThemedChevronDown = withUnistyles(ChevronDown);
 
-type FlatListItem =
-  | { type: "header"; key: string; section: DateSectionKey }
-  | { type: "agent"; key: string; agent: AggregatedAgent };
+const mutedIconColor = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
+const chevronProps = densityIconProps("xs", mutedIconColor);
+const providerIconProps = densityIconProps("sm", mutedIconColor);
+const refreshControlColors = (theme: Theme) => ({
+  tintColor: theme.colors.foregroundMuted,
+  colors: [theme.colors.foregroundMuted],
+});
 
-function deriveDateSectionKey(lastActivityAt: Date): DateSectionKey {
-  const now = new Date();
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const yesterdayStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
-  const activityStart = new Date(
-    lastActivityAt.getFullYear(),
-    lastActivityAt.getMonth(),
-    lastActivityAt.getDate(),
-  );
-
-  if (activityStart.getTime() >= todayStart.getTime()) {
-    return "today";
-  }
-  if (activityStart.getTime() >= yesterdayStart.getTime()) {
-    return "yesterday";
-  }
-
-  const diffTime = todayStart.getTime() - activityStart.getTime();
-  const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-  if (diffDays <= 7) {
-    return "thisWeek";
-  }
-  if (diffDays <= 30) {
-    return "thisMonth";
-  }
-  return "older";
-}
-
-function formatDateSectionLabel(t: TFunction, section: DateSectionKey): string {
-  switch (section) {
-    case "today":
-      return t("agentList.dateSections.today");
-    case "yesterday":
-      return t("agentList.dateSections.yesterday");
-    case "thisWeek":
-      return t("agentList.dateSections.thisWeek");
-    case "thisMonth":
-      return t("agentList.dateSections.thisMonth");
-    case "older":
-      return t("agentList.dateSections.older");
-  }
-}
-
-function SessionBadge({
-  label,
-  tone = "neutral",
-}: {
-  label: string;
-  tone?: "neutral" | "warning" | "danger";
-}) {
-  let variant: StatusBadgeVariant = "muted";
-  if (tone === "warning") variant = "warning";
-  else if (tone === "danger") variant = "error";
-  return <StatusBadge label={label} variant={variant} />;
-}
-
-function SessionRowBadges({
+function SessionProviderIcon({
   agent,
-  pendingPermissionCount,
-  showDesktopAttention,
-}: {
-  agent: AggregatedAgent;
-  pendingPermissionCount: number;
-  showDesktopAttention: boolean;
-}) {
-  const { t } = useTranslation();
-  return (
-    <>
-      {agent.archivedAt ? <ArchivedBadge /> : null}
-      {pendingPermissionCount > 0 ? (
-        <SessionBadge
-          label={t("agentList.badges.pending", { count: pendingPermissionCount })}
-          tone="warning"
-        />
-      ) : null}
-      {showDesktopAttention ? (
-        <SessionBadge label={t("agentList.badges.attention")} tone="danger" />
-      ) : null}
-    </>
-  );
+  size,
+  color,
+}: ProviderIconProps & { agent: AggregatedAgent }) {
+  const Icon = useProviderIcon(agent.provider, agent.serverId);
+  return <Icon size={size} color={color} />;
 }
 
-function SessionRowTrailingAttention({
-  isMobile,
-  showAttentionIndicator,
-  requiresAttention,
-}: {
-  isMobile: boolean;
-  showAttentionIndicator: boolean;
-  requiresAttention: boolean | undefined;
-}) {
-  const { t } = useTranslation();
-  if (!isMobile || !showAttentionIndicator || !requiresAttention) {
-    return null;
-  }
+const ThemedSessionProviderIcon = withUnistyles(SessionProviderIcon);
+
+function ProjectHeading({ project, search }: { project: HistoryProjectGroup; search: string }) {
+  const { projectName } = project;
+  const initial = projectName.trim().charAt(0).toUpperCase() || "?";
   return (
-    <View style={styles.rowTrailing}>
-      <SessionBadge label={t("agentList.badges.attention")} tone="danger" />
+    <View style={styles.projectHeading} accessibilityRole="header" testID="history-project-header">
+      <ProjectIconView
+        size={18}
+        iconDataUri={null}
+        initial={initial}
+        projectViewKey={project.key}
+        textStyle={styles.projectIconText}
+      />
+      <HighlightedText
+        text={projectName}
+        ranges={findHighlightRanges(search, projectName, HISTORY_MATCH_OPTIONS)}
+        style={styles.projectTitle}
+        numberOfLines={1}
+      />
     </View>
   );
+}
+
+function WorkspaceHeading({
+  workspace,
+  search,
+  showHost,
+}: {
+  workspace: HistoryWorkspaceGroup;
+  search: string;
+  showHost: boolean;
+}) {
+  const { workspaceName, branch, serverLabel, isWorkspaceArchived } = workspace;
+  const hostLabel = showHost ? serverLabel : "";
+  return (
+    <View
+      style={styles.workspaceHeading}
+      accessibilityRole="header"
+      testID="history-workspace-header"
+    >
+      <View style={[styles.workspaceHeadingRow, styles.workspaceNameRow]}>
+        <HighlightedText
+          text={workspaceName}
+          ranges={findHighlightRanges(search, workspaceName, HISTORY_MATCH_OPTIONS)}
+          style={styles.workspaceTitle}
+          numberOfLines={1}
+        />
+        {isWorkspaceArchived ? <ArchivedBadge /> : null}
+      </View>
+      {branch || hostLabel ? (
+        <View style={styles.workspaceHeadingRow}>
+          {branch ? (
+            <HighlightedText
+              text={branch}
+              ranges={findHighlightRanges(search, branch, HISTORY_MATCH_OPTIONS)}
+              style={styles.workspaceMeta}
+              numberOfLines={1}
+            />
+          ) : null}
+          {branch && hostLabel ? <Text style={styles.workspaceMeta}>·</Text> : null}
+          {hostLabel ? (
+            <Text style={styles.workspaceMeta} numberOfLines={1}>
+              {hostLabel}
+            </Text>
+          ) : null}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+type SessionListItem = Extract<HistoryFlatListItem, { type: "root-agent" | "subagent" }>;
+
+function sessionNavigationStyle({ hovered }: PressableStateCallbackType & { hovered?: boolean }) {
+  return [styles.sessionNavigation, hovered && styles.rowHovered];
 }
 
 function SessionRow({
-  agent,
+  item,
   search,
-  isMobile,
-  selectedAgentId,
-  showAttentionIndicator,
-  showHostColumn,
   onPress,
   onLongPress,
+  onToggle,
 }: {
-  agent: AggregatedAgent;
-  search?: string;
-  isMobile: boolean;
-  selectedAgentId?: string;
-  showAttentionIndicator: boolean;
-  showHostColumn: boolean;
+  item: SessionListItem;
+  search: string;
   onPress: (agent: AggregatedAgent) => void;
   onLongPress: (agent: AggregatedAgent) => void;
+  onToggle: (key: string, expanded: boolean) => void;
 }) {
-  const { theme } = useUnistyles();
   const { t } = useTranslation();
-  const agentKey = `${agent.serverId}:${agent.id}`;
-  const isSelected = selectedAgentId === agentKey;
-  const projectName = agent.projectPlacement?.projectName ?? "";
-  const branch = agent.projectPlacement?.checkout.currentBranch ?? "";
-  const workspaceName = agent.projectPlacement?.workspaceName ?? "";
-  const ProviderIcon = useProviderIcon(agent.provider, agent.serverId);
-  const pendingPermissionCount = agent.pendingPermissionCount ?? 0;
-  const ranges = useMemo(
-    () => ({
-      // History search matches typo-tolerantly on the daemon, so the marks do too.
-      workspace: findHighlightRanges(search ?? "", workspaceName, HISTORY_MATCH_OPTIONS),
-      title: findHighlightRanges(search ?? "", agent.title ?? "", HISTORY_MATCH_OPTIONS),
-      branch: findHighlightRanges(search ?? "", branch, HISTORY_MATCH_OPTIONS),
-      project: findHighlightRanges(search ?? "", projectName, HISTORY_MATCH_OPTIONS),
-    }),
-    [search, workspaceName, agent.title, branch, projectName],
-  );
-
-  const pressableStyle = useCallback(
-    ({ pressed, hovered = false }: PressableStateCallbackType & { hovered?: boolean }) => [
-      styles.row,
-      isSelected && styles.rowSelected,
-      Boolean(hovered) && styles.rowHovered,
-      pressed && styles.rowPressed,
-    ],
-    [isSelected],
-  );
-
+  const isRoot = item.type === "root-agent";
+  const agent = isRoot ? item.node.agent : item.agent;
+  const isAncestorShell = isRoot && item.node.isAncestorShell;
+  const showArchiveBadge = Boolean(agent.archivedAt) && !item.workspace.isWorkspaceArchived;
+  const permissionCount = agent.pendingPermissionCount ?? 0;
+  const title = agent.title || t("agentList.fallbackTitle");
+  const testSuffix = `${agent.serverId}-${agent.id}`;
   const handlePress = useCallback(() => onPress(agent), [onPress, agent]);
   const handleLongPress = useCallback(() => onLongPress(agent), [onLongPress, agent]);
 
-  const showDesktopAttention =
-    !isMobile && showAttentionIndicator && Boolean(agent.requiresAttention);
-
-  const agentTitle = (
-    <View style={styles.agentTitleRow}>
-      <View style={styles.providerIconWrap}>
-        <ProviderIcon size={theme.iconSize.sm} color={theme.colors.foregroundMuted} />
-      </View>
-      <HighlightedText
-        text={agent.title || t("agentList.fallbackTitle")}
-        ranges={ranges.title}
-        style={styles.sessionTitle}
-        numberOfLines={1}
-        testID={`agent-row-title-${agent.serverId}-${agent.id}`}
-      />
-    </View>
-  );
-
   return (
-    <Pressable
-      style={pressableStyle}
-      onPress={handlePress}
-      onLongPress={handleLongPress}
-      accessibilityRole="button"
-      testID={`agent-row-${agent.serverId}-${agent.id}`}
-    >
-      <View style={styles.rowContent}>
-        <View style={styles.rowTitleRow}>
+    <View style={[styles.sessionRow, !isRoot && styles.subagentRow]}>
+      <PressHighlight
+        style={sessionNavigationStyle}
+        highlightStyle={styles.rowPressed}
+        onPress={handlePress}
+        onLongPress={handleLongPress}
+        accessibilityRole="button"
+        testID={`agent-row-${testSuffix}`}
+      >
+        <View style={styles.sessionTitleRow}>
+          <ThemedSessionProviderIcon agent={agent} uniProps={providerIconProps} />
           <HighlightedText
-            text={workspaceName || projectName}
-            ranges={workspaceName ? ranges.workspace : ranges.project}
-            style={styles.workspaceTitleText}
+            text={title}
+            ranges={findHighlightRanges(search, title, HISTORY_MATCH_OPTIONS)}
+            style={[styles.sessionTitle, isAncestorShell && styles.ancestorTitle]}
             numberOfLines={1}
-            testID={`agent-row-workspace-${agent.serverId}-${agent.id}`}
-          />
-          {!isMobile ? (
-            <>
-              <ChevronRight size={theme.iconSize.xs} color={theme.colors.foregroundMuted} />
-              {agentTitle}
-            </>
-          ) : null}
-          <SessionRowBadges
-            agent={agent}
-            pendingPermissionCount={pendingPermissionCount}
-            showDesktopAttention={showDesktopAttention}
+            testID={`agent-row-title-${testSuffix}`}
           />
         </View>
-        {isMobile ? agentTitle : null}
-        {isMobile ? (
-          <View style={styles.rowMetaRow}>
-            <HighlightedText
-              text={projectName}
-              ranges={ranges.project}
-              style={styles.sessionMetaText}
-              numberOfLines={1}
-              testID={`agent-row-project-${agent.serverId}-${agent.id}`}
+        <View style={styles.sessionMetadata}>
+          {showArchiveBadge ? <ArchivedBadge /> : null}
+          {permissionCount > 0 ? (
+            <StatusBadge
+              label={t("agentList.badges.pending", { count: permissionCount })}
+              variant="warning"
             />
-            <Text style={styles.sessionMetaSeparator}>·</Text>
-            <HighlightedText
-              text={branch}
-              ranges={ranges.branch}
-              style={styles.sessionMetaText}
-              numberOfLines={1}
-              testID={`agent-row-branch-${agent.serverId}-${agent.id}`}
-            />
-            <Text style={styles.sessionMetaSeparator}>·</Text>
-            <AgentActivityTime date={agent.lastActivityAt} isMobile />
-            {showHostColumn && agent.serverLabel ? (
-              <>
-                <Text style={styles.sessionMetaSeparator}>·</Text>
-                <Text style={styles.sessionMetaText} numberOfLines={1}>
-                  {agent.serverLabel}
-                </Text>
-              </>
-            ) : null}
-          </View>
-        ) : null}
-      </View>
-      {!isMobile ? (
-        <View style={styles.rowColumns}>
-          <HighlightedText
-            text={projectName}
-            ranges={ranges.project}
-            style={styles.columnMeta}
-            numberOfLines={1}
-            testID={`agent-row-project-${agent.serverId}-${agent.id}`}
-          />
-          {showHostColumn ? (
-            <Text style={styles.columnMetaHost} numberOfLines={1}>
-              {agent.serverLabel}
-            </Text>
           ) : null}
-          <HighlightedText
-            text={branch}
-            ranges={ranges.branch}
-            style={styles.columnMeta}
-            numberOfLines={1}
-            testID={`agent-row-branch-${agent.serverId}-${agent.id}`}
-          />
-          <AgentActivityTime date={agent.lastActivityAt} isMobile={false} />
+          <AgentActivityTime date={agent.lastActivityAt} />
         </View>
+      </PressHighlight>
+      {isRoot && item.node.subagents.length > 0 ? (
+        <SubagentsToggle
+          agentKey={item.node.key}
+          testSuffix={testSuffix}
+          expanded={item.expanded}
+          count={item.node.subagents.length}
+          onToggle={onToggle}
+        />
       ) : null}
-      <SessionRowTrailingAttention
-        isMobile={isMobile}
-        showAttentionIndicator={showAttentionIndicator}
-        requiresAttention={agent.requiresAttention}
-      />
-    </Pressable>
+    </View>
   );
 }
 
-function AgentActivityTime({ date, isMobile }: { date: Date; isMobile: boolean }) {
+function SubagentsToggle({
+  agentKey,
+  testSuffix,
+  expanded,
+  count,
+  onToggle,
+}: {
+  agentKey: string;
+  testSuffix: string;
+  expanded: boolean;
+  count: number;
+  onToggle: (key: string, expanded: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  const handlePress = useCallback(
+    () => onToggle(agentKey, !expanded),
+    [onToggle, agentKey, expanded],
+  );
+  const Chevron = expanded ? ThemedChevronDown : ThemedChevronRight;
+  const accessibilityState = useMemo(() => ({ expanded }), [expanded]);
+  return (
+    <PressHighlight
+      style={styles.subagentsToggle}
+      highlightStyle={styles.rowPressed}
+      onPress={handlePress}
+      accessibilityRole="button"
+      accessibilityState={accessibilityState}
+      aria-expanded={expanded}
+      accessibilityLabel={t(
+        expanded
+          ? "agentList.subagents.collapseAccessibility"
+          : "agentList.subagents.expandAccessibility",
+      )}
+      testID={`agent-row-subagents-toggle-${testSuffix}`}
+    >
+      <Text style={styles.subagentsLabel} numberOfLines={1}>
+        {count === 1 ? t("agentList.subagents.one") : t("agentList.subagents.many", { count })}
+      </Text>
+      <Chevron uniProps={chevronProps} />
+    </PressHighlight>
+  );
+}
+
+function AgentActivityTime({ date }: { date: Date }) {
   const label = useTimeAgo(date);
   return (
-    <Text style={isMobile ? styles.sessionMetaText : styles.columnMetaFixed} numberOfLines={1}>
+    <Text style={styles.activityTime} numberOfLines={1}>
       {label}
     </Text>
   );
 }
 
+function historyItemKey(item: HistoryFlatListItem) {
+  return item.key;
+}
+
 export function AgentList({
   agents,
+  ancestors,
+  archiveScope,
+  activeWorkspaceIdsByServer,
   isRefreshing = false,
   onRefresh,
-  selectedAgentId,
-  onAgentSelect,
   listFooterComponent,
-  showAttentionIndicator = true,
   showHostColumn = false,
-  search,
+  search = "",
 }: AgentListProps) {
-  const { theme } = useUnistyles();
   const { t } = useTranslation();
   const insets = useSafeAreaInsets();
   const [actionAgent, setActionAgent] = useState<AggregatedAgent | null>(null);
-  const isMobile = useIsCompactFormFactor();
+  const [expansion, setExpansion] = useState({
+    archiveScope,
+    search,
+    overrides: EMPTY_EXPANDED_OVERRIDES,
+  });
+  const isCurrentExpansion = expansion.archiveScope === archiveScope && expansion.search === search;
+  if (!isCurrentExpansion) {
+    setExpansion({ archiveScope, search, overrides: EMPTY_EXPANDED_OVERRIDES });
+  }
+  const expandedOverrides = isCurrentExpansion ? expansion.overrides : EMPTY_EXPANDED_OVERRIDES;
   const { archiveAgent } = useArchiveAgent();
 
   const actionClient = useSessionStore((state) =>
     actionAgent?.serverId ? (state.sessions[actionAgent.serverId]?.client ?? null) : null,
   );
-
   const isActionSheetVisible = actionAgent !== null;
   const isActionDaemonUnavailable = Boolean(actionAgent?.serverId && !actionClient);
 
   const handleAgentPress = useCallback(
     (agent: AggregatedAgent) => {
-      if (isActionSheetVisible) {
-        return;
-      }
+      if (isActionSheetVisible) return;
 
-      const serverId = agent.serverId;
-      const agentId = agent.id;
-
-      onAgentSelect?.();
       navigateToAgent({
-        serverId,
-        agentId,
+        serverId: agent.serverId,
+        agentId: agent.id,
         workspaceId: agent.workspaceId,
         pin: true,
       });
     },
-    [isActionSheetVisible, onAgentSelect],
+    [isActionSheetVisible],
   );
 
   const handleAgentLongPress = useCallback(
     (agent: AggregatedAgent) => {
-      const isRunning = agent.status === "running";
-      if (isRunning) {
-        setActionAgent(agent);
-        return;
-      }
-
       const client = useSessionStore.getState().sessions[agent.serverId]?.client ?? null;
-      if (!client) {
+      if (agent.status === "running" || !client) {
         setActionAgent(agent);
         return;
       }
@@ -392,111 +330,79 @@ export function AgentList({
     [archiveAgent],
   );
 
-  const handleCloseActionSheet = useCallback(() => {
-    setActionAgent(null);
-  }, []);
+  const handleCloseActionSheet = useCallback(() => setActionAgent(null), []);
 
   const handleArchiveAgent = useCallback(() => {
-    if (!actionAgent || !actionClient) {
-      return;
-    }
-    // Timeout errors are swallowed — the daemon will still process the archive
+    if (!actionAgent || !actionClient) return;
+    // Timeout errors are swallowed — the daemon will still process the archive.
     void archiveAgent({ serverId: actionAgent.serverId, agentId: actionAgent.id }).catch(() => {});
     setActionAgent(null);
   }, [actionAgent, actionClient, archiveAgent]);
 
-  const flatItems = useMemo((): FlatListItem[] => {
-    const buckets = new Map<DateSectionKey, AggregatedAgent[]>();
-    for (const agent of agents) {
-      const section = deriveDateSectionKey(agent.lastActivityAt);
-      const existing = buckets.get(section) ?? [];
-      existing.push(agent);
-      buckets.set(section, existing);
-    }
+  const handleToggle = useCallback((key: string, expanded: boolean) => {
+    setExpansion((current) => {
+      const overrides = new Map(current.overrides);
+      overrides.set(key, expanded);
+      return { ...current, overrides };
+    });
+  }, []);
 
-    const result: FlatListItem[] = [];
-    for (const section of DATE_SECTION_ORDER) {
-      const data = buckets.get(section);
-      if (!data || data.length === 0) {
-        continue;
-      }
-      result.push({ type: "header", key: `header:${section}`, section });
-      for (const agent of data) {
-        result.push({ type: "agent", key: `${agent.serverId}:${agent.id}`, agent });
-      }
-    }
-    return result;
-  }, [agents]);
+  const groups = useMemo(
+    () =>
+      buildHistoryProjectGroups({ entries: agents, ancestors, activeWorkspaceIdsByServer, search }),
+    [agents, ancestors, activeWorkspaceIdsByServer, search],
+  );
+  const flatItems = useMemo(
+    () =>
+      flattenHistoryProjectGroups({
+        groups,
+        isSearching: search.length > 0,
+        expandedOverrides,
+      }),
+    [groups, search, expandedOverrides],
+  );
 
-  const renderItem: ListRenderItem<FlatListItem> = useCallback(
+  const renderItem: ListRenderItem<HistoryFlatListItem> = useCallback(
     ({ item }) => {
-      if (item.type === "header") {
+      if (item.type === "project-header") {
+        return <ProjectHeading project={item.project} search={search} />;
+      }
+      if (item.type === "workspace-header") {
         return (
-          <View style={styles.sectionHeading}>
-            <Text style={styles.sectionTitle}>{formatDateSectionLabel(t, item.section)}</Text>
-          </View>
+          <WorkspaceHeading workspace={item.workspace} search={search} showHost={showHostColumn} />
         );
       }
       return (
         <SessionRow
-          agent={item.agent}
+          item={item}
           search={search}
-          isMobile={isMobile}
-          selectedAgentId={selectedAgentId}
-          showAttentionIndicator={showAttentionIndicator}
-          showHostColumn={showHostColumn}
           onPress={handleAgentPress}
           onLongPress={handleAgentLongPress}
+          onToggle={handleToggle}
         />
       );
     },
-    [
-      handleAgentLongPress,
-      handleAgentPress,
-      isMobile,
-      search,
-      selectedAgentId,
-      showAttentionIndicator,
-      showHostColumn,
-      t,
-    ],
-  );
-
-  const keyExtractor = useCallback((item: FlatListItem) => item.key, []);
-
-  const refreshColors = useMemo(
-    () => [theme.colors.foregroundMuted],
-    [theme.colors.foregroundMuted],
-  );
-  const sheetContainerStyle = useMemo(
-    () => [styles.sheetContainer, { paddingBottom: Math.max(insets.bottom, theme.spacing[6]) }],
-    [insets.bottom, theme.spacing],
-  );
-  const sheetArchiveTextStyle = useMemo(
-    () => [styles.sheetArchiveText, isActionDaemonUnavailable && styles.sheetArchiveTextDisabled],
-    [isActionDaemonUnavailable],
+    [search, showHostColumn, handleAgentPress, handleAgentLongPress, handleToggle],
   );
 
   const refreshControl = useMemo(
     () =>
       onRefresh ? (
-        <RefreshControl
+        <ThemedRefreshControl
           refreshing={isRefreshing}
           onRefresh={onRefresh}
-          tintColor={theme.colors.foregroundMuted}
-          colors={refreshColors}
+          uniProps={refreshControlColors}
         />
       ) : undefined,
-    [onRefresh, isRefreshing, theme.colors.foregroundMuted, refreshColors],
+    [onRefresh, isRefreshing],
   );
-
   return (
     <>
       <FlatList
         data={flatItems}
         style={styles.list}
         contentContainerStyle={styles.listContent}
-        keyExtractor={keyExtractor}
+        keyExtractor={historyItemKey}
         renderItem={renderItem}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
@@ -511,8 +417,8 @@ export function AgentList({
         onRequestClose={handleCloseActionSheet}
       >
         <View style={styles.sheetOverlay}>
-          <Pressable style={styles.sheetBackdrop} onPress={handleCloseActionSheet} />
-          <View style={sheetContainerStyle}>
+          <PressHighlight style={styles.sheetBackdrop} onPress={handleCloseActionSheet} />
+          <View style={styles.sheetContainer(insets.bottom)}>
             <View style={styles.sheetHandle} />
             <Text style={styles.sheetTitle}>
               {isActionDaemonUnavailable
@@ -520,21 +426,28 @@ export function AgentList({
                 : t("agentList.archiveSheet.runningAgent")}
             </Text>
             <View style={styles.sheetButtonRow}>
-              <Pressable
+              <PressHighlight
                 style={[styles.sheetButton, styles.sheetCancelButton]}
                 onPress={handleCloseActionSheet}
                 testID="agent-action-cancel"
               >
                 <Text style={styles.sheetCancelText}>{t("common.actions.cancel")}</Text>
-              </Pressable>
-              <Pressable
+              </PressHighlight>
+              <PressHighlight
                 disabled={isActionDaemonUnavailable}
                 style={[styles.sheetButton, styles.sheetArchiveButton]}
                 onPress={handleArchiveAgent}
                 testID="agent-action-archive"
               >
-                <Text style={sheetArchiveTextStyle}>{t("agentList.archiveSheet.archive")}</Text>
-              </Pressable>
+                <Text
+                  style={[
+                    styles.sheetArchiveText,
+                    isActionDaemonUnavailable && styles.sheetArchiveTextDisabled,
+                  ]}
+                >
+                  {t("agentList.archiveSheet.archive")}
+                </Text>
+              </PressHighlight>
             </View>
           </View>
         </View>
@@ -549,131 +462,125 @@ const styles = StyleSheet.create((theme) => ({
     minHeight: 0,
   },
   listContent: {
-    paddingHorizontal: {
-      xs: theme.spacing[3],
-      md: theme.spacing[6],
-    },
+    paddingHorizontal: { xs: theme.spacing[3], md: theme.spacing[6] },
     paddingTop: theme.spacing[4],
     paddingBottom: theme.spacing[6],
-    gap: theme.spacing[1],
   },
-  sectionHeading: {
-    marginTop: theme.spacing[2],
+  projectHeading: {
     flexDirection: "row",
     alignItems: "center",
-    gap: theme.spacing[3],
-    paddingHorizontal: theme.spacing[3],
+    gap: theme.spacing[2],
+    paddingHorizontal: theme.spacing[2],
+    marginTop: theme.spacing[3],
     marginBottom: theme.spacing[2],
   },
-  sectionTitle: {
+  projectIconText: {
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
+  },
+  projectTitle: {
+    flexShrink: 1,
     fontSize: theme.fontSize.base,
     fontWeight: theme.fontWeight.medium,
-    color: theme.colors.foregroundMuted,
-  },
-  row: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingVertical: theme.spacing[2],
-    paddingHorizontal: theme.spacing[3],
-    borderRadius: {
-      xs: theme.borderRadius.lg,
-      md: 0,
-    },
-    marginBottom: {
-      xs: theme.spacing[1],
-      md: 0,
-    },
-  },
-  rowContent: {
-    flex: 1,
-    minWidth: 0,
-    overflow: "hidden",
-  },
-  rowTitleRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    flexWrap: "nowrap",
-    gap: theme.spacing[2],
-    overflow: "hidden",
-  },
-  agentTitleRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: theme.spacing[2],
-    flexShrink: 1,
-    minWidth: 0,
-  },
-  providerIconWrap: {
-    flexShrink: 0,
-  },
-  workspaceTitleText: {
-    flexShrink: { xs: 1, md: 0 },
-    maxWidth: { xs: "100%", md: 320 },
-    fontSize: theme.fontSize.base,
     color: theme.colors.foreground,
   },
-  rowMetaRow: {
+  workspaceHeading: {
+    gap: theme.spacing[1],
+    marginStart: theme.spacing[3],
+    paddingHorizontal: theme.spacing[2],
+    paddingVertical: theme.spacing[2],
+  },
+  workspaceHeadingRow: {
     flexDirection: "row",
     alignItems: "center",
-    flexWrap: "wrap",
+    gap: theme.spacing[2],
+  },
+  workspaceNameRow: {
+    minHeight: theme.spacing[6],
+  },
+  workspaceTitle: {
+    flexShrink: 1,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
+    color: theme.colors.foreground,
+  },
+  workspaceMeta: {
+    flexShrink: 1,
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+  },
+  sessionRow: {
+    flexDirection: "row",
+    alignItems: "center",
     gap: theme.spacing[1],
-    marginTop: 2,
+    marginStart: theme.spacing[6],
   },
-  rowTrailing: {
-    marginLeft: theme.spacing[2],
+  subagentRow: {
+    marginStart: theme.spacing[8],
   },
-  rowSelected: {
-    backgroundColor: theme.colors.surface2,
+  sessionNavigation: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: density.rowHeight,
+    flexDirection: { xs: "column", md: "row" },
+    alignItems: { xs: "stretch", md: "center" },
+    justifyContent: { xs: "center", md: "space-between" },
+    columnGap: theme.spacing[2],
+    paddingHorizontal: theme.spacing[2],
+    borderRadius: theme.borderRadius.lg,
   },
-  rowHovered: {
-    backgroundColor: theme.colors.surface1,
-  },
-  rowPressed: {
-    backgroundColor: theme.colors.surface2,
+  sessionTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexShrink: 1,
+    minWidth: 0,
+    gap: theme.spacing[2],
   },
   sessionTitle: {
     flexShrink: 1,
     minWidth: 0,
     fontSize: theme.fontSize.base,
-    fontWeight: "400",
+    fontWeight: theme.fontWeight.normal,
+    color: theme.colors.foreground,
+  },
+  ancestorTitle: {
     color: theme.colors.foregroundMuted,
   },
-  sessionMetaText: {
-    maxWidth: "100%",
-    fontSize: theme.fontSize.base,
-    color: theme.colors.foregroundMuted,
-  },
-  sessionMetaSeparator: {
-    fontSize: theme.fontSize.base,
-    color: theme.colors.foregroundMuted,
-    opacity: 0.7,
-  },
-  rowColumns: {
+  sessionMetadata: {
     flexDirection: "row",
     alignItems: "center",
-    flexShrink: 0,
-    gap: theme.spacing[3],
+    gap: theme.spacing[1],
+    minHeight: 20,
+    minWidth: 0,
   },
-  columnMeta: {
-    fontSize: theme.fontSize.base,
+  activityTime: {
     color: theme.colors.foregroundMuted,
-    flexShrink: 0,
-    width: 132,
+    fontSize: theme.fontSize.sm,
+    flexShrink: 1,
   },
-  columnMetaFixed: {
-    fontSize: theme.fontSize.base,
-    color: theme.colors.foregroundMuted,
+  subagentsToggle: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
     flexShrink: 0,
-    width: 72,
-    textAlign: "right" as const,
+    maxWidth: "38%",
+    minHeight: density.rowHeight,
+    gap: theme.spacing[1],
+    paddingHorizontal: theme.spacing[2],
+    borderRadius: theme.borderRadius.full,
+    backgroundColor: theme.colors.surface1,
   },
-  columnMetaHost: {
-    fontSize: theme.fontSize.base,
+  subagentsLabel: {
     color: theme.colors.foregroundMuted,
-    flexShrink: 0,
-    width: 120,
-    marginLeft: theme.spacing[4],
-    textAlign: "right" as const,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
+    flexShrink: 1,
+  },
+  rowPressed: {
+    backgroundColor: theme.colors.surface2,
+  },
+  rowHovered: {
+    backgroundColor: theme.colors.surface1,
   },
   sheetOverlay: {
     flex: 1,
@@ -687,14 +594,15 @@ const styles = StyleSheet.create((theme) => ({
     left: 0,
     backgroundColor: "rgba(0,0,0,0.35)",
   },
-  sheetContainer: {
+  sheetContainer: (bottomInset: number) => ({
     backgroundColor: theme.colors.surface2,
     borderTopLeftRadius: theme.borderRadius["2xl"],
     borderTopRightRadius: theme.borderRadius["2xl"],
     paddingHorizontal: theme.spacing[6],
     paddingTop: theme.spacing[4],
+    paddingBottom: Math.max(bottomInset, theme.spacing[6]),
     gap: theme.spacing[4],
-  },
+  }),
   sheetHandle: {
     alignSelf: "center",
     width: 40,
@@ -705,7 +613,7 @@ const styles = StyleSheet.create((theme) => ({
   },
   sheetTitle: {
     fontSize: theme.fontSize.base,
-    fontWeight: theme.fontWeight.semibold,
+    fontWeight: theme.fontWeight.medium,
     color: theme.colors.foreground,
     textAlign: "center",
   },
@@ -725,7 +633,7 @@ const styles = StyleSheet.create((theme) => ({
   },
   sheetArchiveText: {
     color: theme.colors.primaryForeground,
-    fontWeight: theme.fontWeight.semibold,
+    fontWeight: theme.fontWeight.medium,
     fontSize: theme.fontSize.base,
   },
   sheetArchiveTextDisabled: {
@@ -736,7 +644,7 @@ const styles = StyleSheet.create((theme) => ({
   },
   sheetCancelText: {
     color: theme.colors.foreground,
-    fontWeight: theme.fontWeight.semibold,
+    fontWeight: theme.fontWeight.medium,
     fontSize: theme.fontSize.base,
   },
 }));

@@ -300,7 +300,14 @@ export const en = {
   },
   sessions: {
     title: "History",
+    tabs: {
+      archived: "Archived",
+      active: "Active",
+    },
     empty: "No sessions yet",
+    emptyArchived: "No archived sessions",
+    emptyActive: "No active sessions",
+    emptyHost: "No sessions for this host",
     noMatches: "No sessions match",
     tooManyMatches: "Too many matches — narrow your search",
     hostLoadFailed: "{{host}}: Could not load history",
@@ -312,6 +319,12 @@ export const en = {
   },
   agentList: {
     fallbackTitle: "New session",
+    subagents: {
+      one: "1 subagent",
+      many: "{{count}} subagents",
+      expandAccessibility: "Show subagents",
+      collapseAccessibility: "Hide subagents",
+    },
     dateSections: {
       recent: "Recent",
       today: "Today",

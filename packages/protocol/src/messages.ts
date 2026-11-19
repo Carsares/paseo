@@ -1465,9 +1465,14 @@ export const ProjectSuggestionsRequestSchema = z.object({
   limit: z.number().int().positive().max(100).optional(),
 });
 
+export const AgentHistoryArchiveScopeSchema = z.enum(["all", "active", "archived"]);
+export type AgentHistoryArchiveScope = z.infer<typeof AgentHistoryArchiveScopeSchema>;
+
 export const FetchAgentHistoryRequestMessageSchema = z.object({
   type: z.literal("fetch_agent_history_request"),
   requestId: z.string(),
+  // Active and archived scopes classify both the agent and its workspace and override includeArchived.
+  archiveScope: AgentHistoryArchiveScopeSchema.optional(),
   filter: AgentDirectoryFilterSchema.optional(),
   // A free-text filter over agent title, workspace name, branch, and project name.
   // Matching rows follow the requested sort and cursor pagination.
@@ -3930,6 +3935,8 @@ export const ServerInfoStatusPayloadSchema = z
         backgroundWorkspaces: z.boolean().optional(),
         // COMPAT(backgroundAgents): added in v0.15.0; remove gate after 2027-05-03.
         backgroundAgents: z.boolean().optional(),
+        // COMPAT(agentHistoryArchiveScope): added in v0.16.0, remove gate after 2027-05-19.
+        agentHistoryArchiveScope: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
         connectedHosts: z.boolean().optional(),
         hostMultiplexing: z.boolean().optional(),
@@ -4326,8 +4333,10 @@ export const ProjectCheckoutLitePayloadSchema = z.union([
 
 export const ProjectPlacementPayloadSchema = z.object({
   projectKey: z.string(),
+  projectEquivalenceKey: z.string().nullable().optional(),
   projectName: z.string(),
   workspaceName: z.string().nullable().optional(),
+  workspaceArchivedAt: z.string().nullable().optional(),
   checkout: ProjectCheckoutLitePayloadSchema,
 });
 
@@ -4609,6 +4618,8 @@ export const FetchAgentHistoryResponseMessageSchema = z.object({
   payload: z.object({
     requestId: z.string(),
     entries: z.array(AgentDirectoryResponseEntrySchema),
+    // Same-workspace context for entries on this page, outside pagination and search matching.
+    ancestors: z.array(AgentDirectoryResponseEntrySchema).optional(),
     pageInfo: AgentDirectoryPageInfoSchema,
     // Older daemons truncate relevance-ranked searches instead of returning a cursor.
     searchTruncated: z.boolean().optional(),

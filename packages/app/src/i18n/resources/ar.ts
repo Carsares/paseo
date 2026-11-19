@@ -301,7 +301,14 @@ export const ar: TranslationResources = {
   },
   sessions: {
     title: "السجل",
+    tabs: {
+      archived: "المؤرشفة",
+      active: "النشطة",
+    },
     empty: "لا توجد جلسات بعد",
+    emptyArchived: "لا توجد جلسات مؤرشفة",
+    emptyActive: "لا توجد جلسات نشطة",
+    emptyHost: "لا توجد جلسات على هذا المضيف",
     noMatches: "لا توجد جلسات مطابقة",
     tooManyMatches: "نتائج كثيرة جدًا — ضيّق نطاق البحث",
     hostLoadFailed: "{{host}}: تعذر تحميل السجل",
@@ -313,6 +320,12 @@ export const ar: TranslationResources = {
   },
   agentList: {
     fallbackTitle: "جلسة جديدة",
+    subagents: {
+      one: "وكيل فرعي واحد",
+      many: "الوكلاء الفرعيون: {{count}}",
+      expandAccessibility: "إظهار الوكلاء الفرعيين",
+      collapseAccessibility: "إخفاء الوكلاء الفرعيين",
+    },
     dateSections: {
       recent: "مؤخرًا",
       today: "اليوم",

@@ -14,6 +14,7 @@ import { searchTimeline } from "./agent/chat-search/index.js";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import { BrowserAutomationHostCapabilitySchema } from "@getpaseo/protocol/browser-automation/capabilities";
 import type {
+  AgentHistoryArchiveScope,
   SessionEventSubscription,
   UsageReportEntry,
   ProviderUsage,
@@ -97,7 +98,10 @@ import { toWireDaemonConfig, type DaemonConfigStore } from "./daemon-config-stor
 import { releaseWorkspaceServicePortPlan } from "./workspace-service-port-registry.js";
 import { getErrorMessage, getErrorMessageOr } from "@getpaseo/protocol/error-utils";
 import { getAgentStatusPriority } from "@getpaseo/protocol/agent-state-bucket";
-import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  getParentAddressFromLabels,
+  getParentAgentIdFromLabels,
+} from "@getpaseo/protocol/agent-labels";
 import { applyRecordPatch } from "./record-patch.js";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
 import type { ProjectUpdate } from "./workspace-reconciliation-service.js";
@@ -413,6 +417,22 @@ type FetchAgentsResponsePayload = Extract<
 type FetchAgentsResponseEntry = FetchAgentsResponsePayload["entries"][number];
 type FetchAgentsResponsePageInfo = FetchAgentsResponsePayload["pageInfo"];
 type AgentUpdatesFilter = FetchAgentsRequestFilter;
+
+function agentDirectoryArchiveOptions(request: AgentDirectoryRequestMessage): {
+  archiveScope: AgentHistoryArchiveScope;
+  filter: AgentUpdatesFilter | undefined;
+} {
+  if (request.type !== "fetch_agent_history_request") {
+    return { archiveScope: "all", filter: request.filter };
+  }
+  const archiveScope = request.archiveScope ?? "all";
+  const filter =
+    archiveScope === "all" && request.filter?.includeArchived !== undefined
+      ? request.filter
+      : { ...request.filter, includeArchived: archiveScope !== "active" };
+  return { archiveScope, filter };
+}
+
 type CreateAgentRequestMessage = Extract<SessionInboundMessage, { type: "create_agent_request" }>;
 
 interface ResolvedSessionCreateAgentIntent {
@@ -772,6 +792,7 @@ export class Session {
   );
   private readonly browserToolsBroker: SessionOptions["browserToolsBroker"];
   private readonly clientId: string;
+  private readonly serverId: string | undefined;
   private readonly authorization: SessionAuthorization;
   private appVersion: string | null;
   private clientCapabilities: ReadonlySet<ClientCapability>;
@@ -944,6 +965,7 @@ export class Session {
     } = options;
     this.browserToolsBroker = options.browserToolsBroker;
     this.clientId = clientId;
+    this.serverId = serverId;
     this.authorization = new SessionAuthorization(permissions);
 
     this.appVersion = appVersion ?? null;
@@ -2368,13 +2390,21 @@ export class Session {
 
   private async buildProjectPlacementForWorkspaceId(
     workspaceId: string,
+    includeHistoryMetadata = false,
   ): Promise<ProjectPlacementPayload | null> {
     const workspace = await this.workspaceRegistry.get(workspaceId);
     if (!workspace) return null;
 
     const project = await this.projectRegistry.get(workspace.projectId);
     if (!project) return null;
-    return this.buildProjectPlacementForWorkspace(workspace, project);
+    const placement = await this.buildProjectPlacementForWorkspace(workspace, project);
+    return includeHistoryMetadata
+      ? {
+          ...placement,
+          projectEquivalenceKey: project.projectKey ?? null,
+          workspaceArchivedAt: workspace.archivedAt,
+        }
+      : placement;
   }
 
   /**
@@ -5932,9 +5962,10 @@ export class Session {
     limit: number;
     getPlacement: (workspaceId: string | undefined) => Promise<ProjectPlacementPayload | null>;
     filter: AgentUpdatesFilter | undefined;
+    archiveScope: AgentHistoryArchiveScope;
     search?: string;
   }): Promise<FetchAgentsResponseEntry[]> {
-    const { candidates, limit, getPlacement, filter, search } = params;
+    const { candidates, limit, getPlacement, filter, archiveScope, search } = params;
     const matchedEntries: FetchAgentsResponseEntry[] = [];
     const batchSize = 25;
     for (
@@ -5952,6 +5983,11 @@ export class Session {
       for (const entry of batchEntries) {
         if (!entry) {
           continue;
+        }
+        if (archiveScope !== "all") {
+          const archived =
+            entry.agent.archivedAt != null || entry.project.workspaceArchivedAt != null;
+          if (archived !== (archiveScope === "archived")) continue;
         }
         if (
           !matchesAgentUpdatesFilter({
@@ -5972,6 +6008,65 @@ export class Session {
     return matchedEntries;
   }
 
+  private async collectAgentHistoryAncestors(params: {
+    pagedEntries: FetchAgentsResponseEntry[];
+    agents: AgentSnapshotPayload[];
+    backgroundVisibility: BackgroundVisibility;
+  }): Promise<FetchAgentsResponseEntry[]> {
+    const { pagedEntries, agents, backgroundVisibility } = params;
+    const serverId = this.serverId ?? "";
+    const snapshots = new Map<string, AgentSnapshotPayload | null>(
+      agents.map((agent) => [agent.id, agent]),
+    );
+    const includedIds = new Set(pagedEntries.map(({ agent }) => agent.id));
+    const ancestors: FetchAgentsResponseEntry[] = [];
+
+    const getParent = async (
+      id: string,
+      workspaceId: string,
+    ): Promise<AgentSnapshotPayload | null> => {
+      const cached = snapshots.get(id);
+      if (cached !== undefined) return cached?.workspaceId === workspaceId ? cached : null;
+
+      const live = this.agentManager.getAgent(id);
+      const stored = live ? null : await this.agentStorage.get(id);
+      const source = live ?? stored;
+      if (source && source.workspaceId !== workspaceId) return null;
+
+      let parent: AgentSnapshotPayload | null = null;
+      if (
+        source &&
+        this.isProviderVisibleToClient(source.provider) &&
+        (await this.agentDirectory.includes(source, backgroundVisibility))
+      ) {
+        if (live) parent = await this.buildAgentPayload(live);
+        else if (stored) parent = this.buildStoredAgentPayload(stored);
+      }
+      snapshots.set(id, parent);
+      return parent;
+    };
+
+    for (const { agent, project } of pagedEntries) {
+      const seen = new Set([agent.id]);
+      let current = agent;
+      while (current.workspaceId) {
+        const address = getParentAddressFromLabels(current.labels, serverId);
+        if (!address || address.serverId !== serverId || seen.has(address.agentId)) break;
+
+        const parent = await getParent(address.agentId, current.workspaceId);
+        if (!parent) break;
+
+        seen.add(parent.id);
+        if (!includedIds.has(parent.id)) {
+          ancestors.push({ agent: parent, project });
+          includedIds.add(parent.id);
+        }
+        current = parent;
+      }
+    }
+    return ancestors;
+  }
+
   /**
    * Inclusive discovery for the requesting source. Exact-ID reads never pass through this.
    * COMPAT(backgroundAgents): added in v0.15.0, remove after 2027-05-03 once client floor
@@ -5989,14 +6084,12 @@ export class Session {
     backgroundVisibility: BackgroundVisibility,
   ): Promise<{
     entries: FetchAgentsResponseEntry[];
+    ancestors?: FetchAgentsResponseEntry[];
     pageInfo: FetchAgentsResponsePageInfo;
     searchTruncated?: boolean;
   }> {
-    const filter =
-      request.type === "fetch_agent_history_request" &&
-      request.filter?.includeArchived === undefined
-        ? { ...request.filter, includeArchived: true }
-        : request.filter;
+    const { archiveScope, filter } = agentDirectoryArchiveOptions(request);
+    const isHistory = request.type === "fetch_agent_history_request";
     const scope = request.type === "fetch_agents_request" ? request.scope : undefined;
     const sort = this.agentsPager.normalizeSort(request.sort);
 
@@ -6004,7 +6097,7 @@ export class Session {
       labels: filter?.labels,
       includeArchived: filter?.includeArchived,
       includeBackground: backgroundVisibility,
-      includeUnavailablePersisted: request.type === "fetch_agent_history_request",
+      includeUnavailablePersisted: isHistory,
     });
     const activePlacementsByWorkspaceId =
       scope === "active" ? await this.buildActiveProjectPlacementsByWorkspaceId() : null;
@@ -6031,7 +6124,7 @@ export class Session {
       if (existing) {
         return existing;
       }
-      const placementPromise = this.buildProjectPlacementForWorkspaceId(workspaceId);
+      const placementPromise = this.buildProjectPlacementForWorkspaceId(workspaceId, isHistory);
       placementByWorkspaceId.set(workspaceId, placementPromise);
       return placementPromise;
     };
@@ -6054,6 +6147,7 @@ export class Session {
       limit,
       getPlacement,
       filter,
+      archiveScope,
       search,
     });
 
@@ -6063,9 +6157,18 @@ export class Session {
       hasMore && pagedEntries.length > 0
         ? this.agentsPager.encode(pagedEntries[pagedEntries.length - 1].agent, sort)
         : null;
+    const ancestors =
+      isHistory && pagedEntries.length > 0
+        ? await this.collectAgentHistoryAncestors({
+            pagedEntries,
+            agents,
+            backgroundVisibility,
+          })
+        : [];
 
     return {
       entries: pagedEntries,
+      ...(ancestors.length > 0 ? { ancestors } : {}),
       pageInfo: {
         nextCursor,
         prevCursor: request.page?.cursor ?? null,

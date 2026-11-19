@@ -306,7 +306,14 @@ export const ja: TranslationResources = {
   },
   sessions: {
     title: "履歴",
+    tabs: {
+      archived: "アーカイブ済み",
+      active: "アクティブ",
+    },
     empty: "セッションがまだありません",
+    emptyArchived: "アーカイブ済みのセッションはありません",
+    emptyActive: "アクティブなセッションはありません",
+    emptyHost: "このホストにはセッションがありません",
     noMatches: "一致するセッションはありません",
     tooManyMatches: "一致が多すぎます — 検索条件を絞ってください",
     hostLoadFailed: "{{host}}: 履歴を読み込めませんでした",
@@ -318,6 +325,12 @@ export const ja: TranslationResources = {
   },
   agentList: {
     fallbackTitle: "新しいセッション",
+    subagents: {
+      one: "サブエージェント 1 件",
+      many: "サブエージェント {{count}} 件",
+      expandAccessibility: "サブエージェントを表示",
+      collapseAccessibility: "サブエージェントを非表示",
+    },
     dateSections: {
       recent: "最近",
       today: "今日",

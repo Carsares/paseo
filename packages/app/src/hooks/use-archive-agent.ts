@@ -42,6 +42,7 @@ export interface AgentHistoryQueryAgent {
 
 export interface AgentHistoryQueryPage {
   agents?: AgentHistoryQueryAgent[];
+  ancestors?: AgentHistoryQueryAgent[];
 }
 
 export interface AgentHistoryQueryData {
@@ -177,12 +178,8 @@ export function markAgentArchivedInHistoryPayload<T extends AgentHistoryQueryDat
 
   let changed = false;
   const pages = payload.pages.map((page) => {
-    if (!Array.isArray(page.agents)) {
-      return page;
-    }
-
     let pageChanged = false;
-    const agents = page.agents.map((agent) => {
+    const markArchived = (agent: AgentHistoryQueryAgent) => {
       if (
         agent.id !== input.agentId ||
         (agent.serverId != null && agent.serverId !== input.serverId)
@@ -195,9 +192,11 @@ export function markAgentArchivedInHistoryPayload<T extends AgentHistoryQueryDat
         ...agent,
         archivedAt,
       };
-    });
+    };
+    const agents = page.agents?.map(markArchived);
+    const ancestors = page.ancestors?.map(markArchived);
 
-    return pageChanged ? { ...page, agents } : page;
+    return pageChanged ? { ...page, agents, ...(ancestors ? { ancestors } : {}) } : page;
   });
 
   return changed ? ({ ...payload, pages } as T) : payload;
@@ -207,8 +206,8 @@ export function markAgentArchivedInHistoryCache(
   queryClient: QueryClient,
   input: ArchiveAgentInput & { archivedAt: string },
 ): void {
-  queryClient.setQueryData<AgentHistoryQueryData | undefined>(
-    agentHistoryQueryKey(input.serverId),
+  queryClient.setQueriesData<AgentHistoryQueryData | undefined>(
+    { queryKey: agentHistoryQueryKey(input.serverId) },
     (current) => markAgentArchivedInHistoryPayload(current, input),
   );
   queryClient.setQueriesData<AgentHistoryQueryData | undefined>(
@@ -232,7 +231,7 @@ export interface ArchivedAgentCloseResult {
 interface ArchivedAgentListCacheSnapshot {
   sidebarAgentsList: AgentsListQueryData | undefined;
   allAgents: AgentsListQueryData | undefined;
-  agentHistory: AgentHistoryQueryData | undefined;
+  agentHistory: Array<[QueryKey, AgentHistoryQueryData | undefined]>;
   allAgentHistory: Array<[QueryKey, AgentHistoryQueryData | undefined]>;
 }
 
@@ -261,9 +260,9 @@ function getArchivedAgentListCacheSnapshot(
       serverId,
     ]),
     allAgents: queryClient.getQueryData<AgentsListQueryData | undefined>(["allAgents", serverId]),
-    agentHistory: queryClient.getQueryData<AgentHistoryQueryData | undefined>(
-      agentHistoryQueryKey(serverId),
-    ),
+    agentHistory: queryClient.getQueriesData<AgentHistoryQueryData | undefined>({
+      queryKey: agentHistoryQueryKey(serverId),
+    }),
     allAgentHistory: queryClient.getQueriesData<AgentHistoryQueryData | undefined>({
       queryKey: allAgentHistoryQueryRootKey(),
     }),
@@ -293,8 +292,7 @@ function restoreArchivedAgentListCacheSnapshot(
     snapshot.sidebarAgentsList,
   );
   restoreCachedQuerySnapshot(queryClient, ["allAgents", serverId], snapshot.allAgents);
-  restoreCachedQuerySnapshot(queryClient, agentHistoryQueryKey(serverId), snapshot.agentHistory);
-  for (const [queryKey, querySnapshot] of snapshot.allAgentHistory) {
+  for (const [queryKey, querySnapshot] of [...snapshot.agentHistory, ...snapshot.allAgentHistory]) {
     restoreCachedQuerySnapshot(queryClient, queryKey, querySnapshot);
   }
 }

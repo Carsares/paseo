@@ -23,8 +23,14 @@ const AGENT_HISTORY_SORT: NonNullable<FetchAgentHistoryOptions["sort"]> = [
 ];
 const AGENT_HISTORY_ALL_HOSTS_FAILED_MESSAGE = "No connected hosts could load agent history";
 
+export type AgentHistoryArchiveScope = Exclude<
+  FetchAgentHistoryOptions["archiveScope"],
+  "all" | undefined
+>;
+
 export interface AgentHistoryResult {
   agents: AggregatedAgent[];
+  ancestors: AggregatedAgent[];
   isLoading: boolean;
   isInitialLoad: boolean;
   isRevalidating: boolean;
@@ -33,6 +39,7 @@ export interface AgentHistoryResult {
   isLoadingMore: boolean;
   /** False when any target host predates search; the screen hides the field. */
   isSearchSupported: boolean;
+  isArchiveScopeSupported: boolean;
   /** More sessions matched than the ranked page holds. Narrow the query. */
   isSearchTruncated: boolean;
   /** The agents answer the previous query; the current one is loading (`keepPreviousResults`). */
@@ -45,6 +52,7 @@ export interface AgentHistoryResult {
 
 export interface AgentHistoryPage {
   agents: AggregatedAgent[];
+  ancestors: AggregatedAgent[];
   pageInfo: FetchAgentHistoryPageInfo;
   /** More matched this host's query than its page could hold. */
   isSearchTruncated: boolean;
@@ -70,6 +78,7 @@ export interface AgentHistoryHost {
 
 interface AgentHistoryBatchPage {
   agents: AggregatedAgent[];
+  ancestors: AggregatedAgent[];
   pageInfoByServerId: Record<string, FetchAgentHistoryPageInfo>;
   hostErrors: AgentHistoryHostError[];
   /** Set only under a query: more sessions matched than this page can hold. */
@@ -81,27 +90,26 @@ type AgentHistoryCursorByServerId = Record<string, string | null>;
 export async function fetchAgentHistoryPage(input: {
   client: AgentHistoryClient;
   serverId: string;
+  serverLabel?: string;
   cursor: string | null;
   search?: string;
+  archiveScope?: AgentHistoryArchiveScope;
 }): Promise<AgentHistoryPage> {
   const payload = await input.client.fetchAgentHistory({
     ...(input.search ? { search: input.search } : {}),
+    ...(input.archiveScope ? { archiveScope: input.archiveScope } : {}),
     sort: AGENT_HISTORY_SORT,
     page: input.cursor
       ? { limit: AGENT_HISTORY_PAGE_LIMIT, cursor: input.cursor }
       : { limit: AGENT_HISTORY_PAGE_LIMIT },
   });
 
-  const { agents } = buildAgentDirectoryState({
-    serverId: input.serverId,
-    entries: payload.entries,
-  });
-  return {
-    isSearchTruncated: payload.searchTruncated === true,
-    agents: Array.from(agents.values(), (agent) => ({
+  function normalizeEntries(entries: typeof payload.entries): AggregatedAgent[] {
+    const { agents } = buildAgentDirectoryState({ serverId: input.serverId, entries });
+    return Array.from(agents.values(), (agent) => ({
       id: agent.id,
       serverId: input.serverId,
-      serverLabel: input.serverId,
+      serverLabel: input.serverLabel ?? input.serverId,
       title: agent.title ?? null,
       status: agent.status,
       turn: agent.turn,
@@ -117,9 +125,35 @@ export async function fetchAgentHistoryPage(input: {
       createdAt: agent.createdAt,
       labels: agent.labels,
       projectPlacement: agent.projectPlacement,
-    })),
+    }));
+  }
+
+  return {
+    isSearchTruncated: payload.searchTruncated === true,
+    agents: normalizeEntries(payload.entries),
+    ancestors: normalizeEntries(payload.ancestors ?? []),
     pageInfo: payload.pageInfo,
   };
+}
+
+function collectAgentHistoryAncestors(
+  pages: readonly Partial<Pick<AgentHistoryPage, "ancestors">>[],
+): AggregatedAgent[] {
+  const ancestors = new Map<string, AggregatedAgent>();
+  for (const page of pages) {
+    for (const agent of page.ancestors ?? []) {
+      const key = JSON.stringify([agent.serverId, agent.id]);
+      if (!ancestors.has(key)) ancestors.set(key, agent);
+    }
+  }
+  return [...ancestors.values()];
+}
+
+function withCurrentServerLabel(agent: AggregatedAgent, labels: ReadonlyMap<string, string>) {
+  const serverLabel = labels.get(agent.serverId);
+  return serverLabel !== undefined && serverLabel !== agent.serverLabel
+    ? { ...agent, serverLabel }
+    : agent;
 }
 
 function sortByLatestActivity(agents: AggregatedAgent[]): AggregatedAgent[] {
@@ -168,6 +202,7 @@ export async function fetchAgentHistoryBatch(input: {
   hosts: readonly AgentHistoryHost[];
   cursorByServerId: AgentHistoryCursorByServerId | null;
   search?: string;
+  archiveScope?: AgentHistoryArchiveScope;
 }): Promise<AgentHistoryBatchPage> {
   const cursorByServerId = input.cursorByServerId ?? {};
   const hasCursorFilter = Object.keys(cursorByServerId).length > 0;
@@ -180,8 +215,10 @@ export async function fetchAgentHistoryBatch(input: {
       const page = await fetchAgentHistoryPage({
         client: host.client,
         serverId: host.serverId,
+        serverLabel: host.serverLabel,
         cursor: cursorByServerId[host.serverId] ?? null,
-        ...(input.search ? { search: input.search } : {}),
+        search: input.search,
+        archiveScope: input.archiveScope,
       });
       return { host, page };
     }),
@@ -205,14 +242,13 @@ export async function fetchAgentHistoryBatch(input: {
       : [],
   );
 
-  const agents = pages.flatMap(({ host, page }) =>
-    page.agents.map((agent) => Object.assign({}, agent, { serverLabel: host.serverLabel })),
-  );
+  const agents = pages.flatMap(({ page }) => page.agents);
   const pageInfoByServerId = Object.fromEntries(
     pages.map(({ host, page }) => [host.serverId, page.pageInfo]),
   );
   return {
     agents: sortByLatestActivity(agents),
+    ancestors: collectAgentHistoryAncestors(pages.map(({ page }) => page)),
     pageInfoByServerId,
     hostErrors,
     ...(input.search
@@ -225,6 +261,7 @@ export function useAgentHistory(options: {
   serverId?: string | null;
   enabled?: boolean;
   search?: string;
+  archiveScope?: AgentHistoryArchiveScope;
   /**
    * Leave out hosts that predate search, instead of searching no host. For a surface that adds
    * history matches to other results, where a missing host is not a claim of "no matches".
@@ -289,6 +326,18 @@ export function useAgentHistory(options: {
       [targetServerIds],
     ),
   );
+  // COMPAT(agentHistoryArchiveScope): added in v0.16.0, remove gate after 2027-05-19.
+  const isArchiveScopeSupported = useSessionStore(
+    useCallback(
+      (state) =>
+        targetServerIds.length > 0 &&
+        targetServerIds.every(
+          (id) => state.sessions[id]?.serverInfo?.features?.agentHistoryArchiveScope === true,
+        ),
+      [targetServerIds],
+    ),
+  );
+  const effectiveArchiveScope = isArchiveScopeSupported ? options.archiveScope : undefined;
   const search = useMemo(() => {
     const trimmed = options.search?.trim() ?? "";
     return isSearchSupported ? trimmed : "";
@@ -297,8 +346,9 @@ export function useAgentHistory(options: {
     () => [
       ...(serverId ? agentHistoryQueryKey(serverId) : allAgentHistoryQueryKey(targetServerIds)),
       search,
+      ...(effectiveArchiveScope ? [{ archiveScope: effectiveArchiveScope }] : []),
     ],
-    [search, serverId, targetServerIds],
+    [effectiveArchiveScope, search, serverId, targetServerIds],
   );
   const serverLabelById = useMemo(
     () => new Map(daemons.map((daemon) => [daemon.serverId, daemon.label])),
@@ -318,7 +368,22 @@ export function useAgentHistory(options: {
     staleTime: 30_000,
     // Previous results stand in only until the next query's arrive. With no host to search,
     // nothing will arrive, so they would stand in, and read as still loading, indefinitely.
-    ...(options.keepPreviousResults && queryEnabled ? { placeholderData: keepPreviousData } : {}),
+    ...(options.keepPreviousResults && queryEnabled
+      ? {
+          placeholderData: (previousData, previousQuery) => {
+            const previousSuffix = previousQuery?.queryKey.at(-1);
+            const previousScope =
+              previousSuffix &&
+              typeof previousSuffix === "object" &&
+              "archiveScope" in previousSuffix
+                ? previousSuffix.archiveScope
+                : undefined;
+            return previousScope === effectiveArchiveScope
+              ? keepPreviousData(previousData)
+              : undefined;
+          },
+        }
+      : {}),
     initialPageParam: null,
     getNextPageParam: getNextAgentHistoryPageParam,
     queryFn: async ({ pageParam }) => {
@@ -328,7 +393,8 @@ export function useAgentHistory(options: {
       return fetchAgentHistoryBatch({
         hosts: targetHosts,
         cursorByServerId: pageParam,
-        ...(search ? { search } : {}),
+        search,
+        archiveScope: effectiveArchiveScope,
       });
     },
   });
@@ -358,16 +424,27 @@ export function useAgentHistory(options: {
     void fetchNextPage();
   }, [enabled, fetchNextPage, hasNextPage, isFetchingNextPage, targetHosts.length]);
 
-  const agents = useMemo(() => {
+  const { agents, ancestors } = useMemo(() => {
     const pages = data?.pages ?? [];
-    const historyAgents = pages.flatMap((page) => page.agents);
-    const labelledAgents = historyAgents.map((agent) =>
-      Object.assign({}, agent, {
-        serverLabel: serverLabelById.get(agent.serverId) ?? agent.serverLabel,
-      }),
-    );
-    return sortByLatestActivity(labelledAgents);
-  }, [data?.pages, serverLabelById]);
+    const matched: AggregatedAgent[] = [];
+    const archivedWhileActive: AggregatedAgent[] = [];
+    for (const page of pages) {
+      for (const agent of page.agents) {
+        // An optimistic archive may leave a parent in the active cache until refetch.
+        const destination =
+          effectiveArchiveScope === "active" && agent.archivedAt ? archivedWhileActive : matched;
+        destination.push(withCurrentServerLabel(agent, serverLabelById));
+      }
+    }
+    const parentContext = collectAgentHistoryAncestors([
+      { ancestors: archivedWhileActive },
+      ...pages,
+    ]);
+    return {
+      agents: sortByLatestActivity(matched),
+      ancestors: parentContext.map((agent) => withCurrentServerLabel(agent, serverLabelById)),
+    };
+  }, [data?.pages, effectiveArchiveScope, serverLabelById]);
   const isInitialLoad = isLoading && agents.length === 0;
   const isRevalidating = isFetching && !isFetchingNextPage && agents.length > 0;
   const isSearchTruncated = Boolean(search && data?.pages.some((page) => page.isSearchTruncated));
@@ -378,6 +455,7 @@ export function useAgentHistory(options: {
 
   return {
     agents,
+    ancestors,
     isLoading,
     isInitialLoad,
     isRevalidating,
@@ -385,6 +463,7 @@ export function useAgentHistory(options: {
     hasMore: hasNextPage,
     isLoadingMore: isFetchingNextPage,
     isSearchSupported,
+    isArchiveScopeSupported,
     isSearchTruncated,
     isPreviousResults: isPlaceholderData,
     hostErrors,

@@ -1,7 +1,7 @@
-import { seedSessionHosts } from "@/test/seed-session";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { QueryClient } from "@tanstack/react-query";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AgentDirectoryReplica } from "@/runtime/directory-sync/agent-replica";
 import type { Agent } from "@/stores/session-store";
 import { useSessionStore } from "@/stores/session-store";
 import { agentHistoryQueryKey, allAgentHistoryQueryKey } from "./agent-history-query-key";
@@ -12,6 +12,19 @@ import {
   selectPendingArchiveAgentIds,
   setAgentArchiving,
 } from "./use-archive-agent";
+
+vi.mock("@/runtime/host-runtime", () => ({
+  getHostRuntimeStore: () => ({
+    archiveAgentSnapshot: (serverId: string, agentId: string, archivedAt: string) => {
+      const replica = new AgentDirectoryReplica(
+        serverId,
+        () => {},
+        () => {},
+      );
+      replica.archive(agentId, archivedAt);
+    },
+  }),
+}));
 
 function makeAgent(overrides: Partial<Agent> = {}): Agent {
   return {
@@ -47,11 +60,8 @@ function makeAgent(overrides: Partial<Agent> = {}): Agent {
 }
 
 describe("useArchiveAgent", () => {
-  afterEach(() => seedSessionHosts([]));
-  beforeEach(() => {
-    useSessionStore.setState((state) => ({ ...state, sessions: {} }));
-    seedSessionHosts(["server-a"]);
-  });
+  afterEach(() => useSessionStore.setState({ sessions: {} }));
+  beforeEach(() => useSessionStore.setState({ sessions: {} }));
 
   it("tracks pending archive state in shared react-query cache", () => {
     const queryClient = new QueryClient();
@@ -265,6 +275,41 @@ describe("useArchiveAgent", () => {
           ],
         },
       ],
+      pageParams: [null],
+    });
+  });
+
+  it("marks matching entries and ancestor context in scoped single-host history", () => {
+    const queryClient = new QueryClient();
+    const activeKey = [...agentHistoryQueryKey("server-a"), "title", { archiveScope: "active" }];
+    const archivedKey = [...agentHistoryQueryKey("server-a"), "", { archiveScope: "archived" }];
+    const otherHostKey = [...agentHistoryQueryKey("server-b"), "", { archiveScope: "active" }];
+    const agent = { id: "agent-1", archivedAt: null };
+    queryClient.setQueryData(activeKey, { pages: [{ agents: [agent] }], pageParams: [null] });
+    queryClient.setQueryData(archivedKey, {
+      pages: [{ agents: [], ancestors: [agent] }],
+      pageParams: [null],
+    });
+    queryClient.setQueryData(otherHostKey, { pages: [{ agents: [agent] }], pageParams: [null] });
+
+    const archivedAt = new Date("2026-04-01T04:00:00.000Z");
+    applyArchivedAgentCloseResults({
+      queryClient,
+      serverId: "server-a",
+      results: [{ agentId: agent.id, archivedAt: archivedAt.toISOString() }],
+      invalidateQueries: false,
+    });
+
+    expect(queryClient.getQueryData(activeKey)).toEqual({
+      pages: [{ agents: [{ ...agent, archivedAt }] }],
+      pageParams: [null],
+    });
+    expect(queryClient.getQueryData(archivedKey)).toEqual({
+      pages: [{ agents: [], ancestors: [{ ...agent, archivedAt }] }],
+      pageParams: [null],
+    });
+    expect(queryClient.getQueryData(otherHostKey)).toEqual({
+      pages: [{ agents: [agent] }],
       pageParams: [null],
     });
   });

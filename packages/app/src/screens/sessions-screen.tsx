@@ -2,26 +2,35 @@ import { useMemo, useState, useCallback, useEffect, type ReactElement } from "re
 import { View, Text } from "react-native";
 import { useIsFocused } from "expo-router/react-navigation";
 import { router } from "expo-router";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { ChevronLeft, Import } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
+import { useShallow } from "zustand/shallow";
 import { MenuHeader } from "@/components/headers/menu-header";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { AgentList } from "@/components/agent-list";
 import { SearchField } from "@/components/ui/search-field";
+import { SegmentedControl, type SegmentedControlOption } from "@/components/ui/segmented-control";
 import { HostFilter } from "@/components/hosts/host-filter";
 import { ALL_HOSTS_OPTION_ID } from "@/components/hosts/host-picker";
-import { type AgentHistoryHostError, useAgentHistory } from "@/hooks/use-agent-history";
+import {
+  type AgentHistoryArchiveScope,
+  type AgentHistoryHostError,
+  useAgentHistory,
+} from "@/hooks/use-agent-history";
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { useImportSession } from "@/hooks/use-import-session";
 import { useHosts } from "@/runtime/host-runtime";
+import { useSessionStore } from "@/stores/session-store";
+import type { Theme } from "@/styles/theme";
 import { buildOpenProjectRoute } from "@/utils/host-routes";
 
 /** Long enough that a typed word is one request, short enough to feel live. */
 const SEARCH_DEBOUNCE_MS = 200;
-
+const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
+const mutedSpinnerColor = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 const sessionsHostOptionTestID = (serverId: string) => `sessions-host-filter-item-${serverId}`;
 
 /**
@@ -54,10 +63,15 @@ function resolveEmptyText(input: {
   t: TFunction;
   isSearching: boolean;
   isAllHosts: boolean;
+  isArchiveScopeSupported: boolean;
+  selectedTab: AgentHistoryArchiveScope;
 }): string {
   if (input.isSearching) return input.t("sessions.noMatches");
-  if (input.isAllHosts) return input.t("sessions.empty");
-  return "No sessions for this host";
+  if (!input.isAllHosts) return input.t("sessions.emptyHost");
+  if (!input.isArchiveScopeSupported) return input.t("sessions.empty");
+  return input.t(
+    input.selectedTab === "archived" ? "sessions.emptyArchived" : "sessions.emptyActive",
+  );
 }
 
 export function SessionsScreen() {
@@ -70,22 +84,96 @@ export function SessionsScreen() {
   return <SessionsScreenContent />;
 }
 
+interface SessionFiltersProps {
+  hosts: ReturnType<typeof useHosts>;
+  selectedHost: string;
+  onSelectHost: (host: string) => void;
+  selectedTab: AgentHistoryArchiveScope;
+  onSelectTab: (tab: AgentHistoryArchiveScope) => void;
+  searchInput: string;
+  onSearchChange: (search: string) => void;
+  isSearchSupported: boolean;
+  isArchiveScopeSupported: boolean;
+}
+
+function SessionFilters({
+  hosts,
+  selectedHost,
+  onSelectHost,
+  selectedTab,
+  onSelectTab,
+  searchInput,
+  onSearchChange,
+  isSearchSupported,
+  isArchiveScopeSupported,
+}: SessionFiltersProps) {
+  const { t } = useTranslation();
+  const tabs = useMemo<SegmentedControlOption<AgentHistoryArchiveScope>[]>(
+    () => [
+      { value: "archived", label: t("sessions.tabs.archived") },
+      { value: "active", label: t("sessions.tabs.active") },
+    ],
+    [t],
+  );
+  const showHostFilter = hosts.length > 1;
+  const showFilterRow = showHostFilter || isSearchSupported;
+  if (!isArchiveScopeSupported && !showFilterRow) return null;
+
+  return (
+    <View style={styles.filterContainer}>
+      {isArchiveScopeSupported ? (
+        <SegmentedControl
+          value={selectedTab}
+          onValueChange={onSelectTab}
+          options={tabs}
+          testID="sessions-archive-scope-filter"
+        />
+      ) : null}
+      {showFilterRow ? (
+        <View style={styles.filterRow}>
+          {isSearchSupported ? (
+            <SearchField
+              value={searchInput}
+              onChangeText={onSearchChange}
+              placeholder={t("sessions.searchPlaceholder")}
+              clearAccessibilityLabel={t("sessions.actions.clearSearch")}
+              testID="sessions-search-input"
+              clearTestID="sessions-search-clear"
+            />
+          ) : null}
+          {showHostFilter ? (
+            <HostFilter
+              hosts={hosts}
+              selectedHost={selectedHost}
+              onSelectHost={onSelectHost}
+              triggerTestID="sessions-host-filter-trigger"
+              hostOptionTestID={sessionsHostOptionTestID}
+            />
+          ) : null}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
 function SessionsScreenContent() {
-  const { theme } = useUnistyles();
   const { t } = useTranslation();
   const importSession = useImportSession();
   const hosts = useHosts();
   const [selectedHost, setSelectedHost] = useState(ALL_HOSTS_OPTION_ID);
+  const [selectedTab, setSelectedTab] = useState<AgentHistoryArchiveScope>("archived");
   const [searchInput, setSearchInput] = useState("");
   const search = useDebouncedValue(searchInput, SEARCH_DEBOUNCE_MS).trim();
   const historyServerId = selectedHost === ALL_HOSTS_OPTION_ID ? null : selectedHost;
   const {
     agents,
+    ancestors,
     hasMore,
     isInitialLoad,
     isLoadingMore,
     isError,
     isSearchSupported,
+    isArchiveScopeSupported,
     isSearchTruncated,
     hostErrors,
     loadMore,
@@ -93,8 +181,26 @@ function SessionsScreenContent() {
   } = useAgentHistory({
     serverId: historyServerId,
     search,
+    archiveScope: selectedTab,
   });
   const isSearching = isSearchSupported && search.length > 0;
+  const workspacesByServer = useSessionStore(
+    useShallow((state) =>
+      Object.fromEntries(
+        Object.entries(state.sessions).map(([serverId, session]) => [serverId, session.workspaces]),
+      ),
+    ),
+  );
+  const activeWorkspaceIdsByServer = useMemo(
+    () =>
+      new Map(
+        Object.entries(workspacesByServer).map(([serverId, workspaces]) => [
+          serverId,
+          new Set(workspaces.keys()),
+        ]),
+      ),
+    [workspacesByServer],
+  );
 
   useEffect(() => {
     if (
@@ -112,15 +218,15 @@ function SessionsScreenContent() {
     void refreshAll().finally(() => setIsManualRefresh(false));
   }, [refreshAll]);
 
-  // Searching filters the chronological history without changing its date buckets.
   const emptyText = resolveEmptyText({
     t,
     isSearching,
     isAllHosts: selectedHost === ALL_HOSTS_OPTION_ID,
+    isArchiveScopeSupported,
+    selectedTab,
   });
-  const showHostFilter = hosts.length > 1;
-  const showFilterRow = showHostFilter || isSearchSupported;
-  const showLoadError = isError && agents.length === 0;
+  const showList = agents.length > 0 || hasMore;
+  const showLoadError = isError && !showList;
 
   const handleBack = useCallback(() => {
     router.navigate(buildOpenProjectRoute());
@@ -153,33 +259,21 @@ function SessionsScreenContent() {
   return (
     <View style={styles.container}>
       <MenuHeader title={t("sessions.title")} />
-      {showFilterRow ? (
-        <View style={styles.filterContainer}>
-          {isSearchSupported ? (
-            <SearchField
-              value={searchInput}
-              onChangeText={setSearchInput}
-              placeholder={t("sessions.searchPlaceholder")}
-              clearAccessibilityLabel={t("sessions.actions.clearSearch")}
-              testID="sessions-search-input"
-              clearTestID="sessions-search-clear"
-            />
-          ) : null}
-          {showHostFilter ? (
-            <HostFilter
-              hosts={hosts}
-              selectedHost={selectedHost}
-              onSelectHost={setSelectedHost}
-              triggerTestID="sessions-host-filter-trigger"
-              hostOptionTestID={sessionsHostOptionTestID}
-            />
-          ) : null}
-        </View>
-      ) : null}
+      <SessionFilters
+        hosts={hosts}
+        selectedHost={selectedHost}
+        onSelectHost={setSelectedHost}
+        selectedTab={selectedTab}
+        onSelectTab={setSelectedTab}
+        searchInput={searchInput}
+        onSearchChange={setSearchInput}
+        isSearchSupported={isSearchSupported}
+        isArchiveScopeSupported={isArchiveScopeSupported}
+      />
       {hostErrors.length > 0 ? <SessionHostErrorsBanner errors={hostErrors} t={t} /> : null}
       {isInitialLoad ? (
         <View style={styles.loadingContainer}>
-          <LoadingSpinner size="large" color={theme.colors.foregroundMuted} />
+          <ThemedLoadingSpinner size="large" uniProps={mutedSpinnerColor} />
         </View>
       ) : null}
       {!isInitialLoad && showLoadError ? (
@@ -190,7 +284,7 @@ function SessionsScreenContent() {
           </Button>
         </View>
       ) : null}
-      {!isInitialLoad && !showLoadError && agents.length === 0 ? (
+      {!isInitialLoad && !showLoadError && !showList ? (
         <View style={styles.emptyContainer} testID="sessions-empty">
           <Text style={styles.emptyText}>{emptyText}</Text>
           {isSearching ? (
@@ -207,15 +301,17 @@ function SessionsScreenContent() {
           </Button>
         </View>
       ) : null}
-      {!isInitialLoad && !showLoadError && agents.length > 0 ? (
+      {!isInitialLoad && showList ? (
         <AgentList
+          key={selectedHost}
           agents={agents}
-          showCheckoutInfo={false}
+          ancestors={ancestors}
+          archiveScope={isArchiveScopeSupported ? selectedTab : undefined}
+          activeWorkspaceIdsByServer={activeWorkspaceIdsByServer}
           isRefreshing={isManualRefresh}
           onRefresh={handleRefresh}
           listFooterComponent={listFooterComponent}
-          showAttentionIndicator={false}
-          showHostColumn
+          showHostColumn={hosts.length > 1}
           search={isSearching ? search : undefined}
         />
       ) : null}
@@ -230,14 +326,22 @@ const styles = StyleSheet.create((theme) => ({
     backgroundColor: theme.colors.surface0,
   },
   filterContainer: {
-    flexDirection: "row",
-    alignItems: "center",
+    flexDirection: { xs: "column", md: "row" },
+    alignItems: { xs: "flex-start", md: "center" },
     gap: theme.spacing[2],
     paddingHorizontal: {
       xs: theme.spacing[3],
       md: theme.spacing[6],
     },
     paddingTop: theme.spacing[4],
+  },
+  filterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+    alignSelf: "stretch",
+    flexGrow: 1,
+    minWidth: 0,
   },
   emptyContainer: {
     flex: 1,

@@ -306,7 +306,14 @@ export const fr: TranslationResources = {
   },
   sessions: {
     title: "Historique",
+    tabs: {
+      archived: "Archivées",
+      active: "Actives",
+    },
     empty: "Aucune session pour l’instant",
+    emptyArchived: "Aucune session archivée",
+    emptyActive: "Aucune session active",
+    emptyHost: "Aucune session sur cet hôte",
     noMatches: "Aucune session correspondante",
     tooManyMatches: "Trop de résultats — affinez la recherche",
     hostLoadFailed: "{{host}} : impossible de charger l’historique",
@@ -318,6 +325,12 @@ export const fr: TranslationResources = {
   },
   agentList: {
     fallbackTitle: "Nouvelle session",
+    subagents: {
+      one: "1 sous-agent",
+      many: "{{count}} sous-agents",
+      expandAccessibility: "Afficher les sous-agents",
+      collapseAccessibility: "Masquer les sous-agents",
+    },
     dateSections: {
       recent: "Récents",
       today: "Aujourd’hui",

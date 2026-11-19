@@ -301,7 +301,14 @@ export const zhCN: TranslationResources = {
   },
   sessions: {
     title: "历史",
+    tabs: {
+      archived: "已归档",
+      active: "活跃",
+    },
     empty: "还没有会话",
+    emptyArchived: "还没有已归档会话",
+    emptyActive: "还没有活跃会话",
+    emptyHost: "此 Host 暂无会话",
     noMatches: "没有匹配的会话",
     tooManyMatches: "匹配过多 — 请缩小搜索范围",
     hostLoadFailed: "{{host}}：无法加载历史",
@@ -313,6 +320,12 @@ export const zhCN: TranslationResources = {
   },
   agentList: {
     fallbackTitle: "新会话",
+    subagents: {
+      one: "1 个子 Agent",
+      many: "{{count}} 个子 Agent",
+      expandAccessibility: "展开子 Agent",
+      collapseAccessibility: "收起子 Agent",
+    },
     dateSections: {
       recent: "最近",
       today: "今天",
