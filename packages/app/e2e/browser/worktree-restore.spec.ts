@@ -20,6 +20,7 @@ import {
 } from "../support/helpers/branch-switcher";
 import {
   createIdleAgent,
+  expectHistoryWorkspaceArchived,
   expectSessionRowNotArchived,
   fetchAgentArchivedAt,
   openSessions,
@@ -107,11 +108,13 @@ test.describe("Worktree restore", () => {
 
   async function openArchivedWorkspaceFromHistory(page: Page, prefix: string) {
     const seeded = await createArchivedMissingWorktree(prefix);
+    const serverId = getServerId();
     await gotoAppShell(page);
     await waitForSidebarHydration(page);
-    await openSessions(page);
+    await openSessions(page, { tab: "archived" });
+    await expectHistoryWorkspaceArchived(page, `${serverId}:${seeded.worktree.workspaceId}`);
     await expectSessionRowNotArchived(page, seeded.agent.title);
-    await page.getByTestId(`agent-row-${getServerId()}-${seeded.agent.id}`).click();
+    await page.getByTestId(`agent-row-${serverId}-${seeded.agent.id}`).click();
     await expect(page.getByText("Workspace archived", { exact: true })).toBeVisible({
       timeout: 30_000,
     });
@@ -197,7 +200,7 @@ test.describe("Worktree restore", () => {
 
     await gotoAppShell(page);
     await waitForSidebarHydration(page);
-    await openSessions(page);
+    await openSessions(page, { tab: "active" });
     await expectSessionRowNotArchived(page, agent.title);
 
     await page.getByTestId(`agent-row-${serverId}-${agent.id}`).click();
@@ -209,7 +212,7 @@ test.describe("Worktree restore", () => {
     expect(await fetchAgentArchivedAt(client, agent.id)).toBeNull();
     expect(existsSync(worktree.workspaceDirectory)).toBe(true);
 
-    await openSessions(page);
+    await openSessions(page, { tab: "active" });
     await expectSessionRowNotArchived(page, agent.title);
     await page.getByTestId(`agent-row-${serverId}-${agent.id}`).click();
 
@@ -311,7 +314,7 @@ test.describe("Worktree restore", () => {
 
     await gotoAppShell(page);
     await waitForSidebarHydration(page);
-    await openSessions(page);
+    await openSessions(page, { tab: "archived" });
     await page.getByTestId(`agent-row-${getServerId()}-${firstAgent.id}`).click();
 
     await expect(page.getByText("Workspace archived", { exact: true })).toBeVisible({
@@ -336,7 +339,7 @@ test.describe("Worktree restore", () => {
       timeout: 30_000,
     });
 
-    await openSessions(page);
+    await openSessions(page, { tab: "active" });
     await page.getByTestId(`agent-row-${getServerId()}-${secondAgent.id}`).click();
     await expect(
       page.getByTestId(`workspace-tab-agent_${secondAgent.id}`).filter({ visible: true }).first(),
@@ -385,7 +388,7 @@ test.describe("Worktree restore", () => {
 
     await gotoAppShell(page);
     await waitForSidebarHydration(page);
-    await openSessions(page);
+    await openSessions(page, { tab: "archived" });
     await page.getByTestId(`agent-row-${getServerId()}-${agent.id}`).click();
     await expect(page.getByText("Workspace archived", { exact: true })).toBeVisible();
     await expect(
@@ -470,7 +473,8 @@ test.describe("Worktree restore", () => {
     try {
       await gotoAppShell(page);
       await waitForSidebarHydration(page);
-      await openSessions(page);
+      await openSessions(page, { tab: "archived" });
+      await expectHistoryWorkspaceArchived(page, `${getServerId()}:${project.workspaceId}`);
       await expectSessionRowNotArchived(page, agent.title);
       await page.getByTestId(`agent-row-${getServerId()}-${agent.id}`).click();
 

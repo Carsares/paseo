@@ -73,7 +73,7 @@ test.describe("Archive tab reconciliation", () => {
       await closeActiveAgentWithShortcut(page, agent.agentId);
       await expect.poll(() => fetchAgentArchivedAt(agent.client, agent.agentId)).not.toBeNull();
       await page.reload();
-      await openSessions(page);
+      await openSessions(page, { tab: "archived" });
       await expectSessionRowArchived(page, "Restore unsent draft");
       await clickSessionRow(page, "Restore unsent draft");
       await expectArchivedAgentFocused(page, agent.agentId);
@@ -101,10 +101,10 @@ test.describe("Archive tab reconciliation", () => {
       await primeAdditionalPage(passivePage);
       await resetSeededPageState(page);
       await resetSeededPageState(passivePage);
-      await openSessions(page);
+      await openSessions(page, { tab: "active" });
       await expectSessionRowVisible(page, archived.title);
       await expectSessionRowVisible(page, surviving.title);
-      await openSessions(passivePage);
+      await openSessions(passivePage, { tab: "active" });
       await expectSessionRowVisible(passivePage, archived.title);
       await expectSessionRowVisible(passivePage, surviving.title);
       await openWorkspaceWithAgents(page, [archived, surviving]);
@@ -144,7 +144,7 @@ test.describe("Archive tab reconciliation", () => {
       await resetSeededPageState(passivePage);
       await openWorkspaceWithAgents(page, [archived, surviving]);
       await openWorkspaceWithAgents(passivePage, [archived, surviving]);
-      await openSessions(page);
+      await openSessions(page, { tab: "active" });
       await archiveAgentFromSessions(page, { agentId: archived.id, title: archived.title });
       await reloadWorkspace(page, surviving.workspaceId);
       await expectWorkspaceTabHidden(page, archived.id);
@@ -174,7 +174,7 @@ test.describe("Archive tab reconciliation", () => {
     await archiveAgentFromDaemon(client, archived.id);
     const archivedAt = await fetchAgentArchivedAt(client, archived.id);
     expect(archivedAt).not.toBeNull();
-    await openSessions(page);
+    await openSessions(page, { tab: "archived" });
     await expectSessionRowArchived(page, archived.title);
 
     await clickSessionRow(page, archived.title);

@@ -6,7 +6,7 @@ import { buildCreateAgentPreferences, buildSeededHost } from "../support/helpers
 import { startIsolatedHostDaemon } from "../support/helpers/isolated-host-daemon";
 import { seedWorkspace } from "../support/helpers/seed-client";
 
-test("Sessions shows an empty placeholder when the host has no history", async ({ page }) => {
+test("History shows distinct empty states on the Archived and Active tabs", async ({ page }) => {
   const serverId = `srv_sessions_empty_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
   const daemon = await startIsolatedHostDaemon(serverId);
   let workspace: Awaited<ReturnType<typeof seedWorkspace>> | null = null;
@@ -15,6 +15,7 @@ test("Sessions shows an empty placeholder when the host has no history", async (
     workspace = await seedWorkspace({
       repoPrefix: "sessions-empty-",
       port: daemon.port,
+      git: false,
     });
     const host = buildSeededHost({
       serverId,

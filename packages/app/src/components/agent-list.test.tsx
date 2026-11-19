@@ -175,8 +175,8 @@ describe("AgentList history hierarchy", () => {
         showHostColumn
       />,
     );
-    const project = getByRole("heading", { name: /Atlas/ });
-    const workspace = getByRole("heading", { name: /Spring work/ });
+    const project = getByTestId("history-project-header-host:atlas");
+    const workspace = getByTestId(`history-workspace-header-host:${workspaceId}`);
     const parentRow = getByTestId("agent-row-host-root");
     const toggle = getByRole("button", { name: "Show subagents" });
 
@@ -186,7 +186,15 @@ describe("AgentList history hierarchy", () => {
     expect(
       workspace.compareDocumentPosition(parentRow) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    expect(workspace.textContent).toContain("feature/spring");
+    expect(within(project).getByTestId("history-project-name-host:atlas").textContent).toBe(
+      "Atlas",
+    );
+    expect(
+      within(workspace).getByTestId(`history-workspace-name-host:${workspaceId}`).textContent,
+    ).toBe("Spring work");
+    expect(
+      within(workspace).getByTestId(`history-workspace-branch-host:${workspaceId}`).textContent,
+    ).toBe("feature/spring");
     expect(workspace.textContent).toContain("MacBook");
     expect(parentRow.textContent).not.toContain("Spring work");
     expect(toggle.textContent).toBe("2 subagents");
@@ -262,8 +270,8 @@ describe("AgentList history hierarchy", () => {
     );
     const { getByRole, getByTestId, queryByTestId } = render(<SessionsScreen />);
     const tabs = within(getByTestId("sessions-archive-scope-filter"));
-    const archivedTab = tabs.getByRole("button", { name: "Archived" });
-    const activeTab = tabs.getByRole("button", { name: "Active" });
+    const archivedTab = tabs.getByTestId("sessions-tab-archived");
+    const activeTab = tabs.getByTestId("sessions-tab-active");
     expect(archivedTab.getAttribute("aria-selected")).toBe("true");
     fireEvent.click(getByRole("button", { name: "Show subagents" }));
     expect(getByTestId("agent-row-title-host-child").textContent).toBe("Quartz investigation");
@@ -310,7 +318,7 @@ describe("AgentList history hierarchy", () => {
     );
     const parentRow = getByTestId("agent-row-host-root");
     expect(
-      within(getByRole("heading", { name: /Spring work/ })).getByText("Archived"),
+      within(getByTestId(`history-workspace-header-host:${workspaceId}`)).getByText("Archived"),
     ).toBeDefined();
     expect(within(parentRow).queryByText("Archived")).toBeNull();
     expect(queryByTestId("agent-row-host-child")).toBeNull();

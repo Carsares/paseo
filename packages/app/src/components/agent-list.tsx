@@ -76,7 +76,11 @@ function ProjectHeading({ project, search }: { project: HistoryProjectGroup; sea
   const { projectName } = project;
   const initial = projectName.trim().charAt(0).toUpperCase() || "?";
   return (
-    <View style={styles.projectHeading} accessibilityRole="header" testID="history-project-header">
+    <View
+      style={styles.projectHeading}
+      accessibilityRole="header"
+      testID={`history-project-header-${project.key}`}
+    >
       <ProjectIconView
         size={18}
         iconDataUri={null}
@@ -89,6 +93,7 @@ function ProjectHeading({ project, search }: { project: HistoryProjectGroup; sea
         ranges={findHighlightRanges(search, projectName, HISTORY_MATCH_OPTIONS)}
         style={styles.projectTitle}
         numberOfLines={1}
+        testID={`history-project-name-${project.key}`}
       />
     </View>
   );
@@ -109,7 +114,7 @@ function WorkspaceHeading({
     <View
       style={styles.workspaceHeading}
       accessibilityRole="header"
-      testID="history-workspace-header"
+      testID={`history-workspace-header-${workspace.key}`}
     >
       <View style={[styles.workspaceHeadingRow, styles.workspaceNameRow]}>
         <HighlightedText
@@ -117,6 +122,7 @@ function WorkspaceHeading({
           ranges={findHighlightRanges(search, workspaceName, HISTORY_MATCH_OPTIONS)}
           style={styles.workspaceTitle}
           numberOfLines={1}
+          testID={`history-workspace-name-${workspace.key}`}
         />
         {isWorkspaceArchived ? <ArchivedBadge /> : null}
       </View>
@@ -128,6 +134,7 @@ function WorkspaceHeading({
               ranges={findHighlightRanges(search, branch, HISTORY_MATCH_OPTIONS)}
               style={styles.workspaceMeta}
               numberOfLines={1}
+              testID={`history-workspace-branch-${workspace.key}`}
             />
           ) : null}
           {branch && hostLabel ? <Text style={styles.workspaceMeta}>·</Text> : null}

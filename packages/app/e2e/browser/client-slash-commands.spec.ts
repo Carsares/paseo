@@ -60,7 +60,7 @@ async function selectClientSlashCommand(page: Page, query: string, label: string
 }
 
 async function expectAgentArchivedInSessions(page: Page, title: string): Promise<void> {
-  await openSessions(page);
+  await openSessions(page, { tab: "archived" });
   await expectSessionRowArchived(page, title);
 }
 

@@ -11,7 +11,8 @@ import { metroTest as test } from "../support/fixtures";
 import { gotoAppShell } from "../support/helpers/app";
 import {
   createMockIdleAgent,
-  expectSessionRowArchived,
+  expectHistoryWorkspaceArchived,
+  expectSessionRowVisible,
   openSessions,
 } from "../support/helpers/archive-tab";
 import { buildCreateAgentPreferences, buildSeededHost } from "../support/helpers/daemon-registry";
@@ -90,8 +91,7 @@ test.describe("Worktree restore after daemon restart", () => {
     page,
   }) => {
     // A paseo worktree is cut on its own branch named after the slug, and the
-    // worktree workspace is displayed under the same name. These are the values
-    // the History table cells must show after restore — never "main".
+    // worktree workspace is displayed under the same name.
     const worktreeSlug = `restart-restore-${randomUUID().slice(0, 8)}`;
 
     const project = await openProjectViaDaemon(worktreeClient, tempRepo.path);
@@ -135,19 +135,19 @@ test.describe("Worktree restore after daemon restart", () => {
     await seedBrowser(page);
     await gotoAppShell(page);
     await waitForSidebarHydration(page);
-    await openSessions(page);
-    await expectSessionRowArchived(page, agent.title);
+    await openSessions(page, { tab: "archived" });
+    await expectSessionRowVisible(page, agent.title);
 
-    // KEY ASSERTION: reproduce the screenshot state. Right after the daemon
-    // restart, with NO restore and NO row click, the rendered History table cells
-    // (fed by each agent row's projectPlacement via fetch_agent_history) must read
-    // the worktree branch and the worktree workspace name — never "main".
-    const branchCell = page.getByTestId(`agent-row-branch-${serverId}-${agent.id}`);
-    const workspaceCell = page.getByTestId(`agent-row-workspace-${serverId}-${agent.id}`);
-
-    await expect(branchCell).toBeVisible({ timeout: 60_000 });
-    await expect(branchCell).toHaveText(worktreeSlug, { timeout: 60_000 });
-    await expect(workspaceCell).toHaveText(worktree.workspaceName, { timeout: 60_000 });
+    // The archived workspace heading must retain its saved name and branch
+    // after the daemon restarts, before the worktree is restored.
+    const workspaceKey = `${serverId}:${worktree.workspaceId}`;
+    await expectHistoryWorkspaceArchived(page, workspaceKey);
+    await expect(page.getByTestId(`history-workspace-name-${workspaceKey}`)).toHaveText(
+      worktree.workspaceName,
+    );
+    await expect(page.getByTestId(`history-workspace-branch-${workspaceKey}`)).toHaveText(
+      worktreeSlug,
+    );
     await restoreWorkspaceFromHistory(page, serverId, agent.id);
     await expectCommittedFileAfterReload(page, "restart-change.txt");
   });

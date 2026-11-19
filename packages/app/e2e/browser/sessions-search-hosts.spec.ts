@@ -2,8 +2,7 @@ import { randomUUID } from "node:crypto";
 import { expect, type Page } from "@playwright/test";
 import { test } from "../support/fixtures";
 import { gotoAppShell } from "../support/helpers/app";
-import { openSessions } from "../support/helpers/archive-tab";
-import { createIdleAgent } from "../support/helpers/archive-tab";
+import { createIdleAgent, openSessions } from "../support/helpers/archive-tab";
 import { addConnectedHostAndReload, addOfflineHostAndReload } from "../support/helpers/hosts";
 import { startIsolatedHostDaemon } from "../support/helpers/isolated-host-daemon";
 import { connectSeedClient, seedWorkspace } from "../support/helpers/seed-client";
@@ -15,7 +14,7 @@ import { ALL_HOSTS_OPTION_ID } from "@/components/hosts/host-picker-constants";
 const PRIMARY_LABEL = "Primary box";
 const SECONDARY_LABEL = "Secondary box";
 
-/** Scopes every assertion to this spec's sessions on a shared daemon. */
+/** Keeps search assertions scoped to the sessions seeded by this spec. */
 const NONCE = `hsx${randomUUID().replaceAll("-", "").slice(0, 8)}`;
 
 async function search(page: Page, query: string): Promise<void> {
@@ -27,12 +26,12 @@ async function selectHost(page: Page, serverId: string): Promise<void> {
   await page.getByTestId(`sessions-host-filter-item-${serverId}`).click();
 }
 
+function historyTitles(page: Page) {
+  return page.getByTestId(/^agent-row-title-/).filter({ hasText: NONCE });
+}
+
 async function expectChronologicalTitles(page: Page, titles: string[]): Promise<void> {
-  const rows = page.getByRole("button").filter({ hasText: NONCE });
-  await expect(rows).toHaveCount(titles.length, { timeout: 30_000 });
-  for (const [index, title] of titles.entries()) {
-    await expect(rows.nth(index)).toContainText(title, { timeout: 30_000 });
-  }
+  await expect(historyTitles(page)).toHaveText(titles, { timeout: 30_000 });
 }
 
 // Searching across hosts merges each host's chronological matching sessions.
@@ -81,7 +80,7 @@ test.describe("History search across hosts", () => {
         port: secondaryDaemon.port,
         primaryLabel: PRIMARY_LABEL,
       });
-      await openSessions(page);
+      await openSessions(page, { tab: "active" });
 
       // All hosts: the newer partial match leads.
       await search(page, `${NONCE} bill`);
@@ -97,8 +96,7 @@ test.describe("History search across hosts", () => {
       // Back to all hosts, and clearing the query returns every seeded session.
       await selectHost(page, ALL_HOSTS_OPTION_ID);
       await page.getByTestId("sessions-search-clear").click();
-      const rows = page.getByRole("button").filter({ hasText: NONCE });
-      await expect(rows).toHaveCount(3, { timeout: 30_000 });
+      await expect(historyTitles(page)).toHaveCount(3, { timeout: 30_000 });
     } finally {
       await primaryWorkspace?.cleanup().catch(() => undefined);
       await secondaryWorkspace?.cleanup().catch(() => undefined);
@@ -126,7 +124,7 @@ test.describe("History search across hosts", () => {
         label: SECONDARY_LABEL,
         primaryLabel: PRIMARY_LABEL,
       });
-      await openSessions(page);
+      await openSessions(page, { tab: "active" });
 
       // The unreachable host's sessions were never searched. Reporting only the
       // matches that were found, with no word about the host that never

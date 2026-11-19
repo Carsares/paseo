@@ -110,8 +110,8 @@ function SessionFilters({
   const { t } = useTranslation();
   const tabs = useMemo<SegmentedControlOption<AgentHistoryArchiveScope>[]>(
     () => [
-      { value: "archived", label: t("sessions.tabs.archived") },
-      { value: "active", label: t("sessions.tabs.active") },
+      { value: "archived", label: t("sessions.tabs.archived"), testID: "sessions-tab-archived" },
+      { value: "active", label: t("sessions.tabs.active"), testID: "sessions-tab-active" },
     ],
     [t],
   );

@@ -79,7 +79,7 @@ test.describe("archived Codex agent recovery", () => {
 
       await page.reload();
       await waitForSidebarHydration(page);
-      await openSessions(page);
+      await openSessions(page, { tab: "archived" });
       await page.getByTestId(`agent-row-${getServerId()}-${handle.agentId}`).click();
 
       await expect(

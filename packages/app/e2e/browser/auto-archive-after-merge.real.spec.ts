@@ -3,7 +3,7 @@ import { expect, test, type Page } from "../support/fixtures";
 import { gotoAppShell } from "../support/helpers/app";
 import {
   clickSessionRow,
-  expectSessionRowArchived,
+  expectHistoryWorkspaceArchived,
   openSessions,
 } from "../support/helpers/archive-tab";
 import {
@@ -31,7 +31,7 @@ test.describe("Auto-archive after pull request merge", () => {
 
     try {
       await scenario.autoArchive();
-      await openArchivedWorkspaceFromHistory(page, scenario.agentTitle);
+      await openArchivedWorkspaceFromHistory(page, scenario);
       await restoreWorkspace(page, scenario.workspaceId);
 
       await scenario.refreshMergedPullRequest();
@@ -166,11 +166,14 @@ async function runScenarioCleanups(cleanups: Array<() => Promise<unknown>>): Pro
   }
 }
 
-async function openArchivedWorkspaceFromHistory(page: Page, agentTitle: string): Promise<void> {
+async function openArchivedWorkspaceFromHistory(
+  page: Page,
+  { agentTitle, workspaceId }: Pick<MergedPullRequestScenario, "agentTitle" | "workspaceId">,
+): Promise<void> {
   await gotoAppShell(page);
   await waitForSidebarHydration(page);
-  await openSessions(page);
-  await expectSessionRowArchived(page, agentTitle);
+  await openSessions(page, { tab: "archived" });
+  await expectHistoryWorkspaceArchived(page, `${getServerId()}:${workspaceId}`);
   await clickSessionRow(page, agentTitle);
   await expect(page.getByText("Workspace archived", { exact: true })).toBeVisible({
     timeout: 30_000,

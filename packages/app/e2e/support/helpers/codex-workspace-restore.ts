@@ -7,7 +7,7 @@ import { z } from "zod";
 import type { TestInfo } from "@playwright/test";
 import { test as base, expect, type Page } from "../fixtures";
 import { buildHostAgentDetailRoute } from "@/utils/host-routes";
-import { openSessions } from "./archive-tab";
+import { expectHistoryWorkspaceArchived, openSessions } from "./archive-tab";
 import { getE2EDaemonPort } from "./daemon-port";
 import { assertComposerIdle } from "./rewind-flow";
 import { getServerId } from "./server-id";
@@ -149,10 +149,11 @@ async function createCodexRestoreJourney(page: Page, client: SeedDaemonClient, i
         });
     },
     async openArchivedWorkspaceFromHistory() {
-      await openSessions(page);
-      const row = page.getByTestId(`agent-row-${getServerId()}-${created().agentId}`);
-      await expect(row).toContainText("Archived");
-      await row.click();
+      const target = created();
+      const serverId = getServerId();
+      await openSessions(page, { tab: "archived" });
+      await expectHistoryWorkspaceArchived(page, `${serverId}:${target.workspaceId}`);
+      await page.getByTestId(`agent-row-${serverId}-${target.agentId}`).click();
       await expect(page.getByText("Workspace archived", { exact: true })).toBeVisible();
     },
     async restoreWorkspace() {

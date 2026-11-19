@@ -461,7 +461,7 @@ async function visitEvictionWorkspaces(
   agents: readonly { agentId: string }[],
 ): Promise<void> {
   for (const [index, agent] of agents.entries()) {
-    await openSessions(page);
+    await openSessions(page, { tab: "active" });
     await clickSessionRow(page, `Workspace eviction ${index + 1}.`);
     await expectWorkspaceTabVisible(page, agent.agentId);
     await expectComposerVisible(page);

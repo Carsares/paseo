@@ -252,7 +252,19 @@ export async function reloadWorkspace(page: Page, workspaceId: string): Promise<
   await waitForWorkspaceTabsVisible(page);
 }
 
-export async function openSessions(page: Page): Promise<void> {
+type SessionsTab = "archived" | "active";
+
+function sessionsTabButton(page: Page, tab: SessionsTab) {
+  return page.getByTestId(`sessions-tab-${tab}`);
+}
+
+export async function selectSessionsTab(page: Page, tab: SessionsTab): Promise<void> {
+  const button = sessionsTabButton(page, tab);
+  await button.click({ timeout: 30_000 });
+  await expect(button).toHaveAttribute("aria-selected", "true");
+}
+
+export async function openSessions(page: Page, options?: { tab?: SessionsTab }): Promise<void> {
   const sessionsButton = page.getByTestId("sidebar-sessions");
   await expect(sessionsButton).toBeVisible({ timeout: 30_000 });
   await sessionsButton.click();
@@ -260,46 +272,74 @@ export async function openSessions(page: Page): Promise<void> {
   await expect(page.getByText("History", { exact: true }).last()).toBeVisible({
     timeout: 30_000,
   });
+  if (options?.tab) {
+    await selectSessionsTab(page, options.tab);
+  }
 }
 
-const AGENT_ROW_SELECTOR = '[data-testid^="agent-row-"]';
-
-function getSessionRowByTitle(page: Page, title: string) {
-  return page.locator(AGENT_ROW_SELECTOR).filter({ hasText: title }).first();
+function getSessionRows(page: Page, title?: string) {
+  const titles = page.getByTestId(/^agent-row-title-/);
+  return page
+    .getByRole("button")
+    .and(page.getByTestId(/^agent-row-/))
+    .filter({
+      has: title === undefined ? titles : titles.and(page.getByText(title, { exact: true })),
+    });
 }
 
 export async function expectSessionRowVisible(page: Page, title: string): Promise<void> {
-  await expect(getSessionRowByTitle(page, title)).toBeVisible({ timeout: 30_000 });
+  await expect(getSessionRows(page, title)).toBeVisible({ timeout: 30_000 });
 }
 
 export async function expectSessionRowArchived(page: Page, title: string): Promise<void> {
-  await expect(getSessionRowByTitle(page, title)).toContainText("Archived", { timeout: 30_000 });
-}
-
-export async function expectSessionRowNotArchived(page: Page, title: string): Promise<void> {
-  await expect(getSessionRowByTitle(page, title)).not.toContainText("Archived", {
+  await expect(getSessionRows(page, title).getByText("Archived", { exact: true })).toBeVisible({
     timeout: 30_000,
   });
 }
 
+export async function expectSessionRowNotArchived(page: Page, title: string): Promise<void> {
+  const row = getSessionRows(page, title);
+  await expect(row).toBeVisible({ timeout: 30_000 });
+  await expect(row.getByText("Archived", { exact: true })).toHaveCount(0);
+}
+
+export async function expectHistoryWorkspaceArchived(
+  page: Page,
+  workspaceKey: string,
+): Promise<void> {
+  const heading = page.getByTestId(`history-workspace-header-${workspaceKey}`);
+  await expect(heading.getByText("Archived", { exact: true })).toBeVisible({ timeout: 30_000 });
+}
+
 export async function clickSessionRow(page: Page, title: string): Promise<void> {
-  const row = getSessionRowByTitle(page, title);
+  const row = getSessionRows(page, title);
   await expect(row).toBeVisible({ timeout: 30_000 });
   await row.click();
 }
 
 export async function expectSessionsEmptyState(page: Page): Promise<void> {
-  // Guard: the sessions-empty spec owns a pristine daemon, so this helper only
-  // needs to distinguish an empty result from the expected seeded rows.
-  await expect(page.locator(AGENT_ROW_SELECTOR)).toHaveCount(0, { timeout: 5_000 });
-  await expect(page.getByText("No sessions yet")).toBeVisible({ timeout: 30_000 });
+  const empty = page.getByTestId("sessions-empty");
+  await expect(sessionsTabButton(page, "archived")).toHaveAttribute("aria-selected", "true", {
+    timeout: 30_000,
+  });
+  await expect(empty.getByText("No archived sessions", { exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
+  await expect(getSessionRows(page)).toHaveCount(0);
+
+  await selectSessionsTab(page, "active");
+  await expect(empty.getByText("No active sessions", { exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
+  await expect(getSessionRows(page)).toHaveCount(0);
 }
 
 export async function archiveAgentFromSessions(
   page: Page,
   input: { agentId: string; title: string },
 ): Promise<void> {
-  const row = getSessionRowByTitle(page, input.title);
+  await expect(sessionsTabButton(page, "active")).toHaveAttribute("aria-selected", "true");
+  const row = page.getByTestId(`agent-row-${getServerId()}-${input.agentId}`);
   await expect(row).toBeVisible({ timeout: 30_000 });
   const box = await row.boundingBox();
   if (!box) {
@@ -320,5 +360,7 @@ export async function archiveAgentFromSessions(
     await archiveButton.click();
   }
 
+  await expect(row).toHaveCount(0, { timeout: 30_000 });
+  await selectSessionsTab(page, "archived");
   await expectSessionRowArchived(page, input.title);
 }

@@ -16,7 +16,7 @@ test("agent list age advances and command center says just now for a fresh works
     await session.client.waitForAgentUpsert(session.agentId, (agent) => agent.status === "idle");
     await resetSeededPageState(page);
     await page.clock.install({ time: Date.now() });
-    await openSessions(page);
+    await openSessions(page, { tab: "active" });
 
     const row = page.getByTestId(`agent-row-${getServerId()}-${session.agentId}`);
     await expect(row).toContainText("just now", { timeout: 30_000 });
