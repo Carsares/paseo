@@ -10,6 +10,7 @@ export type DesktopDaemonStopReason =
   | "settings"
   | "host_remove"
   | "quit"
+  | "quit_preserve_work"
   | "app_update"
   | "version_mismatch"
   | "restart";

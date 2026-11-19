@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { mkdtemp, rm, mkdir, writeFile, readdir, symlink } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, readdir, symlink, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -107,6 +107,108 @@ test("opt-out consumes pending recovery and excludes archived, private, owned an
   }
 });
 
+test("forced capture resumes eligible running agents on only the next startup with recovery disabled", async () => {
+  const root = await mkdtemp(join(tmpdir(), "restart-recovery-once-"));
+  try {
+    const agentsPath = join(root, "agents");
+    const oneShotMarkerPath = join(root, "paseo-home", "restart-recovery-once.json");
+    const dispatched: { id: string; prompt: string }[] = [];
+    const start = () => {
+      const storage = new AgentStorage(agentsPath, createTestLogger());
+      const recovery = createRestartRecovery({
+        storage,
+        oneShotMarkerPath,
+        settings: () => ({ enabled: false, prompt: "Continue once.\n" }),
+        eligible: async (record) => record.id !== "ineligible",
+        dispatch: async (id, prompt) => {
+          expect((await storage.get(id))?.resumeOnStartup).toBe(false);
+          dispatched.push({ id, prompt });
+        },
+        report: () => {},
+      });
+      return { storage, recovery };
+    };
+    const shutdown = start();
+    for (const [id, lastStatus] of [
+      ["working", "running"],
+      ["ineligible", "running"],
+      ["idle", "idle"],
+    ] as const) {
+      await shutdown.storage.upsert(
+        parseStoredAgentRecord({
+          id,
+          lastStatus,
+          resumeOnStartup: false,
+          provider: "codex",
+          cwd: root,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        }),
+      );
+    }
+    await shutdown.recovery.captureRunningAgents({ force: true });
+    await expect(readFile(oneShotMarkerPath, "utf8")).resolves.toBe(JSON.stringify({ version: 1 }));
+    expect((await shutdown.storage.get("working"))?.resumeOnStartup).toBe(true);
+    expect((await shutdown.storage.get("ineligible"))?.resumeOnStartup).toBe(false);
+    expect((await shutdown.storage.get("idle"))?.resumeOnStartup).toBe(false);
+
+    const signal = new AbortController().signal;
+    const first = start();
+    await first.recovery.prepareStartup();
+    await expect(readFile(oneShotMarkerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    first.recovery.resumePending();
+    await first.recovery.waitForResume("working", signal);
+    expect(dispatched).toEqual([{ id: "working", prompt: "Continue once.\n" }]);
+    expect((await first.storage.get("working"))?.resumeOnStartup).toBe(false);
+
+    const second = start();
+    await second.recovery.prepareStartup();
+    second.recovery.resumePending();
+    await second.recovery.waitForResume("working", signal);
+    expect(dispatched).toEqual([{ id: "working", prompt: "Continue once.\n" }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("disabled recovery clears a persisted resume flag when the one-shot marker is absent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "restart-recovery-no-marker-"));
+  try {
+    const agentsPath = join(root, "agents");
+    const storage = new AgentStorage(agentsPath, createTestLogger());
+    await storage.upsert(
+      parseStoredAgentRecord({
+        id: "pending",
+        lastStatus: "closed",
+        resumeOnStartup: true,
+        provider: "codex",
+        cwd: root,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }),
+    );
+    const startupStorage = new AgentStorage(agentsPath, createTestLogger());
+    const dispatched: string[] = [];
+    const recovery = createRestartRecovery({
+      storage: startupStorage,
+      oneShotMarkerPath: join(root, "restart-recovery-once.json"),
+      settings: () => ({ enabled: false, prompt: "Continue." }),
+      eligible: async () => true,
+      dispatch: async (id) => {
+        dispatched.push(id);
+      },
+      report: () => {},
+    });
+    await recovery.prepareStartup();
+    recovery.resumePending();
+    await recovery.waitForResume("pending", new AbortController().signal);
+    expect(dispatched).toEqual([]);
+    expect((await startupStorage.get("pending"))?.resumeOnStartup).toBe(false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 const bashAvailable =
   process.platform !== "win32" &&
   spawnSync("bash", ["-c", "true"], { stdio: "ignore" }).status === 0;
@@ -139,6 +241,7 @@ for (const seeder of ["setup", "shell", "setup-bom"] as const) {
         }
         await storage.flush();
         await mkdir(source, { recursive: true });
+        await writeFile(join(source, "restart-recovery-once.json"), JSON.stringify({ version: 1 }));
         await symlink(
           join(root, "source-records"),
           join(source, "agents"),
@@ -178,6 +281,7 @@ for (const seeder of ["setup", "shell", "setup-bom"] as const) {
         const dispatched: string[] = [];
         const recovery = createRestartRecovery({
           storage: copied,
+          oneShotMarkerPath: join(target, "restart-recovery-once.json"),
           settings: () => ({
             enabled: config.agents?.resumeOnStartup === true,
             prompt: "Continue",

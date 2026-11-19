@@ -55,6 +55,7 @@ export interface AppUpdateRuntime {
 }
 
 export interface AppUpdateService {
+  hasDownloadedUpdate(): boolean;
   checkForAppUpdate(input: {
     currentVersion: string;
     releaseChannel: AppReleaseChannel;
@@ -486,6 +487,10 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     }
   }
 
+  function hasDownloadedUpdate(): boolean {
+    return deps.isPackaged() && downloadedUpdateVersion !== null;
+  }
+
   async function installUpdateOnQuit({
     currentVersion,
     releaseChannel,
@@ -513,6 +518,7 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
   }
 
   return {
+    hasDownloadedUpdate,
     checkForAppUpdate,
     downloadAndInstallUpdate,
     installUpdateOnQuit,

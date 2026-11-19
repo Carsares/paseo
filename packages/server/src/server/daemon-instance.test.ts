@@ -95,6 +95,77 @@ describe("daemon instance identity across a reboot", () => {
   });
 });
 
+describe("stopping a daemon instance with agent resume", () => {
+  const listenAddress = "127.0.0.1:17676";
+  let paseoHome: string;
+  let supervisor: ChildProcess | undefined;
+
+  beforeEach(async () => {
+    paseoHome = await mkdtemp(join(tmpdir(), "paseo-daemon-instance-resume-"));
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    supervisor?.kill("SIGKILL");
+    supervisor = undefined;
+    await rm(paseoHome, { recursive: true, force: true });
+  });
+
+  async function startSupervisor(listen: string | null) {
+    supervisor = spawn(process.execPath, ["-e", "process.stdin.resume()"], {
+      stdio: ["pipe", "ignore", "ignore"],
+    });
+    const { pid, stdin } = supervisor;
+    if (pid === undefined || !stdin) throw new Error("test supervisor did not start");
+    const instance = { ...lockFor(pid, new Date()), listen };
+    await writeLock(paseoHome, instance);
+    return { instance, stdin };
+  }
+
+  test("uses the shutdown callback to record agents even when terminals are not kept", async () => {
+    const { instance, stdin } = await startSupervisor(listenAddress);
+    const kill = vi.spyOn(process, "kill");
+    const requestShutdown = vi.fn(async () => {
+      stdin.end();
+    });
+
+    expect(
+      await stopDaemonInstance(paseoHome, {
+        keepTerminals: false,
+        resumeAgents: true,
+        requestShutdown,
+      }),
+    ).toEqual({ action: "stopped", pid: instance.pid, forced: false, usedLifecycleRpc: true });
+    expect(requestShutdown).toHaveBeenCalledExactlyOnceWith(instance);
+    expect(kill).not.toHaveBeenCalledWith(instance.pid, "SIGTERM");
+  });
+
+  test.each(["listen address", "shutdown callback"])(
+    "refuses resume without a %s",
+    async (missing) => {
+      await startSupervisor(missing === "listen address" ? null : listenAddress);
+      const requestShutdown = vi.fn(async () => {});
+
+      await expect(
+        stopDaemonInstance(paseoHome, {
+          resumeAgents: true,
+          requestShutdown: missing === "shutdown callback" ? undefined : requestShutdown,
+        }),
+      ).rejects.toMatchObject({ code: "STOP_NO_GRACEFUL_CHANNEL" });
+      expect(requestShutdown).not.toHaveBeenCalled();
+    },
+  );
+
+  test("rejects combining force with agent resume", async () => {
+    await expect(
+      stopDaemonInstance(paseoHome, { force: true, resumeAgents: true }),
+    ).rejects.toMatchObject({
+      code: "INVALID_STOP_OPTIONS",
+      message: "--force kills agents; it cannot be combined with --resume-agents.",
+    });
+  });
+});
+
 // Linux keeps a boot's id while a VM is paused for a host sleep, though the VM's wall clock
 // runs ahead of its uptime once it resumes. A sleep longer than the time between boot and
 // the supervisor's start puts the wall-clock boot instant after the lock's startedAt.

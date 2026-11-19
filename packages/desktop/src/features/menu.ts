@@ -8,6 +8,7 @@ interface ShowContextMenuInput {
 
 interface ApplicationMenuOptions {
   onNewWindow: () => void;
+  onQuitAndResumeAgents?: () => void;
 }
 
 function withBrowserWindow(
@@ -64,12 +65,20 @@ export function reloadActiveBrowserOrWindow({
   win.webContents.reload();
 }
 
-function buildApplicationMenuTemplate(
+export function buildApplicationMenuTemplate(
   options: ApplicationMenuOptions,
   capturing: boolean,
+  platform: NodeJS.Platform = process.platform,
 ): Electron.MenuItemConstructorOptions[] {
-  const isMac = process.platform === "darwin";
+  const isMac = platform === "darwin";
   const zoomEnabled = !capturing;
+  const quitAndResumeAgents = {
+    label: "Quit and Resume Agents on Next Launch",
+    accelerator: "CmdOrCtrl+Alt+Q",
+    click: () => {
+      options.onQuitAndResumeAgents?.();
+    },
+  };
 
   return [
     ...(isMac
@@ -85,6 +94,7 @@ function buildApplicationMenuTemplate(
               { role: "hideOthers" as const },
               { role: "unhide" as const },
               { type: "separator" as const },
+              quitAndResumeAgents,
               { role: "quit" as const },
             ],
           },
@@ -100,6 +110,7 @@ function buildApplicationMenuTemplate(
             options.onNewWindow();
           },
         },
+        ...(isMac ? [] : [{ type: "separator" as const }, quitAndResumeAgents]),
       ],
     },
     {

@@ -1,6 +1,9 @@
+import { rm, stat } from "node:fs/promises";
+import { writeFileAtomic } from "../../atomic-file.js";
 import type { AgentStorage, StoredAgentRecord } from "../agent-storage.js";
 interface Dependencies {
   storage: AgentStorage;
+  oneShotMarkerPath?: string;
   settings(): { enabled: boolean; prompt: string };
   eligible(record: StoredAgentRecord): Promise<boolean>;
   dispatch(agentId: string, prompt: string): Promise<unknown>;
@@ -8,25 +11,39 @@ interface Dependencies {
 }
 export function createRestartRecovery(deps: Dependencies) {
   // Candidates are chosen at startup; each settles once its resume was sent or abandoned.
-  const resuming = new Map<string, { promise: Promise<void>; resolve(): void }>();
+  const resuming = new Map<string, { promise: Promise<void>; resolve(): void; forced: boolean }>();
   const eligible = async (record: StoredAgentRecord) =>
     !record.archivedAt && !record.internal && !record.owner && (await deps.eligible(record));
-  async function resume(agentId: string) {
+  async function consumeOneShotMarker(): Promise<boolean> {
+    const markerPath = deps.oneShotMarkerPath;
+    if (!markerPath) return false;
+    try {
+      await stat(markerPath);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+      throw error;
+    }
+    await rm(markerPath, { force: true });
+    return true;
+  }
+  async function resume(agentId: string, forced: boolean) {
     const record = await deps.storage.get(agentId);
     if (!record?.resumeOnStartup) return;
     await deps.storage.upsert({ ...record, resumeOnStartup: false });
-    if (!deps.settings().enabled || !(await eligible(record))) return;
+    if ((!forced && !deps.settings().enabled) || !(await eligible(record))) return;
     await deps.dispatch(agentId, deps.settings().prompt);
   }
   return {
     /** Choose candidates before anything else reads or repairs persisted running status. */
     async prepareStartup() {
+      const forcedOnce = await consumeOneShotMarker();
       // Startup recovery repairs persisted running status once before agents are restored.
       for (const record of await deps.storage.listAll()) {
+        const forced = forcedOnce && record.resumeOnStartup === true;
         const pending =
-          deps.settings().enabled &&
-          (record.resumeOnStartup === true || record.lastStatus === "running") &&
-          (await eligible(record));
+          (deps.settings().enabled
+            ? record.resumeOnStartup === true || record.lastStatus === "running"
+            : forced) && (await eligible(record));
         await deps.storage.upsert({
           ...record,
           resumeOnStartup: pending,
@@ -40,22 +57,27 @@ export function createRestartRecovery(deps: Dependencies) {
           const promise = new Promise<void>((settle) => {
             resolve = settle;
           });
-          resuming.set(record.id, { promise, resolve });
+          resuming.set(record.id, { promise, resolve, forced });
         }
       }
     },
-    async captureRunningAgents() {
+    async captureRunningAgents(options?: { force?: boolean }) {
+      const force = options?.force === true;
+      const shouldResume = force || deps.settings().enabled;
       await deps.storage.flush();
+      if (force && deps.oneShotMarkerPath) {
+        await writeFileAtomic(deps.oneShotMarkerPath, JSON.stringify({ version: 1 }));
+      }
       // Shutdown recovery captures running state once before the daemon exits.
       for (const record of await deps.storage.listAll()) {
         if (record.lastStatus === "running" && (await eligible(record)))
-          await deps.storage.upsert({ ...record, resumeOnStartup: deps.settings().enabled });
+          await deps.storage.upsert({ ...record, resumeOnStartup: shouldResume });
       }
     },
     /** Resume every candidate in the background; a slow provider holds back only its agent. */
     resumePending() {
       for (const [agentId, settled] of resuming) {
-        void resume(agentId)
+        void resume(agentId, settled.forced)
           .catch((error) => deps.report(agentId, error))
           .finally(() => {
             resuming.delete(agentId);

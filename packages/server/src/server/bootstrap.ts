@@ -400,6 +400,7 @@ export type DaemonLifecycleIntent =
       requestId: string;
       reason: string;
       keepTerminals: boolean;
+      resumeAgents?: boolean;
     }
   | {
       type: "restart";
@@ -407,6 +408,7 @@ export type DaemonLifecycleIntent =
       requestId: string;
       reason: string;
       keepTerminals: boolean;
+      resumeAgents?: boolean;
     };
 
 export interface PaseoDaemonConfig {
@@ -502,7 +504,7 @@ export interface PaseoDaemon {
   browserToolsBroker: BrowserToolsBroker;
   start(): Promise<void>;
   /** Stops the daemon. Terminals keep running for the next daemon only with keepTerminals. */
-  stop(options?: { keepTerminals?: boolean }): Promise<void>;
+  stop(options?: { keepTerminals?: boolean; resumeAgents?: boolean }): Promise<void>;
   getListenTarget(): ListenTarget | null;
   getServerId(): string;
 }
@@ -1054,6 +1056,7 @@ export async function createPaseoDaemon(
   await agentStorage.initialize();
   const restartRecovery = createRestartRecovery({
     storage: agentStorage,
+    oneShotMarkerPath: path.join(config.paseoHome, "restart-recovery-once.json"),
     settings: () => ({
       enabled: daemonConfigStore.get().resumeOnStartup === true,
       prompt: daemonConfigStore.get().resumePrompt ?? "Resume working.",
@@ -1979,7 +1982,7 @@ export async function createPaseoDaemon(
     }
   };
 
-  const stop = async (options?: { keepTerminals?: boolean }) => {
+  const stop = async (options?: { keepTerminals?: boolean; resumeAgents?: boolean }) => {
     const keepTerminals = options?.keepTerminals === true;
     let terminalShutdownError: unknown = null;
     localCredential = null;
@@ -2000,7 +2003,7 @@ export async function createPaseoDaemon(
     await finishSubscriptions.close();
     await wsServer?.agentMessages.close();
     agentManager.prepareForShutdown();
-    await restartRecovery.captureRunningAgents();
+    await restartRecovery.captureRunningAgents({ force: options?.resumeAgents === true });
     await closeAllAgents(logger, agentManager);
     await withTimeout({
       promise: pluginRuntime.drainEvents(),

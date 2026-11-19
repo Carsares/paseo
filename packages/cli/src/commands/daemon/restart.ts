@@ -7,6 +7,7 @@ import {
   TerminalCleanupNotConfirmedError,
 } from "@getpaseo/server/daemon-control";
 import { setTimeout as delay } from "node:timers/promises";
+import { requireAgentResumeOnStopCapability } from "@getpaseo/client/internal/daemon-client";
 import type { DaemonGetStatusResponse } from "@getpaseo/protocol/messages";
 import { connectToDaemon } from "../../utils/client.js";
 import { withOutput, type CommandOptions } from "../../output/index.js";
@@ -24,6 +25,7 @@ export function daemonRestartCommand(): Command {
   )
     .option("--timeout <seconds>", "Replacement readiness deadline (default: 600)")
     .option("--kill-terminals", "Close every terminal instead of keeping them across the restart")
+    .option("--resume-agents", "Record running agents so the replacement worker resumes them")
     .action(withOutput(runRestartCommand));
 }
 
@@ -34,6 +36,7 @@ export async function runRestartCommand(options: CommandOptions, _command: Comma
   const deadline = Date.now() + parseTimeoutMs(options.timeout);
   const remaining = () => Math.max(1, deadline - Date.now());
   const killTerminals = options.killTerminals === true;
+  const resumeAgents = options.resumeAgents === true;
   // The supervisor reaps before the respawn and the replacement retries what that left;
   // anything still named by a closing record survived both. A local caller retries once more
   // itself; a remote one has only what the replacement reports.
@@ -67,21 +70,27 @@ export async function runRestartCommand(options: CommandOptions, _command: Comma
     instance: instance ?? undefined,
     timeout: remaining(),
   });
-  let workerPid: number;
-  const serverId = client.getLastServerInfoMessage()?.serverId;
-  let acknowledged = false;
-  try {
-    workerPid = (await client.getDaemonStatus({ timeout: remaining() })).pid;
-    await checkSupervisor();
+  const requestRestart = async () => {
     try {
       await client.restartServer("cli_restart", undefined, {
         timeout: remaining(),
         killTerminals,
+        ...(resumeAgents ? { resumeAgents: true } : {}),
       });
-      acknowledged = true;
+      return true;
     } catch (error) {
       if (!isReconnectFailure(error)) throw error;
+      return false;
     }
+  };
+  let workerPid: number;
+  const serverId = client.getLastServerInfoMessage()?.serverId;
+  let acknowledged: boolean;
+  try {
+    if (resumeAgents) requireAgentResumeOnStopCapability(client, describeDaemonTarget(target));
+    workerPid = (await client.getDaemonStatus({ timeout: remaining() })).pid;
+    await checkSupervisor();
+    acknowledged = await requestRestart();
   } finally {
     await client.close();
   }

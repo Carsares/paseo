@@ -12,6 +12,7 @@ interface BeforeQuitEvent {
 
 interface BeforeQuitApp {
   exit(code: number): void;
+  quit?(): void;
 }
 
 interface ExternalQuitSignalSource {
@@ -21,6 +22,7 @@ interface ExternalQuitSignalSource {
 interface QuitLifecycle {
   handleBeforeQuit(event: BeforeQuitEvent): void;
   handleBeforeQuitForUpdate(): void;
+  requestPreserveWorkQuit(): void;
 }
 
 interface DeferredUpdateQuit {
@@ -31,8 +33,11 @@ interface DeferredUpdateQuit {
 export interface StopOnQuitDeps {
   settingsStore: Pick<DesktopSettingsStore, "get">;
   isDesktopManagedDaemonRunning: () => boolean;
-  stopDaemon: () => Promise<unknown>;
+  isDesktopManagedDaemonPresent?: () => boolean;
+  hasPendingUpdateOnQuit?: () => boolean;
+  stopDaemon: (reason?: "quit" | "app_update" | "quit_preserve_work") => Promise<unknown>;
   showShutdownFeedback: () => void;
+  preserveWork?: boolean;
 }
 
 export function registerExternalQuitSignals({
@@ -59,17 +64,30 @@ export function shouldStopDesktopManagedDaemonOnQuit(settings: QuitLifecycleSett
 export async function stopDesktopManagedDaemonOnQuitIfNeeded(
   deps: StopOnQuitDeps,
 ): Promise<boolean> {
+  if (deps.preserveWork === true) {
+    if (!(deps.isDesktopManagedDaemonPresent ?? deps.isDesktopManagedDaemonRunning)()) {
+      return false;
+    }
+    deps.showShutdownFeedback();
+    await deps.stopDaemon("quit_preserve_work");
+    return true;
+  }
+
   const settings = await deps.settingsStore.get();
   if (!shouldStopDesktopManagedDaemonOnQuit(settings)) {
     return false;
   }
 
-  if (!deps.isDesktopManagedDaemonRunning()) {
+  const hasPendingUpdate = deps.hasPendingUpdateOnQuit?.() === true;
+  const shouldStopDaemon = hasPendingUpdate
+    ? (deps.isDesktopManagedDaemonPresent ?? deps.isDesktopManagedDaemonRunning)()
+    : deps.isDesktopManagedDaemonRunning();
+  if (!shouldStopDaemon) {
     return false;
   }
 
   deps.showShutdownFeedback();
-  await deps.stopDaemon();
+  await deps.stopDaemon(hasPendingUpdate ? "app_update" : "quit");
   return true;
 }
 
@@ -102,7 +120,7 @@ export function createQuitLifecycle({
 }: {
   app: BeforeQuitApp;
   closeTransportSessions: () => void;
-  stopDesktopManagedDaemonIfNeeded: () => Promise<boolean>;
+  stopDesktopManagedDaemonIfNeeded: (options?: { preserveWork?: boolean }) => Promise<boolean>;
   installAppUpdateOnQuit: (signal: AbortSignal) => Promise<boolean>;
   createUpdateDeadlineSignal: () => AbortSignal;
   onStopError: (error: unknown) => void;
@@ -113,6 +131,7 @@ export function createQuitLifecycle({
   // window-all-closed handler, which would veto that second quit.
   let quitting = false;
   let quittingForUpdate = false;
+  let preserveWorkRequested = false;
   const updateQuit = createDeferredUpdateQuit();
 
   function handleBeforeQuit(event: BeforeQuitEvent): void {
@@ -129,7 +148,7 @@ export function createQuitLifecycle({
 
     void (async () => {
       try {
-        await stopDesktopManagedDaemonIfNeeded();
+        await stopDesktopManagedDaemonIfNeeded({ preserveWork: preserveWorkRequested });
       } catch (error) {
         onStopError(error);
       }
@@ -159,6 +178,11 @@ export function createQuitLifecycle({
 
   return {
     handleBeforeQuit,
+    requestPreserveWorkQuit() {
+      if (quitting || quittingForUpdate) return;
+      preserveWorkRequested = true;
+      app.quit?.();
+    },
     handleBeforeQuitForUpdate() {
       quittingForUpdate = true;
       updateQuit.resolve();

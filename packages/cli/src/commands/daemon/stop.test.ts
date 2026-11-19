@@ -3,29 +3,31 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { Command } from "commander";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { createStopCommandRunner, type StopCommandDeps } from "./stop.js";
 
-// The daemon the gate is checked against: a connection whose server_info may or may not
-// advertise terminalsSurviveRestart, and that records any shutdown it is asked for.
-function createFakeDaemon(features: { terminalsSurviveRestart?: boolean } = {}) {
-  const shutdownRequests: Array<{ keepTerminals?: boolean }> = [];
-  const deps: StopCommandDeps = {
-    connectToDaemon: async () => ({
-      getLastServerInfoMessage: () => ({
-        status: "server_info",
-        serverId: "fake-daemon",
-        version: "0.11.0",
-        features,
-      }),
-      shutdownServer: async (options) => {
-        shutdownRequests.push({ keepTerminals: options?.keepTerminals });
-        return { status: "shutdown_requested", clientId: "fake-client", requestId: "fake-request" };
-      },
-      close: async () => undefined,
+// A connection that advertises capabilities and records the shutdown options it receives.
+function createFakeDaemon(
+  features: { terminalsSurviveRestart?: boolean; resumeAgentsOnStop?: boolean } = {},
+) {
+  const shutdownRequests: Array<{ keepTerminals?: boolean; resumeAgents?: boolean }> = [];
+  const connectToDaemon = vi.fn<StopCommandDeps["connectToDaemon"]>(async () => ({
+    getLastServerInfoMessage: () => ({
+      status: "server_info",
+      serverId: "fake-daemon",
+      version: "0.11.0",
+      features,
     }),
-  };
-  return { deps, shutdownRequests };
+    shutdownServer: async (options) => {
+      shutdownRequests.push({
+        keepTerminals: options?.keepTerminals,
+        ...(options?.resumeAgents === true ? { resumeAgents: true } : {}),
+      });
+      return { status: "shutdown_requested", clientId: "fake-client", requestId: "fake-request" };
+    },
+    close: async () => undefined,
+  }));
+  return { deps: { connectToDaemon }, shutdownRequests };
 }
 
 const cleanups: Array<() => void> = [];
@@ -106,5 +108,66 @@ describe("daemon stop --keep-terminals", () => {
       ),
     ).rejects.toMatchObject({ code: "INVALID_OPTIONS" });
     expect(daemon.shutdownRequests).toEqual([]);
+  });
+});
+
+describe("daemon stop --resume-agents", () => {
+  test("refuses an endpoint daemon that does not advertise resumeAgentsOnStop", async () => {
+    const daemon = createFakeDaemon();
+    await expect(
+      stop(
+        { daemonTarget: { kind: "endpoint", host: "127.0.0.1:7777" }, resumeAgents: true },
+        daemon.deps,
+      ),
+    ).rejects.toMatchObject({ code: "AGENT_RESUME_ON_STOP_UNSUPPORTED" });
+    expect(daemon.shutdownRequests).toEqual([]);
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "refuses a local daemon without the capability and never signals its supervisor",
+    async () => {
+      const daemon = createFakeDaemon();
+      const { home, supervisor } = homeWithRunningSupervisor();
+      const kill = vi.spyOn(process, "kill");
+      cleanups.push(() => kill.mockRestore());
+      await expect(
+        stop({ daemonTarget: { kind: "instance", home }, resumeAgents: true }, daemon.deps),
+      ).rejects.toMatchObject({ code: "AGENT_RESUME_ON_STOP_UNSUPPORTED" });
+      expect(daemon.shutdownRequests).toEqual([]);
+      expect(
+        kill.mock.calls.filter(([pid, signal]) => pid === supervisor.pid && signal !== 0),
+      ).toEqual([]);
+    },
+  );
+
+  test.each([false, true])("requests agent resume with keepTerminals=%s", async (keepTerminals) => {
+    const daemon = createFakeDaemon({
+      resumeAgentsOnStop: true,
+      terminalsSurviveRestart: keepTerminals,
+    });
+    await stop(
+      {
+        daemonTarget: { kind: "endpoint", host: "127.0.0.1:7777" },
+        resumeAgents: true,
+        keepTerminals,
+      },
+      daemon.deps,
+    );
+    expect(daemon.shutdownRequests).toEqual([{ resumeAgents: true, keepTerminals }]);
+  });
+
+  test("rejects --force with --resume-agents before contacting the daemon", async () => {
+    const daemon = createFakeDaemon({ resumeAgentsOnStop: true });
+    const { home } = homeWithRunningSupervisor();
+    await expect(
+      stop(
+        { daemonTarget: { kind: "instance", home }, resumeAgents: true, force: true },
+        daemon.deps,
+      ),
+    ).rejects.toMatchObject({
+      code: "INVALID_OPTIONS",
+      message: "--force kills agents; it cannot be combined with --resume-agents.",
+    });
+    expect(daemon.deps.connectToDaemon).not.toHaveBeenCalled();
   });
 });

@@ -103,17 +103,20 @@ async function requestInstanceStop(
   options: {
     force?: boolean;
     keepTerminals?: boolean;
+    resumeAgents?: boolean;
     requestShutdown?: (instance: PidLockInfo & { listen: string }) => Promise<void>;
   },
 ) {
   let forced = false;
   let usedLifecycleRpc = false;
-  if (options.keepTerminals) {
-    // SIGTERM means "stop and close terminals"; keeping them always goes over the RPC.
+  if (options.keepTerminals || options.resumeAgents) {
+    // SIGTERM cannot carry the options to keep terminals or record agents for resume.
     if (!instance.listen || !options.requestShutdown) {
       throw new DaemonInstanceError(
         "STOP_NO_GRACEFUL_CHANNEL",
-        `PID ${instance.pid} for ${home} has no listen address, so it cannot be asked to keep its terminals.`,
+        options.resumeAgents
+          ? `PID ${instance.pid} for ${home} has no graceful shutdown channel, so it cannot be asked to save running agents for resume.`
+          : `PID ${instance.pid} for ${home} has no listen address, so it cannot be asked to keep its terminals.`,
       );
     }
     await options.requestShutdown({ ...instance, listen: instance.listen });
@@ -161,6 +164,8 @@ export async function stopDaemonInstance(
     force?: boolean;
     // Leave the terminal worker running so the next daemon adopts it. Not valid with force.
     keepTerminals?: boolean;
+    // Record running agents for the next daemon to resume. Not valid with force.
+    resumeAgents?: boolean;
     timeoutMs?: number;
     killTimeoutMs?: number;
     requestShutdown?: (instance: PidLockInfo & { listen: string }) => Promise<void>;
@@ -229,11 +234,21 @@ export async function stopDaemonInstance(
   return { action: "stopped", pid: instance.pid, forced, usedLifecycleRpc };
 }
 
-function assertStopOptions(options: { force?: boolean; keepTerminals?: boolean }): void {
+function assertStopOptions(options: {
+  force?: boolean;
+  keepTerminals?: boolean;
+  resumeAgents?: boolean;
+}): void {
   if (options.force && options.keepTerminals) {
     throw new DaemonInstanceError(
       "INVALID_STOP_OPTIONS",
       "--force kills terminals; it cannot be combined with --keep-terminals.",
+    );
+  }
+  if (options.force && options.resumeAgents) {
+    throw new DaemonInstanceError(
+      "INVALID_STOP_OPTIONS",
+      "--force kills agents; it cannot be combined with --resume-agents.",
     );
   }
 }

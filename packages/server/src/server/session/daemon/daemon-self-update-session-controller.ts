@@ -20,6 +20,7 @@ interface DaemonSelfUpdateRestartIntent {
   requestId: string;
   reason: string;
   keepTerminals: boolean;
+  resumeAgents: true;
 }
 
 export interface DaemonSelfUpdateSessionControllerOptions {
@@ -91,6 +92,7 @@ export class DaemonSelfUpdateSessionController {
         reason: "daemon_update",
         // A self-update restart keeps terminals: the worker outlives the daemon.
         keepTerminals: true,
+        resumeAgents: true,
       });
     } catch (error) {
       if (error instanceof DaemonSelfUpdateInProgressError) {

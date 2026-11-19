@@ -77,11 +77,13 @@ async function runSupervisorWith(workerScript: string, timeoutMs = 8_000) {
 }
 
 // Generation 1 asks for `firstIntent`; generation 2 (if any) stops with `secondIntent`.
-function scriptedWorker(firstIntent: string, secondIntent = "") {
+function scriptedWorker(firstIntent: string, secondIntent = "", recordResumeAgents = false) {
   return `
     process.on("message", (message) => {
       if (message.type !== "paseo:graceful-shutdown") return;
-      record({ graceful: generation, keepTerminals: message.keepTerminals });
+      record({ graceful: generation, keepTerminals: message.keepTerminals${
+        recordResumeAgents ? ", resumeAgents: message.resumeAgents" : ""
+      } });
       process.exit(0);
     });
     process.send({ type: "paseo:ready", listen: "endpoint-" + generation, serverId: "srv" });
@@ -175,6 +177,29 @@ describe("supervisor terminal cleanup", () => {
       { started: 1 },
       { graceful: 1, keepTerminals: false },
       "cleanup",
+    ]);
+  });
+
+  test.each([
+    { type: "paseo:shutdown", resumeAgents: true },
+    { type: "paseo:shutdown", resumeAgents: undefined },
+    { type: "paseo:restart", resumeAgents: true },
+    { type: "paseo:restart", resumeAgents: undefined },
+  ])("$type forwards resumeAgents=$resumeAgents to the stopping worker", async (intent) => {
+    const result = await runSupervisorWith(
+      scriptedWorker(
+        `process.send(${JSON.stringify({ ...intent, keepTerminals: true })});`,
+        stopKeeping,
+        true,
+      ),
+    );
+    expect(result.code, result.output).toBe(0);
+    expect(result.events).toEqual([
+      { started: 1 },
+      { graceful: 1, keepTerminals: true, resumeAgents: intent.resumeAgents === true },
+      ...(intent.type === "paseo:restart"
+        ? [{ started: 2 }, { graceful: 2, keepTerminals: true, resumeAgents: false }]
+        : []),
     ]);
   });
 });

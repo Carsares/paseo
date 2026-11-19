@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import {
+  requireAgentResumeOnStopCapability,
   requireTerminalKeepCapability,
   type DaemonClient,
 } from "@getpaseo/client/internal/daemon-client";
@@ -17,6 +18,10 @@ export function daemonStopCommand(): Command {
     .option(
       "--keep-terminals",
       "Leave terminals running; the next daemon started for this home takes them back",
+    )
+    .option(
+      "--resume-agents",
+      "Record running agents so the next daemon started for this home resumes them",
     )
     .option("--kill-timeout <seconds>", "Forced exit deadline (default: 3)")
     .action(withOutput(runStopCommand));
@@ -44,17 +49,24 @@ async function runStop(options: CommandOptions, deps: StopCommandDeps) {
   const deadline = Date.now() + timeoutMs;
   const remaining = () => Math.max(1, deadline - Date.now());
   const keepTerminals = options.keepTerminals === true;
+  const resumeAgents = options.resumeAgents === true;
   const requestShutdown = async (instance?: DaemonInstance) => {
     const client = await deps.connectToDaemon({ target, timeout: remaining(), instance });
     try {
       // Checked on the connection that carries the shutdown: a daemon without the capability
       // would close the terminals it was asked to keep.
       if (keepTerminals) requireTerminalKeepCapability(client, describeDaemonTarget(target));
-      await client.shutdownServer({ timeout: remaining(), keepTerminals });
+      if (resumeAgents) requireAgentResumeOnStopCapability(client, describeDaemonTarget(target));
+      await client.shutdownServer({ timeout: remaining(), keepTerminals, resumeAgents });
     } finally {
       await client.close();
     }
   };
+  if (options.force && resumeAgents)
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--force kills agents; it cannot be combined with --resume-agents.",
+    };
   if (target.kind === "endpoint" && options.force)
     throw {
       code: "INVALID_OPTIONS",
@@ -78,6 +90,7 @@ async function runStop(options: CommandOptions, deps: StopCommandDeps) {
           ...(await stopDaemonInstance(target.home, {
             force: options.force === true,
             keepTerminals,
+            resumeAgents,
             timeoutMs,
             killTimeoutMs: parseTimeoutMs(options.killTimeout, 3_000),
             requestShutdown,

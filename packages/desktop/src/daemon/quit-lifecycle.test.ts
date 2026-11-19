@@ -99,8 +99,8 @@ describe("quit-lifecycle", () => {
     const stopped = await stopDesktopManagedDaemonOnQuitIfNeeded({
       settingsStore: { get: async () => SETTINGS_STOP_ON_QUIT },
       isDesktopManagedDaemonRunning: () => true,
-      stopDaemon: async () => {
-        events.push("stop");
+      stopDaemon: async (reason) => {
+        events.push(`stop:${reason}`);
       },
       showShutdownFeedback: () => {
         events.push("feedback");
@@ -108,7 +108,91 @@ describe("quit-lifecycle", () => {
     });
 
     expect(stopped).toBe(true);
-    expect(events).toEqual(["feedback", "stop"]);
+    expect(events).toEqual(["feedback", "stop:quit"]);
+  });
+
+  it("uses the app update stop reason on ordinary quit when an update is pending", async () => {
+    const events: string[] = [];
+    const stopped = await stopDesktopManagedDaemonOnQuitIfNeeded({
+      settingsStore: { get: async () => SETTINGS_STOP_ON_QUIT },
+      isDesktopManagedDaemonRunning: () => false,
+      isDesktopManagedDaemonPresent: () => true,
+      hasPendingUpdateOnQuit: () => true,
+      stopDaemon: async (reason) => {
+        events.push(`stop:${reason}`);
+      },
+      showShutdownFeedback: () => events.push("feedback"),
+    });
+
+    expect(stopped).toBe(true);
+    expect(events).toEqual(["feedback", "stop:app_update"]);
+  });
+
+  it("honors a preserve-work quit for a daemon from a previous launch even with keep-running enabled", async () => {
+    const events: string[] = [];
+    const stopGate = deferred<void>();
+    const quitLifecycle = createQuitLifecycle({
+      app: {
+        quit: () => {
+          events.push("quit");
+          quitLifecycle.handleBeforeQuit({ preventDefault: () => events.push("prevent-default") });
+        },
+        exit: (code) => events.push(`exit:${code}`),
+      },
+      closeTransportSessions: () => {},
+      stopDesktopManagedDaemonIfNeeded: (options) =>
+        stopDesktopManagedDaemonOnQuitIfNeeded({
+          settingsStore: { get: async () => SETTINGS_KEEP_RUNNING },
+          isDesktopManagedDaemonRunning: () => false,
+          isDesktopManagedDaemonPresent: () => true,
+          hasPendingUpdateOnQuit: () => true,
+          preserveWork: options?.preserveWork,
+          stopDaemon: async (reason) => {
+            events.push(`stop:${reason}`);
+            await stopGate.promise;
+          },
+          showShutdownFeedback: () => events.push("feedback"),
+        }),
+      installAppUpdateOnQuit: async () => false,
+      createUpdateDeadlineSignal: () => new AbortController().signal,
+      onStopError: () => events.push("stop-error"),
+      onUpdateError: () => events.push("update-error"),
+    });
+
+    quitLifecycle.requestPreserveWorkQuit();
+    // Repeated invocations while quitting is already in progress must be idempotent no-ops.
+    quitLifecycle.requestPreserveWorkQuit();
+    stopGate.resolve();
+    await waitForQuitLifecycle();
+
+    expect(events).toEqual([
+      "quit",
+      "prevent-default",
+      "feedback",
+      "stop:quit_preserve_work",
+      "exit:0",
+    ]);
+  });
+
+  it("ignores preserve-work quit requests when an update quit is already in progress", () => {
+    const events: string[] = [];
+    const quitLifecycle = createQuitLifecycle({
+      app: {
+        quit: () => events.push("quit"),
+        exit: (code) => events.push(`exit:${code}`),
+      },
+      closeTransportSessions: () => {},
+      stopDesktopManagedDaemonIfNeeded: async () => false,
+      installAppUpdateOnQuit: async () => false,
+      createUpdateDeadlineSignal: () => new AbortController().signal,
+      onStopError: () => {},
+      onUpdateError: () => {},
+    });
+
+    quitLifecycle.handleBeforeQuitForUpdate();
+    quitLifecycle.requestPreserveWorkQuit();
+
+    expect(events).toEqual([]);
   });
 
   it("revalidates updates after daemon shutdown before exiting", async () => {

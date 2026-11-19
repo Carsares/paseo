@@ -15,6 +15,7 @@ type SupervisorLifecycleMessage =
       type: "paseo:shutdown";
       reason: string;
       keepTerminals: boolean;
+      resumeAgents: boolean;
     }
   | {
       type: "paseo:ready";
@@ -25,6 +26,7 @@ type SupervisorLifecycleMessage =
       type: "paseo:restart";
       reason?: string;
       keepTerminals: boolean;
+      resumeAgents: boolean;
     };
 
 interface BootstrapResult {
@@ -160,14 +162,16 @@ async function main() {
       reason?: string;
       successExitCode?: number;
       keepTerminals?: boolean;
+      resumeAgents?: boolean;
     },
   ) => {
     const reason = options?.reason ?? `worker_received_${signal}`;
     // Signals mean "stop and close terminals"; only an explicit keep request keeps them.
     const keepTerminals = options?.keepTerminals === true;
+    const resumeAgents = options?.resumeAgents === true;
     if (!shutdownPromise) {
       logger.info(
-        { signal, reason, keepTerminals, ...getProcessDiagnostics() },
+        { signal, reason, keepTerminals, resumeAgents, ...getProcessDiagnostics() },
         `${signal} received, shutting down gracefully...`,
       );
 
@@ -186,7 +190,7 @@ async function main() {
             clearTimeout(forceExit);
             return 1;
           }
-          await daemon.stop({ keepTerminals });
+          await daemon.stop({ keepTerminals, resumeAgents });
           clearTimeout(forceExit);
           logger.info("Server closed");
           return options?.successExitCode ?? 0;
@@ -225,39 +229,38 @@ async function main() {
       requestId: intent.requestId,
       reason: intent.reason,
       keepTerminals: intent.keepTerminals,
+      resumeAgents: intent.resumeAgents === true,
     };
     if (intent.type === "shutdown") {
       logger.warn(fields, "Shutdown requested via websocket");
       const sent = sendSupervisorLifecycleMessage({
         type: "paseo:shutdown",
-        reason: intent.reason,
-        keepTerminals: intent.keepTerminals,
+        reason: fields.reason,
+        keepTerminals: fields.keepTerminals,
+        resumeAgents: fields.resumeAgents,
       });
       recordLifecycleIntentDispatched(intent.type, fields);
       if (sent) {
         return;
       }
-      beginShutdown("shutdown lifecycle intent", {
-        reason: intent.reason,
-        keepTerminals: intent.keepTerminals,
-      });
+      beginShutdown("shutdown lifecycle intent", fields);
       return;
     }
 
     logger.warn(fields, "Restart requested via websocket");
     const sent = sendSupervisorLifecycleMessage({
       type: "paseo:restart",
-      ...(intent.reason ? { reason: intent.reason } : {}),
-      keepTerminals: intent.keepTerminals,
+      ...(fields.reason ? { reason: fields.reason } : {}),
+      keepTerminals: fields.keepTerminals,
+      resumeAgents: fields.resumeAgents,
     });
     recordLifecycleIntentDispatched(intent.type, fields);
     if (sent) {
       return;
     }
     beginShutdown("restart lifecycle intent", {
-      reason: intent.reason,
+      ...fields,
       successExitCode: 0,
-      keepTerminals: intent.keepTerminals,
     });
   };
 
@@ -306,10 +309,15 @@ async function main() {
         return;
       }
       if (type === "paseo:graceful-shutdown") {
-        const { reason, keepTerminals } = message as { reason?: unknown; keepTerminals?: unknown };
+        const { reason, keepTerminals, resumeAgents } = message as {
+          reason?: unknown;
+          keepTerminals?: unknown;
+          resumeAgents?: unknown;
+        };
         beginShutdown("Supervisor shutdown request", {
           reason: typeof reason === "string" ? reason : "supervisor_requested_shutdown",
           keepTerminals: keepTerminals === true,
+          resumeAgents: resumeAgents === true,
         });
       }
     });

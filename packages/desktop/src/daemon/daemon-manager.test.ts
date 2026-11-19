@@ -7,8 +7,12 @@ import { DEFAULT_DESKTOP_SETTINGS } from "../settings/desktop-settings";
 import { ExternalCliCommandError } from "./cli/external";
 import {
   createDaemonCommandHandlers,
+  isDesktopManagedDaemonPresentSync,
+  isDesktopManagedDaemonRunningSync,
   keepsTerminalsOnStop,
+  resumesAgentsOnStop,
   stopCapturedDaemon,
+  stopDesktopDaemon,
   type DesktopDaemonStopReason,
 } from "./daemon-manager";
 
@@ -29,6 +33,8 @@ const mocks = vi.hoisted(() => ({
     env: {},
   })),
   spawnProcess: vi.fn(),
+  startDaemonInstance: vi.fn(),
+  stopDaemonInstance: vi.fn(),
   logInfo: vi.fn(),
   logError: vi.fn(),
   appLogPath: "",
@@ -61,6 +67,8 @@ vi.mock("@getpaseo/server/daemon-control", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   resolvePaseoHome: () => mocks.paseoHome,
   spawnProcess: mocks.spawnProcess,
+  startDaemonInstance: mocks.startDaemonInstance,
+  stopDaemonInstance: mocks.stopDaemonInstance,
 }));
 
 vi.mock("../settings/desktop-settings-electron.js", () => ({
@@ -98,6 +106,8 @@ describe("daemon-manager commands", () => {
     mocks.createNodeEntrypointInvocation.mockReset();
     mocks.createNodeEntrypointInvocation.mockReturnValue({ command: "node", args: [], env: {} });
     mocks.spawnProcess.mockReset();
+    mocks.startDaemonInstance.mockReset();
+    mocks.stopDaemonInstance.mockReset();
     mocks.logInfo.mockReset();
     mocks.logError.mockReset();
     mocks.getElectronLogFile.mockReset();
@@ -152,6 +162,22 @@ describe("daemon-manager commands", () => {
     expect(mocks.runExternalCliJsonCommand).not.toHaveBeenCalled();
   });
 
+  it("recognizes a desktop-managed daemon left running by a previous desktop launch", () => {
+    expect(isDesktopManagedDaemonPresentSync()).toBe(false);
+
+    mkdirSync(mocks.paseoHome);
+    const lockPath = path.join(mocks.paseoHome, "paseo.pid");
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, desktopManaged: true }));
+    expect(isDesktopManagedDaemonRunningSync()).toBe(false);
+    expect(isDesktopManagedDaemonPresentSync()).toBe(true);
+
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, desktopManaged: false }));
+    expect(isDesktopManagedDaemonPresentSync()).toBe(false);
+
+    writeFileSync(lockPath, "garbage");
+    expect(isDesktopManagedDaemonPresentSync()).toBe(false);
+  });
+
   it("reports an errored daemon when the local daemon state cannot be read", async () => {
     mkdirSync(mocks.paseoHome);
     writeFileSync(path.join(mocks.paseoHome, "paseo.pid"), "garbage");
@@ -182,6 +208,109 @@ describe("daemon-manager commands", () => {
     writeFileSync(lockPath, JSON.stringify({ ...lock, desktopManaged: false }));
     expect(await handler({ listen: "localhost:6799" })).toBeNull();
   });
+
+  it("stops a desktop-managed daemon from a previous launch only for resume-agents reasons and never stops a manual CLI daemon", async () => {
+    mkdirSync(mocks.paseoHome);
+    const lock = {
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      hostname: hostname(),
+      uid: process.getuid?.() ?? 0,
+      listen: "127.0.0.1:6799",
+      desktopManaged: true,
+    };
+    const lockPath = path.join(mocks.paseoHome, "paseo.pid");
+    writeFileSync(lockPath, JSON.stringify(lock));
+    mocks.runExternalCliJsonCommand.mockResolvedValue({
+      localDaemon: "running",
+      pid: lock.pid,
+      startedAt: lock.startedAt,
+      listen: lock.listen,
+      desktopManaged: true,
+    });
+    mocks.stopDaemonInstance.mockResolvedValue({
+      action: "stopped",
+      pid: lock.pid,
+      forced: false,
+      usedLifecycleRpc: true,
+    });
+
+    for (const reason of ["quit", "settings", "host_remove", "manual_ipc"] as const) {
+      await stopDesktopDaemon(reason);
+    }
+    expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
+
+    for (const reason of ["quit_preserve_work", "app_update", "version_mismatch"] as const) {
+      await stopDesktopDaemon(reason);
+    }
+    expect(mocks.stopDaemonInstance).toHaveBeenCalledTimes(3);
+
+    mocks.stopDaemonInstance.mockClear();
+    writeFileSync(lockPath, JSON.stringify({ ...lock, desktopManaged: false }));
+    for (const reason of [
+      "quit",
+      "quit_preserve_work",
+      "app_update",
+      "version_mismatch",
+    ] as const) {
+      await stopDesktopDaemon(reason);
+    }
+    expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
+  });
+
+  it("restarts a version-mismatched daemon from a previous desktop launch on start, but leaves a manual CLI daemon untouched", async () => {
+    mkdirSync(mocks.paseoHome);
+    const lock = {
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      hostname: hostname(),
+      uid: process.getuid?.() ?? 0,
+      listen: "127.0.0.1:6799",
+      desktopManaged: false,
+    };
+    const lockPath = path.join(mocks.paseoHome, "paseo.pid");
+    writeFileSync(lockPath, JSON.stringify(lock));
+    mocks.runExternalCliJsonCommand.mockResolvedValue({
+      localDaemon: "running",
+      pid: lock.pid,
+      startedAt: lock.startedAt,
+      listen: lock.listen,
+      daemonVersion: "0.15.0",
+      desktopManaged: false,
+    });
+
+    const handlers = createDaemonCommandHandlers();
+    await handlers.start_desktop_daemon();
+    expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
+    expect(mocks.startDaemonInstance).not.toHaveBeenCalled();
+
+    writeFileSync(lockPath, JSON.stringify({ ...lock, desktopManaged: true }));
+    mocks.runExternalCliJsonCommand.mockResolvedValue({
+      localDaemon: "running",
+      pid: lock.pid,
+      startedAt: lock.startedAt,
+      listen: lock.listen,
+      daemonVersion: "0.15.0",
+      desktopManaged: true,
+    });
+    mocks.stopDaemonInstance.mockResolvedValue({
+      action: "stopped",
+      pid: lock.pid,
+      forced: false,
+      usedLifecycleRpc: true,
+    });
+    mocks.startDaemonInstance.mockResolvedValue({ instance: lock });
+
+    await handlers.start_desktop_daemon();
+    expect(mocks.stopDaemonInstance).toHaveBeenCalledExactlyOnceWith(
+      mocks.paseoHome,
+      expect.objectContaining({
+        keepTerminals: process.platform !== "win32",
+        resumeAgents: true,
+      }),
+    );
+    expect(mocks.startDaemonInstance).toHaveBeenCalledOnce();
+  });
 });
 
 describe("desktop stops and terminals", () => {
@@ -190,6 +319,7 @@ describe("desktop stops and terminals", () => {
     "settings",
     "host_remove",
     "quit",
+    "quit_preserve_work",
     "app_update",
     "version_mismatch",
     "restart",
@@ -205,8 +335,16 @@ describe("desktop stops and terminals", () => {
     expect(reasons.filter((reason) => keepsTerminalsOnStop(reason, "win32"))).toEqual([]);
   });
 
+  it("resumes agents only after a preserve-work quit, app update, or version-mismatch restart", () => {
+    expect(reasons.filter(resumesAgentsOnStop)).toEqual([
+      "quit_preserve_work",
+      "app_update",
+      "version_mismatch",
+    ]);
+  });
+
   function stopHarness(runCliJson: (args: string[]) => Promise<unknown>) {
-    const stops: Array<{ keepTerminals: boolean | undefined }> = [];
+    const stops: Array<{ keepTerminals?: boolean; resumeAgents?: boolean }> = [];
     const logged: string[] = [];
     const instance = {
       pid: 4242,
@@ -215,17 +353,16 @@ describe("desktop stops and terminals", () => {
       uid: 501,
       listen: "127.0.0.1:6799",
     };
-    const stopInstance = (async (
-      _home: string,
-      options: {
-        keepTerminals?: boolean;
-        requestShutdown?: (ready: { listen: string }) => Promise<void>;
-      },
-    ) => {
-      stops.push({ keepTerminals: options.keepTerminals });
-      await options.requestShutdown?.({ listen: instance.listen });
+    const stopInstance: NonNullable<
+      Parameters<typeof stopCapturedDaemon>[0]["stopInstance"]
+    > = async (_home, { requestShutdown, ...options } = {}) => {
+      stops.push({
+        keepTerminals: options.keepTerminals,
+        ...("resumeAgents" in options ? { resumeAgents: options.resumeAgents } : {}),
+      });
+      await requestShutdown?.(instance);
       return { action: "stopped", pid: instance.pid, forced: false, usedLifecycleRpc: true };
-    }) as unknown as NonNullable<Parameters<typeof stopCapturedDaemon>[0]["stopInstance"]>;
+    };
     return {
       stops,
       logged,
@@ -239,18 +376,126 @@ describe("desktop stops and terminals", () => {
     };
   }
 
-  it("asks the daemon to keep its terminals on an app update", async () => {
-    const calls: string[][] = [];
-    const harness = stopHarness(async (args) => {
-      calls.push(args);
-      return { action: "shutdown_requested" };
+  it("asks the daemon to keep its terminals and resume agents on an app update", async () => {
+    const runCliJson = vi.fn().mockResolvedValue({ action: "shutdown_requested" });
+    const harness = stopHarness(runCliJson);
+
+    await stopCapturedDaemon({
+      ...harness.input,
+      reason: "app_update",
+      keepTerminals: true,
+      resumeAgents: true,
     });
 
-    await stopCapturedDaemon({ ...harness.input, reason: "app_update", keepTerminals: true });
+    expect(harness.stops).toEqual([{ keepTerminals: true, resumeAgents: true }]);
+    expect(runCliJson).toHaveBeenCalledExactlyOnceWith([
+      "daemon",
+      "stop",
+      "--host",
+      "127.0.0.1:6799",
+      "--keep-terminals",
+      "--resume-agents",
+      "--json",
+    ]);
+  });
 
-    expect(harness.stops).toEqual([{ keepTerminals: true }]);
-    expect(calls).toEqual([
-      ["daemon", "stop", "--host", "127.0.0.1:6799", "--keep-terminals", "--json"],
+  it("asks the daemon to resume agents and close its terminals on a preserve-work quit", async () => {
+    const runCliJson = vi.fn().mockResolvedValue({ action: "shutdown_requested" });
+    const harness = stopHarness(runCliJson);
+
+    await stopCapturedDaemon({
+      ...harness.input,
+      reason: "quit_preserve_work",
+      keepTerminals: false,
+      resumeAgents: true,
+    });
+
+    expect(harness.stops).toEqual([{ keepTerminals: false, resumeAgents: true }]);
+    expect(runCliJson).toHaveBeenCalledExactlyOnceWith([
+      "daemon",
+      "stop",
+      "--host",
+      "127.0.0.1:6799",
+      "--resume-agents",
+      "--json",
+    ]);
+  });
+
+  it("keeps terminals on an app update when the daemon cannot resume agents", async () => {
+    const runCliJson = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new ExternalCliCommandError("refused", {
+          code: "AGENT_RESUME_ON_STOP_UNSUPPORTED",
+          version: "0.16.0",
+        }),
+      )
+      .mockResolvedValueOnce({ action: "shutdown_requested" });
+    const harness = stopHarness(runCliJson);
+
+    await stopCapturedDaemon({
+      ...harness.input,
+      reason: "app_update",
+      keepTerminals: true,
+      resumeAgents: true,
+    });
+
+    expect(harness.stops).toEqual([
+      { keepTerminals: true, resumeAgents: true },
+      { keepTerminals: true },
+    ]);
+    expect(runCliJson).toHaveBeenCalledTimes(2);
+    expect(runCliJson).toHaveBeenLastCalledWith([
+      "daemon",
+      "stop",
+      "--host",
+      "127.0.0.1:6799",
+      "--keep-terminals",
+      "--json",
+    ]);
+    expect(harness.logged).toEqual([
+      "daemon v0.16.0 cannot resume agents on stop; stopping without agent resume",
+    ]);
+  });
+
+  it("drops unsupported terminal preservation before retrying agent resume", async () => {
+    const runCliJson = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new ExternalCliCommandError("refused", { code: "TERMINALS_KEEP_UNSUPPORTED" }),
+      )
+      .mockRejectedValueOnce(
+        new ExternalCliCommandError("refused", { code: "AGENT_RESUME_ON_STOP_UNSUPPORTED" }),
+      )
+      .mockResolvedValueOnce({ action: "shutdown_requested" });
+    const harness = stopHarness(runCliJson);
+
+    await stopCapturedDaemon({
+      ...harness.input,
+      reason: "app_update",
+      keepTerminals: true,
+      resumeAgents: true,
+    });
+
+    expect(harness.stops).toEqual([
+      { keepTerminals: true, resumeAgents: true },
+      { keepTerminals: false, resumeAgents: true },
+      { keepTerminals: false },
+    ]);
+    expect(runCliJson).toHaveBeenNthCalledWith(2, [
+      "daemon",
+      "stop",
+      "--host",
+      "127.0.0.1:6799",
+      "--resume-agents",
+      "--json",
+    ]);
+    expect(runCliJson).toHaveBeenLastCalledWith([
+      "daemon",
+      "stop",
+      "--host",
+      "127.0.0.1:6799",
+      "--json",
     ]);
   });
 

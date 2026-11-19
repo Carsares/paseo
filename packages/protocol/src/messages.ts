@@ -2054,6 +2054,8 @@ export const RestartServerRequestMessageSchema = z.object({
   // Restart keeps terminals unless this is true. Daemons that predate
   // `features.terminalsSurviveRestart` ignore it and close terminals anyway.
   killTerminals: z.boolean().optional(),
+  // Gate on features.resumeAgentsOnStop: older daemons drop the field.
+  resumeAgents: z.boolean().optional(),
 });
 
 export const ShutdownServerRequestMessageSchema = z.object({
@@ -2062,6 +2064,8 @@ export const ShutdownServerRequestMessageSchema = z.object({
   // Shutdown closes terminals unless this is true. Gate on
   // `features.terminalsSurviveRestart`: older daemons drop the field.
   keepTerminals: z.boolean().optional(),
+  // Gate on features.resumeAgentsOnStop: older daemons drop the field.
+  resumeAgents: z.boolean().optional(),
 });
 
 export const DaemonUpdateRequestMessageSchema = z.object({
@@ -4105,6 +4109,8 @@ export const ServerInfoStatusPayloadSchema = z
         daemonSelfUpdate: z.boolean().optional(),
         // COMPAT(terminalsSurviveRestart): added in v0.12.0, remove gate after 2027-04-21.
         terminalsSurviveRestart: z.boolean().optional(),
+        // COMPAT(resumeAgentsOnStop): added after v0.16.0, remove gate after 2027-05-19.
+        resumeAgentsOnStop: z.boolean().optional(),
         // COMPAT(agentForkContext): added in v0.1.102, remove gate after 2026-12-28.
         agentForkContext: z.boolean().optional(),
         // COMPAT(agentForkContextCursor): added in v0.1.108, remove gate after 2027-01-14.

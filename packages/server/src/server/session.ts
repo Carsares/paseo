@@ -673,6 +673,7 @@ export type SessionLifecycleIntent =
       requestId: string;
       reason: string;
       keepTerminals: boolean;
+      resumeAgents: boolean;
     }
   | {
       type: "restart";
@@ -680,6 +681,7 @@ export type SessionLifecycleIntent =
       requestId: string;
       reason: string;
       keepTerminals: boolean;
+      resumeAgents: boolean;
     };
 
 function parseClientCapabilities(
@@ -1203,7 +1205,11 @@ export class Session {
     this.daemonSession = new DaemonSession({
       host: {
         emit: (msg) => this.emit(msg),
-        emitLifecycleIntent: (intent) => this.emitLifecycleIntent(intent),
+        emitLifecycleIntent: (intent) =>
+          this.emitLifecycleIntent({
+            ...intent,
+            resumeAgents: "resumeAgents" in intent && intent.resumeAgents === true,
+          }),
       },
       clientId: this.clientId,
       paseoHome: this.paseoHome,
@@ -3106,10 +3112,12 @@ export class Session {
       case "restart_server_request":
         return this.handleRestartServerRequest(msg.requestId, msg.reason, {
           keepTerminals: msg.killTerminals !== true,
+          resumeAgents: msg.resumeAgents === true,
         });
       case "shutdown_server_request":
         return this.handleShutdownServerRequest(msg.requestId, {
           keepTerminals: msg.keepTerminals === true,
+          resumeAgents: msg.resumeAgents === true,
         });
       case "client_heartbeat":
         this.handleClientHeartbeat(msg);
@@ -3672,7 +3680,7 @@ export class Session {
   private async handleRestartServerRequest(
     requestId: string,
     reason: string | undefined,
-    options: { keepTerminals: boolean },
+    options: { keepTerminals: boolean; resumeAgents: boolean },
   ): Promise<void> {
     const lifecycleReason = normalizeClientRestartRpcReason(reason);
     const payload: { status: string } & Record<string, unknown> = {
@@ -3685,7 +3693,11 @@ export class Session {
     payload.requestId = requestId;
 
     this.sessionLogger.warn(
-      { reason: lifecycleReason, keepTerminals: options.keepTerminals },
+      {
+        reason: lifecycleReason,
+        keepTerminals: options.keepTerminals,
+        resumeAgents: options.resumeAgents,
+      },
       "Restart requested via websocket",
     );
     this.emit({
@@ -3699,16 +3711,17 @@ export class Session {
       requestId,
       reason: lifecycleReason,
       keepTerminals: options.keepTerminals,
+      resumeAgents: options.resumeAgents,
     });
   }
 
   private async handleShutdownServerRequest(
     requestId: string,
-    options: { keepTerminals: boolean },
+    options: { keepTerminals: boolean; resumeAgents: boolean },
   ): Promise<void> {
     const reason = CLIENT_SHUTDOWN_RPC_REASON;
     this.sessionLogger.warn(
-      { reason, keepTerminals: options.keepTerminals },
+      { reason, keepTerminals: options.keepTerminals, resumeAgents: options.resumeAgents },
       "Shutdown requested via websocket",
     );
     this.emit({
@@ -3726,6 +3739,7 @@ export class Session {
       requestId,
       reason,
       keepTerminals: options.keepTerminals,
+      resumeAgents: options.resumeAgents,
     });
   }
 

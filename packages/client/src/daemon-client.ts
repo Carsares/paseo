@@ -813,6 +813,8 @@ export interface ShutdownServerOptions {
   // Leave terminals running for the next daemon. Only daemons advertising
   // `features.terminalsSurviveRestart` honor it; check before sending.
   keepTerminals?: boolean;
+  // Record running agents for the next daemon to resume. Check `features.resumeAgentsOnStop` first.
+  resumeAgents?: boolean;
 }
 export interface DaemonStatusOptions {
   requestId?: string;
@@ -1377,6 +1379,30 @@ export function requireTerminalKeepCapability(
   const serverInfo = client.getLastServerInfoMessage();
   if (serverInfo?.features?.terminalsSurviveRestart !== true) {
     throw new TerminalKeepUnsupportedError(target, serverInfo?.version ?? null);
+  }
+}
+
+export class AgentResumeOnStopUnsupportedError extends Error {
+  readonly code = "AGENT_RESUME_ON_STOP_UNSUPPORTED";
+  readonly version: string | null;
+
+  constructor(target: string, version: string | null) {
+    super(
+      `The daemon at ${target}${version ? ` (v${version})` : ""} cannot save running agents for a one-time resume when it stops. Update it first, or run the command without \`--resume-agents\`.`,
+    );
+    this.name = "AgentResumeOnStopUnsupportedError";
+    this.version = version;
+  }
+}
+
+// COMPAT(resumeAgentsOnStop): added after v0.16.0, remove gate after 2027-05-19.
+export function requireAgentResumeOnStopCapability(
+  client: Pick<DaemonClient, "getLastServerInfoMessage">,
+  target: string,
+): void {
+  const serverInfo = client.getLastServerInfoMessage();
+  if (serverInfo?.features?.resumeAgentsOnStop !== true) {
+    throw new AgentResumeOnStopUnsupportedError(target, serverInfo?.version ?? null);
   }
 }
 
@@ -4611,7 +4637,7 @@ export class DaemonClient {
   async restartServer(
     reason?: string,
     requestId?: string,
-    options?: { timeout?: number; killTerminals?: boolean },
+    options?: { timeout?: number; killTerminals?: boolean; resumeAgents?: boolean },
   ): Promise<RestartRequestedStatusPayload> {
     const resolvedRequestId = this.createRequestId(requestId);
     const message = SessionInboundMessageSchema.parse({
@@ -4619,6 +4645,7 @@ export class DaemonClient {
       ...(reason && reason.trim().length > 0 ? { reason } : {}),
       requestId: resolvedRequestId,
       ...(options?.killTerminals ? { killTerminals: true } : {}),
+      ...(options?.resumeAgents ? { resumeAgents: true } : {}),
     });
     return this.sendRequest({
       requestId: resolvedRequestId,
@@ -4647,6 +4674,7 @@ export class DaemonClient {
       type: "shutdown_server_request",
       requestId: resolvedRequestId,
       ...(options?.keepTerminals ? { keepTerminals: true } : {}),
+      ...(options?.resumeAgents ? { resumeAgents: true } : {}),
     });
     return this.sendRequest({
       requestId: resolvedRequestId,

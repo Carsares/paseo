@@ -254,6 +254,15 @@ const appUpdateService = createAppUpdateService({
 // Public API
 // ---------------------------------------------------------------------------
 
+export function hasDownloadedAppUpdate(): boolean {
+  return (
+    shouldInstallAppUpdateOnQuit({
+      platform: process.platform,
+      isAppImage: Boolean(process.env.APPIMAGE),
+    }) && appUpdateService.hasDownloadedUpdate()
+  );
+}
+
 export async function checkForAppUpdate({
   currentVersion,
   releaseChannel,

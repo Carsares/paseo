@@ -119,6 +119,7 @@ describe("DaemonSelfUpdateSessionController", () => {
         requestId: "update-1",
         reason: "daemon_update",
         keepTerminals: true,
+        resumeAgents: true,
       },
     ]);
   });

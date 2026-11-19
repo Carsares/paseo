@@ -22,6 +22,7 @@ type WorkerLifecycleMessage =
       type: "paseo:shutdown";
       reason?: string;
       keepTerminals: boolean;
+      resumeAgents: boolean;
     }
   | {
       type: "paseo:ready";
@@ -32,6 +33,7 @@ type WorkerLifecycleMessage =
       type: "paseo:restart";
       reason?: string;
       keepTerminals: boolean;
+      resumeAgents: boolean;
     };
 
 interface SupervisorHeartbeatMessage {
@@ -42,6 +44,7 @@ interface SupervisorGracefulShutdownMessage {
   type: "paseo:graceful-shutdown";
   reason: string;
   keepTerminals: boolean;
+  resumeAgents: boolean;
 }
 
 export type SupervisorLifecycleLog = (message: string, fields?: Record<string, unknown>) => void;
@@ -70,7 +73,10 @@ interface SupervisorOptions {
 }
 
 export interface SupervisorController {
-  requestShutdown(reason: string, options?: { keepTerminals?: boolean }): void;
+  requestShutdown(
+    reason: string,
+    options?: { keepTerminals?: boolean; resumeAgents?: boolean },
+  ): void;
 }
 
 function describeExit(code: number | null, signal: NodeJS.Signals | null): string {
@@ -82,12 +88,17 @@ function parseLifecycleMessage(msg: unknown): WorkerLifecycleMessage | null {
     return null;
   }
   const type = (msg as { type?: unknown }).type;
-  if (type === "paseo:shutdown") {
-    const { reason, keepTerminals } = msg as { reason?: unknown; keepTerminals?: unknown };
+  if (type === "paseo:shutdown" || type === "paseo:restart") {
+    const { reason, keepTerminals, resumeAgents } = msg as {
+      reason?: unknown;
+      keepTerminals?: unknown;
+      resumeAgents?: unknown;
+    };
     return {
-      type: "paseo:shutdown",
+      type,
       ...(typeof reason === "string" && reason.trim().length > 0 ? { reason } : {}),
       keepTerminals: keepTerminals === true,
+      resumeAgents: resumeAgents === true,
     };
   }
   if (type === "paseo:ready") {
@@ -99,14 +110,6 @@ function parseLifecycleMessage(msg: unknown): WorkerLifecycleMessage | null {
       return null;
     }
     return { type: "paseo:ready", listen, serverId };
-  }
-  if (type === "paseo:restart") {
-    const { reason, keepTerminals } = msg as { reason?: unknown; keepTerminals?: unknown };
-    return {
-      type: "paseo:restart",
-      ...(typeof reason === "string" && reason.trim().length > 0 ? { reason } : {}),
-      keepTerminals: keepTerminals === true,
-    };
   }
   return null;
 }
@@ -199,6 +202,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
   // The resolved terminal decision of the pending restart or stop. It survives the force-kill
   // path, so a hung kill restart still closes terminals before the respawn.
   let pendingKeepTerminals = false;
+  let pendingResumeAgents = false;
   let exiting = false;
   let lifecycleFailed = false;
   let publication = Promise.resolve();
@@ -393,8 +397,9 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
         writeLifecycleLog("Worker requested shutdown", {
           reason,
           keepTerminals: lifecycleMessage.keepTerminals,
+          resumeAgents: lifecycleMessage.resumeAgents,
         });
-        requestShutdown(reason, { keepTerminals: lifecycleMessage.keepTerminals });
+        requestShutdown(reason, lifecycleMessage);
         return;
       }
 
@@ -402,8 +407,9 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       writeLifecycleLog("Worker requested restart", {
         reason,
         keepTerminals: lifecycleMessage.keepTerminals,
+        resumeAgents: lifecycleMessage.resumeAgents,
       });
-      requestRestart(reason, lifecycleMessage.keepTerminals);
+      requestRestart(reason, lifecycleMessage);
     });
 
     child.on("error", (error) => {
@@ -446,6 +452,7 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
           const closeTerminals = restarting && !pendingKeepTerminals;
           restarting = false;
           pendingKeepTerminals = false;
+          pendingResumeAgents = false;
           log(
             crashed && !closeTerminals
               ? `Worker crashed (${exitDescriptor}). Restarting worker...`
@@ -481,10 +488,12 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
       type: "paseo:graceful-shutdown",
       reason,
       keepTerminals: pendingKeepTerminals,
+      resumeAgents: pendingResumeAgents,
     };
     writeLifecycleLog("Supervisor requesting graceful worker shutdown", {
       reason,
       keepTerminals: pendingKeepTerminals,
+      resumeAgents: pendingResumeAgents,
       supervisorPid: process.pid,
       workerPid: currentChild.pid ?? null,
     });
@@ -508,28 +517,41 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
     });
   };
 
-  const requestRestart = (reason: string, keepTerminals: boolean) => {
+  const requestRestart = (
+    reason: string,
+    restartOptions: { keepTerminals: boolean; resumeAgents: boolean },
+  ) => {
     if (!child || restarting || shuttingDown) {
       return;
     }
     restarting = true;
-    pendingKeepTerminals = keepTerminals;
-    writeLifecycleLog("Restart requested", { reason, keepTerminals });
+    pendingKeepTerminals = restartOptions.keepTerminals;
+    pendingResumeAgents = restartOptions.resumeAgents;
+    writeLifecycleLog("Restart requested", {
+      reason,
+      keepTerminals: pendingKeepTerminals,
+      resumeAgents: pendingResumeAgents,
+    });
     log(`${reason}. Stopping worker for restart...`);
     requestWorkerShutdown(reason);
     scheduleForceKill(reason);
   };
 
-  const requestShutdown = (reason: string, shutdownOptions: { keepTerminals?: boolean } = {}) => {
+  const requestShutdown: SupervisorController["requestShutdown"] = (
+    reason,
+    shutdownOptions = {},
+  ) => {
     if (shuttingDown) {
       return;
     }
     shuttingDown = true;
     restarting = false;
     pendingKeepTerminals = shutdownOptions.keepTerminals === true;
+    pendingResumeAgents = shutdownOptions.resumeAgents === true;
     writeLifecycleLog("Supervisor shutdown requested", {
       reason,
       keepTerminals: pendingKeepTerminals,
+      resumeAgents: pendingResumeAgents,
     });
     log(`${reason}. Stopping worker...`);
     if (!child) {

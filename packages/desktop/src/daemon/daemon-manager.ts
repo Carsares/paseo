@@ -68,6 +68,7 @@ const DESKTOP_DAEMON_STOP_REASON_VALUES = [
   "settings",
   "host_remove",
   "quit",
+  "quit_preserve_work",
   "app_update",
   "version_mismatch",
   "restart",
@@ -137,10 +138,23 @@ function logFilePath(): string {
 }
 
 export function isDesktopManagedDaemonRunningSync(): boolean {
-  if (!ownedLaunch) return false;
+  const home = getPaseoHome();
+  if (!ownedLaunch || ownedLaunch.home !== home) return false;
   try {
-    const lock = JSON.parse(readFileSync(path.join(ownedLaunch.home, "paseo.pid"), "utf8"));
+    const lock = JSON.parse(readFileSync(path.join(home, "paseo.pid"), "utf8"));
     return isSameDaemonInstance(lock, ownedLaunch.instance) && isProcessRunning(lock.pid);
+  } catch {
+    return false;
+  }
+}
+
+export function isDesktopManagedDaemonPresentSync(): boolean {
+  if (isDesktopManagedDaemonRunningSync()) return true;
+  try {
+    const lock = JSON.parse(readFileSync(path.join(getPaseoHome(), "paseo.pid"), "utf8"));
+    return (
+      lock?.desktopManaged === true && typeof lock.pid === "number" && isProcessRunning(lock.pid)
+    );
   } catch {
     return false;
   }
@@ -269,7 +283,7 @@ function normalizeVersion(version: string | null): string | null {
 }
 
 function shouldRestartForVersion(current: DesktopDaemonStatus): boolean {
-  if (!current.ownedByDesktop) return false;
+  if (!current.desktopManaged) return false;
   const appVersion = normalizeVersion(resolveDesktopAppVersion());
   const daemonVersion = normalizeVersion(current.version);
   return Boolean(appVersion && daemonVersion && appVersion !== daemonVersion);
@@ -352,15 +366,19 @@ export async function stopDesktopDaemon(
     throw new Error(
       "Daemon changed since confirmation; inspect its current home and PID before stopping it.",
     );
-  if (!instance || (!owned && !explicit)) return resolveDesktopDaemonStatus();
+  const resumeAgents = resumesAgentsOnStop(reason);
+  if (!instance || (!owned && !explicit && !(resumeAgents && instance.desktopManaged === true))) {
+    return resolveDesktopDaemonStatus();
+  }
   const keepTerminals = keepsTerminalsOnStop(reason, process.platform);
   logDesktopDaemonLifecycle("stopping captured supervisor", {
     reason,
     pid: instance.pid,
     owned,
     keepTerminals,
+    resumeAgents,
   });
-  await stopCapturedDaemon({ home, instance, reason, keepTerminals });
+  await stopCapturedDaemon({ home, instance, reason, keepTerminals, resumeAgents });
   if (owned) ownedLaunch = null;
   return resolveDesktopDaemonStatus();
 }
@@ -370,21 +388,23 @@ export interface StopCapturedDaemonInput {
   instance: DaemonInstance;
   reason: DesktopDaemonStopReason;
   keepTerminals: boolean;
+  resumeAgents?: boolean;
   stopInstance?: typeof stopDaemonInstance;
   runCliJson?: typeof runExternalCliJsonCommand;
   log?: typeof logDesktopDaemonLifecycle;
 }
 
-/** Stops the supervisor desktop captured, keeping its terminals when asked and supported. */
+/** Stops the captured supervisor with the requested preservation options it supports. */
 export async function stopCapturedDaemon(input: StopCapturedDaemonInput): Promise<void> {
   const stopInstance = input.stopInstance ?? stopDaemonInstance;
   const runCliJson = input.runCliJson ?? runExternalCliJsonCommand;
   const logLifecycle = input.log ?? logDesktopDaemonLifecycle;
-  const stop = (keep: boolean) =>
+  const stop = (keep: boolean, resume: boolean) =>
     stopInstance(input.home, {
       instance: input.instance,
       timeoutMs: 15_000,
       keepTerminals: keep,
+      ...(resume ? { resumeAgents: true } : {}),
       requestShutdown: async (ready) => {
         await runCliJson([
           "daemon",
@@ -392,28 +412,42 @@ export async function stopCapturedDaemon(input: StopCapturedDaemonInput): Promis
           "--host",
           ready.listen,
           ...(keep ? ["--keep-terminals"] : []),
+          ...(resume ? ["--resume-agents"] : []),
           "--json",
         ]);
       },
     });
-  try {
-    await stop(input.keepTerminals);
-  } catch (error) {
-    // The CLI refuses a keep stop before sending anything when the daemon predates the feature;
-    // that daemon closes terminals on every stop, as every upgrade did before.
-    if (
-      !input.keepTerminals ||
-      !(error instanceof ExternalCliCommandError) ||
-      error.code !== "TERMINALS_KEEP_UNSUPPORTED"
-    ) {
+  let keep = input.keepTerminals;
+  let resume = input.resumeAgents ?? false;
+  // The CLI rejects unsupported options before sending a shutdown request.
+  // Each retry drops one option, so there can be at most two retries.
+  while (true) {
+    try {
+      await stop(keep, resume);
+      return;
+    } catch (error) {
+      if (!(error instanceof ExternalCliCommandError)) throw error;
+      const version = typeof error.error?.version === "string" ? error.error.version : "unknown";
+      const details = { reason: input.reason, pid: input.instance.pid };
+      // COMPAT(resumeAgentsOnStop): added after v0.16.0, remove after 2027-05-19.
+      if (resume && error.code === "AGENT_RESUME_ON_STOP_UNSUPPORTED") {
+        logLifecycle(
+          `daemon v${version} cannot resume agents on stop; stopping without agent resume`,
+          details,
+        );
+        resume = false;
+        continue;
+      }
+      if (keep && error.code === "TERMINALS_KEEP_UNSUPPORTED") {
+        logLifecycle(
+          `daemon v${version} cannot keep terminals; stopping it and closing them`,
+          details,
+        );
+        keep = false;
+        continue;
+      }
       throw error;
     }
-    const version = typeof error.error?.version === "string" ? error.error.version : "unknown";
-    logLifecycle(`daemon v${version} cannot keep terminals; stopping it and closing them`, {
-      reason: input.reason,
-      pid: input.instance.pid,
-    });
-    await stop(false);
   }
 }
 
@@ -429,6 +463,12 @@ export function keepsTerminalsOnStop(
 ): boolean {
   if (platform === "win32") return false;
   return reason === "app_update" || reason === "version_mismatch";
+}
+
+export function resumesAgentsOnStop(reason: DesktopDaemonStopReason): boolean {
+  return (
+    reason === "app_update" || reason === "version_mismatch" || reason === "quit_preserve_work"
+  );
 }
 
 async function restartDaemon(): Promise<DesktopDaemonStatus> {
