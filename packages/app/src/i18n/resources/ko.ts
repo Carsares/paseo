@@ -261,6 +261,9 @@ export const ko: TranslationResources = {
     messageCapped: "이 메시지는 길이 제한으로 잘렸습니다({{bytes}}바이트).",
     quote: {
       action: "인용",
+      quoteInChat: "현재 대화에 인용",
+      newSubagent: "새 하위 에이전트",
+      newSibling: "같은 계층에 새 하위 에이전트",
       noteLabel: "인용에 대한 메모",
       notePlaceholder: "메모 추가",
       hint: "Enter로 메시지에 추가 · Shift+Enter로 줄바꿈 · Esc로 취소",
@@ -414,6 +417,8 @@ export const ko: TranslationResources = {
       copyTurn: "턴 복사",
       copyMessage: "메시지 복사",
       forkMenu: "여기에서 채팅 분기",
+      forkAsSubagent: "하위 에이전트로 분기",
+      forkAsSibling: "같은 계층의 하위 에이전트로 분기",
       forkInNewTab: "새 탭으로 분기",
       forkInNewWorkspace: "새 워크스페이스로 분기",
       forkUnavailable: "이를 사용하려면 호스트를 업데이트하세요.",

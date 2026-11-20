@@ -263,6 +263,9 @@ export const es: TranslationResources = {
     messageCapped: "Este mensaje fue truncado ({{bytes}} bytes).",
     quote: {
       action: "Citar",
+      quoteInChat: "Citar en el chat actual",
+      newSubagent: "Nuevo subagente",
+      newSibling: "Nuevo subagente del mismo nivel",
       noteLabel: "Nota sobre la cita",
       notePlaceholder: "Añade una nota",
       hint: "Enter lo añade al mensaje · Shift+Enter nueva línea · Esc cancela",
@@ -418,6 +421,8 @@ export const es: TranslationResources = {
       copyTurn: "Copiar turno",
       copyMessage: "Copiar mensaje",
       forkMenu: "Bifurcar mensaje",
+      forkAsSubagent: "Bifurcar como subagente",
+      forkAsSibling: "Bifurcar como subagente del mismo nivel",
       forkInNewTab: "Bifurcar en una pestaña nueva",
       forkInNewWorkspace: "Bifurcar en un espacio de trabajo nuevo",
       forkUnavailable: "Actualiza el host para usar esto.",

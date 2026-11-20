@@ -264,6 +264,9 @@ export const fr: TranslationResources = {
     messageCapped: "Ce message a été tronqué ({{bytes}} octets).",
     quote: {
       action: "Citer",
+      quoteInChat: "Citer dans la conversation actuelle",
+      newSubagent: "Nouveau sous-agent",
+      newSibling: "Nouveau sous-agent de même niveau",
       noteLabel: "Note sur la citation",
       notePlaceholder: "Ajouter une note",
       hint: "Entrée l’ajoute au message · Maj+Entrée nouvelle ligne · Échap annule",
@@ -418,6 +421,8 @@ export const fr: TranslationResources = {
       copyTurn: "Copier l’échange",
       copyMessage: "Copier le message",
       forkMenu: "Forker la conversation à partir d’ici",
+      forkAsSubagent: "Forker en tant que sous-agent",
+      forkAsSibling: "Forker en tant que sous-agent de même niveau",
       forkInNewTab: "Forker dans un nouvel onglet",
       forkInNewWorkspace: "Forker dans un nouvel espace de travail",
       forkUnavailable: "Mettez à jour l’hôte pour utiliser cette fonction.",

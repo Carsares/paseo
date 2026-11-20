@@ -263,6 +263,9 @@ export const ru: TranslationResources = {
     messageCapped: "Это сообщение было обрезано ({{bytes}} байт).",
     quote: {
       action: "Цитировать",
+      quoteInChat: "Цитировать в текущем чате",
+      newSubagent: "Новый подагент",
+      newSibling: "Новый подагент того же уровня",
       noteLabel: "Заметка к цитате",
       notePlaceholder: "Добавьте заметку",
       hint: "Enter добавляет в сообщение · Shift+Enter новая строка · Esc отмена",
@@ -417,6 +420,8 @@ export const ru: TranslationResources = {
       copyTurn: "Скопировать ответ",
       copyMessage: "Копировать сообщение",
       forkMenu: "Форкнуть чат отсюда",
+      forkAsSubagent: "Создать форк как подагент",
+      forkAsSibling: "Создать форк как подагент того же уровня",
       forkInNewTab: "Создать форк в новой вкладке",
       forkInNewWorkspace: "Создать форк в новом рабочем пространстве",
       forkUnavailable: "Обновите хост, чтобы использовать эту функцию.",

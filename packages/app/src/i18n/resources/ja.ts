@@ -263,6 +263,9 @@ export const ja: TranslationResources = {
     messageCapped: "このメッセージは上限で切り詰められました（{{bytes}}バイト）。",
     quote: {
       action: "引用",
+      quoteInChat: "現在のチャットに引用",
+      newSubagent: "新しいサブエージェント",
+      newSibling: "同階層にサブエージェントを作成",
       noteLabel: "引用へのメモ",
       notePlaceholder: "メモを追加",
       hint: "Enterでメッセージに追加 · Shift+Enterで改行 · Escでキャンセル",
@@ -418,6 +421,8 @@ export const ja: TranslationResources = {
       copyTurn: "ターンをコピー",
       copyMessage: "メッセージをコピー",
       forkMenu: "メッセージをフォーク",
+      forkAsSubagent: "サブエージェントとしてフォーク",
+      forkAsSibling: "同階層のサブエージェントとしてフォーク",
       forkInNewTab: "新しいタブにフォーク",
       forkInNewWorkspace: "新しいワークスペースにフォーク",
       forkUnavailable: "これを使用するにはホストを更新してください。",

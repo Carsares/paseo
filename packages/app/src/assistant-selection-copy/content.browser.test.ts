@@ -1,6 +1,8 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { createElement } from "react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { page, userEvent } from "vitest/browser";
+import { i18n } from "@/i18n/i18next";
 import { createMarkdownParser } from "@/utils/markdown-parser";
 import {
   createAssistantSelectionClipboardContent,
@@ -127,10 +129,11 @@ function copiedMarkdown(selection: Selection): string | null {
   return createAssistantSelectionClipboardContent(selection)?.plainText ?? null;
 }
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
   window.getSelection()?.removeAllRanges();
   document.body.replaceChildren();
+  if (i18n.language !== "en") await i18n.changeLanguage("en");
 });
 
 describe("assistant selection quote", () => {
@@ -141,8 +144,10 @@ describe("assistant selection quote", () => {
     ({ AssistantSelectionQuote } = await import(/* @vite-ignore */ quoteModule));
   });
 
-  function mountQuoteStream() {
-    const viewport = mountTranscript([{ messageId: "reply", blocks: ["Selected passage."] }]);
+  function mountQuoteStream(
+    messages: TranscriptMessage[] = [{ messageId: "reply", blocks: ["Selected passage."] }],
+  ) {
+    const viewport = mountTranscript(messages);
     const stream = document.createElement("div");
     stream.style.display = "contents";
     viewport.replaceWith(stream);
@@ -153,6 +158,12 @@ describe("assistant selection quote", () => {
     viewport.append(spacer);
     const message = fixtureElement(viewport, '[data-paseo-markdown-tag="p"]');
     return { streamRef: { current: stream }, viewport, message };
+  }
+
+  function expectSelectionDismissed() {
+    expect(window.getSelection()?.rangeCount).toBe(0);
+    expect(screen.queryByTestId("assistant-selection-quote")).toBeNull();
+    expect(screen.queryByTestId("assistant-selection-context-menu")).toBeNull();
   }
 
   it("settles a cancelled touch selection and hides offscreen or unmounted anchors", async () => {
@@ -210,6 +221,165 @@ describe("assistant selection quote", () => {
     await screen.findByTestId("assistant-selection-context-menu-subagent");
     expect(screen.queryByTestId("assistant-selection-context-menu-quote")).toBeNull();
     expect(onQuote).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { language: "en", mode: undefined, label: "New subagent" },
+    { language: "en", mode: "sibling", label: "New sibling subagent" },
+    { language: "zh-CN", mode: "child", label: "新建子会话" },
+    { language: "zh-CN", mode: "sibling", label: "新建同级会话" },
+  ] as const)(
+    "spawns from either action with the $language label $label",
+    async ({ language, mode, label }) => {
+      const { streamRef, message } = mountQuoteStream();
+      const onSpawnSubagentFromSelection = vi.fn();
+      await i18n.changeLanguage(language);
+      render(
+        createElement(AssistantSelectionQuote, {
+          streamRef,
+          subagentSpawnMode: mode,
+          onSpawnSubagentFromSelection,
+        }),
+      );
+
+      selectText(message, 0, 8);
+      const pillAction = await screen.findByTestId("assistant-selection-spawn-subagent");
+      expect(pillAction.textContent).toBe(label);
+      fireEvent.click(pillAction);
+      expect(onSpawnSubagentFromSelection).toHaveBeenCalledExactlyOnceWith("Selected", {
+        messageRowId: "reply",
+      });
+      expectSelectionDismissed();
+
+      selectText(message, 0, 8);
+      fireEvent.contextMenu(message, { clientX: 15, clientY: 15 });
+      const menuAction = await screen.findByTestId("assistant-selection-context-menu-subagent");
+      expect(menuAction.textContent).toBe(label);
+      fireEvent.click(menuAction);
+      expect(onSpawnSubagentFromSelection).toHaveBeenCalledTimes(2);
+      expect(onSpawnSubagentFromSelection).toHaveBeenNthCalledWith(2, "Selected", {
+        messageRowId: "reply",
+      });
+      expectSelectionDismissed();
+    },
+  );
+
+  it("spawns from the pill or menu across multiple block rows of one message", async () => {
+    const { streamRef, viewport, message } = mountQuoteStream([
+      { messageId: "reply", blocks: ["Selected", "passage."] },
+    ]);
+    const lastBlock = fixtureElement(viewport, '[data-paseo-markdown-tag="p"]', 1);
+    const onSpawnSubagentFromSelection = vi.fn();
+    render(createElement(AssistantSelectionQuote, { streamRef, onSpawnSubagentFromSelection }));
+
+    selectRange(message, 0, lastBlock, 7);
+    fireEvent.click(await screen.findByTestId("assistant-selection-spawn-subagent"));
+    expect(onSpawnSubagentFromSelection).toHaveBeenCalledExactlyOnceWith("Selected\n\npassage", {
+      messageRowId: "reply",
+    });
+    expectSelectionDismissed();
+
+    selectRange(message, 0, lastBlock, 7);
+    fireEvent.contextMenu(lastBlock, { clientX: 15, clientY: 30 });
+    fireEvent.click(await screen.findByTestId("assistant-selection-context-menu-subagent"));
+    expect(onSpawnSubagentFromSelection).toHaveBeenCalledTimes(2);
+    expect(onSpawnSubagentFromSelection).toHaveBeenNthCalledWith(2, "Selected\n\npassage", {
+      messageRowId: "reply",
+    });
+    expectSelectionDismissed();
+  });
+
+  it("spawns with the original selection after the context menu restores focus", async () => {
+    const { streamRef, viewport, message } = mountQuoteStream([
+      { messageId: "reply", blocks: ["Selected passage."] },
+      { messageId: "other-reply", blocks: ["Other passage."] },
+    ]);
+    const otherMessage = fixtureElement(viewport, '[data-paseo-markdown-tag="p"]', 1);
+    const originalPane = document.createElement("button");
+    const newPane = document.createElement("button");
+    document.body.append(originalPane, newPane);
+    originalPane.focus();
+    const onSpawnSubagentFromSelection = vi.fn(() => {
+      expectSelectionDismissed();
+      expect(document.activeElement).toBe(originalPane);
+      newPane.focus();
+    });
+    render(createElement(AssistantSelectionQuote, { streamRef, onSpawnSubagentFromSelection }));
+
+    selectText(message, 0, 8);
+    fireEvent.contextMenu(message, { clientX: 15, clientY: 15 });
+    const menuAction = page.getByTestId("assistant-selection-context-menu-subagent");
+    await expect.element(menuAction).toHaveFocus();
+    selectText(otherMessage, 0, 5);
+    await userEvent.click(menuAction);
+
+    expect(onSpawnSubagentFromSelection).toHaveBeenCalledExactlyOnceWith("Selected", {
+      messageRowId: "reply",
+    });
+    expect(document.activeElement).toBe(newPane);
+  });
+
+  it("keeps the floating selection shortcut on the primary quote action", async () => {
+    const { streamRef, message } = mountQuoteStream();
+    const onQuote = vi.fn();
+    const onSpawnSubagentFromSelection = vi.fn();
+    render(
+      createElement(AssistantSelectionQuote, { streamRef, onQuote, onSpawnSubagentFromSelection }),
+    );
+
+    selectText(message, 0, 8);
+    await screen.findByTestId("assistant-selection-spawn-subagent");
+    await userEvent.keyboard("{Enter}");
+
+    expect(onQuote).toHaveBeenCalledExactlyOnceWith({ quote: "Selected" });
+    expect(onSpawnSubagentFromSelection).not.toHaveBeenCalled();
+    expectSelectionDismissed();
+  });
+
+  it.each(["callback removal", "unmount"] as const)(
+    "cancels the pending menu action on %s",
+    async (change) => {
+      const { streamRef, message } = mountQuoteStream();
+      const onSpawnSubagentFromSelection = vi.fn();
+      const { rerender, unmount } = render(
+        createElement(AssistantSelectionQuote, { streamRef, onSpawnSubagentFromSelection }),
+      );
+
+      selectText(message, 0, 8);
+      fireEvent.contextMenu(message, { clientX: 15, clientY: 15 });
+      const menuAction = await screen.findByTestId("assistant-selection-context-menu-subagent");
+
+      // Apply the availability change in the same update that closes the menu.
+      act(() => {
+        fireEvent.click(menuAction);
+        if (change === "unmount") {
+          unmount();
+        } else {
+          rerender(createElement(AssistantSelectionQuote, { streamRef }));
+        }
+      });
+
+      expect(onSpawnSubagentFromSelection).not.toHaveBeenCalled();
+      expectSelectionDismissed();
+    },
+  );
+
+  it("keeps spawn callbacks single-argument when the message has no row id", async () => {
+    const message = mountFixture();
+    const streamRef = { current: message };
+    const onSpawnSubagentFromSelection = vi.fn();
+    render(createElement(AssistantSelectionQuote, { streamRef, onSpawnSubagentFromSelection }));
+
+    const paragraph = fixtureElement(message, '[data-paseo-markdown-tag="p"]');
+    selectText(paragraph, 0, 6);
+    fireEvent.click(await screen.findByTestId("assistant-selection-spawn-subagent"));
+    expect(onSpawnSubagentFromSelection).toHaveBeenCalledExactlyOnceWith("Prefix");
+
+    selectText(paragraph, 0, 6);
+    fireEvent.contextMenu(paragraph, { clientX: 15, clientY: 15 });
+    fireEvent.click(await screen.findByTestId("assistant-selection-context-menu-subagent"));
+    expect(onSpawnSubagentFromSelection).toHaveBeenCalledTimes(2);
+    expect(onSpawnSubagentFromSelection).toHaveBeenNthCalledWith(2, "Prefix");
   });
 });
 

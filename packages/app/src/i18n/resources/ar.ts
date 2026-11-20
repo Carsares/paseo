@@ -261,6 +261,9 @@ export const ar: TranslationResources = {
     messageCapped: "تم اقتطاع هذه الرسالة ({{bytes}} بايت).",
     quote: {
       action: "اقتباس",
+      quoteInChat: "اقتباس في المحادثة الحالية",
+      newSubagent: "وكيل فرعي جديد",
+      newSibling: "وكيل فرعي جديد على المستوى نفسه",
       noteLabel: "ملاحظة على الاقتباس",
       notePlaceholder: "أضف ملاحظة",
       hint: "Enter يضيف إلى الرسالة · Shift+Enter سطر جديد · Esc للإلغاء",
@@ -413,6 +416,8 @@ export const ar: TranslationResources = {
       copyTurn: "نسخ بدوره",
       copyMessage: "انسخ الرسالة",
       forkMenu: "تفريع الرسالة",
+      forkAsSubagent: "تفريع كوكيل فرعي",
+      forkAsSibling: "تفريع كوكيل فرعي على المستوى نفسه",
       forkInNewTab: "تفريع في تبويب جديد",
       forkInNewWorkspace: "تفريع في مساحة عمل جديدة",
       forkUnavailable: "حدّث المضيف لاستخدام هذا.",

@@ -13,13 +13,15 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 
 export type AssistantForkTarget = "subagent" | "tab" | "workspace";
+export type SubagentForkMode = "child" | "sibling";
+export type SubagentForkAllowance = boolean | SubagentForkMode;
 
 // The stream's completed and in-flight turn footers share the source agent's eligibility.
-export const AllowSubagentForkContext = createContext(false);
+export const AllowSubagentForkContext = createContext<SubagentForkAllowance>(false);
 
 interface AssistantForkMenuProps {
   onFork: (target: AssistantForkTarget) => Promise<void> | void;
-  allowSubagentFork?: boolean;
+  allowSubagentFork?: SubagentForkAllowance;
   testID?: string;
 }
 
@@ -33,9 +35,9 @@ export const AssistantForkMenu = memo(function AssistantForkMenu({
   allowSubagentFork,
   testID = "assistant-fork-menu",
 }: AssistantForkMenuProps) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const streamAllowsSubagentFork = useContext(AllowSubagentForkContext);
-  const showSubagentFork = allowSubagentFork ?? streamAllowsSubagentFork;
+  const effectiveSubagentFork = allowSubagentFork ?? streamAllowsSubagentFork;
   const [isOpen, setIsOpen] = useState(false);
   const [pendingTarget, setPendingTarget] = useState<AssistantForkTarget | null>(null);
   const isLocked = pendingTarget !== null;
@@ -105,7 +107,7 @@ export const AssistantForkMenu = memo(function AssistantForkMenu({
         {tooltipContent}
       </Tooltip>
       <DropdownMenuContent align="start" minWidth={220} side="bottom" testID={`${testID}-content`}>
-        {showSubagentFork ? (
+        {effectiveSubagentFork !== false ? (
           <DropdownMenuItem
             closeOnSelect={false}
             disabled={isLocked && pendingTarget !== "subagent"}
@@ -114,7 +116,9 @@ export const AssistantForkMenu = memo(function AssistantForkMenu({
             status={pendingTarget === "subagent" ? "pending" : undefined}
             testID={`${testID}-subagent`}
           >
-            {i18n.language?.startsWith("zh") ? "分叉为子会话" : "Fork as subagent"}
+            {effectiveSubagentFork === "sibling"
+              ? t("message.actions.forkAsSibling")
+              : t("message.actions.forkAsSubagent")}
           </DropdownMenuItem>
         ) : null}
         <DropdownMenuItem

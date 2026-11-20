@@ -262,6 +262,9 @@ export const ptBR: TranslationResources = {
     messageCapped: "Esta mensagem foi truncada ({{bytes}} bytes).",
     quote: {
       action: "Citar",
+      quoteInChat: "Citar na conversa atual",
+      newSubagent: "Novo subagente",
+      newSibling: "Novo subagente do mesmo nível",
       noteLabel: "Nota sobre a citação",
       notePlaceholder: "Adicione uma nota",
       hint: "Enter adiciona à mensagem · Shift+Enter nova linha · Esc cancela",
@@ -417,6 +420,8 @@ export const ptBR: TranslationResources = {
       copyTurn: "Copiar turno",
       copyMessage: "Copiar mensagem",
       forkMenu: "Bifurcar mensagem",
+      forkAsSubagent: "Bifurcar como subagente",
+      forkAsSibling: "Bifurcar como subagente do mesmo nível",
       forkInNewTab: "Bifurcar em uma nova aba",
       forkInNewWorkspace: "Bifurcar em um novo workspace",
       forkUnavailable: "Atualize o host para usar isto.",

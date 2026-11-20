@@ -1,6 +1,8 @@
 /** @vitest-environment jsdom */
 import { act, fireEvent, render, renderHook, screen } from "@testing-library/react";
+import { createInstance } from "i18next";
 import { createElement, createRef } from "react";
+import { I18nextProvider } from "react-i18next";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
   getOpenAgentTabLabel,
@@ -22,6 +24,7 @@ import { useHostRuntimeClient } from "@/runtime/host-runtime";
 import { AllowSubagentForkContext, AssistantForkMenu } from "@/components/assistant-fork-menu";
 import { buildSubagentDraftSetup } from "@/hooks/use-fork-agent";
 import { DEFAULT_OPEN_IN_SIDE_PANE_PREFERENCES } from "@/hooks/use-settings/storage";
+import { en } from "@/i18n/resources/en";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
 import { useSessionStore, type Agent } from "@/stores/session-store";
 import { WorkspaceLayoutPersistedStateSchema } from "@/stores/workspace-layout-storage";
@@ -790,35 +793,54 @@ describe("workspace tab lifecycle", () => {
   });
 });
 
+async function createEnglishI18n() {
+  const i18n = createInstance();
+  await i18n.init({ lng: "en", resources: { en: { translation: en } } });
+  return i18n;
+}
+
 describe("AssistantForkMenu depth gating", () => {
-  test("shows Fork as subagent first only when AllowSubagentForkContext is true", () => {
+  test.each([
+    { allowance: "child" as const, label: "Fork as subagent" },
+    { allowance: true, label: "Fork as subagent" },
+    { allowance: "sibling" as const, label: "Fork as sibling subagent" },
+  ])("shows $label first when the allowance is $allowance", async ({ allowance, label }) => {
+    const i18n = await createEnglishI18n();
     const onFork = vi.fn();
     const { unmount } = render(
       createElement(
-        AllowSubagentForkContext.Provider,
-        { value: true },
-        createElement(AssistantForkMenu, { onFork, testID: "fork-allowed" }),
+        I18nextProvider,
+        { i18n },
+        createElement(
+          AllowSubagentForkContext.Provider,
+          { value: allowance },
+          createElement(AssistantForkMenu, { onFork, testID: "fork-allowed" }),
+        ),
       ),
     );
     fireEvent.click(screen.getByTestId("fork-allowed-trigger"));
-    const items = screen.getAllByRole("menuitem");
-    expect(items[0]).toBe(screen.getByTestId("fork-allowed-subagent"));
-    fireEvent.click(screen.getByTestId("fork-allowed-subagent"));
+    const subagentItem = screen.getByRole("menuitem", { name: label });
+    expect(screen.getAllByRole("menuitem")[0]).toBe(subagentItem);
+    await act(async () => {
+      fireEvent.click(subagentItem);
+    });
     expect(onFork).toHaveBeenCalledExactlyOnceWith("subagent");
     unmount();
+  });
 
-    const { unmount: unmountHidden } = render(
+  test("hides the subagent item when the allowance is false", () => {
+    const { unmount } = render(
       createElement(
         AllowSubagentForkContext.Provider,
         { value: false },
-        createElement(AssistantForkMenu, { onFork, testID: "fork-hidden" }),
+        createElement(AssistantForkMenu, { onFork: vi.fn(), testID: "fork-hidden" }),
       ),
     );
     fireEvent.click(screen.getByTestId("fork-hidden-trigger"));
     expect(screen.queryByTestId("fork-hidden-subagent")).toBeNull();
     expect(screen.getByTestId("fork-hidden-new-tab")).toBeTruthy();
     expect(screen.getByTestId("fork-hidden-new-workspace")).toBeTruthy();
-    unmountHidden();
+    unmount();
   });
 });
 
@@ -863,6 +885,60 @@ describe("selection right click menu", () => {
     expect(screen.queryByTestId("assistant-selection-context-menu")).toBeNull();
     selection.removeAllRanges();
     unmount();
+  });
+
+  test.each([
+    { mode: "child" as const, label: "New subagent" },
+    { mode: "sibling" as const, label: "New sibling subagent" },
+  ])("passes the selected message row in $mode mode", async ({ mode, label }) => {
+    const i18n = await createEnglishI18n();
+    const streamRef = createRef<HTMLDivElement>();
+    const spawn = vi.fn();
+    const { unmount } = render(
+      createElement(
+        I18nextProvider,
+        { i18n },
+        createElement(
+          "div",
+          { ref: streamRef },
+          createElement(
+            "div",
+            { "data-message-id": "assistant-row-1" },
+            createElement("p", { "data-testid": "assistant-message" }, "Investigate this"),
+          ),
+          createElement(AssistantSelectionQuote, {
+            streamRef,
+            subagentSpawnMode: mode,
+            onSpawnSubagentFromSelection: spawn,
+          }),
+        ),
+      ),
+    );
+    const message = screen.getByTestId("assistant-message");
+    const selection = window.getSelection();
+    if (!selection) throw new Error("Expected a browser selection");
+    selection.removeAllRanges();
+    const range = document.createRange();
+    range.selectNodeContents(message);
+    selection.addRange(range);
+
+    try {
+      expect(
+        fireEvent.contextMenu(message, {
+          bubbles: true,
+          cancelable: true,
+          clientX: 30,
+          clientY: 40,
+        }),
+      ).toBe(false);
+      fireEvent.click(screen.getByRole("menuitem", { name: label }));
+      expect(spawn).toHaveBeenCalledExactlyOnceWith("Investigate this", {
+        messageRowId: "assistant-row-1",
+      });
+    } finally {
+      selection.removeAllRanges();
+      unmount();
+    }
   });
 
   test("preserves quote and copy while hiding subagent action at depth limit and dismisses on Escape or outside pointerdown", () => {

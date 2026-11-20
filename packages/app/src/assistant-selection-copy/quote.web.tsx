@@ -43,13 +43,19 @@ import {
   createAssistantSelectionMarkdown,
 } from "./content.web";
 import type { ComposerQuote } from "./composer-quote";
+import type { SelectionSubagentSpawnContext, SelectionSubagentSpawnMode } from "./surface";
 
 type QuoteState = { phase: "idle" } | ({ phase: "offered" } & SelectionPassage);
 interface SelectionPassage {
   range: Range;
   endpoints: readonly [Node, Node];
   quote: string;
+  messageRowId: string | null;
 }
+
+type PendingMenuAction =
+  | { kind: "quote"; quote: string }
+  | { kind: "spawn"; quote: string; messageRowId: string | null };
 
 const IDLE: QuoteState = { phase: "idle" };
 const ANCHOR_OFFSET = 4;
@@ -66,7 +72,11 @@ const copyIcon = <MenuCopyIcon size={ICON_SIZE.sm} uniProps={menuIconColor} />;
 interface AssistantSelectionQuoteProps {
   streamRef: RefObject<HTMLElement | null>;
   onQuote?: (quote: ComposerQuote) => void;
-  onSpawnSubagentFromSelection?: (selectedMarkdown: string) => void;
+  subagentSpawnMode?: SelectionSubagentSpawnMode;
+  onSpawnSubagentFromSelection?: (
+    selectedMarkdown: string,
+    context?: SelectionSubagentSpawnContext,
+  ) => void;
 }
 
 export function AssistantSelectionQuote(props: AssistantSelectionQuoteProps) {
@@ -85,11 +95,14 @@ export function AssistantSelectionQuote(props: AssistantSelectionQuoteProps) {
 function SelectionActions({
   streamRef,
   onQuote,
+  subagentSpawnMode = "child",
   onSpawnSubagentFromSelection,
 }: AssistantSelectionQuoteProps) {
-  const { i18n } = useTranslation();
-  const isChinese = i18n.language?.startsWith("zh");
-  const spawnLabel = isChinese ? "新建子会话" : "New subagent";
+  const { t } = useTranslation();
+  const spawnLabel =
+    subagentSpawnMode === "sibling"
+      ? t("agentStream.quote.newSibling")
+      : t("agentStream.quote.newSubagent");
   const [state, setState] = useState<QuoteState>(IDLE);
   const [menuSelection, setMenuSelection] = useState<
     (SelectionPassage & { clipboard: MarkdownClipboardContent }) | null
@@ -97,25 +110,39 @@ function SelectionActions({
   const stateRef = useRef(state);
   const floatingRef = useRef<HTMLElement | null>(null);
   const { open: menuOpen, setOpen: setMenuOpen, setAnchorRect } = useContextMenu();
-  const pendingMenuQuote = useRef<ComposerQuote | null>(null);
+  const pendingMenuAction = useRef<PendingMenuAction | null>(null);
   const menuOpenRef = useRef(menuOpen);
   menuOpenRef.current = menuOpen;
   const update = useCallback((next: QuoteState) => {
     stateRef.current = next;
     setState(next);
   }, []);
+  const spawnSubagent = useCallback(
+    (quote: string, messageRowId: string | null) => {
+      if (messageRowId === null) {
+        onSpawnSubagentFromSelection?.(quote);
+      } else {
+        onSpawnSubagentFromSelection?.(quote, { messageRowId });
+      }
+    },
+    [onSpawnSubagentFromSelection],
+  );
 
   useEffect(() => {
     if (!menuOpen) setMenuSelection(null);
   }, [menuOpen]);
 
   useLayoutEffect(() => {
-    if (menuOpen || !pendingMenuQuote.current) return;
-    const quote = pendingMenuQuote.current;
-    pendingMenuQuote.current = null;
-    // The menu's unmount restores focus during commit, before the composer takes it.
-    onQuote?.(quote);
-  }, [menuOpen, onQuote]);
+    if (menuOpen || !pendingMenuAction.current) return;
+    const action = pendingMenuAction.current;
+    pendingMenuAction.current = null;
+    // Let the menu restore focus during unmount before the composer or new tab takes it.
+    if (action.kind === "quote") {
+      onQuote?.({ quote: action.quote });
+    } else {
+      spawnSubagent(action.quote, action.messageRowId);
+    }
+  }, [menuOpen, onQuote, spawnSubagent]);
 
   useEffect(() => {
     let pointerDown = false;
@@ -201,13 +228,19 @@ function SelectionActions({
 
   const dismiss = useCallback(() => update(IDLE), [update]);
   const spawnSubagentFromMenu = useCallback(() => {
-    if (!menuSelection) return;
+    if (!onSpawnSubagentFromSelection || !menuSelection) return;
+    pendingMenuAction.current = {
+      kind: "spawn",
+      quote: menuSelection.quote,
+      messageRowId: menuSelection.messageRowId,
+    };
+    setMenuOpen(false);
     dismiss();
-    onSpawnSubagentFromSelection?.(menuSelection.quote);
-  }, [dismiss, menuSelection, onSpawnSubagentFromSelection]);
+    window.getSelection()?.removeAllRanges();
+  }, [dismiss, menuSelection, onSpawnSubagentFromSelection, setMenuOpen]);
   const quoteFromMenu = useCallback(() => {
     if (!onQuote || !menuSelection) return;
-    pendingMenuQuote.current = { quote: menuSelection.quote };
+    pendingMenuAction.current = { kind: "quote", quote: menuSelection.quote };
     setMenuOpen(false);
     dismiss();
     window.getSelection()?.removeAllRanges();
@@ -219,10 +252,11 @@ function SelectionActions({
   }, [dismiss, menuSelection]);
   const spawnSubagentFromPill = useCallback(() => {
     const current = stateRef.current;
-    if (current.phase !== "offered") return;
+    if (!onSpawnSubagentFromSelection || current.phase !== "offered") return;
+    window.getSelection()?.removeAllRanges();
     dismiss();
-    onSpawnSubagentFromSelection?.(current.quote);
-  }, [dismiss, onSpawnSubagentFromSelection]);
+    spawnSubagent(current.quote, current.messageRowId);
+  }, [dismiss, onSpawnSubagentFromSelection, spawnSubagent]);
   const quoteFromPill = useCallback(() => {
     const current = stateRef.current;
     if (!onQuote || current.phase !== "offered") return;
@@ -249,7 +283,7 @@ function SelectionActions({
             testID={`${SELECTION_MENU_ID}-quote`}
             onSelect={quoteFromMenu}
           >
-            {isChinese ? "引用到当前会话" : "Quote in chat"}
+            {t("agentStream.quote.quoteInChat")}
           </ContextMenuItem>
         ) : null}
         {onSpawnSubagentFromSelection || onQuote ? <ContextMenuSeparator /> : null}
@@ -258,7 +292,7 @@ function SelectionActions({
           testID={`${SELECTION_MENU_ID}-copy`}
           onSelect={copyFromMenu}
         >
-          {isChinese ? "复制" : "Copy"}
+          {t("common.actions.copy")}
         </ContextMenuItem>
       </ContextMenuContent>
     );
@@ -289,7 +323,12 @@ function readSelectionPassage(
   const quote = createAssistantSelectionMarkdown(selection);
   // A live Range can retarget to a connected parent when virtualization removes its text.
   const endpoints = [range.startContainer, range.endContainer] as const;
-  return quote ? { range: range.cloneRange(), endpoints, quote } : null;
+  const messageRowId =
+    eventTargetElement(range.startContainer)
+      ?.closest<HTMLElement>("[data-message-id]")
+      ?.getAttribute("data-message-id")
+      ?.trim() || null;
+  return quote ? { range: range.cloneRange(), endpoints, quote, messageRowId } : null;
 }
 
 function eventTargetElement(target: EventTarget | null): Element | null {
@@ -418,8 +457,9 @@ function QuoteButton({
       ) : null}
       {onSpawnSubagent ? (
         <Button
-          variant="secondary"
+          variant="ghost"
           size="sm"
+          leftIcon={GitBranch}
           onPress={onSpawnSubagent}
           testID="assistant-selection-spawn-subagent"
         >

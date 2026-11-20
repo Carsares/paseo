@@ -261,6 +261,9 @@ export const zhCN: TranslationResources = {
     messageCapped: "此消息已被截断（{{bytes}} 字节）。",
     quote: {
       action: "引用",
+      quoteInChat: "引用到当前会话",
+      newSubagent: "新建子会话",
+      newSibling: "新建同级会话",
       noteLabel: "引用备注",
       notePlaceholder: "添加备注",
       hint: "Enter 添加到消息 · Shift+Enter 换行 · Esc 取消",
@@ -413,6 +416,8 @@ export const zhCN: TranslationResources = {
       copyTurn: "复制回合",
       copyMessage: "复制消息",
       forkMenu: "分叉消息",
+      forkAsSubagent: "分叉为子会话",
+      forkAsSibling: "分叉为同级会话",
       forkInNewTab: "分叉到新标签页",
       forkInNewWorkspace: "分叉到新工作区",
       forkUnavailable: "请更新主机以使用此功能。",

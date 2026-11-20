@@ -10,6 +10,7 @@ const DISPLAY_CONTENTS: CSSProperties = { display: "contents" };
 export function AssistantSelectionCopySurface({
   children,
   style,
+  subagentSpawnMode,
   onSpawnSubagentFromSelection,
 }: AssistantSelectionCopySurfaceProps) {
   const surfaceRef = useRef<HTMLDivElement | null>(null);
@@ -32,6 +33,7 @@ export function AssistantSelectionCopySurface({
         <AssistantSelectionQuote
           streamRef={surfaceRef}
           onQuote={composerQuote?.addQuote}
+          subagentSpawnMode={subagentSpawnMode}
           onSpawnSubagentFromSelection={onSpawnSubagentFromSelection}
         />
       ) : null}

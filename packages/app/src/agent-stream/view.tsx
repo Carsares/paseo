@@ -13,6 +13,7 @@ import React, {
   type ReactNode,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useShallow } from "zustand/shallow";
 import {
   View,
   Text,
@@ -28,7 +29,6 @@ import { useMutation } from "@tanstack/react-query";
 import Animated, { FadeIn, FadeOut } from "react-native-reanimated";
 import { Check, ChevronDown, X } from "lucide-react-native";
 import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
-import { openPreferredWorkspaceTarget } from "@/workspace-tabs/open-beside";
 import { AllowSubagentForkContext } from "@/components/assistant-fork-menu";
 import { openExplorerSidebarView } from "@/workspace-tabs/explorer-sidebar";
 import {
@@ -52,10 +52,6 @@ import type {
   AgentPermissionAction,
   AgentPermissionResponse,
 } from "@getpaseo/protocol/agent-types";
-import {
-  getParentAgentIdFromLabels,
-  resolveAgentHierarchyDepth,
-} from "@getpaseo/protocol/agent-labels";
 import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
 import { useSessionStore } from "@/stores/session-store";
 import { useRevealedText } from "@/hooks/use-revealed-text";
@@ -109,8 +105,10 @@ import {
   type BottomAnchorRouteRequest,
 } from "./bottom-anchor-controller";
 import { createAssistantImageOccurrenceKey } from "@/assistant-image/acquisition-cache";
-import { AssistantSelectionCopySurface } from "@/assistant-selection-copy/surface";
-import { appendQuoteToDraft } from "@/assistant-selection-copy/composer-quote";
+import {
+  AssistantSelectionCopySurface,
+  type SelectionSubagentSpawnContext,
+} from "@/assistant-selection-copy/surface";
 import { AssistantFileLinkResolverProvider, createInlinePathOpener } from "@/assistant-file-links";
 import { useOpenOutsideWorkspaceFolder } from "@/workspace/open-in-file-manager/outside-folder";
 import {
@@ -121,14 +119,14 @@ import {
 } from "@/workspace/file-open";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useStableEvent } from "@/hooks/use-stable-event";
-import { buildSubagentDraftSetup, useForkAgent } from "@/hooks/use-fork-agent";
+import { useForkAgent } from "@/hooks/use-fork-agent";
 import { useOptionalPaneContext } from "@/panels/pane-context";
-import { generateDraftId } from "@/stores/draft-keys";
 import { isWeb } from "@/constants/platform";
 import type { Theme } from "@/styles/theme";
 import { recordRenderProfileReasons } from "@/utils/render-profiler";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { useStreamHistoryWindow } from "./use-stream-history-window";
+import { resolveSelectionForkBoundary, resolveSubagentSpawnTarget } from "./turn-boundary";
 import { PluginTimelineItemView, useInstalledTimelineTransform } from "@/plugins/timeline";
 
 function renderLiveAuxiliaryNode(input: {
@@ -353,59 +351,51 @@ function ScrollToBottomButton({
   );
 }
 
-const REMOTE_HIERARCHY_DEPTH_LABEL = "paseo.remote-hierarchy-depth";
-
 function useStreamSubagentActions({
   serverId,
   agentId,
   context,
   toast,
   readOnly,
+  selectionBoundary,
 }: {
   serverId: string;
   agentId: string;
   context: AgentScreenAgent;
   toast?: ToastApi | null;
   readOnly: boolean;
+  selectionBoundary: Omit<Parameters<typeof resolveSelectionForkBoundary>[0], "messageRowId">;
 }) {
   const forkAgent = useForkAgent({ serverId, toast, readOnly });
   const tabId = useOptionalPaneContext()?.tabId;
-  const openInSidePane = useSettings((settings) => settings.openInSidePane);
   const sourceAgentLabels = useSessionStore((state) => {
     const session = state.sessions[serverId];
     return session?.agents.get(agentId)?.labels ?? session?.agentDetails.get(agentId)?.labels;
   });
-  const canSpawnSubagent = useSessionStore((state) => {
-    const session = state.sessions[serverId];
-    if (session?.serverInfo?.features?.agentHierarchyControl !== true) return false;
-    const getAgent = (id: string) => session.agents.get(id) ?? session.agentDetails.get(id);
-    if (getAgent(agentId)?.archivedAt) return false;
-    let remoteParentDepth = 0;
-    const depth = resolveAgentHierarchyDepth(
-      agentId,
-      (id) => {
-        const entry = getAgent(id);
-        const parentId = getParentAgentIdFromLabels(entry?.labels) ?? entry?.parentAgentId;
-        if (parentId && entry?.labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] === "2") {
-          remoteParentDepth = 1;
-        }
-        return parentId;
-      },
-      2,
-    );
-    return depth + remoteParentDepth < 2;
-  });
-  const allowSubagentFork =
-    canSpawnSubagent && !readOnly && Boolean(context.workspaceId && context.provider);
+  const spawnTarget = useSessionStore(
+    useShallow((state) => {
+      if (readOnly || !context.workspaceId || !context.provider) return null;
+      const session = state.sessions[serverId];
+      return resolveSubagentSpawnTarget({
+        agentId,
+        serverId,
+        features: session?.serverInfo?.features,
+        getAgent: (id) => session?.agents.get(id) ?? session?.agentDetails.get(id),
+      });
+    }),
+  );
   const handleForkAssistantTurn: AssistantTurnForkHandler = useStableEvent(
     async ({ target, boundary }) => {
-      if (target === "subagent" && !allowSubagentFork) return;
+      if (target === "subagent" && !spawnTarget) return;
       await forkAgent({
         agentId,
         agent: { ...context, labels: sourceAgentLabels },
         workspaceId: context.workspaceId,
         parentTabId: tabId,
         target,
+        ...(target === "subagent" && spawnTarget
+          ? { parentAgentId: spawnTarget.parentAgentId }
+          : {}),
         boundary,
       });
     },
@@ -416,45 +406,40 @@ function useStreamSubagentActions({
   // fork carries everything up to now, including the response still streaming
   // in front of the user.
   const handleForkInFlightTurn: InFlightTurnForkHandler = useStableEvent(async (target) => {
-    if (target === "subagent" && !allowSubagentFork) return;
+    if (target === "subagent" && !spawnTarget) return;
     await forkAgent({
       agentId,
       agent: { ...context, labels: sourceAgentLabels },
       workspaceId: context.workspaceId,
       parentTabId: tabId,
       target,
+      ...(target === "subagent" && spawnTarget ? { parentAgentId: spawnTarget.parentAgentId } : {}),
     });
   });
-  const handleSpawnSubagentFromSelection = useStableEvent((selectedMarkdown: string) => {
-    const { workspaceId } = context;
-    if (!allowSubagentFork || !workspaceId) return;
-    const setup = buildSubagentDraftSetup({ ...context, labels: sourceAgentLabels }, agentId);
-    if (!setup) return;
-
-    const target = {
-      kind: "draft" as const,
-      draftId: generateDraftId(),
-      setup: {
-        ...setup,
-        initialDraftText: appendQuoteToDraft({ draft: "", quote: selectedMarkdown, note: "" }),
-      },
-    };
-    const openedTabId = openPreferredWorkspaceTarget({
-      workspaceKey: buildWorkspaceTabPersistenceKey({ serverId, workspaceId }),
-      target,
-      source: "subagents",
-      preferences: openInSidePane,
-      parentTabId: tabId,
-    });
-    if (!openedTabId) {
-      navigateToWorkspace({ serverId, workspaceId, target });
-    }
-  });
+  const handleSpawnSubagentFromSelection = useStableEvent(
+    (selectedMarkdown: string, selectionContext?: SelectionSubagentSpawnContext) => {
+      if (!spawnTarget || !context.workspaceId) return;
+      const boundary = resolveSelectionForkBoundary({
+        ...selectionBoundary,
+        messageRowId: selectionContext?.messageRowId,
+      });
+      void forkAgent({
+        agentId,
+        agent: { ...context, labels: sourceAgentLabels },
+        workspaceId: context.workspaceId,
+        parentTabId: tabId,
+        target: "subagent",
+        parentAgentId: spawnTarget.parentAgentId,
+        quoteText: selectedMarkdown,
+        boundary,
+      });
+    },
+  );
   return {
-    allowSubagentFork,
+    spawnTarget,
     handleForkAssistantTurn,
     handleForkInFlightTurn,
-    onSpawnSubagentFromSelection: allowSubagentFork ? handleSpawnSubagentFromSelection : undefined,
+    onSpawnSubagentFromSelection: spawnTarget ? handleSpawnSubagentFromSelection : undefined,
   };
 }
 
@@ -549,12 +534,6 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       state.sessions[resolvedServerId]?.agentStreamHead?.get(agentId),
     );
     const streamHead = providedStreamHead ?? sessionStreamHead;
-    const {
-      allowSubagentFork,
-      handleForkAssistantTurn,
-      handleForkInFlightTurn,
-      onSpawnSubagentFromSelection,
-    } = useStreamSubagentActions({ serverId: resolvedServerId, agentId, context, toast, readOnly });
     const supportsAgentForkContextCursor = useSessionStore(
       (state) =>
         state.sessions[resolvedServerId]?.serverInfo?.features?.agentForkContextCursor === true,
@@ -1094,6 +1073,41 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       ],
     );
 
+    const layoutHistoryItemById = useMemo(() => {
+      const itemById = new Map<string, StreamLayoutItem>();
+      for (const item of streamLayout.history) {
+        itemById.set(item.item.id, item);
+      }
+      return itemById;
+    }, [streamLayout.history]);
+
+    const layoutLiveHeadItemById = useMemo(() => {
+      const itemById = new Map<string, StreamLayoutItem>();
+      for (const item of streamLayout.liveHead) {
+        itemById.set(item.item.id, item);
+      }
+      return itemById;
+    }, [streamLayout.liveHead]);
+
+    const {
+      spawnTarget,
+      handleForkAssistantTurn,
+      handleForkInFlightTurn,
+      onSpawnSubagentFromSelection,
+    } = useStreamSubagentActions({
+      serverId: resolvedServerId,
+      agentId,
+      context,
+      toast,
+      readOnly,
+      selectionBoundary: {
+        isTurnActive,
+        historyItemById: layoutHistoryItemById,
+        liveHeadItemById: layoutLiveHeadItemById,
+        supportsTimelineCursor: supportsAgentForkContextCursor,
+      },
+    });
+    const allowSubagentFork = spawnTarget?.mode ?? false;
     const bottomTurnFooterHost = streamLayout.auxiliaryTurnFooter;
 
     const renderStreamItem = useCallback<RenderStreamItem>(
@@ -1179,22 +1193,6 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     );
 
     const { boundary, auxiliary } = renderModel;
-
-    const layoutHistoryItemById = useMemo(() => {
-      const itemById = new Map<string, StreamLayoutItem>();
-      for (const item of streamLayout.history) {
-        itemById.set(item.item.id, item);
-      }
-      return itemById;
-    }, [streamLayout.history]);
-
-    const layoutLiveHeadItemById = useMemo(() => {
-      const itemById = new Map<string, StreamLayoutItem>();
-      for (const item of streamLayout.liveHead) {
-        itemById.set(item.item.id, item);
-      }
-      return itemById;
-    }, [streamLayout.liveHead]);
 
     const handleReadingPositionChange = useStableEvent((rowId: string | null) => {
       const row =
@@ -1310,6 +1308,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           <AllowSubagentForkContext.Provider value={allowSubagentFork}>
             <AssistantSelectionCopySurface
               style={stylesheet.container}
+              subagentSpawnMode={spawnTarget?.mode}
               onSpawnSubagentFromSelection={onSpawnSubagentFromSelection}
             >
               <MessageOuterSpacingProvider disableOuterSpacing>

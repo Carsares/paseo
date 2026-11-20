@@ -259,6 +259,9 @@ export const en = {
     messageCapped: "This message was capped ({{bytes}} bytes).",
     quote: {
       action: "Quote",
+      quoteInChat: "Quote in chat",
+      newSubagent: "New subagent",
+      newSibling: "New sibling subagent",
       noteLabel: "Note on the quote",
       notePlaceholder: "Add a note",
       hint: "Enter adds to the message · Shift+Enter new line · Esc cancels",
@@ -412,6 +415,8 @@ export const en = {
       copyTurn: "Copy turn",
       copyMessage: "Copy message",
       forkMenu: "Fork chat from here",
+      forkAsSubagent: "Fork as subagent",
+      forkAsSibling: "Fork as sibling subagent",
       forkInNewTab: "Fork in a new tab",
       forkInNewWorkspace: "Fork in a new workspace",
       forkUnavailable: "Update the host to use this.",

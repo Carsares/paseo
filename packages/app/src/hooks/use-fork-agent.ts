@@ -5,7 +5,9 @@ import type {
   DaemonClient,
 } from "@getpaseo/client/internal/daemon-client";
 import { isMainControlAgent, type AgentLabelSource } from "@getpaseo/protocol/agent-labels";
+import { appendQuoteAttachment } from "@/attachments/quote";
 import type { WorkspaceComposerAttachment } from "@/attachments/types";
+import { hasDraftContent } from "@/composer/draft/input-draft-core";
 import type { AssistantForkTarget } from "@/components/assistant-fork-menu";
 import type { ToastApi } from "@/components/toast-host";
 import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
@@ -13,7 +15,9 @@ import { useFormPreferences } from "@/hooks/use-form-preferences";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useSettings, type OpenInSidePanePreferences } from "@/hooks/use-settings";
 import { useHostFeature } from "@/runtime/host-features";
-import { generateDraftId } from "@/stores/draft-keys";
+import { buildDraftStoreKey, generateDraftId } from "@/stores/draft-keys";
+import { useDraftStore } from "@/stores/draft-store";
+import type { DraftRecord } from "@/stores/draft-store/state";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useSessionStore } from "@/stores/session-store";
 import {
@@ -65,6 +69,8 @@ export interface ForkAgentRequest {
   agent: ForkAgentSource & AgentLabelSource;
   workspaceId?: string;
   parentTabId?: string;
+  parentAgentId?: string | null;
+  quoteText?: string;
   target: AssistantForkTarget;
   boundary?: ForkAgentBoundary;
 }
@@ -251,17 +257,84 @@ function resolveForkDraftSetup(input: {
   target: AssistantForkTarget;
   agent: ForkAgentSource & AgentLabelSource;
   agentId: string;
+  parentAgentId?: string | null;
   preferredProvider?: string;
   unavailableMessage: string;
 }): WorkspaceDraftTabSetup | undefined {
   if (input.target !== "subagent") {
     return buildForkDraftSetup(input.agent);
   }
-  const setup = buildSubagentDraftSetup(input.agent, input.agentId, input.preferredProvider);
+  const targetParentId = input.parentAgentId?.trim() || input.agentId;
+  const setup = buildSubagentDraftSetup(input.agent, targetParentId, input.preferredProvider);
   if (!setup) {
     throw new Error(input.unavailableMessage);
   }
   return setup;
+}
+
+function seedForkQuoteDraft(serverId: string, draftId: string, quoteText: string): void {
+  const quotes = appendQuoteAttachment([], quoteText);
+  if (quotes.length === 0) return;
+
+  const draftKey = buildDraftStoreKey({ serverId, agentId: "", draftId });
+  const saveIfEmpty = () => {
+    const { drafts, getDraftInput, saveDraftInput } = useDraftStore.getState();
+    const current = getDraftInput(draftKey);
+    if (drafts[draftKey] && (!current || hasDraftContent(current))) return;
+    saveDraftInput({ draftKey, draft: { text: "", attachments: quotes } });
+  };
+
+  saveIfEmpty();
+  const { hasHydrated, onFinishHydration } = useDraftStore.persist;
+  if (!hasHydrated()) {
+    const seed = useDraftStore.getState().drafts[draftKey];
+    let editedDraft: DraftRecord | undefined;
+    const stopTracking = useDraftStore.subscribe((state, previous) => {
+      const current = state.drafts[draftKey];
+      const before = previous.drafts[draftKey];
+      // The draft's edit and clear actions advance its revision. Hydration can
+      // replace the entire drafts map with a snapshot from before this draft existed.
+      if (before && current?.version === before.version + 1) editedDraft = current;
+    });
+    const unsubscribe = onFinishHydration(() => {
+      unsubscribe();
+      stopTracking();
+      const restored = useDraftStore.getState().drafts[draftKey];
+      const draftToKeep = editedDraft ?? (restored === seed ? seed : undefined);
+      if (!draftToKeep) {
+        saveIfEmpty();
+        return;
+      }
+      // Writes during the storage read can be skipped, even if the seed survived hydration.
+      useDraftStore.setState((state) => ({ drafts: { ...state.drafts, [draftKey]: draftToKeep } }));
+    });
+  }
+}
+
+export async function prepareForkDraft(input: {
+  client: Pick<DaemonClient, "buildAgentForkContext">;
+  serverId: string;
+  agentId: string;
+  boundary?: ForkAgentBoundary;
+  quoteText?: string;
+  missingAttachmentMessage: string;
+}): Promise<string> {
+  const { client, serverId, agentId, boundary, quoteText, missingAttachmentMessage } = input;
+  const draftId = generateDraftId();
+  const payload = await client.buildAgentForkContext(agentId, boundary);
+  const attachment = buildChatHistoryAttachment({
+    draftId,
+    serverId,
+    agentId,
+    payload,
+    missingAttachmentMessage,
+  });
+  useWorkspaceAttachmentsStore.getState().setWorkspaceAttachments({
+    scopeKey: buildDraftWorkspaceAttachmentScopeKey(draftId),
+    attachments: [attachment],
+  });
+  if (quoteText !== undefined) seedForkQuoteDraft(serverId, draftId, quoteText);
+  return draftId;
 }
 
 function openForkDraftInNewWorkspace(input: {
@@ -310,7 +383,9 @@ export function useForkAgent(
   const openInSidePane = useSettings((settings) => settings.openInSidePane);
   const { preferences } = useFormPreferences();
 
-  return useStableEvent(async ({ agentId, agent, workspaceId, parentTabId, target, boundary }) => {
+  return useStableEvent(async (request: ForkAgentRequest) => {
+    const { agentId, agent, workspaceId, parentTabId, parentAgentId, target, boundary, quoteText } =
+      request;
     try {
       const canForkTarget =
         supportsAgentForkContext && (target !== "subagent" || supportsAgentHierarchyControl);
@@ -325,31 +400,25 @@ export function useForkAgent(
         target,
         agent,
         agentId,
+        parentAgentId,
         preferredProvider: preferences.provider,
         unavailableMessage: t("message.actions.forkUnavailable"),
       });
-      const prepareForkDraft = async () => {
-        const draftId = generateDraftId();
-        const payload = await client.buildAgentForkContext(agentId, boundary);
-        const attachment = buildChatHistoryAttachment({
-          draftId,
+      const prepareDraft = () =>
+        prepareForkDraft({
+          client,
           serverId,
           agentId,
-          payload,
+          boundary,
+          quoteText,
           missingAttachmentMessage: t("message.actions.forkFailed"),
         });
-        useWorkspaceAttachmentsStore.getState().setWorkspaceAttachments({
-          scopeKey: buildDraftWorkspaceAttachmentScopeKey(draftId),
-          attachments: [attachment],
-        });
-        return draftId;
-      };
 
       if (target !== "workspace") {
         if (!workspaceId) {
           throw new Error(t("message.actions.forkMissingWorkspace"));
         }
-        const draftId = await prepareForkDraft();
+        const draftId = await prepareDraft();
         openForkDraftInWorkspace({
           serverId,
           workspaceId,
@@ -361,7 +430,7 @@ export function useForkAgent(
         return;
       }
 
-      const draftId = await prepareForkDraft();
+      const draftId = await prepareDraft();
       openForkDraftInNewWorkspace({ router, serverId, draftId, agent, draftSetup });
     } catch (error) {
       toast?.error(toErrorMessage(error) || t("message.actions.forkFailed"));
