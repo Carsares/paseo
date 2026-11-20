@@ -31,20 +31,25 @@ export function useCanMoveSubagentToWorkspace(
   return useSessionStore(selectCanMove);
 }
 
-export function useMoveSubagentToWorkspace(): (address: AgentAddress) => void {
+export function useMoveSubagentToWorkspace(): (address: AgentAddress, workspaceId: string) => void {
   const toast = useToast();
 
   return useCallback(
-    ({ serverId, agentId: subagentId }: AgentAddress) => {
+    ({ serverId, agentId: subagentId }: AgentAddress, workspaceId: string) => {
       void requestMoveSubagentToWorkspace(
-        { serverId, subagentId },
+        { serverId, subagentId, expectedWorkspaceId: workspaceId },
         {
-          moveAgentToWorkspace: async ({ serverId: targetServerId, agentId, idempotencyKey }) => {
+          moveAgentToWorkspace: async ({
+            serverId: targetServerId,
+            agentId,
+            idempotencyKey,
+            expectedWorkspaceId,
+          }) => {
             const client = useSessionStore.getState().sessions[targetServerId]?.client;
             if (!client) {
               throw new DaemonConnectionError(i18n.t("workspaceSetup.errors.hostDisconnected"));
             }
-            return client.moveAgentToWorkspace(agentId, { idempotencyKey });
+            return client.moveAgentToWorkspace(agentId, { idempotencyKey, expectedWorkspaceId });
           },
           openMovedWorkspace: ({
             serverId: targetServerId,

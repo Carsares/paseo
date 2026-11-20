@@ -5,7 +5,12 @@ import { AgentMessageAdmissionError } from "./agent/agent-messages/delivery.js";
 import { AgentDirectory, type BackgroundVisibility } from "./agent/directory.js";
 import { ConnectedHostSession } from "./connected-hosts/index.js";
 import type { ConnectedHosts } from "./connected-hosts/index.js";
-import { createToolHosts } from "./agent/host-operations/index.js";
+import {
+  assertDirectParent,
+  createToolHosts,
+  DirectParentRequiredError,
+  readDirectParentRoute,
+} from "./agent/host-operations/index.js";
 import {
   createWorkspaceBaseBranchService,
   type WorkspaceBaseBranchService,
@@ -111,6 +116,7 @@ import {
   PARENT_AGENT_ID_LABEL,
   PARENT_SERVER_ID_LABEL,
   getParentAgentIdFromLabels,
+  isMainControlAgentLabels,
 } from "@getpaseo/protocol/agent-labels";
 import { applyRecordPatch } from "./record-patch.js";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
@@ -131,7 +137,11 @@ import {
   type WorkspaceLabelService,
 } from "./workspace-labels/index.js";
 
-import { AgentManager, AgentRunCancellationError } from "./agent/agent-manager.js";
+import {
+  AgentManager,
+  AgentRunCancellationError,
+  REMOTE_CHILD_RESERVATION_LABEL,
+} from "./agent/agent-manager.js";
 import { buildTimelinePromptIndex } from "./agent/timeline-prompt-index.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type {
@@ -156,12 +166,12 @@ import {
   archiveAgentCommand,
   cancelAgentRunCommand,
   closeAgentCommand,
-  detachAgentCommand,
   moveAgentToWorkspaceCommand,
   setAgentModeCommand,
   updateAgentCommand,
 } from "./agent/lifecycle-command.js";
 import { buildStoredAgentPayload, toAgentPayload } from "./agent/agent-projections.js";
+import { hasReservedHierarchyLabels } from "./agent/hierarchy-policy.js";
 import {
   assertPluginTimelineDataSize,
   assertPluginTimelineKind,
@@ -1323,7 +1333,16 @@ export class Session {
     });
     this.agentDirectory = new AgentDirectory({
       manager: this.agentManager,
-      storage: this.agentStorage,
+      storage: {
+        get: async (id) => {
+          const snapshots = this.agentManager.getStoredWorkspaceMoveSnapshots();
+          return snapshots.get(id) ?? this.agentStorage.get(id);
+        },
+        listActive: (filter) => this.listWorkspaceMoveVisibleRecords(undefined, filter),
+        listByWorkspaces: (ids, filter) => this.listWorkspaceMoveVisibleRecords(ids, filter),
+        lastUserMessageAtByWorkspace: (ids, filter) =>
+          this.agentStorage.lastUserMessageAtByWorkspace(ids, filter),
+      },
       workspaces: this.workspaceRegistry,
       projectLive: (agent) => this.buildAgentPayload(agent),
       projectStored: (record) => this.buildStoredAgentPayload(record),
@@ -3222,6 +3241,7 @@ export class Session {
           msg.agentId,
           msg.requestId,
           msg.idempotencyKey,
+          msg.expectedWorkspaceId,
         );
       default:
         return undefined;
@@ -3332,7 +3352,13 @@ export class Session {
       case "close_items_request":
         return this.handleCloseItemsRequest(msg);
       case "update_agent_request":
-        return this.handleUpdateAgentRequest(msg.agentId, msg.name, msg.labels, msg.requestId);
+        return this.handleUpdateAgentRequest(
+          msg.agentId,
+          msg.name,
+          msg.labels,
+          msg.requestId,
+          msg.expectedWorkspaceId,
+        );
       case "project.rename.request":
         return this.handleProjectRenameRequest(msg.projectId, msg.customName, msg.requestId);
       case "project.icon.set.request":
@@ -3948,10 +3974,25 @@ export class Session {
     const { agentId, requestId, enabled } = request;
     let workspaceId: string | null = null;
     let failure: string | null = null;
+    let archivedSource: boolean | undefined;
     try {
-      const result = await this.agentManager.setAgentMainControl(agentId, enabled);
+      const result = await this.agentManager.setAgentMainControl(agentId, enabled, {
+        handoffFromAgentId: request.handoffFromAgentId,
+        archiveSource: request.archiveSource,
+        assertNoRemoteChildren: (ids) =>
+          this.assertRemoteDepthCanChange(ids, "hand off Main Control", false),
+        checkReservation: (destination, id) => this.checkRemoteChildReservation(destination, id),
+      });
       workspaceId = result.record.workspaceId ?? null;
-      if (workspaceId) await this.emitWorkspaceUpdateForWorkspaceId(workspaceId);
+      archivedSource = result.archivedSource;
+      if (workspaceId) {
+        await this.emitWorkspaceUpdateForWorkspaceId(workspaceId).catch((error) =>
+          this.sessionLogger.warn(
+            { err: error, agentId },
+            "Failed to publish Main Control workspace update",
+          ),
+        );
+      }
     } catch (error) {
       failure = getErrorMessageOr(error, "Failed to change Main Control");
       this.sessionLogger.warn({ err: error, agentId, requestId }, "Failed to change Main Control");
@@ -3963,6 +4004,7 @@ export class Session {
         agentId,
         enabled,
         workspaceId,
+        ...(archivedSource !== undefined ? { archivedSource } : {}),
         accepted: failure === null,
         error: failure,
       },
@@ -3991,7 +4033,8 @@ export class Session {
                 true,
               )
           : undefined,
-        (localParentIds) => this.assertRemoteDepthCanIncrease(localParentIds),
+        (localParentIds) => this.assertRemoteDepthCanChange(localParentIds),
+        (destination, id) => this.checkRemoteChildReservation(destination, id),
       );
       try {
         if (!result.live) await this.agentUpdates.emitStoredRecord(result.record);
@@ -4031,12 +4074,38 @@ export class Session {
     });
   }
 
-  private async assertRemoteDepthCanIncrease(localParentIds: ReadonlySet<string>): Promise<void> {
+  private async checkRemoteChildReservation(destination: string, id: string): Promise<boolean> {
+    if (!this.connectedHosts) return false;
+    try {
+      return await createToolHosts(this.connectedHosts).use(
+        destination,
+        async (client) => {
+          const result = await client.fetchAgentHistory({
+            filter: {
+              includeArchived: true,
+              includeBackground: true,
+              labels: { [REMOTE_CHILD_RESERVATION_LABEL]: id },
+            },
+            page: { limit: 1 },
+          });
+          return result.entries.length > 0;
+        },
+        AbortSignal.timeout(5_000),
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private async assertRemoteDepthCanChange(
+    localParentIds: ReadonlySet<string>,
+    action = "change this hierarchy's depth",
+    includeArchived = true,
+  ): Promise<void> {
     const serverId = this.serverId;
     if (!this.connectedHosts || !serverId) return;
     const hosts = createToolHosts(this.connectedHosts);
-    const unavailable =
-      "Cannot deepen this hierarchy because a connected host could not be checked.";
+    const unavailable = `Cannot ${action} because a connected host could not be checked.`;
     const { hosts: registered } = await hosts.directory();
     const remoteHosts = registered.filter((host) => host.serverId !== serverId);
     // Completion notifications are optional. An unreachable host can still
@@ -4058,7 +4127,7 @@ export class Session {
                   filter: {
                     includeBackground: true,
                     // The destination can still restore an archived child using its old depth.
-                    includeArchived: true,
+                    includeArchived,
                     labels: {
                       [PARENT_AGENT_ID_LABEL]: parentId,
                       [PARENT_SERVER_ID_LABEL]: serverId,
@@ -4078,10 +4147,10 @@ export class Session {
         }
       }),
     );
-    // A remote child stores its absolute depth. Raising the parent's depth
+    // A remote child stores its absolute depth. Changing the parent's depth
     // here would leave an outdated value at the destination.
     if (results.includes(true)) {
-      throw new Error("Cannot deepen this hierarchy while it has subagents on another host.");
+      throw new Error(`Cannot ${action} while it has subagents on another host.`);
     }
     if (results.includes(null)) throw new Error(unavailable);
   }
@@ -4090,7 +4159,11 @@ export class Session {
     this.sessionLogger.info({ agentId, requestId }, "Detaching agent from parent");
 
     try {
-      const result = await detachAgentCommand({ agentManager: this.agentManager }, agentId);
+      const result = await this.agentManager.detachAgent(
+        agentId,
+        (ids) => this.assertRemoteDepthCanChange(ids, "detach this agent"),
+        (destination, id) => this.checkRemoteChildReservation(destination, id),
+      );
       const affectedWorkspaceIds = new Set<string>();
 
       if (!result.live) {
@@ -4141,6 +4214,7 @@ export class Session {
     agentId: string,
     requestId: string,
     idempotencyKey?: string,
+    expectedWorkspaceId?: string,
   ): Promise<void> {
     if (
       !this.authorization.allowsPermission("workspace.write") ||
@@ -4159,6 +4233,11 @@ export class Session {
     }
     let finishMove: (() => void) | undefined;
     let finishTargetMove: (() => void) | undefined;
+    let protectionRetained = false;
+    const releaseWorkspaceProtection = () => {
+      finishTargetMove?.();
+      finishMove?.();
+    };
     const workspaceId = generateWorkspaceId();
     const journal = new AgentWorkspaceMoveJournal({
       paseoHome: this.paseoHome,
@@ -4171,12 +4250,17 @@ export class Session {
       const result = await this.withWorkspaceMoveQueue(queuedWorkspaceId, () =>
         moveAgentToWorkspaceCommand({ agentManager: this.agentManager }, agentId, {
           idempotencyKey,
+          expectedWorkspaceId,
           serverId: this.serverId,
           getWorktreeRoot: async (cwd) =>
             (await this.workspaceGitService.getCheckout(cwd)).worktreeRoot,
           durable: {
             workspaceId,
             journal,
+            retainWorkspaceProtection: () => {
+              protectionRetained = true;
+              return releaseWorkspaceProtection;
+            },
             publishWorkspace: async (source, persistMembers) => {
               const sourceWorkspace = await this.requireMoveSourceWorkspace(
                 source.sourceWorkspaceId,
@@ -4215,8 +4299,7 @@ export class Session {
             },
           },
         }).finally(() => {
-          finishTargetMove?.();
-          finishMove?.();
+          if (!protectionRetained) releaseWorkspaceProtection();
         }),
       );
       if (!result.replayed) {
@@ -4516,6 +4599,7 @@ export class Session {
     name: string | undefined,
     labels: Record<string, string> | undefined,
     requestId: string,
+    expectedWorkspaceId?: string,
   ): Promise<void> {
     this.sessionLogger.info(
       {
@@ -4528,10 +4612,23 @@ export class Session {
     );
 
     try {
-      const result = await updateAgentCommand(
-        { agentManager: this.agentManager },
-        { agentId, name, labels },
-      );
+      const title = name?.trim();
+      const hasLabels = Boolean(labels && Object.keys(labels).length);
+      const result = await (async () => {
+        if (
+          expectedWorkspaceId === undefined ||
+          hasReservedHierarchyLabels(labels) ||
+          (!title && !hasLabels)
+        ) {
+          return updateAgentCommand({ agentManager: this.agentManager }, { agentId, name, labels });
+        }
+        await this.agentManager.updateAgentMetadata(agentId, {
+          title,
+          labels: hasLabels ? labels : undefined,
+          expectedWorkspaceId,
+        });
+        return { accepted: true, error: null };
+      })();
 
       if (!result.accepted) {
         this.emit({
@@ -4742,6 +4839,7 @@ export class Session {
         for (const { workspaceId } of beforeMoves) {
           for (const move of moves.get(workspaceId) ?? []) pendingMoves.push(move);
         }
+        if (pendingMoves.length > 0) await this.agentManager.recoverPendingWorkspaceMove();
         await Promise.all(pendingMoves);
         activeWorkspaceIds = (await listProjectWorkspaces()).map(({ workspaceId }) => workspaceId);
         if (activeWorkspaceIds.length > 0) {
@@ -5389,6 +5487,18 @@ export class Session {
           hasAgent: Boolean(agentInput),
           hasPrompt: hasInitialCreationPrompt(agentInput),
           exists: this.creationResourceExists,
+          readMainAgent: async (id, workspaceId) => {
+            const record = await this.agentStorage.get(id);
+            if (!record) return null;
+            if (
+              record.archivedAt ||
+              record.workspaceId !== workspaceId ||
+              !isMainControlAgentLabels(record.labels)
+            ) {
+              throw new Error("The saved Main Session does not match this workspace creation.");
+            }
+            return this.buildStoredAgentPayload(record);
+          },
           provision: async (id) => {
             const descriptor = await this.createRequestedWorkspace(
               {
@@ -5410,13 +5520,19 @@ export class Session {
           createMainAgent: mainAgentInput
             ? async (workspace, agentId) => {
                 const config = await resolveAgentCwd(mainAgentInput.config, workspace);
-                const record = await this.agentManager.createSilentWorkspaceMainAgent({
-                  agentId,
-                  config: { ...mainAgentInput.config, cwd: config.cwd },
-                  workspaceId: workspace.id,
-                  background: (await this.workspaceRegistry.get(workspace.id))?.background,
-                });
-                return this.buildStoredAgentPayload(record);
+                const finish = this.reserveWorkspaceMove(workspace.id);
+                try {
+                  const storedWorkspace = await this.requireMoveSourceWorkspace(workspace.id);
+                  const record = await this.agentManager.createSilentWorkspaceMainAgent({
+                    agentId,
+                    config: { ...mainAgentInput.config, cwd: config.cwd },
+                    workspaceId: workspace.id,
+                    background: storedWorkspace.background,
+                  });
+                  return this.buildStoredAgentPayload(record);
+                } finally {
+                  finish();
+                }
               }
             : undefined,
           createAgent: agentInput
@@ -5647,6 +5763,11 @@ export class Session {
           env,
           provisionalTitle,
           firstAgentContext,
+        },
+        {
+          inheritParentWorkspace: Boolean(
+            msg.callerAgentId && !msg.workspaceId && !createdWorktree,
+          ),
         },
       );
       createdAgentId = snapshot.id;
@@ -6498,6 +6619,27 @@ export class Session {
     return this.agentDirectory.list(filter);
   }
 
+  private async listWorkspaceMoveVisibleRecords(
+    workspaceIds?: Iterable<string>,
+    filter?: { includeArchived?: boolean },
+  ): Promise<StoredAgentRecord[]> {
+    const requested = workspaceIds ? new Set(workspaceIds) : undefined;
+    const before = this.agentManager.getStoredWorkspaceMoveSnapshots();
+    const records = requested
+      ? await this.agentStorage.listByWorkspaces(requested, filter)
+      : await this.agentStorage.listActive(filter);
+    const staged = new Map([...this.agentManager.getStoredWorkspaceMoveSnapshots(), ...before]);
+    if (!staged.size) return records;
+    return [
+      ...records.filter(({ id }) => !staged.has(id)),
+      ...[...staged.values()].filter(
+        (record) =>
+          (filter?.includeArchived || !record.archivedAt) &&
+          (!requested || requested.has(record.workspaceId ?? "")),
+      ),
+    ];
+  }
+
   private async resolveAgentIdentifier(
     identifier: string,
   ): Promise<{ ok: true; agentId: string } | { ok: false; notFound: boolean; error: string }> {
@@ -7203,7 +7345,10 @@ export class Session {
     const ids = Array.from(workspaceIds);
     const { archives, moves } = this.workspaceArchiveActivity;
     const pendingMoves = ids.flatMap((id) => (archives.has(id) ? [...(moves.get(id) ?? [])] : []));
-    if (pendingMoves.length > 0) await Promise.all(pendingMoves);
+    if (pendingMoves.length > 0) {
+      await this.agentManager.recoverPendingWorkspaceMove();
+      await Promise.all(pendingMoves);
+    }
     await this.emitWorkspaceUpdatesForWorkspaceIds(ids);
   }
 
@@ -9930,13 +10075,23 @@ export class Session {
         queued = acceptAdmission;
       });
       let deliveryStatus: "queued" | undefined;
+      const directParent = readDirectParentRoute(this.getHostSourceId());
       const send = async (beforeDispatch: () => Promise<void>) => {
         if (msg.sourceAgentId) {
+          const validateDispatch = directParent
+            ? async () => {
+                const stored = await this.agentStorage.get(agentId);
+                const labels = this.agentManager.getAgent(agentId)?.labels ?? stored?.labels;
+                if (!this.serverId) throw new DirectParentRequiredError();
+                assertDirectParent(labels, this.serverId, directParent);
+              }
+            : undefined;
           if (!msg.waitForDispatch) await beforeDispatch();
           const receipt = this.agentMessages.enqueue({
             recipientId: agentId,
             messageId: msg.messageId,
             beforeProviderDispatch: msg.waitForDispatch ? beforeDispatch : undefined,
+            validateDispatch,
             prompt,
             source: sourceAgentEvent
               ? {
@@ -10001,7 +10156,9 @@ export class Session {
             },
             retryIfUnsent:
               msg.waitForDispatch && msg.sourceAgentId
-                ? (error) => error instanceof AgentRunCancellationError
+                ? (error) =>
+                    error instanceof AgentRunCancellationError ||
+                    error instanceof DirectParentRequiredError
                 : undefined,
             retryIfNotAdmitted: (error) =>
               deliveryStatus !== "queued" && error instanceof AgentMessageAdmissionError,

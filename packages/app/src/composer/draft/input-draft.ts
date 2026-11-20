@@ -176,7 +176,7 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
 
   const editText = useCallback(
     (nextText: string) => {
-      if (isWeb) {
+      if (isWeb && isHydrated) {
         if (nextText === textSource.getSnapshot()) {
           textPublication.cancel();
           return;
@@ -186,7 +186,7 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
         useDraftStore.getState().editDraftText({ draftKey, text: nextText });
       }
     },
-    [draftKey, textPublication, textSource],
+    [draftKey, isHydrated, textPublication, textSource],
   );
 
   const replaceText = useCallback(

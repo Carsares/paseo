@@ -22,8 +22,29 @@ const QuoteStateSchema = z.strictObject({
   drafts: z.record(z.string(), QuoteSnapshotSchema),
   createModalDraft: QuoteSnapshotSchema.nullable(),
 });
+// The original single-snapshot shape is also the steady state after a commit.
+const QuoteJournalSchema = QuoteStateSchema.extend({ pending: QuoteStateSchema.optional() });
+
 type QuoteSnapshot = z.infer<typeof QuoteSnapshotSchema>;
 type QuoteState = z.infer<typeof QuoteStateSchema>;
+type QuoteJournal = z.infer<typeof QuoteJournalSchema>;
+
+function matchesRecord(snapshot: QuoteSnapshot | undefined, record: PersistedDraftRecord) {
+  return snapshot?.version === record.version && snapshot?.updatedAt === record.updatedAt;
+}
+
+function findQuoteSnapshot(
+  quotes: QuoteJournal | undefined,
+  record: PersistedDraftRecord,
+  key: string | null,
+): QuoteSnapshot | undefined {
+  const lookup = (state: QuoteState | undefined) =>
+    key === null ? (state?.createModalDraft ?? undefined) : state?.drafts[key];
+  const pending = lookup(quotes?.pending);
+  if (pending && matchesRecord(pending, record)) return pending;
+  const previous = lookup(quotes);
+  return previous && matchesRecord(previous, record) ? previous : undefined;
+}
 
 function getDraftInput(record: PersistedDraftRecord) {
   return "input" in record ? record.input : record;
@@ -59,7 +80,7 @@ export function createQuoteAwareDraftStorage(
   backing: StateStorage,
 ): PersistStorage<PersistedDraftStore> {
   const baseStorage = createValidatedPersistStorage(backing, PersistedDraftStoreSchema);
-  const quoteStorage = createValidatedPersistStorage(backing, QuoteStateSchema);
+  const quoteStorage = createValidatedPersistStorage(backing, QuoteJournalSchema);
   const reading = new Set<string>();
   const quoteKey = (name: string) => `${name}-quotes`;
 
@@ -68,28 +89,61 @@ export function createQuoteAwareDraftStorage(
     value: StorageValue<PersistedDraftStore>,
     migratingInlineQuotes = false,
   ): Promise<void> {
-    const drafts = new Map<string, QuoteSnapshot>();
-    let createModalDraft: QuoteSnapshot | null = null;
+    // A failed read cannot tell us which quotes the current body still needs.
+    const oldQuotes = await quoteStorage.getItem(quoteKey(name));
+    const hasQuotes = [
+      ...Object.values(value.state.drafts ?? {}),
+      value.state.createModalDraft,
+    ].some(
+      (record) =>
+        record && getDraftInput(record).attachments?.some((item) => item.kind === "quote"),
+    );
+    const previousBase =
+      oldQuotes || hasQuotes ? (await baseStorage.getItem(name))?.state : undefined;
+    const previous: QuoteState = { drafts: Object.create(null), createModalDraft: null };
+    const next: QuoteState = { drafts: Object.create(null), createModalDraft: null };
+    if (previousBase) {
+      mapDraftRecords(previousBase, (record, key) => {
+        const snapshot = findQuoteSnapshot(oldQuotes?.state, record, key);
+        if (snapshot) {
+          if (key === null) previous.createModalDraft = snapshot;
+          else previous.drafts[key] = snapshot;
+        }
+        return record;
+      });
+    }
     const state = mapDraftRecords(value.state, (record, key) => {
       const attachments = getDraftInput(record).attachments ?? [];
       const entries = attachments.flatMap((attachment, position) =>
         attachment.kind === "quote" ? [{ position, attachment }] : [],
       );
+      const oldRecord = key === null ? previousBase?.createModalDraft : previousBase?.drafts?.[key];
+      // A deleted and recreated draft can reuse its version in the same millisecond.
+      // Give those records distinct identities so a failed write can't attach the new quotes to the old body.
+      if (
+        oldRecord &&
+        oldRecord.version === record.version &&
+        oldRecord.updatedAt === record.updatedAt &&
+        !getDraftInput(oldRecord).attachments?.some((attachment) => attachment.kind === "quote") &&
+        JSON.stringify(findQuoteSnapshot(oldQuotes?.state, oldRecord, key)?.entries ?? []) !==
+          JSON.stringify(entries)
+      ) {
+        record = { ...record, version: (record.version ?? 0) + 1 };
+      }
       if (!entries.length) return record;
       const snapshot = { updatedAt: record.updatedAt, version: record.version, entries };
-      if (key === null) createModalDraft = snapshot;
-      else drafts.set(key, snapshot);
+      if (key === null) next.createModalDraft = snapshot;
+      else next.drafts[key] = snapshot;
       return withAttachments(
         record,
         attachments.filter((attachment) => attachment.kind !== "quote"),
       );
     });
-    const quotes: QuoteState = { drafts: Object.fromEntries(drafts), createModalDraft };
+    let journalWritten = false;
     try {
-      if (drafts.size || createModalDraft) {
-        await quoteStorage.setItem(quoteKey(name), { state: quotes });
-      } else {
-        await quoteStorage.removeItem(quoteKey(name));
+      if (hasQuotes) {
+        await quoteStorage.setItem(quoteKey(name), { state: { ...previous, pending: next } });
+        journalWritten = true;
       }
     } catch (error) {
       // During migration the base key still holds the only saved copy of the quotes.
@@ -97,6 +151,16 @@ export function createQuoteAwareDraftStorage(
       console.warn("[DraftStore] Failed to persist draft quotes", error);
     }
     await baseStorage.setItem(name, { ...value, state });
+    try {
+      if (journalWritten) {
+        await quoteStorage.setItem(quoteKey(name), { state: next });
+      } else if (!hasQuotes && oldQuotes) {
+        await quoteStorage.removeItem(quoteKey(name));
+      }
+    } catch (error) {
+      // Both versions are still readable if cleanup fails after committing the body.
+      console.warn("[DraftStore] Failed to clean up draft quotes after checkpoint", error);
+    }
   }
 
   return {
@@ -105,7 +169,7 @@ export function createQuoteAwareDraftStorage(
       try {
         const base = await baseStorage.getItem(name);
         if (!base) return null;
-        let quotes: StorageValue<QuoteState> | null = null;
+        let quotes: StorageValue<QuoteJournal> | null = null;
         let couldReadQuotes = true;
         try {
           quotes = await quoteStorage.getItem(quoteKey(name));
@@ -122,16 +186,9 @@ export function createQuoteAwareDraftStorage(
             hasInlineQuotes = true;
             return record;
           }
-          const snapshot =
-            key === null ? quotes?.state.createModalDraft : quotes?.state.drafts[key];
           // An older app can edit or clear this draft while the quotes key is still present.
-          if (
-            !snapshot ||
-            snapshot.version !== record.version ||
-            snapshot.updatedAt !== record.updatedAt
-          ) {
-            return record;
-          }
+          const snapshot = findQuoteSnapshot(quotes?.state, record, key);
+          if (!snapshot) return record;
           const restored = [...attachments];
           for (const { position, attachment } of snapshot.entries)
             restored.splice(position, 0, attachment);

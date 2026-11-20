@@ -2061,39 +2061,82 @@ function readHistoricalCollabAgentResult(item: unknown) {
   } as const;
 }
 
-function applyHistoricalCollabAgentResult(
-  item: unknown,
-  timeline: PersistedTimelineEntry[],
-  subAgentTimelineIndexByThreadId: ReadonlyMap<string, number>,
-  closedSubAgentThreadIds: Set<string>,
-): boolean {
-  const result = readHistoricalCollabAgentResult(item);
-  if (!result) return false;
+interface HistoricalCollabOutcome {
+  tool: "wait" | "closeAgent" | "resumeAgent";
+  childStatus: unknown;
+  timestampMs: number;
+}
+type HistoricalCollabOutcomesByThread = Map<string, HistoricalCollabOutcome[]>;
+type HistoricalSubAgentEvent =
+  | HistoricalCollabOutcome
+  | { kind: CodexSubAgentActivity["kind"]; subAgentType?: string; timestampMs: number };
+
+function historicalOutcomeTime(row: CodexHistoryRow): number {
+  const timestamp =
+    readCodexHistoryTimestamp(row.item) ??
+    normalizeProviderReplayTimestamp(row.completedAt) ??
+    normalizeProviderReplayTimestamp(row.startedAt);
+  return timestamp ? Date.parse(timestamp) : Number.NaN;
+}
+
+function readHistoricalCollabOutcomes(
+  row: CodexHistoryRow,
+): [string, HistoricalCollabOutcome][] | null {
+  const result = readHistoricalCollabAgentResult(row.item);
+  if (!result) return null;
   const { tool, status, receiverThreadIds, agentStates } = result;
-  if (status !== "completed" && (tool !== "wait" || status !== "failed")) return true;
-  if (!Array.isArray(receiverThreadIds)) return true;
+  if (status !== "completed" && (tool !== "wait" || status !== "failed")) return [];
+  if (!Array.isArray(receiverThreadIds)) return [];
+  const timestampMs = historicalOutcomeTime(row);
+  return receiverThreadIds.flatMap((threadId): [string, HistoricalCollabOutcome][] =>
+    typeof threadId === "string"
+      ? [
+          [
+            threadId,
+            { tool, childStatus: toObjectRecord(agentStates?.[threadId])?.status, timestampMs },
+          ],
+        ]
+      : [],
+  );
+}
 
-  // Wait, close, and resume outcomes belong to the original launch card.
-  for (const threadId of receiverThreadIds) {
-    if (typeof threadId !== "string") continue;
-    const index = subAgentTimelineIndexByThreadId.get(threadId);
-    if (index === undefined) continue;
-    const entry = timeline[index];
-    if (entry?.item.type !== "tool_call" || entry.item.detail.type !== "sub_agent") continue;
-
-    const nextStatus = resolveHistoricalCollabAgentStatus(
-      entry.item.status,
-      toObjectRecord(agentStates?.[threadId])?.status,
-      tool,
-    );
-    // A successful close also shuts down open descendants of an already completed child.
-    if (tool === "closeAgent") closedSubAgentThreadIds.add(threadId);
-    else if (tool === "resumeAgent" && nextStatus) closedSubAgentThreadIds.delete(threadId);
-    if (nextStatus) {
-      timeline[index] = { ...entry, item: { ...entry.item, status: nextStatus, error: null } };
-    }
+function applyHistoricalCollabAgentResult(
+  { tool, childStatus }: HistoricalCollabOutcome,
+  threadId: string,
+  timeline: PersistedTimelineEntry[],
+  index: number,
+  closedSubAgentThreadIds: Set<string>,
+): void {
+  const entry = timeline[index];
+  if (entry?.item.type !== "tool_call" || entry.item.detail.type !== "sub_agent") return;
+  const nextStatus = resolveHistoricalCollabAgentStatus(entry.item.status, childStatus, tool);
+  // A successful close also shuts down open descendants of an already completed child.
+  if (tool === "closeAgent") closedSubAgentThreadIds.add(threadId);
+  else if (tool === "resumeAgent" && nextStatus) closedSubAgentThreadIds.delete(threadId);
+  if (nextStatus) {
+    timeline[index] = { ...entry, item: { ...entry.item, status: nextStatus, error: null } };
   }
-  return true;
+}
+
+function mergeHistoricalSubAgentEvents<T extends HistoricalSubAgentEvent>(
+  local: readonly T[],
+  inherited: readonly T[],
+): T[] {
+  // An untimed ancestor outcome still precedes the next timed outcome in its
+  // thread. Without that bound, apply the launch owner's results first.
+  const merged: T[] = [];
+  let ancestor = 0;
+  let timed = 0;
+  for (const event of local) {
+    while (ancestor < inherited.length) {
+      timed = Math.max(timed, ancestor);
+      while (timed < inherited.length && Number.isNaN(inherited[timed].timestampMs)) timed++;
+      if (timed === inherited.length || !(inherited[timed].timestampMs < event.timestampMs)) break;
+      while (ancestor <= timed) merged.push(inherited[ancestor++]);
+    }
+    merged.push(event);
+  }
+  return merged.concat(inherited.slice(ancestor));
 }
 
 function codexImageOutputFromResult(result: unknown): ProviderImageOutput | null {
@@ -2243,6 +2286,7 @@ async function loadCodexThreadHistoryTimeline(params: {
   threadId: string;
   cwd: string | null;
   ancestorCanceled?: boolean;
+  pendingCollabOutcomes: HistoricalCollabOutcomesByThread;
 }): Promise<CodexThreadHistoryProjection> {
   const timeline: PersistedTimelineEntry[] = [];
   const subAgentTimelineIndexByThreadId = new Map<string, number>();
@@ -2276,7 +2320,12 @@ async function loadCodexThreadHistoryTimeline(params: {
 }
 
 async function projectCodexThreadHistory(
-  params: { client: CodexAppServerClientLike; threadId: string; cwd: string | null },
+  params: {
+    client: CodexAppServerClientLike;
+    threadId: string;
+    cwd: string | null;
+    pendingCollabOutcomes: HistoricalCollabOutcomesByThread;
+  },
   projection: {
     timeline: PersistedTimelineEntry[];
     subAgentTimelineIndexByThreadId: Map<string, number>;
@@ -2284,56 +2333,96 @@ async function projectCodexThreadHistory(
   },
 ): Promise<void> {
   const { timeline, subAgentTimelineIndexByThreadId, closedSubAgentThreadIds } = projection;
-  for await (const row of readCodexThreadHistory(params.client, params.threadId)) {
-    const { item } = row;
-    if (
-      applyHistoricalCollabAgentResult(
-        item,
-        timeline,
-        subAgentTimelineIndexByThreadId,
-        closedSubAgentThreadIds,
-      )
-    ) {
-      continue;
+  const { pendingCollabOutcomes } = params;
+  const localEvents = new Map<string, HistoricalSubAgentEvent[]>();
+  function applyEvent(threadId: string, index: number, event: HistoricalSubAgentEvent) {
+    if ("tool" in event) {
+      applyHistoricalCollabAgentResult(event, threadId, timeline, index, closedSubAgentThreadIds);
+    } else {
+      updateHistoricalSubAgentActivity(timeline, index, event.kind, event.subAgentType);
     }
-    const historicalSubAgentActivity = readCodexSubAgentActivity(item);
-    if (historicalSubAgentActivity) {
-      const existingIndex = subAgentTimelineIndexByThreadId.get(
-        historicalSubAgentActivity.agentThreadId,
+  }
+  function recordEvent(threadId: string, event: HistoricalSubAgentEvent) {
+    const events = localEvents.get(threadId);
+    if (events) {
+      events.push(event);
+      return;
+    }
+    const index = subAgentTimelineIndexByThreadId.get(threadId);
+    if (index !== undefined && !pendingCollabOutcomes.has(threadId)) {
+      applyEvent(threadId, index, event);
+    } else {
+      localEvents.set(threadId, [event]);
+    }
+  }
+  function settleEvents() {
+    for (const [threadId, events] of localEvents) {
+      if (subAgentTimelineIndexByThreadId.has(threadId)) continue;
+      const outcomes = events.filter((event) => "tool" in event);
+      pendingCollabOutcomes.set(
+        threadId,
+        mergeHistoricalSubAgentEvents(outcomes, pendingCollabOutcomes.get(threadId) ?? []),
       );
-      if (existingIndex !== undefined) {
-        const activityTimelineItem = await threadItemToTimeline(item, { cwd: params.cwd });
-        updateHistoricalSubAgentActivity(
-          timeline,
-          existingIndex,
-          historicalSubAgentActivity.kind,
-          activityTimelineItem?.type === "tool_call" &&
-            activityTimelineItem.detail.type === "sub_agent"
-            ? activityTimelineItem.detail.subAgentType
-            : undefined,
-        );
+    }
+    for (const [threadId, index] of subAgentTimelineIndexByThreadId) {
+      const inherited = pendingCollabOutcomes.get(threadId);
+      const events = localEvents.get(threadId);
+      if (!inherited && !events) continue;
+      pendingCollabOutcomes.delete(threadId);
+      for (const event of mergeHistoricalSubAgentEvents(events ?? [], inherited ?? [])) {
+        applyEvent(threadId, index, event);
+      }
+    }
+  }
+  try {
+    for await (const row of readCodexThreadHistory(params.client, params.threadId)) {
+      const { item } = row;
+      const collabOutcomes = readHistoricalCollabOutcomes(row);
+      if (collabOutcomes) {
+        for (const [threadId, outcome] of collabOutcomes) recordEvent(threadId, outcome);
         continue;
       }
-    }
-    for (const timelineItem of await threadItemToTimelineEntries(item, { cwd: params.cwd })) {
-      const timestamp =
-        readCodexHistoryTimestamp(item) ?? readCodexHistoryRowTimestamp(row, timelineItem);
-      const settledTimelineItem =
-        historicalSubAgentActivity && timelineItem.type === "tool_call"
-          ? settleHistoricalSubAgentActivity(timelineItem, historicalSubAgentActivity.kind)
-          : timelineItem;
-      timeline.push({
-        // Cap each item as it is projected so a large history is never held uncapped.
-        item: limitAgentTimelineItemContent(settledTimelineItem),
-        timestamp: timestamp ?? undefined,
-        ...(timelineItem.type === "user_message" && row.turnId !== undefined
-          ? { providerTurnId: row.turnId }
-          : {}),
-      });
-      for (const childThreadId of readCodexHistoricalSubAgentThreadIds(item)) {
-        subAgentTimelineIndexByThreadId.set(childThreadId, timeline.length - 1);
+      const historicalSubAgentActivity = readCodexSubAgentActivity(item);
+      if (historicalSubAgentActivity) {
+        const existingIndex = subAgentTimelineIndexByThreadId.get(
+          historicalSubAgentActivity.agentThreadId,
+        );
+        if (existingIndex !== undefined) {
+          const activityTimelineItem = await threadItemToTimeline(item, { cwd: params.cwd });
+          recordEvent(historicalSubAgentActivity.agentThreadId, {
+            kind: historicalSubAgentActivity.kind,
+            timestampMs: historicalOutcomeTime(row),
+            subAgentType:
+              activityTimelineItem?.type === "tool_call" &&
+              activityTimelineItem.detail.type === "sub_agent"
+                ? activityTimelineItem.detail.subAgentType
+                : undefined,
+          });
+          continue;
+        }
+      }
+      for (const timelineItem of await threadItemToTimelineEntries(item, { cwd: params.cwd })) {
+        const timestamp =
+          readCodexHistoryTimestamp(item) ?? readCodexHistoryRowTimestamp(row, timelineItem);
+        const settledTimelineItem =
+          historicalSubAgentActivity && timelineItem.type === "tool_call"
+            ? settleHistoricalSubAgentActivity(timelineItem, historicalSubAgentActivity.kind)
+            : timelineItem;
+        timeline.push({
+          // Cap each item as it is projected so a large history is never held uncapped.
+          item: limitAgentTimelineItemContent(settledTimelineItem),
+          timestamp: timestamp ?? undefined,
+          ...(timelineItem.type === "user_message" && row.turnId !== undefined
+            ? { providerTurnId: row.turnId }
+            : {}),
+        });
+        for (const childThreadId of readCodexHistoricalSubAgentThreadIds(item)) {
+          subAgentTimelineIndexByThreadId.set(childThreadId, timeline.length - 1);
+        }
       }
     }
+  } finally {
+    settleEvents();
   }
 }
 
@@ -4308,10 +4397,12 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!client || !this.currentThreadId) {
       return { timeline: [], providerSubagentEvents: [] };
     }
+    const pendingCollabOutcomes: HistoricalCollabOutcomesByThread = new Map();
     const { timeline, subAgentRoutes } = await loadCodexThreadHistoryTimeline({
       client,
       threadId: this.currentThreadId,
       cwd: this.config.cwd ?? null,
+      pendingCollabOutcomes,
     });
     this.subAgentCallsByCallId.clear();
     this.subAgentCallIdByChildThreadId.clear();
@@ -4319,7 +4410,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     const providerSubagentEvents: AgentStreamEvent[] = [];
     this.historySubagentEvents = providerSubagentEvents;
     try {
-      await this.loadPersistedSubAgentHistories(client, subAgentRoutes);
+      await this.loadPersistedSubAgentHistories(client, subAgentRoutes, pendingCollabOutcomes);
     } finally {
       this.historySubagentEvents = null;
     }
@@ -4346,6 +4437,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private async loadPersistedSubAgentHistories(
     client: CodexAppServerClientLike,
     rootRoutes: readonly PersistedSubAgentRoute[],
+    pendingCollabOutcomes: HistoricalCollabOutcomesByThread,
   ): Promise<void> {
     const queue = rootRoutes.map((route) => ({
       route,
@@ -4374,6 +4466,7 @@ export class CodexAppServerAgentSession implements AgentSession {
           threadId: next.route.childThreadId,
           cwd: this.config.cwd ?? null,
           ancestorCanceled,
+          pendingCollabOutcomes,
         });
         for (const entry of childHistory.timeline) {
           this.emitProviderSubagentTimeline(next.route.childThreadId, entry.item, entry.timestamp);

@@ -121,6 +121,7 @@ export const PiProviderOptionsSchema = z
   .object({
     sessionDir: z.string().min(1).optional(),
     rpcTimeoutMs: z.number().int().positive().default(DEFAULT_PI_RPC_TIMEOUT_MS),
+    mainControlReadOnly: z.boolean().optional(),
     extensionTimeoutMs: z.number().int().positive().default(DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS),
   })
   .strict();
@@ -496,11 +497,13 @@ function buildResumeStartInput(input: {
   launchContext: AgentLaunchContext | undefined;
   mcpConfigFile: PiTempFile | null;
   paseoExtension: PiTempFile | null;
+  mainControlReadOnly?: boolean;
 }): PiStartSessionInput {
   return {
     cwd: input.processCwd,
     env: input.launchContext?.env,
     session: input.sessionFile,
+    ...(input.mainControlReadOnly ? { mainControlReadOnly: true } : {}),
     thinkingOptionId: normalizePiThinkingOption(input.resumeConfig.thinkingOptionId) ?? undefined,
     mcpConfigPath: input.mcpConfigFile?.path,
     extensionPaths: input.paseoExtension ? [input.paseoExtension.path] : undefined,
@@ -2631,6 +2634,7 @@ export class PiRpcAgentClient implements AgentClient {
         model: config.model,
         thinkingOptionId: normalizePiThinkingOption(config.thinkingOptionId) ?? undefined,
         noSession: config.internal === true,
+        mainControlReadOnly: providerOptions.mainControlReadOnly,
         env: launchContext?.env,
         mcpConfigPath: mcpConfigFile?.path,
         extensionPaths: paseoExtension ? [paseoExtension.path] : undefined,
@@ -2715,6 +2719,7 @@ export class PiRpcAgentClient implements AgentClient {
           launchContext,
           mcpConfigFile,
           paseoExtension,
+          mainControlReadOnly: providerOptions.mainControlReadOnly,
         }),
       );
     } catch (error) {

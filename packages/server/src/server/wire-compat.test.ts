@@ -481,6 +481,43 @@ describe("wire compatibility", () => {
     );
   });
 
+  test.each(["canonical", "projected"] as const)(
+    "advances %s pages across a retracted row without skipping a filtered row and the next message",
+    async (projection) => {
+      const timestamp = "2026-05-02T00:00:00.000Z";
+      const rows: AgentTimelineRow[] = [
+        ...[1, 3, 4].map(
+          (seq): AgentTimelineRow => ({
+            seq,
+            timestamp,
+            item: { type: "user_message", text: String(seq) },
+          }),
+        ),
+        { seq: 5, timestamp, item: { type: "notification", level: "info", message: "Hidden" } },
+        { seq: 6, timestamp, item: { type: "user_message", text: "6" } },
+      ];
+      let cursor = { epoch: "epoch-1", seq: 0 };
+      for (const { visible, end } of [
+        { visible: [1], end: 2 },
+        { visible: [3], end: 3 },
+        { visible: [4], end: 4 },
+        { visible: [], end: 5 },
+        { visible: [6], end: 6 },
+      ]) {
+        const { payload } = await emitTimelineResponse({
+          rows,
+          clientCapabilities: { [CLIENT_CAPS.timelineNotifications]: false },
+          request: { direction: "after", cursor, limit: 1, projection },
+        });
+        expect(payload.error).toBeNull();
+        expect(payload.entries.map((entry) => entry.seqEnd)).toEqual(visible);
+        expect(payload.endCursor).toEqual({ epoch: "epoch-1", seq: end });
+        expect(payload.hasNewer).toBe(end < 6);
+        cursor = { epoch: "epoch-1", seq: end };
+      }
+    },
+  );
+
   test("legacy worktree request shape normalizes to the same internal input as the new shape", async () => {
     const workflow = new InMemoryWorktreeWorkflow();
 

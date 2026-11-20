@@ -93,6 +93,11 @@ export class AgentWorkspaceMoveJournal {
     await this.restoreUnpublishedMembers(storage, state);
   }
 
+  async isPublished(workspaceId: string): Promise<boolean> {
+    const { prepared } = await this.read();
+    return prepared?.workspaceId === workspaceId && (await this.wasPublished(prepared));
+  }
+
   private async wasPublished(prepared: PreparedMove): Promise<boolean> {
     return (
       prepared.receiptKeyHash !== undefined &&
@@ -107,13 +112,21 @@ export class AgentWorkspaceMoveJournal {
     if (!prepared) return;
     for (const member of prepared.members.toReversed()) {
       const record = await storage.get(member.id);
-      if (record?.workspaceId !== prepared.workspaceId) continue;
-      await storage.upsert({
-        ...record,
-        workspaceId: prepared.sourceWorkspaceId,
-        labels: member.labels,
-        updatedAt: member.updatedAt,
-      });
+      if (record?.workspaceId === prepared.workspaceId) {
+        await storage.upsert({
+          ...record,
+          workspaceId: prepared.sourceWorkspaceId,
+          labels: member.labels,
+          updatedAt: member.updatedAt,
+        });
+      }
+    }
+    for (const { id } of prepared.members) {
+      if ((await storage.get(id))?.workspaceId !== prepared.sourceWorkspaceId) {
+        throw new Error(
+          `Workspace move recovery did not restore agent ${id} to its source workspace`,
+        );
+      }
     }
     if (prepared.receiptKeyHash === undefined) {
       await this.options.workspaceRegistry.remove(prepared.workspaceId);

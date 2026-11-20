@@ -1591,9 +1591,9 @@ function ResolvedDesktopTabChip({
   const moveSubagentToWorkspace = useMoveSubagentToWorkspace();
   const handleMoveAgentToWorkspace = useCallback(
     (agentId: string) => {
-      moveSubagentToWorkspace({ serverId, agentId });
+      moveSubagentToWorkspace({ serverId, agentId }, workspaceId);
     },
-    [moveSubagentToWorkspace, serverId],
+    [moveSubagentToWorkspace, serverId, workspaceId],
   );
   const resolvedTab = useMemo(
     () =>

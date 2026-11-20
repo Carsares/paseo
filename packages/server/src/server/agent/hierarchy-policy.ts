@@ -223,6 +223,10 @@ export function requiresSingleHopOrchestration(
 
 const MAIN_CONTROL_DISABLED_TOOLS = [
   "archive_workspace",
+  "create_schedule",
+  "update_schedule",
+  "resume_schedule",
+  "run_schedule_once",
   "create_workspace",
   "create_terminal",
   "send_terminal_keys",
@@ -260,6 +264,11 @@ export function resolveInheritedHierarchyMode(
 
 const LEVEL_TWO_DISABLED_TOOLS = [
   "create_agent",
+  "archive_workspace",
+  "create_schedule",
+  "update_schedule",
+  "resume_schedule",
+  "run_schedule_once",
   "send_agent_prompt",
   "update_agent",
   "cancel_agent",
@@ -283,12 +292,25 @@ export function applyHierarchyPaseoToolPolicy(
   };
 }
 
+export function assertMainControlReadOnlyCapability(provider: string): void {
+  if (!["codex", "claude", "opencode", "pi"].includes(provider)) {
+    throw new Error(`Provider '${provider}' does not support enforced read-only Main Control.`);
+  }
+}
+
 export function applyMainControlReadOnlyConfig(
   config: AgentSessionConfig,
   labels: HierarchyAgent["labels"],
   provider = config.provider,
 ): AgentSessionConfig {
   if (!isMainControlAgentLabels(labels)) return config;
+  assertMainControlReadOnlyCapability(provider);
+  if (provider === "pi") {
+    return {
+      ...config,
+      providerOptions: { ...config.providerOptions, mainControlReadOnly: true },
+    };
+  }
   if (provider === "codex") {
     return {
       ...config,

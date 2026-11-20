@@ -26,6 +26,7 @@ export interface PiRuntimeLaunch {
 
 export interface PiStartSessionInput {
   cwd: string;
+  mainControlReadOnly?: boolean;
   signal?: AbortSignal;
   env?: Record<string, string>;
   protocolMode?: "rpc" | "rpc-ui";
@@ -119,6 +120,12 @@ function appendPiLaunchArgs(
   session: PiStartSessionInput,
   protocolMode: "rpc" | "rpc-ui",
 ): void {
+  if (
+    session.mainControlReadOnly &&
+    (argv.includes("--", 1) || session.extraArgs?.includes("--"))
+  ) {
+    throw new Error("Pi Main Control cannot enforce read-only tools after a -- option terminator.");
+  }
   if (!hasModeFlag(argv)) {
     argv.push("--mode", protocolMode);
   }
@@ -141,6 +148,9 @@ function appendPiLaunchArgs(
   }
   for (const extensionPath of session.extensionPaths ?? []) {
     argv.push("--extension", extensionPath);
+  }
+  if (session.mainControlReadOnly) {
+    argv.push("--tools", "read,grep,find,ls");
   }
 }
 

@@ -366,6 +366,7 @@ function useStreamSubagentActions({
   readOnly: boolean;
   selectionBoundary: Omit<Parameters<typeof resolveSelectionForkBoundary>[0], "messageRowId">;
 }) {
+  const { t } = useTranslation();
   const forkAgent = useForkAgent({ serverId, toast, readOnly });
   const tabId = useOptionalPaneContext()?.tabId;
   const sourceAgentLabels = useSessionStore((state) => {
@@ -423,6 +424,14 @@ function useStreamSubagentActions({
         ...selectionBoundary,
         messageRowId: selectionContext?.messageRowId,
       });
+      if (boundary === null) {
+        toast?.error(
+          t("agentStream.quote.reselectToFork", {
+            defaultValue: "The selected reply is unavailable. Select the text again to fork.",
+          }),
+        );
+        return;
+      }
       void forkAgent({
         agentId,
         agent: { ...context, labels: sourceAgentLabels },

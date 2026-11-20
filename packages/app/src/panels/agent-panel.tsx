@@ -48,7 +48,7 @@ import {
   type ComposerQuoteTarget,
 } from "@/assistant-selection-copy/composer-quote";
 import { useToastHost, type ToastApi, type ToastState } from "@/components/toast-host";
-import { appendQuoteAttachment } from "@/attachments/quote";
+import { createQuoteAttachment } from "@/attachments/quote";
 import type { WorkspaceComposerAttachment } from "@/attachments/types";
 import { useWorkspaceAttachmentScopeKey } from "@/attachments/workspace-attachments-store";
 import { COMPACT_CONTENT_WIDTH, useIsCompactFormFactor } from "@/constants/layout";
@@ -1219,7 +1219,8 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
         ? {
             addQuoteAttachment: (quoteText: string) => {
               if (isHandoffInputLocked(serverId, agentId)) return;
-              setAttachments((prev) => appendQuoteAttachment(prev, quoteText));
+              const quote = createQuoteAttachment({ text: quoteText });
+              if (quote.text) setAttachments((prev) => [...prev, quote]);
             },
           }
         : null,

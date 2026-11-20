@@ -249,10 +249,42 @@ describe("resolveSelectionForkBoundary", () => {
     ).toBeUndefined();
   });
 
+  it("rejects the original live reply if it is withdrawn before the menu action runs", () => {
+    const messageRowId = liveMessage.id;
+    expect(
+      resolveSelectionForkBoundary({ ...input, messageRowId, isTurnActive: true }),
+    ).toBeUndefined();
+    const nextReply = assistantMessage("new-live-row", 4, "new-live-message");
+    expect(
+      resolveSelectionForkBoundary({
+        ...input,
+        messageRowId,
+        isTurnActive: true,
+        liveHeadItemById: new Map([
+          [nextReply.id, { item: nextReply, timelineCursor: liveCursor }],
+        ]),
+      }),
+    ).toBeNull();
+  });
+
+  it("rejects a historical row without a safe provider message or timeline boundary", () => {
+    expect(
+      resolveSelectionForkBoundary({
+        ...input,
+        messageRowId: historyMessage.id,
+        historyItemById: new Map([
+          [historyMessage.id, { item: { ...historyMessage, messageId: undefined } }],
+        ]),
+      }),
+    ).toBeNull();
+  });
+
   it.each(["missing-row", "user-row", "", null, undefined])(
-    "leaves the fork unbounded without an assistant row (%s)",
+    "rejects a selection whose original assistant row cannot be resolved (%s)",
     (messageRowId) => {
-      expect(resolveSelectionForkBoundary({ ...input, messageRowId })).toBeUndefined();
+      expect(
+        resolveSelectionForkBoundary({ ...input, messageRowId, isTurnActive: true }),
+      ).toBeNull();
     },
   );
 });

@@ -3,12 +3,14 @@ import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useDraftStore } from "@/stores/draft-store";
+import { flushDraftPersistStorage, useDraftStore } from "@/stores/draft-store";
+import { createQuoteAwareDraftStorage } from "@/stores/draft-store/quote-persistence";
 import type { AttachmentMetadata, ComposerAttachment } from "@/attachments/types";
 import { createWorkspaceFileAttachment } from "@/attachments/workspace-file";
 
-const { asyncStorage } = vi.hoisted(() => ({
+const { asyncStorage, readGate } = vi.hoisted(() => ({
   asyncStorage: new Map<string, string>(),
+  readGate: { quotes: null as Promise<void> | null },
 }));
 
 vi.hoisted(() => {
@@ -17,7 +19,10 @@ vi.hoisted(() => {
 
 vi.mock("@react-native-async-storage/async-storage", () => ({
   default: {
-    getItem: async (key: string) => asyncStorage.get(key) ?? null,
+    getItem: async (key: string) => {
+      if (key === "paseo-drafts-quotes") await readGate.quotes;
+      return asyncStorage.get(key) ?? null;
+    },
     setItem: async (key: string, value: string) => {
       asyncStorage.set(key, value);
     },
@@ -145,7 +150,138 @@ describe("useAgentInputDraft live contract", () => {
       createModalDraft: null,
       attachmentFocusRequestByDraftKey: {},
       textReplacementRequestByDraftKey: {},
+      metadataByDraftKey: {},
     });
+  });
+
+  it("keeps early typing and quote edits while both draft keys finish restoring", async () => {
+    await flushDraftPersistStorage();
+    const backing = {
+      getItem: (name: string) => asyncStorage.get(name) ?? null,
+      setItem: (name: string, value: string) => {
+        asyncStorage.set(name, value);
+      },
+      removeItem: (name: string) => {
+        asyncStorage.delete(name);
+      },
+    };
+    const disk = createQuoteAwareDraftStorage(backing);
+    const oldQuote = { kind: "quote", id: "old", text: "Already on disk" } as const;
+    const newQuote = { kind: "quote", id: "new", text: "Added while loading" } as const;
+    const removedQuote = { ...newQuote, id: "removed" };
+    const record = {
+      input: { text: "Old body", attachments: [oldQuote] },
+      lifecycle: "active" as const,
+      updatedAt: 100,
+      version: 2,
+    };
+    await disk.setItem("paseo-drafts", {
+      state: {
+        drafts: {
+          edited: { ...record },
+          clear: { ...record },
+          untouched: { ...record },
+        },
+      },
+      version: 5,
+    });
+    const gate = Promise.withResolvers<void>();
+    readGate.quotes = gate.promise;
+    const merging = useDraftStore.persist.rehydrate();
+    const editors = new Map<string, ReturnType<typeof useAgentInputDraft>>();
+    function Probe({ draftKey }: { draftKey: string }) {
+      editors.set(draftKey, useAgentInputDraft({ draftKey }));
+      return null;
+    }
+    const root = createTestRoot(document.getElementById("root")!);
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={new QueryClient()}>
+          <Probe draftKey="edited" />
+          <Probe draftKey="clear" />
+        </QueryClientProvider>,
+      );
+    });
+    function editWhileRestoring() {
+      const edited = editors.get("edited")!;
+      expect(edited.isHydrated).toBe(false);
+      edited.editText("New body");
+      edited.setAttachments((attachments) => [...attachments, newQuote, removedQuote]);
+      edited.setAttachments(removeTemporaryQuote);
+      useDraftStore.getState().patchDraftMetadata({ draftKey: "edited", patch: { flag: true } });
+      editors.get("clear")!.clear("abandoned");
+    }
+    function removeTemporaryQuote(
+      attachments: ReturnType<typeof useAgentInputDraft>["attachments"],
+    ) {
+      return attachments.filter(
+        (attachment) => attachment.kind !== "quote" || attachment.id !== removedQuote.id,
+      );
+    }
+    await act(async () => editWhileRestoring());
+    const checkpoint = flushDraftPersistStorage();
+
+    expect(await disk.getItem("paseo-drafts")).toMatchObject({
+      state: { drafts: { edited: record, clear: record, untouched: record } },
+    });
+    await act(async () => {
+      readGate.quotes = null;
+      gate.resolve();
+      await merging;
+    });
+    await checkpoint;
+    const merged = useDraftStore.getState();
+    const expected = { text: "New body", attachments: [oldQuote, newQuote] };
+    expect(merged.getDraftInput("edited")).toEqual(expected);
+    expect(merged.metadataByDraftKey.edited).toEqual({ flag: true });
+    expect(merged.getDraftInput("clear")).toBeUndefined();
+    expect(merged.getDraftInput("untouched")).toEqual(record.input);
+    expect(editors.get("edited")?.textReplacement).toMatchObject({
+      kind: "hydrated",
+      text: "New body",
+    });
+    expect(editors.get("edited")?.attachments).toEqual([oldQuote, newQuote]);
+    expect(editors.get("clear")?.textSource.getSnapshot()).toBe("");
+    const saved = await disk.getItem("paseo-drafts");
+    expect(saved?.state.drafts).toEqual({
+      edited: expect.objectContaining({ input: expected }),
+      clear: expect.objectContaining({
+        input: { text: "", attachments: [] },
+        lifecycle: "abandoned",
+      }),
+      untouched: record,
+    });
+  });
+
+  it("keeps disk drafts intact when only a metadata patch happens during restoration", async () => {
+    await flushDraftPersistStorage();
+    const name = "paseo-drafts";
+    const checkpoint = {
+      state: {
+        drafts: {
+          saved: {
+            input: { text: "Already saved", attachments: [] },
+            lifecycle: "active",
+            updatedAt: 100,
+            version: 1,
+          },
+        },
+        createModalDraft: null,
+      },
+      version: 5,
+    };
+    asyncStorage.set(name, JSON.stringify(checkpoint));
+    const gate = Promise.withResolvers<void>();
+    readGate.quotes = gate.promise;
+    const merging = useDraftStore.persist.rehydrate();
+    useDraftStore.getState().patchDraftMetadata({ draftKey: "saved", patch: { flag: true } });
+    const flushing = flushDraftPersistStorage();
+    readGate.quotes = null;
+    gate.resolve();
+    await merging;
+    await flushing;
+    expect(useDraftStore.getState().metadataByDraftKey.saved).toEqual({ flag: true });
+    expect(JSON.parse(asyncStorage.get(name)!)).toEqual(checkpoint);
   });
 
   it("hydrates persisted text and attachments and returns draft-mode composer state for a caller-provided key", async () => {

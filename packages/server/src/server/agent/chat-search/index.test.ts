@@ -26,6 +26,31 @@ it("returns source locations for formatted assistant text and literal user text"
   });
 });
 
+it("finds phrases across quoted lines without joining quotes and body text", async () => {
+  const source = rows([
+    { type: "user_message", text: "start\r\n\t> alpha\r> beta\nend" },
+    { type: "user_message", text: "> alpha\n\n> beta" },
+  ]);
+  expect((await searchTimeline({ rows: source, query: "alpha beta" })).locations).toEqual([
+    { seq: 1, role: "user", count: 1 },
+  ]);
+  expect((await searchTimeline({ rows: source, query: "beta end" })).locations).toEqual([]);
+  expect((await searchTimeline({ rows: source, query: "start alpha" })).locations).toEqual([]);
+});
+
+it.each(["```", "~~~"])("keeps quote markers literal inside %s fences", async (fence) => {
+  const outerFence = fence + fence[0];
+  const text = [outerFence + "txt", fence, "> alpha", "> beta", outerFence, "> gamma", "> delta"];
+  const source = rows([{ type: "user_message", text: text.join("\n") }]);
+  expect((await searchTimeline({ rows: source, query: "alpha beta" })).locations).toEqual([]);
+  expect((await searchTimeline({ rows: source, query: "alpha > beta" })).locations).toEqual([
+    { seq: 1, role: "user", count: 1 },
+  ]);
+  expect((await searchTimeline({ rows: source, query: "gamma delta" })).locations).toEqual([
+    { seq: 1, role: "user", count: 1 },
+  ]);
+});
+
 it("finds code and literal punctuation without searching tools, reasoning, or task state", async () => {
   const result = await searchTimeline({
     rows: rows([
@@ -41,6 +66,14 @@ it("finds code and literal punctuation without searching tools, reasoning, or ta
     { seq: 1, role: "assistant", count: 1 },
     { seq: 5, role: "user", count: 1 },
   ]);
+});
+
+it("matches literal text across carriage-return line breaks in fences without quotes", async () => {
+  const source = rows([{ type: "user_message", text: "```\r> alpha\r> beta\r```" }]);
+  expect((await searchTimeline({ rows: source, query: "alpha > beta" })).locations).toEqual([
+    { seq: 1, role: "user", count: 1 },
+  ]);
+  expect((await searchTimeline({ rows: source, query: "alpha> beta" })).locations).toEqual([]);
 });
 
 it("bounds results and resumes without losing locations", async () => {

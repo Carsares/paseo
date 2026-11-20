@@ -233,6 +233,36 @@ test("canceling a completion wait leaves queued delivery intact", async () => {
   await expect(receipt.dispatched).resolves.toBe("steered");
 });
 
+test("reparenting rejects only the former parent's queued message before applying its mode", async () => {
+  let parentId = "old-parent";
+  const dispatched: Array<{ messageIds: readonly string[]; sessionMode?: string }> = [];
+  const delivery = createAgentMessageDelivery({
+    dispatch: async (batch) => {
+      dispatched.push(batch);
+      return "steered";
+    },
+    onError: () => {},
+  });
+  const enqueue = (sender: string, sessionMode?: string) =>
+    delivery.enqueue({
+      recipientId: "child",
+      messageId: sender,
+      source: { kind: "agent-message", agentId: sender, serverId: "origin" },
+      prompt: "Continue",
+      sessionMode,
+      validateDispatch: async () => {
+        if (sender !== parentId) throw new Error("Sender is no longer the parent");
+      },
+    });
+  const old = enqueue("old-parent", "plan");
+  parentId = "new-parent";
+  const current = enqueue("new-parent", "full-access");
+  await delivery.close();
+  await expect(old.dispatched).rejects.toThrow("no longer the parent");
+  await expect(current.dispatched).resolves.toBe("steered");
+  expect(dispatched).toMatchObject([{ messageIds: ["new-parent"], sessionMode: "full-access" }]);
+});
+
 test("batches retain each sender's attachment context and image order", async () => {
   let prompt: AgentPromptInput = "";
   const delivery = createAgentMessageDelivery({

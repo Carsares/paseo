@@ -10,7 +10,7 @@ import { readPersistedConfig } from "../../persisted-config.js";
 import { createRestartRecovery } from "./index.js";
 import { createLifecyclePreparation } from "./lifecycle-preparation.js";
 
-test("recovery saves intent before normalization, clears before dispatch, and resumes each agent independently", async () => {
+test("recovery preserves intent until dispatch settles and resumes each agent independently", async () => {
   const root = await mkdtemp(join(tmpdir(), "restart-recovery-"));
   try {
     const storage = new AgentStorage(root, createTestLogger());
@@ -40,7 +40,7 @@ test("recovery saves intent before normalization, clears before dispatch, and re
       settings: () => ({ enabled: true, prompt: "Continue verbatim.\n" }),
       eligible: async () => true,
       dispatch: async (id, prompt) => {
-        expect((await storage.get(id))?.resumeOnStartup).toBe(false);
+        expect((await storage.get(id))?.resumeOnStartup).toBe(true);
         if (id === "broken") throw new Error("unavailable");
         if (id === "stuck") {
           stuckDispatchStarted.resolve();
@@ -59,6 +59,8 @@ test("recovery saves intent before normalization, clears before dispatch, and re
     await recovery.waitForResume("working", running);
     await recovery.waitForResume("idle", running);
     expect(dispatched).toEqual(["workingContinue verbatim.\n"]);
+    expect((await storage.get("working"))?.resumeOnStartup).toBe(false);
+    expect((await storage.get("broken"))?.resumeOnStartup).toBe(true);
     const stopped = new AbortController();
     stopped.abort();
     await expect(recovery.waitForResume("stuck", stopped.signal)).rejects.toBeDefined();
@@ -72,7 +74,7 @@ test("recovery saves intent before normalization, clears before dispatch, and re
       capture: (force) => recovery.captureRunningAgents({ force }),
     });
     await stuckDispatchStarted.promise;
-    expect((await storage.get("stuck"))?.resumeOnStartup).toBe(false);
+    expect((await storage.get("stuck"))?.resumeOnStartup).toBe(true);
     await expect(lifecycle.prepare(true)).rejects.toThrow("startup recovery is still in progress");
     expect(pauseDelivery).not.toHaveBeenCalled();
     releaseStuckDispatch.resolve();
@@ -174,7 +176,7 @@ test("forced capture resumes eligible running agents on only the next startup wi
           return record.id !== "ineligible";
         },
         dispatch: async (id, prompt) => {
-          expect((await storage.get(id))?.resumeOnStartup).toBe(false);
+          expect((await storage.get(id))?.resumeOnStartup).toBe(true);
           dispatched.push({ id, prompt });
         },
         report: () => {},
@@ -220,8 +222,8 @@ test("forced capture resumes eligible running agents on only the next startup wi
     const first = start();
     await first.recovery.prepareStartup();
     first.recovery.resumePending();
-    await expect(readFile(oneShotMarkerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await first.recovery.waitForResume("working", signal);
+    await expect(readFile(oneShotMarkerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     expect(dispatched).toEqual([{ id: "working", prompt: "Continue once.\n" }]);
     expect((await first.storage.get("working"))?.resumeOnStartup).toBe(false);
 
@@ -234,6 +236,91 @@ test("forced capture resumes eligible running agents on only the next startup wi
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test.each([false, true])(
+  "a second startup retains unfinished recovery (graceful stop: %s)",
+  async (gracefulStop) => {
+    const root = await mkdtemp(join(tmpdir(), "restart-recovery-interrupted-"));
+    const releaseDispatch = Promise.withResolvers<void>();
+    const interruptedLoad = Promise.withResolvers<void>();
+    const queuedLoad = Promise.withResolvers<void>();
+    const unfinished = ["interrupted", "queued"];
+    const signal = new AbortController().signal;
+    const start = (dispatch: (id: string) => Promise<void>) => {
+      const storage = new AgentStorage(join(root, "agents"), createTestLogger());
+      const recovery = createRestartRecovery({
+        storage,
+        oneShotMarkerPath: join(root, "restart-recovery-once.json"),
+        settings: () => ({ enabled: false, prompt: "Continue." }),
+        eligible: async ({ id }) => id !== "ineligible",
+        dispatch,
+        report: () => {},
+      });
+      return { storage, recovery };
+    };
+    const markerPath = join(root, "restart-recovery-once.json");
+    const first = start(async (id) => {
+      if (id === "interrupted") {
+        const record = await first.storage.get(id);
+        expect(record?.resumeOnStartup).toBe(true);
+        // Session registration can persist an idle snapshot before sending the prompt.
+        await first.storage.upsert({ ...record!, lastStatus: "idle", resumeOnStartup: false });
+        interruptedLoad.resolve();
+      } else if (id === "queued") {
+        queuedLoad.resolve();
+      }
+      if (unfinished.includes(id)) {
+        await releaseDispatch.promise;
+        throw new Error("Interrupted");
+      }
+    });
+    const waitForUnfinished = (recovery: ReturnType<typeof createRestartRecovery>) =>
+      Promise.all(unfinished.map((id) => recovery.waitForResume(id, signal)));
+    try {
+      for (const id of ["finished", "also-finished", ...unfinished, "ineligible"]) {
+        await first.storage.upsert(
+          parseStoredAgentRecord({
+            id,
+            lastStatus: "closed",
+            resumeOnStartup: true,
+            provider: "codex",
+            cwd: root,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          }),
+        );
+      }
+      await writeFile(markerPath, JSON.stringify({ version: 1 }));
+      await first.recovery.prepareStartup();
+      first.recovery.resumePending();
+      await Promise.all([interruptedLoad.promise, queuedLoad.promise]);
+      await first.recovery.waitForResume("finished", signal);
+      await first.recovery.waitForResume("also-finished", signal);
+      const marker = JSON.parse(await readFile(markerPath, "utf8"));
+      expect(marker.version).toBe(2);
+      expect(marker.agentIds.sort()).toEqual(unfinished);
+      expect((await first.storage.get("interrupted"))?.resumeOnStartup).toBe(false);
+      if (gracefulStop) {
+        releaseDispatch.resolve();
+        await waitForUnfinished(first.recovery);
+        await first.recovery.captureRunningAgents({ force: true });
+      }
+      const dispatchAfterRestart = vi.fn(async (_id: string, _prompt: string) => {});
+      const second = start(dispatchAfterRestart);
+      await second.recovery.prepareStartup();
+      second.recovery.resumePending();
+      await waitForUnfinished(second.recovery);
+      expect(dispatchAfterRestart.mock.calls.sort()).toEqual(
+        unfinished.map((id) => [id, "Continue."]),
+      );
+      await expect(readFile(markerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      releaseDispatch.resolve();
+      await waitForUnfinished(first.recovery);
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("disabled recovery clears a persisted resume flag when the one-shot marker is absent", async () => {
   const root = await mkdtemp(join(tmpdir(), "restart-recovery-no-marker-"));
@@ -268,6 +355,54 @@ test("disabled recovery clears a persisted resume flag when the one-shot marker 
     await recovery.waitForResume("pending", new AbortController().signal);
     expect(dispatched).toEqual([]);
     expect((await startupStorage.get("pending"))?.resumeOnStartup).toBe(false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("does not dispatch a completed one-shot recovery again if clearing its agent flag fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "restart-recovery-flag-write-"));
+  try {
+    const markerPath = join(root, "restart-recovery-once.json");
+    const storage = new AgentStorage(join(root, "agents"), createTestLogger());
+    const dispatch = vi.fn(async () => {});
+    const report = vi.fn();
+    const start = (agentStorage: AgentStorage) =>
+      createRestartRecovery({
+        storage: agentStorage,
+        oneShotMarkerPath: markerPath,
+        settings: () => ({ enabled: false, prompt: "Continue." }),
+        eligible: async () => true,
+        dispatch,
+        report,
+      });
+    await storage.upsert(
+      parseStoredAgentRecord({
+        id: "working",
+        lastStatus: "closed",
+        resumeOnStartup: true,
+        provider: "codex",
+        cwd: root,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }),
+    );
+    await writeFile(markerPath, JSON.stringify({ version: 2, agentIds: ["working"] }));
+    const first = start(storage);
+    await first.prepareStartup();
+    const writeError = new Error("Agent record write failed");
+    vi.spyOn(storage, "upsert").mockRejectedValueOnce(writeError);
+    first.resumePending();
+    const signal = new AbortController().signal;
+    await first.waitForResume("working", signal);
+    expect(report).toHaveBeenCalledExactlyOnceWith("working", writeError);
+    await expect(readFile(markerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+    const second = start(new AgentStorage(join(root, "agents"), createTestLogger()));
+    await second.prepareStartup();
+    second.resumePending();
+    await second.waitForResume("working", signal);
+    expect(dispatch).toHaveBeenCalledExactlyOnceWith("working", "Continue.");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

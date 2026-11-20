@@ -66,6 +66,8 @@ import { tailFile } from "../diagnostics/tail-file.js";
 const DAEMON_LOG_FILENAME = "daemon.log";
 let ownedLaunch: { home: string; instance: DaemonInstance } | null = null;
 let manualUpdateHandoffInProgress = false;
+const daemonUpdateStops = new Set<string>();
+let daemonLaunchesInProgress = 0;
 
 export function isManualUpdateHandoffInProgress(): boolean {
   return manualUpdateHandoffInProgress;
@@ -171,8 +173,9 @@ export function isDesktopManagedDaemonPresentSync(): boolean {
 
 export async function stopDesktopDaemonViaCli(
   reason: DesktopDaemonStopReason = DEFAULT_DESKTOP_DAEMON_STOP_REASON,
+  options?: { includePreviousLaunch?: boolean },
 ): Promise<void> {
-  await stopDesktopDaemon(reason);
+  await stopDesktopDaemon(reason, undefined, options);
 }
 
 function isProcessRunning(pid: number): boolean {
@@ -304,6 +307,20 @@ function assertBuiltInDaemonManagementEnabled(settings: DesktopSettings): void {
   }
 }
 
+async function runDaemonLaunch(
+  launch: () => Promise<DesktopDaemonStatus>,
+): Promise<DesktopDaemonStatus> {
+  if (daemonUpdateStops.has(getPaseoHome())) {
+    throw new Error("The built-in daemon is stopped for an app update.");
+  }
+  daemonLaunchesInProgress++;
+  try {
+    return await launch();
+  } finally {
+    daemonLaunchesInProgress--;
+  }
+}
+
 async function startDaemon(): Promise<DesktopDaemonStatus> {
   assertBuiltInDaemonManagementEnabled(await getDesktopSettingsStore().get());
 
@@ -366,14 +383,58 @@ async function readRecoveryMarkerIdentity(markerPath: string): Promise<string | 
   }
 }
 
-export async function prepareBuiltInDaemonForUpdate(): Promise<AppUpdateShutdown | undefined> {
+export function prepareBuiltInDaemonForUpdate(): Promise<AppUpdateShutdown>;
+export function prepareBuiltInDaemonForUpdate(
+  policy: "stop" | "keep" | "defer",
+): Promise<AppUpdateShutdown | false>;
+export async function prepareBuiltInDaemonForUpdate(
+  policy: "stop" | "keep" | "defer" = "stop",
+): Promise<AppUpdateShutdown | false> {
   const home = getPaseoHome();
-  const instance = await readDaemonInstance(home);
-  if (!instance?.desktopManaged) return undefined;
-  return stopBuiltInDaemonForUpdate(home, instance);
+  return withDaemonUpdateLock(home, async () => {
+    const instance = await readDaemonInstance(home);
+    if (instance?.desktopManaged) {
+      if (policy === "defer") return false;
+      if (policy === "keep") return holdDaemonLaunchForUpdate(home, instance);
+      const shutdown = await captureDaemonUpdateShutdown(home, instance);
+      if (shutdown) return shutdown;
+    }
+    return holdDaemonLaunchForUpdate(home);
+  });
 }
 
-async function stopBuiltInDaemonForUpdate(
+function holdDaemonLaunchForUpdate(home: string, retained?: DaemonInstance): AppUpdateShutdown {
+  return {
+    async beforeHandoff() {
+      const current = await readDaemonInstance(home);
+      if (current?.desktopManaged && (!retained || !isSameDaemonInstance(retained, current))) {
+        throw new Error("A daemon restarted before the update.");
+      }
+    },
+    async restore() {
+      daemonUpdateStops.delete(home);
+    },
+  };
+}
+
+async function withDaemonUpdateLock<T extends AppUpdateShutdown | false>(
+  home: string,
+  prepare: () => Promise<T>,
+): Promise<T> {
+  if (daemonUpdateStops.has(home) || daemonLaunchesInProgress > 0) {
+    throw new Error("The built-in daemon is busy. Retry the update in a moment.");
+  }
+  daemonUpdateStops.add(home);
+  let shutdown: T | undefined;
+  try {
+    shutdown = await prepare();
+    return shutdown;
+  } finally {
+    if (!shutdown) daemonUpdateStops.delete(home);
+  }
+}
+
+async function captureDaemonUpdateShutdown(
   home: string,
   instance: DaemonInstance,
 ): Promise<AppUpdateShutdown | undefined> {
@@ -404,12 +465,25 @@ async function stopBuiltInDaemonForUpdate(
     }),
   );
   let rollbackMarker: Buffer | undefined;
+  async function preserveForNextLaunch(): Promise<void> {
+    if (!rollbackMarker) return;
+    // Another shutdown may have recorded newer intent. Never overwrite it.
+    try {
+      await writeFile(markerPath, rollbackMarker, { flag: "wx" });
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+    }
+  }
   return {
+    preserveForNextLaunch,
     async beforeHandoff() {
       if (markerAfterStop.error) throw markerAfterStop.error;
       if (await readDaemonInstance(home)) throw new Error("A daemon restarted before the update.");
       const marker = markerAfterStop.identity;
-      if (!marker) return;
+      if (!marker) {
+        if (stopped.requestedAgentResume) throw new Error("Daemon recovery record is missing.");
+        return;
+      }
       const contents = await readFile(markerPath);
       if (
         (await readRecoveryMarkerIdentity(markerPath)) !== marker ||
@@ -422,34 +496,42 @@ async function stopBuiltInDaemonForUpdate(
       rollbackMarker = contents;
     },
     async restore() {
-      const running = await readDaemonInstance(home);
-      if (running && !running.desktopManaged) throw new Error("A different daemon is running.");
-      if (!running) {
-        if (rollbackMarker) {
-          // Another shutdown may have recorded newer intent. Never overwrite it.
-          try {
-            await writeFile(markerPath, rollbackMarker, { flag: "wx" });
-          } catch (error) {
-            if (!(error instanceof Error && "code" in error && error.code === "EEXIST"))
-              throw error;
-          }
+      try {
+        const running = await readDaemonInstance(home);
+        if (running && !running.desktopManaged) throw new Error("A different daemon is running.");
+        if (!running) {
+          await preserveForNextLaunch();
+          await launchBuiltInDaemon(home);
         }
-        await launchBuiltInDaemon(home);
-      }
-      const current = await waitForDaemonReady(home, {
-        timeoutMs: 30_000,
-        instance: running ?? undefined,
-      });
-      if (!current.desktopManaged || isSameDaemonInstance(instance, current)) {
-        throw new Error("Replacement built-in daemon was not started.");
+        const current = await waitForDaemonReady(home, {
+          timeoutMs: 30_000,
+          instance: running ?? undefined,
+        });
+        if (!current.desktopManaged || isSameDaemonInstance(instance, current)) {
+          throw new Error("Replacement built-in daemon was not started.");
+        }
+      } finally {
+        daemonUpdateStops.delete(home);
       }
     },
   };
 }
 
+function canStopPreviouslyManagedDaemon(
+  reason: DesktopDaemonStopReason,
+  includePreviousLaunch?: boolean,
+): boolean {
+  return (
+    resumesAgentsOnStop(reason) ||
+    reason === "app_update" ||
+    (reason === "quit" && includePreviousLaunch === true)
+  );
+}
+
 export async function stopDesktopDaemon(
   reason: DesktopDaemonStopReason = DEFAULT_DESKTOP_DAEMON_STOP_REASON,
   confirmedInstance?: { pid: number; startedAt: string },
+  options?: { includePreviousLaunch?: boolean },
 ): Promise<DesktopDaemonStatus> {
   const home = getPaseoHome();
   const instance = await readDaemonInstance(home);
@@ -470,9 +552,13 @@ export async function stopDesktopDaemon(
       "Daemon changed since confirmation; inspect its current home and PID before stopping it.",
     );
   const resumeAgents = resumesAgentsOnStop(reason);
+  const canStopPreviouslyManaged = canStopPreviouslyManagedDaemon(
+    reason,
+    options?.includePreviousLaunch,
+  );
   if (
     !instance ||
-    (!owned && !explicit && !((resumeAgents || reason === "app_update") && instance.desktopManaged))
+    (!owned && !explicit && !(instance.desktopManaged && canStopPreviouslyManaged))
   ) {
     return resolveDesktopDaemonStatus();
   }
@@ -633,7 +719,7 @@ export function createDaemonCommandHandlers(
       if (!instance?.desktopManaged || typeof args?.listen !== "string") return null;
       return readLocalCredentialForTarget(getPaseoHome(), args.listen);
     },
-    start_desktop_daemon: () => startDaemon(),
+    start_desktop_daemon: () => runDaemonLaunch(startDaemon),
     stop_desktop_daemon: (args) =>
       stopDesktopDaemon(
         parseDesktopDaemonStopReason(args),
@@ -641,7 +727,7 @@ export function createDaemonCommandHandlers(
           ? { pid: args.pid, startedAt: args.startedAt }
           : undefined,
       ),
-    restart_desktop_daemon: () => restartDaemon(),
+    restart_desktop_daemon: () => runDaemonLaunch(restartDaemon),
     desktop_daemon_logs: () => getDaemonLogs(),
     desktop_sandbox_diagnostics: () =>
       describeSandbox({
@@ -696,9 +782,12 @@ export function createDaemonCommandHandlers(
             if (isQuitting()) return false;
             ownsHandoff = true;
             manualUpdateHandoffInProgress = true;
-            return instance?.desktopManaged
-              ? stopBuiltInDaemonForUpdate(home, instance)
-              : undefined;
+            return withDaemonUpdateLock(home, async () => {
+              const shutdown = instance?.desktopManaged
+                ? await captureDaemonUpdateShutdown(home, instance)
+                : undefined;
+              return shutdown ?? holdDaemonLaunchForUpdate(home);
+            });
           },
         );
       } finally {

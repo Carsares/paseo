@@ -5,6 +5,7 @@ import {
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,7 @@ import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
 import { createProviderSnapshotManagerStub } from "../test-utils/session-stubs.js";
 import { AgentManager } from "./agent-manager.js";
+import { createAgentMessageDelivery, parseAgentMessages } from "./agent-messages/index.js";
 import type { AgentPromptInput, AgentSessionConfig } from "./agent-sdk-types.js";
 import { AgentStorage } from "./agent-storage.js";
 import { createAgentCommand, registerParentFinishSubscription } from "./create-agent/create.js";
@@ -51,7 +53,7 @@ const worker = child("worker", lead);
 const sibling = child("other-lead", main);
 const root: HierarchyAgent = { id: "ordinary-root" };
 
-it("promotes an adapter without a dynamic system prompt and injects instructions once per activation", async () => {
+it("rejects silent creation, promotion and startup for a provider without read-only enforcement", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "main-control-first-turn-"));
   const provider = "antigravity";
   const providerPrompts: AgentPromptInput[] = [];
@@ -69,34 +71,24 @@ it("promotes an adapter without a dynamic system prompt and injects instructions
     const agent = await manager.createAgent({ provider, cwd }, undefined, {
       workspaceId: "workspace",
     });
-    const run = async (prompt: string) => {
-      for await (const _event of manager.streamAgent(agent.id, prompt, {
-        clientMessageId: prompt,
-      })) {
-        // Drain the turn before admitting another one.
-      }
-    };
-    await manager.setAgentMainControl(agent.id, true);
-    const quoted =
-      "[Workspace Main Control Instructions]\nRole: Workspace Main Control Coordinator.\nDirect Level-1 children: []\n\nQuoted text";
-    await run(quoted);
-    await run("Second");
-    expect(providerPrompts[0]).toEqual(
-      expect.stringMatching(/^\[Workspace Main Control Instructions\]/),
+    await expect(
+      manager.createSilentWorkspaceMainAgent({
+        workspaceId: "workspace",
+        config: { provider, cwd },
+      }),
+    ).rejects.toThrow("does not support enforced read-only Main Control");
+    await expect(manager.setAgentMainControl(agent.id, true)).rejects.toThrow(
+      "does not support enforced read-only Main Control",
     );
-    expect(providerPrompts[0]).toEqual(expect.stringContaining("summarize_workspace_agents"));
-    expect(providerPrompts[1]).toBe("Second");
-    expect(
-      manager
-        .getTimeline(agent.id)
-        .flatMap((item) => (item.type === "user_message" ? [item.text] : [])),
-    ).toEqual([quoted, "Second"]);
-    await manager.setAgentMainControl(agent.id, false);
-    await manager.setAgentMainControl(agent.id, true);
-    await run("Third");
-    expect(providerPrompts[2]).toEqual(
-      expect.stringMatching(/^\[Workspace Main Control Instructions\]/),
-    );
+    expect((await storage.get(agent.id))?.labels).toEqual({});
+    await expect(
+      manager.createAgent({ provider, cwd }, undefined, {
+        workspaceId: "workspace",
+        labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+      }),
+    ).rejects.toThrow("does not support enforced read-only Main Control");
+    await manager.runAgent(agent.id, "Ordinary session");
+    expect(providerPrompts).toEqual(["Ordinary session"]);
   } finally {
     await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
     await rm(cwd, { recursive: true, force: true });
@@ -189,6 +181,10 @@ describe("agent orchestration", () => {
       "custom_tool",
       "create_terminal",
       "archive_workspace",
+      "create_schedule",
+      "update_schedule",
+      "resume_schedule",
+      "run_schedule_once",
       "create_workspace",
       "send_terminal_keys",
       "kill_terminal",
@@ -201,6 +197,11 @@ describe("agent orchestration", () => {
       enabled: false,
       disabledTools: [
         "create_agent",
+        "archive_workspace",
+        "create_schedule",
+        "update_schedule",
+        "resume_schedule",
+        "run_schedule_once",
         "send_agent_prompt",
         "update_agent",
         "cancel_agent",
@@ -398,6 +399,240 @@ it("switches a live workspace's Main Control and restores the previous agent's m
     expect(manager.getPaseoToolPolicy(first.id)).toBeUndefined();
     expect(manager.getAgent(second.id)?.currentModeId).toBe("read-only");
     expect((await storage.get(second.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+  });
+});
+
+it("transfers Main Control children and archives the source under the same operation", async () => {
+  await withAgents(async ({ manager, storage, cwd }) => {
+    const workspaceId = "workspace";
+    const config = { provider: "codex", cwd };
+    const source = await manager.createSilentWorkspaceMainAgent({ config, workspaceId });
+    const replacement = await manager.createAgent(config, undefined, { workspaceId });
+    const childAgent = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: { [PARENT_AGENT_ID_LABEL]: source.id },
+    });
+    await manager.closeAgent(childAgent.id);
+    await expect(
+      manager.setAgentMainControl(replacement.id, true, {
+        handoffFromAgentId: source.id,
+        archiveSource: true,
+        assertNoRemoteChildren: async () => {
+          throw new Error("Connected host unavailable");
+        },
+      }),
+    ).rejects.toThrow("Connected host unavailable");
+    expect((await storage.get(childAgent.id))?.labels[PARENT_AGENT_ID_LABEL]).toBe(source.id);
+    expect((await storage.get(source.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+
+    await expect(
+      manager.setAgentMainControl(replacement.id, true, {
+        handoffFromAgentId: source.id,
+        archiveSource: true,
+      }),
+    ).resolves.toMatchObject({ archivedSource: true });
+    expect(await storage.get(childAgent.id)).toMatchObject({
+      labels: { [PARENT_AGENT_ID_LABEL]: replacement.id },
+    });
+    expect((await storage.get(childAgent.id))?.archivedAt).toBeFalsy();
+    expect((await storage.get(source.id))?.archivedAt).toBeTruthy();
+    expect((await storage.get(replacement.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(
+      WORKSPACE_MAIN_ROLE,
+    );
+  });
+});
+
+it.each(["before archive", "after archive", "during compensation"] as const)(
+  "keeps Main Control handoff consistent when storage fails %s",
+  async (failure) => {
+    await withAgents(async ({ manager, storage, cwd }) => {
+      const workspaceId = "workspace";
+      const config = { provider: "codex", cwd, modeId: "full-access" };
+      const source = await manager.createSilentWorkspaceMainAgent({ config, workspaceId });
+      const target = await manager.createAgent(config, undefined, { workspaceId });
+      const childAgent = await manager.createAgent(config, undefined, {
+        workspaceId,
+        labels: { [PARENT_AGENT_ID_LABEL]: source.id },
+      });
+      await manager.closeAgent(childAgent.id);
+      let archiveAttempted = false;
+      const upsert = storage.upsert.bind(storage);
+      const write = vi.spyOn(storage, "upsert").mockImplementation(async (record) => {
+        if (record.id === source.id && record.archivedAt) {
+          archiveAttempted = true;
+          if (failure === "after archive") await upsert(record);
+          throw new Error("archive write interrupted");
+        }
+        if (record.id === childAgent.id && archiveAttempted && failure === "during compensation") {
+          throw new Error("cannot restore child record");
+        }
+        await upsert(record);
+      });
+      try {
+        await expect(
+          manager.setAgentMainControl(target.id, true, {
+            handoffFromAgentId: source.id,
+            archiveSource: true,
+          }),
+        ).rejects.toThrow(
+          {
+            "before archive": "archive write interrupted",
+            "after archive": "handoff committed, but archive cleanup failed",
+            "during compensation": `Failed to restore parent of ${childAgent.id}: cannot restore child record`,
+          }[failure],
+        );
+      } finally {
+        write.mockRestore();
+      }
+      const committed = failure === "after archive";
+      const storedSource = await storage.get(source.id);
+      expect(Boolean(storedSource?.archivedAt)).toBe(committed);
+      expect(storedSource?.labels[WORKSPACE_ROLE_LABEL]).toBe(
+        committed ? undefined : WORKSPACE_MAIN_ROLE,
+      );
+      expect((await storage.get(target.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(
+        committed ? WORKSPACE_MAIN_ROLE : undefined,
+      );
+      expect(manager.getAgent(target.id)?.currentModeId).toBe(
+        committed ? "read-only" : "full-access",
+      );
+      expect((await storage.get(childAgent.id))?.labels[PARENT_AGENT_ID_LABEL]).toBe(
+        failure === "before archive" ? source.id : target.id,
+      );
+    });
+  },
+);
+
+it("retains an uncertain remote child reservation until the destination confirms it", async () => {
+  await withAgents(async ({ manager, cwd }) => {
+    const workspaceId = "workspace";
+    const config = { provider: "codex", cwd };
+    const source = await manager.createAgent(config, undefined, { workspaceId });
+    const parent = await manager.createAgent(config, undefined, { workspaceId });
+    const reservation = await manager.reserveRemoteChild(source.id, "remote-host");
+    expect(reservation.depth).toBe(1);
+    await expect(manager.setAgentParent(source.id, parent.id)).rejects.toThrow("in progress");
+    reservation.finish("unknown");
+    await expect(manager.setAgentParent(source.id, parent.id)).rejects.toThrow(
+      "outcome is unknown",
+    );
+    const check = vi.fn(async () => true);
+    await expect(
+      manager.setAgentParent(
+        source.id,
+        parent.id,
+        undefined,
+        undefined,
+        async () => {
+          throw new Error("Remote child found");
+        },
+        check,
+      ),
+    ).rejects.toThrow("Remote child found");
+    expect(check).toHaveBeenCalledWith("remote-host", reservation.id);
+  });
+});
+
+it("checks remote children of every affected local descendant before detaching a branch", async () => {
+  await withAgents(async ({ manager, storage, cwd }) => {
+    const options = { workspaceId: "workspace" };
+    const config = { provider: "codex", cwd };
+    const rootAgent = await manager.createAgent(config, undefined, options);
+    const branch = await manager.createAgent(config, undefined, {
+      ...options,
+      labels: { [PARENT_AGENT_ID_LABEL]: rootAgent.id },
+    });
+    const childAgent = await manager.createAgent(config, undefined, {
+      ...options,
+      labels: { [PARENT_AGENT_ID_LABEL]: branch.id },
+    });
+    const checkRemoteDepths = vi.fn(async (ids: ReadonlySet<string>) => {
+      expect(ids).toEqual(new Set([branch.id, childAgent.id]));
+      throw new Error("Cannot detach while a host cannot be checked");
+    });
+    await expect(manager.detachAgent(branch.id, checkRemoteDepths)).rejects.toThrow(
+      "host cannot be checked",
+    );
+    expect(checkRemoteDepths).toHaveBeenCalledOnce();
+    expect((await storage.get(branch.id))?.labels[PARENT_AGENT_ID_LABEL]).toBe(rootAgent.id);
+    expect((await storage.get(childAgent.id))?.labels[PARENT_AGENT_ID_LABEL]).toBe(branch.id);
+
+    const checkShallowerParent = vi.fn(async () => {
+      throw new Error("Cannot check remote depth");
+    });
+    await expect(
+      manager.setAgentParent(
+        childAgent.id,
+        rootAgent.id,
+        undefined,
+        undefined,
+        checkShallowerParent,
+      ),
+    ).rejects.toThrow("Cannot check remote depth");
+    expect(checkShallowerParent).toHaveBeenCalledWith(new Set([childAgent.id]));
+    expect((await storage.get(childAgent.id))?.labels[PARENT_AGENT_ID_LABEL]).toBe(branch.id);
+  });
+});
+
+it("closes an opening child when its parent is being archived", async () => {
+  await withAgents(async ({ manager, storage, cwd, codex }) => {
+    const workspaceId = "workspace";
+    const config = { provider: "codex", cwd };
+    const parent = await manager.createAgent(config, undefined, { workspaceId });
+    let started!: () => void;
+    let finish!: () => void;
+    const opening = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const finishOpening = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const create = codex.createSession.bind(codex);
+    let closeChild: ReturnType<typeof vi.spyOn> | undefined;
+    vi.spyOn(codex, "createSession").mockImplementationOnce(async (...args) => {
+      const session = await create(...args);
+      closeChild = vi.spyOn(session, "close");
+      started();
+      await finishOpening;
+      return session;
+    });
+    const childId = randomUUID();
+    const childAgent = manager.createAgent(config, childId, {
+      workspaceId,
+      labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+    });
+    await Promise.race([opening, childAgent]);
+    const archive = manager.archiveAgent(parent.id);
+    const rejected = expect(childAgent).rejects.toThrow("missing or archived");
+    finish();
+    await Promise.all([archive, rejected]);
+    expect(closeChild).toHaveBeenCalledOnce();
+    expect(await storage.get(childId)).toBeNull();
+  });
+});
+
+it("resolves an inherited workspace after the parent's queued move", async () => {
+  await withAgents(async ({ manager, storage, cwd }) => {
+    const workspaceId = "origin";
+    const config = { provider: "codex", cwd };
+    const rootAgent = await manager.createAgent(config, undefined, { workspaceId });
+    const parent = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: { [PARENT_AGENT_ID_LABEL]: rootAgent.id },
+    });
+    const move = manager.moveSubagentToWorkspace(parent.id, {
+      allocateWorkspace: async () => ({ workspaceId: "destination" }),
+    });
+    const labels = { [PARENT_AGENT_ID_LABEL]: parent.id };
+    const inherited = manager.createAgent(config, undefined, {
+      workspaceId,
+      inheritParentWorkspace: true,
+      labels,
+    });
+    const explicit = manager.createAgent(config, undefined, { workspaceId, labels });
+    const [, inheritedAgent, explicitAgent] = await Promise.all([move, inherited, explicit]);
+    expect((await storage.get(inheritedAgent.id))?.workspaceId).toBe("destination");
+    expect((await storage.get(explicitAgent.id))?.workspaceId).toBe("origin");
   });
 });
 
@@ -1018,16 +1253,39 @@ it("enforces single-hop MCP orchestration, self mode changes, and refreshes poli
       `Level-1 Module Lead (Flexible Mode) under Main Control Agent ${mainAgent.id}`,
     );
 
-    const makeCatalog = (callerAgentId: string) =>
+    const makeCatalog = (callerAgentId: string, filterTools = false) =>
       createPaseoToolCatalog({
         agentManager: manager,
         agentStorage: storage,
         providerSnapshotManager: createProviderSnapshotManagerStub().manager,
         callerAgentId,
+        paseoToolPolicy: filterTools ? manager.getPaseoToolPolicy(callerAgentId) : undefined,
         logger,
       });
 
     const mainCatalog = makeCatalog(mainAgent.id);
+    const humanCatalog = createPaseoToolCatalog({
+      agentManager: manager,
+      agentStorage: storage,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      logger,
+    });
+    const filteredMain = makeCatalog(mainAgent.id, true);
+    const filteredWorker = makeCatalog(workerA.id, true);
+    const scheduleTools = [
+      "create_schedule",
+      "update_schedule",
+      "resume_schedule",
+      "run_schedule_once",
+    ];
+    for (const name of scheduleTools) {
+      expect(humanCatalog.getTool(name)).toBeDefined();
+      expect(filteredMain.getTool(name)).toBeUndefined();
+      expect(filteredWorker.getTool(name)).toBeUndefined();
+    }
+    await expect(mainCatalog.executeTool("run_schedule_once", { id: "any" })).rejects.toThrow(
+      "Paseo tool is disabled for your hierarchy role: run_schedule_once",
+    );
     await expect(
       mainCatalog.executeTool("send_agent_prompt", { agentId: workerA.id, prompt: "ping" }),
     ).rejects.toThrow("Coordinate through your direct child");
@@ -1044,6 +1302,13 @@ it("enforces single-hop MCP orchestration, self mode changes, and refreshes poli
         response: { behavior: "deny" },
       }),
     ).rejects.toThrow("Coordinate through your direct child");
+    await expect(
+      makeCatalog(ordinaryRoot.id).executeTool("respond_to_permission", {
+        agentId: workerA.id,
+        requestId: "req-1",
+        response: { behavior: "deny" },
+      }),
+    ).rejects.toThrow("You can only manage your direct subagents.");
     await expect(
       mainCatalog.executeTool("set_agent_mode", { agentId: mainAgent.id, modeId: "default" }),
     ).resolves.toMatchObject({ structuredContent: { success: true, newMode: "default" } });
@@ -1064,6 +1329,9 @@ it("enforces single-hop MCP orchestration, self mode changes, and refreshes poli
     ).resolves.toMatchObject({ structuredContent: { success: true, newMode: "auto" } });
 
     const workerCatalog = makeCatalog(workerA.id);
+    await expect(workerCatalog.executeTool("run_schedule_once", { id: "any" })).rejects.toThrow(
+      "Paseo tool is disabled for your hierarchy role: run_schedule_once",
+    );
     await expect(
       workerCatalog.executeTool("create_agent", {
         provider: "codex/gpt-5.4",
@@ -1084,6 +1352,99 @@ it("enforces single-hop MCP orchestration, self mode changes, and refreshes poli
     expect(manager.getPaseoToolPolicy(workerA.id)).toBeUndefined();
   });
 });
+
+it.each(["reparent", "detach"] as const)(
+  "rejects an ordinary parent's queued delegation after %s without blocking a legal message",
+  async (change) => {
+    await withAgents(async ({ manager, storage, cwd }) => {
+      const config = { provider: "codex", cwd, modeId: "auto" };
+      const parent = await manager.createAgent(config, undefined, { workspaceId: "workspace" });
+      const next = await manager.createAgent(config, undefined, { workspaceId: "workspace" });
+      const recipient = await manager.createAgent(config, undefined, {
+        workspaceId: "workspace",
+        labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+      });
+      const logger = createTestLogger();
+      let flush: (() => void) | undefined;
+      const dispatch = vi.fn(async (batch: { prompt: AgentPromptInput; sessionMode?: string }) => {
+        if (batch.sessionMode) await manager.setAgentMode(recipient.id, batch.sessionMode);
+        return "steered" as const;
+      });
+      const delivery = createAgentMessageDelivery({
+        dispatch,
+        schedule: (_delay, callback) => {
+          flush = callback;
+          return () => {
+            flush = undefined;
+          };
+        },
+        onError: () => {},
+      });
+      const records = new Map<string, FinishSubscription>();
+      const finish = createFinishSubscriptions({
+        store: {
+          list: async () => [...records.values()],
+          put: async (record) => {
+            records.set(record.id, record);
+          },
+          remove: async (id) => {
+            records.delete(id);
+          },
+        },
+        callerIsActive: async () => true,
+        open: async () => {
+          throw new Error("Rejected delegation must not be observed");
+        },
+        messages: () => delivery,
+        serverId: "server-1",
+        logger,
+      });
+      await finish.start();
+      const makeCatalog = (callerAgentId: string) =>
+        createPaseoToolCatalog({
+          agentManager: manager,
+          agentStorage: storage,
+          providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+          serverId: "server-1",
+          agentMessages: () => delivery,
+          finishSubscriptions: () => finish,
+          callerAgentId,
+          logger,
+        });
+      try {
+        await expect(
+          makeCatalog(parent.id).executeTool("send_agent_prompt", {
+            agentId: recipient.id,
+            prompt: "Old delegation",
+            sessionMode: "read-only",
+          }),
+        ).resolves.toMatchObject({ structuredContent: { deliveryStatus: "queued" } });
+        expect(finish.hasPendingForCaller(parent.id)).toBe(true);
+        if (change === "reparent") await manager.setAgentParent(recipient.id, next.id);
+        else await manager.detachAgent(recipient.id);
+        await expect(
+          makeCatalog(next.id).executeTool("send_agent_prompt", {
+            agentId: recipient.id,
+            prompt: "Legal message",
+            notifyOnFinish: false,
+          }),
+        ).resolves.toMatchObject({ structuredContent: { deliveryStatus: "queued" } });
+        flush!();
+        await delivery.waitForDispatch(recipient.id, new AbortController().signal);
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        expect(parseAgentMessages(String(dispatch.mock.calls[0]![0].prompt))).toMatchObject([
+          { text: "Legal message" },
+        ]);
+        expect(manager.getAgent(recipient.id)?.currentModeId).toBe("auto");
+        await expect.poll(() => records.size).toBe(0);
+        expect(finish.hasPendingForCaller(parent.id)).toBe(false);
+      } finally {
+        await delivery.close();
+        await finish.close();
+      }
+    });
+  },
+);
 
 it("cleans up rejected finish subscriptions so idle cleanup is never blocked", async () => {
   await withAgents(async ({ manager, storage, cwd }) => {

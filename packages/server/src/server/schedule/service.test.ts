@@ -39,6 +39,11 @@ import {
 } from "./service.js";
 import { ScheduleStore } from "./store.js";
 import type { ScheduleExecutionResult, StoredSchedule } from "@getpaseo/protocol/schedule/types";
+import {
+  PARENT_AGENT_ID_LABEL,
+  WORKSPACE_ROLE_LABEL,
+  WORKSPACE_MAIN_ROLE,
+} from "@getpaseo/protocol/agent-labels";
 
 interface ScheduleServiceInternals {
   executeSchedule(schedule: StoredSchedule, runId: string): Promise<ScheduleExecutionResult>;
@@ -375,6 +380,71 @@ describe("ScheduleService", () => {
       output: "ran:Review new PRs",
     });
     expect(inspected.nextRunAt).toBe("2026-01-01T00:02:00.000Z");
+  });
+
+  test("rechecks the persisted schedule caller after a role change and preserves human run-once", async () => {
+    const callerAgentId = "scheduler";
+    const caller = {
+      id: callerAgentId,
+      provider: "codex" as const,
+      cwd: tempDir,
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      labels: {},
+    };
+    await agentStorage.upsert(caller);
+    const runner = vi.fn(async () => ({ agentId: null, output: "ran" }));
+    const open = () =>
+      createScheduleService({
+        paseoHome: tempDir,
+        logger: createTestLogger(),
+        agentManager: new AgentManager({ logger: createTestLogger() }),
+        agentStorage,
+        now: () => now,
+        runner,
+      });
+    const input = {
+      callerAgentId,
+      prompt: "Run a task",
+      cadence: { type: "every", everyMs: 60_000 } as const,
+      target: { type: "new-agent", config: { provider: "codex", cwd: tempDir } } as const,
+    };
+    const created = await open().createOrReplace(input);
+    const { id } = created;
+    expect(created).not.toHaveProperty("callerAgentId");
+    await agentStorage.upsert({
+      ...caller,
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
+    const restarted = open();
+    await expect(restarted.create(input)).rejects.toThrow("current hierarchy role");
+    await expect(restarted.createOrReplace(input)).rejects.toThrow("current hierarchy role");
+    await expect(restarted.update({ id, prompt: "Override" }, callerAgentId)).rejects.toThrow(
+      "current hierarchy role",
+    );
+    await expect(restarted.runOnce(id, callerAgentId)).rejects.toThrow("current hierarchy role");
+    await restarted.tick();
+    expect(runner).not.toHaveBeenCalled();
+    expect((await restarted.inspect(id)).runs.at(-1)).toMatchObject({ status: "failed" });
+    await agentStorage.upsert({
+      ...caller,
+      id: "lead",
+      labels: { [PARENT_AGENT_ID_LABEL]: "main" },
+    });
+    await agentStorage.upsert({ ...caller, labels: { [PARENT_AGENT_ID_LABEL]: "lead" } });
+    await expect(restarted.create(input)).rejects.toThrow("current hierarchy role");
+    await expect(restarted.update({ id, prompt: "Override" }, callerAgentId)).rejects.toThrow(
+      "current hierarchy role",
+    );
+    await expect(restarted.resume(id, callerAgentId)).rejects.toThrow("current hierarchy role");
+    await expect(restarted.runOnce(id, callerAgentId)).rejects.toThrow("current hierarchy role");
+    await restarted.update({ id, prompt: "Human override" });
+    await restarted.runOnce(id);
+    expect(runner).toHaveBeenCalledTimes(1);
+    expect(runner).toHaveBeenCalledWith(
+      expect.objectContaining({ prompt: "Human override" }),
+      expect.any(String),
+    );
   });
 
   test.each(["new-agent", "agent", "maxRuns: 1"] as const)(

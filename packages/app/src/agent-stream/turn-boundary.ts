@@ -104,16 +104,19 @@ export function resolveSelectionForkBoundary({
   historyItemById: ReadonlyMap<string, { item: StreamItem }>;
   liveHeadItemById: ReadonlyMap<string, { item: StreamItem }>;
   supportsTimelineCursor: boolean;
-}): AssistantTurnForkBoundary | undefined {
-  if (!messageRowId || (isTurnActive && liveHeadItemById.has(messageRowId))) {
-    return undefined;
-  }
-  const row = historyItemById.get(messageRowId) ?? liveHeadItemById.get(messageRowId);
-  if (row?.item.kind !== "assistant_message") return undefined;
+}): AssistantTurnForkBoundary | null | undefined {
+  if (!messageRowId) return null;
+  const historicalRow = historyItemById.get(messageRowId);
+  const row = historicalRow ?? liveHeadItemById.get(messageRowId);
+  if (row?.item.kind !== "assistant_message") return null;
+  // Only a selection on the current stream can intentionally use its latest progress.
+  if (!historicalRow && isTurnActive) return undefined;
 
-  return resolveAssistantTurnForkBoundary({
-    items: [row.item],
-    startIndex: 0,
-    supportsTimelineCursor,
-  });
+  return (
+    resolveAssistantTurnForkBoundary({
+      items: [row.item],
+      startIndex: 0,
+      supportsTimelineCursor,
+    }) ?? null
+  );
 }

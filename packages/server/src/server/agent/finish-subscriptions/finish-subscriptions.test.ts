@@ -7,6 +7,8 @@ import { afterEach, expect, test, vi } from "vitest";
 import type { DaemonClient, WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
 import { buildStoredAgentPayload } from "../agent-projections.js";
+import { registerParentFinishSubscription } from "../create-agent/create.js";
+import { MessageReceipts } from "../../message-receipts/index.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import {
   createFinishSubscriptions,
@@ -272,57 +274,204 @@ test("retains intent until parent dispatch acknowledgment, then restart sends no
   expect(restarted.observation.waits).toHaveLength(0);
 });
 
-test("a one-way follow-up survives completion before the first poll", async () => {
-  const home = await mkdtemp(join(tmpdir(), "finish-followup-"));
-  homes.push(home);
-  const store = createJsonFinishSubscriptionStore(home);
-  const watches = createJsonFinishSubscriptionStore(home, "watches.json");
-  const reports = createJsonFinishSubscriptionStore(home, "reports.json");
-  const observation = new Observation();
-  const reverseAttempt = deferred<void>();
-  const service = createFinishSubscriptions({
-    store,
-    followups: { watches, reports, dispatch: async () => {} },
-    callerIsActive: async () => true,
-    messages: () => new Delivery(),
-    serverId: "origin",
-    logger: createTestLogger(),
-    open: observation.open.bind(observation),
-    retryDelayMs: 1,
-    hosts: () => ({
-      directory: async () => {
-        throw new Error("Unexpected host listing");
-      },
-      use: async () => {
-        reverseAttempt.resolve();
-        throw new HostObservationError("removed");
-      },
-    }),
-  });
-  services.push(service);
-  await service.start();
+test.each(["finished", "permission-required"] as const)(
+  "a one-way human prompt retains a %s report before the first poll",
+  async (firstEvent) => {
+    const home = await mkdtemp(join(tmpdir(), "finish-followup-"));
+    homes.push(home);
+    const store = createJsonFinishSubscriptionStore(home);
+    const watches = createJsonFinishSubscriptionStore(home, "watches.json");
+    const reports = createJsonFinishSubscriptionStore(home, "reports.json");
+    const observation = new Observation();
+    const reverseAttempt = deferred<void>();
+    const service = createFinishSubscriptions({
+      store,
+      followups: { watches, reports, dispatch: async () => {} },
+      callerIsActive: async () => true,
+      messages: () => new Delivery(),
+      serverId: "origin",
+      logger: createTestLogger(),
+      open: observation.open.bind(observation),
+      retryDelayMs: 1,
+      hosts: () => ({
+        directory: async () => {
+          throw new Error("Unexpected host listing");
+        },
+        use: async () => {
+          reverseAttempt.resolve();
+          throw new HostObservationError("removed");
+        },
+      }),
+    });
+    services.push(service);
+    await service.start();
 
+    const pair = { ...intent, callerServerId: "parent-host" };
+    const address = { ...pair, sourceId: "parent-source" };
+    const finished = outcome("idle");
+    finished.final!.labels!["paseo.parent-server-id"] = pair.callerServerId;
+    const registration = await registerParentFinishSubscription({
+      agentId: pair.childAgentId,
+      serverId: "origin",
+      agentManager: { getAgent: () => null },
+      agentStorage: {
+        get: async (id) => ({
+          id,
+          provider: "codex",
+          cwd: "/tmp",
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          labels: finished.final!.labels!,
+        }),
+      },
+      finishSubscriptions: service,
+    });
+    registration!.accept();
+    await until(() => observation.waits.length === 1);
+    const first = firstEvent === "finished" ? finished : structuredClone(finished);
+    if (firstEvent === "permission-required") {
+      first.status = "permission";
+      first.final!.pendingPermissions = [{ id: "approval", kind: "tool", name: "Edit", input: {} }];
+    }
+    observation.waits[0]!.result.resolve(first);
+    await reverseAttempt.promise;
+    expect(await watches.list()).toEqual([]);
+    expect(await reports.list()).toHaveLength(1);
+
+    const result = await service.pullReports(address, [], true, "active");
+    expect(result).toMatchObject({
+      ownsBinding: true,
+      reports: [{ event: firstEvent }],
+    });
+    if (firstEvent === "permission-required") {
+      expect(result.reports[0]!.prompt).toContain('"requestId": "approval"');
+      await until(() => observation.waits.length === 2);
+      observation.waits[1]!.result.resolve(finished);
+      await expect.poll(async () => (await reports.list()).length).toBe(2);
+      const followup = await service.pullReports(address, [result.reports[0]!.id], true, "active");
+      expect(followup.reports).toMatchObject([
+        { event: "finished", prompt: expect.stringContaining("Partial work saved") },
+      ]);
+    } else {
+      expect(result.reports[0]!.prompt).toContain("Partial work saved");
+    }
+    await expect.poll(() => store.list()).toEqual([]);
+    const retired = await service.pullReports(address, [], true, "unrelated");
+    expect(retired).toEqual({ ownsBinding: false, reports: [] });
+    expect(await watches.list()).toEqual([]);
+    expect(await reports.list()).toEqual([]);
+  },
+);
+
+test("unknown delivery outcomes are retained while later reports on subsequent pages are acknowledged", async () => {
+  const home = await mkdtemp(join(tmpdir(), "finish-unknown-"));
+  homes.push(home);
   const pair = { ...intent, callerServerId: "parent-host" };
   const address = { ...pair, sourceId: "parent-source" };
-  await service.register({ ...pair, followupReport: true, requireParentOwnership: true });
-  await until(() => observation.waits.length === 1);
-  const finished = outcome("idle");
-  finished.final!.labels!["paseo.parent-server-id"] = pair.callerServerId;
-  observation.waits[0]!.result.resolve(finished);
-  await reverseAttempt.promise;
-  expect(await watches.list()).toEqual([]);
-  expect(await reports.list()).toHaveLength(1);
-
-  const result = await service.pullReports(address, [], true, "active");
-  expect(result).toMatchObject({
-    ownsBinding: true,
-    reports: [{ prompt: expect.stringContaining("Partial work saved") }],
+  const childReports = createJsonFinishSubscriptionStore(home, "child-reports.json");
+  const child = createFinishSubscriptions({
+    store: createJsonFinishSubscriptionStore(home, "child-intents.json"),
+    followups: {
+      watches: createJsonFinishSubscriptionStore(home, "child-watches.json"),
+      reports: childReports,
+      dispatch: async () => {},
+    },
+    callerIsActive: async () => true,
+    messages: () => new Delivery(),
+    serverId: "child-host",
+    logger: createTestLogger(),
+    open: async () => {
+      throw new Error("Unexpected observation");
+    },
   });
-  await expect.poll(() => store.list()).toEqual([]);
-  const retired = await service.pullReports(address, [], true, "unrelated");
-  expect(retired).toEqual({ ownsBinding: false, reports: [] });
-  expect(await watches.list()).toEqual([]);
-  expect(await reports.list()).toEqual([]);
+  services.push(child);
+  const unknownIds = Array.from({ length: 8 }, (_, index) => `unknown-${index}`);
+  const receipts = new MessageReceipts(join(home, "receipts"));
+  const providerAccepted: string[] = [];
+  const send = (id: string, loseAcknowledgment = false) =>
+    receipts.send({
+      agentId: pair.callerAgentId,
+      messageId: id,
+      request: { prompt: id },
+      async send(beforeDispatch) {
+        await beforeDispatch();
+        providerAccepted.push(id);
+        if (loseAcknowledgment) throw new Error("Lost provider acknowledgment");
+      },
+    });
+  for (const id of unknownIds) {
+    await expect(send(id, true)).rejects.toThrow("Lost provider acknowledgment");
+  }
+  await send("already-pushed");
+  for (const id of [...unknownIds, "delivered", "already-pushed"]) {
+    await childReports.put({
+      ...pair,
+      id,
+      report: { id, prompt: id, title: "Child", event: "finished" },
+    });
+  }
+  const client = {
+    pullAgentFinishReports: async (
+      _childId: string,
+      _parentId: string,
+      acknowledged: string[],
+      observe: boolean,
+    ) => {
+      const { ownsBinding, reports } = await child.pullReports(
+        address,
+        acknowledged,
+        observe,
+        "active",
+      );
+      return { ownsChild: ownsBinding, reports, error: null };
+    },
+  } as DaemonClient;
+  const parent = createFinishSubscriptions({
+    store: createJsonFinishSubscriptionStore(home, "parent-intents.json"),
+    followups: {
+      watches: createJsonFinishSubscriptionStore(home, "parent-watches.json"),
+      reports: createJsonFinishSubscriptionStore(home, "parent-reports.json"),
+      async dispatch(_record, report) {
+        await send(report.id);
+      },
+    },
+    hosts: () => ({
+      directory: async () => ({
+        self: { serverId: "parent-host", label: "Parent" },
+        hosts: [
+          {
+            registrationId: "child-registration",
+            serverId: "child-host",
+            label: "Child",
+            source: { id: "owner", key: "child" },
+            metadata: {},
+            enabled: true,
+            status: "online",
+            targetDescription: "Child",
+            lastOnlineAt: null,
+            nextRetryAt: null,
+            error: null,
+          },
+        ],
+      }),
+      use: async (_id, action) => action(client),
+    }),
+    callerIsActive: async () => true,
+    messages: () => new Delivery(),
+    logger: createTestLogger(),
+    serverId: "parent-host",
+    retryDelayMs: 1,
+    open: async () => {
+      throw new Error("Unexpected observation");
+    },
+  });
+  services.unshift(parent);
+  await parent.start();
+  await parent.trackRemoteChild({ ...intent, serverId: "child-host" });
+  await expect
+    .poll(async () => (await childReports.list()).map(({ id }) => id))
+    .toEqual(unknownIds);
+  expect(providerAccepted).toEqual([...unknownIds, "already-pushed", "delivered"]);
 });
 
 test("restart coalesces predecessor and queued candidate into one settled notification", async () => {
@@ -455,16 +604,19 @@ test("coalesced unconditional follow-up survives detachment of a parent-owned cr
   await until(() => restarted.delivery.prompts.length === 1);
 });
 
-test("detached child suppresses a parent-owned creation subscription", async () => {
-  const state = await scenario();
-  await state.service.register({ ...intent, requireParentOwnership: true });
-  await until(() => state.observation.waits.length === 1);
-  const detached = outcome();
-  detached.final!.labels = {};
-  state.observation.waits[0]!.result.resolve(detached);
-  await expect.poll(async () => (await state.store.list()).length).toBe(0);
-  expect(state.delivery.prompts).toHaveLength(0);
-});
+test.each([{}, { "paseo.parent-agent-id": "new-parent" }])(
+  "a child reassigned to %j suppresses a parent-owned subscription",
+  async (labels) => {
+    const state = await scenario();
+    await state.service.register({ ...intent, requireParentOwnership: true });
+    await until(() => state.observation.waits.length === 1);
+    const finished = outcome();
+    finished.final!.labels = labels;
+    state.observation.waits[0]!.result.resolve(finished);
+    await expect.poll(async () => (await state.store.list()).length).toBe(0);
+    expect(state.delivery.prompts).toHaveLength(0);
+  },
+);
 
 test("dispatch failure retains intent and retries the ordinary finish notification", async () => {
   const state = await scenario();

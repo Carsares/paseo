@@ -14,7 +14,10 @@ export async function clearSubagentOpenTabLabel(input: {
 }): Promise<boolean> {
   const { client, agentId, serverId, workspaceId } = input;
   const clientId = await getOrCreateClientId();
-  await client.updateAgent(agentId, { labels: { [getOpenAgentTabLabel(clientId)]: "false" } });
+  await client.updateAgent(agentId, {
+    labels: { [getOpenAgentTabLabel(clientId)]: "false" },
+    expectedWorkspaceId: workspaceId,
+  });
   const session = useSessionStore.getState().sessions[serverId];
   const latestAgent = session?.agents.get(agentId);
   return (

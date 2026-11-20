@@ -198,6 +198,7 @@ export interface MoveSubagentToWorkspaceDeps {
     serverId: string;
     agentId: string;
     idempotencyKey: string;
+    expectedWorkspaceId?: string;
   }) => Promise<{ workspaceId: string }>;
   openMovedWorkspace: (input: {
     serverId: string;
@@ -212,11 +213,11 @@ const inFlightKeys = new Set<string>();
 const pendingMoveKeys = new Map<string, string>();
 
 export async function requestMoveSubagentToWorkspace(
-  input: { serverId: string; subagentId: string },
+  input: { serverId: string; subagentId: string; expectedWorkspaceId?: string },
   deps: MoveSubagentToWorkspaceDeps,
 ): Promise<void> {
-  const { serverId, subagentId } = input;
-  const key = `${serverId}:${subagentId}`;
+  const { serverId, subagentId, expectedWorkspaceId } = input;
+  const key = JSON.stringify([serverId, subagentId, expectedWorkspaceId]);
   if (inFlightKeys.has(key)) {
     return;
   }
@@ -235,6 +236,7 @@ export async function requestMoveSubagentToWorkspace(
           serverId,
           agentId: subagentId,
           idempotencyKey,
+          ...(expectedWorkspaceId !== undefined ? { expectedWorkspaceId } : {}),
         }));
         break;
       } catch (error) {

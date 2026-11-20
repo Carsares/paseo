@@ -6430,6 +6430,45 @@ describe("agent hierarchy control", () => {
     },
   );
 
+  test.each([true, undefined])(
+    "requests a Main Control handoff and accepts archivedSource=%s",
+    async (archivedSource) => {
+      const { client, mock } = await connectHierarchyClient();
+      const result = client.setAgentMainControl("target", true, {
+        handoffFromAgentId: "source",
+        archiveSource: true,
+      });
+      const request = parseSentFrame(mock.sent[0]);
+      expect(request).toEqual({
+        type: "agent.set_main.request",
+        requestId: expect.any(String),
+        agentId: "target",
+        enabled: true,
+        handoffFromAgentId: "source",
+        archiveSource: true,
+      });
+      mock.triggerMessage(
+        wrapSessionMessage({
+          type: "agent.set_main.response",
+          payload: {
+            requestId: request.requestId,
+            agentId: "target",
+            accepted: true,
+            enabled: true,
+            workspaceId: "workspace",
+            error: null,
+            ...(archivedSource === undefined ? {} : { archivedSource }),
+          },
+        }),
+      );
+      await expect(result).resolves.toStrictEqual({
+        enabled: true,
+        workspaceId: "workspace",
+        ...(archivedSource === undefined ? {} : { archivedSource }),
+      });
+    },
+  );
+
   test.each([
     { accepted: true, parentAgentId: "parent-agent", error: null, expectedError: null },
     {

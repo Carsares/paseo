@@ -2,12 +2,15 @@ import { randomBytes } from "node:crypto";
 import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { Logger } from "pino";
-import {
-  StoredScheduleSchema,
-  type ScheduleTarget,
-  type StoredSchedule,
-} from "@getpaseo/protocol/schedule/types";
+import { StoredScheduleSchema, type ScheduleTarget } from "@getpaseo/protocol/schedule/types";
+import { z } from "zod";
 import { writeJsonFileAtomic } from "../atomic-file.js";
+
+const PersistedScheduleSchema = StoredScheduleSchema.extend({
+  callerAgentId: z.string().min(1).optional(),
+});
+export type PersistedSchedule = z.infer<typeof PersistedScheduleSchema>;
+type StoredSchedule = PersistedSchedule;
 
 function generateScheduleId(): string {
   return randomBytes(4).toString("hex");
@@ -97,7 +100,7 @@ function parseStoredSchedule(
   } catch (error) {
     return { success: false, error };
   }
-  return StoredScheduleSchema.safeParse(json);
+  return PersistedScheduleSchema.safeParse(json);
 }
 
 export class ScheduleStore {
@@ -151,7 +154,7 @@ export class ScheduleStore {
     await this.ensureDir();
     try {
       const content = await readFile(this.filePath(id), "utf-8");
-      return StoredScheduleSchema.parse(JSON.parse(content));
+      return PersistedScheduleSchema.parse(JSON.parse(content));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return null;
@@ -161,7 +164,7 @@ export class ScheduleStore {
   }
 
   async create(schedule: Omit<StoredSchedule, "id">): Promise<StoredSchedule> {
-    const created = StoredScheduleSchema.parse({ ...schedule, id: generateScheduleId() });
+    const created = PersistedScheduleSchema.parse({ ...schedule, id: generateScheduleId() });
     await this.write(created);
     return created;
   }
@@ -179,7 +182,7 @@ export class ScheduleStore {
       if (next.id !== id) {
         throw new Error(`Schedule update cannot change id: ${id}`);
       }
-      const updated = StoredScheduleSchema.parse(next);
+      const updated = PersistedScheduleSchema.parse(next);
       await this.write(updated);
       return updated;
     });
@@ -197,7 +200,7 @@ export class ScheduleStore {
           matchesNameAndTarget(schedule, name, target),
         );
         if (!existing) {
-          const created = StoredScheduleSchema.parse({
+          const created = PersistedScheduleSchema.parse({
             ...(await options.create()),
             id: generateScheduleId(),
           });
@@ -274,7 +277,7 @@ export class ScheduleStore {
       if (next.id !== id) {
         throw new Error(`Schedule update cannot change id: ${id}`);
       }
-      const updated = StoredScheduleSchema.parse(next);
+      const updated = PersistedScheduleSchema.parse(next);
       if (!matchesNameAndTarget(updated, name, target)) {
         throw new Error("Updated schedule does not match requested identity");
       }

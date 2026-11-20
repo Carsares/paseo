@@ -1,5 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
+import { collectRetainedAttachmentIds } from "@/attachments/gc-retention";
+import { __setAttachmentStoreForTests } from "@/attachments/store";
+import { garbageCollectAttachments } from "@/attachments/service";
+import type { AttachmentMetadata } from "@/attachments/types";
 import { AfterPaintPublication } from "@/composer/after-paint-publication";
 import { beginComposerWork, isHandoffInputLocked } from "@/composer/handoff-input-lock";
 import { buildDraftStoreKey } from "@/stores/draft-keys";
@@ -18,10 +22,14 @@ vi.mock("expo-router", () => ({ useRouter: vi.fn() }));
 vi.mock("@/hooks/use-archive-agent", () => ({ applyArchivedAgentCloseResults: vi.fn() }));
 vi.mock("@/stores/navigation-active-workspace-store", () => ({ navigateToWorkspace: vi.fn() }));
 vi.mock("@/stores/draft-store", () => ({ useDraftStore: vi.fn() }));
-vi.mock("@/stores/session-store", () => ({ useSessionStore: vi.fn() }));
+vi.mock("@/stores/session-store", () => ({
+  useSessionStore: { getState: () => ({ sessions: {} }) },
+}));
 vi.mock("@/subagents", () => import("@/subagents/close-tab-policy"));
 vi.mock("@/utils/client-id", () => ({ getOrCreateClientId: vi.fn() }));
 vi.mock("@/utils/confirm-dialog", () => ({ confirmDialog: vi.fn() }));
+
+afterEach(() => __setAttachmentStoreForTests(null));
 
 type Deps = Parameters<typeof performCrossProviderAgentHandoff>[1];
 type ForkPayload = Awaited<ReturnType<NonNullable<Deps["client"]>["buildAgentForkContext"]>>;
@@ -105,7 +113,10 @@ function createHandoff(agentOverrides: Partial<NonNullable<ReturnType<Deps["getA
     attachments: storedDraft.attachments,
     isLocked: vi.fn(() => false),
   };
-  const workspaceAttachmentsStore = { setWorkspaceAttachments: vi.fn() };
+  const workspaceAttachmentsStore = {
+    setWorkspaceAttachments: vi.fn(),
+    addWorkspaceAttachment: vi.fn(),
+  };
   const getWorkspaceTabs = vi.fn<() => WorkspaceTab[]>(() => [
     { tabId: paneContext.tabId, target: { kind: "agent", agentId: "agent-1" }, createdAt: 0 },
   ]);
@@ -130,6 +141,7 @@ function createHandoff(agentOverrides: Partial<NonNullable<ReturnType<Deps["getA
   const deps = {
     supportsAgentForkContext: true,
     supportsAgentInitialPromptOrigin: vi.fn(() => true),
+    readOtherHosts: vi.fn<Deps["readOtherHosts"]>(async () => []),
     client,
     paneContext,
     getAgent: vi.fn<Deps["getAgent"]>(() => agent),
@@ -188,7 +200,35 @@ function createHandoff(agentOverrides: Partial<NonNullable<ReturnType<Deps["getA
   };
 }
 
+type MainControlClient = NonNullable<Deps["mainControlClient"]>;
+const atomicOptions = { handoffFromAgentId: "agent-1", archiveSource: true };
+
 function createMainControlClient(lateChildId?: string) {
+  const replacement = {
+    id: "replacement",
+    provider: "codex",
+    cwd: "/workspace/project",
+    workspaceId: "workspace-1",
+    model: null,
+    createdAt: "2026-11-20T00:00:00Z",
+    updatedAt: "2026-11-20T00:00:00Z",
+    labels: {},
+    status: "idle",
+    capabilities: {
+      supportsStreaming: true,
+      supportsSessionPersistence: false,
+      supportsDynamicModes: false,
+      supportsMcpServers: false,
+      supportsReasoningStream: false,
+      supportsToolInvocations: false,
+    },
+    lastUserMessageAt: null,
+    currentModeId: null,
+    availableModes: [],
+    pendingPermissions: [],
+    persistence: null,
+    title: null,
+  } satisfies Awaited<ReturnType<MainControlClient["createAgent"]>>;
   const entry = (id: string, workspaceId = "workspace-1", archivedAt?: string) => ({
     agent: {
       id,
@@ -217,12 +257,15 @@ function createMainControlClient(lateChildId?: string) {
         entries: [],
         pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
       }),
-    createAgent: vi
-      .fn<NonNullable<Deps["mainControlClient"]>["createAgent"]>()
-      .mockResolvedValue({ id: "replacement" } as Awaited<
-        ReturnType<NonNullable<Deps["mainControlClient"]>["createAgent"]>
-      >),
-    setAgentMainControl: vi.fn(async () => ({ enabled: true, workspaceId: "workspace-1" })),
+    createAgent: vi.fn<MainControlClient["createAgent"]>().mockResolvedValue(replacement),
+    fetchAgent: vi.fn<MainControlClient["fetchAgent"]>().mockResolvedValue({
+      agent: replacement,
+      project: null,
+    }),
+    setAgentMainControl: vi.fn<MainControlClient["setAgentMainControl"]>(async () => ({
+      enabled: true,
+      workspaceId: "workspace-1",
+    })),
     setAgentParent: vi.fn(async (_id: string, parentAgentId: string) => ({ parentAgentId })),
   };
 }
@@ -241,7 +284,11 @@ describe("performCrossProviderAgentHandoff", () => {
       ["child-open", "replacement"],
       ["child-closed", "replacement"],
     ]);
-    expect(mainControlClient.setAgentMainControl).toHaveBeenCalledWith("replacement", true);
+    expect(mainControlClient.setAgentMainControl).toHaveBeenCalledWith(
+      "replacement",
+      true,
+      atomicOptions,
+    );
     expect(mainControlClient.setAgentMainControl).toHaveBeenCalledBefore(
       mainControlClient.setAgentParent,
     );
@@ -267,6 +314,177 @@ describe("performCrossProviderAgentHandoff", () => {
     });
   });
 
+  it("uses the atomic handoff without moving children or archiving the source again", async () => {
+    const { deps, run, paneContext } = createHandoff({ labels: mainControlLabels });
+    const mainControlClient = createMainControlClient();
+    mainControlClient.setAgentMainControl.mockResolvedValueOnce({
+      enabled: true,
+      workspaceId: "workspace-1",
+      archivedSource: true,
+    });
+
+    expect(await run({ mainControlClient })).toBe(true);
+    expect(mainControlClient.setAgentMainControl).toHaveBeenCalledExactlyOnceWith(
+      "replacement",
+      true,
+      atomicOptions,
+    );
+    expect(mainControlClient.fetchAgentHistory).not.toHaveBeenCalled();
+    expect(mainControlClient.setAgentParent).not.toHaveBeenCalled();
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expect(paneContext.retargetCurrentTab).toHaveBeenCalledWith({
+      kind: "agent",
+      agentId: "replacement",
+    });
+  });
+
+  it.each(["unreachable", "remote child"] as const)(
+    "rejects the handoff before creating a replacement when there is an %s",
+    async (reason) => {
+      const { deps, run, expectSourceUntouched } = createHandoff({ labels: mainControlLabels });
+      const mainControlClient = createMainControlClient();
+      const remoteHistory = vi.fn<MainControlClient["fetchAgentHistory"]>().mockResolvedValue({
+        requestId: "remote",
+        entries: [
+          {
+            agent: {
+              id: "remote-child",
+              workspaceId: "remote-workspace",
+              labels: parentAddressLabels({ serverId: "host-1", agentId: "agent-1" }),
+            },
+          },
+        ],
+        pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+      } as Awaited<ReturnType<MainControlClient["fetchAgentHistory"]>>);
+      deps.readOtherHosts.mockResolvedValueOnce([
+        {
+          serverId: "host-2",
+          label: "Build host",
+          client: reason === "unreachable" ? null : { fetchAgentHistory: remoteHistory },
+          includeBackground: true,
+        },
+      ]);
+
+      expect(await run({ mainControlClient })).toBe(false);
+      expect(mainControlClient.createAgent).not.toHaveBeenCalled();
+      expect(deps.toast.error).toHaveBeenCalledExactlyOnceWith(
+        reason === "unreachable"
+          ? "Cannot check Main Control subagents on Build host: host is unreachable."
+          : "Main Control has active subagents on Build host. Detach or archive them before switching providers.",
+      );
+      expectSourceUntouched();
+    },
+  );
+
+  it("keeps the replacement when a moved child cannot be restored", async () => {
+    const { deps, run } = createHandoff({ labels: mainControlLabels });
+    const mainControlClient = createMainControlClient();
+    mainControlClient.setAgentParent.mockImplementation(async (id, parentAgentId) => {
+      if (id === "child-closed" && parentAgentId === "replacement")
+        throw new Error("Cannot move child");
+      if (id === "child-open" && parentAgentId === "agent-1")
+        throw new Error("Cannot restore child");
+      return { parentAgentId };
+    });
+    const history = mainControlClient.fetchAgentHistory;
+    const originalPage = await history({ filter: {}, page: { limit: 200 } });
+    const secondPage = await history({ filter: {}, page: { limit: 200 } });
+    await history({ filter: {}, page: { limit: 200 } });
+    const [child] = originalPage.entries;
+    history
+      .mockResolvedValueOnce(originalPage)
+      .mockResolvedValueOnce(secondPage)
+      .mockResolvedValueOnce({
+        ...originalPage,
+        entries: [
+          {
+            ...child,
+            agent: {
+              ...child.agent,
+              labels: parentAddressLabels({ serverId: "host-1", agentId: "replacement" }),
+            },
+          },
+        ],
+        pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+      });
+    expect(await run({ mainControlClient })).toBe(false);
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expect(deps.toast.error).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/child-open restore failed.*still has subagents: child-open/),
+    );
+  });
+
+  it("archives a verified empty replacement while reporting a failed restore reply", async () => {
+    const { deps, run } = createHandoff({ labels: mainControlLabels });
+    const mainControlClient = createMainControlClient();
+    mainControlClient.setAgentParent.mockImplementation(async (id, parentAgentId) => {
+      if (id === "child-closed" && parentAgentId === "replacement") {
+        throw new Error("Cannot move child");
+      }
+      if (id === "child-open" && parentAgentId === "agent-1") {
+        throw new Error("Restore reply lost");
+      }
+      return { parentAgentId };
+    });
+    expect(await run({ mainControlClient })).toBe(false);
+    expect(deps.archiveAgent).toHaveBeenCalledExactlyOnceWith({
+      serverId: "host-1",
+      agentId: "replacement",
+      expectedWorkspaceId: "workspace-1",
+    });
+    expect(deps.toast.error).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(
+        /child-open restore failed \(Restore reply lost\).*replacement replacement archived/,
+      ),
+    );
+  });
+
+  it("finishes a committed atomic handoff after the daemon reports a follow-up error", async () => {
+    const { deps, run, paneContext } = createHandoff({ labels: mainControlLabels });
+    const mainControlClient = createMainControlClient();
+    const current = await mainControlClient.fetchAgent({ agentId: "replacement" });
+    if (!current) throw new Error("Expected an existing replacement");
+    mainControlClient.fetchAgent.mockResolvedValueOnce({
+      ...current,
+      agent: { ...current.agent, labels: mainControlLabels },
+    });
+    mainControlClient.setAgentMainControl.mockRejectedValueOnce(new Error("Runtime close failed"));
+    deps.confirmSourceArchived.mockResolvedValueOnce(true);
+
+    expect(await run({ mainControlClient })).toBe(true);
+    expect(paneContext.retargetCurrentTab).toHaveBeenCalledExactlyOnceWith({
+      kind: "agent",
+      agentId: "replacement",
+    });
+    expect(mainControlClient.setAgentParent).not.toHaveBeenCalled();
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expect(deps.toast.error).not.toHaveBeenCalled();
+  });
+
+  it("keeps the replacement when a new prompt arrived before rollback cleanup", async () => {
+    const { deps, run } = createHandoff({ labels: mainControlLabels });
+    const mainControlClient = createMainControlClient();
+    mainControlClient.setAgentMainControl.mockRejectedValueOnce(new Error("Promotion refused"));
+    const current = await mainControlClient.fetchAgent({ agentId: "replacement" });
+    if (!current) throw new Error("Expected an existing replacement");
+    const { agent } = current;
+    mainControlClient.fetchAgent.mockResolvedValueOnce({
+      agent: { ...agent, lastUserMessageAt: "2026-11-20T00:00:00Z" },
+      project: null,
+    });
+    mainControlClient.fetchAgentHistory.mockReset().mockResolvedValue({
+      requestId: "check-children",
+      entries: [],
+      pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+    });
+
+    expect(await run({ mainControlClient })).toBe(false);
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expect(deps.toast.error).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("new activity"),
+    );
+  });
+
   it("keeps the old Main Control and restores moved children if a child cannot be moved", async () => {
     const { deps, run, expectSourceUntouched } = createHandoff({ labels: mainControlLabels });
     const mainControlClient = createMainControlClient();
@@ -280,10 +498,14 @@ describe("performCrossProviderAgentHandoff", () => {
     expect(await run({ mainControlClient })).toBe(false);
     expect(mainControlClient.setAgentParent).toHaveBeenCalledWith("child-open", "agent-1");
     expect(mainControlClient.setAgentMainControl.mock.calls).toEqual([
-      ["replacement", true],
+      ["replacement", true, atomicOptions],
       ["agent-1", true],
     ]);
-    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expect(deps.archiveAgent).toHaveBeenCalledExactlyOnceWith({
+      serverId: "host-1",
+      agentId: "replacement",
+      expectedWorkspaceId: "workspace-1",
+    });
     expectSourceUntouched();
   });
 
@@ -296,11 +518,35 @@ describe("performCrossProviderAgentHandoff", () => {
 
     expect(await run({ mainControlClient })).toBe(false);
     expect(mainControlClient.setAgentMainControl.mock.calls).toEqual([
-      ["replacement", true],
+      ["replacement", true, atomicOptions],
       ["agent-1", true],
     ]);
-    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expect(deps.archiveAgent).toHaveBeenCalledExactlyOnceWith({
+      serverId: "host-1",
+      agentId: "replacement",
+      expectedWorkspaceId: "workspace-1",
+    });
     expectSourceUntouched();
+  });
+
+  it("keeps the replacement when a lost reply leaves the source archive unconfirmed", async () => {
+    const { deps, run } = createHandoff({ labels: mainControlLabels });
+    const mainControlClient = createMainControlClient();
+    mainControlClient.setAgentMainControl.mockRejectedValueOnce(
+      new DaemonConnectionError("Promotion reply timed out", "DAEMON_REQUEST_TIMEOUT"),
+    );
+    deps.confirmSourceArchived.mockResolvedValueOnce(null);
+
+    expect(await run({ mainControlClient })).toBe(false);
+    expect(mainControlClient.setAgentMainControl).toHaveBeenCalledExactlyOnceWith(
+      "replacement",
+      true,
+      atomicOptions,
+    );
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expect(deps.toast.error).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("Could not confirm whether the original Main Control was archived"),
+    );
   });
 
   it("moves a child that joined during the first history scan before archiving", async () => {
@@ -801,6 +1047,149 @@ describe("performCrossProviderAgentHandoff", () => {
     expect(deps.archiveAgent).not.toHaveBeenCalled();
     expectSourceUntouched();
   });
+
+  it.each([
+    { main: true, succeeds: true },
+    { main: true, succeeds: false },
+    { main: false, succeeds: true },
+    { main: false, succeeds: false },
+  ])(
+    "keeps queued files across collection during handoff (main: $main, succeeds: $succeeds)",
+    async ({ main, succeeds }) => {
+      const path = main ? "main" : "ordinary";
+      const image: AttachmentMetadata = {
+        id: `image-${path}`,
+        mimeType: "image/png",
+        storageType: "web-indexeddb",
+        storageKey: "queued",
+        createdAt: 1,
+      };
+      const screenshot = { ...image, id: `screenshot-${path}` };
+      const { deps, run, draftStore, workspaceAttachmentsStore } = createHandoff(
+        main ? { labels: mainControlLabels } : {},
+      );
+      const { useDraftStore } =
+        await vi.importActual<typeof import("@/stores/draft-store")>("@/stores/draft-store");
+      await useDraftStore.getState().hydrateDraftInput({ draftKey: "other-draft" });
+      const stored = new Set([image.id, screenshot.id, "orphan"]);
+      const collectionStarted = Promise.withResolvers<void>();
+      const finishCollection = Promise.withResolvers<void>();
+      const garbageCollect = vi.fn(
+        async ({ referencedIds }: { referencedIds: ReadonlySet<string> }) => {
+          collectionStarted.resolve();
+          await finishCollection.promise;
+          for (const id of stored) if (!referencedIds.has(id)) stored.delete(id);
+        },
+      );
+      const messages: ReturnType<Deps["takeQueuedMessages"]>["messages"] = [
+        {
+          id: "queued",
+          text: "Queued",
+          attachments: [
+            { kind: "image", metadata: image },
+            {
+              kind: "browser_element",
+              attachment: {
+                screenshot,
+                url: "https://example.com",
+                selector: "main",
+                tag: "main",
+                text: "",
+                outerHTML: "<main></main>",
+                computedStyles: {},
+                boundingRect: { x: 0, y: 0, width: 10, height: 10 },
+                reactSource: null,
+                parentChain: [],
+                children: [],
+                formatted: "main",
+              },
+            },
+          ],
+        },
+      ];
+      const expectRetained = () => {
+        expect(collectRetainedAttachmentIds()).toEqual(new Set([image.id, screenshot.id]));
+      };
+      const restore = vi.fn(() => {
+        expectRetained();
+        return true;
+      });
+      deps.takeQueuedMessages.mockImplementationOnce((retain) => {
+        retain(messages);
+        expectRetained();
+        return { messages, restore };
+      });
+      let queuedCollection: Promise<void> | undefined;
+      const collectDuringHandoff = async () => {
+        expectRetained();
+        __setAttachmentStoreForTests({
+          storageType: "web-indexeddb",
+          save: vi.fn(),
+          encodeBase64: vi.fn(),
+          resolvePreviewUrl: vi.fn(),
+          delete: vi.fn(),
+          garbageCollect,
+        });
+        useDraftStore.getState().saveDraftInput({
+          draftKey: "other-draft",
+          draft: { text: "Triggers runAttachmentGc", attachments: [] },
+        });
+        await collectionStarted.promise;
+        // Queue another pass with no references while the active pass is blocked.
+        queuedCollection = garbageCollectAttachments({ referencedIds: new Set() });
+        if (!succeeds) throw new Error("Switch refused");
+      };
+      const mainControlClient = createMainControlClient();
+      if (main) {
+        mainControlClient.setAgentMainControl.mockImplementationOnce(async () => {
+          await collectDuringHandoff();
+          return { enabled: true, workspaceId: "workspace-1", archivedSource: true };
+        });
+      } else {
+        deps.archiveAgent.mockImplementationOnce(collectDuringHandoff);
+      }
+      if (succeeds) {
+        draftStore.saveDraftInput.mockImplementationOnce(() => {
+          expectRetained();
+        });
+      }
+      try {
+        expect(await run(main ? { mainControlClient } : {})).toBe(succeeds);
+        expect(restore).toHaveBeenCalledTimes(succeeds ? 0 : 1);
+        if (succeeds) {
+          expect(draftStore.saveDraftInput).toHaveBeenCalledWith(
+            expect.objectContaining({
+              draft: expect.objectContaining({
+                attachments: expect.arrayContaining([messages[0].attachments[0]]),
+              }),
+            }),
+          );
+          const workspaceWrite = main
+            ? workspaceAttachmentsStore.addWorkspaceAttachment
+            : workspaceAttachmentsStore.setWorkspaceAttachments;
+          expect(workspaceWrite).toHaveBeenCalledWith(
+            expect.objectContaining(
+              main
+                ? { attachment: messages[0].attachments[1] }
+                : { attachments: expect.arrayContaining([messages[0].attachments[1]]) },
+            ),
+          );
+        }
+      } finally {
+        finishCollection.resolve();
+        await queuedCollection;
+      }
+      expect(garbageCollect.mock.calls.length).toBeGreaterThanOrEqual(2);
+      for (const [{ referencedIds }] of garbageCollect.mock.calls) {
+        expect(referencedIds.has(image.id)).toBe(true);
+        expect(referencedIds.has(screenshot.id)).toBe(true);
+      }
+      expect(stored).toEqual(new Set([image.id, screenshot.id]));
+      expect(collectRetainedAttachmentIds()).toEqual(new Set());
+      await garbageCollectAttachments({ referencedIds: new Set() });
+      expect(stored).toEqual(new Set());
+    },
+  );
 
   it("leaves the source intact until archive succeeds and reports a failed archive", async () => {
     const { deps, run, expectSourceUntouched } = createHandoff();

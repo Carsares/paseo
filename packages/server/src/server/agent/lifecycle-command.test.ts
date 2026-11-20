@@ -436,6 +436,11 @@ describe("moveAgentToWorkspaceCommand", () => {
       registry: storage,
       logger,
     });
+    await storage.upsert({
+      ...storedAgent(previousParentAgentId),
+      cwd,
+      workspaceId: sourceWorkspaceId,
+    });
     const agent = await manager.createAgent({ provider: "codex", cwd }, undefined, {
       workspaceId: sourceWorkspaceId,
       labels,
@@ -495,7 +500,9 @@ describe("moveAgentToWorkspaceCommand", () => {
       expect(closeSession).not.toHaveBeenCalled();
       const stored = await storage.get(agent.id);
       expect(stored).toMatchObject({ workspaceId, labels: { team: "test" } });
-      expect(await storage.listByWorkspaces([sourceWorkspaceId])).toEqual([]);
+      expect((await storage.listByWorkspaces([sourceWorkspaceId])).map(({ id }) => id)).toEqual([
+        previousParentAgentId,
+      ]);
       expect(await storage.listByWorkspaces([workspaceId])).toEqual([stored]);
     } finally {
       finishTurn.resolve();
@@ -527,7 +534,7 @@ describe("moveAgentToWorkspaceCommand", () => {
     expect((await storage.get(stored.id))?.archivedAt).toBeFalsy();
   });
 
-  test("rechecks the entire descendant path after a detach during candidate collection", async () => {
+  test("serializes a detach with descendant collection for a workspace move", async () => {
     const root = closedSubagent();
     const child = { ...closedSubagent(), labels: { [PARENT_AGENT_ID_LABEL]: root.id } };
     const grandchild = { ...closedSubagent(), labels: { [PARENT_AGENT_ID_LABEL]: child.id } };
@@ -546,20 +553,17 @@ describe("moveAgentToWorkspaceCommand", () => {
       allocateWorkspace: async () => ({ workspaceId }),
     });
     await captured.promise;
-    try {
-      await manager.detachAgent(child.id);
-    } finally {
-      release.resolve();
-      await move;
-    }
+    const detach = manager.detachAgent(child.id);
+    release.resolve();
+    await Promise.all([move, detach]);
 
     expect(await storage.get(root.id)).toMatchObject({ workspaceId });
     expect(await storage.get(child.id)).toMatchObject({
-      workspaceId: sourceWorkspaceId,
+      workspaceId,
       labels: {},
     });
     expect(await storage.get(grandchild.id)).toMatchObject({
-      workspaceId: sourceWorkspaceId,
+      workspaceId,
       labels: { [PARENT_AGENT_ID_LABEL]: child.id },
     });
   });
@@ -878,6 +882,11 @@ describe("moveAgentToWorkspaceCommand", () => {
       registry: storage,
       logger,
     });
+    await storage.upsert({
+      ...storedAgent(previousParentAgentId),
+      cwd,
+      workspaceId: sourceWorkspaceId,
+    });
     const agent = await manager.createAgent({ provider: "codex", cwd }, undefined, {
       workspaceId: sourceWorkspaceId,
       labels,
@@ -924,7 +933,9 @@ describe("moveAgentToWorkspaceCommand", () => {
     const updatedAt = notified.updatedAt.toISOString();
     const expected = { ...stored, updatedAt, lastActivityAt: updatedAt };
     expect(await storage.get(agent.id)).toEqual(expected);
-    expect(await storage.listByWorkspaces([sourceWorkspaceId])).toEqual([expected]);
+    expect(
+      (await storage.listByWorkspaces([sourceWorkspaceId])).find(({ id }) => id === agent.id),
+    ).toEqual(expected);
     expect(await storage.listByWorkspaces([workspaceId])).toEqual([]);
   });
 

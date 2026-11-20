@@ -41,7 +41,7 @@ interface DraftStoreActions {
   getDraftInput: (draftKey: string) => DraftInput | undefined;
   hydrateDraftInput: (input: { draftKey: string }) => Promise<DraftInput | undefined>;
   saveDraftInput: (input: { draftKey: string; draft: DraftInput }) => void;
-  /** Saves what `update` makes of the current input; an emptied input abandons the draft. */
+  /** Applies a pure update, which may be replayed once after restoring disk state. An emptied input abandons the draft. */
   updateDraftInput: (input: {
     draftKey: string;
     update: (current: DraftInput) => DraftInput;
@@ -87,6 +87,45 @@ const draftPersistStorage = createDraftPersistStorage(createQuoteAwareDraftStora
 
 export function flushDraftPersistStorage(): Promise<void> {
   return draftPersistStorage?.flush() ?? Promise.resolve();
+}
+
+type DraftIntent = (record: DraftRecord | undefined) => DraftRecord | undefined;
+
+function beginDraftHydration() {
+  let finish = () => {};
+  const done = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  return {
+    done,
+    finish,
+    resumeWrites: draftPersistStorage.pauseWrites(),
+    intents: new Map<string, DraftIntent[]>(),
+    modalChanged: false,
+  };
+}
+
+let hydration: ReturnType<typeof beginDraftHydration> | undefined;
+
+function applyDraftIntent(
+  set: (update: (state: DraftStore) => Partial<DraftStore>) => void,
+  draftKey: string,
+  intent: DraftIntent,
+): void {
+  set((state) => {
+    const previous = state.drafts[draftKey];
+    const next = intent(previous);
+    if (hydration) {
+      const intents = hydration.intents.get(draftKey) ?? [];
+      intents.push(intent);
+      hydration.intents.set(draftKey, intents);
+    }
+    if (next === previous) return state;
+    const drafts = { ...state.drafts };
+    if (next) drafts[draftKey] = next;
+    else delete drafts[draftKey];
+    return { drafts };
+  });
 }
 
 function createDraftRecord(input: {
@@ -145,7 +184,8 @@ const migrateLegacyImages: MigrateLegacyImages = async (images) => {
 };
 
 async function runAttachmentGc(): Promise<void> {
-  // Restored workspace attachments can still reference screenshot files.
+  // Restored drafts and workspace attachments can both reference screenshot files.
+  await hydration?.done;
   await useWorkspaceAttachmentsStore.hydration;
   gcScheduled = false;
   const nowMs = Date.now();
@@ -214,6 +254,8 @@ function collectQueuedMessageAttachmentIds(
       for (const attachment of queuedMessage.attachments) {
         if (attachment.kind === "image") {
           referencedIds.add(attachment.metadata.id);
+        } else if (attachment.kind === "browser_element" && attachment.attachment.screenshot) {
+          referencedIds.add(attachment.attachment.screenshot.id);
         }
       }
     }
@@ -283,6 +325,7 @@ export const useDraftStore = create<DraftStore>()(
       },
 
       hydrateDraftInput: async ({ draftKey }) => {
+        if (hydration) await hydration.done;
         const current = get().drafts[draftKey];
         if (!current) {
           return undefined;
@@ -302,7 +345,7 @@ export const useDraftStore = create<DraftStore>()(
 
         set((state) => {
           const existing = state.drafts[draftKey];
-          if (!existing || existing.version !== current.version) {
+          if (existing !== current) {
             return state;
           }
           return {
@@ -318,38 +361,41 @@ export const useDraftStore = create<DraftStore>()(
         });
 
         scheduleAttachmentGc();
-        return migratedDraft;
+        return get().getDraftInput(draftKey);
       },
 
       saveDraftInput: ({ draftKey, draft }) => {
-        set((state) => {
-          const existing = state.drafts[draftKey];
-          return {
-            drafts: {
-              ...state.drafts,
-              [draftKey]: createDraftRecord({
-                draft,
-                lifecycle: "active",
-                previousVersion: existing?.version,
-              }),
-            },
-          };
-        });
+        applyDraftIntent(set, draftKey, (existing) =>
+          createDraftRecord({ draft, lifecycle: "active", previousVersion: existing?.version }),
+        );
         scheduleAttachmentGc();
       },
 
       updateDraftInput: ({ draftKey, update }) => {
-        const next = update(get().getDraftInput(draftKey) ?? { text: "", attachments: [] });
-        if (hasDraftContent(next)) get().saveDraftInput({ draftKey, draft: next });
-        else get().clearDraftInput({ draftKey, lifecycle: "abandoned" });
+        applyDraftIntent(set, draftKey, (existing) => {
+          const next = update(toDraftInputIfReady(existing) ?? { text: "", attachments: [] });
+          if (hasDraftContent(next)) {
+            return createDraftRecord({
+              draft: next,
+              lifecycle: "active",
+              previousVersion: existing?.version,
+            });
+          }
+          return existing
+            ? (applyClearDraftRecord({
+                record: existing,
+                lifecycle: "abandoned",
+                nowMs: Date.now(),
+              }) ?? undefined)
+            : undefined;
+        });
+        scheduleAttachmentGc();
       },
 
       editDraftText: ({ draftKey, text }) => {
-        set((state) => {
-          const previous = state.drafts[draftKey];
-          const next = editDraftRecordText(previous, text, Date.now());
-          return next === previous ? state : { drafts: { ...state.drafts, [draftKey]: next } };
-        });
+        applyDraftIntent(set, draftKey, (existing) =>
+          editDraftRecordText(existing, text, Date.now()),
+        );
       },
 
       replaceDraftText: ({ draftKey, text }) => {
@@ -363,50 +409,20 @@ export const useDraftStore = create<DraftStore>()(
       },
 
       markDraftLifecycle: ({ draftKey, lifecycle }) => {
-        set((state) => {
-          const existing = state.drafts[draftKey];
-          if (!existing || existing.lifecycle === lifecycle) {
-            return state;
-          }
-          return {
-            drafts: {
-              ...state.drafts,
-              [draftKey]: {
-                ...existing,
-                lifecycle,
-                updatedAt: Date.now(),
-                version: existing.version + 1,
-              },
-            },
-          };
+        applyDraftIntent(set, draftKey, (existing) => {
+          if (!existing || existing.lifecycle === lifecycle) return existing;
+          return { ...existing, lifecycle, updatedAt: Date.now(), version: existing.version + 1 };
         });
         scheduleAttachmentGc();
       },
 
       clearDraftInput: ({ draftKey, lifecycle }) => {
-        set((state) => {
-          const existing = state.drafts[draftKey];
-          if (!existing) {
-            return state;
-          }
-          const cleared = applyClearDraftRecord({
-            record: existing,
-            lifecycle,
-            nowMs: Date.now(),
-          });
-          if (cleared) {
-            return {
-              drafts: {
-                ...state.drafts,
-                [draftKey]: cleared,
-              },
-            };
-          }
-          const nextDrafts = { ...state.drafts };
-          delete nextDrafts[draftKey];
-          return { drafts: nextDrafts };
-        });
-
+        applyDraftIntent(set, draftKey, (existing) =>
+          existing
+            ? (applyClearDraftRecord({ record: existing, lifecycle, nowMs: Date.now() }) ??
+              undefined)
+            : undefined,
+        );
         scheduleAttachmentGc();
       },
 
@@ -461,6 +477,7 @@ export const useDraftStore = create<DraftStore>()(
       },
 
       saveCreateModalDraft: (draft) => {
+        if (hydration) hydration.modalChanged = true;
         set((state) => {
           if (!draft) {
             return { createModalDraft: null };
@@ -490,8 +507,36 @@ export const useDraftStore = create<DraftStore>()(
           migrateLegacyImages,
           nowMs: Date.now(),
         }),
+      merge: (persisted, current) => {
+        const restored = persisted as Partial<DraftStoreState> | undefined;
+        const drafts = { ...current.drafts, ...restored?.drafts };
+        for (const [draftKey, intents] of hydration?.intents ?? []) {
+          const record = intents.reduce(
+            (previous, intent) => intent(previous),
+            restored?.drafts?.[draftKey],
+          );
+          if (record) drafts[draftKey] = record;
+          else delete drafts[draftKey];
+        }
+        // Metadata is runtime-only. Keep the already applied patches and clears in current.
+        return {
+          ...current,
+          drafts,
+          createModalDraft: hydration?.modalChanged
+            ? current.createModalDraft
+            : (restored?.createModalDraft ?? null),
+        };
+      },
       onRehydrateStorage: () => {
-        return () => {
+        const window = (hydration ??= beginDraftHydration());
+        return (_state, error) => {
+          hydration = undefined;
+          if (!error && draftPersistStorage.hasPendingWrite()) {
+            // Replace the pending partial checkpoint with the complete merged state.
+            useDraftStore.setState((state) => state);
+          }
+          window.resumeWrites(Boolean(error));
+          window.finish();
           void migrateAllLegacyDrafts();
           scheduleAttachmentGc();
         };

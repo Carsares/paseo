@@ -119,11 +119,8 @@ function SelectionActions({
   }, []);
   const spawnSubagent = useCallback(
     (quote: string, messageRowId: string | null) => {
-      if (messageRowId === null) {
-        onSpawnSubagentFromSelection?.(quote);
-      } else {
-        onSpawnSubagentFromSelection?.(quote, { messageRowId });
-      }
+      if (messageRowId === null) onSpawnSubagentFromSelection?.(quote);
+      else onSpawnSubagentFromSelection?.(quote, { messageRowId });
     },
     [onSpawnSubagentFromSelection],
   );

@@ -25,11 +25,11 @@ export function createMarkdownStyles(
 } {
   const fontSize = compact ? theme.fontSize.base : theme.fontSize.content;
   const contentLineHeight = theme.lineHeight?.content ?? Math.round(theme.fontSize.content * 1.6);
-  const lineHeight = compact
-    ? Math.round(
-        fontSize * (theme.fontSize.content > 0 ? contentLineHeight / theme.fontSize.content : 1.6),
-      )
-    : contentLineHeight;
+  const lineHeightRatio =
+    theme.fontSize.content > 0 ? contentLineHeight / theme.fontSize.content : 1.6;
+  const lineHeight = compact ? Math.round(fontSize * lineHeightRatio) : contentLineHeight;
+  const codeFontSize = theme.fontSize.code;
+  const codeLineHeight = Math.round(codeFontSize * lineHeightRatio);
   // Every block is followed by the same gap; the library drops it after the last block.
   const block = { marginTop: 0, marginBottom: blockGap };
   const paragraph = {
@@ -102,7 +102,8 @@ export function createMarkdownStyles(
       codeBlock: {
         ...paragraph,
         fontFamily: theme.fontFamily.mono === "ui-monospace" && !isWeb ? "" : theme.fontFamily.mono,
-        fontSize: theme.fontSize.code,
+        fontSize: codeFontSize,
+        lineHeight: Math.max(codeFontSize, codeLineHeight),
         backgroundColor: theme.colors.surface2,
         borderColor: theme.colors.border,
         borderRadius: 8,

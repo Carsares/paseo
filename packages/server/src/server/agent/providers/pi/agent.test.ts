@@ -85,6 +85,35 @@ function createConfig(overrides: Partial<AgentSessionConfig> = {}): AgentSession
   };
 }
 
+test("launches and resumes a Main Control session with only read-only built-in tools", async () => {
+  const pi = new FakePi(["pi", "--tools", "read,bash"]);
+  const client = createClient(pi);
+  const config = createConfig({ providerOptions: { mainControlReadOnly: true } });
+  const created = await client.createSession(config);
+  await created.close();
+  const resumed = await client.resumeSession(
+    {
+      provider: "pi",
+      sessionId: "main-control",
+      nativeHandle: "/tmp/pi-main-control.jsonl",
+    },
+    config,
+  );
+  await resumed.close();
+  for (const { argv } of pi.recordedLaunches) {
+    expect(argv.slice(-2)).toEqual(["--tools", "read,grep,find,ls"]);
+  }
+});
+
+test("refuses to launch Main Control when Pi would ignore the read-only flags", async () => {
+  const pi = new FakePi(["pi", "--mode", "rpc", "--"]);
+  const client = createClient(pi);
+  await expect(
+    client.createSession(createConfig({ providerOptions: { mainControlReadOnly: true } })),
+  ).rejects.toThrow("cannot enforce read-only tools");
+  expect(pi.recordedLaunches).toHaveLength(0);
+});
+
 class ManualUsagePollScheduler implements PiUsagePollScheduler {
   private readonly polls: Array<{ active: boolean; callback: () => void }> = [];
 

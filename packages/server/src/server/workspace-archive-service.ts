@@ -1,7 +1,10 @@
 import { resolve } from "node:path";
 
 import type { Logger } from "pino";
-import { isMainControlAgentLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  getParentAgentIdFromLabels,
+  isMainControlAgentLabels,
+} from "@getpaseo/protocol/agent-labels";
 
 import type { AgentManager } from "./agent/agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
@@ -155,6 +158,9 @@ export async function archiveByScope(
   if (isMainControlAgentLabels(request.caller?.labels)) {
     throw new Error(MAIN_CONTROL_WRITE_DENIAL);
   }
+  if (getParentAgentIdFromLabels(request.caller?.labels)) {
+    throw new Error("Subagents cannot archive a workspace.");
+  }
   return runWithGitCommandPriority("high", () => archiveByScopeWithPriority(dependencies, request));
 }
 
@@ -173,9 +179,6 @@ async function archiveByScopeWithPriority(
   const target = await resolveArchiveTarget(dependencies, request.scope);
   const targetWorkspaceIds = target.workspaceIds;
 
-  await stopWorkspaceSetups(dependencies, target.setupWorkspaceIds, request.requestId);
-  checkpoint();
-
   if (targetWorkspaceIds.length > 0) {
     dependencies.markWorkspaceArchiving(targetWorkspaceIds, new Date().toISOString());
   }
@@ -184,6 +187,8 @@ async function archiveByScopeWithPriority(
   let directoryLeftBehind: ArchiveResult["directoryLeftBehind"];
 
   try {
+    await stopWorkspaceSetups(dependencies, target.setupWorkspaceIds, request.requestId);
+    checkpoint();
     if (targetWorkspaceIds.length > 0) {
       await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
     }

@@ -119,7 +119,9 @@ describe("useOpenAgentTabLabels", () => {
       clientId.resolve("client-1");
     });
     update.resolve();
-    expect(updateAgent.mock.calls).toEqual([["local", { labels: { [label]: "true" } }]]);
+    expect(updateAgent.mock.calls).toEqual([
+      ["local", { labels: { [label]: "true" }, expectedWorkspaceId: "source" }],
+    ]);
   });
 });
 

@@ -9,6 +9,11 @@ const ReceiptSchema = z.object({
   state: z.enum(["pending", "completed"]),
   agentId: z.string(),
 });
+export class AgentRequestOutcomeUnknownError extends Error {
+  constructor() {
+    super("agent_request_outcome_unknown");
+  }
+}
 interface SendMessageInput {
   agentId: string;
   messageId: string;
@@ -60,7 +65,7 @@ export class MessageReceipts {
       if (existing.fingerprint !== fingerprint) throw new Error("agent_request_key_conflict");
       if (existing.state === "completed") return;
       // A provider may have accepted the message before its receipt was committed.
-      throw new Error("agent_request_outcome_unknown");
+      throw new AgentRequestOutcomeUnknownError();
     }
     const receipt = { fingerprint, agentId: input.agentId };
     let pending: Promise<void> | null = null;

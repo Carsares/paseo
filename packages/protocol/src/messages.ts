@@ -1056,6 +1056,7 @@ export const CloseItemsRequestMessageSchema = z.object({
 export const UpdateAgentRequestMessageSchema = z.object({
   type: z.literal("update_agent_request"),
   agentId: z.string(),
+  expectedWorkspaceId: z.string().optional(),
   name: z.string().optional(),
   labels: z.record(z.string(), z.string()).optional(),
   requestId: z.string(),
@@ -2293,6 +2294,7 @@ export const AgentMoveToWorkspaceRequestMessageSchema = z.object({
   type: z.literal("agent.move_to_workspace.request"),
   agentId: z.string(),
   idempotencyKey: z.string().optional(),
+  expectedWorkspaceId: z.string().optional(),
   requestId: z.string(),
 });
 
@@ -2311,6 +2313,8 @@ export const AgentSetMainRequestMessageSchema = z.object({
   type: z.literal("agent.set_main.request"),
   agentId: z.string(),
   enabled: z.boolean(),
+  handoffFromAgentId: z.string().min(1).optional(),
+  archiveSource: z.boolean().optional(),
   requestId: z.string(),
 });
 
@@ -2321,6 +2325,7 @@ export const AgentSetMainResponseMessageSchema = z.object({
     agentId: z.string(),
     accepted: z.boolean(),
     enabled: z.boolean(),
+    archivedSource: z.boolean().optional(),
     workspaceId: z.string().nullable(),
     error: z.string().nullable(),
   }),

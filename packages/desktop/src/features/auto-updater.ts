@@ -7,6 +7,7 @@ import log from "electron-log/main";
 import { autoUpdater } from "electron-updater";
 import { getDesktopSettingsStore } from "../settings/desktop-settings-electron.js";
 import {
+  AppUpdateHandoffUncertainError,
   createAppUpdateService,
   type AppUpdateCheckResult,
   type AppUpdateInstallRequest,
@@ -155,8 +156,7 @@ async function isOfficialUpdatesEnabled(): Promise<boolean> {
 class ElectronAppUpdateRuntime implements AppUpdateRuntime {
   private configured = false;
   private macDownloadedInfo: RuntimeUpdateInfo | null = null;
-  private macNativeReady = false;
-  private macNativePreparationTimedOut = false;
+  private macNativeInstallPending = false;
   private nativeHandoffTimedOut = false;
   private onUpdateDownloaded?: AppUpdateRuntimeConfiguration["onUpdateDownloaded"];
 
@@ -204,7 +204,6 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
       const updateInfo = info as RuntimeUpdateInfo;
       if (process.platform === "darwin") {
         this.macDownloadedInfo = updateInfo;
-        this.macNativeReady = false;
       }
       updateLifecycleLog.updateDownloaded(updateInfo.version);
       this.onUpdateDownloaded?.(updateInfo);
@@ -249,7 +248,6 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
     if (downloaded?.version !== targetVersion) {
       throw new Error(`Squirrel's feed is not serving Paseo ${targetVersion}.`);
     }
-    if (this.macNativeReady) return;
     const feedUrl = electronAutoUpdater.getFeedURL();
     const feedOrigin = new URL(feedUrl).origin;
 
@@ -270,6 +268,8 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
         _date: Date,
         updateUrl: string,
       ) => {
+        // A different feed cannot approve this handoff, but its update can still install on exit.
+        this.macNativeInstallPending = true;
         if (!URL.canParse(updateUrl) || new URL(updateUrl).origin !== feedOrigin) return;
         cleanup();
         resolve();
@@ -283,7 +283,7 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
       const timeout = setTimeout(() => {
         // Electron cannot cancel a native check. An event from this attempt
         // cannot authorize a retry, even if it uses the same feed URL.
-        this.macNativePreparationTimedOut = true;
+        this.macNativeInstallPending = true;
         onError(new Error("macOS did not finish preparing the update in time."));
       }, MAC_UPDATE_PREPARATION_TIMEOUT_MS);
       electronAutoUpdater.on("update-downloaded", onReady);
@@ -298,7 +298,6 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
     if (this.macDownloadedInfo !== downloaded || electronAutoUpdater.getFeedURL() !== feedUrl) {
       throw new Error(`Squirrel's feed changed while preparing Paseo ${targetVersion}.`);
     }
-    this.macNativeReady = true;
   }
 
   getInstallBlockReason(): string | undefined {
@@ -306,7 +305,7 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
     // acknowledge a second install in this process.
     if (
       this.nativeHandoffTimedOut ||
-      (process.platform === "darwin" && this.macNativePreparationTimedOut)
+      (process.platform === "darwin" && this.macNativeInstallPending)
     ) {
       return "Restart Paseo before retrying the update.";
     }
@@ -318,17 +317,23 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
     beforeHandoff?: () => Promise<void>,
   ): Promise<void> {
     const isMac = process.platform === "darwin";
+    await beforeHandoff?.();
     const release = isMac ? await getDesktopSettingsStore().beginOfficialUpdateInstall() : null;
     if (isMac && !release) throw new Error("Official updates are disabled.");
     try {
       if (isMac) await this.prepareMacUpdate(request.targetVersion);
-      await beforeHandoff?.();
-      // Native preparation on macOS has already committed the update. On
-      // other platforms the user can still disable updates until handoff.
       if (!isMac && !(await isOfficialUpdatesEnabled())) {
         throw new Error("Official updates are disabled.");
       }
       await this.handoffUpdate(request, isMac);
+    } catch (error) {
+      if (isMac && this.macNativeInstallPending) {
+        throw new AppUpdateHandoffUncertainError(
+          "macOS may install the update on exit. Quit and reopen Paseo before retrying.",
+          { cause: error },
+        );
+      }
+      throw error;
     } finally {
       release?.();
     }

@@ -89,6 +89,7 @@ import {
   asGitHubService,
   asWorkspaceGitService,
   asDaemonConfigStore,
+  filterByType,
   findByType,
   createProviderSnapshot,
   createProviderSnapshotManagerStub,
@@ -443,6 +444,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
         ? options.agentManager
         : asAgentManager({
             listAgents: vi.fn(() => []),
+            getStoredWorkspaceMoveSnapshots: () => new Map(),
             listProviderSubagentActivity: vi.fn(() => []),
             getAgentBackgroundWorkSummary: () => undefined,
             subscribe: vi.fn(() => () => {}),
@@ -2035,7 +2037,11 @@ describe("agent detach RPC", () => {
       requestId: "detach-1",
     });
 
-    expect(detachAgent).toHaveBeenCalledWith("child-agent");
+    expect(detachAgent).toHaveBeenCalledWith(
+      "child-agent",
+      expect.any(Function),
+      expect.any(Function),
+    );
     expect(messages).toContainEqual({
       type: "agent_update",
       payload: {
@@ -2083,12 +2089,14 @@ test("creation preserves the human first prompt while assigning validated local 
     updatedAt: "2026-01-01T00:00:00.000Z",
   });
   const messages: SessionOutboundMessage[] = [];
+  const providers = createProviderSnapshotManagerStub();
   const session = createSessionForTest({
     messages,
     paseoHome: cwd,
     serverId: "local-host",
     agentManager: manager,
     agentStorage: storage,
+    providerSnapshotManager: providers.manager,
     workspaceRegistry: { get: vi.fn().mockResolvedValue(workspace) },
   });
   try {
@@ -2131,6 +2139,15 @@ test("creation preserves the human first prompt while assigning validated local 
       REMOTE_HIERARCHY_DEPTH_LABEL,
     );
 
+    // Move after the request resolved placement and before it enters the creation lock.
+    const destinationWorkspaceId = "destination-workspace";
+    providers.resolveCreateConfig.mockImplementationOnce(async () => {
+      await manager.moveSubagentToWorkspace(parent.id, {
+        serverId: "local-host",
+        allocateWorkspace: async () => ({ workspaceId: destinationWorkspaceId }),
+      });
+      return { modeId: undefined, providerOptions: undefined };
+    });
     await session.handleMessage({
       type: "create_agent_request",
       config,
@@ -2138,6 +2155,14 @@ test("creation preserves the human first prompt while assigning validated local 
       initialPrompt: "Delegated by the parent",
       labels: {},
       requestId: "create-delegated",
+    });
+    const delegated = filterByType(messages, "status").find(
+      ({ payload }) => payload.requestId === "create-delegated",
+    );
+    expect(delegated?.payload).toMatchObject({ status: "agent_created" });
+    expect(await storage.get(delegated!.payload.agentId!)).toMatchObject({
+      workspaceId: destinationWorkspaceId,
+      labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
     });
     expect(parseAgentMessage(onStartTurn.mock.lastCall?.[0])).toMatchObject({
       source: { kind: "agent-message", agentId: parent.id },
@@ -2173,7 +2198,11 @@ describe("agent move to workspace RPC", () => {
     tempDirs.push(cwd);
     const logger = pino({ level: "silent" });
     const storage = new AgentStorage(join(cwd, "agents"), logger);
-    const manager = new AgentManager({ registry: storage, logger });
+    const manager = new AgentManager({
+      clients: { codex: createTestAgentClient("codex") },
+      registry: storage,
+      logger,
+    });
     const registry = new FileBackedWorkspaceRegistry(join(cwd, "workspaces.json"), logger);
     const project = createPersistedProjectRecord({
       projectId: "move-project",
@@ -2233,6 +2262,8 @@ describe("agent move to workspace RPC", () => {
       isPaseoOwnedWorktree: false,
       mainRepoRoot: null,
     }));
+    const providers = createProviderSnapshotManagerStub();
+    providers.listRegisteredProviderIds.mockReturnValue(["codex"]);
     const createSession = (
       outbound: SessionOutboundMessage[],
       agentManager = manager,
@@ -2242,6 +2273,7 @@ describe("agent move to workspace RPC", () => {
         messages: outbound,
         paseoHome: cwd,
         serverId: "local-host",
+        providerSnapshotManager: providers.manager,
         agentManager: {
           getAgent: agentManager.getAgent.bind(agentManager),
           listAgents: agentManager.listAgents.bind(agentManager),
@@ -2249,6 +2281,12 @@ describe("agent move to workspace RPC", () => {
           archiveSnapshot: agentManager.archiveSnapshot.bind(agentManager),
           archiveAgentInWorkspace: agentManager.archiveAgentInWorkspace.bind(agentManager),
           moveSubagentToWorkspace: agentManager.moveSubagentToWorkspace.bind(agentManager),
+          getStoredWorkspaceMoveSnapshots:
+            agentManager.getStoredWorkspaceMoveSnapshots.bind(agentManager),
+          recoverPendingWorkspaceMove: agentManager.recoverPendingWorkspaceMove.bind(agentManager),
+          updateAgentMetadata: agentManager.updateAgentMetadata.bind(agentManager),
+          createSilentWorkspaceMainAgent:
+            agentManager.createSilentWorkspaceMainAgent.bind(agentManager),
         },
         agentStorage: {
           get: agentStorage.get.bind(agentStorage),
@@ -2264,7 +2302,7 @@ describe("agent move to workspace RPC", () => {
           list: vi.fn().mockResolvedValue([project]),
           remove: vi.fn().mockResolvedValue(undefined),
         },
-        workspaceGitService: { getCheckout },
+        workspaceGitService: { getCheckout, getSnapshot: vi.fn().mockResolvedValue(undefined) },
       });
     const session = createSession(messages);
     sessions.push(session);
@@ -2370,6 +2408,7 @@ describe("agent move to workspace RPC", () => {
       type: "agent.move_to_workspace.request" as const,
       agentId: childId,
       idempotencyKey: "move-key",
+      expectedWorkspaceId: sourceWorkspaceId,
     };
     await session.handleMessage({ ...request, requestId: "move-1" });
     const beforeReplay = messages.length;
@@ -2395,6 +2434,14 @@ describe("agent move to workspace RPC", () => {
         },
       })),
     );
+    await session.handleMessage({ ...request, idempotencyKey: "stale", requestId: "stale-move" });
+    expect(
+      messages.findLast((message) => message.type === "agent.move_to_workspace.response")?.payload,
+    ).toMatchObject({
+      requestId: "stale-move",
+      accepted: false,
+      error: expect.stringContaining("no longer in workspace"),
+    });
   });
 
   test("only archives agents still in the workspace named by a bulk close", async () => {
@@ -2406,6 +2453,17 @@ describe("agent move to workspace RPC", () => {
     });
     const moved = (await storage.get(childId))!;
     expect(moved.workspaceId).not.toBe(sourceWorkspaceId);
+    await session.handleMessage({
+      type: "update_agent_request",
+      agentId: childId,
+      expectedWorkspaceId: sourceWorkspaceId,
+      labels: { "paseo.open-agent-tab.old-client": "true" },
+      requestId: "stale-open-label",
+    });
+    expect(findByType(messages, "update_agent_response")?.payload).toMatchObject({
+      requestId: "stale-open-label",
+      accepted: false,
+    });
 
     await session.handleMessage({
       type: "archive_agent_request",
@@ -2664,6 +2722,23 @@ describe("agent move to workspace RPC", () => {
         expect(await storage.get(childId)).toMatchObject({ workspaceId });
         expect(await registry.get(workspaceId)).toBeNull();
         expect(workspaceRegistry.upsert).not.toHaveBeenCalled();
+        await session.handleMessage({
+          type: "fetch_agents_request",
+          scope: "active",
+          requestId: "directory-during-move",
+        });
+        const directory = filterByType(messages, "fetch_agents_response").find(
+          ({ payload }) => payload.requestId === "directory-during-move",
+        );
+        expect(
+          directory?.payload.entries.find(({ agent }) => agent.id === childId)?.agent,
+        ).toMatchObject({
+          workspaceId: sourceWorkspaceId,
+          labels: {
+            [getOpenAgentTabLabel("client-a")]: "true",
+            [getOpenAgentTabLabel("client-b")]: "true",
+          },
+        });
       } finally {
         failWrite.resolve();
         await move;
@@ -2677,6 +2752,49 @@ describe("agent move to workspace RPC", () => {
     } finally {
       write.mockRestore();
     }
+  });
+
+  test("keeps move protection when a rollback write silently fails and retries recovery", async () => {
+    const { session, messages, registry, storage, manager, workspaceRegistry } = await setup();
+    workspaceRegistry.upsert.mockRejectedValueOnce(new Error("Cannot publish destination"));
+    const upsert = storage.upsert.bind(storage);
+    const refuseRestore = vi.spyOn(storage, "upsert").mockImplementation(async (record) => {
+      if (record.id === childId && record.workspaceId === sourceWorkspaceId) return;
+      return upsert(record);
+    });
+    try {
+      await session.handleMessage({
+        type: "agent.move_to_workspace.request",
+        agentId: childId,
+        requestId: "move-requires-recovery",
+      });
+      expect(findByType(messages, "agent.move_to_workspace.response")?.payload).toMatchObject({
+        accepted: false,
+        error: "Workspace move requires recovery",
+      });
+      expect((await storage.get(childId))?.workspaceId).not.toBe(sourceWorkspaceId);
+      await expect(manager.updateAgentMetadata(childId, { title: "Blocked" })).rejects.toThrow(
+        "requires recovery",
+      );
+      await session.handleMessage({
+        type: "archive_workspace_request",
+        workspaceId: sourceWorkspaceId,
+        requestId: "archive-before-recovery",
+      });
+      expect(findByType(messages, "archive_workspace_response")?.payload.error).toContain(
+        "did not restore agent",
+      );
+      expect((await registry.get(sourceWorkspaceId))?.archivedAt).toBeNull();
+      await expect(manager.recoverPendingWorkspaceMove()).rejects.toThrow("did not restore agent");
+    } finally {
+      refuseRestore.mockRestore();
+    }
+    await manager.recoverPendingWorkspaceMove();
+    expect((await storage.get(childId))?.workspaceId).toBe(sourceWorkspaceId);
+    expect(await registry.listActive()).toHaveLength(1);
+    await expect(
+      manager.updateAgentMetadata(childId, { title: "Writable" }),
+    ).resolves.toBeUndefined();
   });
 
   test("uses the history request's archived workspace snapshot for filtering and placement", async () => {
@@ -2844,6 +2962,68 @@ describe("agent move to workspace RPC", () => {
       requestId: "archive-after-move",
       error: null,
     });
+  });
+
+  test("workspace archive waits for the default Main write and archives that session", async () => {
+    const { session, messages, registry, storage, createSession, cwd, project } = await setup();
+    const archiveMessages: SessionOutboundMessage[] = [];
+    const archiveSession = createSession(archiveMessages);
+    sessions.push(archiveSession);
+    const writingMain = deferred<{ agentId: string; workspaceId: string }>();
+    const releaseMain = deferred<void>();
+    const marked = deferred<void>();
+    const upsert = storage.upsert.bind(storage);
+    using _write = vi.spyOn(storage, "upsert").mockImplementationOnce(async (record) => {
+      expect(record.labels[WORKSPACE_ROLE_LABEL]).toBe("main");
+      writingMain.resolve({ agentId: record.id, workspaceId: record.workspaceId! });
+      await releaseMain.promise;
+      await upsert(record);
+    });
+    const markArchiving = archiveSession.markWorkspaceArchiving.bind(archiveSession);
+    using _mark = vi
+      .spyOn(archiveSession, "markWorkspaceArchiving")
+      .mockImplementationOnce((ids, at) => {
+        markArchiving(ids, at);
+        marked.resolve();
+      });
+    using list = vi.spyOn(storage, "listByWorkspace");
+    const create = session.handleMessage({
+      type: "workspace.create.request",
+      requestId: "create-default-main",
+      source: { kind: "directory", path: cwd, projectId: project.projectId },
+      mainAgent: { config: { provider: "codex", cwd } },
+    });
+    let archive: Promise<void> | undefined;
+    try {
+      const { agentId, workspaceId } = await Promise.race([
+        writingMain.promise,
+        create.then(() => {
+          throw new Error(
+            findByType(messages, "workspace.create.response")?.payload.error ??
+              "Workspace creation did not write the default Main",
+          );
+        }),
+      ]);
+      archive = archiveSession.handleMessage({
+        type: "archive_workspace_request",
+        requestId: "archive-during-main-write",
+        workspaceId,
+      });
+      await Promise.race([marked.promise, archive]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(list).not.toHaveBeenCalled();
+      releaseMain.resolve();
+      await Promise.all([create, archive]);
+      expect(findByType(messages, "workspace.create.response")?.payload.mainAgent?.id).toBe(
+        agentId,
+      );
+      expect(findByType(archiveMessages, "archive_workspace_response")?.payload.error).toBeNull();
+      expect((await registry.get(workspaceId))?.archivedAt).toBeTruthy();
+      expect((await storage.get(agentId))?.archivedAt).toBeTruthy();
+    } finally {
+      releaseMain.resolve();
+      await Promise.all([create, archive]);
+    }
   });
 
   test("project removal includes a workspace published by a move already persisting", async () => {

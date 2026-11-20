@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   createAppUpdateService,
@@ -299,6 +299,34 @@ describe("app update service", () => {
 
     expect(events).toEqual(["stop:1.2.4", "clear-marker", "handoff:1.2.4", "restart-daemon"]);
     expect(result).toMatchObject({ installed: false, message: expect.stringContaining("refused") });
+  });
+
+  it("keeps the daemon stopped and saves recovery when an ordinary quit install fails", async () => {
+    const { runtime, service } = createService();
+    const input = { currentVersion: "1.2.3", releaseChannel: "stable" } as const;
+    runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
+    await service.checkForAppUpdate({ ...input, intent: "automatic" });
+    runtime.finishUpdateDownload(rolledOutUpdate);
+    runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
+    runtime.quitAndInstall = async (_request, beforeHandoff) => {
+      await beforeHandoff?.();
+      throw new Error("Installer refused the update");
+    };
+    const restore = vi.fn(async () => {});
+    const preserveForNextLaunch = vi.fn(async () => {});
+    const beforeHandoff = vi.fn(async () => {});
+    await expect(
+      service.installUpdateOnQuit({
+        ...input,
+        signal: new AbortController().signal,
+        onBeforeQuit: async () => ({ restore, preserveForNextLaunch, beforeHandoff }),
+      }),
+    ).resolves.toBe(false);
+    expect(preserveForNextLaunch).toHaveBeenCalledOnce();
+    expect(beforeHandoff.mock.invocationCallOrder[0]).toBeLessThan(
+      preserveForNextLaunch.mock.invocationCallOrder[0],
+    );
+    expect(restore).not.toHaveBeenCalled();
   });
 
   it("keeps later checks from replacing the target while its daemon is stopping", async () => {

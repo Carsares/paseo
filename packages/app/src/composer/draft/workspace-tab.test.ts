@@ -694,6 +694,7 @@ describe("workspace tab lifecycle", () => {
         const label = getOpenAgentTabLabel(await getOrCreateClientId());
         expect(updateAgent).toHaveBeenCalledExactlyOnceWith(child.id, {
           labels: { [label]: "false" },
+          expectedWorkspaceId: "source",
         });
       } finally {
         store.clearSession(serverId);
@@ -894,26 +895,28 @@ describe("selection right click menu", () => {
     const i18n = await createEnglishI18n();
     const streamRef = createRef<HTMLDivElement>();
     const spawn = vi.fn();
-    const { unmount } = render(
-      createElement(
+    function stream(showReply: boolean) {
+      return createElement(
         I18nextProvider,
         { i18n },
         createElement(
           "div",
           { ref: streamRef },
-          createElement(
-            "div",
-            { "data-message-id": "assistant-row-1" },
-            createElement("p", { "data-testid": "assistant-message" }, "Investigate this"),
-          ),
+          showReply &&
+            createElement(
+              "div",
+              { "data-message-id": "assistant-row-1" },
+              createElement("p", { "data-testid": "assistant-message" }, "Investigate this"),
+            ),
           createElement(AssistantSelectionQuote, {
             streamRef,
             subagentSpawnMode: mode,
             onSpawnSubagentFromSelection: spawn,
           }),
         ),
-      ),
-    );
+      );
+    }
+    const { rerender, unmount } = render(stream(true));
     const message = screen.getByTestId("assistant-message");
     const selection = window.getSelection();
     if (!selection) throw new Error("Expected a browser selection");
@@ -931,6 +934,8 @@ describe("selection right click menu", () => {
           clientY: 40,
         }),
       ).toBe(false);
+      rerender(stream(false));
+      expect(screen.queryByTestId("assistant-message")).toBeNull();
       fireEvent.click(screen.getByRole("menuitem", { name: label }));
       expect(spawn).toHaveBeenCalledExactlyOnceWith("Investigate this", {
         messageRowId: "assistant-row-1",

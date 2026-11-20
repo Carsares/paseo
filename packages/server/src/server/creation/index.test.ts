@@ -167,6 +167,9 @@ test("an uncertain prompt outcome never resends or removes its workspace and age
 
 test("a Main Session written before a failure is not created again on retry", async () => {
   const f = await fixture();
+  f.input.hasAgent = false;
+  f.input.hasPrompt = false;
+  f.input.agentId = undefined;
   const storedIds = new Set<string>();
   let attempts = 0;
   f.input.exists = async (kind, id) => kind === "agent" && storedIds.has(id);
@@ -175,6 +178,8 @@ test("a Main Session written before a failure is not created again on retry", as
     storedIds.add(id);
     throw new Error("Failed to project persisted Main Session");
   };
+  f.input.readMainAgent = async (id, workspaceId) =>
+    storedIds.has(id) ? { ...agent, id, workspaceId } : null;
 
   const result = await f.service.create(f.input);
   expect(result).toMatchObject({
@@ -183,9 +188,53 @@ test("a Main Session written before a failure is not created again on retry", as
     outcomeUnknown: true,
     workspace,
   });
-  expect(await new CreationService(f.directory, silentLogger).create(f.input)).toEqual(result);
+  expect(await new CreationService(f.directory, silentLogger).create(f.input)).toMatchObject({
+    phase: "completed",
+    mainAgent: { id: [...storedIds][0], workspaceId: workspace.id },
+  });
   expect(attempts).toBe(1);
   expect(f.calls).toEqual(["workspace"]);
+});
+
+test("restarts interrupted default Main creation with the same reserved ID", async () => {
+  const f = await fixture();
+  f.input.hasAgent = false;
+  f.input.hasPrompt = false;
+  f.input.agentId = undefined;
+  const started = deferred();
+  const release = deferred();
+  let reservedId: string | undefined;
+  f.input.createMainAgent = async (_workspace, id) => {
+    reservedId = id;
+    started.resolve();
+    await release.promise;
+    throw new Error("Interrupted before persistence");
+  };
+  const first = f.service.create(f.input);
+  await started.promise;
+  try {
+    // Copy the on-disk receipt at the same point a restarted daemon would read it.
+    const restartedDirectory = await mkdtemp(join(tmpdir(), "creation-main-recovery-"));
+    directories.push(restartedDirectory);
+    await cp(f.directory, restartedDirectory, { recursive: true });
+    const restarted = new CreationService(restartedDirectory, silentLogger);
+    expect(
+      await restarted.create({
+        ...f.input,
+        readMainAgent: async (id) => {
+          expect(id).toBe(reservedId);
+          return null;
+        },
+        createMainAgent: async (createdWorkspace, id) => {
+          expect(id).toBe(reservedId);
+          return { ...agent, id, workspaceId: createdWorkspace.id };
+        },
+      }),
+    ).toMatchObject({ phase: "completed", mainAgent: { id: reservedId } });
+  } finally {
+    release.resolve();
+    await first;
+  }
 });
 
 test("conflicting intents and resource IDs cannot start more work", async () => {

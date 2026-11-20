@@ -3568,7 +3568,17 @@ export class DaemonClient {
         ? await this.routeLegacyCreateConfig(config)
         : config,
     });
-    if (result.error || !result.agent) throw new Error(result.error ?? "Agent creation failed");
+    if (result.error || !result.agent) {
+      const error = new Error(result.error ?? "Agent creation failed");
+      if (
+        result.creation?.phase === "failed" &&
+        result.creation.outcomeUnknown === false &&
+        !result.agent
+      ) {
+        throw Object.assign(error, { outcome: "rejected" as const });
+      }
+      throw error;
+    }
     return result.agent;
   }
 
@@ -3724,7 +3734,7 @@ export class DaemonClient {
 
   async moveAgentToWorkspace(
     agentId: string,
-    options?: { idempotencyKey?: string },
+    options?: { idempotencyKey?: string; expectedWorkspaceId?: string },
   ): Promise<{ workspaceId: string }> {
     const idempotencyKey = options?.idempotencyKey?.trim();
     const payload =
@@ -3733,6 +3743,7 @@ export class DaemonClient {
           type: "agent.move_to_workspace.request",
           agentId,
           ...(idempotencyKey ? { idempotencyKey } : {}),
+          expectedWorkspaceId: options?.expectedWorkspaceId,
         },
       });
     if (!payload.accepted || !payload.workspaceId) {
@@ -3744,18 +3755,25 @@ export class DaemonClient {
   async setAgentMainControl(
     agentId: string,
     enabled: boolean,
-  ): Promise<{ enabled: boolean; workspaceId: string | null }> {
+    options?: { handoffFromAgentId?: string; archiveSource?: boolean },
+  ): Promise<{ enabled: boolean; workspaceId: string | null; archivedSource?: boolean }> {
     const payload = await this.sendNamespacedCorrelatedSessionRequest<"agent.set_main.response">({
       message: {
         type: "agent.set_main.request",
         agentId,
         enabled,
+        handoffFromAgentId: options?.handoffFromAgentId,
+        archiveSource: options?.archiveSource,
       },
     });
     if (!payload.accepted) {
       throw new Error(payload.error ?? "setAgentMainControl rejected");
     }
-    return { enabled: payload.enabled, workspaceId: payload.workspaceId };
+    return {
+      enabled: payload.enabled,
+      workspaceId: payload.workspaceId,
+      ...(payload.archivedSource !== undefined ? { archivedSource: payload.archivedSource } : {}),
+    };
   }
 
   async setAgentParent(agentId: string, parentAgentId: string): Promise<{ parentAgentId: string }> {
@@ -3774,12 +3792,13 @@ export class DaemonClient {
 
   async updateAgent(
     agentId: string,
-    updates: { name?: string; labels?: Record<string, string> },
+    updates: { name?: string; labels?: Record<string, string>; expectedWorkspaceId?: string },
   ): Promise<void> {
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
       type: "update_agent_request",
       agentId,
+      expectedWorkspaceId: updates.expectedWorkspaceId,
       ...(updates.name !== undefined ? { name: updates.name } : {}),
       ...(updates.labels && Object.keys(updates.labels).length > 0
         ? { labels: updates.labels }

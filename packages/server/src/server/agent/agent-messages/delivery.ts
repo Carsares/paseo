@@ -13,6 +13,8 @@ interface Message {
   clearPendingPermissions?: boolean;
   activeTurnBehavior?: "steer" | "interrupt";
   beforeDispatch?: () => void;
+  /** Recheck mutable sender authority when the message leaves the queue. */
+  validateDispatch?: () => Promise<void>;
   beforeProviderDispatch?: () => Promise<void>;
   onDispatch?: (disposition: PromptDispatchDisposition) => void;
 }
@@ -34,6 +36,7 @@ interface DispatchRequest {
   sessionMode?: string;
   clearPendingPermissions: boolean;
   unarchive: boolean;
+  validateDispatch?: () => Promise<void>;
   beforeProviderDispatch(): Promise<void>;
   onDispatch(disposition: PromptDispatchDisposition): void;
 }
@@ -94,6 +97,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       sessionMode: messages.find((message) => message.sessionMode)?.sessionMode,
       clearPendingPermissions: messages.some((message) => message.clearPendingPermissions),
       unarchive: messages.some((message) => message.unarchive !== false),
+      validateDispatch: messages[0]!.validateDispatch,
       async beforeProviderDispatch() {
         for (const message of messages) await message.beforeProviderDispatch?.();
       },
@@ -112,6 +116,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       .catch(() => undefined)
       .then(async () => {
         try {
+          await request.validateDispatch?.();
           for (const message of messages) message.beforeDispatch?.();
           const disposition = await dependencies.dispatch(request);
           for (const message of messages) message.resolve(disposition);
@@ -143,6 +148,8 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         group.length &&
         ((message.activeTurnBehavior ?? "steer") !== (group[0]!.activeTurnBehavior ?? "steer") ||
           (mode && message.sessionMode && mode !== message.sessionMode) ||
+          group[0]!.validateDispatch ||
+          message.validateDispatch ||
           group[0]!.beforeProviderDispatch ||
           message.beforeProviderDispatch)
       ) {

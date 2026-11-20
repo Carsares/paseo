@@ -235,9 +235,9 @@ function MobileWorkspaceTabOption({
   const moveSubagentToWorkspace = useMoveSubagentToWorkspace();
   const handleMoveAgentToWorkspace = useCallback(
     (agentId: string) => {
-      moveSubagentToWorkspace({ serverId: normalizedServerId, agentId });
+      moveSubagentToWorkspace({ serverId: normalizedServerId, agentId }, normalizedWorkspaceId);
     },
-    [moveSubagentToWorkspace, normalizedServerId],
+    [moveSubagentToWorkspace, normalizedServerId, normalizedWorkspaceId],
   );
   const menuTestIDBase = `workspace-tab-menu-${tab.tabId}`;
   const menuEntries = useMemo(

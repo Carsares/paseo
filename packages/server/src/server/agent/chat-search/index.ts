@@ -97,6 +97,58 @@ function searchableBlocks(text: string): string[] {
     .filter(Boolean);
 }
 
+// Match the app's components/user-message/quote-segments.ts rules. User messages display
+// literal text, with each non-empty run of quote lines shown in a separate block.
+const USER_QUOTE_LINE = /^[ \t]*>(?:[ \t](.*))?$/;
+const USER_FENCE_LINE = /^\s*(`{3,}|~{3,})(.*)$/;
+
+function searchableUserBlocks(text: string): string[] {
+  if (!text.includes(">")) return [text];
+
+  const blocks: string[] = [];
+  let bodyLines: string[] = [];
+  let quoteLines: string[] = [];
+  let fence: string | undefined;
+
+  function flushQuote() {
+    if (!quoteLines.length) return;
+    const quote = quoteLines.join("\n").trim();
+    quoteLines = [];
+    if (!quote) return;
+
+    const body = bodyLines.join("\n").trim();
+    if (body) blocks.push(body);
+    bodyLines = [];
+    blocks.push(quote);
+  }
+
+  for (const line of text.split(/\r\n|\r|\n/)) {
+    const quoted = fence ? null : USER_QUOTE_LINE.exec(line);
+    if (quoted) {
+      quoteLines.push(quoted[1] ?? "");
+      continue;
+    }
+
+    flushQuote();
+    bodyLines.push(line);
+
+    const marker = USER_FENCE_LINE.exec(line);
+    if (!marker) continue;
+    const [, run, rest] = marker;
+    if (fence) {
+      if (run[0] === fence[0] && run.length >= fence.length && !rest.trim()) fence = undefined;
+    } else if (run[0] === "~" || !rest.includes("`")) {
+      fence = run;
+    }
+  }
+
+  flushQuote();
+  if (!blocks.length) return [text];
+  const body = bodyLines.join("\n").trim();
+  if (body) blocks.push(body);
+  return blocks;
+}
+
 function searchPattern(query: string): RegExp {
   const source = query
     .trim()
@@ -128,8 +180,10 @@ export async function searchTimeline({
     if (entry.seqEnd <= cursor) continue;
     const item = entry.item;
     if (item.type !== "user_message" && item.type !== "assistant_message") continue;
-    const raw = item.text.replace(/\r/g, "");
-    const blocks = item.type === "assistant_message" ? searchableBlocks(raw) : [raw];
+    const blocks =
+      item.type === "assistant_message"
+        ? searchableBlocks(item.text.replace(/\r/g, ""))
+        : searchableUserBlocks(item.text);
     const count = blocks.reduce((sum, block) => sum + countMatches(block, pattern), 0);
     if (count) {
       if (locations.length === PAGE_SIZE) {

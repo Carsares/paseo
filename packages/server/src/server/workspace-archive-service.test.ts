@@ -204,6 +204,20 @@ function assertArchiveResult(
 }
 
 describe("archiveByScope", () => {
+  test("rejects a subagent before resolving an archive target", async () => {
+    const deps = createArchiveDeps({ paseoHome: tmpdir(), activeWorkspaces: [] });
+    const resolveTargets = vi.spyOn(deps, "listActiveWorkspaces");
+    await expect(
+      archiveByScope(deps, {
+        requestId: "subagent-archive",
+        scope: { kind: "workspace", workspaceId: "workspace" },
+        caller: { labels: { "paseo.parent-agent-id": "parent" } },
+      }),
+    ).rejects.toThrow("Subagents cannot archive a workspace.");
+    expect(resolveTargets).not.toHaveBeenCalled();
+    expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();
+  });
+
   test("rejects a Main Control caller before resolving an archive target", async () => {
     const deps = createArchiveDeps({ paseoHome: tmpdir(), activeWorkspaces: [] });
     const resolveTargets = vi.spyOn(deps, "listActiveWorkspaces");

@@ -2,6 +2,7 @@ import { registerPluginTools } from "./plugin-tools.js";
 import type { FinishSubscriptions, FinishRegistration } from "../finish-subscriptions/index.js";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
 import {
+  assertDirectParent,
   createHostResolver,
   HostOperationRejectedError,
   type HostOperation,
@@ -15,7 +16,7 @@ import { ensureValidJson } from "../../json-utils.js";
 import type { Logger } from "pino";
 
 import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-types.js";
-import type { AgentManager } from "../agent-manager.js";
+import { REMOTE_CHILD_RESERVATION_LABEL, type AgentManager } from "../agent-manager.js";
 import {
   ActiveTurnBehaviorSchema,
   AgentProfileSchema,
@@ -690,6 +691,7 @@ function createToolCatalog(
     name: string,
     destination: string | undefined,
     input: Record<string, unknown>,
+    requireParentOwnership: boolean,
   ): Promise<FinishRegistration | undefined> {
     if (
       name !== "send_agent_prompt" ||
@@ -699,7 +701,12 @@ function createToolCatalog(
     )
       return undefined;
     return finishSubscriptions().register(
-      { childAgentId: input.agentId as string, callerAgentId, serverId: destination },
+      {
+        childAgentId: input.agentId as string,
+        callerAgentId,
+        serverId: destination,
+        ...(requireParentOwnership ? { requireParentOwnership: true } : {}),
+      },
       true,
     );
   }
@@ -733,6 +740,7 @@ function createToolCatalog(
     ["create_workspace", "createWorkspace"],
     ["list_workspaces", "listWorkspaces"],
     ["send_agent_prompt", "sendPrompt"],
+    ["respond_to_permission", "respondToPermission"],
     ["get_agent_status", "getStatus"],
     ["get_agent_activity", "getActivity"],
     ["list_agents", "listAgents"],
@@ -757,6 +765,8 @@ function createToolCatalog(
         localHostOperations.get("create_workspace")!(args, context),
       listWorkspaces: (args, context) => localHostOperations.get("list_workspaces")!(args, context),
       sendPrompt: (args, context) => localHostOperations.get("send_agent_prompt")!(args, context),
+      respondToPermission: (args, context) =>
+        localHostOperations.get("respond_to_permission")!(args, context),
       getStatus: (args, context) => localHostOperations.get("get_agent_status")!(args, context),
       getActivity: (args, context) => localHostOperations.get("get_agent_activity")!(args, context),
       listAgents: (args, context) => localHostOperations.get("list_agents")!(args, context),
@@ -804,8 +814,8 @@ function createToolCatalog(
     name: string,
     args: { agentId?: string; serverId?: string },
     context: PaseoToolExecutionContext,
-  ): Promise<number> {
-    if (!callerAgentId) return 0;
+  ): Promise<boolean> {
+    if (!callerAgentId) return false;
     const path = await readAgentHierarchyPath(callerAgentId, readHierarchyAgent);
     const caller = path.get(callerAgentId);
     const read = (id: string) => path.get(id);
@@ -819,32 +829,101 @@ function createToolCatalog(
     const localServer = options.serverId ?? "self";
     const destination = args.serverId ?? localServer;
     const targetsSelf = args.agentId === callerAgentId && destination === localServer;
-    if (name === "set_agent_mode") {
-      if (targetsSelf) return depth;
+    if (name === "set_agent_mode" || name === "respond_to_permission") {
+      if (targetsSelf) return false;
       if (depth >= 2) {
-        throw new PaseoToolInputError("Level-2 subagents can only change their own mode.");
+        throw new PaseoToolInputError(
+          name === "set_agent_mode"
+            ? "Level-2 subagents can only change their own mode."
+            : "Level-2 subagents cannot respond to permission requests for other agents.",
+        );
       }
     }
-    if (name === "respond_to_permission" && depth >= 2 && !targetsSelf) {
-      throw new PaseoToolInputError(
-        "Level-2 subagents cannot respond to permission requests for other agents.",
-      );
-    }
-    if (
-      !args.agentId ||
-      !orchestrationTools.has(name) ||
-      !requiresSingleHopOrchestration(callerAgentId, read)
-    )
-      return depth;
-
-    const targetId = args.agentId;
-    const target = await readOrchestrationTarget(targetId, destination, localServer, context);
-    validateSingleHopOrchestration({
+    if (!args.agentId || !orchestrationTools.has(name)) return false;
+    return checkOrchestration(
+      name,
+      args.agentId,
+      destination,
+      localServer,
       callerAgentId,
+      path,
+      context,
+    );
+  }
+
+  async function checkOrchestration(
+    name: string,
+    targetId: string,
+    destination: string,
+    localServer: string,
+    callerId: string,
+    path: ReadonlyMap<string, HierarchyAgent>,
+    context: PaseoToolExecutionContext,
+  ): Promise<boolean> {
+    const read = (id: string) => path.get(id);
+    const singleHop = requiresSingleHopOrchestration(callerId, read);
+    if (!singleHop && name !== "send_agent_prompt" && name !== "respond_to_permission")
+      return false;
+
+    const target = await readOrchestrationTarget(targetId, destination, localServer, context);
+    if (!singleHop) {
+      const directChild =
+        getParentAddressFromLabels(target?.labels, destination)?.agentId === callerId;
+      if (name === "respond_to_permission" && !directChild) {
+        throw new PaseoToolInputError("You can only manage your direct subagents.");
+      }
+      // A prompt admitted as a parent's delegation must still belong to that parent at dispatch.
+      return directChild;
+    }
+    validateSingleHopOrchestration({
+      callerAgentId: callerId,
       targetAgentId: targetId,
-      readAgent: (id) => (id === targetId && id !== callerAgentId ? target : path.get(id)),
+      readAgent: (id) => (id === targetId && id !== callerId ? target : path.get(id)),
     });
-    return depth;
+    return true;
+  }
+
+  async function withRemoteChildReservation(
+    name: string,
+    destination: string | undefined,
+    input: Record<string, unknown>,
+    dispatch: (markStarted: () => void) => Promise<PaseoToolResult>,
+  ): Promise<PaseoToolResult> {
+    if (
+      name !== "create_agent" ||
+      !callerAgentId ||
+      !destination ||
+      destination === options.serverId
+    ) {
+      return dispatch(() => {});
+    }
+    const reservation = await agentManager.reserveRemoteChild(
+      callerAgentId,
+      destination,
+      typeof input.idempotencyKey === "string" ? input.idempotencyKey : undefined,
+    );
+    input.labels = {
+      ...(input.labels as Record<string, string> | undefined),
+      [REMOTE_HIERARCHY_DEPTH_LABEL]: String(reservation.depth),
+      [REMOTE_CHILD_RESERVATION_LABEL]: reservation.id,
+    };
+    let started = false;
+    try {
+      const response = await dispatch(() => {
+        started = true;
+      });
+      reservation.finish(response.isError ? "rejected" : "confirmed");
+      return response;
+    } catch (error) {
+      const rejected =
+        !started ||
+        error instanceof PaseoToolInputError ||
+        error instanceof HostOperationRejectedError ||
+        error instanceof z.ZodError ||
+        (error instanceof Error && "outcome" in error && error.outcome === "rejected");
+      reservation.finish(rejected ? "rejected" : "unknown");
+      throw error;
+    }
   }
 
   const registerTool = (
@@ -877,18 +956,30 @@ function createToolCatalog(
       };
       handler = async ({ serverId, ...input }, context) => {
         const destination = serverId ?? options.serverId;
-        const depth = await checkHierarchy(name, { ...input, serverId }, context);
-        if (name === "create_agent" && callerAgentId && destination !== options.serverId) {
-          input.labels = {
-            ...input.labels,
-            [REMOTE_HIERARCHY_DEPTH_LABEL]: String(depth + 1),
-          };
-        }
-        const remoteNotification = await prepareRemoteNotification(name, destination, input);
+        const singleHop = await checkHierarchy(name, { ...input, serverId }, context);
+        const restrictedSend = name === "send_agent_prompt" && singleHop;
+        const remoteNotification = await prepareRemoteNotification(
+          name,
+          destination,
+          input,
+          restrictedSend,
+        );
         try {
-          const response = await hostResolver.use(serverId, (host) =>
-            host[operation](input, context),
-          );
+          const forward = (markStarted: () => void) =>
+            hostResolver.use(
+              serverId,
+              (host) => {
+                markStarted();
+                return host[operation](
+                  name === "send_agent_prompt"
+                    ? { ...input, requireParentOwnership: restrictedSend }
+                    : input,
+                  context,
+                );
+              },
+              restrictedSend || name === "respond_to_permission" ? callerAgentId : undefined,
+            );
+          const response = await withRemoteChildReservation(name, destination, input, forward);
           if (response.isError) await remoteNotification?.reject();
           else remoteNotification?.accept();
           await registerRemoteCreation(name, destination, input, response);
@@ -1973,7 +2064,7 @@ function createToolCatalog(
     firstAgentContext?: FirstAgentContext,
   ): Promise<{
     cwd: string | undefined;
-    workspaceId: string;
+    workspaceId: string | undefined;
   }> {
     if (workspaceId) {
       const resolved = await resolveCreateAgentWorkspace(
@@ -2000,7 +2091,7 @@ function createToolCatalog(
     if (!caller?.workspaceId) {
       throw new PaseoToolInputError(`Caller agent ${callerAgentId} has no current workspace`);
     }
-    return { cwd: undefined, workspaceId: caller.workspaceId };
+    return { cwd: undefined, workspaceId: undefined };
   }
 
   function normalizeTopLevelCreateAgentArgs(
@@ -2133,6 +2224,7 @@ function createToolCatalog(
       agentId,
       prompt,
       sessionMode,
+      requireParentOwnership,
       notifyOnFinish = Boolean(callerAgentId),
       activeTurnBehavior = callerAgentId ? "steer" : "interrupt",
     }) => {
@@ -2145,9 +2237,14 @@ function createToolCatalog(
           ? await (() => {
               if (!options.finishSubscriptions)
                 throw new Error("Finish subscriptions are not configured");
-              return options
-                .finishSubscriptions()
-                .register({ childAgentId: agentId, callerAgentId }, true);
+              return options.finishSubscriptions().register(
+                {
+                  childAgentId: agentId,
+                  callerAgentId,
+                  ...(requireParentOwnership ? { requireParentOwnership: true } : {}),
+                },
+                true,
+              );
             })()
           : undefined;
       function confirmDispatch(_disposition: PromptDispatchDisposition): void {
@@ -2173,9 +2270,20 @@ function createToolCatalog(
               source: {
                 kind: "agent-message",
                 agentId: callerAgentId,
+                serverId: requireParentOwnership ? options.serverId : undefined,
                 title: resolveCallerAgent()?.config.title ?? undefined,
               },
               sessionMode,
+              validateDispatch: requireParentOwnership
+                ? async () => {
+                    const target = await readHierarchyAgent(agentId);
+                    const serverId = options.serverId ?? "self";
+                    assertDirectParent(target?.labels, serverId, {
+                      agentId: callerAgentId,
+                      serverId,
+                    });
+                  }
+                : undefined,
               activeTurnBehavior,
               onDispatch: confirmDispatch,
             });
@@ -2852,17 +2960,20 @@ function createToolCatalog(
       }
 
       const expiresAt = buildScheduleExpiry(expiresIn);
-      const schedule = await scheduleService.createOrReplace({
-        prompt: prompt.trim(),
-        cadence: buildCronScheduleCadence({
-          cron,
-          ...(timezone !== undefined ? { timezone } : {}),
+      const schedule = await runScheduleAction(() =>
+        scheduleService.createOrReplace({
+          callerAgentId,
+          prompt: prompt.trim(),
+          cadence: buildCronScheduleCadence({
+            cron,
+            ...(timezone !== undefined ? { timezone } : {}),
+          }),
+          target: resolveNewAgentScheduleTarget({ provider, cwd, isolation }),
+          ...(name?.trim() ? { name: name.trim() } : {}),
+          ...(maxRuns === undefined ? {} : { maxRuns }),
+          ...(expiresAt === undefined ? {} : { expiresAt }),
         }),
-        target: resolveNewAgentScheduleTarget({ provider, cwd, isolation }),
-        ...(name?.trim() ? { name: name.trim() } : {}),
-        ...(maxRuns === undefined ? {} : { maxRuns }),
-        ...(expiresAt === undefined ? {} : { expiresAt }),
-      });
+      );
 
       return {
         content: [],
@@ -3035,7 +3146,7 @@ function createToolCatalog(
       }
 
       await requireScheduleTarget(id, "new-agent");
-      await runScheduleAction(() => scheduleService.resume(id));
+      await runScheduleAction(() => scheduleService.resume(id, callerAgentId));
       return {
         content: [],
         structuredContent: ensureValidJson({ success: true }),
@@ -3132,7 +3243,9 @@ function createToolCatalog(
       }
 
       await requireScheduleTarget(input.id, "new-agent");
-      const schedule = await scheduleService.update(buildScheduleUpdateInput(input));
+      const schedule = await runScheduleAction(() =>
+        scheduleService.update(buildScheduleUpdateInput(input), callerAgentId),
+      );
 
       return {
         content: [],
@@ -3180,7 +3293,7 @@ function createToolCatalog(
         throw new Error("Schedule service is not configured");
       }
       await requireScheduleTarget(id, "new-agent");
-      const schedule = await runScheduleAction(() => scheduleService.runOnce(id));
+      const schedule = await runScheduleAction(() => scheduleService.runOnce(id, callerAgentId));
       return {
         content: [],
         structuredContent: ensureValidJson(schedule),
@@ -3436,6 +3549,15 @@ function createToolCatalog(
       },
     },
     async ({ agentId, requestId, response }) => {
+      if (callerAgentId && callerAgentId !== agentId) {
+        const stored = await agentStorage.get(agentId);
+        const target = agentManager.getAgent(agentId);
+        const serverId = options.serverId ?? "self";
+        assertDirectParent(target?.labels, serverId, { agentId: callerAgentId, serverId });
+        if (stored?.archivedAt || !target?.pendingPermissions.has(requestId)) {
+          throw new PaseoToolInputError("Permission request is no longer pending.");
+        }
+      }
       await respondToAgentPermission({
         agentManager,
         agentId,

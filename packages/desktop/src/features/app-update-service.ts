@@ -65,7 +65,11 @@ export interface AppUpdateTarget {
 export interface AppUpdateShutdown {
   restore(): Promise<void>;
   beforeHandoff(): Promise<void>;
+  preserveForNextLaunch?(): Promise<void>;
 }
+
+/** The native updater may already install on exit. Keep the daemon stopped. */
+export class AppUpdateHandoffUncertainError extends Error {}
 
 export type BeforeAppUpdateInstall = (
   target: AppUpdateTarget,
@@ -412,6 +416,26 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     return signal?.aborted ? "aborted" : "ready";
   }
 
+  async function recoverAfterFailedInstall(
+    shutdown: AppUpdateShutdown | undefined,
+    installError: string,
+    restoreNow: boolean,
+  ): Promise<string> {
+    if (!shutdown) return installError;
+    try {
+      if (restoreNow) await shutdown.restore();
+      else await shutdown.preserveForNextLaunch?.();
+    } catch (error) {
+      const action = restoreNow
+        ? "restart the built-in daemon"
+        : "save agent recovery for next launch";
+      const message = `Could not ${action}: ${getErrorMessage(error)}`;
+      deps.reportInstallError?.(message);
+      return `${installError} ${message}`;
+    }
+    return installError;
+  }
+
   async function installCheckedUpdate(
     check: AppUpdateCheckResult,
     {
@@ -432,6 +456,7 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     });
     let shutdown: AppUpdateShutdown | undefined;
     let installError: string | null = null;
+    let handoffUncertain = false;
     try {
       const blocked = deps.runtime.getInstallBlockReason?.();
       if (blocked) return notInstalled(blocked);
@@ -467,20 +492,16 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
         };
       }
     } catch (error) {
-      installError = `Update failed: ${getErrorMessage(error)}`;
+      handoffUncertain = error instanceof AppUpdateHandoffUncertainError;
+      installError = handoffUncertain
+        ? getErrorMessage(error)
+        : `Update failed: ${getErrorMessage(error)}`;
       deps.reportInstallError?.(installError);
     }
 
-    if (shutdown) {
-      try {
-        await shutdown.restore();
-      } catch (error) {
-        const message = `Could not restart the built-in daemon: ${getErrorMessage(error)}`;
-        deps.reportInstallError?.(message);
-        return notInstalled(`${installError} ${message}`);
-      }
-    }
-    return notInstalled(installError);
+    return notInstalled(
+      await recoverAfterFailedInstall(shutdown, installError, restart && !handoffUncertain),
+    );
   }
 
   function hasDownloadedUpdate(): boolean {

@@ -12,6 +12,7 @@ import { expect, test } from "vitest";
 import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
 import { createPersistedWorkspaceRecord } from "../workspace-registry.js";
 import { AgentManager } from "./agent-manager.js";
+import { formatAgentMessage } from "./agent-messages/envelope.js";
 import type { AgentStreamEvent, AgentTimelineItem } from "./agent-sdk-types.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
 import { summarizeWorkspaceAgents } from "./workspace-agents-summary.js";
@@ -133,6 +134,27 @@ test("summarizes only the selected workspace and releases successful and failed 
         [getOpenAgentTabLabel("desktop")]: "true",
       },
     });
+    for (const [id, source, text] of [
+      [
+        "notice",
+        { kind: "agent-notification", agentId: main.id, event: "permission-required" },
+        "Permission report",
+      ],
+      [
+        "completion",
+        { kind: "agent-notification", agentId: main.id, event: "finished" },
+        "Completion report",
+      ],
+      ["delegate", { kind: "agent-message", agentId: main.id }, "Implement the delegated task"],
+    ] as const) {
+      for await (const _event of agentManager.streamAgent(
+        live.id,
+        formatAgentMessage({ id, source, text }),
+        { clientMessageId: id },
+      )) {
+        // Wait for the turn to commit its timeline.
+      }
+    }
     for await (const _event of agentManager.streamAgent(live.id, "Still working", {
       clientMessageId: "live-prompt",
     })) {
@@ -175,7 +197,7 @@ test("summarizes only the selected workspace and releases successful and failed 
       ["archived", "closed", "level2"],
       ["closed", "closed", "standalone"],
     ]);
-    expect(result.entries[0]?.firstUserPrompt).toBe("Still working");
+    expect(result.entries[0]?.firstUserPrompt).toBe("Implement the delegated task");
     expect(result.entries[1]).toMatchObject({
       firstUserPrompt: "Add coverage",
       lastAssistantSummary: "Added coverage",

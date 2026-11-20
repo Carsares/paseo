@@ -9,6 +9,8 @@ export interface PersistenceScheduler {
 
 export interface DraftPersistStorage<T> extends PersistStorage<T> {
   flush: () => Promise<void>;
+  hasPendingWrite: () => boolean;
+  pauseWrites: () => (discardPending?: boolean) => void;
 }
 
 let nextSystemTimerId = 0;
@@ -55,6 +57,7 @@ export function createDraftPersistStorage<T>(
   let inFlight: Promise<void> | null = null;
   let timer: unknown = null;
   let lastWriteAt = -Infinity;
+  let writesPaused: Promise<void> | null = null;
 
   const cancelTimer = () => {
     if (timer !== null) {
@@ -86,7 +89,7 @@ export function createDraftPersistStorage<T>(
     }
   };
   const scheduleWrite = () => {
-    if (inFlight || !pending) return;
+    if (writesPaused || inFlight || !pending) return;
     const delay = DRAFT_PERSIST_INTERVAL_MS - (scheduler.now() - lastWriteAt);
     if (delay <= 0) {
       cancelTimer();
@@ -101,12 +104,13 @@ export function createDraftPersistStorage<T>(
     for (;;) {
       if (!pending && !inFlight) return;
       cancelTimer();
-      await (inFlight ?? writePending());
+      await (writesPaused ?? inFlight ?? writePending());
     }
   };
 
   return {
-    getItem: (name) => storage.getItem(name),
+    getItem: (name) =>
+      inFlight ? inFlight.then(() => storage.getItem(name)) : storage.getItem(name),
     setItem: (name, value) => {
       pending = { name, value };
       return scheduleWrite();
@@ -118,5 +122,19 @@ export function createDraftPersistStorage<T>(
       return storage.removeItem(name);
     },
     flush,
+    hasPendingWrite: () => pending !== null,
+    pauseWrites: () => {
+      cancelTimer();
+      let resume = () => {};
+      writesPaused = new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      return (discardPending) => {
+        if (discardPending) pending = null;
+        writesPaused = null;
+        resume();
+        scheduleWrite();
+      };
+    },
   };
 }

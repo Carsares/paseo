@@ -1,5 +1,6 @@
 import {
   getParentAgentIdFromLabels,
+  getParentAddressFromLabels,
   hasOpenAgentTab,
   isMainControlAgentLabels,
 } from "@getpaseo/protocol/agent-labels";
@@ -51,7 +52,11 @@ function modifiedPaths(item: Extract<AgentTimelineItem, { type: "tool_call" }>):
   );
 }
 
-function summarizeTimeline(items: AgentTimelineItem[]): SummaryDetails {
+function summarizeTimeline(
+  items: AgentTimelineItem[],
+  parentId: string | null,
+  parentServerId: string | undefined,
+): SummaryDetails {
   let firstUserPrompt: string | null = null;
   let lastAssistantSummary: string | null = null;
   let todos: WorkspaceAgentSummaryEntry["todos"] = [];
@@ -71,6 +76,14 @@ function summarizeTimeline(items: AgentTimelineItem[]): SummaryDetails {
         }));
         break;
       case "tool_call":
+        if (
+          parentId &&
+          item.agentMessage?.event === "message" &&
+          item.agentMessage.sender.id === parentId &&
+          (!parentServerId || item.agentMessage.sender.serverId === parentServerId)
+        ) {
+          firstUserPrompt ??= excerpt(item.agentMessage.text, 300);
+        }
         for (const path of modifiedPaths(item)) {
           if (touchedFiles.size >= 30) break;
           if (path.trim()) touchedFiles.add(path);
@@ -226,10 +239,13 @@ export async function summarizeWorkspaceAgents({
           return [];
         });
       if (rows === null) continue;
+      const metadata = summarizeAgentMetadata(agent, mainAgent?.id);
       entries.push({
-        ...summarizeAgentMetadata(agent, mainAgent?.id),
+        ...metadata,
         ...summarizeTimeline(
           projectTimelineRows({ rows, mode: "projected" }).map(({ item }) => item),
+          metadata.parentAgentId,
+          getParentAddressFromLabels((agent.live ?? agent.record)?.labels, "")?.serverId,
         ),
       });
     }

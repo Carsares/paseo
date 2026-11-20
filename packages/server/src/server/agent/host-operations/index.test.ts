@@ -1,12 +1,14 @@
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
   MAIN_PRIOR_MODE_ID_LABEL,
+  parentAddressLabels,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 
 import { createHostResolver, type HostOperations } from "./index.js";
+import { buildStoredAgentPayload } from "../agent-projections.js";
 
 type Handler = ((event?: unknown) => void) | null;
 
@@ -146,6 +148,54 @@ const createArgs = {
   title: "Helper",
   initialPrompt: "Summarize",
 };
+
+test("remote permission responses carry the caller scope and require the matching pending request", async () => {
+  const id = "child";
+  const agent = buildStoredAgentPayload(
+    {
+      id,
+      provider: "codex",
+      cwd: "/repo",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      labels: parentAddressLabels({ agentId: "caller", serverId: "origin" }),
+    },
+    ["codex"],
+    (_provider, own) => own ?? {},
+  );
+  agent.pendingPermissions = [{ id: "pending", provider: "codex", name: "Approve", kind: "tool" }];
+  const respondToPermissionAndWait = vi.fn(async () => {});
+  const client = {
+    fetchAgent: async () => ({ agent }),
+    respondToPermissionAndWait,
+  } as unknown as DaemonClient;
+  const resolver = createHostResolver({
+    serverId: "origin",
+    callerAgentId: "caller",
+    caller: () => visibleCodexCaller,
+    local: {} as HostOperations,
+    hosts: () => ({
+      directory: async () => ({ self: { serverId: "origin", label: "Origin" }, hosts: [] }),
+      use: (serverId, action, _signal, directParentAgentId) => {
+        expect(serverId).toBe("remote");
+        expect(directParentAgentId).toBe("caller");
+        return action(client);
+      },
+    }),
+  });
+  const response = { behavior: "deny" };
+  const respond = (requestId: string) =>
+    resolver.use(
+      "remote",
+      (host) => host.respondToPermission({ agentId: id, requestId, response }, {}),
+      "caller",
+    );
+  await expect(respond("stale")).rejects.toThrow("no longer pending");
+  await expect(respond("pending")).resolves.toMatchObject({ structuredContent: { success: true } });
+  agent.labels = parentAddressLabels({ agentId: "caller", serverId: "other-host" });
+  await expect(respond("pending")).rejects.toThrow("direct subagents");
+  expect(respondToPermissionAndWait).toHaveBeenCalledExactlyOnceWith(id, "pending", response);
+});
 
 test("a visible caller still creates agents on a host without background agents", async () => {
   const { client, socket } = await olderHost();

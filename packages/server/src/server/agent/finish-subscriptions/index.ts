@@ -7,6 +7,7 @@ import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-clien
 import type { FinishObservationResult } from "./internal/observation-buffer.js";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
 import { getParentAddressFromLabels } from "@getpaseo/protocol/agent-labels";
+import { AgentRequestOutcomeUnknownError } from "../../message-receipts/index.js";
 import {
   formatFinishNotificationBody,
   finishNotificationEvents,
@@ -22,7 +23,7 @@ export interface FinishSubscription {
   serverId?: string;
   /** Creation subscriptions stop reporting after the child is detached. */
   requireParentOwnership?: boolean;
-  /** Allows the parent to fetch a notification-triggered turn on its forward connection. */
+  /** Allows the remote parent to fetch this turn's reports on its forward connection. */
   followupReport?: boolean;
   /** Authenticated source of a remote observation binding. */
   pullSourceId?: string;
@@ -112,6 +113,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
   const tasks = new Set<Promise<void>>();
   const watches = new Map<string, Set<Watch>>();
   const followupWatches = new Map<string, AbortController>();
+  const lastReportByBinding = new Map<string, string>();
   let reportMutations = Promise.resolve();
   function serializeReports<T>(action: () => Promise<T>): Promise<T> {
     const result = reportMutations.then(action);
@@ -317,7 +319,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           finishNotificationEvents[reason],
           signal,
         );
-        if (followups) await serializeReports(() => followups.reports.remove(id));
+        if (followups && active) await serializeReports(() => followups.reports.remove(id));
         if (!active) return true;
         if (request) permissions.add(request.id);
         continue;
@@ -454,12 +456,25 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     followupWatches.set(record.id, controller);
     const task = (async () => {
       let acknowledged: string[] = [];
+      const outcomesUnknown = new Set<string>();
       async function dispatchReports(reports: AgentFinishReport[]): Promise<void> {
         for (const report of reports) {
           signal.throwIfAborted();
           if (!(await deps.callerIsActive(record.callerAgentId))) return;
-          await abortable(followups.dispatch(record, report), signal);
-          acknowledged.push(report.id);
+          try {
+            await abortable(followups.dispatch(record, report), signal);
+            outcomesUnknown.delete(report.id);
+            acknowledged.push(report.id);
+          } catch (error) {
+            if (!(error instanceof AgentRequestOutcomeUnknownError)) throw error;
+            if (!outcomesUnknown.has(report.id)) {
+              outcomesUnknown.add(report.id);
+              deps.logger.warn(
+                { reportId: report.id, subscription: record.id },
+                "Remote finish report awaits delivery verification",
+              );
+            }
+          }
         }
       }
       let warned = false;
@@ -606,23 +621,32 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           if (existing?.pullSourceId === sourceId) {
             for (const record of matching) await reports.remove(record.id);
             await followups.watches.remove(bindingId);
+            lastReportByBinding.delete(bindingId);
           }
           return { ownsBinding: false, reports: [] };
         }
         if (existing?.pullSourceId !== sourceId) {
-          if (existing || !observe || childState !== "active")
+          if (existing || !observe || (childState === "archived" && matching.length === 0))
             return { ownsBinding: false, reports: [] };
           await followups.watches.put({ ...pair, id: bindingId, pullSourceId: sourceId });
         }
         const consumed = new Set(acknowledged);
         for (const record of matching) if (consumed.has(record.id)) await reports.remove(record.id);
-        const remaining = matching
+        const remaining = matching.filter((record) => !consumed.has(record.id));
+        const lastReportId = lastReportByBinding.get(bindingId);
+        const cursor = matching.findIndex((record) => record.id === lastReportId);
+        const page = [...matching.slice(cursor + 1), ...matching.slice(0, cursor + 1)]
           .filter((record) => !consumed.has(record.id))
           .slice(0, 8)
           .map((record) => record.report!);
+        // An unacknowledged report stays durable. Rotate through remaining pages even
+        // when an entire page is awaiting delivery verification.
+        if (page.length && remaining.length > page.length)
+          lastReportByBinding.set(bindingId, page.at(-1)!.id);
+        else lastReportByBinding.delete(bindingId);
         if (childState === "archived" && remaining.length === 0)
           await followups.watches.remove(bindingId);
-        return { ownsBinding: childState === "active" || remaining.length > 0, reports: remaining };
+        return { ownsBinding: childState === "active" || remaining.length > 0, reports: page };
       }),
     async close() {
       closed = true;

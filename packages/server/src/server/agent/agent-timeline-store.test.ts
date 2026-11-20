@@ -66,6 +66,92 @@ describe("InMemoryAgentTimelineStore", () => {
     ).toBe(2);
   });
 
+  it("pages across retracted sequences and stops before retained rows outside the page", () => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("agent");
+    const tool = {
+      type: "tool_call",
+      callId: "tool",
+      name: "shell",
+      status: "running",
+      error: null,
+      detail: { type: "plain_text", label: "work" },
+    } as const;
+    const retractable = { type: "assistant_message", messageId: "retracted", text: "Bad" } as const;
+    const turn = { turnId: "turn" };
+    store.append("agent", tool, turn); // 1
+    store.append("agent", retractable, turn); // 2
+    store.append("agent", { type: "user_message", text: "Keep" }, turn); // 3
+    store.append("agent", { ...tool, status: "completed" }, turn); // 4
+    store.append("agent", retractable, turn); // 5
+    store.append("agent", { type: "assistant_message", messageId: "final", text: "Done" }, turn);
+    store.append("agent", retractable, turn); // 7
+    expect(store.removeAssistantMessages("agent", "turn", ["retracted"])).toBe(true);
+    const epoch = store.getEpoch("agent");
+    const fetchAfter = (seq: number, limit = 1) =>
+      store.fetch("agent", { direction: "after", cursor: { epoch, seq }, limit });
+
+    expect(fetchAfter(0)).toMatchObject({ endSeq: 2, hasNewer: true, rows: [{ seq: 4 }] });
+    expect(fetchAfter(2)).toMatchObject({ endSeq: 3, hasNewer: true, rows: [{ seq: 3 }] });
+    expect(fetchAfter(3)).toMatchObject({ endSeq: 5, hasNewer: true, rows: [{ seq: 4 }] });
+    expect(fetchAfter(4)).toMatchObject({ endSeq: 7, hasNewer: false, rows: [{ seq: 6 }] });
+    expect(fetchAfter(5)).toMatchObject({ endSeq: 7, hasNewer: false, rows: [{ seq: 6 }] });
+    expect(fetchAfter(6)).toMatchObject({ endSeq: null, hasNewer: false, rows: [] });
+    expect(fetchAfter(0, 0)).toMatchObject({
+      endSeq: 7,
+      hasNewer: false,
+      rows: [{ seq: 4 }, { seq: 3 }, { seq: 6 }],
+    });
+  });
+
+  it("pages from the beginning when the first allocated sequence was retracted", () => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("agent");
+    store.append(
+      "agent",
+      { type: "assistant_message", messageId: "retracted", text: "Bad" },
+      { turnId: "turn" },
+    );
+    store.removeAssistantMessages("agent", "turn", ["retracted"]);
+    store.append("agent", { type: "user_message", text: "One" });
+    store.append("agent", { type: "user_message", text: "Two" });
+
+    expect(
+      store.fetch("agent", {
+        direction: "after",
+        cursor: { epoch: store.getEpoch("agent"), seq: 0 },
+        limit: 1,
+      }),
+    ).toMatchObject({ gap: false, reset: false, endSeq: 2, hasNewer: true, rows: [{ seq: 2 }] });
+  });
+
+  it("reaches the fourth item with one row per page after retracting the second", () => {
+    const store = new InMemoryAgentTimelineStore();
+    store.initialize("agent");
+    store.append("agent", { type: "user_message", text: "First" });
+    store.append(
+      "agent",
+      { type: "assistant_message", messageId: "retracted", text: "Bad" },
+      { turnId: "turn" },
+    );
+    store.append("agent", { type: "user_message", text: "Third" });
+    store.append("agent", { type: "user_message", text: "Fourth" });
+    expect(store.removeAssistantMessages("agent", "turn", ["retracted"])).toBe(true);
+
+    const epoch = store.getEpoch("agent");
+    const after = (seq: number) =>
+      store.fetch("agent", { direction: "after", cursor: { epoch, seq }, limit: 1 });
+    const first = after(0);
+    expect(first).toMatchObject({ endSeq: 2, hasNewer: true, rows: [{ seq: 1 }] });
+    const second = after(first.endSeq!);
+    expect(second).toMatchObject({ endSeq: 3, hasNewer: true, rows: [{ seq: 3 }] });
+    expect(after(second.endSeq!)).toMatchObject({
+      endSeq: 4,
+      hasNewer: false,
+      rows: [{ seq: 4 }],
+    });
+  });
+
   it("resets stale forward cursors to complete available turns", () => {
     const store = new InMemoryAgentTimelineStore();
     store.initialize("agent", { epoch: "current" });

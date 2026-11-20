@@ -1,5 +1,10 @@
+/**
+ * @vitest-environment jsdom
+ */
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentDirectoryReplica } from "@/runtime/directory-sync/agent-replica";
 import type { Agent } from "@/stores/session-store";
@@ -11,7 +16,10 @@ import {
   removeAgentFromListPayload,
   selectPendingArchiveAgentIds,
   setAgentArchiving,
+  useArchiveAgent,
 } from "./use-archive-agent";
+
+vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 
 vi.mock("@/runtime/host-runtime", () => ({
   getHostRuntimeStore: () => ({
@@ -137,6 +145,98 @@ describe("useArchiveAgent", () => {
     expect(next.pageInfo).toEqual({ hasMore: false });
   });
 
+  it.each([
+    { scope: "single-host", key: agentHistoryQueryKey("server-a") },
+    { scope: "all-host", key: allAgentHistoryQueryKey(["server-a", "server-b"]) },
+  ])(
+    "refreshes $scope archived history when its first request predates archival",
+    async ({ key }) => {
+      const queryClient = new QueryClient();
+      const agentId = "agent-1";
+      const archivedAt = "2026-04-01T04:00:00.000Z";
+      const archived = { pages: [{ agents: [{ id: agentId, archivedAt: new Date(archivedAt) }] }] };
+      const stale = Promise.withResolvers<typeof archived>();
+      const archiveAgent = vi.fn<DaemonClient["archiveAgent"]>().mockResolvedValue({ archivedAt });
+      useSessionStore
+        .getState()
+        .initializeSession("server-a", { archiveAgent } as unknown as DaemonClient);
+      const { result, unmount } = renderHook(useArchiveAgent, {
+        wrapper: ({ children }) =>
+          createElement(QueryClientProvider, { client: queryClient }, children),
+      });
+
+      const queryKey = [...key, "", { archiveScope: "archived" }];
+      const observer = new QueryObserver(queryClient, {
+        queryKey,
+        queryFn: vi.fn().mockReturnValueOnce(stale.promise).mockResolvedValue(archived),
+      });
+      const unsubscribe = observer.subscribe(() => {});
+      try {
+        expect(observer.getCurrentResult().fetchStatus).toBe("fetching");
+        await act(async () => {
+          await result.current.archiveAgent({ serverId: "server-a", agentId });
+        });
+        stale.resolve({ pages: [{ agents: [] }] });
+        await waitFor(() => expect(observer.getCurrentResult().data).toEqual(archived));
+      } finally {
+        unsubscribe();
+        unmount();
+        queryClient.clear();
+      }
+    },
+  );
+
+  it.each([
+    { scope: "single-host", key: agentHistoryQueryKey("server-a") },
+    { scope: "all-host", key: allAgentHistoryQueryKey(["server-a", "server-b"]) },
+  ])(
+    "refreshes $scope history on remount if the first result is about to enter the cache",
+    async ({ key }) => {
+      const queryClient = new QueryClient();
+      const agentId = "agent-1";
+      const archivedAt = "2026-04-01T04:00:00.000Z";
+      const archived = { pages: [{ agents: [{ id: agentId, archivedAt: new Date(archivedAt) }] }] };
+      const stale = Promise.withResolvers<typeof archived>();
+      const queryKey = [...key, "", { archiveScope: "archived" }];
+      const queryFn = vi.fn().mockReturnValueOnce(stale.promise).mockResolvedValue(archived);
+      const options = {
+        queryKey,
+        queryFn,
+        staleTime: 30_000,
+        refetchOnMount: () => queryClient.getQueryState(queryKey)?.isInvalidated ?? false,
+      };
+      const observer = new QueryObserver(queryClient, options);
+      const leave = observer.subscribe(() => {});
+      expect(observer.getCurrentResult().fetchStatus).toBe("fetching");
+      leave();
+
+      try {
+        stale.resolve({ pages: [{ agents: [] }] });
+        // Let the query receive the resolved value before it writes the result to the cache.
+        await Promise.resolve();
+        expect(queryClient.getQueryData(queryKey)).toBeUndefined();
+        applyArchivedAgentCloseResults({
+          queryClient,
+          serverId: "server-a",
+          results: [{ agentId, archivedAt }],
+        });
+        await waitFor(() => expect(queryClient.getQueryState(queryKey)?.isInvalidated).toBe(true));
+        expect(queryFn).toHaveBeenCalledTimes(1);
+
+        const reopened = new QueryObserver(queryClient, options);
+        const unsubscribe = reopened.subscribe(() => {});
+        try {
+          await waitFor(() => expect(reopened.getCurrentResult().data).toEqual(archived));
+          expect(queryFn).toHaveBeenCalledTimes(2);
+        } finally {
+          unsubscribe();
+        }
+      } finally {
+        queryClient.clear();
+      }
+    },
+  );
+
   it("applies archived agent close results to session state and cached lists", async () => {
     const queryClient = new QueryClient();
     useSessionStore.getState().initializeSession("server-a", {} as DaemonClient);
@@ -199,9 +299,11 @@ describe("useArchiveAgent", () => {
       ],
       pageParams: [null],
     });
-    expect(
-      queryClient.getQueryState(allAgentHistoryQueryKey(["server-a", "server-b"]))?.isInvalidated,
-    ).toBe(true);
+    await waitFor(() =>
+      expect(
+        queryClient.getQueryState(allAgentHistoryQueryKey(["server-a", "server-b"]))?.isInvalidated,
+      ).toBe(true),
+    );
     expect(queryClient.getQueryData(allAgentHistoryQueryKey(["server-a", "server-b"]))).toEqual({
       pages: [
         {

@@ -1,6 +1,4 @@
-// oxlint-disable-next-line paseo/no-sync-io -- Consume the startup marker before dispatching any recovery.
-import { rmSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { writeFileAtomic } from "../../atomic-file.js";
 import type { AgentStorage, StoredAgentRecord } from "../agent-storage.js";
 
@@ -20,20 +18,22 @@ interface Dependencies {
 export function createRestartRecovery(deps: Dependencies) {
   // Candidates are chosen at startup; each settles once its resume was sent or abandoned.
   const resuming = new Map<string, { promise: Promise<void>; resolve(): void; forced: boolean }>();
+  let oneShotAgentIds = new Set<string>();
+  let markerWrites = Promise.resolve();
   const eligible = async (record: RecoveryCandidate) =>
     !record.archivedAt && !record.internal && !record.owner && (await deps.eligible(record));
   async function readOneShotMarker(): Promise<{
     allAgents: boolean;
     agentIds: ReadonlySet<string>;
-  }> {
+  } | null> {
     const markerPath = deps.oneShotMarkerPath;
-    if (!markerPath) return { allAgents: false, agentIds: new Set() };
+    if (!markerPath) return null;
     let raw: string;
     try {
       raw = await readFile(markerPath, "utf8");
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        return { allAgents: false, agentIds: new Set() };
+        return null;
       }
       throw error;
     }
@@ -67,12 +67,49 @@ export function createRestartRecovery(deps: Dependencies) {
     );
     return { allAgents: false, agentIds: new Set(agentIds) };
   }
+
+  async function writeRemainingMarker(agentIds: Set<string>) {
+    const markerPath = deps.oneShotMarkerPath;
+    if (!markerPath) return;
+    if (agentIds.size === 0) {
+      await rm(markerPath, { force: true });
+    } else {
+      await writeFileAtomic(markerPath, JSON.stringify({ version: 2, agentIds: [...agentIds] }));
+    }
+  }
+
+  function consumeOneShotAgent(agentId: string): Promise<void> {
+    if (!oneShotAgentIds.has(agentId)) return Promise.resolve();
+    // Dispatches run independently, but each marker write must see every prior removal.
+    async function consume() {
+      const remaining = new Set(oneShotAgentIds);
+      if (!remaining.delete(agentId)) return;
+      await writeRemainingMarker(remaining);
+      oneShotAgentIds = remaining;
+    }
+    const write = markerWrites.then(consume);
+    markerWrites = write.catch(() => {});
+    return write;
+  }
+
   async function resume(agentId: string, forced: boolean) {
     const record = await deps.storage.get(agentId);
-    if (!record?.resumeOnStartup) return;
-    await deps.storage.upsert({ ...record, resumeOnStartup: false });
-    if ((!forced && !deps.settings().enabled) || !(await eligible(record))) return;
-    await deps.dispatch(agentId, deps.settings().prompt);
+    if (record && (forced || record.resumeOnStartup)) {
+      if ((forced || deps.settings().enabled) && (await eligible(record))) {
+        await deps.dispatch(agentId, deps.settings().prompt);
+      }
+      // A completed dispatch no longer needs the one-shot marker even if clearing
+      // the agent's persisted flag fails. With recovery disabled the marker is authoritative.
+      await consumeOneShotAgent(agentId);
+      // Dispatch can load and update the agent. Clear the flag on its latest record.
+      await deps.storage.flush();
+      const latest = await deps.storage.get(agentId);
+      if (latest?.resumeOnStartup) {
+        await deps.storage.upsert({ ...latest, resumeOnStartup: false });
+      }
+    } else {
+      await consumeOneShotAgent(agentId);
+    }
   }
   return {
     assertStartupRecoverySettled() {
@@ -86,14 +123,18 @@ export function createRestartRecovery(deps: Dependencies) {
     async prepareStartup() {
       const oneShotMarker = await readOneShotMarker();
       // Startup recovery repairs persisted running status once before agents are restored.
-      for (const record of await deps.storage.listAll()) {
+      const records = await deps.storage.listAll();
+      for (const record of records) {
+        // A provider can persist an idle snapshot while dispatch is still
+        // loading the session. The per-agent marker remains valid in that window.
         const forced =
-          (oneShotMarker.allAgents || oneShotMarker.agentIds.has(record.id)) &&
-          record.resumeOnStartup === true;
+          oneShotMarker?.agentIds.has(record.id) === true ||
+          (oneShotMarker?.allAgents === true && record.resumeOnStartup === true);
         const pending =
-          (deps.settings().enabled
-            ? record.resumeOnStartup === true || record.lastStatus === "running"
-            : forced) && (await eligible(record));
+          (forced ||
+            (deps.settings().enabled &&
+              (record.resumeOnStartup === true || record.lastStatus === "running"))) &&
+          (await eligible(record));
         await deps.storage.upsert({
           ...record,
           resumeOnStartup: pending,
@@ -103,12 +144,22 @@ export function createRestartRecovery(deps: Dependencies) {
               : record.lastStatus,
         });
         if (pending) {
+          if (forced) oneShotAgentIds.add(record.id);
           let resolve!: () => void;
           const promise = new Promise<void>((settle) => {
             resolve = settle;
           });
           resuming.set(record.id, { promise, resolve, forced });
         }
+      }
+      // Convert legacy global markers and drop missing or ineligible agents.
+      if (
+        oneShotMarker &&
+        (oneShotMarker.allAgents ||
+          oneShotAgentIds.size === 0 ||
+          oneShotAgentIds.size !== oneShotMarker.agentIds.size)
+      ) {
+        await writeRemainingMarker(oneShotAgentIds);
       }
     },
     async captureRunningAgents(options?: {
@@ -140,15 +191,18 @@ export function createRestartRecovery(deps: Dependencies) {
       }
       await deps.storage.flush();
       if (force && deps.oneShotMarkerPath) {
+        // A failed startup dispatch can still be pending when the daemon stops again.
         await writeFileAtomic(
           deps.oneShotMarkerPath,
-          JSON.stringify({ version: 2, agentIds: capturedAgentIds }),
+          JSON.stringify({
+            version: 2,
+            agentIds: [...new Set([...oneShotAgentIds, ...capturedAgentIds])],
+          }),
         );
       }
     },
     /** Resume every candidate in the background; a slow provider holds back only its agent. */
     resumePending() {
-      if (deps.oneShotMarkerPath) rmSync(deps.oneShotMarkerPath, { force: true });
       for (const [agentId, settled] of resuming) {
         void resume(agentId, settled.forced)
           .catch((error) => deps.report(agentId, error))

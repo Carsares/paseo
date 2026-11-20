@@ -8,14 +8,18 @@ import {
   sendPreparedPromptToAgent,
   waitForAgentRunStartWithTimeout,
 } from "./agent/agent-prompt.js";
-import { createToolHosts } from "./agent/host-operations/index.js";
+import {
+  assertDirectParent,
+  createToolHosts,
+  DIRECT_PARENT_ROUTE_ACK,
+  readDirectParentRoute,
+} from "./agent/host-operations/index.js";
 import {
   type FinishRegistration,
   type FinishSubscription,
   type FinishSubscriptions,
 } from "./agent/finish-subscriptions/index.js";
 import { getParentAddressFromLabels } from "@getpaseo/protocol/agent-labels";
-import { MAX_SUBAGENT_DEPTH, REMOTE_HIERARCHY_DEPTH_LABEL } from "./agent/hierarchy-policy.js";
 import { parseAgentMessages } from "./agent/agent-messages/envelope.js";
 import { registerParentFinishSubscription } from "./agent/create-agent/create.js";
 import { HOST_ROUTE_OPCODE } from "@getpaseo/protocol/binary-frames/index";
@@ -762,37 +766,20 @@ export class VoiceAssistantWebSocketServer {
           agentId: batch.recipientId,
           prompt: batch.prompt,
           activeTurnBehavior: batch.activeTurnBehavior,
-          sessionMode: batch.sessionMode,
+          sessionMode: batch.validateDispatch ? undefined : batch.sessionMode,
           clearPendingPermissions: batch.clearPendingPermissions,
           unarchive: batch.unarchive,
           runOptions: { clientMessageId: batch.messageIds[0] },
           beforeDispatch: async () => {
             if (shouldReportUpward) {
               try {
-                const recipient =
-                  agentManager.getAgent(batch.recipientId) ??
-                  (await agentStorage.get(batch.recipientId));
-                const parent = getParentAddressFromLabels(recipient?.labels, serverId);
-                const depth = recipient?.labels?.[REMOTE_HIERARCHY_DEPTH_LABEL];
-                registration =
-                  parent && parent.serverId !== serverId && depth !== String(MAX_SUBAGENT_DEPTH)
-                    ? await finishSubscriptions?.register(
-                        {
-                          childAgentId: batch.recipientId,
-                          callerAgentId: parent.agentId,
-                          callerServerId: parent.serverId,
-                          requireParentOwnership: true,
-                          followupReport: true,
-                        },
-                        true,
-                      )
-                    : await registerParentFinishSubscription({
-                        agentId: batch.recipientId,
-                        serverId,
-                        agentManager,
-                        agentStorage,
-                        finishSubscriptions,
-                      });
+                registration = await registerParentFinishSubscription({
+                  agentId: batch.recipientId,
+                  serverId,
+                  agentManager,
+                  agentStorage,
+                  finishSubscriptions,
+                });
               } catch (error) {
                 this.logger.warn(
                   { err: error, agentId: batch.recipientId },
@@ -800,7 +787,13 @@ export class VoiceAssistantWebSocketServer {
                 );
               }
             }
+            if (batch.validateDispatch) {
+              await batch.validateDispatch();
+              if (batch.sessionMode)
+                await agentManager.setAgentMode(batch.recipientId, batch.sessionMode);
+            }
             await batch.beforeProviderDispatch();
+            await batch.validateDispatch?.();
             prepared = true;
           },
           onDispatch: batch.onDispatch,
@@ -2114,7 +2107,10 @@ export class VoiceAssistantWebSocketServer {
       serverId: this.serverId,
       hostname: getHostName(),
       version: this.daemonVersion,
-      sourceId: session.getHostSourceId(),
+      sourceId:
+        session.isRouted() && readDirectParentRoute(session.getHostSourceId())
+          ? session.getHostSourceId() + DIRECT_PARENT_ROUTE_ACK
+          : session.getHostSourceId(),
       permissions: session.getPermissions(),
       // COMPAT(desktopManaged): added in v0.1.X, remove optional parsing after 2027-01-16.
       desktopManaged: this.daemonRuntimeConfig?.desktopManaged === true,
@@ -2912,11 +2908,66 @@ export class VoiceAssistantWebSocketServer {
     });
   }
 
+  private async allowsDirectParentRequest(
+    ws: WebSocketLike,
+    session: Session,
+    request: Extract<WSInboundMessage, { type: "session" }>["message"],
+  ): Promise<boolean> {
+    const directParent = readDirectParentRoute(session.getHostSourceId());
+    if (!directParent) return true;
+    if (request.type === "send_agent_message_request") {
+      if (
+        !(ws instanceof VirtualHostSocket) ||
+        !session.isRouted() ||
+        request.sourceAgentId !== directParent.agentId ||
+        request.sourceAgentServerId !== directParent.serverId ||
+        request.sourceAgentEvent ||
+        request.waitForDispatch !== true
+      ) {
+        ws.close(1008, "Invalid direct-parent message");
+        return false;
+      }
+    }
+    if (request.type === "agent_permission_response") {
+      try {
+        if (
+          !(ws instanceof VirtualHostSocket) ||
+          !session.isRouted() ||
+          !session.allowsInbound(request)
+        ) {
+          throw new Error("Permission denied for direct-parent operations.");
+        }
+        const stored = await this.agentStorage.get(request.agentId);
+        const child = this.agentManager.getAgent(request.agentId);
+        assertDirectParent(child?.labels, this.serverId, directParent);
+        if (stored?.archivedAt || !child?.pendingPermissions.has(request.requestId)) {
+          throw new Error("Permission request is no longer pending.");
+        }
+      } catch (error) {
+        await session.delivery.request(ws, request, async () => {
+          session.delivery.reply({
+            type: "rpc_error",
+            payload: {
+              requestId: request.requestId,
+              requestType: request.type,
+              error: error instanceof Error ? error.message : "Permission response denied",
+              code: "access_denied",
+            },
+          });
+        });
+        return false;
+      }
+    }
+    return true;
+  }
+
   private async dispatchSessionMessage(
     ws: WebSocketLike,
     activeConnection: SessionConnection,
     message: Extract<WSInboundMessage, { type: "session" }>,
   ): Promise<void> {
+    if (!(await this.allowsDirectParentRequest(ws, activeConnection.session, message.message)))
+      return;
     const link = this.hostLink(ws, activeConnection);
     if (link.handles(message.message)) {
       await activeConnection.session.delivery.request(ws, message.message, () =>

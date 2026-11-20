@@ -20,6 +20,11 @@ interface ExternalQuitSignalSource {
   on(signal: NodeJS.Signals, listener: () => void): unknown;
 }
 
+interface DaemonQuitOptions {
+  preserveWork?: boolean;
+  includePreviousLaunch?: boolean;
+}
+
 interface QuitLifecycle {
   isQuitting(): boolean;
   handleBeforeQuit(event: BeforeQuitEvent): void;
@@ -27,13 +32,12 @@ interface QuitLifecycle {
   requestPreserveWorkQuit(): void;
 }
 
-export interface StopOnQuitDeps {
+export interface StopOnQuitDeps extends DaemonQuitOptions {
   settingsStore: Pick<DesktopSettingsStore, "get">;
   isDesktopManagedDaemonRunning: () => boolean;
   isDesktopManagedDaemonPresent?: () => boolean;
   stopDaemon: (reason?: "quit" | "quit_preserve_work") => Promise<unknown>;
   showShutdownFeedback: () => void;
-  preserveWork?: boolean;
 }
 
 export function registerExternalQuitSignals({
@@ -57,6 +61,16 @@ export function shouldStopDesktopManagedDaemonOnQuit(settings: QuitLifecycleSett
   return !settings.daemon.keepRunningAfterQuit;
 }
 
+export function shouldDeferAppUpdateOnQuit(
+  platform: NodeJS.Platform,
+  settings: QuitLifecycleSettings,
+  isDesktopManagedDaemonPresent: () => boolean,
+): boolean {
+  return (
+    platform === "win32" && settings.daemon.keepRunningAfterQuit && isDesktopManagedDaemonPresent()
+  );
+}
+
 export async function stopDesktopManagedDaemonOnQuitIfNeeded(
   deps: StopOnQuitDeps,
 ): Promise<boolean> {
@@ -74,7 +88,10 @@ export async function stopDesktopManagedDaemonOnQuitIfNeeded(
     return false;
   }
 
-  if (!deps.isDesktopManagedDaemonRunning()) {
+  const isDaemonRunning = deps.includePreviousLaunch
+    ? (deps.isDesktopManagedDaemonPresent ?? deps.isDesktopManagedDaemonRunning)
+    : deps.isDesktopManagedDaemonRunning;
+  if (!isDaemonRunning()) {
     return false;
   }
 
@@ -98,7 +115,7 @@ export function createQuitLifecycle({
 }: {
   app: BeforeQuitApp;
   closeTransportSessions: () => void;
-  stopDesktopManagedDaemonIfNeeded: (options?: { preserveWork?: boolean }) => Promise<boolean>;
+  stopDesktopManagedDaemonIfNeeded: (options?: DaemonQuitOptions) => Promise<boolean>;
   prepareDaemonForAppUpdate?: BeforeAppUpdateInstall;
   installAppUpdateOnQuit: (
     signal: AbortSignal,
@@ -154,7 +171,8 @@ export function createQuitLifecycle({
         return;
       }
 
-      let stoppedForUpdate = false;
+      let updateSelected = false;
+      let updateShutdownPrepared = false;
       const signal = createUpdateDeadlineSignal();
       let onDeadline!: () => void;
       const deadline = new Promise<boolean>((resolve) => {
@@ -169,9 +187,10 @@ export function createQuitLifecycle({
         // Validation and consent have their own deadline. The installer uses
         // independent time limits once an update is selected.
         signal.removeEventListener("abort", onDeadline);
+        updateSelected = true;
         try {
           const shutdown = await prepareDaemonForAppUpdate?.(appUpdate);
-          stoppedForUpdate = Boolean(shutdown);
+          updateShutdownPrepared = Boolean(shutdown);
           return shutdown;
         } catch (error) {
           onStopError(error);
@@ -185,8 +204,11 @@ export function createQuitLifecycle({
       signal.removeEventListener("abort", onDeadline);
       if (installingUpdate) return;
 
-      if (!stoppedForUpdate) {
-        await stopDesktopManagedDaemonIfNeeded().catch(onStopError);
+      if (!updateShutdownPrepared) {
+        const shutdown = updateSelected
+          ? stopDesktopManagedDaemonIfNeeded({ includePreviousLaunch: true })
+          : stopDesktopManagedDaemonIfNeeded();
+        await shutdown.catch(onStopError);
       }
       app.exit(0);
     })();

@@ -5880,6 +5880,91 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test.each([
+    { rootEvents: ["wait"], localResumeAt: null, expected: "completed" },
+    {
+      rootEvents: ["closeAgent", "resumeAgent", "wait"],
+      localResumeAt: null,
+      expected: "completed",
+    },
+    { rootEvents: ["resumeAgent", "closeAgent"], localResumeAt: null, expected: "canceled" },
+    { rootEvents: ["wait"], localResumeAt: "2026-05-01T00:00:30Z", expected: "running" },
+    {
+      rootEvents: ["closeAgent", "wait"],
+      omitFirstTimestamp: true,
+      localResumeAt: "2026-05-01T00:00:30Z",
+      expected: "running",
+    },
+    {
+      rootEvents: ["resumeAgent", "closeAgent", "resumeAgent", "wait"],
+      omitFirstTimestamp: true,
+      localResumeAt: null,
+      expected: "completed",
+    },
+  ] as const)(
+    "merges grandchild outcomes from the root ($rootEvents, local resume $localResumeAt)",
+    async ({ rootEvents, localResumeAt, expected, ...options }) => {
+      const session = createSession();
+      const childStatus = { wait: "completed", closeAgent: "shutdown", resumeAgent: "running" };
+      const outcome = (tool: string, timestamp: string, status: string) => ({
+        type: "collabAgentToolCall",
+        id: `${tool}-${timestamp}`,
+        tool,
+        status: "completed",
+        timestamp,
+        receiverThreadIds: ["grandchild"],
+        agentsStates: { grandchild: { status } },
+      });
+      const itemsByThread: Record<string, unknown[]> = {
+        "test-thread": [
+          {
+            type: "subAgentActivity",
+            id: "spawn-child",
+            kind: "started",
+            agentThreadId: "child",
+            agentPath: "/root/child",
+          },
+          ...rootEvents.map((tool, index) => {
+            const event = outcome(tool, `2026-05-01T00:00:1${index}Z`, childStatus[tool]);
+            return index === 0 && "omitFirstTimestamp" in options
+              ? { ...event, timestamp: undefined }
+              : event;
+          }),
+        ],
+        child: [
+          {
+            ...outcome("spawnAgent", "2026-05-01T00:00:00Z", "running"),
+            id: "spawn-grandchild",
+            prompt: "Grandchild task",
+          },
+          ...(localResumeAt ? [outcome("resumeAgent", localResumeAt, "running")] : []),
+        ],
+      };
+      session.client = {
+        request: vi.fn(async (_method: string, params: { threadId: string }) => ({
+          thread: { turns: [{ items: itemsByThread[params.threadId] ?? [] }] },
+        })),
+      };
+      const history = await Array.fromAsync(session.streamHistory());
+      const events = history.flatMap((event) =>
+        event.type === "provider_subagent" ? [event.event] : [],
+      );
+      expect(
+        events.filter((event) => event.type === "upsert" && event.id === "grandchild"),
+      ).toMatchObject([
+        {
+          id: "grandchild",
+          parentSubagentId: "child",
+          toolCallId: "spawn-grandchild",
+          status: expected,
+        },
+      ]);
+      expect(
+        events.filter((event) => event.type === "timeline" && event.id === "child"),
+      ).toMatchObject([{ item: { callId: "spawn-grandchild", status: expected } }]);
+    },
+  );
+
   test("cancels running persisted descendants of a canceled child", async () => {
     const session = createSession();
     const activity = (id: string, kind: string, agentThreadId: string, agentPath: string) => ({

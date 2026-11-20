@@ -101,6 +101,7 @@ import {
 import {
   createQuitLifecycle,
   registerExternalQuitSignals,
+  shouldDeferAppUpdateOnQuit,
   stopDesktopManagedDaemonOnQuitIfNeeded,
 } from "./daemon/quit-lifecycle.js";
 import { runDesktopStartup } from "./desktop-startup.js";
@@ -1062,8 +1063,9 @@ const quitLifecycle = createQuitLifecycle({
       isDesktopManagedDaemonRunning: isDesktopManagedDaemonRunningSync,
       isDesktopManagedDaemonPresent: isDesktopManagedDaemonPresentSync,
       preserveWork: options?.preserveWork,
+      includePreviousLaunch: options?.includePreviousLaunch,
       stopDaemon: async (reason = "quit") => {
-        await stopDesktopDaemonViaCli(reason);
+        await stopDesktopDaemonViaCli(reason, options);
         if (reason === "quit_preserve_work") showDaemonShutdownDialog();
       },
       // This overlay has no dismissal path. Show it only once a preserve-work stop succeeds.
@@ -1073,9 +1075,12 @@ const quitLifecycle = createQuitLifecycle({
     }),
   prepareDaemonForAppUpdate: async () => {
     const settings = await getDesktopSettingsStore().get();
-    if (settings.daemon.keepRunningAfterQuit) return;
-    if (!isDesktopManagedDaemonPresentSync()) return;
-    showDaemonShutdownDialog();
+    if (settings.daemon.keepRunningAfterQuit) {
+      if (process.platform === "win32") return prepareBuiltInDaemonForUpdate("defer");
+      if (process.platform === "darwin") return prepareBuiltInDaemonForUpdate("keep");
+      return;
+    }
+    if (isDesktopManagedDaemonPresentSync()) showDaemonShutdownDialog();
     return prepareBuiltInDaemonForUpdate();
   },
   confirmAppUpdate: async (target, signal) => {
@@ -1089,6 +1094,9 @@ const quitLifecycle = createQuitLifecycle({
   installAppUpdateOnQuit: async (signal, onBeforeQuit) => {
     if (!hasDownloadedAppUpdate()) return false;
     const settings = await getDesktopSettingsStore().get();
+    if (shouldDeferAppUpdateOnQuit(process.platform, settings, isDesktopManagedDaemonPresentSync)) {
+      return false;
+    }
     return installAppUpdateOnQuit({
       currentVersion: app.getVersion(),
       releaseChannel: settings.releaseChannel,

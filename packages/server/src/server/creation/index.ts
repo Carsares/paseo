@@ -32,6 +32,7 @@ interface CreationRequest {
     workspace: WorkspaceDescriptorPayload,
     agentId: string,
   ) => Promise<AgentSnapshotPayload>;
+  readMainAgent?: (agentId: string, workspaceId: string) => Promise<AgentSnapshotPayload | null>;
   createAgent?: (
     agentId: string,
     workspace: WorkspaceDescriptorPayload | undefined,
@@ -78,15 +79,18 @@ export class CreationService {
         throw new Error(`${input.kind}_request_key_conflict`);
       const running = this.active.get(identity);
       if (running && record) return { completion: running, snapshot: record.snapshot };
+      if (record?.inFlight === "mainAgent") {
+        await this.recoverMainAgent(identity, record, input);
+      }
       if (record?.snapshot.phase === "completed") await this.validateCompleted(record.snapshot);
       if (record?.snapshot.phase === "completed" || record?.snapshot.outcomeUnknown) {
         return { completion: Promise.resolve(record.snapshot), snapshot: record.snapshot };
       }
-      if (record?.inFlight) {
+      if (record?.inFlight && record.inFlight !== "mainAgent") {
         await this.publish(identity, record, {
           phase: "failed",
           error: `${input.kind}_request_outcome_unknown`,
-          failedStage: record.inFlight === "mainAgent" ? "agent" : record.inFlight,
+          failedStage: record.inFlight,
           outcomeUnknown: true,
         });
         return { completion: Promise.resolve(record.snapshot), snapshot: record.snapshot };
@@ -138,10 +142,10 @@ export class CreationService {
     try {
       await this.admission;
       const record = await this.read(identity);
-      if (record?.inFlight && !this.active.has(identity)) {
+      if (record?.inFlight && record.inFlight !== "mainAgent" && !this.active.has(identity)) {
         await this.publish(identity, record, {
           phase: "failed",
-          failedStage: record.inFlight === "mainAgent" ? "agent" : record.inFlight,
+          failedStage: record.inFlight,
           outcomeUnknown: true,
           error: `${kind}_request_outcome_unknown`,
         });
@@ -279,6 +283,27 @@ export class CreationService {
     };
     await this.write(identityFor(input.kind, input.key), record);
     return record;
+  }
+
+  private async recoverMainAgent(
+    identity: string,
+    record: Record,
+    input: CreationInput,
+  ): Promise<void> {
+    const { mainAgentId, snapshot } = record;
+    if (!mainAgentId || !snapshot.workspaceId || !input.readMainAgent || !input.createMainAgent) {
+      throw new Error("Unable to recover the default Main Session.");
+    }
+    const mainAgent = await input.readMainAgent(mainAgentId, snapshot.workspaceId);
+    record.inFlight = null;
+    await this.publish(identity, record, {
+      phase: "workspace_ready",
+      error: null,
+      errorCode: undefined,
+      failedStage: undefined,
+      outcomeUnknown: undefined,
+      ...(mainAgent ? { mainAgent } : {}),
+    });
   }
 
   private async claimResources(

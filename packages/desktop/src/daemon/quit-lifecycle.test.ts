@@ -4,6 +4,7 @@ import { DEFAULT_DESKTOP_SETTINGS } from "../settings/desktop-settings";
 import {
   createQuitLifecycle,
   registerExternalQuitSignals,
+  shouldDeferAppUpdateOnQuit,
   shouldStopDesktopManagedDaemonOnQuit,
   stopDesktopManagedDaemonOnQuitIfNeeded,
 } from "./quit-lifecycle";
@@ -30,6 +31,21 @@ function waitForQuitLifecycle(): Promise<void> {
 }
 
 describe("quit-lifecycle", () => {
+  it.each([
+    ["win32", true, true, true],
+    ["win32", true, false, false],
+    ["win32", false, true, false],
+    ["darwin", true, true, false],
+  ] as const)(
+    "defers installation on %s with keep running %s and a managed daemon present %s: %s",
+    (platform, keepRunning, managedDaemonPresent, defer) => {
+      const settings = keepRunning ? SETTINGS_KEEP_RUNNING : SETTINGS_STOP_ON_QUIT;
+      expect(shouldDeferAppUpdateOnQuit(platform, settings, () => managedDaemonPresent)).toBe(
+        defer,
+      );
+    },
+  );
+
   it("turns external termination signals into one Electron quit", () => {
     const listeners = new Map<NodeJS.Signals, () => void>();
     const quits: string[] = [];
@@ -303,6 +319,35 @@ describe("quit-lifecycle", () => {
     await waitForQuitLifecycle();
 
     expect(exits).toEqual([]);
+  });
+
+  it("checks for a daemon from a previous launch when update preparation fails", async () => {
+    const events: unknown[] = [];
+    const lifecycle = createQuitLifecycle({
+      app: { exit: (code) => events.push(code) },
+      closeTransportSessions: () => {},
+      prepareDaemonForAppUpdate: async () => {
+        throw new Error("A recovery record is already pending");
+      },
+      installAppUpdateOnQuit: async (_signal, beforeQuit) =>
+        (await beforeQuit({ version: "1.2.4" })) !== false,
+      stopDesktopManagedDaemonIfNeeded: (options) =>
+        stopDesktopManagedDaemonOnQuitIfNeeded({
+          ...options,
+          settingsStore: { get: async () => SETTINGS_STOP_ON_QUIT },
+          isDesktopManagedDaemonRunning: () => false,
+          isDesktopManagedDaemonPresent: () => true,
+          stopDaemon: async (reason) => events.push(reason),
+          showShutdownFeedback: () => {},
+        }),
+      createUpdateDeadlineSignal: () => new AbortController().signal,
+      onStopError: () => {},
+      onUpdateError: () => {},
+    });
+
+    lifecycle.handleBeforeQuit({ preventDefault: () => {} });
+    await waitForQuitLifecycle();
+    expect(events).toEqual(["quit", 0]);
   });
 
   it("prevents repeated user quits while the selected installer is still pending", async () => {

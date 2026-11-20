@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { useSessionStore } from "@/stores/session-store";
 import { getOrCreateClientId } from "@/utils/client-id";
+import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
 import type { WorkspaceTab } from "@/workspace-tabs/model";
 import {
   getAgentTabsNeedingOpenLabel,
@@ -84,7 +85,10 @@ export function useOpenAgentTabLabels(input: {
           }
           pendingAgentIdsRef.current.add(agentId);
           try {
-            await client.updateAgent(agentId, { labels: { [label]: "true" } });
+            await client.updateAgent(agentId, {
+              labels: { [label]: "true" },
+              expectedWorkspaceId: normalizeWorkspaceOpaqueId(input.workspaceId) ?? undefined,
+            });
           } catch (error) {
             console.warn("[OpenAgentTabLabels] Failed to mark open subagent tab", {
               error,

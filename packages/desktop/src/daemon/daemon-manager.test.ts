@@ -218,12 +218,67 @@ describe("daemon-manager commands", () => {
     },
   );
 
+  it("blocks daemon starts until a manual update that found no daemon has failed", async () => {
+    mkdirSync(mocks.paseoHome);
+    const handlers = createDaemonCommandHandlers();
+    mocks.installUpdate.mockImplementation(async (_input, beforeQuit) => {
+      const shutdown = await beforeQuit({ version: "1.2.4" });
+      if (!shutdown) throw new Error("Expected the update to hold the daemon launch lock");
+      await shutdown.beforeHandoff();
+      await expect(handlers.start_desktop_daemon()).rejects.toThrow("stopped for an app update");
+      await expect(handlers.restart_desktop_daemon()).rejects.toThrow("stopped for an app update");
+      await shutdown.restore();
+      return { installed: false };
+    });
+
+    expect(await handlers.install_app_update()).toEqual({ installed: false });
+    expect(mocks.startDaemonInstance).not.toHaveBeenCalled();
+    const next = await prepareBuiltInDaemonForUpdate();
+    await next.restore();
+  });
+
+  it("defers an ordinary update when a daemon is present, then permits a stop for manual install", async () => {
+    mkdirSync(mocks.paseoHome);
+    const lockPath = path.join(mocks.paseoHome, "paseo.pid");
+    const instance = {
+      pid: process.pid,
+      startedAt: new Date(Date.now() - 1_000).toISOString(),
+      hostname: hostname(),
+      uid: process.getuid?.() ?? 0,
+      listen: "127.0.0.1:6799",
+      desktopManaged: true,
+    };
+    writeFileSync(lockPath, JSON.stringify(instance));
+    mocks.settings = { ...DEFAULT_DESKTOP_SETTINGS, officialUpdatesEnabled: true };
+
+    expect(await prepareBuiltInDaemonForUpdate("defer")).toBe(false);
+    expect(existsSync(lockPath)).toBe(true);
+    expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
+
+    mocks.confirmUpdate.mockResolvedValue(true);
+    mocks.stopDaemonInstance.mockImplementation(async () => {
+      rmSync(lockPath);
+      return { action: "stopped", pid: instance.pid, forced: false, usedLifecycleRpc: false };
+    });
+    mocks.installUpdate.mockImplementation(async (_input, beforeQuit) => {
+      const shutdown = await beforeQuit({ version: "1.2.4" });
+      if (!shutdown) throw new Error("Expected a stopped daemon before installation");
+      await shutdown.beforeHandoff();
+      return { installed: true };
+    });
+    expect(await createDaemonCommandHandlers().install_app_update()).toEqual({ installed: true });
+    expect(existsSync(lockPath)).toBe(false);
+    expect(mocks.stopDaemonInstance).toHaveBeenCalledOnce();
+  });
+
   it.each([
     "handoff",
+    "preserve until next launch",
     "rollback",
     "restart failure",
     "unsupported",
     "existing",
+    "missing",
     "replaced",
   ] as const)("preserves recovery-record ownership on %s", async (outcome) => {
     mkdirSync(mocks.paseoHome);
@@ -254,7 +309,9 @@ describe("daemon-manager commands", () => {
         });
       }
       // Simulate an unrelated recovery record appearing during an unsupported stop.
-      writeFileSync(markerPath, options.resumeAgents ? marker : otherMarker);
+      if (outcome !== "missing") {
+        writeFileSync(markerPath, options.resumeAgents ? marker : otherMarker);
+      }
       rmSync(lockPath);
       return { action: "stopped", pid: instance.pid, forced: false, usedLifecycleRpc: true };
     });
@@ -279,6 +336,10 @@ describe("daemon-manager commands", () => {
 
     const shutdown = await prepareBuiltInDaemonForUpdate();
     expect(shutdown).toBeDefined();
+    if (outcome === "missing") {
+      await expect(shutdown?.beforeHandoff()).rejects.toThrow("recovery record is missing");
+      return;
+    }
     expect(existsSync(markerPath)).toBe(true);
     if (outcome === "replaced") {
       writeFileSync(`${markerPath}.tmp`, otherMarker);
@@ -289,7 +350,15 @@ describe("daemon-manager commands", () => {
     }
     await shutdown?.beforeHandoff();
     expect(existsSync(markerPath)).toBe(outcome === "unsupported");
-    if (outcome === "handoff") {
+    if (outcome === "handoff" || outcome === "preserve until next launch") {
+      const handlers = createDaemonCommandHandlers();
+      await expect(handlers.start_desktop_daemon()).rejects.toThrow("stopped for an app update");
+      await expect(handlers.restart_desktop_daemon()).rejects.toThrow("stopped for an app update");
+      if (outcome === "preserve until next launch") {
+        await shutdown?.preserveForNextLaunch?.();
+        expect(readFileSync(markerPath, "utf8")).toBe(marker);
+        expect(existsSync(lockPath)).toBe(false);
+      }
       expect(mocks.startDaemonInstance).not.toHaveBeenCalled();
     } else if (outcome === "restart failure") {
       await expect(shutdown?.restore()).rejects.toThrow("Daemon startup failed");
@@ -408,6 +477,13 @@ describe("daemon-manager commands", () => {
     }
     expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
 
+    await stopDesktopDaemon("quit", undefined, { includePreviousLaunch: true });
+    expect(mocks.stopDaemonInstance).toHaveBeenCalledExactlyOnceWith(
+      mocks.paseoHome,
+      expect.objectContaining({ instance: expect.objectContaining({ pid: lock.pid }) }),
+    );
+    mocks.stopDaemonInstance.mockClear();
+
     for (const reason of ["quit_preserve_work", "app_update", "version_mismatch"] as const) {
       await stopDesktopDaemon(reason);
     }
@@ -415,6 +491,7 @@ describe("daemon-manager commands", () => {
 
     mocks.stopDaemonInstance.mockClear();
     writeFileSync(lockPath, JSON.stringify({ ...lock, desktopManaged: false }));
+    await stopDesktopDaemon("quit", undefined, { includePreviousLaunch: true });
     for (const reason of [
       "quit",
       "quit_preserve_work",

@@ -1,5 +1,10 @@
-import type { AgentSessionConfig, AgentStreamEvent } from "../agent-sdk-types.js";
+import type {
+  AgentPermissionResponse,
+  AgentSessionConfig,
+  AgentStreamEvent,
+} from "../agent-sdk-types.js";
 import { getParentAddressFromLabels, parentAddressLabels } from "@getpaseo/protocol/agent-labels";
+import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import type { ActiveTurnBehavior, AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -50,6 +55,7 @@ export interface HostOperations {
   createWorkspace: HostOperation;
   listWorkspaces: HostOperation;
   sendPrompt: HostOperation;
+  respondToPermission: HostOperation;
   getStatus: HostOperation;
   getActivity: HostOperation;
   listAgents: HostOperation;
@@ -83,14 +89,48 @@ export interface ToolHosts {
     serverId: string,
     action: (client: DaemonClient) => Promise<T>,
     signal?: AbortSignal,
+    directParentAgentId?: string,
   ): Promise<T>;
+}
+
+const DIRECT_PARENT_SOURCE = "mcp-direct-parent:";
+export const DIRECT_PARENT_ROUTE_ACK = ":direct-parent";
+
+export function readDirectParentRoute(sourceId: string): AgentAddress | undefined {
+  const parts = sourceId.split(":");
+  if (parts.length !== 4 || parts[0] !== "route") return;
+  try {
+    const producer = decodeURIComponent(parts[3]!);
+    if (!producer.startsWith(DIRECT_PARENT_SOURCE)) return;
+    const agentId = producer.slice(DIRECT_PARENT_SOURCE.length);
+    if (agentId) return { agentId, serverId: decodeURIComponent(parts[2]!) };
+  } catch {
+    return;
+  }
+}
+
+export class DirectParentRequiredError extends Error {
+  constructor() {
+    super("You can only manage your direct subagents.");
+  }
+}
+
+export function assertDirectParent(
+  labels: Record<string, string> | undefined,
+  serverId: string,
+  expected: AgentAddress,
+): void {
+  const parent = getParentAddressFromLabels(labels, serverId);
+  if (parent?.agentId !== expected.agentId || parent.serverId !== expected.serverId) {
+    throw new DirectParentRequiredError();
+  }
 }
 
 /** Daemon MCP has the daemon's authority, bounded by the destination's admission of its link. */
 export function createToolHosts(hosts: ConnectedHosts): ToolHosts {
   return {
     directory: () => hosts.list(),
-    async use(serverId, action, signal) {
+    async use(serverId, action, signal, directParentAgentId) {
       const lifetime = new AbortController();
       let routeFailure: unknown;
       const transportFactory: DaemonTransportFactory = () => {
@@ -104,7 +144,7 @@ export function createToolHosts(hosts: ConnectedHosts): ToolHosts {
           .openRoute({
             serverId,
             scopeId: randomUUID(),
-            sourceId: "mcp",
+            sourceId: directParentAgentId ? DIRECT_PARENT_SOURCE + directParentAgentId : "mcp",
             originSessionId: "mcp",
             permissions: OWNER_PERMISSIONS,
             signal: signal ? AbortSignal.any([lifetime.signal, signal]) : lifetime.signal,
@@ -169,6 +209,19 @@ export function createToolHosts(hosts: ConnectedHosts): ToolHosts {
           // The action has not run; no application request could have been transmitted.
           throw new HostOperationRejectedError(routeFailure ?? error);
         });
+        if (directParentAgentId) {
+          const source = client.getLastServerInfoMessage()?.sourceId;
+          if (
+            !source?.endsWith(DIRECT_PARENT_ROUTE_ACK) ||
+            readDirectParentRoute(source.slice(0, -DIRECT_PARENT_ROUTE_ACK.length))?.agentId !==
+              directParentAgentId
+          ) {
+            // COMPAT(directParentRoute): added in v0.16.0, remove after 2027-05-19.
+            throw new HostOperationRejectedError(
+              new Error("Update the destination Paseo host to use direct-parent operations."),
+            );
+          }
+        }
         return await action(client);
       } finally {
         signal?.removeEventListener("abort", stop);
@@ -255,12 +308,15 @@ export function createHostResolver(input: {
     async use<T>(
       serverId: string | undefined,
       action: (host: HostOperations) => Promise<T>,
+      directParentAgentId?: string,
     ): Promise<T> {
       const destination = serverId ?? input.serverId;
       if (destination === input.serverId) return action(input.local);
       if (input.lockedCwd)
         throw new Error("This caller is restricted to its local working directory");
-      return input.hosts().use(destination, async (client) =>
+      const use = (invoke: (client: DaemonClient) => Promise<T>) =>
+        input.hosts().use(destination, invoke, undefined, directParentAgentId);
+      return use(async (client) =>
         action({
           async createAgent(args) {
             const parsed = remoteCreate.parse(args);
@@ -305,7 +361,7 @@ export function createHostResolver(input: {
               initialPrompt: parsed.initialPrompt,
               idempotencyKey: parsed.idempotencyKey,
             });
-            if (shouldObserveRemoteFollowups(client, labels, parsed.notifyOnFinish))
+            if (shouldObserveRemoteFollowups(client, labels, undefined))
               await input.trackRemoteChild?.(snapshot.id, destination);
             return result({
               agentId: snapshot.id,
@@ -348,6 +404,7 @@ export function createHostResolver(input: {
             }
             const receipt = await client
               .sendMessage(agentId, args.prompt as string, {
+                waitForDispatch: args.requireParentOwnership === true ? true : undefined,
                 sessionMode: input.callerAgentId
                   ? (args.sessionMode as string | undefined)
                   : undefined,
@@ -370,6 +427,27 @@ export function createHostResolver(input: {
                   ? "Queued for delivery after two quiet seconds. You will get notified when the prompted agent finishes, errors, or needs permission unless notifyOnFinish is false."
                   : "Dispatch acknowledged. Observe completion using get_agent_status/get_agent_activity or SDK/RPC subscriptions and wait APIs.",
             });
+          },
+          async respondToPermission(args) {
+            const agentId = args.agentId as string;
+            const requestId = args.requestId as string;
+            const agent = (await client.fetchAgent(agentId))?.agent;
+            if (!agent || agent.archivedAt) throw new Error(`Agent ${agentId} is unavailable`);
+            if (input.callerAgentId) {
+              assertDirectParent(agent.labels, destination, {
+                agentId: input.callerAgentId,
+                serverId: input.serverId,
+              });
+            }
+            if (!agent.pendingPermissions.some((request) => request.id === requestId)) {
+              throw new Error(`Permission request ${requestId} is no longer pending`);
+            }
+            await client.respondToPermissionAndWait(
+              agentId,
+              requestId,
+              args.response as AgentPermissionResponse,
+            );
+            return result({ success: true });
           },
           async getStatus(args) {
             const agent = (await client.fetchAgent(args.agentId as string))?.agent;

@@ -178,6 +178,7 @@ export async function registerParentFinishSubscription({
         callerAgentId: parentId,
         callerServerId: parentAddress.serverId,
         requireParentOwnership: true,
+        followupReport: true,
       },
       true,
     );
@@ -229,11 +230,12 @@ interface ResolvedCreateAgent {
 export async function createAgentCommand(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentCommandInput,
+  options?: Pick<CreateAgentOptions, "inheritParentWorkspace">,
 ): Promise<CreateAgentCommandResult> {
   if (input.callerAgentId) await validateCreateCaller(dependencies, input.callerAgentId);
   const resolved =
     input.kind === "session"
-      ? await resolveSessionCreateAgent(dependencies, input)
+      ? await resolveSessionCreateAgent(dependencies, input, options)
       : await resolveMcpCreateAgent(dependencies, input);
 
   if (resolved.createOptions.labels) {
@@ -323,6 +325,7 @@ function registerInitialPromptFinish(
 async function resolveSessionCreateAgent(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentFromSessionInput,
+  options?: Pick<CreateAgentOptions, "inheritParentWorkspace">,
 ): Promise<ResolvedCreateAgent> {
   const trimmedPrompt = input.initialPrompt?.trim();
   const builtSessionConfig = foldFeatureValues(input.config);
@@ -366,6 +369,7 @@ async function resolveSessionCreateAgent(
       // provider session either. Same as the daemon's own ephemeral helpers.
       ...(sessionConfig.internal ? { persistSession: false } : {}),
       workspaceId: requireResolvedWorkspaceId(workspaceId),
+      ...(options?.inheritParentWorkspace ? { inheritParentWorkspace: true } : {}),
       background: input.background,
     },
     prompt: hasPromptContent ? prompt : undefined,
@@ -445,6 +449,8 @@ async function resolveMcpCreateAgent(
     createOptions: {
       ...(Object.keys(intent.labels).length > 0 ? { labels: intent.labels } : {}),
       workspaceId: intent.workspaceId,
+      inheritParentWorkspace:
+        Boolean(parentAgent && !input.detached) && !createdWorkspaceId && !input.workspaceId,
       owner: input.owner,
       background: inheritAgentBackground(input.background, parentAgent),
       env: input.env,

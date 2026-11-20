@@ -373,9 +373,25 @@ interface ApplyArchivedAgentCloseResultsInput {
   invalidateQueries?: boolean;
 }
 
+async function refreshAgentHistoryAfterArchive(queryClient: QueryClient, serverId: string) {
+  const queryKeys = [agentHistoryQueryKey(serverId), allAgentHistoryQueryRootKey()];
+  // Even a response that has just resolved can still be on its way into the cache.
+  // Let that write finish before invalidating, so it cannot clear the invalidation.
+  await Promise.all(queryKeys.map((queryKey) => queryClient.cancelQueries({ queryKey })));
+  for (const queryKey of queryKeys) {
+    void queryClient.invalidateQueries({ queryKey });
+  }
+}
+
 export function applyArchivedAgentCloseResults(input: ApplyArchivedAgentCloseResultsInput): void {
   if (input.results.length === 0) {
     return;
+  }
+
+  const invalidateQueries = input.invalidateQueries ?? true;
+  if (invalidateQueries) {
+    // Cancellation can restore the pre-fetch cache state. Start it before patching the caches.
+    void refreshAgentHistoryAfterArchive(input.queryClient, input.serverId);
   }
 
   for (const result of input.results) {
@@ -395,18 +411,12 @@ export function applyArchivedAgentCloseResults(input: ApplyArchivedAgentCloseRes
     });
   }
 
-  if (input.invalidateQueries ?? true) {
+  if (invalidateQueries) {
     void input.queryClient.invalidateQueries({
       queryKey: ["sidebarAgentsList", input.serverId],
     });
     void input.queryClient.invalidateQueries({
       queryKey: ["allAgents", input.serverId],
-    });
-    void input.queryClient.invalidateQueries({
-      queryKey: agentHistoryQueryKey(input.serverId),
-    });
-    void input.queryClient.invalidateQueries({
-      queryKey: allAgentHistoryQueryRootKey(),
     });
   }
 }
@@ -519,12 +529,7 @@ export function useArchiveAgent() {
       void queryClient.invalidateQueries({
         queryKey: ["allAgents", input.serverId],
       });
-      void queryClient.invalidateQueries({
-        queryKey: agentHistoryQueryKey(input.serverId),
-      });
-      void queryClient.invalidateQueries({
-        queryKey: allAgentHistoryQueryRootKey(),
-      });
+      return refreshAgentHistoryAfterArchive(queryClient, input.serverId);
     },
   });
 

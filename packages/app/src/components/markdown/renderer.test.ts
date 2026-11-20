@@ -1125,6 +1125,30 @@ it("uses theme.lineHeight.content for regular paragraphs and scales proportional
   ).toBe(28);
 });
 
+it.each([false, true])(
+  "gives larger code blocks their own line height (compact: %s)",
+  (compact) => {
+    const theme = {
+      ...darkTheme,
+      fontSize: { ...darkTheme.fontSize, content: 10, base: 13, code: 22 },
+      lineHeight: { ...darkTheme.lineHeight, content: 12 },
+    };
+    const { markdownStyle } = createMarkdownStyles(theme, { compact, blockGap: 16 });
+    expect(markdownStyle.paragraph?.lineHeight).toBe(compact ? 16 : 12);
+    expect(markdownStyle.codeBlock).toMatchObject({ fontSize: 22, lineHeight: 26 });
+  },
+);
+
+it("keeps a code block's line height at least as large as its font size", () => {
+  const theme = {
+    ...darkTheme,
+    fontSize: { ...darkTheme.fontSize, content: 10, code: 22 },
+    lineHeight: { ...darkTheme.lineHeight, content: 9 },
+  };
+  const { markdownStyle } = createMarkdownStyles(theme, { blockGap: 16 });
+  expect(markdownStyle.codeBlock).toMatchObject({ fontSize: 22, lineHeight: 22 });
+});
+
 it.each([
   [4, 4],
   [6, 4],

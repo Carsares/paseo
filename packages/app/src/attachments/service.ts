@@ -1,4 +1,7 @@
-import { collectRetainedAttachmentIds } from "@/attachments/gc-retention";
+import {
+  collectRetainedAttachmentIds,
+  retainAttachmentForGarbageCollection as retainAttachment,
+} from "@/attachments/gc-retention";
 import { getAttachmentStore } from "@/attachments/store";
 import type { AttachmentMetadata, SaveAttachmentInput } from "@/attachments/types";
 
@@ -8,6 +11,15 @@ let pendingGarbageCollections = 0;
 let garbageCollectionTail: Promise<void> = Promise.resolve();
 let persistenceBarrier: Promise<void> | null = null;
 let releasePersistenceBarrier: (() => void) | null = null;
+
+export function retainAttachmentForGarbageCollection(attachmentId: string): () => void {
+  const release = retainAttachment(attachmentId);
+  return () => {
+    // A queued collection may still have a reference snapshot from mid-handoff.
+    if (pendingGarbageCollections > 0) persistedDuringGarbageCollection.add(attachmentId);
+    release();
+  };
+}
 
 async function waitForPersistenceBarrier(): Promise<void> {
   const barrier = persistenceBarrier;

@@ -30,6 +30,7 @@ export interface AgentTimelineFetchOptions {
 
 export interface AgentTimelineWindow {
   minSeq: number;
+  /** Highest allocated sequence, which can belong to a retracted row. */
   maxSeq: number;
   nextSeq: number;
 }
@@ -44,6 +45,7 @@ export interface AgentTimelineFetchResult {
   hasOlder: boolean;
   hasNewer: boolean;
   startSeq: number | null;
+  /** Coverage cursor, including retracted sequences before the next retained row. */
   endSeq: number | null;
   rows: ProjectedTimelineRow[];
 }

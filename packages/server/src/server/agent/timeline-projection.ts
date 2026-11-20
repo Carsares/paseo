@@ -2,7 +2,7 @@ import { continuesTimelineTurn, isTimelineTurnTrigger } from "@getpaseo/protocol
 import type { AgentTimelineItem, ToolCallDetail } from "./agent-sdk-types.js";
 import { timelineItemIdentity } from "@getpaseo/protocol/timeline-identity";
 
-import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
+import type { AgentTimelineRow, AgentTimelineWindow } from "./agent-timeline-store-types.js";
 
 export type TimelineProjectionMode = "canonical" | "projected";
 
@@ -45,34 +45,24 @@ export interface ProjectedTimelinePageSelection {
   hasNewer: boolean;
 }
 
-function appendSeqToRanges(ranges: TimelineSeqRange[], seq: number): TimelineSeqRange[] {
-  if (ranges.length === 0) {
-    return [{ startSeq: seq, endSeq: seq }];
-  }
-
-  const next = [...ranges];
-  const last = next[next.length - 1];
-  if (!last) {
-    return [{ startSeq: seq, endSeq: seq }];
-  }
-
-  if (seq <= last.endSeq + 1) {
-    next[next.length - 1] = { ...last, endSeq: Math.max(last.endSeq, seq) };
-    return next;
-  }
-
-  next.push({ startSeq: seq, endSeq: seq });
-  return next;
-}
-
 function mergeSeqRanges(
   existing: TimelineSeqRange[],
   incoming: TimelineSeqRange[],
 ): TimelineSeqRange[] {
-  let merged = [...existing];
-  for (const range of incoming) {
-    for (let seq = range.startSeq; seq <= range.endSeq; seq += 1) {
-      merged = appendSeqToRanges(merged, seq);
+  const merged: TimelineSeqRange[] = [];
+  let left = 0;
+  let right = 0;
+  while (left < existing.length || right < incoming.length) {
+    const range =
+      right === incoming.length ||
+      (left < existing.length && existing[left].startSeq <= incoming[right].startSeq)
+        ? existing[left++]
+        : incoming[right++];
+    const last = merged.at(-1);
+    if (last && range.startSeq <= last.endSeq + 1) {
+      last.endSeq = Math.max(last.endSeq, range.endSeq);
+    } else {
+      merged.push({ ...range });
     }
   }
   return merged;
@@ -298,7 +288,8 @@ export type ProjectedTimelineRow = AgentTimelineRow & TimelineProjectionEntry;
 
 interface ProjectedTimelinePageOptions {
   wholeTurns?: boolean;
-  bounds: { minSeq: number; maxSeq: number };
+  bounds: Pick<AgentTimelineWindow, "minSeq" | "maxSeq">;
+  afterCoverageStart?: number;
   direction: TimelineLimitDirection;
   cursorSeq?: number;
   limit?: number;
@@ -407,10 +398,7 @@ export class TimelineProjection {
           input.direction === "after"
             ? cursor >= input.bounds.minSeq
             : input.direction === "before" && cursor > input.bounds.minSeq,
-        hasNewer:
-          input.direction === "after"
-            ? cursor < input.bounds.maxSeq
-            : input.direction === "before" && cursor <= input.bounds.maxSeq,
+        hasNewer: input.direction === "before" && cursor <= input.bounds.maxSeq,
       };
     }
     switch (input.direction) {
@@ -449,10 +437,8 @@ export class TimelineProjection {
   }
 
   private selectAfter(input: ProjectedTimelinePageOptions): ProjectedTimelinePageSelection {
-    const startSeq = Math.max(
-      input.bounds.minSeq,
-      (input.cursorSeq ?? input.bounds.minSeq - 1) + 1,
-    );
+    const coverageStart = input.afterCoverageStart ?? input.bounds.minSeq;
+    const startSeq = Math.max(coverageStart, (input.cursorSeq ?? coverageStart - 1) + 1);
     let low = 0;
     let high = this.sourceRanges.length;
     while (low < high) {
@@ -460,20 +446,12 @@ export class TimelineProjection {
       if (this.sourceRanges[middle].endSeq < startSeq) low = middle + 1;
       else high = middle;
     }
-    const indexes = new Set<number>();
-    const limit = Math.max(0, Math.floor(input.limit ?? 0));
-    for (let i = low; i < this.sourceRanges.length; i++) {
-      const range = this.sourceRanges[i];
-      if (range.startSeq > input.bounds.maxSeq) break;
-      indexes.add(range.rowIndex);
-      if (limit > 0 && indexes.size === limit) break;
-    }
-    const entries = [...indexes].sort((a, b) => a - b).map((index) => this.rows[index]);
     const selected = selectProjectedEntriesAfter({
-      entries,
-      startSeq,
+      rows: this.rows,
+      sourceRanges: this.sourceRanges,
+      firstRange: low,
       maxSeq: input.bounds.maxSeq,
-      limit,
+      limit: Math.max(0, Math.floor(input.limit ?? 0)),
     });
     return {
       entries: selected.entries,
@@ -644,59 +622,30 @@ export function selectTimelineWindowByProjectedLimit(input: {
   };
 }
 
-function firstSourceSeqInRange(
-  entry: TimelineProjectionEntry,
-  startSeq: number,
-  endSeq: number,
-): number | null {
-  for (const range of entry.sourceSeqRanges) {
-    const firstSeq = Math.max(range.startSeq, startSeq);
-    if (firstSeq <= Math.min(range.endSeq, endSeq)) return firstSeq;
-  }
-  return null;
-}
-
-interface ProjectedEntryCandidate {
-  entry: TimelineProjectionEntry;
-  index: number;
-  firstSourceSeq: number;
-}
-
 function selectProjectedEntriesAfter(input: {
-  entries: readonly TimelineProjectionEntry[];
-  startSeq: number;
+  rows: readonly TimelineProjectionEntry[];
+  sourceRanges: readonly (TimelineSeqRange & { rowIndex: number })[];
+  firstRange: number;
   maxSeq: number;
   limit: number;
 }): { entries: TimelineProjectionEntry[]; endSeq: number | null } {
-  const eligible = input.entries
-    .map((entry, index) => ({
-      entry,
-      index,
-      firstSourceSeq: firstSourceSeqInRange(entry, input.startSeq, input.maxSeq),
-    }))
-    .filter((candidate): candidate is ProjectedEntryCandidate => candidate.firstSourceSeq !== null)
-    .sort((left, right) => left.firstSourceSeq - right.firstSourceSeq || left.index - right.index);
-  const selected = input.limit === 0 ? eligible : eligible.slice(0, input.limit);
-  const selectedEntries = selected
-    .sort((left, right) => left.index - right.index)
-    .map((candidate) => candidate.entry);
-  if (selectedEntries.length === 0) return { entries: [], endSeq: null };
-
-  const selectedRanges = selectedEntries
-    .flatMap((entry) => entry.sourceSeqRanges)
-    .sort((left, right) => left.startSeq - right.startSeq || left.endSeq - right.endSeq);
-  // Wide projected entries can include future, discontiguous source ranges. The
-  // page cursor advances only through source rows covered without a gap.
-  let endSeq = input.startSeq - 1;
-  for (const range of selectedRanges) {
-    if (range.endSeq <= endSeq) continue;
-    if (range.startSeq > endSeq + 1) break;
-    endSeq = Math.min(range.endSeq, input.maxSeq);
+  const selected = new Set<number>();
+  let endSeq = input.maxSeq;
+  // The index covers every retained source sequence. Advance across holes, and
+  // stop immediately before the first source sequence this page did not cover.
+  for (let i = input.firstRange; i < input.sourceRanges.length; i++) {
+    const { startSeq, rowIndex } = input.sourceRanges[i];
+    if (startSeq > input.maxSeq) break;
+    if (input.limit > 0 && selected.size === input.limit && !selected.has(rowIndex)) {
+      endSeq = startSeq - 1;
+      break;
+    }
+    selected.add(rowIndex);
   }
 
   return {
-    entries: selectedEntries,
-    endSeq: endSeq >= input.startSeq ? endSeq : null,
+    entries: [...selected].sort((a, b) => a - b).map((index) => input.rows[index]),
+    endSeq: selected.size > 0 ? endSeq : null,
   };
 }
 

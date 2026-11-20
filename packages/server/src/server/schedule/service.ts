@@ -13,7 +13,13 @@ import { resolveCreateAgentTitles } from "../agent/create-agent-title.js";
 import { type BoundCreateAgentCommand, formatProviderModel } from "../agent/create-agent/create.js";
 import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../worktree-session.js";
-import { ScheduleStore } from "./store.js";
+import { ScheduleStore, type PersistedSchedule as StoredSchedule } from "./store.js";
+import {
+  computeAgentDepth,
+  MAX_SUBAGENT_DEPTH,
+  readAgentHierarchyPath,
+} from "../agent/hierarchy-policy.js";
+import { isMainControlAgentLabels } from "@getpaseo/protocol/agent-labels";
 import { computeNextRunAt, validateScheduleCadence } from "./cron.js";
 import { foldFeatureValues } from "../agent/option-controls.js";
 import type {
@@ -21,13 +27,20 @@ import type {
   ScheduleExecutionResult,
   ScheduleRun,
   ScheduleTarget,
-  StoredSchedule,
+  StoredSchedule as PublicSchedule,
   UpdateScheduleInput,
   UpdateScheduleNewAgentConfig,
 } from "@getpaseo/protocol/schedule/types";
 import type { FirstAgentContext } from "@getpaseo/protocol/messages";
 
 const SCHEDULE_TICK_INTERVAL_MS = 1000;
+
+function publicSchedule({
+  callerAgentId: _callerAgentId,
+  ...schedule
+}: StoredSchedule): PublicSchedule {
+  return schedule;
+}
 
 // A run failed because its target no longer exists: the agent was deleted or
 // archived, or a new-agent cwd was removed. These are permanent, so the schedule
@@ -323,7 +336,30 @@ export class ScheduleService {
     }
   }
 
-  async create(input: CreateScheduleInput): Promise<StoredSchedule> {
+  private async assertScheduleCaller(
+    target: ScheduleTarget,
+    callerAgentId?: string,
+  ): Promise<void> {
+    if (target.type !== "new-agent" || !callerAgentId) return;
+    const path = await readAgentHierarchyPath(callerAgentId, async (id) => {
+      const stored = await this.agentStorage.get(id);
+      return stored?.archivedAt ? stored : (this.agentManager.getAgent(id) ?? stored);
+    });
+    const caller = path.get(callerAgentId);
+    if (
+      !caller ||
+      caller.archivedAt ||
+      isMainControlAgentLabels(caller.labels) ||
+      computeAgentDepth(callerAgentId, (id) => path.get(id)) >= MAX_SUBAGENT_DEPTH
+    ) {
+      throw new ScheduleStateConflictError(
+        "This agent cannot start new-agent schedules under its current hierarchy role.",
+      );
+    }
+  }
+
+  async create(input: CreateScheduleInput & { callerAgentId?: string }): Promise<PublicSchedule> {
+    await this.assertScheduleCaller(input.target, input.callerAgentId);
     const prompt = normalizePrompt(input.prompt);
     validateScheduleCadence(input.cadence);
     return this.createScheduleRecord(input, {
@@ -334,14 +370,14 @@ export class ScheduleService {
   }
 
   private async createScheduleRecord(
-    input: CreateScheduleInput,
+    input: CreateScheduleInput & { callerAgentId?: string },
     fields: { name: string | null; prompt: string; target: ScheduleTarget },
-  ): Promise<StoredSchedule> {
-    return this.store.create(this.buildScheduleRecord(input, fields));
+  ): Promise<PublicSchedule> {
+    return publicSchedule(await this.store.create(this.buildScheduleRecord(input, fields)));
   }
 
   private buildScheduleRecord(
-    input: CreateScheduleInput,
+    input: CreateScheduleInput & { callerAgentId?: string },
     fields: { name: string | null; prompt: string; target: ScheduleTarget },
   ): Omit<StoredSchedule, "id"> {
     const now = this.now();
@@ -352,6 +388,9 @@ export class ScheduleService {
       prompt: fields.prompt,
       cadence: input.cadence,
       target: fields.target,
+      ...(fields.target.type === "new-agent" && input.callerAgentId
+        ? { callerAgentId: input.callerAgentId }
+        : {}),
       status: "active",
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
@@ -367,7 +406,10 @@ export class ScheduleService {
   // Idempotent create for the MCP write path: repeating a create with the same
   // name and target (e.g. babysit-pr re-registering its heartbeat) refreshes the
   // existing non-completed schedule in place instead of minting a duplicate.
-  async createOrReplace(input: CreateScheduleInput): Promise<StoredSchedule> {
+  async createOrReplace(
+    input: CreateScheduleInput & { callerAgentId?: string },
+  ): Promise<PublicSchedule> {
+    await this.assertScheduleCaller(input.target, input.callerAgentId);
     const name = trimOptionalName(input.name);
     const prompt = normalizePrompt(input.prompt);
     validateScheduleCadence(input.cadence);
@@ -376,7 +418,7 @@ export class ScheduleService {
     }
 
     const inputTarget = input.target;
-    return this.store.upsertByNameAndTarget(name, inputTarget, {
+    const schedule = await this.store.upsertByNameAndTarget(name, inputTarget, {
       create: async () => {
         return this.buildScheduleRecord(input, { name, prompt, target: inputTarget });
       },
@@ -391,6 +433,9 @@ export class ScheduleService {
           prompt,
           cadence,
           target: inputTarget,
+          ...(inputTarget.type === "new-agent" && input.callerAgentId
+            ? { callerAgentId: input.callerAgentId }
+            : {}),
           status: "active",
           pausedAt: null,
           nextRunAt: nextRunAt.toISOString(),
@@ -400,15 +445,16 @@ export class ScheduleService {
         };
       },
     });
+    return publicSchedule(schedule);
   }
 
-  async list(): Promise<StoredSchedule[]> {
-    return this.store.list();
+  async list(): Promise<PublicSchedule[]> {
+    return (await this.store.list()).map(publicSchedule);
   }
 
-  async inspect(id: string): Promise<StoredSchedule> {
+  async inspect(id: string): Promise<PublicSchedule> {
     const schedule = await this.store.get(id);
-    return requireSchedule(schedule, id);
+    return publicSchedule(requireSchedule(schedule, id));
   }
 
   async logs(id: string): Promise<ScheduleRun[]> {
@@ -416,7 +462,7 @@ export class ScheduleService {
     return [...schedule.runs].sort((left, right) => left.startedAt.localeCompare(right.startedAt));
   }
 
-  async pause(id: string): Promise<StoredSchedule> {
+  async pause(id: string): Promise<PublicSchedule> {
     const paused = await this.store.update(id, (schedule) => {
       if (schedule.status === "completed") {
         throw new ScheduleStateConflictError(`Schedule ${id} is already completed`);
@@ -433,11 +479,12 @@ export class ScheduleService {
         updatedAt: now.toISOString(),
       };
     });
-    return requireSchedule(paused, id);
+    return publicSchedule(requireSchedule(paused, id));
   }
 
-  async resume(id: string): Promise<StoredSchedule> {
-    const resumed = await this.store.update(id, (schedule) => {
+  async resume(id: string, callerAgentId?: string): Promise<PublicSchedule> {
+    const resumed = await this.store.update(id, async (schedule) => {
+      await this.assertScheduleCaller(schedule.target, callerAgentId);
       if (schedule.status === "completed") {
         throw new ScheduleStateConflictError(`Schedule ${id} is already completed`);
       }
@@ -447,19 +494,24 @@ export class ScheduleService {
       const now = this.now();
       return {
         ...schedule,
+        ...(schedule.target.type === "new-agent" && callerAgentId ? { callerAgentId } : {}),
         status: "active" as const,
         pausedAt: null,
         nextRunAt: computeNextRunAt(schedule.cadence, now).toISOString(),
         updatedAt: now.toISOString(),
       };
     });
-    return requireSchedule(resumed, id);
+    return publicSchedule(requireSchedule(resumed, id));
   }
 
-  async update(input: UpdateScheduleInput): Promise<StoredSchedule> {
+  async update(input: UpdateScheduleInput, callerAgentId?: string): Promise<PublicSchedule> {
     const next = await this.store.update(input.id, async (schedule) => {
+      await this.assertScheduleCaller(schedule.target, callerAgentId);
       const now = this.now();
-      let updated: StoredSchedule = schedule;
+      let updated: StoredSchedule =
+        schedule.target.type === "new-agent" && callerAgentId
+          ? { ...schedule, callerAgentId }
+          : schedule;
 
       if (input.prompt !== undefined) {
         updated = { ...updated, prompt: normalizePrompt(input.prompt) };
@@ -498,7 +550,7 @@ export class ScheduleService {
 
       return { ...updated, updatedAt: now.toISOString() };
     });
-    return requireSchedule(next, input.id);
+    return publicSchedule(requireSchedule(next, input.id));
   }
 
   async delete(id: string): Promise<void> {
@@ -556,15 +608,16 @@ export class ScheduleService {
     return completed;
   }
 
-  async runOnce(id: string): Promise<StoredSchedule> {
+  async runOnce(id: string, callerAgentId?: string): Promise<PublicSchedule> {
     const schedule = await this.inspect(id);
+    await this.assertScheduleCaller(schedule.target, callerAgentId);
     if (schedule.status === "completed") {
       throw new ScheduleStateConflictError(`Schedule ${id} is already completed`);
     }
     if (this.runningScheduleIds.has(id)) {
       throw new ScheduleStateConflictError(`Schedule ${id} is already running`);
     }
-    await this.runSchedule(schedule, this.now(), { manual: true });
+    await this.runSchedule(schedule, this.now(), { manual: true, callerAgentId });
     return this.inspect(id);
   }
 
@@ -715,7 +768,7 @@ export class ScheduleService {
   private async runSchedule(
     schedule: StoredSchedule,
     now: Date,
-    options?: { manual?: boolean },
+    options?: { manual?: boolean; callerAgentId?: string },
   ): Promise<void> {
     const manual = options?.manual === true;
     // Reserve before store I/O; persisted history cannot prove a run is still alive.
@@ -745,6 +798,10 @@ export class ScheduleService {
       }
 
       try {
+        await this.assertScheduleCaller(
+          scheduleWithRun.target,
+          manual ? options?.callerAgentId : scheduleWithRun.callerAgentId,
+        );
         const result = await this.runner(scheduleWithRun, runId);
         await this.finishRun({
           scheduleId: schedule.id,

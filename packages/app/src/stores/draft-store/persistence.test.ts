@@ -82,6 +82,114 @@ describe("draft quote persistence", () => {
     expect(await storage.getItem(key)).toEqual(editedBase);
   });
 
+  it.each([true, false])(
+    "restores the last committed quotes when the body write fails (new quotes: %s)",
+    async (hasNewQuote) => {
+      const { backing, storage } = quoteStorageFixture();
+      await storage.setItem(key, snapshot);
+      let failBody = true;
+      const interrupted = createQuoteAwareDraftStorage({
+        ...backing,
+        setItem: (name, value) => {
+          if (name === key && failBody) throw new Error("body write interrupted");
+          backing.setItem(name, value);
+        },
+      });
+      const nextQuote = { ...quote, id: "q2", text: "New selection" };
+      const next = {
+        ...snapshot,
+        state: {
+          drafts: {
+            selected: {
+              ...storedDraft,
+              version: 4,
+              updatedAt: 200,
+              input: { text: "New body", attachments: hasNewQuote ? [file, nextQuote] : [file] },
+            },
+            other,
+          },
+          createModalDraft: null,
+        },
+      };
+
+      await expect(interrupted.setItem(key, next)).rejects.toThrow("body write interrupted");
+      expect(await createQuoteAwareDraftStorage(backing).getItem(key)).toEqual(snapshot);
+
+      // Simulate another interrupted write after restart, then a successful retry.
+      await expect(
+        createQuoteAwareDraftStorage({
+          ...backing,
+          setItem: (name, value) => {
+            if (name === key) throw new Error("second body write interrupted");
+            backing.setItem(name, value);
+          },
+        }).setItem(key, next),
+      ).rejects.toThrow("second body write interrupted");
+      expect(await createQuoteAwareDraftStorage(backing).getItem(key)).toEqual(snapshot);
+      failBody = false;
+      await interrupted.setItem(key, next);
+      expect(await createQuoteAwareDraftStorage(backing).getItem(key)).toEqual(next);
+    },
+  );
+
+  it("does not apply pending quotes to a quote-less body that reused the same revision", async () => {
+    const { backing } = quoteStorageFixture();
+    const previous = {
+      ...baseSnapshot,
+      state: { drafts: { selected: baseDraft }, createModalDraft: null },
+    };
+    backing.setItem(key, JSON.stringify(previous));
+    const interrupted = createQuoteAwareDraftStorage({
+      ...backing,
+      setItem: (name, value) => {
+        if (name === key) throw new Error("body write interrupted");
+        backing.setItem(name, value);
+      },
+    });
+    await expect(interrupted.setItem(key, snapshot)).rejects.toThrow("body write interrupted");
+    expect(await createQuoteAwareDraftStorage(backing).getItem(key)).toEqual(previous);
+  });
+
+  it("keeps the committed snapshot if the old quote journal cannot be read", async () => {
+    const { backing, storage } = quoteStorageFixture();
+    await storage.setItem(key, snapshot);
+    const unreadable = createQuoteAwareDraftStorage({
+      ...backing,
+      getItem: (name) => {
+        if (name === quotesKey) throw new Error("Quote read interrupted");
+        return backing.getItem(name);
+      },
+    });
+
+    await expect(unreadable.setItem(key, baseSnapshot)).rejects.toThrow("Quote read interrupted");
+    expect(await createQuoteAwareDraftStorage(backing).getItem(key)).toEqual(snapshot);
+  });
+
+  it("loads the new quote version when the body committed but journal cleanup failed", async () => {
+    const { backing, storage } = quoteStorageFixture();
+    await storage.setItem(key, snapshot);
+    let quoteWrites = 0;
+    const interrupted = createQuoteAwareDraftStorage({
+      ...backing,
+      setItem: (name, value) => {
+        if (name === quotesKey && ++quoteWrites === 2) throw new Error("cleanup interrupted");
+        backing.setItem(name, value);
+      },
+    });
+    const nextRecord = {
+      ...storedDraft,
+      version: 4,
+      input: { text: "New body", attachments: [{ ...quote, text: "New selection" }] },
+    };
+    const next = {
+      ...snapshot,
+      state: { drafts: { selected: nextRecord, other }, createModalDraft: null },
+    };
+    await interrupted.setItem(key, next);
+    expect(await storage.getItem(key)).toEqual(next);
+    expect(quoteWrites).toBe(2);
+  });
+
   it("still saves draft text and other attachments when the quote key cannot be written", async () => {
     const { backing } = quoteStorageFixture();
     const storage = createQuoteAwareDraftStorage({

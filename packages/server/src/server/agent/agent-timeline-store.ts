@@ -6,6 +6,7 @@ import type {
   AgentTimelineFetchOptions,
   AgentTimelineFetchResult,
   AgentTimelineRow,
+  AgentTimelineWindow,
 } from "./agent-timeline-store-types.js";
 
 export interface SeedAgentTimelineOptions {
@@ -20,6 +21,7 @@ interface AgentTimelineState {
   epoch: string;
   projection: TimelineProjection;
   minSeq: number;
+  earliestCoveredSeq: number | null;
   nextSeq: number;
 }
 const DEFAULT_TIMELINE_FETCH_LIMIT = 200;
@@ -41,10 +43,12 @@ export class InMemoryAgentTimelineStore {
       : this.buildRowsFromItems(options?.items ?? [], options?.nextSeq ?? 1, timestamp);
     const nextSeq = rows.reduce((next, row) => Math.max(next, row.seq + 1), options?.nextSeq ?? 1);
     const projection = new TimelineProjection(rows);
+    const firstSeq = projection.getRows()[0]?.seqStart ?? null;
     this.states.set(agentId, {
       epoch: options?.epoch ?? randomUUID(),
       projection,
-      minSeq: projection.getRows()[0]?.seqStart ?? 0,
+      minSeq: firstSeq ?? 0,
+      earliestCoveredSeq: firstSeq,
       nextSeq,
     });
   }
@@ -69,6 +73,8 @@ export class InMemoryAgentTimelineStore {
     if (rows.length === previous.length) return false;
     // Keep sequence numbers monotonic; a new epoch invalidates clients' old rows and cursors.
     this.initialize(agentId, { rows, nextSeq: state.nextSeq });
+    // A deleted prefix still belongs to the covered range, unlike truncated history.
+    this.requireState(agentId).earliestCoveredSeq = state.earliestCoveredSeq;
     return true;
   }
 
@@ -117,18 +123,22 @@ export class InMemoryAgentTimelineStore {
     const state = this.requireState(agentId);
     const direction = options?.direction ?? "tail";
     const cursor = options?.cursor;
-    const hasRows = state.minSeq !== 0;
-    const window = { minSeq: state.minSeq, maxSeq: state.nextSeq - 1, nextSeq: state.nextSeq };
+    const window: AgentTimelineWindow = {
+      minSeq: state.minSeq,
+      maxSeq: state.nextSeq - 1,
+      nextSeq: state.nextSeq,
+    };
     const staleCursor = cursor !== undefined && cursor.epoch !== state.epoch;
     const gap =
       !staleCursor &&
       direction === "after" &&
       cursor !== undefined &&
-      hasRows &&
-      cursor.seq < state.minSeq - 1;
+      state.earliestCoveredSeq !== null &&
+      cursor.seq < state.earliestCoveredSeq - 1;
     const reset = staleCursor || gap;
     const page = state.projection.selectPage({
       bounds: window,
+      afterCoverageStart: state.earliestCoveredSeq ?? undefined,
       direction: reset ? "tail" : direction,
       cursorSeq: cursor?.seq,
       limit: options?.limit ?? DEFAULT_TIMELINE_FETCH_LIMIT,
@@ -169,6 +179,7 @@ export class InMemoryAgentTimelineStore {
     };
     state.nextSeq += 1;
     if (state.minSeq === 0) state.minSeq = row.seq;
+    state.earliestCoveredSeq ??= row.seq;
     state.projection.append(row);
     return cloneRow(row);
   }
