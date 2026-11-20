@@ -17,11 +17,7 @@ import {
   useHostRuntimeConnectionStatuses,
   useHosts,
 } from "@/runtime/host-runtime";
-import {
-  normalizeProjectDescriptor,
-  type ProjectDescriptor,
-  useSessionStore,
-} from "@/stores/session-store";
+import { normalizeProjectDescriptor, useSessionStore } from "@/stores/session-store";
 import type { Theme } from "@/styles/theme";
 import { resolveProjectPlacement } from "@/utils/project-placement";
 import { buildProjects, type ProjectSummary } from "@/utils/projects";
@@ -79,7 +75,7 @@ function useArchivedProjectCatalog() {
     ),
   );
 
-  const catalog = useFetchQueries<{ serverId: string; projects: ProjectDescriptor[] }>(
+  const hostsWithCatalog = useFetchQueries(
     hosts.map(({ serverId }) => ({
       queryKey: ["historyProjectCatalog", serverId],
       enabled: supportedIds.includes(serverId) && statuses.get(serverId) === "online",
@@ -93,25 +89,28 @@ function useArchivedProjectCatalog() {
         return { serverId, projects: projects.map(normalizeProjectDescriptor) };
       },
     })),
+    // useQueries preserves the combined value when catalog data and host metadata are unchanged.
+    (results) =>
+      results.flatMap(({ data }) =>
+        data
+          ? [
+              {
+                serverId: data.serverId,
+                serverName:
+                  hosts.find((host) => host.serverId === data.serverId)?.label ?? data.serverId,
+                isOnline: statuses.get(data.serverId) === "online",
+                workspaces: [],
+                projects: data.projects,
+              },
+            ]
+          : [],
+      ),
   );
 
-  return useMemo(() => {
-    const hostsWithCatalog = catalog.flatMap(({ data }) =>
-      data
-        ? [
-            {
-              serverId: data.serverId,
-              serverName:
-                hosts.find((host) => host.serverId === data.serverId)?.label ?? data.serverId,
-              isOnline: statuses.get(data.serverId) === "online",
-              workspaces: [],
-              projects: data.projects,
-            },
-          ]
-        : [],
-    );
-    return { projects: buildProjects({ hosts: hostsWithCatalog }).projects, hostsWithCatalog };
-  }, [catalog, hosts, statuses]);
+  return useMemo(
+    () => ({ projects: buildProjects({ hosts: hostsWithCatalog }).projects, hostsWithCatalog }),
+    [hostsWithCatalog],
+  );
 }
 
 function disambiguateProjectLabels(

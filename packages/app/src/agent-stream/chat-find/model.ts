@@ -1,6 +1,30 @@
 import type { AgentTimelineSearchPayload } from "@getpaseo/client/internal/daemon-client";
 import type { StreamItem } from "@/types/stream";
+import { createMarkdownParser } from "@/utils/markdown-parser";
 import { getMergedAssistantFragmentSeqs } from "../agent-interactions";
+
+const markdown = createMarkdownParser({ linkify: false });
+
+function countMergedMatches(text: string, pattern: RegExp): number {
+  let visibleCount = 0;
+  // Like the host search, count each rendered block separately.
+  for (const token of markdown.parse(text.replace(/\r/g, ""), {})) {
+    if (token.type === "inline") {
+      const visible = (token.children ?? [])
+        .map((child) => {
+          if (child.type === "text" || child.type === "code_inline") return child.content;
+          if (child.type === "softbreak" || child.type === "hardbreak") return "\n";
+          return "";
+        })
+        .join("");
+      visibleCount += [...visible.matchAll(pattern)].length;
+    } else if (token.type === "fence" || token.type === "code_block") {
+      visibleCount += [...token.content.matchAll(pattern)].length;
+    }
+  }
+  // Keep raw matches discoverable without counting the same hit in both forms.
+  return Math.max(visibleCount, [...text.matchAll(pattern)].length);
+}
 
 /**
  * A message the host says contains the query. `count` is the host's estimate of its
@@ -204,7 +228,15 @@ export class ChatFindModel {
     this.historyListeners.forEach((listener) => listener());
   }
   private addLoadedMergedMatches() {
-    const query = this.state.query.trim().toLowerCase();
+    const query = this.state.query.trim();
+    if (!query) return;
+    const pattern = new RegExp(
+      query
+        .split(/\s+/)
+        .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join("\\s+"),
+      "giu",
+    );
     const assistantSeqs = new Set(
       this.locations.filter((location) => location.role === "assistant").map(({ seq }) => seq),
     );
@@ -217,7 +249,7 @@ export class ChatFindModel {
       if (!fragments || fragments.length < 2 || fragments.some((seq) => assistantSeqs.has(seq))) {
         continue;
       }
-      const count = item.text.toLowerCase().split(query).length - 1;
+      const count = countMergedMatches(item.text, pattern);
       if (!count) continue;
       const seq = fragments[0]!;
       assistantSeqs.add(seq);

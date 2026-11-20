@@ -35,19 +35,32 @@ describe("parseUserMessageSegments", () => {
     ]);
   });
 
-  it("splits independent quotes at unquoted blank lines and drops empty cards", () => {
-    expect(parseUserMessageSegments("> first quote\n \n>\n\n> second quote")).toEqual([
+  it.each([">", ">\n  > "])("preserves empty quote runs as text (%j)", (emptyQuote) => {
+    expect(
+      parseUserMessageSegments("> first quote\n \n" + emptyQuote + "\n\n> real quote"),
+    ).toEqual([
       { kind: "quote", quoteIndex: 1, text: "first quote" },
-      { kind: "quote", quoteIndex: 2, text: "second quote" },
+      { kind: "text", text: emptyQuote },
+      { kind: "quote", quoteIndex: 2, text: "real quote" },
+    ]);
+  });
+
+  it.each(["    > output.log", "\t> output.log"])("preserves indented code (%j)", (code) => {
+    expect(parseUserMessageSegments(code)).toEqual([{ kind: "text", text: code }]);
+    expect(parseUserMessageSegments(code + "\n\n> real quote")).toEqual([
+      { kind: "text", text: code },
+      { kind: "quote", quoteIndex: 1, text: "real quote" },
     ]);
   });
 
   it("trims only text blanks next to quotes and normalizes mixed line endings", () => {
-    expect(parseUserMessageSegments("\r\nFirst\r\n\r\nSecond\r \r\t> Quote\n\nThird\r\n")).toEqual([
-      { kind: "text", text: "\nFirst\n\nSecond" },
-      { kind: "quote", quoteIndex: 1, text: "Quote" },
-      { kind: "text", text: "Third\n" },
-    ]);
+    expect(parseUserMessageSegments("\r\nFirst\r\n\r\nSecond\r \r   > Quote\n\nThird\r\n")).toEqual(
+      [
+        { kind: "text", text: "\nFirst\n\nSecond" },
+        { kind: "quote", quoteIndex: 1, text: "Quote" },
+        { kind: "text", text: "Third\n" },
+      ],
+    );
   });
 
   it.each([

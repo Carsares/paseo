@@ -69,6 +69,25 @@ describe("assistant message render limit", () => {
     });
   });
 
+  it.each(["start\n", ""])("advances through an oversized grapheme after %j", (prefix) => {
+    const message = prefix + "e" + "\u0301".repeat(96_000);
+    let previousLength = 0;
+    for (const expandedSteps of [0, 1, 2, 3]) {
+      const { text } = capAssistantMessageForRender(message, { expandedSteps });
+      expect(text.length).toBeGreaterThan(previousLength);
+      previousLength = text.length;
+    }
+    expect(previousLength).toBe(message.length);
+  });
+
+  it("keeps surrogate pairs intact when an oversized grapheme forces a split", () => {
+    const mark = "\u{1d165}";
+    const message = "e" + mark.repeat(ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT);
+    expect(capAssistantMessageForRender(message).text).toBe(
+      "e" + mark.repeat(ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT / 2 - 1),
+    );
+  });
+
   it("snaps back to the preceding line break instead of splitting an inline link", () => {
     const leading = `${"a".repeat(ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT - 40)}\n`;
     const brokenLine = "• P2-29 [codex-app-server-agent.ts](file:///workspace/agent.ts#L10)\n";

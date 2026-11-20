@@ -2,7 +2,15 @@
  * @vitest-environment jsdom
  */
 import React from "react";
-import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { FlatListProps } from "react-native";
 import { parentAddressLabels } from "@getpaseo/protocol/agent-labels";
@@ -12,6 +20,7 @@ import type { AggregatedAgent } from "@/hooks/use-aggregated-agents";
 import { i18n } from "@/i18n/i18next";
 import { SessionsScreen } from "@/screens/sessions-screen";
 import { DEFAULT_HISTORY_SORT } from "@/screens/sessions/history-grouping";
+import { useHistoryProjectOptions } from "@/screens/sessions/project-filter";
 import type { ProjectDescriptor } from "@/stores/session-store";
 import { buildProjects, type ProjectSummary } from "@/utils/projects";
 import { AgentList } from "./agent-list";
@@ -868,6 +877,37 @@ describe("AgentList history hierarchy", () => {
     );
     fireEvent.click(trigger);
     expect(queryByRole("button", { name: "Boron" })).toBeNull();
+  });
+
+  it("reuses the history catalog inputs when a render leaves the query data unchanged", () => {
+    const project: ProjectDescriptor = {
+      projectId: "archived-atlas",
+      projectKey: "shared-atlas",
+      projectDisplayName: "Atlas",
+      projectCustomName: null,
+      projectKind: "git",
+      projectRootPath: "/archive/atlas",
+    };
+    historyCatalog.hosts = [{ serverId: "host", label: "MacBook" }];
+    historyCatalog.statuses.set("host", "online");
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(["historyProjectCatalog", "host"], {
+      serverId: "host",
+      projects: [project],
+    });
+    const input = { selectedHost: "host", agents: [], ancestors: [] };
+    const { result, rerender } = renderHook(() => useHistoryProjectOptions(input), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      ),
+    });
+    const { options, catalogEquivalenceCounts } = result.current;
+    expect(options.map(({ label }) => label)).toEqual(["Atlas"]);
+    expect(catalogEquivalenceCounts.get("host")?.get("shared-atlas")).toBe(1);
+
+    rerender();
+    expect(result.current.catalogEquivalenceCounts).toBe(catalogEquivalenceCounts);
+    expect(result.current.options).toBe(options);
   });
 
   it("retains a selected placement when the complete catalog splits it from another host", async () => {

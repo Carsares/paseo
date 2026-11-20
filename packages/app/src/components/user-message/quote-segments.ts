@@ -2,7 +2,7 @@ export type UserMessageSegment =
   | { kind: "quote"; quoteIndex: number; text: string }
   | { kind: "text"; text: string };
 
-const QUOTE_LINE = /^[ \t]*>(?:[ \t](.*))?$/;
+const QUOTE_LINE = /^ {0,3}>(?:[ \t](.*))?$/;
 const FENCE_LINE = /^\s*(`{3,}|~{3,})(.*)$/;
 
 function joinLines(lines: string[], trimStart: boolean, trimEnd: boolean): string {
@@ -23,14 +23,19 @@ export function parseUserMessageSegments(message: string): UserMessageSegment[] 
 
   const segments: UserMessageSegment[] = [];
   let textLines: string[] = [];
-  let quoteLines: string[] = [];
+  const quoteLines: string[] = [];
+  const rawQuoteLines: string[] = [];
   let quoteIndex = 0;
   let fence: string | undefined;
 
   function flushQuote() {
     if (!quoteLines.length) return;
     const quote = joinLines(quoteLines, true, true);
-    quoteLines = [];
+    if (!quote) {
+      for (const line of rawQuoteLines) textLines.push(line);
+    }
+    quoteLines.length = 0;
+    rawQuoteLines.length = 0;
     if (!quote) return;
 
     const text = joinLines(textLines, quoteIndex > 0, true);
@@ -43,6 +48,7 @@ export function parseUserMessageSegments(message: string): UserMessageSegment[] 
     const quoted = fence ? null : QUOTE_LINE.exec(line);
     if (quoted) {
       quoteLines.push(quoted[1] ?? "");
+      rawQuoteLines.push(line);
       continue;
     }
 

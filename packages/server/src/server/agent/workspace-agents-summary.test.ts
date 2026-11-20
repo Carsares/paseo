@@ -223,3 +223,63 @@ test("summarizes only the selected workspace and releases successful and failed 
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test.each(["active", "archived", "absent"])(
+  "distinguishes children of an independent root when Main Control is %s",
+  async (mainState) => {
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    const workspace = createPersistedWorkspaceRecord({
+      workspaceId: "wks_1234567890abcdef",
+      projectId: "prj_1234567890abcdef",
+      cwd: "/workspace",
+      kind: "directory",
+      displayName: "Summary workspace",
+      createdAt,
+      updatedAt: createdAt,
+    });
+    const base: Omit<StoredAgentRecord, "id"> = {
+      provider: "codex",
+      cwd: workspace.cwd,
+      workspaceId: workspace.workspaceId,
+      labels: {},
+      metadata: {},
+      createdAt,
+      updatedAt: createdAt,
+      lastStatus: "closed",
+    };
+    const records: StoredAgentRecord[] = [
+      { ...base, id: "root" },
+      { ...base, id: "child", labels: { [PARENT_AGENT_ID_LABEL]: "root" } },
+      { ...base, id: "delegated", labels: { [PARENT_AGENT_ID_LABEL]: "main" } },
+    ];
+    if (mainState !== "absent") {
+      records.push({
+        ...base,
+        id: "main",
+        labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+        ...(mainState === "archived" ? { archivedAt: createdAt } : {}),
+      });
+    }
+    const { entries, summaryText } = await summarizeWorkspaceAgents({
+      workspaceId: workspace.workspaceId,
+      agentManager: { listAgents: () => [], readTimelineForSummary: async () => [] },
+      agentStorage: { listByWorkspaces: async () => records },
+      workspaceRegistry: { get: async () => workspace },
+      logger: pino({ level: "silent" }),
+    });
+    expect(
+      entries.map(({ agentId, parentAgentId, relationship }) => [
+        agentId,
+        parentAgentId,
+        relationship,
+      ]),
+    ).toEqual([
+      ["child", "root", "standalone"],
+      ["delegated", "main", mainState === "active" ? "level1" : "standalone"],
+      ["root", null, "standalone"],
+    ]);
+    expect(summaryText).toContain(
+      "- ID: child\n- Relationship: outside Main Control tree (parent: root)",
+    );
+  },
+);

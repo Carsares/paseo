@@ -234,6 +234,48 @@ it("inserts a case-insensitive cross-fragment match in timeline order", async ()
   }
 });
 
+it.each([
+  ["alpha **be", "ta** and alpha\t**beta**"],
+  ["alpha [`be", "ta`](https://example.com) and alpha\n_beta_"],
+])("finds visible phrases across loaded fragments (%j, %j)", async (first, second) => {
+  const model = new ChatFindModel({
+    async search() {
+      return response([{ seq: 1, role: "assistant" }]);
+    },
+    async load() {
+      throw new Error("All results are loaded");
+    },
+    async reveal(id) {
+      return { count: id === "row-2" ? 2 : 1, occurrence: 0 };
+    },
+    clear() {},
+  });
+  try {
+    const query = "ALPHA \t BETA";
+    model.updateHistory("epoch", [message(1, "alpha beta"), ...mergedReply([first, second], 2)]);
+    model.open();
+    model.setQuery(query);
+    await expect
+      .poll(() => model.getSnapshot())
+      .toMatchObject({
+        phase: "ready",
+        selectedItemId: "row-1",
+        count: 3,
+      });
+    model.next();
+    await expect
+      .poll(() => model.getSnapshot())
+      .toMatchObject({
+        phase: "ready",
+        selectedItemId: "row-2",
+        occurrence: 1,
+        count: 3,
+      });
+  } finally {
+    model.close();
+  }
+});
+
 it("skips a source-only candidate and highlights a displayed match", async () => {
   const revealed: string[] = [];
   const model = new ChatFindModel({

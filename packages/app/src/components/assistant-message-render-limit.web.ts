@@ -41,7 +41,10 @@ export function capAssistantMessageForRender(
   let end = characterLimit;
   if (graphemeSegmenter) {
     end = graphemeSegmenter.segment(message).containing(end)!.index;
-  } else {
+  }
+  // A single cluster can cover several steps. In that case, advance by whole code points.
+  if (!graphemeSegmenter || end <= characterLimit - ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT) {
+    end = characterLimit;
     const finalCodeUnit = message.charCodeAt(end - 1);
     if (finalCodeUnit >= 0xd800 && finalCodeUnit <= 0xdbff) {
       end -= 1;

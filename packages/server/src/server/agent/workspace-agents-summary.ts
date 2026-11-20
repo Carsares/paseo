@@ -100,10 +100,14 @@ function buildSummaryText(entries: WorkspaceAgentSummaryEntry[]): string {
     const sessions = entries.filter((entry) => entry.stateGroup === group);
     if (!sessions.length) lines.push("None.", "");
     for (const entry of sessions) {
+      const relationship =
+        entry.relationship === "standalone" && entry.parentAgentId
+          ? `outside Main Control tree (parent: ${entry.parentAgentId})`
+          : entry.relationship;
       lines.push(
         `### ${entry.title ?? "Untitled session"}`,
         `- ID: ${entry.agentId}`,
-        `- Relationship: ${entry.relationship}`,
+        `- Relationship: ${relationship}`,
         `- Status: ${entry.status}${entry.archivedAt ? " (archived)" : ""}`,
         `- First prompt: ${entry.firstUserPrompt ?? "Unavailable"}`,
         `- Latest conclusion: ${entry.lastAssistantSummary ?? "Unavailable"}`,
@@ -130,11 +134,19 @@ interface SummaryAgent {
 type SummaryMetadata = Omit<WorkspaceAgentSummaryEntry, keyof SummaryDetails>;
 
 function relationshipToMain(
+  agentId: string,
   parent: string | null,
   main: string | undefined,
+  parentByAgentId: ReadonlyMap<string, string | null>,
 ): SummaryMetadata["relationship"] {
-  if (!parent) return "standalone";
-  return parent === main ? "level1" : "level2";
+  if (!main || !parent) return "standalone";
+  const visited = new Set([agentId]);
+  for (let ancestor: string | null = parent; ancestor && !visited.has(ancestor); ) {
+    if (ancestor === main) return ancestor === parent ? "level1" : "level2";
+    visited.add(ancestor);
+    ancestor = parentByAgentId.get(ancestor) ?? null;
+  }
+  return "standalone";
 }
 
 function isActive(status: SummaryMetadata["status"], labels: Record<string, string>): boolean {
@@ -153,10 +165,11 @@ function getSummaryModel({ live, record }: SummaryAgent): string | null {
 function summarizeAgentMetadata(
   entry: SummaryAgent,
   mainAgentId: string | undefined,
+  parentByAgentId: ReadonlyMap<string, string | null>,
 ): SummaryMetadata {
   const { id, live, record } = entry;
   const agent = live ?? record!;
-  const parentAgentId = getParentAgentIdFromLabels(agent.labels);
+  const parentAgentId = parentByAgentId.get(id) ?? null;
   const status = live?.lifecycle ?? record?.lastStatus ?? "closed";
   const archivedAt = record?.archivedAt ?? null;
   return {
@@ -164,7 +177,7 @@ function summarizeAgentMetadata(
     title: record?.title ?? live?.config.title ?? null,
     provider: agent.provider,
     model: getSummaryModel(entry),
-    relationship: relationshipToMain(parentAgentId, mainAgentId),
+    relationship: relationshipToMain(id, parentAgentId, mainAgentId, parentByAgentId),
     parentAgentId,
     stateGroup: !archivedAt && isActive(status, agent.labels) ? "active" : "closed",
     status,
@@ -226,6 +239,12 @@ export async function summarizeWorkspaceAgents({
       ({ live, record }) =>
         !record?.archivedAt && isMainControlAgentLabels((live ?? record)?.labels),
     );
+    const parentByAgentId = new Map(
+      agents.map(({ id, live, record }) => [
+        id,
+        getParentAgentIdFromLabels((live ?? record)?.labels),
+      ]),
+    );
     for (const agent of agents) {
       if (isMainControlAgentLabels((agent.live ?? agent.record)?.labels)) continue;
       const agentId = agent.id;
@@ -239,7 +258,7 @@ export async function summarizeWorkspaceAgents({
           return [];
         });
       if (rows === null) continue;
-      const metadata = summarizeAgentMetadata(agent, mainAgent?.id);
+      const metadata = summarizeAgentMetadata(agent, mainAgent?.id, parentByAgentId);
       entries.push({
         ...metadata,
         ...summarizeTimeline(
