@@ -59,6 +59,15 @@ describe("ACP provider catalog", () => {
     expect(findProvider("traecli").command).toEqual(["traecli", "acp", "serve"]);
   });
 
+  it("offers Gemini CLI on a release that awaits ACP session/load history replay", () => {
+    const gemini = findProvider("gemini");
+    const [major, minor] = gemini.version.split(".").map(Number);
+
+    // @google/gemini-cli <= 0.65.0 returned from ACP loadSession without awaiting streamHistory().
+    expect(major > 0 || (major === 0 && minor >= 68)).toBe(true);
+    expect(gemini.command).toEqual(["npx", "-y", `@google/gemini-cli@${gemini.version}`, "--acp"]);
+  });
+
   it("offers MiniMax Code through its pinned public ACP package", () => {
     expect(findProvider("minimax-code")).toMatchObject({
       title: "MiniMax Code",

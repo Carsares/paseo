@@ -194,10 +194,10 @@ const CATALOG_DATA = [
     id: "gemini",
     title: "Gemini CLI",
     description: "Google's official CLI for Gemini",
-    version: "0.65.0",
+    version: "0.70.0",
     iconId: "gemini",
     installLink: "https://geminicli.com",
-    command: ["npx", "-y", "@google/gemini-cli@0.65.0", "--acp"],
+    command: ["npx", "-y", "@google/gemini-cli@0.70.0", "--acp"],
   },
   {
     id: "gjc",
