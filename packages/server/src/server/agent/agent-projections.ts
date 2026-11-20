@@ -51,7 +51,13 @@ function projectSubagentDraftOptions(
   agent: Pick<ManagedAgent, "labels" | "config"> | StoredAgentRecord,
   providerAdapter: AgentProvider,
 ): Pick<AgentSnapshotPayload, "subagentDraftOptions"> {
-  if (providerAdapter !== "opencode" || !isMainControlAgentLabels(agent.labels)) return {};
+  const hasStoredAutoAccept = agent.config?.providerOptions?.auto_accept !== undefined;
+  if (
+    (providerAdapter !== "opencode" && !hasStoredAutoAccept) ||
+    !isMainControlAgentLabels(agent.labels)
+  ) {
+    return {};
+  }
   // The new draft resolves provider defaults again. Copy the parent's configured overrides
   // before the Main Control role added its launch-only permission rules.
   return { subagentDraftOptions: sanitizeEffectiveOptions(agent.config?.providerOptions ?? {}) };

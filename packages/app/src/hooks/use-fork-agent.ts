@@ -147,6 +147,9 @@ function stripMainControlReadOnlyProviderOptions(
   providerOptions: Record<string, unknown>,
 ): Record<string, unknown> {
   const next: Record<string, unknown> = { ...providerOptions };
+  if (next.mainControlReadOnly === true) {
+    delete next.mainControlReadOnly;
+  }
   if (next.sandbox_mode === "read-only") {
     delete next.sandbox_mode;
   }

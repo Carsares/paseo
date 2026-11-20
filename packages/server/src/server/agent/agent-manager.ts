@@ -122,7 +122,6 @@ import type { PaseoToolCatalogFactory } from "./tools/types.js";
 import { isPaseoToolPolicyEnabled, resolveAgentPaseoToolPolicy } from "./paseo-tool-policy.js";
 import {
   applyMainControlReadOnlyConfig,
-  assertMainControlReadOnlyCapability,
   buildHierarchyAppendSystemPrompt,
   computeAgentDepth,
   hasReservedHierarchyLabels,
@@ -1101,6 +1100,7 @@ export class AgentManager {
   private readonly mainControlRoleUpdates = new Set<string>();
   private readonly mainControlRoleVersions = new Map<string, number>();
   private readonly promptedMainControlRoleVersions = new Map<string, number>();
+  private readonly inPlaceMainControlSessions = new WeakSet<AgentSession>();
   private readonly launchMainControlRoleVersions = new WeakMap<AgentSessionConfig, number>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
@@ -3060,6 +3060,7 @@ export class AgentManager {
       if (isMainControlAgentLabels(agent.labels)) {
         const adapter = this.adapterOf(agent.provider);
         if (
+          patch.auto_accept === true ||
           (adapter === "codex" && ("sandbox_mode" in patch || "approval_policy" in patch)) ||
           (adapter === "claude" && "disallowedTools" in patch) ||
           (adapter === "opencode" && ("auto_accept" in patch || "permission" in patch))
@@ -3279,7 +3280,6 @@ export class AgentManager {
     background?: boolean;
   }): Promise<StoredAgentRecord> {
     return this.runHierarchyMutation(async () => {
-      assertMainControlReadOnlyCapability(this.adapterOf(config.provider));
       this.assertAcceptingAgentRegistrations();
       if (!workspaceId.trim()) throw new Error("Main Control requires a workspace.");
       const registry = this.requireRegistry();
@@ -3357,7 +3357,6 @@ export class AgentManager {
         }
         const workspaceId = agent.workspaceId ?? targetRecord.workspaceId;
         if (enabled) {
-          assertMainControlReadOnlyCapability(this.adapterOf(targetRecord.provider));
           if (
             !workspaceId ||
             getParentAgentIdFromLabels(agent.labels) ||
@@ -3674,7 +3673,7 @@ export class AgentManager {
       priorMode,
     });
     if (current) {
-      return this.reloadWithMainControlRole(agentId, { labels, modeId, enabled });
+      return this.applyLiveMainControlRole(current, { labels, modeId, enabled });
     }
 
     const next: StoredAgentRecord = {
@@ -3709,6 +3708,96 @@ export class AgentManager {
     }
     if (!enabled && priorMode) return priorMode;
     return currentMode ?? undefined;
+  }
+
+  private applyLiveMainControlRole(
+    current: ActiveManagedAgent,
+    role: { labels: Record<string, string>; modeId?: string; enabled: boolean },
+  ): Promise<AgentRelationshipUpdate> {
+    const shouldReload =
+      Boolean(current.persistence && current.capabilities.supportsSessionPersistence) &&
+      HIERARCHY_SYSTEM_PROMPT_ADAPTERS.has(this.adapterOf(current.provider));
+    return shouldReload
+      ? this.reloadWithMainControlRole(current.id, role)
+      : this.updateLiveMainControlRole(current, role);
+  }
+
+  private async updateLiveMainControlRole(
+    current: ActiveManagedAgent,
+    {
+      labels,
+      modeId,
+      enabled,
+    }: { labels: Record<string, string>; modeId?: string; enabled: boolean },
+  ): Promise<AgentRelationshipUpdate> {
+    const agentId = current.id;
+    const previousLabels = current.labels;
+    const previousConfig = current.config;
+    const previousModeId = current.currentModeId;
+    const previousRuntimeInfo = current.runtimeInfo;
+    const previousUpdatedAt = current.updatedAt;
+    const hadPreviousPolicy = this.paseoToolPolicies.has(agentId);
+    const previousPolicy = this.paseoToolPolicies.get(agentId);
+    const wasInPlaceSession = this.inPlaceMainControlSessions.has(current.session);
+
+    current.labels = labels;
+    current.config = { ...current.config, modeId };
+    current.currentModeId = modeId ?? null;
+    if (current.runtimeInfo) {
+      current.runtimeInfo = { ...current.runtimeInfo, modeId: current.currentModeId };
+    }
+    this.touchUpdatedAt(current);
+    const policy = resolveAgentPaseoToolPolicy(
+      this.basePaseoToolPolicy(current.provider),
+      current,
+      0,
+    );
+    if (policy === undefined) this.paseoToolPolicies.delete(agentId);
+    else this.paseoToolPolicies.set(agentId, policy);
+    if (enabled && HIERARCHY_SYSTEM_PROMPT_ADAPTERS.has(this.adapterOf(current.provider))) {
+      this.inPlaceMainControlSessions.add(current.session);
+    } else {
+      this.inPlaceMainControlSessions.delete(current.session);
+    }
+
+    try {
+      await this.persistSnapshot(current);
+    } catch (error) {
+      current.labels = previousLabels;
+      current.config = previousConfig;
+      current.currentModeId = previousModeId;
+      current.runtimeInfo = previousRuntimeInfo;
+      current.updatedAt = previousUpdatedAt;
+      if (hadPreviousPolicy) this.paseoToolPolicies.set(agentId, previousPolicy);
+      else this.paseoToolPolicies.delete(agentId);
+      if (wasInPlaceSession) this.inPlaceMainControlSessions.add(current.session);
+      else this.inPlaceMainControlSessions.delete(current.session);
+      throw error;
+    }
+
+    if (enabled && current.effectiveOptions?.auto_accept === true) {
+      await current.session.applyOptions?.({ auto_accept: false }).catch(() => undefined);
+      current.effectiveOptions = { ...current.effectiveOptions, auto_accept: false };
+    } else if (!enabled) {
+      const restoredEffective = this.effectiveOptionsFor(
+        current.provider,
+        current.config.providerOptions,
+      );
+      if (
+        "auto_accept" in restoredEffective &&
+        restoredEffective.auto_accept !== current.effectiveOptions?.auto_accept
+      ) {
+        await current.session
+          .applyOptions?.({ auto_accept: restoredEffective.auto_accept })
+          .catch(() => undefined);
+        current.effectiveOptions = restoredEffective;
+      }
+    }
+
+    this.emitState(current);
+    const record = await this.requireRegistry().get(agentId);
+    if (!record) throw new Error(`Agent not found after updating Main Control: ${agentId}`);
+    return { record, live: true };
   }
 
   private async reloadWithMainControlRole(
@@ -4776,7 +4865,8 @@ export class AgentManager {
       let providerPrompt = prompt;
       if (
         isMainControlAgentLabels(agent.labels) &&
-        !HIERARCHY_SYSTEM_PROMPT_ADAPTERS.has(this.adapterOf(agent.provider)) &&
+        (!HIERARCHY_SYSTEM_PROMPT_ADAPTERS.has(this.adapterOf(agent.provider)) ||
+          this.inPlaceMainControlSessions.has(agent.session)) &&
         this.promptedMainControlRoleVersions.get(agentId) !== roleVersion
       ) {
         const hierarchy = await this.readHierarchyAgents();
@@ -8084,9 +8174,13 @@ export class AgentManager {
     const adapter = this.adapterOf(storedConfig.provider);
     const mainControl = isMainControlAgentLabels(agent.labels);
     if (mainControl && adapter === "codex") storedConfig = { ...storedConfig, modeId: "read-only" };
+    const rawEffectiveOptions = mainControl
+      ? this.effectiveOptionsFor(storedConfig.provider, storedConfig.providerOptions)
+      : undefined;
     const effectiveOptions =
-      mainControl && (adapter === "claude" || adapter === "opencode")
-        ? this.effectiveOptionsFor(storedConfig.provider, storedConfig.providerOptions)
+      mainControl &&
+      (adapter === "claude" || adapter === "opencode" || rawEffectiveOptions?.auto_accept === true)
+        ? rawEffectiveOptions
         : undefined;
     const restrictedConfig = applyMainControlReadOnlyConfig(
       effectiveOptions ? { ...storedConfig, providerOptions: effectiveOptions } : storedConfig,

@@ -292,10 +292,14 @@ export function applyHierarchyPaseoToolPolicy(
   };
 }
 
-export function assertMainControlReadOnlyCapability(provider: string): void {
-  if (!["codex", "claude", "opencode", "pi"].includes(provider)) {
-    throw new Error(`Provider '${provider}' does not support enforced read-only Main Control.`);
+function resolveOpenCodePermissionRules(rawPermission: unknown): Record<string, unknown> {
+  if (typeof rawPermission === "string") {
+    return Object.fromEntries(OPENCODE_NON_WRITE_PERMISSIONS.map((name) => [name, rawPermission]));
   }
+  if (rawPermission && typeof rawPermission === "object" && !Array.isArray(rawPermission)) {
+    return rawPermission as Record<string, unknown>;
+  }
+  return {};
 }
 
 export function applyMainControlReadOnlyConfig(
@@ -304,7 +308,6 @@ export function applyMainControlReadOnlyConfig(
   provider = config.provider,
 ): AgentSessionConfig {
   if (!isMainControlAgentLabels(labels)) return config;
-  assertMainControlReadOnlyCapability(provider);
   if (provider === "pi") {
     return {
       ...config,
@@ -338,11 +341,11 @@ export function applyMainControlReadOnlyConfig(
     };
   }
   if (provider === "opencode") {
-    const { permission } = OpenCodeProviderOptionsSchema.parse(config.providerOptions ?? {});
-    const rules =
-      typeof permission === "string"
-        ? Object.fromEntries(OPENCODE_NON_WRITE_PERMISSIONS.map((name) => [name, permission]))
-        : permission;
+    const parsed = OpenCodeProviderOptionsSchema.safeParse(config.providerOptions ?? {});
+    const rawPermission = parsed.success
+      ? parsed.data.permission
+      : config.providerOptions?.permission;
+    const rules = resolveOpenCodePermissionRules(rawPermission);
     return {
       ...config,
       providerOptions: {
@@ -354,6 +357,15 @@ export function applyMainControlReadOnlyConfig(
           bash: "deny",
           todowrite: "deny",
         },
+      },
+    };
+  }
+  if (config.providerOptions?.auto_accept === true) {
+    return {
+      ...config,
+      providerOptions: {
+        ...config.providerOptions,
+        auto_accept: false,
       },
     };
   }

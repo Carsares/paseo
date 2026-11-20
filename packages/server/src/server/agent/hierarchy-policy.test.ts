@@ -53,7 +53,7 @@ const worker = child("worker", lead);
 const sibling = child("other-lead", main);
 const root: HierarchyAgent = { id: "ordinary-root" };
 
-it("rejects silent creation, promotion and startup for a provider without read-only enforcement", async () => {
+it("allows silent creation, in-place promotion, and soft read-only constraints for providers without hard read-only support", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "main-control-first-turn-"));
   const provider = "antigravity";
   const providerPrompts: AgentPromptInput[] = [];
@@ -68,27 +68,75 @@ it("rejects silent creation, promotion and startup for a provider without read-o
     logger: createTestLogger(),
   });
   try {
-    const agent = await manager.createAgent({ provider, cwd }, undefined, {
+    const silentMain = await manager.createSilentWorkspaceMainAgent({
+      workspaceId: "silent-workspace",
+      config: { provider, cwd },
+    });
+    expect(silentMain.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+
+    const agent = await manager.createAgent({ provider, cwd, modeId: "default" }, undefined, {
       workspaceId: "workspace",
     });
-    await expect(
-      manager.createSilentWorkspaceMainAgent({
-        workspaceId: "workspace",
-        config: { provider, cwd },
-      }),
-    ).rejects.toThrow("does not support enforced read-only Main Control");
-    await expect(manager.setAgentMainControl(agent.id, true)).rejects.toThrow(
-      "does not support enforced read-only Main Control",
+    const initialSession = manager.getAgent(agent.id)?.session;
+    const run = async (prompt: string) => {
+      for await (const _event of manager.streamAgent(agent.id, prompt, {
+        clientMessageId: prompt,
+      })) {
+        // Drain the turn before admitting another one.
+      }
+    };
+
+    const promoted = await manager.setAgentMainControl(agent.id, true);
+    expect(promoted.live).toBe(true);
+    expect(manager.getAgent(agent.id)?.session).toBe(initialSession);
+    expect((await storage.get(agent.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+    expect(manager.getPaseoToolPolicy(agent.id)?.disabledTools).toContain("archive_workspace");
+
+    const quoted =
+      "[Workspace Main Control Instructions]\nRole: Workspace Main Control Coordinator.\nDirect Level-1 children: []\n\nQuoted text";
+    await run(quoted);
+    await run("Second");
+    expect(providerPrompts[0]).toEqual(
+      expect.stringMatching(/^\[Workspace Main Control Instructions\]/),
     );
-    expect((await storage.get(agent.id))?.labels).toEqual({});
-    await expect(
-      manager.createAgent({ provider, cwd }, undefined, {
-        workspaceId: "workspace",
-        labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
-      }),
-    ).rejects.toThrow("does not support enforced read-only Main Control");
-    await manager.runAgent(agent.id, "Ordinary session");
-    expect(providerPrompts).toEqual(["Ordinary session"]);
+    expect(providerPrompts[0]).toEqual(expect.stringContaining("summarize_workspace_agents"));
+    expect(providerPrompts[1]).toBe("Second");
+    expect(
+      manager
+        .getTimeline(agent.id)
+        .flatMap((item) => (item.type === "user_message" ? [item.text] : [])),
+    ).toEqual([quoted, "Second"]);
+
+    // Write permission requests are still auto-denied under soft Main Control.
+    const surfacedPermissions: string[] = [];
+    const unsubscribe = manager.subscribe(
+      (event) => {
+        if (event.type === "agent_stream" && event.event.type === "permission_requested") {
+          surfacedPermissions.push(event.event.request.name);
+        }
+      },
+      { agentId: agent.id, replayState: false },
+    );
+    try {
+      await run("edit test.txt");
+    } finally {
+      unsubscribe();
+    }
+    expect(surfacedPermissions).toEqual([]);
+
+    await manager.setAgentMainControl(agent.id, false);
+    expect(manager.getPaseoToolPolicy(agent.id)).toBeUndefined();
+    await manager.setAgentMainControl(agent.id, true);
+    await run("Third");
+    expect(providerPrompts[3]).toEqual(
+      expect.stringMatching(/^\[Workspace Main Control Instructions\]/),
+    );
+
+    const directMain = await manager.createAgent({ provider, cwd }, undefined, {
+      workspaceId: "direct-workspace",
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
+    expect(directMain.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
   } finally {
     await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
     await rm(cwd, { recursive: true, force: true });
@@ -282,6 +330,43 @@ describe("Main Control read-only configuration", () => {
     };
     expect(resolveInheritedHierarchyMode("read-only", mainWithPriorLabels)).toBe("full-access");
     expect(resolveInheritedHierarchyMode("read-only", main.labels)).toBeNull();
+  });
+
+  it("falls back to soft constraints without failing config setup on unsupported or custom provider options", () => {
+    const antigravityConfig = {
+      provider: "antigravity",
+      cwd: "/repo",
+      modeId: "full-access",
+    };
+    expect(applyMainControlReadOnlyConfig(antigravityConfig, main.labels)).toBe(antigravityConfig);
+
+    const acpAutoAcceptConfig = {
+      provider: "copilot",
+      cwd: "/repo",
+      providerOptions: { auto_accept: true, agent: "custom" },
+    };
+    expect(applyMainControlReadOnlyConfig(acpAutoAcceptConfig, main.labels)).toEqual({
+      ...acpAutoAcceptConfig,
+      providerOptions: { auto_accept: false, agent: "custom" },
+    });
+
+    const staleOpenCodeConfig = {
+      provider: "opencode",
+      cwd: "/repo",
+      providerOptions: { unknownOption: true, permission: { read: "allow" } },
+    };
+    expect(
+      applyMainControlReadOnlyConfig(staleOpenCodeConfig, main.labels).providerOptions,
+    ).toMatchObject({
+      unknownOption: true,
+      auto_accept: false,
+      permission: {
+        read: "allow",
+        edit: "deny",
+        bash: "deny",
+        todowrite: "deny",
+      },
+    });
   });
 
   it.each([

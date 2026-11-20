@@ -120,12 +120,8 @@ function appendPiLaunchArgs(
   session: PiStartSessionInput,
   protocolMode: "rpc" | "rpc-ui",
 ): void {
-  if (
-    session.mainControlReadOnly &&
-    (argv.includes("--", 1) || session.extraArgs?.includes("--"))
-  ) {
-    throw new Error("Pi Main Control cannot enforce read-only tools after a -- option terminator.");
-  }
+  const canAppendReadOnlyTools =
+    session.mainControlReadOnly && !argv.includes("--", 1) && !session.extraArgs?.includes("--");
   if (!hasModeFlag(argv)) {
     argv.push("--mode", protocolMode);
   }
@@ -149,7 +145,7 @@ function appendPiLaunchArgs(
   for (const extensionPath of session.extensionPaths ?? []) {
     argv.push("--extension", extensionPath);
   }
-  if (session.mainControlReadOnly) {
+  if (canAppendReadOnlyTools) {
     argv.push("--tools", "read,grep,find,ls");
   }
 }

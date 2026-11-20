@@ -105,13 +105,15 @@ test("launches and resumes a Main Control session with only read-only built-in t
   }
 });
 
-test("refuses to launch Main Control when Pi would ignore the read-only flags", async () => {
+test("falls back to soft Main Control launch when Pi has a -- option terminator", async () => {
   const pi = new FakePi(["pi", "--mode", "rpc", "--"]);
   const client = createClient(pi);
-  await expect(
-    client.createSession(createConfig({ providerOptions: { mainControlReadOnly: true } })),
-  ).rejects.toThrow("cannot enforce read-only tools");
-  expect(pi.recordedLaunches).toHaveLength(0);
+  const created = await client.createSession(
+    createConfig({ providerOptions: { mainControlReadOnly: true } }),
+  );
+  await created.close();
+  expect(pi.recordedLaunches).toHaveLength(1);
+  expect(pi.recordedLaunches[0]?.argv).not.toContain("--tools");
 });
 
 class ManualUsagePollScheduler implements PiUsagePollScheduler {
