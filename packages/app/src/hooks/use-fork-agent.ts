@@ -9,6 +9,7 @@ import type { WorkspaceComposerAttachment } from "@/attachments/types";
 import type { AssistantForkTarget } from "@/components/assistant-fork-menu";
 import type { ToastApi } from "@/components/toast-host";
 import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
+import { useFormPreferences } from "@/hooks/use-form-preferences";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useSettings, type OpenInSidePanePreferences } from "@/hooks/use-settings";
 import { useHostFeature } from "@/runtime/host-features";
@@ -159,28 +160,60 @@ function stripMainControlReadOnlyProviderOptions(
   return next;
 }
 
+export function buildMainSubagentTabDraftSetup(input: {
+  mainAgent: Pick<ForkAgentSource, "provider" | "cwd">;
+  mainAgentId: string;
+  preferredProvider?: string;
+}): WorkspaceDraftTabSetup | undefined {
+  const provider = input.preferredProvider || input.mainAgent.provider;
+  const parentAgentId = input.mainAgentId.trim();
+  if (!provider || !parentAgentId) return undefined;
+  // The persisted draft needs a provider; the composer resolves the other fields from preferences.
+  return {
+    provider,
+    cwd: input.mainAgent.cwd,
+    parentAgentId,
+    modeId: null,
+    model: null,
+    thinkingOptionId: null,
+    providerOptions: {},
+  };
+}
+
 export function buildSubagentDraftSetup(
   agent: ForkAgentSource & AgentLabelSource,
   parentAgentId: string,
+  preferredProvider?: string,
 ): WorkspaceDraftTabSetup | undefined {
+  const isMainControl = isMainControlAgent(agent);
+  const hasSafeInheritedOptions =
+    agent.subagentDraftOptions || agent.provider === "codex" || agent.provider === "claude";
+  if (isMainControl && (preferredProvider || !hasSafeInheritedOptions)) {
+    return buildMainSubagentTabDraftSetup({
+      mainAgent: agent,
+      mainAgentId: parentAgentId,
+      preferredProvider,
+    });
+  }
   const normalizedParentId = parentAgentId.trim();
   if (!normalizedParentId) return undefined;
   const setup = buildForkDraftSetup(agent);
   if (!setup) return undefined;
-  if (!isMainControlAgent(agent)) return { ...setup, parentAgentId: normalizedParentId };
+  if (!isMainControl) return { ...setup, parentAgentId: normalizedParentId };
+  const modeId = setup.modeId === "read-only" ? null : setup.modeId;
   if (agent.subagentDraftOptions) {
     return {
       ...setup,
+      modeId,
       parentAgentId: normalizedParentId,
       providerOptions: agent.subagentDraftOptions,
     };
   }
   // COMPAT(subagentDraftOptions): added in v0.16.0, remove after 2027-05-01.
-  if (agent.provider === "opencode") return { ...setup, parentAgentId: normalizedParentId };
   return {
     ...setup,
     parentAgentId: normalizedParentId,
-    modeId: setup.modeId === "read-only" ? null : setup.modeId,
+    modeId,
     providerOptions: stripMainControlReadOnlyProviderOptions(setup.providerOptions),
   };
 }
@@ -218,12 +251,13 @@ function resolveForkDraftSetup(input: {
   target: AssistantForkTarget;
   agent: ForkAgentSource & AgentLabelSource;
   agentId: string;
+  preferredProvider?: string;
   unavailableMessage: string;
 }): WorkspaceDraftTabSetup | undefined {
   if (input.target !== "subagent") {
     return buildForkDraftSetup(input.agent);
   }
-  const setup = buildSubagentDraftSetup(input.agent, input.agentId);
+  const setup = buildSubagentDraftSetup(input.agent, input.agentId, input.preferredProvider);
   if (!setup) {
     throw new Error(input.unavailableMessage);
   }
@@ -274,6 +308,7 @@ export function useForkAgent(
   const supportsAgentForkContext = useHostFeature(serverId, "agentForkContext") && !readOnly;
   const supportsAgentHierarchyControl = useHostFeature(serverId, "agentHierarchyControl");
   const openInSidePane = useSettings((settings) => settings.openInSidePane);
+  const { preferences } = useFormPreferences();
 
   return useStableEvent(async ({ agentId, agent, workspaceId, parentTabId, target, boundary }) => {
     try {
@@ -290,6 +325,7 @@ export function useForkAgent(
         target,
         agent,
         agentId,
+        preferredProvider: preferences.provider,
         unavailableMessage: t("message.actions.forkUnavailable"),
       });
       const prepareForkDraft = async () => {

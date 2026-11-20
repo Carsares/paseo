@@ -956,17 +956,18 @@ function openSheetTabInFront(
 }
 
 /**
- * A sheet agent closes once the workspace no longer has it (archived or gone), like its tab would,
- * and once it stops being a subagent: as a root agent, reconcile gives it its own tab, and the sheet
- * would hold a second tab with the same id.
+ * Like a tab, a sheet closes when its agent leaves the workspace unless the agent is pinned.
+ * An active agent that becomes a root gets its own tab, so close its sheet to avoid a duplicate.
  */
 function sheetAgentNoLongerFits(
   workspaceKey: string,
   sheet: SheetTab,
-  snapshot: WorkspaceTabSnapshot,
+  activeAgentIds: ReadonlySet<string>,
+  pinnedAgentIds: ReadonlySet<string> | null,
 ): boolean {
-  if (sheet.tab.target.kind !== "agent" || !snapshot.agentsHydrated) return false;
-  if (!new Set(snapshot.activeAgentIds).has(sheet.tab.target.agentId)) return true;
+  if (sheet.tab.target.kind !== "agent") return false;
+  const { agentId } = sheet.tab.target;
+  if (!activeAgentIds.has(agentId)) return !pinnedAgentIds?.has(agentId);
   return resolveCompactSheetPolicy(workspaceKey, sheet.tab.target) === null;
 }
 
@@ -1814,9 +1815,19 @@ export function createWorkspaceLayoutStore(
               }
             }
             const sheets = getSheets(state, normalizedWorkspaceKey);
-            const fittingSheets = sheets.filter(
-              (sheet) => !sheetAgentNoLongerFits(normalizedWorkspaceKey, sheet, snapshot),
-            );
+            let fittingSheets = sheets;
+            if (snapshot.agentsHydrated && sheets.length > 0) {
+              const activeAgentIds = new Set(snapshot.activeAgentIds);
+              fittingSheets = sheets.filter(
+                (sheet) =>
+                  !sheetAgentNoLongerFits(
+                    normalizedWorkspaceKey,
+                    sheet,
+                    activeAgentIds,
+                    nextState.pinnedAgentIds ?? null,
+                  ),
+              );
+            }
             const sheetAgentGone = fittingSheets.length !== sheets.length;
             if (
               state.layoutByWorkspace[normalizedWorkspaceKey] &&

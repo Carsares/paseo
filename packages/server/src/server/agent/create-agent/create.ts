@@ -74,6 +74,7 @@ export type EnsureWorkspaceForCreate = (
 export interface CreateAgentFromSessionInput {
   kind: "session";
   callerAgentId?: string;
+  notifyParentOnInitialPrompt?: boolean;
   onAgentReady?: (agent: ManagedAgent) => Promise<void>;
   agentId?: string;
   /** Wire configs from older clients can still carry `featureValues`; they are folded on entry. */
@@ -304,6 +305,7 @@ function registerInitialPromptFinish(
   childAgentId: string,
 ): Promise<FinishRegistration> | undefined {
   if (!input.callerAgentId || (input.kind === "mcp" && !input.notifyOnFinish)) return;
+  if (input.kind === "session" && input.notifyParentOnInitialPrompt === false) return;
   const subscriptions =
     input.kind === "mcp"
       ? requireFinishSubscriptions(dependencies)

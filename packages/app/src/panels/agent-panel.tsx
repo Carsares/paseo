@@ -90,7 +90,8 @@ import { type DraftConversation, useDraftTimeline } from "@/composer/draft/timel
 import { AgentTracks } from "@/panels/agent-tracks";
 import { OverlayDismissalScope } from "@/components/ui/overlay-dismissal";
 import { ParentAgentCallout, useParentAgentId } from "@/subagents/parent";
-import { MainControlTreeLayout } from "@/subagents/main-control-tree";
+import { MainControlQuickActions, MainControlTreeLayout } from "@/subagents/main-control-tree";
+import { isWorkspaceRootAgent } from "@/subagents/main-control-tree/select-tree";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
 import { buildDraftStoreKey, generateDraftId } from "@/stores/draft-keys";
 import {
@@ -1112,7 +1113,9 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   // The dock lays out fullscreen for the same session the composer edits in.
   const mainAgentId = useSessionStore((state) => {
     const agent = resolveChatAgentFromSession(state, serverId, effectiveAgent?.id);
-    return agent && isMainControlAgent(agent) ? agent.id : null;
+    return agent && isWorkspaceRootAgent(agent, workspaceId) && isMainControlAgent(agent)
+      ? agent.id
+      : null;
   });
   const composerEditingSession = useComposerEditingSession("chat");
   const isComposerFullscreen = useComposerFullscreen(composerEditingSession);
@@ -1177,7 +1180,9 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     <RenderProfile id={`AgentComposerSection:${agentId}`}>
       <AgentComposerSection
         agentId={agentId}
+        mainAgentId={mainAgentId}
         serverId={serverId}
+        workspaceId={workspaceId}
         isPaneFocused={isPaneFocused}
         isArchivingCurrentAgent={isArchivingCurrentAgent}
         archivedAt={agentState.archivedAt}
@@ -1588,7 +1593,9 @@ function DraftComposerSection({
 
 const AgentComposerSection = memo(function AgentComposerSection({
   agentId,
+  mainAgentId,
   serverId,
+  workspaceId,
   isPaneFocused,
   isArchivingCurrentAgent,
   archivedAt,
@@ -1602,7 +1609,9 @@ const AgentComposerSection = memo(function AgentComposerSection({
   onMessageSent,
 }: {
   agentId?: string;
+  mainAgentId: string | null;
   serverId: string;
+  workspaceId: string;
   isPaneFocused: boolean;
   isArchivingCurrentAgent: boolean;
   archivedAt: Date | null;
@@ -1615,6 +1624,10 @@ const AgentComposerSection = memo(function AgentComposerSection({
   onComposerHeightChange: (height: number) => void;
   onMessageSent: () => void;
 }) {
+  const handleQuickPromptSent = useCallback(() => {
+    onAttentionPromptSend();
+    onMessageSent();
+  }, [onAttentionPromptSend, onMessageSent]);
   if (!agentId) {
     return null;
   }
@@ -1626,19 +1639,29 @@ const AgentComposerSection = memo(function AgentComposerSection({
   }
 
   return (
-    <ActiveAgentComposer
-      agentId={agentId}
-      serverId={serverId}
-      isPaneFocused={isPaneFocused}
-      cwd={cwd}
-      isSubmitLoading={isSubmitLoading}
-      agentInputDraft={agentInputDraft}
-      editingSession={editingSession}
-      onAttentionInputFocus={onAttentionInputFocus}
-      onAttentionPromptSend={onAttentionPromptSend}
-      onComposerHeightChange={onComposerHeightChange}
-      onMessageSent={onMessageSent}
-    />
+    <>
+      {mainAgentId ? (
+        <MainControlQuickActions
+          mainAgentId={mainAgentId}
+          serverId={serverId}
+          workspaceId={workspaceId}
+          onPromptSent={handleQuickPromptSent}
+        />
+      ) : null}
+      <ActiveAgentComposer
+        agentId={agentId}
+        serverId={serverId}
+        isPaneFocused={isPaneFocused}
+        cwd={cwd}
+        isSubmitLoading={isSubmitLoading}
+        agentInputDraft={agentInputDraft}
+        editingSession={editingSession}
+        onAttentionInputFocus={onAttentionInputFocus}
+        onAttentionPromptSend={onAttentionPromptSend}
+        onComposerHeightChange={onComposerHeightChange}
+        onMessageSent={onMessageSent}
+      />
+    </>
   );
 });
 

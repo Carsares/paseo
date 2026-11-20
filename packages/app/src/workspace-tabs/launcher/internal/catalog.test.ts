@@ -25,4 +25,12 @@ describe("getBuiltInLaunchOrder", () => {
       "pullRequest",
     ]);
   });
+
+  it("offers a standalone session directly after the default agent when a Main Tab exists", () => {
+    expect(getBuiltInLaunchOrder("primary", true).slice(0, 3)).toEqual([
+      "agent",
+      "standalone-agent",
+      "terminal",
+    ]);
+  });
 });

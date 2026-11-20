@@ -48,7 +48,6 @@ import { useTranslation } from "react-i18next";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import type { Theme } from "@/styles/theme";
-import invariant from "tiny-invariant";
 import { SidebarMenuToggle } from "@/components/headers/sidebar-menu-toggle";
 import { ScreenHeader } from "@/components/headers/screen-header";
 import { MenuHeader } from "@/components/headers/menu-header";
@@ -117,6 +116,8 @@ import {
   type WorkspaceTabTarget,
 } from "@/workspace-tabs/model";
 import { useSettings } from "@/hooks/use-settings";
+import { useFormPreferences } from "@/hooks/use-form-preferences";
+import { buildMainSubagentTabDraftSetup } from "@/hooks/use-fork-agent";
 import { isDraftTabSubmitting, revealCreatedDraftAgentTab } from "@/composer/draft/workspace-tab";
 import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
 import { buildWorkspaceKeyboardHandlerId } from "@/keyboard/handler-id";
@@ -220,7 +221,7 @@ import { SheetTabs } from "@/screens/workspace/sheet-tabs";
 import type { PaneHost } from "@/panels/panel-manifest";
 import { WorkspaceFocusProvider } from "@/workspace/focus";
 import { DiffDocumentWorkspaceCacheProvider } from "@/git/diff-document/workspace-cache";
-import type { NewTabSelection } from "@/workspace-tabs/new-tab";
+import { buildNewAgentTabTarget, type NewTabSelection } from "@/workspace-tabs/new-tab";
 import {
   NewTabLauncherProvider,
   type NewTabLauncher,
@@ -1408,6 +1409,19 @@ function WorkspaceScreenContent({
   const hierarchyTabState = useSessionStore(selectHierarchyTabState);
   const supportsHierarchyControl = useHostFeature(normalizedServerId, "agentHierarchyControl");
   const mainAgentId = hierarchyTabState.mainAgentId;
+  const { preferences: codingPreferences } = useFormPreferences();
+  const resolveNewAgentTabSetup = useCallback(() => {
+    const state = useSessionStore.getState();
+    const currentMainAgentId = selectHierarchyTabState(state).mainAgentId;
+    if (!currentMainAgentId) return undefined;
+    const mainAgent = state.sessions[normalizedServerId]?.agents.get(currentMainAgentId);
+    if (!mainAgent) return undefined;
+    return buildMainSubagentTabDraftSetup({
+      mainAgent,
+      mainAgentId: currentMainAgentId,
+      preferredProvider: codingPreferences.provider,
+    });
+  }, [codingPreferences.provider, normalizedServerId, selectHierarchyTabState]);
   useOpenAgentTabLabels({
     client,
     serverId: normalizedServerId,
@@ -1580,11 +1594,10 @@ function WorkspaceScreenContent({
         return null;
       }
 
-      const target = normalizeWorkspaceTabTarget({
-        kind: "draft",
+      const target = buildNewAgentTabTarget({
         draftId: trimNonEmpty(input?.draftId) ?? generateDraftId(),
+        resolveSubagentSetup: resolveNewAgentTabSetup,
       });
-      invariant(target?.kind === "draft", "Draft tab target must be valid");
       if (input?.ambient) {
         return openWorkspaceTabFocused(persistenceKey, target);
       }
@@ -1594,7 +1607,12 @@ function WorkspaceScreenContent({
       }
       return openWorkspaceTabFocused(persistenceKey, target, placement);
     },
-    [openWorkspaceTabFocused, openWorkspaceTabInBackground, persistenceKey],
+    [
+      openWorkspaceTabFocused,
+      openWorkspaceTabInBackground,
+      persistenceKey,
+      resolveNewAgentTabSetup,
+    ],
   );
 
   useLayoutEffect(() => {
@@ -1616,6 +1634,15 @@ function WorkspaceScreenContent({
       return pending?.serverId === normalizedServerId && pending.lifecycle === "active";
     });
 
+    if (
+      hasActivePendingDraftCreateInWorkspace &&
+      mainAgentId &&
+      !uiTabs.some((tab) => isWorkspaceMainTab(tab, mainAgentId))
+    ) {
+      // Draft reconciliation defers new agent tabs so it cannot race the draft's replacement.
+      openWorkspaceTabInBackground(persistenceKey, { kind: "agent", agentId: mainAgentId });
+    }
+
     reconcileWorkspaceTabs(
       persistenceKey,
       buildWorkspaceTabSnapshot({
@@ -1636,8 +1663,10 @@ function WorkspaceScreenContent({
     pendingTerminalCreateInput,
     createTerminalMutation.isPending,
     isRouteFocused,
+    mainAgentId,
     normalizedServerId,
     normalizedWorkspaceId,
+    openWorkspaceTabInBackground,
     pendingByDraftId,
     persistenceKey,
     reconcileWorkspaceTabs,
@@ -1952,10 +1981,13 @@ function WorkspaceScreenContent({
         return;
       }
       if (selection.kind === "agent") {
-        openTarget({
-          kind: "draft",
-          draftId: generateDraftId(),
-        });
+        openTarget(
+          buildNewAgentTabTarget({
+            draftId: generateDraftId(),
+            selection,
+            resolveSubagentSetup: resolveNewAgentTabSetup,
+          }),
+        );
         return;
       }
       if (selection.kind === "terminal") {
@@ -1968,7 +2000,13 @@ function WorkspaceScreenContent({
       const { browserId } = createWorkspaceBrowser();
       openTarget({ kind: "browser", browserId });
     },
-    [createTerminal, createWorkspaceTab, persistenceKey, replaceWorkspaceTabTarget],
+    [
+      createTerminal,
+      createWorkspaceTab,
+      persistenceKey,
+      replaceWorkspaceTabTarget,
+      resolveNewAgentTabSetup,
+    ],
   );
 
   const handleOpenUrlInBrowserTab = useCallback(
@@ -3535,6 +3573,7 @@ function WorkspaceScreenContent({
   const showCreateBrowserTab = getIsElectron();
   const newTabLauncher = useMemo<NewTabLauncher>(
     () => ({
+      hasMainAgent: Boolean(mainAgentId),
       showChanges: isGitCheckout,
       showPullRequest: hasPullRequest,
       showBrowser: showCreateBrowserTab,
@@ -3546,6 +3585,7 @@ function WorkspaceScreenContent({
       hasPullRequest,
       isGitCheckout,
       launchWorkspaceTab,
+      mainAgentId,
       showCreateBrowserTab,
     ],
   );

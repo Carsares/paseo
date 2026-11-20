@@ -55,6 +55,25 @@ function makeDeps(
 }
 
 describe("loadAppSettingsFromStorage", () => {
+  it("defaults Main Control off and persists an explicit choice in client settings", async () => {
+    const deps = makeDeps({
+      desktop: createFakeDesktopBridge({ isElectron: true }),
+      storage: createInMemoryKeyValueStorage({
+        [APP_SETTINGS_KEY]: JSON.stringify({ defaultWorkspaceMainAgent: "true" }),
+      }),
+    });
+    expect((await loadSettingsFromStorage(deps)).defaultWorkspaceMainAgent).toBe(false);
+
+    await saveAppSettings({
+      queryClient: new QueryClient(),
+      deps,
+      updates: { defaultWorkspaceMainAgent: true },
+    });
+
+    expect((await loadSettingsFromStorage(deps)).defaultWorkspaceMainAgent).toBe(true);
+    expect(deps.desktop.migrationsApplied).toEqual([]);
+  });
+
   it("hides subagent interactions on a new installation", async () => {
     const deps = makeDeps();
 

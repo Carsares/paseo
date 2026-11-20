@@ -1260,22 +1260,30 @@ export const ExternalResourceAttachmentMetadataSchema = z.object({
   url: z.string(),
 });
 
-export const TextAttachmentSchema = z
-  .object({
-    type: z.literal("text"),
-    mimeType: z.literal("text/plain"),
-    contextKind: z.string().optional(),
-    title: z.string().nullable().optional(),
-    text: z.string(),
-    externalResource: ExternalResourceAttachmentMetadataSchema.optional(),
-    forkContext: UserMessageForkContextSchema.optional(),
-  })
-  .transform(({ contextKind, forkContext, ...attachment }) => ({
+const TextAttachmentWireSchema = z.object({
+  type: z.literal("text"),
+  mimeType: z.literal("text/plain"),
+  contextKind: z.string().optional(),
+  title: z.string().nullable().optional(),
+  text: z.string(),
+  externalResource: ExternalResourceAttachmentMetadataSchema.optional(),
+  forkContext: UserMessageForkContextSchema.optional(),
+});
+
+function normalizeTextAttachment({
+  contextKind,
+  forkContext,
+  ...attachment
+}: z.infer<typeof TextAttachmentWireSchema>) {
+  return {
     ...attachment,
     ...(contextKind === "chat_history"
       ? { contextKind, ...(forkContext ? { forkContext } : {}) }
       : {}),
-  }));
+  };
+}
+
+export const TextAttachmentSchema = TextAttachmentWireSchema.transform(normalizeTextAttachment);
 
 export const ReviewAttachmentContextLineSchema = z.object({
   oldLineNumber: z.number().int().positive().nullable(),
@@ -1314,14 +1322,23 @@ export const UploadedFileAttachmentSchema = z.object({
   path: z.string(),
 });
 
-export const AgentAttachmentSchema = z.discriminatedUnion("type", [
+const nonTextAttachmentSchemas = [
   ForgeChangeRequestAttachmentSchema,
   ForgeIssueAttachmentSchema,
   GitHubPrAttachmentSchema,
   GitHubIssueAttachmentSchema,
-  TextAttachmentSchema,
   ReviewAttachmentSchema,
   UploadedFileAttachmentSchema,
+] as const;
+
+export const AgentAttachmentSchema = z.discriminatedUnion("type", [
+  ...nonTextAttachmentSchemas,
+  TextAttachmentWireSchema,
+]);
+
+const LegacyAgentAttachmentSchema = z.discriminatedUnion("type", [
+  ...nonTextAttachmentSchemas,
+  TextAttachmentSchema,
 ]);
 
 function normalizeAgentAttachments(input: unknown): AgentAttachment[] {
@@ -1330,7 +1347,7 @@ function normalizeAgentAttachments(input: unknown): AgentAttachment[] {
   }
   const normalized: AgentAttachment[] = [];
   for (const item of input) {
-    const parsed = AgentAttachmentSchema.safeParse(item);
+    const parsed = LegacyAgentAttachmentSchema.safeParse(item);
     if (parsed.success) {
       normalized.push(parsed.data);
     }
@@ -1501,7 +1518,9 @@ export const FetchAgentHistoryRequestMessageSchema = z.object({
   requestId: z.string(),
   // Active and archived scopes classify both the agent and its workspace and override includeArchived.
   archiveScope: AgentHistoryArchiveScopeSchema.optional(),
-  filter: AgentDirectoryFilterSchema.optional(),
+  filter: AgentDirectoryFilterSchema.extend({
+    workspaceIds: z.array(z.string()).optional(),
+  }).optional(),
   // A free-text filter over the names selected by searchScope, which defaults to "all".
   // Matching rows follow the requested sort and cursor pagination.
   search: z.string().optional(),
@@ -1948,7 +1967,7 @@ export const CreateAgentRequestMessageSchema = z.object({
 export const AgentCreateRequestSchema = CreateAgentRequestMessageSchema.extend({
   type: z.literal("agent.create.request"),
   agentId: z.uuid().optional(),
-  attachments: z.array(AgentAttachmentSchema).optional(),
+  attachments: z.array(LegacyAgentAttachmentSchema).optional(),
   subscribe: z.boolean().optional(),
 });
 
@@ -3055,6 +3074,16 @@ export const ArchiveWorkspaceRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const WorkspaceMainAgentInitSchema = z.object({
+  config: AgentSessionConfigSchema,
+});
+
+export const WorkspaceAgentsSummaryRequestMessageSchema = z.object({
+  type: z.literal("workspace.agents.summary.request"),
+  workspaceId: z.string(),
+  requestId: z.string(),
+});
+
 // Create a new workspace record. Unlike open_project, this never deduplicates by
 // directory: it always produces a fresh workspace. The source discriminates
 // between an existing local directory and a newly created paseo worktree.
@@ -3065,6 +3094,7 @@ export const WorkspaceCreateRequestSchema = z.object({
     .regex(/^wks_[a-f0-9]{16}$/)
     .optional(),
   agent: WorkspaceInitialAgentSchema.optional(),
+  mainAgent: WorkspaceMainAgentInitSchema.optional(),
   subscribe: z.boolean().optional(),
   requestId: z.string(),
   idempotencyKey: z.string().min(1).max(512).optional(),
@@ -3812,6 +3842,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ProjectGithubCloneRequestSchema,
   ArchiveWorkspaceRequestSchema,
   WorkspaceCreateRequestSchema,
+  WorkspaceAgentsSummaryRequestMessageSchema,
   AgentCreateRequestSchema,
   CreationSubscribeRequestSchema,
   WorkspaceClearAttentionRequestSchema,
@@ -4179,6 +4210,12 @@ export const ServerInfoStatusPayloadSchema = z
         agentMoveToWorkspace: z.boolean().optional(),
         // COMPAT(agentHierarchyControl): added in v0.16.0, remove gate after 2027-05-19.
         agentHierarchyControl: z.boolean().optional(),
+        // COMPAT(workspaceMainAgentDefault): added in v0.16.0, remove gate after 2027-05-20.
+        workspaceMainAgentDefault: z.boolean().optional(),
+        // COMPAT(workspaceAgentsSummary): added in v0.16.0, remove gate after 2027-05-20.
+        workspaceAgentsSummary: z.boolean().optional(),
+        // COMPAT(agentHistoryWorkspaceFilter): added in v0.16.0, remove gate after 2027-05-20.
+        agentHistoryWorkspaceFilter: z.boolean().optional(),
         // COMPAT(agentThinkingUpdate): added in v0.2.4, remove gate after 2027-01-28.
         agentThinkingUpdate: z.boolean().optional(),
         // COMPAT(daemonDiagnostics): added in v0.1.100, remove gate after 2026-12-25 once daemon floor >= v0.1.100.
@@ -5527,6 +5564,7 @@ export const CreationSnapshotSchema = z.object({
   agentId: z.string().nullable(),
   workspace: WorkspaceDescriptorPayloadSchema.optional(),
   agent: AgentSnapshotPayloadSchema.optional(),
+  mainAgent: AgentSnapshotPayloadSchema.nullable().optional(),
   error: z.string().nullable(),
   setupSkippedReason: z.string().optional(),
   errorCode: z.string().optional(),
@@ -5567,6 +5605,7 @@ export const WorkspaceCreateResponseSchema = z.object({
   type: z.literal("workspace.create.response"),
   payload: z.object({
     agent: AgentSnapshotPayloadSchema.optional(),
+    mainAgent: AgentSnapshotPayloadSchema.nullable().optional(),
     creation: CreationSnapshotSchema.optional(),
     workspace: WorkspaceDescriptorPayloadSchema.nullable(),
     setupTerminalId: z.string().nullable(),
@@ -5574,6 +5613,40 @@ export const WorkspaceCreateResponseSchema = z.object({
     error: z.string().nullable(),
     errorCode: z.string().optional(),
     requestId: z.string(),
+  }),
+});
+
+export const WorkspaceAgentSummaryTodoSchema = z.object({
+  text: z.string(),
+  completed: z.boolean(),
+});
+
+export const WorkspaceAgentSummaryEntrySchema = z.object({
+  agentId: z.string(),
+  title: z.string().nullable(),
+  provider: z.string(),
+  model: z.string().nullable(),
+  relationship: z.enum(["level1", "level2", "standalone"]),
+  parentAgentId: z.string().nullable(),
+  stateGroup: z.enum(["active", "closed"]),
+  status: AgentStatusSchema,
+  archivedAt: z.string().nullable(),
+  updatedAt: z.string(),
+  firstUserPrompt: z.string().nullable(),
+  lastAssistantSummary: z.string().nullable(),
+  todos: z.array(WorkspaceAgentSummaryTodoSchema),
+  touchedFiles: z.array(z.string()),
+});
+
+export const WorkspaceAgentsSummaryResponseMessageSchema = z.object({
+  type: z.literal("workspace.agents.summary.response"),
+  payload: z.object({
+    requestId: z.string(),
+    workspaceId: z.string(),
+    summaryText: z.string(),
+    attachment: AgentAttachmentSchema.nullable(),
+    entries: z.array(WorkspaceAgentSummaryEntrySchema),
+    error: z.string().nullable(),
   }),
 });
 
@@ -7675,6 +7748,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CancelAgentResponseMessageSchema,
   ClearAgentAttentionResponseMessageSchema,
   WorkspaceCreateResponseSchema,
+  WorkspaceAgentsSummaryResponseMessageSchema,
   AgentCreateResponseSchema,
   WorkspaceCreationUpdateSchema,
   AgentCreationUpdateSchema,
@@ -7941,6 +8015,15 @@ export type WorkspaceRecoveryRestoreResponse = z.infer<
 export type WorkspaceArchiveUndoResponse = z.infer<typeof WorkspaceArchiveUndoResponseSchema>;
 export type WorkspaceCreateRequest = z.infer<typeof WorkspaceCreateRequestSchema>;
 export type WorkspaceCreateResponse = z.infer<typeof WorkspaceCreateResponseSchema>;
+export type WorkspaceMainAgentInit = z.infer<typeof WorkspaceMainAgentInitSchema>;
+export type WorkspaceAgentSummaryTodo = z.infer<typeof WorkspaceAgentSummaryTodoSchema>;
+export type WorkspaceAgentSummaryEntry = z.infer<typeof WorkspaceAgentSummaryEntrySchema>;
+export type WorkspaceAgentsSummaryRequestMessage = z.infer<
+  typeof WorkspaceAgentsSummaryRequestMessageSchema
+>;
+export type WorkspaceAgentsSummaryResponseMessage = z.infer<
+  typeof WorkspaceAgentsSummaryResponseMessageSchema
+>;
 export type ProjectRenameResponsePayload = z.infer<typeof ProjectRenameResponsePayloadSchema>;
 export type ProjectRemoveResponsePayload = z.infer<typeof ProjectRemoveResponsePayloadSchema>;
 export type WaitForFinishResponseMessage = z.infer<typeof WaitForFinishResponseMessageSchema>;

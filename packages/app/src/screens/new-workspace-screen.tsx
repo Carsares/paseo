@@ -58,6 +58,8 @@ import {
 import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
 import type { KeyboardActionId } from "@/keyboard/keyboard-action-dispatcher";
 import { useFormPreferences } from "@/hooks/use-form-preferences";
+import { useAppSettings } from "@/hooks/use-settings";
+import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
 import type { CreateAgentInitialValues } from "@/hooks/use-agent-form-state";
 import { toErrorMessage } from "@/utils/error-messages";
 import {
@@ -78,7 +80,12 @@ import type { AgentAttachment, ForgeSearchItem } from "@getpaseo/protocol/messag
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { AgentProvider, JsonValue } from "@getpaseo/protocol/agent-types";
 import type { WorkspaceDraftTabSetup, WorkspaceTabTarget } from "@/workspace-tabs/model";
-import { isEmptyWorkspaceSubmission, runCreateEmptyWorkspace } from "./new-workspace-empty";
+import {
+  isEmptyWorkspaceSubmission,
+  resolveEmptyWorkspaceMainProvider,
+  runCreateEmptyWorkspace,
+  type EnsureNewWorkspaceRequest,
+} from "./new-workspace-empty";
 import {
   getWorkspaceNamingAttachments,
   remapDraftCwdToWorkspace,
@@ -280,6 +287,7 @@ interface WorkspaceDraftSubmissionConfig {
 interface WorkspaceCreationResult {
   workspace: ReturnType<typeof normalizeWorkspaceDescriptor>;
   agent?: AgentSnapshotPayload;
+  mainAgent?: AgentSnapshotPayload | null;
 }
 
 async function createMultiplicityWorkspace(input: {
@@ -296,6 +304,7 @@ async function createMultiplicityWorkspace(input: {
   metadata: Readonly<Record<string, JsonValue>>;
   withInitialAgent: boolean;
   agent?: CreateWorkspaceRequestOptions["agent"];
+  mainAgent?: CreateWorkspaceRequestOptions["mainAgent"];
   onEvent?: (snapshot: CreationSnapshot) => void;
   prompt: string;
   attachments: AgentAttachment[];
@@ -313,10 +322,22 @@ async function createMultiplicityWorkspace(input: {
     prompt: input.prompt,
     attachments: input.attachments,
   });
+  const acceptMainAgent = (snapshot: AgentSnapshotPayload | null | undefined) => {
+    if (snapshot) {
+      getHostRuntimeStore().acceptAgentSnapshot(
+        input.serverId,
+        normalizeAgentSnapshot(snapshot, input.serverId),
+      );
+    }
+  };
   const payload = await input.client.createWorkspace({
     idempotencyKey: input.idempotencyKey,
     agent: input.agent,
-    onEvent: input.onEvent,
+    ...(input.mainAgent ? { mainAgent: input.mainAgent } : {}),
+    onEvent: (snapshot) => {
+      acceptMainAgent(snapshot.mainAgent);
+      input.onEvent?.(snapshot);
+    },
     source: isWorktree
       ? {
           kind: "worktree",
@@ -344,21 +365,20 @@ async function createMultiplicityWorkspace(input: {
     ? { ...normalizedWorkspace, status: "running" as const, statusEnteredAt: new Date() }
     : normalizedWorkspace;
   input.mergeWorkspaces(input.serverId, [workspaceForInitialMerge]);
-  return { workspace: normalizedWorkspace, agent: payload.agent };
+  acceptMainAgent(payload.mainAgent);
+  return { workspace: normalizedWorkspace, agent: payload.agent, mainAgent: payload.mainAgent };
 }
+
+type EnsureWorkspace = (
+  input: EnsureNewWorkspaceRequest & Pick<CreateWorkspaceRequestOptions, "agent" | "onEvent">,
+) => Promise<WorkspaceCreationResult>;
 
 interface CreateChatAgentInput {
   payload: MessagePayload;
   composerState: ReturnType<typeof useAgentInputDraft>["composerState"];
   forkDraftSetup?: PendingWorkspaceDraftSetup | null;
-  ensureWorkspace: (input: {
-    cwd: string;
-    prompt: string;
-    attachments: AgentAttachment[];
-    withInitialAgent: boolean;
-    agent?: CreateWorkspaceRequestOptions["agent"];
-    onEvent?: (snapshot: CreationSnapshot) => void;
-  }) => Promise<WorkspaceCreationResult>;
+  ensureWorkspace: EnsureWorkspace;
+  createMainAgent: boolean;
   serverId: string;
   draftKey: string;
   clearDraft: (lifecycle: "sent" | "abandoned") => void;
@@ -370,6 +390,21 @@ interface CreateChatAgentInput {
   labels: {
     composerStateRequired: string;
     selectModel: string;
+  };
+}
+
+function buildWorkspaceAgentConfig(
+  cwd: string,
+  provider: AgentProvider,
+  composerState: NewWorkspaceComposerState | null,
+): NonNullable<CreateWorkspaceRequestOptions["mainAgent"]>["config"] {
+  return {
+    provider,
+    cwd,
+    modeId: composerState?.effectiveModeId || undefined,
+    model: composerState?.effectiveModelId || undefined,
+    thinkingOptionId: composerState?.effectiveThinkingOptionId || undefined,
+    providerOptions: composerState?.providerOptions,
   };
 }
 
@@ -393,19 +428,22 @@ function buildWorkspaceDraftSetupForCreatedWorkspace(input: {
   workspaceDirectory: string;
   provider: AgentProvider;
   composerState: NewWorkspaceComposerState;
+  mainAgentId?: string;
 }): WorkspaceDraftTabSetup | undefined {
-  if (!input.forkDraftSetup) {
-    return undefined;
-  }
-  return buildWorkspaceDraftSetupFromComposer({
-    cwd: remapDraftCwdToWorkspace({
-      cwd: input.forkDraftSetup.setup.cwd,
-      sourceDirectory: input.forkDraftSetup.sourceDirectory,
-      workspaceDirectory: input.workspaceDirectory,
-    }),
+  if (!input.forkDraftSetup && !input.mainAgentId) return undefined;
+  const cwd = input.forkDraftSetup
+    ? remapDraftCwdToWorkspace({
+        cwd: input.forkDraftSetup.setup.cwd,
+        sourceDirectory: input.forkDraftSetup.sourceDirectory,
+        workspaceDirectory: input.workspaceDirectory,
+      })
+    : input.workspaceDirectory;
+  const setup = buildWorkspaceDraftSetupFromComposer({
+    cwd,
     provider: input.provider,
     composerState: input.composerState,
   });
+  return input.mainAgentId ? { ...setup, parentAgentId: input.mainAgentId } : setup;
 }
 
 function buildComposerInitialValues(input: {
@@ -457,64 +495,70 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
   const images = await encodeImages(wirePayload.images);
   let navigated = false;
   let outcome: SubmitOutcome = "background";
+  const agentConfig = buildWorkspaceAgentConfig(cwd, provider, composerState);
   const initialAgent: NonNullable<CreateWorkspaceRequestOptions["agent"]> = {
-    config: {
-      provider,
-      cwd,
-      modeId: composerState.effectiveModeId || undefined,
-      model: composerState.effectiveModelId || undefined,
-      thinkingOptionId: composerState.effectiveThinkingOptionId || undefined,
-      providerOptions: composerState.providerOptions,
-    },
+    config: agentConfig,
     ...(Object.keys(composerState.metadata).length > 0 ? { metadata: composerState.metadata } : {}),
     initialPrompt: text,
     clientMessageId: `${input.draftId}:initial-message`,
     images: images?.length ? images : undefined,
     attachments: wirePayload.attachments?.length ? wirePayload.attachments : undefined,
   };
+  const openWorkspaceDraft = (
+    workspace: WorkspaceCreationResult["workspace"],
+    mainAgent?: WorkspaceCreationResult["mainAgent"],
+  ) => {
+    if (navigated || (input.createMainAgent && !mainAgent)) return;
+    navigated = true;
+    if (!input.isStillOnCreateScreen()) return;
+    const initialSetup = buildWorkspaceDraftSetupForCreatedWorkspace({
+      forkDraftSetup: input.forkDraftSetup,
+      workspaceDirectory: workspace.workspaceDirectory,
+      provider,
+      composerState,
+      mainAgentId: mainAgent?.id,
+    });
+    outcome = submitWorkspaceDraft({
+      clearConsumedDraft,
+      draftKey: input.draftKey,
+      draftContextScopeKey: input.draftContextScopeKey,
+      resolveClient: input.resolveClient,
+      isStillOnCreateScreen: input.isStillOnCreateScreen,
+      serverId,
+      clearDraft,
+      draftId: input.draftId,
+      initialSetup,
+      workspaceId: workspace.id,
+      workspaceDirectory: workspace.workspaceDirectory,
+      text,
+      attachments,
+      provider,
+      composerState,
+      supportsForgeSearch: input.supportsForgeSearch,
+      agentCreation,
+    });
+  };
   const execute = async (): Promise<AgentSnapshotPayload> => {
-    const { agent } = await ensureWorkspace({
+    const { workspace, agent, mainAgent } = await ensureWorkspace({
       cwd,
       prompt: text,
       attachments: workspaceNamingAttachments,
       withInitialAgent: true,
       agent: initialAgent,
+      ...(input.createMainAgent ? { mainAgent: { config: agentConfig } } : {}),
       onEvent: (snapshot) => {
-        if (!snapshot.workspace || navigated) return;
-        navigated = true;
-        if (!input.isStillOnCreateScreen()) return;
-        const workspace = normalizeWorkspaceDescriptor(snapshot.workspace);
+        if (!snapshot.workspace || navigated || (input.createMainAgent && !snapshot.mainAgent)) {
+          return;
+        }
+        const readyWorkspace = normalizeWorkspaceDescriptor(snapshot.workspace);
         getHostRuntimeStore().acceptWorkspaceSnapshots(serverId, [
-          { ...workspace, status: "running" },
+          { ...readyWorkspace, status: "running" },
         ]);
-        const initialSetup = buildWorkspaceDraftSetupForCreatedWorkspace({
-          forkDraftSetup: input.forkDraftSetup,
-          workspaceDirectory: workspace.workspaceDirectory,
-          provider,
-          composerState,
-        });
-        outcome = submitWorkspaceDraft({
-          clearConsumedDraft,
-          draftKey: input.draftKey,
-          draftContextScopeKey: input.draftContextScopeKey,
-          resolveClient: input.resolveClient,
-          isStillOnCreateScreen: input.isStillOnCreateScreen,
-          serverId,
-          clearDraft,
-          draftId: input.draftId,
-          initialSetup,
-          workspaceId: workspace.id,
-          workspaceDirectory: workspace.workspaceDirectory,
-          text,
-          attachments,
-          provider,
-          composerState,
-          supportsForgeSearch: input.supportsForgeSearch,
-          agentCreation,
-        });
+        openWorkspaceDraft(readyWorkspace, snapshot.mainAgent);
       },
     });
     if (!agent) throw new Error("Workspace creation returned no agent");
+    if (input.createMainAgent && mainAgent) openWorkspaceDraft(workspace, mainAgent);
     return agent;
   };
   // A retry after a failed agent start belongs to the ready workspace's draft, not to this creation.
@@ -888,6 +932,11 @@ export function NewWorkspaceScreen({
   // COMPAT(workspaceMultiplicity): added in v0.1.97, drop the gate when floor >= v0.1.97
   const supportsWorkspaceMultiplicity = useHostFeature(selectedServerId, "workspaceMultiplicity");
   const supportsForgeSearch = useHostFeature(selectedServerId, "forgeSearch");
+  // COMPAT(workspaceMainAgentDefault): added in v0.16.0, remove gate after 2027-05-20.
+  const supportsDefaultMainAgent = useHostFeature(selectedServerId, "workspaceMainAgentDefault");
+  const { settings: appSettings } = useAppSettings();
+  const { defaultWorkspaceMainAgent } = appSettings;
+  const createMainAgent = defaultWorkspaceMainAgent && supportsDefaultMainAgent;
   const [creationIdentity] = useState(() => ({
     draftId: draftId ?? generateDraftId(),
     worktreeSlug: createNameId(),
@@ -1223,15 +1272,8 @@ export function NewWorkspaceScreen({
     setProjectPickerOpen(nextOpen);
   }, []);
 
-  const ensureWorkspace = useCallback(
-    async (input: {
-      cwd: string;
-      prompt: string;
-      attachments: AgentAttachment[];
-      withInitialAgent: boolean;
-      agent?: CreateWorkspaceRequestOptions["agent"];
-      onEvent?: (snapshot: CreationSnapshot) => void;
-    }) => {
+  const ensureWorkspace = useCallback<EnsureWorkspace>(
+    async (input) => {
       if (creationResult.workspace) {
         return creationResult;
       }
@@ -1256,6 +1298,18 @@ export function NewWorkspaceScreen({
             selectedItem ?? defaultBasePickerItem(checkoutStatusForCreate),
           )
         : undefined;
+      let mainAgent = input.mainAgent;
+      if (createMainAgent && !input.withInitialAgent) {
+        const selectedProvider = composerState?.selectedProvider ?? null;
+        const provider = resolveEmptyWorkspaceMainProvider({
+          selectedProvider,
+          preferredProvider: formPreferences.provider,
+          entries: composerState?.allProviderEntries ?? [],
+        });
+        if (!provider) throw new Error(t("newWorkspace.errors.selectModel"));
+        const matchingComposer = provider === selectedProvider ? composerState : null;
+        mainAgent = { config: buildWorkspaceAgentConfig(input.cwd, provider, matchingComposer) };
+      }
       const normalizedWorkspace = await createMultiplicityWorkspace({
         idempotencyKey: creationIdentity.draftId,
         worktreeSlug: creationIdentity.worktreeSlug,
@@ -1270,6 +1324,7 @@ export function NewWorkspaceScreen({
         prompt: input.prompt,
         attachments: input.attachments,
         agent: input.agent,
+        mainAgent,
         onEvent: input.onEvent,
         mergeWorkspaces,
         serverId: selectedServerId,
@@ -1281,7 +1336,10 @@ export function NewWorkspaceScreen({
     [
       creationIdentity,
       creationResult,
+      composerState,
+      createMainAgent,
       effectiveIsolation,
+      formPreferences.provider,
       mergeWorkspaces,
       queryClient,
       selectedItem,
@@ -1306,15 +1364,19 @@ export function NewWorkspaceScreen({
           let outcome: SubmitOutcome = "background";
           await runCreateEmptyWorkspace({
             payload,
-            ensureWorkspace: async (request) => (await ensureWorkspace(request)).workspace,
+            ensureWorkspace,
             serverId: selectedServerId,
-            navigate: (targetServerId, workspaceId) => {
+            navigate: (targetServerId, workspaceId, mainAgentId) => {
               if (!isStillOnCreateScreen()) {
                 return;
               }
               outcome = "navigated";
               leaveFullscreen();
-              navigateToWorkspace({ serverId: targetServerId, workspaceId });
+              navigateToWorkspace({
+                serverId: targetServerId,
+                workspaceId,
+                ...(mainAgentId ? { target: { kind: "agent", agentId: mainAgentId } } : {}),
+              });
             },
           });
           // Nothing navigated, so this screen may still be mounted under another route. Release
@@ -1331,6 +1393,7 @@ export function NewWorkspaceScreen({
           composerState,
           forkDraftSetup,
           ensureWorkspace,
+          createMainAgent,
           serverId: selectedServerId,
           clearDraft: chatDraft.clear,
           draftKey,
@@ -1356,6 +1419,7 @@ export function NewWorkspaceScreen({
     },
     [
       composerState,
+      createMainAgent,
       draftContextScopeKey,
       creationIdentity,
       chatDraft.clear,

@@ -1,11 +1,12 @@
+import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import {
   getParentAddressFromLabels,
   getParentAgentIdFromLabels,
+  hasOpenAgentTab,
   isMainControlAgent,
   resolveAgentHierarchyDepth,
 } from "@getpaseo/protocol/agent-labels";
 import type { Agent } from "@/stores/session-store";
-import type { AgentAddress } from "@getpaseo/protocol/addresses";
 
 type TreeAgent = Pick<
   Agent,
@@ -19,7 +20,8 @@ type TreeAgent = Pick<
   | "createdAt"
   | "archivedAt"
   | "background"
->;
+> &
+  Partial<Pick<Agent, "lastActivityAt" | "updatedAt">>;
 
 export interface MainControlSession {
   serverId: string;
@@ -29,8 +31,15 @@ export interface MainControlSession {
 export interface MainControlTreeNode extends AgentAddress {
   depth: 0 | 1 | 2;
   title: string;
-  processState: "active" | "terminated";
-  children: MainControlTreeNode[];
+  processState: "running" | "idle" | "closed";
+  roleBadge?: "main" | "standalone";
+  isArchived: boolean;
+  lastActivityAt: Date;
+}
+
+export interface MainControlWorkspaceSections {
+  active: MainControlTreeNode[];
+  closed: MainControlTreeNode[];
 }
 
 export function mainControlTreeNodeKey({ serverId, agentId }: AgentAddress): string {
@@ -55,86 +64,196 @@ function indexChildren(session: MainControlSession, include: (agent: TreeAgent) 
   return children;
 }
 
-export function selectMainControlTree({
+interface LocatedAgent extends AgentAddress {
+  agent: TreeAgent;
+}
+
+interface WorkspaceAddress {
+  serverId: string;
+  workspaceId: string;
+}
+
+function belongsToWorkspace(entry: LocatedAgent, workspace: WorkspaceAddress): boolean {
+  return entry.serverId === workspace.serverId && entry.agent.workspaceId === workspace.workspaceId;
+}
+
+function lastActivity(agent: TreeAgent): Date {
+  return agent.lastActivityAt ?? agent.updatedAt ?? agent.archivedAt ?? agent.createdAt;
+}
+
+function collectDirectoryEntries({
+  agentMaps,
+  archivedAgents,
+  workspaceAddress,
+}: {
+  agentMaps: Readonly<Record<string, MainControlSession["agents"]>>;
+  archivedAgents?: Iterable<TreeAgent>;
+  workspaceAddress: WorkspaceAddress;
+}): LocatedAgent[] {
+  const byAddress = new Map<string, LocatedAgent>();
+  for (const agent of archivedAgents ?? []) {
+    const entry = { serverId: workspaceAddress.serverId, agentId: agent.id, agent };
+    if (!agent.archivedAt || agent.background || !belongsToWorkspace(entry, workspaceAddress))
+      continue;
+    const key = mainControlTreeNodeKey(entry);
+    byAddress.set(key, entry);
+  }
+  for (const [serverId, agents] of Object.entries(agentMaps)) {
+    for (const agent of agents.values()) {
+      const entry = { serverId, agentId: agent.id, agent };
+      const key = mainControlTreeNodeKey(entry);
+      const archived = byAddress.get(key);
+      // The directory owns lifecycle state; history can supply newer metadata for an archive.
+      if (
+        !agent.archivedAt ||
+        agent.background ||
+        !archived ||
+        !belongsToWorkspace(entry, workspaceAddress) ||
+        lastActivity(agent) >= lastActivity(archived.agent)
+      ) {
+        byAddress.set(key, entry);
+      }
+    }
+  }
+  return [...byAddress.values()].sort(
+    (a, b) => a.agent.createdAt.getTime() - b.agent.createdAt.getTime(),
+  );
+}
+
+function indexLocatedChildren(entries: LocatedAgent[]): Map<string, LocatedAgent[]> {
+  const childrenByParent = new Map<string, LocatedAgent[]>();
+  for (const entry of entries) {
+    const parent = getParentAddressFromLabels(entry.agent.labels, entry.serverId);
+    if (!parent) continue;
+    const key = mainControlTreeNodeKey(parent);
+    const siblings = childrenByParent.get(key);
+    if (siblings) siblings.push(entry);
+    else childrenByParent.set(key, [entry]);
+  }
+  return childrenByParent;
+}
+
+function resolveProcessState(
+  entry: LocatedAgent,
+  {
+    isMain,
+    openTabAgentIds,
+    workspaceAddress,
+  }: {
+    isMain: boolean;
+    openTabAgentIds: ReadonlySet<string>;
+    workspaceAddress: WorkspaceAddress;
+  },
+): MainControlTreeNode["processState"] {
+  const { agent, agentId, serverId } = entry;
+  if (agent.archivedAt) return "closed";
+  if (
+    agent.turn.phase === "open" ||
+    agent.status === "running" ||
+    agent.status === "initializing" ||
+    (agent.backgroundWork?.count ?? 0) > 0
+  ) {
+    return "running";
+  }
+  if (isMain) return "idle";
+  if (serverId === workspaceAddress.serverId && openTabAgentIds.has(agentId)) return "idle";
+  if (belongsToWorkspace(entry, workspaceAddress)) {
+    // Presence in this workspace's layout is authoritative for closing its idle tabs.
+    return "closed";
+  }
+  // For descendants owned elsewhere, the daemon labels report open tabs.
+  return hasOpenAgentTab(agent.labels) ? "idle" : "closed";
+}
+
+export function selectMainControlWorkspaceSections({
   session,
   agentMaps = {},
+  archivedAgents,
   mainAgentId,
+  workspaceId,
   fallbackTitle,
+  openTabAgentIds,
   pendingArchiveIds,
 }: {
   session: MainControlSession | undefined;
   agentMaps?: Readonly<Record<string, MainControlSession["agents"]>>;
+  archivedAgents?: Iterable<TreeAgent>;
   mainAgentId: string;
+  workspaceId: string;
   fallbackTitle: string;
+  openTabAgentIds: ReadonlySet<string>;
   pendingArchiveIds?: ReadonlySet<string>;
-}): MainControlTreeNode | null {
+}): MainControlWorkspaceSections | null {
   const main = session?.agents.get(mainAgentId);
-  if (!session || !main || !isMainControlAgent(main) || getParentAgentIdFromLabels(main.labels)) {
+  if (!session || !isWorkspaceRootAgent(main, workspaceId) || !isMainControlAgent(main)) {
     return null;
   }
 
-  interface LocatedAgent {
-    serverId: string;
-    agent: TreeAgent;
-  }
-  const childrenByParent = new Map<string, LocatedAgent[]>();
-  for (const [serverId, agents] of Object.entries({
-    ...agentMaps,
-    [session.serverId]: session.agents,
-  })) {
-    for (const agent of agents.values()) {
-      const parent = getParentAddressFromLabels(agent.labels, serverId);
-      if (
-        !parent ||
-        agent.archivedAt ||
-        agent.background ||
-        pendingArchiveIds?.has(mainControlTreeNodeKey({ serverId, agentId: agent.id }))
-      )
-        continue;
-      const key = mainControlTreeNodeKey(parent);
-      const child = { serverId, agent };
-      const siblings = childrenByParent.get(key);
-      if (siblings) siblings.push(child);
-      else childrenByParent.set(key, [child]);
-    }
-  }
+  const workspaceAddress = { serverId: session.serverId, workspaceId };
+  const mainEntry = { serverId: session.serverId, agentId: main.id, agent: main };
+  const mainKey = mainControlTreeNodeKey(mainEntry);
+  const entries = collectDirectoryEntries({
+    agentMaps: { ...agentMaps, [session.serverId]: session.agents },
+    archivedAgents,
+    workspaceAddress,
+  });
+  const childrenByParent = indexLocatedChildren(entries);
+  const active: MainControlTreeNode[] = [];
+  const closed: MainControlTreeNode[] = [];
   const visited = new Set<string>();
-  const build = (
-    { agent, serverId }: LocatedAgent,
-    depth: MainControlTreeNode["depth"],
-  ): MainControlTreeNode => {
-    const key = mainControlTreeNodeKey({ serverId, agentId: agent.id });
+  function add(entry: LocatedAgent, depth: MainControlTreeNode["depth"]) {
+    const { agent, agentId, serverId } = entry;
+    const key = mainControlTreeNodeKey(entry);
+    if (visited.has(key)) return;
     visited.add(key);
-    const children =
-      depth === 2
-        ? []
-        : (childrenByParent.get(key) ?? []).filter(
-            (child) =>
-              !visited.has(
-                mainControlTreeNodeKey({
-                  serverId: child.serverId,
-                  agentId: child.agent.id,
-                }),
-              ),
-          );
-    const active =
-      !agent.archivedAt &&
-      (agent.turn.phase === "open" ||
-        agent.status === "running" ||
-        agent.status === "initializing" ||
-        (agent.backgroundWork?.count ?? 0) > 0);
-    return {
-      agentId: agent.id,
+    const isArchived = Boolean(agent.archivedAt);
+    if (
+      agent.background ||
+      (isArchived && !belongsToWorkspace(entry, workspaceAddress)) ||
+      (!isArchived && pendingArchiveIds?.has(key))
+    )
+      return;
+
+    const isMain = key === mainKey;
+    const processState = resolveProcessState(entry, {
+      isMain,
+      openTabAgentIds,
+      workspaceAddress,
+    });
+    const isStandalone = !getParentAgentIdFromLabels(agent.labels) && !isMain;
+    const roleBadge = isStandalone ? "standalone" : undefined;
+    const isActive = processState !== "closed";
+    (isActive ? active : closed).push({
+      agentId,
       serverId,
       depth,
       title: agent.title?.trim() || fallbackTitle,
-      processState: active ? "active" : "terminated",
-      children: children
-        .sort((a, b) => a.agent.createdAt.getTime() - b.agent.createdAt.getTime())
-        .map((child) => build(child, depth === 0 ? 1 : 2)),
-    };
-  };
-  return build({ agent: main, serverId: session.serverId }, 0);
+      processState,
+      roleBadge: isMain ? "main" : roleBadge,
+      isArchived,
+      lastActivityAt: lastActivity(agent),
+    });
+  }
+
+  const pending: { entry: LocatedAgent; depth: MainControlTreeNode["depth"] }[] = [
+    { entry: mainEntry, depth: 0 },
+  ];
+  while (pending.length > 0) {
+    const node = pending.pop();
+    if (!node || visited.has(mainControlTreeNodeKey(node.entry))) continue;
+    add(node.entry, node.depth);
+    const children = childrenByParent.get(mainControlTreeNodeKey(node.entry));
+    if (!children) continue;
+    const depth = node.depth === 0 ? 1 : 2;
+    for (let i = children.length - 1; i >= 0; i--) {
+      pending.push({ entry: children[i], depth });
+    }
+  }
+  for (const entry of entries) {
+    if (belongsToWorkspace(entry, workspaceAddress)) add(entry, 0);
+  }
+  closed.sort((a, b) => b.lastActivityAt.getTime() - a.lastActivityAt.getTime());
+  return { active, closed };
 }
 
 export function isWorkspaceRootAgent(

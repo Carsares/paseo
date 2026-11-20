@@ -664,12 +664,10 @@ export class VoiceAssistantWebSocketServer {
           code: "directory_not_found",
         });
     }
-    if (
-      snapshot.agentId &&
-      !this.agentManager.getAgent(snapshot.agentId) &&
-      !(await this.agentStorage.get(snapshot.agentId))
-    ) {
-      throw new Error("Previously created agent no longer exists");
+    for (const id of [snapshot.agentId, snapshot.mainAgent?.id]) {
+      if (id && !this.agentManager.getAgent(id) && !(await this.agentStorage.get(id))) {
+        throw new Error("Previously created agent no longer exists");
+      }
     }
   }
 
@@ -2131,6 +2129,9 @@ export class VoiceAssistantWebSocketServer {
         ownedSubscriptions: true,
         // COMPAT(agentHierarchyControl): added in v0.16.0, remove gate after 2027-05-19.
         agentHierarchyControl: true,
+        workspaceMainAgentDefault: true,
+        workspaceAgentsSummary: true,
+        agentHistoryWorkspaceFilter: true,
         // COMPAT(agentInitialPromptOrigin): added in v0.16.0, remove gate after 2027-05-19.
         agentInitialPromptOrigin: true,
         providerOptionControls: true,

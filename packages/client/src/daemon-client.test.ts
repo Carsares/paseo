@@ -459,6 +459,27 @@ test.each([false, true])(
   },
 );
 
+test("rejects workspace summary and filtered history before sending to older hosts", async () => {
+  const transport = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "workspace-summary-old-host",
+    transportFactory: () => transport.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  transport.triggerOpen({ features: {} });
+  await connecting;
+  await expect(client.summarizeWorkspaceAgents({ workspaceId: "workspace" })).rejects.toThrow(
+    "Update the host to summarize workspace sessions.",
+  );
+  await expect(client.fetchAgentHistory({ filter: { workspaceIds: [] } })).rejects.toThrow(
+    "Update the host to filter agent history by workspace.",
+  );
+  expect(transport.sent).toEqual([]);
+});
+
 test.each(["agent", "workspace"] as const)(
   "a lost legacy %s response is not automatically replayed on reconnect",
   async (kind) => {

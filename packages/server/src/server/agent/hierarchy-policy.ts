@@ -15,6 +15,19 @@ import { OpenCodeProviderOptionsSchema } from "./providers/opencode/options.js";
 
 export const MAX_SUBAGENT_DEPTH = 2;
 export const MAIN_CONTROL_WRITE_DENIAL = "Main Control agents are read-only.";
+export const MAIN_CONTROL_PROMPT_HEADER = "[Workspace Main Control Instructions]";
+
+export function mainControlPromptEnd(agentId: string): string {
+  return `\n[/Workspace Main Control Instructions: ${agentId}]`;
+}
+
+export function stripMainControlPromptHeader(text: string, agentId: string): string {
+  if (!text.startsWith(MAIN_CONTROL_PROMPT_HEADER + "\n")) return text;
+  const delimiter = mainControlPromptEnd(agentId);
+  const end = text.indexOf(delimiter);
+  if (end === -1) return text;
+  return text.slice(end + delimiter.length).replace(/^\n\n/, "");
+}
 /** Absolute depth supplied by the parent host when it creates a remote child. */
 export const REMOTE_HIERARCHY_DEPTH_LABEL = "paseo.remote-hierarchy-depth";
 export const RESERVED_HIERARCHY_LABELS = [
@@ -328,7 +341,13 @@ export function applyMainControlReadOnlyConfig(
 export function isMainControlWritePermissionBlocked(
   request: Pick<AgentPermissionRequest, "kind" | "name" | "detail">,
 ): boolean {
-  if (request.detail?.type === "edit" || request.detail?.type === "write") return true;
+  if (
+    request.detail?.type === "edit" ||
+    request.detail?.type === "write" ||
+    request.detail?.type === "shell"
+  ) {
+    return true;
+  }
   if (request.kind !== "tool") return false;
   const name = request.name
     .replace(/([a-z])([A-Z])/g, "$1_$2")
@@ -360,6 +379,7 @@ export function buildHierarchyAppendSystemPrompt({
       "Break workspace goals into module tasks and delegate them to Level-1 Sub-Agents with create_agent.",
       "Coordinate cross-module changes and pacing through direct children with send_agent_prompt and update_agent. Route Level-2 work through its Level-1 lead.",
       "Summarize reports from your children for the user.",
+      "Use summarize_workspace_agents to review active and closed workspace sessions, tasks, and touched files. Cross-check uncommitted changes with read-only git status and git diff when summarizing workspace state.",
     ];
     childRole = "Level-1";
   } else if (

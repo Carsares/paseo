@@ -188,7 +188,131 @@ function createHandoff(agentOverrides: Partial<NonNullable<ReturnType<Deps["getA
   };
 }
 
+function createMainControlClient(lateChildId?: string) {
+  const entry = (id: string, workspaceId = "workspace-1", archivedAt?: string) => ({
+    agent: {
+      id,
+      workspaceId,
+      archivedAt,
+      labels: parentAddressLabels({ serverId: "host-1", agentId: "agent-1" }),
+    },
+  });
+  return {
+    fetchAgentHistory: vi
+      .fn<NonNullable<Deps["mainControlClient"]>["fetchAgentHistory"]>()
+      .mockResolvedValueOnce({
+        entries: [entry("child-open"), entry("another-workspace", "workspace-2")],
+        pageInfo: { nextCursor: "page-2", hasMore: true },
+      } as Awaited<ReturnType<NonNullable<Deps["mainControlClient"]>["fetchAgentHistory"]>>)
+      .mockResolvedValueOnce({
+        entries: [entry("child-closed"), entry("child-archived", "workspace-1", "yesterday")],
+        pageInfo: { nextCursor: null, hasMore: false },
+      } as Awaited<ReturnType<NonNullable<Deps["mainControlClient"]>["fetchAgentHistory"]>>)
+      .mockResolvedValueOnce({
+        entries: lateChildId ? [entry(lateChildId)] : [],
+        pageInfo: { nextCursor: null, hasMore: false },
+      } as Awaited<ReturnType<NonNullable<Deps["mainControlClient"]>["fetchAgentHistory"]>>)
+      .mockResolvedValue({
+        requestId: "fetch-latest",
+        entries: [],
+        pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+      }),
+    createAgent: vi
+      .fn<NonNullable<Deps["mainControlClient"]>["createAgent"]>()
+      .mockResolvedValue({ id: "replacement" } as Awaited<
+        ReturnType<NonNullable<Deps["mainControlClient"]>["createAgent"]>
+      >),
+    setAgentMainControl: vi.fn(async () => ({ enabled: true, workspaceId: "workspace-1" })),
+    setAgentParent: vi.fn(async (_id: string, parentAgentId: string) => ({ parentAgentId })),
+  };
+}
+
 describe("performCrossProviderAgentHandoff", () => {
+  it("moves same-workspace direct children, including closed tabs, before archiving Main Control", async () => {
+    const { deps, run, paneContext, draftStore, storedDraft } = createHandoff({
+      labels: mainControlLabels,
+    });
+    const mainControlClient = createMainControlClient();
+
+    expect(await run({ mainControlClient }, { provider: "pi" })).toBe(true);
+
+    expect(mainControlClient.fetchAgentHistory).toHaveBeenCalledTimes(3);
+    expect(mainControlClient.setAgentParent.mock.calls).toEqual([
+      ["child-open", "replacement"],
+      ["child-closed", "replacement"],
+    ]);
+    expect(mainControlClient.setAgentMainControl).toHaveBeenCalledWith("replacement", true);
+    expect(mainControlClient.setAgentMainControl).toHaveBeenCalledBefore(
+      mainControlClient.setAgentParent,
+    );
+    expect(mainControlClient.setAgentParent).toHaveBeenCalledBefore(deps.archiveAgent);
+    expect(mainControlClient.setAgentMainControl).toHaveBeenCalledBefore(deps.archiveAgent);
+    expect(paneContext.retargetCurrentTab).toHaveBeenCalledWith({
+      kind: "agent",
+      agentId: "replacement",
+    });
+    expect(draftStore.saveDraftInput).toHaveBeenCalledWith({
+      draftKey: "agent:host-1:replacement",
+      draft: {
+        text: "  Continue here.  ",
+        attachments: [
+          ...storedDraft.attachments,
+          {
+            kind: "quote",
+            id: "chat_history:draft-1",
+            text: forkPayload.attachment?.text,
+          },
+        ],
+      },
+    });
+  });
+
+  it("keeps the old Main Control and restores moved children if a child cannot be moved", async () => {
+    const { deps, run, expectSourceUntouched } = createHandoff({ labels: mainControlLabels });
+    const mainControlClient = createMainControlClient();
+    mainControlClient.setAgentParent.mockImplementation(async (id, parentAgentId) => {
+      if (id === "child-closed" && parentAgentId === "replacement") {
+        throw new Error("Cannot move child");
+      }
+      return { parentAgentId };
+    });
+
+    expect(await run({ mainControlClient })).toBe(false);
+    expect(mainControlClient.setAgentParent).toHaveBeenCalledWith("child-open", "agent-1");
+    expect(mainControlClient.setAgentMainControl.mock.calls).toEqual([
+      ["replacement", true],
+      ["agent-1", true],
+    ]);
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expectSourceUntouched();
+  });
+
+  it("restores the original role when the promotion reply is lost", async () => {
+    const { deps, run, expectSourceUntouched } = createHandoff({ labels: mainControlLabels });
+    const mainControlClient = createMainControlClient();
+    mainControlClient.setAgentMainControl.mockRejectedValueOnce(
+      new DaemonConnectionError("Promotion reply timed out", "DAEMON_REQUEST_TIMEOUT"),
+    );
+
+    expect(await run({ mainControlClient })).toBe(false);
+    expect(mainControlClient.setAgentMainControl.mock.calls).toEqual([
+      ["replacement", true],
+      ["agent-1", true],
+    ]);
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expectSourceUntouched();
+  });
+
+  it("moves a child that joined during the first history scan before archiving", async () => {
+    const { deps, run } = createHandoff({ labels: mainControlLabels });
+    const mainControlClient = createMainControlClient("late-child");
+
+    expect(await run({ mainControlClient })).toBe(true);
+    expect(mainControlClient.setAgentParent).toHaveBeenLastCalledWith("late-child", "replacement");
+    expect(mainControlClient.setAgentParent).toHaveBeenCalledBefore(deps.archiveAgent);
+    expect(mainControlClient.fetchAgentHistory).toHaveBeenCalledTimes(4);
+  });
+
   it("moves the live prompt and full chat history to a new draft in the current tab", async () => {
     const {
       client,
@@ -924,5 +1048,12 @@ describe("canSwitchAgentProvider", () => {
       canSwitchAgentProvider({ ...input, paneContext: { ...paneContext, workspaceId: "   " } }),
     ).toBe(false);
     expect(canSwitchAgentProvider({ ...input, agent: { labels: mainControlLabels } })).toBe(false);
+    expect(
+      canSwitchAgentProvider({
+        ...input,
+        supportsAgentHierarchyControl: true,
+        agent: { labels: mainControlLabels },
+      }),
+    ).toBe(true);
   });
 });

@@ -18,8 +18,13 @@ export const SUPPORTING_LAUNCH_ORDER = [
   "pullRequest",
 ] as const;
 
-export type BuiltInLaunchItemId = (typeof PRIMARY_LAUNCH_ORDER)[number];
+export type BuiltInLaunchItemId = (typeof PRIMARY_LAUNCH_ORDER)[number] | "standalone-agent";
 
-export function getBuiltInLaunchOrder(purpose: "primary" | "supporting") {
-  return purpose === "supporting" ? SUPPORTING_LAUNCH_ORDER : PRIMARY_LAUNCH_ORDER;
+export function getBuiltInLaunchOrder(
+  purpose: "primary" | "supporting",
+  showStandaloneAgent = false,
+): readonly BuiltInLaunchItemId[] {
+  const order = purpose === "supporting" ? SUPPORTING_LAUNCH_ORDER : PRIMARY_LAUNCH_ORDER;
+  if (!showStandaloneAgent) return order;
+  return order.flatMap((id) => (id === "agent" ? [id, "standalone-agent"] : [id]));
 }

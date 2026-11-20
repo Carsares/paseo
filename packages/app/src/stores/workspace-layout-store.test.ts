@@ -4647,6 +4647,36 @@ describe("compact workspace sheet", () => {
     expect(topSheet(store)).toBeUndefined();
     expect(tabKinds(store)).toContain("agent");
   });
+
+  it("keeps an archived conversation opened directly as a compact tab on reconciliation", () => {
+    const store = createCompactStore();
+    store.getState().deferOpenTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "archived" },
+      intent: "reveal",
+      pin: true,
+      asTab: true,
+    });
+    store.getState().consumePendingOpen(workspaceKey);
+    store.getState().reconcileTabs(workspaceKey, {
+      agentsHydrated: true,
+      terminalsHydrated: false,
+      activeAgentIds: [],
+      autoOpenAgentIds: [],
+      standaloneTerminalIds: [],
+    });
+
+    expect(topSheet(store)).toBeUndefined();
+    expect(store.getState().pinnedAgentIdsByWorkspace[workspaceKey]).toEqual(new Set(["archived"]));
+    expect(
+      store
+        .getState()
+        .getWorkspaceTabs(workspaceKey)
+        .map((tab) => tab.target)
+        .filter((target) => target.kind === "agent"),
+    ).toEqual([{ kind: "agent", agentId: "archived" }]);
+  });
+
   it("reveals a file in the sheet and leaves the tab strip unchanged", () => {
     const store = createCompactStore();
     const before = tabKinds(store);
@@ -5168,6 +5198,37 @@ describe("compact workspace sheet", () => {
     });
 
     expect(sheetTargets(store)).toEqual([fileTarget, nextTarget]);
+  });
+
+  it("retains a compact agent sheet while its archived conversation is pinned", () => {
+    seedAgents([
+      { id: "root", parentAgentId: null, workspaceId: "sheet-ws" },
+      { id: "child", parentAgentId: "root", workspaceId: "sheet-ws" },
+    ]);
+    const store = createCompactStore();
+    const sheetTabId = store.getState().openTab({
+      workspaceKey,
+      target: { kind: "agent", agentId: "child" },
+      intent: "reveal",
+    });
+    expect(topSheet(store)?.tab.tabId).toBe(sheetTabId);
+    store.setState({ pinnedAgentIdsByWorkspace: { [workspaceKey]: new Set(["child"]) } });
+    seedAgents([{ id: "root", parentAgentId: null, workspaceId: "sheet-ws" }]);
+    const snapshot = {
+      agentsHydrated: true,
+      terminalsHydrated: false,
+      activeAgentIds: ["root"],
+      autoOpenAgentIds: [],
+      knownTerminalIds: ["term-1"],
+      standaloneTerminalIds: ["term-1"],
+    };
+
+    store.getState().reconcileTabs(workspaceKey, snapshot);
+    expect(topSheet(store)?.tab.tabId).toBe(sheetTabId);
+
+    store.getState().unpinAgent(workspaceKey, "child");
+    store.getState().reconcileTabs(workspaceKey, snapshot);
+    expect(topSheet(store)).toBeUndefined();
   });
 
   it("closes the sheet when its agent stops being a subagent, leaving one tab for it", () => {

@@ -78,6 +78,8 @@ import {
   toAgentPersistenceHandle,
 } from "./persistence-hooks.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
+import { summarizeWorkspaceAgents } from "./agent/workspace-agents-summary.js";
+import { resolveClientMessageId } from "./client-message-id.js";
 import {
   sendPromptToAgent,
   waitForAgentRunStartWithTimeout,
@@ -473,6 +475,7 @@ type AgentUpdatesFilter = FetchAgentsRequestFilter;
 function agentDirectoryArchiveOptions(request: AgentDirectoryRequestMessage): {
   archiveScope: AgentHistoryArchiveScope;
   filter: AgentUpdatesFilter | undefined;
+  workspaceIds?: string[];
 } {
   if (request.type !== "fetch_agent_history_request") {
     return { archiveScope: "all", filter: request.filter };
@@ -482,7 +485,7 @@ function agentDirectoryArchiveOptions(request: AgentDirectoryRequestMessage): {
     archiveScope === "all" && request.filter?.includeArchived !== undefined
       ? request.filter
       : { ...request.filter, includeArchived: archiveScope !== "active" };
-  return { archiveScope, filter };
+  return { archiveScope, filter, workspaceIds: request.filter?.workspaceIds };
 }
 
 type CreateAgentRequestMessage = Extract<SessionInboundMessage, { type: "create_agent_request" }>;
@@ -3305,6 +3308,8 @@ export class Session {
         return this.handleCreationSubscription(msg, source);
       case "workspace.create.request":
         return this.handleWorkspaceCreation(msg, source);
+      case "workspace.agents.summary.request":
+        return this.handleWorkspaceAgentsSummary(msg, source);
       default:
         return undefined;
     }
@@ -5341,6 +5346,16 @@ export class Session {
       : undefined;
     try {
       if (
+        request.mainAgent &&
+        (!this.authorization.allowsPermission("workspace.write") ||
+          !this.authorization.allowsPermission("workspace.manage"))
+      ) {
+        throw new SessionRequestError(
+          "access_denied",
+          "Creating a Main Session requires workspace.write and workspace.manage.",
+        );
+      }
+      if (
         request.agent &&
         !this.authorization.allowsPermission("workspace.write") &&
         !this.authorization.allowsPermission("hub.execute")
@@ -5348,6 +5363,22 @@ export class Session {
         throw new Error("Session is not authorized to create an agent");
       }
       const agentInput = request.agent;
+      const mainAgentInput = request.mainAgent;
+      const resolveAgentCwd = async (
+        config: AgentSessionConfig,
+        workspace: WorkspaceDescriptorPayload | undefined,
+      ): Promise<AgentSessionConfig> => {
+        if (!workspace?.workspaceDirectory) throw new Error("Created workspace has no directory");
+        const sourceCwd =
+          request.source.kind === "directory"
+            ? request.source.path
+            : await resolveWorktreeSourceCwd(request.source, this.projectRegistry);
+        const relativeCwd = relative(resolve(sourceCwd), resolve(config.cwd));
+        if (relativeCwd === ".." || relativeCwd.startsWith(".." + sep) || isAbsolute(relativeCwd)) {
+          throw new Error("Agent directory must be inside the workspace source");
+        }
+        return { ...config, cwd: resolve(workspace.workspaceDirectory, relativeCwd) };
+      };
       const creation = await this.creationService.create(
         {
           kind: "workspace",
@@ -5376,34 +5407,39 @@ export class Session {
                 : undefined,
             };
           },
+          createMainAgent: mainAgentInput
+            ? async (workspace, agentId) => {
+                const config = await resolveAgentCwd(mainAgentInput.config, workspace);
+                const record = await this.agentManager.createSilentWorkspaceMainAgent({
+                  agentId,
+                  config: { ...mainAgentInput.config, cwd: config.cwd },
+                  workspaceId: workspace.id,
+                  background: (await this.workspaceRegistry.get(workspace.id))?.background,
+                });
+                return this.buildStoredAgentPayload(record);
+              }
+            : undefined,
           createAgent: agentInput
-            ? async (id, workspace, onReady) => {
-                if (!workspace?.workspaceDirectory)
-                  throw new Error("Created workspace has no directory");
-                const sourceCwd =
-                  request.source.kind === "directory"
-                    ? request.source.path
-                    : await resolveWorktreeSourceCwd(request.source, this.projectRegistry);
-                const relativeCwd = relative(resolve(sourceCwd), resolve(agentInput.config.cwd));
-                if (
-                  relativeCwd === ".." ||
-                  relativeCwd.startsWith(`..${sep}`) ||
-                  isAbsolute(relativeCwd)
-                )
-                  throw new Error("Agent directory must be inside the workspace source");
+            ? async (id, workspace, onReady, mainAgent) => {
+                if (!workspace) throw new Error("Created workspace has no directory");
                 return this.createSessionAgent(
                   {
                     ...agentInput,
                     type: "create_agent_request",
                     requestId,
-                    config: {
-                      ...agentInput.config,
-                      cwd: resolve(workspace.workspaceDirectory, relativeCwd),
-                    },
+                    config: await resolveAgentCwd(agentInput.config, workspace),
                     workspaceId: workspace.id,
+                    ...(mainAgent
+                      ? {
+                          callerAgentId: mainAgent.id,
+                          initialPromptOrigin: "user",
+                          clientMessageId: resolveClientMessageId(agentInput.clientMessageId),
+                        }
+                      : {}),
                   },
                   id,
                   onReady,
+                  mainAgent ? { notifyParentOnInitialPrompt: false } : undefined,
                 );
               }
             : undefined,
@@ -5417,6 +5453,7 @@ export class Session {
             requestId,
             workspace: creation.workspace ?? null,
             agent: creation.agent,
+            mainAgent: creation.mainAgent,
             creation,
             setupSkippedReason: creation.setupSkippedReason,
             error: creation.error,
@@ -5516,6 +5553,7 @@ export class Session {
     msg: CreateAgentRequestMessage,
     agentId?: string,
     onAgentReady?: (agent: AgentSnapshotPayload) => Promise<void>,
+    options?: { notifyParentOnInitialPrompt?: boolean },
   ): Promise<CreatedAgent> {
     const {
       config,
@@ -5586,6 +5624,7 @@ export class Session {
         {
           kind: "session",
           callerAgentId: msg.callerAgentId,
+          notifyParentOnInitialPrompt: options?.notifyParentOnInitialPrompt,
           onAgentReady: async (agent) => {
             createdAgentId = agent.id;
             await onAgentReady?.(await this.buildAgentPayload(agent));
@@ -6788,7 +6827,7 @@ export class Session {
     pageInfo: FetchAgentsResponsePageInfo;
     searchTruncated?: boolean;
   }> {
-    const { archiveScope, filter } = agentDirectoryArchiveOptions(request);
+    const { archiveScope, filter, workspaceIds } = agentDirectoryArchiveOptions(request);
     const isHistory = request.type === "fetch_agent_history_request";
     const scope = request.type === "fetch_agents_request" ? request.scope : undefined;
     const sort = pager.normalizeSort(requestedSort);
@@ -6798,6 +6837,7 @@ export class Session {
       includeArchived: filter?.includeArchived,
       includeBackground: backgroundVisibility,
       includeUnavailablePersisted: isHistory,
+      workspaceIds,
     });
     const activePlacementsByWorkspaceId =
       scope === "active" ? await this.buildActiveProjectPlacementsByWorkspaceId() : null;
@@ -7712,6 +7752,44 @@ export class Session {
           code,
         },
       });
+    }
+  }
+
+  private async handleWorkspaceAgentsSummary(
+    request: Extract<SessionInboundMessage, { type: "workspace.agents.summary.request" }>,
+    source?: object,
+  ): Promise<void> {
+    const { requestId, workspaceId } = request;
+    try {
+      const summary = await summarizeWorkspaceAgents({
+        workspaceId,
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        workspaceRegistry: this.workspaceRegistry,
+        logger: this.sessionLogger,
+      });
+      this.emitForSource(
+        {
+          type: "workspace.agents.summary.response",
+          payload: { requestId, ...summary, error: null },
+        },
+        source,
+      );
+    } catch (error) {
+      this.emitForSource(
+        {
+          type: "workspace.agents.summary.response",
+          payload: {
+            requestId,
+            workspaceId,
+            summaryText: "",
+            entries: [],
+            attachment: null,
+            error: getErrorMessageOr(error, "Failed to summarize workspace agents"),
+          },
+        },
+        source,
+      );
     }
   }
 

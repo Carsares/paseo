@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ComposerAttachment } from "@/attachments/types";
 import type { MessagePayload } from "@/composer/types";
-import { isEmptyWorkspaceSubmission, runCreateEmptyWorkspace } from "./new-workspace-empty";
+import {
+  isEmptyWorkspaceSubmission,
+  resolveEmptyWorkspaceMainProvider,
+  runCreateEmptyWorkspace,
+} from "./new-workspace-empty";
 
 function payload(
   input: { text?: string; attachments?: ComposerAttachment[] } = {},
@@ -10,11 +14,11 @@ function payload(
 }
 
 function createRecordingNavigate() {
-  const recorded: Array<{ serverId: string; workspaceId: string }> = [];
+  const recorded: Array<{ serverId: string; workspaceId: string; mainAgentId?: string }> = [];
   return {
     recorded,
-    navigate: (serverId: string, workspaceId: string) => {
-      recorded.push({ serverId, workspaceId });
+    navigate: (serverId: string, workspaceId: string, mainAgentId?: string) => {
+      recorded.push({ serverId, workspaceId, mainAgentId });
     },
   };
 }
@@ -22,7 +26,7 @@ function createRecordingNavigate() {
 describe("runCreateEmptyWorkspace", () => {
   it("creates a workspace without prompt or attachments and navigates to it", async () => {
     const workspace = { id: "workspace-123" };
-    const ensureWorkspace = vi.fn().mockResolvedValue(workspace);
+    const ensureWorkspace = vi.fn().mockResolvedValue({ workspace });
     const { navigate, recorded } = createRecordingNavigate();
 
     await runCreateEmptyWorkspace({
@@ -40,6 +44,39 @@ describe("runCreateEmptyWorkspace", () => {
       withInitialAgent: false,
     });
     expect(recorded).toEqual([{ serverId: "server-abc", workspaceId: "workspace-123" }]);
+  });
+
+  it("opens the silent Main Tab when the host returns one", async () => {
+    const workspace = { id: "workspace-123" };
+    const ensureWorkspace = vi.fn().mockResolvedValue({ workspace, mainAgent: { id: "main-1" } });
+    const { navigate, recorded } = createRecordingNavigate();
+
+    await runCreateEmptyWorkspace({
+      payload: payload(),
+      ensureWorkspace,
+      serverId: "server-abc",
+      navigate,
+    });
+
+    expect(recorded).toEqual([
+      { serverId: "server-abc", workspaceId: "workspace-123", mainAgentId: "main-1" },
+    ]);
+  });
+});
+
+describe("resolveEmptyWorkspaceMainProvider", () => {
+  it("uses a ready provider on the selected host when the saved provider is unavailable", () => {
+    expect(
+      resolveEmptyWorkspaceMainProvider({
+        selectedProvider: "claude",
+        preferredProvider: "claude",
+        entries: [
+          { provider: "claude", enabled: false, status: "ready" },
+          { provider: "codex", enabled: true, status: "loading" },
+          { provider: "pi", enabled: true, status: "ready" },
+        ],
+      }),
+    ).toBe("pi");
   });
 });
 

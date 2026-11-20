@@ -9,6 +9,7 @@ type Kind = CreationSnapshot["kind"];
 type Observer = (snapshot: CreationSnapshot) => void;
 export interface CreationResult {
   agent?: AgentSnapshotPayload | null;
+  mainAgent?: AgentSnapshotPayload | null;
   workspace?: WorkspaceCreateResponse["payload"]["workspace"];
   creation?: CreationSnapshot;
   error: string | null;
@@ -148,7 +149,8 @@ export class CreationClient {
       resolve,
       reject,
       settled: false,
-      modern: this.deps.supports("creationLifecycle"),
+      modern:
+        this.deps.supports("creationLifecycle") || (kind === "workspace" && !!input.mainAgent),
       recovering: false,
     };
     this.operations.set(identity, operation);
@@ -189,6 +191,7 @@ export class CreationClient {
     if (operation.recovering && (snapshot.phase === "completed" || snapshot.phase === "failed")) {
       this.finish(operation, {
         agent: snapshot.agent,
+        mainAgent: snapshot.mainAgent,
         workspace: snapshot.workspace,
         creation: snapshot,
         setupSkippedReason: snapshot.setupSkippedReason,

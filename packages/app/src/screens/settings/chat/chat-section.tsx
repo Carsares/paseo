@@ -13,7 +13,8 @@ import { useAppSettings, type ChatDisplay } from "@/hooks/use-settings";
 const CHAT_DISPLAYS: readonly ChatDisplay[] = ["full", "collapseToolCalls", "collapseTurns"];
 
 export function ChatSection() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const isChinese = i18n.language?.startsWith("zh");
   const { settings, updateSettings } = useAppSettings();
 
   const chatDisplayOptions = useMemo(
@@ -37,6 +38,10 @@ export function ChatSection() {
     (showAgentInteractions: boolean) => void updateSettings({ showAgentInteractions }),
     [updateSettings],
   );
+  const changeDefaultWorkspaceMainAgent = useCallback(
+    (defaultWorkspaceMainAgent: boolean) => void updateSettings({ defaultWorkspaceMainAgent }),
+    [updateSettings],
+  );
   const changeChatOutline = useCallback(
     (chatOutlineEnabled: boolean) => void updateSettings({ chatOutlineEnabled }),
     [updateSettings],
@@ -57,6 +62,16 @@ export function ChatSection() {
             hint={t("settings.general.showAgentInteractions.description")}
             value={settings.showAgentInteractions}
             onValueChange={changeShowAgentInteractions}
+          />
+          <SettingsSwitch
+            label={isChinese ? "默认启用主标签会话" : "Default main tab for new workspaces"}
+            hint={
+              isChinese
+                ? "新建工作空间时自动创建置顶的主控会话，并将新建标签默认挂载为其子会话（不影响已有工作空间）。"
+                : "Automatically create a pinned main control session in new workspaces and attach new agent tabs under it."
+            }
+            value={settings.defaultWorkspaceMainAgent}
+            onValueChange={changeDefaultWorkspaceMainAgent}
           />
           <SettingsSelect
             label={t("settings.general.chatDisplay.label")}

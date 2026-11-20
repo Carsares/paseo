@@ -72,14 +72,16 @@ import {
 } from "./agent-sdk-types.js";
 import { buildArchivedAgentRecord, type ArchivedStoredAgentRecord } from "./agent-archive.js";
 import type { JsonValue, ProviderOptions } from "@getpaseo/protocol/agent-types";
-import { toStoredAgentRecord } from "./agent-projections.js";
+import { buildSerializableConfig, toStoredAgentRecord } from "./agent-projections.js";
 import {
   applyProviderOptionsPatch,
   exposeFeatureValuesToHook,
   convertLegacyOptions,
   MalformedLegacyOptionError,
   resolveAdapter,
+  foldFeatureValues,
   foldHookFeatureValues,
+  type LegacyFeatureValues,
   type ProviderOptionsPatch,
 } from "./option-controls.js";
 import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
@@ -125,6 +127,9 @@ import {
   type HierarchyAgent,
   isMainControlWritePermissionBlocked,
   MAIN_CONTROL_WRITE_DENIAL,
+  MAIN_CONTROL_PROMPT_HEADER,
+  mainControlPromptEnd,
+  stripMainControlPromptHeader,
   MAX_SUBAGENT_DEPTH,
   readLocalSubtreeDepths,
   REMOTE_HIERARCHY_DEPTH_LABEL,
@@ -140,8 +145,14 @@ import {
 import { AgentBackgroundWorkStore, type AgentBackgroundWorkItem } from "./background-work/index.js";
 import { withTimeout } from "../../utils/promise-timeout.js";
 import { createRealpathAwarePathMatcher } from "../../utils/path.js";
-import { buildSessionConfig, extractAttention } from "../persistence-hooks.js";
+import {
+  buildConfigOverrides,
+  buildSessionConfig,
+  extractAttention,
+  toAgentPersistenceHandle,
+} from "../persistence-hooks.js";
 
+const HIERARCHY_SYSTEM_PROMPT_ADAPTERS = new Set(["claude", "codex", "opencode", "pi", "omp"]);
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
 const IMPORTABLE_SESSION_LIST_TIMEOUT_MS = 90_000;
@@ -718,10 +729,17 @@ function attachManagedTurnIdentity(
   }
 }
 
-function limitAgentStreamEventContent(event: AgentStreamEvent): AgentStreamEvent {
-  return event.type === "timeline"
-    ? { ...event, item: limitAgentTimelineItemContent(event.item) }
-    : event;
+function limitAgentStreamEventContent(event: AgentStreamEvent, agentId: string): AgentStreamEvent {
+  if (event.type !== "timeline") return event;
+  const item = event.item;
+  return {
+    ...event,
+    item: limitAgentTimelineItemContent(
+      item.type === "user_message"
+        ? { ...item, text: stripMainControlPromptHeader(item.text, agentId) }
+        : item,
+    ),
+  };
 }
 
 interface WriteLabelsResult {
@@ -1059,6 +1077,7 @@ export class AgentManager {
   private readonly hierarchySessionUpdates = new Set<string>();
   private readonly mainControlRoleUpdates = new Set<string>();
   private readonly mainControlRoleVersions = new Map<string, number>();
+  private readonly promptedMainControlRoleVersions = new Map<string, number>();
   private readonly launchMainControlRoleVersions = new WeakMap<AgentSessionConfig, number>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
@@ -1651,6 +1670,57 @@ export class AgentManager {
   getTimeline(id: string): AgentTimelineItem[] {
     this.requireAgent(id);
     return this.timelineStore.getItems(id);
+  }
+
+  /** Read the best available timeline without registering a provider runtime or changing agent state. */
+  async readTimelineForSummary(
+    agentId: string,
+    workspaceId: string,
+  ): Promise<AgentTimelineRow[] | null> {
+    return this.runLifecycleMutation(agentId, async () => {
+      const record = await this.registry?.get(agentId);
+      const current = this.agents.get(agentId) ?? record;
+      if (current?.workspaceId !== workspaceId || current.internal || current.background)
+        return null;
+      if (this.timelineStore.has(agentId)) return this.timelineStore.getRows(agentId);
+      const committed = await this.durableTimelineStore?.getCommittedRows(agentId);
+      if (committed?.length) return committed;
+
+      if (!record) return [];
+      const handle = toAgentPersistenceHandle(this.getRegisteredProviderIds(), record.persistence);
+      if (!handle) return [];
+
+      const client = this.requireClient(handle.provider);
+      const config = await this.normalizeConfig(
+        {
+          ...handle.metadata,
+          ...buildConfigOverrides(record),
+          provider: handle.provider,
+          cwd: record.cwd,
+        },
+        { purpose: "history", resolveDefaultModel: false },
+      );
+      const reader = await client.resumeSession(
+        handle,
+        config,
+        { agentId, env: record.launchEnv },
+        { purpose: "history" },
+      );
+      try {
+        const entries: ImportedTimelineEntry[] = [];
+        for await (const rawEvent of reader.streamHistory()) {
+          const event = limitAgentStreamEventContent(rawEvent, agentId);
+          if (event.type === "timeline") {
+            for (const item of projectAgentMessages(event.item)) {
+              entries.push({ item, timestamp: event.timestamp ?? record.updatedAt });
+            }
+          }
+        }
+        return buildImportedTimelineRows(entries);
+      } finally {
+        await reader.close();
+      }
+    });
   }
 
   async getTimelineRows(id: string): Promise<AgentTimelineRow[]> {
@@ -3138,6 +3208,68 @@ export class AgentManager {
     return nextRecord;
   }
 
+  async createSilentWorkspaceMainAgent({
+    agentId,
+    config,
+    workspaceId,
+    background,
+  }: {
+    agentId?: string;
+    config: AgentSessionConfig & LegacyFeatureValues;
+    workspaceId: string;
+    background?: boolean;
+  }): Promise<StoredAgentRecord> {
+    return this.runHierarchyMutation(async () => {
+      this.assertAcceptingAgentRegistrations();
+      if (!workspaceId.trim()) throw new Error("Main Control requires a workspace.");
+      const registry = this.requireRegistry();
+      const existing = [...(await this.readHierarchyAgents()).values()].some(
+        (agent) => agent.workspaceId === workspaceId && isMainControlAgentLabels(agent.labels),
+      );
+      if (existing) throw new Error("Workspace already has a Main Control agent.");
+      this.requireClient(config.provider);
+      const id = validateAgentId(agentId ?? this.idFactory(), "createSilentWorkspaceMainAgent");
+      if (this.agents.has(id) || (await registry.get(id))) {
+        throw new Error("Agent ID is already in use.");
+      }
+      const priorMode = config.modeId?.trim();
+      const labels = {
+        [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
+        ...(priorMode ? { [MAIN_PRIOR_MODE_ID_LABEL]: priorMode } : {}),
+      };
+      const modeId = this.resolveMainControlMode({
+        enabled: true,
+        provider: config.provider,
+        currentMode: priorMode,
+        priorMode: null,
+      });
+      // Discover the provider's default model when the first turn opens its session.
+      const storedConfig = await this.normalizeConfig(
+        stripInternalPaseoMcpServer(foldFeatureValues({ ...config, modeId })),
+        { resolveDefaultModel: false },
+      );
+      const now = new Date().toISOString();
+      const record: StoredAgentRecord = {
+        id,
+        provider: storedConfig.provider,
+        cwd: storedConfig.cwd,
+        workspaceId,
+        title: storedConfig.title?.trim() || "Main Session",
+        labels,
+        metadata: {},
+        createdAt: now,
+        updatedAt: now,
+        lastStatus: "closed",
+        lastModeId: storedConfig.modeId ?? null,
+        config: buildSerializableConfig(storedConfig),
+        background,
+      };
+      await registry.upsert(record);
+      this.dispatchStoredAgentState(record);
+      return record;
+    });
+  }
+
   async setAgentMainControl(agentId: string, enabled: boolean): Promise<AgentRelationshipUpdate> {
     return this.runHierarchyMutation(() =>
       this.runLifecycleMutation(agentId, async () => {
@@ -3150,12 +3282,6 @@ export class AgentManager {
         }
         const workspaceId = agent.workspaceId ?? targetRecord.workspaceId;
         if (enabled) {
-          const adapter = this.adapterOf(targetRecord.provider);
-          if (adapter !== "codex" && adapter !== "claude" && adapter !== "opencode") {
-            throw new Error(
-              `Provider '${targetRecord.provider}' does not support read-only Main Control.`,
-            );
-          }
           if (
             !workspaceId ||
             getParentAgentIdFromLabels(agent.labels) ||
@@ -3249,6 +3375,7 @@ export class AgentManager {
     // won't be in the live map until its provider has finished opening.
     for (const id of changingIds) {
       this.mainControlRoleVersions.set(id, (this.mainControlRoleVersions.get(id) ?? 0) + 1);
+      this.promptedMainControlRoleVersions.delete(id);
     }
     for (const child of this.agents.values()) {
       const parentId = this.localHierarchyParentId(child.labels);
@@ -4230,7 +4357,35 @@ export class AgentManager {
   }): Promise<string> {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
-      const result = await agent.session.startTurn(prompt, options);
+      const roleVersion = this.mainControlRoleVersions.get(agentId) ?? 0;
+      let providerPrompt = prompt;
+      if (
+        isMainControlAgentLabels(agent.labels) &&
+        !HIERARCHY_SYSTEM_PROMPT_ADAPTERS.has(this.adapterOf(agent.provider)) &&
+        this.promptedMainControlRoleVersions.get(agentId) !== roleVersion
+      ) {
+        const hierarchy = await this.readHierarchyAgents();
+        if (pendingRun.settled) {
+          throw new Error(`Agent ${agentId} run was canceled before its turn started`);
+        }
+        const instructions = buildHierarchyAppendSystemPrompt({
+          agent,
+          readAgent: (id) => hierarchy.get(id),
+          listActiveAgents: () => hierarchy.values(),
+        });
+        const prefix = `${MAIN_CONTROL_PROMPT_HEADER}\n${instructions}${mainControlPromptEnd(agentId)}\n\n`;
+        if (typeof prompt === "string") {
+          providerPrompt = prefix + prompt;
+        } else {
+          const [first, ...rest] = prompt;
+          providerPrompt =
+            first?.type === "text" && !("mimeType" in first)
+              ? [{ ...first, text: prefix + first.text }, ...rest]
+              : [{ type: "text", text: prefix }, ...prompt];
+        }
+      }
+      const result = await agent.session.startTurn(providerPrompt, options);
+      if (providerPrompt !== prompt) this.promptedMainControlRoleVersions.set(agentId, roleVersion);
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
@@ -5634,7 +5789,7 @@ export class AgentManager {
       const startupHistory: AgentStreamEvent[] = [];
       if (session.initialTimeline?.length && !managed.historyPrimed) {
         for await (const event of session.streamHistory()) {
-          startupHistory.push(limitAgentStreamEventContent(event));
+          startupHistory.push(event);
         }
       }
 
@@ -6196,7 +6351,7 @@ export class AgentManager {
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
     for await (const rawEvent of agent.session.streamHistory()) {
-      const event = limitAgentStreamEventContent(rawEvent);
+      const event = limitAgentStreamEventContent(rawEvent, agent.id);
       if (event.type === "timeline") {
         for (const item of projectAgentMessages(event.item)) {
           historyEvents.push({ ...event, item });
@@ -6257,7 +6412,7 @@ export class AgentManager {
       // halfway then leaves the committed timeline as it was, instead of a partial
       // copy the next attempt would append to.
       for await (const rawEvent of history) {
-        const event = limitAgentStreamEventContent(rawEvent);
+        const event = limitAgentStreamEventContent(rawEvent, agent.id);
         if (event.type === "provider_subagent") {
           historySubagentEvents.push(event);
           continue;
@@ -6354,7 +6509,7 @@ export class AgentManager {
     event: AgentStreamEvent,
     options?: HandleStreamEventOptions,
   ): Promise<boolean> {
-    event = limitAgentStreamEventContent(event);
+    event = limitAgentStreamEventContent(event, agent.id);
     const identified = attachManagedTurnIdentity(agent, event, options?.fromHistory === true);
     event = identified.event;
     const eventTurnId = identified.turnId;

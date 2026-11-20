@@ -13,7 +13,7 @@ import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
 import { createProviderSnapshotManagerStub } from "../test-utils/session-stubs.js";
 import { AgentManager } from "./agent-manager.js";
-import type { AgentSessionConfig } from "./agent-sdk-types.js";
+import type { AgentPromptInput, AgentSessionConfig } from "./agent-sdk-types.js";
 import { AgentStorage } from "./agent-storage.js";
 import { createAgentCommand, registerParentFinishSubscription } from "./create-agent/create.js";
 import {
@@ -50,6 +50,58 @@ const lead = child("lead", main);
 const worker = child("worker", lead);
 const sibling = child("other-lead", main);
 const root: HierarchyAgent = { id: "ordinary-root" };
+
+it("promotes an adapter without a dynamic system prompt and injects instructions once per activation", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "main-control-first-turn-"));
+  const provider = "antigravity";
+  const providerPrompts: AgentPromptInput[] = [];
+  const storage = new AgentStorage(join(cwd, "agents"), createTestLogger());
+  const manager = new AgentManager({
+    clients: {
+      [provider]: createTestAgentClient(provider, {
+        onStartTurn: (prompt) => providerPrompts.push(prompt),
+      }),
+    },
+    registry: storage,
+    logger: createTestLogger(),
+  });
+  try {
+    const agent = await manager.createAgent({ provider, cwd }, undefined, {
+      workspaceId: "workspace",
+    });
+    const run = async (prompt: string) => {
+      for await (const _event of manager.streamAgent(agent.id, prompt, {
+        clientMessageId: prompt,
+      })) {
+        // Drain the turn before admitting another one.
+      }
+    };
+    await manager.setAgentMainControl(agent.id, true);
+    const quoted =
+      "[Workspace Main Control Instructions]\nRole: Workspace Main Control Coordinator.\nDirect Level-1 children: []\n\nQuoted text";
+    await run(quoted);
+    await run("Second");
+    expect(providerPrompts[0]).toEqual(
+      expect.stringMatching(/^\[Workspace Main Control Instructions\]/),
+    );
+    expect(providerPrompts[0]).toEqual(expect.stringContaining("summarize_workspace_agents"));
+    expect(providerPrompts[1]).toBe("Second");
+    expect(
+      manager
+        .getTimeline(agent.id)
+        .flatMap((item) => (item.type === "user_message" ? [item.text] : [])),
+    ).toEqual([quoted, "Second"]);
+    await manager.setAgentMainControl(agent.id, false);
+    await manager.setAgentMainControl(agent.id, true);
+    await run("Third");
+    expect(providerPrompts[2]).toEqual(
+      expect.stringMatching(/^\[Workspace Main Control Instructions\]/),
+    );
+  } finally {
+    await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
 
 function hierarchy(...agents: HierarchyAgent[]) {
   return {
@@ -258,6 +310,13 @@ describe("Main Control read-only configuration", () => {
         detail: { type: "edit", filePath: "/repo/file" },
       }),
     ).toBe(true);
+    expect(
+      isMainControlWritePermissionBlocked({
+        kind: "tool",
+        name: "custom",
+        detail: { type: "shell", command: "example" },
+      }),
+    ).toBe(true);
     expect(isMainControlWritePermissionBlocked({ kind: "tool", name: "Read" })).toBe(false);
     expect(isMainControlWritePermissionBlocked({ kind: "question", name: "AskUserQuestion" })).toBe(
       false,
@@ -339,6 +398,30 @@ it("switches a live workspace's Main Control and restores the previous agent's m
     expect(manager.getPaseoToolPolicy(first.id)).toBeUndefined();
     expect(manager.getAgent(second.id)?.currentModeId).toBe("read-only");
     expect((await storage.get(second.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+  });
+});
+
+it("restores an archived former Main as an ordinary session when a new Main exists", async () => {
+  await withAgents(async ({ manager, storage, cwd }) => {
+    const workspaceId = "workspace";
+    const config = { provider: "codex", cwd, modeId: "full-access" };
+    const former = await manager.createSilentWorkspaceMainAgent({ workspaceId, config });
+    await manager.archiveSnapshot(former.id, new Date().toISOString());
+    const current = await manager.createSilentWorkspaceMainAgent({ workspaceId, config });
+
+    await expect(manager.unarchiveSnapshot(former.id)).resolves.toBe(true);
+    const records = await storage.listByWorkspaces([workspaceId]);
+    expect(
+      records
+        .filter(({ labels }) => labels[WORKSPACE_ROLE_LABEL] === WORKSPACE_MAIN_ROLE)
+        .map(({ id }) => id),
+    ).toEqual([current.id]);
+    expect(await storage.get(former.id)).toMatchObject({
+      archivedAt: null,
+      labels: {},
+      lastModeId: "full-access",
+    });
+    expect(manager.listAgents()).toEqual([]);
   });
 });
 

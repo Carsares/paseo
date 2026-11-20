@@ -165,6 +165,29 @@ test("an uncertain prompt outcome never resends or removes its workspace and age
   expect(prompts).toBe(1);
 });
 
+test("a Main Session written before a failure is not created again on retry", async () => {
+  const f = await fixture();
+  const storedIds = new Set<string>();
+  let attempts = 0;
+  f.input.exists = async (kind, id) => kind === "agent" && storedIds.has(id);
+  f.input.createMainAgent = async (_workspace, id) => {
+    attempts++;
+    storedIds.add(id);
+    throw new Error("Failed to project persisted Main Session");
+  };
+
+  const result = await f.service.create(f.input);
+  expect(result).toMatchObject({
+    phase: "failed",
+    failedStage: "agent",
+    outcomeUnknown: true,
+    workspace,
+  });
+  expect(await new CreationService(f.directory, silentLogger).create(f.input)).toEqual(result);
+  expect(attempts).toBe(1);
+  expect(f.calls).toEqual(["workspace"]);
+});
+
 test("conflicting intents and resource IDs cannot start more work", async () => {
   const f = await fixture();
   const first = f.service.create(f.input, f.observe);

@@ -38,6 +38,7 @@ export type WorkspaceTabLaunchDestination =
   | { kind: "replace"; tabId: string };
 
 export interface NewTabLauncher {
+  hasMainAgent?: boolean;
   showChanges: boolean;
   showPullRequest: boolean;
   showBrowser: boolean;
@@ -79,6 +80,7 @@ export function NewTabLauncherProvider({
 
 const BUILT_IN_SELECTIONS = {
   agent: { kind: "agent" },
+  "standalone-agent": { kind: "agent", relationship: "standalone" },
   terminal: { kind: "terminal" },
   changes: { kind: "target", target: { kind: "changes_tree" } },
   diff: { kind: "target", target: { kind: "working_diff" } },
@@ -101,10 +103,12 @@ export function useWorkspaceTabLaunchCatalog(input: {
   panePanelKinds?: readonly WorkspaceTabTarget["kind"][];
 }): readonly WorkspaceTabLaunchGroup[] {
   const { serverId, purpose, host, surface, panePanelKinds = EMPTY_PANE_PANEL_KINDS } = input;
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const router = useRouter();
   const launcher = useContext(NewTabLauncherContext);
   invariant(launcher, "NewTabLauncherProvider is required");
+  const showAgentRelationships = host === "main" && launcher.hasMainAgent === true;
+  const isChinese = i18n.language?.startsWith("zh");
   const { config } = useDaemonConfig(serverId);
   const plugins = useInstalledPlugins();
   const isCompact = useIsCompactFormFactor();
@@ -124,15 +128,24 @@ export function useWorkspaceTabLaunchCatalog(input: {
     const diffPresentation = getLaunchPresentation("working_diff");
     const filesPresentation = getLaunchPresentation("files");
     const pullRequestPresentation = getLaunchPresentation("pull_request");
+    const subagentLabel = isChinese ? "新建子会话" : "New subagent";
     const builtIns: Record<BuiltInLaunchItemId, WorkspaceTabLaunchItem & { hidden?: boolean }> = {
       agent: {
         id: "agent",
-        label: t("workspace.tabs.fallback.agent"),
+        label: showAgentRelationships ? subagentLabel : t("workspace.tabs.fallback.agent"),
         Icon: SquarePen,
         shortcutActionId: "workspace-tab-target-agent",
         disabled: false,
         panelKind: "draft",
         launch: launchSelection(BUILT_IN_SELECTIONS.agent),
+      },
+      "standalone-agent": {
+        id: "standalone-agent",
+        label: isChinese ? "新建独立会话" : "New standalone agent",
+        Icon: SquarePen,
+        disabled: false,
+        panelKind: "draft",
+        launch: launchSelection(BUILT_IN_SELECTIONS["standalone-agent"]),
       },
       terminal: {
         id: "terminal",
@@ -192,7 +205,7 @@ export function useWorkspaceTabLaunchCatalog(input: {
         launch: launchSelection(BUILT_IN_SELECTIONS.pullRequest),
       },
     };
-    const tabItems = getBuiltInLaunchOrder(purpose).flatMap((id) => {
+    const tabItems = getBuiltInLaunchOrder(purpose, showAgentRelationships).flatMap((id) => {
       const item = builtIns[id];
       return item.hidden || !panelSupportsHost(item.panelKind, host) ? [] : [item];
     });
@@ -254,6 +267,7 @@ export function useWorkspaceTabLaunchCatalog(input: {
     config?.terminalProfiles,
     editTerminalProfiles,
     isCompact,
+    isChinese,
     launchSelection,
     launcher,
     plugins,
@@ -262,6 +276,7 @@ export function useWorkspaceTabLaunchCatalog(input: {
     surface,
     panePanelKinds,
     serverId,
+    showAgentRelationships,
     t,
   ]);
 }

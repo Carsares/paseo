@@ -1,18 +1,11 @@
-import {
-  ChevronDown,
-  ChevronRight,
-  ListCollapse,
-  ListTree,
-  PanelLeft,
-  PanelLeftClose,
-} from "lucide-react-native";
+import { ChevronDown, ChevronRight, PanelLeft, PanelLeftClose } from "lucide-react-native";
 import { type ReactNode, useCallback, useMemo, useState } from "react";
-import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import { useTranslation } from "react-i18next";
 import { ScrollView, Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useShallow } from "zustand/shallow";
 import { useStreamTopOverlayInset } from "@/agent-stream/top-overlay";
+import { Button } from "@/components/ui/button";
 import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import { StatusBadge } from "@/components/ui/status-badge";
@@ -22,6 +15,7 @@ import { usePendingArchiveAgentKeys } from "@/hooks/use-archive-agent";
 import { useSettings } from "@/hooks/use-settings";
 import { usePaneContext, usePaneFocus } from "@/panels/pane-context";
 import { useSessionStore } from "@/stores/session-store";
+import { collectAllTabs, useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
 import type { Theme } from "@/styles/theme";
 import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
@@ -31,14 +25,14 @@ import {
   mainControlTreeNodeKey,
   type MainControlSession,
   type MainControlTreeNode,
-  selectMainControlTree,
+  type MainControlWorkspaceSections,
+  selectMainControlWorkspaceSections,
 } from "./select-tree";
+import { useWorkspaceArchivedAgents } from "./use-workspace-archived-agents";
 
 const iconColor = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 const DownIcon = withUnistyles(ChevronDown, iconColor);
 const RightIcon = withUnistyles(ChevronRight, iconColor);
-const CollapseIcon = withUnistyles(ListCollapse, iconColor);
-const ExpandIcon = withUnistyles(ListTree, iconColor);
 const ShowIcon = withUnistyles(PanelLeft, iconColor);
 const HideIcon = withUnistyles(PanelLeftClose, iconColor);
 
@@ -49,7 +43,7 @@ export function MainControlTreeLayout({
   mainAgentId: string | null;
   children: ReactNode;
 }) {
-  const { t, i18n } = useTranslation();
+  const { i18n } = useTranslation();
   const { serverId, workspaceId, tabId } = usePaneContext();
   const { focusPane } = usePaneFocus();
   const isCompact = useIsCompactFormFactor();
@@ -58,69 +52,77 @@ export function MainControlTreeLayout({
   const overlay = isCompact || isBelow;
   const [wideVisible, setWideVisible] = useState(true);
   const [overlayVisible, setOverlayVisible] = useState(false);
+  const [closedExpanded, setClosedExpanded] = useState(false);
   const visible = overlay ? overlayVisible : wideVisible;
   const setVisible = overlay ? setOverlayVisible : setWideVisible;
   const hideTree = useCallback(() => setVisible(false), [setVisible]);
   const showTree = useCallback(() => setVisible(true), [setVisible]);
+  const expandAll = useCallback(() => {
+    setVisible(true);
+    setClosedExpanded(true);
+  }, [setVisible]);
+  const toggleClosed = useCallback(() => setClosedExpanded((current) => !current), []);
   const preferences = useSettings((settings) => settings.openInSidePane);
-  const agentMaps = useSessionStore(
-    useShallow(
-      (state): Record<string, MainControlSession["agents"]> =>
-        mainAgentId
-          ? Object.fromEntries(
-              Object.entries(state.sessions).map(([id, session]) => [id, session.agents]),
-            )
-          : {},
-    ),
-  );
-  const pendingArchiveIds = usePendingArchiveAgentKeys();
-  const fallbackTitle = t("workspace.tabs.fallback.agent");
-  const tree = useMemo(() => {
-    const agents = agentMaps[serverId];
-    if (!mainAgentId || !agents) return null;
-    return selectMainControlTree({
-      session: { serverId, agents },
-      agentMaps,
+  const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
+  const { sections, supportsWorkspaceHistory, isLoadingArchive, archiveError, retryArchive } =
+    useMainControlDirectoryData({
       mainAgentId,
-      fallbackTitle,
-      pendingArchiveIds,
+      serverId,
+      workspaceId,
+      workspaceKey,
     });
-  }, [agentMaps, fallbackTitle, mainAgentId, pendingArchiveIds, serverId]);
+
   const isChinese = i18n.language?.startsWith("zh") === true;
-  const showLabel = isChinese ? "显示会话进程目录树" : "Show agent tree";
+  const showLabel = isChinese ? "显示会话目录" : "Show sessions";
   const hideLabel = isChinese ? "隐藏" : "Hide";
+  const expandLabel = isChinese ? "展开全部会话" : "Expand all sessions";
+  const closedLabel = `${isChinese ? "已关闭" : "Closed"} (${sections?.closed.length ?? 0})`;
 
   const openNode = useCallback(
-    ({ serverId: nodeServerId, agentId }: AgentAddress) => {
+    ({ serverId: nodeServerId, agentId, isArchived, processState }: MainControlTreeNode) => {
       if (overlay) setOverlayVisible(false);
-      if (nodeServerId !== serverId) {
-        navigateToAgent({ serverId: nodeServerId, agentId });
-        return;
-      }
-      if (agentId === mainAgentId) {
+      if (nodeServerId === serverId && agentId === mainAgentId) {
         focusPane();
         return;
       }
-      const session = useSessionStore.getState().sessions[serverId];
-      const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
-      if (agent?.workspaceId && agent.workspaceId !== workspaceId) {
-        navigateToAgent({ serverId, agentId });
+
+      const agent = useSessionStore.getState().sessions[nodeServerId]?.agents.get(agentId);
+      if (agent ? Boolean(agent.archivedAt) : isArchived) {
+        navigateToAgent({
+          serverId: nodeServerId,
+          workspaceId: nodeServerId === serverId ? workspaceId : undefined,
+          agentId,
+          pin: true,
+          asTab: true,
+        });
+        return;
+      }
+      if (nodeServerId !== serverId || (agent?.workspaceId && agent.workspaceId !== workspaceId)) {
+        navigateToAgent({ serverId: nodeServerId, agentId, asTab: processState === "closed" });
+        return;
+      }
+      // The preferred opener uses a sheet for subagents in compact mode.
+      if (
+        processState === "closed" &&
+        useWorkspaceLayoutStore.getState().layoutMode === "compact"
+      ) {
+        navigateToAgent({ serverId, workspaceId, agentId, asTab: true });
         return;
       }
       openPreferredWorkspaceTarget({
-        workspaceKey: buildWorkspaceTabPersistenceKey({ serverId, workspaceId }),
+        workspaceKey,
         target: { kind: "agent", agentId },
         source: "subagents",
         preferences,
         parentTabId: tabId,
       });
     },
-    [focusPane, mainAgentId, overlay, preferences, serverId, tabId, workspaceId],
+    [focusPane, mainAgentId, overlay, preferences, serverId, tabId, workspaceId, workspaceKey],
   );
 
   return (
     <View style={styles.layout} onLayout={mainAgentId ? onLayout : undefined}>
-      {tree && overlay && visible ? (
+      {sections && overlay && visible ? (
         <PressHighlight
           style={styles.overlayBackdrop}
           accessibilityRole="button"
@@ -128,21 +130,26 @@ export function MainControlTreeLayout({
           onPress={hideTree}
         />
       ) : null}
-      {tree ? (
-        <MainControlTree
-          key={mainControlTreeNodeKey(tree)}
-          tree={tree}
-          visible={visible}
+      {sections && visible ? (
+        <MainControlDirectory
+          sections={sections}
+          isChinese={isChinese}
           overlay={overlay}
           topOverlayInset={topOverlayInset}
-          isChinese={isChinese}
+          closedExpanded={closedExpanded}
+          closedLabel={closedLabel}
           hideLabel={hideLabel}
+          supportsWorkspaceHistory={supportsWorkspaceHistory}
+          isLoadingArchive={isLoadingArchive}
+          archiveError={archiveError}
+          onRetryArchive={retryArchive}
+          onToggleClosed={toggleClosed}
           onHide={hideTree}
           onOpen={openNode}
         />
       ) : null}
       <View style={styles.content}>
-        {tree && !visible ? (
+        {sections && !visible ? (
           <View
             style={[
               styles.showTree,
@@ -157,6 +164,16 @@ export function MainControlTreeLayout({
             >
               <ShowIcon size={16} />
             </ToolbarButton>
+            <Button
+              size="sm"
+              variant="secondary"
+              accessibilityLabel={`${expandLabel}, ${closedLabel}`}
+              testID="main-control-tree-show-all"
+              style={styles.toggle}
+              onPress={expandAll}
+            >
+              {expandLabel}
+            </Button>
           </View>
         ) : null}
         {children}
@@ -165,67 +182,123 @@ export function MainControlTreeLayout({
   );
 }
 
-function MainControlTree({
-  tree,
-  visible,
+function useMainControlDirectoryData({
+  mainAgentId,
+  serverId,
+  workspaceId,
+  workspaceKey,
+}: {
+  mainAgentId: string | null;
+  serverId: string;
+  workspaceId: string;
+  workspaceKey: string | null;
+}) {
+  const { t } = useTranslation();
+  const layoutRoot = useWorkspaceLayoutStore((state) =>
+    mainAgentId && workspaceKey ? state.layoutByWorkspace[workspaceKey]?.root : undefined,
+  );
+  const openTabAgentIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (layoutRoot) {
+      for (const { target } of collectAllTabs(layoutRoot)) {
+        if (target.kind === "agent") ids.add(target.agentId);
+      }
+    }
+    return ids;
+  }, [layoutRoot]);
+  const agentMaps = useSessionStore(
+    useShallow(
+      (state): Record<string, MainControlSession["agents"]> =>
+        mainAgentId
+          ? Object.fromEntries(
+              Object.entries(state.sessions).map(([id, session]) => [id, session.agents]),
+            )
+          : {},
+    ),
+  );
+  const agents = agentMaps[serverId];
+  const workspaceAgentMembership = useMemo(() => {
+    const ids = [];
+    for (const agent of agents?.values() ?? []) {
+      if (agent.workspaceId === workspaceId && !agent.background) {
+        ids.push([agent.id, agent.archivedAt != null]);
+      }
+    }
+    return JSON.stringify(ids.sort());
+  }, [agents, workspaceId]);
+  const {
+    data: archivedAgents,
+    supportsWorkspaceHistory,
+    isLoading: isLoadingArchive,
+    isError: archiveError,
+    refetch: refetchArchive,
+  } = useWorkspaceArchivedAgents({ serverId, workspaceId, mainAgentId, workspaceAgentMembership });
+  const retryArchive = useCallback(() => {
+    void refetchArchive();
+  }, [refetchArchive]);
+  const pendingArchiveIds = usePendingArchiveAgentKeys();
+  const fallbackTitle = t("workspace.tabs.fallback.agent");
+  const sections = useMemo(() => {
+    if (!mainAgentId || !agents) return null;
+    return selectMainControlWorkspaceSections({
+      session: { serverId, agents },
+      agentMaps,
+      archivedAgents,
+      mainAgentId,
+      workspaceId,
+      fallbackTitle,
+      openTabAgentIds,
+      pendingArchiveIds,
+    });
+  }, [
+    agentMaps,
+    agents,
+    archivedAgents,
+    fallbackTitle,
+    mainAgentId,
+    openTabAgentIds,
+    pendingArchiveIds,
+    serverId,
+    workspaceId,
+  ]);
+
+  return { sections, supportsWorkspaceHistory, isLoadingArchive, archiveError, retryArchive };
+}
+
+function MainControlDirectory({
+  sections,
+  isChinese,
   overlay,
   topOverlayInset,
-  isChinese,
+  closedExpanded,
+  closedLabel,
   hideLabel,
+  supportsWorkspaceHistory,
+  isLoadingArchive,
+  archiveError,
+  onRetryArchive,
+  onToggleClosed,
   onHide,
   onOpen,
 }: {
-  tree: MainControlTreeNode;
-  visible: boolean;
+  sections: MainControlWorkspaceSections;
+  isChinese: boolean;
   overlay: boolean;
   topOverlayInset: number;
-  isChinese: boolean;
+  closedExpanded: boolean;
+  closedLabel: string;
   hideLabel: string;
+  supportsWorkspaceHistory: boolean;
+  isLoadingArchive: boolean;
+  archiveError: boolean;
+  onRetryArchive: () => void;
+  onToggleClosed: () => void;
   onHide: () => void;
-  onOpen: (address: AgentAddress) => void;
+  onOpen: (node: MainControlTreeNode) => void;
 }) {
-  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set());
-  const collapsibleIds = useMemo(() => {
-    const ids: string[] = [];
-    if (tree.children.length > 0) ids.push(mainControlTreeNodeKey(tree));
-    for (const child of tree.children) {
-      if (child.children.length > 0) ids.push(mainControlTreeNodeKey(child));
-    }
-    return ids;
-  }, [tree]);
-  const collapseLabel = isChinese ? "折叠" : "Collapse";
-  const expandLabel = isChinese ? "展开" : "Expand";
-  const activeLabel = isChinese ? "活跃" : "Active";
-  const terminatedLabel = isChinese ? "已终止" : "Terminated";
-
-  const visibleNodes = useMemo(() => {
-    const nodes: MainControlTreeNode[] = [];
-    function visit(node: MainControlTreeNode) {
-      nodes.push(node);
-      if (!collapsed.has(mainControlTreeNodeKey(node))) node.children.forEach(visit);
-    }
-    if (visible) visit(tree);
-    return nodes;
-  }, [collapsed, tree, visible]);
-  const allCollapsed =
-    collapsibleIds.length > 0 &&
-    !visibleNodes.some(
-      (node) => node.children.length > 0 && !collapsed.has(mainControlTreeNodeKey(node)),
-    );
-
-  const toggleBranches = useCallback(() => {
-    setCollapsed(allCollapsed ? new Set() : new Set(collapsibleIds));
-  }, [allCollapsed, collapsibleIds]);
-  const toggleNode = useCallback((id: string) => {
-    setCollapsed((current) => {
-      const next = new Set(current);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }, []);
-  if (!visible) return null;
-
+  const expandedState = useMemo(() => ({ expanded: closedExpanded }), [closedExpanded]);
+  const expandLabel = isChinese ? "展开全部会话" : "Expand all sessions";
+  const collapseLabel = isChinese ? "收起已关闭" : "Collapse closed";
   return (
     <View
       style={[
@@ -237,33 +310,79 @@ function MainControlTree({
     >
       <View style={styles.header}>
         <Text numberOfLines={1} style={styles.headerTitle}>
-          {isChinese ? "会话进程目录树" : "Agent Tree"}
+          {isChinese ? "会话" : "Sessions"}
         </Text>
-        <ToolbarButton
-          compact
+        <Button
+          size="sm"
+          variant="ghost"
           testID="main-control-tree-toggle-all"
-          disabled={collapsibleIds.length === 0}
-          label={allCollapsed ? expandLabel : collapseLabel}
-          onPress={toggleBranches}
+          style={styles.toggle}
+          numberOfLines={1}
+          accessibilityState={expandedState}
+          onPress={onToggleClosed}
         >
-          {allCollapsed ? <ExpandIcon size={16} /> : <CollapseIcon size={16} />}
-        </ToolbarButton>
+          {closedExpanded ? collapseLabel : expandLabel}
+        </Button>
         <ToolbarButton compact testID="main-control-tree-hide" label={hideLabel} onPress={onHide}>
           <HideIcon size={16} />
         </ToolbarButton>
       </View>
-      <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.tree}>
-        {visibleNodes.map((node) => (
-          <MainControlTreeRow
-            key={mainControlTreeNodeKey(node)}
-            node={node}
-            expanded={!collapsed.has(mainControlTreeNodeKey(node))}
-            toggleLabel={collapsed.has(mainControlTreeNodeKey(node)) ? expandLabel : collapseLabel}
-            statusLabel={node.processState === "active" ? activeLabel : terminatedLabel}
-            onToggle={toggleNode}
-            onOpen={onOpen}
-          />
-        ))}
+      <ScrollView keyboardShouldPersistTaps="handled">
+        <View style={styles.tree}>
+          <View style={styles.sectionHeading}>
+            <Text accessibilityRole="header" style={styles.sectionTitle}>
+              {isChinese ? "活跃中" : "Active"} ({sections.active.length})
+            </Text>
+          </View>
+          {sections.active.map((node) => (
+            <MainControlTreeRow
+              key={mainControlTreeNodeKey(node)}
+              node={node}
+              isChinese={isChinese}
+              onOpen={onOpen}
+            />
+          ))}
+          <PressHighlight
+            style={styles.sectionHeading}
+            highlightStyle={styles.rowHighlight}
+            accessibilityRole="button"
+            accessibilityState={expandedState}
+            testID="main-control-tree-toggle-closed"
+            onPress={onToggleClosed}
+          >
+            {closedExpanded ? <DownIcon size={14} /> : <RightIcon size={14} />}
+            <Text style={styles.sectionTitle}>{closedLabel}</Text>
+          </PressHighlight>
+          {closedExpanded ? (
+            <>
+              {sections.closed.map((node) => (
+                <MainControlTreeRow
+                  key={mainControlTreeNodeKey(node)}
+                  node={node}
+                  isChinese={isChinese}
+                  onOpen={onOpen}
+                />
+              ))}
+              {!supportsWorkspaceHistory ? (
+                <Text style={styles.rowMeta}>
+                  {isChinese
+                    ? "更新主机以查看归档会话"
+                    : "Update the host to see archived sessions"}
+                </Text>
+              ) : null}
+              {isLoadingArchive ? (
+                <Text style={styles.rowMeta}>
+                  {isChinese ? "正在加载归档会话…" : "Loading archived sessions…"}
+                </Text>
+              ) : null}
+              {archiveError ? (
+                <Button size="sm" variant="ghost" onPress={onRetryArchive}>
+                  {isChinese ? "重试加载归档会话" : "Retry loading archived sessions"}
+                </Button>
+              ) : null}
+            </>
+          ) : null}
+        </View>
       </ScrollView>
     </View>
   );
@@ -271,58 +390,42 @@ function MainControlTree({
 
 function MainControlTreeRow({
   node,
-  expanded,
-  toggleLabel,
-  statusLabel,
-  onToggle,
+  isChinese,
   onOpen,
 }: {
   node: MainControlTreeNode;
-  expanded: boolean;
-  toggleLabel: string;
-  statusLabel: string;
-  onToggle: (id: string) => void;
-  onOpen: (address: AgentAddress) => void;
+  isChinese: boolean;
+  onOpen: (node: MainControlTreeNode) => void;
 }) {
-  const { serverId, agentId, depth, title, processState } = node;
-  const key = mainControlTreeNodeKey(node);
-  const toggle = useCallback(() => onToggle(key), [key, onToggle]);
-  const open = useCallback(() => onOpen({ serverId, agentId }), [agentId, onOpen, serverId]);
-  const statusDot = useMemo(
-    () => <View style={[styles.statusDot, processState === "active" && styles.activeDot]} />,
-    [processState],
-  );
+  const { agentId, depth, title, processState, roleBadge } = node;
+  const open = useCallback(() => onOpen(node), [node, onOpen]);
+  let statusLabel: string;
+  if (processState === "running") statusLabel = isChinese ? "运行中" : "Running";
+  else if (processState === "idle") statusLabel = isChinese ? "空闲" : "Idle";
+  else statusLabel = isChinese ? "已关闭" : "Closed";
+  let roleLabel: string | undefined;
+  if (roleBadge === "main") roleLabel = isChinese ? "主控" : "Main";
+  else if (roleBadge === "standalone") roleLabel = isChinese ? "独立" : "Standalone";
 
   return (
-    <View style={[styles.row, depth === 1 && styles.levelTwo, depth === 2 && styles.levelThree]}>
-      {node.children.length > 0 ? (
-        <ToolbarButton compact label={`${toggleLabel}: ${title}`} onPress={toggle}>
-          {expanded ? <DownIcon size={14} /> : <RightIcon size={14} />}
-        </ToolbarButton>
-      ) : (
-        <View style={styles.leaf}>
-          <View style={styles.leafDot} />
-        </View>
-      )}
-      <PressHighlight
-        testID={`main-control-tree-row-${agentId}`}
-        accessibilityRole="button"
-        accessibilityLabel={`${title}, ${statusLabel}`}
-        style={styles.rowBody}
-        highlightStyle={styles.rowHighlight}
-        onPress={open}
-      >
+    <PressHighlight
+      testID={`main-control-tree-row-${agentId}`}
+      accessibilityRole="button"
+      accessibilityLabel={
+        roleLabel ? `${title}, ${roleLabel}, ${statusLabel}` : `${title}, ${statusLabel}`
+      }
+      style={[styles.row, depth === 1 && styles.levelTwo, depth === 2 && styles.levelThree]}
+      highlightStyle={styles.rowHighlight}
+      onPress={open}
+    >
+      <View style={styles.rowHeading}>
         <Text numberOfLines={1} ellipsizeMode="tail" style={styles.nodeTitle}>
           {title}
         </Text>
-        <StatusBadge
-          size="xs"
-          variant={processState === "active" ? "success" : "muted"}
-          label={statusLabel}
-          leading={statusDot}
-        />
-      </PressHighlight>
-    </View>
+        {roleLabel ? <StatusBadge size="xs" variant="muted" label={roleLabel} /> : null}
+      </View>
+      <Text style={styles.rowMeta}>{statusLabel}</Text>
+    </PressHighlight>
   );
 }
 
@@ -364,23 +467,43 @@ const styles = StyleSheet.create((theme) => ({
   },
   headerTitle: {
     flex: 1,
+    minWidth: 0,
     color: theme.colors.foreground,
     fontSize: theme.fontSize.base,
     fontWeight: theme.fontWeight.medium,
   },
   tree: { padding: theme.spacing[2] },
-  row: { flexDirection: "row", alignItems: "center", minHeight: 36 },
-  levelTwo: { paddingLeft: theme.spacing[3] },
-  levelThree: { paddingLeft: theme.spacing[6] },
-  rowBody: {
-    flex: 1,
-    minWidth: 0,
-    minHeight: 36,
+  toggle: {
+    flexShrink: 1,
+    borderRadius: theme.borderRadius.full,
+  },
+  sectionHeading: {
     flexDirection: "row",
     alignItems: "center",
-    gap: theme.spacing[2],
+    gap: theme.spacing[1],
+    minHeight: 36,
     paddingHorizontal: theme.spacing[1],
     borderRadius: theme.borderRadius.md,
+  },
+  sectionTitle: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+    fontWeight: theme.fontWeight.medium,
+  },
+  row: {
+    minHeight: 36,
+    justifyContent: "center",
+    gap: theme.spacing[1],
+    paddingHorizontal: theme.spacing[1],
+    paddingVertical: theme.spacing[1],
+    borderRadius: theme.borderRadius.md,
+  },
+  levelTwo: { marginLeft: theme.spacing[3] },
+  levelThree: { marginLeft: theme.spacing[6] },
+  rowHeading: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[1],
   },
   rowHighlight: { backgroundColor: theme.colors.interactionHighlight },
   nodeTitle: {
@@ -389,18 +512,8 @@ const styles = StyleSheet.create((theme) => ({
     color: theme.colors.foreground,
     fontSize: theme.fontSize.base,
   },
-  leaf: { width: 24, alignItems: "center" },
-  leafDot: {
-    width: 3,
-    height: 3,
-    borderRadius: theme.borderRadius.full,
-    backgroundColor: theme.colors.foregroundMuted,
+  rowMeta: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
   },
-  statusDot: {
-    width: 6,
-    height: 6,
-    borderRadius: theme.borderRadius.full,
-    backgroundColor: theme.colors.foregroundMuted,
-  },
-  activeDot: { backgroundColor: theme.colors.statusDotSuccess },
 }));

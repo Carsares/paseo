@@ -1,6 +1,11 @@
 import { execFileSync } from "node:child_process";
 import type { z } from "zod";
 import { BUILTIN_PROVIDER_IDS } from "@getpaseo/protocol/provider-manifest";
+import {
+  PARENT_AGENT_ID_LABEL,
+  WORKSPACE_ROLE_LABEL,
+  WORKSPACE_MAIN_ROLE,
+} from "@getpaseo/protocol/agent-labels";
 import { WebSocket } from "ws";
 import { SessionInboundMessageSchema, WSOutboundMessageSchema } from "@getpaseo/protocol/messages";
 import { randomUUID } from "node:crypto";
@@ -14,6 +19,88 @@ import type { AgentTimelineItem } from "../agent/agent-sdk-types.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
+
+test("creates a silent Main Session and scopes summary and history to the new workspace", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "creation-main-session-"));
+  const opened: string[] = [];
+  const daemon = await createCreationDaemon({
+    agentClients: createTestAgentClients({
+      beforeCreateSession: async (config) => {
+        if (!config.internal) opened.push(config.provider);
+      },
+    }),
+  });
+  const client = new DaemonClient({
+    url: `ws://127.0.0.1:${daemon.port}/ws`,
+    appVersion: "0.16.0",
+    clientId: "creation-main-session",
+  });
+  try {
+    await client.connect();
+    const source = { kind: "directory", path: directory } as const;
+    const legacy = await client.createWorkspace({
+      source,
+      agent: { config: { provider: "codex", cwd: directory } },
+    });
+    expect(legacy.error).toBeNull();
+    expect(legacy.mainAgent).toBeUndefined();
+    const empty = await client.createWorkspace({
+      source,
+      mainAgent: { config: { provider: "claude", cwd: directory } },
+    });
+    expect(empty.error).toBeNull();
+    expect(empty.agent).toBeUndefined();
+    expect(empty.mainAgent).toMatchObject({
+      workspaceId: empty.workspace?.id,
+      status: "closed",
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
+    expect(opened).toEqual(["codex"]);
+    const input = {
+      source,
+      idempotencyKey: "default-main",
+      mainAgent: { config: { provider: "claude", cwd: directory } },
+      agent: { config: { provider: "codex", cwd: directory }, initialPrompt: "Write a test" },
+    };
+    const created = await client.createWorkspace(input);
+    expect(created.error).toBeNull();
+    if (!created.workspace || !created.agent || !created.mainAgent) {
+      throw new Error("Expected the workspace, Main Session, and coding session");
+    }
+    const { workspace, agent, mainAgent } = created;
+    expect(mainAgent).toMatchObject({
+      workspaceId: workspace.id,
+      status: "closed",
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
+    expect(agent.labels).toMatchObject({ [PARENT_AGENT_ID_LABEL]: mainAgent.id });
+    expect(created.creation?.mainAgent?.id).toBe(mainAgent.id);
+    const duplicate = await client.createWorkspace(input);
+    expect(duplicate.mainAgent?.id).toBe(mainAgent.id);
+    expect(duplicate.agent?.id).toBe(agent.id);
+    const history = await client.fetchAgentHistory({ filter: { workspaceIds: [workspace.id] } });
+    expect(history.entries.map(({ agent: entry }) => entry.id).sort()).toEqual(
+      [mainAgent.id, agent.id].sort(),
+    );
+    const emptyHistory = await client.fetchAgentHistory({ filter: { workspaceIds: [] } });
+    expect(emptyHistory.entries).toEqual([]);
+    const summary = await client.summarizeWorkspaceAgents({ workspaceId: workspace.id });
+    expect(summary.entries).toHaveLength(1);
+    expect(summary.entries[0]).toMatchObject({
+      agentId: agent.id,
+      parentAgentId: mainAgent.id,
+      relationship: "level1",
+      firstUserPrompt: "Write a test",
+    });
+    expect(summary.attachment.type).toBe("text");
+    expect(daemon.daemon.agentManager.getAgent(mainAgent.id)).toBeNull();
+    expect(opened).toEqual(["codex", "codex"]);
+  } finally {
+    await client.close();
+    await daemon.close();
+    await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  }
+}, 60_000);
 
 function createCreationDaemon(options: Parameters<typeof createTestPaseoDaemon>[0] = {}) {
   const agentClients = options.agentClients ?? createTestAgentClients();

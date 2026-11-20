@@ -1,4 +1,5 @@
 import {
+  getOpenAgentTabLabel,
   PARENT_AGENT_ID_LABEL,
   parentAddressLabels,
   WORKSPACE_MAIN_ROLE,
@@ -11,7 +12,7 @@ import {
   findWorkspaceMainAgentId,
   hasUnarchivedWorkspaceDescendants,
   type MainControlSession,
-  selectMainControlTree,
+  selectMainControlWorkspaceSections,
 } from "./select-tree";
 
 type TreeAgent = NonNullable<ReturnType<MainControlSession["agents"]["get"]>>;
@@ -37,100 +38,157 @@ function session(...agents: TreeAgent[]): MainControlSession {
   return { serverId: "host", agents: new Map(agents.map((value) => [value.id, value])) };
 }
 
-describe("main control tree", () => {
-  it("orders all three levels by creation time and ignores archived, background, and unrelated nodes", () => {
-    const tree = selectMainControlTree({
-      session: session(
+function selectSections(
+  local: MainControlSession,
+  options: Partial<Parameters<typeof selectMainControlWorkspaceSections>[0]> = {},
+) {
+  return selectMainControlWorkspaceSections({
+    session: local,
+    workspaceId: "workspace",
+    mainAgentId: main.id,
+    fallbackTitle: "Agent",
+    openTabAgentIds: new Set(),
+    ...options,
+  });
+}
+
+describe("main control sessions", () => {
+  it("groups workspace sessions with the main first and preserves descendant order and depth", () => {
+    const sections = selectSections(
+      session(
         main,
         agent("later", { labels: parent("main"), createdAt: new Date(2), title: " " }),
         agent("earlier", { labels: parent("main"), createdAt: new Date(1), title: "  Earlier  " }),
         agent("second-leaf", { labels: parent("earlier"), createdAt: new Date(2) }),
-        agent("first-leaf", { labels: parent("earlier"), createdAt: new Date(1) }),
+        agent("first-leaf", {
+          labels: parent("earlier"),
+          status: "running",
+          createdAt: new Date(1),
+        }),
         agent("too-deep", { labels: parent("first-leaf") }),
         agent("archived", { labels: parent("main"), archivedAt }),
         agent("background", { labels: parent("earlier"), background: true }),
-        agent("different-host-parent", {
-          labels: parentAddressLabels({ serverId: "other", agentId: "main" }),
-        }),
-        agent("unrelated"),
+        agent("standalone"),
+        agent("foreign", { workspaceId: "elsewhere", status: "running" }),
       ),
-      mainAgentId: "main",
-      fallbackTitle: "Agent",
-    });
+      { openTabAgentIds: new Set(["earlier", "later", "standalone"]) },
+    );
 
-    expect(tree).toMatchObject({
-      agentId: "main",
-      depth: 0,
-      children: [
-        {
-          agentId: "earlier",
-          depth: 1,
-          title: "Earlier",
-          children: [
-            { agentId: "first-leaf", depth: 2, children: [] },
-            { agentId: "second-leaf", depth: 2, children: [] },
-          ],
-        },
-        { agentId: "later", depth: 1, title: "Agent", children: [] },
-      ],
-    });
+    expect(sections?.active).toMatchObject([
+      { agentId: "main", depth: 0, roleBadge: "main", processState: "idle" },
+      { agentId: "earlier", depth: 1, title: "Earlier", processState: "idle" },
+      { agentId: "first-leaf", depth: 2, processState: "running" },
+      { agentId: "later", depth: 1, title: "Agent" },
+      { agentId: "standalone", depth: 0, roleBadge: "standalone" },
+    ]);
+    expect(sections?.closed).toMatchObject([
+      { agentId: "archived", isArchived: true, depth: 1 },
+      { agentId: "second-leaf", isArchived: false, depth: 2 },
+      { agentId: "too-deep", isArchived: false, depth: 2 },
+    ]);
   });
 
-  it("locates cross-host descendants by the parent address even when IDs repeat", () => {
-    const local = session(main, agent("lead", { labels: parent("main"), createdAt: new Date(1) }));
+  it("keeps cross-host and cross-workspace descendants without confusing repeated ids", () => {
+    const local = session(
+      main,
+      agent("lead", { labels: parent("main"), createdAt: new Date(1) }),
+      agent("sibling-workspace", { labels: parent("main"), workspaceId: "elsewhere" }),
+    );
     const remote = session(
       agent("lead", {
         labels: parentAddressLabels({ serverId: "host", agentId: "main" }),
         createdAt: new Date(2),
       }),
       agent("worker", { labels: parent("lead") }),
-      agent("pending", { labels: parent("lead") }),
+      agent("deep-remote", { labels: parent("worker"), status: "running" }),
+      agent("pending", { labels: parent("lead"), status: "running" }),
+      agent("unrelated", { status: "running" }),
     );
-    const tree = selectMainControlTree({
-      session: local,
+    const sections = selectSections(local, {
       agentMaps: { remote: remote.agents },
-      mainAgentId: main.id,
-      fallbackTitle: "Agent",
+      openTabAgentIds: new Set(["lead"]),
       pendingArchiveIds: new Set(["remote:pending"]),
     });
-    expect(tree?.children).toMatchObject([
-      { serverId: "host", agentId: "lead", children: [] },
+    expect(sections?.active).toMatchObject([
+      { serverId: "host", agentId: "main" },
+      { serverId: "host", agentId: "lead", depth: 1 },
+      { serverId: "remote", agentId: "deep-remote", depth: 2 },
+    ]);
+    expect(sections?.closed).toMatchObject([
+      { serverId: "remote", agentId: "lead", depth: 1 },
+      { serverId: "host", agentId: "sibling-workspace", depth: 1 },
+      { serverId: "remote", agentId: "worker", depth: 2 },
+    ]);
+  });
+
+  it("moves an idle session to Closed as soon as this workspace's tab closes", () => {
+    const label = getOpenAgentTabLabel("local");
+    const child = agent("child", {
+      labels: { ...parent("main"), [label]: "true", [getOpenAgentTabLabel("remote")]: "true" },
+    });
+    const otherWorkspace = agent("other-workspace", {
+      workspaceId: "elsewhere",
+      labels: { ...parent("main"), [label]: "true" },
+    });
+    const local = session(main, child, otherWorkspace);
+    expect(
+      selectSections(local, {
+        openTabAgentIds: new Set(["child"]),
+      })?.active.map((node) => node.agentId),
+    ).toEqual(["main", "child", "other-workspace"]);
+
+    const closedTab = selectSections(local);
+    expect(closedTab?.active.map((node) => node.agentId)).toEqual(["main", "other-workspace"]);
+    expect(closedTab?.closed).toMatchObject([{ agentId: "child", isArchived: false }]);
+  });
+
+  it("deduplicates archived history against live state and sorts all closed sessions by activity", () => {
+    const live = agent("unarchived", { status: "running" });
+    const archived = agent("archive", { archivedAt, labels: parent("main") });
+    const sections = selectSections(
+      session(
+        main,
+        live,
+        { ...archived, title: "Stale live title" },
+        agent("newly-archived", { archivedAt: new Date(40) }),
+        agent("closed-tab", { updatedAt: new Date(35) }),
+      ),
       {
-        serverId: "remote",
-        agentId: "lead",
-        children: [{ serverId: "remote", agentId: "worker", children: [] }],
+        archivedAgents: [
+          { ...live, archivedAt },
+          { ...archived, lastActivityAt: new Date(50), status: "running" },
+          { ...main, archivedAt },
+          agent("background", { archivedAt, background: true }),
+          agent("foreign", { archivedAt, workspaceId: "another-workspace" }),
+          agent("recent", { archivedAt: new Date(25), updatedAt: new Date(60) }),
+        ],
       },
+    );
+
+    expect(sections?.active.map((node) => node.agentId)).toEqual(["main", "unarchived"]);
+    expect(sections?.closed).toMatchObject([
+      { agentId: "recent", isArchived: true },
+      { agentId: "archive", title: "archive", depth: 1, isArchived: true, processState: "closed" },
+      { agentId: "newly-archived", roleBadge: "standalone", isArchived: true },
+      { agentId: "closed-tab", roleBadge: "standalone", isArchived: false },
     ]);
   });
 
   it.each([
-    { name: "running", state: { status: "running" }, expected: "active" },
-    { name: "initializing", state: { status: "initializing" }, expected: "active" },
+    { name: "running", state: { status: "running" } },
+    { name: "initializing", state: { status: "initializing" } },
     {
       name: "open turn",
       state: {
         turn: { phase: "open", turnId: null, startedAt: null, cancellationRequestId: null },
       },
-      expected: "active",
     },
-    { name: "background work", state: { backgroundWork: { count: 1 } }, expected: "active" },
-    { name: "idle", state: { status: "idle" }, expected: "terminated" },
-    { name: "closed", state: { status: "closed" }, expected: "terminated" },
-    { name: "error", state: { status: "error" }, expected: "terminated" },
-    {
-      name: "archived even when running",
-      state: { archivedAt, status: "running" },
-      expected: "terminated",
-    },
-  ] satisfies { name: string; state: Partial<TreeAgent>; expected: string }[])(
-    "shows $name as $expected",
-    ({ state, expected }) => {
-      const tree = selectMainControlTree({
-        session: session({ ...main, ...state }),
-        mainAgentId: "main",
-        fallbackTitle: "Agent",
-      });
-      expect(tree?.processState).toBe(expected);
+    { name: "background work", state: { backgroundWork: { count: 1 } } },
+  ] satisfies { name: string; state: Partial<TreeAgent> }[])(
+    "keeps $name sessions active even without an open tab",
+    ({ state }) => {
+      const sections = selectSections(session(main, agent("child", state)));
+      expect(sections?.active[1]).toMatchObject({ agentId: "child", processState: "running" });
     },
   );
 
@@ -145,13 +203,8 @@ describe("main control tree", () => {
     expect(
       findWorkspaceMainAgentId(session(foreign, archived, background, child, main), "workspace"),
     ).toBe("main");
-    expect(
-      selectMainControlTree({
-        session: session(child),
-        mainAgentId: "child",
-        fallbackTitle: "Agent",
-      }),
-    ).toBeNull();
+    expect(selectSections(session(child), { mainAgentId: "child" })).toBeNull();
+    expect(selectSections(session(archived), { mainAgentId: "archived" })).toBeNull();
   });
 
   it("only attaches unarchived roots in the same workspace without exceeding three levels", () => {
@@ -198,22 +251,6 @@ describe("main control tree", () => {
         "workspace",
       ),
     ).toBe(false);
-  });
-
-  it("breaks malformed parent cycles so nodes never duplicate across levels", () => {
-    const first = agent("first", { labels: parent("main"), createdAt: new Date(1) });
-    const cyclicChild = agent("cyclic", { labels: parent("first"), createdAt: new Date(2) });
-    const tree = selectMainControlTree({
-      session: session(main, first, cyclicChild, {
-        ...first,
-        id: "self-loop",
-        labels: parent("self-loop"),
-      }),
-      mainAgentId: "main",
-      fallbackTitle: "Agent",
-    });
-    expect(tree?.children.map((node) => node.agentId)).toEqual(["first"]);
-    expect(tree?.children[0]?.children.map((node) => node.agentId)).toEqual(["cyclic"]);
   });
 
   it("memoizes workspace hierarchy tab state across unrelated agent updates", () => {

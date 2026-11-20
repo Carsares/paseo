@@ -138,6 +138,36 @@ const SourceSchema = z.object({
     expect(validateWSOutboundMessage({ type: "not_a_message" }).success).toBe(false);
   });
 
+  it("validates a workspace summary with a text attachment", () => {
+    const envelope = {
+      type: "session",
+      message: {
+        type: "workspace.agents.summary.response",
+        payload: {
+          workspaceId: "wks_1234567890abcdef",
+          requestId: "summary",
+          summaryText: "Work finished",
+          attachment: { type: "text", mimeType: "text/plain", text: "Work finished" },
+          entries: [],
+          error: null,
+        },
+      },
+    };
+    expect(validateWSOutboundMessage(envelope)).toEqual({ success: true, data: envelope });
+    expect(
+      validateWSOutboundMessage({
+        ...envelope,
+        message: {
+          ...envelope.message,
+          payload: {
+            ...envelope.message.payload,
+            attachment: { ...envelope.message.payload.attachment, text: 123 },
+          },
+        },
+      }).success,
+    ).toBe(false);
+  });
+
   it("accepts project config responses with and without setup commit status", () => {
     const payload = {
       requestId: "project-config-read",

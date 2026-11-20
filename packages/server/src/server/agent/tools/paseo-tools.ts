@@ -16,7 +16,11 @@ import type { Logger } from "pino";
 
 import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-types.js";
 import type { AgentManager } from "../agent-manager.js";
-import { ActiveTurnBehaviorSchema, AgentProfileSchema } from "@getpaseo/protocol/messages";
+import {
+  ActiveTurnBehaviorSchema,
+  AgentProfileSchema,
+  WorkspaceAgentSummaryEntrySchema,
+} from "@getpaseo/protocol/messages";
 import type { DaemonConfigStore } from "../../daemon-config-store.js";
 import { featuresFromControls } from "@getpaseo/protocol/option-controls";
 import {
@@ -33,6 +37,7 @@ import {
   toAgentPayload,
 } from "../agent-projections.js";
 import { summarizeAgentActivity } from "../activity-curator.js";
+import { summarizeWorkspaceAgents } from "../workspace-agents-summary.js";
 import type { AgentStorage } from "../agent-storage.js";
 import { AgentNotFoundError, ensureAgentLoaded } from "../agent-loading.js";
 import { isStoredAgentProviderAvailable } from "../../persistence-hooks.js";
@@ -1673,6 +1678,36 @@ function createToolCatalog(
       return {
         content: [],
         structuredContent: ensureValidJson({ workspaces }),
+      };
+    },
+  );
+
+  registerTool(
+    "summarize_workspace_agents",
+    {
+      title: "Summarize workspace sessions",
+      description:
+        "Read active and closed sessions, their latest progress, tasks, and touched files.",
+      inputSchema: { workspaceId: z.string().trim().min(1).optional() },
+      outputSchema: {
+        workspaceId: z.string(),
+        summaryText: z.string(),
+        entries: z.array(WorkspaceAgentSummaryEntrySchema),
+      },
+    },
+    async ({ workspaceId: requestedWorkspaceId }) => {
+      if (!options.workspaceRegistry) throw new Error("Workspace registry is not configured");
+      const workspaceId = resolveWorkspaceIdForRename(requestedWorkspaceId);
+      const { summaryText, entries } = await summarizeWorkspaceAgents({
+        workspaceId,
+        agentManager,
+        agentStorage,
+        workspaceRegistry: options.workspaceRegistry,
+        logger: childLogger,
+      });
+      return {
+        content: [],
+        structuredContent: ensureValidJson({ workspaceId, summaryText, entries }),
       };
     },
   );

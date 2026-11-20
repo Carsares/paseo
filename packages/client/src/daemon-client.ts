@@ -52,6 +52,8 @@ import {
 } from "@getpaseo/protocol/messages";
 import { validateWSOutboundMessage } from "@getpaseo/protocol/validation/ws-outbound";
 import type {
+  AgentAttachment,
+  WorkspaceAgentSummaryEntry,
   AgentStreamEventPayload,
   AgentSnapshotPayload,
   ProjectPlacementPayload,
@@ -532,6 +534,8 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
   metadata?: CreateAgentRequestMessage["metadata"];
 }
 
+export type CreateWorkspaceAgentConfig = AgentSessionConfig;
+
 export interface CreateWorkspaceRequestOptions {
   source: WorkspaceCreateRequest["source"];
   title?: string;
@@ -542,6 +546,7 @@ export interface CreateWorkspaceRequestOptions {
   callerAgentId?: string;
   idempotencyKey?: string;
   workspaceId?: string;
+  mainAgent?: { config: CreateWorkspaceAgentConfig };
   agent?: Omit<
     CreateAgentRequestOptions,
     "workspaceId" | "onEvent" | "worktree" | "git" | "worktreeName" | "idempotencyKey" | "requestId"
@@ -2966,8 +2971,9 @@ export class DaemonClient {
   }
 
   private requireAgentHistoryCapabilities(options?: FetchAgentHistoryOptions): void {
+    if (!options) return;
     const features = this.lastServerInfoMessage?.features;
-    const archiveScope = options?.archiveScope;
+    const archiveScope = options.archiveScope;
     // COMPAT(agentHistoryArchiveScope): added in v0.16.0, remove gate after 2027-05-19.
     if (
       archiveScope !== undefined &&
@@ -2976,8 +2982,8 @@ export class DaemonClient {
     ) {
       throw new Error("Update the host to filter agent history by archive status.");
     }
-    const searchScope = options?.searchScope;
-    const usesArchivedAtSort = options?.sort?.some((entry) => entry.key === "archived_at") === true;
+    const searchScope = options.searchScope;
+    const usesArchivedAtSort = options.sort?.some((entry) => entry.key === "archived_at") === true;
     // COMPAT(agentHistoryQueryControls): added in v0.16.0, remove gate after 2027-05-19.
     if (
       ((searchScope !== undefined && searchScope !== "all") || usesArchivedAtSort) &&
@@ -2986,6 +2992,13 @@ export class DaemonClient {
       throw new Error(
         "Update the host to use agent history search scopes or archive-time sorting.",
       );
+    }
+    // COMPAT(agentHistoryWorkspaceFilter): added in v0.16.0, remove gate after 2027-05-20.
+    if (
+      options.filter?.workspaceIds !== undefined &&
+      features?.agentHistoryWorkspaceFilter !== true
+    ) {
+      throw new Error("Update the host to filter agent history by workspace.");
     }
   }
 
@@ -5633,6 +5646,9 @@ export class DaemonClient {
       throw new Error("Configure background on the workspace, not its initial agent.");
     if (input.metadata !== undefined || input.agent?.metadata !== undefined)
       this.requireEntityMetadata();
+    const mainAgent = input.mainAgent
+      ? await this.normalizeWorkspaceMainAgent(input.mainAgent)
+      : undefined;
     let agentConfig = input.agent ? resolveAgentConfig(input.agent) : undefined;
     if (agentConfig && this.carriesLegacyOptions(agentConfig)) {
       agentConfig = await this.routeLegacyCreateConfig(agentConfig);
@@ -5641,6 +5657,7 @@ export class DaemonClient {
       ...input,
       requestId: resolvedRequestId,
       ...(input.agent && agentConfig ? { agent: { ...input.agent, config: agentConfig } } : {}),
+      ...(mainAgent ? { mainAgent } : {}),
     });
     return {
       ...result,
@@ -5648,6 +5665,46 @@ export class DaemonClient {
       agent: result.agent ?? undefined,
       setupTerminalId: result.setupTerminalId ?? null,
       requestId: result.requestId ?? resolvedRequestId,
+    };
+  }
+
+  private async normalizeWorkspaceMainAgent(
+    input: NonNullable<CreateWorkspaceRequestOptions["mainAgent"]>,
+  ): Promise<{ config: AgentSessionConfig }> {
+    // COMPAT(workspaceMainAgentDefault): added in v0.16.0, remove gate after 2027-05-20.
+    if (this.lastServerInfoMessage?.features?.workspaceMainAgentDefault !== true) {
+      throw new Error("Update the host to create workspaces with a Main Session.");
+    }
+    const config = resolveAgentConfig(input);
+    return {
+      config: this.carriesLegacyOptions(config)
+        ? await this.routeLegacyCreateConfig(config)
+        : config,
+    };
+  }
+
+  async summarizeWorkspaceAgents(input: { workspaceId: string }): Promise<{
+    workspaceId: string;
+    summaryText: string;
+    attachment: Extract<AgentAttachment, { type: "text" }>;
+    entries: WorkspaceAgentSummaryEntry[];
+  }> {
+    // COMPAT(workspaceAgentsSummary): added in v0.16.0, remove gate after 2027-05-20.
+    if (this.lastServerInfoMessage?.features?.workspaceAgentsSummary !== true) {
+      throw new Error("Update the host to summarize workspace sessions.");
+    }
+    const payload = await this.sendCorrelatedSessionRequest({
+      message: { type: "workspace.agents.summary.request", workspaceId: input.workspaceId },
+      responseType: "workspace.agents.summary.response",
+    });
+    if (payload.error || !payload.attachment || payload.attachment.type !== "text") {
+      throw new Error(payload.error || "Failed to summarize workspace agents");
+    }
+    return {
+      workspaceId: payload.workspaceId,
+      summaryText: payload.summaryText,
+      attachment: payload.attachment,
+      entries: payload.entries,
     };
   }
 

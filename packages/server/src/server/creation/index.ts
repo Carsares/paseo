@@ -28,10 +28,15 @@ interface CreationRequest {
   provision?: (
     workspaceId: string,
   ) => Promise<{ workspace: WorkspaceDescriptorPayload; setupSkippedReason?: string }>;
+  createMainAgent?: (
+    workspace: WorkspaceDescriptorPayload,
+    agentId: string,
+  ) => Promise<AgentSnapshotPayload>;
   createAgent?: (
     agentId: string,
     workspace: WorkspaceDescriptorPayload | undefined,
     onReady: (agent: AgentSnapshotPayload) => Promise<void>,
+    mainAgent: AgentSnapshotPayload | null | undefined,
   ) => Promise<CreatedAgent>;
 }
 export type CreationInput = CreationRequest &
@@ -42,7 +47,8 @@ export type CreationInput = CreationRequest &
 const RecordSchema = z.object({
   fingerprint: z.string(),
   snapshot: CreationSnapshotSchema,
-  inFlight: z.enum(["workspace", "agent", "prompt"]).nullable(),
+  mainAgentId: z.string().optional(),
+  inFlight: z.enum(["workspace", "agent", "mainAgent", "prompt"]).nullable(),
 });
 type Record = z.infer<typeof RecordSchema>;
 
@@ -80,7 +86,7 @@ export class CreationService {
         await this.publish(identity, record, {
           phase: "failed",
           error: `${input.kind}_request_outcome_unknown`,
-          failedStage: record.inFlight,
+          failedStage: record.inFlight === "mainAgent" ? "agent" : record.inFlight,
           outcomeUnknown: true,
         });
         return { completion: Promise.resolve(record.snapshot), snapshot: record.snapshot };
@@ -90,7 +96,7 @@ export class CreationService {
         // Persist identity before claiming resources. A failed admission can only retry these IDs.
         await this.write(identity, record);
       }
-      await this.claimResources(identity, record.snapshot, input);
+      await this.claimResources(identity, record, input);
       if (record.snapshot.phase === "failed") {
         await this.publish(identity, record, {
           phase: record.snapshot.workspace ? "workspace_ready" : "accepted",
@@ -135,7 +141,7 @@ export class CreationService {
       if (record?.inFlight && !this.active.has(identity)) {
         await this.publish(identity, record, {
           phase: "failed",
-          failedStage: record.inFlight,
+          failedStage: record.inFlight === "mainAgent" ? "agent" : record.inFlight,
           outcomeUnknown: true,
           error: `${kind}_request_outcome_unknown`,
         });
@@ -168,6 +174,7 @@ export class CreationService {
           setupSkippedReason,
         });
       }
+      await this.createMainAgent(identity, record, input.createMainAgent);
       if (input.hasAgent && input.createAgent && !record.snapshot.agent) {
         record.inFlight = "agent";
         await this.write(identity, record);
@@ -182,6 +189,7 @@ export class CreationService {
               workspaceId: readyAgent.workspaceId ?? record.snapshot.workspaceId,
             });
           },
+          record.snapshot.mainAgent,
         );
         record.inFlight = null;
         if (initialPromptStarted)
@@ -191,30 +199,53 @@ export class CreationService {
       record.inFlight = null;
       await this.publish(identity, record, { phase: "completed" });
     } catch (error) {
-      const stage = record.inFlight ?? "agent";
-      const resourceId =
-        stage === "workspace" ? record.snapshot.workspaceId : record.snapshot.agentId;
-      const code =
-        error instanceof Error && "code" in error && typeof error.code === "string"
-          ? error.code
-          : undefined;
-      const rejectedBeforeProvision = code === "directory_not_found" || code === "source_required";
-      const unknown =
-        stage === "prompt" ||
-        (stage === "workspace" && !rejectedBeforeProvision) ||
-        (resourceId !== null && (await input.exists(stage, resourceId)));
-      // A failed provider startup with no registered resource can retry under the same ID.
-      // A partially provisioned resource or an attempted prompt needs reconciliation.
-      if (!unknown) record.inFlight = null;
-      await this.publish(identity, record, {
-        phase: "failed",
-        error: error instanceof Error ? error.message : String(error),
-        errorCode: code,
-        failedStage: stage,
-        outcomeUnknown: unknown,
-      });
+      await this.recordFailure(identity, record, input.exists, error);
     }
     return record.snapshot;
+  }
+
+  private async recordFailure(
+    identity: string,
+    record: Record,
+    exists: CreationInput["exists"],
+    error: unknown,
+  ): Promise<void> {
+    const { inFlight, snapshot } = record;
+    const stage = inFlight === "mainAgent" ? "agent" : (inFlight ?? "agent");
+    let resourceId = stage === "workspace" ? snapshot.workspaceId : snapshot.agentId;
+    if (inFlight === "mainAgent") resourceId = record.mainAgentId ?? null;
+    const code =
+      error instanceof Error && "code" in error && typeof error.code === "string"
+        ? error.code
+        : undefined;
+    const rejectedBeforeProvision = code === "directory_not_found" || code === "source_required";
+    const unknown =
+      stage === "prompt" ||
+      (stage === "workspace" && !rejectedBeforeProvision) ||
+      (resourceId !== null && (await exists(stage, resourceId)));
+    // A partially provisioned resource or an attempted prompt needs reconciliation.
+    if (!unknown) record.inFlight = null;
+    await this.publish(identity, record, {
+      phase: "failed",
+      error: error instanceof Error ? error.message : String(error),
+      errorCode: code,
+      failedStage: stage,
+      outcomeUnknown: unknown,
+    });
+  }
+
+  private async createMainAgent(
+    identity: string,
+    record: Record,
+    create: CreationInput["createMainAgent"],
+  ): Promise<void> {
+    if (!create || !record.snapshot.workspace || !record.mainAgentId || record.snapshot.mainAgent)
+      return;
+    record.inFlight = "mainAgent";
+    await this.write(identity, record);
+    const mainAgent = await create(record.snapshot.workspace, record.mainAgentId);
+    record.inFlight = null;
+    await this.publish(identity, record, { mainAgent });
   }
 
   // COMPAT(agentRequestReceipts): added in v0.8.0, remove after 2027-03-11 once old creation receipts can expire.
@@ -252,12 +283,14 @@ export class CreationService {
 
   private async claimResources(
     identity: string,
-    snapshot: CreationSnapshot,
+    record: Record,
     input: CreationInput,
   ): Promise<void> {
+    const { snapshot, mainAgentId } = record;
     if (input.kind === "workspace" && snapshot.workspaceId)
       await this.claim(identity, "workspace", snapshot.workspaceId, input.exists);
     if (snapshot.agentId) await this.claim(identity, "agent", snapshot.agentId, input.exists);
+    if (mainAgentId) await this.claim(identity, "agent", mainAgentId, input.exists);
   }
 
   private async claim(
@@ -342,6 +375,7 @@ function initialRecord(input: CreationInput, fingerprint: string): Record {
   return {
     fingerprint,
     inFlight: null,
+    ...(input.createMainAgent ? { mainAgentId: randomUUID() } : {}),
     snapshot: {
       kind: input.kind,
       idempotencyKey: input.key,
