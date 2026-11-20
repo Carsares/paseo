@@ -1,4 +1,7 @@
 import { useDisclosureHold } from "@/agent-stream/disclosure";
+import { markdownCopyDataSet } from "@/assistant-selection-copy/markup";
+import { useAssistantMessageExpansion } from "@/components/assistant-message-expansion/expansion-context";
+import { Button } from "@/components/ui/button";
 import { MessagePreview, MessageSender } from "@/components/user-message";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { getAgentAttachmentPillContent } from "@/attachments/attachment-pill-content";
@@ -787,6 +790,7 @@ export const LiveElapsed = memo(function LiveElapsed({
 });
 
 interface AssistantMessageProps {
+  itemId: string;
   renderFullContent?: boolean;
   occurrenceKey: string;
   message: string;
@@ -797,6 +801,8 @@ interface AssistantMessageProps {
   spacing?: "default" | "compactTop" | "compactBottom" | "compactBoth";
   phase: MarkdownPhase;
 }
+
+const COLLAPSE_BELOW_CONTENT = { triggerEdge: "bottom" } as const;
 
 export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
   container: {
@@ -809,12 +815,26 @@ export const assistantMessageStylesheet = StyleSheet.create((theme) => ({
   containerCompactBottom: {
     paddingBottom: 0,
   },
-  cappedNotice: {
+  cappedFooter: {
     marginTop: theme.spacing[3],
+    gap: theme.spacing[1],
+  },
+  cappedNotice: {
     fontFamily: theme.fontFamily.ui,
     fontSize: theme.fontSize.base,
     fontStyle: "italic",
     color: theme.colors.foregroundMuted,
+  },
+  cappedActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[3],
+  },
+  cappedToggle: {
+    alignSelf: "flex-start",
+    paddingHorizontal: 0,
+    minHeight: 0,
+    borderWidth: 0,
   },
   imageFrame: {
     width: "100%",
@@ -1212,7 +1232,62 @@ function NativeShimmerPeakSvg({ gradientId }: { gradientId: string }) {
   );
 }
 
+interface AssistantMessageCappedControlsProps {
+  fullMessageByteLength: number | null;
+  canShowMore: boolean;
+  canShowLess: boolean;
+  onShowMore: () => void;
+  onShowLess: () => void;
+}
+
+function AssistantMessageCappedControls({
+  fullMessageByteLength,
+  canShowMore,
+  canShowLess,
+  onShowMore,
+  onShowLess,
+}: AssistantMessageCappedControlsProps) {
+  const { t } = useTranslation();
+  return (
+    <View dataSet={markdownCopyDataSet.ignore} style={assistantMessageStylesheet.cappedFooter}>
+      {fullMessageByteLength !== null ? (
+        <Text
+          testID="assistant-message-capped-notice"
+          style={assistantMessageStylesheet.cappedNotice}
+        >
+          {t("agentStream.messageCapped", { bytes: fullMessageByteLength })}
+        </Text>
+      ) : null}
+      <View style={assistantMessageStylesheet.cappedActions}>
+        {canShowMore ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            testID="assistant-message-show-more"
+            style={assistantMessageStylesheet.cappedToggle}
+            onPress={onShowMore}
+          >
+            {t("turnSummary.showMore")}
+          </Button>
+        ) : null}
+        {canShowLess ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            testID="assistant-message-show-less"
+            style={assistantMessageStylesheet.cappedToggle}
+            onPress={onShowLess}
+          >
+            {t("turnSummary.showLess")}
+          </Button>
+        ) : null}
+      </View>
+    </View>
+  );
+}
+
 export const AssistantMessage = memo(function AssistantMessage({
+  itemId,
   renderFullContent = false,
   occurrenceKey,
   message,
@@ -1223,17 +1298,33 @@ export const AssistantMessage = memo(function AssistantMessage({
   spacing = "default",
   phase,
 }: AssistantMessageProps) {
-  const { t } = useTranslation();
+  const { expandedSteps, showMore, showLess } = useAssistantMessageExpansion(itemId);
+  const hold = useDisclosureHold();
+  const isComplete = phase === "complete";
   const renderedMessage = useMemo(
     () =>
-      renderFullContent ? { text: message, capped: false } : capAssistantMessageForRender(message),
-    [message, renderFullContent],
+      renderFullContent
+        ? { text: message, capped: false }
+        : capAssistantMessageForRender(message, {
+            expandedSteps,
+            preferLineBoundary: isComplete,
+          }),
+    [expandedSteps, isComplete, message, renderFullContent],
   );
   const revealedText = useRevealedText(renderedMessage.text, phase);
-  const revealedMessage = renderFullContent ? renderedMessage.text : revealedText;
+  const bypassPacedReveal = renderFullContent || expandedSteps > 0;
+  const revealedMessage = bypassPacedReveal ? renderedMessage.text : revealedText;
+  const canShowMore = !renderFullContent && isComplete && renderedMessage.capped;
+  const canShowLess = !renderFullContent && isComplete && expandedSteps > 0;
   const fullMessageByteLength = useMemo(
-    () => (renderedMessage.capped && phase === "complete" ? getUtf8ByteLength(message) : null),
-    [message, phase, renderedMessage.capped],
+    () => (canShowMore ? getUtf8ByteLength(message) : null),
+    [canShowMore, message],
+  );
+  // Show more appends below the cut, so holding the top keeps the line above the cut in place.
+  const handleShowMore = useCallback(() => hold(showMore), [hold, showMore]);
+  const handleShowLess = useCallback(
+    () => hold(showLess, COLLAPSE_BELOW_CONTENT),
+    [hold, showLess],
   );
 
   const assistantContainerStyle = useMemo(
@@ -1271,18 +1362,19 @@ export const AssistantMessage = memo(function AssistantMessage({
       <MarkdownRenderer
         text={revealedMessage}
         agentCommands
-        streaming={phase !== "complete" || revealedMessage.length < renderedMessage.text.length}
+        streaming={!isComplete || revealedMessage.length < renderedMessage.text.length}
         client={client}
         workspaceRoot={workspaceRoot}
         serverId={serverId}
       />
-      {fullMessageByteLength !== null ? (
-        <Text
-          testID="assistant-message-capped-notice"
-          style={assistantMessageStylesheet.cappedNotice}
-        >
-          {t("agentStream.messageCapped", { bytes: fullMessageByteLength })}
-        </Text>
+      {canShowMore || canShowLess ? (
+        <AssistantMessageCappedControls
+          fullMessageByteLength={fullMessageByteLength}
+          canShowMore={canShowMore}
+          canShowLess={canShowLess}
+          onShowMore={handleShowMore}
+          onShowLess={handleShowLess}
+        />
       ) : null}
     </View>
   );

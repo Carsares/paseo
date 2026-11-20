@@ -3,6 +3,11 @@ export interface CappedAssistantMessage {
   capped: boolean;
 }
 
+export interface CapAssistantMessageOptions {
+  expandedSteps?: number;
+  preferLineBoundary?: boolean;
+}
+
 export function getUtf8ByteLength(message: string): number {
   let bytes = 0;
 

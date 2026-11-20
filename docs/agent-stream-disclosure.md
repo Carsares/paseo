@@ -1,8 +1,9 @@
 # Agent stream disclosures
 
 Expanding or collapsing something in the chat timeline (a turn's summary line, a tool-call group,
-a tool call's inline details, a todo card, a long user message's show more, a plan card) keeps the
-tapped trigger at the same screen y in the first painted frame. No animation.
+a tool call's inline details, a todo card, a long user message's show more, a capped assistant
+message's show more/less, a plan card) keeps the tapped trigger at the same screen y in the first
+painted frame. No animation.
 
 ## The contract
 
@@ -22,7 +23,9 @@ over the next row for a frame before the list learns the new size.
 `triggerEdge` names the edge of the row the trigger sits on, and the strategy keeps that edge in
 place. Header triggers sit on the top edge, the default. A long user message's show more sits under
 the text it opens, so `MessagePreview` passes `{ triggerEdge: "bottom" }`: the text grows and shrinks
-above the trigger, and the rows below stay put.
+above the trigger, and the rows below stay put. A capped assistant message's show more appends text
+below the cut, so it holds the top edge to keep the line above the cut in place; its show less passes
+`{ triggerEdge: "bottom" }` so the collapsed message ends at the trigger.
 
 Following output:
 
@@ -44,7 +47,8 @@ ends at its end and the trigger moves by the difference.
 The list mounts a row again whenever it opens the chat, brings a web row back into the history
 window, or reassigns a native row's LegendList container. State held in the row resets each time.
 Keep a disclosure's open state in the per-agent store the timeline provides, keyed by item id:
-`ToolCallExpansionContext` for tool calls, `UserMessageExpansionContext` for long user messages.
+`ToolCallExpansionContext` for tool calls, `UserMessageExpansionContext` for long user messages,
+`AssistantMessageExpansionContext` for capped assistant messages.
 
 Decide a row's first painted shape in the commit that mounts it. `MessagePreview` measures its body
 in a layout effect, which commits before paint on web and Fabric. `onLayout` lands after the first

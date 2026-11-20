@@ -5,7 +5,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { i18n as testI18n } from "@/i18n/i18next";
 import { ToolCallDetailsContent } from "@/components/tool-call-details";
-import { ExpandableBadge } from "@/components/message";
+import { AssistantMessage, ExpandableBadge } from "@/components/message";
+import { createAssistantMessageExpansion } from "@/components/assistant-message-expansion/expansion";
+import { AssistantMessageExpansionContext } from "@/components/assistant-message-expansion/expansion-context";
+import { ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT } from "@/components/assistant-message-render-limit";
 import { page, userEvent } from "vitest/browser";
 import { PlanCard } from "@/components/plan-card";
 import { MessagePreview } from "@/components/user-message";
@@ -101,6 +104,69 @@ describe("timeline disclosures hold their row", () => {
       // Show more sits under the text it opens.
       { rowId: "message-1", triggerEdge: "bottom", appliedBefore: false },
       { rowId: "message-1", triggerEdge: "bottom", appliedBefore: true },
+    ]);
+  });
+
+  it("reveals capped assistant messages in 32,000-character steps, holds the row, and survives remount", () => {
+    const firstChunk = `${"a".repeat(ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT - 10)}\n`;
+    const secondChunk = `${"b".repeat(ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT - 10)}\n`;
+    const finalTail = "FINAL_VISIBLE_TAIL";
+    const fullMessage = `${firstChunk}${secondChunk}${finalTail}`;
+    const expansion = createAssistantMessageExpansion();
+    const renderAssistant = () => (
+      <AssistantMessageExpansionContext.Provider value={expansion}>
+        <AssistantMessage
+          itemId="assistant-1"
+          occurrenceKey="occ-1"
+          message={fullMessage}
+          timestamp={0}
+          phase="complete"
+        />
+      </AssistantMessageExpansionContext.Provider>
+    );
+    const holds = mountRow(
+      "assistant-1",
+      () => view().queryByRole("button", { name: "Show less" }) !== null,
+      renderAssistant(),
+    );
+
+    expect(view().getByTestId("assistant-message-capped-notice")).toBeTruthy();
+    expect(container.textContent).not.toContain(finalTail);
+    expect(view().queryByRole("button", { name: "Show less" })).toBeNull();
+
+    act(() => view().getByRole("button", { name: "Show more" }).click());
+    expect(view().getByTestId("assistant-message-capped-notice")).toBeTruthy();
+    expect(view().getByRole("button", { name: "Show more" })).toBeTruthy();
+    expect(view().getByRole("button", { name: "Show less" })).toBeTruthy();
+    expect(container.textContent).not.toContain(finalTail);
+
+    act(() => view().getByRole("button", { name: "Show more" }).click());
+    expect(view().queryByTestId("assistant-message-capped-notice")).toBeNull();
+    expect(view().queryByRole("button", { name: "Show more" })).toBeNull();
+    expect(view().getByRole("button", { name: "Show less" })).toBeTruthy();
+    expect(container.textContent).toContain(finalTail);
+
+    act(() => root.render(null));
+    const remountedHolds = mountRow(
+      "assistant-1",
+      () => view().queryByRole("button", { name: "Show less" }) !== null,
+      renderAssistant(),
+    );
+    expect(container.textContent).toContain(finalTail);
+    expect(view().getByRole("button", { name: "Show less" })).toBeTruthy();
+
+    act(() => view().getByRole("button", { name: "Show less" }).click());
+    expect(view().getByTestId("assistant-message-capped-notice")).toBeTruthy();
+    expect(view().getByRole("button", { name: "Show more" })).toBeTruthy();
+    expect(view().queryByRole("button", { name: "Show less" })).toBeNull();
+    expect(container.textContent).not.toContain(finalTail);
+
+    expect(holds).toEqual([
+      { rowId: "assistant-1", triggerEdge: "top", appliedBefore: false },
+      { rowId: "assistant-1", triggerEdge: "top", appliedBefore: true },
+    ]);
+    expect(remountedHolds).toEqual([
+      { rowId: "assistant-1", triggerEdge: "bottom", appliedBefore: true },
     ]);
   });
 

@@ -55,6 +55,44 @@ describe("assistant message render limit", () => {
       capped: true,
     });
   });
+
+  it("advances the cap by 32,000 characters per expanded step until complete", () => {
+    const message = "a".repeat(ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT * 2 + 500);
+
+    expect(capAssistantMessageForRender(message, { expandedSteps: 1 })).toEqual({
+      text: "a".repeat(ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT * 2),
+      capped: true,
+    });
+    expect(capAssistantMessageForRender(message, { expandedSteps: 2 })).toEqual({
+      text: message,
+      capped: false,
+    });
+  });
+
+  it("snaps back to the preceding line break instead of splitting an inline link", () => {
+    const leading = `${"a".repeat(ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT - 40)}\n`;
+    const brokenLine = "• P2-29 [codex-app-server-agent.ts](file:///workspace/agent.ts#L10)\n";
+    const message = `${leading}${brokenLine}tail`;
+
+    expect(capAssistantMessageForRender(message)).toEqual({
+      text: leading.slice(0, -1),
+      capped: true,
+    });
+    expect(capAssistantMessageForRender(message, { preferLineBoundary: false })).toEqual({
+      text: message.slice(0, ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT),
+      capped: true,
+    });
+  });
+
+  it("strips carriage return when snapping to a CRLF line break", () => {
+    const prefix = "a".repeat(ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT - 20);
+    const message = `${prefix}\r\n${"b".repeat(80)}`;
+
+    expect(capAssistantMessageForRender(message)).toEqual({
+      text: prefix,
+      capped: true,
+    });
+  });
 });
 
 it("preserves complete native multi-paragraph messages and the newline-heavy repro", async () => {

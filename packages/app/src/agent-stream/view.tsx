@@ -76,6 +76,10 @@ import {
   UserMessageExpansionContext,
   useAgentUserMessageExpansion,
 } from "@/components/user-message/expansion-context";
+import {
+  AssistantMessageExpansionContext,
+  useAgentAssistantMessageExpansion,
+} from "@/components/assistant-message-expansion/expansion-context";
 import { ToolCallSheetProvider } from "@/components/tool-call-sheet";
 import { createStreamPresentation } from "./presentation";
 import { OverviewToolCallGroupView } from "@/tool-calls/detail-level/overview/view";
@@ -454,6 +458,30 @@ function useStreamSubagentActions({
   };
 }
 
+interface StreamExpansionProvidersProps {
+  toolCallExpansion: ReturnType<typeof useAgentToolCallExpansion>;
+  userMessageExpansion: ReturnType<typeof useAgentUserMessageExpansion>;
+  assistantMessageExpansion: ReturnType<typeof useAgentAssistantMessageExpansion>;
+  children: ReactNode;
+}
+
+function StreamExpansionProviders({
+  toolCallExpansion,
+  userMessageExpansion,
+  assistantMessageExpansion,
+  children,
+}: StreamExpansionProvidersProps) {
+  return (
+    <ToolCallExpansionContext.Provider value={toolCallExpansion}>
+      <UserMessageExpansionContext.Provider value={userMessageExpansion}>
+        <AssistantMessageExpansionContext.Provider value={assistantMessageExpansion}>
+          {children}
+        </AssistantMessageExpansionContext.Provider>
+      </UserMessageExpansionContext.Provider>
+    </ToolCallExpansionContext.Provider>
+  );
+}
+
 const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamViewProps>(
   function AgentStreamView(
     {
@@ -508,6 +536,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     );
     const toolCallExpansion = useAgentToolCallExpansion(agentId);
     const userMessageExpansion = useAgentUserMessageExpansion(agentId);
+    const assistantMessageExpansion = useAgentAssistantMessageExpansion(agentId);
     const expandedToolCallGroups = useExpandedToolCallGroups(toolCallExpansion);
     const [expandedTurnHostIds, setExpandedTurnHostIds] = useState<ReadonlySet<string>>(new Set());
 
@@ -855,6 +884,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             <ChatFindExpansion messageId={getStreamItemMessageId(item)}>
               {(renderFullContent) => (
                 <AssistantMessage
+                  itemId={item.id}
                   renderFullContent={renderFullContent}
                   occurrenceKey={createAssistantImageOccurrenceKey({ agentId, itemId: item.id })}
                   message={item.text}
@@ -1285,36 +1315,38 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
               onSpawnSubagentFromSelection={onSpawnSubagentFromSelection}
             >
               <MessageOuterSpacingProvider disableOuterSpacing>
-                <ToolCallExpansionContext.Provider value={toolCallExpansion}>
-                  <UserMessageExpansionContext.Provider value={userMessageExpansion}>
-                    {streamRenderStrategy.render({
-                      readingRowReplacements: presentation.readingRowReplacements,
-                      agentId,
-                      segments: renderModel.segments,
-                      historyRowRevision,
-                      liveHeadRowRevision: expandedToolCallGroups,
-                      boundary,
-                      renderers,
-                      listEmptyComponent,
-                      viewportRef,
-                      routeBottomAnchorRequest,
-                      isAuthoritativeHistoryReady,
-                      isInitialHistoryLoading,
-                      revealInitialHistory,
-                      onNearBottomChange: nearBottom.set,
-                      onReadingPositionChange: handleReadingPositionChange,
-                      onNearHistoryStart: loadOlder,
-                      isLoadingOlderHistory: isLoadingOlder,
-                      hasOlderHistory: hasOlder,
-                      olderHistoryProgressKey: progressKey,
-                      scrollEnabled: streamScrollEnabled,
-                      listStyle: stylesheet.list,
-                      baseListContentContainerStyle: stylesheet.listContentContainer,
-                      forwardListContentContainerStyle: stylesheet.forwardListContentContainer,
-                      contentMaxWidth,
-                    })}
-                  </UserMessageExpansionContext.Provider>
-                </ToolCallExpansionContext.Provider>
+                <StreamExpansionProviders
+                  toolCallExpansion={toolCallExpansion}
+                  userMessageExpansion={userMessageExpansion}
+                  assistantMessageExpansion={assistantMessageExpansion}
+                >
+                  {streamRenderStrategy.render({
+                    readingRowReplacements: presentation.readingRowReplacements,
+                    agentId,
+                    segments: renderModel.segments,
+                    historyRowRevision,
+                    liveHeadRowRevision: expandedToolCallGroups,
+                    boundary,
+                    renderers,
+                    listEmptyComponent,
+                    viewportRef,
+                    routeBottomAnchorRequest,
+                    isAuthoritativeHistoryReady,
+                    isInitialHistoryLoading,
+                    revealInitialHistory,
+                    onNearBottomChange: nearBottom.set,
+                    onReadingPositionChange: handleReadingPositionChange,
+                    onNearHistoryStart: loadOlder,
+                    isLoadingOlderHistory: isLoadingOlder,
+                    hasOlderHistory: hasOlder,
+                    olderHistoryProgressKey: progressKey,
+                    scrollEnabled: streamScrollEnabled,
+                    listStyle: stylesheet.list,
+                    baseListContentContainerStyle: stylesheet.listContentContainer,
+                    forwardListContentContainerStyle: stylesheet.forwardListContentContainer,
+                    contentMaxWidth,
+                  })}
+                </StreamExpansionProviders>
               </MessageOuterSpacingProvider>
               <ChatOutlineRail
                 prompts={chatOutline.prompts}
