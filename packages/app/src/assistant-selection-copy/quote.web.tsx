@@ -9,7 +9,6 @@ import {
 } from "react";
 import {
   Dimensions,
-  Text,
   View,
   type LayoutChangeEvent,
   type StyleProp,
@@ -30,7 +29,6 @@ import {
   useContextMenu,
 } from "@/components/ui/context-menu";
 import { FloatingSurface, type FloatingSurfaceProps } from "@/components/ui/floating";
-import { EditingTextInput, type EditingTextInputHandle } from "@/components/ui/text-input";
 import { isWeb } from "@/constants/platform";
 import { resolveKeyboardFocusScope } from "@/keyboard/focus-scope";
 import { getOverlayRoot, OverlayLayerProvider, useOverlayLayer } from "@/lib/overlay-root";
@@ -45,7 +43,7 @@ import {
 } from "./content.web";
 import type { ComposerQuote } from "./composer-quote";
 
-type QuoteState = { phase: "idle" } | ({ phase: "offered" | "noting" } & SelectionPassage);
+type QuoteState = { phase: "idle" } | ({ phase: "offered" } & SelectionPassage);
 interface SelectionPassage {
   range: Range;
   endpoints: readonly [Node, Node];
@@ -80,12 +78,8 @@ export function AssistantSelectionQuote(props: AssistantSelectionQuoteProps) {
 }
 
 /**
- * Quote for a selection inside one agent message: a Quote button at the end of the
- * selection, or Enter while it shows, opens a note box, and Enter puts the quote and the
- * note into the composer.
- *
- * The quote is read when the selection settles, so a message that keeps streaming, or
- * a selection the note box takes over, still quotes what was selected.
+ * Capture the passage when the selection settles, before streaming updates or menu
+ * interaction can change the selection.
  */
 function SelectionActions({
   streamRef,
@@ -114,16 +108,12 @@ function SelectionActions({
   }, [menuOpen]);
 
   useEffect(() => {
-    if (!onQuote && stateRef.current.phase === "noting") update(IDLE);
-  }, [onQuote, update]);
-
-  useEffect(() => {
     let pointerDown = false;
     let frame = 0;
 
     const readSelection = () => {
       frame = 0;
-      if (stateRef.current.phase === "noting" || menuOpenRef.current) return;
+      if (menuOpenRef.current) return;
       const passage = readSelectionPassage(streamRef.current, window.getSelection());
       update(passage ? { phase: "offered", ...passage } : IDLE);
     };
@@ -207,9 +197,11 @@ function SelectionActions({
   }, [dismiss, menuSelection, onSpawnSubagentFromSelection]);
   const quoteFromMenu = useCallback(() => {
     if (!onQuote || !menuSelection) return;
-    const { range, endpoints, quote } = menuSelection;
-    update({ phase: "noting", range, endpoints, quote });
-  }, [menuSelection, onQuote, update]);
+    setMenuOpen(false);
+    dismiss();
+    window.getSelection()?.removeAllRanges();
+    onQuote({ quote: menuSelection.quote });
+  }, [dismiss, menuSelection, onQuote, setMenuOpen]);
   const copyFromMenu = useCallback(() => {
     if (!menuSelection) return;
     dismiss();
@@ -221,28 +213,13 @@ function SelectionActions({
     dismiss();
     onSpawnSubagentFromSelection?.(current.quote);
   }, [dismiss, onSpawnSubagentFromSelection]);
-  const openNote = useCallback(() => {
+  const quoteFromPill = useCallback(() => {
     const current = stateRef.current;
-    if (onQuote && current.phase === "offered") update({ ...current, phase: "noting" });
-  }, [onQuote, update]);
-  const submitNote = useCallback(
-    (note: string) => {
-      const current = stateRef.current;
-      if (current.phase !== "noting" || !onQuote) return;
-      onQuote({ quote: current.quote, note });
-      update(IDLE);
-    },
-    [onQuote, update],
-  );
-  const cancelNote = useCallback(() => {
-    const current = stateRef.current;
-    if (current.phase !== "noting") return;
-    update(IDLE);
-    // Escape hands the passage back as it was, so it can be copied or quoted again.
-    const selection = window.getSelection();
-    selection?.removeAllRanges();
-    selection?.addRange(current.range);
-  }, [update]);
+    if (!onQuote || current.phase !== "offered") return;
+    window.getSelection()?.removeAllRanges();
+    dismiss();
+    onQuote({ quote: current.quote });
+  }, [dismiss, onQuote]);
 
   if (menuOpen && menuSelection) {
     return (
@@ -282,21 +259,10 @@ function SelectionActions({
         passage={state}
         streamRef={streamRef}
         floatingRef={floatingRef}
-        onPress={onQuote ? openNote : undefined}
+        onPress={onQuote ? quoteFromPill : undefined}
         spawnLabel={spawnLabel}
         onSpawnSubagent={onSpawnSubagentFromSelection ? spawnSubagentFromPill : undefined}
         onDismiss={dismiss}
-      />
-    );
-  }
-  if (state.phase === "noting" && onQuote) {
-    return (
-      <QuoteNoteBox
-        passage={state}
-        streamRef={streamRef}
-        floatingRef={floatingRef}
-        onSubmit={submitNote}
-        onCancel={cancelNote}
       />
     );
   }
@@ -395,7 +361,10 @@ function QuoteButton({
       // Like Escape, this comes before the app's shortcuts, dictation's Enter included.
       if (onPress && isBareEnter(event) && !focusReadsEnter(document.activeElement)) {
         event.preventDefault();
-        onPress();
+        if (!event.repeat) {
+          swallowEnterRepeatsUntilReleased();
+          onPress();
+        }
         return true;
       }
       return false;
@@ -447,111 +416,6 @@ function QuoteButton({
           {spawnLabel}
         </Button>
       ) : null}
-    </AnchoredSurface>
-  );
-}
-
-function QuoteNoteBox({
-  passage,
-  streamRef,
-  floatingRef,
-  onSubmit,
-  onCancel,
-}: {
-  passage: SelectionPassage;
-  streamRef: AssistantSelectionQuoteProps["streamRef"];
-  floatingRef: RefObject<HTMLElement | null>;
-  onSubmit: (note: string) => void;
-  onCancel: () => void;
-}) {
-  const { t } = useTranslation();
-  const layer = useOverlayLayer("floating");
-  const anchor = useRangeEndRect(passage, streamRef);
-  const visible = anchor !== null;
-  const inputRef = useRef<EditingTextInputHandle | null>(null);
-  const noteRef = useRef("");
-  const handleChangeText = useCallback((text: string) => {
-    noteRef.current = text;
-  }, []);
-  const handleKeyDown = useCallback(
-    (event: KeyboardInputEvent) => {
-      const input = inputRef.current?.getNativeRef();
-      if (event.key === "Escape") {
-        event.preventDefault();
-        // Let go of focus first, so the passage can be selected again behind the box.
-        if (input instanceof HTMLElement) input.blur();
-        onCancel();
-        return true;
-      }
-      if (
-        event.key === "Enter" &&
-        !event.shiftKey &&
-        document.activeElement === input &&
-        !isImeComposingKeyboardEvent(event)
-      ) {
-        event.preventDefault();
-        // A held Enter that opened the box repeats into it; only a fresh press adds the quote.
-        if (!event.repeat) {
-          // onSubmit moves focus to the composer, whose Enter sends: drop this key's repeats
-          // until it comes up.
-          swallowEnterRepeatsUntilReleased();
-          onSubmit(noteRef.current);
-        }
-        return true;
-      }
-      return false;
-    },
-    [onCancel, onSubmit],
-  );
-  // The box takes focus itself: the registry would hand focus back to the page when it
-  // closes, and Enter moves it to the composer.
-  const setOverlayScope = useOverlayRegistration({
-    keys: ["Escape", "Enter"],
-    active: visible,
-    layer,
-    onKeyDown: handleKeyDown,
-    manageFocus: false,
-  });
-  const setSurface = useCallback(
-    (node: View | null) => {
-      const element = node instanceof HTMLElement ? node : null;
-      floatingRef.current = element;
-      setOverlayScope(element);
-    },
-    [floatingRef, setOverlayScope],
-  );
-
-  useEffect(() => {
-    if (!visible) return;
-    const element = inputRef.current?.getNativeRef();
-    if (!(element instanceof HTMLElement)) return;
-    // The box mounts off-screen until it is measured; scrolling to it would move the chat.
-    element.focus({ preventScroll: true });
-  }, [visible]);
-
-  // No fade-in: Reanimated hides an entering view until its animation starts, and a
-  // hidden input cannot take focus.
-  return (
-    <AnchoredSurface
-      anchor={anchor}
-      alignment="start"
-      layer={layer}
-      style={styles.noteSurface}
-      surfaceRef={setSurface}
-      testID="assistant-selection-quote-note"
-    >
-      <EditingTextInput
-        ref={inputRef}
-        initialValue={noteRef.current}
-        multiline
-        accessibilityLabel={t("agentStream.quote.noteLabel")}
-        placeholder={t("agentStream.quote.notePlaceholder")}
-        placeholderTextColor={styles.placeholder.color}
-        onChangeText={handleChangeText}
-        style={styles.noteInput}
-        testID="assistant-selection-quote-note-input"
-      />
-      <Text style={styles.hint}>{t("agentStream.quote.hint")}</Text>
     </AnchoredSurface>
   );
 }
@@ -699,8 +563,7 @@ function isBareEnter(event: KeyboardInputEvent): boolean {
 
 /**
  * Whether the focused element answers Enter itself: a text field, the composer or the
- * terminal, or a control Enter presses. Only Enter that would otherwise do nothing opens
- * the note box.
+ * terminal, or a control Enter presses. Quote only when Enter would otherwise do nothing.
  */
 function focusReadsEnter(target: EventTarget | null): boolean {
   if (resolveKeyboardFocusScope({ target, commandCenterOpen: false }) !== "other") return true;
@@ -708,8 +571,8 @@ function focusReadsEnter(target: EventTarget | null): boolean {
 }
 
 /**
- * Swallows the repeats of an Enter that is still held after the note box gave focus away,
- * until the key comes up, so a held Enter cannot send the draft it just added to.
+ * A held Enter can repeat after focus moves to the composer. Swallow those repeats until
+ * the key comes up so a single press cannot add the quote and then send the draft.
  */
 function swallowEnterRepeatsUntilReleased() {
   const swallowRepeat = (event: KeyboardEvent) => {
@@ -761,31 +624,5 @@ const styles = StyleSheet.create((theme) => ({
     borderRadius: theme.borderRadius.lg,
     padding: theme.spacing[1],
     ...theme.shadow.md,
-  },
-  noteSurface: {
-    width: 320,
-    padding: theme.spacing[2],
-    gap: theme.spacing[1.5],
-  },
-  noteInput: {
-    height: theme.fontSize.content * 1.4 * 3 + theme.spacing[2] * 2,
-    color: theme.colors.foreground,
-    backgroundColor: theme.colors.surface1,
-    borderWidth: theme.borderWidth[1],
-    borderColor: theme.colors.border,
-    borderRadius: theme.borderRadius.md,
-    paddingHorizontal: theme.spacing[3],
-    paddingVertical: theme.spacing[2],
-    fontSize: theme.fontSize.content,
-    lineHeight: theme.fontSize.content * 1.4,
-    outlineWidth: 0,
-    outlineColor: "transparent",
-  },
-  placeholder: {
-    color: theme.colors.foregroundMuted,
-  },
-  hint: {
-    color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.sm,
   },
 }));

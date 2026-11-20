@@ -45,6 +45,10 @@ export function splitComposerAttachmentsForSubmit(
       : buildForgeAttachmentFromSearchItem;
 
   for (const attachment of attachments) {
+    if (attachment.kind === "quote") {
+      continue;
+    }
+
     if (attachment.kind === "image") {
       images.push(attachment.metadata);
       continue;

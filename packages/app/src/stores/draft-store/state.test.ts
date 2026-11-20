@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { migrateDraftInput } from "./migration";
 import {
   applyClearDraftRecord,
   pruneFinalizedDraftRecords,
   toDraftInputIfReady,
   editDraftRecordText,
+  UserComposerAttachmentSchema,
   type DraftRecord,
 } from "./state";
 
@@ -97,6 +99,28 @@ describe("draft-store lifecycle", () => {
 });
 
 describe("draft-store normalization", () => {
+  it("restores quote attachments from persisted drafts, preserving the typed text", async () => {
+    const rawInput = {
+      text: "Keep this prompt  ",
+      attachments: [{ kind: "quote", id: "q1", text: "\r\n  Selected text\r\n\r\n\tcode\r" }],
+    };
+    const input = await migrateDraftInput({ rawInput }, { migrateLegacyImages: async () => [] });
+    expect(toDraftInputIfReady({ input, lifecycle: "active", updatedAt: 1, version: 1 })).toEqual({
+      text: "Keep this prompt  ",
+      attachments: [{ kind: "quote", id: "q1", text: "  Selected text\n\n\tcode" }],
+    });
+  });
+
+  it("rejects malformed persisted quote attachments", () => {
+    expect(
+      UserComposerAttachmentSchema.safeParse({ kind: "quote", id: "q1", text: null }).success,
+    ).toBe(false);
+    expect(
+      UserComposerAttachmentSchema.safeParse({ kind: "quote", id: "q1", text: "text", note: "x" })
+        .success,
+    ).toBe(false);
+  });
+
   it("preserves plugin resources when hydrating a draft", () => {
     const attachment = {
       kind: "plugin_resource" as const,

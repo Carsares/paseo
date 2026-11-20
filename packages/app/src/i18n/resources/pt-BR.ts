@@ -192,6 +192,12 @@ export const ptBR: TranslationResources = {
       openReview: "Abrir anexo de revisão",
       removeReview: "Remover anexo de revisão",
     },
+    quoteCard: {
+      title: "Citação {{index}}",
+      expand: "Mostrar mais",
+      collapse: "Mostrar menos",
+      remove: "Remover citação {{index}}",
+    },
     errors: {
       failedToSend: "Falha ao enviar mensagem",
       failedToCreateAgent: "Falha ao criar agente",

@@ -1,3 +1,4 @@
+import { composePromptTextWithQuotes } from "@/attachments/quote";
 import type { SelectedFile } from "@/attachments/selected-file";
 import { FILE_UPLOAD_MAX_BYTES } from "@/attachments/upload-limit";
 import type { ForgeSearchItem } from "@getpaseo/protocol/messages";
@@ -202,13 +203,14 @@ export interface DispatchComposerAgentMessageInput {
 export async function dispatchComposerAgentMessage(
   input: DispatchComposerAgentMessageInput,
 ): Promise<void> {
+  const submittedText = composePromptTextWithQuotes(input.text, input.attachments);
   const wirePayload = splitComposerAttachmentsForSubmit(input.attachments, {
     format: input.attachmentSubmitFormat,
   });
   const clientMessageId = generateMessageId();
   const userMessage = createUserMessage({
     clientMessageId,
-    text: input.text,
+    text: submittedText,
     timestamp: new Date(),
     images: wirePayload.images,
     attachments: wirePayload.attachments,
@@ -219,7 +221,7 @@ export async function dispatchComposerAgentMessage(
   input.submission.begin(input.agentId, userMessage);
   try {
     const imagesData = await input.encodeImages(wirePayload.images);
-    await input.client.sendAgentMessage(input.agentId, input.text, {
+    await input.client.sendAgentMessage(input.agentId, submittedText, {
       messageId: clientMessageId,
       ...(input.activeTurnBehavior ? { activeTurnBehavior: input.activeTurnBehavior } : {}),
       images: imagesData ?? [],
@@ -348,7 +350,11 @@ export function openComposerAttachment(input: OpenComposerAttachmentInput): void
     input.setLightboxMetadata(input.attachment.metadata);
     return;
   }
-  if (input.attachment.kind === "file" || input.attachment.kind === "workspace_file") {
+  if (
+    input.attachment.kind === "file" ||
+    input.attachment.kind === "workspace_file" ||
+    input.attachment.kind === "quote"
+  ) {
     return;
   }
   if (isWorkspaceAttachment(input.attachment)) {

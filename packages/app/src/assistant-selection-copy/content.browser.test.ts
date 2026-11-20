@@ -157,7 +157,8 @@ describe("assistant selection quote", () => {
 
   it("settles a cancelled touch selection and hides offscreen or unmounted anchors", async () => {
     const { streamRef, viewport, message } = mountQuoteStream();
-    render(createElement(AssistantSelectionQuote, { streamRef, onQuote: vi.fn() }));
+    const onQuote = vi.fn();
+    render(createElement(AssistantSelectionQuote, { streamRef, onQuote }));
     fireEvent.pointerDown(message, { pointerType: "touch", button: 0 });
     selectText(message, 0, 8);
     fireEvent.pointerCancel(message, { pointerType: "touch" });
@@ -173,22 +174,19 @@ describe("assistant selection quote", () => {
     const returnedPill = await screen.findByTestId("assistant-selection-quote");
     expect(pill.isConnected).toBe(false);
     fireEvent.click(returnedPill.querySelector("button, [role='button']")!);
-    const note = await screen.findByTestId<HTMLTextAreaElement>(
-      "assistant-selection-quote-note-input",
-    );
-    fireEvent.change(note, { target: { value: "Keep this note" } });
-    scroll(200);
-    await expect.poll(() => screen.queryByTestId("assistant-selection-quote-note")).toBeNull();
-    scroll(0);
-    const restored = await screen.findByTestId<HTMLTextAreaElement>(
-      "assistant-selection-quote-note-input",
-    );
-    expect(restored.value).toBe("Keep this note");
+    expect(onQuote).toHaveBeenCalledExactlyOnceWith({ quote: "Selected" });
+    expect(screen.queryByTestId("assistant-selection-quote")).toBeNull();
+    expect(screen.queryByTestId("assistant-selection-quote-note")).toBeNull();
+
+    fireEvent.pointerDown(message, { pointerType: "touch", button: 0 });
+    selectText(message, 0, 8);
+    fireEvent.pointerCancel(message, { pointerType: "touch" });
+    await screen.findByTestId("assistant-selection-quote");
     message.remove();
-    await expect.poll(() => screen.queryByTestId("assistant-selection-quote-note")).toBeNull();
+    await expect.poll(() => screen.queryByTestId("assistant-selection-quote")).toBeNull();
   });
 
-  it("closes an open note if its quote target disappears and keeps the subagent action", async () => {
+  it("quotes directly from the context menu and hides quote actions if the quote target disappears", async () => {
     const { streamRef, message } = mountQuoteStream();
     const onQuote = vi.fn();
     const onSpawnSubagentFromSelection = vi.fn();
@@ -203,15 +201,15 @@ describe("assistant selection quote", () => {
     const contextMenu = () => fireEvent.contextMenu(message, { clientX: 15, clientY: 15 });
     contextMenu();
     fireEvent.click(await screen.findByTestId("assistant-selection-context-menu-quote"));
-    await screen.findByTestId("assistant-selection-quote-note");
-    rerender(quote());
+    expect(onQuote).toHaveBeenCalledExactlyOnceWith({ quote: "Selected" });
     expect(screen.queryByTestId("assistant-selection-quote-note")).toBeNull();
 
+    rerender(quote());
     selectText(message, 0, 8);
     contextMenu();
     await screen.findByTestId("assistant-selection-context-menu-subagent");
     expect(screen.queryByTestId("assistant-selection-context-menu-quote")).toBeNull();
-    expect(onQuote).not.toHaveBeenCalled();
+    expect(onQuote).toHaveBeenCalledTimes(1);
   });
 });
 

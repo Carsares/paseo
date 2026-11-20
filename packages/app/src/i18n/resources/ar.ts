@@ -191,6 +191,12 @@ export const ar: TranslationResources = {
       openReview: "فتح مرفق المراجعة",
       removeReview: "إزالة مرفق المراجعة",
     },
+    quoteCard: {
+      title: "اقتباس {{index}}",
+      expand: "عرض المزيد",
+      collapse: "عرض أقل",
+      remove: "إزالة الاقتباس {{index}}",
+    },
     errors: {
       failedToSend: "فشل في إرسال الرسالة",
       failedToCreateAgent: "فشل في إنشاء الوكيل",

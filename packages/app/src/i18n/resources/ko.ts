@@ -191,6 +191,12 @@ export const ko: TranslationResources = {
       openReview: "리뷰 첨부 열기",
       removeReview: "리뷰 첨부 제거",
     },
+    quoteCard: {
+      title: "인용 {{index}}",
+      expand: "더 보기",
+      collapse: "접기",
+      remove: "인용 {{index}} 제거",
+    },
     errors: {
       failedToSend: "메시지를 보내지 못했습니다",
       failedToCreateAgent: "에이전트를 생성하지 못했습니다",

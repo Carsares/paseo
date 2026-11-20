@@ -1,16 +1,13 @@
 import { createContext, useContext, useMemo, type ReactNode } from "react";
-import type { ComposerTextSource } from "@/composer/text-source";
 import { useKeyboardActionDispatcher } from "@/keyboard/keyboard-action-dispatcher-context";
 
 export interface ComposerQuote {
   quote: string;
-  note: string;
 }
 
 /** The composer draft a quote goes into. */
 export interface ComposerQuoteTarget {
-  textSource: ComposerTextSource;
-  setText: (text: string) => void;
+  addQuoteAttachment: (quoteText: string) => void;
 }
 
 interface ComposerQuoteContextValue {
@@ -25,7 +22,7 @@ const ComposerQuoteContext = createContext<ComposerQuoteContextValue | null>(nul
  * Without a note the draft ends on an empty paragraph: a line typed straight under a quote
  * would continue it.
  */
-export function appendQuoteToDraft(input: { draft: string } & ComposerQuote): string {
+export function appendQuoteToDraft(input: { draft: string; quote: string; note: string }): string {
   const quote = input.quote
     .split("\n")
     .map((line) => (line ? `> ${line}` : ">"))
@@ -37,22 +34,21 @@ export function appendQuoteToDraft(input: { draft: string } & ComposerQuote): st
 }
 
 /**
- * Lets a selection in the agent's messages be quoted into the same agent's composer. Without
- * a target, while the pane is not focused or has no composer, nothing offers a quote.
+ * Lets a selection in the agent's messages be quoted into the same agent's composer.
  */
 export function ComposerQuoteProvider({
   target,
   children,
 }: {
   target: ComposerQuoteTarget | null;
-  children: ReactNode;
+  children?: ReactNode;
 }) {
   const keyboardActionDispatcher = useKeyboardActionDispatcher();
   const value = useMemo<ComposerQuoteContextValue | null>(
     () =>
       target && {
         addQuote: (input) => {
-          target.setText(appendQuoteToDraft({ draft: target.textSource.getSnapshot(), ...input }));
+          target.addQuoteAttachment(input.quote);
           keyboardActionDispatcher.dispatch({ id: "message-input.focus", scope: "message-input" });
         },
       },

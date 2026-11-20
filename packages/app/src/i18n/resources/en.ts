@@ -189,6 +189,12 @@ export const en = {
       openReview: "Open review attachment",
       removeReview: "Remove review attachment",
     },
+    quoteCard: {
+      title: "Quote {{index}}",
+      expand: "Show more",
+      collapse: "Show less",
+      remove: "Remove quote {{index}}",
+    },
     errors: {
       failedToSend: "Failed to send message",
       failedToCreateAgent: "Failed to create agent",

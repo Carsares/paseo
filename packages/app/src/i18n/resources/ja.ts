@@ -192,6 +192,12 @@ export const ja: TranslationResources = {
       openReview: "レビュー添付ファイルを開く",
       removeReview: "レビュー添付ファイルを削除",
     },
+    quoteCard: {
+      title: "引用 {{index}}",
+      expand: "もっと見る",
+      collapse: "折りたたむ",
+      remove: "引用 {{index}} を削除",
+    },
     errors: {
       failedToSend: "メッセージの送信に失敗しました",
       failedToCreateAgent: "エージェントの作成に失敗しました",

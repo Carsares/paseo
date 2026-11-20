@@ -680,10 +680,7 @@ describe("selection right click menu", () => {
     expect(screen.queryByTestId("assistant-selection-context-menu")).toBeNull();
     expect(screen.queryByTestId("assistant-selection-quote")).toBeNull();
 
-    // Open menu -> click Quote -> opens note box with pre-captured quote.
-    const originalGetClientRects = Range.prototype.getClientRects;
-    Range.prototype.getClientRects = () =>
-      [{ left: 10, top: 20, width: 80, height: 18 }] as unknown as DOMRectList;
+    // Changing the selection after right-click must not change the captured quote.
     try {
       expect(
         fireEvent.contextMenu(message, {
@@ -693,19 +690,63 @@ describe("selection right click menu", () => {
           clientY: 20,
         }),
       ).toBe(false);
-      // Collapse selection after right-click to confirm quote was captured before menu interaction.
       selection.removeAllRanges();
+      const outsideRange = document.createRange();
+      outsideRange.selectNodeContents(outside);
+      selection.addRange(outsideRange);
       fireEvent.click(screen.getByTestId("assistant-selection-context-menu-quote"));
-      expect(screen.getByTestId("assistant-selection-quote-note")).toBeTruthy();
-      const input = screen.getByTestId("assistant-selection-quote-note-input");
-      fireEvent.change(input, { target: { value: "Explain why" } });
-      input.focus();
-      fireEvent.keyDown(window, { key: "Enter" });
-      expect(onQuote).toHaveBeenCalledExactlyOnceWith({
-        quote: "Selected snippet",
-        note: "Explain why",
-      });
+      expect(onQuote).toHaveBeenCalledExactlyOnceWith({ quote: "Selected snippet" });
+      expect(selection.rangeCount).toBe(0);
+      expect(screen.queryByTestId("assistant-selection-context-menu")).toBeNull();
+      expect(screen.queryByTestId("assistant-selection-quote-note")).toBeNull();
     } finally {
+      selection.removeAllRanges();
+      unmount();
+    }
+  });
+
+  test.each(["click", "Enter"])("adds a floating quote directly on %s", async (action) => {
+    const streamRef = createRef<HTMLDivElement>();
+    const onQuote = vi.fn();
+    const originalGetClientRects = Range.prototype.getClientRects;
+    Range.prototype.getClientRects = () =>
+      [{ left: 10, top: 20, width: 80, height: 18 }] as unknown as DOMRectList;
+    const { unmount } = render(
+      createElement(
+        "div",
+        { ref: streamRef },
+        createElement("p", { "data-testid": "assistant-message" }, "Selected snippet"),
+        createElement(AssistantSelectionQuote, { streamRef, onQuote }),
+      ),
+    );
+    const selection = window.getSelection();
+    if (!selection) throw new Error("Expected a browser selection");
+    try {
+      const message = screen.getByTestId("assistant-message");
+      selection.removeAllRanges();
+      const range = document.createRange();
+      range.selectNodeContents(message);
+      selection.addRange(range);
+      fireEvent(document, new Event("selectionchange"));
+      const pill = await screen.findByTestId("assistant-selection-quote");
+
+      if (action === "click") {
+        const button = pill.querySelector("button, [role='button']");
+        if (!button) throw new Error("Expected a quote button");
+        fireEvent.click(button);
+      } else {
+        expect(fireEvent.keyDown(window, { key: "Enter" })).toBe(false);
+        expect(fireEvent.keyDown(window, { key: "Enter", repeat: true })).toBe(false);
+        fireEvent.keyUp(window, { key: "Enter" });
+        expect(fireEvent.keyDown(window, { key: "Enter" })).toBe(true);
+      }
+
+      expect(onQuote).toHaveBeenCalledExactlyOnceWith({ quote: "Selected snippet" });
+      expect(selection.rangeCount).toBe(0);
+      expect(screen.queryByTestId("assistant-selection-quote")).toBeNull();
+      expect(screen.queryByTestId("assistant-selection-quote-note")).toBeNull();
+    } finally {
+      fireEvent.keyUp(window, { key: "Enter" });
       Range.prototype.getClientRects = originalGetClientRects;
       selection.removeAllRanges();
       unmount();

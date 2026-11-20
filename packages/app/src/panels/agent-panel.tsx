@@ -47,6 +47,7 @@ import {
   type ComposerQuoteTarget,
 } from "@/assistant-selection-copy/composer-quote";
 import { useToastHost, type ToastApi, type ToastState } from "@/components/toast-host";
+import { appendQuoteAttachment } from "@/attachments/quote";
 import type { WorkspaceComposerAttachment } from "@/attachments/types";
 import { useWorkspaceAttachmentScopeKey } from "@/attachments/workspace-attachments-store";
 import { COMPACT_CONTENT_WIDTH, useIsCompactFormFactor } from "@/constants/layout";
@@ -1202,15 +1203,13 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   const quoteTarget = useMemo<ComposerQuoteTarget | null>(
     () =>
       showsComposer && hasActiveComposer && !draft
-        ? { textSource: agentInputDraft.textSource, setText: agentInputDraft.replaceText }
+        ? {
+            addQuoteAttachment: (quoteText: string) => {
+              setAttachments((prev) => appendQuoteAttachment(prev, quoteText));
+            },
+          }
         : null,
-    [
-      agentInputDraft.replaceText,
-      agentInputDraft.textSource,
-      draft,
-      hasActiveComposer,
-      showsComposer,
-    ],
+    [setAttachments, draft, hasActiveComposer, showsComposer],
   );
   const streamContent = (
     <View

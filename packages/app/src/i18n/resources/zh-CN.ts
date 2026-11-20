@@ -191,6 +191,12 @@ export const zhCN: TranslationResources = {
       openReview: "打开 review 附件",
       removeReview: "移除 review 附件",
     },
+    quoteCard: {
+      title: "引用 {{index}}",
+      expand: "展开",
+      collapse: "收起",
+      remove: "移除引用 {{index}}",
+    },
     errors: {
       failedToSend: "发送消息失败",
       failedToCreateAgent: "创建 Agent 失败",

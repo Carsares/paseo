@@ -193,6 +193,12 @@ export const fr: TranslationResources = {
       openReview: "Ouvrir la revue jointe",
       removeReview: "Retirer la revue jointe",
     },
+    quoteCard: {
+      title: "Citation {{index}}",
+      expand: "Afficher plus",
+      collapse: "Afficher moins",
+      remove: "Supprimer la citation {{index}}",
+    },
     errors: {
       failedToSend: "Impossible d’envoyer le message",
       failedToCreateAgent: "Impossible de créer l’agent",

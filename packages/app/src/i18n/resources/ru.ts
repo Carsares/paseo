@@ -192,6 +192,12 @@ export const ru: TranslationResources = {
       openReview: "Открыть вложение проверки",
       removeReview: "Удалить вложение проверки",
     },
+    quoteCard: {
+      title: "Цитата {{index}}",
+      expand: "Показать больше",
+      collapse: "Свернуть",
+      remove: "Удалить цитату {{index}}",
+    },
     errors: {
       failedToSend: "Не удалось отправить сообщение",
       failedToCreateAgent: "Не удалось создать агента.",

@@ -1,5 +1,56 @@
+/** @vitest-environment jsdom */
+import { renderHook } from "@testing-library/react";
+import { createElement, useEffect, type ReactNode } from "react";
+import {
+  KeyboardActionDispatcherProvider,
+  useKeyboardActionDispatcher,
+} from "@/keyboard/keyboard-action-dispatcher-context";
 import { describe, expect, it } from "vitest";
-import { appendQuoteToDraft } from "./composer-quote";
+import { appendQuoteToDraft, ComposerQuoteProvider, useComposerQuote } from "./composer-quote";
+
+describe("ComposerQuoteProvider", () => {
+  it("offers an attachment to the active composer before focusing the input", () => {
+    const calls: string[] = [];
+    function ObserveFocus({ children }: { children?: ReactNode }) {
+      const dispatcher = useKeyboardActionDispatcher();
+      useEffect(
+        () =>
+          dispatcher.registerHandler({
+            handlerId: "test-composer-focus",
+            actions: ["message-input.focus"],
+            enabled: true,
+            priority: 0,
+            handle: (action) => {
+              calls.push(action.scope);
+              return true;
+            },
+          }),
+        [dispatcher],
+      );
+      return children;
+    }
+    const { result } = renderHook(useComposerQuote, {
+      wrapper: ({ children }) =>
+        createElement(
+          KeyboardActionDispatcherProvider,
+          null,
+          createElement(
+            ObserveFocus,
+            null,
+            createElement(
+              ComposerQuoteProvider,
+              {
+                target: { addQuoteAttachment: (quote) => calls.push(quote) },
+              },
+              children,
+            ),
+          ),
+        ),
+    });
+    result.current?.addQuote({ quote: "Selected text" });
+    expect(calls).toEqual(["Selected text", "message-input"]);
+  });
+});
 
 describe("appendQuoteToDraft", () => {
   it("starts an empty draft with the quote and the note under it", () => {

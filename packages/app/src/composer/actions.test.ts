@@ -419,6 +419,34 @@ describe("pickAndPersistImages", () => {
 });
 
 describe("dispatchComposerAgentMessage", () => {
+  it("sends quotes in the same body as the optimistic message and keeps file attachments separate", async () => {
+    const client = createFakeSendClient();
+    const stream = createFakeStream();
+    await dispatchComposerAgentMessage({
+      client,
+      agentId: "agent",
+      text: "  Explain this.  ",
+      attachments: [
+        { kind: "quote", id: "q1", text: "First\r\n\r\n  snippet" },
+        { kind: "workspace_file", path: "src/app.ts", selection: { kind: "whole_file" } },
+        { kind: "quote", id: "q2", text: "Second" },
+      ],
+      encodeImages: async () => [],
+      submission: stream,
+    });
+
+    const text = "> First\n>\n>   snippet\n\n> Second\n\nExplain this.";
+    expect(client.calls[0]).toMatchObject({
+      agentId: "agent",
+      text,
+      options: { attachments: [{ type: "text", text: "Workspace file: src/app.ts" }] },
+    });
+    expect(stream.tail.get("agent")?.[0]).toMatchObject({
+      text,
+      attachments: client.calls[0]?.options.attachments,
+    });
+  });
+
   it("forwards the configured active-turn intent without provider capability checks", async () => {
     const client = createFakeSendClient();
     const stream = createFakeStream();
@@ -754,6 +782,23 @@ describe("queueComposerMessage", () => {
 });
 
 describe("editQueuedComposerMessage", () => {
+  it("restores a queued quote as an attachment even without typed text", () => {
+    const queue = createFakeQueue();
+    const quote = { kind: "quote", id: "q1", text: "Selected text" } as const;
+    const { queued } = queueComposerMessage({
+      agentId: "agent",
+      text: "  ",
+      attachments: [quote],
+      queue,
+    });
+    if (!queued) throw new Error("Expected a quote-only message to be queued");
+
+    expect(editQueuedComposerMessage({ agentId: "agent", messageId: queued.id, queue })).toEqual({
+      text: "",
+      attachments: [quote],
+    });
+  });
+
   it("returns null and leaves the queue untouched when the message id is missing", () => {
     const queue = createFakeQueue(
       new Map([["agent", [{ id: "other", text: "other", attachments: [] }]]]),
@@ -880,6 +925,21 @@ describe("removeComposerAttachmentAtIndex", () => {
 });
 
 describe("openComposerAttachment", () => {
+  it("ignores quote attachments without opening lightbox, workspace, or external url", () => {
+    openComposerAttachment({
+      attachment: { kind: "quote", id: "q1", text: "Selected text" },
+      setLightboxMetadata: () => {
+        throw new Error("unexpected lightbox call");
+      },
+      openWorkspaceAttachment: () => {
+        throw new Error("unexpected workspace opener call");
+      },
+      openExternalUrl: () => {
+        throw new Error("unexpected external url call");
+      },
+    });
+  });
+
   it("opens the lightbox for image attachments", () => {
     const image = imageWithId("img-body");
     const lightboxCalls: AttachmentMetadata[] = [];

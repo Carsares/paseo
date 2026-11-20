@@ -192,6 +192,12 @@ export const es: TranslationResources = {
       openReview: "Abrir archivo adjunto de reseña",
       removeReview: "Eliminar archivo adjunto de reseña",
     },
+    quoteCard: {
+      title: "Cita {{index}}",
+      expand: "Mostrar más",
+      collapse: "Mostrar menos",
+      remove: "Quitar la cita {{index}}",
+    },
     errors: {
       failedToSend: "No se pudo enviar el mensaje",
       failedToCreateAgent: "No se pudo crear el agente",

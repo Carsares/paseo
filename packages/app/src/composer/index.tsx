@@ -178,6 +178,7 @@ import { useCheckoutPrStatusQuery } from "@/git/use-pr-status-query";
 import { getForgePresentation } from "@/git/forge";
 import { ForgeBrandIcon } from "@/git/forge-icon";
 import { useComposerForgeAutoAttach } from "./forge-auto-attach";
+import { ComposerQuoteCardList, type ComposerQuoteCardEntry } from "./quote-card";
 import { readClipboardImage } from "./clipboard-image";
 import { normalizeNativePastedImages, type NativePastedFile } from "./native-pasted-image";
 import { PluginResourceAttachmentPill, usePluginAttachmentPicker } from "@/plugins";
@@ -362,29 +363,51 @@ function renderAttachmentTray(args: RenderAttachmentTrayArgs): ReactElement | nu
     handleRemoveAttachment,
     labels,
   } = args;
-  if (selectedAttachments.length === 0 && pendingFiles.length === 0) return null;
+  const quoteEntries: ComposerQuoteCardEntry[] = [];
+  const pillAttachments: Array<{ attachment: PillComposerAttachment; index: number }> = [];
+  for (const [index, attachment] of selectedAttachments.entries()) {
+    if (attachment.kind === "quote") {
+      quoteEntries.push({ id: attachment.id, text: attachment.text, attachmentIndex: index });
+    } else {
+      pillAttachments.push({ attachment, index });
+    }
+  }
+  if (quoteEntries.length === 0 && pillAttachments.length === 0 && pendingFiles.length === 0) {
+    return null;
+  }
   return (
-    <View style={styles.attachmentTray} testID="composer-attachment-tray">
-      {selectedAttachments.map((attachment, index) =>
-        renderComposerAttachmentPill({
-          serverId,
-          attachment,
-          index,
-          disabled: isComposerLocked,
-          onOpen: handleOpenAttachment,
-          onRemove: handleRemoveAttachment,
-          labels,
-        }),
-      )}
-      {pendingFiles.map(({ id, file }) => (
-        <AttachmentFrame key={id} testID="composer-pending-file-attachment">
-          <AttachmentLabel
-            icon={pendingFilePillIcon}
-            title={file.fileName}
-            subtitle={getFileTypeLabel(file.fileName) ?? ""}
-          />
-        </AttachmentFrame>
-      ))}
+    <View style={styles.attachmentSlotStack} testID="composer-attachment-tray">
+      {quoteEntries.length > 0 ? (
+        <ComposerQuoteCardList
+          quotes={quoteEntries}
+          disabled={isComposerLocked}
+          onRemove={handleRemoveAttachment}
+        />
+      ) : null}
+      {pillAttachments.length > 0 || pendingFiles.length > 0 ? (
+        <View style={styles.attachmentTray}>
+          {pillAttachments.map(({ attachment, index }) =>
+            renderComposerAttachmentPill({
+              serverId,
+              attachment,
+              index,
+              disabled: isComposerLocked,
+              onOpen: handleOpenAttachment,
+              onRemove: handleRemoveAttachment,
+              labels,
+            }),
+          )}
+          {pendingFiles.map(({ id, file }) => (
+            <AttachmentFrame key={id} testID="composer-pending-file-attachment">
+              <AttachmentLabel
+                icon={pendingFilePillIcon}
+                title={file.fileName}
+                subtitle={getFileTypeLabel(file.fileName) ?? ""}
+              />
+            </AttachmentFrame>
+          ))}
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -417,9 +440,11 @@ function renderQueueTrack(args: RenderQueueTrackArgs): ReactElement | null {
   );
 }
 
+type PillComposerAttachment = Exclude<ComposerAttachment, { kind: "quote" }>;
+
 interface RenderComposerAttachmentPillArgs {
   serverId: string;
-  attachment: ComposerAttachment;
+  attachment: PillComposerAttachment;
   index: number;
   disabled: boolean;
   onOpen: (attachment: ComposerAttachment) => void;
@@ -700,10 +725,12 @@ function QueuedMessageRow({
   const handleSendNow = useCallback(() => {
     onSendNow(item.id);
   }, [onSendNow, item.id]);
+  const previewText =
+    item.text || item.attachments.find((attachment) => attachment.kind === "quote")?.text || "";
   return (
     <View style={styles.queueItem}>
       <Text style={styles.queueText} numberOfLines={2} ellipsizeMode="tail">
-        {item.text}
+        {previewText}
       </Text>
       <View style={styles.queueActions}>
         <Pressable
@@ -2762,6 +2789,11 @@ const styles = StyleSheet.create((theme: Theme) => ({
   },
   discPressed: {
     opacity: 0.7,
+  },
+  attachmentSlotStack: {
+    width: "100%",
+    flexDirection: "column",
+    gap: theme.spacing[2],
   },
   attachmentTray: {
     flexDirection: "row",

@@ -3,6 +3,7 @@ import { markdownCopyDataSet } from "@/assistant-selection-copy/markup";
 import { useAssistantMessageExpansion } from "@/components/assistant-message-expansion/expansion-context";
 import { Button } from "@/components/ui/button";
 import { MessagePreview, MessageSender } from "@/components/user-message";
+import { UserMessageBody } from "@/components/user-message/message-body";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { getAgentAttachmentPillContent } from "@/attachments/attachment-pill-content";
 import {
@@ -550,11 +551,7 @@ export const UserMessage = memo(function UserMessage({
                 ))}
               </View>
             ) : null}
-            {hasText ? (
-              <Text selectable style={userMessageStylesheet.text} dataSet={MESSAGE_TEXT_DATASET}>
-                {message}
-              </Text>
-            ) : null}
+            {hasText ? <UserMessageBody message={message} /> : null}
           </MessagePreview>
         </View>
         {hasText ? (

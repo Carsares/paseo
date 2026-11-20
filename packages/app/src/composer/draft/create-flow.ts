@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useReducer } from "react";
 import { useTranslation } from "react-i18next";
+import { composePromptTextWithQuotes } from "@/attachments/quote";
 import type { ComposerAttachment } from "@/attachments/types";
 import {
   resolveComposerAttachmentSubmitFormat,
@@ -239,6 +240,7 @@ export function useDraftAgentCreateFlow<TDraftAgent, TCreateResult>({
 
       dispatch({ type: "DRAFT_SET_ERROR", message: "" });
       const trimmedPrompt = text.trim();
+      const submittedPrompt = composePromptTextWithQuotes(trimmedPrompt, attachments);
       const pendingServerId = getPendingServerId();
       if (!pendingServerId) {
         const error = new Error(t("composer.errors.noHostSelected"));
@@ -256,7 +258,7 @@ export function useDraftAgentCreateFlow<TDraftAgent, TCreateResult>({
       const images = wirePayload.images;
 
       const hasAttachmentContent = images.length > 0 || wirePayload.attachments.length > 0;
-      if (!trimmedPrompt && !hasAttachmentContent && !allowEmptyText) {
+      if (!submittedPrompt && !hasAttachmentContent && !allowEmptyText) {
         const error = new Error(t("composer.errors.initialPromptRequired"));
         dispatch({ type: "DRAFT_SET_ERROR", message: error.message });
         throw error;
@@ -275,7 +277,7 @@ export function useDraftAgentCreateFlow<TDraftAgent, TCreateResult>({
 
       const attempt: CreateAttempt = {
         clientMessageId: `${draftId}:initial-message`,
-        text: trimmedPrompt,
+        text: submittedPrompt,
         timestamp: new Date(),
         ...(images.length > 0 ? { images } : {}),
         ...(wirePayload.attachments.length > 0 ? { attachments: wirePayload.attachments } : {}),

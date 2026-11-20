@@ -1,3 +1,4 @@
+import { normalizeQuoteText } from "@/attachments/quote";
 import {
   NEW_WORKSPACE_PICKER_ATTACHMENT_OWNER,
   type AttachmentMetadata,
@@ -96,6 +97,7 @@ export const UserComposerAttachmentSchema: z.ZodType<UserComposerAttachment> = z
   [
     z.strictObject({ kind: z.literal("image"), metadata: AttachmentMetadataSchema }),
     z.strictObject({ kind: z.literal("file"), attachment: UploadedFileSchema }),
+    z.strictObject({ kind: z.literal("quote"), id: z.string(), text: z.string() }),
     z.strictObject({
       kind: z.literal("workspace_file"),
       path: z.string(),
@@ -167,6 +169,9 @@ export function isUserComposerAttachment(value: unknown): value is UserComposerA
 export function normalizeComposerAttachment(
   attachment: UserComposerAttachment,
 ): UserComposerAttachment {
+  if (attachment.kind === "quote") {
+    return { kind: "quote", id: attachment.id, text: normalizeQuoteText(attachment.text) };
+  }
   if (attachment.kind === "image") {
     return {
       kind: "image",
