@@ -20,6 +20,7 @@ import {
   ArrowRightToLine,
   Copy,
   Crown,
+  GitMerge,
   Pencil,
   RotateCw,
   Columns2,
@@ -104,6 +105,7 @@ import {
   useCanMoveSubagentToWorkspace,
   useMoveSubagentToWorkspace,
 } from "@/subagents/use-move-subagent-to-workspace";
+import { CrownOffIcon } from "@/components/icons/crown-off-icon";
 
 const DROPDOWN_WIDTH = 220;
 const DEFAULT_INLINE_ADD_BUTTON_RESERVED_WIDTH = 36;
@@ -138,6 +140,9 @@ const AGENT_TOOLTIP_TITLE_MAX_LENGTH = 80;
 const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
 const ThemedX = withUnistyles(X);
 const ThemedCopy = withUnistyles(Copy);
+const ThemedCrown = withUnistyles(Crown);
+const ThemedCrownOff = withUnistyles(CrownOffIcon);
+const ThemedGitMerge = withUnistyles(GitMerge);
 const ThemedExternalLink = withUnistyles(ExternalLink);
 
 const ThemedRotateCw = withUnistyles(RotateCw);
@@ -439,6 +444,12 @@ function TabContextMenuItem({
     switch (entry.icon) {
       case "copy":
         return <ThemedCopy size={16} uniProps={mutedColorMapping} />;
+      case "crown":
+        return <ThemedCrown size={16} uniProps={mutedColorMapping} />;
+      case "crown-off":
+        return <ThemedCrownOff size={16} uniProps={mutedColorMapping} />;
+      case "git-merge":
+        return <ThemedGitMerge size={16} uniProps={mutedColorMapping} />;
       case "rotate-cw":
         return <ThemedRotateCw size={16} uniProps={mutedColorMapping} />;
       case "arrow-left-to-line":
@@ -453,8 +464,6 @@ function TabContextMenuItem({
         return <ThemedPencil size={16} uniProps={mutedColorMapping} />;
       case "x":
         return <ThemedX size={16} uniProps={mutedColorMapping} />;
-      default:
-        return undefined;
     }
   }, [entry.icon]);
   const trailing = useMemo(

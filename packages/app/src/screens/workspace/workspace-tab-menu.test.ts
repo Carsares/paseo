@@ -51,8 +51,12 @@ describe("main tab menu", () => {
       });
       const toggle = menu.find((entry) => entry.key === "toggle-main-tab");
       const attach = menu.find((entry) => entry.key === "attach-to-main-tab");
-      expect(toggle).toMatchObject({ label: "设为主标签页", disabled: false });
-      expect(attach).toMatchObject({ label: "挂载到主标签页", disabled: false });
+      expect(toggle).toMatchObject({ label: "设为主标签页", icon: "crown", disabled: false });
+      expect(attach).toMatchObject({
+        label: "挂载到主标签页",
+        icon: "git-merge",
+        disabled: false,
+      });
       if (toggle?.kind !== "item" || attach?.kind !== "item")
         throw new Error("Missing hierarchy actions");
       toggle.onSelect();
@@ -69,6 +73,7 @@ describe("main tab menu", () => {
       });
       expect(mainMenu.find((entry) => entry.key === "toggle-main-tab")).toMatchObject({
         label: "取消主标签页",
+        icon: "crown-off",
         disabled: true,
       });
       expect(mainMenu.find((entry) => entry.key === "attach-to-main-tab")).toBeUndefined();

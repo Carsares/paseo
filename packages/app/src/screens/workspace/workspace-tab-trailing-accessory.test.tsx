@@ -18,12 +18,13 @@ void testI18n;
  */
 const capturedRootProps: { compactMode?: string }[] = [];
 const capturedContentProps: { sheetTitle?: string; testID?: string }[] = [];
+const capturedItemLeading = new Map<string, React.ReactNode>();
 
 const { mockTheme } = vi.hoisted(() => ({
   mockTheme: {
     colors: { foregroundMuted: "#aaa", surface2: "#222" },
     borderRadius: { md: 6 },
-    fontSize: { xs: 11 },
+    fontSize: { sm: 12, xs: 11 },
   },
 }));
 
@@ -34,8 +35,10 @@ vi.mock("lucide-react-native", () => {
     ArrowRightToLine: StubIcon,
     Copy: StubIcon,
     CopyX: StubIcon,
+    Crown: StubIcon,
     Ellipsis: StubIcon,
     ExternalLink: StubIcon,
+    GitMerge: StubIcon,
     Pencil: StubIcon,
     RotateCw: StubIcon,
     X: StubIcon,
@@ -99,17 +102,23 @@ vi.mock("@/components/ui/dropdown-menu", () => ({
   DropdownMenuSeparator: () => <div role="separator" />,
   DropdownMenuItem: ({
     children,
+    leading,
     onSelect,
     testID,
   }: {
     children: React.ReactNode;
+    leading?: React.ReactNode;
     onSelect?: () => void;
     testID?: string;
-  }) => (
-    <button type="button" data-testid={testID} onClick={onSelect}>
-      {children}
-    </button>
-  ),
+  }) => {
+    if (testID) capturedItemLeading.set(testID, leading);
+    return (
+      <button type="button" data-testid={testID} onClick={onSelect}>
+        {leading}
+        {children}
+      </button>
+    );
+  },
 }));
 
 function agentTab(): WorkspaceTabDescriptor {
@@ -186,12 +195,90 @@ describe("MobileTabTrailingAccessory", () => {
     document.body.innerHTML = "";
     capturedRootProps.length = 0;
     capturedContentProps.length = 0;
+    capturedItemLeading.clear();
   });
 
   afterEach(() => {
     current?.unmount();
     current = null;
     vi.unstubAllGlobals();
+  });
+
+  it("renders leading icons for set-main, unset-main, and attach-to-main items", () => {
+    const tab = agentTab();
+    const base = `workspace-tab-menu-${tab.tabId}`;
+    const sharedInput = {
+      surface: "mobile" as const,
+      tab,
+      index: 1,
+      tabCount: 2,
+      mainTabIndex: 0,
+      menuTestIDBase: base,
+      onCopyResumeCommand: vi.fn(),
+      onCopyAgentId: vi.fn(),
+      onCopyTerminalId: vi.fn(),
+      onCopyFilePath: vi.fn(),
+      onReloadAgent: vi.fn(),
+      onRenameTab: vi.fn(),
+      onCloseTab: vi.fn(),
+      onCloseTabsBefore: vi.fn(),
+      onCloseTabsAfter: vi.fn(),
+      onCloseOtherTabs: vi.fn(),
+    };
+
+    const nonMainEntries = buildWorkspaceTabMenuEntries({
+      ...sharedInput,
+      hierarchyActions: {
+        isMain: false,
+        pending: false,
+        setMain: vi.fn(),
+        attachToMain: vi.fn(),
+      },
+    });
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => {
+      root.render(
+        <MobileTabTrailingAccessory
+          menuTestIDBase={base}
+          presentationLabel="My session"
+          menuEntries={nonMainEntries}
+        />,
+      );
+    });
+    current = {
+      unmount: () => {
+        act(() => root.unmount());
+        container.remove();
+      },
+    };
+
+    expect(capturedItemLeading.get(`${base}-toggle-main-tab`)).toBeTruthy();
+    expect(capturedItemLeading.get(`${base}-attach-to-main-tab`)).toBeTruthy();
+
+    capturedItemLeading.clear();
+    const mainEntries = buildWorkspaceTabMenuEntries({
+      ...sharedInput,
+      index: 0,
+      hierarchyActions: {
+        isMain: true,
+        pending: false,
+        setMain: vi.fn(),
+      },
+    });
+    act(() => {
+      root.render(
+        <MobileTabTrailingAccessory
+          menuTestIDBase={base}
+          presentationLabel="My session"
+          menuEntries={mainEntries}
+        />,
+      );
+    });
+
+    expect(capturedItemLeading.get(`${base}-toggle-main-tab`)).toBeTruthy();
   });
 
   it("renders the per-session actions as a bottom sheet on compact (so it is reachable over the sessions sheet)", () => {

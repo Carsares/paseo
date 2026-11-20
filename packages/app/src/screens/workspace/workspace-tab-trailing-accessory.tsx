@@ -7,12 +7,15 @@ import {
   ArrowRightToLine,
   Copy,
   CopyX,
+  Crown,
   Ellipsis,
   ExternalLink,
+  GitMerge,
   Pencil,
   RotateCw,
   X,
 } from "lucide-react-native";
+import { CrownOffIcon } from "@/components/icons/crown-off-icon";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -26,6 +29,9 @@ import type { Theme } from "@/styles/theme";
 
 const ThemedEllipsis = withUnistyles(Ellipsis);
 const ThemedCopy = withUnistyles(Copy);
+const ThemedCrown = withUnistyles(Crown);
+const ThemedCrownOff = withUnistyles(CrownOffIcon);
+const ThemedGitMerge = withUnistyles(GitMerge);
 const ThemedRotateCw = withUnistyles(RotateCw);
 const ThemedArrowLeftToLine = withUnistyles(ArrowLeftToLine);
 const ThemedArrowRightToLine = withUnistyles(ArrowRightToLine);
@@ -52,6 +58,12 @@ function MobileTabDropdownMenuItem({
     switch (entry.icon) {
       case "copy":
         return <ThemedCopy size={16} uniProps={mutedColorMapping} />;
+      case "crown":
+        return <ThemedCrown size={16} uniProps={mutedColorMapping} />;
+      case "crown-off":
+        return <ThemedCrownOff size={16} uniProps={mutedColorMapping} />;
+      case "git-merge":
+        return <ThemedGitMerge size={16} uniProps={mutedColorMapping} />;
       case "rotate-cw":
         return <ThemedRotateCw size={16} uniProps={mutedColorMapping} />;
       case "arrow-left-to-line":
@@ -66,8 +78,6 @@ function MobileTabDropdownMenuItem({
         return <ThemedPencil size={16} uniProps={mutedColorMapping} />;
       case "x":
         return <ThemedX size={16} uniProps={mutedColorMapping} />;
-      default:
-        return undefined;
     }
   }, [entry.icon]);
   const trailing = useMemo(

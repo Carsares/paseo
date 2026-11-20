@@ -109,20 +109,25 @@ export const DEFAULT_WORKSPACE_TAB_MENU_LABELS: WorkspaceTabMenuLabels = {
   close: i18n.t("workspace.tabs.menu.close"),
 };
 
+export type WorkspaceTabMenuIcon =
+  | "copy"
+  | "crown"
+  | "crown-off"
+  | "git-merge"
+  | "rotate-cw"
+  | "arrow-left-to-line"
+  | "arrow-right-to-line"
+  | "copy-x"
+  | "external-link"
+  | "pencil"
+  | "x";
+
 export type WorkspaceTabMenuEntry =
   | {
       kind: "item";
       key: string;
       label: string;
-      icon?:
-        | "copy"
-        | "rotate-cw"
-        | "arrow-left-to-line"
-        | "arrow-right-to-line"
-        | "copy-x"
-        | "external-link"
-        | "pencil"
-        | "x";
+      icon: WorkspaceTabMenuIcon;
       hint?: string;
       tooltip?: string;
       disabled?: boolean;
@@ -309,6 +314,7 @@ export function buildWorkspaceTabMenuEntries(
       kind: "item",
       key: "toggle-main-tab",
       label: isMain ? hierarchyLabels.unsetMain : hierarchyLabels.setMain,
+      icon: isMain ? "crown-off" : "crown",
       disabled: pending,
       testID: `${menuTestIDBase}-toggle-main-tab`,
       onSelect: () => setMain(!isMain),
@@ -318,6 +324,7 @@ export function buildWorkspaceTabMenuEntries(
         kind: "item",
         key: "attach-to-main-tab",
         label: hierarchyLabels.attach,
+        icon: "git-merge",
         disabled: pending,
         testID: `${menuTestIDBase}-attach-to-main-tab`,
         onSelect: attachToMain,
