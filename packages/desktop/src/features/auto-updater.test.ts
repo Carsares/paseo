@@ -4,49 +4,60 @@ import path from "node:path";
 import { UUID } from "builder-util-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const { autoUpdaterMock, settingsMock, appEvents, nativeUpdateEvents, updateEvents } =
-  await vi.hoisted(async () => {
-    const { EventEmitter } = await import("node:events");
-    const handlers = new Map<string, (value: unknown) => void>();
-    const updaterEmitter = new EventEmitter();
-    return {
-      appEvents: new EventEmitter(),
-      nativeUpdateEvents: Object.assign(new EventEmitter(), {
-        checkForUpdates: vi.fn(),
-        getFeedURL: () => "http://127.0.0.1:32100",
-      }),
-      updateEvents: updaterEmitter,
-      settingsMock: { officialUpdatesEnabled: true },
-      autoUpdaterMock: {
-        autoDownload: true,
-        handlers,
-        logger: {
-          debug: vi.fn(),
-          error: vi.fn((message: unknown) => console.error(message)),
-          info: vi.fn(),
-          warn: vi.fn(),
-        },
-        checkForUpdates: vi.fn(),
-        downloadUpdate: vi.fn(),
-        on: vi.fn((event: string, handler: (value: unknown) => void) => {
-          handlers.set(event, handler);
-        }),
-        once: updaterEmitter.once.bind(updaterEmitter),
-        removeListener: updaterEmitter.removeListener.bind(updaterEmitter),
-        quitAndInstall: vi.fn(),
+const {
+  autoUpdaterMock,
+  settingsMock,
+  releaseInstallLock,
+  appEvents,
+  nativeUpdateEvents,
+  updateEvents,
+} = await vi.hoisted(async () => {
+  const { EventEmitter } = await import("node:events");
+  const handlers = new Map<string, (value: unknown) => void>();
+  const updaterEmitter = new EventEmitter();
+  return {
+    appEvents: new EventEmitter(),
+    nativeUpdateEvents: Object.assign(new EventEmitter(), {
+      checkForUpdates: vi.fn(),
+      getFeedURL: () => "http://127.0.0.1:32100",
+    }),
+    updateEvents: updaterEmitter,
+    settingsMock: { officialUpdatesEnabled: true },
+    releaseInstallLock: vi.fn(),
+    autoUpdaterMock: {
+      autoDownload: true,
+      handlers,
+      logger: {
+        debug: vi.fn(),
+        error: vi.fn((message: unknown) => console.error(message)),
+        info: vi.fn(),
+        warn: vi.fn(),
       },
-    };
-  });
+      checkForUpdates: vi.fn(),
+      downloadUpdate: vi.fn(),
+      on: vi.fn((event: string, handler: (value: unknown) => void) => {
+        handlers.set(event, handler);
+      }),
+      once: updaterEmitter.once.bind(updaterEmitter),
+      removeListener: updaterEmitter.removeListener.bind(updaterEmitter),
+      quitAndInstall: vi.fn(),
+    },
+  };
+});
 
 vi.mock("../settings/desktop-settings-electron.js", () => ({
-  getDesktopSettingsStore: () => ({ get: async () => settingsMock }),
+  getDesktopSettingsStore: () => ({
+    get: async () => settingsMock,
+    beginOfficialUpdateInstall: async () =>
+      settingsMock.officialUpdatesEnabled ? releaseInstallLock : null,
+  }),
 }));
 
 vi.mock("electron", () => ({
   app: {
     getPath: vi.fn(),
     isPackaged: true,
-    once: appEvents.once.bind(appEvents),
+    on: appEvents.on.bind(appEvents),
     removeListener: appEvents.removeListener.bind(appEvents),
   },
   autoUpdater: nativeUpdateEvents,
@@ -61,8 +72,10 @@ import {
   checkForAppUpdate,
   createAppUpdateLifecycleLogger,
   downloadAndInstallUpdate,
+  hasAcceptedNativeUpdateQuit,
   installAppUpdateOnQuit,
   isMacUpdateQuitInProgress,
+  isNativeUpdateHandoffInProgress,
   resolveStagingUserId,
   rolloutManifestSchema,
   shouldAdmitToRollout,
@@ -210,7 +223,9 @@ describe("manual installer handoff", () => {
 
   afterEach(() => {
     Object.defineProperty(process, "platform", platform);
+    vi.useRealTimers();
     settingsMock.officialUpdatesEnabled = true;
+    releaseInstallLock.mockClear();
     autoUpdaterMock.quitAndInstall.mockReset();
     autoUpdaterMock.downloadUpdate.mockReset();
     nativeUpdateEvents.checkForUpdates.mockReset();
@@ -230,7 +245,7 @@ describe("manual installer handoff", () => {
     let completed = false;
     const pending = downloadAndInstallUpdate(
       { currentVersion: "1.2.3", releaseChannel: "stable" },
-      async () => restore,
+      async () => ({ restore, beforeHandoff: async () => {} }),
     ).finally(() => {
       completed = true;
     });
@@ -259,7 +274,7 @@ describe("manual installer handoff", () => {
       autoUpdaterMock.handlers.get("update-downloaded")?.(info);
     });
     const restore = vi.fn(async () => {});
-    const onBeforeQuit = vi.fn(async () => restore);
+    const onBeforeQuit = vi.fn(async () => ({ restore, beforeHandoff: async () => {} }));
     const failed = downloadAndInstallUpdate(input, onBeforeQuit);
     await expect.poll(() => nativeUpdateEvents.checkForUpdates.mock.calls.length).toBe(1);
     expect(onBeforeQuit).toHaveBeenCalledExactlyOnceWith(info);
@@ -270,6 +285,7 @@ describe("manual installer handoff", () => {
       message: expect.stringContaining("Squirrel failed"),
     });
     expect(restore).toHaveBeenCalledOnce();
+    expect(releaseInstallLock).toHaveBeenCalledOnce();
 
     // An event after the rejected attempt cannot quit the app.
     emitMacUpdateDownloaded();
@@ -286,6 +302,36 @@ describe("manual installer handoff", () => {
     expect(await retry).toMatchObject({ installed: true, version: info.version });
     expect(onBeforeQuit.mock.calls).toEqual([[info], [info]]);
     expect(restore).toHaveBeenCalledOnce();
+  });
+
+  it("restores when Electron reports a synchronous error after acknowledging the quit", async () => {
+    Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+    const info = { version: "1.2.13" };
+    autoUpdaterMock.checkForUpdates.mockResolvedValue({
+      isUpdateAvailable: true,
+      updateInfo: info,
+    });
+    autoUpdaterMock.downloadUpdate.mockImplementation(async () => {
+      autoUpdaterMock.handlers.get("update-downloaded")?.(info);
+    });
+    nativeUpdateEvents.checkForUpdates.mockImplementation(() => emitMacUpdateDownloaded());
+    autoUpdaterMock.quitAndInstall.mockImplementation(() => {
+      nativeUpdateEvents.emit("before-quit-for-update");
+      updateEvents.emit("error", new Error("Native install failed"));
+    });
+    const restore = vi.fn(async () => {});
+    const result = await downloadAndInstallUpdate(
+      { currentVersion: "1.2.3", releaseChannel: "stable" },
+      async () => ({ restore, beforeHandoff: async () => {} }),
+    );
+
+    expect(result).toMatchObject({
+      installed: false,
+      message: expect.stringContaining("Native install failed"),
+    });
+    expect(restore).toHaveBeenCalledOnce();
+    expect(releaseInstallLock).toHaveBeenCalledOnce();
+    expect(hasAcceptedNativeUpdateQuit()).toBe(false);
   });
 
   it("acknowledges the macOS no-relaunch exit only after native staging completes", async () => {
@@ -320,6 +366,34 @@ describe("manual installer handoff", () => {
     expect(onBeforeQuit).toHaveBeenCalledExactlyOnceWith(info);
     expect(autoUpdaterMock.quitAndInstall).toHaveBeenCalledExactlyOnceWith(true, false);
     expect(isMacUpdateQuitInProgress()).toBe(false);
+  });
+
+  it("does not mistake an ordinary macOS quit for the pending no-relaunch handoff", async () => {
+    Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+    const info = { version: "1.2.14" };
+    const input = { currentVersion: "1.2.3", releaseChannel: "stable" } as const;
+    autoUpdaterMock.checkForUpdates.mockResolvedValue({
+      isUpdateAvailable: true,
+      updateInfo: info,
+    });
+    autoUpdaterMock.downloadUpdate.mockImplementation(async () => {
+      autoUpdaterMock.handlers.get("update-downloaded")?.(info);
+    });
+    nativeUpdateEvents.checkForUpdates.mockImplementation(() => emitMacUpdateDownloaded());
+    await checkForAppUpdate({ ...input, intent: "automatic" });
+    const restore = vi.fn(async () => {});
+    const install = installAppUpdateOnQuit({
+      ...input,
+      signal: new AbortController().signal,
+      onBeforeQuit: async () => ({ restore, beforeHandoff: async () => {} }),
+    });
+
+    await expect.poll(() => autoUpdaterMock.quitAndInstall).toHaveBeenCalledOnce();
+    appEvents.emit("before-quit");
+    updateEvents.emit("error", new Error("Updater did not call app.quit"));
+    expect(await install).toBe(false);
+    expect(restore).toHaveBeenCalledOnce();
+    expect(appEvents.listenerCount("before-quit")).toBe(0);
   });
 
   it("honors disabling updates while macOS is downloading the ZIP", async () => {
@@ -362,8 +436,9 @@ describe("manual installer handoff", () => {
     autoUpdaterMock.downloadUpdate.mockImplementation(async () => {
       autoUpdaterMock.handlers.get("update-downloaded")?.(info);
     });
-    const stopped = Promise.withResolvers<() => Promise<void>>();
     const restore = vi.fn(async () => {});
+    const shutdown = { restore, beforeHandoff: async () => {} };
+    const stopped = Promise.withResolvers<typeof shutdown>();
     const onBeforeQuit = vi.fn(() => stopped.promise);
     const install = downloadAndInstallUpdate(
       { currentVersion: "1.2.3", releaseChannel: "stable" },
@@ -371,7 +446,7 @@ describe("manual installer handoff", () => {
     );
     await expect.poll(() => onBeforeQuit.mock.calls).toEqual([[info]]);
     settingsMock.officialUpdatesEnabled = false;
-    stopped.resolve(restore);
+    stopped.resolve(shutdown);
 
     expect(await install).toMatchObject({
       installed: false,
@@ -436,7 +511,8 @@ describe("manual installer handoff", () => {
     expect(autoUpdaterMock.quitAndInstall).not.toHaveBeenCalled();
   });
 
-  it("quits after a selected macOS update fails in Squirrel, even after the deadline", async () => {
+  it("bounds the selected macOS preparation, restores the daemon and ignores late native events", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
     const info = { version: "1.2.10" };
     const input = { currentVersion: "1.2.3", releaseChannel: "stable" } as const;
@@ -451,10 +527,13 @@ describe("manual installer handoff", () => {
     const deadline = new AbortController();
     const exit = vi.fn();
     const stopDaemon = vi.fn(async () => true);
+    const restore = vi.fn(async () => {});
+    const prepare = vi.fn(async () => ({ restore, beforeHandoff: async () => {} }));
     const lifecycle = createQuitLifecycle({
       app: { exit },
       closeTransportSessions: () => {},
       stopDesktopManagedDaemonIfNeeded: stopDaemon,
+      prepareDaemonForAppUpdate: prepare,
       installAppUpdateOnQuit: (signal, onBeforeQuit) =>
         installAppUpdateOnQuit({ ...input, signal, onBeforeQuit }),
       createUpdateDeadlineSignal: () => deadline.signal,
@@ -462,16 +541,65 @@ describe("manual installer handoff", () => {
       onUpdateError: vi.fn(),
     });
     lifecycle.handleBeforeQuit({ preventDefault: vi.fn() });
-    await expect.poll(() => nativeUpdateEvents.checkForUpdates.mock.calls.length).toBe(1);
-    expect(stopDaemon).toHaveBeenCalledExactlyOnceWith({ appUpdate: info });
+    await vi.waitFor(() => expect(nativeUpdateEvents.checkForUpdates).toHaveBeenCalledOnce());
+    expect(prepare).toHaveBeenCalledExactlyOnceWith(info);
     deadline.abort();
     await Promise.resolve();
     expect(exit).not.toHaveBeenCalled();
-    nativeUpdateEvents.emit("error", new Error("Squirrel failed to prepare update"));
-    await expect.poll(() => exit.mock.calls).toEqual([[0]]);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(exit).toHaveBeenCalledExactlyOnceWith(0);
+    expect(restore).toHaveBeenCalledOnce();
+    expect(releaseInstallLock).toHaveBeenCalledOnce();
+    expect(nativeUpdateEvents.listenerCount("update-downloaded")).toBe(0);
+    expect(nativeUpdateEvents.listenerCount("update-not-available")).toBe(0);
+    expect(nativeUpdateEvents.listenerCount("error")).toBe(0);
     emitMacUpdateDownloaded();
-    expect(stopDaemon).toHaveBeenCalledExactlyOnceWith({ appUpdate: info });
+    expect(stopDaemon).not.toHaveBeenCalled();
     expect(autoUpdaterMock.quitAndInstall).not.toHaveBeenCalled();
+  });
+
+  it("times out a manual handoff and clears listeners and ownership before a late event", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const info = { version: "1.2.12" };
+    autoUpdaterMock.checkForUpdates.mockResolvedValue({
+      isUpdateAvailable: true,
+      updateInfo: info,
+    });
+    autoUpdaterMock.downloadUpdate.mockImplementation(async () => {
+      autoUpdaterMock.handlers.get("update-downloaded")?.(info);
+    });
+    const restore = vi.fn(async () => {});
+    const pending = downloadAndInstallUpdate(
+      { currentVersion: "1.2.3", releaseChannel: "stable" },
+      async () => ({ restore, beforeHandoff: async () => {} }),
+    );
+    await vi.waitFor(() => expect(autoUpdaterMock.quitAndInstall).toHaveBeenCalledOnce());
+    expect(isNativeUpdateHandoffInProgress()).toBe(true);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(await pending).toMatchObject({
+      installed: false,
+      message: expect.stringContaining("ownership"),
+    });
+    expect(restore).toHaveBeenCalledOnce();
+    expect(isNativeUpdateHandoffInProgress()).toBe(false);
+    expect(updateEvents.listenerCount("error")).toBe(0);
+
+    const retryShutdown = vi.fn(async () => ({ restore, beforeHandoff: async () => {} }));
+    const retry = downloadAndInstallUpdate(
+      { currentVersion: "1.2.3", releaseChannel: "stable" },
+      retryShutdown,
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(nativeUpdateEvents.emit("before-quit-for-update")).toBe(false);
+    expect(await retry).toMatchObject({
+      installed: false,
+      message: expect.stringContaining("Restart Paseo"),
+    });
+    expect(autoUpdaterMock.quitAndInstall).toHaveBeenCalledOnce();
+    expect(hasAcceptedNativeUpdateQuit()).toBe(false);
+    expect(retryShutdown).not.toHaveBeenCalled();
+    expect(restore).toHaveBeenCalledOnce();
   });
 });
 

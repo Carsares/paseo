@@ -1,5 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import pino, { type Logger } from "pino";
@@ -12,7 +20,7 @@ import { getPaseoWorktreeMetadataPath } from "../utils/worktree-metadata.js";
 import { archiveCommand } from "./worktree/commands.js";
 import { createWorktree, listPaseoWorktrees, type WorktreeConfig } from "../utils/worktree.js";
 import type { ManagedAgent } from "./agent/agent-manager.js";
-import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
+import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import {
   archiveByScope,
@@ -160,8 +168,9 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
       }),
     },
     agentStorage: {
+      listActive: async (): Promise<StoredAgentRecord[]> => [],
       listByWorkspace: async (): Promise<StoredAgentRecord[]> => [],
-    } as Pick<AgentStorage, "listByWorkspace">,
+    },
     findWorkspaceIdForCwd: input.findWorkspaceIdForCwd ?? vi.fn(async () => null),
     listActiveWorkspaces: async () =>
       active.filter((workspace) => !archivedWorkspaceIds.has(workspace.workspaceId)),
@@ -285,6 +294,46 @@ describe("archiveByScope", () => {
       removedDirectory: true,
     });
     expect(existsSync(worktree.worktreePath)).toBe(false);
+  });
+
+  test("keeps an owned worktree while a cold moved agent uses a nested directory through an alias", async () => {
+    const { tempDir, repoDir } = createGitRepo();
+    const paseoHome = path.join(tempDir, ".paseo");
+    const source = await createPaseoOwnedWorktree(repoDir, paseoHome, "move-source");
+    const destination = await createPaseoOwnedWorktree(repoDir, paseoHome, "move-destination");
+    const nested = path.join(source.worktreePath, "nested");
+    mkdirSync(nested);
+    const alias = path.join(tempDir, "source-alias");
+    symlinkSync(source.worktreePath, alias, process.platform === "win32" ? "junction" : "dir");
+    const cwd = path.join(alias, "nested");
+    const sourceWorkspace = {
+      workspaceId: "source",
+      cwd: source.worktreePath,
+      kind: "worktree",
+    } as const;
+    const deps = createArchiveDeps({
+      paseoHome,
+      activeWorkspaces: [
+        sourceWorkspace,
+        { workspaceId: "destination", cwd: destination.worktreePath, kind: "worktree" },
+      ],
+    });
+    const agent = { id: "moved", workspaceId: "destination", cwd } as StoredAgentRecord;
+    deps.agentStorage.listActive = async () => [agent];
+    const request = {
+      scope: { kind: "workspace", workspaceId: "source" },
+      requestId: "archive",
+    } as const;
+
+    expect((await archiveByScope(deps, request)).removedDirectory).toBe(false);
+    expect(existsSync(nested)).toBe(true);
+
+    deps.activeWorkspaces.push(sourceWorkspace);
+    deps.listActiveWorkspaces = async () => deps.activeWorkspaces;
+    deps.agentStorage.listActive = async () => [{ ...agent, cwd: destination.worktreePath }];
+    expect((await archiveByScope(deps, request)).removedDirectory).toBe(true);
+    expect(existsSync(source.worktreePath)).toBe(false);
+    expect(existsSync(destination.worktreePath)).toBe(true);
   });
 
   test("workspace scope archives the record but leaves a plugin-placed directory whose marker is gone", async () => {
@@ -961,7 +1010,12 @@ describe("archiveByScope", () => {
       ],
     });
     deps.agentManager = {
-      listAgents: () => [{ id: liveAgentId, workspaceId: targetWorkspaceId }] as ManagedAgent[],
+      listAgents: () =>
+        deps.archivedAgentIds.includes(liveAgentId)
+          ? []
+          : ([
+              { id: liveAgentId, workspaceId: targetWorkspaceId, cwd: worktree.worktreePath },
+            ] as ManagedAgent[]),
       getAgent: (agentId: string) =>
         agentId === liveAgentId ? ({ id: liveAgentId } as ManagedAgent) : null,
       archiveAgent: vi.fn(async (agentId: string) => {
@@ -974,6 +1028,7 @@ describe("archiveByScope", () => {
       }),
     };
     deps.agentStorage = {
+      ...deps.agentStorage,
       listByWorkspace: async (workspaceId: string) =>
         workspaceId === targetWorkspaceId
           ? ([
@@ -982,7 +1037,7 @@ describe("archiveByScope", () => {
           : ([
               { id: otherStoredAgentId, workspaceId: otherWorkspaceId, archivedAt: null },
             ] as StoredAgentRecord[]),
-    } as Pick<AgentStorage, "listByWorkspace">;
+    };
 
     const result = await archiveByScope(deps, {
       scope: { kind: "workspace", workspaceId: targetWorkspaceId },
@@ -1019,9 +1074,10 @@ describe("archiveByScope", () => {
       }),
     };
     deps.agentStorage = {
+      ...deps.agentStorage,
       listByWorkspace: async () =>
         [{ id: agentId, workspaceId, archivedAt: null }] as StoredAgentRecord[],
-    } as Pick<AgentStorage, "listByWorkspace">;
+    };
 
     const result = await archiveByScope(deps, {
       scope: { kind: "workspace", workspaceId },
@@ -1099,9 +1155,10 @@ describe("archiveByScope cancellation", () => {
     agents: Array<{ id: string; archivedAt: string | null }>,
   ) {
     return {
+      listActive: async () => [],
       listByWorkspace: async () =>
         agents.map((agent) => ({ ...agent, workspaceId })) as StoredAgentRecord[],
-    } as Pick<AgentStorage, "listByWorkspace">;
+    };
   }
 
   test("an abort while agents archive keeps the workspace record active", async () => {

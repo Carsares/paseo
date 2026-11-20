@@ -200,8 +200,7 @@ export const es: TranslationResources = {
     },
     errors: {
       failedToSend: "No se pudo enviar el mensaje",
-      removeQuotesForClaudeCommand:
-        "Quita las citas para ejecutar este comando de barra de Claude.",
+      removeQuotesForSlashCommand: "Quita las citas para ejecutar este comando de barra.",
       failedToCreateAgent: "No se pudo crear el agente",
       noHostSelected: "Ningún anfitrión seleccionado",
       initialPromptRequired: "Se requiere aviso inicial",
@@ -424,6 +423,7 @@ export const es: TranslationResources = {
       forkUnavailable: "Actualiza el host para usar esto.",
       forkMissingWorkspace: "Este agente no está en un espacio de trabajo.",
       forkFailed: "No se pudo bifurcar el chat",
+      forkSourceHostRemoved: "Se ha eliminado el host de origen.",
       openFile: "Abrir archivo",
       copied: "Copiado",
     },
@@ -823,6 +823,10 @@ export const es: TranslationResources = {
         closeTerminalMessage:
           "Cualquier proceso en ejecución en esta terminal se detendrá inmediatamente.",
         archiveRunningAgentTitle: "¿Agente de ejecución de archivos?",
+        handoffKeepQueueTitle: "¿Conservar los mensajes en cola con el agente original?",
+        handoffKeepQueueMessage:
+          "El agente original seguirá abierto y enviará los mensajes en cola con su proveedor actual.",
+        handoffKeepQueueConfirm: "Cambiar de proveedor",
         archiveRunningAgentMessage:
           "Este agente todavía está ejecutándose. Archivarlo detendrá al agente y cerrará la pestaña.",
         closeTabsLeftTitle: "¿Cerrar pestañas a la izquierda?",
@@ -2691,7 +2695,7 @@ export const es: TranslationResources = {
       officialUpdates: {
         label: "Permitir actualizaciones oficiales",
         description:
-          "Buscar, descargar e instalar versiones oficiales. Reemplazan las versiones personalizadas.",
+          "Buscar, descargar e instalar versiones oficiales. Reemplazan las versiones personalizadas. En macOS, puedes desactivar esta opción cuando termine el intento de instalación. macOS puede completar una actualización ya preparada al volver a abrir la aplicación.",
         disabled: "Las actualizaciones oficiales están desactivadas.",
       },
       updates: {

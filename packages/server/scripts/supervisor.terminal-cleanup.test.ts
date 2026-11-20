@@ -77,14 +77,19 @@ async function runSupervisorWith(workerScript: string, timeoutMs = 8_000) {
 }
 
 // Generation 1 asks for `firstIntent`; generation 2 (if any) stops with `secondIntent`.
-function scriptedWorker(firstIntent: string, secondIntent = "", recordResumeAgents = false) {
+function scriptedWorker(
+  firstIntent: string,
+  secondIntent = "",
+  recordResumeAgents = false,
+  firstExitCode = 0,
+) {
   return `
     process.on("message", (message) => {
       if (message.type !== "paseo:graceful-shutdown") return;
       record({ graceful: generation, keepTerminals: message.keepTerminals${
         recordResumeAgents ? ", resumeAgents: message.resumeAgents" : ""
       } });
-      process.exit(0);
+      process.exit(generation === 1 ? ${firstExitCode} : 0);
     });
     process.send({ type: "paseo:ready", listen: "endpoint-" + generation, serverId: "srv" });
     if (generation === 1) { ${firstIntent} }
@@ -219,4 +224,39 @@ describe("supervisor terminal cleanup", () => {
       expect(result.events).toEqual([{ started: 1 }, { graceful: 1, resumeAgents: true }]);
     },
   );
+
+  test("a kill restart retries cleanup before respawning if the worker saved recovery", async () => {
+    const result = await runSupervisorWith(
+      scriptedWorker(
+        `process.send({ type: "paseo:restart", keepTerminals: false, resumeAgents: true });`,
+        stopKeeping,
+        true,
+      ),
+    );
+    expect(result.code, result.output).toBe(0);
+    expect(result.events).toEqual([
+      { started: 1 },
+      { graceful: 1, keepTerminals: false, resumeAgents: true },
+      "cleanup",
+      { started: 2 },
+      { graceful: 2, keepTerminals: true, resumeAgents: false },
+    ]);
+  });
+
+  test("a worker that cannot confirm recovery still fails a kill restart", async () => {
+    const result = await runSupervisorWith(
+      scriptedWorker(
+        `process.send({ type: "paseo:restart", keepTerminals: false, resumeAgents: true });`,
+        stopKeeping,
+        true,
+        1,
+      ),
+    );
+    expect(result.code, result.output).toBe(1);
+    expect(result.events).toEqual([
+      { started: 1 },
+      { graceful: 1, keepTerminals: false, resumeAgents: true },
+      "cleanup",
+    ]);
+  });
 });

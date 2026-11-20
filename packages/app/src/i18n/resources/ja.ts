@@ -200,8 +200,7 @@ export const ja: TranslationResources = {
     },
     errors: {
       failedToSend: "メッセージの送信に失敗しました",
-      removeQuotesForClaudeCommand:
-        "この Claude スラッシュコマンドを実行するには、引用を削除してください。",
+      removeQuotesForSlashCommand: "このスラッシュコマンドを実行するには引用を削除してください。",
       failedToCreateAgent: "エージェントの作成に失敗しました",
       noHostSelected: "ホストが選択されていません",
       initialPromptRequired: "初期プロンプトが必要です",
@@ -424,6 +423,7 @@ export const ja: TranslationResources = {
       forkUnavailable: "これを使用するにはホストを更新してください。",
       forkMissingWorkspace: "このエージェントはワークスペース内にありません。",
       forkFailed: "チャットのフォークに失敗しました",
+      forkSourceHostRemoved: "元のホストは削除されました。",
       openFile: "ファイルを開く",
       copied: "コピーしました",
     },
@@ -820,6 +820,10 @@ export const ja: TranslationResources = {
         closeTerminalTitle: "ターミナルを閉じますか？",
         closeTerminalMessage: "このターミナルで実行中のプロセスはすぐに停止されます。",
         archiveRunningAgentTitle: "実行中のエージェントをアーカイブしますか？",
+        handoffKeepQueueTitle: "待機中のメッセージを元のエージェントに残しますか？",
+        handoffKeepQueueMessage:
+          "元のエージェントは開いたままで、現在のプロバイダーから待機中のメッセージを送信します。",
+        handoffKeepQueueConfirm: "プロバイダーを切り替える",
         archiveRunningAgentMessage:
           "このエージェントはまだ実行中です。アーカイブするとエージェントが停止してタブが閉じられます。",
         closeTabsLeftTitle: "左のタブを閉じますか？",
@@ -2658,7 +2662,7 @@ export const ja: TranslationResources = {
       officialUpdates: {
         label: "公式アップデートを許可",
         description:
-          "公式版の確認、ダウンロード、インストールを許可します。カスタム版は上書きされます。",
+          "公式版の確認、ダウンロード、インストールを許可します。カスタム版は上書きされます。macOS では、インストール処理が終わるまでこの設定をオフにできません。準備済みのアップデートは、再起動時に完了する場合があります。",
         disabled: "公式アップデートは無効です。",
       },
       updates: {

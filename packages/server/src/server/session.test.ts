@@ -59,8 +59,14 @@ import {
   parseStoredAgentRecord,
   type StoredAgentRecord,
 } from "./agent/agent-storage.js";
-import { AgentManager, type AgentManagerEvent } from "./agent/agent-manager.js";
+import {
+  AgentManager,
+  AgentRunCancellationError,
+  type AgentManagerEvent,
+} from "./agent/agent-manager.js";
+import { createAgentMessageDelivery } from "./agent/agent-messages/delivery.js";
 import { parseAgentMessage } from "./agent/agent-messages/index.js";
+import { MessageReceipts } from "./message-receipts/index.js";
 import { REMOTE_HIERARCHY_DEPTH_LABEL } from "./agent/hierarchy-policy.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
@@ -327,9 +333,11 @@ vi.mock("./worktree-bootstrap.js", async (importOriginal) => {
 
 interface SessionForTestOptions {
   workspaceRuntimeStore?: WorkspaceRuntimeStore;
+  messageDelivery?: Pick<SessionOptions, "agentMessages" | "messageReceipts">;
   sendToSource?: SessionOptions["onMessageToSource"];
   clientId?: string;
   permissions?: readonly DaemonPermission[];
+  authenticateAgentNotificationEvent?: SessionOptions["authenticateAgentNotificationEvent"];
   agentManager?: { [K in keyof SessionOptions["agentManager"]]?: unknown };
   agentStorage?: { [K in keyof SessionOptions["agentStorage"]]?: unknown };
   github?: Partial<ForgeService & GitHubService>;
@@ -410,6 +418,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     workspaceRuntimeStore: options.workspaceRuntimeStore ?? createWorkspaceRuntimeStore(),
     messageReceipts: createMessageReceiptsStub(),
     agentMessages: createAgentMessageDeliveryStub(),
+    ...options.messageDelivery,
     creationService: createTestCreationService(),
     clientId: options.clientId ?? "test-client",
     onMessage: (message) => messages.push(message),
@@ -424,6 +433,7 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
         }),
     onBinaryMessage: createBinaryMessageHandler(options.binaryMessages),
     clientCapabilities: options.clientCapabilities,
+    authenticateAgentNotificationEvent: options.authenticateAgentNotificationEvent,
     logger,
     downloadTokenStore: options.downloadTokenStore ?? asDownloadTokenStore(),
     pushNotifications: options.pushNotifications ?? asPushNotifications(),
@@ -495,6 +505,190 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
   if (options.sendToSource) sessionOptions.onMessageToSource = options.sendToSource;
   return new Session(sessionOptions);
 }
+
+test.each([null, "Last turn failed"])(
+  "wait for finish scopes stored closed-agent replies when the last error is %s",
+  async (lastError) => {
+    const id = "11111111-1111-4111-8111-111111111111";
+    const record = {
+      id,
+      cwd: "/tmp",
+      provider: "codex",
+      labels: {},
+      lastStatus: "closed",
+      lastError,
+      createdAt: "2026-01-01",
+      updatedAt: "2026-01-01",
+    } as const;
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      agentStorage: { listAll: async () => [record], get: async () => record },
+      agentManager: { getAgent: () => null, getLastAssistantMessage: async () => "Stored reply" },
+    });
+    try {
+      await session.handleMessage({
+        type: "wait_for_finish_request",
+        requestId: "wait",
+        agentId: id,
+      });
+      expect(messages).toContainEqual(
+        expect.objectContaining({
+          type: "wait_for_finish_response",
+          payload: expect.objectContaining({
+            status: "idle",
+            lastMessage: lastError ? null : "Stored reply",
+          }),
+        }),
+      );
+    } finally {
+      await session.cleanup();
+    }
+  },
+);
+
+test("agent message retries distinguish admission refusal from unconfirmed dispatch", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-session-message-receipts-"));
+  const agentId = "11111111-1111-4111-8111-111111111111";
+  const messages: SessionOutboundMessage[] = [];
+  const dispatch = vi.fn(async (request: { beforeProviderDispatch(): Promise<void> }) => {
+    await request.beforeProviderDispatch();
+    return "steered" as const;
+  });
+  const delivery = createAgentMessageDelivery({
+    dispatch,
+    onError: () => {},
+    schedule: () => () => {},
+  });
+  const session = createSessionForTest({
+    messages,
+    agentManager: { getAgent: (id: string) => (id === agentId ? { id } : null) },
+    messageDelivery: { agentMessages: delivery, messageReceipts: new MessageReceipts(directory) },
+  });
+  let attempt = 0;
+  async function send(messageId: string, waitForDispatch?: boolean) {
+    const requestId = String(++attempt);
+    await session.handleMessage({
+      type: "send_agent_message_request",
+      requestId,
+      agentId,
+      sourceAgentId: "22222222-2222-4222-8222-222222222222",
+      sourceAgentServerId: "remote-server",
+      messageId,
+      text: "Update",
+      waitForDispatch,
+    });
+    return messages.findLast(
+      (message) =>
+        message.type === "send_agent_message_response" && message.payload.requestId === requestId,
+    );
+  }
+  async function drain() {
+    const paused = delivery.pauseAdmission();
+    await paused.drained;
+    paused.release();
+  }
+  try {
+    const paused = delivery.pauseAdmission();
+    expect(await send("retry")).toMatchObject({
+      payload: { accepted: false, error: "Agent message delivery is preparing for shutdown" },
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    paused.release();
+    expect(await send("retry")).toMatchObject({
+      payload: { accepted: true, deliveryStatus: "queued" },
+    });
+    await drain();
+    expect(await send("retry")).toMatchObject({ payload: { accepted: true } });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+
+    dispatch.mockRejectedValueOnce(new Error("Provider reply lost"));
+    expect(await send("unknown")).toMatchObject({
+      payload: { accepted: true, deliveryStatus: "queued" },
+    });
+    await drain();
+    expect(await send("unknown")).toMatchObject({
+      payload: { accepted: false, error: "agent_request_outcome_unknown" },
+    });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+
+    dispatch.mockImplementationOnce(async (request) => {
+      await request.beforeProviderDispatch();
+      throw new AgentRunCancellationError(agentId, "replace");
+    });
+    const canceled = send("waited", true);
+    await vi.waitFor(() => expect(delivery.hasPending(agentId)).toBe(true));
+    await drain();
+    expect(await canceled).toMatchObject({ payload: { accepted: false } });
+    const retry = send("waited", true);
+    await vi.waitFor(() => expect(delivery.hasPending(agentId)).toBe(true));
+    await drain();
+    expect(await retry).toMatchObject({ payload: { accepted: true } });
+    expect(dispatch).toHaveBeenCalledTimes(4);
+  } finally {
+    await delivery.close();
+    await session.cleanup();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("direct clients cannot project structured agent notifications", async () => {
+  const recipientId = "11111111-1111-4111-8111-111111111111";
+  const sourceAgentId = "22222222-2222-4222-8222-222222222222";
+  const sources: unknown[] = [];
+  const delivery = createAgentMessageDelivery({
+    dispatch: async ({ prompt }) => {
+      if (typeof prompt !== "string") throw new Error("Expected one agent message");
+      sources.push(parseAgentMessage(prompt)?.source);
+      return "steered";
+    },
+    onError: (error) => {
+      throw error;
+    },
+    schedule: (_delayMs, callback) => {
+      queueMicrotask(callback);
+      return () => {};
+    },
+  });
+  const messages: SessionOutboundMessage[] = [];
+  const session = createSessionForTest({
+    messages,
+    agentManager: {
+      getAgent: (id: string) => (id === recipientId ? { id } : null),
+    },
+    messageDelivery: { agentMessages: delivery },
+  });
+
+  try {
+    await session.handleMessage({
+      type: "send_agent_message_request",
+      requestId: "direct-notification",
+      agentId: recipientId,
+      sourceAgentId,
+      sourceAgentServerId: "remote-server",
+      sourceAgentEvent: "finished",
+      messageId: "notification-id",
+      text: "The child finished.",
+      waitForDispatch: true,
+    });
+
+    expect(sources).toEqual([
+      { kind: "agent-message", agentId: sourceAgentId, serverId: "remote-server" },
+    ]);
+    expect(messages).toContainEqual({
+      type: "send_agent_message_response",
+      payload: {
+        requestId: "direct-notification",
+        agentId: recipientId,
+        accepted: true,
+        error: null,
+      },
+    });
+  } finally {
+    await delivery.close();
+    await session.cleanup();
+  }
+});
 
 test("routes host-scoped agent skills requests through the daemon owner", async () => {
   const messages: SessionOutboundMessage[] = [];
@@ -1899,7 +2093,9 @@ test("creation preserves the human first prompt while assigning validated local 
   });
   try {
     const config = { provider: "codex", cwd } as const;
-    const parent = await manager.createAgent(config, undefined, {
+    const parentCwd = join(cwd, "parent-directory");
+    mkdirSync(parentCwd);
+    const parent = await manager.createAgent({ ...config, cwd: parentCwd }, undefined, {
       workspaceId: workspace.workspaceId,
     });
     const suppliedLabels = {
@@ -1912,6 +2108,7 @@ test("creation preserves the human first prompt while assigning validated local 
     await session.handleMessage({
       type: "create_agent_request",
       config,
+      workspaceId: workspace.workspaceId,
       callerAgentId: parent.id,
       initialPrompt: "Written by the user",
       initialPromptOrigin: "user",
@@ -1922,6 +2119,7 @@ test("creation preserves the human first prompt while assigning validated local 
     expect(human).toMatchObject({ status: "agent_created" });
     expect(onStartTurn).toHaveBeenCalledExactlyOnceWith("Written by the user", expect.anything());
     expect(await storage.get(human!.agentId!)).toMatchObject({
+      cwd: parentCwd,
       labels: {
         [PARENT_AGENT_ID_LABEL]: parent.id,
         [PARENT_SERVER_ID_LABEL]: "local-host",
@@ -2043,6 +2241,7 @@ describe("agent move to workspace RPC", () => {
       createSessionForTest({
         messages: outbound,
         paseoHome: cwd,
+        serverId: "local-host",
         agentManager: {
           getAgent: agentManager.getAgent.bind(agentManager),
           listAgents: agentManager.listAgents.bind(agentManager),
@@ -2063,6 +2262,7 @@ describe("agent move to workspace RPC", () => {
         projectRegistry: {
           get: vi.fn().mockResolvedValue(project),
           list: vi.fn().mockResolvedValue([project]),
+          remove: vi.fn().mockResolvedValue(undefined),
         },
         workspaceGitService: { getCheckout },
       });
@@ -2643,6 +2843,155 @@ describe("agent move to workspace RPC", () => {
     expect(findByType(archiveMessages, "archive_workspace_response")?.payload).toMatchObject({
       requestId: "archive-after-move",
       error: null,
+    });
+  });
+
+  test("project removal includes a workspace published by a move already persisting", async () => {
+    const { session, registry, storage, project, workspaceRegistry, createSession } = await setup();
+    const messages: SessionOutboundMessage[] = [];
+    const removingSession = createSession(messages);
+    sessions.push(removingSession);
+    const persisting = deferred<string>();
+    const releaseMove = deferred<void>();
+    const beforeRemoval = deferred<void>();
+    const upsert = storage.upsert.bind(storage);
+    vi.spyOn(storage, "upsert").mockImplementationOnce(async (record) => {
+      persisting.resolve(record.workspaceId!);
+      await releaseMove.promise;
+      return upsert(record);
+    });
+    vi.spyOn(workspaceRegistry, "listActive").mockImplementationOnce(async () => {
+      const records = await registry.listActive();
+      beforeRemoval.resolve();
+      return records;
+    });
+
+    const move = session.handleMessage({
+      type: "agent.move_to_workspace.request",
+      agentId: childId,
+      requestId: "move-before-project-remove",
+    });
+    const workspaceId = await persisting.promise;
+    const removal = removingSession.handleMessage({
+      type: "project.remove.request",
+      projectId: project.projectId,
+      requestId: "remove-project",
+    });
+    try {
+      await beforeRemoval.promise;
+    } finally {
+      releaseMove.resolve();
+      await Promise.all([move, removal]);
+    }
+    expect(await registry.listActive()).toEqual([]);
+    expect(await storage.get(childId)).toMatchObject({
+      workspaceId,
+      archivedAt: expect.any(String),
+    });
+    expect(findByType(messages, "project.remove.response")?.payload).toMatchObject({
+      accepted: true,
+      removedWorkspaceIds: expect.arrayContaining([sourceWorkspaceId, workspaceId]),
+    });
+  });
+
+  test("a failed project removal releases the lock for a move on another connection", async () => {
+    const { session, messages, project, workspaceRegistry, createSession } = await setup();
+    const removalMessages: SessionOutboundMessage[] = [];
+    const removingSession = createSession(removalMessages);
+    sessions.push(removingSession);
+    const listing = deferred<void>();
+    const failListing = deferred<void>();
+    vi.spyOn(workspaceRegistry, "listActive").mockImplementationOnce(async () => {
+      listing.resolve();
+      await failListing.promise;
+      throw new Error("Cannot list workspaces");
+    });
+    const removal = removingSession.handleMessage({
+      type: "project.remove.request",
+      projectId: project.projectId,
+      requestId: "fail-project-removal",
+    });
+    try {
+      await listing.promise;
+      await session.handleMessage({
+        type: "agent.move_to_workspace.request",
+        agentId: childId,
+        requestId: "move-during-failed-removal",
+      });
+      expect(findByType(messages, "agent.move_to_workspace.response")?.payload).toMatchObject({
+        accepted: false,
+        error: `Project is being removed: ${project.projectId}`,
+      });
+    } finally {
+      failListing.resolve();
+      await removal;
+    }
+    expect(findByType(removalMessages, "project.remove.response")?.payload).toMatchObject({
+      accepted: false,
+      error: "Cannot list workspaces",
+    });
+    messages.length = 0;
+    await session.handleMessage({
+      type: "agent.move_to_workspace.request",
+      agentId: childId,
+      requestId: "move-after-failed-removal",
+    });
+    expect(findByType(messages, "agent.move_to_workspace.response")?.payload).toMatchObject({
+      accepted: true,
+    });
+  });
+
+  test("moves only descendants whose parent ID belongs to this host", async () => {
+    const { session, messages, registry, storage, cwd } = await setup();
+    await storage.upsert(
+      createStoredAgentRecord({
+        id: "remote-child",
+        cwd,
+        workspaceId: sourceWorkspaceId,
+        labels: { [PARENT_AGENT_ID_LABEL]: childId, [PARENT_SERVER_ID_LABEL]: "other-host" },
+      }),
+    );
+    await session.handleMessage({
+      type: "agent.move_to_workspace.request",
+      agentId: childId,
+      requestId: "move-with-remote-collision",
+    });
+    expect(await registry.listActive()).toHaveLength(2);
+    expect(findByType(messages, "agent.move_to_workspace.response")?.payload).toMatchObject({
+      accepted: true,
+    });
+    expect(await storage.get("remote-child")).toMatchObject({ workspaceId: sourceWorkspaceId });
+  });
+
+  test("rejects moving a subtree whose members use different Git worktrees", async () => {
+    const { session, messages, registry, storage, cwd, getCheckout } = await setup();
+    const otherCwd = join(cwd, "other-worktree");
+    getCheckout.mockImplementation((directory: string) => ({
+      cwd: directory,
+      isGit: true,
+      currentBranch: null,
+      remoteUrl: null,
+      worktreeRoot: directory,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: cwd,
+    }));
+    await storage.upsert(
+      createStoredAgentRecord({
+        id: "mixed-worktree-child",
+        cwd: otherCwd,
+        workspaceId: sourceWorkspaceId,
+        labels: { [PARENT_AGENT_ID_LABEL]: childId },
+      }),
+    );
+    await session.handleMessage({
+      type: "agent.move_to_workspace.request",
+      agentId: childId,
+      requestId: "move-mixed-worktree",
+    });
+    expect(await registry.listActive()).toHaveLength(1);
+    expect(findByType(messages, "agent.move_to_workspace.response")?.payload).toMatchObject({
+      accepted: false,
+      error: "Cannot move agents that use different Git worktrees together.",
     });
   });
 

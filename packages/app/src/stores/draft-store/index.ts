@@ -145,6 +145,8 @@ const migrateLegacyImages: MigrateLegacyImages = async (images) => {
 };
 
 async function runAttachmentGc(): Promise<void> {
+  // Restored workspace attachments can still reference screenshot files.
+  await useWorkspaceAttachmentsStore.hydration;
   gcScheduled = false;
   const nowMs = Date.now();
 

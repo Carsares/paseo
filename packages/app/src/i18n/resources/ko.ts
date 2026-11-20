@@ -199,7 +199,7 @@ export const ko: TranslationResources = {
     },
     errors: {
       failedToSend: "메시지를 보내지 못했습니다",
-      removeQuotesForClaudeCommand: "이 Claude 슬래시 명령을 실행하려면 인용문을 제거하세요.",
+      removeQuotesForSlashCommand: "이 슬래시 명령을 실행하려면 인용문을 제거하세요.",
       failedToCreateAgent: "에이전트를 생성하지 못했습니다",
       noHostSelected: "선택된 호스트가 없습니다",
       initialPromptRequired: "초기 프롬프트가 필요합니다",
@@ -419,6 +419,7 @@ export const ko: TranslationResources = {
       forkUnavailable: "이를 사용하려면 호스트를 업데이트하세요.",
       forkMissingWorkspace: "이 에이전트는 워크스페이스에 속해 있지 않습니다.",
       forkFailed: "채팅을 분기하지 못했습니다.",
+      forkSourceHostRemoved: "원본 호스트가 삭제되었습니다.",
       openFile: "파일 열기",
       copied: "복사됨",
     },
@@ -815,6 +816,10 @@ export const ko: TranslationResources = {
         closeTerminalTitle: "터미널을 닫을까요?",
         closeTerminalMessage: "이 터미널에서 실행 중인 프로세스가 즉시 중지됩니다.",
         archiveRunningAgentTitle: "실행 중인 에이전트를 보관할까요?",
+        handoffKeepQueueTitle: "대기 중인 메시지를 기존 에이전트에 남길까요?",
+        handoffKeepQueueMessage:
+          "기존 에이전트는 계속 열려 있으며 현재 제공업체로 대기 중인 메시지를 보냅니다.",
+        handoffKeepQueueConfirm: "제공업체 전환",
         archiveRunningAgentMessage:
           "이 에이전트는 아직 실행 중입니다. 보관하면 에이전트가 중지되고 탭이 닫힙니다.",
         closeTabsLeftTitle: "왼쪽 탭을 닫을까요?",
@@ -2647,7 +2652,8 @@ export const ko: TranslationResources = {
       },
       officialUpdates: {
         label: "공식 업데이트 허용",
-        description: "공식 버전을 확인하고 다운로드 및 설치합니다. 사용자 지정 버전을 대체합니다.",
+        description:
+          "공식 버전을 확인하고 다운로드 및 설치합니다. 사용자 지정 버전을 대체합니다. macOS에서는 설치 시도가 끝나면 이 설정을 끌 수 있습니다. 이미 준비된 업데이트는 앱을 다시 열 때 완료될 수 있습니다.",
         disabled: "공식 업데이트가 비활성화되었습니다.",
       },
       updates: {

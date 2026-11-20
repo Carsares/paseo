@@ -1,5 +1,6 @@
 import {
   getMainPriorModeIdFromLabels,
+  getParentAddressFromLabels,
   getParentAgentIdFromLabels,
   isMainControlAgentLabels,
   MAIN_PRIOR_MODE_ID_LABEL,
@@ -8,7 +9,6 @@ import {
   resolveAgentHierarchyDepth,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
-import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import type { AgentPermissionRequest, AgentSessionConfig } from "./agent-sdk-types.js";
 import { OpenCodeProviderOptionsSchema } from "./providers/opencode/options.js";
@@ -58,11 +58,28 @@ export async function readAgentHierarchyPath(
   return agents;
 }
 
-export function computeAgentDepth(agentId: string, readAgent: ReadAgent): number {
+function readLocalParentId(labels: HierarchyAgent["labels"], serverId?: string): string | null {
+  if (serverId === undefined) return getParentAgentIdFromLabels(labels);
+  const parent = getParentAddressFromLabels(labels, serverId);
+  return parent?.serverId === serverId ? parent.agentId : null;
+}
+
+export function computeAgentDepth(
+  agentId: string,
+  readAgent: ReadAgent,
+  serverId?: string,
+): number {
   let remoteParentDepth = 0;
   const depth = resolveAgentHierarchyDepth(agentId, (id) => {
     const labels = readAgent(id)?.labels;
     const parentId = getParentAgentIdFromLabels(labels);
+    if (parentId && serverId !== undefined && !readLocalParentId(labels, serverId)) {
+      remoteParentDepth =
+        labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] === String(MAX_SUBAGENT_DEPTH)
+          ? MAX_SUBAGENT_DEPTH
+          : 1;
+      return null;
+    }
     if (parentId && labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] === String(MAX_SUBAGENT_DEPTH)) {
       // The declared remote child is already Level-2. Count its parent hop and
       // add the remaining hop, regardless of whether that parent exists locally.
@@ -73,29 +90,40 @@ export function computeAgentDepth(agentId: string, readAgent: ReadAgent): number
   return depth + remoteParentDepth;
 }
 
-export function computeMaxSubtreeDepth(
+export function readLocalSubtreeDepths(
   rootAgentId: string,
-  listActiveAgents: ListActiveAgents,
-): number {
+  agents: Iterable<HierarchyAgent>,
+  serverId?: string,
+): ReadonlyMap<string, number> {
   const children = new Map<string, string[]>();
-  for (const agent of listActiveAgents()) {
-    const parentId = getParentAgentIdFromLabels(agent.labels);
+  for (const agent of agents) {
+    const parentId = readLocalParentId(agent.labels, serverId);
     if (!parentId || agent.archivedAt) continue;
     const siblings = children.get(parentId);
     if (siblings) siblings.push(agent.id);
     else children.set(parentId, [agent.id]);
   }
-  const seen = new Set<string>();
+  const depths = new Map<string, number>();
   const pending = [{ id: rootAgentId, depth: 0 }];
-  let maxDepth = 0;
   while (pending.length) {
     const { id, depth } = pending.pop()!;
-    if (seen.has(id)) continue;
-    seen.add(id);
-    maxDepth = Math.max(maxDepth, depth);
+    if (depths.has(id)) continue;
+    depths.set(id, depth);
     for (const childId of children.get(id) ?? []) {
       pending.push({ id: childId, depth: depth + 1 });
     }
+  }
+  return depths;
+}
+
+export function computeMaxSubtreeDepth(
+  rootAgentId: string,
+  listActiveAgents: ListActiveAgents,
+  serverId?: string,
+): number {
+  let maxDepth = 0;
+  for (const depth of readLocalSubtreeDepths(rootAgentId, listActiveAgents(), serverId).values()) {
+    maxDepth = Math.max(maxDepth, depth);
   }
   return maxDepth;
 }
@@ -114,11 +142,13 @@ export function validateSetAgentParent({
   parentAgent,
   readAgent,
   listActiveAgents,
+  serverId,
 }: {
   agent: HierarchyAgent;
   parentAgent: HierarchyAgent;
   readAgent: ReadAgent;
   listActiveAgents: ListActiveAgents;
+  serverId?: string;
 }): void {
   if (agent.id === parentAgent.id) throw new Error("An agent cannot be its own parent.");
   if (agent.archivedAt || parentAgent.archivedAt) {
@@ -134,12 +164,12 @@ export function validateSetAgentParent({
       throw new Error("This parent relationship would create or join a cycle.");
     }
     seen.add(ancestorId);
-    ancestorId = getParentAgentIdFromLabels(readAgent(ancestorId)?.labels);
+    ancestorId = readLocalParentId(readAgent(ancestorId)?.labels, serverId);
   }
   if (
-    computeAgentDepth(parentAgent.id, readAgent) +
+    computeAgentDepth(parentAgent.id, readAgent, serverId) +
       1 +
-      computeMaxSubtreeDepth(agent.id, listActiveAgents) >
+      computeMaxSubtreeDepth(agent.id, listActiveAgents, serverId) >
     MAX_SUBAGENT_DEPTH
   ) {
     throw new Error(
@@ -180,6 +210,7 @@ export function requiresSingleHopOrchestration(
 
 const MAIN_CONTROL_DISABLED_TOOLS = [
   "archive_workspace",
+  "create_workspace",
   "create_terminal",
   "send_terminal_keys",
   "kill_terminal",
@@ -214,23 +245,6 @@ export function resolveInheritedHierarchyMode(
     : mode;
 }
 
-export function resolveInheritedHierarchyOptions(
-  options: ProviderOptions | undefined,
-  labels: HierarchyAgent["labels"],
-): ProviderOptions | undefined {
-  if (!options || !isMainControlAgentLabels(labels)) return options;
-  const inherited = { ...options };
-  if (inherited.sandbox_mode === "read-only") delete inherited.sandbox_mode;
-  if (inherited.approval_policy === "never") delete inherited.approval_policy;
-  if (Array.isArray(inherited.disallowedTools)) {
-    const tools = inherited.disallowedTools.filter(
-      (tool) => !MAIN_CONTROL_CLAUDE_DENIED_TOOLS.some((denied) => denied === tool),
-    );
-    if (tools.length > 0) inherited.disallowedTools = tools;
-    else delete inherited.disallowedTools;
-  }
-  return inherited;
-}
 const LEVEL_TWO_DISABLED_TOOLS = [
   "create_agent",
   "send_agent_prompt",

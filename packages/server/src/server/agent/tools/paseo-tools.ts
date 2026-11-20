@@ -125,7 +125,6 @@ import {
   REMOTE_HIERARCHY_DEPTH_LABEL,
   RESERVED_HIERARCHY_LABELS_ERROR,
   requiresSingleHopOrchestration,
-  resolveInheritedHierarchyOptions,
   validateCanSpawnChild,
   validateSingleHopOrchestration,
   type HierarchyAgent,
@@ -998,10 +997,7 @@ function createToolCatalog(
       return undefined;
     }
     return {
-      providerOptions: resolveInheritedHierarchyOptions(
-        callerAgent.config.providerOptions,
-        callerAgent.labels,
-      ),
+      providerOptions: callerAgent.config.providerOptions,
     };
   };
 

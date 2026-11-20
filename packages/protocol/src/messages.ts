@@ -1548,6 +1548,7 @@ export const SendAgentMessageRequestSchema = z.object({
   /** Opaque sender identity for agent-originated prompts. */
   sourceAgentId: z.string().min(1).optional(),
   sourceAgentServerId: z.string().min(1).optional(),
+  sourceAgentEvent: z.enum(["finished", "errored", "permission-required", "closed"]).optional(),
   sessionMode: z.string().optional(),
   messageId: z.string().optional(), // Client-provided ID for deduplication
   waitForDispatch: z.boolean().optional(),
@@ -4260,6 +4261,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentMessageProvenance: z.boolean().optional(),
         agentMessageBatching: z.boolean().optional(),
         agentMessageDispatchConfirmation: z.boolean().optional(),
+        // COMPAT(agentNotificationEvents): added in v0.16.0, remove after 2027-05-19.
+        agentNotificationEvents: z.boolean().optional(),
         agentFinishReportPull: z.boolean().optional(),
         // COMPAT(agentTurnIdentity): accept peers that observed pre-release v0.2.6 through 2027-01-31.
         agentTurnIdentity: z.boolean().optional(),

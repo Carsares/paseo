@@ -97,7 +97,8 @@ export function useDesktopSettings(): {
         DEFAULT_DESKTOP_SETTINGS;
       queryClient.setQueryData<DesktopSettings>(
         DESKTOP_SETTINGS_QUERY_KEY,
-        mergeDesktopSettings(previous, updates),
+        // The main process may lock this preference once native installation starts.
+        mergeDesktopSettings(previous, { ...updates, officialUpdatesEnabled: undefined }),
       );
       return { previous };
     },

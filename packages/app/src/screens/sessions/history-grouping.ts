@@ -45,6 +45,7 @@ export interface HistoryWorkspaceGroup {
   serverLabel: string;
   workspaceId: string | undefined;
   workspaceName: string;
+  directoryName: string;
   branch: string | null;
   isWorkspaceArchived: boolean;
   latestActivityAt: Date;
@@ -180,6 +181,10 @@ function createWorkspaceDraft(input: {
       serverLabel,
       workspaceId,
       workspaceName: placement.workspaceName?.trim() || cwd.split(/[\\/]/).findLast(Boolean) || cwd,
+      directoryName:
+        (placement.checkout.worktreeRoot || placement.checkout.cwd)
+          .split(/[\\/]/)
+          .findLast(Boolean) ?? "",
       branch: placement.checkout.isGit ? (placement.checkout.currentBranch ?? null) : null,
       isWorkspaceArchived:
         archivedAt === undefined
@@ -429,6 +434,7 @@ export function flattenHistoryProjectGroups(input: {
   expandedOverrides: ReadonlyMap<string, boolean>;
   projectExpandedOverrides?: ReadonlyMap<string, boolean>;
   workspaceExpandedOverrides?: ReadonlyMap<string, boolean>;
+  workspaceExpandedByDefault?: boolean;
   groupMode?: HistoryGroupMode;
   sort?: HistorySortOption;
   isSearching: boolean;
@@ -437,7 +443,7 @@ export function flattenHistoryProjectGroups(input: {
   const items: HistoryFlatListItem[] = [];
 
   function appendWorkspace(project: HistoryProjectGroup, workspace: HistoryWorkspaceGroup): void {
-    const workspaceExpanded = input.workspaceExpandedOverrides?.get(workspace.key) ?? true;
+    const workspaceExpanded = isHistoryWorkspaceExpanded(workspace, input);
     items.push({
       type: "workspace-header",
       key: `workspace:${workspace.key}`,
@@ -508,6 +514,7 @@ export function areAllHistoryWorkspacesCollapsed(input: {
   groupMode?: HistoryGroupMode;
   projectExpandedOverrides?: ReadonlyMap<string, boolean>;
   workspaceExpandedOverrides?: ReadonlyMap<string, boolean>;
+  workspaceExpandedByDefault?: boolean;
 }): boolean {
   let hasWorkspace = false;
   for (const project of input.groups) {
@@ -516,7 +523,7 @@ export function areAllHistoryWorkspacesCollapsed(input: {
       !isHistoryProjectExpanded(project, input.projectExpandedOverrides);
     for (const workspace of project.workspaces) {
       hasWorkspace = true;
-      if (!projectCollapsed && input.workspaceExpandedOverrides?.get(workspace.key) !== false) {
+      if (!projectCollapsed && isHistoryWorkspaceExpanded(workspace, input)) {
         return false;
       }
     }
@@ -524,16 +531,14 @@ export function areAllHistoryWorkspacesCollapsed(input: {
   return hasWorkspace;
 }
 
-export function buildAllWorkspacesExpansionMap(
-  groups: readonly HistoryProjectGroup[],
-  expanded: boolean,
-): Map<string, boolean> {
-  const overrides = new Map<string, boolean>();
-  if (expanded) return overrides;
-  for (const project of groups) {
-    for (const workspace of project.workspaces) {
-      overrides.set(workspace.key, false);
-    }
-  }
-  return overrides;
+function isHistoryWorkspaceExpanded(
+  workspace: HistoryWorkspaceGroup,
+  input: {
+    workspaceExpandedOverrides?: ReadonlyMap<string, boolean>;
+    workspaceExpandedByDefault?: boolean;
+  },
+): boolean {
+  return (
+    input.workspaceExpandedOverrides?.get(workspace.key) ?? input.workspaceExpandedByDefault ?? true
+  );
 }

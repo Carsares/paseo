@@ -1,4 +1,12 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +19,7 @@ import {
   isDesktopManagedDaemonRunningSync,
   isManualUpdateHandoffInProgress,
   keepsTerminalsOnStop,
+  prepareBuiltInDaemonForUpdate,
   resumesAgentsOnStop,
   stopCapturedDaemon,
   stopDesktopDaemon,
@@ -183,9 +192,9 @@ describe("daemon-manager commands", () => {
         return { instance: restored, spawned: true };
       });
       mocks.installUpdate.mockImplementation(async (_input, beforeQuit) => {
-        const restore = await beforeQuit({ version: "1.2.4" });
+        const shutdown = await beforeQuit({ version: "1.2.4" });
         expect(mocks.settings.officialUpdatesEnabled).toBe(false);
-        await restore?.();
+        await shutdown?.restore();
         return { installed: false };
       });
 
@@ -199,7 +208,7 @@ describe("daemon-manager commands", () => {
           instance: expect.objectContaining({ pid: instance.pid, startedAt: instance.startedAt }),
         }),
       );
-      expect(mocks.stopDaemonInstance.mock.calls[0]?.[1]).not.toHaveProperty("resumeAgents");
+      expect(mocks.stopDaemonInstance.mock.calls[0]?.[1]).toHaveProperty("resumeAgents", true);
       expect(mocks.startDaemonInstance.mock.calls).toEqual(
         action === "stopped"
           ? [[expect.objectContaining({ home: capturedHome, desktopManaged: true })]]
@@ -208,6 +217,89 @@ describe("daemon-manager commands", () => {
       expect(isManualUpdateHandoffInProgress()).toBe(false);
     },
   );
+
+  it.each([
+    "handoff",
+    "rollback",
+    "restart failure",
+    "unsupported",
+    "existing",
+    "replaced",
+  ] as const)("preserves recovery-record ownership on %s", async (outcome) => {
+    mkdirSync(mocks.paseoHome);
+    const lockPath = path.join(mocks.paseoHome, "paseo.pid");
+    const markerPath = path.join(mocks.paseoHome, "restart-recovery-once.json");
+    const instance = {
+      pid: process.pid,
+      startedAt: new Date(Date.now() - 1_000).toISOString(),
+      hostname: hostname(),
+      uid: process.getuid?.() ?? 0,
+      listen: "127.0.0.1:6799",
+      desktopManaged: true,
+    };
+    const marker = JSON.stringify({ version: 2, agentIds: ["running-agent"] });
+    const otherMarker = JSON.stringify({ version: 2, agentIds: ["another-agent"] });
+    writeFileSync(lockPath, JSON.stringify(instance));
+    if (outcome === "existing") {
+      writeFileSync(markerPath, otherMarker);
+      await expect(prepareBuiltInDaemonForUpdate()).rejects.toThrow("record is pending");
+      expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
+      expect(readFileSync(markerPath, "utf8")).toBe(otherMarker);
+      return;
+    }
+    mocks.stopDaemonInstance.mockImplementation(async (_home, options) => {
+      if (outcome === "unsupported" && options.resumeAgents) {
+        throw new ExternalCliCommandError("Recovery unavailable", {
+          code: "AGENT_RESUME_ON_STOP_UNSUPPORTED",
+        });
+      }
+      // Simulate an unrelated recovery record appearing during an unsupported stop.
+      writeFileSync(markerPath, options.resumeAgents ? marker : otherMarker);
+      rmSync(lockPath);
+      return { action: "stopped", pid: instance.pid, forced: false, usedLifecycleRpc: true };
+    });
+    const restored = { ...instance, startedAt: new Date().toISOString() };
+    mocks.startDaemonInstance.mockImplementation(async () => {
+      if (outcome === "restart failure") {
+        expect(readFileSync(markerPath, "utf8")).toBe(marker);
+        throw new Error("Daemon startup failed");
+      }
+      if (outcome === "rollback" || outcome === "unsupported") {
+        expect(readFileSync(markerPath, "utf8")).toBe(
+          outcome === "rollback" ? marker : otherMarker,
+        );
+        // The old daemon consumes the one-shot record at startup.
+        rmSync(markerPath);
+      } else {
+        expect(existsSync(markerPath)).toBe(false);
+      }
+      writeFileSync(lockPath, JSON.stringify(restored));
+      return { instance: restored, spawned: true };
+    });
+
+    const shutdown = await prepareBuiltInDaemonForUpdate();
+    expect(shutdown).toBeDefined();
+    expect(existsSync(markerPath)).toBe(true);
+    if (outcome === "replaced") {
+      writeFileSync(`${markerPath}.tmp`, otherMarker);
+      renameSync(`${markerPath}.tmp`, markerPath);
+      await expect(shutdown?.beforeHandoff()).rejects.toThrow("Daemon recovery changed");
+      expect(readFileSync(markerPath, "utf8")).toBe(otherMarker);
+      return;
+    }
+    await shutdown?.beforeHandoff();
+    expect(existsSync(markerPath)).toBe(outcome === "unsupported");
+    if (outcome === "handoff") {
+      expect(mocks.startDaemonInstance).not.toHaveBeenCalled();
+    } else if (outcome === "restart failure") {
+      await expect(shutdown?.restore()).rejects.toThrow("Daemon startup failed");
+      expect(readFileSync(markerPath, "utf8")).toBe(marker);
+    } else {
+      await shutdown?.restore();
+      expect(mocks.startDaemonInstance).toHaveBeenCalledOnce();
+      expect(existsSync(markerPath)).toBe(false);
+    }
+  });
 
   it("exposes updater diagnostics through the desktop command boundary", () => {
     const diagnostics = createDaemonCommandHandlers().desktop_update_diagnostics();

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_DESKTOP_SETTINGS } from "../settings/desktop-settings";
 import {
@@ -111,25 +111,6 @@ describe("quit-lifecycle", () => {
     expect(events).toEqual(["feedback", "stop:quit"]);
   });
 
-  it("uses the app update stop reason on ordinary quit when an enabled update is pending", async () => {
-    const events: string[] = [];
-    const stopped = await stopDesktopManagedDaemonOnQuitIfNeeded({
-      settingsStore: {
-        get: async () => ({ ...SETTINGS_STOP_ON_QUIT, officialUpdatesEnabled: true }),
-      },
-      isDesktopManagedDaemonRunning: () => false,
-      isDesktopManagedDaemonPresent: () => true,
-      appUpdate: { version: "1.2.4" },
-      stopDaemon: async (reason) => {
-        events.push(`stop:${reason}`);
-      },
-      showShutdownFeedback: () => events.push("feedback"),
-    });
-
-    expect(stopped).toBe(true);
-    expect(events).toEqual(["feedback", "stop:app_update"]);
-  });
-
   it("treats a downloaded update as an ordinary quit when official updates are disabled", async () => {
     const events: string[] = [];
     const stopped = await stopDesktopManagedDaemonOnQuitIfNeeded({
@@ -216,7 +197,6 @@ describe("quit-lifecycle", () => {
           settingsStore: { get: async () => SETTINGS_KEEP_RUNNING },
           isDesktopManagedDaemonRunning: () => false,
           isDesktopManagedDaemonPresent: () => true,
-          appUpdate: { version: "1.2.4" },
           preserveWork: options?.preserveWork,
           stopDaemon: async (reason) => {
             events.push(`stop:${reason}`);
@@ -274,9 +254,10 @@ describe("quit-lifecycle", () => {
     const lifecycle = createQuitLifecycle({
       app: { exit: (code) => events.push(`exit:${code}`) },
       closeTransportSessions: () => {},
-      stopDesktopManagedDaemonIfNeeded: (options) => {
-        events.push(`stop:${options?.appUpdate?.version}`);
-        return stopped.promise;
+      stopDesktopManagedDaemonIfNeeded: async () => false,
+      prepareDaemonForAppUpdate: async (target) => {
+        events.push(`stop:${target.version}`);
+        await stopped.promise;
       },
       installAppUpdateOnQuit: async (_signal, beforeQuit) => {
         const target = await validated.promise;
@@ -363,8 +344,11 @@ describe("quit-lifecycle", () => {
     const quitLifecycle = createQuitLifecycle({
       app: { exit: (code) => events.push(`exit:${code}`) },
       closeTransportSessions: () => {},
-      stopDesktopManagedDaemonIfNeeded: async (options) => {
-        events.push(options?.appUpdate ? "update-stop" : "ordinary-stop");
+      prepareDaemonForAppUpdate: async () => {
+        events.push("update-stop");
+      },
+      stopDesktopManagedDaemonIfNeeded: async () => {
+        events.push("ordinary-stop");
         return true;
       },
       confirmAppUpdate: () => {
@@ -423,6 +407,29 @@ describe("quit-lifecycle", () => {
     });
 
     expect(events).toEqual(["prevent-default", "close-transports"]);
+  });
+
+  it("blocks a late updater quit without treating the next user quit as an update", async () => {
+    const exit = vi.fn();
+    const preventDefault = vi.fn();
+    const lifecycle = createQuitLifecycle({
+      app: { exit },
+      closeTransportSessions: () => {},
+      stopDesktopManagedDaemonIfNeeded: async () => false,
+      installAppUpdateOnQuit: async () => false,
+      createUpdateDeadlineSignal: () => new AbortController().signal,
+      onStopError: vi.fn(),
+      onUpdateError: vi.fn(),
+    });
+
+    lifecycle.handleBeforeQuitForUpdate(false);
+    lifecycle.handleBeforeQuit({ preventDefault });
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(lifecycle.isQuitting()).toBe(false);
+    await waitForQuitLifecycle();
+    lifecycle.handleBeforeQuit({ preventDefault });
+    await waitForQuitLifecycle();
+    expect(exit).toHaveBeenCalledExactlyOnceWith(0);
   });
 
   it("exits when update revalidation reaches its deadline", async () => {

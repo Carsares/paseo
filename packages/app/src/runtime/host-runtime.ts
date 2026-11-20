@@ -2627,6 +2627,10 @@ export class HostRuntimeStore {
     }
   }
 
+  isDrainingQueuedAgentMessage(serverId: string, agentId: string): boolean {
+    return this.queuedAgentDrainInFlight.has(`${serverId}:${agentId}`);
+  }
+
   drainQueuedAgentMessage(serverId: string, agentId: string): void {
     const drainKey = `${serverId}:${agentId}`;
     if (this.queuedAgentDrainInFlight.has(drainKey)) return;
@@ -2875,14 +2879,26 @@ export class HostRuntimeStore {
     serverId: string,
     agentId: string,
     request: Parameters<DaemonClient["fetchAgentTimeline"]>[1],
+    options?: {
+      canApply: (page: Awaited<ReturnType<DaemonClient["fetchAgentTimeline"]>>) => boolean;
+      forceTailReplacement?: boolean;
+    },
   ): Promise<Awaited<ReturnType<DaemonClient["fetchAgentTimeline"]>>> {
     const directory = this.directorySyncByServer.get(serverId);
     if (!directory) throw new Error(`Unknown host runtime for serverId ${serverId}`);
     const owner = useSessionStore.getState().sessions[serverId]?.viewedTimelineSync;
     const page = await directory.fetchTimeline(agentId, request);
-    if (owner && useSessionStore.getState().sessions[serverId]?.viewedTimelineSync === owner) {
+    if (
+      owner &&
+      useSessionStore.getState().sessions[serverId]?.viewedTimelineSync === owner &&
+      (!options || options.canApply(page))
+    ) {
       owner.flushStreamAgent(agentId);
-      owner.applyTimelineResponse(page);
+      owner.applyTimelineResponse(
+        options?.forceTailReplacement && page.direction === "tail"
+          ? { ...page, reset: true }
+          : page,
+      );
     }
     return page;
   }

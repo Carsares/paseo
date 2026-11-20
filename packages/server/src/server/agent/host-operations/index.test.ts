@@ -117,6 +117,7 @@ interface Caller {
   provider: string;
   currentModeId: string | null;
   labels?: Record<string, string>;
+  config: Record<string, never>;
 }
 
 function resolverFor(client: DaemonClient, caller: Caller | null) {
@@ -136,6 +137,7 @@ const visibleCodexCaller: Caller = {
   background: false,
   provider: "codex",
   currentModeId: "full-access",
+  config: {},
 };
 
 const createArgs = {

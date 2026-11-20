@@ -1,9 +1,11 @@
 import { DiffSession } from "./diff/index.js";
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
 import type { AgentMessageDelivery } from "./agent/agent-messages/index.js";
+import { AgentMessageAdmissionError } from "./agent/agent-messages/delivery.js";
 import { AgentDirectory, type BackgroundVisibility } from "./agent/directory.js";
 import { ConnectedHostSession } from "./connected-hosts/index.js";
 import type { ConnectedHosts } from "./connected-hosts/index.js";
+import { createToolHosts } from "./agent/host-operations/index.js";
 import {
   createWorkspaceBaseBranchService,
   type WorkspaceBaseBranchService,
@@ -104,6 +106,8 @@ import { getErrorMessage, getErrorMessageOr } from "@getpaseo/protocol/error-uti
 import { getAgentStatusPriority } from "@getpaseo/protocol/agent-state-bucket";
 import {
   getParentAddressFromLabels,
+  PARENT_AGENT_ID_LABEL,
+  PARENT_SERVER_ID_LABEL,
   getParentAgentIdFromLabels,
 } from "@getpaseo/protocol/agent-labels";
 import { applyRecordPatch } from "./record-patch.js";
@@ -312,6 +316,7 @@ interface WorkspaceArchiveActivity {
   archives: Map<string, Set<object | symbol>>;
   moves: Map<string, Set<Promise<void>>>;
   moveQueues: Map<string, Promise<void>>;
+  removingProjects: Set<string>;
 }
 
 const workspaceArchiveActivityByRegistry = new WeakMap<
@@ -323,7 +328,12 @@ const externalWorkspaceArchive = Symbol("external workspace archive");
 function getWorkspaceArchiveActivity(registry: WorkspaceRegistry): WorkspaceArchiveActivity {
   const existing = workspaceArchiveActivityByRegistry.get(registry);
   if (existing) return existing;
-  const activity = { archives: new Map(), moves: new Map(), moveQueues: new Map() };
+  const activity = {
+    archives: new Map(),
+    moves: new Map(),
+    moveQueues: new Map(),
+    removingProjects: new Set<string>(),
+  };
   workspaceArchiveActivityByRegistry.set(registry, activity);
   return activity;
 }
@@ -543,6 +553,7 @@ export interface SessionOptions {
   connectedHosts?: ConnectedHosts;
   sourceId?: string;
   routed?: boolean;
+  authenticateAgentNotificationEvent?: (sourceAgentServerId: string) => boolean;
   browserToolsBroker?: BrowserToolsBroker | null;
   clientId: string;
   permissions: readonly DaemonPermission[];
@@ -839,6 +850,7 @@ export class Session {
   private readonly browserToolsBroker: SessionOptions["browserToolsBroker"];
   private readonly clientId: string;
   private readonly serverId: string | undefined;
+  private readonly authenticateAgentNotificationEvent?: SessionOptions["authenticateAgentNotificationEvent"];
   private readonly authorization: SessionAuthorization;
   private appVersion: string | null;
   private clientCapabilities: ReadonlySet<ClientCapability>;
@@ -951,6 +963,7 @@ export class Session {
   private readonly messageReceipts: Pick<MessageReceipts, "send">;
   private readonly agentMessages: AgentMessageDelivery;
   private readonly finishSubscriptions?: FinishSubscriptions;
+  private readonly connectedHosts?: ConnectedHosts;
   private readonly createAgentLifecycleDispatch: CreateAgentLifecycleDispatch;
   private readonly creationService: Pick<CreationService, "create" | "subscribe">;
 
@@ -1018,6 +1031,7 @@ export class Session {
     this.browserToolsBroker = options.browserToolsBroker;
     this.clientId = clientId;
     this.serverId = serverId;
+    this.authenticateAgentNotificationEvent = options.authenticateAgentNotificationEvent;
     this.authorization = new SessionAuthorization(permissions);
 
     this.appVersion = appVersion ?? null;
@@ -1025,6 +1039,7 @@ export class Session {
     this.sessionId = uuidv4();
     this.hostSourceId = hostSource(options);
     this.connectedHostSession = createHostSession(options, this);
+    this.connectedHosts = options.connectedHosts;
     this.onMessage = onMessage;
     this.onMessageToSource = onMessageToSource
       ? (source, message) => this.observeSourceSend(() => onMessageToSource(source, message))
@@ -3971,6 +3986,7 @@ export class Session {
                 true,
               )
           : undefined,
+        (localParentIds) => this.assertRemoteDepthCanIncrease(localParentIds),
       );
       try {
         if (!result.live) await this.agentUpdates.emitStoredRecord(result.record);
@@ -4008,6 +4024,61 @@ export class Session {
         error: failure,
       },
     });
+  }
+
+  private async assertRemoteDepthCanIncrease(localParentIds: ReadonlySet<string>): Promise<void> {
+    const serverId = this.serverId;
+    if (!this.connectedHosts || !serverId) return;
+    const hosts = createToolHosts(this.connectedHosts);
+    const unavailable =
+      "Cannot deepen this hierarchy because a connected host could not be checked.";
+    const { hosts: registered } = await hosts.directory();
+    const remoteHosts = registered.filter((host) => host.serverId !== serverId);
+    // Completion notifications are optional. An unreachable host can still
+    // own an active child of this branch, even if no subscription exists.
+    if (remoteHosts.some((host) => host.status !== "online" || !host.serverId)) {
+      throw new Error(unavailable);
+    }
+    const destinationIds = new Set(
+      remoteHosts.flatMap((host) => (host.serverId ? [host.serverId] : [])),
+    );
+    const results = await Promise.all(
+      [...destinationIds].map(async (hostId) => {
+        try {
+          return await hosts.use(
+            hostId,
+            async (client) => {
+              for (const parentId of localParentIds) {
+                const response = await client.fetchAgentHistory({
+                  filter: {
+                    includeBackground: true,
+                    // The destination can still restore an archived child using its old depth.
+                    includeArchived: true,
+                    labels: {
+                      [PARENT_AGENT_ID_LABEL]: parentId,
+                      [PARENT_SERVER_ID_LABEL]: serverId,
+                    },
+                  },
+                  page: { limit: 1 },
+                });
+                if (response.entries.length > 0) return true;
+              }
+              return false;
+            },
+            AbortSignal.timeout(5_000),
+          );
+        } catch (error) {
+          this.sessionLogger.debug({ err: error, hostId }, "Could not read remote hierarchy");
+          return null;
+        }
+      }),
+    );
+    // A remote child stores its absolute depth. Raising the parent's depth
+    // here would leave an outdated value at the destination.
+    if (results.includes(true)) {
+      throw new Error("Cannot deepen this hierarchy while it has subagents on another host.");
+    }
+    if (results.includes(null)) throw new Error(unavailable);
   }
 
   private async handleDetachAgentRequest(agentId: string, requestId: string): Promise<void> {
@@ -4095,6 +4166,9 @@ export class Session {
       const result = await this.withWorkspaceMoveQueue(queuedWorkspaceId, () =>
         moveAgentToWorkspaceCommand({ agentManager: this.agentManager }, agentId, {
           idempotencyKey,
+          serverId: this.serverId,
+          getWorktreeRoot: async (cwd) =>
+            (await this.workspaceGitService.getCheckout(cwd)).worktreeRoot,
           durable: {
             workspaceId,
             journal,
@@ -4115,6 +4189,7 @@ export class Session {
                 );
               }
 
+              this.assertProjectNotRemoving(sourceWorkspace.projectId);
               finishMove = this.reserveWorkspaceMove(source.sourceWorkspaceId);
               finishTargetMove = this.reserveWorkspaceMove(workspaceId);
               await this.workspaceProvisioning.createWorkspaceForDirectory(
@@ -4284,10 +4359,12 @@ export class Session {
     labels: Record<string, string>,
     sourceWorkspaceId: string,
   ): Promise<boolean> {
-    const parentId = getParentAgentIdFromLabels(labels);
-    if (!parentId) {
+    const serverId = this.serverId ?? "self";
+    const parentAddress = getParentAddressFromLabels(labels, serverId);
+    if (!parentAddress || parentAddress.serverId !== serverId) {
       return true;
     }
+    const parentId = parentAddress.agentId;
     const parent = this.agentManager.getAgent(parentId) ?? (await this.agentStorage.get(parentId));
     const parentArchived = Boolean(parent && "archivedAt" in parent && parent.archivedAt);
     const parentWorkspaceId = parent && !parentArchived ? parent.workspaceId?.trim() : undefined;
@@ -4315,7 +4392,14 @@ export class Session {
     if (!workspace) throw new Error(`Workspace not found: ${workspaceId}`);
     if (workspace.archivedAt) throw new Error(`Workspace is archived: ${workspaceId}`);
     this.assertWorkspaceNotArchiving(workspaceId);
+    this.assertProjectNotRemoving(workspace.projectId);
     return workspace;
+  }
+
+  private assertProjectNotRemoving(projectId: string): void {
+    if (this.workspaceArchiveActivity.removingProjects.has(projectId)) {
+      throw new Error(`Project is being removed: ${projectId}`);
+    }
   }
 
   private assertWorkspaceNotArchiving(workspaceId: string): void {
@@ -4638,15 +4722,23 @@ export class Session {
     try {
       const project = await this.projectRegistry.get(projectId);
       const resolvedProjectId = project?.projectId ?? projectId;
-      const projectWorkspaces = (await this.workspaceRegistry.listActive()).filter(
-        (workspace) => workspace.projectId === resolvedProjectId,
-      );
-      const activeWorkspaceIds = projectWorkspaces
-        .filter((workspace) => !workspace.archivedAt)
-        .map((workspace) => workspace.workspaceId);
-
+      this.assertProjectNotRemoving(resolvedProjectId);
+      const { removingProjects, moves } = this.workspaceArchiveActivity;
+      removingProjects.add(resolvedProjectId);
+      const listProjectWorkspaces = async () =>
+        (await this.workspaceRegistry.listActive()).filter(
+          (workspace) => !workspace.archivedAt && workspace.projectId === resolvedProjectId,
+        );
+      let activeWorkspaceIds: string[] = [];
       const removedWorkspaceIds: string[] = [];
       try {
+        const beforeMoves = await listProjectWorkspaces();
+        const pendingMoves: Promise<void>[] = [];
+        for (const { workspaceId } of beforeMoves) {
+          for (const move of moves.get(workspaceId) ?? []) pendingMoves.push(move);
+        }
+        await Promise.all(pendingMoves);
+        activeWorkspaceIds = (await listProjectWorkspaces()).map(({ workspaceId }) => workspaceId);
         if (activeWorkspaceIds.length > 0) {
           this.markWorkspaceArchiving(activeWorkspaceIds, new Date().toISOString());
           await this.emitWorkspaceArchiveUpdates(activeWorkspaceIds);
@@ -4682,12 +4774,11 @@ export class Session {
         if (activeWorkspaceIds.length > 0) {
           this.clearWorkspaceArchiving(activeWorkspaceIds);
         }
+        removingProjects.delete(resolvedProjectId);
       }
 
       const updateIds =
-        removedWorkspaceIds.length > 0
-          ? removedWorkspaceIds
-          : [projectWorkspaces[0]?.workspaceId ?? projectId];
+        removedWorkspaceIds.length > 0 ? removedWorkspaceIds : [activeWorkspaceIds[0] ?? projectId];
       await this.emitWorkspaceUpdatesForWorkspaceIds(updateIds, {
         removedProjectId: projectId,
       });
@@ -5576,7 +5667,10 @@ export class Session {
         if (!workspace || workspace.archivedAt) {
           throw new Error(`Workspace ${workspaceId} not found`);
         }
-        return { workspaceId, cwd: workspace.cwd };
+        return {
+          workspaceId,
+          cwd: callerAgent?.workspaceId === workspaceId ? callerAgent.cwd : workspace.cwd,
+        };
       },
       createWorkspace: async () => ({
         workspaceId: await this.workspaceProvisioning.resolveOrCreateWorkspaceIdForCreateAgent({
@@ -6441,15 +6535,20 @@ export class Session {
    */
   private async readSettledAgent(
     agentId: string,
+    forCompletion = false,
   ): Promise<{ record: StoredAgentRecord; lastMessage: string | null } | null> {
     const retired = this.agentManager.getRetiredInternalAgent(agentId);
-    if (retired) {
-      return { record: retired.record, lastMessage: retired.lastMessage };
-    }
-    const record = await this.agentStorage.get(agentId);
-    if (!record || record.internal) {
+    const record = retired?.record ?? (await this.agentStorage.get(agentId));
+    if (!record || (!retired && record.internal)) {
       return null;
     }
+    const unknownFailedTurn =
+      forCompletion &&
+      record.attentionReason !== "permission" &&
+      (record.lastStatus === "error" ||
+        (record.lastStatus === "closed" && Boolean(record.lastError)));
+    if (unknownFailedTurn) return { record, lastMessage: null };
+    if (retired) return { record, lastMessage: retired.lastMessage };
     return { record, lastMessage: await this.agentManager.getLastAssistantMessage(agentId) };
   }
 
@@ -6664,7 +6763,7 @@ export class Session {
       return this.pageFetchAgentsEntries(
         request,
         backgroundVisibility,
-        this.createAgentHistoryPager(workspaces),
+        this.createAgentHistoryPager(workspaces, request.sort),
         request.sort,
         workspaces,
       );
@@ -6792,7 +6891,14 @@ export class Session {
     getSortValue: this.getAgentSortValue,
   });
 
-  private createAgentHistoryPager(workspaces: ReadonlyMap<string, PersistedWorkspaceRecord>) {
+  private createAgentHistoryPager(
+    workspaces: ReadonlyMap<string, PersistedWorkspaceRecord>,
+    sort: readonly SortSpec<AgentHistorySortKey>[] | undefined,
+  ) {
+    // Finite values round-trip through the cursor's JSON and lie outside the Date range.
+    const archiveDirection = sort?.find(({ key }) => key === "archived_at")?.direction;
+    const unknownArchiveTime =
+      archiveDirection === "asc" ? Number.MAX_SAFE_INTEGER : Number.MIN_SAFE_INTEGER;
     return new SortablePager<AgentSnapshotPayload, AgentHistorySortKey>({
       validKeys: FETCH_AGENT_HISTORY_SORT_KEYS,
       defaultSort: [{ key: "updated_at", direction: "desc" }],
@@ -6808,8 +6914,7 @@ export class Session {
           const parsed = Date.parse(timestamp);
           if (!Number.isNaN(parsed)) return parsed;
         }
-        // Keep missing dates before valid dates in ascending order and encodable in cursors.
-        return Number.MIN_SAFE_INTEGER;
+        return unknownArchiveTime;
       },
     });
   }
@@ -9632,27 +9737,39 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "agent.fork_context.request" }>,
   ): Promise<void> {
     try {
-      const snapshot = await ensureAgentLoaded(msg.agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      const agentPayload = await this.buildAgentPayload(snapshot);
-      const timeline = this.agentManager.fetchTimeline(msg.agentId, {
-        direction: "tail",
-        limit: 0,
-      });
-      const forkContext = buildAgentForkContextAttachment({
-        rows: timeline.rows,
-        cursorBoundary: msg.boundaryCursor
-          ? { timelineEpoch: timeline.epoch, cursor: msg.boundaryCursor }
-          : null,
-        boundaryMessageId: msg.boundaryMessageId,
-        sourceAgentId: msg.agentId,
-        sourceServerId: this.serverId,
-        agentTitle: agentPayload.title,
-        cwd: snapshot.cwd,
-      });
+      const readForkContext = async () => {
+        await this.agentManager.waitForAgentClose(msg.agentId);
+        const record = await this.agentStorage.get(msg.agentId);
+        if (record?.archivedAt && !msg.boundaryCursor && !msg.boundaryMessageId) {
+          const archived = this.agentManager.readArchivedForkContext(
+            msg.agentId,
+            record.archivedAt,
+          );
+          if (archived) return archived;
+        }
+        const snapshot = await ensureAgentLoaded(msg.agentId, {
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+          logger: this.sessionLogger,
+          ...(record?.archivedAt ? { purpose: "history" } : {}),
+        });
+        const timeline = this.agentManager.fetchTimeline(msg.agentId, {
+          direction: "tail",
+          limit: 0,
+        });
+        return buildAgentForkContextAttachment({
+          rows: timeline.rows,
+          cursorBoundary: msg.boundaryCursor
+            ? { timelineEpoch: timeline.epoch, cursor: msg.boundaryCursor }
+            : null,
+          boundaryMessageId: msg.boundaryMessageId,
+          sourceAgentId: msg.agentId,
+          sourceServerId: this.serverId,
+          agentTitle: record?.title,
+          cwd: snapshot.cwd,
+        });
+      };
+      const forkContext = await readForkContext();
 
       this.emit({
         type: "agent.fork_context.response",
@@ -9718,6 +9835,7 @@ export class Session {
 
     try {
       const agentId = resolved.agentId;
+      const sourceAgentEvent = this.authenticatedAgentNotificationEvent(msg);
 
       const prompt = buildAgentPrompt(msg.text, msg.images, msg.attachments);
       this.sessionLogger.trace(
@@ -9742,14 +9860,24 @@ export class Session {
             messageId: msg.messageId,
             beforeProviderDispatch: msg.waitForDispatch ? beforeDispatch : undefined,
             prompt,
-            source: {
-              kind: "agent-message",
-              agentId: msg.sourceAgentId,
-              serverId: msg.sourceAgentServerId,
-              title: !msg.sourceAgentServerId
-                ? (this.agentManager.getAgent(msg.sourceAgentId)?.config.title ?? undefined)
-                : undefined,
-            },
+            source: sourceAgentEvent
+              ? {
+                  kind: "agent-notification",
+                  agentId: msg.sourceAgentId,
+                  serverId: msg.sourceAgentServerId,
+                  title: !msg.sourceAgentServerId
+                    ? (this.agentManager.getAgent(msg.sourceAgentId)?.config.title ?? undefined)
+                    : undefined,
+                  event: sourceAgentEvent,
+                }
+              : {
+                  kind: "agent-message",
+                  agentId: msg.sourceAgentId,
+                  serverId: msg.sourceAgentServerId,
+                  title: !msg.sourceAgentServerId
+                    ? (this.agentManager.getAgent(msg.sourceAgentId)?.config.title ?? undefined)
+                    : undefined,
+                },
             activeTurnBehavior: msg.activeTurnBehavior ?? "steer",
             sessionMode: msg.sessionMode,
             clearPendingPermissions: false,
@@ -9797,6 +9925,8 @@ export class Session {
               msg.waitForDispatch && msg.sourceAgentId
                 ? (error) => error instanceof AgentRunCancellationError
                 : undefined,
+            retryIfNotAdmitted: (error) =>
+              deliveryStatus !== "queued" && error instanceof AgentMessageAdmissionError,
           })
         : send(async () => {});
       void sent.catch((error) => {
@@ -9830,6 +9960,19 @@ export class Session {
         },
       });
     }
+  }
+
+  private authenticatedAgentNotificationEvent(
+    msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
+  ): NonNullable<typeof msg.sourceAgentEvent> | undefined {
+    if (
+      !msg.sourceAgentEvent ||
+      !msg.messageId ||
+      !msg.sourceAgentServerId ||
+      !this.authenticateAgentNotificationEvent?.(msg.sourceAgentServerId)
+    )
+      return undefined;
+    return msg.sourceAgentEvent;
   }
 
   private async handleWaitForFinish(
@@ -9871,7 +10014,7 @@ export class Session {
 
       const live = this.agentManager.getAgent(agentId);
       if (!live) {
-        const settled = await this.readSettledAgent(agentId);
+        const settled = await this.readSettledAgent(agentId, true);
         if (!settled) {
           this.emit({
             type: "wait_for_finish_response",
@@ -9903,12 +10046,13 @@ export class Session {
         return;
       }
 
-      let result = await this.agentManager.waitForAgentEvent(agentId, {
+      const result = await this.agentManager.waitForAgentEvent(agentId, {
         signal: AbortSignal.any([abortController.signal, sourceSignal]),
         waitForActive: true,
+        completionResponse: true,
       });
-      let final = await this.getAgentPayloadById(agentId);
-      if (!final) {
+      const final = await this.buildAgentPayload(result.completionSnapshot ?? live);
+      if (!this.isProviderVisibleToClient(final.provider)) {
         throw new Error(`Agent ${agentId} disappeared while waiting`);
       }
 

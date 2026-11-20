@@ -1,5 +1,5 @@
 import { queryClient } from "@/data/query-client";
-import { agentHistoryQueryKey, allAgentHistoryQueryRootKey } from "@/hooks/agent-history-query-key";
+import { invalidateAgentHistory } from "@/hooks/agent-history-query-key";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import {
   isWorkspaceArchiveIntentCurrent,
@@ -98,12 +98,6 @@ function restoreOptimisticallyHiddenWorkspace(input: {
   }
 }
 
-/** History fetched before the archive still lists the workspace's agents as active. */
-function invalidateAgentHistory(serverId: string): void {
-  void queryClient.invalidateQueries({ queryKey: agentHistoryQueryKey(serverId) });
-  void queryClient.invalidateQueries({ queryKey: allAgentHistoryQueryRootKey() });
-}
-
 async function archiveWorkspaceOrThrow(input: {
   client: WorkspaceArchiveClient;
   workspaceId: string;
@@ -136,7 +130,7 @@ export function beginOptimisticWorkspaceArchive(input: {
       if (outcome === "canceled") {
         restoreOptimisticallyHiddenWorkspace({ serverId: input.workspace.serverId, snapshot });
       } else {
-        invalidateAgentHistory(input.workspace.serverId);
+        invalidateAgentHistory(queryClient, input.workspace.serverId);
       }
       return outcome;
     } catch (error) {
@@ -171,6 +165,7 @@ export async function undoWorkspaceArchiveOptimistically(input: {
   }
   try {
     await input.client.undoWorkspaceArchive(workspaceId);
+    invalidateAgentHistory(queryClient, serverId);
   } catch (error) {
     if (isWorkspaceArchiveIntentCurrent(intent)) {
       getHostRuntimeStore().removeWorkspaceSnapshot(serverId, workspaceId);

@@ -32,6 +32,7 @@ const NO_METADATA: Record<string, JsonValue> = {};
 
 export interface DraftComposerTextSource extends ComposerTextSource {
   peekPendingText: () => string | null;
+  cancelPendingText: () => void;
 }
 
 type AttachmentUpdater =
@@ -113,6 +114,7 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
   const textSource = useMemo<DraftComposerTextSource>(
     () => ({
       peekPendingText: () => textPublication.peek(),
+      cancelPendingText: () => textPublication.cancel(),
       getSnapshot: () => {
         const record = useDraftStore.getState().drafts[draftKey];
         return record?.lifecycle === "active" ? record.input.text : "";

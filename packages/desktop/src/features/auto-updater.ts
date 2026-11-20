@@ -38,8 +38,11 @@ export {
 
 let cachedStagingUserIdPromise: Promise<string> | null = null;
 let macUpdateQuitInProgress = false;
+let nativeUpdateHandoffInProgress = false;
+let nativeUpdateQuitAccepted = false;
 
 const UPDATE_CHANNEL_NOT_PUBLISHED_CODE = "ERR_UPDATER_CHANNEL_FILE_NOT_FOUND";
+const MAC_UPDATE_PREPARATION_TIMEOUT_MS = 30_000;
 const QUIT_UPDATE_HANDOFF_TIMEOUT_MS = 5_000;
 
 interface AppUpdateLogSink {
@@ -153,6 +156,8 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
   private configured = false;
   private macDownloadedInfo: RuntimeUpdateInfo | null = null;
   private macNativeReady = false;
+  private macNativePreparationTimedOut = false;
+  private nativeHandoffTimedOut = false;
   private onUpdateDownloaded?: AppUpdateRuntimeConfiguration["onUpdateDownloaded"];
 
   configure(input: AppUpdateRuntimeConfiguration): void {
@@ -253,6 +258,7 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
     // Own the readiness listener so a failed attempt leaves no install callback.
     await new Promise<void>((resolve, reject) => {
       const cleanup = () => {
+        clearTimeout(timeout);
         electronAutoUpdater.removeListener("update-downloaded", onReady);
         electronAutoUpdater.removeListener("update-not-available", onUnavailable);
         electronAutoUpdater.removeListener("error", onError);
@@ -274,6 +280,12 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
       };
       const onUnavailable = () =>
         onError(new Error(`Squirrel did not find Paseo ${targetVersion}.`));
+      const timeout = setTimeout(() => {
+        // Electron cannot cancel a native check. An event from this attempt
+        // cannot authorize a retry, even if it uses the same feed URL.
+        this.macNativePreparationTimedOut = true;
+        onError(new Error("macOS did not finish preparing the update in time."));
+      }, MAC_UPDATE_PREPARATION_TIMEOUT_MS);
       electronAutoUpdater.on("update-downloaded", onReady);
       electronAutoUpdater.once("update-not-available", onUnavailable);
       electronAutoUpdater.once("error", onError);
@@ -289,47 +301,87 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
     this.macNativeReady = true;
   }
 
-  async quitAndInstall({
-    targetVersion,
-    isSilent,
-    isForceRunAfter,
-  }: AppUpdateInstallRequest): Promise<void> {
+  getInstallBlockReason(): string | undefined {
+    // Native events have no attempt identifier. A late event must not
+    // acknowledge a second install in this process.
+    if (
+      this.nativeHandoffTimedOut ||
+      (process.platform === "darwin" && this.macNativePreparationTimedOut)
+    ) {
+      return "Restart Paseo before retrying the update.";
+    }
+    return undefined;
+  }
+
+  async quitAndInstall(
+    request: AppUpdateInstallRequest,
+    beforeHandoff?: () => Promise<void>,
+  ): Promise<void> {
     const isMac = process.platform === "darwin";
-    if (isMac) await this.prepareMacUpdate(targetVersion);
+    const release = isMac ? await getDesktopSettingsStore().beginOfficialUpdateInstall() : null;
+    if (isMac && !release) throw new Error("Official updates are disabled.");
+    try {
+      if (isMac) await this.prepareMacUpdate(request.targetVersion);
+      await beforeHandoff?.();
+      // Native preparation on macOS has already committed the update. On
+      // other platforms the user can still disable updates until handoff.
+      if (!isMac && !(await isOfficialUpdatesEnabled())) {
+        throw new Error("Official updates are disabled.");
+      }
+      await this.handoffUpdate(request, isMac);
+    } finally {
+      release?.();
+    }
+  }
+
+  private handoffUpdate(request: AppUpdateInstallRequest, isMac: boolean): Promise<void> {
+    const { isSilent, isForceRunAfter } = request;
     autoUpdater.autoRunAppAfterInstall = isForceRunAfter;
-    updateLifecycleLog.quitAndInstallRequested({
-      targetVersion,
-      isSilent,
-      isForceRunAfter,
-    });
+    updateLifecycleLog.quitAndInstallRequested(request);
     return new Promise((resolve, reject) => {
       const useAppQuit = isMac && !isForceRunAfter;
-      const timeout = !isForceRunAfter
-        ? setTimeout(
-            () => onError(new Error("The updater did not take ownership of the quit.")),
-            QUIT_UPDATE_HANDOFF_TIMEOUT_MS,
-          )
-        : undefined;
-      const onHandoff = () => {
+      let requestReturned = false;
+      let acknowledged = false;
+      nativeUpdateQuitAccepted = false;
+      const timeout = setTimeout(() => {
+        this.nativeHandoffTimedOut = true;
+        onError(new Error("The updater did not take ownership of the quit."));
+      }, QUIT_UPDATE_HANDOFF_TIMEOUT_MS);
+      const complete = () => {
         cleanup();
         resolve();
       };
+      const onHandoff = () => {
+        // MacUpdater calls app.quit() synchronously on the no-relaunch path.
+        // A user quit while the attempt waits cannot acknowledge that call.
+        if (useAppQuit && !macUpdateQuitInProgress) return;
+        acknowledged = true;
+        nativeUpdateQuitAccepted = !useAppQuit;
+        if (requestReturned) complete();
+      };
       const onError = (error: unknown) => {
+        acknowledged = false;
+        nativeUpdateQuitAccepted = false;
         cleanup();
         reject(error);
       };
       const cleanup = () => {
         clearTimeout(timeout);
+        nativeUpdateHandoffInProgress = false;
         app.removeListener("before-quit", onHandoff);
         electronAutoUpdater.removeListener("before-quit-for-update", onHandoff);
         autoUpdater.removeListener("error", onError);
       };
       autoUpdater.once("error", onError);
-      if (useAppQuit) app.once("before-quit", onHandoff);
+      if (useAppQuit) app.on("before-quit", onHandoff);
       else electronAutoUpdater.once("before-quit-for-update", onHandoff);
       try {
         macUpdateQuitInProgress = useAppQuit;
+        nativeUpdateHandoffInProgress = !useAppQuit;
         autoUpdater.quitAndInstall(isSilent, isForceRunAfter);
+        requestReturned = true;
+        // Electron can acknowledge the quit before reporting a synchronous error.
+        if (acknowledged) complete();
       } catch (error) {
         onError(error);
       } finally {
@@ -373,6 +425,14 @@ export function isMacUpdateQuitInProgress(): boolean {
   return macUpdateQuitInProgress;
 }
 
+export function isNativeUpdateHandoffInProgress(): boolean {
+  return nativeUpdateHandoffInProgress;
+}
+
+export function hasAcceptedNativeUpdateQuit(): boolean {
+  return nativeUpdateQuitAccepted;
+}
+
 export async function confirmOfficialUpdateWithoutAgentResume(
   target: AppUpdateTarget,
   cancelLabel: string,
@@ -388,7 +448,7 @@ export async function confirmOfficialUpdateWithoutAgentResume(
     title: "Paseo Desktop Update",
     message: `Agent recovery is unverified for Paseo ${target.version}.`,
     detail:
-      "Paseo will stop the built-in daemon without requesting one-time agent recovery. Agents may need to be resumed manually.",
+      "Agents may need to be resumed manually after installing. If installation fails, the current version will try to resume running agents when supported.",
     buttons: ["Install Update", cancelLabel],
     defaultId: 0,
     cancelId: 1,

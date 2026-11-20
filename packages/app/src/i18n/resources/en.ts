@@ -197,7 +197,7 @@ export const en = {
     },
     errors: {
       failedToSend: "Failed to send message",
-      removeQuotesForClaudeCommand: "Remove the quotes to run this Claude slash command.",
+      removeQuotesForSlashCommand: "Remove the quotes to run this slash command.",
       failedToCreateAgent: "Failed to create agent",
       noHostSelected: "No host selected",
       initialPromptRequired: "Initial prompt is required",
@@ -417,6 +417,7 @@ export const en = {
       forkUnavailable: "Update the host to use this.",
       forkMissingWorkspace: "This agent is not in a workspace.",
       forkFailed: "Failed to fork chat",
+      forkSourceHostRemoved: "The original host was removed.",
       openFile: "Open file",
       copied: "Copied",
     },
@@ -812,6 +813,10 @@ export const en = {
         closeTerminalTitle: "Close terminal?",
         closeTerminalMessage: "Any running process in this terminal will be stopped immediately.",
         archiveRunningAgentTitle: "Archive running agent?",
+        handoffKeepQueueTitle: "Keep queued messages with the original agent?",
+        handoffKeepQueueMessage:
+          "The original agent stays open and will send its queued messages using the current provider.",
+        handoffKeepQueueConfirm: "Switch provider",
         archiveRunningAgentMessage:
           "This agent is still running. Archiving it will stop the agent and close the tab.",
         closeTabsLeftTitle: "Close tabs to the left?",
@@ -2764,7 +2769,8 @@ export const en = {
       },
       officialUpdates: {
         label: "Allow official updates",
-        description: "Check, download, and install official releases. These replace custom builds.",
+        description:
+          "Check, download, and install official releases. These replace custom builds. On macOS, you can turn this off after an installation attempt ends. macOS may finish an update it already prepared on relaunch.",
         disabled: "Official updates are disabled.",
       },
       updates: {

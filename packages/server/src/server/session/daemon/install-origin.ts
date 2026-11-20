@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { access, readFile, realpath } from "node:fs/promises";
+import { access, readFile, realpath, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,11 +13,11 @@ const ServerPackageJsonSchema = PackageNameSchema.extend({
   paseoAgentResumeOnRestart: z.boolean().optional(),
 });
 
-export async function installedServerSupportsAgentResume(
+export async function readInstalledServerRecoveryIdentity(
   install: NpmGlobalPaseoInstall,
   currentServerRoot: string | null,
-): Promise<boolean> {
-  if (install.isLinked || !currentServerRoot) return false;
+): Promise<string | null> {
+  if (install.isLinked || !currentServerRoot) return null;
   try {
     // Resolve from the installed CLI, the same package resolution used to launch its daemon.
     const daemonLauncher = path.join(
@@ -30,24 +30,39 @@ export async function installedServerSupportsAgentResume(
     await access(daemonLauncher);
     const require = createRequire(daemonLauncher);
     const root = resolvePackageRootFrom(require.resolve("@getpaseo/server"), "@getpaseo/server");
-    if (!root || !isCurrentServerUnderNpmInstall(root, install)) return false;
+    if (!root || !isCurrentServerUnderNpmInstall(root, install)) return null;
     // The live supervisor restarts its original worker entrypoint. If npm moved
     // the package, the newly resolved CLI alone cannot attest to that worker.
     const [resolvedRoot, resolvedCurrentRoot] = await Promise.all([
       realpath(root),
       realpath(currentServerRoot),
     ]);
-    if (resolvedRoot !== resolvedCurrentRoot) return false;
-    const worker = path.join(root, "dist", "server", "server", "daemon-worker.js");
-    if (!isRealpathInsideRoot(resolvedRoot, await realpath(worker))) return false;
+    if (resolvedRoot !== resolvedCurrentRoot) return null;
+    const worker = await realpath(path.join(root, "dist", "server", "server", "daemon-worker.js"));
+    if (!isRealpathInsideRoot(resolvedRoot, worker)) return null;
     const packageJson = ServerPackageJsonSchema.parse(
       JSON.parse(await readFile(path.join(root, "package.json"), "utf8")),
     );
-    return (
-      packageJson.version === install.version && packageJson.paseoAgentResumeOnRestart === true
+    if (packageJson.version !== install.version || packageJson.paseoAgentResumeOnRestart !== true) {
+      return null;
+    }
+    // A subsequent npm install can replace the package at the same version and path.
+    const [cli, entry] = await Promise.all(
+      [install.packagePath, worker].map((file) => stat(file, { bigint: true })),
     );
+    if (!cli?.isDirectory() || !entry?.isFile()) return null;
+    return [
+      resolvedRoot,
+      worker,
+      cli.dev,
+      cli.ino,
+      cli.ctimeNs,
+      entry.dev,
+      entry.ino,
+      entry.ctimeNs,
+    ].join("\0");
   } catch {
-    return false;
+    return null;
   }
 }
 

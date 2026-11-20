@@ -130,118 +130,141 @@ describe("workspace draft agent model validation", () => {
 });
 
 describe("workspace draft empty text readiness", () => {
-  test("blocks the handoff submit until its history is restored and includes it in the request", async () => {
-    const draftId = "handoff-submit";
-    const scopeKey = buildDraftWorkspaceAttachmentScopeKey(draftId);
-    const history = {
-      kind: "chat_history",
-      id: draftId,
-      source: { serverId: "host-1", agentId: "source-1" },
-      attachment: {
-        type: "text",
-        mimeType: "text/plain",
-        contextKind: "chat_history",
-        text: "Archived conversation",
-      },
-    } as const;
-    const createAgent = vi.fn<DaemonClient["createAgent"]>().mockRejectedValue(new Error("Retry"));
-    vi.mocked(useHostRuntimeClient).mockReturnValue({ createAgent } as unknown as DaemonClient);
-    vi.mocked(useAgentInputDraft).mockReturnValue({
-      isHydrated: true,
-      textSource: {
-        getSnapshot: () => "Continue here",
-        peekPendingText: () => null,
-        subscribe: () => () => {},
-      },
-      textReplacement: { kind: "hydrated", key: "handoff", text: "Continue here" },
-      editText: vi.fn(),
-      replaceText: vi.fn(),
-      attachments: [],
-      setAttachments: vi.fn(),
-      clear: vi.fn(),
-      attachmentFocusRequestId: 0,
-      composerState: {
-        ...baseComposerState,
-        workingDir: "/tmp/project",
-        effectiveModeId: "",
-        effectiveThinkingOptionId: "",
-        metadata: {},
-        agentControls: {},
-        persistFormPreferences: async () => {},
-      } as unknown as NonNullable<AgentInputDraft["composerState"]>,
-    });
-    const storedAttachments = useWorkspaceAttachmentsStore.getState();
-    useWorkspaceAttachmentsStore.setState({ draftHistoryHydrated: false, attachmentsByScope: {} });
-    const view = render(
-      createElement(WorkspaceDraftComposer, {
-        serverId: "host-1",
-        workspaceId: "workspace-1",
-        tabId: "handoff-tab",
-        draftId,
-        isPaneFocused: false,
-        editingSession: new ComposerEditingSession(),
-        initialSetup: {
-          provider: "codewhale",
-          cwd: "/tmp/project",
-          modeId: null,
-          model: null,
-          thinkingOptionId: null,
-          providerOptions: {},
-          restoreChatHistory: true,
+  test.each([true, false])(
+    "waits for handoff attachments with restoreChatHistory=%s",
+    async (restoreChatHistory) => {
+      const draftId = "handoff-submit";
+      const scopeKey = buildDraftWorkspaceAttachmentScopeKey(draftId);
+      const history = {
+        kind: "chat_history",
+        id: draftId,
+        source: { serverId: "host-1", agentId: "source-1" },
+        attachment: {
+          type: "text",
+          mimeType: "text/plain",
+          contextKind: "chat_history",
+          text: "Archived conversation",
         },
-        onCreated: vi.fn(),
-      }),
-    );
-    const submit = async (expectedError: string) => {
-      const props = vi.mocked(Composer).mock.lastCall?.[0];
-      if (!props?.onSubmitMessage) throw new Error("Expected the composer submit handler");
-      const attachments = collectWorkspaceAttachmentsForScopes({
-        attachmentsByScope: useWorkspaceAttachmentsStore.getState().attachmentsByScope,
-        scopeKeys: props.attachmentScopeKeys ?? [],
+      } as const;
+      const queuedContext = {
+        kind: "forge.change_request_comment",
+        id: "queued-comment",
+        title: "Queued review comment",
+        text: "Please cover this case.",
+      } as const;
+      const attachment = restoreChatHistory ? history : queuedContext;
+      const createAgent = vi
+        .fn<DaemonClient["createAgent"]>()
+        .mockRejectedValue(new Error("Retry"));
+      vi.mocked(useHostRuntimeClient).mockReturnValue({ createAgent } as unknown as DaemonClient);
+      vi.mocked(useAgentInputDraft).mockReturnValue({
+        isHydrated: true,
+        textSource: {
+          getSnapshot: () => "Continue here",
+          peekPendingText: () => null,
+          cancelPendingText: () => {},
+          subscribe: () => () => {},
+        },
+        textReplacement: { kind: "hydrated", key: "handoff", text: "Continue here" },
+        editText: vi.fn(),
+        replaceText: vi.fn(),
+        attachments: [],
+        setAttachments: vi.fn(),
+        clear: vi.fn(),
+        attachmentFocusRequestId: 0,
+        composerState: {
+          ...baseComposerState,
+          workingDir: "/tmp/project",
+          effectiveModeId: "",
+          effectiveThinkingOptionId: "",
+          metadata: {},
+          agentControls: {},
+          persistFormPreferences: async () => {},
+        } as unknown as NonNullable<AgentInputDraft["composerState"]>,
       });
-      await act(async () => {
-        await expect(
-          props.onSubmitMessage?.({
-            text: "Continue here",
+      const storedAttachments = useWorkspaceAttachmentsStore.getState();
+      useWorkspaceAttachmentsStore.setState({
+        draftHistoryHydrated: false,
+        attachmentsByScope: {},
+      });
+      const view = render(
+        createElement(WorkspaceDraftComposer, {
+          serverId: "host-1",
+          workspaceId: "workspace-1",
+          tabId: "handoff-tab",
+          draftId,
+          isPaneFocused: false,
+          editingSession: new ComposerEditingSession(),
+          initialSetup: {
+            provider: "codewhale",
             cwd: "/tmp/project",
-            attachments: [...attachments],
-          }),
-        ).rejects.toThrow(expectedError);
-      });
-    };
-    try {
-      expect(vi.mocked(Composer).mock.lastCall?.[0].isSubmitLoading).toBe(true);
-      await submit("Loading");
-      expect(createAgent).not.toHaveBeenCalled();
-      act(() => {
-        useWorkspaceAttachmentsStore.setState({
-          draftHistoryHydrated: true,
-          attachmentsByScope: { [scopeKey]: [history] },
-        });
-      });
-      expect(vi.mocked(Composer).mock.lastCall?.[0].isSubmitLoading).toBe(false);
-      await submit("Retry");
-      expect(createAgent).toHaveBeenCalledExactlyOnceWith(
-        expect.objectContaining({
-          initialPrompt: "Continue here",
-          attachments: [
-            {
-              ...history.attachment,
-              forkContext: { sourceAgentId: "source-1", sourceServerId: "host-1" },
-            },
-          ],
+            modeId: null,
+            model: null,
+            thinkingOptionId: null,
+            providerOptions: {},
+            restoreChatHistory,
+          },
+          onCreated: vi.fn(),
         }),
       );
-      expect(useWorkspaceAttachmentsStore.getState().attachmentsByScope[scopeKey]).toEqual([
-        history,
-      ]);
-    } finally {
-      view.unmount();
-      useWorkspaceAttachmentsStore.setState(storedAttachments);
-      vi.mocked(useHostRuntimeClient).mockReset();
-      vi.mocked(useAgentInputDraft).mockReset();
-    }
-  });
+      const submit = async (expectedError: string) => {
+        const props = vi.mocked(Composer).mock.lastCall?.[0];
+        if (!props?.onSubmitMessage) throw new Error("Expected the composer submit handler");
+        const attachments = collectWorkspaceAttachmentsForScopes({
+          attachmentsByScope: useWorkspaceAttachmentsStore.getState().attachmentsByScope,
+          scopeKeys: props.attachmentScopeKeys ?? [],
+        });
+        await act(async () => {
+          await expect(
+            props.onSubmitMessage?.({
+              text: "Continue here",
+              cwd: "/tmp/project",
+              attachments: [...attachments],
+            }),
+          ).rejects.toThrow(expectedError);
+        });
+      };
+      try {
+        expect(vi.mocked(Composer).mock.lastCall?.[0].isSubmitLoading).toBe(true);
+        await submit("Loading");
+        expect(createAgent).not.toHaveBeenCalled();
+        act(() => {
+          useWorkspaceAttachmentsStore.setState({
+            draftHistoryHydrated: true,
+            attachmentsByScope: { [scopeKey]: [attachment] },
+          });
+        });
+        expect(vi.mocked(Composer).mock.lastCall?.[0].isSubmitLoading).toBe(false);
+        await submit("Retry");
+        expect(createAgent).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            initialPrompt: "Continue here",
+            attachments: [
+              restoreChatHistory
+                ? {
+                    ...history.attachment,
+                    forkContext: { sourceAgentId: "source-1", sourceServerId: "host-1" },
+                  }
+                : {
+                    type: "text",
+                    mimeType: "text/plain",
+                    title: queuedContext.title,
+                    text: queuedContext.text,
+                  },
+            ],
+          }),
+        );
+        expect(useWorkspaceAttachmentsStore.getState().attachmentsByScope[scopeKey]).toEqual([
+          attachment,
+        ]);
+      } finally {
+        view.unmount();
+        useWorkspaceAttachmentsStore.setState(storedAttachments);
+        vi.mocked(useHostRuntimeClient).mockReset();
+        vi.mocked(useAgentInputDraft).mockReset();
+      }
+    },
+  );
 
   test("text and model readiness can precede restored draft history", async () => {
     const storedHistory = Promise.withResolvers<string>();

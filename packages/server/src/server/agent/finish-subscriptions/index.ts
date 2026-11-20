@@ -99,6 +99,14 @@ function key(record: Omit<FinishSubscription, "id">): string {
   ]);
 }
 
+function isAgentMessageDispatchConfirmationUnsupported(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    error.code === "AGENT_MESSAGE_DISPATCH_CONFIRMATION_UNSUPPORTED"
+  );
+}
+
 /** Owns durable intent, live observation, supersession, and dispatch acknowledgment. */
 export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptions {
   const tasks = new Set<Promise<void>>();
@@ -219,6 +227,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     childServerId: string,
     prompt: string,
     messageId: string,
+    event: AgentFinishReport["event"],
     signal: AbortSignal,
   ): Promise<boolean> {
     if (!deps.hosts) throw new Error("Remote finish delivery is unavailable");
@@ -231,6 +240,9 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           messageId,
           sourceAgentId: record.childAgentId,
           sourceAgentServerId: childServerId,
+          ...(client.getLastServerInfoMessage()?.features?.agentNotificationEvents === true
+            ? { sourceAgentEvent: event }
+            : {}),
           activeTurnBehavior: "steer",
           waitForDispatch: true,
         });
@@ -302,6 +314,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           childServerId,
           prompt,
           id,
+          finishNotificationEvents[reason],
           signal,
         );
         if (followups) await serializeReports(() => followups.reports.remove(id));
@@ -406,6 +419,14 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           warned = false;
         } catch (error) {
           if (signal.aborted) return;
+          if (isAgentMessageDispatchConfirmationUnsupported(error)) {
+            // Keep the intent for recovery on restart after the parent host is updated.
+            deps.logger.warn(
+              { err: error, subscription: record.id, callerServerId: record.callerServerId },
+              "Finish notification paused. Update the parent host to support message dispatch confirmation.",
+            );
+            return;
+          }
           // Delivery and storage failures retain the captured outcome and durable intent.
           // They do not spend the remote-observation budget or change the child's outcome.
           if (!warned) {

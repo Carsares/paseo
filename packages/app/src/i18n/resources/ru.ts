@@ -200,7 +200,7 @@ export const ru: TranslationResources = {
     },
     errors: {
       failedToSend: "Не удалось отправить сообщение",
-      removeQuotesForClaudeCommand: "Удалите цитаты, чтобы выполнить эту команду Claude со слешем.",
+      removeQuotesForSlashCommand: "Удалите цитаты, чтобы выполнить эту слеш-команду.",
       failedToCreateAgent: "Не удалось создать агента.",
       noHostSelected: "Хост не выбран",
       initialPromptRequired: "Необходим инициализирующий промпт",
@@ -422,6 +422,7 @@ export const ru: TranslationResources = {
       forkUnavailable: "Обновите хост, чтобы использовать эту функцию.",
       forkMissingWorkspace: "Этот агент не связан с рабочим пространством.",
       forkFailed: "Не удалось создать форк чата",
+      forkSourceHostRemoved: "Исходный хост удалён.",
       openFile: "Открыть файл",
       copied: "Скопировано",
     },
@@ -822,6 +823,10 @@ export const ru: TranslationResources = {
         closeTerminalMessage:
           "Любой запущенный процесс в этом терминале будет немедленно остановлен.",
         archiveRunningAgentTitle: "Архивировать работающего агента?",
+        handoffKeepQueueTitle: "Оставить сообщения в очереди исходного агента?",
+        handoffKeepQueueMessage:
+          "Исходный агент останется открытым и отправит сообщения из очереди через текущего провайдера.",
+        handoffKeepQueueConfirm: "Сменить провайдера",
         archiveRunningAgentMessage:
           "Этот агент всё ещё работает. При архивировании агент будет остановлен, а вкладка закрыта.",
         closeTabsLeftTitle: "Закрыть вкладки слева?",
@@ -2678,7 +2683,7 @@ export const ru: TranslationResources = {
       officialUpdates: {
         label: "Разрешить официальные обновления",
         description:
-          "Проверять, загружать и устанавливать официальные версии. Они заменяют пользовательские сборки.",
+          "Проверять, загружать и устанавливать официальные версии. Они заменяют пользовательские сборки. В macOS этот параметр можно отключить после завершения попытки установки. При следующем запуске macOS может завершить уже подготовленное обновление.",
         disabled: "Официальные обновления отключены.",
       },
       updates: {

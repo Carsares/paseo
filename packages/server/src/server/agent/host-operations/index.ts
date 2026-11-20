@@ -1,4 +1,4 @@
-import type { AgentStreamEvent } from "../agent-sdk-types.js";
+import type { AgentSessionConfig, AgentStreamEvent } from "../agent-sdk-types.js";
 import { getParentAddressFromLabels, parentAddressLabels } from "@getpaseo/protocol/agent-labels";
 import type { ActiveTurnBehavior, AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { randomUUID } from "node:crypto";
@@ -239,12 +239,13 @@ export function createHostResolver(input: {
   hosts: () => ToolHosts;
   callerAgentId?: string;
   trackRemoteChild?(childAgentId: string, serverId: string): Promise<void>;
-  /** The destination can't see the caller, so its background and mode defaults resolve before routing. */
+  /** The destination can't see the caller, so its defaults resolve before routing. */
   caller: () =>
     | (BackgroundCaller & {
         provider: string;
         currentModeId: string | null;
         labels?: Record<string, string>;
+        config: Pick<AgentSessionConfig, "providerOptions">;
       })
     | null;
   lockedCwd?: string;
@@ -266,12 +267,17 @@ export function createHostResolver(input: {
             assertRemoteHierarchySupport(client, input.callerAgentId, parsed.labels);
             const { provider, model } = resolveRequiredProviderModel(parsed.provider);
             const caller = input.caller();
+            const sameProviderCaller = caller?.provider === provider ? caller : null;
             // Same-provider children inherit the caller's mode, as they would on the same host.
             const modeId =
               parsed.settings?.modeId ??
-              (caller?.provider === provider
-                ? (resolveInheritedHierarchyMode(caller.currentModeId, caller.labels) ?? undefined)
+              (sameProviderCaller
+                ? (resolveInheritedHierarchyMode(
+                    sameProviderCaller.currentModeId,
+                    sameProviderCaller.labels,
+                  ) ?? undefined)
                 : undefined);
+            const inheritedOptions = sameProviderCaller?.config.providerOptions;
             const workspace = await client.findWorkspace(parsed.workspaceId);
             if (!workspace) throw new Error(`Workspace ${parsed.workspaceId} not found`);
             const labels: Record<string, string> = {
@@ -287,8 +293,10 @@ export function createHostResolver(input: {
                 cwd: workspace.workspaceDirectory,
                 title: parsed.title,
                 modeId,
+                ...(inheritedOptions && Object.keys(inheritedOptions).length > 0
+                  ? { providerOptions: { ...inheritedOptions, ...parsed.settings?.features } }
+                  : { featureValues: parsed.settings?.features }),
                 thinkingOptionId: parsed.settings?.thinkingOptionId,
-                featureValues: parsed.settings?.features,
               },
               workspaceId: parsed.workspaceId,
               // Older hosts reject any background with a workspaceId, so a visible create omits it.
@@ -460,10 +468,74 @@ function workspaceSummary(workspace: FetchWorkspacesEntry) {
 }
 
 function remoteObservation(client: DaemonClient): HostObservation {
+  let updates = Promise.resolve();
   return {
     async observe(agentId, handler, signal, onError) {
       const observation = client.observeTimeline([agentId], { signal });
-      const refresh = async (event?: AgentStreamEvent) => {
+      let started: { turnId: string; timestamp: string } | undefined;
+      async function readTurnResponse(turnId: string, startedAt?: string): Promise<string | null> {
+        const chunks: string[] = [];
+        let cursor: { epoch: string; seq: number } | undefined;
+        do {
+          signal.throwIfAborted();
+          const page = await client.fetchAgentTimeline(agentId, {
+            direction: cursor ? "before" : "tail",
+            cursor,
+            limit: 200,
+          });
+          // Retraction changes the timeline epoch. Discard a partial read across that boundary.
+          if (cursor && page.reset) return null;
+          for (const entry of page.entries.toReversed()) {
+            if (entry.turnId !== turnId) {
+              if (startedAt && entry.timestamp < startedAt)
+                return chunks.length ? chunks.toReversed().join("") : null;
+              continue;
+            }
+            if (entry.item.type === "assistant_message") chunks.push(entry.item.text);
+            else if (chunks.length) return chunks.toReversed().join("");
+          }
+          cursor = page.hasOlder ? (page.startCursor ?? undefined) : undefined;
+        } while (cursor);
+        return chunks.length ? chunks.toReversed().join("") : null;
+      }
+      async function refreshTerminal(
+        event: Extract<
+          AgentStreamEvent,
+          { type: "turn_completed" | "turn_canceled" | "turn_failed" }
+        >,
+        endedAt: string,
+        startedAt?: string,
+      ): Promise<void> {
+        const snapshot = (await client.fetchAgent(agentId))?.agent;
+        if (!snapshot) return;
+        const failed = event.type === "turn_failed";
+        const running = snapshot.status === "running" || snapshot.status === "initializing";
+        if (running) {
+          // An interrupt can keep the old turn busy until its replacement starts.
+          if (event.type === "turn_canceled") return;
+          const active = snapshot.activeTurn;
+          const nextTurnStarted =
+            event.turnId &&
+            ((started && started.turnId !== event.turnId) ||
+              (active?.startedAt && active.turnId !== event.turnId && active.startedAt >= endedAt));
+          if (!nextTurnStarted && (!failed || !startedAt)) return;
+        }
+        // The latest wait may already describe another turn. Read only rows owned by this event.
+        const lastMessage = event.turnId ? await readTurnResponse(event.turnId, startedAt) : null;
+        const status = failed ? "error" : "idle";
+        handler(
+          {
+            ...snapshot,
+            status,
+            lastError: failed ? event.error : undefined,
+            activeTurn: null,
+            pendingPermissions: [],
+          },
+          event,
+          lastMessage,
+        );
+      }
+      const refreshPermission = async (event: AgentStreamEvent) => {
         let snapshot = (await client.fetchAgent(agentId))?.agent ?? null;
         let lastMessage: string | null = null;
         if (
@@ -479,7 +551,7 @@ function remoteObservation(client: DaemonClient): HostObservation {
           if (current.status === "timeout") {
             // Queued delivery can leave a closed/error snapshot visible before the new turn.
             // A timed-out wait has not established an outcome for that queued work.
-            if (event?.type === "permission_resolved") handler(snapshot, event);
+            if (event.type === "permission_resolved") handler(snapshot, event);
             return;
           }
           if (!current.final && current.error && current.error !== `Agent not found: ${agentId}`)
@@ -489,27 +561,37 @@ function remoteObservation(client: DaemonClient): HostObservation {
         }
         handler(snapshot, event, lastMessage);
       };
-      let updates = Promise.resolve();
       const unsubscribe = observation.subscribe({
         snapshot: () => {},
         update: (message) => {
           if (message.type !== "agent_stream" || message.payload.agentId !== agentId) return;
           const event = message.payload.event;
-          if (
-            event.type === "permission_requested" ||
-            event.type === "permission_resolved" ||
-            event.type === "turn_started" ||
+          if (event.type === "turn_started") {
+            if (event.turnId)
+              started = { turnId: event.turnId, timestamp: message.payload.timestamp };
+            return;
+          }
+          if (event.type === "permission_requested" || event.type === "permission_resolved") {
+            updates = updates.then(() => refreshPermission(event)).catch(onError);
+          } else if (
             event.type === "turn_completed" ||
             event.type === "turn_canceled" ||
             event.type === "turn_failed"
-          )
-            updates = updates.then(() => refresh(event)).catch(onError);
+          ) {
+            if (started && event.turnId && started.turnId !== event.turnId) return;
+            const startedAt = started?.turnId === event.turnId ? started?.timestamp : undefined;
+            updates = updates
+              .then(() => refreshTerminal(event, message.payload.timestamp, startedAt))
+              .catch(onError);
+          }
         },
         error: onError,
       });
       try {
         await observation.ready;
-        await refresh();
+        // The initial wait publishes the baseline after any terminal events received while opening.
+        const active = (await client.fetchAgent(agentId))?.agent.activeTurn;
+        if (active?.startedAt) started ??= { turnId: active.turnId, timestamp: active.startedAt };
       } catch (error) {
         unsubscribe();
         await observation.release();
@@ -525,7 +607,9 @@ function remoteObservation(client: DaemonClient): HostObservation {
       signal.addEventListener("abort", close, { once: true });
       return client
         .waitForFinish(agentId, 0)
-        .then((outcome) => {
+        .then(async (outcome) => {
+          // Publish stream events already received before considering a later baseline snapshot.
+          await updates;
           if (!outcome.final && outcome.error && outcome.error !== `Agent not found: ${agentId}`)
             throw new Error(outcome.error);
           return outcome;

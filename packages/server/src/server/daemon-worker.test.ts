@@ -23,18 +23,32 @@ vi.mock("./logger.js", () => ({ createRootLogger: () => ({ info() {}, warn() {},
 vi.mock("./process-diagnostics.js", () => ({ getProcessDiagnostics: () => ({}) }));
 
 test.each([
-  { shutdownError: null, exitCode: 0 },
-  { shutdownError: "Failed to save agent recovery", exitCode: 1 },
-])(
-  "keeps preservation flags on a bare supervisor reply and exits $exitCode",
-  async ({ shutdownError, exitCode }) => {
+  { type: "restart", keep: true, reply: {}, failure: null, exitCode: 0 },
+  { type: "restart", keep: false, reply: {}, failure: "save", exitCode: 1 },
+  { type: "restart", keep: false, reply: {}, failure: "terminals", exitCode: 0 },
+  {
+    type: "restart",
+    keep: false,
+    reply: { resumeAgents: true },
+    failure: "terminals",
+    exitCode: 0,
+  },
+  {
+    type: "restart",
+    keep: false,
+    reply: { resumeAgents: false },
+    failure: "terminals",
+    exitCode: 1,
+  },
+  { type: "shutdown", keep: false, reply: {}, failure: "terminals", exitCode: 1 },
+] as const)(
+  "$type with keepTerminals=$keep, supervisor flags $reply and failure $failure exits $exitCode",
+  async ({ type, keep, reply, failure, exitCode }) => {
     const home = await mkdtemp(path.join(tmpdir(), "paseo-daemon-worker-"));
     const title = process.title;
     const ready = Promise.withResolvers<void>();
     const exited = Promise.withResolvers<number>();
-    const stop = vi.fn(async () => {
-      if (shutdownError) throw new Error(shutdownError);
-    });
+    const stop = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
     const ipc: { receiveMessage?: (message: unknown) => void } = {};
     mocks.getHome.mockReturnValue(home);
     mocks.createDaemon.mockResolvedValue({
@@ -61,6 +75,12 @@ test.each([
 
     try {
       vi.resetModules();
+      const { SavedRecoveryTerminalCleanupError } = await import("./daemon-shutdown-outcome.js");
+      if (failure === "terminals") {
+        stop.mockRejectedValue(new SavedRecoveryTerminalCleanupError(new Error("Reaper failed")));
+      } else if (failure === "save") {
+        stop.mockRejectedValue(new Error("Failed to save agent recovery"));
+      }
       await import("./daemon-worker.js");
       await ready.promise;
       const config = mocks.createDaemon.mock.lastCall?.[0];
@@ -68,21 +88,21 @@ test.each([
         throw new Error("Worker did not register lifecycle handlers");
       const { onLifecycleIntent } = config;
       onLifecycleIntent({
-        type: "restart",
+        type,
         clientId: "test-client",
         requestId: "restart-request",
         reason: "test_restart",
-        keepTerminals: true,
+        keepTerminals: keep,
         resumeAgents: true,
       });
       expect(send).toHaveBeenLastCalledWith({
-        type: "paseo:restart",
+        type: `paseo:${type}`,
         reason: "test_restart",
-        keepTerminals: true,
+        keepTerminals: keep,
         resumeAgents: true,
       });
-      ipc.receiveMessage({ type: "paseo:graceful-shutdown" });
-      expect(stop).toHaveBeenCalledExactlyOnceWith({ keepTerminals: true, resumeAgents: true });
+      ipc.receiveMessage({ type: "paseo:graceful-shutdown", ...reply });
+      expect(stop).toHaveBeenCalledExactlyOnceWith({ keepTerminals: keep, resumeAgents: true });
       await expect(exited.promise).resolves.toBe(exitCode);
     } finally {
       vi.useRealTimers();

@@ -39,6 +39,13 @@ interface ObservedProject {
   projectKey: string;
   projectName: string;
   equivalenceKey: string | null;
+  path: string;
+}
+
+interface HistoryProjectOptionDraft {
+  label: string;
+  projectKeysByServer: Map<string, string[]>;
+  pathByServer: Map<string, string>;
 }
 
 const ThemedFolder = withUnistyles(Folder);
@@ -107,23 +114,59 @@ function useArchivedProjectCatalog() {
   }, [catalog, hosts, statuses]);
 }
 
+function disambiguateProjectLabels(
+  options: Iterable<HistoryProjectOptionDraft>,
+  hostLabels: ReadonlyMap<string, string>,
+): void {
+  const optionsByLabel = new Map<string, HistoryProjectOptionDraft[]>();
+  for (const option of options) {
+    const matching = optionsByLabel.get(option.label);
+    if (matching) matching.push(option);
+    else optionsByLabel.set(option.label, [option]);
+  }
+  for (const matching of optionsByLabel.values()) {
+    if (matching.length < 2) continue;
+    const serverIds = new Set(matching.flatMap(({ pathByServer }) => [...pathByServer.keys()]));
+    const showHost = serverIds.size > 1;
+    const seenHostLabels = new Set<string>();
+    const duplicateHostLabels = new Set<string>();
+    for (const serverId of serverIds) {
+      const hostLabel = hostLabels.get(serverId) ?? serverId;
+      if (seenHostLabels.has(hostLabel)) duplicateHostLabels.add(hostLabel);
+      seenHostLabels.add(hostLabel);
+    }
+    for (const option of matching) {
+      const locations = [...option.pathByServer].map(([serverId, path]) => {
+        if (!showHost) return path;
+        const hostLabel = hostLabels.get(serverId) ?? serverId;
+        const host = duplicateHostLabels.has(hostLabel) ? `${hostLabel} · ${serverId}` : hostLabel;
+        return `${path} (${host})`;
+      });
+      option.label = `${option.label} · ${locations.join(", ")}`;
+    }
+  }
+}
+
 function buildHistoryProjectOptions(input: {
   selectedHost: string;
+  hostLabels: ReadonlyMap<string, string>;
   archived: readonly ProjectSummary[];
   active: readonly ProjectSummary[];
   observed: ReadonlyMap<string, ObservedProject>;
 }): HistoryProjectOption[] {
-  const options = new Map<string, { label: string; projectKeysByServer: Map<string, string[]> }>();
+  const options = new Map<string, HistoryProjectOptionDraft>();
   const registeredPlacements = new Set<string>();
   const includesHost = (id: string) =>
     input.selectedHost === ALL_HOSTS_OPTION_ID || input.selectedHost === id;
 
-  function add(id: string, label: string, serverId: string, projectKey: string) {
+  function add(id: string, placement: Omit<ObservedProject, "equivalenceKey">) {
+    const { projectName, serverId, projectKey, path } = placement;
     let option = options.get(id);
     if (!option) {
-      option = { label, projectKeysByServer: new Map() };
+      option = { label: projectName, projectKeysByServer: new Map(), pathByServer: new Map() };
       options.set(id, option);
     }
+    option.pathByServer.set(serverId, path);
     const keys = option.projectKeysByServer.get(serverId);
     if (keys) {
       keys.push(projectKey);
@@ -140,18 +183,23 @@ function buildHistoryProjectOptions(input: {
   for (const project of registered) {
     const named = activeById.get(project.viewKey) ?? project;
     const label = named.projectCustomName?.trim() || named.projectName;
-    for (const { serverId, projectId } of project.hosts) {
+    for (const { serverId, projectId, repoRoot } of project.hosts) {
       if (!includesHost(serverId) || !projectId.trim()) continue;
       const placement = projectPlacementKey(serverId, projectId);
       if (registeredPlacements.has(placement)) continue;
       registeredPlacements.add(placement);
-      add(project.viewKey, label, serverId, projectId);
+      add(project.viewKey, {
+        projectName: label,
+        serverId,
+        projectKey: projectId,
+        path: repoRoot,
+      });
     }
   }
 
   const equivalenceCountsByHost = countObservedEquivalents(input.observed.values());
   for (const [placement, project] of input.observed) {
-    const { serverId, projectKey, projectName, equivalenceKey } = project;
+    const { serverId, projectKey, equivalenceKey } = project;
     if (!includesHost(serverId) || registeredPlacements.has(placement)) continue;
     // Registered projects use buildProjects' view key. Give history-only equivalents
     // the same identity format as the History grouping code.
@@ -161,8 +209,10 @@ function buildHistoryProjectOptions(input: {
       equivalenceKey &&
       equivalenceCountsByHost.get(projectPlacementKey(serverId, equivalenceKey)) === 1 &&
       !options.get(sharedId)?.projectKeysByServer.has(serverId);
-    add(canMerge ? sharedId : `${serverId}:${projectKey}`, projectName, serverId, projectKey);
+    add(canMerge ? sharedId : `${serverId}:${projectKey}`, project);
   }
+
+  disambiguateProjectLabels(options.values(), input.hostLabels);
 
   return [...options]
     .map(([id, { label, projectKeysByServer }]) => ({ id, label, projectKeysByServer }))
@@ -211,6 +261,7 @@ export function useHistoryProjectOptions({
   agents: readonly AggregatedAgent[];
   ancestors: readonly AggregatedAgent[];
 }) {
+  const hosts = useHosts();
   const { projects: active } = useProjects();
   const { projects: archived, hostsWithCatalog } = useArchivedProjectCatalog();
   const activeProjectsByServer = useSessionStore(
@@ -246,27 +297,46 @@ export function useHistoryProjectOptions({
     setObserved((previous) => {
       let next: Map<string, ObservedProject> | undefined;
       for (const agent of [...ancestors, ...agents]) {
-        const { projectKey, projectName, projectEquivalenceKey } = resolveProjectPlacement({
-          projectPlacement: agent.projectPlacement,
-          cwd: agent.cwd,
-        });
+        const { projectKey, projectName, projectEquivalenceKey, checkout } =
+          resolveProjectPlacement({
+            projectPlacement: agent.projectPlacement,
+            cwd: agent.cwd,
+          });
         if (!projectKey.trim()) continue;
         const placement = projectPlacementKey(agent.serverId, projectKey);
         const equivalenceKey = projectEquivalenceKey?.trim() ? projectEquivalenceKey : null;
+        const path = checkout.mainRepoRoot || checkout.cwd;
         const existing = (next ?? previous).get(placement);
-        if (existing?.projectName === projectName && existing.equivalenceKey === equivalenceKey) {
+        if (
+          existing?.projectName === projectName &&
+          existing.equivalenceKey === equivalenceKey &&
+          existing.path === path
+        ) {
           continue;
         }
         next ??= new Map(previous);
-        next.set(placement, { serverId: agent.serverId, projectKey, projectName, equivalenceKey });
+        next.set(placement, {
+          serverId: agent.serverId,
+          projectKey,
+          projectName,
+          equivalenceKey,
+          path,
+        });
       }
       return next ?? previous;
     });
   }, [agents, ancestors]);
 
   const options = useMemo(
-    () => buildHistoryProjectOptions({ selectedHost, archived, active, observed }),
-    [selectedHost, archived, active, observed],
+    () =>
+      buildHistoryProjectOptions({
+        selectedHost,
+        hostLabels: new Map(hosts.map(({ serverId, label }) => [serverId, label])),
+        archived,
+        active,
+        observed,
+      }),
+    [selectedHost, hosts, archived, active, observed],
   );
   return { options, catalogEquivalenceCounts };
 }

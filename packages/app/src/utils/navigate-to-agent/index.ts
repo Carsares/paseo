@@ -1,6 +1,8 @@
 import { router, type Href } from "expo-router";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useSessionStore } from "@/stores/session-store";
+import { getHostRuntimeStore, isHostRuntimeConnected } from "@/runtime/host-runtime";
+import { i18n } from "@/i18n/i18next";
 import {
   resolveNavigateToAgent,
   resolveOpenForkSourceAgent,
@@ -31,18 +33,32 @@ export function openForkSourceAgent(input: OpenForkSourceAgentInput): Promise<bo
     ? useSessionStore.getState().sessions[input.serverId.trim()]
     : undefined;
   const client = session?.client;
-  return resolveOpenForkSourceAgent(input, {
-    readCachedAgent: ({ serverId, agentId }) => {
-      const cachedSession = useSessionStore.getState().sessions[serverId];
-      const agent = cachedSession?.agents.get(agentId) ?? cachedSession?.agentDetails.get(agentId);
-      return { found: Boolean(agent), workspaceId: agent?.workspaceId };
+  const runtime = getHostRuntimeStore();
+  return resolveOpenForkSourceAgent(
+    {
+      ...input,
+      onHostRemoved:
+        input.onHostRemoved ??
+        (() => input.onError?.(new Error(i18n.t("message.actions.forkSourceHostRemoved")))),
     },
-    fetchRemoteAgent: client
-      ? async ({ agentId }) => {
-          const result = await client.fetchAgent({ agentId });
-          return { found: Boolean(result?.agent), workspaceId: result?.agent?.workspaceId };
-        }
-      : undefined,
-    navigate: navigateToAgent,
-  });
+    {
+      isHostRemoved: (serverId) =>
+        runtime.getHostRegistryStatus() === "ready" &&
+        !runtime.getHosts().some((host) => host.serverId === serverId),
+      isHostOffline: (serverId) => !isHostRuntimeConnected(runtime.getSnapshot(serverId)),
+      readCachedAgent: ({ serverId, agentId }) => {
+        const cachedSession = useSessionStore.getState().sessions[serverId];
+        const agent =
+          cachedSession?.agents.get(agentId) ?? cachedSession?.agentDetails.get(agentId);
+        return { found: Boolean(agent), workspaceId: agent?.workspaceId };
+      },
+      fetchRemoteAgent: client
+        ? async ({ agentId }) => {
+            const result = await client.fetchAgent({ agentId });
+            return { found: Boolean(result?.agent), workspaceId: result?.agent?.workspaceId };
+          }
+        : undefined,
+      navigate: navigateToAgent,
+    },
+  );
 }

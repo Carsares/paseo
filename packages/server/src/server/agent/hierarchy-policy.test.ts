@@ -1,6 +1,7 @@
 import {
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
+  PARENT_SERVER_ID_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
@@ -30,7 +31,6 @@ import {
   MAIN_CONTROL_WRITE_DENIAL,
   REMOTE_HIERARCHY_DEPTH_LABEL,
   resolveInheritedHierarchyMode,
-  resolveInheritedHierarchyOptions,
   validateCanSpawnChild,
   validateSetAgentParent,
   validateSingleHopOrchestration,
@@ -137,6 +137,7 @@ describe("agent orchestration", () => {
       "custom_tool",
       "create_terminal",
       "archive_workspace",
+      "create_workspace",
       "send_terminal_keys",
       "kill_terminal",
       "start_workspace_script",
@@ -204,7 +205,7 @@ describe("Main Control read-only configuration", () => {
     ).toEqual(["WebFetch", "Edit", "MultiEdit", "Write", "NotebookEdit", "Bash"]);
   });
 
-  it("locks OpenCode Main Control permissions and strips Main Control read-only overrides for children", () => {
+  it("locks OpenCode Main Control permissions and restores the inherited mode for children", () => {
     const opencodeConfig = {
       provider: "opencode",
       cwd: "/repo",
@@ -228,18 +229,6 @@ describe("Main Control read-only configuration", () => {
     };
     expect(resolveInheritedHierarchyMode("read-only", mainWithPriorLabels)).toBe("full-access");
     expect(resolveInheritedHierarchyMode("read-only", main.labels)).toBeNull();
-    expect(
-      resolveInheritedHierarchyOptions(
-        {
-          sandbox_mode: "read-only",
-          approval_policy: "never",
-          disallowedTools: ["WebFetch", "Edit", "Bash"],
-        },
-        main.labels,
-      ),
-    ).toEqual({
-      disallowedTools: ["WebFetch"],
-    });
   });
 
   it.each([
@@ -310,6 +299,7 @@ async function withAgents(
   };
   const codex = wrapClient("codex");
   const manager = new AgentManager({
+    serverId: "local-host",
     clients: { codex, claude: wrapClient("claude") },
     registry: storage,
     logger,
@@ -577,7 +567,7 @@ it("refreshes a child that resumed with the old role during a parent's role chan
   });
 });
 
-it("denies workspace archive for Main Control before looking up the workspace", async () => {
+it("denies workspace archive and worktree creation for Main Control before looking up the workspace", async () => {
   await withAgents(async ({ manager, storage, cwd }) => {
     const make = () =>
       manager.createAgent({ provider: "codex", cwd }, undefined, {
@@ -602,11 +592,71 @@ it("denies workspace archive for Main Control before looking up the workspace", 
     await expect(openMainCatalog.executeTool("archive_workspace", request)).rejects.toThrow(
       "Paseo tool is disabled for your hierarchy role: archive_workspace",
     );
+    for (const target of [{}, { serverId: "remote-host" }]) {
+      await expect(
+        openMainCatalog.executeTool("create_workspace", { isolation: "worktree", ...target }),
+      ).rejects.toThrow("Paseo tool is disabled for your hierarchy role: create_workspace");
+    }
     expect(listActiveWorkspaces).not.toHaveBeenCalled();
     await expect(catalog(ordinary.id).executeTool("archive_workspace", request)).rejects.toThrow(
       "Workspace not found",
     );
     expect(listActiveWorkspaces).toHaveBeenCalledOnce();
+  });
+});
+
+it("refuses to restore a fourth-tier agent before restoring its native session", async () => {
+  await withAgents(async ({ manager, storage, cwd, codex }) => {
+    const restoreNative = vi.fn(async () => {});
+    Object.assign(codex, { unarchiveNativeSession: restoreNative });
+    const options = { workspaceId: "workspace" };
+    const config = { provider: "codex", cwd };
+    const create = (parentId?: string) =>
+      manager.createAgent(config, undefined, {
+        ...options,
+        labels: parentId ? { [PARENT_AGENT_ID_LABEL]: parentId } : undefined,
+      });
+    const newParent = await create();
+    const branch = await create();
+    const localChild = await create(branch.id);
+    const grandchild = await create(localChild.id);
+    await manager.archiveAgent(grandchild.id);
+    const archived = await storage.get(grandchild.id);
+    expect(archived?.archivedAt).toBeTruthy();
+    await manager.setAgentParent(branch.id, newParent.id);
+
+    await expect(manager.unarchiveSnapshot(grandchild.id)).rejects.toThrow(
+      "maximum hierarchy depth",
+    );
+    expect(restoreNative).not.toHaveBeenCalled();
+    expect(await storage.get(grandchild.id)).toEqual(archived);
+    expect(manager.getAgent(grandchild.id)).toBeNull();
+  });
+});
+
+it("restores a remote child without counting an unrelated local parent with the same ID", async () => {
+  await withAgents(async ({ manager, storage, cwd }) => {
+    const config = { provider: "codex", cwd };
+    const createLocal = (parentId?: string) =>
+      manager.createAgent(config, undefined, {
+        labels: parentId ? { [PARENT_AGENT_ID_LABEL]: parentId } : undefined,
+      });
+    const localRoot = await createLocal();
+    const localChild = await createLocal(localRoot.id);
+    const sameIdAsRemoteParent = await createLocal(localChild.id);
+    const remoteChild = await createLocal();
+    await manager.archiveAgent(remoteChild.id);
+    const archived = await storage.get(remoteChild.id);
+    if (!archived) throw new Error("Missing archived agent");
+    await storage.upsert({
+      ...archived,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: sameIdAsRemoteParent.id,
+        [PARENT_SERVER_ID_LABEL]: "remote-host",
+        [REMOTE_HIERARCHY_DEPTH_LABEL]: "1",
+      },
+    });
+    await expect(manager.unarchiveSnapshot(remoteChild.id)).resolves.toBe(true);
   });
 });
 
@@ -756,7 +806,7 @@ it("enforces Claude Main Control disallowedTools, auto-denies write permissions,
         cwd,
         title: "Claude Main",
         modeId: "default",
-        providerOptions: { disallowedTools: ["WebFetch"] },
+        providerOptions: { disallowedTools: ["WebFetch", "Bash"] },
       },
       undefined,
       { workspaceId: "workspace" },
@@ -767,11 +817,11 @@ it("enforces Claude Main Control disallowedTools, auto-denies write permissions,
     const mainLaunch = launchedConfigs.get("claude")?.at(-1);
     expect(mainLaunch?.providerOptions?.disallowedTools).toEqual([
       "WebFetch",
+      "Bash",
       "Edit",
       "MultiEdit",
       "Write",
       "NotebookEdit",
-      "Bash",
     ]);
     expect(mainLaunch?.daemonAppendSystemPrompt).toContain("Workspace Main Control Coordinator");
     expect(manager.getPaseoToolPolicy(claudeAgent.id)?.disabledTools).toEqual(
@@ -807,9 +857,28 @@ it("enforces Claude Main Control disallowedTools, auto-denies write permissions,
     expect(surfacedPermissions).toEqual([]);
     expect(manager.getAgent(claudeAgent.id)?.pendingPermissions.size).toBe(0);
 
+    const catalog = createPaseoToolCatalog({
+      agentManager: manager,
+      agentStorage: storage,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      callerAgentId: claudeAgent.id,
+      logger: createTestLogger(),
+    });
+    const childResult = await catalog.executeTool("create_agent", {
+      provider: "claude/sonnet",
+      title: "Delegated workload",
+      initialPrompt: "Read project files",
+      notifyOnFinish: false,
+    });
+    expect(childResult.isError).not.toBe(true);
+    expect(launchedConfigs.get("claude")?.at(-1)?.providerOptions?.disallowedTools).toEqual([
+      "WebFetch",
+      "Bash",
+    ]);
+
     await manager.setAgentMainControl(claudeAgent.id, false);
     const restoredLaunch = launchedConfigs.get("claude")?.at(-1);
-    expect(restoredLaunch?.providerOptions?.disallowedTools).toEqual(["WebFetch"]);
+    expect(restoredLaunch?.providerOptions?.disallowedTools).toEqual(["WebFetch", "Bash"]);
     expect(restoredLaunch?.daemonAppendSystemPrompt).toBeUndefined();
     expect(manager.getAgent(claudeAgent.id)?.currentModeId).toBe("default");
     expect((await storage.get(claudeAgent.id))?.labels).toEqual({});

@@ -75,6 +75,13 @@ export function createRestartRecovery(deps: Dependencies) {
     await deps.dispatch(agentId, deps.settings().prompt);
   }
   return {
+    assertStartupRecoverySettled() {
+      if (resuming.size > 0) {
+        throw new Error(
+          "Cannot preserve agents while startup recovery is still in progress. Retry after it finishes.",
+        );
+      }
+    },
     /** Choose candidates before anything else reads or repairs persisted running status. */
     async prepareStartup() {
       const oneShotMarker = await readOneShotMarker();

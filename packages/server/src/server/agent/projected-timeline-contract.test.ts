@@ -113,6 +113,83 @@ test("projects Codex child history and confines old-client degradation to the ch
   }
 }, 30_000);
 
+test("forks the final archived transcript without resuming the provider", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "paseo-archived-fork-"));
+  const writeDelta = (delta: string, itemId: string) => {
+    app.child.stdout.write(
+      JSON.stringify({
+        method: "item/agentMessage/delta",
+        params: { threadId: "thread-1", itemId, delta },
+      }) + "\n",
+    );
+  };
+  const app = createFakeCodexAppServer({
+    "turn/interrupt": () => {
+      writeDelta("Last answer during interruption.", "last-answer");
+      app.completeTurn({ status: "interrupted" });
+      return {};
+    },
+  });
+  const session = new CodexAppServerAgentSession(
+    { provider: "codex", cwd },
+    null,
+    pino({ level: "silent" }),
+    async () => app.child,
+  );
+  await session.connect();
+  const provider: AgentClient = {
+    provider: "codex",
+    capabilities: session.capabilities,
+    isAvailable: async () => true,
+    createSession: async () => session,
+    resumeSession: async () => {
+      throw new Error("Provider history unavailable");
+    },
+    fetchCatalog: async () => ({ models: [], modes: [] }),
+  };
+  const ctx = await createDaemonTestContext({
+    pluginsEnabled: false,
+    relayEnabled: false,
+    agentClients: { codex: provider },
+  });
+  try {
+    const agent = await ctx.client.createAgent({ provider: "codex", cwd, title: "Archived fork" });
+    if (!agent.workspaceId) throw new Error("Expected the created workspace");
+    app.startsTurn({ threadId: "thread-1" });
+    writeDelta("Earlier answer.", "earlier-answer");
+    const manager = ctx.daemon.daemon.agentManager;
+    await expect.poll(() => manager.hasInFlightRun(agent.id)).toBe(true);
+    await expect
+      .poll(() => manager.fetchTimeline(agent.id).rows)
+      .toMatchObject([{ item: { text: "Earlier answer." } }]);
+    const before = manager.fetchTimeline(agent.id);
+    const ordinaryFork = await ctx.client.buildAgentForkContext(agent.id, {
+      boundaryCursor: { epoch: before.epoch, seq: before.rows[0].seqEnd },
+    });
+    expect(ordinaryFork.attachment?.text).toContain("Earlier answer.");
+
+    const { archivedAt } = await ctx.client.archiveAgent(agent.id, agent.workspaceId);
+    expect(manager.getAgent(agent.id)).toBeNull();
+    const archivedFork = await ctx.client.buildAgentForkContext(agent.id);
+    expect(archivedFork.attachment?.text).toContain("Earlier answer.");
+    expect(archivedFork.attachment?.text).toContain("Last answer during interruption.");
+    expect(manager.getAgent(agent.id)).toBeNull();
+
+    expect(await manager.unarchiveSnapshot(agent.id)).toBe(true);
+    await expect(ctx.client.buildAgentForkContext(agent.id)).rejects.toThrow(
+      "Provider history unavailable",
+    );
+    // Two archive cycles can use the same timestamp.
+    await manager.archiveSnapshot(agent.id, archivedAt);
+    await expect(ctx.client.buildAgentForkContext(agent.id)).rejects.toThrow(
+      "Provider history unavailable",
+    );
+  } finally {
+    await ctx.cleanup();
+    await rm(cwd, { recursive: true, force: true });
+  }
+}, 30_000);
+
 test("resuming Codex restores child descriptors and complete messages without historical deltas", async () => {
   const app = createFakeCodexAppServer({
     "thread/read": (params) => {

@@ -51,16 +51,25 @@ export interface AppUpdateRuntime {
   configure(input: AppUpdateRuntimeConfiguration): void;
   checkForUpdates(): Promise<RuntimeUpdateCheckResult | null>;
   downloadUpdate(targetVersion: string): Promise<unknown>;
-  quitAndInstall(input: AppUpdateInstallRequest): void | Promise<void>;
+  getInstallBlockReason?(): string | undefined;
+  quitAndInstall(
+    input: AppUpdateInstallRequest,
+    beforeHandoff?: () => Promise<void>,
+  ): void | Promise<void>;
 }
 
 export interface AppUpdateTarget {
   version: string;
 }
 
+export interface AppUpdateShutdown {
+  restore(): Promise<void>;
+  beforeHandoff(): Promise<void>;
+}
+
 export type BeforeAppUpdateInstall = (
   target: AppUpdateTarget,
-) => Promise<void | false | (() => Promise<void>)>;
+) => Promise<void | false | AppUpdateShutdown>;
 
 export interface AppUpdateService {
   hasDownloadedUpdate(): boolean;
@@ -421,9 +430,11 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
       version: check.currentVersion,
       message,
     });
-    let restore: (() => Promise<void>) | undefined;
+    let shutdown: AppUpdateShutdown | undefined;
     let installError: string | null = null;
     try {
+      const blocked = deps.runtime.getInstallBlockReason?.();
+      if (blocked) return notInstalled(blocked);
       const preparation = await ensureUpdateDownloaded(targetVersion, signal);
       if (preparation === "superseded") {
         return notInstalled("A newer update was found and will be installed later.");
@@ -439,17 +450,16 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
       }
       const beforeQuit = await onBeforeQuit?.({ version: targetVersion });
       if (beforeQuit === false) return notInstalled("The update was cancelled.");
-      if (typeof beforeQuit === "function") restore = beforeQuit;
+      shutdown = beforeQuit || undefined;
       if (!(await deps.isUpdatesEnabled())) {
         installError = "Official updates are disabled.";
       } else if (!isReadyToInstallVersion(targetVersion)) {
         installError = "The validated download is no longer ready.";
       } else {
-        await deps.runtime.quitAndInstall({
-          targetVersion,
-          isSilent: !restart,
-          isForceRunAfter: restart,
-        });
+        await deps.runtime.quitAndInstall(
+          { targetVersion, isSilent: !restart, isForceRunAfter: restart },
+          beforeQuit ? () => beforeQuit.beforeHandoff() : undefined,
+        );
         return {
           installed: true,
           version: targetVersion,
@@ -461,9 +471,9 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
       deps.reportInstallError?.(installError);
     }
 
-    if (restore) {
+    if (shutdown) {
       try {
-        await restore();
+        await shutdown.restore();
       } catch (error) {
         const message = `Could not restart the built-in daemon: ${getErrorMessage(error)}`;
         deps.reportInstallError?.(message);
@@ -483,7 +493,7 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     signal,
     onBeforeQuit,
   }: Parameters<AppUpdateService["installUpdateOnQuit"]>[0]): Promise<boolean> {
-    if (!hasDownloadedUpdate()) return false;
+    if (!hasDownloadedUpdate() || deps.runtime.getInstallBlockReason?.()) return false;
     return runCheckExclusively(async () => {
       if (signal.aborted) return false;
       const check = await checkForAppUpdateUnlocked({

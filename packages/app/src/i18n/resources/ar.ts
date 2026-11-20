@@ -199,7 +199,7 @@ export const ar: TranslationResources = {
     },
     errors: {
       failedToSend: "فشل في إرسال الرسالة",
-      removeQuotesForClaudeCommand: "أزل الاقتباسات لتشغيل أمر Claude الذي يبدأ بشرطة مائلة.",
+      removeQuotesForSlashCommand: "أزل الاقتباسات لتشغيل هذا الأمر الذي يبدأ بشرطة مائلة.",
       failedToCreateAgent: "فشل في إنشاء الوكيل",
       noHostSelected: "لم يتم تحديد مضيف",
       initialPromptRequired: "مطلوب موجه الأولي",
@@ -418,6 +418,7 @@ export const ar: TranslationResources = {
       forkUnavailable: "حدّث المضيف لاستخدام هذا.",
       forkMissingWorkspace: "هذا الوكيل ليس في مساحة عمل.",
       forkFailed: "فشل تفريع المحادثة",
+      forkSourceHostRemoved: "تمت إزالة المضيف الأصلي.",
       openFile: "افتح الملف",
       copied: "منقول",
     },
@@ -814,6 +815,10 @@ export const ar: TranslationResources = {
         closeTerminalTitle: "إغلاق المحطة؟",
         closeTerminalMessage: "سيتم إيقاف أي عملية جارية في هذه المحطة على الفور.",
         archiveRunningAgentTitle: "وكيل تشغيل الأرشيف؟",
+        handoffKeepQueueTitle: "هل تريد إبقاء الرسائل في قائمة انتظار الوكيل الأصلي؟",
+        handoffKeepQueueMessage:
+          "سيظل الوكيل الأصلي مفتوحًا وسيرسل الرسائل المنتظرة باستخدام المزوّد الحالي.",
+        handoffKeepQueueConfirm: "تبديل المزوّد",
         archiveRunningAgentMessage:
           "هذا الوكيل لا يزال قيد التشغيل. ستؤدي أرشفته إلى إيقاف الوكيل وإغلاق علامة التبويب.",
         closeTabsLeftTitle: "هل تريد إغلاق علامات التبويب على اليسار؟",
@@ -2669,7 +2674,8 @@ export const ar: TranslationResources = {
       },
       officialUpdates: {
         label: "السماح بالتحديثات الرسمية",
-        description: "البحث عن الإصدارات الرسمية وتنزيلها وتثبيتها. تحل محل الإصدارات المخصصة.",
+        description:
+          "البحث عن الإصدارات الرسمية وتنزيلها وتثبيتها. تحل محل الإصدارات المخصصة. على macOS، يمكنك إيقاف هذا الخيار بعد انتهاء محاولة التثبيت. قد يكمل macOS تحديثًا سبق أن جهّزه عند إعادة التشغيل.",
         disabled: "التحديثات الرسمية معطلة.",
       },
       updates: {

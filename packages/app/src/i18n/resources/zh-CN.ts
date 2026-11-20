@@ -199,7 +199,7 @@ export const zhCN: TranslationResources = {
     },
     errors: {
       failedToSend: "发送消息失败",
-      removeQuotesForClaudeCommand: "请移除引用后再运行这条 Claude 斜杠命令。",
+      removeQuotesForSlashCommand: "请移除引用后再运行这条斜杠命令。",
       failedToCreateAgent: "创建 Agent 失败",
       noHostSelected: "未选择 Host",
       initialPromptRequired: "初始 prompt 必填",
@@ -418,6 +418,7 @@ export const zhCN: TranslationResources = {
       forkUnavailable: "请更新主机以使用此功能。",
       forkMissingWorkspace: "此 Agent 不在工作区中。",
       forkFailed: "分叉聊天失败",
+      forkSourceHostRemoved: "来源主机已移除。",
       openFile: "打开文件",
       copied: "已复制",
     },
@@ -812,6 +813,9 @@ export const zhCN: TranslationResources = {
         closeTerminalTitle: "关闭 Terminal？",
         closeTerminalMessage: "此 Terminal 中任何正在运行的进程都会立即停止。",
         archiveRunningAgentTitle: "归档正在运行的 Agent？",
+        handoffKeepQueueTitle: "将待发消息留给原 Agent？",
+        handoffKeepQueueMessage: "原 Agent 会继续运行，待发消息仍由原提供方发送。",
+        handoffKeepQueueConfirm: "切换提供方",
         archiveRunningAgentMessage: "此 Agent 仍在运行。归档会停止该 Agent 并关闭标签。",
         closeTabsLeftTitle: "关闭左侧标签？",
         closeTabsRightTitle: "关闭右侧标签？",
@@ -2605,7 +2609,8 @@ export const zhCN: TranslationResources = {
       },
       officialUpdates: {
         label: "允许官方更新",
-        description: "允许检查、下载和安装官方版本，更新会覆盖自定义版本。",
+        description:
+          "允许检查、下载和安装官方版本，更新会覆盖自定义版本。macOS 开始准备安装后，本次安装尝试结束才可关闭。macOS 可能在下次启动时完成已准备好的更新。",
         disabled: "已禁用官方更新。",
       },
       updates: {

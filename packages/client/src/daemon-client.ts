@@ -481,6 +481,7 @@ export interface DaemonClientTrace {
 export interface SendMessageOptions {
   sourceAgentId?: string;
   sourceAgentServerId?: string;
+  sourceAgentEvent?: SendAgentMessageRequest["sourceAgentEvent"];
   sessionMode?: string;
   messageId?: string;
   /** Wait for provider dispatch instead of the agent message's queue admission. */
@@ -4393,24 +4394,34 @@ export class DaemonClient {
   }
 
   private assertAgentSendSupport(options: SendMessageOptions): void {
+    const serverInfo = this.lastServerInfoMessage;
     if (
-      options.sourceAgentId &&
-      this.lastServerInfoMessage?.features?.agentMessageProvenance !== true
+      (options.waitForDispatch || options.sourceAgentEvent) &&
+      (!this.isConnected || !serverInfo)
     ) {
+      throw this.unavailableError();
+    }
+    const features = serverInfo?.features;
+    // COMPAT(agentMessageDispatchConfirmation): added in v0.16.0, remove gate after 2027-05-19.
+    if (options.waitForDispatch && features?.agentMessageDispatchConfirmation !== true) {
+      throw Object.assign(new Error("Update the Paseo host to confirm agent message dispatch."), {
+        code: "AGENT_MESSAGE_DISPATCH_CONFIRMATION_UNSUPPORTED",
+      });
+    }
+    if (options.sourceAgentId && features?.agentMessageProvenance !== true) {
       throw new Error("Update the Paseo host to send messages with agent provenance.");
     }
-    if (
-      options.sourceAgentServerId &&
-      this.lastServerInfoMessage?.features?.agentMessageBatching !== true
-    ) {
+    if (options.sourceAgentServerId && features?.agentMessageBatching !== true) {
       throw new Error("Update the Paseo host to send messages with a qualified agent address.");
     }
-    // COMPAT(agentMessageDispatchConfirmation): added in v0.16.0, remove gate after 2027-05-19.
-    if (
-      options.waitForDispatch &&
-      this.lastServerInfoMessage?.features?.agentMessageDispatchConfirmation !== true
-    ) {
-      throw new Error("Update the Paseo host to confirm agent message dispatch.");
+    // COMPAT(agentNotificationEvents): added in v0.16.0, remove gate after 2027-05-19.
+    if (options.sourceAgentEvent && features?.agentNotificationEvents !== true) {
+      throw Object.assign(
+        new Error("Update the Paseo host to deliver structured agent notifications."),
+        {
+          code: "AGENT_NOTIFICATION_EVENTS_UNSUPPORTED",
+        },
+      );
     }
   }
 
@@ -4429,6 +4440,7 @@ export class DaemonClient {
       text,
       sourceAgentId: options.sourceAgentId,
       sourceAgentServerId: options.sourceAgentServerId,
+      sourceAgentEvent: options.sourceAgentEvent,
       sessionMode: options.sessionMode,
       ...(messageId ? { messageId } : {}),
       waitForDispatch: options.waitForDispatch,

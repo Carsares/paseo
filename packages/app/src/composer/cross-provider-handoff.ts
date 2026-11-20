@@ -2,7 +2,11 @@ import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { DaemonConnectionError, type DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { useQueryClient } from "@tanstack/react-query";
-import { getOpenAgentTabLabel, isMainControlAgent } from "@getpaseo/protocol/agent-labels";
+import {
+  getOpenAgentTabLabel,
+  getParentAddressFromLabels,
+  isMainControlAgent,
+} from "@getpaseo/protocol/agent-labels";
 import type { AgentProvider } from "@getpaseo/protocol/agent-types";
 import {
   buildDraftWorkspaceAttachmentScopeKey,
@@ -14,6 +18,7 @@ import {
 } from "@/attachments/workspace-attachment-utils";
 import type { ToastApi } from "@/components/toast-host";
 import type { QueuedComposerMessage } from "@/composer/actions";
+import { lockHandoffInput } from "@/composer/handoff-input-lock";
 import { useComposerInput, type ComposerInput } from "@/composer/session";
 import { useToast } from "@/contexts/toast-api-context";
 import type { DraftComposerTextSource } from "@/composer/draft/input-draft";
@@ -22,6 +27,7 @@ import { buildChatHistoryAttachment } from "@/hooks/use-fork-agent";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useOptionalPaneContext, type PaneContextValue } from "@/panels/pane-context";
 import { selectHostFeature, useHostFeature } from "@/runtime/host-features";
+import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { buildDraftStoreKey, generateDraftId } from "@/stores/draft-keys";
 import { useDraftStore } from "@/stores/draft-store";
 import { useSessionStore, type Agent } from "@/stores/session-store";
@@ -62,9 +68,10 @@ interface CrossProviderHandoffDeps {
   inFlight?: { current: boolean };
   getAgent: () => HandoffAgent | null;
   hasUnsettledMessage: () => boolean;
-  takeQueuedMessages: () => { messages: readonly QueuedComposerMessage[]; restore: () => void };
+  hasQueuedMessages: () => boolean;
+  takeQueuedMessages: () => { messages: readonly QueuedComposerMessage[]; restore: () => boolean };
   getComposerInput: () =>
-    | (Pick<ComposerInput, "attachments" | "setText"> & {
+    | (Pick<ComposerInput, "isLocked"> & {
         textSource: ComposerInput["textSource"] & Partial<DraftComposerTextSource>;
       })
     | null;
@@ -83,13 +90,13 @@ interface CrossProviderHandoffDeps {
   >;
   getWorkspaceLayoutStore: () => Pick<
     ReturnType<typeof useWorkspaceLayoutStore.getState>,
-    "retainAgentTabForHandoff" | "unpinAgent" | "hideAgent"
+    "retainAgentTabForHandoff" | "unpinAgent" | "hideAgent" | "openTab"
   >;
   confirmDialog: typeof confirmDialog;
   getOrCreateClientId: typeof getOrCreateClientId;
   generateDraftId: typeof generateDraftId;
   archiveAgent: (input: ArchiveAgentInput) => Promise<void>;
-  confirmSourceArchived: (input: ArchiveAgentInput) => Promise<boolean>;
+  confirmSourceArchived: (input: ArchiveAgentInput) => Promise<boolean | null>;
   toast: Pick<ToastApi, "error">;
   t: (key: string) => string;
 }
@@ -99,16 +106,19 @@ function isHandoffPane(paneContext: HandoffPane | null): paneContext is HandoffP
 }
 
 export function canSwitchAgentProvider(input: {
+  serverId: string;
   supportsAgentForkContext: boolean;
   client: Pick<DaemonClient, "buildAgentForkContext" | "updateAgent"> | null;
   paneContext: HandoffPane | null;
   agent: Pick<Agent, "labels"> | null;
 }): boolean {
+  const parent = getParentAddressFromLabels(input.agent?.labels, input.serverId);
   return Boolean(
     input.supportsAgentForkContext &&
     input.client &&
     isHandoffPane(input.paneContext) &&
     input.agent &&
+    (!parent || parent.serverId === input.serverId) &&
     !isMainControlAgent(input.agent),
   );
 }
@@ -126,7 +136,7 @@ function snapshotUnsentDraft(
       composerInput?.textSource.getSnapshot() ??
       storedSourceDraft?.text ??
       "",
-    attachments: [...(composerInput?.attachments ?? storedSourceDraft?.attachments ?? [])],
+    attachments: [...(storedSourceDraft?.attachments ?? [])],
     metadata: draftStore.metadataByDraftKey[sourceDraftKey],
   };
 }
@@ -134,12 +144,13 @@ function snapshotUnsentDraft(
 function buildHandoffDraftSetup(
   agent: Pick<HandoffAgent, "cwd" | "parentAgentId">,
   selection: CrossProviderHandoffSelection,
+  restoreChatHistory: boolean,
 ): WorkspaceDraftTabSetup {
   const parentAgentId = agent.parentAgentId?.trim();
   return {
     provider: selection.provider,
     cwd: agent.cwd,
-    restoreChatHistory: true,
+    restoreChatHistory,
     ...(parentAgentId ? { parentAgentId } : {}),
     modeId: selection.modeId?.trim() || null,
     model: selection.modelId?.trim() || null,
@@ -155,8 +166,9 @@ async function closeHandoffSource(input: {
   confirmedArchive: boolean;
   getClientId: () => Promise<string>;
   releaseTabLabel: (clientId: string) => Promise<void>;
+  confirmKeepQueue: () => Promise<boolean>;
   archiveAndCommit: (agent: HandoffAgent) => Promise<boolean>;
-  commit: (agent: HandoffAgent) => boolean;
+  commit: (agent: HandoffAgent) => Promise<boolean>;
 }): Promise<boolean> {
   let { confirmedArchive } = input;
   let clientId: string | null = null;
@@ -174,6 +186,10 @@ async function closeHandoffSource(input: {
         clientId = await input.getClientId();
         continue;
       }
+      if (!(await input.confirmKeepQueue())) return false;
+      const current = input.getCurrentAgent();
+      if (!current) return false;
+      if (resolveCloseAgentTabPolicy(current).kind !== "layout-only") continue;
       await input.releaseTabLabel(clientId);
       releasedTabLabel = true;
       continue;
@@ -200,6 +216,7 @@ export async function performCrossProviderAgentHandoff(
     inFlight.current = true;
   }
   let releaseSourceTab: (() => void) | undefined;
+  let releaseInput: (() => void) | undefined;
 
   try {
     if (!deps.supportsAgentForkContext) {
@@ -236,11 +253,19 @@ export async function performCrossProviderAgentHandoff(
         isMainControlAgent(current)
       )
         return null;
-      return current;
+      const parent = getParentAddressFromLabels(current.labels, serverId);
+      return parent?.serverId === serverId && current.parentAgentId !== parent.agentId
+        ? { ...current, parentAgentId: parent.agentId }
+        : current;
     };
     // COMPAT(agentInitialPromptOrigin): added in v0.16.0, remove gate after 2027-05-19.
     const canKeepParent = (agent: HandoffAgent): boolean => {
-      if (!agent.parentAgentId?.trim() || deps.supportsAgentInitialPromptOrigin()) return true;
+      const parent = getParentAddressFromLabels(agent.labels, serverId);
+      if (
+        (!parent || parent.serverId === serverId) &&
+        (!(parent || agent.parentAgentId?.trim()) || deps.supportsAgentInitialPromptOrigin())
+      )
+        return true;
       toast.error(t("message.actions.forkUnavailable"));
       return false;
     };
@@ -261,25 +286,37 @@ export async function performCrossProviderAgentHandoff(
     let confirmedArchive = false;
     if (needsArchiveConfirmation(sourceAgent)) {
       confirmedArchive = await confirmArchive();
-      if (!confirmedArchive || !getCurrentAgent()) return false;
+      if (!confirmedArchive) return false;
     }
 
-    const payload = await client.buildAgentForkContext(agentId);
-    if (!getCurrentAgent()) return false;
     const draftId = deps.generateDraftId();
-    const attachment = buildChatHistoryAttachment({
-      draftId,
-      serverId,
-      agentId,
-      payload,
-      missingAttachmentMessage: t("message.actions.forkFailed"),
-    });
+    const readHistory = async () =>
+      buildChatHistoryAttachment({
+        draftId,
+        serverId,
+        agentId,
+        payload: await client.buildAgentForkContext(agentId),
+        missingAttachmentMessage: t("message.actions.forkFailed"),
+      });
+    // An attached child stays live, so its history is safe to read before closing the tab.
+    // Root history must be read after the archive has stopped and drained the old run.
+    const childHistory =
+      resolveCloseAgentTabPolicy(sourceAgent).kind === "layout-only" ? await readHistory() : null;
+    if (!getCurrentAgent()) return false;
     const sourceDraftKey = buildDraftStoreKey({ serverId, agentId });
     const targetDraftKey = buildDraftStoreKey({ serverId, agentId: paneContext.tabId, draftId });
+    const tryLockInput = () => {
+      releaseInput = lockHandoffInput(sourceDraftKey) ?? undefined;
+      if (releaseInput) return true;
+      toast.error(t("composer.errors.alreadyLoading"));
+      return false;
+    };
     const commit = (
       agent: HandoffAgent,
       unsent: ReturnType<typeof snapshotUnsentDraft>,
+      history: Awaited<ReturnType<typeof readHistory>> | null,
       queued: readonly QueuedComposerMessage[] = [],
+      replaceSource = true,
     ) => {
       const queuedAttachments = queued.flatMap((message) => message.attachments);
       const text = [...queued.map((message) => message.text), unsent.text]
@@ -287,9 +324,21 @@ export async function performCrossProviderAgentHandoff(
         .join("\n\n");
       const attachments = [...userAttachmentsOnly(queuedAttachments), ...unsent.attachments];
       const draftStore = deps.getDraftStore();
+      const workspaceAttachments = [
+        ...(history ? [history] : []),
+        ...queuedAttachments.filter(isWorkspaceAttachment),
+      ];
+      if (
+        !replaceSource &&
+        !text &&
+        attachments.length === 0 &&
+        workspaceAttachments.length === 0 &&
+        !unsent.metadata
+      )
+        return false;
       deps.getWorkspaceAttachmentsStore().setWorkspaceAttachments({
         scopeKey: buildDraftWorkspaceAttachmentScopeKey(draftId),
-        attachments: [attachment, ...queuedAttachments.filter(isWorkspaceAttachment)],
+        attachments: workspaceAttachments,
       });
       if (text.length > 0 || attachments.length > 0) {
         draftStore.saveDraftInput({ draftKey: targetDraftKey, draft: { text, attachments } });
@@ -297,15 +346,20 @@ export async function performCrossProviderAgentHandoff(
       if (unsent.metadata && Object.keys(unsent.metadata).length > 0) {
         draftStore.patchDraftMetadata({ draftKey: targetDraftKey, patch: unsent.metadata });
       }
+      const target = {
+        kind: "draft" as const,
+        draftId,
+        setup: buildHandoffDraftSetup(agent, selection, history !== null),
+      };
+      const layoutStore = deps.getWorkspaceLayoutStore();
+      if (!replaceSource && !layoutStore.openTab({ workspaceKey, target, intent: "background" })) {
+        return false;
+      }
+      deps.getComposerInput()?.textSource.cancelPendingText?.();
       draftStore.clearDraftInput({ draftKey: sourceDraftKey, lifecycle: "abandoned" });
       draftStore.clearDraftMetadata({ draftKey: sourceDraftKey });
-      deps.getComposerInput()?.setText("");
-      paneContext.retargetCurrentTab({
-        kind: "draft",
-        draftId,
-        setup: buildHandoffDraftSetup(agent, selection),
-      });
-      const layoutStore = deps.getWorkspaceLayoutStore();
+      if (!replaceSource) return true;
+      paneContext.retargetCurrentTab(target);
       layoutStore.unpinAgent(workspaceKey, agentId);
       layoutStore.hideAgent(workspaceKey, agentId);
       return true;
@@ -317,6 +371,15 @@ export async function performCrossProviderAgentHandoff(
       confirmArchive,
       confirmedArchive,
       getClientId: deps.getOrCreateClientId,
+      confirmKeepQueue: () =>
+        !deps.hasQueuedMessages()
+          ? Promise.resolve(true)
+          : deps.confirmDialog({
+              title: t("workspace.tabs.confirmations.handoffKeepQueueTitle"),
+              message: t("workspace.tabs.confirmations.handoffKeepQueueMessage"),
+              confirmLabel: t("workspace.tabs.confirmations.handoffKeepQueueConfirm"),
+              cancelLabel: t("workspace.tabs.confirmations.cancel"),
+            }),
       releaseTabLabel: async (clientId) => {
         await client.updateAgent(agentId, {
           labels: { [getOpenAgentTabLabel(clientId)]: "false" },
@@ -325,43 +388,55 @@ export async function performCrossProviderAgentHandoff(
       archiveAndCommit: async (agent) => {
         if (!canKeepParent(agent)) return false;
         // The queue removes a message during delivery and returns it only if the send fails.
-        if (deps.hasUnsettledMessage()) {
+        if (deps.hasUnsettledMessage() || deps.getComposerInput()?.isLocked()) {
           toast.error(t("composer.errors.alreadyLoading"));
           return false;
         }
+        if (!tryLockInput()) return false;
         const unsent = snapshotUnsentDraft(sourceDraftKey, deps);
         const queued = deps.takeQueuedMessages();
         const source = { serverId, agentId, expectedWorkspaceId: workspaceId };
         try {
           await deps.archiveAgent(source);
         } catch (error) {
-          // A lost reply can follow a successful archive. A missing directory entry alone
-          // does not prove the agent was archived in this workspace.
-          const archived =
-            error instanceof DaemonConnectionError &&
-            sourceTab.isCurrent() &&
-            (await deps.confirmSourceArchived(source).catch(() => false));
-          if (!archived) {
-            queued.restore();
+          // Archive persistence can succeed before runtime close or the reply fails.
+          const archived = await deps.confirmSourceArchived(source).catch(() => null);
+          const lostReply = error instanceof DaemonConnectionError;
+          if (!archived || !lostReply) {
+            // A timed-out request may still archive the agent after the lookup.
+            if (archived !== false || lostReply || !queued.restore()) {
+              commit(agent, unsent, null, queued.messages, false);
+            }
             throw error;
           }
         }
-        const current = deps.getAgent();
-        if (
-          !sourceTab.isCurrent() ||
-          (current && (current.workspaceId?.trim() !== workspaceId || isMainControlAgent(current)))
-        ) {
-          return false;
+        let history: Awaited<ReturnType<typeof readHistory>> | null = null;
+        try {
+          history = await readHistory();
+        } catch (error) {
+          toast.error(toErrorMessage(error) || t("message.actions.forkFailed"));
         }
-        return commit(agent, unsent, queued.messages);
+        const current = deps.getAgent();
+        const canReplaceSource =
+          sourceTab.isCurrent() &&
+          (!current ||
+            (current.workspaceId?.trim() === workspaceId && !isMainControlAgent(current)));
+        return commit(agent, unsent, history, queued.messages, canReplaceSource);
       },
-      commit: (agent) =>
-        canKeepParent(agent) && commit(agent, snapshotUnsentDraft(sourceDraftKey, deps)),
+      commit: async (agent) => {
+        if (!canKeepParent(agent)) return false;
+        const history = childHistory ?? (await readHistory());
+        const current = getCurrentAgent();
+        if (!current || !canKeepParent(current)) return false;
+        if (!tryLockInput()) return false;
+        return commit(current, snapshotUnsentDraft(sourceDraftKey, deps), history);
+      },
     });
   } catch (error) {
     toast.error(toErrorMessage(error) || t("message.actions.forkFailed"));
     return false;
   } finally {
+    releaseInput?.();
     releaseSourceTab?.();
     if (inFlight) {
       inFlight.current = false;
@@ -387,6 +462,7 @@ export function useCrossProviderAgentHandoff(input: {
   const getComposerInput = useStableEvent(() => composerInput);
   const inFlightRef = useRef(false);
   const canSwitchProvider = canSwitchAgentProvider({
+    serverId,
     supportsAgentForkContext,
     client,
     paneContext,
@@ -405,10 +481,16 @@ export function useCrossProviderAgentHandoff(input: {
         inFlight: inFlightRef,
         getAgent: () => useSessionStore.getState().sessions[serverId]?.agents?.get(agentId) ?? null,
         hasUnsettledMessage: () =>
-          useSessionStore
+          getHostRuntimeStore().isDrainingQueuedAgentMessage(serverId, agentId) ||
+          (useSessionStore
             .getState()
             .sessions[serverId]?.messageSubmissions.get(agentId)
-            ?.some((submission) => !submission.rpcSettled) ?? false,
+            ?.some((submission) => !submission.rpcSettled) ??
+            false),
+        hasQueuedMessages: () =>
+          Boolean(
+            useSessionStore.getState().sessions[serverId]?.queuedMessages.get(agentId)?.length,
+          ),
         takeQueuedMessages: () => {
           const store = useSessionStore.getState();
           const messages = store.sessions[serverId]?.queuedMessages.get(agentId) ?? [];
@@ -423,12 +505,14 @@ export function useCrossProviderAgentHandoff(input: {
           return {
             messages,
             restore: () => {
+              if (messages.length === 0) return true;
               const latest = useSessionStore.getState();
               const agent = latest.sessions[serverId]?.agents.get(agentId);
-              if (messages.length === 0 || !agent || agent.archivedAt) return;
+              if (!agent || agent.archivedAt) return false;
               latest.setQueuedMessages(serverId, (current) =>
                 new Map(current).set(agentId, [...messages, ...(current.get(agentId) ?? [])]),
               );
+              return true;
             },
           };
         },
@@ -452,10 +536,12 @@ export function useCrossProviderAgentHandoff(input: {
           });
         },
         confirmSourceArchived: async (target) => {
-          if (!client) return false;
+          if (!client) return null;
           const { agent } =
             (await client.fetchAgent({ agentId: target.agentId, timeout: 5_000 })) ?? {};
-          if (!agent?.archivedAt || agent.workspaceId !== target.expectedWorkspaceId) return false;
+          if (!agent) return null;
+          if (!agent.archivedAt) return false;
+          if (agent.workspaceId !== target.expectedWorkspaceId) return null;
           applyArchivedAgentCloseResults({
             queryClient,
             serverId: target.serverId,

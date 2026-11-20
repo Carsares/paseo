@@ -6,7 +6,10 @@ import type { z } from "zod";
 import { WorkspaceLayoutPersistedStateSchema } from "./workspace-layout-storage";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import type { WorkspaceTab, WorkspaceTabTarget } from "@/workspace-tabs/model";
-import { useWorkspaceAttachmentsStore } from "@/attachments/workspace-attachments-store";
+import {
+  buildDraftWorkspaceAttachmentScopeKey,
+  useWorkspaceAttachmentsStore,
+} from "@/attachments/workspace-attachments-store";
 import {
   defaultWorkspaceLayoutIds,
   type WorkspaceLayoutIdSource,
@@ -1050,7 +1053,7 @@ interface AgentTabHandoff {
   lastSnapshot?: WorkspaceTabSnapshot;
 }
 
-function clearClosedDraftHistory(state: WorkspaceLayoutStore, draftId: string): void {
+function clearClosedDraftAttachments(state: WorkspaceLayoutStore, draftId: string): void {
   const matchesDraft = (tab: WorkspaceTab) =>
     tab.target.kind === "draft" && tab.target.draftId === draftId;
   const stillOpen =
@@ -1060,7 +1063,11 @@ function clearClosedDraftHistory(state: WorkspaceLayoutStore, draftId: string): 
     Object.values(state.sheetsByWorkspace).some((sheets) =>
       sheets.some((sheet) => matchesDraft(sheet.tab)),
     );
-  if (!stillOpen) useWorkspaceAttachmentsStore.getState().clearDraftChatHistory({ draftId });
+  if (!stillOpen) {
+    useWorkspaceAttachmentsStore.getState().clearWorkspaceAttachments({
+      scopeKey: buildDraftWorkspaceAttachmentScopeKey(draftId),
+    });
+  }
 }
 
 export function createWorkspaceLayoutStore(
@@ -1496,7 +1503,7 @@ export function createWorkspaceLayoutStore(
             };
           });
           if (closingTarget?.kind === "draft") {
-            clearClosedDraftHistory(get(), closingTarget.draftId);
+            clearClosedDraftAttachments(get(), closingTarget.draftId);
           }
         },
         getTabDestination: (workspaceKey, tabId) => {
@@ -2069,7 +2076,7 @@ export function createWorkspaceLayoutStore(
             };
           });
           for (const tab of closingTabs) {
-            if (tab.target.kind === "draft") clearClosedDraftHistory(get(), tab.target.draftId);
+            if (tab.target.kind === "draft") clearClosedDraftAttachments(get(), tab.target.draftId);
           }
         },
         focusWorkspace: (workspaceKey) => {

@@ -5730,6 +5730,95 @@ describe("Codex app-server provider", () => {
     );
   });
 
+  test.each([
+    { resumeStatus: "completed", childStatus: "running", finalClose: false, expected: "running" },
+    {
+      resumeStatus: "completed",
+      childStatus: "pendingInit",
+      finalClose: false,
+      expected: "running",
+    },
+    {
+      resumeStatus: "completed",
+      childStatus: "completed",
+      finalClose: false,
+      expected: "completed",
+    },
+    { resumeStatus: "failed", childStatus: "notFound", finalClose: false, expected: "canceled" },
+    { resumeStatus: "completed", childStatus: "running", finalClose: true, expected: "canceled" },
+    {
+      resumeStatus: "completed",
+      childStatus: "completed",
+      finalClose: true,
+      expected: "completed",
+    },
+  ])(
+    "replays close, $resumeStatus resume ($childStatus) and optional final close ($finalClose)",
+    async ({ resumeStatus, childStatus, finalClose, expected }) => {
+      const session = createSession();
+      const collabItem = (
+        id: string,
+        threadId: string,
+        tool: string,
+        status: string,
+        state: string,
+      ) => ({
+        type: "collabAgentToolCall",
+        id,
+        tool,
+        status,
+        ...(tool === "spawnAgent" ? { prompt: `Task for ${threadId}` } : {}),
+        receiverThreadIds: [threadId],
+        agentsStates: { [threadId]: { status: state, message: null } },
+      });
+      const itemsByThread: Record<string, unknown[]> = {
+        "test-thread": [
+          collabItem("spawn-child", "child", "spawnAgent", "completed", "running"),
+          collabItem("close-child", "child", "closeAgent", "completed", "shutdown"),
+          collabItem("resume-child", "child", "resumeAgent", resumeStatus, childStatus),
+          ...(finalClose
+            ? [collabItem("close-child-again", "child", "closeAgent", "completed", childStatus)]
+            : []),
+        ],
+        child: [collabItem("spawn-grandchild", "grandchild", "spawnAgent", "completed", "running")],
+      };
+      session.client = {
+        request: vi.fn(async (_method: string, params: { threadId: string }) => ({
+          thread: { turns: [{ items: itemsByThread[params.threadId] ?? [] }] },
+        })),
+      };
+
+      const history = await Array.fromAsync(session.streamHistory());
+      const grandchildStatus = finalClose || expected === "canceled" ? "canceled" : "running";
+      expect(
+        history.flatMap((event) =>
+          event.type === "timeline" && event.item.type === "tool_call"
+            ? [[event.item.callId, event.item.status]]
+            : [],
+        ),
+      ).toEqual([["spawn-child", expected]]);
+      expect(
+        history.flatMap((event) =>
+          event.type === "provider_subagent" && event.event.type === "upsert"
+            ? [[event.event.id, event.event.parentSubagentId, event.event.status]]
+            : [],
+        ),
+      ).toEqual([
+        ["child", null, expected],
+        ["grandchild", "child", grandchildStatus],
+      ]);
+      expect(
+        history.flatMap((event) =>
+          event.type === "provider_subagent" &&
+          event.event.type === "timeline" &&
+          event.event.item.type === "tool_call"
+            ? [[event.event.id, event.event.item.callId, event.event.item.status]]
+            : [],
+        ),
+      ).toEqual([["child", "spawn-grandchild", grandchildStatus]]);
+    },
+  );
+
   test("restores nested MultiAgentV2 ownership from persisted child threads", async () => {
     const session = createSession();
     session.client = {

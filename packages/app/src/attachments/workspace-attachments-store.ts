@@ -1,9 +1,10 @@
 import { useMemo } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { TextAttachmentSchema } from "@getpaseo/protocol/messages";
+import { ReviewAttachmentSchema, TextAttachmentSchema } from "@getpaseo/protocol/messages";
 import { create } from "zustand";
 import { useShallow } from "zustand/shallow";
 import { z } from "zod";
+import { AttachmentMetadataSchema } from "@/stores/draft-store/state";
 import type { WorkspaceComposerAttachment } from "./types";
 
 const EMPTY_WORKSPACE_ATTACHMENTS: readonly WorkspaceComposerAttachment[] = [];
@@ -21,6 +22,60 @@ const ChatHistoryAttachmentSchema = z.object({
     itemCount: z.number().int().nonnegative().optional(),
   }),
 });
+const WorkspaceAttachmentSchema: z.ZodType<WorkspaceComposerAttachment> = z.union([
+  ChatHistoryAttachmentSchema,
+  z.object({
+    kind: z.literal("review"),
+    attachment: ReviewAttachmentSchema,
+    reviewDraftKey: z.string(),
+    commentCount: z.number().int().nonnegative(),
+  }),
+  z.object({
+    kind: z.enum([
+      "forge.change_request_comment",
+      "forge.change_request_review",
+      "forge.change_request_check",
+      "github.pull_request_comment",
+      "github.pull_request_review",
+      "github.pull_request_check",
+    ]),
+    id: z.string(),
+    title: z.string(),
+    subtitle: z.string().optional(),
+    text: z.string(),
+    url: z.string().nullish(),
+  }),
+  z.object({
+    kind: z.literal("browser_element"),
+    attachment: z.object({
+      url: z.string(),
+      selector: z.string(),
+      tag: z.string(),
+      text: z.string(),
+      outerHTML: z.string(),
+      computedStyles: z.record(z.string(), z.string()),
+      boundingRect: z.object({
+        x: z.number(),
+        y: z.number(),
+        width: z.number(),
+        height: z.number(),
+      }),
+      reactSource: z
+        .object({
+          fileName: z.string().nullable(),
+          lineNumber: z.number().nullable(),
+          columnNumber: z.number().nullable(),
+          componentName: z.string().nullable(),
+        })
+        .nullable(),
+      parentChain: z.array(z.string()),
+      children: z.array(z.string()),
+      comment: z.string().optional(),
+      screenshot: AttachmentMetadataSchema.optional(),
+      formatted: z.string(),
+    }),
+  }),
+]);
 const StoredAttachmentsSchema = z.record(z.string(), z.array(z.unknown()));
 
 export interface WorkspaceAttachmentScopeInput {
@@ -198,10 +253,14 @@ export function createWorkspaceAttachmentsStore(
         )
           continue;
         const attachments = values.flatMap((value) => {
-          const parsed = ChatHistoryAttachmentSchema.safeParse(value);
-          return parsed.success && parsed.data.attachment.contextKind === "chat_history"
-            ? [parsed.data]
-            : [];
+          const parsed = WorkspaceAttachmentSchema.safeParse(value);
+          if (!parsed.success) return [];
+          if (
+            parsed.data.kind === "chat_history" &&
+            parsed.data.attachment.contextKind !== "chat_history"
+          )
+            return [];
+          return [parsed.data];
         });
         if (attachments.length > 0) restored[scopeKey] = attachments;
       }
@@ -218,13 +277,13 @@ export function createWorkspaceAttachmentsStore(
   }
   const hydration = hydrate();
 
-  async function writeDraftHistory() {
+  async function writeDraftAttachments() {
     await hydration;
     const persisted = Object.entries(store.getState().attachmentsByScope).flatMap(
       ([key, values]) => {
-        if (!key.startsWith(DRAFT_SCOPE_PREFIX)) return [];
-        const history = values.filter((attachment) => attachment.kind === "chat_history");
-        return history.length > 0 ? [[key, history] as const] : [];
+        return key.startsWith(DRAFT_SCOPE_PREFIX) && values.length > 0
+          ? [[key, values] as const]
+          : [];
       },
     );
     const next = persisted.length > 0 ? JSON.stringify(Object.fromEntries(persisted)) : null;
@@ -235,12 +294,12 @@ export function createWorkspaceAttachmentsStore(
   }
 
   function queueWrite() {
-    writes = writes.then(writeDraftHistory).catch(() => {
+    writes = writes.then(writeDraftAttachments).catch(() => {
       // Keep accepting edits if the storage operation fails.
     });
   }
 
-  return store;
+  return Object.assign(store, { hydration });
 }
 
 export const useWorkspaceAttachmentsStore = createWorkspaceAttachmentsStore();

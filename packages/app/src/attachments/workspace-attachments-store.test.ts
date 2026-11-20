@@ -80,7 +80,7 @@ function chatHistoryAttachment(id: string, text = "Previous chat."): ChatHistory
 }
 
 describe("workspace attachments store", () => {
-  it("restores only draft chat history and removes it from storage when set to empty", async () => {
+  it("restores a recovery draft's history and queued context without restoring workspace scopes", async () => {
     let persisted: string | null = null;
     const storage = {
       getItem: async () => persisted,
@@ -97,6 +97,8 @@ describe("workspace attachments store", () => {
       cwd: "/repo",
     });
     const history = chatHistoryAttachment("history-1");
+    const review = reviewAttachment("Queued review");
+    const context = contextAttachment("queued-comment");
     history.source = {
       serverId: " source-host ",
       agentId: "agent-1",
@@ -105,16 +107,17 @@ describe("workspace attachments store", () => {
     const writer = createWorkspaceAttachmentsStore(storage);
     writer.getState().setWorkspaceAttachments({ scopeKey: workspaceScope, attachments: [history] });
     writer.getState().addWorkspaceAttachment({ scopeKey: draftScope, attachment: history });
-    writer
-      .getState()
-      .addWorkspaceAttachment({ scopeKey: draftScope, attachment: reviewAttachment("ephemeral") });
+    writer.getState().addWorkspaceAttachment({ scopeKey: draftScope, attachment: review });
+    writer.getState().addWorkspaceAttachment({ scopeKey: draftScope, attachment: context });
     await vi.waitFor(() =>
-      expect(JSON.parse(persisted ?? "null")).toEqual({ [draftScope]: [history] }),
+      expect(JSON.parse(persisted ?? "null")).toEqual({ [draftScope]: [history, review, context] }),
     );
 
     const restored = createWorkspaceAttachmentsStore(storage);
     await vi.waitFor(() =>
-      expect(restored.getState().attachmentsByScope).toEqual({ [draftScope]: [history] }),
+      expect(restored.getState().attachmentsByScope).toEqual({
+        [draftScope]: [history, review, context],
+      }),
     );
     const restoredHistory = restored.getState().attachmentsByScope[draftScope]![0]!;
     expect(workspaceAttachmentToSubmitAttachment(restoredHistory)).toMatchObject({

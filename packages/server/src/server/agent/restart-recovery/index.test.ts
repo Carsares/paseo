@@ -8,6 +8,7 @@ import { AgentStorage, parseStoredAgentRecord } from "../agent-storage.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { readPersistedConfig } from "../../persisted-config.js";
 import { createRestartRecovery } from "./index.js";
+import { createLifecyclePreparation } from "./lifecycle-preparation.js";
 
 test("recovery saves intent before normalization, clears before dispatch, and resumes each agent independently", async () => {
   const root = await mkdtemp(join(tmpdir(), "restart-recovery-"));
@@ -32,6 +33,8 @@ test("recovery saves intent before normalization, clears before dispatch, and re
       );
     }
     const dispatched: string[] = [];
+    const stuckDispatchStarted = Promise.withResolvers<void>();
+    const releaseStuckDispatch = Promise.withResolvers<void>();
     const recovery = createRestartRecovery({
       storage,
       settings: () => ({ enabled: true, prompt: "Continue verbatim.\n" }),
@@ -39,7 +42,10 @@ test("recovery saves intent before normalization, clears before dispatch, and re
       dispatch: async (id, prompt) => {
         expect((await storage.get(id))?.resumeOnStartup).toBe(false);
         if (id === "broken") throw new Error("unavailable");
-        if (id === "stuck") return new Promise(() => {});
+        if (id === "stuck") {
+          stuckDispatchStarted.resolve();
+          await releaseStuckDispatch.promise;
+        }
         dispatched.push(id + prompt);
       },
       report: () => {},
@@ -56,8 +62,52 @@ test("recovery saves intent before normalization, clears before dispatch, and re
     const stopped = new AbortController();
     stopped.abort();
     await expect(recovery.waitForResume("stuck", stopped.signal)).rejects.toBeDefined();
+
+    const pauseDelivery = vi.fn(() => undefined);
+    const lifecycle = createLifecyclePreparation({
+      assertStartupRecoverySettled: recovery.assertStartupRecoverySettled,
+      pauseDelivery,
+      pauseRunAdmission: () => () => {},
+      waitForAdmittedRunsToStart: async () => {},
+      capture: (force) => recovery.captureRunningAgents({ force }),
+    });
+    await stuckDispatchStarted.promise;
+    expect((await storage.get("stuck"))?.resumeOnStartup).toBe(false);
+    await expect(lifecycle.prepare(true)).rejects.toThrow("startup recovery is still in progress");
+    expect(pauseDelivery).not.toHaveBeenCalled();
+    releaseStuckDispatch.resolve();
+    await recovery.waitForResume("stuck", running);
+    await expect(lifecycle.prepare(true)).resolves.toBeUndefined();
+    expect(pauseDelivery).toHaveBeenCalledTimes(1);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an ordinary stop leaves time for cleanup when the two admission waits overlap its deadline", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+  const releaseDelivery = vi.fn();
+  const releaseRuns = vi.fn();
+  const capture = vi.fn(async () => {});
+  const lifecycle = createLifecyclePreparation({
+    pauseDelivery: () => ({
+      drained: new Promise<void>((resolve) => setTimeout(resolve, 4_000)),
+      release: releaseDelivery,
+    }),
+    pauseRunAdmission: () => releaseRuns,
+    waitForAdmittedRunsToStart: () => new Promise<void>(() => {}),
+    capture,
+  });
+  try {
+    const stopped = lifecycle.beforeStop(false);
+    const assertion = expect(stopped).rejects.toThrow("settle agent run admissions");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(releaseDelivery).toHaveBeenCalledOnce();
+    expect(releaseRuns).toHaveBeenCalledOnce();
+    expect(capture).not.toHaveBeenCalled();
+    await assertion;
+  } finally {
+    vi.useRealTimers();
   }
 });
 

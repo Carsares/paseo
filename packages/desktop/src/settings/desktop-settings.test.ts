@@ -54,6 +54,30 @@ describe("desktop-settings", () => {
     }
   });
 
+  it("serializes disabling updates with the start of native preparation", async () => {
+    const userDataPath = await createTempUserDataDir();
+    directories.add(userDataPath);
+    const store = createDesktopSettingsStore({ userDataPath });
+    await store.patch({ officialUpdatesEnabled: true });
+    const disabling = store.patch({ officialUpdatesEnabled: false });
+    const declined = store.beginOfficialUpdateInstall();
+    expect((await disabling).officialUpdatesEnabled).toBe(false);
+    expect(await declined).toBeNull();
+
+    await store.patch({ officialUpdatesEnabled: true });
+    const preparing = store.beginOfficialUpdateInstall();
+    await expect(store.patch({ officialUpdatesEnabled: false })).rejects.toThrow(/being prepared/);
+    expect((await createDesktopSettingsStore({ userDataPath }).get()).officialUpdatesEnabled).toBe(
+      true,
+    );
+    const release = await preparing;
+    expect(release).not.toBeNull();
+    release?.();
+    expect((await store.patch({ officialUpdatesEnabled: false })).officialUpdatesEnabled).toBe(
+      false,
+    );
+  });
+
   afterEach(async () => {
     await Promise.all(
       [...directories].map(async (directory) => {

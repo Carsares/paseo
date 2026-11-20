@@ -95,6 +95,7 @@ import { clampWindowStateToWorkAreas, createWindowStateStore } from "./settings/
 import {
   isDesktopManagedDaemonPresentSync,
   isDesktopManagedDaemonRunningSync,
+  prepareBuiltInDaemonForUpdate,
   stopDesktopDaemonViaCli,
 } from "./daemon/daemon-manager.js";
 import {
@@ -108,8 +109,10 @@ import { BrowserKeyboard } from "./features/browser-keyboard/index.js";
 import {
   confirmOfficialUpdateWithoutAgentResume,
   hasDownloadedAppUpdate,
+  hasAcceptedNativeUpdateQuit,
   installAppUpdateOnQuit,
   isMacUpdateQuitInProgress,
+  isNativeUpdateHandoffInProgress,
 } from "./features/auto-updater.js";
 import {
   buildAgentDeepLinkRoute,
@@ -1058,7 +1061,6 @@ const quitLifecycle = createQuitLifecycle({
       settingsStore: getDesktopSettingsStore(),
       isDesktopManagedDaemonRunning: isDesktopManagedDaemonRunningSync,
       isDesktopManagedDaemonPresent: isDesktopManagedDaemonPresentSync,
-      appUpdate: options?.appUpdate,
       preserveWork: options?.preserveWork,
       stopDaemon: async (reason = "quit") => {
         await stopDesktopDaemonViaCli(reason);
@@ -1069,6 +1071,13 @@ const quitLifecycle = createQuitLifecycle({
         if (!options?.preserveWork) showDaemonShutdownDialog();
       },
     }),
+  prepareDaemonForAppUpdate: async () => {
+    const settings = await getDesktopSettingsStore().get();
+    if (settings.daemon.keepRunningAfterQuit) return;
+    if (!isDesktopManagedDaemonPresentSync()) return;
+    showDaemonShutdownDialog();
+    return prepareBuiltInDaemonForUpdate();
+  },
   confirmAppUpdate: async (target, signal) => {
     const settings = await getDesktopSettingsStore().get();
     if (settings.daemon.keepRunningAfterQuit || !isDesktopManagedDaemonPresentSync()) return true;
@@ -1105,10 +1114,14 @@ const quitLifecycle = createQuitLifecycle({
 // electron-updater forwards this event through Electron's built-in autoUpdater.
 electronAutoUpdater.on("before-quit-for-update", () => {
   log.info("[auto-updater] before-quit-for-update", { currentVersion: app.getVersion() });
-  quitLifecycle.handleBeforeQuitForUpdate();
+  if (!isNativeUpdateHandoffInProgress() && !hasAcceptedNativeUpdateQuit()) {
+    quitLifecycle.handleBeforeQuitForUpdate(false);
+  }
 });
 app.on("before-quit", (event) => {
-  if (isMacUpdateQuitInProgress()) quitLifecycle.handleBeforeQuitForUpdate();
+  if (isMacUpdateQuitInProgress() || hasAcceptedNativeUpdateQuit()) {
+    quitLifecycle.handleBeforeQuitForUpdate();
+  }
   quitLifecycle.handleBeforeQuit(event);
 });
 registerExternalQuitSignals({ signals: process, quit: () => app.quit() });

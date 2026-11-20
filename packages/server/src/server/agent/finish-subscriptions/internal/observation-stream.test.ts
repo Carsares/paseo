@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
+import type { DaemonClient, WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
 import type { AgentStreamEvent } from "../../agent-sdk-types.js";
 import {
   HostObservationError,
@@ -175,6 +175,159 @@ test("a terminal event observed after newer work starts waits for that running w
     await observation.close();
   }
 });
+
+test.each([
+  { terminal: "turn_failed", retainedReply: null, nextStatus: "idle", duringOpen: false },
+  {
+    terminal: "turn_failed",
+    retainedReply: "Retained reply",
+    nextStatus: "idle",
+    duringOpen: false,
+  },
+  {
+    terminal: "turn_failed",
+    retainedReply: "Retained reply",
+    nextStatus: "running",
+    duringOpen: false,
+  },
+  { terminal: "turn_completed", retainedReply: null, nextStatus: "running", duringOpen: false },
+  { terminal: "turn_failed", retainedReply: null, nextStatus: "closed", duringOpen: false },
+  {
+    terminal: "turn_failed",
+    retainedReply: "Retained reply",
+    nextStatus: "error",
+    duringOpen: true,
+  },
+] as const)(
+  "remote observation reads the $terminal turn when the next is $nextStatus ($retainedReply)",
+  async ({ terminal, retainedReply, nextStatus, duringOpen }) => {
+    const controller = new AbortController();
+    const initialRead = Promise.withResolvers<void>();
+    const releaseInitialRead = Promise.withResolvers<void>();
+    const baseline = Promise.withResolvers<WaitForFinishResult>();
+    const readingTimeline = Promise.withResolvers<void>();
+    const releaseTimeline = Promise.withResolvers<void>();
+    const makeSnapshot = (status: "running" | "idle" | "error" | "closed") =>
+      buildStoredAgentPayload(
+        {
+          id: "child",
+          cwd: "/tmp",
+          provider: "codex",
+          labels: {},
+          lastStatus: status,
+          createdAt: "2026-01-01",
+          updatedAt: "2026-01-01",
+        },
+        ["codex"],
+        (_provider, own) => own ?? {},
+      );
+    let snapshot = makeSnapshot("running");
+    let listener!: Parameters<ReturnType<DaemonClient["observeTimeline"]>["subscribe"]>[0];
+    const reply = (turnId: string, text: string) => ({
+      turnId,
+      timestamp: "2026-01-01",
+      item: { type: "assistant_message", text },
+    });
+    const client = {
+      observeTimeline: () => ({
+        ready: Promise.resolve(),
+        release: async () => {},
+        subscribe: (value: typeof listener) => {
+          listener = value;
+          return () => {};
+        },
+      }),
+      fetchAgent: async () => {
+        if (duringOpen) {
+          initialRead.resolve();
+          await releaseInitialRead.promise;
+        }
+        return { agent: snapshot };
+      },
+      waitForFinish: async (_agentId: string, timeout: number) =>
+        timeout
+          ? {
+              status: nextStatus === "error" ? "error" : "idle",
+              final: snapshot,
+              lastMessage: "Next reply",
+            }
+          : baseline.promise,
+      fetchAgentTimeline: async () => {
+        readingTimeline.resolve();
+        await releaseTimeline.promise;
+        return {
+          entries: [
+            reply("previous", "Previous reply"),
+            ...(retainedReply ? [reply("observed", retainedReply)] : []),
+            reply("next", "Next reply"),
+          ],
+          hasOlder: false,
+        };
+      },
+      close: async () => {},
+    } as unknown as DaemonClient;
+    const opening = openFinishObservation(
+      createHostObservationResolver({
+        serverId: "origin",
+        local: new Host(),
+        hosts: () => ({
+          directory: async () => ({ self: { serverId: "origin", label: "Origin" }, hosts: [] }),
+          use: async (_server, action) => action(client),
+        }),
+      }),
+      { id: "watch", serverId: "remote", callerAgentId: "parent", childAgentId: "child" },
+      controller.signal,
+    );
+    function emit(event: AgentStreamEvent) {
+      listener.update({
+        type: "agent_stream",
+        payload: { agentId: "child", timestamp: "2026-01-01", event },
+      });
+    }
+    function finishObservedTurn() {
+      emit({ type: "turn_started", provider: "codex", turnId: "observed" });
+      emit({ type: "turn_failed", provider: "codex", turnId: "previous", error: "Stale error" });
+      emit(
+        terminal === "turn_failed"
+          ? { type: terminal, provider: "codex", turnId: "observed", error: "Failed turn" }
+          : { type: terminal, provider: "codex", turnId: "observed" },
+      );
+      snapshot = makeSnapshot(nextStatus);
+      if (nextStatus !== "closed")
+        emit({ type: "turn_started", provider: "codex", turnId: "next" });
+      if (nextStatus === "idle")
+        emit({ type: "turn_completed", provider: "codex", turnId: "next" });
+    }
+    if (duringOpen) {
+      await initialRead.promise;
+      finishObservedTurn();
+      releaseInitialRead.resolve();
+    }
+    const observation = await opening;
+    try {
+      const next = observation.next();
+      if (!duringOpen) finishObservedTurn();
+      await readingTimeline.promise;
+      baseline.resolve({
+        status: "idle",
+        final: makeSnapshot("idle"),
+        lastMessage: "Next reply",
+        error: null,
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      releaseTimeline.resolve();
+      expect(await next).toMatchObject({
+        status: terminal === "turn_failed" ? "error" : "idle",
+        lastMessage: retainedReply,
+        error: terminal === "turn_failed" ? "Failed turn" : null,
+      });
+    } finally {
+      baseline.resolve({ status: "idle", final: snapshot, lastMessage: "Next reply", error: null });
+      releaseTimeline.resolve();
+      await observation.close();
+    }
+  },
+);
 
 test.each([
   { status: "connecting", reason: "connecting" },

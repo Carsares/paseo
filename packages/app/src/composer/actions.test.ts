@@ -446,8 +446,11 @@ describe("dispatchComposerAgentMessage", () => {
 
   it.each([
     { provider: "custom-claude", derivedFromProviderId: "claude", blocked: true },
-    { provider: "custom-codex", derivedFromProviderId: "codex", blocked: false },
-    { provider: "codex", blocked: false },
+    { provider: "custom-codex", derivedFromProviderId: "codex", blocked: true },
+    { provider: "codex", blocked: true },
+    { provider: "opencode", blocked: true },
+    { provider: "pi", blocked: true },
+    { provider: "copilot", blocked: false },
   ])(
     "checks the command boundary for $provider",
     async ({ provider, derivedFromProviderId, blocked }) => {

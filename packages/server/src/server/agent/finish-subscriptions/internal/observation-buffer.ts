@@ -11,6 +11,7 @@ export function createObservationBuffer(signal: AbortSignal) {
   const resolvedBeforeInitial = new Set<string>();
   let initialPending = true;
   let terminal: FinishObservationResult | undefined;
+  let terminalObserved = false;
   let failure: unknown;
   let wake: (() => void) | undefined;
   const abort = () => {
@@ -23,7 +24,10 @@ export function createObservationBuffer(signal: AbortSignal) {
     if (result.status === "permission") {
       for (const request of result.final?.pendingPermissions ?? [])
         if (!delivered.has(request.id)) permissions.set(request.id, result);
-    } else terminal = result;
+    } else if (!terminalObserved) {
+      terminalObserved = true;
+      terminal = result;
+    }
     wake?.();
   }
   return {
@@ -36,7 +40,7 @@ export function createObservationBuffer(signal: AbortSignal) {
         if (pendingPermissions.length)
           push({ ...result, final: { ...result.final, pendingPermissions } });
       } else if (
-        !terminal &&
+        !terminalObserved &&
         result.final?.status !== "running" &&
         result.final?.status !== "initializing"
       )

@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { readFile, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { app, ipcMain, powerMonitor } from "electron";
 import log from "electron-log/main";
@@ -28,6 +29,7 @@ import {
   type AppUpdateCheckIntent,
   type AppReleaseChannel,
 } from "../features/auto-updater.js";
+import type { AppUpdateShutdown } from "../features/app-update-service.js";
 import {
   getBundledCliShimPath,
   getCliInstallStatus,
@@ -354,31 +356,94 @@ async function launchBuiltInDaemon(home: string): Promise<void> {
   });
 }
 
+async function readRecoveryMarkerIdentity(markerPath: string): Promise<string | null> {
+  try {
+    const { dev, ino } = await stat(markerPath, { bigint: true });
+    return `${dev}:${ino}`;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+export async function prepareBuiltInDaemonForUpdate(): Promise<AppUpdateShutdown | undefined> {
+  const home = getPaseoHome();
+  const instance = await readDaemonInstance(home);
+  if (!instance?.desktopManaged) return undefined;
+  return stopBuiltInDaemonForUpdate(home, instance);
+}
+
 async function stopBuiltInDaemonForUpdate(
   home: string,
   instance: DaemonInstance,
-): Promise<(() => Promise<void>) | undefined> {
+): Promise<AppUpdateShutdown | undefined> {
+  const markerPath = path.join(home, "restart-recovery-once.json");
+  // A forced stop replaces the canonical marker. An update must not consume
+  // recovery already requested by another operation.
+  if (await readRecoveryMarkerIdentity(markerPath)) {
+    throw new Error("An agent recovery record is pending. Retry the update after recovery.");
+  }
   const stopped = await stopCapturedDaemon({
     home,
     instance,
     reason: "app_update",
     keepTerminals: keepsTerminalsOnStop("app_update", process.platform),
+    resumeAgents: true,
   });
   if (stopped.action !== "stopped") return undefined;
   if (ownedLaunch?.home === home && isSameDaemonInstance(ownedLaunch.instance, instance)) {
     ownedLaunch = null;
   }
-  return async () => {
-    const running = await readDaemonInstance(home);
-    if (running && !running.desktopManaged) throw new Error("A different daemon is running.");
-    if (!running) await launchBuiltInDaemon(home);
-    const current = await waitForDaemonReady(home, {
-      timeoutMs: 30_000,
-      instance: running ?? undefined,
-    });
-    if (!current.desktopManaged || isSameDaemonInstance(instance, current)) {
-      throw new Error("Replacement built-in daemon was not started.");
-    }
+  const markerAfterStop = await (
+    stopped.requestedAgentResume ? readRecoveryMarkerIdentity(markerPath) : Promise.resolve(null)
+  ).then(
+    (identity) => ({ identity, error: null }),
+    (error: unknown) => ({
+      identity: null,
+      error: new Error("Could not read update recovery record.", { cause: error }),
+    }),
+  );
+  let rollbackMarker: Buffer | undefined;
+  return {
+    async beforeHandoff() {
+      if (markerAfterStop.error) throw markerAfterStop.error;
+      if (await readDaemonInstance(home)) throw new Error("A daemon restarted before the update.");
+      const marker = markerAfterStop.identity;
+      if (!marker) return;
+      const contents = await readFile(markerPath);
+      if (
+        (await readRecoveryMarkerIdentity(markerPath)) !== marker ||
+        (await readDaemonInstance(home))
+      ) {
+        throw new Error("Daemon recovery changed before the update.");
+      }
+      // Only the old version may consume the one-shot record for this stop.
+      await unlink(markerPath);
+      rollbackMarker = contents;
+    },
+    async restore() {
+      const running = await readDaemonInstance(home);
+      if (running && !running.desktopManaged) throw new Error("A different daemon is running.");
+      if (!running) {
+        if (rollbackMarker) {
+          // Another shutdown may have recorded newer intent. Never overwrite it.
+          try {
+            await writeFile(markerPath, rollbackMarker, { flag: "wx" });
+          } catch (error) {
+            if (!(error instanceof Error && "code" in error && error.code === "EEXIST"))
+              throw error;
+          }
+        }
+        await launchBuiltInDaemon(home);
+      }
+      const current = await waitForDaemonReady(home, {
+        timeoutMs: 30_000,
+        instance: running ?? undefined,
+      });
+      if (!current.desktopManaged || isSameDaemonInstance(instance, current)) {
+        throw new Error("Replacement built-in daemon was not started.");
+      }
+    },
   };
 }
 
@@ -436,9 +501,7 @@ export interface StopCapturedDaemonInput {
 }
 
 /** Stops the captured supervisor with the requested preservation options it supports. */
-export async function stopCapturedDaemon(
-  input: StopCapturedDaemonInput,
-): ReturnType<typeof stopDaemonInstance> {
+export async function stopCapturedDaemon(input: StopCapturedDaemonInput) {
   const stopInstance = input.stopInstance ?? stopDaemonInstance;
   const runCliJson = input.runCliJson ?? runExternalCliJsonCommand;
   const logLifecycle = input.log ?? logDesktopDaemonLifecycle;
@@ -466,7 +529,8 @@ export async function stopCapturedDaemon(
   // Each retry drops one option, so there can be at most two retries.
   while (true) {
     try {
-      return await stop(keep, resume);
+      const result = await stop(keep, resume);
+      return { ...result, requestedAgentResume: resume && result.usedLifecycleRpc };
     } catch (error) {
       if (!(error instanceof ExternalCliCommandError)) throw error;
       const version = typeof error.error?.version === "string" ? error.error.version : "unknown";

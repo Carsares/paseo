@@ -143,7 +143,11 @@ class FakeAppUpdateRuntime implements AppUpdateRuntime {
     }
   }
 
-  quitAndInstall({ targetVersion, isSilent, isForceRunAfter }: AppUpdateInstallRequest): void {
+  async quitAndInstall(
+    { targetVersion, isSilent, isForceRunAfter }: AppUpdateInstallRequest,
+    beforeHandoff?: () => Promise<void>,
+  ): Promise<void> {
+    await beforeHandoff?.();
     if (this.downloadedUpdate) {
       this.installedVersions.push(this.downloadedUpdate.version);
       this.installModes.push({ targetVersion, isSilent, isForceRunAfter });
@@ -250,8 +254,11 @@ describe("app update service", () => {
     const installing = service.downloadAndInstallUpdate(input, async (target) => {
       events.push(`stop:${target.version}`);
       await stopped;
-      return async () => {
-        events.push("restart-daemon");
+      return {
+        beforeHandoff: async () => {},
+        restore: async () => {
+          events.push("restart-daemon");
+        },
       };
     });
     await expect.poll(() => events).toEqual(["stop:1.2.4"]);
@@ -269,7 +276,8 @@ describe("app update service", () => {
     const { runtime, service } = createService();
     const events: string[] = [];
     runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
-    runtime.quitAndInstall = async (request) => {
+    runtime.quitAndInstall = async (request, beforeHandoff) => {
+      await beforeHandoff?.();
       events.push(`handoff:${request.targetVersion}`);
       await Promise.resolve();
       throw new Error("Installer refused the update");
@@ -278,13 +286,18 @@ describe("app update service", () => {
       { currentVersion: "1.2.3", releaseChannel: "stable" },
       async (target) => {
         events.push(`stop:${target.version}`);
-        return async () => {
-          events.push("restart-daemon");
+        return {
+          beforeHandoff: async () => {
+            events.push("clear-marker");
+          },
+          restore: async () => {
+            events.push("restart-daemon");
+          },
         };
       },
     );
 
-    expect(events).toEqual(["stop:1.2.4", "handoff:1.2.4", "restart-daemon"]);
+    expect(events).toEqual(["stop:1.2.4", "clear-marker", "handoff:1.2.4", "restart-daemon"]);
     expect(result).toMatchObject({ installed: false, message: expect.stringContaining("refused") });
   });
 

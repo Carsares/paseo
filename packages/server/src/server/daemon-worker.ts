@@ -6,6 +6,7 @@ import { loadConfig } from "./config.js";
 import { resolvePaseoHome } from "./paseo-home.js";
 import { createRootLogger } from "./logger.js";
 import type { DaemonLifecycleIntent } from "./bootstrap.js";
+import { SavedRecoveryTerminalCleanupError } from "./daemon-shutdown-outcome.js";
 import { getProcessDiagnostics } from "./process-diagnostics.js";
 
 process.title = "Paseo Daemon";
@@ -145,6 +146,7 @@ async function main() {
   let exitHookInstalled = false;
   let latchedKeepTerminals = false;
   let latchedResumeAgents = false;
+  let sentKillRestartWithRecovery = false;
 
   applyCliFlagOverrides(config);
 
@@ -165,6 +167,7 @@ async function main() {
       successExitCode?: number;
       keepTerminals?: boolean;
       resumeAgents?: boolean;
+      supervisorWillRetryTerminalCleanup?: boolean;
     },
   ) => {
     const reason = options?.reason ?? `worker_received_${signal}`;
@@ -199,6 +202,14 @@ async function main() {
         } catch (err) {
           clearTimeout(forceExit);
           logger.error({ err }, "Shutdown failed");
+          if (
+            err instanceof SavedRecoveryTerminalCleanupError &&
+            options?.supervisorWillRetryTerminalCleanup
+          ) {
+            // Both old and new supervisors retry cleanup before respawning on a clean exit.
+            // This status confirms the recovery save so that retry can proceed.
+            return 0;
+          }
           return 1;
         }
       })();
@@ -258,6 +269,7 @@ async function main() {
       keepTerminals: fields.keepTerminals,
       resumeAgents: fields.resumeAgents,
     });
+    sentKillRestartWithRecovery = sent && fields.resumeAgents && !fields.keepTerminals;
     recordLifecycleIntentDispatched(intent.type, fields);
     if (sent) {
       return;
@@ -322,6 +334,8 @@ async function main() {
           reason: typeof reason === "string" ? reason : "supervisor_requested_shutdown",
           keepTerminals: keepTerminals === true || latchedKeepTerminals,
           resumeAgents: resumeAgents === true || latchedResumeAgents,
+          supervisorWillRetryTerminalCleanup:
+            sentKillRestartWithRecovery && keepTerminals !== true && resumeAgents !== false,
         });
       }
     });

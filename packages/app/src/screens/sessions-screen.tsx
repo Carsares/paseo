@@ -49,7 +49,6 @@ import type { Theme } from "@/styles/theme";
 import { buildOpenProjectRoute } from "@/utils/host-routes";
 import {
   areAllHistoryWorkspacesCollapsed,
-  buildAllWorkspacesExpansionMap,
   buildHistoryProjectGroups,
   DEFAULT_HISTORY_SORT,
   type HistoryGroupMode,
@@ -519,23 +518,29 @@ function SessionsScreenContent() {
           ...current,
           projectExpandedOverrides: DEFAULT_HISTORY_GROUP_EXPANSION.projectExpandedOverrides,
           workspaceExpandedOverrides: DEFAULT_HISTORY_GROUP_EXPANSION.workspaceExpandedOverrides,
+          workspaceExpandedByDefault: true,
         };
       }
-      const visibleProjects =
-        groupMode === "workspace"
-          ? groups
-          : groups.filter((project) =>
-              isHistoryProjectExpanded(project, current.projectExpandedOverrides),
-            );
-      const workspaceExpandedOverrides = new Map([
-        ...current.workspaceExpandedOverrides,
-        ...buildAllWorkspacesExpansionMap(visibleProjects, false),
-      ]);
-      return { ...current, workspaceExpandedOverrides };
+      const workspaceExpandedOverrides = new Map<string, boolean>();
+      if (groupMode === "project") {
+        for (const project of groups) {
+          if (isHistoryProjectExpanded(project, current.projectExpandedOverrides)) continue;
+          for (const { key } of project.workspaces) {
+            if (current.workspaceExpandedOverrides.get(key) ?? current.workspaceExpandedByDefault) {
+              workspaceExpandedOverrides.set(key, true);
+            }
+          }
+        }
+      }
+      return { ...current, workspaceExpandedOverrides, workspaceExpandedByDefault: false };
     });
   }, [allCollapsed, groupMode, groups]);
   const toggleGroup = useCallback(
-    (group: keyof HistoryGroupExpansion, key: string, expanded: boolean) => {
+    (
+      group: keyof Omit<HistoryGroupExpansion, "workspaceExpandedByDefault">,
+      key: string,
+      expanded: boolean,
+    ) => {
       setExpansion((current) => {
         const overrides = new Map(current[group]);
         overrides.set(key, expanded);

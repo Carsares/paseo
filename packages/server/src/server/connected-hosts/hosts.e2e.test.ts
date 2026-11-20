@@ -3,11 +3,12 @@ import pino from "pino";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { createPaseoApi } from "@getpaseo/client";
 import { createHostClient, createHostChannelTransport } from "@getpaseo/client/node";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import type { HostDirectory } from "@getpaseo/protocol/hosts";
+import { AgentFinishReportSchema } from "@getpaseo/protocol/messages";
 
 const cleanup: (() => Promise<unknown>)[] = [];
 
@@ -2046,8 +2047,8 @@ test(
   },
 );
 
-test.each(["creation", "later prompt"] as const)(
-  "%s registers a one-way host's grandchild follow-up and delivers it after reconnect",
+test.each(["creation", "later prompt", "reverse route", "legacy text then pull"] as const)(
+  "%s delivers a cross-host grandchild follow-up",
   { timeout: 40000 },
   async (when) => {
     const parentPrompts: string[] = [];
@@ -2091,13 +2092,17 @@ test.each(["creation", "later prompt"] as const)(
         provider: "claude/claude-test",
         title: "Lead",
         initialPrompt: "First lead turn",
-        notifyOnFinish: when === "creation",
+        notifyOnFinish: when === "creation" || when === "legacy text then pull",
         settings: { modeId: "full-access" },
       },
     });
     expect(lead.isError, JSON.stringify(lead)).not.toBe(true);
     const leadId = (lead.structuredContent as { agentId: string }).agentId;
-    if (when === "later prompt") {
+    if (when === "reverse route") {
+      await destination.client.waitForFinish(leadId, 5000);
+      await destination.paseo.hosts.add({ connection: `127.0.0.1:${a.port}` });
+      await online(destination.paseo);
+    } else if (when === "later prompt") {
       await destination.client.waitForFinish(leadId, 5000);
       const prompted = await parentTools.callTool({
         name: "send_agent_prompt",
@@ -2105,9 +2110,6 @@ test.each(["creation", "later prompt"] as const)(
       });
       expect(prompted.isError, JSON.stringify(prompted)).not.toBe(true);
     }
-    await expect.poll(() => parentPrompts.length, { timeout: 10000 }).toBe(1);
-    expect(parentPrompts[0]).toContain(`source-agent-id="${leadId}"`);
-
     const storedWatches = async () => {
       const file = join(b.paseoHome, "finish-followup-watches.json");
       try {
@@ -2117,7 +2119,11 @@ test.each(["creation", "later prompt"] as const)(
         throw error;
       }
     };
-    await expect.poll(storedWatches).toHaveLength(1);
+    if (when !== "reverse route") {
+      await expect.poll(() => parentPrompts.length, { timeout: 10000 }).toBe(1);
+      expect(parentPrompts[0]).toContain(`source-agent-id="${leadId}"`);
+      await expect.poll(storedWatches).toHaveLength(1);
+    }
     await origin.paseo.hosts.update(saved.registrationId, { enabled: false });
     const leadTools = await toolsFor(b, leadId);
     const leaf = await leadTools.callTool({
@@ -2138,18 +2144,43 @@ test.each(["creation", "later prompt"] as const)(
           if (error.code === "ENOENT") return [];
           throw error;
         });
+    if (when === "reverse route") {
+      await expect.poll(() => parentPrompts.length, { timeout: 10000 }).toBe(1);
+      expect(parentPrompts[0]).toContain(`source-agent-id="${leadId}"`);
+      expect(parentPrompts[0]).toContain(`source-server-id="${serverId}"`);
+      expect(parentPrompts[0]).toContain('event="finished"');
+      await expect.poll(storedReports).toEqual([]);
+      return;
+    }
     await expect.poll(storedReports, { timeout: 10000 }).toHaveLength(1);
     expect(parentPrompts).toHaveLength(1);
     expect((await destination.paseo.hosts.list()).hosts).toEqual([]);
     const direct = await destination.client.pullAgentFinishReports(leadId, parent.id, []);
     expect(direct).toMatchObject({ ownsChild: false, reports: [], error: expect.any(String) });
 
+    const [stored] = await storedReports();
+    const report = AgentFinishReportSchema.parse(stored?.report);
+    const sendLegacy = () =>
+      origin.client.sendMessage(parent.id, report.prompt, {
+        messageId: report.id,
+        sourceAgentId: leadId,
+        sourceAgentServerId: serverId,
+        activeTurnBehavior: "steer",
+        waitForDispatch: true,
+      });
+    if (when === "legacy text then pull") await sendLegacy();
+
     await origin.paseo.hosts.update(saved.registrationId, { enabled: true });
     await online(origin.paseo);
     await expect.poll(storedReports, { timeout: 15000 }).toEqual([]);
     expect(parentPrompts).toHaveLength(2);
     expect(parentPrompts[1]).toContain(`source-agent-id="${leadId}"`);
-    expect(parentPrompts[1]).toContain('event="finished"');
+    if (when === "legacy text then pull") {
+      expect(parentPrompts[1]).not.toContain('event="finished"');
+    } else {
+      expect(parentPrompts[1]).toContain('event="finished"');
+      await sendLegacy();
+    }
     await destination.client.detachAgent(leadId);
     await expect.poll(storedWatches, { timeout: 10000 }).toEqual([]);
     expect(parentPrompts).toHaveLength(2);
@@ -2203,6 +2234,79 @@ test("only Level-2 remote creation requires destination hierarchy support", asyn
   const ordinary = await tryCreate(parent.id, "Level-1");
   expect(ordinary.isError, JSON.stringify(ordinary)).not.toBe(true);
   expect(b.daemon.agentManager.listAgents()).toHaveLength(1);
+});
+
+test("adoption checks remote descendants even when their completion notifications are disabled", async () => {
+  const a = await daemon({ mcpEnabled: true });
+  const b = await daemon();
+  const c = await daemon();
+  const origin = await api(a);
+  const destination = await api(c);
+  await origin.paseo.hosts.add({ connection: `127.0.0.1:${b.port}` });
+  const registration = await origin.paseo.hosts.add({ connection: `127.0.0.1:${c.port}` });
+  await expect
+    .poll(async () => (await origin.paseo.hosts.list()).hosts.map((host) => host.status))
+    .toEqual(["online", "online"]);
+  const serverId = c.daemon.getServerId();
+  const workspace = await origin.paseo.workspaces.create({
+    source: { kind: "directory", path: a.staticDir },
+  });
+  const remoteWorkspace = await destination.paseo.workspaces.create({
+    source: { kind: "directory", path: c.staticDir },
+  });
+  const config = { provider: "claude/claude-test", modeId: "full-access" };
+  const create = (title: string) => workspace.agents.create({ config, title });
+  const newParent = await create("New parent");
+  const branch = await create("Branch");
+  const child = await create("Local child");
+  const unrelated = await create("Unrelated");
+  await origin.client.setAgentParent(child.id, branch.id);
+
+  const tools = new Client({ name: "adoption-hierarchy", version: "1" });
+  cleanup.push(() => tools.close());
+  await tools.connect(
+    new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${a.port}/mcp/agents?callerAgentId=${child.id}`),
+    ),
+  );
+  const remote = await tools.callTool({
+    name: "create_agent",
+    arguments: {
+      serverId,
+      workspaceId: remoteWorkspace.id,
+      provider: config.provider,
+      title: "Remote grandchild",
+      initialPrompt: "Check files",
+      notifyOnFinish: false,
+      settings: { modeId: config.modeId },
+    },
+  });
+  expect(remote.isError, JSON.stringify(remote)).not.toBe(true);
+  await expect(origin.client.setAgentParent(branch.id, newParent.id)).rejects.toThrow(
+    "while it has subagents on another host",
+  );
+  const remoteAgentId = (remote.structuredContent as { agentId: string }).agentId;
+  await destination.client.archiveAgent(remoteAgentId);
+  await expect(origin.client.setAgentParent(branch.id, newParent.id)).rejects.toThrow(
+    "while it has subagents on another host",
+  );
+  const history = vi
+    .spyOn(c.daemon.agentStorage, "listActive")
+    .mockRejectedValueOnce(new Error("History temporarily unavailable"));
+  try {
+    await expect(origin.client.setAgentParent(unrelated.id, newParent.id)).rejects.toThrow(
+      "a connected host could not be checked",
+    );
+  } finally {
+    history.mockRestore();
+  }
+  await origin.client.setAgentParent(unrelated.id, newParent.id);
+
+  await origin.paseo.hosts.update(registration.registrationId, { enabled: false });
+  await expect(origin.client.setAgentParent(branch.id, newParent.id)).rejects.toThrow(
+    "a connected host could not be checked",
+  );
+  await origin.client.setAgentParent(unrelated.id, branch.id);
 });
 
 test("attach keeps the previous relationship when finish intent cannot be saved", async () => {
@@ -2332,11 +2436,18 @@ test(
 );
 
 test(
-  "a remote child without a mode starts in its same-provider caller's mode",
+  "a remote child inherits the Main Control caller's original same-provider settings",
   { timeout: 30000 },
   async () => {
     const a = await daemon({ mcpEnabled: true });
-    const b = await daemon();
+    const launchedOptions = new Map<string, unknown>();
+    const b = await daemon({
+      agentClients: createTestAgentClients({
+        beforeCreateSession: async (config) => {
+          launchedOptions.set(config.provider, config.providerOptions);
+        },
+      }),
+    });
     const origin = await api(a);
     const destination = await api(b);
     await origin.paseo.hosts.add({ connection: `127.0.0.1:${b.port}` });
@@ -2348,9 +2459,14 @@ test(
       source: { kind: "directory", path: b.staticDir },
     });
     const parent = await workspace.agents.create({
-      config: { provider: "claude/claude-test", modeId: "bypassPermissions" },
+      config: {
+        provider: "claude/claude-test",
+        modeId: "bypassPermissions",
+        options: { disallowedTools: ["Bash"], fast_mode: false },
+      },
       title: "Mode parent",
     });
+    await origin.client.setAgentMainControl(parent.id, true);
     const mcp = new Client({ name: "mode-parent", version: "1" });
     cleanup.push(() => mcp.close());
     await mcp.connect(
@@ -2358,7 +2474,10 @@ test(
         new URL(`http://127.0.0.1:${a.port}/mcp/agents?callerAgentId=${parent.id}`),
       ),
     );
-    const remoteMode = async (provider: string, settings?: { modeId: string }) => {
+    const remoteMode = async (
+      provider: string,
+      settings?: { modeId: string; features?: Record<string, unknown> },
+    ) => {
       const response = await mcp.callTool({
         name: "create_agent",
         arguments: {
@@ -2376,9 +2495,25 @@ test(
     };
 
     expect(await remoteMode("claude/claude-test")).toBe("bypassPermissions");
-    expect(await remoteMode("claude/claude-test", { modeId: "default" })).toBe("default");
+    expect(launchedOptions.get("claude")).toMatchObject({
+      disallowedTools: ["Bash"],
+      fast_mode: false,
+    });
+    expect(
+      await remoteMode("claude/claude-test", { modeId: "default", features: { fast_mode: true } }),
+    ).toBe("default");
+    expect(launchedOptions.get("claude")).toMatchObject({
+      disallowedTools: ["Bash"],
+      fast_mode: true,
+    });
     // Another provider's modes are unknown here, so the destination applies its own default.
     expect(await remoteMode("codex/gpt-5.4")).toBeNull();
+    expect(launchedOptions.get("codex")).not.toEqual(
+      expect.objectContaining({ disallowedTools: expect.anything() }),
+    );
+    expect(launchedOptions.get("codex")).not.toEqual(
+      expect.objectContaining({ fast_mode: expect.anything() }),
+    );
   },
 );
 

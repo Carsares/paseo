@@ -1246,9 +1246,9 @@ export class VoiceAssistantWebSocketServer {
     }
   }
 
-  public async close(): Promise<void> {
+  public async close(options?: { waitForAgentMessages?: boolean }): Promise<void> {
     this.prepareForShutdown();
-    await this.agentMessages.close();
+    if (options?.waitForAgentMessages !== false) await this.agentMessages.close();
     await this.connectedHosts.close();
     this.unsubscribeSpeechReadiness?.();
     this.unsubscribeSpeechReadiness = null;
@@ -1729,7 +1729,8 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private createSocketSession(options: SocketSessionOptions): Session {
-    return new Session({
+    let session!: Session;
+    session = new Session({
       connectedHosts: this.connectedHosts,
       getConnectedHostBufferedAmount: () => {
         let total = 0;
@@ -1742,6 +1743,9 @@ export class VoiceAssistantWebSocketServer {
         return total;
       },
       sourceId: options.sourceId,
+      authenticateAgentNotificationEvent: (sourceAgentServerId) =>
+        session.delivery.currentSource instanceof VirtualHostSocket &&
+        this.canAcceptAgentNotificationEvent(session, sourceAgentServerId),
       browserToolsBroker: this.browserToolsBroker,
       clientId: options.clientId,
       appVersion: options.appVersion,
@@ -1839,6 +1843,7 @@ export class VoiceAssistantWebSocketServer {
       daemonRuntimeConfig: this.daemonRuntimeConfig,
       getWebSocketRuntimeMetrics: () => this.lastRuntimeMetricsSnapshot,
     });
+    return session;
   }
 
   private clearPendingConnection(ws: WebSocketLike): PendingConnection | null {
@@ -2313,6 +2318,8 @@ export class VoiceAssistantWebSocketServer {
         agentMessageProvenance: true,
         agentMessageBatching: true,
         agentMessageDispatchConfirmation: true,
+        // COMPAT(agentNotificationEvents): added in v0.16.0, remove after 2027-05-19.
+        agentNotificationEvents: true,
         agentFinishReportPull: this.finishSubscriptions !== undefined,
         // COMPAT(stableProjectIdentity): added in v0.1.109, remove gate after 2027-01-15.
         stableProjectIdentity: true,
@@ -2830,6 +2837,16 @@ export class VoiceAssistantWebSocketServer {
         await receipt.dispatched;
       },
     });
+  }
+
+  private canAcceptAgentNotificationEvent(session: Session, sourceAgentServerId: string): boolean {
+    const source = session.getHostSourceId().split(":");
+    if (!this.canPullFinishReports(session, true, source)) return false;
+    try {
+      return decodeURIComponent(source[2]!) === sourceAgentServerId;
+    } catch {
+      return false;
+    }
   }
 
   private canPullFinishReports(session: Session, routedSource: boolean, source: string[]): boolean {

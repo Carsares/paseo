@@ -43,6 +43,13 @@ interface Dependencies {
   /** Return a cancellation function. Production uses the daemon's event loop. */
   schedule?: (delayMs: number, callback: () => void) => () => void;
 }
+export class AgentMessageAdmissionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AgentMessageAdmissionError";
+  }
+}
+
 export interface AgentMessageDelivery {
   enqueue(message: Message): Receipt;
   /** Queued messages and provider dispatches still owned by this recipient. */
@@ -158,8 +165,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   return {
     hasPending: (recipientId) => pending.has(recipientId) || dispatching.has(recipientId),
     enqueue(message) {
-      if (closed) throw new Error("Agent message delivery is closed");
-      if (admissionPaused) throw new Error("Agent message delivery is preparing for shutdown");
+      if (closed) throw new AgentMessageAdmissionError("Agent message delivery is closed");
+      if (admissionPaused)
+        throw new AgentMessageAdmissionError("Agent message delivery is preparing for shutdown");
       let resolve!: Admitted["resolve"];
       let reject!: Admitted["reject"];
       const dispatched = new Promise<PromptDispatchDisposition>((accepted, failed) => {

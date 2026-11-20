@@ -240,10 +240,11 @@ export function createDesktopSettingsStore({
   userDataPath,
 }: {
   userDataPath: string;
-}): DesktopSettingsStore {
+}): DesktopSettingsStore & { beginOfficialUpdateInstall(): Promise<(() => void) | null> } {
   const filePath = path.join(userDataPath, DESKTOP_SETTINGS_FILENAME);
   let cachedDocument: PersistedDesktopSettingsDocument | null = null;
   let operationQueue: Promise<void> = Promise.resolve();
+  let officialUpdateInstallInProgress = false;
 
   function runSerialized<T>(operation: () => Promise<T>): Promise<T> {
     const queued = operationQueue.then(operation);
@@ -298,10 +299,30 @@ export function createDesktopSettingsStore({
       return runSerialized(async () => toDesktopSettings((await loadDocument()).settings));
     },
 
-    patch(patch) {
+    beginOfficialUpdateInstall() {
+      return runSerialized(async () => {
+        if (
+          officialUpdateInstallInProgress ||
+          !(await loadDocument()).settings.officialUpdatesEnabled
+        ) {
+          return null;
+        }
+        officialUpdateInstallInProgress = true;
+        return () => {
+          officialUpdateInstallInProgress = false;
+        };
+      });
+    },
+
+    patch(patch: unknown) {
       return runSerialized(async () => {
         const current = await loadDocument();
         const coercedPatch = coerceDesktopSettingsPatch(patch);
+        if (coercedPatch.officialUpdatesEnabled === false && officialUpdateInstallInProgress) {
+          throw new Error(
+            "An official update is being prepared for installation. Try again after it finishes.",
+          );
+        }
         const next = mergeDesktopSettings(current.settings, coercedPatch);
         await persistDocument({
           ...current,
@@ -317,7 +338,7 @@ export function createDesktopSettingsStore({
       });
     },
 
-    migrateLegacyRendererSettings(legacySettings) {
+    migrateLegacyRendererSettings(legacySettings: unknown) {
       return runSerialized(async () => {
         const current = await initializeLegacyRendererMigration();
         if (current.migrations.legacyRendererSettingsImported) {

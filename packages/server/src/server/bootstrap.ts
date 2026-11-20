@@ -165,6 +165,7 @@ import {
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import { ScheduleService } from "./schedule/service.js";
 import { DaemonConfigStore, type MutableDaemonConfig } from "./daemon-config-store.js";
+import { SavedRecoveryTerminalCleanupError } from "./daemon-shutdown-outcome.js";
 import { createOrchestrationSkills } from "./orchestration-skills/index.js";
 import {
   resolveReloadableConfig,
@@ -1025,6 +1026,7 @@ export async function createPaseoDaemon(
   });
   const initialAgentManagerState = providerSnapshotManager.getAgentManagerProviderState();
   const agentManager = new AgentManager({
+    serverId,
     pluginLifecycle: pluginRuntime,
     pluginAgentTools: pluginRuntime,
     clients: initialAgentManagerState.clients,
@@ -1072,6 +1074,7 @@ export async function createPaseoDaemon(
   });
   await restartRecovery.prepareStartup();
   const lifecyclePreparation = createLifecyclePreparation({
+    assertStartupRecoverySettled: restartRecovery.assertStartupRecoverySettled,
     pauseDelivery: () => wsServer?.agentMessages.pauseAdmission(),
     pauseRunAdmission: () => agentManager.pauseRunAdmission(),
     waitForAdmittedRunsToStart: () => agentManager.waitForAdmittedRunsToStart(),
@@ -2013,9 +2016,19 @@ export async function createPaseoDaemon(
   const stop = async (options?: { keepTerminals?: boolean; resumeAgents?: boolean }) => {
     const keepTerminals = options?.keepTerminals === true;
     const resumeAgents = options?.resumeAgents === true;
+    let recoveryPreparationFailed = false;
     let terminalShutdownError: unknown = null;
     // Lifecycle requests save recovery before acknowledgement. Signal-driven stops prepare here.
-    await lifecyclePreparation.beforeStop(resumeAgents);
+    try {
+      await lifecyclePreparation.beforeStop(resumeAgents);
+    } catch (error) {
+      if (resumeAgents) throw error;
+      recoveryPreparationFailed = true;
+      logger.warn(
+        { err: error },
+        "Failed to prepare agent recovery during shutdown; continuing cleanup",
+      );
+    }
     localCredential = null;
     await deleteLocalCredential(config.paseoHome);
     // Stop tracking plugin provider registrations before anything tears plugins
@@ -2032,7 +2045,13 @@ export async function createPaseoDaemon(
     // Freeze both ingress and registration before taking the agent closure snapshot.
     wsServer?.prepareForShutdown();
     await finishSubscriptions.close();
-    await wsServer?.agentMessages.close();
+    const deliveryClosed = wsServer?.agentMessages.close();
+    // If recovery preparation timed out on dispatch, provider shutdown may be what unblocks it.
+    if (recoveryPreparationFailed) {
+      void deliveryClosed?.catch((error) =>
+        logger.warn({ err: error }, "Failed to close agent message delivery"),
+      );
+    } else await deliveryClosed;
     agentManager.prepareForShutdown();
     await closeAllAgents(logger, agentManager);
     await withTimeout({
@@ -2055,15 +2074,15 @@ export async function createPaseoDaemon(
     } catch (error) {
       // Finish the rest of the shutdown, then report it: the supervisor and `daemon stop`
       // retry the cleanup from the record the reaper kept.
-      terminalShutdownError = error;
+      terminalShutdownError =
+        resumeAgents && !keepTerminals ? new SavedRecoveryTerminalCleanupError(error) : error;
       logger.error({ err: error }, "Terminal shutdown failed");
     }
     await speechService.stop();
     await scheduleService.stop().catch(() => undefined);
     await relayRuntime?.stop().catch(() => undefined);
-    if (wsServer) {
-      await wsServer.close();
-    }
+    // Message delivery has already been closed above.
+    await wsServer?.close({ waitForAgentMessages: false });
     await serviceProxy.stopStandalone();
     // Force-drop remaining sockets so httpServer.close() resolves promptly.
     // We've already closed wsServer (which sent ws-layer close frames) and

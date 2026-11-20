@@ -2,7 +2,7 @@ import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import { isMainControlAgent } from "@getpaseo/protocol/agent-labels";
+import { getParentAddressFromLabels, isMainControlAgent } from "@getpaseo/protocol/agent-labels";
 import type { TFunction } from "i18next";
 import { SquarePen } from "lucide-react-native";
 import React, {
@@ -29,6 +29,7 @@ import { FileDropZone } from "@/components/file-drop/file-drop-zone";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { RetainedChatContent } from "./retained-chat-content";
 import { Composer } from "@/composer";
+import { isHandoffInputLocked } from "@/composer/handoff-input-lock";
 import { AgentCommandsProvider } from "@/agent-commands";
 import {
   useComposerEditingSession,
@@ -1117,6 +1118,10 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   const isComposerFullscreen = useComposerFullscreen(composerEditingSession);
   const hasActiveComposer = !agentState.archivedAt && !isArchivingCurrentAgent;
   const parentAgentId = useParentAgentId(serverId, agentId);
+  const isSubagent = useSessionStore((state) => {
+    const agent = resolveChatAgentFromSession(state, serverId, agentId);
+    return Boolean(agent && getParentAddressFromLabels(agent.labels, serverId));
+  });
   // With a composer the parent is a pill above it; without one, the box takes the composer's place.
   const parentPillAgentId = showsComposer ? parentAgentId : null;
   const rawAgentInputDraft = useAgentInputDraft({
@@ -1208,11 +1213,12 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       showsComposer && hasActiveComposer && !draft
         ? {
             addQuoteAttachment: (quoteText: string) => {
+              if (isHandoffInputLocked(serverId, agentId)) return;
               setAttachments((prev) => appendQuoteAttachment(prev, quoteText));
             },
           }
         : null,
-    [setAttachments, draft, hasActiveComposer, showsComposer],
+    [agentId, serverId, setAttachments, draft, hasActiveComposer, showsComposer],
   );
   const streamContent = (
     <View
@@ -1222,7 +1228,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       {showsComposer ? null : <SheetAgentFacts serverId={serverId} agentId={agentId} />}
       <RenderProfile id={`AgentStreamSection:${agentId}`}>
         <AgentStreamSection
-          parentAgentId={parentAgentId}
+          isSubagent={isSubagent}
           streamViewRef={streamViewRef}
           serverId={serverId}
           agentId={agentId}
@@ -1411,7 +1417,7 @@ function SheetAgentFacts({ serverId, agentId }: { serverId: string; agentId: str
 }
 
 const AgentStreamSection = memo(function AgentStreamSection({
-  parentAgentId,
+  isSubagent,
   streamViewRef,
   serverId,
   agentId,
@@ -1426,7 +1432,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
   quoteTarget,
   onOpenWorkspaceFile,
 }: {
-  parentAgentId: string | null;
+  isSubagent: boolean;
   streamViewRef: React.RefObject<AgentStreamViewHandle | null>;
   serverId: string;
   agentId?: string;
@@ -1535,7 +1541,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
         toast={toast}
         pendingMessageSubmissions={pendingMessageSubmissions}
         turnPresentation={turnPresentation}
-        showAgentInteractions={parentAgentId !== null ? true : undefined}
+        showAgentInteractions={isSubagent ? true : undefined}
         onOpenWorkspaceFile={onOpenWorkspaceFile}
       />
     </ComposerQuoteProvider>

@@ -51,6 +51,7 @@ export interface OpenForkSourceAgentInput {
   serverId: string | undefined;
   sourceAgentId: string | undefined;
   onNotFound?: () => void;
+  onHostRemoved?: () => void;
   onError?: (error: unknown) => void;
 }
 
@@ -60,6 +61,8 @@ interface ForkSourceAgentLookup {
 }
 
 export interface OpenForkSourceAgentDeps {
+  isHostRemoved: (serverId: string) => boolean;
+  isHostOffline: (serverId: string) => boolean;
   readCachedAgent: (input: { serverId: string; agentId: string }) => ForkSourceAgentLookup;
   fetchRemoteAgent?: (input: {
     serverId: string;
@@ -81,6 +84,12 @@ export async function resolveOpenForkSourceAgent(
   if (!serverId || !agentId) {
     return false;
   }
+  const checkHostRemoved = () => {
+    if (!deps.isHostRemoved(serverId)) return false;
+    input.onHostRemoved?.();
+    return true;
+  };
+  if (checkHostRemoved()) return false;
 
   const cached = deps.readCachedAgent({ serverId, agentId });
   if (cached.found) {
@@ -94,18 +103,22 @@ export async function resolveOpenForkSourceAgent(
     return true;
   }
 
-  if (!deps.fetchRemoteAgent) {
+  const openHostAgentRoute = () => {
     deps.navigate({ serverId, agentId, pin: true, asTab: true });
     return true;
-  }
+  };
+  if (!deps.fetchRemoteAgent || deps.isHostOffline(serverId)) return openHostAgentRoute();
 
   let remote: ForkSourceAgentLookup;
   try {
     remote = await deps.fetchRemoteAgent({ serverId, agentId });
   } catch (error) {
+    if (checkHostRemoved()) return false;
+    if (deps.isHostOffline(serverId)) return openHostAgentRoute();
     input.onError?.(error);
     return false;
   }
+  if (checkHostRemoved()) return false;
   if (!remote.found) {
     input.onNotFound?.();
     return false;

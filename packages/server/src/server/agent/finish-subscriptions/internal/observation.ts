@@ -39,15 +39,21 @@ export function createFinishObservation(input: {
                   agentManager.effectiveOptionsFor(provider, own),
                 )
               : null,
-            lastMessage: await agentManager.getLastAssistantMessage(agentId),
+            lastMessage: await agentManager.getCompletionAssistantMessage(
+              agentId,
+              null,
+              stored?.lastStatus ?? "idle",
+              stored?.lastError,
+            ),
             error: stored?.lastError ?? null,
           };
         }
         const result = await agentManager.waitForAgentEvent(agentId, {
           signal,
           waitForActive: true,
+          completionResponse: true,
         });
-        const current = agentManager.getAgent(agentId);
+        const current = result.completionSnapshot;
         const status = result.permission ? "permission" : result.status;
         return {
           status: status === "permission" || status === "error" ? status : "idle",
@@ -62,49 +68,63 @@ export function createFinishObservation(input: {
         await input.waitForResume(agentId, signal);
         const stored = await agentStorage.get(agentId);
         let updates = Promise.resolve();
-        const publish = (snapshot: AgentSnapshotPayload | null, event?: AgentStreamEvent) => {
-          updates = updates
-            .then(async () =>
-              handler(snapshot, event, await agentManager.getLastAssistantMessage(agentId)),
-            )
+        const publish = (
+          snapshot: AgentSnapshotPayload,
+          event: AgentStreamEvent | undefined,
+          lastMessage: string | null | Promise<string | null>,
+        ) => {
+          updates = Promise.all([updates, lastMessage])
+            .then(([, message]) => handler(snapshot, event, message))
             .catch(onError);
         };
         signal.throwIfAborted();
         const unsubscribe = agentManager.subscribe(
           (event) => {
-            if (event.type === "agent_state" && event.agent.lifecycle !== "idle")
-              publish(toAgentPayload(event.agent, { title: stored?.title }));
-            else if (
-              event.type === "agent_stream" &&
-              [
-                "permission_requested",
-                "permission_resolved",
-                "turn_started",
-                "turn_completed",
-                "turn_canceled",
-                "turn_failed",
-              ].includes(event.event.type)
-            ) {
+            if (event.type === "agent_state") {
+              const status = event.agent.lifecycle;
+              if (status === "closed") {
+                publish(
+                  toAgentPayload(event.agent, { title: stored?.title }),
+                  undefined,
+                  agentManager.getCompletionAssistantMessage(agentId, event.agent, status),
+                );
+              } else if (
+                status === "error" &&
+                event.agent.lastTurnCompletion?.event.type !== "turn_failed"
+              ) {
+                publish(toAgentPayload(event.agent, { title: stored?.title }), undefined, null);
+              }
+              return;
+            }
+            if (event.type === "agent_stream") {
+              const streamEvent = event.event;
+              if (
+                streamEvent.type !== "turn_completed" &&
+                streamEvent.type !== "turn_failed" &&
+                streamEvent.type !== "turn_canceled" &&
+                streamEvent.type !== "permission_requested" &&
+                streamEvent.type !== "permission_resolved"
+              )
+                return;
               const current = agentManager.getAgent(agentId);
-              if (current) publish(toAgentPayload(current, { title: stored?.title }), event.event);
+              if (!current) return;
+              const completion = current.lastTurnCompletion;
+              const snapshot = toAgentPayload(current, { title: stored?.title });
+              if (completion?.event === streamEvent) {
+                publish(snapshot, streamEvent, completion.lastMessage);
+              } else if (streamEvent.type === "permission_requested") {
+                publish(
+                  snapshot,
+                  streamEvent,
+                  agentManager.getCompletionAssistantMessage(agentId, current, current.lifecycle),
+                );
+              } else if (streamEvent.type === "permission_resolved") {
+                publish(snapshot, streamEvent, null);
+              }
             }
           },
           { agentId, replayState: false },
         );
-        const current = agentManager.getAgent(agentId);
-        if (current)
-          publish(toAgentPayload(current, { title: stored?.title }), {
-            type: "turn_started",
-            provider: current.provider,
-          });
-        else
-          publish(
-            stored
-              ? buildStoredAgentPayload(stored, [stored.provider], (provider, own) =>
-                  agentManager.effectiveOptionsFor(provider, own),
-                )
-              : null,
-          );
         const stop = () => unsubscribe();
         signal.addEventListener("abort", stop, { once: true });
         return async () => {

@@ -134,6 +134,8 @@ describe("resolveOpenForkSourceAgent", () => {
     const navigations: NavigateToAgentInput[] = [];
     const fetches: string[] = [];
     const deps: OpenForkSourceAgentDeps = {
+      isHostRemoved: () => false,
+      isHostOffline: () => false,
       readCachedAgent: () => ({ found: false }),
       navigate: (input) => {
         navigations.push(input);
@@ -169,6 +171,37 @@ describe("resolveOpenForkSourceAgent", () => {
     ]);
     await expect(pending).resolves.toBe(true);
     expect(fetches).toEqual([]);
+  });
+
+  it("stays on the current tab when the host has been removed even with a cached agent", async () => {
+    const onHostRemoved = vi.fn();
+    const { deps, navigations } = createForkDeps({
+      isHostRemoved: () => true,
+      readCachedAgent: () => ({ found: true, workspaceId: "workspace-2" }),
+    });
+    await expect(
+      resolveOpenForkSourceAgent(
+        { serverId: SERVER_ID, sourceAgentId: AGENT_ID, onHostRemoved },
+        deps,
+      ),
+    ).resolves.toBe(false);
+    expect(onHostRemoved).toHaveBeenCalledOnce();
+    expect(navigations).toEqual([]);
+  });
+
+  it("opens the host route for a registered offline host even if its client still exists", async () => {
+    const fetchRemoteAgent = vi.fn();
+    const { deps, navigations } = createForkDeps({
+      isHostOffline: () => true,
+      fetchRemoteAgent,
+    });
+    expect(
+      await resolveOpenForkSourceAgent({ serverId: SERVER_ID, sourceAgentId: AGENT_ID }, deps),
+    ).toBe(true);
+    expect(navigations).toEqual([
+      { serverId: SERVER_ID, agentId: AGENT_ID, pin: true, asTab: true },
+    ]);
+    expect(fetchRemoteAgent).not.toHaveBeenCalled();
   });
 
   it("fetches an uncached agent and navigates with the fetched workspace", async () => {

@@ -18,6 +18,8 @@ interface SendMessageInput {
    * the message; a failure before that call proves nothing was submitted and leaves no receipt.
    */
   send: (beforeDispatch: () => Promise<void>) => Promise<void>;
+  /** Admission was refused before the message could enter the delivery queue. */
+  retryIfNotAdmitted?: (error: unknown) => boolean;
   /** Only errors that prove the provider never received the message may clear a pending receipt. */
   retryIfUnsent?: (error: unknown) => boolean;
 }
@@ -68,7 +70,8 @@ export class MessageReceipts {
         return pending;
       });
     } catch (error) {
-      if (pending && input.retryIfUnsent?.(error)) await rm(file, { force: true });
+      if (pending && (input.retryIfNotAdmitted?.(error) || input.retryIfUnsent?.(error)))
+        await rm(file, { force: true });
       throw error;
     }
     if (input.retryIfUnsent) this.awaitingCommit.set(key, receipt);

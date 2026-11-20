@@ -3,12 +3,11 @@ import { DaemonClient, type DaemonTransport } from "@getpaseo/client/internal/da
 import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import type { ProjectedTimelineForwardFetchPlan } from "./timeline-sync-plan";
 import {
-  consumeForcedTimelineTailReplacement,
   createTimelineReplica,
   createViewedTimelineOwner,
   createViewedTimelineSync,
   FRESHNESS_CHECK_QUIET_MS,
-  type TimelineResponsePayload,
+  type TimelinePageResult,
   type ViewedTimelineStatus,
   type ViewedTimelineSyncPorts,
 } from "./viewed-timeline-sync";
@@ -45,7 +44,9 @@ interface TimelineCurrentReport {
 interface TimelineFetch {
   agentId: string;
   request: ProjectedTimelineForwardFetchPlan;
-  respond(input: { hasNewer: boolean; seq?: number }): void;
+  forceTailReplacement: boolean;
+  canApply(page: TimelinePageResult): boolean;
+  respond(input: { hasNewer: boolean; seq?: number; epoch?: string }): void;
   fail(message: string): void;
 }
 
@@ -140,7 +141,6 @@ class TimelineWorld {
   readonly releasedMemberships: string[][] = [];
   readonly cursors = new Map<string, { epoch: string; endSeq: number }>();
   readonly cacheRequests: string[] = [];
-  readonly forcedTimelineTailReplacements = new Set<string>();
   readonly reportedCurrent: TimelineCurrentReport[] = [];
   cacheGate: Deferred<void> | null = null;
   readonly sync = createViewedTimelineSync({
@@ -181,37 +181,15 @@ class TimelineWorld {
       };
     },
     readCursor: (agentId) => this.cursors.get(agentId),
-    fetchPage: async (agentId, request) => {
-      const result = deferred<{
-        hasNewer: boolean;
-        endCursor: { epoch: string; seq: number } | null;
-      }>();
-      this.fetches.push({
+    fetchPage: (agentId, request, canApply) =>
+      this.fetchTimeline(agentId, request, canApply, false),
+    fetchLatestTail: (agentId, canApply) =>
+      this.fetchTimeline(
         agentId,
-        request,
-        respond: ({ hasNewer, seq = 1 }) =>
-          result.resolve({
-            hasNewer,
-            endCursor: { epoch: `epoch-${agentId}`, seq },
-          }),
-        fail: (message) => result.reject(new Error(message)),
-      });
-      this.releaseFetchWaiters();
-      return result.promise;
-    },
-    fetchLatestTail: async (agentId) => {
-      this.forcedTimelineTailReplacements.add(agentId);
-      try {
-        return await this.fetchTimeline(agentId, {
-          direction: "tail",
-          limit: 40,
-          projection: "projected",
-          wholeTurns: true,
-        });
-      } finally {
-        this.forcedTimelineTailReplacements.delete(agentId);
-      }
-    },
+        { direction: "tail", limit: 40, projection: "projected", wholeTurns: true },
+        canApply,
+        true,
+      ),
     reportError: (error) => {
       this.errors.push(error instanceof Error ? error.message : String(error));
       const waiter = this.errorWaiters.shift();
@@ -242,10 +220,6 @@ class TimelineWorld {
     return this.fetches.length;
   }
 
-  applyTimelineResponse(payload: TimelineResponsePayload): TimelineResponsePayload {
-    return consumeForcedTimelineTailReplacement(payload, this.forcedTimelineTailReplacements);
-  }
-
   nextCacheRequest(): Promise<string> {
     const request = this.cacheRequests.at(-1);
     if (request) return Promise.resolve(request);
@@ -255,16 +229,17 @@ class TimelineWorld {
   private fetchTimeline(
     agentId: string,
     request: ProjectedTimelineForwardFetchPlan,
-  ): Promise<{ hasNewer: boolean; endCursor: { epoch: string; seq: number } | null }> {
-    const result = deferred<{
-      hasNewer: boolean;
-      endCursor: { epoch: string; seq: number } | null;
-    }>();
+    canApply: TimelineFetch["canApply"],
+    forceTailReplacement: boolean,
+  ): Promise<TimelinePageResult> {
+    const result = deferred<TimelinePageResult>();
     this.fetches.push({
       agentId,
       request,
-      respond: ({ hasNewer, seq = 1 }) =>
-        result.resolve({ hasNewer, endCursor: { epoch: `epoch-${agentId}`, seq } }),
+      forceTailReplacement,
+      canApply,
+      respond: ({ hasNewer, seq = 1, epoch = `epoch-${agentId}` }) =>
+        result.resolve({ epoch, hasNewer, endCursor: seq === 0 ? null : { epoch, seq } }),
       fail: (message) => result.reject(new Error(message)),
     });
     this.releaseFetchWaiters();
@@ -396,26 +371,7 @@ test("falls back to the latest tail when a restored cursor has more than one cat
     projection: "projected",
     wholeTurns: true,
   });
-  expect(
-    world.applyTimelineResponse({
-      requestId: "fallback-tail",
-      agentId: "agent-a",
-      agent: null,
-      direction: "tail",
-      projection: "projected",
-      epoch: "epoch-agent-a",
-      reset: false,
-      staleCursor: false,
-      gap: false,
-      window: { minSeq: 43, maxSeq: 82, nextSeq: 83 },
-      startCursor: { epoch: "epoch-agent-a", seq: 43 },
-      endCursor: { epoch: "epoch-agent-a", seq: 82 },
-      hasOlder: true,
-      hasNewer: false,
-      entries: [],
-      error: null,
-    }).reset,
-  ).toBe(true);
+  expect(fallback.forceTailReplacement).toBe(true);
   fallback.respond({ hasNewer: false });
 });
 
@@ -450,7 +406,7 @@ test("retries a forced timeline replacement after a transient fetch failure", as
   world.show("workspace", ["agent-a"]);
   (await world.nextMembership()).succeed();
   const initial = await world.nextFetch("agent-a");
-  world.sync.requestReplacement("agent-a");
+  world.sync.requestReplacement("agent-a", "new-epoch");
   world.sync.recoverGap("agent-a", { epoch: "old-epoch", endSeq: 9 });
   world.expectNoPendingFetch();
   initial.respond({ hasNewer: false });
@@ -461,28 +417,111 @@ test("retries a forced timeline replacement after a transient fetch failure", as
   const retry = await world.nextFetch("agent-a");
   expect(retry.request.direction).toBe("tail");
   expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("pending");
-  expect(
-    world.applyTimelineResponse({
-      requestId: "replacement",
-      agentId: "agent-a",
-      agent: null,
-      direction: "tail",
-      projection: "projected",
-      epoch: "new-epoch",
-      reset: false,
-      staleCursor: false,
-      gap: false,
-      window: { minSeq: 1, maxSeq: 0, nextSeq: 1 },
-      startCursor: null,
-      endCursor: null,
-      hasOlder: false,
-      hasNewer: false,
-      entries: [],
-      error: null,
-    }).reset,
-  ).toBe(true);
-  retry.respond({ hasNewer: false });
+  expect(retry.forceTailReplacement).toBe(true);
+  retry.respond({ hasNewer: false, epoch: "new-epoch", seq: 0 });
   await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+  world.expectNoPendingFetch();
+  world.sync.dispose();
+});
+
+test.each(["first-rewind", "second-rewind"])(
+  "coalesces replacement notifications using the epoch returned by the in-flight tail (%s)",
+  async (firstResponseEpoch) => {
+    const world = new TimelineWorld();
+    const agentId = "agent-a";
+    world.sync.setConnected(true);
+    world.show("workspace", [agentId]);
+    (await world.nextMembership()).succeed();
+    (await world.nextFetch(agentId)).respond({ hasNewer: false });
+    await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus(agentId)).toBe("ready"));
+
+    world.sync.requestReplacement(agentId, "first-rewind");
+    const first = await world.nextFetch(agentId);
+    world.sync.requestReplacement(agentId, "second-rewind");
+    world.sync.requestReplacement(agentId, "second-rewind");
+    world.sync.requestReplacement(agentId, "first-rewind");
+    world.expectNoPendingFetch();
+    expect(first.canApply({ epoch: firstResponseEpoch, hasNewer: false, endCursor: null })).toBe(
+      firstResponseEpoch === "second-rewind",
+    );
+    first.respond({ hasNewer: false, epoch: firstResponseEpoch, seq: 0 });
+
+    if (firstResponseEpoch === "first-rewind") {
+      await vi.waitFor(() => expect(world.pendingFetchCount).toBe(1));
+      expect(world.sync.getAgentTimelineStatus(agentId)).toBe("pending");
+      const followUp = await world.nextFetch(agentId);
+      expect(followUp.request.direction).toBe("tail");
+      followUp.respond({ hasNewer: false, epoch: "second-rewind", seq: 0 });
+    }
+
+    await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus(agentId)).toBe("ready"));
+    world.sync.requestReplacement(agentId, "second-rewind");
+    world.expectNoPendingFetch();
+    world.sync.dispose();
+  },
+);
+
+test("does not refetch when the initial catch-up already includes a notified replacement", async () => {
+  const world = new TimelineWorld();
+  const agentId = "agent-a";
+  world.sync.setConnected(true);
+  world.show("workspace", [agentId]);
+  (await world.nextMembership()).succeed();
+  const initial = await world.nextFetch(agentId);
+  world.sync.requestReplacement(agentId, "new-epoch");
+  initial.respond({ hasNewer: false, seq: 0, epoch: "new-epoch" });
+  await vi.waitFor(() => {
+    world.expectNoPendingFetch();
+    expect(world.sync.getAgentTimelineStatus(agentId)).toBe("ready");
+  });
+  world.sync.requestReplacement(agentId, "new-epoch");
+  world.expectNoPendingFetch();
+  world.sync.dispose();
+});
+
+test("resumes only the latest replacement after reconnect and drops it when the tab closes", async () => {
+  const world = new TimelineWorld();
+  const agentId = "agent-a";
+  world.sync.setConnected(true);
+  world.show("workspace", [agentId]);
+  (await world.nextMembership()).succeed();
+  (await world.nextFetch(agentId)).respond({ hasNewer: false });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus(agentId)).toBe("ready"));
+
+  world.sync.requestReplacement(agentId, "first-rewind");
+  const interrupted = await world.nextFetch(agentId);
+  world.sync.requestReplacement(agentId, "second-rewind");
+  world.sync.setConnected(false);
+  world.sync.setConnected(true);
+  (await world.nextMembership()).succeed();
+  const restored = await world.nextFetch(agentId);
+  expect(restored.forceTailReplacement).toBe(true);
+  world.sync.requestReplacement(agentId, "second-rewind");
+  restored.respond({ hasNewer: false, epoch: "second-rewind" });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus(agentId)).toBe("ready"));
+  expect(interrupted.canApply({ epoch: "first-rewind", hasNewer: false, endCursor: null })).toBe(
+    false,
+  );
+  interrupted.respond({ hasNewer: false, epoch: "first-rewind" });
+  world.expectNoPendingFetch();
+
+  world.sync.requestReplacement(agentId, "third-rewind");
+  const beforeClose = await world.nextFetch(agentId);
+  world.sync.requestReplacement(agentId, "fourth-rewind");
+  world.show("workspace", []);
+  world.sync.replaceOpenTabAgentIds([]);
+  (await world.nextMembership()).succeed();
+  expect(beforeClose.canApply({ epoch: "third-rewind", hasNewer: false, endCursor: null })).toBe(
+    false,
+  );
+  beforeClose.respond({ hasNewer: false, epoch: "third-rewind" });
+
+  world.show("workspace", [agentId]);
+  (await world.nextMembership()).succeed();
+  const reopened = await world.nextFetch(agentId);
+  expect(reopened.forceTailReplacement).toBe(false);
+  reopened.respond({ hasNewer: false, epoch: "fourth-rewind" });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus(agentId)).toBe("ready"));
   world.expectNoPendingFetch();
   world.sync.dispose();
 });
@@ -611,7 +650,7 @@ test("recovers from a failed replacement when a new-epoch stream event arrives a
     await vi.waitFor(() => expect(owner.getAgentTimelineStatus(agentId)).toBe("ready"));
 
     failTailFetches = true;
-    owner.requestReplacement(agentId);
+    owner.requestReplacement(agentId, "epoch-2");
     await vi.waitFor(() => expect(owner.getAgentTimelineStatus(agentId)).toBe("error"));
 
     owner.applyStreamEvent(agentId, {

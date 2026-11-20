@@ -85,7 +85,10 @@ import { ICON_SIZE, type Theme } from "@/styles/theme";
 import type { DraftCommandTarget } from "@/agent-commands";
 import { encodeImages } from "@/utils/encode-images";
 import { focusWithRetries } from "@/utils/web-focus";
-import { hasSlashCommandWithQuotes } from "@/attachments/quote";
+import {
+  hasSlashCommandWithQuotes,
+  providerRequiresUnquotedSlashCommand,
+} from "@/attachments/quote";
 import { BUILTIN_PROVIDER_IDS } from "@getpaseo/protocol/provider-manifest";
 import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
 import {
@@ -158,6 +161,11 @@ import type {
 import type { SelectedFile } from "@/attachments/selected-file";
 import { resolveComposerAttachmentSubmitFormat } from "@/composer/attachments/submit";
 import { ComposerInputProvider, type ComposerInput } from "@/composer/session";
+import {
+  beginComposerWork,
+  isHandoffInputLocked,
+  useHandoffInputLocked,
+} from "@/composer/handoff-input-lock";
 import type { ComposerFocusOptions } from "@/composer/model";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { insertAtSelection } from "@/composer/insert-text";
@@ -1377,7 +1385,17 @@ function ComposerContentImpl({
   const { finePointer: hasFinePointer } = usePointerCapabilities();
   const isDesktopLayout = resolveIsDesktopWebBreakpoint(isCompactLayout);
   const messagePlaceholder = resolveMessagePlaceholder(inputMode, isDesktopLayout, t, placeholder);
-  const setUserInput = onChangeText;
+  const handoffInputLocked = useHandoffInputLocked(serverId, agentId);
+  const isHandoffLocked = useCallback(
+    () => isHandoffInputLocked(serverId, agentId),
+    [serverId, agentId],
+  );
+  const setUserInput = useCallback<ComposerContentProps["onChangeText"]>(
+    (text) => {
+      if (!isHandoffLocked()) onChangeText(text);
+    },
+    [isHandoffLocked, onChangeText],
+  );
   const workspaceAttachments = useWorkspaceAttachmentsForScopes(attachmentScopeKeys);
   const {
     selectedAttachments,
@@ -1393,7 +1411,12 @@ function ComposerContentImpl({
     workspaceAttachments,
     onOpenWorkspaceAttachment,
   });
-  const setSelectedAttachments = onChangeAttachments;
+  const setSelectedAttachments = useCallback<ComposerContentProps["onChangeAttachments"]>(
+    (updater) => {
+      if (!isHandoffLocked()) onChangeAttachments(updater);
+    },
+    [isHandoffLocked, onChangeAttachments],
+  );
   const checkoutStatusQuery = useCheckoutStatusQuery({ serverId, cwd });
   const supportsForgeSearch = useSessionStore(
     (state) => state.sessions[serverId]?.serverInfo?.features?.forgeSearch === true,
@@ -1457,15 +1480,16 @@ function ComposerContentImpl({
   )?.derivedFromProviderId;
   const quoteProviderLookupPending =
     quoteCommandProviderMayBeAlias && supportsSnapshot && quoteProviderEntries === undefined;
-  const rejectQuotedClaudeCommand = useCallback(
+  const rejectQuotedSlashCommand = useCallback(
     (text: string, outgoingAttachments: ComposerAttachment[]) => {
       if (!hasSlashCommandWithQuotes(text, outgoingAttachments)) return false;
       if (quoteProviderLookupPending) {
         setSendError(quoteProviderError ?? t("composer.errors.alreadyLoading"));
         return true;
       }
-      if ((quoteProviderBase ?? quoteCommandProvider) !== "claude") return false;
-      setSendError(t("composer.errors.removeQuotesForClaudeCommand"));
+      if (!providerRequiresUnquotedSlashCommand(quoteProviderBase ?? quoteCommandProvider))
+        return false;
+      setSendError(t("composer.errors.removeQuotesForSlashCommand"));
       return true;
     },
     [quoteCommandProvider, quoteProviderBase, quoteProviderError, quoteProviderLookupPending, t],
@@ -1489,24 +1513,27 @@ function ComposerContentImpl({
     workspaceId,
     agentId,
   });
-  const isComposerLocked = resolveIsComposerLocked(submitBehavior, isSubmitLoading);
+  const isComposerLocked =
+    handoffInputLocked || resolveIsComposerLocked(submitBehavior, isSubmitLoading);
   const keyboardHandlerIdRef = useRef(
     `message-input:${serverId}:${agentId}:${Math.random().toString(36).slice(2)}`,
   );
 
   const replaceUserInput = useCallback(
     (text: string, selection?: { start: number; end: number }) => {
+      if (isHandoffLocked()) return;
       if (messageInputRef.current) {
         messageInputRef.current.replaceText(text, selection);
         return;
       }
       onChangeText(text);
     },
-    [onChangeText],
+    [isHandoffLocked, onChangeText],
   );
 
   const insertUserInput = useCallback(
     (text: string) => {
+      if (isHandoffLocked()) return;
       const input = messageInputRef.current;
       if (!input) {
         onChangeText(textSource.getSnapshot() + text);
@@ -1515,7 +1542,7 @@ function ComposerContentImpl({
       const inserted = insertAtSelection(input.getInputSnapshot(), text);
       input.replaceText(inserted.text, inserted.selection);
     },
-    [onChangeText, textSource],
+    [isHandoffLocked, onChangeText, textSource],
   );
   const isInputLive = useIsInputLive(messageInputRef);
   const isPanelActive = useRetainedPanelActive();
@@ -1569,7 +1596,12 @@ function ComposerContentImpl({
   const composerInput = useMemo<ComposerInput>(
     () => ({
       locked: isComposerLocked,
-      isLocked: () => isComposerLockedRef.current,
+      isLocked: () =>
+        isHandoffLocked() ||
+        isComposerLockedRef.current ||
+        isProcessing ||
+        isUploadingFile ||
+        pendingNativeImagePastes > 0,
       isLive: isInputLive,
       revealed: inputRevealed,
       isRevealed: isInputRevealed,
@@ -1585,6 +1617,10 @@ function ComposerContentImpl({
       inputRevealed,
       insertUserInput,
       isComposerLocked,
+      isHandoffLocked,
+      isProcessing,
+      isUploadingFile,
+      pendingNativeImagePastes,
       isInputLive,
       isInputRevealed,
       replaceUserInput,
@@ -1599,6 +1635,8 @@ function ComposerContentImpl({
       if (command.execution !== "immediate" || !onClientSlashCommand) {
         return false;
       }
+      const finish = beginComposerWork(serverId, agentId, "submit");
+      if (!finish) return true;
 
       if (blurOnSubmit) {
         messageInputRef.current?.blur();
@@ -1609,12 +1647,14 @@ function ComposerContentImpl({
       resetSuppression();
       setSendError(null);
       setIsProcessing(true);
-      void onClientSlashCommand(command)
+      void Promise.resolve()
+        .then(() => onClientSlashCommand(command))
         .catch((error) => {
           console.error("[Composer] Failed to run client slash command:", error);
           setSendError(error instanceof Error ? error.message : String(error));
         })
         .finally(() => {
+          finish();
           setIsProcessing(false);
         });
       return true;
@@ -1622,6 +1662,8 @@ function ComposerContentImpl({
     [
       blurOnSubmit,
       clearDraft,
+      agentId,
+      serverId,
       onClientSlashCommand,
       resetSuppression,
       setSelectedAttachments,
@@ -1846,44 +1888,50 @@ function ComposerContentImpl({
       outgoingAttachments: ComposerAttachment[],
       forceSend?: boolean,
     ) => {
-      const result = await submitAgentInput({
-        message: outgoingMessage,
-        attachments: outgoingAttachments,
-        hasExternalContent,
-        allowEmptySubmit,
-        forceSend,
-        submitBehavior,
-        isAgentRunning,
-        // Parent-managed submits are still valid submit paths even when the
-        // transport is disconnected, because the parent decides the failure mode.
-        canSubmit: Boolean(sendAgentMessageRef.current || onSubmitMessageRef.current),
-        queueMessage: ({ message: queuedText, attachments: queuedAttachments }) => {
-          queueMessage(queuedText, queuedAttachments);
-        },
-        submitMessage: async ({ message: submitText, attachments: submitAttachments }) => {
-          if (submitBehavior !== "preserve-and-lock") {
-            beginSubmit(submitAttachments);
-          }
-          await submitMessage(submitText, submitAttachments);
-        },
-        clearDraft,
-        setUserInput: replaceUserInput,
-        setAttachments: (nextAttachments) => {
-          setSelectedAttachments(composerWorkspaceAttachment.userAttachmentsOnly(nextAttachments));
-        },
-        setSendError,
-        setIsProcessing,
-        onSubmitError: (error) => {
-          console.error("[AgentInput] Failed to send message:", error);
-        },
-        failedToSendMessage: t("composer.errors.failedToSend"),
-      });
-      completeSubmit({
-        result,
-        outgoingAttachments,
-      });
+      const finish = beginComposerWork(serverId, agentId, "submit");
+      if (!finish) return;
+      try {
+        const result = await submitAgentInput({
+          message: outgoingMessage,
+          attachments: outgoingAttachments,
+          hasExternalContent,
+          allowEmptySubmit,
+          forceSend,
+          submitBehavior,
+          isAgentRunning,
+          // Parent-managed submits are still valid submit paths even when the
+          // transport is disconnected, because the parent decides the failure mode.
+          canSubmit: Boolean(sendAgentMessageRef.current || onSubmitMessageRef.current),
+          queueMessage: ({ message: queuedText, attachments: queuedAttachments }) => {
+            queueMessage(queuedText, queuedAttachments);
+          },
+          submitMessage: async ({ message: submitText, attachments: submitAttachments }) => {
+            if (submitBehavior !== "preserve-and-lock") {
+              beginSubmit(submitAttachments);
+            }
+            await submitMessage(submitText, submitAttachments);
+          },
+          clearDraft,
+          setUserInput: replaceUserInput,
+          setAttachments: (nextAttachments) => {
+            setSelectedAttachments(
+              composerWorkspaceAttachment.userAttachmentsOnly(nextAttachments),
+            );
+          },
+          setSendError,
+          setIsProcessing,
+          onSubmitError: (error) => {
+            console.error("[AgentInput] Failed to send message:", error);
+          },
+          failedToSendMessage: t("composer.errors.failedToSend"),
+        });
+        completeSubmit({ result, outgoingAttachments });
+      } finally {
+        finish();
+      }
     },
     [
+      agentId,
       allowEmptySubmit,
       beginSubmit,
       clearDraft,
@@ -1893,6 +1941,7 @@ function ComposerContentImpl({
       queueMessage,
       setSelectedAttachments,
       replaceUserInput,
+      serverId,
       submitBehavior,
       submitMessage,
       t,
@@ -1901,6 +1950,7 @@ function ComposerContentImpl({
 
   const handleSubmit = useCallback(
     (payload: MessagePayload) => {
+      if (isHandoffLocked()) return;
       const outgoingAttachments = buildOutgoingAttachments(attachments);
       const clientSlashCommand = resolveClientSlashCommand({
         text: payload.text,
@@ -1915,7 +1965,7 @@ function ComposerContentImpl({
         commands: pluginClientSlashCommands,
       });
       if (pluginSlashCommand && runPluginClientSlashCommand(pluginSlashCommand)) return;
-      if (rejectQuotedClaudeCommand(payload.text, outgoingAttachments)) return;
+      if (rejectQuotedSlashCommand(payload.text, outgoingAttachments)) return;
 
       if (blurOnSubmit) {
         messageInputRef.current?.blur();
@@ -1925,7 +1975,8 @@ function ComposerContentImpl({
     [
       attachments,
       blurOnSubmit,
-      rejectQuotedClaudeCommand,
+      isHandoffLocked,
+      rejectQuotedSlashCommand,
       buildOutgoingAttachments,
       runClientSlashCommand,
       pluginClientSlashCommands,
@@ -1935,15 +1986,22 @@ function ComposerContentImpl({
   );
 
   const handlePickImage = useCallback(async () => {
-    const newImages = await pickAndPersistImages({
-      pickImages,
-      persister: composerImageAttachmentPersister,
-    });
-    if (newImages.length === 0) return;
-    addImages(newImages);
-  }, [addImages, pickImages]);
+    const finish = beginComposerWork(serverId, agentId, "attachment");
+    if (!finish) return;
+    try {
+      const newImages = await pickAndPersistImages({
+        pickImages,
+        persister: composerImageAttachmentPersister,
+      });
+      if (newImages.length > 0) addImages(newImages);
+    } finally {
+      finish();
+    }
+  }, [addImages, agentId, pickImages, serverId]);
 
   const handlePasteImage = useCallback(async () => {
+    const finish = beginComposerWork(serverId, agentId, "attachment");
+    if (!finish) return;
     try {
       const newImages = await pickAndPersistImages({
         pickImages: async () => {
@@ -1960,11 +2018,15 @@ function ComposerContentImpl({
     } catch (error) {
       console.error("[Composer] Failed to paste clipboard image:", error);
       toastErrorRef.current(t("composer.errors.pasteImageFailed"));
+    } finally {
+      finish();
     }
-  }, [addImages, t]);
+  }, [addImages, agentId, serverId, t]);
 
   const handleNativePasteImages = useCallback(
     (files: readonly NativePastedFile[]) => {
+      const finish = beginComposerWork(serverId, agentId, "attachment");
+      if (!finish) return;
       setPendingNativeImagePastes((pending) => pending + 1);
       void pickAndPersistImages({
         pickImages: async () => normalizeNativePastedImages(files),
@@ -1981,10 +2043,11 @@ function ComposerContentImpl({
           toastErrorRef.current(t("composer.errors.pasteImageFailed"));
         })
         .finally(() => {
+          finish();
           setPendingNativeImagePastes((pending) => Math.max(0, pending - 1));
         });
     },
-    [addImages, t],
+    [addImages, agentId, serverId, t],
   );
 
   const uploadSelectedFiles = useCallback(
@@ -1994,6 +2057,8 @@ function ComposerContentImpl({
         toastErrorRef.current(t("composer.errors.daemonClientDisconnected"));
         return;
       }
+      const finish = beginComposerWork(serverId, agentId, "attachment");
+      if (!finish) return;
 
       const placeholders = files.map((file) => ({ id: nextPendingFileId.current++, file }));
       setPendingFiles((pending) => [...pending, ...placeholders]);
@@ -2006,10 +2071,11 @@ function ComposerContentImpl({
           error instanceof Error ? error.message : t("composer.errors.uploadFailed"),
         );
       } finally {
+        finish();
         setPendingFiles((pending) => pending.filter((entry) => !placeholders.includes(entry)));
       }
     },
-    [addFiles, client, t],
+    [addFiles, agentId, client, serverId, t],
   );
 
   const handlePickFile = useCallback(async () => {
@@ -2017,6 +2083,8 @@ function ComposerContentImpl({
       toastErrorRef.current(t("composer.errors.daemonClientDisconnected"));
       return;
     }
+    const finish = beginComposerWork(serverId, agentId, "attachment");
+    if (!finish) return;
     try {
       const files = await pickFiles();
       if (!files) return;
@@ -2026,8 +2094,10 @@ function ComposerContentImpl({
       toastErrorRef.current(
         error instanceof Error ? error.message : t("composer.errors.uploadFailed"),
       );
+    } finally {
+      finish();
     }
-  }, [client, pickFiles, t, uploadSelectedFiles]);
+  }, [agentId, client, pickFiles, serverId, t, uploadSelectedFiles]);
 
   const handleGenericFilesDropped = useCallback(
     async (items: DroppedItem[]) => {
@@ -2123,6 +2193,7 @@ function ComposerContentImpl({
 
   const handleEditQueuedMessage = useCallback(
     (id: string) => {
+      if (isHandoffLocked()) return;
       const result = editQueuedComposerMessage({
         agentId,
         messageId: id,
@@ -2132,30 +2203,37 @@ function ComposerContentImpl({
       replaceUserInput(result.text);
       setSelectedAttachments(result.attachments);
     },
-    [agentId, queueWriter, replaceUserInput, setSelectedAttachments],
+    [agentId, isHandoffLocked, queueWriter, replaceUserInput, setSelectedAttachments],
   );
 
   const handleSendQueuedNow = useCallback(
     async (id: string) => {
       if (!sendAgentMessageRef.current && !onSubmitMessageRef.current) return;
+      const finish = beginComposerWork(serverId, agentId, "submit");
+      if (!finish) return;
       // Reuse the regular send path; server-side send atomically interrupts any active run.
-      const result = await sendQueuedComposerMessageNow({
-        agentId,
-        messageId: id,
-        queue: queueWriter,
-        submitMessage: ({ text, attachments: queuedAttachments }) =>
-          submitMessage(text, queuedAttachments),
-        failedToSendMessage: t("composer.errors.failedToSend"),
-      });
-      if (result.status === "failed") {
-        setSendError(result.errorMessage);
+      try {
+        const result = await sendQueuedComposerMessageNow({
+          agentId,
+          messageId: id,
+          queue: queueWriter,
+          submitMessage: ({ text, attachments: queuedAttachments }) =>
+            submitMessage(text, queuedAttachments),
+          failedToSendMessage: t("composer.errors.failedToSend"),
+        });
+        if (result.status === "failed") {
+          setSendError(result.errorMessage);
+        }
+      } finally {
+        finish();
       }
     },
-    [agentId, queueWriter, submitMessage, t],
+    [agentId, queueWriter, serverId, submitMessage, t],
   );
 
   const handleQueue = useCallback(
     (payload: MessagePayload) => {
+      if (isHandoffLocked()) return;
       const outgoingAttachments = buildOutgoingAttachments(attachments);
       const clientSlashCommand = resolveClientSlashCommand({
         text: payload.text,
@@ -2170,15 +2248,16 @@ function ComposerContentImpl({
         commands: pluginClientSlashCommands,
       });
       if (pluginSlashCommand && runPluginClientSlashCommand(pluginSlashCommand)) return;
-      if (rejectQuotedClaudeCommand(payload.text, outgoingAttachments)) return;
+      if (rejectQuotedSlashCommand(payload.text, outgoingAttachments)) return;
       queueMessage(payload.text, outgoingAttachments);
     },
     [
       attachments,
       buildOutgoingAttachments,
+      isHandoffLocked,
       pluginClientSlashCommands,
       queueMessage,
-      rejectQuotedClaudeCommand,
+      rejectQuotedSlashCommand,
       runClientSlashCommand,
       runPluginClientSlashCommand,
     ],
@@ -2585,7 +2664,9 @@ function ComposerContentImpl({
   const isSubmitLoadingVisible =
     isProcessing || isSubmitLoading || isUploadingFile || pendingNativeImagePastes > 0;
   const isSubmitDisabled =
-    isSubmitLoadingVisible || (waitForForgeAutoAttachOnSubmit && isForgeResolving);
+    handoffInputLocked ||
+    isSubmitLoadingVisible ||
+    (waitForForgeAutoAttachOnSubmit && isForgeResolving);
 
   // Disable drops while submitting/uploading: the submit path clears and restores attachments,
   // so a drop in that window would be lost or land on a locked draft. `disabled` hides the
@@ -2596,7 +2677,7 @@ function ComposerContentImpl({
       onGenericFiles: handleGenericFilesDropped,
       onWorkspaceFile: handleWorkspaceFileDropped,
     },
-    { disabled: isSubmitLoadingVisible },
+    { disabled: handoffInputLocked || isSubmitLoadingVisible },
   );
 
   // Focusing the composer on a touch screen raises the on-screen keyboard over the conversation.
@@ -2684,7 +2765,7 @@ function ComposerContentImpl({
                   placeholder={messagePlaceholder}
                   autoFocus={messageInputAutoFocus}
                   autoFocusKey={`${serverId}:${agentId}:${autoFocusKey ?? ""}`}
-                  disabled={isSubmitLoading}
+                  disabled={handoffInputLocked || isSubmitLoading}
                   leftContent={leftContent}
                   beforeVoiceContent={beforeVoiceContent}
                   voiceModeContent={voiceModeContent}

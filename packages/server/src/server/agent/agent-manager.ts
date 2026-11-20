@@ -4,6 +4,7 @@ import type { AgentToolResult } from "@getpaseo/plugin/server";
 import type { RuntimeCleanupCandidate } from "./idle-runtime-cleanup/index.js";
 import { AgentNotFoundError, ensureAgentLoaded } from "./agent-loading.js";
 import { projectTimelineRows } from "./timeline-projection.js";
+import { buildAgentForkContextAttachment } from "./activity-curator.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
 import { applyRecordPatch } from "../record-patch.js";
@@ -18,6 +19,7 @@ import {
 } from "@getpaseo/protocol/agent-lifecycle";
 import {
   getMainPriorModeIdFromLabels,
+  getParentAddressFromLabels,
   getParentAgentIdFromLabels,
   hasOpenAgentTab,
   isDelegatedAgent,
@@ -123,6 +125,8 @@ import {
   type HierarchyAgent,
   isMainControlWritePermissionBlocked,
   MAIN_CONTROL_WRITE_DENIAL,
+  MAX_SUBAGENT_DEPTH,
+  readLocalSubtreeDepths,
   REMOTE_HIERARCHY_DEPTH_LABEL,
   RESERVED_HIERARCHY_LABELS_ERROR,
   validateCanSpawnChild,
@@ -135,6 +139,7 @@ import {
 } from "./provider-subagents/store.js";
 import { AgentBackgroundWorkStore, type AgentBackgroundWorkItem } from "./background-work/index.js";
 import { withTimeout } from "../../utils/promise-timeout.js";
+import { createRealpathAwarePathMatcher } from "../../utils/path.js";
 import { buildSessionConfig, extractAttention } from "../persistence-hooks.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
@@ -418,7 +423,11 @@ export interface MoveSubagentToWorkspaceAllocation {
   rollback?: () => Promise<void>;
 }
 
-export type MoveSubagentToWorkspaceOptions = { idempotencyKey?: string } & (
+export type MoveSubagentToWorkspaceOptions = {
+  idempotencyKey?: string;
+  serverId?: string;
+  getWorktreeRoot?: (cwd: string) => Promise<string | null>;
+} & (
   | {
       durable?: undefined;
       allocateWorkspace: (
@@ -461,6 +470,7 @@ export type MoveSubagentToWorkspaceResult =
 
 export interface AgentManagerOptions {
   pluginLifecycle?: PluginLifecycle;
+  serverId?: string;
   /** An internal workspace makes every agent created inside it internal. */
   clients?: ProviderClientMap;
   providerDefinitions?: ProviderEnabledMap;
@@ -500,12 +510,14 @@ function stripSteerOptions(options?: AgentSteerOptions): AgentRunOptions | undef
 export interface WaitForAgentOptions {
   signal?: AbortSignal;
   waitForActive?: boolean;
+  completionResponse?: boolean;
 }
 
 export interface WaitForAgentResult {
   status: AgentLifecycleStatus;
   permission: AgentPermissionRequest | null;
   lastMessage: string | null;
+  completionSnapshot?: ManagedAgent;
 }
 
 export interface WaitForAgentStartOptions {
@@ -590,6 +602,7 @@ interface ManagedAgentBase {
   lastUserMessageAt: Date | null;
   activeTurnId: string | null;
   activeTurnStartedAt: Date | null;
+  lastTurnCompletion?: { event: TurnTerminalEvent; lastMessage: string | null };
   lastUsage?: AgentUsage;
   lastError?: string;
   attention: AttentionState;
@@ -759,7 +772,12 @@ function isAgentBusy(status: AgentLifecycleStatus): boolean {
   return BUSY_STATUSES.has(status);
 }
 
-function isTurnTerminalEvent(event: AgentStreamEvent): boolean {
+type TurnTerminalEvent = Extract<
+  AgentStreamEvent,
+  { type: "turn_completed" | "turn_failed" | "turn_canceled" }
+>;
+
+function isTurnTerminalEvent(event: AgentStreamEvent): event is TurnTerminalEvent {
   return (
     event.type === "turn_completed" ||
     event.type === "turn_failed" ||
@@ -929,15 +947,17 @@ function describeSubagentMoveSource(
   agentId: string,
   liveAgent: LiveManagedAgent | undefined,
   storedRecord: StoredAgentRecord | null,
+  serverId: string,
 ): MoveSubagentToWorkspaceSource {
   const current = liveAgent ?? storedRecord;
   if (!current || current.internal || storedRecord?.internal) {
     throw new Error(`Agent not found: ${agentId}`);
   }
-  if (storedRecord?.archivedAt || ("archivedAt" in current && current.archivedAt)) {
+  if (storedRecord?.archivedAt) {
     throw new Error(`Agent is archived: ${agentId}`);
   }
-  const previousParentAgentId = getParentAgentIdFromLabels(current.labels) ?? null;
+  const parent = getParentAddressFromLabels(current.labels, serverId);
+  const previousParentAgentId = parent?.serverId === serverId ? parent.agentId : null;
   const sourceWorkspaceId = (current.workspaceId ?? storedRecord?.workspaceId)?.trim();
   if (!sourceWorkspaceId) {
     throw new Error(`Agent has no workspace: ${agentId}`);
@@ -953,6 +973,27 @@ function describeSubagentMoveSource(
   };
 }
 
+async function assertMoveSharesWorktree(
+  rootCwd: string,
+  memberDirectories: Iterable<string | undefined>,
+  getWorktreeRoot: MoveSubagentToWorkspaceOptions["getWorktreeRoot"],
+): Promise<void> {
+  if (!getWorktreeRoot) return;
+  const directories = new Set(memberDirectories);
+  directories.delete(undefined);
+  directories.delete(rootCwd);
+  if (directories.size === 0) return;
+  const root = await getWorktreeRoot(rootCwd);
+  const matchesRoot = root ? createRealpathAwarePathMatcher(root) : null;
+  for (const cwd of directories) {
+    if (!cwd) continue;
+    const otherRoot = await getWorktreeRoot(cwd);
+    if (otherRoot ? !matchesRoot?.(otherRoot) : matchesRoot) {
+      throw new Error("Cannot move agents that use different Git worktrees together.");
+    }
+  }
+}
+
 /**
  * How long an archived internal agent stays readable by id. Storage plays this
  * role for public agents; internal agents never reach it, and a one-shot helper
@@ -960,6 +1001,8 @@ function describeSubagentMoveSource(
  */
 const RETIRED_INTERNAL_AGENT_TTL_MS = 10 * 60 * 1000;
 const RETIRED_INTERNAL_AGENT_LIMIT = 500;
+const ARCHIVED_FORK_CONTEXT_TTL_MS = 5 * 60 * 1000;
+const ARCHIVED_FORK_CONTEXT_LIMIT = 16;
 
 export interface RetiredInternalAgent {
   record: ArchivedStoredAgentRecord;
@@ -968,6 +1011,14 @@ export interface RetiredInternalAgent {
 
 export class AgentManager {
   private readonly pluginLifecycle: PluginLifecycle | undefined;
+  private readonly archivedForkContexts = new Map<
+    string,
+    {
+      archivedAt: string;
+      expiresAt: number;
+      context: ReturnType<typeof buildAgentForkContextAttachment>;
+    }
+  >();
   private readonly retiredInternalAgents = new Map<
     string,
     RetiredInternalAgent & { expiresAt: number }
@@ -1016,6 +1067,7 @@ export class AgentManager {
   private readonly sessionOpenGenerations = new Map<string, number>();
   private readonly attachedPluginTools = new Map<string, AttachedAgentTool[]>();
   private readonly pluginAgentTools: PluginAgentToolsRuntime | undefined;
+  private readonly serverId?: string;
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
   private readonly paseoToolPolicies = new Map<string, ProviderPaseoToolsPolicy | undefined>();
@@ -1035,6 +1087,7 @@ export class AgentManager {
 
   constructor(options: AgentManagerOptions) {
     this.pluginLifecycle = options.pluginLifecycle;
+    this.serverId = options.serverId;
     this.pluginAgentTools = options.pluginAgentTools;
     this.timelineStore = options.timelineStore ?? new InMemoryAgentTimelineStore();
     this.idFactory = options.idFactory ?? (() => randomUUID());
@@ -1609,6 +1662,39 @@ export class AgentManager {
       }).map((entry) => Object.assign({ seq: entry.seqEnd }, entry));
     }
     return this.timelineStore.getRows(id);
+  }
+
+  readArchivedForkContext(agentId: string, archivedAt: string) {
+    const entry = this.archivedForkContexts.get(agentId);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now() || entry.archivedAt !== archivedAt) {
+      this.archivedForkContexts.delete(agentId);
+      return null;
+    }
+    return entry.context;
+  }
+
+  private retainArchivedForkContext(record: ArchivedStoredAgentRecord): void {
+    const rows = this.timelineStore.getRows(record.id);
+    if (rows.length === 0) return;
+    const context = buildAgentForkContextAttachment({
+      rows,
+      sourceAgentId: record.id,
+      sourceServerId: this.serverId,
+      agentTitle: record.title,
+      cwd: record.cwd,
+    });
+    if (context.itemCount === 0) return;
+    this.archivedForkContexts.delete(record.id);
+    if (this.archivedForkContexts.size >= ARCHIVED_FORK_CONTEXT_LIMIT) {
+      const oldest = this.archivedForkContexts.keys().next();
+      if (!oldest.done) this.archivedForkContexts.delete(oldest.value);
+    }
+    this.archivedForkContexts.set(record.id, {
+      archivedAt: record.archivedAt,
+      expiresAt: Date.now() + ARCHIVED_FORK_CONTEXT_TTL_MS,
+      context,
+    });
   }
 
   /** The timeline head of a loaded agent, or null when this agent is not loaded. Never loads. */
@@ -2521,7 +2607,9 @@ export class AgentManager {
       }
       if (this.hasInFlightRun(agentId)) await this.cancelAgentRun(agentId);
       await this.clearAgentAttentionUnlocked(agentId).catch(() => undefined);
-      const { archivedAt } = await this.archiveAgentUnlocked(agentId);
+      const { archivedAt } = await this.archiveAgentUnlocked(agentId, undefined, {
+        retainForkContext: true,
+      });
       const record = live.internal ? null : await this.requireRegistry().get(agentId);
       if (!record && !live.internal) {
         throw new Error(`Agent not found in storage after archive: ${agentId}`);
@@ -2533,6 +2621,7 @@ export class AgentManager {
   private async archiveAgentUnlocked(
     agentId: string,
     requestedArchivedAt?: string,
+    options?: { retainForkContext: boolean },
   ): Promise<{ archivedAt: string }> {
     const agent = this.requireAgent(agentId);
     if (agent.internal) {
@@ -2568,6 +2657,9 @@ export class AgentManager {
     const { archivedAt } = archivedRecord;
     agent.updatedAt = new Date(archivedRecord.updatedAt);
     await this.closeAgentRuntime(agentId);
+    // Close has drained provider events and flushed buffered text. Provider history
+    // may never contain the last partial reply, so retain the bounded fork attachment.
+    if (options?.retainForkContext) this.retainArchivedForkContext(archivedRecord);
     await this.syncNativeArchiveState(stored.provider, stored.persistence, "archive");
     this.discardRetainedAgentState(agentId);
 
@@ -2664,6 +2756,9 @@ export class AgentManager {
   ): Promise<ArchivedStoredAgentRecord> {
     const archivedRecord = buildArchivedAgentRecord(record, options);
     await this.requireRegistry().upsert(archivedRecord);
+    // A restore and a new archive can reuse the previous timestamp.
+    if (record.archivedAt !== archivedRecord.archivedAt)
+      this.archivedForkContexts.delete(record.id);
     if (!record.archivedAt && !record.internal) {
       this.pluginLifecycle?.emit("agent.archive.after", {
         agent: describeHookAgent(archivedRecord),
@@ -3271,6 +3366,7 @@ export class AgentManager {
     parentAgentId: string,
     serverId?: string,
     prepareFinishSubscription?: () => Promise<FinishRegistration>,
+    assertRemoteDepthCanIncrease?: (localAgentIds: ReadonlySet<string>) => Promise<void>,
   ): Promise<AgentParentUpdate> {
     return this.runHierarchyMutation(() =>
       this.runLifecycleMutation(agentId, async () => {
@@ -3286,7 +3382,17 @@ export class AgentManager {
           parentAgent,
           readAgent: (id) => hierarchy.get(id),
           listActiveAgents: () => hierarchy.values(),
+          serverId,
         });
+        const read = (id: string) => hierarchy.get(id);
+        if (
+          assertRemoteDepthCanIncrease &&
+          computeAgentDepth(parentAgentId, read, serverId) + 1 >
+            computeAgentDepth(agentId, read, serverId)
+        ) {
+          const branch = readLocalSubtreeDepths(agentId, hierarchy.values(), serverId);
+          await assertRemoteDepthCanIncrease(new Set(branch.keys()));
+        }
         const previousParentAgentId = getParentAgentIdFromLabels(agent.labels);
         const wasRunning = this.agents.get(agentId)?.lifecycle === "running";
         const registration =
@@ -3414,7 +3520,7 @@ export class AgentManager {
   ): Promise<MoveSubagentToWorkspaceResult> {
     return this.runHierarchyMutation(() =>
       this.runLifecycleMutation(agentId, () =>
-        this.moveSubagentToWorkspaceUnlocked(agentId, options),
+        this.moveSubagentToWorkspaceUnlocked(agentId, options, options.serverId ?? "self"),
       ),
     );
   }
@@ -3422,6 +3528,7 @@ export class AgentManager {
   private async moveSubagentToWorkspaceUnlocked(
     agentId: string,
     options: MoveSubagentToWorkspaceOptions,
+    serverId: string,
   ): Promise<MoveSubagentToWorkspaceResult> {
     const trimmedKey = options.idempotencyKey?.trim();
     const receiptKey = trimmedKey ? JSON.stringify([agentId, trimmedKey]) : null;
@@ -3436,12 +3543,13 @@ export class AgentManager {
     const registry = this.requireRegistry();
     const liveAgent = this.agents.get(agentId);
     const storedRecord = await registry.get(agentId);
-    const source = describeSubagentMoveSource(agentId, liveAgent, storedRecord);
+    const source = describeSubagentMoveSource(agentId, liveAgent, storedRecord, serverId);
     const { sourceWorkspaceId, previousParentAgentId } = source;
     const descendantIds = await this.findSameWorkspaceDescendantIds(
       registry,
       agentId,
       sourceWorkspaceId,
+      serverId,
     );
     const lockedIds = new Set(descendantIds);
     // Match the archive cascade's lock order. Re-read the full path to the root
@@ -3462,6 +3570,7 @@ export class AgentManager {
         registry,
         agentId,
         sourceWorkspaceId,
+        serverId,
       );
       if (currentIds.some((id) => !lockedIds.has(id))) {
         throw new Error("Workspace agents changed while preparing the move. Retry the move.");
@@ -3473,6 +3582,11 @@ export class AgentManager {
           live: this.agents.get(id),
           stored: await registry.get(id),
         })),
+      );
+      await assertMoveSharesWorktree(
+        source.cwd,
+        members.map(({ live, stored }) => (live ?? stored)?.cwd),
+        options.getWorktreeRoot,
       );
       const before = members.flatMap(({ stored }) => (stored ? [stored] : []));
       const rollbackRecords: StoredAgentRecord[] = [];
@@ -3668,6 +3782,7 @@ export class AgentManager {
     registry: AgentStorage,
     rootAgentId: string,
     sourceWorkspaceId: string,
+    serverId: string,
   ): Promise<string[]> {
     const candidates = await this.collectSameWorkspaceDescendantCandidates(
       registry,
@@ -3683,8 +3798,8 @@ export class AgentManager {
         if (owners.has(candidateId)) {
           continue;
         }
-        const parentId = getParentAgentIdFromLabels(labels);
-        if (parentId && owners.has(parentId)) {
+        const parent = getParentAddressFromLabels(labels, serverId);
+        if (parent?.serverId === serverId && owners.has(parent.agentId)) {
           owners.add(candidateId);
           descendantIds.push(candidateId);
           added = true;
@@ -3831,11 +3946,6 @@ export class AgentManager {
       return false;
     }
 
-    // Close and native restore share the lifecycle lane with persisted resume.
-    // No new history or interactive runtime can acquire the writer between them.
-    if (this.agents.has(agentId)) await this.closeAgentRuntime(agentId);
-    await this.syncNativeArchiveState(record.provider, record.persistence, "restore");
-
     const nextRecord: StoredAgentRecord = {
       ...record,
       ...(updates?.workspaceId ? { workspaceId: updates.workspaceId } : {}),
@@ -3843,6 +3953,26 @@ export class AgentManager {
       archivedAt: null,
       updatedAt: new Date().toISOString(),
     };
+    if (getParentAgentIdFromLabels(nextRecord.labels)) {
+      const hierarchy = await this.readHierarchyAgents();
+      const stored = await registry.listAll();
+      const ancestors = new Map(stored.map((agent) => [agent.id, agent]));
+      const depth = computeAgentDepth(
+        agentId,
+        (id) => (id === agentId ? nextRecord : (hierarchy.get(id) ?? ancestors.get(id))),
+        this.serverId,
+      );
+      if (depth > MAX_SUBAGENT_DEPTH) {
+        throw new Error(
+          "Restoring this agent would exceed the maximum hierarchy depth of 3 tiers.",
+        );
+      }
+    }
+    // Close and native restore share the lifecycle lane with persisted resume.
+    // No new history or interactive runtime can acquire the writer between them.
+    if (this.agents.has(agentId)) await this.closeAgentRuntime(agentId);
+    await this.syncNativeArchiveState(record.provider, record.persistence, "restore");
+
     if (nextRecord.workspaceId && isMainControlAgentLabels(nextRecord.labels)) {
       const hierarchy = await this.readHierarchyAgents();
       const hasMain = [...hierarchy.values()].some(
@@ -5152,6 +5282,35 @@ export class AgentManager {
     return await this.getLastAssistantMessageFromStores(agentId);
   }
 
+  async getCompletionAssistantMessage(
+    agentId: string,
+    snapshot: Pick<ManagedAgent, "activeTurnId" | "lastTurnCompletion" | "lastError"> | null,
+    status: AgentLifecycleStatus,
+    storedError?: string | null,
+  ): Promise<string | null> {
+    if (snapshot?.activeTurnId) {
+      return this.getTurnAssistantMessage(agentId, snapshot.activeTurnId);
+    }
+    const completed = snapshot?.lastTurnCompletion;
+    const failed =
+      status === "error" || (status === "closed" && Boolean(snapshot?.lastError ?? storedError));
+    if (completed && failed === (completed.event.type === "turn_failed")) {
+      return completed.lastMessage;
+    }
+    // An older stored failure has no turn identity. Its historical last reply may
+    // be from a different turn.
+    return failed ? null : await this.getLastAssistantMessage(agentId);
+  }
+
+  private getTurnAssistantMessage(agentId: string, turnId: string | undefined): string | null {
+    if (!turnId || !this.timelineStore.has(agentId)) return null;
+    return (
+      this.getLastAssistantMessageSegmentFromTimeline(
+        this.timelineStore.getRows(agentId).filter((row) => row.turnId === turnId),
+      )?.text ?? null
+    );
+  }
+
   private getLastAssistantMessageFromTimeline(
     timeline: readonly AgentTimelineItem[],
   ): string | null {
@@ -5234,13 +5393,20 @@ export class AgentManager {
     const pendingForegroundRun = this.runs.getPendingRun(agentId);
     const hasForegroundTurn =
       Boolean(snapshot.activeForegroundTurnId) || Boolean(pendingForegroundRun);
+    const readResponse = (state: ManagedAgent, status: AgentLifecycleStatus) =>
+      options?.completionResponse
+        ? this.getCompletionAssistantMessage(agentId, state, status)
+        : this.getLastAssistantMessage(agentId);
+    const completionSnapshot = (state: ManagedAgent) =>
+      options?.completionResponse ? { completionSnapshot: state } : {};
 
     const immediatePermission = this.peekPendingPermission(snapshot);
     if (immediatePermission) {
       return {
         status: snapshot.lifecycle,
         permission: immediatePermission,
-        lastMessage: await this.getLastAssistantMessage(agentId),
+        lastMessage: await readResponse(snapshot, snapshot.lifecycle),
+        ...completionSnapshot(snapshot),
       };
     }
 
@@ -5251,14 +5417,16 @@ export class AgentManager {
       return {
         status: initialStatus,
         permission: null,
-        lastMessage: await this.getLastAssistantMessage(agentId),
+        lastMessage: await readResponse(snapshot, initialStatus),
+        ...completionSnapshot(snapshot),
       };
     }
     if (waitForActive && !initialBusy && !hasForegroundTurn) {
       return {
         status: initialStatus,
         permission: null,
-        lastMessage: await this.getLastAssistantMessage(agentId),
+        lastMessage: await readResponse(snapshot, initialStatus),
+        ...completionSnapshot(snapshot),
       };
     }
 
@@ -5308,18 +5476,20 @@ export class AgentManager {
         }
       };
 
-      const finish = (permission: AgentPermissionRequest | null) => {
+      const finish = (permission: AgentPermissionRequest | null, state: ManagedAgent) => {
         if (finished) {
           return;
         }
         finished = true;
         cleanup();
-        void this.getLastAssistantMessage(agentId)
+        const status = currentStatus;
+        void readResponse(state, status)
           .then((lastMessage) => {
             resolvePromise({
-              status: currentStatus,
+              status,
               permission,
               lastMessage,
+              ...completionSnapshot(state),
             });
             return;
           })
@@ -5344,7 +5514,7 @@ export class AgentManager {
             currentStatus = event.agent.lifecycle;
             const pending = this.peekPendingPermission(event.agent);
             if (pending) {
-              finish(pending);
+              finish(pending, event.agent);
               return;
             }
             if (isAgentBusy(event.agent.lifecycle)) {
@@ -5355,19 +5525,21 @@ export class AgentManager {
               if (terminalStatusOverride) {
                 currentStatus = terminalStatusOverride;
               }
-              finish(null);
+              finish(null, event.agent);
             }
             return;
           }
 
           if (event.type === "agent_stream") {
             if (event.event.type === "permission_requested") {
-              finish(event.event.request);
+              finish(event.event.request, this.getAgent(agentId) ?? snapshot);
               return;
             }
             if (event.event.type === "turn_failed") {
               hasStarted = true;
-              terminalStatusOverride = "error";
+              // Completion waits use the same state snapshot for status and reply.
+              // A late failure for a different turn must not override it.
+              if (!options?.completionResponse) terminalStatusOverride = "error";
               return;
             }
             if (event.event.type === "turn_completed") {
@@ -5380,6 +5552,7 @@ export class AgentManager {
         },
         { agentId, replayState: true },
       );
+      if (finished) cleanup();
     });
   }
 
@@ -6217,6 +6390,13 @@ export class AgentManager {
         eventTurnId,
         options?.fromHistory === true,
       );
+      if (terminalDisposition !== "stale") {
+        // Capture the remaining reply before publishing state or starting another turn.
+        agent.lastTurnCompletion = {
+          event,
+          lastMessage: this.getTurnAssistantMessage(agent.id, eventTurnId),
+        };
+      }
     }
 
     const flags: StreamEventFlags = { shouldDispatchEvent: true, shouldNotifyWaiters: true };

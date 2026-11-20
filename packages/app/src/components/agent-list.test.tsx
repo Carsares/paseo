@@ -437,6 +437,21 @@ describe("AgentList history hierarchy", () => {
     expect(isHighlighted(getByTestId(inlineProjectID))).toBe(false);
   });
 
+  it("shows a renamed workspace's directory only when search matches it", () => {
+    const props = { agents: [root], ancestors: [], activeWorkspaceIdsByServer };
+    const directoryId = `history-workspace-directory-host:${workspaceId}`;
+    const { getByTestId, queryByTestId, rerender } = render(
+      <AgentList {...props} search="atlas" searchScope="workspace" />,
+    );
+    const directory = getByTestId(directoryId);
+    expect(directory.textContent).toBe("atlas");
+    expect(within(directory).getByText("atlas")).not.toBe(directory);
+    rerender(<AgentList {...props} search="spring" searchScope="workspace" />);
+    expect(queryByTestId(directoryId)).toBeNull();
+    rerender(<AgentList {...props} search="atlas" searchScope="agent" />);
+    expect(queryByTestId(directoryId)).toBeNull();
+  });
+
   it("toggles child rows independently and navigates from both session rows", () => {
     const { getByTestId, queryByTestId } = render(
       <AgentList
@@ -653,6 +668,127 @@ describe("AgentList history hierarchy", () => {
     expect(queryByTestId("sessions-empty")).toBeNull();
   });
 
+  it("keeps new workspaces collapsed after loading another page and permits a single override", () => {
+    const later = agent("later", {
+      workspaceId: "later",
+      projectPlacement: { ...root.projectPlacement!, workspaceName: "Later workspace" },
+    });
+    useAgentHistory.mockReturnValue(historyResult({ agents: [root], hasMore: true }));
+    const { getByRole, getByTestId, queryByTestId, rerender } = renderSessions();
+    const toggleAll = getByTestId("sessions-collapse-all-button");
+    fireEvent.click(toggleAll);
+    useAgentHistory.mockReturnValue(historyResult({ agents: [root, later] }));
+    rerender(<SessionsScreen />);
+    expect(toggleAll.textContent).toBe("Expand all");
+    expect(queryByTestId("agent-row-host-later")).toBeNull();
+    fireEvent.click(getByRole("button", { name: "Expand workspace Later workspace" }));
+    expect(getByTestId("agent-row-host-later").textContent).toContain(later.title);
+    expect(queryByTestId("agent-row-host-root")).toBeNull();
+    expect(toggleAll.textContent).toBe("Collapse all");
+  });
+
+  it("distinguishes same-named filter choices by the paths and hosts of their copies", () => {
+    const project: ProjectDescriptor = {
+      projectId: "atlas-one",
+      projectKey: "remote:github.com/acme/atlas",
+      projectDisplayName: "Atlas",
+      projectCustomName: null,
+      projectKind: "git",
+      projectRootPath: "/repos/atlas",
+    };
+    historyCatalog.hosts = [
+      { serverId: "host", label: "Mac" },
+      { serverId: "peer", label: "Linux" },
+    ];
+    historyCatalog.projects = buildProjects({
+      hosts: [
+        {
+          serverId: "host",
+          serverName: "Mac",
+          isOnline: true,
+          workspaces: [],
+          projects: [
+            project,
+            { ...project, projectId: "atlas-two", projectRootPath: "/temp/atlas" },
+          ],
+        },
+        {
+          serverId: "peer",
+          serverName: "Linux",
+          isOnline: true,
+          workspaces: [],
+          projects: [project],
+        },
+      ],
+    }).projects;
+    const entry = agent("root", {
+      projectPlacement: { ...root.projectPlacement!, projectKey: project.projectId },
+    });
+    useAgentHistory.mockReturnValue(historyResult({ agents: [entry] }));
+    const { getByRole, getByTestId } = renderSessions();
+    const trigger = getByTestId("sessions-project-filter-trigger");
+    fireEvent.click(trigger);
+    expect(getByRole("button", { name: "Atlas · /repos/atlas (Linux)" })).toHaveProperty(
+      "tagName",
+      "BUTTON",
+    );
+    fireEvent.click(getByRole("button", { name: "Atlas · /temp/atlas (Mac)" }));
+    expect(useAgentHistory).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        projectKeysByServer: new Map([["host", ["atlas-two"]]]),
+      }),
+    );
+    fireEvent.click(getByRole("button", { name: "Mac" }));
+    fireEvent.click(trigger);
+    fireEvent.click(getByRole("button", { name: "Atlas · /repos/atlas" }));
+    expect(useAgentHistory).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        projectKeysByServer: new Map([["host", ["atlas-one"]]]),
+      }),
+    );
+  });
+
+  it("distinguishes identical project paths on hosts with the same display name", () => {
+    const project: ProjectDescriptor = {
+      projectId: "atlas",
+      projectKey: "remote:github.com/acme/atlas",
+      projectDisplayName: "Atlas",
+      projectCustomName: null,
+      projectKind: "git",
+      projectRootPath: "/repos/atlas",
+    };
+    historyCatalog.hosts = [
+      { serverId: "host", label: "Mac" },
+      { serverId: "peer", label: "Mac" },
+    ];
+    historyCatalog.projects = buildProjects({
+      hosts: [
+        {
+          serverId: "host",
+          serverName: "Mac",
+          isOnline: true,
+          workspaces: [],
+          projects: [project],
+        },
+        {
+          serverId: "peer",
+          serverName: "Mac",
+          isOnline: true,
+          workspaces: [],
+          projects: [{ ...project, projectKey: "remote:github.com/other/atlas" }],
+        },
+      ],
+    }).projects;
+    useAgentHistory.mockReturnValue(historyResult({}));
+    const { getByRole, getByTestId } = renderSessions();
+    fireEvent.click(getByTestId("sessions-project-filter-trigger"));
+    expect(getByRole("button", { name: "Atlas · /repos/atlas (Mac · host)" })).toBeDefined();
+    fireEvent.click(getByRole("button", { name: "Atlas · /repos/atlas (Mac · peer)" }));
+    expect(useAgentHistory).toHaveBeenLastCalledWith(
+      expect.objectContaining({ projectKeysByServer: new Map([["peer", ["atlas"]]]) }),
+    );
+  });
+
   it("unifies active and archived catalog placements and clears projects outside the selected host", async () => {
     const activeAtlas: ProjectDescriptor = {
       projectId: "atlas-active",
@@ -802,6 +938,7 @@ describe("AgentList history hierarchy", () => {
   });
 
   it("keeps an active ancestor above its archived child and puts the workspace badge on the header", () => {
+    vi.useFakeTimers();
     const { getByRole, getByTestId, queryByTestId } = render(
       <AgentList
         agents={[child]}
@@ -822,6 +959,10 @@ describe("AgentList history hierarchy", () => {
       parentRow.compareDocumentPosition(childRow) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(within(childRow).queryByText("Archived")).toBeNull();
+    fireEvent.mouseDown(parentRow, { button: 0 });
+    act(() => vi.advanceTimersByTime(600));
+    fireEvent.mouseUp(parentRow, { button: 0 });
+    expect(archiveAgent).not.toHaveBeenCalled();
     fireEvent.click(parentRow);
     expect(navigateToAgent).toHaveBeenCalledWith({
       serverId: "host",

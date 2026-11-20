@@ -1,12 +1,16 @@
 import { getErrorMessage } from "@getpaseo/protocol/error-utils";
 import {
   daemonInstallOriginRuntime,
-  installedServerSupportsAgentResume,
+  readInstalledServerRecoveryIdentity,
   resolveNpmGlobalPrefix,
   validateDaemonInstallOrigin,
   type DaemonInstallOriginRuntime,
 } from "./install-origin.js";
-import { npmGlobalPaseoCli, type NpmGlobalPaseoCli } from "./npm-global-cli.js";
+import {
+  npmGlobalPaseoCli,
+  type NpmGlobalPaseoCli,
+  type NpmGlobalPaseoInstall,
+} from "./npm-global-cli.js";
 
 export type DaemonSelfUpdatePhase = "starting" | "downloading" | "installing" | "complete";
 
@@ -51,8 +55,36 @@ const DESKTOP_MANAGED_UPDATE_ERROR =
 
 export class DaemonSelfUpdater {
   private inProgress = false;
+  // Kept by the process-wide updater so a retry can also come from a new connection.
+  private installedForRestart?: {
+    daemonVersion: string | null;
+    serverRoot: string;
+    install: NpmGlobalPaseoInstall;
+    recoveryIdentity: string;
+  };
 
   constructor(private readonly runtime: DaemonSelfUpdateRuntime = defaultRuntime) {}
+
+  private async canReuseInstall(input: {
+    daemonVersion: string | null;
+    serverRoot: string | null;
+    install: NpmGlobalPaseoInstall;
+  }): Promise<boolean> {
+    const pending = this.installedForRestart;
+    if (!pending) return false;
+
+    const { install, serverRoot } = input;
+    const matches =
+      pending.daemonVersion === input.daemonVersion &&
+      pending.serverRoot === serverRoot &&
+      pending.install.version === install.version &&
+      pending.install.packagePath === install.packagePath &&
+      pending.install.globalRootPath === install.globalRootPath &&
+      !validateDaemonInstallOrigin(install, pending.install.version, this.runtime.installOrigin) &&
+      (await readInstalledServerRecoveryIdentity(install, serverRoot)) === pending.recoveryIdentity;
+    if (!matches) this.installedForRestart = undefined;
+    return matches;
+  }
 
   async update(input: DaemonSelfUpdateInput): Promise<DaemonSelfUpdateResult> {
     if (input.desktopManaged) {
@@ -71,6 +103,21 @@ export class DaemonSelfUpdater {
         prefix: resolveNpmGlobalPrefix(currentServerRoot),
       };
       const install = await this.runtime.npm.inspect(npmOptions);
+      if (
+        await this.canReuseInstall({
+          daemonVersion: input.daemonVersion,
+          serverRoot: currentServerRoot,
+          install,
+        })
+      ) {
+        input.onProgress("complete");
+        return {
+          success: true,
+          error: null,
+          newVersion: install.version,
+          agentResumeSupported: true,
+        };
+      }
       const unsupportedReason = validateDaemonInstallOrigin(
         install,
         input.daemonVersion,
@@ -99,15 +146,28 @@ export class DaemonSelfUpdater {
         return null;
       });
 
+      const recoveryIdentity =
+        updatedInstall &&
+        (await readInstalledServerRecoveryIdentity(updatedInstall, currentServerRoot));
+      if (
+        recoveryIdentity &&
+        currentServerRoot &&
+        updatedInstall.packagePath === install.packagePath &&
+        updatedInstall.globalRootPath === install.globalRootPath
+      ) {
+        this.installedForRestart = {
+          daemonVersion: input.daemonVersion,
+          serverRoot: currentServerRoot,
+          install: updatedInstall,
+          recoveryIdentity,
+        };
+      }
       input.onProgress("complete");
       return {
         success: true,
         error: null,
         newVersion: updatedInstall?.version ?? null,
-        ...(updatedInstall &&
-        (await installedServerSupportsAgentResume(updatedInstall, currentServerRoot))
-          ? { agentResumeSupported: true }
-          : {}),
+        ...(recoveryIdentity ? { agentResumeSupported: true } : {}),
       };
     } catch (error) {
       input.logger.error({ err: error }, "Daemon self-update failed with exception");

@@ -20,7 +20,7 @@ import type {
   WorkspaceArchiveContext,
   WorkspaceRegistry,
 } from "./workspace-registry.js";
-import { createRealpathAwarePathMatcher } from "../utils/path.js";
+import { createRealpathAwarePathMatcher, isRealpathInsideRoot } from "../utils/path.js";
 import { runWithGitCommandPriority } from "../utils/run-git-command.js";
 import { WorkspaceAutomationBlockedError } from "./workspace-automation-gate.js";
 
@@ -36,7 +36,7 @@ export interface ArchiveDependencies {
   github: ForgeService;
   workspaceGitService: Pick<WorkspaceGitService, "getSnapshot" | "invalidateWorktrees">;
   agentManager: Pick<AgentManager, "listAgents" | "getAgent" | "archiveAgent" | "archiveSnapshot">;
-  agentStorage: Pick<AgentStorage, "listByWorkspace">;
+  agentStorage: Pick<AgentStorage, "listActive" | "listByWorkspace">;
   // Resolves the worktree at a path to its workspaceId for archive-by-path. The
   // path uniquely identifies a worktree workspace; this is a directory lookup for
   // the archive target, not status/ownership.
@@ -555,8 +555,8 @@ function uniqueTeardownTargets<T extends { cwd: string }>(targets: T[]): T[] {
 
 export type ArchiveWorkspaceContentsDependencies = Pick<
   ArchiveDependencies,
-  "agentManager" | "agentStorage" | "killTerminalsForWorkspace" | "sessionLogger"
->;
+  "agentManager" | "killTerminalsForWorkspace" | "sessionLogger"
+> & { agentStorage: Pick<AgentStorage, "listByWorkspace"> };
 
 // Tears down everything OWNED by a single workspace record: its live agents,
 // its persisted-but-not-running agent snapshots, and its terminals. Scoped by
@@ -626,14 +626,16 @@ export async function archiveWorkspaceContents(
   return archivedAgents;
 }
 
-// True when, after archiving
-// the in-scope records, no active workspace still points at targetDir. Derived
-// from records each call — no stored counter.
+// Check actual working directories too. Older agent records could specify a
+// cwd independently of their workspace, and moves leave that cwd unchanged.
 async function isDirectoryUnreferenced(
   activeWorkspaces: ActiveWorkspaceRef[],
   targetDir: string,
   archivedWorkspaceIds: ReadonlySet<string>,
-  dependencies: Pick<ArchiveDependencies, "paseoHome" | "paseoWorktreesBaseRoot">,
+  dependencies: Pick<
+    ArchiveDependencies,
+    "paseoHome" | "paseoWorktreesBaseRoot" | "agentStorage" | "agentManager"
+  >,
 ): Promise<boolean> {
   const target = resolve(targetDir);
   const matchesTarget = createRealpathAwarePathMatcher(target);
@@ -642,7 +644,9 @@ async function isDirectoryUnreferenced(
     const backingDirectory = await resolveWorkspaceBackingDirectory(workspace, dependencies);
     if (matchesTarget(backingDirectory.path)) return false;
   }
-  return true;
+  const stored = await dependencies.agentStorage.listActive();
+  const live = dependencies.agentManager.listAgents({ includeInternal: true });
+  return ![...stored, ...live].some((agent) => isRealpathInsideRoot(target, agent.cwd));
 }
 
 export async function killTerminalsForWorkspace(

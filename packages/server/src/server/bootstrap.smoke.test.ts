@@ -13,6 +13,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { WebSocket } from "ws";
 
 import { createPaseoDaemon, parseListenString, type PaseoDaemonConfig } from "./bootstrap.js";
+import { SavedRecoveryTerminalCleanupError } from "./daemon-shutdown-outcome.js";
 import { loadConfig } from "./config.js";
 import {
   FileBackedProjectRegistry,
@@ -35,6 +36,7 @@ import {
   snapshotGitCommandRuntimeMetrics,
 } from "../utils/run-git-command.js";
 import { DEFAULT_GIT_PROCESS_POLICY } from "../utils/git-process-scheduler.js";
+import { VoiceAssistantWebSocketServer } from "./websocket-server.js";
 import type {
   HubEnrollment,
   HubEnrollmentResult,
@@ -620,6 +622,107 @@ describe("paseo daemon bootstrap", () => {
       ).resolves.toEqual([{ status: "rejected", statusCode: 503 }, "rejected"]);
     } finally {
       await shutdown.finish();
+    }
+  });
+
+  test("ordinary shutdown closes terminals and the listener after the admission wait times out", async () => {
+    const handle = await createTestPaseoDaemon();
+    const { daemon } = handle;
+    const waiting = Promise.withResolvers<void>();
+    vi.spyOn(daemon.agentManager, "waitForAdmittedRunsToStart").mockImplementationOnce(() => {
+      waiting.resolve();
+      return new Promise<void>(() => {});
+    });
+    const closeTerminals = vi.spyOn(daemon.terminalManager, "closeTerminals");
+    try {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const stopped = daemon.stop();
+      const stopAssertion = expect(stopped).resolves.toBeUndefined();
+      await waiting.promise;
+      await vi.advanceTimersByTimeAsync(5_000);
+      vi.useRealTimers();
+
+      await stopAssertion;
+      expect(closeTerminals).toHaveBeenCalledOnce();
+      await expect(fetch(`http://127.0.0.1:${handle.port}/api/health`)).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+      await handle.close();
+    }
+  });
+
+  test("ordinary shutdown closes terminals and the listener while dispatch is still stuck", async () => {
+    const accepting = VoiceAssistantWebSocketServer.prototype.beginAcceptingConnections;
+    const socketServer = Promise.withResolvers<VoiceAssistantWebSocketServer>();
+    vi.spyOn(
+      VoiceAssistantWebSocketServer.prototype,
+      "beginAcceptingConnections",
+    ).mockImplementationOnce(function (this: VoiceAssistantWebSocketServer) {
+      accepting.call(this);
+      socketServer.resolve(this);
+    });
+    const handle = await createTestPaseoDaemon();
+    const { daemon } = handle;
+    const dispatchStarted = Promise.withResolvers<void>();
+    const releaseDispatch = Promise.withResolvers<void>();
+    const closeTerminals = vi.spyOn(daemon.terminalManager, "closeTerminals");
+    try {
+      const agent = await daemon.agentManager.createAgent(
+        { provider: "codex", cwd: handle.paseoHome },
+        undefined,
+        { workspaceId: undefined },
+      );
+      const { agentMessages } = await socketServer.promise;
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const receipt = agentMessages.enqueue({
+        recipientId: agent.id,
+        prompt: "Queued before shutdown",
+        source: { kind: "agent-message", agentId: agent.id },
+        async beforeProviderDispatch() {
+          dispatchStarted.resolve();
+          await releaseDispatch.promise;
+        },
+      });
+      const stopped = daemon.stop();
+      const stopAssertion = expect(stopped).resolves.toBeUndefined();
+      await dispatchStarted.promise;
+      await vi.advanceTimersByTimeAsync(5_000);
+      vi.useRealTimers();
+
+      await stopAssertion;
+      expect(closeTerminals).toHaveBeenCalledOnce();
+      await expect(fetch(`http://127.0.0.1:${handle.port}/api/health`)).rejects.toThrow();
+      releaseDispatch.resolve();
+      await expect(receipt.dispatched).rejects.toThrow();
+    } finally {
+      releaseDispatch.resolve();
+      vi.useRealTimers();
+      await handle.close();
+    }
+  });
+
+  test("marks a terminal cleanup failure separately only after saving explicit recovery", async () => {
+    const handle = await createTestPaseoDaemon();
+    const { daemon } = handle;
+    const marker = path.join(handle.paseoHome, "restart-recovery-once.json");
+    const saveError = new Error("Recovery storage failed");
+    const terminalError = new Error("Terminal reaper failed");
+    vi.spyOn(daemon.agentStorage, "flush").mockRejectedValueOnce(saveError);
+    const closeTerminals = vi
+      .spyOn(daemon.terminalManager, "closeTerminals")
+      .mockRejectedValueOnce(terminalError);
+    try {
+      await expect(daemon.stop({ resumeAgents: true })).rejects.toBe(saveError);
+      expect(closeTerminals).not.toHaveBeenCalled();
+      await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+      const stopped = daemon.stop({ resumeAgents: true });
+      await expect(stopped).rejects.toBeInstanceOf(SavedRecoveryTerminalCleanupError);
+      await expect(stopped).rejects.toHaveProperty("cause", terminalError);
+      expect(closeTerminals).toHaveBeenCalledOnce();
+      expect(JSON.parse(await readFile(marker, "utf8"))).toEqual({ version: 2, agentIds: [] });
+    } finally {
+      await handle.close();
     }
   });
 

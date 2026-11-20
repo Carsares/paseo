@@ -503,9 +503,8 @@ export function WorkspaceDraftComposer({
     workspaceId,
   });
   const draftAttachmentScopeKey = useDraftWorkspaceAttachmentScopeKey(draftId);
-  const isDraftHistoryReady = useWorkspaceAttachmentsStore(
-    (state) =>
-      !draftSetup?.restoreChatHistory || isDraftChatHistoryReady(state, draftAttachmentScopeKey),
+  const areDraftAttachmentsReady = useWorkspaceAttachmentsStore((state) =>
+    isDraftChatHistoryReady(state, draftAttachmentScopeKey),
   );
   const openInSidePane = useSettings((settings) => settings.openInSidePane);
   const attachmentScopeKeys = useMemo(
@@ -536,7 +535,7 @@ export function WorkspaceDraftComposer({
       initialAttempt: initialCreateAttempt,
       allowEmptyText: allowsEmptyAutoSubmit,
       validateBeforeSubmit: ({ text, attachments }) => {
-        if (!isDraftHistoryReady) return t("common.loading");
+        if (!areDraftAttachmentsReady) return t("common.loading");
         const allowsEmptyDraftText = shouldAllowEmptyDraftText({
           allowsEmptyAutoSubmit,
           attachments,
@@ -639,7 +638,7 @@ export function WorkspaceDraftComposer({
   );
   const autoSubmitKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!isReadyForPendingAutoSubmit || !isDraftHistoryReady) {
+    if (!isReadyForPendingAutoSubmit || !areDraftAttachmentsReady) {
       return;
     }
     const submitKey = `${serverId}:${workspaceId}:${draftId}`;
@@ -679,7 +678,7 @@ export function WorkspaceDraftComposer({
     handleCreateFromInput,
     initialCreateAttempt,
     isReadyForPendingAutoSubmit,
-    isDraftHistoryReady,
+    areDraftAttachmentsReady,
     serverId,
     setDraftAttachments,
     replaceDraftText,
@@ -726,7 +725,7 @@ export function WorkspaceDraftComposer({
         workspaceId={workspaceId}
         isPaneFocused={isPaneFocused}
         onSubmitMessage={handleCreateFromInput}
-        isSubmitLoading={isSubmitting || !isDraftHistoryReady}
+        isSubmitLoading={isSubmitting || !areDraftAttachmentsReady}
         blurOnSubmit={true}
         textSource={draftInput.textSource}
         onChangeText={draftInput.editText}

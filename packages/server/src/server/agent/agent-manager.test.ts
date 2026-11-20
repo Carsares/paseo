@@ -1,4 +1,5 @@
 import { createIdleRuntimeCleanup } from "./idle-runtime-cleanup/index.js";
+import { createFinishObservation } from "./finish-subscriptions/internal/observation.js";
 import {
   prepareAgentMessage,
   formatAgentMessage,
@@ -13898,6 +13899,129 @@ test("the last assistant message is the newest turn's reply, not joined to the p
     rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test.each([
+  { terminal: "turn_failed", retainedReply: null },
+  { terminal: "turn_failed", retainedReply: "Retained current reply" },
+  { terminal: "turn_completed", retainedReply: null },
+] as const)(
+  "finish observation and scoped wait use only the $terminal turn's remaining reply ($retainedReply)",
+  async ({ terminal, retainedReply }) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-finish-reply-"));
+    const session = new TestAgentSession({ provider: "codex", cwd: workdir });
+    const client = new (class extends TestAgentClient {
+      override async createSession(): Promise<AgentSession> {
+        return session;
+      }
+    })();
+    const manager = new AgentManager({ clients: { codex: client }, logger });
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const signal = new AbortController().signal;
+    const initialWait = Promise.withResolvers<void>();
+    const observer = createFinishObservation({
+      agentManager: manager,
+      agentStorage: new AgentStorage(join(workdir, "agents"), logger),
+      waitForResume: async () => {},
+      messages: () => ({
+        enqueue: () => {
+          throw new Error("Unexpected enqueue");
+        },
+        hasPending: () => false,
+        close: async () => {},
+        waitForDispatch: () => initialWait.promise,
+      }),
+      hosts: () => {
+        throw new Error("Unexpected remote host");
+      },
+      serverId: "local",
+      logger,
+    });
+    function start(turnId: string) {
+      session.pushEvent({ type: "turn_started", provider: "codex", turnId });
+    }
+    function reply(turnId: string, messageId: string, text: string) {
+      session.pushEvent({
+        type: "timeline",
+        provider: "codex",
+        turnId,
+        item: { type: "assistant_message", messageId, text },
+      });
+    }
+    function complete(turnId: string) {
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId });
+    }
+
+    try {
+      start("previous");
+      reply("previous", "earlier", "Previous turn's reply");
+      complete("previous");
+      start("observed");
+      await vi.waitFor(() => expect(manager.getAgent(agent.id)?.activeTurnId).toBe("observed"));
+      const observation = await observer.open(
+        { id: "observe", callerAgentId: "parent", childAgentId: agent.id },
+        signal,
+      );
+      try {
+        const remoteWait = manager.waitForAgentEvent(agent.id, {
+          completionResponse: true,
+          waitForActive: true,
+          signal,
+        });
+        if (terminal === "turn_failed") {
+          reply("observed", "removed", "Retracted reply");
+          if (retainedReply) reply("observed", "retained", retainedReply);
+          session.pushEvent({
+            type: "assistant_messages_removed",
+            provider: "codex",
+            turnId: "observed",
+            messageIds: ["removed"],
+          });
+          session.pushEvent({
+            type: "turn_failed",
+            provider: "codex",
+            turnId: "observed",
+            error: "Failed turn",
+          });
+        } else {
+          session.pushEvent({
+            type: "turn_failed",
+            provider: "codex",
+            turnId: "previous",
+            error: "Stale error",
+          });
+          complete("observed");
+        }
+        start("next");
+        reply("next", "newer", "Next turn's reply");
+        complete("next");
+        await vi.waitFor(async () =>
+          expect(await manager.getLastAssistantMessage(agent.id)).toBe("Next turn's reply"),
+        );
+        initialWait.resolve();
+        const status = terminal === "turn_failed" ? "error" : "idle";
+        const error = terminal === "turn_failed" ? "Failed turn" : null;
+        expect(await remoteWait).toMatchObject({
+          status,
+          lastMessage: retainedReply,
+          completionSnapshot: { lifecycle: status, lastError: error ?? undefined },
+        });
+        expect(await observation.next()).toMatchObject({
+          status,
+          lastMessage: retainedReply,
+          error,
+        });
+      } finally {
+        initialWait.resolve();
+        await observation.close();
+      }
+    } finally {
+      await manager.closeAgent(agent.id);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("reads the last durable assistant response without loading a stored-only child", async () => {
   const store = new RecordingTimelineStore();

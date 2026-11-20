@@ -1,11 +1,14 @@
 import { SessionDelivery } from "../owned-subscriptions/index.js";
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
 import {
   DaemonSelfUpdateInProgressError,
+  DaemonSelfUpdater,
   type DaemonSelfUpdateInput,
-  type DaemonSelfUpdater,
 } from "./daemon-self-updater.js";
 import {
   DaemonSelfUpdateSessionController,
@@ -179,32 +182,61 @@ describe("DaemonSelfUpdateSessionController", () => {
     expect(prepareLifecycleIntent).toHaveBeenCalledExactlyOnceWith(restartIntents[0]);
   });
 
-  test("waits for agent recovery data before acknowledging and does not restart if saving fails", async () => {
-    let rejectPreparation!: (reason: Error) => void;
-    const preparation = new Promise<void>((_resolve, reject) => {
-      rejectPreparation = reject;
+  test("waits for recovery and retries a verified install from a new connection", async ({
+    onTestFinished,
+  }) => {
+    const root = await mkdtemp(path.join(tmpdir(), "paseo-update-retry-"));
+    onTestFinished(() => rm(root, { recursive: true, force: true }));
+    const packagePath = path.join(root, "node_modules", "@getpaseo", "cli");
+    const serverRoot = path.join(packagePath, "node_modules", "@getpaseo", "server");
+    const launcher = path.join(packagePath, "dist", "commands", "daemon", "local-daemon.js");
+    const worker = "dist/server/server/daemon-worker.js";
+    await mkdir(path.dirname(launcher), { recursive: true });
+    await mkdir(path.dirname(path.join(serverRoot, worker)), { recursive: true });
+    await writeFile(launcher, "");
+    await writeFile(path.join(serverRoot, worker), "");
+
+    let version = "0.1.15";
+    let isLinked = false;
+    const installLatest = vi.fn(async () => {
+      version = "0.1.96";
+      await writeFile(
+        path.join(serverRoot, "package.json"),
+        JSON.stringify({
+          name: "@getpaseo/server",
+          version,
+          main: worker,
+          paseoAgentResumeOnRestart: true,
+        }),
+      );
+      return { exitCode: 0, stdout: "", stderr: "" };
     });
-    const prepared: RestartIntent[] = [];
-    const { controller, emitted, restartIntents } = createController({
-      updater: {
-        async update() {
-          return { success: true, error: null, newVersion: "0.1.96", agentResumeSupported: true };
-        },
+    const updater = new DaemonSelfUpdater({
+      npm: {
+        inspect: async () => ({ version, packagePath, globalRootPath: root, isLinked }),
+        installLatest,
       },
+      installOrigin: { resolveCurrentServerPackageRoot: () => serverRoot },
+    });
+    const preparation = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<RestartIntent>();
+    const { controller, emitted, restartIntents } = createController({
+      updater,
       prepareLifecycleIntent(intent) {
-        prepared.push(intent);
-        return preparation;
+        started.resolve(intent);
+        return preparation.promise;
       },
     });
 
     const update = controller.dispatch(updateRequest);
-    await expect.poll(() => prepared).toMatchObject([{ resumeAgents: true }]);
-    expect(emitted).toEqual([]);
-    rejectPreparation(new Error("Recovery data could not be saved"));
+    await expect(started.promise).resolves.toMatchObject({ resumeAgents: true });
+    const responses = () => emitted.filter((message) => message.type === "daemon.update.response");
+    expect(responses()).toEqual([]);
+    preparation.reject(new Error("Recovery data could not be saved"));
     await update;
 
     expect(restartIntents).toEqual([]);
-    expect(emitted).toMatchObject([
+    expect(responses()).toMatchObject([
       {
         type: "daemon.update.response",
         payload: {
@@ -214,6 +246,43 @@ describe("DaemonSelfUpdateSessionController", () => {
         },
       },
     ]);
+
+    const retry = createController({ updater });
+    await retry.controller.dispatch({ ...updateRequest, requestId: "update-2" });
+    expect(retry.emitted.at(-1)).toMatchObject({
+      type: "daemon.update.response",
+      payload: {
+        requestId: "update-2",
+        success: true,
+        newVersion: version,
+        agentResume: "requested",
+      },
+    });
+    expect(retry.restartIntents).toMatchObject([{ requestId: "update-2", resumeAgents: true }]);
+
+    const workerPath = path.join(serverRoot, worker);
+    await rename(workerPath, `${workerPath}.previous`);
+    await writeFile(workerPath, "");
+    const replacedRetry = createController({ updater });
+    await replacedRetry.controller.dispatch(updateRequest);
+    expect(replacedRetry.emitted.at(-1)).toMatchObject({
+      type: "daemon.update.response",
+      payload: {
+        success: false,
+        error: expect.stringContaining("global npm has 0.1.96, daemon is 0.1.15"),
+      },
+    });
+    expect(replacedRetry.restartIntents).toEqual([]);
+
+    isLinked = true;
+    const linkedRetry = createController({ updater });
+    await linkedRetry.controller.dispatch(updateRequest);
+    expect(linkedRetry.emitted.at(-1)).toMatchObject({
+      type: "daemon.update.response",
+      payload: { success: false, error: expect.stringContaining("is linked") },
+    });
+    expect(linkedRetry.restartIntents).toEqual([]);
+    expect(installLatest).toHaveBeenCalledOnce();
   });
 
   test("maps concurrent updates to rpc_error", async () => {

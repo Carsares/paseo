@@ -30,6 +30,7 @@ import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { foldFeatureValues, type LegacyFeatureValues } from "../option-controls.js";
 import {
   getParentAddressFromLabels,
+  isMainControlAgentLabels,
   getParentAgentIdFromLabels,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
@@ -40,7 +41,6 @@ import {
   MAX_SUBAGENT_DEPTH,
   REMOTE_HIERARCHY_DEPTH_LABEL,
   resolveInheritedHierarchyMode,
-  resolveInheritedHierarchyOptions,
   validateCanSpawnChild,
 } from "../hierarchy-policy.js";
 
@@ -488,14 +488,9 @@ async function resolveMcpProviderCreateConfig(params: {
     parent: parent && {
       ...parent,
       currentModeId: resolveInheritedHierarchyMode(parent.currentModeId, parent.labels) ?? null,
-      config: {
-        ...parent.config,
-        providerOptions: resolveInheritedHierarchyOptions(
-          parent.config.providerOptions,
-          parent.labels,
-        ),
-      },
-      effectiveOptions: resolveInheritedHierarchyOptions(parent.effectiveOptions, parent.labels),
+      effectiveOptions: isMainControlAgentLabels(parent.labels)
+        ? parent.config.providerOptions
+        : parent.effectiveOptions,
     },
     unattended: params.input.unattended ?? false,
   });

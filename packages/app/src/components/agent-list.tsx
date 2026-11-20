@@ -7,7 +7,7 @@ import {
   type PressableStateCallbackType,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useCallback, useMemo, useState, type ReactElement } from "react";
+import { Fragment, useCallback, useMemo, useState, type ReactElement } from "react";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
 import { ChevronDown, ChevronRight } from "lucide-react-native";
@@ -67,6 +67,7 @@ export interface HistoryGroupExpansion {
   projectExpandedOverrides: ReadonlyMap<string, boolean>;
   workspaceExpandedOverrides: ReadonlyMap<string, boolean>;
   subagentExpandedOverrides: ReadonlyMap<string, boolean>;
+  workspaceExpandedByDefault: boolean;
 }
 
 const HISTORY_MATCH_OPTIONS = { typoTolerant: true } as const;
@@ -75,6 +76,7 @@ export const DEFAULT_HISTORY_GROUP_EXPANSION: HistoryGroupExpansion = {
   projectExpandedOverrides: EMPTY_EXPANDED_OVERRIDES,
   workspaceExpandedOverrides: EMPTY_EXPANDED_OVERRIDES,
   subagentExpandedOverrides: EMPTY_EXPANDED_OVERRIDES,
+  workspaceExpandedByDefault: true,
 };
 const ThemedRefreshControl = withUnistyles(RefreshControl);
 const ThemedChevronRight = withUnistyles(ChevronRight);
@@ -188,8 +190,57 @@ function WorkspaceHeading({
   onToggle: GroupToggle;
 }) {
   const { t } = useTranslation();
-  const { workspaceName, branch, serverLabel, isWorkspaceArchived } = workspace;
+  const { workspaceName, directoryName, branch, serverLabel, isWorkspaceArchived } = workspace;
   const hostLabel = showHost ? serverLabel : "";
+  const directoryRanges =
+    directoryName !== workspaceName
+      ? findHighlightRanges(search, directoryName, HISTORY_MATCH_OPTIONS)
+      : [];
+  const metadata = [
+    showProjectBadge ? (
+      <Fragment key="project">
+        <ProjectIconView
+          size={16}
+          iconDataUri={null}
+          initial={project.projectName.trim().charAt(0).toUpperCase() || "?"}
+          projectViewKey={project.key}
+          textStyle={styles.projectIconText}
+        />
+        <HighlightedText
+          text={project.projectName}
+          ranges={findHighlightRanges(projectSearch, project.projectName, HISTORY_MATCH_OPTIONS)}
+          style={styles.workspaceMeta}
+          numberOfLines={1}
+          testID={`history-workspace-project-${workspace.key}`}
+        />
+      </Fragment>
+    ) : null,
+    branch ? (
+      <HighlightedText
+        key="branch"
+        text={branch}
+        ranges={findHighlightRanges(search, branch, HISTORY_MATCH_OPTIONS)}
+        style={styles.workspaceMeta}
+        numberOfLines={1}
+        testID={`history-workspace-branch-${workspace.key}`}
+      />
+    ) : null,
+    directoryRanges.length > 0 ? (
+      <HighlightedText
+        key="directory"
+        text={directoryName}
+        ranges={directoryRanges}
+        style={styles.workspaceMeta}
+        numberOfLines={1}
+        testID={`history-workspace-directory-${workspace.key}`}
+      />
+    ) : null,
+    hostLabel ? (
+      <Text key="host" style={styles.workspaceMeta} numberOfLines={1}>
+        {hostLabel}
+      </Text>
+    ) : null,
+  ].filter((item) => item !== null);
   const count = workspace.rootAgents.reduce(
     (total, node) => total + node.subagents.length + (node.isAncestorShell ? 0 : 1),
     0,
@@ -237,48 +288,14 @@ function WorkspaceHeading({
             />
             {isWorkspaceArchived ? <ArchivedBadge /> : null}
           </View>
-          {showProjectBadge || branch || hostLabel ? (
+          {metadata.length > 0 ? (
             <View style={styles.workspaceHeadingRow}>
-              {showProjectBadge ? (
-                <>
-                  <ProjectIconView
-                    size={16}
-                    iconDataUri={null}
-                    initial={project.projectName.trim().charAt(0).toUpperCase() || "?"}
-                    projectViewKey={project.key}
-                    textStyle={styles.projectIconText}
-                  />
-                  <HighlightedText
-                    text={project.projectName}
-                    ranges={findHighlightRanges(
-                      projectSearch,
-                      project.projectName,
-                      HISTORY_MATCH_OPTIONS,
-                    )}
-                    style={styles.workspaceMeta}
-                    numberOfLines={1}
-                    testID={`history-workspace-project-${workspace.key}`}
-                  />
-                </>
-              ) : null}
-              {showProjectBadge && (branch || hostLabel) ? (
-                <Text style={styles.workspaceMeta}>·</Text>
-              ) : null}
-              {branch ? (
-                <HighlightedText
-                  text={branch}
-                  ranges={findHighlightRanges(search, branch, HISTORY_MATCH_OPTIONS)}
-                  style={styles.workspaceMeta}
-                  numberOfLines={1}
-                  testID={`history-workspace-branch-${workspace.key}`}
-                />
-              ) : null}
-              {branch && hostLabel ? <Text style={styles.workspaceMeta}>·</Text> : null}
-              {hostLabel ? (
-                <Text style={styles.workspaceMeta} numberOfLines={1}>
-                  {hostLabel}
-                </Text>
-              ) : null}
+              {metadata.map((item, index) => (
+                <Fragment key={item.key}>
+                  {index > 0 ? <Text style={styles.workspaceMeta}>·</Text> : null}
+                  {item}
+                </Fragment>
+              ))}
             </View>
           ) : null}
         </View>
@@ -343,7 +360,7 @@ function SessionRow({
         style={sessionNavigationStyle}
         highlightStyle={styles.rowPressed}
         onPress={handlePress}
-        onLongPress={handleLongPress}
+        onLongPress={isAncestorShell ? undefined : handleLongPress}
         accessibilityRole="button"
         testID={`agent-row-${testSuffix}`}
       >
@@ -466,8 +483,12 @@ export function AgentList({
     setExpansion(initialExpansion);
   }
   const localExpansion = expansion.key === expansionKey ? expansion : initialExpansion;
-  const { projectExpandedOverrides, workspaceExpandedOverrides, subagentExpandedOverrides } =
-    groupExpansion ?? localExpansion;
+  const {
+    projectExpandedOverrides,
+    workspaceExpandedOverrides,
+    subagentExpandedOverrides,
+    workspaceExpandedByDefault,
+  } = groupExpansion ?? localExpansion;
   const { archiveAgent } = useArchiveAgent();
 
   const actionClient = useSessionStore((state) =>
@@ -512,7 +533,11 @@ export function AgentList({
   }, [actionAgent, actionClient, archiveAgent]);
 
   const toggleLocalExpansion = useCallback(
-    (group: keyof HistoryGroupExpansion, key: string, expanded: boolean) => {
+    (
+      group: keyof Omit<HistoryGroupExpansion, "workspaceExpandedByDefault">,
+      key: string,
+      expanded: boolean,
+    ) => {
       setExpansion((current) => {
         const overrides = new Map(current[group]);
         overrides.set(key, expanded);
@@ -557,6 +582,7 @@ export function AgentList({
         expandedOverrides: subagentExpandedOverrides,
         projectExpandedOverrides,
         workspaceExpandedOverrides,
+        workspaceExpandedByDefault,
         groupMode,
         sort,
       }),
@@ -566,6 +592,7 @@ export function AgentList({
       subagentExpandedOverrides,
       projectExpandedOverrides,
       workspaceExpandedOverrides,
+      workspaceExpandedByDefault,
       groupMode,
       sort,
     ],

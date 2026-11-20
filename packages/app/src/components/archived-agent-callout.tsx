@@ -1,8 +1,10 @@
 import { useCallback, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { View, Text } from "react-native";
 import { useTranslation } from "react-i18next";
 import { StyleSheet } from "react-native-unistyles";
 import { FOOTER_HEIGHT } from "@/constants/layout";
+import { invalidateAgentHistory } from "@/hooks/agent-history-query-key";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { KeyboardTranslateView } from "@/keyboard/shift";
 import { Button } from "@/components/ui/button";
@@ -16,6 +18,7 @@ interface ArchivedAgentCalloutProps {
 
 export function ArchivedAgentCallout({ serverId, agentId }: ArchivedAgentCalloutProps) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const client = useHostRuntimeClient(serverId);
   const isConnected = useHostRuntimeIsConnected(serverId);
   const [isUnarchiving, setIsUnarchiving] = useState(false);
@@ -27,11 +30,12 @@ export function ArchivedAgentCallout({ serverId, agentId }: ArchivedAgentCallout
     setUnarchiveError(null);
     try {
       await client.refreshAgent(agentId);
+      invalidateAgentHistory(queryClient, serverId);
     } catch (error) {
       setUnarchiveError(toErrorMessage(error));
       setIsUnarchiving(false);
     }
-  }, [client, isConnected, isUnarchiving, agentId]);
+  }, [client, isConnected, isUnarchiving, agentId, queryClient, serverId]);
 
   return (
     <KeyboardTranslateView style={styles.container}>

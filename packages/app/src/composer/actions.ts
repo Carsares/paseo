@@ -1,4 +1,8 @@
-import { composePromptTextWithQuotes, hasSlashCommandWithQuotes } from "@/attachments/quote";
+import {
+  composePromptTextWithQuotes,
+  hasSlashCommandWithQuotes,
+  providerRequiresUnquotedSlashCommand,
+} from "@/attachments/quote";
 import { BUILTIN_PROVIDER_IDS } from "@getpaseo/protocol/provider-manifest";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { providersSnapshotQuery } from "@/data/providers-snapshot";
@@ -221,8 +225,8 @@ export async function dispatchComposerAgentMessage(
       const data = await queryClient.ensureQueryData(query);
       provider = data.entries.find((entry) => entry.provider === provider)?.derivedFromProviderId;
     }
-    if (provider === "claude") {
-      throw new Error(i18n.t("composer.errors.removeQuotesForClaudeCommand"));
+    if (providerRequiresUnquotedSlashCommand(provider)) {
+      throw new Error(i18n.t("composer.errors.removeQuotesForSlashCommand"));
     }
   }
   const submittedText = composePromptTextWithQuotes(input.text, input.attachments);

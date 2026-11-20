@@ -197,6 +197,8 @@ export function createTimelineReplica(input: {
 }
 
 export interface TimelinePageResult {
+  /** The response's epoch is available even when a replacement tail is empty. */
+  epoch?: string;
   hasNewer: boolean;
   endCursor: { epoch: string; seq: number } | null;
 }
@@ -205,15 +207,6 @@ export type TimelineResponsePayload = Extract<
   SessionOutboundMessage,
   { type: "fetch_agent_timeline_response" }
 >["payload"];
-
-export function consumeForcedTimelineTailReplacement(
-  payload: TimelineResponsePayload,
-  replacements: Set<string>,
-): TimelineResponsePayload {
-  if (payload.direction !== "tail") return payload;
-  if (!replacements.delete(payload.agentId)) return payload;
-  return { ...payload, reset: true };
-}
 
 function clearAgentInitializingFlag(serverId: string, agentId: string): void {
   useSessionStore.getState().setInitializingAgents(serverId, (previous) => {
@@ -393,8 +386,12 @@ export interface ViewedTimelineSyncPorts {
   fetchPage(
     agentId: string,
     request: ProjectedTimelineForwardFetchPlan,
+    canApply: (page: TimelinePageResult) => boolean,
   ): Promise<TimelinePageResult>;
-  fetchLatestTail(agentId: string): Promise<TimelinePageResult>;
+  fetchLatestTail(
+    agentId: string,
+    canApply: (page: TimelinePageResult) => boolean,
+  ): Promise<TimelinePageResult>;
   /**
    * The sync no longer owes this chat a catch-up: it reached current, or it left the
    * demanded set. Disconnect and backgrounding keep the obligation and do not report here.
@@ -443,7 +440,7 @@ export interface ViewedTimelineSync extends ViewedTimelineUiBridge {
   setActive(active: boolean): void;
   setConnected(connected: boolean): void;
   recoverGap(agentId: string, cursor: { epoch: string; endSeq: number }): void;
-  requestReplacement(agentId: string): void;
+  requestReplacement(agentId: string, epoch: string): void;
   dispose(): void;
 }
 
@@ -476,17 +473,8 @@ export function createViewedTimelineOwner(input: {
   applyTurnLiveness: (agentId: string, transitions: readonly TurnLivenessTransition[]) => void;
   ports: ViewedTimelineOwnerPorts;
 }): ViewedTimelineOwner {
-  const forcedTailReplacements = new Set<string>();
   const sync = createViewedTimelineSync({
     ...input.ports,
-    fetchLatestTail: async (agentId) => {
-      forcedTailReplacements.add(agentId);
-      try {
-        return await input.ports.fetchLatestTail(agentId);
-      } finally {
-        forcedTailReplacements.delete(agentId);
-      }
-    },
     prepare: (agentId) => input.replica.prepare(agentId),
     readCursor: (agentId) => input.replica.readCursor(agentId) ?? input.ports.readCursor(agentId),
     replaceDemandedAgentIds: input.replaceDemandedAgentIds,
@@ -516,8 +504,7 @@ export function createViewedTimelineOwner(input: {
   });
   return {
     ...sync,
-    applyTimelineResponse(receivedPayload) {
-      const payload = consumeForcedTimelineTailReplacement(receivedPayload, forcedTailReplacements);
+    applyTimelineResponse(payload) {
       const accepted = applyAuthoritativeTimelineResponse({
         serverId: input.serverId,
         payload,
@@ -545,14 +532,13 @@ export function createViewedTimelineOwner(input: {
   };
 }
 
-type CatchUpStatus = "running" | "complete" | "error";
-type CatchUpRequest = ProjectedTimelineForwardFetchPlan | { direction: "replacement" };
+type CatchUpRequest =
+  | ProjectedTimelineForwardFetchPlan
+  | { direction: "replacement"; epoch: string };
 
-interface CatchUpState {
-  generation: number;
-  status: CatchUpStatus;
-  request?: CatchUpRequest;
-}
+type CatchUpState =
+  | { generation: number; status: "running" | "error"; request: CatchUpRequest }
+  | { generation: number; status: "complete"; epoch?: string };
 
 function isSameCatchUpRequest(
   left: CatchUpRequest | undefined,
@@ -715,16 +701,31 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
   };
 
   const cancelCatchUp = (agentId: string, preserveReplacement = false) => {
-    const replacementOwed =
-      pendingCatchUps.get(agentId)?.direction === "replacement" ||
-      catchUps.get(agentId)?.request?.direction === "replacement";
+    let replacement = pendingCatchUps.get(agentId);
+    if (replacement?.direction !== "replacement") {
+      const current = catchUps.get(agentId);
+      replacement = current && current.status !== "complete" ? current.request : undefined;
+    }
     catchUpGenerations.set(agentId, (catchUpGenerations.get(agentId) ?? 0) + 1);
     catchUps.delete(agentId);
-    if (preserveReplacement && replacementOwed) {
-      pendingCatchUps.set(agentId, { direction: "replacement" });
+    if (preserveReplacement && replacement?.direction === "replacement") {
+      pendingCatchUps.set(agentId, replacement);
     } else {
       pendingCatchUps.delete(agentId);
     }
+  };
+
+  const completeCatchUp = (agentId: string, generation: number, epoch?: string) => {
+    catchUps.set(agentId, { generation, status: "complete", epoch });
+    const pending = pendingCatchUps.get(agentId);
+    // A tail can already include a replacement committed after the fetch started.
+    if (pending?.direction === "replacement" && pending.epoch === epoch) {
+      pendingCatchUps.delete(agentId);
+    } else if (pending) {
+      startCatchUp(agentId, { request: pending, supersede: true });
+      return;
+    }
+    setVisibilityCatchUpReady(agentId);
   };
 
   const fetchUntilCurrent = async (
@@ -736,14 +737,23 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
   ): Promise<void> => {
     if (!ownsCatchUp(agentId, generation)) return;
 
+    const canApply = (page: TimelinePageResult) => {
+      if (!ownsCatchUp(agentId, generation)) return false;
+      const pending = pendingCatchUps.get(agentId);
+      return pending?.direction !== "replacement" || pending.epoch === page.epoch;
+    };
     try {
-      const page = await (request.direction === "replacement"
-        ? ports.fetchLatestTail(agentId)
-        : ports.fetchPage(agentId, request));
+      let page = await (request.direction === "replacement"
+        ? ports.fetchLatestTail(agentId, canApply)
+        : ports.fetchPage(agentId, request, canApply));
       if (!ownsCatchUp(agentId, generation)) return;
+      if (!canApply(page)) {
+        completeCatchUp(agentId, generation);
+        return;
+      }
       if (page.hasNewer && page.endCursor) {
         if (fallbackToLatestTailOnOverflow) {
-          await ports.fetchLatestTail(agentId);
+          page = await ports.fetchLatestTail(agentId, canApply);
           if (!ownsCatchUp(agentId, generation)) return;
         } else {
           await fetchUntilCurrent(
@@ -758,13 +768,7 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
       } else if (page.hasNewer) {
         throw new Error(`Timeline page for ${agentId} hasNewer without an end cursor`);
       }
-      catchUps.set(agentId, { generation, status: "complete" });
-      const pendingCatchUp = pendingCatchUps.get(agentId);
-      if (pendingCatchUp) {
-        startCatchUp(agentId, { request: pendingCatchUp, supersede: true });
-        return;
-      }
-      setVisibilityCatchUpReady(agentId);
+      completeCatchUp(agentId, generation, canApply(page) ? page.epoch : undefined);
     } catch (error) {
       if (ownsCatchUp(agentId, generation)) {
         const pending = pendingCatchUps.get(agentId);
@@ -906,7 +910,11 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
   const completeCurrentCatchUp = (agentId: string) => {
     const generation = (catchUpGenerations.get(agentId) ?? 0) + 1;
     catchUpGenerations.set(agentId, generation);
-    catchUps.set(agentId, { generation, status: "complete" });
+    catchUps.set(agentId, {
+      generation,
+      status: "complete",
+      epoch: ports.readCursor(agentId)?.epoch,
+    });
     ports.applyCurrentTimeline(agentId);
     setVisibilityCatchUpReady(agentId);
   };
@@ -1159,11 +1167,22 @@ export function createViewedTimelineSync(ports: ViewedTimelineSyncPorts): Viewed
         supersede: true,
       });
     },
-    requestReplacement(agentId) {
+    requestReplacement(agentId, epoch) {
       if (disposed || !isDesired(agentId)) return;
+      const pending = pendingCatchUps.get(agentId);
+      const current = catchUps.get(agentId);
+      if (pending?.direction === "replacement" && pending.epoch === epoch) return;
+      if (
+        current?.status === "running" &&
+        current.request.direction === "replacement" &&
+        current.request.epoch === epoch
+      )
+        return;
+      if (current?.status === "complete" && current.epoch === epoch) return;
+      pendingCatchUps.set(agentId, { direction: "replacement", epoch });
       markCatchUpOwed(agentId);
       visibilityCatchUpErrors.delete(agentId);
-      startCatchUp(agentId, { request: { direction: "replacement" }, supersede: true });
+      startCatchUp(agentId);
       notifyListeners();
     },
     dispose() {

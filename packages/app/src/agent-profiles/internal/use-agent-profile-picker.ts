@@ -52,6 +52,11 @@ function resolveTargetProviderModeIds(
   provider: string,
 ): string[] | null {
   const targetEntry = entries?.find((entry) => entry.provider === provider);
+  // OpenCode loads modes from the target working directory. The host catalog
+  // used to label presets cannot tell whether a project mode is valid there.
+  if (provider === "opencode" || targetEntry?.derivedFromProviderId === "opencode") {
+    return null;
+  }
   if (targetEntry?.status !== "ready") {
     return null;
   }

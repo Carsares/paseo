@@ -201,8 +201,7 @@ export const fr: TranslationResources = {
     },
     errors: {
       failedToSend: "Impossible d’envoyer le message",
-      removeQuotesForClaudeCommand:
-        "Retirez les citations pour exécuter cette commande oblique de Claude.",
+      removeQuotesForSlashCommand: "Retirez les citations pour exécuter cette commande slash.",
       failedToCreateAgent: "Impossible de créer l’agent",
       noHostSelected: "Aucun hôte sélectionné",
       initialPromptRequired: "Un prompt initial est requis",
@@ -424,6 +423,7 @@ export const fr: TranslationResources = {
       forkUnavailable: "Mettez à jour l’hôte pour utiliser cette fonction.",
       forkMissingWorkspace: "Cet agent n’est dans aucun espace de travail.",
       forkFailed: "Impossible de forker la conversation",
+      forkSourceHostRemoved: "L’hôte d’origine a été supprimé.",
       openFile: "Ouvrir le fichier",
       copied: "Copié",
     },
@@ -822,6 +822,10 @@ export const fr: TranslationResources = {
         closeTerminalTitle: "Fermer le terminal ?",
         closeTerminalMessage: "Tout processus en cours dans ce terminal sera arrêté immédiatement.",
         archiveRunningAgentTitle: "Archiver l’agent en cours ?",
+        handoffKeepQueueTitle: "Conserver les messages en attente avec l’agent d’origine ?",
+        handoffKeepQueueMessage:
+          "L’agent d’origine reste ouvert et enverra les messages en attente avec son fournisseur actuel.",
+        handoffKeepQueueConfirm: "Changer de fournisseur",
         archiveRunningAgentMessage:
           "Cet agent est toujours en cours d’exécution. L’archiver arrêtera l’agent et fermera l’onglet.",
         closeTabsLeftTitle: "Fermer les onglets à gauche ?",
@@ -2692,7 +2696,7 @@ export const fr: TranslationResources = {
       officialUpdates: {
         label: "Autoriser les mises à jour officielles",
         description:
-          "Rechercher, télécharger et installer les versions officielles. Elles remplacent les versions personnalisées.",
+          "Rechercher, télécharger et installer les versions officielles. Elles remplacent les versions personnalisées. Sur macOS, vous pouvez désactiver cette option à la fin de la tentative d’installation. macOS peut terminer une mise à jour déjà préparée à la réouverture de l’application.",
         disabled: "Les mises à jour officielles sont désactivées.",
       },
       updates: {

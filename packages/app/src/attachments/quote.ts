@@ -40,10 +40,16 @@ export function hasSlashCommandWithQuotes(
   text: string,
   attachments: readonly ComposerAttachment[],
 ): boolean {
-  // Match Claude's command token. Paths such as /usr/bin are ordinary prompts.
+  // Match the providers' command token. Paths such as /usr/bin are ordinary prompts.
   return (
     /^\/[^/\s]+(?:\s|$)/.test(text.trim()) &&
     attachments.some((attachment) => attachment.kind === "quote" && attachment.text.trim())
+  );
+}
+
+export function providerRequiresUnquotedSlashCommand(provider: string | null | undefined): boolean {
+  return (
+    provider === "claude" || provider === "codex" || provider === "opencode" || provider === "pi"
   );
 }
 

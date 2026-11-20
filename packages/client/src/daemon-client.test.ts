@@ -8924,6 +8924,136 @@ test.each([false, true])(
   },
 );
 
+test.each([false, true])(
+  "structured agent notification events require host support=%s",
+  async (supported) => {
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "notification-events",
+      transportFactory: () => transport.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    transport.triggerOpen({
+      features: {
+        agentMessageProvenance: true,
+        agentMessageBatching: true,
+        agentMessageDispatchConfirmation: true,
+        agentNotificationEvents: supported,
+      },
+    });
+    await connecting;
+    const options = {
+      sourceAgentId: "server::sender",
+      sourceAgentServerId: "source-server",
+      waitForDispatch: true,
+    };
+    if (!supported) {
+      await expect(
+        client.sendAgentMessage("recipient", "finished", {
+          ...options,
+          sourceAgentEvent: "finished",
+        }),
+      ).rejects.toMatchObject({ code: "AGENT_NOTIFICATION_EVENTS_UNSUPPORTED" });
+      expect(transport.sent).toHaveLength(0);
+    }
+    const send = client.sendAgentMessage("recipient", "finished", {
+      ...options,
+      ...(supported ? { sourceAgentEvent: "finished" } : {}),
+    });
+    const request = parseSentFrame(transport.sent[0]);
+    expect(request).toMatchObject({
+      type: "send_agent_message_request",
+      text: "finished",
+      sourceAgentId: "server::sender",
+      sourceAgentServerId: "source-server",
+      waitForDispatch: true,
+    });
+    expect(request.sourceAgentEvent).toBe(supported ? "finished" : undefined);
+    transport.triggerMessage(
+      wrapSessionMessage({
+        type: "send_agent_message_response",
+        payload: {
+          requestId: request.requestId,
+          agentId: "recipient",
+          accepted: true,
+          error: null,
+        },
+      }),
+    );
+    await send;
+  },
+);
+
+test("reports missing dispatch confirmation only after the host handshake", async () => {
+  const transport = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "notification-dispatch",
+    transportFactory: () => transport.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const send = () =>
+    client.sendAgentMessage("recipient", "finished", {
+      sourceAgentId: "server::sender",
+      sourceAgentServerId: "source-server",
+      waitForDispatch: true,
+    });
+
+  const connecting = client.connect();
+  void connecting.catch(() => undefined);
+  await expect(send()).rejects.toMatchObject({ code: "DAEMON_CONNECTION_LOST" });
+  expect(transport.sent).toHaveLength(0);
+
+  transport.triggerOpen({ features: {} });
+  await connecting;
+  await expect(send()).rejects.toMatchObject({
+    code: "AGENT_MESSAGE_DISPATCH_CONFIRMATION_UNSUPPORTED",
+  });
+  expect(transport.sent).toHaveLength(0);
+
+  transport.triggerClose({ code: 1006, reason: "network lost" });
+  await expect(send()).rejects.toMatchObject({ code: "DAEMON_CONNECTION_LOST" });
+  expect(transport.sent).toHaveLength(0);
+});
+
+test("treats a queued reply from a capable host as an unconfirmed dispatch", async () => {
+  const transport = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "queued-notification",
+    transportFactory: () => transport.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  transport.triggerOpen({ features: { agentMessageDispatchConfirmation: true } });
+  await connecting;
+
+  const send = client.sendAgentMessage("recipient", "finished", { waitForDispatch: true });
+  const request = parseSentFrame(transport.sent[0]);
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "send_agent_message_response",
+      payload: {
+        requestId: request.requestId,
+        agentId: "recipient",
+        accepted: true,
+        deliveryStatus: "queued",
+        error: null,
+      },
+    }),
+  );
+  await expect(send).rejects.toThrow("Agent message was queued without dispatch confirmation.");
+  await expect(send).rejects.not.toHaveProperty(
+    "code",
+    "AGENT_MESSAGE_DISPATCH_CONFIRMATION_UNSUPPORTED",
+  );
+});
+
 test("measures an outbound message in UTF-8 bytes against the daemon's message limit", async () => {
   const mock = createMockTransport();
   const client = new DaemonClient({

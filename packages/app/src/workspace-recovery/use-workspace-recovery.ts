@@ -1,6 +1,7 @@
 import { useCallback, useMemo } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useFetchQuery } from "@/data/query";
+import { invalidateAgentHistory } from "@/hooks/agent-history-query-key";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { useSessionStore } from "@/stores/session-store";
 import { toErrorMessage } from "@/utils/error-messages";
@@ -30,6 +31,7 @@ export function useWorkspaceRecovery(input: {
   workspaceId: string;
   enabled: boolean;
 }): WorkspaceRecoveryController {
+  const queryClient = useQueryClient();
   const client = useHostRuntimeClient(input.serverId);
   const isConnected = useHostRuntimeIsConnected(input.serverId);
   const serverInfo = useSessionStore((store) => store.sessions[input.serverId]?.serverInfo ?? null);
@@ -58,6 +60,7 @@ export function useWorkspaceRecovery(input: {
       await waitForMinimumRecoveryLoadingTime();
       await client.restoreWorkspace(input.workspaceId);
     },
+    onSuccess: () => invalidateAgentHistory(queryClient, input.serverId),
   });
 
   const state = useMemo(

@@ -30,10 +30,11 @@ class Observation implements FinishObservation {
   permission = deferred<void>();
   opening: Promise<void> = Promise.resolve();
   openedSignals: AbortSignal[] = [];
+  closed = vi.fn(async () => {});
   async open(_record: unknown, signal: AbortSignal) {
     this.openedSignals.push(signal);
     await this.opening;
-    return { next: () => this.wait(signal), close: async () => {} };
+    return { next: () => this.wait(signal), close: this.closed };
   }
   async wait(signal: AbortSignal) {
     signal.throwIfAborted();
@@ -153,7 +154,13 @@ test("restores a remote parent subscription and delivers to the owning host", as
     .mockImplementation(() => confirmed.promise);
   const fetchAgent = vi.fn(async () => ({ agent: { archivedAt: null } }));
   const use = vi.fn((_serverId: string, action: (client: DaemonClient) => Promise<unknown>) =>
-    action({ sendMessage, fetchAgent } as unknown as DaemonClient),
+    action({
+      sendMessage,
+      fetchAgent,
+      getLastServerInfoMessage: () => ({
+        features: { agentMessageDispatchConfirmation: true },
+      }),
+    } as unknown as DaemonClient),
   );
   const restarted = createFinishSubscriptions({
     store,
@@ -197,6 +204,56 @@ test("restores a remote parent subscription and delivers to the owning host", as
   );
   expect(callerIsActive).not.toHaveBeenCalled();
   expect(first.delivery.prompts).toEqual([]);
+});
+
+test("stops retrying when the parent host cannot confirm message dispatch", async () => {
+  const home = await mkdtemp(join(tmpdir(), "finish-capability-"));
+  homes.push(home);
+  const store = createJsonFinishSubscriptionStore(home);
+  const observation = new Observation();
+  const sendMessage = vi.fn<() => Promise<{ deliveryStatus?: "queued" }>>().mockRejectedValue(
+    Object.assign(new Error("Update the Paseo host to confirm agent message dispatch."), {
+      code: "AGENT_MESSAGE_DISPATCH_CONFIRMATION_UNSUPPORTED",
+    }),
+  );
+  const logger = createTestLogger();
+  const warn = vi.spyOn(logger, "warn");
+  const service = createFinishSubscriptions({
+    store,
+    serverId: "origin",
+    logger,
+    callerIsActive: async () => true,
+    messages: () => new Delivery(),
+    open: observation.open.bind(observation),
+    retryDelayMs: 1,
+    hosts: () => ({
+      directory: async () => {
+        throw new Error("Unexpected host listing");
+      },
+      use: async (_serverId, action) =>
+        action({
+          fetchAgent: async () => ({ agent: { archivedAt: null } }),
+          getLastServerInfoMessage: () => ({
+            features: { agentMessageDispatchConfirmation: false },
+          }),
+          sendMessage,
+        } as unknown as DaemonClient),
+    }),
+  });
+  services.push(service);
+  await service.start();
+  await service.register({ ...intent, callerServerId: "parent-host" });
+  await until(() => observation.waits.length === 1);
+  const finished = outcome("idle");
+  finished.final!.labels!["paseo.parent-server-id"] = "parent-host";
+  observation.waits[0]!.result.resolve(finished);
+  await expect.poll(() => observation.closed.mock.calls.length).toBe(1);
+  expect(sendMessage).toHaveBeenCalledTimes(1);
+  expect(warn).toHaveBeenCalledWith(
+    expect.objectContaining({ callerServerId: "parent-host" }),
+    expect.stringContaining("Update the parent host"),
+  );
+  expect(await store.list()).toHaveLength(1);
 });
 
 test("retains intent until parent dispatch acknowledgment, then restart sends nothing", async () => {

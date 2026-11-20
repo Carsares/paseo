@@ -552,6 +552,7 @@ interface CodexThreadHistory {
 interface PersistedSubAgentRoute {
   childThreadId: string;
   toolCall: ToolCallTimelineItem;
+  closed: boolean;
 }
 
 interface CodexThreadHistoryProjection {
@@ -2034,30 +2035,45 @@ function readCodexHistoricalSubAgentThreadIds(item: unknown): string[] {
 function resolveHistoricalCollabAgentStatus(
   currentStatus: ToolCallTimelineItem["status"],
   childStatus: unknown,
-  closed: boolean,
-): "completed" | "canceled" | undefined {
+  tool: "wait" | "closeAgent" | "resumeAgent",
+): "completed" | "canceled" | "running" | undefined {
   if (childStatus === "completed") return "completed";
+  if (tool === "resumeAgent" && (childStatus === "running" || childStatus === "pendingInit")) {
+    return "running";
+  }
   if (isTerminalSubAgentStatus(currentStatus)) return undefined;
-  if (closed || childStatus === "shutdown") return "canceled";
+  if (tool === "closeAgent" || childStatus === "shutdown") return "canceled";
   return undefined;
+}
+
+function readHistoricalCollabAgentResult(item: unknown) {
+  const record = toObjectRecord(item);
+  if (!record || typeof record.type !== "string") return null;
+  if (normalizeCodexThreadItemType(record.type) !== "collabAgentToolCall") return null;
+
+  const { tool, status, receiverThreadIds } = record;
+  if (tool !== "wait" && tool !== "closeAgent" && tool !== "resumeAgent") return null;
+  return {
+    tool,
+    status,
+    receiverThreadIds,
+    agentStates: toObjectRecord(record.agentsStates),
+  } as const;
 }
 
 function applyHistoricalCollabAgentResult(
   item: unknown,
   timeline: PersistedTimelineEntry[],
   subAgentTimelineIndexByThreadId: ReadonlyMap<string, number>,
-): void {
-  const record = toObjectRecord(item);
-  if (!record || typeof record.type !== "string") return;
-  if (normalizeCodexThreadItemType(record.type) !== "collabAgentToolCall") return;
+  closedSubAgentThreadIds: Set<string>,
+): boolean {
+  const result = readHistoricalCollabAgentResult(item);
+  if (!result) return false;
+  const { tool, status, receiverThreadIds, agentStates } = result;
+  if (status !== "completed" && (tool !== "wait" || status !== "failed")) return true;
+  if (!Array.isArray(receiverThreadIds)) return true;
 
-  const { tool, status, receiverThreadIds } = record;
-  if (tool !== "wait" && tool !== "closeAgent") return;
-  if (status !== "completed" && (tool !== "wait" || status !== "failed")) return;
-  if (!Array.isArray(receiverThreadIds)) return;
-
-  // Wait and close records have a null prompt. Their outcomes belong to the original launch card.
-  const agentStates = toObjectRecord(record.agentsStates);
+  // Wait, close, and resume outcomes belong to the original launch card.
   for (const threadId of receiverThreadIds) {
     if (typeof threadId !== "string") continue;
     const index = subAgentTimelineIndexByThreadId.get(threadId);
@@ -2068,12 +2084,16 @@ function applyHistoricalCollabAgentResult(
     const nextStatus = resolveHistoricalCollabAgentStatus(
       entry.item.status,
       toObjectRecord(agentStates?.[threadId])?.status,
-      tool === "closeAgent",
+      tool,
     );
+    // A successful close also shuts down open descendants of an already completed child.
+    if (tool === "closeAgent") closedSubAgentThreadIds.add(threadId);
+    else if (tool === "resumeAgent" && nextStatus) closedSubAgentThreadIds.delete(threadId);
     if (nextStatus) {
       timeline[index] = { ...entry, item: { ...entry.item, status: nextStatus, error: null } };
     }
   }
+  return true;
 }
 
 function codexImageOutputFromResult(result: unknown): ProviderImageOutput | null {
@@ -2226,8 +2246,13 @@ async function loadCodexThreadHistoryTimeline(params: {
 }): Promise<CodexThreadHistoryProjection> {
   const timeline: PersistedTimelineEntry[] = [];
   const subAgentTimelineIndexByThreadId = new Map<string, number>();
+  const closedSubAgentThreadIds = new Set<string>();
   try {
-    await projectCodexThreadHistory(params, { timeline, subAgentTimelineIndexByThreadId });
+    await projectCodexThreadHistory(params, {
+      timeline,
+      subAgentTimelineIndexByThreadId,
+      closedSubAgentThreadIds,
+    });
   } catch (error) {
     if (!(error instanceof CodexThreadHistoryTooLargeError)) throw error;
     // The session stays usable; the row says why the history stops here.
@@ -2244,7 +2269,7 @@ async function loadCodexThreadHistoryTimeline(params: {
           ? { ...entry.item, status: "canceled", error: null }
           : entry.item;
       entry.item = toolCall;
-      return [{ childThreadId, toolCall }];
+      return [{ childThreadId, toolCall, closed: closedSubAgentThreadIds.has(childThreadId) }];
     },
   );
   return { timeline, subAgentRoutes };
@@ -2255,12 +2280,22 @@ async function projectCodexThreadHistory(
   projection: {
     timeline: PersistedTimelineEntry[];
     subAgentTimelineIndexByThreadId: Map<string, number>;
+    closedSubAgentThreadIds: Set<string>;
   },
 ): Promise<void> {
-  const { timeline, subAgentTimelineIndexByThreadId } = projection;
+  const { timeline, subAgentTimelineIndexByThreadId, closedSubAgentThreadIds } = projection;
   for await (const row of readCodexThreadHistory(params.client, params.threadId)) {
     const { item } = row;
-    applyHistoricalCollabAgentResult(item, timeline, subAgentTimelineIndexByThreadId);
+    if (
+      applyHistoricalCollabAgentResult(
+        item,
+        timeline,
+        subAgentTimelineIndexByThreadId,
+        closedSubAgentThreadIds,
+      )
+    ) {
+      continue;
+    }
     const historicalSubAgentActivity = readCodexSubAgentActivity(item);
     if (historicalSubAgentActivity) {
       const existingIndex = subAgentTimelineIndexByThreadId.get(
@@ -4316,7 +4351,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       route,
       parentCallId: null as string | null,
       parentSubagentId: null as string | null,
-      ancestorCanceled: route.toolCall.status === "canceled",
+      ancestorCanceled: false,
     }));
     const visitedThreadIds = new Set(this.currentThreadId ? [this.currentThreadId] : []);
     while (queue.length > 0 && visitedThreadIds.size < 100) {
@@ -4325,7 +4360,8 @@ export class CodexAppServerAgentSession implements AgentSession {
         continue;
       }
       visitedThreadIds.add(next.route.childThreadId);
-      const ancestorCanceled = next.ancestorCanceled || next.route.toolCall.status === "canceled";
+      const ancestorCanceled =
+        next.ancestorCanceled || next.route.closed || next.route.toolCall.status === "canceled";
       this.registerSubAgentToolCall({
         timelineItem: next.route.toolCall,
         rawItem: { agentThreadId: next.route.childThreadId },

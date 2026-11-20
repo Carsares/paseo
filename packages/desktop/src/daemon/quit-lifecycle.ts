@@ -23,7 +23,7 @@ interface ExternalQuitSignalSource {
 interface QuitLifecycle {
   isQuitting(): boolean;
   handleBeforeQuit(event: BeforeQuitEvent): void;
-  handleBeforeQuitForUpdate(): void;
+  handleBeforeQuitForUpdate(accepted?: boolean): void;
   requestPreserveWorkQuit(): void;
 }
 
@@ -31,8 +31,7 @@ export interface StopOnQuitDeps {
   settingsStore: Pick<DesktopSettingsStore, "get">;
   isDesktopManagedDaemonRunning: () => boolean;
   isDesktopManagedDaemonPresent?: () => boolean;
-  appUpdate?: AppUpdateTarget;
-  stopDaemon: (reason?: "quit" | "app_update" | "quit_preserve_work") => Promise<unknown>;
+  stopDaemon: (reason?: "quit" | "quit_preserve_work") => Promise<unknown>;
   showShutdownFeedback: () => void;
   preserveWork?: boolean;
 }
@@ -75,32 +74,20 @@ export async function stopDesktopManagedDaemonOnQuitIfNeeded(
     return false;
   }
 
-  const shouldStopDaemon = deps.appUpdate
-    ? (deps.isDesktopManagedDaemonPresent ?? deps.isDesktopManagedDaemonRunning)()
-    : deps.isDesktopManagedDaemonRunning();
-  if (!shouldStopDaemon) {
+  if (!deps.isDesktopManagedDaemonRunning()) {
     return false;
   }
 
   deps.showShutdownFeedback();
-  await deps.stopDaemon(deps.appUpdate ? "app_update" : "quit");
+  await deps.stopDaemon("quit");
   return true;
-}
-
-function waitForUpdateDeadline(signal: AbortSignal): Promise<boolean> {
-  if (signal.aborted) {
-    return Promise.resolve(false);
-  }
-
-  return new Promise((resolve) => {
-    signal.addEventListener("abort", () => resolve(false), { once: true });
-  });
 }
 
 export function createQuitLifecycle({
   app,
   closeTransportSessions,
   stopDesktopManagedDaemonIfNeeded,
+  prepareDaemonForAppUpdate,
   installAppUpdateOnQuit,
   confirmAppUpdate,
   createUpdateDeadlineSignal,
@@ -111,10 +98,8 @@ export function createQuitLifecycle({
 }: {
   app: BeforeQuitApp;
   closeTransportSessions: () => void;
-  stopDesktopManagedDaemonIfNeeded: (options?: {
-    preserveWork?: boolean;
-    appUpdate?: AppUpdateTarget;
-  }) => Promise<boolean>;
+  stopDesktopManagedDaemonIfNeeded: (options?: { preserveWork?: boolean }) => Promise<boolean>;
+  prepareDaemonForAppUpdate?: BeforeAppUpdateInstall;
   installAppUpdateOnQuit: (
     signal: AbortSignal,
     onBeforeQuit: BeforeAppUpdateInstall,
@@ -131,9 +116,14 @@ export function createQuitLifecycle({
   // window-all-closed handler, which would veto that second quit.
   let quitting = false;
   let quittingForUpdate = false;
+  let ignoreLateUpdaterQuit = false;
   let preserveWorkRequested = false;
 
   function handleBeforeQuit(event: BeforeQuitEvent): void {
+    if (ignoreLateUpdaterQuit) {
+      event.preventDefault();
+      return;
+    }
     if (!quittingForUpdate && isManualUpdateHandoffInProgress()) {
       event.preventDefault();
       return;
@@ -164,31 +154,35 @@ export function createQuitLifecycle({
         return;
       }
 
-      let selectedUpdate = false;
       let stoppedForUpdate = false;
       const signal = createUpdateDeadlineSignal();
+      let onDeadline!: () => void;
+      const deadline = new Promise<boolean>((resolve) => {
+        onDeadline = () => resolve(false);
+        if (signal.aborted) onDeadline();
+        else signal.addEventListener("abort", onDeadline, { once: true });
+      });
       const updateInstallation = installAppUpdateOnQuit(signal, async (appUpdate) => {
         if (signal.aborted) return false;
         if (confirmAppUpdate && !(await confirmAppUpdate(appUpdate, signal))) return false;
         if (signal.aborted) return false;
-        selectedUpdate = true;
+        // Validation and consent have their own deadline. The installer uses
+        // independent time limits once an update is selected.
+        signal.removeEventListener("abort", onDeadline);
         try {
-          stoppedForUpdate = await stopDesktopManagedDaemonIfNeeded({ appUpdate });
+          const shutdown = await prepareDaemonForAppUpdate?.(appUpdate);
+          stoppedForUpdate = Boolean(shutdown);
+          return shutdown;
         } catch (error) {
           onStopError(error);
           return false;
         }
-        return undefined;
       }).catch((error) => {
         onUpdateError(error);
         return false;
       });
-      let installingUpdate = await Promise.race([
-        updateInstallation,
-        waitForUpdateDeadline(signal),
-      ]);
-      // Once shutdown has started, finish the chosen attempt before exiting.
-      if (selectedUpdate) installingUpdate = await updateInstallation;
+      const installingUpdate = await Promise.race([updateInstallation, deadline]);
+      signal.removeEventListener("abort", onDeadline);
       if (installingUpdate) return;
 
       if (!stoppedForUpdate) {
@@ -206,7 +200,16 @@ export function createQuitLifecycle({
       preserveWorkRequested = true;
       app.quit?.();
     },
-    handleBeforeQuitForUpdate() {
+    handleBeforeQuitForUpdate(accepted = true) {
+      if (!accepted) {
+        // BaseUpdater emits its handoff event immediately before app.quit().
+        // Ignore this pair after the attempt has failed, without blocking user quits.
+        ignoreLateUpdaterQuit = true;
+        queueMicrotask(() => {
+          ignoreLateUpdaterQuit = false;
+        });
+        return;
+      }
       quittingForUpdate = true;
     },
   };

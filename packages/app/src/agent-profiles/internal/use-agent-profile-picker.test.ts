@@ -204,6 +204,22 @@ describe("applyProfileToTarget", () => {
     expect(deps.client.applyAgentConfig).not.toHaveBeenCalled();
   });
 
+  it.each(["opencode", "custom-opencode"])(
+    "preserves an OpenCode project mode for %s",
+    async (provider) => {
+      const deps = applicationDependencies();
+      const onSwitchProvider = vi.fn(async () => true);
+      const resolved = { ...ANTIGRAVITY_PROFILE, provider, modeId: "project-review" };
+      await applyProfileToTarget({
+        ...deps,
+        target: { ...CODEX_AGENT, onSwitchProvider },
+        resolved,
+        entries: [{ ...ANTIGRAVITY_ENTRY, provider, derivedFromProviderId: "opencode" }],
+      });
+      expect(onSwitchProvider).toHaveBeenCalledExactlyOnceWith(resolved);
+    },
+  );
+
   it("leaves preferences alone while the handoff is pending and when it is canceled", async () => {
     const deps = applicationDependencies();
     const handoff = Promise.withResolvers<boolean>();

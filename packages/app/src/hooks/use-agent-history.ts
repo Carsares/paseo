@@ -172,6 +172,39 @@ function withCurrentServerLabel(agent: AggregatedAgent, labels: ReadonlyMap<stri
     : agent;
 }
 
+function useAgentHistoryCapabilities(serverIds: readonly string[]) {
+  return useSessionStore(
+    useShallow((state) => {
+      const features = serverIds.map((id) => state.sessions[id]?.serverInfo?.features);
+      const hasHosts = features.length > 0;
+      return {
+        isSearchSupported:
+          hasHosts && features.every((entry) => entry?.agentHistorySearch === true),
+        // COMPAT(agentHistoryArchiveScope): added in v0.16.0, remove gate after 2027-05-19.
+        isArchiveScopeSupported:
+          hasHosts && features.every((entry) => entry?.agentHistoryArchiveScope === true),
+        // COMPAT(agentHistoryQueryControls): added in v0.16.0, remove gate after 2027-05-19.
+        isQueryControlsSupported:
+          hasHosts && features.every((entry) => entry?.agentHistoryQueryControls === true),
+      };
+    }),
+  );
+}
+
+function resolveAgentHistorySortField(input: {
+  field: HistorySortOption["field"];
+  archiveScope: AgentHistoryArchiveScope | undefined;
+  supportsQueryControls: boolean;
+}): HistorySortOption["field"] {
+  if (
+    input.field === "archived_at" &&
+    (!input.supportsQueryControls || input.archiveScope !== "archived")
+  ) {
+    return "updated_at";
+  }
+  return input.field;
+}
+
 function sortHistoryAgents(agents: AggregatedAgent[], sort: HistorySortOption): AggregatedAgent[] {
   const preservesLegacyOrder =
     sort.field === DEFAULT_HISTORY_SORT.field && sort.direction === DEFAULT_HISTORY_SORT.direction;
@@ -388,41 +421,9 @@ export function useAgentHistory(
     return { targetHosts: hosts, unreachableHosts: unreachable };
   }, [daemons, runtime, connectionStatuses, serverIds]);
   const targetServerIds = useMemo(() => targetHosts.map((host) => host.serverId), [targetHosts]);
-  // One gate, checked before the field is offered: a fleet where any host
-  // predates search has no search, rather than a list that silently omits that
-  // host's sessions.
-  const isSearchSupported = useSessionStore(
-    useCallback(
-      (state) =>
-        targetServerIds.length > 0 &&
-        targetServerIds.every(
-          (id) => state.sessions[id]?.serverInfo?.features?.agentHistorySearch === true,
-        ),
-      [targetServerIds],
-    ),
-  );
-  // COMPAT(agentHistoryArchiveScope): added in v0.16.0, remove gate after 2027-05-19.
-  const isArchiveScopeSupported = useSessionStore(
-    useCallback(
-      (state) =>
-        targetServerIds.length > 0 &&
-        targetServerIds.every(
-          (id) => state.sessions[id]?.serverInfo?.features?.agentHistoryArchiveScope === true,
-        ),
-      [targetServerIds],
-    ),
-  );
-  // COMPAT(agentHistoryQueryControls): added in v0.16.0, remove gate after 2027-05-19.
-  const isQueryControlsSupported = useSessionStore(
-    useCallback(
-      (state) =>
-        targetServerIds.length > 0 &&
-        targetServerIds.every(
-          (id) => state.sessions[id]?.serverInfo?.features?.agentHistoryQueryControls === true,
-        ),
-      [targetServerIds],
-    ),
-  );
+  // A single host's cache identity follows its last advertised capabilities across disconnects.
+  const { isSearchSupported, isArchiveScopeSupported, isQueryControlsSupported } =
+    useAgentHistoryCapabilities(serverId ? serverIds : targetServerIds);
   const effectiveArchiveScope = isArchiveScopeSupported ? options.archiveScope : undefined;
   const search = useMemo(() => {
     const trimmed = options.search?.trim() ?? "";
@@ -435,11 +436,11 @@ export function useAgentHistory(
   );
   const requestedSort = options.sort ?? DEFAULT_HISTORY_SORT;
   const sortDirection = requestedSort.direction;
-  const sortField =
-    requestedSort.field === "archived_at" &&
-    (!isQueryControlsSupported || effectiveArchiveScope !== "archived")
-      ? "updated_at"
-      : requestedSort.field;
+  const sortField = resolveAgentHistorySortField({
+    field: requestedSort.field,
+    archiveScope: effectiveArchiveScope,
+    supportsQueryControls: isQueryControlsSupported,
+  });
   const effectiveSort = useMemo<HistorySortOption>(
     () => ({ field: sortField, direction: sortDirection }),
     [sortField, sortDirection],
@@ -460,7 +461,7 @@ export function useAgentHistory(
     [daemons],
   );
 
-  const queryEnabled = Boolean(enabled && targetHosts.length > 0);
+  const queryEnabled = enabled && targetHosts.length > 0;
   const historyQuery = useInfiniteQuery<
     AgentHistoryBatchPage,
     Error,
@@ -471,6 +472,7 @@ export function useAgentHistory(
     queryKey,
     enabled: queryEnabled,
     staleTime: 30_000,
+    refetchOnMount: (query) => query.state.isInvalidated,
     // Previous results stand in only until the next query's arrive. With no host to search,
     // nothing will arrive, so they would stand in, and read as still loading, indefinitely.
     ...(options.keepPreviousResults && queryEnabled
@@ -515,18 +517,18 @@ export function useAgentHistory(
   } = historyQuery;
 
   const refreshAll = useCallback(async () => {
-    if (!enabled || targetHosts.length === 0) {
+    if (!queryEnabled) {
       return;
     }
     await refetch();
-  }, [enabled, refetch, targetHosts.length]);
+  }, [queryEnabled, refetch]);
 
   const loadMore = useCallback(() => {
-    if (!enabled || targetHosts.length === 0 || !hasNextPage || isFetchingNextPage) {
+    if (!queryEnabled || !hasNextPage || isFetchingNextPage) {
       return;
     }
     void fetchNextPage();
-  }, [enabled, fetchNextPage, hasNextPage, isFetchingNextPage, targetHosts.length]);
+  }, [queryEnabled, fetchNextPage, hasNextPage, isFetchingNextPage]);
 
   const { agents, ancestors } = useMemo(() => {
     const pages = data?.pages ?? [];

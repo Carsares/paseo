@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import type { AggregatedAgent } from "@/hooks/use-aggregated-agents";
 import {
   areAllHistoryWorkspacesCollapsed,
-  buildAllWorkspacesExpansionMap,
   buildHistoryProjectGroups,
   flattenHistoryProjectGroups,
   type HistoryRootAgentNode,
@@ -1115,24 +1114,23 @@ describe("bulk workspace expansion", () => {
     ],
   });
 
-  it("collapses every workspace by key and clears the overrides to expand all", () => {
-    const collapsed = buildAllWorkspacesExpansionMap(groups, false);
-    const expanded = buildAllWorkspacesExpansionMap(groups, true);
-    expect(collapsed).toEqual(
-      new Map([
-        ["mac:main", false],
-        ["mac:branch", false],
-        ["mac:other", false],
-      ]),
+  it("uses the bulk default for each workspace without an explicit override", () => {
+    expect(areAllHistoryWorkspacesCollapsed({ groups, workspaceExpandedByDefault: false })).toBe(
+      true,
     );
-    expect(expanded).toEqual(new Map());
-    expect(buildAllWorkspacesExpansionMap([], false)).toEqual(new Map());
-    expect(
-      areAllHistoryWorkspacesCollapsed({ groups, workspaceExpandedOverrides: collapsed }),
-    ).toBe(true);
-    expect(areAllHistoryWorkspacesCollapsed({ groups, workspaceExpandedOverrides: expanded })).toBe(
+    expect(areAllHistoryWorkspacesCollapsed({ groups, workspaceExpandedByDefault: true })).toBe(
       false,
     );
+    expect(
+      areAllHistoryWorkspacesCollapsed({ groups: [], workspaceExpandedByDefault: false }),
+    ).toBe(false);
+    expect(
+      areAllHistoryWorkspacesCollapsed({
+        groups,
+        workspaceExpandedByDefault: false,
+        workspaceExpandedOverrides: new Map([["mac:branch", true]]),
+      }),
+    ).toBe(false);
   });
 
   it("counts workspaces hidden by project collapse only in project mode", () => {
@@ -1148,7 +1146,7 @@ describe("bulk workspace expansion", () => {
       areAllHistoryWorkspacesCollapsed({
         ...input,
         groupMode: "workspace",
-        workspaceExpandedOverrides: buildAllWorkspacesExpansionMap(groups, false),
+        workspaceExpandedByDefault: false,
       }),
     ).toBe(true);
   });
@@ -1168,7 +1166,7 @@ describe("bulk workspace expansion", () => {
     const expanded = flattenHistoryProjectGroups({
       ...input,
       projectExpandedOverrides: new Map(),
-      workspaceExpandedOverrides: buildAllWorkspacesExpansionMap(groups, true),
+      workspaceExpandedOverrides: new Map(),
     });
     expect(expanded.map(({ key }) => key)).toEqual([
       "project:mac:atlas",
