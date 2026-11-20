@@ -1,9 +1,11 @@
 import { resolve } from "node:path";
 
 import type { Logger } from "pino";
+import { isMainControlAgentLabels } from "@getpaseo/protocol/agent-labels";
 
 import type { AgentManager } from "./agent/agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent/agent-storage.js";
+import { MAIN_CONTROL_WRITE_DENIAL, type HierarchyAgent } from "./agent/hierarchy-policy.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import type { ForgeService } from "../services/forge-service.js";
 import {
@@ -78,6 +80,8 @@ export interface ArchiveResult {
 export interface ArchiveByScopeRequest {
   scope: ArchiveScope;
   requestId: string;
+  /** Trusted caller metadata for agent-scoped requests. */
+  caller?: Pick<HierarchyAgent, "labels"> | null;
   // Aborting cancels the archive at its next checkpoint. Removing the worktree directory is the
   // point of no return: once it starts the archive completes.
   signal?: AbortSignal;
@@ -148,6 +152,9 @@ export async function archiveByScope(
   dependencies: ArchiveDependencies,
   request: ArchiveByScopeRequest,
 ): Promise<ArchiveResult> {
+  if (isMainControlAgentLabels(request.caller?.labels)) {
+    throw new Error(MAIN_CONTROL_WRITE_DENIAL);
+  }
   return runWithGitCommandPriority("high", () => archiveByScopeWithPriority(dependencies, request));
 }
 

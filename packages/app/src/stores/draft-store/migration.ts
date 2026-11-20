@@ -102,7 +102,8 @@ export const PersistedDraftStoreSchema = z.strictObject({
   drafts: z.record(z.string(), PersistedDraftRecordSchema).optional(),
   createModalDraft: PersistedDraftRecordSchema.nullable().optional(),
 });
-type PersistedDraftRecord = z.infer<typeof PersistedDraftRecordSchema>;
+export type PersistedDraftRecord = z.infer<typeof PersistedDraftRecordSchema>;
+export type PersistedDraftStore = z.infer<typeof PersistedDraftStoreSchema>;
 
 export type MigrateLegacyImages = (
   images: readonly PersistedDraftImage[],

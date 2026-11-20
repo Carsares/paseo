@@ -179,6 +179,7 @@ export function requiresSingleHopOrchestration(
 }
 
 const MAIN_CONTROL_DISABLED_TOOLS = [
+  "archive_workspace",
   "create_terminal",
   "send_terminal_keys",
   "kill_terminal",

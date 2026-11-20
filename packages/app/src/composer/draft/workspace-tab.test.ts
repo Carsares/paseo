@@ -1,5 +1,5 @@
 /** @vitest-environment jsdom */
-import { fireEvent, render, renderHook, screen } from "@testing-library/react";
+import { act, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { createElement, createRef } from "react";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
@@ -8,6 +8,17 @@ import {
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import { AssistantSelectionQuote } from "@/assistant-selection-copy/quote.web";
+import {
+  buildDraftWorkspaceAttachmentScopeKey,
+  createWorkspaceAttachmentsStore,
+  isDraftChatHistoryReady,
+  collectWorkspaceAttachmentsForScopes,
+  useWorkspaceAttachmentsStore,
+} from "@/attachments/workspace-attachments-store";
+import { Composer } from "@/composer";
+import { ComposerEditingSession } from "@/composer/editing-session";
+import { useAgentInputDraft, type AgentInputDraft } from "@/composer/draft/input-draft";
+import { useHostRuntimeClient } from "@/runtime/host-runtime";
 import { AllowSubagentForkContext, AssistantForkMenu } from "@/components/assistant-fork-menu";
 import { buildSubagentDraftSetup } from "@/hooks/use-fork-agent";
 import { DEFAULT_OPEN_IN_SIDE_PANE_PREFERENCES } from "@/hooks/use-settings/storage";
@@ -29,11 +40,27 @@ import {
   revealCreatedDraftAgentTab,
   submitDraftCreateRequest,
   useInitialDraftText,
+  WorkspaceDraftComposer,
 } from "./workspace-tab";
 import { shouldAllowEmptyDraftText, validateDraftSubmission } from "./workspace-tab-core";
 
-vi.mock("@/composer", () => ({ Composer: () => null }));
+vi.mock("@/composer", () => ({ Composer: vi.fn(() => null) }));
 vi.mock("@/composer/draft/input-draft", () => ({ useAgentInputDraft: vi.fn() }));
+vi.mock("@/command-center/agent-control-registration", () => ({
+  useAgentControlCommandCenterActions: vi.fn(),
+}));
+vi.mock("@/hooks/use-settings", () => ({
+  useSettings: () => DEFAULT_OPEN_IN_SIDE_PANE_PREFERENCES,
+}));
+vi.mock("@/runtime/host-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/runtime/host-runtime")>()),
+  useHostRuntimeClient: vi.fn(),
+  useHostRuntimeIsConnected: () => true,
+}));
+vi.mock("@/stores/session-store-hooks", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/stores/session-store-hooks")>()),
+  useWorkspaceFields: () => ({ id: "workspace-1", workspaceDirectory: "/tmp/project" }),
+}));
 vi.mock("@/subagents/parent", () => ({ ParentAgentPill: () => null }));
 vi.mock("lucide-react-native", async (importOriginal) => ({
   ...(await importOriginal<typeof import("lucide-react-native")>()),
@@ -103,6 +130,150 @@ describe("workspace draft agent model validation", () => {
 });
 
 describe("workspace draft empty text readiness", () => {
+  test("blocks the handoff submit until its history is restored and includes it in the request", async () => {
+    const draftId = "handoff-submit";
+    const scopeKey = buildDraftWorkspaceAttachmentScopeKey(draftId);
+    const history = {
+      kind: "chat_history",
+      id: draftId,
+      source: { serverId: "host-1", agentId: "source-1" },
+      attachment: {
+        type: "text",
+        mimeType: "text/plain",
+        contextKind: "chat_history",
+        text: "Archived conversation",
+      },
+    } as const;
+    const createAgent = vi.fn<DaemonClient["createAgent"]>().mockRejectedValue(new Error("Retry"));
+    vi.mocked(useHostRuntimeClient).mockReturnValue({ createAgent } as unknown as DaemonClient);
+    vi.mocked(useAgentInputDraft).mockReturnValue({
+      isHydrated: true,
+      textSource: {
+        getSnapshot: () => "Continue here",
+        peekPendingText: () => null,
+        subscribe: () => () => {},
+      },
+      textReplacement: { kind: "hydrated", key: "handoff", text: "Continue here" },
+      editText: vi.fn(),
+      replaceText: vi.fn(),
+      attachments: [],
+      setAttachments: vi.fn(),
+      clear: vi.fn(),
+      attachmentFocusRequestId: 0,
+      composerState: {
+        ...baseComposerState,
+        workingDir: "/tmp/project",
+        effectiveModeId: "",
+        effectiveThinkingOptionId: "",
+        metadata: {},
+        agentControls: {},
+        persistFormPreferences: async () => {},
+      } as unknown as NonNullable<AgentInputDraft["composerState"]>,
+    });
+    const storedAttachments = useWorkspaceAttachmentsStore.getState();
+    useWorkspaceAttachmentsStore.setState({ draftHistoryHydrated: false, attachmentsByScope: {} });
+    const view = render(
+      createElement(WorkspaceDraftComposer, {
+        serverId: "host-1",
+        workspaceId: "workspace-1",
+        tabId: "handoff-tab",
+        draftId,
+        isPaneFocused: false,
+        editingSession: new ComposerEditingSession(),
+        initialSetup: {
+          provider: "codewhale",
+          cwd: "/tmp/project",
+          modeId: null,
+          model: null,
+          thinkingOptionId: null,
+          providerOptions: {},
+          restoreChatHistory: true,
+        },
+        onCreated: vi.fn(),
+      }),
+    );
+    const submit = async (expectedError: string) => {
+      const props = vi.mocked(Composer).mock.lastCall?.[0];
+      if (!props?.onSubmitMessage) throw new Error("Expected the composer submit handler");
+      const attachments = collectWorkspaceAttachmentsForScopes({
+        attachmentsByScope: useWorkspaceAttachmentsStore.getState().attachmentsByScope,
+        scopeKeys: props.attachmentScopeKeys ?? [],
+      });
+      await act(async () => {
+        await expect(
+          props.onSubmitMessage?.({
+            text: "Continue here",
+            cwd: "/tmp/project",
+            attachments: [...attachments],
+          }),
+        ).rejects.toThrow(expectedError);
+      });
+    };
+    try {
+      expect(vi.mocked(Composer).mock.lastCall?.[0].isSubmitLoading).toBe(true);
+      await submit("Loading");
+      expect(createAgent).not.toHaveBeenCalled();
+      act(() => {
+        useWorkspaceAttachmentsStore.setState({
+          draftHistoryHydrated: true,
+          attachmentsByScope: { [scopeKey]: [history] },
+        });
+      });
+      expect(vi.mocked(Composer).mock.lastCall?.[0].isSubmitLoading).toBe(false);
+      await submit("Retry");
+      expect(createAgent).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          initialPrompt: "Continue here",
+          attachments: [
+            {
+              ...history.attachment,
+              forkContext: { sourceAgentId: "source-1", sourceServerId: "host-1" },
+            },
+          ],
+        }),
+      );
+      expect(useWorkspaceAttachmentsStore.getState().attachmentsByScope[scopeKey]).toEqual([
+        history,
+      ]);
+    } finally {
+      view.unmount();
+      useWorkspaceAttachmentsStore.setState(storedAttachments);
+      vi.mocked(useHostRuntimeClient).mockReset();
+      vi.mocked(useAgentInputDraft).mockReset();
+    }
+  });
+
+  test("text and model readiness can precede restored draft history", async () => {
+    const storedHistory = Promise.withResolvers<string>();
+    const scopeKey = buildDraftWorkspaceAttachmentScopeKey("handoff");
+    const history = {
+      kind: "chat_history",
+      id: "handoff",
+      source: { serverId: "host-1", agentId: "source-1" },
+      attachment: {
+        type: "text",
+        mimeType: "text/plain",
+        contextKind: "chat_history",
+        text: "Archived conversation",
+      },
+    };
+    const store = createWorkspaceAttachmentsStore({
+      getItem: () => storedHistory.promise,
+      setItem: async () => {},
+      removeItem: async () => {},
+    });
+    expect(validate({})).toBeNull();
+    expect(isDraftChatHistoryReady(store.getState(), scopeKey)).toBe(false);
+    expect(store.getState().attachmentsByScope[scopeKey]).toBeUndefined();
+
+    storedHistory.resolve(JSON.stringify({ [scopeKey]: [history] }));
+    await vi.waitFor(() => {
+      const restored = store.getState();
+      expect(isDraftChatHistoryReady(restored, scopeKey)).toBe(true);
+      expect(restored.attachmentsByScope[scopeKey]).toEqual([history]);
+    });
+  });
+
   test("allows attachment-only retries after a fork draft create fails", () => {
     expect(
       shouldAllowEmptyDraftText({
@@ -222,6 +393,9 @@ describe("workspace subagent draft", () => {
           },
           hostDisconnectedMessage: "disconnected",
           selectModelMessage: "select a model",
+          requiresUserPromptOrigin: true,
+          supportsAgentInitialPromptOrigin: () => true,
+          initialPromptOriginUnavailableMessage: "update the host",
         }),
       ).resolves.toEqual({ agentId: result.id, result });
 
@@ -268,7 +442,7 @@ describe("workspace subagent draft", () => {
       labels: {},
     };
     const createAgent = vi.fn<DaemonClient["createAgent"]>().mockResolvedValue(result);
-    const submit = (parentAgentId: string | null) =>
+    const submit = (parentAgentId: string | null, supportsOrigin = true, fromHandoff = true) =>
       submitDraftCreateRequest({
         draftId: "draft-1",
         parentAgentId,
@@ -289,11 +463,17 @@ describe("workspace subagent draft", () => {
         },
         hostDisconnectedMessage: "disconnected",
         selectModelMessage: "select a model",
+        requiresUserPromptOrigin: fromHandoff,
+        supportsAgentInitialPromptOrigin: () => supportsOrigin,
+        initialPromptOriginUnavailableMessage: "update the host",
       });
 
     await submit("  parent-1  ");
     await submit("parent-2");
-    await submit("   ");
+    await expect(submit("parent-agent", false)).rejects.toThrow("update the host");
+    await submit("   ", false);
+    await submit("parent-1", false, false);
+    expect(createAgent).toHaveBeenCalledTimes(4);
 
     const first = createAgent.mock.calls[0]?.[0];
     const second = createAgent.mock.calls[1]?.[0];
@@ -362,6 +542,44 @@ describe("workspace subagent draft", () => {
     );
     expect(regularReadOnlySetup?.modeId).toBe("read-only");
     expect(regularReadOnlySetup?.providerOptions).toEqual({ sandbox_mode: "read-only" });
+  });
+
+  test("uses OpenCode Main Control's original restrictions when starting a child draft", () => {
+    const setup = buildSubagentDraftSetup(
+      {
+        provider: "opencode",
+        cwd: "/tmp/project",
+        options: {
+          auto_accept: false,
+          permission: { edit: "deny", bash: "deny", todowrite: "deny" },
+        },
+        subagentDraftOptions: { auto_accept: true, permission: { edit: "deny", bash: "ask" } },
+        labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+      },
+      "main-opencode",
+    );
+    expect(setup?.providerOptions).toEqual({
+      auto_accept: true,
+      permission: { edit: "deny", bash: "ask" },
+    });
+  });
+
+  test("uses original OpenCode Main Control draft options with a custom provider ID", () => {
+    const setup = buildSubagentDraftSetup(
+      {
+        provider: "opencode-custom",
+        cwd: "/tmp/project",
+        options: { permission: { edit: "deny", bash: "deny", todowrite: "deny" } },
+        subagentDraftOptions: { permission: { edit: "deny", bash: "ask" } },
+        labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+      },
+      "main-opencode",
+    );
+    expect(setup).toMatchObject({
+      provider: "opencode-custom",
+      providerOptions: { permission: { edit: "deny", bash: "ask" } },
+    });
+    expect(setup?.providerOptions.permission).not.toHaveProperty("todowrite");
   });
 
   test("prefills after hydration once and leaves an edited draft alone", () => {

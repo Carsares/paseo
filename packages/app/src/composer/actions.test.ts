@@ -419,12 +419,72 @@ describe("pickAndPersistImages", () => {
 });
 
 describe("dispatchComposerAgentMessage", () => {
+  it("keeps a quoted Claude command off the wire and sends it unchanged after removing the quote", async () => {
+    const client = createFakeSendClient();
+    const stream = createFakeStream();
+    const submission = {
+      client,
+      agentId: "agent",
+      provider: "claude",
+      text: "/review changes",
+      encodeImages: async () => [],
+      submission: stream,
+    };
+    await expect(
+      dispatchComposerAgentMessage({
+        ...submission,
+        attachments: [{ kind: "quote", id: "q1", text: "Selected text" }],
+      }),
+    ).rejects.toThrow("Remove the quotes");
+    expect(client.calls).toHaveLength(0);
+    expect(stream.tail.get("agent")).toBeUndefined();
+
+    await dispatchComposerAgentMessage({ ...submission, attachments: [] });
+    expect(client.calls).toHaveLength(1);
+    expect(client.calls[0].text).toBe("/review changes");
+  });
+
+  it.each([
+    { provider: "custom-claude", derivedFromProviderId: "claude", blocked: true },
+    { provider: "custom-codex", derivedFromProviderId: "codex", blocked: false },
+    { provider: "codex", blocked: false },
+  ])(
+    "checks the command boundary for $provider",
+    async ({ provider, derivedFromProviderId, blocked }) => {
+      const client = createFakeSendClient();
+      const getProvidersSnapshot = vi.fn(async () => ({
+        generatedAt: "2026-01-01T00:00:00.000Z",
+        requestId: "snapshot",
+        entries: [{ provider, derivedFromProviderId, status: "ready" as const, enabled: true }],
+      }));
+      const send = dispatchComposerAgentMessage({
+        client,
+        agentId: "agent",
+        provider,
+        providerSnapshot: { client: { getProvidersSnapshot }, serverId: provider },
+        text: "/review changes",
+        attachments: [{ kind: "quote", id: "q1", text: "Selected text" }],
+        encodeImages: async () => [],
+        submission: createFakeStream(),
+      });
+      if (blocked) {
+        await expect(send).rejects.toThrow("Remove the quotes");
+        expect(client.calls).toHaveLength(0);
+      } else {
+        await send;
+        expect(client.calls[0]?.text).toBe("> Selected text\n\n/review changes");
+      }
+      expect(getProvidersSnapshot).toHaveBeenCalledTimes(derivedFromProviderId ? 1 : 0);
+    },
+  );
+
   it("sends quotes in the same body as the optimistic message and keeps file attachments separate", async () => {
     const client = createFakeSendClient();
     const stream = createFakeStream();
     await dispatchComposerAgentMessage({
       client,
       agentId: "agent",
+      provider: "claude",
       text: "  Explain this.  ",
       attachments: [
         { kind: "quote", id: "q1", text: "First\r\n\r\n  snippet" },

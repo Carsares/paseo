@@ -20,6 +20,8 @@ const WorkspaceDraftTabSetupStorageSchema = z.preprocess(
     providerOptions: z.record(z.string(), z.json()),
     parentAgentId: z.string().nullish(),
     initialDraftText: z.string().nullish(),
+    // Configured drafts saved before this flag may have a separate history attachment.
+    restoreChatHistory: z.boolean().default(true),
   }),
 );
 const WorkspaceTabTargetStorageSchema = z.discriminatedUnion("kind", [

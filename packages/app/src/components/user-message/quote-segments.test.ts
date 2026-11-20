@@ -21,6 +21,14 @@ describe("parseUserMessageSegments", () => {
     ]);
   });
 
+  it("preserves unformatted Python prompts even beside a genuine quote", () => {
+    const code = ">>> 1 + 1\n2";
+    expect(parseUserMessageSegments(`${code}\n\n> Real quote`)).toEqual([
+      { kind: "text", text: code },
+      { kind: "quote", quoteIndex: 1, text: "Real quote" },
+    ]);
+  });
+
   it("trims outer quote blanks and preserves quoted paragraph breaks", () => {
     expect(parseUserMessageSegments(">\n> first paragraph\n>\n> second paragraph\n>  ")).toEqual([
       { kind: "quote", quoteIndex: 1, text: "first paragraph\n\nsecond paragraph" },

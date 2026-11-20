@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { writeJsonFileAtomic } from "../atomic-file.js";
@@ -18,11 +18,14 @@ interface SendMessageInput {
    * the message; a failure before that call proves nothing was submitted and leaves no receipt.
    */
   send: (beforeDispatch: () => Promise<void>) => Promise<void>;
+  /** Only errors that prove the provider never received the message may clear a pending receipt. */
+  retryIfUnsent?: (error: unknown) => boolean;
 }
 
 /** Owns message delivery receipts; creation is owned by CreationService. */
 export class MessageReceipts {
   private readonly pending = new Map<string, Promise<void>>();
+  private readonly awaitingCommit = new Map<string, { fingerprint: string; agentId: string }>();
   constructor(private readonly directory: string) {}
 
   send(input: SendMessageInput): Promise<void> {
@@ -44,6 +47,12 @@ export class MessageReceipts {
   private async sendOnce(key: string, input: SendMessageInput): Promise<void> {
     const file = path.join(this.directory, `${key}.json`);
     const fingerprint = digest(input.request);
+    const accepted = this.awaitingCommit.get(key);
+    if (accepted) {
+      if (accepted.fingerprint !== fingerprint) throw new Error("agent_request_key_conflict");
+      await this.commit(file, key, accepted);
+      return;
+    }
     const existing = await readReceipt(file);
     if (existing) {
       if (existing.fingerprint !== fingerprint) throw new Error("agent_request_key_conflict");
@@ -53,11 +62,26 @@ export class MessageReceipts {
     }
     const receipt = { fingerprint, agentId: input.agentId };
     let pending: Promise<void> | null = null;
-    await input.send(() => {
-      pending ??= writeJsonFileAtomic(file, { ...receipt, state: "pending" });
-      return pending;
-    });
+    try {
+      await input.send(() => {
+        pending ??= writeJsonFileAtomic(file, { ...receipt, state: "pending" });
+        return pending;
+      });
+    } catch (error) {
+      if (pending && input.retryIfUnsent?.(error)) await rm(file, { force: true });
+      throw error;
+    }
+    if (input.retryIfUnsent) this.awaitingCommit.set(key, receipt);
+    await this.commit(file, key, receipt);
+  }
+
+  private async commit(
+    file: string,
+    key: string,
+    receipt: { fingerprint: string; agentId: string },
+  ): Promise<void> {
     await writeJsonFileAtomic(file, { ...receipt, state: "completed" });
+    this.awaitingCommit.delete(key);
   }
 }
 

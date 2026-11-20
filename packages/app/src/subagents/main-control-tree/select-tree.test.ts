@@ -76,6 +76,33 @@ describe("main control tree", () => {
     });
   });
 
+  it("locates cross-host descendants by the parent address even when IDs repeat", () => {
+    const local = session(main, agent("lead", { labels: parent("main"), createdAt: new Date(1) }));
+    const remote = session(
+      agent("lead", {
+        labels: parentAddressLabels({ serverId: "host", agentId: "main" }),
+        createdAt: new Date(2),
+      }),
+      agent("worker", { labels: parent("lead") }),
+      agent("pending", { labels: parent("lead") }),
+    );
+    const tree = selectMainControlTree({
+      session: local,
+      agentMaps: { remote: remote.agents },
+      mainAgentId: main.id,
+      fallbackTitle: "Agent",
+      pendingArchiveIds: new Set(["remote:pending"]),
+    });
+    expect(tree?.children).toMatchObject([
+      { serverId: "host", agentId: "lead", children: [] },
+      {
+        serverId: "remote",
+        agentId: "lead",
+        children: [{ serverId: "remote", agentId: "worker", children: [] }],
+      },
+    ]);
+  });
+
   it.each([
     { name: "running", state: { status: "running" }, expected: "active" },
     { name: "initializing", state: { status: "initializing" }, expected: "active" },

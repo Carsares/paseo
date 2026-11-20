@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { app } from "electron";
+import { app, autoUpdater as electronAutoUpdater, BrowserWindow, dialog } from "electron";
 import { UUID } from "builder-util-runtime";
 import log from "electron-log/main";
 import { autoUpdater } from "electron-updater";
@@ -13,6 +13,8 @@ import {
   type AppUpdateInstallResult,
   type AppUpdateRuntime,
   type AppUpdateRuntimeConfiguration,
+  type AppUpdateTarget,
+  type BeforeAppUpdateInstall,
   type RuntimeUpdateCheckResult,
   type RuntimeUpdateInfo,
 } from "./app-update-service.js";
@@ -35,8 +37,10 @@ export {
 };
 
 let cachedStagingUserIdPromise: Promise<string> | null = null;
+let macUpdateQuitInProgress = false;
 
 const UPDATE_CHANNEL_NOT_PUBLISHED_CODE = "ERR_UPDATER_CHANNEL_FILE_NOT_FOUND";
+const QUIT_UPDATE_HANDOFF_TIMEOUT_MS = 5_000;
 
 interface AppUpdateLogSink {
   info(message: string, details: object): void;
@@ -147,8 +151,12 @@ async function isOfficialUpdatesEnabled(): Promise<boolean> {
 
 class ElectronAppUpdateRuntime implements AppUpdateRuntime {
   private configured = false;
+  private macDownloadedInfo: RuntimeUpdateInfo | null = null;
+  private macNativeReady = false;
+  private onUpdateDownloaded?: AppUpdateRuntimeConfiguration["onUpdateDownloaded"];
 
   configure(input: AppUpdateRuntimeConfiguration): void {
+    this.onUpdateDownloaded = input.onUpdateDownloaded;
     // Download explicitly so a setting change during a network check is respected.
     autoUpdater.autoDownload = false;
     autoUpdater.autoRunAppAfterInstall = true;
@@ -189,8 +197,12 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
     });
     autoUpdater.on("update-downloaded", (info) => {
       const updateInfo = info as RuntimeUpdateInfo;
+      if (process.platform === "darwin") {
+        this.macDownloadedInfo = updateInfo;
+        this.macNativeReady = false;
+      }
       updateLifecycleLog.updateDownloaded(updateInfo.version);
-      input.onUpdateDownloaded(updateInfo);
+      this.onUpdateDownloaded?.(updateInfo);
     });
     autoUpdater.on("error", (error) => {
       if (isUpdateChannelNotPublished(error)) return;
@@ -218,18 +230,112 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
 
   async downloadUpdate(targetVersion: string): Promise<unknown> {
     if (!(await isOfficialUpdatesEnabled())) return;
+    if (this.macDownloadedInfo?.version === targetVersion) {
+      // Rechecking the same release must not replace Squirrel's existing feed.
+      this.onUpdateDownloaded?.(this.macDownloadedInfo);
+      return;
+    }
     updateLifecycleLog.downloadRequested(targetVersion);
     return autoUpdater.downloadUpdate();
   }
 
-  quitAndInstall({ targetVersion, isSilent, isForceRunAfter }: AppUpdateInstallRequest): void {
+  private async prepareMacUpdate(targetVersion: string): Promise<void> {
+    const downloaded = this.macDownloadedInfo;
+    if (downloaded?.version !== targetVersion) {
+      throw new Error(`Squirrel's feed is not serving Paseo ${targetVersion}.`);
+    }
+    if (this.macNativeReady) return;
+    const feedUrl = electronAutoUpdater.getFeedURL();
+    const feedOrigin = new URL(feedUrl).origin;
+
+    // Squirrel schedules installation before emitting update-downloaded, so
+    // call it only after consent, shutdown and the final settings check.
+    // Own the readiness listener so a failed attempt leaves no install callback.
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        electronAutoUpdater.removeListener("update-downloaded", onReady);
+        electronAutoUpdater.removeListener("update-not-available", onUnavailable);
+        electronAutoUpdater.removeListener("error", onError);
+      };
+      const onReady = (
+        _event: Electron.Event,
+        _notes: string,
+        _name: string,
+        _date: Date,
+        updateUrl: string,
+      ) => {
+        if (!URL.canParse(updateUrl) || new URL(updateUrl).origin !== feedOrigin) return;
+        cleanup();
+        resolve();
+      };
+      const onError = (error: unknown) => {
+        cleanup();
+        reject(error);
+      };
+      const onUnavailable = () =>
+        onError(new Error(`Squirrel did not find Paseo ${targetVersion}.`));
+      electronAutoUpdater.on("update-downloaded", onReady);
+      electronAutoUpdater.once("update-not-available", onUnavailable);
+      electronAutoUpdater.once("error", onError);
+      try {
+        electronAutoUpdater.checkForUpdates();
+      } catch (error) {
+        onError(error);
+      }
+    });
+    if (this.macDownloadedInfo !== downloaded || electronAutoUpdater.getFeedURL() !== feedUrl) {
+      throw new Error(`Squirrel's feed changed while preparing Paseo ${targetVersion}.`);
+    }
+    this.macNativeReady = true;
+  }
+
+  async quitAndInstall({
+    targetVersion,
+    isSilent,
+    isForceRunAfter,
+  }: AppUpdateInstallRequest): Promise<void> {
+    const isMac = process.platform === "darwin";
+    if (isMac) await this.prepareMacUpdate(targetVersion);
     autoUpdater.autoRunAppAfterInstall = isForceRunAfter;
     updateLifecycleLog.quitAndInstallRequested({
       targetVersion,
       isSilent,
       isForceRunAfter,
     });
-    autoUpdater.quitAndInstall(isSilent, isForceRunAfter);
+    return new Promise((resolve, reject) => {
+      const useAppQuit = isMac && !isForceRunAfter;
+      const timeout = !isForceRunAfter
+        ? setTimeout(
+            () => onError(new Error("The updater did not take ownership of the quit.")),
+            QUIT_UPDATE_HANDOFF_TIMEOUT_MS,
+          )
+        : undefined;
+      const onHandoff = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (error: unknown) => {
+        cleanup();
+        reject(error);
+      };
+      const cleanup = () => {
+        clearTimeout(timeout);
+        app.removeListener("before-quit", onHandoff);
+        electronAutoUpdater.removeListener("before-quit-for-update", onHandoff);
+        autoUpdater.removeListener("error", onError);
+      };
+      autoUpdater.once("error", onError);
+      if (useAppQuit) app.once("before-quit", onHandoff);
+      else electronAutoUpdater.once("before-quit-for-update", onHandoff);
+      try {
+        macUpdateQuitInProgress = useAppQuit;
+        autoUpdater.quitAndInstall(isSilent, isForceRunAfter);
+      } catch (error) {
+        onError(error);
+      } finally {
+        macUpdateQuitInProgress = false;
+      }
+    });
   }
 }
 
@@ -261,6 +367,37 @@ export function hasDownloadedAppUpdate(): boolean {
       isAppImage: Boolean(process.env.APPIMAGE),
     }) && appUpdateService.hasDownloadedUpdate()
   );
+}
+
+export function isMacUpdateQuitInProgress(): boolean {
+  return macUpdateQuitInProgress;
+}
+
+export async function confirmOfficialUpdateWithoutAgentResume(
+  target: AppUpdateTarget,
+  cancelLabel: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  // Official desktop update manifests do not attest to daemon recovery support.
+  if (signal?.aborted) return false;
+  const parent = signal && (BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]);
+  // On macOS a message box without a parent cannot be cancelled by the deadline.
+  if (signal && process.platform === "darwin" && !parent) return false;
+  const options = {
+    type: "warning" as const,
+    title: "Paseo Desktop Update",
+    message: `Agent recovery is unverified for Paseo ${target.version}.`,
+    detail:
+      "Paseo will stop the built-in daemon without requesting one-time agent recovery. Agents may need to be resumed manually.",
+    buttons: ["Install Update", cancelLabel],
+    defaultId: 0,
+    cancelId: 1,
+    signal,
+  };
+  const result = parent
+    ? await dialog.showMessageBox(parent, options)
+    : await dialog.showMessageBox(options);
+  return result.response === 0;
 }
 
 export async function checkForAppUpdate({
@@ -298,7 +435,7 @@ export async function downloadAndInstallUpdate(
     currentVersion: string;
     releaseChannel: AppReleaseChannel;
   },
-  onBeforeQuit?: () => Promise<void>,
+  onBeforeQuit?: BeforeAppUpdateInstall,
 ): Promise<AppUpdateInstallResult> {
   return appUpdateService.downloadAndInstallUpdate(
     { currentVersion, releaseChannel },
@@ -310,10 +447,12 @@ export async function installAppUpdateOnQuit({
   currentVersion,
   releaseChannel,
   signal,
+  onBeforeQuit,
 }: {
   currentVersion: string;
   releaseChannel: AppReleaseChannel;
   signal: AbortSignal;
+  onBeforeQuit: BeforeAppUpdateInstall;
 }): Promise<boolean> {
   if (
     !shouldInstallAppUpdateOnQuit({
@@ -324,5 +463,10 @@ export async function installAppUpdateOnQuit({
     return false;
   }
 
-  return appUpdateService.installUpdateOnQuit({ currentVersion, releaseChannel, signal });
+  return appUpdateService.installUpdateOnQuit({
+    currentVersion,
+    releaseChannel,
+    signal,
+    onBeforeQuit,
+  });
 }

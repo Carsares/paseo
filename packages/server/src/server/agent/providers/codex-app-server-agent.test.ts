@@ -5839,6 +5839,20 @@ describe("Codex app-server provider", () => {
       ["finished", "child", "completed"],
       ["descendant", "finished", "canceled"],
     ]);
+    expect(
+      history.flatMap((event) =>
+        event.type === "provider_subagent" &&
+        event.event.type === "timeline" &&
+        event.event.item.type === "tool_call" &&
+        event.event.item.detail.type === "sub_agent"
+          ? [[event.event.id, event.event.item.status]]
+          : [],
+      ),
+    ).toEqual([
+      ["child", "canceled"],
+      ["child", "completed"],
+      ["finished", "canceled"],
+    ]);
   });
 
   test("coalesces persisted MultiAgentV2 activity for one child into one terminal card", async () => {

@@ -527,6 +527,11 @@ function parseFiniteNumber(value: unknown): number | null {
 }
 
 function parseClampedDecimal(value: unknown, bounds: { min: number; max: number }): number | null {
+  if (typeof value === "string") {
+    const decimal = value.trim();
+    if (!/^[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)$/.test(decimal)) return null;
+    value = decimal.replace(",", ".");
+  }
   const numericValue = parseFiniteNumber(value);
   if (numericValue === null) {
     return null;

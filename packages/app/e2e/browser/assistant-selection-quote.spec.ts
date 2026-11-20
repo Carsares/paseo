@@ -30,15 +30,8 @@ function quoteButton(page: Page) {
   return page.getByRole("button", { name: "Quote", exact: true });
 }
 
-function noteInput(page: Page) {
-  return page.getByRole("textbox", { name: "Note on the quote" });
-}
-
-function quoted(markdown: string): string {
-  return markdown
-    .split("\n")
-    .map((line) => (line ? `> ${line}` : ">"))
-    .join("\n");
+function quoteCards(page: Page) {
+  return page.getByTestId("composer-quote-card");
 }
 
 async function openIdleAgent(page: Page, repoPrefix: string): Promise<MockAgentWorkspace> {
@@ -58,7 +51,7 @@ async function openIdleAgent(page: Page, repoPrefix: string): Promise<MockAgentW
   return agent;
 }
 
-test("quoting a selection puts it and the note into the composer without sending", async ({
+test("quoting selections adds cards without changing or sending the draft", async ({
   context,
   page,
 }) => {
@@ -79,52 +72,35 @@ test("quoting a selection puts it and the note into the composer without sending
     expect(copied).toContain("```ts\nconst quoted = true;\n```");
 
     await quoteButton(page).click();
-    await expect(noteInput(page)).toBeFocused();
-    await expect(page.getByText("Enter adds to the message", { exact: false })).toBeVisible();
     await expect(quoteButton(page)).toHaveCount(0);
-
-    await page.keyboard.type("First line");
-    await page.keyboard.press("Shift+Enter");
-    await page.keyboard.type("second line");
-    await page.keyboard.press("Enter");
-
-    await expect(noteInput(page)).toHaveCount(0);
     await expect(composer(page)).toBeFocused();
-    await expect(composer(page)).toHaveValue(
-      `Draft start\n\n${quoted(copied)}\n\nFirst line\nsecond line`,
-    );
-    expect(
-      await composer(page).evaluate(
-        (element) =>
-          element instanceof HTMLTextAreaElement &&
-          element.selectionStart === element.value.length &&
-          element.selectionEnd === element.value.length,
-      ),
-    ).toBe(true);
+    await expect(composer(page)).toHaveValue("Draft start");
+    await expect(quoteCards(page)).toHaveCount(1);
+    await expect(quoteCards(page).first()).toContainText(copied);
 
-    // An empty note quotes alone and leaves a fresh paragraph to type into.
+    // Quote another selection through its context menu, with a different focus owner.
     await assistantMessageBlocks(page)
       .getByText("Closing paragraph.")
       .dblclick({ position: { x: 5, y: 5 } });
-    await quoteButton(page).click();
-    await expect(noteInput(page)).toBeFocused();
-    await page.keyboard.press("Enter");
-
-    await expect(composer(page)).toHaveValue(
-      `Draft start\n\n${quoted(copied)}\n\nFirst line\nsecond line\n\n> Closing\n\n`,
-    );
+    await page
+      .getByRole("button", { name: /^(Copy turn|Copied)$/ })
+      .last()
+      .focus();
+    await assistantMessageBlocks(page).getByText("Closing paragraph.").dispatchEvent("contextmenu");
+    await page.getByTestId("assistant-selection-context-menu-quote").click();
+    await expect(page.getByTestId("assistant-selection-context-menu")).toHaveCount(0);
+    await expect(quoteCards(page)).toHaveCount(2);
+    await expect(quoteCards(page).last()).toContainText("Closing");
+    await expect(composer(page)).toHaveValue("Draft start");
     await expect(composer(page)).toBeFocused();
 
-    // Nothing was sent: the only user message is the one that started the agent.
-    await expect(page.getByText("First line", { exact: false })).toHaveCount(0);
+    await expect(page.getByTestId("user-message")).toHaveCount(1);
   } finally {
     await agent.cleanup();
   }
 });
 
-test("Enter opens the note box while the button shows, so quoting runs on the keyboard", async ({
-  page,
-}) => {
+test("Enter adds the quote card when the selection owns the key", async ({ page }) => {
   const agent = await openIdleAgent(page, "assistant-selection-quote-enter-");
   try {
     // A real double-click, as a reader selects: focus leaves the composer.
@@ -138,18 +114,18 @@ test("Enter opens the note box while the button shows, so quoting runs on the ke
     await page.keyboard.press("Shift+Enter");
     await page.keyboard.press("ControlOrMeta+Enter");
     await page.keyboard.press("Alt+Enter");
-    await expect(noteInput(page)).toHaveCount(0);
+    await expect(quoteCards(page)).toHaveCount(0);
     await expect(quoteButton(page)).toBeVisible();
 
     await page.keyboard.press("Enter");
-    await expect(noteInput(page)).toBeFocused();
     await expect(quoteButton(page)).toHaveCount(0);
-    await page.keyboard.type("typed without the mouse");
-    await page.keyboard.press("Enter");
-
-    await expect(noteInput(page)).toHaveCount(0);
     await expect(composer(page)).toBeFocused();
-    await expect(composer(page)).toHaveValue("> Closing\n\ntyped without the mouse");
+    await expect(composer(page)).toHaveValue("");
+    await expect(quoteCards(page)).toHaveCount(1);
+    await expect(quoteCards(page).first()).toContainText("Closing");
+    await page.keyboard.type("typed without the mouse");
+    await expect(composer(page)).toHaveValue("typed without the mouse");
+    await expect(page.getByTestId("user-message")).toHaveCount(1);
   } finally {
     await agent.cleanup();
   }
@@ -172,7 +148,7 @@ test("Enter stays with the composer and a focused button while the Quote button 
     await expect(quoteButton(page)).toBeVisible();
     await page.keyboard.press("Enter");
     await expect(page.getByRole("button", { name: "Copied" })).toBeVisible();
-    await expect(noteInput(page)).toHaveCount(0);
+    await expect(quoteCards(page)).toHaveCount(0);
 
     // Selecting by script leaves focus in the composer, where Enter still sends.
     await composer(page).fill("Sent with Enter");
@@ -181,7 +157,7 @@ test("Enter stays with the composer and a focused button while the Quote button 
     await expect(composer(page)).toBeFocused();
     await page.keyboard.press("Enter");
 
-    await expect(noteInput(page)).toHaveCount(0);
+    await expect(quoteCards(page)).toHaveCount(0);
     await expect(composer(page)).toHaveValue("");
     await expect(
       page.getByTestId("user-message").filter({ hasText: "Sent with Enter" }),
@@ -191,16 +167,17 @@ test("Enter stays with the composer and a focused button while the Quote button 
   }
 });
 
-test("holding Enter in the note box adds the quote and sends nothing until the key comes up", async ({
+test("holding Enter on a selection adds one quote and sends nothing until a fresh press", async ({
   page,
 }) => {
   const agent = await openIdleAgent(page, "assistant-selection-quote-held-enter-");
   try {
     await composer(page).fill("Draft start");
-    await selectAssistantTextRange(page, "Closing paragraph.", "Closing paragraph.");
-    await quoteButton(page).click();
-    await expect(noteInput(page)).toBeFocused();
-    await page.keyboard.type("held note");
+    await assistantMessageBlocks(page)
+      .getByText("Closing paragraph.")
+      .dblclick({ position: { x: 5, y: 5 } });
+    await expect(quoteButton(page)).toBeVisible();
+    await expect(composer(page)).not.toBeFocused();
 
     // Pressing a key that is already down repeats it, as holding it does.
     await page.keyboard.down("Enter");
@@ -209,24 +186,25 @@ test("holding Enter in the note box adds the quote and sends nothing until the k
       await page.keyboard.down("Enter");
     }
     await page.keyboard.up("Enter");
-    await expect(composer(page)).toHaveValue("Draft start\n\n> Closing paragraph.\n\nheld note");
+    await expect(composer(page)).toHaveValue("Draft start");
+    await expect(quoteCards(page)).toHaveCount(1);
+    await expect(quoteCards(page).first()).toContainText("Closing");
+    await expect(page.getByTestId("user-message")).toHaveCount(1);
 
     // Released, Enter sends again, and the draft goes out whole as one message.
     await page.keyboard.type(" and more");
     await page.keyboard.press("Enter");
-    await expect(
-      page.getByTestId("user-message").filter({ hasText: "held note and more" }),
-    ).toBeVisible();
-    await expect(page.getByTestId("user-message").filter({ hasText: "held note" })).toHaveCount(1);
+    const sent = page.getByTestId("user-message").filter({ hasText: "Draft start and more" });
+    await expect(sent).toHaveCount(1);
+    await expect(sent.getByTestId("user-message-quote-block")).toContainText("Closing");
     await expect(composer(page)).toHaveValue("");
+    await expect(quoteCards(page)).toHaveCount(0);
   } finally {
     await agent.cleanup();
   }
 });
 
-test("Escape closes the note box and keeps the selection, then dismisses the button", async ({
-  page,
-}) => {
+test("Escape dismisses the quote button and keeps the selection", async ({ page }) => {
   const agent = await openIdleAgent(page, "assistant-selection-quote-escape-");
   try {
     await selectAssistantTextRange(page, "First point", "First point");
@@ -242,21 +220,14 @@ test("Escape closes the note box and keeps the selection, then dismisses the but
     await expect(find).toHaveCount(0);
 
     await selectAssistantTextRange(page, "First point", "First point");
-    await quoteButton(page).click();
-    await expect(noteInput(page)).toBeFocused();
-    await page.keyboard.type("a note to drop");
-    await page.keyboard.press("Escape");
-
-    await expect(noteInput(page)).toHaveCount(0);
-    await expect
-      .poll(() => page.evaluate(() => window.getSelection()?.toString()))
-      .toBe("First point");
     await expect(quoteButton(page)).toBeVisible();
 
     await page.keyboard.press("Escape");
     await expect(quoteButton(page)).toHaveCount(0);
     expect(await page.evaluate(() => window.getSelection()?.toString())).toBe("First point");
     await expect(composer(page)).toHaveValue("");
+    await expect(quoteCards(page)).toHaveCount(0);
+    await expect(page.getByTestId("user-message")).toHaveCount(1);
   } finally {
     await agent.cleanup();
   }
@@ -265,8 +236,8 @@ test("Escape closes the note box and keeps the selection, then dismisses the but
 const STREAMED_RESPONSE = [
   "Early passage to quote.",
   "",
-  "The reply keeps arriving one word at a time while the quote is written,",
-  "so the message is still growing when the note goes into the composer.",
+  "The reply keeps arriving one word at a time while the passage is quoted,",
+  "so the message is still growing when the card goes into the composer.",
   "",
   "More words follow here to keep the stream open for a while longer.",
   "",
@@ -292,11 +263,13 @@ test("quoting works while the message is still streaming", async ({ page }) => {
 
     await selectAssistantTextRange(page, "Early passage", "to quote.");
     await quoteButton(page).click();
-    await expect(noteInput(page)).toBeFocused();
+    await expect(composer(page)).toBeFocused();
+    await expect(composer(page)).toHaveValue("");
+    await expect(quoteCards(page)).toHaveCount(1);
+    await expect(quoteCards(page).first()).toContainText("Early passage to quote.");
     await page.keyboard.type("noted mid-stream");
-    await page.keyboard.press("Enter");
-
-    await expect(composer(page)).toHaveValue("> Early passage to quote.\n\nnoted mid-stream");
+    await expect(composer(page)).toHaveValue("noted mid-stream");
+    await expect(page.getByTestId("user-message")).toHaveCount(1);
     await expect(page.getByText("stream-end-sentinel")).toHaveCount(0);
     await agent.client.waitForFinish(agent.agentId, 60_000);
   } finally {

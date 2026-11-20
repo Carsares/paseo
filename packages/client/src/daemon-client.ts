@@ -483,6 +483,8 @@ export interface SendMessageOptions {
   sourceAgentServerId?: string;
   sessionMode?: string;
   messageId?: string;
+  /** Wait for provider dispatch instead of the agent message's queue admission. */
+  waitForDispatch?: boolean;
   /** What happens when the agent is mid-turn. The daemon interrupts the turn when omitted. */
   activeTurnBehavior?: ActiveTurnBehavior;
   images?: Array<{ data: string; mimeType: string }>;
@@ -744,6 +746,7 @@ export interface AgentTimelineSearchOptions {
   agentId: string;
   query: string;
   cursor?: number;
+  hideAgentInteractions?: boolean;
 }
 
 export type AgentTimelineSearchPayload = Extract<
@@ -3665,11 +3668,15 @@ export class DaemonClient {
     });
   }
 
-  async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
+  async archiveAgent(
+    agentId: string,
+    expectedWorkspaceId?: string,
+  ): Promise<{ archivedAt: string }> {
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
       type: "archive_agent_request",
       agentId,
+      ...(expectedWorkspaceId === undefined ? {} : { expectedWorkspaceId }),
       requestId,
     });
     const result = await this.sendRequest({
@@ -4131,11 +4138,19 @@ export class DaemonClient {
     agentId,
     query,
     cursor,
+    hideAgentInteractions,
   }: AgentTimelineSearchOptions): Promise<AgentTimelineSearchPayload> {
     const requestId = this.createRequestId();
     const payload = await this.sendCorrelatedSessionRequest({
       requestId,
-      message: { type: "agent.timeline.search.request", requestId, agentId, query, cursor },
+      message: {
+        type: "agent.timeline.search.request",
+        requestId,
+        agentId,
+        query,
+        cursor,
+        hideAgentInteractions,
+      },
       responseType: "agent.timeline.search.response",
     });
     if (payload.error) throw new Error(payload.error);
@@ -4356,11 +4371,28 @@ export class DaemonClient {
   // Agent Interaction
   // ============================================================================
 
-  async sendAgentMessage(
-    agentId: string,
-    text: string,
-    options: SendMessageOptions = {},
-  ): Promise<{ deliveryStatus?: "queued" }> {
+  async pullAgentFinishReports(
+    childAgentId: string,
+    parentAgentId: string,
+    acknowledged: string[],
+    observe?: boolean,
+  ) {
+    // COMPAT(agentFinishReportPull): added in v0.16.0, remove gate after 2027-05-19.
+    if (this.getLastServerInfoMessage()?.features?.agentFinishReportPull !== true) {
+      throw new Error("Update the Paseo host to fetch follow-up completion reports.");
+    }
+    return this.sendNamespacedCorrelatedSessionRequest<"agent.finish_reports.pull.response">({
+      message: {
+        type: "agent.finish_reports.pull.request",
+        childAgentId,
+        parentAgentId,
+        acknowledged,
+        observe,
+      },
+    });
+  }
+
+  private assertAgentSendSupport(options: SendMessageOptions): void {
     if (
       options.sourceAgentId &&
       this.lastServerInfoMessage?.features?.agentMessageProvenance !== true
@@ -4373,6 +4405,21 @@ export class DaemonClient {
     ) {
       throw new Error("Update the Paseo host to send messages with a qualified agent address.");
     }
+    // COMPAT(agentMessageDispatchConfirmation): added in v0.16.0, remove gate after 2027-05-19.
+    if (
+      options.waitForDispatch &&
+      this.lastServerInfoMessage?.features?.agentMessageDispatchConfirmation !== true
+    ) {
+      throw new Error("Update the Paseo host to confirm agent message dispatch.");
+    }
+  }
+
+  async sendAgentMessage(
+    agentId: string,
+    text: string,
+    options: SendMessageOptions = {},
+  ): Promise<{ deliveryStatus?: "queued" }> {
+    this.assertAgentSendSupport(options);
     const requestId = this.createRequestId();
     const messageId = options.messageId ?? crypto.randomUUID();
     const message = SessionInboundMessageSchema.parse({
@@ -4384,6 +4431,7 @@ export class DaemonClient {
       sourceAgentServerId: options.sourceAgentServerId,
       sessionMode: options.sessionMode,
       ...(messageId ? { messageId } : {}),
+      waitForDispatch: options.waitForDispatch,
       activeTurnBehavior: options.activeTurnBehavior,
       images: options.images,
       attachments: options.attachments,
@@ -4404,6 +4452,9 @@ export class DaemonClient {
     });
     if (!payload.accepted) {
       throw new Error(payload.error ?? "sendAgentMessage rejected");
+    }
+    if (options.waitForDispatch && payload.deliveryStatus === "queued") {
+      throw new Error("Agent message was queued without dispatch confirmation.");
     }
     return payload.deliveryStatus ? { deliveryStatus: payload.deliveryStatus } : {};
   }
@@ -4674,6 +4725,9 @@ export class DaemonClient {
     requestId?: string,
     options?: { timeout?: number; killTerminals?: boolean; resumeAgents?: boolean },
   ): Promise<RestartRequestedStatusPayload> {
+    if (options?.resumeAgents) {
+      requireAgentResumeOnStopCapability(this, this.config.url);
+    }
     const resolvedRequestId = this.createRequestId(requestId);
     const message = SessionInboundMessageSchema.parse({
       type: "restart_server_request",
@@ -7231,7 +7285,7 @@ export class DaemonClient {
   }
 
   async closeItems(
-    input: { agentIds?: string[]; terminalIds?: string[] },
+    input: { agentIds?: string[]; terminalIds?: string[]; expectedWorkspaceId?: string },
     requestId?: string,
   ): Promise<CloseItemsPayload> {
     const resolvedRequestId = this.createRequestId(requestId);
@@ -7239,6 +7293,9 @@ export class DaemonClient {
       type: "close_items_request",
       agentIds: input.agentIds ?? [],
       terminalIds: input.terminalIds ?? [],
+      ...(input.expectedWorkspaceId === undefined
+        ? {}
+        : { expectedWorkspaceId: input.expectedWorkspaceId }),
       requestId: resolvedRequestId,
     });
     return this.sendCorrelatedRequest({

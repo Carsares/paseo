@@ -1300,6 +1300,8 @@ describe("content spacing settings", () => {
     expect(parseContentLineHeightMultiplier(0.5)).toBe(MIN_CONTENT_LINE_HEIGHT_MULTIPLIER);
     expect(parseContentLineHeightMultiplier(5)).toBe(MAX_CONTENT_LINE_HEIGHT_MULTIPLIER);
     expect(parseContentLineHeightMultiplier("1.756")).toBe(1.76);
+    expect(parseContentLineHeightMultiplier("1,5")).toBe(1.5);
+    expect(parseContentLineHeightMultiplier("1,2.5")).toBeNull();
     expect(parseContentLineHeightMultiplier(1.444)).toBe(1.44);
     expect(parseContentLineHeightMultiplier("")).toBeNull();
     expect(parseContentLineHeightMultiplier("abc")).toBeNull();
@@ -1310,6 +1312,8 @@ describe("content spacing settings", () => {
     expect(parseContentLetterSpacing(-0)).toBe(0);
     expect(parseContentLetterSpacing(10)).toBe(MAX_CONTENT_LETTER_SPACING);
     expect(parseContentLetterSpacing("1.236")).toBe(1.24);
+    expect(parseContentLetterSpacing("0,5")).toBe(0.5);
+    expect(parseContentLetterSpacing("0,5,0")).toBeNull();
     expect(parseContentLetterSpacing(0.554)).toBe(0.55);
     expect(parseContentLetterSpacing("   ")).toBeNull();
     expect(parseContentLetterSpacing("abc")).toBeNull();

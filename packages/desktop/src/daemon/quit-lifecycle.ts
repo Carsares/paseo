@@ -1,4 +1,5 @@
 import type { DesktopSettingsStore } from "../settings/desktop-settings.js";
+import type { AppUpdateTarget, BeforeAppUpdateInstall } from "../features/app-update-service.js";
 
 interface QuitLifecycleSettings {
   daemon: {
@@ -20,21 +21,17 @@ interface ExternalQuitSignalSource {
 }
 
 interface QuitLifecycle {
+  isQuitting(): boolean;
   handleBeforeQuit(event: BeforeQuitEvent): void;
   handleBeforeQuitForUpdate(): void;
   requestPreserveWorkQuit(): void;
-}
-
-interface DeferredUpdateQuit {
-  promise: Promise<boolean>;
-  resolve(): void;
 }
 
 export interface StopOnQuitDeps {
   settingsStore: Pick<DesktopSettingsStore, "get">;
   isDesktopManagedDaemonRunning: () => boolean;
   isDesktopManagedDaemonPresent?: () => boolean;
-  hasPendingUpdateOnQuit?: () => boolean;
+  appUpdate?: AppUpdateTarget;
   stopDaemon: (reason?: "quit" | "app_update" | "quit_preserve_work") => Promise<unknown>;
   showShutdownFeedback: () => void;
   preserveWork?: boolean;
@@ -78,9 +75,7 @@ export async function stopDesktopManagedDaemonOnQuitIfNeeded(
     return false;
   }
 
-  const hasPendingUpdate =
-    settings.officialUpdatesEnabled !== false && deps.hasPendingUpdateOnQuit?.() === true;
-  const shouldStopDaemon = hasPendingUpdate
+  const shouldStopDaemon = deps.appUpdate
     ? (deps.isDesktopManagedDaemonPresent ?? deps.isDesktopManagedDaemonRunning)()
     : deps.isDesktopManagedDaemonRunning();
   if (!shouldStopDaemon) {
@@ -88,7 +83,7 @@ export async function stopDesktopManagedDaemonOnQuitIfNeeded(
   }
 
   deps.showShutdownFeedback();
-  await deps.stopDaemon(hasPendingUpdate ? "app_update" : "quit");
+  await deps.stopDaemon(deps.appUpdate ? "app_update" : "quit");
   return true;
 }
 
@@ -102,29 +97,31 @@ function waitForUpdateDeadline(signal: AbortSignal): Promise<boolean> {
   });
 }
 
-function createDeferredUpdateQuit(): DeferredUpdateQuit {
-  let resolvePromise!: (started: boolean) => void;
-  const promise = new Promise<boolean>((resolve) => {
-    resolvePromise = resolve;
-  });
-  return { promise, resolve: () => resolvePromise(true) };
-}
-
 export function createQuitLifecycle({
   app,
   closeTransportSessions,
   stopDesktopManagedDaemonIfNeeded,
   installAppUpdateOnQuit,
+  confirmAppUpdate,
   createUpdateDeadlineSignal,
+  isManualUpdateHandoffInProgress = () => false,
   onStopError,
   onPreserveWorkStopFailed,
   onUpdateError,
 }: {
   app: BeforeQuitApp;
   closeTransportSessions: () => void;
-  stopDesktopManagedDaemonIfNeeded: (options?: { preserveWork?: boolean }) => Promise<boolean>;
-  installAppUpdateOnQuit: (signal: AbortSignal) => Promise<boolean>;
+  stopDesktopManagedDaemonIfNeeded: (options?: {
+    preserveWork?: boolean;
+    appUpdate?: AppUpdateTarget;
+  }) => Promise<boolean>;
+  installAppUpdateOnQuit: (
+    signal: AbortSignal,
+    onBeforeQuit: BeforeAppUpdateInstall,
+  ) => Promise<boolean>;
+  confirmAppUpdate?: (target: AppUpdateTarget, signal: AbortSignal) => Promise<boolean>;
   createUpdateDeadlineSignal: () => AbortSignal;
+  isManualUpdateHandoffInProgress?: () => boolean;
   onStopError: (error: unknown) => void;
   onPreserveWorkStopFailed?: (error: unknown) => void;
   onUpdateError: (error: unknown) => void;
@@ -135,75 +132,82 @@ export function createQuitLifecycle({
   let quitting = false;
   let quittingForUpdate = false;
   let preserveWorkRequested = false;
-  const updateQuit = createDeferredUpdateQuit();
 
   function handleBeforeQuit(event: BeforeQuitEvent): void {
+    if (!quittingForUpdate && isManualUpdateHandoffInProgress()) {
+      event.preventDefault();
+      return;
+    }
     if (!preserveWorkRequested) closeTransportSessions();
     if (quittingForUpdate) return;
     if (quitting) {
-      if (preserveWorkRequested) {
-        event.preventDefault();
-        return;
-      }
-      // MacUpdater's no-relaunch path calls app.quit() without emitting
-      // before-quit-for-update. A second quit is equivalent handoff evidence.
-      updateQuit.resolve();
+      event.preventDefault();
       return;
     }
     quitting = true;
     event.preventDefault();
 
     void (async () => {
-      try {
-        await stopDesktopManagedDaemonIfNeeded({ preserveWork: preserveWorkRequested });
-      } catch (error) {
-        if (preserveWorkRequested) {
+      if (preserveWorkRequested) {
+        try {
+          await stopDesktopManagedDaemonIfNeeded({ preserveWork: true });
+        } catch (error) {
           quitting = false;
           preserveWorkRequested = false;
           onStopError(error);
           onPreserveWorkStopFailed?.(error);
           return;
         }
-        onStopError(error);
-      }
-
-      if (preserveWorkRequested) {
         preserveWorkRequested = false;
         closeTransportSessions();
+        app.exit(0);
+        return;
       }
+
+      let selectedUpdate = false;
+      let stoppedForUpdate = false;
       const signal = createUpdateDeadlineSignal();
-      const updateInstallation = installAppUpdateOnQuit(signal).catch((error) => {
+      const updateInstallation = installAppUpdateOnQuit(signal, async (appUpdate) => {
+        if (signal.aborted) return false;
+        if (confirmAppUpdate && !(await confirmAppUpdate(appUpdate, signal))) return false;
+        if (signal.aborted) return false;
+        selectedUpdate = true;
+        try {
+          stoppedForUpdate = await stopDesktopManagedDaemonIfNeeded({ appUpdate });
+        } catch (error) {
+          onStopError(error);
+          return false;
+        }
+        return undefined;
+      }).catch((error) => {
         onUpdateError(error);
         return false;
       });
-      const installingUpdate = await Promise.race([
+      let installingUpdate = await Promise.race([
         updateInstallation,
         waitForUpdateDeadline(signal),
       ]);
-      if (installingUpdate) {
-        const handoffStarted = await Promise.race([
-          updateQuit.promise,
-          waitForUpdateDeadline(createUpdateDeadlineSignal()),
-        ]);
-        if (handoffStarted) {
-          return;
-        }
-      }
+      // Once shutdown has started, finish the chosen attempt before exiting.
+      if (selectedUpdate) installingUpdate = await updateInstallation;
+      if (installingUpdate) return;
 
+      if (!stoppedForUpdate) {
+        await stopDesktopManagedDaemonIfNeeded().catch(onStopError);
+      }
       app.exit(0);
     })();
   }
 
   return {
+    isQuitting: () => quitting || quittingForUpdate,
     handleBeforeQuit,
     requestPreserveWorkQuit() {
-      if (quitting || quittingForUpdate) return;
+      if (quitting || quittingForUpdate || isManualUpdateHandoffInProgress()) return;
       preserveWorkRequested = true;
       app.quit?.();
     },
     handleBeforeQuitForUpdate() {
       quittingForUpdate = true;
-      updateQuit.resolve();
     },
   };
 }

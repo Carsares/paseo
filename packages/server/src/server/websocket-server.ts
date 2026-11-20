@@ -3,19 +3,19 @@ import {
   ChunkedTransportProtocolError,
 } from "@getpaseo/protocol/chunked-transport";
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
-import {
-  createAgentMessageDelivery,
-  type AgentMessageDelivery,
-} from "./agent/agent-messages/index.js";
+import { createAgentMessageDelivery } from "./agent/agent-messages/index.js";
 import {
   sendPreparedPromptToAgent,
   waitForAgentRunStartWithTimeout,
 } from "./agent/agent-prompt.js";
 import { createToolHosts } from "./agent/host-operations/index.js";
-import type {
-  FinishRegistration,
-  FinishSubscriptions,
+import {
+  type FinishRegistration,
+  type FinishSubscription,
+  type FinishSubscriptions,
 } from "./agent/finish-subscriptions/index.js";
+import { getParentAddressFromLabels } from "@getpaseo/protocol/agent-labels";
+import { MAX_SUBAGENT_DEPTH, REMOTE_HIERARCHY_DEPTH_LABEL } from "./agent/hierarchy-policy.js";
 import { parseAgentMessages } from "./agent/agent-messages/envelope.js";
 import { registerParentFinishSubscription } from "./agent/create-agent/create.js";
 import { HOST_ROUTE_OPCODE } from "@getpaseo/protocol/binary-frames/index";
@@ -26,7 +26,7 @@ import {
   createWorkspaceBaseBranchService,
   type WorkspaceBaseBranchService,
 } from "./session/workspace-base-branch/service.js";
-import type { CreationSnapshot } from "@getpaseo/protocol/messages";
+import type { AgentFinishReport, CreationSnapshot } from "@getpaseo/protocol/messages";
 import { CreationService } from "./creation/index.js";
 import { MessageReceipts } from "./message-receipts/index.js";
 import { WebSocket, WebSocketServer } from "ws";
@@ -35,7 +35,11 @@ import { join } from "path";
 import { getHostName } from "./host-name.js";
 import { randomUUID } from "node:crypto";
 import { monitorEventLoopDelay } from "node:perf_hooks";
-import type { AgentManager, AgentMetricsSnapshot } from "./agent/agent-manager.js";
+import {
+  AgentRunCancellationError,
+  type AgentManager,
+  type AgentMetricsSnapshot,
+} from "./agent/agent-manager.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
 import type { DownloadTokenStore } from "./file-download/token-store.js";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
@@ -512,6 +516,7 @@ interface SocketSessionOptions {
   onBinaryMessageToSource?: (source: object, frame: Uint8Array) => Promise<void>;
   getTransportBufferedAmount?: (source?: object) => number | null;
   onLifecycleIntent?: (intent: SessionLifecycleIntent) => void;
+  prepareLifecycleIntent?: (intent: SessionLifecycleIntent) => Promise<void>;
   hubExecutionAgents?: HubExecutionAgents;
   hubRelationships?: HubRelationshipManagement;
 }
@@ -581,7 +586,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly agentManager: AgentManager;
   private readonly agentStorage: AgentStorage;
   private readonly messageReceipts: MessageReceipts;
-  readonly agentMessages: AgentMessageDelivery;
+  readonly agentMessages: ReturnType<typeof createAgentMessageDelivery>;
   private readonly creationService: CreationService;
   private readonly projectRegistry: ProjectRegistry;
   private readonly workspaceRegistry: WorkspaceRegistry;
@@ -626,6 +631,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly workspaceArchiveOperations = new WorkspaceArchiveOperations();
   private readonly providerSnapshotManager: ProviderSnapshotManager;
   private onLifecycleIntent!: ((intent: SessionLifecycleIntent) => void) | null;
+  private prepareLifecycleIntent!: ((intent: SessionLifecycleIntent) => Promise<void>) | null;
   private onBranchChanged!:
     | ((workspaceId: string, oldBranch: string | null, newBranch: string | null) => void)
     | null;
@@ -688,6 +694,7 @@ export class VoiceAssistantWebSocketServer {
     },
     daemonVersion?: string,
     onLifecycleIntent?: (intent: SessionLifecycleIntent) => void,
+    prepareLifecycleIntent?: (intent: SessionLifecycleIntent) => Promise<void>,
     projectRegistry?: ProjectRegistry,
     workspaceRegistry?: WorkspaceRegistry,
     scheduleService?: ScheduleService,
@@ -750,6 +757,7 @@ export class VoiceAssistantWebSocketServer {
         );
         let registration: FinishRegistration | undefined;
         let dispatched = false;
+        let prepared = false;
         const { disposition } = await sendPreparedPromptToAgent({
           agentManager,
           agentStorage,
@@ -760,44 +768,67 @@ export class VoiceAssistantWebSocketServer {
           clearPendingPermissions: batch.clearPendingPermissions,
           unarchive: batch.unarchive,
           runOptions: { clientMessageId: batch.messageIds[0] },
-          beforeDispatch: shouldReportUpward
-            ? async () => {
-                try {
-                  registration = await registerParentFinishSubscription({
-                    agentId: batch.recipientId,
-                    serverId,
-                    agentManager,
-                    agentStorage,
-                    finishSubscriptions,
-                  });
-                } catch (error) {
-                  this.logger.warn(
-                    { err: error, agentId: batch.recipientId },
-                    "Failed to register parent finish subscription",
-                  );
-                }
+          beforeDispatch: async () => {
+            if (shouldReportUpward) {
+              try {
+                const recipient =
+                  agentManager.getAgent(batch.recipientId) ??
+                  (await agentStorage.get(batch.recipientId));
+                const parent = getParentAddressFromLabels(recipient?.labels, serverId);
+                const depth = recipient?.labels?.[REMOTE_HIERARCHY_DEPTH_LABEL];
+                registration =
+                  parent && parent.serverId !== serverId && depth !== String(MAX_SUBAGENT_DEPTH)
+                    ? await finishSubscriptions?.register(
+                        {
+                          childAgentId: batch.recipientId,
+                          callerAgentId: parent.agentId,
+                          callerServerId: parent.serverId,
+                          requireParentOwnership: true,
+                          followupReport: true,
+                        },
+                        true,
+                      )
+                    : await registerParentFinishSubscription({
+                        agentId: batch.recipientId,
+                        serverId,
+                        agentManager,
+                        agentStorage,
+                        finishSubscriptions,
+                      });
+              } catch (error) {
+                this.logger.warn(
+                  { err: error, agentId: batch.recipientId },
+                  "Failed to register parent finish subscription",
+                );
               }
-            : undefined,
-          onDispatch: (started) => {
-            if (started !== "out_of_band") {
+            }
+            await batch.beforeProviderDispatch();
+            prepared = true;
+          },
+          onDispatch: batch.onDispatch,
+          logger: this.logger,
+        })
+          .then(async (result) => {
+            if (!prepared) throw new Error("Recipient was archived before message dispatch");
+            if (result.disposition === "turn_started") {
+              await waitForAgentRunStartWithTimeout(agentManager, batch.recipientId);
+            }
+            if (result.disposition !== "out_of_band") {
               dispatched = true;
               registration?.accept();
             }
-            batch.onDispatch(started);
-          },
-          logger: this.logger,
-        }).finally(async () => {
-          if (!dispatched) {
-            await registration?.reject().catch((error) => {
-              this.logger.warn(
-                { err: error, agentId: batch.recipientId },
-                "Failed to reject parent finish subscription",
-              );
-            });
-          }
-        });
-        if (disposition === "turn_started")
-          await waitForAgentRunStartWithTimeout(agentManager, batch.recipientId);
+            return result;
+          })
+          .finally(async () => {
+            if (!dispatched) {
+              await registration?.reject().catch((error) => {
+                this.logger.warn(
+                  { err: error, agentId: batch.recipientId },
+                  "Failed to reject parent finish subscription",
+                );
+              });
+            }
+          });
         return disposition;
       },
       onError: (err, batch) =>
@@ -843,6 +874,7 @@ export class VoiceAssistantWebSocketServer {
       terminalManager,
       dictation,
       onLifecycleIntent,
+      prepareLifecycleIntent,
       serviceProxy,
       scriptRuntimeStore,
       onBranchChanged,
@@ -900,6 +932,7 @@ export class VoiceAssistantWebSocketServer {
     terminalManager: TerminalManager | null | undefined;
     dictation: { finalTimeoutMs?: number } | undefined;
     onLifecycleIntent: ((intent: SessionLifecycleIntent) => void) | undefined;
+    prepareLifecycleIntent: ((intent: SessionLifecycleIntent) => Promise<void>) | undefined;
     serviceProxy: ServiceProxySubsystem | null | undefined;
     scriptRuntimeStore: WorkspaceScriptRuntimeStore | null | undefined;
     onBranchChanged:
@@ -938,6 +971,7 @@ export class VoiceAssistantWebSocketServer {
     }
     this.dictation = params.dictation ?? null;
     this.onLifecycleIntent = params.onLifecycleIntent ?? null;
+    this.prepareLifecycleIntent = params.prepareLifecycleIntent ?? null;
     this.serviceProxy = params.serviceProxy ?? null;
     this.scriptRuntimeStore = params.scriptRuntimeStore ?? null;
     this.onBranchChanged = params.onBranchChanged ?? null;
@@ -1668,6 +1702,9 @@ export class VoiceAssistantWebSocketServer {
       onLifecycleIntent: (intent) => {
         this.onLifecycleIntent?.(intent);
       },
+      prepareLifecycleIntent: async (intent) => {
+        await this.prepareLifecycleIntent?.(intent);
+      },
       hubExecutionAgents: admission.hubExecutionAgents,
       hubRelationships: this.hubRelationships ?? undefined,
     });
@@ -1716,6 +1753,7 @@ export class VoiceAssistantWebSocketServer {
       onBinaryMessageToSource: options.onBinaryMessageToSource,
       getTransportBufferedAmount: options.getTransportBufferedAmount,
       onLifecycleIntent: options.onLifecycleIntent,
+      prepareLifecycleIntent: options.prepareLifecycleIntent,
       logger: options.connectionLogger.child({ module: "session" }),
       onWorkspaceRecovered: async (workspace) => {
         await Promise.all(
@@ -2088,6 +2126,8 @@ export class VoiceAssistantWebSocketServer {
         ownedSubscriptions: true,
         // COMPAT(agentHierarchyControl): added in v0.16.0, remove gate after 2027-05-19.
         agentHierarchyControl: true,
+        // COMPAT(agentInitialPromptOrigin): added in v0.16.0, remove gate after 2027-05-19.
+        agentInitialPromptOrigin: true,
         providerOptionControls: true,
         entityMetadata: true,
         diffSubscription: true,
@@ -2272,6 +2312,8 @@ export class VoiceAssistantWebSocketServer {
         canonicalSubmittedPrompts: true,
         agentMessageProvenance: true,
         agentMessageBatching: true,
+        agentMessageDispatchConfirmation: true,
+        agentFinishReportPull: this.finishSubscriptions !== undefined,
         // COMPAT(stableProjectIdentity): added in v0.1.109, remove gate after 2027-01-15.
         stableProjectIdentity: true,
         // COMPAT(workspaceScriptManagement): added in v0.1.105, remove gate after 2027-01-10.
@@ -2757,6 +2799,101 @@ export class VoiceAssistantWebSocketServer {
     return link;
   }
 
+  async dispatchFinishReport(record: FinishSubscription, report: AgentFinishReport): Promise<void> {
+    await this.messageReceipts.send({
+      agentId: record.callerAgentId,
+      messageId: report.id,
+      retryIfUnsent: (error) => error instanceof AgentRunCancellationError,
+      // Use the same receipt if a reverse route tried to dispatch before the observer enrolled.
+      request: {
+        prompt: report.prompt,
+        sourceAgentId: record.childAgentId,
+        sourceAgentServerId: record.serverId,
+        activeTurnBehavior: "steer",
+      },
+      send: async (beforeProviderDispatch) => {
+        const receipt = this.agentMessages.enqueue({
+          recipientId: record.callerAgentId,
+          messageId: report.id,
+          prompt: report.prompt,
+          source: {
+            kind: "agent-notification",
+            agentId: record.childAgentId,
+            serverId: record.serverId,
+            title: report.title,
+            event: report.event,
+          },
+          activeTurnBehavior: "steer",
+          unarchive: false,
+          beforeProviderDispatch,
+        });
+        await receipt.dispatched;
+      },
+    });
+  }
+
+  private canPullFinishReports(session: Session, routedSource: boolean, source: string[]): boolean {
+    const permissions = session.getPermissions();
+    return (
+      routedSource &&
+      session.isRouted() &&
+      source.length === 4 &&
+      source[0] === "route" &&
+      source[3] === "mcp" &&
+      permissions.includes("workspace.write") &&
+      permissions.includes("workspace.read")
+    );
+  }
+
+  private async pullFinishReports(
+    session: Session,
+    request: Extract<
+      Extract<WSInboundMessage, { type: "session" }>["message"],
+      { type: "agent.finish_reports.pull.request" }
+    >,
+    routedSource: boolean,
+  ): Promise<void> {
+    const subscriptions = this.finishSubscriptions;
+    const sourceId = session.getHostSourceId();
+    const source = sourceId.split(":");
+    let ownsChild = false;
+    let reports: AgentFinishReport[] = [];
+    let error: string | null = null;
+    if (!subscriptions || !this.canPullFinishReports(session, routedSource, source)) {
+      error = "Permission denied for delegated completion reports.";
+    } else {
+      try {
+        const callerServerId = decodeURIComponent(source[2]!);
+        const stored = await this.agentStorage.get(request.childAgentId);
+        const labels = this.agentManager.getAgent(request.childAgentId)?.labels ?? stored?.labels;
+        const parent = getParentAddressFromLabels(labels, this.serverId);
+        const archivedOrActive = stored?.archivedAt ? "archived" : "active";
+        const related =
+          parent?.agentId === request.parentAgentId && parent.serverId === callerServerId;
+        const result = await subscriptions.pullReports(
+          {
+            childAgentId: request.childAgentId,
+            callerAgentId: request.parentAgentId,
+            callerServerId,
+            sourceId,
+          },
+          request.acknowledged,
+          request.observe === true,
+          related ? archivedOrActive : "unrelated",
+        );
+        reports = result.reports;
+        ownsChild = result.ownsBinding;
+      } catch (failure) {
+        this.logger.warn({ err: failure }, "Failed to read delegated finish reports");
+        error = "Failed to read delegated completion reports.";
+      }
+    }
+    session.delivery.reply({
+      type: "agent.finish_reports.pull.response",
+      payload: { requestId: request.requestId, ownsChild, reports, error },
+    });
+  }
+
   private async dispatchSessionMessage(
     ws: WebSocketLike,
     activeConnection: SessionConnection,
@@ -2766,6 +2903,13 @@ export class VoiceAssistantWebSocketServer {
     if (link.handles(message.message)) {
       await activeConnection.session.delivery.request(ws, message.message, () =>
         link.dispatch(message.message),
+      );
+      return;
+    }
+    if (message.message.type === "agent.finish_reports.pull.request") {
+      const request = message.message;
+      await activeConnection.session.delivery.request(ws, request, () =>
+        this.pullFinishReports(activeConnection.session, request, ws instanceof VirtualHostSocket),
       );
       return;
     }

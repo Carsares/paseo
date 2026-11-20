@@ -98,6 +98,7 @@ export interface Agent {
   workspaceId?: string;
   model: string | null;
   options?: ProviderOptions;
+  subagentDraftOptions?: ProviderOptions;
   controls?: AgentOptionControl[];
   thinkingOptionId?: string | null;
   requiresAttention?: boolean;

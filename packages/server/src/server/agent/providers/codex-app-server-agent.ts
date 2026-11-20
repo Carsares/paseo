@@ -2222,6 +2222,7 @@ async function loadCodexThreadHistoryTimeline(params: {
   client: CodexAppServerClientLike;
   threadId: string;
   cwd: string | null;
+  ancestorCanceled?: boolean;
 }): Promise<CodexThreadHistoryProjection> {
   const timeline: PersistedTimelineEntry[] = [];
   const subAgentTimelineIndexByThreadId = new Map<string, number>();
@@ -2234,10 +2235,16 @@ async function loadCodexThreadHistoryTimeline(params: {
   }
   const subAgentRoutes = Array.from(subAgentTimelineIndexByThreadId.entries()).flatMap(
     ([childThreadId, timelineIndex]): PersistedSubAgentRoute[] => {
-      const item = timeline[timelineIndex]?.item;
-      return item?.type === "tool_call" && item.detail.type === "sub_agent"
-        ? [{ childThreadId, toolCall: item }]
-        : [];
+      const entry = timeline[timelineIndex];
+      if (!entry || entry.item.type !== "tool_call" || entry.item.detail.type !== "sub_agent") {
+        return [];
+      }
+      const toolCall: ToolCallTimelineItem =
+        params.ancestorCanceled && entry.item.status === "running"
+          ? { ...entry.item, status: "canceled", error: null }
+          : entry.item;
+      entry.item = toolCall;
+      return [{ childThreadId, toolCall }];
     },
   );
   return { timeline, subAgentRoutes };
@@ -4320,10 +4327,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       visitedThreadIds.add(next.route.childThreadId);
       const ancestorCanceled = next.ancestorCanceled || next.route.toolCall.status === "canceled";
       this.registerSubAgentToolCall({
-        timelineItem:
-          next.ancestorCanceled && next.route.toolCall.status === "running"
-            ? { ...next.route.toolCall, status: "canceled", error: null }
-            : next.route.toolCall,
+        timelineItem: next.route.toolCall,
         rawItem: { agentThreadId: next.route.childThreadId },
         parentCallId: next.parentCallId,
         parentSubagentId: next.parentSubagentId,
@@ -4333,6 +4337,7 @@ export class CodexAppServerAgentSession implements AgentSession {
           client,
           threadId: next.route.childThreadId,
           cwd: this.config.cwd ?? null,
+          ancestorCanceled,
         });
         for (const entry of childHistory.timeline) {
           this.emitProviderSubagentTimeline(next.route.childThreadId, entry.item, entry.timestamp);

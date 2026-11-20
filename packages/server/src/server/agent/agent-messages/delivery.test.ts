@@ -5,7 +5,7 @@ import {
   parseAgentMessages,
   projectAgentMessages,
 } from "./index.js";
-import { extractSubmittedPromptForkContext } from "./envelope.js";
+import { extractSubmittedPromptForkContext, prepareAgentMessage } from "./envelope.js";
 import { buildAgentPrompt } from "../prompt-attachments.js";
 import type { AgentPromptInput } from "../agent-sdk-types.js";
 
@@ -326,32 +326,109 @@ const FORK_SUMMARY_WITH_PROVENANCE =
 const LEGACY_FORK_SUMMARY =
   "<chat-history-summary>\nChat history from a previous Paseo agent.\nSource agent: Source\n\n[User] Hi\n</chat-history-summary>";
 
-test("provider-replayed fork summary is stripped from the user message and keeps its provenance", () => {
-  expect(
-    projectAgentMessages({
-      type: "user_message",
-      text: `${FORK_SUMMARY_WITH_PROVENANCE}\n\n评估下方案`,
-      messageId: "provider-1",
-    }),
-  ).toEqual([
+test("requires a matching recorded source to hide an unmarked summary during replay", () => {
+  const text = `${FORK_SUMMARY_WITH_PROVENANCE}
+
+评估下方案`;
+  expect(projectAgentMessages({ type: "user_message", text, messageId: "provider-1" })).toEqual([
+    { type: "user_message", text, messageId: "provider-1" },
+  ]);
+  expect(projectAgentMessages({ type: "user_message", text: LEGACY_FORK_SUMMARY })).toEqual([
+    { type: "user_message", text: LEGACY_FORK_SUMMARY },
+  ]);
+  const withRecordedContext = {
+    type: "user_message" as const,
+    text,
+    forkContext: { sourceAgentId: "agent-src-1" },
+  };
+  expect(projectAgentMessages(withRecordedContext)).toEqual([
     {
       type: "user_message",
       text: "评估下方案",
-      messageId: "provider-1",
+      forkContext: { sourceAgentId: "agent-src-1", boundaryMessageId: "assistant-1" },
+    },
+  ]);
+  expect(projectAgentMessages(withRecordedContext, { submitted: true })).toEqual([
+    withRecordedContext,
+  ]);
+});
+
+test.each([
+  { sourceServerId: "different-host", boundaryMessageId: "assistant-1" },
+  { sourceServerId: "host-src-1", boundaryMessageId: "different-assistant-message" },
+])(
+  "keeps an unmarked summary whose host or boundary disagrees with the recorded source",
+  (context) => {
+    const item = {
+      type: "user_message" as const,
+      text: FORK_SUMMARY_WITH_PROVENANCE.replace(
+        "Source agent: Source",
+        "Source server ID: host-src-1\nSource agent: Source",
+      ),
+      forkContext: { sourceAgentId: "agent-src-1", ...context },
+    };
+
+    expect(projectAgentMessages(item)).toEqual([item]);
+  },
+);
+
+const historyAttachment = {
+  type: "text",
+  mimeType: "text/plain",
+  contextKind: "chat_history",
+  title: "Chat history",
+  text: FORK_SUMMARY_WITH_PROVENANCE,
+} as const;
+
+function replayText(prompt: AgentPromptInput): string {
+  return typeof prompt === "string"
+    ? prompt
+    : prompt.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n\n");
+}
+
+test("replays a structured history attachment separately from a pasted history summary", () => {
+  const body = `${FORK_SUMMARY_WITH_PROVENANCE}
+
+评估下方案`;
+  const submitted = buildAgentPrompt(body, undefined, [historyAttachment]);
+  const prepared = prepareAgentMessage(submitted);
+  expect(extractSubmittedPromptForkContext(prepared.prompt)).toEqual({
+    sourceAgentId: "agent-src-1",
+    boundaryMessageId: "assistant-1",
+  });
+  const item = { type: "user_message" as const, text: replayText(prepared.prompt) };
+  expect(projectAgentMessages(item)).toEqual([
+    {
+      type: "user_message",
+      text: body,
       forkContext: { sourceAgentId: "agent-src-1", boundaryMessageId: "assistant-1" },
     },
   ]);
 });
 
-test("a fork summary without provenance headers still marks the message as a fork", () => {
-  expect(
-    projectAgentMessages({ type: "user_message", text: `${LEGACY_FORK_SUMMARY}\n\n继续` }),
-  ).toEqual([{ type: "user_message", text: "继续", forkContext: {} }]);
+test("preserves a pasted attachment marker in the user message", () => {
+  const body = replayText(
+    prepareAgentMessage(buildAgentPrompt("", undefined, [historyAttachment])).prompt,
+  );
+  const prepared = prepareAgentMessage(body);
+  const rawUserMessage = { type: "user_message" as const, text: replayText(prepared.prompt) };
+  for (const options of [undefined, { submitted: true }]) {
+    expect(projectAgentMessages(rawUserMessage, options)).toEqual([
+      { type: "user_message", text: body, clientMessageId: prepared.messageId },
+    ]);
+  }
 });
 
-test("an attachment-only fork summary leaves empty user text", () => {
+test("keeps the typed slash command separate from history, including in a history-only turn", () => {
+  const slash = "/review";
+  const prepared = prepareAgentMessage(buildAgentPrompt(slash, undefined, [historyAttachment]));
+  expect(prepared.prompt).toEqual([
+    expect.objectContaining({ contextKind: "chat_history" }),
+    { type: "text", text: slash },
+  ]);
+  const historyOnly = prepareAgentMessage(buildAgentPrompt("", undefined, [historyAttachment]));
   expect(
-    projectAgentMessages({ type: "user_message", text: FORK_SUMMARY_WITH_PROVENANCE }),
+    projectAgentMessages({ type: "user_message", text: replayText(historyOnly.prompt) }),
   ).toEqual([
     {
       type: "user_message",
@@ -361,49 +438,15 @@ test("an attachment-only fork summary leaves empty user text", () => {
   ]);
 });
 
-test("repeated fork summaries are all stripped and the first provenance wins", () => {
-  const second = FORK_SUMMARY_WITH_PROVENANCE.replace("agent-src-1", "agent-src-2");
+test("preserves text inside a human message envelope", () => {
+  const text = `${FORK_SUMMARY_WITH_PROVENANCE}
+
+hi`;
   const [item] = projectAgentMessages({
     type: "user_message",
-    text: `${FORK_SUMMARY_WITH_PROVENANCE}\n\n${second}\n\nhello`,
+    text: formatAgentMessage({ id: "client-1", source: null, text }),
   });
-  expect(item).toMatchObject({ text: "hello", forkContext: { sourceAgentId: "agent-src-1" } });
-});
-
-test("a fork summary that is not at the start of the message stays user text", () => {
-  const text = `see this\n\n${LEGACY_FORK_SUMMARY}`;
-  expect(projectAgentMessages({ type: "user_message", text })).toEqual([
-    { type: "user_message", text },
-  ]);
-});
-
-test("explicit fork context on the item wins over the one parsed from text", () => {
-  const [item] = projectAgentMessages({
-    type: "user_message",
-    text: `${FORK_SUMMARY_WITH_PROVENANCE}\n\nhi`,
-    forkContext: { sourceAgentId: "explicit" },
-  });
-  expect(item).toMatchObject({
-    text: "hi",
-    forkContext: { sourceAgentId: "explicit", boundaryMessageId: "assistant-1" },
-  });
-});
-
-test("the fork summary of a human message wrapped in a user-message envelope is stripped", () => {
-  const [item] = projectAgentMessages({
-    type: "user_message",
-    text: formatAgentMessage({
-      id: "client-1",
-      source: null,
-      text: `${FORK_SUMMARY_WITH_PROVENANCE}\n\nhi`,
-    }),
-  });
-  expect(item).toMatchObject({
-    type: "user_message",
-    text: "hi",
-    clientMessageId: "client-1",
-    forkContext: { sourceAgentId: "agent-src-1", boundaryMessageId: "assistant-1" },
-  });
+  expect(item).toEqual({ type: "user_message", text, clientMessageId: "client-1" });
 });
 
 test("submitted prompt fork context comes from the chat history attachment", () => {
@@ -431,8 +474,5 @@ test("submitted prompt fork context comes from the chat history attachment", () 
     ),
   ).toEqual({ sourceAgentId: "from-attachment" });
   expect(extractSubmittedPromptForkContext(buildAgentPrompt("plain"))).toBeUndefined();
-  expect(extractSubmittedPromptForkContext(FORK_SUMMARY_WITH_PROVENANCE)).toEqual({
-    sourceAgentId: "agent-src-1",
-    boundaryMessageId: "assistant-1",
-  });
+  expect(extractSubmittedPromptForkContext(FORK_SUMMARY_WITH_PROVENANCE)).toBeUndefined();
 });

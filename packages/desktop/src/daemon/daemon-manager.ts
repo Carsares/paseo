@@ -8,6 +8,7 @@ import {
   DaemonInstanceError,
   stopDaemonInstance,
   readDaemonInstance,
+  waitForDaemonReady,
   isSameDaemonInstance,
   readLocalCredentialForTarget,
   type DaemonInstance,
@@ -22,6 +23,7 @@ import {
 } from "../features/attachments.js";
 import {
   checkForAppUpdate,
+  confirmOfficialUpdateWithoutAgentResume,
   downloadAndInstallUpdate,
   type AppUpdateCheckIntent,
   type AppReleaseChannel,
@@ -61,6 +63,11 @@ import { tailFile } from "../diagnostics/tail-file.js";
 
 const DAEMON_LOG_FILENAME = "daemon.log";
 let ownedLaunch: { home: string; instance: DaemonInstance } | null = null;
+let manualUpdateHandoffInProgress = false;
+
+export function isManualUpdateHandoffInProgress(): boolean {
+  return manualUpdateHandoffInProgress;
+}
 
 type DesktopDaemonState = "starting" | "running" | "stopped" | "errored";
 const DESKTOP_DAEMON_STOP_REASON_VALUES = [
@@ -319,29 +326,60 @@ async function startDaemon(): Promise<DesktopDaemonStatus> {
     }
   }
 
-  const home = getPaseoHome();
+  try {
+    await launchBuiltInDaemon(getPaseoHome());
+  } catch (error) {
+    if (!(error instanceof DaemonInstanceError && error.code === "DAEMON_NOT_READY")) throw error;
+  }
+  return resolveDesktopDaemonStatus();
+}
+
+async function launchBuiltInDaemon(home: string): Promise<void> {
   const invocation = createNodeEntrypointInvocation({
     entrypoint: resolveDaemonRunnerEntrypoint(),
     argvMode: "node-script",
     args: [],
     baseEnv: process.env,
   });
-  try {
-    await startDaemonInstance({
-      home,
-      timeoutMs: 30_000,
-      ...invocation,
-      env: { ...invocation.env, PASEO_CLI: getBundledCliShimPath() },
-      mode: "managed",
-      desktopManaged: true,
-      onAcquired: (instance) => {
-        ownedLaunch = { home, instance };
-      },
-    });
-  } catch (error) {
-    if (!(error instanceof DaemonInstanceError && error.code === "DAEMON_NOT_READY")) throw error;
+  await startDaemonInstance({
+    home,
+    timeoutMs: 30_000,
+    ...invocation,
+    env: { ...invocation.env, PASEO_CLI: getBundledCliShimPath() },
+    mode: "managed",
+    desktopManaged: true,
+    onAcquired: (instance) => {
+      ownedLaunch = { home, instance };
+    },
+  });
+}
+
+async function stopBuiltInDaemonForUpdate(
+  home: string,
+  instance: DaemonInstance,
+): Promise<(() => Promise<void>) | undefined> {
+  const stopped = await stopCapturedDaemon({
+    home,
+    instance,
+    reason: "app_update",
+    keepTerminals: keepsTerminalsOnStop("app_update", process.platform),
+  });
+  if (stopped.action !== "stopped") return undefined;
+  if (ownedLaunch?.home === home && isSameDaemonInstance(ownedLaunch.instance, instance)) {
+    ownedLaunch = null;
   }
-  return resolveDesktopDaemonStatus();
+  return async () => {
+    const running = await readDaemonInstance(home);
+    if (running && !running.desktopManaged) throw new Error("A different daemon is running.");
+    if (!running) await launchBuiltInDaemon(home);
+    const current = await waitForDaemonReady(home, {
+      timeoutMs: 30_000,
+      instance: running ?? undefined,
+    });
+    if (!current.desktopManaged || isSameDaemonInstance(instance, current)) {
+      throw new Error("Replacement built-in daemon was not started.");
+    }
+  };
 }
 
 export async function stopDesktopDaemon(
@@ -367,7 +405,10 @@ export async function stopDesktopDaemon(
       "Daemon changed since confirmation; inspect its current home and PID before stopping it.",
     );
   const resumeAgents = resumesAgentsOnStop(reason);
-  if (!instance || (!owned && !explicit && !(resumeAgents && instance.desktopManaged === true))) {
+  if (
+    !instance ||
+    (!owned && !explicit && !((resumeAgents || reason === "app_update") && instance.desktopManaged))
+  ) {
     return resolveDesktopDaemonStatus();
   }
   const keepTerminals = keepsTerminalsOnStop(reason, process.platform);
@@ -395,7 +436,9 @@ export interface StopCapturedDaemonInput {
 }
 
 /** Stops the captured supervisor with the requested preservation options it supports. */
-export async function stopCapturedDaemon(input: StopCapturedDaemonInput): Promise<void> {
+export async function stopCapturedDaemon(
+  input: StopCapturedDaemonInput,
+): ReturnType<typeof stopDaemonInstance> {
   const stopInstance = input.stopInstance ?? stopDaemonInstance;
   const runCliJson = input.runCliJson ?? runExternalCliJsonCommand;
   const logLifecycle = input.log ?? logDesktopDaemonLifecycle;
@@ -423,8 +466,7 @@ export async function stopCapturedDaemon(input: StopCapturedDaemonInput): Promis
   // Each retry drops one option, so there can be at most two retries.
   while (true) {
     try {
-      await stop(keep, resume);
-      return;
+      return await stop(keep, resume);
     } catch (error) {
       if (!(error instanceof ExternalCliCommandError)) throw error;
       const version = typeof error.error?.version === "string" ? error.error.version : "unknown";
@@ -467,9 +509,7 @@ export function keepsTerminalsOnStop(
 }
 
 export function resumesAgentsOnStop(reason: DesktopDaemonStopReason): boolean {
-  return (
-    reason === "app_update" || reason === "version_mismatch" || reason === "quit_preserve_work"
-  );
+  return reason === "version_mismatch" || reason === "quit_preserve_work";
 }
 
 async function restartDaemon(): Promise<DesktopDaemonStatus> {
@@ -512,6 +552,7 @@ async function resolveRequestedReleaseChannel(
 
 export function createDaemonCommandHandlers(
   onSettingsChanged?: (settings: DesktopSettings) => void,
+  isQuitting: () => boolean = () => false,
 ): Record<string, DesktopCommandHandler> {
   return {
     ...createDesktopSettingsCommandHandlers({
@@ -576,12 +617,29 @@ export function createDaemonCommandHandlers(
     },
     install_app_update: async (args) => {
       const currentVersion = resolveDesktopAppVersion();
-      return downloadAndInstallUpdate(
-        { currentVersion, releaseChannel: await resolveRequestedReleaseChannel(args) },
-        async () => {
-          await stopDesktopDaemon("app_update");
-        },
-      );
+      let ownsHandoff = false;
+      try {
+        return await downloadAndInstallUpdate(
+          { currentVersion, releaseChannel: await resolveRequestedReleaseChannel(args) },
+          async (target) => {
+            if (isQuitting()) return false;
+            const home = getPaseoHome();
+            const instance = await readDaemonInstance(home);
+            if (instance?.desktopManaged) {
+              if (!(await confirmOfficialUpdateWithoutAgentResume(target, "Cancel"))) return false;
+              if (!(await getDesktopSettingsStore().get()).officialUpdatesEnabled) return false;
+            }
+            if (isQuitting()) return false;
+            ownsHandoff = true;
+            manualUpdateHandoffInProgress = true;
+            return instance?.desktopManaged
+              ? stopBuiltInDaemonForUpdate(home, instance)
+              : undefined;
+          },
+        );
+      } finally {
+        if (ownsHandoff) manualUpdateHandoffInProgress = false;
+      }
     },
     get_local_daemon_version: () => getLocalDaemonVersion(),
     install_cli: () => installCli(),
@@ -594,8 +652,9 @@ export function createDaemonCommandHandlers(
 
 export function registerDaemonManager(
   onSettingsChanged?: (settings: DesktopSettings) => void,
+  isQuitting?: () => boolean,
 ): void {
-  const handlers = createDaemonCommandHandlers(onSettingsChanged);
+  const handlers = createDaemonCommandHandlers(onSettingsChanged, isQuitting);
 
   ipcMain.handle(
     "paseo:invoke",

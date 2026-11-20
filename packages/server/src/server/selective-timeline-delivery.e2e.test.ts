@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createPersistedWorkspaceRecord } from "./workspace-registry.js";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import { DaemonClient, type WebSocketLike } from "@getpaseo/client/internal/daemon-client";
@@ -489,6 +489,10 @@ test("rewind routes replacement completion by source capability and subscription
     selective: true,
     timelineReplacementInvalidation: true,
   });
+  const legacyUnsubscribed = await connect({
+    clientId: "rewind-legacy-unsubscribed",
+    selective: true,
+  });
   const legacy = await connect({ clientId: "rewind-legacy", selective: false });
   const agent = await initiating.client.createAgent({
     provider: "mock",
@@ -501,6 +505,7 @@ test("rewind routes replacement completion by source capability and subscription
     initiating.setLegacyTimelineMembership([agent.id]),
     passive.setLegacyTimelineMembership([agent.id]),
     unrelated.setLegacyTimelineMembership([]),
+    legacyUnsubscribed.setLegacyTimelineMembership([]),
   ]);
   await initiating.client.sendMessage(agent.id, "Rewind this synthetic prompt");
   await initiating.client.cancelAgent(agent.id);
@@ -517,12 +522,22 @@ test("rewind routes replacement completion by source capability and subscription
     throw new Error("Expected rewindable canonical user message");
   }
 
-  for (const connected of [initiating, passive, unrelated, legacy]) connected.clear();
-  await initiating.client.rewindAgent(agent.id, target.item.messageId, "conversation");
+  for (const connected of [initiating, passive, unrelated, legacyUnsubscribed, legacy])
+    connected.clear();
+  const fetchTimeline = vi.spyOn(daemon.daemon.agentManager, "fetchTimeline");
+  try {
+    await initiating.client.rewindAgent(agent.id, target.item.messageId, "conversation");
+    expect(
+      fetchTimeline.mock.calls.filter(([id, options]) => id === agent.id && options?.limit === 0),
+    ).toHaveLength(1);
+  } finally {
+    fetchTimeline.mockRestore();
+  }
   await Promise.all([
     initiating.barrier("rewind-initiator"),
     passive.barrier("rewind-passive"),
     unrelated.barrier("rewind-unrelated"),
+    legacyUnsubscribed.barrier("rewind-legacy-unsubscribed"),
     legacy.barrier("rewind-legacy"),
   ]);
 
@@ -541,6 +556,7 @@ test("rewind routes replacement completion by source capability and subscription
     unrelated.messages.filter((message) => message.type === "agent.timeline.replacement"),
   ).toHaveLength(0);
   expect(unrelated.hasTimeline(agent.id)).toBe(false);
+  expect(legacyUnsubscribed.hasTimeline(agent.id)).toBe(false);
 }, 30_000);
 
 test("subscription acknowledgements stay on the requesting socket of a retained session", async () => {

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { WORKSPACE_MAIN_ROLE, WORKSPACE_ROLE_LABEL } from "@getpaseo/protocol/agent-labels";
 
 import { AGENT_LIFECYCLE_STATUSES } from "./agent-manager.js";
 import {
@@ -220,6 +221,50 @@ describe("toStoredAgentRecord", () => {
 });
 
 describe("toAgentPayload", () => {
+  it("copies OpenCode Main Control draft options from the configured values", () => {
+    const own = { auto_accept: true, permission: { edit: "deny", bash: "ask" } };
+    const restricted = {
+      auto_accept: false,
+      permission: { edit: "deny", bash: "deny", todowrite: "deny" },
+    };
+    const agent = createManagedAgent({
+      provider: "opencode",
+      config: { provider: "opencode", providerOptions: own },
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+      effectiveOptions: restricted,
+    });
+    expect(toAgentPayload(agent)).toMatchObject({
+      options: restricted,
+      subagentDraftOptions: own,
+    });
+    const stored = toStoredAgentRecord(agent);
+    expect(
+      buildStoredAgentPayload(stored, ["opencode"], ownOptionsOnly).subagentDraftOptions,
+    ).toEqual(own);
+    expect(toAgentPayload({ ...agent, labels: {} }).subagentDraftOptions).toBeUndefined();
+  });
+
+  it("projects original Main Control draft options for providers derived from OpenCode", () => {
+    const own = { permission: { edit: "deny", bash: "ask" } };
+    const provider = "opencode-custom";
+    const agent = createManagedAgent({
+      provider,
+      providerAdapter: "opencode",
+      config: { provider, providerOptions: own },
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
+
+    expect(toAgentPayload(agent).subagentDraftOptions).toEqual(own);
+    expect(
+      buildStoredAgentPayload(
+        toStoredAgentRecord(agent),
+        [provider],
+        ownOptionsOnly,
+        () => "opencode",
+      ).subagentDraftOptions,
+    ).toEqual(own);
+  });
+
   it("serializes dates, clones arrays, and hides session", () => {
     const permissionA = createPermission({ id: "perm-a" });
     const permissionB = createPermission({

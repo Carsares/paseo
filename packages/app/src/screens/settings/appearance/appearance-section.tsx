@@ -60,12 +60,6 @@ function sizeDraftToOverride(value: string): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function decimalDraftToOverride(value: string): number | undefined {
-  if (value.length === 0) return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
 // ---------------------------------------------------------------------------
 // Fonts: family text fields + numeric size fields (commit on blur/submit)
 // ---------------------------------------------------------------------------
@@ -157,7 +151,7 @@ function FontSizeRow({
   const inputRef = useRef<EditingTextInputHandle>(null);
   const handleChangeText = useCallback(
     (value: string) => {
-      const sanitized = value.replace(decimal ? /[^\d.]/g : /[^\d]/g, "");
+      const sanitized = decimal ? value : value.replace(/[^\d]/g, "");
       if (sanitized !== value) {
         inputRef.current?.replaceText(sanitized);
       }
@@ -507,14 +501,6 @@ export function AppearanceSection() {
     setContentSizeDraft(value.replace(/[^\d]/g, ""));
   }, []);
 
-  const handleContentLineHeightChange = useCallback((value: string) => {
-    setContentLineHeightDraft(value.replace(/[^\d.]/g, ""));
-  }, []);
-
-  const handleContentLetterSpacingChange = useCallback((value: string) => {
-    setContentLetterSpacingDraft(value.replace(/[^\d.]/g, ""));
-  }, []);
-
   const commitUiBaseSize = useCallback(() => {
     const parsed = parseClampedFontSize(uiBaseSizeDraft, {
       min: MIN_UI_BASE_FONT_SIZE,
@@ -580,8 +566,9 @@ export function AppearanceSection() {
   const previewOverrides = useMemo(
     () => ({
       contentFontSize: sizeDraftToOverride(contentSizeDraft),
-      contentLineHeightMultiplier: decimalDraftToOverride(contentLineHeightDraft),
-      contentLetterSpacing: decimalDraftToOverride(contentLetterSpacingDraft),
+      contentLineHeightMultiplier:
+        parseContentLineHeightMultiplier(contentLineHeightDraft) ?? undefined,
+      contentLetterSpacing: parseContentLetterSpacing(contentLetterSpacingDraft) ?? undefined,
       monoFontFamily: monoFontDraft,
       codeFontSize: sizeDraftToOverride(codeSizeDraft),
     }),
@@ -640,7 +627,7 @@ export function AppearanceSection() {
             draft={contentLineHeightDraft}
             unit="×"
             decimal
-            onChangeDraft={handleContentLineHeightChange}
+            onChangeDraft={setContentLineHeightDraft}
             onCommit={commitContentLineHeight}
           />
           {showContentLetterSpacingRow ? (
@@ -651,7 +638,7 @@ export function AppearanceSection() {
               draft={contentLetterSpacingDraft}
               unit="px"
               decimal
-              onChangeDraft={handleContentLetterSpacingChange}
+              onChangeDraft={setContentLetterSpacingDraft}
               onCommit={commitContentLetterSpacing}
             />
           ) : null}

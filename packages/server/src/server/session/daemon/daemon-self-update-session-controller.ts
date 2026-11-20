@@ -14,13 +14,13 @@ const DAEMON_SELF_UPDATE_MESSAGE_TYPES: ReadonlySet<SessionInboundMessage["type"
   "daemon.update.request",
 ]);
 
-interface DaemonSelfUpdateRestartIntent {
+export interface DaemonSelfUpdateRestartIntent {
   type: "restart";
   clientId: string;
   requestId: string;
   reason: string;
   keepTerminals: boolean;
-  resumeAgents: true;
+  resumeAgents?: true;
 }
 
 export interface DaemonSelfUpdateSessionControllerOptions {
@@ -28,6 +28,7 @@ export interface DaemonSelfUpdateSessionControllerOptions {
   daemonVersion: string | null;
   desktopManaged?: boolean;
   emit: (msg: SessionOutboundMessage) => void;
+  prepareLifecycleIntent: (intent: DaemonSelfUpdateRestartIntent) => Promise<void>;
   emitLifecycleIntent: (intent: DaemonSelfUpdateRestartIntent) => void;
   sessionLogger: pino.Logger;
   updater?: Pick<DaemonSelfUpdater, "update">;
@@ -42,6 +43,7 @@ export class DaemonSelfUpdateSessionController {
   private readonly daemonVersion: string | null;
   private readonly desktopManaged: boolean;
   private readonly emit: (msg: SessionOutboundMessage) => void;
+  private readonly prepareLifecycleIntent: (intent: DaemonSelfUpdateRestartIntent) => Promise<void>;
   private readonly emitLifecycleIntent: (intent: DaemonSelfUpdateRestartIntent) => void;
   private readonly sessionLogger: pino.Logger;
   private readonly updater: Pick<DaemonSelfUpdater, "update">;
@@ -51,6 +53,7 @@ export class DaemonSelfUpdateSessionController {
     this.daemonVersion = options.daemonVersion;
     this.desktopManaged = options.desktopManaged === true;
     this.emit = options.emit;
+    this.prepareLifecycleIntent = options.prepareLifecycleIntent;
     this.emitLifecycleIntent = options.emitLifecycleIntent;
     this.sessionLogger = options.sessionLogger;
     this.updater = options.updater ?? daemonSelfUpdater;
@@ -65,6 +68,7 @@ export class DaemonSelfUpdateSessionController {
 
   private async handleDaemonUpdateRequest(msg: DaemonUpdateRequest): Promise<void> {
     const previousVersion = this.daemonVersion;
+    let installedVersion: string | null = null;
 
     try {
       const result = await this.updater.update({
@@ -74,26 +78,34 @@ export class DaemonSelfUpdateSessionController {
         logger: this.sessionLogger,
       });
 
-      this.emitResponse({
+      const response = {
         requestId: msg.requestId,
         success: result.success,
         error: result.error,
         previousVersion,
         newVersion: result.newVersion,
-      });
+      };
       if (!result.success) {
+        this.emitResponse(response);
         return;
       }
 
-      this.emitLifecycleIntent({
+      installedVersion = result.newVersion;
+      const intent: DaemonSelfUpdateRestartIntent = {
         type: "restart",
         clientId: this.clientId,
         requestId: msg.requestId,
         reason: "daemon_update",
         // A self-update restart keeps terminals: the worker outlives the daemon.
         keepTerminals: true,
-        resumeAgents: true,
+        ...(result.agentResumeSupported ? { resumeAgents: true } : {}),
+      };
+      await this.prepareLifecycleIntent(intent);
+      this.emitResponse({
+        ...response,
+        agentResume: result.agentResumeSupported ? "requested" : "unverified",
       });
+      this.emitLifecycleIntent(intent);
     } catch (error) {
       if (error instanceof DaemonSelfUpdateInProgressError) {
         this.emit({
@@ -111,9 +123,11 @@ export class DaemonSelfUpdateSessionController {
       this.emitResponse({
         requestId: msg.requestId,
         success: false,
-        error: getErrorMessage(error),
+        error: installedVersion
+          ? `Installed daemon ${installedVersion} but could not restart: ${getErrorMessage(error)}`
+          : getErrorMessage(error),
         previousVersion,
-        newVersion: null,
+        newVersion: installedVersion,
       });
     }
   }
@@ -134,6 +148,7 @@ export class DaemonSelfUpdateSessionController {
     error: string | null;
     previousVersion: string | null;
     newVersion: string | null;
+    agentResume?: "requested" | "unverified";
   }): void {
     this.emit({
       type: "daemon.update.response",

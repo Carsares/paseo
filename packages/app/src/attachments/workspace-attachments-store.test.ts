@@ -153,7 +153,7 @@ describe("workspace attachments store", () => {
       },
     });
     store.getState().setWorkspaceAttachments({ scopeKey: edited, attachments: [fresh] });
-    store.getState().clearWorkspaceAttachments({ scopeKey: cleared });
+    store.getState().clearDraftChatHistory({ draftId: "cleared" });
     read.resolve(
       JSON.stringify({
         [edited]: [old],

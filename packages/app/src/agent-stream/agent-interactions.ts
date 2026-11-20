@@ -5,6 +5,7 @@ import {
 import type { StreamItem } from "@/types/stream";
 
 // Agent lifecycle and messaging tools in the Paseo catalog. Permission tools stay visible.
+// Keep the persisted tool classification in the server's agent/chat-search/index.ts in sync.
 const PASEO_INTERACTION_TOOLS = new Set([
   "create_agent",
   "send_agent_prompt",

@@ -2344,6 +2344,7 @@ function collapseStaleEntityTabs(input: {
   layout: WorkspaceLayout;
   snapshot: WorkspaceTabSnapshot;
   visibleAgentIds: Set<string>;
+  retainedAgentTabIds?: ReadonlySet<string>;
   knownTerminalIds: Set<string>;
   explorerSidebarPaneId: string | null;
 }): WorkspaceLayout {
@@ -2352,7 +2353,9 @@ function collapseStaleEntityTabs(input: {
   for (const tab of collectAllTabs(nextLayout.root)) {
     if (
       snapshot.agentsHydrated &&
-      ((isAgentTab(tab) && !visibleAgentIds.has(tab.target.agentId)) ||
+      ((isAgentTab(tab) &&
+        !visibleAgentIds.has(tab.target.agentId) &&
+        !input.retainedAgentTabIds?.has(tab.tabId)) ||
         (tab.target.kind === "provider_subagent" && !visibleAgentIds.has(tab.target.parentAgentId)))
     ) {
       nextLayout =
@@ -2440,6 +2443,7 @@ function addMissingEntityTabs(input: {
 export function reconcileWorkspaceTabs(
   state: WorkspaceTabReconcileState,
   snapshot: WorkspaceTabSnapshot,
+  retainedAgentTabIds?: ReadonlySet<string>,
 ): WorkspaceTabReconcileState {
   let nextLayout = state.layout;
   const originalFocusedTabId =
@@ -2517,6 +2521,7 @@ export function reconcileWorkspaceTabs(
     layout: nextLayout,
     snapshot,
     visibleAgentIds,
+    retainedAgentTabIds,
     knownTerminalIds,
     explorerSidebarPaneId: state.explorerSidebarPaneId,
   });

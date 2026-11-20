@@ -136,10 +136,10 @@ test("an installed version is confirmed only in its replacement worker", async (
       updateDaemon: async () => {
         pid = 11;
         version = "2.0.0";
-        return { success: true, error: null, newVersion: version };
+        return { success: true, error: null, newVersion: version, agentResume: "unverified" };
       },
     }),
-  ).resolves.toEqual({ workerVersion: "2.0.0" });
+  ).resolves.toEqual({ workerVersion: "2.0.0", agentResume: "unverified" });
 });
 
 test("RPC errors mentioning transport are not retried", async () => {

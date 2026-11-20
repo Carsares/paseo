@@ -710,7 +710,7 @@ function RestartDaemonCard({ host }: { host: HostProfile }) {
 
 type DaemonUpdateState =
   | { status: "idle" }
-  | { status: "complete"; workerVersion: string }
+  | { status: "complete"; workerVersion: string; agentResume?: "requested" | "unverified" }
   | { status: "updating"; phase: string }
   | { status: "failed"; title: string; message: string };
 
@@ -815,10 +815,11 @@ function UpdateDaemonCard({ host }: { host: HostProfile }) {
             version: daemonClient.getLastServerInfoMessage()?.version ?? null,
           }),
         })
-          .then(({ workerVersion }) => {
+          .then(({ workerVersion, agentResume }) => {
             unsubscribeRef.current = null;
             unsubscribe();
-            if (isMountedRef.current) setUpdateState({ status: "complete", workerVersion });
+            if (isMountedRef.current)
+              setUpdateState({ status: "complete", workerVersion, agentResume });
             return undefined;
           })
           .catch((error) => {
@@ -883,7 +884,17 @@ function UpdateDaemonCard({ host }: { host: HostProfile }) {
           title={t("desktop.daemon.lifecycle.workerUpdated", {
             version: updateState.workerVersion,
           })}
-          description={t("desktop.daemon.lifecycle.supervisorRefresh")}
+          description={[
+            t("desktop.daemon.lifecycle.supervisorRefresh"),
+            ...(updateState.agentResume === "unverified"
+              ? [
+                  t("settings.host.daemon.update.agentResumeUnverified", {
+                    defaultValue:
+                      "Agent recovery support was unverified for this update. Agents may need to be resumed manually.",
+                  }),
+                ]
+              : []),
+          ].join("\n")}
         />
       ) : null}
       {updateState.status === "failed" ? (

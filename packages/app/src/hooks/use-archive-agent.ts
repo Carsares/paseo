@@ -17,6 +17,7 @@ const EMPTY_PENDING_ARCHIVE_AGENT_IDS = new Set<string>();
 export interface ArchiveAgentInput {
   serverId: string;
   agentId: string;
+  expectedWorkspaceId?: string;
 }
 
 export type ArchiveAgentPendingState = Record<string, true>;
@@ -445,9 +446,18 @@ export function useArchiveAgent() {
       if (!client) {
         throw new Error(t("common.errors.daemonClientUnavailable"));
       }
-      return await client.archiveAgent(input.agentId);
+      return input.expectedWorkspaceId === undefined
+        ? client.archiveAgent(input.agentId)
+        : client.archiveAgent(input.agentId, input.expectedWorkspaceId);
     },
     onMutate: (input) => {
+      if (input.expectedWorkspaceId !== undefined) {
+        // Another device can move the agent before the daemon checks the close.
+        // Wait for that check before changing the shared agent and list caches.
+        setAgentArchiving({ ...input, queryClient, isArchiving: true });
+        return;
+      }
+
       const archivedAt = new Date();
       const context: ArchiveAgentMutationContext = {
         agent: getStoredAgentSnapshot(input),
@@ -470,6 +480,16 @@ export function useArchiveAgent() {
       return context;
     },
     onSuccess: (result, input) => {
+      if (input.expectedWorkspaceId !== undefined) {
+        applyArchivedAgentCloseResults({
+          queryClient,
+          serverId: input.serverId,
+          results: [{ agentId: input.agentId, archivedAt: result.archivedAt }],
+          invalidateQueries: false,
+        });
+        return;
+      }
+
       markAgentArchivedInStore({
         serverId: input.serverId,
         agentId: input.agentId,

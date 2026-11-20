@@ -1,5 +1,6 @@
 import { unarchiveWorkspaceAgents } from "./workspace-archive-service.js";
 import { createRestartRecovery } from "./agent/restart-recovery/index.js";
+import { createLifecyclePreparation } from "./agent/restart-recovery/lifecycle-preparation.js";
 import { sendPromptToAgent, unarchiveAgentState } from "./agent/agent-prompt.js";
 import { createIdleRuntimeCleanup } from "./agent/idle-runtime-cleanup/index.js";
 import {
@@ -144,6 +145,7 @@ import { createSpeechService } from "./speech/speech-runtime.js";
 import { createSpeechSettingsOwner } from "./speech/speech-settings.js";
 import { AgentManager } from "./agent/agent-manager.js";
 import { AgentStorage } from "./agent/agent-storage.js";
+import { recoverAgentWorkspaceMove } from "./agent/agent-workspace-move-journal.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
 import { createAgentMcpServer } from "./agent/mcp-server.js";
 import {
@@ -949,6 +951,7 @@ export async function createPaseoDaemon(
     path.join(config.paseoHome, "projects", "workspaces.json"),
     logger,
   );
+  await recoverAgentWorkspaceMove({ paseoHome: config.paseoHome, workspaceRegistry, agentStorage });
   const workspaceLabelService = createWorkspaceLabelService({
     paseoHome: config.paseoHome,
     workspaceRegistry,
@@ -1068,6 +1071,17 @@ export async function createPaseoDaemon(
     report: (agentId, err) => logger.error({ agentId, err }, "Agent restart recovery failed"),
   });
   await restartRecovery.prepareStartup();
+  const lifecyclePreparation = createLifecyclePreparation({
+    pauseDelivery: () => wsServer?.agentMessages.pauseAdmission(),
+    pauseRunAdmission: () => agentManager.pauseRunAdmission(),
+    waitForAdmittedRunsToStart: () => agentManager.waitForAdmittedRunsToStart(),
+    capture: (force) =>
+      restartRecovery.captureRunningAgents({
+        force,
+        listRunningAgents: () =>
+          agentManager.listAgents().filter((agent) => agent.lifecycle === "running"),
+      }),
+  });
   logger.info({ elapsed: elapsed() }, "Agent storage initialized");
   await bootstrapWorkspaceRegistries({
     serverId,
@@ -1494,6 +1508,14 @@ export async function createPaseoDaemon(
 
   const finishSubscriptions = createFinishSubscriptions({
     store: createJsonFinishSubscriptionStore(config.paseoHome),
+    followups: {
+      watches: createJsonFinishSubscriptionStore(config.paseoHome, "finish-followup-watches.json"),
+      reports: createJsonFinishSubscriptionStore(config.paseoHome, "finish-followup-reports.json"),
+      dispatch: (record, report) => {
+        if (!wsServer) throw new Error("Daemon is not accepting agent messages");
+        return wsServer.dispatchFinishReport(record, report);
+      },
+    },
     serverId,
     logger,
     messages: () => {
@@ -1868,6 +1890,7 @@ export async function createPaseoDaemon(
                   logger.error({ err: error, intent }, "Failed to handle daemon lifecycle intent");
                 }
               },
+              (intent) => lifecyclePreparation.prepare(intent.resumeAgents === true),
               projectRegistry,
               workspaceRegistry,
               scheduleService,
@@ -1989,7 +2012,10 @@ export async function createPaseoDaemon(
 
   const stop = async (options?: { keepTerminals?: boolean; resumeAgents?: boolean }) => {
     const keepTerminals = options?.keepTerminals === true;
+    const resumeAgents = options?.resumeAgents === true;
     let terminalShutdownError: unknown = null;
+    // Lifecycle requests save recovery before acknowledgement. Signal-driven stops prepare here.
+    await lifecyclePreparation.beforeStop(resumeAgents);
     localCredential = null;
     await deleteLocalCredential(config.paseoHome);
     // Stop tracking plugin provider registrations before anything tears plugins
@@ -2008,7 +2034,6 @@ export async function createPaseoDaemon(
     await finishSubscriptions.close();
     await wsServer?.agentMessages.close();
     agentManager.prepareForShutdown();
-    await restartRecovery.captureRunningAgents({ force: options?.resumeAgents === true });
     await closeAllAgents(logger, agentManager);
     await withTimeout({
       promise: pluginRuntime.drainEvents(),

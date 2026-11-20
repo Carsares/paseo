@@ -2,7 +2,7 @@ export type UserMessageSegment =
   | { kind: "quote"; quoteIndex: number; text: string }
   | { kind: "text"; text: string };
 
-const QUOTE_LINE = /^\s*>\s?(.*)$/;
+const QUOTE_LINE = /^[ \t]*>(?:[ \t](.*))?$/;
 const FENCE_LINE = /^\s*(`{3,}|~{3,})(.*)$/;
 
 function joinLines(lines: string[], trimStart: boolean, trimEnd: boolean): string {
@@ -42,7 +42,7 @@ export function parseUserMessageSegments(message: string): UserMessageSegment[] 
   for (const line of message.split(/\r\n|\r|\n/)) {
     const quoted = fence ? null : QUOTE_LINE.exec(line);
     if (quoted) {
-      quoteLines.push(quoted[1]);
+      quoteLines.push(quoted[1] ?? "");
       continue;
     }
 

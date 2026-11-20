@@ -1,7 +1,12 @@
 import MarkdownIt from "markdown-it";
 import { setImmediate } from "node:timers/promises";
+import {
+  getPaseoToolLeafName,
+  normalizeToolName,
+} from "@getpaseo/protocol/tool-name-normalization";
 import type { AgentTimelineRow } from "../agent-timeline-store-types.js";
-import { projectTimelineRows } from "../timeline-projection.js";
+import type { AgentTimelineItem } from "../agent-sdk-types.js";
+import { projectTimelineRows, type TimelineProjectionEntry } from "../timeline-projection.js";
 
 const markdown = new MarkdownIt({ html: false });
 const PAGE_SIZE = 200;
@@ -14,6 +19,57 @@ interface SearchInput {
   rows: readonly AgentTimelineRow[];
   query: string;
   cursor?: number;
+  hideAgentInteractions?: boolean;
+  provider?: string;
+}
+
+// The app also handles local interaction rows that never enter the retained timeline.
+// Keep its persisted tool classification in agent-stream/agent-interactions.ts in sync.
+const PASEO_INTERACTION_TOOLS = new Set([
+  "create_agent",
+  "send_agent_prompt",
+  "get_agent_status",
+  "get_agent_activity",
+  "list_agents",
+  "cancel_agent",
+  "archive_agent",
+  "kill_agent",
+  "update_agent",
+  "set_agent_mode",
+]);
+
+function isHiddenInteraction(item: AgentTimelineItem, provider: string | undefined): boolean {
+  if (item.type !== "tool_call") return false;
+  if (item.agentMessage || item.detail.type === "sub_agent") return true;
+  if (provider === "claude" && (item.name === "Task" || item.name === "Agent")) return true;
+  const leaf = getPaseoToolLeafName(item.name);
+  if (leaf !== null) return PASEO_INTERACTION_TOOLS.has(leaf);
+  const normalized = normalizeToolName(item.name);
+  return normalized.startsWith("paseo_") && PASEO_INTERACTION_TOOLS.has(normalized.slice(6));
+}
+
+function* hideInteractionRows(entries: TimelineProjectionEntry[], provider: string | undefined) {
+  let previous: TimelineProjectionEntry | undefined;
+  for (const entry of entries) {
+    const { item } = entry;
+    if (isHiddenInteraction(item, provider)) continue;
+    // A tool update can fold into a row before both fragments, leaving a sequence
+    // gap between otherwise adjacent fragments that the client hydrates together.
+    if (
+      previous?.item.type === "assistant_message" &&
+      item.type === "assistant_message" &&
+      item.messageId &&
+      entry.turnId &&
+      previous.item.messageId === item.messageId &&
+      previous.turnId === entry.turnId
+    ) {
+      previous = { ...entry, item: { ...item, text: previous.item.text + item.text } };
+    } else {
+      if (previous) yield previous;
+      previous = entry;
+    }
+  }
+  if (previous) yield previous;
 }
 
 // Discovery is deliberately approximate. Only the client can verify displayed text, so
@@ -56,12 +112,19 @@ function countMatches(text: string, pattern: RegExp): number {
   return count;
 }
 
-export async function searchTimeline({ rows, query, cursor = 0 }: SearchInput) {
+export async function searchTimeline({
+  rows,
+  query,
+  cursor = 0,
+  hideAgentInteractions,
+  provider,
+}: SearchInput) {
   const locations: SearchLocation[] = [];
   if (!query.trim()) return { locations, nextCursor: null };
   const pattern = searchPattern(query);
   let lastYield = performance.now();
-  for (const entry of projectTimelineRows({ rows, mode: "projected" })) {
+  const entries = projectTimelineRows({ rows, mode: "projected" });
+  for (const entry of hideAgentInteractions ? hideInteractionRows(entries, provider) : entries) {
     if (entry.seqEnd <= cursor) continue;
     const item = entry.item;
     if (item.type !== "user_message" && item.type !== "assistant_message") continue;

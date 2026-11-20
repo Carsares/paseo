@@ -85,6 +85,9 @@ import { ICON_SIZE, type Theme } from "@/styles/theme";
 import type { DraftCommandTarget } from "@/agent-commands";
 import { encodeImages } from "@/utils/encode-images";
 import { focusWithRetries } from "@/utils/web-focus";
+import { hasSlashCommandWithQuotes } from "@/attachments/quote";
+import { BUILTIN_PROVIDER_IDS } from "@getpaseo/protocol/provider-manifest";
+import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
 import {
   cancelComposerAgent,
   dispatchComposerAgentMessage,
@@ -299,6 +302,7 @@ function buildAgentStateSelector(serverId: string, agentId: string) {
     const agent = state.sessions[serverId]?.agents?.get(agentId) ?? null;
     return {
       status: agent?.status ?? null,
+      provider: agent?.provider ?? null,
       contextWindowMaxTokens: agent?.lastUsage?.contextWindowMaxTokens ?? null,
       contextWindowUsedTokens: agent?.lastUsage?.contextWindowUsedTokens ?? null,
       totalCostUsd: agent?.lastUsage?.totalCostUsd ?? null,
@@ -1438,6 +1442,34 @@ function ComposerContentImpl({
   const editingSession = useComposerEditingSession(inputMode, providedEditingSession);
   const isFullscreen = useComposerFullscreen(editingSession);
   const [sendError, setSendError] = useState<string | null>(null);
+  const quoteCommandProvider =
+    agentControls?.selectedProvider ??
+    (commandDraft?.status === "ready" ? commandDraft.config.provider : agentState.provider);
+  const quoteCommandProviderMayBeAlias =
+    !!quoteCommandProvider && !BUILTIN_PROVIDER_IDS.includes(quoteCommandProvider);
+  const {
+    entries: quoteProviderEntries,
+    supportsSnapshot,
+    error: quoteProviderError,
+  } = useProvidersSnapshot(serverId, { cwd, enabled: quoteCommandProviderMayBeAlias });
+  const quoteProviderBase = quoteProviderEntries?.find(
+    (entry) => entry.provider === quoteCommandProvider,
+  )?.derivedFromProviderId;
+  const quoteProviderLookupPending =
+    quoteCommandProviderMayBeAlias && supportsSnapshot && quoteProviderEntries === undefined;
+  const rejectQuotedClaudeCommand = useCallback(
+    (text: string, outgoingAttachments: ComposerAttachment[]) => {
+      if (!hasSlashCommandWithQuotes(text, outgoingAttachments)) return false;
+      if (quoteProviderLookupPending) {
+        setSendError(quoteProviderError ?? t("composer.errors.alreadyLoading"));
+        return true;
+      }
+      if ((quoteProviderBase ?? quoteCommandProvider) !== "claude") return false;
+      setSendError(t("composer.errors.removeQuotesForClaudeCommand"));
+      return true;
+    },
+    [quoteCommandProvider, quoteProviderBase, quoteProviderError, quoteProviderLookupPending, t],
+  );
   const [isMessageInputFocused, setIsMessageInputFocused] = useState(false);
   const [isGithubPickerOpen, setIsGithubPickerOpen] = useState(false);
   const [githubSearchQuery, setGithubSearchQuery] = useState("");
@@ -1716,6 +1748,9 @@ function ComposerContentImpl({
       await dispatchComposerAgentMessage({
         client,
         agentId: targetAgentId,
+        provider: useSessionStore.getState().sessions[serverId]?.agents.get(targetAgentId)
+          ?.provider,
+        ...(supportsSnapshot ? { providerSnapshot: { client, serverId, cwd } } : {}),
         text,
         attachments: sendAttachments,
         attachmentSubmitFormat: resolveComposerAttachmentSubmitFormat({
@@ -1734,7 +1769,16 @@ function ComposerContentImpl({
       });
       onAttentionPromptSend?.();
     };
-  }, [appSettings.sendBehavior, client, onAttentionPromptSend, serverId, supportsForgeSearch, t]);
+  }, [
+    appSettings.sendBehavior,
+    client,
+    cwd,
+    onAttentionPromptSend,
+    serverId,
+    supportsForgeSearch,
+    supportsSnapshot,
+    t,
+  ]);
 
   useEffect(() => {
     onSubmitMessageRef.current = onSubmitMessage;
@@ -1871,6 +1915,7 @@ function ComposerContentImpl({
         commands: pluginClientSlashCommands,
       });
       if (pluginSlashCommand && runPluginClientSlashCommand(pluginSlashCommand)) return;
+      if (rejectQuotedClaudeCommand(payload.text, outgoingAttachments)) return;
 
       if (blurOnSubmit) {
         messageInputRef.current?.blur();
@@ -1880,6 +1925,7 @@ function ComposerContentImpl({
     [
       attachments,
       blurOnSubmit,
+      rejectQuotedClaudeCommand,
       buildOutgoingAttachments,
       runClientSlashCommand,
       pluginClientSlashCommands,
@@ -2124,6 +2170,7 @@ function ComposerContentImpl({
         commands: pluginClientSlashCommands,
       });
       if (pluginSlashCommand && runPluginClientSlashCommand(pluginSlashCommand)) return;
+      if (rejectQuotedClaudeCommand(payload.text, outgoingAttachments)) return;
       queueMessage(payload.text, outgoingAttachments);
     },
     [
@@ -2131,6 +2178,7 @@ function ComposerContentImpl({
       buildOutgoingAttachments,
       pluginClientSlashCommands,
       queueMessage,
+      rejectQuotedClaudeCommand,
       runClientSlashCommand,
       runPluginClientSlashCommand,
     ],

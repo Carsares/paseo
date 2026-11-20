@@ -1,4 +1,4 @@
-import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { DaemonConnectionError, type DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useSessionStore, type Agent } from "@/stores/session-store";
 import { deriveWorkspaceHierarchyTabState } from "./main-control-tree/select-tree";
@@ -561,6 +561,37 @@ describe("requestMoveSubagentToWorkspace", () => {
     await requestMoveSubagentToWorkspace(input, deps);
     expect(deps.moveAgentToWorkspace).toHaveBeenCalledTimes(2);
     expect(deps.openMovedWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers a lost receipt from the retry action using the original key", async () => {
+    const confirmation = Promise.withResolvers<boolean>();
+    const offeredRetry = Promise.withResolvers<void>();
+    const confirmRetry = vi.fn<NonNullable<MoveSubagentToWorkspaceDeps["confirmRetry"]>>(() => {
+      offeredRetry.resolve();
+      return confirmation.promise;
+    });
+    const deps = { ...createDeps(), confirmRetry };
+    const disconnected = new DaemonConnectionError("Connection lost");
+    deps.moveAgentToWorkspace.mockRejectedValueOnce(disconnected);
+
+    const moving = requestMoveSubagentToWorkspace(input, deps);
+    await offeredRetry.promise;
+    expect(confirmRetry).toHaveBeenCalledExactlyOnceWith(disconnected);
+    await requestMoveSubagentToWorkspace(input, deps);
+    expect(deps.moveAgentToWorkspace).toHaveBeenCalledTimes(1);
+    confirmation.resolve(true);
+    await moving;
+
+    expect(deps.createIdempotencyKey).toHaveBeenCalledTimes(1);
+    expect(deps.moveAgentToWorkspace.mock.calls.map(([call]) => call.idempotencyKey)).toEqual([
+      "move-key",
+      "move-key",
+    ]);
+    expect(deps.openMovedWorkspace).toHaveBeenCalledExactlyOnceWith({
+      serverId: input.serverId,
+      agentId: input.subagentId,
+      workspaceId: "new-workspace",
+    });
   });
 
   it("keeps the move pending and reports failures while opening the workspace", async () => {

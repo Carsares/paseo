@@ -16,6 +16,12 @@ vi.mock("@react-native-async-storage/async-storage", () => {
 });
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import {
+  buildDraftWorkspaceAttachmentScopeKey,
+  createWorkspaceAttachmentsStore,
+  useWorkspaceAttachmentsStore,
+} from "@/attachments/workspace-attachments-store";
+import type { ChatHistoryContextAttachment } from "@/attachments/types";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { useSessionStore, type Agent } from "@/stores/session-store";
 import { setPanelInstanceAttributes } from "@/panels/panel-instance-attributes";
@@ -144,6 +150,60 @@ it("observes open chats across unmounted workspaces until their tabs close", () 
     intent: "reveal",
   });
   expect(received).toEqual([[], ["agent-a"], ["agent-a", "agent-b"], ["agent-b"]]);
+});
+
+it("removes persisted chat history only when the final tab for its draft closes", async () => {
+  const layout = createWorkspaceLayoutStore(workspaceLayoutIds, {
+    getItem: () => null,
+    setItem: () => {},
+    removeItem: () => {},
+  });
+  const firstWorkspace = "server-1:workspace-a";
+  const secondWorkspace = "server-1:workspace-b";
+  const target = { kind: "draft", draftId: "shared-handoff" } as const;
+  const other = { kind: "draft", draftId: "other-handoff" } as const;
+  const first = layout.getState().openTab({ workspaceKey: firstWorkspace, intent: "new", target });
+  const second = layout
+    .getState()
+    .openTab({ workspaceKey: secondWorkspace, intent: "new", target });
+  const otherTab = layout.getState().openTab({
+    workspaceKey: firstWorkspace,
+    intent: "new",
+    target: other,
+  });
+  if (!first || !second || !otherTab) throw new Error("Expected all draft tabs");
+  const history: ChatHistoryContextAttachment = {
+    kind: "chat_history",
+    id: "history",
+    source: { serverId: "server-1", agentId: "agent-1" },
+    attachment: { type: "text", mimeType: "text/plain", contextKind: "chat_history", text: "Chat" },
+  };
+  const scopeKey = buildDraftWorkspaceAttachmentScopeKey(target.draftId);
+  const otherScopeKey = buildDraftWorkspaceAttachmentScopeKey(other.draftId);
+  const attachmentsStore = useWorkspaceAttachmentsStore.getState();
+  attachmentsStore.setWorkspaceAttachments({ scopeKey, attachments: [history] });
+  attachmentsStore.setWorkspaceAttachments({ scopeKey: otherScopeKey, attachments: [history] });
+
+  try {
+    layout.getState().closeTab(firstWorkspace, first);
+    expect(useWorkspaceAttachmentsStore.getState().attachmentsByScope[scopeKey]).toEqual([history]);
+    layout.getState().closeTab(secondWorkspace, second);
+    expect(useWorkspaceAttachmentsStore.getState().attachmentsByScope[scopeKey]).toBeUndefined();
+    await vi.waitFor(async () => {
+      const restored = createWorkspaceAttachmentsStore();
+      await vi.waitFor(() => expect(restored.getState().draftHistoryHydrated).toBe(true));
+      expect(restored.getState().attachmentsByScope[scopeKey]).toBeUndefined();
+      expect(restored.getState().attachmentsByScope[otherScopeKey]).toEqual([history]);
+    });
+    expect(
+      layout
+        .getState()
+        .getWorkspaceTabs(firstWorkspace)
+        .some((tab) => tab.tabId === otherTab),
+    ).toBe(true);
+  } finally {
+    attachmentsStore.clearDraftChatHistory({ draftId: other.draftId });
+  }
 });
 
 it("feeds restored layout to timeline sync as a release signal, not a subscription source", async () => {

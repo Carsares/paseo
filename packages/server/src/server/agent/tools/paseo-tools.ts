@@ -736,6 +736,11 @@ function createToolCatalog(
   const hostResolver = createHostResolver({
     serverId: options.serverId ?? "self",
     callerAgentId,
+    trackRemoteChild:
+      callerAgentId && options.finishSubscriptions
+        ? (childAgentId, serverId) =>
+            finishSubscriptions().trackRemoteChild({ childAgentId, callerAgentId, serverId })
+        : undefined,
     caller: () => resolveCallerAgent(),
     lockedCwd: callerContext?.lockedCwd,
     hosts: () => {
@@ -1706,6 +1711,7 @@ function createToolCatalog(
         {
           requestId: "mcp:archive_workspace",
           scope: { kind: "workspace", workspaceId: workspace.workspaceId },
+          caller: callerAgentId ? await readHierarchyAgent(callerAgentId) : null,
         },
       );
       return {

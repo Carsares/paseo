@@ -1,11 +1,55 @@
 import { existsSync, readFileSync } from "node:fs";
+import { access, readFile, realpath } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { isRealpathInsideRoot } from "../../../utils/path.js";
 import { PASEO_CLI_PACKAGE, type NpmGlobalPaseoInstall } from "./npm-global-cli.js";
 
-const PackageJsonSchema = z.object({ name: z.string().optional() }).passthrough();
+const PackageNameSchema = z.object({ name: z.string().optional() });
+const ServerPackageJsonSchema = PackageNameSchema.extend({
+  version: z.string().optional(),
+  paseoAgentResumeOnRestart: z.boolean().optional(),
+});
+
+export async function installedServerSupportsAgentResume(
+  install: NpmGlobalPaseoInstall,
+  currentServerRoot: string | null,
+): Promise<boolean> {
+  if (install.isLinked || !currentServerRoot) return false;
+  try {
+    // Resolve from the installed CLI, the same package resolution used to launch its daemon.
+    const daemonLauncher = path.join(
+      install.packagePath,
+      "dist",
+      "commands",
+      "daemon",
+      "local-daemon.js",
+    );
+    await access(daemonLauncher);
+    const require = createRequire(daemonLauncher);
+    const root = resolvePackageRootFrom(require.resolve("@getpaseo/server"), "@getpaseo/server");
+    if (!root || !isCurrentServerUnderNpmInstall(root, install)) return false;
+    // The live supervisor restarts its original worker entrypoint. If npm moved
+    // the package, the newly resolved CLI alone cannot attest to that worker.
+    const [resolvedRoot, resolvedCurrentRoot] = await Promise.all([
+      realpath(root),
+      realpath(currentServerRoot),
+    ]);
+    if (resolvedRoot !== resolvedCurrentRoot) return false;
+    const worker = path.join(root, "dist", "server", "server", "daemon-worker.js");
+    if (!isRealpathInsideRoot(resolvedRoot, await realpath(worker))) return false;
+    const packageJson = ServerPackageJsonSchema.parse(
+      JSON.parse(await readFile(path.join(root, "package.json"), "utf8")),
+    );
+    return (
+      packageJson.version === install.version && packageJson.paseoAgentResumeOnRestart === true
+    );
+  } catch {
+    return false;
+  }
+}
 
 export interface DaemonInstallOriginRuntime {
   resolveCurrentServerPackageRoot(): string | null;
@@ -84,7 +128,7 @@ function resolvePackageRootFrom(startPath: string, packageName: string): string 
     const packageJsonPath = path.join(currentDir, "package.json");
     if (existsSync(packageJsonPath)) {
       try {
-        const packageJson = PackageJsonSchema.parse(
+        const packageJson = PackageNameSchema.parse(
           JSON.parse(readFileSync(packageJsonPath, "utf8")),
         );
         if (packageJson.name === packageName) {

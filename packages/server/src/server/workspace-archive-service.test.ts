@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import pino, { type Logger } from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { WORKSPACE_MAIN_ROLE, WORKSPACE_ROLE_LABEL } from "@getpaseo/protocol/agent-labels";
 
 import type { ForgeService } from "../services/forge-service.js";
 import { createRealpathAwarePathMatcher } from "../utils/path.js";
@@ -194,6 +195,20 @@ function assertArchiveResult(
 }
 
 describe("archiveByScope", () => {
+  test("rejects a Main Control caller before resolving an archive target", async () => {
+    const deps = createArchiveDeps({ paseoHome: tmpdir(), activeWorkspaces: [] });
+    const resolveTargets = vi.spyOn(deps, "listActiveWorkspaces");
+    await expect(
+      archiveByScope(deps, {
+        requestId: "main-control-archive",
+        scope: { kind: "workspace", workspaceId: "workspace" },
+        caller: { labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE } },
+      }),
+    ).rejects.toThrow("Main Control agents are read-only.");
+    expect(resolveTargets).not.toHaveBeenCalled();
+    expect(deps.markWorkspaceArchiving).not.toHaveBeenCalled();
+  });
+
   test.each(["workspace", "worktree"] as const)(
     "%s archive preserves a restored external worktree despite its marker",
     async (kind) => {

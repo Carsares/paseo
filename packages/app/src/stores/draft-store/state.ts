@@ -92,12 +92,17 @@ const ChangeRequestItemSchema = z.strictObject({
   kind: z.literal("change_request"),
   ...ForgeItemFields,
 });
+export const QuoteComposerAttachmentSchema = z.strictObject({
+  kind: z.literal("quote"),
+  id: z.string(),
+  text: z.string(),
+});
 export const UserComposerAttachmentSchema: z.ZodType<UserComposerAttachment> = z.discriminatedUnion(
   "kind",
   [
     z.strictObject({ kind: z.literal("image"), metadata: AttachmentMetadataSchema }),
     z.strictObject({ kind: z.literal("file"), attachment: UploadedFileSchema }),
-    z.strictObject({ kind: z.literal("quote"), id: z.string(), text: z.string() }),
+    QuoteComposerAttachmentSchema,
     z.strictObject({
       kind: z.literal("workspace_file"),
       path: z.string(),

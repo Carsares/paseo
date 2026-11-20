@@ -1,4 +1,8 @@
-import { composePromptTextWithQuotes } from "@/attachments/quote";
+import { composePromptTextWithQuotes, hasSlashCommandWithQuotes } from "@/attachments/quote";
+import { BUILTIN_PROVIDER_IDS } from "@getpaseo/protocol/provider-manifest";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { providersSnapshotQuery } from "@/data/providers-snapshot";
+import { queryClient } from "@/data/query-client";
 import type { SelectedFile } from "@/attachments/selected-file";
 import { FILE_UPLOAD_MAX_BYTES } from "@/attachments/upload-limit";
 import type { ForgeSearchItem } from "@getpaseo/protocol/messages";
@@ -189,6 +193,12 @@ export function cancelComposerAgent(input: CancelComposerAgentInput): Promise<vo
 export interface DispatchComposerAgentMessageInput {
   client: ComposerSendClient;
   agentId: string;
+  provider?: string | null;
+  providerSnapshot?: {
+    client: Pick<DaemonClient, "getProvidersSnapshot">;
+    serverId: string;
+    cwd?: string | null;
+  };
   text: string;
   attachments: ComposerAttachment[];
   attachmentSubmitFormat?: ComposerAttachmentSubmitFormat;
@@ -203,6 +213,18 @@ export interface DispatchComposerAgentMessageInput {
 export async function dispatchComposerAgentMessage(
   input: DispatchComposerAgentMessageInput,
 ): Promise<void> {
+  if (hasSlashCommandWithQuotes(input.text, input.attachments)) {
+    let provider = input.provider;
+    const snapshot = input.providerSnapshot;
+    if (snapshot && provider && !BUILTIN_PROVIDER_IDS.includes(provider)) {
+      const query = providersSnapshotQuery({ ...snapshot, client: () => snapshot.client });
+      const data = await queryClient.ensureQueryData(query);
+      provider = data.entries.find((entry) => entry.provider === provider)?.derivedFromProviderId;
+    }
+    if (provider === "claude") {
+      throw new Error(i18n.t("composer.errors.removeQuotesForClaudeCommand"));
+    }
+  }
   const submittedText = composePromptTextWithQuotes(input.text, input.attachments);
   const wirePayload = splitComposerAttachmentsForSubmit(input.attachments, {
     format: input.attachmentSubmitFormat,

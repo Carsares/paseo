@@ -11,6 +11,7 @@ import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { isNative } from "@/constants/platform";
 import { useDisclosureHold } from "@/agent-stream/disclosure";
 import { useUserMessageExpanded } from "./expansion-context";
+import { ExpandedQuoteCountContext } from "./quote-expansion-context";
 
 const PREVIEW_HEIGHT = 240;
 // Show more and show less sit under the text they open and close.
@@ -26,6 +27,11 @@ const previewStyle: ViewStyle = {
 export function MessagePreview({ itemId, children }: { itemId: string; children: ReactNode }) {
   const { t } = useTranslation();
   const { expanded, toggle: toggleExpanded } = useUserMessageExpanded(itemId);
+  const [expandedQuoteCount, setExpandedQuoteCount] = useState(0);
+  const adjustExpandedQuoteCount = useCallback((delta: number) => {
+    setExpandedQuoteCount((count) => count + delta);
+  }, []);
+  const hasExpandedQuote = expandedQuoteCount > 0;
   const bodyRef = useRef<View>(null);
   const [overflowing, setOverflowing] = useState(false);
   // A hidden panel lays out at zero height, which says nothing about the message.
@@ -49,15 +55,17 @@ export function MessagePreview({ itemId, children }: { itemId: string; children:
   const accessibilityState = useMemo(() => ({ expanded }), [expanded]);
   return (
     <>
-      <View style={!expanded && previewStyle}>
+      <View style={!expanded && !hasExpandedQuote && previewStyle}>
         <View ref={bodyRef} style={styles.body} onLayout={measure}>
-          {children}
+          <ExpandedQuoteCountContext.Provider value={adjustExpandedQuoteCount}>
+            {children}
+          </ExpandedQuoteCountContext.Provider>
         </View>
-        {overflowing && !expanded ? (
+        {overflowing && !expanded && !hasExpandedQuote ? (
           <EdgeFade edge="bottom" solidFraction={0} backdrop="surface3" style={styles.fade} />
         ) : null}
       </View>
-      {overflowing ? (
+      {overflowing && !hasExpandedQuote ? (
         <Button
           variant="ghost"
           size="sm"

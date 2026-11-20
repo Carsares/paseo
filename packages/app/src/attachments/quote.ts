@@ -36,6 +36,17 @@ export function formatQuoteAsMarkdownBlockquote(quoteText: string): string {
     .join("\n");
 }
 
+export function hasSlashCommandWithQuotes(
+  text: string,
+  attachments: readonly ComposerAttachment[],
+): boolean {
+  // Match Claude's command token. Paths such as /usr/bin are ordinary prompts.
+  return (
+    /^\/[^/\s]+(?:\s|$)/.test(text.trim()) &&
+    attachments.some((attachment) => attachment.kind === "quote" && attachment.text.trim())
+  );
+}
+
 export function composePromptTextWithQuotes(
   text: string,
   attachments: readonly ComposerAttachment[],

@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -60,7 +61,7 @@ export function ChatFind({
   viewportRef,
   revealLoadedMessage,
   visibleMessageIds,
-  projectionKey,
+  showAgentInteractions,
   children,
 }: ChatFindProps) {
   const { t } = useTranslation();
@@ -68,6 +69,7 @@ export function ChatFind({
   const root = useRef<HTMLDivElement>(null);
   const bindings = useRef({ viewportRef, revealLoadedMessage, visibleMessageIds });
   bindings.current = { viewportRef, revealLoadedMessage, visibleMessageIds };
+  const showInteractions = useRef(showAgentInteractions);
   const [highlightName] = useState(() => `paseo-chat-find-${++nextHighlightId}`);
   const { isInteractive } = usePaneFocus();
   const active = useRetainedPanelActive();
@@ -77,7 +79,12 @@ export function ChatFind({
         search(query, cursor) {
           const client = getHostRuntimeStore().getClient(serverId);
           if (!client) return Promise.reject(new Error("Host disconnected"));
-          return client.searchAgentTimeline({ agentId, query, cursor });
+          return client.searchAgentTimeline({
+            agentId,
+            query,
+            cursor,
+            hideAgentInteractions: !showInteractions.current,
+          });
         },
         load(targetEpoch, seq) {
           return getHostRuntimeStore().fetchAgentTimeline(
@@ -98,10 +105,10 @@ export function ChatFind({
   useEffect(() => {
     model.updateHistory(epoch, items);
   }, [model, epoch, items]);
-  useEffect(() => {
-    model.close();
-  }, [model, projectionKey]);
-  useEffect(() => () => model.close(), [model]);
+  useLayoutEffect(() => {
+    showInteractions.current = showAgentInteractions;
+    return () => model.close();
+  }, [model, showAgentInteractions]);
   useEffect(() => {
     if (!active) model.close();
   }, [active, model]);

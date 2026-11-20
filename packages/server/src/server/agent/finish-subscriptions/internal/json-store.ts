@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
+import { AgentFinishReportSchema } from "@getpaseo/protocol/messages";
 import { writeJsonFileAtomic } from "../../../atomic-file.js";
 import type { FinishSubscription, FinishSubscriptionStore } from "../index.js";
 
@@ -12,11 +13,17 @@ const recordsSchema = z.array(
     childAgentId: z.string().min(1),
     serverId: z.string().min(1).optional(),
     requireParentOwnership: z.boolean().optional(),
+    followupReport: z.boolean().optional(),
+    pullSourceId: z.string().optional(),
+    report: AgentFinishReportSchema.optional(),
   }),
 );
 
-export function createJsonFinishSubscriptionStore(paseoHome: string): FinishSubscriptionStore {
-  const file = join(paseoHome, "finish-subscriptions.json");
+export function createJsonFinishSubscriptionStore(
+  paseoHome: string,
+  filename = "finish-subscriptions.json",
+): FinishSubscriptionStore {
+  const file = join(paseoHome, filename);
   let records: FinishSubscription[] | undefined;
   let pending = Promise.resolve();
   async function load(): Promise<FinishSubscription[]> {

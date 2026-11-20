@@ -201,6 +201,8 @@ export const fr: TranslationResources = {
     },
     errors: {
       failedToSend: "Impossible d’envoyer le message",
+      removeQuotesForClaudeCommand:
+        "Retirez les citations pour exécuter cette commande oblique de Claude.",
       failedToCreateAgent: "Impossible de créer l’agent",
       noHostSelected: "Aucun hôte sélectionné",
       initialPromptRequired: "Un prompt initial est requis",

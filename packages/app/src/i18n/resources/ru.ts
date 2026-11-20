@@ -200,6 +200,7 @@ export const ru: TranslationResources = {
     },
     errors: {
       failedToSend: "Не удалось отправить сообщение",
+      removeQuotesForClaudeCommand: "Удалите цитаты, чтобы выполнить эту команду Claude со слешем.",
       failedToCreateAgent: "Не удалось создать агента.",
       noHostSelected: "Хост не выбран",
       initialPromptRequired: "Необходим инициализирующий промпт",

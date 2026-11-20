@@ -2125,7 +2125,11 @@ function WorkspaceScreenContent({
         }
 
         // Errors (e.g. timeout) are handled by the mutation's onSettled callback
-        void archiveAgent({ serverId: normalizedServerId, agentId }).catch(() => {});
+        void archiveAgent({
+          serverId: normalizedServerId,
+          agentId,
+          expectedWorkspaceId: normalizedWorkspaceId,
+        }).catch(() => {});
       });
     },
     [
@@ -2503,6 +2507,7 @@ function WorkspaceScreenContent({
       await closeBulkWorkspaceTabs({
         client,
         groups,
+        workspaceId: normalizedWorkspaceId,
         closeTab,
         closeLayoutOnlyAgent: async (agentId) => {
           if (!client) {
@@ -2515,7 +2520,11 @@ function WorkspaceScreenContent({
             workspaceId: normalizedWorkspaceId,
           });
           if (shouldArchive) {
-            await archiveAgent({ serverId: normalizedServerId, agentId });
+            await archiveAgent({
+              serverId: normalizedServerId,
+              agentId,
+              expectedWorkspaceId: normalizedWorkspaceId,
+            });
           }
         },
         closeWorkspaceTabWithCleanup: (cleanupInput) => {

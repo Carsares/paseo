@@ -30,7 +30,7 @@ import {
   shell,
   webContents,
 } from "electron";
-import { registerDaemonManager } from "./daemon/daemon-manager.js";
+import { isManualUpdateHandoffInProgress, registerDaemonManager } from "./daemon/daemon-manager.js";
 import { parsePassthroughCliArgsFromArgv, runPassthroughCli } from "./daemon/cli/passthrough.js";
 import { closeAllTransportSessions } from "./daemon/local-transport.js";
 import {
@@ -105,7 +105,12 @@ import {
 import { runDesktopStartup } from "./desktop-startup.js";
 import { registerBrowserAutomationIpc } from "./features/browser-automation/ipc.js";
 import { BrowserKeyboard } from "./features/browser-keyboard/index.js";
-import { hasDownloadedAppUpdate, installAppUpdateOnQuit } from "./features/auto-updater.js";
+import {
+  confirmOfficialUpdateWithoutAgentResume,
+  hasDownloadedAppUpdate,
+  installAppUpdateOnQuit,
+  isMacUpdateQuitInProgress,
+} from "./features/auto-updater.js";
 import {
   buildAgentDeepLinkRoute,
   parseAgentDeepLink,
@@ -970,13 +975,16 @@ async function bootstrap(): Promise<void> {
     },
   });
   ensureNotificationCenterRegistration();
-  registerDaemonManager((settings) => {
-    for (const win of BrowserWindow.getAllWindows()) {
-      if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
-        win.webContents.send("paseo:event:desktop-settings-changed", settings);
+  registerDaemonManager(
+    (settings) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+          win.webContents.send("paseo:event:desktop-settings-changed", settings);
+        }
       }
-    }
-  });
+    },
+    () => quitLifecycle.isQuitting(),
+  );
   registerWindowManager({ mode: DESKTOP_WINDOW_CHROME_MODE });
   registerDialogHandlers();
   registerNotificationHandlers();
@@ -1043,13 +1051,14 @@ function showDaemonShutdownDialog(): void {
 
 const quitLifecycle = createQuitLifecycle({
   app,
+  isManualUpdateHandoffInProgress,
   closeTransportSessions: closeAllTransportSessions,
   stopDesktopManagedDaemonIfNeeded: (options) =>
     stopDesktopManagedDaemonOnQuitIfNeeded({
       settingsStore: getDesktopSettingsStore(),
       isDesktopManagedDaemonRunning: isDesktopManagedDaemonRunningSync,
       isDesktopManagedDaemonPresent: isDesktopManagedDaemonPresentSync,
-      hasPendingUpdateOnQuit: hasDownloadedAppUpdate,
+      appUpdate: options?.appUpdate,
       preserveWork: options?.preserveWork,
       stopDaemon: async (reason = "quit") => {
         await stopDesktopDaemonViaCli(reason);
@@ -1060,12 +1069,22 @@ const quitLifecycle = createQuitLifecycle({
         if (!options?.preserveWork) showDaemonShutdownDialog();
       },
     }),
-  installAppUpdateOnQuit: async (signal) => {
+  confirmAppUpdate: async (target, signal) => {
+    const settings = await getDesktopSettingsStore().get();
+    if (settings.daemon.keepRunningAfterQuit || !isDesktopManagedDaemonPresentSync()) return true;
+    return (
+      (await confirmOfficialUpdateWithoutAgentResume(target, "Quit Without Updating", signal)) &&
+      (await getDesktopSettingsStore().get()).officialUpdatesEnabled
+    );
+  },
+  installAppUpdateOnQuit: async (signal, onBeforeQuit) => {
+    if (!hasDownloadedAppUpdate()) return false;
     const settings = await getDesktopSettingsStore().get();
     return installAppUpdateOnQuit({
       currentVersion: app.getVersion(),
       releaseChannel: settings.releaseChannel,
       signal,
+      onBeforeQuit,
     });
   },
   createUpdateDeadlineSignal: () => AbortSignal.timeout(UPDATE_QUIT_DEADLINE_MS),
@@ -1088,7 +1107,10 @@ electronAutoUpdater.on("before-quit-for-update", () => {
   log.info("[auto-updater] before-quit-for-update", { currentVersion: app.getVersion() });
   quitLifecycle.handleBeforeQuitForUpdate();
 });
-app.on("before-quit", quitLifecycle.handleBeforeQuit);
+app.on("before-quit", (event) => {
+  if (isMacUpdateQuitInProgress()) quitLifecycle.handleBeforeQuitForUpdate();
+  quitLifecycle.handleBeforeQuit(event);
+});
 registerExternalQuitSignals({ signals: process, quit: () => app.quit() });
 
 app.on("window-all-closed", () => {

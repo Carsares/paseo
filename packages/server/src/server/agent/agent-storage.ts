@@ -295,13 +295,31 @@ export class AgentStorage {
     await this.queueRecordWrite(record);
   }
 
+  async setRunningAgentRecovery(agentId: string, resumeOnStartup: boolean): Promise<boolean> {
+    await this.load();
+    let captured = false;
+    await this.queueRecordMutation(agentId, (record) => {
+      if (
+        record?.lastStatus !== "running" ||
+        record.archivedAt ||
+        record.internal ||
+        record.owner
+      ) {
+        return null;
+      }
+      captured = true;
+      return { ...record, resumeOnStartup };
+    });
+    return captured;
+  }
+
   private queueRecordWrite(record: StoredAgentRecord): Promise<void> {
     return this.queueRecordMutation(record.id, () => record);
   }
 
   private queueRecordMutation(
     agentId: string,
-    mutate: (existing: StoredAgentRecord | null) => StoredAgentRecord,
+    mutate: (existing: StoredAgentRecord | null) => StoredAgentRecord | null,
   ): Promise<void> {
     const prev = this.pendingWrites.get(agentId) ?? Promise.resolve();
     const next = prev.then(async () => {
@@ -310,7 +328,7 @@ export class AgentStorage {
       }
 
       const record = mutate(this.cache.get(agentId) ?? null);
-      await this.writeRecord(record);
+      if (record) await this.writeRecord(record);
       return undefined;
     });
 

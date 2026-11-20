@@ -1,5 +1,5 @@
 import { SessionDelivery } from "../owned-subscriptions/index.js";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "../../messages.js";
 import {
@@ -23,6 +23,7 @@ interface ControllerHarness {
 
 function createController(input: {
   updater: TestUpdater;
+  prepareLifecycleIntent?: DaemonSelfUpdateSessionControllerOptions["prepareLifecycleIntent"];
   daemonVersion?: string | null;
   desktopManaged?: boolean;
 }): ControllerHarness {
@@ -35,6 +36,7 @@ function createController(input: {
     emit: (msg) => {
       emitted.push(msg);
     },
+    prepareLifecycleIntent: input.prepareLifecycleIntent ?? (async () => {}),
     emitLifecycleIntent: (intent) => {
       restartIntents.push(intent);
     },
@@ -77,7 +79,7 @@ describe("DaemonSelfUpdateSessionController", () => {
         updateInput = input;
         input.onProgress("starting");
         input.onProgress("installing");
-        return { success: true, error: null, newVersion: "0.1.96" };
+        return { success: true, error: null, newVersion: "0.1.96", agentResumeSupported: true };
       },
     };
     const { controller, emitted, restartIntents } = createController({ updater });
@@ -109,6 +111,7 @@ describe("DaemonSelfUpdateSessionController", () => {
           error: null,
           previousVersion: "0.1.15",
           newVersion: "0.1.96",
+          agentResume: "requested",
         },
       },
     ]);
@@ -153,6 +156,64 @@ describe("DaemonSelfUpdateSessionController", () => {
       },
     ]);
     expect(restartIntents).toEqual([]);
+  });
+
+  test("restarts without requesting agent resume when the installed target has no attestation", async () => {
+    const prepareLifecycleIntent = vi.fn(async () => {});
+    const { controller, emitted, restartIntents } = createController({
+      prepareLifecycleIntent,
+      updater: {
+        async update() {
+          return { success: true, error: null, newVersion: "0.1.96" };
+        },
+      },
+    });
+
+    await controller.dispatch(updateRequest);
+
+    expect(emitted).toMatchObject([
+      { type: "daemon.update.response", payload: { success: true, agentResume: "unverified" } },
+    ]);
+    expect(restartIntents).toHaveLength(1);
+    expect(restartIntents[0]).not.toHaveProperty("resumeAgents");
+    expect(prepareLifecycleIntent).toHaveBeenCalledExactlyOnceWith(restartIntents[0]);
+  });
+
+  test("waits for agent recovery data before acknowledging and does not restart if saving fails", async () => {
+    let rejectPreparation!: (reason: Error) => void;
+    const preparation = new Promise<void>((_resolve, reject) => {
+      rejectPreparation = reject;
+    });
+    const prepared: RestartIntent[] = [];
+    const { controller, emitted, restartIntents } = createController({
+      updater: {
+        async update() {
+          return { success: true, error: null, newVersion: "0.1.96", agentResumeSupported: true };
+        },
+      },
+      prepareLifecycleIntent(intent) {
+        prepared.push(intent);
+        return preparation;
+      },
+    });
+
+    const update = controller.dispatch(updateRequest);
+    await expect.poll(() => prepared).toMatchObject([{ resumeAgents: true }]);
+    expect(emitted).toEqual([]);
+    rejectPreparation(new Error("Recovery data could not be saved"));
+    await update;
+
+    expect(restartIntents).toEqual([]);
+    expect(emitted).toMatchObject([
+      {
+        type: "daemon.update.response",
+        payload: {
+          success: false,
+          newVersion: "0.1.96",
+          error: "Installed daemon 0.1.96 but could not restart: Recovery data could not be saved",
+        },
+      },
+    ]);
   });
 
   test("maps concurrent updates to rpc_error", async () => {
@@ -200,6 +261,7 @@ test("self-update progress is request-owned through the final delivery boundary"
     emit: (message) => {
       delivery.reply(message);
     },
+    prepareLifecycleIntent: async () => {},
     emitLifecycleIntent: () => {
       throw new Error("No restart is allowed in this test");
     },

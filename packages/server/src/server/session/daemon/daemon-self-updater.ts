@@ -1,6 +1,7 @@
 import { getErrorMessage } from "@getpaseo/protocol/error-utils";
 import {
   daemonInstallOriginRuntime,
+  installedServerSupportsAgentResume,
   resolveNpmGlobalPrefix,
   validateDaemonInstallOrigin,
   type DaemonInstallOriginRuntime,
@@ -13,6 +14,7 @@ export interface DaemonSelfUpdateResult {
   success: boolean;
   error: string | null;
   newVersion: string | null;
+  agentResumeSupported?: true;
 }
 
 export interface DaemonSelfUpdateInput {
@@ -64,10 +66,9 @@ export class DaemonSelfUpdater {
     this.inProgress = true;
     try {
       input.onProgress("starting");
+      const currentServerRoot = this.runtime.installOrigin.resolveCurrentServerPackageRoot();
       const npmOptions = {
-        prefix: resolveNpmGlobalPrefix(
-          this.runtime.installOrigin.resolveCurrentServerPackageRoot(),
-        ),
+        prefix: resolveNpmGlobalPrefix(currentServerRoot),
       };
       const install = await this.runtime.npm.inspect(npmOptions);
       const unsupportedReason = validateDaemonInstallOrigin(
@@ -99,7 +100,15 @@ export class DaemonSelfUpdater {
       });
 
       input.onProgress("complete");
-      return { success: true, error: null, newVersion: updatedInstall?.version ?? null };
+      return {
+        success: true,
+        error: null,
+        newVersion: updatedInstall?.version ?? null,
+        ...(updatedInstall &&
+        (await installedServerSupportsAgentResume(updatedInstall, currentServerRoot))
+          ? { agentResumeSupported: true }
+          : {}),
+      };
     } catch (error) {
       input.logger.error({ err: error }, "Daemon self-update failed with exception");
       return { success: false, error: getErrorMessage(error), newVersion: null };

@@ -199,6 +199,7 @@ export const ar: TranslationResources = {
     },
     errors: {
       failedToSend: "فشل في إرسال الرسالة",
+      removeQuotesForClaudeCommand: "أزل الاقتباسات لتشغيل أمر Claude الذي يبدأ بشرطة مائلة.",
       failedToCreateAgent: "فشل في إنشاء الوكيل",
       noHostSelected: "لم يتم تحديد مضيف",
       initialPromptRequired: "مطلوب موجه الأولي",

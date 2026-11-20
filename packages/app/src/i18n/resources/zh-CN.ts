@@ -199,6 +199,7 @@ export const zhCN: TranslationResources = {
     },
     errors: {
       failedToSend: "发送消息失败",
+      removeQuotesForClaudeCommand: "请移除引用后再运行这条 Claude 斜杠命令。",
       failedToCreateAgent: "创建 Agent 失败",
       noHostSelected: "未选择 Host",
       initialPromptRequired: "初始 prompt 必填",

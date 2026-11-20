@@ -20,6 +20,7 @@ export interface AgentScreenAgent {
     thinkingOptionId?: string | null;
   } | null;
   options?: Agent["options"];
+  subagentDraftOptions?: Agent["subagentDraftOptions"];
   controls?: Agent["controls"];
   lastError?: string | null;
   projectPlacement?: {

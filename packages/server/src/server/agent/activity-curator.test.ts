@@ -2,8 +2,13 @@ import { describe, expect, it } from "vitest";
 import { buildAgentForkContextAttachment, curateAgentActivity } from "./activity-curator.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
-import { formatAgentMessage, projectAgentMessages } from "./agent-messages/index.js";
+import {
+  formatAgentMessage,
+  prepareAgentMessage,
+  projectAgentMessages,
+} from "./agent-messages/index.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
+import { buildAgentPrompt } from "./prompt-attachments.js";
 
 function toolCallItem(params: {
   callId: string;
@@ -601,6 +606,18 @@ it("preserves every message in fork history below the character budget", () => {
   );
 });
 
+function replayForkMessage(
+  text: string,
+  attachments: ReturnType<typeof buildAgentForkContextAttachment>["attachment"][],
+) {
+  const { prompt } = prepareAgentMessage(buildAgentPrompt(text, undefined, attachments));
+  const replayedText =
+    typeof prompt === "string"
+      ? prompt
+      : prompt.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n\n");
+  return projectAgentMessages({ type: "user_message", text: replayedText });
+}
+
 it("records the source host and escapes closing tags in the fork attachment", () => {
   const result = buildAgentForkContextAttachment({
     rows: [
@@ -622,9 +639,7 @@ it("records the source host and escapes closing tags in the fork attachment", ()
   expect(result.attachment.text).toContain("Source server ID: host-src-1");
   expect(result.attachment.text).toContain("Source boundary message ID: assistant-1");
   expect(result.attachment.text).toContain("<\\/chat-history-summary>");
-  expect(
-    projectAgentMessages({ type: "user_message", text: `${result.attachment.text}\nContinue` }),
-  ).toEqual([
+  expect(replayForkMessage("Continue", [result.attachment])).toEqual([
     { type: "user_message", text: "Continue", forkContext: result.attachment.forkContext },
   ]);
 });
@@ -636,12 +651,9 @@ it("replays provenance from the first summary without borrowing fields from the 
     sourceAgentId: "second",
     sourceServerId: "other-host",
   });
-  expect(
-    projectAgentMessages({
-      type: "user_message",
-      text: `${first.attachment.text}\n${second.attachment.text}\nContinue`,
-    }),
-  ).toEqual([{ type: "user_message", text: "Continue", forkContext: { sourceAgentId: "first" } }]);
+  expect(replayForkMessage("Continue", [first.attachment, second.attachment])).toEqual([
+    { type: "user_message", text: "Continue", forkContext: { sourceAgentId: "first" } },
+  ]);
 });
 
 it("omits fork provenance when neither source agent nor boundary message is known", () => {

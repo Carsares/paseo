@@ -19,6 +19,10 @@ export interface LifecycleAgentManager {
   cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
   clearAgentAttention(agentId: string): Promise<void>;
   archiveAgent(agentId: string): Promise<{ archivedAt: string }>;
+  archiveAgentInWorkspace(
+    agentId: string,
+    expectedWorkspaceId: string,
+  ): Promise<{ archivedAt: string; record: StoredAgentRecord | null }>;
   archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord>;
   closeAgent(agentId: string): Promise<void>;
   setLabels(agentId: string, labels: Record<string, string>): Promise<void>;
@@ -126,7 +130,14 @@ export interface ArchiveAgentResult {
 export async function archiveAgentCommand(
   dependencies: AgentLifecycleCommandDependencies,
   agentId: string,
+  expectedWorkspaceId?: string,
 ): Promise<ArchiveAgentResult> {
+  if (expectedWorkspaceId !== undefined) {
+    return {
+      agentId,
+      ...(await dependencies.agentManager.archiveAgentInWorkspace(agentId, expectedWorkspaceId)),
+    };
+  }
   const liveAgent = dependencies.agentManager.getAgent(agentId);
   let record: StoredAgentRecord | null;
   if (liveAgent) {
@@ -217,9 +228,7 @@ export async function detachAgentCommand(
   };
 }
 
-export interface MoveAgentToWorkspaceResult extends MoveSubagentToWorkspaceResult {
-  agentId: string;
-}
+export type MoveAgentToWorkspaceResult = MoveSubagentToWorkspaceResult & { agentId: string };
 
 export async function moveAgentToWorkspaceCommand(
   dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager">,

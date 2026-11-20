@@ -13,8 +13,7 @@ export interface ChatFindProps {
   viewportRef: RefObject<StreamViewportHandle | null>;
   revealLoadedMessage(messageId: string): boolean;
   visibleMessageIds: MountedMessageIds;
-  /** Changes when the source projection changes; resets find state without remounting the chat. */
-  projectionKey?: string;
+  showAgentInteractions: boolean;
   children: ReactNode;
 }
 export interface ChatFindExpansionProps {

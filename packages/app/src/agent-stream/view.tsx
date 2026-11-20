@@ -1301,9 +1301,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         serverId={resolvedServerId}
         epoch={timelineEpoch}
         items={findItems}
-        projectionKey={
-          showAgentInteractions ? "agent-interactions-shown" : "agent-interactions-hidden"
-        }
+        showAgentInteractions={showAgentInteractions}
         viewportRef={viewportRef}
         revealLoadedMessage={revealLoadedMessage}
         visibleMessageIds={mountedMessageIds}
@@ -1412,6 +1410,9 @@ function collectAgentSetupDiffs(left: AgentScreenAgent, right: AgentScreenAgent)
     reasons.push("agent.runtimeInfo.thinkingOptionId");
   }
   if (left.options !== right.options) reasons.push("agent.options");
+  if (left.subagentDraftOptions !== right.subagentDraftOptions) {
+    reasons.push("agent.subagentDraftOptions");
+  }
   if (left.controls !== right.controls) reasons.push("agent.controls");
   return reasons;
 }

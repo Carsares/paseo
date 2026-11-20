@@ -3,7 +3,9 @@ import {
   prepareAgentMessage,
   formatAgentMessage,
   formatSystemNotificationPrompt,
+  createAgentMessageDelivery,
 } from "./agent-messages/index.js";
+import { createLifecyclePreparation } from "./restart-recovery/lifecycle-preparation.js";
 import { expect, test, vi, onTestFinished } from "vitest";
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -2200,6 +2202,102 @@ function fakeCodexEmitting(args: FakeCodexEmitterArgs): AgentClient {
 }
 
 const logger = createTestLogger();
+
+test("lifecycle preparation drains accepted messages, waits for their starts, and reopens on failure", async () => {
+  const startEntered = deferred<void>();
+  const startHeld = deferred<void>();
+  const saving = deferred<void>();
+  const write = deferred<void>();
+  const session = new (class extends SteeringTestSession {
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      startEntered.resolve();
+      await startHeld.promise;
+      this.startPrompts.push(prompt);
+      return { turnId: `active-turn-${++this.startCount}` };
+    }
+  })({ provider: "codex", cwd: process.cwd() });
+  const manager = new AgentManager({
+    clients: {
+      codex: new (class extends TestAgentClient {
+        override async createSession(): Promise<AgentSession> {
+          return session;
+        }
+      })(),
+    },
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const delivery = createAgentMessageDelivery({
+    dispatch: async ({ recipientId, prompt }) =>
+      (await startAgentRun(manager, recipientId, prompt, logger)).disposition,
+    onError: (error) => {
+      throw error;
+    },
+  });
+  const enqueue = () =>
+    delivery.enqueue({
+      recipientId: agent.id,
+      prompt: "queued work",
+      source: { kind: "agent-message", agentId: "sender" },
+    });
+  const capture = vi.fn(async () => {
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("running");
+    saving.resolve();
+    await write.promise;
+  });
+  const lifecycle = createLifecyclePreparation({
+    pauseDelivery: () => delivery.pauseAdmission(),
+    pauseRunAdmission: () => manager.pauseRunAdmission(),
+    waitForAdmittedRunsToStart: () => manager.waitForAdmittedRunsToStart(),
+    capture,
+  });
+  try {
+    const receipt = enqueue();
+    const prepare = lifecycle.prepare(true);
+    void prepare.catch(() => undefined);
+    await expect(lifecycle.prepare(true)).rejects.toThrow("already in progress");
+    await expect(lifecycle.prepare(false)).rejects.toThrow("already in progress");
+    await startEntered.promise;
+    expect(receipt.status).toBe("queued");
+    expect(capture).not.toHaveBeenCalled();
+    expect(enqueue).toThrow("preparing for shutdown");
+    startHeld.resolve();
+    await saving.promise;
+    await expect(receipt.dispatched).resolves.toBe("turn_started");
+    await expect(manager.replaceAgentRun(agent.id, "new work")).rejects.toBeInstanceOf(
+      AgentManagerShuttingDownError,
+    );
+    await expect(manager.steerAgentRun(agent.id, "new steer")).rejects.toBeInstanceOf(
+      AgentManagerShuttingDownError,
+    );
+    await expect(startAgentRun(manager, agent.id, "new prompt", logger)).rejects.toBeInstanceOf(
+      AgentManagerShuttingDownError,
+    );
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await vi.waitFor(() => expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle"));
+
+    write.reject(new Error("disk full"));
+    await expect(prepare).rejects.toThrow("disk full");
+    capture.mockResolvedValueOnce(undefined);
+    const retryReceipt = enqueue();
+    await lifecycle.prepare(false);
+    await expect(retryReceipt.dispatched).resolves.toBe("turn_started");
+    await expect(lifecycle.prepare(false)).rejects.toThrow("already in progress");
+    await lifecycle.beforeStop(false);
+    expect(capture.mock.calls).toEqual([[true], [false]]);
+    expect(enqueue).toThrow("preparing for shutdown");
+    expect(() => manager.streamAgent(agent.id, "after acknowledgement")).toThrow(
+      AgentManagerShuttingDownError,
+    );
+  } finally {
+    startHeld.resolve();
+    write.resolve();
+    await delivery.close();
+    await manager.closeAgent(agent.id);
+  }
+});
 
 test("does not register a session that finishes starting after shutdown begins", async () => {
   const client = new HeldAgentCreationClient();

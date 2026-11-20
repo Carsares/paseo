@@ -103,6 +103,7 @@ export function normalizeWorkspaceDraftTabSetup(
     providerOptions: isPlainRecord(record.providerOptions) ? { ...record.providerOptions } : {},
     ...(parentAgentId ? { parentAgentId } : {}),
     ...(initialDraftText ? { initialDraftText } : {}),
+    restoreChatHistory: record.restoreChatHistory === true,
   };
 }
 
@@ -183,6 +184,7 @@ function workspaceDraftTabSetupsEqual(
     left.thinkingOptionId === right.thinkingOptionId &&
     (left.parentAgentId ?? null) === (right.parentAgentId ?? null) &&
     (left.initialDraftText ?? null) === (right.initialDraftText ?? null) &&
+    (left.restoreChatHistory ?? false) === (right.restoreChatHistory ?? false) &&
     recordsShallowEqual(left.providerOptions, right.providerOptions)
   );
 }

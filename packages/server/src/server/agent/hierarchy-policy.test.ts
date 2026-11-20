@@ -136,12 +136,14 @@ describe("agent orchestration", () => {
     expect(mainPolicy?.disabledTools).toEqual([
       "custom_tool",
       "create_terminal",
+      "archive_workspace",
       "send_terminal_keys",
       "kill_terminal",
       "start_workspace_script",
       "stop_workspace_script",
     ]);
     expect(applyHierarchyPaseoToolPolicy(base, lead.labels, 1)).toBe(base);
+    expect(applyHierarchyPaseoToolPolicy(undefined, root.labels, 0)).toBeUndefined();
     expect(applyHierarchyPaseoToolPolicy({ enabled: false }, worker.labels, 2)).toEqual({
       enabled: false,
       disabledTools: [
@@ -280,6 +282,7 @@ async function withAgents(
     storage: AgentStorage;
     cwd: string;
     launchedConfigs: Map<string, AgentSessionConfig[]>;
+    codex: ReturnType<typeof createTestAgentClient>;
   }) => Promise<void>,
 ): Promise<void> {
   const cwd = await mkdtemp(join(tmpdir(), "paseo-hierarchy-test-"));
@@ -305,13 +308,14 @@ async function withAgents(
     };
     return inner;
   };
+  const codex = wrapClient("codex");
   const manager = new AgentManager({
-    clients: { codex: wrapClient("codex"), claude: wrapClient("claude") },
+    clients: { codex, claude: wrapClient("claude") },
     registry: storage,
     logger,
   });
   try {
-    await run({ manager, storage, cwd, launchedConfigs });
+    await run({ manager, storage, cwd, launchedConfigs, codex });
   } finally {
     manager.prepareForShutdown();
     await Promise.all(manager.listAgents().map((agent) => manager.closeAgent(agent.id)));
@@ -345,6 +349,311 @@ it("switches a live workspace's Main Control and restores the previous agent's m
     expect(manager.getPaseoToolPolicy(first.id)).toBeUndefined();
     expect(manager.getAgent(second.id)?.currentModeId).toBe("read-only");
     expect((await storage.get(second.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+  });
+});
+
+it("keeps pending turns intact when either Main Control role is busy", async () => {
+  await withAgents(async ({ manager, storage, cwd }) => {
+    const options = { workspaceId: "workspace" };
+    const config = { provider: "codex", cwd, modeId: "full-access" };
+    const first = await manager.createAgent(config, undefined, options);
+    const next = await manager.createAgent(config, undefined, options);
+    await manager.setAgentMainControl(first.id, true);
+
+    for (const busy of [next.id, first.id]) {
+      const session = manager.getAgent(busy)?.session;
+      const turn = manager.streamAgent(busy, "Continue the current task");
+      try {
+        await expect(manager.setAgentMainControl(next.id, true)).rejects.toThrow(
+          "Wait for active work to finish",
+        );
+        if (busy === first.id) {
+          await expect(manager.setAgentMainControl(first.id, false)).rejects.toThrow(
+            "Wait for active work to finish",
+          );
+        }
+        expect(manager.getAgent(busy)?.session).toBe(session);
+        expect(manager.hasInFlightRun(busy)).toBe(true);
+        expect((await storage.get(first.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(
+          WORKSPACE_MAIN_ROLE,
+        );
+        expect((await storage.get(next.id))?.labels[WORKSPACE_ROLE_LABEL]).toBeUndefined();
+      } finally {
+        const events = await Array.fromAsync(turn);
+        expect(events.some((event) => event.type === "turn_completed")).toBe(true);
+      }
+    }
+  });
+});
+
+it("starts a new prompt on the replacement session when a Main Control switch is in progress", async () => {
+  await withAgents(async ({ manager, cwd }) => {
+    const agent = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId: "workspace",
+    });
+    const session = manager.getAgent(agent.id)?.session;
+    if (!session) throw new Error("Expected a live session");
+    const closing = Promise.withResolvers<void>();
+    const releaseClose = Promise.withResolvers<void>();
+    const close = session.close.bind(session);
+    vi.spyOn(session, "close").mockImplementationOnce(async () => {
+      closing.resolve();
+      await releaseClose.promise;
+      await close();
+    });
+    const switchRole = manager.setAgentMainControl(agent.id, true);
+    try {
+      await Promise.race([closing.promise, switchRole]);
+      const run = manager.runAgent(agent.id, "Run after the role changes");
+      expect(manager.hasInFlightRun(agent.id)).toBe(false);
+      releaseClose.resolve();
+      await switchRole;
+      await expect(run).resolves.toMatchObject({ canceled: false });
+      expect(manager.getAgent(agent.id)?.session).not.toBe(session);
+      expect(manager.getAgent(agent.id)?.currentModeId).toBe("read-only");
+    } finally {
+      releaseClose.resolve();
+      await switchRole;
+    }
+  });
+});
+
+it("refreshes both sets of direct children before their next turns after switching Main Control", async () => {
+  await withAgents(async ({ manager, cwd, launchedConfigs }) => {
+    const workspaceId = "workspace";
+    const make = (title: string, parentId?: string) =>
+      manager.createAgent({ provider: "codex", cwd, title }, undefined, {
+        workspaceId,
+        labels: parentId ? { [PARENT_AGENT_ID_LABEL]: parentId } : {},
+      });
+    const first = await make("First");
+    const next = await make("Next");
+    const firstChild = await make("First child", first.id);
+    const nextChild = await make("Next child", next.id);
+    const getLaunches = (title: string) =>
+      (launchedConfigs.get("codex") ?? []).filter((config) => config.title === title);
+
+    await manager.setAgentMainControl(first.id, true);
+    expect(getLaunches("First child")).toHaveLength(1);
+    await manager.runAgent(firstChild.id, "Work as a lead");
+    expect(getLaunches("First child").at(-1)?.daemonAppendSystemPrompt).toContain(
+      "Level-1 Module Lead",
+    );
+
+    const existingTurn = manager.streamAgent(firstChild.id, "Finish the current task");
+    try {
+      await manager.setAgentMainControl(next.id, true);
+      expect(getLaunches("First child")).toHaveLength(2);
+      expect(getLaunches("Next child")).toHaveLength(1);
+      expect(manager.hasInFlightRun(firstChild.id)).toBe(true);
+    } finally {
+      const events = await Array.fromAsync(existingTurn);
+      expect(events.some((event) => event.type === "turn_completed")).toBe(true);
+    }
+    await manager.runAgent(firstChild.id, "Work without the lead role");
+    await manager.runAgent(nextChild.id, "Work as a lead");
+    expect(getLaunches("First child")).toHaveLength(3);
+    expect(getLaunches("First child").at(-1)?.daemonAppendSystemPrompt ?? "").not.toContain(
+      "Level-1 Module Lead",
+    );
+    expect(getLaunches("Next child").at(-1)?.daemonAppendSystemPrompt).toContain(
+      "Level-1 Module Lead",
+    );
+  });
+});
+
+it("queues an explicit replacement while the Main Control runtime is reopening", async () => {
+  await withAgents(async ({ manager, cwd, codex }) => {
+    const agent = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId: "workspace",
+    });
+    const reopening = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const resume = codex.resumeSession.bind(codex);
+    vi.spyOn(codex, "resumeSession").mockImplementationOnce(async (...args) => {
+      reopening.resolve();
+      await release.promise;
+      return resume(...args);
+    });
+
+    const switchRole = manager.setAgentMainControl(agent.id, true);
+    try {
+      await Promise.race([reopening.promise, switchRole]);
+      expect(manager.getAgent(agent.id)).toBeNull();
+      const turn = await manager.replaceAgentRun(agent.id, "Work in Main Control");
+      release.resolve();
+      const events = await Array.fromAsync(turn);
+      expect(events.some((event) => event.type === "turn_completed")).toBe(true);
+      expect(manager.getAgent(agent.id)?.currentModeId).toBe("read-only");
+    } finally {
+      release.resolve();
+      await switchRole;
+    }
+  });
+});
+
+it("waits for a parent's role change before starting an idle child's turn", async () => {
+  await withAgents(async ({ manager, cwd, launchedConfigs }) => {
+    const options = { workspaceId: "workspace" };
+    const parent = await manager.createAgent({ provider: "codex", cwd }, undefined, options);
+    const childAgent = await manager.createAgent(
+      { provider: "codex", cwd, title: "Child" },
+      undefined,
+      {
+        ...options,
+        labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+      },
+    );
+    const session = manager.getAgent(parent.id)?.session;
+    if (!session) throw new Error("Expected a live parent");
+    const closing = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const close = session.close.bind(session);
+    vi.spyOn(session, "close").mockImplementationOnce(async () => {
+      closing.resolve();
+      await release.promise;
+      await close();
+    });
+
+    const switchRole = manager.setAgentMainControl(parent.id, true);
+    try {
+      await Promise.race([closing.promise, switchRole]);
+      const run = manager.runAgent(childAgent.id, "Work as a lead");
+      expect(manager.hasInFlightRun(childAgent.id)).toBe(false);
+      release.resolve();
+      await expect(run).resolves.toMatchObject({ canceled: false });
+      expect(launchedConfigs.get("codex")?.at(-1)?.daemonAppendSystemPrompt).toContain(
+        "Level-1 Module Lead",
+      );
+    } finally {
+      release.resolve();
+      await switchRole;
+    }
+  });
+});
+
+it("refreshes a child that resumed with the old role during a parent's role change", async () => {
+  await withAgents(async ({ manager, cwd, codex, launchedConfigs }) => {
+    const options = { workspaceId: "workspace" };
+    const parent = await manager.createAgent({ provider: "codex", cwd }, undefined, options);
+    const childAgent = await manager.createAgent(
+      { provider: "codex", cwd, title: "Child" },
+      undefined,
+      { ...options, labels: { [PARENT_AGENT_ID_LABEL]: parent.id } },
+    );
+    if (!childAgent.persistence) throw new Error("Expected a persisted child");
+    await manager.closeAgent(childAgent.id);
+
+    const opening = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const resume = codex.resumeSession.bind(codex);
+    vi.spyOn(codex, "resumeSession").mockImplementationOnce(async (...args) => {
+      opening.resolve();
+      await release.promise;
+      return resume(...args);
+    });
+
+    const resumeChild = manager.resumeAgentFromPersistence(
+      childAgent.persistence,
+      { cwd, title: "Child" },
+      childAgent.id,
+    );
+    try {
+      await Promise.race([opening.promise, resumeChild]);
+      await manager.setAgentMainControl(parent.id, true);
+      release.resolve();
+      await resumeChild;
+      const childLaunch = () =>
+        launchedConfigs.get("codex")?.findLast((config) => config.title === "Child");
+      expect(childLaunch()?.daemonAppendSystemPrompt ?? "").not.toContain("Level-1 Module Lead");
+      await expect(manager.runAgent(childAgent.id, "Work as a lead")).resolves.toMatchObject({
+        canceled: false,
+      });
+      expect(childLaunch()?.daemonAppendSystemPrompt).toContain("Level-1 Module Lead");
+    } finally {
+      release.resolve();
+      await resumeChild;
+    }
+  });
+});
+
+it("denies workspace archive for Main Control before looking up the workspace", async () => {
+  await withAgents(async ({ manager, storage, cwd }) => {
+    const make = () =>
+      manager.createAgent({ provider: "codex", cwd }, undefined, {
+        workspaceId: "workspace",
+      });
+    const mainAgent = await make();
+    const ordinary = await make();
+    const listActiveWorkspaces = vi.fn(async () => []);
+    const catalog = (callerAgentId: string) =>
+      createPaseoToolCatalog({
+        agentManager: manager,
+        agentStorage: storage,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        callerAgentId,
+        listActiveWorkspaces,
+        logger: createTestLogger(),
+      });
+    const openMainCatalog = catalog(mainAgent.id);
+    await manager.setAgentMainControl(mainAgent.id, true);
+    expect(manager.getPaseoToolPolicy(mainAgent.id)?.disabledTools).toContain("archive_workspace");
+    const request = { workspaceId: "missing" };
+    await expect(openMainCatalog.executeTool("archive_workspace", request)).rejects.toThrow(
+      "Paseo tool is disabled for your hierarchy role: archive_workspace",
+    );
+    expect(listActiveWorkspaces).not.toHaveBeenCalled();
+    await expect(catalog(ordinary.id).executeTool("archive_workspace", request)).rejects.toThrow(
+      "Workspace not found",
+    );
+    expect(listActiveWorkspaces).toHaveBeenCalledOnce();
+  });
+});
+
+it("refreshes the child's instructions before a user replaces its current turn", async () => {
+  await withAgents(async ({ manager, cwd, launchedConfigs }) => {
+    const workspaceId = "workspace";
+    const parent = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId,
+    });
+    const childAgent = await manager.createAgent(
+      { provider: "claude", cwd, modeId: "default" },
+      undefined,
+      { workspaceId, labels: { [PARENT_AGENT_ID_LABEL]: parent.id } },
+    );
+    const held = Promise.withResolvers<void>();
+    const unsubscribe = manager.subscribe(
+      (event) => {
+        if (event.type === "agent_stream" && event.event.type === "permission_requested") {
+          held.resolve();
+        }
+      },
+      { agentId: childAgent.id, replayState: false },
+    );
+    const running = manager.runAgent(childAgent.id, "edit test.txt");
+    try {
+      await Promise.race([
+        held.promise,
+        running.then(() => {
+          throw new Error("Expected the original turn to be held");
+        }),
+      ]);
+      await manager.setAgentMainControl(parent.id, true);
+      expect(launchedConfigs.get("claude")).toHaveLength(1);
+      expect(manager.hasInFlightRun(childAgent.id)).toBe(true);
+      const replacement = await manager.replaceAgentRun(
+        childAgent.id,
+        "Continue with updated instructions",
+      );
+      const events = await Array.fromAsync(replacement);
+      expect((await running).canceled).toBe(true);
+      expect(events.some((event) => event.type === "turn_completed")).toBe(true);
+      expect(launchedConfigs.get("claude")?.at(-1)?.daemonAppendSystemPrompt).toContain(
+        "Level-1 Module Lead",
+      );
+    } finally {
+      unsubscribe();
+    }
   });
 });
 

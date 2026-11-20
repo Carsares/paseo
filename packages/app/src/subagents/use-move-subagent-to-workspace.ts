@@ -1,9 +1,11 @@
+import { DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import { useCallback, useMemo } from "react";
 import { useToast } from "@/contexts/toast-context";
 import { i18n } from "@/i18n/i18next";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useSessionStore } from "@/stores/session-store";
+import { confirmDialog } from "@/utils/confirm-dialog";
 import { toErrorMessage } from "@/utils/error-messages";
 import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
 import {
@@ -40,7 +42,7 @@ export function useMoveSubagentToWorkspace(): (address: AgentAddress) => void {
           moveAgentToWorkspace: async ({ serverId: targetServerId, agentId, idempotencyKey }) => {
             const client = useSessionStore.getState().sessions[targetServerId]?.client;
             if (!client) {
-              throw new Error(i18n.t("workspaceSetup.errors.hostDisconnected"));
+              throw new DaemonConnectionError(i18n.t("workspaceSetup.errors.hostDisconnected"));
             }
             return client.moveAgentToWorkspace(agentId, { idempotencyKey });
           },
@@ -55,6 +57,13 @@ export function useMoveSubagentToWorkspace(): (address: AgentAddress) => void {
               target: { kind: "agent", agentId },
             });
           },
+          confirmRetry: (error) =>
+            confirmDialog({
+              title: i18n.t("common.actions.retry"),
+              message: toErrorMessage(error),
+              confirmLabel: i18n.t("common.actions.retry"),
+              cancelLabel: i18n.t("common.actions.cancel"),
+            }),
           reportError: (error) => {
             toast.error(toErrorMessage(error));
           },

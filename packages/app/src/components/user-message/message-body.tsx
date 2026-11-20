@@ -1,9 +1,11 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useContext, useLayoutEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Text, View, type LayoutChangeEvent } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { Button } from "@/components/ui/button";
 import { isWeb } from "@/constants/platform";
+import { useDisclosureHold } from "@/agent-stream/disclosure";
+import { ExpandedQuoteCountContext } from "./quote-expansion-context";
 import { parseUserMessageSegments } from "./quote-segments";
 
 const MESSAGE_TEXT_DATASET = { messageText: "true" };
@@ -49,6 +51,12 @@ export function UserMessageBody({ message }: UserMessageBodyProps) {
 function UserMessageQuoteBlock({ text }: { text: string }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  const adjustExpandedQuoteCount = useContext(ExpandedQuoteCountContext);
+  useLayoutEffect(() => {
+    if (!expanded || !adjustExpandedQuoteCount) return;
+    adjustExpandedQuoteCount(1);
+    return () => adjustExpandedQuoteCount(-1);
+  }, [adjustExpandedQuoteCount, expanded]);
   const [previewHeight, setPreviewHeight] = useState(0);
   const [fullHeight, setFullHeight] = useState(0);
   const longSource =
@@ -63,7 +71,11 @@ function UserMessageQuoteBlock({ text }: { text: string }) {
     const { height } = event.nativeEvent.layout;
     if (height > 0) setFullHeight(height);
   }, []);
-  const toggleExpanded = useCallback(() => setExpanded((value) => !value), []);
+  const hold = useDisclosureHold();
+  const toggleExpanded = useCallback(
+    () => hold(() => setExpanded((value) => !value), { triggerEdge: "bottom" }),
+    [hold],
+  );
   const accessibilityState = useMemo(() => ({ expanded }), [expanded]);
 
   return (

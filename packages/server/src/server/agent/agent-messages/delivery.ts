@@ -13,6 +13,7 @@ interface Message {
   clearPendingPermissions?: boolean;
   activeTurnBehavior?: "steer" | "interrupt";
   beforeDispatch?: () => void;
+  beforeProviderDispatch?: () => Promise<void>;
   onDispatch?: (disposition: PromptDispatchDisposition) => void;
 }
 interface Receipt {
@@ -33,6 +34,7 @@ interface DispatchRequest {
   sessionMode?: string;
   clearPendingPermissions: boolean;
   unarchive: boolean;
+  beforeProviderDispatch(): Promise<void>;
   onDispatch(disposition: PromptDispatchDisposition): void;
 }
 interface Dependencies {
@@ -52,7 +54,9 @@ export interface AgentMessageDelivery {
 }
 
 /** Recipient-owned agent delivery. Human prompts never enter this module. */
-export function createAgentMessageDelivery(dependencies: Dependencies): AgentMessageDelivery {
+export function createAgentMessageDelivery(dependencies: Dependencies): AgentMessageDelivery & {
+  pauseAdmission(): { drained: Promise<void>; release(): void };
+} {
   const schedule =
     dependencies.schedule ??
     ((delayMs, callback) => {
@@ -62,6 +66,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   const pending = new Map<string, { messages: Admitted[]; cancel(): void }>();
   const dispatching = new Map<string, Promise<void>>();
   let closed = false;
+  let admissionPaused = false;
   let closing: Promise<void> | undefined;
 
   function dispatch(recipientId: string, messages: Admitted[]): void {
@@ -82,6 +87,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       sessionMode: messages.find((message) => message.sessionMode)?.sessionMode,
       clearPendingPermissions: messages.some((message) => message.clearPendingPermissions),
       unarchive: messages.some((message) => message.unarchive !== false),
+      async beforeProviderDispatch() {
+        for (const message of messages) await message.beforeProviderDispatch?.();
+      },
       onDispatch: (disposition) => {
         for (const message of messages) {
           try {
@@ -127,7 +135,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       if (
         group.length &&
         ((message.activeTurnBehavior ?? "steer") !== (group[0]!.activeTurnBehavior ?? "steer") ||
-          (mode && message.sessionMode && mode !== message.sessionMode))
+          (mode && message.sessionMode && mode !== message.sessionMode) ||
+          group[0]!.beforeProviderDispatch ||
+          message.beforeProviderDispatch)
       ) {
         dispatch(recipientId, group);
         group = [];
@@ -139,10 +149,17 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     if (group.length) dispatch(recipientId, group);
   }
 
+  async function drain(): Promise<void> {
+    for (const recipientId of pending.keys()) flush(recipientId);
+    // Individual failures reject their receipts and are reported by dispatch.
+    await Promise.allSettled(dispatching.values());
+  }
+
   return {
     hasPending: (recipientId) => pending.has(recipientId) || dispatching.has(recipientId),
     enqueue(message) {
       if (closed) throw new Error("Agent message delivery is closed");
+      if (admissionPaused) throw new Error("Agent message delivery is preparing for shutdown");
       let resolve!: Admitted["resolve"];
       let reject!: Admitted["reject"];
       const dispatched = new Promise<PromptDispatchDisposition>((accepted, failed) => {
@@ -180,12 +197,19 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         signal.removeEventListener("abort", aborted);
       }
     },
+    pauseAdmission() {
+      admissionPaused = true;
+      return {
+        drained: drain(),
+        release: () => {
+          admissionPaused = false;
+        },
+      };
+    },
     close() {
       if (closing) return closing;
       closed = true;
-      for (const recipientId of pending.keys()) flush(recipientId);
-      // Each failure is reported and rejects its receipts; shutdown still drains other recipients.
-      closing = Promise.allSettled(dispatching.values()).then(() => undefined);
+      closing = drain();
       return closing;
     },
   };

@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -96,6 +97,7 @@ function SelectionActions({
   const stateRef = useRef(state);
   const floatingRef = useRef<HTMLElement | null>(null);
   const { open: menuOpen, setOpen: setMenuOpen, setAnchorRect } = useContextMenu();
+  const pendingMenuQuote = useRef<ComposerQuote | null>(null);
   const menuOpenRef = useRef(menuOpen);
   menuOpenRef.current = menuOpen;
   const update = useCallback((next: QuoteState) => {
@@ -106,6 +108,14 @@ function SelectionActions({
   useEffect(() => {
     if (!menuOpen) setMenuSelection(null);
   }, [menuOpen]);
+
+  useLayoutEffect(() => {
+    if (menuOpen || !pendingMenuQuote.current) return;
+    const quote = pendingMenuQuote.current;
+    pendingMenuQuote.current = null;
+    // The menu's unmount restores focus during commit, before the composer takes it.
+    onQuote?.(quote);
+  }, [menuOpen, onQuote]);
 
   useEffect(() => {
     let pointerDown = false;
@@ -197,10 +207,10 @@ function SelectionActions({
   }, [dismiss, menuSelection, onSpawnSubagentFromSelection]);
   const quoteFromMenu = useCallback(() => {
     if (!onQuote || !menuSelection) return;
+    pendingMenuQuote.current = { quote: menuSelection.quote };
     setMenuOpen(false);
     dismiss();
     window.getSelection()?.removeAllRanges();
-    onQuote({ quote: menuSelection.quote });
   }, [dismiss, menuSelection, onQuote, setMenuOpen]);
   const copyFromMenu = useCallback(() => {
     if (!menuSelection) return;

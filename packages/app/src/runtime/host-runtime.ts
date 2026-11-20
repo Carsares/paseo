@@ -2650,9 +2650,14 @@ export class HostRuntimeStore {
       submitMessage: async ({ text, attachments }) => {
         const supportsForgeAttachments =
           useSessionStore.getState().sessions[serverId]?.serverInfo?.features?.forgeSearch === true;
+        const agent = useSessionStore.getState().sessions[serverId]?.agents.get(agentId);
         await dispatchComposerAgentMessage({
           client,
           agentId,
+          provider: agent?.provider,
+          ...(session.serverInfo?.features?.providersSnapshot
+            ? { providerSnapshot: { client, serverId, cwd: agent?.cwd } }
+            : {}),
           text,
           attachments,
           attachmentSubmitFormat: resolveComposerAttachmentSubmitFormat({

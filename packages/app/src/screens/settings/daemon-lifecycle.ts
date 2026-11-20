@@ -65,12 +65,18 @@ export async function updateDaemonFromSettings(
       success: boolean;
       error: string | null;
       newVersion: string | null;
+      agentResume?: "requested" | "unverified";
     }>;
   },
-): Promise<{ workerVersion: string }> {
+): Promise<{ workerVersion: string; agentResume?: "requested" | "unverified" }> {
   const previous = await readSelectedWorker(hostServerId, deps);
   const installed = await deps.updateDaemon();
-  if (!installed.success) throw new Error(installed.error ?? "Package installation failed");
+  if (!installed.success) {
+    const error = installed.error ?? "Package installation failed";
+    throw new Error(
+      installed.newVersion ? `Package installed; restart could not be prepared. ${error}` : error,
+    );
+  }
   try {
     const worker = await observeReplacement(previous, deps);
     if (!worker.version || !installed.newVersion || worker.version !== installed.newVersion) {
@@ -78,7 +84,10 @@ export async function updateDaemonFromSettings(
         `Expected installed version ${installed.newVersion ?? "unknown"}; observed worker ${worker.version}.`,
       );
     }
-    return { workerVersion: worker.version };
+    return {
+      workerVersion: worker.version,
+      ...(installed.agentResume ? { agentResume: installed.agentResume } : {}),
+    };
   } catch (error) {
     throw new Error(
       `Package installed; replacement worker version was not confirmed. ${String(error)}`,

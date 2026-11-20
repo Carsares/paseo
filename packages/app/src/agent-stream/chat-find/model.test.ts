@@ -141,6 +141,45 @@ it("uses all loaded fragment cursors and visits the merged row once", async () =
   }
 });
 
+it("loads an unseen merged match using the final fragment sequence from the host", async () => {
+  const loaded: number[] = [];
+  const revealed: string[] = [];
+  const model = new ChatFindModel({
+    async search() {
+      return {
+        ...response([{ seq: 3, role: "assistant", count: 1 }]),
+        agentInteractionsHidden: true as const,
+      };
+    },
+    async load(epoch, seq) {
+      loaded.push(seq);
+      model.updateHistory(epoch, [...mergedReply(["A TAR", "GET."]), message(100)]);
+    },
+    async reveal(id, query) {
+      revealed.push(id);
+      expect(query).toBe("target");
+      return { count: 1, occurrence: 0 };
+    },
+    clear() {},
+  });
+  try {
+    model.updateHistory("epoch", [message(100)]);
+    model.open();
+    model.setQuery("target");
+    await expect
+      .poll(() => model.getSnapshot())
+      .toMatchObject({
+        phase: "ready",
+        selectedItemId: "row-1",
+        count: 1,
+      });
+    expect(loaded).toEqual([3]);
+    expect(revealed).toEqual(["row-1"]);
+  } finally {
+    model.close();
+  }
+});
+
 it("inserts a case-insensitive cross-fragment match in timeline order", async () => {
   const model = new ChatFindModel({
     async search() {

@@ -45,6 +45,21 @@ function providerEntry(): ProviderSnapshotEntry {
 }
 
 describe("provider snapshot codec", () => {
+  it("round trips the optional base provider alongside an older snapshot entry", () => {
+    const entries: ProviderSnapshotEntry[] = [
+      {
+        provider: "custom-claude",
+        derivedFromProviderId: "claude",
+        enabled: true,
+        status: "loading",
+      },
+      { provider: "codex", enabled: true, status: "ready" },
+    ];
+    expect(
+      expandProviderSnapshot(CompactProviderSnapshotSchema.parse(compactProviderSnapshot(entries))),
+    ).toEqual(entries);
+  });
+
   it("shares repeated thinking options while preserving the public snapshot shape", () => {
     const original = [providerEntry()];
     const compact = compactProviderSnapshot(original);

@@ -114,6 +114,7 @@ describe("workspace bulk close helpers", () => {
 
     await closeBulkWorkspaceTabs({
       groups,
+      workspaceId: "source-workspace",
       client: { closeItems },
       closeTab: async (tabId, action) => {
         closedTabIds.push(tabId);
@@ -129,6 +130,7 @@ describe("workspace bulk close helpers", () => {
     expect(closeItems).toHaveBeenCalledTimes(1);
     expect(closeItems).toHaveBeenCalledWith({
       agentIds: ["a1"],
+      expectedWorkspaceId: "source-workspace",
       terminalIds: ["t1", "t2"],
     });
     expect(closedTabIds).toEqual([
@@ -157,6 +159,7 @@ describe("workspace bulk close helpers", () => {
 
     await closeBulkWorkspaceTabs({
       groups,
+      workspaceId: "source-workspace",
       client: {
         closeItems: async () => {
           throw new Error("rpc failed");
@@ -196,6 +199,7 @@ describe("workspace bulk close helpers", () => {
 
     await closeBulkWorkspaceTabs({
       groups,
+      workspaceId: "source-workspace",
       client: { closeItems },
       closeTab: async (_tabId, action) => action(),
       closeLayoutOnlyAgent: async (agentId) => {
@@ -207,7 +211,11 @@ describe("workspace bulk close helpers", () => {
       logLabel: "others",
     });
 
-    expect(closeItems).toHaveBeenCalledWith({ agentIds: ["root"], terminalIds: [] });
+    expect(closeItems).toHaveBeenCalledWith({
+      agentIds: ["root"],
+      expectedWorkspaceId: "source-workspace",
+      terminalIds: [],
+    });
     expect(preparedSubagents).toEqual(["child"]);
     expect(cleanedTabs).toEqual(["agent_child", "agent_root"]);
   });

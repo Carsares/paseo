@@ -127,6 +127,8 @@ export function prepareAgentMessage(
   source?: AgentPromptSource,
   id?: string,
 ): { prompt: AgentPromptInput; messageId?: string } {
+  const replayablePrompt =
+    !source && Array.isArray(prompt) ? prompt.map(markForkAttachment) : prompt;
   if (!source) {
     const submittedText =
       typeof prompt === "string"
@@ -139,12 +141,24 @@ export function prepareAgentMessage(
             .trim();
     // Quote reserved envelopes only when they arrived through the human send path.
     // This provenance must survive provider history, not only the accepted local row.
-    if (!parseAgentMessages(submittedText) && !isSystemInjectedEnvelope(submittedText)) {
-      return { prompt, messageId: id };
+    if (
+      !parseAgentMessages(submittedText) &&
+      !isSystemInjectedEnvelope(submittedText) &&
+      !submittedText.trimStart().startsWith(FORK_ATTACHMENT_OPEN)
+    ) {
+      return { prompt: replayablePrompt, messageId: id };
     }
   }
   const messageId = id ?? randomUUID();
-  const text = typeof prompt === "string" ? prompt : prompt.flatMap(renderMessageText).join("\n\n");
+  const forkAttachments =
+    !source && Array.isArray(replayablePrompt) ? replayablePrompt.filter(isForkAttachment) : [];
+  const text =
+    typeof prompt === "string"
+      ? prompt
+      : prompt
+          .filter((block) => source || !isForkAttachment(block))
+          .flatMap(renderMessageText)
+          .join("\n\n");
   // Render textual attachments before wrapping, so provider replay still contains one
   // complete envelope instead of an envelope followed by provider-rendered context.
   const envelope = formatAgentMessage({ id: messageId, source: source ?? null, text });
@@ -153,20 +167,32 @@ export function prepareAgentMessage(
     prompt:
       typeof prompt === "string"
         ? envelope
-        : [{ type: "text", text: envelope }, ...prompt.filter((block) => block.type === "image")],
+        : [
+            ...forkAttachments,
+            { type: "text", text: envelope },
+            ...prompt.filter((block) => block.type === "image"),
+          ],
   };
 }
 
 /** The same projection owns provider echoes, acceptance, import, and replay. */
-export function projectAgentMessages(item: AgentTimelineItem): AgentTimelineItem[] {
+export function projectAgentMessages(
+  item: AgentTimelineItem,
+  options?: { submitted?: boolean },
+): AgentTimelineItem[] {
   if (item.type === "user_message") {
-    const messages = parseAgentMessages(item.text);
+    const userMessage = options?.submitted ? item : withReplayForkContext(item);
+    const messages = parseAgentMessages(userMessage.text);
     if (messages) {
       return messages.flatMap((message) => {
-        const projected = projectAgentMessage({ ...item, text: formatAgentMessage(message) });
+        const projected = projectAgentMessage({
+          ...userMessage,
+          text: formatAgentMessage(message),
+        });
         return projected ? [projected] : [];
       });
     }
+    item = userMessage;
   }
   const projected = projectAgentMessage(item);
   return projected ? [projected] : [];
@@ -174,6 +200,13 @@ export function projectAgentMessages(item: AgentTimelineItem): AgentTimelineItem
 
 const FORK_SUMMARY_PREFIX = "<chat-history-summary>\nChat history from a previous Paseo agent.";
 const FORK_SUMMARY_CLOSE = "\n</chat-history-summary>";
+const FORK_ATTACHMENT_OPEN = '<paseo-chat-history-attachment context="';
+const FORK_ATTACHMENT_CLOSE = "\n</paseo-chat-history-attachment>";
+const forkContextSchema = z.strictObject({
+  sourceAgentId: z.string().optional(),
+  sourceServerId: z.string().optional(),
+  boundaryMessageId: z.string().optional(),
+});
 
 function parseForkSummaryHeader(content: string): UserMessageForkContext {
   const headerEnd = content.indexOf("\n\n");
@@ -188,52 +221,24 @@ function parseForkSummaryHeader(content: string): UserMessageForkContext {
   };
 }
 
-/**
- * Strips leading Paseo fork summary blocks from replayed user text. Summaries written before
- * provenance headers existed yield an empty `forkContext`, which still marks the message as a fork.
- */
-export function extractForkContextFromSummaryText(text: string): {
-  text: string;
-  forkContext?: UserMessageForkContext;
-} {
-  let remaining = text;
-  let forkContext: UserMessageForkContext | undefined;
-  while (
-    remaining.startsWith(FORK_SUMMARY_PREFIX) &&
-    remaining[FORK_SUMMARY_PREFIX.length] === "\n"
-  ) {
-    const closeIndex = remaining.indexOf(FORK_SUMMARY_CLOSE, FORK_SUMMARY_PREFIX.length);
-    if (closeIndex < 0) break;
-    forkContext ??= parseForkSummaryHeader(remaining.slice(FORK_SUMMARY_PREFIX.length, closeIndex));
-    let afterBlock = closeIndex + FORK_SUMMARY_CLOSE.length;
-    while (afterBlock < remaining.length) {
-      if (remaining[afterBlock] === "\n") {
-        afterBlock += 1;
-      } else if (remaining[afterBlock] === "\r" && remaining[afterBlock + 1] === "\n") {
-        afterBlock += 2;
-      } else {
-        break;
-      }
-    }
-    remaining = remaining.slice(afterBlock);
-  }
-  return forkContext ? { text: remaining, forkContext } : { text };
+function readLegacyForkSummary(text: string) {
+  if (!text.startsWith(`${FORK_SUMMARY_PREFIX}\n`)) return null;
+  const closeIndex = text.indexOf(FORK_SUMMARY_CLOSE, FORK_SUMMARY_PREFIX.length);
+  if (closeIndex < 0) return null;
+  return {
+    text: text.slice(closeIndex + FORK_SUMMARY_CLOSE.length).replace(/^(?:\r?\n)+/, ""),
+    forkContext: parseForkSummaryHeader(text.slice(FORK_SUMMARY_PREFIX.length, closeIndex)),
+  };
 }
 
-export function extractSubmittedPromptForkContext(
-  prompt: AgentPromptInput,
-): UserMessageForkContext | undefined {
-  if (typeof prompt === "string") {
-    return extractForkContextFromSummaryText(prompt).forkContext;
-  }
-  const block = prompt.find(
-    (candidate) =>
-      candidate.type === "text" &&
-      "mimeType" in candidate &&
-      candidate.contextKind === "chat_history",
-  );
-  if (!block || block.type !== "text" || !("mimeType" in block)) return undefined;
-  const fromText = extractForkContextFromSummaryText(block.text).forkContext;
+type ForkAttachment = Extract<AgentPromptContentBlock, { type: "text"; mimeType: string }>;
+
+function isForkAttachment(block: AgentPromptContentBlock): block is ForkAttachment {
+  return block.type === "text" && "mimeType" in block && block.contextKind === "chat_history";
+}
+
+function getForkAttachmentContext(block: ForkAttachment): UserMessageForkContext {
+  const fromText = readLegacyForkSummary(block.text)?.forkContext;
   const sourceAgentId = block.forkContext?.sourceAgentId?.trim() || fromText?.sourceAgentId;
   const sourceServerId = block.forkContext?.sourceServerId?.trim() || fromText?.sourceServerId;
   const boundaryMessageId =
@@ -245,35 +250,71 @@ export function extractSubmittedPromptForkContext(
   };
 }
 
-function withExtractedForkContext(
+export function extractSubmittedPromptForkContext(
+  prompt: AgentPromptInput,
+): UserMessageForkContext | undefined {
+  const block = Array.isArray(prompt) ? prompt.find(isForkAttachment) : undefined;
+  return block ? getForkAttachmentContext(block) : undefined;
+}
+
+function markForkAttachment(block: AgentPromptContentBlock): AgentPromptContentBlock {
+  if (!isForkAttachment(block)) return block;
+  const forkContext = getForkAttachmentContext(block);
+  const metadata = escapeXml(JSON.stringify(forkContext));
+  const text = block.text.replaceAll(
+    FORK_ATTACHMENT_CLOSE,
+    "\n&lt;/paseo-chat-history-attachment>",
+  );
+  return {
+    ...block,
+    forkContext,
+    text: `${FORK_ATTACHMENT_OPEN}${metadata}">\n${text}${FORK_ATTACHMENT_CLOSE}`,
+  };
+}
+
+function readMarkedForkAttachment(text: string) {
+  if (!text.startsWith(FORK_ATTACHMENT_OPEN)) return null;
+  const headerEnd = text.indexOf('">\n', FORK_ATTACHMENT_OPEN.length);
+  if (headerEnd < 0) return null;
+  const closeIndex = text.indexOf(FORK_ATTACHMENT_CLOSE, headerEnd + 3);
+  if (closeIndex < 0) return null;
+  const metadata = unescapeXml(text.slice(FORK_ATTACHMENT_OPEN.length, headerEnd));
+  if (metadata === null) return null;
+  try {
+    const parsed = forkContextSchema.safeParse(JSON.parse(metadata));
+    if (!parsed.success) return null;
+    return {
+      text: text.slice(closeIndex + FORK_ATTACHMENT_CLOSE.length).replace(/^(?:\r?\n)+/, ""),
+      forkContext: parsed.data,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function withReplayForkContext(
   item: Extract<AgentTimelineItem, { type: "user_message" }>,
-  text: string,
 ): Extract<AgentTimelineItem, { type: "user_message" }> {
-  const extracted = extractForkContextFromSummaryText(text);
-  const forkContext =
-    item.forkContext || extracted.forkContext
-      ? {
-          ...(extracted.forkContext?.sourceAgentId
-            ? { sourceAgentId: extracted.forkContext.sourceAgentId }
-            : {}),
-          ...(extracted.forkContext?.sourceServerId
-            ? { sourceServerId: extracted.forkContext.sourceServerId }
-            : {}),
-          ...(extracted.forkContext?.boundaryMessageId
-            ? { boundaryMessageId: extracted.forkContext.boundaryMessageId }
-            : {}),
-          ...(item.forkContext?.sourceAgentId
-            ? { sourceAgentId: item.forkContext.sourceAgentId }
-            : {}),
-          ...(item.forkContext?.sourceServerId
-            ? { sourceServerId: item.forkContext.sourceServerId }
-            : {}),
-          ...(item.forkContext?.boundaryMessageId
-            ? { boundaryMessageId: item.forkContext.boundaryMessageId }
-            : {}),
-        }
-      : undefined;
-  return { ...item, text: extracted.text, ...(forkContext ? { forkContext } : {}) };
+  const marked = readMarkedForkAttachment(item.text);
+  if (marked) {
+    let text = marked.text;
+    for (let next = readMarkedForkAttachment(text); next; next = readMarkedForkAttachment(text)) {
+      text = next.text;
+    }
+    return { ...item, text, forkContext: { ...marked.forkContext, ...item.forkContext } };
+  }
+  // COMPAT(unmarkedForkSummary): added in v0.16.0 for replay with recorded provenance.
+  // Remove after 2027-05-20 once supported stored history no longer needs this path.
+  const recorded = item.forkContext;
+  const legacy = recorded?.sourceAgentId ? readLegacyForkSummary(item.text) : null;
+  if (!legacy || legacy.forkContext.sourceAgentId !== recorded?.sourceAgentId) return item;
+  const contextAgrees = (["sourceServerId", "boundaryMessageId"] as const).every((key) => {
+    const value = legacy.forkContext[key];
+    return !value || !recorded?.[key] || value === recorded[key];
+  });
+  return contextAgrees
+    ? { ...item, text: legacy.text, forkContext: { ...legacy.forkContext, ...recorded } }
+    : item;
 }
 
 function projectAgentMessage(item: AgentTimelineItem): AgentTimelineItem | null {
@@ -282,7 +323,7 @@ function projectAgentMessage(item: AgentTimelineItem): AgentTimelineItem | null 
   if (!message) {
     // Schedule bodies include their run ID, keeping identity stable across acceptance
     // and provider replay even when the provider assigns its own message ID.
-    if (!isSystemInjectedEnvelope(item.text)) return withExtractedForkContext(item, item.text);
+    if (!isSystemInjectedEnvelope(item.text)) return item;
     const text = item.text.slice("<paseo-system>\n".length, -"\n</paseo-system>".length);
     return {
       type: "tool_call",
@@ -296,7 +337,8 @@ function projectAgentMessage(item: AgentTimelineItem): AgentTimelineItem | null 
   const { source } = message;
   if (!source) {
     return {
-      ...withExtractedForkContext(item, message.text),
+      ...item,
+      text: message.text,
       clientMessageId: message.id,
     };
   }

@@ -164,6 +164,7 @@ export class ChatFindModel {
   private async search(signal: AbortSignal) {
     try {
       let cursor: number | undefined;
+      let agentInteractionsHidden = false;
       do {
         const result = await tagged("connection", this.operations.search(this.state.query, cursor));
         if (signal.aborted) return;
@@ -171,6 +172,7 @@ export class ChatFindModel {
         const searchChanged = this.resultEpoch !== null && result.epoch !== this.resultEpoch;
         if (historyChanged || searchChanged) throw new ChatFindFailureError("historyChanged");
         this.resultEpoch = result.epoch;
+        agentInteractionsHidden = result.agentInteractionsHidden === true;
         this.locations.push(
           ...result.locations.map((location) => ({
             seq: location.seq,
@@ -181,7 +183,8 @@ export class ChatFindModel {
         );
         cursor = result.nextCursor ?? undefined;
       } while (cursor !== undefined);
-      this.addLoadedMergedMatches();
+      // COMPAT(timelineSearchInteractionProjection): added in v0.16.0, remove the loaded-row fallback after 2027-05-20.
+      if (!agentInteractionsHidden) this.addLoadedMergedMatches();
       await this.navigate(0, 1, signal);
     } catch (error) {
       this.fail(error, signal);

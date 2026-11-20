@@ -21,6 +21,7 @@ import type {
 import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import type { ManagedAgent } from "./agent-manager.js";
 import { featuresFromControls } from "@getpaseo/protocol/option-controls";
+import { isMainControlAgentLabels } from "@getpaseo/protocol/agent-labels";
 import type { JsonValue } from "../json-utils.js";
 import {
   isStoredAgentProviderAvailable,
@@ -44,6 +45,16 @@ interface ProjectionOptions {
 
 interface RecentProviderSessionProjectionOptions {
   providerLabel: string;
+}
+
+function projectSubagentDraftOptions(
+  agent: Pick<ManagedAgent, "labels" | "config"> | StoredAgentRecord,
+  providerAdapter: AgentProvider,
+): Pick<AgentSnapshotPayload, "subagentDraftOptions"> {
+  if (providerAdapter !== "opencode" || !isMainControlAgentLabels(agent.labels)) return {};
+  // The new draft resolves provider defaults again. Copy the parent's configured overrides
+  // before the Main Control role added its launch-only permission rules.
+  return { subagentDraftOptions: sanitizeEffectiveOptions(agent.config?.providerOptions ?? {}) };
 }
 
 function normalizeThinkingOptionId(value: string | null | undefined): string | null {
@@ -158,6 +169,7 @@ export function toAgentPayload(
     ...(agent.effectiveOptions
       ? { options: sanitizeEffectiveOptions(agent.effectiveOptions) }
       : {}),
+    ...projectSubagentDraftOptions(agent, agent.providerAdapter ?? agent.provider),
     controls: normalizeControls(agent.controls),
     pendingPermissions: sanitizePendingPermissions(agent.pendingPermissions),
     persistence: projectPersistenceHandleForWire(agent.persistence),
@@ -264,6 +276,7 @@ export function buildStoredAgentPayload(
   record: StoredAgentRecord,
   validProviders: Iterable<AgentProvider>,
   effectiveOptionsFor: EffectiveOptionsResolver,
+  adapterOf: (provider: AgentProvider) => AgentProvider = (provider) => provider,
 ): AgentSnapshotPayload {
   const defaultCapabilities = {
     supportsStreaming: false,
@@ -308,6 +321,7 @@ export function buildStoredAgentPayload(
     currentModeId: record.lastModeId ?? null,
     availableModes: [],
     ...optionControls,
+    ...projectSubagentDraftOptions(record, adapterOf(record.provider)),
     pendingPermissions: [],
     persistence,
     title: record.title ?? null,

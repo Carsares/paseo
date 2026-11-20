@@ -5,6 +5,121 @@ import {
   DRAFT_PERSIST_INTERVAL_MS,
   type PersistenceScheduler,
 } from "./persistence";
+import { createQuoteAwareDraftStorage } from "./quote-persistence";
+
+const key = "paseo-drafts";
+const quotesKey = "paseo-drafts-quotes";
+const quote = { kind: "quote", id: "q1", text: "Selected text" } as const;
+const file = {
+  kind: "workspace_file",
+  path: "README.md",
+  selection: { kind: "whole_file" },
+} as const;
+const draft = {
+  input: { text: "Keep this", attachments: [quote, file] },
+  lifecycle: "active",
+  updatedAt: 100,
+  version: 3,
+} as const;
+const storedDraft = { ...draft, input: { ...draft.input, attachments: [quote, file] } };
+const other = { ...draft, input: { text: "Other draft", attachments: [] } };
+const snapshot = {
+  state: { drafts: { selected: storedDraft, other }, createModalDraft: storedDraft },
+  version: 5,
+};
+const baseDraft = { ...draft, input: { ...draft.input, attachments: [file] } };
+const baseSnapshot = {
+  state: { drafts: { selected: baseDraft, other }, createModalDraft: baseDraft },
+  version: 5,
+};
+
+function quoteStorageFixture() {
+  const entries = new Map<string, string>();
+  const backing = {
+    getItem: (name: string) => entries.get(name) ?? null,
+    setItem: (name: string, value: string) => void entries.set(name, value),
+    removeItem: (name: string) => void entries.delete(name),
+  };
+  return { backing, storage: createQuoteAwareDraftStorage(backing) };
+}
+
+describe("draft quote persistence", () => {
+  it("keeps the original storage key in the old shape and restores attachment order in both drafts", async () => {
+    const { backing, storage } = quoteStorageFixture();
+    await storage.setItem(key, snapshot);
+    expect(JSON.parse(backing.getItem(key)!)).toEqual(baseSnapshot);
+    expect(await storage.getItem(key)).toEqual(snapshot);
+  });
+
+  it("reads the baseline without quote data and repairs drafts from builds that saved quotes inline", async () => {
+    const { backing, storage } = quoteStorageFixture();
+    backing.setItem(key, JSON.stringify(baseSnapshot));
+    expect(await storage.getItem(key)).toEqual(baseSnapshot);
+    backing.setItem(key, JSON.stringify(snapshot));
+    expect(await storage.getItem(key)).toEqual(snapshot);
+    expect(JSON.parse(backing.getItem(key)!)).toEqual(baseSnapshot);
+    expect(await storage.getItem(key)).toEqual(snapshot);
+  });
+
+  it("does not restore stale quotes after an older app edits the draft or drop drafts if quote data is corrupt", async () => {
+    const { backing, storage } = quoteStorageFixture();
+    await storage.setItem(key, snapshot);
+    const edited = {
+      ...baseDraft,
+      version: 4,
+      input: { ...baseDraft.input, text: "Old app edit" },
+    };
+    const editedBase = {
+      ...baseSnapshot,
+      state: { ...baseSnapshot.state, drafts: { selected: edited, other } },
+    };
+    backing.setItem(key, JSON.stringify(editedBase));
+    expect(await storage.getItem(key)).toEqual({
+      ...editedBase,
+      state: { ...editedBase.state, createModalDraft: storedDraft },
+    });
+    backing.setItem(quotesKey, "invalid JSON");
+    expect(await storage.getItem(key)).toEqual(editedBase);
+  });
+
+  it("still saves draft text and other attachments when the quote key cannot be written", async () => {
+    const { backing } = quoteStorageFixture();
+    const storage = createQuoteAwareDraftStorage({
+      ...backing,
+      setItem: (name, value) => {
+        if (name === quotesKey) throw new Error("quote storage quota exceeded");
+        backing.setItem(name, value);
+      },
+    });
+
+    await storage.setItem(key, snapshot);
+    expect(await storage.getItem(key)).toEqual(baseSnapshot);
+
+    backing.setItem(key, JSON.stringify(snapshot));
+    expect(await storage.getItem(key)).toEqual(snapshot);
+    expect(JSON.parse(backing.getItem(key)!)).toEqual(snapshot);
+  });
+
+  it("still saves draft text when removal of the previous quote key fails", async () => {
+    const { backing, storage } = quoteStorageFixture();
+    await storage.setItem(key, snapshot);
+    const unableToRemoveQuotes = createQuoteAwareDraftStorage({
+      ...backing,
+      removeItem: (name) => {
+        if (name === quotesKey) throw new Error("quote storage unavailable");
+        backing.removeItem(name);
+      },
+    });
+    const edited = { ...baseDraft, version: 4, input: { ...baseDraft.input, text: "After quote" } };
+    const editedBase = {
+      ...baseSnapshot,
+      state: { drafts: { selected: edited, other }, createModalDraft: null },
+    };
+
+    await unableToRemoveQuotes.setItem(key, editedBase);
+    expect(await storage.getItem(key)).toEqual(editedBase);
+  });
+});
 
 interface DraftState {
   text: string;

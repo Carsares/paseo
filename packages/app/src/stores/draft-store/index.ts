@@ -28,14 +28,9 @@ import {
   type DraftRecord,
   type DraftStoreState,
 } from "./state";
-import {
-  migrateDraftInput,
-  migratePersistedState,
-  type MigrateLegacyImages,
-  PersistedDraftStoreSchema,
-} from "./migration";
+import { migrateDraftInput, migratePersistedState, type MigrateLegacyImages } from "./migration";
 import { createDraftPersistStorage } from "./persistence";
-import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
+import { createQuoteAwareDraftStorage } from "./quote-persistence";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { applyMetadataPatch } from "@/composer/draft/metadata";
 import { hasDraftContent } from "@/composer/draft/input-draft-core";
@@ -88,9 +83,7 @@ interface DraftStoreRuntimeState {
 type DraftStore = DraftStoreState & DraftStoreRuntimeState & DraftStoreActions;
 
 let gcScheduled = false;
-const draftPersistStorage = createDraftPersistStorage(
-  createValidatedPersistStorage(AsyncStorage, PersistedDraftStoreSchema),
-);
+const draftPersistStorage = createDraftPersistStorage(createQuoteAwareDraftStorage(AsyncStorage));
 
 export function flushDraftPersistStorage(): Promise<void> {
   return draftPersistStorage?.flush() ?? Promise.resolve();

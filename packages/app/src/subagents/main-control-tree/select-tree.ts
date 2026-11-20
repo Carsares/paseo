@@ -5,6 +5,7 @@ import {
   resolveAgentHierarchyDepth,
 } from "@getpaseo/protocol/agent-labels";
 import type { Agent } from "@/stores/session-store";
+import type { AgentAddress } from "@getpaseo/protocol/addresses";
 
 type TreeAgent = Pick<
   Agent,
@@ -25,12 +26,15 @@ export interface MainControlSession {
   agents: ReadonlyMap<string, TreeAgent>;
 }
 
-export interface MainControlTreeNode {
-  agentId: string;
+export interface MainControlTreeNode extends AgentAddress {
   depth: 0 | 1 | 2;
   title: string;
   processState: "active" | "terminated";
   children: MainControlTreeNode[];
+}
+
+export function mainControlTreeNodeKey({ serverId, agentId }: AgentAddress): string {
+  return `${serverId}:${agentId}`;
 }
 
 function getLocalParentId(session: MainControlSession, agentId: string): string | null {
@@ -53,29 +57,66 @@ function indexChildren(session: MainControlSession, include: (agent: TreeAgent) 
 
 export function selectMainControlTree({
   session,
+  agentMaps = {},
   mainAgentId,
   fallbackTitle,
+  pendingArchiveIds,
 }: {
   session: MainControlSession | undefined;
+  agentMaps?: Readonly<Record<string, MainControlSession["agents"]>>;
   mainAgentId: string;
   fallbackTitle: string;
+  pendingArchiveIds?: ReadonlySet<string>;
 }): MainControlTreeNode | null {
   const main = session?.agents.get(mainAgentId);
   if (!session || !main || !isMainControlAgent(main) || getParentAgentIdFromLabels(main.labels)) {
     return null;
   }
 
-  const childrenByParent = indexChildren(
-    session,
-    (agent) => !agent.archivedAt && !agent.background,
-  );
+  interface LocatedAgent {
+    serverId: string;
+    agent: TreeAgent;
+  }
+  const childrenByParent = new Map<string, LocatedAgent[]>();
+  for (const [serverId, agents] of Object.entries({
+    ...agentMaps,
+    [session.serverId]: session.agents,
+  })) {
+    for (const agent of agents.values()) {
+      const parent = getParentAddressFromLabels(agent.labels, serverId);
+      if (
+        !parent ||
+        agent.archivedAt ||
+        agent.background ||
+        pendingArchiveIds?.has(mainControlTreeNodeKey({ serverId, agentId: agent.id }))
+      )
+        continue;
+      const key = mainControlTreeNodeKey(parent);
+      const child = { serverId, agent };
+      const siblings = childrenByParent.get(key);
+      if (siblings) siblings.push(child);
+      else childrenByParent.set(key, [child]);
+    }
+  }
   const visited = new Set<string>();
-  const build = (agent: TreeAgent, depth: MainControlTreeNode["depth"]): MainControlTreeNode => {
-    visited.add(agent.id);
+  const build = (
+    { agent, serverId }: LocatedAgent,
+    depth: MainControlTreeNode["depth"],
+  ): MainControlTreeNode => {
+    const key = mainControlTreeNodeKey({ serverId, agentId: agent.id });
+    visited.add(key);
     const children =
       depth === 2
         ? []
-        : (childrenByParent.get(agent.id) ?? []).filter((child) => !visited.has(child.id));
+        : (childrenByParent.get(key) ?? []).filter(
+            (child) =>
+              !visited.has(
+                mainControlTreeNodeKey({
+                  serverId: child.serverId,
+                  agentId: child.agent.id,
+                }),
+              ),
+          );
     const active =
       !agent.archivedAt &&
       (agent.turn.phase === "open" ||
@@ -84,15 +125,16 @@ export function selectMainControlTree({
         (agent.backgroundWork?.count ?? 0) > 0);
     return {
       agentId: agent.id,
+      serverId,
       depth,
       title: agent.title?.trim() || fallbackTitle,
       processState: active ? "active" : "terminated",
       children: children
-        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+        .sort((a, b) => a.agent.createdAt.getTime() - b.agent.createdAt.getTime())
         .map((child) => build(child, depth === 0 ? 1 : 2)),
     };
   };
-  return build(main, 0);
+  return build({ agent: main, serverId: session.serverId }, 0);
 }
 
 export function isWorkspaceRootAgent(

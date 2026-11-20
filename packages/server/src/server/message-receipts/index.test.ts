@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, test } from "vitest";
@@ -74,5 +74,52 @@ test("a send that fails before beforeDispatch can be retried with the same messa
   await new MessageReceipts(directory).send(input);
   available = false;
   await requests.send(input);
+  expect(sends).toBe(1);
+});
+
+test("a confirmed refusal can be retried after the pending receipt was saved", async () => {
+  const { requests, directory } = await fixture();
+  const refusal = new Error("replacement was refused");
+  let attempts = 0;
+  const input = {
+    agentId: "agent",
+    messageId: "completion",
+    request: {},
+    retryIfUnsent: (error: unknown) => error === refusal,
+    send: async (beforeDispatch: () => Promise<void>) => {
+      await beforeDispatch();
+      if (++attempts === 1) throw refusal;
+    },
+  };
+  await expect(requests.send(input)).rejects.toThrow(refusal);
+  const restarted = new MessageReceipts(directory);
+  await restarted.send(input);
+  await restarted.send(input);
+  expect(attempts).toBe(2);
+});
+
+test("retry repairs a completion write without repeating the accepted dispatch", async () => {
+  const { requests, directory } = await fixture();
+  let receipt: string;
+  let sends = 0;
+  const input = {
+    agentId: "agent",
+    messageId: "completion",
+    request: {},
+    retryIfUnsent: () => false,
+    send: async (beforeDispatch: () => Promise<void>) => {
+      await beforeDispatch();
+      sends++;
+      const [file] = await readdir(directory);
+      receipt = path.join(directory, file!);
+      await rename(receipt, `${receipt}.pending`);
+      await mkdir(receipt);
+    },
+  };
+  await expect(requests.send(input)).rejects.toThrow();
+  await rm(receipt!, { recursive: true });
+  await rename(`${receipt!}.pending`, receipt!);
+  await requests.send(input);
+  await new MessageReceipts(directory).send(input);
   expect(sends).toBe(1);
 });

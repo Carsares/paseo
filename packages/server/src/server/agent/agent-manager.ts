@@ -7,6 +7,7 @@ import { projectTimelineRows } from "./timeline-projection.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
 import { applyRecordPatch } from "../record-patch.js";
+import type { FinishRegistration } from "./finish-subscriptions/index.js";
 import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import { randomUUID } from "node:crypto";
 import { basename, resolve } from "node:path";
@@ -80,6 +81,7 @@ import {
   type ProviderOptionsPatch,
 } from "./option-controls.js";
 import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
+import type { AgentWorkspaceMoveJournal } from "./agent-workspace-move-journal.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
   InMemoryAgentTimelineStore,
@@ -416,22 +418,46 @@ export interface MoveSubagentToWorkspaceAllocation {
   rollback?: () => Promise<void>;
 }
 
-export interface MoveSubagentToWorkspaceOptions {
-  idempotencyKey?: string;
-  allocateWorkspace: (
-    source: MoveSubagentToWorkspaceSource,
-  ) => Promise<MoveSubagentToWorkspaceAllocation>;
-}
+export type MoveSubagentToWorkspaceOptions = { idempotencyKey?: string } & (
+  | {
+      durable?: undefined;
+      allocateWorkspace: (
+        source: MoveSubagentToWorkspaceSource,
+      ) => Promise<MoveSubagentToWorkspaceAllocation>;
+    }
+  | {
+      durable: {
+        workspaceId: string;
+        journal: AgentWorkspaceMoveJournal;
+        publishWorkspace: (
+          source: MoveSubagentToWorkspaceSource,
+          beforeSave: () => Promise<void>,
+        ) => Promise<void>;
+      };
+    }
+);
 
-export interface MoveSubagentToWorkspaceResult {
+interface CommittedWorkspaceMove {
   record: StoredAgentRecord;
   live: boolean;
   sourceWorkspaceId: string;
   workspaceId: string;
   previousParentAgentId: string | null;
   movedDescendantStoredRecords?: StoredAgentRecord[];
-  replayed?: boolean;
+  replayed?: false;
 }
+
+export type MoveSubagentToWorkspaceResult =
+  | CommittedWorkspaceMove
+  | {
+      workspaceId: string;
+      replayed: true;
+      record?: StoredAgentRecord;
+      live?: boolean;
+      sourceWorkspaceId?: string;
+      previousParentAgentId?: string | null;
+      movedDescendantStoredRecords?: StoredAgentRecord[];
+    };
 
 export interface AgentManagerOptions {
   pluginLifecycle?: PluginLifecycle;
@@ -531,6 +557,7 @@ interface HandleStreamEventOptions {
 interface ManagedAgentBase {
   id: string;
   provider: AgentProvider;
+  providerAdapter?: AgentProvider;
   cwd: string;
   /**
    * Workspace this agent belongs to, stamped at creation. Independent of cwd:
@@ -975,9 +1002,13 @@ export class AgentManager {
   >();
   private readonly collectingRuntimes = new Set<string>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
-  private readonly moveToWorkspaceReceipts = new Map<string, MoveSubagentToWorkspaceResult>();
+  private readonly moveToWorkspaceReceipts = new Map<string, CommittedWorkspaceMove>();
   private readonly pendingSubagentMoveSnapshots = new Map<string, Promise<void>>();
   private readonly pendingHierarchySessionReloads = new Set<string>();
+  private readonly hierarchySessionUpdates = new Set<string>();
+  private readonly mainControlRoleUpdates = new Set<string>();
+  private readonly mainControlRoleVersions = new Map<string, number>();
+  private readonly launchMainControlRoleVersions = new WeakMap<AgentSessionConfig, number>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -1000,6 +1031,7 @@ export class AgentManager {
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
   private readonly beforeSteerUnavailableFallback?: AgentManagerOptions["beforeSteerUnavailableFallback"];
   private acceptingAgentRegistrations = true;
+  private runAdmissionPaused = false;
 
   constructor(options: AgentManagerOptions) {
     this.pluginLifecycle = options.pluginLifecycle;
@@ -1098,6 +1130,26 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+  }
+
+  pauseRunAdmission(): () => void {
+    this.runAdmissionPaused = true;
+    return () => {
+      this.runAdmissionPaused = false;
+    };
+  }
+
+  async waitForAdmittedRunsToStart(): Promise<void> {
+    // The foreground lane includes steers, commands and replacements already past
+    // their admission check. A replacement can reserve its new turn as it leaves the lane.
+    await Promise.all(this.foregroundMutationTails.values());
+    await Promise.all(Array.from(this.agents.keys(), (id) => this.runs.waitForForegroundStart(id)));
+  }
+
+  private assertAcceptingAgentRuns(): void {
+    if (this.runAdmissionPaused || !this.acceptingAgentRegistrations) {
+      throw new AgentManagerShuttingDownError();
+    }
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -1980,6 +2032,10 @@ export class AgentManager {
       );
       const timelineRows = buildImportedTimelineRows(imported.timeline);
       const initialTitle = resolveImportedAgentTitle(importedConfig, timelineRows);
+      const mainControlRoleVersion = this.launchMainControlRoleVersions.get(storedConfig);
+      if (mainControlRoleVersion !== undefined) {
+        this.launchMainControlRoleVersions.set(importedConfig, mainControlRoleVersion);
+      }
 
       handedToRegistration = true;
       const agent = await this.registerSession(imported.session, importedConfig, resolvedAgentId, {
@@ -2029,14 +2085,16 @@ export class AgentManager {
     {
       rehydrateFromDisk = false,
       hierarchyLabels,
+      refreshHierarchy = false,
     }: {
       rehydrateFromDisk?: boolean;
       hierarchyLabels?: Record<string, string>;
+      refreshHierarchy?: boolean;
     } = {},
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
-    if (this.hasInFlightRun(agentId)) {
+    if (this.shouldCancelRunForReload(existing, { hierarchyLabels, refreshHierarchy })) {
       await this.cancelAgentRunBefore(agentId, "reload");
       existing = this.requireSessionAgent(agentId);
     }
@@ -2174,6 +2232,23 @@ export class AgentManager {
     if (agent.runtimeInfo)
       agent.runtimeInfo = { ...agent.runtimeInfo, modeId: agent.currentModeId };
     this.touchUpdatedAt(agent);
+  }
+
+  private shouldCancelRunForReload(
+    agent: ManagedAgent,
+    options: { hierarchyLabels?: Record<string, string>; refreshHierarchy: boolean },
+  ): boolean {
+    if (options.hierarchyLabels) {
+      this.assertMainControlAgentIdle(agent.id);
+      return false;
+    }
+    if (options.refreshHierarchy) {
+      if (this.hasRunningHierarchyTurn(agent)) {
+        throw new Error("Cannot refresh hierarchy during an active turn.");
+      }
+      return false;
+    }
+    return this.hasInFlightRun(agent.id);
   }
 
   private async cleanUpReload(
@@ -2424,6 +2499,35 @@ export class AgentManager {
 
   async archiveAgent(agentId: string, archivedAt?: string): Promise<{ archivedAt: string }> {
     return this.runLifecycleMutation(agentId, () => this.archiveAgentUnlocked(agentId, archivedAt));
+  }
+
+  async archiveAgentInWorkspace(
+    agentId: string,
+    expectedWorkspaceId: string,
+  ): Promise<{ archivedAt: string; record: StoredAgentRecord | null }> {
+    return this.runLifecycleMutation(agentId, async () => {
+      const live = this.agents.get(agentId);
+      const stored = live?.internal ? null : await this.requireRegistry().get(agentId);
+      const workspaceId = live ? live.workspaceId : stored?.workspaceId;
+      if (workspaceId !== expectedWorkspaceId) {
+        throw new Error(`Agent ${agentId} is no longer in workspace ${expectedWorkspaceId}`);
+      }
+      if (!live) {
+        if (!stored) throw new Error(`Agent not found: ${agentId}`);
+        if (stored.archivedAt) return { archivedAt: stored.archivedAt, record: stored };
+        const archivedAt = new Date().toISOString();
+        const record = await this.archiveSnapshotUnlocked(agentId, archivedAt);
+        return { archivedAt: record.archivedAt ?? archivedAt, record };
+      }
+      if (this.hasInFlightRun(agentId)) await this.cancelAgentRun(agentId);
+      await this.clearAgentAttentionUnlocked(agentId).catch(() => undefined);
+      const { archivedAt } = await this.archiveAgentUnlocked(agentId);
+      const record = live.internal ? null : await this.requireRegistry().get(agentId);
+      if (!record && !live.internal) {
+        throw new Error(`Agent not found in storage after archive: ${agentId}`);
+      }
+      return { archivedAt: record?.archivedAt ?? archivedAt, record };
+    });
   }
 
   private async archiveAgentUnlocked(
@@ -2940,16 +3044,16 @@ export class AgentManager {
   }
 
   async setAgentMainControl(agentId: string, enabled: boolean): Promise<AgentRelationshipUpdate> {
-    return this.runHierarchyMutation(async () => {
-      const registry = this.requireRegistry();
-      const hierarchy = await this.readHierarchyAgents();
-      const agent = hierarchy.get(agentId);
-      const targetRecord = await registry.get(agentId);
-      if (!agent || !targetRecord || agent.archivedAt || targetRecord.archivedAt) {
-        throw new Error("Agent is missing or archived.");
-      }
-      const demoted: string[] = [];
-      try {
+    return this.runHierarchyMutation(() =>
+      this.runLifecycleMutation(agentId, async () => {
+        const registry = this.requireRegistry();
+        const hierarchy = await this.readHierarchyAgents();
+        const agent = hierarchy.get(agentId);
+        const targetRecord = await registry.get(agentId);
+        if (!agent || !targetRecord || agent.archivedAt || targetRecord.archivedAt) {
+          throw new Error("Agent is missing or archived.");
+        }
+        const workspaceId = agent.workspaceId ?? targetRecord.workspaceId;
         if (enabled) {
           const adapter = this.adapterOf(targetRecord.provider);
           if (adapter !== "codex" && adapter !== "claude" && adapter !== "opencode") {
@@ -2957,63 +3061,118 @@ export class AgentManager {
               `Provider '${targetRecord.provider}' does not support read-only Main Control.`,
             );
           }
-          const targetWorkspaceId = agent.workspaceId ?? targetRecord.workspaceId;
           if (
-            !targetWorkspaceId ||
+            !workspaceId ||
             getParentAgentIdFromLabels(agent.labels) ||
             getParentAgentIdFromLabels(targetRecord.labels)
           ) {
             throw new Error("Only a workspace root agent can be Main Control.");
           }
-          for (const other of hierarchy.values()) {
-            if (
-              other.id !== agentId &&
-              other.workspaceId === targetWorkspaceId &&
-              isMainControlAgentLabels(other.labels)
-            ) {
-              await this.runLifecycleMutation(other.id, async () => {
-                const record = await registry.get(other.id);
-                if (
-                  record &&
-                  !record.archivedAt &&
-                  record.workspaceId === targetWorkspaceId &&
-                  isMainControlAgentLabels(record.labels)
-                ) {
-                  demoted.push(other.id);
-                  await this.writeMainControlRole(other.id, false);
-                }
-              });
-            }
-          }
         }
-        return await this.runLifecycleMutation(agentId, async () => {
-          if (enabled) {
-            const current = this.agents.get(agentId);
-            const record = await registry.get(agentId);
-            if (!record || record.archivedAt) throw new Error("Agent is missing or archived.");
-            if (
-              !(current?.workspaceId ?? record.workspaceId) ||
-              getParentAgentIdFromLabels(current?.labels ?? record.labels)
-            ) {
-              throw new Error("Only a workspace root agent can be Main Control.");
-            }
-          }
-          return this.writeMainControlRole(agentId, enabled);
-        });
-      } catch (error) {
-        for (const previousMain of demoted.toReversed()) {
-          await this.runLifecycleMutation(previousMain, () =>
-            this.writeMainControlRole(previousMain, true),
-          ).catch((restoreError) => {
-            this.logger.error(
-              { err: restoreError, agentId: previousMain },
-              "Failed to restore previous Main Control",
-            );
-          });
-        }
-        throw error;
+        const previousMainIds = enabled
+          ? [...hierarchy.values()]
+              .filter(
+                (other) =>
+                  other.id !== agentId &&
+                  other.workspaceId === workspaceId &&
+                  isMainControlAgentLabels(other.labels),
+              )
+              .map((other) => other.id)
+          : [];
+        const withPreviousMainLanes = (index: number): Promise<AgentRelationshipUpdate> => {
+          const previousId = previousMainIds[index];
+          return previousId
+            ? this.runLifecycleMutation(previousId, () => withPreviousMainLanes(index + 1))
+            : this.changeMainControlRoles({ targetRecord, enabled, workspaceId, previousMainIds });
+        };
+        return withPreviousMainLanes(0);
+      }),
+    );
+  }
+
+  private async changeMainControlRoles({
+    targetRecord,
+    enabled,
+    workspaceId,
+    previousMainIds,
+  }: {
+    targetRecord: StoredAgentRecord;
+    enabled: boolean;
+    workspaceId: string | undefined;
+    previousMainIds: string[];
+  }): Promise<AgentRelationshipUpdate> {
+    const registry = this.requireRegistry();
+    const agentId = targetRecord.id;
+    const previousMains = (await Promise.all(previousMainIds.map((id) => registry.get(id)))).filter(
+      (record): record is StoredAgentRecord =>
+        Boolean(
+          record &&
+          !record.archivedAt &&
+          record.workspaceId === workspaceId &&
+          isMainControlAgentLabels(record.labels),
+        ),
+    );
+    const targetChanges = isMainControlAgentLabels(targetRecord.labels) !== enabled;
+    const changingIds = previousMains.map((record) => record.id);
+    if (targetChanges) changingIds.push(agentId);
+    for (const id of changingIds) this.assertMainControlAgentIdle(id);
+    // Run admission is synchronous. Reserve every changed agent before the first await so
+    // a prompt arriving during the reload waits in the existing lifecycle lane.
+    for (const id of changingIds) {
+      this.hierarchySessionUpdates.add(id);
+      this.mainControlRoleUpdates.add(id);
+    }
+    const demoted: string[] = [];
+    try {
+      for (const previousMain of previousMains) {
+        demoted.push(previousMain.id);
+        await this.writeMainControlRole(previousMain.id, false);
       }
-    });
+      return await this.writeMainControlRole(agentId, enabled);
+    } catch (error) {
+      for (const previousMain of demoted.toReversed()) {
+        await this.writeMainControlRole(previousMain, true).catch((restoreError) => {
+          this.logger.error(
+            { err: restoreError, agentId: previousMain },
+            "Failed to restore previous Main Control",
+          );
+        });
+      }
+      throw error;
+    } finally {
+      this.invalidateMainControlChildren(changingIds);
+      for (const id of changingIds) {
+        this.mainControlRoleUpdates.delete(id);
+        this.hierarchySessionUpdates.delete(id);
+      }
+    }
+  }
+
+  private invalidateMainControlChildren(changingIds: readonly string[]): void {
+    if (!changingIds.length) return;
+    // Also invalidate an opening session that already read the old hierarchy and
+    // won't be in the live map until its provider has finished opening.
+    for (const id of changingIds) {
+      this.mainControlRoleVersions.set(id, (this.mainControlRoleVersions.get(id) ?? 0) + 1);
+    }
+    for (const child of this.agents.values()) {
+      const parentId = this.localHierarchyParentId(child.labels);
+      if (parentId && this.mainControlRoleUpdates.has(parentId)) {
+        this.markHierarchySessionForRefresh(child);
+      }
+    }
+  }
+
+  private assertMainControlAgentIdle(agentId: string): void {
+    const live = this.agents.get(agentId);
+    if (
+      this.hasInFlightRun(agentId) ||
+      live?.activeTurnId ||
+      live?.lifecycle === "initializing" ||
+      (this.backgroundWork.summary(agentId)?.count ?? 0) > 0
+    ) {
+      throw new Error("Wait for active work to finish before changing Main Control.");
+    }
   }
 
   private async writeMainControlRole(
@@ -3111,6 +3270,7 @@ export class AgentManager {
     agentId: string,
     parentAgentId: string,
     serverId?: string,
+    prepareFinishSubscription?: () => Promise<FinishRegistration>,
   ): Promise<AgentParentUpdate> {
     return this.runHierarchyMutation(() =>
       this.runLifecycleMutation(agentId, async () => {
@@ -3129,12 +3289,20 @@ export class AgentManager {
         });
         const previousParentAgentId = getParentAgentIdFromLabels(agent.labels);
         const wasRunning = this.agents.get(agentId)?.lifecycle === "running";
-        const { record, live } = await this.writeLabels(agentId, {
-          [PARENT_AGENT_ID_LABEL]: parentAgentId,
-          [PARENT_SERVER_ID_LABEL]: serverId ?? null,
-          [REMOTE_HIERARCHY_DEPTH_LABEL]: null,
-        });
-        if (!record) throw new Error(`Agent not found after changing parent: ${agentId}`);
+        const registration =
+          wasRunning || this.hasInFlightRun(agentId)
+            ? await prepareFinishSubscription?.()
+            : undefined;
+        const { record, live } = await this.commitAgentParent(
+          agentId,
+          agent.labels,
+          {
+            [PARENT_AGENT_ID_LABEL]: parentAgentId,
+            [PARENT_SERVER_ID_LABEL]: serverId ?? null,
+            [REMOTE_HIERARCHY_DEPTH_LABEL]: null,
+          },
+          registration,
+        );
         if (!live) {
           this.paseoToolPolicies.delete(agentId);
           if (!record.internal) this.dispatchStoredAgentState(record);
@@ -3145,6 +3313,37 @@ export class AgentManager {
         return { record, live, previousParentAgentId, wasRunning };
       }),
     );
+  }
+
+  private async commitAgentParent(
+    agentId: string,
+    previousLabels: Record<string, string> | undefined,
+    patch: AgentLabelPatch,
+    registration: FinishRegistration | undefined,
+  ): Promise<AgentRelationshipUpdate> {
+    let result: WriteLabelsResult;
+    try {
+      result = await this.writeLabels(agentId, patch);
+      if (!result.record) throw new Error("Agent not found after changing parent: " + agentId);
+    } catch (error) {
+      // writeLabels updates the live labels before persisting them.
+      const liveAgent = this.agents.get(agentId);
+      if (liveAgent) {
+        const restore = Object.fromEntries(
+          Object.keys(patch).map((key) => [key, previousLabels?.[key] ?? null]),
+        );
+        liveAgent.labels = applyRecordPatch(liveAgent.labels, restore);
+      }
+      await registration?.reject().catch((cleanupError) => {
+        this.logger.warn(
+          { err: cleanupError, agentId },
+          "Failed to remove rejected parent subscription",
+        );
+      });
+      throw error;
+    }
+    registration?.accept();
+    return { record: result.record, live: result.live };
   }
 
   private runHierarchyMutation<T>(mutation: () => Promise<T>): Promise<T> {
@@ -3226,9 +3425,12 @@ export class AgentManager {
   ): Promise<MoveSubagentToWorkspaceResult> {
     const trimmedKey = options.idempotencyKey?.trim();
     const receiptKey = trimmedKey ? JSON.stringify([agentId, trimmedKey]) : null;
+    const durable = options.durable;
     if (receiptKey) {
       const receipt = this.moveToWorkspaceReceipts.get(receiptKey);
       if (receipt) return { ...receipt, replayed: true };
+      const workspaceId = await durable?.journal.findReceipt(receiptKey);
+      if (workspaceId) return { workspaceId, replayed: true };
     }
 
     const registry = this.requireRegistry();
@@ -3236,165 +3438,197 @@ export class AgentManager {
     const storedRecord = await registry.get(agentId);
     const source = describeSubagentMoveSource(agentId, liveAgent, storedRecord);
     const { sourceWorkspaceId, previousParentAgentId } = source;
-    const allocated = await options.allocateWorkspace(source);
-    const workspaceId = allocated.workspaceId?.trim();
-    const rollbackRecords: StoredAgentRecord[] = [];
+    const descendantIds = await this.findSameWorkspaceDescendantIds(
+      registry,
+      agentId,
+      sourceWorkspaceId,
+    );
+    const lockedIds = new Set(descendantIds);
+    // Match the archive cascade's lock order. Re-read the full path to the root
+    // after acquiring the lanes, since detach can run while they are queued.
+    const withDescendantLanes = <T>(index: number, operation: () => Promise<T>): Promise<T> =>
+      index === descendantIds.length
+        ? operation()
+        : this.runLifecycleMutation(descendantIds[index]!, () =>
+            withDescendantLanes(index + 1, operation),
+          );
     const liveMoves: {
       agent: LiveManagedAgent;
       labels: Record<string, string>;
       updatedAt: Date;
     }[] = [];
-    const movedDescendantStoredRecords: StoredAgentRecord[] = [];
-    let releaseSnapshots!: () => void;
-    const snapshotsReleased = new Promise<void>((release) => {
-      releaseSnapshots = release;
-    });
-
-    const move = async (
-      id: string,
-      stored: StoredAgentRecord | null,
-      live: LiveManagedAgent | undefined,
-      patch: AgentLabelPatch,
-    ): Promise<StoredAgentRecord | undefined> => {
-      if (!stored && !live?.internal) throw new Error(`Agent not found in storage: ${id}`);
-      const labels = applyRecordPatch(live?.labels ?? stored!.labels, patch);
-      if (live) {
-        this.pendingSubagentMoveSnapshots.set(id, snapshotsReleased);
-        const snapshot = { ...live, workspaceId, labels };
-        const updatedAt = this.touchUpdatedAt(snapshot);
-        liveMoves.push({ agent: live, labels, updatedAt });
-        if (live.internal) return;
-        rollbackRecords.push(stored!);
-        await registry.applySnapshot(snapshot);
-      } else {
-        rollbackRecords.push(stored!);
-        await registry.upsert({
-          ...stored!,
-          workspaceId,
-          labels,
-          updatedAt: this.nextStoredUpdatedAt(stored!),
-        });
-      }
-      const record = await registry.get(id);
-      if (record?.workspaceId !== workspaceId) {
-        throw new Error(`Agent move was not persisted: ${id}`);
-      }
-      return record;
-    };
-
-    const moveSameWorkspaceDescendants = async (descendantIds: string[]) => {
-      for (const id of descendantIds) {
-        const child = this.agents.get(id);
-        const stored = await registry.get(id);
-        if (
-          stored?.archivedAt ||
-          (child?.workspaceId ?? stored?.workspaceId)?.trim() !== sourceWorkspaceId
-        )
-          continue;
-        const labels = child?.labels ?? stored!.labels;
-        const moved = await move(
-          id,
-          stored,
-          child,
-          child?.internal ? {} : clearOpenAgentTabLabelPatch(labels),
-        );
-        if (!child && moved) movedDescendantStoredRecords.push(moved);
-      }
-    };
-
-    let record: StoredAgentRecord;
-    try {
-      if (!workspaceId || workspaceId === sourceWorkspaceId) {
-        throw new Error(`Move requires a different workspace: ${agentId}`);
-      }
-      const descendantIds = await this.findSameWorkspaceDescendantIds(
+    const result = await withDescendantLanes(0, async () => {
+      const currentIds = await this.findSameWorkspaceDescendantIds(
         registry,
         agentId,
         sourceWorkspaceId,
       );
-      // Hold descendant lifecycle lanes through commit or rollback so their label updates
-      // cannot overwrite the staged records. Acquire ancestors before their children.
-      const withDescendantLanes = (index: number, operation: () => Promise<void>): Promise<void> =>
-        index === descendantIds.length
-          ? operation()
-          : this.runLifecycleMutation(descendantIds[index]!, () =>
-              withDescendantLanes(index + 1, operation),
-            );
-      let movedRoot: StoredAgentRecord | undefined;
-      await withDescendantLanes(0, async () => {
-        try {
-          movedRoot = await move(
-            agentId,
-            storedRecord,
-            liveAgent,
-            detachedAgentLabelPatch(liveAgent?.labels ?? storedRecord!.labels),
-          );
-          if (!movedRoot) throw new Error(`Agent move was not persisted: ${agentId}`);
-          await moveSameWorkspaceDescendants(descendantIds);
-          // Apply live fields only once all writes succeed. Provider snapshots waiting on
-          // this move will see either the fully committed fields or the original ones.
-          for (const { agent, labels, updatedAt } of liveMoves) {
-            agent.workspaceId = workspaceId;
-            agent.labels = labels;
-            if (agent.updatedAt < updatedAt) agent.updatedAt = updatedAt;
-          }
-        } catch (error) {
-          for (const stored of rollbackRecords.toReversed()) {
-            try {
-              await registry.upsert(stored);
-            } catch (rollbackError) {
-              this.logger.error(
-                { err: rollbackError, agentId: stored.id },
-                "Failed to restore agent after move",
-              );
-            }
-          }
-          throw error;
-        } finally {
-          for (const { agent } of liveMoves) this.pendingSubagentMoveSnapshots.delete(agent.id);
-          releaseSnapshots();
-        }
-      });
-      record = movedRoot!;
-    } catch (error) {
-      await allocated
-        .rollback?.()
-        .catch((rollbackError) =>
-          this.logger.error(
-            { err: rollbackError, workspaceId },
-            "Failed to remove allocated workspace after move",
-          ),
-        );
-      throw error;
-    }
+      if (currentIds.some((id) => !lockedIds.has(id))) {
+        throw new Error("Workspace agents changed while preparing the move. Retry the move.");
+      }
 
-    const result: MoveSubagentToWorkspaceResult = {
-      record,
-      live: Boolean(liveAgent),
-      sourceWorkspaceId,
-      workspaceId,
-      previousParentAgentId,
-      ...(movedDescendantStoredRecords.length > 0 ? { movedDescendantStoredRecords } : {}),
+      const members = await Promise.all(
+        [agentId, ...currentIds].map(async (id) => ({
+          id,
+          live: this.agents.get(id),
+          stored: await registry.get(id),
+        })),
+      );
+      const before = members.flatMap(({ stored }) => (stored ? [stored] : []));
+      const rollbackRecords: StoredAgentRecord[] = [];
+      const storedUpdates: StoredAgentRecord[] = [];
+      let releaseSnapshots!: () => void;
+      const snapshotsReleased = new Promise<void>((release) => {
+        releaseSnapshots = release;
+      });
+      for (const { id, live } of members) {
+        if (live) this.pendingSubagentMoveSnapshots.set(id, snapshotsReleased);
+      }
+
+      const persistMember = async (
+        { id, live, stored }: (typeof members)[number],
+        workspaceId: string,
+      ): Promise<StoredAgentRecord | undefined> => {
+        if (!stored && !live?.internal) throw new Error(`Agent not found in storage: ${id}`);
+        const previousLabels = live?.labels ?? stored!.labels;
+        let patch: AgentLabelPatch = {};
+        if (id === agentId) patch = detachedAgentLabelPatch(previousLabels);
+        else if (!live?.internal) patch = clearOpenAgentTabLabelPatch(previousLabels);
+        const labels = applyRecordPatch(previousLabels, patch);
+        if (live) {
+          const snapshot = { ...live, workspaceId, labels };
+          const updatedAt = this.touchUpdatedAt(snapshot);
+          liveMoves.push({ agent: live, labels, updatedAt });
+          if (live.internal) return;
+          rollbackRecords.push(stored!);
+          await registry.applySnapshot(snapshot);
+        } else {
+          rollbackRecords.push(stored!);
+          await registry.upsert({
+            ...stored!,
+            workspaceId,
+            labels,
+            updatedAt: this.nextStoredUpdatedAt(stored!),
+          });
+        }
+        const moved = await registry.get(id);
+        if (moved?.workspaceId !== workspaceId) {
+          throw new Error(`Agent move was not persisted: ${id}`);
+        }
+        if (!live) storedUpdates.push(moved);
+        return moved;
+      };
+
+      let prepared = false;
+      let allocation: MoveSubagentToWorkspaceAllocation | undefined;
+      const rollback = async () => {
+        const reportError = (error: unknown) =>
+          this.logger.error({ err: error, agentId }, "Failed to roll back workspace move");
+        if (durable) {
+          if (prepared) await durable.journal.recover(registry).catch(reportError);
+          return;
+        }
+        for (const stored of rollbackRecords.toReversed()) {
+          await registry.upsert(stored).catch(reportError);
+        }
+        await allocation?.rollback?.().catch(reportError);
+      };
+
+      try {
+        let workspaceId: string;
+        if (options.durable) {
+          workspaceId = options.durable.workspaceId;
+        } else {
+          allocation = await options.allocateWorkspace(source);
+          workspaceId = allocation.workspaceId.trim();
+        }
+        if (!workspaceId || workspaceId === sourceWorkspaceId) {
+          throw new Error(`Move requires a different workspace: ${agentId}`);
+        }
+
+        let record: StoredAgentRecord | undefined;
+        const persistMembers = async () => {
+          for (const member of members) {
+            const moved = await persistMember(member, workspaceId);
+            if (member.id === agentId) record = moved;
+          }
+          if (!record) throw new Error(`Agent move was not persisted: ${agentId}`);
+        };
+        if (durable) {
+          await durable.journal.prepare(
+            {
+              workspaceId,
+              sourceWorkspaceId,
+              members: before.map(({ id, labels, updatedAt }) => ({ id, labels, updatedAt })),
+            },
+            receiptKey,
+          );
+          prepared = true;
+          await durable.publishWorkspace(source, persistMembers);
+          await durable.journal.commit(workspaceId).catch((error) => {
+            this.logger.warn(
+              { err: error, agentId, workspaceId },
+              "Failed to finalize move receipt",
+            );
+          });
+        } else {
+          await persistMembers();
+        }
+        for (const { agent, labels, updatedAt } of liveMoves) {
+          agent.workspaceId = workspaceId;
+          agent.labels = labels;
+          if (agent.updatedAt < updatedAt) agent.updatedAt = updatedAt;
+        }
+        return {
+          record: record!,
+          live: Boolean(liveAgent),
+          sourceWorkspaceId,
+          workspaceId,
+          previousParentAgentId,
+          storedUpdates,
+        };
+      } catch (error) {
+        await rollback();
+        throw error;
+      } finally {
+        for (const { id, live } of members) {
+          if (live) this.pendingSubagentMoveSnapshots.delete(id);
+        }
+        releaseSnapshots();
+      }
+    });
+
+    const { storedUpdates, ...moved } = result;
+    const committed: CommittedWorkspaceMove = {
+      ...moved,
+      ...(storedUpdates.some((record) => record.id !== agentId)
+        ? { movedDescendantStoredRecords: storedUpdates.filter((record) => record.id !== agentId) }
+        : {}),
     };
-    if (receiptKey) {
+    if (receiptKey && !durable) {
       if (this.moveToWorkspaceReceipts.size >= 256) {
         const oldest = this.moveToWorkspaceReceipts.keys().next();
         if (!oldest.done) this.moveToWorkspaceReceipts.delete(oldest.value);
       }
-      this.moveToWorkspaceReceipts.set(receiptKey, result);
+      this.moveToWorkspaceReceipts.set(receiptKey, committed);
     }
-    for (const { agent } of liveMoves) this.emitState(agent, { persist: false });
-    if (!liveAgent) this.paseoToolPolicies.delete(agentId);
-    if (this.agents.size > 0) this.refreshHierarchyToolPolicies(await this.readHierarchyAgents());
-    if (liveAgent) await this.refreshHierarchySessionUnlocked(agentId);
-    for (const { agent } of liveMoves) {
-      if (agent.id !== agentId) {
-        await this.runLifecycleMutation(agent.id, () =>
-          this.refreshHierarchySessionUnlocked(agent.id),
-        );
+    try {
+      for (const { agent } of liveMoves) this.emitState(agent, { persist: false });
+      for (const record of storedUpdates) this.dispatchStoredAgentState(record);
+      if (!liveAgent) this.paseoToolPolicies.delete(agentId);
+      if (this.agents.size > 0) this.refreshHierarchyToolPolicies(await this.readHierarchyAgents());
+      if (liveAgent) await this.refreshHierarchySessionUnlocked(agentId);
+      for (const { agent } of liveMoves) {
+        if (agent.id !== agentId) {
+          await this.runLifecycleMutation(agent.id, () =>
+            this.refreshHierarchySessionUnlocked(agent.id),
+          );
+        }
       }
+    } catch (error) {
+      this.logger.warn({ err: error, agentId }, "Failed to publish committed workspace move");
     }
-    return result;
+    return committed;
   }
 
   private async collectSameWorkspaceDescendantCandidates(
@@ -3767,6 +4001,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<boolean> {
+    this.assertAcceptingAgentRuns();
     if (this.collectingRuntimes.has(agentId) || !this.agents.has(agentId)) {
       await this.waitForAgentClose(agentId);
       await ensureAgentLoaded(agentId, {
@@ -3776,6 +4011,7 @@ export class AgentManager {
       });
     }
     const agent = await this.ensureInteractiveSession(agentId);
+    this.assertAcceptingAgentRuns();
     // Providers parse slash commands from the raw text, so a command another agent sent
     // must reach them without its sender envelope.
     const agentMessage = typeof prompt === "string" ? parseAgentMessage(prompt) : null;
@@ -3913,27 +4149,92 @@ export class AgentManager {
       this.pendingHierarchySessionReloads.delete(agentId);
       return;
     }
-    if (this.hasInFlightRun(agentId) || (!beforeTurn && agent.lifecycle !== "idle")) {
+    if (this.hasRunningHierarchyTurn(agent) || (!beforeTurn && agent.lifecycle !== "idle")) {
       this.pendingHierarchySessionReloads.add(agentId);
       return;
     }
     this.pendingHierarchySessionReloads.delete(agentId);
+    this.hierarchySessionUpdates.add(agentId);
     try {
-      await this.trackAgentRegistrationOperation(this.reloadAgentSessionInternal(agentId));
+      await this.trackAgentRegistrationOperation(
+        this.reloadAgentSessionInternal(agentId, undefined, { refreshHierarchy: true }),
+      );
     } catch (error) {
       this.logger.warn(
         { err: error, agentId },
         "Failed to refresh agent session after hierarchy change",
       );
+      if (this.agents.has(agentId)) this.pendingHierarchySessionReloads.add(agentId);
+      if (beforeTurn) throw error;
+    } finally {
+      this.hierarchySessionUpdates.delete(agentId);
     }
   }
 
+  private hasRunningHierarchyTurn(agent: ManagedAgent): boolean {
+    if (agent.pendingReplacement) {
+      // Between canceled and replacement turns, lifecycle remains running for the UI.
+      return Boolean(
+        agent.activeTurnId || agent.activeForegroundTurnId || this.runs.hasRun(agent.id),
+      );
+    }
+    return this.hasInFlightRun(agent.id);
+  }
+
   private needsHierarchySessionReload(agentId: string): boolean {
-    return this.pendingHierarchySessionReloads.has(agentId) && !this.hasInFlightRun(agentId);
+    const agent = this.agents.get(agentId);
+    return (
+      !!agent &&
+      this.pendingHierarchySessionReloads.has(agentId) &&
+      !this.hasRunningHierarchyTurn(agent)
+    );
+  }
+
+  private localHierarchyParentId(labels?: Record<string, string>): string | null {
+    return labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] ? null : getParentAgentIdFromLabels(labels);
+  }
+
+  private changingMainControlParent(agent: ManagedAgent): string | null {
+    const parentId = this.localHierarchyParentId(agent.labels);
+    return parentId &&
+      this.mainControlRoleUpdates.has(parentId) &&
+      !this.hasRunningHierarchyTurn(agent)
+      ? parentId
+      : null;
+  }
+
+  private refreshIfMainControlChangedWhileOpening(
+    agent: ManagedAgent,
+    openedConfig: AgentSessionConfig,
+  ): void {
+    const parentId = this.localHierarchyParentId(agent.labels);
+    const roleVersion = this.launchMainControlRoleVersions.get(openedConfig);
+    if (
+      parentId &&
+      roleVersion !== undefined &&
+      roleVersion !== (this.mainControlRoleVersions.get(parentId) ?? 0)
+    ) {
+      this.markHierarchySessionForRefresh(agent);
+    }
+  }
+
+  private markHierarchySessionForRefresh(agent: ManagedAgent): void {
+    if (agent.persistence && agent.capabilities.supportsSessionPersistence) {
+      this.pendingHierarchySessionReloads.add(agent.id);
+    }
   }
 
   private async ensureInteractiveSession(agentId: string): Promise<ActiveManagedAgent> {
-    const agent = this.requireSessionAgent(agentId);
+    while (this.hierarchySessionUpdates.has(agentId)) {
+      await this.waitForAgentClose(agentId);
+    }
+    let agent = this.requireSessionAgent(agentId);
+    let changingParent = this.changingMainControlParent(agent);
+    while (changingParent) {
+      await this.waitForAgentClose(changingParent);
+      agent = this.requireSessionAgent(agentId);
+      changingParent = this.changingMainControlParent(agent);
+    }
     if (this.historySessions.has(agent.session) || this.needsHierarchySessionReload(agentId)) {
       await this.runLifecycleMutation(agentId, () =>
         this.ensureInteractiveSessionUnlocked(agentId),
@@ -3985,12 +4286,26 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
-    if (this.collectingRuntimes.has(agentId) || (!this.agents.has(agentId) && this.registry))
+    this.assertAcceptingAgentRuns();
+    return this.reserveAgentRun(agentId, prompt, options);
+  }
+
+  private reserveAgentRun(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+  ): AsyncGenerator<AgentStreamEvent> {
+    if (
+      this.hierarchySessionUpdates.has(agentId) ||
+      this.collectingRuntimes.has(agentId) ||
+      (!this.agents.has(agentId) && this.registry)
+    )
       return this.streamAfterRuntimeCollection(agentId, prompt, options);
     const existingAgent = this.requireSessionAgent(agentId);
     if (
       this.historySessions.has(existingAgent.session) ||
-      this.needsHierarchySessionReload(agentId)
+      this.needsHierarchySessionReload(agentId) ||
+      this.changingMainControlParent(existingAgent)
     )
       return this.streamAfterHistoryLoad(agentId, prompt, options);
     this.logger.trace(
@@ -4193,7 +4508,8 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
-    this.requireSessionAgent(agentId);
+    this.assertAcceptingAgentRuns();
+    if (!this.hierarchySessionUpdates.has(agentId)) this.requireSessionAgent(agentId);
     return this.replaceRunInForegroundLane(agentId, prompt, options);
   }
 
@@ -4202,6 +4518,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentSteerOptions,
   ): Promise<SteerResult> {
+    this.assertAcceptingAgentRuns();
     const agent = this.requireSessionAgent(agentId);
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
     if (!expectedTurnId || !agent.session.steerActiveTurn) {
@@ -4236,9 +4553,11 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentSteerOptions,
   ): Promise<ActiveTurnSteerDispatchResult> {
+    this.assertAcceptingAgentRuns();
     // A turn that is still starting has no id to steer yet. Replacing it would drop its
     // prompt, so wait until it is accepted (or fails) and steer the turn it became.
     await this.runs.waitForForegroundStart(agentId);
+    this.assertAcceptingAgentRuns();
     const agent = this.requireSessionAgent(agentId);
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
     if (!expectedTurnId) {
@@ -4299,6 +4618,7 @@ export class AgentManager {
   ): Promise<T> {
     return this.runForegroundMutation(agent.id, async () => {
       await this.drainSessionEvents(agent.id);
+      this.assertAcceptingAgentRuns();
       this.agentStreamCoalescer.flushFor(agent.id);
       this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
       const barrier: SteerEventBarrier = { events: [] };
@@ -4380,6 +4700,13 @@ export class AgentManager {
     let stalledStart: PendingForegroundRun | null = null;
     for (;;) {
       const admission = await this.runForegroundMutation(agentId, async () => {
+        this.assertAcceptingAgentRuns();
+        if (this.hierarchySessionUpdates.has(agentId) && !assertAdmission) {
+          return {
+            status: "reserved" as const,
+            iterator: this.streamAgent(agentId, prompt, options),
+          };
+        }
         // Resolve the agent inside the lane: a reload while this send waited replaces it.
         const agent = this.requireSessionAgent(agentId);
         // A run that is still starting has no turn to interrupt yet. Canceling it would drop
@@ -4407,7 +4734,7 @@ export class AgentManager {
           }
           return {
             status: "reserved" as const,
-            iterator: this.streamAgent(agent.id, prompt, options),
+            iterator: this.reserveAgentRun(agent.id, prompt, options),
           };
         } catch (error) {
           agent.pendingReplacement = false;
@@ -5141,6 +5468,7 @@ export class AgentManager {
       this.assertAcceptingAgentRegistrations();
       this.runtimeCleanupIdentities.set(session, Object.freeze({ openedAt: Date.now() }));
       this.agents.set(resolvedAgentId, managed);
+      this.refreshIfMainControlChangedWhileOpening(managed, openedConfig);
       registered = true;
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
@@ -5303,6 +5631,7 @@ export class AgentManager {
     return {
       id: resolvedAgentId,
       provider: config.provider,
+      providerAdapter: this.adapterOf(config.provider),
       cwd: config.cwd,
       workspaceId: options?.workspaceId,
       owner: options?.owner,
@@ -6429,13 +6758,16 @@ export class AgentManager {
     options?: { messageId?: string; providerMessageId?: string; turnId?: string },
   ): void {
     const forkContext = extractSubmittedPromptForkContext(prompt);
-    const items = projectAgentMessages({
-      type: "user_message",
-      text: submittedPromptText(prompt),
-      clientMessageId,
-      ...(forkContext ? { forkContext } : {}),
-      ...(options?.messageId ? { messageId: options.messageId } : {}),
-    });
+    const items = projectAgentMessages(
+      {
+        type: "user_message",
+        text: submittedPromptText(prompt),
+        clientMessageId,
+        ...(forkContext ? { forkContext } : {}),
+        ...(options?.messageId ? { messageId: options.messageId } : {}),
+      },
+      { submitted: true },
+    );
     for (const item of items) {
       // Human attempts stay in history on rejection; delivery notifications require acceptance.
       if (outcome === "rejected" && item.type !== "user_message") continue;
@@ -6950,7 +7282,7 @@ export class AgentManager {
   }
 
   /** The adapter a provider id runs on: a custom provider is named by the one it extends. */
-  private adapterOf(provider: AgentProvider): AgentProvider {
+  adapterOf(provider: AgentProvider): AgentProvider {
     return resolveAdapter({
       provider,
       extendsOf: (id) => this.providerDefinitions.get(id)?.derivedFromProviderId,
@@ -6983,6 +7315,10 @@ export class AgentManager {
       purpose: options.purpose,
       resolveDefaultModel: options.resolveDefaultModel,
     });
+    const parentId = this.localHierarchyParentId(options.labels);
+    const mainControlRoleVersion = parentId
+      ? (this.mainControlRoleVersions.get(parentId) ?? 0)
+      : undefined;
     const hierarchy = await this.readHierarchyAgents();
     const agent = { id: agentId, labels: options.labels };
     const readAgent = (id: string) => (id === agentId ? agent : hierarchy.get(id));
@@ -7021,6 +7357,9 @@ export class AgentManager {
       }),
       hierarchyPrompt,
     );
+    if (mainControlRoleVersion !== undefined) {
+      this.launchMainControlRoleVersions.set(storedConfig, mainControlRoleVersion);
+    }
     return { storedConfig, launchConfig, paseoToolPolicy };
   }
 

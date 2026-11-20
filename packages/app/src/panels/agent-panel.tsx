@@ -125,6 +125,7 @@ interface ChatAgentStateShape {
   thinkingOptionId?: Agent["thinkingOptionId"];
   runtimeInfo?: Agent["runtimeInfo"];
   options?: Agent["options"];
+  subagentDraftOptions?: Agent["subagentDraftOptions"];
   controls?: Agent["controls"];
   lastError?: Agent["lastError"] | null;
 }
@@ -185,6 +186,7 @@ function selectChatAgentState(
     thinkingOptionId: agent.thinkingOptionId,
     runtimeInfo: agent.runtimeInfo,
     options: agent.options,
+    subagentDraftOptions: agent.subagentDraftOptions,
     controls: agent.controls,
     lastError: agent.lastError ?? null,
     archivedAt: agent.archivedAt ?? null,
@@ -213,6 +215,7 @@ function buildChatAgentFromState(
     thinkingOptionId: state.thinkingOptionId,
     runtimeInfo: state.runtimeInfo,
     options: state.options,
+    subagentDraftOptions: state.subagentDraftOptions,
     controls: state.controls,
     lastError: state.lastError ?? null,
     projectPlacement,

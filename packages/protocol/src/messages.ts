@@ -423,6 +423,7 @@ export const ProviderSnapshotEntrySchema = z.object({
   status: ProviderStatusSchema,
   enabled: z.boolean().optional().default(true),
   source: z.enum(["builtin", "custom"]).optional(),
+  derivedFromProviderId: AgentProviderSchema.optional(),
   error: z.string().optional(),
   models: z.array(AgentModelDefinitionSchema).optional(),
   modes: z.array(AgentModeSchema).optional(),
@@ -921,6 +922,7 @@ export const AgentSnapshotPayloadSchema = z.object({
   features: z.array(AgentFeatureSchema).optional(),
   /** Effective provider options: `config.json` defaults deep-merged with the agent's own. */
   options: ProviderOptionsSchema.optional(),
+  subagentDraftOptions: ProviderOptionsSchema.optional(),
   controls: z.array(AgentOptionControlSchema).optional(),
   thinkingOptionId: z.string().nullable().optional(),
   effectiveThinkingOptionId: z.string().nullable().optional(),
@@ -1039,6 +1041,7 @@ export const DeleteAgentRequestMessageSchema = z.object({
 export const ArchiveAgentRequestMessageSchema = z.object({
   type: z.literal("archive_agent_request"),
   agentId: z.string(),
+  expectedWorkspaceId: z.string().optional(),
   requestId: z.string(),
 });
 
@@ -1046,6 +1049,7 @@ export const CloseItemsRequestMessageSchema = z.object({
   type: z.literal("close_items_request"),
   agentIds: z.array(z.string()).default([]),
   terminalIds: z.array(z.string()).default([]),
+  expectedWorkspaceId: z.string().optional(),
   requestId: z.string(),
 });
 
@@ -1546,6 +1550,7 @@ export const SendAgentMessageRequestSchema = z.object({
   sourceAgentServerId: z.string().min(1).optional(),
   sessionMode: z.string().optional(),
   messageId: z.string().optional(), // Client-provided ID for deduplication
+  waitForDispatch: z.boolean().optional(),
   activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
   images: z.array(ImageAttachmentSchema).optional(),
   attachments: AgentAttachmentsSchema,
@@ -2102,6 +2107,7 @@ export const AgentTimelineSearchRequestMessageSchema = z.object({
   requestId: z.string(),
   query: z.string(),
   cursor: z.number().int().nonnegative().optional(),
+  hideAgentInteractions: z.boolean().optional(),
 });
 
 export const AgentTimelineListPromptsRequestMessageSchema = z.object({
@@ -2296,6 +2302,33 @@ export const AgentSetMainResponseMessageSchema = z.object({
     accepted: z.boolean(),
     enabled: z.boolean(),
     workspaceId: z.string().nullable(),
+    error: z.string().nullable(),
+  }),
+});
+
+export const AgentFinishReportSchema = z.object({
+  id: z.string(),
+  prompt: z.string(),
+  title: z.string(),
+  event: z.enum(["finished", "errored", "permission-required", "closed"]),
+});
+export type AgentFinishReport = z.infer<typeof AgentFinishReportSchema>;
+
+export const AgentPullFinishReportsRequestSchema = z.object({
+  type: z.literal("agent.finish_reports.pull.request"),
+  requestId: z.string(),
+  childAgentId: z.string().min(1),
+  parentAgentId: z.string().min(1),
+  acknowledged: z.array(z.string().min(1)).max(8),
+  observe: z.boolean().optional(),
+});
+
+export const AgentPullFinishReportsResponseSchema = z.object({
+  type: z.literal("agent.finish_reports.pull.response"),
+  payload: z.object({
+    requestId: z.string(),
+    ownsChild: z.boolean(),
+    reports: z.array(AgentFinishReportSchema).max(8),
     error: z.string().nullable(),
   }),
 });
@@ -3727,6 +3760,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   AgentMoveToWorkspaceRequestMessageSchema,
   AgentSetMainRequestMessageSchema,
   AgentSetParentRequestMessageSchema,
+  AgentPullFinishReportsRequestSchema,
   AgentRewindRequestMessageSchema,
   AgentPermissionResponseMessageSchema,
   DiffSubscribeRequestSchema,
@@ -4158,6 +4192,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentForkContext: z.boolean().optional(),
         // COMPAT(agentForkContextCursor): added in v0.1.108, remove gate after 2027-01-14.
         agentForkContextCursor: z.boolean().optional(),
+        // COMPAT(agentInitialPromptOrigin): added in v0.16.0, remove gate after 2027-05-19.
+        agentInitialPromptOrigin: z.boolean().optional(),
         // COMPAT(providerSubagents): added in v0.1.107, remove gate after 2027-01-12.
         providerSubagents: z.boolean().optional(),
         // COMPAT(agentBackgroundWork): added after v0.11.0-beta.5, remove gate after 2027-04-06.
@@ -4223,6 +4259,8 @@ export const ServerInfoStatusPayloadSchema = z
         canonicalSubmittedPrompts: z.boolean().optional(),
         agentMessageProvenance: z.boolean().optional(),
         agentMessageBatching: z.boolean().optional(),
+        agentMessageDispatchConfirmation: z.boolean().optional(),
+        agentFinishReportPull: z.boolean().optional(),
         // COMPAT(agentTurnIdentity): accept peers that observed pre-release v0.2.6 through 2027-01-31.
         agentTurnIdentity: z.boolean().optional(),
         // COMPAT(stableProjectIdentity): added in v0.1.109, remove gate after 2027-01-15.
@@ -5221,6 +5259,7 @@ export const AgentTimelineSearchResponseMessageSchema = z.object({
     requestId: z.string(),
     agentId: z.string(),
     epoch: z.string(),
+    agentInteractionsHidden: z.literal(true).optional(),
     locations: z.array(
       z.object({
         seq: z.number().int().nonnegative(),
@@ -7170,6 +7209,7 @@ export const DaemonUpdateResponseSchema = z.object({
     error: z.string().nullable(),
     previousVersion: z.string().nullable(),
     newVersion: z.string().nullable(),
+    agentResume: z.enum(["requested", "unverified"]).optional(),
   }),
 });
 
@@ -7661,6 +7701,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentMoveToWorkspaceResponseMessageSchema,
   AgentSetMainResponseMessageSchema,
   AgentSetParentResponseMessageSchema,
+  AgentPullFinishReportsResponseSchema,
   AgentRewindResponseMessageSchema,
   UpdateAgentResponseMessageSchema,
   ProjectRenameResponseSchema,

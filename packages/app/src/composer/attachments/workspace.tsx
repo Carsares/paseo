@@ -20,6 +20,7 @@ import {
 } from "./workspace-cleanup";
 import { useOptionalToast } from "@/contexts/toast-api-context";
 import { useClearReviewDraft } from "@/review/store";
+import { toErrorMessage } from "@/utils/error-messages";
 import { openForkSourceAgent } from "@/utils/navigate-to-agent";
 
 interface WorkspaceAttachmentBindingInput {
@@ -199,6 +200,8 @@ function useWorkspaceAttachmentBinding({
           serverId: attachment.source.serverId,
           sourceAgentId: attachment.source.agentId,
           onNotFound: () => toast?.error(t("agentPanel.states.notFound")),
+          onError: (error) =>
+            toast?.error(toErrorMessage(error) || t("workspace.terminal.hostDisconnected")),
         });
         return true;
       }

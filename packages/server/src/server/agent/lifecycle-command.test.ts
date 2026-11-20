@@ -98,6 +98,10 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
     return { archivedAt };
   }
 
+  async archiveAgentInWorkspace(): Promise<never> {
+    throw new Error("Guarded archive requires a real AgentManager");
+  }
+
   async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
     const existing = this.storage.records.get(agentId);
     if (!existing) {
@@ -415,7 +419,7 @@ describe("moveAgentToWorkspaceCommand", () => {
     return { ...storedAgent(randomUUID()), cwd, workspaceId: sourceWorkspaceId, labels };
   }
 
-  test("moves a running subagent and keeps the same provider session and turn", async () => {
+  test("moves a running subagent without interrupting it for a queued close from the old workspace", async () => {
     const turnStarted = deferred();
     const finishTurn = deferred();
     const closeSession = vi.fn(async () => {});
@@ -455,13 +459,18 @@ describe("moveAgentToWorkspaceCommand", () => {
       const move = moveAgentToWorkspaceCommand({ agentManager: manager }, agent.id, {
         allocateWorkspace,
       });
+      let staleClose: PromiseLike<unknown> | undefined;
       try {
         await Promise.race([writeStarted.promise, move]);
+        staleClose = expect(
+          manager.archiveAgentInWorkspace(agent.id, sourceWorkspaceId),
+        ).rejects.toThrow("is no longer in workspace");
         manager.notifyAgentState(agent.id);
       } finally {
         finishWrite.resolve();
       }
       const result = await move;
+      await staleClose;
       await manager.flush();
 
       expect(allocateWorkspace).toHaveBeenCalledExactlyOnceWith({
@@ -492,6 +501,67 @@ describe("moveAgentToWorkspaceCommand", () => {
       finishTurn.resolve();
       expect((await run).timeline).not.toHaveLength(0);
     }
+  });
+
+  test("a close queued for the old workspace cannot archive the moved agent", async () => {
+    const stored = closedSubagent();
+    await storage.upsert(stored);
+    const allocating = deferred();
+    const release = deferred();
+    const move = manager.moveSubagentToWorkspace(stored.id, {
+      allocateWorkspace: async () => {
+        allocating.resolve();
+        await release.promise;
+        return { workspaceId };
+      },
+    });
+
+    await allocating.promise;
+    const close = expect(
+      manager.archiveAgentInWorkspace(stored.id, sourceWorkspaceId),
+    ).rejects.toThrow("is no longer in workspace");
+    release.resolve();
+    await Promise.all([move, close]);
+
+    expect(await storage.get(stored.id)).toMatchObject({ workspaceId });
+    expect((await storage.get(stored.id))?.archivedAt).toBeFalsy();
+  });
+
+  test("rechecks the entire descendant path after a detach during candidate collection", async () => {
+    const root = closedSubagent();
+    const child = { ...closedSubagent(), labels: { [PARENT_AGENT_ID_LABEL]: root.id } };
+    const grandchild = { ...closedSubagent(), labels: { [PARENT_AGENT_ID_LABEL]: child.id } };
+    await Promise.all([root, child, grandchild].map((record) => storage.upsert(record)));
+    const listByWorkspaces = storage.listByWorkspaces.bind(storage);
+    const captured = deferred();
+    const release = deferred();
+    vi.spyOn(storage, "listByWorkspaces").mockImplementationOnce(async (ids) => {
+      const records = await listByWorkspaces(ids);
+      captured.resolve();
+      await release.promise;
+      return records;
+    });
+
+    const move = manager.moveSubagentToWorkspace(root.id, {
+      allocateWorkspace: async () => ({ workspaceId }),
+    });
+    await captured.promise;
+    try {
+      await manager.detachAgent(child.id);
+    } finally {
+      release.resolve();
+      await move;
+    }
+
+    expect(await storage.get(root.id)).toMatchObject({ workspaceId });
+    expect(await storage.get(child.id)).toMatchObject({
+      workspaceId: sourceWorkspaceId,
+      labels: {},
+    });
+    expect(await storage.get(grandchild.id)).toMatchObject({
+      workspaceId: sourceWorkspaceId,
+      labels: { [PARENT_AGENT_ID_LABEL]: child.id },
+    });
   });
 
   test("moves a closed subagent and updates stored workspace membership", async () => {

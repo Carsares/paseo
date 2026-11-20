@@ -6,6 +6,7 @@ import { i18n as testI18n } from "@/i18n/i18next";
 import { MessagePreview } from "./index";
 import { createUserMessageExpansion, type UserMessageExpansion } from "./expansion";
 import { UserMessageExpansionContext } from "./expansion-context";
+import { UserMessageBody } from "./message-body";
 
 // Load translations so the toggle exposes its real accessible name.
 void testI18n;
@@ -53,6 +54,48 @@ async function waitForLayout() {
 }
 
 describe("long user message preview", () => {
+  it("preserves the Python prompt in selected text alongside a quote card", () => {
+    const code = ">>> 1 + 1";
+    act(() => root.render(<UserMessageBody message={`${code}\n\n> Real quote`} />));
+    const range = document.createRange();
+    range.selectNodeContents(view().getByText(code, { exact: true }));
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    expect(selection.toString()).toBe(code);
+    expect(view().getAllByTestId("user-message-quote-block")).toHaveLength(1);
+    selection.removeAllRanges();
+  });
+
+  it("removes the message height limit while the quote is expanded", async () => {
+    const expansion = createUserMessageExpansion();
+    const message = `${longText
+      .split("\n")
+      .map((line) => `> ${line}`)
+      .join("\n")}\n\nReply`;
+    act(() =>
+      root.render(
+        <UserMessageExpansionContext.Provider value={expansion}>
+          <MessagePreview itemId="message-1">
+            <UserMessageBody message={message} />
+          </MessagePreview>
+        </UserMessageExpansionContext.Provider>,
+      ),
+    );
+    const quote = view().getByTestId("user-message-quote-block");
+    const toggle = view().getByTestId("user-message-quote-toggle");
+    const previewHeight = container.getBoundingClientRect().height;
+    act(() => toggle.click());
+    await waitForLayout();
+    expect(quote.getBoundingClientRect().height).toBeGreaterThan(240);
+    expect(container.getBoundingClientRect().bottom).toBeGreaterThanOrEqual(
+      quote.getBoundingClientRect().bottom,
+    );
+    act(() => toggle.click());
+    await waitForLayout();
+    expect(container.getBoundingClientRect().height).toBe(previewHeight);
+  });
+
   it("commits the control with the mount, so the first frame is the settled one", async () => {
     renderMessage(createUserMessageExpansion());
 

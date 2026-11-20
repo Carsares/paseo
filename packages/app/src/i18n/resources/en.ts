@@ -197,6 +197,7 @@ export const en = {
     },
     errors: {
       failedToSend: "Failed to send message",
+      removeQuotesForClaudeCommand: "Remove the quotes to run this Claude slash command.",
       failedToCreateAgent: "Failed to create agent",
       noHostSelected: "No host selected",
       initialPromptRequired: "Initial prompt is required",

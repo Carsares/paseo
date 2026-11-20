@@ -8,7 +8,10 @@ import {
   collectDaemonDiagnostics,
   type DaemonWebSocketRuntimeDiagnosticSnapshot,
 } from "./diagnostics.js";
-import { DaemonSelfUpdateSessionController } from "./daemon-self-update-session-controller.js";
+import {
+  DaemonSelfUpdateSessionController,
+  type DaemonSelfUpdateRestartIntent,
+} from "./daemon-self-update-session-controller.js";
 import type { ManagedAgent } from "../../agent/agent-manager.js";
 import type { PersistedProjectRecord, PersistedWorkspaceRecord } from "../../workspace-registry.js";
 import type { HubRelationshipManagement } from "../../hub/relationship-controller.js";
@@ -31,13 +34,8 @@ export interface DaemonRuntimeConfig {
 
 export interface DaemonSessionHost {
   emit(msg: SessionOutboundMessage): void;
-  emitLifecycleIntent(intent: {
-    type: "restart";
-    clientId: string;
-    requestId: string;
-    reason: string;
-    keepTerminals: boolean;
-  }): void;
+  prepareLifecycleIntent(intent: DaemonSelfUpdateRestartIntent): Promise<void>;
+  emitLifecycleIntent(intent: DaemonSelfUpdateRestartIntent): void;
 }
 
 export interface DaemonSessionOptions {
@@ -108,6 +106,7 @@ export class DaemonSession {
       daemonVersion: this.daemonVersion ?? null,
       desktopManaged: this.daemonRuntimeConfig?.desktopManaged === true,
       emit: (msg) => this.host.emit(msg),
+      prepareLifecycleIntent: (intent) => this.host.prepareLifecycleIntent(intent),
       emitLifecycleIntent: (intent) => this.host.emitLifecycleIntent(intent),
       sessionLogger: this.logger,
     });

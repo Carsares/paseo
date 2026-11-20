@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import { DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
 import { AfterPaintPublication } from "@/composer/after-paint-publication";
 import type { DraftInput } from "@/stores/draft-store";
+import { createWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
+import type { WorkspaceTab } from "@/workspace-tabs/model";
 import {
   canSwitchAgentProvider,
   performCrossProviderAgentHandoff,
@@ -13,7 +16,6 @@ vi.mock("@/hooks/use-archive-agent", () => ({ applyArchivedAgentCloseResults: vi
 vi.mock("@/stores/navigation-active-workspace-store", () => ({ navigateToWorkspace: vi.fn() }));
 vi.mock("@/stores/draft-store", () => ({ useDraftStore: vi.fn() }));
 vi.mock("@/stores/session-store", () => ({ useSessionStore: vi.fn() }));
-vi.mock("@/stores/workspace-layout-store", () => ({ useWorkspaceLayoutStore: vi.fn() }));
 vi.mock("@/subagents", () => import("@/subagents/close-tab-policy"));
 vi.mock("@/utils/client-id", () => ({ getOrCreateClientId: vi.fn() }));
 vi.mock("@/utils/confirm-dialog", () => ({ confirmDialog: vi.fn() }));
@@ -105,18 +107,38 @@ function createHandoff(agentOverrides: Partial<NonNullable<ReturnType<Deps["getA
     }),
   };
   const workspaceAttachmentsStore = { setWorkspaceAttachments: vi.fn() };
+  const getWorkspaceTabs = vi.fn<() => WorkspaceTab[]>(() => [
+    { tabId: paneContext.tabId, target: { kind: "agent", agentId: "agent-1" }, createdAt: 0 },
+  ]);
   const layoutStore = {
-    getWorkspaceTabs: vi.fn<ReturnType<Deps["getWorkspaceLayoutStore"]>["getWorkspaceTabs"]>(() => [
-      { tabId: paneContext.tabId, target: { kind: "agent", agentId: "agent-1" }, createdAt: 0 },
-    ]),
+    getWorkspaceTabs,
+    retainAgentTabForHandoff: vi.fn<
+      ReturnType<Deps["getWorkspaceLayoutStore"]>["retainAgentTabForHandoff"]
+    >(() => ({
+      isCurrent: () =>
+        getWorkspaceTabs().some(
+          (tab) =>
+            tab.tabId === paneContext.tabId &&
+            tab.target.kind === "agent" &&
+            tab.target.agentId === "agent-1",
+        ),
+      release: vi.fn(),
+    })),
     unpinAgent: vi.fn(),
     hideAgent: vi.fn(),
   };
   const deps = {
     supportsAgentForkContext: true,
+    supportsAgentInitialPromptOrigin: vi.fn(() => true),
     client,
     paneContext,
     getAgent: vi.fn<Deps["getAgent"]>(() => agent),
+    hasUnsettledMessage: vi.fn(() => false),
+    confirmSourceArchived: vi.fn<Deps["confirmSourceArchived"]>(async () => false),
+    takeQueuedMessages: vi.fn<Deps["takeQueuedMessages"]>(() => ({
+      messages: [],
+      restore: vi.fn(),
+    })),
     getComposerInput: vi.fn<Deps["getComposerInput"]>(() => composerInput),
     getDraftStore: () => draftStore,
     getWorkspaceAttachmentsStore: () => workspaceAttachmentsStore,
@@ -230,6 +252,7 @@ describe("performCrossProviderAgentHandoff", () => {
       setup: {
         provider: "codex",
         cwd: "/workspace/project",
+        restoreChatHistory: true,
         modeId: "mode-1",
         model: "model-1",
         thinkingOptionId: "high",
@@ -239,6 +262,7 @@ describe("performCrossProviderAgentHandoff", () => {
     expect(deps.archiveAgent).toHaveBeenCalledExactlyOnceWith({
       serverId: "host-1",
       agentId: "agent-1",
+      expectedWorkspaceId: "workspace-1",
     });
     expect(client.buildAgentForkContext).toHaveBeenCalledBefore(
       workspaceAttachmentsStore.setWorkspaceAttachments,
@@ -247,7 +271,7 @@ describe("performCrossProviderAgentHandoff", () => {
     expect(workspaceAttachmentsStore.setWorkspaceAttachments).toHaveBeenCalledBefore(
       paneContext.retargetCurrentTab,
     );
-    expect(layoutStore.hideAgent).toHaveBeenCalledBefore(paneContext.retargetCurrentTab);
+    expect(paneContext.retargetCurrentTab).toHaveBeenCalledBefore(layoutStore.hideAgent);
     expect(deps.archiveAgent).toHaveBeenCalledBefore(
       workspaceAttachmentsStore.setWorkspaceAttachments,
     );
@@ -318,7 +342,124 @@ describe("performCrossProviderAgentHandoff", () => {
     expect(deps.archiveAgent).toHaveBeenCalledExactlyOnceWith({
       serverId: "host-1",
       agentId: "agent-1",
+      expectedWorkspaceId: "workspace-1",
     });
+  });
+
+  it.each(["removed", "reply lost", "closed", "reopened", "replaced"] as const)(
+    "handles an archive whose source is %s before the reply",
+    async (change) => {
+      const layout = createWorkspaceLayoutStore(undefined, {
+        getItem: () => null,
+        setItem: () => {},
+        removeItem: () => {},
+      });
+      const { deps, run, draftStore, workspaceAttachmentsStore, composerInput } = createHandoff();
+      const sourceTarget = { kind: "agent", agentId: "agent-1" } as const;
+      const replacement = { kind: "agent", agentId: "agent-2" } as const;
+      const tabId = layout.getState().openTab({
+        workspaceKey,
+        target: sourceTarget,
+        intent: "reveal",
+      });
+      if (!tabId) throw new Error("Expected a source tab");
+      const retargetCurrentTab = vi.fn<NonNullable<Deps["paneContext"]>["retargetCurrentTab"]>(
+        (target) => {
+          layout.getState().replaceTab(workspaceKey, tabId, target);
+        },
+      );
+      const queuedFile = {
+        kind: "workspace_file",
+        path: "queued.ts",
+        selection: { kind: "whole_file" },
+      } as const;
+      deps.takeQueuedMessages.mockReturnValue({
+        messages: [
+          { id: "queued-1", text: "First queued prompt", attachments: [queuedFile] },
+          { id: "queued-2", text: "Second queued prompt", attachments: [] },
+        ],
+        restore: vi.fn(),
+      });
+
+      deps.archiveAgent.mockImplementationOnce(async () => {
+        if (change === "closed" || change === "reopened") {
+          layout.getState().closeTab(workspaceKey, tabId);
+        }
+        if (change === "reopened") {
+          layout.getState().openTab({ workspaceKey, target: sourceTarget, intent: "reveal" });
+        }
+        if (change === "replaced") {
+          layout.getState().replaceTab(workspaceKey, tabId, replacement);
+        }
+        // The active-directory removal and its reconciliation both precede the archive reply.
+        deps.getAgent.mockReturnValue(null);
+        deps.getComposerInput.mockReturnValue(null);
+        draftStore.getDraftInput.mockReturnValue(undefined);
+        const activeAgentIds = [];
+        if (change === "replaced") activeAgentIds.push("agent-2");
+        if (change === "reopened") activeAgentIds.push("agent-1");
+        layout.getState().reconcileTabs(workspaceKey, {
+          agentsHydrated: true,
+          activeAgentIds,
+          autoOpenAgentIds: [],
+          terminalsHydrated: true,
+          standaloneTerminalIds: [],
+        });
+        if (change === "removed" || change === "reply lost") {
+          expect(layout.getState().getWorkspaceTabs(workspaceKey)[0]?.target).toEqual(sourceTarget);
+        }
+        if (change === "reply lost") {
+          throw new DaemonConnectionError("Archive reply timed out", "DAEMON_REQUEST_TIMEOUT");
+        }
+      });
+      deps.confirmSourceArchived.mockResolvedValueOnce(change === "reply lost");
+
+      const switched = await run({
+        paneContext: { ...deps.paneContext, tabId, retargetCurrentTab },
+        getWorkspaceLayoutStore: layout.getState,
+      });
+      const shouldSwitch = change === "removed" || change === "reply lost";
+      expect(switched).toBe(shouldSwitch);
+      expect(deps.confirmSourceArchived).toHaveBeenCalledTimes(Number(change === "reply lost"));
+      if (!shouldSwitch) {
+        expect(retargetCurrentTab).not.toHaveBeenCalled();
+        expect(draftStore.saveDraftInput).not.toHaveBeenCalled();
+        expect(
+          layout
+            .getState()
+            .getWorkspaceTabs(workspaceKey)
+            .map((tab) => tab.target)
+            .filter((target) => target.kind === "agent" || target.kind === "draft"),
+        ).toEqual(change === "closed" ? [] : [change === "replaced" ? replacement : sourceTarget]);
+        return;
+      }
+      expect(layout.getState().getWorkspaceTabs(workspaceKey)[0]?.target).toMatchObject({
+        kind: "draft",
+        draftId: "draft-1",
+      });
+      expect(draftStore.saveDraftInput).toHaveBeenCalledExactlyOnceWith({
+        draftKey: targetDraftKey,
+        draft: {
+          text: "First queued prompt\n\nSecond queued prompt\n\n  Continue here.  ",
+          attachments: [queuedFile, ...composerInput.attachments],
+        },
+      });
+      expect(workspaceAttachmentsStore.setWorkspaceAttachments).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("requires user prompt origin support only for handoffs that keep a parent", async () => {
+    const parented = createHandoff({ parentAgentId: "parent-1" });
+    parented.deps.supportsAgentInitialPromptOrigin.mockReturnValue(false);
+    expect(await parented.run()).toBe(false);
+    expect(parented.deps.toast.error).toHaveBeenCalledWith("message.actions.forkUnavailable");
+    expect(parented.client.buildAgentForkContext).not.toHaveBeenCalled();
+    expect(parented.client.updateAgent).not.toHaveBeenCalled();
+    parented.expectSourceUntouched();
+
+    const root = createHandoff();
+    root.deps.supportsAgentInitialPromptOrigin.mockReturnValue(false);
+    expect(await root.run()).toBe(true);
   });
 
   it("releases this client's open-tab label and keeps an attached subagent unarchived", async () => {
@@ -344,6 +485,7 @@ describe("performCrossProviderAgentHandoff", () => {
       setup: {
         provider: "codex",
         cwd: "/workspace/project",
+        restoreChatHistory: true,
         parentAgentId: "new-parent",
         modeId: null,
         model: null,
@@ -369,6 +511,7 @@ describe("performCrossProviderAgentHandoff", () => {
     expect(deps.archiveAgent).toHaveBeenCalledExactlyOnceWith({
       serverId: "host-1",
       agentId: "agent-1",
+      expectedWorkspaceId: "workspace-1",
     });
   });
 
@@ -449,14 +592,35 @@ describe("performCrossProviderAgentHandoff", () => {
   it("leaves the source intact until archive succeeds and reports a failed archive", async () => {
     const { deps, run, expectSourceUntouched } = createHandoff();
     const archive = Promise.withResolvers<void>();
+    const restore = vi.fn();
+    deps.takeQueuedMessages.mockReturnValue({
+      messages: [{ id: "queued", text: "Still waiting", attachments: [] }],
+      restore,
+    });
     deps.archiveAgent.mockReturnValueOnce(archive.promise);
     const handoff = run();
     await vi.waitFor(() => expect(deps.archiveAgent).toHaveBeenCalledOnce());
     expectSourceUntouched();
+    expect(restore).not.toHaveBeenCalled();
     archive.reject(new Error("Archive refused"));
     expect(await handoff).toBe(false);
+    expect(restore).toHaveBeenCalledOnce();
     expectSourceUntouched();
     expect(deps.toast.error).toHaveBeenCalledExactlyOnceWith("Archive refused");
+  });
+
+  it("preserves the source and its queue when a message starts sending during history collection", async () => {
+    const { client, deps, run, expectSourceUntouched } = createHandoff();
+    client.buildAgentForkContext.mockImplementationOnce(async () => {
+      deps.hasUnsettledMessage.mockReturnValue(true);
+      return forkPayload;
+    });
+
+    expect(await run()).toBe(false);
+    expect(deps.takeQueuedMessages).not.toHaveBeenCalled();
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expect(deps.toast.error).toHaveBeenCalledExactlyOnceWith("composer.errors.alreadyLoading");
+    expectSourceUntouched();
   });
 
   it("shows a message on unsupported hosts and leaves the tab untouched", async () => {

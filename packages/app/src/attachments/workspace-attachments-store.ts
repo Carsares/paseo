@@ -41,6 +41,7 @@ export type WorkspaceAttachmentScope =
 
 interface WorkspaceAttachmentsStoreState {
   attachmentsByScope: Record<string, readonly WorkspaceComposerAttachment[]>;
+  draftHistoryHydrated: boolean;
 }
 
 interface WorkspaceAttachmentsStoreActions {
@@ -53,6 +54,7 @@ interface WorkspaceAttachmentsStoreActions {
     attachment: WorkspaceComposerAttachment;
   }) => void;
   clearWorkspaceAttachments: (input: { scopeKey: string }) => void;
+  clearDraftChatHistory: (input: { draftId: string }) => void;
 }
 
 type WorkspaceAttachmentsStore = WorkspaceAttachmentsStoreState & WorkspaceAttachmentsStoreActions;
@@ -136,16 +138,17 @@ export function createWorkspaceAttachmentsStore(
 ) {
   // A clear before hydration is an intentional edit even if the in-memory scope is empty.
   const editedBeforeHydration = new Set<string>();
-  let hydrated = false;
   let lastStored: string | null = null;
   let writes = Promise.resolve();
   const store = create<WorkspaceAttachmentsStore>()((set, get) => ({
     attachmentsByScope: {},
+    draftHistoryHydrated: false,
     setWorkspaceAttachments: ({ scopeKey, attachments }) => {
-      const current = get().attachmentsByScope[scopeKey] ?? EMPTY_WORKSPACE_ATTACHMENTS;
+      const { attachmentsByScope, draftHistoryHydrated } = get();
+      const current = attachmentsByScope[scopeKey] ?? EMPTY_WORKSPACE_ATTACHMENTS;
       const changed = !areWorkspaceAttachmentsEqual(current, attachments);
-      if (scopeKey.startsWith(DRAFT_SCOPE_PREFIX) && (changed || !hydrated)) {
-        if (!hydrated) editedBeforeHydration.add(scopeKey);
+      if (scopeKey.startsWith(DRAFT_SCOPE_PREFIX) && (changed || !draftHistoryHydrated)) {
+        if (!draftHistoryHydrated) editedBeforeHydration.add(scopeKey);
         queueWrite();
       }
       if (!changed) return;
@@ -166,9 +169,20 @@ export function createWorkspaceAttachmentsStore(
     clearWorkspaceAttachments: ({ scopeKey }) => {
       get().setWorkspaceAttachments({ scopeKey, attachments: EMPTY_WORKSPACE_ATTACHMENTS });
     },
+    clearDraftChatHistory: ({ draftId }) => {
+      const scopeKey = buildDraftWorkspaceAttachmentScopeKey(draftId);
+      const current = get().attachmentsByScope[scopeKey] ?? EMPTY_WORKSPACE_ATTACHMENTS;
+      get().setWorkspaceAttachments({
+        scopeKey,
+        attachments: current.some((item) => item.kind === "chat_history")
+          ? current.filter((item) => item.kind !== "chat_history")
+          : current,
+      });
+    },
   }));
 
   async function hydrate() {
+    let attachmentsByScope: WorkspaceAttachmentsStoreState["attachmentsByScope"] | undefined;
     try {
       lastStored = await storage.getItem(STORAGE_KEY);
       if (!lastStored) return;
@@ -191,12 +205,15 @@ export function createWorkspaceAttachmentsStore(
         });
         if (attachments.length > 0) restored[scopeKey] = attachments;
       }
-      store.setState({ attachmentsByScope: restored });
+      attachmentsByScope = restored;
     } catch {
       // Unreadable storage does not prevent the composer from using its in-memory attachments.
     } finally {
-      hydrated = true;
       editedBeforeHydration.clear();
+      store.setState({
+        draftHistoryHydrated: true,
+        ...(attachmentsByScope ? { attachmentsByScope } : {}),
+      });
     }
   }
   const hydration = hydrate();
@@ -227,6 +244,16 @@ export function createWorkspaceAttachmentsStore(
 }
 
 export const useWorkspaceAttachmentsStore = createWorkspaceAttachmentsStore();
+
+export function isDraftChatHistoryReady(
+  state: WorkspaceAttachmentsStoreState,
+  scopeKey: string,
+): boolean {
+  return (
+    state.draftHistoryHydrated ||
+    state.attachmentsByScope[scopeKey]?.some((item) => item.kind === "chat_history") === true
+  );
+}
 
 export function useWorkspaceAttachmentScopeKey(input: WorkspaceAttachmentScope): string {
   const isDraftScope = input.kind === "draft";

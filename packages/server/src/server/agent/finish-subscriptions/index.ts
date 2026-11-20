@@ -2,6 +2,7 @@ import { setTimeout as pause } from "node:timers/promises";
 import { HostObservationError, type ToolHosts } from "../host-operations/index.js";
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
+import type { AgentFinishReport } from "@getpaseo/protocol/messages";
 import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
 import type { FinishObservationResult } from "./internal/observation-buffer.js";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
@@ -21,6 +22,11 @@ export interface FinishSubscription {
   serverId?: string;
   /** Creation subscriptions stop reporting after the child is detached. */
   requireParentOwnership?: boolean;
+  /** Allows the parent to fetch a notification-triggered turn on its forward connection. */
+  followupReport?: boolean;
+  /** Authenticated source of a remote observation binding. */
+  pullSourceId?: string;
+  report?: AgentFinishReport;
 }
 export interface FinishSubscriptionStore {
   list(): Promise<FinishSubscription[]>;
@@ -36,6 +42,11 @@ export interface FinishObservation {
 }
 interface Dependencies extends FinishObservation {
   store: FinishSubscriptionStore;
+  followups?: {
+    watches: FinishSubscriptionStore;
+    reports: FinishSubscriptionStore;
+    dispatch(record: FinishSubscription, report: AgentFinishReport): Promise<void>;
+  };
   messages(): AgentMessageDelivery;
   hosts?(): ToolHosts;
   callerIsActive(agentId: string): Promise<boolean>;
@@ -57,6 +68,18 @@ export interface FinishSubscriptions {
     input: Omit<FinishSubscription, "id">,
     pendingDispatch?: boolean,
   ): Promise<FinishRegistration>;
+  trackRemoteChild(input: Omit<FinishSubscription, "id">): Promise<void>;
+  pullReports(
+    address: {
+      childAgentId: string;
+      callerAgentId: string;
+      callerServerId: string;
+      sourceId: string;
+    },
+    acknowledged: string[],
+    observe: boolean,
+    childState: "active" | "archived" | "unrelated",
+  ): Promise<{ ownsBinding: boolean; reports: AgentFinishReport[] }>;
   close(): Promise<void>;
 }
 interface Watch {
@@ -67,7 +90,7 @@ interface Watch {
   pending: boolean;
   task?: Promise<void>;
 }
-function key(record: FinishSubscription): string {
+function key(record: Omit<FinishSubscription, "id">): string {
   return JSON.stringify([
     record.callerAgentId,
     record.childAgentId,
@@ -80,6 +103,16 @@ function key(record: FinishSubscription): string {
 export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptions {
   const tasks = new Set<Promise<void>>();
   const watches = new Map<string, Set<Watch>>();
+  const followupWatches = new Map<string, AbortController>();
+  let reportMutations = Promise.resolve();
+  function serializeReports<T>(action: () => Promise<T>): Promise<T> {
+    const result = reportMutations.then(action);
+    reportMutations = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
   let closed = false;
   let recovering = true;
   const registering = new Map<string, number>();
@@ -177,20 +210,57 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     if (result.status === "permission") return "needs permission";
     return result.reason ?? "finished";
   }
+  function notificationId(subscriptionId: string, permissionId?: string): string {
+    return permissionId ? subscriptionId + ":" + permissionId : subscriptionId;
+  }
+
+  async function deliverRemote(
+    record: FinishSubscription & { callerServerId: string },
+    childServerId: string,
+    prompt: string,
+    messageId: string,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (!deps.hosts) throw new Error("Remote finish delivery is unavailable");
+    return deps.hosts().use(
+      record.callerServerId,
+      async (client) => {
+        const caller = (await client.fetchAgent(record.callerAgentId))?.agent;
+        if (!caller || caller.archivedAt) return false;
+        const receipt = await client.sendMessage(record.callerAgentId, prompt, {
+          messageId,
+          sourceAgentId: record.childAgentId,
+          sourceAgentServerId: childServerId,
+          activeTurnBehavior: "steer",
+          waitForDispatch: true,
+        });
+        if (receipt.deliveryStatus === "queued")
+          throw new Error("Remote finish notification has not been dispatched");
+        return true;
+      },
+      signal,
+    );
+  }
+
+  function permissionRequests(result: FinishObservationResult, notified: Set<string>) {
+    const requests = result.final?.pendingPermissions ?? [];
+    for (const id of notified)
+      if (!requests.some((request) => request.id === id)) notified.delete(id);
+    return requests.filter((request) => !notified.has(request.id));
+  }
+
   async function deliver(
     record: FinishSubscription,
     result: FinishObservationResult,
     permissions: Set<string>,
+    savedFollowups: Set<string>,
     signal: AbortSignal,
   ): Promise<boolean> {
-    const requests = result.final?.pendingPermissions ?? [];
+    const requests = permissionRequests(result, permissions);
     const reason = reasonFor(result);
-    for (const id of permissions)
-      if (!requests.some((request) => request.id === id)) permissions.delete(id);
     const acknowledgments: Promise<unknown>[] = [];
     for (const request of reason === "needs permission" ? requests : [undefined]) {
       if (signal.aborted) return false;
-      if (request && permissions.has(request.id)) continue;
       const title = result.final?.title ?? record.childAgentId;
       const childServerId = record.serverId ?? deps.serverId;
       const prompt = formatFinishNotificationBody({
@@ -201,23 +271,40 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         lastAssistantMessage: result.lastMessage,
         permissionRequest: request,
       });
-      if (record.callerServerId) {
-        if (!deps.hosts) throw new Error("Remote finish delivery is unavailable");
-        const active = await deps.hosts().use(
-          record.callerServerId,
-          async (client) => {
-            const caller = (await client.fetchAgent(record.callerAgentId))?.agent;
-            if (!caller || caller.archivedAt) return false;
-            await client.sendMessage(record.callerAgentId, prompt, {
-              messageId: request ? `${record.id}:${request.id}` : record.id,
-              sourceAgentId: record.childAgentId,
-              sourceAgentServerId: childServerId,
-              activeTurnBehavior: "steer",
+      const id = notificationId(record.id, request?.id);
+      const followups = record.followupReport ? deps.followups : undefined;
+      if (followups) {
+        const bound = await serializeReports(async () => {
+          const binding = (await followups.watches.list()).find(
+            (entry) => entry.id === key(record),
+          );
+          if (!savedFollowups.has(id)) {
+            // The turn can finish before the origin's first poll. Keep the result across
+            // supersession and restart, even if a reverse route cannot be opened.
+            await followups.reports.put({
+              ...record,
+              id,
+              pullSourceId: binding?.pullSourceId,
+              report: { id, prompt, title, event: finishNotificationEvents[reason] },
             });
-            return true;
-          },
+            savedFollowups.add(id);
+          }
+          return Boolean(binding);
+        });
+        if (bound) {
+          if (request) permissions.add(request.id);
+          continue;
+        }
+      }
+      if (record.callerServerId) {
+        const active = await deliverRemote(
+          { ...record, callerServerId: record.callerServerId },
+          childServerId,
+          prompt,
+          id,
           signal,
         );
+        if (followups) await serializeReports(() => followups.reports.remove(id));
         if (!active) return true;
         if (request) permissions.add(request.id);
         continue;
@@ -243,9 +330,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       );
     }
     await abortable(Promise.all(acknowledgments), signal);
-    if (signal.aborted) return false;
-    if (reason !== "needs permission") return true;
-    return false;
+    return !signal.aborted && reason !== "needs permission";
   }
   async function run(watch: Watch, group: Set<Watch>): Promise<void> {
     const signal = watch.controller.signal;
@@ -257,6 +342,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       ),
     };
     const permissions = new Set<string>();
+    const savedFollowups = new Set<string>();
     let observation: FinishObservationSession | undefined;
     let pending: FinishObservationResult | undefined;
     let acknowledged = false;
@@ -307,7 +393,8 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
             stop(watch, group);
             return;
           }
-          if (!acknowledged) acknowledged = await deliver(record, pending, permissions, signal);
+          if (!acknowledged)
+            acknowledged = await deliver(record, pending, permissions, savedFollowups, signal);
           if (acknowledged) {
             // A removal failure retries only the commit, never the already accepted callback.
             await remove(watch);
@@ -336,6 +423,77 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     }
   }
 
+  function startFollowupWatch(record: FinishSubscription): void {
+    if (!deps.followups || !deps.hosts || !record.serverId || followupWatches.has(record.id))
+      return;
+    const followups = deps.followups;
+    const serverId = record.serverId;
+    const controller = new AbortController();
+    const { signal } = controller;
+    followupWatches.set(record.id, controller);
+    const task = (async () => {
+      let acknowledged: string[] = [];
+      async function dispatchReports(reports: AgentFinishReport[]): Promise<void> {
+        for (const report of reports) {
+          signal.throwIfAborted();
+          if (!(await deps.callerIsActive(record.callerAgentId))) return;
+          await abortable(followups.dispatch(record, report), signal);
+          acknowledged.push(report.id);
+        }
+      }
+      let warned = false;
+      while (!signal.aborted) {
+        try {
+          const hosts = deps.hosts!();
+          const host = (await hosts.directory()).hosts.find((row) => row.serverId === serverId);
+          if (!(await deps.callerIsActive(record.callerAgentId)) || !host) {
+            await followups.watches.remove(record.id);
+            return;
+          }
+          if (host.status === "online") {
+            const response = await hosts.use(
+              serverId,
+              (client) =>
+                client.pullAgentFinishReports(
+                  record.childAgentId,
+                  record.callerAgentId,
+                  acknowledged,
+                  true,
+                ),
+              signal,
+            );
+            signal.throwIfAborted();
+            if (response.error) throw new Error(response.error);
+            if (!response.ownsChild) {
+              await followups.watches.remove(record.id);
+              return;
+            }
+            acknowledged = [];
+            await dispatchReports(response.reports);
+            warned = false;
+            if (acknowledged.length) continue;
+          }
+        } catch (error) {
+          if (signal.aborted) return;
+          if (!warned) {
+            deps.logger.warn(
+              { err: error, subscription: record.id },
+              "Retrying remote follow-up observation",
+            );
+            warned = true;
+          }
+        }
+        await delay(signal, 3);
+      }
+    })();
+    tasks.add(task);
+    void task.then(() => {
+      followupWatches.delete(record.id);
+      tasks.delete(task);
+      return undefined;
+    });
+  }
+
   return {
     hasPendingForCaller(agentId) {
       if (recovering || registering.has(agentId)) return true;
@@ -356,6 +514,8 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           groups.set(key(record), records);
         }
         for (const records of groups.values()) attach(records, false);
+        for (const record of (await deps.followups?.watches.list()) ?? [])
+          startFollowupWatch(record);
         recovering = false;
       }),
     register: (input, pendingDispatch = false) => {
@@ -387,8 +547,8 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           },
           reject: () =>
             serialize(async () => {
-              await remove(watch);
               stop(watch, actualGroup);
+              await remove(watch);
             }),
         };
         if (!pendingDispatch) registration.accept();
@@ -399,6 +559,50 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         else registering.delete(input.callerAgentId);
       });
     },
+    trackRemoteChild: (input) =>
+      serialize(async () => {
+        if (closed || !deps.followups)
+          throw new Error("Remote follow-up observation is unavailable");
+        const record = { ...input, id: key(input) };
+        await deps.followups.watches.put(record);
+        startFollowupWatch(record);
+      }),
+    pullReports: (address, acknowledged, observe, childState) =>
+      serializeReports(async () => {
+        const followups = deps.followups;
+        if (!followups) return { ownsBinding: false, reports: [] };
+        const { sourceId, ...pair } = address;
+        const bindingId = key(pair);
+        const existing = (await followups.watches.list()).find((entry) => entry.id === bindingId);
+        const reports = followups.reports;
+        const matching = (await reports.list()).filter(
+          (record) =>
+            key(record) === bindingId &&
+            (!record.pullSourceId || record.pullSourceId === sourceId) &&
+            record.report,
+        );
+        if (childState === "unrelated") {
+          if (existing?.pullSourceId === sourceId) {
+            for (const record of matching) await reports.remove(record.id);
+            await followups.watches.remove(bindingId);
+          }
+          return { ownsBinding: false, reports: [] };
+        }
+        if (existing?.pullSourceId !== sourceId) {
+          if (existing || !observe || childState !== "active")
+            return { ownsBinding: false, reports: [] };
+          await followups.watches.put({ ...pair, id: bindingId, pullSourceId: sourceId });
+        }
+        const consumed = new Set(acknowledged);
+        for (const record of matching) if (consumed.has(record.id)) await reports.remove(record.id);
+        const remaining = matching
+          .filter((record) => !consumed.has(record.id))
+          .slice(0, 8)
+          .map((record) => record.report!);
+        if (childState === "archived" && remaining.length === 0)
+          await followups.watches.remove(bindingId);
+        return { ownsBinding: childState === "active" || remaining.length > 0, reports: remaining };
+      }),
     async close() {
       closed = true;
       await mutations;
@@ -408,7 +612,9 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           watch.decide(false);
         }
       await mutations;
+      for (const controller of followupWatches.values()) controller.abort();
       await Promise.all(tasks);
+      await reportMutations;
       await deps.store.list();
       // Dispatch may still be pending. The delivery owner drains it after observers stop.
     },

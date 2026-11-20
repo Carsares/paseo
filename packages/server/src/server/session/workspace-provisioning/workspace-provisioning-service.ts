@@ -77,6 +77,8 @@ export interface WorkspaceProvisioningService {
       metadata?: Record<string, JsonValue>;
       background?: boolean;
       callerWorkspaceId?: string;
+      untrustedSource?: UntrustedWorkspaceSource;
+      beforeSave?: () => Promise<void>;
     },
   ): Promise<PersistedWorkspaceRecord>;
   createWorkspaceForWorktree(
@@ -260,6 +262,8 @@ export function createWorkspaceProvisioningService(deps: {
       metadata?: Record<string, JsonValue>;
       background?: boolean;
       callerWorkspaceId?: string;
+      untrustedSource?: UntrustedWorkspaceSource;
+      beforeSave?: () => Promise<void>;
     },
   ): Promise<PersistedWorkspaceRecord> {
     const normalizedCwd = resolve(cwd);
@@ -283,8 +287,10 @@ export function createWorkspaceProvisioningService(deps: {
         metadata: context?.metadata,
         createdAt: timestamp,
         updatedAt: timestamp,
+        ...(context?.untrustedSource ? { untrustedSource: context.untrustedSource } : {}),
         ...(await resolveCreationMetadata(context)),
       });
+      if (context?.beforeSave) await context.beforeSave();
       await workspaceRegistry.upsert(workspace, {
         expectsInitialAgent: context?.expectsInitialAgent,
       });

@@ -119,7 +119,7 @@ describe("quit-lifecycle", () => {
       },
       isDesktopManagedDaemonRunning: () => false,
       isDesktopManagedDaemonPresent: () => true,
-      hasPendingUpdateOnQuit: () => true,
+      appUpdate: { version: "1.2.4" },
       stopDaemon: async (reason) => {
         events.push(`stop:${reason}`);
       },
@@ -135,7 +135,6 @@ describe("quit-lifecycle", () => {
     const stopped = await stopDesktopManagedDaemonOnQuitIfNeeded({
       settingsStore: { get: async () => SETTINGS_STOP_ON_QUIT },
       isDesktopManagedDaemonRunning: () => true,
-      hasPendingUpdateOnQuit: () => true,
       stopDaemon: async (reason) => {
         events.push(`stop:${reason}`);
       },
@@ -194,8 +193,8 @@ describe("quit-lifecycle", () => {
     expect(events).toEqual([
       "close-transports",
       "prevent-default",
-      "preserve:false",
       "revalidate-update",
+      "preserve:undefined",
       "exit:0",
     ]);
   });
@@ -217,7 +216,7 @@ describe("quit-lifecycle", () => {
           settingsStore: { get: async () => SETTINGS_KEEP_RUNNING },
           isDesktopManagedDaemonRunning: () => false,
           isDesktopManagedDaemonPresent: () => true,
-          hasPendingUpdateOnQuit: () => true,
+          appUpdate: { version: "1.2.4" },
           preserveWork: options?.preserveWork,
           stopDaemon: async (reason) => {
             events.push(`stop:${reason}`);
@@ -267,65 +266,39 @@ describe("quit-lifecycle", () => {
     expect(events).toEqual([]);
   });
 
-  it("revalidates updates after daemon shutdown before exiting", async () => {
-    const stopDecision = deferred<boolean>();
-    const updateDecision = deferred<boolean>();
+  it("chooses the same update for shutdown and installation before stopping the daemon", async () => {
+    const validated = deferred<{ version: string }>();
+    const stopped = deferred<boolean>();
     const events: string[] = [];
-
-    const quitLifecycle = createQuitLifecycle({
-      app: {
-        exit: (code) => {
-          events.push(`exit:${code}`);
-        },
+    const deadline = new AbortController();
+    const lifecycle = createQuitLifecycle({
+      app: { exit: (code) => events.push(`exit:${code}`) },
+      closeTransportSessions: () => {},
+      stopDesktopManagedDaemonIfNeeded: (options) => {
+        events.push(`stop:${options?.appUpdate?.version}`);
+        return stopped.promise;
       },
-      closeTransportSessions: () => {
-        events.push("close-transports");
+      installAppUpdateOnQuit: async (_signal, beforeQuit) => {
+        const target = await validated.promise;
+        if ((await beforeQuit(target)) === false) return false;
+        events.push(`install:${target.version}`);
+        return true;
       },
-      stopDesktopManagedDaemonIfNeeded: () => stopDecision.promise,
-      installAppUpdateOnQuit: () => updateDecision.promise,
-      createUpdateDeadlineSignal: () => new AbortController().signal,
-      onStopError: () => {
-        events.push("stop-error");
-      },
-      onUpdateError: () => {
-        events.push("update-error");
-      },
+      createUpdateDeadlineSignal: () => deadline.signal,
+      onStopError: () => events.push("stop-error"),
+      onUpdateError: () => events.push("update-error"),
     });
 
-    quitLifecycle.handleBeforeQuit({
-      preventDefault: () => {
-        events.push("prevent-default");
-      },
-    });
-
-    expect(events).toEqual(["close-transports", "prevent-default"]);
-
-    events.push("daemon-stopped");
-    stopDecision.resolve(false);
+    lifecycle.handleBeforeQuit({ preventDefault: () => {} });
+    expect(events).toEqual([]);
+    validated.resolve({ version: "1.2.5" });
     await waitForQuitLifecycle();
+    expect(events).toEqual(["stop:1.2.5"]);
 
-    expect(events).toEqual(["close-transports", "prevent-default", "daemon-stopped"]);
-
-    events.push("update-checked");
-    updateDecision.resolve(false);
+    stopped.resolve(true);
+    lifecycle.handleBeforeQuitForUpdate();
     await waitForQuitLifecycle();
-
-    expect(events).toEqual([
-      "close-transports",
-      "prevent-default",
-      "daemon-stopped",
-      "update-checked",
-      "exit:0",
-    ]);
-
-    quitLifecycle.handleBeforeQuit({
-      preventDefault: () => {
-        events.push("second-prevent-default");
-      },
-    });
-
-    expect(events.at(-1)).toBe("close-transports");
-    expect(events).not.toContain("second-prevent-default");
+    expect(events).toEqual(["stop:1.2.5", "install:1.2.5"]);
   });
 
   it("lets the updater own process exit when a validated update is installing", async () => {
@@ -334,7 +307,10 @@ describe("quit-lifecycle", () => {
       app: { exit: (code) => exits.push(code) },
       closeTransportSessions: () => {},
       stopDesktopManagedDaemonIfNeeded: async () => false,
-      installAppUpdateOnQuit: async () => true,
+      installAppUpdateOnQuit: async (_signal, beforeQuit) => {
+        await beforeQuit({ version: "1.2.4" });
+        return true;
+      },
       createUpdateDeadlineSignal: () => new AbortController().signal,
       onStopError: () => {},
       onUpdateError: () => {},
@@ -348,14 +324,18 @@ describe("quit-lifecycle", () => {
     expect(exits).toEqual([]);
   });
 
-  it("recognizes a repeated quit as updater handoff", async () => {
+  it("prevents repeated user quits while the selected installer is still pending", async () => {
     const exits: number[] = [];
     let preventedQuitCount = 0;
+    const installation = deferred<boolean>();
     const quitLifecycle = createQuitLifecycle({
       app: { exit: (code) => exits.push(code) },
       closeTransportSessions: () => {},
       stopDesktopManagedDaemonIfNeeded: async () => false,
-      installAppUpdateOnQuit: async () => true,
+      installAppUpdateOnQuit: async (_signal, beforeQuit) => {
+        await beforeQuit({ version: "1.2.4" });
+        return installation.promise;
+      },
       createUpdateDeadlineSignal: () => new AbortController().signal,
       onStopError: () => {},
       onUpdateError: () => {},
@@ -365,33 +345,52 @@ describe("quit-lifecycle", () => {
     await waitForQuitLifecycle();
     quitLifecycle.handleBeforeQuit({ preventDefault: () => preventedQuitCount++ });
     await waitForQuitLifecycle();
+    expect(preventedQuitCount).toBe(2);
 
-    expect(preventedQuitCount).toBe(1);
+    quitLifecycle.handleBeforeQuitForUpdate();
+    quitLifecycle.handleBeforeQuit({ preventDefault: () => preventedQuitCount++ });
+    installation.resolve(true);
+    await waitForQuitLifecycle();
+
+    expect(preventedQuitCount).toBe(2);
     expect(exits).toEqual([]);
   });
 
-  it("exits when the updater does not take ownership before its deadline", async () => {
-    const revalidationDeadline = new AbortController();
-    const handoffDeadline = new AbortController();
-    let deadlineCount = 0;
-    const exits: number[] = [];
+  it("quits normally if confirmation expires and cannot stop for a late approval", async () => {
+    const deadline = new AbortController();
+    const confirmation = deferred<boolean>();
+    const events: string[] = [];
     const quitLifecycle = createQuitLifecycle({
-      app: { exit: (code) => exits.push(code) },
+      app: { exit: (code) => events.push(`exit:${code}`) },
       closeTransportSessions: () => {},
-      stopDesktopManagedDaemonIfNeeded: async () => false,
-      installAppUpdateOnQuit: async () => true,
-      createUpdateDeadlineSignal: () =>
-        deadlineCount++ === 0 ? revalidationDeadline.signal : handoffDeadline.signal,
+      stopDesktopManagedDaemonIfNeeded: async (options) => {
+        events.push(options?.appUpdate ? "update-stop" : "ordinary-stop");
+        return true;
+      },
+      confirmAppUpdate: () => {
+        events.push("confirm");
+        return confirmation.promise;
+      },
+      installAppUpdateOnQuit: async (_signal, beforeQuit) => {
+        if ((await beforeQuit({ version: "1.2.4" })) === false) return false;
+        events.push("install");
+        return true;
+      },
+      createUpdateDeadlineSignal: () => deadline.signal,
       onStopError: () => {},
       onUpdateError: () => {},
     });
 
     quitLifecycle.handleBeforeQuit({ preventDefault: () => {} });
     await waitForQuitLifecycle();
-    handoffDeadline.abort();
+    expect(events).toEqual(["confirm"]);
+    deadline.abort();
     await waitForQuitLifecycle();
+    expect(events).toEqual(["confirm", "ordinary-stop", "exit:0"]);
 
-    expect(exits).toEqual([0]);
+    confirmation.resolve(true);
+    await waitForQuitLifecycle();
+    expect(events).toEqual(["confirm", "ordinary-stop", "exit:0"]);
   });
 
   it("does not intercept a quit started by a manual update", () => {
@@ -399,6 +398,7 @@ describe("quit-lifecycle", () => {
     const quitLifecycle = createQuitLifecycle({
       app: { exit: (code) => events.push(`exit:${code}`) },
       closeTransportSessions: () => events.push("close-transports"),
+      isManualUpdateHandoffInProgress: () => true,
       stopDesktopManagedDaemonIfNeeded: async () => {
         events.push("stop-daemon");
         return false;
@@ -412,12 +412,17 @@ describe("quit-lifecycle", () => {
       onUpdateError: () => events.push("update-error"),
     });
 
+    quitLifecycle.handleBeforeQuit({
+      preventDefault: () => events.push("prevent-default"),
+    });
+    expect(events).toEqual(["prevent-default"]);
+
     quitLifecycle.handleBeforeQuitForUpdate();
     quitLifecycle.handleBeforeQuit({
       preventDefault: () => events.push("prevent-default"),
     });
 
-    expect(events).toEqual(["close-transports"]);
+    expect(events).toEqual(["prevent-default", "close-transports"]);
   });
 
   it("exits when update revalidation reaches its deadline", async () => {

@@ -242,11 +242,83 @@ describe("app update service", () => {
 
     enabled = true;
     runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
-    const result = await service.downloadAndInstallUpdate(input, async () => {
-      enabled = false;
+    const events: string[] = [];
+    let finishStop!: () => void;
+    const stopped = new Promise<void>((resolve) => {
+      finishStop = resolve;
     });
-    expect(result.installed).toBe(false);
+    const installing = service.downloadAndInstallUpdate(input, async (target) => {
+      events.push(`stop:${target.version}`);
+      await stopped;
+      return async () => {
+        events.push("restart-daemon");
+      };
+    });
+    await expect.poll(() => events).toEqual(["stop:1.2.4"]);
+    enabled = false;
+    finishStop();
+    expect(await installing).toMatchObject({
+      installed: false,
+      message: "Official updates are disabled.",
+    });
+    expect(events).toEqual(["stop:1.2.4", "restart-daemon"]);
     expect(runtime.installedVersions).toEqual([]);
+  });
+
+  it("restores the daemon after the handoff reports an installation failure", async () => {
+    const { runtime, service } = createService();
+    const events: string[] = [];
+    runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
+    runtime.quitAndInstall = async (request) => {
+      events.push(`handoff:${request.targetVersion}`);
+      await Promise.resolve();
+      throw new Error("Installer refused the update");
+    };
+    const result = await service.downloadAndInstallUpdate(
+      { currentVersion: "1.2.3", releaseChannel: "stable" },
+      async (target) => {
+        events.push(`stop:${target.version}`);
+        return async () => {
+          events.push("restart-daemon");
+        };
+      },
+    );
+
+    expect(events).toEqual(["stop:1.2.4", "handoff:1.2.4", "restart-daemon"]);
+    expect(result).toMatchObject({ installed: false, message: expect.stringContaining("refused") });
+  });
+
+  it("keeps later checks from replacing the target while its daemon is stopping", async () => {
+    const { runtime, service } = createService({ bucket: async () => 0 });
+    const input = { currentVersion: "1.2.3", releaseChannel: "stable" as const };
+    runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
+    await service.checkForAppUpdate({ ...input, intent: "automatic" });
+    runtime.finishUpdateDownload(rolledOutUpdate);
+    runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
+    let finishStop!: () => void;
+    const stopped = new Promise<void>((resolve) => {
+      finishStop = resolve;
+    });
+    const targets: string[] = [];
+    const installing = service.installUpdateOnQuit({
+      ...input,
+      signal: new AbortController().signal,
+      onBeforeQuit: async (target) => {
+        targets.push(target.version);
+        await stopped;
+      },
+    });
+    await expect.poll(() => targets).toEqual(["1.2.4"]);
+
+    runtime.nextCheck({
+      isUpdateAvailable: true,
+      updateInfo: { ...rolledOutUpdate, version: "1.2.5" },
+    });
+    const laterCheck = service.checkForAppUpdate({ ...input, intent: "automatic" });
+    finishStop();
+    expect(await installing).toBe(true);
+    expect(runtime.installedVersions).toEqual(["1.2.4"]);
+    expect(await laterCheck).toMatchObject({ latestVersion: "1.2.5" });
   });
 
   it("does not expose automatic stable updates before the user is admitted to rollout", async () => {

@@ -202,4 +202,21 @@ describe("supervisor terminal cleanup", () => {
         : []),
     ]);
   });
+
+  test.each(["paseo:shutdown", "paseo:restart"])(
+    "reports a worker failure during %s with agent preservation",
+    async (type) => {
+      const result = await runSupervisorWith(`
+        process.on("message", (message) => {
+          if (message.type !== "paseo:graceful-shutdown") return;
+          record({ graceful: generation, resumeAgents: message.resumeAgents });
+          process.exit(1);
+        });
+        process.send({ type: "paseo:ready", listen: "endpoint", serverId: "srv" });
+        process.send({ type: ${JSON.stringify(type)}, resumeAgents: true, keepTerminals: true });
+      `);
+      expect(result.code, result.output).toBe(1);
+      expect(result.events).toEqual([{ started: 1 }, { graceful: 1, resumeAgents: true }]);
+    },
+  );
 });

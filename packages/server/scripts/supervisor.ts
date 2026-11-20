@@ -438,6 +438,14 @@ export function runSupervisor(options: SupervisorOptions): SupervisorController 
           return;
         }
 
+        if (pendingResumeAgents && (code !== 0 || signal !== null)) {
+          log(
+            `Worker did not finish the requested shutdown with agent recovery (${exitDescriptor}). Supervisor exiting.`,
+          );
+          exitSupervisor(1, { keepTerminals: pendingKeepTerminals });
+          return;
+        }
+
         if (shuttingDown) {
           log(`Worker exited (${exitDescriptor}). Supervisor shutting down.`);
           exitSupervisor(0, { keepTerminals: pendingKeepTerminals });

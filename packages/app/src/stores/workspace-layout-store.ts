@@ -6,6 +6,7 @@ import type { z } from "zod";
 import { WorkspaceLayoutPersistedStateSchema } from "./workspace-layout-storage";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import type { WorkspaceTab, WorkspaceTabTarget } from "@/workspace-tabs/model";
+import { useWorkspaceAttachmentsStore } from "@/attachments/workspace-attachments-store";
 import {
   defaultWorkspaceLayoutIds,
   type WorkspaceLayoutIdSource,
@@ -190,6 +191,11 @@ interface WorkspaceLayoutStore {
   setTabState: (workspaceKey: string, tabId: string, state: JsonValue | undefined) => void;
   convertDraftToAgent: (workspaceKey: string, tabId: string, agentId: string) => string | null;
   reconcileTabs: (workspaceKey: string, snapshot: WorkspaceTabSnapshot) => void;
+  retainAgentTabForHandoff: (
+    workspaceKey: string,
+    tabId: string,
+    agentId: string,
+  ) => { isCurrent: () => boolean; release: () => void } | null;
   reorderTabs: (workspaceKey: string, tabIds: string[]) => void;
   getWorkspaceTabs: (workspaceKey: string) => WorkspaceTab[];
   splitPane: (
@@ -1039,13 +1045,32 @@ function advancePanelRevision(
   };
 }
 
+interface AgentTabHandoff {
+  isCurrent: () => boolean;
+  lastSnapshot?: WorkspaceTabSnapshot;
+}
+
+function clearClosedDraftHistory(state: WorkspaceLayoutStore, draftId: string): void {
+  const matchesDraft = (tab: WorkspaceTab) =>
+    tab.target.kind === "draft" && tab.target.draftId === draftId;
+  const stillOpen =
+    Object.values(state.layoutByWorkspace).some((layout) =>
+      collectAllTabs(layout.root).some(matchesDraft),
+    ) ||
+    Object.values(state.sheetsByWorkspace).some((sheets) =>
+      sheets.some((sheet) => matchesDraft(sheet.tab)),
+    );
+  if (!stillOpen) useWorkspaceAttachmentsStore.getState().clearDraftChatHistory({ draftId });
+}
+
 export function createWorkspaceLayoutStore(
   ids: WorkspaceLayoutIdSource = defaultWorkspaceLayoutIds,
   storage: StateStorage = AsyncStorage,
 ) {
+  const handoffTabs = new Map<string, Map<string, AgentTabHandoff>>();
   return create<WorkspaceLayoutStore>()(
     persist(
-      (set, get) => ({
+      (set, get, api) => ({
         autoOpenPullRequestTab: (workspaceKey, resolvePlacement) => {
           const key = trimNonEmpty(workspaceKey);
           if (!key || get().pullRequestTabAutoOpenedByWorkspace[key]) return null;
@@ -1391,6 +1416,12 @@ export function createWorkspaceLayoutStore(
             return;
           }
 
+          const stateBeforeClose = get();
+          const closingTarget =
+            findSheet(stateBeforeClose, normalizedWorkspaceKey, normalizedTabId)?.tab.target ??
+            stateBeforeClose
+              .getWorkspaceTabs(normalizedWorkspaceKey)
+              .find((tab) => tab.tabId === normalizedTabId)?.target;
           set((state) => {
             if (findSheet(state, normalizedWorkspaceKey, normalizedTabId)) {
               return withoutSheet(state, normalizedWorkspaceKey, normalizedTabId);
@@ -1464,6 +1495,9 @@ export function createWorkspaceLayoutStore(
               },
             };
           });
+          if (closingTarget?.kind === "draft") {
+            clearClosedDraftHistory(get(), closingTarget.draftId);
+          }
         },
         getTabDestination: (workspaceKey, tabId) => {
           const state = get();
@@ -1689,6 +1723,39 @@ export function createWorkspaceLayoutStore(
 
           return result.tabId;
         },
+        retainAgentTabForHandoff: (workspaceKey, tabId, agentId) => {
+          const tabs = handoffTabs.get(workspaceKey) ?? new Map<string, AgentTabHandoff>();
+          if (tabs.has(tabId)) return null;
+          const matches = () =>
+            get()
+              .getWorkspaceTabs(workspaceKey)
+              .some(
+                (tab) =>
+                  tab.tabId === tabId &&
+                  tab.target.kind === "agent" &&
+                  tab.target.agentId === agentId,
+              );
+          if (!matches()) return null;
+          let current = true;
+          const isCurrent = () => current && matches();
+          const unsubscribe = api.subscribe(() => {
+            if (!matches()) current = false;
+          });
+          const handoff: AgentTabHandoff = { isCurrent };
+          tabs.set(tabId, handoff);
+          handoffTabs.set(workspaceKey, tabs);
+          return {
+            isCurrent,
+            release: () => {
+              unsubscribe();
+              tabs.delete(tabId);
+              if (tabs.size === 0) handoffTabs.delete(workspaceKey);
+              if (handoff.lastSnapshot && isCurrent()) {
+                get().reconcileTabs(workspaceKey, handoff.lastSnapshot);
+              }
+            },
+          };
+        },
         reconcileTabs: (workspaceKey, snapshot) => {
           const normalizedWorkspaceKey = trimNonEmpty(workspaceKey);
           if (!normalizedWorkspaceKey) {
@@ -1706,6 +1773,14 @@ export function createWorkspaceLayoutStore(
               explorerSidebarPaneId,
               rawLayout.focusedPaneId,
             );
+            const retainedAgentTabIds = handoffTabs.has(normalizedWorkspaceKey)
+              ? new Set<string>()
+              : undefined;
+            for (const [tabId, handoff] of handoffTabs.get(normalizedWorkspaceKey) ?? []) {
+              if (!handoff.isCurrent()) continue;
+              handoff.lastSnapshot = snapshot;
+              retainedAgentTabIds?.add(tabId);
+            }
             const nextState = reconcileWorkspaceTabs(
               {
                 layout: currentLayout,
@@ -1714,6 +1789,7 @@ export function createWorkspaceLayoutStore(
                 explorerSidebarPaneId,
               },
               snapshot,
+              retainedAgentTabIds,
             );
             const nextLayout = keepWorkspaceFocusOutOfExplorerSidebar(
               nextState.layout,
@@ -1945,6 +2021,18 @@ export function createWorkspaceLayoutStore(
             return;
           }
 
+          const stateBeforeClose = get();
+          const closingPane = findPaneById(
+            getWorkspaceLayout(stateBeforeClose.layoutByWorkspace, normalizedWorkspaceKey).root,
+            normalizedPaneId,
+          );
+          const closingTabs = closingPane
+            ? stateBeforeClose
+                .getWorkspaceTabs(normalizedWorkspaceKey)
+                .filter(
+                  (tab) => tab.target.kind === "draft" && closingPane.tabIds.includes(tab.tabId),
+                )
+            : [];
           set((state) => {
             const layout = getWorkspaceLayout(state.layoutByWorkspace, normalizedWorkspaceKey);
             // The Explorer is a surface the user summons, so closing it puts it
@@ -1980,6 +2068,9 @@ export function createWorkspaceLayoutStore(
                   : state.sidePaneIdByWorkspace,
             };
           });
+          for (const tab of closingTabs) {
+            if (tab.target.kind === "draft") clearClosedDraftHistory(get(), tab.target.draftId);
+          }
         },
         focusWorkspace: (workspaceKey) => {
           const state = get();

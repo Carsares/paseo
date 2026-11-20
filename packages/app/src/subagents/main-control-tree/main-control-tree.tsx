@@ -7,15 +7,18 @@ import {
   PanelLeftClose,
 } from "lucide-react-native";
 import { type ReactNode, useCallback, useMemo, useState } from "react";
+import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import { useTranslation } from "react-i18next";
 import { ScrollView, Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import { useShallow } from "zustand/shallow";
 import { useStreamTopOverlayInset } from "@/agent-stream/top-overlay";
 import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { useContainerWidthBelow } from "@/hooks/use-container-width";
+import { usePendingArchiveAgentKeys } from "@/hooks/use-archive-agent";
 import { useSettings } from "@/hooks/use-settings";
 import { usePaneContext, usePaneFocus } from "@/panels/pane-context";
 import { useSessionStore } from "@/stores/session-store";
@@ -24,7 +27,12 @@ import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
 import { openPreferredWorkspaceTarget } from "@/workspace-tabs/open-beside";
-import { type MainControlTreeNode, selectMainControlTree } from "./select-tree";
+import {
+  mainControlTreeNodeKey,
+  type MainControlSession,
+  type MainControlTreeNode,
+  selectMainControlTree,
+} from "./select-tree";
 
 const iconColor = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 const DownIcon = withUnistyles(ChevronDown, iconColor);
@@ -55,24 +63,40 @@ export function MainControlTreeLayout({
   const hideTree = useCallback(() => setVisible(false), [setVisible]);
   const showTree = useCallback(() => setVisible(true), [setVisible]);
   const preferences = useSettings((settings) => settings.openInSidePane);
-  const agents = useSessionStore((state) =>
-    mainAgentId ? state.sessions[serverId]?.agents : undefined,
+  const agentMaps = useSessionStore(
+    useShallow(
+      (state): Record<string, MainControlSession["agents"]> =>
+        mainAgentId
+          ? Object.fromEntries(
+              Object.entries(state.sessions).map(([id, session]) => [id, session.agents]),
+            )
+          : {},
+    ),
   );
+  const pendingArchiveIds = usePendingArchiveAgentKeys();
   const fallbackTitle = t("workspace.tabs.fallback.agent");
-  const tree = useMemo(
-    () =>
-      mainAgentId && agents
-        ? selectMainControlTree({ session: { serverId, agents }, mainAgentId, fallbackTitle })
-        : null,
-    [agents, fallbackTitle, mainAgentId, serverId],
-  );
+  const tree = useMemo(() => {
+    const agents = agentMaps[serverId];
+    if (!mainAgentId || !agents) return null;
+    return selectMainControlTree({
+      session: { serverId, agents },
+      agentMaps,
+      mainAgentId,
+      fallbackTitle,
+      pendingArchiveIds,
+    });
+  }, [agentMaps, fallbackTitle, mainAgentId, pendingArchiveIds, serverId]);
   const isChinese = i18n.language?.startsWith("zh") === true;
   const showLabel = isChinese ? "显示会话进程目录树" : "Show agent tree";
   const hideLabel = isChinese ? "隐藏" : "Hide";
 
   const openNode = useCallback(
-    (agentId: string) => {
+    ({ serverId: nodeServerId, agentId }: AgentAddress) => {
       if (overlay) setOverlayVisible(false);
+      if (nodeServerId !== serverId) {
+        navigateToAgent({ serverId: nodeServerId, agentId });
+        return;
+      }
       if (agentId === mainAgentId) {
         focusPane();
         return;
@@ -106,7 +130,7 @@ export function MainControlTreeLayout({
       ) : null}
       {tree ? (
         <MainControlTree
-          key={tree.agentId}
+          key={mainControlTreeNodeKey(tree)}
           tree={tree}
           visible={visible}
           overlay={overlay}
@@ -158,14 +182,14 @@ function MainControlTree({
   isChinese: boolean;
   hideLabel: string;
   onHide: () => void;
-  onOpen: (agentId: string) => void;
+  onOpen: (address: AgentAddress) => void;
 }) {
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set());
   const collapsibleIds = useMemo(() => {
     const ids: string[] = [];
-    if (tree.children.length > 0) ids.push(tree.agentId);
+    if (tree.children.length > 0) ids.push(mainControlTreeNodeKey(tree));
     for (const child of tree.children) {
-      if (child.children.length > 0) ids.push(child.agentId);
+      if (child.children.length > 0) ids.push(mainControlTreeNodeKey(child));
     }
     return ids;
   }, [tree]);
@@ -178,14 +202,16 @@ function MainControlTree({
     const nodes: MainControlTreeNode[] = [];
     function visit(node: MainControlTreeNode) {
       nodes.push(node);
-      if (!collapsed.has(node.agentId)) node.children.forEach(visit);
+      if (!collapsed.has(mainControlTreeNodeKey(node))) node.children.forEach(visit);
     }
     if (visible) visit(tree);
     return nodes;
   }, [collapsed, tree, visible]);
   const allCollapsed =
     collapsibleIds.length > 0 &&
-    !visibleNodes.some((node) => node.children.length > 0 && !collapsed.has(node.agentId));
+    !visibleNodes.some(
+      (node) => node.children.length > 0 && !collapsed.has(mainControlTreeNodeKey(node)),
+    );
 
   const toggleBranches = useCallback(() => {
     setCollapsed(allCollapsed ? new Set() : new Set(collapsibleIds));
@@ -229,10 +255,10 @@ function MainControlTree({
       <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.tree}>
         {visibleNodes.map((node) => (
           <MainControlTreeRow
-            key={node.agentId}
+            key={mainControlTreeNodeKey(node)}
             node={node}
-            expanded={!collapsed.has(node.agentId)}
-            toggleLabel={collapsed.has(node.agentId) ? expandLabel : collapseLabel}
+            expanded={!collapsed.has(mainControlTreeNodeKey(node))}
+            toggleLabel={collapsed.has(mainControlTreeNodeKey(node)) ? expandLabel : collapseLabel}
             statusLabel={node.processState === "active" ? activeLabel : terminatedLabel}
             onToggle={toggleNode}
             onOpen={onOpen}
@@ -256,11 +282,12 @@ function MainControlTreeRow({
   toggleLabel: string;
   statusLabel: string;
   onToggle: (id: string) => void;
-  onOpen: (id: string) => void;
+  onOpen: (address: AgentAddress) => void;
 }) {
-  const { agentId, depth, title, processState } = node;
-  const toggle = useCallback(() => onToggle(agentId), [agentId, onToggle]);
-  const open = useCallback(() => onOpen(agentId), [agentId, onOpen]);
+  const { serverId, agentId, depth, title, processState } = node;
+  const key = mainControlTreeNodeKey(node);
+  const toggle = useCallback(() => onToggle(key), [key, onToggle]);
+  const open = useCallback(() => onOpen({ serverId, agentId }), [agentId, onOpen, serverId]);
   const statusDot = useMemo(
     () => <View style={[styles.statusDot, processState === "active" && styles.activeDot]} />,
     [processState],

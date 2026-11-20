@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
+import { InMemoryAgentTimelineStore } from "../agent-timeline-store.js";
 import { searchTimeline } from "./index.js";
 
 function rows(items: AgentTimelineItem[]) {
@@ -57,6 +58,117 @@ it("bounds results and resumes without losing locations", async () => {
     ],
     nextCursor: null,
   });
+});
+
+it("only joins fragments across hidden tools in the same reply and returns the last fragment cursor", async () => {
+  const fragment = (text: string, messageId = "reply"): AgentTimelineItem => ({
+    type: "assistant_message",
+    text,
+    messageId,
+  });
+  const tool = (name: string, callId: string): AgentTimelineItem => ({
+    type: "tool_call",
+    name,
+    callId,
+    status: "completed",
+    detail: { type: "plain_text", text: "" },
+    error: null,
+  });
+  const source = rows([
+    fragment("**proto"),
+    tool("mcp__paseo__send_agent_prompt", "hidden-1"),
+    tool("Agent", "hidden-2"),
+    fragment("col**"),
+    fragment("proto", "other"),
+    tool("paseo_create_agent", "hidden-3"),
+    fragment("col"), // Different message.
+    fragment("proto", "visible-break"),
+    tool("mcp__paseo__request_permission", "visible"),
+    fragment("col", "visible-break"),
+    fragment("proto", "turn-break"),
+    tool("paseo_list_agents", "hidden-4"),
+    fragment("col", "turn-break"), // Different turn.
+  ]).map((row) => Object.assign(row, { turnId: row.seq < 13 ? "turn-1" : "turn-2" }));
+  const input = { rows: source, query: "protocol", provider: "claude" };
+  await expect(searchTimeline(input)).resolves.toMatchObject({ locations: [] });
+  await expect(searchTimeline({ ...input, hideAgentInteractions: true })).resolves.toEqual({
+    locations: [{ seq: 4, role: "assistant", count: 1 }],
+    nextCursor: null,
+  });
+  await expect(
+    searchTimeline({ ...input, hideAgentInteractions: true, cursor: 4 }),
+  ).resolves.toEqual({
+    locations: [],
+    nextCursor: null,
+  });
+});
+
+it("finds adjacent displayed fragments when the hidden tool update folds into an earlier row", async () => {
+  const tool = {
+    type: "tool_call" as const,
+    name: "mcp__paseo__send_agent_prompt",
+    callId: "interaction",
+    detail: { type: "plain_text" as const, text: "" },
+    error: null,
+  };
+  const source = rows([
+    { ...tool, status: "running" },
+    { type: "assistant_message", text: "proto", messageId: "reply" },
+    { ...tool, status: "completed" },
+    { type: "assistant_message", text: "col", messageId: "reply" },
+  ]).map((row) => Object.assign(row, { turnId: "turn" }));
+
+  await expect(
+    searchTimeline({ rows: source, query: "protocol", hideAgentInteractions: true }),
+  ).resolves.toEqual({
+    locations: [{ seq: 4, role: "assistant", count: 1 }],
+    nextCursor: null,
+  });
+});
+
+it("uses the final fragment sequence to load a whole old reply longer than a timeline page", async () => {
+  const source = rows([
+    { type: "assistant_message", text: "proto", messageId: "reply" },
+    ...Array.from(
+      { length: 50 },
+      (_, index): AgentTimelineItem => ({
+        type: "tool_call",
+        name: "mcp__paseo__send_agent_prompt",
+        callId: `interaction-${index}`,
+        detail: { type: "plain_text", text: "" },
+        status: "completed",
+        error: null,
+      }),
+    ),
+    { type: "assistant_message", text: "col", messageId: "reply" },
+    ...Array.from(
+      { length: 70 },
+      (_, index): AgentTimelineItem => ({
+        type: "user_message",
+        text: `Newer prompt ${index}`,
+      }),
+    ),
+  ]).map((row) => Object.assign(row, { turnId: row.seq <= 52 ? "old" : `new-${row.seq}` }));
+  const store = new InMemoryAgentTimelineStore();
+  store.initialize("agent", { rows: source, epoch: "epoch" });
+  const tail = store.fetch("agent", { limit: 40, wholeTurns: true });
+  expect(tail.startSeq).toBe(83);
+  const result = await searchTimeline({
+    rows: store.getRows("agent"),
+    query: "protocol",
+    hideAgentInteractions: true,
+  });
+  expect(result.locations).toEqual([{ seq: 52, role: "assistant", count: 1 }]);
+
+  const jump = store.fetch("agent", {
+    direction: "before",
+    cursor: { epoch: "epoch", seq: result.locations[0]!.seq + 21 },
+    limit: 40,
+    wholeTurns: true,
+  });
+  expect(
+    jump.rows.flatMap(({ item }) => (item.type === "assistant_message" ? [item.text] : [])),
+  ).toEqual(["proto", "col"]);
 });
 
 it("finds ordinary Markdown entities and line breaks without requiring identical parsers", async () => {

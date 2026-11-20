@@ -15,12 +15,13 @@ import { composerWorkspaceAttachment } from "@/composer/attachments/workspace";
 import { useAgentInputDraft } from "@/composer/draft/input-draft";
 import type { CreateAgentInitialValues } from "@/hooks/use-agent-form-state";
 import { useDraftAgentCreateFlow, type DraftCreateAttempt } from "@/composer/draft/create-flow";
+import { selectHostFeature } from "@/runtime/host-features";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { buildWorkspaceDraftAgentConfig } from "@/screens/workspace/workspace-draft-agent-config";
 import { buildDraftStoreKey } from "@/stores/draft-keys";
 import { flushDraftPersistStorage } from "@/stores/draft-store";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
-import type { Agent } from "@/stores/session-store";
+import { useSessionStore, type Agent } from "@/stores/session-store";
 import { useWorkspaceFields } from "@/stores/session-store-hooks";
 import { useWorkspaceDraftSubmissionStore } from "@/stores/workspace-draft-submission-store";
 import { collectAllTabs, useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
@@ -37,6 +38,7 @@ import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { WorkspaceComposerAttachment } from "@/attachments/types";
 import {
+  isDraftChatHistoryReady,
   useDraftWorkspaceAttachmentScopeKey,
   useWorkspaceAttachmentScopeKey,
   useWorkspaceAttachmentsStore,
@@ -136,6 +138,21 @@ function resolveDraftModeId(input: {
   return null;
 }
 
+function buildDraftCaller(input: {
+  parentAgentId?: string | null;
+  requiresUserPromptOrigin: boolean;
+  supportsAgentInitialPromptOrigin: () => boolean;
+  initialPromptOriginUnavailableMessage: string;
+}): { callerAgentId?: string; initialPromptOrigin?: "user" } {
+  const callerAgentId = normalizeParentAgentId(input.parentAgentId);
+  if (!callerAgentId) return {};
+  // COMPAT(agentInitialPromptOrigin): added in v0.16.0, remove gate after 2027-05-19.
+  if (input.requiresUserPromptOrigin && !input.supportsAgentInitialPromptOrigin()) {
+    throw new Error(input.initialPromptOriginUnavailableMessage);
+  }
+  return { callerAgentId, initialPromptOrigin: "user" };
+}
+
 export async function submitDraftCreateRequest(input: {
   draftId: string;
   parentAgentId?: string | null;
@@ -158,6 +175,9 @@ export async function submitDraftCreateRequest(input: {
   };
   hostDisconnectedMessage: string;
   selectModelMessage: string;
+  requiresUserPromptOrigin: boolean;
+  supportsAgentInitialPromptOrigin: () => boolean;
+  initialPromptOriginUnavailableMessage: string;
 }): Promise<{ agentId: string | null; result: AgentSnapshotPayload }> {
   const {
     attempt,
@@ -168,7 +188,6 @@ export async function submitDraftCreateRequest(input: {
     client,
     workspaceDirectory,
     workspaceId,
-    parentAgentId,
     autoSubmitConfig,
     composerState,
   } = input;
@@ -199,11 +218,10 @@ export async function submitDraftCreateRequest(input: {
 
   const attachmentsArray = Array.isArray(attachments) ? attachments : undefined;
   const imagesData = await encodeImages(images);
-  const callerAgentId = normalizeParentAgentId(parentAgentId);
   const request = {
     config,
     workspaceId,
-    ...(callerAgentId ? { callerAgentId, initialPromptOrigin: "user" as const } : {}),
+    ...buildDraftCaller(input),
     initialPrompt: text,
     clientMessageId: attempt.clientMessageId,
     ...(Object.keys(composerState.metadata).length > 0 ? { metadata: composerState.metadata } : {}),
@@ -485,6 +503,10 @@ export function WorkspaceDraftComposer({
     workspaceId,
   });
   const draftAttachmentScopeKey = useDraftWorkspaceAttachmentScopeKey(draftId);
+  const isDraftHistoryReady = useWorkspaceAttachmentsStore(
+    (state) =>
+      !draftSetup?.restoreChatHistory || isDraftChatHistoryReady(state, draftAttachmentScopeKey),
+  );
   const openInSidePane = useSettings((settings) => settings.openInSidePane);
   const attachmentScopeKeys = useMemo(
     () => [draftAttachmentScopeKey, workspaceAttachmentScopeKey].filter(Boolean),
@@ -514,6 +536,7 @@ export function WorkspaceDraftComposer({
       initialAttempt: initialCreateAttempt,
       allowEmptyText: allowsEmptyAutoSubmit,
       validateBeforeSubmit: ({ text, attachments }) => {
+        if (!isDraftHistoryReady) return t("common.loading");
         const allowsEmptyDraftText = shouldAllowEmptyDraftText({
           allowsEmptyAutoSubmit,
           attachments,
@@ -565,6 +588,10 @@ export function WorkspaceDraftComposer({
           composerState,
           hostDisconnectedMessage: t("workspace.terminal.hostDisconnected"),
           selectModelMessage: t("workspaceSetup.errors.selectModel"),
+          requiresUserPromptOrigin: draftSetup?.restoreChatHistory === true,
+          supportsAgentInitialPromptOrigin: () =>
+            selectHostFeature(useSessionStore.getState(), serverId, "agentInitialPromptOrigin"),
+          initialPromptOriginUnavailableMessage: t("message.actions.forkUnavailable"),
         });
       },
       onCreateSuccess: ({ result }) => {
@@ -612,7 +639,7 @@ export function WorkspaceDraftComposer({
   );
   const autoSubmitKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!isReadyForPendingAutoSubmit) {
+    if (!isReadyForPendingAutoSubmit || !isDraftHistoryReady) {
       return;
     }
     const submitKey = `${serverId}:${workspaceId}:${draftId}`;
@@ -652,6 +679,7 @@ export function WorkspaceDraftComposer({
     handleCreateFromInput,
     initialCreateAttempt,
     isReadyForPendingAutoSubmit,
+    isDraftHistoryReady,
     serverId,
     setDraftAttachments,
     replaceDraftText,
@@ -698,7 +726,7 @@ export function WorkspaceDraftComposer({
         workspaceId={workspaceId}
         isPaneFocused={isPaneFocused}
         onSubmitMessage={handleCreateFromInput}
-        isSubmitLoading={isSubmitting}
+        isSubmitLoading={isSubmitting || !isDraftHistoryReady}
         blurOnSubmit={true}
         textSource={draftInput.textSource}
         onChangeText={draftInput.editText}

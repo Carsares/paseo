@@ -79,7 +79,8 @@ export async function runRestartCommand(options: CommandOptions, _command: Comma
       });
       return true;
     } catch (error) {
-      if (!isReconnectFailure(error)) throw error;
+      // A replacement PID cannot confirm that the old worker saved agent recovery.
+      if (resumeAgents || !isReconnectFailure(error)) throw error;
       return false;
     }
   };

@@ -49,6 +49,7 @@ function makeSubsystem(overrides: {
   const restartIntents: Parameters<DaemonSessionHost["emitLifecycleIntent"]>[0][] = [];
   const host: DaemonSessionHost = {
     emit: (msg) => emitted.push(msg),
+    prepareLifecycleIntent: async () => {},
     emitLifecycleIntent: (intent) => restartIntents.push(intent),
   };
   const paseoHome = makeHome();

@@ -5042,6 +5042,27 @@ test("sends explicit shutdown_server_request via shutdownServer", async () => {
   });
 });
 
+test("restartServer rejects agent resume when the daemon lacks support", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger: createMockLogger(),
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  await expect(
+    client.restartServer(undefined, "req-restart-resume", { resumeAgents: true }),
+  ).rejects.toThrow("cannot save running agents");
+  expect(mock.sent).toHaveLength(0);
+});
+
 test("restartServer remains restart-only and sends restart_server_request", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

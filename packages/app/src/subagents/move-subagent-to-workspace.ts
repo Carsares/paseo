@@ -1,3 +1,4 @@
+import { DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
 import type { Agent } from "@/stores/session-store";
 import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
 import { isWorkspaceRootAgent } from "./workspace-root-policy";
@@ -204,9 +205,11 @@ export interface MoveSubagentToWorkspaceDeps {
     agentId: string;
   }) => Promise<void> | void;
   reportError: (error: unknown) => void;
+  confirmRetry?: (error: DaemonConnectionError) => Promise<boolean>;
 }
 
 const inFlightKeys = new Set<string>();
+const pendingMoveKeys = new Map<string, string>();
 
 export async function requestMoveSubagentToWorkspace(
   input: { serverId: string; subagentId: string },
@@ -221,13 +224,30 @@ export async function requestMoveSubagentToWorkspace(
 
   try {
     const idempotencyKey =
+      pendingMoveKeys.get(key) ??
       deps.createIdempotencyKey?.() ??
       `move_ws_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-    const { workspaceId } = await deps.moveAgentToWorkspace({
-      serverId,
-      agentId: subagentId,
-      idempotencyKey,
-    });
+    pendingMoveKeys.set(key, idempotencyKey);
+    let workspaceId: string;
+    for (;;) {
+      try {
+        ({ workspaceId } = await deps.moveAgentToWorkspace({
+          serverId,
+          agentId: subagentId,
+          idempotencyKey,
+        }));
+        break;
+      } catch (error) {
+        if (!(error instanceof DaemonConnectionError)) {
+          pendingMoveKeys.delete(key);
+          throw error;
+        }
+        if (!deps.confirmRetry) throw error;
+        // The retry dialog outlives the original tab and its move menu.
+        if (!(await deps.confirmRetry(error))) return;
+      }
+    }
+    pendingMoveKeys.delete(key);
     await deps.openMovedWorkspace({ serverId, workspaceId, agentId: subagentId });
   } catch (error) {
     deps.reportError(error);

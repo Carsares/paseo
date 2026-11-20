@@ -1,5 +1,5 @@
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
-import { parentAddressLabels } from "@getpaseo/protocol/agent-labels";
+import { getParentAddressFromLabels, parentAddressLabels } from "@getpaseo/protocol/agent-labels";
 import type { ActiveTurnBehavior, AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -16,7 +16,11 @@ import type { ConnectedHosts } from "../../connected-hosts/index.js";
 import { resolveRequiredProviderModel } from "../mcp-shared.js";
 import { selectAgentListItems } from "../agent-projections.js";
 import { summarizeAgentActivity } from "../activity-curator.js";
-import { resolveInheritedHierarchyMode } from "../hierarchy-policy.js";
+import {
+  MAX_SUBAGENT_DEPTH,
+  REMOTE_HIERARCHY_DEPTH_LABEL,
+  resolveInheritedHierarchyMode,
+} from "../hierarchy-policy.js";
 import {
   inheritAgentBackground,
   inheritWorkspaceBackground,
@@ -199,11 +203,42 @@ const result = (structuredContent: unknown): PaseoToolResult => ({
   structuredContent,
 });
 
+function assertRemoteHierarchySupport(
+  client: DaemonClient,
+  callerAgentId: string | undefined,
+  labels: Record<string, string> | undefined,
+): void {
+  // COMPAT(agentHierarchyControl): added in v0.16.0, remove gate after 2027-05-19.
+  if (
+    callerAgentId &&
+    labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] === String(MAX_SUBAGENT_DEPTH) &&
+    client.getLastServerInfoMessage()?.features?.agentHierarchyControl !== true
+  ) {
+    throw new HostOperationRejectedError(
+      new Error("Update the destination Paseo host to create a Level-2 subagent."),
+    );
+  }
+}
+
+function shouldObserveRemoteFollowups(
+  client: DaemonClient,
+  labels: Record<string, string> | undefined,
+  notifyOnFinish: boolean | undefined,
+): boolean {
+  // COMPAT(agentFinishReportPull): added in v0.16.0, remove gate after 2027-05-19.
+  return (
+    notifyOnFinish !== false &&
+    labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] === "1" &&
+    client.getLastServerInfoMessage()?.features?.agentFinishReportPull === true
+  );
+}
+
 export function createHostResolver(input: {
   serverId: string;
   local: HostOperations;
   hosts: () => ToolHosts;
   callerAgentId?: string;
+  trackRemoteChild?(childAgentId: string, serverId: string): Promise<void>;
   /** The destination can't see the caller, so its background and mode defaults resolve before routing. */
   caller: () =>
     | (BackgroundCaller & {
@@ -228,6 +263,7 @@ export function createHostResolver(input: {
         action({
           async createAgent(args) {
             const parsed = remoteCreate.parse(args);
+            assertRemoteHierarchySupport(client, input.callerAgentId, parsed.labels);
             const { provider, model } = resolveRequiredProviderModel(parsed.provider);
             const caller = input.caller();
             // Same-provider children inherit the caller's mode, as they would on the same host.
@@ -238,7 +274,7 @@ export function createHostResolver(input: {
                 : undefined);
             const workspace = await client.findWorkspace(parsed.workspaceId);
             if (!workspace) throw new Error(`Workspace ${parsed.workspaceId} not found`);
-            const labels = {
+            const labels: Record<string, string> = {
               ...parsed.labels,
               ...(input.callerAgentId
                 ? parentAddressLabels({ agentId: input.callerAgentId, serverId: input.serverId })
@@ -261,6 +297,8 @@ export function createHostResolver(input: {
               initialPrompt: parsed.initialPrompt,
               idempotencyKey: parsed.idempotencyKey,
             });
+            if (shouldObserveRemoteFollowups(client, labels, parsed.notifyOnFinish))
+              await input.trackRemoteChild?.(snapshot.id, destination);
             return result({
               agentId: snapshot.id,
               type: snapshot.provider,
@@ -286,6 +324,20 @@ export function createHostResolver(input: {
             )?.agent;
             if (!agent)
               throw new HostOperationRejectedError(new Error(`Agent ${agentId} not found`));
+            const parent = getParentAddressFromLabels(agent.labels, destination);
+            if (
+              parent?.serverId === input.serverId &&
+              parent.agentId === input.callerAgentId &&
+              shouldObserveRemoteFollowups(
+                client,
+                agent.labels,
+                args.notifyOnFinish as boolean | undefined,
+              )
+            ) {
+              await input.trackRemoteChild?.(agentId, destination).catch((error) => {
+                throw new HostOperationRejectedError(error);
+              });
+            }
             const receipt = await client
               .sendMessage(agentId, args.prompt as string, {
                 sessionMode: input.callerAgentId

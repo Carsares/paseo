@@ -9,6 +9,7 @@ import {
   createDaemonCommandHandlers,
   isDesktopManagedDaemonPresentSync,
   isDesktopManagedDaemonRunningSync,
+  isManualUpdateHandoffInProgress,
   keepsTerminalsOnStop,
   resumesAgentsOnStop,
   stopCapturedDaemon,
@@ -39,6 +40,14 @@ const mocks = vi.hoisted(() => ({
   logError: vi.fn(),
   appLogPath: "",
   getElectronLogFile: vi.fn(),
+  confirmUpdate: vi.fn(),
+  installUpdate: vi.fn(),
+}));
+
+vi.mock("node:os", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:os")>()),
+  // Keep PID-lock checks independent of the host boot time and sandbox syscalls.
+  uptime: () => 3600,
 }));
 
 vi.mock("electron", () => ({
@@ -93,6 +102,12 @@ vi.mock("./cli/external.js", async (importOriginal) => ({
   runExternalCliTextCommand: mocks.runExternalCliTextCommand,
 }));
 
+vi.mock("../features/auto-updater.js", () => ({
+  checkForAppUpdate: vi.fn(),
+  confirmOfficialUpdateWithoutAgentResume: mocks.confirmUpdate,
+  downloadAndInstallUpdate: mocks.installUpdate,
+}));
+
 describe("daemon-manager commands", () => {
   let fixtureRoot: string;
 
@@ -112,6 +127,8 @@ describe("daemon-manager commands", () => {
     mocks.logError.mockReset();
     mocks.getElectronLogFile.mockReset();
     mocks.getElectronLogFile.mockReturnValue({ path: mocks.appLogPath });
+    mocks.confirmUpdate.mockReset();
+    mocks.installUpdate.mockReset();
   });
 
   afterEach(() => {
@@ -132,6 +149,65 @@ describe("daemon-manager commands", () => {
       ),
     });
   });
+
+  it.each(["stopped", "not_running"] as const)(
+    "restores the captured built-in daemon on cancellation only when the stop returned %s",
+    async (action) => {
+      const capturedHome = mocks.paseoHome;
+      mkdirSync(capturedHome);
+      const instance = {
+        pid: process.pid,
+        startedAt: new Date(Date.now() - 1_000).toISOString(),
+        hostname: hostname(),
+        uid: process.getuid?.() ?? 0,
+        listen: "127.0.0.1:6799",
+        desktopManaged: true,
+      };
+      const lockPath = path.join(capturedHome, "paseo.pid");
+      writeFileSync(lockPath, JSON.stringify(instance));
+      mocks.confirmUpdate.mockImplementation(async () => {
+        mocks.paseoHome = path.join(fixtureRoot, "other-home");
+        return true;
+      });
+      mocks.settings = { ...DEFAULT_DESKTOP_SETTINGS, officialUpdatesEnabled: true };
+      mocks.stopDaemonInstance.mockImplementation(async () => {
+        expect(isManualUpdateHandoffInProgress()).toBe(true);
+        await Promise.resolve();
+        mocks.settings = { ...DEFAULT_DESKTOP_SETTINGS, officialUpdatesEnabled: false };
+        rmSync(lockPath);
+        return { action, pid: instance.pid, forced: false, usedLifecycleRpc: false };
+      });
+      const restored = { ...instance, startedAt: new Date().toISOString() };
+      mocks.startDaemonInstance.mockImplementation(async () => {
+        writeFileSync(lockPath, JSON.stringify(restored));
+        return { instance: restored, spawned: true };
+      });
+      mocks.installUpdate.mockImplementation(async (_input, beforeQuit) => {
+        const restore = await beforeQuit({ version: "1.2.4" });
+        expect(mocks.settings.officialUpdatesEnabled).toBe(false);
+        await restore?.();
+        return { installed: false };
+      });
+
+      expect(await createDaemonCommandHandlers().install_app_update()).toEqual({
+        installed: false,
+      });
+      expect(mocks.confirmUpdate).toHaveBeenCalledExactlyOnceWith({ version: "1.2.4" }, "Cancel");
+      expect(mocks.stopDaemonInstance).toHaveBeenCalledExactlyOnceWith(
+        capturedHome,
+        expect.objectContaining({
+          instance: expect.objectContaining({ pid: instance.pid, startedAt: instance.startedAt }),
+        }),
+      );
+      expect(mocks.stopDaemonInstance.mock.calls[0]?.[1]).not.toHaveProperty("resumeAgents");
+      expect(mocks.startDaemonInstance.mock.calls).toEqual(
+        action === "stopped"
+          ? [[expect.objectContaining({ home: capturedHome, desktopManaged: true })]]
+          : [],
+      );
+      expect(isManualUpdateHandoffInProgress()).toBe(false);
+    },
+  );
 
   it("exposes updater diagnostics through the desktop command boundary", () => {
     const diagnostics = createDaemonCommandHandlers().desktop_update_diagnostics();
@@ -335,12 +411,8 @@ describe("desktop stops and terminals", () => {
     expect(reasons.filter((reason) => keepsTerminalsOnStop(reason, "win32"))).toEqual([]);
   });
 
-  it("resumes agents only after a preserve-work quit, app update, or version-mismatch restart", () => {
-    expect(reasons.filter(resumesAgentsOnStop)).toEqual([
-      "quit_preserve_work",
-      "app_update",
-      "version_mismatch",
-    ]);
+  it("resumes agents only for a preserve-work quit or a restart with the bundled daemon", () => {
+    expect(reasons.filter(resumesAgentsOnStop)).toEqual(["quit_preserve_work", "version_mismatch"]);
   });
 
   function stopHarness(runCliJson: (args: string[]) => Promise<unknown>) {

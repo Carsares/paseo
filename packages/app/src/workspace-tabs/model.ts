@@ -11,6 +11,7 @@ export interface WorkspaceDraftTabSetup {
   providerOptions: Record<string, unknown>;
   parentAgentId?: string | null;
   initialDraftText?: string | null;
+  restoreChatHistory?: boolean;
 }
 
 export interface WorkspaceWorkingDiffTabTarget {

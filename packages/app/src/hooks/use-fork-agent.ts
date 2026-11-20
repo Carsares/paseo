@@ -44,6 +44,7 @@ export type ForkAgentSource = Pick<
   | "thinkingOptionId"
   | "runtimeInfo"
   | "options"
+  | "subagentDraftOptions"
   | "projectPlacement"
 >;
 
@@ -166,14 +167,21 @@ export function buildSubagentDraftSetup(
   if (!normalizedParentId) return undefined;
   const setup = buildForkDraftSetup(agent);
   if (!setup) return undefined;
-  const fromMainControl = isMainControlAgent(agent);
+  if (!isMainControlAgent(agent)) return { ...setup, parentAgentId: normalizedParentId };
+  if (agent.subagentDraftOptions) {
+    return {
+      ...setup,
+      parentAgentId: normalizedParentId,
+      providerOptions: agent.subagentDraftOptions,
+    };
+  }
+  // COMPAT(subagentDraftOptions): added in v0.16.0, remove after 2027-05-01.
+  if (agent.provider === "opencode") return { ...setup, parentAgentId: normalizedParentId };
   return {
     ...setup,
     parentAgentId: normalizedParentId,
-    modeId: fromMainControl && setup.modeId === "read-only" ? null : setup.modeId,
-    providerOptions: fromMainControl
-      ? stripMainControlReadOnlyProviderOptions(setup.providerOptions)
-      : setup.providerOptions,
+    modeId: setup.modeId === "read-only" ? null : setup.modeId,
+    providerOptions: stripMainControlReadOnlyProviderOptions(setup.providerOptions),
   };
 }
 

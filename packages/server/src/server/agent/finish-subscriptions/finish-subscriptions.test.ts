@@ -145,7 +145,12 @@ test("restores a remote parent subscription and delivers to the owning host", as
   const store = createJsonFinishSubscriptionStore(first.home);
   const observation = new Observation();
   const callerIsActive = vi.fn(async () => false);
-  const sendMessage = vi.fn(async () => ({}));
+  const confirmed = Promise.withResolvers<{ deliveryStatus?: "queued" }>();
+  const sendMessage = vi
+    .fn<() => Promise<{ deliveryStatus?: "queued" }>>()
+    .mockResolvedValueOnce({ deliveryStatus: "queued" })
+    .mockRejectedValueOnce(new Error("Provider preparation failed"))
+    .mockImplementation(() => confirmed.promise);
   const fetchAgent = vi.fn(async () => ({ agent: { archivedAt: null } }));
   const use = vi.fn((_serverId: string, action: (client: DaemonClient) => Promise<unknown>) =>
     action({ sendMessage, fetchAgent } as unknown as DaemonClient),
@@ -163,6 +168,7 @@ test("restores a remote parent subscription and delivers to the owning host", as
       use: use as import("../host-operations/index.js").ToolHosts["use"],
     }),
     open: observation.open.bind(observation),
+    retryDelayMs: 1,
   });
   services.push(restarted);
   await restarted.start();
@@ -170,9 +176,15 @@ test("restores a remote parent subscription and delivers to the owning host", as
   const finished = outcome("idle");
   finished.final!.labels!["paseo.parent-server-id"] = "parent-host";
   observation.waits[0]!.result.resolve(finished);
+  await expect.poll(() => sendMessage.mock.calls.length).toBe(3);
+  expect(await store.list()).toHaveLength(1);
+  expect(sendMessage.mock.calls[1]).toEqual(sendMessage.mock.calls[0]);
+  expect(sendMessage.mock.calls[2]).toEqual(sendMessage.mock.calls[0]);
+  confirmed.resolve({});
   await expect.poll(async () => await store.list()).toEqual([]);
   expect(use).toHaveBeenCalledWith("parent-host", expect.any(Function), expect.any(AbortSignal));
-  expect(sendMessage).toHaveBeenCalledExactlyOnceWith(
+  expect(sendMessage).toHaveBeenNthCalledWith(
+    1,
     "parent",
     expect.stringContaining("Partial work saved"),
     {
@@ -180,6 +192,7 @@ test("restores a remote parent subscription and delivers to the owning host", as
       sourceAgentId: "child",
       sourceAgentServerId: "origin",
       activeTurnBehavior: "steer",
+      waitForDispatch: true,
     },
   );
   expect(callerIsActive).not.toHaveBeenCalled();
@@ -200,6 +213,59 @@ test("retains intent until parent dispatch acknowledgment, then restart sends no
   await first.service.close();
   const restarted = await scenario(first.home);
   expect(restarted.observation.waits).toHaveLength(0);
+});
+
+test("a one-way follow-up survives completion before the first poll", async () => {
+  const home = await mkdtemp(join(tmpdir(), "finish-followup-"));
+  homes.push(home);
+  const store = createJsonFinishSubscriptionStore(home);
+  const watches = createJsonFinishSubscriptionStore(home, "watches.json");
+  const reports = createJsonFinishSubscriptionStore(home, "reports.json");
+  const observation = new Observation();
+  const reverseAttempt = deferred<void>();
+  const service = createFinishSubscriptions({
+    store,
+    followups: { watches, reports, dispatch: async () => {} },
+    callerIsActive: async () => true,
+    messages: () => new Delivery(),
+    serverId: "origin",
+    logger: createTestLogger(),
+    open: observation.open.bind(observation),
+    retryDelayMs: 1,
+    hosts: () => ({
+      directory: async () => {
+        throw new Error("Unexpected host listing");
+      },
+      use: async () => {
+        reverseAttempt.resolve();
+        throw new HostObservationError("removed");
+      },
+    }),
+  });
+  services.push(service);
+  await service.start();
+
+  const pair = { ...intent, callerServerId: "parent-host" };
+  const address = { ...pair, sourceId: "parent-source" };
+  await service.register({ ...pair, followupReport: true, requireParentOwnership: true });
+  await until(() => observation.waits.length === 1);
+  const finished = outcome("idle");
+  finished.final!.labels!["paseo.parent-server-id"] = pair.callerServerId;
+  observation.waits[0]!.result.resolve(finished);
+  await reverseAttempt.promise;
+  expect(await watches.list()).toEqual([]);
+  expect(await reports.list()).toHaveLength(1);
+
+  const result = await service.pullReports(address, [], true, "active");
+  expect(result).toMatchObject({
+    ownsBinding: true,
+    reports: [{ prompt: expect.stringContaining("Partial work saved") }],
+  });
+  await expect.poll(() => store.list()).toEqual([]);
+  const retired = await service.pullReports(address, [], true, "unrelated");
+  expect(retired).toEqual({ ownsBinding: false, reports: [] });
+  expect(await watches.list()).toEqual([]);
+  expect(await reports.list()).toEqual([]);
 });
 
 test("restart coalesces predecessor and queued candidate into one settled notification", async () => {
@@ -243,6 +309,16 @@ test("accepted replacement ignores old idle and stale acknowledgment cannot dele
   await expect.poll(async () => (await state.store.list()).length).toBe(1);
   state.observation.waits[1]!.result.resolve(outcome("idle"));
   await until(() => state.delivery.prompts.length === 2);
+});
+
+test("a rejected candidate releases the preceding observer even if its cleanup write fails", async () => {
+  const state = await scenario(undefined, 1);
+  await state.service.register(intent);
+  await until(() => state.observation.waits.length === 1);
+  const candidate = await state.service.register(intent, true);
+  state.observation.waits[0]!.result.resolve(outcome());
+  await expect(candidate.reject()).rejects.toThrow("Subscription removal unavailable");
+  await until(() => state.delivery.prompts.length === 1);
 });
 
 test("shutdown before dispatch acknowledgment leaves intent for recovery", async () => {

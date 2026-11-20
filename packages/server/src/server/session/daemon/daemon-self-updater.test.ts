@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, onTestFinished, test } from "vitest";
@@ -107,6 +107,64 @@ async function runUpdate(input: {
 }
 
 describe("DaemonSelfUpdater", () => {
+  test.each([
+    { declaresSupport: true, sameVersion: true, samePackage: true, supported: true },
+    { declaresSupport: false, sameVersion: true, samePackage: true, supported: false },
+    { declaresSupport: true, sameVersion: false, samePackage: true, supported: false },
+    { declaresSupport: true, sameVersion: true, samePackage: false, supported: false },
+  ])(
+    "attests only the active worker package for the installed version ($declaresSupport, $sameVersion, $samePackage)",
+    async ({ declaresSupport, sameVersion, samePackage, supported }) => {
+      const root = mkdtempSync(path.join(tmpdir(), "paseo npm update "));
+      onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+      const packagePath = path.join(root, "node_modules", "@getpaseo", "cli");
+      const server = path.join(packagePath, "node_modules", "@getpaseo", "server");
+      const launcherDir = path.join(packagePath, "dist", "commands", "daemon");
+      mkdirSync(launcherDir, { recursive: true });
+      writeFileSync(path.join(launcherDir, "local-daemon.js"), "");
+      mkdirSync(path.join(server, "dist", "server", "server"), { recursive: true });
+      writeFileSync(path.join(server, "dist", "server", "server", "daemon-worker.js"), "");
+      const inspect = (version: string) => ({
+        version,
+        packagePath,
+        globalRootPath: root,
+        isLinked: false,
+      });
+      let install = inspect("0.1.15");
+      const { result } = await runUpdate({
+        runtime: {
+          npm: {
+            inspect: async () => install,
+            installLatest: async () => {
+              install = inspect("0.1.96");
+              const manifest = {
+                name: "@getpaseo/server",
+                version: sameVersion ? install.version : "0.1.95",
+                main: "dist/server/server/daemon-worker.js",
+                paseoAgentResumeOnRestart: declaresSupport,
+              };
+              writeFileSync(path.join(server, "package.json"), JSON.stringify(manifest));
+              if (!samePackage) {
+                const other = path.join(launcherDir, "node_modules", "@getpaseo", "server");
+                mkdirSync(path.join(other, "dist", "server", "server"), { recursive: true });
+                writeFileSync(path.join(other, "package.json"), JSON.stringify(manifest));
+                writeFileSync(path.join(other, manifest.main), "");
+              }
+              return { exitCode: 0, stdout: "", stderr: "" };
+            },
+          },
+          installOrigin: { resolveCurrentServerPackageRoot: () => server },
+        },
+      });
+      expect(result).toEqual({
+        success: true,
+        error: null,
+        newVersion: "0.1.96",
+        ...(supported ? { agentResumeSupported: true } : {}),
+      });
+    },
+  );
+
   test("probes and updates the running install's prefix when npm defaults elsewhere", async () => {
     const prefix = mkdtempSync(path.join(tmpdir(), "custom npm prefix "));
     onTestFinished(() => rmSync(prefix, { recursive: true, force: true }));

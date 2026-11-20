@@ -1037,6 +1037,53 @@ describe("useAgentHistory archive scope", () => {
     expect(result.current.ancestors).toMatchObject([{ id: "parent", archivedAt: new Date(date) }]);
   });
 
+  it("leaves the moved placement in cache when a workspace-scoped archive is refused", async () => {
+    const mutation = Promise.withResolvers<{ archivedAt: string }>();
+    const client = createClient([]);
+    configureHosts([{ serverId: "server-a", serverLabel: "MacBook", client }], ["server-a"]);
+    const archiveAgent = vi.fn(() => mutation.promise);
+    featureState.sessions["server-a"].client = { archiveAgent };
+
+    const queryClient = new QueryClient();
+    const listKey = ["allAgents", "server-a"];
+    const entry = { agent: { id: "parent", workspaceId: "old-workspace" } };
+    const moved = { agent: { ...entry.agent, workspaceId: "new-workspace" } };
+    queryClient.setQueryData(listKey, { entries: [entry] });
+
+    const archivedBefore = runtime.archiveAgentSnapshot.mock.calls.length;
+    const restoredBefore = runtime.restoreAgentSnapshot.mock.calls.length;
+    const { result } = renderHook(useArchiveAgent, {
+      wrapper: ({ children }: PropsWithChildren) =>
+        createElement(QueryClientProvider, { client: queryClient }, children),
+    });
+    let failed!: Promise<unknown>;
+    const captureError = (error: unknown) => error;
+    act(() => {
+      failed = result.current
+        .archiveAgent({
+          serverId: "server-a",
+          agentId: "parent",
+          expectedWorkspaceId: "old-workspace",
+        })
+        .catch(captureError);
+    });
+
+    await waitFor(() =>
+      expect(archiveAgent).toHaveBeenCalledExactlyOnceWith("parent", "old-workspace"),
+    );
+    expect(queryClient.getQueryData(listKey)).toEqual({ entries: [entry] });
+    queryClient.setQueryData(listKey, { entries: [moved] });
+
+    const staleClose = new Error("Agent parent is no longer in workspace old-workspace");
+    await act(async () => {
+      mutation.reject(staleClose);
+      expect(await failed).toBe(staleClose);
+    });
+    expect(queryClient.getQueryData(listKey)).toEqual({ entries: [moved] });
+    expect(runtime.archiveAgentSnapshot).toHaveBeenCalledTimes(archivedBefore);
+    expect(runtime.restoreAgentSnapshot).toHaveBeenCalledTimes(restoredBefore);
+  });
+
   it("rolls back the archived session without losing pages loaded while the mutation was pending", async () => {
     const mutation = Promise.withResolvers<{ archivedAt: string }>();
     const client = createClient([]);

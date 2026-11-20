@@ -44,6 +44,36 @@ it("shows the Web letter spacing field and hides it on native", () => {
 });
 
 it.each([
+  {
+    label: "Content line height multiplier",
+    draft: "1,73",
+    settings: { contentLineHeightMultiplier: 1.73 },
+    native: true,
+  },
+  {
+    label: "Content character spacing",
+    draft: "0,5",
+    settings: { contentLetterSpacing: 0.5 },
+    native: false,
+  },
+])("saves the decimal comma entered in $label", ({ label, draft, settings, native }) => {
+  platform.native = native;
+  platform.compact = false;
+  render(<AppearanceSection />);
+  const field = screen.getByLabelText<HTMLInputElement>(label);
+  const original = field.value;
+
+  fireEvent.change(field, { target: { value: `${draft}.6` } });
+  fireEvent.blur(field);
+  expect(field.value).toBe(original);
+  expect(updateSettings).not.toHaveBeenCalled();
+
+  fireEvent.change(field, { target: { value: draft } });
+  fireEvent.blur(field);
+  expect(updateSettings).toHaveBeenCalledExactlyOnceWith(settings);
+});
+
+it.each([
   { compact: true, defaultSpacing: 12, override: 16 },
   { compact: false, defaultSpacing: 16, override: 12 },
 ])("keeps the $defaultSpacing px paragraph default and saves an override", (input) => {

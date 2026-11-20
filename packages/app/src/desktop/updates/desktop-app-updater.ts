@@ -102,6 +102,16 @@ function getErrorMessage(error: unknown): string {
   return String(error);
 }
 
+function formatUpToDateStatus(
+  lastCheckedAt: number | null,
+  formatLastCheckedAt: (timestamp: number) => string,
+): string {
+  if (lastCheckedAt == null) return i18n.t("desktop.updates.status.upToDate");
+  return i18n.t("desktop.updates.status.upToDateWithLastChecked", {
+    time: formatLastCheckedAt(lastCheckedAt),
+  });
+}
+
 export function formatStatusText(input: {
   status: DesktopAppUpdateStatus;
   availableUpdate: DesktopAppUpdateCheckResult | null;
@@ -128,12 +138,7 @@ export function formatStatusText(input: {
   }
 
   if (status === "up-to-date") {
-    if (lastCheckedAt != null) {
-      return i18n.t("desktop.updates.status.upToDateWithLastChecked", {
-        time: formatLastCheckedAt(lastCheckedAt),
-      });
-    }
-    return i18n.t("desktop.updates.status.upToDate");
+    return installMessage ?? formatUpToDateStatus(lastCheckedAt, formatLastCheckedAt);
   }
 
   if (status === "pending") {

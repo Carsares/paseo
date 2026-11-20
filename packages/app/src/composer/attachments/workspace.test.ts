@@ -15,6 +15,10 @@ import { removeSentContextAttachments } from "./workspace-cleanup";
 
 vi.mock("lucide-react-native", () => import("../../../test-stubs/lucide-react-native"));
 vi.mock("react-native-unistyles", () => import("../../../test-stubs/react-native-unistyles"));
+const toastError = vi.hoisted(() => vi.fn());
+vi.mock("@/contexts/toast-api-context", () => ({
+  useOptionalToast: () => ({ error: toastError }),
+}));
 vi.mock("@/utils/navigate-to-agent", () => ({
   openForkSourceAgent: vi.fn(async () => true),
 }));
@@ -86,6 +90,7 @@ describe("workspace composer attachment cleanup", () => {
 describe("workspace composer attachment opening", () => {
   beforeEach(() => {
     vi.mocked(openForkSourceAgent).mockClear();
+    toastError.mockClear();
   });
 
   function renderBinding(workspaceAttachments: WorkspaceComposerAttachment[]) {
@@ -103,6 +108,18 @@ describe("workspace composer attachment opening", () => {
     expect(openForkSourceAgent).toHaveBeenCalledWith(
       expect.objectContaining({ serverId: "local", sourceAgentId: "agent-1" }),
     );
+  });
+
+  it("shows a toast when looking up a draft history source fails", () => {
+    const attachment = chatHistoryAttachment();
+    vi.mocked(openForkSourceAgent).mockImplementationOnce(async (input) => {
+      input.onError?.(new Error("History lookup failed"));
+      return false;
+    });
+    const { result } = renderBinding([attachment]);
+
+    expect(result.current.openAttachment({ attachment })).toBe(true);
+    expect(toastError).toHaveBeenCalledExactlyOnceWith("History lookup failed");
   });
 
   it("does not open anything for a chat history attachment without a source agent", () => {
