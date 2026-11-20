@@ -11,13 +11,15 @@ import type {
   FetchAgentHistoryOptions,
 } from "@getpaseo/client/internal/daemon-client";
 import type { AgentHistoryClient, AgentHistoryHost } from "./use-agent-history";
-import { allAgentHistoryQueryKey } from "./agent-history-query-key";
-import { markAgentArchivedInHistoryCache } from "./use-archive-agent";
+import { agentHistoryQueryKey, allAgentHistoryQueryKey } from "./agent-history-query-key";
+import { markAgentArchivedInHistoryCache, useArchiveAgent } from "./use-archive-agent";
 
 interface HistoryFeatureState {
   sessions: Record<
     string,
     {
+      agents?: Map<string, never>;
+      client?: Pick<DaemonClient, "archiveAgent">;
       serverInfo: {
         features: {
           agentHistorySearch: boolean;
@@ -38,6 +40,8 @@ let registeredHosts: Array<{ serverId: string; label: string }> = [];
 let featureState: HistoryFeatureState = { sessions: {} };
 const runtime = {
   getClient: (id: string) => runtimeHosts.find(({ serverId }) => serverId === id)?.client,
+  archiveAgentSnapshot: vi.fn(),
+  restoreAgentSnapshot: vi.fn(),
 };
 vi.mock("@/runtime/host-runtime", () => ({
   getHostRuntimeStore: () => runtime,
@@ -45,7 +49,10 @@ vi.mock("@/runtime/host-runtime", () => ({
   useHostRuntimeConnectionStatuses: () => onlineStatuses,
 }));
 vi.mock("@/stores/session-store", () => ({
-  useSessionStore: (select: (state: HistoryFeatureState) => unknown) => select(featureState),
+  useSessionStore: Object.assign(
+    (select: (state: HistoryFeatureState) => unknown) => select(featureState),
+    { getState: () => featureState },
+  ),
 }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 
@@ -835,37 +842,41 @@ describe("useAgentHistory archive scope", () => {
         { serverId: "server-a", serverLabel: "First", client: primary },
         { serverId: "server-b", serverLabel: "Second", client: legacy },
       ],
-      ["server-a", "server-b"],
+      ["server-a"],
+      ["server-a"],
     );
+    featureState.sessions["server-b"].serverInfo.features.agentHistorySearch = false;
+    const controls = { archiveScope: "archived", search: "atlas", searchScope: "agent" } as const;
     const { result, queryClient, rerender } = renderHistory({
+      ...controls,
       projectKeysByServer: new Map([
         ["server-b", [" "]],
         ["server-a", ["z", "a", "z", ""]],
       ]),
     });
     await waitFor(() => expect(result.current.isLoading).toBe(false));
-    expect(primary.calls[0]?.filter).toEqual({ projectKeys: ["a", "z"] });
+    expect(result.current).toMatchObject({
+      isSearchSupported: true,
+      isArchiveScopeSupported: true,
+      isQueryControlsSupported: true,
+    });
+    expect(primary.calls[0]).toMatchObject({
+      filter: { projectKeys: ["a", "z"] },
+      search: "atlas",
+      archiveScope: "archived",
+      searchScope: "agent",
+    });
     expect(legacy.calls).toHaveLength(0);
 
-    rerender({ projectKeysByServer: new Map([["server-a", ["a", "z"]]]) });
+    rerender({ ...controls, projectKeysByServer: new Map([["server-a", ["a", "z"]]]) });
     expect(queryClient.getQueryCache().getAll()).toHaveLength(1);
 
     rerender({ projectKeysByServer: new Map([["server-b", [" "]]]) });
-    await waitFor(() =>
-      expect(
-        queryClient.getQueryState([
-          "allAgentHistory",
-          "server-a",
-          "server-b",
-          "",
-          { projectKeys: [] },
-        ])?.status,
-      ).toBe("success"),
-    );
     expect(result.current).toMatchObject({
       agents: [],
       hostErrors: [],
       isError: false,
+      isInitialLoad: false,
       hasMore: false,
     });
     expect(primary.calls).toHaveLength(1);
@@ -1024,5 +1035,70 @@ describe("useAgentHistory archive scope", () => {
     });
     await waitFor(() => expect(result.current.agents.map(getId)).toEqual(["child"]));
     expect(result.current.ancestors).toMatchObject([{ id: "parent", archivedAt: new Date(date) }]);
+  });
+
+  it("rolls back the archived session without losing pages loaded while the mutation was pending", async () => {
+    const mutation = Promise.withResolvers<{ archivedAt: string }>();
+    const client = createClient([]);
+    configureHosts([{ serverId: "server-a", serverLabel: "MacBook", client }], ["server-a"]);
+    featureState.sessions["server-a"].client = { archiveAgent: () => mutation.promise };
+    featureState.sessions["server-a"].agents = new Map<string, never>();
+    const queryClient = new QueryClient();
+    const single = [...agentHistoryQueryKey("server-a"), ""];
+    const all = [...allAgentHistoryQueryKey(["server-a", "server-b"]), ""];
+    const unloaded = [...all, { archiveScope: "archived" }];
+    const target: { id: string; serverId: string; archivedAt: Date | null } = {
+      id: "parent",
+      serverId: "server-a",
+      archivedAt: null,
+    };
+    const alreadyArchived: typeof target = {
+      ...target,
+      archivedAt: new Date("2026-04-02T10:00:00.000Z"),
+    };
+    const otherHost = { ...target, serverId: "server-b" };
+    const firstPage = { agents: [target, otherHost], ancestors: [alreadyArchived] };
+    const laterPage = { agents: [{ ...target, id: "new-page" }], ancestors: [target] };
+    const initial = { pages: [firstPage], pageParams: [null] as Array<string | null> };
+    const afterPagination = { pages: [firstPage, laterPage], pageParams: [null, "next"] };
+    for (const key of [single, all]) queryClient.setQueryData(key, initial);
+    queryClient.getQueryCache().build(queryClient, { queryKey: unloaded });
+    const { result } = renderHook(useArchiveAgent, {
+      wrapper: ({ children }: PropsWithChildren) =>
+        createElement(QueryClientProvider, { client: queryClient }, children),
+    });
+
+    let failed!: Promise<unknown>;
+    const captureError = (error: unknown) => error;
+    act(() => {
+      failed = result.current
+        .archiveAgent({ serverId: target.serverId, agentId: target.id })
+        .catch(captureError);
+    });
+    await waitFor(() => {
+      for (const key of [single, all]) {
+        expect(
+          queryClient.getQueryData<typeof initial>(key)?.pages[0].agents[0].archivedAt,
+        ).toBeInstanceOf(Date);
+      }
+    });
+    for (const key of [single, all]) {
+      queryClient.setQueryData<typeof initial>(
+        key,
+        (current) =>
+          current && {
+            pages: [...current.pages, laterPage],
+            pageParams: [...current.pageParams, "next"],
+          },
+      );
+    }
+    queryClient.setQueryData(unloaded, { pages: [laterPage], pageParams: [null] });
+
+    await act(async () => {
+      mutation.reject(new Error("Archive failed"));
+      expect(await failed).toEqual(new Error("Archive failed"));
+    });
+    for (const key of [single, all]) expect(queryClient.getQueryData(key)).toEqual(afterPagination);
+    expect(queryClient.getQueryData(unloaded)).toEqual({ pages: [laterPage], pageParams: [null] });
   });
 });

@@ -35,7 +35,14 @@ import {
   PARENT_AGENT_ID_LABEL,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
-import { readAgentHierarchyPath, validateCanSpawnChild } from "../hierarchy-policy.js";
+import {
+  readAgentHierarchyPath,
+  MAX_SUBAGENT_DEPTH,
+  REMOTE_HIERARCHY_DEPTH_LABEL,
+  resolveInheritedHierarchyMode,
+  resolveInheritedHierarchyOptions,
+  validateCanSpawnChild,
+} from "../hierarchy-policy.js";
 
 /** How a workspace this creation makes inherits its creator's visibility. */
 interface McpWorkspaceIntent {
@@ -44,6 +51,7 @@ interface McpWorkspaceIntent {
 }
 
 export interface CreateAgentCommandDependencies {
+  serverId?: string;
   finishSubscriptions?: FinishSubscriptions;
   agentManager: AgentManager;
   agentStorage: AgentStorage;
@@ -160,8 +168,19 @@ export async function registerParentFinishSubscription({
   const agent = agentManager.getAgent(agentId) ?? (await agentStorage.get(agentId));
   const parentId = getParentAgentIdFromLabels(agent?.labels);
   if (!parentId || parentId === agentId) return;
-  if (serverId && getParentAddressFromLabels(agent?.labels, serverId)?.serverId !== serverId)
-    return;
+  const parentAddress = serverId && getParentAddressFromLabels(agent?.labels, serverId);
+  if (parentAddress && parentAddress.serverId !== serverId) {
+    if (agent?.labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] === String(MAX_SUBAGENT_DEPTH)) return;
+    return finishSubscriptions.register(
+      {
+        childAgentId: agentId,
+        callerAgentId: parentId,
+        callerServerId: parentAddress.serverId,
+        requireParentOwnership: true,
+      },
+      true,
+    );
+  }
   const storedParent = await agentStorage.get(parentId);
   if (storedParent ? storedParent.archivedAt : !agentManager.getAgent(parentId)) return;
   return finishSubscriptions.register(
@@ -386,6 +405,7 @@ async function resolveMcpCreateAgent(
       ? { id: parentAgent.id, cwd: parentAgent.cwd, workspaceId: parentAgent.workspaceId }
       : null,
     labels: input.labels,
+    serverId: dependencies.serverId,
     childAgentDefaultLabels: input.callerContext?.childAgentDefaultLabels,
     legacyDetached: input.detached ?? false,
     resolveWorkspace: async (workspaceId) => ({ workspaceId, cwd: resolvedCwd }),
@@ -459,12 +479,24 @@ async function resolveMcpProviderCreateConfig(params: {
   parentAgent: ManagedAgent | null;
 }): Promise<{ modeId?: string; providerOptions?: ProviderOptions }> {
   const passthroughConfig = params.input.config;
+  const parent = params.parentAgent;
   return params.dependencies.providerSnapshotManager.resolveCreateConfig({
     cwd: params.resolvedCwd,
     provider: params.provider,
     requestedMode: params.input.mode ?? passthroughConfig?.modeId,
     providerOptions: mergeMcpProviderOptions(params.input),
-    parent: params.parentAgent,
+    parent: parent && {
+      ...parent,
+      currentModeId: resolveInheritedHierarchyMode(parent.currentModeId, parent.labels) ?? null,
+      config: {
+        ...parent.config,
+        providerOptions: resolveInheritedHierarchyOptions(
+          parent.config.providerOptions,
+          parent.labels,
+        ),
+      },
+      effectiveOptions: resolveInheritedHierarchyOptions(parent.effectiveOptions, parent.labels),
+    },
     unattended: params.input.unattended ?? false,
   });
 }

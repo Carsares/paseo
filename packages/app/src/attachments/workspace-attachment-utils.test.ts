@@ -75,7 +75,11 @@ describe("workspace attachment utilities", () => {
       contextKind: "chat_history",
       title: "Chat history",
       text: "Previous chat.",
-      forkContext: { sourceAgentId: "agent-1", boundaryMessageId: "message-9" },
+      forkContext: {
+        sourceServerId: "local",
+        sourceAgentId: "agent-1",
+        boundaryMessageId: "message-9",
+      },
     });
   });
 });

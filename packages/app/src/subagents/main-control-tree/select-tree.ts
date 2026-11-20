@@ -104,6 +104,7 @@ export function isWorkspaceRootAgent(
     agent &&
     agent.workspaceId === workspaceId &&
     !agent.archivedAt &&
+    !agent.background &&
     !getParentAgentIdFromLabels(agent.labels),
   );
 }

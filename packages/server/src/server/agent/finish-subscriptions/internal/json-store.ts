@@ -8,6 +8,7 @@ const recordsSchema = z.array(
   z.object({
     id: z.string().min(1),
     callerAgentId: z.string().min(1),
+    callerServerId: z.string().min(1).optional(),
     childAgentId: z.string().min(1),
     serverId: z.string().min(1).optional(),
     requireParentOwnership: z.boolean().optional(),

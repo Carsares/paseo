@@ -30,6 +30,10 @@ import { isWeb } from "@/constants/platform";
 
 const NO_METADATA: Record<string, JsonValue> = {};
 
+export interface DraftComposerTextSource extends ComposerTextSource {
+  peekPendingText: () => string | null;
+}
+
 type AttachmentUpdater =
   | UserComposerAttachment[]
   | ((prev: UserComposerAttachment[]) => UserComposerAttachment[]);
@@ -62,7 +66,7 @@ type DraftComposerState = UseAgentFormStateResult & {
 };
 
 export interface AgentInputDraft {
-  textSource: ComposerTextSource;
+  textSource: DraftComposerTextSource;
   editText: (text: string) => void;
   replaceText: (text: string) => void;
   textReplacement: TextReplacement;
@@ -99,8 +103,16 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
         : [],
     ),
   );
-  const textSource = useMemo<ComposerTextSource>(
+  const textPublication = useMemo(
+    () =>
+      new AfterPaintPublication<string>((nextText) => {
+        useDraftStore.getState().editDraftText({ draftKey, text: nextText });
+      }),
+    [draftKey],
+  );
+  const textSource = useMemo<DraftComposerTextSource>(
     () => ({
+      peekPendingText: () => textPublication.peek(),
       getSnapshot: () => {
         const record = useDraftStore.getState().drafts[draftKey];
         return record?.lifecycle === "active" ? record.input.text : "";
@@ -114,7 +126,7 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
             listener();
         }),
     }),
-    [draftKey],
+    [draftKey, textPublication],
   );
   const attachmentFocusRequestId = useDraftStore(
     (state) => state.attachmentFocusRequestByDraftKey[draftKey] ?? 0,
@@ -146,14 +158,6 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
     [draftKey],
   );
 
-  const textPublication = useMemo(
-    () =>
-      new AfterPaintPublication<string>((nextText) => {
-        useDraftStore.getState().editDraftText({ draftKey, text: nextText });
-      }),
-    [draftKey],
-  );
-
   // Text another module put in the draft (a plugin writing to a composer that is not on screen)
   // reaches the input the way a rewind restore does.
   const replacementRequest = useDraftStore(
@@ -171,12 +175,16 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
   const editText = useCallback(
     (nextText: string) => {
       if (isWeb) {
+        if (nextText === textSource.getSnapshot()) {
+          textPublication.cancel();
+          return;
+        }
         textPublication.stage(nextText);
       } else {
         useDraftStore.getState().editDraftText({ draftKey, text: nextText });
       }
     },
-    [draftKey, textPublication],
+    [draftKey, textPublication, textSource],
   );
 
   const replaceText = useCallback(
@@ -216,7 +224,7 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
 
   useEffect(() => {
     const flushWhenHidden = () => {
-      if (document.visibilityState === "hidden") textPublication.flush();
+      if (isWeb && document.visibilityState === "hidden") textPublication.flush();
     };
     const flush = () => textPublication.flush();
     const canListenForPageHide =

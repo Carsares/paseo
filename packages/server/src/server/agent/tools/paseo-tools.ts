@@ -120,20 +120,17 @@ import { isPaseoToolEnabled } from "../paseo-tool-policy.js";
 import {
   applyHierarchyPaseoToolPolicy,
   computeAgentDepth,
+  hasReservedHierarchyLabels,
   readAgentHierarchyPath,
   REMOTE_HIERARCHY_DEPTH_LABEL,
+  RESERVED_HIERARCHY_LABELS_ERROR,
   requiresSingleHopOrchestration,
+  resolveInheritedHierarchyOptions,
   validateCanSpawnChild,
   validateSingleHopOrchestration,
   type HierarchyAgent,
 } from "../hierarchy-policy.js";
-import {
-  getParentAddressFromLabels,
-  MAIN_PRIOR_MODE_ID_LABEL,
-  PARENT_AGENT_ID_LABEL,
-  PARENT_SERVER_ID_LABEL,
-  WORKSPACE_ROLE_LABEL,
-} from "@getpaseo/protocol/agent-labels";
+import { getParentAddressFromLabels } from "@getpaseo/protocol/agent-labels";
 
 export interface PaseoToolHostDependencies {
   agentMessages?: () => AgentMessageDelivery;
@@ -995,7 +992,12 @@ function createToolCatalog(
     if (callerAgent?.provider !== selectedProvider || !callerAgent.config?.providerOptions) {
       return undefined;
     }
-    return { providerOptions: callerAgent.config.providerOptions };
+    return {
+      providerOptions: resolveInheritedHierarchyOptions(
+        callerAgent.config.providerOptions,
+        callerAgent.labels,
+      ),
+    };
   };
 
   const resolveScopedCwd = (requestedCwd?: string, opts?: { required?: boolean }): string => {
@@ -1748,6 +1750,7 @@ function createToolCatalog(
       const inheritedConfig = resolveInheritedProviderConfig(selectedProvider);
       const { snapshot, initialPromptStarted } = await createAgentCommand(
         {
+          serverId: options.serverId,
           agentManager,
           agentStorage,
           finishSubscriptions: options.finishSubscriptions?.(),
@@ -1771,12 +1774,7 @@ function createToolCatalog(
           workspaceId: resolvedArgs.workspaceId,
           thinking: parsedArgs.settings?.thinkingOptionId,
           providerOptions: parsedArgs.settings?.features,
-          labels: {
-            ...parsedArgs.labels,
-            ...(callerAgentId && !resolvedArgs.detached && options.serverId
-              ? { "paseo.parent-server-id": options.serverId }
-              : {}),
-          },
+          labels: parsedArgs.labels,
           mode: parsedArgs.settings?.modeId,
           promptFailure: "throw",
           notifyOnFinish,
@@ -2419,17 +2417,8 @@ function createToolCatalog(
       },
     },
     async ({ agentId, name, labels, settings }) => {
-      if (
-        labels &&
-        [
-          PARENT_AGENT_ID_LABEL,
-          PARENT_SERVER_ID_LABEL,
-          WORKSPACE_ROLE_LABEL,
-          MAIN_PRIOR_MODE_ID_LABEL,
-          REMOTE_HIERARCHY_DEPTH_LABEL,
-        ].some((label) => label in labels)
-      ) {
-        throw new PaseoToolInputError("Change agent hierarchy through the workspace controls.");
+      if (hasReservedHierarchyLabels(labels)) {
+        throw new PaseoToolInputError(RESERVED_HIERARCHY_LABELS_ERROR);
       }
       if (settings?.modeId !== undefined) {
         await agentManager.setAgentMode(agentId, settings.modeId);

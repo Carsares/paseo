@@ -47,11 +47,34 @@ import { isWeb } from "@/constants/platform";
 import {
   buildWorkspaceTabPersistenceKey,
   type WorkspaceDraftTabSetup,
+  type WorkspaceTabTarget,
 } from "@/workspace-tabs/model";
+import { openPreferredWorkspaceTarget } from "@/workspace-tabs/open-beside";
 import { openWorkspaceChanges } from "@/workspace-tabs/open-supporting-view";
-import { useSettings } from "@/hooks/use-settings";
+import { useSettings, type OpenInSidePanePreferences } from "@/hooks/use-settings";
 import { draftCreationKey } from "@/composer/draft/creation-key";
 import { ParentAgentPill } from "@/subagents/parent";
+
+export function isDraftTabSubmitting(target: WorkspaceTabTarget | null | undefined): boolean {
+  return (
+    target?.kind === "draft" &&
+    useCreateFlowStore.getState().pendingByDraftId[target.draftId]?.lifecycle === "active"
+  );
+}
+
+export function revealCreatedDraftAgentTab(input: {
+  workspaceKey: string;
+  target: Extract<WorkspaceTabTarget, { kind: "agent" }>;
+  preferences: OpenInSidePanePreferences;
+}): void {
+  const openedTabId = openPreferredWorkspaceTarget({ ...input, source: "subagents" });
+  // A compact reveal can open a sheet. The completed draft needs a workspace tab.
+  const store = useWorkspaceLayoutStore.getState();
+  const sheet = store.sheetsByWorkspace[input.workspaceKey]?.find(
+    (entry) => entry.tab.tabId === openedTabId,
+  );
+  if (sheet) store.openTabInFront(input.workspaceKey, sheet);
+}
 
 interface AutoSubmitConfig {
   provider: string;
@@ -180,7 +203,7 @@ export async function submitDraftCreateRequest(input: {
   const request = {
     config,
     workspaceId,
-    ...(callerAgentId ? { callerAgentId } : {}),
+    ...(callerAgentId ? { callerAgentId, initialPromptOrigin: "user" as const } : {}),
     initialPrompt: text,
     clientMessageId: attempt.clientMessageId,
     ...(Object.keys(composerState.metadata).length > 0 ? { metadata: composerState.metadata } : {}),

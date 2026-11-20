@@ -25,6 +25,7 @@ import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative, isWeb } from "@/constants/platform";
 import { useOptionalToast } from "@/contexts/toast-api-context";
+import { toErrorMessage } from "@/utils/error-messages";
 import { useRevealedText, type MarkdownPhase } from "@/hooks/use-revealed-text";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
@@ -389,18 +390,22 @@ function UserMessageAttachmentFrame({ attachment, serverId }: UserMessageAttachm
   const toast = useOptionalToast();
   const content = getAgentAttachmentPillContent(attachment, t);
   // Messages sent before fork context was recorded have no source id and stay read-only.
-  const forkSourceAgentId =
+  const forkContext =
     attachment.type === "text" && attachment.contextKind === "chat_history"
-      ? attachment.forkContext?.sourceAgentId?.trim()
+      ? attachment.forkContext
       : undefined;
-  const canOpenForkSource = Boolean(forkSourceAgentId && serverId);
+  const forkSourceAgentId = forkContext?.sourceAgentId?.trim();
+  const forkSourceServerId = forkContext?.sourceServerId?.trim() || serverId?.trim();
+  const canOpenForkSource = Boolean(forkSourceAgentId && forkSourceServerId);
   const handlePress = useCallback(() => {
     void openForkSourceAgent({
-      serverId,
+      serverId: forkSourceServerId,
       sourceAgentId: forkSourceAgentId,
       onNotFound: () => toast?.error(t("agentPanel.states.notFound")),
+      onError: (error) =>
+        toast?.error(toErrorMessage(error) || t("workspace.terminal.hostDisconnected")),
     });
-  }, [forkSourceAgentId, serverId, t, toast]);
+  }, [forkSourceAgentId, forkSourceServerId, t, toast]);
   return (
     <AttachmentFrame
       onPress={canOpenForkSource ? handlePress : undefined}

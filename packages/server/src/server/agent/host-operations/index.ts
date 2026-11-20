@@ -16,6 +16,7 @@ import type { ConnectedHosts } from "../../connected-hosts/index.js";
 import { resolveRequiredProviderModel } from "../mcp-shared.js";
 import { selectAgentListItems } from "../agent-projections.js";
 import { summarizeAgentActivity } from "../activity-curator.js";
+import { resolveInheritedHierarchyMode } from "../hierarchy-policy.js";
 import {
   inheritAgentBackground,
   inheritWorkspaceBackground,
@@ -204,7 +205,13 @@ export function createHostResolver(input: {
   hosts: () => ToolHosts;
   callerAgentId?: string;
   /** The destination can't see the caller, so its background and mode defaults resolve before routing. */
-  caller: () => (BackgroundCaller & { provider: string; currentModeId: string | null }) | null;
+  caller: () =>
+    | (BackgroundCaller & {
+        provider: string;
+        currentModeId: string | null;
+        labels?: Record<string, string>;
+      })
+    | null;
   lockedCwd?: string;
 }) {
   return {
@@ -226,7 +233,9 @@ export function createHostResolver(input: {
             // Same-provider children inherit the caller's mode, as they would on the same host.
             const modeId =
               parsed.settings?.modeId ??
-              (caller?.provider === provider ? (caller.currentModeId ?? undefined) : undefined);
+              (caller?.provider === provider
+                ? (resolveInheritedHierarchyMode(caller.currentModeId, caller.labels) ?? undefined)
+                : undefined);
             const workspace = await client.findWorkspace(parsed.workspaceId);
             if (!workspace) throw new Error(`Workspace ${parsed.workspaceId} not found`);
             const labels = {

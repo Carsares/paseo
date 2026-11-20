@@ -2435,8 +2435,11 @@ export class Session {
   private async buildProjectPlacementForWorkspaceId(
     workspaceId: string,
     includeHistoryMetadata = false,
+    workspaces?: ReadonlyMap<string, PersistedWorkspaceRecord>,
   ): Promise<ProjectPlacementPayload | null> {
-    const workspace = await this.workspaceRegistry.get(workspaceId);
+    const workspace = workspaces
+      ? workspaces.get(workspaceId)
+      : await this.workspaceRegistry.get(workspaceId);
     if (!workspace) return null;
 
     const project = await this.projectRegistry.get(workspace.projectId);
@@ -3972,7 +3975,23 @@ export class Session {
     requestId: string,
     idempotencyKey?: string,
   ): Promise<void> {
+    if (
+      !this.authorization.allowsPermission("workspace.write") ||
+      !this.authorization.allowsPermission("workspace.manage")
+    ) {
+      this.emit({
+        type: "rpc_error",
+        payload: {
+          requestId,
+          requestType: "agent.move_to_workspace.request",
+          error: "Moving an agent requires workspace.write and workspace.manage.",
+          code: "access_denied",
+        },
+      });
+      return;
+    }
     let finishMove: (() => void) | undefined;
+    let finishTargetMove: (() => void) | undefined;
     try {
       const preMoveAgent =
         this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
@@ -4006,6 +4025,8 @@ export class Session {
               await this.workspaceRegistry.remove(created.workspaceId);
             };
             try {
+              finishTargetMove = this.reserveWorkspaceMove(created.workspaceId);
+              await this.requireMoveSourceWorkspace(created.workspaceId);
               // Provisioning awaits checkout and registry work, during which archive can start.
               await this.requireMoveSourceWorkspace(source.sourceWorkspaceId);
             } catch (error) {
@@ -4019,32 +4040,42 @@ export class Session {
             }
             return { workspaceId: created.workspaceId, rollback };
           },
-        }).finally(() => finishMove?.()),
+        }).finally(() => {
+          finishTargetMove?.();
+          finishMove?.();
+        }),
       );
-      const affectedWorkspaceIds = new Set<string>([result.sourceWorkspaceId, result.workspaceId]);
-      const warnUpdateFailure = (error: unknown) =>
-        this.sessionLogger.warn(
-          { err: error, agentId, workspaceId: result.workspaceId, requestId },
-          "Failed to publish agent move update",
-        );
-      if (!result.live) {
-        await this.agentUpdates.emitStoredRecord(result.record).catch(warnUpdateFailure);
-      }
-      for (const descendantRecord of result.movedDescendantStoredRecords ?? []) {
-        await this.agentUpdates.emitStoredRecord(descendantRecord).catch(warnUpdateFailure);
-      }
-      if (result.previousParentAgentId) {
-        const rootWorkspaceId = await this.resolveDelegationRootWorkspaceId(
-          result.previousParentAgentId,
-        ).catch((error) => {
-          warnUpdateFailure(error);
-          return null;
-        });
-        if (rootWorkspaceId) {
-          affectedWorkspaceIds.add(rootWorkspaceId);
+      if (!result.replayed) {
+        const affectedWorkspaceIds = new Set<string>([
+          result.sourceWorkspaceId,
+          result.workspaceId,
+        ]);
+        const warnUpdateFailure = (error: unknown) =>
+          this.sessionLogger.warn(
+            { err: error, agentId, workspaceId: result.workspaceId, requestId },
+            "Failed to publish agent move update",
+          );
+        if (!result.live) {
+          await this.agentUpdates.emitStoredRecord(result.record).catch(warnUpdateFailure);
         }
+        for (const descendantRecord of result.movedDescendantStoredRecords ?? []) {
+          await this.agentUpdates.emitStoredRecord(descendantRecord).catch(warnUpdateFailure);
+        }
+        if (result.previousParentAgentId) {
+          const rootWorkspaceId = await this.resolveDelegationRootWorkspaceId(
+            result.previousParentAgentId,
+          ).catch((error) => {
+            warnUpdateFailure(error);
+            return null;
+          });
+          if (rootWorkspaceId) {
+            affectedWorkspaceIds.add(rootWorkspaceId);
+          }
+        }
+        await this.emitWorkspaceUpdatesForWorkspaceIds(affectedWorkspaceIds).catch(
+          warnUpdateFailure,
+        );
       }
-      await this.emitWorkspaceUpdatesForWorkspaceIds(affectedWorkspaceIds).catch(warnUpdateFailure);
 
       this.emit({
         type: "agent.move_to_workspace.response",
@@ -5385,9 +5416,10 @@ export class Session {
           workspaceId: resolvedIntent.intent.workspaceId,
           background: resolvedIntent.background,
           initialPrompt,
-          source: msg.callerAgentId
-            ? { kind: "agent-message", agentId: msg.callerAgentId }
-            : undefined,
+          source:
+            msg.callerAgentId && msg.initialPromptOrigin !== "user"
+              ? { kind: "agent-message", agentId: msg.callerAgentId }
+              : undefined,
           clientMessageId,
           outputSchema,
           images,
@@ -5447,6 +5479,7 @@ export class Session {
       explicitWorkspaceId: createdWorktree?.workspace.workspaceId ?? request.workspaceId,
       caller: callerAgent,
       labels: request.labels,
+      serverId: this.serverId,
       resolveWorkspace: async (workspaceId) => {
         if (createdWorktree?.workspace.workspaceId === workspaceId) {
           return { workspaceId, cwd: createdWorktree.workspace.cwd };
@@ -6517,19 +6550,18 @@ export class Session {
     backgroundVisibility: BackgroundVisibility,
   ) {
     if (request.type === "fetch_agent_history_request") {
-      const workspaceArchivedAtByWorkspaceId = new Map<string, string>();
-      if (request.sort?.some(({ key }) => key === "archived_at")) {
-        for (const workspace of await this.workspaceRegistry.listAll()) {
-          if (workspace.archivedAt) {
-            workspaceArchivedAtByWorkspaceId.set(workspace.workspaceId, workspace.archivedAt);
-          }
-        }
-      }
+      const workspaces = new Map(
+        (await this.workspaceRegistry.listAll()).map((workspace) => [
+          workspace.workspaceId,
+          workspace,
+        ]),
+      );
       return this.pageFetchAgentsEntries(
         request,
         backgroundVisibility,
-        this.createAgentHistoryPager(workspaceArchivedAtByWorkspaceId),
+        this.createAgentHistoryPager(workspaces),
         request.sort,
+        workspaces,
       );
     }
     return this.pageFetchAgentsEntries(
@@ -6545,6 +6577,7 @@ export class Session {
     backgroundVisibility: BackgroundVisibility,
     pager: SortablePager<AgentSnapshotPayload, K>,
     requestedSort: SortSpec<K>[] | undefined,
+    workspaces?: ReadonlyMap<string, PersistedWorkspaceRecord>,
   ): Promise<{
     entries: FetchAgentsResponseEntry[];
     ancestors?: FetchAgentsResponseEntry[];
@@ -6587,7 +6620,11 @@ export class Session {
       if (existing) {
         return existing;
       }
-      const placementPromise = this.buildProjectPlacementForWorkspaceId(workspaceId, isHistory);
+      const placementPromise = this.buildProjectPlacementForWorkspaceId(
+        workspaceId,
+        isHistory,
+        workspaces,
+      );
       placementByWorkspaceId.set(workspaceId, placementPromise);
       return placementPromise;
     };
@@ -6650,7 +6687,7 @@ export class Session {
     getSortValue: this.getAgentSortValue,
   });
 
-  private createAgentHistoryPager(workspaceArchivedAtByWorkspaceId: ReadonlyMap<string, string>) {
+  private createAgentHistoryPager(workspaces: ReadonlyMap<string, PersistedWorkspaceRecord>) {
     return new SortablePager<AgentSnapshotPayload, AgentHistorySortKey>({
       validKeys: FETCH_AGENT_HISTORY_SORT_KEYS,
       defaultSort: [{ key: "updated_at", direction: "desc" }],
@@ -6659,7 +6696,7 @@ export class Session {
       getSortValue: (agent, key) => {
         if (key !== "archived_at") return this.getAgentSortValue(agent, key);
         const workspaceArchivedAt = agent.workspaceId
-          ? workspaceArchivedAtByWorkspaceId.get(agent.workspaceId)
+          ? workspaces.get(agent.workspaceId)?.archivedAt
           : undefined;
         for (const timestamp of [agent.archivedAt, workspaceArchivedAt, agent.updatedAt]) {
           if (timestamp == null) continue;
@@ -9504,6 +9541,7 @@ export class Session {
           : null,
         boundaryMessageId: msg.boundaryMessageId,
         sourceAgentId: msg.agentId,
+        sourceServerId: this.serverId,
         agentTitle: agentPayload.title,
         cwd: snapshot.cwd,
       });

@@ -114,6 +114,19 @@ describe("resolveNavigateToAgent", () => {
     expect(hostNavigations).toEqual([{ route: "/h/server-1/agent/missing-agent" }]);
     expect(tabNavigations).toEqual([]);
   });
+
+  it("preserves the tab intent on the fallback host agent route", () => {
+    const { deps, hostNavigations, tabNavigations } = createFakeNavigators({
+      agentWorkspaceId: null,
+    });
+    const route = resolveNavigateToAgent(
+      { serverId: SERVER_ID, agentId: AGENT_ID, asTab: true },
+      deps,
+    );
+    expect(route).toBe("/h/server-1/agent/agent-1?asTab=1");
+    expect(hostNavigations).toEqual([{ route }]);
+    expect(tabNavigations).toEqual([]);
+  });
 });
 
 describe("resolveOpenForkSourceAgent", () => {
@@ -180,37 +193,42 @@ describe("resolveOpenForkSourceAgent", () => {
 
   it("reports not found and stays on the current tab when the agent is missing", async () => {
     const onNotFound = vi.fn();
+    const onError = vi.fn();
     const { deps, navigations } = createForkDeps({
       fetchRemoteAgent: async () => ({ found: false }),
     });
 
     await expect(
       resolveOpenForkSourceAgent(
-        { serverId: SERVER_ID, sourceAgentId: AGENT_ID, onNotFound },
+        { serverId: SERVER_ID, sourceAgentId: AGENT_ID, onNotFound, onError },
         deps,
       ),
     ).resolves.toBe(false);
 
     expect(onNotFound).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
     expect(navigations).toEqual([]);
   });
 
-  it("reports not found when the fetch throws", async () => {
+  it("reports a connection error and stays on the current tab when the fetch throws", async () => {
     const onNotFound = vi.fn();
+    const onError = vi.fn();
+    const timeout = new Error("Connection timed out");
     const { deps, navigations } = createForkDeps({
       fetchRemoteAgent: async () => {
-        throw new Error("boom");
+        throw timeout;
       },
     });
 
     await expect(
       resolveOpenForkSourceAgent(
-        { serverId: SERVER_ID, sourceAgentId: AGENT_ID, onNotFound },
+        { serverId: SERVER_ID, sourceAgentId: AGENT_ID, onNotFound, onError },
         deps,
       ),
     ).resolves.toBe(false);
 
-    expect(onNotFound).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledExactlyOnceWith(timeout);
+    expect(onNotFound).not.toHaveBeenCalled();
     expect(navigations).toEqual([]);
   });
 

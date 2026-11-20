@@ -25,7 +25,18 @@ import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
 import { buildStoredAgentPayload, toAgentPayload } from "./agent-projections.js";
 import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { projectTimelineRows } from "./timeline-projection.js";
-import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  getOpenAgentTabLabel,
+  PARENT_AGENT_ID_LABEL,
+  PARENT_SERVER_ID_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
+import {
+  isMainControlWritePermissionBlocked,
+  MAIN_CONTROL_WRITE_DENIAL,
+  REMOTE_HIERARCHY_DEPTH_LABEL,
+} from "./hierarchy-policy.js";
 import { startAgentRun } from "./agent-prompt.js";
 import { StaleProviderSessionError } from "./stale-provider-session-error.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
@@ -459,7 +470,7 @@ class EnvProbeAgentClient extends TestAgentClient {
 
 class TestAgentSession implements AgentSession {
   readonly provider = "codex" as const;
-  readonly capabilities = TEST_CAPABILITIES;
+  readonly capabilities: AgentSession["capabilities"] = TEST_CAPABILITIES;
   readonly id = randomUUID();
   private runtimeModel: string | null = null;
   private subscribers = new Set<(event: AgentStreamEvent) => void>();
@@ -6304,6 +6315,8 @@ test("detachAgent removes relationship lifecycle labels from a live agent and em
     {
       labels: {
         [PARENT_AGENT_ID_LABEL]: parent.id,
+        [PARENT_SERVER_ID_LABEL]: "other-host",
+        [REMOTE_HIERARCHY_DEPTH_LABEL]: "1",
         [DESKTOP_OPEN_AGENT_TAB_LABEL]: "true",
         [MOBILE_OPEN_AGENT_TAB_LABEL]: "false",
         team: "infra",
@@ -6331,6 +6344,173 @@ test("detachAgent removes relationship lifecycle labels from a live agent and em
   expect(manager.getAgent(child.id)?.labels).toEqual({ team: "infra" });
   expect((await storage.get(child.id))?.labels).toEqual({ team: "infra" });
   expect(emittedLabels).toContainEqual({ team: "infra" });
+});
+
+test("OpenCode Main Control applies default non-write permissions and blocks runtime overrides", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-opencode-main-"));
+  const client = new (class extends TestAgentClient {
+    effectiveOptions(own?: ProviderOptions) {
+      return mergeProviderOptions({ auto_accept: true, permission: "allow" }, own);
+    }
+  })("opencode");
+  const manager = new AgentManager({
+    clients: { opencode: client },
+    logger,
+    registry: new AgentStorage(join(workdir, "agents"), logger),
+  });
+  onTestFinished(async () => {
+    await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+    rmSync(workdir, { recursive: true, force: true });
+  });
+  const agent = await manager.createAgent({ provider: "opencode", cwd: workdir }, undefined, {
+    workspaceId: "workspace",
+    labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+  });
+  expect(client.createdConfigs.at(-1)?.providerOptions).toMatchObject({
+    auto_accept: false,
+    permission: { read: "allow", grep: "allow", edit: "deny", bash: "deny", todowrite: "deny" },
+  });
+  await expect(manager.setAgentOptions(agent.id, { auto_accept: true })).rejects.toThrow(
+    MAIN_CONTROL_WRITE_DENIAL,
+  );
+  await expect(manager.setAgentOptions(agent.id, { permission: null })).rejects.toThrow(
+    MAIN_CONTROL_WRITE_DENIAL,
+  );
+  for (const name of [
+    "Bash",
+    "shell",
+    "exec",
+    "run-command",
+    "executeCommand",
+    "run_terminal_cmd",
+    "TodoWrite",
+  ]) {
+    expect(isMainControlWritePermissionBlocked({ name, kind: "tool" })).toBe(true);
+  }
+  expect(isMainControlWritePermissionBlocked({ name: "Read", kind: "tool" })).toBe(false);
+  await expect(
+    manager.updateAgentMetadata(agent.id, {
+      labels: { [PARENT_SERVER_ID_LABEL]: "forged" },
+    }),
+  ).rejects.toThrow("Change agent hierarchy");
+  await manager.updateAgentMetadata(agent.id, {
+    labels: { [DESKTOP_OPEN_AGENT_TAB_LABEL]: "true" },
+  });
+  expect(manager.getAgent(agent.id)?.labels[DESKTOP_OPEN_AGENT_TAB_LABEL]).toBe("true");
+});
+
+test("failed promotion restores Main Control and unarchive keeps the existing main", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-main-rollback-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  onTestFinished(async () => {
+    await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+    rmSync(workdir, { recursive: true, force: true });
+  });
+  const create = (title: string) =>
+    manager.createAgent(
+      { provider: "codex", cwd: workdir, title, modeId: "workspace-write" },
+      undefined,
+      { workspaceId: "workspace" },
+    );
+  const old = await create("Old");
+  const next = await create("Next");
+  await manager.closeAgent(old.id);
+  await manager.closeAgent(next.id);
+  await manager.setAgentMainControl(old.id, true);
+  const upsert = storage.upsert.bind(storage);
+  const failPromotion = vi.spyOn(storage, "upsert").mockImplementation(async (record) => {
+    if (record.id === next.id && record.labels[WORKSPACE_ROLE_LABEL] === WORKSPACE_MAIN_ROLE) {
+      throw new Error("Promotion failed");
+    }
+    await upsert(record);
+  });
+  try {
+    await expect(manager.setAgentMainControl(next.id, true)).rejects.toThrow("Promotion failed");
+  } finally {
+    failPromotion.mockRestore();
+  }
+  expect(await storage.get(old.id)).toMatchObject({
+    labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    lastModeId: "read-only",
+  });
+  await manager.archiveSnapshot(old.id, new Date().toISOString());
+  await manager.setAgentMainControl(next.id, true);
+  await expect(manager.unarchiveSnapshot(old.id)).resolves.toBe(true);
+  expect((await storage.get(old.id))?.labels).not.toHaveProperty(WORKSPACE_ROLE_LABEL);
+  expect(await storage.get(old.id)).toMatchObject({
+    archivedAt: null,
+    lastModeId: "workspace-write",
+  });
+  expect((await storage.get(next.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+});
+
+test("adoption and an in-flight move refresh the persisted session before its next turn", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-hierarchy-reload-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const gate = deferred<void>();
+  const turnStarted = deferred<void>();
+  const resumed: Array<{
+    config?: Partial<AgentSessionConfig>;
+    context?: AgentLaunchContext;
+  }> = [];
+  class PersistentSession extends TestAgentSession {
+    override readonly capabilities = { ...TEST_CAPABILITIES, supportsSessionPersistence: true };
+  }
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig) {
+      return new PersistentSession(config);
+    }
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+      context?: AgentLaunchContext,
+    ) {
+      resumed.push({ config, context });
+      return new (class extends PersistentSession {
+        override async startTurn() {
+          if (resumed.length !== 1) return super.startTurn();
+          queueMicrotask(() => {
+            turnStarted.resolve();
+            void gate.promise.then(() => {
+              this.pushEvent({ type: "turn_completed", provider: "codex", turnId: "held" });
+              return undefined;
+            });
+          });
+          return { turnId: "held" };
+        }
+      })({ ...config, provider: "codex", cwd: workdir });
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  onTestFinished(async () => {
+    gate.resolve();
+    await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+    rmSync(workdir, { recursive: true, force: true });
+  });
+  const config = { provider: "codex", cwd: workdir } as const;
+  const main = await manager.createAgent(config, undefined, {
+    workspaceId: "source",
+    labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+  });
+  const child = await manager.createAgent(config, undefined, { workspaceId: "source" });
+  await manager.setAgentParent(child.id, main.id);
+  expect(resumed).toHaveLength(1);
+  expect(resumed[0]?.config?.daemonAppendSystemPrompt).toContain("Level-1 Module Lead");
+
+  const running = manager.runAgent(child.id, "Hold this turn");
+  await turnStarted.promise;
+  await manager.moveSubagentToWorkspace(child.id, {
+    allocateWorkspace: async () => ({ workspaceId: "target" }),
+  });
+  expect(resumed).toHaveLength(1);
+  gate.resolve();
+  await running;
+  await manager.runAgent(child.id, "Continue after moving");
+  expect(resumed).toHaveLength(2);
+  expect(resumed[1]?.context?.env?.PASEO_WORKSPACE_ID).toBe("target");
+  expect(resumed[1]?.config?.daemonAppendSystemPrompt ?? "").not.toContain("Level-1 Module Lead");
 });
 
 test("detachAgent removes relationship lifecycle labels from a stored-only agent", async () => {

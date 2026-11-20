@@ -111,10 +111,12 @@ describe("quit-lifecycle", () => {
     expect(events).toEqual(["feedback", "stop:quit"]);
   });
 
-  it("uses the app update stop reason on ordinary quit when an update is pending", async () => {
+  it("uses the app update stop reason on ordinary quit when an enabled update is pending", async () => {
     const events: string[] = [];
     const stopped = await stopDesktopManagedDaemonOnQuitIfNeeded({
-      settingsStore: { get: async () => SETTINGS_STOP_ON_QUIT },
+      settingsStore: {
+        get: async () => ({ ...SETTINGS_STOP_ON_QUIT, officialUpdatesEnabled: true }),
+      },
       isDesktopManagedDaemonRunning: () => false,
       isDesktopManagedDaemonPresent: () => true,
       hasPendingUpdateOnQuit: () => true,
@@ -126,6 +128,76 @@ describe("quit-lifecycle", () => {
 
     expect(stopped).toBe(true);
     expect(events).toEqual(["feedback", "stop:app_update"]);
+  });
+
+  it("treats a downloaded update as an ordinary quit when official updates are disabled", async () => {
+    const events: string[] = [];
+    const stopped = await stopDesktopManagedDaemonOnQuitIfNeeded({
+      settingsStore: { get: async () => SETTINGS_STOP_ON_QUIT },
+      isDesktopManagedDaemonRunning: () => true,
+      hasPendingUpdateOnQuit: () => true,
+      stopDaemon: async (reason) => {
+        events.push(`stop:${reason}`);
+      },
+      showShutdownFeedback: () => events.push("feedback"),
+    });
+
+    expect(stopped).toBe(true);
+    expect(events).toEqual(["feedback", "stop:quit"]);
+  });
+
+  it("keeps the app and its connections open when preserving work fails", async () => {
+    const events: string[] = [];
+    const error = new Error("Cannot save agents for restart");
+    const beforeQuit = { preventDefault: () => events.push("prevent-default") };
+    const quitLifecycle = createQuitLifecycle({
+      app: {
+        quit: () => quitLifecycle.handleBeforeQuit(beforeQuit),
+        exit: (code) => events.push(`exit:${code}`),
+      },
+      closeTransportSessions: () => events.push("close-transports"),
+      stopDesktopManagedDaemonIfNeeded: async (options) => {
+        events.push(`preserve:${options?.preserveWork}`);
+        if (options?.preserveWork) throw error;
+        return true;
+      },
+      installAppUpdateOnQuit: async () => {
+        events.push("revalidate-update");
+        return false;
+      },
+      createUpdateDeadlineSignal: () => new AbortController().signal,
+      onStopError: (reported) => {
+        expect(reported).toBe(error);
+        events.push("stop-error");
+      },
+      onPreserveWorkStopFailed: (reported) => {
+        expect(reported).toBe(error);
+        events.push("alert");
+      },
+      onUpdateError: () => {},
+    });
+
+    quitLifecycle.requestPreserveWorkQuit();
+    quitLifecycle.handleBeforeQuit(beforeQuit);
+    await waitForQuitLifecycle();
+    expect(events).toEqual([
+      "prevent-default",
+      "preserve:true",
+      "prevent-default",
+      "stop-error",
+      "alert",
+    ]);
+
+    events.length = 0;
+    quitLifecycle.handleBeforeQuit(beforeQuit);
+    await waitForQuitLifecycle();
+    expect(events).toEqual([
+      "close-transports",
+      "prevent-default",
+      "preserve:false",
+      "revalidate-update",
+      "exit:0",
+    ]);
   });
 
   it("honors a preserve-work quit for a daemon from a previous launch even with keep-running enabled", async () => {

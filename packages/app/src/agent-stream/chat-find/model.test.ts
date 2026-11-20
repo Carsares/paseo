@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 import { hydrateStreamState, type StreamItem } from "@/types/stream";
+import { createAgentInteractionProjection } from "../agent-interactions";
 import { ChatFindModel, type ChatFindOperations } from "./model";
 
 function response(locations: Array<{ seq: number; role: "user" | "assistant"; count?: number }>) {
@@ -80,23 +81,40 @@ it("loads an older location and searches a response merged across suppressed tas
   }
 });
 
-it("uses a merged message's ending cursor to deduplicate cross-interaction search hits", async () => {
-  const merged = {
-    ...message(3, "first target and second target"),
-    id: "message-first",
-  };
+function mergedReply(fragments: string[], firstSeq = 1): StreamItem[] {
+  const tail = fragments.flatMap((text, index): StreamItem[] => {
+    const seq = firstSeq + index * 2;
+    const reply = { ...message(seq, text), messageId: "reply", turnId: "turn" };
+    return index === 0
+      ? [reply]
+      : [
+          {
+            id: `interaction-${seq - 1}`,
+            kind: "user_message",
+            text: "Hidden interaction",
+            timestamp: new Date(0),
+            timelineCursor: { epoch: "epoch", seq: seq - 1 },
+            sender: { id: "child" },
+          },
+          reply,
+        ];
+  });
+  return createAgentInteractionProjection()({ tail, head: [] }).tail;
+}
+
+it("uses all loaded fragment cursors and visits the merged row once", async () => {
+  const history = mergedReply(["first target ", "second ", "target"]);
   const loaded: number[] = [];
   const revealed: string[] = [];
   const model = new ChatFindModel({
     async search() {
       return response([
         { seq: 1, role: "assistant" },
-        { seq: 3, role: "assistant" },
+        { seq: 5, role: "assistant" },
       ]);
     },
     async load(_epoch, seq) {
       loaded.push(seq);
-      model.updateHistory("epoch", [merged]);
     },
     async reveal(id, _query, occurrence) {
       revealed.push(id);
@@ -105,17 +123,73 @@ it("uses a merged message's ending cursor to deduplicate cross-interaction searc
     clear() {},
   });
   try {
-    model.updateHistory("epoch", [merged]);
+    model.updateHistory("epoch", history);
     model.open();
     model.setQuery("target");
     await expect.poll(() => model.getSnapshot().phase).toBe("ready");
-    expect(loaded).toEqual([1]);
-    expect(revealed).toEqual(["message-first"]);
-    expect(model.getSnapshot()).toMatchObject({ selectedItemId: "message-first", count: 2 });
+    expect(loaded).toEqual([]);
+    expect(revealed).toEqual(["row-1"]);
+    expect(model.getSnapshot()).toMatchObject({ selectedItemId: "row-1", count: 2 });
     model.next();
     await expect.poll(() => model.getSnapshot().occurrence).toBe(1);
-    expect(loaded).toEqual([1]);
-    expect(revealed).toEqual(["message-first", "message-first"]);
+    model.next();
+    await expect.poll(() => model.getSnapshot().occurrence).toBe(0);
+    expect(loaded).toEqual([]);
+    expect(revealed).toEqual(["row-1", "row-1", "row-1"]);
+  } finally {
+    model.close();
+  }
+});
+
+it("inserts a case-insensitive cross-fragment match in timeline order", async () => {
+  const model = new ChatFindModel({
+    async search() {
+      return response([
+        { seq: 1, role: "assistant" },
+        { seq: 8, role: "assistant" },
+      ]);
+    },
+    async load() {
+      throw new Error("All results are loaded");
+    },
+    async reveal(_id, _query, occurrence) {
+      return { count: 1, occurrence: Math.max(0, occurrence) };
+    },
+    clear() {},
+  });
+  try {
+    model.updateHistory("epoch", [
+      message(1),
+      ...mergedReply(["A TAR", "GET."], 2),
+      ...mergedReply(["Unrelated ", "text."], 5),
+      message(8),
+    ]);
+    model.open();
+    model.setQuery("TaRgEt");
+    await expect
+      .poll(() => model.getSnapshot())
+      .toMatchObject({
+        phase: "ready",
+        selectedItemId: "row-1",
+        count: 3,
+        occurrence: 0,
+      });
+    model.next();
+    await expect
+      .poll(() => model.getSnapshot())
+      .toMatchObject({
+        phase: "ready",
+        selectedItemId: "row-2",
+        occurrence: 1,
+      });
+    model.next();
+    await expect
+      .poll(() => model.getSnapshot())
+      .toMatchObject({
+        phase: "ready",
+        selectedItemId: "row-8",
+        occurrence: 2,
+      });
   } finally {
     model.close();
   }

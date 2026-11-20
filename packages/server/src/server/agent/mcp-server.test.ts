@@ -643,6 +643,9 @@ class BoundaryAgentManagerFake {
 }
 
 class BoundaryAgentStorageFake {
+  public async get(): Promise<StoredAgentRecord | null> {
+    return null;
+  }
   public async listActive(): Promise<StoredAgentRecord[]> {
     return [];
   }

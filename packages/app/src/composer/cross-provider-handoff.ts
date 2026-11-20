@@ -1,7 +1,8 @@
 import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import { getOpenAgentTabLabel } from "@getpaseo/protocol/agent-labels";
+import { useQueryClient } from "@tanstack/react-query";
+import { getOpenAgentTabLabel, isMainControlAgent } from "@getpaseo/protocol/agent-labels";
 import type { AgentProvider } from "@getpaseo/protocol/agent-types";
 import {
   buildDraftWorkspaceAttachmentScopeKey,
@@ -10,7 +11,8 @@ import {
 import type { ToastApi } from "@/components/toast-host";
 import { useComposerInput, type ComposerInput } from "@/composer/session";
 import { useToast } from "@/contexts/toast-api-context";
-import { useArchiveAgent } from "@/hooks/use-archive-agent";
+import type { DraftComposerTextSource } from "@/composer/draft/input-draft";
+import { applyArchivedAgentCloseResults, type ArchiveAgentInput } from "@/hooks/use-archive-agent";
 import { buildChatHistoryAttachment } from "@/hooks/use-fork-agent";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useOptionalPaneContext, type PaneContextValue } from "@/panels/pane-context";
@@ -42,14 +44,22 @@ export interface CrossProviderAgentHandoff {
 }
 
 type HandoffPane = Pick<PaneContextValue, "host" | "workspaceId" | "tabId" | "retargetCurrentTab">;
+type HandoffAgent = Pick<
+  Agent,
+  "archivedAt" | "cwd" | "labels" | "parentAgentId" | "status" | "workspaceId"
+>;
 
 interface CrossProviderHandoffDeps {
   supportsAgentForkContext: boolean;
   client: Pick<DaemonClient, "buildAgentForkContext" | "updateAgent"> | null;
   paneContext: HandoffPane | null;
   inFlight?: { current: boolean };
-  getAgent: () => Pick<Agent, "archivedAt" | "cwd" | "parentAgentId" | "status"> | null;
-  getComposerInput: () => Pick<ComposerInput, "textSource" | "attachments" | "setText"> | null;
+  getAgent: () => HandoffAgent | null;
+  getComposerInput: () =>
+    | (Pick<ComposerInput, "attachments" | "setText"> & {
+        textSource: ComposerInput["textSource"] & Partial<DraftComposerTextSource>;
+      })
+    | null;
   getDraftStore: () => Pick<
     ReturnType<typeof useDraftStore.getState>,
     | "getDraftInput"
@@ -65,12 +75,12 @@ interface CrossProviderHandoffDeps {
   >;
   getWorkspaceLayoutStore: () => Pick<
     ReturnType<typeof useWorkspaceLayoutStore.getState>,
-    "unpinAgent" | "hideAgent"
+    "getWorkspaceTabs" | "unpinAgent" | "hideAgent"
   >;
   confirmDialog: typeof confirmDialog;
   getOrCreateClientId: typeof getOrCreateClientId;
   generateDraftId: typeof generateDraftId;
-  archiveAgent: ReturnType<typeof useArchiveAgent>["archiveAgent"];
+  archiveAgent: (input: ArchiveAgentInput) => Promise<void>;
   toast: Pick<ToastApi, "error">;
   t: (key: string) => string;
 }
@@ -83,9 +93,14 @@ export function canSwitchAgentProvider(input: {
   supportsAgentForkContext: boolean;
   client: Pick<DaemonClient, "buildAgentForkContext" | "updateAgent"> | null;
   paneContext: HandoffPane | null;
+  agent: Pick<Agent, "labels"> | null;
 }): boolean {
   return Boolean(
-    input.supportsAgentForkContext && input.client && isHandoffPane(input.paneContext),
+    input.supportsAgentForkContext &&
+    input.client &&
+    isHandoffPane(input.paneContext) &&
+    input.agent &&
+    !isMainControlAgent(input.agent),
   );
 }
 
@@ -97,7 +112,11 @@ function moveUnsentDraft(
   const composerInput = deps.getComposerInput();
   const draftStore = deps.getDraftStore();
   const storedSourceDraft = draftStore.getDraftInput(sourceDraftKey);
-  const unsentText = composerInput?.textSource.getSnapshot() ?? storedSourceDraft?.text ?? "";
+  const unsentText =
+    composerInput?.textSource.peekPendingText?.() ??
+    composerInput?.textSource.getSnapshot() ??
+    storedSourceDraft?.text ??
+    "";
   const unsentAttachments = [
     ...(composerInput?.attachments ?? storedSourceDraft?.attachments ?? []),
   ];
@@ -111,23 +130,70 @@ function moveUnsentDraft(
   if (sourceMetadata && Object.keys(sourceMetadata).length > 0) {
     draftStore.patchDraftMetadata({ draftKey: targetDraftKey, patch: sourceMetadata });
   }
-  composerInput?.setText("");
   draftStore.clearDraftInput({ draftKey: sourceDraftKey, lifecycle: "abandoned" });
   draftStore.clearDraftMetadata({ draftKey: sourceDraftKey });
+  composerInput?.setText("");
 }
 
 function buildHandoffDraftSetup(
-  cwd: string,
+  agent: Pick<HandoffAgent, "cwd" | "parentAgentId">,
   selection: CrossProviderHandoffSelection,
 ): WorkspaceDraftTabSetup {
+  const parentAgentId = agent.parentAgentId?.trim();
   return {
     provider: selection.provider,
-    cwd,
+    cwd: agent.cwd,
+    ...(parentAgentId ? { parentAgentId } : {}),
     modeId: selection.modeId?.trim() || null,
     model: selection.modelId?.trim() || null,
     thinkingOptionId: selection.thinkingOptionId?.trim() || null,
     providerOptions: { ...selection.providerOptions },
   };
+}
+
+async function closeHandoffSource(input: {
+  getCurrentAgent: (allowArchived?: boolean) => HandoffAgent | null;
+  confirmArchive: () => Promise<boolean>;
+  needsArchiveConfirmation: (agent: HandoffAgent) => boolean;
+  confirmedArchive: boolean;
+  getClientId: () => Promise<string>;
+  releaseTabLabel: (clientId: string) => Promise<void>;
+  archiveAgent: () => Promise<void>;
+  commit: (agent: HandoffAgent) => void;
+}): Promise<boolean> {
+  let { confirmedArchive } = input;
+  let clientId: string | null = null;
+  let releasedTabLabel = false;
+  // Recheck the target and close policy after each wait.
+  while (true) {
+    const agent = input.getCurrentAgent();
+    if (!agent) return false;
+    const closePolicy = resolveCloseAgentTabPolicy(agent);
+    if (closePolicy.kind === "layout-only") {
+      if (releasedTabLabel) {
+        input.commit(agent);
+        return true;
+      }
+      if (clientId === null) {
+        clientId = await input.getClientId();
+        continue;
+      }
+      await input.releaseTabLabel(clientId);
+      releasedTabLabel = true;
+      continue;
+    }
+    if (!confirmedArchive && input.needsArchiveConfirmation(agent)) {
+      confirmedArchive = await input.confirmArchive();
+      if (!confirmedArchive) return false;
+      continue;
+    }
+    await input.archiveAgent();
+    // The archive can mark the source archived during the wait. Its tab and workspace must match.
+    const archivedSource = input.getCurrentAgent(true);
+    if (!archivedSource) return false;
+    input.commit(archivedSource);
+    return true;
+  }
 }
 
 export async function performCrossProviderAgentHandoff(
@@ -156,29 +222,50 @@ export async function performCrossProviderAgentHandoff(
       return false;
     }
 
-    const agent = deps.getAgent();
-    if (!agent || agent.archivedAt) {
+    const workspaceId = paneContext.workspaceId.trim();
+    const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
+    if (!workspaceKey) {
       return false;
     }
 
-    let closePolicy = resolveCloseAgentTabPolicy(agent);
-    if (
-      closePolicy.kind === "archive-on-close" &&
-      (agent.status === "running" || agent.status === "initializing")
-    ) {
-      const confirmed = await deps.confirmDialog({
+    const getCurrentAgent = (allowArchived = false): HandoffAgent | null => {
+      const tab = deps
+        .getWorkspaceLayoutStore()
+        .getWorkspaceTabs(workspaceKey)
+        .find((candidate) => candidate.tabId === paneContext.tabId);
+      if (tab?.target.kind !== "agent" || tab.target.agentId !== agentId) return null;
+      const current = deps.getAgent();
+      if (
+        !current ||
+        (!allowArchived && current.archivedAt) ||
+        current.workspaceId?.trim() !== workspaceId ||
+        isMainControlAgent(current)
+      )
+        return null;
+      return current;
+    };
+    const needsArchiveConfirmation = (agent: HandoffAgent) =>
+      resolveCloseAgentTabPolicy(agent).kind === "archive-on-close" &&
+      (agent.status === "running" || agent.status === "initializing");
+    const confirmArchive = () =>
+      deps.confirmDialog({
         title: t("workspace.tabs.confirmations.archiveRunningAgentTitle"),
         message: t("workspace.tabs.confirmations.archiveRunningAgentMessage"),
         confirmLabel: t("workspace.tabs.confirmations.archive"),
         cancelLabel: t("workspace.tabs.confirmations.cancel"),
         destructive: true,
       });
-      if (!confirmed) {
-        return false;
-      }
+
+    const sourceAgent = getCurrentAgent();
+    if (!sourceAgent) return false;
+    let confirmedArchive = false;
+    if (needsArchiveConfirmation(sourceAgent)) {
+      confirmedArchive = await confirmArchive();
+      if (!confirmedArchive || !getCurrentAgent()) return false;
     }
 
     const payload = await client.buildAgentForkContext(agentId);
+    if (!getCurrentAgent()) return false;
     const draftId = deps.generateDraftId();
     const attachment = buildChatHistoryAttachment({
       draftId,
@@ -188,42 +275,37 @@ export async function performCrossProviderAgentHandoff(
       missingAttachmentMessage: t("message.actions.forkFailed"),
     });
 
-    if (closePolicy.kind === "layout-only") {
-      const clientId = await deps.getOrCreateClientId();
-      await client.updateAgent(agentId, { labels: { [getOpenAgentTabLabel(clientId)]: "false" } });
-      closePolicy = resolveCloseAgentTabPolicy(deps.getAgent());
-    }
-
-    deps.getWorkspaceAttachmentsStore().setWorkspaceAttachments({
-      scopeKey: buildDraftWorkspaceAttachmentScopeKey(draftId),
-      attachments: [attachment],
-    });
-
-    moveUnsentDraft(
-      {
-        sourceDraftKey: buildDraftStoreKey({ serverId, agentId }),
-        targetDraftKey: buildDraftStoreKey({ serverId, agentId: paneContext.tabId, draftId }),
+    return await closeHandoffSource({
+      getCurrentAgent,
+      needsArchiveConfirmation,
+      confirmArchive,
+      confirmedArchive,
+      getClientId: deps.getOrCreateClientId,
+      releaseTabLabel: async (clientId) => {
+        await client.updateAgent(agentId, {
+          labels: { [getOpenAgentTabLabel(clientId)]: "false" },
+        });
       },
-      deps,
-    );
-
-    const workspaceKey = buildWorkspaceTabPersistenceKey({
-      serverId,
-      workspaceId: paneContext.workspaceId,
+      archiveAgent: () => deps.archiveAgent({ serverId, agentId }),
+      commit: (agent) => {
+        deps.getWorkspaceAttachmentsStore().setWorkspaceAttachments({
+          scopeKey: buildDraftWorkspaceAttachmentScopeKey(draftId),
+          attachments: [attachment],
+        });
+        moveUnsentDraft(
+          {
+            sourceDraftKey: buildDraftStoreKey({ serverId, agentId }),
+            targetDraftKey: buildDraftStoreKey({ serverId, agentId: paneContext.tabId, draftId }),
+          },
+          deps,
+        );
+        const layoutStore = deps.getWorkspaceLayoutStore();
+        layoutStore.unpinAgent(workspaceKey, agentId);
+        layoutStore.hideAgent(workspaceKey, agentId);
+        const setup = buildHandoffDraftSetup(agent, selection);
+        paneContext.retargetCurrentTab({ kind: "draft", draftId, setup });
+      },
     });
-    if (workspaceKey) {
-      const layoutStore = deps.getWorkspaceLayoutStore();
-      layoutStore.unpinAgent(workspaceKey, agentId);
-      layoutStore.hideAgent(workspaceKey, agentId);
-    }
-
-    const setup = buildHandoffDraftSetup(agent.cwd, selection);
-    paneContext.retargetCurrentTab({ kind: "draft", draftId, setup });
-
-    if (closePolicy.kind === "archive-on-close") {
-      void deps.archiveAgent({ serverId, agentId }).catch(() => {});
-    }
-    return true;
   } catch (error) {
     toast.error(toErrorMessage(error) || t("message.actions.forkFailed"));
     return false;
@@ -241,10 +323,13 @@ export function useCrossProviderAgentHandoff(input: {
   const { serverId, agentId } = input;
   const { t } = useTranslation();
   const toast = useToast();
-  const { archiveAgent } = useArchiveAgent();
+  const queryClient = useQueryClient();
   const supportsAgentForkContext = useHostFeature(serverId, "agentForkContext");
   const paneContext = useOptionalPaneContext();
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
+  const agentLabels = useSessionStore(
+    (state) => state.sessions[serverId]?.agents.get(agentId)?.labels,
+  );
   const composerInput = useComposerInput();
   const getComposerInput = useStableEvent(() => composerInput);
   const inFlightRef = useRef(false);
@@ -252,6 +337,7 @@ export function useCrossProviderAgentHandoff(input: {
     supportsAgentForkContext,
     client,
     paneContext,
+    agent: agentLabels ? { labels: agentLabels } : null,
   });
 
   const handoffToProvider = useStableEvent((selection: CrossProviderHandoffSelection) =>
@@ -270,7 +356,15 @@ export function useCrossProviderAgentHandoff(input: {
         confirmDialog,
         getOrCreateClientId,
         generateDraftId,
-        archiveAgent,
+        archiveAgent: async (target) => {
+          if (!client) throw new Error(t("workspace.terminal.hostDisconnected"));
+          const { archivedAt } = await client.archiveAgent(target.agentId);
+          applyArchivedAgentCloseResults({
+            queryClient,
+            serverId: target.serverId,
+            results: [{ agentId: target.agentId, archivedAt }],
+          });
+        },
         toast,
         t,
       },

@@ -29,6 +29,8 @@ import {
   isMainControlWritePermissionBlocked,
   MAIN_CONTROL_WRITE_DENIAL,
   REMOTE_HIERARCHY_DEPTH_LABEL,
+  resolveInheritedHierarchyMode,
+  resolveInheritedHierarchyOptions,
   validateCanSpawnChild,
   validateSetAgentParent,
   validateSingleHopOrchestration,
@@ -198,6 +200,44 @@ describe("Main Control read-only configuration", () => {
     expect(
       applyMainControlReadOnlyConfig(config, main.labels).providerOptions?.disallowedTools,
     ).toEqual(["WebFetch", "Edit", "MultiEdit", "Write", "NotebookEdit", "Bash"]);
+  });
+
+  it("locks OpenCode Main Control permissions and strips Main Control read-only overrides for children", () => {
+    const opencodeConfig = {
+      provider: "opencode",
+      cwd: "/repo",
+      providerOptions: { auto_accept: true, permission: "allow" },
+    };
+    expect(
+      applyMainControlReadOnlyConfig(opencodeConfig, main.labels).providerOptions,
+    ).toMatchObject({
+      auto_accept: false,
+      permission: {
+        read: "allow",
+        grep: "allow",
+        edit: "deny",
+        bash: "deny",
+        todowrite: "deny",
+      },
+    });
+    const mainWithPriorLabels = {
+      [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
+      [MAIN_PRIOR_MODE_ID_LABEL]: "full-access",
+    };
+    expect(resolveInheritedHierarchyMode("read-only", mainWithPriorLabels)).toBe("full-access");
+    expect(resolveInheritedHierarchyMode("read-only", main.labels)).toBeNull();
+    expect(
+      resolveInheritedHierarchyOptions(
+        {
+          sandbox_mode: "read-only",
+          approval_policy: "never",
+          disallowedTools: ["WebFetch", "Edit", "Bash"],
+        },
+        main.labels,
+      ),
+    ).toEqual({
+      disallowedTools: ["WebFetch"],
+    });
   });
 
   it.each([

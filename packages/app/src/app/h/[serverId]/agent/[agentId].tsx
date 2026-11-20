@@ -26,10 +26,12 @@ function HostAgentReadyRouteContent() {
   const params = useLocalSearchParams<{
     serverId?: string;
     agentId?: string;
+    asTab?: string;
   }>();
   const handledNavigationRef = useRef<string | null>(null);
   const serverId = typeof params.serverId === "string" ? params.serverId : "";
   const agentId = typeof params.agentId === "string" ? params.agentId : "";
+  const asTab = params.asTab === "1";
   const hosts = useHosts();
   const runtimeSnapshot = useHostRuntimeSnapshot(serverId);
   const client = runtimeSnapshot?.client ?? null;
@@ -104,7 +106,7 @@ function HostAgentReadyRouteContent() {
     if (resolution.kind === "invalid") {
       navigationKey = "invalid";
     } else if (resolution.kind === "resolved") {
-      navigationKey = `workspace:${resolution.workspaceId}`;
+      navigationKey = JSON.stringify([serverId, agentId, resolution.workspaceId, asTab]);
     } else if (resolution.kind === "notFound") {
       navigationKey = "not-found";
     }
@@ -114,11 +116,11 @@ function HostAgentReadyRouteContent() {
     handledNavigationRef.current = navigationKey;
 
     if (resolution.kind === "resolved") {
-      navigateToAgent({ serverId, agentId, workspaceId: resolution.workspaceId, pin: true });
+      navigateToAgent({ serverId, agentId, workspaceId: resolution.workspaceId, pin: true, asTab });
       return;
     }
     router.replace(resolution.kind === "invalid" ? ("/" as Href) : buildHostRootRoute(serverId));
-  }, [agentId, resolution, router, serverId]);
+  }, [agentId, asTab, resolution, router, serverId]);
 
   const handleRetry = useCallback(() => {
     if (resolution.kind === "lookupError") {

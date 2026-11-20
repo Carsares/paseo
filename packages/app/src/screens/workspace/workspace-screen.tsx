@@ -117,6 +117,7 @@ import {
   type WorkspaceTabTarget,
 } from "@/workspace-tabs/model";
 import { useSettings } from "@/hooks/use-settings";
+import { isDraftTabSubmitting, revealCreatedDraftAgentTab } from "@/composer/draft/workspace-tab";
 import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
 import { buildWorkspaceKeyboardHandlerId } from "@/keyboard/handler-id";
 import type {
@@ -151,6 +152,7 @@ import { getDesktopHost } from "@/desktop/host";
 import { buildProviderCommand } from "@/utils/provider-command-templates";
 import { generateDraftId } from "@/stores/draft-keys";
 import { resolveWorkspaceRouteId } from "@/utils/workspace-identity";
+import { clearSubagentOpenTabLabel } from "@/subagents/open-tab-labels";
 import { useOpenAgentTabLabels } from "@/subagents/use-open-agent-tab-labels";
 import {
   canAdoptTabUnderMainAgent,
@@ -1409,6 +1411,7 @@ function WorkspaceScreenContent({
   useOpenAgentTabLabels({
     client,
     serverId: normalizedServerId,
+    workspaceId: normalizedWorkspaceId,
     tabs: uiTabs,
     enabled: hasHydratedWorkspaceLayoutStore,
   });
@@ -1462,7 +1465,7 @@ function WorkspaceScreenContent({
       target?: WorkspaceTabTarget | null;
     }) {
       const normalizedTabId = trimNonEmpty(input.tabId);
-      if (!normalizedTabId || !persistenceKey) {
+      if (!normalizedTabId || !persistenceKey || isDraftTabSubmitting(input.target)) {
         return;
       }
 
@@ -2081,28 +2084,27 @@ function WorkspaceScreenContent({
 
         const session = useSessionStore.getState().sessions[normalizedServerId];
         const agent = session?.agents.get(agentId) ?? null;
-        let closePolicy = resolveCloseAgentTabPolicy(agent);
-        if (closePolicy.kind === "archive-on-close") {
+        let shouldArchive = resolveCloseAgentTabPolicy(agent).kind === "archive-on-close";
+        if (shouldArchive) {
           const confirmation = confirmArchiveAgentTab(session, agentId);
           if (confirmation !== true && !(await confirmation)) {
             return;
           }
         }
 
-        if (closePolicy.kind === "layout-only") {
+        if (!shouldArchive) {
           const sessionClient = useSessionStore.getState().sessions[normalizedServerId]?.client;
           if (!sessionClient) {
             toast.error(t("common.errors.daemonClientUnavailable"));
             return;
           }
           try {
-            const clientId = await getOrCreateClientId();
-            await sessionClient.updateAgent(agentId, {
-              labels: { [getOpenAgentTabLabel(clientId)]: "false" },
+            shouldArchive = await clearSubagentOpenTabLabel({
+              client: sessionClient,
+              agentId,
+              serverId: normalizedServerId,
+              workspaceId: normalizedWorkspaceId,
             });
-            const latestAgent =
-              useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId) ?? null;
-            closePolicy = resolveCloseAgentTabPolicy(latestAgent);
           } catch (error) {
             console.error("[WorkspaceScreen] Failed to close subagent tab", { error, agentId });
             toast.error(t("workspace.tabs.toasts.failedToCloseAgent"));
@@ -2118,7 +2120,7 @@ function WorkspaceScreenContent({
           });
         }
 
-        if (closePolicy.kind === "layout-only") {
+        if (!shouldArchive) {
           return;
         }
 
@@ -2132,6 +2134,7 @@ function WorkspaceScreenContent({
       closeWorkspaceTabWithCleanup,
       confirmArchiveAgentTab,
       normalizedServerId,
+      normalizedWorkspaceId,
       persistenceKey,
       t,
       toast,
@@ -2224,6 +2227,7 @@ function WorkspaceScreenContent({
 
   const handleClosePassiveTab = useCallback(
     function handleClosePassiveTab(input: { tabId: string; target?: WorkspaceTabTarget | null }) {
+      if (isDraftTabSubmitting(input.target)) return;
       setHoveredCloseTabKey((current) => (current === input.tabId ? null : current));
       if (persistenceKey) {
         closeWorkspaceTabWithCleanup({ tabId: input.tabId, target: input.target });
@@ -2256,14 +2260,19 @@ function WorkspaceScreenContent({
 
   const handleCloseTabById = useCallback(
     async (tabId: string) => {
-      if (persistenceKey && sheets.some((sheet) => sheet.tab.tabId === tabId)) {
-        if (await confirmDiscardModifiedTab(tabId)) {
+      const sheet = sheets.find((entry) => entry.tab.tabId === tabId);
+      if (persistenceKey && sheet) {
+        if (
+          !isDraftTabSubmitting(sheet.tab.target) &&
+          (await confirmDiscardModifiedTab(tabId)) &&
+          !isDraftTabSubmitting(sheet.tab.target)
+        ) {
           closeWorkspaceTab(persistenceKey, tabId);
         }
         return;
       }
       const tab = allTabDescriptorsById.get(tabId);
-      if (!tab) {
+      if (!tab || isDraftTabSubmitting(tab.target)) {
         return;
       }
       if (!(await confirmDiscardModifiedTab(tabId))) {
@@ -2442,7 +2451,8 @@ function WorkspaceScreenContent({
       title: string;
       logLabel: string;
     }): Promise<boolean> => {
-      const { tabsToClose, title, logLabel } = input;
+      const { title, logLabel } = input;
+      const tabsToClose = input.tabsToClose.filter((tab) => !isDraftTabSubmitting(tab.target));
       if (tabsToClose.length === 0) {
         return true;
       }
@@ -2498,13 +2508,13 @@ function WorkspaceScreenContent({
           if (!client) {
             throw new Error(t("common.errors.daemonClientUnavailable"));
           }
-          const clientId = await getOrCreateClientId();
-          await client.updateAgent(agentId, {
-            labels: { [getOpenAgentTabLabel(clientId)]: "false" },
+          const shouldArchive = await clearSubagentOpenTabLabel({
+            client,
+            agentId,
+            serverId: normalizedServerId,
+            workspaceId: normalizedWorkspaceId,
           });
-          const latestAgent =
-            useSessionStore.getState().sessions[normalizedServerId]?.agents?.get(agentId) ?? null;
-          if (resolveCloseAgentTabPolicy(latestAgent).kind === "archive-on-close") {
+          if (shouldArchive) {
             await archiveAgent({ serverId: normalizedServerId, agentId });
           }
         },
@@ -2608,12 +2618,26 @@ function WorkspaceScreenContent({
         const tab = allTabDescriptorsById.get(tabId);
         return tab ? [tab] : [];
       });
+      if (tabsToClose.some((tab) => isDraftTabSubmitting(tab.target))) {
+        return;
+      }
       const closed = await handleBulkCloseTabs({
         tabsToClose,
         title: t("workspace.tabs.confirmations.closePaneTitle"),
         logLabel: "from pane close",
       });
       if (!closed) {
+        return;
+      }
+      const layoutStore = useWorkspaceLayoutStore.getState();
+      const latestLayout = layoutStore.layoutByWorkspace[persistenceKey];
+      const latestPane = latestLayout && findPaneById(latestLayout.root, paneId);
+      if (
+        latestPane &&
+        layoutStore
+          .getWorkspaceTabs(persistenceKey)
+          .some((tab) => latestPane.tabIds.includes(tab.tabId) && isDraftTabSubmitting(tab.target))
+      ) {
         return;
       }
       closeWorkspacePane(persistenceKey, paneId);
@@ -3182,7 +3206,14 @@ function WorkspaceScreenContent({
           if (!persistenceKey) {
             return;
           }
-          replaceWorkspaceTabTarget(persistenceKey, input.tab.tabId, target);
+          const replaced = replaceWorkspaceTabTarget(persistenceKey, input.tab.tabId, target);
+          if (replaced === null && target.kind === "agent") {
+            revealCreatedDraftAgentTab({
+              workspaceKey: persistenceKey,
+              target,
+              preferences: openInSidePane,
+            });
+          }
         },
         onSetCurrentTabState: (state) => {
           if (persistenceKey) {

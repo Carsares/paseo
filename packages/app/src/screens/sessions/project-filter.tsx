@@ -88,26 +88,23 @@ function useArchivedProjectCatalog() {
     })),
   );
 
-  return useMemo(
-    () =>
-      buildProjects({
-        hosts: catalog.flatMap(({ data }) =>
-          data
-            ? [
-                {
-                  serverId: data.serverId,
-                  serverName:
-                    hosts.find((host) => host.serverId === data.serverId)?.label ?? data.serverId,
-                  isOnline: statuses.get(data.serverId) === "online",
-                  workspaces: [],
-                  projects: data.projects,
-                },
-              ]
-            : [],
-        ),
-      }).projects,
-    [catalog, hosts, statuses],
-  );
+  return useMemo(() => {
+    const hostsWithCatalog = catalog.flatMap(({ data }) =>
+      data
+        ? [
+            {
+              serverId: data.serverId,
+              serverName:
+                hosts.find((host) => host.serverId === data.serverId)?.label ?? data.serverId,
+              isOnline: statuses.get(data.serverId) === "online",
+              workspaces: [],
+              projects: data.projects,
+            },
+          ]
+        : [],
+    );
+    return { projects: buildProjects({ hosts: hostsWithCatalog }).projects, hostsWithCatalog };
+  }, [catalog, hosts, statuses]);
 }
 
 function buildHistoryProjectOptions(input: {
@@ -179,7 +176,22 @@ export function resolveHistoryProjectSelection(
   options: readonly HistoryProjectOption[],
 ): HistoryProjectOption | null {
   const exact = options.find(({ id }) => id === selection.id);
-  if (exact) return exact;
+  if (exact) {
+    let merged: Map<string, readonly string[]> | undefined;
+    for (const [serverId, keys] of selection.projectKeysByServer) {
+      const exactKeys = exact.projectKeysByServer.get(serverId) ?? [];
+      const splitKeys = keys.filter(
+        (key) =>
+          !exactKeys.includes(key) &&
+          options.some((option) => option.projectKeysByServer.get(serverId)?.includes(key)),
+      );
+      if (splitKeys.length > 0) {
+        merged ??= new Map(exact.projectKeysByServer);
+        merged.set(serverId, [...exactKeys, ...splitKeys]);
+      }
+    }
+    return merged ? { ...exact, projectKeysByServer: merged } : exact;
+  }
   // A catalog can replace a history-only ID with a registered view key.
   const matchingPlacements = options.filter(({ projectKeysByServer }) => {
     for (const [serverId, keys] of selection.projectKeysByServer) {
@@ -198,9 +210,35 @@ export function useHistoryProjectOptions({
   selectedHost: string;
   agents: readonly AggregatedAgent[];
   ancestors: readonly AggregatedAgent[];
-}): HistoryProjectOption[] {
+}) {
   const { projects: active } = useProjects();
-  const archived = useArchivedProjectCatalog();
+  const { projects: archived, hostsWithCatalog } = useArchivedProjectCatalog();
+  const activeProjectsByServer = useSessionStore(
+    useShallow((state) =>
+      Object.fromEntries(
+        Object.entries(state.sessions).map(([serverId, session]) => [serverId, session.projects]),
+      ),
+    ),
+  );
+  const catalogEquivalenceCounts = useMemo(() => {
+    const completeByServer = new Map(
+      hostsWithCatalog.map(({ serverId, projects }) => [serverId, projects]),
+    );
+    const serverIds = new Set([...Object.keys(activeProjectsByServer), ...completeByServer.keys()]);
+    const countsByServer = new Map<string, Map<string, number>>();
+    for (const serverId of serverIds) {
+      const projects = new Map(activeProjectsByServer[serverId]);
+      for (const project of completeByServer.get(serverId) ?? []) {
+        projects.set(project.projectId, project);
+      }
+      const counts = new Map<string, number>();
+      for (const { projectKey } of projects.values()) {
+        if (projectKey?.trim()) counts.set(projectKey, (counts.get(projectKey) ?? 0) + 1);
+      }
+      countsByServer.set(serverId, counts);
+    }
+    return countsByServer;
+  }, [activeProjectsByServer, hostsWithCatalog]);
   const [observed, setObserved] = useState<ReadonlyMap<string, ObservedProject>>(() => new Map());
 
   // Keep just the placement metadata. Filtered pages can no longer rediscover other projects.
@@ -226,10 +264,11 @@ export function useHistoryProjectOptions({
     });
   }, [agents, ancestors]);
 
-  return useMemo(
+  const options = useMemo(
     () => buildHistoryProjectOptions({ selectedHost, archived, active, observed }),
     [selectedHost, archived, active, observed],
   );
+  return { options, catalogEquivalenceCounts };
 }
 
 export function HistoryProjectFilter({

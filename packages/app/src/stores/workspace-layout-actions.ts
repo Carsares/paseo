@@ -2350,7 +2350,11 @@ function collapseStaleEntityTabs(input: {
   const { snapshot, visibleAgentIds, knownTerminalIds } = input;
   let nextLayout = input.layout;
   for (const tab of collectAllTabs(nextLayout.root)) {
-    if (isAgentTab(tab) && snapshot.agentsHydrated && !visibleAgentIds.has(tab.target.agentId)) {
+    if (
+      snapshot.agentsHydrated &&
+      ((isAgentTab(tab) && !visibleAgentIds.has(tab.target.agentId)) ||
+        (tab.target.kind === "provider_subagent" && !visibleAgentIds.has(tab.target.parentAgentId)))
+    ) {
       nextLayout =
         closeTabInLayout({
           layout: nextLayout,

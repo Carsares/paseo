@@ -522,6 +522,29 @@ describe("AgentList history hierarchy", () => {
     expect(queryByTestId("agent-row-host-child")).toBeNull();
   });
 
+  it("keeps expanded subagents after a sort loads and remounts the results", () => {
+    const initial = historyResult({
+      agents: [child],
+      ancestors: [root],
+      isQueryControlsSupported: true,
+    });
+    useAgentHistory.mockImplementation(({ sort }) =>
+      sort?.field === "archived_at"
+        ? historyResult({ isInitialLoad: true, isQueryControlsSupported: true })
+        : initial,
+    );
+    const { getByRole, getByTestId, queryByTestId, rerender } = renderSessions();
+    fireEvent.click(getByRole("button", { name: "Show subagents" }));
+    expect(getByTestId("agent-row-host-child")).toBeDefined();
+
+    fireEvent.click(getByRole("button", { name: "Archived (oldest)" }));
+    expect(queryByTestId("agent-row-host-root")).toBeNull();
+
+    useAgentHistory.mockReturnValue(initial);
+    rerender(<SessionsScreen />);
+    expect(getByTestId("agent-row-host-child")).toBeDefined();
+  });
+
   it("keeps Load more reachable when an archive leaves a page without visible sessions", () => {
     const loadMore = vi.fn();
     const firstPage = historyResult({ agents: [root], hasMore: true, loadMore });
@@ -709,6 +732,73 @@ describe("AgentList history hierarchy", () => {
     );
     fireEvent.click(trigger);
     expect(queryByRole("button", { name: "Boron" })).toBeNull();
+  });
+
+  it("retains a selected placement when the complete catalog splits it from another host", async () => {
+    const remote = "remote:github.com/acme/atlas";
+    const project: ProjectDescriptor = {
+      projectId: "atlas",
+      projectKey: remote,
+      projectDisplayName: "Atlas",
+      projectCustomName: null,
+      projectKind: "git",
+      projectRootPath: "/repos/atlas",
+    };
+    historyCatalog.hosts = [
+      { serverId: "host", label: "Mac" },
+      { serverId: "peer", label: "Linux" },
+    ];
+    historyCatalog.projects = buildProjects({
+      hosts: historyCatalog.hosts.map(({ serverId, label }) => ({
+        serverId,
+        serverName: label,
+        isOnline: true,
+        projects: [project],
+        workspaces: [],
+      })),
+    }).projects;
+    historyCatalog.sessions = {
+      host: {
+        workspaces: new Map(),
+        projects: new Map([["atlas", project]]),
+        serverInfo: { features: { agentHistoryQueryControls: true } },
+      },
+      peer: { workspaces: new Map(), projects: new Map([["atlas", project]]) },
+    };
+    historyCatalog.statuses.set("host", "online");
+    const catalog = Promise.withResolvers<{ projects: ProjectDescriptor[] }>();
+    historyCatalog.getClient.mockReturnValue({ listProjects: () => catalog.promise });
+    const entry = agent("root", {
+      projectPlacement: { ...root.projectPlacement!, projectEquivalenceKey: remote },
+    });
+    useAgentHistory.mockReturnValue(historyResult({ agents: [entry] }));
+
+    const { getByRole, getByTestId, findByTestId, queryByTestId } = renderSessions();
+    fireEvent.click(getByTestId("sessions-project-filter-trigger"));
+    fireEvent.click(getByRole("button", { name: "Atlas" }));
+    fireEvent.click(getByRole("button", { name: "Collapse project Atlas" }));
+    expect(getByTestId(`history-project-header-eq:${remote}`)).toBeDefined();
+
+    catalog.resolve({
+      projects: [
+        project,
+        { ...project, projectId: "atlas-old", projectDisplayName: "Atlas (old)" },
+      ],
+    });
+    expect(
+      (await findByTestId("history-project-header-host:atlas")).getAttribute("aria-expanded"),
+    ).toBe("false");
+    expect(queryByTestId("agent-row-host-root")).toBeNull();
+    expect(useAgentHistory).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        projectKeysByServer: new Map([
+          ["host", ["atlas"]],
+          ["peer", ["atlas"]],
+        ]),
+      }),
+    );
+    fireEvent.click(getByRole("button", { name: "Expand project Atlas" }));
+    expect(getByTestId("agent-row-host-root")).toBeDefined();
   });
 
   it("keeps an active ancestor above its archived child and puts the workspace badge on the header", () => {

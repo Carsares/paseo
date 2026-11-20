@@ -431,6 +431,7 @@ export async function stopCapturedDaemon(input: StopCapturedDaemonInput): Promis
       const details = { reason: input.reason, pid: input.instance.pid };
       // COMPAT(resumeAgentsOnStop): added after v0.16.0, remove after 2027-05-19.
       if (resume && error.code === "AGENT_RESUME_ON_STOP_UNSUPPORTED") {
+        if (input.reason === "quit_preserve_work") throw error;
         logLifecycle(
           `daemon v${version} cannot resume agents on stop; stopping without agent resume`,
           details,
@@ -509,9 +510,14 @@ async function resolveRequestedReleaseChannel(
 // IPC registration
 // ---------------------------------------------------------------------------
 
-export function createDaemonCommandHandlers(): Record<string, DesktopCommandHandler> {
+export function createDaemonCommandHandlers(
+  onSettingsChanged?: (settings: DesktopSettings) => void,
+): Record<string, DesktopCommandHandler> {
   return {
-    ...createDesktopSettingsCommandHandlers({ settingsStore: getDesktopSettingsStore() }),
+    ...createDesktopSettingsCommandHandlers({
+      settingsStore: getDesktopSettingsStore(),
+      onSettingsChanged,
+    }),
     desktop_get_runtime_info: () => ({
       appVersion: resolveDesktopAppVersion(),
       runningUnderARM64Translation: isRunningUnderARM64Translation(),
@@ -586,8 +592,10 @@ export function createDaemonCommandHandlers(): Record<string, DesktopCommandHand
   };
 }
 
-export function registerDaemonManager(): void {
-  const handlers = createDaemonCommandHandlers();
+export function registerDaemonManager(
+  onSettingsChanged?: (settings: DesktopSettings) => void,
+): void {
+  const handlers = createDaemonCommandHandlers(onSettingsChanged);
 
   ipcMain.handle(
     "paseo:invoke",

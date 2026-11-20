@@ -1,10 +1,30 @@
 import type {
   ComposerAttachment,
+  ChatHistoryContextAttachment,
   PullRequestContextAttachment,
   UserComposerAttachment,
   WorkspaceComposerAttachment,
 } from "@/attachments/types";
 import type { AgentAttachment } from "@getpaseo/protocol/messages";
+
+function chatHistoryToSubmitAttachment(attachment: ChatHistoryContextAttachment): AgentAttachment {
+  const forkContext = attachment.attachment.forkContext;
+  const sourceServerId = attachment.source.serverId.trim() || forkContext?.sourceServerId?.trim();
+  const sourceAgentId = attachment.source.agentId.trim() || forkContext?.sourceAgentId?.trim();
+  const boundaryMessageId =
+    attachment.source.boundaryMessageId?.trim() || forkContext?.boundaryMessageId?.trim();
+  if (!sourceAgentId && !boundaryMessageId && !sourceServerId) {
+    return attachment.attachment;
+  }
+  return {
+    ...attachment.attachment,
+    forkContext: {
+      ...(sourceServerId ? { sourceServerId } : {}),
+      ...(sourceAgentId ? { sourceAgentId } : {}),
+      ...(boundaryMessageId ? { boundaryMessageId } : {}),
+    },
+  };
+}
 
 export function isPullRequestContextAttachment(
   attachment: ComposerAttachment | undefined,
@@ -62,20 +82,7 @@ export function workspaceAttachmentToSubmitAttachment(
     };
   }
   if (attachment.kind === "chat_history") {
-    const forkContext = attachment.attachment.forkContext;
-    const sourceAgentId = attachment.source.agentId.trim() || forkContext?.sourceAgentId?.trim();
-    const boundaryMessageId =
-      attachment.source.boundaryMessageId?.trim() || forkContext?.boundaryMessageId?.trim();
-    if (!sourceAgentId && !boundaryMessageId) {
-      return attachment.attachment;
-    }
-    return {
-      ...attachment.attachment,
-      forkContext: {
-        ...(sourceAgentId ? { sourceAgentId } : {}),
-        ...(boundaryMessageId ? { boundaryMessageId } : {}),
-      },
-    };
+    return chatHistoryToSubmitAttachment(attachment);
   }
   return attachment.kind === "review" ? attachment.attachment : null;
 }

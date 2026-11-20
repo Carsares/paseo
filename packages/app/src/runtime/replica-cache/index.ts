@@ -17,6 +17,7 @@ import {
   type WorkspaceDescriptor,
 } from "@/stores/session-store";
 import {
+  firstChatHistoryForkContext,
   forkContextToChatHistoryAttachments,
   isUnreconciledLocalUserMessage,
   type AgentToolCallData,
@@ -127,6 +128,7 @@ const StoredTimelineItemSchema = z.discriminatedUnion("kind", [
     forkContext: z
       .strictObject({
         sourceAgentId: z.string().optional(),
+        sourceServerId: z.string().optional(),
         boundaryMessageId: z.string().optional(),
       })
       .optional(),
@@ -473,16 +475,14 @@ function serializeAgentToolCall(data: AgentToolCallData): StoredToolCall {
 
 function serializeForkContext(item: StreamItem): StoredForkContext | undefined {
   if (item.kind !== "user_message") return undefined;
-  const chatHistory = item.attachments?.find(
-    (attachment) => attachment.type === "text" && attachment.contextKind === "chat_history",
+  return (
+    firstChatHistoryForkContext(item.attachments) ??
+    (item.attachments?.some(
+      (attachment) => attachment.type === "text" && attachment.contextKind === "chat_history",
+    )
+      ? {}
+      : undefined)
   );
-  if (!chatHistory || chatHistory.type !== "text") return undefined;
-  const sourceAgentId = chatHistory.forkContext?.sourceAgentId?.trim();
-  const boundaryMessageId = chatHistory.forkContext?.boundaryMessageId?.trim();
-  return {
-    ...(sourceAgentId ? { sourceAgentId } : {}),
-    ...(boundaryMessageId ? { boundaryMessageId } : {}),
-  };
 }
 
 function serializeTimelineItem(item: StreamItem): StoredTimelineItem | null {

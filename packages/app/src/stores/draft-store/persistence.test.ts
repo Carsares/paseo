@@ -106,4 +106,37 @@ describe("draft persistence", () => {
 
     expect(drafts.text()).toBe("pending checkpoint");
   });
+
+  it("waits for an in-progress checkpoint and drains changes queued during flush", async () => {
+    const writes: string[] = [];
+    const writeStarts = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const writeFinishes = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    const storage = createDraftPersistStorage<DraftState>({
+      getItem: () => null,
+      setItem: (_name, { state }) => {
+        const position = writes.length;
+        writes.push(state.text);
+        writeStarts[position]?.resolve();
+        return writeFinishes[position]?.promise;
+      },
+      removeItem: () => {},
+    });
+    storage.setItem("drafts", { state: { text: "first" } });
+    let flushed = false;
+    const flush = storage.flush().then(() => (flushed = true));
+    await Promise.resolve();
+    expect(flushed).toBe(false);
+
+    storage.setItem("drafts", { state: { text: "pending" } });
+    storage.setItem("drafts", { state: { text: "latest" } });
+    expect(writes).toEqual(["first"]);
+    writeFinishes[0]?.resolve();
+    await writeStarts[1]?.promise;
+    expect(writes).toEqual(["first", "latest"]);
+    expect(flushed).toBe(false);
+
+    writeFinishes[1]?.resolve();
+    await flush;
+    expect(flushed).toBe(true);
+  });
 });

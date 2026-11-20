@@ -3970,6 +3970,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     const hasActiveRootTurn = this.activeForegroundTurnId !== null || this.currentTurnId !== null;
     this.clearPendingPermissions({ preservePlanApprovals: !hasActiveRootTurn });
     if (hasActiveRootTurn) {
+      this.retractPendingRootAssistantMessages();
       this.settleStreamRetry({ status: "failed", error: error.message });
       this.emitEvent({
         type: "turn_failed",
@@ -4308,6 +4309,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       route,
       parentCallId: null as string | null,
       parentSubagentId: null as string | null,
+      ancestorCanceled: route.toolCall.status === "canceled",
     }));
     const visitedThreadIds = new Set(this.currentThreadId ? [this.currentThreadId] : []);
     while (queue.length > 0 && visitedThreadIds.size < 100) {
@@ -4316,8 +4318,12 @@ export class CodexAppServerAgentSession implements AgentSession {
         continue;
       }
       visitedThreadIds.add(next.route.childThreadId);
+      const ancestorCanceled = next.ancestorCanceled || next.route.toolCall.status === "canceled";
       this.registerSubAgentToolCall({
-        timelineItem: next.route.toolCall,
+        timelineItem:
+          next.ancestorCanceled && next.route.toolCall.status === "running"
+            ? { ...next.route.toolCall, status: "canceled", error: null }
+            : next.route.toolCall,
         rawItem: { agentThreadId: next.route.childThreadId },
         parentCallId: next.parentCallId,
         parentSubagentId: next.parentSubagentId,
@@ -4336,6 +4342,7 @@ export class CodexAppServerAgentSession implements AgentSession {
             route,
             parentCallId: next.route.toolCall.callId,
             parentSubagentId: next.route.childThreadId,
+            ancestorCanceled,
           });
         }
       } catch (error) {

@@ -5,7 +5,11 @@ import { useShallow } from "zustand/shallow";
 import { useSessionStore } from "@/stores/session-store";
 import { getOrCreateClientId } from "@/utils/client-id";
 import type { WorkspaceTab } from "@/workspace-tabs/model";
-import { getAgentTabsNeedingOpenLabel, selectOpenTabAgents } from "./open-tab-labels";
+import {
+  getAgentTabsNeedingOpenLabel,
+  needsOpenAgentTabLabel,
+  selectOpenTabAgents,
+} from "./open-tab-labels";
 
 function increment(value: number): number {
   return value + 1;
@@ -14,6 +18,7 @@ function increment(value: number): number {
 export function useOpenAgentTabLabels(input: {
   client: DaemonClient | null;
   serverId: string;
+  workspaceId?: string | null;
   tabs: WorkspaceTab[];
   enabled: boolean;
 }): void {
@@ -66,8 +71,17 @@ export function useOpenAgentTabLabels(input: {
           getAgent: (agentId) => agentsById.get(agentId),
           label,
           pendingAgentIds: pendingAgentIdsRef.current,
+          workspaceId: input.workspaceId,
         });
         for (const agentId of agentIds) {
+          const session = useSessionStore.getState().sessions[input.serverId];
+          const latestAgent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+          if (
+            pendingAgentIdsRef.current.has(agentId) ||
+            !needsOpenAgentTabLabel(latestAgent, label, input.workspaceId)
+          ) {
+            continue;
+          }
           pendingAgentIdsRef.current.add(agentId);
           try {
             await client.updateAgent(agentId, { labels: { [label]: "true" } });
@@ -88,5 +102,14 @@ export function useOpenAgentTabLabels(input: {
         console.warn("[OpenAgentTabLabels] Failed to resolve client ID", { error });
       }
     })();
-  }, [input.client, input.enabled, input.tabs, openAgentIds, openAgents, retryVersion]);
+  }, [
+    input.client,
+    input.enabled,
+    input.serverId,
+    input.tabs,
+    input.workspaceId,
+    openAgentIds,
+    openAgents,
+    retryVersion,
+  ]);
 }

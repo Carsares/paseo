@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { AfterPaintPublication } from "@/composer/after-paint-publication";
 import type { DraftInput } from "@/stores/draft-store";
 import {
   canSwitchAgentProvider,
@@ -8,7 +9,7 @@ import {
 
 // Keep the shared history builder and close policy real while isolating the hook's app wiring.
 vi.mock("expo-router", () => ({ useRouter: vi.fn() }));
-vi.mock("@/hooks/use-archive-agent", () => ({ useArchiveAgent: vi.fn() }));
+vi.mock("@/hooks/use-archive-agent", () => ({ applyArchivedAgentCloseResults: vi.fn() }));
 vi.mock("@/stores/navigation-active-workspace-store", () => ({ navigateToWorkspace: vi.fn() }));
 vi.mock("@/stores/draft-store", () => ({ useDraftStore: vi.fn() }));
 vi.mock("@/stores/session-store", () => ({ useSessionStore: vi.fn() }));
@@ -38,6 +39,7 @@ const sourceDraftKey = "agent:host-1:agent-1";
 const targetDraftKey = "draft:host-1:draft-1";
 const draftAttachmentScopeKey = "workspace-attachments:draft=draft-1";
 const workspaceKey = "host-1:workspace-1";
+const mainControlLabels = { "paseo.workspace-role": "main" };
 
 const confirmation = {
   title: "workspace.tabs.confirmations.archiveRunningAgentTitle",
@@ -50,8 +52,10 @@ const confirmation = {
 function createHandoff(agentOverrides: Partial<NonNullable<ReturnType<Deps["getAgent"]>>> = {}) {
   const agent: NonNullable<ReturnType<Deps["getAgent"]>> = {
     cwd: "/workspace/project",
+    labels: {},
     parentAgentId: null,
     status: "idle",
+    workspaceId: "workspace-1",
     ...agentOverrides,
   };
   const client = {
@@ -79,18 +83,35 @@ function createHandoff(agentOverrides: Partial<NonNullable<ReturnType<Deps["getA
     clearDraftInput: vi.fn(),
     clearDraftMetadata: vi.fn(),
   };
+  const textPublication = new AfterPaintPublication<string>(
+    (text) => {
+      liveText = text;
+    },
+    { schedule: () => () => {} },
+  );
   let liveText = "  Continue here.  ";
   const composerInput = {
-    textSource: { getSnapshot: () => liveText, subscribe: () => () => {} },
+    textSource: {
+      getSnapshot: () => liveText,
+      peekPendingText: () => textPublication.peek(),
+      subscribe: () => () => {},
+    },
     attachments: [
       { kind: "workspace_file", path: "live.ts", selection: { kind: "whole_file" } },
     ] satisfies DraftInput["attachments"],
     setText: vi.fn((next: string) => {
+      textPublication.cancel();
       liveText = next;
     }),
   };
   const workspaceAttachmentsStore = { setWorkspaceAttachments: vi.fn() };
-  const layoutStore = { unpinAgent: vi.fn(), hideAgent: vi.fn() };
+  const layoutStore = {
+    getWorkspaceTabs: vi.fn<ReturnType<Deps["getWorkspaceLayoutStore"]>["getWorkspaceTabs"]>(() => [
+      { tabId: paneContext.tabId, target: { kind: "agent", agentId: "agent-1" }, createdAt: 0 },
+    ]),
+    unpinAgent: vi.fn(),
+    hideAgent: vi.fn(),
+  };
   const deps = {
     supportsAgentForkContext: true,
     client,
@@ -126,7 +147,6 @@ function createHandoff(agentOverrides: Partial<NonNullable<ReturnType<Deps["getA
     expect(layoutStore.unpinAgent).not.toHaveBeenCalled();
     expect(layoutStore.hideAgent).not.toHaveBeenCalled();
     expect(paneContext.retargetCurrentTab).not.toHaveBeenCalled();
-    expect(deps.archiveAgent).not.toHaveBeenCalled();
   }
 
   return {
@@ -136,6 +156,7 @@ function createHandoff(agentOverrides: Partial<NonNullable<ReturnType<Deps["getA
     storedDraft,
     draftStore,
     composerInput,
+    textPublication,
     workspaceAttachmentsStore,
     layoutStore,
     deps,
@@ -227,8 +248,34 @@ describe("performCrossProviderAgentHandoff", () => {
       paneContext.retargetCurrentTab,
     );
     expect(layoutStore.hideAgent).toHaveBeenCalledBefore(paneContext.retargetCurrentTab);
-    expect(paneContext.retargetCurrentTab).toHaveBeenCalledBefore(deps.archiveAgent);
+    expect(deps.archiveAgent).toHaveBeenCalledBefore(
+      workspaceAttachmentsStore.setWorkspaceAttachments,
+    );
     expect(deps.toast.error).not.toHaveBeenCalled();
+  });
+
+  it.each(["The last keystroke", ""])("moves pending text %j before paint", async (text) => {
+    const { draftStore, composerInput, textPublication, run } = createHandoff();
+    let storeText = "  Continue here.  ";
+    composerInput.textSource.getSnapshot = () => storeText;
+    draftStore.clearDraftInput.mockImplementation(({ draftKey }) => {
+      if (draftKey === sourceDraftKey) storeText = "";
+    });
+    composerInput.setText.mockImplementation((next: string) => {
+      if (next === composerInput.textSource.getSnapshot()) {
+        textPublication.cancel();
+        return;
+      }
+      textPublication.stage(next);
+    });
+    textPublication.stage(text);
+    expect(composerInput.textSource.getSnapshot()).toBe("  Continue here.  ");
+    expect(await run()).toBe(true);
+    expect(draftStore.saveDraftInput).toHaveBeenCalledExactlyOnceWith({
+      draftKey: targetDraftKey,
+      draft: { text, attachments: composerInput.attachments },
+    });
+    expect(textPublication.peek()).toBeNull();
   });
 
   it("keeps the stored prompt when there is no mounted composer input", async () => {
@@ -275,9 +322,12 @@ describe("performCrossProviderAgentHandoff", () => {
   });
 
   it("releases this client's open-tab label and keeps an attached subagent unarchived", async () => {
-    const { client, paneContext, deps, run } = createHandoff({
+    const { agent, client, paneContext, deps, run } = createHandoff({
       parentAgentId: "parent-1",
       status: "running",
+    });
+    client.updateAgent.mockImplementationOnce(async () => {
+      deps.getAgent.mockReturnValue({ ...agent, parentAgentId: "new-parent" });
     });
 
     expect(await run()).toBe(true);
@@ -294,6 +344,7 @@ describe("performCrossProviderAgentHandoff", () => {
       setup: {
         provider: "codex",
         cwd: "/workspace/project",
+        parentAgentId: "new-parent",
         modeId: null,
         model: null,
         thinkingOptionId: null,
@@ -314,11 +365,98 @@ describe("performCrossProviderAgentHandoff", () => {
     expect(client.updateAgent).toHaveBeenCalledExactlyOnceWith("agent-1", {
       labels: { "paseo.open-agent-tab.client-1": "false" },
     });
-    expect(paneContext.retargetCurrentTab).toHaveBeenCalledBefore(deps.archiveAgent);
+    expect(deps.archiveAgent).toHaveBeenCalledBefore(paneContext.retargetCurrentTab);
     expect(deps.archiveAgent).toHaveBeenCalledExactlyOnceWith({
       serverId: "host-1",
       agentId: "agent-1",
     });
+  });
+
+  it("keeps a main control agent and its draft untouched", async () => {
+    const { client, deps, run, expectSourceUntouched } = createHandoff({
+      labels: mainControlLabels,
+    });
+    expect(await run()).toBe(false);
+    expect(client.buildAgentForkContext).not.toHaveBeenCalled();
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expectSourceUntouched();
+  });
+
+  it.each(["closed", "retargeted", "migrated", "archived", "removed"] as const)(
+    "aborts if the source was %s while loading history",
+    async (change) => {
+      const { agent, client, deps, layoutStore, run, expectSourceUntouched } = createHandoff();
+      client.buildAgentForkContext.mockImplementationOnce(async () => {
+        switch (change) {
+          case "closed":
+            layoutStore.getWorkspaceTabs.mockReturnValue([]);
+            break;
+          case "retargeted":
+            layoutStore.getWorkspaceTabs.mockReturnValue([
+              {
+                tabId: "existing-tab",
+                target: { kind: "agent", agentId: "other-agent" },
+                createdAt: 0,
+              },
+            ]);
+            break;
+          case "migrated":
+            deps.getAgent.mockReturnValue({ ...agent, workspaceId: "other-workspace" });
+            break;
+          case "archived":
+            deps.getAgent.mockReturnValue({ ...agent, archivedAt: new Date(1_000) });
+            break;
+          case "removed":
+            deps.getAgent.mockReturnValue(null);
+            break;
+        }
+        return forkPayload;
+      });
+      expect(await run()).toBe(false);
+      expect(deps.archiveAgent).not.toHaveBeenCalled();
+      expectSourceUntouched();
+    },
+  );
+
+  it("does not update the label if the tab closes while obtaining the client ID", async () => {
+    const { client, deps, layoutStore, run, expectSourceUntouched } = createHandoff({
+      parentAgentId: "parent-1",
+    });
+    deps.getOrCreateClientId.mockImplementationOnce(async () => {
+      layoutStore.getWorkspaceTabs.mockReturnValue([]);
+      return "client-1";
+    });
+    expect(await run()).toBe(false);
+    expect(client.updateAgent).not.toHaveBeenCalled();
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expectSourceUntouched();
+  });
+
+  it("asks before archiving an agent that starts running and detaches during the label update", async () => {
+    const { agent, client, deps, run, expectSourceUntouched } = createHandoff({
+      parentAgentId: "parent-1",
+    });
+    client.updateAgent.mockImplementationOnce(async () => {
+      deps.getAgent.mockReturnValue({ ...agent, parentAgentId: null, status: "running" });
+    });
+    deps.confirmDialog.mockResolvedValueOnce(false);
+    expect(await run()).toBe(false);
+    expect(deps.confirmDialog).toHaveBeenCalledExactlyOnceWith(confirmation);
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expectSourceUntouched();
+  });
+
+  it("leaves the source intact until archive succeeds and reports a failed archive", async () => {
+    const { deps, run, expectSourceUntouched } = createHandoff();
+    const archive = Promise.withResolvers<void>();
+    deps.archiveAgent.mockReturnValueOnce(archive.promise);
+    const handoff = run();
+    await vi.waitFor(() => expect(deps.archiveAgent).toHaveBeenCalledOnce());
+    expectSourceUntouched();
+    archive.reject(new Error("Archive refused"));
+    expect(await handoff).toBe(false);
+    expectSourceUntouched();
+    expect(deps.toast.error).toHaveBeenCalledExactlyOnceWith("Archive refused");
   });
 
   it("shows a message on unsupported hosts and leaves the tab untouched", async () => {
@@ -432,40 +570,21 @@ describe("performCrossProviderAgentHandoff", () => {
 
 describe("canSwitchAgentProvider", () => {
   it("requires agentForkContext support, a connected client, and a non-sheet workspace pane", () => {
-    const { client, paneContext } = createHandoff();
-
-    expect(canSwitchAgentProvider({ supportsAgentForkContext: true, client, paneContext })).toBe(
-      true,
-    );
+    const { agent, client, paneContext } = createHandoff();
+    const input = { supportsAgentForkContext: true, client, paneContext, agent };
+    expect(canSwitchAgentProvider(input)).toBe(true);
     expect(
-      canSwitchAgentProvider({
-        supportsAgentForkContext: true,
-        client,
-        paneContext: { ...paneContext, host: "explorer" },
-      }),
+      canSwitchAgentProvider({ ...input, paneContext: { ...paneContext, host: "explorer" } }),
     ).toBe(true);
-    expect(canSwitchAgentProvider({ supportsAgentForkContext: false, client, paneContext })).toBe(
-      false,
-    );
+    expect(canSwitchAgentProvider({ ...input, supportsAgentForkContext: false })).toBe(false);
+    expect(canSwitchAgentProvider({ ...input, client: null })).toBe(false);
+    expect(canSwitchAgentProvider({ ...input, paneContext: null })).toBe(false);
     expect(
-      canSwitchAgentProvider({ supportsAgentForkContext: true, client: null, paneContext }),
+      canSwitchAgentProvider({ ...input, paneContext: { ...paneContext, host: "sheet" } }),
     ).toBe(false);
     expect(
-      canSwitchAgentProvider({ supportsAgentForkContext: true, client, paneContext: null }),
+      canSwitchAgentProvider({ ...input, paneContext: { ...paneContext, workspaceId: "   " } }),
     ).toBe(false);
-    expect(
-      canSwitchAgentProvider({
-        supportsAgentForkContext: true,
-        client,
-        paneContext: { ...paneContext, host: "sheet" },
-      }),
-    ).toBe(false);
-    expect(
-      canSwitchAgentProvider({
-        supportsAgentForkContext: true,
-        client,
-        paneContext: { ...paneContext, workspaceId: "   " },
-      }),
-    ).toBe(false);
+    expect(canSwitchAgentProvider({ ...input, agent: { labels: mainControlLabels } })).toBe(false);
   });
 });

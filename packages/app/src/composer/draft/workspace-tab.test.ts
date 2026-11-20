@@ -2,16 +2,34 @@
 import { fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { createElement, createRef } from "react";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import { WORKSPACE_MAIN_ROLE, WORKSPACE_ROLE_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  getOpenAgentTabLabel,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import { AssistantSelectionQuote } from "@/assistant-selection-copy/quote.web";
 import { AllowSubagentForkContext, AssistantForkMenu } from "@/components/assistant-fork-menu";
 import { buildSubagentDraftSetup } from "@/hooks/use-fork-agent";
+import { DEFAULT_OPEN_IN_SIDE_PANE_PREFERENCES } from "@/hooks/use-settings/storage";
+import { useCreateFlowStore } from "@/stores/create-flow-store";
+import { useSessionStore, type Agent } from "@/stores/session-store";
 import { WorkspaceLayoutPersistedStateSchema } from "@/stores/workspace-layout-storage";
-import { collectAllTabs } from "@/stores/workspace-layout-store";
+import {
+  collectAllTabs,
+  createWorkspaceLayoutStore,
+  useWorkspaceLayoutStore,
+} from "@/stores/workspace-layout-store";
+import { getOrCreateClientId } from "@/utils/client-id";
+import { clearSubagentOpenTabLabel } from "@/subagents/open-tab-labels";
 import { normalizeWorkspaceTabTarget, workspaceTabTargetsEqual } from "@/workspace-tabs/identity";
 import { describe, expect, test, vi } from "vitest";
 
-import { submitDraftCreateRequest, useInitialDraftText } from "./workspace-tab";
+import {
+  isDraftTabSubmitting,
+  revealCreatedDraftAgentTab,
+  submitDraftCreateRequest,
+  useInitialDraftText,
+} from "./workspace-tab";
 import { shouldAllowEmptyDraftText, validateDraftSubmission } from "./workspace-tab-core";
 
 vi.mock("@/composer", () => ({ Composer: () => null }));
@@ -156,7 +174,7 @@ describe("workspace subagent draft", () => {
   });
 
   test.each(["parent-agent", null])(
-    "submits the caller only when the draft has a parent (%s)",
+    "marks the first prompt as user input when the draft has a parent (%s)",
     async (parentAgentId) => {
       const result = {
         id: "created-agent",
@@ -212,8 +230,15 @@ describe("workspace subagent draft", () => {
         workspaceId: "workspace-1",
         initialPrompt: "Investigate this",
       });
-      if (parentAgentId) expect(request).toHaveProperty("callerAgentId", parentAgentId);
-      else expect(request).not.toHaveProperty("callerAgentId");
+      if (parentAgentId) {
+        expect(request).toMatchObject({
+          callerAgentId: parentAgentId,
+          initialPromptOrigin: "user",
+        });
+      } else {
+        expect(request).not.toHaveProperty("callerAgentId");
+        expect(request).not.toHaveProperty("initialPromptOrigin");
+      }
     },
   );
 
@@ -374,6 +399,153 @@ describe("workspace subagent draft", () => {
     rerender({ draftKey: "draft-2", isHydrated: true });
     expect(text).toBe("Saved draft");
     expect(replaceDraftText).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("workspace tab lifecycle", () => {
+  test.each([
+    ["destination", false],
+    [" source ", true],
+  ] as const)(
+    "rechecks whether to archive when clearing the label detaches the agent in %j",
+    async (nextWorkspaceId, shouldArchive) => {
+      const serverId = "close-subagent-host";
+      const store = useSessionStore.getState();
+      const child = { id: "child", parentAgentId: "parent", workspaceId: "source" } as Agent;
+      store.initializeSession(serverId, null as unknown as DaemonClient);
+      const setChild = (agent: Agent) =>
+        store.setAgents(
+          serverId,
+          new Map([
+            [
+              agent.id,
+              {
+                ...agent,
+                pendingPermissions: [],
+                turn: { phase: "idle", cancellationRequestId: null },
+                status: "idle",
+                updatedAt: new Date(0),
+              },
+            ],
+          ]),
+        );
+      setChild(child);
+      const updateStarted = Promise.withResolvers<void>();
+      const updateFinished = Promise.withResolvers<void>();
+      const updateAgent = vi.fn<DaemonClient["updateAgent"]>(() => {
+        updateStarted.resolve();
+        return updateFinished.promise;
+      });
+      try {
+        const close = clearSubagentOpenTabLabel({
+          client: { updateAgent },
+          agentId: child.id,
+          serverId,
+          workspaceId: "source",
+        });
+        await updateStarted.promise;
+        setChild({ ...child, parentAgentId: null, workspaceId: nextWorkspaceId });
+        updateFinished.resolve();
+        await expect(close).resolves.toBe(shouldArchive);
+        const label = getOpenAgentTabLabel(await getOrCreateClientId());
+        expect(updateAgent).toHaveBeenCalledExactlyOnceWith(child.id, {
+          labels: { [label]: "false" },
+        });
+      } finally {
+        store.clearSession(serverId);
+      }
+    },
+  );
+
+  test("blocks draft close only while creation is active", () => {
+    const draftId = "closing-draft";
+    const target = { kind: "draft", draftId } as const;
+    const store = useCreateFlowStore.getState();
+    expect(isDraftTabSubmitting(target)).toBe(false);
+    store.setPending({
+      draftId,
+      serverId: "host",
+      agentId: null,
+      clientMessageId: "message",
+      text: "hello",
+      timestamp: 0,
+    });
+    try {
+      expect(isDraftTabSubmitting(target)).toBe(true);
+      store.markLifecycle({ draftId, lifecycle: "abandoned" });
+      expect(isDraftTabSubmitting(target)).toBe(false);
+    } finally {
+      store.clear({ draftId });
+    }
+  });
+
+  test.each(["split-panes", "compact"] as const)(
+    "opens the created subagent as a tab if its draft is gone (%s)",
+    (layoutMode) => {
+      const serverId = "retarget-draft-host";
+      const workspaceId = "retargeted-draft";
+      const workspaceKey = `${serverId}:${workspaceId}`;
+      const state = useWorkspaceLayoutStore.getState();
+      const target = { kind: "agent", agentId: "created-agent" } as const;
+      const store = useSessionStore.getState();
+      store.initializeSession(serverId, null as unknown as DaemonClient);
+      const child = { id: target.agentId, parentAgentId: "parent", workspaceId } as Agent;
+      store.setAgentDetails(serverId, new Map([[child.id, child]]));
+      try {
+        state.setLayoutMode(layoutMode);
+        const draftTabId = state.openTab({
+          workspaceKey,
+          target: { kind: "draft", draftId: "closed-draft" },
+          intent: "new",
+        });
+        if (!draftTabId) throw new Error("Expected a draft tab");
+        state.closeTab(workspaceKey, draftTabId);
+        expect(state.replaceTab(workspaceKey, draftTabId, target)).toBeNull();
+        revealCreatedDraftAgentTab({
+          workspaceKey,
+          target,
+          preferences: DEFAULT_OPEN_IN_SIDE_PANE_PREFERENCES,
+        });
+        expect(state.getWorkspaceTabs(workspaceKey).map((tab) => tab.target)).toContainEqual(
+          target,
+        );
+      } finally {
+        useWorkspaceLayoutStore.setState(state);
+        store.clearSession(serverId);
+      }
+    },
+  );
+
+  test("keeps provider subagent tabs until the parent list loads, then removes orphaned tabs", () => {
+    const store = createWorkspaceLayoutStore().getState();
+    const workspaceKey = "host:provider-subagent-tabs";
+    const open = (parentAgentId: string) =>
+      store.openTab({
+        workspaceKey,
+        target: {
+          kind: "provider_subagent",
+          parentAgentId,
+          subagentId: `subagent-${parentAgentId}`,
+        },
+        intent: "new",
+      });
+    const local = open("local");
+    const moved = open("moved");
+    const snapshot = {
+      activeAgentIds: ["local"],
+      autoOpenAgentIds: [],
+      standaloneTerminalIds: [],
+      terminalsHydrated: true,
+    };
+    const providerTabs = () =>
+      store
+        .getWorkspaceTabs(workspaceKey)
+        .filter((tab) => tab.target.kind === "provider_subagent")
+        .map((tab) => tab.tabId);
+    store.reconcileTabs(workspaceKey, { ...snapshot, agentsHydrated: false });
+    expect(providerTabs()).toEqual([local, moved]);
+    store.reconcileTabs(workspaceKey, { ...snapshot, agentsHydrated: true });
+    expect(providerTabs()).toEqual([local]);
   });
 });
 

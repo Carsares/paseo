@@ -1,4 +1,9 @@
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import {
+  MAIN_PRIOR_MODE_ID_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import { afterEach, expect, test } from "vitest";
 
 import { createHostResolver, type HostOperations } from "./index.js";
@@ -111,6 +116,7 @@ interface Caller {
   background: boolean;
   provider: string;
   currentModeId: string | null;
+  labels?: Record<string, string>;
 }
 
 function resolverFor(client: DaemonClient, caller: Caller | null) {
@@ -188,4 +194,26 @@ test("a remote child of another provider leaves its mode to the host", async () 
 
 test("a remote create without a caller agent leaves its mode to the host", async () => {
   expect(await forwardedMode(null)).toBeUndefined();
+});
+
+test("a Main Control caller forwards its prior mode instead of read-only to a remote child", async () => {
+  expect(
+    await forwardedMode({
+      ...visibleCodexCaller,
+      currentModeId: "read-only",
+      labels: {
+        [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
+        [MAIN_PRIOR_MODE_ID_LABEL]: "full-access",
+      },
+    }),
+  ).toBe("full-access");
+  expect(
+    await forwardedMode({
+      ...visibleCodexCaller,
+      currentModeId: "read-only",
+      labels: {
+        [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
+      },
+    }),
+  ).toBeUndefined();
 });

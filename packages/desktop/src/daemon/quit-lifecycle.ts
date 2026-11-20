@@ -78,7 +78,8 @@ export async function stopDesktopManagedDaemonOnQuitIfNeeded(
     return false;
   }
 
-  const hasPendingUpdate = deps.hasPendingUpdateOnQuit?.() === true;
+  const hasPendingUpdate =
+    settings.officialUpdatesEnabled !== false && deps.hasPendingUpdateOnQuit?.() === true;
   const shouldStopDaemon = hasPendingUpdate
     ? (deps.isDesktopManagedDaemonPresent ?? deps.isDesktopManagedDaemonRunning)()
     : deps.isDesktopManagedDaemonRunning();
@@ -116,6 +117,7 @@ export function createQuitLifecycle({
   installAppUpdateOnQuit,
   createUpdateDeadlineSignal,
   onStopError,
+  onPreserveWorkStopFailed,
   onUpdateError,
 }: {
   app: BeforeQuitApp;
@@ -124,6 +126,7 @@ export function createQuitLifecycle({
   installAppUpdateOnQuit: (signal: AbortSignal) => Promise<boolean>;
   createUpdateDeadlineSignal: () => AbortSignal;
   onStopError: (error: unknown) => void;
+  onPreserveWorkStopFailed?: (error: unknown) => void;
   onUpdateError: (error: unknown) => void;
 }): QuitLifecycle {
   // The first quit waits for daemon shutdown and update revalidation. A validated
@@ -135,9 +138,13 @@ export function createQuitLifecycle({
   const updateQuit = createDeferredUpdateQuit();
 
   function handleBeforeQuit(event: BeforeQuitEvent): void {
-    closeTransportSessions();
+    if (!preserveWorkRequested) closeTransportSessions();
     if (quittingForUpdate) return;
     if (quitting) {
+      if (preserveWorkRequested) {
+        event.preventDefault();
+        return;
+      }
       // MacUpdater's no-relaunch path calls app.quit() without emitting
       // before-quit-for-update. A second quit is equivalent handoff evidence.
       updateQuit.resolve();
@@ -150,9 +157,20 @@ export function createQuitLifecycle({
       try {
         await stopDesktopManagedDaemonIfNeeded({ preserveWork: preserveWorkRequested });
       } catch (error) {
+        if (preserveWorkRequested) {
+          quitting = false;
+          preserveWorkRequested = false;
+          onStopError(error);
+          onPreserveWorkStopFailed?.(error);
+          return;
+        }
         onStopError(error);
       }
 
+      if (preserveWorkRequested) {
+        preserveWorkRequested = false;
+        closeTransportSessions();
+      }
       const signal = createUpdateDeadlineSignal();
       const updateInstallation = installAppUpdateOnQuit(signal).catch((error) => {
         onUpdateError(error);

@@ -70,7 +70,7 @@ function createRowIdentityIndex() {
     const rowIdBySourceId = new Map<string, string>();
     const sourceIdByRowId = new Map<string, string>();
     for (const item of rows) {
-      const sourceId = getStreamItemMessageId(item);
+      const sourceId = item.kind === "turn_summary" ? item.hostId : getStreamItemMessageId(item);
       // A plugin can split one source into several rows. Enter at the first row.
       if (!rowIdBySourceId.has(sourceId)) rowIdBySourceId.set(sourceId, item.id);
       sourceIdByRowId.set(item.id, sourceId);

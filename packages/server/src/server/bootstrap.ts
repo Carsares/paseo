@@ -1504,6 +1504,10 @@ export async function createPaseoDaemon(
       const record = await agentStorage.get(agentId);
       return record ? !record.archivedAt : Boolean(agentManager.getAgent(agentId));
     },
+    hosts: () => {
+      if (!wsServer) throw new Error("Daemon is not accepting host operations");
+      return wsServer.toolHosts();
+    },
     ...createFinishObservation({
       agentManager,
       agentStorage,

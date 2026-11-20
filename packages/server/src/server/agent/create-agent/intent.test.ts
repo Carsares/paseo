@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  getOpenAgentTabLabel,
+  MAIN_PRIOR_MODE_ID_LABEL,
+  PARENT_AGENT_ID_LABEL,
+  PARENT_SERVER_ID_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
+import { REMOTE_HIERARCHY_DEPTH_LABEL } from "../hierarchy-policy.js";
 import { resolveCreateAgentIntent } from "./intent.js";
 
 describe("resolveCreateAgentIntent", () => {
@@ -70,5 +78,57 @@ describe("resolveCreateAgentIntent", () => {
       parentAgentId: null,
       labels: {},
     });
+  });
+
+  it("strips reserved hierarchy labels and preserves valid remote parent labels with validated depth", async () => {
+    const forgedLocal = await resolveCreateAgentIntent({
+      caller: null,
+      serverId: "local-host",
+      labels: {
+        [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
+        [MAIN_PRIOR_MODE_ID_LABEL]: "full-access",
+        [PARENT_AGENT_ID_LABEL]: "forged-parent",
+        [PARENT_SERVER_ID_LABEL]: "local-host",
+        [REMOTE_HIERARCHY_DEPTH_LABEL]: "1",
+        [getOpenAgentTabLabel("client-1")]: "true",
+      },
+      resolveWorkspace: async (workspaceId) => ({ workspaceId, cwd: "/unused" }),
+      createWorkspace: async () => ({ workspaceId: "workspace-created", cwd: "/created" }),
+    });
+    expect(forgedLocal.labels).toEqual({
+      [getOpenAgentTabLabel("client-1")]: "true",
+    });
+
+    const remoteChild = await resolveCreateAgentIntent({
+      caller: null,
+      serverId: "local-host",
+      labels: {
+        [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
+        [PARENT_AGENT_ID_LABEL]: "remote-parent",
+        [PARENT_SERVER_ID_LABEL]: "remote-host",
+        [REMOTE_HIERARCHY_DEPTH_LABEL]: "2",
+      },
+      resolveWorkspace: async (workspaceId) => ({ workspaceId, cwd: "/unused" }),
+      createWorkspace: async () => ({ workspaceId: "workspace-created", cwd: "/created" }),
+    });
+    expect(remoteChild.labels).toEqual({
+      [PARENT_AGENT_ID_LABEL]: "remote-parent",
+      [PARENT_SERVER_ID_LABEL]: "remote-host",
+      [REMOTE_HIERARCHY_DEPTH_LABEL]: "2",
+    });
+
+    await expect(
+      resolveCreateAgentIntent({
+        caller: null,
+        serverId: "local-host",
+        labels: {
+          [PARENT_AGENT_ID_LABEL]: "remote-parent",
+          [PARENT_SERVER_ID_LABEL]: "remote-host",
+          [REMOTE_HIERARCHY_DEPTH_LABEL]: "3",
+        },
+        resolveWorkspace: async (workspaceId) => ({ workspaceId, cwd: "/unused" }),
+        createWorkspace: async () => ({ workspaceId: "workspace-created", cwd: "/created" }),
+      }),
+    ).rejects.toThrow("Invalid remote subagent depth: 3");
   });
 });

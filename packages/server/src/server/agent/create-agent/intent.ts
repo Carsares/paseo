@@ -1,4 +1,9 @@
-import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import { PARENT_AGENT_ID_LABEL, PARENT_SERVER_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  MAX_SUBAGENT_DEPTH,
+  REMOTE_HIERARCHY_DEPTH_LABEL,
+  RESERVED_HIERARCHY_LABELS,
+} from "../hierarchy-policy.js";
 
 export interface CreateAgentCaller {
   id: string;
@@ -47,26 +52,48 @@ export async function resolveCreateAgentIntent(input: {
   caller: CreateAgentCaller | null;
   labels?: Record<string, string>;
   childAgentDefaultLabels?: Record<string, string>;
+  serverId?: string;
   resolveWorkspace: (workspaceId: string) => Promise<CreateAgentPlacement>;
   createWorkspace: () => Promise<CreateAgentPlacement>;
   legacyDetached?: boolean;
 }): Promise<CreateAgentIntent> {
   const parentAgentId = input.legacyDetached ? null : (input.caller?.id ?? null);
-  const placement = await resolvePlacement(input);
   const labels = {
     ...input.childAgentDefaultLabels,
     ...input.labels,
-    ...(parentAgentId ? { [PARENT_AGENT_ID_LABEL]: parentAgentId } : {}),
   };
-
+  for (const key of RESERVED_HIERARCHY_LABELS) delete labels[key];
   // COMPAT(detachedCreate): legacy callers may still request detached creation.
   // Added in v0.2.0; remove after 2027-01-17 once detached creation is outside the floor.
-  // The delete also strips a parent label injected through input.labels.
-  if (input.legacyDetached) {
-    delete labels[PARENT_AGENT_ID_LABEL];
+  if (parentAgentId) {
+    labels[PARENT_AGENT_ID_LABEL] = parentAgentId;
+    if (input.serverId) labels[PARENT_SERVER_ID_LABEL] = input.serverId;
+  } else if (!input.caller && !input.legacyDetached && input.serverId) {
+    Object.assign(labels, validatedRemoteParentLabels(input.labels, input.serverId));
   }
 
+  const placement = await resolvePlacement(input);
   return { ...placement, parentAgentId, labels };
+}
+
+function validatedRemoteParentLabels(
+  labels: Record<string, string> | undefined,
+  serverId: string,
+): Record<string, string> {
+  const parentId = labels?.[PARENT_AGENT_ID_LABEL]?.trim();
+  const parentServerId = labels?.[PARENT_SERVER_ID_LABEL]?.trim();
+  if (!parentId || !parentServerId || parentServerId === serverId) return {};
+  const parentLabels = {
+    [PARENT_AGENT_ID_LABEL]: parentId,
+    [PARENT_SERVER_ID_LABEL]: parentServerId,
+  };
+  const rawDepth = labels?.[REMOTE_HIERARCHY_DEPTH_LABEL];
+  if (rawDepth === undefined) return parentLabels;
+  const depth = Number(rawDepth);
+  if (!Number.isInteger(depth) || depth < 1 || depth > MAX_SUBAGENT_DEPTH) {
+    throw new Error(`Invalid remote subagent depth: ${rawDepth}`);
+  }
+  return { ...parentLabels, [REMOTE_HIERARCHY_DEPTH_LABEL]: String(depth) };
 }
 
 async function resolvePlacement(input: {

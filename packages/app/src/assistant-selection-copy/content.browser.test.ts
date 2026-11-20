@@ -1,9 +1,16 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { createElement } from "react";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createMarkdownParser } from "@/utils/markdown-parser";
 import {
   createAssistantSelectionClipboardContent,
   createAssistantSelectionMarkdown,
 } from "./content.web";
+
+vi.mock("lucide-react-native", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("lucide-react-native")>()),
+  TextQuote: () => null,
+}));
 
 const fixture = `
   <div data-testid="assistant-message">
@@ -121,8 +128,91 @@ function copiedMarkdown(selection: Selection): string | null {
 }
 
 afterEach(() => {
+  cleanup();
   window.getSelection()?.removeAllRanges();
   document.body.replaceChildren();
+});
+
+describe("assistant selection quote", () => {
+  let AssistantSelectionQuote: typeof import("./quote.web").AssistantSelectionQuote;
+  beforeAll(async () => {
+    // Load after Vitest installs the icon mock so Vite's dependency scan skips the unmocked export.
+    const quoteModule = "./quote.web.tsx";
+    ({ AssistantSelectionQuote } = await import(/* @vite-ignore */ quoteModule));
+  });
+
+  function mountQuoteStream() {
+    const viewport = mountTranscript([{ messageId: "reply", blocks: ["Selected passage."] }]);
+    const stream = document.createElement("div");
+    stream.style.display = "contents";
+    viewport.replaceWith(stream);
+    stream.append(viewport);
+    viewport.style.cssText = "height: 120px; overflow-y: auto";
+    const spacer = document.createElement("div");
+    spacer.style.height = "400px";
+    viewport.append(spacer);
+    const message = fixtureElement(viewport, '[data-paseo-markdown-tag="p"]');
+    return { streamRef: { current: stream }, viewport, message };
+  }
+
+  it("settles a cancelled touch selection and hides offscreen or unmounted anchors", async () => {
+    const { streamRef, viewport, message } = mountQuoteStream();
+    render(createElement(AssistantSelectionQuote, { streamRef, onQuote: vi.fn() }));
+    fireEvent.pointerDown(message, { pointerType: "touch", button: 0 });
+    selectText(message, 0, 8);
+    fireEvent.pointerCancel(message, { pointerType: "touch" });
+    const pill = await screen.findByTestId("assistant-selection-quote");
+
+    const scroll = (top: number) => {
+      viewport.scrollTop = top;
+      fireEvent.scroll(viewport);
+    };
+    scroll(200);
+    await expect.poll(() => screen.queryByTestId("assistant-selection-quote")).toBeNull();
+    scroll(0);
+    const returnedPill = await screen.findByTestId("assistant-selection-quote");
+    expect(pill.isConnected).toBe(false);
+    fireEvent.click(returnedPill.querySelector("button, [role='button']")!);
+    const note = await screen.findByTestId<HTMLTextAreaElement>(
+      "assistant-selection-quote-note-input",
+    );
+    fireEvent.change(note, { target: { value: "Keep this note" } });
+    scroll(200);
+    await expect.poll(() => screen.queryByTestId("assistant-selection-quote-note")).toBeNull();
+    scroll(0);
+    const restored = await screen.findByTestId<HTMLTextAreaElement>(
+      "assistant-selection-quote-note-input",
+    );
+    expect(restored.value).toBe("Keep this note");
+    message.remove();
+    await expect.poll(() => screen.queryByTestId("assistant-selection-quote-note")).toBeNull();
+  });
+
+  it("closes an open note if its quote target disappears and keeps the subagent action", async () => {
+    const { streamRef, message } = mountQuoteStream();
+    const onQuote = vi.fn();
+    const onSpawnSubagentFromSelection = vi.fn();
+    const quote = (handler?: typeof onQuote) =>
+      createElement(AssistantSelectionQuote, {
+        streamRef,
+        onQuote: handler,
+        onSpawnSubagentFromSelection,
+      });
+    const { rerender } = render(quote(onQuote));
+    selectText(message, 0, 8);
+    const contextMenu = () => fireEvent.contextMenu(message, { clientX: 15, clientY: 15 });
+    contextMenu();
+    fireEvent.click(await screen.findByTestId("assistant-selection-context-menu-quote"));
+    await screen.findByTestId("assistant-selection-quote-note");
+    rerender(quote());
+    expect(screen.queryByTestId("assistant-selection-quote-note")).toBeNull();
+
+    selectText(message, 0, 8);
+    contextMenu();
+    await screen.findByTestId("assistant-selection-context-menu-subagent");
+    expect(screen.queryByTestId("assistant-selection-context-menu-quote")).toBeNull();
+    expect(onQuote).not.toHaveBeenCalled();
+  });
 });
 
 describe("assistant selection copy ranges", () => {

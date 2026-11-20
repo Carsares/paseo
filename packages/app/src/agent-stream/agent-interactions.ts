@@ -71,6 +71,12 @@ interface SegmentInput {
   trailingGap?: boolean;
 }
 
+const mergedAssistantFragmentSeqs = new WeakMap<StreamItem, readonly number[]>();
+
+export function getMergedAssistantFragmentSeqs(item: StreamItem): readonly number[] | undefined {
+  return mergedAssistantFragmentSeqs.get(item);
+}
+
 function mergeAssistantFragments(previous: StreamItem | undefined, item: StreamItem) {
   if (
     previous?.kind !== "assistant_message" ||
@@ -82,12 +88,19 @@ function mergeAssistantFragments(previous: StreamItem | undefined, item: StreamI
   ) {
     return undefined;
   }
-  return {
+  const merged = {
     ...previous,
     text: previous.text + item.text,
-    // Search uses the row's ending cursor to locate hits in any merged fragment.
     timelineCursor: item.timelineCursor ?? previous.timelineCursor,
   };
+  const previousSeqs =
+    getMergedAssistantFragmentSeqs(previous) ??
+    (previous.timelineCursor ? [previous.timelineCursor.seq] : []);
+  mergedAssistantFragmentSeqs.set(
+    merged,
+    item.timelineCursor ? [...previousSeqs, item.timelineCursor.seq] : previousSeqs,
+  );
+  return merged;
 }
 
 function projectSegment({ source, preceding, trailingGap = false }: SegmentInput): Segment {

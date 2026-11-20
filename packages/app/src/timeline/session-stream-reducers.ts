@@ -1539,7 +1539,7 @@ function processTimelineSequencingGate(input: {
       cursorChanged: true,
     };
   }
-  if (decision === "gap") {
+  if (decision === "gap" || (decision === "drop_epoch" && seq > 1)) {
     return {
       ...base,
       shouldApplyStreamEvent: false,
@@ -1550,7 +1550,7 @@ function processTimelineSequencingGate(input: {
               cursor: { epoch: currentCursor.epoch, endSeq: currentCursor.endSeq },
             },
           ]
-        : [],
+        : [{ type: "catch_up", cursor: { epoch, endSeq: 0 } }],
     };
   }
   if (decision === "drop_epoch" && seq === 1) {

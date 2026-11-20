@@ -2,6 +2,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { createDesktopSettingsCommandHandlers } from "./desktop-settings-commands";
 
 import {
   DEFAULT_DESKTOP_SETTINGS,
@@ -90,6 +91,34 @@ describe("desktop-settings", () => {
     expect(settings).toEqual(Array.from({ length: 20 }, () => DEFAULT_DESKTOP_SETTINGS));
     expect(persisted.settings).toEqual(DEFAULT_DESKTOP_SETTINGS);
     expect(files).toEqual(["desktop-settings.json"]);
+  });
+
+  it("preserves concurrent patches and migration while publishing each committed snapshot", async () => {
+    const userDataPath = await createTempUserDataDir();
+    directories.add(userDataPath);
+    const snapshots: DesktopSettings[] = [];
+    const handlers = createDesktopSettingsCommandHandlers({
+      settingsStore: createDesktopSettingsStore({ userDataPath }),
+      onSettingsChanged: (settings) => snapshots.push(settings),
+    });
+
+    const [initial, updates, migrated, final] = await Promise.all([
+      handlers.get_desktop_settings(),
+      handlers.patch_desktop_settings({ officialUpdatesEnabled: true }),
+      handlers.migrate_legacy_desktop_settings({ releaseChannel: "beta" }),
+      handlers.patch_desktop_settings({ notifications: { playSound: false } }),
+    ]);
+    const firstPatch = { ...DEFAULT_DESKTOP_SETTINGS, officialUpdatesEnabled: true };
+    const migration = { ...firstPatch, releaseChannel: "beta" };
+    const lastPatch = { ...migration, notifications: { playSound: false } };
+    expect([initial, updates, migrated, final]).toEqual([
+      DEFAULT_DESKTOP_SETTINGS,
+      firstPatch,
+      migration,
+      lastPatch,
+    ]);
+    expect(snapshots).toEqual([firstPatch, migration, lastPatch]);
+    expect(await createDesktopSettingsStore({ userDataPath }).get()).toEqual(lastPatch);
   });
 
   it("coerces invalid persisted values back to safe defaults", async () => {

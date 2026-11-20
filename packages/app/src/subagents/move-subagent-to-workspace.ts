@@ -13,6 +13,8 @@ interface MoveSubagentSessionEntry {
   agentDetails: ReadonlyMap<string, MovableWorkspaceAgent>;
 }
 
+type ParentAgent = Pick<Agent, "workspaceId" | "archivedAt">;
+
 export interface MoveSubagentSessionSnapshot {
   sessions: Record<string, MoveSubagentSessionEntry | undefined>;
 }
@@ -20,19 +22,33 @@ export interface MoveSubagentSessionSnapshot {
 function lookupParentAgent(
   parentAgentId: string | null | undefined,
   agents: ReadonlyMap<string, MovableWorkspaceAgent> | undefined,
-  agentDetails: ReadonlyMap<string, Pick<Agent, "workspaceId">> | undefined,
-): Pick<Agent, "workspaceId"> | undefined {
+  agentDetails: ReadonlyMap<string, ParentAgent> | undefined,
+): ParentAgent | undefined {
   if (!parentAgentId) {
     return undefined;
   }
   return agents?.get(parentAgentId) ?? agentDetails?.get(parentAgentId);
 }
 
+function isSameWorkspaceSubagent(
+  agent: Pick<Agent, "parentAgentId" | "workspaceId">,
+  parentAgent: ParentAgent | undefined,
+): boolean {
+  const workspaceId = normalizeWorkspaceOpaqueId(agent.workspaceId);
+  return Boolean(
+    agent.parentAgentId &&
+    workspaceId &&
+    parentAgent &&
+    !parentAgent.archivedAt &&
+    normalizeWorkspaceOpaqueId(parentAgent.workspaceId) === workspaceId,
+  );
+}
+
 export function hasSiblingWorkspaceRootAgent(input: {
   workspaceId: string | null | undefined;
   agentId: string;
   agents: ReadonlyMap<string, MovableWorkspaceAgent> | undefined;
-  agentDetails?: ReadonlyMap<string, Pick<Agent, "workspaceId">> | undefined;
+  agentDetails?: ReadonlyMap<string, ParentAgent> | undefined;
 }): boolean {
   const normalizedWorkspaceId = normalizeWorkspaceOpaqueId(input.workspaceId);
   if (!normalizedWorkspaceId || !input.agents) {
@@ -50,7 +66,7 @@ export function hasSiblingWorkspaceRootAgent(input: {
       input.agents,
       input.agentDetails,
     );
-    if (isWorkspaceRootAgent(candidate, candidateParent)) {
+    if (!candidateParent?.archivedAt && isWorkspaceRootAgent(candidate, candidateParent)) {
       return true;
     }
   }
@@ -67,7 +83,7 @@ export function canMoveSubagentToWorkspace(input: {
       })
     | null
     | undefined;
-  parentAgent: Pick<Agent, "workspaceId"> | undefined;
+  parentAgent: ParentAgent | undefined;
   hasOtherWorkspaceRootAgent?: boolean;
 }): boolean {
   if (!input.featureEnabled || !input.agent) {
@@ -85,7 +101,7 @@ export function canMoveSubagentToWorkspace(input: {
       return false;
     }
   }
-  if (!isWorkspaceRootAgent(input.agent, input.parentAgent)) {
+  if (isSameWorkspaceSubagent(input.agent, input.parentAgent)) {
     return true;
   }
   return input.hasOtherWorkspaceRootAgent === true;
@@ -110,7 +126,7 @@ function evaluateCanMoveSubagentToWorkspace(input: {
   }
   const parentAgent = lookupParentAgent(agent.parentAgentId, input.agents, input.agentDetails);
   let hasOtherWorkspaceRootAgent = false;
-  if (isWorkspaceRootAgent(agent, parentAgent)) {
+  if (!isSameWorkspaceSubagent(agent, parentAgent)) {
     hasOtherWorkspaceRootAgent = hasSiblingWorkspaceRootAgent({
       workspaceId: input.workspaceId,
       agentId: input.agentId,

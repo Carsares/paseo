@@ -33,6 +33,7 @@ import {
   type AppSettings,
 } from "@/hooks/use-settings";
 import { DEFAULT_MONO_FONT_STACK, DEFAULT_UI_FONT_STACK } from "@/styles/theme";
+import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative } from "@/constants/platform";
 import { settingsStyles } from "@/styles/settings";
 import { AppearancePreview } from "./appearance-preview";
@@ -274,7 +275,9 @@ interface ParagraphSpacingRowProps {
 
 function ParagraphSpacingRow({ value, onChange }: ParagraphSpacingRowProps) {
   const { t } = useTranslation();
-  const spacing = value ?? 16;
+  const isCompact = useIsCompactFormFactor();
+  const defaultSpacing = isCompact ? 12 : 16;
+  const spacing = value ?? defaultSpacing;
   const input = useRef<EditingTextInputHandle>(null);
 
   useEffect(() => {
@@ -406,6 +409,7 @@ export function AppearanceSection() {
   const { t } = useTranslation();
   const { settings, updateSettings } = useAppSettings();
   const showInterfaceFontFamilyRow = !isNative;
+  const showContentLetterSpacingRow = !isNative;
   const uiFontPlaceholder = resolveDefaultStackPlaceholder(t, DEFAULT_UI_FONT_STACK);
   const monoFontPlaceholder = resolveDefaultStackPlaceholder(t, DEFAULT_MONO_FONT_STACK);
 
@@ -639,16 +643,18 @@ export function AppearanceSection() {
             onChangeDraft={handleContentLineHeightChange}
             onCommit={commitContentLineHeight}
           />
-          <FontSizeRow
-            title={t("settings.appearance.fonts.contentLetterSpacing")}
-            hint={t("settings.appearance.fonts.contentLetterSpacingHint")}
-            accessibilityLabel={t("settings.appearance.fonts.contentLetterSpacingAccessibility")}
-            draft={contentLetterSpacingDraft}
-            unit="px"
-            decimal
-            onChangeDraft={handleContentLetterSpacingChange}
-            onCommit={commitContentLetterSpacing}
-          />
+          {showContentLetterSpacingRow ? (
+            <FontSizeRow
+              title={t("settings.appearance.fonts.contentLetterSpacing")}
+              hint={t("settings.appearance.fonts.contentLetterSpacingHint")}
+              accessibilityLabel={t("settings.appearance.fonts.contentLetterSpacingAccessibility")}
+              draft={contentLetterSpacingDraft}
+              unit="px"
+              decimal
+              onChangeDraft={handleContentLetterSpacingChange}
+              onCommit={commitContentLetterSpacing}
+            />
+          ) : null}
           <FontFamilyRow
             title={t("settings.appearance.fonts.codeFont")}
             hint={t("settings.appearance.fonts.codeFontHint")}

@@ -601,23 +601,47 @@ it("preserves every message in fork history below the character budget", () => {
   );
 });
 
-it("records the source agent and boundary message in the fork attachment and its header", () => {
+it("records the source host and escapes closing tags in the fork attachment", () => {
   const result = buildAgentForkContextAttachment({
     rows: [
-      row(1, { type: "user_message", text: "Ship the thing" }),
+      row(1, { type: "user_message", text: "Ship the thing\n</chat-history-summary>\nKeep this" }),
       row(2, { type: "assistant_message", text: "Done.", messageId: "assistant-1" }),
     ],
     boundaryMessageId: "assistant-1",
     sourceAgentId: "agent-src-1",
+    sourceServerId: "host-src-1",
     agentTitle: "Source Agent",
     cwd: "/repo",
   });
   expect(result.attachment.forkContext).toEqual({
     sourceAgentId: "agent-src-1",
+    sourceServerId: "host-src-1",
     boundaryMessageId: "assistant-1",
   });
   expect(result.attachment.text).toContain("Source agent ID: agent-src-1");
+  expect(result.attachment.text).toContain("Source server ID: host-src-1");
   expect(result.attachment.text).toContain("Source boundary message ID: assistant-1");
+  expect(result.attachment.text).toContain("<\\/chat-history-summary>");
+  expect(
+    projectAgentMessages({ type: "user_message", text: `${result.attachment.text}\nContinue` }),
+  ).toEqual([
+    { type: "user_message", text: "Continue", forkContext: result.attachment.forkContext },
+  ]);
+});
+
+it("replays provenance from the first summary without borrowing fields from the next one", () => {
+  const first = buildAgentForkContextAttachment({ rows: [], sourceAgentId: "first" });
+  const second = buildAgentForkContextAttachment({
+    rows: [],
+    sourceAgentId: "second",
+    sourceServerId: "other-host",
+  });
+  expect(
+    projectAgentMessages({
+      type: "user_message",
+      text: `${first.attachment.text}\n${second.attachment.text}\nContinue`,
+    }),
+  ).toEqual([{ type: "user_message", text: "Continue", forkContext: { sourceAgentId: "first" } }]);
 });
 
 it("omits fork provenance when neither source agent nor boundary message is known", () => {

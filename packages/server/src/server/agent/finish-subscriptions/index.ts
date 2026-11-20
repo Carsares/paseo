@@ -1,5 +1,5 @@
 import { setTimeout as pause } from "node:timers/promises";
-import { HostObservationError } from "../host-operations/index.js";
+import { HostObservationError, type ToolHosts } from "../host-operations/index.js";
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
@@ -16,6 +16,7 @@ export { createJsonFinishSubscriptionStore } from "./internal/json-store.js";
 export interface FinishSubscription {
   id: string;
   callerAgentId: string;
+  callerServerId?: string;
   childAgentId: string;
   serverId?: string;
   /** Creation subscriptions stop reporting after the child is detached. */
@@ -36,6 +37,7 @@ export interface FinishObservation {
 interface Dependencies extends FinishObservation {
   store: FinishSubscriptionStore;
   messages(): AgentMessageDelivery;
+  hosts?(): ToolHosts;
   callerIsActive(agentId: string): Promise<boolean>;
   serverId: string;
   logger: Logger;
@@ -66,7 +68,12 @@ interface Watch {
   task?: Promise<void>;
 }
 function key(record: FinishSubscription): string {
-  return JSON.stringify([record.callerAgentId, record.childAgentId, record.serverId]);
+  return JSON.stringify([
+    record.callerAgentId,
+    record.childAgentId,
+    record.serverId,
+    record.callerServerId,
+  ]);
 }
 
 /** Owns durable intent, live observation, supersession, and dispatch acknowledgment. */
@@ -150,13 +157,16 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     record: FinishSubscription,
     result?: WaitForFinishResult,
   ): Promise<boolean> {
-    if (!(await deps.callerIsActive(record.callerAgentId))) return true;
+    if (!record.callerServerId && !(await deps.callerIsActive(record.callerAgentId))) return true;
     if (!record.requireParentOwnership || !result?.final) return false;
     const parent = getParentAddressFromLabels(
       result.final.labels,
       record.serverId ?? deps.serverId,
     );
-    return parent?.agentId !== record.callerAgentId || parent.serverId !== deps.serverId;
+    return (
+      parent?.agentId !== record.callerAgentId ||
+      parent.serverId !== (record.callerServerId ?? deps.serverId)
+    );
   }
   function reasonFor(result: FinishObservationResult): FinishNotificationReason {
     if (result.reason === "host unreachable" || result.reason === "host removed")
@@ -182,20 +192,43 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       if (signal.aborted) return false;
       if (request && permissions.has(request.id)) continue;
       const title = result.final?.title ?? record.childAgentId;
+      const childServerId = record.serverId ?? deps.serverId;
+      const prompt = formatFinishNotificationBody({
+        childAgentId: record.childAgentId,
+        serverId: childServerId,
+        title,
+        reason,
+        lastAssistantMessage: result.lastMessage,
+        permissionRequest: request,
+      });
+      if (record.callerServerId) {
+        if (!deps.hosts) throw new Error("Remote finish delivery is unavailable");
+        const active = await deps.hosts().use(
+          record.callerServerId,
+          async (client) => {
+            const caller = (await client.fetchAgent(record.callerAgentId))?.agent;
+            if (!caller || caller.archivedAt) return false;
+            await client.sendMessage(record.callerAgentId, prompt, {
+              messageId: request ? `${record.id}:${request.id}` : record.id,
+              sourceAgentId: record.childAgentId,
+              sourceAgentServerId: childServerId,
+              activeTurnBehavior: "steer",
+            });
+            return true;
+          },
+          signal,
+        );
+        if (!active) return true;
+        if (request) permissions.add(request.id);
+        continue;
+      }
       const receipt = deps.messages().enqueue({
         recipientId: record.callerAgentId,
-        prompt: formatFinishNotificationBody({
-          childAgentId: record.childAgentId,
-          serverId: record.serverId ?? deps.serverId,
-          title,
-          reason,
-          lastAssistantMessage: result.lastMessage,
-          permissionRequest: request,
-        }),
+        prompt,
         source: {
           kind: "agent-notification",
           agentId: record.childAgentId,
-          serverId: record.serverId ?? deps.serverId,
+          serverId: childServerId,
           title,
           event: finishNotificationEvents[reason],
         },
@@ -307,7 +340,10 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     hasPendingForCaller(agentId) {
       if (recovering || registering.has(agentId)) return true;
       for (const group of watches.values()) {
-        for (const watch of group) if (watch.records[0]!.callerAgentId === agentId) return true;
+        for (const watch of group) {
+          const record = watch.records[0]!;
+          if (!record.callerServerId && record.callerAgentId === agentId) return true;
+        }
       }
       return false;
     },
@@ -329,6 +365,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         const record: FinishSubscription = {
           ...input,
           serverId: input.serverId === deps.serverId ? undefined : input.serverId,
+          callerServerId: input.callerServerId === deps.serverId ? undefined : input.callerServerId,
           id: randomUUID(),
         };
         await deps.store.put(record);

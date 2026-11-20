@@ -110,11 +110,14 @@ describe("main control tree", () => {
   it("finds only the workspace's unarchived main root", () => {
     const foreign = { ...main, id: "foreign", workspaceId: "other" };
     const archived = { ...main, id: "archived", archivedAt };
+    const background = { ...main, id: "background", background: true };
     const child = { ...main, id: "child", labels: { ...main.labels, ...parent("other") } };
-    expect(findWorkspaceMainAgentId(session(foreign, archived, child), "workspace")).toBeNull();
-    expect(findWorkspaceMainAgentId(session(foreign, archived, child, main), "workspace")).toBe(
-      "main",
-    );
+    expect(
+      findWorkspaceMainAgentId(session(foreign, archived, background, child), "workspace"),
+    ).toBeNull();
+    expect(
+      findWorkspaceMainAgentId(session(foreign, archived, background, child, main), "workspace"),
+    ).toBe("main");
     expect(
       selectMainControlTree({
         session: session(child),
@@ -147,6 +150,8 @@ describe("main control tree", () => {
     expect(check(state, "foreign")).toBe(false);
     expect(check(state, "root", null)).toBe(false);
     expect(check(session({ ...main, archivedAt }, root))).toBe(false);
+    expect(check(session({ ...main, background: true }, root))).toBe(false);
+    expect(check(session(main, { ...root, background: true }))).toBe(false);
     expect(check(session(main, root, child, grandchild))).toBe(false);
   });
 

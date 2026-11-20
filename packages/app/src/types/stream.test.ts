@@ -620,6 +620,78 @@ describe("fork context chat history", () => {
     expect(second[0]).toBe(first[0]);
   });
 
+  it("preserves sourceServerId and does not mix forkContext fields across multiple chat history attachments", () => {
+    const local = createUserMessage({
+      clientMessageId: "client-multi-fork",
+      text: "Compare both histories",
+      timestamp: new Date("2026-08-15T10:00:00Z"),
+      attachments: [
+        {
+          type: "text",
+          mimeType: "text/plain",
+          contextKind: "chat_history",
+          title: "Chat history 1",
+          text: "<summary-1>",
+          forkContext: { sourceServerId: "host-a", sourceAgentId: "agent-a" },
+        },
+        {
+          type: "text",
+          mimeType: "text/plain",
+          contextKind: "chat_history",
+          title: "Chat history 2",
+          text: "<summary-2>",
+          forkContext: {
+            sourceServerId: "host-b",
+            sourceAgentId: "agent-b",
+            boundaryMessageId: "msg-b",
+          },
+        },
+      ],
+    });
+    const canonical = createUserMessage({
+      id: "fork-multi-msg",
+      messageId: "fork-multi-msg",
+      clientMessageId: "client-multi-fork",
+      text: "Compare both histories",
+      timestamp: new Date("2026-08-15T10:00:01Z"),
+      attachments: [
+        {
+          type: "text",
+          mimeType: "text/plain",
+          contextKind: "chat_history",
+          title: "Chat history",
+          text: "",
+          forkContext: {
+            sourceServerId: "host-b",
+            sourceAgentId: "agent-b",
+            boundaryMessageId: "msg-b",
+          },
+        },
+      ],
+    });
+
+    const merged = upsertUserMessage([local], canonical);
+    expect(merged[0]).toMatchObject({
+      attachments: [
+        {
+          title: "Chat history 1",
+          forkContext: { sourceServerId: "host-a", sourceAgentId: "agent-a" },
+        },
+        {
+          title: "Chat history 2",
+          forkContext: {
+            sourceServerId: "host-b",
+            sourceAgentId: "agent-b",
+            boundaryMessageId: "msg-b",
+          },
+        },
+      ],
+    });
+    if (merged[0]?.kind === "user_message" && merged[0].attachments?.[0]?.type === "text") {
+      expect(merged[0].attachments[0].forkContext).not.toHaveProperty("boundaryMessageId");
+    }
+  });
+
   it("takes the canonical chat history card when the existing row has no attachments", () => {
     const cached = createUserMessage({
       id: "fork-msg",

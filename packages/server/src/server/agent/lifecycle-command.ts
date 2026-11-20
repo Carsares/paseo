@@ -9,6 +9,7 @@ import {
 } from "./agent-manager.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
 import type { AgentProviderNotice } from "./agent-sdk-types.js";
+import { hasReservedHierarchyLabels, RESERVED_HIERARCHY_LABELS_ERROR } from "./hierarchy-policy.js";
 
 export type LifecycleAgentSnapshot = Pick<ManagedAgent, "id" | "cwd" | "lifecycle" | "internal">;
 
@@ -177,6 +178,9 @@ export async function updateAgentCommand(
   const title = input.name?.trim();
   const labels = input.labels && Object.keys(input.labels).length > 0 ? input.labels : undefined;
 
+  if (hasReservedHierarchyLabels(labels)) {
+    return { accepted: false, error: RESERVED_HIERARCHY_LABELS_ERROR };
+  }
   if (!title && !labels) {
     return {
       accepted: false,

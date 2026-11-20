@@ -1,6 +1,8 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useSessionStore, type Agent } from "@/stores/session-store";
+import { deriveWorkspaceHierarchyTabState } from "./main-control-tree/select-tree";
+import { WORKSPACE_MAIN_ROLE, WORKSPACE_ROLE_LABEL } from "@getpaseo/protocol/agent-labels";
 import {
   canMoveSubagentToWorkspace,
   createCanMoveSubagentToWorkspaceSelector,
@@ -118,7 +120,7 @@ describe("canMoveSubagentToWorkspace", () => {
     featureEnabled: true,
     workspaceId: WORKSPACE_ID,
     agent,
-    parentAgent: { workspaceId: WORKSPACE_ID },
+    parentAgent: { workspaceId: WORKSPACE_ID, archivedAt: null },
   };
 
   it("allows a Paseo subagent in its parent's workspace even without sibling roots", () => {
@@ -143,11 +145,21 @@ describe("canMoveSubagentToWorkspace", () => {
         featureEnabled: true,
         workspaceId: WORKSPACE_ID,
         agent,
-        parentAgent: { workspaceId: "ws-parent" },
+        parentAgent: { workspaceId: "ws-parent", archivedAt: null },
         hasOtherWorkspaceRootAgent: true,
       }),
     ).toBe(true);
   });
+
+  it.each([undefined, { workspaceId: WORKSPACE_ID, archivedAt: AGENT_TIMESTAMP }])(
+    "requires another root when the parent is absent or archived (%j)",
+    (parentAgent) => {
+      expect(canMoveSubagentToWorkspace({ ...input, parentAgent })).toBe(false);
+      expect(
+        canMoveSubagentToWorkspace({ ...input, parentAgent, hasOtherWorkspaceRootAgent: true }),
+      ).toBe(true);
+    },
+  );
 
   it.each([
     ["the feature is disabled", { featureEnabled: false }],
@@ -292,7 +304,9 @@ describe("hasSiblingWorkspaceRootAgent", () => {
       [root.id, root],
       [crossWorkspaceChild.id, crossWorkspaceChild],
     ]);
-    const agentDetails = new Map([["foreign-parent", { workspaceId: "workspace-parent" }]]);
+    const agentDetails = new Map([
+      ["foreign-parent", { workspaceId: "workspace-parent", archivedAt: null }],
+    ]);
 
     expect(
       hasSiblingWorkspaceRootAgent({
@@ -485,6 +499,22 @@ describe("createCanMoveSubagentToWorkspaceSelector", () => {
   });
 });
 
+it("excludes background sessions from main control and adoptable roots", () => {
+  const labels = { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE };
+  const backgroundMain = makeAgent({ id: "background-main", background: true, labels });
+  const main = makeAgent({ id: "main", labels });
+  const backgroundRoot = makeAgent({ id: "background-root", background: true });
+  const root = makeAgent({ id: "root" });
+  const agents = new Map(
+    [backgroundMain, main, backgroundRoot, root].map((agent) => [agent.id, agent]),
+  );
+  expect(deriveWorkspaceHierarchyTabState({ serverId: SERVER_ID, agents }, WORKSPACE_ID)).toEqual({
+    mainAgentId: main.id,
+    rootAgentIds: new Set([main.id, root.id]),
+    adoptableAgentIds: new Set([root.id]),
+  });
+});
+
 const input = { serverId: "server-1", subagentId: "child-agent" };
 
 function createDeps() {
@@ -568,4 +598,30 @@ describe("requestMoveSubagentToWorkspace", () => {
     await moving;
     expect(deps.openMovedWorkspace).toHaveBeenCalledTimes(1);
   });
+});
+it("requires a visible sibling root after the parent disappears or is archived", () => {
+  const child = makeAgent({ id: "child", parentAgentId: "parent" });
+  const parent = makeAgent({ id: "parent" });
+  const sibling = makeAgent({ id: "sibling" });
+  seedSession(new Map([[child.id, child]]));
+  const selectCanMove = createCanMoveSubagentToWorkspaceSelector({
+    serverId: SERVER_ID,
+    workspaceId: WORKSPACE_ID,
+    agentId: child.id,
+  });
+  expect(selectCanMove(useSessionStore.getState())).toBe(false);
+  const sessionStore = useSessionStore.getState();
+  sessionStore.setAgentDetails(
+    SERVER_ID,
+    new Map([[parent.id, { ...parent, archivedAt: AGENT_TIMESTAMP }]]),
+  );
+  expect(selectCanMove(useSessionStore.getState())).toBe(false);
+  sessionStore.setAgents(
+    SERVER_ID,
+    new Map([
+      [child.id, child],
+      [sibling.id, sibling],
+    ]),
+  );
+  expect(selectCanMove(useSessionStore.getState())).toBe(true);
 });

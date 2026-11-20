@@ -1,7 +1,8 @@
-import { useCallback } from "react";
+import { useCallback, useEffect } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getIsElectron } from "@/constants/platform";
 import { invokeDesktopCommand } from "@/desktop/electron/invoke";
+import { getDesktopHost } from "@/desktop/host";
 import {
   useDesktopIpcErrorReporter,
   useDesktopIpcQueryErrorToast,
@@ -51,6 +52,21 @@ export function useDesktopSettings(): {
 } {
   const queryClient = useQueryClient();
   const reportError = useDesktopIpcErrorReporter();
+  useEffect(() => {
+    const events = getDesktopHost()?.events;
+    if (!events?.on) return;
+
+    let active = true;
+    const subscription = events.on("desktop-settings-changed", (settings) => {
+      if (!active) return;
+      void queryClient.cancelQueries({ queryKey: DESKTOP_SETTINGS_QUERY_KEY }, { revert: false });
+      queryClient.setQueryData(DESKTOP_SETTINGS_QUERY_KEY, parseDesktopSettings(settings));
+    });
+    return () => {
+      active = false;
+      void Promise.resolve(subscription).then((unlisten) => unlisten());
+    };
+  }, [queryClient]);
   const {
     data,
     isPending,

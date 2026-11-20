@@ -57,6 +57,7 @@ interface AgentListProps {
   groupExpansion?: HistoryGroupExpansion & {
     onToggleProject: GroupToggle;
     onToggleWorkspace: GroupToggle;
+    onToggleSubagents: GroupToggle;
   };
 }
 
@@ -65,6 +66,7 @@ type GroupToggle = (key: string, expanded: boolean) => void;
 export interface HistoryGroupExpansion {
   projectExpandedOverrides: ReadonlyMap<string, boolean>;
   workspaceExpandedOverrides: ReadonlyMap<string, boolean>;
+  subagentExpandedOverrides: ReadonlyMap<string, boolean>;
 }
 
 const HISTORY_MATCH_OPTIONS = { typoTolerant: true } as const;
@@ -72,6 +74,7 @@ const EMPTY_EXPANDED_OVERRIDES: ReadonlyMap<string, boolean> = new Map();
 export const DEFAULT_HISTORY_GROUP_EXPANSION: HistoryGroupExpansion = {
   projectExpandedOverrides: EMPTY_EXPANDED_OVERRIDES,
   workspaceExpandedOverrides: EMPTY_EXPANDED_OVERRIDES,
+  subagentExpandedOverrides: EMPTY_EXPANDED_OVERRIDES,
 };
 const ThemedRefreshControl = withUnistyles(RefreshControl);
 const ThemedChevronRight = withUnistyles(ChevronRight);
@@ -456,7 +459,6 @@ export function AgentList({
   const expansionKey = JSON.stringify([archiveScope, search, searchScope, groupMode]);
   const initialExpansion = {
     key: expansionKey,
-    subagents: EMPTY_EXPANDED_OVERRIDES,
     ...DEFAULT_HISTORY_GROUP_EXPANSION,
   };
   const [expansion, setExpansion] = useState(initialExpansion);
@@ -464,7 +466,8 @@ export function AgentList({
     setExpansion(initialExpansion);
   }
   const localExpansion = expansion.key === expansionKey ? expansion : initialExpansion;
-  const { projectExpandedOverrides, workspaceExpandedOverrides } = groupExpansion ?? localExpansion;
+  const { projectExpandedOverrides, workspaceExpandedOverrides, subagentExpandedOverrides } =
+    groupExpansion ?? localExpansion;
   const { archiveAgent } = useArchiveAgent();
 
   const actionClient = useSessionStore((state) =>
@@ -509,7 +512,7 @@ export function AgentList({
   }, [actionAgent, actionClient, archiveAgent]);
 
   const toggleLocalExpansion = useCallback(
-    (group: "subagents" | keyof HistoryGroupExpansion, key: string, expanded: boolean) => {
+    (group: keyof HistoryGroupExpansion, key: string, expanded: boolean) => {
       setExpansion((current) => {
         const overrides = new Map(current[group]);
         overrides.set(key, expanded);
@@ -518,8 +521,8 @@ export function AgentList({
     },
     [],
   );
-  const toggleSubagents = useCallback<GroupToggle>(
-    (key, expanded) => toggleLocalExpansion("subagents", key, expanded),
+  const toggleLocalSubagents = useCallback<GroupToggle>(
+    (key, expanded) => toggleLocalExpansion("subagentExpandedOverrides", key, expanded),
     [toggleLocalExpansion],
   );
   const toggleLocalProject = useCallback<GroupToggle>(
@@ -532,6 +535,7 @@ export function AgentList({
   );
   const toggleProject = groupExpansion?.onToggleProject ?? toggleLocalProject;
   const toggleWorkspace = groupExpansion?.onToggleWorkspace ?? toggleLocalWorkspace;
+  const toggleSubagents = groupExpansion?.onToggleSubagents ?? toggleLocalSubagents;
 
   const groups = useMemo(
     () =>
@@ -550,7 +554,7 @@ export function AgentList({
       flattenHistoryProjectGroups({
         groups,
         isSearching: search.length > 0,
-        expandedOverrides: localExpansion.subagents,
+        expandedOverrides: subagentExpandedOverrides,
         projectExpandedOverrides,
         workspaceExpandedOverrides,
         groupMode,
@@ -559,7 +563,7 @@ export function AgentList({
     [
       groups,
       search,
-      localExpansion.subagents,
+      subagentExpandedOverrides,
       projectExpandedOverrides,
       workspaceExpandedOverrides,
       groupMode,

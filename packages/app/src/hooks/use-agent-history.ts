@@ -343,10 +343,20 @@ export function useAgentHistory(
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
   }, [options.serverId]);
   const enabled = options.enabled ?? true;
-  const requestedServerIds = useMemo(
-    () => (serverId ? [serverId] : daemons.map((daemon) => daemon.serverId)),
-    [daemons, serverId],
-  );
+  const projectKeysByServer = useMemo(() => {
+    if (options.projectKeysByServer == null) return null;
+    const normalized = new Map<string, string[]>();
+    for (const id of [...options.projectKeysByServer.keys()].sort()) {
+      const keys = [...new Set(options.projectKeysByServer.get(id)?.filter((key) => key.trim()))];
+      if (keys.length > 0) normalized.set(id, keys.sort());
+    }
+    return normalized;
+  }, [options.projectKeysByServer]);
+  const requestedProjects = options.projectKeysByServer;
+  const requestedServerIds = useMemo(() => {
+    const ids = serverId ? [serverId] : daemons.map((daemon) => daemon.serverId);
+    return requestedProjects?.size ? ids.filter((id) => projectKeysByServer?.has(id)) : ids;
+  }, [daemons, serverId, requestedProjects, projectKeysByServer]);
   const searchableServerIds = useSessionStore(
     useShallow((state) =>
       requestedServerIds.filter(
@@ -434,15 +444,6 @@ export function useAgentHistory(
     () => ({ field: sortField, direction: sortDirection }),
     [sortField, sortDirection],
   );
-  const projectKeysByServer = useMemo(() => {
-    if (options.projectKeysByServer == null) return null;
-    const normalized = new Map<string, string[]>();
-    for (const id of [...options.projectKeysByServer.keys()].sort()) {
-      const keys = [...new Set(options.projectKeysByServer.get(id)?.filter((key) => key.trim()))];
-      if (keys.length > 0) normalized.set(id, keys.sort());
-    }
-    return normalized;
-  }, [options.projectKeysByServer]);
   const queryOptions = buildAgentHistoryQueryOptions({
     archiveScope: effectiveArchiveScope,
     searchScope: effectiveSearchScope,

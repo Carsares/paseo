@@ -113,13 +113,16 @@ test("forced capture resumes eligible running agents on only the next startup wi
     const agentsPath = join(root, "agents");
     const oneShotMarkerPath = join(root, "paseo-home", "restart-recovery-once.json");
     const dispatched: { id: string; prompt: string }[] = [];
-    const start = () => {
+    const start = (failCapture = false) => {
       const storage = new AgentStorage(agentsPath, createTestLogger());
       const recovery = createRestartRecovery({
         storage,
         oneShotMarkerPath,
         settings: () => ({ enabled: false, prompt: "Continue once.\n" }),
-        eligible: async (record) => record.id !== "ineligible",
+        eligible: async (record) => {
+          if (failCapture) throw new Error("Failed to check eligibility");
+          return record.id !== "ineligible";
+        },
         dispatch: async (id, prompt) => {
           expect((await storage.get(id))?.resumeOnStartup).toBe(false);
           dispatched.push({ id, prompt });
@@ -146,17 +149,24 @@ test("forced capture resumes eligible running agents on only the next startup wi
         }),
       );
     }
+    await expect(start(true).recovery.captureRunningAgents({ force: true })).rejects.toThrow(
+      "Failed to check eligibility",
+    );
+    await expect(readFile(oneShotMarkerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await shutdown.recovery.captureRunningAgents({ force: true });
     await expect(readFile(oneShotMarkerPath, "utf8")).resolves.toBe(JSON.stringify({ version: 1 }));
-    expect((await shutdown.storage.get("working"))?.resumeOnStartup).toBe(true);
+    const interruptedStartup = start();
+    expect((await interruptedStartup.storage.get("working"))?.resumeOnStartup).toBe(true);
     expect((await shutdown.storage.get("ineligible"))?.resumeOnStartup).toBe(false);
     expect((await shutdown.storage.get("idle"))?.resumeOnStartup).toBe(false);
 
     const signal = new AbortController().signal;
+    await interruptedStartup.recovery.prepareStartup();
+    await expect(readFile(oneShotMarkerPath, "utf8")).resolves.toBe(JSON.stringify({ version: 1 }));
     const first = start();
     await first.recovery.prepareStartup();
-    await expect(readFile(oneShotMarkerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     first.recovery.resumePending();
+    await expect(readFile(oneShotMarkerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     await first.recovery.waitForResume("working", signal);
     expect(dispatched).toEqual([{ id: "working", prompt: "Continue once.\n" }]);
     expect((await first.storage.get("working"))?.resumeOnStartup).toBe(false);

@@ -1,10 +1,12 @@
-import { describe, expect, it } from "vitest";
-import type { WorkspaceComposerAttachment } from "./types";
+import { describe, expect, it, vi } from "vitest";
+import { workspaceAttachmentToSubmitAttachment } from "./workspace-attachment-utils";
+import type { ChatHistoryContextAttachment, WorkspaceComposerAttachment } from "./types";
 import {
   appendWorkspaceAttachment,
   buildDraftWorkspaceAttachmentScopeKey,
   buildWorkspaceAttachmentScopeKey,
   collectWorkspaceAttachmentsForScopes,
+  createWorkspaceAttachmentsStore,
   resetWorkspaceAttachmentsStore,
   useWorkspaceAttachmentsStore,
 } from "./workspace-attachments-store";
@@ -59,7 +61,7 @@ function contextAttachment(id: string): WorkspaceComposerAttachment {
   };
 }
 
-function chatHistoryAttachment(id: string, text = "Previous chat."): WorkspaceComposerAttachment {
+function chatHistoryAttachment(id: string, text = "Previous chat."): ChatHistoryContextAttachment {
   return {
     kind: "chat_history",
     id,
@@ -78,6 +80,93 @@ function chatHistoryAttachment(id: string, text = "Previous chat."): WorkspaceCo
 }
 
 describe("workspace attachments store", () => {
+  it("restores only draft chat history and removes it from storage when set to empty", async () => {
+    let persisted: string | null = null;
+    const storage = {
+      getItem: async () => persisted,
+      setItem: async (_key: string, value: string) => {
+        persisted = value;
+      },
+      removeItem: async () => {
+        persisted = null;
+      },
+    };
+    const draftScope = buildDraftWorkspaceAttachmentScopeKey("draft-1");
+    const workspaceScope = buildWorkspaceAttachmentScopeKey({
+      serverId: "target-host",
+      cwd: "/repo",
+    });
+    const history = chatHistoryAttachment("history-1");
+    history.source = {
+      serverId: " source-host ",
+      agentId: "agent-1",
+      boundaryMessageId: "message-1",
+    };
+    const writer = createWorkspaceAttachmentsStore(storage);
+    writer.getState().setWorkspaceAttachments({ scopeKey: workspaceScope, attachments: [history] });
+    writer.getState().addWorkspaceAttachment({ scopeKey: draftScope, attachment: history });
+    writer
+      .getState()
+      .addWorkspaceAttachment({ scopeKey: draftScope, attachment: reviewAttachment("ephemeral") });
+    await vi.waitFor(() =>
+      expect(JSON.parse(persisted ?? "null")).toEqual({ [draftScope]: [history] }),
+    );
+
+    const restored = createWorkspaceAttachmentsStore(storage);
+    await vi.waitFor(() =>
+      expect(restored.getState().attachmentsByScope).toEqual({ [draftScope]: [history] }),
+    );
+    const restoredHistory = restored.getState().attachmentsByScope[draftScope]![0]!;
+    expect(workspaceAttachmentToSubmitAttachment(restoredHistory)).toMatchObject({
+      forkContext: {
+        sourceServerId: "source-host",
+        sourceAgentId: "agent-1",
+        boundaryMessageId: "message-1",
+      },
+    });
+    expect(
+      workspaceAttachmentToSubmitAttachment({
+        ...history,
+        source: { ...history.source, serverId: " " },
+        attachment: { ...history.attachment, forkContext: { sourceServerId: " fallback-host " } },
+      }),
+    ).toMatchObject({ forkContext: { sourceServerId: "fallback-host" } });
+    restored.getState().setWorkspaceAttachments({ scopeKey: draftScope, attachments: [] });
+    await vi.waitFor(() => expect(persisted).toBeNull());
+  });
+
+  it("keeps current edits and clears made during hydration while restoring untouched drafts", async () => {
+    const edited = buildDraftWorkspaceAttachmentScopeKey("edited");
+    const cleared = buildDraftWorkspaceAttachmentScopeKey("cleared");
+    const untouched = buildDraftWorkspaceAttachmentScopeKey("untouched");
+    const old = chatHistoryAttachment("old");
+    const fresh = chatHistoryAttachment("fresh");
+    const read = Promise.withResolvers<string>();
+    let persisted = "";
+    const store = createWorkspaceAttachmentsStore({
+      getItem: () => read.promise,
+      setItem: async (_key, value) => {
+        persisted = value;
+      },
+      removeItem: async () => {
+        persisted = "";
+      },
+    });
+    store.getState().setWorkspaceAttachments({ scopeKey: edited, attachments: [fresh] });
+    store.getState().clearWorkspaceAttachments({ scopeKey: cleared });
+    read.resolve(
+      JSON.stringify({
+        [edited]: [old],
+        [cleared]: [old],
+        [untouched]: [old, { kind: "chat_history" }],
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(JSON.parse(persisted || "null")).toEqual({ [edited]: [fresh], [untouched]: [old] }),
+    );
+    expect(store.getState().attachmentsByScope).toEqual({ [edited]: [fresh], [untouched]: [old] });
+  });
+
   it("scopes workspace attachments by server and workspace before cwd fallback", () => {
     expect(
       buildWorkspaceAttachmentScopeKey({

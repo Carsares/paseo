@@ -1,5 +1,6 @@
 import type { AgentTimelineSearchPayload } from "@getpaseo/client/internal/daemon-client";
 import type { StreamItem } from "@/types/stream";
+import { getMergedAssistantFragmentSeqs } from "../agent-interactions";
 
 /**
  * A message the host says contains the query. `count` is the host's estimate of its
@@ -15,6 +16,23 @@ interface Target {
   seq: number;
   before: number;
 }
+
+function mergedAssistantTarget(
+  item: StreamItem,
+  location: Location,
+  exact: boolean,
+): Target | null {
+  if (location.role !== "assistant") return null;
+  const fragments = getMergedAssistantFragmentSeqs(item);
+  if (!fragments?.length) return null;
+  const first = fragments[0]!;
+  const last = fragments.at(-1)!;
+  const matches = exact
+    ? fragments.includes(location.seq)
+    : first <= location.seq && location.seq <= last;
+  return matches ? { id: item.id, seq: last, before: first - 1 } : null;
+}
+
 /**
  * Why a search stopped, so the widget can say something true. `connection` is the
  * host call itself failing, `historyChanged` is the timeline moving under a result
@@ -163,6 +181,7 @@ export class ChatFindModel {
         );
         cursor = result.nextCursor ?? undefined;
       } while (cursor !== undefined);
+      this.addLoadedMergedMatches();
       await this.navigate(0, 1, signal);
     } catch (error) {
       this.fail(error, signal);
@@ -181,10 +200,34 @@ export class ChatFindModel {
     this.items = items;
     this.historyListeners.forEach((listener) => listener());
   }
+  private addLoadedMergedMatches() {
+    const query = this.state.query.trim().toLowerCase();
+    const assistantSeqs = new Set(
+      this.locations.filter((location) => location.role === "assistant").map(({ seq }) => seq),
+    );
+    for (const item of this.items) {
+      if (item.kind !== "assistant_message" || item.timelineCursor?.epoch !== this.resultEpoch) {
+        continue;
+      }
+      const fragments = getMergedAssistantFragmentSeqs(item);
+      // A host hit already reveals the entire merged message, including any joined matches.
+      if (!fragments || fragments.length < 2 || fragments.some((seq) => assistantSeqs.has(seq))) {
+        continue;
+      }
+      const count = item.text.toLowerCase().split(query).length - 1;
+      if (!count) continue;
+      const seq = fragments[0]!;
+      assistantSeqs.add(seq);
+      this.locations.push({ seq, role: "assistant", count });
+    }
+    this.locations.sort((a, b) => a.seq - b.seq);
+  }
   private target(location: Location, exact: boolean): Target | null {
     let before = 0;
     for (const item of this.items) {
       if (item.timelineCursor?.epoch !== this.resultEpoch) continue;
+      const merged = mergedAssistantTarget(item, location, exact);
+      if (merged) return merged;
       const seq = item.timelineCursor.seq;
       if (seq < location.seq) {
         before = Math.max(before, seq);
@@ -227,10 +270,15 @@ export class ChatFindModel {
       index = (index + this.locations.length) % this.locations.length;
       const location = this.locations[index]!;
       const cached = this.resolved.get(location);
-      const stillLoaded =
+      const cachedItem =
         cached &&
-        this.items.some((item) => item.id === cached.id && item.timelineCursor?.seq === cached.seq);
-      let target = stillLoaded ? cached : this.target(location, true);
+        this.items.find((item) => item.id === cached.id && item.timelineCursor?.epoch === epoch);
+      const stillLoaded =
+        cached && cachedItem
+          ? (mergedAssistantTarget(cachedItem, location, false) ??
+            (cachedItem.timelineCursor?.seq === cached.seq ? cached : null))
+          : null;
+      let target = stillLoaded ?? this.target(location, true);
       if (!target) {
         await tagged("connection", this.operations.load(epoch, location.seq));
         if (signal.aborted) return;

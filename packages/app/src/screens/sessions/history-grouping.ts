@@ -55,6 +55,7 @@ export interface HistoryWorkspaceGroup {
 export interface HistoryProjectGroup {
   /** `eq:${projectEquivalenceKey}` unless ambiguous on the host, otherwise `${serverId}:${projectKey}`. */
   key: string;
+  sharedProjectKey?: string;
   projectName: string;
   serverId: string;
   projectId: string;
@@ -233,6 +234,7 @@ function resolveRootAgent(input: {
 function groupWorkspacesByProject(
   workspaces: Iterable<WorkspaceDraft>,
   direction: HistorySortDirection,
+  catalogEquivalenceCounts?: ReadonlyMap<string, ReadonlyMap<string, number>>,
 ): HistoryProjectGroup[] {
   const localProjects = new Map<string, LocalProjectDraft>();
   const equivalenceCountsByServer = new Map<string, Map<string, number>>();
@@ -274,16 +276,19 @@ function groupWorkspacesByProject(
   const projects = new Map<string, HistoryProjectGroup>();
   for (const { project, equivalenceKeys } of localProjects.values()) {
     const [equivalenceKey] = equivalenceKeys;
-    const key =
-      equivalenceKeys.size === 1 &&
-      equivalenceCountsByServer.get(project.serverId)?.get(equivalenceKey) === 1
-        ? `eq:${equivalenceKey}`
-        : project.key;
+    const sharedProjectKey = equivalenceKeys.size === 1 ? `eq:${equivalenceKey}` : undefined;
+    const isAmbiguous = isHistoryEquivalenceAmbiguous(
+      project.serverId,
+      equivalenceKey,
+      equivalenceCountsByServer,
+      catalogEquivalenceCounts,
+    );
+    const key = !isAmbiguous && sharedProjectKey ? sharedProjectKey : project.key;
     const existing = projects.get(key);
     if (existing) {
       for (const workspace of project.workspaces) existing.workspaces.push(workspace);
     } else {
-      projects.set(key, { ...project, key });
+      projects.set(key, { ...project, key, sharedProjectKey });
     }
   }
 
@@ -311,11 +316,24 @@ function groupWorkspacesByProject(
   );
 }
 
+function isHistoryEquivalenceAmbiguous(
+  serverId: string,
+  equivalenceKey: string,
+  visibleCounts: ReadonlyMap<string, ReadonlyMap<string, number>>,
+  catalogCounts?: ReadonlyMap<string, ReadonlyMap<string, number>>,
+): boolean {
+  return (
+    (visibleCounts.get(serverId)?.get(equivalenceKey) ?? 0) > 1 ||
+    (catalogCounts?.get(serverId)?.get(equivalenceKey) ?? 0) > 1
+  );
+}
+
 /** With a search query, entries are the matching results and ancestors supply parent context. */
 export function buildHistoryProjectGroups(input: {
   entries: readonly AggregatedAgent[];
   ancestors?: readonly AggregatedAgent[];
   activeWorkspaceIdsByServer?: ReadonlyMap<string, ReadonlySet<string>>;
+  catalogEquivalenceCounts?: ReadonlyMap<string, ReadonlyMap<string, number>>;
   search?: string;
   sort?: HistorySortOption;
 }): HistoryProjectGroup[] {
@@ -390,7 +408,20 @@ export function buildHistoryProjectGroups(input: {
         compareKeys(left.key, right.key),
     );
   }
-  return groupWorkspacesByProject(workspaces.values(), direction);
+  return groupWorkspacesByProject(workspaces.values(), direction, input.catalogEquivalenceCounts);
+}
+
+export function isHistoryProjectExpanded(
+  project: HistoryProjectGroup,
+  overrides?: ReadonlyMap<string, boolean>,
+): boolean {
+  return (
+    overrides?.get(project.key) ??
+    (project.sharedProjectKey && project.sharedProjectKey !== project.key
+      ? overrides?.get(project.sharedProjectKey)
+      : undefined) ??
+    true
+  );
 }
 
 export function flattenHistoryProjectGroups(input: {
@@ -462,7 +493,7 @@ export function flattenHistoryProjectGroups(input: {
   }
 
   for (const project of input.groups) {
-    const expanded = input.projectExpandedOverrides?.get(project.key) ?? true;
+    const expanded = isHistoryProjectExpanded(project, input.projectExpandedOverrides);
     items.push({ type: "project-header", key: `project:${project.key}`, project, expanded });
     if (!expanded) continue;
     for (const workspace of project.workspaces) {
@@ -481,7 +512,8 @@ export function areAllHistoryWorkspacesCollapsed(input: {
   let hasWorkspace = false;
   for (const project of input.groups) {
     const projectCollapsed =
-      input.groupMode !== "workspace" && input.projectExpandedOverrides?.get(project.key) === false;
+      input.groupMode !== "workspace" &&
+      !isHistoryProjectExpanded(project, input.projectExpandedOverrides);
     for (const workspace of project.workspaces) {
       hasWorkspace = true;
       if (!projectCollapsed && input.workspaceExpandedOverrides?.get(workspace.key) !== false) {

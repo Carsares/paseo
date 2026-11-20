@@ -49,6 +49,12 @@ export interface AgentHistoryQueryData {
   pages?: AgentHistoryQueryPage[];
 }
 
+function matchesHistoryAgent(agent: AgentHistoryQueryAgent, input: ArchiveAgentInput): boolean {
+  return (
+    agent.id === input.agentId && (agent.serverId == null || agent.serverId === input.serverId)
+  );
+}
+
 export function toArchiveKey(input: ArchiveAgentInput): string {
   const serverId = input.serverId.trim();
   const agentId = input.agentId.trim();
@@ -180,10 +186,7 @@ export function markAgentArchivedInHistoryPayload<T extends AgentHistoryQueryDat
   const pages = payload.pages.map((page) => {
     let pageChanged = false;
     const markArchived = (agent: AgentHistoryQueryAgent) => {
-      if (
-        agent.id !== input.agentId ||
-        (agent.serverId != null && agent.serverId !== input.serverId)
-      ) {
+      if (!matchesHistoryAgent(agent, input)) {
         return agent;
       }
       pageChanged = true;
@@ -238,6 +241,7 @@ interface ArchivedAgentListCacheSnapshot {
 interface ArchiveAgentMutationContext {
   agent: ReturnType<typeof getStoredAgentSnapshot>;
   lists: ArchivedAgentListCacheSnapshot;
+  optimisticArchivedAt: number;
 }
 
 function getStoredAgentSnapshot(input: ArchiveAgentInput) {
@@ -283,9 +287,11 @@ function restoreCachedQuerySnapshot(
 
 function restoreArchivedAgentListCacheSnapshot(
   queryClient: QueryClient,
-  serverId: string,
-  snapshot: ArchivedAgentListCacheSnapshot,
+  input: ArchiveAgentInput,
+  context: ArchiveAgentMutationContext,
 ): void {
+  const { serverId } = input;
+  const snapshot = context.lists;
   restoreCachedQuerySnapshot(
     queryClient,
     ["sidebarAgentsList", serverId],
@@ -293,7 +299,56 @@ function restoreArchivedAgentListCacheSnapshot(
   );
   restoreCachedQuerySnapshot(queryClient, ["allAgents", serverId], snapshot.allAgents);
   for (const [queryKey, querySnapshot] of [...snapshot.agentHistory, ...snapshot.allAgentHistory]) {
-    restoreCachedQuerySnapshot(queryClient, queryKey, querySnapshot);
+    const current = queryClient.getQueryData<AgentHistoryQueryData>(queryKey);
+    if (!querySnapshot) {
+      if (!current?.pages?.length && queryClient.getQueryState(queryKey)?.fetchStatus === "idle") {
+        queryClient.removeQueries({ queryKey, exact: true });
+      }
+      continue;
+    }
+    if (!current?.pages) continue;
+
+    const restoreEntries = (
+      page: AgentHistoryQueryPage,
+      index: number,
+      field: keyof AgentHistoryQueryPage,
+    ) => {
+      const entries = page[field];
+      if (
+        !entries?.some(
+          (agent) =>
+            matchesHistoryAgent(agent, input) &&
+            agent.archivedAt?.getTime() === context.optimisticArchivedAt,
+        )
+      ) {
+        return entries;
+      }
+      const findPrevious = (previousPage: AgentHistoryQueryPage | undefined) =>
+        previousPage?.[field]?.find((agent) => matchesHistoryAgent(agent, input));
+      const previous =
+        findPrevious(querySnapshot.pages?.[index]) ??
+        querySnapshot.pages?.map(findPrevious).find((agent) => agent !== undefined);
+      if (!previous) return entries;
+      const restored = [...entries];
+      for (const [entryIndex, agent] of entries.entries()) {
+        if (
+          matchesHistoryAgent(agent, input) &&
+          agent.archivedAt?.getTime() === context.optimisticArchivedAt
+        ) {
+          restored[entryIndex] = { ...agent, archivedAt: previous.archivedAt };
+        }
+      }
+      return restored;
+    };
+    let changed = false;
+    const pages = current.pages.map((page, index) => {
+      const agents = restoreEntries(page, index, "agents");
+      const ancestors = restoreEntries(page, index, "ancestors");
+      if (agents === page.agents && ancestors === page.ancestors) return page;
+      changed = true;
+      return { ...page, agents, ...(ancestors ? { ancestors } : {}) };
+    });
+    if (changed) queryClient.setQueryData(queryKey, { ...current, pages });
   }
 }
 
@@ -393,16 +448,17 @@ export function useArchiveAgent() {
       return await client.archiveAgent(input.agentId);
     },
     onMutate: (input) => {
+      const archivedAt = new Date();
       const context: ArchiveAgentMutationContext = {
         agent: getStoredAgentSnapshot(input),
         lists: getArchivedAgentListCacheSnapshot(queryClient, input.serverId),
+        optimisticArchivedAt: archivedAt.getTime(),
       };
-      const archivedAt = new Date().toISOString();
 
       applyArchivedAgentCloseResults({
         queryClient,
         serverId: input.serverId,
-        results: [{ agentId: input.agentId, archivedAt }],
+        results: [{ agentId: input.agentId, archivedAt: archivedAt.toISOString() }],
         invalidateQueries: false,
       });
       setAgentArchiving({
@@ -429,7 +485,7 @@ export function useArchiveAgent() {
         agentId: input.agentId,
         agent: context.agent,
       });
-      restoreArchivedAgentListCacheSnapshot(queryClient, input.serverId, context.lists);
+      restoreArchivedAgentListCacheSnapshot(queryClient, input, context);
     },
     onSettled: (_result, _error, input) => {
       clearArchiveAgentPending({

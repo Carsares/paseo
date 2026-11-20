@@ -1,15 +1,36 @@
 import {
+  getMainPriorModeIdFromLabels,
   getParentAgentIdFromLabels,
   isMainControlAgentLabels,
+  MAIN_PRIOR_MODE_ID_LABEL,
+  PARENT_AGENT_ID_LABEL,
+  PARENT_SERVER_ID_LABEL,
   resolveAgentHierarchyDepth,
+  WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
+import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import type { AgentPermissionRequest, AgentSessionConfig } from "./agent-sdk-types.js";
+import { OpenCodeProviderOptionsSchema } from "./providers/opencode/options.js";
 
 export const MAX_SUBAGENT_DEPTH = 2;
 export const MAIN_CONTROL_WRITE_DENIAL = "Main Control agents are read-only.";
 /** Absolute depth supplied by the parent host when it creates a remote child. */
 export const REMOTE_HIERARCHY_DEPTH_LABEL = "paseo.remote-hierarchy-depth";
+export const RESERVED_HIERARCHY_LABELS = [
+  PARENT_AGENT_ID_LABEL,
+  PARENT_SERVER_ID_LABEL,
+  WORKSPACE_ROLE_LABEL,
+  MAIN_PRIOR_MODE_ID_LABEL,
+  REMOTE_HIERARCHY_DEPTH_LABEL,
+] as const;
+
+export function hasReservedHierarchyLabels(labels?: Record<string, string>): boolean {
+  return !!labels && RESERVED_HIERARCHY_LABELS.some((label) => Object.hasOwn(labels, label));
+}
+
+export const RESERVED_HIERARCHY_LABELS_ERROR =
+  "Change agent hierarchy through the workspace controls.";
 
 export interface HierarchyAgent {
   id: string;
@@ -164,6 +185,51 @@ const MAIN_CONTROL_DISABLED_TOOLS = [
   "start_workspace_script",
   "stop_workspace_script",
 ];
+const MAIN_CONTROL_CLAUDE_DENIED_TOOLS = ["Edit", "MultiEdit", "Write", "NotebookEdit", "Bash"];
+const OPENCODE_NON_WRITE_PERMISSIONS = [
+  "read",
+  "glob",
+  "grep",
+  "list",
+  "task",
+  "external_directory",
+  "question",
+  "webfetch",
+  "websearch",
+  "codesearch",
+  "repo_clone",
+  "repo_overview",
+  "lsp",
+  "doom_loop",
+  "skill",
+] as const;
+
+export function resolveInheritedHierarchyMode(
+  mode: string | null | undefined,
+  labels: HierarchyAgent["labels"],
+): string | null | undefined {
+  return isMainControlAgentLabels(labels) && mode === "read-only"
+    ? getMainPriorModeIdFromLabels(labels)
+    : mode;
+}
+
+export function resolveInheritedHierarchyOptions(
+  options: ProviderOptions | undefined,
+  labels: HierarchyAgent["labels"],
+): ProviderOptions | undefined {
+  if (!options || !isMainControlAgentLabels(labels)) return options;
+  const inherited = { ...options };
+  if (inherited.sandbox_mode === "read-only") delete inherited.sandbox_mode;
+  if (inherited.approval_policy === "never") delete inherited.approval_policy;
+  if (Array.isArray(inherited.disallowedTools)) {
+    const tools = inherited.disallowedTools.filter(
+      (tool) => !MAIN_CONTROL_CLAUDE_DENIED_TOOLS.some((denied) => denied === tool),
+    );
+    if (tools.length > 0) inherited.disallowedTools = tools;
+    else delete inherited.disallowedTools;
+  }
+  return inherited;
+}
 const LEVEL_TWO_DISABLED_TOOLS = [
   "create_agent",
   "send_agent_prompt",
@@ -215,13 +281,29 @@ export function applyMainControlReadOnlyConfig(
         disallowedTools: [
           ...new Set([
             ...(Array.isArray(existing) ? existing : []),
-            "Edit",
-            "MultiEdit",
-            "Write",
-            "NotebookEdit",
-            "Bash",
+            ...MAIN_CONTROL_CLAUDE_DENIED_TOOLS,
           ]),
         ],
+      },
+    };
+  }
+  if (provider === "opencode") {
+    const { permission } = OpenCodeProviderOptionsSchema.parse(config.providerOptions ?? {});
+    const rules =
+      typeof permission === "string"
+        ? Object.fromEntries(OPENCODE_NON_WRITE_PERMISSIONS.map((name) => [name, permission]))
+        : permission;
+    return {
+      ...config,
+      providerOptions: {
+        ...config.providerOptions,
+        auto_accept: false,
+        permission: {
+          ...rules,
+          edit: "deny",
+          bash: "deny",
+          todowrite: "deny",
+        },
       },
     };
   }
@@ -239,7 +321,7 @@ export function isMainControlWritePermissionBlocked(
     .toLowerCase()
     .split(/__|[./:]+/)
     .at(-1);
-  return /^(?:(?:multi_|notebook_)?edit|(?:file_|filesystem_|fs_)?(?:edit|write|patch)|(?:edit|write|patch|create|delete|remove|move|rename)_file|write_to_file|(?:multi_)?replace_file_content|replace|str_replace_editor|apply_patch|(?:codex_)?file_change)(?:_tool)?$/.test(
+  return /^(?:(?:multi_|notebook_)?edit|(?:file_|filesystem_|fs_)?(?:edit|write|patch)|(?:edit|write|patch|create|delete|remove|move|rename)_file|write_to_file|(?:multi_)?replace_file_content|replace|str_replace_editor|apply_patch|(?:codex_)?file_change|bash|shell|exec|run_command|execute_command|run_terminal_cmd|todo_?write)(?:_tool)?$/.test(
     name ?? "",
   );
 }

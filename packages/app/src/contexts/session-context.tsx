@@ -13,7 +13,6 @@ import {
 } from "@/hooks/use-agent-initialization";
 import type { StreamItem } from "@/types/stream";
 import { planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
-import { requestTimelineReplacement } from "@/timeline/timeline-replacement";
 import { type ViewedTimelineOwner } from "@/timeline/viewed-timeline-sync";
 import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import { parseServerInfoStatusPayload } from "@getpaseo/protocol/messages";
@@ -375,15 +374,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     };
     const onReplacement = (message: SessionOutboundMessage) => {
       if (message.type !== "agent.timeline.replacement") return;
-      void requestTimelineReplacement(
-        {
-          fetchAgentTimeline: (agentId, request) =>
-            getHostRuntimeStore().fetchAgentTimeline(serverId, agentId, request),
-        },
-        message.payload.agentId,
-      ).catch((error: unknown) => {
-        console.warn("[Session] timeline replacement refresh failed", { serverId, error });
-      });
+      sync.requestReplacement(message.payload.agentId);
     };
     const sync = getHostRuntimeStore().createViewedTimelineOwner(serverId, {
       canCheckFreshness: () =>

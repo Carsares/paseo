@@ -3,8 +3,8 @@ import { HostObservationError } from "../host-operations/index.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, test } from "vitest";
-import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
+import { afterEach, expect, test, vi } from "vitest";
+import type { DaemonClient, WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
 import { buildStoredAgentPayload } from "../agent-projections.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
@@ -132,6 +132,59 @@ function outcome(status: "idle" | "running" | "closed" | "error" = "closed"): Wa
 async function until(check: () => boolean) {
   await expect.poll(check).toBe(true);
 }
+
+test("restores a remote parent subscription and delivers to the owning host", async () => {
+  const first = await scenario();
+  await first.service.register({
+    ...intent,
+    callerServerId: "parent-host",
+    requireParentOwnership: true,
+  });
+  await first.service.close();
+
+  const store = createJsonFinishSubscriptionStore(first.home);
+  const observation = new Observation();
+  const callerIsActive = vi.fn(async () => false);
+  const sendMessage = vi.fn(async () => ({}));
+  const fetchAgent = vi.fn(async () => ({ agent: { archivedAt: null } }));
+  const use = vi.fn((_serverId: string, action: (client: DaemonClient) => Promise<unknown>) =>
+    action({ sendMessage, fetchAgent } as unknown as DaemonClient),
+  );
+  const restarted = createFinishSubscriptions({
+    store,
+    serverId: "origin",
+    logger: createTestLogger(),
+    callerIsActive,
+    messages: () => first.delivery,
+    hosts: () => ({
+      directory: async () => {
+        throw new Error("Unexpected host listing");
+      },
+      use: use as import("../host-operations/index.js").ToolHosts["use"],
+    }),
+    open: observation.open.bind(observation),
+  });
+  services.push(restarted);
+  await restarted.start();
+  await until(() => observation.waits.length === 1);
+  const finished = outcome("idle");
+  finished.final!.labels!["paseo.parent-server-id"] = "parent-host";
+  observation.waits[0]!.result.resolve(finished);
+  await expect.poll(async () => await store.list()).toEqual([]);
+  expect(use).toHaveBeenCalledWith("parent-host", expect.any(Function), expect.any(AbortSignal));
+  expect(sendMessage).toHaveBeenCalledExactlyOnceWith(
+    "parent",
+    expect.stringContaining("Partial work saved"),
+    {
+      messageId: expect.any(String),
+      sourceAgentId: "child",
+      sourceAgentServerId: "origin",
+      activeTurnBehavior: "steer",
+    },
+  );
+  expect(callerIsActive).not.toHaveBeenCalled();
+  expect(first.delivery.prompts).toEqual([]);
+});
 
 test("retains intent until parent dispatch acknowledgment, then restart sends nothing", async () => {
   const first = await scenario();

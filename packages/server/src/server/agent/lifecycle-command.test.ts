@@ -306,6 +306,19 @@ describe("agent lifecycle commands", () => {
       accepted: false,
       error: "Nothing to update (provide name and/or labels)",
     });
+    await expect(
+      updateAgentCommand(
+        { agentManager: manager },
+        {
+          agentId: "agent-1",
+          name: "Do not apply",
+          labels: { [PARENT_AGENT_ID_LABEL]: "spoofed-parent" },
+        },
+      ),
+    ).resolves.toEqual({
+      accepted: false,
+      error: "Change agent hierarchy through the workspace controls.",
+    });
 
     expect(storage.upserts).toHaveLength(0);
     expect(manager.metadataUpdates).toEqual([
@@ -564,8 +577,8 @@ describe("moveAgentToWorkspaceCommand", () => {
     finishAllocation.resolve();
 
     const result = await first;
-    await expect(replay).resolves.toEqual(result);
-    await expect(move("move-once")).resolves.toEqual(result);
+    await expect(replay).resolves.toEqual({ ...result, replayed: true });
+    await expect(move("move-once")).resolves.toEqual({ ...result, replayed: true });
     await withoutKey;
     expect(allocateWorkspace).toHaveBeenCalledTimes(1);
     expect(unexpectedAllocation).not.toHaveBeenCalled();

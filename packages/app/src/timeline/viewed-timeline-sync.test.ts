@@ -4,12 +4,15 @@ import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/pr
 import type { ProjectedTimelineForwardFetchPlan } from "./timeline-sync-plan";
 import {
   consumeForcedTimelineTailReplacement,
+  createTimelineReplica,
+  createViewedTimelineOwner,
   createViewedTimelineSync,
   FRESHNESS_CHECK_QUIET_MS,
   type TimelineResponsePayload,
   type ViewedTimelineStatus,
   type ViewedTimelineSyncPorts,
 } from "./viewed-timeline-sync";
+import { selectAgentTimelineState, useSessionStore } from "@/stores/session-store";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -439,6 +442,228 @@ test("a gap absorbed by a running tail is recovered after the tail completes", a
   });
   recovery.respond({ hasNewer: false });
   await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+});
+
+test("retries a forced timeline replacement after a transient fetch failure", async () => {
+  const world = new TimelineWorld();
+  world.sync.setConnected(true);
+  world.show("workspace", ["agent-a"]);
+  (await world.nextMembership()).succeed();
+  const initial = await world.nextFetch("agent-a");
+  world.sync.requestReplacement("agent-a");
+  world.sync.recoverGap("agent-a", { epoch: "old-epoch", endSeq: 9 });
+  world.expectNoPendingFetch();
+  initial.respond({ hasNewer: false });
+
+  const firstRefresh = await world.nextFetch("agent-a");
+  expect(firstRefresh.request.direction).toBe("tail");
+  firstRefresh.fail("temporary connection error");
+  const retry = await world.nextFetch("agent-a");
+  expect(retry.request.direction).toBe("tail");
+  expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("pending");
+  expect(
+    world.applyTimelineResponse({
+      requestId: "replacement",
+      agentId: "agent-a",
+      agent: null,
+      direction: "tail",
+      projection: "projected",
+      epoch: "new-epoch",
+      reset: false,
+      staleCursor: false,
+      gap: false,
+      window: { minSeq: 1, maxSeq: 0, nextSeq: 1 },
+      startCursor: null,
+      endCursor: null,
+      hasOlder: false,
+      hasNewer: false,
+      entries: [],
+      error: null,
+    }).reset,
+  ).toBe(true);
+  retry.respond({ hasNewer: false });
+  await vi.waitFor(() => expect(world.sync.getAgentTimelineStatus("agent-a")).toBe("ready"));
+  world.expectNoPendingFetch();
+  world.sync.dispose();
+});
+
+test("recovers from a failed replacement when a new-epoch stream event arrives after seq 1", async () => {
+  const serverId = "server-epoch-recovery";
+  const agentId = "agent-a";
+  useSessionStore.getState().initializeSession(serverId, null);
+  let failTailFetches = false;
+  const afterRequests: ProjectedTimelineForwardFetchPlan[] = [];
+  const replica = createTimelineReplica({
+    serverId,
+    storage: { readTimeline: async () => undefined, commitTimeline: () => undefined },
+    prepareAgent: async () => undefined,
+  });
+  const owner = createViewedTimelineOwner({
+    serverId,
+    replica,
+    replaceDemandedAgentIds: () => undefined,
+    drainQueuedAgentMessage: () => undefined,
+    applyTurnLiveness: () => undefined,
+    ports: {
+      canCheckFreshness: () => false,
+      observe: () => ({ ready: Promise.resolve(), release: async () => undefined }),
+      readCursor: () => {
+        const timeline = selectAgentTimelineState(
+          useSessionStore.getState().sessions[serverId],
+          agentId,
+        );
+        return timeline.status === "synced" && timeline.range
+          ? { epoch: timeline.range.epoch, endSeq: timeline.range.endSeq }
+          : undefined;
+      },
+      fetchPage: async (_id, request) => {
+        if (request.direction === "tail") {
+          owner.applyTimelineResponse({
+            requestId: "init-tail",
+            agentId,
+            agent: null,
+            direction: "tail",
+            projection: "projected",
+            epoch: "epoch-1",
+            reset: false,
+            staleCursor: false,
+            gap: false,
+            window: { minSeq: 1, maxSeq: 2, nextSeq: 3 },
+            startCursor: { epoch: "epoch-1", seq: 1 },
+            endCursor: { epoch: "epoch-1", seq: 2 },
+            hasOlder: false,
+            hasNewer: false,
+            entries: [
+              {
+                seqStart: 1,
+                seqEnd: 1,
+                sourceSeqRanges: [{ startSeq: 1, endSeq: 1 }],
+                collapsed: [],
+                provider: "codex",
+                timestamp: "2026-08-26T10:00:00.000Z",
+                item: { type: "user_message", text: "Hello" },
+              },
+              {
+                seqStart: 2,
+                seqEnd: 2,
+                sourceSeqRanges: [{ startSeq: 2, endSeq: 2 }],
+                collapsed: [],
+                provider: "codex",
+                timestamp: "2026-08-26T10:00:01.000Z",
+                item: { type: "assistant_message", text: "Aborted partial reply" },
+              },
+            ],
+            error: null,
+          });
+          return { hasNewer: false, endCursor: { epoch: "epoch-1", seq: 2 } };
+        }
+        afterRequests.push(request);
+        owner.applyTimelineResponse({
+          requestId: "stale-cursor-reset",
+          agentId,
+          agent: null,
+          direction: "after",
+          projection: "projected",
+          epoch: "epoch-2",
+          reset: true,
+          staleCursor: true,
+          gap: false,
+          window: { minSeq: 1, maxSeq: 2, nextSeq: 3 },
+          startCursor: { epoch: "epoch-2", seq: 1 },
+          endCursor: { epoch: "epoch-2", seq: 2 },
+          hasOlder: false,
+          hasNewer: false,
+          entries: [
+            {
+              seqStart: 1,
+              seqEnd: 1,
+              sourceSeqRanges: [{ startSeq: 1, endSeq: 1 }],
+              collapsed: [],
+              provider: "codex",
+              timestamp: "2026-08-26T10:00:00.000Z",
+              item: { type: "user_message", text: "Hello" },
+            },
+            {
+              seqStart: 2,
+              seqEnd: 2,
+              sourceSeqRanges: [{ startSeq: 2, endSeq: 2 }],
+              collapsed: [],
+              provider: "codex",
+              timestamp: "2026-08-26T10:00:02.000Z",
+              item: { type: "assistant_message", text: "New reply" },
+            },
+          ],
+          error: null,
+        });
+        return { hasNewer: false, endCursor: { epoch: "epoch-2", seq: 2 } };
+      },
+      fetchLatestTail: async () => {
+        if (failTailFetches) throw new Error("replacement fetch failed");
+        return { hasNewer: false, endCursor: { epoch: "epoch-2", seq: 2 } };
+      },
+      reportError: () => undefined,
+    },
+  });
+
+  try {
+    owner.setConnected(true);
+    owner.replaceVisibleAgentIds("workspace", [agentId]);
+    await vi.waitFor(() => expect(owner.getAgentTimelineStatus(agentId)).toBe("ready"));
+
+    failTailFetches = true;
+    owner.requestReplacement(agentId);
+    await vi.waitFor(() => expect(owner.getAgentTimelineStatus(agentId)).toBe("error"));
+
+    owner.applyStreamEvent(agentId, {
+      event: {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: " New reply" },
+      },
+      seq: 2,
+      epoch: "epoch-2",
+      timestamp: new Date("2026-08-26T10:00:02.000Z"),
+    });
+    owner.flushStreamAgent(agentId);
+
+    await vi.waitFor(() => expect(owner.getAgentTimelineStatus(agentId)).toBe("ready"));
+    expect(afterRequests).toEqual([
+      expect.objectContaining({
+        direction: "after",
+        cursor: { epoch: "epoch-1", seq: 2 },
+      }),
+    ]);
+
+    owner.applyStreamEvent(agentId, {
+      event: {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "assistant_message", text: " continued" },
+      },
+      seq: 3,
+      epoch: "epoch-2",
+      timestamp: new Date("2026-08-26T10:00:03.000Z"),
+    });
+    owner.flushStreamAgent(agentId);
+
+    const session = useSessionStore.getState().sessions[serverId];
+    const timeline = selectAgentTimelineState(session, agentId);
+    const items = [
+      ...(timeline.status === "cold" ? [] : timeline.items),
+      ...(session?.agentStreamHead.get(agentId) ?? []),
+    ];
+    expect(timeline.status).toBe("synced");
+    if (timeline.status === "synced") {
+      expect(timeline.range).toEqual({ epoch: "epoch-2", startSeq: 1, endSeq: 3 });
+    }
+    expect(
+      items
+        .filter((item) => item.kind === "assistant_message")
+        .map((item) => (item.kind === "assistant_message" ? item.text : "")),
+    ).toEqual(["New reply continued"]);
+  } finally {
+    owner.dispose();
+  }
 });
 
 test("reports a chat current only once its parked follow-up page completes", async () => {

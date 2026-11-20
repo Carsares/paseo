@@ -960,6 +960,27 @@ describe("interaction reading positions through display projections", () => {
     },
   ];
 
+  it("keeps the reader on the host prompt when hiding interactions removes its summary", () => {
+    const prompt: StreamItem = { kind: "user_message", id: "prompt", text: "Work", timestamp };
+    const input = {
+      ...presentationOptions,
+      transform: undefined,
+      tail: [prompt, interaction, reply],
+      head: [],
+      display: "collapseTurns" as const,
+      isTurnActive: false,
+    };
+    const present = createStreamPresentation();
+    const shown = present({ ...input, showAgentInteractions: true });
+    expect(ids(shown.tail)).toEqual(["prompt", "turn-summary:prompt", "reply"]);
+    const anchor = createReadingAnchor();
+    anchor.reconcile(0, [{ id: "turn-summary:prompt", top: 48, height: 150 }]);
+
+    const hidden = present(input);
+    expect(ids(hidden.tail)).toEqual(["prompt", "reply"]);
+    expect(anchor.getRowId(hidden.readingRowReplacements)).toBe("prompt");
+  });
+
   it("maps old plugin rows and merged fragments to the current visible plugin host", () => {
     const fragment = { ...reply, id: "fragment", text: "after" };
     const tail = [reply, interaction, fragment];

@@ -1,8 +1,15 @@
-import { describe, expect, it } from "vitest";
-import type { Agent } from "@/stores/session-store";
+/** @vitest-environment jsdom */
+import { act, cleanup, renderHook } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { useSessionStore, type Agent } from "@/stores/session-store";
+import { getOrCreateClientId } from "@/utils/client-id";
 import type { WorkspaceTab } from "@/workspace-tabs/model";
 import { shallow } from "zustand/shallow";
 import { getAgentTabsNeedingOpenLabel, selectOpenTabAgents } from "./open-tab-labels";
+import { useOpenAgentTabLabels } from "./use-open-agent-tab-labels";
+
+vi.mock("@/utils/client-id", () => ({ getOrCreateClientId: vi.fn() }));
 
 const label = "paseo.open-agent-tab.client-1";
 
@@ -10,11 +17,17 @@ function tab(agentId: string, createdAt: number): WorkspaceTab {
   return { tabId: `agent_${agentId}`, target: { kind: "agent", agentId }, createdAt };
 }
 
-function agent(input: { id: string; parentAgentId?: string | null; open?: boolean }): Agent {
+function agent(input: {
+  id: string;
+  parentAgentId?: string | null;
+  open?: boolean;
+  workspaceId?: string;
+}): Agent {
   return {
     id: input.id,
     parentAgentId: input.parentAgentId ?? null,
     labels: input.open ? { [label]: "true" } : {},
+    workspaceId: input.workspaceId,
   } as Agent;
 }
 
@@ -50,6 +63,63 @@ describe("getAgentTabsNeedingOpenLabel", () => {
         pendingAgentIds: new Set(["pending"]),
       }),
     ).toEqual([]);
+  });
+
+  it("marks parented tabs only in the supplied workspace", () => {
+    const local = agent({ id: "local", parentAgentId: "parent", workspaceId: " source " });
+    const moved = agent({ id: "moved", parentAgentId: "parent", workspaceId: "destination" });
+    const agents = new Map([local, moved].map((entry) => [entry.id, entry]));
+    expect(
+      getAgentTabsNeedingOpenLabel({
+        tabs: [tab("local", 1), tab("moved", 2)],
+        getAgent: (agentId) => agents.get(agentId),
+        label,
+        pendingAgentIds: new Set(),
+        workspaceId: "source",
+      }),
+    ).toEqual(["local"]);
+  });
+});
+
+describe("useOpenAgentTabLabels", () => {
+  const serverId = "open-label-server";
+  afterEach(() => {
+    cleanup();
+    useSessionStore.getState().clearSession(serverId);
+  });
+
+  it("rechecks workspace and parentage after resolving the client id", async () => {
+    const clientId = Promise.withResolvers<string>();
+    vi.mocked(getOrCreateClientId).mockReturnValue(clientId.promise);
+    const update = Promise.withResolvers<void>();
+    const updateAgent = vi.fn<DaemonClient["updateAgent"]>().mockReturnValue(update.promise);
+    const client = { updateAgent } as unknown as DaemonClient;
+    const store = useSessionStore.getState();
+    store.initializeSession(serverId, client);
+    const localChild = (id: string) =>
+      agent({ id, parentAgentId: "parent", workspaceId: "source" });
+    const local = localChild("local");
+    const moved = localChild("moved");
+    const detached = localChild("detached");
+    const setAgents = (agents: Agent[]) => {
+      store.setAgentDetails(serverId, new Map(agents.map((entry) => [entry.id, entry])));
+    };
+    setAgents([local, moved, detached]);
+    const tabs = [tab("local", 1), tab("moved", 2), tab("detached", 3)];
+    renderHook(() =>
+      useOpenAgentTabLabels({ client, serverId, workspaceId: "source", tabs, enabled: true }),
+    );
+
+    await act(async () => {
+      setAgents([
+        local,
+        { ...moved, workspaceId: "destination" },
+        { ...detached, parentAgentId: null },
+      ]);
+      clientId.resolve("client-1");
+    });
+    update.resolve();
+    expect(updateAgent.mock.calls).toEqual([["local", { labels: { [label]: "true" } }]]);
   });
 });
 

@@ -304,17 +304,22 @@ function trimContextMetadata(value: string | null | undefined): string | null {
 function buildForkContextText(input: {
   body: string;
   sourceAgentId?: string | null;
+  sourceServerId?: string | null;
   boundaryMessageId?: string | null;
   agentTitle?: string | null;
   cwd?: string | null;
 }): string {
   const header = ["Chat history from a previous Paseo agent."];
   const sourceAgentId = trimContextMetadata(input.sourceAgentId);
+  const sourceServerId = trimContextMetadata(input.sourceServerId);
   const boundaryMessageId = trimContextMetadata(input.boundaryMessageId);
   const agentTitle = trimContextMetadata(input.agentTitle);
   const cwd = trimContextMetadata(input.cwd);
   if (sourceAgentId) {
     header.push(`Source agent ID: ${sourceAgentId}`);
+  }
+  if (sourceServerId) {
+    header.push(`Source server ID: ${sourceServerId}`);
   }
   if (agentTitle) {
     header.push(`Source agent: ${agentTitle}`);
@@ -357,6 +362,7 @@ export function buildAgentForkContextAttachment(input: {
   cursorBoundary?: ForkCursorBoundary | null;
   boundaryMessageId?: string | null;
   sourceAgentId?: string | null;
+  sourceServerId?: string | null;
   agentTitle?: string | null;
   cwd?: string | null;
 }): {
@@ -378,14 +384,23 @@ export function buildAgentForkContextAttachment(input: {
   });
   const metadata = {
     sourceAgentId: input.sourceAgentId,
+    sourceServerId: input.sourceServerId,
     agentTitle: input.agentTitle,
     boundaryMessageId: selected.boundaryMessageId,
     cwd: input.cwd,
   };
   const budget = MAX_FORK_CONTEXT_CHARS - buildForkContextText({ body: "", ...metadata }).length;
   const body =
-    entries.length > 0 ? fitForkContextEntries(entries, budget) : "No chat history to display.";
+    entries.length > 0
+      ? fitForkContextEntries(
+          entries.map((entry) => ({
+            text: entry.text.replaceAll("</chat-history-summary>", "<\\/chat-history-summary>"),
+          })),
+          budget,
+        )
+      : "No chat history to display.";
   const trimmedSourceAgentId = trimContextMetadata(input.sourceAgentId);
+  const trimmedSourceServerId = trimContextMetadata(input.sourceServerId);
   const trimmedBoundaryMessageId = trimContextMetadata(selected.boundaryMessageId);
   return {
     attachment: {
@@ -394,10 +409,11 @@ export function buildAgentForkContextAttachment(input: {
       contextKind: "chat_history",
       title: "Chat history",
       text: buildForkContextText({ body, ...metadata }),
-      ...(trimmedSourceAgentId || trimmedBoundaryMessageId
+      ...(trimmedSourceAgentId || trimmedSourceServerId || trimmedBoundaryMessageId
         ? {
             forkContext: {
               ...(trimmedSourceAgentId ? { sourceAgentId: trimmedSourceAgentId } : {}),
+              ...(trimmedSourceServerId ? { sourceServerId: trimmedSourceServerId } : {}),
               ...(trimmedBoundaryMessageId ? { boundaryMessageId: trimmedBoundaryMessageId } : {}),
             },
           }

@@ -54,6 +54,7 @@ import {
   DEFAULT_HISTORY_SORT,
   type HistoryGroupMode,
   type HistorySortOption,
+  isHistoryProjectExpanded,
 } from "./sessions/history-grouping";
 import {
   ALL_PROJECTS_OPTION_ID,
@@ -451,7 +452,11 @@ function SessionsScreenContent() {
   const isSearching = isSearchSupported && search.length > 0;
   const effectiveSearchScope = isQueryControlsSupported ? searchScope : "all";
   const effectiveSearch = isSearching ? search : "";
-  const projectOptions = useHistoryProjectOptions({ selectedHost, agents, ancestors });
+  const { options: projectOptions, catalogEquivalenceCounts } = useHistoryProjectOptions({
+    selectedHost,
+    agents,
+    ancestors,
+  });
   // The catalog can gain project placements while history is already filtered.
   useEffect(() => {
     if (!projectSelection) return;
@@ -481,10 +486,18 @@ function SessionsScreenContent() {
         entries: agents,
         ancestors,
         activeWorkspaceIdsByServer,
+        catalogEquivalenceCounts,
         search: effectiveSearch,
         sort: effectiveSort,
       }),
-    [agents, ancestors, activeWorkspaceIdsByServer, effectiveSearch, effectiveSort],
+    [
+      agents,
+      ancestors,
+      activeWorkspaceIdsByServer,
+      catalogEquivalenceCounts,
+      effectiveSearch,
+      effectiveSort,
+    ],
   );
   const expansionKey = JSON.stringify([
     selectedTab,
@@ -501,11 +514,19 @@ function SessionsScreenContent() {
   const allCollapsed = areAllHistoryWorkspacesCollapsed({ groups, groupMode, ...groupExpansion });
   const handleToggleCollapseAll = useCallback(() => {
     setExpansion((current) => {
-      if (allCollapsed) return { key: current.key, ...DEFAULT_HISTORY_GROUP_EXPANSION };
+      if (allCollapsed) {
+        return {
+          ...current,
+          projectExpandedOverrides: DEFAULT_HISTORY_GROUP_EXPANSION.projectExpandedOverrides,
+          workspaceExpandedOverrides: DEFAULT_HISTORY_GROUP_EXPANSION.workspaceExpandedOverrides,
+        };
+      }
       const visibleProjects =
         groupMode === "workspace"
           ? groups
-          : groups.filter((project) => current.projectExpandedOverrides.get(project.key) !== false);
+          : groups.filter((project) =>
+              isHistoryProjectExpanded(project, current.projectExpandedOverrides),
+            );
       const workspaceExpandedOverrides = new Map([
         ...current.workspaceExpandedOverrides,
         ...buildAllWorkspacesExpansionMap(visibleProjects, false),
@@ -531,13 +552,18 @@ function SessionsScreenContent() {
     (key: string, expanded: boolean) => toggleGroup("workspaceExpandedOverrides", key, expanded),
     [toggleGroup],
   );
+  const toggleSubagents = useCallback(
+    (key: string, expanded: boolean) => toggleGroup("subagentExpandedOverrides", key, expanded),
+    [toggleGroup],
+  );
   const listGroupExpansion = useMemo(
     () => ({
       ...groupExpansion,
       onToggleProject: toggleProject,
       onToggleWorkspace: toggleWorkspace,
+      onToggleSubagents: toggleSubagents,
     }),
-    [groupExpansion, toggleProject, toggleWorkspace],
+    [groupExpansion, toggleProject, toggleWorkspace, toggleSubagents],
   );
 
   useEffect(() => {

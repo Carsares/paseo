@@ -246,12 +246,25 @@ function normalizeForkContext(
   forkContext: UserMessageForkContext | undefined,
 ): UserMessageForkContext | undefined {
   const sourceAgentId = forkContext?.sourceAgentId?.trim();
+  const sourceServerId = forkContext?.sourceServerId?.trim();
   const boundaryMessageId = forkContext?.boundaryMessageId?.trim();
-  if (!sourceAgentId && !boundaryMessageId) return undefined;
+  if (!sourceAgentId && !boundaryMessageId && !sourceServerId) return undefined;
   return {
     ...(sourceAgentId ? { sourceAgentId } : {}),
+    ...(sourceServerId ? { sourceServerId } : {}),
     ...(boundaryMessageId ? { boundaryMessageId } : {}),
   };
+}
+
+export function firstChatHistoryForkContext(
+  attachments: readonly AgentAttachment[] | undefined,
+): UserMessageForkContext | undefined {
+  for (const attachment of attachments ?? []) {
+    if (!isChatHistoryAttachment(attachment)) continue;
+    const context = normalizeForkContext(attachment.forkContext);
+    if (context) return context;
+  }
+  return undefined;
 }
 
 export function forkContextToChatHistoryAttachments(
@@ -280,13 +293,13 @@ function mergeUserMessageAttachments(
   if (!presented || presented.length === 0) {
     return other;
   }
-  const otherForkContext = normalizeForkContext(other?.find(isChatHistoryAttachment)?.forkContext);
-  if (!otherForkContext) {
+  const otherForkContext = firstChatHistoryForkContext(other);
+  if (!otherForkContext || firstChatHistoryForkContext(presented)) {
     return presented;
   }
   let changed = false;
   const enriched = presented.map((attachment) => {
-    if (!isChatHistoryAttachment(attachment) || normalizeForkContext(attachment.forkContext)) {
+    if (changed || !isChatHistoryAttachment(attachment)) {
       return attachment;
     }
     changed = true;

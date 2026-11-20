@@ -762,13 +762,20 @@ export class VoiceAssistantWebSocketServer {
           runOptions: { clientMessageId: batch.messageIds[0] },
           beforeDispatch: shouldReportUpward
             ? async () => {
-                registration = await registerParentFinishSubscription({
-                  agentId: batch.recipientId,
-                  serverId,
-                  agentManager,
-                  agentStorage,
-                  finishSubscriptions,
-                });
+                try {
+                  registration = await registerParentFinishSubscription({
+                    agentId: batch.recipientId,
+                    serverId,
+                    agentManager,
+                    agentStorage,
+                    finishSubscriptions,
+                  });
+                } catch (error) {
+                  this.logger.warn(
+                    { err: error, agentId: batch.recipientId },
+                    "Failed to register parent finish subscription",
+                  );
+                }
               }
             : undefined,
           onDispatch: (started) => {

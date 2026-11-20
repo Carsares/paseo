@@ -1,10 +1,16 @@
+import { isWeb } from "@/constants/platform";
+
 export interface AfterPaintScheduler {
   schedule: (callback: () => void) => () => void;
 }
 
 export const browserAfterPaintScheduler: AfterPaintScheduler = {
   schedule: (callback) => {
-    if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+    if (
+      !isWeb ||
+      typeof window === "undefined" ||
+      typeof window.requestAnimationFrame !== "function"
+    ) {
       let cancelled = false;
       queueMicrotask(() => {
         if (!cancelled) callback();
@@ -41,6 +47,10 @@ export class AfterPaintPublication<T> {
       this.cancelScheduled = null;
       this.flush();
     });
+  }
+
+  peek(): T | null {
+    return this.pending;
   }
 
   flush(): void {

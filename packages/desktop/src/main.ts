@@ -19,6 +19,7 @@ import {
   BrowserWindow,
   ClipboardItem,
   clipboard,
+  dialog,
   Menu,
   ipcMain,
   nativeImage,
@@ -969,7 +970,13 @@ async function bootstrap(): Promise<void> {
     },
   });
   ensureNotificationCenterRegistration();
-  registerDaemonManager();
+  registerDaemonManager((settings) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+        win.webContents.send("paseo:event:desktop-settings-changed", settings);
+      }
+    }
+  });
   registerWindowManager({ mode: DESKTOP_WINDOW_CHROME_MODE });
   registerDialogHandlers();
   registerNotificationHandlers();
@@ -1044,8 +1051,14 @@ const quitLifecycle = createQuitLifecycle({
       isDesktopManagedDaemonPresent: isDesktopManagedDaemonPresentSync,
       hasPendingUpdateOnQuit: hasDownloadedAppUpdate,
       preserveWork: options?.preserveWork,
-      stopDaemon: (reason = "quit") => stopDesktopDaemonViaCli(reason),
-      showShutdownFeedback: showDaemonShutdownDialog,
+      stopDaemon: async (reason = "quit") => {
+        await stopDesktopDaemonViaCli(reason);
+        if (reason === "quit_preserve_work") showDaemonShutdownDialog();
+      },
+      // This overlay has no dismissal path. Show it only once a preserve-work stop succeeds.
+      showShutdownFeedback: () => {
+        if (!options?.preserveWork) showDaemonShutdownDialog();
+      },
     }),
   installAppUpdateOnQuit: async (signal) => {
     const settings = await getDesktopSettingsStore().get();
@@ -1058,6 +1071,12 @@ const quitLifecycle = createQuitLifecycle({
   createUpdateDeadlineSignal: () => AbortSignal.timeout(UPDATE_QUIT_DEADLINE_MS),
   onStopError: (error) => {
     log.error("[desktop daemon] failed to stop managed daemon on quit", error);
+  },
+  onPreserveWorkStopFailed: () => {
+    dialog.showErrorBox(
+      "Could not quit and resume agents",
+      "Paseo stayed open because it could not save the agents for the next launch. You can retry or quit normally.",
+    );
   },
   onUpdateError: (error) => {
     log.error("[auto-updater] failed to validate downloaded update on quit", error);

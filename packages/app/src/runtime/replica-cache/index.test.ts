@@ -337,7 +337,11 @@ describe("ReplicaCache", () => {
   it("persists a forked user message's chat history card without its summary body", async () => {
     const storage = new MemoryStorage();
     const writer = createCache(storage);
-    const forkContext = { sourceAgentId: "agent-src", boundaryMessageId: "msg-1" };
+    const forkContext = {
+      sourceServerId: "source-host",
+      sourceAgentId: "agent-src",
+      boundaryMessageId: "msg-1",
+    };
     const forked: StreamItem = {
       kind: "user_message",
       id: "fork-msg",
@@ -403,6 +407,7 @@ describe("ReplicaCache", () => {
     await writer.flush();
     expect((await createCache(storage).readTimeline(SERVER_ID, "agent-1"))?.range).toBeNull();
 
+    const firstValidForkContext = { sourceServerId: "source-host", sourceAgentId: "agent-src" };
     writer.commitTimeline(SERVER_ID, "agent-1", {
       ...timeline(),
       items: [
@@ -415,6 +420,7 @@ describe("ReplicaCache", () => {
               contextKind: "chat_history",
               title: "Chat history",
               text: "",
+              forkContext: { sourceServerId: " " },
             },
             {
               type: "text",
@@ -422,6 +428,19 @@ describe("ReplicaCache", () => {
               contextKind: "chat_history",
               title: "Chat history",
               text: "",
+              forkContext: firstValidForkContext,
+            },
+            {
+              type: "text",
+              mimeType: "text/plain",
+              contextKind: "chat_history",
+              title: "Chat history",
+              text: "",
+              forkContext: {
+                sourceServerId: "different-host",
+                sourceAgentId: "different-agent",
+                boundaryMessageId: "different-message",
+              },
             },
           ],
         },
@@ -429,7 +448,25 @@ describe("ReplicaCache", () => {
       ],
     });
     await writer.flush();
-    expect((await createCache(storage).readTimeline(SERVER_ID, "agent-1"))?.range).toBeNull();
+    const restored = await createCache(storage).readTimeline(SERVER_ID, "agent-1");
+    expect(restored?.range).toBeNull();
+    expect(restored?.items[0]).toMatchObject({
+      kind: "user_message",
+      attachments: [
+        {
+          type: "text",
+          mimeType: "text/plain",
+          contextKind: "chat_history",
+          title: "Chat history",
+          text: "",
+          forkContext: firstValidForkContext,
+        },
+      ],
+    });
+    const restoredMessage = restored?.items[0];
+    expect(
+      restoredMessage?.kind === "user_message" && restoredMessage.attachments?.[0],
+    ).toHaveProperty("forkContext", firstValidForkContext);
   });
 
   it("preserves workspace parentage and its checkpoint across cache reopen", async () => {

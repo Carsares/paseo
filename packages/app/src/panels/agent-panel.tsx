@@ -1201,7 +1201,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   }, [onAttentionInputFocus]);
   const quoteTarget = useMemo<ComposerQuoteTarget | null>(
     () =>
-      showsComposer && isPaneFocused && hasActiveComposer && !draft
+      showsComposer && hasActiveComposer && !draft
         ? { textSource: agentInputDraft.textSource, setText: agentInputDraft.replaceText }
         : null,
     [
@@ -1209,7 +1209,6 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
       agentInputDraft.textSource,
       draft,
       hasActiveComposer,
-      isPaneFocused,
       showsComposer,
     ],
   );

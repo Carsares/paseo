@@ -33,7 +33,7 @@ export function resolveNavigateToAgent(
   const workspaceId = normalizeWorkspaceOpaqueId(agentWorkspaceId);
 
   if (!workspaceId) {
-    const route = buildHostAgentDetailRoute(input.serverId, input.agentId);
+    const route = buildHostAgentDetailRoute(input.serverId, input.agentId, { asTab: input.asTab });
     deps.navigateToHostAgent(route);
     return route;
   }
@@ -51,6 +51,7 @@ export interface OpenForkSourceAgentInput {
   serverId: string | undefined;
   sourceAgentId: string | undefined;
   onNotFound?: () => void;
+  onError?: (error: unknown) => void;
 }
 
 interface ForkSourceAgentLookup {
@@ -101,8 +102,8 @@ export async function resolveOpenForkSourceAgent(
   let remote: ForkSourceAgentLookup;
   try {
     remote = await deps.fetchRemoteAgent({ serverId, agentId });
-  } catch {
-    input.onNotFound?.();
+  } catch (error) {
+    input.onError?.(error);
     return false;
   }
   if (!remote.found) {

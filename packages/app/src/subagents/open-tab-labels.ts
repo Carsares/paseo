@@ -1,11 +1,47 @@
-import type { Agent } from "@/stores/session-store";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { getOpenAgentTabLabel } from "@getpaseo/protocol/agent-labels";
+import { useSessionStore, type Agent } from "@/stores/session-store";
+import { getOrCreateClientId } from "@/utils/client-id";
+import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
 import type { WorkspaceTab } from "@/workspace-tabs/model";
+import { resolveCloseAgentTabPolicy } from "./close-tab-policy";
+
+export async function clearSubagentOpenTabLabel(input: {
+  client: Pick<DaemonClient, "updateAgent">;
+  agentId: string;
+  serverId: string;
+  workspaceId: string;
+}): Promise<boolean> {
+  const { client, agentId, serverId, workspaceId } = input;
+  const clientId = await getOrCreateClientId();
+  await client.updateAgent(agentId, { labels: { [getOpenAgentTabLabel(clientId)]: "false" } });
+  const session = useSessionStore.getState().sessions[serverId];
+  const latestAgent = session?.agents.get(agentId);
+  return (
+    normalizeWorkspaceOpaqueId(latestAgent?.workspaceId) === workspaceId &&
+    resolveCloseAgentTabPolicy(latestAgent).kind === "archive-on-close"
+  );
+}
+
+export function needsOpenAgentTabLabel(
+  agent: Agent | null | undefined,
+  label: string,
+  workspaceId?: string | null,
+): agent is Agent {
+  return Boolean(
+    agent?.parentAgentId &&
+    agent.labels[label] !== "true" &&
+    (workspaceId === undefined ||
+      normalizeWorkspaceOpaqueId(agent.workspaceId) === normalizeWorkspaceOpaqueId(workspaceId)),
+  );
+}
 
 export function getAgentTabsNeedingOpenLabel(input: {
   tabs: WorkspaceTab[];
   getAgent: (agentId: string) => Agent | null | undefined;
   label: string;
   pendingAgentIds: ReadonlySet<string>;
+  workspaceId?: string | null;
 }): string[] {
   const agentIds = new Set<string>();
   for (const tab of input.tabs) {
@@ -14,8 +50,7 @@ export function getAgentTabsNeedingOpenLabel(input: {
     }
     const agent = input.getAgent(tab.target.agentId);
     if (
-      agent?.parentAgentId &&
-      agent.labels[input.label] !== "true" &&
+      needsOpenAgentTabLabel(agent, input.label, input.workspaceId) &&
       !input.pendingAgentIds.has(agent.id)
     ) {
       agentIds.add(agent.id);

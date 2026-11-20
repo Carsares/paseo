@@ -395,6 +395,7 @@ export interface AgentTaskItem {
 
 export interface UserMessageForkContext {
   sourceAgentId?: string;
+  sourceServerId?: string;
   boundaryMessageId?: string;
 }
 

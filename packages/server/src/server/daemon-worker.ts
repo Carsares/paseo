@@ -143,6 +143,8 @@ async function main() {
   let daemon: Awaited<ReturnType<typeof createPaseoDaemon>> | null = null;
   let shutdownPromise: Promise<number> | null = null;
   let exitHookInstalled = false;
+  let latchedKeepTerminals = false;
+  let latchedResumeAgents = false;
 
   applyCliFlagOverrides(config);
 
@@ -224,6 +226,8 @@ async function main() {
   };
 
   const handleLifecycleIntent = (intent: DaemonLifecycleIntent) => {
+    latchedKeepTerminals ||= intent.keepTerminals === true;
+    latchedResumeAgents ||= intent.resumeAgents === true;
     const fields = {
       clientId: intent.clientId,
       requestId: intent.requestId,
@@ -316,8 +320,8 @@ async function main() {
         };
         beginShutdown("Supervisor shutdown request", {
           reason: typeof reason === "string" ? reason : "supervisor_requested_shutdown",
-          keepTerminals: keepTerminals === true,
-          resumeAgents: resumeAgents === true,
+          keepTerminals: keepTerminals === true || latchedKeepTerminals,
+          resumeAgents: resumeAgents === true || latchedResumeAgents,
         });
       }
     });

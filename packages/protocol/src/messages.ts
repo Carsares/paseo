@@ -758,6 +758,7 @@ const ToolCallTimelineItemPayloadSchema: z.ZodType<ToolCallTimelineItem, unknown
 
 export const UserMessageForkContextSchema = z.object({
   sourceAgentId: z.string().optional(),
+  sourceServerId: z.string().optional(),
   boundaryMessageId: z.string().optional(),
 });
 
@@ -1916,6 +1917,7 @@ export const CreateAgentRequestMessageSchema = z.object({
   callerAgentId: z.string().optional(),
   worktreeName: z.string().optional(),
   initialPrompt: z.string().optional(),
+  initialPromptOrigin: z.enum(["user", "agent"]).optional(),
   clientMessageId: z.string().optional(),
   outputSchema: z.record(z.string(), z.unknown()).optional(),
   images: z.array(ImageAttachmentSchema).optional(),

@@ -117,10 +117,12 @@ import {
   applyMainControlReadOnlyConfig,
   buildHierarchyAppendSystemPrompt,
   computeAgentDepth,
+  hasReservedHierarchyLabels,
   type HierarchyAgent,
   isMainControlWritePermissionBlocked,
   MAIN_CONTROL_WRITE_DENIAL,
   REMOTE_HIERARCHY_DEPTH_LABEL,
+  RESERVED_HIERARCHY_LABELS_ERROR,
   validateCanSpawnChild,
   validateSetAgentParent,
 } from "./hierarchy-policy.js";
@@ -428,6 +430,7 @@ export interface MoveSubagentToWorkspaceResult {
   workspaceId: string;
   previousParentAgentId: string | null;
   movedDescendantStoredRecords?: StoredAgentRecord[];
+  replayed?: boolean;
 }
 
 export interface AgentManagerOptions {
@@ -885,6 +888,8 @@ function detachedAgentLabelPatch(labels: Record<string, string>): AgentLabelPatc
   return {
     ...clearOpenAgentTabLabelPatch(labels),
     [PARENT_AGENT_ID_LABEL]: null,
+    [PARENT_SERVER_ID_LABEL]: null,
+    [REMOTE_HIERARCHY_DEPTH_LABEL]: null,
   };
 }
 
@@ -971,7 +976,8 @@ export class AgentManager {
   private readonly collectingRuntimes = new Set<string>();
   private readonly lifecycleMutationTails = new Map<string, Promise<void>>();
   private readonly moveToWorkspaceReceipts = new Map<string, MoveSubagentToWorkspaceResult>();
-  private readonly pendingSubagentMoveSnapshots = new Map<string, Promise<StoredAgentRecord>>();
+  private readonly pendingSubagentMoveSnapshots = new Map<string, Promise<void>>();
+  private readonly pendingHierarchySessionReloads = new Set<string>();
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
@@ -2727,7 +2733,8 @@ export class AgentManager {
         const adapter = this.adapterOf(agent.provider);
         if (
           (adapter === "codex" && ("sandbox_mode" in patch || "approval_policy" in patch)) ||
-          (adapter === "claude" && "disallowedTools" in patch)
+          (adapter === "claude" && "disallowedTools" in patch) ||
+          (adapter === "opencode" && ("auto_accept" in patch || "permission" in patch))
         ) {
           throw new Error(MAIN_CONTROL_WRITE_DENIAL);
         }
@@ -2941,49 +2948,71 @@ export class AgentManager {
       if (!agent || !targetRecord || agent.archivedAt || targetRecord.archivedAt) {
         throw new Error("Agent is missing or archived.");
       }
-      if (enabled) {
-        const targetWorkspaceId = agent.workspaceId ?? targetRecord.workspaceId;
-        if (
-          !targetWorkspaceId ||
-          getParentAgentIdFromLabels(agent.labels) ||
-          getParentAgentIdFromLabels(targetRecord.labels)
-        ) {
-          throw new Error("Only a workspace root agent can be Main Control.");
-        }
-        for (const other of hierarchy.values()) {
-          if (
-            other.id !== agentId &&
-            other.workspaceId === targetWorkspaceId &&
-            isMainControlAgentLabels(other.labels)
-          ) {
-            await this.runLifecycleMutation(other.id, async () => {
-              const record = await registry.get(other.id);
-              if (
-                record &&
-                !record.archivedAt &&
-                record.workspaceId === targetWorkspaceId &&
-                isMainControlAgentLabels(record.labels)
-              ) {
-                await this.writeMainControlRole(other.id, false);
-              }
-            });
-          }
-        }
-      }
-      return this.runLifecycleMutation(agentId, async () => {
+      const demoted: string[] = [];
+      try {
         if (enabled) {
-          const current = this.agents.get(agentId);
-          const record = await registry.get(agentId);
-          if (!record || record.archivedAt) throw new Error("Agent is missing or archived.");
+          const adapter = this.adapterOf(targetRecord.provider);
+          if (adapter !== "codex" && adapter !== "claude" && adapter !== "opencode") {
+            throw new Error(
+              `Provider '${targetRecord.provider}' does not support read-only Main Control.`,
+            );
+          }
+          const targetWorkspaceId = agent.workspaceId ?? targetRecord.workspaceId;
           if (
-            !(current?.workspaceId ?? record.workspaceId) ||
-            getParentAgentIdFromLabels(current?.labels ?? record.labels)
+            !targetWorkspaceId ||
+            getParentAgentIdFromLabels(agent.labels) ||
+            getParentAgentIdFromLabels(targetRecord.labels)
           ) {
             throw new Error("Only a workspace root agent can be Main Control.");
           }
+          for (const other of hierarchy.values()) {
+            if (
+              other.id !== agentId &&
+              other.workspaceId === targetWorkspaceId &&
+              isMainControlAgentLabels(other.labels)
+            ) {
+              await this.runLifecycleMutation(other.id, async () => {
+                const record = await registry.get(other.id);
+                if (
+                  record &&
+                  !record.archivedAt &&
+                  record.workspaceId === targetWorkspaceId &&
+                  isMainControlAgentLabels(record.labels)
+                ) {
+                  demoted.push(other.id);
+                  await this.writeMainControlRole(other.id, false);
+                }
+              });
+            }
+          }
         }
-        return this.writeMainControlRole(agentId, enabled);
-      });
+        return await this.runLifecycleMutation(agentId, async () => {
+          if (enabled) {
+            const current = this.agents.get(agentId);
+            const record = await registry.get(agentId);
+            if (!record || record.archivedAt) throw new Error("Agent is missing or archived.");
+            if (
+              !(current?.workspaceId ?? record.workspaceId) ||
+              getParentAgentIdFromLabels(current?.labels ?? record.labels)
+            ) {
+              throw new Error("Only a workspace root agent can be Main Control.");
+            }
+          }
+          return this.writeMainControlRole(agentId, enabled);
+        });
+      } catch (error) {
+        for (const previousMain of demoted.toReversed()) {
+          await this.runLifecycleMutation(previousMain, () =>
+            this.writeMainControlRole(previousMain, true),
+          ).catch((restoreError) => {
+            this.logger.error(
+              { err: restoreError, agentId: previousMain },
+              "Failed to restore previous Main Control",
+            );
+          });
+        }
+        throw error;
+      }
     });
   }
 
@@ -3112,6 +3141,7 @@ export class AgentManager {
         }
         hierarchy.set(agentId, { ...agent, labels: record.labels });
         this.refreshHierarchyToolPolicies(hierarchy);
+        if (live) await this.refreshHierarchySessionUnlocked(agentId);
         return { record, live, previousParentAgentId, wasRunning };
       }),
     );
@@ -3157,6 +3187,7 @@ export class AgentManager {
         throw new Error(`Agent not found in storage after detach: ${agentId}`);
       }
       if (this.agents.size > 0) this.refreshHierarchyToolPolicies(await this.readHierarchyAgents());
+      await this.refreshHierarchySessionUnlocked(agentId);
       return { record, live: true, previousParentAgentId };
     }
 
@@ -3182,8 +3213,10 @@ export class AgentManager {
     agentId: string,
     options: MoveSubagentToWorkspaceOptions,
   ): Promise<MoveSubagentToWorkspaceResult> {
-    return this.runLifecycleMutation(agentId, () =>
-      this.moveSubagentToWorkspaceUnlocked(agentId, options),
+    return this.runHierarchyMutation(() =>
+      this.runLifecycleMutation(agentId, () =>
+        this.moveSubagentToWorkspaceUnlocked(agentId, options),
+      ),
     );
   }
 
@@ -3195,7 +3228,7 @@ export class AgentManager {
     const receiptKey = trimmedKey ? JSON.stringify([agentId, trimmedKey]) : null;
     if (receiptKey) {
       const receipt = this.moveToWorkspaceReceipts.get(receiptKey);
-      if (receipt) return receipt;
+      if (receipt) return { ...receipt, replayed: true };
     }
 
     const registry = this.requireRegistry();
@@ -3204,48 +3237,136 @@ export class AgentManager {
     const source = describeSubagentMoveSource(agentId, liveAgent, storedRecord);
     const { sourceWorkspaceId, previousParentAgentId } = source;
     const allocated = await options.allocateWorkspace(source);
+    const workspaceId = allocated.workspaceId?.trim();
+    const rollbackRecords: StoredAgentRecord[] = [];
+    const liveMoves: {
+      agent: LiveManagedAgent;
+      labels: Record<string, string>;
+      updatedAt: Date;
+    }[] = [];
+    const movedDescendantStoredRecords: StoredAgentRecord[] = [];
+    let releaseSnapshots!: () => void;
+    const snapshotsReleased = new Promise<void>((release) => {
+      releaseSnapshots = release;
+    });
 
-    let workspaceId: string;
+    const move = async (
+      id: string,
+      stored: StoredAgentRecord | null,
+      live: LiveManagedAgent | undefined,
+      patch: AgentLabelPatch,
+    ): Promise<StoredAgentRecord | undefined> => {
+      if (!stored && !live?.internal) throw new Error(`Agent not found in storage: ${id}`);
+      const labels = applyRecordPatch(live?.labels ?? stored!.labels, patch);
+      if (live) {
+        this.pendingSubagentMoveSnapshots.set(id, snapshotsReleased);
+        const snapshot = { ...live, workspaceId, labels };
+        const updatedAt = this.touchUpdatedAt(snapshot);
+        liveMoves.push({ agent: live, labels, updatedAt });
+        if (live.internal) return;
+        rollbackRecords.push(stored!);
+        await registry.applySnapshot(snapshot);
+      } else {
+        rollbackRecords.push(stored!);
+        await registry.upsert({
+          ...stored!,
+          workspaceId,
+          labels,
+          updatedAt: this.nextStoredUpdatedAt(stored!),
+        });
+      }
+      const record = await registry.get(id);
+      if (record?.workspaceId !== workspaceId) {
+        throw new Error(`Agent move was not persisted: ${id}`);
+      }
+      return record;
+    };
+
+    const moveSameWorkspaceDescendants = async (descendantIds: string[]) => {
+      for (const id of descendantIds) {
+        const child = this.agents.get(id);
+        const stored = await registry.get(id);
+        if (
+          stored?.archivedAt ||
+          (child?.workspaceId ?? stored?.workspaceId)?.trim() !== sourceWorkspaceId
+        )
+          continue;
+        const labels = child?.labels ?? stored!.labels;
+        const moved = await move(
+          id,
+          stored,
+          child,
+          child?.internal ? {} : clearOpenAgentTabLabelPatch(labels),
+        );
+        if (!child && moved) movedDescendantStoredRecords.push(moved);
+      }
+    };
+
     let record: StoredAgentRecord;
     try {
-      workspaceId = allocated.workspaceId?.trim();
       if (!workspaceId || workspaceId === sourceWorkspaceId) {
         throw new Error(`Move requires a different workspace: ${agentId}`);
       }
-      if (liveAgent) {
-        const labels = applyRecordPatch(
-          liveAgent.labels,
-          detachedAgentLabelPatch(liveAgent.labels),
-        );
-        record = await this.persistLiveAgentMove(registry, liveAgent, workspaceId, labels);
-      } else {
-        const stored = storedRecord!;
-        record = {
-          ...stored,
-          workspaceId,
-          labels: applyRecordPatch(stored.labels, detachedAgentLabelPatch(stored.labels)),
-          updatedAt: this.nextStoredUpdatedAt(stored),
-        };
-        await registry.upsert(record);
-        if ((await registry.get(agentId))?.workspaceId !== workspaceId) {
-          throw new Error(`Agent move was not persisted: ${agentId}`);
+      const descendantIds = await this.findSameWorkspaceDescendantIds(
+        registry,
+        agentId,
+        sourceWorkspaceId,
+      );
+      // Hold descendant lifecycle lanes through commit or rollback so their label updates
+      // cannot overwrite the staged records. Acquire ancestors before their children.
+      const withDescendantLanes = (index: number, operation: () => Promise<void>): Promise<void> =>
+        index === descendantIds.length
+          ? operation()
+          : this.runLifecycleMutation(descendantIds[index]!, () =>
+              withDescendantLanes(index + 1, operation),
+            );
+      let movedRoot: StoredAgentRecord | undefined;
+      await withDescendantLanes(0, async () => {
+        try {
+          movedRoot = await move(
+            agentId,
+            storedRecord,
+            liveAgent,
+            detachedAgentLabelPatch(liveAgent?.labels ?? storedRecord!.labels),
+          );
+          if (!movedRoot) throw new Error(`Agent move was not persisted: ${agentId}`);
+          await moveSameWorkspaceDescendants(descendantIds);
+          // Apply live fields only once all writes succeed. Provider snapshots waiting on
+          // this move will see either the fully committed fields or the original ones.
+          for (const { agent, labels, updatedAt } of liveMoves) {
+            agent.workspaceId = workspaceId;
+            agent.labels = labels;
+            if (agent.updatedAt < updatedAt) agent.updatedAt = updatedAt;
+          }
+        } catch (error) {
+          for (const stored of rollbackRecords.toReversed()) {
+            try {
+              await registry.upsert(stored);
+            } catch (rollbackError) {
+              this.logger.error(
+                { err: rollbackError, agentId: stored.id },
+                "Failed to restore agent after move",
+              );
+            }
+          }
+          throw error;
+        } finally {
+          for (const { agent } of liveMoves) this.pendingSubagentMoveSnapshots.delete(agent.id);
+          releaseSnapshots();
         }
-      }
+      });
+      record = movedRoot!;
     } catch (error) {
-      try {
-        await allocated.rollback?.();
-      } catch {
-        // Preserve the error that caused the rollback.
-      }
+      await allocated
+        .rollback?.()
+        .catch((rollbackError) =>
+          this.logger.error(
+            { err: rollbackError, workspaceId },
+            "Failed to remove allocated workspace after move",
+          ),
+        );
       throw error;
     }
-
-    const movedDescendantStoredRecords = await this.moveSameWorkspaceDescendants(
-      registry,
-      agentId,
-      sourceWorkspaceId,
-      workspaceId,
-    );
 
     const result: MoveSubagentToWorkspaceResult = {
       record,
@@ -3262,9 +3383,17 @@ export class AgentManager {
       }
       this.moveToWorkspaceReceipts.set(receiptKey, result);
     }
-    if (liveAgent) this.emitState(liveAgent, { persist: false });
-    else this.paseoToolPolicies.delete(agentId);
+    for (const { agent } of liveMoves) this.emitState(agent, { persist: false });
+    if (!liveAgent) this.paseoToolPolicies.delete(agentId);
     if (this.agents.size > 0) this.refreshHierarchyToolPolicies(await this.readHierarchyAgents());
+    if (liveAgent) await this.refreshHierarchySessionUnlocked(agentId);
+    for (const { agent } of liveMoves) {
+      if (agent.id !== agentId) {
+        await this.runLifecycleMutation(agent.id, () =>
+          this.refreshHierarchySessionUnlocked(agent.id),
+        );
+      }
+    }
     return result;
   }
 
@@ -3329,89 +3458,6 @@ export class AgentManager {
       }
     }
     return descendantIds;
-  }
-
-  private async moveSameWorkspaceDescendants(
-    registry: AgentStorage,
-    rootAgentId: string,
-    sourceWorkspaceId: string,
-    targetWorkspaceId: string,
-  ): Promise<StoredAgentRecord[]> {
-    const descendantIds = await this.findSameWorkspaceDescendantIds(
-      registry,
-      rootAgentId,
-      sourceWorkspaceId,
-    );
-    const movedDescendantStoredRecords: StoredAgentRecord[] = [];
-    for (const childId of descendantIds) {
-      await this.runLifecycleMutation(childId, async () => {
-        const liveChild = this.agents.get(childId);
-        const storedChild = await registry.get(childId);
-        if (!liveChild && !storedChild) {
-          return;
-        }
-        if (storedChild?.archivedAt) {
-          return;
-        }
-        if ((liveChild?.workspaceId ?? storedChild?.workspaceId)?.trim() !== sourceWorkspaceId) {
-          return;
-        }
-        if (liveChild) {
-          if (liveChild.internal) {
-            liveChild.workspaceId = targetWorkspaceId;
-            return;
-          }
-          const labels = applyRecordPatch(
-            liveChild.labels,
-            clearOpenAgentTabLabelPatch(liveChild.labels),
-          );
-          await this.persistLiveAgentMove(registry, liveChild, targetWorkspaceId, labels);
-          this.emitState(liveChild, { persist: false });
-          return;
-        }
-        const stored = storedChild!;
-        const updatedChild: StoredAgentRecord = {
-          ...stored,
-          workspaceId: targetWorkspaceId,
-          labels: applyRecordPatch(stored.labels, clearOpenAgentTabLabelPatch(stored.labels)),
-          updatedAt: this.nextStoredUpdatedAt(stored),
-        };
-        await registry.upsert(updatedChild);
-        const persistedChild = await registry.get(childId);
-        if (persistedChild?.workspaceId === targetWorkspaceId) {
-          movedDescendantStoredRecords.push(persistedChild);
-        }
-      });
-    }
-    return movedDescendantStoredRecords;
-  }
-
-  private async persistLiveAgentMove(
-    registry: AgentStorage,
-    agent: LiveManagedAgent,
-    workspaceId: string,
-    labels: Record<string, string>,
-  ): Promise<StoredAgentRecord> {
-    // Provider events can publish state during the write. Keep the live fields
-    // unchanged until the staged snapshot commits.
-    const snapshot = { ...agent, workspaceId, labels };
-    const updatedAt = this.touchUpdatedAt(snapshot);
-    const pending = this.persistSnapshot(snapshot).then(async () => {
-      const record = await registry.get(agent.id);
-      if (record?.workspaceId !== workspaceId) {
-        throw new Error(`Agent move was not persisted: ${agent.id}`);
-      }
-      agent.labels = labels;
-      agent.workspaceId = workspaceId;
-      if (agent.updatedAt < updatedAt) agent.updatedAt = updatedAt;
-      return record;
-    });
-    this.pendingSubagentMoveSnapshots.set(agent.id, pending);
-    try {
-      return await pending;
-    } finally {
-      this.pendingSubagentMoveSnapshots.delete(agent.id);
-    }
   }
 
   notifyAgentState(agentId: string): void {
@@ -3536,8 +3582,8 @@ export class AgentManager {
     agentId: string,
     updates?: { workspaceId?: string; labels?: AgentLabelPatch },
   ): Promise<boolean> {
-    return this.runLifecycleMutation(agentId, () =>
-      this.unarchiveSnapshotUnlocked(agentId, updates),
+    return this.runHierarchyMutation(() =>
+      this.runLifecycleMutation(agentId, () => this.unarchiveSnapshotUnlocked(agentId, updates)),
     );
   }
 
@@ -3563,6 +3609,33 @@ export class AgentManager {
       archivedAt: null,
       updatedAt: new Date().toISOString(),
     };
+    if (nextRecord.workspaceId && isMainControlAgentLabels(nextRecord.labels)) {
+      const hierarchy = await this.readHierarchyAgents();
+      const hasMain = [...hierarchy.values()].some(
+        (other) =>
+          other.id !== agentId &&
+          !other.archivedAt &&
+          other.workspaceId === nextRecord.workspaceId &&
+          isMainControlAgentLabels(other.labels),
+      );
+      if (hasMain) {
+        const modeId = this.resolveMainControlMode({
+          enabled: false,
+          provider: record.provider,
+          currentMode: record.lastModeId ?? record.config?.modeId,
+          priorMode: getMainPriorModeIdFromLabels(nextRecord.labels),
+        });
+        nextRecord.labels = applyRecordPatch(nextRecord.labels, {
+          [WORKSPACE_ROLE_LABEL]: null,
+          [MAIN_PRIOR_MODE_ID_LABEL]: null,
+        });
+        nextRecord.config = { ...record.config, modeId };
+        nextRecord.lastModeId = modeId ?? null;
+        if (record.runtimeInfo) {
+          nextRecord.runtimeInfo = { ...record.runtimeInfo, modeId: modeId ?? null };
+        }
+      }
+    }
     await registry.upsert(nextRecord);
 
     if (this.getAgent(agentId)) {
@@ -3597,6 +3670,8 @@ export class AgentManager {
       labels?: Record<string, string>;
     },
   ): Promise<void> {
+    if (hasReservedHierarchyLabels(updates.labels))
+      throw new Error(RESERVED_HIERARCHY_LABELS_ERROR);
     await this.runLifecycleMutation(agentId, () =>
       this.updateAgentMetadataUnlocked(agentId, updates),
     );
@@ -3829,9 +3904,37 @@ export class AgentManager {
     }
   }
 
+  private async refreshHierarchySessionUnlocked(
+    agentId: string,
+    beforeTurn = false,
+  ): Promise<void> {
+    const agent = this.agents.get(agentId);
+    if (!agent?.persistence || !agent.capabilities.supportsSessionPersistence) {
+      this.pendingHierarchySessionReloads.delete(agentId);
+      return;
+    }
+    if (this.hasInFlightRun(agentId) || (!beforeTurn && agent.lifecycle !== "idle")) {
+      this.pendingHierarchySessionReloads.add(agentId);
+      return;
+    }
+    this.pendingHierarchySessionReloads.delete(agentId);
+    try {
+      await this.trackAgentRegistrationOperation(this.reloadAgentSessionInternal(agentId));
+    } catch (error) {
+      this.logger.warn(
+        { err: error, agentId },
+        "Failed to refresh agent session after hierarchy change",
+      );
+    }
+  }
+
+  private needsHierarchySessionReload(agentId: string): boolean {
+    return this.pendingHierarchySessionReloads.has(agentId) && !this.hasInFlightRun(agentId);
+  }
+
   private async ensureInteractiveSession(agentId: string): Promise<ActiveManagedAgent> {
     const agent = this.requireSessionAgent(agentId);
-    if (this.historySessions.has(agent.session)) {
+    if (this.historySessions.has(agent.session) || this.needsHierarchySessionReload(agentId)) {
       await this.runLifecycleMutation(agentId, () =>
         this.ensureInteractiveSessionUnlocked(agentId),
       );
@@ -3841,6 +3944,9 @@ export class AgentManager {
 
   /** Inside the agent's lane: a history session is upgraded before anything is applied to it. */
   private async ensureInteractiveSessionUnlocked(agentId: string): Promise<ActiveManagedAgent> {
+    if (this.needsHierarchySessionReload(agentId)) {
+      await this.refreshHierarchySessionUnlocked(agentId, true);
+    }
     const agent = this.requireSessionAgent(agentId);
     if (this.historySessions.has(agent.session)) {
       const record = await this.registry?.get(agentId);
@@ -3882,7 +3988,10 @@ export class AgentManager {
     if (this.collectingRuntimes.has(agentId) || (!this.agents.has(agentId) && this.registry))
       return this.streamAfterRuntimeCollection(agentId, prompt, options);
     const existingAgent = this.requireSessionAgent(agentId);
-    if (this.historySessions.has(existingAgent.session))
+    if (
+      this.historySessions.has(existingAgent.session) ||
+      this.needsHierarchySessionReload(agentId)
+    )
       return this.streamAfterHistoryLoad(agentId, prompt, options);
     this.logger.trace(
       {
@@ -5253,6 +5362,7 @@ export class AgentManager {
   ): ManagedAgentClosed {
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     this.agents.delete(agent.id);
+    this.pendingHierarchySessionReloads.delete(agent.id);
     this.previousStatuses.delete(agent.id);
     if (agent.unsubscribeSession) {
       agent.unsubscribeSession();
@@ -6885,21 +6995,12 @@ export class AgentManager {
     const adapter = this.adapterOf(storedConfig.provider);
     const mainControl = isMainControlAgentLabels(agent.labels);
     if (mainControl && adapter === "codex") storedConfig = { ...storedConfig, modeId: "read-only" };
-    const effectiveDisallowedTools =
-      mainControl && adapter === "claude"
+    const effectiveOptions =
+      mainControl && (adapter === "claude" || adapter === "opencode")
         ? this.effectiveOptionsFor(storedConfig.provider, storedConfig.providerOptions)
-            .disallowedTools
         : undefined;
     const restrictedConfig = applyMainControlReadOnlyConfig(
-      effectiveDisallowedTools === undefined
-        ? storedConfig
-        : {
-            ...storedConfig,
-            providerOptions: {
-              ...storedConfig.providerOptions,
-              disallowedTools: effectiveDisallowedTools,
-            },
-          },
+      effectiveOptions ? { ...storedConfig, providerOptions: effectiveOptions } : storedConfig,
       agent.labels,
       adapter,
     );

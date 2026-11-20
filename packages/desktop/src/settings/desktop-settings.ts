@@ -243,19 +243,23 @@ export function createDesktopSettingsStore({
 }): DesktopSettingsStore {
   const filePath = path.join(userDataPath, DESKTOP_SETTINGS_FILENAME);
   let cachedDocument: PersistedDesktopSettingsDocument | null = null;
-  let persistQueue: Promise<void> = Promise.resolve();
+  let operationQueue: Promise<void> = Promise.resolve();
+
+  function runSerialized<T>(operation: () => Promise<T>): Promise<T> {
+    const queued = operationQueue.then(operation);
+    operationQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
+  }
 
   async function persistDocument(document: PersistedDesktopSettingsDocument): Promise<void> {
-    const write = async () => {
-      await mkdir(userDataPath, { recursive: true });
-      const tempFilePath = `${filePath}.tmp.${process.pid}.${randomUUID()}`;
-      await writeFile(tempFilePath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
-      await rename(tempFilePath, filePath);
-      cachedDocument = document;
-    };
-    const queued = persistQueue.then(write, write);
-    persistQueue = queued.catch(() => undefined);
-    await queued;
+    await mkdir(userDataPath, { recursive: true });
+    const tempFilePath = `${filePath}.tmp.${process.pid}.${randomUUID()}`;
+    await writeFile(tempFilePath, `${JSON.stringify(document, null, 2)}\n`, "utf8");
+    await rename(tempFilePath, filePath);
+    cachedDocument = document;
   }
 
   async function loadDocument(): Promise<PersistedDesktopSettingsDocument> {
@@ -290,47 +294,50 @@ export function createDesktopSettingsStore({
   }
 
   return {
-    async get(): Promise<DesktopSettings> {
-      const document = await loadDocument();
-      return toDesktopSettings(document.settings);
+    get() {
+      return runSerialized(async () => toDesktopSettings((await loadDocument()).settings));
     },
 
-    async patch(patch: unknown): Promise<DesktopSettings> {
-      const current = await loadDocument();
-      const coercedPatch = coerceDesktopSettingsPatch(patch);
-      const next = mergeDesktopSettings(current.settings, coercedPatch);
-      await persistDocument({
-        ...current,
-        settings: next,
-        migrations: {
-          ...current.migrations,
-          legacyRendererSettingsImported:
-            current.migrations.legacyRendererSettingsImported ||
-            hasLegacyRendererOwnedPatch(coercedPatch),
-        },
+    patch(patch) {
+      return runSerialized(async () => {
+        const current = await loadDocument();
+        const coercedPatch = coerceDesktopSettingsPatch(patch);
+        const next = mergeDesktopSettings(current.settings, coercedPatch);
+        await persistDocument({
+          ...current,
+          settings: next,
+          migrations: {
+            ...current.migrations,
+            legacyRendererSettingsImported:
+              current.migrations.legacyRendererSettingsImported ||
+              hasLegacyRendererOwnedPatch(coercedPatch),
+          },
+        });
+        return toDesktopSettings(next);
       });
-      return toDesktopSettings(next);
     },
 
-    async migrateLegacyRendererSettings(legacySettings: unknown): Promise<DesktopSettings> {
-      const current = await initializeLegacyRendererMigration();
-      if (current.migrations.legacyRendererSettingsImported) {
-        return toDesktopSettings(current.settings);
-      }
+    migrateLegacyRendererSettings(legacySettings) {
+      return runSerialized(async () => {
+        const current = await initializeLegacyRendererMigration();
+        if (current.migrations.legacyRendererSettingsImported) {
+          return toDesktopSettings(current.settings);
+        }
 
-      const next = mergeDesktopSettings(
-        current.settings,
-        pickDesktopSettingsFromLegacyRendererSettings(legacySettings),
-      );
-      await persistDocument({
-        ...current,
-        settings: next,
-        migrations: {
-          ...current.migrations,
-          legacyRendererSettingsImported: true,
-        },
+        const next = mergeDesktopSettings(
+          current.settings,
+          pickDesktopSettingsFromLegacyRendererSettings(legacySettings),
+        );
+        await persistDocument({
+          ...current,
+          settings: next,
+          migrations: {
+            ...current.migrations,
+            legacyRendererSettingsImported: true,
+          },
+        });
+        return toDesktopSettings(next);
       });
-      return toDesktopSettings(next);
     },
   };
 }

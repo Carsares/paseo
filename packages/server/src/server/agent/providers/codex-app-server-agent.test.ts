@@ -5791,6 +5791,56 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test("cancels running persisted descendants of a canceled child", async () => {
+    const session = createSession();
+    const activity = (id: string, kind: string, agentThreadId: string, agentPath: string) => ({
+      type: "subAgentActivity",
+      id,
+      kind,
+      agentThreadId,
+      agentPath,
+    });
+    const runningChild = (agentThreadId: string) => ({
+      type: "collabAgentToolCall",
+      id: `start-${agentThreadId}`,
+      tool: "spawnAgent",
+      status: "completed",
+      prompt: `Task for ${agentThreadId}`,
+      receiverThreadIds: [agentThreadId],
+      agentsStates: { [agentThreadId]: { status: "running", message: null } },
+    });
+    const itemsByThread: Record<string, unknown[]> = {
+      "test-thread": [
+        activity("start-child", "started", "child", "/root/child"),
+        activity("stop-child", "interrupted", "child", "/root/child"),
+      ],
+      child: [
+        runningChild("grandchild"),
+        activity("start-finished", "started", "finished", "/root/child/finished"),
+      ],
+      finished: [runningChild("descendant")],
+    };
+    session.client = {
+      request: vi.fn(async (_method: string, params: { threadId: string }) => ({
+        thread: { turns: [{ items: itemsByThread[params.threadId] ?? [] }] },
+      })),
+    };
+
+    const history = await Array.fromAsync(session.streamHistory());
+    expect(
+      history.flatMap((event) =>
+        event.type === "provider_subagent" && event.event.type === "upsert"
+          ? [[event.event.id, event.event.parentSubagentId, event.event.status]]
+          : [],
+      ),
+    ).toEqual([
+      ["child", null, "canceled"],
+      ["grandchild", "child", "canceled"],
+      ["finished", "child", "completed"],
+      ["descendant", "finished", "canceled"],
+    ]);
+  });
+
   test("coalesces persisted MultiAgentV2 activity for one child into one terminal card", async () => {
     const session = createSession();
     session.client = {
@@ -8694,6 +8744,52 @@ describe("legacy empty additions", () => {
 });
 
 describe("Codex failed reply retraction", () => {
+  test("retracts the unfinished root reply before reporting app-server exit", async () => {
+    const { appServer, session, terminalEvent } = await startStatusNoticeTurnTest();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    try {
+      appServer.says({ threadId: "thread-1", itemId: "finished", text: "Completed progress" });
+      appServer.child.stdout.write(
+        `${JSON.stringify({
+          method: "item/agentMessage/delta",
+          params: { threadId: "thread-1", itemId: "pending", delta: "Incomplete answer" },
+        })}\n`,
+      );
+      appServer.disconnect();
+      const failure = await terminalEvent;
+      expect(failure).toMatchObject({
+        type: "turn_failed",
+        error: expect.stringContaining("exited"),
+      });
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: {
+            type: "assistant_message",
+            messageId: "pending",
+            text: expect.stringContaining("Incomplete answer"),
+          },
+        }),
+      );
+      expect(
+        events.filter(
+          (event) => event.type === "assistant_messages_removed" || event.type === "turn_failed",
+        ),
+      ).toEqual([
+        {
+          type: "assistant_messages_removed",
+          provider: "codex",
+          turnId: failure.turnId,
+          messageIds: ["pending"],
+        },
+        failure,
+      ]);
+    } finally {
+      await session.close();
+    }
+  });
+
   test.each(["delta", "started", "divergent"])(
     "run returns corrected text and history after %s replacement",
     async (replacement) => {

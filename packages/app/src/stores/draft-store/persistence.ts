@@ -52,6 +52,7 @@ export function createDraftPersistStorage<T>(
   }
 
   let pending: { name: string; value: Parameters<typeof storage.setItem>[1] } | null = null;
+  let inFlight: Promise<void> | null = null;
   let timer: unknown = null;
   let lastWriteAt = -Infinity;
 
@@ -61,18 +62,46 @@ export function createDraftPersistStorage<T>(
       timer = null;
     }
   };
-  const flush = async (): Promise<void> => {
-    cancelTimer();
+  const warnWriteFailure = (error: unknown) => {
+    console.warn("[DraftStore] Failed to persist draft checkpoint", error);
+  };
+  const writePending = (): Promise<void> | undefined => {
     const write = pending;
+    if (!write) return;
     pending = null;
-    if (!write) {
-      return;
-    }
     lastWriteAt = scheduler.now();
     try {
-      await storage.setItem(write.name, write.value);
+      const result = storage.setItem(write.name, write.value);
+      if (typeof (result as PromiseLike<unknown> | undefined)?.then === "function") {
+        inFlight = Promise.resolve(result)
+          .then(() => undefined, warnWriteFailure)
+          .finally(() => {
+            inFlight = null;
+            scheduleWrite();
+          });
+        return inFlight;
+      }
     } catch (error) {
-      console.warn("[DraftStore] Failed to persist draft checkpoint", error);
+      warnWriteFailure(error);
+    }
+  };
+  const scheduleWrite = () => {
+    if (inFlight || !pending) return;
+    const delay = DRAFT_PERSIST_INTERVAL_MS - (scheduler.now() - lastWriteAt);
+    if (delay <= 0) {
+      cancelTimer();
+      return writePending();
+    }
+    timer ??= scheduler.schedule(() => {
+      timer = null;
+      void writePending();
+    }, delay);
+  };
+  const flush = async (): Promise<void> => {
+    for (;;) {
+      if (!pending && !inFlight) return;
+      cancelTimer();
+      await (inFlight ?? writePending());
     }
   };
 
@@ -80,13 +109,7 @@ export function createDraftPersistStorage<T>(
     getItem: (name) => storage.getItem(name),
     setItem: (name, value) => {
       pending = { name, value };
-      const delay = DRAFT_PERSIST_INTERVAL_MS - (scheduler.now() - lastWriteAt);
-      if (delay <= 0) {
-        return flush();
-      }
-      timer ??= scheduler.schedule(() => {
-        void flush();
-      }, delay);
+      return scheduleWrite();
     },
     removeItem: (name) => {
       cancelTimer();

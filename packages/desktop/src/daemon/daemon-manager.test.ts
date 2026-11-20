@@ -421,42 +421,63 @@ describe("desktop stops and terminals", () => {
     ]);
   });
 
-  it("keeps terminals on an app update when the daemon cannot resume agents", async () => {
-    const runCliJson = vi
-      .fn()
-      .mockRejectedValueOnce(
-        new ExternalCliCommandError("refused", {
-          code: "AGENT_RESUME_ON_STOP_UNSUPPORTED",
-          version: "0.16.0",
-        }),
-      )
-      .mockResolvedValueOnce({ action: "shutdown_requested" });
+  it("rejects a preserve-work quit without retrying when the daemon cannot resume agents", async () => {
+    const error = new ExternalCliCommandError("refused", {
+      code: "AGENT_RESUME_ON_STOP_UNSUPPORTED",
+    });
+    const runCliJson = vi.fn().mockRejectedValue(error);
     const harness = stopHarness(runCliJson);
 
-    await stopCapturedDaemon({
-      ...harness.input,
-      reason: "app_update",
-      keepTerminals: true,
-      resumeAgents: true,
-    });
-
-    expect(harness.stops).toEqual([
-      { keepTerminals: true, resumeAgents: true },
-      { keepTerminals: true },
-    ]);
-    expect(runCliJson).toHaveBeenCalledTimes(2);
-    expect(runCliJson).toHaveBeenLastCalledWith([
-      "daemon",
-      "stop",
-      "--host",
-      "127.0.0.1:6799",
-      "--keep-terminals",
-      "--json",
-    ]);
-    expect(harness.logged).toEqual([
-      "daemon v0.16.0 cannot resume agents on stop; stopping without agent resume",
-    ]);
+    await expect(
+      stopCapturedDaemon({
+        ...harness.input,
+        reason: "quit_preserve_work",
+        keepTerminals: false,
+        resumeAgents: true,
+      }),
+    ).rejects.toBe(error);
+    expect(harness.stops).toEqual([{ keepTerminals: false, resumeAgents: true }]);
   });
+
+  it.each(["app_update", "version_mismatch"] as const)(
+    "keeps terminals on %s when the daemon cannot resume agents",
+    async (reason) => {
+      const runCliJson = vi
+        .fn()
+        .mockRejectedValueOnce(
+          new ExternalCliCommandError("refused", {
+            code: "AGENT_RESUME_ON_STOP_UNSUPPORTED",
+            version: "0.16.0",
+          }),
+        )
+        .mockResolvedValueOnce({ action: "shutdown_requested" });
+      const harness = stopHarness(runCliJson);
+
+      await stopCapturedDaemon({
+        ...harness.input,
+        reason,
+        keepTerminals: true,
+        resumeAgents: true,
+      });
+
+      expect(harness.stops).toEqual([
+        { keepTerminals: true, resumeAgents: true },
+        { keepTerminals: true },
+      ]);
+      expect(runCliJson).toHaveBeenCalledTimes(2);
+      expect(runCliJson).toHaveBeenLastCalledWith([
+        "daemon",
+        "stop",
+        "--host",
+        "127.0.0.1:6799",
+        "--keep-terminals",
+        "--json",
+      ]);
+      expect(harness.logged).toEqual([
+        "daemon v0.16.0 cannot resume agents on stop; stopping without agent resume",
+      ]);
+    },
+  );
 
   it("drops unsupported terminal preservation before retrying agent resume", async () => {
     const runCliJson = vi

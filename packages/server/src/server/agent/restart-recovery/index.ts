@@ -1,4 +1,6 @@
-import { rm, stat } from "node:fs/promises";
+// oxlint-disable-next-line paseo/no-sync-io -- Consume the startup marker before dispatching any recovery.
+import { rmSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { writeFileAtomic } from "../../atomic-file.js";
 import type { AgentStorage, StoredAgentRecord } from "../agent-storage.js";
 interface Dependencies {
@@ -14,7 +16,7 @@ export function createRestartRecovery(deps: Dependencies) {
   const resuming = new Map<string, { promise: Promise<void>; resolve(): void; forced: boolean }>();
   const eligible = async (record: StoredAgentRecord) =>
     !record.archivedAt && !record.internal && !record.owner && (await deps.eligible(record));
-  async function consumeOneShotMarker(): Promise<boolean> {
+  async function hasOneShotMarker(): Promise<boolean> {
     const markerPath = deps.oneShotMarkerPath;
     if (!markerPath) return false;
     try {
@@ -23,7 +25,6 @@ export function createRestartRecovery(deps: Dependencies) {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
       throw error;
     }
-    await rm(markerPath, { force: true });
     return true;
   }
   async function resume(agentId: string, forced: boolean) {
@@ -36,7 +37,7 @@ export function createRestartRecovery(deps: Dependencies) {
   return {
     /** Choose candidates before anything else reads or repairs persisted running status. */
     async prepareStartup() {
-      const forcedOnce = await consumeOneShotMarker();
+      const forcedOnce = await hasOneShotMarker();
       // Startup recovery repairs persisted running status once before agents are restored.
       for (const record of await deps.storage.listAll()) {
         const forced = forcedOnce && record.resumeOnStartup === true;
@@ -65,17 +66,19 @@ export function createRestartRecovery(deps: Dependencies) {
       const force = options?.force === true;
       const shouldResume = force || deps.settings().enabled;
       await deps.storage.flush();
-      if (force && deps.oneShotMarkerPath) {
-        await writeFileAtomic(deps.oneShotMarkerPath, JSON.stringify({ version: 1 }));
-      }
       // Shutdown recovery captures running state once before the daemon exits.
       for (const record of await deps.storage.listAll()) {
         if (record.lastStatus === "running" && (await eligible(record)))
           await deps.storage.upsert({ ...record, resumeOnStartup: shouldResume });
       }
+      await deps.storage.flush();
+      if (force && deps.oneShotMarkerPath) {
+        await writeFileAtomic(deps.oneShotMarkerPath, JSON.stringify({ version: 1 }));
+      }
     },
     /** Resume every candidate in the background; a slow provider holds back only its agent. */
     resumePending() {
+      if (deps.oneShotMarkerPath) rmSync(deps.oneShotMarkerPath, { force: true });
       for (const [agentId, settled] of resuming) {
         void resume(agentId, settled.forced)
           .catch((error) => deps.report(agentId, error))

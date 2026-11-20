@@ -179,9 +179,11 @@ function parseForkSummaryHeader(content: string): UserMessageForkContext {
   const headerEnd = content.indexOf("\n\n");
   const header = headerEnd < 0 ? content : content.slice(0, headerEnd);
   const sourceAgentId = /^Source agent ID: (.+)$/m.exec(header)?.[1]?.trim();
+  const sourceServerId = /^Source server ID: (.+)$/m.exec(header)?.[1]?.trim();
   const boundaryMessageId = /^Source boundary message ID: (.+)$/m.exec(header)?.[1]?.trim();
   return {
     ...(sourceAgentId ? { sourceAgentId } : {}),
+    ...(sourceServerId ? { sourceServerId } : {}),
     ...(boundaryMessageId ? { boundaryMessageId } : {}),
   };
 }
@@ -202,15 +204,7 @@ export function extractForkContextFromSummaryText(text: string): {
   ) {
     const closeIndex = remaining.indexOf(FORK_SUMMARY_CLOSE, FORK_SUMMARY_PREFIX.length);
     if (closeIndex < 0) break;
-    const parsed = parseForkSummaryHeader(remaining.slice(FORK_SUMMARY_PREFIX.length, closeIndex));
-    forkContext = {
-      ...(forkContext?.sourceAgentId || parsed.sourceAgentId
-        ? { sourceAgentId: forkContext?.sourceAgentId ?? parsed.sourceAgentId }
-        : {}),
-      ...(forkContext?.boundaryMessageId || parsed.boundaryMessageId
-        ? { boundaryMessageId: forkContext?.boundaryMessageId ?? parsed.boundaryMessageId }
-        : {}),
-    };
+    forkContext ??= parseForkSummaryHeader(remaining.slice(FORK_SUMMARY_PREFIX.length, closeIndex));
     let afterBlock = closeIndex + FORK_SUMMARY_CLOSE.length;
     while (afterBlock < remaining.length) {
       if (remaining[afterBlock] === "\n") {
@@ -241,10 +235,12 @@ export function extractSubmittedPromptForkContext(
   if (!block || block.type !== "text" || !("mimeType" in block)) return undefined;
   const fromText = extractForkContextFromSummaryText(block.text).forkContext;
   const sourceAgentId = block.forkContext?.sourceAgentId?.trim() || fromText?.sourceAgentId;
+  const sourceServerId = block.forkContext?.sourceServerId?.trim() || fromText?.sourceServerId;
   const boundaryMessageId =
     block.forkContext?.boundaryMessageId?.trim() || fromText?.boundaryMessageId;
   return {
     ...(sourceAgentId ? { sourceAgentId } : {}),
+    ...(sourceServerId ? { sourceServerId } : {}),
     ...(boundaryMessageId ? { boundaryMessageId } : {}),
   };
 }
@@ -260,11 +256,17 @@ function withExtractedForkContext(
           ...(extracted.forkContext?.sourceAgentId
             ? { sourceAgentId: extracted.forkContext.sourceAgentId }
             : {}),
+          ...(extracted.forkContext?.sourceServerId
+            ? { sourceServerId: extracted.forkContext.sourceServerId }
+            : {}),
           ...(extracted.forkContext?.boundaryMessageId
             ? { boundaryMessageId: extracted.forkContext.boundaryMessageId }
             : {}),
           ...(item.forkContext?.sourceAgentId
             ? { sourceAgentId: item.forkContext.sourceAgentId }
+            : {}),
+          ...(item.forkContext?.sourceServerId
+            ? { sourceServerId: item.forkContext.sourceServerId }
             : {}),
           ...(item.forkContext?.boundaryMessageId
             ? { boundaryMessageId: item.forkContext.boundaryMessageId }

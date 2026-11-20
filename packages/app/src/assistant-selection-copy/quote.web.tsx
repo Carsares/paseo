@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/context-menu";
 import { FloatingSurface, type FloatingSurfaceProps } from "@/components/ui/floating";
 import { EditingTextInput, type EditingTextInputHandle } from "@/components/ui/text-input";
+import { isWeb } from "@/constants/platform";
 import { resolveKeyboardFocusScope } from "@/keyboard/focus-scope";
 import { getOverlayRoot, OverlayLayerProvider, useOverlayLayer } from "@/lib/overlay-root";
 import { useOverlayRegistration, type KeyboardInputEvent } from "@/keyboard";
@@ -44,9 +45,10 @@ import {
 } from "./content.web";
 import type { ComposerQuote } from "./composer-quote";
 
-type QuoteState = { phase: "idle" } | { phase: "offered" | "noting"; range: Range; quote: string };
+type QuoteState = { phase: "idle" } | ({ phase: "offered" | "noting" } & SelectionPassage);
 interface SelectionPassage {
   range: Range;
+  endpoints: readonly [Node, Node];
   quote: string;
 }
 
@@ -69,6 +71,7 @@ interface AssistantSelectionQuoteProps {
 }
 
 export function AssistantSelectionQuote(props: AssistantSelectionQuoteProps) {
+  if (!isWeb) return null;
   return (
     <ContextMenu compactMode="popover">
       <SelectionActions {...props} />
@@ -111,6 +114,10 @@ function SelectionActions({
   }, [menuOpen]);
 
   useEffect(() => {
+    if (!onQuote && stateRef.current.phase === "noting") update(IDLE);
+  }, [onQuote, update]);
+
+  useEffect(() => {
     let pointerDown = false;
     let frame = 0;
 
@@ -143,11 +150,13 @@ function SelectionActions({
     document.addEventListener("selectionchange", handleSelectionChange);
     document.addEventListener("pointerdown", handlePointerDown, true);
     document.addEventListener("pointerup", handlePointerUp, true);
+    document.addEventListener("pointercancel", handlePointerUp, true);
     return () => {
       window.cancelAnimationFrame(frame);
       document.removeEventListener("selectionchange", handleSelectionChange);
       document.removeEventListener("pointerdown", handlePointerDown, true);
       document.removeEventListener("pointerup", handlePointerUp, true);
+      document.removeEventListener("pointercancel", handlePointerUp, true);
     };
   }, [streamRef, update]);
 
@@ -197,10 +206,10 @@ function SelectionActions({
     onSpawnSubagentFromSelection?.(menuSelection.quote);
   }, [dismiss, menuSelection, onSpawnSubagentFromSelection]);
   const quoteFromMenu = useCallback(() => {
-    if (menuSelection) {
-      update({ phase: "noting", range: menuSelection.range, quote: menuSelection.quote });
-    }
-  }, [menuSelection, update]);
+    if (!onQuote || !menuSelection) return;
+    const { range, endpoints, quote } = menuSelection;
+    update({ phase: "noting", range, endpoints, quote });
+  }, [menuSelection, onQuote, update]);
   const copyFromMenu = useCallback(() => {
     if (!menuSelection) return;
     dismiss();
@@ -214,13 +223,13 @@ function SelectionActions({
   }, [dismiss, onSpawnSubagentFromSelection]);
   const openNote = useCallback(() => {
     const current = stateRef.current;
-    if (current.phase === "offered") update({ ...current, phase: "noting" });
-  }, [update]);
+    if (onQuote && current.phase === "offered") update({ ...current, phase: "noting" });
+  }, [onQuote, update]);
   const submitNote = useCallback(
     (note: string) => {
       const current = stateRef.current;
-      if (current.phase !== "noting") return;
-      onQuote?.({ quote: current.quote, note });
+      if (current.phase !== "noting" || !onQuote) return;
+      onQuote({ quote: current.quote, note });
       update(IDLE);
     },
     [onQuote, update],
@@ -267,10 +276,11 @@ function SelectionActions({
       </ContextMenuContent>
     );
   }
-  if (state.phase === "offered") {
+  if (state.phase === "offered" && (onQuote || onSpawnSubagentFromSelection)) {
     return (
       <QuoteButton
-        range={state.range}
+        passage={state}
+        streamRef={streamRef}
         floatingRef={floatingRef}
         onPress={onQuote ? openNote : undefined}
         spawnLabel={spawnLabel}
@@ -279,10 +289,11 @@ function SelectionActions({
       />
     );
   }
-  if (state.phase === "noting") {
+  if (state.phase === "noting" && onQuote) {
     return (
       <QuoteNoteBox
-        range={state.range}
+        passage={state}
+        streamRef={streamRef}
         floatingRef={floatingRef}
         onSubmit={submitNote}
         onCancel={cancelNote}
@@ -300,7 +311,9 @@ function readSelectionPassage(
   const range = selection.getRangeAt(0);
   if (!stream.contains(range.commonAncestorContainer)) return null;
   const quote = createAssistantSelectionMarkdown(selection);
-  return quote ? { range: range.cloneRange(), quote } : null;
+  // A live Range can retarget to a connected parent when virtualization removes its text.
+  const endpoints = [range.startContainer, range.endContainer] as const;
+  return quote ? { range: range.cloneRange(), endpoints, quote } : null;
 }
 
 function eventTargetElement(target: EventTarget | null): Element | null {
@@ -353,14 +366,16 @@ async function writeSelectionClipboard(clipboard: MarkdownClipboardContent): Pro
 }
 
 function QuoteButton({
-  range,
+  passage,
+  streamRef,
   floatingRef,
   onPress,
   spawnLabel,
   onSpawnSubagent,
   onDismiss,
 }: {
-  range: Range;
+  passage: SelectionPassage;
+  streamRef: AssistantSelectionQuoteProps["streamRef"];
   floatingRef: RefObject<HTMLElement | null>;
   onPress?: () => void;
   spawnLabel: string;
@@ -369,6 +384,7 @@ function QuoteButton({
 }) {
   const { t } = useTranslation();
   const layer = useOverlayLayer("floating");
+  const anchor = useRangeEndRect(passage, streamRef);
   const handleKeyDown = useCallback(
     (event: KeyboardInputEvent) => {
       if (event.key === "Escape") {
@@ -388,7 +404,7 @@ function QuoteButton({
   );
   const setOverlayScope = useOverlayRegistration({
     keys: ["Escape", "Enter"],
-    active: true,
+    active: anchor !== null,
     layer,
     onKeyDown: handleKeyDown,
     manageFocus: false,
@@ -408,7 +424,7 @@ function QuoteButton({
 
   return (
     <AnchoredSurface
-      range={range}
+      anchor={anchor}
       alignment="end"
       layer={layer}
       entering={FADE_IN}
@@ -436,18 +452,22 @@ function QuoteButton({
 }
 
 function QuoteNoteBox({
-  range,
+  passage,
+  streamRef,
   floatingRef,
   onSubmit,
   onCancel,
 }: {
-  range: Range;
+  passage: SelectionPassage;
+  streamRef: AssistantSelectionQuoteProps["streamRef"];
   floatingRef: RefObject<HTMLElement | null>;
   onSubmit: (note: string) => void;
   onCancel: () => void;
 }) {
   const { t } = useTranslation();
   const layer = useOverlayLayer("floating");
+  const anchor = useRangeEndRect(passage, streamRef);
+  const visible = anchor !== null;
   const inputRef = useRef<EditingTextInputHandle | null>(null);
   const noteRef = useRef("");
   const handleChangeText = useCallback((text: string) => {
@@ -487,7 +507,7 @@ function QuoteNoteBox({
   // closes, and Enter moves it to the composer.
   const setOverlayScope = useOverlayRegistration({
     keys: ["Escape", "Enter"],
-    active: true,
+    active: visible,
     layer,
     onKeyDown: handleKeyDown,
     manageFocus: false,
@@ -502,17 +522,18 @@ function QuoteNoteBox({
   );
 
   useEffect(() => {
+    if (!visible) return;
     const element = inputRef.current?.getNativeRef();
     if (!(element instanceof HTMLElement)) return;
     // The box mounts off-screen until it is measured; scrolling to it would move the chat.
     element.focus({ preventScroll: true });
-  }, []);
+  }, [visible]);
 
   // No fade-in: Reanimated hides an entering view until its animation starts, and a
   // hidden input cannot take focus.
   return (
     <AnchoredSurface
-      range={range}
+      anchor={anchor}
       alignment="start"
       layer={layer}
       style={styles.noteSurface}
@@ -521,6 +542,7 @@ function QuoteNoteBox({
     >
       <EditingTextInput
         ref={inputRef}
+        initialValue={noteRef.current}
         multiline
         accessibilityLabel={t("agentStream.quote.noteLabel")}
         placeholder={t("agentStream.quote.notePlaceholder")}
@@ -535,7 +557,7 @@ function QuoteNoteBox({
 }
 
 function AnchoredSurface({
-  range,
+  anchor,
   alignment,
   layer,
   entering,
@@ -544,7 +566,7 @@ function AnchoredSurface({
   testID,
   children,
 }: {
-  range: Range;
+  anchor: Rect | null;
   alignment: Alignment;
   layer: number;
   entering?: FloatingSurfaceProps["entering"];
@@ -554,7 +576,6 @@ function AnchoredSurface({
   testID: string;
   children: ReactNode;
 }) {
-  const anchor = useRangeEndRect(range);
   const [size, setSize] = useState<Size | null>(null);
   const handleLayout = useCallback((event: LayoutChangeEvent) => {
     const { width, height } = event.nativeEvent.layout;
@@ -576,6 +597,7 @@ function AnchoredSurface({
   const surfaceStyle = useMemo(() => [styles.surface, style], [style]);
   const overlayStyle = useMemo(() => [styles.portalOverlay, { zIndex: layer }], [layer]);
 
+  if (!anchor) return null;
   return createPortal(
     <OverlayLayerProvider layer={layer}>
       <View pointerEvents="box-none" style={overlayStyle}>
@@ -597,17 +619,20 @@ function AnchoredSurface({
 }
 
 /**
- * The last line box of the range, followed through scrolling. A range whose text the
- * stream re-rendered away has no box left, so the surface stays where it last was.
+ * Follow the last visible line through scrolling and transcript layout changes.
  */
-function useRangeEndRect(range: Range): Rect | null {
-  const [rect, setRect] = useState<Rect | null>(() => rangeEndRect(range));
+function useRangeEndRect(
+  passage: SelectionPassage,
+  streamRef: AssistantSelectionQuoteProps["streamRef"],
+): Rect | null {
+  const [rect, setRect] = useState<Rect | null>(() => rangeEndRect(passage, streamRef.current));
   useEffect(() => {
+    const stream = streamRef.current;
+    if (!isWeb || !stream) return;
     let frame = 0;
     const measure = () => {
       frame = 0;
-      const next = rangeEndRect(range);
-      if (next) setRect(next);
+      setRect(rangeEndRect(passage, streamRef.current));
     };
     const scheduleMeasure = () => {
       if (!frame) frame = window.requestAnimationFrame(measure);
@@ -615,17 +640,49 @@ function useRangeEndRect(range: Range): Rect | null {
     measure();
     document.addEventListener("scroll", scheduleMeasure, true);
     window.addEventListener("resize", scheduleMeasure);
+    const viewport = selectionViewport(stream, passage.endpoints[0]);
+    const resize =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scheduleMeasure);
+    resize?.observe(viewport);
+    if (viewport.firstElementChild) resize?.observe(viewport.firstElementChild);
+    const mutations = new MutationObserver(scheduleMeasure);
+    mutations.observe(stream, { childList: true, subtree: true, characterData: true });
     return () => {
       window.cancelAnimationFrame(frame);
       document.removeEventListener("scroll", scheduleMeasure, true);
       window.removeEventListener("resize", scheduleMeasure);
+      resize?.disconnect();
+      mutations.disconnect();
     };
-  }, [range]);
+  }, [passage, streamRef]);
   return rect;
 }
 
-function rangeEndRect(range: Range): Rect | null {
-  const last = Array.from(range.getClientRects()).findLast((box) => box.width > 0);
+function selectionViewport(stream: HTMLElement, start: Node): HTMLElement {
+  // The selection wrapper uses display: contents; its descendant owns scrolling.
+  return (
+    eventTargetElement(start)?.closest<HTMLElement>('[data-testid="agent-chat-scroll"]') ?? stream
+  );
+}
+
+function rangeEndRect(
+  { range, endpoints }: SelectionPassage,
+  stream: HTMLElement | null,
+): Rect | null {
+  if (
+    !isWeb ||
+    !stream ||
+    !range.startContainer.isConnected ||
+    !range.endContainer.isConnected ||
+    endpoints.some((node) => !node.isConnected || !stream.contains(node))
+  ) {
+    return null;
+  }
+  const viewport = selectionViewport(stream, endpoints[0]);
+  const bounds = viewport.getClientRects()[0] ?? { top: 0, bottom: window.innerHeight };
+  const last = Array.from(range.getClientRects()).findLast(
+    (box) => box.width > 0 && box.top < bounds.bottom && box.top + box.height > bounds.top,
+  );
   return last ? { x: last.left, y: last.top, width: last.width, height: last.height } : null;
 }
 

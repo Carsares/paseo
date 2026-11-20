@@ -27,7 +27,12 @@ import {
   assertPullRequestAutoMergeDisableReady,
   assertPullRequestAutoMergeEnableReady,
 } from "../services/github-service.js";
-import { getOpenAgentTabLabel, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  getOpenAgentTabLabel,
+  PARENT_AGENT_ID_LABEL,
+  PARENT_SERVER_ID_LABEL,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
 import {
@@ -47,6 +52,8 @@ import { DownloadTokenStore } from "./file-download/token-store.js";
 import { StructuredAgentFallbackError } from "./agent/agent-response-loop.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent/agent-storage.js";
 import { AgentManager, type AgentManagerEvent } from "./agent/agent-manager.js";
+import { parseAgentMessage } from "./agent/agent-messages/index.js";
+import { REMOTE_HIERARCHY_DEPTH_LABEL } from "./agent/hierarchy-policy.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
 import {
@@ -413,18 +420,24 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     downloadTokenStore: options.downloadTokenStore ?? asDownloadTokenStore(),
     pushNotifications: options.pushNotifications ?? asPushNotifications(),
     paseoHome: options.paseoHome ?? "/tmp/paseo-home",
-    agentManager: asAgentManager({
-      listAgents: vi.fn(() => []),
-      listProviderSubagentActivity: vi.fn(() => []),
-      getAgentBackgroundWorkSummary: () => undefined,
-      subscribe: vi.fn(() => () => {}),
-      ...options.agentManager,
-    }),
-    agentStorage: asAgentStorage({
-      get: vi.fn().mockResolvedValue(undefined),
-      list: vi.fn().mockResolvedValue([]),
-      ...options.agentStorage,
-    }),
+    agentManager:
+      options.agentManager instanceof AgentManager
+        ? options.agentManager
+        : asAgentManager({
+            listAgents: vi.fn(() => []),
+            listProviderSubagentActivity: vi.fn(() => []),
+            getAgentBackgroundWorkSummary: () => undefined,
+            subscribe: vi.fn(() => () => {}),
+            ...options.agentManager,
+          }),
+    agentStorage:
+      options.agentStorage instanceof AgentStorage
+        ? options.agentStorage
+        : asAgentStorage({
+            get: vi.fn().mockResolvedValue(undefined),
+            list: vi.fn().mockResolvedValue([]),
+            ...options.agentStorage,
+          }),
     projectRegistry: {
       list: vi.fn().mockResolvedValue([]),
       get: vi.fn(),
@@ -1000,6 +1013,46 @@ describe("session authorization permissions", () => {
         },
       },
     ]);
+  });
+
+  test.each(["workspace.write", "workspace.manage"] as const)(
+    "refuses a move with only %s before looking up the agent",
+    async (permission) => {
+      const messages: SessionOutboundMessage[] = [];
+      const getAgent = vi.fn();
+      const session = createSessionForTest({
+        permissions: [permission],
+        messages,
+        agentManager: { getAgent },
+      });
+      await session.handleMessage({
+        type: "agent.move_to_workspace.request",
+        requestId: "restricted-move",
+        agentId: "11111111-1111-4111-8111-111111111111",
+      });
+      expect(findByType(messages, "rpc_error")?.payload).toMatchObject({
+        requestId: "restricted-move",
+        code: "access_denied",
+      });
+      expect(getAgent).not.toHaveBeenCalled();
+    },
+  );
+
+  test("rejects reserved hierarchy labels before applying any agent metadata", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const updateAgentMetadata = vi.fn();
+    const session = createSessionForTest({ messages, agentManager: { updateAgentMetadata } });
+    await session.handleMessage({
+      type: "update_agent_request",
+      requestId: "hierarchy-label",
+      agentId: "11111111-1111-4111-8111-111111111111",
+      name: "Do not rename",
+      labels: { [WORKSPACE_ROLE_LABEL]: "main" },
+    });
+    expect(findByType(messages, "update_agent_response")?.payload).toMatchObject({
+      accepted: false,
+    });
+    expect(updateAgentMetadata).not.toHaveBeenCalled();
   });
 });
 
@@ -1808,6 +1861,90 @@ describe("agent detach RPC", () => {
   });
 });
 
+test("creation preserves the human first prompt while assigning validated local parentage", async () => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "paseo-session-create-source-")));
+  const logger = pino({ level: "silent" });
+  const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const onStartTurn = vi.fn();
+  const manager = new AgentManager({
+    clients: { codex: createTestAgentClient("codex", { onStartTurn }) },
+    registry: storage,
+    logger,
+  });
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "source-workspace",
+    projectId: "project",
+    cwd,
+    kind: "directory",
+    displayName: "Source workspace",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  });
+  const messages: SessionOutboundMessage[] = [];
+  const session = createSessionForTest({
+    messages,
+    paseoHome: cwd,
+    serverId: "local-host",
+    agentManager: manager,
+    agentStorage: storage,
+    workspaceRegistry: { get: vi.fn().mockResolvedValue(workspace) },
+  });
+  try {
+    const config = { provider: "codex", cwd } as const;
+    const parent = await manager.createAgent(config, undefined, {
+      workspaceId: workspace.workspaceId,
+    });
+    const suppliedLabels = {
+      [PARENT_AGENT_ID_LABEL]: "forged",
+      [PARENT_SERVER_ID_LABEL]: "other-host",
+      [WORKSPACE_ROLE_LABEL]: "main",
+      [REMOTE_HIERARCHY_DEPTH_LABEL]: "2",
+      [getOpenAgentTabLabel("client")]: "true",
+    };
+    await session.handleMessage({
+      type: "create_agent_request",
+      config,
+      callerAgentId: parent.id,
+      initialPrompt: "Written by the user",
+      initialPromptOrigin: "user",
+      labels: suppliedLabels,
+      requestId: "create-human",
+    });
+    const human = findByType(messages, "status")?.payload;
+    expect(human).toMatchObject({ status: "agent_created" });
+    expect(onStartTurn).toHaveBeenCalledExactlyOnceWith("Written by the user", expect.anything());
+    expect(await storage.get(human!.agentId!)).toMatchObject({
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: parent.id,
+        [PARENT_SERVER_ID_LABEL]: "local-host",
+        [getOpenAgentTabLabel("client")]: "true",
+      },
+    });
+    expect((await storage.get(human!.agentId!))?.labels).not.toHaveProperty(WORKSPACE_ROLE_LABEL);
+    expect((await storage.get(human!.agentId!))?.labels).not.toHaveProperty(
+      REMOTE_HIERARCHY_DEPTH_LABEL,
+    );
+
+    await session.handleMessage({
+      type: "create_agent_request",
+      config,
+      callerAgentId: parent.id,
+      initialPrompt: "Delegated by the parent",
+      labels: {},
+      requestId: "create-delegated",
+    });
+    expect(parseAgentMessage(onStartTurn.mock.lastCall?.[0])).toMatchObject({
+      source: { kind: "agent-message", agentId: parent.id },
+      text: "Delegated by the parent",
+    });
+  } finally {
+    await session.cleanup();
+    await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+    await manager.flush();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 describe("agent move to workspace RPC", () => {
   const sourceWorkspaceId = "source-workspace";
   const parentId = "parent-agent";
@@ -1865,6 +2002,7 @@ describe("agent move to workspace RPC", () => {
         lastUserMessageAt,
         labels: {
           [PARENT_AGENT_ID_LABEL]: parentId,
+          [PARENT_SERVER_ID_LABEL]: "local-host",
           [getOpenAgentTabLabel("client-a")]: "true",
           [getOpenAgentTabLabel("client-b")]: "true",
           topic: "review",
@@ -1874,6 +2012,7 @@ describe("agent move to workspace RPC", () => {
     const messages: SessionOutboundMessage[] = [];
     const workspaceRegistry = {
       get: vi.fn(registry.get.bind(registry)),
+      listAll: vi.fn(registry.listAll.bind(registry)),
       listActive: registry.listActive.bind(registry),
       upsert: registry.upsert.bind(registry),
       archive: registry.archive.bind(registry),
@@ -1987,13 +2126,27 @@ describe("agent move to workspace RPC", () => {
 
   test("replaying an idempotency key returns the original workspace", async () => {
     const { session, messages, registry } = await setup();
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId: "subscribe-agents",
+      subscribe: { subscriptionId: "agents-sub" },
+    });
+    await session.handleMessage({
+      type: "fetch_workspaces_request",
+      requestId: "subscribe-workspaces",
+      subscribe: { subscriptionId: "workspaces-sub" },
+    });
     const request = {
       type: "agent.move_to_workspace.request" as const,
       agentId: childId,
       idempotencyKey: "move-key",
     };
     await session.handleMessage({ ...request, requestId: "move-1" });
+    const beforeReplay = messages.length;
     await session.handleMessage({ ...request, requestId: "move-2" });
+    expect(messages.slice(beforeReplay).map(({ type }) => type)).toEqual([
+      "agent.move_to_workspace.response",
+    ]);
 
     const workspaces = await registry.listActive();
     expect(workspaces).toHaveLength(2);
@@ -2021,8 +2174,11 @@ describe("agent move to workspace RPC", () => {
       requestId: "subscribe-agents",
       subscribe: { subscriptionId: "agents-sub" },
     });
+    let destinationReads = 0;
     workspaceRegistry.get.mockImplementation(async (workspaceId) => {
-      if (workspaceId !== sourceWorkspaceId) throw new Error("Destination lookup failed");
+      if (workspaceId !== sourceWorkspaceId && ++destinationReads > 1) {
+        throw new Error("Destination lookup failed");
+      }
       return registry.get(workspaceId);
     });
 
@@ -2044,6 +2200,64 @@ describe("agent move to workspace RPC", () => {
       workspaceId: moved.workspaceId,
       error: null,
     });
+  });
+
+  test("restores the original records and removes the allocation when a descendant write fails", async () => {
+    const { session, messages, registry, storage, cwd } = await setup();
+    const grandchildId = "33333333-3333-4333-8333-333333333333";
+    await storage.upsert(
+      createStoredAgentRecord({
+        id: grandchildId,
+        cwd,
+        workspaceId: sourceWorkspaceId,
+        labels: { [PARENT_AGENT_ID_LABEL]: childId },
+      }),
+    );
+    const before = await Promise.all([storage.get(childId), storage.get(grandchildId)]);
+    const upsert = storage.upsert.bind(storage);
+    const write = vi.spyOn(storage, "upsert").mockImplementation(async (record) => {
+      if (record.id === grandchildId && record.workspaceId !== sourceWorkspaceId) {
+        throw new Error("Cannot write descendant");
+      }
+      await upsert(record);
+    });
+    try {
+      await session.handleMessage({
+        type: "agent.move_to_workspace.request",
+        agentId: childId,
+        requestId: "move-failed-descendant",
+      });
+      expect(await Promise.all([storage.get(childId), storage.get(grandchildId)])).toEqual(before);
+      expect(await registry.listActive()).toHaveLength(1);
+      expect(findByType(messages, "agent.move_to_workspace.response")?.payload).toMatchObject({
+        accepted: false,
+        error: "Cannot write descendant",
+      });
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  test("uses the history request's archived workspace snapshot for filtering and placement", async () => {
+    const { session, messages, registry, workspaceRegistry } = await setup();
+    const workspace = (await registry.get(sourceWorkspaceId))!;
+    const archivedAt = "2026-09-20T10:00:00.000Z";
+    workspaceRegistry.listAll.mockResolvedValue([{ ...workspace, archivedAt }]);
+    await session.handleMessage({
+      type: "fetch_agent_history_request",
+      requestId: "history-snapshot",
+      archiveScope: "archived",
+      sort: [{ key: "archived_at", direction: "desc" }],
+    });
+    expect(findByType(messages, "fetch_agent_history_response")?.payload.entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          agent: expect.objectContaining({ id: childId }),
+          project: expect.objectContaining({ workspaceArchivedAt: archivedAt }),
+        }),
+      ]),
+    );
+    expect(workspaceRegistry.listAll).toHaveBeenCalledTimes(1);
   });
 
   test("rejects a move while another session is starting to archive its source workspace", async () => {
@@ -2334,7 +2548,11 @@ describe("agent move to workspace RPC", () => {
     expect(await storage.get(childId)).toMatchObject({
       cwd,
       workspaceId: moved.workspaceId,
-      labels: { [PARENT_AGENT_ID_LABEL]: parentId, topic: "review" },
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: parentId,
+        [PARENT_SERVER_ID_LABEL]: "local-host",
+        topic: "review",
+      },
     });
     expect(await storage.get(grandchildId)).toMatchObject({
       cwd,
@@ -2361,7 +2579,11 @@ describe("agent move to workspace RPC", () => {
             agent: expect.objectContaining({
               id: childId,
               workspaceId: moved.workspaceId,
-              labels: { [PARENT_AGENT_ID_LABEL]: parentId, topic: "review" },
+              labels: {
+                [PARENT_AGENT_ID_LABEL]: parentId,
+                [PARENT_SERVER_ID_LABEL]: "local-host",
+                topic: "review",
+              },
             }),
           }),
         }),
