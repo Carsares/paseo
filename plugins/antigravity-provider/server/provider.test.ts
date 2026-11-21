@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -46,7 +46,7 @@ async function harness(env: Record<string, string> = {}) {
   const launch: ProviderLaunch = {
     command: process.execPath,
     args: [fake, "--launch-prefix"],
-    env: { AGY_TEST_LOG: log, ...env },
+    env: { HOME: cwd, USERPROFILE: cwd, AGY_TEST_LOG: log, ...env },
   };
   const connection = await provider.connect({
     versions: [1],
@@ -78,13 +78,17 @@ async function harness(env: Record<string, string> = {}) {
             event.type === "catalog"),
       );
   }
-  async function open(restored?: ProviderPersistence, sessionId = "s") {
+  async function open(
+    restored?: ProviderPersistence,
+    sessionId = "s",
+    history: "replay" | "skip" = "replay",
+  ) {
     await request({
       type: "session.open",
       requestId: `open-${events.length}`,
       sessionId,
       persistence: restored,
-      history: "replay",
+      history,
       config: {
         cwd,
         env: { AGY_SESSION_VALUE: "session-overlay" },
@@ -508,7 +512,7 @@ it("defers model and mode changes until the next prompt, then respawns with vali
   );
 });
 
-it("resumes after connection close without replay or another system prefix", async () => {
+it("resumes after connection close without replay when no local transcript exists or another system prefix", async () => {
   const first = await harness();
   await first.open();
   await first.completed(await first.prompt("HELLO"));
@@ -523,6 +527,373 @@ it("resumes after connection close without replay or another system prefix", asy
       .filter((entry) => entry.input)
       .map((entry) => entry.input.message.content),
   ).toEqual(["RESUME"]);
+});
+
+it("replays local transcript history before session.ready on resume and skips replay when requested", async () => {
+  const conversationId = "e5cf1e2d-c715-4328-8e67-4a85c8dc3cda";
+  const persistence: ProviderPersistence = { version: 1, data: { conversationId } };
+  const h = await harness();
+  const logsDir = path.join(
+    h.cwd,
+    ".gemini",
+    "antigravity-cli",
+    "brain",
+    conversationId,
+    ".system_generated",
+    "logs",
+  );
+  await mkdir(logsDir, { recursive: true });
+  const steps = [
+    {
+      step_index: 0,
+      source: "USER_EXPLICIT",
+      type: "USER_INPUT",
+      status: "DONE",
+      created_at: "2026-11-20T15:18:52Z",
+      content: [
+        "<USER_REQUEST>",
+        "SYSTEM PREFIX",
+        "",
+        "Inspect docs/design.md and explain </USER_REQUEST> handling.",
+        "Attached image: /tmp/paseo-antigravity-images-abc123/shot.png",
+        "</USER_REQUEST>",
+        "<ADDITIONAL_METADATA>",
+        "The current local time is: 2026-11-20T23:18:52+08:00.",
+        "</ADDITIONAL_METADATA>",
+        "<USER_SETTINGS_CHANGE>",
+        "Model changed.",
+        "</USER_SETTINGS_CHANGE>",
+      ].join("\n"),
+    },
+    {
+      step_index: 1,
+      source: "MODEL",
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: "2026-11-20T15:18:55Z",
+      thinking: "Checking design docs and running a shell check.\n",
+      tool_calls: [
+        {
+          name: "read_file",
+          args: { Path: "/repo/docs/design.md", StartLine: 10, EndLine: 29 },
+        },
+        {
+          name: "edit_file",
+          args: { Path: "/repo/src/a.ts", Target: "oldVal", Replacement: "newVal" },
+        },
+        {
+          name: "run_command",
+          args: { CommandLine: "npm test", Cwd: "/repo" },
+        },
+        {
+          name: "invoke_subagent",
+          args: { TypeName: "research", Prompt: "Survey icons" },
+        },
+      ],
+    },
+    {
+      step_index: 2,
+      source: "MODEL",
+      type: "GENERIC",
+      status: "DONE",
+      created_at: "2026-11-20T15:18:56Z",
+      content:
+        "Created At: 2026-11-20T23:18:56+08:00\nCompleted At: 2026-11-20T23:18:57+08:00\n10: token rules",
+    },
+    {
+      step_index: 3,
+      source: "MODEL",
+      type: "GENERIC",
+      status: "ERROR",
+      error: "Target not found",
+      created_at: "2026-11-20T15:18:57Z",
+      content: "Created At: 2026-11-20T23:18:57+08:00\nEncountered error: Target not found",
+    },
+    {
+      step_index: 4,
+      source: "MODEL",
+      type: "GENERIC",
+      status: "DONE",
+      created_at: "2026-11-20T15:18:58Z",
+      content:
+        "Created At: 2026-11-20T23:18:58+08:00\nCompleted At: 2026-11-20T23:18:59+08:00\nCommand exited with code 1.\n\nFAIL test",
+    },
+    {
+      step_index: 5,
+      source: "MODEL",
+      type: "GENERIC",
+      status: "DONE",
+      created_at: "2026-11-20T15:19:00Z",
+      content: [
+        "Created At: 2026-11-20T23:19:00+08:00",
+        "Created the following subagent:",
+        "{",
+        '  "conversationId": "child-conv-1",',
+        '  "logAbsoluteUri": "file:///tmp/child.jsonl"',
+        "}",
+      ].join("\n"),
+    },
+    {
+      step_index: 6,
+      source: "MODEL",
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: "2026-11-20T15:19:05Z",
+      content: "Here is the summary.",
+    },
+    {
+      step_index: 7,
+      source: "USER_EXPLICIT",
+      type: "USER_INPUT",
+      status: "DONE",
+      created_at: "2026-11-20T15:20:00Z",
+      content:
+        "<USER_REQUEST>\nAttached image: /tmp/paseo-antigravity-images-abc123/only.webp\n</USER_REQUEST>",
+    },
+    {
+      step_index: 8,
+      source: "MODEL",
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: "2026-11-20T15:20:02Z",
+      tool_calls: [{ name: "write_file", args: { Path: "/repo/out.md", Content: "# Out" } }],
+    },
+  ];
+  await writeFile(
+    path.join(logsDir, "transcript_full.jsonl"),
+    `${steps.map((step) => JSON.stringify(step)).join("\n")}\n`,
+  );
+
+  await h.open(persistence);
+  const openedIdx = h.events.findIndex((event) => event.type === "session.opened");
+  const readyIdx = h.events.findIndex((event) => event.type === "session.ready");
+  const timelineIndices = h.events
+    .map((event, idx) => (event.type === "timeline.item" ? idx : -1))
+    .filter((idx) => idx >= 0);
+  expect(timelineIndices.length).toBe(9);
+  expect(timelineIndices.every((idx) => idx > openedIdx && idx < readyIdx)).toBe(true);
+
+  const replayed = h.events.filter((event) => event.type === "timeline.item");
+  expect(replayed).toEqual([
+    {
+      type: "timeline.item",
+      sessionId: "s",
+      timestamp: "2026-11-20T15:18:52Z",
+      item: {
+        type: "user_message",
+        id: "history:user:0",
+        messageId: "history:user:0",
+        text: "Inspect docs/design.md and explain </USER_REQUEST> handling.",
+      },
+    },
+    {
+      type: "timeline.item",
+      sessionId: "s",
+      timestamp: "2026-11-20T15:18:55Z",
+      item: {
+        type: "reasoning",
+        id: "history:reasoning:1",
+        text: "Checking design docs and running a shell check.",
+      },
+    },
+    {
+      type: "timeline.item",
+      sessionId: "s",
+      timestamp: "2026-11-20T15:18:56Z",
+      item: {
+        type: "tool_call",
+        id: "history:tool:1:0",
+        callId: "history:tool:1:0",
+        name: "read_file",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "read",
+          filePath: "/repo/docs/design.md",
+          content: "10: token rules",
+          offset: 10,
+          limit: 20,
+        },
+      },
+    },
+    {
+      type: "timeline.item",
+      sessionId: "s",
+      timestamp: "2026-11-20T15:18:57Z",
+      item: {
+        type: "tool_call",
+        id: "history:tool:1:1",
+        callId: "history:tool:1:1",
+        name: "edit_file",
+        status: "failed",
+        error: "Target not found",
+        detail: {
+          type: "edit",
+          filePath: "/repo/src/a.ts",
+          oldString: "oldVal",
+          newString: "newVal",
+        },
+      },
+    },
+    {
+      type: "timeline.item",
+      sessionId: "s",
+      timestamp: "2026-11-20T15:18:58Z",
+      item: {
+        type: "tool_call",
+        id: "history:tool:1:2",
+        callId: "history:tool:1:2",
+        name: "run_command",
+        status: "failed",
+        error: "Command exited with code 1",
+        detail: {
+          type: "shell",
+          command: "npm test",
+          cwd: "/repo",
+          output: "Command exited with code 1.\n\nFAIL test",
+          exitCode: 1,
+        },
+      },
+    },
+    {
+      type: "timeline.item",
+      sessionId: "s",
+      timestamp: "2026-11-20T15:19:00Z",
+      item: {
+        type: "tool_call",
+        id: "history:tool:1:3",
+        callId: "history:tool:1:3",
+        name: "invoke_subagent",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "sub_agent",
+          subAgentType: "research",
+          description: "Survey icons",
+          childSessionId: "child-conv-1",
+          log: "file:///tmp/child.jsonl",
+        },
+      },
+    },
+    {
+      type: "timeline.item",
+      sessionId: "s",
+      timestamp: "2026-11-20T15:19:05Z",
+      item: {
+        type: "assistant_message",
+        id: "history:assistant:6",
+        messageId: "history:assistant:6",
+        text: "Here is the summary.",
+      },
+    },
+    {
+      type: "timeline.item",
+      sessionId: "s",
+      timestamp: "2026-11-20T15:20:00Z",
+      item: {
+        type: "user_message",
+        id: "history:user:7",
+        messageId: "history:user:7",
+        text: "[Attached image]",
+      },
+    },
+    {
+      type: "timeline.item",
+      sessionId: "s",
+      timestamp: "2026-11-20T15:20:02Z",
+      item: {
+        type: "tool_call",
+        id: "history:tool:8:0",
+        callId: "history:tool:8:0",
+        name: "write_file",
+        status: "canceled",
+        error: null,
+        detail: {
+          type: "write",
+          filePath: "/repo/out.md",
+          content: "# Out",
+        },
+      },
+    },
+  ]);
+
+  await h.open(persistence, "skip-session", "skip");
+  expect(
+    h.events.filter(
+      (event) => event.type === "timeline.item" && event.sessionId === "skip-session",
+    ),
+  ).toEqual([]);
+});
+
+it("falls back to compact transcript.jsonl and decodes stringified tool arguments", async () => {
+  const conversationId = "e5cf1e2d-c715-4328-8e67-4a85c8dc3cda";
+  const persistence: ProviderPersistence = { version: 1, data: { conversationId } };
+  const h = await harness();
+  const logsDir = path.join(
+    h.cwd,
+    ".gemini",
+    "antigravity-cli",
+    "brain",
+    conversationId,
+    ".system_generated",
+    "logs",
+  );
+  await mkdir(logsDir, { recursive: true });
+  const compactSteps = [
+    {
+      step_index: 0,
+      source: "MODEL",
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+      created_at: "2026-11-20T16:00:00Z",
+      tool_calls: [
+        {
+          name: "read_file",
+          args: {
+            Path: JSON.stringify("/repo/README.md"),
+            StartLine: "1",
+            EndLine: "50",
+          },
+        },
+      ],
+    },
+    {
+      step_index: 1,
+      source: "MODEL",
+      type: "GENERIC",
+      status: "DONE",
+      created_at: "2026-11-20T16:00:01Z",
+      content: "Created At: 2026-11-20T16:00:01Z\n1: # Readme",
+    },
+  ];
+  await writeFile(
+    path.join(logsDir, "transcript.jsonl"),
+    `${compactSteps.map((step) => JSON.stringify(step)).join("\n")}\n`,
+  );
+
+  await h.open(persistence);
+  expect(h.events.filter((event) => event.type === "timeline.item")).toEqual([
+    {
+      type: "timeline.item",
+      sessionId: "s",
+      timestamp: "2026-11-20T16:00:01Z",
+      item: {
+        type: "tool_call",
+        id: "history:tool:0:0",
+        callId: "history:tool:0:0",
+        name: "read_file",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "read",
+          filePath: "/repo/README.md",
+          content: "1: # Readme",
+          offset: 1,
+          limit: 50,
+        },
+      },
+    },
+  ]);
 });
 
 it.each(["auth", "exit", "stderr"])(

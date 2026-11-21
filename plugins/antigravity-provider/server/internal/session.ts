@@ -13,6 +13,7 @@ import type {
 } from "@getpaseo/plugin/server/provider";
 import { startDriver, selection, type Driver } from "./process.js";
 import { validateSelection } from "./catalog.js";
+import { readHistory } from "./history.js";
 import { PromptFiles } from "./prompt.js";
 import { toolItem } from "./timeline.js";
 import { AntigravityError, diagnostic, type Frame, type Step } from "./wire.js";
@@ -60,7 +61,11 @@ export class Session {
     validateSelection(this.config, options.catalog());
   }
 
-  async open(requestId: string, capabilities: readonly string[]): Promise<void> {
+  async open(
+    requestId: string,
+    capabilities: readonly string[],
+    history: "replay" | "skip" = "replay",
+  ): Promise<void> {
     await this.ensureDriver();
     this.emit({
       type: "session.opened",
@@ -72,6 +77,21 @@ export class Session {
       cwd: this.config.cwd,
       title: this.config.title,
     });
+    if (history === "replay" && this.options.persistence && this.conversationId) {
+      const replayed = await readHistory({
+        conversationId: this.conversationId,
+        launch: this.options.launch,
+        config: this.config,
+      });
+      for (const entry of replayed) {
+        this.emit({
+          type: "timeline.item",
+          sessionId: this.options.id,
+          item: entry.item,
+          ...(entry.timestamp ? { timestamp: entry.timestamp } : {}),
+        });
+      }
+    }
     this.publishFullAccessNotice();
     this.publishConfig();
     this.emit({ type: "session.commands", sessionId: this.options.id, commands: [] });
