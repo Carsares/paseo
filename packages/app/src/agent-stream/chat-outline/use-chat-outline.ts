@@ -1,4 +1,12 @@
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type RefObject,
+} from "react";
 import type { AgentTimelinePromptIndexPayload } from "@getpaseo/client/internal/daemon-client";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
@@ -82,6 +90,21 @@ export function useChatOutline({
   mountedHistoryMessageIds,
   revealLoadedMessage,
 }: UseChatOutlineInput): ChatOutline {
+  const store = getHostRuntimeStore();
+  const canRequestIndex = enabled && timelineEpoch !== null;
+  const subscribeToHost = useCallback(
+    (listener: () => void) => (canRequestIndex ? store.subscribe(serverId, listener) : () => {}),
+    [canRequestIndex, serverId, store],
+  );
+  const onlineConnectionEpoch = useSyncExternalStore(
+    subscribeToHost,
+    () => {
+      if (!canRequestIndex) return null;
+      const snapshot = store.getSnapshot(serverId);
+      return snapshot?.connectionStatus === "online" ? snapshot.connectionEpoch : null;
+    },
+    () => null,
+  );
   const timeline = useMemo(
     () => ({ agentId, serverId, timelineEpoch }),
     [agentId, serverId, timelineEpoch],
@@ -122,30 +145,29 @@ export function useChatOutline({
       setIndexedTimeline(null);
       return;
     }
-    const client = getHostRuntimeStore().getClient(timeline.serverId);
+    // Reconnect can keep the same client and leave the viewed timeline unchanged.
+    if (onlineConnectionEpoch === null) return;
+    const client = store.getClient(timeline.serverId);
     if (!client) return;
     let active = true;
-    const refresh = () => {
-      const requestId = ++nextIndexRequestIdRef.current;
-      void client
-        .listAgentTimelinePrompts(timeline.agentId)
-        .then((payload) => {
-          if (
-            active &&
-            requestId === nextIndexRequestIdRef.current &&
-            shouldAcceptPromptIndexEpoch(epoch, payload.epoch)
-          ) {
-            setIndexedTimeline({ timeline, index: payload });
-          }
-          return undefined;
-        })
-        .catch(() => undefined);
-    };
-    refresh();
+    const requestId = ++nextIndexRequestIdRef.current;
+    void client
+      .listAgentTimelinePrompts(timeline.agentId)
+      .then((payload) => {
+        if (
+          active &&
+          requestId === nextIndexRequestIdRef.current &&
+          shouldAcceptPromptIndexEpoch(epoch, payload.epoch)
+        ) {
+          setIndexedTimeline({ timeline, index: payload });
+        }
+        return undefined;
+      })
+      .catch(() => undefined);
     return () => {
       active = false;
     };
-  }, [enabled, latestPromptSeq, timeline]);
+  }, [enabled, latestPromptSeq, onlineConnectionEpoch, store, timeline]);
 
   // The transcript resolves display rows (including Markdown blocks and plugin cards) to
   // timeline positions. The outline uses the complete index, including unloaded prompts.

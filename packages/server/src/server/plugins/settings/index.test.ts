@@ -93,6 +93,54 @@ test("server settings read current values and notify after successful writes", a
   expect(notifications).toHaveLength(1);
 });
 
+test("rereading repaired settings updates existing listeners once on the same installation", async () => {
+  const { directory, changes, handlers } = await setup();
+  const other = await setup();
+  const notifications: DisplaySettingsState[] = [];
+  const otherNotifications: DisplaySettingsState[] = [];
+  const file = path.join(directory, "display.json");
+  await writeFile(file, JSON.stringify({ version: 1, values: { count: 0 } }));
+  let listenerRead: Promise<DisplaySettingsState> | undefined;
+  const unsubscribe = handlers.settings.subscribe((state) => {
+    notifications.push(state);
+    listenerRead = handlers.settings.read();
+  });
+  other.handlers.settings.subscribe((state) => {
+    otherNotifications.push(state);
+  });
+  expect(await handlers.settings.read()).toMatchObject({ status: "invalid" });
+  await other.handlers.settings.read();
+
+  const repairedRaw = JSON.stringify({ version: 1, values: { enabled: false, count: 9 } });
+  await writeFile(file, repairedRaw);
+  const reloaded = await handlers.read.handle();
+
+  expect(reloaded).toMatchObject({ status: "ready", values: { enabled: false, count: 9 } });
+  expect(notifications).toHaveLength(1);
+  expect(notifications[0]).toMatchObject({
+    status: "ready",
+    values: { enabled: false, count: 9 },
+  });
+  const listenerState = await listenerRead;
+  expect(listenerState).toMatchObject({
+    status: "ready",
+    values: { enabled: false, count: 9 },
+  });
+  expect(listenerState).toEqual(notifications[0]);
+  const reread = await handlers.read.handle();
+  expect(reread).toMatchObject({ status: "ready", values: { enabled: false, count: 9 } });
+  expect(reread.revision).toBe(reloaded.revision);
+  expect(notifications).toHaveLength(1);
+  expect(otherNotifications).toEqual([]);
+  expect(changes).toEqual([]);
+  expect(await readFile(file, "utf8")).toBe(repairedRaw);
+
+  unsubscribe();
+  await writeFile(file, JSON.stringify({ version: 1, values: { count: 12 } }));
+  expect(await handlers.read.handle()).toMatchObject({ status: "ready", values: { count: 12 } });
+  expect(notifications).toHaveLength(1);
+});
+
 test("validation failure preserves disk and leaves the writer usable", async () => {
   const { handlers, changes } = await setup();
   expect(await handlers.write.handle({ revision: "missing", values: { count: -1 } })).toMatchObject(

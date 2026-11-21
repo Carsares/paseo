@@ -8,6 +8,8 @@ interface Message {
   recipientId: string;
   messageId?: string;
   source: AgentPromptSource;
+  /** A verified child report can wake its parent without changing its displayed message kind. */
+  childReported?: boolean;
   prompt: AgentPromptInput;
   sessionMode?: string;
   unarchive?: boolean;
@@ -37,6 +39,7 @@ interface Admitted extends Message {
 interface DispatchRequest {
   recipientId: string;
   messageIds: readonly string[];
+  shouldReportUpward: boolean;
   prompt: AgentPromptInput;
   activeTurnBehavior: "steer" | "interrupt";
   idleOnly: boolean;
@@ -79,7 +82,7 @@ export interface AgentMessageDelivery {
   /** Queued messages and provider dispatches still owned by this recipient. */
   hasPending(recipientId: string): boolean;
   /** Stop admission, flush pending messages, and await provider dispatch acknowledgments. */
-  close(): Promise<void>;
+  close(options?: { deferWith?: Error }): Promise<void>;
   /** Completion waits include admitted messages, but return at permission checkpoints. */
   waitForDispatch(recipientId: string, signal: AbortSignal): Promise<void>;
 }
@@ -146,6 +149,11 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         return true;
       },
       messageIds: messages.map((message) => message.receipt.messageId),
+      shouldReportUpward: messages.some(
+        ({ childReported, source }) =>
+          childReported ||
+          (source.kind === "agent-notification" && source.event !== "permission-required"),
+      ),
       prompt,
       activeTurnBehavior: messages[0]!.activeTurnBehavior ?? "steer",
       sessionMode: messages.find((message) => message.sessionMode)?.sessionMode,
@@ -507,11 +515,26 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         },
       };
     },
-    close() {
+    close(options) {
       if (closing) return closing;
       closed = true;
       unsubscribe?.();
-      closing = drain();
+      if (options?.deferWith) {
+        // The shutdown budget expired. Cancel work before provider handoff so
+        // durable receipts can replay it without replacing the active turn.
+        for (const entry of pending.values()) entry.cancel();
+        pending.clear();
+        for (const messages of admitted.values()) {
+          for (const message of messages) {
+            if (message.state !== "queued") continue;
+            message.state = "withdrawn";
+            message.reject(options.deferWith);
+          }
+        }
+        closing = Promise.resolve();
+      } else {
+        closing = drain();
+      }
       return closing;
     },
   };

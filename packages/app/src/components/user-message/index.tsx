@@ -20,9 +20,9 @@ import { isNative } from "@/constants/platform";
 import { useDisclosureHold } from "@/agent-stream/disclosure";
 import { useUserMessageExpanded } from "./expansion-context";
 import {
-  ExpandedQuoteCountContext,
   FindQuoteIndexContext,
   FindUserMessageExpansionContext,
+  UserMessageQuoteExpansionContext,
 } from "./quote-expansion-context";
 
 const PREVIEW_HEIGHT = 240;
@@ -39,14 +39,19 @@ const previewStyle: ViewStyle = {
 /** Caps a long message at the preview height, with a control to read the rest. */
 export function MessagePreview({ itemId, children }: { itemId: string; children: ReactNode }) {
   const { t } = useTranslation();
-  const { expanded, toggle: toggleExpanded } = useUserMessageExpanded(itemId);
+  const {
+    expanded,
+    toggle: toggleExpanded,
+    expandedQuotes,
+    toggleQuote,
+  } = useUserMessageExpanded(itemId);
   const findExpansion = useContext(FindUserMessageExpansionContext);
   const expandedForFind = findExpansion?.rowId === itemId;
-  const [expandedQuoteCount, setExpandedQuoteCount] = useState(0);
-  const adjustExpandedQuoteCount = useCallback((delta: number) => {
-    setExpandedQuoteCount((count) => count + delta);
-  }, []);
-  const hasExpandedQuote = expandedQuoteCount > 0;
+  const quoteExpansion = useMemo(
+    () => ({ expandedQuotes, toggleQuote }),
+    [expandedQuotes, toggleQuote],
+  );
+  const hasExpandedQuote = expandedQuotes.size > 0;
   const clipped = !expanded && !hasExpandedQuote && !expandedForFind;
   const bodyRef = useRef<View>(null);
   const [overflowing, setOverflowing] = useState(false);
@@ -73,13 +78,13 @@ export function MessagePreview({ itemId, children }: { itemId: string; children:
     <>
       <View style={clipped && previewStyle} dataSet={clipped ? COLLAPSED_MESSAGE : undefined}>
         <View ref={bodyRef} style={styles.body} onLayout={measure}>
-          <ExpandedQuoteCountContext.Provider value={adjustExpandedQuoteCount}>
+          <UserMessageQuoteExpansionContext.Provider value={quoteExpansion}>
             <FindQuoteIndexContext.Provider
               value={expandedForFind ? findExpansion.quoteIndex : null}
             >
               {children}
             </FindQuoteIndexContext.Provider>
-          </ExpandedQuoteCountContext.Provider>
+          </UserMessageQuoteExpansionContext.Provider>
         </View>
         {overflowing && clipped ? (
           <EdgeFade edge="bottom" solidFraction={0} backdrop="surface3" style={styles.fade} />

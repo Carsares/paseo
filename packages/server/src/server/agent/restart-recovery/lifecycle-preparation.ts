@@ -6,18 +6,26 @@ interface Dependencies {
   pauseRunAdmission(): () => void;
   waitForAdmittedRunsToStart(): Promise<void>;
   capture(force: boolean): Promise<void>;
+  report?(error: unknown): void;
 }
 
 const ADMISSION_DRAIN_TIMEOUT_MS = 5_000;
 
 export function createLifecyclePreparation(deps: Dependencies) {
-  let current: { force: boolean; prepared: Promise<void> } | undefined;
+  let current: { force: boolean; prepared: Promise<{ deliveryDrained: boolean }> } | undefined;
 
-  async function capture(force: boolean, stopping: boolean): Promise<void> {
+  async function capture(force: boolean): Promise<{ deliveryDrained: boolean }> {
     // A recovery still opening its provider session has not reached run admission yet.
     if (force) deps.assertStartupRecoverySettled?.();
     const drainStarted = performance.now();
     const delivery = deps.pauseDelivery();
+    let deliveryDrained = true;
+    const remainingBudget = () =>
+      Math.max(0, Math.ceil(ADMISSION_DRAIN_TIMEOUT_MS - (performance.now() - drainStarted)));
+    const reportOrThrow = (error: unknown) => {
+      if (force) throw error;
+      deps.report?.(error);
+    };
     let releaseRuns: (() => void) | undefined;
     try {
       if (delivery) {
@@ -25,19 +33,21 @@ export function createLifecyclePreparation(deps: Dependencies) {
           promise: delivery.drained,
           timeoutMs: ADMISSION_DRAIN_TIMEOUT_MS,
           label: "dispatch queued agent messages",
+        }).catch((error) => {
+          deliveryDrained = false;
+          reportOrThrow(error);
         });
       }
       releaseRuns = deps.pauseRunAdmission();
       await withTimeout({
         promise: deps.waitForAdmittedRunsToStart(),
-        // Once an ordinary stop has started, both waits share one budget to leave time for cleanup.
-        timeoutMs: stopping
-          ? Math.max(0, Math.ceil(ADMISSION_DRAIN_TIMEOUT_MS - (performance.now() - drainStarted)))
-          : ADMISSION_DRAIN_TIMEOUT_MS,
+        // Ordinary requests and shutdown share the same budget.
+        timeoutMs: force ? ADMISSION_DRAIN_TIMEOUT_MS : remainingBudget(),
         label: "settle agent run admissions",
-      });
+      }).catch(reportOrThrow);
       // Keep both admission barriers up after success, including the gap before IPC.
-      await deps.capture(force);
+      await deps.capture(force).catch(reportOrThrow);
+      return { deliveryDrained };
     } catch (error) {
       releaseRuns?.();
       delivery?.release();
@@ -45,13 +55,13 @@ export function createLifecyclePreparation(deps: Dependencies) {
     }
   }
 
-  function startPreparation(force: boolean, stopping = false): Promise<void> {
+  function startPreparation(force: boolean) {
     if (current) {
       return Promise.reject(new Error("A daemon lifecycle request is already in progress"));
     }
     // Claim before starting any async work. Only the owning request may acknowledge and dispatch.
     const prepared = Promise.resolve()
-      .then(() => capture(force, stopping))
+      .then(() => capture(force))
       .catch((error) => {
         current = undefined;
         throw error;
@@ -61,16 +71,15 @@ export function createLifecyclePreparation(deps: Dependencies) {
   }
 
   return {
-    prepare: (force: boolean) => startPreparation(force),
-    async beforeStop(force: boolean): Promise<void> {
-      if (!current) {
-        await startPreparation(force, !force);
-        return;
-      }
+    async prepare(force: boolean): Promise<void> {
+      await startPreparation(force);
+    },
+    async beforeStop(force: boolean) {
+      if (!current) return startPreparation(force);
       if (force && !current.force) {
         throw new Error("Daemon shutdown was already prepared without agent resume");
       }
-      await current.prepared;
+      return current.prepared;
     },
   };
 }

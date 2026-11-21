@@ -211,7 +211,7 @@ export function createHostActions(
         // Initial acquisition has a deadline; established scopes restore demand on loss.
         reconnect: { enabled: false },
       });
-      const api = owner.api(client, { signal: owner.signal });
+      const api = owner.api(client, { signal: owner.signal, routeOrigin: origin });
       const scope = owner.own(() => ({
         release: async () => {
           try {

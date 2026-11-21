@@ -1126,6 +1126,10 @@ function maxTimelineSeq(rows: readonly AgentTimelineRow[]): number {
   return rows.reduce((max, row) => Math.max(max, row.seq), 0);
 }
 
+function projectSummaryTimelineItems(rows: AgentTimelineRow[]): AgentTimelineItem[] {
+  return projectTimelineRows({ rows, mode: "projected" }).map(({ item }) => item);
+}
+
 export class AgentManager {
   private readonly timelinePrefixes: TimelinePrefixStore;
   private readonly contextHandoffs = new Map<string, PendingContextHandoff>();
@@ -1795,51 +1799,107 @@ export class AgentManager {
   async readTimelineForSummary(
     agentId: string,
     workspaceId: string,
-  ): Promise<AgentTimelineRow[] | null> {
+  ): Promise<AgentTimelineItem[] | null> {
     return this.runLifecycleMutation(agentId, async () => {
       const record = await this.registry?.get(agentId);
       const current = this.agents.get(agentId) ?? record;
       if (current?.workspaceId !== workspaceId || current.internal || current.background)
         return null;
-      if (this.timelineStore.has(agentId)) return this.timelineStore.getRows(agentId);
-      const committed = await this.durableTimelineStore?.getCommittedRows(agentId);
-      if (committed?.length) return committed;
-
-      if (!record) return [];
-      const handle = toAgentPersistenceHandle(this.getRegisteredProviderIds(), record.persistence);
-      if (!handle) return [];
-
-      const client = this.requireClient(handle.provider);
-      const config = await this.normalizeConfig(
-        {
-          ...handle.metadata,
-          ...buildConfigOverrides(record),
-          provider: handle.provider,
-          cwd: record.cwd,
-        },
-        { purpose: "history", resolveDefaultModel: false },
-      );
-      const reader = await client.resumeSession(
-        handle,
-        config,
-        { agentId, env: record.launchEnv },
-        { purpose: "history" },
-      );
-      try {
-        const entries: ImportedTimelineEntry[] = [];
-        for await (const rawEvent of reader.streamHistory()) {
-          const event = limitAgentStreamEventContent(rawEvent, agentId);
-          if (event.type === "timeline") {
-            for (const item of projectAgentMessages(event.item)) {
-              entries.push({ item, timestamp: event.timestamp ?? record.updatedAt });
-            }
-          }
-        }
-        return buildImportedTimelineRows(entries);
-      } finally {
-        await reader.close();
+      if (this.timelineStore.has(agentId)) {
+        return this.readLoadedTimelineForSummary(agentId);
       }
+      const committed = await this.durableTimelineStore?.getCommittedRows(agentId);
+      if (committed?.length) return projectSummaryTimelineItems(committed);
+
+      return record ? this.readStoredTimelineForSummary(record) : [];
     });
+  }
+
+  private async readLoadedTimelineForSummary(agentId: string): Promise<AgentTimelineItem[]> {
+    if (this.timelineStore.getSealedThrough(agentId)) return this.timelineStore.getItems(agentId);
+
+    const items = projectSummaryTimelineItems(this.timelineStore.getRows(agentId));
+    if (this.agents.get(agentId)?.historyPrimed !== false) return items;
+
+    // A resumed session is registered before replay completes. A failed replay leaves
+    // its timeline unprimed, so the retained prefix is still on disk.
+    const prefix = await this.timelinePrefixes.load(agentId);
+    return prefix?.rows.length ? [...prefix.rows.map(({ item }) => item), ...items] : items;
+  }
+
+  private async readStoredTimelineForSummary(
+    record: StoredAgentRecord,
+  ): Promise<AgentTimelineItem[]> {
+    const agentId = record.id;
+    const prefix = await this.timelinePrefixes.load(agentId);
+    const handle = toAgentPersistenceHandle(this.getRegisteredProviderIds(), record.persistence);
+    if (!handle) return prefix?.rows.map(({ item }) => item) ?? [];
+
+    let events: Extract<AgentStreamEvent, { type: "timeline" }>[];
+    try {
+      events = await this.readSummaryProviderHistory(record, handle);
+    } catch (error) {
+      if (!prefix?.rows.length) throw error;
+      this.logger.warn({ err: error, agentId }, "Using retained history for workspace summary");
+      return prefix.rows.map(({ item }) => item);
+    }
+
+    if (!prefix?.rows.length) {
+      return projectSummaryTimelineItems(
+        buildImportedTimelineRows(
+          events.map(({ item, timestamp }) => ({ item, timestamp: timestamp ?? record.updatedAt })),
+        ),
+      );
+    }
+
+    // Use the same sealed boundary as chat hydration so provider-local IDs cannot replace
+    // retained tool calls or join new assistant text to a previous provider's message.
+    const timeline = new InMemoryAgentTimelineStore();
+    timeline.initialize(agentId, {
+      rows: prefix.rows,
+      sealedThrough: maxTimelineSeq(prefix.rows),
+    });
+    for (const { item, timestamp } of this.excludePrefixReplay(prefix, events)) {
+      timeline.append(agentId, limitAgentTimelineItemContent(item), {
+        timestamp: timestamp ?? record.updatedAt,
+      });
+    }
+    return timeline.getItems(agentId);
+  }
+
+  private async readSummaryProviderHistory(
+    record: StoredAgentRecord,
+    handle: AgentPersistenceHandle,
+  ): Promise<Extract<AgentStreamEvent, { type: "timeline" }>[]> {
+    const client = this.requireClient(handle.provider);
+    const config = await this.normalizeConfig(
+      {
+        ...handle.metadata,
+        ...buildConfigOverrides(record),
+        provider: handle.provider,
+        cwd: record.cwd,
+      },
+      { purpose: "history", resolveDefaultModel: false },
+    );
+    const reader = await client.resumeSession(
+      handle,
+      config,
+      { agentId: record.id, env: record.launchEnv },
+      { purpose: "history" },
+    );
+    try {
+      const events: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
+      for await (const rawEvent of reader.streamHistory()) {
+        const event = limitAgentStreamEventContent(rawEvent, record.id);
+        if (event.type !== "timeline") continue;
+        for (const item of projectAgentMessages(event.item)) {
+          events.push({ ...event, item });
+        }
+      }
+      return events;
+    } finally {
+      await reader.close();
+    }
   }
 
   async getTimelineRows(id: string): Promise<AgentTimelineRow[]> {

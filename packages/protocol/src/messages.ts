@@ -2460,6 +2460,22 @@ export const AgentConfirmFinishReportResponseSchema = z.object({
   }),
 });
 
+export const AgentTrackFinishReportsRequestSchema = z.object({
+  type: z.literal("agent.finish_reports.track.request"),
+  requestId: z.string(),
+  childServerId: z.string().min(1),
+  childAgentId: z.string().min(1),
+  parentAgentId: z.string().min(1),
+});
+
+export const AgentTrackFinishReportsResponseSchema = z.object({
+  type: z.literal("agent.finish_reports.track.response"),
+  payload: z.object({
+    requestId: z.string(),
+    error: z.string().nullable(),
+  }),
+});
+
 export const AgentPullFinishReportsRequestSchema = z.object({
   type: z.literal("agent.finish_reports.pull.request"),
   requestId: z.string(),
@@ -3934,6 +3950,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   AgentPushFinishReportRequestSchema,
   AgentConfirmFinishReportResponseSchema,
   AgentPullFinishReportsRequestSchema,
+  AgentTrackFinishReportsRequestSchema,
   AgentRewindRequestMessageSchema,
   AgentPermissionResponseMessageSchema,
   DiffSubscribeRequestSchema,
@@ -4456,6 +4473,7 @@ export const ServerInfoStatusPayloadSchema = z
         agentNotificationEvents: z.boolean().optional(),
         agentFinishReportPull: z.boolean().optional(),
         agentExplicitParentReports: z.boolean().optional(),
+        agentTrackRemoteParentReports: z.boolean().optional(),
         agentDirectParentQueuedDelivery: z.boolean().optional(),
         // COMPAT(agentTurnIdentity): accept peers that observed pre-release v0.2.6 through 2027-01-31.
         agentTurnIdentity: z.boolean().optional(),
@@ -8096,6 +8114,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentPushFinishReportResponseSchema,
   AgentConfirmFinishReportRequestSchema,
   AgentPullFinishReportsResponseSchema,
+  AgentTrackFinishReportsResponseSchema,
   AgentRewindResponseMessageSchema,
   UpdateAgentResponseMessageSchema,
   ProjectRenameResponseSchema,

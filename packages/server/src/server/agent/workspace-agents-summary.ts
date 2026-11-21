@@ -10,7 +10,6 @@ import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type { WorkspaceRegistry } from "../workspace-registry.js";
-import { projectTimelineRows } from "./timeline-projection.js";
 
 type SummaryDetails = Pick<
   WorkspaceAgentSummaryEntry,
@@ -248,7 +247,7 @@ export async function summarizeWorkspaceAgents({
     for (const agent of agents) {
       if (isMainControlAgentLabels((agent.live ?? agent.record)?.labels)) continue;
       const agentId = agent.id;
-      const rows = await agentManager
+      const items = await agentManager
         .readTimelineForSummary(agentId, workspaceId)
         .catch((error: unknown) => {
           logger.warn(
@@ -257,10 +256,10 @@ export async function summarizeWorkspaceAgents({
           );
           return [];
         });
-      if (rows === null) continue;
+      if (items === null) continue;
       const metadata = summarizeAgentMetadata(agent, mainAgent?.id, parentByAgentId);
       const timeline = summarizeTimeline(
-        projectTimelineRows({ rows, mode: "projected" }).map(({ item }) => item),
+        items,
         metadata.parentAgentId,
         getParentAddressFromLabels((agent.live ?? agent.record)?.labels, "")?.serverId,
       );

@@ -968,6 +968,113 @@ describe("paseo daemon bootstrap", () => {
     }
   });
 
+  test.each(["signal", "restart", "shutdown"] as const)(
+    "ordinary %s captures a running turn while deferring durable queued messages",
+    async (entry) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paseo-ordinary-recovery-"));
+      const running = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const onLifecycleIntent = vi.fn();
+      const home = path.join(root, ".paseo");
+      const config: PaseoDaemonConfig = {
+        ...loadConfig(home, { env: {} }),
+        listen: "127.0.0.1:0",
+        staticDir: root,
+        agentStoragePath: path.join(home, "agents"),
+        agentClients: createTestAgentClients({
+          async beforeTurnComplete() {
+            running.resolve();
+            await release.promise;
+          },
+        }),
+        mcpEnabled: false,
+        relayEnabled: false,
+        pluginsEnabled: false,
+        resumeOnStartup: true,
+        onLifecycleIntent,
+      };
+      const first = await createPaseoDaemon(config, pino({ level: "silent" }));
+      let second: typeof first | undefined;
+      let client: DaemonClient | undefined;
+      try {
+        await first.start();
+        const listen = first.getListenTarget();
+        if (listen?.type !== "tcp") throw new Error("Expected an isolated TCP listener");
+        client = new DaemonClient({ url: `ws://127.0.0.1:${listen.port}/ws` });
+        await client.connect();
+        const agent = await first.agentManager.createAgent(
+          { provider: "codex", cwd: root },
+          undefined,
+          { workspaceId: undefined },
+        );
+        void first.agentManager.runAgent(agent.id, "Existing non-steerable work").catch(() => {});
+        await running.promise;
+        await first.agentStorage.flush();
+        for (const text of ["first durable", "second durable"]) {
+          await expect(
+            client.sendAgentMessage(agent.id, text, {
+              sourceAgentId: agent.id,
+              messageId: text,
+            }),
+          ).resolves.toEqual({ deliveryStatus: "queued" });
+        }
+        if (entry === "signal") {
+          await first.stop();
+          expect(onLifecycleIntent).not.toHaveBeenCalled();
+        } else {
+          const request =
+            entry === "restart"
+              ? client.restartServer(undefined, undefined, { timeout: 12_000 })
+              : client.shutdownServer({ timeout: 12_000 });
+          await expect(request).resolves.toMatchObject({ status: `${entry}_requested` });
+          expect(onLifecycleIntent).toHaveBeenCalledExactlyOnceWith(
+            expect.objectContaining({
+              type: entry,
+              resumeAgents: false,
+            }),
+          );
+          await first.stop();
+        }
+        const reopenedStorage = new AgentStorage(
+          path.join(home, "agents"),
+          pino({ level: "silent" }),
+        );
+        const stored = await reopenedStorage.get(agent.id);
+        expect(stored?.resumeOnStartup).toBe(true);
+        const receipts = new MessageReceipts(path.join(home, "agent-requests"));
+        expect(
+          (await receipts.queuedMessages()).map(({ queued }) => queued.message.messageId),
+        ).toEqual(["first durable", "second durable"]);
+        const prompts: string[] = [];
+        second = await createPaseoDaemon(
+          {
+            ...config,
+            agentClients: createTestAgentClients({
+              onStartTurn(prompt) {
+                const messages = parseAgentMessages(String(prompt));
+                if (messages) prompts.push(...messages.map(({ text }) => text));
+                else prompts.push(String(prompt));
+              },
+            }),
+          },
+          pino({ level: "silent" }),
+        );
+        await second.start();
+        await expect
+          .poll(() => prompts, { timeout: 7_000 })
+          .toEqual(["Resume working.", "first durable", "second durable"]);
+        await expect.poll(() => receipts.queuedMessages()).toEqual([]);
+      } finally {
+        release.resolve();
+        await client?.close();
+        await second?.stop();
+        await first.stop().catch(() => {});
+        await rm(root, { force: true, recursive: true });
+      }
+    },
+    25_000,
+  );
+
   test("startup rechecks the saved direct parent and recipient archive state before replay", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paseo-queue-recovery-policy-"));
     const handles: Awaited<ReturnType<typeof createTestPaseoDaemon>>[] = [];
@@ -1409,6 +1516,132 @@ describe("paseo daemon bootstrap", () => {
           await rm(handle.staticDir, { recursive: true, force: true });
         }
         await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.each(["stay-enabled", "toggle-after-rejection", "toggle-before-rejection"] as const)(
+    "automatic startup recovery handles live settings change (%s)",
+    async (scenario) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paseo-auto-opt-out-"));
+      const home = path.join(root, ".paseo");
+      const marker = path.join(home, "restart-recovery-pending.json");
+      const storage = new AgentStorage(path.join(home, "agents"), pino({ level: "silent" }));
+      const stamp = new Date().toISOString();
+      const id = randomUUID();
+      const explicitId = randomUUID();
+      const oneShotMarker = path.join(home, "restart-recovery-once.json");
+      const entered = Promise.withResolvers<void>();
+      const pending = Promise.withResolvers<void>();
+      const reported = Promise.withResolvers<void>();
+      const logger = pino({ level: "silent" });
+      const bootstrapLogger = logger.child({ module: "bootstrap" });
+      vi.spyOn(logger, "child").mockReturnValueOnce(bootstrapLogger);
+      vi.spyOn(bootstrapLogger, "error").mockImplementation((_error, msg) => {
+        if (msg === "Agent restart recovery failed") reported.resolve();
+      });
+      const providers = createTestAgentClients();
+      const codex = providers.codex!;
+      const resume = codex.resumeSession.bind(codex);
+      vi.spyOn(codex, "resumeSession").mockImplementation(async (...args) => {
+        const session = await resume(...args);
+        const start = session.startTurn?.bind(session);
+        if (!start) throw new Error("Test session must support starting a turn");
+        session.startTurn = async (...turn) => {
+          if (args[0].sessionId === id) {
+            entered.resolve();
+            await pending.promise;
+          } else {
+            throw new Error("The one-shot provider rejects the first start");
+          }
+          return start(...turn);
+        };
+        return session;
+      });
+      const handles: Awaited<ReturnType<typeof createTestPaseoDaemon>>[] = [];
+      let client: DaemonClient | undefined;
+      const launch = async (agentClients: typeof providers, instanceLogger?: typeof logger) => {
+        const handle = await createTestPaseoDaemon({
+          paseoHomeRoot: root,
+          cleanup: false,
+          logger: instanceLogger,
+          resumeOnStartup: true,
+          agentClients,
+        });
+        handles.push(handle);
+        return handle;
+      };
+      try {
+        for (const agentId of [id, explicitId]) {
+          await storage.upsert(
+            parseStoredAgentRecord({
+              id: agentId,
+              provider: "codex",
+              cwd: root,
+              createdAt: stamp,
+              updatedAt: stamp,
+              lastStatus: agentId === id ? "running" : "closed",
+              resumeOnStartup: true,
+              persistence: { provider: "codex", sessionId: agentId },
+            }),
+          );
+        }
+        await writeFile(oneShotMarker, JSON.stringify({ version: 2, agentIds: [explicitId] }));
+        await writeFile(marker, JSON.stringify({ version: 2, agentIds: [id, explicitId] }));
+        const first = await launch(providers, logger);
+        await entered.promise;
+        expect(JSON.parse(await readFile(marker, "utf8")).agentIds).toEqual([id]);
+        client = new DaemonClient({ url: `ws://127.0.0.1:${first.port}/ws` });
+        await client.connect();
+        const reject = async () => {
+          pending.reject(new Error("Provider rejected the automatic continuation"));
+          await expect
+            .poll(async () => (await first.daemon.agentStorage.get(id))?.lastStatus)
+            .toBe("error");
+          await reported.promise;
+        };
+        if (scenario === "toggle-before-rejection") {
+          await client.patchDaemonConfig({ resumeOnStartup: false });
+          await client.patchDaemonConfig({ resumeOnStartup: true });
+          await reject();
+        } else {
+          await reject();
+          if (scenario === "toggle-after-rejection") {
+            await client.patchDaemonConfig({ resumeOnStartup: false });
+            await client.patchDaemonConfig({ resumeOnStartup: true });
+          }
+        }
+        expect(JSON.parse(await readFile(oneShotMarker, "utf8")).agentIds).toEqual([explicitId]);
+        if (scenario === "stay-enabled") {
+          expect(JSON.parse(await readFile(marker, "utf8")).agentIds).toEqual([id]);
+        } else {
+          await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+          expect((await first.daemon.agentStorage.get(id))?.resumeOnStartup).toBe(false);
+        }
+        await first.daemon.stop();
+        const resumed: string[] = [];
+        const nextProviders = createTestAgentClients();
+        const nextCodex = nextProviders.codex!;
+        const nextResume = nextCodex.resumeSession.bind(nextCodex);
+        vi.spyOn(nextCodex, "resumeSession").mockImplementation(async (...args) => {
+          resumed.push(args[0].sessionId);
+          return nextResume(...args);
+        });
+        const next = await launch(nextProviders);
+        await expect
+          .poll(() => next.daemon.agentStorage.get(explicitId))
+          .toMatchObject({ resumeOnStartup: false });
+        expect(resumed.toSorted()).toEqual(
+          (scenario === "stay-enabled" ? [id, explicitId] : [explicitId]).toSorted(),
+        );
+      } finally {
+        pending.resolve();
+        await client?.close();
+        for (const handle of handles.toReversed()) {
+          await handle.close();
+          await rm(handle.staticDir, { force: true, recursive: true });
+        }
+        await rm(root, { force: true, recursive: true });
       }
     },
   );

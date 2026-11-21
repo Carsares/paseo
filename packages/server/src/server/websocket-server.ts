@@ -20,8 +20,10 @@ import {
   type FinishSubscription,
   type FinishSubscriptions,
 } from "./agent/finish-subscriptions/index.js";
-import { getParentAddressFromLabels } from "@getpaseo/protocol/agent-labels";
-import { parseAgentMessages } from "./agent/agent-messages/envelope.js";
+import {
+  getParentAddressFromLabels,
+  isExplicitParentReportingLabels,
+} from "@getpaseo/protocol/agent-labels";
 import { registerParentFinishSubscription } from "./agent/create-agent/create.js";
 import { HOST_ROUTE_OPCODE } from "@getpaseo/protocol/binary-frames/index";
 import { DaemonLinkEndpoint, VirtualHostSocket } from "./connected-hosts/index.js";
@@ -821,18 +823,6 @@ export class VoiceAssistantWebSocketServer {
           { replayState: false },
         ),
       dispatch: async (batch) => {
-        // A completion can wake a module lead after its previous turn reported
-        // to Main Control. Watch the new turn so its follow-up also goes upward.
-        const texts =
-          typeof batch.prompt === "string"
-            ? [batch.prompt]
-            : batch.prompt.flatMap((block) => (block.type === "text" ? [block.text] : []));
-        const shouldReportUpward = texts.some((text) =>
-          parseAgentMessages(text)?.some(
-            ({ source }) =>
-              source?.kind === "agent-notification" && source.event !== "permission-required",
-          ),
-        );
         let registration: FinishRegistration | undefined;
         let dispatched = false;
         let prepared = false;
@@ -852,7 +842,7 @@ export class VoiceAssistantWebSocketServer {
           unarchive: batch.unarchive,
           runOptions: { clientMessageId: batch.messageIds[0] },
           beforeDispatch: async () => {
-            if (shouldReportUpward) {
+            if (batch.shouldReportUpward) {
               try {
                 registration = await registerParentFinishSubscription({
                   agentId: batch.recipientId,
@@ -2416,6 +2406,7 @@ export class VoiceAssistantWebSocketServer {
         agentNotificationEvents: true,
         agentFinishReportPull: this.finishSubscriptions !== undefined,
         agentExplicitParentReports: this.finishSubscriptions !== undefined,
+        agentTrackRemoteParentReports: this.finishSubscriptions !== undefined,
         agentDirectParentQueuedDelivery: true,
         // COMPAT(stableProjectIdentity): added in v0.1.109, remove gate after 2027-01-15.
         stableProjectIdentity: true,
@@ -3099,6 +3090,7 @@ export class VoiceAssistantWebSocketServer {
           recipientId: record.callerAgentId,
           messageId,
           prompt: report.prompt,
+          childReported: explicit,
           source: explicit
             ? {
                 kind: "agent-message",
@@ -3225,6 +3217,63 @@ export class VoiceAssistantWebSocketServer {
   private hasFinishReportWorkspacePermissions(session: Session): boolean {
     const permissions = session.getPermissions();
     return permissions.includes("workspace.write") && permissions.includes("workspace.read");
+  }
+
+  private async trackFinishReports(
+    session: Session,
+    request: Extract<SessionInboundMessage, { type: "agent.finish_reports.track.request" }>,
+  ): Promise<void> {
+    const { childServerId, childAgentId, parentAgentId, requestId } = request;
+    const subscriptions = this.finishSubscriptions;
+    let error: string | null = null;
+    try {
+      if (
+        !subscriptions ||
+        session.isRouted() ||
+        !session.allowsInbound(request) ||
+        !this.hasFinishReportWorkspacePermissions(session) ||
+        childServerId === this.serverId
+      )
+        throw new Error("Permission denied for remote parent report registration.");
+      await this.assertParentReportRecipientAvailable(parentAgentId);
+      // The normal route is bounded by the saved host link grants on the child host.
+      await this.toolHosts().use(
+        childServerId,
+        async (client) => {
+          const info = client.getLastServerInfoMessage();
+          const child = (await client.fetchAgent(childAgentId))?.agent;
+          const parent = getParentAddressFromLabels(child?.labels, childServerId);
+          if (
+            info?.features?.agentExplicitParentReports !== true ||
+            info.features.agentFinishReportPull !== true ||
+            !info.permissions?.includes("workspace.read") ||
+            !info.permissions.includes("workspace.write") ||
+            !child ||
+            child.archivedAt ||
+            !isExplicitParentReportingLabels(child.labels) ||
+            parent?.agentId !== parentAgentId ||
+            parent.serverId !== this.serverId
+          )
+            throw new Error(
+              "Could not verify an active explicit-reporting child on the destination.",
+            );
+        },
+        session.delivery.requestSignal,
+      );
+      await this.assertParentReportRecipientAvailable(parentAgentId);
+      await subscriptions.trackRemoteChild({
+        callerAgentId: parentAgentId,
+        childAgentId,
+        serverId: childServerId,
+      });
+    } catch (failure) {
+      error =
+        failure instanceof Error ? failure.message : "Failed to register remote parent reports.";
+    }
+    session.delivery.reply({
+      type: "agent.finish_reports.track.response",
+      payload: { requestId, error },
+    });
   }
 
   private async pullFinishReports(
@@ -3358,6 +3407,13 @@ export class VoiceAssistantWebSocketServer {
     if (link.handles(message.message)) {
       await activeConnection.session.delivery.request(ws, message.message, () =>
         link.dispatch(message.message),
+      );
+      return;
+    }
+    if (message.message.type === "agent.finish_reports.track.request") {
+      const request = message.message;
+      await activeConnection.session.delivery.request(ws, request, () =>
+        this.trackFinishReports(activeConnection.session, request),
       );
       return;
     }

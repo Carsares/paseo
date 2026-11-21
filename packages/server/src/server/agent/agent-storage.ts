@@ -320,6 +320,13 @@ export class AgentStorage {
     return captured;
   }
 
+  async clearAgentRecovery(agentId: string): Promise<void> {
+    await this.load();
+    await this.queueRecordMutation(agentId, (record) =>
+      record?.resumeOnStartup ? { ...record, resumeOnStartup: false } : null,
+    );
+  }
+
   private queueRecordWrite(record: StoredAgentRecord): Promise<void> {
     return this.queueRecordMutation(record.id, () => record);
   }

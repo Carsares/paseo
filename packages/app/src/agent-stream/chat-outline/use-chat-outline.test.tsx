@@ -1,10 +1,13 @@
 // @vitest-environment jsdom
 
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, waitFor } from "@testing-library/react";
 import { createRef, useLayoutEffect, useState } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { i18n } from "@/i18n/i18next";
+import type { StreamItem } from "@/types/stream";
 import { createNativeReadingPositionTracker } from "../native-reading-position";
 import type { StreamViewportHandle } from "../strategy";
+import { ActivePromptBar } from "./active-prompt-bar";
 import type { ChatOutlinePrompt } from "./model";
 import { shouldTrackChatOutline, useChatOutline, type ChatOutline } from "./use-chat-outline";
 
@@ -17,19 +20,45 @@ const runtime = vi.hoisted(() => ({
 }));
 
 vi.mock("@/constants/platform", () => ({ isWeb: false, isNative: true }));
-vi.mock("@/runtime/host-runtime", () => ({
-  getHostRuntimeStore: () => ({
+vi.mock("lucide-react-native", async (importOriginal) => {
+  const icons = await importOriginal<typeof import("lucide-react-native")>();
+  return { ...icons, ChevronUp: icons.ChevronDown };
+});
+
+const connectionListeners = new Set<() => void>();
+let connection: { connectionStatus: "online" | "offline"; connectionEpoch: number };
+
+function publishConnection(online: boolean) {
+  const connectionStatus = online ? "online" : "offline";
+  connection = {
+    connectionStatus,
+    connectionEpoch:
+      connection.connectionEpoch + (online && connection.connectionStatus === "offline" ? 1 : 0),
+  };
+  for (const listener of connectionListeners) listener();
+}
+
+vi.mock("@/runtime/host-runtime", () => {
+  const store = {
     getClient: () => runtime,
+    getSnapshot: () => connection,
+    subscribe: (_serverId: string, listener: () => void) => {
+      connectionListeners.add(listener);
+      return () => connectionListeners.delete(listener);
+    },
     fetchAgentTimeline: runtime.fetchAgentTimeline,
-  }),
-}));
+  };
+  return { getHostRuntimeStore: () => store };
+});
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((complete) => {
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((complete, fail) => {
     resolve = complete;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function useReportInitialReading(
@@ -54,10 +83,13 @@ function useReportStationaryNativeReading(
 
 describe("useChatOutline", () => {
   beforeEach(() => {
+    connection = { connectionStatus: "online", connectionEpoch: 1 };
     runtime.listAgentTimelinePrompts.mockReset();
     runtime.fetchAgentTimeline.mockReset();
     runtime.subscribeAgentTimeline.mockClear();
   });
+
+  afterEach(cleanup);
 
   it("requests the native prompt index only after the host advertises it", async () => {
     runtime.listAgentTimelinePrompts.mockResolvedValue({ epoch: "epoch", prompts: [] });
@@ -80,6 +112,10 @@ describe("useChatOutline", () => {
         }),
       { initialProps: { supportsPromptIndex: false } },
     );
+    await act(async () => {
+      publishConnection(false);
+      publishConnection(true);
+    });
     expect(runtime.listAgentTimelinePrompts).not.toHaveBeenCalled();
     rerender({ supportsPromptIndex: true });
     await waitFor(() =>
@@ -408,6 +444,110 @@ describe("useChatOutline", () => {
     expect(runtime.listAgentTimelinePrompts).toHaveBeenCalledTimes(2);
     expect(runtime.subscribeAgentTimeline).not.toHaveBeenCalled();
   });
+
+  it.each(["initial request", "refresh after a new prompt"])(
+    "restores the native prompt bar and adjacent jumps when reconnect interrupts the %s",
+    async (interrupted) => {
+      await i18n.changeLanguage("en");
+      const previous = {
+        seq: 4,
+        timestamp: new Date(4).toISOString(),
+        preview: "Previous question",
+      };
+      const current = { seq: 9, timestamp: new Date(9).toISOString(), preview: "Current question" };
+      const next = { seq: 21, timestamp: new Date(21).toISOString(), preview: "Next question" };
+      const earlierIndex = { epoch: "epoch-1", prompts: [previous] };
+      const latestIndex = { epoch: "epoch-1", prompts: [previous, current, next] };
+      const pending = deferred<typeof latestIndex>();
+      const isRefresh = interrupted === "refresh after a new prompt";
+      if (isRefresh) runtime.listAgentTimelinePrompts.mockResolvedValueOnce(earlierIndex);
+      runtime.listAgentTimelinePrompts
+        .mockReturnValueOnce(pending.promise)
+        .mockResolvedValue(latestIndex);
+      runtime.fetchAgentTimeline.mockResolvedValue(undefined);
+      const viewportRef = createRef<StreamViewportHandle>();
+      const loadedHead: StreamItem[] = [
+        {
+          kind: "user_message",
+          id: "prompt-9",
+          text: "Current question",
+          timestamp: new Date(9),
+          timelineCursor: { epoch: "epoch-1", seq: 9 },
+        },
+      ];
+
+      function NativePromptBar({ head }: { head: StreamItem[] }) {
+        const outline = useChatOutline({
+          agentId: "agent-1",
+          serverId: "server-1",
+          timelineEpoch: "epoch-1",
+          tail: [],
+          head,
+          enabled: shouldTrackChatOutline({
+            isNative: true,
+            railEnabled: false,
+            supportsPromptIndex: true,
+          }),
+          viewportRef,
+          onJumpError: vi.fn(),
+        });
+        useReportStationaryNativeReading(outline.reportReadingPosition, "epoch-1", 10);
+        return (
+          <ActivePromptBar
+            activePrompt={outline.activePrompt}
+            prompts={outline.prompts}
+            onJumpToPrompt={outline.jumpToPrompt}
+            contentMaxWidth={undefined}
+          />
+        );
+      }
+
+      const view = render(<NativePromptBar head={isRefresh ? [] : loadedHead} />);
+      if (isRefresh) {
+        await view.findByRole("button", { name: "Prompt 1/1: Previous question" });
+        view.rerender(<NativePromptBar head={loadedHead} />);
+      }
+      const requestsBeforeDisconnect = isRefresh ? 2 : 1;
+      expect(runtime.listAgentTimelinePrompts).toHaveBeenCalledTimes(requestsBeforeDisconnect);
+
+      await act(async () => {
+        publishConnection(false);
+        pending.reject(new Error("Client disconnected"));
+      });
+      expect(runtime.listAgentTimelinePrompts).toHaveBeenCalledTimes(requestsBeforeDisconnect);
+      const currentPrompt = { name: "Prompt 2/3: Current question" };
+      expect(view.queryByRole("button", currentPrompt)).toBeNull();
+
+      // The reconnect uses the same client, feature flag, timeline epoch, and loaded prompt.
+      await act(async () => publishConnection(true));
+      expect(view.getByRole("button", currentPrompt).textContent).toContain("Current question");
+
+      // Another host notification and a catch-up render with the same prompt don't refresh it.
+      await act(async () => publishConnection(true));
+      view.rerender(<NativePromptBar head={[...loadedHead]} />);
+      expect(runtime.listAgentTimelinePrompts).toHaveBeenCalledTimes(requestsBeforeDisconnect + 1);
+      expect(runtime.listAgentTimelinePrompts).toHaveBeenLastCalledWith("agent-1");
+
+      await act(async () => {
+        fireEvent.click(view.getByTestId("active-prompt-bar-prev"));
+        fireEvent.click(view.getByTestId("active-prompt-bar-next"));
+      });
+      expect(runtime.fetchAgentTimeline).toHaveBeenCalledTimes(2);
+      expect(runtime.fetchAgentTimeline).toHaveBeenNthCalledWith(
+        1,
+        "server-1",
+        "agent-1",
+        expect.objectContaining({ cursor: { epoch: "epoch-1", seq: 25 } }),
+      );
+      expect(runtime.fetchAgentTimeline).toHaveBeenNthCalledWith(
+        2,
+        "server-1",
+        "agent-1",
+        expect.objectContaining({ cursor: { epoch: "epoch-1", seq: 42 } }),
+      );
+      expect(runtime.subscribeAgentTimeline).not.toHaveBeenCalled();
+    },
+  );
 
   it("reports a failed unloaded prompt jump", async () => {
     runtime.listAgentTimelinePrompts.mockResolvedValue({

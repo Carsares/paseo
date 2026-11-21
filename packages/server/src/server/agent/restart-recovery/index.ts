@@ -17,11 +17,16 @@ interface Dependencies {
   dispatch(agentId: string, prompt: string): Promise<void>;
   report(agentId: string, error: unknown): void;
 }
+interface StartupRecovery {
+  promise: Promise<void>;
+  resolve(): void;
+  forced: boolean;
+  dispatched: boolean;
+  canceled?: boolean;
+}
+
 export function createRestartRecovery(deps: Dependencies) {
-  const resuming = new Map<
-    string,
-    { promise: Promise<void>; resolve(): void; forced: boolean; dispatched: boolean }
-  >();
+  const resuming = new Map<string, StartupRecovery>();
   const oneShot = { path: deps.oneShotMarkerPath, agentIds: new Set<string>() };
   // Opening a session or failing to start its turn can persist an idle/error
   // snapshot before confirmation. Keep automatic intent outside that snapshot.
@@ -96,39 +101,37 @@ export function createRestartRecovery(deps: Dependencies) {
     }
   }
 
-  function consumeMarkerAgent(marker: typeof oneShot, agentId: string): Promise<void> {
-    if (!marker.agentIds.has(agentId)) return Promise.resolve();
-    // Dispatches run independently, but each marker write must see every prior removal.
-    async function consume() {
-      const remaining = new Set(marker.agentIds);
-      if (!remaining.delete(agentId)) return;
-      await writeRemainingMarker(marker.path, remaining);
-      marker.agentIds = remaining;
-    }
-    const write = markerWrites.then(consume);
+  function serializeRecoveryWrites(operation: () => Promise<void>): Promise<void> {
+    const write = markerWrites.then(operation);
     markerWrites = write.catch(() => {});
     return write;
   }
 
-  async function resume(agentId: string, forced: boolean) {
+  async function consumeMarkerAgent(marker: typeof oneShot, agentId: string): Promise<void> {
+    const remaining = new Set(marker.agentIds);
+    if (!remaining.delete(agentId)) return;
+    await writeRemainingMarker(marker.path, remaining);
+    marker.agentIds = remaining;
+  }
+
+  async function resume(agentId: string, intent: StartupRecovery) {
     const record = await deps.storage.get(agentId);
+    const { forced } = intent;
     const marker = forced ? oneShot : automatic;
-    if (record && (forced || record.resumeOnStartup || automatic.agentIds.has(agentId))) {
-      if ((forced || deps.settings().enabled) && (await eligible(record))) {
-        await deps.dispatch(agentId, deps.settings().prompt);
-      }
-      // With recovery disabled the one-shot marker remains authoritative even
-      // if clearing the agent's persisted flag fails.
-      await consumeMarkerAgent(marker, agentId);
-      // Dispatch can load and update the agent. Clear the flag on its latest record.
-      await deps.storage.flush();
-      const latest = await deps.storage.get(agentId);
-      if (latest?.resumeOnStartup) {
-        await deps.storage.upsert({ ...latest, resumeOnStartup: false });
-      }
-    } else {
-      await consumeMarkerAgent(marker, agentId);
+    if (
+      record &&
+      (forced || record.resumeOnStartup || automatic.agentIds.has(agentId)) &&
+      (await eligible(record)) &&
+      !intent.canceled &&
+      (forced || deps.settings().enabled)
+    ) {
+      await deps.dispatch(agentId, deps.settings().prompt);
     }
+    await serializeRecoveryWrites(async () => {
+      if (intent.canceled) return;
+      await consumeMarkerAgent(marker, agentId);
+      if (record) await deps.storage.clearAgentRecovery(agentId);
+    });
   }
   return {
     assertStartupRecoverySettled() {
@@ -186,51 +189,66 @@ export function createRestartRecovery(deps: Dependencies) {
         await writeRemainingMarker(automatic.path, automatic.agentIds);
       }
     },
-    async captureRunningAgents(options?: {
+    cancelAutomaticRecovery() {
+      for (const intent of resuming.values()) {
+        if (!intent.forced) intent.canceled = true;
+      }
+      return serializeRecoveryWrites(async () => {
+        // Use the latest record in its storage write queue. Opening or closing a
+        // session can persist another snapshot while this setting is being applied.
+        for (const record of await deps.storage.listAll()) {
+          if (!oneShot.agentIds.has(record.id)) await deps.storage.clearAgentRecovery(record.id);
+        }
+        await writeRemainingMarker(automatic.path, new Set());
+        automatic.agentIds.clear();
+      });
+    },
+    captureRunningAgents(options?: {
       force?: boolean;
       listRunningAgents?: () => readonly RecoveryCandidate[];
     }) {
-      const force = options?.force === true;
-      const shouldResume = force || deps.settings().enabled;
-      await deps.storage.flush();
-      const capturedAgentIds: string[] = [];
-      const records = await deps.storage.listAll();
-      if (shouldResume && options?.listRunningAgents) {
-        // Snapshot writes are best effort elsewhere. A missing running record must
-        // fail this request instead of being silently skipped by the storage scan.
-        const byId = new Map(records.map((record) => [record.id, record]));
-        for (const live of options.listRunningAgents()) {
-          const record = byId.get(live.id);
-          if (record?.lastStatus !== "running" && (await eligible(record ?? live))) {
-            if (!options.listRunningAgents().some((agent) => agent.id === live.id)) continue;
-            throw new Error(`Could not persist running agent ${live.id} for recovery`);
+      return serializeRecoveryWrites(async () => {
+        const force = options?.force === true;
+        const shouldResume = force || deps.settings().enabled;
+        await deps.storage.flush();
+        const capturedAgentIds: string[] = [];
+        const records = await deps.storage.listAll();
+        if (force && options?.listRunningAgents) {
+          // Snapshot writes are best effort elsewhere. A missing running record must
+          // fail this request instead of being silently skipped by the storage scan.
+          const byId = new Map(records.map((record) => [record.id, record]));
+          for (const live of options.listRunningAgents()) {
+            const record = byId.get(live.id);
+            if (record?.lastStatus !== "running" && (await eligible(record ?? live))) {
+              if (!options.listRunningAgents().some((agent) => agent.id === live.id)) continue;
+              throw new Error(`Could not persist running agent ${live.id} for recovery`);
+            }
           }
         }
-      }
-      // Shutdown recovery captures running state once before the daemon exits.
-      for (const record of records) {
-        if (record.lastStatus !== "running" || !(await eligible(record))) continue;
-        const captured = await deps.storage.setRunningAgentRecovery(record.id, shouldResume);
-        if (force && captured) capturedAgentIds.push(record.id);
-      }
-      await deps.storage.flush();
-      if (force && deps.oneShotMarkerPath) {
-        // A failed startup dispatch can still be pending when the daemon stops again.
-        await writeFileAtomic(
-          deps.oneShotMarkerPath,
-          JSON.stringify({
-            version: 2,
-            agentIds: [...new Set([...oneShot.agentIds, ...capturedAgentIds])],
-          }),
-        );
-      }
+        // Shutdown recovery captures running state once before the daemon exits.
+        for (const record of records) {
+          if (record.lastStatus !== "running" || !(await eligible(record))) continue;
+          const captured = await deps.storage.setRunningAgentRecovery(record.id, shouldResume);
+          if (force && captured) capturedAgentIds.push(record.id);
+        }
+        await deps.storage.flush();
+        if (force && deps.oneShotMarkerPath) {
+          // A failed startup dispatch can still be pending when the daemon stops again.
+          const agentIds = new Set([...oneShot.agentIds, ...capturedAgentIds]);
+          await writeFileAtomic(
+            deps.oneShotMarkerPath,
+            JSON.stringify({ version: 2, agentIds: [...agentIds] }),
+          );
+          oneShot.agentIds = agentIds;
+        }
+      });
     },
     /** Resume every candidate in the background; a slow provider holds back only its agent. */
     resumePending() {
       for (const [agentId, settled] of resuming) {
         if (settled.dispatched) continue;
         settled.dispatched = true;
-        void resume(agentId, settled.forced)
+        void resume(agentId, settled)
           .catch((error) => deps.report(agentId, error))
           .finally(() => {
             resuming.delete(agentId);

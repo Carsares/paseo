@@ -153,7 +153,7 @@ import type { LocalSpeechProviderConfig } from "./speech/providers/local/config.
 import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
 import { createSpeechSettingsOwner } from "./speech/speech-settings.js";
-import { AgentManager } from "./agent/agent-manager.js";
+import { AgentManager, AgentManagerShuttingDownError } from "./agent/agent-manager.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { recoverAgentWorkspaceMove } from "./agent/agent-workspace-move-journal.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
@@ -1112,8 +1112,10 @@ export async function createPaseoDaemon(
     report: (agentId, err) => logger.error({ agentId, err }, "Agent restart recovery failed"),
   });
   await restartRecovery.prepareStartup();
+  daemonConfigStore.setRestartRecoveryCleanup(restartRecovery.cancelAutomaticRecovery);
   const lifecyclePreparation = createLifecyclePreparation({
     assertStartupRecoverySettled: restartRecovery.assertStartupRecoverySettled,
+    report: (err) => logger.warn({ err }, "Agent recovery preparation did not finish"),
     pauseDelivery: () => wsServer?.agentMessages.pauseAdmission(),
     pauseRunAdmission: () => agentManager.pauseRunAdmission(),
     waitForAdmittedRunsToStart: () => agentManager.waitForAdmittedRunsToStart(),
@@ -2137,14 +2139,13 @@ export async function createPaseoDaemon(
   const stop = async (options?: { keepTerminals?: boolean; resumeAgents?: boolean }) => {
     const keepTerminals = options?.keepTerminals === true;
     const resumeAgents = options?.resumeAgents === true;
-    let recoveryPreparationFailed = false;
+    let deliveryDrained = false;
     let terminalShutdownError: unknown = null;
     // Lifecycle requests save recovery before acknowledgement. Signal-driven stops prepare here.
     try {
-      await lifecyclePreparation.beforeStop(resumeAgents);
+      ({ deliveryDrained } = await lifecyclePreparation.beforeStop(resumeAgents));
     } catch (error) {
       if (resumeAgents) throw error;
-      recoveryPreparationFailed = true;
       logger.warn(
         { err: error },
         "Failed to prepare agent recovery during shutdown; continuing cleanup",
@@ -2167,13 +2168,9 @@ export async function createPaseoDaemon(
     wsServer?.prepareForShutdown();
     await changeRequestWatches.close();
     await finishSubscriptions.close();
-    const deliveryClosed = wsServer?.agentMessages.close();
-    // If recovery preparation timed out on dispatch, provider shutdown may be what unblocks it.
-    if (recoveryPreparationFailed) {
-      void deliveryClosed?.catch((error) =>
-        logger.warn({ err: error }, "Failed to close agent message delivery"),
-      );
-    } else await deliveryClosed;
+    await wsServer?.agentMessages.close(
+      deliveryDrained ? undefined : { deferWith: new AgentManagerShuttingDownError() },
+    );
     agentManager.prepareForShutdown();
     await closeAllAgents(logger, agentManager);
     await withTimeout({

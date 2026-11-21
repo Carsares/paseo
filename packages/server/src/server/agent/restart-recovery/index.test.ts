@@ -91,6 +91,7 @@ test("an ordinary stop leaves time for cleanup when the two admission waits over
   const releaseDelivery = vi.fn();
   const releaseRuns = vi.fn();
   const capture = vi.fn(async () => {});
+  const report = vi.fn();
   const lifecycle = createLifecyclePreparation({
     pauseDelivery: () => ({
       drained: new Promise<void>((resolve) => setTimeout(resolve, 4_000)),
@@ -99,15 +100,20 @@ test("an ordinary stop leaves time for cleanup when the two admission waits over
     pauseRunAdmission: () => releaseRuns,
     waitForAdmittedRunsToStart: () => new Promise<void>(() => {}),
     capture,
+    report,
   });
   try {
     const stopped = lifecycle.beforeStop(false);
-    const assertion = expect(stopped).rejects.toThrow("settle agent run admissions");
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(releaseDelivery).toHaveBeenCalledOnce();
-    expect(releaseRuns).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(4_999);
     expect(capture).not.toHaveBeenCalled();
-    await assertion;
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(stopped).resolves.toEqual({ deliveryDrained: true });
+    expect(report).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining("settle agent run admissions") }),
+    );
+    expect(capture).toHaveBeenCalledExactlyOnceWith(false);
+    expect(releaseDelivery).not.toHaveBeenCalled();
+    expect(releaseRuns).not.toHaveBeenCalled();
   } finally {
     vi.useRealTimers();
   }
@@ -456,7 +462,7 @@ test("does not dispatch a completed one-shot recovery again if clearing its agen
     const first = start(storage);
     await first.prepareStartup();
     const writeError = new Error("Agent record write failed");
-    vi.spyOn(storage, "upsert").mockRejectedValueOnce(writeError);
+    vi.spyOn(storage, "clearAgentRecovery").mockRejectedValueOnce(writeError);
     first.resumePending();
     const signal = new AbortController().signal;
     await first.waitForResume("working", signal);

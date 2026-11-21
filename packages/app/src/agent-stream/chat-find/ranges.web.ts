@@ -1,5 +1,6 @@
 const BLOCKS = ["p", "pre", "li", "td", "th", "h1", "h2", "h3", "h4", "h5", "h6"]
   .flatMap((tag) => [tag, `[data-paseo-markdown-tag="${tag}"]`])
+  .concat('[data-find-text-block="true"]')
   .join(",");
 const IGNORED =
   '[data-paseo-markdown-ignore="true"], [aria-hidden="true"], button, [role="button"], svg, script, style';

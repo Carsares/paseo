@@ -810,7 +810,11 @@ describe("terminal collection protocol compatibility", () => {
 
 test("keeps parent report negotiation and report status optional on the wire", () => {
   const minimal = { status: "server_info", serverId: "host" };
-  const features = { agentExplicitParentReports: true, agentDirectParentQueuedDelivery: true };
+  const features = {
+    agentExplicitParentReports: true,
+    agentDirectParentQueuedDelivery: true,
+    agentTrackRemoteParentReports: true,
+  };
   expect(parseServerInfoStatusPayload(minimal)).not.toBeNull();
   expect(parseServerInfoStatusPayload({ ...minimal, features })?.features).toMatchObject(features);
   const request = {

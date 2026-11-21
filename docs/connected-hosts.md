@@ -65,6 +65,11 @@ connection to the child, and the child can push it over an existing authenticate
 the parent. Both routes share the same delivery receipt. The child keeps the report until
 the parent acknowledges dispatch or the relationship no longer permits delivery.
 
+When a parent host advertises `agentTrackRemoteParentReports`, SDK creation through
+`hosts.client` registers a durable pull watch on that host for an explicit child of one of
+its agents. This also applies to workspace creation with an initial agent. Registration
+checks both hosts' workspace grants and the relationship saved by the destination.
+
 Remote creation and local subscription persistence are separate commits. A failed local write reports
 failure even if the destination already created the child; inspect it before retrying creation.
 See [finish notification lifetime](agent-lifecycle.md#relationships) for registration, acknowledgment,

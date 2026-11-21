@@ -3,6 +3,8 @@ export type { TerminalReplayEvent, TerminalStreamEvent } from "./terminal-stream
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import {
   EXPLICIT_PARENT_REPORTING,
+  getParentAddressFromLabels,
+  isExplicitParentReportingLabels,
   PARENT_REPORTING_LABEL,
   parentAddressLabels,
 } from "@getpaseo/protocol/agent-labels";
@@ -685,7 +687,7 @@ function toDaemonAgentCreateOptions(
 
 export function createPaseoApi(
   daemonClient: DaemonClient,
-  scopeOptions?: { signal?: AbortSignal },
+  scopeOptions?: { signal?: AbortSignal; routeOrigin?: DaemonClient },
 ): PaseoApi {
   const handles = new Set<{ release(): Promise<void> }>();
   const agentListeners = new Set<PaseoAgentUpdateHandler>();
@@ -722,6 +724,33 @@ export function createPaseoApi(
     (agentId, handler) => own(() => daemonClient.subscribeAgentTimeline(agentId, handler)),
     () => own(() => daemonClient.observeAgentBackgroundWork()),
   );
+  const trackExplicitChild = async (agent: AgentSnapshotPayload, workspaceId?: string) => {
+    const origin = scopeOptions?.routeOrigin;
+    const originInfo = origin?.getLastServerInfoMessage();
+    // COMPAT(agentTrackRemoteParentReports): added in v0.17.0, remove after 2027-05-22.
+    if (!origin || originInfo?.features?.agentTrackRemoteParentReports !== true) return;
+    const destination = daemonClient.getLastServerInfoMessage()?.serverId;
+    if (!destination || !isExplicitParentReportingLabels(agent.labels)) return;
+    const parent = getParentAddressFromLabels(agent.labels, destination);
+    if (!parent || parent.serverId !== originInfo.serverId || destination === parent.serverId)
+      return;
+    try {
+      await origin.trackAgentFinishReports(destination, agent.id, parent.agentId);
+    } catch (cause) {
+      throw Object.assign(
+        new Error(
+          "The destination created the child but the parent host could not register report delivery.",
+          { cause },
+        ),
+        {
+          code: "parent_report_registration_failed",
+          agentId: agent.id,
+          serverId: destination,
+          workspaceId,
+        },
+      );
+    }
+  };
   const createAgent = async (
     options: PaseoAgentCreateOptions,
     placement?: { workspaceId: string; cwd: string },
@@ -735,6 +764,7 @@ export function createPaseoApi(
     const agent = await daemonClient.createAgent(
       toDaemonAgentCreateOptions(resolved, placement, serverId),
     );
+    await trackExplicitChild(agent, agent.workspaceId ?? undefined);
     return createAgentHandle(agent);
   };
   const terminals = createTerminalActions(daemonClient, async (workspaceId) => {
@@ -876,6 +906,7 @@ export function createPaseoApi(
         if (result.error || !result.workspace) {
           throw new Error(result.error ?? "The daemon did not create a workspace");
         }
+        if (result.agent) await trackExplicitChild(result.agent, result.workspace.id);
         return createWorkspaceHandle(result.workspace);
       },
       archive: (workspace, requestId) =>

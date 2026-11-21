@@ -87,6 +87,42 @@ test("a queued child report and completion reach the recipient in one steer afte
   ]);
 });
 
+test("a verified child report requests an upward follow-up while chat and checkpoints do not", async () => {
+  const clock = createClock();
+  const requests: { shouldReportUpward: boolean; kind: string | undefined }[] = [];
+  const delivery = createAgentMessageDelivery({
+    schedule: clock.schedule,
+    dispatch: async ({ shouldReportUpward, prompt }) => {
+      requests.push({
+        shouldReportUpward,
+        kind: parseAgentMessages(String(prompt))?.[0]?.source?.kind,
+      });
+      return "turn_started";
+    },
+    onError: (error) => {
+      throw error;
+    },
+  });
+  const agent = { agentId: "child" };
+  const message = { recipientId: "lead", prompt: "Child update" };
+  for (const input of [
+    { ...message, source: { ...agent, kind: "agent-message" } },
+    { ...message, source: { ...agent, kind: "agent-notification", event: "permission-required" } },
+    { ...message, source: { ...agent, kind: "agent-message" }, childReported: true },
+  ] as const) {
+    const receipt = delivery.enqueue(input);
+    clock.advance(2000);
+    await receipt.dispatched;
+  }
+
+  expect(requests).toEqual([
+    { shouldReportUpward: false, kind: "agent-message" },
+    { shouldReportUpward: false, kind: "agent-notification" },
+    { shouldReportUpward: true, kind: "agent-message" },
+  ]);
+  await delivery.close();
+});
+
 test("recipient timers are independent, later messages form another batch, and close flushes pending work", async () => {
   const clock = createClock();
   const sent: string[] = [];

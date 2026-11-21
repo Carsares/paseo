@@ -424,6 +424,8 @@ export class DaemonConfigStore {
   private readonly startupPersisted: PersistedConfig;
   private readonly speechOwner: SpeechSettingsOwner | undefined;
   private lastKnownPersisted: PersistedConfig;
+  private restartRecoveryCleanup?: () => Promise<void>;
+  private restartRecoveryCleanupPending = false;
 
   constructor(
     paseoHome: string,
@@ -454,20 +456,24 @@ export class DaemonConfigStore {
     return this.current;
   }
 
+  public setRestartRecoveryCleanup(cleanup: () => Promise<void>): void {
+    this.restartRecoveryCleanup = cleanup;
+  }
+
   public patch(
     partial:
       | MutableDaemonConfigPatch
       | ((current: MutableDaemonConfig) => MutableDaemonConfigPatch),
   ): Promise<MutableDaemonConfig> {
-    return this.enqueue(() =>
-      this.applySupportedPatch(
-        pickSupportedPatchFields(
-          MutableDaemonConfigPatchSchema.parse(
-            typeof partial === "function" ? partial(this.current) : partial,
-          ),
+    return this.enqueue(async () => {
+      const patch = pickSupportedPatchFields(
+        MutableDaemonConfigPatchSchema.parse(
+          typeof partial === "function" ? partial(this.current) : partial,
         ),
-      ),
-    );
+      );
+      if (patch.resumeOnStartup !== undefined) await this.finishRestartRecoveryCleanup();
+      return this.applySupportedPatch(patch);
+    });
   }
 
   public setAgentSkillSelection(selection: AgentSkillSelection): Promise<MutableDaemonConfig> {
@@ -512,6 +518,8 @@ export class DaemonConfigStore {
     );
 
     const configChanged = !isEqualValue(this.current, next);
+    const disablingRecovery =
+      this.current.resumeOnStartup === true && next.resumeOnStartup !== true;
 
     // A replaced API key leaves the speech view unchanged, so a speech patch always persists.
     // Profiles held folded in memory may still be on disk with `featureValues`; saving them writes `options`.
@@ -541,6 +549,7 @@ export class DaemonConfigStore {
       }
     }
     this.lastKnownPersisted = knownNext;
+    await this.finishRestartRecoveryChange(disablingRecovery);
     if (speechChanged) this.speechOwner?.apply(knownNext);
 
     return this.current;
@@ -624,8 +633,12 @@ export class DaemonConfigStore {
       (provider) => !(provider in desired.providers),
     );
     const speechChanged = this.speechPersistedChanged(this.lastKnownPersisted, persisted);
+    const disablingRecovery =
+      this.current.resumeOnStartup === true && desired.resumeOnStartup !== true;
+    await this.finishRestartRecoveryCleanup();
     this.applyReplacement(desired, { removedProviders });
     this.lastKnownPersisted = persisted;
+    await this.finishRestartRecoveryChange(disablingRecovery);
     if (speechChanged && this.speechOwner) {
       this.speechOwner.apply(persisted);
       appliedPaths.push(
@@ -640,6 +653,19 @@ export class DaemonConfigStore {
       restartRequiredPaths,
       overrideControlledPaths,
     };
+  }
+
+  private async finishRestartRecoveryChange(disablingRecovery: boolean): Promise<void> {
+    if (!disablingRecovery || !this.restartRecoveryCleanup) return;
+    this.restartRecoveryCleanupPending = true;
+    await this.finishRestartRecoveryCleanup();
+  }
+
+  private async finishRestartRecoveryCleanup(): Promise<void> {
+    if (!this.restartRecoveryCleanupPending) return;
+    // Re-enabling must wait for a prior disable to durably consume its intent.
+    await this.restartRecoveryCleanup?.();
+    this.restartRecoveryCleanupPending = false;
   }
 
   private applyReplacement(

@@ -4,17 +4,19 @@ import {
   WORKSPACE_ROLE_LABEL,
   WORKSPACE_MAIN_ROLE,
 } from "@getpaseo/protocol/agent-labels";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pino from "pino";
 import { expect, test } from "vitest";
 import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
 import { createPersistedWorkspaceRecord } from "../workspace-registry.js";
+import { ensureAgentLoaded } from "./agent-loading.js";
 import { AgentManager } from "./agent-manager.js";
 import { formatAgentMessage } from "./agent-messages/envelope.js";
 import type { AgentStreamEvent, AgentTimelineItem } from "./agent-sdk-types.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
+import { sliceTimelineRowsAtBoundary } from "./timeline-prefix-store.js";
 import { summarizeWorkspaceAgents } from "./workspace-agents-summary.js";
 
 test("summarizes only the selected workspace and releases successful and failed cold readers", async () => {
@@ -227,6 +229,242 @@ test("summarizes only the selected workspace and releases successful and failed 
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+async function readStoredFiles(dir: string) {
+  const names = (await readdir(dir, { recursive: true, withFileTypes: true }))
+    .filter((entry) => entry.isFile())
+    .map((entry) => join(entry.parentPath, entry.name))
+    .sort();
+  return Promise.all(
+    names.map(async (path) => {
+      const { ino, mtimeMs } = await stat(path);
+      return { path, ino, mtimeMs, bytes: await readFile(path) };
+    }),
+  );
+}
+
+test.each([
+  { operation: "switch", replay: "available" },
+  { operation: "fork", replay: "available" },
+  { operation: "fork", replay: "no handle" },
+  { operation: "switch", replay: "failed" },
+])(
+  "summarizes retained history after a $operation with $replay provider replay",
+  async ({ operation, replay }) => {
+    const cwd = await mkdtemp(join(tmpdir(), "workspace-summary-prefix-"));
+    const logger = pino({ level: "silent" });
+    const agentsDir = join(cwd, "agents");
+    const storage = new AgentStorage(agentsDir, logger);
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    const workspace = createPersistedWorkspaceRecord({
+      workspaceId: "wks_1234567890abcdef",
+      projectId: "prj_1234567890abcdef",
+      cwd,
+      kind: "directory",
+      displayName: "Summary workspace",
+      createdAt,
+      updatedAt: createdAt,
+    });
+    const { workspaceId } = workspace;
+    const workspaceRegistry = { get: async () => workspace };
+
+    const firstPrompt = {
+      type: "user_message",
+      text: "Add a parser",
+      messageId: "request-1",
+    } as const;
+    const priorConclusion = {
+      type: "assistant_message",
+      text: "Parser added",
+      messageId: "reply-1",
+    } as const;
+    const repeatedPrompt = { ...firstPrompt, messageId: "request-2" };
+    const originalEdit = {
+      type: "tool_call",
+      name: "Edit",
+      callId: "session-local-edit",
+      status: "completed",
+      error: null,
+      detail: { type: "edit", filePath: "src/parser.ts" },
+    } as const;
+    const followup: AgentTimelineItem[] = [
+      { type: "user_message", text: "Cover the empty input case" },
+      { ...originalEdit, detail: { type: "edit", filePath: "src/parser.test.ts" } },
+      { type: "assistant_message", text: "Empty input covered", messageId: "reply-1" },
+    ];
+
+    const codex = createTestAgentClient("codex");
+    const originalManager = new AgentManager({
+      clients: { codex, claude: createTestAgentClient("claude") },
+      registry: storage,
+      logger,
+    });
+    const historyReads: Array<{ purpose?: string; closes: number }> = [];
+    const createdProviders: string[] = [];
+    const startedTurns: string[] = [];
+    const revivedClaude = createTestAgentClient("claude", {
+      beforeCreateSession: async () => {
+        createdProviders.push("claude");
+      },
+      onStartTurn: () => {
+        startedTurns.push("claude");
+      },
+    });
+    const resume = revivedClaude.resumeSession.bind(revivedClaude);
+    revivedClaude.resumeSession = async (handle, config, launchContext, options) => {
+      const read = { purpose: options?.purpose, closes: 0 };
+      historyReads.push(read);
+      const session = await resume(handle, config, launchContext, options);
+      const close = session.close.bind(session);
+      session.close = async () => {
+        read.closes++;
+        await close();
+      };
+      session.streamHistory = async function* () {
+        yield {
+          type: "timeline",
+          provider: "claude",
+          item: repeatedPrompt,
+          timestamp: "2026-01-02T00:00:00.000Z",
+        } as const;
+        for (const item of followup) yield { type: "timeline", provider: "claude", item } as const;
+        if (replay === "failed") throw new Error("Provider history is unavailable");
+        // A provider may replay messages already retained in the fork or switch.
+        for (const item of [firstPrompt, priorConclusion]) {
+          yield { type: "timeline", provider: "claude", item } as const;
+        }
+      };
+      return session;
+    };
+    const restartedStorage = new AgentStorage(agentsDir, logger);
+    const restartedManager = new AgentManager({
+      clients: {
+        codex: createTestAgentClient("codex", {
+          beforeCreateSession: async () => {
+            createdProviders.push("codex");
+          },
+          onStartTurn: () => {
+            startedTurns.push("codex");
+          },
+        }),
+        claude: revivedClaude,
+      },
+      registry: restartedStorage,
+      logger,
+    });
+    const events: string[] = [];
+    const unsubscribe = restartedManager.subscribe((event) => events.push(event.type), {
+      replayState: false,
+    });
+
+    try {
+      const source = await originalManager.createAgent({ provider: "codex", cwd }, undefined, {
+        workspaceId,
+      });
+      for (const item of [firstPrompt, originalEdit, priorConclusion]) {
+        await originalManager.appendTimelineItem(source.id, item);
+      }
+      let id = source.id;
+      if (operation === "switch") {
+        await originalManager.switchAgentProvider(id, { provider: "claude", model: "haiku" });
+      } else {
+        const { rows, epoch } = originalManager.fetchTimeline(source.id, { limit: 0 });
+        await originalManager.appendTimelineItem(source.id, {
+          type: "assistant_message",
+          text: "Outside the selected history",
+          messageId: "outside-fork",
+        });
+        const currentRows = originalManager.fetchTimeline(source.id, { limit: 0 }).rows;
+        const fork = await originalManager.createAgent({ provider: "claude", cwd }, undefined, {
+          workspaceId,
+          forkedTimelineRows: sliceTimelineRowsAtBoundary(currentRows, {
+            boundaryCursor: { epoch, seq: rows.at(-1)!.seq },
+            timelineEpoch: epoch,
+          }),
+        });
+        id = fork.id;
+      }
+      for (const agent of originalManager.listAgents()) await originalManager.closeAgent(agent.id);
+      await originalManager.flush();
+      const persisted = (await storage.get(id))!;
+      if (replay === "no handle") await storage.upsert({ ...persisted, persistence: undefined });
+      const filesBefore = await readStoredFiles(agentsDir);
+      expect(
+        filesBefore
+          .find(({ path }) => path.endsWith(`/${id}.timeline-prefix.json`))
+          ?.bytes.toString(),
+      ).toContain("src/parser.ts");
+      const summarize = async () => {
+        const { entries } = await summarizeWorkspaceAgents({
+          workspaceId,
+          agentManager: restartedManager,
+          agentStorage: restartedStorage,
+          workspaceRegistry,
+          logger,
+        });
+        return entries.find(({ agentId }) => agentId === id);
+      };
+      const cold = await summarize();
+      const expectedDetails = {
+        firstUserPrompt: "Add a parser",
+        lastAssistantSummary: replay === "available" ? "Empty input covered" : "Parser added",
+        touchedFiles:
+          replay === "available" ? ["src/parser.ts", "src/parser.test.ts"] : ["src/parser.ts"],
+      };
+      expect.soft(cold).toMatchObject(expectedDetails);
+      const expectedUserMessages =
+        replay === "available" ? [firstPrompt, repeatedPrompt, followup[0]] : [firstPrompt];
+      const coldItems = await restartedManager.readTimelineForSummary(id, workspaceId);
+      expect
+        .soft(coldItems?.filter(({ type }) => type === "user_message"))
+        .toEqual(expectedUserMessages);
+      expect(historyReads).toEqual(
+        replay === "no handle"
+          ? []
+          : [
+              { purpose: "history", closes: 1 },
+              { purpose: "history", closes: 1 },
+            ],
+      );
+      expect(restartedManager.listAgents()).toEqual([]);
+      expect(events).toEqual([]);
+      expect(createdProviders).toEqual([]);
+      expect(startedTurns).toEqual([]);
+      expect(await readStoredFiles(agentsDir)).toEqual(filesBefore);
+
+      const openChat = ensureAgentLoaded(id, {
+        agentManager: restartedManager,
+        agentStorage: restartedStorage,
+        logger,
+        purpose: "history",
+      });
+      if (replay === "failed") {
+        await expect(openChat).rejects.toThrow("Provider history is unavailable");
+        expect(restartedManager.getAgent(id)).not.toBeNull();
+      } else {
+        await openChat;
+        expect(
+          restartedManager.getTimeline(id).filter(({ type }) => type === "user_message"),
+        ).toEqual(expectedUserMessages);
+      }
+      const warmed = await summarize();
+      expect(warmed).toMatchObject(expectedDetails);
+      expect(cold).toMatchObject({
+        firstUserPrompt: warmed?.firstUserPrompt,
+        lastAssistantSummary: warmed?.lastAssistantSummary,
+        touchedFiles: warmed?.touchedFiles,
+      });
+      expect(historyReads).toHaveLength(replay === "no handle" ? 0 : 3);
+    } finally {
+      unsubscribe();
+      for (const manager of [originalManager, restartedManager]) {
+        await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+        await manager.flush();
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
 
 test.each(["active", "archived", "absent"])(
   "distinguishes children of an independent root when Main Control is %s",

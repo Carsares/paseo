@@ -2098,6 +2098,187 @@ test(
   },
 );
 
+test.each([
+  ["agent", "completed"],
+  ["workspace", "blocked"],
+] as const)(
+  "public routed %s creation delivers a %s report across reconnect",
+  { timeout: 30000 },
+  async (entry, status) => {
+    const prompts: string[] = [];
+    const a = await daemon({
+      agentClients: createTestAgentClients({
+        onStartTurn: (prompt) => prompts.push(String(prompt)),
+      }),
+    });
+    const b = await daemon();
+    const origin = await api(a);
+    const destination = await api(b);
+    const wire = await hostWire(b);
+    const saved = await origin.paseo.hosts.add({ connection: wire.connection });
+    const bId = (await online(origin.paseo)).hosts[0]!.serverId!;
+    const remote = await origin.paseo.hosts.client(bId);
+    const local = await origin.paseo.workspaces.create({
+      source: { kind: "directory", path: a.staticDir },
+    });
+    const parent = await local.agents.create({
+      config: { provider: "claude/claude-test", modeId: "full-access" },
+    });
+    const options = {
+      config: { provider: "claude/claude-test", modeId: "full-access" },
+      title: "Public routed child",
+      parent: entry === "agent" ? parent : parent.address,
+      parentReporting: "explicit" as const,
+      prompt: "Work on the task",
+    };
+    const source = { kind: "directory" as const, path: b.staticDir };
+    let childId: string;
+    if (entry === "agent") {
+      childId = (await remote.agents.create({ ...options, cwd: b.staticDir })).id;
+    } else {
+      const workspace = await remote.workspaces.create({
+        source,
+        agent: { ...options, cwd: b.staticDir },
+      });
+      const { entries } = await destination.paseo.agents.list();
+      const child = entries.find(
+        ({ agent }) => agent.workspaceId === workspace.id && agent.title === options.title,
+      );
+      expect(child).toBeDefined();
+      childId = child!.agent.id;
+    }
+    expect((await destination.client.waitForFinish(childId, 5000)).status).toBe("idle");
+    expect((await destination.paseo.hosts.list()).hosts).toEqual([]);
+    const watches = join(a.paseoHome, "finish-followup-watches.json");
+    const registeredWatches = await readFile(watches, "utf8").catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+        return "[]";
+      },
+    );
+
+    await origin.paseo.hosts.update(saved.registrationId, { enabled: false });
+    const childTools = new Client({ name: "public-routed-child", version: "1" });
+    cleanup.push(() => childTools.close());
+    await childTools.connect(
+      new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${b.port}/mcp/agents?callerAgentId=${childId}`),
+      ),
+    );
+    const result = await childTools.callTool({
+      name: "report_to_parent",
+      arguments: { status, summary: "Report from the SDK child" },
+    });
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({ deliveryStatus: "queued" });
+    const { messageId } = result.structuredContent as { messageId: string };
+    const reportFile = join(b.paseoHome, "finish-followup-reports.json");
+    const reports = async () => JSON.parse(await readFile(reportFile, "utf8"));
+    expect(await reports()).toMatchObject([
+      { id: messageId, report: { parentReportStatus: status } },
+    ]);
+    expect(prompts).toEqual([]);
+
+    await origin.paseo.hosts.update(saved.registrationId, { enabled: true });
+    await online(origin.paseo);
+    await expect.poll(reports, { timeout: 15_000 }).toEqual([]);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain(`Report to parent (${status})`);
+    expect(prompts[0]).toContain(`source-agent-id="${childId}"`);
+    expect(prompts[0]).toContain("Report from the SDK child");
+    expect(JSON.parse(registeredWatches)).toMatchObject([
+      { callerAgentId: parent.id, childAgentId: childId, serverId: bId },
+    ]);
+  },
+);
+
+test.each(["automatic", "explicit"] as const)(
+  "a local %s intermediate only reports upward according to its own mode",
+  { timeout: 20000 },
+  async (parentReporting) => {
+    const turns: string[] = [];
+    const host = await daemon({
+      agentClients: createTestAgentClients({ onStartTurn: (prompt) => turns.push(String(prompt)) }),
+    });
+    const { paseo, client } = await api(host);
+    const workspace = await paseo.workspaces.create({
+      source: { kind: "directory", path: host.staticDir },
+    });
+    const config = { provider: "claude/claude-test", modeId: "full-access" };
+    const root = await workspace.agents.create({ config });
+    async function toolsFor(agentId: string) {
+      const tools = new Client({ name: "local-reporting", version: "1" });
+      cleanup.push(() => tools.close());
+      await tools.connect(
+        new StreamableHTTPClientTransport(
+          new URL(`http://127.0.0.1:${host.port}/mcp/agents?callerAgentId=${agentId}`),
+        ),
+      );
+      return tools;
+    }
+    async function delegate(caller: Client, prompt: string, reporting: "automatic" | "explicit") {
+      const result = await caller.callTool({
+        name: "create_agent",
+        arguments: {
+          provider: config.provider,
+          title: prompt,
+          initialPrompt: prompt,
+          settings: { modeId: config.modeId },
+          ...(reporting === "explicit" ? { parentReporting: reporting } : {}),
+        },
+      });
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      const { agentId } = result.structuredContent as { agentId: string };
+      expect((await client.waitForFinish(agentId, 5000)).status).toBe("idle");
+      return agentId;
+    }
+    const middleId = await delegate(
+      await toolsFor(root.id),
+      "Initial middle turn",
+      parentReporting,
+    );
+    const notifications = () =>
+      turns.filter(
+        (turn) =>
+          turn.includes('event="finished"') && turn.includes(`source-agent-id="${middleId}"`),
+      );
+    const automatic = parentReporting === "automatic";
+    if (automatic) await expect.poll(notifications, { timeout: 7000 }).toHaveLength(1);
+    const childId = await delegate(await toolsFor(middleId), "Initial child turn", "explicit");
+    const childTools = await toolsFor(childId);
+    const report = await childTools.callTool({
+      name: "report_to_parent",
+      arguments: { status: "completed", summary: "Child work finished" },
+    });
+    expect(report.structuredContent).toMatchObject({ deliveryStatus: "queued" });
+    await expect
+      .poll(() => turns.filter((turn) => turn.includes("Child work finished")), {
+        timeout: 7000,
+      })
+      .toHaveLength(1);
+    const reportLog = join(host.paseoHome, "finish-followup-reports.json");
+    await expect.poll(async () => JSON.parse(await readFile(reportLog, "utf8"))).toEqual([]);
+    expect((await client.waitForFinish(middleId, 5000)).status).toBe("idle");
+    if (automatic) {
+      await expect.poll(notifications, { timeout: 7000 }).toHaveLength(2);
+    } else {
+      const initial = await (
+        await toolsFor(middleId)
+      ).callTool({
+        name: "report_to_parent",
+        arguments: { status: "completed", summary: "Middle work finished manually" },
+      });
+      expect(initial.structuredContent).toMatchObject({ deliveryStatus: "queued" });
+      await expect
+        .poll(() => turns.some((turn) => turn.includes("Middle work finished manually")), {
+          timeout: 7000,
+        })
+        .toBe(true);
+      expect(notifications()).toEqual([]);
+    }
+  },
+);
+
 test.each(["completed", "blocked", "archive", "detach"] as const)(
   "handles %s parent report delivery on a one-way link across reconnect",
   { timeout: 30000 },

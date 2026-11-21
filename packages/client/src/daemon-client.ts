@@ -4483,6 +4483,23 @@ export class DaemonClient {
   // Agent Interaction
   // ============================================================================
 
+  async trackAgentFinishReports(
+    childServerId: string,
+    childAgentId: string,
+    parentAgentId: string,
+  ) {
+    const { error } =
+      await this.sendNamespacedCorrelatedSessionRequest<"agent.finish_reports.track.response">({
+        message: {
+          type: "agent.finish_reports.track.request",
+          childServerId,
+          childAgentId,
+          parentAgentId,
+        },
+      });
+    if (error) throw new Error(error);
+  }
+
   async pullAgentFinishReports(
     childAgentId: string,
     parentAgentId: string,

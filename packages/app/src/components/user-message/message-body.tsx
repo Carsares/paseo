@@ -1,14 +1,16 @@
-import { useCallback, useContext, useLayoutEffect, useMemo, useState } from "react";
+import { useCallback, useContext, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Text, View, type LayoutChangeEvent } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { Button } from "@/components/ui/button";
 import { isWeb } from "@/constants/platform";
 import { useDisclosureHold } from "@/agent-stream/disclosure";
-import { ExpandedQuoteCountContext, FindQuoteIndexContext } from "./quote-expansion-context";
+import { FindQuoteIndexContext, UserMessageQuoteExpansionContext } from "./quote-expansion-context";
 import { parseUserMessageSegments } from "./quote-segments";
 
 const MESSAGE_TEXT_DATASET = { messageText: "true" };
+// Match the host's search boundary without treating every React Native Web div as a block.
+const FIND_TEXT_BLOCK_DATASET = { findTextBlock: "true" };
 const QUOTE_PREVIEW_LINES = 3;
 const QUOTE_PREVIEW_CHARACTERS = 160;
 
@@ -45,6 +47,7 @@ export function UserMessageBody({ message }: UserMessageBodyProps) {
             key={previous?.kind === "quote" ? `text-after-${previous.quoteIndex}` : "text-start"}
             selectable
             style={styles.text}
+            dataSet={FIND_TEXT_BLOCK_DATASET}
           >
             {segment.text}
           </Text>
@@ -56,16 +59,12 @@ export function UserMessageBody({ message }: UserMessageBodyProps) {
 
 function UserMessageQuoteBlock({ text, quoteIndex }: { text: string; quoteIndex: number }) {
   const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
+  const quoteExpansion = useContext(UserMessageQuoteExpansionContext);
+  const [standaloneExpanded, setStandaloneExpanded] = useState(false);
+  const expanded = quoteExpansion?.expandedQuotes.has(quoteIndex) ?? standaloneExpanded;
   const expandedForFind = useContext(FindQuoteIndexContext) === quoteIndex;
   const showFullQuote = expanded || expandedForFind;
   const clipMarker = useMemo(() => ({ findQuoteClipped: String(quoteIndex) }), [quoteIndex]);
-  const adjustExpandedQuoteCount = useContext(ExpandedQuoteCountContext);
-  useLayoutEffect(() => {
-    if (!expanded || !adjustExpandedQuoteCount) return;
-    adjustExpandedQuoteCount(1);
-    return () => adjustExpandedQuoteCount(-1);
-  }, [adjustExpandedQuoteCount, expanded]);
   const [previewHeight, setPreviewHeight] = useState(0);
   const [fullHeight, setFullHeight] = useState(0);
   const longSource =
@@ -82,13 +81,20 @@ function UserMessageQuoteBlock({ text, quoteIndex }: { text: string; quoteIndex:
   }, []);
   const hold = useDisclosureHold();
   const toggleExpanded = useCallback(
-    () => hold(() => setExpanded((value) => !value), { triggerEdge: "bottom" }),
-    [hold],
+    () =>
+      hold(
+        () => {
+          if (quoteExpansion) quoteExpansion.toggleQuote(quoteIndex);
+          else setStandaloneExpanded((previous) => !previous);
+        },
+        { triggerEdge: "bottom" },
+      ),
+    [hold, quoteExpansion, quoteIndex],
   );
   const accessibilityState = useMemo(() => ({ expanded }), [expanded]);
 
   return (
-    <View style={styles.quote} testID="user-message-quote-block">
+    <View style={styles.quote} testID="user-message-quote-block" dataSet={FIND_TEXT_BLOCK_DATASET}>
       <View>
         <Text
           selectable

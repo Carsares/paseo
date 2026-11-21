@@ -23,8 +23,12 @@ export function useUserMessageExpanded(itemId: string) {
     (listener: () => void) => expansion.subscribe(itemId, listener),
     [expansion, itemId],
   );
-  const getSnapshot = useCallback(() => expansion.isExpanded(itemId), [expansion, itemId]);
-  const expanded = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const getSnapshot = useCallback(() => expansion.getSnapshot(itemId), [expansion, itemId]);
+  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   const toggle = useCallback(() => expansion.toggle(itemId), [expansion, itemId]);
-  return { expanded, toggle };
+  const toggleQuote = useCallback(
+    (quoteIndex: number) => expansion.toggleQuote(itemId, quoteIndex),
+    [expansion, itemId],
+  );
+  return { ...state, toggle, toggleQuote };
 }

@@ -13,10 +13,15 @@ const ServerPackageJsonSchema = PackageNameSchema.extend({
   paseoAgentResumeOnRestart: z.boolean().optional(),
 });
 
-export async function readInstalledServerRecoveryIdentity(
+export interface InstalledServerTarget {
+  identity: string;
+  agentResumeSupported: boolean;
+}
+
+export async function readInstalledServerTarget(
   install: NpmGlobalPaseoInstall,
   currentServerRoot: string | null,
-): Promise<string | null> {
+): Promise<InstalledServerTarget | null> {
   if (install.isLinked || !currentServerRoot) return null;
   try {
     // Resolve from the installed CLI, the same package resolution used to launch its daemon.
@@ -43,24 +48,25 @@ export async function readInstalledServerRecoveryIdentity(
     const packageJson = ServerPackageJsonSchema.parse(
       JSON.parse(await readFile(path.join(root, "package.json"), "utf8")),
     );
-    if (packageJson.version !== install.version || packageJson.paseoAgentResumeOnRestart !== true) {
-      return null;
-    }
+    if (packageJson.version !== install.version) return null;
     // A subsequent npm install can replace the package at the same version and path.
     const [cli, entry] = await Promise.all(
       [install.packagePath, worker].map((file) => stat(file, { bigint: true })),
     );
     if (!cli?.isDirectory() || !entry?.isFile()) return null;
-    return [
-      resolvedRoot,
-      worker,
-      cli.dev,
-      cli.ino,
-      cli.ctimeNs,
-      entry.dev,
-      entry.ino,
-      entry.ctimeNs,
-    ].join("\0");
+    return {
+      identity: [
+        resolvedRoot,
+        worker,
+        cli.dev,
+        cli.ino,
+        cli.ctimeNs,
+        entry.dev,
+        entry.ino,
+        entry.ctimeNs,
+      ].join("\0"),
+      agentResumeSupported: packageJson.paseoAgentResumeOnRestart === true,
+    };
   } catch {
     return null;
   }

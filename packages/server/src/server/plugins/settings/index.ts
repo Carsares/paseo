@@ -50,7 +50,9 @@ export class PluginSettingsStore {
       throw new Error(`Duplicate settings: ${definition.id}`);
     this.definitions.set(definition.id, definition);
     const listeners = new Set<SettingsListener<Schema>>();
+    let observedRevision: string | undefined;
     const notify = (state: PluginSettingsState<Schema>): void => {
+      observedRevision = state.revision;
       for (const listener of listeners) {
         try {
           void Promise.resolve(listener(copySettingsState(state))).catch((error) =>
@@ -62,7 +64,21 @@ export class PluginSettingsStore {
       }
     };
     const rpc = settingsRpc(definition.id);
-    const read = () => this.serial(() => this.read(definition, notify));
+    const read = () =>
+      this.serial(async () => {
+        const state = await this.read(definition, notify);
+        if (
+          state.status === "ready" &&
+          observedRevision !== undefined &&
+          state.revision !== observedRevision
+        ) {
+          // Publish a repaired or edited file to existing subscribers. A read need not invalidate client queries.
+          notify(state);
+        } else {
+          observedRevision = state.revision;
+        }
+        return state;
+      });
     const write = (input: z.output<typeof rpc.write.input>) =>
       this.serial(() => this.write(definition, input.revision, input.values, "save", notify));
     const reset = (input: z.output<typeof rpc.reset.input>) =>

@@ -1,10 +1,11 @@
 import { getErrorMessage } from "@getpaseo/protocol/error-utils";
 import {
   daemonInstallOriginRuntime,
-  readInstalledServerRecoveryIdentity,
+  readInstalledServerTarget,
   resolveNpmGlobalPrefix,
   validateDaemonInstallOrigin,
   type DaemonInstallOriginRuntime,
+  type InstalledServerTarget,
 } from "./install-origin.js";
 import {
   npmGlobalPaseoCli,
@@ -60,30 +61,37 @@ export class DaemonSelfUpdater {
     daemonVersion: string | null;
     serverRoot: string;
     install: NpmGlobalPaseoInstall;
-    recoveryIdentity: string;
+    target: InstalledServerTarget;
   };
 
   constructor(private readonly runtime: DaemonSelfUpdateRuntime = defaultRuntime) {}
 
-  private async canReuseInstall(input: {
+  private async readReusableInstallTarget(input: {
     daemonVersion: string | null;
     serverRoot: string | null;
     install: NpmGlobalPaseoInstall;
-  }): Promise<boolean> {
+  }): Promise<InstalledServerTarget | null> {
     const pending = this.installedForRestart;
-    if (!pending) return false;
+    if (!pending) return null;
 
     const { install, serverRoot } = input;
-    const matches =
+    const matchesOrigin =
       pending.daemonVersion === input.daemonVersion &&
       pending.serverRoot === serverRoot &&
       pending.install.version === install.version &&
       pending.install.packagePath === install.packagePath &&
       pending.install.globalRootPath === install.globalRootPath &&
-      !validateDaemonInstallOrigin(install, pending.install.version, this.runtime.installOrigin) &&
-      (await readInstalledServerRecoveryIdentity(install, serverRoot)) === pending.recoveryIdentity;
-    if (!matches) this.installedForRestart = undefined;
-    return matches;
+      !validateDaemonInstallOrigin(install, pending.install.version, this.runtime.installOrigin);
+    const target = matchesOrigin ? await readInstalledServerTarget(install, serverRoot) : null;
+    if (
+      !target ||
+      target.identity !== pending.target.identity ||
+      target.agentResumeSupported !== pending.target.agentResumeSupported
+    ) {
+      this.installedForRestart = undefined;
+      return null;
+    }
+    return target;
   }
 
   async update(input: DaemonSelfUpdateInput): Promise<DaemonSelfUpdateResult> {
@@ -103,19 +111,18 @@ export class DaemonSelfUpdater {
         prefix: resolveNpmGlobalPrefix(currentServerRoot),
       };
       const install = await this.runtime.npm.inspect(npmOptions);
-      if (
-        await this.canReuseInstall({
-          daemonVersion: input.daemonVersion,
-          serverRoot: currentServerRoot,
-          install,
-        })
-      ) {
+      const reusableTarget = await this.readReusableInstallTarget({
+        daemonVersion: input.daemonVersion,
+        serverRoot: currentServerRoot,
+        install,
+      });
+      if (reusableTarget) {
         input.onProgress("complete");
         return {
           success: true,
           error: null,
           newVersion: install.version,
-          agentResumeSupported: true,
+          ...(reusableTarget.agentResumeSupported ? { agentResumeSupported: true } : {}),
         };
       }
       const unsupportedReason = validateDaemonInstallOrigin(
@@ -146,11 +153,10 @@ export class DaemonSelfUpdater {
         return null;
       });
 
-      const recoveryIdentity =
-        updatedInstall &&
-        (await readInstalledServerRecoveryIdentity(updatedInstall, currentServerRoot));
+      const target =
+        updatedInstall && (await readInstalledServerTarget(updatedInstall, currentServerRoot));
       if (
-        recoveryIdentity &&
+        target &&
         currentServerRoot &&
         updatedInstall.packagePath === install.packagePath &&
         updatedInstall.globalRootPath === install.globalRootPath
@@ -159,7 +165,7 @@ export class DaemonSelfUpdater {
           daemonVersion: input.daemonVersion,
           serverRoot: currentServerRoot,
           install: updatedInstall,
-          recoveryIdentity,
+          target,
         };
       }
       input.onProgress("complete");
@@ -167,7 +173,7 @@ export class DaemonSelfUpdater {
         success: true,
         error: null,
         newVersion: updatedInstall?.version ?? null,
-        ...(recoveryIdentity ? { agentResumeSupported: true } : {}),
+        ...(target?.agentResumeSupported ? { agentResumeSupported: true } : {}),
       };
     } catch (error) {
       input.logger.error({ err: error }, "Daemon self-update failed with exception");

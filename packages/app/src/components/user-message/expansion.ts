@@ -1,16 +1,28 @@
 type Listener = () => void;
 
+interface MessageExpansion {
+  expanded: boolean;
+  expandedQuotes: ReadonlySet<number>;
+}
+
+const COLLAPSED: MessageExpansion = { expanded: false, expandedQuotes: new Set() };
+
 /**
- * Which of one agent's long user messages the user expanded past the preview. It lives with the
- * timeline, not the row, so a row that remounts (a virtualized row coming back into view, a row
- * reassigned to another list container) paints the choice the user made. A toggle notifies only
- * that message's subscribers.
+ * Manual message and quote choices live with the timeline so remounting rows preserve them.
+ * A toggle notifies only that message's subscribers.
  */
 export function createUserMessageExpansion() {
-  const expanded = new Set<string>();
+  const messages = new Map<string, MessageExpansion>();
   const listeners = new Map<string, Set<Listener>>();
+  const getSnapshot = (itemId: string) => messages.get(itemId) ?? COLLAPSED;
+  function update(itemId: string, state: MessageExpansion) {
+    if (state.expanded || state.expandedQuotes.size > 0) messages.set(itemId, state);
+    else messages.delete(itemId);
+    for (const listener of listeners.get(itemId) ?? []) listener();
+  }
   return {
-    isExpanded: (itemId: string) => expanded.has(itemId),
+    getSnapshot,
+    isExpanded: (itemId: string) => getSnapshot(itemId).expanded,
     subscribe(itemId: string, listener: Listener) {
       let itemListeners = listeners.get(itemId);
       if (!itemListeners) {
@@ -24,9 +36,14 @@ export function createUserMessageExpansion() {
       };
     },
     toggle(itemId: string) {
-      if (expanded.has(itemId)) expanded.delete(itemId);
-      else expanded.add(itemId);
-      for (const listener of listeners.get(itemId) ?? []) listener();
+      const state = getSnapshot(itemId);
+      update(itemId, { ...state, expanded: !state.expanded });
+    },
+    toggleQuote(itemId: string, quoteIndex: number) {
+      const state = getSnapshot(itemId);
+      const expandedQuotes = new Set(state.expandedQuotes);
+      if (!expandedQuotes.delete(quoteIndex)) expandedQuotes.add(quoteIndex);
+      update(itemId, { ...state, expandedQuotes });
     },
   };
 }

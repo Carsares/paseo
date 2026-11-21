@@ -8,4 +8,7 @@ export interface FindUserMessageExpansion {
 export const FindUserMessageExpansionContext = createContext<FindUserMessageExpansion | null>(null);
 export const FindQuoteIndexContext = createContext<number | null>(null);
 
-export const ExpandedQuoteCountContext = createContext<((delta: number) => void) | null>(null);
+export const UserMessageQuoteExpansionContext = createContext<{
+  expandedQuotes: ReadonlySet<number>;
+  toggleQuote(quoteIndex: number): void;
+} | null>(null);

@@ -267,6 +267,44 @@ test("counts and steps through every match in the chat, not just the selected me
   }
 });
 
+test("finds matches within a user message segment without joining separate segments", async ({
+  page,
+}) => {
+  const agent = await seedMockAgentWorkspace({
+    repoPrefix: "chat-find-user-segments-",
+    title: "Chat Find in a quoted prompt",
+    initialPrompt:
+      "> cobalt\n\nline starts here\ncobaltline in the body\n\n> cobaltline in the quote",
+    featureValues: { mockAssistantResponse: "Received the prompt." },
+  });
+  try {
+    await agent.client.waitForFinish(agent.agentId, 15_000);
+    await openAgentRoute(page, agent);
+    const highlightedSource = () =>
+      page.evaluate(() => {
+        const highlight = Array.from(CSS.highlights.entries()).find(([name]) =>
+          name.startsWith("paseo-chat-find-"),
+        )?.[1];
+        const range = highlight && Array.from(highlight)[0];
+        return range?.startContainer === range?.endContainer
+          ? range?.startContainer.textContent
+          : null;
+      });
+
+    await searchChat(page, "cobaltline");
+    await expect(status(page)).toHaveText("1 of 2");
+    await expectHighlight(page, "cobaltline");
+    await expect.poll(highlightedSource).toBe("line starts here\ncobaltline in the body");
+    await expectNextMatch(page, "2 of 2", "cobaltline");
+    await expect.poll(highlightedSource).toBe("cobaltline in the quote");
+    await expectFindStatus(page, "here cobaltline", "1 of 1");
+    await expectHighlight(page, "here\ncobaltline");
+    await closeFind(page);
+  } finally {
+    await agent.cleanup();
+  }
+});
+
 test("finds text in a prompt a timeline plugin draws", async ({ page }, testInfo) => {
   testInfo.setTimeout(120_000);
   const agent = await seedMockAgentWorkspace({
