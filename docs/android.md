@@ -110,6 +110,22 @@ The older `android`, `android:development`, and `ios` commands remain aliases fo
 `android:production` still builds and installs a release through Expo; use `build:apk` when you
 need an artifact. `android:clear` removes the generated Android project.
 
+### Build an APK on GitHub Actions
+
+Push a new `apk-*` tag on a commit that includes the Android APK Build workflow.
+
+```bash
+git tag apk-test.1
+git push origin refs/tags/apk-test.1
+```
+
+Download `paseo-android-arm64` from the workflow run within three days. This uses the same
+diagnostic build as `npm run build:apk:arm64`, including the Android test signature. Android
+requires matching signatures for in-place updates, so use a test device if you already have the
+store build installed. The `apk-*` tag is separate from the [release tags](release.md#standard-release-stable).
+
+### Native unit tests
+
 Run `npm run test:android --workspace=@getpaseo/app` explicitly with a local Android toolchain to prebuild Android and run native module unit tests. Ordinary CI does not prebuild Android or run these tests.
 
 With an emulator or device connected, run the hardware keyboard's window-dispatch regression tests
