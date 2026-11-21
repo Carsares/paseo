@@ -33,6 +33,9 @@ export function createPluginClientRuntime(
     addHeaderButton(contribution) {
       return pluginButtonStore.addHeaderButton(installation, contribution);
     },
+    addSelectionButton(contribution) {
+      return pluginButtonStore.addSelectionButton(installation, contribution);
+    },
     openPanel(panelId, options) {
       openClientPanel({ installation, state, panelId, options });
     },

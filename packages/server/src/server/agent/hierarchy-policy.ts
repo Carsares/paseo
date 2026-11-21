@@ -5,6 +5,7 @@ import {
   isMainControlAgentLabels,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
   resolveAgentHierarchyDepth,
   WORKSPACE_ROLE_LABEL,
@@ -33,6 +34,7 @@ export const REMOTE_HIERARCHY_DEPTH_LABEL = "paseo.remote-hierarchy-depth";
 export const RESERVED_HIERARCHY_LABELS = [
   PARENT_AGENT_ID_LABEL,
   PARENT_SERVER_ID_LABEL,
+  PARENT_REPORTING_LABEL,
   WORKSPACE_ROLE_LABEL,
   MAIN_PRIOR_MODE_ID_LABEL,
   REMOTE_HIERARCHY_DEPTH_LABEL,
@@ -410,9 +412,9 @@ export function buildHierarchyAppendSystemPrompt({
   if (isMainControlAgentLabels(agent.labels)) {
     contract = [
       "Role: Workspace Main Control Coordinator. Work strictly read-only. Do not modify files or run builds that alter the workspace.",
-      "Break workspace goals into module tasks and delegate them to Level-1 Sub-Agents with create_agent.",
-      "Coordinate cross-module changes and pacing through direct children with send_agent_prompt and update_agent. Route Level-2 work through its Level-1 lead.",
-      "Summarize reports from your children for the user.",
+      'For each task you delegate, use create_agent with parentReporting: "explicit" to create exactly one Level-1 lead. Keep workspace edits in the delegated sessions.',
+      "Coordinate through that lead with send_agent_prompt and update_agent. Wait for the lead to call report_to_parent with the final outcome or a blocking question that needs your decision.",
+      "Summarize the lead's report for the user.",
       "Use summarize_workspace_agents to review active and closed workspace sessions, tasks, and touched files. Cross-check uncommitted changes with read-only git status and git diff when summarizing workspace state.",
     ];
     childRole = "Level-1";
@@ -424,8 +426,8 @@ export function buildHierarchyAppendSystemPrompt({
   ) {
     contract = [
       `Role: Level-1 Module Lead (Flexible Mode) under Main Control Agent ${parent.id}.`,
-      "Refine the module's requirements, edge cases, and file boundaries. Delegate substantive implementation and independent verification to Level-2 Sub-Agents with create_agent.",
-      "Keep your own edits to small final adjustments and integration. Once verified, finish your turn with a concise summary of outcomes and changed files for your parent.",
+      "Refine the task's requirements, edge cases, and file boundaries. Complete and verify small changes yourself. Delegate substantive implementation and independent verification to Level-2 Sub-Agents with create_agent.",
+      "Call report_to_parent once all verification is complete, with a concise outcome and changed files. If you need a decision from your parent to proceed, use report_to_parent with status blocked and the question.",
     ];
     childRole = "Level-2";
   } else {

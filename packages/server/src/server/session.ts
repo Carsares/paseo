@@ -115,10 +115,13 @@ import { releaseWorkspaceServicePortPlan } from "./workspace-service-port-regist
 import { getErrorMessage, getErrorMessageOr } from "@getpaseo/protocol/error-utils";
 import { getAgentStatusPriority } from "@getpaseo/protocol/agent-state-bucket";
 import {
+  EXPLICIT_PARENT_REPORTING,
   getParentAddressFromLabels,
   PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
   getParentAgentIdFromLabels,
+  isExplicitParentReportingLabels,
   isMainControlAgentLabels,
 } from "@getpaseo/protocol/agent-labels";
 import { applyRecordPatch } from "./record-patch.js";
@@ -5846,6 +5849,7 @@ export class Session {
 
       const { snapshot, liveSnapshot, initialPromptStarted } = await createAgentCommand(
         {
+          serverId: this.serverId,
           agentManager: this.agentManager,
           agentStorage: this.agentStorage,
           finishSubscriptions: this.finishSubscriptions,
@@ -5961,6 +5965,9 @@ export class Session {
         cwd: config.cwd,
       }),
     });
+    if (isExplicitParentReportingLabels(request.labels)) {
+      intent.labels[PARENT_REPORTING_LABEL] = EXPLICIT_PARENT_REPORTING;
+    }
     config = { ...config, cwd: intent.cwd };
 
     return {

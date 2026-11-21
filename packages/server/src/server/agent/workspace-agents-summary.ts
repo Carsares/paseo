@@ -259,13 +259,17 @@ export async function summarizeWorkspaceAgents({
         });
       if (rows === null) continue;
       const metadata = summarizeAgentMetadata(agent, mainAgent?.id, parentByAgentId);
+      const timeline = summarizeTimeline(
+        projectTimelineRows({ rows, mode: "projected" }).map(({ item }) => item),
+        metadata.parentAgentId,
+        getParentAddressFromLabels((agent.live ?? agent.record)?.labels, "")?.serverId,
+      );
       entries.push({
         ...metadata,
-        ...summarizeTimeline(
-          projectTimelineRows({ rows, mode: "projected" }).map(({ item }) => item),
-          metadata.parentAgentId,
-          getParentAddressFromLabels((agent.live ?? agent.record)?.labels, "")?.serverId,
-        ),
+        ...timeline,
+        ...(metadata.relationship === "level2"
+          ? { firstUserPrompt: null, lastAssistantSummary: null, todos: [] }
+          : {}),
       });
     }
     entries.sort(compareEntries);

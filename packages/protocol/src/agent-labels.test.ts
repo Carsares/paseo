@@ -4,6 +4,7 @@ import {
   getOpenAgentTabLabel,
   hasOpenAgentTab,
   isDelegatedAgent,
+  isExplicitParentReportingLabels,
   isOpenAgentTabLabel,
   PARENT_AGENT_ID_LABEL,
 } from "./agent-labels.js";
@@ -36,4 +37,17 @@ describe("agent label policy", () => {
     expect(isOpenAgentTabLabel("paseo.open-agent-tab")).toBe(false);
     expect(isOpenAgentTabLabel("custom.open-agent-tab.client-a")).toBe(false);
   });
+});
+
+test("only the reserved explicit label opts an agent out of automatic parent reporting", () => {
+  expect(isExplicitParentReportingLabels({ "paseo.parent-reporting": "explicit" })).toBe(true);
+  for (const labels of [
+    null,
+    undefined,
+    {},
+    { "paseo.parent-reporting": true },
+    { "paseo.parent-reporting": "auto" },
+  ]) {
+    expect(isExplicitParentReportingLabels(labels)).toBe(false);
+  }
 });

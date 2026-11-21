@@ -56,6 +56,13 @@ export type {
   PluginButtonRegistration,
   PluginComposerPillContribution,
   PluginHeaderButtonContribution,
+  PluginSelectionButton,
+  PluginSelectionButtonBehavior,
+  PluginSelectionButtonContentProps,
+  PluginSelectionButtonContribution,
+  PluginSelectionButtonMenuEntry,
+  PluginSelectionButtonRegistration,
+  PluginTimelineSelection,
 } from "./buttons.js";
 export type { PluginIconProps, PluginSerializableIcon, PluginSvgIcon } from "../icons.js";
 export type {

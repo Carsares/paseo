@@ -1,9 +1,15 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { createElement } from "react";
+import type {
+  PluginSelectionButtonBehavior,
+  PluginTimelineSelection,
+} from "@getpaseo/plugin/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { i18n } from "@/i18n/i18next";
+import { KeyboardActionDispatcherProvider } from "@/keyboard/keyboard-action-dispatcher-context";
 import { createMarkdownParser } from "@/utils/markdown-parser";
+import { ComposerQuoteProvider } from "./composer-quote";
 import {
   createAssistantSelectionClipboardContent,
   createAssistantSelectionMarkdown,
@@ -11,7 +17,22 @@ import {
 
 vi.mock("lucide-react-native", async (importOriginal) => ({
   ...(await importOriginal<typeof import("lucide-react-native")>()),
+  AlertCircle: () => null,
+  ChevronUp: () => null,
+  Crown: () => null,
   TextQuote: () => null,
+}));
+
+vi.mock("@/runtime/host-runtime", () => ({
+  useHostRuntimeClient: () => ({}),
+  useHostRuntimeIsConnected: () => true,
+  isHostRuntimeConnected: () => true,
+  useHosts: () => [{ serverId: "test-host", label: "Test host" }],
+  getHostRuntimeStore: () => ({
+    getHosts: () => [],
+    subscribeAll: () => () => {},
+    subscribeHostList: () => () => {},
+  }),
 }));
 
 const fixture = `
@@ -165,6 +186,284 @@ describe("assistant selection quote", () => {
     expect(screen.queryByTestId("assistant-selection-quote")).toBeNull();
     expect(screen.queryByTestId("assistant-selection-context-menu")).toBeNull();
   }
+
+  async function mountPluginSelection(
+    behavior: PluginSelectionButtonBehavior,
+    addQuoteAttachment?: (quote: string) => void,
+  ) {
+    const surfaceModule = "./surface.web.tsx";
+    const [
+      { pluginButtonStore },
+      { PluginTranslationRuntime },
+      { QueryClient },
+      { ToastProvider },
+      { AssistantSelectionCopySurface },
+    ] = await Promise.all([
+      import("@/plugins/buttons/store"),
+      import("@getpaseo/plugin/client/host"),
+      import("@tanstack/react-query"),
+      import("@/contexts/toast-context"),
+      import(/* @vite-ignore */ surfaceModule) as Promise<typeof import("./surface.web")>,
+    ]);
+    const pluginI18n = new PluginTranslationRuntime({
+      getLocale: () => "en",
+      subscribe: () => () => {},
+    });
+    const lifetime = new AbortController();
+    const registration = pluginButtonStore.addSelectionButton(
+      {
+        lifetime,
+        id: "test-plugin",
+        serverId: "test-host",
+        queryClient: new QueryClient(),
+        i18n: pluginI18n,
+        paseo: { workspaces: {}, agents: {}, terminals: {}, projects: {} },
+      } as import("@/plugins/types").InstalledPlugin,
+      {
+        id: "review",
+        workspaceId: "test-workspace",
+        button: { title: "Plugin review", icon: () => null, behavior },
+      },
+    );
+    const { viewport } = mountQuoteStream([
+      {
+        messageId: "reply",
+        blocks: ['<span data-paseo-markdown-tag="strong">Selected</span>'],
+      },
+      { messageId: "other", blocks: ["Other passage."] },
+    ]);
+    render(
+      createElement(
+        ToastProvider,
+        null,
+        createElement(
+          KeyboardActionDispatcherProvider,
+          null,
+          createElement(
+            ComposerQuoteProvider,
+            { target: addQuoteAttachment ? { addQuoteAttachment } : null },
+            createElement(
+              AssistantSelectionCopySurface,
+              {
+                serverId: "test-host",
+                workspaceId: "test-workspace",
+                agentId: "test-agent",
+              } as import("./surface").AssistantSelectionCopySurfaceProps,
+              createElement("div", {
+                dangerouslySetInnerHTML: { __html: viewport.outerHTML },
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+    viewport.parentElement?.remove();
+    const transcript = screen.getByTestId("agent-chat-scroll");
+    return {
+      original: fixtureElement(transcript, '[data-paseo-markdown-tag="p"]'),
+      other: fixtureElement(transcript, '[data-paseo-markdown-tag="p"]', 1),
+      remove() {
+        registration.remove();
+        pluginI18n.dispose();
+        lifetime.abort();
+      },
+    };
+  }
+
+  const pluginSnapshot: PluginTimelineSelection = {
+    text: "Selected",
+    markdown: "**Selected**",
+    messageId: "reply",
+    workspaceId: "test-workspace",
+    agentId: "test-agent",
+  };
+
+  const pluginMenu = (onPress: (selection: PluginTimelineSelection) => void) =>
+    ({
+      kind: "menu",
+      items: [
+        {
+          kind: "item",
+          id: "more",
+          title: "More review actions",
+          behavior: {
+            kind: "menu",
+            items: [
+              {
+                kind: "item",
+                id: "run",
+                title: "Review passage",
+                behavior: { kind: "action", onPress },
+              },
+            ],
+          },
+        },
+      ],
+    }) satisfies PluginSelectionButtonBehavior;
+
+  it("keeps plugin-only floating menus anchored to the original selection through DOM and selection changes", async () => {
+    const onPress = vi.fn();
+    const { original, other, remove } = await mountPluginSelection(pluginMenu(onPress));
+    try {
+      selectNodeContents(original);
+      const toolbar = await screen.findByTestId("assistant-selection-quote");
+      fireEvent.click(await screen.findByRole("button", { name: "Plugin review" }));
+      const trigger = await screen.findByText("More review actions");
+      const position = toolbar.getBoundingClientRect();
+      act(() => {
+        selectText(other, 0, 5);
+        original.remove();
+        fireEvent(document, new Event("selectionchange"));
+      });
+      await expect.element(page.getByText("More review actions")).toBeVisible();
+      expect(toolbar.getBoundingClientRect().x).toBe(position.x);
+      expect(toolbar.getBoundingClientRect().y).toBe(position.y);
+      fireEvent.click(trigger);
+      await userEvent.click(page.getByText("Review passage"));
+      expect(onPress).toHaveBeenCalledExactlyOnceWith(pluginSnapshot);
+      expectSelectionDismissed();
+    } finally {
+      act(remove);
+    }
+  });
+
+  it("uses the captured selection for a plugin-only right-click submenu", async () => {
+    const previous = document.createElement("button");
+    const destination = document.createElement("button");
+    document.body.append(previous, destination);
+    const onPress = vi.fn(() => {
+      expectSelectionDismissed();
+      expect(document.activeElement).toBe(previous);
+      destination.focus();
+    });
+    const { original, other, remove } = await mountPluginSelection(pluginMenu(onPress));
+    try {
+      previous.focus();
+      selectNodeContents(original);
+      fireEvent.contextMenu(original, { clientX: 15, clientY: 15 });
+      fireEvent.click(await screen.findByText("Plugin review"));
+      fireEvent.click(await screen.findByText("More review actions"));
+      selectText(other, 0, 5);
+      await userEvent.click(page.getByText("Review passage"));
+      expect(onPress).toHaveBeenCalledExactlyOnceWith(pluginSnapshot);
+      expect(document.activeElement).toBe(destination);
+      expectSelectionDismissed();
+    } finally {
+      act(remove);
+    }
+  });
+
+  it("lets an open plugin menu handle Enter and Escape before the built-in quote shortcut", async () => {
+    const onPress = vi.fn();
+    const onQuote = vi.fn();
+    const previous = document.createElement("button");
+    document.body.append(previous);
+    const { original, remove } = await mountPluginSelection(
+      {
+        kind: "menu",
+        items: [
+          {
+            kind: "item",
+            id: "run",
+            title: "Review passage",
+            behavior: { kind: "action", onPress },
+          },
+        ],
+      },
+      onQuote,
+    );
+    const open = async () => {
+      previous.focus();
+      selectNodeContents(original);
+      await screen.findByText(i18n.t("agentStream.quote.action"));
+      fireEvent.click(await screen.findByRole("button", { name: "Plugin review" }));
+      await expect.element(page.getByRole("menuitem", { name: "Review passage" })).toHaveFocus();
+    };
+    try {
+      await open();
+      await userEvent.keyboard("{Enter}");
+      expect(onQuote).not.toHaveBeenCalled();
+      expect(onPress).toHaveBeenCalledExactlyOnceWith(pluginSnapshot);
+
+      await open();
+      await userEvent.keyboard("{Escape}");
+      expect(onQuote).not.toHaveBeenCalled();
+      expect(onPress).toHaveBeenCalledTimes(1);
+      expectSelectionDismissed();
+      expect(document.activeElement).toBe(previous);
+    } finally {
+      act(remove);
+    }
+  });
+
+  it("passes a frozen selection to a plugin popover and clears it when the content closes", async () => {
+    const { original, other, remove } = await mountPluginSelection({
+      kind: "popover",
+      Content({ selection, close }) {
+        return createElement("button", { onClick: close }, selection.markdown);
+      },
+    });
+    try {
+      selectNodeContents(original);
+      await screen.findByTestId("assistant-selection-quote");
+      fireEvent.click(await screen.findByRole("button", { name: "Plugin review" }));
+      selectText(other, 0, 5);
+      await userEvent.click(page.getByRole("button", { name: "**Selected**" }));
+      expectSelectionDismissed();
+    } finally {
+      act(remove);
+    }
+  });
+
+  it("delivers the frozen selection to a right-click popover and restores focus on close", async () => {
+    const previous = document.createElement("button");
+    document.body.append(previous);
+    const { original, other, remove } = await mountPluginSelection({
+      kind: "popover",
+      Content({ selection, close }) {
+        return createElement("button", { onClick: close }, selection.markdown);
+      },
+    });
+    try {
+      previous.focus();
+      selectNodeContents(original);
+      fireEvent.contextMenu(original, { clientX: 15, clientY: 15 });
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Plugin review" }));
+      selectText(other, 0, 5);
+      await userEvent.click(page.getByRole("button", { name: "**Selected**" }));
+      expect(screen.queryByTestId("assistant-selection-context-menu")).toBeNull();
+      expect(document.activeElement).toBe(previous);
+    } finally {
+      act(remove);
+    }
+  });
+
+  it("shows action errors and lets the user retry after a pending plugin action rejects", async () => {
+    const { promise, reject } = Promise.withResolvers<void>();
+    const onPress = vi
+      .fn<(selection: PluginTimelineSelection) => void | Promise<void>>()
+      .mockReturnValueOnce(promise)
+      .mockImplementationOnce(() => {
+        throw new Error("Review unavailable");
+      });
+    const { original, remove } = await mountPluginSelection({ kind: "action", onPress });
+    try {
+      selectNodeContents(original);
+      fireEvent.click(await screen.findByRole("button", { name: "Plugin review" }));
+      expectSelectionDismissed();
+      selectNodeContents(original);
+      const retry = await screen.findByRole("button", { name: "Plugin review" });
+      expect(retry.getAttribute("aria-disabled")).toBe("true");
+      await act(async () => reject(new Error("Review timed out")));
+      await expect.element(page.getByText("Review timed out")).toBeVisible();
+      expect(retry.getAttribute("aria-disabled")).not.toBe("true");
+      fireEvent.click(retry);
+      await expect.element(page.getByText("Review unavailable")).toBeVisible();
+      expect(onPress.mock.calls).toEqual([[pluginSnapshot], [pluginSnapshot]]);
+    } finally {
+      act(remove);
+    }
+  });
 
   it("settles a cancelled touch selection and hides offscreen or unmounted anchors", async () => {
     const { streamRef, viewport, message } = mountQuoteStream();

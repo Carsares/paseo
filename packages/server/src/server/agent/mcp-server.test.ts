@@ -78,7 +78,11 @@ import type { ForgeService } from "../../services/forge-service.js";
 import { areEquivalentPaths } from "../../utils/path.js";
 import { createTerminalManager, type TerminalManager } from "../../terminal/terminal-manager.js";
 import { startWorkerTerminalManager } from "../../terminal/worker-terminal-manager.js";
-import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  EXPLICIT_PARENT_REPORTING,
+  PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import { PASEO_TOOL_NAMES } from "@getpaseo/protocol/paseo-tool-presentation/index";
 import { MutableDaemonConfigSchema, type AgentProfile } from "@getpaseo/protocol/messages";
 import type { DaemonConfigStore } from "../daemon-config-store.js";
@@ -274,6 +278,7 @@ function buildAgentManagerSpies() {
     appendTimelineItem: vi.fn().mockResolvedValue(undefined),
     emitLiveTimelineItem: vi.fn().mockResolvedValue(undefined),
     getPluginTools: () => [],
+    adapterOf: (provider: AgentProvider) => provider,
     effectiveOptionsFor: (_provider: string, own?: Record<string, unknown>) => own ?? {},
     reloadStalePluginSession: async () => {},
     hasInFlightRun: vi.fn().mockReturnValue(false),
@@ -1687,7 +1692,7 @@ describe("create_agent MCP tool", () => {
     expect(spies.agentManager.createAgent).toHaveBeenCalledWith(
       expect.objectContaining({ cwd: existingCwd }),
       undefined,
-      { workspaceId: "workspace-created", background: false },
+      { workspaceId: "workspace-created", background: false, inheritParentWorkspace: false },
     );
   });
 
@@ -1830,7 +1835,7 @@ describe("create_agent MCP tool", () => {
         cwd: existingCwd,
       }),
       undefined,
-      { workspaceId: "wks_existing", background: false },
+      { workspaceId: "wks_existing", background: false, inheritParentWorkspace: false },
     );
   });
 
@@ -1874,7 +1879,7 @@ describe("create_agent MCP tool", () => {
         providerOptions: { fast_mode: true },
       }),
       undefined,
-      { workspaceId: "workspace-created", background: false },
+      { workspaceId: "workspace-created", background: false, inheritParentWorkspace: false },
     );
   });
 
@@ -2070,7 +2075,7 @@ describe("create_agent MCP tool", () => {
         title: "Fix auth bug",
       }),
       undefined,
-      { workspaceId: "workspace-created", background: false },
+      { workspaceId: "workspace-created", background: false, inheritParentWorkspace: false },
     );
   });
 
@@ -2105,7 +2110,7 @@ describe("create_agent MCP tool", () => {
         title: "Fix auth",
       }),
       undefined,
-      { workspaceId: "workspace-created", background: false },
+      { workspaceId: "workspace-created", background: false, inheritParentWorkspace: false },
     );
   });
 
@@ -2150,6 +2155,7 @@ describe("create_agent MCP tool", () => {
         labels: { source: "mcp" },
         workspaceId: "workspace-created",
         background: false,
+        inheritParentWorkspace: false,
       },
     );
   });
@@ -2252,7 +2258,11 @@ describe("create_agent MCP tool", () => {
           title: "Directory agent",
         }),
         undefined,
-        { workspaceId: "workspace-directory-auto-title", background: false },
+        {
+          workspaceId: "workspace-directory-auto-title",
+          background: false,
+          inheritParentWorkspace: false,
+        },
       );
       expect(workspaceRecords.get("workspace-directory-auto-title")).toMatchObject({
         title: "Directory Workspace Title",
@@ -2870,6 +2880,7 @@ describe("create_agent MCP tool", () => {
         },
         workspaceId: "wks_voice",
         background: false,
+        inheritParentWorkspace: false,
       },
     );
     await rm(baseDir, { recursive: true, force: true });
@@ -3052,6 +3063,7 @@ describe("create_agent MCP tool", () => {
         },
         workspaceId: "wks_parent",
         background: false,
+        inheritParentWorkspace: false,
       },
     );
   });
@@ -3114,6 +3126,7 @@ describe("create_agent MCP tool", () => {
         },
         workspaceId: "wks_parent",
         background: false,
+        inheritParentWorkspace: false,
       },
     );
   });
@@ -3253,6 +3266,7 @@ describe("create_agent MCP tool", () => {
     expect(optionsArg).toEqual({
       workspaceId: "workspace-created",
       background: false,
+      inheritParentWorkspace: false,
     });
   });
 
@@ -3330,7 +3344,7 @@ describe("create_agent MCP tool", () => {
     expect(spies.agentManager.createAgent).toHaveBeenCalledWith(
       expect.objectContaining({ modeId: "dynamic" }),
       undefined,
-      { workspaceId: "workspace-created", background: false },
+      { workspaceId: "workspace-created", background: false, inheritParentWorkspace: false },
     );
   });
 
@@ -3369,7 +3383,7 @@ describe("create_agent MCP tool", () => {
     expect(spies.agentManager.createAgent).toHaveBeenCalledWith(
       expect.objectContaining({ modeId: "build", providerOptions: { auto_accept: true } }),
       undefined,
-      { workspaceId: "workspace-created", background: false },
+      { workspaceId: "workspace-created", background: false, inheritParentWorkspace: false },
     );
   });
 
@@ -3941,61 +3955,71 @@ describe("send_agent_prompt MCP tool", () => {
   const logger = createTestLogger();
   const existingCwd = process.cwd();
 
-  it("defaults agent-scoped prompts to background finish notifications", async () => {
-    const { agentManager, agentStorage, spies } = createTestDeps();
-    const parentAgent = {
-      id: "parent-agent",
-      config: {},
-      cwd: existingCwd,
-      workspaceId: "wks_parent",
-      provider: "codex",
-      currentModeId: "full-access",
-    } as ManagedAgent;
-    const childAgent = {
-      id: "child-agent",
-      cwd: existingCwd,
-      lifecycle: "running",
-      currentModeId: null,
-      availableModes: [],
-      config: { title: "Child" },
-    } as ManagedAgent;
-    spies.agentManager.getAgent.mockImplementation((agentId: string) => {
-      if (agentId === "parent-agent") return parentAgent;
-      if (agentId === "child-agent") return childAgent;
-      return null;
-    });
+  it.each([
+    { explicit: false, requested: undefined, notifications: 1 },
+    { explicit: true, requested: undefined, notifications: 0 },
+    { explicit: true, requested: true, notifications: 1 },
+    { explicit: false, requested: false, notifications: 0 },
+  ])(
+    "uses the target reporting mode unless overridden ($explicit, $requested)",
+    async ({ explicit, requested, notifications }) => {
+      const { agentManager, agentStorage, spies } = createTestDeps();
+      const parentAgent = {
+        id: "parent-agent",
+        config: {},
+        cwd: existingCwd,
+        workspaceId: "wks_parent",
+        provider: "codex",
+        currentModeId: "full-access",
+      } as ManagedAgent;
+      const childAgent = {
+        id: "child-agent",
+        cwd: existingCwd,
+        lifecycle: "running",
+        currentModeId: null,
+        availableModes: [],
+        config: { title: "Child" },
+        labels: explicit ? { [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING } : {},
+      } as ManagedAgent;
+      spies.agentManager.getAgent.mockImplementation((agentId: string) => {
+        if (agentId === "parent-agent") return parentAgent;
+        if (agentId === "child-agent") return childAgent;
+        return null;
+      });
 
-    const server = await createAgentMcpServer({
-      agentManager,
-      agentStorage,
-      providerSnapshotManager: createOpenCodeManager().manager,
-      callerAgentId: "parent-agent",
-      logger,
-    });
+      const server = await createAgentMcpServer({
+        agentManager,
+        agentStorage,
+        providerSnapshotManager: createOpenCodeManager().manager,
+        callerAgentId: "parent-agent",
+        logger,
+      });
 
-    const tool = registeredTool(server, "send_agent_prompt");
-    const parsed = await tool.inputSchema.safeParseAsync({
-      agentId: "child-agent",
-      prompt: "Follow up",
-    });
-    expect(parsed.success).toBe(true);
-    if (!parsed.success) {
-      throw new Error("Expected caller send_agent_prompt input to parse");
-    }
-    expect(parsed.data).toMatchObject({
-      notifyOnFinish: true,
-    });
+      const tool = registeredTool(server, "send_agent_prompt");
+      const parsed = await tool.inputSchema.safeParseAsync({
+        agentId: "child-agent",
+        prompt: "Follow up",
+        ...(requested === undefined ? {} : { notifyOnFinish: requested }),
+      });
+      expect(parsed.success).toBe(true);
+      if (!parsed.success) {
+        throw new Error("Expected caller send_agent_prompt input to parse");
+      }
+      if (requested === undefined) expect(parsed.data).not.toHaveProperty("notifyOnFinish");
 
-    const response = await tool.handler(parsed.data as Record<string, unknown>);
+      const response = await tool.handler(parsed.data as Record<string, unknown>);
 
-    expect(response.structuredContent).toMatchObject({ deliveryStatus: "queued" });
-    expect(serverSubscriptionRecords.get(server)!.size).toBe(1);
-    await serverDeliveries
-      .get(server)!
-      .waitForDispatch("child-agent", new AbortController().signal);
-    expect(serverSubscriptionRecords.get(server)!.size).toBe(1);
-    expect(response.structuredContent.guidance).toContain("You will get notified");
-  });
+      expect(response.structuredContent).toMatchObject({ deliveryStatus: "queued" });
+      expect(serverSubscriptionRecords.get(server)!.size).toBe(notifications);
+      await serverDeliveries
+        .get(server)!
+        .waitForDispatch("child-agent", new AbortController().signal);
+      expect(serverSubscriptionRecords.get(server)!.size).toBe(notifications);
+      expect(response.structuredContent.guidance.includes("You will get notified")).toBe(
+        notifications > 0,
+      );
+    },
+  );
 
   it("acknowledges top-level prompts without a completion wait", async () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
@@ -5413,11 +5437,14 @@ describe("update_schedule MCP tool", () => {
       prompt: "new prompt",
     });
 
-    expect(update).toHaveBeenCalledWith({
-      id: "schedule-1",
-      name: "updated name",
-      prompt: "new prompt",
-    });
+    expect(update).toHaveBeenCalledWith(
+      {
+        id: "schedule-1",
+        name: "updated name",
+        prompt: "new prompt",
+      },
+      undefined,
+    );
   });
 
   it("converts every to cadence", async () => {
@@ -5438,10 +5465,13 @@ describe("update_schedule MCP tool", () => {
       every: "10m",
     });
 
-    expect(update).toHaveBeenCalledWith({
-      id: "schedule-1",
-      cadence: { type: "cron", expression: "*/10 * * * *" },
-    });
+    expect(update).toHaveBeenCalledWith(
+      {
+        id: "schedule-1",
+        cadence: { type: "cron", expression: "*/10 * * * *" },
+      },
+      undefined,
+    );
   });
 
   it("passes timezone through cron update_schedule input", async () => {
@@ -5463,14 +5493,17 @@ describe("update_schedule MCP tool", () => {
       timezone: "Europe/Zurich",
     });
 
-    expect(update).toHaveBeenCalledWith({
-      id: "schedule-1",
-      cadence: {
-        type: "cron",
-        expression: "0 9 * * 1-5",
-        timezone: "Europe/Zurich",
+    expect(update).toHaveBeenCalledWith(
+      {
+        id: "schedule-1",
+        cadence: {
+          type: "cron",
+          expression: "0 9 * * 1-5",
+          timezone: "Europe/Zurich",
+        },
       },
-    });
+      undefined,
+    );
   });
 
   it("accepts a blank cron field when updating every cadence", async () => {
@@ -5492,10 +5525,13 @@ describe("update_schedule MCP tool", () => {
       cron: "",
     });
 
-    expect(update).toHaveBeenCalledWith({
-      id: "schedule-1",
-      cadence: { type: "cron", expression: "*/10 * * * *" },
-    });
+    expect(update).toHaveBeenCalledWith(
+      {
+        id: "schedule-1",
+        cadence: { type: "cron", expression: "*/10 * * * *" },
+      },
+      undefined,
+    );
   });
 
   it.each([
@@ -5529,10 +5565,13 @@ describe("update_schedule MCP tool", () => {
 
     await invokeToolWithParsedInput(tool, input);
 
-    expect(update).toHaveBeenCalledWith({
-      id: "schedule-1",
-      cadence,
-    });
+    expect(update).toHaveBeenCalledWith(
+      {
+        id: "schedule-1",
+        cadence,
+      },
+      undefined,
+    );
   });
 
   it("rejects both every and cron", async () => {
@@ -5658,15 +5697,18 @@ describe("update_schedule MCP tool", () => {
       clearExpires: true,
     });
 
-    expect(update).toHaveBeenCalledWith({
-      id: "schedule-1",
-      maxRuns: null,
-      expiresAt: null,
-      newAgentConfig: {
-        model: null,
-        modeId: null,
+    expect(update).toHaveBeenCalledWith(
+      {
+        id: "schedule-1",
+        maxRuns: null,
+        expiresAt: null,
+        newAgentConfig: {
+          model: null,
+          modeId: null,
+        },
       },
-    });
+      undefined,
+    );
   });
 
   it("rejects conflicting model and expiry inputs", async () => {
@@ -6919,7 +6961,7 @@ describe("local durable finish subscription MCP wiring", () => {
         const child = await manager.createAgent(
           { provider: "codex", cwd: existingCwd },
           undefined,
-          { workspaceId: "wks_parent" },
+          { workspaceId: "wks_parent", labels: { [PARENT_AGENT_ID_LABEL]: parent.id } },
         );
         const server = await createAgentMcpServer({
           agentManager: manager,

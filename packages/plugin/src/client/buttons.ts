@@ -54,3 +54,53 @@ export interface PluginComposerPillContribution<
 > extends PluginHeaderButtonContribution<Text> {
   agentId: string;
 }
+
+/** The passage captured when the user selected assistant text. */
+export interface PluginTimelineSelection {
+  readonly text: string;
+  readonly markdown: string;
+  readonly messageId: string | null;
+  readonly workspaceId: string;
+  readonly agentId: string;
+}
+
+export type PluginSelectionButtonContentProps = PluginButtonContentProps & {
+  readonly selection: PluginTimelineSelection;
+};
+
+export type PluginSelectionButtonBehavior<Text extends PluginText = string> =
+  | { kind: "action"; onPress(selection: PluginTimelineSelection): void | Promise<void> }
+  | { kind: "menu"; items: readonly PluginSelectionButtonMenuEntry<Text>[] }
+  | { kind: "popover"; Content: ComponentType<PluginSelectionButtonContentProps> };
+
+export type PluginSelectionButtonMenuEntry<Text extends PluginText = string> =
+  | { kind: "separator"; id: string }
+  | {
+      kind: "item";
+      id: string;
+      title: Text;
+      icon?: PluginButtonIcon;
+      visible?: boolean;
+      disabled?: boolean;
+      behavior: PluginSelectionButtonBehavior<Text>;
+    };
+
+export interface PluginSelectionButton<Text extends PluginText = string> extends Omit<
+  PluginButton<Text>,
+  "behavior"
+> {
+  behavior: PluginSelectionButtonBehavior<Text>;
+}
+
+export interface PluginSelectionButtonRegistration<Text extends PluginText = string> {
+  update(patch: Partial<PluginSelectionButton<Text>>): void;
+  remove(): void;
+}
+
+export interface PluginSelectionButtonContribution<Text extends PluginText = string> {
+  id: string;
+  workspaceId: string;
+  /** Omit to contribute to every agent in the workspace. */
+  agentId?: string;
+  button: PluginSelectionButton<Text>;
+}

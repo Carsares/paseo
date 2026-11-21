@@ -29,6 +29,9 @@ const runtime = {
   addComposerPill() {
     return { update() {}, remove() {} };
   },
+  addSelectionButton() {
+    return { update() {}, remove() {} };
+  },
 } as unknown as PluginClientRuntime;
 
 function installProbe(

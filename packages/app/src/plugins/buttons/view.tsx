@@ -2,7 +2,11 @@ import type {
   ResolvedPluginButtonBehavior as PluginButtonBehavior,
   ResolvedPluginButtonMenuEntry as PluginButtonMenuEntry,
 } from "./validation";
-import type { PluginButtonIcon, PluginHostProps } from "@getpaseo/plugin/client";
+import type {
+  PluginButtonIcon,
+  PluginHostProps,
+  PluginTimelineSelection,
+} from "@getpaseo/plugin/client";
 import type { PluginTheme } from "@getpaseo/plugin";
 import {
   useCallback,
@@ -46,7 +50,7 @@ import {
 } from "../popover";
 import { SurfaceErrorBoundary } from "../surface-error-boundary";
 import { toPluginTheme } from "../theme";
-import { buttonMatches, type RegisteredPluginButton } from "./model";
+import { buttonMatches, selectionButtonMatches, type RegisteredPluginButton } from "./model";
 import { pluginButtonStore } from "./store";
 import { resolvePluginPlatform } from "../platform";
 
@@ -55,6 +59,17 @@ interface ButtonView {
   props: PluginHostProps & RegisteredPluginButton["context"];
   environment: PluginEnvironment;
   toast: ReturnType<typeof useToast>;
+  selectionAction?: SelectionAction;
+}
+
+interface SelectionAction {
+  selection: PluginTimelineSelection;
+  onAction(run: () => void): void;
+}
+
+interface SelectionButtonControls {
+  openKey: number | null;
+  onOpenChange(key: number, open: boolean): void;
 }
 
 const ROOT_PATH: readonly string[] = [];
@@ -99,9 +114,15 @@ function ButtonIcon({ view, icon }: { view: ButtonView; icon: PluginButtonIcon }
 }
 
 function pressButton(view: ButtonView, path: readonly string[]) {
-  void pluginButtonStore.run(view.entry.key, path).catch((error: unknown) => {
-    view.toast.error(error instanceof Error ? error.message : String(error));
-  });
+  const run = () => {
+    void pluginButtonStore
+      .run(view.entry.key, path, view.selectionAction?.selection)
+      .catch((error: unknown) => {
+        view.toast.error(error instanceof Error ? error.message : String(error));
+      });
+  };
+  if (view.selectionAction) view.selectionAction.onAction(run);
+  else run();
 }
 
 function visibleMenuItems(
@@ -166,6 +187,16 @@ function ButtonBody({
   const menu = useMenuContext("PluginButton");
   const close = useCallback(() => menu.setOpen(false), [menu]);
   if (behavior.kind === "popover") {
+    if (behavior.withSelection) {
+      const selection = view.selectionAction?.selection;
+      if (!selection) return null;
+      const Content = behavior.Content;
+      return (
+        <PluginPopoverContent>
+          <Content {...view.props} selection={selection} close={close} />
+        </PluginPopoverContent>
+      );
+    }
     const Content = behavior.Content;
     return (
       <PluginPopoverContent>
@@ -241,58 +272,43 @@ function buttonPages(
   });
 }
 
-function ButtonControl({ view }: { view: ButtonView }) {
+function ButtonControl({
+  view,
+  selectionControls,
+}: {
+  view: ButtonView;
+  selectionControls?: SelectionButtonControls;
+}) {
   const { entry, props } = view;
   const { button } = entry;
   const composer = entry.placement === "composer";
+  const selection = entry.placement === "selection";
+  const open = selectionControls ? selectionControls.openKey === entry.key : entry.open;
   const disabled = button.disabled || entry.pending;
   const expanded = button.behavior.kind !== "action";
-  // A chevron marks a button that opens something. Composer pills keep their label on compact and
-  // open their surface above, so theirs points up and shows at every width; compact headers drop
-  // the label and the chevron with it.
-  const chevron = expanded && (composer || !props.layout.compact);
-  const Chevron = composer ? ChevronUp : ChevronDown;
-  let label = button.label;
-  if (composer) label = button.label ?? button.title;
-  else if (props.layout.compact) label = undefined;
   const press = useCallback(() => pressButton(view, []), [view]);
   const setOpen = useCallback(
-    (open: boolean) => pluginButtonStore.setOpen(entry.key, open),
-    [entry.key],
+    (next: boolean) => {
+      if (selectionControls) selectionControls.onOpenChange(entry.key, next);
+      else pluginButtonStore.setOpen(entry.key, next);
+    },
+    [entry.key, selectionControls],
   );
   const buttonStyle = useCallback(
-    ({ hovered, pressed }: { hovered?: boolean; pressed: boolean }) =>
-      composer
-        ? [
-            composerPillStyles.body,
-            styles.button,
-            (hovered || pressed || entry.open) && styles.active,
-            disabled && styles.disabled,
-          ]
-        : headerButtonStyle(props.layout.compact, { hovered, pressed, open: entry.open }, disabled),
-    [composer, disabled, entry.open, props.layout.compact],
+    ({ hovered, pressed }: { hovered?: boolean; pressed: boolean }) => {
+      if (composer || selection) {
+        return [
+          composer ? composerPillStyles.body : styles.selectionButton,
+          styles.button,
+          (hovered || pressed || open) && styles.active,
+          disabled && styles.disabled,
+        ];
+      }
+      return headerButtonStyle(props.layout.compact, { hovered, pressed, open }, disabled);
+    },
+    [composer, disabled, open, props.layout.compact, selection],
   );
-  const contents = (
-    <>
-      {entry.pending ? (
-        <View style={styles.icon}>
-          <LoadingSpinner size={14} color={props.theme.colors.foregroundMuted} />
-        </View>
-      ) : (
-        <ButtonIcon view={view} icon={button.icon} />
-      )}
-      {label ? (
-        <Text numberOfLines={1} style={composer ? styles.composerLabel : styles.label}>
-          {label}
-        </Text>
-      ) : null}
-      {chevron ? (
-        <View testID="plugin-button-chevron">
-          <Chevron size={12} color={props.theme.colors.foregroundMuted} />
-        </View>
-      ) : null}
-    </>
-  );
+  const contents = <ButtonControlContents view={view} expanded={expanded} />;
   const accessibilityState = useMemo(
     () => ({ busy: entry.pending, disabled }),
     [entry.pending, disabled],
@@ -327,7 +343,7 @@ function ButtonControl({ view }: { view: ButtonView }) {
     [view, entry.key, button.behavior],
   );
   return (
-    <MenuRoot compactMode="sheet" open={entry.open} onOpenChange={setOpen}>
+    <MenuRoot compactMode={selection ? "popover" : "sheet"} open={open} onOpenChange={setOpen}>
       <Tooltip enabledOnMobile={false}>
         <TooltipTrigger asChild>{trigger}</TooltipTrigger>
         <TooltipContent>
@@ -346,6 +362,40 @@ function ButtonControl({ view }: { view: ButtonView }) {
         </PluginPopoverSurface>
       ) : null}
     </MenuRoot>
+  );
+}
+
+function ButtonControlContents({ view, expanded }: { view: ButtonView; expanded: boolean }) {
+  const { entry, props } = view;
+  const { button } = entry;
+  const composer = entry.placement === "composer";
+  const selection = entry.placement === "selection";
+  // Compact headers drop the label and chevron. Composer menus open above their trigger.
+  const chevron = expanded && (composer || selection || !props.layout.compact);
+  const Chevron = composer ? ChevronUp : ChevronDown;
+  let label = button.label;
+  if (composer || selection) label = button.label ?? button.title;
+  else if (props.layout.compact) label = undefined;
+  return (
+    <>
+      {entry.pending ? (
+        <View style={styles.icon}>
+          <LoadingSpinner size={14} color={props.theme.colors.foregroundMuted} />
+        </View>
+      ) : (
+        <ButtonIcon view={view} icon={button.icon} />
+      )}
+      {label ? (
+        <Text numberOfLines={1} style={composer ? styles.composerLabel : styles.label}>
+          {label}
+        </Text>
+      ) : null}
+      {chevron ? (
+        <View testID="plugin-button-chevron">
+          <Chevron size={12} color={props.theme.colors.foregroundMuted} />
+        </View>
+      ) : null}
+    </>
   );
 }
 
@@ -382,6 +432,7 @@ function createButtonView({
   compact,
   hostLabel,
   theme,
+  selectionAction,
 }: {
   entry: RegisteredPluginButton;
   client: ReturnType<typeof useHostRuntimeClient>;
@@ -389,18 +440,26 @@ function createButtonView({
   compact: boolean;
   hostLabel: string;
   theme: PluginTheme;
+  selectionAction?: SelectionAction;
 }): ButtonView | null {
   if (!client) return null;
   return {
     entry,
     toast,
+    selectionAction,
     environment: {
       installation: entry.installation,
       toast,
       state: createPluginClientStateSource(entry.installation.serverId),
     },
     props: {
-      ...entry.context,
+      ...(selectionAction
+        ? {
+            context: "agent",
+            workspaceId: selectionAction.selection.workspaceId,
+            agentId: selectionAction.selection.agentId,
+          }
+        : entry.context),
       theme,
       host: { id: entry.installation.serverId, label: hostLabel },
       layout: { compact, platform: resolvePluginPlatform() },
@@ -413,17 +472,21 @@ function PluginButtonHost({
   compact,
   hostLabel,
   theme,
+  selectionAction,
+  selectionControls,
 }: {
   entry: RegisteredPluginButton;
   compact: boolean;
   hostLabel: string;
   theme: PluginTheme;
+  selectionAction?: SelectionAction;
+  selectionControls?: SelectionButtonControls;
 }) {
   const client = useHostRuntimeClient(entry.installation.serverId);
   const toast = useToast();
   const view = useMemo(
-    () => createButtonView({ entry, client, toast, compact, hostLabel, theme }),
-    [entry, client, toast, compact, hostLabel, theme],
+    () => createButtonView({ entry, client, toast, compact, hostLabel, theme, selectionAction }),
+    [entry, client, toast, compact, hostLabel, theme, selectionAction],
   );
   const renderError = useCallback(
     (error: string) => <BrokenButton title={entry.button.title} error={error} compact={compact} />,
@@ -437,7 +500,7 @@ function PluginButtonHost({
       renderError={renderError}
     >
       <ButtonEnvironment view={view}>
-        <ButtonControl view={view} />
+        <ButtonControl view={view} selectionControls={selectionControls} />
       </ButtonEnvironment>
     </SurfaceErrorBoundary>
   );
@@ -449,7 +512,11 @@ const ThemedPluginButton = withUnistyles(PluginButtonHost);
  * Each row and page of a shared menu resolves its own installation's runtime: one menu can hold
  * buttons from several plugins, and none of them may run through another's host client.
  */
-function useMenuButtonView(entry: RegisteredPluginButton, theme: PluginTheme): ButtonView | null {
+function useMenuButtonView(
+  entry: RegisteredPluginButton,
+  theme: PluginTheme,
+  selectionAction?: SelectionAction,
+): ButtonView | null {
   const client = useHostRuntimeClient(entry.installation.serverId);
   const toast = useToast();
   const compact = useIsCompactFormFactor();
@@ -457,13 +524,21 @@ function useMenuButtonView(entry: RegisteredPluginButton, theme: PluginTheme): B
   const serverId = entry.installation.serverId;
   const hostLabel = hosts.find((host) => host.serverId === serverId)?.label ?? serverId;
   return useMemo(
-    () => createButtonView({ entry, client, toast, compact, hostLabel, theme }),
-    [entry, client, toast, compact, hostLabel, theme],
+    () => createButtonView({ entry, client, toast, compact, hostLabel, theme, selectionAction }),
+    [entry, client, toast, compact, hostLabel, theme, selectionAction],
   );
 }
 
-function MenuButtonRow({ entry, theme }: { entry: RegisteredPluginButton; theme: PluginTheme }) {
-  const view = useMenuButtonView(entry, theme);
+function MenuButtonRow({
+  entry,
+  theme,
+  selectionAction,
+}: {
+  entry: RegisteredPluginButton;
+  theme: PluginTheme;
+  selectionAction?: SelectionAction;
+}) {
+  const view = useMenuButtonView(entry, theme, selectionAction);
   if (!view) return null;
   const { button } = entry;
   return (
@@ -488,13 +563,15 @@ function MenuButtonPage({
   behavior,
   path,
   theme,
+  selectionAction,
 }: {
   entry: RegisteredPluginButton;
   behavior: PluginButtonBehavior;
   path: readonly string[];
   theme: PluginTheme;
+  selectionAction?: SelectionAction;
 }) {
-  const view = useMenuButtonView(entry, theme);
+  const view = useMenuButtonView(entry, theme, selectionAction);
   if (!view) return null;
   return <ButtonSurfaceBody view={view} behavior={behavior} path={path} />;
 }
@@ -509,9 +586,17 @@ export interface PluginButtonsMenu {
   pages: MenuPageDefinition[];
 }
 
-function buttonsMenu(entries: readonly RegisteredPluginButton[]): PluginButtonsMenu {
+function buttonsMenu(
+  entries: readonly RegisteredPluginButton[],
+  selectionAction?: SelectionAction,
+): PluginButtonsMenu {
   const rows = entries.map((entry) => (
-    <ThemedMenuButtonRow key={entry.key} entry={entry} uniProps={pluginThemeMapping} />
+    <ThemedMenuButtonRow
+      key={entry.key}
+      entry={entry}
+      selectionAction={selectionAction}
+      uniProps={pluginThemeMapping}
+    />
   ));
   const pages = entries.flatMap((entry): MenuPageDefinition[] => {
     const { behavior } = entry.button;
@@ -521,6 +606,7 @@ function buttonsMenu(entries: readonly RegisteredPluginButton[]): PluginButtonsM
         entry={entry}
         behavior={pageBehavior}
         path={path}
+        selectionAction={selectionAction}
         uniProps={pluginThemeMapping}
       />
     );
@@ -528,7 +614,7 @@ function buttonsMenu(entries: readonly RegisteredPluginButton[]): PluginButtonsM
       {
         id: buttonPageId(entry.key, ROOT_PATH),
         title: entry.button.title,
-        hoverIntent: false,
+        hoverIntent: selectionAction ? behavior.kind === "menu" : false,
         content: render(behavior, ROOT_PATH),
       },
       ...buttonPages(entry.key, behavior, ROOT_PATH, render),
@@ -551,16 +637,79 @@ function OverflowSurface({ entries }: { entries: readonly RegisteredPluginButton
   );
 }
 
-function useButtons(serverId: string, workspaceId: string, agentId: string | null) {
-  const entries = useSyncExternalStore(
+function useRegisteredButtons() {
+  return useSyncExternalStore(
     pluginButtonStore.subscribe,
     pluginButtonStore.getSnapshot,
     pluginButtonStore.getSnapshot,
   );
+}
+
+function useButtons(serverId: string, workspaceId: string, agentId: string | null) {
+  const entries = useRegisteredButtons();
   return useMemo(
     () => entries.filter((entry) => buttonMatches(entry, serverId, workspaceId, agentId)),
     [entries, serverId, workspaceId, agentId],
   );
+}
+
+export function usePluginSelectionButtons(
+  serverId?: string,
+  workspaceId?: string,
+  agentId?: string,
+): readonly RegisteredPluginButton[] {
+  const entries = useRegisteredButtons();
+  return useMemo(
+    () =>
+      serverId && workspaceId && agentId
+        ? entries.filter((entry) => selectionButtonMatches(entry, serverId, workspaceId, agentId))
+        : [],
+    [entries, serverId, workspaceId, agentId],
+  );
+}
+
+export function usePluginSelectionMenu(
+  entries: readonly RegisteredPluginButton[],
+  selection: PluginTimelineSelection | null,
+  onAction: SelectionAction["onAction"],
+): PluginButtonsMenu {
+  return useMemo(
+    () => buttonsMenu(selection ? entries : [], selection ? { selection, onAction } : undefined),
+    [entries, selection, onAction],
+  );
+}
+
+export function PluginSelectionButtons({
+  entries,
+  selection,
+  openKey,
+  onOpenChange,
+  onAction,
+}: {
+  entries: readonly RegisteredPluginButton[];
+  selection: PluginTimelineSelection;
+  openKey: number | null;
+  onOpenChange(key: number, open: boolean): void;
+  onAction: SelectionAction["onAction"];
+}) {
+  const compact = useIsCompactFormFactor();
+  const hosts = useHosts();
+  const selectionAction = useMemo(() => ({ selection, onAction }), [selection, onAction]);
+  const selectionControls = useMemo(() => ({ openKey, onOpenChange }), [openKey, onOpenChange]);
+  return entries.map((entry) => (
+    <ThemedPluginButton
+      key={entry.key}
+      entry={entry}
+      compact={compact}
+      hostLabel={
+        hosts.find((host) => host.serverId === entry.installation.serverId)?.label ??
+        entry.installation.serverId
+      }
+      selectionAction={selectionAction}
+      selectionControls={selectionControls}
+      uniProps={pluginThemeMapping}
+    />
+  ));
 }
 
 export function PluginComposerPills({
@@ -666,6 +815,14 @@ const styles = StyleSheet.create((theme) => ({
     borderRadius: theme.borderRadius.md,
     borderWidth: theme.borderWidth[1],
     borderColor: theme.colors.borderAccent,
+  },
+  selectionButton: {
+    height: 28,
+    paddingHorizontal: theme.spacing[2],
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[1],
+    borderRadius: theme.borderRadius.md,
   },
   button: { flexShrink: 1, minWidth: 0, maxWidth: 160 },
   active: { backgroundColor: theme.colors.surface2 },

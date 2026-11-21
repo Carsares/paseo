@@ -1,10 +1,14 @@
 import { defineTranslations } from "@getpaseo/plugin/client";
 import { PluginTranslationRuntime } from "@getpaseo/plugin/client/host";
 import { QueryClient } from "@tanstack/react-query";
-import { describe, expect, it } from "vitest";
-import type { PluginButton } from "@getpaseo/plugin/client";
+import { describe, expect, it, vi } from "vitest";
+import type {
+  PluginButton,
+  PluginSelectionButtonContribution,
+  PluginTimelineSelection,
+} from "@getpaseo/plugin/client";
 import type { InstalledPlugin } from "../types";
-import { PluginButtonStore, buttonMatches } from "./model";
+import { PluginButtonStore, buttonMatches, selectionButtonMatches } from "./model";
 
 function installation(): InstalledPlugin {
   return {
@@ -182,6 +186,153 @@ describe("plugin buttons", () => {
     });
     await buttons.run(key, ["nested", "run"]);
     expect(calls).toBe(2);
+  });
+});
+
+describe("plugin selection buttons", () => {
+  const selection: PluginTimelineSelection = {
+    text: "Selected",
+    markdown: "**Selected**",
+    messageId: "message",
+    workspaceId: "workspace",
+    agentId: "agent",
+  };
+
+  it("matches only the registered host and scope and supports updates and removal", () => {
+    const buttons = store();
+    const plugin = installation();
+    const contribution: PluginSelectionButtonContribution = {
+      id: "review",
+      workspaceId: "workspace",
+      button: { title: "Review", icon: "Scan", behavior: { kind: "action", onPress() {} } },
+    };
+    const workspaceButton = buttons.addSelectionButton(plugin, contribution);
+    const agentButton = buttons.addSelectionButton(plugin, { ...contribution, agentId: "agent" });
+    for (const blank of ["", " \t"]) {
+      expect(() =>
+        buttons.addSelectionButton(plugin, { ...contribution, workspaceId: blank }),
+      ).toThrow("needs a workspace");
+      expect(() => buttons.addSelectionButton(plugin, { ...contribution, agentId: blank })).toThrow(
+        "needs a non-empty agent",
+      );
+    }
+    expect(() => buttons.addSelectionButton(plugin, contribution)).toThrow(
+      "Duplicate plugin button",
+    );
+    expect(() => buttons.addSelectionButton(plugin, { ...contribution, agentId: "agent" })).toThrow(
+      "Duplicate plugin button",
+    );
+    const matches = (serverId: string, workspaceId: string, agentId: string) =>
+      buttons
+        .getSnapshot()
+        .filter((entry) => selectionButtonMatches(entry, serverId, workspaceId, agentId));
+    expect(matches("host-a", "workspace", "agent")).toHaveLength(2);
+    expect(matches("host-a", "workspace", "other")).toHaveLength(1);
+    expect(matches("host-b", "workspace", "agent")).toHaveLength(0);
+    expect(matches("host-a", "other", "agent")).toHaveLength(0);
+    expect(buttonMatches(buttons.getSnapshot()[0], "host-a", "workspace", null)).toBe(false);
+    workspaceButton.update({ visible: false });
+    expect(matches("host-a", "workspace", "other")).toHaveLength(0);
+    agentButton.remove();
+    expect(matches("host-a", "workspace", "agent")).toHaveLength(0);
+    workspaceButton.remove();
+    workspaceButton.update({ visible: true });
+    expect(buttons.getSnapshot()).toEqual([]);
+  });
+
+  it("removes the button and its translation listener as soon as the installation stops", async () => {
+    const buttons = store();
+    const plugin = installation();
+    const subscribe = plugin.i18n.subscribe;
+    const unsubscribe = vi.fn();
+    vi.spyOn(plugin.i18n, "subscribe").mockImplementation((listener) => {
+      const stopListening = subscribe(listener);
+      return () => {
+        stopListening();
+        unsubscribe();
+      };
+    });
+    const onPress = vi.fn();
+    const contribution: PluginSelectionButtonContribution = {
+      id: "review",
+      workspaceId: "workspace",
+      button: { title: "Review", icon: "Scan", behavior: { kind: "action", onPress } },
+    };
+    const old = buttons.addSelectionButton(plugin, contribution);
+    const oldKey = buttons.getSnapshot()[0].key;
+    plugin.lifetime.abort();
+    expect(buttons.getSnapshot()).toEqual([]);
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    expect(() => buttons.addSelectionButton(plugin, contribution)).toThrow("Plugin has stopped");
+    const fresh = installation();
+    const replacement = buttons.addSelectionButton(fresh, contribution);
+    const newKey = buttons.getSnapshot()[0].key;
+    old.remove();
+    old.update({ title: "Old" });
+    await buttons.run(oldKey, [], selection);
+    expect(onPress).not.toHaveBeenCalled();
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    await buttons.run(newKey, [], selection);
+    expect(onPress).toHaveBeenCalledExactlyOnceWith(selection);
+    replacement.remove();
+    fresh.i18n.dispose();
+    plugin.i18n.dispose();
+  });
+
+  it("passes the snapshot to nested actions, prevents repeats, and allows retry after rejection", async () => {
+    const buttons = store();
+    let reject = (_error: Error) => {};
+    const pending = new Promise<void>((_, rejectPromise) => {
+      reject = rejectPromise;
+    });
+    const onPress = vi
+      .fn<(selection: PluginTimelineSelection) => void | Promise<void>>()
+      .mockReturnValueOnce(pending);
+    const registration = buttons.addSelectionButton(installation(), {
+      id: "review",
+      workspaceId: "workspace",
+      agentId: "agent",
+      button: {
+        title: "Review",
+        icon: "Scan",
+        behavior: {
+          kind: "menu",
+          items: [
+            {
+              kind: "item",
+              id: "group",
+              title: "More",
+              behavior: {
+                kind: "menu",
+                items: [
+                  { kind: "separator", id: "separator" },
+                  {
+                    kind: "item",
+                    id: "run",
+                    title: "Review this",
+                    behavior: { kind: "action", onPress },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    });
+    const key = buttons.getSnapshot()[0].key;
+    const path = ["group", "run"];
+    await buttons.run(key, path, { ...selection, agentId: "other" });
+    expect(onPress).not.toHaveBeenCalled();
+    const first = buttons.run(key, path, selection);
+    expect(buttons.getSnapshot()[0].pending).toBe(true);
+    await buttons.run(key, path, selection);
+    expect(onPress).toHaveBeenCalledExactlyOnceWith(selection);
+    reject(new Error("Unavailable"));
+    await expect(first).rejects.toThrow("Unavailable");
+    expect(buttons.getSnapshot()[0].pending).toBe(false);
+    await buttons.run(key, path, selection);
+    expect(onPress).toHaveBeenCalledTimes(2);
+    registration.remove();
   });
 });
 

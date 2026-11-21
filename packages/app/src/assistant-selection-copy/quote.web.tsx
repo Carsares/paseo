@@ -16,6 +16,7 @@ import {
   type ViewStyle,
 } from "react-native";
 import { createPortal } from "react-dom";
+import type { PluginTimelineSelection } from "@getpaseo/plugin/client";
 import { FadeIn } from "react-native-reanimated";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { Copy, GitBranch, TextQuote } from "lucide-react-native";
@@ -34,6 +35,8 @@ import { isWeb } from "@/constants/platform";
 import { resolveKeyboardFocusScope } from "@/keyboard/focus-scope";
 import { getOverlayRoot, OverlayLayerProvider, useOverlayLayer } from "@/lib/overlay-root";
 import { useOverlayRegistration, type KeyboardInputEvent } from "@/keyboard";
+import { PluginSelectionButtons, usePluginSelectionMenu } from "@/plugins/buttons/view";
+import type { RegisteredPluginButton } from "@/plugins/buttons/model";
 import { isImeComposingKeyboardEvent } from "@/utils/keyboard-ime";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import { copyToClipboard } from "@/utils/copy-to-clipboard";
@@ -49,13 +52,15 @@ type QuoteState = { phase: "idle" } | ({ phase: "offered" } & SelectionPassage);
 interface SelectionPassage {
   range: Range;
   endpoints: readonly [Node, Node];
+  text: string;
   quote: string;
   messageRowId: string | null;
 }
 
 type PendingMenuAction =
   | { kind: "quote"; quote: string }
-  | { kind: "spawn"; quote: string; messageRowId: string | null };
+  | { kind: "spawn"; quote: string; messageRowId: string | null }
+  | { kind: "plugin"; run: () => void };
 
 const IDLE: QuoteState = { phase: "idle" };
 const ANCHOR_OFFSET = 4;
@@ -71,6 +76,9 @@ const copyIcon = <MenuCopyIcon size={ICON_SIZE.sm} uniProps={menuIconColor} />;
 
 interface AssistantSelectionQuoteProps {
   streamRef: RefObject<HTMLElement | null>;
+  workspaceId?: string;
+  agentId?: string;
+  selectionButtons?: readonly RegisteredPluginButton[];
   onQuote?: (quote: ComposerQuote) => void;
   subagentSpawnMode?: SelectionSubagentSpawnMode;
   onSpawnSubagentFromSelection?: (
@@ -94,6 +102,9 @@ export function AssistantSelectionQuote(props: AssistantSelectionQuoteProps) {
  */
 function SelectionActions({
   streamRef,
+  workspaceId,
+  agentId,
+  selectionButtons = NO_SELECTION_BUTTONS,
   onQuote,
   subagentSpawnMode = "child",
   onSpawnSubagentFromSelection,
@@ -109,6 +120,17 @@ function SelectionActions({
   >(null);
   const stateRef = useRef(state);
   const floatingRef = useRef<HTMLElement | null>(null);
+  const floatingMenu = useRef<{ restoreFocus: HTMLElement | null } | null>(null);
+  const recordFloatingMenu = useCallback((restoreFocus: HTMLElement | null) => {
+    floatingMenu.current = { restoreFocus };
+  }, []);
+  useLayoutEffect(
+    () => () => {
+      if (floatingMenu.current) window.getSelection()?.removeAllRanges();
+      floatingMenu.current = null;
+    },
+    [],
+  );
   const { open: menuOpen, setOpen: setMenuOpen, setAnchorRect } = useContextMenu();
   const pendingMenuAction = useRef<PendingMenuAction | null>(null);
   const menuOpenRef = useRef(menuOpen);
@@ -130,16 +152,25 @@ function SelectionActions({
   }, [menuOpen]);
 
   useLayoutEffect(() => {
-    if (menuOpen || !pendingMenuAction.current) return;
+    if (menuOpen || state.phase !== "idle") return;
+    const restoreFocus = floatingMenu.current?.restoreFocus;
+    floatingMenu.current = null;
+    // The menu's usual restore target is its trigger, which leaves with the selection toolbar.
+    if (restoreFocus?.isConnected && document.activeElement === document.body) {
+      restoreFocus.focus({ preventScroll: true });
+    }
     const action = pendingMenuAction.current;
     pendingMenuAction.current = null;
-    // Let the menu restore focus during unmount before the composer or new tab takes it.
+    if (!action) return;
+    // Let the menu restore focus during unmount before the action can move it again.
     if (action.kind === "quote") {
       onQuote?.({ quote: action.quote });
-    } else {
+    } else if (action.kind === "spawn") {
       spawnSubagent(action.quote, action.messageRowId);
+    } else {
+      action.run();
     }
-  }, [menuOpen, onQuote, spawnSubagent]);
+  }, [menuOpen, onQuote, spawnSubagent, state.phase]);
 
   useEffect(() => {
     let pointerDown = false;
@@ -147,7 +178,7 @@ function SelectionActions({
 
     const readSelection = () => {
       frame = 0;
-      if (menuOpenRef.current) return;
+      if (menuOpenRef.current || floatingMenu.current) return;
       const passage = readSelectionPassage(streamRef.current, window.getSelection());
       update(passage ? { phase: "offered", ...passage } : IDLE);
     };
@@ -156,10 +187,10 @@ function SelectionActions({
     };
     const handleSelectionChange = () => {
       // A drag settles on pointerup; until then the button would chase the pointer.
-      if (!pointerDown && !menuOpenRef.current) scheduleRead();
+      if (!pointerDown && !menuOpenRef.current && !floatingMenu.current) scheduleRead();
     };
     const handlePointerDown = (event: PointerEvent) => {
-      if (menuOpenRef.current) return;
+      if (menuOpenRef.current || floatingMenu.current) return;
       if (floatingRef.current?.contains(event.target as Node)) return;
       update(IDLE);
       if (event.button === 2) return;
@@ -184,11 +215,14 @@ function SelectionActions({
     };
   }, [streamRef, update]);
 
+  const hasSelectionActions = Boolean(
+    onQuote || onSpawnSubagentFromSelection || selectionButtons.length,
+  );
   useEffect(() => {
     const stream = streamRef.current;
-    if (!stream || (!onQuote && !onSpawnSubagentFromSelection)) return;
+    if (!stream || !hasSelectionActions) return;
     const handleContextMenu = (event: MouseEvent) => {
-      if (event.defaultPrevented) return;
+      if (event.defaultPrevented || floatingMenu.current) return;
       if (isEditableContextTarget(event.target)) return;
       const selection = window.getSelection();
       const passage = readSelectionPassage(stream, selection);
@@ -206,24 +240,48 @@ function SelectionActions({
     };
     stream.addEventListener("contextmenu", handleContextMenu);
     return () => stream.removeEventListener("contextmenu", handleContextMenu);
-  }, [onQuote, onSpawnSubagentFromSelection, setAnchorRect, setMenuOpen, streamRef, update]);
+  }, [hasSelectionActions, setAnchorRect, setMenuOpen, streamRef, update]);
 
   useEffect(() => {
     if (!menuOpen) return;
-    const close = () => setMenuOpen(false);
-    const handleOutsidePointerDown = (event: PointerEvent) => {
-      if (eventTargetElement(event.target)?.closest(`[data-testid="${SELECTION_MENU_ID}"]`)) return;
-      close();
+    const handleOutsideInteraction = (event: Event) => {
+      if (
+        eventTargetElement(event.target)?.closest(
+          `[data-testid="${SELECTION_MENU_ID}"], [data-testid^="${SELECTION_MENU_ID}-"]`,
+        )
+      )
+        return;
+      setMenuOpen(false);
     };
-    document.addEventListener("pointerdown", handleOutsidePointerDown, true);
-    document.addEventListener("scroll", close, true);
+    document.addEventListener("pointerdown", handleOutsideInteraction, true);
+    document.addEventListener("scroll", handleOutsideInteraction, true);
     return () => {
-      document.removeEventListener("pointerdown", handleOutsidePointerDown, true);
-      document.removeEventListener("scroll", close, true);
+      document.removeEventListener("pointerdown", handleOutsideInteraction, true);
+      document.removeEventListener("scroll", handleOutsideInteraction, true);
     };
   }, [menuOpen, setMenuOpen]);
 
   const dismiss = useCallback(() => update(IDLE), [update]);
+  const dismissPluginSelection = useCallback(() => {
+    dismiss();
+    window.getSelection()?.removeAllRanges();
+  }, [dismiss]);
+  const runPluginSelectionAction = useCallback(
+    (run: () => void) => {
+      pendingMenuAction.current = { kind: "plugin", run };
+      dismissPluginSelection();
+    },
+    [dismissPluginSelection],
+  );
+  const contextSelection = useMemo(
+    () => pluginSelection(menuSelection, workspaceId, agentId),
+    [menuSelection, workspaceId, agentId],
+  );
+  const contextPluginMenu = usePluginSelectionMenu(
+    selectionButtons,
+    contextSelection,
+    runPluginSelectionAction,
+  );
   const spawnSubagentFromMenu = useCallback(() => {
     if (!onSpawnSubagentFromSelection || !menuSelection) return;
     pendingMenuAction.current = {
@@ -264,7 +322,7 @@ function SelectionActions({
 
   if (menuOpen && menuSelection) {
     return (
-      <ContextMenuContent offset={0} testID={SELECTION_MENU_ID}>
+      <ContextMenuContent offset={0} testID={SELECTION_MENU_ID} pages={contextPluginMenu.pages}>
         {onSpawnSubagentFromSelection ? (
           <ContextMenuItem
             leading={branchIcon}
@@ -283,7 +341,10 @@ function SelectionActions({
             {t("agentStream.quote.quoteInChat")}
           </ContextMenuItem>
         ) : null}
-        {onSpawnSubagentFromSelection || onQuote ? <ContextMenuSeparator /> : null}
+        {contextPluginMenu.rows}
+        {onSpawnSubagentFromSelection || onQuote || contextPluginMenu.rows.length ? (
+          <ContextMenuSeparator />
+        ) : null}
         <ContextMenuItem
           leading={copyIcon}
           testID={`${SELECTION_MENU_ID}-copy`}
@@ -294,12 +355,18 @@ function SelectionActions({
       </ContextMenuContent>
     );
   }
-  if (state.phase === "offered" && (onQuote || onSpawnSubagentFromSelection)) {
+  if (state.phase === "offered" && hasSelectionActions) {
     return (
       <QuoteButton
         passage={state}
         streamRef={streamRef}
         floatingRef={floatingRef}
+        workspaceId={workspaceId}
+        agentId={agentId}
+        selectionButtons={selectionButtons}
+        onPluginMenuOpen={recordFloatingMenu}
+        onPluginMenuClose={dismissPluginSelection}
+        onPluginAction={runPluginSelectionAction}
         onPress={onQuote ? quoteFromPill : undefined}
         spawnLabel={spawnLabel}
         onSpawnSubagent={onSpawnSubagentFromSelection ? spawnSubagentFromPill : undefined}
@@ -308,6 +375,23 @@ function SelectionActions({
     );
   }
   return null;
+}
+
+const NO_SELECTION_BUTTONS: readonly RegisteredPluginButton[] = [];
+
+function pluginSelection(
+  passage: SelectionPassage | null,
+  workspaceId?: string,
+  agentId?: string,
+): PluginTimelineSelection | null {
+  if (!passage || !workspaceId || !agentId) return null;
+  return Object.freeze({
+    text: passage.text,
+    markdown: passage.quote,
+    messageId: passage.messageRowId,
+    workspaceId,
+    agentId,
+  });
 }
 
 function readSelectionPassage(
@@ -325,7 +409,9 @@ function readSelectionPassage(
       ?.closest<HTMLElement>("[data-message-id]")
       ?.getAttribute("data-message-id")
       ?.trim() || null;
-  return quote ? { range: range.cloneRange(), endpoints, quote, messageRowId } : null;
+  return quote
+    ? { range: range.cloneRange(), endpoints, text: selection.toString(), quote, messageRowId }
+    : null;
 }
 
 function eventTargetElement(target: EventTarget | null): Element | null {
@@ -381,6 +467,12 @@ function QuoteButton({
   passage,
   streamRef,
   floatingRef,
+  workspaceId,
+  agentId,
+  selectionButtons,
+  onPluginMenuOpen,
+  onPluginMenuClose,
+  onPluginAction,
   onPress,
   spawnLabel,
   onSpawnSubagent,
@@ -389,6 +481,12 @@ function QuoteButton({
   passage: SelectionPassage;
   streamRef: AssistantSelectionQuoteProps["streamRef"];
   floatingRef: RefObject<HTMLElement | null>;
+  workspaceId?: string;
+  agentId?: string;
+  selectionButtons: readonly RegisteredPluginButton[];
+  onPluginMenuOpen(restoreFocus: HTMLElement | null): void;
+  onPluginMenuClose(): void;
+  onPluginAction(run: () => void): void;
   onPress?: () => void;
   spawnLabel: string;
   onSpawnSubagent?: () => void;
@@ -396,9 +494,47 @@ function QuoteButton({
 }) {
   const { t } = useTranslation();
   const layer = useOverlayLayer("floating");
-  const anchor = useRangeEndRect(passage, streamRef);
+  const [openMenu, setOpenMenu] = useState<{
+    key: number;
+    position: Pick<Rect, "x" | "y">;
+    selection: PluginTimelineSelection;
+  } | null>(null);
+  const anchor = useRangeEndRect(passage, streamRef, openMenu !== null);
+  const selection = useMemo(
+    () => pluginSelection(passage, workspaceId, agentId),
+    [passage, workspaceId, agentId],
+  );
+  const closePluginMenu = useCallback(() => setOpenMenu(null), []);
+  const menuWasOpen = useRef(false);
+  useLayoutEffect(() => {
+    if (menuWasOpen.current && !openMenu) onPluginMenuClose();
+    menuWasOpen.current = openMenu !== null;
+  }, [onPluginMenuClose, openMenu]);
+  const handlePluginMenuOpenChange = useCallback(
+    (key: number, open: boolean) => {
+      if (!open) {
+        if (openMenu?.key === key) closePluginMenu();
+        return;
+      }
+      const surface = floatingRef.current;
+      if (!anchor || !selection || !surface) return;
+      const { x, y } = surface.getBoundingClientRect();
+      // Lock synchronously before the menu can move focus or replace the browser selection.
+      const active = document.activeElement;
+      onPluginMenuOpen(active instanceof HTMLElement && !surface.contains(active) ? active : null);
+      setOpenMenu({ key, position: { x, y }, selection });
+    },
+    [anchor, closePluginMenu, floatingRef, onPluginMenuOpen, openMenu, selection],
+  );
+  useEffect(() => {
+    if (!openMenu) return;
+    const entry = selectionButtons.find((button) => button.key === openMenu.key);
+    if (!entry || entry.button.disabled || entry.button.behavior.kind === "action")
+      closePluginMenu();
+  }, [closePluginMenu, openMenu, selectionButtons]);
   const handleKeyDown = useCallback(
     (event: KeyboardInputEvent) => {
+      if (openMenu) return false;
       if (event.key === "Escape") {
         event.preventDefault();
         onDismiss();
@@ -415,11 +551,11 @@ function QuoteButton({
       }
       return false;
     },
-    [onDismiss, onPress],
+    [onDismiss, onPress, openMenu],
   );
   const setOverlayScope = useOverlayRegistration({
     keys: ["Escape", "Enter"],
-    active: anchor !== null,
+    active: anchor !== null && !openMenu,
     layer,
     onKeyDown: handleKeyDown,
     manageFocus: false,
@@ -440,6 +576,7 @@ function QuoteButton({
   return (
     <AnchoredSurface
       anchor={anchor}
+      frozenPosition={openMenu?.position}
       alignment="end"
       layer={layer}
       entering={FADE_IN}
@@ -463,12 +600,22 @@ function QuoteButton({
           {spawnLabel}
         </Button>
       ) : null}
+      {selection && selectionButtons.length > 0 ? (
+        <PluginSelectionButtons
+          entries={selectionButtons}
+          selection={openMenu?.selection ?? selection}
+          openKey={openMenu?.key ?? null}
+          onOpenChange={handlePluginMenuOpenChange}
+          onAction={onPluginAction}
+        />
+      ) : null}
     </AnchoredSurface>
   );
 }
 
 function AnchoredSurface({
   anchor,
+  frozenPosition,
   alignment,
   layer,
   entering,
@@ -478,6 +625,7 @@ function AnchoredSurface({
   children,
 }: {
   anchor: Rect | null;
+  frozenPosition?: Pick<Rect, "x" | "y">;
   alignment: Alignment;
   layer: number;
   entering?: FloatingSurfaceProps["entering"];
@@ -493,6 +641,9 @@ function AnchoredSurface({
     setSize({ width, height });
   }, []);
   const frameStyle = useMemo(() => {
+    if (frozenPosition) {
+      return { position: "absolute" as const, top: frozenPosition.y, left: frozenPosition.x };
+    }
     if (!anchor || !size) return { position: "absolute" as const, top: -9999, left: -9999 };
     const { width, height } = Dimensions.get("window");
     const { x, y } = computePosition({
@@ -504,11 +655,11 @@ function AnchoredSurface({
       offset: ANCHOR_OFFSET,
     });
     return { position: "absolute" as const, top: y, left: x };
-  }, [alignment, anchor, size]);
+  }, [alignment, anchor, frozenPosition, size]);
   const surfaceStyle = useMemo(() => [styles.surface, style], [style]);
   const overlayStyle = useMemo(() => [styles.portalOverlay, { zIndex: layer }], [layer]);
 
-  if (!anchor) return null;
+  if (!anchor && !frozenPosition) return null;
   return createPortal(
     <OverlayLayerProvider layer={layer}>
       <View pointerEvents="box-none" style={overlayStyle}>
@@ -535,11 +686,12 @@ function AnchoredSurface({
 function useRangeEndRect(
   passage: SelectionPassage,
   streamRef: AssistantSelectionQuoteProps["streamRef"],
+  locked: boolean,
 ): Rect | null {
   const [rect, setRect] = useState<Rect | null>(() => rangeEndRect(passage, streamRef.current));
   useEffect(() => {
     const stream = streamRef.current;
-    if (!isWeb || !stream) return;
+    if (!isWeb || !stream || locked) return;
     let frame = 0;
     const measure = () => {
       frame = 0;
@@ -565,7 +717,7 @@ function useRangeEndRect(
       resize?.disconnect();
       mutations.disconnect();
     };
-  }, [passage, streamRef]);
+  }, [locked, passage, streamRef]);
   return rect;
 }
 

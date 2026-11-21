@@ -30,11 +30,14 @@ import {
 import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { foldFeatureValues, type LegacyFeatureValues } from "../option-controls.js";
 import {
+  EXPLICIT_PARENT_REPORTING,
   getParentAddressFromLabels,
+  isExplicitParentReportingLabels,
   isMainControlAgentLabels,
   getParentAgentIdFromLabels,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import {
@@ -111,6 +114,7 @@ export interface CreateAgentFromMcpInput {
   unattended?: boolean;
   promptFailure?: CreateAgentPromptFailureMode;
   notifyOnFinish: boolean;
+  parentReporting?: "auto" | "explicit";
   internal?: boolean;
   /** Omitted with a caller, the caller agent's own background applies. */
   background?: boolean;
@@ -142,6 +146,18 @@ export interface CreateAgentFromMcpInput {
 export type CreateAgentCommandInput = CreateAgentFromSessionInput | CreateAgentFromMcpInput;
 export type CreateAgentPromptFailureMode = "throw" | "log" | "return-error";
 
+export function shouldUseExplicitParentReporting(
+  input: Partial<Pick<CreateAgentFromMcpInput, "parentReporting" | "notifyOnFinish">>,
+  parentLabels: ManagedAgent["labels"] | undefined,
+): boolean {
+  return (
+    input.parentReporting === "explicit" ||
+    (input.parentReporting === undefined &&
+      input.notifyOnFinish === false &&
+      isMainControlAgentLabels(parentLabels))
+  );
+}
+
 export interface CreateAgentCommandResult {
   snapshot: ManagedAgent;
   liveSnapshot: ManagedAgent;
@@ -169,6 +185,7 @@ export async function registerParentFinishSubscription({
 }): Promise<FinishRegistration | undefined> {
   if (!finishSubscriptions) return;
   const agent = agentManager.getAgent(agentId) ?? (await agentStorage.get(agentId));
+  if (isExplicitParentReportingLabels(agent?.labels)) return;
   const parentId = getParentAgentIdFromLabels(agent?.labels);
   if (!parentId || parentId === agentId) return;
   const parentAddress = serverId && getParentAddressFromLabels(agent?.labels, serverId);
@@ -259,7 +276,7 @@ export async function createAgentCommand(
     input.onCreated?.({ agentId: snapshot.id, createdWorktree: resolved.createdWorktree ?? null });
   }
   if (resolved.prompt !== undefined) {
-    const notification = await registerInitialPromptFinish(dependencies, input, snapshot.id);
+    const notification = await registerInitialPromptFinish(dependencies, input, snapshot);
     const rejectNotification = async () => {
       await notification?.reject().catch((rejectError) => {
         dependencies.logger.warn(
@@ -306,9 +323,12 @@ async function validateCreateCaller(
 function registerInitialPromptFinish(
   dependencies: CreateAgentCommandDependencies,
   input: CreateAgentCommandInput,
-  childAgentId: string,
+  child: ManagedAgent,
 ): Promise<FinishRegistration> | undefined {
-  if (!input.callerAgentId || (input.kind === "mcp" && !input.notifyOnFinish)) return;
+  if (isExplicitParentReportingLabels(child.labels)) return;
+  if (!input.callerAgentId) return;
+  if (input.kind === "mcp" && (!input.notifyOnFinish || input.parentReporting === "explicit"))
+    return;
   if (input.kind === "session" && input.notifyParentOnInitialPrompt === false) return;
   const subscriptions =
     input.kind === "mcp"
@@ -316,7 +336,7 @@ function registerInitialPromptFinish(
       : dependencies.finishSubscriptions;
   return subscriptions?.register(
     {
-      childAgentId,
+      childAgentId: child.id,
       callerAgentId: input.callerAgentId,
       requireParentOwnership: input.kind === "session" || !input.detached,
     },
@@ -355,14 +375,21 @@ async function resolveSessionCreateAgent(
         }
       : undefined;
   const workspaceId = input.workspaceId;
+  const labels: Record<string, string> = {
+    ...input.labels,
+    ...(input.callerAgentId ? { [PARENT_AGENT_ID_LABEL]: input.callerAgentId } : {}),
+  };
+  const parent = getParentAddressFromLabels(labels, dependencies.serverId ?? "");
+  const isRemoteChild =
+    parent && dependencies.serverId && parent.serverId !== dependencies.serverId;
+  if (!isExplicitParentReportingLabels(labels) || (!input.callerAgentId && !isRemoteChild)) {
+    delete labels[PARENT_REPORTING_LABEL];
+  }
 
   return {
     config: sessionConfig,
     createOptions: {
-      labels: {
-        ...input.labels,
-        ...(input.callerAgentId ? { [PARENT_AGENT_ID_LABEL]: input.callerAgentId } : {}),
-      },
+      labels,
       metadata: input.metadata,
       initialPrompt: trimmedPrompt,
       forkedTimelineRows: input.forkedTimelineRows,
@@ -410,9 +437,7 @@ async function resolveMcpCreateAgent(
   if (createdWorktree) input.onWorktreeCreated?.(createdWorktree);
   const intent = await resolveCreateAgentIntent({
     explicitWorkspaceId: createdWorkspaceId ?? input.workspaceId,
-    caller: parentAgent
-      ? { id: parentAgent.id, cwd: parentAgent.cwd, workspaceId: parentAgent.workspaceId }
-      : null,
+    caller: parentAgent,
     labels: input.labels,
     serverId: dependencies.serverId,
     childAgentDefaultLabels: input.callerContext?.childAgentDefaultLabels,
@@ -430,6 +455,9 @@ async function resolveMcpCreateAgent(
       cwd: resolvedCwd,
     }),
   });
+  if (intent.parentAgentId && shouldUseExplicitParentReporting(input, parentAgent?.labels)) {
+    intent.labels[PARENT_REPORTING_LABEL] = EXPLICIT_PARENT_REPORTING;
+  }
   const resolvedCreateConfig = await resolveMcpProviderCreateConfig({
     dependencies,
     input,
@@ -453,7 +481,7 @@ async function resolveMcpCreateAgent(
       ...(Object.keys(intent.labels).length > 0 ? { labels: intent.labels } : {}),
       workspaceId: intent.workspaceId,
       inheritParentWorkspace:
-        Boolean(parentAgent && !input.detached) && !createdWorkspaceId && !input.workspaceId,
+        Boolean(intent.parentAgentId) && !createdWorkspaceId && !input.workspaceId,
       owner: input.owner,
       background: inheritAgentBackground(input.background, parentAgent),
       env: input.env,

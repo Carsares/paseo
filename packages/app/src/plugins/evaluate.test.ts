@@ -15,6 +15,9 @@ const runtime = {
   addComposerPill() {
     return { update() {}, remove() {} };
   },
+  addSelectionButton() {
+    return { update() {}, remove() {} };
+  },
 } as unknown as PluginClientRuntime;
 
 function evaluatePluginClientBundle(id: string, source: string) {
@@ -47,12 +50,49 @@ describe("evaluatePluginClientBundle", () => {
         bundle(`
       plugin.addHeaderButton({ id: "header", workspaceId: "workspace", button: { title: "Header", icon: "Scan", behavior: { kind: "action", onPress() {} } } });
       plugin.addComposerPill({ id: "pill", workspaceId: "workspace", agentId: "agent", button: { title: "Pill", icon: "Scan", behavior: { kind: "action", onPress() {} } } });
+      plugin.addSelectionButton({ id: "selection", workspaceId: "workspace", button: { title: "Selection", icon: "Scan", behavior: { kind: "action", onPress() {} } } });
       throw new Error("Setup failed");
     `),
-        { ...runtime, addHeaderButton: addButton, addComposerPill: addButton },
+        {
+          ...runtime,
+          addHeaderButton: addButton,
+          addComposerPill: addButton,
+          addSelectionButton: addButton,
+        },
       ),
     ).toThrow("Setup failed");
     expect(active).toBe(0);
+  });
+
+  it("keeps selection button updates live until client teardown, then removes the button", async () => {
+    let title = "";
+    const plugin = runPluginClientBundle(
+      "selection",
+      bundle(`
+        const registration = plugin.addSelectionButton({
+          id: "selection", workspaceId: "workspace",
+          button: { title: "Selection", icon: "Scan", behavior: { kind: "action", onPress() {} } },
+        });
+        registration.update({ title: "Updated selection" });
+      `),
+      {
+        ...runtime,
+        addSelectionButton(contribution) {
+          title = String(contribution.button.title);
+          return {
+            update(patch) {
+              title = String(patch.title);
+            },
+            remove() {
+              title = "";
+            },
+          };
+        },
+      },
+    );
+    expect(title).toBe("Updated selection");
+    await plugin.cleanup();
+    expect(title).toBe("");
   });
 
   it("registers sidebar views without selecting one and removes them on cleanup", async () => {

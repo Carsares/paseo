@@ -199,14 +199,18 @@ test("summarizes only the selected workspace and releases successful and failed 
     ]);
     expect(result.entries[0]?.firstUserPrompt).toBe("Implement the delegated task");
     expect(result.entries[1]).toMatchObject({
-      firstUserPrompt: "Add coverage",
-      lastAssistantSummary: "Added coverage",
-      todos: [{ text: "Run tests", completed: true }],
+      title: "Finished work",
+      parentAgentId: live.id,
+      firstUserPrompt: null,
+      lastAssistantSummary: null,
+      todos: [],
       touchedFiles: ["src/example.ts"],
     });
     expect(result.entries[2]).toMatchObject({ title: "Incomplete history", firstUserPrompt: null });
     expect(result.summaryText).toContain("## Active Sessions");
     expect(result.summaryText).toContain("## Closed Sessions");
+    expect(result.summaryText).toContain("src/example.ts");
+    expect(result.summaryText).not.toMatch(/Add coverage|Added coverage|Run tests/);
     expect(result.attachment.text).toBe(
       "<workspace-agents-summary>\n" + result.summaryText + "\n</workspace-agents-summary>",
     );

@@ -1881,6 +1881,43 @@ test("qualified parents preserve foreign identity without resolving an equal loc
   expect(localParent.address).toEqual({ serverId: "srv_sdk_test", agentId: "same-parent" });
 });
 
+test("explicit-reporting forks preserve the qualified parent and existing labels", async () => {
+  const { client, ws } = await connectClient();
+  const creating = client.agents.create({
+    config: { provider: "codex/gpt-5.4" },
+    cwd: "/repo/sdk",
+    parent: { serverId: "srv_parent_elsewhere", agentId: "same-parent" },
+    forkFrom: { sourceAgentId: "source", boundaryMessageId: "cutoff" },
+    parentReporting: "explicit",
+    labels: { task: "preserved", "paseo.parent-reporting": "auto" },
+  });
+  const request = parseSentSessionMessage(ws.sent.at(-1));
+  expect(request).not.toHaveProperty("callerAgentId");
+  expect(request).not.toHaveProperty("parentReporting");
+  expect(request).toMatchObject({
+    forkFrom: { sourceAgentId: "source", boundaryMessageId: "cutoff" },
+    labels: {
+      task: "preserved",
+      "paseo.parent-agent-id": "same-parent",
+      "paseo.parent-server-id": "srv_parent_elsewhere",
+      "paseo.parent-reporting": "explicit",
+    },
+  });
+  ws.message(
+    sessionMessage({
+      type: "status",
+      payload: {
+        status: "agent_created",
+        requestId: request.requestId,
+        agentId: "agent_sdk",
+        agent: createAgent(),
+      },
+    }),
+  );
+  await creating;
+  await client.close();
+});
+
 test("agent reload reopens through the daemon RPC then returns the observed snapshot; refresh remains a read", async () => {
   const { client, ws } = await connectClient();
   try {

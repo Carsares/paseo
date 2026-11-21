@@ -1,12 +1,53 @@
+import type { ComponentType } from "react";
 import type { PluginText } from "@getpaseo/plugin/client";
 import type {
   PluginButton as SDKPluginButton,
   PluginButtonBehavior as SDKPluginButtonBehavior,
+  PluginButtonContentProps,
   PluginButtonIcon,
+  PluginSelectionButton,
+  PluginSelectionButtonBehavior,
+  PluginSelectionButtonContentProps,
+  PluginTimelineSelection,
 } from "@getpaseo/plugin/client";
 
 type PluginButton = SDKPluginButton<PluginText>;
-type PluginButtonBehavior = SDKPluginButtonBehavior<PluginText>;
+type PluginButtonLeaf = Exclude<SDKPluginButtonBehavior<PluginText>, { kind: "menu" }>;
+type SelectionButtonLeaf = Exclude<PluginSelectionButtonBehavior<PluginText>, { kind: "menu" }>;
+type ButtonLeaf = PluginButtonLeaf | SelectionButtonLeaf;
+type ButtonBehavior<Leaf> =
+  | Leaf
+  | { kind: "menu"; items: readonly ButtonMenuEntry<PluginText, ButtonBehavior<Leaf>>[] };
+type ButtonMenuEntry<Text, Behavior> =
+  | { kind: "separator"; id: string }
+  | {
+      kind: "item";
+      id: string;
+      title: Text;
+      icon?: PluginButtonIcon;
+      visible?: boolean;
+      disabled?: boolean;
+      behavior: Behavior;
+    };
+
+type ResolvedButtonLeaf =
+  | { kind: "action"; withSelection: false; onPress(): void | Promise<void> }
+  | {
+      kind: "action";
+      withSelection: true;
+      onPress(selection: PluginTimelineSelection): void | Promise<void>;
+    }
+  | { kind: "popover"; withSelection: false; Content: ComponentType<PluginButtonContentProps> }
+  | {
+      kind: "popover";
+      withSelection: true;
+      Content: ComponentType<PluginSelectionButtonContentProps>;
+    };
+
+export type ResolvedPluginButtonBehavior =
+  | ResolvedButtonLeaf
+  | { kind: "menu"; items: readonly ResolvedPluginButtonMenuEntry[] };
+export type ResolvedPluginButtonMenuEntry = ButtonMenuEntry<string, ResolvedPluginButtonBehavior>;
 
 export interface ButtonValidation {
   /** Returns the normalized icon, or throws naming why the icon is unusable. */
@@ -43,19 +84,20 @@ function isComponent(value: unknown): boolean {
   );
 }
 
-function validateBehavior(
-  behavior: PluginButtonBehavior,
+function validateBehavior<Leaf extends ButtonLeaf>(
+  behavior: ButtonBehavior<Leaf>,
   validation: ButtonValidation,
   resolve: (text: PluginText) => string,
+  resolveLeaf: (leaf: Leaf) => ResolvedButtonLeaf,
 ): ResolvedPluginButtonBehavior {
   switch (behavior.kind) {
     case "action":
       if (typeof behavior.onPress !== "function")
         throw new Error("Plugin button action needs onPress");
-      return { ...behavior };
+      return resolveLeaf(behavior);
     case "popover":
       if (!isComponent(behavior.Content)) throw new Error("Plugin button popover needs Content");
-      return { ...behavior };
+      return resolveLeaf(behavior);
     case "menu": {
       const ids = new Set<string>();
       return {
@@ -72,7 +114,7 @@ function validateBehavior(
             title: requireText(item.title, "menu item title", resolve),
             visible: optionalBoolean(item.visible, true),
             disabled: optionalBoolean(item.disabled, false),
-            behavior: validateBehavior(item.behavior, validation, resolve),
+            behavior: validateBehavior(item.behavior, validation, resolve, resolveLeaf),
           };
         }),
       };
@@ -82,20 +124,6 @@ function validateBehavior(
   }
 }
 
-export type ResolvedPluginButtonBehavior =
-  | Exclude<PluginButtonBehavior, { kind: "menu" }>
-  | { kind: "menu"; items: readonly ResolvedPluginButtonMenuEntry[] };
-export type ResolvedPluginButtonMenuEntry =
-  | { kind: "separator"; id: string }
-  | {
-      kind: "item";
-      id: string;
-      title: string;
-      icon?: PluginButtonIcon;
-      visible?: boolean;
-      disabled?: boolean;
-      behavior: ResolvedPluginButtonBehavior;
-    };
 export type ResolvedPluginButton = Omit<PluginButton, "title" | "label" | "behavior"> & {
   title: string;
   visible: boolean;
@@ -109,6 +137,29 @@ export function validateButton(
   validation: ButtonValidation,
   resolve: (text: PluginText) => string,
 ): ResolvedPluginButton {
+  return validateButtonShape<PluginButtonLeaf>(button, validation, resolve, (leaf) => ({
+    ...leaf,
+    withSelection: false,
+  }));
+}
+
+export function validateSelectionButton(
+  button: PluginSelectionButton<PluginText>,
+  validation: ButtonValidation,
+  resolve: (text: PluginText) => string,
+): ResolvedPluginButton {
+  return validateButtonShape<SelectionButtonLeaf>(button, validation, resolve, (leaf) => ({
+    ...leaf,
+    withSelection: true,
+  }));
+}
+
+function validateButtonShape<Leaf extends ButtonLeaf>(
+  button: Omit<PluginButton, "behavior"> & { behavior: ButtonBehavior<Leaf> },
+  validation: ButtonValidation,
+  resolve: (text: PluginText) => string,
+  resolveLeaf: (leaf: Leaf) => ResolvedButtonLeaf,
+): ResolvedPluginButton {
   return {
     ...button,
     icon: validation.parseIcon(button.icon),
@@ -116,6 +167,6 @@ export function validateButton(
     label: button.label === undefined ? undefined : requireText(button.label, "label", resolve),
     visible: optionalBoolean(button.visible, true),
     disabled: optionalBoolean(button.disabled, false),
-    behavior: validateBehavior(button.behavior, validation, resolve),
+    behavior: validateBehavior(button.behavior, validation, resolve, resolveLeaf),
   };
 }

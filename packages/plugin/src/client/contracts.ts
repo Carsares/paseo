@@ -22,6 +22,8 @@ import type {
   PluginButtonRegistration,
   PluginHeaderButtonContribution,
   PluginComposerPillContribution,
+  PluginSelectionButtonContribution,
+  PluginSelectionButtonRegistration,
 } from "./buttons.js";
 import type {
   PluginTheme,
@@ -253,6 +255,9 @@ export interface PluginClientContext extends PluginCommandCapabilities, PluginCl
   addComposerPill(
     contribution: PluginComposerPillContribution<PluginText>,
   ): PluginButtonRegistration<PluginText>;
+  addSelectionButton(
+    contribution: PluginSelectionButtonContribution<PluginText>,
+  ): PluginSelectionButtonRegistration<PluginText>;
   addAttachmentSource(contribution: PluginAttachmentSourceContribution<PluginText>): PluginCleanup;
   addComposerItem(contribution: PluginComposerItemContribution): PluginCleanup;
   addNewWorkspaceItem(contribution: PluginNewWorkspaceItemContribution): PluginCleanup;

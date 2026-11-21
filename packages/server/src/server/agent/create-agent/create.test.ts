@@ -2,18 +2,122 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test, vi } from "vitest";
+import { createPaseoApi } from "@getpaseo/client";
+import { createHostClient } from "@getpaseo/client/node";
+import {
+  EXPLICIT_PARENT_REPORTING,
+  isExplicitParentReportingLabels,
+  PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
+  PARENT_SERVER_ID_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { createTestAgentClients } from "../../test-utils/fake-agent-client.js";
+import { createTestPaseoDaemon } from "../../test-utils/paseo-daemon.js";
 import { createProviderSnapshotManagerStub } from "../../test-utils/session-stubs.js";
 import { AgentManager } from "../agent-manager.js";
 import { AgentStorage } from "../agent-storage.js";
+import { createJsonFinishSubscriptionStore } from "../finish-subscriptions/index.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
 import { createAgentCommand } from "./create.js";
 import { ForegroundPromptStart } from "../agent-run-state.js";
 import type { ManagedAgent } from "../agent-manager.js";
 
 const logger = createTestLogger();
+
+test("SDK WebSocket creation persists explicit reporting only for a valid child", async () => {
+  const finishInitial = Promise.withResolvers<void>();
+  const finish = Promise.withResolvers<void>();
+  const instance = await createTestPaseoDaemon({
+    agentClients: createTestAgentClients({
+      beforeTurnComplete: (prompt) =>
+        String(prompt).includes("Work and report the result explicitly")
+          ? finishInitial.promise
+          : finish.promise,
+    }),
+  });
+  const client = createHostClient(`127.0.0.1:${instance.port}`, {
+    clientId: "explicit-parent-reporting-test",
+    reconnect: { enabled: false },
+  });
+  const paseo = createPaseoApi(client);
+  try {
+    await client.connect();
+    const workspace = await paseo.workspaces.create({
+      source: { kind: "directory", path: instance.staticDir },
+    });
+    const config = { provider: "claude/claude-test" };
+    const main = await workspace.agents.create({ config });
+    const child = await workspace.agents.create({
+      config,
+      parent: main.id,
+      parentReporting: "explicit",
+      prompt: "Work and report the result explicitly",
+    });
+    const listSubscriptions = () => createJsonFinishSubscriptionStore(instance.paseoHome).list();
+    const storedLabels = async (id: string) => (await instance.daemon.agentStorage.get(id))?.labels;
+    expect(await storedLabels(child.id)).toMatchObject({
+      [PARENT_AGENT_ID_LABEL]: main.id,
+      [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+    });
+
+    finishInitial.resolve();
+    expect((await child.waitForFinish(5000)).status).toBe("idle");
+    expect(await listSubscriptions()).toEqual([]);
+    await child.send("A follow-up from the user");
+    expect(await listSubscriptions()).toEqual([]);
+
+    const ordinary = await workspace.agents.create({
+      config,
+      parent: main.id,
+      prompt: "Use default completion notifications",
+    });
+    expect(await storedLabels(ordinary.id)).not.toHaveProperty(PARENT_REPORTING_LABEL);
+    await expect
+      .poll(listSubscriptions)
+      .toEqual([expect.objectContaining({ childAgentId: ordinary.id, callerAgentId: main.id })]);
+
+    const invalid = await workspace.agents.create({
+      config,
+      parent: main.id,
+      labels: { [PARENT_REPORTING_LABEL]: "invalid" },
+    });
+    expect(await storedLabels(invalid.id)).toMatchObject({ [PARENT_AGENT_ID_LABEL]: main.id });
+    expect(await storedLabels(invalid.id)).not.toHaveProperty(PARENT_REPORTING_LABEL);
+
+    const root = await workspace.agents.create({ config, parentReporting: "explicit" });
+    expect(await storedLabels(root.id)).not.toHaveProperty(PARENT_REPORTING_LABEL);
+    const forged = await client.createAgent({
+      config: { provider: "claude", model: "claude-test", cwd: instance.staticDir },
+      workspaceId: workspace.id,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: main.id,
+        [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+      },
+    });
+    expect(await storedLabels(forged.id)).not.toHaveProperty(PARENT_REPORTING_LABEL);
+    expect(await storedLabels(forged.id)).not.toHaveProperty(PARENT_AGENT_ID_LABEL);
+
+    const remoteParent = { agentId: main.id, serverId: "other-host" };
+    const remoteChild = await workspace.agents.create({
+      config,
+      parent: remoteParent,
+      parentReporting: "explicit",
+    });
+    expect(await storedLabels(remoteChild.id)).toMatchObject({
+      [PARENT_AGENT_ID_LABEL]: remoteParent.agentId,
+      [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+      [PARENT_SERVER_ID_LABEL]: remoteParent.serverId,
+    });
+  } finally {
+    finishInitial.resolve();
+    finish.resolve();
+    await paseo.dispose();
+    await client.close();
+    await instance.close();
+  }
+}, 20000);
 
 function createRealAgentManager(storage: AgentStorage): AgentManager {
   return new AgentManager({
@@ -300,11 +404,59 @@ test("mcp create stamps the new worktree's workspaceId, not the parent's", async
 
     const storedChild = await storage.get(child.id);
     expect(storedChild?.workspaceId).toBe("ws-new-worktree");
+    expect(storedChild?.labels).not.toHaveProperty(PARENT_REPORTING_LABEL);
     expect(child.cwd).toBe(join(workdir, "worktree", "packages", "app"));
   } finally {
     await removeRealAgentManagerWorkdir({ agentManager, storage, workdir });
   }
 });
+
+test.each([
+  { parentReporting: "explicit", detached: false, expected: true },
+  { parentReporting: "explicit", detached: true, expected: false },
+  { parentReporting: "auto", detached: false, expected: false },
+] as const)(
+  "persists $parentReporting MCP reporting only for an explicit subagent (detached: $detached)",
+  async ({ parentReporting, detached, expected }) => {
+    const workdir = mkdtempSync(join(tmpdir(), "create-agent-reporting-test-"));
+    const agentStorage = new AgentStorage(join(workdir, "agents"), logger);
+    const agentManager = createRealAgentManager(agentStorage);
+    const workspaceId = "ws-parent";
+    try {
+      const parent = await agentManager.createAgent(
+        { provider: "codex", cwd: workdir },
+        undefined,
+        { workspaceId },
+      );
+      if (parentReporting === "auto") await agentManager.setAgentMainControl(parent.id, true);
+      const { snapshot, initialPromptStarted } = await createAgentCommand(
+        {
+          agentManager,
+          agentStorage,
+          logger,
+          providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        },
+        {
+          kind: "mcp",
+          provider: "codex/gpt-5.4",
+          title: "Worker",
+          callerAgentId: parent.id,
+          initialPrompt: "Complete the task",
+          notifyOnFinish: parentReporting === "explicit",
+          parentReporting,
+          detached,
+          labels: { [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING },
+        },
+      );
+      expect(initialPromptStarted).toBe(true);
+      const stored = await agentStorage.get(snapshot.id);
+      expect(stored?.labels[PARENT_AGENT_ID_LABEL]).toBe(detached ? undefined : parent.id);
+      expect(isExplicitParentReportingLabels(stored?.labels)).toBe(expected);
+    } finally {
+      await removeRealAgentManagerWorkdir({ agentManager, storage: agentStorage, workdir });
+    }
+  },
+);
 
 test("mcp create exposes the created worktree before dispatching the initial prompt", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "create-agent-worktree-callback-test-"));

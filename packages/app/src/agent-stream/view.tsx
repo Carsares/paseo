@@ -1347,6 +1347,9 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           <AllowSubagentForkContext.Provider value={allowSubagentFork}>
             <AssistantSelectionCopySurface
               style={stylesheet.container}
+              serverId={resolvedServerId}
+              workspaceId={context.workspaceId}
+              agentId={agentId}
               subagentSpawnMode={spawnTarget?.mode}
               onSpawnSubagentFromSelection={onSpawnSubagentFromSelection}
             >

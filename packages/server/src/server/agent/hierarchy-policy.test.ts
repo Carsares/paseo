@@ -1,6 +1,9 @@
+import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
+  EXPLICIT_PARENT_REPORTING,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
@@ -15,6 +18,7 @@ import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
 import { createProviderSnapshotManagerStub } from "../test-utils/session-stubs.js";
 import { AgentManager } from "./agent-manager.js";
 import { createAgentMessageDelivery, parseAgentMessages } from "./agent-messages/index.js";
+import { toAgentPayload } from "./agent-projections.js";
 import type { AgentPromptInput, AgentSessionConfig } from "./agent-sdk-types.js";
 import { AgentStorage } from "./agent-storage.js";
 import { createAgentCommand, registerParentFinishSubscription } from "./create-agent/create.js";
@@ -266,6 +270,8 @@ describe("agent orchestration", () => {
     });
     const prompt = buildHierarchyAppendSystemPrompt({ agent: main, ...graph });
     expect(prompt).toContain("Workspace Main Control Coordinator");
+    expect(prompt).toContain('parentReporting: "explicit" to create exactly one Level-1 lead');
+    expect(prompt).toContain("Wait for the lead to call report_to_parent");
     expect(prompt).toContain(
       'Direct Level-1 children: [{"id":"lead","title":"lead","status":"running"},{"id":"other-lead","title":"other-lead","status":"running"}]',
     );
@@ -274,6 +280,7 @@ describe("agent orchestration", () => {
       "Level-1 Module Lead (Flexible Mode) under Main Control Agent main",
     );
     expect(leadPrompt).toContain('Direct Level-2 children: [{"id":"worker"');
+    expect(leadPrompt).toContain("Call report_to_parent once all verification is complete");
     expect(buildHierarchyAppendSystemPrompt({ agent: worker, ...graph })).toBe("");
     expect(buildHierarchyAppendSystemPrompt({ agent: root, ...graph })).toBe("");
   });
@@ -1274,6 +1281,10 @@ it("enforces Claude Main Control disallowedTools, auto-denies write permissions,
       notifyOnFinish: false,
     });
     expect(childResult.isError).not.toBe(true);
+    const childId = (childResult.structuredContent as { agentId: string }).agentId;
+    expect((await storage.get(childId))?.labels[PARENT_REPORTING_LABEL]).toBe(
+      EXPLICIT_PARENT_REPORTING,
+    );
     expect(launchedConfigs.get("claude")?.at(-1)?.providerOptions?.disallowedTools).toEqual([
       "WebFetch",
       "Bash",
@@ -1400,6 +1411,12 @@ it("enforces single-hop MCP orchestration, self mode changes, and refreshes poli
 
     const leadCatalog = makeCatalog(leadA.id);
     await expect(
+      mainCatalog.executeTool("update_agent", {
+        agentId: leadA.id,
+        labels: { [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING },
+      }),
+    ).rejects.toThrow("Change agent hierarchy through the workspace controls.");
+    await expect(
       leadCatalog.executeTool("send_agent_prompt", { agentId: leadB.id, prompt: "ping" }),
     ).rejects.toThrow("Coordinate through your direct child");
     await expect(
@@ -1515,8 +1532,11 @@ it.each(["reparent", "detach"] as const)(
           }),
         ).resolves.toMatchObject({ structuredContent: { deliveryStatus: "queued" } });
         flush!();
-        await delivery.waitForDispatch(recipient.id, new AbortController().signal);
-        expect(dispatch).toHaveBeenCalledTimes(1);
+        await expect(
+          delivery.waitForDispatch(recipient.id, new AbortController().signal),
+        ).rejects.toThrow("You can only manage your direct subagents.");
+        flush!();
+        await expect.poll(() => dispatch.mock.calls.length).toBe(1);
         expect(parseAgentMessages(String(dispatch.mock.calls[0]![0].prompt))).toMatchObject([
           { text: "Legal message" },
         ]);
@@ -1531,7 +1551,178 @@ it.each(["reparent", "detach"] as const)(
   },
 );
 
-it("cleans up rejected finish subscriptions so idle cleanup is never blocked", async () => {
+it("delivers explicit reports to direct parents and rejects a queued report after detach", async () => {
+  await withAgents(async ({ manager, storage, cwd }) => {
+    const config = { provider: "codex", cwd };
+    const workspaceId = "workspace";
+    const coordinator = await manager.createAgent(config, undefined, { workspaceId });
+    await manager.setAgentMainControl(coordinator.id, true);
+    const leadAgent = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: { [PARENT_AGENT_ID_LABEL]: coordinator.id },
+    });
+    const workerAgent = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: { [PARENT_AGENT_ID_LABEL]: leadAgent.id },
+    });
+    const dispatch = vi.fn(
+      async (_batch: { recipientId: string; prompt: AgentPromptInput }) => "steered" as const,
+    );
+    const scheduled: Array<() => void> = [];
+    const onError = vi.fn();
+    const delivery = createAgentMessageDelivery({
+      dispatch,
+      schedule: (_delay, callback) => {
+        scheduled.push(callback);
+        return () => {};
+      },
+      onError,
+    });
+    const makeCatalog = (callerAgentId?: string) =>
+      createPaseoToolCatalog({
+        agentManager: manager,
+        agentStorage: storage,
+        providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+        serverId: "server-1",
+        agentMessages: () => delivery,
+        callerAgentId,
+        paseoToolPolicy: callerAgentId ? manager.getPaseoToolPolicy(callerAgentId) : undefined,
+        logger: createTestLogger(),
+      });
+    try {
+      const workerTools = makeCatalog(workerAgent.id);
+      const leadTools = makeCatalog(leadAgent.id);
+      await expect(
+        workerTools.executeTool("report_to_parent", {
+          status: "blocked",
+          summary: "  Which API?  ",
+        }),
+      ).resolves.toMatchObject({ structuredContent: { deliveryStatus: "queued" } });
+      await expect(
+        leadTools.executeTool("report_to_parent", { summary: "Verified all changes." }),
+      ).resolves.toMatchObject({ structuredContent: { deliveryStatus: "queued" } });
+      while (scheduled.length) scheduled.shift()!();
+      for (const id of [leadAgent.id, coordinator.id]) {
+        await delivery.waitForDispatch(id, new AbortController().signal);
+      }
+      const reports = new Map(
+        dispatch.mock.calls.map(([batch]) => [
+          batch.recipientId,
+          parseAgentMessages(String(batch.prompt)),
+        ]),
+      );
+      expect(reports.get(leadAgent.id)).toMatchObject([
+        {
+          source: { kind: "agent-message", agentId: workerAgent.id },
+          text: "Report to parent (blocked):\n\nWhich API?",
+        },
+      ]);
+      expect(reports.get(coordinator.id)).toMatchObject([
+        {
+          source: { kind: "agent-message", agentId: leadAgent.id },
+          text: "Report to parent (completed):\n\nVerified all changes.",
+        },
+      ]);
+      await expect(
+        workerTools.executeTool("report_to_parent", { summary: "Do not deliver after detach" }),
+      ).resolves.toMatchObject({ structuredContent: { deliveryStatus: "queued" } });
+      await manager.detachAgent(workerAgent.id);
+      while (scheduled.length) scheduled.shift()!();
+      await expect(
+        delivery.waitForDispatch(leadAgent.id, new AbortController().signal),
+      ).rejects.toThrow("You can only manage your direct subagents.");
+      expect(dispatch).toHaveBeenCalledTimes(2);
+      expect(onError).toHaveBeenCalled();
+      for (const caller of [undefined, coordinator.id, workerAgent.id]) {
+        await expect(
+          makeCatalog(caller).executeTool("report_to_parent", { summary: "No parent" }),
+        ).rejects.toThrow(/Only subagents/);
+      }
+      await expect(
+        leadTools.executeTool("report_to_parent", { summary: "Do not revive my parent" }),
+      ).resolves.toMatchObject({ structuredContent: { deliveryStatus: "queued" } });
+      await manager.archiveAgent(coordinator.id);
+      while (scheduled.length) scheduled.shift()!();
+      await expect(
+        delivery.waitForDispatch(coordinator.id, new AbortController().signal),
+      ).rejects.toThrow("is unavailable");
+      await expect(
+        leadTools.executeTool("report_to_parent", { summary: "Parent already archived" }),
+      ).rejects.toThrow("Only subagents with a direct parent can report.");
+      expect(dispatch).toHaveBeenCalledTimes(2);
+    } finally {
+      await delivery.close();
+    }
+  });
+});
+
+it("routes a report to its parent on another host even if the agent IDs match", async () => {
+  await withAgents(async ({ manager, storage, cwd }) => {
+    const callerAgent = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId: "workspace",
+    });
+    await manager.setLabels(callerAgent.id, {
+      [PARENT_AGENT_ID_LABEL]: callerAgent.id,
+      [PARENT_SERVER_ID_LABEL]: "remote-host",
+      [REMOTE_HIERARCHY_DEPTH_LABEL]: "2",
+    });
+    const sendMessage = vi.fn<DaemonClient["sendMessage"]>(async () => ({
+      deliveryStatus: "queued",
+    }));
+    const parent = toAgentPayload(callerAgent);
+    const fetchAgent = vi.fn(async () => ({ agent: parent, project: null }));
+    const remoteClient = Object.assign(
+      new DaemonClient({ clientId: "parent-report-test", url: "ws://unused.invalid" }),
+      {
+        fetchAgent,
+        sendMessage,
+      },
+    );
+    const catalog = createPaseoToolCatalog({
+      agentManager: manager,
+      agentStorage: storage,
+      callerAgentId: callerAgent.id,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      serverId: "local-host",
+      hosts: () => ({
+        directory: async () => {
+          throw new Error("A report does not need host discovery");
+        },
+        use: async (destination, action) => {
+          expect(destination).toBe("remote-host");
+          return action(remoteClient);
+        },
+      }),
+      logger: createTestLogger(),
+    });
+    try {
+      await expect(
+        catalog.executeTool("report_to_parent", { summary: "Remote work verified" }),
+      ).resolves.toMatchObject({ structuredContent: { success: true, deliveryStatus: "queued" } });
+      expect(sendMessage).toHaveBeenCalledWith(
+        callerAgent.id,
+        "Report to parent (completed):\n\nRemote work verified",
+        expect.objectContaining({
+          sourceAgentId: callerAgent.id,
+          sourceAgentServerId: "local-host",
+          activeTurnBehavior: "steer",
+        }),
+      );
+      fetchAgent.mockResolvedValueOnce({
+        agent: { ...parent, archivedAt: "2026-11-21T00:00:00.000Z" },
+        project: null,
+      });
+      await expect(
+        catalog.executeTool("report_to_parent", { summary: "Do not revive my remote parent" }),
+      ).rejects.toThrow("is unavailable");
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      await remoteClient.close();
+    }
+  });
+});
+
+it("cleans up rejected subscriptions and skips automatic reports for explicit SDK children", async () => {
   await withAgents(async ({ manager, storage, cwd }) => {
     const logger = createTestLogger();
     const workspaceId = "workspace";
@@ -1579,6 +1770,38 @@ it("cleans up rejected finish subscriptions so idle cleanup is never blocked", a
       expect(finishSubscriptions.hasPendingForCaller(parentAgent.id)).toBe(true);
       await registration!.reject();
       expect(finishSubscriptions.hasPendingForCaller(parentAgent.id)).toBe(false);
+      expect(records.size).toBe(0);
+
+      const { snapshot: explicitChild, initialPromptStarted } = await createAgentCommand(
+        {
+          agentManager: manager,
+          agentStorage: storage,
+          providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+          finishSubscriptions,
+          logger,
+        },
+        {
+          kind: "session",
+          config: { provider: "codex", cwd },
+          workspaceId,
+          callerAgentId: parentAgent.id,
+          labels: { [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING },
+          initialPrompt: "Work until you have a result",
+          provisionalTitle: null,
+          firstAgentContext: { attachments: [] },
+        },
+      );
+      expect(initialPromptStarted).toBe(true);
+      expect(records.size).toBe(0);
+      await expect(
+        registerParentFinishSubscription({
+          agentId: explicitChild.id,
+          serverId: "server-1",
+          agentManager: manager,
+          agentStorage: storage,
+          finishSubscriptions,
+        }),
+      ).resolves.toBeUndefined();
       expect(records.size).toBe(0);
 
       await manager.archiveAgent(parentAgent.id);

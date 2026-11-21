@@ -1,6 +1,8 @@
 import type { AgentAddress } from "./addresses.js";
 export const PARENT_SERVER_ID_LABEL = "paseo.parent-server-id";
 export const PARENT_AGENT_ID_LABEL = "paseo.parent-agent-id";
+export const PARENT_REPORTING_LABEL = "paseo.parent-reporting";
+export const EXPLICIT_PARENT_REPORTING = "explicit";
 export const WORKSPACE_ROLE_LABEL = "paseo.workspace-role";
 export const WORKSPACE_MAIN_ROLE = "main";
 export const MAIN_PRIOR_MODE_ID_LABEL = "paseo.main-prior-mode-id";
@@ -16,6 +18,12 @@ export function isOpenAgentTabLabel(label: string): boolean {
 
 export interface AgentLabelSource {
   labels?: Record<string, unknown> | null;
+}
+
+export function isExplicitParentReportingLabels(
+  labels: Record<string, unknown> | null | undefined,
+): boolean {
+  return labels?.[PARENT_REPORTING_LABEL] === EXPLICIT_PARENT_REPORTING;
 }
 
 export function isMainControlAgentLabels(

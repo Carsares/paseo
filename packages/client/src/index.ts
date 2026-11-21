@@ -1,7 +1,11 @@
 import { workspaceLabelKey } from "@getpaseo/protocol/workspace-labels";
 export type { TerminalReplayEvent, TerminalStreamEvent } from "./terminal-stream-router.js";
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
-import { parentAddressLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  EXPLICIT_PARENT_REPORTING,
+  PARENT_REPORTING_LABEL,
+  parentAddressLabels,
+} from "@getpaseo/protocol/agent-labels";
 export type { AgentAddress } from "@getpaseo/protocol/addresses";
 import { createHostActions, type PaseoHostActions } from "./hosts/index.js";
 export type { PaseoHostActions } from "./hosts/index.js";
@@ -272,6 +276,8 @@ export interface PaseoAgentCreateOptions {
   config: PaseoAgentConfig;
   cwd: string;
   parent?: string | AgentAddress | PaseoAgentHandle;
+  forkFrom?: CreateAgentRequestMessage["forkFrom"];
+  parentReporting?: "auto" | "explicit";
   title?: PaseoAgentSessionConfig["title"];
   env?: CreateAgentRequestMessage["env"];
   prompt?: string;
@@ -633,7 +639,15 @@ function toDaemonAgentCreateOptions(
   placement?: { workspaceId: string; cwd: string },
   serverId?: string,
 ): CreateAgentRequestOptions {
-  const { config: agentConfig, cwd, parent, title, prompt, ...requestOptions } = options;
+  const {
+    config: agentConfig,
+    cwd,
+    parent,
+    parentReporting,
+    title,
+    prompt,
+    ...requestOptions
+  } = options;
   const {
     provider: providerModel,
     options: ownOptions,
@@ -644,6 +658,14 @@ function toDaemonAgentCreateOptions(
   const providerOptions = featureValues ? { ...featureValues, ...ownOptions } : ownOptions;
   const { provider, model } = parseProviderModel(providerModel);
   const relationship = parent ? encodeParent(parent, serverId) : {};
+  const labels =
+    parent || parentReporting ? { ...requestOptions.labels, ...relationship.labels } : undefined;
+  if (labels && parentReporting) {
+    delete labels[PARENT_REPORTING_LABEL];
+    if (parent && parentReporting === "explicit") {
+      labels[PARENT_REPORTING_LABEL] = EXPLICIT_PARENT_REPORTING;
+    }
+  }
   return {
     ...requestOptions,
     config: {
@@ -655,12 +677,8 @@ function toDaemonAgentCreateOptions(
       ...(providerOptions !== undefined ? { providerOptions } : {}),
     },
     ...(placement ? { workspaceId: placement.workspaceId } : {}),
-    ...(parent
-      ? {
-          ...relationship,
-          labels: { ...requestOptions.labels, ...relationship.labels },
-        }
-      : {}),
+    ...relationship,
+    ...(labels ? { labels } : {}),
     ...(prompt !== undefined ? { initialPrompt: prompt } : {}),
   };
 }

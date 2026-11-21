@@ -10,6 +10,9 @@ export interface SelectionSubagentSpawnContext {
 export interface AssistantSelectionCopySurfaceProps {
   children: ReactNode;
   style?: StyleProp<ViewStyle>;
+  serverId?: string;
+  workspaceId?: string | null;
+  agentId?: string;
   subagentSpawnMode?: SelectionSubagentSpawnMode;
   onSpawnSubagentFromSelection?: (
     selectedMarkdown: string,

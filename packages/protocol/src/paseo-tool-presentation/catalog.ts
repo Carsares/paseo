@@ -159,6 +159,16 @@ export const PASEO_TOOL_CATALOG = {
       outputFields: ["status", "lastMessage", "permission"],
     },
   },
+  report_to_parent: {
+    label: "Report to parent",
+    completedLabel: "Reported to parent",
+    context: field("summary"),
+    detail: {
+      promptField: "summary",
+      inputOrder: ["status"],
+      outputFields: ["deliveryStatus"],
+    },
+  },
   get_agent_status: {
     label: "Check agent",
     completedLabel: "Checked agent",
@@ -175,6 +185,11 @@ export const PASEO_TOOL_CATALOG = {
     label: "List agents",
     completedLabel: "Listed agents",
     detail: { inputOrder: ["cwd", "statuses", "sinceHours", "limit", "includeArchived"] },
+  },
+  summarize_workspace_agents: {
+    label: "Summarize workspace sessions",
+    completedLabel: "Summarized workspace sessions",
+    detail: { inputOrder: ["workspaceId"], outputFields: ["summaryText"] },
   },
   update_agent: {
     label: "Update agent",

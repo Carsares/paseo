@@ -40,6 +40,7 @@ function registry(version: string) {
         async playAudio() {},
         openPanel() {},
         addComposerPill: () => ({ update() {}, remove() {} }),
+        addSelectionButton: () => ({ update() {}, remove() {} }),
         addHeaderButton: () => ({ update() {}, remove() {} }),
         subscribe: () => {
           throw new Error("Subscriptions are not used here");

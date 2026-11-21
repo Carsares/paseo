@@ -1,4 +1,5 @@
 import type { SessionMessageInfo } from "@opencode/client";
+import { isExplicitParentReportingLabels } from "@getpaseo/protocol/agent-labels";
 import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -330,12 +331,18 @@ describe("OpenCodeBridge", () => {
           expect(tools.get(`paseo_${definition.name}`)!.input).toEqual(definition.inputSchema);
         }
         expect(createDefinition.inputSchema).toMatchObject({
-          properties: { notifyOnFinish: { default: true } },
+          properties: {
+            notifyOnFinish: { default: true },
+            parentReporting: { enum: ["auto", "explicit"] },
+          },
         });
+        expect(createDefinition.inputSchema.required).not.toContain("parentReporting");
         expect(createDefinition.inputSchema.properties).toHaveProperty("background");
-        expect(sendDefinition.inputSchema).toMatchObject({
-          properties: { notifyOnFinish: { default: true } },
-        });
+        expect(sendDefinition.inputSchema.properties).toHaveProperty(
+          "notifyOnFinish.type",
+          "boolean",
+        );
+        expect(sendDefinition.inputSchema.properties).not.toHaveProperty("notifyOnFinish.default");
         await catalog.executeTool("create_agent", {
           ...createInput,
           title: "Background child",
@@ -344,6 +351,23 @@ describe("OpenCodeBridge", () => {
         expect(
           agentManager.listAgents().find((agent) => agent.config.title === "Background child"),
         ).toMatchObject({ background: true });
+
+        const explicitResult = await tools.get("paseo_create_agent")!.execute(
+          {
+            ...createInput,
+            title: "Explicit child",
+            notifyOnFinish: true,
+            parentReporting: "explicit",
+          },
+          { sessionID: "bound" },
+        );
+        const explicitChild = agentManager
+          .listAgents()
+          .find((agent) => agent.config.title === "Explicit child");
+        expect(isExplicitParentReportingLabels(explicitChild?.labels)).toBe(true);
+        expect(explicitResult).toMatchObject({
+          content: [{ type: "text", text: expect.stringContaining("Creation acknowledged") }],
+        });
 
         const v1Module = await import(plugin.pluginUrl);
         const hooks = await v1Module.default({}, plugin);
