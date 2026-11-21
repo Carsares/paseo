@@ -7,13 +7,18 @@ import {
   type FetchAgentResult,
 } from "@getpaseo/client/internal/daemon-client";
 import { useQueryClient } from "@tanstack/react-query";
+import { create } from "zustand";
 import {
   getOpenAgentTabLabel,
   getParentAddressFromLabels,
   isMainControlAgent,
   PARENT_AGENT_ID_LABEL,
 } from "@getpaseo/protocol/agent-labels";
-import type { AgentProvider } from "@getpaseo/protocol/agent-types";
+import type {
+  AgentModelDefinition,
+  AgentProvider,
+  ProviderSnapshotEntry,
+} from "@getpaseo/protocol/agent-types";
 import {
   buildDraftWorkspaceAttachmentScopeKey,
   buildWorkspaceAttachmentScopeKey,
@@ -28,6 +33,12 @@ import type { QueuedComposerMessage } from "@/composer/actions";
 import { lockHandoffInput } from "@/composer/handoff-input-lock";
 import { useComposerInput, type ComposerInput } from "@/composer/session";
 import { useToast } from "@/contexts/toast-api-context";
+import {
+  mergeCreateAgentSelectionPreferences,
+  type FormPreferences,
+} from "@/create-agent-preferences/preferences";
+import { useFormPreferences } from "@/hooks/use-form-preferences";
+import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
 import type { DraftComposerTextSource } from "@/composer/draft/input-draft";
 import type { UserComposerAttachment } from "@/attachments/types";
 import { retainAttachmentForGarbageCollection } from "@/attachments/service";
@@ -45,6 +56,8 @@ import { resolveCloseAgentTabPolicy } from "@/subagents";
 import { getOrCreateClientId } from "@/utils/client-id";
 import { confirmDialog } from "@/utils/confirm-dialog";
 import { toErrorMessage } from "@/utils/error-messages";
+import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
+import { showProviderNoticeToast } from "@/utils/provider-notice-toast";
 import {
   buildWorkspaceTabPersistenceKey,
   type WorkspaceDraftTabSetup,
@@ -56,18 +69,30 @@ export interface CrossProviderHandoffSelection {
   modeId?: string | null;
   thinkingOptionId?: string | null;
   providerOptions?: Record<string, unknown>;
+  kind?: "model" | "profile";
 }
 
 export interface CrossProviderAgentHandoff {
   canSwitchProvider: boolean;
+  supportsSeamlessContextSwitch: boolean;
   handoffToProvider: (selection: CrossProviderHandoffSelection) => Promise<boolean>;
 }
 
 type HandoffPane = Pick<PaneContextValue, "host" | "workspaceId" | "tabId" | "retargetCurrentTab">;
 type HandoffAgent = Pick<
   Agent,
-  "archivedAt" | "cwd" | "labels" | "parentAgentId" | "status" | "workspaceId"
->;
+  | "archivedAt"
+  | "cwd"
+  | "labels"
+  | "parentAgentId"
+  | "projectPlacement"
+  | "provider"
+  | "status"
+  | "workspaceId"
+> &
+  Partial<Pick<Agent, "currentModeId" | "turn">>;
+type HandoffClient = Pick<DaemonClient, "buildAgentForkContext" | "updateAgent"> &
+  Partial<Pick<DaemonClient, "switchAgentProvider">>;
 type MainControlHandoffClient = Pick<
   DaemonClient,
   "createAgent" | "fetchAgentHistory" | "setAgentMainControl" | "setAgentParent"
@@ -82,11 +107,15 @@ interface OtherHandoffHost {
 
 interface CrossProviderHandoffDeps {
   supportsAgentForkContext: boolean;
+  supportsSeamlessContextSwitch?: boolean;
+  providerEntries?: readonly ProviderSnapshotEntry[];
+  formPreferences?: FormPreferences;
+  persistSelection?: (config: ProviderSwitchConfig) => Promise<void>;
   mainControlClient?: MainControlHandoffClient;
   includeBackgroundChildren?: boolean;
   readOtherHosts: () => Promise<OtherHandoffHost[]>;
   supportsAgentInitialPromptOrigin: () => boolean;
-  client: Pick<DaemonClient, "buildAgentForkContext" | "updateAgent"> | null;
+  client: HandoffClient | null;
   paneContext: HandoffPane | null;
   inFlight?: { current: boolean };
   getAgent: () => HandoffAgent | null;
@@ -123,9 +152,19 @@ interface CrossProviderHandoffDeps {
   generateDraftId: typeof generateDraftId;
   archiveAgent: (input: ArchiveAgentInput) => Promise<void>;
   confirmSourceArchived: (input: ArchiveAgentInput) => Promise<boolean | null>;
-  toast: Pick<ToastApi, "error">;
+  toast: ToastApi;
   t: (key: string) => string;
 }
+
+interface ProviderSwitchConfig {
+  provider: AgentProvider;
+  model: string | null;
+  modeId: string | null;
+  thinkingOptionId: string | null;
+  options: Record<string, unknown>;
+}
+
+const useProviderSwitches = create<ReadonlySet<string>>(() => new Set());
 
 function takeRetainedQueuedMessages(deps: Pick<CrossProviderHandoffDeps, "takeQueuedMessages">) {
   const releases = new Map<string, () => void>();
@@ -156,14 +195,160 @@ function isHandoffPane(paneContext: HandoffPane | null): paneContext is HandoffP
   return Boolean(paneContext && paneContext.host !== "sheet" && paneContext.workspaceId.trim());
 }
 
+function isAgentIdle(agent: Partial<Pick<Agent, "status" | "turn">>): boolean {
+  return agent.status !== "running" && (!agent.turn || agent.turn.phase === "idle");
+}
+
+function findTargetModel(
+  entry: ProviderSnapshotEntry | undefined,
+  modelId: string | null | undefined,
+): AgentModelDefinition | null {
+  const normalizedModelId = modelId?.trim();
+  if (!entry?.models || !normalizedModelId) return null;
+  return (
+    entry.models.find((model) => model.id === normalizedModelId) ??
+    entry.models.find((model) => model.aliases?.includes(normalizedModelId)) ??
+    null
+  );
+}
+
+function findSavedThinkingOptionId(
+  preferences: FormPreferences | undefined,
+  provider: AgentProvider,
+  model: AgentModelDefinition | null,
+): string | null {
+  if (!model) return null;
+  const saved = preferences?.providerPreferences?.[provider]?.thinkingByModel;
+  for (const reference of [model.id, ...(model.aliases ?? [])]) {
+    const value = saved?.[reference]?.trim();
+    if (value && model.thinkingOptions?.some((option) => option.id === value)) return value;
+  }
+  if (!model.thinkingOptions?.length) return null;
+  return (
+    model.thinkingOptions.find((option) => option.id === model.defaultThinkingOptionId)?.id ??
+    model.thinkingOptions.find((option) => option.isDefault)?.id ??
+    model.thinkingOptions[0].id
+  );
+}
+
+function resolveProfileProviderSwitchConfig(
+  selection: CrossProviderHandoffSelection,
+): ProviderSwitchConfig {
+  return {
+    provider: selection.provider,
+    model: selection.modelId?.trim() || null,
+    modeId: selection.modeId?.trim() || null,
+    thinkingOptionId: selection.thinkingOptionId?.trim() || null,
+    options: { ...selection.providerOptions },
+  };
+}
+
+function resolveModelProviderSwitchConfig(input: {
+  agent: HandoffAgent;
+  provider: AgentProvider;
+  modelId: string | null | undefined;
+  providerEntries: readonly ProviderSnapshotEntry[] | undefined;
+  formPreferences: FormPreferences | undefined;
+}): ProviderSwitchConfig {
+  const { agent, provider, modelId, providerEntries, formPreferences } = input;
+  const targetEntry = providerEntries?.find((entry) => entry.provider === provider);
+  const targetModel = findTargetModel(targetEntry, modelId);
+  const model = targetModel?.id ?? (modelId?.trim() || null);
+  const defaultModeId = targetEntry?.defaultModeId || null;
+  const targetModes = targetEntry?.modes;
+  const validDefaultModeId =
+    !targetModes?.length || targetModes.some((mode) => mode.id === defaultModeId)
+      ? defaultModeId
+      : null;
+  const modeId =
+    targetModes?.find((mode) => mode.id === agent.currentModeId)?.id ?? validDefaultModeId;
+  const savedOptions = formPreferences?.providerPreferences?.[provider]?.options;
+  return {
+    provider,
+    model,
+    modeId,
+    thinkingOptionId: findSavedThinkingOptionId(formPreferences, provider, targetModel),
+    options: { ...savedOptions },
+  };
+}
+
+function resolveProviderSwitchConfig(input: {
+  agent: HandoffAgent;
+  selection: CrossProviderHandoffSelection;
+  providerEntries: readonly ProviderSnapshotEntry[] | undefined;
+  formPreferences: FormPreferences | undefined;
+}): ProviderSwitchConfig {
+  if (input.selection.kind === "profile") {
+    return resolveProfileProviderSwitchConfig(input.selection);
+  }
+  return resolveModelProviderSwitchConfig({
+    agent: input.agent,
+    provider: input.selection.provider,
+    modelId: input.selection.modelId,
+    providerEntries: input.providerEntries,
+    formPreferences: input.formPreferences,
+  });
+}
+
+async function switchAgentProviderInPlace(
+  input: { serverId: string; agentId: string; selection: CrossProviderHandoffSelection },
+  deps: CrossProviderHandoffDeps,
+): Promise<boolean> {
+  const { client, toast } = deps;
+  if (!client?.switchAgentProvider) {
+    toast.error(deps.t("message.actions.forkUnavailable"));
+    return false;
+  }
+  const agent = deps.getAgent();
+  if (!agent || !isAgentIdle(agent) || agent.provider === input.selection.provider) {
+    return false;
+  }
+
+  const config = resolveProviderSwitchConfig({
+    agent,
+    selection: input.selection,
+    providerEntries: deps.providerEntries,
+    formPreferences: deps.formPreferences,
+  });
+  const result = await client.switchAgentProvider(input.agentId, {
+    provider: config.provider,
+    model: config.model,
+    modeId: config.modeId,
+    thinkingOptionId: config.thinkingOptionId,
+    ...(Object.keys(config.options).length > 0 ? { options: config.options } : {}),
+  });
+  const snapshot = normalizeAgentSnapshot(result.agent, input.serverId);
+  // The switch response omits project placement, which arrives with directory updates.
+  const current = deps.getAgent() ?? agent;
+  getHostRuntimeStore().acceptAgentSnapshot(input.serverId, {
+    ...snapshot,
+    projectPlacement: current.projectPlacement,
+  });
+  showProviderNoticeToast(toast, result.notice);
+  try {
+    await deps.persistSelection?.(config);
+  } catch (error) {
+    // The daemon already switched this agent. A preference write cannot undo it.
+    console.warn("[AgentControls] persist provider switch preference failed", error);
+  }
+  return true;
+}
+
 export function canSwitchAgentProvider(input: {
   serverId: string;
   supportsAgentForkContext: boolean;
+  supportsSeamlessContextSwitch?: boolean;
   supportsAgentHierarchyControl?: boolean;
-  client: Pick<DaemonClient, "buildAgentForkContext" | "updateAgent"> | null;
+  isSwitchingProvider?: boolean;
+  client: HandoffClient | null;
   paneContext: HandoffPane | null;
-  agent: Pick<Agent, "labels"> | null;
+  agent: (Pick<Agent, "labels"> & Partial<Pick<Agent, "archivedAt" | "status" | "turn">>) | null;
 }): boolean {
+  if (input.isSwitchingProvider) return false;
+  // COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
+  if (input.supportsSeamlessContextSwitch === true) {
+    return Boolean(input.client?.switchAgentProvider && input.agent && isAgentIdle(input.agent));
+  }
   const parent = getParentAddressFromLabels(input.agent?.labels, input.serverId);
   return Boolean(
     input.supportsAgentForkContext &&
@@ -688,7 +873,39 @@ async function maybeConfirmHandoffArchive(input: {
   return (await input.confirmArchive()) ? true : null;
 }
 
-export async function performCrossProviderAgentHandoff(
+async function performSeamlessContextSwitch(
+  input: { serverId: string; agentId: string; selection: CrossProviderHandoffSelection },
+  deps: CrossProviderHandoffDeps,
+): Promise<boolean> {
+  const { toast } = deps;
+  const key = buildDraftStoreKey(input);
+  const switches = useProviderSwitches.getState();
+  if (switches.has(key) || deps.inFlight?.current) return false;
+  useProviderSwitches.setState(new Set([...switches, key]), true);
+  try {
+    return await switchAgentProviderInPlace(input, deps);
+  } catch (error) {
+    toast.error(toErrorMessage(error));
+    return false;
+  } finally {
+    const remaining = new Set(useProviderSwitches.getState());
+    remaining.delete(key);
+    useProviderSwitches.setState(remaining, true);
+  }
+}
+
+// COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
+export function performCrossProviderAgentHandoff(
+  input: { serverId: string; agentId: string; selection: CrossProviderHandoffSelection },
+  deps: CrossProviderHandoffDeps,
+): Promise<boolean> {
+  if (deps.supportsSeamlessContextSwitch === true) {
+    return performSeamlessContextSwitch(input, deps);
+  }
+  return performLegacyCrossProviderAgentHandoff(input, deps);
+}
+
+async function performLegacyCrossProviderAgentHandoff(
   input: { serverId: string; agentId: string; selection: CrossProviderHandoffSelection },
   deps: CrossProviderHandoffDeps,
 ): Promise<boolean> {
@@ -966,22 +1183,36 @@ export function useCrossProviderAgentHandoff(input: {
   const queryClient = useQueryClient();
   const supportsAgentForkContext = useHostFeature(serverId, "agentForkContext");
   const supportsAgentHierarchyControl = useHostFeature(serverId, "agentHierarchyControl");
+  // COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
+  const supportsSeamlessContextSwitch = useHostFeature(serverId, "agentSeamlessContextSwitch");
   const supportsBackgroundWorkspaces = useHostFeature(serverId, "backgroundWorkspaces");
   const paneContext = useOptionalPaneContext();
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
-  const agentLabels = useSessionStore(
-    (state) => state.sessions[serverId]?.agents.get(agentId)?.labels,
-  );
+  const readAgent = (state: ReturnType<typeof useSessionStore.getState>) => {
+    const session = state.sessions[serverId];
+    return (
+      session?.agents?.get(agentId) ??
+      (supportsSeamlessContextSwitch ? session?.agentDetails?.get(agentId) : undefined) ??
+      null
+    );
+  };
+  const selectedAgent = useSessionStore(readAgent);
+  const { entries: providerEntries } = useProvidersSnapshot(serverId, { cwd: selectedAgent?.cwd });
+  const { preferences, updatePreferences } = useFormPreferences();
   const composerInput = useComposerInput();
   const getComposerInput = useStableEvent(() => composerInput);
   const inFlightRef = useRef(false);
+  const switchKey = buildDraftStoreKey({ serverId, agentId });
+  const isSwitchingProvider = useProviderSwitches((switches) => switches.has(switchKey));
   const canSwitchProvider = canSwitchAgentProvider({
     serverId,
     supportsAgentForkContext,
+    supportsSeamlessContextSwitch,
     supportsAgentHierarchyControl,
+    isSwitchingProvider,
     client,
     paneContext,
-    agent: agentLabels ? { labels: agentLabels } : null,
+    agent: selectedAgent,
   });
 
   const handoffToProvider = useStableEvent((selection: CrossProviderHandoffSelection) =>
@@ -989,6 +1220,21 @@ export function useCrossProviderAgentHandoff(input: {
       { serverId, agentId, selection },
       {
         supportsAgentForkContext,
+        supportsSeamlessContextSwitch,
+        providerEntries,
+        formPreferences: preferences,
+        persistSelection: async (config) => {
+          await updatePreferences((current) =>
+            mergeCreateAgentSelectionPreferences({
+              preferences: current,
+              provider: config.provider,
+              modelId: config.model,
+              modeId: config.modeId,
+              thinkingOptionId: config.thinkingOptionId,
+              ...(Object.keys(config.options).length > 0 ? { options: config.options } : {}),
+            }),
+          );
+        },
         mainControlClient: supportsAgentHierarchyControl ? (client ?? undefined) : undefined,
         includeBackgroundChildren: supportsBackgroundWorkspaces,
         readOtherHosts: async () => {
@@ -1025,7 +1271,7 @@ export function useCrossProviderAgentHandoff(input: {
         client,
         paneContext,
         inFlight: inFlightRef,
-        getAgent: () => useSessionStore.getState().sessions[serverId]?.agents?.get(agentId) ?? null,
+        getAgent: () => readAgent(useSessionStore.getState()),
         hasUnsettledMessage: () =>
           getHostRuntimeStore().isDrainingQueuedAgentMessage(serverId, agentId) ||
           (useSessionStore
@@ -1101,5 +1347,5 @@ export function useCrossProviderAgentHandoff(input: {
     ),
   );
 
-  return { canSwitchProvider, handoffToProvider };
+  return { canSwitchProvider, supportsSeamlessContextSwitch, handoffToProvider };
 }

@@ -8,8 +8,10 @@ import { AfterPaintPublication } from "@/composer/after-paint-publication";
 import { beginComposerWork, isHandoffInputLocked } from "@/composer/handoff-input-lock";
 import { buildDraftStoreKey } from "@/stores/draft-keys";
 import { parentAddressLabels } from "@getpaseo/protocol/agent-labels";
+import type { AgentProviderNotice } from "@getpaseo/protocol/agent-types";
 import type { DraftInput } from "@/stores/draft-store";
 import { createWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
+import { deriveProjectPlacementFromCwd } from "@/utils/project-placement";
 import type { WorkspaceTab } from "@/workspace-tabs/model";
 import {
   canSwitchAgentProvider,
@@ -17,8 +19,11 @@ import {
   type CrossProviderHandoffSelection,
 } from "./cross-provider-handoff";
 
+const runtimeMocks = vi.hoisted(() => ({ acceptAgentSnapshot: vi.fn() }));
+
 // Keep the shared history builder and close policy real while isolating the hook's app wiring.
 vi.mock("expo-router", () => ({ useRouter: vi.fn() }));
+vi.mock("@/runtime/host-runtime", () => ({ getHostRuntimeStore: () => runtimeMocks }));
 vi.mock("@/hooks/use-archive-agent", () => ({ applyArchivedAgentCloseResults: vi.fn() }));
 vi.mock("@/stores/navigation-active-workspace-store", () => ({ navigateToWorkspace: vi.fn() }));
 vi.mock("@/stores/draft-store", () => ({ useDraftStore: vi.fn() }));
@@ -29,7 +34,10 @@ vi.mock("@/subagents", () => import("@/subagents/close-tab-policy"));
 vi.mock("@/utils/client-id", () => ({ getOrCreateClientId: vi.fn() }));
 vi.mock("@/utils/confirm-dialog", () => ({ confirmDialog: vi.fn() }));
 
-afterEach(() => __setAttachmentStoreForTests(null));
+afterEach(() => {
+  __setAttachmentStoreForTests(null);
+  runtimeMocks.acceptAgentSnapshot.mockReset();
+});
 
 type Deps = Parameters<typeof performCrossProviderAgentHandoff>[1];
 type ForkPayload = Awaited<ReturnType<NonNullable<Deps["client"]>["buildAgentForkContext"]>>;
@@ -53,6 +61,33 @@ const targetDraftKey = "draft:host-1:draft-1";
 const draftAttachmentScopeKey = "workspace-attachments:draft=draft-1";
 const workspaceKey = "host-1:workspace-1";
 const mainControlLabels = { "paseo.workspace-role": "main" };
+const seamlessSnapshot = {
+  id: "agent-1",
+  provider: "claude",
+  cwd: "/workspace/project",
+  workspaceId: "workspace-1",
+  model: "sonnet",
+  options: { effort: "high" },
+  thinkingOptionId: "high",
+  createdAt: "2026-11-20T00:00:00Z",
+  updatedAt: "2026-11-20T00:00:00Z",
+  lastUserMessageAt: null,
+  status: "idle" as const,
+  capabilities: {
+    supportsStreaming: true,
+    supportsSessionPersistence: false,
+    supportsDynamicModes: false,
+    supportsMcpServers: false,
+    supportsReasoningStream: false,
+    supportsToolInvocations: false,
+  },
+  currentModeId: "shared",
+  availableModes: [{ id: "shared", label: "Shared" }],
+  pendingPermissions: [],
+  persistence: null,
+  title: null,
+  labels: {},
+};
 
 const confirmation = {
   title: "workspace.tabs.confirmations.archiveRunningAgentTitle",
@@ -67,13 +102,22 @@ function createHandoff(agentOverrides: Partial<NonNullable<ReturnType<Deps["getA
     cwd: "/workspace/project",
     labels: {},
     parentAgentId: null,
+    provider: "codex",
     status: "idle",
+    turn: { phase: "idle" as const, cancellationRequestId: null },
+    currentModeId: "shared",
     workspaceId: "workspace-1",
     ...agentOverrides,
   };
   const client = {
     buildAgentForkContext: vi.fn(async () => forkPayload),
     updateAgent: vi.fn(async () => {}),
+    switchAgentProvider: vi.fn(
+      async (): Promise<{
+        agent: typeof seamlessSnapshot;
+        notice: AgentProviderNotice | null;
+      }> => ({ agent: seamlessSnapshot, notice: null }),
+    ),
   };
   const paneContext = {
     host: "main" as const,
@@ -160,7 +204,7 @@ function createHandoff(agentOverrides: Partial<NonNullable<ReturnType<Deps["getA
     getOrCreateClientId: vi.fn(async () => "client-1"),
     generateDraftId: vi.fn(() => "draft-1"),
     archiveAgent: vi.fn(async () => {}),
-    toast: { error: vi.fn() },
+    toast: { error: vi.fn(), show: vi.fn(() => vi.fn()), copied: vi.fn() },
     t: (key: string) => key,
   } satisfies Deps;
   const run = (
@@ -271,6 +315,262 @@ function createMainControlClient(lateChildId?: string) {
 }
 
 describe("performCrossProviderAgentHandoff", () => {
+  it("switches a Main Session in place with target model settings", async () => {
+    const projectPlacement = deriveProjectPlacementFromCwd("/workspace/project");
+    const { client, deps, layoutStore, run, expectSourceUntouched } = createHandoff({
+      labels: mainControlLabels,
+      projectPlacement,
+    });
+    deps.hasQueuedMessages.mockReturnValue(true);
+    const persistSelection = vi.fn(async () => {});
+    const targetEntry = {
+      provider: "claude",
+      status: "ready" as const,
+      enabled: true,
+      defaultModeId: "plan",
+      modes: [
+        { id: "plan", label: "Plan" },
+        { id: "shared", label: "Shared" },
+      ],
+      models: [
+        {
+          provider: "claude",
+          id: "sonnet",
+          label: "Sonnet",
+          thinkingOptions: [{ id: "high", label: "High" }],
+          defaultThinkingOptionId: "high",
+        },
+      ],
+    };
+
+    expect(
+      await run(
+        {
+          supportsAgentForkContext: false,
+          supportsSeamlessContextSwitch: true,
+          providerEntries: [targetEntry],
+          formPreferences: {
+            providerPreferences: {
+              claude: {
+                thinkingByModel: { sonnet: "high" },
+                options: { effort: "high" },
+              },
+            },
+          },
+          persistSelection,
+        },
+        { provider: "claude", modelId: "sonnet" },
+      ),
+    ).toBe(true);
+
+    expect(client.switchAgentProvider).toHaveBeenCalledExactlyOnceWith("agent-1", {
+      provider: "claude",
+      model: "sonnet",
+      modeId: "shared",
+      thinkingOptionId: "high",
+      options: { effort: "high" },
+    });
+    expect(persistSelection).toHaveBeenCalledExactlyOnceWith({
+      provider: "claude",
+      model: "sonnet",
+      modeId: "shared",
+      thinkingOptionId: "high",
+      options: { effort: "high" },
+    });
+    expect(runtimeMocks.acceptAgentSnapshot).toHaveBeenCalledExactlyOnceWith(
+      "host-1",
+      expect.objectContaining({
+        id: "agent-1",
+        provider: "claude",
+        model: "sonnet",
+        projectPlacement,
+        createdAt: new Date(seamlessSnapshot.createdAt),
+        turn: { phase: "idle", cancellationRequestId: null },
+      }),
+    );
+    expect(runtimeMocks.acceptAgentSnapshot).toHaveBeenCalledBefore(persistSelection);
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+    expect(client.buildAgentForkContext).not.toHaveBeenCalled();
+    expect(deps.hasQueuedMessages).not.toHaveBeenCalled();
+    expect(deps.takeQueuedMessages).not.toHaveBeenCalled();
+    expect(deps.getComposerInput).not.toHaveBeenCalled();
+    expect(layoutStore.openTab).not.toHaveBeenCalled();
+    expectSourceUntouched();
+  });
+
+  it.each([null, new Date("2026-11-20T00:00:00Z")])(
+    "switches a closed profile with no workspace pane and archive date %s",
+    async (archivedAt) => {
+      const { client, deps, run } = createHandoff({
+        status: "closed",
+        archivedAt,
+      });
+      const persistSelection = vi.fn(async () => {});
+      const notice = { type: "warning" as const, message: "Profile adjusted" };
+      client.switchAgentProvider.mockResolvedValueOnce({ agent: seamlessSnapshot, notice });
+
+      expect(
+        await run(
+          {
+            supportsSeamlessContextSwitch: true,
+            paneContext: null,
+            providerEntries: [],
+            persistSelection,
+          },
+          {
+            provider: "claude",
+            modelId: "sonnet",
+            modeId: "plan",
+            thinkingOptionId: "high",
+            providerOptions: { effort: "high" },
+            kind: "profile",
+          },
+        ),
+      ).toBe(true);
+
+      expect(client.switchAgentProvider).toHaveBeenCalledExactlyOnceWith("agent-1", {
+        provider: "claude",
+        model: "sonnet",
+        modeId: "plan",
+        thinkingOptionId: "high",
+        options: { effort: "high" },
+      });
+      expect(deps.toast.show).toHaveBeenCalledWith("Profile adjusted", {
+        variant: "warning",
+        durationMs: 5000,
+      });
+      expect(deps.archiveAgent).not.toHaveBeenCalled();
+      expect(client.buildAgentForkContext).not.toHaveBeenCalled();
+      expect(persistSelection).toHaveBeenCalledExactlyOnceWith({
+        provider: "claude",
+        model: "sonnet",
+        modeId: "plan",
+        thinkingOptionId: "high",
+        options: { effort: "high" },
+      });
+    },
+  );
+
+  it.each([
+    { status: "running", turn: { phase: "idle", cancellationRequestId: null } },
+    {
+      status: "idle",
+      turn: { phase: "open", turnId: "turn-1", startedAt: null, cancellationRequestId: null },
+    },
+  ] as const)("blocks a switch if status or turn is active (%j)", async (state) => {
+    const { agent, client, deps, paneContext, run } = createHandoff(state);
+
+    expect(
+      canSwitchAgentProvider({
+        serverId: "host-1",
+        supportsAgentForkContext: true,
+        supportsSeamlessContextSwitch: true,
+        client,
+        paneContext,
+        agent,
+      }),
+    ).toBe(false);
+
+    expect(
+      await run({ supportsSeamlessContextSwitch: true }, { provider: "claude", modelId: "sonnet" }),
+    ).toBe(false);
+    expect(client.switchAgentProvider).not.toHaveBeenCalled();
+    expect(deps.archiveAgent).not.toHaveBeenCalled();
+  });
+
+  it("rejects another model or profile switch on the same agent while a request is pending", async () => {
+    const first = createHandoff();
+    const second = createHandoff();
+    const pending =
+      Promise.withResolvers<Awaited<ReturnType<typeof first.client.switchAgentProvider>>>();
+    first.client.switchAgentProvider.mockReturnValueOnce(pending.promise);
+    const capabilities = { supportsSeamlessContextSwitch: true };
+
+    const switching = first.run(capabilities, { provider: "claude", modelId: "sonnet" });
+    expect(await second.run(capabilities, { provider: "pi", kind: "profile" })).toBe(false);
+    expect(second.client.switchAgentProvider).not.toHaveBeenCalled();
+
+    pending.reject(new Error("Host rejected the switch"));
+    expect(await switching).toBe(false);
+    expect(first.deps.toast.error).toHaveBeenCalledWith("Host rejected the switch");
+    expect(await second.run(capabilities, { provider: "claude", kind: "profile" })).toBe(true);
+  });
+
+  it.each([
+    { defaultModeId: "plan", savedThinking: "high", modeId: "plan", thinkingOptionId: "low" },
+    { defaultModeId: "stale", savedThinking: "low", modeId: null, thinkingOptionId: "low" },
+    { defaultModeId: "plan", savedThinking: "medium", modeId: "plan", thinkingOptionId: "medium" },
+  ])("uses target model and mode defaults or valid saved thinking (%j)", async (config) => {
+    const { client, run } = createHandoff({ currentModeId: "source-only" });
+
+    expect(
+      await run(
+        {
+          supportsSeamlessContextSwitch: true,
+          providerEntries: [
+            {
+              provider: "claude",
+              status: "ready",
+              enabled: true,
+              defaultModeId: config.defaultModeId,
+              modes: [{ id: "plan", label: "Plan" }],
+              models: [
+                {
+                  provider: "claude",
+                  id: "sonnet",
+                  aliases: ["latest"],
+                  label: "Sonnet",
+                  defaultThinkingOptionId: "stale",
+                  thinkingOptions: [
+                    { id: "medium", label: "Medium" },
+                    { id: "low", label: "Low", isDefault: true },
+                  ],
+                },
+              ],
+            },
+          ],
+          formPreferences: {
+            providerPreferences: {
+              codex: { options: { service_tier: "fast" } },
+              claude: { thinkingByModel: { latest: config.savedThinking } },
+            },
+          },
+        },
+        { provider: "claude", modelId: "latest" },
+      ),
+    ).toBe(true);
+
+    expect(client.switchAgentProvider).toHaveBeenCalledExactlyOnceWith("agent-1", {
+      provider: "claude",
+      model: "sonnet",
+      modeId: config.modeId,
+      thinkingOptionId: config.thinkingOptionId,
+    });
+  });
+
+  it("shows the notice and keeps the switch successful if saving preferences fails", async () => {
+    const { client, deps, run } = createHandoff();
+    const saved = Promise.withResolvers<void>();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const notice = { type: "warning" as const, message: "Options adjusted" };
+      client.switchAgentProvider.mockResolvedValueOnce({ agent: seamlessSnapshot, notice });
+      const persistSelection = vi.fn(() => saved.promise);
+      const switching = run(
+        { supportsSeamlessContextSwitch: true, persistSelection },
+        { provider: "claude", modelId: "sonnet" },
+      );
+      await Promise.resolve();
+      expect(deps.toast.show).toHaveBeenCalledBefore(persistSelection);
+      saved.reject(new Error("Settings storage unavailable"));
+      expect(await switching).toBe(true);
+      expect(deps.toast.error).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledOnce();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("moves same-workspace direct children, including closed tabs, before archiving Main Control", async () => {
     const { deps, run, paneContext, draftStore, storedDraft } = createHandoff({
       labels: mainControlLabels,
@@ -574,7 +874,7 @@ describe("performCrossProviderAgentHandoff", () => {
 
     expect(
       await run(
-        {},
+        { supportsSeamlessContextSwitch: false },
         {
           provider: "codex",
           modelId: " model-1 ",
@@ -586,6 +886,7 @@ describe("performCrossProviderAgentHandoff", () => {
     ).toBe(true);
 
     expect(deps.confirmDialog).not.toHaveBeenCalled();
+    expect(client.switchAgentProvider).not.toHaveBeenCalled();
     expect(client.buildAgentForkContext).toHaveBeenCalledExactlyOnceWith("agent-1");
     expect(workspaceAttachmentsStore.setWorkspaceAttachments).toHaveBeenCalledExactlyOnceWith({
       scopeKey: draftAttachmentScopeKey,
@@ -1414,6 +1715,24 @@ describe("performCrossProviderAgentHandoff", () => {
 });
 
 describe("canSwitchAgentProvider", () => {
+  it("allows idle Main Sessions and archived sessions on seamless hosts", () => {
+    const { agent, client } = createHandoff({
+      archivedAt: new Date("2026-11-20T00:00:00Z"),
+      labels: mainControlLabels,
+    });
+
+    expect(
+      canSwitchAgentProvider({
+        serverId: "host-1",
+        supportsAgentForkContext: false,
+        supportsSeamlessContextSwitch: true,
+        client,
+        paneContext: null,
+        agent,
+      }),
+    ).toBe(true);
+  });
+
   it("requires agentForkContext support, a connected client, and a non-sheet workspace pane", () => {
     const { agent, client, paneContext } = createHandoff();
     const input = {

@@ -110,7 +110,25 @@ import {
 } from "./agent-run-state.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import { parseAgentMessage, projectAgentMessages } from "./agent-messages/index.js";
-import { extractSubmittedPromptForkContext } from "./agent-messages/envelope.js";
+import {
+  extractSubmittedPromptForkContext,
+  stripContextHandoffEnvelope,
+} from "./agent-messages/envelope.js";
+import {
+  buildContextHandoffEnvelope,
+  fallbackContextSummary,
+  injectContextHandoffIntoPrompt,
+  splitContextHandoff,
+  summarizeContextHandoff,
+  waitForAbort,
+  waitForContextSummary,
+  type ContextHandoff,
+} from "./context-handoff.js";
+import {
+  retainTimelinePrefixRows,
+  TimelinePrefixStore,
+  type PersistedTimelinePrefix,
+} from "./timeline-prefix-store.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import {
   PASEO_MCP_SERVER_NAME,
@@ -422,6 +440,7 @@ export interface CreateAgentOptions {
   labels?: Record<string, string>;
   metadata?: AgentMetadata;
   initialPrompt?: string;
+  forkedTimelineRows?: AgentTimelineRow[];
   env?: Record<string, string>;
   persistSession?: boolean;
   initialTitle?: string | null;
@@ -431,6 +450,14 @@ export interface CreateAgentOptions {
   owner?: AgentOwner;
   /** Background agents stay out of discovery, tabs, tracks and attention. Fixed at creation. */
   background?: boolean;
+}
+
+interface SwitchAgentProviderInput {
+  provider: AgentProvider;
+  model?: string | null;
+  modeId?: string | null;
+  thinkingOptionId?: string | null;
+  options?: ProviderOptionsPatch;
 }
 
 export interface MoveSubagentToWorkspaceSource {
@@ -747,14 +774,24 @@ function attachManagedTurnIdentity(
 function limitAgentStreamEventContent(event: AgentStreamEvent, agentId: string): AgentStreamEvent {
   if (event.type !== "timeline") return event;
   const item = event.item;
-  return {
-    ...event,
-    item: limitAgentTimelineItemContent(
-      item.type === "user_message"
-        ? { ...item, text: stripMainControlPromptHeader(item.text, agentId) }
-        : item,
-    ),
-  };
+  const rendered = item.type === "user_message" ? cleanProviderPromptItem(item, agentId) : item;
+  return { ...event, item: limitAgentTimelineItemContent(rendered) };
+}
+
+function cleanProviderPromptItem(
+  item: Extract<AgentTimelineItem, { type: "user_message" }>,
+  agentId: string,
+): typeof item {
+  const text = stripMainControlPromptHeader(item.text, agentId);
+  const clean = stripContextHandoffEnvelope(text);
+  // Keep an envelope-only block recognizable so the projection can drop it.
+  return { ...item, text: clean.trim() ? clean : text };
+}
+
+function replayIncludesContextHandoff(event: AgentStreamEvent, agentId: string): boolean {
+  if (event.type !== "timeline" || event.item.type !== "user_message") return false;
+  const text = stripMainControlPromptHeader(event.item.text, agentId);
+  return stripContextHandoffEnvelope(text) !== text;
 }
 
 interface WriteLabelsResult {
@@ -1042,7 +1079,35 @@ export interface RetiredInternalAgent {
   lastMessage: string | null;
 }
 
+interface PendingContextHandoff {
+  prefix: PersistedTimelinePrefix;
+  context: ContextHandoff;
+  controller?: AbortController;
+  summary?: Promise<string>;
+  compactionRow?: AgentTimelineRow;
+}
+
+function timelineMessageId(item: AgentTimelineItem): string | undefined {
+  if (item.type === "user_message") {
+    const id = item.clientMessageId ?? item.messageId;
+    return id ? `user:${id}` : undefined;
+  }
+  if (item.type === "assistant_message" && item.messageId) return `assistant:${item.messageId}`;
+  return undefined;
+}
+
+function timelineMessageText(item: AgentTimelineItem): string | undefined {
+  if (item.type === "user_message" || item.type === "assistant_message") return item.text;
+}
+
+function maxTimelineSeq(rows: readonly AgentTimelineRow[]): number {
+  return rows.reduce((max, row) => Math.max(max, row.seq), 0);
+}
+
 export class AgentManager {
+  private readonly timelinePrefixes: TimelinePrefixStore;
+  private readonly contextHandoffs = new Map<string, PendingContextHandoff>();
+  private readonly providerSwitches = new Set<string>();
   private readonly pluginLifecycle: PluginLifecycle | undefined;
   private readonly archivedForkContexts = new Map<
     string,
@@ -1133,12 +1198,13 @@ export class AgentManager {
     this.pluginAgentTools = options.pluginAgentTools;
     this.timelineStore = options.timelineStore ?? new InMemoryAgentTimelineStore();
     this.idFactory = options.idFactory ?? (() => randomUUID());
-    this.registry = options?.registry;
-    this.durableTimelineStore = options?.durableTimelineStore;
-    this.onAgentAttention = options?.onAgentAttention;
-    this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
-    this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
-    this.mcpAuthToken = options?.mcpAuthToken ?? null;
+    this.registry = options.registry;
+    this.timelinePrefixes = this.registry?.timelinePrefixes ?? new TimelinePrefixStore();
+    this.durableTimelineStore = options.durableTimelineStore;
+    this.onAgentAttention = options.onAgentAttention;
+    this.onWorkspaceStateMayHaveChanged = options.onWorkspaceStateMayHaveChanged;
+    this.mcpBaseUrl = options.mcpBaseUrl ?? null;
+    this.mcpAuthToken = options.mcpAuthToken ?? null;
     this.configurePaseoTools(options);
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
@@ -1225,6 +1291,7 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+    for (const handoff of this.contextHandoffs.values()) handoff.controller?.abort();
   }
 
   pauseRunAdmission(): () => void {
@@ -1750,7 +1817,8 @@ export class AgentManager {
 
   async getTimelineRows(id: string): Promise<AgentTimelineRow[]> {
     this.requireAgent(id);
-    if (this.durableTimelineStore) {
+    if (this.durableTimelineStore && !this.timelineStore.getSealedThrough(id)) {
+      await this.durableTimelineWriteTails.get(id);
       return projectTimelineRows({
         rows: await this.durableTimelineStore.getCommittedRows(id),
         mode: "projected",
@@ -1882,14 +1950,17 @@ export class AgentManager {
       parentId
         ? this.runHierarchyMutation(async () => {
             const hierarchy = await this.readHierarchyAgents();
-            const parent = hierarchy.get(parentId) ?? (await this.registry?.get(parentId));
+            const parent =
+              hierarchy.get(parentId) ??
+              (await this.registry?.get(parentId)) ??
+              this.agents.get(parentId);
             if (!parent || this.pendingHierarchyArchives.has(parentId)) {
               throw new Error(`Parent agent ${parentId} is missing or archived.`);
             }
             if (this.pendingSubagentMoveSnapshots.has(parentId)) {
               throw new Error("Recover the parent's workspace move before creating a subagent.");
             }
-            validateCanSpawnChild(parent, (id) => hierarchy.get(id));
+            validateCanSpawnChild(parent, (id) => hierarchy.get(id) ?? this.agents.get(id));
             if (options.inheritParentWorkspace && !parent.workspaceId) {
               throw new Error(`Parent agent ${parentId} has no current workspace.`);
             }
@@ -1922,14 +1993,20 @@ export class AgentManager {
             `Agent ${resolvedAgentId} references unavailable provider '${record.provider}'`,
           );
         }
-        return this.createAgentInternal(config, resolvedAgentId, {
-          labels: record.labels,
-          metadata: record.metadata,
-          workspaceId: record.workspaceId,
-          owner: record.owner,
-          background: record.background,
-          env: record.launchEnv,
-        });
+        const prefix = await this.timelinePrefixes.load(resolvedAgentId);
+        return this.createAgentInternal(
+          config,
+          resolvedAgentId,
+          {
+            labels: record.labels,
+            metadata: record.metadata,
+            workspaceId: record.workspaceId,
+            owner: record.owner,
+            background: record.background,
+            env: record.launchEnv,
+          },
+          prefix,
+        );
       }),
     );
   }
@@ -1938,6 +2015,7 @@ export class AgentManager {
     config: AgentSessionConfig,
     resolvedAgentId: string,
     options: CreateAgentOptions,
+    retainedPrefix?: PersistedTimelinePrefix | null,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     config = this.withConvertedOptions(config);
@@ -1960,7 +2038,9 @@ export class AgentManager {
       };
       options = { ...options, env: request.env, metadata: request.metadata ?? options.metadata };
     }
-    await this.deleteAgentState(resolvedAgentId);
+    if (!retainedPrefix) {
+      await this.deleteAgentState(resolvedAgentId);
+    }
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       config,
       resolvedAgentId,
@@ -1976,7 +2056,7 @@ export class AgentManager {
       client,
       storedConfig.cwd,
       paseoToolPolicy,
-      options?.env,
+      options.env,
       {
         reason: "create",
         purpose: "interactive",
@@ -1996,6 +2076,12 @@ export class AgentManager {
     const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
     await this.requireExternalMcpSupport(session, providerLaunchConfig, launchContext);
     await this.assertOpeningChildHasActiveParent(options.labels, session);
+    const forkPrefix = await this.prepareForkPrefix({
+      session,
+      agentId: resolvedAgentId,
+      rows: options.forkedTimelineRows,
+      retainedPrefix,
+    });
     const agent = await this.registerSession(session, storedConfig, resolvedAgentId, {
       launchedOptions,
       labels: options.labels,
@@ -2006,6 +2092,8 @@ export class AgentManager {
       background: options.background,
       launchEnv: options.env ? { ...options.env } : undefined,
       historyPrimed: true,
+      timelineRows: forkPrefix?.rows,
+      contextPrefix: forkPrefix,
     });
     if (!agent.internal) {
       this.pluginLifecycle?.emit("agent.create.after", {
@@ -2013,6 +2101,23 @@ export class AgentManager {
       });
     }
     return agent;
+  }
+
+  private async prepareForkPrefix(input: {
+    session: AgentSession;
+    agentId: string;
+    rows?: AgentTimelineRow[];
+    retainedPrefix?: PersistedTimelinePrefix | null;
+  }): Promise<PersistedTimelinePrefix | null | undefined> {
+    if (!input.rows) return input.retainedPrefix;
+    const prefix = this.buildPendingTimelinePrefix(input.rows);
+    try {
+      await this.timelinePrefixes.save(input.agentId, prefix);
+    } catch (error) {
+      await this.closeUnregisteredSession(input.session);
+      throw error;
+    }
+    return prefix;
   }
 
   private async assertOpeningChildHasActiveParent(
@@ -2956,6 +3061,245 @@ export class AgentManager {
         metadata: record.metadata,
       },
     });
+  }
+
+  async switchAgentProvider(
+    agentId: string,
+    input: SwitchAgentProviderInput,
+  ): Promise<{ agent: ManagedAgent; notice: AgentProviderNotice | null }> {
+    const source = this.getAgent(agentId) ?? (await this.registry?.get(agentId));
+    if (source?.internal) throw new AgentNotFoundError(agentId);
+    if (this.registry) {
+      await ensureAgentLoaded(agentId, {
+        agentManager: this,
+        agentStorage: this.registry,
+        logger: this.logger,
+        purpose: "history",
+      });
+    }
+    return this.trackAgentRegistrationOperation(
+      this.runLifecycleMutation(agentId, async () => {
+        this.providerSwitches.add(agentId);
+        try {
+          const agent = this.requireSessionAgent(agentId);
+          await this.drainSessionEvents(agentId);
+          if (
+            agent.lifecycle === "running" ||
+            this.hasInFlightRun(agentId) ||
+            agent.activeTurnId ||
+            this.foregroundMutationTails.has(agentId)
+          ) {
+            throw new Error(`Agent ${agentId} must be idle before switching providers`);
+          }
+          await this.hydrateTimelineFromLegacyProviderHistory(agent);
+          return await this.switchAgentSession(agent, input);
+        } finally {
+          this.providerSwitches.delete(agentId);
+        }
+      }),
+    );
+  }
+
+  private async switchAgentSession(agent: ActiveManagedAgent, input: SwitchAgentProviderInput) {
+    this.assertAcceptingAgentRegistrations();
+    const { id, cwd, labels, launchEnv } = agent;
+    const record = await this.registry?.get(id);
+    const config: AgentSessionConfig = {
+      cwd,
+      title: record?.title ?? agent.config.title,
+      internal: agent.internal,
+      provider: input.provider,
+      model: input.model ?? undefined,
+      modeId: input.modeId ?? undefined,
+      thinkingOptionId: input.thinkingOptionId ?? undefined,
+      providerOptions: applyProviderOptionsPatch({
+        options: undefined,
+        patch: input.options ?? {},
+      }),
+      systemPrompt: agent.config.systemPrompt,
+      mcpServers: agent.config.mcpServers,
+      toolPolicy: agent.config.toolPolicy,
+    };
+    const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
+      config,
+      id,
+      { env: launchEnv, labels },
+    );
+    this.requireEnabledProvider(storedConfig.provider);
+    const client = await this.requireAvailableClient({ provider: storedConfig.provider });
+    const priorTools = this.attachedPluginTools.get(id);
+    const priorGeneration = this.sessionOpenGenerations.get(id);
+    const switchId = randomUUID();
+    let opened: AgentSession | undefined;
+    let previousPrefix: PersistedTimelinePrefix | null = null;
+    let handoffCanceled = false;
+    let prefixWritten = false;
+    let installed = false;
+    try {
+      const launchContext = await this.buildLaunchContext(
+        id,
+        client,
+        cwd,
+        paseoToolPolicy,
+        launchEnv,
+        {
+          ...agent,
+          reason: "create",
+          purpose: "interactive",
+          title: config.title,
+        },
+      );
+      const providerConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
+      const session = await client.createSession(providerConfig, launchContext);
+      await this.requireExternalMcpSupport(session, providerConfig, launchContext);
+      opened = session;
+      const next = this.buildSwitchedAgent(agent, session, storedConfig, providerConfig, client);
+      const notice = await this.initializeSwitchedAgent(next, storedConfig);
+      this.assertAgentRegistrationActive(agent);
+
+      previousPrefix = await this.timelinePrefixes.load(id);
+      // Let the old provider's already submitted events reach the retained timeline.
+      await this.drainSessionEvents(id);
+      agent.unsubscribeSession?.();
+      agent.unsubscribeSession = null;
+      this.agentStreamCoalescer.flushAndDiscard(id);
+      const cache = this.contextHandoffs.get(id);
+      const prefix = this.buildPendingTimelinePrefix(this.timelineStore.getRows(id), cache);
+      this.cancelContextHandoff(id);
+      handoffCanceled = true;
+      // Compaction could have completed while the previous sidecar was being read.
+      previousPrefix = cache?.prefix ?? previousPrefix;
+      await this.timelinePrefixes.stageSwitch(id, switchId, previousPrefix, prefix);
+      prefixWritten = true;
+      next.updatedAt = new Date();
+      await this.commitSwitchedSession(agent, next, switchId, record?.timelinePrefixSwitchId);
+      // The staged file is already readable as committed if this cleanup fails.
+      await this.timelinePrefixes.save(id, prefix).catch((err) => {
+        this.logger.warn({ err, agentId: id }, "Failed to finalize the timeline prefix");
+      });
+      this.clearBackgroundWork(id);
+      this.cancelRunningProviderSubagents(id);
+      this.paseoToolPolicies.set(id, paseoToolPolicy);
+      this.promptedMainControlRoleVersions.delete(id);
+      this.pendingHierarchySessionReloads.delete(id);
+      this.runtimeCleanupIdentities.set(session, Object.freeze({ openedAt: Date.now() }));
+      this.timelineStore.sealPrefix(id);
+      Object.assign(agent, next);
+      installed = true;
+      this.refreshIfMainControlChangedWhileOpening(agent, storedConfig);
+      this.subscribeToSession(agent);
+      this.installContextHandoff(agent, prefix);
+      this.emitState(agent, { persist: false });
+      return { agent: { ...agent }, notice };
+    } catch (error) {
+      if (!installed) {
+        await this.rollbackProviderSwitch(id, {
+          opened,
+          prefixWritten,
+          previousPrefix,
+          priorTools,
+          priorGeneration,
+        });
+        if (handoffCanceled) {
+          this.subscribeToSession(agent);
+          if (previousPrefix) this.installContextHandoff(agent, previousPrefix);
+        }
+      }
+      throw error;
+    }
+  }
+
+  private buildSwitchedAgent(
+    agent: ActiveManagedAgent,
+    session: AgentSession,
+    config: AgentSessionConfig,
+    launchConfig: AgentSessionConfig,
+    client: AgentClient,
+  ): ActiveManagedAgent {
+    const openedConfig = this.withOpenedOptions({ config, session });
+    return {
+      ...agent,
+      provider: openedConfig.provider,
+      providerAdapter: this.adapterOf(openedConfig.provider),
+      session,
+      config: openedConfig,
+      effectiveOptions: this.openedEffectiveOptions({
+        session,
+        launchedOptions: this.launchOptionsFor({ client, own: launchConfig.providerOptions }),
+      }),
+      capabilities: session.capabilities,
+      persistence: normalizePersistenceForConfig(session.describePersistence(), openedConfig),
+      lifecycle: "idle",
+      activeForegroundTurnId: null,
+      activeTurnId: null,
+      activeTurnStartedAt: null,
+      pendingReplacement: false,
+      pendingPermissions: new Map(),
+      bufferedPermissionResolutions: new Map(),
+      inFlightPermissionResponses: new Set(),
+      unsubscribeSession: null,
+      controls: undefined,
+      runtimeInfo: undefined,
+      currentModeId: null,
+      availableModes: [],
+      lastError: undefined,
+    };
+  }
+
+  private async initializeSwitchedAgent(agent: ActiveManagedAgent, config: AgentSessionConfig) {
+    let notice: AgentProviderNotice | null = null;
+    const { modeId, thinkingOptionId } = config;
+    await this.refreshSessionState(agent, { emit: false });
+    if (modeId && agent.currentModeId !== modeId) {
+      notice = (await agent.session.setMode(modeId)) ?? null;
+    }
+    if (thinkingOptionId && agent.runtimeInfo?.thinkingOptionId !== thinkingOptionId) {
+      const thinkingNotice = await agent.session.setThinkingOption?.(thinkingOptionId);
+      notice ??= thinkingNotice ?? null;
+    }
+    await this.refreshSessionState(agent, { emit: false });
+    this.refreshSessionPersistence(agent);
+    return notice;
+  }
+
+  private async commitSwitchedSession(
+    agent: ActiveManagedAgent,
+    replacement: ActiveManagedAgent,
+    switchId: string,
+    priorSwitchId?: string | null,
+  ): Promise<void> {
+    let persisted = false;
+    try {
+      // The old provider remains available if committing the new record fails.
+      await this.persistSnapshot(replacement, { timelinePrefixSwitchId: switchId });
+      persisted = true;
+      await agent.session.close();
+    } catch (error) {
+      if (persisted) {
+        await this.persistSnapshot(agent, { timelinePrefixSwitchId: priorSwitchId ?? null });
+      }
+      throw error;
+    }
+  }
+
+  private async rollbackProviderSwitch(
+    id: string,
+    previous: {
+      opened?: AgentSession;
+      prefixWritten: boolean;
+      previousPrefix: PersistedTimelinePrefix | null;
+      priorTools?: AttachedAgentTool[];
+      priorGeneration?: number;
+    },
+  ): Promise<void> {
+    this.detachPluginTools(id);
+    if (previous.priorTools) this.attachedPluginTools.set(id, previous.priorTools);
+    if (previous.priorGeneration !== undefined)
+      this.sessionOpenGenerations.set(id, previous.priorGeneration);
+    if (previous.opened) await this.closeUnregisteredSession(previous.opened);
+    if (!previous.prefixWritten) return;
+    if (previous.previousPrefix) await this.timelinePrefixes.save(id, previous.previousPrefix);
+    else await this.timelinePrefixes.delete(id);
   }
 
   // Mode, model, thinking and options change inside the agent's lifecycle lane, like every other
@@ -4773,6 +5117,9 @@ export class AgentManager {
     }
     const agent = await this.ensureInteractiveSession(agentId);
     this.assertAcceptingAgentRuns();
+    // A switch can acquire the lifecycle lane while the history session is opening.
+    // Let the foreground admission path wait for that switch.
+    if (this.providerSwitches.has(agentId)) return false;
     // Providers parse slash commands from the raw text, so a command another agent sent
     // must reach them without its sender envelope.
     const agentMessage = typeof prompt === "string" ? parseAgentMessage(prompt) : null;
@@ -4793,11 +5140,15 @@ export class AgentManager {
       if (event.type === "timeline") {
         this.touchUpdatedAt(agent);
         const row = this.recordTimeline(agent.id, event.item);
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
-        });
+        this.dispatchStream(
+          agent.id,
+          { ...event, item: row.item },
+          {
+            seq: row.seq,
+            epoch: this.timelineStore.getEpoch(agent.id),
+            timestamp: row.timestamp,
+          },
+        );
         return;
       }
       this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
@@ -4821,6 +5172,7 @@ export class AgentManager {
     agentId: string,
     item: AgentTimelineItem,
   ): Promise<{ seq: number; epoch: string }> {
+    if (this.providerSwitches.has(agentId)) await this.waitForAgentClose(agentId);
     const agent = this.requireAgent(agentId);
     item = limitAgentTimelineItemContent(item);
     this.touchUpdatedAt(agent);
@@ -4829,7 +5181,7 @@ export class AgentManager {
       agentId,
       {
         type: "timeline",
-        item,
+        item: row.item,
         provider: agent.provider,
       },
       {
@@ -4852,6 +5204,38 @@ export class AgentManager {
     });
   }
 
+  private async prepareProviderTurnPrompt(
+    agent: ActiveManagedAgent,
+    prompt: AgentPromptInput,
+    handoff: PendingContextHandoff | undefined,
+    addMainControl: boolean,
+  ): Promise<AgentPromptInput> {
+    const envelope = handoff && (await this.prepareContextForSend(agent, handoff));
+    const providerPrompt = envelope ? injectContextHandoffIntoPrompt(prompt, envelope) : prompt;
+    if (!addMainControl) return providerPrompt;
+    const hierarchy = await this.readHierarchyAgents();
+    const instructions = buildHierarchyAppendSystemPrompt({
+      agent,
+      readAgent: (id) => hierarchy.get(id),
+      listActiveAgents: () => hierarchy.values(),
+    });
+    const prefix = `${MAIN_CONTROL_PROMPT_HEADER}\n${instructions}${mainControlPromptEnd(agent.id)}\n\n`;
+    if (typeof providerPrompt === "string") return prefix + providerPrompt;
+    const [first, ...rest] = providerPrompt;
+    return first?.type === "text" && !("mimeType" in first)
+      ? [{ ...first, text: prefix + first.text }, ...rest]
+      : [{ type: "text", text: prefix }, ...providerPrompt];
+  }
+
+  private needsMainControlPrompt(agent: ActiveManagedAgent, roleVersion: number): boolean {
+    return (
+      isMainControlAgentLabels(agent.labels) &&
+      (!HIERARCHY_SYSTEM_PROMPT_ADAPTERS.has(this.adapterOf(agent.provider)) ||
+        this.inPlaceMainControlSessions.has(agent.session)) &&
+      this.promptedMainControlRoleVersions.get(agent.id) !== roleVersion
+    );
+  }
+
   private async startPendingForegroundTurn(params: {
     agent: ActiveManagedAgent;
     agentId: string;
@@ -4861,36 +5245,19 @@ export class AgentManager {
   }): Promise<string> {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
+      const handoff = this.contextHandoffs.get(agentId);
       const roleVersion = this.mainControlRoleVersions.get(agentId) ?? 0;
-      let providerPrompt = prompt;
-      if (
-        isMainControlAgentLabels(agent.labels) &&
-        (!HIERARCHY_SYSTEM_PROMPT_ADAPTERS.has(this.adapterOf(agent.provider)) ||
-          this.inPlaceMainControlSessions.has(agent.session)) &&
-        this.promptedMainControlRoleVersions.get(agentId) !== roleVersion
-      ) {
-        const hierarchy = await this.readHierarchyAgents();
-        if (pendingRun.settled) {
-          throw new Error(`Agent ${agentId} run was canceled before its turn started`);
-        }
-        const instructions = buildHierarchyAppendSystemPrompt({
-          agent,
-          readAgent: (id) => hierarchy.get(id),
-          listActiveAgents: () => hierarchy.values(),
-        });
-        const prefix = `${MAIN_CONTROL_PROMPT_HEADER}\n${instructions}${mainControlPromptEnd(agentId)}\n\n`;
-        if (typeof prompt === "string") {
-          providerPrompt = prefix + prompt;
-        } else {
-          const [first, ...rest] = prompt;
-          providerPrompt =
-            first?.type === "text" && !("mimeType" in first)
-              ? [{ ...first, text: prefix + first.text }, ...rest]
-              : [{ type: "text", text: prefix }, ...prompt];
-        }
+      const addedMainControl = this.needsMainControlPrompt(agent, roleVersion);
+      const providerPrompt =
+        handoff || addedMainControl
+          ? await this.prepareProviderTurnPrompt(agent, prompt, handoff, addedMainControl)
+          : prompt;
+      if (pendingRun.settled) {
+        throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
       const result = await agent.session.startTurn(providerPrompt, options);
-      if (providerPrompt !== prompt) this.promptedMainControlRoleVersions.set(agentId, roleVersion);
+      if (addedMainControl) this.promptedMainControlRoleVersions.set(agentId, roleVersion);
+      if (handoff) await this.consumeContextHandoff(agentId, handoff);
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
@@ -5018,7 +5385,7 @@ export class AgentManager {
   }
 
   private async ensureInteractiveSession(agentId: string): Promise<ActiveManagedAgent> {
-    while (this.hierarchySessionUpdates.has(agentId)) {
+    while (this.hierarchySessionUpdates.has(agentId) || this.providerSwitches.has(agentId)) {
       await this.waitForAgentClose(agentId);
     }
     let agent = this.requireSessionAgent(agentId);
@@ -5090,6 +5457,7 @@ export class AgentManager {
   ): AsyncGenerator<AgentStreamEvent> {
     if (
       this.hierarchySessionUpdates.has(agentId) ||
+      this.providerSwitches.has(agentId) ||
       this.collectingRuntimes.has(agentId) ||
       (!this.agents.has(agentId) && this.registry)
     )
@@ -5853,7 +6221,220 @@ export class AgentManager {
     await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
   }
 
+  private buildPendingTimelinePrefix(
+    rows: readonly AgentTimelineRow[],
+    cache?: PendingContextHandoff,
+  ): PersistedTimelinePrefix {
+    const savedRows = retainTimelinePrefixRows(rows);
+    const context = splitContextHandoff(savedRows);
+    const olderSummary =
+      context.olderDigest && context.olderDigest === cache?.context.olderDigest
+        ? cache.prefix.pendingContextHandoff?.olderSummary
+        : undefined;
+    return {
+      version: 1,
+      rows: savedRows,
+      pendingContextHandoff: context.recentTurns.length ? { olderSummary } : null,
+    };
+  }
+
+  private installContextHandoff(
+    agent: ActiveManagedAgent,
+    prefix: PersistedTimelinePrefix | null | undefined,
+  ): void {
+    if (!prefix?.pendingContextHandoff || this.contextHandoffs.has(agent.id)) return;
+    const context = splitContextHandoff(prefix.rows);
+    if (!context.recentTurns.length) return;
+    const handoff: PendingContextHandoff = { prefix, context };
+    this.contextHandoffs.set(agent.id, handoff);
+    if (context.olderDigest && !prefix.pendingContextHandoff.olderSummary) {
+      this.startContextCompaction(agent, handoff);
+    }
+  }
+
+  private startContextCompaction(agent: ActiveManagedAgent, handoff: PendingContextHandoff): void {
+    const item = { type: "compaction", status: "loading", trigger: "auto" } as const;
+    // A loading marker belongs only to this runtime, including when a durable store is installed.
+    const row = this.timelineStore.append(agent.id, item);
+    this.dispatchStream(
+      agent.id,
+      { type: "timeline", provider: agent.provider, item },
+      {
+        seq: row.seq,
+        epoch: this.timelineStore.getEpoch(agent.id),
+        timestamp: row.timestamp,
+      },
+    );
+    const controller = new AbortController();
+    handoff.controller = controller;
+    handoff.compactionRow = row;
+    const summary = summarizeContextHandoff(
+      handoff.context,
+      (prompt, signal) => this.summarizePriorConversation(agent, prompt, signal),
+      controller,
+    );
+    handoff.summary = summary;
+    this.trackBackgroundTask(
+      summary
+        .then(async (olderSummary) => {
+          if (this.contextHandoffs.get(agent.id) !== handoff || !handoff.compactionRow)
+            return undefined;
+          return this.completeContextCompaction(agent.id, handoff, olderSummary);
+        })
+        .catch((err) => {
+          this.logger.warn({ err, agentId: agent.id }, "Failed to persist context summary");
+        }),
+    );
+  }
+
+  private async summarizePriorConversation(
+    agent: ActiveManagedAgent,
+    prompt: string,
+    signal: AbortSignal,
+  ): Promise<string> {
+    signal.throwIfAborted();
+    const adapter = this.adapterOf(agent.provider);
+    const client = this.requireClient(agent.provider);
+    const restrictions = this.contextSummaryRestrictions(adapter);
+    if (!restrictions && client.capabilities.supportsToolInvocations) return "";
+    const opening = client.createSession(
+      {
+        provider: agent.provider,
+        model: agent.runtimeInfo?.model ?? agent.config.model,
+        cwd: agent.cwd,
+        internal: true,
+        mcpServers: {},
+        ...restrictions,
+      },
+      { mcpServers: {} },
+      { persistSession: false },
+    );
+    const session = await waitForAbort(opening, signal);
+    if (!session) {
+      // Provider creation has no abort option. Dispose it if it returns after the deadline.
+      void opening.then(
+        (late) => this.closeUnregisteredSession(late),
+        () => undefined,
+      );
+      return "";
+    }
+    try {
+      signal.throwIfAborted();
+      const result = await waitForAbort(session.run(prompt), signal);
+      return result && !result.canceled ? result.finalText : "";
+    } finally {
+      await this.closeUnregisteredSession(session);
+    }
+  }
+
+  private contextSummaryRestrictions(
+    adapter: string,
+  ): Pick<AgentSessionConfig, "modeId" | "providerOptions"> | undefined {
+    switch (adapter) {
+      case "codex":
+        return {
+          modeId: "read-only",
+          providerOptions: { sandbox_mode: "read-only", approval_policy: "never" },
+        };
+      case "claude":
+        return { modeId: "plan", providerOptions: { disallowedTools: ["*"] } };
+      case "opencode":
+        return { providerOptions: { permission: { "*": "deny" } } };
+      case "pi":
+        return { providerOptions: { mainControlReadOnly: true } };
+      default:
+        return undefined;
+    }
+  }
+
+  private async completeContextCompaction(
+    agentId: string,
+    handoff: PendingContextHandoff,
+    olderSummary: string,
+  ): Promise<void> {
+    const pending = handoff.prefix.pendingContextHandoff;
+    const loading = handoff.compactionRow;
+    if (!loading || !pending) return;
+    handoff.compactionRow = undefined;
+    const completed: AgentTimelineRow = {
+      ...loading,
+      item: { type: "compaction", status: "completed", trigger: "auto" },
+    };
+    pending.olderSummary = olderSummary;
+    handoff.prefix.rows.push(completed);
+    this.replaceContextCompactionRow(agentId, loading, completed);
+    this.enqueueDurableTimelineAppend(agentId, completed);
+    await this.timelinePrefixes.save(agentId, handoff.prefix);
+  }
+
+  private replaceContextCompactionRow(
+    agentId: string,
+    loading: AgentTimelineRow,
+    completed?: AgentTimelineRow,
+  ): void {
+    if (!this.timelineStore.has(agentId)) return;
+    const { seq } = this.timelineStore.getHead(agentId);
+    const rows = this.timelineStore.getRows(agentId).flatMap((row) => {
+      if (row.seq !== loading.seq) return [row];
+      return completed ? [{ ...row, item: completed.item }] : [];
+    });
+    // Clients deduplicate replacement events by epoch.
+    this.timelineStore.initialize(agentId, {
+      rows,
+      nextSeq: seq + 1,
+      sealedThrough: this.timelineStore.getSealedThrough(agentId),
+    });
+    this.dispatch({
+      type: "timeline_replacement",
+      agentId,
+      epoch: this.timelineStore.getEpoch(agentId),
+    });
+  }
+
+  private async prepareContextForSend(agent: ActiveManagedAgent, handoff: PendingContextHandoff) {
+    let summary = handoff.prefix.pendingContextHandoff?.olderSummary;
+    if (summary == null && handoff.summary) {
+      summary = await waitForContextSummary(handoff.summary);
+      if (summary === undefined) {
+        handoff.controller?.abort();
+        summary = fallbackContextSummary(handoff.context);
+        this.trackBackgroundTask(
+          this.completeContextCompaction(agent.id, handoff, summary).catch((err) => {
+            this.logger.warn(
+              { err, agentId: agent.id },
+              "Failed to persist fallback context summary",
+            );
+          }),
+        );
+      }
+    }
+    return buildContextHandoffEnvelope(handoff.context, summary);
+  }
+
+  private cancelContextHandoff(agentId: string): void {
+    const handoff = this.contextHandoffs.get(agentId);
+    if (!handoff) return;
+    this.contextHandoffs.delete(agentId);
+    handoff.controller?.abort();
+    if (handoff.compactionRow) this.replaceContextCompactionRow(agentId, handoff.compactionRow);
+  }
+
+  private async consumeContextHandoff(agentId: string, handoff: PendingContextHandoff) {
+    if (this.contextHandoffs.get(agentId) !== handoff) return;
+    this.contextHandoffs.delete(agentId);
+    await this.clearPersistedContextHandoff(agentId, handoff.prefix);
+  }
+
+  private async clearPersistedContextHandoff(agentId: string, prefix: PersistedTimelinePrefix) {
+    await this.timelinePrefixes
+      .save(agentId, { ...prefix, pendingContextHandoff: null })
+      .catch((err) => {
+        this.logger.warn({ err, agentId }, "Failed to clear persisted context handoff");
+      });
+  }
+
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
+    if (this.providerSwitches.has(agentId)) await this.waitForAgentClose(agentId);
     let agent = this.requireSessionAgent(agentId);
     if (this.historySessions.has(agent.session)) {
       agent = await this.ensureInteractiveSession(agentId);
@@ -5922,6 +6503,7 @@ export class AgentManager {
 
   async deleteAgentState(agentId: string): Promise<void> {
     this.discardRetainedAgentState(agentId);
+    await this.timelinePrefixes.delete(agentId);
     await this.deleteCommittedTimeline(agentId);
   }
 
@@ -5935,7 +6517,8 @@ export class AgentManager {
   }
 
   async deleteCommittedTimeline(agentId: string): Promise<void> {
-    await this.durableTimelineStore?.deleteAgent(agentId);
+    const store = this.durableTimelineStore;
+    if (store) await this.writeDurableTimeline(agentId, () => store.deleteAgent(agentId));
   }
 
   async getLastAssistantMessage(agentId: string): Promise<string | null> {
@@ -6231,6 +6814,7 @@ export class AgentManager {
       metadata?: AgentMetadata;
       timeline?: AgentTimelineItem[];
       timelineRows?: AgentTimelineRow[];
+      contextPrefix?: PersistedTimelinePrefix | null;
       timelineNextSeq?: number;
       persistence?: AgentPersistenceHandle;
       historyPrimed?: boolean;
@@ -6291,7 +6875,6 @@ export class AgentManager {
         background: options?.background === true,
         options,
       });
-
       // Read history before publishing the agent: a provider failure must leave the
       // session unregistered so the registration catch closes it.
       const startupHistory: AgentStreamEvent[] = [];
@@ -6344,6 +6927,7 @@ export class AgentManager {
       this.subscribeToSession(managed);
       await this.drainSessionEvents(managed.id);
       this.assertAgentRegistrationActive(managed);
+      this.installContextHandoff(managed, options.contextPrefix);
       return { ...managed };
     } catch (error) {
       if (!registered) {
@@ -6401,6 +6985,7 @@ export class AgentManager {
       | {
           timeline?: AgentTimelineItem[];
           timelineRows?: AgentTimelineRow[];
+          contextPrefix?: PersistedTimelinePrefix | null;
           timelineNextSeq?: number;
           persistence?: AgentPersistenceHandle;
           createdAt?: Date;
@@ -6410,7 +6995,10 @@ export class AgentManager {
   }): Promise<{ durableTimelineHasRows: boolean }> {
     const { agentId, now, options } = params;
     const timelineAlreadyPrimed = this.timelineStore.has(agentId);
-    const explicitTimelineSeed = buildExplicitTimelineSeedForRegister(now, options);
+    const preserveExistingPrefix = timelineAlreadyPrimed && options?.contextPrefix;
+    const explicitTimelineSeed = preserveExistingPrefix
+      ? null
+      : buildExplicitTimelineSeedForRegister(now, options);
     const shouldSeedFromDurable =
       !explicitTimelineSeed && !this.timelineStore.has(agentId) && this.durableTimelineStore;
     const durableTimelineSeed = shouldSeedFromDurable
@@ -6421,9 +7009,13 @@ export class AgentManager {
       (durableTimelineSeed != null && (durableTimelineSeed.nextSeq ?? 1) > 1);
     const timelineSeed = explicitTimelineSeed ?? durableTimelineSeed;
     if (timelineSeed || !this.timelineStore.has(agentId)) {
-      this.timelineStore.initialize(agentId, timelineSeed ?? { timestamp: now.toISOString() });
+      this.timelineStore.initialize(agentId, {
+        timestamp: now.toISOString(),
+        ...timelineSeed,
+        sealedThrough: maxTimelineSeq(options?.contextPrefix?.rows ?? []),
+      });
     }
-    if (options?.timelineRows?.length) {
+    if (explicitTimelineSeed && options?.timelineRows?.length) {
       this.enqueueDurableTimelineBulkInsert(agentId, options.timelineRows);
     }
     return { durableTimelineHasRows };
@@ -6558,6 +7150,7 @@ export class AgentManager {
   }
 
   private discardRetainedAgentState(agentId: string): void {
+    this.cancelContextHandoff(agentId);
     this.timelineStore.delete(agentId);
     this.paseoToolPolicies.delete(agentId);
     this.detachPluginTools(agentId);
@@ -6737,7 +7330,7 @@ export class AgentManager {
 
   private async persistSnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean },
+    options?: { title?: string | null; internal?: boolean; timelinePrefixSwitchId?: string | null },
   ): Promise<void> {
     if (!this.registry) {
       return;
@@ -6858,7 +7451,9 @@ export class AgentManager {
   ): Promise<void> {
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
+    let deliveredHandoff = false;
     for await (const rawEvent of agent.session.streamHistory()) {
+      deliveredHandoff ||= replayIncludesContextHandoff(rawEvent, agent.id);
       const event = limitAgentStreamEventContent(rawEvent, agent.id);
       if (event.type === "timeline") {
         for (const item of projectAgentMessages(event.item)) {
@@ -6870,9 +7465,11 @@ export class AgentManager {
     }
 
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
+    this.cancelContextHandoff(agent.id);
     await this.deleteCommittedTimeline(agent.id);
     this.timelineStore.delete(agent.id);
     this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
+    const prefix = await this.seedTimelinePrefix(agent.id);
     agent.historyPrimed = true;
 
     for (const event of this.providerSubagents.deleteParent(agent.id)) {
@@ -6886,20 +7483,25 @@ export class AgentManager {
         this.dispatch({ type: "provider_subagent", event: update });
       }
     }
-    for (const event of historyEvents) {
+    for (const event of this.excludePrefixReplay(prefix, historyEvents)) {
       const row = this.recordTimeline(
         agent.id,
         event.item,
         event.timestamp ? { timestamp: event.timestamp } : undefined,
       );
       if (broadcastTimeline) {
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
-        });
+        this.dispatchStream(
+          agent.id,
+          { ...event, item: row.item },
+          {
+            seq: row.seq,
+            epoch: this.timelineStore.getEpoch(agent.id),
+            timestamp: row.timestamp,
+          },
+        );
       }
     }
+    await this.restoreContextAfterReplay(agent, prefix, deliveredHandoff);
     this.touchUpdatedAt(agent);
     this.emitState(agent);
   }
@@ -6914,12 +7516,14 @@ export class AgentManager {
     const deferredBroadcast = typeof broadcast === "function";
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const historySubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
+    let deliveredHandoff = false;
     agent.historyPrimed = false;
     try {
       // Collect the whole replay before touching either store. A stream that fails
       // halfway then leaves the committed timeline as it was, instead of a partial
       // copy the next attempt would append to.
       for await (const rawEvent of history) {
+        deliveredHandoff ||= replayIncludesContextHandoff(rawEvent, agent.id);
         const event = limitAgentStreamEventContent(rawEvent, agent.id);
         if (event.type === "provider_subagent") {
           historySubagentEvents.push(event);
@@ -6940,6 +7544,7 @@ export class AgentManager {
     // The replay is the timeline, so drop the rows a previous hydration committed.
     // Keeping them would leave getTimelineRows reading one copy per hydration.
     await this.deleteCommittedTimeline(agent.id);
+    const prefix = await this.seedTimelinePrefix(agent.id);
 
     const timelineEvents: Array<{
       event: Extract<AgentStreamEvent, { type: "timeline" }>;
@@ -6955,7 +7560,7 @@ export class AgentManager {
         this.dispatch(managerEvent);
       }
     }
-    for (const event of historyEvents) {
+    for (const event of this.excludePrefixReplay(prefix, historyEvents)) {
       const row = this.recordTimeline(
         agent.id,
         event.item,
@@ -6964,14 +7569,19 @@ export class AgentManager {
       if (deferredBroadcast) {
         timelineEvents.push({ event, row });
       } else if (broadcast) {
-        this.dispatchStream(agent.id, event, {
-          seq: row.seq,
-          epoch: this.timelineStore.getEpoch(agent.id),
-          timestamp: row.timestamp,
-        });
+        this.dispatchStream(
+          agent.id,
+          { ...event, item: row.item },
+          {
+            seq: row.seq,
+            epoch: this.timelineStore.getEpoch(agent.id),
+            timestamp: row.timestamp,
+          },
+        );
       }
     }
     agent.historyPrimed = true;
+    await this.restoreContextAfterReplay(agent, prefix, deliveredHandoff);
 
     if (typeof broadcast !== "function" || !broadcast()) {
       return;
@@ -6980,11 +7590,65 @@ export class AgentManager {
       this.dispatch(event);
     }
     for (const { event, row } of timelineEvents) {
-      this.dispatchStream(agent.id, event, {
-        seq: row.seq,
-        epoch: this.timelineStore.getEpoch(agent.id),
-        timestamp: row.timestamp,
-      });
+      this.dispatchStream(
+        agent.id,
+        { ...event, item: row.item },
+        {
+          seq: row.seq,
+          epoch: this.timelineStore.getEpoch(agent.id),
+          timestamp: row.timestamp,
+        },
+      );
+    }
+  }
+
+  private async seedTimelinePrefix(agentId: string): Promise<PersistedTimelinePrefix | null> {
+    const prefix = await this.timelinePrefixes.load(agentId);
+    if (!prefix?.rows.length) return prefix;
+    const current = this.timelineStore.getRows(agentId);
+    const { epoch, seq } = this.timelineStore.getHead(agentId);
+    const retained = new Set(current.map((row) => row.seq));
+    const rows = [...prefix.rows.filter((row) => !retained.has(row.seq)), ...current];
+    this.timelineStore.initialize(agentId, {
+      rows,
+      epoch,
+      nextSeq: seq + 1,
+      sealedThrough: maxTimelineSeq(prefix.rows),
+    });
+    this.enqueueDurableTimelineBulkInsert(agentId, prefix.rows);
+    return prefix;
+  }
+
+  private excludePrefixReplay(
+    prefix: PersistedTimelinePrefix | null,
+    events: Extract<AgentStreamEvent, { type: "timeline" }>[],
+  ): Extract<AgentStreamEvent, { type: "timeline" }>[] {
+    if (!prefix?.rows.length) return events;
+    const replayedTextById = new Map<string, Set<string>>();
+    for (const { item } of prefix.rows) {
+      const id = timelineMessageId(item);
+      const text = timelineMessageText(item);
+      if (!id || text === undefined) continue;
+      const matched = replayedTextById.get(id) ?? new Set<string>();
+      matched.add(text);
+      replayedTextById.set(id, matched);
+    }
+    return events.filter(({ item }) => {
+      const id = timelineMessageId(item);
+      return !id || !replayedTextById.get(id)?.has(timelineMessageText(item)!);
+    });
+  }
+
+  private async restoreContextAfterReplay(
+    agent: ActiveManagedAgent,
+    prefix: PersistedTimelinePrefix | null,
+    deliveredHandoff: boolean,
+  ): Promise<void> {
+    if (!prefix?.pendingContextHandoff) return;
+    if (deliveredHandoff) {
+      await this.clearPersistedContextHandoff(agent.id, prefix);
+    } else {
+      this.installContextHandoff(agent, prefix);
     }
   }
 
@@ -7568,7 +8232,7 @@ export class AgentManager {
     const row = this.recordTimeline(agentId, item, { ...options, turnId });
     const event: AgentStreamEvent = {
       type: "timeline",
-      item,
+      item: row.item,
       provider,
       ...(turnId !== undefined ? { turnId } : {}),
     };

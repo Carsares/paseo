@@ -67,8 +67,8 @@ interface AgentModelSelectionRoutingInput {
   nextProvider: AgentProvider;
   modelId: string;
   selectSameProviderModel: (modelId: string) => Promise<void>;
-  handoffToProvider: (selection: { provider: AgentProvider; modelId: string }) => Promise<boolean>;
-  persistCrossProviderModelPreference: (provider: AgentProvider, modelId: string) => Promise<void>;
+  handoffToProvider?: (selection: { provider: AgentProvider; modelId: string }) => Promise<boolean>;
+  persistCrossProviderModelPreference?: (provider: AgentProvider, modelId: string) => Promise<void>;
 }
 
 export async function routeAgentModelSelection(
@@ -84,11 +84,11 @@ export async function routeAgentModelSelection(
     return;
   }
 
-  const didSwitch = await input.handoffToProvider({
+  const didSwitch = await input.handoffToProvider?.({
     provider: targetProvider,
     modelId: input.modelId,
   });
   if (didSwitch) {
-    await input.persistCrossProviderModelPreference(targetProvider, input.modelId);
+    await input.persistCrossProviderModelPreference?.(targetProvider, input.modelId);
   }
 }

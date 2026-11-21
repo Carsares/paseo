@@ -240,6 +240,32 @@ describe("applyProfileToTarget", () => {
     expect(deps.client.applyAgentConfig).not.toHaveBeenCalled();
   });
 
+  it("passes the full in-place profile through even if its mode is absent from the host catalog", async () => {
+    const deps = applicationDependencies();
+    const onSwitchProvider = vi.fn(async () => true);
+    const resolved = {
+      ...ANTIGRAVITY_PROFILE,
+      modeId: "workspace-mode",
+      thinkingOptionId: "high",
+      options: { effort: "high" },
+    };
+
+    await applyProfileToTarget({
+      ...deps,
+      target: {
+        ...CODEX_AGENT,
+        onSwitchProvider,
+        switchesProviderInPlace: true,
+      },
+      resolved,
+      entries: [ANTIGRAVITY_ENTRY],
+    });
+
+    expect(onSwitchProvider).toHaveBeenCalledExactlyOnceWith(resolved);
+    expect(deps.persistSelection).not.toHaveBeenCalled();
+    expect(deps.client.applyAgentConfig).not.toHaveBeenCalled();
+  });
+
   it.each([
     {
       label: "a rejected handoff",

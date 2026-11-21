@@ -1931,6 +1931,18 @@ export const CreateAgentWorktreeTargetSchema = z.discriminatedUnion("mode", [
 
 export type CreateAgentWorktreeTarget = z.infer<typeof CreateAgentWorktreeTargetSchema>;
 
+export const AgentTimelineCursorSchema = z.object({
+  epoch: z.string(),
+  seq: z.number().int().nonnegative(),
+});
+
+export const AgentForkSourceSchema = z.object({
+  sourceAgentId: z.string().min(1),
+  boundaryCursor: AgentTimelineCursorSchema.optional(),
+  boundaryMessageId: z.string().min(1).optional(),
+});
+export type AgentForkSource = z.infer<typeof AgentForkSourceSchema>;
+
 export const CreateAgentRequestMessageSchema = z.object({
   type: z.literal("create_agent_request"),
   // Legacy create_agent_request uses a separate initial-message receipt when keyed.
@@ -1941,6 +1953,7 @@ export const CreateAgentRequestMessageSchema = z.object({
   // Optional caller context lets managed CLI invocations use the same daemon-owned
   // workspace and parentage policy as agent-scoped MCP creation.
   callerAgentId: z.string().optional(),
+  forkFrom: AgentForkSourceSchema.optional(),
   worktreeName: z.string().optional(),
   initialPrompt: z.string().optional(),
   initialPromptOrigin: z.enum(["user", "agent"]).optional(),
@@ -2099,11 +2112,6 @@ export const ShutdownServerRequestMessageSchema = z.object({
 export const DaemonUpdateRequestMessageSchema = z.object({
   type: z.literal("daemon.update.request"),
   requestId: z.string(),
-});
-
-export const AgentTimelineCursorSchema = z.object({
-  epoch: z.string(),
-  seq: z.number().int().nonnegative(),
 });
 
 export const FetchAgentTimelineRequestMessageSchema = z.object({
@@ -2278,6 +2286,40 @@ export const AgentConfigApplyResponseMessageSchema = z.object({
   type: z.literal("agent.config.apply.response"),
   payload: AgentActionResponsePayloadSchema,
 });
+
+export const AgentProviderSwitchRequestMessageSchema = z.object({
+  type: z.literal("agent.provider.switch.request"),
+  agentId: z.string().min(1),
+  provider: AgentProviderSchema,
+  model: z.string().nullable().optional(),
+  modeId: z.string().nullable().optional(),
+  thinkingOptionId: z.string().nullable().optional(),
+  options: ProviderOptionsSchema.optional(),
+  requestId: z.string(),
+});
+export type AgentProviderSwitchRequestMessage = z.infer<
+  typeof AgentProviderSwitchRequestMessageSchema
+>;
+
+export const AgentProviderSwitchResponsePayloadSchema = z.object({
+  requestId: z.string(),
+  agentId: z.string(),
+  accepted: z.boolean(),
+  agent: AgentSnapshotPayloadSchema.nullable(),
+  error: z.string().nullable(),
+  notice: AgentProviderNoticeSchema.nullable().optional(),
+});
+export type AgentProviderSwitchResponsePayload = z.infer<
+  typeof AgentProviderSwitchResponsePayloadSchema
+>;
+
+export const AgentProviderSwitchResponseMessageSchema = z.object({
+  type: z.literal("agent.provider.switch.response"),
+  payload: AgentProviderSwitchResponsePayloadSchema,
+});
+export type AgentProviderSwitchResponseMessage = z.infer<
+  typeof AgentProviderSwitchResponseMessageSchema
+>;
 
 export const AgentDetachRequestMessageSchema = z.object({
   type: z.literal("agent.detach.request"),
@@ -3792,6 +3834,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentThinkingRequestMessageSchema,
   SetAgentFeatureRequestMessageSchema,
   AgentConfigApplyRequestMessageSchema,
+  AgentProviderSwitchRequestMessageSchema,
   AgentDetachRequestMessageSchema,
   AgentMoveToWorkspaceRequestMessageSchema,
   AgentSetMainRequestMessageSchema,
@@ -4235,6 +4278,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentForkContext: z.boolean().optional(),
         // COMPAT(agentForkContextCursor): added in v0.1.108, remove gate after 2027-01-14.
         agentForkContextCursor: z.boolean().optional(),
+        // COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
+        agentSeamlessContextSwitch: z.boolean().optional(),
         // COMPAT(agentInitialPromptOrigin): added in v0.16.0, remove gate after 2027-05-19.
         agentInitialPromptOrigin: z.boolean().optional(),
         // COMPAT(providerSubagents): added in v0.1.107, remove gate after 2027-01-12.
@@ -7779,6 +7824,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentThinkingResponseMessageSchema,
   SetAgentFeatureResponseMessageSchema,
   AgentConfigApplyResponseMessageSchema,
+  AgentProviderSwitchResponseMessageSchema,
   AgentDetachResponseMessageSchema,
   AgentMoveToWorkspaceResponseMessageSchema,
   AgentSetMainResponseMessageSchema,

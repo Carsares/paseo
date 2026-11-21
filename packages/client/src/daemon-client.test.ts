@@ -4199,7 +4199,7 @@ test("normalizes workspace_setup_progress into a workspace-scoped daemon event",
   });
 });
 
-test("sends create_agent_request with workspace and caller identity", async () => {
+test("sends create_agent_request with workspace, caller identity, and fork source", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();
 
@@ -4216,12 +4216,14 @@ test("sends create_agent_request with workspace and caller identity", async () =
   mock.triggerOpen({ features: { agentRequestReceipts: true } });
   await connectPromise;
 
+  const forkFrom = { sourceAgentId: "source-agent", boundaryMessageId: "message-1" };
   const createPromise = client.createAgent({
     idempotencyKey: "one-creation",
     provider: "codex",
     cwd: "/tmp/project/.paseo/worktrees/feature-a",
     workspaceId: "ws-feature-a",
     callerAgentId: "parent-agent",
+    forkFrom,
     title: "Compat agent",
     modeId: "default",
   });
@@ -4234,6 +4236,7 @@ test("sends create_agent_request with workspace and caller identity", async () =
       idempotencyKey: "one-creation",
       workspaceId: "ws-feature-a",
       callerAgentId: "parent-agent",
+      forkFrom,
     }),
   );
 
@@ -8433,7 +8436,7 @@ test("wire snapshot callers own expansion and receive hash references unchanged"
   expect(await request).toEqual(body);
 });
 
-test("creation lifecycle sends the keyed agent and initial prompt as one intent", async () => {
+test("creation lifecycle sends the keyed agent, fork source, and initial prompt as one intent", async () => {
   const transport = createMockTransport();
   const client = new DaemonClient({
     url: "ws://test",
@@ -8445,11 +8448,13 @@ test("creation lifecycle sends the keyed agent and initial prompt as one intent"
   const connected = client.connect();
   transport.triggerOpen({ features: { creationLifecycle: true, agentRequestReceipts: true } });
   await connected;
+  const forkFrom = { sourceAgentId: "source-agent", boundaryCursor: { epoch: "epoch-1", seq: 4 } };
   const creation = client.createAgent({
     idempotencyKey: "draft-one",
     provider: "codex",
     cwd: "/project",
     workspaceId: "wks_0123456789abcdef",
+    forkFrom,
     initialPrompt: "Start once",
     clientMessageId: "first-message",
   });
@@ -8458,6 +8463,7 @@ test("creation lifecycle sends the keyed agent and initial prompt as one intent"
   expect(request).toMatchObject({
     type: "agent.create.request",
     idempotencyKey: "draft-one",
+    forkFrom,
     initialPrompt: "Start once",
     clientMessageId: "first-message",
   });
@@ -8530,12 +8536,18 @@ test("creation reconnect observation uses connection-owned subscriptions and rel
   transport.triggerOpen({ features });
   await connect;
   const phases: string[] = [];
+  const forkFrom = { sourceAgentId: "source-agent" };
   const creation = client.createWorkspace({
     idempotencyKey: "reconnect-one",
     source: { kind: "directory", path: "/project" },
+    agent: { provider: "codex", cwd: "/project", forkFrom },
     onEvent: (snapshot) => phases.push(snapshot.phase),
   });
   void creation.catch(() => undefined);
+  expect(parseSentFrame(transport.sent[0])).toMatchObject({
+    type: "workspace.create.request",
+    agent: { forkFrom },
+  });
   const snapshot = {
     kind: "workspace",
     idempotencyKey: "reconnect-one",
@@ -10067,6 +10079,140 @@ describe("provider options across daemon versions", () => {
       );
     return { mock, client, sentMessages };
   }
+
+  test("preserves the initial agent's fork source when workspace creation uses two requests", async () => {
+    const { client, mock, sentMessages } = await connect({});
+    const forkFrom = { sourceAgentId: "source-agent", boundaryMessageId: "message-1" };
+    const workspace = {
+      id: "wks_0123456789abcdef",
+      projectId: "project",
+      projectDisplayName: "Project",
+      projectRootPath: "/repo",
+      workspaceDirectory: "/repo",
+      projectKind: "non_git",
+      workspaceKind: "directory",
+      name: "Project",
+      status: "running",
+      activityAt: null,
+    };
+    const creating = client.createWorkspace({
+      source: { kind: "directory", path: "/repo" },
+      agent: { provider: "codex", cwd: "/repo", forkFrom },
+    });
+    const [workspaceRequest] = sentMessages();
+    expect(workspaceRequest.type).toBe("workspace.create.request");
+    expect(workspaceRequest).not.toHaveProperty("agent");
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "workspace.create.response",
+        payload: {
+          requestId: workspaceRequest.requestId,
+          workspace,
+          setupTerminalId: null,
+          error: null,
+        },
+      }),
+    );
+
+    await expect
+      .poll(() => sentMessages()[1])
+      .toMatchObject({
+        type: "create_agent_request",
+        workspaceId: workspace.id,
+        forkFrom,
+      });
+    const agent = { ...agentSnapshot, workspaceId: workspace.id };
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "status",
+        payload: {
+          status: "agent_created",
+          requestId: sentMessages()[1].requestId,
+          agentId: agent.id,
+          agent,
+        },
+      }),
+    );
+    await expect(creating).resolves.toMatchObject({ workspace, agent });
+  });
+
+  test.each([undefined, { type: "warning", message: "Model adjusted" }])(
+    "switches provider using the matching response and returns its snapshot and notice (%j)",
+    async (notice) => {
+      const { client, mock, sentMessages } = await connect({ agentSeamlessContextSwitch: true });
+      const input = {
+        provider: "claude",
+        model: null,
+        modeId: "plan",
+        thinkingOptionId: null,
+        options: { speed: 1 },
+      } as const;
+      const switching = client.switchAgentProvider("agent-1", input);
+      const [request] = sentMessages();
+      expect(request).toEqual({
+        type: "agent.provider.switch.request",
+        requestId: expect.any(String),
+        agentId: "agent-1",
+        ...input,
+      });
+
+      const agent = { ...agentSnapshot, provider: "claude", currentModeId: "plan" };
+      const reply = (requestId: unknown, snapshot: typeof agent) =>
+        mock.triggerMessage(
+          wrapSessionMessage({
+            type: "agent.provider.switch.response",
+            payload: {
+              requestId,
+              agentId: "agent-1",
+              accepted: true,
+              agent: snapshot,
+              error: null,
+              notice,
+            },
+          }),
+        );
+      reply("unrelated-request", { ...agent, model: "unrelated-model" });
+      reply(request.requestId, agent);
+
+      await expect(switching).resolves.toEqual({
+        agent: {
+          ...agent,
+          capabilities: {
+            ...agent.capabilities,
+            supportsRewindConversation: false,
+            supportsRewindFiles: false,
+            supportsRewindBoth: false,
+          },
+        },
+        notice: notice ?? null,
+      });
+    },
+  );
+
+  test.each([
+    {
+      accepted: false,
+      agent: agentSnapshot,
+      error: "Provider unavailable",
+      expected: "Provider unavailable",
+    },
+    { accepted: true, agent: null, error: null, expected: "Failed to switch agent provider" },
+  ])(
+    "rejects a provider switch without a successful snapshot ($expected)",
+    async ({ expected, ...result }) => {
+      const { client, mock, sentMessages } = await connect({ agentSeamlessContextSwitch: true });
+      const switching = client.switchAgentProvider("agent-1", { provider: "claude" });
+      const [request] = sentMessages();
+      mock.triggerMessage(
+        wrapSessionMessage({
+          type: "agent.provider.switch.response",
+          payload: { requestId: request.requestId, agentId: "agent-1", ...result },
+        }),
+      );
+
+      await expect(switching).rejects.toThrow(expected);
+    },
+  );
 
   test("a legacy create and a timeline read return the agent with controls over options", async () => {
     const { mock, client, sentMessages } = await connect({});

@@ -178,6 +178,8 @@ import {
 } from "./agent/agent-timeline-content.js";
 import { parsePluginClientId } from "./plugins/plugin-session-identity.js";
 import { buildAgentForkContextAttachment } from "./agent/activity-curator.js";
+import { sliceTimelineRowsAtBoundary } from "./agent/timeline-prefix-store.js";
+import type { AgentForkSource } from "@getpaseo/protocol/messages";
 import { buildAgentPrompt } from "./agent/prompt-attachments.js";
 import type { StructuredGenerationDaemonConfig } from "./agent/structured-generation-providers.js";
 import {
@@ -2768,7 +2770,7 @@ export class Session {
       this.dispatchHubExecutionMessage(msg) ??
       this.dispatchCreationMessage(msg, source) ??
       this.dispatchAgentLifecycleMessage(msg) ??
-      this.dispatchAgentConfigMessage(msg) ??
+      this.dispatchAgentConfigMessage(msg, source) ??
       this.dispatchCheckoutMessage(msg) ??
       this.dispatchWorkspaceLifecycleMessage(msg) ??
       this.dispatchWorkspaceFileMessage(msg, source) ??
@@ -3386,7 +3388,10 @@ export class Session {
     }
   }
 
-  private dispatchAgentConfigMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+  private dispatchAgentConfigMessage(
+    msg: SessionInboundMessage,
+    source?: object,
+  ): Promise<void> | undefined {
     switch (msg.type) {
       case "set_agent_mode_request":
         return this.agentConfigSession.handleSetAgentModeRequest(msg);
@@ -3398,6 +3403,8 @@ export class Session {
         return this.agentConfigSession.handleSetAgentThinkingRequest(msg);
       case "agent.config.apply.request":
         return this.agentConfigSession.handleAgentConfigApplyRequest(msg);
+      case "agent.provider.switch.request":
+        return this.handleAgentProviderSwitchRequest(msg, source);
       case "get_daemon_config_request":
         this.emit({
           type: "get_daemon_config_response",
@@ -5693,6 +5700,7 @@ export class Session {
     let createdWorktreeForCleanup: CreatePaseoWorktreeWorkflowResult | null = null;
     let createdAgentId: string | null = null;
     try {
+      const forkedTimelineRows = await this.readForkedTimeline(msg.forkFrom);
       const requestedCwd = resolve(config.cwd);
       const needsRequestedDirectory = Boolean(worktree) || (!msg.workspaceId && !msg.callerAgentId);
       if (needsRequestedDirectory && !(await this.filesystem.isDirectory(requestedCwd))) {
@@ -5750,6 +5758,7 @@ export class Session {
           workspaceId: resolvedIntent.intent.workspaceId,
           background: resolvedIntent.background,
           initialPrompt,
+          forkedTimelineRows,
           source:
             msg.callerAgentId && msg.initialPromptOrigin !== "user"
               ? { kind: "agent-message", agentId: msg.callerAgentId }
@@ -9956,6 +9965,83 @@ export class Session {
     }
   }
 
+  private async handleAgentProviderSwitchRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.provider.switch.request" }>,
+    source?: object,
+  ): Promise<void> {
+    const { requestId, agentId } = msg;
+    try {
+      const { agent, notice } = await this.agentManager.switchAgentProvider(agentId, msg);
+      const payload = await this.buildAgentPayload(agent);
+      await this.agentUpdates.forwardLiveAgent(agent);
+      this.emitForSource(
+        {
+          type: "agent.provider.switch.response",
+          payload: { requestId, agentId, accepted: true, agent: payload, error: null, notice },
+        },
+        source,
+      );
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, agentId, requestId },
+        "Failed to switch agent provider",
+      );
+      const message = getErrorMessage(error);
+      this.emit({
+        type: "activity_log",
+        payload: {
+          id: uuidv4(),
+          timestamp: new Date(),
+          type: "error",
+          content: `Failed to switch agent provider: ${message}`,
+        },
+      });
+      this.emitForSource(
+        {
+          type: "agent.provider.switch.response",
+          payload: {
+            requestId,
+            agentId,
+            accepted: false,
+            agent: null,
+            error: message,
+            notice: null,
+          },
+        },
+        source,
+      );
+    }
+  }
+
+  private async readForkedTimeline(forkFrom?: AgentForkSource) {
+    if (!forkFrom) return undefined;
+    // Creation authorizes the destination. Reading inherited messages also requires
+    // the permission checked at ingress for an explicit fork-context read.
+    if (!this.authorization.allowsPermission("workspace.read")) {
+      throw new Error("Session is not authorized to read fork source history");
+    }
+    const { timeline } = await this.loadForkSourceTimeline(forkFrom.sourceAgentId);
+    return sliceTimelineRowsAtBoundary(timeline.rows, {
+      ...forkFrom,
+      timelineEpoch: timeline.epoch,
+    });
+  }
+
+  private async loadForkSourceTimeline(agentId: string) {
+    const source = this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
+    if (!source || source.internal) throw new Error(`Agent not found: ${agentId}`);
+    const snapshot = await ensureAgentLoaded(agentId, {
+      agentManager: this.agentManager,
+      agentStorage: this.agentStorage,
+      logger: this.sessionLogger,
+      purpose: "history",
+    });
+    return {
+      snapshot,
+      timeline: this.agentManager.fetchTimeline(agentId, { direction: "tail", limit: 0 }),
+    };
+  }
+
   private async handleAgentForkContextRequest(
     msg: Extract<SessionInboundMessage, { type: "agent.fork_context.request" }>,
   ): Promise<void> {
@@ -9970,16 +10056,7 @@ export class Session {
           );
           if (archived) return archived;
         }
-        const snapshot = await ensureAgentLoaded(msg.agentId, {
-          agentManager: this.agentManager,
-          agentStorage: this.agentStorage,
-          logger: this.sessionLogger,
-          ...(record?.archivedAt ? { purpose: "history" } : {}),
-        });
-        const timeline = this.agentManager.fetchTimeline(msg.agentId, {
-          direction: "tail",
-          limit: 0,
-        });
+        const { snapshot, timeline } = await this.loadForkSourceTimeline(msg.agentId);
         return buildAgentForkContextAttachment({
           rows: timeline.rows,
           cursorBoundary: msg.boundaryCursor

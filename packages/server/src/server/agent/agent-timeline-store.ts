@@ -14,6 +14,7 @@ export interface SeedAgentTimelineOptions {
   rows?: readonly AgentTimelineRow[];
   epoch?: string;
   nextSeq?: number;
+  sealedThrough?: number;
   timestamp?: string;
 }
 
@@ -23,10 +24,43 @@ interface AgentTimelineState {
   minSeq: number;
   earliestCoveredSeq: number | null;
   nextSeq: number;
+  sealedThrough: number;
+  prefixToolIds: ReadonlySet<string>;
 }
 const DEFAULT_TIMELINE_FETCH_LIMIT = 200;
 function cloneRow<T extends AgentTimelineRow>(row: T): T {
   return { ...row };
+}
+
+function toolIdentity(callId: string, turnId?: string): string {
+  return JSON.stringify([turnId, callId]);
+}
+
+function getPrefixToolIds(rows: readonly AgentTimelineRow[], sealedThrough: number): Set<string> {
+  const ids = new Set<string>();
+  if (!sealedThrough) return ids;
+  for (const { item, seq, turnId } of rows) {
+    if (seq <= sealedThrough && item.type === "tool_call") {
+      ids.add(toolIdentity(item.callId, turnId));
+    }
+  }
+  return ids;
+}
+
+function distinguishToolFromPrefix(
+  state: AgentTimelineState,
+  item: AgentTimelineItem,
+  turnId?: string,
+): AgentTimelineItem {
+  if (item.type !== "tool_call" || !state.prefixToolIds.size) return item;
+  let { callId } = item;
+  // Preserve the retained call ID. Clients key tool updates by turn and call
+  // ID, so a provider replay with neither a new turn ID nor a new call ID
+  // would otherwise replace the earlier call.
+  while (state.prefixToolIds.has(toolIdentity(callId, turnId))) {
+    callId = `paseo-context:${callId}`;
+  }
+  return callId === item.callId ? item : { ...item, callId };
 }
 
 export class InMemoryAgentTimelineStore {
@@ -42,7 +76,8 @@ export class InMemoryAgentTimelineStore {
       ? options.rows.map(cloneRow)
       : this.buildRowsFromItems(options?.items ?? [], options?.nextSeq ?? 1, timestamp);
     const nextSeq = rows.reduce((next, row) => Math.max(next, row.seq + 1), options?.nextSeq ?? 1);
-    const projection = new TimelineProjection(rows);
+    const sealedThrough = options?.sealedThrough ?? 0;
+    const projection = new TimelineProjection(rows, sealedThrough);
     const firstSeq = projection.getRows()[0]?.seqStart ?? null;
     this.states.set(agentId, {
       epoch: options?.epoch ?? randomUUID(),
@@ -50,11 +85,24 @@ export class InMemoryAgentTimelineStore {
       minSeq: firstSeq ?? 0,
       earliestCoveredSeq: firstSeq,
       nextSeq,
+      sealedThrough,
+      prefixToolIds: getPrefixToolIds(rows, sealedThrough),
     });
   }
 
   delete(agentId: string): void {
     this.states.delete(agentId);
+  }
+
+  sealPrefix(agentId: string): void {
+    const state = this.requireState(agentId);
+    state.sealedThrough = state.nextSeq - 1;
+    state.prefixToolIds = getPrefixToolIds(state.projection.getRows(), state.sealedThrough);
+    state.projection.seal();
+  }
+
+  getSealedThrough(agentId: string): number {
+    return this.requireState(agentId).sealedThrough;
   }
 
   removeAssistantMessages(agentId: string, turnId: string, messageIds: readonly string[]): boolean {
@@ -72,7 +120,7 @@ export class InMemoryAgentTimelineStore {
     );
     if (rows.length === previous.length) return false;
     // Keep sequence numbers monotonic; a new epoch invalidates clients' old rows and cursors.
-    this.initialize(agentId, { rows, nextSeq: state.nextSeq });
+    this.initialize(agentId, { rows, nextSeq: state.nextSeq, sealedThrough: state.sealedThrough });
     // A deleted prefix still belongs to the covered range, unlike truncated history.
     this.requireState(agentId).earliestCoveredSeq = state.earliestCoveredSeq;
     return true;
@@ -173,7 +221,7 @@ export class InMemoryAgentTimelineStore {
     const row: AgentTimelineRow = {
       seq: state.nextSeq,
       timestamp: options?.timestamp ?? new Date().toISOString(),
-      item,
+      item: distinguishToolFromPrefix(state, item, options?.turnId),
       ...(options?.turnId ? { turnId: options.turnId } : {}),
       ...(options?.providerMessageId ? { providerMessageId: options.providerMessageId } : {}),
     };

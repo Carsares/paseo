@@ -12,6 +12,7 @@ import type { AgentSessionConfig } from "./agent-sdk-types.js";
 import { AgentOwnerSchema, daemonExecutionKey, type DaemonAgentOwner } from "./agent-owner.js";
 import { controlsFromFeatures } from "@getpaseo/protocol/option-controls";
 import { foldFeatureValues } from "./option-controls.js";
+import { isTimelinePrefixFilename, TimelinePrefixStore } from "./timeline-prefix-store.js";
 
 const SERIALIZABLE_CONFIG_SCHEMA = z
   .object({
@@ -77,6 +78,7 @@ const RAW_STORED_AGENT_SCHEMA = z.object({
   // COMPAT(featureValues): added in v0.15.0, remove after 2027-05-01. Read-only; becomes controls.
   features: z.array(AgentFeatureSchema).optional(),
   persistence: PERSISTENCE_HANDLE_SCHEMA,
+  timelinePrefixSwitchId: z.string().nullable().optional(),
   lastError: z.string().nullable().optional(),
   requiresAttention: z.boolean().optional(),
   attentionReason: z.enum(["finished", "error", "permission"]).nullable().optional(),
@@ -123,6 +125,7 @@ export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
 }
 
 export class AgentStorage {
+  readonly timelinePrefixes: TimelinePrefixStore;
   private cache: Map<string, StoredAgentRecord> = new Map();
   private pathById: Map<string, string> = new Map();
   private pathsById: Map<string, Set<string>> = new Map();
@@ -142,6 +145,10 @@ export class AgentStorage {
 
   constructor(baseDir: string, logger: Logger) {
     this.baseDir = baseDir;
+    this.timelinePrefixes = new TimelinePrefixStore(
+      baseDir,
+      async (agentId) => (await this.get(agentId))?.timelinePrefixSwitchId,
+    );
     this.logger = logger.child({ module: "agent", component: "agent-storage" });
   }
 
@@ -372,6 +379,7 @@ export class AgentStorage {
     await this.load();
     this.beginDelete(agentId);
     await (this.pendingWrites.get(agentId) ?? Promise.resolve());
+    await this.timelinePrefixes.delete(agentId);
     const paths = Array.from(this.pathsById.get(agentId) ?? []);
     await Promise.all(
       paths.map(async (filePath) => {
@@ -405,26 +413,32 @@ export class AgentStorage {
 
   async applySnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean },
+    options?: { title?: string | null; internal?: boolean; timelinePrefixSwitchId?: string | null },
   ): Promise<void> {
     await this.load();
     const hasTitleOverride =
       options !== undefined && Object.prototype.hasOwnProperty.call(options, "title");
     const hasInternalOverride =
       options !== undefined && Object.prototype.hasOwnProperty.call(options, "internal");
+    const switchId = options?.timelinePrefixSwitchId;
+    const titleOverride = options?.title ?? null;
+    const internalOverride = options?.internal;
     await this.queueRecordMutation(agent.id, (existing) => {
+      if (switchId !== undefined && !existing) {
+        throw new Error(`Agent ${agent.id} disappeared during provider switch`);
+      }
       const record = toStoredAgentRecord(agent, {
-        title: hasTitleOverride ? (options?.title ?? null) : (existing?.title ?? null),
+        title: hasTitleOverride ? titleOverride : (existing?.title ?? null),
         createdAt: existing?.createdAt,
-        internal: hasInternalOverride ? options?.internal : (agent.internal ?? existing?.internal),
+        internal: hasInternalOverride ? internalOverride : (agent.internal ?? existing?.internal),
       });
 
       // Preserve soft-delete/archive status across snapshot flushes. The
       // projection runs inside the per-agent write queue so it cannot commit a
       // stale pre-archive record after the archive mutation.
-      if (existing && existing.archivedAt !== undefined) {
-        record.archivedAt = existing.archivedAt;
-      }
+      record.archivedAt = existing?.archivedAt;
+      record.timelinePrefixSwitchId =
+        switchId === undefined ? existing?.timelinePrefixSwitchId : switchId;
       // Background is fixed at creation; a runtime opened without it cannot clear it.
       if (existing?.background) record.background = true;
       record.resumeOnStartup =
@@ -493,7 +507,10 @@ export class AgentStorage {
     }
 
     const rootRecordPaths = entries
-      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .filter(
+        (entry) =>
+          entry.isFile() && entry.name.endsWith(".json") && !isTimelinePrefixFilename(entry.name),
+      )
       .map((entry) => path.join(this.baseDir, entry.name));
 
     const projectDirs = entries

@@ -19,6 +19,7 @@ import type { ProviderSelectorProvider } from "@/provider-selection/provider-sel
 import { filterSelectableModels } from "@/provider-selection/model-catalog";
 import { useSessionStore } from "@/stores/session-store";
 import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
+import { useStableEvent } from "@/hooks/use-stable-event";
 import { mergeProviderPreferences, useFormPreferences } from "@/hooks/use-form-preferences";
 import {
   AgentModeControl,
@@ -311,25 +312,7 @@ function buildFallbackModelSelectorProviders(
   ];
 }
 
-function pickSheetModel({
-  nextProviderId,
-  modelId,
-  onSelectProviderAndModel,
-  onSelectModel,
-}: {
-  nextProviderId: string;
-  modelId: string;
-  onSelectProviderAndModel?: (provider: string, modelId: string) => void;
-  onSelectModel?: (modelId: string) => void;
-}) {
-  if (onSelectProviderAndModel) {
-    onSelectProviderAndModel(nextProviderId, modelId);
-    return;
-  }
-  onSelectModel?.(modelId);
-}
-
-function pickDesktopModel({
+function pickModel({
   nextProviderId,
   modelId,
   currentProvider,
@@ -369,7 +352,8 @@ function selectAgentControlsSlice(
   serverId: string,
   agentId: string,
 ): AgentControlsSlice {
-  const currentAgent = state.sessions[serverId]?.agents?.get(agentId) ?? null;
+  const session = state.sessions[serverId];
+  const currentAgent = session?.agents?.get(agentId) ?? session?.agentDetails?.get(agentId);
   if (!currentAgent) {
     return null;
   }
@@ -579,9 +563,9 @@ function ControlledAgentControls({
     [onDropdownClose],
   );
 
-  const handleDesktopModelSelect = useCallback(
+  const handleModelSelect = useCallback(
     (nextProviderId: string, modelId: string) => {
-      pickDesktopModel({
+      pickModel({
         nextProviderId,
         modelId,
         currentProvider: provider,
@@ -601,18 +585,6 @@ function ControlledAgentControls({
     setActiveSheet(null);
     if (!presentation.foldControls) onDropdownClose?.();
   }, [onDropdownClose, presentation.foldControls]);
-
-  const handleSheetModelSelect = useCallback(
-    (nextProviderId: string, modelId: string) => {
-      pickSheetModel({
-        nextProviderId,
-        modelId,
-        onSelectProviderAndModel,
-        onSelectModel,
-      });
-    },
-    [onSelectModel, onSelectProviderAndModel],
-  );
 
   if (!hasAnyControl) {
     return null;
@@ -641,7 +613,7 @@ function ControlledAgentControls({
             canSelectModel={canSelectModel}
             modelSelectorProviders={effectiveModelSelectorProviders}
             openSelector={openSelector}
-            handleDesktopModelSelect={handleDesktopModelSelect}
+            handleDesktopModelSelect={handleModelSelect}
             handleToolbarOpenChange={handleToolbarOpenChange}
             handleSheetOpenChange={setOpenSelector}
             modeControl={modeControl}
@@ -674,7 +646,7 @@ function ControlledAgentControls({
             modelSelectorProviders={effectiveModelSelectorProviders}
             openSelector={openSelector}
             displayThinking={thinking ? displayThinking : null}
-            handleSheetModelSelect={handleSheetModelSelect}
+            handleSheetModelSelect={handleModelSelect}
             handleSheetOpenChange={setOpenSelector}
             modeControl={modeControl}
             glyphs={layoutContextValue.glyphs}
@@ -1044,7 +1016,12 @@ export const AgentControls = memo(function AgentControls({
 
   const handleSelectModel = useCallback(
     async (modelId: string) => {
-      if (!client || !agentProvider) {
+      const provider = selectAgentControlsSlice(
+        useSessionStore.getState(),
+        serverId,
+        agentId,
+      )?.provider;
+      if (!client || !provider) {
         return;
       }
       try {
@@ -1052,7 +1029,7 @@ export const AgentControls = memo(function AgentControls({
         await updatePreferences((current) =>
           mergeProviderPreferences({
             preferences: current,
-            provider: agentProvider,
+            provider,
             updates: { model: modelId },
           }),
         );
@@ -1061,40 +1038,35 @@ export const AgentControls = memo(function AgentControls({
         toast.error(toErrorMessage(error));
       }
     },
-    [agentId, agentProvider, client, toast, updatePreferences],
+    [agentId, client, serverId, toast, updatePreferences],
   );
-  const handleSelectProviderAndModel = useCallback(
-    (nextProvider: string, modelId: string) => {
-      void routeAgentModelSelection({
-        currentProvider: agentProvider,
-        nextProvider,
-        modelId,
-        selectSameProviderModel: handleSelectModel,
-        handoffToProvider,
-        persistCrossProviderModelPreference: async (provider, selectedModel) => {
-          await updatePreferences((current) =>
-            mergeProviderPreferences({
-              preferences: current,
-              provider,
-              updates: { model: selectedModel || undefined },
-            }),
-          );
-        },
-      }).catch((error) => {
-        console.warn("[AgentControls] persist cross-provider model preference failed", error);
-      });
-    },
-    [agentProvider, handleSelectModel, handoffToProvider, updatePreferences],
-  );
-  const handleSelectCommandCenterModel = useCallback(
-    (provider: AgentProvider, modelId: string) => {
-      if (handoff.canSwitchProvider) {
-        return handleSelectProviderAndModel(provider, modelId);
-      }
-      return handleSelectModel(modelId);
-    },
-    [handleSelectModel, handleSelectProviderAndModel, handoff.canSwitchProvider],
-  );
+  const handleSelectProviderAndModel = useStableEvent((nextProvider: string, modelId: string) => {
+    const currentProvider = selectAgentControlsSlice(
+      useSessionStore.getState(),
+      serverId,
+      agentId,
+    )?.provider;
+    return routeAgentModelSelection({
+      currentProvider,
+      nextProvider,
+      modelId,
+      selectSameProviderModel: handleSelectModel,
+      handoffToProvider: handoff.canSwitchProvider ? handoffToProvider : undefined,
+      persistCrossProviderModelPreference: handoff.supportsSeamlessContextSwitch
+        ? undefined
+        : async (provider, selectedModel) => {
+            await updatePreferences((current) =>
+              mergeProviderPreferences({
+                preferences: current,
+                provider,
+                updates: { model: selectedModel || undefined },
+              }),
+            );
+          },
+    }).catch((error) => {
+      console.warn("[AgentControls] persist cross-provider model preference failed", error);
+    });
+  });
 
   const profileProviders = useMemo(
     () =>
@@ -1117,6 +1089,7 @@ export const AgentControls = memo(function AgentControls({
         modeId: profile.modeId || null,
         thinkingOptionId: profile.thinkingOptionId || null,
         providerOptions: profile.options,
+        kind: "profile",
       }),
     [handoffToProvider],
   );
@@ -1127,11 +1100,13 @@ export const AgentControls = memo(function AgentControls({
       availableModeIds: profileModeIds,
       currentProvider: agentProvider,
       onSwitchProvider: handoff.canSwitchProvider ? handleSwitchProviderProfile : undefined,
+      switchesProviderInPlace: handoff.supportsSeamlessContextSwitch,
     }),
     [
       agentId,
       agentProvider,
       handoff.canSwitchProvider,
+      handoff.supportsSeamlessContextSwitch,
       handleSwitchProviderProfile,
       profileModeIds,
     ],
@@ -1233,7 +1208,7 @@ export const AgentControls = memo(function AgentControls({
         providers: agentModelSelectorProviders,
         selectedProvider: agentProvider,
         selectedModelId: activeModelId,
-        select: handleSelectCommandCenterModel,
+        select: handleSelectProviderAndModel,
       },
       thinking: {
         options: modelSelection.thinkingOptions,
@@ -1251,7 +1226,7 @@ export const AgentControls = memo(function AgentControls({
       agentModelSelectorProviders,
       agentProvider,
       commandCenterModes,
-      handleSelectCommandCenterModel,
+      handleSelectProviderAndModel,
       handleSelectThinkingOption,
       modeProviderDefinitions,
       modelSelection.selectedThinkingId,

@@ -956,6 +956,275 @@ test("refreshing an agent replaces the injected timeline store instead of append
   }
 });
 
+test("context compaction completes once and the persisted summary survives another switch", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-context-compaction-"));
+  const dir = join(cwd, "agents");
+  const store = new AgentStorage(dir, logger);
+  const summary = deferred<AgentRunResult>();
+  const summarySession = new TestAgentSession({ provider: "codex", cwd });
+  const runSummary = vi.spyOn(summarySession, "run").mockReturnValue(summary.promise);
+  const closeSummary = vi.spyOn(summarySession, "close");
+  const client = new TestAgentClient();
+  const create = client.createSession.bind(client);
+  const open = vi
+    .spyOn(client, "createSession")
+    .mockImplementation(async (config) => (config.internal ? summarySession : create(config)));
+  const manager = new AgentManager({ clients: { codex: client }, logger, registry: store });
+  const events: AgentManagerEvent[] = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event));
+  let restarted: AgentManager | undefined;
+  const agent = await manager.createAgent({ cwd, provider: "codex" }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    for (const text of ["Earlier requirement", "Latest requirement"]) {
+      await manager.appendTimelineItem(agent.id, { type: "user_message", text });
+      await manager.appendTimelineItem(agent.id, {
+        type: "assistant_message",
+        text: text.repeat(1250),
+      });
+    }
+    const head = manager.getLoadedTimelineHead(agent.id);
+    const first = await manager.switchAgentProvider(agent.id, {
+      provider: "codex",
+      model: "gpt-5.4-mini",
+    });
+    expect(first.agent.id).toBe(agent.id);
+    expect(manager.getTimeline(agent.id).at(-1)).toEqual({
+      type: "compaction",
+      trigger: "auto",
+      status: "loading",
+    });
+    expect(
+      events.some(
+        (event) =>
+          event.type === "agent_stream" &&
+          event.event.type === "timeline" &&
+          event.event.item.type === "compaction" &&
+          event.event.item.status === "loading",
+      ),
+    ).toBe(true);
+    expect(runSummary).toHaveBeenCalledTimes(1);
+    summary.resolve({
+      sessionId: summarySession.id,
+      finalText: "Retain the earlier requirement",
+      timeline: [],
+    });
+    await manager.flush();
+    expect(closeSummary).toHaveBeenCalledOnce();
+    expect(manager.getTimeline(agent.id).at(-1)).toEqual({
+      type: "compaction",
+      trigger: "auto",
+      status: "completed",
+    });
+    const completedHead = manager.getLoadedTimelineHead(agent.id);
+    expect(completedHead?.epoch).not.toBe(head?.epoch);
+    expect(events).toContainEqual({
+      type: "timeline_replacement",
+      agentId: agent.id,
+      epoch: completedHead?.epoch,
+    });
+    await manager.closeAgent(agent.id);
+    const restartedStorage = new AgentStorage(dir, logger);
+    restarted = new AgentManager({
+      clients: { codex: client },
+      logger,
+      registry: restartedStorage,
+    });
+    const { agent: switched } = await restarted.switchAgentProvider(agent.id, {
+      provider: "codex",
+      model: "gpt-5.2-codex",
+    });
+    expect(open.mock.calls.filter(([config]) => config.internal)).toHaveLength(1);
+    expect(
+      restarted.getTimeline(agent.id).filter((item) => item.type === "compaction"),
+    ).toHaveLength(1);
+    expect(await restartedStorage.timelinePrefixes.load(agent.id)).toMatchObject({
+      pendingContextHandoff: { olderSummary: "Retain the earlier requirement" },
+    });
+    const start = vi.spyOn(switched.session!, "startTurn");
+    start.mockRejectedValueOnce(new Error("Start rejected"));
+    await expect(
+      drainAsyncGenerator(
+        restarted.streamAgent(agent.id, "Try once", { clientMessageId: "rejected" }),
+      ),
+    ).rejects.toThrow("Start rejected");
+    expect(await restartedStorage.timelinePrefixes.load(agent.id)).toMatchObject({
+      pendingContextHandoff: { olderSummary: "Retain the earlier requirement" },
+    });
+    await drainAsyncGenerator(
+      restarted.streamAgent(agent.id, "Retry", { clientMessageId: "accepted" }),
+    );
+    expect(start).toHaveBeenLastCalledWith(
+      expect.stringContaining("Retain the earlier requirement"),
+      expect.anything(),
+    );
+    expect(await restartedStorage.timelinePrefixes.load(agent.id)).toMatchObject({
+      pendingContextHandoff: null,
+    });
+    await drainAsyncGenerator(
+      restarted.streamAgent(agent.id, "Second turn", { clientMessageId: "second" }),
+    );
+    expect(start).toHaveBeenLastCalledWith("Second turn", expect.anything());
+  } finally {
+    unsubscribe();
+    await manager.closeAgent(agent.id);
+    await restarted?.closeAgent(agent.id);
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("repeated switches keep prior tool rows with reused IDs, including after restart", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-switch-reused-id-"));
+  const dir = join(cwd, "agents");
+  const storage = new AgentStorage(dir, logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, logger, registry: storage });
+  const restarted = new AgentManager({
+    clients: { codex: client },
+    logger,
+    registry: new AgentStorage(dir, logger),
+  });
+  const { id } = await manager.createAgent({ cwd, provider: "codex" }, undefined, {
+    workspaceId: "workspace",
+  });
+  try {
+    const tool = {
+      type: "tool_call",
+      callId: "session-local-id",
+      name: "read",
+      status: "completed",
+      error: null,
+      detail: { type: "unknown", input: null, output: null },
+    } as const;
+    await manager.appendTimelineItem(id, { ...tool, name: "first provider call" });
+    await manager.switchAgentProvider(id, { provider: "codex", model: "gpt-5.4-mini" });
+    await manager.appendTimelineItem(id, { ...tool, name: "second provider call" });
+    const rows = manager.fetchTimeline(id, { limit: 0 }).rows;
+    expect(rows.map(({ item }) => item)).toEqual([
+      { ...tool, name: "first provider call" },
+      { ...tool, callId: "paseo-context:session-local-id", name: "second provider call" },
+    ]);
+    await manager.switchAgentProvider(id, { provider: "codex", model: "gpt-5.2-codex" });
+    expect(manager.fetchTimeline(id, { limit: 0 }).rows).toEqual(rows);
+    expect((await storage.timelinePrefixes.load(id))?.rows).toEqual(rows);
+    await manager.closeAgent(id);
+    await ensureAgentLoaded(id, {
+      agentManager: restarted,
+      agentStorage: new AgentStorage(dir, logger),
+      logger,
+      purpose: "history",
+    });
+    expect(restarted.fetchTimeline(id, { limit: 0 }).rows).toEqual(rows);
+  } finally {
+    await manager.closeAgent(id);
+    await restarted.closeAgent(id);
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a superseding switch cancels its predecessor and a foreground send waits for the new summary", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-context-superseded-"));
+  const prior = new TestAgentSession({ provider: "codex", cwd });
+  const latest = new TestAgentSession({ provider: "codex", cwd });
+  const result = deferred<AgentRunResult>();
+  const priorClosed = vi.spyOn(prior, "close");
+  vi.spyOn(prior, "run").mockReturnValue(new Promise<AgentRunResult>(() => {}));
+  vi.spyOn(latest, "run").mockReturnValue(result.promise);
+  const client = new TestAgentClient();
+  const create = client.createSession.bind(client);
+  const summaries = [prior, latest];
+  const opening = vi.spyOn(client, "createSession").mockImplementation(async (config) => {
+    return config.internal ? summaries.shift()! : create(config);
+  });
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const { id } = await manager.createAgent({ cwd, provider: "codex" }, undefined, {});
+  const summaryResult = {
+    sessionId: latest.id,
+    finalText: "Keep the original constraint",
+    timeline: [],
+  };
+  try {
+    await manager.appendTimelineItem(id, { type: "user_message", text: "Earlier constraint" });
+    await manager.switchAgentProvider(id, { provider: "codex", model: "gpt-5.4-mini" });
+    expect(opening.mock.calls.filter(([config]) => config.internal)).toHaveLength(0);
+    await manager.appendTimelineItem(id, { type: "user_message", text: "Latest question" });
+    await manager.appendTimelineItem(id, { type: "assistant_message", text: "x".repeat(36_000) });
+    await manager.switchAgentProvider(id, { provider: "codex", model: "gpt-5.2-codex" });
+    const { agent } = await manager.switchAgentProvider(id, {
+      provider: "codex",
+      model: "gpt-5.4",
+    });
+    await vi.waitFor(() => expect(priorClosed).toHaveBeenCalledOnce());
+    expect(opening).toHaveBeenCalledWith(
+      expect.objectContaining({ internal: true, mcpServers: {} }),
+      { mcpServers: {} },
+      { persistSession: false },
+    );
+    expect(manager.getTimeline(id).filter((item) => item.type === "compaction")).toEqual([
+      { type: "compaction", status: "loading", trigger: "auto" },
+    ]);
+    const start = vi.spyOn(agent.session!, "startTurn");
+    const send = drainAsyncGenerator(
+      manager.streamAgent(id, "Foreground question", { clientMessageId: "foreground" }),
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(start).not.toHaveBeenCalled();
+    result.resolve(summaryResult);
+    await send;
+    expect(start).toHaveBeenCalledOnce();
+    expect(start).toHaveBeenCalledWith(
+      expect.stringContaining(summaryResult.finalText),
+      expect.anything(),
+    );
+    expect(manager.getTimeline(id).filter((item) => item.type === "compaction")).toEqual([
+      { type: "compaction", status: "completed", trigger: "auto" },
+    ]);
+  } finally {
+    result.resolve(summaryResult);
+    manager.prepareForShutdown();
+    await manager.closeAgent(id);
+    await manager.flush();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a failed switch preserves the original session and pending sidecar", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-failed-switch-"));
+  const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, logger, registry: storage });
+  const { id } = await manager.createAgent({ cwd, provider: "codex" }, undefined, {
+    workspaceId: "workspace",
+  });
+  try {
+    await manager.appendTimelineItem(id, { type: "user_message", text: "Keep this message" });
+    const switched = await manager.switchAgentProvider(id, {
+      provider: "codex",
+      model: "gpt-5.4-mini",
+    });
+    const rows = manager.fetchTimeline(id, { limit: 0 });
+    const prefix = await storage.timelinePrefixes.load(id);
+    const record = await storage.get(id);
+    vi.spyOn(client, "createSession").mockRejectedValueOnce(new Error("Model unavailable"));
+    const switchAgain = () =>
+      manager.switchAgentProvider(id, { provider: "codex", model: "gpt-5.2-codex" });
+    await expect(switchAgain()).rejects.toThrow("Model unavailable");
+    vi.spyOn(switched.agent.session!, "close").mockRejectedValueOnce(new Error("Close failed"));
+    await expect(switchAgain()).rejects.toThrow("Close failed");
+    expect(manager.getAgent(id)?.session).toBe(switched.agent.session);
+    expect(manager.fetchTimeline(id, { limit: 0 })).toEqual(rows);
+    expect(await storage.timelinePrefixes.load(id)).toEqual(prefix);
+    expect(await storage.get(id)).toEqual(record);
+    const run = manager.streamAgent(id, "Still works", { clientMessageId: "retry-after-switch" });
+    await expect(switchAgain()).rejects.toThrow("must be idle");
+    await drainAsyncGenerator(run);
+  } finally {
+    await manager.closeAgent(id);
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("a failed history replay leaves the committed timeline intact", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-timeline-replay-fail-"));
   const store = new RecordingTimelineStore();
@@ -9628,6 +9897,7 @@ test("onAgentAttention is not called for internal agents", async () => {
 });
 
 test("onAgentAttention is not called for delegated child agents", async () => {
+  const parentAgentId = "00000000-0000-4000-8000-000000000111";
   const childAgentId = "00000000-0000-4000-8000-000000000112";
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");
@@ -9645,6 +9915,9 @@ test("onAgentAttention is not called for delegated child agents", async () => {
     },
   });
 
+  await manager.createAgent({ provider: "codex", cwd: workdir }, parentAgentId, {
+    workspaceId: undefined,
+  });
   const agent = await manager.createAgent(
     {
       provider: "codex",
@@ -9652,7 +9925,7 @@ test("onAgentAttention is not called for delegated child agents", async () => {
       title: "Delegated Child Agent",
     },
     undefined,
-    { labels: { [PARENT_AGENT_ID_LABEL]: "parent-agent" }, workspaceId: undefined },
+    { labels: { [PARENT_AGENT_ID_LABEL]: parentAgentId }, workspaceId: undefined },
   );
 
   await manager.runAgent(agent.id, "hello");
@@ -10219,6 +10492,9 @@ test("unarchiveSnapshot unarchives native provider storage before clearing archi
     registry: storage,
     logger,
   });
+  const parent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
 
   const agent = await manager.createAgent(
     {
@@ -10229,7 +10505,7 @@ test("unarchiveSnapshot unarchives native provider storage before clearing archi
     undefined,
     {
       workspaceId: undefined,
-      labels: { [PARENT_AGENT_ID_LABEL]: "archived-parent", retained: "yes" },
+      labels: { [PARENT_AGENT_ID_LABEL]: parent.id, retained: "yes" },
     },
   );
   await manager.archiveAgent(agent.id);

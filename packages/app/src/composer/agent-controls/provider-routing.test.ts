@@ -178,6 +178,20 @@ describe("routeAgentModelSelection", () => {
     expect(actions.selectSameProviderModel).not.toHaveBeenCalled();
   });
 
+  it("ignores a stale Command Center selection for another provider when switching is unavailable", async () => {
+    const { selectSameProviderModel, persistCrossProviderModelPreference } =
+      modelSelectionActions();
+    await routeAgentModelSelection({
+      currentProvider: "codex",
+      nextProvider: "claude",
+      modelId: "sonnet",
+      selectSameProviderModel,
+      persistCrossProviderModelPreference,
+    });
+    expect(selectSameProviderModel).not.toHaveBeenCalled();
+    expect(persistCrossProviderModelPreference).not.toHaveBeenCalled();
+  });
+
   it("ignores selections until the current agent provider is known", async () => {
     const actions = modelSelectionActions();
     await routeAgentModelSelection({

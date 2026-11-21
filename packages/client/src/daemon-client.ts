@@ -67,6 +67,8 @@ import type {
   FileWriteResult,
   FetchAgentTimelineResponseMessage,
   AgentForkContextResponseMessage,
+  AgentForkSource,
+  AgentProviderSwitchRequestMessage,
   GitSetupOptions,
   CheckoutStatusResponse,
   CheckoutCommit,
@@ -513,6 +515,7 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
   env?: CreateAgentRequestMessage["env"];
   workspaceId?: string;
   callerAgentId?: string;
+  forkFrom?: AgentForkSource;
   initialPrompt?: string;
   initialPromptOrigin?: CreateAgentRequestMessage["initialPromptOrigin"];
   idempotencyKey?: string;
@@ -535,6 +538,16 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
 }
 
 export type CreateWorkspaceAgentConfig = AgentSessionConfig;
+
+export type SwitchAgentProviderInput = Omit<
+  AgentProviderSwitchRequestMessage,
+  "type" | "agentId" | "requestId"
+>;
+
+export interface SwitchAgentProviderResult {
+  agent: AgentSnapshotPayload;
+  notice: AgentProviderNotice | null;
+}
 
 export interface CreateWorkspaceRequestOptions {
   source: WorkspaceCreateRequest["source"];
@@ -3622,6 +3635,7 @@ export class DaemonClient {
       ...(options.env ? { env: options.env } : {}),
       ...(options.workspaceId !== undefined ? { workspaceId: options.workspaceId } : {}),
       ...(options.callerAgentId !== undefined ? { callerAgentId: options.callerAgentId } : {}),
+      forkFrom: options.forkFrom,
       ...(options.initialPrompt ? { initialPrompt: options.initialPrompt } : {}),
       ...(options.initialPromptOrigin !== undefined
         ? { initialPromptOrigin: options.initialPromptOrigin }
@@ -4762,6 +4776,26 @@ export class DaemonClient {
       throw new Error(payload.error ?? "applyAgentConfig rejected");
     }
     return payload.notice ?? null;
+  }
+
+  /** Requires a host advertising `server_info.features.agentSeamlessContextSwitch`. */
+  async switchAgentProvider(
+    agentId: string,
+    input: SwitchAgentProviderInput,
+  ): Promise<SwitchAgentProviderResult> {
+    const message = {
+      ...input,
+      type: "agent.provider.switch.request",
+      agentId,
+    } satisfies Omit<AgentProviderSwitchRequestMessage, "requestId">;
+    const payload = await this.sendCorrelatedSessionRequest({
+      message,
+      responseType: "agent.provider.switch.response",
+    });
+    if (!payload.accepted || !payload.agent) {
+      throw new Error(payload.error || "Failed to switch agent provider");
+    }
+    return { agent: payload.agent, notice: payload.notice ?? null };
   }
 
   async restartServer(
@@ -8453,6 +8487,7 @@ function resolveAgentConfig(options: CreateAgentRequestOptions): AgentSessionCon
     idempotencyKey: _idempotencyKey,
     clientMessageId: _clientMessageId,
     callerAgentId: _callerAgentId,
+    forkFrom: _forkFrom,
     outputSchema: _outputSchema,
     attachments: _attachments,
     worktree: _worktree,

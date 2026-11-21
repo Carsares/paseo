@@ -4,6 +4,7 @@ import { createInstance } from "i18next";
 import { createElement, createRef } from "react";
 import { I18nextProvider } from "react-i18next";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import type { AgentForkSource, AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import {
   getOpenAgentTabLabel,
   WORKSPACE_MAIN_ROLE,
@@ -77,6 +78,34 @@ const baseComposerState = {
   effectiveModelId: "",
   availableModels: [],
 };
+
+function mockWorkspaceDraftInput() {
+  vi.mocked(useAgentInputDraft).mockReturnValue({
+    isHydrated: true,
+    textSource: {
+      getSnapshot: () => "Continue here",
+      peekPendingText: () => null,
+      cancelPendingText: () => {},
+      subscribe: () => () => {},
+    },
+    textReplacement: { kind: "hydrated", key: "handoff", text: "Continue here" },
+    editText: vi.fn(),
+    replaceText: vi.fn(),
+    attachments: [],
+    setAttachments: vi.fn(),
+    clear: vi.fn(),
+    attachmentFocusRequestId: 0,
+    composerState: {
+      ...baseComposerState,
+      workingDir: "/tmp/project",
+      effectiveModeId: "",
+      effectiveThinkingOptionId: "",
+      metadata: {},
+      agentControls: {},
+      persistFormPreferences: async () => {},
+    } as unknown as NonNullable<AgentInputDraft["composerState"]>,
+  });
+}
 
 function validate(overrides = {}) {
   return validateDraftSubmission({
@@ -160,31 +189,7 @@ describe("workspace draft empty text readiness", () => {
         .fn<DaemonClient["createAgent"]>()
         .mockRejectedValue(new Error("Retry"));
       vi.mocked(useHostRuntimeClient).mockReturnValue({ createAgent } as unknown as DaemonClient);
-      vi.mocked(useAgentInputDraft).mockReturnValue({
-        isHydrated: true,
-        textSource: {
-          getSnapshot: () => "Continue here",
-          peekPendingText: () => null,
-          cancelPendingText: () => {},
-          subscribe: () => () => {},
-        },
-        textReplacement: { kind: "hydrated", key: "handoff", text: "Continue here" },
-        editText: vi.fn(),
-        replaceText: vi.fn(),
-        attachments: [],
-        setAttachments: vi.fn(),
-        clear: vi.fn(),
-        attachmentFocusRequestId: 0,
-        composerState: {
-          ...baseComposerState,
-          workingDir: "/tmp/project",
-          effectiveModeId: "",
-          effectiveThinkingOptionId: "",
-          metadata: {},
-          agentControls: {},
-          persistFormPreferences: async () => {},
-        } as unknown as NonNullable<AgentInputDraft["composerState"]>,
-      });
+      mockWorkspaceDraftInput();
       const storedAttachments = useWorkspaceAttachmentsStore.getState();
       useWorkspaceAttachmentsStore.setState({
         draftHistoryHydrated: false,
@@ -268,6 +273,76 @@ describe("workspace draft empty text readiness", () => {
       }
     },
   );
+
+  test("retries an empty workspace fork before attachment storage finishes loading", async () => {
+    const draftId = "workspace-fork-retry";
+    const forkFrom = { sourceAgentId: "source-1", boundaryMessageId: "turn-7" };
+    const setup = {
+      provider: "codewhale",
+      cwd: "/tmp/project",
+      modeId: null,
+      model: null,
+      thinkingOptionId: null,
+      providerOptions: {},
+      parentAgentId: "main-1",
+      forkFrom,
+    };
+    const created = { id: "forked-agent", workspaceId: "workspace-1" } as AgentSnapshotPayload;
+    const createAgent = vi.fn<DaemonClient["createAgent"]>().mockResolvedValue(created);
+    const onCreated = vi.fn();
+    const host = useSessionStore.getState();
+    host.initializeSession("host-1", { createAgent } as unknown as DaemonClient);
+    vi.mocked(useHostRuntimeClient).mockReturnValue({ createAgent } as unknown as DaemonClient);
+    mockWorkspaceDraftInput();
+    const storedAttachments = useWorkspaceAttachmentsStore.getState();
+    useWorkspaceAttachmentsStore.setState({ draftHistoryHydrated: false, attachmentsByScope: {} });
+    const view = render(
+      createElement(WorkspaceDraftComposer, {
+        serverId: "host-1",
+        workspaceId: "workspace-1",
+        tabId: "retry-tab",
+        draftId,
+        isPaneFocused: false,
+        editingSession: new ComposerEditingSession(),
+        initialSetup: setup,
+        onCreated,
+      }),
+    );
+    try {
+      const props = vi.mocked(Composer).mock.lastCall?.[0];
+      if (!props?.onSubmitMessage) throw new Error("Expected the composer submit handler");
+      expect(props.isSubmitLoading).toBe(false);
+      expect(props.allowEmptySubmit).toBe(true);
+      await act(async () => {
+        await props.onSubmitMessage?.({ text: "", cwd: setup.cwd, attachments: [] });
+      });
+      expect(createAgent).toHaveBeenCalledExactlyOnceWith({
+        config: { provider: "codewhale", cwd: setup.cwd },
+        workspaceId: "workspace-1",
+        initialPrompt: "",
+        callerAgentId: "main-1",
+        initialPromptOrigin: "user",
+        clientMessageId: expect.any(String),
+        idempotencyKey: expect.any(String),
+        forkFrom,
+      });
+      expect(onCreated).toHaveBeenCalledExactlyOnceWith(created);
+      expect(
+        useSessionStore.getState().sessions["host-1"]?.agentStreamTail.get(created.id),
+      ).toBeUndefined();
+      expect(useCreateFlowStore.getState().pendingByDraftId[draftId]).toMatchObject({
+        agentId: created.id,
+        lifecycle: "sent",
+      });
+    } finally {
+      view.unmount();
+      host.clearSession("host-1");
+      useCreateFlowStore.getState().clear({ draftId });
+      useWorkspaceAttachmentsStore.setState(storedAttachments);
+      vi.mocked(useHostRuntimeClient).mockReset();
+      vi.mocked(useAgentInputDraft).mockReset();
+    }
+  });
 
   test("text and model readiness can precede restored draft history", async () => {
     const storedHistory = Promise.withResolvers<string>();
@@ -442,7 +517,7 @@ describe("workspace subagent draft", () => {
     },
   );
 
-  test("varies idempotencyKey when callerAgentId changes and trims blank parent ids", async () => {
+  test("keys draft retries by parent and fork boundary while trimming blank parent ids", async () => {
     const result = {
       id: "created-agent",
       provider: "codewhale",
@@ -468,10 +543,16 @@ describe("workspace subagent draft", () => {
       labels: {},
     };
     const createAgent = vi.fn<DaemonClient["createAgent"]>().mockResolvedValue(result);
-    const submit = (parentAgentId: string | null, supportsOrigin = true, fromHandoff = true) =>
+    const submit = (
+      parentAgentId: string | null,
+      supportsOrigin = true,
+      fromHandoff = true,
+      forkFrom?: AgentForkSource,
+    ) =>
       submitDraftCreateRequest({
         draftId: "draft-1",
         parentAgentId,
+        forkFrom,
         attempt: { clientMessageId: "message-1" },
         text: "Investigate this",
         cwd: "/tmp/project",
@@ -499,7 +580,12 @@ describe("workspace subagent draft", () => {
     await expect(submit("parent-agent", false)).rejects.toThrow("update the host");
     await submit("   ", false);
     await submit("parent-1", false, false);
-    expect(createAgent).toHaveBeenCalledTimes(4);
+    const firstSource = { sourceAgentId: "source-1", boundaryMessageId: "turn-1" };
+    const secondSource = { ...firstSource, boundaryMessageId: "turn-2" };
+    await submit(null, true, false, firstSource);
+    await submit(null, true, false, secondSource);
+    await submit(null, true, false, secondSource);
+    expect(createAgent).toHaveBeenCalledTimes(7);
 
     const first = createAgent.mock.calls[0]?.[0];
     const second = createAgent.mock.calls[1]?.[0];
@@ -509,6 +595,13 @@ describe("workspace subagent draft", () => {
     expect(third).not.toHaveProperty("callerAgentId");
     expect(first?.idempotencyKey).not.toBe(second?.idempotencyKey);
     expect(first?.idempotencyKey).not.toBe(third?.idempotencyKey);
+    const firstFork = createAgent.mock.calls[4]?.[0];
+    const secondFork = createAgent.mock.calls[5]?.[0];
+    const retry = createAgent.mock.calls[6]?.[0];
+    expect(firstFork?.forkFrom).toEqual(firstSource);
+    expect(secondFork?.forkFrom).toEqual(secondSource);
+    expect(firstFork?.idempotencyKey).not.toBe(secondFork?.idempotencyKey);
+    expect(retry).toEqual(secondFork);
   });
 
   test("resets read-only mode and Main Control restrictions when spawning from Main Control", () => {

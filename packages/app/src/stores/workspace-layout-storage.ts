@@ -1,3 +1,4 @@
+import { AgentForkSourceSchema } from "@getpaseo/protocol/messages";
 import { z } from "zod";
 import type { SplitNode, WorkspaceLayout } from "./workspace-layout-actions";
 
@@ -11,18 +12,21 @@ function renameLegacyFeatureValues(value: unknown): unknown {
 
 const WorkspaceDraftTabSetupStorageSchema = z.preprocess(
   renameLegacyFeatureValues,
-  z.strictObject({
-    provider: z.string(),
-    cwd: z.string(),
-    modeId: z.string().nullable(),
-    model: z.string().nullable(),
-    thinkingOptionId: z.string().nullable(),
-    providerOptions: z.record(z.string(), z.json()),
-    parentAgentId: z.string().nullish(),
-    initialDraftText: z.string().nullish(),
-    // Configured drafts saved before this flag may have a separate history attachment.
-    restoreChatHistory: z.boolean().default(true),
-  }),
+  z
+    .strictObject({
+      provider: z.string(),
+      cwd: z.string(),
+      modeId: z.string().nullable(),
+      model: z.string().nullable(),
+      thinkingOptionId: z.string().nullable(),
+      providerOptions: z.record(z.string(), z.json()),
+      parentAgentId: z.string().nullish(),
+      initialDraftText: z.string().nullish(),
+      forkFrom: AgentForkSourceSchema.optional(),
+      // Configured drafts saved before this flag may have a separate history attachment.
+      restoreChatHistory: z.boolean().default(true),
+    })
+    .transform((setup) => (setup.forkFrom ? { ...setup, restoreChatHistory: false } : setup)),
 );
 const WorkspaceTabTargetStorageSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("new_tab") }),

@@ -1,3 +1,4 @@
+import { AgentForkSourceSchema, type AgentForkSource } from "@getpaseo/protocol/messages";
 import { normalizeWorkspaceFileLocation, workspaceFileLocationsEqual } from "@/workspace/file-open";
 import type { WorkspaceDraftTabSetup, WorkspaceTabTarget } from "@/workspace-tabs/model";
 
@@ -92,6 +93,7 @@ export function normalizeWorkspaceDraftTabSetup(
     typeof record.initialDraftText === "string" && record.initialDraftText.trim()
       ? record.initialDraftText
       : null;
+  const forkFrom = AgentForkSourceSchema.safeParse(record.forkFrom).data;
   return {
     provider,
     cwd,
@@ -103,7 +105,9 @@ export function normalizeWorkspaceDraftTabSetup(
     providerOptions: isPlainRecord(record.providerOptions) ? { ...record.providerOptions } : {},
     ...(parentAgentId ? { parentAgentId } : {}),
     ...(initialDraftText ? { initialDraftText } : {}),
-    restoreChatHistory: record.restoreChatHistory === true,
+    ...(forkFrom
+      ? { forkFrom, restoreChatHistory: false }
+      : { restoreChatHistory: record.restoreChatHistory === true }),
   };
 }
 
@@ -185,7 +189,17 @@ function workspaceDraftTabSetupsEqual(
     (left.parentAgentId ?? null) === (right.parentAgentId ?? null) &&
     (left.initialDraftText ?? null) === (right.initialDraftText ?? null) &&
     (left.restoreChatHistory ?? false) === (right.restoreChatHistory ?? false) &&
+    forkSourcesEqual(left.forkFrom, right.forkFrom) &&
     recordsShallowEqual(left.providerOptions, right.providerOptions)
+  );
+}
+
+function forkSourcesEqual(left: AgentForkSource | undefined, right: AgentForkSource | undefined) {
+  return (
+    left?.sourceAgentId === right?.sourceAgentId &&
+    left?.boundaryMessageId === right?.boundaryMessageId &&
+    left?.boundaryCursor?.epoch === right?.boundaryCursor?.epoch &&
+    left?.boundaryCursor?.seq === right?.boundaryCursor?.seq
   );
 }
 

@@ -300,18 +300,29 @@ export class TimelineProjection {
   private readonly rows: ProjectedTimelineRow[] = [];
   private readonly identities = new Map<string, number>();
   private lastAssistantRowIndex: number | null = null;
+  private mergeFromIndex = 0;
   // Disjoint source-coverage spans in display order. A tail starting inside a
   // span must include its first anchor to cover interleaved lifecycle updates.
   private readonly spans: { start: number; endSeq: number }[] = [];
 
   private readonly sourceRanges: { startSeq: number; endSeq: number; rowIndex: number }[] = [];
 
-  constructor(rows: readonly AgentTimelineRow[] = []) {
-    for (const row of rows) this.appendProjected(row);
+  constructor(rows: readonly AgentTimelineRow[] = [], sealedThrough = 0) {
+    for (const row of rows) {
+      // A prefix already contains projected rows. Preserve the old provider's
+      // identities even when several previous sessions reused the same IDs.
+      this.appendProjected(row);
+      if (row.seq <= sealedThrough) this.seal();
+    }
     for (const [rowIndex, row] of this.rows.entries()) {
       for (const range of row.sourceSeqRanges) this.sourceRanges.push({ ...range, rowIndex });
     }
     this.sourceRanges.sort((a, b) => a.startSeq - b.startSeq);
+  }
+
+  seal(): void {
+    this.identities.clear();
+    this.mergeFromIndex = this.rows.length;
   }
 
   append(row: AgentTimelineRow): ProjectedTimelineRow {
@@ -336,7 +347,7 @@ export class TimelineProjection {
       this.extendSpan(index);
       return index;
     }
-    const previous = this.rows.at(-1);
+    const previous = this.rows.length > this.mergeFromIndex ? this.rows.at(-1) : undefined;
     const adjacent = previous
       ? mergeReasoningChunks(mergeAssistantChunks([previous, entry]))
       : [entry];

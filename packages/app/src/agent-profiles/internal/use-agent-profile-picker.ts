@@ -33,6 +33,7 @@ export type AgentProfileApplyTarget =
       availableModeIds: readonly string[] | null;
       currentProvider?: string;
       onSwitchProvider?: SwitchProvider;
+      switchesProviderInPlace?: boolean;
     }
   | { kind: "draft"; controls: DraftAgentProfileControls };
 
@@ -45,7 +46,12 @@ interface AgentProfileApplicationInput {
 type AgentProfileApplication =
   | { kind: "draft"; controls: DraftAgentProfileControls; profile: MaterializedAgentProfile }
   | { kind: "agent"; agentId: string; profile: MaterializedAgentProfile }
-  | { kind: "switch-provider"; switchProvider: SwitchProvider; profile: MaterializedAgentProfile };
+  | {
+      kind: "switch-provider";
+      switchProvider: SwitchProvider;
+      profile: MaterializedAgentProfile;
+      persistAfterSwitch: boolean;
+    };
 
 function resolveTargetProviderModeIds(
   entries: readonly ProviderSnapshotEntry[] | undefined,
@@ -82,12 +88,14 @@ export function resolveAgentProfileApplication({
     if (!target.onSwitchProvider) {
       return null;
     }
-    const targetModeIds = resolveTargetProviderModeIds(entries, resolved.provider);
-    const reconciled = reconcileMaterializedProfileMode(resolved, targetModeIds) ?? resolved;
+    const modeIds = target.switchesProviderInPlace
+      ? null
+      : resolveTargetProviderModeIds(entries, resolved.provider);
     return {
       kind: "switch-provider",
       switchProvider: target.onSwitchProvider,
-      profile: reconciled,
+      profile: reconcileMaterializedProfileMode(resolved, modeIds) ?? resolved,
+      persistAfterSwitch: !target.switchesProviderInPlace,
     };
   }
 
@@ -138,13 +146,17 @@ export function applyProfileToTarget({
 }
 
 async function applyProviderSwitch(
-  { switchProvider, profile }: Extract<AgentProfileApplication, { kind: "switch-provider" }>,
+  {
+    switchProvider,
+    profile,
+    persistAfterSwitch,
+  }: Extract<AgentProfileApplication, { kind: "switch-provider" }>,
   persistSelection: ApplyProfileToTargetInput["persistSelection"],
   toast: ToastApi,
 ): Promise<void> {
   try {
     const didSwitch = await switchProvider(profile);
-    if (didSwitch !== false) {
+    if (didSwitch !== false && persistAfterSwitch) {
       persistSelection(profile);
     }
   } catch (error) {
@@ -178,7 +190,7 @@ export interface UseAgentProfilePickerInput {
    * Providers this composer can actually run; pass a stable reference. A profile
    * naming anything else is hidden rather than shown as a row that cannot do
    * what it says. A live composer can offer another provider if it supports
-   * handing off to a new draft with that provider.
+   * switching the existing agent to that provider.
    */
   availableProviders: readonly string[];
   target: AgentProfileApplyTarget;

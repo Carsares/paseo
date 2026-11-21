@@ -31,6 +31,7 @@ import {
   getOpenAgentTabLabel,
   PARENT_AGENT_ID_LABEL,
   PARENT_SERVER_ID_LABEL,
+  WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
@@ -65,6 +66,12 @@ import {
   type AgentManagerEvent,
 } from "./agent/agent-manager.js";
 import { createAgentMessageDelivery } from "./agent/agent-messages/delivery.js";
+import { sendPromptToAgent, waitForAgentRunStartWithTimeout } from "./agent/agent-prompt.js";
+import type {
+  AgentPromptInput,
+  AgentStreamEvent,
+  AgentTimelineItem,
+} from "./agent/agent-sdk-types.js";
 import { parseAgentMessage } from "./agent/agent-messages/index.js";
 import { MessageReceipts } from "./message-receipts/index.js";
 import { REMOTE_HIERARCHY_DEPTH_LABEL } from "./agent/hierarchy-policy.js";
@@ -77,6 +84,7 @@ import {
 } from "./workspace-registry.js";
 import { deriveProjectKey } from "./project-key.js";
 import type { SessionOptions } from "./session.js";
+import { createStub } from "./test-utils/class-mocks.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "./messages.js";
 import {
   asSessionInternals as asSessionInternalsHelper,
@@ -421,6 +429,10 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
     agentMessages: createAgentMessageDeliveryStub(),
     ...options.messageDelivery,
     creationService: createTestCreationService(),
+    workspaceAutoName: createStub<SessionOptions["workspaceAutoName"]>({
+      scheduleForWorktree: vi.fn(),
+      scheduleForDirectory: vi.fn(),
+    }),
     clientId: options.clientId ?? "test-client",
     onMessage: (message) => messages.push(message),
     ...(options.targetedMessages
@@ -507,6 +519,362 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
   if (options.sendToSource) sessionOptions.onMessageToSource = options.sendToSource;
   return new Session(sessionOptions);
 }
+
+const CONTEXT_HANDOFF_ITEMS: AgentTimelineItem[] = [
+  { type: "user_message", text: "Original question", clientMessageId: "original" },
+  { type: "assistant_message", text: "Original answer", messageId: "checkpoint" },
+];
+
+test("provider switch rejects a session with read-only workspace permission", async () => {
+  const switchAgentProvider = vi.fn();
+  const messages: SessionOutboundMessage[] = [];
+  const session = createSessionForTest({
+    messages,
+    permissions: ["workspace.read"],
+    agentManager: { switchAgentProvider },
+  });
+  try {
+    await session.handleMessage({
+      type: "agent.provider.switch.request",
+      requestId: "unauthorized-switch",
+      agentId: "11111111-1111-4111-8111-111111111111",
+      provider: "claude",
+    });
+    expect(switchAgentProvider).not.toHaveBeenCalled();
+    expect(findByType(messages, "rpc_error")?.payload).toMatchObject({
+      requestId: "unauthorized-switch",
+      code: "access_denied",
+    });
+  } finally {
+    await session.cleanup();
+  }
+});
+
+test.each(["live", "closed", "archived"] as const)(
+  "provider switch keeps the %s agent and restores pending context after restart",
+  async (state) => {
+    const cwd = mkdtempSync(join(tmpdir(), "paseo-provider-switch-"));
+    const logger = pino({ level: "silent" });
+    const dir = join(cwd, "agents");
+    const storage = new AgentStorage(dir, logger);
+    const targetHistory: AgentStreamEvent[] = [];
+    const onStartTurn = vi.fn((prompt: AgentPromptInput) => {
+      if (typeof prompt === "string") {
+        targetHistory.push({
+          type: "timeline",
+          provider: "claude",
+          item: { type: "user_message", text: prompt },
+        });
+      }
+    });
+    const clients = {
+      codex: createTestAgentClient("codex", {
+        historyEvents: CONTEXT_HANDOFF_ITEMS.map((item) => ({
+          type: "timeline",
+          provider: "codex",
+          item,
+        })),
+      }),
+      claude: createTestAgentClient("claude", { onStartTurn, historyEvents: targetHistory }),
+    };
+    const manager = new AgentManager({ logger, clients, registry: storage });
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      agentManager: manager,
+      agentStorage: storage,
+    });
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd, title: "Original title" },
+      undefined,
+      {
+        workspaceId: "switch-workspace",
+        labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE, topic: "keep" },
+        metadata: { tag: "keep" },
+      },
+    );
+    const agentId = agent.id;
+    let restarted: AgentManager | undefined;
+    let replayed: AgentManager | undefined;
+    try {
+      for (const item of CONTEXT_HANDOFF_ITEMS) await manager.appendTimelineItem(agentId, item);
+      const original = manager.fetchTimeline(agentId, { limit: 0 });
+      if (state === "closed") await manager.closeAgent(agentId);
+      if (state === "archived") await manager.archiveAgent(agentId);
+      await session.handleMessage({
+        type: "agent.provider.switch.request",
+        provider: "claude",
+        model: "sonnet",
+        agentId,
+        requestId: "switch",
+      });
+      expect(findByType(messages, "agent.provider.switch.response")?.payload).toMatchObject({
+        requestId: "switch",
+        agentId,
+        accepted: true,
+        agent: {
+          id: agentId,
+          provider: "claude",
+          workspaceId: agent.workspaceId,
+          labels: agent.labels,
+          metadata: agent.metadata,
+          title: "Original title",
+        },
+        error: null,
+      });
+      expect(manager.getTimeline(agentId)).toEqual(CONTEXT_HANDOFF_ITEMS);
+      if (state !== "archived")
+        expect(manager.fetchTimeline(agentId, { limit: 0 })).toEqual(original);
+      expect(await storage.timelinePrefixes.load(agentId)).toMatchObject({
+        version: 1,
+        pendingContextHandoff: {},
+      });
+      await manager.closeAgent(agentId);
+
+      const afterRestart = new AgentStorage(dir, logger);
+      restarted = new AgentManager({ logger, clients, registry: afterRestart });
+      await sendPromptToAgent({
+        agentManager: restarted,
+        agentStorage: afterRestart,
+        agentId,
+        logger,
+        prompt: "New clean prompt",
+        messageId: "next-message",
+      });
+      await waitForAgentRunStartWithTimeout(restarted, agentId);
+      expect(onStartTurn).toHaveBeenCalledWith(
+        expect.stringContaining('<paseo-context-handoff version="1">'),
+        expect.anything(),
+      );
+      expect(onStartTurn.mock.calls[0]?.[0]).toContain("Original answer");
+      expect(
+        restarted
+          .getTimeline(agentId)
+          .filter((item) => item.type === "user_message")
+          .map((item) => item.text),
+      ).toEqual(["Original question", "New clean prompt"]);
+      expect(await afterRestart.timelinePrefixes.load(agentId)).toMatchObject({
+        pendingContextHandoff: null,
+      });
+      await restarted.closeAgent(agentId);
+
+      const afterSend = new AgentStorage(dir, logger);
+      replayed = new AgentManager({ logger, clients, registry: afterSend });
+      const replaySession = createSessionForTest({
+        messages,
+        agentManager: replayed,
+        agentStorage: afterSend,
+      });
+      try {
+        await replaySession.handleMessage({
+          type: "fetch_agent_timeline_request",
+          agentId,
+          requestId: "after-send",
+          limit: 0,
+        });
+        expect(
+          findByType(messages, "fetch_agent_timeline_response")
+            ?.payload.entries.filter((entry) => entry.item.type === "user_message")
+            .map((entry) => entry.item.text),
+        ).toEqual(["Original question", "New clean prompt"]);
+      } finally {
+        await replaySession.cleanup();
+      }
+    } finally {
+      await session.cleanup();
+      await manager.closeAgent(agentId);
+      await restarted?.closeAgent(agentId);
+      await replayed?.closeAgent(agentId);
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each([undefined, "Start at the checkpoint"])(
+  "fork creation inherits every selected row with initial prompt %s",
+  async (initialPrompt) => {
+    const cwd = mkdtempSync(join(tmpdir(), "paseo-fork-inheritance-"));
+    const logger = pino({ level: "silent" });
+    const storage = new AgentStorage(join(cwd, "agents"), logger);
+    const onStartTurn = vi.fn();
+    const manager = new AgentManager({
+      logger,
+      registry: storage,
+      clients: {
+        codex: createTestAgentClient("codex"),
+        claude: createTestAgentClient("claude", { onStartTurn }),
+      },
+    });
+    const workspaceId = "fork-workspace";
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      agentManager: manager,
+      agentStorage: storage,
+      workspaceRegistry: { get: vi.fn().mockResolvedValue({ id: workspaceId, cwd }) },
+    });
+    try {
+      const source = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+        workspaceId,
+      });
+      for (const item of CONTEXT_HANDOFF_ITEMS) await manager.appendTimelineItem(source.id, item);
+      await manager.appendTimelineItem(source.id, {
+        type: "user_message",
+        text: "After checkpoint",
+      });
+      const { epoch } = manager.fetchTimeline(source.id);
+      await session.handleMessage({
+        type: "create_agent_request",
+        requestId: "fork",
+        workspaceId,
+        config: { provider: "claude", cwd },
+        forkFrom: { sourceAgentId: source.id, boundaryCursor: { epoch, seq: 2 } },
+        initialPrompt,
+        clientMessageId: "fork-prompt",
+      });
+      const created = findByType(messages, "status")?.payload;
+      expect(created).toMatchObject({ status: "agent_created", agentId: expect.any(String) });
+      if (created?.status !== "agent_created") throw new Error("Expected fork creation");
+      await session.handleMessage({
+        type: "fetch_agent_timeline_request",
+        agentId: created.agentId,
+        requestId: "fork-timeline",
+        limit: 0,
+      });
+      const forkRows = findByType(messages, "fetch_agent_timeline_response")?.payload.entries.map(
+        (entry) => entry.item,
+      );
+      expect(forkRows?.slice(0, 2)).toEqual(CONTEXT_HANDOFF_ITEMS);
+      expect(
+        forkRows?.filter((item) => item.type === "user_message").map((item) => item.text),
+      ).toEqual(["Original question", ...(initialPrompt ? [initialPrompt] : [])]);
+      if (initialPrompt) {
+        expect(onStartTurn).toHaveBeenCalledWith(
+          expect.stringContaining('<paseo-context-handoff version="1">'),
+          expect.anything(),
+        );
+      } else {
+        expect(onStartTurn).not.toHaveBeenCalled();
+      }
+      expect(await storage.timelinePrefixes.load(created.agentId)).toMatchObject({
+        rows: CONTEXT_HANDOFF_ITEMS.map((item) => expect.objectContaining({ item })),
+        pendingContextHandoff: initialPrompt ? null : {},
+      });
+    } finally {
+      await session.cleanup();
+      for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test("agent and workspace creation inherit a closed fork source by message ID", async () => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "paseo-fork-create-")));
+  const logger = pino({ level: "silent" });
+  const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const registry = new FileBackedWorkspaceRegistry(join(cwd, "workspaces.json"), logger);
+  const at = new Date(0).toISOString();
+  const project = createPersistedProjectRecord({
+    projectId: "fork-project",
+    rootPath: cwd,
+    kind: "non_git",
+    displayName: "Fork project",
+    createdAt: at,
+    updatedAt: at,
+  });
+  const manager = new AgentManager({
+    logger,
+    registry: storage,
+    clients: {
+      codex: createTestAgentClient("codex", {
+        historyEvents: CONTEXT_HANDOFF_ITEMS.map((item) => ({
+          type: "timeline",
+          item,
+          provider: "codex",
+        })),
+      }),
+      claude: createTestAgentClient("claude"),
+    },
+  });
+  const messages: SessionOutboundMessage[] = [];
+  const session = createSessionForTest({
+    messages,
+    paseoHome: cwd,
+    agentManager: manager,
+    agentStorage: storage,
+    workspaceRegistry: {
+      get: vi.fn(registry.get.bind(registry)),
+      listActive: registry.listActive.bind(registry),
+      upsert: registry.upsert.bind(registry),
+    },
+    projectRegistry: { get: vi.fn().mockResolvedValue(project) },
+    workspaceGitService: {
+      getCheckout: vi.fn((directory) => ({
+        cwd: directory,
+        isGit: false,
+        currentBranch: null,
+        remoteUrl: null,
+        worktreeRoot: null,
+        isPaseoOwnedWorktree: false,
+        mainRepoRoot: null,
+      })),
+      getSnapshot: vi.fn().mockResolvedValue(undefined),
+    },
+  });
+  try {
+    const workspaceId = "fork-source-workspace";
+    await registry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId: project.projectId,
+        cwd,
+        kind: "directory",
+        displayName: "Fork source",
+        createdAt: at,
+        updatedAt: at,
+      }),
+    );
+    const source = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId,
+    });
+    for (const item of CONTEXT_HANDOFF_ITEMS) await manager.appendTimelineItem(source.id, item);
+    await manager.closeAgent(source.id);
+    const agent = {
+      config: { provider: "claude" as const, cwd },
+      forkFrom: { sourceAgentId: source.id, boundaryMessageId: "checkpoint" },
+      labels: {},
+      initialPrompt: "Continue here",
+      clientMessageId: "creation-fork-prompt",
+    };
+    await session.handleMessage({
+      ...agent,
+      workspaceId,
+      type: "agent.create.request",
+      requestId: "agent-fork",
+    });
+    await session.handleMessage({
+      type: "workspace.create.request",
+      requestId: "workspace-fork",
+      source: { kind: "directory", path: cwd, projectId: project.projectId },
+      agent,
+    });
+    for (const type of ["agent.create.response", "workspace.create.response"] as const) {
+      const response = findByType(messages, type)?.payload;
+      expect(response?.error).toBeNull();
+      const id = response?.agent?.id;
+      expect(id).toEqual(expect.any(String));
+      expect(manager.getTimeline(id!).slice(0, 2)).toEqual(CONTEXT_HANDOFF_ITEMS);
+      expect(await storage.timelinePrefixes.load(id!)).toMatchObject({
+        rows: CONTEXT_HANDOFF_ITEMS.map((item) => expect.objectContaining({ item })),
+        pendingContextHandoff: null,
+      });
+    }
+  } finally {
+    await session.cleanup();
+    for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test.each([null, "Last turn failed"])(
   "wait for finish scopes stored closed-agent replies when the last error is %s",

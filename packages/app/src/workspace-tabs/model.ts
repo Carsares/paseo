@@ -1,5 +1,6 @@
 import type { AgentProvider } from "@getpaseo/protocol/agent-types";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
+import type { AgentForkSource } from "@getpaseo/protocol/messages";
 import type { WorkspaceFileTabTarget } from "@/workspace/file-open";
 
 export interface WorkspaceDraftTabSetup {
@@ -12,6 +13,7 @@ export interface WorkspaceDraftTabSetup {
   parentAgentId?: string | null;
   initialDraftText?: string | null;
   restoreChatHistory?: boolean;
+  forkFrom?: AgentForkSource;
 }
 
 export interface WorkspaceWorkingDiffTabTarget {

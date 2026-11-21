@@ -1,20 +1,31 @@
 /** @vitest-environment jsdom */
+import { useRouter } from "expo-router";
 import { renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import { WORKSPACE_MAIN_ROLE, WORKSPACE_ROLE_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  PARENT_AGENT_ID_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
+import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import {
   buildDraftWorkspaceAttachmentScopeKey,
   useWorkspaceAttachmentsStore,
 } from "@/attachments/workspace-attachments-store";
+import * as draftKeys from "@/stores/draft-keys";
 import { useDraftStore } from "@/stores/draft-store";
+import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useSessionStore } from "@/stores/session-store";
+import { useWorkspaceDraftSubmissionStore } from "@/stores/workspace-draft-submission-store";
+import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
 import { normalizeWorkspaceDraftTabSetup } from "@/workspace-tabs/identity";
 import { buildNewAgentTabTarget } from "@/workspace-tabs/new-tab";
 import { openPreferredWorkspaceTarget } from "@/workspace-tabs/open-beside";
 import {
   buildMainSubagentTabDraftSetup,
   buildSubagentDraftSetup,
+  type ForkAgentRequest,
   prepareForkDraft,
   useForkAgent,
 } from "./use-fork-agent";
@@ -35,11 +46,22 @@ vi.mock("@react-native-async-storage/async-storage", () => {
   };
 });
 vi.mock("expo-router", () => ({ useRouter: vi.fn() }));
-vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock("react-i18next", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react-i18next")>()),
+  useTranslation: () => ({ t: (key: string) => key }),
+}));
 vi.mock("@/hooks/use-form-preferences", () => ({
   useFormPreferences: () => ({ preferences: { provider: "pi" } }),
 }));
-vi.mock("@/hooks/use-settings", () => ({ useSettings: vi.fn() }));
+const { acceptAgentSnapshot, push, openInSidePane } = vi.hoisted(() => ({
+  acceptAgentSnapshot: vi.fn(),
+  push: vi.fn<(href: string) => void>(),
+  openInSidePane: { subagents: true },
+}));
+vi.mock("@/hooks/use-settings", () => ({ useSettings: () => openInSidePane }));
+vi.mock("@/runtime/host-runtime", () => ({
+  getHostRuntimeStore: () => ({ acceptAgentSnapshot }),
+}));
 vi.mock("@/stores/navigation-active-workspace-store", () => ({ navigateToWorkspace: vi.fn() }));
 vi.mock("@/workspace-tabs/open-beside", () => ({ openPreferredWorkspaceTarget: vi.fn() }));
 
@@ -113,6 +135,233 @@ describe("drafts from a subagent", () => {
       model: "subagent-model",
       thinkingOptionId: "high",
       providerOptions: { approval_policy: "on-request" },
+    });
+  });
+});
+
+describe("seamless timeline forks", () => {
+  const serverId = "seamless-host";
+  const workspaceId = "workspace-1";
+  const workspaceKey = `${serverId}:${workspaceId}`;
+  const boundary = { boundaryMessageId: "message-1", boundaryCursor: { epoch: "old", seq: 5 } };
+  const forkFrom = { sourceAgentId: "source-agent", ...boundary };
+  const request = {
+    agentId: forkFrom.sourceAgentId,
+    agent: subagent,
+    workspaceId,
+    boundary,
+  };
+  const config = {
+    provider: "codex",
+    cwd: "/workspace/project",
+    modeId: "workspace-write",
+    model: "subagent-model",
+    thinkingOptionId: "high",
+    providerOptions: { approval_policy: "on-request" },
+  };
+
+  async function fork(
+    input: ForkAgentRequest,
+    run: (input: {
+      onFork: (request: ForkAgentRequest) => Promise<void>;
+      createAgent: ReturnType<typeof vi.fn<DaemonClient["createAgent"]>>;
+      toast: NonNullable<Parameters<typeof useForkAgent>[0]["toast"]>;
+    }) => Promise<void> = ({ onFork }) => onFork(input),
+  ) {
+    const created: AgentSnapshotPayload = {
+      id: `created-${input.target}`,
+      provider: "codex",
+      model: "subagent-model",
+      cwd: "/workspace/project",
+      workspaceId,
+      status: "idle",
+      createdAt: "2026-11-21T00:00:00Z",
+      updatedAt: "2026-11-21T00:00:00Z",
+      lastUserMessageAt: null,
+      capabilities: {
+        supportsStreaming: true,
+        supportsSessionPersistence: true,
+        supportsDynamicModes: false,
+        supportsMcpServers: false,
+        supportsReasoningStream: false,
+        supportsToolInvocations: false,
+      },
+      currentModeId: null,
+      availableModes: [],
+      pendingPermissions: [],
+      persistence: null,
+      title: null,
+      labels: input.parentAgentId ? { [PARENT_AGENT_ID_LABEL]: input.parentAgentId.trim() } : {},
+    };
+    const createAgent = vi.fn<DaemonClient["createAgent"]>().mockResolvedValue(created);
+    const buildAgentForkContext = vi.fn<DaemonClient["buildAgentForkContext"]>();
+    const session = useSessionStore.getState();
+    session.initializeSession(serverId, {
+      createAgent,
+      buildAgentForkContext,
+    } as unknown as DaemonClient);
+    session.updateSessionServerInfo(serverId, {
+      serverId,
+      hostname: null,
+      version: null,
+      features: { agentSeamlessContextSwitch: true, agentHierarchyControl: true },
+    });
+    vi.mocked(useRouter).mockReturnValue({ push } as unknown as ReturnType<typeof useRouter>);
+    acceptAgentSnapshot.mockClear();
+    vi.mocked(navigateToWorkspace).mockReset();
+    const attachmentsBefore = useWorkspaceAttachmentsStore.getState().attachmentsByScope;
+    const toast = { error: vi.fn() } as unknown as NonNullable<
+      Parameters<typeof useForkAgent>[0]["toast"]
+    >;
+    const { result, unmount } = renderHook(() => useForkAgent({ serverId, toast }));
+    try {
+      await run({ onFork: result.current, createAgent, toast });
+    } finally {
+      unmount();
+      session.clearSession(serverId);
+    }
+    expect(buildAgentForkContext).not.toHaveBeenCalled();
+    expect(useWorkspaceAttachmentsStore.getState().attachmentsByScope).toBe(attachmentsBefore);
+    return { createAgent, created, toast };
+  }
+
+  function assertSeededTabQuote() {
+    const draftKey = draftKeys.buildDraftStoreKey({ serverId, agentId: "created-tab" });
+    expect(acceptAgentSnapshot).toHaveBeenCalledTimes(1);
+    expect(useDraftStore.getState().getDraftInput(draftKey)).toEqual({
+      text: "",
+      attachments: [{ kind: "quote", id: expect.any(String), text: "Selected for tab" }],
+    });
+    return "/workspace";
+  }
+
+  it("opens the real fork as a new tab before the user sends any prompt", async () => {
+    const input = { ...request, target: "tab", quoteText: "Selected for tab" } as const;
+    const { createAgent, created, toast } = await fork(input, async ({ onFork }) => {
+      vi.mocked(navigateToWorkspace).mockImplementationOnce(assertSeededTabQuote);
+      await onFork(input);
+    });
+
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(createAgent).toHaveBeenCalledExactlyOnceWith({ config, workspaceId, forkFrom });
+    expect(acceptAgentSnapshot).toHaveBeenCalledExactlyOnceWith(
+      serverId,
+      expect.objectContaining({ id: created.id, workspaceId, status: "idle" }),
+    );
+    expect(navigateToWorkspace).toHaveBeenCalledExactlyOnceWith({
+      serverId,
+      workspaceId,
+      target: { kind: "agent", agentId: created.id },
+      asTab: true,
+    });
+  });
+
+  it("ignores duplicate clicks and releases the fork after reporting a create failure", async () => {
+    const input = { ...request, target: "tab", boundary: undefined } as const;
+    const outcome = await fork(input, async ({ onFork, createAgent, toast }) => {
+      const attempt = Promise.withResolvers<AgentSnapshotPayload>();
+      createAgent.mockReturnValueOnce(attempt.promise);
+      const first = onFork(input);
+      await onFork({ ...input, target: "subagent" });
+      expect(createAgent).toHaveBeenCalledTimes(1);
+
+      attempt.reject(new Error("Creation failed"));
+      await first;
+      expect(toast.error).toHaveBeenCalledExactlyOnceWith("Creation failed");
+      expect(navigateToWorkspace).not.toHaveBeenCalled();
+      expect(acceptAgentSnapshot).not.toHaveBeenCalled();
+
+      await onFork(input);
+    });
+    expect(outcome.createAgent).toHaveBeenCalledTimes(2);
+    expect(outcome.createAgent).toHaveBeenLastCalledWith({
+      config,
+      workspaceId,
+      forkFrom: { sourceAgentId: request.agentId },
+    });
+    expect(navigateToWorkspace).toHaveBeenCalledTimes(1);
+    expect(outcome.toast.error).toHaveBeenCalledTimes(1);
+  });
+
+  it("seeds only the selected quote before opening a sibling in the compact sheet", async () => {
+    const target = { kind: "agent", agentId: "created-subagent" } as const;
+    const draftKey = draftKeys.buildDraftStoreKey({ serverId, agentId: target.agentId });
+    const { openPreferredWorkspaceTarget: openActual } = await vi.importActual<
+      typeof import("@/workspace-tabs/open-beside")
+    >("@/workspace-tabs/open-beside");
+    const layout = useWorkspaceLayoutStore.getState();
+    layout.setLayoutMode("compact");
+    acceptAgentSnapshot.mockImplementationOnce((id, agent) => {
+      useSessionStore.getState().setAgents(id, new Map([[agent.id, agent]]));
+    });
+    const open = vi.mocked(openPreferredWorkspaceTarget).mockReset();
+    open.mockImplementationOnce((destination) => {
+      expect(acceptAgentSnapshot).toHaveBeenCalledTimes(1);
+      expect(useDraftStore.getState().getDraftInput(draftKey)).toEqual({
+        text: "",
+        attachments: [{ kind: "quote", id: expect.any(String), text: "Selected text" }],
+      });
+      return openActual(destination);
+    });
+    try {
+      const { createAgent, toast } = await fork({
+        ...request,
+        target: "subagent",
+        parentAgentId: ` ${sharedParentId} `,
+        parentTabId: "source-tab",
+        quoteText: "\nSelected text\n",
+      });
+
+      expect(toast.error).not.toHaveBeenCalled();
+      expect(createAgent).toHaveBeenCalledExactlyOnceWith({
+        config,
+        workspaceId,
+        forkFrom,
+        callerAgentId: sharedParentId,
+        initialPromptOrigin: "user",
+        labels: { [PARENT_AGENT_ID_LABEL]: sharedParentId },
+      });
+      expect(open).toHaveBeenCalledExactlyOnceWith({
+        workspaceKey,
+        target,
+        preferences: openInSidePane,
+        source: "subagents",
+        parentTabId: "source-tab",
+      });
+      expect(useWorkspaceLayoutStore.getState().sheetsByWorkspace[workspaceKey]).toMatchObject([
+        { tab: { target }, parentTabId: "source-tab" },
+      ]);
+      expect(navigateToWorkspace).not.toHaveBeenCalled();
+    } finally {
+      layout.setLayoutMode(layout.layoutMode);
+      useWorkspaceLayoutStore.setState({ sheetsByWorkspace: layout.sheetsByWorkspace });
+    }
+  });
+
+  it("keeps the boundary and quote in the new workspace draft until submission", async () => {
+    push.mockClear();
+    const { createAgent, toast } = await fork({
+      ...request,
+      target: "workspace",
+      quoteText: "Selected",
+    });
+
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(createAgent).not.toHaveBeenCalled();
+    expect(push).toHaveBeenCalledTimes(1);
+    const [href] = push.mock.calls[0];
+    const route = new URL(href, "https://paseo.test");
+    expect(route.pathname).toBe("/new");
+    expect(route.searchParams.get("serverId")).toBe(serverId);
+    const draftId = route.searchParams.get("draftId");
+    if (!draftId) throw new Error("Expected a new workspace draft ID");
+    const pending = useWorkspaceDraftSubmissionStore.getState().setupByDraftId[draftId];
+    expect(pending).toEqual({ sourceDirectory: subagent.cwd, setup: { ...config, forkFrom } });
+    expect(
+      useDraftStore.getState().getDraftInput(draftKeys.buildNewWorkspaceDraftKey(draftId)),
+    ).toEqual({
+      text: "",
+      attachments: [{ kind: "quote", id: expect.any(String), text: "Selected" }],
     });
   });
 });
@@ -253,6 +502,13 @@ describe("fork draft attachments", () => {
   it.each(["none", "persisted", "live", "abandoned", "cleared"] as const)(
     "preserves the correct draft after hydration (edit: %s)",
     async (editLocation) => {
+      const draftId = `pending-fork-${editLocation}`;
+      const draftKey = getDraftKey(draftId);
+      const generate = vi.spyOn(draftKeys, "generateDraftId").mockReturnValueOnce(draftId);
+      const edit = { text: "Keep my draft", attachments: [] };
+      if (editLocation === "cleared") {
+        useDraftStore.getState().saveDraftInput({ draftKey, draft: edit });
+      }
       const { storage, version } = useDraftStore.persist.getOptions();
       if (!storage) throw new Error("Draft persistence storage is unavailable");
       type StoredDrafts = Pick<
@@ -268,19 +524,13 @@ describe("fork draft attachments", () => {
       const draftsBefore = useDraftStore.getState().drafts;
 
       try {
-        const draftId = await prepareForkDraft({ ...input, quoteText: "Selected text" });
-        const seed = getQuoteDraft(draftId);
-        expect(seed?.attachments).toHaveLength(1);
-
-        const edit = { text: "Keep my draft", attachments: [] };
+        const fork = prepareForkDraft({ ...input, quoteText: "Selected text" });
         if (editLocation === "live") {
-          useDraftStore
-            .getState()
-            .editDraftText({ draftKey: getDraftKey(draftId), text: edit.text });
+          useDraftStore.getState().editDraftText({ draftKey, text: edit.text });
         }
         if (editLocation === "cleared") {
           useDraftStore.getState().clearDraftInput({
-            draftKey: getDraftKey(draftId),
+            draftKey,
             lifecycle: "abandoned",
           });
         }
@@ -288,7 +538,7 @@ describe("fork draft attachments", () => {
           editLocation === "persisted" || editLocation === "abandoned"
             ? {
                 ...draftsBefore,
-                [getDraftKey(draftId)]: {
+                [draftKey]: {
                   input: editLocation === "persisted" ? edit : { text: "", attachments: [] },
                   lifecycle:
                     editLocation === "persisted" ? ("active" as const) : ("abandoned" as const),
@@ -298,26 +548,28 @@ describe("fork draft attachments", () => {
               }
             : draftsBefore;
         finishRead({ state: { drafts, createModalDraft: null }, version });
-        await hydration;
+        await expect(fork).resolves.toBe(draftId);
 
         expect(getQuoteDraft(draftId)).toEqual(
           {
-            none: seed,
+            none: {
+              text: "",
+              attachments: [{ kind: "quote", id: expect.any(String), text: "Selected text" }],
+            },
             persisted: edit,
-            live: { ...seed, text: edit.text },
+            live: edit,
             abandoned: undefined,
             cleared: undefined,
           }[editLocation],
         );
         if (editLocation === "cleared") {
-          expect(useDraftStore.getState().drafts[getDraftKey(draftId)]?.lifecycle).toBe(
-            "abandoned",
-          );
+          expect(useDraftStore.getState().drafts[draftKey]?.lifecycle).toBe("abandoned");
         }
       } finally {
         finishRead({ state: { drafts: draftsBefore, createModalDraft: null }, version });
         await hydration;
         read.mockRestore();
+        generate.mockRestore();
       }
     },
   );

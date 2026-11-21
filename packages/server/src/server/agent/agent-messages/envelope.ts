@@ -32,6 +32,17 @@ interface AgentMessage {
   text: string;
 }
 
+const CONTEXT_HANDOFF_PREFIX =
+  /^<paseo-context-handoff version="1">\r?\n[\s\S]*?\r?\n<\/paseo-context-handoff>(?:\r?\n){0,2}/;
+
+export function stripContextHandoffEnvelope(text: string): string {
+  for (;;) {
+    const prefix = CONTEXT_HANDOFF_PREFIX.exec(text);
+    if (!prefix) return text;
+    text = text.slice(prefix[0].length);
+  }
+}
+
 function escapeXml(value: string): string {
   return value.replace(/[&<>"']/g, (character) => {
     switch (character) {
@@ -144,6 +155,7 @@ export function prepareAgentMessage(
     if (
       !parseAgentMessages(submittedText) &&
       !isSystemInjectedEnvelope(submittedText) &&
+      stripContextHandoffEnvelope(submittedText.trimStart()) === submittedText.trimStart() &&
       !submittedText.trimStart().startsWith(FORK_ATTACHMENT_OPEN)
     ) {
       return { prompt: replayablePrompt, messageId: id };
@@ -181,7 +193,11 @@ export function projectAgentMessages(
   options?: { submitted?: boolean },
 ): AgentTimelineItem[] {
   if (item.type === "user_message") {
-    const userMessage = options?.submitted ? item : withReplayForkContext(item);
+    const cleanText = options?.submitted ? item.text : stripContextHandoffEnvelope(item.text);
+    if (cleanText !== item.text && !cleanText.trim()) return [];
+    const userMessage = options?.submitted
+      ? item
+      : withReplayForkContext({ ...item, text: cleanText });
     const messages = parseAgentMessages(userMessage.text);
     if (messages) {
       return messages.flatMap((message) => {

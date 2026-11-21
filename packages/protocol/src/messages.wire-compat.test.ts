@@ -4,9 +4,11 @@ import {
   MutableDaemonConfigSchema,
   MutableDaemonConfigPatchSchema,
   UsageReportEntrySchema,
+  AgentForkSourceSchema,
   AgentSnapshotPayloadSchema,
   AgentTimelineItemPayloadSchema,
   ServerInfoStatusPayloadSchema,
+  SessionInboundMessageSchema,
   SessionOutboundMessageSchema,
   WSHelloMessageSchema,
   WorkspaceSetupSnapshotSchema,
@@ -17,6 +19,104 @@ import {
   WorkspaceBaseBranchSetRequestSchema,
   WorkspaceBaseBranchSetResponseSchema,
 } from "./messages.js";
+import { validateWSOutboundMessage } from "./validation/ws-outbound.js";
+
+test("fork sources require a source agent and validate optional boundaries", () => {
+  expect(AgentForkSourceSchema.parse({ sourceAgentId: "source-agent" })).toEqual({
+    sourceAgentId: "source-agent",
+  });
+  for (const invalid of [
+    { sourceAgentId: "" },
+    { sourceAgentId: "source-agent", boundaryMessageId: "" },
+    { sourceAgentId: "source-agent", boundaryCursor: { epoch: "epoch-1", seq: -1 } },
+  ]) {
+    expect(AgentForkSourceSchema.safeParse(invalid).success).toBe(false);
+  }
+});
+
+test("agent and workspace creation accept and preserve optional fork sources", () => {
+  const requestId = "creation-1";
+  const config = { provider: "codex", cwd: "/repo" };
+  const forkFrom = {
+    sourceAgentId: "source-agent",
+    boundaryCursor: { epoch: "epoch-1", seq: 4 },
+    boundaryMessageId: "message-1",
+  };
+  for (const fields of [{ config }, { config, forkFrom }]) {
+    const requests = [
+      { type: "create_agent_request", requestId, ...fields },
+      { type: "agent.create.request", requestId, ...fields },
+      {
+        type: "workspace.create.request",
+        requestId,
+        source: { kind: "directory", path: "/repo" },
+        agent: fields,
+      },
+    ];
+    for (const request of requests) {
+      const parsed = SessionInboundMessageSchema.parse(request);
+      expect(parsed).toMatchObject(request);
+      if (!("forkFrom" in fields)) {
+        expect(
+          parsed.type === "workspace.create.request" ? parsed.agent : parsed,
+        ).not.toHaveProperty("forkFrom");
+      }
+    }
+  }
+});
+
+test("provider switch is a registered request and response with optional settings and notice", () => {
+  const request = {
+    type: "agent.provider.switch.request",
+    requestId: "switch-1",
+    agentId: "agent-1",
+    provider: "claude",
+  };
+  const settings = { model: null, modeId: "plan", thinkingOptionId: null, options: { speed: 1 } };
+  expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+  expect(SessionInboundMessageSchema.parse({ ...request, ...settings })).toEqual({
+    ...request,
+    ...settings,
+  });
+  expect(SessionInboundMessageSchema.safeParse({ ...request, agentId: "" }).success).toBe(false);
+
+  const response = {
+    type: "agent.provider.switch.response",
+    payload: {
+      requestId: request.requestId,
+      agentId: request.agentId,
+      accepted: false,
+      agent: null,
+      error: "Provider unavailable",
+    },
+  };
+  expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
+
+  const frame = { type: "session", message: response };
+  expect(validateWSOutboundMessage(frame)).toEqual({ success: true, data: frame });
+  expect(
+    validateWSOutboundMessage({
+      ...frame,
+      message: { ...response, payload: { ...response.payload, notice: { type: "warning" } } },
+    }),
+  ).toMatchObject({
+    success: false,
+    error: {
+      issues: [expect.objectContaining({ path: ["message", "payload", "notice", "message"] })],
+    },
+  });
+});
+
+test("server info preserves the optional seamless context switch capability", () => {
+  const info = { status: "server_info", serverId: "server-1" };
+  for (const features of [
+    {},
+    { agentSeamlessContextSwitch: true },
+    { agentSeamlessContextSwitch: false },
+  ]) {
+    expect(ServerInfoStatusPayloadSchema.parse({ ...info, features }).features).toEqual(features);
+  }
+});
 
 test("base selection RPCs are correlated while older checkout and branch messages remain valid", () => {
   const payload = {

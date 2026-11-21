@@ -1,5 +1,6 @@
 import type { FinishRegistration, FinishSubscriptions } from "../finish-subscriptions/index.js";
 import type { AgentPromptSource } from "../agent-messages/index.js";
+import type { AgentTimelineRow } from "../agent-timeline-store-types.js";
 import type { Logger } from "pino";
 
 import type { TerminalManager } from "../../../terminal/terminal-manager.js";
@@ -82,6 +83,7 @@ export interface CreateAgentFromSessionInput {
   workspaceId: string;
   background: boolean;
   initialPrompt?: string;
+  forkedTimelineRows?: AgentTimelineRow[];
   source?: AgentPromptSource;
   clientMessageId?: string;
   outputSchema?: Record<string, unknown>;
@@ -363,6 +365,7 @@ async function resolveSessionCreateAgent(
       },
       metadata: input.metadata,
       initialPrompt: trimmedPrompt,
+      forkedTimelineRows: input.forkedTimelineRows,
       env: input.env,
       initialTitle: input.provisionalTitle,
       // Paseo never persists an internal agent, so nothing could resume its

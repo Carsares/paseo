@@ -34,7 +34,7 @@ import {
   validateDraftSubmission,
 } from "@/composer/draft/workspace-tab-core";
 import { DRAFT_CAPABILITIES } from "@/composer/draft/timeline";
-import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
+import type { AgentForkSource, AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { WorkspaceComposerAttachment } from "@/attachments/types";
 import {
@@ -153,9 +153,22 @@ function buildDraftCaller(input: {
   return { callerAgentId, initialPromptOrigin: "user" };
 }
 
+function resolveDraftSubmitPolicy(
+  setup: WorkspaceDraftTabSetup | null,
+  pendingAutoSubmit: { allowEmptyText?: boolean } | null,
+) {
+  const isTimelineFork = Boolean(setup?.forkFrom);
+  return {
+    isTimelineFork,
+    allowEmptyText: isTimelineFork || pendingAutoSubmit?.allowEmptyText === true,
+    requiresUserPromptOrigin: !isTimelineFork && setup?.restoreChatHistory === true,
+  };
+}
+
 export async function submitDraftCreateRequest(input: {
   draftId: string;
   parentAgentId?: string | null;
+  forkFrom?: AgentForkSource;
   attempt: { clientMessageId: string };
   text: string;
   images?: UserMessageImageAttachment[];
@@ -224,6 +237,7 @@ export async function submitDraftCreateRequest(input: {
     ...buildDraftCaller(input),
     initialPrompt: text,
     clientMessageId: attempt.clientMessageId,
+    ...(input.forkFrom ? { forkFrom: input.forkFrom } : {}),
     ...(Object.keys(composerState.metadata).length > 0 ? { metadata: composerState.metadata } : {}),
     ...(imagesData?.length ? { images: imagesData } : {}),
     ...(attachmentsArray?.length ? { attachments: attachmentsArray } : {}),
@@ -490,7 +504,10 @@ export function WorkspaceDraftComposer({
         : {}),
     };
   }, [pendingCreateAttempt]);
-  const allowsEmptyAutoSubmit = pendingAutoSubmit?.allowEmptyText === true;
+  const { isTimelineFork, allowEmptyText, requiresUserPromptOrigin } = resolveDraftSubmitPolicy(
+    draftSetup,
+    pendingAutoSubmit,
+  );
   const isCompactFormFactor = useIsCompactFormFactor();
   const isComposerFullscreen = useComposerFullscreen(editingSession);
   const { onLayout: onInputAreaLayout, isBelow: isCompactComposerLayout } = useContainerWidthBelow(
@@ -503,8 +520,8 @@ export function WorkspaceDraftComposer({
     workspaceId,
   });
   const draftAttachmentScopeKey = useDraftWorkspaceAttachmentScopeKey(draftId);
-  const areDraftAttachmentsReady = useWorkspaceAttachmentsStore((state) =>
-    isDraftChatHistoryReady(state, draftAttachmentScopeKey),
+  const areDraftAttachmentsReady = useWorkspaceAttachmentsStore(
+    (state) => isTimelineFork || isDraftChatHistoryReady(state, draftAttachmentScopeKey),
   );
   const openInSidePane = useSettings((settings) => settings.openInSidePane);
   const attachmentScopeKeys = useMemo(
@@ -533,11 +550,11 @@ export function WorkspaceDraftComposer({
       draftId,
       getPendingServerId: () => serverId,
       initialAttempt: initialCreateAttempt,
-      allowEmptyText: allowsEmptyAutoSubmit,
+      allowEmptyText,
       validateBeforeSubmit: ({ text, attachments }) => {
         if (!areDraftAttachmentsReady) return t("common.loading");
         const allowsEmptyDraftText = shouldAllowEmptyDraftText({
-          allowsEmptyAutoSubmit,
+          allowsEmptyAutoSubmit: allowEmptyText,
           attachments,
         });
         return validateDraftSubmission({
@@ -568,13 +585,17 @@ export function WorkspaceDraftComposer({
           selectModelMessage: t("workspaceSetup.errors.selectModel"),
         }),
       createRequest: async ({ attempt, text, images, attachments, cwd }) => {
+        const hasInitialMessage = Boolean(text.trim() || images?.length || attachments?.length);
+        // An empty fork has no incoming user message for the create flow to hand off.
+        const forkOnly = isTimelineFork && !hasInitialMessage;
         if (pendingAutoSubmit?.agentCreation) {
           const result = await pendingAutoSubmit.agentCreation.result;
-          return { agentId: result.id, result };
+          return { agentId: forkOnly ? null : result.id, result };
         }
-        return submitDraftCreateRequest({
+        const created = await submitDraftCreateRequest({
           draftId,
           parentAgentId,
+          forkFrom: draftSetup?.forkFrom,
           attempt,
           text,
           images,
@@ -587,13 +608,21 @@ export function WorkspaceDraftComposer({
           composerState,
           hostDisconnectedMessage: t("workspace.terminal.hostDisconnected"),
           selectModelMessage: t("workspaceSetup.errors.selectModel"),
-          requiresUserPromptOrigin: draftSetup?.restoreChatHistory === true,
+          requiresUserPromptOrigin,
           supportsAgentInitialPromptOrigin: () =>
             selectHostFeature(useSessionStore.getState(), serverId, "agentInitialPromptOrigin"),
           initialPromptOriginUnavailableMessage: t("message.actions.forkUnavailable"),
         });
+        return forkOnly ? { ...created, agentId: null } : created;
       },
       onCreateSuccess: ({ result }) => {
+        if (isTimelineFork) {
+          const createFlow = useCreateFlowStore.getState();
+          if (!createFlow.pendingByDraftId[draftId]?.agentId) {
+            createFlow.updateAgentId({ draftId, agentId: result.id });
+            createFlow.markLifecycle({ draftId, lifecycle: "sent" });
+          }
+        }
         clearDraftInput("sent");
         clearWorkspaceAttachments({ scopeKey: draftAttachmentScopeKey });
         useWorkspaceDraftSubmissionStore.getState().clearDraftSetup({ draftId });
@@ -725,6 +754,7 @@ export function WorkspaceDraftComposer({
         workspaceId={workspaceId}
         isPaneFocused={isPaneFocused}
         onSubmitMessage={handleCreateFromInput}
+        allowEmptySubmit={isTimelineFork}
         isSubmitLoading={isSubmitting || !areDraftAttachmentsReady}
         blurOnSubmit={true}
         textSource={draftInput.textSource}

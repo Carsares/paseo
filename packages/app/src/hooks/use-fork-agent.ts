@@ -1,10 +1,16 @@
 import { useRouter } from "expo-router";
+import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type {
   AgentForkContextOptions,
   DaemonClient,
 } from "@getpaseo/client/internal/daemon-client";
-import { isMainControlAgent, type AgentLabelSource } from "@getpaseo/protocol/agent-labels";
+import {
+  isMainControlAgent,
+  PARENT_AGENT_ID_LABEL,
+  type AgentLabelSource,
+} from "@getpaseo/protocol/agent-labels";
+import type { AgentForkSource } from "@getpaseo/protocol/messages";
 import { appendQuoteAttachment } from "@/attachments/quote";
 import type { WorkspaceComposerAttachment } from "@/attachments/types";
 import { hasDraftContent } from "@/composer/draft/input-draft-core";
@@ -14,10 +20,15 @@ import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
 import { useFormPreferences } from "@/hooks/use-form-preferences";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useSettings, type OpenInSidePanePreferences } from "@/hooks/use-settings";
-import { useHostFeature } from "@/runtime/host-features";
-import { buildDraftStoreKey, generateDraftId } from "@/stores/draft-keys";
+import { selectHostFeature, useHostFeature } from "@/runtime/host-features";
+import { getHostRuntimeStore } from "@/runtime/host-runtime";
+import { buildWorkspaceDraftAgentConfig } from "@/screens/workspace/workspace-draft-agent-config";
+import {
+  buildDraftStoreKey,
+  buildNewWorkspaceDraftKey,
+  generateDraftId,
+} from "@/stores/draft-keys";
 import { useDraftStore } from "@/stores/draft-store";
-import type { DraftRecord } from "@/stores/draft-store/state";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useSessionStore } from "@/stores/session-store";
 import {
@@ -25,6 +36,7 @@ import {
   useWorkspaceAttachmentsStore,
 } from "@/attachments/workspace-attachments-store";
 import { useWorkspaceDraftSubmissionStore } from "@/stores/workspace-draft-submission-store";
+import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
 import { toErrorMessage } from "@/utils/error-messages";
 import { buildNewWorkspaceRoute } from "@/utils/host-routes";
 import {
@@ -82,6 +94,7 @@ export interface UseForkAgentInput {
   readOnly?: boolean;
 }
 
+// COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
 export function buildChatHistoryAttachment(input: {
   draftId: string;
   serverId: string;
@@ -275,43 +288,17 @@ function resolveForkDraftSetup(input: {
   return setup;
 }
 
-function seedForkQuoteDraft(serverId: string, draftId: string, quoteText: string): void {
+async function seedDraftQuoteAttachment(draftKey: string, quoteText: string): Promise<void> {
   const quotes = appendQuoteAttachment([], quoteText);
   if (quotes.length === 0) return;
 
-  const draftKey = buildDraftStoreKey({ serverId, agentId: "", draftId });
-  const saveIfEmpty = () => {
-    const { drafts, getDraftInput, saveDraftInput } = useDraftStore.getState();
-    const current = getDraftInput(draftKey);
-    if (drafts[draftKey] && (!current || hasDraftContent(current))) return;
-    saveDraftInput({ draftKey, draft: { text: "", attachments: quotes } });
-  };
-
-  saveIfEmpty();
-  const { hasHydrated, onFinishHydration } = useDraftStore.persist;
-  if (!hasHydrated()) {
-    const seed = useDraftStore.getState().drafts[draftKey];
-    let editedDraft: DraftRecord | undefined;
-    const stopTracking = useDraftStore.subscribe((state, previous) => {
-      const current = state.drafts[draftKey];
-      const before = previous.drafts[draftKey];
-      // The draft's edit and clear actions advance its revision. Hydration can
-      // replace the entire drafts map with a snapshot from before this draft existed.
-      if (before && current?.version === before.version + 1) editedDraft = current;
-    });
-    const unsubscribe = onFinishHydration(() => {
-      unsubscribe();
-      stopTracking();
-      const restored = useDraftStore.getState().drafts[draftKey];
-      const draftToKeep = editedDraft ?? (restored === seed ? seed : undefined);
-      if (!draftToKeep) {
-        saveIfEmpty();
-        return;
-      }
-      // Writes during the storage read can be skipped, even if the seed survived hydration.
-      useDraftStore.setState((state) => ({ drafts: { ...state.drafts, [draftKey]: draftToKeep } }));
-    });
-  }
+  // A save made during hydration is replayed over the stored draft. Wait so a seed
+  // cannot replace input the user already saved, edited, or cleared.
+  await useDraftStore.getState().hydrateDraftInput({ draftKey });
+  const { drafts, getDraftInput, saveDraftInput } = useDraftStore.getState();
+  const current = getDraftInput(draftKey);
+  if (drafts[draftKey] && (!current || hasDraftContent(current))) return;
+  saveDraftInput({ draftKey, draft: { text: "", attachments: quotes } });
 }
 
 export async function prepareForkDraft(input: {
@@ -336,7 +323,12 @@ export async function prepareForkDraft(input: {
     scopeKey: buildDraftWorkspaceAttachmentScopeKey(draftId),
     attachments: [attachment],
   });
-  if (quoteText !== undefined) seedForkQuoteDraft(serverId, draftId, quoteText);
+  if (quoteText !== undefined) {
+    await seedDraftQuoteAttachment(
+      buildDraftStoreKey({ serverId, agentId: "", draftId }),
+      quoteText,
+    );
+  }
   return draftId;
 }
 
@@ -368,6 +360,91 @@ function openForkDraftInNewWorkspace(input: {
   );
 }
 
+function resolveForkParentAgentId(request: ForkAgentRequest): string | null {
+  if (request.target === "workspace") return null;
+  return request.parentAgentId?.trim() || (request.target === "subagent" ? request.agentId : null);
+}
+
+async function openSeamlessFork(input: {
+  request: ForkAgentRequest;
+  draftSetup: WorkspaceDraftTabSetup;
+  client: Pick<DaemonClient, "createAgent">;
+  serverId: string;
+  router: ReturnType<typeof useRouter>;
+  preferences: OpenInSidePanePreferences;
+  missingWorkspaceMessage: string;
+}): Promise<void> {
+  const { request, draftSetup, client, serverId, router, preferences } = input;
+  const { target, agentId, agent, boundary, quoteText, parentTabId } = request;
+  const forkFrom: AgentForkSource = {
+    sourceAgentId: agentId,
+    ...(boundary?.boundaryCursor ? { boundaryCursor: boundary.boundaryCursor } : {}),
+    ...(boundary?.boundaryMessageId ? { boundaryMessageId: boundary.boundaryMessageId } : {}),
+  };
+
+  if (target === "workspace") {
+    const draftId = generateDraftId();
+    if (quoteText !== undefined) {
+      await seedDraftQuoteAttachment(buildNewWorkspaceDraftKey(draftId), quoteText);
+    }
+    openForkDraftInNewWorkspace({
+      router,
+      serverId,
+      draftId,
+      agent,
+      draftSetup: { ...draftSetup, forkFrom },
+    });
+    return;
+  }
+
+  const workspaceId = request.workspaceId?.trim() ?? "";
+  const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
+  if (!workspaceKey) throw new Error(input.missingWorkspaceMessage);
+  const parentAgentId = resolveForkParentAgentId(request);
+  const created = await client.createAgent({
+    config: buildWorkspaceDraftAgentConfig({
+      ...draftSetup,
+      modeId: draftSetup.modeId?.trim(),
+      model: draftSetup.model?.trim(),
+      thinkingOptionId: draftSetup.thinkingOptionId?.trim(),
+    }),
+    workspaceId,
+    forkFrom,
+    ...(parentAgentId
+      ? {
+          callerAgentId: parentAgentId,
+          initialPromptOrigin: "user",
+          labels: { [PARENT_AGENT_ID_LABEL]: parentAgentId },
+        }
+      : {}),
+  });
+  getHostRuntimeStore().acceptAgentSnapshot(serverId, normalizeAgentSnapshot(created, serverId));
+  if (quoteText !== undefined) {
+    await seedDraftQuoteAttachment(
+      buildDraftStoreKey({ serverId, agentId: created.id }),
+      quoteText,
+    );
+  }
+
+  const agentTarget = { kind: "agent", agentId: created.id } as const;
+  if (target === "subagent") {
+    const tabId = openPreferredWorkspaceTarget({
+      workspaceKey,
+      target: agentTarget,
+      preferences,
+      source: "subagents",
+      parentTabId,
+    });
+    if (tabId) return;
+  }
+  navigateToWorkspace({
+    serverId,
+    workspaceId,
+    target: agentTarget,
+    ...(target === "tab" ? { asTab: true } : {}),
+  });
+}
+
 /**
  * Shared fork driver behind both turn-footer fork affordances: the completed
  * turn's footer (which supplies a boundary pinned to that turn) and the
@@ -381,17 +458,28 @@ export function useForkAgent(
   const { t } = useTranslation();
   const router = useRouter();
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
-  const supportsAgentForkContext = useHostFeature(serverId, "agentForkContext") && !readOnly;
+  const supportsAgentForkContext = useHostFeature(serverId, "agentForkContext");
   const supportsAgentHierarchyControl = useHostFeature(serverId, "agentHierarchyControl");
   const openInSidePane = useSettings((settings) => settings.openInSidePane);
   const { preferences } = useFormPreferences();
+  const isForking = useRef(false);
 
   return useStableEvent(async (request: ForkAgentRequest) => {
+    if (isForking.current) return;
+    isForking.current = true;
     const { agentId, agent, workspaceId, parentTabId, parentAgentId, target, boundary, quoteText } =
       request;
     try {
+      // COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
+      const supportsSeamlessContextSwitch = selectHostFeature(
+        useSessionStore.getState(),
+        serverId,
+        "agentSeamlessContextSwitch",
+      );
       const canForkTarget =
-        supportsAgentForkContext && (target !== "subagent" || supportsAgentHierarchyControl);
+        !readOnly &&
+        (supportsSeamlessContextSwitch || supportsAgentForkContext) &&
+        (target !== "subagent" || supportsAgentHierarchyControl);
       if (!canForkTarget) {
         toast?.error(t("message.actions.forkUnavailable"));
         return;
@@ -407,6 +495,21 @@ export function useForkAgent(
         preferredProvider: preferences.provider,
         unavailableMessage: t("message.actions.forkUnavailable"),
       });
+      if (supportsSeamlessContextSwitch) {
+        if (!draftSetup) throw new Error(t("message.actions.forkUnavailable"));
+        await openSeamlessFork({
+          request,
+          draftSetup,
+          client,
+          serverId,
+          router,
+          preferences: openInSidePane,
+          missingWorkspaceMessage: t("message.actions.forkMissingWorkspace"),
+        });
+        return;
+      }
+
+      // COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
       const prepareDraft = () =>
         prepareForkDraft({
           client,
@@ -437,6 +540,8 @@ export function useForkAgent(
       openForkDraftInNewWorkspace({ router, serverId, draftId, agent, draftSetup });
     } catch (error) {
       toast?.error(toErrorMessage(error) || t("message.actions.forkFailed"));
+    } finally {
+      isForking.current = false;
     }
   });
 }

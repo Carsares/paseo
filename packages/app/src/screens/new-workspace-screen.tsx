@@ -30,7 +30,11 @@ import { ensureCheckoutStatus } from "@/git/checkout-status-cache";
 import { useDaemonConfig } from "@/hooks/use-daemon-config";
 import { resolveTerminalProfiles } from "@getpaseo/protocol/terminal-profiles";
 import type { TerminalProfile } from "@getpaseo/protocol/messages";
-import { resolveLaunchTarget, type LaunchTarget } from "@/new-workspace-launch/target";
+import {
+  CHAT_LAUNCH_TARGET,
+  resolveLaunchTarget,
+  type LaunchTarget,
+} from "@/new-workspace-launch/target";
 import { useTerminalComposerState } from "@/new-workspace-launch/composer-state";
 import { runCreateTerminalWorkspace } from "./new-workspace-terminal";
 import {
@@ -443,7 +447,12 @@ function buildWorkspaceDraftSetupForCreatedWorkspace(input: {
     provider: input.provider,
     composerState: input.composerState,
   });
-  return input.mainAgentId ? { ...setup, parentAgentId: input.mainAgentId } : setup;
+  const forkFrom = input.forkDraftSetup?.setup.forkFrom;
+  return {
+    ...setup,
+    ...(input.mainAgentId ? { parentAgentId: input.mainAgentId } : {}),
+    ...(forkFrom ? { forkFrom, restoreChatHistory: false } : {}),
+  };
 }
 
 function buildComposerInitialValues(input: {
@@ -496,8 +505,10 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
   let navigated = false;
   let outcome: SubmitOutcome = "background";
   const agentConfig = buildWorkspaceAgentConfig(cwd, provider, composerState);
+  const forkFrom = input.forkDraftSetup?.setup.forkFrom;
   const initialAgent: NonNullable<CreateWorkspaceRequestOptions["agent"]> = {
     config: agentConfig,
+    ...(forkFrom ? { forkFrom } : {}),
     ...(Object.keys(composerState.metadata).length > 0 ? { metadata: composerState.metadata } : {}),
     initialPrompt: text,
     clientMessageId: `${input.draftId}:initial-message`,
@@ -586,16 +597,12 @@ function buildComposerConfig(input: {
   };
 }
 
-function usePendingWorkspaceDraftSetup(
-  draftId: string | undefined,
-): PendingWorkspaceDraftSetup | null {
+function usePendingWorkspaceDraftSetup(draftId: string | undefined) {
   const normalizedDraftId = draftId?.trim() ?? "";
-  return useWorkspaceDraftSubmissionStore((state) => {
-    if (!normalizedDraftId) {
-      return null;
-    }
-    return state.setupByDraftId[normalizedDraftId] ?? null;
-  });
+  const forkDraftSetup = useWorkspaceDraftSubmissionStore((state) =>
+    normalizedDraftId ? (state.setupByDraftId[normalizedDraftId] ?? null) : null,
+  );
+  return { forkDraftSetup, isTimelineFork: Boolean(forkDraftSetup?.setup.forkFrom) };
 }
 
 function resolveWorkspaceDraftSubmissionConfig(input: {
@@ -904,6 +911,7 @@ export function NewWorkspaceScreen({
   const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
   const toast = useToast();
+  const { forkDraftSetup, isTimelineFork } = usePendingWorkspaceDraftSetup(draftId);
   const composerEditing = useNewWorkspaceComposerEditing();
   const { leaveFullscreen } = composerEditing;
   const mergeWorkspaces = useCallback(
@@ -979,8 +987,11 @@ export function NewWorkspaceScreen({
   // daemon-side falls back to chat rather than leaving a dead selection.
   const [manualLaunchTarget, setManualLaunchTarget] = useState<LaunchTarget | null>(null);
   const launchTarget = useMemo(
-    () => resolveLaunchTarget(manualLaunchTarget ?? formPreferences.launchTarget, terminalProfiles),
-    [manualLaunchTarget, formPreferences.launchTarget, terminalProfiles],
+    () =>
+      isTimelineFork
+        ? CHAT_LAUNCH_TARGET
+        : resolveLaunchTarget(manualLaunchTarget ?? formPreferences.launchTarget, terminalProfiles),
+    [isTimelineFork, manualLaunchTarget, formPreferences.launchTarget, terminalProfiles],
   );
   const [terminalPromptText, setTerminalPromptText] = useState("");
   const {
@@ -1038,7 +1049,6 @@ export function NewWorkspaceScreen({
     projects: projectIconTargets,
   });
   const draftKey = buildNewWorkspaceDraftKey(draftId);
-  const forkDraftSetup = usePendingWorkspaceDraftSetup(draftId);
   const draftContextScopeKey = useDraftWorkspaceAttachmentScopeKey(draftId);
   const visibleDraftContextScopeKeys = useMemo(
     () => resolveVisibleDraftContextScopeKeys({ isDraftHandoffActive, draftContextScopeKey }),
@@ -1063,6 +1073,16 @@ export function NewWorkspaceScreen({
     updatePreferences: updateFormPreferences,
     setAttachments: chatDraft.setAttachments,
   });
+  const launchControl = useMemo(
+    () => ({
+      serverId: selectedServerId,
+      target: launchTarget,
+      onChange: setManualLaunchTarget,
+      profiles: terminalProfiles,
+      disabled: isPending || isTimelineFork,
+    }),
+    [isPending, isTimelineFork, launchTarget, selectedServerId, terminalProfiles],
+  );
   const dispatchPickerSelection = setup.dispatchPicker;
   const selectedItem = useNewWorkspaceSetupState(setup).pickerSelection.selectedItem;
 
@@ -1213,10 +1233,22 @@ export function NewWorkspaceScreen({
 
   const handleSelectWorkspaceHost = useCallback(
     (id: string) => {
+      if (isTimelineFork && id !== serverId.trim()) {
+        toast.error(t("message.actions.forkUnavailable"));
+        return;
+      }
       handleSelectHost(id);
       clearPickerSelectionForTargetChange(selectedServerId, id);
     },
-    [clearPickerSelectionForTargetChange, handleSelectHost, selectedServerId],
+    [
+      clearPickerSelectionForTargetChange,
+      handleSelectHost,
+      isTimelineFork,
+      selectedServerId,
+      serverId,
+      t,
+      toast,
+    ],
   );
 
   const handleAddProject = useCallback(() => {
@@ -1357,9 +1389,13 @@ export function NewWorkspaceScreen({
     async (payload: MessagePayload) => {
       try {
         setErrorMessage(null);
+        // The source agent ID is local to the host that opened this draft.
+        if (isTimelineFork && selectedServerId !== serverId.trim()) {
+          throw new Error(t("message.actions.forkUnavailable"));
+        }
         await composerState?.persistFormPreferences();
-        await updateFormPreferences({ launchTarget });
-        if (isEmptyWorkspaceSubmission(payload)) {
+        if (!isTimelineFork) await updateFormPreferences({ launchTarget });
+        if (!isTimelineFork && isEmptyWorkspaceSubmission(payload)) {
           setPendingAction("empty");
           let outcome: SubmitOutcome = "background";
           await runCreateEmptyWorkspace({
@@ -1427,9 +1463,11 @@ export function NewWorkspaceScreen({
       ensureWorkspace,
       forkDraftSetup,
       isStillOnCreateScreen,
+      isTimelineFork,
       launchTarget,
       leaveFullscreen,
       selectedServerId,
+      serverId,
       supportsForgeSearch,
       t,
       toast,
@@ -1587,13 +1625,7 @@ export function NewWorkspaceScreen({
       emptyText: pickerEmptyText,
       showRefPicker,
     },
-    launch: {
-      serverId: selectedServerId,
-      target: launchTarget,
-      onChange: setManualLaunchTarget,
-      profiles: terminalProfiles,
-      disabled: isPending,
-    },
+    launch: launchControl,
   });
 
   const importSession = useImportSession({ serverId: selectedServerId });
