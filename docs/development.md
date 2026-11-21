@@ -31,6 +31,14 @@ the titlebar row. Production builds leave the variable unset and show no label.
 
 ## Custom desktop builds
 
+Build a local desktop installer without Apple Developer ID signing or notarization:
+
+```bash
+npm run build:desktop:local
+```
+
+Local macOS builds use ad-hoc signing (`identity=-`) with Hardened Runtime disabled so `dyld` loads the bundled `Electron Framework` without a Developer ID Team ID.
+
 This fork defaults **Settings → About → Allow official updates** to off, including
 when upgrading an existing settings file. Official releases replace the custom
 application, so enable this only when switching back to upstream builds. The
