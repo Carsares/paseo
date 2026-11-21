@@ -1,7 +1,11 @@
 import { unarchiveWorkspaceAgents } from "./workspace-archive-service.js";
 import { createRestartRecovery } from "./agent/restart-recovery/index.js";
 import { createLifecyclePreparation } from "./agent/restart-recovery/lifecycle-preparation.js";
-import { sendPromptToAgent, unarchiveAgentState } from "./agent/agent-prompt.js";
+import {
+  sendPromptToAgent,
+  unarchiveAgentState,
+  waitForAgentRunStartWithTimeout,
+} from "./agent/agent-prompt.js";
 import { createChangeRequestWatches } from "./agent/change-request-watches/index.js";
 import { createIdleRuntimeCleanup } from "./agent/idle-runtime-cleanup/index.js";
 import {
@@ -131,6 +135,8 @@ export async function fanOutReconciledWorkspaceUpdates(input: {
 }
 
 import { VoiceAssistantWebSocketServer, isDaemonOriginAllowed } from "./websocket-server.js";
+import { MessageReceipts } from "./message-receipts/index.js";
+import { enqueueRecoverableAgentMessage, retainQueuedAgentMessage } from "./session.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
 import { createWorkspaceLabelService } from "./workspace-labels/index.js";
 import { createChangeRequestRouter } from "../services/change-request-router.js";
@@ -954,6 +960,7 @@ export async function createPaseoDaemon(
   }
 
   const agentStorage = new AgentStorage(config.agentStoragePath, logger);
+  const messageReceipts = new MessageReceipts(path.join(config.paseoHome, "agent-requests"));
   const projectRegistry = new FileBackedProjectRegistry(
     path.join(config.paseoHome, "projects", "projects.json"),
     logger,
@@ -1075,14 +1082,33 @@ export async function createPaseoDaemon(
   const restartRecovery = createRestartRecovery({
     storage: agentStorage,
     oneShotMarkerPath: path.join(config.paseoHome, "restart-recovery-once.json"),
+    automaticMarkerPath: path.join(config.paseoHome, "restart-recovery-pending.json"),
     settings: () => ({
       enabled: daemonConfigStore.get().resumeOnStartup === true,
       prompt: daemonConfigStore.get().resumePrompt ?? "Resume working.",
     }),
     eligible: async (record) =>
       !record.workspaceId || !(await workspaceRegistry?.get(record.workspaceId))?.archivedAt,
-    dispatch: (agentId, prompt) =>
-      sendPromptToAgent({ agentId, prompt, agentManager, agentStorage, logger, unarchive: false }),
+    dispatch: async (agentId, prompt) => {
+      const result = await sendPromptToAgent({
+        agentId,
+        prompt,
+        agentManager,
+        agentStorage,
+        logger,
+        unarchive: false,
+      });
+      if (result.disposition !== "turn_started") return;
+      try {
+        await waitForAgentRunStartWithTimeout(agentManager, agentId, result.started);
+      } catch (error) {
+        if (!(error instanceof Error) || error.name !== "AbortError") throw error;
+        // A wait timeout does not cancel the start. Keep the recovery intent and
+        // finish observers pending so a late success can consume it exactly once.
+        logger.warn({ agentId, err: error }, "Agent restart recovery start is unconfirmed");
+        await result.started;
+      }
+    },
     report: (agentId, err) => logger.error({ agentId, err }, "Agent restart recovery failed"),
   });
   await restartRecovery.prepareStartup();
@@ -1559,12 +1585,14 @@ export async function createPaseoDaemon(
   );
   logger.info({ elapsed: elapsed() }, "Preparing voice and MCP runtime");
 
+  let finishRecoveryReady = Promise.resolve();
   const finishSubscriptions = createFinishSubscriptions({
     store: createJsonFinishSubscriptionStore(config.paseoHome),
     followups: {
       watches: createJsonFinishSubscriptionStore(config.paseoHome, "finish-followup-watches.json"),
       reports: createJsonFinishSubscriptionStore(config.paseoHome, "finish-followup-reports.json"),
-      dispatch: (record, report) => {
+      dispatch: async (record, report) => {
+        await finishRecoveryReady;
         if (!wsServer) throw new Error("Daemon is not accepting agent messages");
         return wsServer.dispatchFinishReport(record, report);
       },
@@ -1586,7 +1614,10 @@ export async function createPaseoDaemon(
     ...createFinishObservation({
       agentManager,
       agentStorage,
-      waitForResume: restartRecovery.waitForResume,
+      waitForResume: async (agentId, signal) => {
+        await finishRecoveryReady;
+        await restartRecovery.waitForResume(agentId, signal);
+      },
       serverId,
       logger,
       messages: () => {
@@ -1619,9 +1650,31 @@ export async function createPaseoDaemon(
   ): PaseoToolHostDependencies => ({
     changeRequestWatches,
     finishSubscriptions: () => finishSubscriptions,
-    agentMessages: () => {
+    queueAgentPrompt: async (agentId, request) => {
       if (!wsServer) throw new Error("Daemon is not accepting agent messages");
-      return wsServer.agentMessages;
+      const context = {
+        agentManager,
+        agentStorage,
+        agentMessages: wsServer.agentMessages,
+        finishSubscriptions,
+        serverId,
+        logger,
+      };
+      const message = { ...request, messageId: randomUUID() };
+      let markAdmitted!: () => void;
+      const admitted = new Promise<void>((resolve) => {
+        markAdmitted = resolve;
+      });
+      const settled = messageReceipts.sendQueued({
+        agentId,
+        message,
+        request,
+        enqueue: (handoff) => enqueueRecoverableAgentMessage(context, agentId, message, handoff),
+        retainOnError: retainQueuedAgentMessage,
+        onQueued: markAdmitted,
+      });
+      await Promise.race([admitted, settled]);
+      return message.messageId;
     },
     serverId,
     hosts: () => {
@@ -1930,6 +1983,7 @@ export async function createPaseoDaemon(
                 daemonStatusRpc: dependencies.serverFeatureOverrides?.daemonStatusRpc,
                 relayConfig: dependencies.serverFeatureOverrides?.relayConfig,
                 startPaused: true,
+                messageReceipts,
               },
               workspaceAutoName,
               workspaceRuntimeStore,
@@ -1995,7 +2049,18 @@ export async function createPaseoDaemon(
             await pluginRuntime.start();
             providerSnapshotManager.settlePluginProviders();
             restartRecovery.resumePending();
-            await finishSubscriptions.start();
+            let releaseFinishRecovery!: () => void;
+            finishRecoveryReady = new Promise<void>((release) => {
+              releaseFinishRecovery = release;
+            });
+            try {
+              // Attach existing watches first so an accepted replay can supersede them.
+              // Hold observation and report dispatch until the restored prompts are queued.
+              await finishSubscriptions.start();
+              await wsServer.restoreQueuedAgentMessages();
+            } finally {
+              releaseFinishRecovery();
+            }
             await changeRequestWatches.start();
             wsServer.beginAcceptingConnections();
             const relaySecurityLogger = logger.child({ module: "relay-security" });

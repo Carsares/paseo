@@ -16437,6 +16437,64 @@ test.each(["turn_completed", "turn_failed", "turn_canceled"] as const)(
   },
 );
 
+test("shutdown steering checks authorization and queue ownership at the provider boundary", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-shutdown-steering-"));
+  const session = new SteeringTestSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const send = {
+    agentManager: manager,
+    agentStorage: storage,
+    agentId: agent.id,
+    prompt: "queued follow-up",
+    activeTurnBehavior: "steer" as const,
+    idleOnly: true,
+    canSteerDuringDrain: () => true,
+    logger,
+  };
+  try {
+    const original = await startAgentRun(manager, agent.id, "original", logger);
+    await dispatchStarted(original);
+    const validationStarted = Promise.withResolvers<void>();
+    const validation = Promise.withResolvers<void>();
+    const rejected = expect(
+      sendPreparedPromptToAgent({
+        ...send,
+        validateDispatch: () => {
+          validationStarted.resolve();
+          return validation.promise;
+        },
+      }),
+    ).rejects.toThrow("no longer the direct parent");
+    await validationStarted.promise;
+    expect(session.steerCount).toBe(0);
+    validation.reject(new Error("no longer the direct parent"));
+    await rejected;
+    await expect(sendPreparedPromptToAgent({ ...send, admit: () => false })).rejects.toThrow(
+      "withdrawn",
+    );
+    expect(session.steerCount).toBe(0);
+
+    session.steerResult = "unavailable";
+    await expect(sendPreparedPromptToAgent(send)).rejects.toBeInstanceOf(AgentTurnBusyError);
+    expect(session.steerCount).toBe(1);
+    expect(session.interruptCount).toBe(0);
+    expect(session.startPrompts).toEqual(["original"]);
+    expect(manager.hasInFlightRun(agent.id)).toBe(true);
+  } finally {
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("an idle-only prompt waits for idle and checks admission before handoff", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-queued-mode-"));
   class ModeSession extends SteeringTestSession {

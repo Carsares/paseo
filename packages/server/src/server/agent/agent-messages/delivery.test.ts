@@ -648,6 +648,118 @@ test("shutdown flushes a dispatch that discovered a concurrent turn during prepa
   expect(modes).toEqual([true, false]);
 });
 
+test("shutdown preparation drains busy recipients and keeps each batch's receipt pending until dispatch", async () => {
+  const clock = createClock();
+  const entered = Promise.withResolvers<void>();
+  const releaseDispatch = Promise.withResolvers<void>();
+  const sent: string[][] = [];
+  let running = true;
+  let wake!: (recipientId: string) => void;
+  const delivery = createAgentMessageDelivery({
+    schedule: clock.schedule,
+    isRunning: () => running,
+    subscribe(listener) {
+      wake = listener;
+      return () => {};
+    },
+    async dispatch(request) {
+      expect(request.idleOnly).toBe(true);
+      sent.push([...request.messageIds]);
+      if (request.messageIds.includes("first")) {
+        entered.resolve();
+        await releaseDispatch.promise;
+      }
+      return "turn_started";
+    },
+    onError: () => {},
+  });
+  const enqueue = (messageId: string, sessionMode: string) =>
+    delivery.enqueue({
+      recipientId: "parent",
+      messageId,
+      prompt: messageId,
+      source: { kind: "agent-message", agentId: "child" },
+      sessionMode,
+    });
+  const first = enqueue("first", "review");
+  clock.advance(2000);
+  const second = enqueue("second", "default");
+  const paused = delivery.pauseAdmission();
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sent).toEqual([]);
+    running = false;
+    wake("parent");
+    expect(
+      await Promise.race([
+        entered.promise.then(() => "dispatch"),
+        paused.drained.then(() => "drained"),
+      ]),
+    ).toBe("dispatch");
+    expect(sent).toEqual([["first"]]);
+    expect(delivery.hasPending("parent")).toBe(true);
+    const firstStatus = await Promise.race([first.dispatched, Promise.resolve("pending")]);
+    expect(firstStatus).toBe("pending");
+    expect(() => enqueue("while-paused", "default")).toThrow("preparing for shutdown");
+
+    releaseDispatch.resolve();
+    await paused.drained;
+    await expect(first.dispatched).resolves.toBe("turn_started");
+    await expect(second.dispatched).resolves.toBe("turn_started");
+    expect(sent).toEqual([["first"], ["second"]]);
+    expect(delivery.hasPending("parent")).toBe(false);
+  } finally {
+    releaseDispatch.resolve();
+    paused.release();
+    await delivery.close();
+  }
+});
+
+test("shutdown preparation drains an earlier declined out-of-band offer ahead of newer queued messages", async () => {
+  const clock = createClock();
+  const attempted = Promise.withResolvers<void>();
+  const offer = Promise.withResolvers<boolean>();
+  const sent: string[] = [];
+  let running = true;
+  const delivery = createAgentMessageDelivery({
+    schedule: clock.schedule,
+    isRunning: () => running,
+    tryRunOutOfBand: () => {
+      attempted.resolve();
+      return offer.promise;
+    },
+    async dispatch(request) {
+      sent.push(...request.messageIds);
+      return "steered";
+    },
+    onError: () => {},
+  });
+  const enqueue = (messageId: string) =>
+    delivery.enqueue({
+      recipientId: "parent",
+      messageId,
+      prompt: messageId,
+      source: { kind: "agent-message", agentId: "child" },
+    });
+  const first = enqueue("first");
+  clock.advance(2000);
+  await attempted.promise;
+  const second = enqueue("second");
+  const paused = delivery.pauseAdmission();
+  try {
+    running = false;
+    offer.resolve(false);
+    await paused.drained;
+    expect(sent).toEqual(["first", "second"]);
+    await expect(first.dispatched).resolves.toBe("steered");
+    await expect(second.dispatched).resolves.toBe("steered");
+  } finally {
+    offer.resolve(false);
+    paused.release();
+    await delivery.close();
+  }
+});
+
 test("conflicting modes dispatch on separate turn ends without changing the active turn mode", async () => {
   const clock = createClock();
   let busy = false;

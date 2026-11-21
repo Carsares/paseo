@@ -3,7 +3,11 @@ import type {
   AgentSessionConfig,
   AgentStreamEvent,
 } from "../agent-sdk-types.js";
-import { getParentAddressFromLabels, parentAddressLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  getParentAddressFromLabels,
+  isExplicitParentReportingLabels,
+  parentAddressLabels,
+} from "@getpaseo/protocol/agent-labels";
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import type { ActiveTurnBehavior, AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { randomUUID } from "node:crypto";
@@ -200,6 +204,20 @@ export function createToolHosts(hosts: ConnectedHosts): ToolHosts {
         clientId: randomUUID(),
         transportFactory,
         reconnect: { enabled: false },
+        onAgentFinishReportConfirm: async (request) => {
+          if (request.parentServerId !== serverId || request.childAgentId !== directParentAgentId) {
+            return {
+              accepted: false,
+              error: "Report confirmation does not match the active route.",
+            };
+          }
+          return (
+            (await hosts.finishReportConfirmationHandler()?.(request)) ?? {
+              accepted: false,
+              error: "Report confirmation is unavailable.",
+            }
+          );
+        },
       });
       const stop = () => void client.close();
       signal?.addEventListener("abort", stop, { once: true });
@@ -256,11 +274,17 @@ const result = (structuredContent: unknown): PaseoToolResult => ({
   structuredContent,
 });
 
-function assertRemoteHierarchySupport(
+function assertRemoteCreationSupport(
   client: DaemonClient,
   callerAgentId: string | undefined,
   labels: Record<string, string> | undefined,
 ): void {
+  // COMPAT(agentExplicitParentReports): added in v0.17.0, remove gate after 2027-05-22.
+  if (isExplicitParentReportingLabels(labels) && !supportsExplicitReports(client)) {
+    throw new HostOperationRejectedError(
+      new Error("Update the destination Paseo host to use explicit parent reporting."),
+    );
+  }
   // COMPAT(agentHierarchyControl): added in v0.16.0, remove gate after 2027-05-19.
   if (
     callerAgentId &&
@@ -273,6 +297,31 @@ function assertRemoteHierarchySupport(
   }
 }
 
+function supportsExplicitReports(client: DaemonClient): boolean {
+  return client.getLastServerInfoMessage()?.features?.agentExplicitParentReports === true;
+}
+
+function canQueueDirectParentPrompt(client: DaemonClient, restricted: boolean): boolean {
+  // COMPAT(agentDirectParentQueuedDelivery): added in v0.17.0, remove after 2027-05-22.
+  const features = client.getLastServerInfoMessage()?.features;
+  return (
+    restricted &&
+    features?.agentDirectParentQueuedDelivery === true &&
+    features.agentFinishReportPull === true
+  );
+}
+
+function remoteTurnOptions(
+  queueDirectParent: boolean,
+  directParent: boolean,
+  notifyOnFinish: unknown,
+) {
+  if (queueDirectParent) {
+    return { notifyDirectParentOnFinish: notifyOnFinish === true ? true : undefined };
+  }
+  return { waitForDispatch: directParent ? true : undefined };
+}
+
 function shouldObserveRemoteFollowups(
   client: DaemonClient,
   labels: Record<string, string> | undefined,
@@ -280,9 +329,10 @@ function shouldObserveRemoteFollowups(
 ): boolean {
   // COMPAT(agentFinishReportPull): added in v0.16.0, remove gate after 2027-05-19.
   return (
-    notifyOnFinish !== false &&
-    labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] === "1" &&
-    client.getLastServerInfoMessage()?.features?.agentFinishReportPull === true
+    supportsExplicitReports(client) ||
+    (notifyOnFinish !== false &&
+      labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] === "1" &&
+      client.getLastServerInfoMessage()?.features?.agentFinishReportPull === true)
   );
 }
 
@@ -303,6 +353,23 @@ export function createHostResolver(input: {
     | null;
   lockedCwd?: string;
 }) {
+  async function trackFollowups(
+    client: DaemonClient,
+    agent: AgentSnapshotPayload,
+    destination: string,
+    notifyOnFinish?: boolean,
+  ): Promise<void> {
+    const parent = getParentAddressFromLabels(agent.labels, destination);
+    if (
+      parent?.serverId !== input.serverId ||
+      parent.agentId !== input.callerAgentId ||
+      !shouldObserveRemoteFollowups(client, agent.labels, notifyOnFinish)
+    )
+      return;
+    await input.trackRemoteChild?.(agent.id, destination).catch((error) => {
+      throw new HostOperationRejectedError(error);
+    });
+  }
   return {
     directory: () => input.hosts().directory(),
     async use<T>(
@@ -320,7 +387,7 @@ export function createHostResolver(input: {
         action({
           async createAgent(args) {
             const parsed = remoteCreate.parse(args);
-            assertRemoteHierarchySupport(client, input.callerAgentId, parsed.labels);
+            assertRemoteCreationSupport(client, input.callerAgentId, parsed.labels);
             const { provider, model } = resolveRequiredProviderModel(parsed.provider);
             const caller = input.caller();
             const sameProviderCaller = caller?.provider === provider ? caller : null;
@@ -388,23 +455,21 @@ export function createHostResolver(input: {
             )?.agent;
             if (!agent)
               throw new HostOperationRejectedError(new Error(`Agent ${agentId} not found`));
-            const parent = getParentAddressFromLabels(agent.labels, destination);
-            if (
-              parent?.serverId === input.serverId &&
-              parent.agentId === input.callerAgentId &&
-              shouldObserveRemoteFollowups(
-                client,
-                agent.labels,
-                args.notifyOnFinish as boolean | undefined,
-              )
-            ) {
-              await input.trackRemoteChild?.(agentId, destination).catch((error) => {
-                throw new HostOperationRejectedError(error);
-              });
-            }
+            await trackFollowups(
+              client,
+              agent,
+              destination,
+              args.notifyOnFinish as boolean | undefined,
+            );
+            const directParent = args.requireParentOwnership === true;
+            const queueDirectParent = canQueueDirectParentPrompt(client, directParent);
+            const prepareLegacyNotification = args.prepareLegacyNotification as
+              | (() => Promise<void>)
+              | undefined;
+            if (!queueDirectParent) await prepareLegacyNotification?.();
             const receipt = await client
               .sendMessage(agentId, args.prompt as string, {
-                waitForDispatch: args.requireParentOwnership === true ? true : undefined,
+                ...remoteTurnOptions(queueDirectParent, directParent, args.notifyOnFinish),
                 sessionMode: input.callerAgentId
                   ? (args.sessionMode as string | undefined)
                   : undefined,
@@ -424,7 +489,7 @@ export function createHostResolver(input: {
               status: agent.status,
               guidance:
                 receipt.deliveryStatus === "queued"
-                  ? "Queued for delivery after two quiet seconds and the current turn ends, unless interrupt was requested. You will get notified when the prompted agent finishes, errors, or needs permission unless notifyOnFinish is false."
+                  ? "Queued for delivery after two quiet seconds and the current turn ends, unless interrupt was requested."
                   : "Dispatch acknowledged. Observe completion using get_agent_status/get_agent_activity or SDK/RPC subscriptions and wait APIs.",
             });
           },

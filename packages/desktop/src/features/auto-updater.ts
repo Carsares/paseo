@@ -357,6 +357,8 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
         resolve();
       };
       const onHandoff = () => {
+        // BaseUpdater can emit this as soon as it starts the installer, before
+        // installation succeeds or the user cancels elevation on Windows.
         // MacUpdater calls app.quit() synchronously on the no-relaunch path.
         // A user quit while the attempt waits cannot acknowledge that call.
         if (useAppQuit && !macUpdateQuitInProgress) return;

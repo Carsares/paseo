@@ -16,6 +16,7 @@ export interface AppUpdateCheckResult {
 }
 
 export interface AppUpdateInstallResult {
+  /** The native updater accepted the handoff. The next launch determines the installed version. */
   installed: boolean;
   version: string | null;
   message: string;
@@ -52,6 +53,7 @@ export interface AppUpdateRuntime {
   checkForUpdates(): Promise<RuntimeUpdateCheckResult | null>;
   downloadUpdate(targetVersion: string): Promise<unknown>;
   getInstallBlockReason?(): string | undefined;
+  /** Resolves after the native updater takes ownership of quitting the app. */
   quitAndInstall(
     input: AppUpdateInstallRequest,
     beforeHandoff?: () => Promise<void>,

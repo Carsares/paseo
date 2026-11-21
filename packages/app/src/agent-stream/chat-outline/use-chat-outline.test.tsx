@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { createRef, useLayoutEffect } from "react";
+import { createRef, useLayoutEffect, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createNativeReadingPositionTracker } from "../native-reading-position";
 import type { StreamViewportHandle } from "../strategy";
 import type { ChatOutlinePrompt } from "./model";
-import { useChatOutline, type ChatOutline } from "./use-chat-outline";
+import { shouldTrackChatOutline, useChatOutline, type ChatOutline } from "./use-chat-outline";
 
 const runtime = vi.hoisted(() => ({
   listAgentTimelinePrompts: vi.fn(),
@@ -40,11 +41,53 @@ function useReportInitialReading(
   }, [reportReadingPosition, timelineEpoch]);
 }
 
+function useReportStationaryNativeReading(
+  reportReadingPosition: ChatOutline["reportReadingPosition"],
+  epoch: string,
+  seq: number,
+) {
+  const [tracker] = useState(createNativeReadingPositionTracker);
+  useLayoutEffect(() => {
+    tracker.report("same-visible-row", () => reportReadingPosition(seq), epoch);
+  }, [epoch, reportReadingPosition, seq, tracker]);
+}
+
 describe("useChatOutline", () => {
   beforeEach(() => {
     runtime.listAgentTimelinePrompts.mockReset();
     runtime.fetchAgentTimeline.mockReset();
     runtime.subscribeAgentTimeline.mockClear();
+  });
+
+  it("requests the native prompt index only after the host advertises it", async () => {
+    runtime.listAgentTimelinePrompts.mockResolvedValue({ epoch: "epoch", prompts: [] });
+    const viewportRef = createRef<StreamViewportHandle>();
+    const { rerender } = renderHook(
+      ({ supportsPromptIndex }) =>
+        useChatOutline({
+          agentId: "agent-1",
+          serverId: "server-1",
+          timelineEpoch: "epoch",
+          tail: [],
+          head: [],
+          enabled: shouldTrackChatOutline({
+            isNative: true,
+            railEnabled: false,
+            supportsPromptIndex,
+          }),
+          viewportRef,
+          onJumpError: vi.fn(),
+        }),
+      { initialProps: { supportsPromptIndex: false } },
+    );
+    expect(runtime.listAgentTimelinePrompts).not.toHaveBeenCalled();
+    rerender({ supportsPromptIndex: true });
+    await waitFor(() =>
+      expect(runtime.listAgentTimelinePrompts).toHaveBeenCalledExactlyOnceWith("agent-1"),
+    );
+    rerender({ supportsPromptIndex: false });
+    await act(async () => {});
+    expect(runtime.listAgentTimelinePrompts).toHaveBeenCalledTimes(1);
   });
 
   it("waits for a served timeline before requesting its prompt index", async () => {
@@ -127,6 +170,46 @@ describe("useChatOutline", () => {
       });
     },
   );
+
+  it("updates the active prompt and jump when a stationary native reading row changes epoch", async () => {
+    const first = { seq: 1, timestamp: new Date(1).toISOString(), preview: "Original prompt" };
+    const replacement = {
+      seq: 15,
+      timestamp: new Date(15).toISOString(),
+      preview: "Replacement prompt",
+    };
+    runtime.listAgentTimelinePrompts
+      .mockResolvedValueOnce({ epoch: "epoch-a", prompts: [first] })
+      .mockResolvedValueOnce({ epoch: "epoch-b", prompts: [replacement] });
+    runtime.fetchAgentTimeline.mockResolvedValue(undefined);
+    const viewportRef = createRef<StreamViewportHandle>();
+    const { result, rerender } = renderHook(
+      ({ epoch, seq }) => {
+        const outline = useChatOutline({
+          agentId: "agent-1",
+          serverId: "server-1",
+          timelineEpoch: epoch,
+          tail: [],
+          head: [],
+          enabled: true,
+          viewportRef,
+          onJumpError: vi.fn(),
+        });
+        useReportStationaryNativeReading(outline.reportReadingPosition, epoch, seq);
+        return outline;
+      },
+      { initialProps: { epoch: "epoch-a", seq: 2 } },
+    );
+    await waitFor(() => expect(result.current.activePrompt.getReadingState().activeSeq).toBe(1));
+    rerender({ epoch: "epoch-b", seq: 16 });
+    await waitFor(() => expect(result.current.activePrompt.getReadingState().activeSeq).toBe(15));
+    await act(async () => result.current.jumpToPrompt(15));
+    expect(runtime.fetchAgentTimeline).toHaveBeenCalledExactlyOnceWith(
+      "server-1",
+      "agent-1",
+      expect.objectContaining({ cursor: { epoch: "epoch-b", seq: 36 } }),
+    );
+  });
 
   it("preserves a reading row reported during the layout of a newly served timeline", async () => {
     const prompt = { seq: 4, timestamp: new Date(4).toISOString(), preview: "Latest prompt" };

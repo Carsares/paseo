@@ -79,6 +79,7 @@ interface AssistantSelectionQuoteProps {
   workspaceId?: string;
   agentId?: string;
   selectionButtons?: readonly RegisteredPluginButton[];
+  canSubmitSelection?: (agentId: string, workspaceId: string) => boolean;
   onQuote?: (quote: ComposerQuote) => void;
   subagentSpawnMode?: SelectionSubagentSpawnMode;
   onSpawnSubagentFromSelection?: (
@@ -105,6 +106,7 @@ function SelectionActions({
   workspaceId,
   agentId,
   selectionButtons = NO_SELECTION_BUTTONS,
+  canSubmitSelection,
   onQuote,
   subagentSpawnMode = "child",
   onSpawnSubagentFromSelection,
@@ -281,6 +283,7 @@ function SelectionActions({
     selectionButtons,
     contextSelection,
     runPluginSelectionAction,
+    canSubmitSelection,
   );
   const spawnSubagentFromMenu = useCallback(() => {
     if (!onSpawnSubagentFromSelection || !menuSelection) return;
@@ -364,6 +367,7 @@ function SelectionActions({
         workspaceId={workspaceId}
         agentId={agentId}
         selectionButtons={selectionButtons}
+        canSubmitSelection={canSubmitSelection}
         onPluginMenuOpen={recordFloatingMenu}
         onPluginMenuClose={dismissPluginSelection}
         onPluginAction={runPluginSelectionAction}
@@ -470,6 +474,7 @@ function QuoteButton({
   workspaceId,
   agentId,
   selectionButtons,
+  canSubmitSelection,
   onPluginMenuOpen,
   onPluginMenuClose,
   onPluginAction,
@@ -484,6 +489,7 @@ function QuoteButton({
   workspaceId?: string;
   agentId?: string;
   selectionButtons: readonly RegisteredPluginButton[];
+  canSubmitSelection?: (agentId: string, workspaceId: string) => boolean;
   onPluginMenuOpen(restoreFocus: HTMLElement | null): void;
   onPluginMenuClose(): void;
   onPluginAction(run: () => void): void;
@@ -607,6 +613,7 @@ function QuoteButton({
           openKey={openMenu?.key ?? null}
           onOpenChange={handlePluginMenuOpenChange}
           onAction={onPluginAction}
+          canSubmit={canSubmitSelection}
         />
       ) : null}
     </AnchoredSurface>

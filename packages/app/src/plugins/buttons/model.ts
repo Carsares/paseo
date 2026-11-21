@@ -10,6 +10,7 @@ import type {
   PluginSelectionButtonRegistration,
   PluginTimelineSelection,
 } from "@getpaseo/plugin/client";
+import { beginComposerWork } from "@/composer/handoff-input-lock";
 import type { InstalledPlugin } from "../types";
 import {
   requireButtonId,
@@ -29,6 +30,7 @@ export interface RegisteredPluginButton {
   placement: ButtonPlacement;
   context: PluginButtonContext;
   button: ResolvedPluginButton;
+  requiresComposerSubmission?: boolean;
   pending: boolean;
   open: boolean;
 }
@@ -102,6 +104,9 @@ export class PluginButtonStore {
         ? { context: "workspace", workspaceId }
         : { context: "agent", workspaceId, agentId },
       validateSelectionButton,
+      // COMPAT(quickPromptsSelectionSubmission): existing Quick Prompts installs do not declare this yet.
+      input.requiresComposerSubmission === true ||
+        (installation.id === "quick-prompts" && input.id.trim() === "quick-prompts"),
     );
   }
 
@@ -115,6 +120,7 @@ export class PluginButtonStore {
       validation: ButtonValidation,
       resolve: (text: PluginText) => string,
     ) => ResolvedPluginButton,
+    requiresComposerSubmission = false,
   ): { update(patch: Partial<Button>): void; remove(): void } {
     const { signal } = installation.lifetime;
     if (signal.aborted) throw new Error("Plugin has stopped");
@@ -158,6 +164,7 @@ export class PluginButtonStore {
         placement,
         context,
         button: initialButton,
+        ...(requiresComposerSubmission ? { requiresComposerSubmission } : {}),
         pending: false,
         open: false,
       },
@@ -187,6 +194,7 @@ export class PluginButtonStore {
     key: number,
     path: readonly string[] = [],
     selection?: PluginTimelineSelection,
+    canSubmitSelection?: (agentId: string, workspaceId: string) => boolean,
   ): Promise<void> {
     const entry = this.entries.find((candidate) => candidate.key === key);
     if (!entry || !entry.button.visible || entry.button.disabled || entry.pending) return;
@@ -196,7 +204,21 @@ export class PluginButtonStore {
     if (!invoke) return;
     this.replace(key, { pending: true });
     try {
-      if (!entry.installation.lifetime.signal.aborted) await invoke();
+      if (entry.installation.lifetime.signal.aborted) return;
+      if (!entry.requiresComposerSubmission) {
+        await invoke();
+        return;
+      }
+      if (!selection || !canSubmitSelection?.(selection.agentId, selection.workspaceId)) {
+        throw new Error("This chat no longer accepts prompts.");
+      }
+      const finish = beginComposerWork(entry.installation.serverId, selection.agentId, "submit");
+      if (!finish) throw new Error("The composer is busy. Try again when it is available.");
+      try {
+        await invoke();
+      } finally {
+        finish();
+      }
     } finally {
       this.replace(key, { pending: false });
     }
@@ -261,8 +283,10 @@ export function selectionButtonMatches(
   serverId: string,
   workspaceId: string,
   agentId: string,
+  canSubmit = true,
 ): boolean {
   return (
+    (!entry.requiresComposerSubmission || canSubmit) &&
     entry.placement === "selection" &&
     entry.installation.serverId === serverId &&
     entry.context.workspaceId === workspaceId &&

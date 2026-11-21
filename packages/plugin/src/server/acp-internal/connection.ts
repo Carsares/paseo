@@ -442,6 +442,7 @@ class AcpRuntime {
    * Once ready, suppress late replay rows until the first prompt.
    */
   private replayWindow: "replay" | "skip" | null = null;
+  private sawLoadTimeline = false;
   private lastLoadUpdateAt = 0;
   private closing = false;
   private closePromise: Promise<void> | null = null;
@@ -529,7 +530,12 @@ class AcpRuntime {
     this.child = child;
     this.closeConnector = closeConnector;
     this.whenConnectorClosed = whenConnectorClosed;
-    this.emit = options.emit;
+    this.emit = (event) => {
+      if (this.replayWindow === "replay" && event.type === "timeline.item") {
+        this.sawLoadTimeline = true;
+      }
+      options.emit(event);
+    };
     this.transformers = options.options.transformers ?? [];
     const client: Client = {
       requestPermission: (request) => this.requestPermission(request),
@@ -646,12 +652,32 @@ class AcpRuntime {
     if (this.options.options.acpOptions?.waitForInitialCommands) {
       await this.waitForInitialCommands();
     }
+    if (nativeSessionId) await this.finishLoadReplay(nativeSessionId, input);
+    return sessionCapabilities;
+  }
+
+  private async finishLoadReplay(
+    nativeSessionId: string,
+    input: Extract<ProviderInput, { type: "session.open" }>,
+  ): Promise<void> {
     const quietPeriod = this.options.options.acpOptions?.loadReplayQuietPeriodMs;
     if (this.replayWindow && quietPeriod && quietPeriod > 0) {
       await this.waitForLoadReplay(quietPeriod);
       this.replayWindow = "skip";
     }
-    return sessionCapabilities;
+    if (input.history !== "replay" || this.sawLoadTimeline) return;
+    for (const transformer of this.transformers) {
+      const entries = await transformer.loadHistoryFallback?.({
+        nativeSessionId,
+        launch: this.options.launch,
+        config: input.config,
+      });
+      if (!entries?.length) continue;
+      for (const { item, timestamp } of entries) {
+        this.emit({ type: "timeline.item", sessionId: input.sessionId, item, timestamp });
+      }
+      return;
+    }
   }
 
   async discover(cwd?: string): Promise<ProviderCatalog> {

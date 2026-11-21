@@ -8,6 +8,7 @@ import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
+import type { QueueHandoff } from "../message-receipts/index.js";
 
 export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "unarchiveSnapshot">;
 
@@ -28,6 +29,10 @@ export class AgentTurnBusyError extends Error {}
 
 export interface StartAgentRunOptions {
   idleOnly?: boolean;
+  /** If busy, try an admitted steer without replacing or switching the active turn. */
+  admitSteer?: () => Promise<boolean>;
+  beforeHandoff?: () => Promise<void>;
+  onSteerDeclined?: () => Promise<void>;
   admit?: () => boolean;
   /** Called after selecting the run, before consuming its events. */
   onDispatch?: (disposition: PromptDispatchDisposition) => void;
@@ -70,6 +75,8 @@ async function steerOrReplaceActiveRun(
     prompt,
     steerOptions,
     promptStart,
+    options.admitSteer,
+    options.onSteerDeclined,
   );
   if (result.status === "steered") {
     return { disposition: "steered" };
@@ -105,6 +112,14 @@ async function drainAgentRunIterator(
   }
 }
 
+function admitOutOfBand(options?: StartAgentRunOptions): (() => Promise<void>) | undefined {
+  if (!options?.admit && !options?.beforeHandoff) return undefined;
+  return async () => {
+    if (options?.admit?.() === false) throw new Error("Queued agent message was withdrawn");
+    await options?.beforeHandoff?.();
+  };
+}
+
 export async function startAgentRun(
   agentManager: AgentRunController,
   agentId: string,
@@ -128,17 +143,12 @@ export async function startAgentRun(
   // Out-of-band commands (e.g. /goal pause) must run WITHOUT canceling an
   // in-flight turn — replaceAgentRun would interrupt the running turn. The
   // intercept lives at this layer so it covers every prompt entrypoint.
-  const admit = options?.admit;
-  const admitCommand = admit
-    ? () => {
-        if (!admit()) throw new Error("Queued agent message was withdrawn");
-      }
-    : undefined;
+  const admitCommand = admitOutOfBand(options);
   if (await agentManager.tryRunOutOfBand(agentId, prompt, options?.runOptions, admitCommand)) {
     options?.onDispatch?.("out_of_band");
     return { disposition: "out_of_band" };
   }
-  const promptStart = new ForegroundPromptStart(agentId, admit);
+  const promptStart = new ForegroundPromptStart(agentId, options?.admit, options?.beforeHandoff);
   try {
     try {
       await agentManager.reloadStalePluginSession(agentId);
@@ -169,15 +179,16 @@ async function startAgentRunInner(
   promptStart: ForegroundPromptStart,
 ): Promise<PromptDispatchResult> {
   const snapshot = agentManager.getAgent(agentId);
-  const steered = options?.idleOnly
-    ? null
-    : await steerOrReplaceActiveRun(agentManager, agentId, prompt, options, promptStart);
-  if (options?.idleOnly && agentManager.hasInFlightRun(agentId)) {
-    throw new AgentTurnBusyError(`Agent ${agentId} is running`);
-  }
+  const steered =
+    options?.idleOnly && !options.admitSteer
+      ? null
+      : await steerOrReplaceActiveRun(agentManager, agentId, prompt, options, promptStart);
   if (steered?.disposition === "steered") {
     options?.onDispatch?.("steered");
     return steered;
+  }
+  if (options?.idleOnly && agentManager.hasInFlightRun(agentId)) {
+    throw new AgentTurnBusyError(`Agent ${agentId} is running`);
   }
   const { iterator, replaced } = steered
     ? { iterator: steered.iterator, replaced: true }
@@ -251,6 +262,9 @@ export async function unarchiveAgentState(
 
 export interface SendPromptToAgentParams {
   idleOnly?: boolean;
+  canSteerDuringDrain?: () => boolean;
+  validateDispatch?: () => Promise<void>;
+  handoff?: QueueHandoff;
   admit?: StartAgentRunOptions["admit"];
   /** Awaited after the agent is loaded and its mode is set, before the prompt is handed to a run. */
   beforeDispatch?: () => Promise<void>;
@@ -411,7 +425,11 @@ export async function sendPreparedPromptToAgent(
     throw error;
   }
 
-  if (params.idleOnly && params.agentManager.hasInFlightRun(params.agentId)) {
+  if (
+    params.idleOnly &&
+    !params.canSteerDuringDrain?.() &&
+    params.agentManager.hasInFlightRun(params.agentId)
+  ) {
     throw new AgentTurnBusyError(`Agent ${params.agentId} is running`);
   }
   if (params.sessionMode) {
@@ -422,9 +440,27 @@ export async function sendPreparedPromptToAgent(
   if (!params.idleOnly && params.admit?.() === false) {
     throw new Error("Queued agent message was withdrawn");
   }
+  const beforeHandoff = params.handoff
+    ? async () => {
+        await params.validateDispatch?.();
+        await params.handoff!.begin();
+        await params.validateDispatch?.();
+      }
+    : undefined;
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
     replaceRunning: !params.idleOnly,
     idleOnly: params.idleOnly,
+    admitSteer: params.canSteerDuringDrain
+      ? async () => {
+          await params.validateDispatch?.();
+          if (!params.canSteerDuringDrain?.()) return false;
+          if (params.admit?.() === false) throw new Error("Queued agent message was withdrawn");
+          await beforeHandoff?.();
+          return true;
+        }
+      : undefined,
+    beforeHandoff,
+    onSteerDeclined: params.handoff?.declined,
     admit: params.admit,
     onDispatch: params.onDispatch,
     activeTurnBehavior: params.activeTurnBehavior,

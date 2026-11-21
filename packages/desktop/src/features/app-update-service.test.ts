@@ -301,6 +301,32 @@ describe("app update service", () => {
     expect(result).toMatchObject({ installed: false, message: expect.stringContaining("refused") });
   });
 
+  it("does not launch the approved installer if recovery could not be saved", async () => {
+    const { runtime, service } = createService();
+    runtime.nextCheck({ isUpdateAvailable: true, updateInfo: rolledOutUpdate });
+    const restore = vi.fn(async () => {});
+    const beforeQuit = vi.fn(async () => ({
+      restore,
+      beforeHandoff: async () => {
+        throw new Error("Could not save app update recovery");
+      },
+    }));
+
+    await expect(
+      service.downloadAndInstallUpdate(
+        { currentVersion: "1.2.3", releaseChannel: "stable" },
+        beforeQuit,
+      ),
+    ).resolves.toEqual({
+      installed: false,
+      version: "1.2.3",
+      message: "Update failed: Could not save app update recovery",
+    });
+    expect(beforeQuit).toHaveBeenCalledExactlyOnceWith({ version: "1.2.4" });
+    expect(runtime.installModes).toEqual([]);
+    expect(restore).toHaveBeenCalledOnce();
+  });
+
   it("keeps the daemon stopped and saves recovery when an ordinary quit install fails", async () => {
     const { runtime, service } = createService();
     const input = { currentVersion: "1.2.3", releaseChannel: "stable" } as const;

@@ -2,6 +2,7 @@ import {
   type ReactElement,
   type ReactNode,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -47,6 +48,7 @@ import {
 import { EndPinnedScrollView } from "./native-end-pin";
 import {
   createNativeReadingPositionTracker,
+  NativeReadingEpochContext,
   findNativeMessageRowIndex,
   findNativeReadingStartIndex,
   resolveNativeReadingRowId,
@@ -274,6 +276,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
       load: async () => onNearHistoryStart(),
       scheduleSettle: () => scheduleHistoryStartSettle(),
     });
+  const readingEpoch = useContext(NativeReadingEpochContext);
   const [readingPositionTracker] = useState(createNativeReadingPositionTracker);
   const readingAgentIdRef = useRef(agentId);
   const canReadPosition =
@@ -307,7 +310,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
             sizeAtIndex: state.sizeAtIndex,
           });
           if (firstReadableIndex === null) {
-            readingPositionTracker.report(null, onReadingPositionChange);
+            readingPositionTracker.report(null, onReadingPositionChange, readingEpoch);
             return;
           }
           startIndex = firstReadableIndex;
@@ -319,6 +322,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
       readingPositionTracker.report(
         resolveNativeReadingRowId({ rows, startIndex, viewableItems, readingRowReplacements }),
         onReadingPositionChange,
+        readingEpoch,
       );
     },
   );
@@ -328,7 +332,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
     if (!isActive || changedAgent) readingPositionTracker.reset();
     if (!isActive || !onReadingPositionChange) return;
     if (changedAgent || !canReadPosition)
-      readingPositionTracker.report(null, onReadingPositionChange);
+      readingPositionTracker.report(null, onReadingPositionChange, readingEpoch);
     if (!canReadPosition) return;
     // LegendList only emits when the visible set changes, including during the hidden initial fill.
     handleViewableItemsChanged();
@@ -339,8 +343,10 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
     isActive,
     onReadingPositionChange,
     readingLineInset,
+    readingEpoch,
     readingPositionTracker,
     readingRowReplacements,
+    rows,
   ]);
   const evaluateHistoryStart = useStableEvent(() => historyStartPagination.update());
   const disposeHistoryStart = useStableEvent(() => historyStartPagination.dispose());

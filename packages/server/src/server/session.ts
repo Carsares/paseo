@@ -30,7 +30,11 @@ import { relative } from "node:path";
 import { isAbsolute } from "node:path";
 import { CreationService, type CreatedAgent } from "./creation/index.js";
 import type { CreationSnapshot, AgentCreateRequest } from "@getpaseo/protocol/messages";
-import type { MessageReceipts } from "./message-receipts/index.js";
+import type {
+  MessageReceipts,
+  QueueHandoff,
+  RecoverableAgentMessage,
+} from "./message-receipts/index.js";
 import {
   isDaemonBackgroundWorkItem,
   type AgentBackgroundWorkItem,
@@ -146,6 +150,7 @@ import {
 
 import {
   AgentManager,
+  AgentManagerShuttingDownError,
   AgentRunCancellationError,
   REMOTE_CHILD_RESERVATION_LABEL,
 } from "./agent/agent-manager.js";
@@ -193,6 +198,7 @@ import {
   getAgentStreamEventTurnId,
   type AgentPersistenceHandle,
   type AgentPermissionResponse,
+  type AgentPromptInput,
   type AgentRunOptions,
   type AgentSessionConfig,
 } from "./agent/agent-sdk-types.js";
@@ -563,6 +569,135 @@ class SessionRequestError extends Error {
   ) {
     super(message);
     this.name = "SessionRequestError";
+  }
+}
+
+type QueuedMessageContext = Pick<
+  SessionOptions,
+  "agentManager" | "agentStorage" | "agentMessages" | "finishSubscriptions" | "serverId" | "logger"
+>;
+
+export function retainQueuedAgentMessage(error: unknown): boolean {
+  return error instanceof AgentManagerShuttingDownError;
+}
+
+async function validateDirectParentPrompt(
+  context: Pick<QueuedMessageContext, "agentStorage" | "agentManager" | "serverId">,
+  agentId: string,
+  parent: NonNullable<ReturnType<typeof readDirectParentRoute>>,
+  allowArchived = false,
+): Promise<void> {
+  const stored = await context.agentStorage.get(agentId);
+  const labels = stored?.archivedAt
+    ? stored.labels
+    : (context.agentManager.getAgent(agentId)?.labels ?? stored?.labels);
+  if (!context.serverId || (stored?.archivedAt && !allowArchived))
+    throw new DirectParentRequiredError();
+  assertDirectParent(labels, context.serverId, parent);
+}
+
+function registerDirectParentPromptNotification(
+  finishSubscriptions: FinishSubscriptions | undefined,
+  agentId: string,
+  parent: ReturnType<typeof readDirectParentRoute>,
+  notify?: boolean,
+) {
+  if (!parent || notify !== true) return undefined;
+  if (!finishSubscriptions) throw new Error("Finish subscriptions are unavailable");
+  return finishSubscriptions.register(
+    {
+      childAgentId: agentId,
+      callerAgentId: parent.agentId,
+      callerServerId: parent.serverId,
+      requireParentOwnership: true,
+      followupReport: true,
+    },
+    true,
+  );
+}
+
+function registerQueuedPromptNotification(
+  finishSubscriptions: FinishSubscriptions | undefined,
+  agentId: string,
+  message: RecoverableAgentMessage,
+) {
+  if (!message.notifyLocalCaller) {
+    return registerDirectParentPromptNotification(
+      finishSubscriptions,
+      agentId,
+      message.directParent,
+      message.notifyOnFinish,
+    );
+  }
+  if (!finishSubscriptions) throw new Error("Finish subscriptions are not configured");
+  return finishSubscriptions.register(
+    {
+      childAgentId: agentId,
+      callerAgentId: message.source.agentId,
+      ...(message.directParent ? { requireParentOwnership: true } : {}),
+    },
+    true,
+  );
+}
+
+export async function enqueueRecoverableAgentMessage(
+  context: QueuedMessageContext,
+  agentId: string,
+  message: RecoverableAgentMessage,
+  handoff: QueueHandoff,
+  restoring = false,
+) {
+  const parent = message.directParent;
+  const validateDispatch =
+    parent || restoring
+      ? async () => {
+          if (parent)
+            await validateDirectParentPrompt(
+              context,
+              agentId,
+              parent,
+              !restoring && message.unarchive,
+            );
+          if (restoring) {
+            const stored = await context.agentStorage.get(agentId);
+            if (!stored || stored.archivedAt) throw new Error("Queued recipient is unavailable");
+          }
+        }
+      : undefined;
+  await validateDispatch?.();
+  const notification = await registerQueuedPromptNotification(
+    context.finishSubscriptions,
+    agentId,
+    message,
+  );
+  const rejectNotification = () =>
+    notification
+      ?.reject()
+      .catch((err) =>
+        context.logger.warn({ err, agentId }, "Failed to remove rejected finish subscription"),
+      );
+  try {
+    const receipt = context.agentMessages.enqueue({
+      recipientId: agentId,
+      messageId: message.messageId,
+      prompt: message.prompt,
+      source: { kind: "agent-message", ...message.source },
+      sessionMode: message.sessionMode,
+      activeTurnBehavior: message.activeTurnBehavior,
+      unarchive: !restoring && message.unarchive,
+      validateDispatch,
+      handoff,
+      onDispatch: () => notification?.accept(),
+    });
+    return {
+      dispatched: receipt.dispatched.catch(async (error) => {
+        await rejectNotification();
+        throw error;
+      }),
+    };
+  } catch (error) {
+    await rejectNotification();
+    throw error;
   }
 }
 
@@ -10318,6 +10453,31 @@ export class Session {
     }
   }
 
+  private recoverableAgentMessage(
+    msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
+    prompt: AgentPromptInput,
+    directParent: ReturnType<typeof readDirectParentRoute>,
+    sourceAgentEvent: ReturnType<Session["authenticatedAgentNotificationEvent"]>,
+  ): RecoverableAgentMessage | undefined {
+    if (!msg.sourceAgentId || sourceAgentEvent || msg.waitForDispatch) return undefined;
+    return {
+      messageId: msg.messageId ?? uuidv4(),
+      prompt,
+      source: {
+        agentId: msg.sourceAgentId,
+        serverId: msg.sourceAgentServerId,
+        title: !msg.sourceAgentServerId
+          ? (this.agentManager.getAgent(msg.sourceAgentId)?.config?.title ?? undefined)
+          : undefined,
+      },
+      directParent,
+      notifyOnFinish: msg.notifyDirectParentOnFinish,
+      activeTurnBehavior: msg.activeTurnBehavior ?? "steer",
+      sessionMode: msg.sessionMode,
+      unarchive: !directParent,
+    };
+  }
+
   private async handleSendAgentMessageRequest(
     msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
   ): Promise<void> {
@@ -10355,49 +10515,72 @@ export class Session {
       });
       let deliveryStatus: "queued" | undefined;
       const directParent = readDirectParentRoute(this.getHostSourceId());
+      const queuedContext = {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        agentMessages: this.agentMessages,
+        finishSubscriptions: this.finishSubscriptions,
+        serverId: this.serverId,
+        logger: this.sessionLogger,
+      };
+      const recoverable = this.recoverableAgentMessage(msg, prompt, directParent, sourceAgentEvent);
       const send = async (beforeDispatch: () => Promise<void>) => {
         if (msg.sourceAgentId) {
           const validateDispatch = directParent
-            ? async () => {
-                const stored = await this.agentStorage.get(agentId);
-                const labels = this.agentManager.getAgent(agentId)?.labels ?? stored?.labels;
-                if (!this.serverId) throw new DirectParentRequiredError();
-                assertDirectParent(labels, this.serverId, directParent);
-              }
+            ? () => validateDirectParentPrompt(queuedContext, agentId, directParent)
             : undefined;
-          if (!msg.waitForDispatch) await beforeDispatch();
-          const receipt = this.agentMessages.enqueue({
-            recipientId: agentId,
-            messageId: msg.messageId,
-            beforeProviderDispatch: msg.waitForDispatch ? beforeDispatch : undefined,
-            validateDispatch,
-            prompt,
-            source: sourceAgentEvent
-              ? {
-                  kind: "agent-notification",
-                  agentId: msg.sourceAgentId,
-                  serverId: msg.sourceAgentServerId,
-                  title: !msg.sourceAgentServerId
-                    ? (this.agentManager.getAgent(msg.sourceAgentId)?.config.title ?? undefined)
-                    : undefined,
-                  event: sourceAgentEvent,
-                }
-              : {
-                  kind: "agent-message",
-                  agentId: msg.sourceAgentId,
-                  serverId: msg.sourceAgentServerId,
-                  title: !msg.sourceAgentServerId
-                    ? (this.agentManager.getAgent(msg.sourceAgentId)?.config.title ?? undefined)
-                    : undefined,
-                },
-            activeTurnBehavior: msg.activeTurnBehavior ?? "steer",
-            sessionMode: msg.sessionMode,
-            clearPendingPermissions: false,
-            unarchive: msg.waitForDispatch ? false : undefined,
-          });
-          deliveryStatus = "queued";
-          queued();
-          await receipt.dispatched;
+          await validateDispatch?.();
+          const confirmAtDispatch = Boolean(msg.waitForDispatch || directParent);
+          if (!confirmAtDispatch) await beforeDispatch();
+          const notification = await registerDirectParentPromptNotification(
+            this.finishSubscriptions,
+            agentId,
+            directParent,
+            msg.notifyDirectParentOnFinish,
+          );
+          try {
+            const receipt = this.agentMessages.enqueue({
+              recipientId: agentId,
+              messageId: msg.messageId,
+              beforeProviderDispatch: confirmAtDispatch ? beforeDispatch : undefined,
+              validateDispatch,
+              prompt,
+              source: sourceAgentEvent
+                ? {
+                    kind: "agent-notification",
+                    agentId: msg.sourceAgentId,
+                    serverId: msg.sourceAgentServerId,
+                    title: !msg.sourceAgentServerId
+                      ? (this.agentManager.getAgent(msg.sourceAgentId)?.config.title ?? undefined)
+                      : undefined,
+                    event: sourceAgentEvent,
+                  }
+                : {
+                    kind: "agent-message",
+                    agentId: msg.sourceAgentId,
+                    serverId: msg.sourceAgentServerId,
+                    title: !msg.sourceAgentServerId
+                      ? (this.agentManager.getAgent(msg.sourceAgentId)?.config.title ?? undefined)
+                      : undefined,
+                  },
+              activeTurnBehavior: msg.activeTurnBehavior ?? "steer",
+              sessionMode: msg.sessionMode,
+              clearPendingPermissions: false,
+              unarchive: confirmAtDispatch ? false : undefined,
+              onDispatch: () => notification?.accept(),
+            });
+            deliveryStatus = "queued";
+            queued();
+            await receipt.dispatched;
+          } catch (error) {
+            await notification?.reject().catch((cleanupError) => {
+              this.sessionLogger.warn(
+                { err: cleanupError, agentId },
+                "Failed to remove rejected finish subscription",
+              );
+            });
+            throw error;
+          }
           return;
         }
         const result = await this.sendHumanPrompt({
@@ -10418,15 +10601,31 @@ export class Session {
           );
         }
       };
-      const sent = msg.messageId
+      const messageId = recoverable?.messageId ?? msg.messageId;
+      const sent = messageId
         ? this.messageReceipts.send({
             agentId,
-            messageId: msg.messageId,
+            messageId,
+            queue: recoverable
+              ? {
+                  message: recoverable,
+                  enqueue: (handoff) =>
+                    enqueueRecoverableAgentMessage(queuedContext, agentId, recoverable, handoff),
+                  onQueued: () => {
+                    deliveryStatus = "queued";
+                    queued();
+                  },
+                  retainOnError: retainQueuedAgentMessage,
+                }
+              : undefined,
             request: {
               prompt,
               sourceAgentId: msg.sourceAgentId,
               sourceAgentServerId: msg.sourceAgentServerId,
               sessionMode: msg.sessionMode,
+              ...(directParent && msg.notifyDirectParentOnFinish === true
+                ? { notifyDirectParentOnFinish: true }
+                : {}),
               activeTurnBehavior:
                 msg.activeTurnBehavior ?? (msg.sourceAgentId ? "steer" : "interrupt"),
             },
@@ -10435,7 +10634,7 @@ export class Session {
               await send(beforeDispatch);
             },
             retryIfUnsent:
-              msg.waitForDispatch && msg.sourceAgentId
+              (msg.waitForDispatch || directParent) && msg.sourceAgentId
                 ? (error) =>
                     error instanceof AgentRunCancellationError ||
                     error instanceof DirectParentRequiredError

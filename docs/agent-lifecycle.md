@@ -148,7 +148,10 @@ Setup belongs to the workspace, including combined workspace-plus-agent creation
 
 Users can also detach an existing subagent from the subagents track. Detach is deliberately a manual lifecycle gesture, not an agent-facing MCP tool. It removes the parent and open-tab lifecycle labels: it does not stop, archive, move, or restart the agent. The agent keeps its current `cwd` and `workspaceId`, leaves the former parent's track, and behaves like a root agent for tab close, workspace activity, and future parent archive.
 
-`notifyOnFinish` defaults to `true` for agent-scoped creation and prompt follow-ups because most delegated work needs to report back to the creating agent. Set it to `false` for explicit reporting or no completion callback.
+`notifyOnFinish` defaults to `true` for agent-scoped creation and prompt follow-ups because most delegated work needs to report back to the creating agent. A child created with `parentReporting: "explicit"` skips automatic notifications by default.
+Set `notifyOnFinish: true` on creation or a later prompt to get a notification for that turn.
+Change the child's parent while it is running and the new parent receives automatic completion
+only in automatic mode.
 
 Agent-originated messages and automatic notifications share a recipient-daemon delivery module. A queued receipt acknowledges admission before provider dispatch. Idle recipients retain the two-second quiet window. While a recipient has a running or starting turn (including compaction), messages stay queued across quiet windows and are delivered together after that turn settles, including failure or cancellation. A ready batch is released when the daemon observes the recipient settle; the two-second timer also retries it. Agent callers using `steer`, including the default, wait for the turn to end; only explicit `interrupt` replaces a running turn. An explicit interrupt or a command the provider accepts out of band runs before earlier queued messages. Those messages stay queued and are delivered after the running or replacement turn ends. Human prompts dispatch directly with their existing behavior. Conflicting session-mode choices retain separate ordered dispatches.
 
@@ -179,6 +182,11 @@ follows the [connected-host observation policy](connected-hosts.md#delegating-ag
 outstanding intent. A crash after successful dispatch but before removal commits can repeat the
 notification. Clean shutdown can also flush an already queued callback while retaining its intent,
 so that callback can repeat after restart. This is an at-least-once wakeup, without turn attribution or exactly-once delivery.
+
+`report_to_parent` durably records a `completed` or `blocked` report before returning its queued
+receipt. The recipient rechecks the current parent relationship before dispatch and skips archived
+parents. A stable report ID lets the recipient acknowledge a repeated report without re-running
+a message already confirmed by the provider.
 
 Permission requests are notification checkpoints, not the end of that subscription. The caller is notified again after a permission response when the child finishes, errors, or requests another permission.
 The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.

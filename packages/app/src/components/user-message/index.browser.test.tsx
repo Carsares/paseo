@@ -1,4 +1,4 @@
-import React, { act } from "react";
+import React, { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { within } from "@testing-library/dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +7,13 @@ import { MessagePreview } from "./index";
 import { createUserMessageExpansion, type UserMessageExpansion } from "./expansion";
 import { UserMessageExpansionContext } from "./expansion-context";
 import { UserMessageBody } from "./message-body";
+
+import { createFindViewport } from "@/agent-stream/chat-find/viewport.web";
+import { findMessageMatches } from "@/agent-stream/chat-find/ranges.web";
+import {
+  FindUserMessageExpansionContext,
+  type FindUserMessageExpansion,
+} from "./quote-expansion-context";
 
 // Load translations so the toggle exposes its real accessible name.
 void testI18n;
@@ -53,6 +60,37 @@ async function waitForLayout() {
   });
 }
 
+function renderFindTranscript(message: string, expansion = createUserMessageExpansion()) {
+  let viewport: ReturnType<typeof createFindViewport> | undefined;
+  function Transcript() {
+    const [target, setTarget] = useState<FindUserMessageExpansion | null>(null);
+    viewport ??= createFindViewport({
+      getRoot: () => container,
+      getBindings: () => ({
+        viewportRef: { current: null },
+        revealLoadedMessage: () => false,
+        visibleMessageIds: new Set(["message-1"]),
+      }),
+      highlightName: "quoted-find-regression",
+      setUserMessageExpansion: setTarget,
+    });
+    return (
+      <FindUserMessageExpansionContext.Provider value={target}>
+        <UserMessageExpansionContext.Provider value={expansion}>
+          <div data-history-row-id="message-1" data-message-id="message-1">
+            <MessagePreview itemId="message-1">
+              <UserMessageBody message={message} />
+            </MessagePreview>
+          </div>
+        </UserMessageExpansionContext.Provider>
+      </FindUserMessageExpansionContext.Provider>
+    );
+  }
+
+  act(() => root.render(<Transcript />));
+  return viewport!;
+}
+
 describe("long user message preview", () => {
   it("preserves the Python prompt in selected text alongside a quote card", () => {
     const code = ">>> 1 + 1";
@@ -94,6 +132,65 @@ describe("long user message preview", () => {
     act(() => toggle.click());
     await waitForLayout();
     expect(container.getBoundingClientRect().height).toBe(previewHeight);
+  });
+
+  it("reveals the selected clipped quote and restores the reader's other disclosure choices", async () => {
+    const expansion = createUserMessageExpansion();
+    const quote = (prefix: string, last: string) =>
+      [...Array.from({ length: 20 }, (_, i) => `> ${prefix} ${i}`), `> ${last}`].join("\n");
+    const message = [
+      quote("Manual", "Manual end"),
+      quote("Folded", "Hidden needle"),
+      quote("Untouched", "Untouched end"),
+    ].join("\n\n");
+    const viewport = renderFindTranscript(message, expansion);
+    const [manual, found, untouched] = view().getAllByTestId("user-message-quote-block");
+    const matchBottom = () =>
+      findMessageMatches(container, "message-1", "Hidden needle")[0].getBoundingClientRect().bottom;
+    expect(matchBottom()).toBeGreaterThan(found.getBoundingClientRect().bottom);
+    const result = await viewport.reveal(
+      "message-1",
+      "Hidden needle",
+      0,
+      new AbortController().signal,
+    );
+    expect(result).toEqual({ occurrence: 0, count: 1 });
+    expect(matchBottom()).toBeLessThanOrEqual(found.getBoundingClientRect().bottom);
+    expect(matchBottom()).toBeLessThanOrEqual(container.getBoundingClientRect().bottom);
+    expect(untouched.getBoundingClientRect().height).toBeLessThan(240);
+    const highlight = CSS.highlights.get("quoted-find-regression");
+    expect(Array.from(highlight ?? [], (range) => range.toString())).toEqual(["Hidden needle"]);
+
+    act(() => within(manual).getByRole("button", { name: "Show more" }).click());
+    act(() => viewport.clear());
+    await waitForLayout();
+    expect(manual.getBoundingClientRect().height).toBeGreaterThan(240);
+    expect(matchBottom()).toBeGreaterThan(found.getBoundingClientRect().bottom);
+    expect(within(untouched).getByRole("button").getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("shows a search match covered by the ellipsis on the last preview line", async () => {
+    const viewport = renderFindTranscript("> first\n> second\n> 123456789012345678X\n> fourth");
+    const quoteText = container.querySelector<HTMLElement>("[data-find-quote-clipped]")!;
+    // Fit the last character at the end of line three, where the ellipsis is painted.
+    Object.assign(quoteText.style, { font: "16px/20px monospace", width: "19.9ch" });
+    const match = findMessageMatches(container, "message-1", "X")[0];
+    const preview = quoteText.getBoundingClientRect();
+    const matchBounds = match.getBoundingClientRect();
+    expect(quoteText.scrollHeight).toBeGreaterThan(quoteText.clientHeight);
+    expect(matchBounds.bottom).toBeLessThanOrEqual(preview.bottom);
+    expect(matchBounds.right).toBeLessThanOrEqual(preview.right);
+
+    const signal = new AbortController().signal;
+    await viewport.reveal("message-1", "first", 0, signal);
+    expect(quoteText.hasAttribute("data-find-quote-clipped")).toBe(true);
+    await viewport.reveal("message-1", "X", 0, signal);
+    expect(quoteText.clientHeight).toBe(quoteText.scrollHeight);
+    const highlight = CSS.highlights.get("quoted-find-regression");
+    expect(Array.from(highlight ?? [], (range) => range.toString())).toEqual(["X"]);
+
+    act(() => viewport.clear());
+    expect(quoteText.scrollHeight).toBeGreaterThan(quoteText.clientHeight);
   });
 
   it("commits the control with the mount, so the first frame is the settled one", async () => {

@@ -102,5 +102,7 @@ export interface PluginSelectionButtonContribution<Text extends PluginText = str
   workspaceId: string;
   /** Omit to contribute to every agent in the workspace. */
   agentId?: string;
+  /** Only show this button in an editable chat and serialize its actions with composer sends. */
+  requiresComposerSubmission?: boolean;
   button: PluginSelectionButton<Text>;
 }

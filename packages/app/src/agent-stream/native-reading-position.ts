@@ -1,3 +1,4 @@
+import { createContext } from "react";
 import { getStreamItemMessageId, type StreamItem } from "@/types/stream";
 import type { ReadingRowReplacements } from "./reading-anchor";
 
@@ -47,12 +48,20 @@ export function findNativeMessageRowIndex(rows: readonly StreamItem[], messageId
   return rows.findIndex((row) => getStreamItemMessageId(row) === messageId);
 }
 
+export const NativeReadingEpochContext = createContext<string | null>(null);
+
 export function createNativeReadingPositionTracker() {
   let lastReportedRowId: string | null | undefined = null;
+  let lastReportedEpoch: string | null = null;
   return {
-    report(rowId: string | null, onChange: (id: string | null) => void) {
-      if (rowId === lastReportedRowId) return;
+    report(
+      rowId: string | null,
+      onChange: (id: string | null) => void,
+      epoch: string | null = null,
+    ) {
+      if (rowId === lastReportedRowId && epoch === lastReportedEpoch) return;
       lastReportedRowId = rowId;
+      lastReportedEpoch = epoch;
       onChange(rowId);
     },
     reset() {

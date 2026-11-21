@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { ProviderSnapshotEntry } from "@getpaseo/protocol/agent-types";
 import { resolveAgentModelSelection } from "@/composer/agent-controls/utils";
+import { lockHandoffInput } from "@/composer/handoff-input-lock";
+import { insertAtSelection } from "@/composer/insert-text";
 import { filterSelectableModels } from "@/provider-selection/model-catalog";
 import { buildDraftStoreKey } from "@/stores/draft-keys";
 import { useDraftStore } from "@/stores/draft-store";
@@ -345,6 +347,57 @@ describe("agent composer", () => {
     expect(useDraftStore.getState().getDraftInput(draftKey)?.text).toBe("Review this diff.\n");
     model.setPrompt("Start over");
     expect(model.getState().prompt).toBe("Start over");
+  });
+
+  it("preserves an unmounted draft during handoff and appends on retry", () => {
+    openSession(agent());
+    const model = composer();
+    model.insertText("Review this ");
+    const replacementRequest = useDraftStore.getState().textReplacementRequestByDraftKey[draftKey];
+    const unlock = lockHandoffInput(draftKey);
+    if (!unlock) throw new Error("Expected to acquire the handoff lock");
+    try {
+      expect(() => model.insertText("diff.")).toThrow(
+        "The composer is locked. Try again after the handoff.",
+      );
+      expect(useDraftStore.getState().getDraftInput(draftKey)?.text).toBe("Review this ");
+      expect(useDraftStore.getState().textReplacementRequestByDraftKey[draftKey]).toBe(
+        replacementRequest,
+      );
+    } finally {
+      unlock();
+    }
+
+    model.insertText("diff.");
+    expect(model.getState().prompt).toBe("Review this diff.");
+  });
+
+  it("preserves live input text and selection during handoff and inserts on retry", () => {
+    openSession(agent());
+    const model = composer();
+    let editor = { text: "Before selected after", selection: { start: 7, end: 15 } };
+    const insertText = vi.fn((text: string) => {
+      editor = insertAtSelection(editor, text);
+    });
+    const { input } = mountedInput({ revealed: true });
+    model.attachInput({ ...input, insertText });
+
+    const unlock = lockHandoffInput(draftKey);
+    if (!unlock) throw new Error("Expected to acquire the handoff lock");
+    try {
+      expect(() => model.insertText("replacement")).toThrow(
+        "The composer is locked. Try again after the handoff.",
+      );
+      expect(insertText).not.toHaveBeenCalled();
+      expect(editor).toEqual({ text: "Before selected after", selection: { start: 7, end: 15 } });
+    } finally {
+      unlock();
+    }
+
+    model.insertText("replacement");
+    expect(insertText).toHaveBeenCalledExactlyOnceWith("replacement");
+    expect(editor).toEqual({ text: "Before replacement after", selection: { start: 18, end: 18 } });
+    expect(useDraftStore.getState().getDraftInput(draftKey)).toBeUndefined();
   });
 
   it("sends prompt commands through the mounted composer while it is mounted", () => {

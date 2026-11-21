@@ -6,6 +6,7 @@ import {
   type ProviderRegistration,
 } from "@getpaseo/plugin/server/provider";
 import { z } from "zod";
+import { readHistory } from "./internal/history.js";
 
 const legacySession = z.object({
   version: z.literal(1),
@@ -43,6 +44,9 @@ const antigravity: AcpTransformer = {
           ? { antigravity: { systemPrompt: { append: systemPrompt } } }
           : undefined,
     };
+  },
+  loadHistoryFallback({ nativeSessionId, launch, config }) {
+    return readHistory({ conversationId: nativeSessionId, launch, config });
   },
   async configure(change, { apply, catalog }) {
     // COMPAT(antigravityStreamJson): added in v0.16.2, remove after 2027-11-19.

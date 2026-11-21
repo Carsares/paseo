@@ -1144,7 +1144,12 @@ test("source-key registration remains idempotent at directory capacity", async (
 /** Real WebSocket proxy records the A–B physical wire without replacing either daemon. */
 async function hostWire(
   b: TestPaseoDaemon,
-  options: { legacyFlowControl?: boolean; withoutHierarchyControl?: boolean } = {},
+  options: {
+    legacyFlowControl?: boolean;
+    withoutHierarchyControl?: boolean;
+    omitReportAcknowledgments?: () => boolean;
+    omitSendConfirmation?: boolean;
+  } = {},
 ) {
   const http = createServer();
   const wss = new WebSocketServer({ server: http });
@@ -1166,6 +1171,20 @@ async function hostWire(
           bytes = Buffer.from(JSON.stringify(envelope));
         }
       }
+      if (!binary && options.omitReportAcknowledgments?.()) {
+        const envelope = JSON.parse(bytes.toString());
+        if (envelope.message?.type === "hosts.route.frame.request") {
+          const inner = JSON.parse(envelope.message.data);
+          if (
+            inner.message?.type === "agent.finish_reports.pull.request" &&
+            inner.message.acknowledged.length > 0
+          ) {
+            inner.message.acknowledged = [];
+            envelope.message.data = JSON.stringify(inner);
+            bytes = Buffer.from(JSON.stringify(envelope));
+          }
+        }
+      }
       frames.push({ binary, bytes, direction: "toB" });
       const send = () => {
         if (upstream.readyState === 1) upstream.send(bytes, { binary });
@@ -1175,6 +1194,13 @@ async function hostWire(
     });
     upstream.on("message", (data, binary) => {
       let bytes = Buffer.from(data as Buffer);
+      if (!binary && options.omitSendConfirmation) {
+        const envelope = JSON.parse(bytes.toString());
+        if (envelope.message?.type === "hosts.route.frame") {
+          const inner = JSON.parse(envelope.message.payload.data);
+          if (inner.message?.type === "send_agent_message_response") return;
+        }
+      }
       if (options.withoutHierarchyControl && !binary) {
         const envelope = JSON.parse(bytes.toString());
         if (envelope.type === "session" && envelope.message.type === "hosts.route.frame") {
@@ -1832,8 +1858,10 @@ test(
     const parentPrompts: string[] = [];
     const childStarted = Promise.withResolvers<void>();
     const finishChild = Promise.withResolvers<void>();
+    const finishPriorTurn = Promise.withResolvers<void>();
     cleanup.push(async () => {
       finishChild.resolve();
+      finishPriorTurn.resolve();
     });
     const a = await daemon({
       logger: completionLogger(),
@@ -1846,8 +1874,13 @@ test(
     });
     const b = await daemon({
       agentClients: createTestAgentClients({
-        onStartTurn: () => childStarted.resolve(),
-        beforeTurnComplete: () => finishChild.promise,
+        onStartTurn: (prompt) => {
+          if (String(prompt).includes("Do the delegated task")) childStarted.resolve();
+        },
+        beforeTurnComplete: (prompt) =>
+          String(prompt).includes("Hold the current child turn")
+            ? finishPriorTurn.promise
+            : finishChild.promise,
       }),
     });
     const origin = await api(a);
@@ -1873,6 +1906,13 @@ test(
       title: "Batch child",
       labels: { "paseo.parent-agent-id": parent.id, "paseo.parent-server-id": aId },
     });
+    // A Level-1 child cannot send ordinary prompts upward. Exercise ordinary
+    // cross-host provenance with an independent root, and automatic completion
+    // with the actual child.
+    const reporter = await bWorkspace.agents.create({
+      config: { provider: "claude/claude-test", modeId: "full-access" },
+      title: "Remote reporter",
+    });
     const caller = async (host: TestPaseoDaemon, agentId: string) => {
       const mcp = new Client({ name: "batching-agent", version: "1" });
       await mcp.connect(
@@ -1884,7 +1924,11 @@ test(
       return mcp;
     };
     const parentMcp = await caller(a, parent.id);
-    const childMcp = await caller(b, child.id);
+    await destination.client.sendMessage(child.id, "Hold the current child turn");
+    await expect
+      .poll(async () => (await destination.client.fetchAgent(child.id))?.agent.status)
+      .toBe("running");
+    const childMcp = await caller(b, reporter.id);
     const task = await parentMcp.callTool({
       name: "send_agent_prompt",
       arguments: { serverId: bId, agentId: child.id, prompt: "Do the delegated task" },
@@ -1901,8 +1945,9 @@ test(
       deliveryStatus: "queued",
       serverId: bId,
     });
-    // An idle recipient must not report old idle as completion of its queued task.
+    // Wait covers the held turn and the pending delegation.
     expect((await destination.client.waitForFinish(child.id, 50)).status).toBe("timeout");
+    finishPriorTurn.resolve();
     await childStarted.promise;
     const report = await childMcp.callTool({
       name: "send_agent_prompt",
@@ -1913,7 +1958,7 @@ test(
         notifyOnFinish: false,
       },
     });
-    expect(report.isError).not.toBe(true);
+    expect(report.isError, JSON.stringify(report)).not.toBe(true);
     expect(report.structuredContent).toMatchObject({ deliveryStatus: "queued", serverId: aId });
     // A CLI process can take longer than the two-second quiet window to start.
     // Exercise each delivery across windows; delivery.test.ts owns batching with a clock.
@@ -1957,6 +2002,12 @@ test(
         .map((receipt) => receipt.state)
         .sort();
     };
+    await expect
+      .poll(receiptStates, {
+        timeout: 10000,
+        message: "The remote message and the CLI send both committed receipts",
+      })
+      .toEqual(["completed", "completed"]);
     finishChild.resolve();
     await expect.poll(() => parentPrompts, { timeout: 10000 }).toHaveLength(3);
     expect(parentPrompts[2]).toContain('event="finished"');
@@ -1964,9 +2015,9 @@ test(
     await expect
       .poll(receiptStates, {
         timeout: 10000,
-        message: "Parent accepted the batch; waiting for durable receipt commits",
+        message: "The completion notification also committed a durable receipt",
       })
-      .toEqual(["completed", "completed"]);
+      .toEqual(["completed", "completed", "completed"]);
     const timeline = await origin.client.fetchAgentTimeline(parent.id);
     const messages = timeline.entries.flatMap((row) =>
       row.item.type === "tool_call" && row.item.agentMessage ? [row.item.agentMessage] : [],
@@ -1974,7 +2025,7 @@ test(
     expect(
       messages.map((message) => [message.event, message.sender.id, message.sender.serverId]),
     ).toEqual([
-      ["message", child.id, bId],
+      ["message", reporter.id, bId],
       ["message", parent.id, undefined],
       ["finished", child.id, bId],
     ]);
@@ -2047,22 +2098,29 @@ test(
   },
 );
 
-test.each(["creation", "later prompt", "reverse route", "legacy text then pull"] as const)(
-  "%s delivers a cross-host grandchild follow-up",
-  { timeout: 40000 },
-  async (when) => {
+test.each(["completed", "blocked", "archive", "detach"] as const)(
+  "handles %s parent report delivery on a one-way link across reconnect",
+  { timeout: 30000 },
+  async (scenario) => {
+    const status = scenario === "blocked" ? "blocked" : "completed";
     const parentPrompts: string[] = [];
+    const held = Promise.withResolvers<void>();
+    cleanup.push(async () => held.resolve());
     const a = await daemon({
-      mcpEnabled: true,
       agentClients: createTestAgentClients({
         onStartTurn: (prompt) => parentPrompts.push(String(prompt)),
+        beforeTurnComplete: async (prompt) => {
+          if (String(prompt).includes("Hold this parent turn")) await held.promise;
+        },
       }),
     });
-    const b = await daemon({ mcpEnabled: true });
+    const b = await daemon();
     const origin = await api(a);
     const destination = await api(b);
-    const saved = await origin.paseo.hosts.add({ connection: `127.0.0.1:${b.port}` });
-    const serverId = (await online(origin.paseo)).hosts[0]!.serverId!;
+    let omitAcknowledgments = scenario === "completed" || scenario === "blocked";
+    const wire = await hostWire(b, { omitReportAcknowledgments: () => omitAcknowledgments });
+    const saved = await origin.paseo.hosts.add({ connection: wire.connection });
+    const bId = (await online(origin.paseo)).hosts[0]!.serverId!;
     const workspace = await origin.paseo.workspaces.create({
       source: { kind: "directory", path: a.staticDir },
     });
@@ -2071,10 +2129,10 @@ test.each(["creation", "later prompt", "reverse route", "legacy text then pull"]
     });
     const parent = await workspace.agents.create({
       config: { provider: "claude/claude-test", modeId: "full-access" },
-      title: "Parent",
+      title: "Report recipient",
     });
     const toolsFor = async (host: TestPaseoDaemon, agentId: string) => {
-      const client = new Client({ name: "delegation", version: "1" });
+      const client = new Client({ name: "explicit-reporting", version: "1" });
       cleanup.push(() => client.close());
       await client.connect(
         new StreamableHTTPClientTransport(
@@ -2084,108 +2142,262 @@ test.each(["creation", "later prompt", "reverse route", "legacy text then pull"]
       return client;
     };
     const parentTools = await toolsFor(a, parent.id);
-    const lead = await parentTools.callTool({
+    const creation = await parentTools.callTool({
       name: "create_agent",
       arguments: {
-        serverId,
+        serverId: bId,
         workspaceId: remoteWorkspace.id,
         provider: "claude/claude-test",
-        title: "Lead",
-        initialPrompt: "First lead turn",
-        notifyOnFinish: when === "creation" || when === "legacy text then pull",
+        title: "Remote explicit child",
+        initialPrompt: "Work on the task",
+        parentReporting: "explicit",
+        ...(status === "blocked" ? { notifyOnFinish: true } : {}),
         settings: { modeId: "full-access" },
       },
     });
-    expect(lead.isError, JSON.stringify(lead)).not.toBe(true);
-    const leadId = (lead.structuredContent as { agentId: string }).agentId;
-    if (when === "reverse route") {
-      await destination.client.waitForFinish(leadId, 5000);
-      await destination.paseo.hosts.add({ connection: `127.0.0.1:${a.port}` });
-      await online(destination.paseo);
-    } else if (when === "later prompt") {
-      await destination.client.waitForFinish(leadId, 5000);
-      const prompted = await parentTools.callTool({
-        name: "send_agent_prompt",
-        arguments: { serverId, agentId: leadId, prompt: "Resume delegation" },
-      });
-      expect(prompted.isError, JSON.stringify(prompted)).not.toBe(true);
-    }
-    const storedWatches = async () => {
-      const file = join(b.paseoHome, "finish-followup-watches.json");
-      try {
-        return JSON.parse(await readFile(file, "utf8"));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-        throw error;
-      }
+    expect(creation.isError, JSON.stringify(creation)).not.toBe(true);
+    const { agentId: childId, guidance } = creation.structuredContent as {
+      agentId: string;
+      guidance?: string;
     };
-    if (when !== "reverse route") {
-      await expect.poll(() => parentPrompts.length, { timeout: 10000 }).toBe(1);
-      expect(parentPrompts[0]).toContain(`source-agent-id="${leadId}"`);
-      await expect.poll(storedWatches).toHaveLength(1);
-    }
-    await origin.paseo.hosts.update(saved.registrationId, { enabled: false });
-    const leadTools = await toolsFor(b, leadId);
-    const leaf = await leadTools.callTool({
-      name: "create_agent",
-      arguments: {
-        workspaceId: remoteWorkspace.id,
-        provider: "claude/claude-test",
-        title: "Leaf",
-        initialPrompt: "Finish local work",
-        settings: { modeId: "full-access" },
-      },
-    });
-    expect(leaf.isError, JSON.stringify(leaf)).not.toBe(true);
-    const storedReports = () =>
-      readFile(join(b.paseoHome, "finish-followup-reports.json"), "utf8")
-        .then(JSON.parse)
-        .catch((error: NodeJS.ErrnoException) => {
-          if (error.code === "ENOENT") return [];
-          throw error;
-        });
-    if (when === "reverse route") {
-      await expect.poll(() => parentPrompts.length, { timeout: 10000 }).toBe(1);
-      expect(parentPrompts[0]).toContain(`source-agent-id="${leadId}"`);
-      expect(parentPrompts[0]).toContain(`source-server-id="${serverId}"`);
+    expect((await destination.client.fetchAgent(childId))?.agent.labels).toHaveProperty(
+      ["paseo.parent-reporting"],
+      "explicit",
+    );
+    expect((await destination.client.waitForFinish(childId, 5000)).status).toBe("idle");
+    if (status === "blocked") {
+      expect(guidance).toContain("You will get notified");
+      await expect.poll(() => parentPrompts, { timeout: 10000 }).toHaveLength(1);
       expect(parentPrompts[0]).toContain('event="finished"');
-      await expect.poll(storedReports).toEqual([]);
-      return;
+    } else {
+      expect(guidance).toBeUndefined();
+      expect(parentPrompts).toEqual([]);
     }
-    await expect.poll(storedReports, { timeout: 10000 }).toHaveLength(1);
-    expect(parentPrompts).toHaveLength(1);
-    expect((await destination.paseo.hosts.list()).hosts).toEqual([]);
-    const direct = await destination.client.pullAgentFinishReports(leadId, parent.id, []);
-    expect(direct).toMatchObject({ ownsChild: false, reports: [], error: expect.any(String) });
+    if (scenario === "archive" || scenario === "detach") {
+      await origin.client.sendMessage(parent.id, "Hold this parent turn");
+      await expect.poll(() => parentPrompts).toHaveLength(1);
+    }
+    const beforeReport = parentPrompts.length;
 
-    const [stored] = await storedReports();
-    const report = AgentFinishReportSchema.parse(stored?.report);
-    const sendLegacy = () =>
-      origin.client.sendMessage(parent.id, report.prompt, {
-        messageId: report.id,
-        sourceAgentId: leadId,
-        sourceAgentServerId: serverId,
-        activeTurnBehavior: "steer",
-        waitForDispatch: true,
-      });
-    if (when === "legacy text then pull") await sendLegacy();
+    await origin.paseo.hosts.update(saved.registrationId, { enabled: false });
+    expect((await destination.paseo.hosts.list()).hosts).toEqual([]);
+    const childTools = await toolsFor(b, childId);
+    const submitted = await childTools.callTool({
+      name: "report_to_parent",
+      arguments: { status, summary: "Review the changes" },
+    });
+    expect(submitted.isError, JSON.stringify(submitted)).not.toBe(true);
+    expect(submitted.structuredContent).toMatchObject({
+      success: true,
+      deliveryStatus: "queued",
+      messageId: expect.any(String),
+    });
+    const reportFile = join(b.paseoHome, "finish-followup-reports.json");
+    const readReports = async () => JSON.parse(await readFile(reportFile, "utf8"));
+    const { messageId } = submitted.structuredContent as { messageId: string };
+    expect(await readReports()).toMatchObject([
+      { id: messageId, report: { parentReportStatus: status } },
+    ]);
+    expect(parentPrompts).toHaveLength(beforeReport);
 
     await origin.paseo.hosts.update(saved.registrationId, { enabled: true });
     await online(origin.paseo);
-    await expect.poll(storedReports, { timeout: 15000 }).toEqual([]);
-    expect(parentPrompts).toHaveLength(2);
-    expect(parentPrompts[1]).toContain(`source-agent-id="${leadId}"`);
-    if (when === "legacy text then pull") {
-      expect(parentPrompts[1]).not.toContain('event="finished"');
-    } else {
-      expect(parentPrompts[1]).toContain('event="finished"');
-      await sendLegacy();
+    const pulls = () =>
+      wire.frames.filter(
+        (frame) => frame.direction === "fromB" && !frame.binary && frame.bytes.includes(messageId),
+      ).length;
+    if (scenario === "archive" || scenario === "detach") {
+      await expect.poll(pulls, { timeout: 15000 }).toBeGreaterThanOrEqual(1);
+      if (scenario === "archive") {
+        try {
+          await origin.client.archiveAgent(parent.id);
+        } finally {
+          held.resolve();
+        }
+        await expect
+          .poll(async () => (await origin.client.fetchAgent(parent.id))?.agent.archivedAt)
+          .toBeTruthy();
+        await expect
+          .poll(
+            async () => {
+              const filename = join(a.paseoHome, "finish-followup-watches.json");
+              return JSON.parse(await readFile(filename, "utf8"));
+            },
+            { timeout: 15000 },
+          )
+          .toEqual([]);
+        expect((await origin.client.fetchAgent(parent.id))?.agent.archivedAt).toBeTruthy();
+      } else {
+        await destination.client.detachAgent(childId);
+        held.resolve();
+        await expect.poll(readReports, { timeout: 15000 }).toEqual([]);
+      }
+      expect(parentPrompts).toHaveLength(beforeReport);
+      return;
     }
-    await destination.client.detachAgent(leadId);
-    await expect.poll(storedWatches, { timeout: 10000 }).toEqual([]);
-    expect(parentPrompts).toHaveLength(2);
+    await expect.poll(pulls, { timeout: 15000 }).toBeGreaterThanOrEqual(2);
+    expect(await readReports()).toHaveLength(1);
+    omitAcknowledgments = false;
+    await expect.poll(readReports, { timeout: 15000 }).toEqual([]);
+    expect(parentPrompts).toHaveLength(beforeReport + 1);
+    expect(parentPrompts.at(-1)).toContain(`Report to parent (${status}):`);
+    expect(parentPrompts.at(-1)).toContain(`source-agent-id="${childId}"`);
+    expect(parentPrompts.at(-1)).toContain("Review the changes");
   },
 );
+
+test.each([
+  "creation",
+  "later prompt",
+  "reverse route",
+  "reverse dispatch then pull",
+  "legacy text then pull",
+] as const)("%s delivers a cross-host grandchild follow-up", { timeout: 40000 }, async (when) => {
+  const parentPrompts: string[] = [];
+  const reverse = when === "reverse route" || when === "reverse dispatch then pull";
+  const a = await daemon({
+    mcpEnabled: true,
+    agentClients: createTestAgentClients({
+      onStartTurn: (prompt) => parentPrompts.push(String(prompt)),
+    }),
+  });
+  const b = await daemon({ mcpEnabled: true });
+  const origin = await api(a);
+  const destination = await api(b);
+  const saved = await origin.paseo.hosts.add({ connection: `127.0.0.1:${b.port}` });
+  const serverId = (await online(origin.paseo)).hosts[0]!.serverId!;
+  const workspace = await origin.paseo.workspaces.create({
+    source: { kind: "directory", path: a.staticDir },
+  });
+  const remoteWorkspace = await destination.paseo.workspaces.create({
+    source: { kind: "directory", path: b.staticDir },
+  });
+  const parent = await workspace.agents.create({
+    config: { provider: "claude/claude-test", modeId: "full-access" },
+    title: "Parent",
+  });
+  const toolsFor = async (host: TestPaseoDaemon, agentId: string) => {
+    const client = new Client({ name: "delegation", version: "1" });
+    cleanup.push(() => client.close());
+    await client.connect(
+      new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${host.port}/mcp/agents?callerAgentId=${agentId}`),
+      ),
+    );
+    return client;
+  };
+  const parentTools = await toolsFor(a, parent.id);
+  const lead = await parentTools.callTool({
+    name: "create_agent",
+    arguments: {
+      serverId,
+      workspaceId: remoteWorkspace.id,
+      provider: "claude/claude-test",
+      title: "Lead",
+      initialPrompt: "First lead turn",
+      notifyOnFinish: when === "creation" || when === "legacy text then pull",
+      settings: { modeId: "full-access" },
+    },
+  });
+  expect(lead.isError, JSON.stringify(lead)).not.toBe(true);
+  const leadId = (lead.structuredContent as { agentId: string }).agentId;
+  if (reverse) {
+    await destination.client.waitForFinish(leadId, 5000);
+    const wire =
+      when === "reverse dispatch then pull"
+        ? await hostWire(a, { omitSendConfirmation: true })
+        : undefined;
+    await destination.paseo.hosts.add({ connection: wire?.connection ?? `127.0.0.1:${a.port}` });
+    await online(destination.paseo);
+  } else if (when === "later prompt") {
+    await destination.client.waitForFinish(leadId, 5000);
+    const prompted = await parentTools.callTool({
+      name: "send_agent_prompt",
+      arguments: { serverId, agentId: leadId, prompt: "Resume delegation" },
+    });
+    expect(prompted.isError, JSON.stringify(prompted)).not.toBe(true);
+  }
+  const storedWatches = async () => {
+    const file = join(b.paseoHome, "finish-followup-watches.json");
+    try {
+      return JSON.parse(await readFile(file, "utf8"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+  };
+  if (!reverse) {
+    await expect.poll(() => parentPrompts.length, { timeout: 10000 }).toBe(1);
+    expect(parentPrompts[0]).toContain(`source-agent-id="${leadId}"`);
+  }
+  await expect.poll(storedWatches).toHaveLength(1);
+  await origin.paseo.hosts.update(saved.registrationId, { enabled: false });
+  const leadTools = await toolsFor(b, leadId);
+  const leaf = await leadTools.callTool({
+    name: "create_agent",
+    arguments: {
+      workspaceId: remoteWorkspace.id,
+      provider: "claude/claude-test",
+      title: "Leaf",
+      initialPrompt: "Finish local work",
+      settings: { modeId: "full-access" },
+    },
+  });
+  expect(leaf.isError, JSON.stringify(leaf)).not.toBe(true);
+  const storedReports = () =>
+    readFile(join(b.paseoHome, "finish-followup-reports.json"), "utf8")
+      .then(JSON.parse)
+      .catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return [];
+        throw error;
+      });
+  if (reverse) {
+    await expect.poll(() => parentPrompts.length, { timeout: 10000 }).toBe(1);
+    expect(parentPrompts[0]).toContain(`source-agent-id="${leadId}"`);
+    expect(parentPrompts[0]).toContain(`source-server-id="${serverId}"`);
+    expect(parentPrompts[0]).toContain('event="finished"');
+    if (when === "reverse dispatch then pull") {
+      expect(await storedReports()).toHaveLength(1);
+      await origin.paseo.hosts.update(saved.registrationId, { enabled: true });
+      await online(origin.paseo);
+    }
+    await expect.poll(storedReports, { timeout: 15000 }).toEqual([]);
+    expect(parentPrompts).toHaveLength(1);
+    return;
+  }
+  await expect.poll(storedReports, { timeout: 10000 }).toHaveLength(1);
+  expect(parentPrompts).toHaveLength(1);
+  expect((await destination.paseo.hosts.list()).hosts).toEqual([]);
+  const direct = await destination.client.pullAgentFinishReports(leadId, parent.id, []);
+  expect(direct).toMatchObject({ ownsChild: false, reports: [], error: expect.any(String) });
+
+  const [stored] = await storedReports();
+  const report = AgentFinishReportSchema.parse(stored?.report);
+  const sendLegacy = () =>
+    origin.client.sendMessage(parent.id, report.prompt, {
+      messageId: report.id,
+      sourceAgentId: leadId,
+      sourceAgentServerId: serverId,
+      activeTurnBehavior: "steer",
+      waitForDispatch: true,
+    });
+  if (when === "legacy text then pull") await sendLegacy();
+
+  await origin.paseo.hosts.update(saved.registrationId, { enabled: true });
+  await online(origin.paseo);
+  await expect.poll(storedReports, { timeout: 15000 }).toEqual([]);
+  expect(parentPrompts).toHaveLength(2);
+  expect(parentPrompts[1]).toContain(`source-agent-id="${leadId}"`);
+  if (when === "legacy text then pull") {
+    expect(parentPrompts[1]).not.toContain('event="finished"');
+  } else {
+    expect(parentPrompts[1]).toContain('event="finished"');
+    await sendLegacy();
+  }
+  await destination.client.detachAgent(leadId);
+  await expect.poll(storedWatches, { timeout: 10000 }).toEqual([]);
+  expect(parentPrompts).toHaveLength(2);
+});
 
 test("only Level-2 remote creation requires destination hierarchy support", async () => {
   const a = await daemon({ mcpEnabled: true });

@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { link, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { app, ipcMain, powerMonitor } from "electron";
 import log from "electron-log/main";
@@ -29,7 +30,7 @@ import {
   type AppUpdateCheckIntent,
   type AppReleaseChannel,
 } from "../features/auto-updater.js";
-import type { AppUpdateShutdown } from "../features/app-update-service.js";
+import type { AppUpdateShutdown, AppUpdateTarget } from "../features/app-update-service.js";
 import {
   getBundledCliShimPath,
   getCliInstallStatus,
@@ -64,9 +65,12 @@ import {
 import { tailFile } from "../diagnostics/tail-file.js";
 
 const DAEMON_LOG_FILENAME = "daemon.log";
+const RECOVERY_MARKER_FILENAME = "restart-recovery-once.json";
+const UPDATE_RECOVERY_FILENAME = "app-update-recovery.json";
 let ownedLaunch: { home: string; instance: DaemonInstance } | null = null;
 let manualUpdateHandoffInProgress = false;
 const daemonUpdateStops = new Set<string>();
+const updateRecoveryRestores = new Map<string, Promise<void>>();
 let daemonLaunchesInProgress = 0;
 
 export function isManualUpdateHandoffInProgress(): boolean {
@@ -354,6 +358,7 @@ async function startDaemon(): Promise<DesktopDaemonStatus> {
 }
 
 async function launchBuiltInDaemon(home: string): Promise<void> {
+  await restoreUpdateRecovery(home);
   const invocation = createNodeEntrypointInvocation({
     entrypoint: resolveDaemonRunnerEntrypoint(),
     argvMode: "node-script",
@@ -375,19 +380,112 @@ async function launchBuiltInDaemon(home: string): Promise<void> {
 
 async function readRecoveryMarkerIdentity(markerPath: string): Promise<string | null> {
   try {
-    const { dev, ino } = await stat(markerPath, { bigint: true });
-    return `${dev}:${ino}`;
+    const marker = await stat(markerPath, { bigint: true });
+    if (!marker.isFile()) throw new Error("Daemon recovery marker path is not a file.");
+    return `${marker.dev}:${marker.ino}`;
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
     throw error;
   }
 }
 
-export function prepareBuiltInDaemonForUpdate(): Promise<AppUpdateShutdown>;
+interface AppUpdateRecovery {
+  sourceVersion: string;
+  targetVersion: string;
+  marker: string;
+}
+
+function parseUpdateRecovery(raw: string): AppUpdateRecovery {
+  const recovery: unknown = JSON.parse(raw);
+  if (
+    typeof recovery !== "object" ||
+    recovery === null ||
+    !("sourceVersion" in recovery) ||
+    typeof recovery.sourceVersion !== "string" ||
+    !("targetVersion" in recovery) ||
+    typeof recovery.targetVersion !== "string" ||
+    !("marker" in recovery) ||
+    typeof recovery.marker !== "string"
+  ) {
+    throw new Error("Invalid app update recovery record.");
+  }
+  return {
+    sourceVersion: recovery.sourceVersion,
+    targetVersion: recovery.targetVersion,
+    marker: recovery.marker,
+  };
+}
+
+async function publishRecoveryFile(filePath: string, contents: string): Promise<void> {
+  const tempPath = `${filePath}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tempPath, contents, { flag: "wx", mode: 0o600, flush: true });
+    // Use the same publish step before handoff and during recovery. If the home
+    // volume cannot link files, the update fails while the daemon's record is intact.
+    await link(tempPath, filePath);
+  } finally {
+    await rm(tempPath, { force: true });
+  }
+}
+
+function restoreUpdateRecovery(home: string): Promise<void> {
+  const existing = updateRecoveryRestores.get(home);
+  if (existing) return existing;
+  const restore = restoreUpdateRecoveryFromDisk(home).finally(() => {
+    updateRecoveryRestores.delete(home);
+  });
+  updateRecoveryRestores.set(home, restore);
+  return restore;
+}
+
+async function restoreUpdateRecoveryFromDisk(home: string): Promise<void> {
+  const filePath = path.join(home, UPDATE_RECOVERY_FILENAME);
+  let raw: string;
+  try {
+    raw = await readFile(filePath, "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error) {
+      if (error.code === "ENOENT") return;
+      if (error.code === "EISDIR") {
+        log.error("[desktop daemon] Recovery file path is occupied by a directory.", error);
+        return;
+      }
+    }
+    throw error;
+  }
+  const markerPath = path.join(home, RECOVERY_MARKER_FILENAME);
+  if (await readRecoveryMarkerIdentity(markerPath)) {
+    await unlink(filePath);
+    return;
+  }
+  const recovery = parseUpdateRecovery(raw);
+  const runningVersion = resolveDesktopAppVersion();
+  // The installer event only acknowledges handoff. The running version decides
+  // whether this desktop can use the record from before the update.
+  if (runningVersion === recovery.sourceVersion && runningVersion !== recovery.targetVersion) {
+    try {
+      // Publish a complete record without replacing one from another shutdown.
+      await publishRecoveryFile(markerPath, recovery.marker);
+    } catch (error) {
+      // A newer shutdown's record is authoritative.
+      if (
+        !(error instanceof Error && "code" in error && error.code === "EEXIST") ||
+        !(await readRecoveryMarkerIdentity(markerPath))
+      ) {
+        throw error;
+      }
+    }
+  }
+  await unlink(filePath);
+}
+
+export function prepareBuiltInDaemonForUpdate(target: AppUpdateTarget): Promise<AppUpdateShutdown>;
 export function prepareBuiltInDaemonForUpdate(
+  target: AppUpdateTarget,
   policy: "stop" | "keep" | "defer",
 ): Promise<AppUpdateShutdown | false>;
 export async function prepareBuiltInDaemonForUpdate(
+  target: AppUpdateTarget,
   policy: "stop" | "keep" | "defer" = "stop",
 ): Promise<AppUpdateShutdown | false> {
   const home = getPaseoHome();
@@ -396,7 +494,7 @@ export async function prepareBuiltInDaemonForUpdate(
     if (instance?.desktopManaged) {
       if (policy === "defer") return false;
       if (policy === "keep") return holdDaemonLaunchForUpdate(home, instance);
-      const shutdown = await captureDaemonUpdateShutdown(home, instance);
+      const shutdown = await captureDaemonUpdateShutdown(home, instance, target);
       if (shutdown) return shutdown;
     }
     return holdDaemonLaunchForUpdate(home);
@@ -437,8 +535,10 @@ async function withDaemonUpdateLock<T extends AppUpdateShutdown | false>(
 async function captureDaemonUpdateShutdown(
   home: string,
   instance: DaemonInstance,
+  target: AppUpdateTarget,
 ): Promise<AppUpdateShutdown | undefined> {
-  const markerPath = path.join(home, "restart-recovery-once.json");
+  const markerPath = path.join(home, RECOVERY_MARKER_FILENAME);
+  const sourceVersion = resolveDesktopAppVersion();
   // A forced stop replaces the canonical marker. An update must not consume
   // recovery already requested by another operation.
   if (await readRecoveryMarkerIdentity(markerPath)) {
@@ -464,18 +564,7 @@ async function captureDaemonUpdateShutdown(
       error: new Error("Could not read update recovery record.", { cause: error }),
     }),
   );
-  let rollbackMarker: Buffer | undefined;
-  async function preserveForNextLaunch(): Promise<void> {
-    if (!rollbackMarker) return;
-    // Another shutdown may have recorded newer intent. Never overwrite it.
-    try {
-      await writeFile(markerPath, rollbackMarker, { flag: "wx" });
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
-    }
-  }
   return {
-    preserveForNextLaunch,
     async beforeHandoff() {
       if (markerAfterStop.error) throw markerAfterStop.error;
       if (await readDaemonInstance(home)) throw new Error("A daemon restarted before the update.");
@@ -484,23 +573,36 @@ async function captureDaemonUpdateShutdown(
         if (stopped.requestedAgentResume) throw new Error("Daemon recovery record is missing.");
         return;
       }
-      const contents = await readFile(markerPath);
+      const contents = await readFile(markerPath, "utf8");
       if (
         (await readRecoveryMarkerIdentity(markerPath)) !== marker ||
         (await readDaemonInstance(home))
       ) {
         throw new Error("Daemon recovery changed before the update.");
       }
-      // Only the old version may consume the one-shot record for this stop.
+      // Park the original record before removing the name the daemon consumes.
+      // The installer can still fail or be cancelled after Electron quits.
+      const recoveryPath = path.join(home, UPDATE_RECOVERY_FILENAME);
+      const recovery: AppUpdateRecovery = {
+        sourceVersion,
+        targetVersion: target.version,
+        marker: contents,
+      };
+      await publishRecoveryFile(recoveryPath, JSON.stringify(recovery));
+      if (
+        (await readRecoveryMarkerIdentity(markerPath)) !== marker ||
+        (await readDaemonInstance(home))
+      ) {
+        await unlink(recoveryPath);
+        throw new Error("Daemon recovery changed before the update.");
+      }
       await unlink(markerPath);
-      rollbackMarker = contents;
     },
     async restore() {
       try {
         const running = await readDaemonInstance(home);
         if (running && !running.desktopManaged) throw new Error("A different daemon is running.");
         if (!running) {
-          await preserveForNextLaunch();
           await launchBuiltInDaemon(home);
         }
         const current = await waitForDaemonReady(home, {
@@ -803,7 +905,7 @@ export function createDaemonCommandHandlers(
             manualUpdateHandoffInProgress = true;
             return withDaemonUpdateLock(home, async () => {
               const shutdown = instance?.desktopManaged
-                ? await captureDaemonUpdateShutdown(home, instance)
+                ? await captureDaemonUpdateShutdown(home, instance, target)
                 : undefined;
               return shutdown ?? holdDaemonLaunchForUpdate(home);
             });

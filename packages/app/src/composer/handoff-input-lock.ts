@@ -35,6 +35,12 @@ export function isHandoffInputLocked(serverId: string, agentId: string): boolean
   return useHandoffInputLocks.getState().has(buildDraftStoreKey({ serverId, agentId }));
 }
 
+export function assertComposerInputUnlocked(serverId: string, agentId: string): void {
+  if (isHandoffInputLocked(serverId, agentId)) {
+    throw new Error("The composer is locked. Try again after the handoff.");
+  }
+}
+
 export function lockHandoffInput(draftKey: string): (() => void) | null {
   const locks = useHandoffInputLocks.getState();
   if (locks.has(draftKey) || pendingSubmissions.has(draftKey) || pendingAttachments.has(draftKey))

@@ -15,6 +15,7 @@ import {
   readDirectParentRoute,
 } from "./agent/host-operations/index.js";
 import {
+  ParentReportRecipientUnavailableError,
   type FinishRegistration,
   type FinishSubscription,
   type FinishSubscriptions,
@@ -60,6 +61,7 @@ import {
 import {
   type ServerInfoStatusPayload,
   type ScriptStatusUpdateMessage,
+  type SessionInboundMessage,
   type SessionOutboundMessage,
   type WSHelloMessage,
   type WSInboundMessage,
@@ -75,6 +77,8 @@ import { MAX_WEBSOCKET_MESSAGE_BYTES } from "@getpaseo/protocol/websocket-messag
 import type { HostnamesConfig } from "./hostnames.js";
 import { isHostnameAllowed } from "./hostnames.js";
 import {
+  enqueueRecoverableAgentMessage,
+  retainQueuedAgentMessage,
   Session,
   type SessionLifecycleIntent,
   type SessionOptions,
@@ -212,6 +216,14 @@ interface WebSocketServerConfig {
   daemonStatusRpc?: boolean;
   relayConfig?: boolean;
   startPaused?: boolean;
+  messageReceipts?: MessageReceipts;
+}
+
+function resolveAgentMessageReceiptStores(paseoHome: string, messages?: MessageReceipts) {
+  return {
+    messages: messages ?? new MessageReceipts(join(paseoHome, "agent-requests")),
+    parentReports: new MessageReceipts(join(paseoHome, "parent-report-receipts")),
+  };
 }
 
 type WebSocketRuntimeMetrics = SessionRuntimeMetrics & CheckoutDiffMetrics;
@@ -512,6 +524,31 @@ interface PluginSessionConnection extends SessionConnectionBase {
   pluginId: string;
 }
 
+type AgentFinishReportPushRequest = Extract<
+  SessionInboundMessage,
+  { type: "agent.finish_reports.push.request" }
+>;
+type AgentFinishReportConfirmRequest = Extract<
+  SessionOutboundMessage,
+  { type: "agent.finish_reports.confirm.request" }
+>;
+type AgentFinishReportConfirmResponse = Extract<
+  SessionInboundMessage,
+  { type: "agent.finish_reports.confirm.response" }
+>;
+type AgentFinishReportConfirmResult = Pick<
+  AgentFinishReportConfirmResponse["payload"],
+  "accepted" | "error"
+>;
+
+interface PendingAgentFinishReportConfirmation {
+  childAgentId: string;
+  parentAgentId: string;
+  reportId: string;
+  resolve: (response: AgentFinishReportConfirmResponse) => void;
+  reject: (error: unknown) => void;
+}
+
 type SessionConnection = ReconnectableSessionConnection | PluginSessionConnection;
 
 interface SocketSessionOptions {
@@ -547,6 +584,13 @@ const WS_CLOSE_INCOMPATIBLE_PROTOCOL = 4003;
 const WS_CLOSE_SERVER_SHUTDOWN = 1001;
 const WS_PROTOCOL_VERSION = 1;
 const WS_RUNTIME_METRICS_FLUSH_MS = 30_000;
+const PARENT_REPORT_CONFIRMATION_TIMEOUT_MS = 5_000;
+class ParentReportConfirmationUnavailableError extends Error {
+  constructor(cause?: unknown) {
+    super("Parent report confirmation is unavailable", { cause });
+    this.name = "ParentReportConfirmationUnavailableError";
+  }
+}
 const OWNER_SESSION_ADMISSION: SessionAdmission = {
   principalId: "owner",
   permissions: OWNER_PERMISSIONS,
@@ -587,6 +631,10 @@ export class VoiceAssistantWebSocketServer {
   private readonly hostLinks = new Map<WebSocketLike, DaemonLinkEndpoint>();
   private readonly pendingConnections: Map<WebSocketLike, PendingConnection> = new Map();
   private readonly sessions: Map<WebSocketLike, SessionConnection> = new Map();
+  private readonly pendingAgentFinishReportConfirmations = new WeakMap<
+    WebSocketLike,
+    Map<string, PendingAgentFinishReportConfirmation>
+  >();
   private readonly socketIdentities: Map<WebSocketLike, WebSocketConnectionIdentity> = new Map();
   private readonly externalSessionsByKey: Map<string, ReconnectableSessionConnection> = new Map();
   private readonly pluginSocketIds = new WeakMap<WebSocketLike, string>();
@@ -597,6 +645,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly agentManager: AgentManager;
   private readonly agentStorage: AgentStorage;
   private readonly messageReceipts: MessageReceipts;
+  private readonly parentReportReceipts: MessageReceipts;
   readonly agentMessages: ReturnType<typeof createAgentMessageDelivery>;
   private readonly creationService: CreationService;
   private readonly projectRegistry: ProjectRegistry;
@@ -794,6 +843,9 @@ export class VoiceAssistantWebSocketServer {
           prompt: batch.prompt,
           activeTurnBehavior: batch.activeTurnBehavior,
           idleOnly: batch.idleOnly,
+          canSteerDuringDrain: batch.canSteerDuringDrain,
+          handoff: batch.handoff,
+          validateDispatch: batch.validateDispatch,
           admit: batch.admit,
           sessionMode: batch.validateDispatch ? undefined : batch.sessionMode,
           clearPendingPermissions: batch.clearPendingPermissions,
@@ -860,7 +912,9 @@ export class VoiceAssistantWebSocketServer {
           "Agent message batch dispatch failed",
         ),
     });
-    this.messageReceipts = new MessageReceipts(join(paseoHome, "agent-requests"));
+    const receiptStores = resolveAgentMessageReceiptStores(paseoHome, wsConfig.messageReceipts);
+    this.messageReceipts = receiptStores.messages;
+    this.parentReportReceipts = receiptStores.parentReports;
     this.creationService = new CreationService(
       join(paseoHome, "creations"),
       this.logger.child({ module: "creation" }),
@@ -888,7 +942,11 @@ export class VoiceAssistantWebSocketServer {
     this.workspaceAutoName = workspaceAutoName;
     this.downloadTokenStore = downloadTokenStore;
     this.paseoHome = paseoHome;
-    this.connectedHosts = new ConnectedHosts(paseoHome, { serverId, label: getHostName() });
+    this.connectedHosts = new ConnectedHosts(
+      paseoHome,
+      { serverId, label: getHostName() },
+      { onFinishReportConfirm: (request) => this.confirmParentReport(request) },
+    );
     this.passwordHash = auth?.password;
     this.daemonConfigStore = daemonConfigStore;
     this.mcpBaseUrl = mcpBaseUrl;
@@ -2357,6 +2415,8 @@ export class VoiceAssistantWebSocketServer {
         // COMPAT(agentNotificationEvents): added in v0.16.0, remove after 2027-05-19.
         agentNotificationEvents: true,
         agentFinishReportPull: this.finishSubscriptions !== undefined,
+        agentExplicitParentReports: this.finishSubscriptions !== undefined,
+        agentDirectParentQueuedDelivery: true,
         // COMPAT(stableProjectIdentity): added in v0.1.109, remove gate after 2027-01-15.
         stableProjectIdentity: true,
         // COMPAT(workspaceScriptManagement): added in v0.1.105, remove gate after 2027-01-10.
@@ -2842,36 +2902,302 @@ export class VoiceAssistantWebSocketServer {
     return link;
   }
 
-  async dispatchFinishReport(record: FinishSubscription, report: AgentFinishReport): Promise<void> {
-    await this.messageReceipts.send({
+  async restoreQueuedAgentMessages(): Promise<void> {
+    let unreadable = 0;
+    const records = await this.messageReceipts.queuedMessages(() => unreadable++);
+    if (unreadable) this.logger.warn({ unreadable }, "Skipped unreadable agent message receipts");
+    for (const receipt of records) {
+      let markAdmitted!: () => void;
+      const admitted = new Promise<void>((resolve) => {
+        markAdmitted = resolve;
+      });
+      const settled = this.messageReceipts.resumeQueued(receipt, {
+        enqueue: (handoff) =>
+          enqueueRecoverableAgentMessage(
+            {
+              agentManager: this.agentManager,
+              agentStorage: this.agentStorage,
+              agentMessages: this.agentMessages,
+              finishSubscriptions: this.finishSubscriptions,
+              logger: this.logger,
+              serverId: this.serverId,
+            },
+            receipt.agentId,
+            receipt.queued.message,
+            handoff,
+            true,
+          ),
+        retainOnError: retainQueuedAgentMessage,
+        onQueued: markAdmitted,
+      });
+      const observed = settled.catch((err) => {
+        this.logger.warn({ err, agentId: receipt.agentId }, "Queued agent message recovery failed");
+      });
+      await Promise.race([admitted, observed]);
+    }
+  }
+
+  private async confirmParentReport(
+    request: AgentFinishReportConfirmRequest,
+  ): Promise<AgentFinishReportConfirmResult> {
+    const storedChild = await this.agentStorage.get(request.childAgentId);
+    const child = this.agentManager.getAgent(request.childAgentId) ?? storedChild;
+    const parent = getParentAddressFromLabels(child?.labels, this.serverId);
+    if (
+      !child ||
+      storedChild?.archivedAt ||
+      parent?.agentId !== request.parentAgentId ||
+      parent.serverId !== request.parentServerId
+    ) {
+      return { accepted: false, error: "The child is no longer assigned to this parent." };
+    }
+    const accepted = await this.finishSubscriptions?.confirmParentReport(
+      {
+        childAgentId: request.childAgentId,
+        callerAgentId: request.parentAgentId,
+        callerServerId: request.parentServerId,
+      },
+      request.reportId,
+    );
+    return accepted
+      ? { accepted: true, error: null }
+      : { accepted: false, error: "The parent report is no longer registered." };
+  }
+
+  private async requestParentReportConfirmation(
+    ws: VirtualHostSocket,
+    request: AgentFinishReportConfirmRequest,
+  ): Promise<void> {
+    const pending = this.pendingAgentFinishReportConfirmations.get(ws) ?? new Map();
+    this.pendingAgentFinishReportConfirmations.set(ws, pending);
+    const response = await new Promise<AgentFinishReportConfirmResponse>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(request.requestId);
+        if (pending.size === 0) this.pendingAgentFinishReportConfirmations.delete(ws);
+        reject(new ParentReportConfirmationUnavailableError());
+      }, PARENT_REPORT_CONFIRMATION_TIMEOUT_MS);
+      pending.set(request.requestId, {
+        childAgentId: request.childAgentId,
+        parentAgentId: request.parentAgentId,
+        reportId: request.reportId,
+        resolve: (result: AgentFinishReportConfirmResponse) => {
+          clearTimeout(timer);
+          pending.delete(request.requestId);
+          if (pending.size === 0) this.pendingAgentFinishReportConfirmations.delete(ws);
+          resolve(result);
+        },
+        reject: (error: unknown) => {
+          clearTimeout(timer);
+          pending.delete(request.requestId);
+          if (pending.size === 0) this.pendingAgentFinishReportConfirmations.delete(ws);
+          reject(error);
+        },
+      });
+      try {
+        void Promise.resolve(ws.send(JSON.stringify(wrapSessionMessage(request)))).catch(
+          (error) => {
+            pending
+              .get(request.requestId)
+              ?.reject(new ParentReportConfirmationUnavailableError(error));
+          },
+        );
+      } catch (error) {
+        pending.get(request.requestId)?.reject(new ParentReportConfirmationUnavailableError(error));
+      }
+    });
+    if (!response.payload.accepted) {
+      throw new ParentReportRecipientUnavailableError(
+        response.payload.error ?? "The parent report was rejected.",
+      );
+    }
+  }
+
+  private allowsDirectParentReportPush(
+    ws: WebSocketLike,
+    session: Session,
+    request: AgentFinishReportPushRequest,
+    directParent: NonNullable<ReturnType<typeof readDirectParentRoute>>,
+  ): boolean {
+    return (
+      ws instanceof VirtualHostSocket &&
+      session.isRouted() &&
+      this.hasFinishReportWorkspacePermissions(session) &&
+      session.allowsInbound(request) &&
+      request.childAgentId === directParent.agentId
+    );
+  }
+
+  private async assertParentReportRecipientAvailable(parentAgentId: string): Promise<void> {
+    const storedParent = await this.agentStorage.get(parentAgentId);
+    if (storedParent?.archivedAt || (!storedParent && !this.agentManager.getAgent(parentAgentId))) {
+      throw new ParentReportRecipientUnavailableError(
+        `Parent agent ${parentAgentId} is unavailable`,
+      );
+    }
+  }
+
+  async dispatchFinishReport(
+    record: FinishSubscription,
+    report: AgentFinishReport,
+    options: {
+      childServerId?: string;
+      confirmBeforeDispatch?: () => Promise<void>;
+    } = {},
+  ): Promise<void> {
+    const explicit = report.parentReportStatus !== undefined;
+    // An older attempt may still have an inconclusive receipt after the parent is archived.
+    if (explicit) await this.assertParentReportRecipientAvailable(record.callerAgentId);
+    const childServerId = options.childServerId ?? record.serverId ?? this.serverId;
+    const messageId = explicit
+      ? JSON.stringify([childServerId, record.childAgentId, report.id])
+      : report.id;
+    const validateDispatch = explicit
+      ? async () => {
+          await this.assertParentReportRecipientAvailable(record.callerAgentId);
+          if (options.confirmBeforeDispatch) return;
+          const localChild = record.serverId
+            ? null
+            : await this.agentStorage.get(record.childAgentId);
+          const child = record.serverId
+            ? await this.toolHosts().use(
+                record.serverId,
+                async (client) => (await client.fetchAgent(record.childAgentId))?.agent,
+              )
+            : (this.agentManager.getAgent(record.childAgentId) ?? localChild);
+          const parent = getParentAddressFromLabels(child?.labels, childServerId);
+          if (
+            !child ||
+            localChild?.archivedAt ||
+            parent?.agentId !== record.callerAgentId ||
+            parent.serverId !== this.serverId
+          ) {
+            throw new ParentReportRecipientUnavailableError(
+              "You can only manage your direct subagents.",
+            );
+          }
+        }
+      : undefined;
+    const receipts = explicit ? this.parentReportReceipts : this.messageReceipts;
+    await receipts.send({
       agentId: record.callerAgentId,
-      messageId: report.id,
-      retryIfUnsent: (error) => error instanceof AgentRunCancellationError,
+      messageId,
+      retryIfUnsent: (error) =>
+        error instanceof AgentRunCancellationError ||
+        error instanceof ParentReportRecipientUnavailableError ||
+        error instanceof ParentReportConfirmationUnavailableError,
       // Use the same receipt if a reverse route tried to dispatch before the observer enrolled.
       request: {
         prompt: report.prompt,
+        ...(explicit ? { parentReportStatus: report.parentReportStatus, title: report.title } : {}),
         sourceAgentId: record.childAgentId,
         sourceAgentServerId: record.serverId,
         activeTurnBehavior: "steer",
       },
       send: async (beforeProviderDispatch) => {
+        await validateDispatch?.();
         const receipt = this.agentMessages.enqueue({
           recipientId: record.callerAgentId,
-          messageId: report.id,
+          messageId,
           prompt: report.prompt,
-          source: {
-            kind: "agent-notification",
-            agentId: record.childAgentId,
-            serverId: record.serverId,
-            title: report.title,
-            event: report.event,
-          },
+          source: explicit
+            ? {
+                kind: "agent-message",
+                agentId: record.childAgentId,
+                serverId: childServerId,
+                title: report.title,
+              }
+            : {
+                kind: "agent-notification",
+                agentId: record.childAgentId,
+                serverId: record.serverId,
+                title: report.title,
+                event: report.event,
+              },
+          validateDispatch,
           activeTurnBehavior: "steer",
           unarchive: false,
-          beforeProviderDispatch,
+          beforeProviderDispatch: async () => {
+            await beforeProviderDispatch();
+            await options.confirmBeforeDispatch?.();
+          },
         });
-        await receipt.dispatched;
+        try {
+          await receipt.dispatched;
+        } catch (error) {
+          await validateDispatch?.();
+          throw error;
+        }
       },
+    });
+  }
+
+  private resolveParentReportConfirmation(
+    ws: WebSocketLike,
+    response: AgentFinishReportConfirmResponse,
+  ): boolean {
+    const pending = this.pendingAgentFinishReportConfirmations
+      .get(ws)
+      ?.get(response.payload.requestId);
+    if (!pending) return false;
+    if (
+      pending.childAgentId !== response.payload.childAgentId ||
+      pending.parentAgentId !== response.payload.parentAgentId ||
+      pending.reportId !== response.payload.reportId
+    ) {
+      pending.reject(
+        new ParentReportConfirmationUnavailableError("Mismatched report confirmation"),
+      );
+      return true;
+    }
+    pending.resolve(response);
+    return true;
+  }
+
+  private async pushFinishReport(
+    session: Session,
+    ws: WebSocketLike,
+    request: AgentFinishReportPushRequest,
+  ): Promise<void> {
+    const directParent = readDirectParentRoute(session.getHostSourceId());
+    if (!(ws instanceof VirtualHostSocket) || !directParent) {
+      throw new Error("Explicit parent reports require an authenticated direct-parent route.");
+    }
+    const record: FinishSubscription = {
+      id: request.report.id,
+      childAgentId: request.childAgentId,
+      callerAgentId: request.parentAgentId,
+      callerServerId: this.serverId,
+      serverId: directParent.serverId,
+      requireParentOwnership: true,
+    };
+    try {
+      await this.dispatchFinishReport(record, request.report, {
+        childServerId: directParent.serverId,
+        confirmBeforeDispatch: () =>
+          this.requestParentReportConfirmation(ws, {
+            type: "agent.finish_reports.confirm.request",
+            requestId: randomUUID(),
+            childAgentId: request.childAgentId,
+            parentAgentId: request.parentAgentId,
+            parentServerId: this.serverId,
+            reportId: request.report.id,
+          }),
+      });
+    } catch (error) {
+      if (!(error instanceof ParentReportRecipientUnavailableError)) throw error;
+      session.delivery.reply({
+        type: "agent.finish_reports.push.response",
+        payload: {
+          requestId: request.requestId,
+          accepted: false,
+          error: error.message,
+        },
+      });
+      return;
+    }
+    session.delivery.reply({
+      type: "agent.finish_reports.push.response",
+      payload: { requestId: request.requestId, accepted: true, error: null },
     });
   }
 
@@ -2886,16 +3212,19 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private canPullFinishReports(session: Session, routedSource: boolean, source: string[]): boolean {
-    const permissions = session.getPermissions();
     return (
       routedSource &&
       session.isRouted() &&
       source.length === 4 &&
       source[0] === "route" &&
       source[3] === "mcp" &&
-      permissions.includes("workspace.write") &&
-      permissions.includes("workspace.read")
+      this.hasFinishReportWorkspacePermissions(session)
     );
+  }
+
+  private hasFinishReportWorkspacePermissions(session: Session): boolean {
+    const permissions = session.getPermissions();
+    return permissions.includes("workspace.write") && permissions.includes("workspace.read");
   }
 
   private async pullFinishReports(
@@ -2933,6 +3262,7 @@ export class VoiceAssistantWebSocketServer {
           request.acknowledged,
           request.observe === true,
           related ? archivedOrActive : "unrelated",
+          request.includeParentReports === true,
         );
         reports = result.reports;
         ownsChild = result.ownsBinding;
@@ -2960,10 +3290,15 @@ export class VoiceAssistantWebSocketServer {
         !session.isRouted() ||
         request.sourceAgentId !== directParent.agentId ||
         request.sourceAgentServerId !== directParent.serverId ||
-        request.sourceAgentEvent ||
-        request.waitForDispatch !== true
+        request.sourceAgentEvent
       ) {
         ws.close(1008, "Invalid direct-parent message");
+        return false;
+      }
+    }
+    if (request.type === "agent.finish_reports.push.request") {
+      if (!this.allowsDirectParentReportPush(ws, session, request, directParent)) {
+        ws.close(1008, "Invalid direct-parent report route");
         return false;
       }
     }
@@ -3005,6 +3340,18 @@ export class VoiceAssistantWebSocketServer {
     activeConnection: SessionConnection,
     message: Extract<WSInboundMessage, { type: "session" }>,
   ): Promise<void> {
+    if (message.message.type === "agent.finish_reports.confirm.response") {
+      if (
+        !(ws instanceof VirtualHostSocket) ||
+        !activeConnection.session.isRouted() ||
+        !this.hasFinishReportWorkspacePermissions(activeConnection.session) ||
+        !activeConnection.session.allowsInbound(message.message) ||
+        !this.resolveParentReportConfirmation(ws, message.message)
+      ) {
+        ws.close(1008, "Unexpected parent report confirmation");
+      }
+      return;
+    }
     if (!(await this.allowsDirectParentRequest(ws, activeConnection.session, message.message)))
       return;
     const link = this.hostLink(ws, activeConnection);
@@ -3018,6 +3365,13 @@ export class VoiceAssistantWebSocketServer {
       const request = message.message;
       await activeConnection.session.delivery.request(ws, request, () =>
         this.pullFinishReports(activeConnection.session, request, ws instanceof VirtualHostSocket),
+      );
+      return;
+    }
+    if (message.message.type === "agent.finish_reports.push.request") {
+      const request = message.message;
+      await activeConnection.session.delivery.request(ws, request, () =>
+        this.pushFinishReport(activeConnection.session, ws, request),
       );
       return;
     }

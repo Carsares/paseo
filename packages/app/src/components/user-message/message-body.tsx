@@ -5,7 +5,7 @@ import { StyleSheet } from "react-native-unistyles";
 import { Button } from "@/components/ui/button";
 import { isWeb } from "@/constants/platform";
 import { useDisclosureHold } from "@/agent-stream/disclosure";
-import { ExpandedQuoteCountContext } from "./quote-expansion-context";
+import { ExpandedQuoteCountContext, FindQuoteIndexContext } from "./quote-expansion-context";
 import { parseUserMessageSegments } from "./quote-segments";
 
 const MESSAGE_TEXT_DATASET = { messageText: "true" };
@@ -31,7 +31,13 @@ export function UserMessageBody({ message }: UserMessageBodyProps) {
     <View style={styles.stack} dataSet={MESSAGE_TEXT_DATASET}>
       {segments.map((segment, index) => {
         if (segment.kind === "quote") {
-          return <UserMessageQuoteBlock key={segment.quoteIndex} text={segment.text} />;
+          return (
+            <UserMessageQuoteBlock
+              key={segment.quoteIndex}
+              quoteIndex={segment.quoteIndex}
+              text={segment.text}
+            />
+          );
         }
         const previous = segments[index - 1];
         return (
@@ -48,9 +54,12 @@ export function UserMessageBody({ message }: UserMessageBodyProps) {
   );
 }
 
-function UserMessageQuoteBlock({ text }: { text: string }) {
+function UserMessageQuoteBlock({ text, quoteIndex }: { text: string; quoteIndex: number }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
+  const expandedForFind = useContext(FindQuoteIndexContext) === quoteIndex;
+  const showFullQuote = expanded || expandedForFind;
+  const clipMarker = useMemo(() => ({ findQuoteClipped: String(quoteIndex) }), [quoteIndex]);
   const adjustExpandedQuoteCount = useContext(ExpandedQuoteCountContext);
   useLayoutEffect(() => {
     if (!expanded || !adjustExpandedQuoteCount) return;
@@ -83,10 +92,11 @@ function UserMessageQuoteBlock({ text }: { text: string }) {
       <View>
         <Text
           selectable
-          numberOfLines={expanded ? undefined : QUOTE_PREVIEW_LINES}
+          numberOfLines={showFullQuote ? undefined : QUOTE_PREVIEW_LINES}
+          dataSet={showFullQuote ? undefined : clipMarker}
           ellipsizeMode="tail"
           style={styles.quoteText}
-          onLayout={expanded || longSource ? undefined : onPreviewLayout}
+          onLayout={showFullQuote || longSource ? undefined : onPreviewLayout}
         >
           {text}
         </Text>

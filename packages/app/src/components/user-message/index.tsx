@@ -1,4 +1,12 @@
-import { useState, useCallback, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
+import {
+  useState,
+  useCallback,
+  useContext,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  type ReactNode,
+} from "react";
 import { View, type LayoutChangeEvent, type ViewStyle } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { useTranslation } from "react-i18next";
@@ -11,9 +19,14 @@ import { navigateToAgent } from "@/utils/navigate-to-agent";
 import { isNative } from "@/constants/platform";
 import { useDisclosureHold } from "@/agent-stream/disclosure";
 import { useUserMessageExpanded } from "./expansion-context";
-import { ExpandedQuoteCountContext } from "./quote-expansion-context";
+import {
+  ExpandedQuoteCountContext,
+  FindQuoteIndexContext,
+  FindUserMessageExpansionContext,
+} from "./quote-expansion-context";
 
 const PREVIEW_HEIGHT = 240;
+const COLLAPSED_MESSAGE = { findMessageClipped: "true" };
 // Show more and show less sit under the text they open and close.
 const TRIGGER_BELOW_CONTENT = { triggerEdge: "bottom" } as const;
 // Native View still clips with "scroll", but Yoga measures its children without
@@ -27,11 +40,14 @@ const previewStyle: ViewStyle = {
 export function MessagePreview({ itemId, children }: { itemId: string; children: ReactNode }) {
   const { t } = useTranslation();
   const { expanded, toggle: toggleExpanded } = useUserMessageExpanded(itemId);
+  const findExpansion = useContext(FindUserMessageExpansionContext);
+  const expandedForFind = findExpansion?.rowId === itemId;
   const [expandedQuoteCount, setExpandedQuoteCount] = useState(0);
   const adjustExpandedQuoteCount = useCallback((delta: number) => {
     setExpandedQuoteCount((count) => count + delta);
   }, []);
   const hasExpandedQuote = expandedQuoteCount > 0;
+  const clipped = !expanded && !hasExpandedQuote && !expandedForFind;
   const bodyRef = useRef<View>(null);
   const [overflowing, setOverflowing] = useState(false);
   // A hidden panel lays out at zero height, which says nothing about the message.
@@ -55,17 +71,21 @@ export function MessagePreview({ itemId, children }: { itemId: string; children:
   const accessibilityState = useMemo(() => ({ expanded }), [expanded]);
   return (
     <>
-      <View style={!expanded && !hasExpandedQuote && previewStyle}>
+      <View style={clipped && previewStyle} dataSet={clipped ? COLLAPSED_MESSAGE : undefined}>
         <View ref={bodyRef} style={styles.body} onLayout={measure}>
           <ExpandedQuoteCountContext.Provider value={adjustExpandedQuoteCount}>
-            {children}
+            <FindQuoteIndexContext.Provider
+              value={expandedForFind ? findExpansion.quoteIndex : null}
+            >
+              {children}
+            </FindQuoteIndexContext.Provider>
           </ExpandedQuoteCountContext.Provider>
         </View>
-        {overflowing && !expanded && !hasExpandedQuote ? (
+        {overflowing && clipped ? (
           <EdgeFade edge="bottom" solidFraction={0} backdrop="surface3" style={styles.fade} />
         ) : null}
       </View>
-      {overflowing && !hasExpandedQuote ? (
+      {overflowing && !hasExpandedQuote && !expandedForFind ? (
         <Button
           variant="ghost"
           size="sm"

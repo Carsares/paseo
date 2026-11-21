@@ -360,6 +360,71 @@ test("disabled recovery clears a persisted resume flag when the one-shot marker 
   }
 });
 
+test.each([true, false])(
+  "retains failed automatic startup intent despite an error snapshot, without overriding opt-out (enabled: %s)",
+  async (enabled) => {
+    const root = await mkdtemp(join(tmpdir(), "restart-recovery-automatic-"));
+    const automaticMarkerPath = join(root, "restart-recovery-pending.json");
+    const initialStorage = new AgentStorage(root, createTestLogger());
+    const startEntered = Promise.withResolvers<void>();
+    const startOutcome = Promise.withResolvers<void>();
+    const dispatch = vi.fn(async () => {
+      // Provider load and failure can both reset the record's resume flag.
+      const record = (await initialStorage.get("working"))!;
+      await initialStorage.upsert({ ...record, resumeOnStartup: false, lastStatus: "error" });
+      startEntered.resolve();
+      await startOutcome.promise;
+    });
+    const retry = vi.fn(async () => {});
+    const create = (storage: AgentStorage, recover: boolean, send: () => Promise<void>) =>
+      createRestartRecovery({
+        storage,
+        automaticMarkerPath,
+        settings: () => ({ enabled: recover, prompt: "Continue." }),
+        eligible: async () => true,
+        dispatch: send,
+        report: () => {},
+      });
+    const initial = create(initialStorage, true, dispatch);
+    const signal = new AbortController().signal;
+    try {
+      const timestamp = new Date().toISOString();
+      await initialStorage.upsert(
+        parseStoredAgentRecord({
+          id: "working",
+          provider: "codex",
+          cwd: root,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          lastStatus: "running",
+        }),
+      );
+      await initial.prepareStartup();
+      initial.resumePending();
+      initial.resumePending();
+      await startEntered.promise;
+      expect(JSON.parse(await readFile(automaticMarkerPath, "utf8"))).toEqual({
+        version: 2,
+        agentIds: ["working"],
+      });
+      startOutcome.reject(new Error("Provider rejected start"));
+      await initial.waitForResume("working", signal);
+      expect(dispatch).toHaveBeenCalledOnce();
+
+      const next = create(new AgentStorage(root, createTestLogger()), enabled, retry);
+      await next.prepareStartup();
+      next.resumePending();
+      await next.waitForResume("working", signal);
+      expect(retry).toHaveBeenCalledTimes(enabled ? 1 : 0);
+      await expect(readFile(automaticMarkerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      startOutcome.resolve();
+      await initial.waitForResume("working", signal);
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
 test("does not dispatch a completed one-shot recovery again if clearing its agent flag fails", async () => {
   const root = await mkdtemp(join(tmpdir(), "restart-recovery-flag-write-"));
   try {

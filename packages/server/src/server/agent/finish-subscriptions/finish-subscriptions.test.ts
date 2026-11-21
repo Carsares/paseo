@@ -859,3 +859,72 @@ test("an undispatched follow-up does not block the running child's permission no
   expect(state.delivery.prompts[0]).toContain("approval");
   expect(await state.store.list()).toHaveLength(2);
 });
+
+test("explicit reports survive a restart and an unacknowledged pull without reaching old readers", async () => {
+  const home = await mkdtemp(join(tmpdir(), "parent-report-recovery-"));
+  homes.push(home);
+  const open = () => {
+    const service = createFinishSubscriptions({
+      store: createJsonFinishSubscriptionStore(home),
+      followups: {
+        watches: createJsonFinishSubscriptionStore(home, "watches.json"),
+        reports: createJsonFinishSubscriptionStore(home, "reports.json"),
+        dispatch: async () => {
+          throw new Error("The parent host owns dispatch");
+        },
+      },
+      messages: () => new Delivery(),
+      open: new Observation().open,
+      callerIsActive: async () => true,
+      serverId: "child-host",
+      logger: createTestLogger(),
+    });
+    services.push(service);
+    return service;
+  };
+  const first = open();
+  await first.start();
+  const pair = { childAgentId: "child", callerAgentId: "parent", callerServerId: "parent-host" };
+  const address = { ...pair, sourceId: "parent-source" };
+  const reportId = await first.queueParentReport(pair, {
+    status: "blocked",
+    title: "Review",
+    summary: "Which API?",
+  });
+  await first.close();
+  const restarted = open();
+  await restarted.start();
+  expect(await restarted.pullReports(address, [], true, "active")).toEqual({
+    ownsBinding: true,
+    reports: [],
+  });
+  const expected = {
+    ownsBinding: true,
+    reports: [
+      expect.objectContaining({
+        id: reportId,
+        parentReportStatus: "blocked",
+        prompt: "Report to parent (blocked):\n\nWhich API?",
+      }),
+    ],
+  };
+  expect(await restarted.pullReports(address, [], true, "active", true)).toEqual(expected);
+  expect(
+    await restarted.pullReports(
+      { ...address, sourceId: "another-source" },
+      [reportId],
+      true,
+      "active",
+      true,
+    ),
+  ).toEqual({ ownsBinding: false, reports: [] });
+  expect(await restarted.pullReports(address, [], true, "active", true)).toEqual(expected);
+  expect(await restarted.pullReports(address, [reportId], true, "active", true)).toEqual({
+    ownsBinding: true,
+    reports: [],
+  });
+  expect(await restarted.pullReports(address, [], true, "active", true)).toEqual({
+    ownsBinding: true,
+    reports: [],
+  });
+});

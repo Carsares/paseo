@@ -190,6 +190,7 @@ describe("assistant selection quote", () => {
   async function mountPluginSelection(
     behavior: PluginSelectionButtonBehavior,
     addQuoteAttachment?: (quote: string) => void,
+    canSubmitSelection?: () => boolean,
   ) {
     const surfaceModule = "./surface.web.tsx";
     const [
@@ -222,6 +223,7 @@ describe("assistant selection quote", () => {
       {
         id: "review",
         workspaceId: "test-workspace",
+        ...(canSubmitSelection ? { requiresComposerSubmission: true } : {}),
         button: { title: "Plugin review", icon: () => null, behavior },
       },
     );
@@ -248,6 +250,7 @@ describe("assistant selection quote", () => {
                 serverId: "test-host",
                 workspaceId: "test-workspace",
                 agentId: "test-agent",
+                canSubmitSelection,
               } as import("./surface").AssistantSelectionCopySurfaceProps,
               createElement("div", {
                 dangerouslySetInnerHTML: { __html: viewport.outerHTML },
@@ -350,6 +353,38 @@ describe("assistant selection quote", () => {
       expectSelectionDismissed();
     } finally {
       act(remove);
+    }
+  });
+
+  it("keeps quote available without a composer and rechecks a queued selection send", async () => {
+    const send = vi.fn();
+    const onQuote = vi.fn();
+    let editable = false;
+    const first = await mountPluginSelection(pluginMenu(send), onQuote, () => editable);
+    try {
+      selectNodeContents(first.original);
+      await screen.findByText(i18n.t("agentStream.quote.action"));
+      expect(screen.queryByRole("button", { name: "Plugin review" })).toBeNull();
+    } finally {
+      act(first.remove);
+      cleanup();
+      window.getSelection()?.removeAllRanges();
+    }
+
+    editable = true;
+    const active = await mountPluginSelection(pluginMenu(send), onQuote, () => editable);
+    try {
+      selectNodeContents(active.original);
+      fireEvent.contextMenu(active.original, { clientX: 15, clientY: 15 });
+      fireEvent.click(await screen.findByText("Plugin review"));
+      fireEvent.click(await screen.findByText("More review actions"));
+      // An archive update has arrived, but React has not committed the panel's new props.
+      editable = false;
+      await userEvent.click(page.getByText("Review passage"));
+      await screen.findByText("This chat no longer accepts prompts.");
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      act(active.remove);
     }
   });
 

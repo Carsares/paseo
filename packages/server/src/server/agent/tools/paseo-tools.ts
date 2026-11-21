@@ -3,6 +3,7 @@ import { changeRequestStatusSchema } from "../../../services/change-request-sour
 import { registerPluginTools } from "./plugin-tools.js";
 import type { FinishSubscriptions, FinishRegistration } from "../finish-subscriptions/index.js";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
+import type { RecoverableAgentMessage } from "../../message-receipts/index.js";
 import {
   assertDirectParent,
   createHostResolver,
@@ -94,11 +95,7 @@ import {
   serializeSnapshotWithMetadata,
   toScheduleSummary,
 } from "../mcp-shared.js";
-import {
-  type PromptDispatchDisposition,
-  sendPromptToAgent,
-  waitForAgentRunStartWithTimeout,
-} from "../agent-prompt.js";
+import { sendPromptToAgent, waitForAgentRunStartWithTimeout } from "../agent-prompt.js";
 import { respondToAgentPermission } from "../permission-response.js";
 import {
   archiveAgentCommand,
@@ -155,6 +152,10 @@ import {
 
 export interface PaseoToolHostDependencies {
   agentMessages?: () => AgentMessageDelivery;
+  queueAgentPrompt?: (
+    agentId: string,
+    message: Omit<RecoverableAgentMessage, "messageId">,
+  ) => Promise<string>;
   changeRequestWatches?: ChangeRequestWatches;
   finishSubscriptions?: () => FinishSubscriptions;
   serverId?: string;
@@ -712,12 +713,10 @@ function createToolCatalog(
     destination: string | undefined,
     input: Record<string, unknown>,
     requireParentOwnership: boolean,
-    targetLabels: HierarchyAgent["labels"],
   ): Promise<FinishRegistration | undefined> {
     if (name !== "send_agent_prompt" || destination === options.serverId || !callerAgentId) {
       return undefined;
     }
-    input.notifyOnFinish ??= !isExplicitParentReportingLabels(targetLabels);
     if (input.notifyOnFinish === false) return undefined;
     return finishSubscriptions().register(
       {
@@ -750,6 +749,34 @@ function createToolCatalog(
       serverId: destination,
       requireParentOwnership: true,
     });
+  }
+  function defaultRemotePromptNotification(
+    name: string,
+    destination: string | undefined,
+    input: Record<string, unknown>,
+    labels: HierarchyAgent["labels"],
+  ): void {
+    if (name === "send_agent_prompt" && destination !== options.serverId)
+      input.notifyOnFinish ??= !isExplicitParentReportingLabels(labels);
+  }
+  const creationNotificationGuidance =
+    "You will get notified when the created agent finishes, errors, or needs permission. Do not poll for status; continue with other work until the notification arrives.";
+  function remoteGuidance(
+    name: string,
+    destination: string | undefined,
+    input: Record<string, unknown>,
+    response: PaseoToolResult,
+  ) {
+    if (
+      destination === options.serverId ||
+      !callerAgentId ||
+      input.notifyOnFinish !== true ||
+      response.isError
+    )
+      return {};
+    if (name === "create_agent") return { guidance: creationNotificationGuidance };
+    if (name === "send_agent_prompt") return { guidance: PROMPTED_AGENT_NOTIFICATION_GUIDANCE };
+    return {};
   }
   const localHostOperations = new Map<string, HostOperation>();
   const tools = new Map<string, PaseoToolDefinition>();
@@ -931,12 +958,13 @@ function createToolCatalog(
     };
     if (explicitReporting) {
       labels[PARENT_REPORTING_LABEL] = EXPLICIT_PARENT_REPORTING;
-      input.notifyOnFinish = false;
+      input.notifyOnFinish ??= false;
     } else {
       delete labels[PARENT_REPORTING_LABEL];
     }
     // The remote create path carries the reporting mode in the child's labels.
     delete input.parentReporting;
+    input.notifyOnFinish ??= true;
     input.labels = labels;
     let started = false;
     try {
@@ -993,13 +1021,20 @@ function createToolCatalog(
           context,
         );
         const restrictedSend = name === "send_agent_prompt" && requireParentOwnership;
-        const remoteNotification = await prepareRemoteNotification(
-          name,
-          destination,
-          input,
-          restrictedSend,
-          targetLabels,
-        );
+        let remoteNotification: FinishRegistration | undefined;
+        defaultRemotePromptNotification(name, destination, input, targetLabels);
+        const prepareLegacyNotification = async () => {
+          try {
+            remoteNotification = await prepareRemoteNotification(
+              name,
+              destination,
+              input,
+              restrictedSend,
+            );
+          } catch (error) {
+            throw new HostOperationRejectedError(error);
+          }
+        };
         try {
           const forward = (markStarted: () => void) =>
             hostResolver.use(
@@ -1008,7 +1043,11 @@ function createToolCatalog(
                 markStarted();
                 return host[operation](
                   name === "send_agent_prompt"
-                    ? { ...input, requireParentOwnership: restrictedSend }
+                    ? {
+                        ...input,
+                        requireParentOwnership: restrictedSend,
+                        prepareLegacyNotification,
+                      }
                     : input,
                   context,
                 );
@@ -1023,9 +1062,7 @@ function createToolCatalog(
             ...response,
             structuredContent: {
               ...(response.structuredContent as object),
-              ...(remoteNotification && !response.isError
-                ? { guidance: PROMPTED_AGENT_NOTIFICATION_GUIDANCE }
-                : {}),
+              ...remoteGuidance(name, destination, input, response),
               ...(destination ? { serverId: destination } : {}),
             },
           };
@@ -1490,7 +1527,6 @@ function createToolCatalog(
     notifyOnFinish: z
       .boolean()
       .optional()
-      .default(true)
       .describe(
         "Get notified when the first turn finishes, errors, or needs permission. Set false to skip that notification. Main Control also defaults the child to explicit reporting in that case unless parentReporting is set.",
       ),
@@ -1913,7 +1949,7 @@ function createToolCatalog(
     async (args: unknown) => {
       const resolvedArgs = await resolveCreateAgentToolArgs(args);
       const { parsedArgs } = resolvedArgs;
-      const notifyOnFinish = parsedArgs.notifyOnFinish ?? false;
+      const notifyOnFinish = parsedArgs.notifyOnFinish;
       const parentReporting =
         resolvedArgs.kind === "agent-scoped" ? resolvedArgs.parsedArgs.parentReporting : undefined;
       const selectedProvider = resolveRequiredProviderModel(parsedArgs.provider).provider;
@@ -1959,8 +1995,10 @@ function createToolCatalog(
       // Return immediately for async creation.
       const currentSnapshot = agentManager.getAgent(snapshot.id) ?? snapshot;
       const guidance =
-        callerAgentId && notifyOnFinish && parentReporting !== "explicit" && initialPromptStarted
-          ? "You will get notified when the created agent finishes, errors, or needs permission. Do not poll for status; continue with other work until the notification arrives."
+        callerAgentId &&
+        (notifyOnFinish ?? !isExplicitParentReportingLabels(snapshot.labels)) &&
+        initialPromptStarted
+          ? creationNotificationGuidance
           : "Creation acknowledged. Observe completion using get_agent_status/get_agent_activity or SDK/RPC subscriptions and wait APIs.";
       const response = {
         content: [],
@@ -2247,6 +2285,67 @@ function createToolCatalog(
   const PROMPTED_AGENT_NOTIFICATION_GUIDANCE =
     "You will get notified when the prompted agent finishes, errors, or needs permission. Do not poll for status; continue with other work until the notification arrives.";
 
+  function queuedPromptResponse(agentId: string, messageId: string, notifying: boolean) {
+    return {
+      content: [],
+      structuredContent: {
+        success: true,
+        deliveryStatus: "queued" as const,
+        messageId,
+        status: agentManager.getAgent(agentId)?.lifecycle ?? "idle",
+        guidance: notifying
+          ? `Queued for delivery after two quiet seconds and the current turn ends. ${PROMPTED_AGENT_NOTIFICATION_GUIDANCE}`
+          : "Queued for delivery after two quiet seconds and the current turn ends; provider dispatch has not occurred.",
+      },
+    };
+  }
+
+  async function enqueueLocalAgentPrompt(
+    agentId: string,
+    message: Omit<RecoverableAgentMessage, "messageId">,
+  ): Promise<string> {
+    if (options.queueAgentPrompt) return options.queueAgentPrompt(agentId, message);
+    const notification = message.notifyLocalCaller
+      ? await finishSubscriptions().register(
+          {
+            childAgentId: agentId,
+            callerAgentId: message.source.agentId,
+            ...(message.directParent ? { requireParentOwnership: true } : {}),
+          },
+          true,
+        )
+      : undefined;
+    function rejectNotification(): void {
+      void notification
+        ?.reject()
+        .catch((err) =>
+          childLogger.error({ err, agentId }, "Failed to remove rejected finish subscription"),
+        );
+    }
+    const parent = message.directParent;
+    try {
+      const receipt = agentMessages().enqueue({
+        recipientId: agentId,
+        prompt: message.prompt,
+        source: { kind: "agent-message", ...message.source },
+        sessionMode: message.sessionMode,
+        validateDispatch: parent
+          ? async () => {
+              const target = await readHierarchyAgent(agentId);
+              assertDirectParent(target?.labels, parent.serverId, parent);
+            }
+          : undefined,
+        activeTurnBehavior: message.activeTurnBehavior,
+        onDispatch: () => notification?.accept(),
+      });
+      void receipt.dispatched.catch(rejectNotification);
+      return receipt.messageId;
+    } catch (error) {
+      rejectNotification();
+      throw error;
+    }
+  }
+
   registerTool(
     "send_agent_prompt",
     {
@@ -2278,95 +2377,33 @@ function createToolCatalog(
       }
       const notifying =
         !!target && (notifyOnFinish ?? !isExplicitParentReportingLabels(target.labels));
-      const notification =
-        notifying && callerAgentId
-          ? await (() => {
-              if (!options.finishSubscriptions)
-                throw new Error("Finish subscriptions are not configured");
-              return options.finishSubscriptions().register(
-                {
-                  childAgentId: agentId,
-                  callerAgentId,
-                  ...(requireParentOwnership ? { requireParentOwnership: true } : {}),
-                },
-                true,
-              );
-            })()
-          : undefined;
-      function confirmDispatch(_disposition: PromptDispatchDisposition): void {
-        notification?.accept();
-      }
-      function rejectNotification(): void {
-        void notification
-          ?.reject()
-          .catch((error) =>
-            childLogger.error(
-              { err: error, agentId },
-              "Failed to remove rejected finish subscription",
-            ),
-          );
-      }
-
       if (callerAgentId) {
-        const receipt = (() => {
-          try {
-            return agentMessages().enqueue({
-              recipientId: agentId,
-              prompt,
-              source: {
-                kind: "agent-message",
-                agentId: callerAgentId,
-                serverId: requireParentOwnership ? options.serverId : undefined,
-                title: resolveCallerAgent()?.config.title ?? undefined,
-              },
-              sessionMode,
-              validateDispatch: requireParentOwnership
-                ? async () => {
-                    const currentTarget = await readHierarchyAgent(agentId);
-                    const serverId = options.serverId ?? "self";
-                    assertDirectParent(currentTarget?.labels, serverId, {
-                      agentId: callerAgentId,
-                      serverId,
-                    });
-                  }
-                : undefined,
-              activeTurnBehavior,
-              onDispatch: confirmDispatch,
-            });
-          } catch (error) {
-            rejectNotification();
-            throw error;
-          }
-        })();
-        void receipt.dispatched.catch(() => {
-          rejectNotification();
-        });
-        return {
-          content: [],
-          structuredContent: {
-            success: true,
-            deliveryStatus: receipt.status,
-            messageId: receipt.messageId,
-            status: agentManager.getAgent(agentId)?.lifecycle ?? "idle",
-            guidance: notifying
-              ? `Queued for delivery after two quiet seconds and the current turn ends. ${PROMPTED_AGENT_NOTIFICATION_GUIDANCE}`
-              : "Queued for delivery after two quiet seconds and the current turn ends; provider dispatch has not occurred.",
+        const messageId = await enqueueLocalAgentPrompt(agentId, {
+          prompt,
+          source: {
+            agentId: callerAgentId,
+            serverId: requireParentOwnership ? options.serverId : undefined,
+            title: resolveCallerAgent()?.config.title ?? undefined,
           },
-        };
+          directParent: requireParentOwnership
+            ? { agentId: callerAgentId, serverId: options.serverId ?? "self" }
+            : undefined,
+          sessionMode,
+          activeTurnBehavior,
+          unarchive: true,
+          notifyLocalCaller: notifying,
+        });
+        return queuedPromptResponse(agentId, messageId, notifying);
       }
-
       const dispatch = await sendPromptToAgent({
         agentManager,
         agentStorage,
         agentId,
         prompt,
-        source: callerAgentId ? { kind: "agent-message", agentId: callerAgentId } : undefined,
         sessionMode,
         activeTurnBehavior,
-        onDispatch: confirmDispatch,
         logger: childLogger,
       }).catch((error) => {
-        rejectNotification();
         if (error instanceof AgentNotFoundError) {
           throw new PaseoToolInputError(error.message);
         }
@@ -2376,12 +2413,7 @@ function createToolCatalog(
       // Return once the provider has accepted the turn, so the status reports it running.
       const { disposition } = dispatch;
       if (dispatch.disposition === "turn_started") {
-        await waitForAgentRunStartWithTimeout(agentManager, agentId, dispatch.started).catch(
-          (error) => {
-            rejectNotification();
-            throw error;
-          },
-        );
+        await waitForAgentRunStartWithTimeout(agentManager, agentId, dispatch.started);
       }
       const currentSnapshot = agentManager.getAgent(agentId);
 
@@ -2389,9 +2421,8 @@ function createToolCatalog(
         success: true,
         disposition,
         status: currentSnapshot?.lifecycle ?? "idle",
-        guidance: notifying
-          ? PROMPTED_AGENT_NOTIFICATION_GUIDANCE
-          : "Dispatch acknowledged. Observe completion using get_agent_status/get_agent_activity or SDK/RPC subscriptions and wait APIs.",
+        guidance:
+          "Dispatch acknowledged. Observe completion using get_agent_status/get_agent_activity or SDK/RPC subscriptions and wait APIs.",
       };
       const validJson = ensureValidJson(responseData);
 
@@ -2422,7 +2453,7 @@ function createToolCatalog(
         messageId: z.string().optional(),
       },
     },
-    async ({ status, summary }, context) => {
+    async ({ status, summary }) => {
       if (!callerAgentId) throw new PaseoToolInputError("Only subagents can report to a parent.");
       const localServer = options.serverId ?? "self";
       const caller = await readHierarchyAgent(callerAgentId);
@@ -2436,66 +2467,43 @@ function createToolCatalog(
       ) {
         throw new PaseoToolInputError("Only subagents with a direct parent can report.");
       }
-      const formattedReport = `Report to parent (${status}):\n\n${summary}`;
-      const requireCurrentParent = async () => {
-        const source = await readHierarchyAgent(callerAgentId);
-        if (!source || source.archivedAt) {
-          throw new PaseoToolInputError(`Reporting agent ${callerAgentId} is unavailable`);
-        }
-        assertDirectParent(source.labels, localServer, parent);
-      };
-      if (parent.serverId !== localServer) {
-        return hostResolver.use(parent.serverId, async (host) => {
-          const response = await host.getStatus({ agentId: parent.agentId }, context);
-          const target = (response.structuredContent as { snapshot?: HierarchyAgent })?.snapshot;
-          if (!target || target.archivedAt) {
-            throw new PaseoToolInputError(`Parent agent ${parent.agentId} is unavailable`);
-          }
-          await requireCurrentParent();
-          return host.sendPrompt(
-            {
-              agentId: parent.agentId,
-              prompt: formattedReport,
-              notifyOnFinish: false,
-              activeTurnBehavior: "steer",
-            },
-            context,
-          );
-        });
-      }
-      const requireActiveParent = async () => {
+      if (parent.serverId === localServer) {
         const target = await readHierarchyAgent(parent.agentId);
         if (!target || target.archivedAt) {
           throw new PaseoToolInputError(`Parent agent ${parent.agentId} is unavailable`);
         }
-      };
-      await requireActiveParent();
-      const receipt = agentMessages().enqueue({
-        recipientId: parent.agentId,
-        prompt: formattedReport,
-        source: {
-          kind: "agent-message",
-          agentId: callerAgentId,
-          serverId: options.serverId,
-          title: agentManager.getAgent(callerAgentId)?.config.title ?? caller.title ?? undefined,
+      } else if (options.hosts) {
+        // A reverse link can confirm that a parent is unavailable. Its absence
+        // does not block the parent's forward-link delivery.
+        const hosts = options.hosts();
+        const target = await (async () => {
+          const directory = await hosts.directory();
+          if (
+            !directory.hosts.some(
+              (host) => host.serverId === parent.serverId && host.status === "online",
+            )
+          )
+            return undefined;
+          return hosts.use(
+            parent.serverId,
+            async (client) => (await client.fetchAgent(parent.agentId))?.agent ?? null,
+          );
+        })().catch(() => undefined);
+        if (target === null || target?.archivedAt) {
+          throw new PaseoToolInputError(`Parent agent ${parent.agentId} is unavailable`);
+        }
+      }
+      const messageId = await finishSubscriptions().queueParentReport(
+        {
+          childAgentId: callerAgentId,
+          callerAgentId: parent.agentId,
+          ...(parent.serverId === localServer ? {} : { callerServerId: parent.serverId }),
         },
-        activeTurnBehavior: "steer",
-        unarchive: false,
-        validateDispatch: async () => {
-          await requireCurrentParent();
-          await requireActiveParent();
-        },
-      });
-      void receipt.dispatched.catch((error) => {
-        childLogger.warn({ err: error, agentId: callerAgentId }, "Parent report was not delivered");
-      });
+        { status, summary, title: caller.title ?? callerAgentId },
+      );
       return {
         content: [],
-        structuredContent: {
-          success: true,
-          deliveryStatus: receipt.status,
-          messageId: receipt.messageId,
-        },
+        structuredContent: { success: true, deliveryStatus: "queued", messageId },
       };
     },
   );

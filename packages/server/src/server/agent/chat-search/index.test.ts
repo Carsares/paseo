@@ -28,7 +28,7 @@ it("returns source locations for formatted assistant text and literal user text"
 
 it("finds phrases across quoted lines without joining quotes and body text", async () => {
   const source = rows([
-    { type: "user_message", text: "start\r\n\t> alpha\r> beta\nend" },
+    { type: "user_message", text: "start\r\n   > alpha\r> beta\nend" },
     { type: "user_message", text: "> alpha\n\n> beta" },
   ]);
   expect((await searchTimeline({ rows: source, query: "alpha beta" })).locations).toEqual([
@@ -36,6 +36,34 @@ it("finds phrases across quoted lines without joining quotes and body text", asy
   ]);
   expect((await searchTimeline({ rows: source, query: "beta end" })).locations).toEqual([]);
   expect((await searchTimeline({ rows: source, query: "start alpha" })).locations).toEqual([]);
+});
+
+it("counts literal quote markers in indented text next to a quote", async () => {
+  const source = rows([
+    { type: "user_message", text: "    > output.log\n\t> output.log\n\n> output.log" },
+  ]);
+  await expect(searchTimeline({ rows: source, query: "> output.log" })).resolves.toEqual({
+    locations: [{ seq: 1, role: "user", count: 2 }],
+    nextCursor: null,
+  });
+  await expect(searchTimeline({ rows: source, query: "output.log" })).resolves.toEqual({
+    locations: [{ seq: 1, role: "user", count: 3 }],
+    nextCursor: null,
+  });
+});
+
+it("searches a standalone empty quote line as literal body text between quotes", async () => {
+  const source = rows([
+    { type: "user_message", text: "> intro\r\n\r\nBefore\r>\r\nAfter\n\n> closing" },
+  ]);
+  await expect(searchTimeline({ rows: source, query: "before > after" })).resolves.toEqual({
+    locations: [{ seq: 1, role: "user", count: 1 }],
+    nextCursor: null,
+  });
+  await expect(searchTimeline({ rows: source, query: "before after" })).resolves.toEqual({
+    locations: [],
+    nextCursor: null,
+  });
 });
 
 it.each(["```", "~~~"])("keeps quote markers literal inside %s fences", async (fence) => {

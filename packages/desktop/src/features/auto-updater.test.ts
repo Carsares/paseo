@@ -266,6 +266,39 @@ describe("manual installer handoff", () => {
     expect(nativeUpdateEvents.listenerCount("before-quit-for-update")).toBe(0);
   });
 
+  it("lets Windows quit after installer launch, with recovery saved before that event", async () => {
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    const info = { version: "1.2.4" };
+    const input = { currentVersion: "1.2.3", releaseChannel: "stable" } as const;
+    const checked = { isUpdateAvailable: true, updateInfo: info };
+    autoUpdaterMock.checkForUpdates.mockResolvedValueOnce(checked).mockResolvedValueOnce(checked);
+    autoUpdaterMock.downloadUpdate.mockImplementation(async () => {
+      autoUpdaterMock.handlers.get("update-downloaded")?.(info);
+    });
+    await updater.checkForAppUpdate({ ...input, intent: "automatic" });
+
+    const saveRecovery = vi.fn(async () => {});
+    const restore = vi.fn(async () => {});
+    const beforeQuit = vi.fn(async () => ({ restore, beforeHandoff: saveRecovery }));
+    const installation = updater.installAppUpdateOnQuit({
+      ...input,
+      signal: new AbortController().signal,
+      onBeforeQuit: beforeQuit,
+    });
+    await expect.poll(() => autoUpdaterMock.quitAndInstall).toHaveBeenCalledWith(true, false);
+    expect(beforeQuit).toHaveBeenCalledExactlyOnceWith({ version: "1.2.4" });
+    expect(saveRecovery).toHaveBeenCalledOnce();
+    expect(saveRecovery.mock.invocationCallOrder[0]).toBeLessThan(
+      autoUpdaterMock.quitAndInstall.mock.invocationCallOrder[0],
+    );
+    expect(updater.hasAcceptedNativeUpdateQuit()).toBe(false);
+
+    nativeUpdateEvents.emit("before-quit-for-update");
+    await expect(installation).resolves.toBe(true);
+    expect(updater.hasAcceptedNativeUpdateQuit()).toBe(true);
+    expect(restore).not.toHaveBeenCalled();
+  });
+
   it("restores the daemon on a native error and ignores an earlier feed during retry", async () => {
     Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
     const info = { version: "1.2.5" };

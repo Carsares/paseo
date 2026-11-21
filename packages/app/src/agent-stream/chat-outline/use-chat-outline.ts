@@ -13,6 +13,14 @@ import {
   type ChatOutlinePrompt,
 } from "./model";
 
+export function shouldTrackChatOutline(input: {
+  isNative: boolean;
+  railEnabled: boolean;
+  supportsPromptIndex: boolean;
+}): boolean {
+  return input.isNative ? input.supportsPromptIndex : input.railEnabled;
+}
+
 const NO_PROMPTS: ChatOutlinePrompt[] = [];
 const NO_STREAM_ITEMS: StreamItem[] = [];
 

@@ -1,3 +1,4 @@
+import { NativeReadingEpochContext } from "@/agent-stream/native-reading-position";
 import { ChatFind, ChatFindExpansion } from "@/agent-stream/chat-find";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import React, {
@@ -88,7 +89,10 @@ import { renderStreamRow, type RenderStreamItem } from "./stream-row";
 import { type NearBottom, useIsNearBottom, useNearBottom } from "./near-bottom";
 import { ActivePromptBar } from "@/agent-stream/chat-outline/active-prompt-bar";
 import { ChatOutlineRail } from "@/agent-stream/chat-outline/rail";
-import { useChatOutline } from "@/agent-stream/chat-outline/use-chat-outline";
+import {
+  shouldTrackChatOutline,
+  useChatOutline,
+} from "@/agent-stream/chat-outline/use-chat-outline";
 import { CHAT_COLUMN_RAIL_DATASET, useChatOutlineRail } from "@/chat-rail";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
@@ -274,6 +278,7 @@ export interface AgentStreamViewProps {
   toast?: ToastApi | null;
   onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
   readOnly?: boolean;
+  canSubmitSelection?: (agentId: string, workspaceId: string) => boolean;
   /** Detail panes opt into the complete interaction transcript. */
   showAgentInteractions?: boolean;
   historyPagination?: {
@@ -478,10 +483,6 @@ function StreamExpansionProviders({
   );
 }
 
-function shouldTrackChatOutline(railEnabled: boolean): boolean {
-  return isNative || railEnabled;
-}
-
 function renderChatOutlineRail(outlineInset: number, outline: ReturnType<typeof useChatOutline>) {
   if (outlineInset <= 0 || outline.prompts.length < 2) return null;
   return (
@@ -519,6 +520,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       toast,
       onOpenWorkspaceFile,
       readOnly = false,
+      canSubmitSelection,
       showAgentInteractions: showAgentInteractionsOverride,
       historyPagination,
     },
@@ -756,7 +758,15 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       };
     }, [baseRenderModel.segments.liveHead, mountedHistoryMessageIds]);
     const outlineRail = useChatOutlineRail();
-    const outlineTrackingEnabled = shouldTrackChatOutline(outlineRail.enabled);
+    const supportsPromptIndex = useSessionStore(
+      (state) =>
+        state.sessions[resolvedServerId]?.serverInfo?.features?.agentTimelinePromptIndex === true,
+    );
+    const outlineTrackingEnabled = shouldTrackChatOutline({
+      isNative,
+      railEnabled: outlineRail.enabled,
+      supportsPromptIndex,
+    });
     const outlineInset = outlineRail.inset;
     const chatOutline = useChatOutline({
       agentId,
@@ -1350,6 +1360,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
               serverId={resolvedServerId}
               workspaceId={context.workspaceId}
               agentId={agentId}
+              canSubmitSelection={readOnly ? undefined : canSubmitSelection}
               subagentSpawnMode={spawnTarget?.mode}
               onSpawnSubagentFromSelection={onSpawnSubagentFromSelection}
             >
@@ -1359,33 +1370,35 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
                   userMessageExpansion={userMessageExpansion}
                   assistantMessageExpansion={assistantMessageExpansion}
                 >
-                  {streamRenderStrategy.render({
-                    readingRowReplacements: presentation.readingRowReplacements,
-                    agentId,
-                    segments: renderModel.segments,
-                    historyRowRevision,
-                    liveHeadRowRevision: expandedToolCallGroups,
-                    boundary,
-                    renderers,
-                    listEmptyComponent,
-                    viewportRef,
-                    routeBottomAnchorRequest,
-                    isAuthoritativeHistoryReady,
-                    isInitialHistoryLoading,
-                    revealInitialHistory,
-                    onNearBottomChange: nearBottom.set,
-                    onReadingPositionChange: handleReadingPositionChange,
-                    onNearHistoryStart: loadOlder,
-                    isLoadingOlderHistory: isLoadingOlder,
-                    hasOlderHistory: hasOlder,
-                    olderHistoryProgressKey: progressKey,
-                    scrollEnabled: streamScrollEnabled,
-                    listStyle: stylesheet.list,
-                    baseListContentContainerStyle: stylesheet.listContentContainer,
-                    forwardListContentContainerStyle: stylesheet.forwardListContentContainer,
-                    contentMaxWidth,
-                    outlineInset,
-                  })}
+                  <NativeReadingEpochContext.Provider value={timelineEpoch}>
+                    {streamRenderStrategy.render({
+                      readingRowReplacements: presentation.readingRowReplacements,
+                      agentId,
+                      segments: renderModel.segments,
+                      historyRowRevision,
+                      liveHeadRowRevision: expandedToolCallGroups,
+                      boundary,
+                      renderers,
+                      listEmptyComponent,
+                      viewportRef,
+                      routeBottomAnchorRequest,
+                      isAuthoritativeHistoryReady,
+                      isInitialHistoryLoading,
+                      revealInitialHistory,
+                      onNearBottomChange: nearBottom.set,
+                      onReadingPositionChange: handleReadingPositionChange,
+                      onNearHistoryStart: loadOlder,
+                      isLoadingOlderHistory: isLoadingOlder,
+                      hasOlderHistory: hasOlder,
+                      olderHistoryProgressKey: progressKey,
+                      scrollEnabled: streamScrollEnabled,
+                      listStyle: stylesheet.list,
+                      baseListContentContainerStyle: stylesheet.listContentContainer,
+                      forwardListContentContainerStyle: stylesheet.forwardListContentContainer,
+                      contentMaxWidth,
+                      outlineInset,
+                    })}
+                  </NativeReadingEpochContext.Provider>
                 </StreamExpansionProviders>
               </MessageOuterSpacingProvider>
               {renderChatOutlineRail(outlineInset, chatOutline)}
@@ -1534,6 +1547,7 @@ function agentStreamViewPropsEqual(
   if (left.toast !== right.toast) reasons.push("toast");
   if (left.onOpenWorkspaceFile !== right.onOpenWorkspaceFile) reasons.push("onOpenWorkspaceFile");
   if (left.readOnly !== right.readOnly) reasons.push("readOnly");
+  if (left.canSubmitSelection !== right.canSubmitSelection) reasons.push("canSubmitSelection");
   if (left.showAgentInteractions !== right.showAgentInteractions) {
     reasons.push("showAgentInteractions");
   }

@@ -807,3 +807,80 @@ describe("terminal collection protocol compatibility", () => {
     ).toMatchObject({ payload: { terminals: [{ isScript: true, createdAt: null }] } });
   });
 });
+
+test("keeps parent report negotiation and report status optional on the wire", () => {
+  const minimal = { status: "server_info", serverId: "host" };
+  const features = { agentExplicitParentReports: true, agentDirectParentQueuedDelivery: true };
+  expect(parseServerInfoStatusPayload(minimal)).not.toBeNull();
+  expect(parseServerInfoStatusPayload({ ...minimal, features })?.features).toMatchObject(features);
+  const request = {
+    type: "agent.finish_reports.pull.request",
+    requestId: "pull",
+    childAgentId: "child",
+    parentAgentId: "parent",
+    acknowledged: [],
+  };
+  expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+  expect(
+    SessionInboundMessageSchema.parse({ ...request, includeParentReports: true }),
+  ).toHaveProperty("includeParentReports", true);
+  const report = { id: "report", title: "Task", prompt: "Ready", event: "finished" };
+  const response = {
+    type: "agent.finish_reports.pull.response",
+    payload: { requestId: "pull", ownsChild: true, reports: [report], error: null },
+  };
+  expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
+  const explicit = { ...report, parentReportStatus: "blocked" };
+  expect(
+    SessionOutboundMessageSchema.parse({
+      ...response,
+      payload: { ...response.payload, reports: [explicit] },
+    }),
+  ).toHaveProperty("payload.reports", [explicit]);
+});
+
+test("keeps explicit parent report push and confirmation separate from ordinary messages", () => {
+  const report = {
+    id: "report",
+    title: "Task",
+    prompt: "Report to parent (completed):\n\nDone",
+    event: "finished",
+    parentReportStatus: "completed",
+  } as const;
+  const push = {
+    type: "agent.finish_reports.push.request",
+    requestId: "push",
+    childAgentId: "child",
+    parentAgentId: "parent",
+    report,
+  };
+  expect(SessionInboundMessageSchema.parse(push)).toEqual(push);
+  expect(
+    SessionOutboundMessageSchema.parse({
+      type: "agent.finish_reports.push.response",
+      payload: { requestId: "push", accepted: true, error: null },
+    }),
+  ).toMatchObject({ type: "agent.finish_reports.push.response" });
+  const confirm = {
+    type: "agent.finish_reports.confirm.request",
+    requestId: "confirm",
+    childAgentId: "child",
+    parentAgentId: "parent",
+    parentServerId: "parent-host",
+    reportId: report.id,
+  };
+  expect(SessionOutboundMessageSchema.parse(confirm)).toEqual(confirm);
+  expect(
+    SessionInboundMessageSchema.parse({
+      type: "agent.finish_reports.confirm.response",
+      payload: {
+        requestId: "confirm",
+        childAgentId: "child",
+        parentAgentId: "parent",
+        reportId: report.id,
+        accepted: false,
+        error: "Parent archived",
+      },
+    }),
+  ).toHaveProperty("payload.accepted", false);
+});

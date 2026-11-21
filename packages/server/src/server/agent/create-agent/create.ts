@@ -113,7 +113,7 @@ export interface CreateAgentFromMcpInput {
   mode?: string;
   unattended?: boolean;
   promptFailure?: CreateAgentPromptFailureMode;
-  notifyOnFinish: boolean;
+  notifyOnFinish?: boolean;
   parentReporting?: "auto" | "explicit";
   internal?: boolean;
   /** Omitted with a caller, the caller agent's own background applies. */
@@ -325,11 +325,9 @@ function registerInitialPromptFinish(
   input: CreateAgentCommandInput,
   child: ManagedAgent,
 ): Promise<FinishRegistration> | undefined {
-  if (isExplicitParentReportingLabels(child.labels)) return;
   if (!input.callerAgentId) return;
-  if (input.kind === "mcp" && (!input.notifyOnFinish || input.parentReporting === "explicit"))
-    return;
-  if (input.kind === "session" && input.notifyParentOnInitialPrompt === false) return;
+  const notify = input.kind === "mcp" ? input.notifyOnFinish : input.notifyParentOnInitialPrompt;
+  if (!(notify ?? !isExplicitParentReportingLabels(child.labels))) return;
   const subscriptions =
     input.kind === "mcp"
       ? requireFinishSubscriptions(dependencies)

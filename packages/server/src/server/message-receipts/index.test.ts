@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, test } from "vitest";
@@ -122,4 +122,63 @@ test("retry repairs a completion write without repeating the accepted dispatch",
   await requests.send(input);
   await new MessageReceipts(directory).send(input);
   expect(sends).toBe(1);
+});
+
+test("restart sees ordered, privately stored unsent entries and skips uncertain provider handoffs", async () => {
+  const { requests, directory } = await fixture();
+  const attempts: Promise<void>[] = [];
+  for (const messageId of ["first", "uncertain", "declined", "last"]) {
+    const admitted = Promise.withResolvers<void>();
+    attempts.push(
+      requests.sendQueued({
+        agentId: "agent",
+        request: { text: messageId },
+        message: {
+          messageId,
+          prompt: messageId,
+          source: { agentId: "sender" },
+          activeTurnBehavior: "steer",
+          unarchive: false,
+        },
+        async enqueue(handoff) {
+          if (messageId === "uncertain" || messageId === "declined") await handoff.begin();
+          if (messageId === "declined") await handoff.declined();
+          return { dispatched: new Promise(() => {}) };
+        },
+        onQueued: admitted.resolve,
+      }),
+    );
+    await admitted.promise;
+  }
+  const restarted = new MessageReceipts(directory);
+  const queued = await restarted.queuedMessages();
+  expect(queued.map((item) => item.queued.message.messageId)).toEqual([
+    "first",
+    "declined",
+    "last",
+  ]);
+  const files = await readdir(directory);
+  if (process.platform !== "win32") {
+    const modes = await Promise.all(
+      files.map(async (file) => (await stat(path.join(directory, file))).mode & 0o777),
+    );
+    expect(modes.filter((mode) => mode === 0o600)).toHaveLength(3);
+  }
+  const broken = path.join(directory, `${"a".repeat(64)}.json`);
+  await writeFile(broken, "{");
+  const unreadable = [];
+  expect(await restarted.queuedMessages(() => unreadable.push(true))).toEqual(queued);
+  expect(unreadable).toHaveLength(1);
+  expect(await readFile(broken, "utf8")).toBe("{");
+  for (const item of queued) {
+    await restarted.resumeQueued(item, {
+      async enqueue(handoff) {
+        await handoff.begin();
+        return { dispatched: Promise.resolve() };
+      },
+    });
+  }
+  expect(await restarted.queuedMessages()).toEqual([]);
+  // The previous daemon's in-memory promises died without provider confirmation.
+  expect(attempts).toHaveLength(4);
 });

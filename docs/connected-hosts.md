@@ -59,6 +59,12 @@ A definitely unsent prompt returns a tool error and creates no notification. An 
 response retains intent because the destination may have admitted it; observation then follows the
 same retry policy. A confirmed missing child reports unavailability.
 
+Explicit parent reporting requires a destination that advertises `agentExplicitParentReports`.
+The child saves the report on its own host. The parent can pull it over its authenticated
+connection to the child, and the child can push it over an existing authenticated connection to
+the parent. Both routes share the same delivery receipt. The child keeps the report until
+the parent acknowledges dispatch or the relationship no longer permits delivery.
+
 Remote creation and local subscription persistence are separate commits. A failed local write reports
 failure even if the destination already created the child; inspect it before retrying creation.
 See [finish notification lifetime](agent-lifecycle.md#relationships) for registration, acknowledgment,

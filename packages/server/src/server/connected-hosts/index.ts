@@ -22,7 +22,12 @@ import {
   type HostAdd,
   type HostUpdate,
 } from "@getpaseo/protocol/hosts";
-import type { DaemonPermission, WSHelloMessage } from "@getpaseo/protocol/messages";
+import type {
+  DaemonPermission,
+  SessionInboundMessage,
+  SessionOutboundMessage,
+  WSHelloMessage,
+} from "@getpaseo/protocol/messages";
 import { webSocketProxyAgent } from "../network/index.js";
 
 export class HostError extends Error {
@@ -40,6 +45,14 @@ export interface HostActor {
   sourceId: string;
   manageSources: boolean;
 }
+export type FinishReportConfirmationHandler = (
+  request: Extract<SessionOutboundMessage, { type: "agent.finish_reports.confirm.request" }>,
+) => Promise<
+  Pick<
+    Extract<SessionInboundMessage, { type: "agent.finish_reports.confirm.response" }>["payload"],
+    "accepted" | "error"
+  >
+>;
 interface Live {
   client: DaemonClient;
   accepted: boolean;
@@ -63,9 +76,15 @@ export class ConnectedHosts {
   constructor(
     private readonly home: string,
     private readonly self: HostDirectory["self"],
+    private readonly options: {
+      onFinishReportConfirm?: FinishReportConfirmationHandler;
+    } = {},
   ) {
     this.ready = this.load();
     void this.ready.catch(() => {});
+  }
+  finishReportConfirmationHandler(): FinishReportConfirmationHandler | undefined {
+    return this.options.onFinishReportConfirm;
   }
   private async load(): Promise<void> {
     try {

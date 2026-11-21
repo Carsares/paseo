@@ -64,6 +64,7 @@ interface ButtonView {
 
 interface SelectionAction {
   selection: PluginTimelineSelection;
+  canSubmit?: (agentId: string, workspaceId: string) => boolean;
   onAction(run: () => void): void;
 }
 
@@ -116,7 +117,7 @@ function ButtonIcon({ view, icon }: { view: ButtonView; icon: PluginButtonIcon }
 function pressButton(view: ButtonView, path: readonly string[]) {
   const run = () => {
     void pluginButtonStore
-      .run(view.entry.key, path, view.selectionAction?.selection)
+      .run(view.entry.key, path, view.selectionAction?.selection, view.selectionAction?.canSubmit)
       .catch((error: unknown) => {
         view.toast.error(error instanceof Error ? error.message : String(error));
       });
@@ -657,14 +658,17 @@ export function usePluginSelectionButtons(
   serverId?: string,
   workspaceId?: string,
   agentId?: string,
+  canSubmit = false,
 ): readonly RegisteredPluginButton[] {
   const entries = useRegisteredButtons();
   return useMemo(
     () =>
       serverId && workspaceId && agentId
-        ? entries.filter((entry) => selectionButtonMatches(entry, serverId, workspaceId, agentId))
+        ? entries.filter((entry) =>
+            selectionButtonMatches(entry, serverId, workspaceId, agentId, canSubmit),
+          )
         : [],
-    [entries, serverId, workspaceId, agentId],
+    [entries, serverId, workspaceId, agentId, canSubmit],
   );
 }
 
@@ -672,10 +676,15 @@ export function usePluginSelectionMenu(
   entries: readonly RegisteredPluginButton[],
   selection: PluginTimelineSelection | null,
   onAction: SelectionAction["onAction"],
+  canSubmit?: (agentId: string, workspaceId: string) => boolean,
 ): PluginButtonsMenu {
   return useMemo(
-    () => buttonsMenu(selection ? entries : [], selection ? { selection, onAction } : undefined),
-    [entries, selection, onAction],
+    () =>
+      buttonsMenu(
+        selection ? entries : [],
+        selection ? { selection, onAction, canSubmit } : undefined,
+      ),
+    [entries, selection, onAction, canSubmit],
   );
 }
 
@@ -685,16 +694,21 @@ export function PluginSelectionButtons({
   openKey,
   onOpenChange,
   onAction,
+  canSubmit,
 }: {
   entries: readonly RegisteredPluginButton[];
   selection: PluginTimelineSelection;
   openKey: number | null;
   onOpenChange(key: number, open: boolean): void;
   onAction: SelectionAction["onAction"];
+  canSubmit?: (agentId: string, workspaceId: string) => boolean;
 }) {
   const compact = useIsCompactFormFactor();
   const hosts = useHosts();
-  const selectionAction = useMemo(() => ({ selection, onAction }), [selection, onAction]);
+  const selectionAction = useMemo(
+    () => ({ selection, onAction, canSubmit }),
+    [selection, onAction, canSubmit],
+  );
   const selectionControls = useMemo(() => ({ openKey, onOpenChange }), [openKey, onOpenChange]);
   return entries.map((entry) => (
     <ThemedPluginButton

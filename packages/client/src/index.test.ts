@@ -1882,7 +1882,10 @@ test("qualified parents preserve foreign identity without resolving an equal loc
 });
 
 test("explicit-reporting forks preserve the qualified parent and existing labels", async () => {
-  const { client, ws } = await connectClient();
+  const { client, ws } = await connectClient({
+    agentSeamlessContextSwitch: true,
+    agentExplicitParentReports: true,
+  });
   const creating = client.agents.create({
     config: { provider: "codex/gpt-5.4" },
     cwd: "/repo/sdk",
@@ -2232,4 +2235,22 @@ test("background stop rejects when the host does not advertise the operation", a
       .backgroundWork.stop({ ...SHELL_ITEM, canStop: true, stopToken: "generation" }),
   ).rejects.toThrow("Update the host");
   await client.close();
+});
+
+test("an SDK explicit child needs a host that supports its reporting mode", async () => {
+  const { client, ws } = await connectClient();
+  try {
+    const sentBefore = ws.sent.length;
+    await expect(
+      client.agents.create({
+        config: { provider: "codex/gpt-5.4" },
+        cwd: "/repo/sdk",
+        parent: "parent-1",
+        parentReporting: "explicit",
+      }),
+    ).rejects.toThrow("Update the host to use explicit parent reporting.");
+    expect(ws.sent).toHaveLength(sentBefore);
+  } finally {
+    await client.close();
+  }
 });

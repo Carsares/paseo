@@ -11,7 +11,14 @@ import { hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  AgentStorage,
+  parseStoredAgentRecord,
+} from "../../../server/src/server/agent/agent-storage";
+import { createRestartRecovery } from "../../../server/src/server/agent/restart-recovery";
+import { createTestLogger } from "../../../server/src/test-utils/test-logger";
 import { DEFAULT_DESKTOP_SETTINGS } from "../settings/desktop-settings";
+import { createAppUpdateService } from "../features/app-update-service";
 import { ExternalCliCommandError } from "./cli/external";
 import {
   createDaemonCommandHandlers,
@@ -25,9 +32,11 @@ import {
   stopDesktopDaemon,
   type DesktopDaemonStopReason,
 } from "./daemon-manager";
+import { createQuitLifecycle, stopDesktopManagedDaemonOnQuitIfNeeded } from "./quit-lifecycle";
 
 const mocks = vi.hoisted(() => ({
   paseoHome: "",
+  appVersion: "1.2.3",
   settings: {
     releaseChannel: "stable",
     daemon: {
@@ -53,6 +62,8 @@ const mocks = vi.hoisted(() => ({
   installUpdate: vi.fn(),
 }));
 
+const approvedUpdate = { version: "1.2.4" };
+
 vi.mock("node:os", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:os")>()),
   // Keep PID-lock checks independent of the host boot time and sandbox syscalls.
@@ -62,7 +73,7 @@ vi.mock("node:os", async (importOriginal) => ({
 vi.mock("electron", () => ({
   app: {
     getPath: vi.fn(() => mocks.paseoHome),
-    getVersion: vi.fn(() => "1.2.3"),
+    getVersion: vi.fn(() => mocks.appVersion),
     isPackaged: true,
   },
   ipcMain: { handle: vi.fn() },
@@ -124,6 +135,7 @@ describe("daemon-manager commands", () => {
     fixtureRoot = mkdtempSync(path.join(tmpdir(), "paseo daemon manager "));
     mocks.paseoHome = path.join(fixtureRoot, "home");
     mocks.appLogPath = path.join(fixtureRoot, "main.log");
+    mocks.appVersion = "1.2.3";
     mocks.settings = DEFAULT_DESKTOP_SETTINGS;
     mocks.runExternalCliJsonCommand.mockReset();
     mocks.runExternalCliTextCommand.mockReset();
@@ -233,7 +245,7 @@ describe("daemon-manager commands", () => {
 
     expect(await handlers.install_app_update()).toEqual({ installed: false });
     expect(mocks.startDaemonInstance).not.toHaveBeenCalled();
-    const next = await prepareBuiltInDaemonForUpdate();
+    const next = await prepareBuiltInDaemonForUpdate(approvedUpdate);
     await next.restore();
   });
 
@@ -251,7 +263,7 @@ describe("daemon-manager commands", () => {
     writeFileSync(lockPath, JSON.stringify(instance));
     mocks.settings = { ...DEFAULT_DESKTOP_SETTINGS, officialUpdatesEnabled: true };
 
-    expect(await prepareBuiltInDaemonForUpdate("defer")).toBe(false);
+    expect(await prepareBuiltInDaemonForUpdate(approvedUpdate, "defer")).toBe(false);
     expect(existsSync(lockPath)).toBe(true);
     expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
 
@@ -272,10 +284,204 @@ describe("daemon-manager commands", () => {
   });
 
   it.each([
+    { scenario: "cancelled update", reopenedVersion: "1.2.3", expectedAgent: "running-agent" },
+    { scenario: "successful update", reopenedVersion: "1.2.4", expectedAgent: null },
+    {
+      scenario: "old version with newer recovery",
+      reopenedVersion: "1.2.3",
+      expectedAgent: "newer-agent",
+    },
+    {
+      scenario: "new version with newer recovery",
+      reopenedVersion: "1.2.4",
+      expectedAgent: "newer-agent",
+    },
+    { scenario: "blocked restore", reopenedVersion: "1.2.3", expectedAgent: "running-agent" },
+  ])(
+    "starts desktop after installer handoff: $scenario",
+    async ({ scenario, reopenedVersion, expectedAgent }) => {
+      const home = mocks.paseoHome;
+      mkdirSync(home);
+      const lockPath = path.join(home, "paseo.pid");
+      const markerPath = path.join(home, "restart-recovery-once.json");
+      const recoveryPath = path.join(home, "app-update-recovery.json");
+      const instance = {
+        pid: process.pid,
+        startedAt: new Date(Date.now() - 1_000).toISOString(),
+        hostname: hostname(),
+        uid: process.getuid?.() ?? 0,
+        listen: "127.0.0.1:6799",
+        desktopManaged: true,
+      };
+      writeFileSync(lockPath, JSON.stringify(instance));
+      mocks.settings = { ...DEFAULT_DESKTOP_SETTINGS, officialUpdatesEnabled: true };
+      mocks.confirmUpdate.mockResolvedValue(true);
+      const storage = new AgentStorage(path.join(home, "agents"), createTestLogger());
+      for (const [id, lastStatus] of [
+        ["running-agent", "running"],
+        ["newer-agent", "idle"],
+      ] as const) {
+        await storage.upsert(
+          parseStoredAgentRecord({
+            id,
+            lastStatus,
+            provider: "codex",
+            cwd: home,
+            createdAt: instance.startedAt,
+            updatedAt: instance.startedAt,
+          }),
+        );
+      }
+      const dispatch = vi.fn(async (_id: string, _prompt: string) => {});
+      const report = vi.fn();
+      const createRecovery = () =>
+        createRestartRecovery({
+          storage,
+          oneShotMarkerPath: markerPath,
+          settings: () => ({ enabled: false, prompt: "Continue." }),
+          eligible: async () => true,
+          dispatch,
+          report,
+        });
+      mocks.stopDaemonInstance.mockImplementation(async () => {
+        await createRecovery().captureRunningAgents({ force: true });
+        rmSync(lockPath);
+        return { action: "stopped", pid: instance.pid, forced: false, usedLifecycleRpc: true };
+      });
+      const service = createAppUpdateService({
+        isPackaged: () => true,
+        isUpdatesEnabled: async () => true,
+        now: () => 0,
+        bucket: async () => 0,
+        runtime: {
+          configure: ({ onUpdateDownloaded }) => onUpdateDownloaded(approvedUpdate),
+          checkForUpdates: async () => ({ isUpdateAvailable: true, updateInfo: approvedUpdate }),
+          downloadUpdate: async () => {},
+          quitAndInstall: async (request, beforeHandoff) => {
+            expect(request).toEqual({
+              targetVersion: "1.2.4",
+              isSilent: false,
+              isForceRunAfter: true,
+            });
+            await beforeHandoff?.();
+            expect(existsSync(markerPath)).toBe(false);
+          },
+        },
+      });
+      mocks.installUpdate.mockImplementation(service.downloadAndInstallUpdate);
+
+      expect(await createDaemonCommandHandlers().install_app_update()).toEqual({
+        installed: true,
+        version: "1.2.4",
+        message: "Update downloaded. The app will restart shortly.",
+      });
+      expect(existsSync(markerPath)).toBe(false);
+      expect(JSON.parse(readFileSync(recoveryPath, "utf8"))).toEqual({
+        sourceVersion: "1.2.3",
+        targetVersion: "1.2.4",
+        marker: '{"version":2,"agentIds":["running-agent"]}',
+      });
+      if (expectedAgent === "newer-agent") {
+        writeFileSync(markerPath, '{"version":2,"agentIds":["newer-agent"]}');
+      }
+
+      // The installer started and the app exited. A fresh desktop process has only the disk state.
+      mocks.appVersion = reopenedVersion;
+      vi.resetModules();
+      const { createDaemonCommandHandlers: createReopenedHandlers } =
+        await import("./daemon-manager");
+      const expectedMarker = expectedAgent ? `{"version":2,"agentIds":["${expectedAgent}"]}` : null;
+      const reopened = createReopenedHandlers();
+      if (scenario === "blocked restore") {
+        mkdirSync(markerPath);
+        await expect(reopened.start_desktop_daemon()).rejects.toThrow();
+        expect(mocks.startDaemonInstance).not.toHaveBeenCalled();
+        expect(existsSync(recoveryPath)).toBe(true);
+        rmSync(markerPath, { recursive: true });
+      }
+      mocks.startDaemonInstance.mockImplementation(async () => {
+        const recovery = createRecovery();
+        expect(existsSync(markerPath) ? readFileSync(markerPath, "utf8") : null).toBe(
+          mocks.startDaemonInstance.mock.calls.length === 1 ? expectedMarker : null,
+        );
+        await recovery.prepareStartup();
+        recovery.resumePending();
+        const signal = new AbortController().signal;
+        await recovery.waitForResume("running-agent", signal);
+        await recovery.waitForResume("newer-agent", signal);
+      });
+      await reopened.start_desktop_daemon();
+      expect(existsSync(markerPath)).toBe(false);
+      expect(existsSync(recoveryPath)).toBe(false);
+      expect(dispatch.mock.calls).toEqual(expectedAgent ? [[expectedAgent, "Continue."]] : []);
+
+      // The old recovery must not replay, even if the source version is opened again.
+      mocks.appVersion = "1.2.3";
+      await reopened.start_desktop_daemon();
+      expect(mocks.startDaemonInstance).toHaveBeenCalledTimes(2);
+      expect(dispatch.mock.calls).toEqual(expectedAgent ? [[expectedAgent, "Continue."]] : []);
+      expect(report).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([true, false])(
+    "takes the ordinary quit path with a daemon running: %s",
+    async (running) => {
+      const home = mocks.paseoHome;
+      mkdirSync(home);
+      const lockPath = path.join(home, "paseo.pid");
+      if (running) {
+        writeFileSync(
+          lockPath,
+          JSON.stringify({
+            pid: process.pid,
+            startedAt: new Date().toISOString(),
+            hostname: hostname(),
+            uid: process.getuid?.() ?? 0,
+            listen: "127.0.0.1:6799",
+            desktopManaged: true,
+          }),
+        );
+      }
+      mocks.stopDaemonInstance.mockImplementation(async () => {
+        rmSync(lockPath);
+        return { action: "stopped", pid: process.pid, forced: false, usedLifecycleRpc: true };
+      });
+      const { promise: exited, resolve: exit } = Promise.withResolvers<number>();
+      const prepareUpdate = vi.fn(prepareBuiltInDaemonForUpdate);
+      const quit = createQuitLifecycle({
+        app: { exit },
+        closeTransportSessions: vi.fn(),
+        stopDesktopManagedDaemonIfNeeded: () =>
+          stopDesktopManagedDaemonOnQuitIfNeeded({
+            settingsStore: { get: async () => DEFAULT_DESKTOP_SETTINGS },
+            isDesktopManagedDaemonRunning: isDesktopManagedDaemonPresentSync,
+            stopDaemon: (reason) =>
+              stopDesktopDaemon(reason, undefined, { includePreviousLaunch: true }),
+            showShutdownFeedback: vi.fn(),
+          }),
+        prepareDaemonForAppUpdate: prepareUpdate,
+        installAppUpdateOnQuit: async () => false,
+        createUpdateDeadlineSignal: () => new AbortController().signal,
+        onStopError: vi.fn(),
+        onUpdateError: vi.fn(),
+      });
+      quit.handleBeforeQuit({ preventDefault: vi.fn() });
+      expect(await exited).toBe(0);
+      expect(prepareUpdate).not.toHaveBeenCalled();
+      expect(mocks.stopDaemonInstance).toHaveBeenCalledTimes(running ? 1 : 0);
+      expect(mocks.startDaemonInstance).not.toHaveBeenCalled();
+      expect(existsSync(path.join(home, "app-update-recovery.json"))).toBe(false);
+      expect(existsSync(path.join(home, "restart-recovery-once.json"))).toBe(false);
+    },
+  );
+
+  it.each([
     "handoff",
     "preserve until next launch",
     "rollback",
     "restart failure",
+    "recovery write failure",
     "unsupported",
     "existing",
     "missing",
@@ -284,6 +490,7 @@ describe("daemon-manager commands", () => {
     mkdirSync(mocks.paseoHome);
     const lockPath = path.join(mocks.paseoHome, "paseo.pid");
     const markerPath = path.join(mocks.paseoHome, "restart-recovery-once.json");
+    const recoveryPath = path.join(mocks.paseoHome, "app-update-recovery.json");
     const instance = {
       pid: process.pid,
       startedAt: new Date(Date.now() - 1_000).toISOString(),
@@ -297,7 +504,9 @@ describe("daemon-manager commands", () => {
     writeFileSync(lockPath, JSON.stringify(instance));
     if (outcome === "existing") {
       writeFileSync(markerPath, otherMarker);
-      await expect(prepareBuiltInDaemonForUpdate()).rejects.toThrow("record is pending");
+      await expect(prepareBuiltInDaemonForUpdate(approvedUpdate)).rejects.toThrow(
+        "record is pending",
+      );
       expect(mocks.stopDaemonInstance).not.toHaveBeenCalled();
       expect(readFileSync(markerPath, "utf8")).toBe(otherMarker);
       return;
@@ -321,9 +530,13 @@ describe("daemon-manager commands", () => {
         expect(readFileSync(markerPath, "utf8")).toBe(marker);
         throw new Error("Daemon startup failed");
       }
-      if (outcome === "rollback" || outcome === "unsupported") {
+      if (
+        outcome === "rollback" ||
+        outcome === "unsupported" ||
+        outcome === "recovery write failure"
+      ) {
         expect(readFileSync(markerPath, "utf8")).toBe(
-          outcome === "rollback" ? marker : otherMarker,
+          outcome === "unsupported" ? otherMarker : marker,
         );
         // The old daemon consumes the one-shot record at startup.
         rmSync(markerPath);
@@ -334,13 +547,22 @@ describe("daemon-manager commands", () => {
       return { instance: restored, spawned: true };
     });
 
-    const shutdown = await prepareBuiltInDaemonForUpdate();
+    const shutdown = await prepareBuiltInDaemonForUpdate(approvedUpdate);
     expect(shutdown).toBeDefined();
     if (outcome === "missing") {
       await expect(shutdown?.beforeHandoff()).rejects.toThrow("recovery record is missing");
       return;
     }
     expect(existsSync(markerPath)).toBe(true);
+    if (outcome === "recovery write failure") {
+      mkdirSync(recoveryPath);
+      await expect(shutdown?.beforeHandoff()).rejects.toThrow();
+      expect(readFileSync(markerPath, "utf8")).toBe(marker);
+      await shutdown?.restore();
+      expect(mocks.startDaemonInstance).toHaveBeenCalledOnce();
+      expect(existsSync(markerPath)).toBe(false);
+      return;
+    }
     if (outcome === "replaced") {
       writeFileSync(`${markerPath}.tmp`, otherMarker);
       renameSync(`${markerPath}.tmp`, markerPath);
@@ -355,8 +577,11 @@ describe("daemon-manager commands", () => {
       await expect(handlers.start_desktop_daemon()).rejects.toThrow("stopped for an app update");
       await expect(handlers.restart_desktop_daemon()).rejects.toThrow("stopped for an app update");
       if (outcome === "preserve until next launch") {
-        await shutdown?.preserveForNextLaunch?.();
-        expect(readFileSync(markerPath, "utf8")).toBe(marker);
+        expect(JSON.parse(readFileSync(recoveryPath, "utf8"))).toEqual({
+          sourceVersion: "1.2.3",
+          targetVersion: "1.2.4",
+          marker,
+        });
         expect(existsSync(lockPath)).toBe(false);
       }
       expect(mocks.startDaemonInstance).not.toHaveBeenCalled();

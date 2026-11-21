@@ -1580,6 +1580,7 @@ export const SendAgentMessageRequestSchema = z.object({
   sessionMode: z.string().optional(),
   messageId: z.string().optional(), // Client-provided ID for deduplication
   waitForDispatch: z.boolean().optional(),
+  notifyDirectParentOnFinish: z.boolean().optional(),
   activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
   images: z.array(ImageAttachmentSchema).optional(),
   attachments: AgentAttachmentsSchema,
@@ -2414,8 +2415,50 @@ export const AgentFinishReportSchema = z.object({
   prompt: z.string(),
   title: z.string(),
   event: z.enum(["finished", "errored", "permission-required", "closed"]),
+  parentReportStatus: z.enum(["completed", "blocked"]).optional(),
 });
 export type AgentFinishReport = z.infer<typeof AgentFinishReportSchema>;
+export const AgentExplicitFinishReportSchema = AgentFinishReportSchema.extend({
+  parentReportStatus: z.enum(["completed", "blocked"]),
+});
+export type AgentExplicitFinishReport = z.infer<typeof AgentExplicitFinishReportSchema>;
+
+export const AgentPushFinishReportRequestSchema = z.object({
+  type: z.literal("agent.finish_reports.push.request"),
+  requestId: z.string(),
+  childAgentId: z.string().min(1),
+  parentAgentId: z.string().min(1),
+  report: AgentExplicitFinishReportSchema,
+});
+export const AgentPushFinishReportResponseSchema = z.object({
+  type: z.literal("agent.finish_reports.push.response"),
+  payload: z.object({
+    requestId: z.string(),
+    accepted: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
+
+export const AgentConfirmFinishReportRequestSchema = z.object({
+  type: z.literal("agent.finish_reports.confirm.request"),
+  requestId: z.string(),
+  childAgentId: z.string().min(1),
+  parentAgentId: z.string().min(1),
+  parentServerId: z.string().min(1),
+  reportId: z.string().min(1),
+});
+
+export const AgentConfirmFinishReportResponseSchema = z.object({
+  type: z.literal("agent.finish_reports.confirm.response"),
+  payload: z.object({
+    requestId: z.string(),
+    childAgentId: z.string().min(1),
+    parentAgentId: z.string().min(1),
+    reportId: z.string().min(1),
+    accepted: z.boolean(),
+    error: z.string().nullable(),
+  }),
+});
 
 export const AgentPullFinishReportsRequestSchema = z.object({
   type: z.literal("agent.finish_reports.pull.request"),
@@ -2424,6 +2467,7 @@ export const AgentPullFinishReportsRequestSchema = z.object({
   parentAgentId: z.string().min(1),
   acknowledged: z.array(z.string().min(1)).max(8),
   observe: z.boolean().optional(),
+  includeParentReports: z.boolean().optional(),
 });
 
 export const AgentPullFinishReportsResponseSchema = z.object({
@@ -3887,6 +3931,8 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   AgentMoveToWorkspaceRequestMessageSchema,
   AgentSetMainRequestMessageSchema,
   AgentSetParentRequestMessageSchema,
+  AgentPushFinishReportRequestSchema,
+  AgentConfirmFinishReportResponseSchema,
   AgentPullFinishReportsRequestSchema,
   AgentRewindRequestMessageSchema,
   AgentPermissionResponseMessageSchema,
@@ -4409,6 +4455,8 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(agentNotificationEvents): added in v0.16.0, remove after 2027-05-19.
         agentNotificationEvents: z.boolean().optional(),
         agentFinishReportPull: z.boolean().optional(),
+        agentExplicitParentReports: z.boolean().optional(),
+        agentDirectParentQueuedDelivery: z.boolean().optional(),
         // COMPAT(agentTurnIdentity): accept peers that observed pre-release v0.2.6 through 2027-01-31.
         agentTurnIdentity: z.boolean().optional(),
         // COMPAT(stableProjectIdentity): added in v0.1.109, remove gate after 2027-01-15.
@@ -8045,6 +8093,8 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentMoveToWorkspaceResponseMessageSchema,
   AgentSetMainResponseMessageSchema,
   AgentSetParentResponseMessageSchema,
+  AgentPushFinishReportResponseSchema,
+  AgentConfirmFinishReportRequestSchema,
   AgentPullFinishReportsResponseSchema,
   AgentRewindResponseMessageSchema,
   UpdateAgentResponseMessageSchema,

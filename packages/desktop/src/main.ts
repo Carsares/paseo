@@ -1090,15 +1090,15 @@ const quitLifecycle = createQuitLifecycle({
         if (!options?.preserveWork) showDaemonShutdownDialog();
       },
     }),
-  prepareDaemonForAppUpdate: async () => {
+  prepareDaemonForAppUpdate: async (target) => {
     const settings = await getDesktopSettingsStore().get();
     if (settings.daemon.keepRunningAfterQuit) {
-      if (process.platform === "win32") return prepareBuiltInDaemonForUpdate("defer");
-      if (process.platform === "darwin") return prepareBuiltInDaemonForUpdate("keep");
+      if (process.platform === "win32") return prepareBuiltInDaemonForUpdate(target, "defer");
+      if (process.platform === "darwin") return prepareBuiltInDaemonForUpdate(target, "keep");
       return;
     }
     if (isDesktopManagedDaemonPresentSync()) showDaemonShutdownDialog();
-    return prepareBuiltInDaemonForUpdate();
+    return prepareBuiltInDaemonForUpdate(target);
   },
   confirmAppUpdate: async (target, signal) => {
     const settings = await getDesktopSettingsStore().get();

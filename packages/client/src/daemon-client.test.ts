@@ -336,6 +336,92 @@ test("advertises consumer-provided browser automation capabilities", async () =>
   });
 });
 
+test("pushes explicit parent reports only after capability negotiation", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "parent-report-push",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({
+    features: {
+      agentExplicitParentReports: true,
+      agentDirectParentQueuedDelivery: true,
+    },
+  });
+  await connected;
+
+  const pushing = client.pushAgentFinishReport("child", "parent", {
+    id: "report-1",
+    title: "Task",
+    prompt: "Report to parent (completed):\n\nDone",
+    event: "finished",
+    parentReportStatus: "completed",
+  });
+  await expect.poll(() => mock.sent.length).toBe(1);
+  const request = parseSentFrame(mock.sent.at(-1));
+  expect(request).toMatchObject({
+    type: "agent.finish_reports.push.request",
+    childAgentId: "child",
+    parentAgentId: "parent",
+    report: { id: "report-1", parentReportStatus: "completed" },
+  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.finish_reports.push.response",
+      payload: { requestId: request.requestId, accepted: true, error: null },
+    }),
+  );
+  await expect(pushing).resolves.toEqual({ accepted: true, error: null });
+});
+
+test("answers a parent report confirmation through the authenticated client route", async () => {
+  const mock = createMockTransport();
+  const confirm = vi.fn(async () => ({ accepted: true, error: null }));
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "parent-report-confirm",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+    onAgentFinishReportConfirm: confirm,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({
+    features: {
+      agentExplicitParentReports: true,
+      agentDirectParentQueuedDelivery: true,
+    },
+  });
+  await connected;
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.finish_reports.confirm.request",
+      requestId: "confirm-1",
+      childAgentId: "child",
+      parentAgentId: "parent",
+      parentServerId: "parent-host",
+      reportId: "report-1",
+    }),
+  );
+  await expect.poll(() => confirm).toHaveBeenCalledTimes(1);
+  expect(parseSentFrame(mock.sent.at(-1))).toEqual({
+    type: "agent.finish_reports.confirm.response",
+    payload: {
+      requestId: "confirm-1",
+      childAgentId: "child",
+      parentAgentId: "parent",
+      reportId: "report-1",
+      accepted: true,
+      error: null,
+    },
+  });
+});
+
 test.each([
   { receipts: false, structured: false },
   { receipts: true, structured: false },
@@ -4349,7 +4435,7 @@ test("sends create_agent_request with workspace, caller identity, and fork sourc
   clients.push(client);
 
   const connectPromise = client.connect();
-  mock.triggerOpen({ features: { agentRequestReceipts: true } });
+  mock.triggerOpen({ features: { agentRequestReceipts: true, agentSeamlessContextSwitch: true } });
   await connectPromise;
 
   const forkFrom = { sourceAgentId: "source-agent", boundaryMessageId: "message-1" };
@@ -8582,7 +8668,13 @@ test("creation lifecycle sends the keyed agent, fork source, and initial prompt 
   });
   clients.push(client);
   const connected = client.connect();
-  transport.triggerOpen({ features: { creationLifecycle: true, agentRequestReceipts: true } });
+  transport.triggerOpen({
+    features: {
+      creationLifecycle: true,
+      agentRequestReceipts: true,
+      agentSeamlessContextSwitch: true,
+    },
+  });
   await connected;
   const forkFrom = { sourceAgentId: "source-agent", boundaryCursor: { epoch: "epoch-1", seq: 4 } };
   const creation = client.createAgent({
@@ -8667,7 +8759,11 @@ test("creation reconnect observation uses connection-owned subscriptions and rel
     reconnect: { enabled: false },
   });
   clients.push(client);
-  const features = { creationLifecycle: true, ownedSubscriptions: true };
+  const features = {
+    creationLifecycle: true,
+    ownedSubscriptions: true,
+    agentSeamlessContextSwitch: true,
+  };
   const connect = client.connect();
   transport.triggerOpen({ features });
   await connect;
@@ -10218,8 +10314,27 @@ describe("provider options across daemon versions", () => {
     return { mock, client, sentMessages };
   }
 
+  test.each([false, true])(
+    "an old host rejects fork creation before sending (workspace: %s)",
+    async (workspace) => {
+      const { client, sentMessages } = await connect({ creationLifecycle: true });
+      const before = sentMessages().length;
+      const agent = {
+        provider: "codex",
+        cwd: "/repo",
+        initialPrompt: "Continue work",
+        forkFrom: { sourceAgentId: "source-agent", boundaryCursor: { epoch: "e1", seq: 10 } },
+      };
+      const creation = workspace
+        ? client.createWorkspace({ source: { kind: "directory", path: "/repo" }, agent })
+        : client.createAgent(agent);
+      await expect(creation).rejects.toThrow("Update the host to fork an agent's conversation.");
+      expect(sentMessages()).toHaveLength(before);
+    },
+  );
+
   test("preserves the initial agent's fork source when workspace creation uses two requests", async () => {
-    const { client, mock, sentMessages } = await connect({});
+    const { client, mock, sentMessages } = await connect({ agentSeamlessContextSwitch: true });
     const forkFrom = { sourceAgentId: "source-agent", boundaryMessageId: "message-1" };
     const workspace = {
       id: "wks_0123456789abcdef",

@@ -470,6 +470,50 @@ describe("Codex collaboration history", () => {
     },
   );
 
+  test("restores a failed close's child error without canceling the child's descendants", async () => {
+    const history = await replay(
+      [
+        collab("spawnAgent", { first: "pendingInit" }, "spawn-first"),
+        { ...collab("closeAgent", { first: "errored" }), status: "failed" },
+      ],
+      {
+        first: {
+          turns: [
+            { status: "completed", items: [collab("spawnAgent", { nested: "pendingInit" })] },
+          ],
+        },
+        nested: { turns: [{ status: "completed" }] },
+      },
+    );
+    expect(
+      history.flatMap((event) =>
+        event.type === "provider_subagent" && event.event.type === "upsert"
+          ? [{ id: event.event.id, status: event.event.status }]
+          : [],
+      ),
+    ).toEqual([
+      { id: "first", status: "failed" },
+      { id: "nested", status: "completed" },
+    ]);
+  });
+
+  test("shows an unregistered receiver's failed close without canceling a registered child", async () => {
+    const history = await replay([
+      collab("spawnAgent", { first: "pendingInit" }, "spawn-first"),
+      { ...collab("closeAgent", { first: "running", external: "notFound" }), status: "failed" },
+    ]);
+    expect(
+      history.flatMap((event) =>
+        event.type === "timeline" && event.item.type === "tool_call"
+          ? [{ id: event.item.callId, status: event.item.status }]
+          : [],
+      ),
+    ).toEqual([
+      { id: "spawn-first", status: "running" },
+      { id: "closeAgent", status: "failed" },
+    ]);
+  });
+
   test.each(["wait", "closeAgent"])(
     "settles a live errored child as failed after %s",
     async (tool) => {
@@ -517,6 +561,45 @@ describe("Codex collaboration history", () => {
       }
     },
   );
+
+  test("keeps a live child running after a failed close with a running snapshot", async () => {
+    const appServer = createFakeCodexAppServer();
+    const session = new CodexAppServerAgentSession(
+      { provider: "codex", cwd: process.cwd(), modeId: "full-access" },
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+    );
+    const cards = new Map<string, string>();
+    const statuses = new Map<string, string | undefined>();
+    session.subscribe((event) => {
+      if (event.type === "timeline" && event.item.type === "tool_call") {
+        cards.set(event.item.callId, event.item.status);
+      }
+      if (event.type === "provider_subagent" && event.event.type === "upsert") {
+        statuses.set(event.event.id, event.event.status);
+      }
+    });
+    try {
+      const result = session.run("Delegate the work.");
+      await appServer.waitForTurnStart();
+      for (const item of [
+        collab("spawnAgent", { first: "pendingInit" }, "spawn-first"),
+        { ...collab("closeAgent", { first: "running" }), status: "failed" },
+      ]) {
+        appServer.child.stdout.write(
+          `${JSON.stringify({ method: "item/completed", params: { threadId: "thread-1", item } })}\n`,
+        );
+      }
+      appServer.completeTurn();
+      await result;
+      expect([...statuses]).toEqual([["first", "running"]]);
+      expect([...cards]).toEqual([["spawn-first", "running"]]);
+    } finally {
+      await session.close();
+      appServer.assertNoErrors();
+    }
+  });
 
   test("preserves completion when a close carries an older running snapshot", async () => {
     const history = await replay([

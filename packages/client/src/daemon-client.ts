@@ -1,3 +1,4 @@
+import { isExplicitParentReportingLabels } from "@getpaseo/protocol/agent-labels";
 import {
   DiffStreamRouter,
   DiffSubscriptionError,
@@ -141,6 +142,7 @@ import type {
   TerminalInput,
   SessionInboundMessage,
   SessionOutboundMessage,
+  AgentExplicitFinishReport,
   SendAgentMessageRequest,
   PaseoConfigRaw,
   PaseoConfigRevision,
@@ -477,6 +479,10 @@ export interface DaemonClientConfig {
   runtimeMetricsWindowMs?: number;
   trace?: DaemonClientTrace;
   capabilities?: Partial<Record<ClientCapability, unknown>>;
+  /** Handles a parent daemon's last-moment confirmation for one stored report. */
+  onAgentFinishReportConfirm?: (
+    request: AgentFinishReportConfirmRequest,
+  ) => Promise<AgentFinishReportConfirmResult>;
 }
 
 export interface DaemonClientTrace {
@@ -493,6 +499,8 @@ export interface SendMessageOptions {
   messageId?: string;
   /** Wait for provider dispatch instead of the agent message's queue admission. */
   waitForDispatch?: boolean;
+  /** The recipient owns the completion watch for this direct-parent delegation. */
+  notifyDirectParentOnFinish?: boolean;
   /** Agent sources wait for turn end unless interrupt is explicit. Human sources default to interrupt. */
   activeTurnBehavior?: ActiveTurnBehavior;
   images?: Array<{ data: string; mimeType: string }>;
@@ -1458,6 +1466,15 @@ function buildFetchAgentsRequest(
       : {}),
   });
 }
+
+type AgentFinishReportConfirmRequest = Extract<
+  SessionOutboundMessage,
+  { type: "agent.finish_reports.confirm.request" }
+>;
+type AgentFinishReportConfirmResult = Pick<
+  Extract<SessionInboundMessage, { type: "agent.finish_reports.confirm.response" }>["payload"],
+  "accepted" | "error"
+>;
 
 export class DaemonClient {
   private readonly providerSnapshotUpdates = new ProviderSnapshotUpdates({
@@ -3518,8 +3535,13 @@ export class DaemonClient {
       return this.lastServerInfoMessage?.features?.[feature] === true;
     },
     requestId: () => this.createRequestId(),
-    request: (kind, input) =>
-      kind === "workspace"
+    request: async (kind, input) => {
+      const options =
+        kind === "workspace"
+          ? (input as unknown as CreateWorkspaceRequestOptions).agent
+          : (input as CreateAgentRequestOptions);
+      this.assertAgentCreationFeatures(options);
+      return kind === "workspace"
         ? this.sendCorrelatedSessionRequest({
             requestId: input.requestId as string | undefined,
             message: { ...input, type: "workspace.create.request" },
@@ -3531,7 +3553,8 @@ export class DaemonClient {
             message: { ...input, type: "agent.create.request" },
             responseType: "agent.create.response",
             timeout: 0,
-          }),
+          });
+    },
     observe: (kind, idempotencyKey, next, error) => {
       const observation = this.observe("creation.subscribe.response", {
         type: "creation.subscribe.request",
@@ -3583,12 +3606,34 @@ export class DaemonClient {
     }
   }
 
+  private assertAgentCreationFeatures(
+    options?: Pick<CreateAgentRequestOptions, "forkFrom" | "labels">,
+  ): void {
+    const features = this.lastServerInfoMessage?.features;
+    // COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
+    if (options?.forkFrom && features?.agentSeamlessContextSwitch !== true) {
+      throw Object.assign(new Error("Update the host to fork an agent's conversation."), {
+        outcome: "rejected" as const,
+      });
+    }
+    // COMPAT(agentExplicitParentReports): added in v0.17.0, remove gate after 2027-05-22.
+    if (
+      isExplicitParentReportingLabels(options?.labels) &&
+      features?.agentExplicitParentReports !== true
+    ) {
+      throw Object.assign(new Error("Update the host to use explicit parent reporting."), {
+        outcome: "rejected" as const,
+      });
+    }
+  }
+
   async createAgent(options: CreateAgentRequestOptions): Promise<AgentSnapshotPayload> {
     if (options.git !== undefined || options.worktreeName !== undefined) {
       throw new Error(
         "Legacy git/worktreeName agent placement was removed. Use createWorkspace({ source, agent, idempotencyKey }) or create a workspace first and pass workspaceId.",
       );
     }
+    this.assertAgentCreationFeatures(options);
     if (options.background !== undefined) this.requireBackgroundCreation(options);
     if (options.metadata !== undefined) this.requireEntityMetadata();
     const config = resolveAgentConfig(options);
@@ -4455,8 +4500,40 @@ export class DaemonClient {
         parentAgentId,
         acknowledged,
         observe,
+        // COMPAT(agentExplicitParentReports): added in v0.17.0, remove after 2027-05-22.
+        includeParentReports:
+          this.getLastServerInfoMessage()?.features?.agentExplicitParentReports === true
+            ? true
+            : undefined,
       },
     });
+  }
+
+  async pushAgentFinishReport(
+    childAgentId: string,
+    parentAgentId: string,
+    report: AgentExplicitFinishReport,
+  ): Promise<{ accepted: boolean; error: string | null }> {
+    const features = this.getLastServerInfoMessage()?.features;
+    // COMPAT(agentDirectParentQueuedDelivery): added in v0.17.0, remove gate after 2027-05-22.
+    if (
+      features?.agentDirectParentQueuedDelivery !== true ||
+      features.agentExplicitParentReports !== true
+    ) {
+      throw Object.assign(new Error("Update the parent host to push explicit reports."), {
+        code: "AGENT_FINISH_REPORT_PUSH_UNSUPPORTED",
+      });
+    }
+    const response =
+      await this.sendNamespacedCorrelatedSessionRequest<"agent.finish_reports.push.response">({
+        message: {
+          type: "agent.finish_reports.push.request",
+          childAgentId,
+          parentAgentId,
+          report,
+        },
+      });
+    return { accepted: response.accepted, error: response.error };
   }
 
   private assertAgentSendSupport(options: SendMessageOptions): void {
@@ -4510,6 +4587,7 @@ export class DaemonClient {
       sessionMode: options.sessionMode,
       ...(messageId ? { messageId } : {}),
       waitForDispatch: options.waitForDispatch,
+      notifyDirectParentOnFinish: options.notifyDirectParentOnFinish,
       activeTurnBehavior: options.activeTurnBehavior,
       images: options.images,
       attachments: options.attachments,
@@ -5737,6 +5815,7 @@ export class DaemonClient {
     input: CreateWorkspaceRequestOptions,
     requestId?: string,
   ): Promise<WorkspaceCreatePayload> {
+    this.assertAgentCreationFeatures(input.agent);
     const resolvedRequestId = this.createRequestId(requestId ?? input.requestId);
     if (input.background !== undefined || input.callerAgentId) this.requireBackgroundWorkspaces();
     if (input.agent?.background !== undefined)
@@ -8319,6 +8398,10 @@ export class DaemonClient {
   private handleSessionMessage(msg: SessionOutboundMessage): void {
     msg = this.owned.normalize(msg);
     msg = this.legacyProviderOptions()?.normalize(msg) ?? msg;
+    if (msg.type === "agent.finish_reports.confirm.request") {
+      void this.handleAgentFinishReportConfirm(msg);
+      return;
+    }
     if (
       msg.type === "providers_snapshot_update" &&
       this.config.providerSnapshots !== "wire" &&
@@ -8329,6 +8412,40 @@ export class DaemonClient {
       return;
     }
     this.deliverSessionMessage(msg);
+  }
+
+  private async handleAgentFinishReportConfirm(
+    request: AgentFinishReportConfirmRequest,
+  ): Promise<void> {
+    let result: AgentFinishReportConfirmResult;
+    try {
+      result = this.config.onAgentFinishReportConfirm
+        ? await this.config.onAgentFinishReportConfirm(request)
+        : { accepted: false, error: "Report confirmation is unavailable." };
+    } catch (error) {
+      result = {
+        accepted: false,
+        error: error instanceof Error ? error.message : "Report confirmation failed.",
+      };
+    }
+    try {
+      await this.sendSessionMessageStrict({
+        type: "agent.finish_reports.confirm.response",
+        payload: {
+          requestId: request.requestId,
+          childAgentId: request.childAgentId,
+          parentAgentId: request.parentAgentId,
+          reportId: request.reportId,
+          accepted: result.accepted,
+          error: result.error,
+        },
+      });
+    } catch (error) {
+      this.logger.warn(
+        { err: error, reportId: request.reportId },
+        "Failed to answer report confirmation",
+      );
+    }
   }
 
   private deliverSessionMessage(msg: SessionOutboundMessage): void {

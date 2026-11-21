@@ -18,7 +18,10 @@ import { createTestPaseoDaemon } from "../../test-utils/paseo-daemon.js";
 import { createProviderSnapshotManagerStub } from "../../test-utils/session-stubs.js";
 import { AgentManager } from "../agent-manager.js";
 import { AgentStorage } from "../agent-storage.js";
-import { createJsonFinishSubscriptionStore } from "../finish-subscriptions/index.js";
+import {
+  createFinishSubscriptions,
+  createJsonFinishSubscriptionStore,
+} from "../finish-subscriptions/index.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
 import { createAgentCommand } from "./create.js";
 import { ForegroundPromptStart } from "../agent-run-state.js";
@@ -412,16 +415,72 @@ test("mcp create stamps the new worktree's workspaceId, not the parent's", async
 });
 
 test.each([
-  { parentReporting: "explicit", detached: false, expected: true },
-  { parentReporting: "explicit", detached: true, expected: false },
-  { parentReporting: "auto", detached: false, expected: false },
+  {
+    parentReporting: "explicit",
+    notifyOnFinish: undefined,
+    detached: false,
+    expected: true,
+    notify: false,
+  },
+  {
+    parentReporting: "explicit",
+    notifyOnFinish: true,
+    detached: false,
+    expected: true,
+    notify: true,
+  },
+  {
+    parentReporting: "explicit",
+    notifyOnFinish: false,
+    detached: false,
+    expected: true,
+    notify: false,
+  },
+  {
+    parentReporting: "explicit",
+    notifyOnFinish: true,
+    detached: true,
+    expected: false,
+    notify: true,
+  },
+  {
+    parentReporting: "auto",
+    notifyOnFinish: false,
+    detached: false,
+    expected: false,
+    notify: false,
+  },
+  {
+    parentReporting: "auto",
+    notifyOnFinish: undefined,
+    detached: false,
+    expected: false,
+    notify: true,
+  },
 ] as const)(
-  "persists $parentReporting MCP reporting only for an explicit subagent (detached: $detached)",
-  async ({ parentReporting, detached, expected }) => {
+  "persists $parentReporting and handles initial notification $notifyOnFinish (detached: $detached)",
+  async ({ parentReporting, notifyOnFinish, detached, expected, notify }) => {
     const workdir = mkdtempSync(join(tmpdir(), "create-agent-reporting-test-"));
     const agentStorage = new AgentStorage(join(workdir, "agents"), logger);
     const agentManager = createRealAgentManager(agentStorage);
     const workspaceId = "ws-parent";
+    const finishSubscriptions = createFinishSubscriptions({
+      store: createJsonFinishSubscriptionStore(workdir),
+      serverId: "host",
+      logger,
+      messages: () => {
+        throw new Error("Should not dispatch completion yet");
+      },
+      callerIsActive: async () => true,
+      open: async (_record, signal) => ({
+        next: () =>
+          new Promise((_resolve, reject) =>
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true }),
+          ),
+        close: async () => {},
+      }),
+    });
+    await finishSubscriptions.start();
     try {
       const parent = await agentManager.createAgent(
         { provider: "codex", cwd: workdir },
@@ -435,6 +494,7 @@ test.each([
           agentStorage,
           logger,
           providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+          finishSubscriptions,
         },
         {
           kind: "mcp",
@@ -442,7 +502,7 @@ test.each([
           title: "Worker",
           callerAgentId: parent.id,
           initialPrompt: "Complete the task",
-          notifyOnFinish: parentReporting === "explicit",
+          notifyOnFinish,
           parentReporting,
           detached,
           labels: { [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING },
@@ -452,7 +512,9 @@ test.each([
       const stored = await agentStorage.get(snapshot.id);
       expect(stored?.labels[PARENT_AGENT_ID_LABEL]).toBe(detached ? undefined : parent.id);
       expect(isExplicitParentReportingLabels(stored?.labels)).toBe(expected);
+      expect(finishSubscriptions.hasPendingForCaller(parent.id)).toBe(notify);
     } finally {
+      await finishSubscriptions.close();
       await removeRealAgentManagerWorkdir({ agentManager, storage: agentStorage, workdir });
     }
   },

@@ -3,10 +3,12 @@ import type {
   ProviderCatalog,
   ProviderCommand,
   ProviderConfigState,
+  ProviderLaunch,
   ProviderMode,
   ProviderNotice,
   ProviderPersistence,
   ProviderRegistration,
+  ProviderSessionConfig,
   ProviderTimelineItem,
   ProviderToolCallDetail,
 } from "./provider.js";
@@ -128,6 +130,13 @@ export interface AcpTransformer {
     systemPrompt?: string;
     agentMetadata: JsonValue;
   }): { sessionId?: string; metadata?: Readonly<Record<string, JsonValue>> };
+
+  /** Read local history for a resumed session only when session/load emitted no timeline items. */
+  loadHistoryFallback?(context: {
+    nativeSessionId: string;
+    launch?: ProviderLaunch;
+    config: ProviderSessionConfig;
+  }): Promise<readonly { item: ProviderTimelineItem; timestamp?: string }[]>;
 
   discover?(
     catalog: ProviderCatalog,

@@ -8,6 +8,7 @@ import {
   resolveAgentModelSelection,
   resolveProviderSnapshotEntry,
 } from "@/composer/agent-controls/utils";
+import { assertComposerInputUnlocked } from "@/composer/handoff-input-lock";
 import type { ComposerFocusOptions, ComposerModel, ComposerState } from "@/composer/model";
 import { filterSelectableModels } from "@/provider-selection/model-catalog";
 import { buildDraftStoreKey } from "@/stores/draft-keys";
@@ -288,6 +289,7 @@ export function createAgentComposer(
       else useDraftStore.getState().replaceDraftText({ draftKey, text });
     },
     insertText(text) {
+      assertComposerInputUnlocked(serverId, agentId);
       if (mounted?.isLive()) mounted.insertText(text);
       else {
         const current = useDraftStore.getState().getDraftInput(draftKey)?.text ?? "";

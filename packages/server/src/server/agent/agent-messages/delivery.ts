@@ -2,6 +2,7 @@ import { AgentTurnBusyError, type PromptDispatchDisposition } from "../agent-pro
 import { randomUUID } from "node:crypto";
 import type { AgentPromptInput, AgentPromptContentBlock } from "../agent-sdk-types.js";
 import { prepareAgentMessage, type AgentPromptSource } from "./envelope.js";
+import type { QueueHandoff } from "../../message-receipts/index.js";
 
 interface Message {
   recipientId: string;
@@ -16,6 +17,7 @@ interface Message {
   /** Recheck mutable sender authority when the message leaves the queue. */
   validateDispatch?: () => Promise<void>;
   beforeProviderDispatch?: () => Promise<void>;
+  handoff?: QueueHandoff;
   onDispatch?: (disposition: PromptDispatchDisposition) => void;
 }
 interface Receipt {
@@ -27,6 +29,7 @@ interface Admitted extends Message {
   sequence: number;
   state: "queued" | "claimed" | "withdrawn";
   outOfBandDeclined: boolean;
+  drainSteerDeclined?: boolean;
   receipt: Receipt;
   resolve(disposition: PromptDispatchDisposition): void;
   reject(error: unknown): void;
@@ -37,6 +40,7 @@ interface DispatchRequest {
   prompt: AgentPromptInput;
   activeTurnBehavior: "steer" | "interrupt";
   idleOnly: boolean;
+  canSteerDuringDrain?: () => boolean;
   /** Claim this exact prompt at provider admission. A withdrawn message invalidates the batch. */
   admit(): boolean;
   sessionMode?: string;
@@ -44,6 +48,7 @@ interface DispatchRequest {
   unarchive: boolean;
   validateDispatch?: () => Promise<void>;
   beforeProviderDispatch(): Promise<void>;
+  handoff?: QueueHandoff;
 }
 interface Dependencies {
   /** Includes admitted starts and provider turns, including compaction. */
@@ -51,7 +56,10 @@ interface Dependencies {
   hasPendingPermission?: (recipientId: string) => boolean;
   /** Notify when recipient state changes; admission still checks whether it is idle. */
   subscribe?: (listener: (recipientId: string) => void) => () => void;
-  tryRunOutOfBand?(request: DispatchRequest, onAccepted: () => void): Promise<boolean>;
+  tryRunOutOfBand?(
+    request: DispatchRequest,
+    onAccepted: () => void | Promise<void>,
+  ): Promise<boolean>;
   dispatch(request: DispatchRequest): Promise<PromptDispatchDisposition>;
   onError(error: unknown, request: DispatchRequest): void;
   /** Return a cancellation function. Production uses the daemon's event loop. */
@@ -95,6 +103,18 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   let closing: Promise<void> | undefined;
 
   const isWithdrawn = (message: Admitted): boolean => message.state === "withdrawn";
+  const draining = () => admissionPaused || closed;
+  const preparing = () => admissionPaused && !closed;
+
+  function maySteerDuringDrain(message: Admitted): boolean {
+    // A request that needs a different session mode must wait for its own turn.
+    return (
+      preparing() &&
+      message.activeTurnBehavior !== "interrupt" &&
+      !message.sessionMode &&
+      !message.drainSteerDeclined
+    );
+  }
 
   function requestFor(recipientId: string, messages: Admitted[]): DispatchRequest {
     const prompts = messages.map(
@@ -107,8 +127,19 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
           typeof entry === "string" ? [{ type: "text", text: entry }] : entry,
         );
     return {
+      handoff: messages.some((message) => message.handoff)
+        ? {
+            async begin() {
+              for (const message of messages) await message.handoff?.begin();
+            },
+            async declined() {
+              for (const message of messages) await message.handoff?.declined();
+            },
+          }
+        : undefined,
       recipientId,
       idleOnly: !closed && messages[0]!.activeTurnBehavior !== "interrupt",
+      canSteerDuringDrain: messages.every(maySteerDuringDrain) ? preparing : undefined,
       admit() {
         if (messages.some(isWithdrawn)) return false;
         for (const message of messages) message.state = "claimed";
@@ -150,6 +181,24 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     return removed;
   }
 
+  async function dispatchRequest(request: DispatchRequest, messages: Admitted[]) {
+    try {
+      return await dependencies.dispatch(request);
+    } catch (error) {
+      if (
+        !(error instanceof AgentTurnBusyError) ||
+        !request.idleOnly ||
+        request.canSteerDuringDrain ||
+        !closed ||
+        messages.some(isWithdrawn)
+      )
+        throw error;
+      // Legacy queue closure can flush a dispatch started before close. A
+      // shutdown steer that was declined must never use this replacement path.
+      return await dependencies.dispatch({ ...request, idleOnly: false });
+    }
+  }
+
   function dispatch(recipientId: string, batch: Admitted[]): void {
     queueDispatch(recipientId, async () => {
       const messages = batch.filter((message) => message.state === "queued");
@@ -158,15 +207,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       try {
         await request.validateDispatch?.();
         for (const message of messages) message.beforeDispatch?.();
-        let disposition: PromptDispatchDisposition;
-        try {
-          disposition = await dependencies.dispatch(request);
-        } catch (error) {
-          if (!(error instanceof AgentTurnBusyError) || !closed || messages.some(isWithdrawn))
-            throw error;
-          // Shutdown drains admitted messages before closing the recipients.
-          disposition = await dependencies.dispatch({ ...request, idleOnly: false });
-        }
+        const disposition = await dispatchRequest(request, messages);
         for (const message of messages) {
           message.state = "claimed";
           try {
@@ -180,10 +221,12 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       } catch (error) {
         if (messages.some(isWithdrawn)) {
           requeue(recipientId, messages);
-          if (closed) flush(recipientId);
           return;
         }
         if (error instanceof AgentTurnBusyError && !closed) {
+          if (request.canSteerDuringDrain && preparing()) {
+            for (const message of messages) message.drainSteerDeclined = true;
+          }
           requeue(recipientId, messages);
           return;
         }
@@ -200,7 +243,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     dispatching.set(recipientId, dispatched);
     void dispatched
       .finally(() => {
-        if (dispatching.get(recipientId) === dispatched) dispatching.delete(recipientId);
+        if (dispatching.get(recipientId) !== dispatched) return;
+        dispatching.delete(recipientId);
+        if (draining()) flush(recipientId);
       })
       .catch(() => undefined);
   }
@@ -224,6 +269,8 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   function flush(recipientId: string): void {
     const entry = pending.get(recipientId);
     if (!entry) return;
+    // A previous dispatch can still restore an earlier message to the head of the queue.
+    if (draining() && dispatching.has(recipientId)) return;
     entry.ready = true;
     entry.cancel();
     if (!closed && dependencies.isRunning?.(recipientId)) {
@@ -233,12 +280,28 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       entry.messages = entry.messages.filter(
         (message) => message.activeTurnBehavior !== "interrupt",
       );
-      if (interrupts.length) dispatchGroups(recipientId, interrupts);
-      if (entry.messages.length && dependencies.tryRunOutOfBand) {
+      if (interrupts.length) {
+        dispatchGroups(recipientId, interrupts);
+        if (preparing() && entry.messages.length) return;
+      }
+      if (
+        dependencies.tryRunOutOfBand &&
+        entry.messages.some((message) => canOfferOutOfBand(recipientId, message))
+      ) {
         pending.delete(recipientId);
         offerOutOfBand(recipientId, entry.messages);
+      } else if (entry.messages[0] && maySteerDuringDrain(entry.messages[0])) {
+        const firstWaiting = entry.messages.findIndex((message) => !maySteerDuringDrain(message));
+        const messages = entry.messages.splice(
+          0,
+          firstWaiting < 0 ? entry.messages.length : firstWaiting,
+        );
+        if (!entry.messages.length) pending.delete(recipientId);
+        dispatchGroups(recipientId, messages);
       } else if (entry.messages.length) {
-        entry.cancel = schedule(2000, () => flush(recipientId));
+        // A turn can settle after its final state event. Resample within the
+        // lifecycle budget if that event still saw the recipient as busy.
+        entry.cancel = schedule(admissionPaused ? 100 : 2000, () => flush(recipientId));
       } else {
         pending.delete(recipientId);
       }
@@ -270,9 +333,11 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         const request = requestFor(recipientId, [message]);
         try {
           await request.validateDispatch?.();
-          const accepted = await dependencies.tryRunOutOfBand!(request, () => {
+          const accepted = await dependencies.tryRunOutOfBand!(request, async () => {
             if (!request.admit()) throw new Error("Queued agent message was withdrawn");
             message.beforeDispatch?.();
+            await request.handoff?.begin();
+            await request.validateDispatch?.();
           });
           if (!accepted) {
             message.outOfBandDeclined = true;
@@ -293,7 +358,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         }
       }
       if (waiting.length) requeue(recipientId, waiting);
-      if (closed || (pending.get(recipientId)?.ready && !dependencies.isRunning?.(recipientId)))
+      if (pending.get(recipientId)?.ready && !dependencies.isRunning?.(recipientId))
         flush(recipientId);
     });
   }
@@ -323,7 +388,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     if (group.length) groups.push(group);
     let started = false;
     for (const batch of groups) {
-      if (!closed && started && batch[0]!.activeTurnBehavior !== "interrupt") {
+      if (started && (draining() || batch[0]!.activeTurnBehavior !== "interrupt")) {
         requeue(recipientId, batch);
       } else {
         dispatch(recipientId, batch);
@@ -334,8 +399,12 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
 
   async function drain(): Promise<void> {
     for (const recipientId of pending.keys()) flush(recipientId);
-    // Individual failures reject their receipts and are reported by dispatch.
-    await Promise.allSettled(dispatching.values());
+    // Receipts include messages that an in-flight dispatch may put back in the queue.
+    await Promise.allSettled(
+      [...admitted.values()].flatMap((owned) =>
+        [...owned].map((message) => message.receipt.dispatched),
+      ),
+    );
   }
   const unsubscribe = dependencies.subscribe?.((recipientId) => {
     if (pending.get(recipientId)?.ready && !dependencies.isRunning?.(recipientId))
@@ -432,6 +501,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         drained: drain(),
         release: () => {
           admissionPaused = false;
+          for (const messages of admitted.values()) {
+            for (const message of messages) message.drainSteerDeclined = false;
+          }
         },
       };
     },
@@ -439,13 +511,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       if (closing) return closing;
       closed = true;
       unsubscribe?.();
-      for (const recipientId of pending.keys()) flush(recipientId);
-      // Each failure is reported and rejects its receipts; shutdown still drains other recipients.
-      closing = Promise.allSettled(
-        [...admitted.values()].flatMap((owned) =>
-          [...owned].map((message) => message.receipt.dispatched),
-        ),
-      ).then(() => undefined);
+      closing = drain();
       return closing;
     },
   };

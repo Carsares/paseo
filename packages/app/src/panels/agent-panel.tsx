@@ -72,7 +72,8 @@ import {
   useAgentScreenStateMachine,
   type AgentScreenReadySyncState,
 } from "@/hooks/use-agent-screen-state-machine";
-import { useArchiveAgent } from "@/hooks/use-archive-agent";
+import { useQueryClient } from "@tanstack/react-query";
+import { isAgentArchiving, useArchiveAgent } from "@/hooks/use-archive-agent";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useContainerWidthBelow } from "@/hooks/use-container-width";
 import { reconcileMissingAgentStateWithPresentAgent } from "@/panels/agent-panel-load-state";
@@ -1123,6 +1124,22 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   const composerEditingSession = useComposerEditingSession("chat");
   const isComposerFullscreen = useComposerFullscreen(composerEditingSession);
   const hasActiveComposer = !agentState.archivedAt && !isArchivingCurrentAgent;
+  const hasAgentComposer = showsComposer && hasActiveComposer && !draft;
+  const queryClient = useQueryClient();
+  const canSubmitSelection = useStableEvent(
+    (selectedAgentId: string, selectedWorkspaceId: string) => {
+      if (!hasAgentComposer || selectedAgentId !== agentId || selectedWorkspaceId !== workspaceId) {
+        return false;
+      }
+      const agent = resolveChatAgentFromSession(useSessionStore.getState(), serverId, agentId);
+      return Boolean(
+        agent &&
+        agent.workspaceId === workspaceId &&
+        !agent.archivedAt &&
+        !isAgentArchiving({ queryClient, serverId, agentId }),
+      );
+    },
+  );
   const focusRestoredComposer = useStableEvent(() => {
     if (isPaneFocused && showsComposer && hasActiveComposer) {
       composerEditingSession.focus();
@@ -1138,7 +1155,6 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     },
     [focusRestoredComposer, streamViewRef],
   );
-  const hasAgentComposer = showsComposer && hasActiveComposer && !draft;
   const parentAgentId = useParentAgentId(serverId, agentId);
   const isSubagent = useSessionStore((state) => {
     const agent = resolveChatAgentFromSession(state, serverId, agentId);
@@ -1268,6 +1284,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
           hasActiveComposer={hasActiveComposer}
           toast={toastApi}
           quoteTarget={quoteTarget}
+          canSubmitSelection={canSubmitSelection}
           onOpenWorkspaceFile={onOpenWorkspaceFile}
         />
       </RenderProfile>
@@ -1470,6 +1487,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
   hasActiveComposer,
   toast,
   quoteTarget,
+  canSubmitSelection,
   onOpenWorkspaceFile,
 }: {
   isSubagent: boolean;
@@ -1485,6 +1503,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
   hasActiveComposer: boolean;
   toast: ReturnType<typeof useToastHost>["api"];
   quoteTarget: ComposerQuoteTarget | null;
+  canSubmitSelection?: (agentId: string, workspaceId: string) => boolean;
   onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
 }) {
   const isCompactFormFactor = useIsCompactFormFactor();
@@ -1582,6 +1601,7 @@ const AgentStreamSection = memo(function AgentStreamSection({
         pendingMessageSubmissions={pendingMessageSubmissions}
         turnPresentation={turnPresentation}
         showAgentInteractions={isSubagent ? true : undefined}
+        canSubmitSelection={quoteTarget ? canSubmitSelection : undefined}
         onOpenWorkspaceFile={onOpenWorkspaceFile}
       />
     </ComposerQuoteProvider>

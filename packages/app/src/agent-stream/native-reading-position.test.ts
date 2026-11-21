@@ -126,6 +126,16 @@ describe("native reading position", () => {
     expect(onChange.mock.calls).toEqual([["first"], [null], ["second"], ["second"]]);
   });
 
+  it("reports a stationary row again after history is replaced", () => {
+    const tracker = createNativeReadingPositionTracker();
+    const onChange = vi.fn();
+    tracker.report("second", onChange, "history-a");
+    tracker.report("second", onChange, "history-a");
+    tracker.report("second", onChange, "history-b");
+    tracker.report("second", onChange, "history-b");
+    expect(onChange.mock.calls).toEqual([["second"], ["second"]]);
+  });
+
   it("clears a previous reading position when a reset panel returns with no rows", () => {
     const tracker = createNativeReadingPositionTracker();
     const onChange = vi.fn();

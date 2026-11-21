@@ -13,6 +13,7 @@ export interface AssistantSelectionCopySurfaceProps {
   serverId?: string;
   workspaceId?: string | null;
   agentId?: string;
+  canSubmitSelection?: (agentId: string, workspaceId: string) => boolean;
   subagentSpawnMode?: SelectionSubagentSpawnMode;
   onSpawnSubagentFromSelection?: (
     selectedMarkdown: string,

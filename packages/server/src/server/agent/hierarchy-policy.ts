@@ -3,6 +3,7 @@ import {
   getParentAddressFromLabels,
   getParentAgentIdFromLabels,
   isMainControlAgentLabels,
+  isExplicitParentReportingLabels,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
@@ -398,17 +399,23 @@ export function isMainControlWritePermissionBlocked(
 
 export function buildHierarchyAppendSystemPrompt({
   agent,
+  serverId = "self",
   readAgent,
   listActiveAgents,
 }: {
   agent: HierarchyAgent;
   readAgent: ReadAgent;
   listActiveAgents: ListActiveAgents;
+  serverId?: string;
 }): string {
-  const parentId = getParentAgentIdFromLabels(agent.labels);
-  const parent = parentId ? readAgent(parentId) : null;
-  let contract: string[];
-  let childRole: string;
+  const parentAddress = getParentAddressFromLabels(agent.labels, serverId);
+  const parent = parentAddress?.serverId === serverId ? readAgent(parentAddress.agentId) : null;
+  const canReport =
+    parentAddress &&
+    (parentAddress.serverId !== serverId ||
+      (parent && !parent.archivedAt && parent.id !== agent.id));
+  let contract: string[] = [];
+  let childRole: string | undefined;
   if (isMainControlAgentLabels(agent.labels)) {
     contract = [
       "Role: Workspace Main Control Coordinator. Work strictly read-only. Do not modify files or run builds that alter the workspace.",
@@ -422,19 +429,29 @@ export function buildHierarchyAppendSystemPrompt({
     parent &&
     !parent.archivedAt &&
     isMainControlAgentLabels(parent.labels) &&
-    computeAgentDepth(agent.id, readAgent) === 1
+    computeAgentDepth(agent.id, readAgent, serverId) === 1
   ) {
     contract = [
       `Role: Level-1 Module Lead (Flexible Mode) under Main Control Agent ${parent.id}.`,
       "Refine the task's requirements, edge cases, and file boundaries. Complete and verify small changes yourself. Delegate substantive implementation and independent verification to Level-2 Sub-Agents with create_agent.",
-      "Call report_to_parent once all verification is complete, with a concise outcome and changed files. If you need a decision from your parent to proceed, use report_to_parent with status blocked and the question.",
     ];
     childRole = "Level-2";
-  } else {
-    return "";
   }
+  if (
+    !isMainControlAgentLabels(agent.labels) &&
+    canReport &&
+    isExplicitParentReportingLabels(agent.labels)
+  ) {
+    contract.push(
+      "Call report_to_parent once all verification is complete, with a concise outcome and changed files. If you need a decision from your parent to proceed, use report_to_parent with status blocked and the question.",
+    );
+  }
+  if (!childRole) return contract.join("\n");
   const children = [...listActiveAgents()]
-    .filter((child) => !child.archivedAt && getParentAgentIdFromLabels(child.labels) === agent.id)
+    .filter((child) => {
+      const address = getParentAddressFromLabels(child.labels, serverId);
+      return !child.archivedAt && address?.serverId === serverId && address.agentId === agent.id;
+    })
     .sort((left, right) => left.id.localeCompare(right.id, "en"))
     .map(({ id, title, lifecycle }) => ({
       id,

@@ -2003,7 +2003,12 @@ interface CodexCollabAgentUpdate {
 
 type CodexCollabAgentControl =
   | { kind: "submission"; childThreadIds: string[] }
-  | { kind: "outcome"; childThreadIds: string[]; updates: CodexCollabAgentUpdate[] };
+  | {
+      kind: "outcome";
+      childThreadIds: string[];
+      updates: CodexCollabAgentUpdate[];
+      failedClose: boolean;
+    };
 
 interface HistoricalCodexSubAgent {
   timelineIndex: number;
@@ -2031,11 +2036,16 @@ function readCodexCollabAgentControl(item: unknown): CodexCollabAgentControl | n
       : null;
   }
   if (tool !== "wait" && tool !== "closeAgent") return null;
+  const failedClose = tool === "closeAgent" && (record.status === "failed" || record.error != null);
   const outcomeStates = toObjectRecord(record.agentsStates);
+  const childThreadIds = new Set(receivers);
   const updates = Object.entries(outcomeStates ?? {}).flatMap(
     ([threadId, value]): CodexCollabAgentUpdate[] => {
       const state = toObjectRecord(value);
       if (typeof state?.status !== "string") return [];
+      childThreadIds.add(threadId);
+      // A failed close can report a child's error without shutting it down.
+      if (failedClose && !/^(error|errored)$/i.test(state.status.trim())) return [];
       // Unlike a spawn snapshot, a control result can report the child's final error.
       const status = normalizeCollabAgentChildStatus(state.status, tool);
       return [
@@ -2049,8 +2059,9 @@ function readCodexCollabAgentControl(item: unknown): CodexCollabAgentControl | n
   );
   return {
     kind: "outcome",
-    childThreadIds: [...new Set([...receivers, ...updates.map((update) => update.threadId)])],
+    childThreadIds: [...childThreadIds],
     updates,
+    failedClose,
   };
 }
 
@@ -2175,6 +2186,7 @@ function readHistoricalCollabAgentResult(item: unknown) {
 
 interface HistoricalCollabOutcome {
   tool: "wait" | "closeAgent" | "resumeAgent" | "sendInput";
+  closed?: boolean;
   update?: CodexCollabAgentUpdate;
   childStatus: unknown;
   timestampMs: number;
@@ -2192,45 +2204,67 @@ function historicalOutcomeTime(row: CodexHistoryRow): number {
   return timestamp ? Date.parse(timestamp) : Number.NaN;
 }
 
-function readHistoricalCollabEvents(
-  row: CodexHistoryRow,
-): [string, HistoricalCollabOutcome][] | null {
+function readHistoricalCollabEvents(row: CodexHistoryRow) {
   const timestampMs = historicalOutcomeTime(row);
   const control = readCodexCollabAgentControl(row.item);
   if (control?.kind === "submission") {
-    return control.childThreadIds.map((threadId) => [
-      threadId,
-      { tool: "sendInput", childStatus: undefined, timestampMs },
-    ]);
+    return {
+      foldReceivers: [],
+      events: control.childThreadIds.map((threadId): [string, HistoricalCollabOutcome] => [
+        threadId,
+        { tool: "sendInput", childStatus: undefined, timestampMs },
+      ]),
+    };
   }
   const result = readHistoricalCollabAgentResult(row.item);
   if (!result) return null;
   const { tool, status, receiverThreadIds, agentStates } = result;
-  if (status !== "completed" && (tool !== "wait" || status !== "failed")) return [];
+  if (tool === "resumeAgent" && status === "failed" && Array.isArray(receiverThreadIds)) {
+    const confirmsClosed = receiverThreadIds.every(
+      (threadId): threadId is string =>
+        typeof threadId === "string" &&
+        toObjectRecord(agentStates?.[threadId])?.status === "notFound",
+    );
+    // Not finding an already canceled child repeats its last known state.
+    return {
+      events: [],
+      foldReceivers: confirmsClosed ? receiverThreadIds : [],
+      foldCanceledOnly: true,
+    };
+  }
+  const failedClose = control?.kind === "outcome" && control.failedClose;
+  if (status !== "completed" && !(status === "failed" && (tool === "wait" || failedClose))) {
+    return null;
+  }
   const updates = new Map(
     control?.kind === "outcome" ? control.updates.map((update) => [update.threadId, update]) : [],
   );
   const receivers = control?.kind === "outcome" ? control.childThreadIds : receiverThreadIds;
-  if (!Array.isArray(receivers)) return [];
-  return receivers.flatMap((threadId): [string, HistoricalCollabOutcome][] =>
-    typeof threadId === "string"
-      ? [
-          [
-            threadId,
-            {
-              tool,
-              childStatus: toObjectRecord(agentStates?.[threadId])?.status,
-              update: updates.get(threadId),
-              timestampMs,
-            },
-          ],
-        ]
-      : [],
+  if (!Array.isArray(receivers)) return null;
+  const foldReceivers = receivers.filter(
+    (threadId): threadId is string => typeof threadId === "string",
   );
+  const events = foldReceivers.flatMap((threadId): [string, HistoricalCollabOutcome][] => {
+    const update = updates.get(threadId);
+    if (failedClose && !update) return [];
+    return [
+      [
+        threadId,
+        {
+          tool,
+          closed: tool === "closeAgent" && !failedClose,
+          childStatus: toObjectRecord(agentStates?.[threadId])?.status,
+          update,
+          timestampMs,
+        },
+      ],
+    ];
+  });
+  return { events, foldReceivers };
 }
 
 function applyHistoricalCollabAgentResult(
-  { tool, childStatus, update }: HistoricalCollabOutcome,
+  { tool, childStatus, update, closed }: HistoricalCollabOutcome,
   threadId: string,
   timeline: PersistedTimelineEntry[],
   child: HistoricalCodexSubAgent,
@@ -2254,7 +2288,7 @@ function applyHistoricalCollabAgentResult(
   }
   child.pendingFollowUp = false;
   // Closing a completed child also shuts down its unfinished descendants.
-  if (tool === "closeAgent") closedSubAgentThreadIds.add(threadId);
+  if (closed) closedSubAgentThreadIds.add(threadId);
   else if (tool === "resumeAgent" && nextStatus) closedSubAgentThreadIds.delete(threadId);
   if (nextStatus) {
     const item: ToolCallTimelineItem =
@@ -2518,6 +2552,21 @@ async function projectCodexThreadHistory(
       localEvents.set(threadId, [event]);
     }
   }
+  function recordCollabEvents(row: CodexHistoryRow): boolean {
+    const collabEvents = readHistoricalCollabEvents(row);
+    if (!collabEvents) return false;
+    for (const [threadId, event] of collabEvents.events) recordEvent(threadId, event);
+    return (
+      collabEvents.foldReceivers.length > 0 &&
+      collabEvents.foldReceivers.every((threadId) => {
+        const child = subAgentsByThreadId.get(threadId);
+        if (!child) return false;
+        if (!collabEvents.foldCanceledOnly) return true;
+        const item = timeline[child.timelineIndex]?.item;
+        return item?.type === "tool_call" && item.status === "canceled";
+      })
+    );
+  }
   function settleEvents() {
     for (const [threadId, events] of localEvents) {
       if (subAgentsByThreadId.has(threadId)) continue;
@@ -2540,18 +2589,7 @@ async function projectCodexThreadHistory(
   try {
     for await (const row of params.rows) {
       const { item } = row;
-      const collabEvents = readHistoricalCollabEvents(row);
-      if (collabEvents) {
-        for (const [threadId, event] of collabEvents) recordEvent(threadId, event);
-        if (
-          collabEvents.length > 0 &&
-          collabEvents.every(
-            ([threadId, event]) => event.tool !== "sendInput" && subAgentsByThreadId.has(threadId),
-          )
-        )
-          continue;
-        continue;
-      }
+      if (recordCollabEvents(row)) continue;
       const historicalSubAgentActivity = readCodexSubAgentActivity(item);
       if (historicalSubAgentActivity) {
         const existingIndex = subAgentsByThreadId.get(

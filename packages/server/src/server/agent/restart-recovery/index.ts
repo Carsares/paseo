@@ -10,23 +10,42 @@ type RecoveryCandidate = Pick<
 interface Dependencies {
   storage: AgentStorage;
   oneShotMarkerPath?: string;
+  automaticMarkerPath?: string;
   settings(): { enabled: boolean; prompt: string };
   eligible(record: RecoveryCandidate): Promise<boolean>;
-  dispatch(agentId: string, prompt: string): Promise<unknown>;
+  /** Resolves once the provider has accepted the continuation. */
+  dispatch(agentId: string, prompt: string): Promise<void>;
   report(agentId: string, error: unknown): void;
 }
 export function createRestartRecovery(deps: Dependencies) {
-  // Candidates are chosen at startup; each settles once its resume was sent or abandoned.
-  const resuming = new Map<string, { promise: Promise<void>; resolve(): void; forced: boolean }>();
-  let oneShotAgentIds = new Set<string>();
+  const resuming = new Map<
+    string,
+    { promise: Promise<void>; resolve(): void; forced: boolean; dispatched: boolean }
+  >();
+  const oneShot = { path: deps.oneShotMarkerPath, agentIds: new Set<string>() };
+  // Opening a session or failing to start its turn can persist an idle/error
+  // snapshot before confirmation. Keep automatic intent outside that snapshot.
+  const automatic = { path: deps.automaticMarkerPath, agentIds: new Set<string>() };
   let markerWrites = Promise.resolve();
   const eligible = async (record: RecoveryCandidate) =>
     !record.archivedAt && !record.internal && !record.owner && (await deps.eligible(record));
-  async function readOneShotMarker(): Promise<{
+
+  function needsAutomaticRecovery(
+    record: StoredAgentRecord,
+    pendingIds: ReadonlySet<string> | undefined,
+  ): boolean {
+    return (
+      deps.settings().enabled &&
+      (record.resumeOnStartup === true ||
+        record.lastStatus === "running" ||
+        pendingIds?.has(record.id) === true)
+    );
+  }
+
+  async function readMarker(markerPath: string | undefined): Promise<{
     allAgents: boolean;
     agentIds: ReadonlySet<string>;
   } | null> {
-    const markerPath = deps.oneShotMarkerPath;
     if (!markerPath) return null;
     let raw: string;
     try {
@@ -68,8 +87,7 @@ export function createRestartRecovery(deps: Dependencies) {
     return { allAgents: false, agentIds: new Set(agentIds) };
   }
 
-  async function writeRemainingMarker(agentIds: Set<string>) {
-    const markerPath = deps.oneShotMarkerPath;
+  async function writeRemainingMarker(markerPath: string | undefined, agentIds: Set<string>) {
     if (!markerPath) return;
     if (agentIds.size === 0) {
       await rm(markerPath, { force: true });
@@ -78,14 +96,14 @@ export function createRestartRecovery(deps: Dependencies) {
     }
   }
 
-  function consumeOneShotAgent(agentId: string): Promise<void> {
-    if (!oneShotAgentIds.has(agentId)) return Promise.resolve();
+  function consumeMarkerAgent(marker: typeof oneShot, agentId: string): Promise<void> {
+    if (!marker.agentIds.has(agentId)) return Promise.resolve();
     // Dispatches run independently, but each marker write must see every prior removal.
     async function consume() {
-      const remaining = new Set(oneShotAgentIds);
+      const remaining = new Set(marker.agentIds);
       if (!remaining.delete(agentId)) return;
-      await writeRemainingMarker(remaining);
-      oneShotAgentIds = remaining;
+      await writeRemainingMarker(marker.path, remaining);
+      marker.agentIds = remaining;
     }
     const write = markerWrites.then(consume);
     markerWrites = write.catch(() => {});
@@ -94,13 +112,14 @@ export function createRestartRecovery(deps: Dependencies) {
 
   async function resume(agentId: string, forced: boolean) {
     const record = await deps.storage.get(agentId);
-    if (record && (forced || record.resumeOnStartup)) {
+    const marker = forced ? oneShot : automatic;
+    if (record && (forced || record.resumeOnStartup || automatic.agentIds.has(agentId))) {
       if ((forced || deps.settings().enabled) && (await eligible(record))) {
         await deps.dispatch(agentId, deps.settings().prompt);
       }
-      // A completed dispatch no longer needs the one-shot marker even if clearing
-      // the agent's persisted flag fails. With recovery disabled the marker is authoritative.
-      await consumeOneShotAgent(agentId);
+      // With recovery disabled the one-shot marker remains authoritative even
+      // if clearing the agent's persisted flag fails.
+      await consumeMarkerAgent(marker, agentId);
       // Dispatch can load and update the agent. Clear the flag on its latest record.
       await deps.storage.flush();
       const latest = await deps.storage.get(agentId);
@@ -108,7 +127,7 @@ export function createRestartRecovery(deps: Dependencies) {
         await deps.storage.upsert({ ...latest, resumeOnStartup: false });
       }
     } else {
-      await consumeOneShotAgent(agentId);
+      await consumeMarkerAgent(marker, agentId);
     }
   }
   return {
@@ -121,7 +140,10 @@ export function createRestartRecovery(deps: Dependencies) {
     },
     /** Choose candidates before anything else reads or repairs persisted running status. */
     async prepareStartup() {
-      const oneShotMarker = await readOneShotMarker();
+      const [oneShotMarker, automaticMarker] = await Promise.all([
+        readMarker(oneShot.path),
+        readMarker(automatic.path),
+      ]);
       // Startup recovery repairs persisted running status once before agents are restored.
       const records = await deps.storage.listAll();
       for (const record of records) {
@@ -131,9 +153,7 @@ export function createRestartRecovery(deps: Dependencies) {
           oneShotMarker?.agentIds.has(record.id) === true ||
           (oneShotMarker?.allAgents === true && record.resumeOnStartup === true);
         const pending =
-          (forced ||
-            (deps.settings().enabled &&
-              (record.resumeOnStartup === true || record.lastStatus === "running"))) &&
+          (forced || needsAutomaticRecovery(record, automaticMarker?.agentIds)) &&
           (await eligible(record));
         await deps.storage.upsert({
           ...record,
@@ -144,22 +164,26 @@ export function createRestartRecovery(deps: Dependencies) {
               : record.lastStatus,
         });
         if (pending) {
-          if (forced) oneShotAgentIds.add(record.id);
+          if (forced) oneShot.agentIds.add(record.id);
+          else if (automatic.path) automatic.agentIds.add(record.id);
           let resolve!: () => void;
           const promise = new Promise<void>((settle) => {
             resolve = settle;
           });
-          resuming.set(record.id, { promise, resolve, forced });
+          resuming.set(record.id, { promise, resolve, forced, dispatched: false });
         }
       }
       // Convert legacy global markers and drop missing or ineligible agents.
       if (
         oneShotMarker &&
         (oneShotMarker.allAgents ||
-          oneShotAgentIds.size === 0 ||
-          oneShotAgentIds.size !== oneShotMarker.agentIds.size)
+          oneShot.agentIds.size === 0 ||
+          oneShot.agentIds.size !== oneShotMarker.agentIds.size)
       ) {
-        await writeRemainingMarker(oneShotAgentIds);
+        await writeRemainingMarker(oneShot.path, oneShot.agentIds);
+      }
+      if (automaticMarker || automatic.agentIds.size) {
+        await writeRemainingMarker(automatic.path, automatic.agentIds);
       }
     },
     async captureRunningAgents(options?: {
@@ -196,7 +220,7 @@ export function createRestartRecovery(deps: Dependencies) {
           deps.oneShotMarkerPath,
           JSON.stringify({
             version: 2,
-            agentIds: [...new Set([...oneShotAgentIds, ...capturedAgentIds])],
+            agentIds: [...new Set([...oneShot.agentIds, ...capturedAgentIds])],
           }),
         );
       }
@@ -204,6 +228,8 @@ export function createRestartRecovery(deps: Dependencies) {
     /** Resume every candidate in the background; a slow provider holds back only its agent. */
     resumePending() {
       for (const [agentId, settled] of resuming) {
+        if (settled.dispatched) continue;
+        settled.dispatched = true;
         void resume(agentId, settled.forced)
           .catch((error) => deps.report(agentId, error))
           .finally(() => {
@@ -212,7 +238,7 @@ export function createRestartRecovery(deps: Dependencies) {
           });
       }
     },
-    /** Wait until this agent's resume was sent or abandoned. Others return at once. */
+    /** Wait until this agent's resume was confirmed or abandoned. Others return at once. */
     async waitForResume(agentId: string, signal: AbortSignal) {
       const settled = resuming.get(agentId);
       if (!settled) return;

@@ -21,6 +21,7 @@ import {
   getMainPriorModeIdFromLabels,
   getParentAddressFromLabels,
   getParentAgentIdFromLabels,
+  isExplicitParentReportingLabels,
   hasOpenAgentTab,
   isDelegatedAgent,
   isMainControlAgentLabels,
@@ -4264,7 +4265,8 @@ export class AgentManager {
         const previousParentAgentId = getParentAgentIdFromLabels(agent.labels);
         const wasRunning = this.agents.get(agentId)?.lifecycle === "running";
         const registration =
-          wasRunning || this.hasInFlightRun(agentId)
+          !isExplicitParentReportingLabels(agent.labels) &&
+          (wasRunning || this.hasInFlightRun(agentId))
             ? await prepareFinishSubscription?.()
             : undefined;
         const { record, live } = await this.commitAgentParent(
@@ -5163,7 +5165,7 @@ export class AgentManager {
     agentId: string,
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
-    onAccepted?: () => void,
+    onAccepted?: () => void | Promise<void>,
   ): Promise<boolean> {
     this.assertAcceptingAgentRuns();
     if (this.collectingRuntimes.has(agentId) || !this.agents.has(agentId)) {
@@ -5188,7 +5190,9 @@ export class AgentManager {
     if (!handler) {
       return false;
     }
-    onAccepted?.();
+    const accepted = onAccepted?.();
+    if (accepted) await accepted;
+    this.assertAcceptingAgentRuns();
     this.touchUpdatedAt(agent);
     if (options?.clientMessageId) {
       this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "accepted");
@@ -5276,6 +5280,7 @@ export class AgentManager {
     const hierarchy = await this.readHierarchyAgents();
     const instructions = buildHierarchyAppendSystemPrompt({
       agent,
+      serverId: this.serverId,
       readAgent: (id) => hierarchy.get(id),
       listActiveAgents: () => hierarchy.values(),
     });
@@ -5323,8 +5328,7 @@ export class AgentManager {
         handoff || addedMainControl
           ? await this.prepareProviderTurnPrompt(agent, prompt, handoff, addedMainControl)
           : prompt;
-      this.assertPendingTurnStart(agentId, pendingRun);
-      const result = await agent.session.startTurn(providerPrompt, options);
+      const result = await this.startAdmittedProviderTurn(params, providerPrompt);
       if (addedMainControl) this.promptedMainControlRoleVersions.set(agentId, roleVersion);
       if (handoff) await this.consumeContextHandoff(agentId, handoff);
       this.assertPendingTurnStart(agentId, pendingRun);
@@ -5383,6 +5387,24 @@ export class AgentManager {
       }
       throw error;
     }
+  }
+
+  private startAdmittedProviderTurn(
+    params: Parameters<AgentManager["startPendingForegroundTurn"]>[0],
+    providerPrompt: AgentPromptInput,
+  ) {
+    const { agent, agentId, pendingRun, options, promptStart } = params;
+    const start = () => {
+      this.assertPendingTurnStart(agentId, pendingRun);
+      return agent.session.startTurn(providerPrompt, options);
+    };
+    if (!promptStart?.beforeHandoff) return start();
+    this.assertPendingTurnStart(agentId, pendingRun);
+    this.assertAcceptingAgentRuns();
+    return promptStart.beforeHandoff().then(() => {
+      this.assertAcceptingAgentRuns();
+      return start();
+    });
   }
 
   private async refreshHierarchySessionUnlocked(
@@ -5845,6 +5867,8 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentSteerOptions,
     promptStart?: ForegroundPromptStart,
+    admitSteer?: () => Promise<boolean>,
+    onSteerDeclined?: () => Promise<void>,
   ): Promise<ActiveTurnSteerDispatchResult> {
     this.assertAcceptingAgentRuns();
     // A turn that is still starting has no id to steer yet. Replacing it would drop its
@@ -5858,26 +5882,39 @@ export class AgentManager {
     }
 
     const result = agent.session.steerActiveTurn
-      ? await this.runSteerAdmission(agent, expectedTurnId, async () => {
-          const admission = await agent.session.steerActiveTurn!(prompt, {
-            ...options,
-            expectedTurnId,
-          });
-          if (admission.status === "accepted") {
-            await this.recordAcceptedSteer(
-              agent,
-              prompt,
-              options?.clientMessageId,
+      ? await this.runSteerAdmission<SteerResult>(
+          agent,
+          expectedTurnId,
+          async () => {
+            if (admitSteer) {
+              if (!(await admitSteer())) return { status: "unavailable" };
+            } else if (promptStart?.beforeHandoff) {
+              await promptStart.beforeHandoff();
+            }
+            this.assertAcceptingAgentRuns();
+            const admission = await agent.session.steerActiveTurn!(prompt, {
+              ...options,
               expectedTurnId,
-              admission.providerMessageId,
-            );
-          }
-          return admission;
-        })
+            });
+            if (admission.status === "unavailable") await onSteerDeclined?.();
+            if (admission.status === "accepted") {
+              await this.recordAcceptedSteer(
+                agent,
+                prompt,
+                options?.clientMessageId,
+                expectedTurnId,
+                admission.providerMessageId,
+              );
+            }
+            return admission;
+          },
+          admitSteer ? () => ({ status: "unavailable" }) : undefined,
+        )
       : { status: "unavailable" as const };
     if (result.status === "accepted") {
       return { status: "steered" };
     }
+    if (admitSteer) return { status: "inactive" };
 
     // Providers without autonomous steering keep their existing dispatch behavior. The shared
     // admission may recognize the turn, but only an accepted steer can own it without replacement.
@@ -5909,11 +5946,13 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     expectedTurnId: string,
     operation: () => Promise<T>,
+    onTurnChanged?: () => T,
   ): Promise<T> {
     return this.runForegroundMutation(agent.id, async () => {
       await this.drainSessionEvents(agent.id);
       this.assertAcceptingAgentRuns();
       this.agentStreamCoalescer.flushFor(agent.id);
+      if (onTurnChanged && agent.activeTurnId !== expectedTurnId) return onTurnChanged();
       this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
       const barrier: SteerEventBarrier = { events: [] };
       this.steerEventBarriers.set(agent.id, barrier);
@@ -9001,6 +9040,7 @@ export class AgentManager {
     const depth = computeAgentDepth(agentId, readAgent);
     const hierarchyPrompt = buildHierarchyAppendSystemPrompt({
       agent,
+      serverId: this.serverId,
       readAgent,
       listActiveAgents: () => hierarchy.values(),
     });

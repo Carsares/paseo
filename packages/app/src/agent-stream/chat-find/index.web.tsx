@@ -20,6 +20,10 @@ import { hasActiveOverlay } from "@/keyboard";
 import { isImeComposingKeyboardEvent } from "@/utils/keyboard-ime";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { planTimelinePromptJump } from "@/timeline/timeline-sync-plan";
+import {
+  FindUserMessageExpansionContext,
+  type FindUserMessageExpansion,
+} from "@/components/user-message/quote-expansion-context";
 import { ChatFindModel, type ChatFindFailure } from "./model";
 import { createFindViewport } from "./viewport.web";
 import type { ChatFindProps, ChatFindExpansionProps } from "./types";
@@ -70,6 +74,9 @@ export function ChatFind({
   const bindings = useRef({ viewportRef, revealLoadedMessage, visibleMessageIds });
   bindings.current = { viewportRef, revealLoadedMessage, visibleMessageIds };
   const showInteractions = useRef(showAgentInteractions);
+  const [userMessageExpansion, setUserMessageExpansion] = useState<FindUserMessageExpansion | null>(
+    null,
+  );
   const [highlightName] = useState(() => `paseo-chat-find-${++nextHighlightId}`);
   const { isInteractive } = usePaneFocus();
   const active = useRetainedPanelActive();
@@ -97,6 +104,7 @@ export function ChatFind({
           getBindings: () => bindings.current,
           getRoot: () => root.current,
           highlightName,
+          setUserMessageExpansion,
         }),
       }),
     [agentId, serverId, highlightName],
@@ -142,7 +150,11 @@ export function ChatFind({
   return (
     <div ref={root} tabIndex={-1} style={ROOT_STYLE}>
       <style>{`::highlight(${highlightName}) { background-color: ${styles.highlight.backgroundColor}; color: ${styles.highlight.color}; }`}</style>
-      <SelectedMessage.Provider value={state.selectedItemId}>{children}</SelectedMessage.Provider>
+      <SelectedMessage.Provider value={state.selectedItemId}>
+        <FindUserMessageExpansionContext.Provider value={userMessageExpansion}>
+          {children}
+        </FindUserMessageExpansionContext.Provider>
+      </SelectedMessage.Provider>
       {state.open && (
         <View style={styles.overlay} dataSet={WIDGET_DATASET}>
           <PaneFind

@@ -2,7 +2,7 @@ import { setTimeout as pause } from "node:timers/promises";
 import { HostObservationError, type ToolHosts } from "../host-operations/index.js";
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
-import type { AgentFinishReport } from "@getpaseo/protocol/messages";
+import type { AgentExplicitFinishReport, AgentFinishReport } from "@getpaseo/protocol/messages";
 import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
 import type { FinishObservationResult } from "./internal/observation-buffer.js";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
@@ -61,6 +61,8 @@ export interface FinishRegistration {
   /** Rejected dispatch preserves preceding registrations. */
   reject(): Promise<void>;
 }
+export class ParentReportRecipientUnavailableError extends Error {}
+
 export interface FinishSubscriptions {
   start(): Promise<void>;
   /** Pending notification intent, including registration, recovery and unacknowledged delivery. */
@@ -70,6 +72,18 @@ export interface FinishSubscriptions {
     pendingDispatch?: boolean,
   ): Promise<FinishRegistration>;
   trackRemoteChild(input: Omit<FinishSubscription, "id">): Promise<void>;
+  queueParentReport(
+    address: Pick<FinishSubscription, "childAgentId" | "callerAgentId" | "callerServerId">,
+    content: {
+      status: NonNullable<AgentFinishReport["parentReportStatus"]>;
+      title: string;
+      summary: string;
+    },
+  ): Promise<string>;
+  confirmParentReport(
+    address: Pick<FinishSubscription, "childAgentId" | "callerAgentId" | "callerServerId">,
+    reportId: string,
+  ): Promise<boolean>;
   pullReports(
     address: {
       childAgentId: string;
@@ -80,6 +94,7 @@ export interface FinishSubscriptions {
     acknowledged: string[],
     observe: boolean,
     childState: "active" | "archived" | "unrelated",
+    includeParentReports?: boolean,
   ): Promise<{ ownsBinding: boolean; reports: AgentFinishReport[] }>;
   close(): Promise<void>;
 }
@@ -108,11 +123,20 @@ function isAgentMessageDispatchConfirmationUnsupported(error: unknown): boolean 
   );
 }
 
+function isFinishReportPushUnsupported(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    error.code === "AGENT_FINISH_REPORT_PUSH_UNSUPPORTED"
+  );
+}
+
 /** Owns durable intent, live observation, supersession, and dispatch acknowledgment. */
 export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptions {
   const tasks = new Set<Promise<void>>();
   const watches = new Map<string, Set<Watch>>();
   const followupWatches = new Map<string, AbortController>();
+  const remoteReportTasks = new Map<string, AbortController>();
   const lastReportByBinding = new Map<string, string>();
   let reportMutations = Promise.resolve();
   function serializeReports<T>(action: () => Promise<T>): Promise<T> {
@@ -227,9 +251,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
   async function deliverRemote(
     record: FinishSubscription & { callerServerId: string },
     childServerId: string,
-    prompt: string,
-    messageId: string,
-    event: AgentFinishReport["event"],
+    report: AgentFinishReport,
     signal: AbortSignal,
   ): Promise<boolean> {
     if (!deps.hosts) throw new Error("Remote finish delivery is unavailable");
@@ -238,12 +260,12 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       async (client) => {
         const caller = (await client.fetchAgent(record.callerAgentId))?.agent;
         if (!caller || caller.archivedAt) return false;
-        const receipt = await client.sendMessage(record.callerAgentId, prompt, {
-          messageId,
+        const receipt = await client.sendMessage(record.callerAgentId, report.prompt, {
+          messageId: report.id,
           sourceAgentId: record.childAgentId,
           sourceAgentServerId: childServerId,
           ...(client.getLastServerInfoMessage()?.features?.agentNotificationEvents === true
-            ? { sourceAgentEvent: event }
+            ? { sourceAgentEvent: report.event }
             : {}),
           activeTurnBehavior: "steer",
           waitForDispatch: true,
@@ -254,6 +276,32 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       },
       signal,
     );
+  }
+
+  async function tryReverseNotification(
+    record: FinishSubscription & { callerServerId: string },
+    childServerId: string,
+    report: AgentFinishReport,
+    bound: boolean,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (!bound) return deliverRemote(record, childServerId, report, signal);
+    // A pull binding survives disconnects. Use a live reverse connection even if
+    // the parent has polled in the past. Both paths share the notification receipt.
+    try {
+      const directory = await deps.hosts?.().directory();
+      if (
+        !directory?.hosts.some(
+          (host) => host.serverId === record.callerServerId && host.status === "online",
+        )
+      )
+        return false;
+      return await deliverRemote(record, childServerId, report, signal);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      // The parent can still pull the saved report if reverse dispatch is unconfirmed.
+      return false;
+    }
   }
 
   function permissionRequests(result: FinishObservationResult, notified: Set<string>) {
@@ -286,9 +334,11 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         permissionRequest: request,
       });
       const id = notificationId(record.id, request?.id);
+      const report = { id, prompt, title, event: finishNotificationEvents[reason] };
       const followups = record.followupReport ? deps.followups : undefined;
+      let bound = false;
       if (followups) {
-        const bound = await serializeReports(async () => {
+        bound = await serializeReports(async () => {
           const binding = (await followups.watches.list()).find(
             (entry) => entry.id === key(record),
           );
@@ -299,28 +349,23 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
               ...record,
               id,
               pullSourceId: binding?.pullSourceId,
-              report: { id, prompt, title, event: finishNotificationEvents[reason] },
+              report,
             });
             savedFollowups.add(id);
           }
           return Boolean(binding);
         });
-        if (bound) {
-          if (request) permissions.add(request.id);
-          continue;
-        }
       }
       if (record.callerServerId) {
-        const active = await deliverRemote(
+        const dispatched = await tryReverseNotification(
           { ...record, callerServerId: record.callerServerId },
           childServerId,
-          prompt,
-          id,
-          finishNotificationEvents[reason],
+          report,
+          bound,
           signal,
         );
-        if (followups && active) await serializeReports(() => followups.reports.remove(id));
-        if (!active) return true;
+        if (followups && dispatched) await serializeReports(() => followups.reports.remove(id));
+        if (!bound && !dispatched) return true;
         if (request) permissions.add(request.id);
         continue;
       }
@@ -448,6 +493,97 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     }
   }
 
+  const localReportTasks = new Map<string, AbortController>();
+  function startLocalReport(record: FinishSubscription, report: AgentFinishReport): void {
+    if (!deps.followups || localReportTasks.has(record.id)) return;
+    const { dispatch, reports } = deps.followups;
+    const controller = new AbortController();
+    const { signal } = controller;
+    localReportTasks.set(record.id, controller);
+    const task = (async () => {
+      let warned = false;
+      while (!signal.aborted) {
+        try {
+          try {
+            await abortable(dispatch(record, report), signal);
+          } catch (error) {
+            if (!(error instanceof ParentReportRecipientUnavailableError)) throw error;
+          }
+          await serializeReports(() => reports.remove(record.id));
+          return;
+        } catch (error) {
+          if (signal.aborted) return;
+          if (!warned) {
+            warned = true;
+            deps.logger.warn({ err: error, reportId: record.id }, "Retrying parent report");
+          }
+          await delay(signal, 3);
+        }
+      }
+    })();
+    tasks.add(task);
+    void task.then(() => {
+      localReportTasks.delete(record.id);
+      tasks.delete(task);
+      return undefined;
+    });
+  }
+
+  function startRemoteReport(
+    record: FinishSubscription & { callerServerId: string },
+    report: AgentFinishReport,
+  ): void {
+    if (!deps.followups || !deps.hosts || remoteReportTasks.has(record.id)) return;
+    if (report.parentReportStatus === undefined) return;
+    const { reports } = deps.followups;
+    const controller = new AbortController();
+    const { signal } = controller;
+    remoteReportTasks.set(record.id, controller);
+    const task = (async () => {
+      let warned = false;
+      while (!signal.aborted) {
+        try {
+          const hosts = deps.hosts?.();
+          if (!hosts) return;
+          const response = await abortable(
+            hosts.use(
+              record.callerServerId,
+              (client) =>
+                client.pushAgentFinishReport(
+                  record.childAgentId,
+                  record.callerAgentId,
+                  report as AgentExplicitFinishReport,
+                ),
+              signal,
+              record.childAgentId,
+            ),
+            signal,
+          );
+          await serializeReports(() => reports.remove(record.id));
+          if (!response.accepted) return;
+          return;
+        } catch (error) {
+          if (signal.aborted) return;
+          if (isFinishReportPushUnsupported(error)) return;
+          if (!warned) {
+            warned = true;
+            deps.logger.warn(
+              { err: error, reportId: record.id, callerServerId: record.callerServerId },
+              "Retrying explicit parent report push",
+            );
+          }
+          await delay(signal, 0);
+        }
+      }
+    })();
+    tasks.add(task);
+    void task.then(() => {
+      remoteReportTasks.delete(record.id);
+      tasks.delete(task);
+      return undefined;
+    });
+  }
+
   function startFollowupWatch(record: FinishSubscription): void {
     if (!deps.followups || !deps.hosts || !record.serverId || followupWatches.has(record.id))
       return;
@@ -468,6 +604,10 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
             outcomesUnknown.delete(report.id);
             acknowledged.push(report.id);
           } catch (error) {
+            if (error instanceof ParentReportRecipientUnavailableError) {
+              acknowledged.push(report.id);
+              continue;
+            }
             if (!(error instanceof AgentRequestOutcomeUnknownError)) throw error;
             if (!outcomesUnknown.has(report.id)) {
               outcomesUnknown.add(report.id);
@@ -554,6 +694,12 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         for (const records of groups.values()) attach(records, false);
         for (const record of (await deps.followups?.watches.list()) ?? [])
           startFollowupWatch(record);
+        for (const record of (await deps.followups?.reports.list()) ?? []) {
+          if (!record.callerServerId && record.report?.parentReportStatus)
+            startLocalReport(record, record.report);
+          if (record.callerServerId && record.report?.parentReportStatus)
+            startRemoteReport({ ...record, callerServerId: record.callerServerId }, record.report);
+        }
         recovering = false;
       }),
     register: (input, pendingDispatch = false) => {
@@ -605,7 +751,38 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         await deps.followups.watches.put(record);
         startFollowupWatch(record);
       }),
-    pullReports: (address, acknowledged, observe, childState) =>
+    queueParentReport: (address, { status, title, summary }) =>
+      serialize(async () => {
+        if (closed || !deps.followups) throw new Error("Parent report delivery is unavailable");
+        const id = randomUUID();
+        const report: AgentFinishReport = {
+          id,
+          title,
+          prompt: `Report to parent (${status}):\n\n${summary}`,
+          event: "finished",
+          parentReportStatus: status,
+        };
+        const record = { ...address, id, report };
+        await serializeReports(() => deps.followups!.reports.put(record));
+        if (!record.callerServerId) startLocalReport(record, report);
+        else startRemoteReport({ ...record, callerServerId: record.callerServerId }, report);
+        return id;
+      }),
+    confirmParentReport: (address, reportId) =>
+      serializeReports(async () => {
+        const reports = deps.followups?.reports;
+        if (!reports) return false;
+        const expected = key(address);
+        const record = (await reports.list()).find(
+          (entry) =>
+            entry.id === reportId &&
+            key(entry) === expected &&
+            entry.report?.id === reportId &&
+            entry.report.parentReportStatus !== undefined,
+        );
+        return record !== undefined;
+      }),
+    pullReports: (address, acknowledged, observe, childState, includeParentReports = false) =>
       serializeReports(async () => {
         const followups = deps.followups;
         if (!followups) return { ownsBinding: false, reports: [] };
@@ -632,12 +809,15 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
             return { ownsBinding: false, reports: [] };
           await followups.watches.put({ ...pair, id: bindingId, pullSourceId: sourceId });
         }
+        const eligible = matching.filter(
+          (record) => includeParentReports || !record.report?.parentReportStatus,
+        );
         const consumed = new Set(acknowledged);
-        for (const record of matching) if (consumed.has(record.id)) await reports.remove(record.id);
-        const remaining = matching.filter((record) => !consumed.has(record.id));
+        for (const record of eligible) if (consumed.has(record.id)) await reports.remove(record.id);
+        const remaining = eligible.filter((record) => !consumed.has(record.id));
         const lastReportId = lastReportByBinding.get(bindingId);
-        const cursor = matching.findIndex((record) => record.id === lastReportId);
-        const page = [...matching.slice(cursor + 1), ...matching.slice(0, cursor + 1)]
+        const cursor = eligible.findIndex((record) => record.id === lastReportId);
+        const page = [...eligible.slice(cursor + 1), ...eligible.slice(0, cursor + 1)]
           .filter((record) => !consumed.has(record.id))
           .slice(0, 8)
           .map((record) => record.report!);
@@ -646,7 +826,10 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         if (page.length && remaining.length > page.length)
           lastReportByBinding.set(bindingId, page.at(-1)!.id);
         else lastReportByBinding.delete(bindingId);
-        if (childState === "archived" && remaining.length === 0)
+        if (
+          childState === "archived" &&
+          matching.every((record) => eligible.includes(record) && consumed.has(record.id))
+        )
           await followups.watches.remove(bindingId);
         return { ownsBinding: childState === "active" || remaining.length > 0, reports: page };
       }),
@@ -660,6 +843,8 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         }
       await mutations;
       for (const controller of followupWatches.values()) controller.abort();
+      for (const controller of localReportTasks.values()) controller.abort();
+      for (const controller of remoteReportTasks.values()) controller.abort();
       await Promise.all(tasks);
       await reportMutations;
       await deps.store.list();

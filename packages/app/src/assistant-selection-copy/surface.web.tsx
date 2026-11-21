@@ -14,12 +14,18 @@ export function AssistantSelectionCopySurface({
   serverId,
   workspaceId,
   agentId,
+  canSubmitSelection,
   subagentSpawnMode,
   onSpawnSubagentFromSelection,
 }: AssistantSelectionCopySurfaceProps) {
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const composerQuote = useComposerQuote();
-  const selectionButtons = usePluginSelectionButtons(serverId, workspaceId ?? undefined, agentId);
+  const selectionButtons = usePluginSelectionButtons(
+    serverId,
+    workspaceId ?? undefined,
+    agentId,
+    !!agentId && !!workspaceId && canSubmitSelection?.(agentId, workspaceId) === true,
+  );
   const handleCopy = useCallback((event: ClipboardEvent<HTMLDivElement>) => {
     const content = createAssistantSelectionClipboardContent(window.getSelection());
     if (!content) {
@@ -41,6 +47,7 @@ export function AssistantSelectionCopySurface({
           workspaceId={workspaceId ?? undefined}
           agentId={agentId}
           selectionButtons={selectionButtons}
+          canSubmitSelection={canSubmitSelection}
           onQuote={composerQuote?.addQuote}
           subagentSpawnMode={subagentSpawnMode}
           onSpawnSubagentFromSelection={onSpawnSubagentFromSelection}

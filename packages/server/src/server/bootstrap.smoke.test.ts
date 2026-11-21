@@ -7,7 +7,7 @@ import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeAgentClient } from "./agent/providers/claude/agent.js";
 import http from "node:http";
 import path from "node:path";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import pino from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { WebSocket } from "ws";
@@ -21,7 +21,12 @@ import {
   createPersistedProjectRecord,
   createPersistedWorkspaceRecord,
 } from "./workspace-registry.js";
-import { AgentStorage, type StoredAgentRecord } from "./agent/agent-storage.js";
+import {
+  AgentStorage,
+  parseStoredAgentRecord,
+  type StoredAgentRecord,
+} from "./agent/agent-storage.js";
+import { parseAgentMessages } from "./agent/agent-messages/index.js";
 import { ensureAgentLoaded } from "./agent/agent-loading.js";
 import { AgentManagerShuttingDownError } from "./agent/agent-manager.js";
 import { hashDaemonPassword } from "./auth.js";
@@ -37,6 +42,8 @@ import {
 } from "../utils/run-git-command.js";
 import { DEFAULT_GIT_PROCESS_POLICY } from "../utils/git-process-scheduler.js";
 import { VoiceAssistantWebSocketServer } from "./websocket-server.js";
+import { MessageReceipts } from "./message-receipts/index.js";
+import { EXPLICIT_PARENT_REPORTING, PARENT_REPORTING_LABEL } from "@getpaseo/protocol/agent-labels";
 import type {
   HubEnrollment,
   HubEnrollmentResult,
@@ -725,6 +732,686 @@ describe("paseo daemon bootstrap", () => {
       await handle.close();
     }
   });
+
+  test("ordinary shutdown waits for a non-steerable user turn and dispatches its queued message", async () => {
+    const running = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const dispatchEntered = Promise.withResolvers<void>();
+    const releaseDispatch = Promise.withResolvers<void>();
+    const received: string[] = [];
+    const interrupted = vi.fn();
+    const clients = createTestAgentClients({
+      onInterrupt: interrupted,
+      async beforeTurnComplete(prompt) {
+        if (prompt !== "Existing work") return;
+        running.resolve();
+        await finish.promise;
+      },
+    });
+    const codex = clients.codex!;
+    const create = codex.createSession.bind(codex);
+    vi.spyOn(codex, "createSession").mockImplementation(async (...args) => {
+      const session = await create(...args);
+      const start = session.startTurn!.bind(session);
+      session.startTurn = async (prompt, ...rest) => {
+        for (const message of parseAgentMessages(String(prompt)) ?? []) received.push(message.text);
+        if (received.length) {
+          dispatchEntered.resolve();
+          await releaseDispatch.promise;
+        }
+        return start(prompt, ...rest);
+      };
+      return session;
+    });
+    const handle = await createTestPaseoDaemon({ agentClients: clients });
+    const client = new DaemonClient({ url: `ws://127.0.0.1:${handle.port}/ws` });
+    let stopped: Promise<void> | undefined;
+    try {
+      await client.connect();
+      const agent = await handle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: handle.paseoHome },
+        undefined,
+        { workspaceId: undefined },
+      );
+      const original = handle.daemon.agentManager.runAgent(agent.id, "Existing work");
+      void original.catch(() => undefined);
+      await running.promise;
+      const texts = ["First queued message", "Second queued message"];
+      for (const text of texts) {
+        await expect(
+          client.sendAgentMessage(agent.id, text, {
+            sourceAgentId: agent.id,
+            messageId: text,
+          }),
+        ).resolves.toEqual({ deliveryStatus: "queued" });
+      }
+
+      const receipts = path.join(handle.paseoHome, "agent-requests");
+      const files = await readdir(receipts);
+      expect(files).toHaveLength(texts.length);
+      const readReceipts = () =>
+        Promise.all(
+          files.map(async (file) => JSON.parse(await readFile(path.join(receipts, file), "utf8"))),
+        );
+      stopped = handle.daemon.stop();
+      void stopped.catch(() => undefined);
+      // Leave the original turn running while shutdown begins to drain.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(interrupted).not.toHaveBeenCalled();
+      expect(received).toEqual([]);
+      finish.resolve();
+      await expect(original).resolves.toMatchObject({ canceled: false });
+      await dispatchEntered.promise;
+      expect(await readReceipts()).toMatchObject(texts.map(() => ({ state: "pending" })));
+      releaseDispatch.resolve();
+      await stopped;
+      expect(received).toEqual(texts);
+      expect(await readReceipts()).toMatchObject(texts.map(() => ({ state: "completed" })));
+    } finally {
+      finish.resolve();
+      releaseDispatch.resolve();
+      await stopped?.catch(() => undefined);
+      await client.close();
+      await handle.close();
+    }
+  });
+
+  test("ordinary shutdown can deliver to a healthy steerable turn beyond the drain budget", async () => {
+    const running = Promise.withResolvers<void>();
+    const providerAccepted = Promise.withResolvers<void>();
+    const steered = vi.fn(async () => {
+      providerAccepted.resolve();
+      return { status: "accepted" as const };
+    });
+    const handle = await createTestPaseoDaemon({
+      agentClients: createTestAgentClients({
+        steerActiveTurn: steered,
+        async beforeTurnComplete() {
+          const finish = new Promise((resolve) => setTimeout(resolve, 5_100));
+          running.resolve();
+          await finish;
+        },
+      }),
+    });
+    const client = new DaemonClient({ url: `ws://127.0.0.1:${handle.port}/ws` });
+    let stopped: Promise<void> | undefined;
+    try {
+      await client.connect();
+      const agent = await handle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: handle.paseoHome },
+        undefined,
+        { workspaceId: undefined },
+      );
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const run = handle.daemon.agentManager.runAgent(agent.id, "Healthy long-running work");
+      void run.catch(() => undefined);
+      await running.promise;
+      await expect(
+        client.sendAgentMessage(agent.id, "Queued work for a live provider", {
+          sourceAgentId: agent.id,
+          messageId: "queued-at-timeout",
+        }),
+      ).resolves.toEqual({ deliveryStatus: "queued" });
+      stopped = handle.daemon.stop();
+      void stopped.catch(() => undefined);
+      await providerAccepted.promise;
+      await stopped;
+      await vi.advanceTimersByTimeAsync(5_100);
+      const receipts = path.join(handle.paseoHome, "agent-requests");
+      const [file] = await readdir(receipts);
+      const disk = JSON.parse(await readFile(path.join(receipts, file!), "utf8"));
+      expect({
+        steers: steered.mock.calls.length,
+        receipt: disk.state,
+      }).toEqual({ steers: 1, receipt: "completed" });
+    } finally {
+      vi.useRealTimers();
+      await stopped?.catch(() => undefined);
+      await client.close();
+      await handle.close();
+    }
+  });
+
+  test("ordinary shutdown restores non-steerable queued messages in order before new ingress", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-queue-recovery-"));
+    const running = Promise.withResolvers<void>();
+    const received: string[] = [];
+    const handles: Awaited<ReturnType<typeof createTestPaseoDaemon>>[] = [];
+    const clients: DaemonClient[] = [];
+    const open = async (agentClients: ReturnType<typeof createTestAgentClients>) => {
+      const handle = await createTestPaseoDaemon({
+        paseoHomeRoot: root,
+        cleanup: false,
+        resumeOnStartup: false,
+        agentClients,
+      });
+      handles.push(handle);
+      const client = new DaemonClient({ url: `ws://127.0.0.1:${handle.port}/ws` });
+      clients.push(client);
+      await client.connect();
+      return { ...handle, client };
+    };
+    try {
+      const first = await open(
+        createTestAgentClients({
+          async beforeTurnComplete() {
+            const finish = new Promise((resolve) => setTimeout(resolve, 5_100));
+            running.resolve();
+            await finish;
+          },
+        }),
+      );
+      const agent = await first.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: root },
+        undefined,
+        { workspaceId: undefined },
+      );
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const original = first.daemon.agentManager.runAgent(agent.id, "Healthy existing work");
+      void original.catch(() => undefined);
+      await running.promise;
+      for (const text of ["first", "second"]) {
+        await expect(
+          first.client.sendAgentMessage(agent.id, text, {
+            sourceAgentId: agent.id,
+            messageId: text,
+          }),
+        ).resolves.toEqual({ deliveryStatus: "queued" });
+      }
+      const stopped = first.daemon.stop();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await stopped;
+      await vi.advanceTimersByTimeAsync(100);
+      vi.useRealTimers();
+      const directory = path.join(first.paseoHome, "agent-requests");
+      const files = (await readdir(directory)).filter((name) => name.endsWith(".json"));
+      const readReceipts = () =>
+        Promise.all(
+          files.map(async (file) => JSON.parse(await readFile(path.join(directory, file), "utf8"))),
+        );
+      expect(files).toHaveLength(2);
+      for (const record of await readReceipts()) {
+        expect(record).toMatchObject({
+          state: "pending",
+          queued: { message: { source: { agentId: agent.id } } },
+        });
+      }
+
+      const second = await open(
+        createTestAgentClients({
+          onStartTurn(prompt) {
+            for (const message of parseAgentMessages(String(prompt)) ?? [])
+              received.push(message.text);
+          },
+        }),
+      );
+      await expect(
+        second.client.sendAgentMessage(agent.id, "third", {
+          sourceAgentId: agent.id,
+          messageId: "third",
+        }),
+      ).resolves.toEqual({ deliveryStatus: "queued" });
+      await second.daemon.stop();
+      expect(received).toEqual(["first", "second", "third"]);
+      for (const record of await readReceipts()) {
+        expect(record.state).toBe("completed");
+        expect(record.queued).toBeUndefined();
+      }
+    } finally {
+      vi.useRealTimers();
+      for (const client of clients) await client.close();
+      for (const handle of handles.toReversed()) {
+        await handle.close();
+        await rm(handle.staticDir, { recursive: true, force: true });
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("startup rechecks the saved direct parent and recipient archive state before replay", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-queue-recovery-policy-"));
+    const handles: Awaited<ReturnType<typeof createTestPaseoDaemon>>[] = [];
+    const open = async (agentClients: ReturnType<typeof createTestAgentClients>) => {
+      const handle = await createTestPaseoDaemon({
+        paseoHomeRoot: root,
+        cleanup: false,
+        resumeOnStartup: false,
+        agentClients,
+      });
+      handles.push(handle);
+      return handle;
+    };
+    try {
+      const first = await open(createTestAgentClients());
+      const parent = { agentId: randomUUID(), serverId: "original-parent-host" };
+      const receipts = new MessageReceipts(path.join(first.paseoHome, "agent-requests"));
+      const targets = [];
+      for (const text of ["valid parent", "changed parent", "archived recipient"]) {
+        const target = await first.daemon.agentManager.createAgent(
+          { provider: "codex", cwd: root },
+          undefined,
+          {
+            workspaceId: undefined,
+            labels: {
+              "paseo.parent-agent-id": parent.agentId,
+              "paseo.parent-server-id": parent.serverId,
+            },
+          },
+        );
+        targets.push(target.id);
+        const admitted = Promise.withResolvers<void>();
+        void receipts
+          .sendQueued({
+            agentId: target.id,
+            request: { text },
+            message: {
+              messageId: randomUUID(),
+              prompt: text,
+              source: parent,
+              directParent: parent,
+              activeTurnBehavior: "steer",
+              unarchive: false,
+            },
+            enqueue: async () => ({ dispatched: new Promise(() => {}) }),
+            onQueued: admitted.resolve,
+          })
+          .catch(admitted.reject);
+        await admitted.promise;
+      }
+      await first.daemon.stop();
+
+      const storage = new AgentStorage(
+        path.join(first.paseoHome, "agents"),
+        pino({ level: "silent" }),
+      );
+      const changed = (await storage.get(targets[1]!))!;
+      await storage.upsert({
+        ...changed,
+        labels: { ...changed.labels, "paseo.parent-server-id": "new-parent-host" },
+      });
+      const archived = (await storage.get(targets[2]!))!;
+      await storage.upsert({ ...archived, archivedAt: new Date().toISOString() });
+
+      const received: unknown[] = [];
+      const restarted = await open(
+        createTestAgentClients({
+          onStartTurn(prompt) {
+            for (const message of parseAgentMessages(String(prompt)) ?? []) {
+              received.push({ text: message.text, source: message.source });
+            }
+          },
+        }),
+      );
+      await restarted.daemon.stop();
+      expect(received).toEqual([
+        { text: "valid parent", source: { kind: "agent-message", ...parent } },
+      ]);
+      expect(await receipts.queuedMessages()).toEqual([]);
+      expect((await restarted.daemon.agentStorage.get(archived.id))?.archivedAt).toBeTruthy();
+    } finally {
+      for (const handle of handles.toReversed()) {
+        await handle.close();
+        await rm(handle.staticDir, { recursive: true, force: true });
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ordinary shutdown restores same-host MCP prompts once, in order, and rechecks parent authority", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-mcp-queue-recovery-"));
+    const running = Promise.withResolvers<void>();
+    let busyTurns = 0;
+    const received: unknown[] = [];
+    const notifications: unknown[] = [];
+    const lastTask = "Second task. Respond with exactly: recovered-finish-result";
+    const handles: Awaited<ReturnType<typeof createTestPaseoDaemon>>[] = [];
+    const open = async (agentClients: ReturnType<typeof createTestAgentClients>) => {
+      const handle = await createTestPaseoDaemon({
+        paseoHomeRoot: root,
+        cleanup: false,
+        resumeOnStartup: false,
+        agentClients,
+      });
+      handles.push(handle);
+      return handle;
+    };
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { StreamableHTTPClientTransport } =
+      await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+    const mcp = new Client({ name: "mcp-queue-test", version: "1" });
+    try {
+      const first = await open(
+        createTestAgentClients({
+          async beforeTurnComplete() {
+            const finish = new Promise((resolve) => setTimeout(resolve, 5_100));
+            if (++busyTurns === 2) running.resolve();
+            await finish;
+          },
+        }),
+      );
+      const manager = first.daemon.agentManager;
+      const parent = await manager.createAgent({ provider: "codex", cwd: root }, undefined, {
+        workspaceId: undefined,
+      });
+      const createChild = (labels?: Record<string, string>) =>
+        manager.createAgent({ provider: "codex", cwd: root }, undefined, {
+          workspaceId: undefined,
+          labels: { ...labels, "paseo.parent-agent-id": parent.id },
+        });
+      const child = await createChild();
+      const moved = await createChild({ [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING });
+      await mcp.connect(
+        new StreamableHTTPClientTransport(
+          new URL(`http://127.0.0.1:${first.port}/mcp/agents?callerAgentId=${parent.id}`),
+        ),
+      );
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      for (const target of [child, moved]) {
+        void manager.runAgent(target.id, "Healthy current work").catch(() => undefined);
+      }
+      await running.promise;
+      const directory = path.join(first.paseoHome, "agent-requests");
+      const expectedById = new Map<string, string>();
+      for (const [target, text] of [
+        [child, "first task"],
+        [moved, "expired task"],
+        [child, lastTask],
+      ] as const) {
+        const accepted = await mcp.callTool({
+          name: "send_agent_prompt",
+          arguments: {
+            agentId: target.id,
+            prompt: text,
+            ...(text === "first task" ? { notifyOnFinish: false } : {}),
+          },
+        });
+        expect(accepted.structuredContent).toMatchObject({
+          success: true,
+          deliveryStatus: "queued",
+          messageId: expect.any(String),
+        });
+        expectedById.set(String(accepted.structuredContent?.messageId), text);
+      }
+      const queued = await new MessageReceipts(directory).queuedMessages();
+      expect(queued.map(({ queued: { message } }) => expectedById.get(message.messageId))).toEqual([
+        "first task",
+        "expired task",
+        lastTask,
+      ]);
+      expect(queued.map(({ queued: { message } }) => message.directParent)).toEqual(
+        Array.from({ length: 3 }, () => ({
+          agentId: parent.id,
+          serverId: first.daemon.getServerId(),
+        })),
+      );
+      expect(queued.map(({ queued: { message } }) => message.notifyLocalCaller)).toEqual([
+        false,
+        false,
+        true,
+      ]);
+      await mcp.close();
+      const stopped = first.daemon.stop();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await stopped;
+      await vi.advanceTimersByTimeAsync(100);
+      vi.useRealTimers();
+      const storage = new AgentStorage(
+        path.join(first.paseoHome, "agents"),
+        pino({ level: "silent" }),
+      );
+      const changed = (await storage.get(moved.id))!;
+      await storage.upsert({
+        ...changed,
+        labels: { ...changed.labels, "paseo.parent-agent-id": randomUUID() },
+      });
+      const capture = () =>
+        createTestAgentClients({
+          onStartTurn(prompt) {
+            for (const message of parseAgentMessages(String(prompt)) ?? []) {
+              if (message.source?.kind === "agent-notification") notifications.push(message);
+              else received.push({ text: message.text, source: message.source });
+            }
+          },
+        });
+      const second = await open(capture());
+      await vi.waitFor(() => expect(notifications).not.toHaveLength(0), { timeout: 7_000 });
+      await second.daemon.stop();
+      const records = await Promise.all(
+        (await readdir(directory)).map(async (file) =>
+          JSON.parse(await readFile(path.join(directory, file), "utf8")),
+        ),
+      );
+      expect(records).toMatchObject([{ state: "completed" }, { state: "completed" }]);
+      const third = await open(capture());
+      await third.daemon.stop();
+      expect(notifications).toMatchObject([
+        {
+          source: { kind: "agent-notification", agentId: child.id, event: "finished" },
+          text: expect.stringContaining("recovered-finish-result"),
+        },
+      ]);
+      expect(received).toEqual(
+        ["first task", lastTask].map((text) => ({
+          text,
+          source: {
+            kind: "agent-message",
+            agentId: parent.id,
+            serverId: first.daemon.getServerId(),
+          },
+        })),
+      );
+    } finally {
+      vi.useRealTimers();
+      await mcp.close();
+      for (const handle of handles.toReversed()) {
+        await handle.close();
+        await rm(handle.staticDir, { recursive: true, force: true });
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("explicit shutdown reopens delivery if an admitted dispatch does not finish in time", async () => {
+    const accepting = VoiceAssistantWebSocketServer.prototype.beginAcceptingConnections;
+    const socketServer = Promise.withResolvers<VoiceAssistantWebSocketServer>();
+    vi.spyOn(
+      VoiceAssistantWebSocketServer.prototype,
+      "beginAcceptingConnections",
+    ).mockImplementationOnce(function (this: VoiceAssistantWebSocketServer) {
+      accepting.call(this);
+      socketServer.resolve(this);
+    });
+    const providerStarts: string[] = [];
+    const handle = await createTestPaseoDaemon({
+      agentClients: createTestAgentClients({
+        onStartTurn(prompt) {
+          for (const message of parseAgentMessages(String(prompt)) ?? []) {
+            providerStarts.push(message.text);
+          }
+        },
+      }),
+    });
+    const dispatchEntered = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const client = new DaemonClient({ url: `ws://127.0.0.1:${handle.port}/ws` });
+    try {
+      await client.connect();
+      const agent = await handle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: handle.paseoHome },
+        undefined,
+        { workspaceId: undefined },
+      );
+      const { agentMessages } = await socketServer.promise;
+      const message = {
+        recipientId: agent.id,
+        prompt: "Queued work",
+        source: { kind: "agent-message" as const, agentId: agent.id },
+      };
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const original = agentMessages.enqueue({
+        ...message,
+        async beforeProviderDispatch() {
+          dispatchEntered.resolve();
+          await finish.promise;
+        },
+      });
+      const preparing = expect(handle.daemon.stop({ resumeAgents: true })).rejects.toThrow(
+        "dispatch queued agent messages",
+      );
+      await dispatchEntered.promise;
+      expect(() => agentMessages.enqueue(message)).toThrow("preparing for shutdown");
+      await vi.advanceTimersByTimeAsync(5_000);
+      await preparing;
+      vi.useRealTimers();
+      await expect(
+        client.sendAgentMessage(agent.id, "Work after failed stop", {
+          sourceAgentId: agent.id,
+          messageId: "after-failed-stop",
+        }),
+      ).resolves.toEqual({ deliveryStatus: "queued" });
+      const receipts = path.join(handle.paseoHome, "agent-requests");
+      const [file] = await readdir(receipts);
+      const receiptPath = path.join(receipts, file!);
+      expect(JSON.parse(await readFile(receiptPath, "utf8"))).toMatchObject({ state: "pending" });
+      finish.resolve();
+      await expect(original.dispatched).resolves.toBe("turn_started");
+      await handle.daemon.stop();
+      expect(providerStarts).toEqual(["Queued work", "Work after failed stop"]);
+      expect(JSON.parse(await readFile(receiptPath, "utf8"))).toMatchObject({ state: "completed" });
+    } finally {
+      finish.resolve();
+      vi.useRealTimers();
+      await client.close();
+      await handle.close();
+    }
+  });
+
+  test.each(["rejected", "late-start", "late-rejection"] as const)(
+    "startup recovery confirms provider outcome %s before consuming its record",
+    async (outcome) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paseo-confirm-recovery-"));
+      const paseoHome = path.join(root, ".paseo");
+      const marker = path.join(paseoHome, "restart-recovery-once.json");
+      const agentId = randomUUID();
+      const seed = new AgentStorage(path.join(paseoHome, "agents"), pino({ level: "silent" }));
+      const timestamp = new Date().toISOString();
+      const providerEntered = Promise.withResolvers<void>();
+      const providerOutcome = Promise.withResolvers<void>();
+      let recoveryErrorReported = false;
+      const unconfirmed = Promise.withResolvers<void>();
+      const logger = pino({ level: "silent" });
+      const bootstrapLogger = logger.child({ module: "bootstrap" });
+      vi.spyOn(logger, "child").mockReturnValueOnce(bootstrapLogger);
+      vi.spyOn(bootstrapLogger, "error").mockImplementation((_error, message) => {
+        if (message === "Agent restart recovery failed") recoveryErrorReported = true;
+      });
+      vi.spyOn(bootstrapLogger, "warn").mockImplementation((_error, message) => {
+        if (message === "Agent restart recovery start is unconfirmed") unconfirmed.resolve();
+      });
+      const clients = createTestAgentClients();
+      const codex = clients.codex!;
+      const resume = codex.resumeSession.bind(codex);
+      const startTurn = vi.fn();
+      vi.spyOn(codex, "resumeSession").mockImplementation(async (...args) => {
+        const session = await resume(...args);
+        const start = session.startTurn?.bind(session);
+        if (!start) throw new Error("Test session must support starting a turn");
+        session.startTurn = async (...turnArgs) => {
+          startTurn(...turnArgs);
+          providerEntered.resolve();
+          await providerOutcome.promise;
+          return start(...turnArgs);
+        };
+        return session;
+      });
+      const handles: Awaited<ReturnType<typeof createTestPaseoDaemon>>[] = [];
+      async function launch(agentClients = clients, daemonLogger = logger) {
+        const handle = await createTestPaseoDaemon({
+          paseoHomeRoot: root,
+          cleanup: false,
+          resumeOnStartup: false,
+          agentClients,
+          logger: daemonLogger,
+        });
+        handles.push(handle);
+        return handle;
+      }
+      try {
+        await seed.upsert(
+          parseStoredAgentRecord({
+            id: agentId,
+            provider: "codex",
+            cwd: root,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            lastStatus: "closed",
+            resumeOnStartup: true,
+            persistence: { provider: "codex", sessionId: "previous-session" },
+          }),
+        );
+        await seed.flush();
+        await writeFile(marker, JSON.stringify({ version: 2, agentIds: [agentId] }));
+        if (outcome !== "rejected") vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        const first = await launch();
+        await providerEntered.promise;
+        expect(JSON.parse(await readFile(marker, "utf8"))).toEqual({
+          version: 2,
+          agentIds: [agentId],
+        });
+        const accepted = vi.fn();
+        const nextClients = createTestAgentClients({ onStartTurn: accepted });
+        if (outcome !== "rejected") {
+          await vi.advanceTimersByTimeAsync(60_000);
+          await unconfirmed.promise;
+          expect(JSON.parse(await readFile(marker, "utf8"))).toEqual({
+            version: 2,
+            agentIds: [agentId],
+          });
+          await expect(first.daemon.stop({ resumeAgents: true })).rejects.toThrow(
+            "startup recovery is still in progress",
+          );
+          vi.useRealTimers();
+        }
+        if (outcome === "late-start") {
+          providerOutcome.resolve();
+          await vi.waitFor(() =>
+            expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" }),
+          );
+          await first.daemon.stop();
+        } else {
+          providerOutcome.reject(new Error("Test provider rejected this turn"));
+          await vi.waitFor(() => expect(recoveryErrorReported).toBe(true));
+          await first.daemon.stop();
+          expect(JSON.parse(await readFile(marker, "utf8"))).toEqual({
+            version: 2,
+            agentIds: [agentId],
+          });
+          const second = await launch(nextClients, pino({ level: "silent" }));
+          await vi.waitFor(async () => {
+            await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+            expect(await second.daemon.agentStorage.get(agentId)).toMatchObject({
+              resumeOnStartup: false,
+            });
+          });
+          await second.daemon.stop();
+        }
+        const final = await launch(nextClients, pino({ level: "silent" }));
+        await final.daemon.stop({ resumeAgents: true });
+        expect(startTurn).toHaveBeenCalledOnce();
+        expect(accepted.mock.calls.map(([prompt]) => prompt)).toEqual(
+          outcome === "late-start" ? [] : ["Resume working."],
+        );
+      } finally {
+        vi.useRealTimers();
+        providerOutcome.resolve();
+        for (const handle of handles.toReversed()) {
+          await handle.close();
+          await rm(handle.staticDir, { recursive: true, force: true });
+        }
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("standalone listener exposes services only", async () => {
     const standalonePort = await findFreePort();

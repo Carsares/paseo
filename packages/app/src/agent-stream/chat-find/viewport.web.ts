@@ -1,3 +1,4 @@
+import type { FindUserMessageExpansion } from "@/components/user-message/quote-expansion-context";
 import type { ChatFindOperations } from "./model";
 import type { ChatFindProps } from "./types";
 import { findMessageMatches, findMessageRows, findRenderedMatches } from "./ranges.web";
@@ -6,26 +7,61 @@ interface ViewportInput {
   getBindings(): Pick<ChatFindProps, "viewportRef" | "revealLoadedMessage" | "visibleMessageIds">;
   getRoot(): HTMLElement | null;
   highlightName: string;
+  setUserMessageExpansion?(value: FindUserMessageExpansion | null): void;
 }
 
 function rowOf(range: Range): HTMLElement | null {
   return range.startContainer.parentElement?.closest<HTMLElement>("[data-history-row-id]") ?? null;
 }
 
+function isClipped(range: Range, container: HTMLElement, hasLineClamp = false): boolean {
+  const rects = Array.from(range.getClientRects());
+  const { bottom } = container.getBoundingClientRect();
+  // A line clamp can paint an ellipsis over the last preview line while the
+  // range still reports a rectangle inside the quote.
+  const ellipsisLineHeight =
+    hasLineClamp && container.scrollHeight > container.clientHeight
+      ? Number.parseFloat(getComputedStyle(container).lineHeight) || 0
+      : 0;
+  return rects.length === 0 || rects.some((rect) => rect.bottom > bottom - ellipsisLineHeight + 1);
+}
+
+function findUserMessageExpansion(range: Range): FindUserMessageExpansion | null {
+  const rowId = rowOf(range)?.dataset.historyRowId;
+  if (!rowId) return null;
+  const element = range.startContainer.parentElement;
+  const endElement = range.endContainer.parentElement;
+  const quote = element?.closest<HTMLElement>("[data-find-quote-clipped]");
+  const preview = element?.closest<HTMLElement>("[data-find-message-clipped]");
+  const endQuote = endElement?.closest<HTMLElement>("[data-find-quote-clipped]");
+  const clippedQuote = [quote, endQuote].find(
+    (candidate) => candidate && isClipped(range, candidate, true),
+  );
+  if (clippedQuote) {
+    return { rowId, quoteIndex: Number(clippedQuote.dataset.findQuoteClipped) };
+  }
+  return preview && isClipped(range, preview) ? { rowId, quoteIndex: null } : null;
+}
+
 export function createFindViewport({
   getBindings,
   getRoot,
   highlightName,
+  setUserMessageExpansion,
 }: ViewportInput): Pick<ChatFindOperations, "reveal" | "clear"> {
   return {
     clear() {
       CSS.highlights.delete(highlightName);
+      setUserMessageExpansion?.(null);
     },
     // The source message owns navigation; the rendered occurrence owns its position.
     reveal(messageId, query, occurrence, signal) {
       return new Promise((resolve, reject) => {
         let frame = 0;
         let started = false;
+        let requestedExpansion = false;
+        // A different occurrence may live in a different quote in the same message.
+        setUserMessageExpansion?.(null);
         const deadline = performance.now() + 5000;
         const cleanup = () => {
           cancelAnimationFrame(frame);
@@ -68,6 +104,15 @@ export function createFindViewport({
           const index =
             occurrence < 0 ? ranges.length - 1 : Math.min(occurrence, ranges.length - 1);
           const range = ranges[index];
+          const expansion = range && setUserMessageExpansion && findUserMessageExpansion(range);
+          if (expansion) {
+            if (!requestedExpansion) {
+              requestedExpansion = true;
+              setUserMessageExpansion(expansion);
+            }
+            frame = requestAnimationFrame(poll);
+            return;
+          }
           cleanup();
           if (!range) {
             resolve({ occurrence: 0, count: 0 });

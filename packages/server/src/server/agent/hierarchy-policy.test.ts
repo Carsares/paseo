@@ -24,6 +24,8 @@ import { AgentStorage } from "./agent-storage.js";
 import { createAgentCommand, registerParentFinishSubscription } from "./create-agent/create.js";
 import {
   createFinishSubscriptions,
+  createJsonFinishSubscriptionStore,
+  ParentReportRecipientUnavailableError,
   type FinishSubscription,
 } from "./finish-subscriptions/index.js";
 import { createPaseoToolCatalog } from "./tools/paseo-tools.js";
@@ -264,7 +266,11 @@ describe("agent orchestration", () => {
   });
 
   it("supplies role instructions and a sorted snapshot of direct active children only", () => {
-    const graph = hierarchy(worker, root, sibling, lead, main, {
+    const explicitLead = {
+      ...lead,
+      labels: { ...lead.labels, [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING },
+    };
+    const graph = hierarchy(worker, root, sibling, explicitLead, main, {
       ...child("archived", main),
       archivedAt: "2026-01-01",
     });
@@ -275,7 +281,7 @@ describe("agent orchestration", () => {
     expect(prompt).toContain(
       'Direct Level-1 children: [{"id":"lead","title":"lead","status":"running"},{"id":"other-lead","title":"other-lead","status":"running"}]',
     );
-    const leadPrompt = buildHierarchyAppendSystemPrompt({ agent: lead, ...graph });
+    const leadPrompt = buildHierarchyAppendSystemPrompt({ agent: explicitLead, ...graph });
     expect(leadPrompt).toContain(
       "Level-1 Module Lead (Flexible Mode) under Main Control Agent main",
     );
@@ -283,6 +289,41 @@ describe("agent orchestration", () => {
     expect(leadPrompt).toContain("Call report_to_parent once all verification is complete");
     expect(buildHierarchyAppendSystemPrompt({ agent: worker, ...graph })).toBe("");
     expect(buildHierarchyAppendSystemPrompt({ agent: root, ...graph })).toBe("");
+  });
+});
+
+it("launches explicit reporting instructions for a level-two or remote child", async () => {
+  await withAgents(async ({ manager, cwd, launchedConfigs }) => {
+    const config = { provider: "codex", cwd };
+    const workspaceId = "workspace";
+    const parent = await manager.createAgent(config, undefined, { workspaceId });
+    await manager.setAgentMainControl(parent.id, true);
+    const leadAgent = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+    });
+    expect(launchedConfigs.get("codex")?.at(-1)?.daemonAppendSystemPrompt).toContain(
+      "Level-1 Module Lead",
+    );
+    expect(launchedConfigs.get("codex")?.at(-1)?.daemonAppendSystemPrompt).not.toContain(
+      "Call report_to_parent",
+    );
+    for (const labels of [
+      { [PARENT_AGENT_ID_LABEL]: leadAgent.id },
+      {
+        [PARENT_AGENT_ID_LABEL]: parent.id,
+        [PARENT_SERVER_ID_LABEL]: "remote-host",
+        [REMOTE_HIERARCHY_DEPTH_LABEL]: "1",
+      },
+    ]) {
+      await manager.createAgent(config, undefined, {
+        workspaceId,
+        labels: { ...labels, [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING },
+      });
+      const prompt = launchedConfigs.get("codex")?.at(-1)?.daemonAppendSystemPrompt;
+      expect(prompt).toContain("Call report_to_parent");
+      expect(prompt).not.toContain("Level-1 Module Lead");
+    }
   });
 });
 
@@ -1134,6 +1175,11 @@ it("applies the Level-2 restrictions after adoption and subscribes a UI child's 
       providerSnapshotManager: createProviderSnapshotManagerStub().manager,
       finishSubscriptions: {
         register,
+        trackRemoteChild: async () => {},
+        queueParentReport: async () => {
+          throw new Error("Unexpected report");
+        },
+        pullReports: async () => ({ ownsBinding: false, reports: [] }),
         hasPendingForCaller: () => false,
         start: async () => {},
         close: async () => {},
@@ -1578,6 +1624,44 @@ it("delivers explicit reports to direct parents and rejects a queued report afte
       },
       onError,
     });
+    const reporting = createFinishSubscriptions({
+      store: createJsonFinishSubscriptionStore(cwd),
+      followups: {
+        watches: createJsonFinishSubscriptionStore(cwd, "watches.json"),
+        reports: createJsonFinishSubscriptionStore(cwd, "reports.json"),
+        async dispatch(record, report) {
+          const receipt = delivery.enqueue({
+            recipientId: record.callerAgentId,
+            messageId: report.id,
+            prompt: report.prompt,
+            source: { kind: "agent-message", agentId: record.childAgentId },
+            unarchive: false,
+            validateDispatch: async () => {
+              if ((await storage.get(record.callerAgentId))?.archivedAt) {
+                throw new ParentReportRecipientUnavailableError("Parent is unavailable");
+              }
+              if (
+                manager.getAgent(record.childAgentId)?.labels?.[PARENT_AGENT_ID_LABEL] !==
+                record.callerAgentId
+              ) {
+                throw new ParentReportRecipientUnavailableError(
+                  "You can only manage your direct subagents.",
+                );
+              }
+            },
+          });
+          await receipt.dispatched;
+        },
+      },
+      messages: () => delivery,
+      open: async () => {
+        throw new Error("Explicit reports do not observe turns");
+      },
+      callerIsActive: async () => true,
+      serverId: "server-1",
+      logger: createTestLogger(),
+    });
+    await reporting.start();
     const makeCatalog = (callerAgentId?: string) =>
       createPaseoToolCatalog({
         agentManager: manager,
@@ -1585,6 +1669,7 @@ it("delivers explicit reports to direct parents and rejects a queued report afte
         providerSnapshotManager: createProviderSnapshotManagerStub().manager,
         serverId: "server-1",
         agentMessages: () => delivery,
+        finishSubscriptions: () => reporting,
         callerAgentId,
         paseoToolPolicy: callerAgentId ? manager.getPaseoToolPolicy(callerAgentId) : undefined,
         logger: createTestLogger(),
@@ -1651,6 +1736,7 @@ it("delivers explicit reports to direct parents and rejects a queued report afte
       ).rejects.toThrow("Only subagents with a direct parent can report.");
       expect(dispatch).toHaveBeenCalledTimes(2);
     } finally {
+      await reporting.close();
       await delivery.close();
     }
   });
@@ -1666,28 +1752,61 @@ it("routes a report to its parent on another host even if the agent IDs match", 
       [PARENT_SERVER_ID_LABEL]: "remote-host",
       [REMOTE_HIERARCHY_DEPTH_LABEL]: "2",
     });
-    const sendMessage = vi.fn<DaemonClient["sendMessage"]>(async () => ({
-      deliveryStatus: "queued",
-    }));
     const parent = toAgentPayload(callerAgent);
     const fetchAgent = vi.fn(async () => ({ agent: parent, project: null }));
     const remoteClient = Object.assign(
       new DaemonClient({ clientId: "parent-report-test", url: "ws://unused.invalid" }),
       {
         fetchAgent,
-        sendMessage,
       },
     );
+    const reports = createJsonFinishSubscriptionStore(cwd, "reports.json");
+    const reporting = createFinishSubscriptions({
+      store: createJsonFinishSubscriptionStore(cwd),
+      followups: {
+        watches: createJsonFinishSubscriptionStore(cwd, "watches.json"),
+        reports,
+        dispatch: async () => {
+          throw new Error("The receiving host owns dispatch");
+        },
+      },
+      messages: () => {
+        throw new Error("The receiving host owns dispatch");
+      },
+      open: async () => {
+        throw new Error("Explicit reports do not observe turns");
+      },
+      callerIsActive: async () => true,
+      serverId: "local-host",
+      logger: createTestLogger(),
+    });
+    await reporting.start();
     const catalog = createPaseoToolCatalog({
       agentManager: manager,
       agentStorage: storage,
       callerAgentId: callerAgent.id,
       providerSnapshotManager: createProviderSnapshotManagerStub().manager,
       serverId: "local-host",
+      finishSubscriptions: () => reporting,
       hosts: () => ({
-        directory: async () => {
-          throw new Error("A report does not need host discovery");
-        },
+        directory: async () => ({
+          self: { serverId: "local-host", label: "Local" },
+          hosts: [
+            {
+              registrationId: "remote-registration",
+              serverId: "remote-host",
+              label: null,
+              source: { id: "remote", key: "remote" },
+              metadata: {},
+              enabled: true,
+              status: "online" as const,
+              targetDescription: "Remote parent",
+              lastOnlineAt: null,
+              nextRetryAt: null,
+              error: null,
+            },
+          ],
+        }),
         use: async (destination, action) => {
           expect(destination).toBe("remote-host");
           return action(remoteClient);
@@ -1699,15 +1818,17 @@ it("routes a report to its parent on another host even if the agent IDs match", 
       await expect(
         catalog.executeTool("report_to_parent", { summary: "Remote work verified" }),
       ).resolves.toMatchObject({ structuredContent: { success: true, deliveryStatus: "queued" } });
-      expect(sendMessage).toHaveBeenCalledWith(
-        callerAgent.id,
-        "Report to parent (completed):\n\nRemote work verified",
-        expect.objectContaining({
-          sourceAgentId: callerAgent.id,
-          sourceAgentServerId: "local-host",
-          activeTurnBehavior: "steer",
-        }),
-      );
+      expect(await reports.list()).toMatchObject([
+        {
+          childAgentId: callerAgent.id,
+          callerAgentId: callerAgent.id,
+          callerServerId: "remote-host",
+          report: {
+            parentReportStatus: "completed",
+            prompt: "Report to parent (completed):\n\nRemote work verified",
+          },
+        },
+      ]);
       fetchAgent.mockResolvedValueOnce({
         agent: { ...parent, archivedAt: "2026-11-21T00:00:00.000Z" },
         project: null,
@@ -1715,8 +1836,9 @@ it("routes a report to its parent on another host even if the agent IDs match", 
       await expect(
         catalog.executeTool("report_to_parent", { summary: "Do not revive my remote parent" }),
       ).rejects.toThrow("is unavailable");
-      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(await reports.list()).toHaveLength(1);
     } finally {
+      await reporting.close();
       await remoteClient.close();
     }
   });
@@ -1816,6 +1938,49 @@ it("cleans up rejected subscriptions and skips automatic reports for explicit SD
       expect(finishSubscriptions.hasPendingForCaller(parentAgent.id)).toBe(false);
     } finally {
       await finishSubscriptions.close();
+    }
+  });
+});
+
+it.each([true, false])("reparents a running child with explicit reporting %s", async (explicit) => {
+  await withAgents(async ({ manager, storage, cwd }) => {
+    const config = { provider: "claude", cwd, modeId: "default" };
+    const workspaceId = "workspace";
+    const parent = await manager.createAgent(config, undefined, { workspaceId });
+    const next = await manager.createAgent(config, undefined, { workspaceId });
+    const childAgent = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: parent.id,
+        ...(explicit ? { [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING } : {}),
+      },
+    });
+    const permission = Promise.withResolvers<void>();
+    const unsubscribe = manager.subscribe(
+      (event) => {
+        if (event.type === "agent_stream" && event.event.type === "permission_requested")
+          permission.resolve();
+      },
+      { agentId: childAgent.id, replayState: false },
+    );
+    const running = manager.runAgent(childAgent.id, "edit test.txt");
+    const accept = vi.fn();
+    const register = vi.fn(async () => ({ accept, reject: async () => {} }));
+    try {
+      await Promise.race([
+        permission.promise,
+        running.then(() => {
+          throw new Error("The child must still be running");
+        }),
+      ]);
+      await manager.setAgentParent(childAgent.id, next.id, "local-host", register);
+      expect((await storage.get(childAgent.id))?.labels[PARENT_AGENT_ID_LABEL]).toBe(next.id);
+      expect(register).toHaveBeenCalledTimes(explicit ? 0 : 1);
+      expect(accept).toHaveBeenCalledTimes(explicit ? 0 : 1);
+    } finally {
+      unsubscribe();
+      await manager.cancelAgentRun(childAgent.id);
+      await running;
     }
   });
 });

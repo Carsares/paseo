@@ -712,6 +712,13 @@ Mounted surfaces and command invocations have shorter API lifetimes.
 Keep the client entry synchronous: return its cleanup function immediately and start asynchronous
 work inside it. See the maintained [composer pill example](../plugin-examples/local-plugin/client/main.tsx).
 
+## Contribute timeline selection buttons
+
+Set `requiresComposerSubmission: true` on an `addSelectionButton` contribution whose actions send
+a prompt. The app shows it only in an editable chat and checks that same chat again when the action
+runs. Return the send promise from the action so the app can hold the composer submission slot until
+the send settles. This shares the handoff lock with regular composer sends.
+
 ## Contribute composer items
 
 `addComposerItem` mounts a plugin component in the agent, draft and New workspace composers. The

@@ -1,3 +1,5 @@
+import { beginComposerWork, lockHandoffInput } from "@/composer/handoff-input-lock";
+import { buildDraftStoreKey } from "@/stores/draft-keys";
 import { defineTranslations } from "@getpaseo/plugin/client";
 import { PluginTranslationRuntime } from "@getpaseo/plugin/client/host";
 import { QueryClient } from "@tanstack/react-query";
@@ -197,6 +199,63 @@ describe("plugin selection buttons", () => {
     workspaceId: "workspace",
     agentId: "agent",
   };
+
+  it.each(["declared", "legacy"] as const)(
+    "rechecks writable chat and serializes %s selection sends with handoff",
+    async (kind) => {
+      const buttons = store();
+      const plugin =
+        kind === "legacy" ? { ...installation(), id: "quick-prompts" } : installation();
+      let settle!: () => void;
+      const send = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            settle = resolve;
+          }),
+      );
+      buttons.addSelectionButton(plugin, {
+        id: plugin.id,
+        workspaceId: selection.workspaceId,
+        ...(kind === "declared" ? { requiresComposerSubmission: true } : {}),
+        button: {
+          title: "Send prompt",
+          icon: "Scan",
+          behavior: { kind: "action", onPress: send },
+        },
+      });
+      const [entry] = buttons.getSnapshot();
+      expect(
+        selectionButtonMatches(entry, "host-a", selection.workspaceId, selection.agentId, false),
+      ).toBe(false);
+      expect(
+        selectionButtonMatches(entry, "host-a", selection.workspaceId, selection.agentId, true),
+      ).toBe(true);
+      let writable = true;
+      const press = () => buttons.run(entry.key, [], selection, () => writable);
+      writable = false;
+      await expect(press()).rejects.toThrow("This chat no longer accepts prompts.");
+      expect(send).not.toHaveBeenCalled();
+      writable = true;
+      const draftKey = buildDraftStoreKey({ serverId: "host-a", agentId: selection.agentId });
+      const endHandoff = lockHandoffInput(draftKey);
+      expect(endHandoff).toBeTypeOf("function");
+      try {
+        await expect(press()).rejects.toThrow("The composer is busy.");
+        expect(send).not.toHaveBeenCalled();
+      } finally {
+        endHandoff?.();
+      }
+      const sent = press();
+      expect(send).toHaveBeenCalledExactlyOnceWith(selection);
+      expect(lockHandoffInput(draftKey)).toBeNull();
+      expect(beginComposerWork("host-a", selection.agentId, "submit")).toBeNull();
+      settle();
+      await sent;
+      const nextHandoff = lockHandoffInput(draftKey);
+      expect(nextHandoff).toBeTypeOf("function");
+      nextHandoff?.();
+    },
+  );
 
   it("matches only the registered host and scope and supports updates and removal", () => {
     const buttons = store();

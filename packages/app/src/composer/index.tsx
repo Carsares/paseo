@@ -163,6 +163,7 @@ import type { SelectedFile } from "@/attachments/selected-file";
 import { resolveComposerAttachmentSubmitFormat } from "@/composer/attachments/submit";
 import { ComposerInputProvider, type ComposerInput } from "@/composer/session";
 import {
+  assertComposerInputUnlocked,
   beginComposerWork,
   isHandoffInputLocked,
   useHandoffInputLocked,
@@ -1547,7 +1548,7 @@ function ComposerContentImpl({
 
   const insertUserInput = useCallback(
     (text: string) => {
-      if (isHandoffLocked()) return;
+      assertComposerInputUnlocked(serverId, agentId);
       const input = messageInputRef.current;
       if (!input) {
         onChangeText(textSource.getSnapshot() + text);
@@ -1556,7 +1557,7 @@ function ComposerContentImpl({
       const inserted = insertAtSelection(input.getInputSnapshot(), text);
       input.replaceText(inserted.text, inserted.selection);
     },
-    [isHandoffLocked, onChangeText, textSource],
+    [agentId, onChangeText, serverId, textSource],
   );
   const isInputLive = useIsInputLive(messageInputRef);
   const isPanelActive = useRetainedPanelActive();

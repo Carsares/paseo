@@ -1,6 +1,8 @@
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
   MAIN_PRIOR_MODE_ID_LABEL,
+  PARENT_REPORTING_LABEL,
+  EXPLICIT_PARENT_REPORTING,
   parentAddressLabels,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
@@ -312,3 +314,73 @@ test("a remote worktree that branches off a pull request is refused, as on the l
   ).rejects.toThrow("branch, prNumber, and forge require a checkout mode");
   expect(socket.requests.map((request) => request.type)).not.toContain("workspace.create.request");
 });
+
+test("a destination without explicit reporting support receives no creation request", async () => {
+  const { client, socket } = await olderHost();
+  const resolver = resolverFor(client, visibleCodexCaller);
+  await expect(
+    resolver.use("srv_older", (host) =>
+      host.createAgent(
+        {
+          ...createArgs,
+          labels: { [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING },
+          notifyOnFinish: true,
+        },
+        {},
+      ),
+    ),
+  ).rejects.toThrow("Update the destination Paseo host to use explicit parent reporting.");
+  expect(socket.requests.map(({ type }) => type)).not.toContain("create_agent_request");
+});
+
+test.each([false, true])(
+  "negotiates queued direct delegation and completion ownership (%s)",
+  async (modern) => {
+    const { client } = await olderHost();
+    const serverInfo = client.getLastServerInfoMessage()!;
+    serverInfo.features!.agentDirectParentQueuedDelivery = modern;
+    serverInfo.features!.agentFinishReportPull = modern;
+    const destination = "srv_older";
+    const agent = buildStoredAgentPayload(
+      {
+        id: "child",
+        provider: "codex",
+        cwd: "/repo",
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+        labels: parentAddressLabels({ agentId: "caller", serverId: "origin" }),
+      },
+      ["codex"],
+      (_provider, own) => own ?? {},
+    );
+    vi.spyOn(client, "fetchAgent").mockResolvedValue({ agent, project: null });
+    const send = vi
+      .spyOn(client, "sendMessage")
+      .mockResolvedValue(modern ? { deliveryStatus: "queued" } : {});
+    const prepareLegacyNotification = vi.fn(async () => {});
+    await expect(
+      resolverFor(client, visibleCodexCaller).use(destination, (host) =>
+        host.sendPrompt(
+          {
+            agentId: agent.id,
+            prompt: "Delegate the task",
+            requireParentOwnership: true,
+            notifyOnFinish: true,
+            prepareLegacyNotification,
+          },
+          {},
+        ),
+      ),
+    ).resolves.toMatchObject({
+      structuredContent: { success: true, ...(modern ? { deliveryStatus: "queued" } : {}) },
+    });
+    expect(prepareLegacyNotification).toHaveBeenCalledTimes(modern ? 0 : 1);
+    expect(send).toHaveBeenCalledWith(
+      agent.id,
+      "Delegate the task",
+      expect.objectContaining(
+        modern ? { notifyDirectParentOnFinish: true } : { waitForDispatch: true },
+      ),
+    );
+  },
+);
