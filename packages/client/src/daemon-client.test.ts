@@ -1513,7 +1513,7 @@ test("keeps the transport connected when a session RPC ping times out", async ()
   await connectPromise;
   expect(client.getConnectionState().status).toBe("connected");
 
-  await expect(client.ping({ timeoutMs: 1 })).rejects.toThrow("Timeout waiting for message");
+  await expect(client.ping({ timeoutMs: 1 })).rejects.toThrow("No response to ping after");
 
   expect(client.getConnectionState().status).toBe("connected");
 });
@@ -1562,13 +1562,39 @@ test("bounds the wait for push token revocation", async () => {
   await connectPromise;
 
   const revocation = client.unregisterPushToken("ExponentPushToken[test-device]");
-  const rejection = expect(revocation).rejects.toThrow("Timeout waiting for message (2000ms)");
+  const rejection = expect(revocation).rejects.toThrow(
+    "No response to push.unregister.request after 2000ms",
+  );
   await vi.advanceTimersByTimeAsync(1_999);
   expect(client.getConnectionState().status).toBe("connected");
 
   await vi.advanceTimersByTimeAsync(1);
   await rejection;
   expect(client.getConnectionState().status).toBe("connected");
+});
+
+test("identifies the request when marking an agent as read times out", async () => {
+  useHeartbeatClock();
+  const transport = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_attention_timeout",
+    reconnect: { enabled: false },
+    transportFactory: () => transport.transport,
+  });
+  clients.push(client);
+  const connected = client.connect();
+  transport.triggerOpen();
+  await connected;
+
+  const outcome = client.clearAgentAttention("agent-1").catch((error: unknown) => error);
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(await outcome).toMatchObject({
+    name: "DaemonConnectionError",
+    code: "DAEMON_REQUEST_TIMEOUT",
+    message: "No response to clear_agent_attention after 60000ms",
+  });
+  expect(client.isConnected).toBe(true);
 });
 
 test("defaults session RPC waiters to sixty seconds", async () => {
@@ -1615,8 +1641,108 @@ test("defaults session RPC waiters to sixty seconds", async () => {
   expect(settled).toBe(false);
 
   await vi.advanceTimersByTimeAsync(1);
-  await expect(responsePromise).rejects.toThrow("Timeout waiting for message (60000ms)");
+  await expect(responsePromise).rejects.toThrow("No response to fetch_agent_request after 60000ms");
 });
+
+test.each([
+  [
+    "archive_workspace_request",
+    (client: DaemonClient) => client.archiveWorkspace("workspace-1"),
+    (requestId: string) => ({
+      type: "archive_workspace_response" as const,
+      payload: {
+        requestId,
+        workspaceId: "workspace-1",
+        archivedAt: "2026-01-01T00:00:00.000Z",
+        error: null,
+      },
+    }),
+  ],
+  [
+    "paseo_worktree_archive_request",
+    (client: DaemonClient) => client.archivePaseoWorktree({ worktreePath: "/repo/worktree" }),
+    (requestId: string) => ({
+      type: "paseo_worktree_archive_response" as const,
+      payload: { requestId, success: true, removedAgents: [], error: null },
+    }),
+  ],
+  [
+    "workspace.recovery.restore.request",
+    (client: DaemonClient) => client.restoreWorkspace("workspace-1"),
+    (requestId: string) => ({
+      type: "workspace.recovery.restore.response" as const,
+      payload: { requestId, workspaceId: "workspace-1", accepted: true, error: null },
+    }),
+  ],
+  [
+    "workspace.archive.undo.request",
+    (client: DaemonClient) => client.undoWorkspaceArchive("workspace-1"),
+    (requestId: string) => ({
+      type: "workspace.archive.undo.response" as const,
+      payload: { requestId, workspaceId: "workspace-1", accepted: true, error: null },
+    }),
+  ],
+  [
+    "open_project_request",
+    (client: DaemonClient) => client.openProject("/repo/worktree"),
+    (requestId: string) => ({
+      type: "open_project_response" as const,
+      payload: { requestId, workspace: null, error: null },
+    }),
+  ],
+  [
+    "create_paseo_worktree_request",
+    (client: DaemonClient) => client.createPaseoWorktree({ cwd: "/repo", worktreeSlug: "topic" }),
+    (requestId: string) => ({
+      type: "create_paseo_worktree_response" as const,
+      payload: { requestId, workspace: null, error: null, setupTerminalId: null },
+    }),
+  ],
+] as const)(
+  "waits on %s across queued and bounded daemon stages until response or disconnect",
+  async (_type, run, buildResponse) => {
+    useHeartbeatClock();
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "worktree-lifecycle-wait-test",
+      logger: createMockLogger(),
+      reconnect: { enabled: false },
+      transportFactory: () => transport.transport,
+    });
+    clients.push(client);
+
+    const connecting = client.connect();
+    transport.triggerOpen();
+    await connecting;
+
+    const pending = run(client);
+    const sentFrame = JSON.parse(assertStr(transport.sent.at(-1))) as {
+      message: { requestId: string };
+    };
+    let settled = false;
+    void pending.then(
+      () => {
+        settled = true;
+        return undefined;
+      },
+      () => {
+        settled = true;
+        return undefined;
+      },
+    );
+    await vi.advanceTimersByTimeAsync(200_000);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    transport.triggerMessage(wrapSessionMessage(buildResponse(sentFrame.message.requestId)));
+    await expect(pending).resolves.not.toThrow();
+
+    const disconnected = run(client);
+    transport.triggerClose({ code: 1006, reason: "gone" });
+    await expect(disconnected).rejects.toMatchObject({ code: "DAEMON_CONNECTION_LOST" });
+  },
+);
 
 test("honors explicit fetchAgent timeout below the session RPC default", async () => {
   useHeartbeatClock();
@@ -1663,7 +1789,7 @@ test("honors explicit fetchAgent timeout below the session RPC default", async (
   expect(settled).toBe(false);
 
   await vi.advanceTimersByTimeAsync(1);
-  await expect(responsePromise).rejects.toThrow("Timeout waiting for message (5000ms)");
+  await expect(responsePromise).rejects.toThrow("No response to fetch_agent_request after 5000ms");
 });
 
 test("preserves legacy fetchAgent id overload", async () => {
@@ -1827,7 +1953,9 @@ test("honors explicit fetchAgentTimeline timeout below the session RPC default",
   expect(settled).toBe(false);
 
   await vi.advanceTimersByTimeAsync(1);
-  await expect(responsePromise).rejects.toThrow("Timeout waiting for message (2000ms)");
+  await expect(responsePromise).rejects.toThrow(
+    "No response to fetch_agent_timeline_request after 2000ms",
+  );
 });
 
 test("lists the full agent prompt index", async () => {
@@ -1920,7 +2048,7 @@ test("honors explicit fetchAgents timeout below the session RPC default", async 
   expect(settled).toBe(false);
 
   await vi.advanceTimersByTimeAsync(1);
-  await expect(responsePromise).rejects.toThrow("Timeout waiting for message (1200ms)");
+  await expect(responsePromise).rejects.toThrow("No response to fetch_agents_request after 1200ms");
 });
 
 test("honors explicit shutdownServer timeout below the session RPC default", async () => {
@@ -1966,7 +2094,9 @@ test("honors explicit shutdownServer timeout below the session RPC default", asy
   expect(settled).toBe(false);
 
   await vi.advanceTimersByTimeAsync(1);
-  await expect(responsePromise).rejects.toThrow("Timeout waiting for message (1500ms)");
+  await expect(responsePromise).rejects.toThrow(
+    "No response to shutdown_server_request after 1500ms",
+  );
 });
 
 test("honors explicit getDaemonStatus timeout below the session RPC default", async () => {
@@ -2012,7 +2142,9 @@ test("honors explicit getDaemonStatus timeout below the session RPC default", as
   expect(settled).toBe(false);
 
   await vi.advanceTimersByTimeAsync(1);
-  await expect(responsePromise).rejects.toThrow("Timeout waiting for message (1500ms)");
+  await expect(responsePromise).rejects.toThrow(
+    "No response to daemon.get_status.request after 1500ms",
+  );
 });
 
 test("honors explicit getDaemonPairingOffer timeout below the session RPC default", async () => {
@@ -2058,7 +2190,9 @@ test("honors explicit getDaemonPairingOffer timeout below the session RPC defaul
   expect(settled).toBe(false);
 
   await vi.advanceTimersByTimeAsync(1);
-  await expect(responsePromise).rejects.toThrow("Timeout waiting for message (1500ms)");
+  await expect(responsePromise).rejects.toThrow(
+    "No response to daemon.get_pairing_offer.request after 1500ms",
+  );
 });
 
 test("gates config reload on the daemon capability", async () => {
@@ -2464,7 +2598,9 @@ test("keeps enable and disable inside the session RPC deadline", async () => {
       expect(settled).toBe(false);
 
       await vi.advanceTimersByTimeAsync(1);
-      await expect(pending).rejects.toThrow("Timeout waiting for message (60000ms)");
+      await expect(pending).rejects.toThrow(
+        `No response to plugin.${action}.request after 60000ms`,
+      );
     }
   } finally {
     vi.useRealTimers();
@@ -8925,7 +9061,9 @@ test("usage request timeout detaches its update listener", async () => {
     const result = client.listUsageReports({ requestId: "timeout-usage" }, (report) =>
       updates.push(report),
     );
-    const rejected = expect(result).rejects.toThrow("Timeout waiting for message (60000ms)");
+    const rejected = expect(result).rejects.toThrow(
+      "No response to usage.list_reports.request after 60000ms",
+    );
     await vi.advanceTimersByTimeAsync(60_001);
     await rejected;
     mock.triggerMessage(
@@ -9839,7 +9977,7 @@ test("RPC deadlines remain active while a preceding frame waits for drain", asyn
   blocked = true;
   const first = client.sendHostFrame("route", new Uint8Array([1]));
   try {
-    await expect(client.ping({ timeoutMs: 20 })).rejects.toThrow("Timeout waiting for message");
+    await expect(client.ping({ timeoutMs: 20 })).rejects.toThrow("No response to ping after");
     expect(client.isConnected).toBe(true);
   } finally {
     drain();

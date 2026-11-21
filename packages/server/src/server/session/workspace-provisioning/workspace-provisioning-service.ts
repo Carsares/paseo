@@ -52,6 +52,7 @@ export interface CreateWorktreeWorkspaceInput {
   worktreeRoot: string;
   branch: string | null;
   baseBranch: string | null;
+  worktreeManagerPluginId?: string | null;
   title: string | null;
   metadata?: Record<string, JsonValue>;
   expectsInitialAgent?: boolean;
@@ -235,6 +236,15 @@ export function createWorkspaceProvisioningService(deps: {
     return project;
   }
 
+  async function findUntrustedSource(checkoutRoot: string) {
+    const matchesCheckout = createRealpathAwarePathMatcher(checkoutRoot);
+    return (await workspaceRegistry.listAll()).find(
+      (candidate) =>
+        Boolean(candidate.untrustedSource) &&
+        matchesCheckout(candidate.worktreeRoot ?? candidate.cwd),
+    )?.untrustedSource;
+  }
+
   async function resolveCreationMetadata(input?: {
     workspaceId?: string;
     background?: boolean;
@@ -272,22 +282,23 @@ export function createWorkspaceProvisioningService(deps: {
       ? await refreshProjectKind(await requireActiveProject(projectId), normalizedCwd, checkout)
       : // COMPAT(workspaceCreateMissingProjectId): added in v0.1.107, remove after 2027-01-15.
         await findOrCreateProjectForDirectory(normalizedCwd);
+    const checkoutRoot = checkout.worktreeRoot ?? normalizedCwd;
+    const isOwnedWorktree = checkout.isGit && checkout.isPaseoOwnedWorktree;
     const create = async () => {
-      const baseMetadata =
-        checkout.isGit && checkout.isPaseoOwnedWorktree
-          ? await readPaseoWorktreeMetadata(checkout.worktreeRoot ?? normalizedCwd)
-          : null;
+      const baseMetadata = isOwnedWorktree ? await readPaseoWorktreeMetadata(checkoutRoot) : null;
+      const untrustedSource = context?.untrustedSource ?? (await findUntrustedSource(checkoutRoot));
       const timestamp = new Date().toISOString();
       const workspace = createPersistedWorkspaceRecord({
         workspaceId: context?.workspaceId ?? generateWorkspaceId(),
         projectId: project.projectId,
         ...initialWorkspacePlacement({ source: "checkout", cwd: normalizedCwd, checkout }),
         baseBranch: baseMetadata?.baseRef ?? baseMetadata?.baseRefName ?? null,
+        worktreeManagerPluginId: baseMetadata?.worktreeManagerPluginId ?? null,
         title: title?.trim() || null,
         metadata: context?.metadata,
+        untrustedSource,
         createdAt: timestamp,
         updatedAt: timestamp,
-        ...(context?.untrustedSource ? { untrustedSource: context.untrustedSource } : {}),
         ...(await resolveCreationMetadata(context)),
       });
       if (context?.beforeSave) await context.beforeSave();
@@ -297,8 +308,8 @@ export function createWorkspaceProvisioningService(deps: {
       emitWorkspaceCreated(workspace);
       return workspace;
     };
-    return deps.withCheckoutLock && checkout.isGit && checkout.isPaseoOwnedWorktree
-      ? deps.withCheckoutLock(checkout.worktreeRoot ?? normalizedCwd, create)
+    return deps.withCheckoutLock && isOwnedWorktree
+      ? deps.withCheckoutLock(checkoutRoot, create)
       : create();
   }
 
@@ -326,6 +337,7 @@ export function createWorkspaceProvisioningService(deps: {
         baseBranch: input.baseBranch,
         mainRepoRoot: repoRoot,
       }),
+      worktreeManagerPluginId: input.worktreeManagerPluginId ?? null,
       title: input.title,
       metadata: input.metadata,
       createdAt: timestamp,

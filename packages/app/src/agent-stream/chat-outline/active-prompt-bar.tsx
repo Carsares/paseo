@@ -27,7 +27,7 @@ const HIDE_DURING_CHAT_FIND =
 interface ActivePromptBarProps {
   prompts: readonly ChatOutlinePrompt[];
   activePrompt: ActivePromptSource;
-  contentMaxWidth: number;
+  contentMaxWidth: number | undefined;
   onJumpToPrompt: (seq: number) => void;
 }
 

@@ -7,6 +7,7 @@ import {
   DEFAULT_MONO_FONT_STACK,
   FONT_SIZE,
   REGISTERED_THEMES,
+  themeContentMaxWidth,
   type Theme,
 } from "@/styles/theme";
 import { applyRootUiFont } from "./apply-root-font";
@@ -19,7 +20,7 @@ export interface AppearanceInput {
   uiBaseFontSize: number; // already clamped
   contentFontSize: number; // already clamped
   codeFontSize: number; // already clamped
-  contentMaxWidth: number; // already clamped, default resolved
+  contentMaxWidth: number | undefined; // undefined fills the available width
   contentLineHeightMultiplier?: number; // already clamped, defaults to DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER
   contentLetterSpacing?: number; // already clamped, defaults to DEFAULT_CONTENT_LETTER_SPACING
   contentBlockGap?: number | null; // already clamped or null, defaults to null
@@ -75,6 +76,7 @@ export function applyAppearance(input: AppearanceInput): void {
   );
   const contentLetterSpacing = input.contentLetterSpacing ?? DEFAULT_CONTENT_LETTER_SPACING;
   const contentBlockGap = input.contentBlockGap ?? null;
+  const contentMaxWidth = themeContentMaxWidth(input.contentMaxWidth);
   const activeTheme = UnistylesRuntime.themeName;
   // Unistyles web emits after each registry patch. Updating the mounted theme
   // first ensures subscribers receive its new numeric tokens in this render;
@@ -98,7 +100,7 @@ export function applyAppearance(input: AppearanceInput): void {
           fontFamily,
           fontSize,
           lineHeight,
-          contentMaxWidth: input.contentMaxWidth,
+          contentMaxWidth,
           contentLetterSpacing,
           contentBlockGap,
           colors: { ...t.colors, syntax: resolveSyntaxColors(input.syntaxTheme, t.colorScheme) },
@@ -109,7 +111,7 @@ export function applyAppearance(input: AppearanceInput): void {
         fontFamily,
         fontSize,
         lineHeight,
-        contentMaxWidth: input.contentMaxWidth,
+        contentMaxWidth,
         contentLetterSpacing,
         contentBlockGap,
         colors: { ...t.colors, syntax: resolveSyntaxColors(input.syntaxTheme, t.colorScheme) },

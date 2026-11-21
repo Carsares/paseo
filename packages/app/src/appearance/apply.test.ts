@@ -5,6 +5,7 @@ import {
   DEFAULT_CONTENT_LINE_HEIGHT_MULTIPLIER,
   DEFAULT_UI_FONT_STACK,
   REGISTERED_THEMES,
+  type Theme,
 } from "@/styles/theme";
 import { applyAppearance, type AppearanceInput } from "./apply";
 
@@ -42,7 +43,7 @@ interface FakeTheme {
     "4xl": number;
   };
   lineHeight: { diff: number; content: number };
-  contentMaxWidth: number;
+  contentMaxWidth: Theme["contentMaxWidth"];
   contentLetterSpacing: number;
   contentBlockGap: number | null;
   colors: { foreground: string; syntax: Record<string, string> };
@@ -114,10 +115,13 @@ describe("applyAppearance", () => {
     ]);
   });
 
-  it("patches the content max width into the theme", () => {
-    applyAppearance(makeInput({ contentMaxWidth: 1600 }));
+  it.each([
+    [1600, "1600px"],
+    [undefined, "100%"],
+  ])("uses a CSS variable-compatible width on web for %s", (contentMaxWidth, cssWidth) => {
+    applyAppearance(makeInput({ contentMaxWidth }));
 
-    expect(runCapturedUpdater().contentMaxWidth).toBe(1600);
+    expect(runCapturedUpdater().contentMaxWidth).toBe(cssWidth);
   });
 
   it("resolves an empty UI font family to the default stack", () => {

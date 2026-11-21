@@ -1,6 +1,6 @@
 import type { AgentProvider, ProviderSnapshotEntry } from "@getpaseo/protocol/agent-types";
 import {
-  buildSelectableProviderSelectorProviders,
+  buildSelectorProvider,
   type ProviderSelectorProvider,
 } from "@/provider-selection/provider-selection";
 
@@ -18,19 +18,15 @@ export function resolveAgentControlsSelectorProviders(
 ): ProviderSelectorProvider[] {
   // Keep the active model's label available even if its provider was disabled.
   const singleProviderList = input.snapshotSelectedEntry
-    ? buildSelectableProviderSelectorProviders(
-        [{ ...input.snapshotSelectedEntry, enabled: true }],
-        input.isConnected,
-      )
+    ? [buildSelectorProvider(input.snapshotSelectedEntry, input.isConnected)]
     : input.fallbackProviders;
   if (!input.canSwitchProvider) {
     return singleProviderList;
   }
 
-  const allSelectable = buildSelectableProviderSelectorProviders(
-    input.snapshotEntries,
-    input.isConnected,
-  );
+  const allSelectable = (input.snapshotEntries ?? [])
+    .filter((entry) => entry.enabled)
+    .map((entry) => buildSelectorProvider(entry, input.isConnected));
   if (input.agentProvider && !allSelectable.some((entry) => entry.id === input.agentProvider)) {
     return [...singleProviderList, ...allSelectable];
   }

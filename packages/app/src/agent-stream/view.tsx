@@ -89,6 +89,7 @@ import { type NearBottom, useIsNearBottom, useNearBottom } from "./near-bottom";
 import { ActivePromptBar } from "@/agent-stream/chat-outline/active-prompt-bar";
 import { ChatOutlineRail } from "@/agent-stream/chat-outline/rail";
 import { useChatOutline } from "@/agent-stream/chat-outline/use-chat-outline";
+import { CHAT_COLUMN_RAIL_DATASET, useChatOutlineRail } from "@/chat-rail";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
 import {
@@ -336,7 +337,7 @@ function ScrollToBottomButton({
   );
   if (isNearBottom && !isTimelineDetached) return null;
   return (
-    <View style={containerStyle} pointerEvents="box-none">
+    <View style={containerStyle} dataSet={CHAT_COLUMN_RAIL_DATASET} pointerEvents="box-none">
       <Animated.View entering={scrollIndicatorFadeIn} exiting={scrollIndicatorFadeOut}>
         <Pressable
           style={stylesheet.scrollToBottomButton}
@@ -477,6 +478,21 @@ function StreamExpansionProviders({
   );
 }
 
+function shouldTrackChatOutline(railEnabled: boolean): boolean {
+  return isNative || railEnabled;
+}
+
+function renderChatOutlineRail(outlineInset: number, outline: ReturnType<typeof useChatOutline>) {
+  if (outlineInset <= 0 || outline.prompts.length < 2) return null;
+  return (
+    <ChatOutlineRail
+      prompts={outline.prompts}
+      activePrompt={outline.activePrompt}
+      onJumpToPrompt={outline.jumpToPrompt}
+    />
+  );
+}
+
 function createActivePromptBarSlots(props: ComponentProps<typeof ActivePromptBar>) {
   const bar = <ActivePromptBar {...props} />;
   // Web mounts beside the find widget. Native mounts inside the transcript's own viewport.
@@ -515,7 +531,6 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     );
     const showAgentInteractions = showAgentInteractionsOverride ?? configuredShowAgentInteractions;
     const chatDisplay = useSettings((settings) => settings.chatDisplay);
-    const chatOutlineEnabled = useSettings((settings) => isNative || settings.chatOutlineEnabled);
     const contentMaxWidth = useSettings(resolveContentMaxWidth);
     const viewportRef = useRef<StreamViewportHandle | null>(null);
     const pendingClientMessageIds = useMemo(
@@ -553,10 +568,6 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     const supportsAgentForkContextCursor = useSessionStore(
       (state) =>
         state.sessions[resolvedServerId]?.serverInfo?.features?.agentForkContextCursor === true,
-    );
-    const supportsChatOutline = useSessionStore(
-      (state) =>
-        state.sessions[resolvedServerId]?.serverInfo?.features?.agentTimelinePromptIndex === true,
     );
     const timelineEpoch = useSessionStore(
       (state) => state.sessions[resolvedServerId]?.agentTimelineCursor.get(agentId)?.epoch ?? null,
@@ -744,13 +755,16 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           mountedHistoryMessageIds.has(messageId) || liveHeadMessageIds.has(messageId),
       };
     }, [baseRenderModel.segments.liveHead, mountedHistoryMessageIds]);
+    const outlineRail = useChatOutlineRail();
+    const outlineTrackingEnabled = shouldTrackChatOutline(outlineRail.enabled);
+    const outlineInset = outlineRail.inset;
     const chatOutline = useChatOutline({
       agentId,
       serverId: resolvedServerId,
       timelineEpoch,
       tail: presentation.sourceTail,
       head: presentation.sourceHead,
-      enabled: supportsChatOutline && chatOutlineEnabled,
+      enabled: outlineTrackingEnabled,
       viewportRef,
       onJumpError: handleTimelineHistoryLoadError,
       mountedHistoryMessageIds,
@@ -1367,14 +1381,11 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
                     baseListContentContainerStyle: stylesheet.listContentContainer,
                     forwardListContentContainerStyle: stylesheet.forwardListContentContainer,
                     contentMaxWidth,
+                    outlineInset,
                   })}
                 </StreamExpansionProviders>
               </MessageOuterSpacingProvider>
-              <ChatOutlineRail
-                prompts={chatOutline.prompts}
-                activePrompt={chatOutline.activePrompt}
-                onJumpToPrompt={chatOutline.jumpToPrompt}
-              />
+              {renderChatOutlineRail(outlineInset, chatOutline)}
               {activePromptBar.native}
               <ScrollToBottomButton
                 nearBottom={nearBottom}

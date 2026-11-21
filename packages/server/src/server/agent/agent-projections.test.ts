@@ -382,6 +382,7 @@ describe("toAgentPayload", () => {
         nativeHandle: { id: "native" } as unknown,
         metadata: {
           restored: new Date("2025-03-01T00:00:00.000Z"),
+          paseoInstructionReceipt: { threadId: "persist-99", digest: "internal-digest" },
           empty: {},
           mcpServers: {
             hub: {
@@ -432,6 +433,8 @@ describe("toAgentPayload", () => {
           sessionId: "persist-stored",
           metadata: {
             conversationId: "conversation-stored",
+            pluginAppendSystemPrompt: ["plugin instruction"],
+            daemonAppendSystemPrompt: "daemon instruction",
             mcpServers: {
               hub: {
                 type: "http",
@@ -447,6 +450,8 @@ describe("toAgentPayload", () => {
 
     expect(record.persistence?.metadata).toEqual({
       conversationId: "conversation-stored",
+      pluginAppendSystemPrompt: ["plugin instruction"],
+      daemonAppendSystemPrompt: "daemon instruction",
       mcpServers: {
         hub: {
           type: "http",
