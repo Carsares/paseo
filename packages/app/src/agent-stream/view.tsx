@@ -86,6 +86,7 @@ import { resolveStreamRenderStrategy } from "./strategy-resolver";
 import { type StreamSegmentRenderers, type StreamViewportHandle } from "./strategy";
 import { renderStreamRow, type RenderStreamItem } from "./stream-row";
 import { type NearBottom, useIsNearBottom, useNearBottom } from "./near-bottom";
+import { ActivePromptBar } from "@/agent-stream/chat-outline/active-prompt-bar";
 import { ChatOutlineRail } from "@/agent-stream/chat-outline/rail";
 import { useChatOutline } from "@/agent-stream/chat-outline/use-chat-outline";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
@@ -121,7 +122,7 @@ import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store"
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useForkAgent } from "@/hooks/use-fork-agent";
 import { useOptionalPaneContext } from "@/panels/pane-context";
-import { isWeb } from "@/constants/platform";
+import { isNative, isWeb } from "@/constants/platform";
 import type { Theme } from "@/styles/theme";
 import { recordRenderProfileReasons } from "@/utils/render-profiler";
 import { useRetainedPanelActive } from "@/components/retained-panel";
@@ -476,6 +477,12 @@ function StreamExpansionProviders({
   );
 }
 
+function createActivePromptBarSlots(props: ComponentProps<typeof ActivePromptBar>) {
+  const bar = <ActivePromptBar {...props} />;
+  // Web mounts beside the find widget. Native mounts inside the transcript's own viewport.
+  return isWeb ? { web: bar, native: null } : { web: null, native: bar };
+}
+
 const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamViewProps>(
   function AgentStreamView(
     {
@@ -508,7 +515,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     );
     const showAgentInteractions = showAgentInteractionsOverride ?? configuredShowAgentInteractions;
     const chatDisplay = useSettings((settings) => settings.chatDisplay);
-    const chatOutlineEnabled = useSettings((settings) => settings.chatOutlineEnabled);
+    const chatOutlineEnabled = useSettings((settings) => isNative || settings.chatOutlineEnabled);
     const contentMaxWidth = useSettings(resolveContentMaxWidth);
     const viewportRef = useRef<StreamViewportHandle | null>(null);
     const pendingClientMessageIds = useMemo(
@@ -1208,7 +1215,10 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         rowId === null
           ? undefined
           : (layoutHistoryItemById.get(rowId) ?? layoutLiveHeadItemById.get(rowId));
-      chatOutline.reportReadingPosition(row?.item.timelineCursor?.seq ?? null);
+      chatOutline.reportReadingPosition(
+        row?.item.timelineCursor?.seq ?? null,
+        row?.item.kind === "user_message",
+      );
     });
 
     const renderHistoryRow = useCallback(
@@ -1302,6 +1312,12 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       () => [...presentation.sourceTail, ...presentation.sourceHead],
       [presentation.sourceHead, presentation.sourceTail],
     );
+    const activePromptBar = createActivePromptBarSlots({
+      prompts: chatOutline.prompts,
+      activePrompt: chatOutline.activePrompt,
+      contentMaxWidth,
+      onJumpToPrompt: chatOutline.jumpToPrompt,
+    });
     return (
       <ChatFind
         agentId={agentId}
@@ -1359,6 +1375,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
                 activePrompt={chatOutline.activePrompt}
                 onJumpToPrompt={chatOutline.jumpToPrompt}
               />
+              {activePromptBar.native}
               <ScrollToBottomButton
                 nearBottom={nearBottom}
                 isTimelineDetached={isTimelineDetached}
@@ -1368,6 +1385,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             </AssistantSelectionCopySurface>
           </AllowSubagentForkContext.Provider>
         </ToolCallSheetProvider>
+        {activePromptBar.web}
       </ChatFind>
     );
   },

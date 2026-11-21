@@ -307,13 +307,14 @@ function shouldStopDetailWheelPropagation(detailRoot: HTMLElement, event: WheelE
 
 const userMessageStylesheet = StyleSheet.create((theme) => ({
   container: {
-    flexDirection: "row",
-    justifyContent: "flex-end",
+    flexDirection: "column",
+    alignItems: "stretch",
     ...(isWeb ? { userSelect: "text" as const } : {}),
   },
   content: {
+    alignSelf: "flex-end",
     alignItems: "flex-end",
-    maxWidth: "100%",
+    maxWidth: "85%",
     cursor: "auto",
   },
   containerSpacing: {
@@ -325,8 +326,40 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
   containerLastInGroup: {
     marginBottom: theme.spacing[4],
   },
+  turnDivider: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+    marginBottom: theme.spacing[2],
+  },
+  turnDividerLine: {
+    flex: 1,
+    height: theme.borderWidth[1],
+    backgroundColor: theme.colors.borderAccent,
+  },
+  turnDividerDot: {
+    width: theme.spacing[2],
+    height: theme.spacing[2],
+    borderRadius: theme.borderRadius.full,
+    backgroundColor: theme.colors.accentBright,
+  },
+  turnDividerLabel: {
+    flexShrink: 1,
+    fontSize: theme.fontSize.sm,
+    color: theme.colors.foregroundMuted,
+    fontWeight: theme.fontWeight.medium,
+  },
+  turnDividerEndLine: {
+    width: theme.spacing[4],
+    height: theme.borderWidth[1],
+    backgroundColor: theme.colors.borderAccent,
+  },
   bubble: {
     backgroundColor: theme.colors.surface3,
+    borderWidth: theme.borderWidth[1],
+    borderColor: theme.colors.borderAccent,
+    borderLeftWidth: 3,
+    borderLeftColor: theme.colors.accentBright,
     borderRadius: theme.borderRadius["2xl"],
     borderTopRightRadius: theme.borderRadius.sm,
     paddingHorizontal: theme.spacing[4],
@@ -454,7 +487,7 @@ export const UserMessage = memo(function UserMessage({
   disableOuterSpacing,
 }: UserMessageProps) {
   const isCompact = useIsCompactFormFactor();
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [isHovered, setIsHovered] = useState(false);
   const [lightboxMetadata, setLightboxMetadata] = useState<UserMessageImageAttachment | null>(null);
   const handleLightboxClose = useCallback(() => setLightboxMetadata(null), []);
@@ -518,15 +551,34 @@ export const UserMessage = memo(function UserMessage({
     [showTrailingRow],
   );
 
+  function renderTurnDivider() {
+    if (!isFirstInGroup || !(hasText || hasImages || hasAttachments)) return null;
+    const label = sender
+      ? formattedTimestamp
+      : `${i18n.language?.startsWith("zh") ? "你的提问" : "Your prompt"} · ${formattedTimestamp}`;
+    return (
+      <View style={userMessageStylesheet.turnDivider} testID="user-message-turn-divider">
+        <View style={userMessageStylesheet.turnDividerLine} />
+        <View style={userMessageStylesheet.turnDividerDot} />
+        <Text style={userMessageStylesheet.turnDividerLabel} testID="user-message-turn-label">
+          {label}
+        </Text>
+        <View style={userMessageStylesheet.turnDividerEndLine} />
+      </View>
+    );
+  }
+
   return (
     <View style={containerStyle} testID="user-message" aria-busy={isPending}>
+      {renderTurnDivider()}
       <View
         style={userMessageStylesheet.content}
+        testID="user-message-content"
         onPointerEnter={handlePointerEnter}
         onPointerLeave={handlePointerLeave}
       >
         {sender ? <MessageSender sender={sender} serverId={serverId} /> : null}
-        <View style={userMessageStylesheet.bubble}>
+        <View style={userMessageStylesheet.bubble} testID="user-message-bubble">
           <MessagePreview itemId={itemId}>
             {hasImages ? (
               <View style={imagePreviewContainerStyle}>

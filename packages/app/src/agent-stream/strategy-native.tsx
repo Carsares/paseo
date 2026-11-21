@@ -21,6 +21,7 @@ import {
   LegendList,
   type LegendListRef,
   type LegendListRenderItemProps,
+  type OnViewableItemsChangedInfo,
   useSyncLayout,
 } from "@legendapp/list/react-native";
 import { withUnistyles } from "react-native-unistyles";
@@ -42,6 +43,12 @@ import {
   type EndHoldDistance,
 } from "./native-disclosure-hold";
 import { EndPinnedScrollView } from "./native-end-pin";
+import {
+  createNativeReadingPositionTracker,
+  findNativeMessageRowIndex,
+  findNativeReadingStartIndex,
+  resolveNativeReadingRowId,
+} from "./native-reading-position";
 import { createNewRowEstimates } from "./new-row-estimates";
 import type {
   DisclosureTriggerEdge,
@@ -79,6 +86,7 @@ const NATIVE_STREAM_DRAW_DISTANCE = 2000;
 // Following resumes after a disclosure or a user scroll only from the end, so resuming never moves
 // the rows the user is looking at. Web resumes within the same distance (strategy-web.tsx).
 const AT_END_OFFSET_PX = 1;
+const PROMPT_JUMP_TOP_INSET_PX = 8;
 // A disclosure settles after this many frames without an item size change.
 const DISCLOSURE_QUIET_FRAMES = 2;
 const BOTTOM_ANCHOR_TRANSPORT_BEHAVIOR = Object.freeze({
@@ -87,6 +95,9 @@ const BOTTOM_ANCHOR_TRANSPORT_BEHAVIOR = Object.freeze({
 });
 
 type RowLayoutSyncRegistry = Map<string, () => void>;
+interface MessageScrollRequest {
+  messageId: string;
+}
 
 // A disclosure toggle changes a row from the row's own state, so LegendList's container does not
 // re-render and would learn the new height from onLayout a task later, a frame after the change
@@ -138,6 +149,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
     segments,
     historyRowRevision,
     liveHeadRowRevision,
+    readingRowReplacements,
     boundary,
     renderers,
     listEmptyComponent,
@@ -147,6 +159,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
     isInitialHistoryLoading,
     revealInitialHistory,
     onNearBottomChange,
+    onReadingPositionChange,
     onNearHistoryStart,
     isLoadingOlderHistory,
     hasOlderHistory,
@@ -160,6 +173,13 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
   const { t } = useTranslation();
   const { renderHistoryMountedRow, renderLiveHeadRow, renderLiveAuxiliary } = renderers;
   const listRef = useRef<LegendListRef>(null);
+  const pendingMessageScrollRef = useRef<MessageScrollRequest | null>(null);
+  const [queuedMessageScroll, setQueuedMessageScroll] = useState<MessageScrollRequest | null>(null);
+  const cancelMessageScroll = useCallback(() => {
+    if (!pendingMessageScrollRef.current) return;
+    pendingMessageScrollRef.current = null;
+    listRef.current?.cancelScroll();
+  }, []);
   // LegendList places the rows once, behind a hidden reveal, when the list mounts.
   const [isListPlaced, setIsListPlaced] = useState(false);
   const isListPlacedRef = useRef(isListPlaced);
@@ -233,6 +253,74 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
       load: async () => onNearHistoryStart(),
       scheduleSettle: () => scheduleHistoryStartSettle(),
     });
+  const [readingPositionTracker] = useState(createNativeReadingPositionTracker);
+  const readingAgentIdRef = useRef(agentId);
+  const canReadPosition =
+    isActive && isListPlaced && historyStartPaginationState.visible && rows.length > 0;
+  const topOverlayInset = useStreamTopOverlayInset();
+  const readingLineInset = topOverlayInset + PROMPT_JUMP_TOP_INSET_PX;
+  const handleViewableItemsChanged = useStableEvent(
+    (info?: Pick<OnViewableItemsChangedInfo<StreamItem>, "start" | "end" | "viewableItems">) => {
+      if (!canReadPosition || readingAgentIdRef.current !== agentId || !onReadingPositionChange) {
+        return;
+      }
+      const list = listRef.current;
+      const state = list?.getState();
+      if (!list || !state || state.data !== rows) return;
+      const start = info?.start ?? state.start;
+      let startIndex = start;
+      let viewableItems = info?.viewableItems;
+      if (start !== undefined && rows[start]) {
+        // The list's viewport starts behind the toolbar. Match the reading line to the jump inset
+        // so the tail of the preceding row does not own the position after a jump.
+        const anchor = list.anchorVisibleContent({ key: rows[start].id, hold: false });
+        const position = state.positionAtIndex(start);
+        if (anchor && position !== undefined) {
+          const viewportStart = position + anchor.offset;
+          const firstReadableIndex = findNativeReadingStartIndex({
+            startIndex: start,
+            endIndex: info?.end ?? state.end,
+            visibleTop: viewportStart + topOverlayInset,
+            readingLine: viewportStart + readingLineInset,
+            positionAtIndex: state.positionAtIndex,
+            sizeAtIndex: state.sizeAtIndex,
+          });
+          if (firstReadableIndex === null) {
+            readingPositionTracker.report(null, onReadingPositionChange);
+            return;
+          }
+          startIndex = firstReadableIndex;
+          if (firstReadableIndex > start) {
+            viewableItems = viewableItems?.filter(({ index }) => index >= firstReadableIndex);
+          }
+        }
+      }
+      readingPositionTracker.report(
+        resolveNativeReadingRowId({ rows, startIndex, viewableItems, readingRowReplacements }),
+        onReadingPositionChange,
+      );
+    },
+  );
+  useEffect(() => {
+    const changedAgent = readingAgentIdRef.current !== agentId;
+    readingAgentIdRef.current = agentId;
+    if (!isActive || changedAgent) readingPositionTracker.reset();
+    if (!isActive || !onReadingPositionChange) return;
+    if (changedAgent || !canReadPosition)
+      readingPositionTracker.report(null, onReadingPositionChange);
+    if (!canReadPosition) return;
+    // LegendList only emits when the visible set changes, including during the hidden initial fill.
+    handleViewableItemsChanged();
+  }, [
+    agentId,
+    canReadPosition,
+    handleViewableItemsChanged,
+    isActive,
+    onReadingPositionChange,
+    readingLineInset,
+    readingPositionTracker,
+    readingRowReplacements,
+  ]);
   const evaluateHistoryStart = useStableEvent(() => historyStartPagination.update());
   const disposeHistoryStart = useStableEvent(() => historyStartPagination.dispose());
   const isHistoryStartSettling = useStableEvent(
@@ -267,6 +355,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
 
   const scrollToBottom = useCallback(
     (animated: boolean) => {
+      pendingMessageScrollRef.current = null;
       programmaticScrollEventBudgetRef.current = 3;
       const metrics = streamViewportMetricsRef.current;
       // The native scroll view finds its end from the content it has mounted, and the end pin holds
@@ -352,6 +441,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
   );
   const holdRow = useStableEvent(
     (rowId: string, apply: () => void, triggerEdge: DisclosureTriggerEdge) => {
+      cancelMessageScroll();
       const applyAndMeasure = () => {
         apply();
         rowLayoutSyncRegistry.get(rowId)?.();
@@ -426,7 +516,62 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
     (scrollProps: ScrollViewProps) => <EndPinnedScrollView {...scrollProps} pinEnd={pinsEnd} />,
     [pinsEnd],
   );
-  const topOverlayInset = useStreamTopOverlayInset();
+  const finishMessageScroll = useStableEvent((request: MessageScrollRequest) => {
+    if (pendingMessageScrollRef.current !== request) return;
+    pendingMessageScrollRef.current = null;
+    const list = listRef.current;
+    if (canReadPosition && list && list.getState().distanceFromEnd <= AT_END_OFFSET_PX) {
+      bottomAnchorController.endUserScroll({ isAtEnd: true });
+    }
+  });
+  const scrollToMessage = useStableEvent((messageId: string) => {
+    const list = listRef.current;
+    if (!canReadPosition || !list || findNativeMessageRowIndex(rows, messageId) < 0) return;
+
+    // Give the jump ownership of the offset before asking LegendList to move it.
+    clearPendingUserScrollEnd();
+    isUserScrollActiveRef.current = false;
+    cancelDisclosureHold();
+    bottomAnchorController.beginUserScroll();
+    bottomAnchorController.endUserScroll({ isAtEnd: false });
+    onNearBottomChange(false);
+
+    list.cancelScroll();
+    const request = { messageId };
+    pendingMessageScrollRef.current = request;
+    setQueuedMessageScroll(request);
+  });
+  const startMessageScroll = useStableEvent((request: MessageScrollRequest) => {
+    if (pendingMessageScrollRef.current !== request || pinsEnd) return;
+    setQueuedMessageScroll(null);
+    const list = listRef.current;
+    // Older rows may have been prepended while the pin was being removed.
+    const index = findNativeMessageRowIndex(rows, request.messageId);
+    if (!canReadPosition || !list || index < 0) {
+      pendingMessageScrollRef.current = null;
+      return;
+    }
+    const scroll = list.scrollToIndex({
+      index,
+      animated: true,
+      viewPosition: 0,
+      viewOffset: readingLineInset,
+    });
+    void scroll.then(() => finishMessageScroll(request));
+  });
+  useLayoutEffect(() => cancelMessageScroll, [agentId, canReadPosition, cancelMessageScroll]);
+  useLayoutEffect(() => {
+    if (
+      pinsEnd ||
+      !queuedMessageScroll ||
+      pendingMessageScrollRef.current !== queuedMessageScroll
+    ) {
+      return;
+    }
+    // Wait for the commit without the end pin and its native mount before issuing the jump.
+    const frame = requestAnimationFrame(() => startMessageScroll(queuedMessageScroll));
+    return () => cancelAnimationFrame(frame);
+  }, [pinsEnd, queuedMessageScroll, startMessageScroll]);
   // No keyboard inset: one committed after the keyboard settles moves every row when the end pin is
   // not holding the offset (docs/agent-stream-disclosure.md).
   const listContentContainerStyle = useMemo(
@@ -460,6 +605,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
         bottomAnchorController.prepareForStickyViewportChange();
       },
       holdRow,
+      scrollToMessage,
     };
     viewportRef.current = handle;
     return () => {
@@ -467,7 +613,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
         viewportRef.current = null;
       }
     };
-  }, [agentId, bottomAnchorController, holdRow, viewportRef]);
+  }, [agentId, bottomAnchorController, holdRow, scrollToMessage, viewportRef]);
 
   // The scroll-to-bottom button shows whenever following would not resume on its own. A detached
   // list resumes only from the end, so the button shows anywhere short of it. While following, the
@@ -536,6 +682,8 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
 
     const nearBottom = isScrollEventNearBottom(event);
     publishNearBottom();
+    // Rows can cross the reading line without entering or leaving LegendList's visible range.
+    handleViewableItemsChanged();
 
     evaluateHistoryStart();
 
@@ -559,6 +707,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
   });
 
   const handleScrollBeginDrag = useStableEvent((event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    cancelMessageScroll();
     finishInitialFill();
     clearPendingUserScrollEnd();
     isUserScrollActiveRef.current = true;
@@ -582,6 +731,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
   // Drag end is deferred a frame so momentum can take ownership.
   const handleScrollEndDrag = useStableEvent((event: NativeSyntheticEvent<NativeScrollEvent>) => {
     scrollKeyboardDismiss.onScrollEndDrag(event);
+    if (!isUserScrollActiveRef.current) return;
     isReleasedAtEndRef.current = isScrollEventAtEnd(event);
 
     clearPendingUserScrollEnd();
@@ -751,6 +901,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
         style={[listStyle, { opacity: historyStartPaginationState.visible ? 1 : 0 }]}
         onLayout={handleListLayout}
         onScroll={handleScroll}
+        onViewableItemsChanged={handleViewableItemsChanged}
         onScrollBeginDrag={handleScrollBeginDrag}
         onScrollEndDrag={handleScrollEndDrag}
         onMomentumScrollBegin={handleMomentumScrollBegin}

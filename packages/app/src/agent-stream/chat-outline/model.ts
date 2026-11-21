@@ -37,33 +37,54 @@ export function resolveActivePromptSeq(
   if (anchorSeq === null) {
     return null;
   }
-  let activeSeq: number | null = null;
-  for (const prompt of prompts) {
-    if (prompt.seq > anchorSeq) {
-      break;
+  let start = 0;
+  let end = prompts.length;
+  while (start < end) {
+    const middle = start + Math.floor((end - start) / 2);
+    if (prompts[middle].seq <= anchorSeq) {
+      start = middle + 1;
+    } else {
+      end = middle;
     }
-    activeSeq = prompt.seq;
   }
-  return activeSeq;
+  return prompts[start - 1]?.seq ?? null;
+}
+
+export interface ActivePromptReadingState {
+  readonly activeSeq: number | null;
+  readonly isPromptScrolledAbove: boolean;
+}
+
+export function resolveActivePromptReadingState(
+  prompts: readonly ChatOutlinePrompt[],
+  anchorSeq: number | null,
+  isReadingPromptRow = false,
+): ActivePromptReadingState {
+  const activeSeq = resolveActivePromptSeq(prompts, anchorSeq);
+  return {
+    activeSeq,
+    isPromptScrolledAbove: activeSeq !== null && !(isReadingPromptRow && anchorSeq === activeSeq),
+  };
 }
 
 export interface ActivePromptSource {
   subscribe: (listener: () => void) => () => void;
   getActiveSeq: () => number | null;
+  getReadingState: () => ActivePromptReadingState;
 }
 
 export interface ActivePromptPublisher extends ActivePromptSource {
-  publish: (seq: number | null) => void;
+  publish: (seq: number | null, isPromptScrolledAbove?: boolean) => void;
 }
 
 /**
  * The transcript reports its reading position on every scroll frame, far more often than
- * it re-renders. Keeping the active prompt outside React lets the rail subscribe to it
- * without dragging the transcript through a render on each frame.
+ * it re-renders. The rail and the prompt bar subscribe here so reading position updates
+ * don't re-render the transcript.
  */
 export function createActivePromptPublisher(): ActivePromptPublisher {
   const listeners = new Set<() => void>();
-  let activeSeq: number | null = null;
+  let readingState: ActivePromptReadingState = { activeSeq: null, isPromptScrolledAbove: false };
   return {
     subscribe(listener) {
       listeners.add(listener);
@@ -71,12 +92,16 @@ export function createActivePromptPublisher(): ActivePromptPublisher {
         listeners.delete(listener);
       };
     },
-    getActiveSeq: () => activeSeq,
-    publish(seq) {
-      if (seq === activeSeq) {
+    getActiveSeq: () => readingState.activeSeq,
+    getReadingState: () => readingState,
+    publish(seq, isPromptScrolledAbove = false) {
+      if (
+        seq === readingState.activeSeq &&
+        isPromptScrolledAbove === readingState.isPromptScrolledAbove
+      ) {
         return;
       }
-      activeSeq = seq;
+      readingState = { activeSeq: seq, isPromptScrolledAbove };
       for (const listener of listeners) {
         listener();
       }

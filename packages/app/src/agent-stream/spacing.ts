@@ -26,11 +26,11 @@ export function getGapBetweenStreamItems(
     return 0;
   }
 
-  if (isUserMessageItem(item) && isUserMessageItem(belowItem)) {
-    return SPACING[1];
-  }
   if (isUserMessageItem(item)) {
-    return SPACING[4];
+    return isUserMessageItem(belowItem) ? SPACING[1] : SPACING[4];
+  }
+  if (isUserMessageItem(belowItem)) {
+    return SPACING[8];
   }
   if (isWorkItem(item) && isWorkItem(belowItem)) {
     return 0;

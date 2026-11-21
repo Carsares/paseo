@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import type { AgentTimelinePromptIndexPayload } from "@getpaseo/client/internal/daemon-client";
-import { isWeb } from "@/constants/platform";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { planTimelinePromptJump } from "@/timeline/timeline-sync-plan";
@@ -8,7 +7,7 @@ import type { StreamItem } from "@/types/stream";
 import type { StreamViewportHandle } from "../strategy";
 import {
   createActivePromptPublisher,
-  resolveActivePromptSeq,
+  resolveActivePromptReadingState,
   shouldAcceptPromptIndexEpoch,
   type ActivePromptSource,
   type ChatOutlinePrompt,
@@ -42,7 +41,7 @@ export interface ChatOutline {
   prompts: ChatOutlinePrompt[];
   activePrompt: ActivePromptSource;
   jumpToPrompt: (seq: number) => void;
-  reportReadingPosition: (seq: number | null) => void;
+  reportReadingPosition: (seq: number | null, isReadingPromptRow?: boolean) => void;
 }
 
 function latestPromptSeqIn(items: StreamItem[], timelineEpoch: string | null): number {
@@ -75,16 +74,28 @@ export function useChatOutline({
   mountedHistoryMessageIds,
   revealLoadedMessage,
 }: UseChatOutlineInput): ChatOutline {
-  const [index, setIndex] = useState<AgentTimelinePromptIndexPayload | null>(null);
+  const timeline = useMemo(
+    () => ({ agentId, serverId, timelineEpoch }),
+    [agentId, serverId, timelineEpoch],
+  );
+  const [indexedTimeline, setIndexedTimeline] = useState<{
+    timeline: typeof timeline;
+    index: AgentTimelinePromptIndexPayload;
+  } | null>(null);
   const [pendingJump, setPendingJump] = useState<PendingPromptJump | null>(null);
   const [activePrompt] = useState(createActivePromptPublisher);
-  const readingSeqRef = useRef<number | null>(null);
+  const readingPosition = useRef<{
+    timeline: typeof timeline;
+    seq: number | null;
+    isPromptRow: boolean;
+  } | null>(null);
   const nextJumpRequestIdRef = useRef(0);
   const nextIndexRequestIdRef = useRef(0);
-  // A disabled outline (every native viewport) must not pay for the timeline per delta.
+  // A disabled outline skips the timeline scan on each delta.
   const loadedTail = enabled ? tail : NO_STREAM_ITEMS;
   const loadedHead = enabled ? (head ?? NO_STREAM_ITEMS) : NO_STREAM_ITEMS;
-  const prompts = enabled ? (index?.prompts ?? NO_PROMPTS) : NO_PROMPTS;
+  const index = enabled && indexedTimeline?.timeline === timeline ? indexedTimeline.index : null;
+  const prompts = index?.prompts ?? NO_PROMPTS;
 
   // The viewed timeline already owns live delivery and reconnect catch-up. Its complete
   // loaded items (including rows outside the mounted window) invalidate the prompt index.
@@ -95,29 +106,28 @@ export function useChatOutline({
   );
   const latestPromptSeq = Math.max(tailPromptSeq, latestPromptSeqIn(loadedHead, timelineEpoch));
 
-  useEffect(() => setIndex(null), [agentId, enabled, serverId, timelineEpoch]);
-
   // Only a timeline the daemon has served can be indexed. A draft's optimistic stream has no
   // epoch, and its id names no agent the daemon knows.
   useEffect(() => {
-    if (!isWeb || !enabled || timelineEpoch === null) {
-      setIndex(null);
+    const epoch = timeline.timelineEpoch;
+    if (!enabled || epoch === null) {
+      setIndexedTimeline(null);
       return;
     }
-    const client = getHostRuntimeStore().getClient(serverId);
+    const client = getHostRuntimeStore().getClient(timeline.serverId);
     if (!client) return;
     let active = true;
     const refresh = () => {
       const requestId = ++nextIndexRequestIdRef.current;
       void client
-        .listAgentTimelinePrompts(agentId)
+        .listAgentTimelinePrompts(timeline.agentId)
         .then((payload) => {
           if (
             active &&
             requestId === nextIndexRequestIdRef.current &&
-            shouldAcceptPromptIndexEpoch(timelineEpoch, payload.epoch)
+            shouldAcceptPromptIndexEpoch(epoch, payload.epoch)
           ) {
-            setIndex(payload);
+            setIndexedTimeline({ timeline, index: payload });
           }
           return undefined;
         })
@@ -127,31 +137,49 @@ export function useChatOutline({
     return () => {
       active = false;
     };
-  }, [agentId, enabled, serverId, timelineEpoch, latestPromptSeq]);
+  }, [enabled, latestPromptSeq, timeline]);
 
   // The transcript resolves display rows (including Markdown blocks and plugin cards) to
   // timeline positions. The outline uses the complete index, including unloaded prompts.
   const publishActivePrompt = useStableEvent(() => {
-    activePrompt.publish(resolveActivePromptSeq(prompts, readingSeqRef.current));
+    const reading = readingPosition.current;
+    if (reading?.timeline !== timeline) {
+      activePrompt.publish(null);
+      return;
+    }
+    const { activeSeq, isPromptScrolledAbove } = resolveActivePromptReadingState(
+      prompts,
+      reading.seq,
+      reading.isPromptRow,
+    );
+    activePrompt.publish(activeSeq, isPromptScrolledAbove);
   });
 
-  const reportReadingPosition = useStableEvent((seq: number | null) => {
-    readingSeqRef.current = seq;
-    publishActivePrompt();
-  });
+  const reportReadingPosition = useStableEvent(
+    (seq: number | null, isPromptRow: boolean = false) => {
+      const current = readingPosition.current;
+      if (
+        current?.timeline === timeline &&
+        current.seq === seq &&
+        current.isPromptRow === isPromptRow
+      ) {
+        return;
+      }
+      readingPosition.current = { timeline, seq, isPromptRow };
+      publishActivePrompt();
+    },
+  );
 
   useEffect(() => {
     nextJumpRequestIdRef.current += 1;
     setPendingJump(null);
-    readingSeqRef.current = null;
-    activePrompt.publish(null);
-  }, [activePrompt, agentId, timelineEpoch]);
+  }, [timeline]);
 
   // The transcript reports its reading position long before the index arrives, and a reader
   // who never scrolls would otherwise sit on an unmarked rail.
   useEffect(() => {
     publishActivePrompt();
-  }, [prompts, publishActivePrompt]);
+  }, [prompts, publishActivePrompt, timeline]);
 
   useEffect(() => {
     if (pendingJump === null) return;

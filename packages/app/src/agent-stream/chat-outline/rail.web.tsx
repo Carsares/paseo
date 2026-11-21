@@ -1,19 +1,21 @@
 import { memo, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import { Pressable, Text, View, type PointerEvent as RNPointerEvent } from "react-native";
+import { Text, View, type PointerEvent as RNPointerEvent } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { useReducedMotion } from "react-native-reanimated";
+import { PressHighlight } from "@/components/ui/press-highlight";
 import { useContainerWidthBelow } from "@/hooks/use-container-width";
 import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import { createChatOutlineHoverIntent } from "./hover-intent";
 import { promptTickMagnification } from "./model";
 import type { ChatOutlineRailProps } from "./rail";
 
-// Hover tracking lives on the rail and the slots, never on the Pressable inside them:
+// Hover tracking lives on the rail and the slots, outside the press target:
 // magnifying a slot must not move the box the pointer is resting on. See docs/hover.md.
 const RAIL_WIDTH = 36;
 const SLOT_HEIGHT = 8;
 const MIN_PANEL_WIDTH = 918;
 const RESTING_PILL_HEIGHT = 2;
+const ACTIVE_PILL_HEIGHT = 3;
 const MAGNIFIED_PILL_HEIGHT = 4;
 const RESTING_PILL_WIDTH = 10;
 const ACTIVE_PILL_WIDTH = 18;
@@ -149,12 +151,12 @@ const ChatOutlineTick = memo(function ChatOutlineTick({
   // target out from under the pointer.
   const restingWidth = isActive ? ACTIVE_PILL_WIDTH : RESTING_PILL_WIDTH;
   const pillWidth = restingWidth + magnification * (MAGNIFIED_PILL_WIDTH - restingWidth);
-  const pillHeight =
-    RESTING_PILL_HEIGHT + magnification * (MAGNIFIED_PILL_HEIGHT - RESTING_PILL_HEIGHT);
+  const baseHeight = isActive ? ACTIVE_PILL_HEIGHT : RESTING_PILL_HEIGHT;
+  const pillHeight = baseHeight + magnification * (MAGNIFIED_PILL_HEIGHT - baseHeight);
 
   return (
     <View style={styles.slot} onPointerEnter={handlePointerEnter}>
-      <Pressable
+      <PressHighlight
         style={styles.target}
         onPress={handlePress}
         onFocus={handleFocus}
@@ -172,7 +174,7 @@ const ChatOutlineTick = memo(function ChatOutlineTick({
             inlineUnistylesStyle({ width: pillWidth, height: pillHeight }),
           ]}
         />
-      </Pressable>
+      </PressHighlight>
       {hasAttention ? (
         <View style={styles.preview} pointerEvents="none" aria-hidden testID="chat-outline-preview">
           <Text style={styles.previewText} numberOfLines={2}>
@@ -228,7 +230,7 @@ const styles = StyleSheet.create((theme) => ({
     transitionTimingFunction: "ease-out",
   },
   pillActive: {
-    backgroundColor: theme.colors.foregroundExtraMuted,
+    backgroundColor: theme.colors.accentBright,
   },
   pillAttention: {
     backgroundColor: theme.colors.foreground,
