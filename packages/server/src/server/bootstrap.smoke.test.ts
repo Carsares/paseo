@@ -1245,6 +1245,166 @@ describe("paseo daemon bootstrap", () => {
     20_000,
   );
 
+  test.each(["authorized", "detached", "archived", "withdrawn"] as const)(
+    "cold /compact load failure keeps only authorized queued content (%s)",
+    async (policy) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paseo-cold-command-"));
+      const handles: Awaited<ReturnType<typeof createTestPaseoDaemon>>[] = [];
+      const failingResume = Promise.withResolvers<void>();
+      const releaseFailure = Promise.withResolvers<void>();
+      const send = Promise.withResolvers<{ settled: Promise<void> }>();
+      const sockets: VoiceAssistantWebSocketServer[] = [];
+      const compactStarts: string[] = [];
+      const accepting = VoiceAssistantWebSocketServer.prototype.beginAcceptingConnections;
+      vi.spyOn(
+        VoiceAssistantWebSocketServer.prototype,
+        "beginAcceptingConnections",
+      ).mockImplementation(function (this: VoiceAssistantWebSocketServer) {
+        accepting.call(this);
+        sockets.push(this);
+      });
+      const sendQueued = MessageReceipts.prototype.sendQueued;
+      vi.spyOn(MessageReceipts.prototype, "sendQueued").mockImplementation(
+        function (this: MessageReceipts, input) {
+          const settled = sendQueued.call(this, input);
+          if (input.message.prompt === "/compact") {
+            void settled.catch(ignoreError);
+            send.resolve({ settled });
+          }
+          return settled;
+        },
+      );
+      const open = async (agentClients: PaseoDaemonConfig["agentClients"]) => {
+        const handle = await createTestPaseoDaemon({
+          paseoHomeRoot: root,
+          staticDir: root,
+          cleanup: false,
+          resumeOnStartup: false,
+          agentClients,
+        });
+        handles.push(handle);
+        return handle;
+      };
+      const codex = (phase: "failure" | "replay" | "dedupe") =>
+        localCodexClient(root, () =>
+          createFakeCodexAppServer({
+            "thread/resume": async () => {
+              if (phase === "failure") {
+                failingResume.resolve();
+                await releaseFailure.promise;
+                return {
+                  __jsonRpcError: { code: -32603, message: "Thread temporarily unavailable" },
+                };
+              }
+              return {};
+            },
+            "thread/compact/start": () => {
+              compactStarts.push(phase);
+              return {};
+            },
+          }),
+        );
+      const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+      const { StreamableHTTPClientTransport } =
+        await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+      const mcp = new Client({ name: "cold-command-test", version: "1" });
+      try {
+        const first = await open(createTestAgentClients());
+        const manager = first.daemon.agentManager;
+        const parent = await manager.createAgent({ provider: "claude", cwd: root }, undefined, {
+          workspaceId: undefined,
+        });
+        const child = await manager.createAgent({ provider: "codex", cwd: root }, undefined, {
+          workspaceId: undefined,
+          labels: { "paseo.parent-agent-id": parent.id },
+        });
+        await manager.runAgent(child.id, "Establish a persisted session");
+        await first.close();
+        const second = await open({ ...createTestAgentClients(), codex: codex("failure") });
+        const storage = second.daemon.agentStorage;
+        const stored = (await storage.get(child.id))!;
+        expect(stored).toMatchObject({
+          persistence: { provider: "codex", sessionId: expect.any(String) },
+        });
+        expect(second.daemon.agentManager.getAgent(child.id)).toBeNull();
+        await ensureAgentLoaded(parent.id, {
+          agentManager: second.daemon.agentManager,
+          agentStorage: storage,
+          logger: pino({ level: "silent" }),
+        });
+
+        await mcp.connect(
+          new StreamableHTTPClientTransport(
+            new URL(`http://127.0.0.1:${second.port}/mcp/agents?callerAgentId=${parent.id}`),
+          ),
+        );
+        const accepted = await mcp.callTool({
+          name: "send_agent_prompt",
+          arguments: { agentId: child.id, prompt: "/compact", notifyOnFinish: false },
+        });
+        expect(accepted.structuredContent).toMatchObject({
+          success: true,
+          deliveryStatus: "queued",
+          messageId: expect.any(String),
+        });
+        const directory = path.join(second.paseoHome, "agent-requests");
+        const [file] = await readdir(directory);
+        const readDisk = async () =>
+          JSON.parse(await readFile(path.join(directory, file!), "utf8"));
+        await failingResume.promise;
+        const admitted = await readDisk();
+        expect(admitted).toMatchObject({
+          agentId: child.id,
+          state: "pending",
+          queued: {
+            sequence: expect.any(Number),
+            message: {
+              messageId: accepted.structuredContent?.messageId,
+              prompt: "/compact",
+              directParent: { agentId: parent.id, serverId: second.daemon.getServerId() },
+            },
+          },
+        });
+
+        if (policy === "detached") {
+          await storage.upsert({ ...stored, labels: {} });
+        } else if (policy === "archived") {
+          await storage.upsert({ ...stored, archivedAt: new Date().toISOString() });
+        } else if (policy === "withdrawn") {
+          expect(sockets[1]!.agentMessages.withdrawPending(child.id, () => true)).toBe(1);
+        }
+        releaseFailure.resolve();
+        const { settled } = await send.promise;
+        await expect(settled).rejects.toThrow();
+        expect(compactStarts).toEqual([]);
+        expect(await readDisk()).toEqual(
+          policy === "authorized"
+            ? admitted
+            : { agentId: child.id, fingerprint: admitted.fingerprint, state: "pending" },
+        );
+        await mcp.close();
+        await second.close();
+
+        const third = await open({ codex: codex("replay") });
+        await third.close();
+        expect(await readDisk()).toEqual({
+          agentId: child.id,
+          fingerprint: admitted.fingerprint,
+          state: policy === "authorized" ? "completed" : "pending",
+        });
+        const fourth = await open({ codex: codex("dedupe") });
+        await fourth.close();
+        expect(compactStarts).toEqual(policy === "authorized" ? ["replay"] : []);
+      } finally {
+        releaseFailure.resolve();
+        await mcp.close();
+        for (const handle of handles.toReversed()) await handle.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
+
   test("ordinary shutdown restores non-steerable queued messages in order before new ingress", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paseo-queue-recovery-"));
     const running = Promise.withResolvers<void>();

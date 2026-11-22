@@ -5,7 +5,7 @@ import type { AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import { ForegroundPromptStart } from "./agent-run-state.js";
 import type { AgentStorage } from "./agent-storage.js";
-import { ensureAgentLoaded } from "./agent-loading.js";
+import { AgentNotFoundError, ensureAgentLoaded } from "./agent-loading.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
 import type { QueueHandoff } from "../message-receipts/index.js";
@@ -26,6 +26,13 @@ export type AgentRunController = Pick<
 };
 
 export class AgentTurnBusyError extends Error {}
+
+export class QueuedPromptLoadError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "QueuedPromptLoadError";
+  }
+}
 
 export interface StartAgentRunOptions {
   idleOnly?: boolean;
@@ -449,6 +456,25 @@ function createAdmitSteer({
   };
 }
 
+async function classifyPromptLoadFailure(
+  params: Pick<
+    SendPromptToAgentParams,
+    "agentId" | "agentStorage" | "assertDispatchAllowed" | "handoff" | "validateDispatch"
+  >,
+  error: unknown,
+): Promise<unknown> {
+  if (!params.handoff || error instanceof AgentNotFoundError) return error;
+
+  // Loading can take long enough for archive or parent authority to change.
+  // Retain the prompt only if it is still eligible and never reached handoff.
+  const latest = await params.agentStorage.get(params.agentId);
+  if (!latest) return new AgentNotFoundError(params.agentId);
+  if (latest.archivedAt) return new Error(`Agent is archived: ${params.agentId}`, { cause: error });
+  await params.validateDispatch?.();
+  params.assertDispatchAllowed?.();
+  return new QueuedPromptLoadError(error);
+}
+
 /** Dispatch daemon-prepared context without reclassifying it as human input. */
 export async function sendPreparedPromptToAgent(
   params: Omit<SendPromptToAgentParams, "source" | "messageId">,
@@ -478,7 +504,7 @@ export async function sendPreparedPromptToAgent(
     if (archivedAtToRestore) {
       await params.agentManager.archiveSnapshot(params.agentId, archivedAtToRestore);
     }
-    throw error;
+    throw await classifyPromptLoadFailure(params, error);
   }
 
   params.assertDispatchAllowed?.();

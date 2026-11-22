@@ -79,6 +79,16 @@ const { nativeUpdater, updateSource } = await vi.hoisted(async () => {
 
 const approvedUpdate = { version: "1.2.4" };
 
+function rejectNativeCodeSignature(code: number): void {
+  nativeUpdater.emit(
+    "error",
+    Object.assign(new Error("Code signature validation failed"), {
+      domain: "SQRLCodeSignatureErrorDomain",
+      code,
+    }),
+  );
+}
+
 vi.mock("node:os", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:os")>()),
   // Keep PID-lock checks independent of the host boot time and sandbox syscalls.
@@ -448,6 +458,7 @@ describe("daemon-manager commands", () => {
     shouldRestore: boolean;
     zipErrorCode?: number;
     quitsDuringPreparation?: boolean;
+    emitTerminal?: () => void;
   }>([
     { outcome: "unavailable", shouldRestore: true },
     { outcome: "failed HTTP download", shouldRestore: true },
@@ -462,6 +473,45 @@ describe("daemon-manager commands", () => {
       zipErrorCode: 1,
       quitsDuringPreparation: true,
     },
+    {
+      outcome: "rejected code signature",
+      shouldRestore: true,
+      emitTerminal: () => rejectNativeCodeSignature(-1),
+    },
+    {
+      outcome: "other code signature error",
+      shouldRestore: false,
+      emitTerminal: () => rejectNativeCodeSignature(-2),
+    },
+    {
+      outcome: "rejected code signature during quit",
+      shouldRestore: false,
+      quitsDuringPreparation: true,
+      emitTerminal: () => rejectNativeCodeSignature(-1),
+    },
+    {
+      outcome: "other feed staged then rejected code signature",
+      shouldRestore: false,
+      emitTerminal: () => {
+        nativeUpdater.emit(
+          "update-downloaded",
+          {},
+          "",
+          "",
+          new Date(0),
+          "http://127.0.0.1:32101/update.zip",
+        );
+        rejectNativeCodeSignature(-1);
+      },
+    },
+    {
+      outcome: "rejected code signature after feed replacement",
+      shouldRestore: false,
+      emitTerminal: () => {
+        nativeUpdater.getFeedURL.mockReturnValue("http://127.0.0.1:32101");
+        rejectNativeCodeSignature(-1);
+      },
+    },
     { outcome: "no native terminal event", shouldRestore: false },
     { outcome: "error", shouldRestore: false },
     { outcome: "ready", shouldRestore: false },
@@ -470,7 +520,7 @@ describe("daemon-manager commands", () => {
     { outcome: "unavailable during quit", shouldRestore: false, quitsDuringPreparation: true },
   ])(
     "handles a timed-out manual macOS update: $outcome",
-    async ({ outcome, shouldRestore, zipErrorCode, quitsDuringPreparation }) => {
+    async ({ outcome, shouldRestore, zipErrorCode, quitsDuringPreparation, emitTerminal }) => {
       const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
       Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -580,7 +630,9 @@ describe("daemon-manager commands", () => {
           expect(lifecycle.isQuitting()).toBe(true);
           expect(exit).not.toHaveBeenCalled();
         }
-        if (outcome === "error") {
+        if (emitTerminal) {
+          emitTerminal();
+        } else if (outcome === "error") {
           nativeUpdater.emit("error", new Error("Native preparation failed"));
         } else if (outcome === "failed HTTP download") {
           nativeUpdater.emit(

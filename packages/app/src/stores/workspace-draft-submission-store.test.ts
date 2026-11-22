@@ -134,18 +134,18 @@ test("a new process restores a fork's host and boundary without replaying pendin
     metadata: { issue: "PAS-101" },
   } satisfies StoreModule.ForkWorktreeSubmission;
   await expect(
-    reader.getState().reserveForkWorktree({
+    reader.getState().recordForkSubmission({
       draftId: fork.draftId,
       serverId: "host-2",
-      submission: { ...submission, source: { ...submission.source, worktreeSlug: "wrong-host" } },
+      worktree: { ...submission, source: { ...submission.source, worktreeSlug: "wrong-host" } },
     }),
   ).rejects.toThrow("The Fork draft is not available on this host.");
   const setup = reader.getState().setupByDraftId[fork.draftId];
   await expect(
-    reader.getState().reserveForkWorktree({
+    reader.getState().recordForkSubmission({
       draftId: fork.draftId,
       serverId: fork.sourceServerId,
-      submission,
+      worktree: submission,
     }),
   ).resolves.toBe("first-worktree");
   expect(reader.getState().setupByDraftId[fork.draftId]).toBe(setup);
@@ -158,10 +158,10 @@ test("a new process restores a fork's host and boundary without replaying pendin
     worktreeSubmission: submission,
   });
   await expect(
-    reloaded.getState().reserveForkWorktree({
+    reloaded.getState().recordForkSubmission({
       draftId: fork.draftId,
       serverId: fork.sourceServerId,
-      submission: {
+      worktree: {
         ...submission,
         source: {
           ...submission.source,
@@ -239,15 +239,17 @@ test.each([false, true])(
         createMainAgent,
       },
     } satisfies StoreModule.ForkWorktreeSubmission;
-    await writer.getState().reserveForkWorktree({ draftId, serverId: sourceServerId, submission });
+    await writer
+      .getState()
+      .recordForkSubmission({ draftId, serverId: sourceServerId, worktree: submission });
 
     const reader = createWorkspaceDraftSubmissionStore(storage);
     await reader.getState().hydrateDraftSetup(draftId);
     await expect(
-      reader.getState().reserveForkWorktree({
+      reader.getState().recordForkSubmission({
         draftId,
         serverId: sourceServerId,
-        submission: {
+        worktree: {
           ...submission,
           agentIntent: {
             config: { provider: "claude", cwd: "/source", model: "edited-model" },
@@ -266,3 +268,56 @@ test.each([false, true])(
     });
   },
 );
+
+test("keeps the Local Fork intent when a later attempt selects a worktree", async () => {
+  const storage = createStorage();
+  const { createWorkspaceDraftSubmissionStore } = loadProductionStores();
+  const draftId = "local-fork";
+  const serverId = "fork-host";
+  const writer = createWorkspaceDraftSubmissionStore(storage);
+  await writer.getState().saveForkDraftSetup({
+    draftId,
+    sourceServerId: serverId,
+    sourceDirectory: "/repo",
+    setup: {
+      provider: "codex",
+      cwd: "/repo",
+      model: "source-model",
+      modeId: null,
+      thinkingOptionId: null,
+      providerOptions: {},
+      forkFrom: { sourceAgentId: "agent", boundaryMessageId: "message" },
+    },
+  });
+  const original = {
+    config: { provider: "codex", cwd: "/repo", model: "local-model" },
+    createMainAgent: false,
+  };
+  await writer.getState().recordForkSubmission({ draftId, serverId, agentIntent: original });
+
+  const reader = createWorkspaceDraftSubmissionStore(storage);
+  await reader.getState().hydrateDraftSetup(draftId);
+  await expect(
+    reader.getState().recordForkSubmission({
+      draftId,
+      serverId,
+      worktree: {
+        source: {
+          kind: "worktree",
+          cwd: "/repo",
+          projectId: "project",
+          worktreeSlug: "edited-worktree",
+        },
+        baseItem: null,
+        metadata: {},
+      },
+      agentIntent: { config: { ...original.config, model: "edited-model" }, createMainAgent: true },
+    }),
+  ).resolves.toBe("edited-worktree");
+  const reloaded = createWorkspaceDraftSubmissionStore(storage);
+  await reloaded.getState().hydrateDraftSetup(draftId);
+  expect(reloaded.getState().draftSetupStatusById[draftId]).toEqual({
+    sourceServerId: serverId,
+    agentIntent: original,
+  });
+});

@@ -463,6 +463,120 @@ test.describe("Timeline Fork", () => {
     });
   }
 
+  test("recovers an accepted Local Fork after a refresh and a default change in another tab", async ({
+    page,
+    seedForkWorkspace,
+  }) => {
+    const prompt = "Continue the accepted Local Fork.";
+    const changedPrompt = "Try a different first prompt.";
+    const filename = "accepted-local-fork.txt";
+    const creation = await holdInitialWorkspaceCreation(page);
+    const session = await seedForkWorkspace({
+      repoPrefix: "assistant-fork-accepted-local-",
+      title: "Accepted Local Fork",
+      initialPrompt: "emit 1 coalesced agent stream updates for the original Local Fork turn.",
+      model: "ten-second-stream",
+    });
+    const knownWorkspaces = new Set(
+      (await session.client.fetchWorkspaces()).entries.map(({ id }) => id),
+    );
+    await openAgentRoute(page, session);
+    await awaitAssistantMessage(page);
+    expect((await session.client.waitForFinish(session.agentId, 45_000)).status).toBe("idle");
+    await forkMostRecentAssistantTurnToNewWorkspace(page);
+    await expect(page).toHaveURL(/\/new\?.*draftId=/);
+    const draftUrl = page.url();
+    const draftId = new URL(draftUrl).searchParams.get("draftId");
+    expect(draftId).toBeTruthy();
+    await selectWorkspaceIsolation(page, "local");
+    await expectWorkspaceIsolationSelected(page, "local");
+    await selectModel(page, "Max-only thinking stream");
+    await fillComposerDraft(page, prompt);
+    await dropFileOnComposer(page, {
+      name: filename,
+      mimeType: "text/plain",
+      buffer: Buffer.from("Retain the original Local Fork attachment."),
+    });
+    const attachment = page.getByTestId("composer-file-attachment-pill");
+    await expect(attachment).toContainText(filename);
+    const submit = page.getByTestId("workspace-create-submit");
+    await submit.click();
+
+    const receipt = await creation.accepted;
+    const first = creation.requests[0]!;
+    expect(receipt).toMatchObject({ idempotencyKey: draftId, agentId: expect.any(String) });
+    expect(first).toMatchObject({
+      idempotencyKey: draftId,
+      source: { kind: "directory", path: session.cwd },
+      agent: {
+        config: { model: "max-only-thinking-stream" },
+        forkFrom: { sourceAgentId: session.agentId, boundaryMessageId: expect.any(String) },
+        initialPrompt: prompt,
+      },
+    });
+    expect(first.mainAgent).toBeUndefined();
+    await expect(page).toHaveURL(draftUrl);
+
+    creation.allowRetry();
+    await page.reload();
+    await expectComposerDraft(page, prompt);
+    await expect(attachment).toContainText(filename);
+    await expectWorkspaceIsolationSelected(page, "local");
+    await fillComposerDraft(page, changedPrompt);
+    await submit.click();
+    const conflict = page.getByText("workspace_request_key_conflict", { exact: true }).first();
+    await expect(conflict).toBeVisible();
+    expect(creation.requests[1]).toMatchObject({
+      idempotencyKey: draftId,
+      source: first.source,
+      agent: { initialPrompt: changedPrompt },
+    });
+    await expectComposerDraft(page, changedPrompt);
+    await expect(attachment).toContainText(filename);
+    await fillComposerDraft(page, prompt);
+
+    const settings = await page.context().newPage();
+    await settings.route(/:6767\b/, (route) => route.abort());
+    await settings.routeWebSocket(/:6767\b/, (socket) => socket.close());
+    await settings.goto(new URL("/settings/chat", draftUrl).href);
+    const toggle = settings.getByRole("switch", { name: "Default main tab for new workspaces" });
+    await expect(toggle).toHaveAttribute("aria-checked", "false");
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-checked", "true");
+    await settings.reload();
+    await expect(toggle).toHaveAttribute("aria-checked", "true");
+    await settings.close();
+
+    await page.reload();
+    await expectComposerDraft(page, prompt);
+    await expect(attachment).toContainText(filename);
+    await expectWorkspaceIsolationSelected(page, "local");
+    await submit.click();
+    await expect.poll(() => creation.requests.length).toBe(3);
+    const selectedTab = page.getByTestId(`workspace-tab-agent_${receipt.agentId}`);
+    await expect(selectedTab.or(conflict)).toBeVisible({ timeout: 30_000 });
+    await expect(conflict).toBeHidden();
+    await expect(selectedTab).toHaveAttribute("aria-selected", "true");
+    const { requestId: _firstRequestId, ...acceptedIntent } = first;
+    const { requestId: _retryRequestId, ...retryIntent } = creation.requests[2]!;
+    expect(retryIntent).toEqual(acceptedIntent);
+    const initialMessage = page.getByTestId("user-message").filter({ hasText: prompt });
+    await expect(initialMessage).toHaveCount(1);
+    await expect(initialMessage).toContainText(filename);
+    await expect.poll(() => readStoredForkDraft(page, draftId)).toBeNull();
+
+    const created = (await session.client.fetchWorkspaces()).entries.filter(
+      ({ id }) => !knownWorkspaces.has(id),
+    );
+    expect(created).toMatchObject([{ id: receipt.workspaceId, workspaceDirectory: session.cwd }]);
+    const agents = (await session.client.fetchAgents()).entries
+      .map(({ agent }) => agent)
+      .filter(({ workspaceId }) => workspaceId === receipt.workspaceId);
+    expect(agents.map(({ id, model }) => ({ id, model }))).toEqual([
+      { id: receipt.agentId, model: "max-only-thinking-stream" },
+    ]);
+  });
+
   test("restores the selected Fork boundary before submitting a refreshed workspace draft", async ({
     page,
     seedForkWorkspace,

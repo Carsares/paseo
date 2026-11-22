@@ -11,6 +11,7 @@ import type { HostDirectory } from "@getpaseo/protocol/hosts";
 import { AgentFinishReportSchema } from "@getpaseo/protocol/messages";
 import { AgentTurnStartRejectedError } from "../agent/agent-sdk-types.js";
 import { StaleProviderSessionError } from "../agent/stale-provider-session-error.js";
+import { createJsonFinishSubscriptionStore } from "../agent/finish-subscriptions/internal/json-store.js";
 
 const cleanup: (() => Promise<unknown>)[] = [];
 
@@ -1155,6 +1156,7 @@ async function hostWire(
   options: {
     legacyFlowControl?: boolean;
     withoutHierarchyControl?: boolean;
+    delegationCapabilities?: "legacy route" | "no dispatch confirmation";
     omitReportAcknowledgments?: () => boolean;
     omitSendConfirmation?: boolean;
     omitAgentCreationResponse?: () => boolean;
@@ -1164,6 +1166,26 @@ async function hostWire(
   const wss = new WebSocketServer({ server: http });
   const frames: { binary: boolean; bytes: Buffer; direction: "toB" | "fromB" }[] = [];
   let connections = 0;
+  function olderServerInfo(bytes: Buffer): Buffer {
+    const envelope = JSON.parse(bytes.toString());
+    if (envelope.message?.type !== "hosts.route.frame") return bytes;
+    const inner = JSON.parse(envelope.message.payload.data);
+    const payload = inner.message?.payload;
+    if (payload?.status !== "server_info") return bytes;
+    if (options.withoutHierarchyControl || options.delegationCapabilities === "legacy route")
+      delete payload.features.agentHierarchyControl;
+    if (options.delegationCapabilities) {
+      delete payload.features.agentMessageDispatchConfirmation;
+      delete payload.features.agentDirectParentQueuedDelivery;
+      delete payload.features.agentFinishReportPull;
+      delete payload.features.agentExplicitParentReports;
+      delete payload.features.agentTrackRemoteParentReports;
+      if (options.delegationCapabilities === "legacy route")
+        payload.sourceId = payload.sourceId?.replace(/:direct-parent$/, "");
+    }
+    envelope.message.payload.data = JSON.stringify(inner);
+    return Buffer.from(JSON.stringify(envelope));
+  }
   wss.on("connection", (downstream) => {
     connections++;
     const upstream = new WebSocket(`ws://127.0.0.1:${b.port}/ws`);
@@ -1210,16 +1232,8 @@ async function hostWire(
           if (inner.message?.type === "send_agent_message_response") return;
         }
       }
-      if (options.withoutHierarchyControl && !binary) {
-        const envelope = JSON.parse(bytes.toString());
-        if (envelope.type === "session" && envelope.message.type === "hosts.route.frame") {
-          const inner = JSON.parse(envelope.message.payload.data);
-          if (inner.message?.payload?.status === "server_info") {
-            delete inner.message.payload.features.agentHierarchyControl;
-            envelope.message.payload.data = JSON.stringify(inner);
-            bytes = Buffer.from(JSON.stringify(envelope));
-          }
-        }
+      if ((options.withoutHierarchyControl || options.delegationCapabilities) && !binary) {
+        bytes = olderServerInfo(bytes);
       }
       frames.push({ binary, bytes, direction: "fromB" });
       if (!binary && options.omitAgentCreationResponse?.() && isAgentCreationResponseFrame(bytes))
@@ -2903,6 +2917,108 @@ test.each([
   expect(parentPrompts).toHaveLength(2);
 });
 
+test.each(["legacy route", "no dispatch confirmation"] as const)(
+  "ordinary remote delegation keeps qualified prompts and finish notifications with %s",
+  { timeout: 30000 },
+  async (delegationCapabilities) => {
+    const parentPrompts: string[] = [];
+    const childPrompts: string[] = [];
+    const a = await daemon({
+      agentClients: createTestAgentClients({
+        onStartTurn: (prompt) => parentPrompts.push(String(prompt)),
+      }),
+    });
+    const b = await daemon({
+      agentClients: createTestAgentClients({
+        onStartTurn: (prompt) => childPrompts.push(String(prompt)),
+      }),
+    });
+    const wire = await hostWire(b, { delegationCapabilities });
+    const origin = await api(a);
+    const destination = await api(b);
+    await origin.paseo.hosts.add({ connection: wire.connection });
+    const directory = await online(origin.paseo);
+    const serverId = directory.hosts[0]!.serverId!;
+    const workspace = await origin.paseo.workspaces.create({
+      source: { kind: "directory", path: a.staticDir },
+    });
+    const remoteWorkspace = await destination.paseo.workspaces.create({
+      source: { kind: "directory", path: b.staticDir },
+    });
+    const config = { provider: "claude/claude-test", modeId: "full-access" };
+    const parent = await workspace.agents.create({ config });
+    const tools = new Client({ name: "legacy-delegation", version: "1" });
+    cleanup.push(() => tools.close());
+    await tools.connect(
+      new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${a.port}/mcp/agents?callerAgentId=${parent.id}`),
+      ),
+    );
+    const creation = await tools.callTool({
+      name: "create_agent",
+      arguments: {
+        serverId,
+        workspaceId: remoteWorkspace.id,
+        provider: config.provider,
+        title: "Ordinary remote child",
+        initialPrompt: "Initialize child",
+        notifyOnFinish: false,
+        settings: { modeId: config.modeId },
+      },
+    });
+    expect(creation.isError, JSON.stringify(creation)).not.toBe(true);
+    const { agentId } = creation.structuredContent as { agentId: string };
+    expect((await destination.client.waitForFinish(agentId, 5000)).status).toBe("idle");
+    const sends = () =>
+      wire.frames
+        .filter(({ direction, binary }) => direction === "toB" && !binary)
+        .flatMap(({ bytes }) => {
+          const outer = JSON.parse(bytes.toString());
+          if (outer.message?.type !== "hosts.route.frame.request") return [];
+          const inner = JSON.parse(outer.message.data);
+          return inner.message?.type === "send_agent_message_request" ? [inner.message] : [];
+        });
+
+    const prompt = "Run the ordinary delegated task";
+    const send = await tools.callTool({
+      name: "send_agent_prompt",
+      arguments: { serverId, agentId, prompt },
+    });
+    expect(send.isError, JSON.stringify(send)).not.toBe(true);
+    expect(send.structuredContent).toMatchObject({ success: true, deliveryStatus: "queued" });
+    expect(sends()).toEqual([
+      expect.objectContaining({
+        agentId,
+        text: prompt,
+        sourceAgentId: parent.id,
+        sourceAgentServerId: directory.self.serverId,
+      }),
+    ]);
+    expect(sends()[0]).not.toHaveProperty("waitForDispatch");
+    expect(sends()[0]).not.toHaveProperty("notifyDirectParentOnFinish");
+    await expect
+      .poll(() => childPrompts, { timeout: 10000 })
+      .toEqual([expect.stringContaining("Initialize child"), expect.stringContaining(prompt)]);
+    await expect
+      .poll(() => parentPrompts, { timeout: 10000 })
+      .toEqual([expect.stringContaining('event="finished"')]);
+    expect(parentPrompts[0]).toContain(`source-agent-id="${agentId}"`);
+    expect(parentPrompts[0]).toContain(`source-server-id="${serverId}"`);
+
+    // Main Control uses stricter delivery for this same child on the same saved connection.
+    await origin.client.setAgentMainControl(parent.id, true);
+    const restricted = await tools.callTool({
+      name: "send_agent_prompt",
+      arguments: { serverId, agentId, prompt: "Delegate with Main Control" },
+    });
+    expect(restricted).toMatchObject({
+      isError: true,
+      structuredContent: { error: expect.stringContaining("Update the") },
+    });
+    expect(sends()).toHaveLength(1);
+  },
+);
+
 test("only Level-2 remote creation requires destination hierarchy support", async () => {
   const a = await daemon({ mcpEnabled: true });
   const b = await daemon();
@@ -3366,8 +3482,8 @@ test(
       arguments: { serverId, agentId: child.id, prompt: "Never sent" },
     });
     expect(response.isError).toBe(true);
-    const records = () =>
-      readFile(join(a.paseoHome, "finish-subscriptions.json"), "utf8").then(JSON.parse);
+    // A rejected send need not write the store. Read a fresh view for each assertion.
+    const records = () => createJsonFinishSubscriptionStore(a.paseoHome).list();
     expect(await records()).toEqual([]);
     await origin.paseo.hosts.update(saved.registrationId, { enabled: true });
     await online(origin.paseo);

@@ -169,6 +169,11 @@ function isMacUpdatePreparationFailure(error: unknown): boolean {
     return error.code === 1; // SQRLZipArchiverShellTaskFailed
   }
 
+  // Squirrel rejects an invalid signature before writing the install request.
+  if (error.domain === "SQRLCodeSignatureErrorDomain") {
+    return error.code === -1; // SQRLCodeSignatureErrorDidNotPass
+  }
+
   // The native URL requests also finish before the local install handoff.
   // NSURLErrorTimedOut and NSURLErrorNetworkConnectionLost
   return error.domain === "NSURLErrorDomain" && (error.code === -1001 || error.code === -1005);

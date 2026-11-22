@@ -37,7 +37,7 @@ export interface PendingWorkspaceDraftSetup {
   sourceDirectory?: string | null;
 }
 
-const ForkWorktreeAgentIntentSchema = z.object({
+const ForkAgentIntentSchema = z.object({
   config: WorkspaceCreateRequestSchema.shape.mainAgent.unwrap().shape.config.pick({
     provider: true,
     cwd: true,
@@ -49,7 +49,7 @@ const ForkWorktreeAgentIntentSchema = z.object({
   createMainAgent: z.boolean(),
 });
 
-export type ForkWorktreeAgentIntent = z.infer<typeof ForkWorktreeAgentIntentSchema>;
+export type ForkAgentIntent = z.infer<typeof ForkAgentIntentSchema>;
 
 const ForkWorktreeSubmissionSchema = z.object({
   source: WorkspaceCreateRequestSchema.shape.source.options[1].required({
@@ -71,7 +71,8 @@ const ForkWorktreeSubmissionSchema = z.object({
     ])
     .nullable(),
   metadata: z.record(z.string(), z.json()),
-  agentIntent: ForkWorktreeAgentIntentSchema.optional(),
+  // Older worktree drafts stored the agent intent alongside their checkout choices.
+  agentIntent: ForkAgentIntentSchema.optional(),
 });
 
 export type ForkWorktreeSubmission = z.infer<typeof ForkWorktreeSubmissionSchema>;
@@ -81,6 +82,7 @@ const StoredForkDraftSchema = z.object({
   sourceDirectory: z.string().nullable(),
   worktreeSlug: z.string().min(1).optional(),
   worktreeSubmission: ForkWorktreeSubmissionSchema.optional(),
+  agentIntent: ForkAgentIntentSchema.optional(),
   setup: z.object({
     provider: z.string().min(1),
     cwd: z.string().min(1),
@@ -99,7 +101,12 @@ type DraftSetupStatus =
       sourceServerId: string | null;
       worktreeSlug?: string;
       worktreeSubmission?: ForkWorktreeSubmission;
+      agentIntent?: ForkAgentIntent;
     };
+
+export function readForkAgentIntent(draft: Exclude<DraftSetupStatus, string> | null) {
+  return draft?.agentIntent ?? draft?.worktreeSubmission?.agentIntent;
+}
 
 interface WorkspaceDraftSubmissionState {
   pendingByDraftId: Record<string, PendingWorkspaceDraftSubmission>;
@@ -117,11 +124,12 @@ interface WorkspaceDraftSubmissionState {
       sourceServerId: string;
     },
   ) => Promise<void>;
-  reserveForkWorktree: (input: {
+  recordForkSubmission: (input: {
     draftId: string;
     serverId: string;
-    submission: ForkWorktreeSubmission;
-  }) => Promise<string>;
+    worktree?: ForkWorktreeSubmission;
+    agentIntent?: ForkAgentIntent;
+  }) => Promise<string | undefined>;
   hydrateDraftSetup: (draftId: string) => Promise<void>;
   clearDraftSetup: (input: { draftId: string }) => Promise<void>;
   consumePending: (input: {
@@ -198,52 +206,53 @@ export function createWorkspaceDraftSubmissionStore(
         };
       });
     },
-    reserveForkWorktree: async ({ draftId, serverId, submission }) => {
+    recordForkSubmission: async ({ draftId, serverId, worktree, agentIntent }) => {
       const id = normalizeDraftId(draftId);
       const status = get().draftSetupStatusById[id];
       if (typeof status !== "object" || status.sourceServerId !== serverId) {
         throw new Error("The Fork draft is not available on this host.");
       }
-      if (status.worktreeSubmission) return status.worktreeSubmission.source.worktreeSlug;
-      // Read the saved source here so this reservation doesn't replace the setup used
+      // Read the saved source here so this record doesn't replace the setup used
       // to track ownership of the composer's draft and attachments.
       const raw = await storage.getItem(forkDraftStorageKey(id));
       const stored = StoredForkDraftSchema.parse(raw === null ? null : JSON.parse(raw));
       if (stored.sourceServerId !== serverId || get().draftSetupStatusById[id] !== status) {
-        throw new Error("The Fork draft changed before the worktree was created.");
+        throw new Error("The Fork draft changed before it was submitted.");
       }
       const slug =
         stored.worktreeSubmission?.source.worktreeSlug ??
         stored.worktreeSlug ??
-        submission.source.worktreeSlug;
-      // Keep the first submitted source for recovery. Later edits still go to the host under
-      // the same request key so it can compare their intent against the accepted request.
-      const worktreeSubmission =
+        worktree?.source.worktreeSlug;
+      // Keep the first submission for recovery. Later edits go to the host under the
+      // same request key, where they can be compared with the accepted request.
+      if (readForkAgentIntent(stored)) return slug;
+      const savedWorktree =
         stored.worktreeSubmission ??
-        ForkWorktreeSubmissionSchema.parse({
-          ...submission,
-          source: { ...submission.source, worktreeSlug: slug },
-        });
-      if (!stored.worktreeSubmission) {
-        await storage.setItem(
-          forkDraftStorageKey(id),
-          JSON.stringify({ ...stored, worktreeSlug: slug, worktreeSubmission }),
-        );
-      }
-      set((state) =>
-        state.draftSetupStatusById[id] === status
-          ? {
-              draftSetupStatusById: {
-                ...state.draftSetupStatusById,
-                [id]: {
-                  ...status,
-                  worktreeSlug: slug,
-                  worktreeSubmission,
-                },
-              },
-            }
-          : state,
-      );
+        (worktree && slug
+          ? ForkWorktreeSubmissionSchema.parse({
+              ...worktree,
+              source: { ...worktree.source, worktreeSlug: slug },
+            })
+          : undefined);
+      const savedIntent = agentIntent && ForkAgentIntentSchema.parse(agentIntent);
+      if (!savedIntent && savedWorktree === stored.worktreeSubmission) return slug;
+      const submission = {
+        ...(savedWorktree && {
+          worktreeSlug: savedWorktree.source.worktreeSlug,
+          worktreeSubmission: savedWorktree,
+        }),
+        ...(savedIntent && { agentIntent: savedIntent }),
+      };
+      await storage.setItem(forkDraftStorageKey(id), JSON.stringify({ ...stored, ...submission }));
+      set((state) => {
+        if (state.draftSetupStatusById[id] !== status) return state;
+        return {
+          draftSetupStatusById: {
+            ...state.draftSetupStatusById,
+            [id]: { ...status, ...submission },
+          },
+        };
+      });
       return slug;
     },
     hydrateDraftSetup: async (draftId) => {
@@ -265,6 +274,7 @@ export function createWorkspaceDraftSubmissionStore(
             sourceServerId: stored.sourceServerId,
             ...(stored.worktreeSlug ? { worktreeSlug: stored.worktreeSlug } : {}),
             ...(stored.worktreeSubmission ? { worktreeSubmission: stored.worktreeSubmission } : {}),
+            ...(stored.agentIntent ? { agentIntent: stored.agentIntent } : {}),
           };
           pending = { setup: stored.setup, sourceDirectory: stored.sourceDirectory };
         }

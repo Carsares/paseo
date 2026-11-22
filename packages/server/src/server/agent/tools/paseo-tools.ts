@@ -850,11 +850,17 @@ function createToolCatalog(
     return parsed.success ? parsed.data.snapshot : null;
   }
 
+  interface OrchestrationCheck {
+    requireParentOwnership: boolean;
+    targetLabels?: HierarchyAgent["labels"];
+    allowLegacyDirectPrompt?: boolean;
+  }
+
   async function checkHierarchy(
     name: string,
     args: { agentId?: string; serverId?: string },
     context: PaseoToolExecutionContext,
-  ): Promise<{ requireParentOwnership: boolean; targetLabels?: HierarchyAgent["labels"] }> {
+  ): Promise<OrchestrationCheck> {
     const unrestricted = { requireParentOwnership: false };
     if (!callerAgentId) return unrestricted;
     const path = await readAgentHierarchyPath(callerAgentId, readHierarchyAgent);
@@ -900,7 +906,7 @@ function createToolCatalog(
     callerId: string,
     path: ReadonlyMap<string, HierarchyAgent>,
     context: PaseoToolExecutionContext,
-  ): Promise<{ requireParentOwnership: boolean; targetLabels?: HierarchyAgent["labels"] }> {
+  ): Promise<OrchestrationCheck> {
     const read = (id: string) => path.get(id);
     const singleHop = requiresSingleHopOrchestration(callerId, read);
     if (!singleHop && name !== "send_agent_prompt" && name !== "respond_to_permission")
@@ -920,7 +926,14 @@ function createToolCatalog(
         throw new PaseoToolInputError("You can only manage your direct subagents.");
       }
       // A prompt admitted as a parent's delegation must still belong to that parent at dispatch.
-      return { requireParentOwnership: directChild, targetLabels: targetSnapshot?.labels };
+      return {
+        requireParentOwnership: directChild,
+        targetLabels: targetSnapshot?.labels,
+        allowLegacyDirectPrompt:
+          name === "send_agent_prompt" &&
+          directChild &&
+          !isExplicitParentReportingLabels(targetSnapshot?.labels),
+      };
     }
     validateSingleHopOrchestration({
       callerAgentId: callerId,
@@ -1015,11 +1028,8 @@ function createToolCatalog(
       };
       handler = async ({ serverId, ...input }, context) => {
         const destination = serverId ?? options.serverId;
-        const { requireParentOwnership, targetLabels } = await checkHierarchy(
-          name,
-          { ...input, serverId },
-          context,
-        );
+        const { requireParentOwnership, targetLabels, allowLegacyDirectPrompt } =
+          await checkHierarchy(name, { ...input, serverId }, context);
         const restrictedSend = name === "send_agent_prompt" && requireParentOwnership;
         let remoteNotification: FinishRegistration | undefined;
         defaultRemotePromptNotification(name, destination, input, targetLabels);
@@ -1053,6 +1063,7 @@ function createToolCatalog(
                 );
               },
               restrictedSend || name === "respond_to_permission" ? callerAgentId : undefined,
+              allowLegacyDirectPrompt,
             );
           const response = await withRemoteChildReservation(name, destination, input, forward);
           if (response.isError) await remoteNotification?.reject();

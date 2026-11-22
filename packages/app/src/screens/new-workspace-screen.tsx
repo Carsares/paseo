@@ -1,4 +1,3 @@
-import equal from "fast-deep-equal";
 import { useAddHost } from "@/hosts/add-host";
 import type { CreateWorkspaceRequestOptions } from "@getpaseo/client/internal/daemon-client";
 import type { AgentSnapshotPayload, CreationSnapshot } from "@getpaseo/protocol/messages";
@@ -60,8 +59,9 @@ import { buildNewWorkspaceDraftKey, generateDraftId } from "@/stores/draft-keys"
 import { useOpenAddProject } from "@/hooks/use-open-add-project";
 import { isActiveCreateFlowForDraft, useCreateFlowStore } from "@/stores/create-flow-store";
 import {
+  readForkAgentIntent,
   useWorkspaceDraftSubmissionStore,
-  type ForkWorktreeAgentIntent,
+  type ForkAgentIntent,
   type ForkWorktreeSubmission,
   type PendingWorkspaceDraftSetup,
 } from "@/stores/workspace-draft-submission-store";
@@ -243,7 +243,7 @@ function useWorkspaceIsolation(input: {
   canCreateWorktree: boolean;
   existingWorktrees: readonly ExistingWorktree[];
   projectDirectory: string | null;
-  hasReservedForkWorktree: boolean;
+  submittedForkIsolation?: "local" | "worktree";
 }): WorkspaceIsolationState {
   const { setup, supportsMultiplicity, canCreateWorktree, existingWorktrees } = input;
   // The last isolation choice is remembered alongside the other New Workspace
@@ -252,9 +252,7 @@ function useWorkspaceIsolation(input: {
   const { preferences } = useFormPreferences();
   const { manualIsolation, existingWorktreePath: chosenPath } = useNewWorkspaceSetupState(setup);
   const isolation =
-    manualIsolation ??
-    (input.hasReservedForkWorktree ? "worktree" : preferences.isolation) ??
-    "local";
+    manualIsolation ?? input.submittedForkIsolation ?? preferences.isolation ?? "local";
   // A worktree that left the list (removed since it was chosen) is no choice.
   const existingWorktreePath =
     canCreateWorktree && existingWorktrees.some((worktree) => worktree.path === chosenPath)
@@ -307,16 +305,15 @@ function resolveStartingRef(
   return status ? defaultBasePickerItem(status) : null;
 }
 
-async function resolveWorktreeCreationSource(input: {
+async function resolveWorktreeSubmission(input: {
   setup: NewWorkspaceSetup;
   submittedWorktree?: ForkWorktreeSubmission;
   readCheckoutStatus: () => Promise<BaseRefCheckoutStatus>;
   sourceDirectory: string;
   projectId: string;
   worktreeSlug: string;
-  forkIdentity?: { draftId: string; serverId: string; agentIntent: ForkWorktreeAgentIntent };
   t: TFunction;
-}): Promise<ForkWorktreeSubmission["source"]> {
+}): Promise<ForkWorktreeSubmission> {
   const { setup, submittedWorktree } = input;
   const status = submittedWorktree ? null : await input.readCheckoutStatus();
   const { pickerSelection, branch, metadata } = setup.getSnapshot();
@@ -333,14 +330,27 @@ async function resolveWorktreeCreationSource(input: {
     ...checkout,
     ...(branch && startsNewBranch(checkout) ? { branchName: branch } : {}),
   };
-  if (submittedWorktree && equal(source, submittedWorktree.source)) return submittedWorktree.source;
-  if (!input.forkIdentity) return source;
-  const worktreeSlug = await useWorkspaceDraftSubmissionStore.getState().reserveForkWorktree({
-    draftId: input.forkIdentity.draftId,
-    serverId: input.forkIdentity.serverId,
-    submission: { source, baseItem, metadata, agentIntent: input.forkIdentity.agentIntent },
-  });
-  return { ...source, worktreeSlug };
+  return { source, baseItem, metadata };
+}
+
+async function recordWorkspaceCreationSource(input: {
+  directory: Extract<CreateWorkspaceRequestOptions["source"], { kind: "directory" }>;
+  worktree?: ForkWorktreeSubmission;
+  forkDraft?: { draftId: string; serverId: string };
+  agentConfig?: ForkAgentIntent["config"];
+  createMainAgent: boolean;
+}): Promise<CreateWorkspaceRequestOptions["source"]> {
+  const { directory, worktree, forkDraft, agentConfig, createMainAgent } = input;
+  const slug =
+    forkDraft && agentConfig
+      ? await useWorkspaceDraftSubmissionStore.getState().recordForkSubmission({
+          ...forkDraft,
+          worktree,
+          agentIntent: { config: agentConfig, createMainAgent },
+        })
+      : undefined;
+  if (!worktree) return directory;
+  return { ...worktree.source, worktreeSlug: slug ?? worktree.source.worktreeSlug };
 }
 
 function normalizeBranchDetails(
@@ -465,7 +475,7 @@ interface CreateChatAgentInput {
   forkDraftSetup?: PendingWorkspaceDraftSetup | null;
   ensureWorkspace: EnsureWorkspace;
   createMainAgent: boolean;
-  submittedAgentConfig?: ForkWorktreeAgentIntent["config"];
+  submittedAgentConfig?: ForkAgentIntent["config"];
   serverId: string;
   draftKey: string;
   clearDraft: (lifecycle: "sent" | "abandoned") => void;
@@ -498,7 +508,7 @@ function buildWorkspaceAgentConfig(
 function buildWorkspaceDraftSetupForCreatedWorkspace(input: {
   forkDraftSetup: PendingWorkspaceDraftSetup | null | undefined;
   workspaceDirectory: string;
-  agentConfig: ForkWorktreeAgentIntent["config"];
+  agentConfig: ForkAgentIntent["config"];
   mainAgentId?: string;
 }): WorkspaceDraftTabSetup | undefined {
   if (!input.forkDraftSetup && !input.mainAgentId) return undefined;
@@ -653,10 +663,11 @@ function buildComposerConfig(input: {
   workspaceDirectory: string | null;
   sourceDirectory: string | null;
   initialSetup?: WorkspaceDraftTabSetup | null;
-  restoredWorktree?: ForkWorktreeSubmission;
+  restoredAgentIntent?: ForkAgentIntent;
 }): Parameters<typeof useAgentInputDraft>[0]["composer"] {
-  const { serverId, workspaceDirectory, sourceDirectory, initialSetup, restoredWorktree } = input;
-  const composerSetup = restoredWorktree?.agentIntent?.config ?? initialSetup;
+  const { serverId, workspaceDirectory, sourceDirectory, initialSetup, restoredAgentIntent } =
+    input;
+  const composerSetup = restoredAgentIntent?.config ?? initialSetup;
   const workingDir = workspaceDirectory || sourceDirectory || undefined;
   return {
     initialServerId: serverId || null,
@@ -677,10 +688,15 @@ function usePendingWorkspaceDraftSetup(draftId: string | undefined) {
     (state) => state.draftSetupStatusById[normalizedDraftId],
   );
   const storedDraft = typeof draftStatus === "object" ? draftStatus : null;
+  const reservedWorktreeSlug = storedDraft?.worktreeSlug;
+  const submittedForkIsolation = reservedWorktreeSlug
+    ? ("worktree" as const)
+    : storedDraft?.agentIntent && ("local" as const);
   return {
     forkDraftSetup,
     isTimelineFork: Boolean(forkDraftSetup?.setup.forkFrom),
-    reservedWorktreeSlug: storedDraft?.worktreeSlug,
+    reservedWorktreeSlug,
+    submittedForkIsolation,
     storedDraft,
   };
 }
@@ -1032,9 +1048,15 @@ export function NewWorkspaceScreen({
   const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
   const toast = useToast();
-  const { forkDraftSetup, isTimelineFork, reservedWorktreeSlug, storedDraft } =
-    usePendingWorkspaceDraftSetup(draftId);
+  const {
+    forkDraftSetup,
+    isTimelineFork,
+    reservedWorktreeSlug,
+    submittedForkIsolation,
+    storedDraft,
+  } = usePendingWorkspaceDraftSetup(draftId);
   const [restoredWorktree] = useState(() => storedDraft?.worktreeSubmission);
+  const [restoredAgentIntent] = useState(() => readForkAgentIntent(storedDraft));
   const agentConfigRevision = useRef(0);
   const submittedAgentConfigRevision = useRef(0);
   const markAgentConfigEdited = useCallback(() => {
@@ -1186,7 +1208,7 @@ export function NewWorkspaceScreen({
       workspaceDirectory: workspace?.workspaceDirectory ?? null,
       sourceDirectory: selectedSourceDirectory,
       initialSetup: forkDraftSetup?.setup,
-      restoredWorktree,
+      restoredAgentIntent,
     }),
   });
   const composerState = chatDraft.composerState;
@@ -1288,7 +1310,7 @@ export function NewWorkspaceScreen({
     canCreateWorktree,
     existingWorktrees,
     projectDirectory: selectedSourceDirectory,
-    hasReservedForkWorktree: Boolean(reservedWorktreeSlug),
+    submittedForkIsolation,
   });
 
   const branchSuggestionsQuery = useQuery({
@@ -1493,39 +1515,23 @@ export function NewWorkspaceScreen({
       const connectedClient = withConnectedClient();
       const createsWorktree = !supportsWorkspaceMultiplicity || effectiveIsolation === "worktree";
       if (!selectedProjectId) throw new Error("Project is not available on the selected host");
-      let source: CreateWorkspaceRequestOptions["source"] = {
-        kind: "directory",
-        path: workingDirectory,
-        projectId: selectedProjectId,
-      };
-      if (createsWorktree) {
-        source = await resolveWorktreeCreationSource({
-          setup,
-          submittedWorktree: submittedWorktreeAtTarget,
-          readCheckoutStatus: () =>
-            ensureCheckoutStatus({
-              queryClient,
-              client: connectedClient,
-              serverId: selectedServerId,
-              cwd: selectedSourceDirectory,
-            }),
-          sourceDirectory: workingDirectory,
-          projectId: selectedProjectId,
-          worktreeSlug: reservedWorktreeSlug ?? creationIdentity.worktreeSlug,
-          forkIdentity:
-            isTimelineFork && input.agent?.config
-              ? {
-                  draftId: creationIdentity.draftId,
-                  serverId: selectedServerId,
-                  agentIntent: {
-                    config: input.agent.config,
-                    createMainAgent: Boolean(input.mainAgent),
-                  },
-                }
-              : undefined,
-          t,
-        });
-      }
+      const worktree = createsWorktree
+        ? await resolveWorktreeSubmission({
+            setup,
+            submittedWorktree: submittedWorktreeAtTarget,
+            readCheckoutStatus: () =>
+              ensureCheckoutStatus({
+                queryClient,
+                client: connectedClient,
+                serverId: selectedServerId,
+                cwd: selectedSourceDirectory,
+              }),
+            sourceDirectory: workingDirectory,
+            projectId: selectedProjectId,
+            worktreeSlug: reservedWorktreeSlug ?? creationIdentity.worktreeSlug,
+            t,
+          })
+        : undefined;
       let mainAgent = input.mainAgent;
       if (createMainAgent && !input.withInitialAgent) {
         const selectedProvider = composerState?.selectedProvider ?? null;
@@ -1538,6 +1544,15 @@ export function NewWorkspaceScreen({
         const matchingComposer = provider === selectedProvider ? composerState : null;
         mainAgent = { config: buildWorkspaceAgentConfig(input.cwd, provider, matchingComposer) };
       }
+      const source = await recordWorkspaceCreationSource({
+        directory: { kind: "directory", path: workingDirectory, projectId: selectedProjectId },
+        worktree,
+        forkDraft: isTimelineFork
+          ? { draftId: creationIdentity.draftId, serverId: selectedServerId }
+          : undefined,
+        agentConfig: input.agent?.config,
+        createMainAgent: Boolean(mainAgent),
+      });
       const normalizedWorkspace = await createMultiplicityWorkspace({
         idempotencyKey: creationIdentity.draftId,
         client: connectedClient,
@@ -1625,7 +1640,7 @@ export function NewWorkspaceScreen({
           ];
         const submittedAgentIntent =
           typeof stored === "object" && stored.sourceServerId === selectedServerId
-            ? stored.worktreeSubmission?.agentIntent
+            ? readForkAgentIntent(stored)
             : undefined;
         if (!submittedAgentIntent) {
           submittedAgentConfigRevision.current = agentConfigRevision.current;

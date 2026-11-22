@@ -94,6 +94,7 @@ export interface ToolHosts {
     action: (client: DaemonClient) => Promise<T>,
     signal?: AbortSignal,
     directParentAgentId?: string,
+    allowLegacyDirectPrompt?: boolean,
   ): Promise<T>;
 }
 
@@ -134,7 +135,7 @@ export function assertDirectParent(
 export function createToolHosts(hosts: ConnectedHosts): ToolHosts {
   return {
     directory: () => hosts.list(),
-    async use(serverId, action, signal, directParentAgentId) {
+    async use(serverId, action, signal, directParentAgentId, allowLegacyDirectPrompt) {
       const lifetime = new AbortController();
       let routeFailure: unknown;
       const transportFactory: DaemonTransportFactory = () => {
@@ -228,13 +229,16 @@ export function createToolHosts(hosts: ConnectedHosts): ToolHosts {
           throw new HostOperationRejectedError(routeFailure ?? error);
         });
         if (directParentAgentId) {
-          const source = client.getLastServerInfoMessage()?.sourceId;
-          if (
-            !source?.endsWith(DIRECT_PARENT_ROUTE_ACK) ||
-            readDirectParentRoute(source.slice(0, -DIRECT_PARENT_ROUTE_ACK.length))?.agentId !==
-              directParentAgentId
-          ) {
-            // COMPAT(directParentRoute): added in v0.16.0, remove after 2027-05-19.
+          const info = client.getLastServerInfoMessage();
+          let sourceId = info?.sourceId;
+          // COMPAT(directParentRoute): added in v0.16.0, remove after 2027-05-19.
+          // Older hosts echo the qualified producer without promising a dispatch-time parent check.
+          if (sourceId?.endsWith(DIRECT_PARENT_ROUTE_ACK)) {
+            sourceId = sourceId.slice(0, -DIRECT_PARENT_ROUTE_ACK.length);
+          } else if (!allowLegacyDirectPrompt || info?.features?.agentHierarchyControl === true) {
+            sourceId = undefined;
+          }
+          if (!sourceId || readDirectParentRoute(sourceId)?.agentId !== directParentAgentId) {
             throw new HostOperationRejectedError(
               new Error("Update the destination Paseo host to use direct-parent operations."),
             );
@@ -313,13 +317,13 @@ function canQueueDirectParentPrompt(client: DaemonClient, restricted: boolean): 
 
 function remoteTurnOptions(
   queueDirectParent: boolean,
-  directParent: boolean,
+  waitForDispatch: boolean,
   notifyOnFinish: unknown,
 ) {
   if (queueDirectParent) {
     return { notifyDirectParentOnFinish: notifyOnFinish === true ? true : undefined };
   }
-  return { waitForDispatch: directParent ? true : undefined };
+  return { waitForDispatch: waitForDispatch ? true : undefined };
 }
 
 function shouldObserveRemoteFollowups(
@@ -376,13 +380,16 @@ export function createHostResolver(input: {
       serverId: string | undefined,
       action: (host: HostOperations) => Promise<T>,
       directParentAgentId?: string,
+      allowLegacyDirectPrompt?: boolean,
     ): Promise<T> {
       const destination = serverId ?? input.serverId;
       if (destination === input.serverId) return action(input.local);
       if (input.lockedCwd)
         throw new Error("This caller is restricted to its local working directory");
       const use = (invoke: (client: DaemonClient) => Promise<T>) =>
-        input.hosts().use(destination, invoke, undefined, directParentAgentId);
+        input
+          .hosts()
+          .use(destination, invoke, undefined, directParentAgentId, allowLegacyDirectPrompt);
       return use(async (client) =>
         action({
           async createAgent(args) {
@@ -455,21 +462,42 @@ export function createHostResolver(input: {
             )?.agent;
             if (!agent)
               throw new HostOperationRejectedError(new Error(`Agent ${agentId} not found`));
+            const directParent = args.requireParentOwnership === true;
+            const info = client.getLastServerInfoMessage();
+            if (directParentAgentId && allowLegacyDirectPrompt) {
+              try {
+                assertDirectParent(agent.labels, destination, {
+                  agentId: directParentAgentId,
+                  serverId: input.serverId,
+                });
+                if (isExplicitParentReportingLabels(agent.labels)) {
+                  throw new Error(
+                    "The child now uses explicit parent reporting. Retry the prompt.",
+                  );
+                }
+              } catch (error) {
+                throw new HostOperationRejectedError(error);
+              }
+            }
+            const queueDirectParent = canQueueDirectParentPrompt(client, directParent);
+            // COMPAT(agentMessageDispatchConfirmation): added in v0.16.0, remove after 2027-05-19.
+            const waitForDispatch =
+              directParent &&
+              (!allowLegacyDirectPrompt ||
+                info?.features?.agentMessageDispatchConfirmation === true);
             await trackFollowups(
               client,
               agent,
               destination,
               args.notifyOnFinish as boolean | undefined,
             );
-            const directParent = args.requireParentOwnership === true;
-            const queueDirectParent = canQueueDirectParentPrompt(client, directParent);
             const prepareLegacyNotification = args.prepareLegacyNotification as
               | (() => Promise<void>)
               | undefined;
             if (!queueDirectParent) await prepareLegacyNotification?.();
             const receipt = await client
               .sendMessage(agentId, args.prompt as string, {
-                ...remoteTurnOptions(queueDirectParent, directParent, args.notifyOnFinish),
+                ...remoteTurnOptions(queueDirectParent, waitForDispatch, args.notifyOnFinish),
                 sessionMode: input.callerAgentId
                   ? (args.sessionMode as string | undefined)
                   : undefined,

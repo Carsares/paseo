@@ -93,6 +93,7 @@ import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-lo
 import { summarizeWorkspaceAgents } from "./agent/workspace-agents-summary.js";
 import { resolveClientMessageId } from "./client-message-id.js";
 import {
+  QueuedPromptLoadError,
   sendPromptToAgent,
   waitForAgentRunStartWithTimeout,
   unarchiveAgentState,
@@ -581,7 +582,8 @@ type QueuedMessageContext = Pick<
 export function retainQueuedAgentMessage(error: unknown): boolean {
   return (
     error instanceof AgentManagerShuttingDownError ||
-    error instanceof AgentCommandNotDispatchedError
+    error instanceof AgentCommandNotDispatchedError ||
+    error instanceof QueuedPromptLoadError
   );
 }
 
