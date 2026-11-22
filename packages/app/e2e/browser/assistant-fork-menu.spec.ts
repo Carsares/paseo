@@ -1,7 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { rename } from "node:fs/promises";
+import { readFile, readdir, rename } from "node:fs/promises";
+import { join } from "node:path";
 import type { CreationSnapshot, WorkspaceCreateRequest } from "@getpaseo/protocol/messages";
 import { expect, test as base, type Page } from "../support/fixtures";
+import { selectModel } from "../support/helpers/app";
 import { awaitAssistantMessage } from "../support/helpers/agent-stream";
 import {
   expectChatHistoryAttachment,
@@ -333,6 +335,133 @@ test.describe("Timeline Fork", () => {
       .filter((agent) => agent.workspaceId === receipt.workspaceId);
     expect(agents.map((agent) => agent.id)).toEqual([receipt.agentId]);
   });
+
+  for (const { label, changeModel, initialMain, retryMain } of [
+    { label: "manually selected model", changeModel: true, initialMain: false, retryMain: false },
+    { label: "main default switched on", changeModel: false, initialMain: false, retryMain: true },
+    { label: "main default switched off", changeModel: false, initialMain: true, retryMain: false },
+  ]) {
+    test(`recovers the submitted Fork configuration with ${label}`, async ({
+      page,
+      seedForkWorkspace,
+    }) => {
+      const sourceModel = "ten-second-stream";
+      const submittedModel = changeModel ? "max-only-thinking-stream" : sourceModel;
+      const prompt = "Continue the Fork with its submitted configuration.";
+      const mainPrompt = "Original test Main Control instructions.";
+      const creation = await holdInitialWorkspaceCreation(page);
+      const session = await seedForkWorkspace({
+        repoPrefix: "assistant-fork-configuration-",
+        title: "Fork configuration",
+        initialPrompt: "emit 1 coalesced agent stream updates for the original turn.",
+        model: sourceModel,
+      });
+      const setDefaultMain = async (enabled: boolean) => {
+        await page.goto("/settings/chat");
+        const toggle = page.getByRole("switch", { name: "Default main tab for new workspaces" });
+        await expect(toggle).toBeVisible();
+        if ((await toggle.isChecked()) !== enabled) await toggle.click();
+        await expect(toggle).toHaveAttribute("aria-checked", String(enabled));
+      };
+      if (initialMain) {
+        await setDefaultMain(true);
+        await session.client.patchDaemonConfig({ mainControlAppendSystemPrompt: mainPrompt });
+      }
+      await openAgentRoute(page, session);
+      await awaitAssistantMessage(page);
+      expect((await session.client.waitForFinish(session.agentId, 45_000)).status).toBe("idle");
+      await forkMostRecentAssistantTurnToNewWorkspace(page);
+      await expect(page).toHaveURL(/\/new\?.*draftId=/);
+      const draftUrl = page.url();
+      await selectWorkspaceIsolation(page, "worktree");
+      await expectWorkspaceIsolationSelected(page, "worktree");
+      if (changeModel) await selectModel(page, "Max-only thinking stream");
+      await fillComposerDraft(page, prompt);
+      const submit = page.getByTestId("workspace-create-submit");
+      await submit.click();
+
+      const receipt = await creation.accepted;
+      const first = creation.requests[0]!;
+      expect(first.agent?.config.model).toBe(submittedModel);
+      expect(first.mainAgent?.config.model).toBe(initialMain ? submittedModel : undefined);
+      expect(receipt).toMatchObject({
+        workspaceId: expect.any(String),
+        agentId: expect.any(String),
+      });
+      const fetchAgents = async () =>
+        (await session.client.fetchAgents()).entries
+          .map(({ agent }) => agent)
+          .filter((agent) => agent.workspaceId === receipt.workspaceId);
+      await expect
+        .poll(fetchAgents)
+        .toContainEqual(expect.objectContaining({ id: receipt.agentId }));
+
+      // Change the host prompt after the originally accepted Main Session has been stored.
+      if (initialMain) {
+        await session.client.patchDaemonConfig({
+          mainControlAppendSystemPrompt: "Updated test Main Control instructions.",
+        });
+      }
+      creation.allowRetry();
+      if (initialMain === retryMain) {
+        await page.reload();
+      } else {
+        await setDefaultMain(retryMain);
+        await page.goto(draftUrl);
+      }
+      const waitForRestoredDraft = async () => {
+        await expectComposerDraft(page, prompt);
+        // Draft text can hydrate before the host's provider catalog and form selection.
+        await expect(
+          page.getByRole("button", {
+            name: /^Select model \((Ten second stream|Max-only thinking stream)\)$/i,
+          }),
+        ).toBeVisible();
+      };
+      await waitForRestoredDraft();
+      if (changeModel) {
+        await selectModel(page, "Ten second stream");
+        await submit.click();
+        await expect.poll(() => creation.requests.length).toBe(2);
+        expect(creation.requests[1]?.agent?.config.model).toBe(sourceModel);
+        await expect(
+          page.getByText("workspace_request_key_conflict", { exact: true }).first(),
+        ).toBeVisible();
+        await expectComposerDraft(page, prompt);
+        await page.reload();
+        await waitForRestoredDraft();
+      }
+
+      const retryRequestIndex = changeModel ? 2 : 1;
+      await submit.click();
+      await expect.poll(() => creation.requests.length).toBe(retryRequestIndex + 1);
+      const { requestId: _firstRequestId, ...acceptedIntent } = first;
+      const { requestId: _retryRequestId, ...retryIntent } = creation.requests[retryRequestIndex]!;
+      expect(retryIntent).toEqual(acceptedIntent);
+      await expect(page).toHaveURL(/\/workspace\//, { timeout: 30_000 });
+      await expect(page.getByTestId(`workspace-tab-agent_${receipt.agentId}`)).toHaveAttribute(
+        "aria-selected",
+        "true",
+        { timeout: 30_000 },
+      );
+      await expect(page.getByTestId("user-message").filter({ hasText: prompt })).toHaveCount(1);
+
+      const agents = await fetchAgents();
+      const initialAgent = agents.find((agent) => agent.id === receipt.agentId);
+      expect(initialAgent?.model).toBe(submittedModel);
+      const mainAgents = agents.filter((agent) => agent.id !== receipt.agentId);
+      expect(mainAgents).toHaveLength(initialMain ? 1 : 0);
+      if (initialMain) {
+        const mainAgentId = mainAgents[0]!.id;
+        const recordsDirectory = join(process.env.E2E_PASEO_HOME!, "agents");
+        const files = await readdir(recordsDirectory, { recursive: true });
+        const recordPath = files.find((name) => name.endsWith(`/${mainAgentId}.json`));
+        expect(recordPath).toBeDefined();
+        const record = JSON.parse(await readFile(join(recordsDirectory, recordPath!), "utf8"));
+        expect(record.mainControlSystemPrompt).toBe(mainPrompt);
+      }
+    });
+  }
 
   test("restores the selected Fork boundary before submitting a refreshed workspace draft", async ({
     page,

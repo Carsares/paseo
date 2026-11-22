@@ -729,12 +729,14 @@ export interface AgentUsageSession {
   sessionKey: string;
 }
 
+export type AgentCommandOutcome = "accepted" | "unknown";
+
 export interface OutOfBandCommandContext {
   emit: (event: AgentStreamEvent) => void;
   /** Called immediately before a provider request makes the command irreversible. */
   beforeProviderDispatch?: () => Promise<void>;
   /** Called after the provider acknowledges the request, or if its outcome is unknown. */
-  onProviderOutcome?: () => void;
+  onProviderOutcome?: (outcome?: AgentCommandOutcome) => void | Promise<void>;
 }
 
 export interface AgentSession {

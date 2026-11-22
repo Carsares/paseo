@@ -149,6 +149,7 @@ import {
 } from "./workspace-labels/index.js";
 
 import {
+  AgentCommandNotDispatchedError,
   AgentManager,
   AgentManagerShuttingDownError,
   AgentRunCancellationError,
@@ -578,7 +579,10 @@ type QueuedMessageContext = Pick<
 >;
 
 export function retainQueuedAgentMessage(error: unknown): boolean {
-  return error instanceof AgentManagerShuttingDownError;
+  return (
+    error instanceof AgentManagerShuttingDownError ||
+    error instanceof AgentCommandNotDispatchedError
+  );
 }
 
 async function validateDirectParentPrompt(
@@ -685,6 +689,7 @@ export async function enqueueRecoverableAgentMessage(
       sessionMode: message.sessionMode,
       activeTurnBehavior: message.activeTurnBehavior,
       unarchive: !restoring && message.unarchive,
+      waitForProviderOutcome: true,
       validateDispatch,
       handoff,
       onDispatch: () => notification?.accept(),
@@ -10559,6 +10564,7 @@ export class Session {
               sessionMode: msg.sessionMode,
               clearPendingPermissions: false,
               unarchive: confirmAtDispatch ? false : undefined,
+              waitForProviderOutcome: confirmAtDispatch,
               onDispatch: () => notification?.accept(),
             });
             deliveryStatus = "queued";
@@ -10621,15 +10627,16 @@ export class Session {
               activeTurnBehavior:
                 msg.activeTurnBehavior ?? (msg.sourceAgentId ? "steer" : "interrupt"),
             },
-            send: async (begin, declined) => {
+            send: async (begin, declined, onProviderOutcome) => {
               if (!msg.sourceAgentId) await this.prepareAgentMessage(agentId, msg.text);
-              await send({ begin, declined });
+              await send({ begin, declined, onProviderOutcome });
             },
             retryIfUnsent:
               (msg.waitForDispatch || directParent) && msg.sourceAgentId
                 ? (error) =>
                     error instanceof AgentRunCancellationError ||
-                    error instanceof DirectParentRequiredError
+                    error instanceof DirectParentRequiredError ||
+                    retainQueuedAgentMessage(error)
                 : undefined,
             retryIfNotAdmitted: (error) =>
               deliveryStatus !== "queued" && error instanceof AgentMessageAdmissionError,

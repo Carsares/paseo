@@ -1497,11 +1497,11 @@ export class OmpAgentSession implements AgentSession {
       if (
         !(error instanceof JsonlRpcRequestNotSentError || error instanceof JsonlRpcResponseError)
       ) {
-        onProviderOutcome?.();
+        await onProviderOutcome?.("unknown");
       }
       throw error;
     }
-    onProviderOutcome?.();
+    await onProviderOutcome?.("accepted");
     return result;
   }
 

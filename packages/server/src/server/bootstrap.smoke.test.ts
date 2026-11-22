@@ -1066,6 +1066,185 @@ describe("paseo daemon bootstrap", () => {
     }
   });
 
+  test.each([
+    ["idle", "unsent"],
+    ["busy", "unsent"],
+    ["idle", "shutdown"],
+    ["busy", "shutdown"],
+    ["idle", "rejected"],
+    ["busy", "rejected"],
+    ["idle", "accepted"],
+    ["busy", "accepted"],
+    ["idle", "unknown"],
+    ["busy", "unknown"],
+  ] as const)(
+    "durable /compact keeps the correct receipt across restart for a %s recipient and %s outcome",
+    async (recipient, outcome) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paseo-queued-command-"));
+      const entered = Promise.withResolvers<void>();
+      const respond = Promise.withResolvers<void>();
+      const sent = Promise.withResolvers<{ delivery: Promise<void> }>();
+      const submissions: string[] = [];
+      const handles: Awaited<ReturnType<typeof createTestPaseoDaemon>>[] = [];
+      const clients: DaemonClient[] = [];
+      const initialTurn = Promise.withResolvers<FakeCodexAppServer>();
+      const beforeHandoff = outcome === "unsent" || outcome === "shutdown";
+      let preparingCommand = false;
+      let stopping = Promise.resolve();
+      const open = async (phase: "first" | "restarted") => {
+        const handle = await createTestPaseoDaemon({
+          paseoHomeRoot: root,
+          staticDir: root,
+          cleanup: false,
+          resumeOnStartup: false,
+          mcpEnabled: false,
+          agentClients: {
+            codex: localCodexClient(root, () => {
+              const server = createFakeCodexAppServer({
+                "thread/loaded/list": async () => {
+                  if (phase === "first" && preparingCommand && beforeHandoff) {
+                    entered.resolve();
+                    await respond.promise;
+                    if (outcome === "unsent") {
+                      return { __jsonRpcError: { code: -32603, message: "Thread could not load" } };
+                    }
+                  }
+                  return { data: ["thread-1"] };
+                },
+                "turn/start": () => {
+                  initialTurn.resolve(server);
+                  return {};
+                },
+                "thread/compact/start": async () => {
+                  submissions.push(phase);
+                  if (phase === "restarted") return {};
+                  entered.resolve();
+                  await respond.promise;
+                  if (outcome === "rejected") {
+                    return { __jsonRpcError: { code: -32602, message: "Compaction rejected" } };
+                  }
+                  if (outcome === "unknown") {
+                    return {
+                      __jsonRpcError: { code: -32603, message: "Compaction outcome unknown" },
+                    };
+                  }
+                  return {};
+                },
+              });
+              return server;
+            }),
+          },
+        });
+        handles.push(handle);
+        const client = new DaemonClient({ url: "ws://127.0.0.1:" + handle.port + "/ws" });
+        clients.push(client);
+        await client.connect();
+        return { ...handle, client };
+      };
+      const id = "queued-compact";
+      const sendQueued = MessageReceipts.prototype.sendQueued;
+      vi.spyOn(MessageReceipts.prototype, "sendQueued").mockImplementation(
+        function (this: MessageReceipts, input) {
+          const delivery = sendQueued.call(this, input);
+          if (input.message.messageId === id) sent.resolve({ delivery });
+          return delivery;
+        },
+      );
+      try {
+        const first = await open("first");
+        const manager = first.daemon.agentManager;
+        const agent = await manager.createAgent({ provider: "codex", cwd: root }, undefined, {
+          workspaceId: undefined,
+        });
+        const running = manager.runAgent(agent.id, "Establish a Codex thread");
+        void running.catch(ignoreError);
+        const server = await initialTurn.promise;
+        server.startsTurn({ threadId: "thread-1", turnId: "initial-turn" });
+        if (recipient === "idle") {
+          server.completeTurn({ threadId: "thread-1" });
+          await running;
+        } else {
+          await expect.poll(() => manager.hasInFlightRun(agent.id)).toBe(true);
+        }
+        const originalTurnId = manager.getAgent(agent.id)?.activeForegroundTurnId;
+
+        preparingCommand = true;
+        const directory = path.join(first.paseoHome, "agent-requests");
+        const receipts = new MessageReceipts(directory);
+        const options = { sourceAgentId: agent.id, messageId: id };
+        await expect(first.client.sendAgentMessage(agent.id, "/compact", options)).resolves.toEqual(
+          {
+            deliveryStatus: "queued",
+          },
+        );
+        await entered.promise;
+        const [file] = await readdir(directory);
+        const readDisk = async () =>
+          JSON.parse(await readFile(path.join(directory, file!), "utf8"));
+        expect((await readDisk()).state).toBe("pending");
+        expect(
+          (await receipts.queuedMessages()).map(({ queued }) => queued.message.messageId),
+        ).toEqual(beforeHandoff ? [id] : []);
+        if (outcome === "shutdown") {
+          const paused = Promise.withResolvers<void>();
+          const pauseRunAdmission = manager.pauseRunAdmission.bind(manager);
+          vi.spyOn(manager, "pauseRunAdmission").mockImplementation(() => {
+            const release = pauseRunAdmission();
+            paused.resolve();
+            return release;
+          });
+          stopping = first.daemon.stop();
+          void stopping.catch(ignoreError);
+          await paused.promise;
+        }
+        const attempt = Promise.allSettled([(await sent.promise).delivery]);
+        respond.resolve();
+        const shouldReplay = beforeHandoff || outcome === "rejected";
+        expect((await attempt)[0]?.status).toBe(shouldReplay ? "rejected" : "fulfilled");
+        expect((await readDisk()).state).toBe(outcome === "accepted" ? "completed" : "pending");
+        expect(
+          (await receipts.queuedMessages()).map(({ queued }) => queued.message.messageId),
+        ).toEqual(shouldReplay ? [id] : []);
+        if (recipient === "busy" && outcome !== "shutdown") {
+          expect(manager.getAgent(agent.id)?.activeForegroundTurnId).toBe(originalTurnId);
+          expect(server.requests().filter(({ method }) => method === "turn/interrupt")).toEqual([]);
+          server.completeTurn({ threadId: "thread-1" });
+          await running;
+        }
+        server.assertNoErrors();
+        await stopping;
+        await first.client.close();
+        await first.close();
+
+        const second = await open("restarted");
+        if (shouldReplay) {
+          await expect
+            .poll(async () => (await readDisk()).state, { timeout: 8_000 })
+            .toBe("completed");
+        }
+        const duplicate = second.client.sendAgentMessage(agent.id, "/compact", options);
+        if (outcome === "unknown") {
+          await expect(duplicate).rejects.toThrow("agent_request_outcome_unknown");
+        } else {
+          await expect(duplicate).resolves.toEqual({});
+        }
+        await second.close();
+        expect(await receipts.queuedMessages()).toEqual([]);
+        expect(submissions).toEqual([
+          ...(beforeHandoff ? [] : ["first"]),
+          ...(shouldReplay ? ["restarted"] : []),
+        ]);
+      } finally {
+        respond.resolve();
+        await stopping.catch(ignoreError);
+        for (const client of clients) await client.close();
+        for (const handle of handles.toReversed()) await handle.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
+
   test("ordinary shutdown restores non-steerable queued messages in order before new ingress", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paseo-queue-recovery-"));
     const running = Promise.withResolvers<void>();

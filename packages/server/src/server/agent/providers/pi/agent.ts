@@ -1872,11 +1872,11 @@ export class PiRpcAgentSession implements AgentSession {
         !(error instanceof JsonlRpcRequestNotSentError) &&
         (providerStarted?.() || !(error instanceof JsonlRpcResponseError))
       ) {
-        onProviderOutcome?.();
+        await onProviderOutcome?.("unknown");
       }
       throw error;
     }
-    onProviderOutcome?.();
+    await onProviderOutcome?.("accepted");
     return result;
   }
 

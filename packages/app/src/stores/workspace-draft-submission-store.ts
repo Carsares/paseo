@@ -37,6 +37,20 @@ export interface PendingWorkspaceDraftSetup {
   sourceDirectory?: string | null;
 }
 
+const ForkWorktreeAgentIntentSchema = z.object({
+  config: WorkspaceCreateRequestSchema.shape.mainAgent.unwrap().shape.config.pick({
+    provider: true,
+    cwd: true,
+    modeId: true,
+    model: true,
+    thinkingOptionId: true,
+    providerOptions: true,
+  }),
+  createMainAgent: z.boolean(),
+});
+
+export type ForkWorktreeAgentIntent = z.infer<typeof ForkWorktreeAgentIntentSchema>;
+
 const ForkWorktreeSubmissionSchema = z.object({
   source: WorkspaceCreateRequestSchema.shape.source.options[1].required({
     cwd: true,
@@ -57,6 +71,7 @@ const ForkWorktreeSubmissionSchema = z.object({
     ])
     .nullable(),
   metadata: z.record(z.string(), z.json()),
+  agentIntent: ForkWorktreeAgentIntentSchema.optional(),
 });
 
 export type ForkWorktreeSubmission = z.infer<typeof ForkWorktreeSubmissionSchema>;

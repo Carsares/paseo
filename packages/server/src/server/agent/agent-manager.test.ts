@@ -14068,6 +14068,7 @@ test("tryRunOutOfBand gives providers the command another agent sent, not its en
 test("automatic out-of-band recovery waits for the provider handoff", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-recovery-handoff-"));
   const order: string[] = [];
+  const recordProviderOutcome = vi.fn(async () => {});
 
   class RecoveryCommandSession extends TestAgentSession {
     override tryHandleOutOfBand(prompt: AgentPromptInput) {
@@ -14078,12 +14079,12 @@ test("automatic out-of-band recovery waits for the provider handoff", async () =
           onProviderOutcome,
         }: {
           beforeProviderDispatch?: () => Promise<void>;
-          onProviderOutcome?: () => void;
+          onProviderOutcome?: (outcome?: "accepted" | "unknown") => void | Promise<void>;
         }) => {
           order.push("run");
           await beforeProviderDispatch?.();
           order.push("provider-request");
-          onProviderOutcome?.();
+          await onProviderOutcome?.("accepted");
         },
       };
     }
@@ -14104,10 +14105,15 @@ test("automatic out-of-band recovery waits for the provider handoff", async () =
       "/recovery",
       { recoveryIntent: "automatic" },
       () => order.push("accepted"),
-      { waitForProviderOutcome: true, assertAllowed: () => {} },
+      {
+        waitForProviderOutcome: true,
+        assertAllowed: () => {},
+        onProviderOutcome: recordProviderOutcome,
+      },
     );
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(order).toEqual(["run", "accepted", "provider-request"]);
+    expect(recordProviderOutcome).toHaveBeenCalledExactlyOnceWith("accepted");
   } finally {
     await manager.closeAgent(agent.id);
     rmSync(workdir, { recursive: true, force: true });

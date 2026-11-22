@@ -182,3 +182,88 @@ test("restart sees ordered, privately stored unsent entries and skips uncertain 
   // The previous daemon's in-memory promises died without provider confirmation.
   expect(attempts).toHaveLength(4);
 });
+
+test("persistent queue records an unknown provider outcome without replayable content", async () => {
+  const { requests, directory } = await fixture();
+  const message = {
+    messageId: "unknown-command",
+    prompt: "/compact",
+    source: { agentId: "sender" },
+    activeTurnBehavior: "steer" as const,
+    unarchive: false,
+  };
+
+  await requests.sendQueued({
+    agentId: "agent",
+    request: { prompt: message.prompt },
+    message,
+    async enqueue(handoff) {
+      await handoff.begin();
+      await handoff.onProviderOutcome?.("unknown");
+      return { dispatched: Promise.resolve() };
+    },
+  });
+
+  const restarted = new MessageReceipts(directory);
+  expect(await restarted.queuedMessages()).toEqual([]);
+  await expect(
+    restarted.sendQueued({
+      agentId: "agent",
+      request: { prompt: message.prompt },
+      message,
+      enqueue: async () => ({ dispatched: Promise.resolve() }),
+    }),
+  ).rejects.toThrow("agent_request_outcome_unknown");
+});
+
+test("direct persistent receipt leaves an unknown provider outcome pending", async () => {
+  const { requests, directory } = await fixture();
+  const input = {
+    agentId: "agent",
+    messageId: "unknown-direct",
+    request: { prompt: "/compact" },
+    send: async (
+      beforeDispatch: () => Promise<void>,
+      _declined: () => Promise<void>,
+      onProviderOutcome: (outcome: "accepted" | "unknown") => Promise<void>,
+    ) => {
+      await beforeDispatch();
+      await onProviderOutcome("unknown");
+    },
+  };
+
+  await requests.send(input);
+  await expect(new MessageReceipts(directory).send(input)).rejects.toThrow(
+    "agent_request_outcome_unknown",
+  );
+});
+
+test("a queued provider refusal keeps the original message available for retry", async () => {
+  const { requests, directory } = await fixture();
+  const message = {
+    messageId: "refused-command",
+    prompt: "/compact",
+    source: { agentId: "sender" },
+    activeTurnBehavior: "steer" as const,
+    unarchive: false,
+  };
+  const refusal = new Error("provider refused command");
+
+  await expect(
+    requests.sendQueued({
+      agentId: "agent",
+      request: { prompt: message.prompt },
+      message,
+      async enqueue(handoff) {
+        await handoff.begin();
+        await handoff.declined();
+        return { dispatched: Promise.reject(refusal) };
+      },
+    }),
+  ).rejects.toBe(refusal);
+
+  const restarted = new MessageReceipts(directory);
+  expect((await restarted.queuedMessages()).map((item) => item.queued.message.messageId)).toEqual([
+    "refused-command",
+  ]);
+});

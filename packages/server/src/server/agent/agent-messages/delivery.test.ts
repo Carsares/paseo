@@ -1,5 +1,5 @@
 import { AgentTurnBusyError } from "../agent-prompt.js";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import {
   createAgentMessageDelivery,
   formatAgentMessage,
@@ -1068,6 +1068,95 @@ test("out-of-band acceptance owns callbacks and receipts; a failed attempt does 
   await ordinary.dispatched;
   expect(callbacks.at(-1)).toBe("ordinary");
   expect(sent).toEqual(["ordinary"]);
+  await delivery.close();
+});
+
+test("persistent commands carry the outcome wait through busy and idle dispatch paths", async () => {
+  const clock = createClock();
+  let running = true;
+  const outcomes = vi.fn(async () => undefined);
+  const idleOutcome = vi.fn(async () => undefined);
+  const dispatched: boolean[] = [];
+  const delivery = createAgentMessageDelivery({
+    schedule: clock.schedule,
+    isRunning: () => running,
+    tryRunOutOfBand: async (request, onAccepted, commandDispatch) => {
+      expect(request.waitForProviderOutcome).toBe(true);
+      await onAccepted();
+      await commandDispatch?.onProviderOutcome?.("unknown");
+      return true;
+    },
+    dispatch: async (request) => {
+      dispatched.push(request.waitForProviderOutcome);
+      await request.handoff?.onProviderOutcome?.("accepted");
+      return "turn_started";
+    },
+    onError: (error) => {
+      throw error;
+    },
+  });
+  const handoff = {
+    begin: vi.fn(async () => undefined),
+    declined: vi.fn(async () => undefined),
+    onProviderOutcome: outcomes,
+  };
+  const busy = delivery.enqueue({
+    recipientId: "agent",
+    prompt: "/compact",
+    source: { kind: "agent-message", agentId: "sender" },
+    waitForProviderOutcome: true,
+    handoff,
+  });
+  clock.advance(2000);
+  await expect(busy.dispatched).resolves.toBe("out_of_band");
+  expect(outcomes).toHaveBeenCalledWith("unknown");
+  expect(handoff.declined).not.toHaveBeenCalled();
+
+  running = false;
+  const idle = delivery.enqueue({
+    recipientId: "agent",
+    prompt: "/compact",
+    source: { kind: "agent-message", agentId: "sender" },
+    waitForProviderOutcome: true,
+    handoff: {
+      begin: async () => undefined,
+      declined: async () => undefined,
+      onProviderOutcome: idleOutcome,
+    },
+  });
+  clock.advance(2000);
+  await expect(idle.dispatched).resolves.toBe("turn_started");
+  expect(dispatched).toEqual([true]);
+  expect(idleOutcome).toHaveBeenCalledWith("accepted");
+  await delivery.close();
+});
+
+test("a provider refusal restores a persistent out-of-band command for retry", async () => {
+  const clock = createClock();
+  const declined = vi.fn(async () => undefined);
+  const delivery = createAgentMessageDelivery({
+    schedule: clock.schedule,
+    isRunning: () => true,
+    tryRunOutOfBand: async () => {
+      throw new Error("provider refused command");
+    },
+    dispatch: async () => "turn_started",
+    onError: () => undefined,
+  });
+  const receipt = delivery.enqueue({
+    recipientId: "agent",
+    prompt: "/compact",
+    source: { kind: "agent-message", agentId: "sender" },
+    waitForProviderOutcome: true,
+    handoff: {
+      begin: async () => undefined,
+      declined,
+    },
+  });
+
+  clock.advance(2000);
+  await expect(receipt.dispatched).rejects.toThrow("provider refused command");
+  expect(declined).toHaveBeenCalledOnce();
   await delivery.close();
 });
 

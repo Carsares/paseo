@@ -201,7 +201,10 @@ export function createWorkspaceAttachmentsStore(
     setWorkspaceAttachments: ({ scopeKey, attachments }) => {
       const { attachmentsByScope, draftHistoryHydrated } = get();
       const current = attachmentsByScope[scopeKey] ?? EMPTY_WORKSPACE_ATTACHMENTS;
-      const changed = !areWorkspaceAttachmentsEqual(current, attachments);
+      const changed =
+        attachments.length === 0
+          ? Object.hasOwn(attachmentsByScope, scopeKey)
+          : !areWorkspaceAttachmentsEqual(current, attachments);
       if (scopeKey.startsWith(DRAFT_SCOPE_PREFIX) && (changed || !draftHistoryHydrated)) {
         if (!draftHistoryHydrated) editedBeforeHydration.add(scopeKey);
         queueWrite();

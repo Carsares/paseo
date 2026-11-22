@@ -443,21 +443,34 @@ describe("daemon-manager commands", () => {
     },
   );
 
-  it.each([
+  it.each<{
+    outcome: string;
+    shouldRestore: boolean;
+    zipErrorCode?: number;
+    quitsDuringPreparation?: boolean;
+  }>([
     { outcome: "unavailable", shouldRestore: true },
     { outcome: "failed HTTP download", shouldRestore: true },
     { outcome: "native download timeout", shouldRestore: true },
     { outcome: "native download disconnected", shouldRestore: true },
     { outcome: "missing application bundle", shouldRestore: true },
+    { outcome: "failed ZIP extraction", shouldRestore: true, zipErrorCode: 1 },
+    { outcome: "unrecognized ZIP error code", shouldRestore: false, zipErrorCode: 2 },
+    {
+      outcome: "failed ZIP extraction during quit",
+      shouldRestore: false,
+      zipErrorCode: 1,
+      quitsDuringPreparation: true,
+    },
     { outcome: "no native terminal event", shouldRestore: false },
     { outcome: "error", shouldRestore: false },
     { outcome: "ready", shouldRestore: false },
     { outcome: "other feed then unavailable", shouldRestore: false },
     { outcome: "unavailable after feed replacement", shouldRestore: false },
-    { outcome: "unavailable during quit", shouldRestore: false },
-  ] as const)(
+    { outcome: "unavailable during quit", shouldRestore: false, quitsDuringPreparation: true },
+  ])(
     "handles a timed-out manual macOS update: $outcome",
-    async ({ outcome, shouldRestore }) => {
+    async ({ outcome, shouldRestore, zipErrorCode, quitsDuringPreparation }) => {
       const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
       Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -562,7 +575,7 @@ describe("daemon-manager commands", () => {
           "stopped for an app update",
         );
 
-        if (outcome === "unavailable during quit") {
+        if (quitsDuringPreparation) {
           lifecycle.handleBeforeQuit({ preventDefault: vi.fn() });
           expect(lifecycle.isQuitting()).toBe(true);
           expect(exit).not.toHaveBeenCalled();
@@ -594,6 +607,14 @@ describe("daemon-manager commands", () => {
             Object.assign(new Error("Could not locate update bundle"), {
               domain: "SQRLUpdaterErrorDomain",
               code: 2,
+            }),
+          );
+        } else if (zipErrorCode !== undefined) {
+          nativeUpdater.emit(
+            "error",
+            Object.assign(new Error("ditto: No space left on device"), {
+              domain: "SQRLZipArchiverErrorDomain",
+              code: zipErrorCode,
             }),
           );
         } else if (outcome === "ready") {
@@ -670,7 +691,7 @@ describe("daemon-manager commands", () => {
         }
         expect(updateSource.quitAndInstall).not.toHaveBeenCalled();
         quitting.resolve(false);
-        if (outcome === "unavailable during quit") {
+        if (quitsDuringPreparation) {
           await vi.waitFor(() => expect(exit).toHaveBeenCalledExactlyOnceWith(0));
         }
       } finally {

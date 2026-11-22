@@ -1,6 +1,10 @@
 import { AgentTurnBusyError, type PromptDispatchDisposition } from "../agent-prompt.js";
 import { randomUUID } from "node:crypto";
-import type { AgentPromptInput, AgentPromptContentBlock } from "../agent-sdk-types.js";
+import type {
+  AgentCommandOutcome,
+  AgentPromptInput,
+  AgentPromptContentBlock,
+} from "../agent-sdk-types.js";
 import { prepareAgentMessage, type AgentPromptSource } from "./envelope.js";
 import type { QueueHandoff } from "../../message-receipts/index.js";
 
@@ -19,6 +23,7 @@ interface Message {
   /** Recheck mutable sender authority when the message leaves the queue. */
   validateDispatch?: () => Promise<void>;
   beforeProviderDispatch?: () => Promise<void>;
+  waitForProviderOutcome?: boolean;
   handoff?: QueueHandoff;
   onDispatch?: (disposition: PromptDispatchDisposition) => void;
 }
@@ -51,6 +56,7 @@ interface DispatchRequest {
   unarchive: boolean;
   validateDispatch?: () => Promise<void>;
   beforeProviderDispatch(): Promise<void>;
+  waitForProviderOutcome: boolean;
   handoff?: QueueHandoff;
 }
 interface Dependencies {
@@ -62,6 +68,10 @@ interface Dependencies {
   tryRunOutOfBand?(
     request: DispatchRequest,
     onAccepted: () => void | Promise<void>,
+    commandDispatch?: {
+      waitForProviderOutcome?: boolean;
+      onProviderOutcome?: (outcome: AgentCommandOutcome) => Promise<void>;
+    },
   ): Promise<boolean>;
   dispatch(request: DispatchRequest): Promise<PromptDispatchDisposition>;
   onError(error: unknown, request: DispatchRequest): void;
@@ -138,6 +148,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
             async declined() {
               for (const message of messages) await message.handoff?.declined();
             },
+            async onProviderOutcome(outcome: AgentCommandOutcome) {
+              for (const message of messages) await message.handoff?.onProviderOutcome?.(outcome);
+            },
           }
         : undefined,
       recipientId,
@@ -160,6 +173,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       clearPendingPermissions: messages.some((message) => message.clearPendingPermissions),
       unarchive: messages.some((message) => message.unarchive !== false),
       validateDispatch: messages[0]!.validateDispatch,
+      waitForProviderOutcome: messages.some((message) => message.waitForProviderOutcome === true),
       async beforeProviderDispatch() {
         for (const message of messages) await message.beforeProviderDispatch?.();
       },
@@ -341,12 +355,19 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         const request = requestFor(recipientId, [message]);
         try {
           await request.validateDispatch?.();
-          const accepted = await dependencies.tryRunOutOfBand!(request, async () => {
-            if (!request.admit()) throw new Error("Queued agent message was withdrawn");
-            message.beforeDispatch?.();
-            await request.handoff?.begin();
-            await request.validateDispatch?.();
-          });
+          const accepted = await dependencies.tryRunOutOfBand!(
+            request,
+            async () => {
+              if (!request.admit()) throw new Error("Queued agent message was withdrawn");
+              message.beforeDispatch?.();
+              await request.handoff?.begin();
+              await request.validateDispatch?.();
+            },
+            {
+              waitForProviderOutcome: request.waitForProviderOutcome,
+              onProviderOutcome: request.handoff?.onProviderOutcome,
+            },
+          );
           if (!accepted) {
             message.outOfBandDeclined = true;
             waiting.push(message);
@@ -361,6 +382,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
           message.resolve("out_of_band");
         } catch (error) {
           if (isWithdrawn(message)) continue;
+          await request.handoff?.declined();
           message.reject(error);
           dependencies.onError(error, request);
         }

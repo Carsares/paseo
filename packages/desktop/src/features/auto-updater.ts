@@ -164,6 +164,11 @@ function isMacUpdatePreparationFailure(error: unknown): boolean {
     return error.code === 2 || error.code === 5;
   }
 
+  // Squirrel extracts the ZIP before verifying the bundle or writing the install request.
+  if (error.domain === "SQRLZipArchiverErrorDomain") {
+    return error.code === 1; // SQRLZipArchiverShellTaskFailed
+  }
+
   // The native URL requests also finish before the local install handoff.
   // NSURLErrorTimedOut and NSURLErrorNetworkConnectionLost
   return error.domain === "NSURLErrorDomain" && (error.code === -1001 || error.code === -1005);

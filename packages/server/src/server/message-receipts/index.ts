@@ -4,6 +4,7 @@ import path from "node:path";
 import { z } from "zod";
 import { AgentAttachmentSchema } from "@getpaseo/protocol/messages";
 import { writeJsonFileAtomic } from "../atomic-file.js";
+import type { AgentCommandOutcome } from "../agent/agent-sdk-types.js";
 
 const AddressSchema = z.object({ agentId: z.string().min(1), serverId: z.string().min(1) });
 const QueuedMessageSchema = z.object({
@@ -43,6 +44,7 @@ export type QueuedMessageReceipt = Receipt & { queued: NonNullable<Receipt["queu
 export interface QueueHandoff {
   begin(): Promise<void>;
   declined(): Promise<void>;
+  onProviderOutcome?(outcome: AgentCommandOutcome): Promise<void>;
 }
 export class AgentRequestOutcomeUnknownError extends Error {
   constructor() {
@@ -57,7 +59,11 @@ interface SendMessageInput {
    * Delivers the message. It awaits `beforeDispatch` immediately before the provider can receive
    * the message; a failure before that call proves nothing was submitted and leaves no receipt.
    */
-  send: (beforeDispatch: () => Promise<void>, declined: () => Promise<void>) => Promise<void>;
+  send: (
+    beforeDispatch: () => Promise<void>,
+    declined: () => Promise<void>,
+    onProviderOutcome: (outcome: AgentCommandOutcome) => Promise<void>,
+  ) => Promise<void>;
   /** Admission was refused before the message could enter the delivery queue. */
   retryIfNotAdmitted?: (error: unknown) => boolean;
   /** Only errors that prove the provider never received the message may clear a pending receipt. */
@@ -172,11 +178,14 @@ export class MessageReceipts {
     const admission = this.admissionTail.then(async () => {
       const queued = existing?.queued ?? { message: input.message, sequence: ++this.sequence };
       let handedOff = false;
+      let declinedAndRestored = false;
+      let providerOutcome: AgentCommandOutcome | undefined;
       const saveQueued = () => this.writeQueued(file, { ...receipt, state: "pending", queued });
       if (!existing) await saveQueued();
       const handoff = {
         begin: async () => {
           if (handedOff) return;
+          declinedAndRestored = false;
           await writeJsonFileAtomic(file, { ...receipt, state: "pending" });
           handedOff = true;
         },
@@ -184,6 +193,13 @@ export class MessageReceipts {
           if (!handedOff) return;
           await saveQueued();
           handedOff = false;
+          declinedAndRestored = true;
+        },
+        onProviderOutcome: async (outcome: AgentCommandOutcome) => {
+          providerOutcome = outcome;
+          if (outcome === "unknown") {
+            await writeJsonFileAtomic(file, { ...receipt, state: "pending" });
+          }
         },
       };
       try {
@@ -192,11 +208,14 @@ export class MessageReceipts {
         return {
           completed: queuedDelivery.dispatched.then(
             async () => {
+              if (providerOutcome === "unknown") return;
               this.awaitingCommit.set(key, receipt);
               return this.commit(file, key, receipt);
             },
             async (error) => {
-              if (!handedOff && !input.retainOnError?.(error)) {
+              if (input.retainOnError?.(error)) {
+                await handoff.declined();
+              } else if (!handedOff && !declinedAndRestored) {
                 await writeJsonFileAtomic(file, { ...receipt, state: "pending" });
               }
               throw error;
@@ -253,15 +272,23 @@ export class MessageReceipts {
       await rm(file, { force: true });
       pending = null;
     };
+    let providerOutcome: AgentCommandOutcome | undefined;
     try {
-      await input.send(() => {
-        pending ??= writeJsonFileAtomic(file, { ...receipt, state: "pending" });
-        return pending;
-      }, declined);
+      await input.send(
+        () => {
+          pending ??= writeJsonFileAtomic(file, { ...receipt, state: "pending" });
+          return pending;
+        },
+        declined,
+        async (outcome) => {
+          providerOutcome = outcome;
+        },
+      );
     } catch (error) {
       if (input.retryIfNotAdmitted?.(error) || input.retryIfUnsent?.(error)) await declined();
       throw error;
     }
+    if (providerOutcome === "unknown") return;
     if (input.retryIfUnsent) this.awaitingCommit.set(key, receipt);
     await this.commit(file, key, receipt);
   }

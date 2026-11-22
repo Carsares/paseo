@@ -42,6 +42,7 @@ import type { TerminalManager } from "../../terminal/terminal-manager.js";
 import {
   AgentTurnStartCanceledError,
   AgentTurnStartRejectedError,
+  type AgentCommandOutcome,
   getAgentStreamEventTurnId,
   type AgentCapabilityFlags,
   type AgentClient,
@@ -218,6 +219,13 @@ export class AgentManagerShuttingDownError extends Error {
   constructor() {
     super("Agent manager is shutting down");
     this.name = "AgentManagerShuttingDownError";
+  }
+}
+
+export class AgentCommandNotDispatchedError extends Error {
+  constructor(cause?: unknown) {
+    super("Out-of-band command did not reach the provider", { cause });
+    this.name = "AgentCommandNotDispatchedError";
   }
 }
 
@@ -5320,7 +5328,11 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
     onAccepted?: () => void | Promise<void>,
-    commandDispatch?: { waitForProviderOutcome?: boolean; assertAllowed?: () => void },
+    commandDispatch?: {
+      waitForProviderOutcome?: boolean;
+      assertAllowed?: () => void;
+      onProviderOutcome?: (outcome: AgentCommandOutcome) => Promise<void>;
+    },
   ): Promise<boolean> {
     this.assertAcceptingAgentRuns();
     if (this.collectingRuntimes.has(agentId) || !this.agents.has(agentId)) {
@@ -5384,20 +5396,29 @@ export class AgentManager {
           markCommandStarted = resolveStarted;
         })
       : undefined;
-    let providerHandoffAccepted = false;
+    let providerHandoffOutcome: AgentCommandOutcome | undefined;
+    let failedAdmission: { error: unknown } | undefined;
     const beforeProviderDispatch = requiresProviderHandoff
       ? async () => {
-          this.assertAcceptingAgentRuns();
-          assertDispatchAllowed?.();
-          const accepted = onAccepted?.();
-          if (accepted) await accepted;
-          this.assertAcceptingAgentRuns();
-          assertDispatchAllowed?.();
+          try {
+            this.assertAcceptingAgentRuns();
+            assertDispatchAllowed?.();
+            const accepted = onAccepted?.();
+            if (accepted) await accepted;
+            this.assertAcceptingAgentRuns();
+            assertDispatchAllowed?.();
+          } catch (error) {
+            // A command handler may turn this error into a timeline message.
+            failedAdmission = { error };
+            throw error;
+          }
         }
       : undefined;
     const onProviderOutcome = requiresProviderHandoff
-      ? () => {
-          providerHandoffAccepted = true;
+      ? async (outcome: AgentCommandOutcome = "accepted") => {
+          if (providerHandoffOutcome) return;
+          providerHandoffOutcome = outcome;
+          await commandDispatch?.onProviderOutcome?.(outcome);
           markCommandStarted?.();
         }
       : undefined;
@@ -5406,7 +5427,10 @@ export class AgentManager {
       try {
         await handler.run({ emit: dispatch, beforeProviderDispatch, onProviderOutcome });
       } catch (error) {
-        if (requiresProviderHandoff && !providerHandoffAccepted) throw error;
+        if (requiresProviderHandoff && !providerHandoffOutcome) {
+          if (failedAdmission) throw failedAdmission.error;
+          throw new AgentCommandNotDispatchedError(error);
+        }
         const text = error instanceof Error ? error.message : "Out-of-band command failed";
         dispatch({
           type: "timeline",
@@ -5414,8 +5438,9 @@ export class AgentManager {
           item: { type: "assistant_message", text: `[Error] ${text}` },
         });
       }
-      if (requiresProviderHandoff && !providerHandoffAccepted) {
-        throw new Error("Out-of-band command did not reach the provider");
+      if (requiresProviderHandoff && !providerHandoffOutcome) {
+        if (failedAdmission) throw failedAdmission.error;
+        throw new AgentCommandNotDispatchedError();
       }
     });
     if (commandStarted) await Promise.race([commandStarted, command]);

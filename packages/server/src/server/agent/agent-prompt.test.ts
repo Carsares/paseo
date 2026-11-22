@@ -14,14 +14,16 @@ import { join } from "node:path";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager } from "./agent-manager.js";
-import { waitForAgentRunStartWithTimeout } from "./agent-prompt.js";
+import { sendPreparedPromptToAgent, waitForAgentRunStartWithTimeout } from "./agent-prompt.js";
 import { ForegroundPromptStart } from "./agent-run-state.js";
 import type {
   AgentClient,
+  AgentCommandOutcome,
   AgentRunResult,
   AgentSession,
   AgentStreamEvent,
 } from "./agent-sdk-types.js";
+import type { AgentStorage } from "./agent-storage.js";
 
 test("isSystemInjectedEnvelope matches the envelope formatSystemNotificationPrompt produces", () => {
   expect(isSystemInjectedEnvelope(formatSystemNotificationPrompt("child finished"))).toBe(true);
@@ -203,6 +205,49 @@ async function createRunStartScenario(startDelayMs: number | null): Promise<{
     },
   };
 }
+
+test("sendPreparedPromptToAgent forwards persistent command outcomes from an idle provider", async () => {
+  const outcomes = vi.fn(async (_outcome: AgentCommandOutcome) => undefined);
+  const agentManager = {
+    getAgent: () => ({ id: "agent", provider: "codex", historyPrimed: true }),
+    waitForAgentClose: async () => undefined,
+    hasInFlightRun: () => false,
+    tryRunOutOfBand: async (
+      _agentId: string,
+      _prompt: AgentPromptInput,
+      _options: unknown,
+      _onAccepted: (() => void | Promise<void>) | undefined,
+      commandDispatch:
+        | {
+            waitForProviderOutcome?: boolean;
+            onProviderOutcome?: (outcome: AgentCommandOutcome) => Promise<void>;
+          }
+        | undefined,
+    ) => {
+      expect(commandDispatch?.waitForProviderOutcome).toBe(true);
+      await commandDispatch?.onProviderOutcome?.("unknown");
+      return true;
+    },
+  } as unknown as AgentManager;
+  const agentStorage = { get: async () => null } as unknown as AgentStorage;
+
+  await expect(
+    sendPreparedPromptToAgent({
+      agentManager,
+      agentStorage,
+      agentId: "agent",
+      prompt: "/compact",
+      handoff: {
+        begin: async () => undefined,
+        declined: async () => undefined,
+        onProviderOutcome: outcomes,
+      },
+      waitForCommandOutcome: true,
+      logger: createTestLogger(),
+    }),
+  ).resolves.toEqual({ disposition: "out_of_band" });
+  expect(outcomes).toHaveBeenCalledWith("unknown");
+});
 
 test("waiting for a run start outlasts the slowest provider startup budget", async () => {
   // A provider is still allowed to be starting here, so the outer wait must not abort it.

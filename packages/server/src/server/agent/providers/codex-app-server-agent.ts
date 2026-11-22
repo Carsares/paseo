@@ -9,6 +9,7 @@ import {
   type AgentPermissionAction,
   type AgentCapabilityFlags,
   type AgentClient,
+  type AgentCommandOutcome,
   type AgentCreateSessionOptions,
   type AgentOptionControl,
   type AgentLaunchContext,
@@ -6145,7 +6146,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private async dispatchCommandRequest(
     request: () => Promise<unknown>,
     beforeProviderDispatch?: () => Promise<void>,
-    onProviderOutcome?: () => void,
+    onProviderOutcome?: (outcome?: AgentCommandOutcome) => void | Promise<void>,
   ): Promise<void> {
     if (beforeProviderDispatch) await beforeProviderDispatch();
     try {
@@ -6154,16 +6155,16 @@ export class CodexAppServerAgentSession implements AgentSession {
       // Protocol-level request rejection proves the command did not execute.
       // Transport failures and other server errors leave the outcome unknown.
       if (!isCodexRequestRejected(error)) {
-        onProviderOutcome?.();
+        await onProviderOutcome?.("unknown");
       }
       throw error;
     }
-    onProviderOutcome?.();
+    await onProviderOutcome?.("accepted");
   }
 
   private async executeCompactCommand(
     beforeProviderDispatch?: () => Promise<void>,
-    onProviderOutcome?: () => void,
+    onProviderOutcome?: (outcome?: AgentCommandOutcome) => void | Promise<void>,
   ): Promise<string | null> {
     try {
       await this.connect();
@@ -6197,7 +6198,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private async executeGoalSubcommand(
     subcommand: GoalSubcommand,
     beforeProviderDispatch?: () => Promise<void>,
-    onProviderOutcome?: () => void,
+    onProviderOutcome?: (outcome?: AgentCommandOutcome) => void | Promise<void>,
   ): Promise<string> {
     if (subcommand.kind === "usage") {
       return "Usage: /goal <objective>|pause|resume|clear";

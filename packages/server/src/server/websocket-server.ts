@@ -806,12 +806,13 @@ export class VoiceAssistantWebSocketServer {
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
     this.agentMessages = createAgentMessageDelivery({
-      tryRunOutOfBand: (request, onAccepted) =>
+      tryRunOutOfBand: (request, onAccepted, commandDispatch) =>
         agentManager.tryRunOutOfBand(
           request.recipientId,
           request.prompt,
           { clientMessageId: request.messageIds[0] },
           onAccepted,
+          commandDispatch,
         ),
       isRunning: (agentId) => agentManager.hasInFlightRun(agentId),
       hasPendingPermission: (agentId) => agentManager.hasPendingPermissions(agentId),
@@ -840,6 +841,7 @@ export class VoiceAssistantWebSocketServer {
           sessionMode: batch.validateDispatch ? undefined : batch.sessionMode,
           clearPendingPermissions: batch.clearPendingPermissions,
           unarchive: batch.unarchive,
+          waitForCommandOutcome: batch.waitForProviderOutcome,
           runOptions: { clientMessageId: batch.messageIds[0] },
           beforeDispatch: async () => {
             if (batch.shouldReportUpward) {
@@ -3066,7 +3068,8 @@ export class VoiceAssistantWebSocketServer {
       retryIfUnsent: (error) =>
         error instanceof AgentRunCancellationError ||
         error instanceof ParentReportRecipientUnavailableError ||
-        error instanceof ParentReportConfirmationUnavailableError,
+        error instanceof ParentReportConfirmationUnavailableError ||
+        retainQueuedAgentMessage(error),
       // Use the same receipt if a reverse route tried to dispatch before the observer enrolled.
       request: {
         prompt: report.prompt,
@@ -3075,7 +3078,7 @@ export class VoiceAssistantWebSocketServer {
         sourceAgentServerId: record.serverId,
         activeTurnBehavior: "steer",
       },
-      send: async (beforeProviderDispatch, declined) => {
+      send: async (beforeProviderDispatch, declined, onProviderOutcome) => {
         await validateDispatch?.();
         const receipt = this.agentMessages.enqueue({
           recipientId: record.callerAgentId,
@@ -3099,12 +3102,14 @@ export class VoiceAssistantWebSocketServer {
           validateDispatch,
           activeTurnBehavior: "steer",
           unarchive: false,
+          waitForProviderOutcome: true,
           handoff: {
             begin: async () => {
               await beforeProviderDispatch();
               await options.confirmBeforeDispatch?.();
             },
             declined,
+            onProviderOutcome,
           },
         });
         await receipt.dispatched;

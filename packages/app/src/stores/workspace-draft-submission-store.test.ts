@@ -194,3 +194,75 @@ test("a new process restores a fork's host and boundary without replaying pendin
     sourceServerId: "host-2",
   });
 });
+
+test.each([false, true])(
+  "recovers the first worktree agent settings and main intent (%s)",
+  async (createMainAgent) => {
+    const storage = createStorage();
+    const { createWorkspaceDraftSubmissionStore } = loadProductionStores();
+    const writer = createWorkspaceDraftSubmissionStore(storage);
+    const draftId = "submitted-fork";
+    const sourceServerId = "fork-host";
+    const forkSetup = {
+      provider: "codex",
+      cwd: "/source",
+      modeId: "source-mode",
+      model: "source-model",
+      thinkingOptionId: null,
+      providerOptions: { feature: false },
+      forkFrom: { sourceAgentId: "source-agent", boundaryMessageId: "source-message" },
+    };
+    await writer.getState().saveForkDraftSetup({
+      draftId,
+      sourceServerId,
+      sourceDirectory: "/source",
+      setup: forkSetup,
+    });
+
+    const submission = {
+      source: {
+        kind: "worktree",
+        cwd: "/source",
+        projectId: "project",
+        worktreeSlug: "reserved-worktree",
+      },
+      baseItem: null,
+      metadata: {},
+      agentIntent: {
+        config: {
+          provider: "codex",
+          cwd: "/source",
+          model: "submitted-model",
+          thinkingOptionId: "high",
+          providerOptions: { feature: true, nested: { value: ["some-setting"] } },
+        },
+        createMainAgent,
+      },
+    } satisfies StoreModule.ForkWorktreeSubmission;
+    await writer.getState().reserveForkWorktree({ draftId, serverId: sourceServerId, submission });
+
+    const reader = createWorkspaceDraftSubmissionStore(storage);
+    await reader.getState().hydrateDraftSetup(draftId);
+    await expect(
+      reader.getState().reserveForkWorktree({
+        draftId,
+        serverId: sourceServerId,
+        submission: {
+          ...submission,
+          agentIntent: {
+            config: { provider: "claude", cwd: "/source", model: "edited-model" },
+            createMainAgent: !createMainAgent,
+          },
+        },
+      }),
+    ).resolves.toBe("reserved-worktree");
+    const retry = createWorkspaceDraftSubmissionStore(storage);
+    await retry.getState().hydrateDraftSetup(draftId);
+    expect(retry.getState().setupByDraftId[draftId]?.setup).toEqual(forkSetup);
+    expect(retry.getState().draftSetupStatusById[draftId]).toEqual({
+      sourceServerId,
+      worktreeSlug: "reserved-worktree",
+      worktreeSubmission: submission,
+    });
+  },
+);

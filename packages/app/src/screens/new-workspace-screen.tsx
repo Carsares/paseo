@@ -61,6 +61,7 @@ import { useOpenAddProject } from "@/hooks/use-open-add-project";
 import { isActiveCreateFlowForDraft, useCreateFlowStore } from "@/stores/create-flow-store";
 import {
   useWorkspaceDraftSubmissionStore,
+  type ForkWorktreeAgentIntent,
   type ForkWorktreeSubmission,
   type PendingWorkspaceDraftSetup,
 } from "@/stores/workspace-draft-submission-store";
@@ -313,7 +314,7 @@ async function resolveWorktreeCreationSource(input: {
   sourceDirectory: string;
   projectId: string;
   worktreeSlug: string;
-  forkIdentity?: { draftId: string; serverId: string };
+  forkIdentity?: { draftId: string; serverId: string; agentIntent: ForkWorktreeAgentIntent };
   t: TFunction;
 }): Promise<ForkWorktreeSubmission["source"]> {
   const { setup, submittedWorktree } = input;
@@ -335,8 +336,9 @@ async function resolveWorktreeCreationSource(input: {
   if (submittedWorktree && equal(source, submittedWorktree.source)) return submittedWorktree.source;
   if (!input.forkIdentity) return source;
   const worktreeSlug = await useWorkspaceDraftSubmissionStore.getState().reserveForkWorktree({
-    ...input.forkIdentity,
-    submission: { source, baseItem, metadata },
+    draftId: input.forkIdentity.draftId,
+    serverId: input.forkIdentity.serverId,
+    submission: { source, baseItem, metadata, agentIntent: input.forkIdentity.agentIntent },
   });
   return { ...source, worktreeSlug };
 }
@@ -463,6 +465,7 @@ interface CreateChatAgentInput {
   forkDraftSetup?: PendingWorkspaceDraftSetup | null;
   ensureWorkspace: EnsureWorkspace;
   createMainAgent: boolean;
+  submittedAgentConfig?: ForkWorktreeAgentIntent["config"];
   serverId: string;
   draftKey: string;
   clearDraft: (lifecycle: "sent" | "abandoned") => void;
@@ -492,26 +495,10 @@ function buildWorkspaceAgentConfig(
   };
 }
 
-function buildWorkspaceDraftSetupFromComposer(input: {
-  cwd: string;
-  provider: AgentProvider;
-  composerState: NewWorkspaceComposerState;
-}): WorkspaceDraftTabSetup {
-  return {
-    provider: input.provider,
-    cwd: input.cwd,
-    modeId: input.composerState.effectiveModeId || null,
-    model: input.composerState.effectiveModelId || null,
-    thinkingOptionId: input.composerState.effectiveThinkingOptionId || null,
-    providerOptions: input.composerState.providerOptions ?? {},
-  };
-}
-
 function buildWorkspaceDraftSetupForCreatedWorkspace(input: {
   forkDraftSetup: PendingWorkspaceDraftSetup | null | undefined;
   workspaceDirectory: string;
-  provider: AgentProvider;
-  composerState: NewWorkspaceComposerState;
+  agentConfig: ForkWorktreeAgentIntent["config"];
   mainAgentId?: string;
 }): WorkspaceDraftTabSetup | undefined {
   if (!input.forkDraftSetup && !input.mainAgentId) return undefined;
@@ -522,21 +509,22 @@ function buildWorkspaceDraftSetupForCreatedWorkspace(input: {
         workspaceDirectory: input.workspaceDirectory,
       })
     : input.workspaceDirectory;
-  const setup = buildWorkspaceDraftSetupFromComposer({
-    cwd,
-    provider: input.provider,
-    composerState: input.composerState,
-  });
+  const { provider, modeId, model, thinkingOptionId, providerOptions } = input.agentConfig;
   const forkFrom = input.forkDraftSetup?.setup.forkFrom;
   return {
-    ...setup,
+    cwd,
+    provider,
+    modeId: modeId ?? null,
+    model: model ?? null,
+    thinkingOptionId: thinkingOptionId ?? null,
+    providerOptions: providerOptions ?? {},
     ...(input.mainAgentId ? { parentAgentId: input.mainAgentId } : {}),
     ...(forkFrom ? { forkFrom, restoreChatHistory: false } : {}),
   };
 }
 
 function buildComposerInitialValues(input: {
-  initialSetup?: WorkspaceDraftTabSetup | null;
+  initialSetup?: CreateAgentInitialValues | null;
 }): CreateAgentInitialValues | undefined {
   if (input.initialSetup) {
     return {
@@ -567,7 +555,7 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
   if (!composerState) {
     throw new Error(input.labels.composerStateRequired);
   }
-  const provider = composerState.selectedProvider;
+  const provider = input.submittedAgentConfig?.provider ?? composerState.selectedProvider;
   if (!provider) {
     throw new Error(input.labels.selectModel);
   }
@@ -584,7 +572,9 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
   const images = await encodeImages(wirePayload.images);
   let navigated = false;
   let outcome: SubmitOutcome = "background";
-  const agentConfig = buildWorkspaceAgentConfig(cwd, provider, composerState);
+  const agentConfig = input.submittedAgentConfig
+    ? { ...input.submittedAgentConfig, cwd }
+    : buildWorkspaceAgentConfig(cwd, provider, composerState);
   const forkFrom = input.forkDraftSetup?.setup.forkFrom;
   const initialAgent: NonNullable<CreateWorkspaceRequestOptions["agent"]> = {
     config: agentConfig,
@@ -605,8 +595,7 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
     const initialSetup = buildWorkspaceDraftSetupForCreatedWorkspace({
       forkDraftSetup: input.forkDraftSetup,
       workspaceDirectory: workspace.workspaceDirectory,
-      provider,
-      composerState,
+      agentConfig,
       mainAgentId: mainAgent?.id,
     });
     outcome = submitWorkspaceDraft({
@@ -664,13 +653,15 @@ function buildComposerConfig(input: {
   workspaceDirectory: string | null;
   sourceDirectory: string | null;
   initialSetup?: WorkspaceDraftTabSetup | null;
+  restoredWorktree?: ForkWorktreeSubmission;
 }): Parameters<typeof useAgentInputDraft>[0]["composer"] {
-  const { serverId, workspaceDirectory, sourceDirectory, initialSetup } = input;
+  const { serverId, workspaceDirectory, sourceDirectory, initialSetup, restoredWorktree } = input;
+  const composerSetup = restoredWorktree?.agentIntent?.config ?? initialSetup;
   const workingDir = workspaceDirectory || sourceDirectory || undefined;
   return {
     initialServerId: serverId || null,
-    initialValues: buildComposerInitialValues({ initialSetup }),
-    initialProviderOptions: initialSetup?.providerOptions,
+    initialValues: buildComposerInitialValues({ initialSetup: composerSetup }),
+    initialProviderOptions: composerSetup?.providerOptions,
     context: "new-workspace" as const,
     isVisible: true,
     lockedWorkingDir: workingDir,
@@ -1044,6 +1035,11 @@ export function NewWorkspaceScreen({
   const { forkDraftSetup, isTimelineFork, reservedWorktreeSlug, storedDraft } =
     usePendingWorkspaceDraftSetup(draftId);
   const [restoredWorktree] = useState(() => storedDraft?.worktreeSubmission);
+  const agentConfigRevision = useRef(0);
+  const submittedAgentConfigRevision = useRef(0);
+  const markAgentConfigEdited = useCallback(() => {
+    agentConfigRevision.current += 1;
+  }, []);
   const composerEditing = useNewWorkspaceComposerEditing();
   const { leaveFullscreen } = composerEditing;
   const mergeWorkspaces = useCallback(
@@ -1190,6 +1186,7 @@ export function NewWorkspaceScreen({
       workspaceDirectory: workspace?.workspaceDirectory ?? null,
       sourceDirectory: selectedSourceDirectory,
       initialSetup: forkDraftSetup?.setup,
+      restoredWorktree,
     }),
   });
   const composerState = chatDraft.composerState;
@@ -1515,9 +1512,17 @@ export function NewWorkspaceScreen({
           sourceDirectory: workingDirectory,
           projectId: selectedProjectId,
           worktreeSlug: reservedWorktreeSlug ?? creationIdentity.worktreeSlug,
-          forkIdentity: isTimelineFork
-            ? { draftId: creationIdentity.draftId, serverId: selectedServerId }
-            : undefined,
+          forkIdentity:
+            isTimelineFork && input.agent?.config
+              ? {
+                  draftId: creationIdentity.draftId,
+                  serverId: selectedServerId,
+                  agentIntent: {
+                    config: input.agent.config,
+                    createMainAgent: Boolean(input.mainAgent),
+                  },
+                }
+              : undefined,
           t,
         });
       }
@@ -1614,12 +1619,30 @@ export function NewWorkspaceScreen({
         }
 
         setPendingAction("chat");
+        const stored =
+          useWorkspaceDraftSubmissionStore.getState().draftSetupStatusById[
+            creationIdentity.draftId
+          ];
+        const submittedAgentIntent =
+          typeof stored === "object" && stored.sourceServerId === selectedServerId
+            ? stored.worktreeSubmission?.agentIntent
+            : undefined;
+        if (!submittedAgentIntent) {
+          submittedAgentConfigRevision.current = agentConfigRevision.current;
+        }
+        // Catalog refreshes and remembered preferences can change the effective composer values.
+        // Only a deliberate edit should replace the configuration from an accepted request.
+        const submittedAgentConfig =
+          agentConfigRevision.current === submittedAgentConfigRevision.current
+            ? submittedAgentIntent?.config
+            : undefined;
         const outcome = await runCreateChatAgent({
           payload,
           composerState,
           forkDraftSetup,
           ensureWorkspace,
-          createMainAgent,
+          createMainAgent: submittedAgentIntent?.createMainAgent ?? createMainAgent,
+          submittedAgentConfig,
           serverId: selectedServerId,
           clearDraft: chatDraft.clear,
           draftKey,
@@ -1742,16 +1765,32 @@ export function NewWorkspaceScreen({
     workingDirectory,
   ]);
 
-  const agentControlsWithDisabled = useMemo(
-    () =>
-      composerState
-        ? {
-            ...composerState.agentControls,
-            disabled: isPending,
-          }
-        : undefined,
-    [composerState, isPending],
-  );
+  const agentControlsWithDisabled = useMemo(() => {
+    if (!composerState) return undefined;
+    const controls = composerState.agentControls;
+    if (!isTimelineFork) return { ...controls, disabled: isPending };
+    function trackEdit<Args extends unknown[], Result>(action: (...args: Args) => Result) {
+      return (...args: Args) => {
+        const result = action(...args);
+        if (result !== false) markAgentConfigEdited();
+        return result;
+      };
+    }
+    return {
+      ...controls,
+      disabled: isPending,
+      onSelectMode: trackEdit(controls.onSelectMode),
+      onSelectModel: trackEdit(controls.onSelectModel),
+      onSelectProviderAndModel: trackEdit(controls.onSelectProviderAndModel),
+      onSelectThinkingOption: trackEdit(controls.onSelectThinkingOption),
+      onApplyAgentProfile: trackEdit(controls.onApplyAgentProfile),
+      onSetOption: trackEdit(controls.onSetOption),
+      optionControls: controls.optionControls && {
+        ...controls.optionControls,
+        onSetOption: trackEdit(controls.optionControls.onSetOption),
+      },
+    };
+  }, [composerState, isPending, isTimelineFork, markAgentConfigEdited]);
 
   const pickerEmptyText =
     branchSuggestionsQuery.isFetching || githubPrSearchQuery.isFetching

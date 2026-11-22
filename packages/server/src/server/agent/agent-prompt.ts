@@ -433,6 +433,22 @@ function preparePromptHandoff({
   };
 }
 
+function createAdmitSteer({
+  canSteerDuringDrain,
+  validateDispatch,
+  admit,
+}: Pick<SendPromptToAgentParams, "canSteerDuringDrain" | "validateDispatch" | "admit">):
+  | (() => Promise<boolean>)
+  | undefined {
+  if (!canSteerDuringDrain) return undefined;
+  return async () => {
+    await validateDispatch?.();
+    if (!canSteerDuringDrain()) return false;
+    if (admit?.() === false) throw new Error("Queued agent message was withdrawn");
+    return true;
+  };
+}
+
 /** Dispatch daemon-prepared context without reclassifying it as human input. */
 export async function sendPreparedPromptToAgent(
   params: Omit<SendPromptToAgentParams, "source" | "messageId">,
@@ -485,18 +501,12 @@ export async function sendPreparedPromptToAgent(
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
     replaceRunning: !params.idleOnly,
     idleOnly: params.idleOnly,
-    admitSteer: params.canSteerDuringDrain
-      ? async () => {
-          await params.validateDispatch?.();
-          if (!params.canSteerDuringDrain?.()) return false;
-          if (params.admit?.() === false) throw new Error("Queued agent message was withdrawn");
-          return true;
-        }
-      : undefined,
+    admitSteer: createAdmitSteer(params),
     beforeHandoff,
     commandDispatch: {
       waitForProviderOutcome: params.waitForCommandOutcome,
       assertAllowed: params.assertDispatchAllowed,
+      onProviderOutcome: params.handoff?.onProviderOutcome,
     },
     onSteerDeclined: params.handoff?.declined,
     admit: params.admit,
