@@ -71,7 +71,17 @@ export interface AppUpdateShutdown {
 }
 
 /** The native updater may already install on exit. Keep the daemon stopped. */
-export class AppUpdateHandoffUncertainError extends Error {}
+export class AppUpdateHandoffUncertainError extends Error {
+  readonly confirmedNotPrepared?: Promise<boolean>;
+
+  constructor(
+    message: string,
+    options?: ErrorOptions & { confirmedNotPrepared?: Promise<boolean> },
+  ) {
+    super(message, options);
+    this.confirmedNotPrepared = options?.confirmedNotPrepared;
+  }
+}
 
 export type BeforeAppUpdateInstall = (
   target: AppUpdateTarget,
@@ -438,6 +448,30 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     return installError;
   }
 
+  async function recoverInstallError(
+    shutdown: AppUpdateShutdown | undefined,
+    error: unknown,
+    restart: boolean,
+  ): Promise<string> {
+    const uncertainHandoff = error instanceof AppUpdateHandoffUncertainError ? error : undefined;
+    const installError = uncertainHandoff
+      ? getErrorMessage(error)
+      : `Update failed: ${getErrorMessage(error)}`;
+    deps.reportInstallError?.(installError);
+    const message = await recoverAfterFailedInstall(
+      shutdown,
+      installError,
+      restart && !uncertainHandoff,
+    );
+    if (restart && shutdown && uncertainHandoff?.confirmedNotPrepared) {
+      // Keep the install response bounded. Only this attempt can restore its daemon.
+      void uncertainHandoff.confirmedNotPrepared.then((notPrepared) =>
+        notPrepared ? recoverAfterFailedInstall(shutdown, installError, true) : undefined,
+      );
+    }
+    return message;
+  }
+
   async function installCheckedUpdate(
     check: AppUpdateCheckResult,
     {
@@ -457,8 +491,7 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
       message,
     });
     let shutdown: AppUpdateShutdown | undefined;
-    let installError: string | null = null;
-    let handoffUncertain = false;
+    let installError: string;
     try {
       const blocked = deps.runtime.getInstallBlockReason?.();
       if (blocked) return notInstalled(blocked);
@@ -494,16 +527,10 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
         };
       }
     } catch (error) {
-      handoffUncertain = error instanceof AppUpdateHandoffUncertainError;
-      installError = handoffUncertain
-        ? getErrorMessage(error)
-        : `Update failed: ${getErrorMessage(error)}`;
-      deps.reportInstallError?.(installError);
+      return notInstalled(await recoverInstallError(shutdown, error, restart));
     }
 
-    return notInstalled(
-      await recoverAfterFailedInstall(shutdown, installError, restart && !handoffUncertain),
-    );
+    return notInstalled(await recoverAfterFailedInstall(shutdown, installError, restart));
   }
 
   function hasDownloadedUpdate(): boolean {

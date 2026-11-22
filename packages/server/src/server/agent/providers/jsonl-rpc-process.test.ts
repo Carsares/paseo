@@ -4,7 +4,12 @@ import { PassThrough } from "node:stream";
 import pino from "pino";
 import { describe, expect, test } from "vitest";
 
-import { JsonlRpcProcess, type JsonlRpcExit } from "./jsonl-rpc-process.js";
+import {
+  JsonlRpcProcess,
+  JsonlRpcRequestNotSentError,
+  JsonlRpcResponseError,
+  type JsonlRpcExit,
+} from "./jsonl-rpc-process.js";
 
 const CHILD_SOURCE = String.raw`
 const readline = require("node:readline");
@@ -41,7 +46,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
     return;
   }
   if (command.type === "fail") {
-    respond(command, false, null, "child rejected the request");
+    respond(command, false, null, command.error ?? "child rejected the request");
     return;
   }
   if (command.type === "hang") {
@@ -183,6 +188,19 @@ describe("JsonlRpcProcess", () => {
       await expect(transport.request({ type: "fail" })).rejects.toThrow(
         "child rejected the request",
       );
+    } finally {
+      await transport.close();
+    }
+  });
+
+  test("identifies a provider rejection even when its text matches a transport error", async () => {
+    const transport = startProcess();
+
+    try {
+      const message = "JSONL RPC stdin is not writable";
+      const request = transport.request({ type: "fail", error: message });
+      await expect(request).rejects.toBeInstanceOf(JsonlRpcResponseError);
+      await expect(request).rejects.toThrow(message);
     } finally {
       await transport.close();
     }
@@ -349,6 +367,28 @@ describe("JsonlRpcProcess", () => {
     );
     await expect(transport.request({ type: "echo", value: "after" })).rejects.toThrow(
       "JSONL RPC process is closed",
+    );
+  });
+
+  test("distinguishes the request refused before write from one already written on the same close", async () => {
+    const child = createInMemoryChildProcess();
+    const transport = startProcess({ child });
+    const frames: string[] = [];
+    child.stdin.on("data", (chunk) => frames.push(chunk.toString()));
+    const written = transport.startRequest({ type: "hang" }, null);
+    child.stdin.end();
+    const refused = transport.startRequest({ type: "compact" }, null);
+
+    expect(frames).toEqual([JSON.stringify({ type: "hang", id: written.id }) + "\n"]);
+    const message = "JSONL RPC stdin is not writable";
+    await Promise.all([
+      expect(written.promise).rejects.toThrow(message),
+      expect(written.promise).rejects.not.toBeInstanceOf(JsonlRpcRequestNotSentError),
+      expect(refused.promise).rejects.toThrow(message),
+      expect(refused.promise).rejects.toBeInstanceOf(JsonlRpcRequestNotSentError),
+    ]);
+    await expect(transport.request({ type: "compact" })).rejects.toBeInstanceOf(
+      JsonlRpcRequestNotSentError,
     );
   });
 

@@ -1,4 +1,5 @@
-import { describe, expect, onTestFinished, test } from "vitest";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { describe, expect, onTestFinished, test, vi } from "vitest";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,6 +14,7 @@ import { resolveOmpProviderOptions } from "./provider-config.js";
 import { OmpRuntimeEventSchema, OmpSessionStateSchema } from "./rpc-types.js";
 import { OmpHarness } from "./test-utils/omp-harness.js";
 import { OmpAgentClient } from "./agent.js";
+import { OmpCliRuntime } from "./cli-runtime.js";
 import { FakeOmp } from "./test-utils/fake-omp.js";
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 
@@ -228,6 +230,83 @@ function createToolCatalog(): PaseoToolCatalog {
 }
 
 describe("OMP agent client and session", () => {
+  test.each([
+    { outcome: "unsent", consumed: 0, diagnostic: "OMP RPC stdin is not writable" },
+    { outcome: "rejected", consumed: 0, diagnostic: "OMP RPC stdin is not writable" },
+    { outcome: "unknown", consumed: 1, diagnostic: "OMP RPC process exited with code 7" },
+  ])("uses the $outcome OMP CLI result for startup compaction", async (scenario) => {
+    const source = String.raw`
+      const readline = require("node:readline");
+      const state = {
+        sessionId: "session-1", model: null, isStreaming: false, isCompacting: false,
+        messageCount: 0, queuedMessageCount: 0,
+      };
+      function send(frame) { process.stdout.write(JSON.stringify(frame) + "\n"); }
+      send({ type: "ready", protocolVersion: 1 });
+      readline.createInterface({ input: process.stdin }).on("line", (line) => {
+        const { id, type } = JSON.parse(line);
+        if (type === "compact" && process.argv[1] === "unknown") process.exit(7);
+        if (type === "compact") {
+          send({ type: "response", id, command: type, success: false,
+            error: "OMP RPC stdin is not writable" });
+        } else {
+          send({ type: "response", id, command: type, success: true, data: state });
+        }
+      });
+    `;
+    const logger = createTestLogger();
+    let child: ChildProcessWithoutNullStreams | undefined;
+    const runtime = new OmpCliRuntime({
+      logger,
+      command: [process.execPath, "-e", source, "--", scenario.outcome],
+      spawnProcess: ({ argv: [command, ...args], cwd, env }) => {
+        child = spawn(command, args, { cwd, env, stdio: "pipe" });
+        return child;
+      },
+    });
+    const client = new OmpAgentClient({ logger, runtime });
+    const session = await client.createSession({ provider: "omp", cwd: process.cwd() });
+    onTestFinished(() => session.close());
+    const events: AgentStreamEvent[] = [];
+    const onProviderOutcome = vi.fn();
+    await session.tryHandleOutOfBand!("/compact")!.run({
+      emit: (event) => events.push(event),
+      beforeProviderDispatch: async () => {
+        if (scenario.outcome === "unsent") child!.stdin.end();
+      },
+      onProviderOutcome,
+    });
+    expect(events).toContainEqual({
+      type: "timeline",
+      provider: "omp",
+      item: {
+        type: "assistant_message",
+        text: expect.stringContaining(`[Error] Failed to compact context: ${scenario.diagnostic}`),
+      },
+    });
+    expect(onProviderOutcome).toHaveBeenCalledTimes(scenario.consumed);
+  });
+
+  test("withdraws startup compaction before sending OMP's runtime request", async () => {
+    const runtime = new FakeOmp();
+    const client = new OmpAgentClient({ logger: createTestLogger(), runtime });
+    const session = await client.createSession({ provider: "omp", cwd: process.cwd() });
+    onTestFinished(() => session.close());
+    const check = Promise.withResolvers<void>();
+    const outcome = vi.fn();
+    const handler = session.tryHandleOutOfBand?.("/compact");
+    const run = handler!.run({
+      emit: () => {},
+      beforeProviderDispatch: () => check.promise,
+      onProviderOutcome: outcome,
+    });
+    const rejected = expect(run).rejects.toThrow("Recovery withdrawn");
+    check.reject(new Error("Recovery withdrawn"));
+    await rejected;
+    expect(runtime.latestSession().compactRequests).toEqual([]);
+    expect(outcome).not.toHaveBeenCalled();
+  });
+
   test("failed manual compact closes its progress row and shows the error", async () => {
     const omp = new OmpHarness();
     await omp.start();

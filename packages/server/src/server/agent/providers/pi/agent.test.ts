@@ -1,3 +1,4 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import {
   closeSync,
   existsSync,
@@ -3191,6 +3192,24 @@ describe("PiRpcAgentClient", () => {
     ]);
   });
 
+  test("withdraws startup compaction before sending Pi's runtime request", async () => {
+    const { pi, session } = await createSession();
+    onTestFinished(() => session.close());
+    const check = Promise.withResolvers<void>();
+    const outcome = vi.fn();
+    const handler = session.tryHandleOutOfBand("/compact");
+    const run = handler!.run({
+      emit: () => {},
+      beforeProviderDispatch: () => check.promise,
+      onProviderOutcome: outcome,
+    });
+    const rejected = expect(run).rejects.toThrow("Recovery withdrawn");
+    check.reject(new Error("Recovery withdrawn"));
+    await rejected;
+    expect(pi.latestSession().compactRequests).toEqual([]);
+    expect(outcome).not.toHaveBeenCalled();
+  });
+
   test("executes Pi compact through RPC instead of prompt text", async () => {
     const { pi, session } = await createSession();
     const fakeSession = pi.latestSession();
@@ -3972,6 +3991,46 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     onTestFinished(() => session.close());
 
     expect(pi.recordedLaunches).toMatchObject([{ cwd: storedCwd, session: archived.sessionFile }]);
+  });
+
+  test("keeps Pi startup compaction retryable when process input closed before dispatch", async () => {
+    const fakePiProcess = writeFakePiProcess();
+    const logger = pino({ level: "silent" });
+    let child: ChildProcessWithoutNullStreams | undefined;
+    const client = new PiRpcAgentClient({
+      logger,
+      runtime: new PiCliRuntime({
+        logger,
+        command: fakePiProcess.command,
+        spawnProcess: ({ argv: [command, ...args], cwd, env }) => {
+          child = spawn(command, args, { cwd, env, stdio: "pipe" });
+          return child;
+        },
+      }),
+    });
+    const session = await client.createSession(createConfig({ cwd: process.cwd() }));
+    onTestFinished(() => session.close());
+    const events: AgentStreamEvent[] = [];
+    let consumed = false;
+    await session.tryHandleOutOfBand?.("/compact")?.run({
+      emit: (event) => events.push(event),
+      beforeProviderDispatch: async () => {
+        child!.stdin.end();
+        expect(child!.stdin.writable).toBe(false);
+      },
+      onProviderOutcome: () => {
+        consumed = true;
+      },
+    });
+    expect(events).toContainEqual({
+      type: "timeline",
+      provider: "pi",
+      item: {
+        type: "assistant_message",
+        text: "[Error] Failed to compact context: Pi RPC stdin is not writable",
+      },
+    });
+    expect(consumed).toBe(false);
   });
 
   test("a history resume of an agent whose folder is gone opens its session in a real Pi process started from the home directory", async () => {

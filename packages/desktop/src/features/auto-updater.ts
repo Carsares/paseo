@@ -153,6 +153,22 @@ async function isOfficialUpdatesEnabled(): Promise<boolean> {
   return (await getDesktopSettingsStore().get()).officialUpdatesEnabled;
 }
 
+class MacUpdateNotPreparedError extends Error {}
+
+function isMacUpdatePreparationFailure(error: unknown): boolean {
+  if (!(error instanceof Error) || !("domain" in error) || !("code" in error)) return false;
+
+  // Squirrel's HTTP and bundle checks precede writing the install request.
+  if (error.domain === "SQRLUpdaterErrorDomain") {
+    // SQRLUpdaterErrorMissingUpdateBundle and SQRLUpdaterErrorInvalidServerResponse
+    return error.code === 2 || error.code === 5;
+  }
+
+  // The native URL requests also finish before the local install handoff.
+  // NSURLErrorTimedOut and NSURLErrorNetworkConnectionLost
+  return error.domain === "NSURLErrorDomain" && (error.code === -1001 || error.code === -1005);
+}
+
 class ElectronAppUpdateRuntime implements AppUpdateRuntime {
   private configured = false;
   private macDownloadedInfo: RuntimeUpdateInfo | null = null;
@@ -273,12 +289,23 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
         cleanup();
         resolve();
       };
-      const onError = (error: unknown) => {
+      const fail = (error: unknown, notPrepared: boolean) => {
         cleanup();
-        reject(error);
+        if (
+          notPrepared &&
+          !this.macNativeInstallPending &&
+          this.macDownloadedInfo === downloaded &&
+          electronAutoUpdater.getFeedURL() === feedUrl
+        ) {
+          const message = error instanceof Error ? error.message : String(error);
+          reject(new MacUpdateNotPreparedError(message, { cause: error }));
+        } else {
+          reject(error);
+        }
       };
+      const onError = (error: unknown) => fail(error, isMacUpdatePreparationFailure(error));
       const onUnavailable = () =>
-        onError(new Error(`Squirrel did not find Paseo ${targetVersion}.`));
+        fail(new Error(`Squirrel did not find Paseo ${targetVersion}.`), true);
       electronAutoUpdater.on("update-downloaded", onReady);
       electronAutoUpdater.once("update-not-available", onUnavailable);
       electronAutoUpdater.once("error", onError);
@@ -344,9 +371,17 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
         const timeoutMessage = this.macPreparationTimedOut
           ? "macOS did not finish preparing the update in time. "
           : "";
+        const confirmedNotPrepared = this.macPreparationTimedOut
+          ? macPreparation?.then(
+              () => false,
+              // Squirrel can report an error after writing the install request.
+              (reason: unknown) =>
+                reason instanceof MacUpdateNotPreparedError && !this.macNativeInstallPending,
+            )
+          : undefined;
         throw new AppUpdateHandoffUncertainError(
           `${timeoutMessage}macOS may install the update on exit. Quit and reopen Paseo before retrying.`,
-          { cause: error },
+          { cause: error, confirmedNotPrepared },
         );
       }
       throw error;

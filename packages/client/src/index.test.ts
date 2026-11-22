@@ -254,6 +254,67 @@ test("createPaseoClient exposes workspace list through the daemon client", async
   await client.close();
 });
 
+test.each([undefined, false, true])(
+  "workspace discovery reads background workspace support from the connected host (%s)",
+  async (backgroundWorkspaces) => {
+    const { client, ws } = await connectClient({
+      ownedSubscriptions: true,
+      ...(backgroundWorkspaces === undefined ? {} : { backgroundWorkspaces }),
+    });
+    try {
+      expect(client.workspaces.supportsBackgroundWorkspaces?.()).toBe(
+        backgroundWorkspaces === true,
+      );
+      if (!backgroundWorkspaces) return;
+
+      const ready = client.workspaces.list({ includeBackground: true, sync: {}, subscribe: {} });
+      expect(parseSentSessionMessage(ws.sent.at(-1))).toMatchObject({
+        type: "fetch_workspaces_request",
+        includeBackground: true,
+        sync: {},
+      });
+      acknowledgeObservation(ws, "inclusive-first");
+
+      const { subscription } = await ready;
+      const restored = vi.fn();
+      subscription.subscribe({ snapshot: restored, update: () => {} });
+
+      ws.readyState = 3;
+      ws.onclose?.({ code: 1006, reason: "Connection lost" });
+      const reconnecting = client.connect();
+      const next = FakeWebSocket.instances[1];
+      next.open();
+      next.message(
+        sessionMessage({
+          type: "status",
+          payload: {
+            status: "server_info",
+            serverId: "srv_sdk_test",
+            hostname: null,
+            version: null,
+            features: { ownedSubscriptions: true, backgroundWorkspaces: true },
+          },
+        }),
+      );
+      await reconnecting;
+
+      expect(parseSentSessionMessage(next.sent.at(-1))).toMatchObject({
+        type: "fetch_workspaces_request",
+        includeBackground: true,
+        sync: {},
+      });
+      acknowledgeObservation(next, "inclusive-restored");
+      await vi.waitFor(() =>
+        expect(restored).toHaveBeenCalledWith(
+          expect.objectContaining({ subscriptionId: "inclusive-restored" }),
+        ),
+      );
+    } finally {
+      await client.close();
+    }
+  },
+);
+
 test("createPaseoApi borrows daemon capabilities without exposing connection ownership", () => {
   const daemonClient = new DaemonClient({
     url: "ws://daemon.test",

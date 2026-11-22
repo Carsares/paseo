@@ -729,6 +729,14 @@ export interface AgentUsageSession {
   sessionKey: string;
 }
 
+export interface OutOfBandCommandContext {
+  emit: (event: AgentStreamEvent) => void;
+  /** Called immediately before a provider request makes the command irreversible. */
+  beforeProviderDispatch?: () => Promise<void>;
+  /** Called after the provider acknowledges the request, or if its outcome is unknown. */
+  onProviderOutcome?: () => void;
+}
+
 export interface AgentSession {
   /** Persist the session's current handle immediately after an interactive resume. */
   readonly persistenceUpdatedOnResume?: boolean;
@@ -809,13 +817,7 @@ export interface AgentSession {
    * (e.g. /goal pause) reach the provider without canceling the running turn.
    */
   tryHandleOutOfBand?(prompt: AgentPromptInput): {
-    run(ctx: {
-      emit: (event: AgentStreamEvent) => void;
-      /** Called immediately before a provider request makes the command irreversible. */
-      beforeProviderDispatch?: () => Promise<void>;
-      /** Called after the provider acknowledges the request, or if its outcome is unknown. */
-      onProviderOutcome?: () => void;
-    }): Promise<void>;
+    run(ctx: OutOfBandCommandContext): Promise<void>;
   } | null;
 }
 

@@ -2673,16 +2673,57 @@ test.each([
   "later prompt",
   "reverse route",
   "reverse dispatch then pull",
+  "reverse rejection then pull",
+  "reverse reopen failure then pull",
+  "reverse outcome unknown",
   "legacy text then pull",
 ] as const)("%s delivers a cross-host grandchild follow-up", { timeout: 40000 }, async (when) => {
   const parentPrompts: string[] = [];
-  const reverse = when === "reverse route" || when === "reverse dispatch then pull";
-  const a = await daemon({
-    mcpEnabled: true,
-    agentClients: createTestAgentClients({
-      onStartTurn: (prompt) => parentPrompts.push(String(prompt)),
-    }),
+  const reverse = when.startsWith("reverse ");
+  const reopenFails = when === "reverse reopen failure then pull";
+  const outcomeUnknown = when === "reverse outcome unknown";
+  const failure = new Map([
+    ["reverse rejection then pull", "Provider refused the request"],
+    ["reverse reopen failure then pull", "is stale after its plugin reloaded"],
+    ["reverse outcome unknown", "Provider transport interrupted after submission"],
+  ]).get(when);
+  let rejectedStart = false;
+  let rejectedReopen = false;
+  const prepareParent = "Prepare to receive completion notifications.";
+  const agentClients = createTestAgentClients({
+    onStartTurn: (prompt) => {
+      if (prompt !== prepareParent) parentPrompts.push(String(prompt));
+    },
+    beforeResumeSession: async () => {
+      if (reopenFails && rejectedStart && !rejectedReopen) {
+        rejectedReopen = true;
+        throw new Error("Provider did not reopen");
+      }
+    },
   });
+  if (failure) {
+    const provider = agentClients.claude!;
+    const create = provider.createSession.bind(provider);
+    vi.spyOn(provider, "createSession").mockImplementation(async (...args) => {
+      const session = await create(...args);
+      const start = session.startTurn.bind(session);
+      session.startTurn = async (prompt, options) => {
+        if (!rejectedStart && String(prompt).includes('event="finished"')) {
+          rejectedStart = true;
+          if (reopenFails) {
+            const handle = session.describePersistence();
+            if (!handle) throw new Error("The parent has no saved provider session");
+            throw new StaleProviderSessionError(handle.sessionId);
+          }
+          if (outcomeUnknown) throw new Error(failure);
+          throw new AgentTurnStartRejectedError(failure);
+        }
+        return start(prompt, options);
+      };
+      return session;
+    });
+  }
+  const a = await daemon({ mcpEnabled: true, agentClients });
   const b = await daemon({ mcpEnabled: true });
   const origin = await api(a);
   const destination = await api(b);
@@ -2697,7 +2738,9 @@ test.each([
   const parent = await workspace.agents.create({
     config: { provider: "claude/claude-test", modeId: "full-access" },
     title: "Parent",
+    ...(failure ? { prompt: prepareParent } : {}),
   });
+  if (failure) expect((await origin.client.waitForFinish(parent.id, 5000)).status).toBe("idle");
   const toolsFor = async (host: TestPaseoDaemon, agentId: string) => {
     const client = new Client({ name: "delegation", version: "1" });
     cleanup.push(() => client.close());
@@ -2723,13 +2766,15 @@ test.each([
   });
   expect(lead.isError, JSON.stringify(lead)).not.toBe(true);
   const leadId = (lead.structuredContent as { agentId: string }).agentId;
+  const reverseWire =
+    failure || when === "reverse dispatch then pull"
+      ? await hostWire(a, { omitSendConfirmation: !failure })
+      : undefined;
   if (reverse) {
     await destination.client.waitForFinish(leadId, 5000);
-    const wire =
-      when === "reverse dispatch then pull"
-        ? await hostWire(a, { omitSendConfirmation: true })
-        : undefined;
-    await destination.paseo.hosts.add({ connection: wire?.connection ?? `127.0.0.1:${a.port}` });
+    await destination.paseo.hosts.add({
+      connection: reverseWire?.connection ?? `127.0.0.1:${a.port}`,
+    });
     await online(destination.paseo);
   } else if (when === "later prompt") {
     await destination.client.waitForFinish(leadId, 5000);
@@ -2773,6 +2818,51 @@ test.each([
         if (error.code === "ENOENT") return [];
         throw error;
       });
+  const sendLegacy = (report: z.infer<typeof AgentFinishReportSchema>) =>
+    origin.client.sendMessage(parent.id, report.prompt, {
+      messageId: report.id,
+      sourceAgentId: leadId,
+      sourceAgentServerId: serverId,
+      activeTurnBehavior: "steer",
+      waitForDispatch: true,
+    });
+  if (failure) {
+    if (!reverseWire) throw new Error("The reverse route was not captured");
+    const response = () =>
+      reverseWire.frames
+        .filter((frame) => frame.direction === "fromB" && !frame.binary)
+        .flatMap(({ bytes }) => {
+          const envelope = JSON.parse(bytes.toString());
+          if (envelope.message?.type !== "hosts.route.frame") return [];
+          const message = JSON.parse(envelope.message.payload.data).message;
+          return message?.type === "send_agent_message_response" ? [message.payload] : [];
+        });
+    await expect.poll(response, { timeout: 10000 }).toEqual([
+      expect.objectContaining({
+        accepted: false,
+        error: expect.stringContaining(failure),
+      }),
+    ]);
+    expect(rejectedReopen).toBe(reopenFails);
+    expect(parentPrompts).toEqual([]);
+    const reports = await storedReports();
+    expect(reports).toMatchObject([{ report: { id: expect.any(String), event: "finished" } }]);
+    if (outcomeUnknown) {
+      const report = AgentFinishReportSchema.parse(reports[0].report);
+      const receiptDir = join(a.paseoHome, "agent-requests");
+      const files = await readdir(receiptDir);
+      expect(files).toHaveLength(1);
+      expect(JSON.parse(await readFile(join(receiptDir, files[0]!), "utf8"))).toMatchObject({
+        state: "pending",
+      });
+      await expect(sendLegacy(report)).rejects.toThrow("agent_request_outcome_unknown");
+      expect(await storedReports()).toEqual(reports);
+      expect(parentPrompts).toEqual([]);
+      return;
+    }
+    await origin.paseo.hosts.update(saved.registrationId, { enabled: true });
+    await online(origin.paseo);
+  }
   if (reverse) {
     await expect.poll(() => parentPrompts.length, { timeout: 10000 }).toBe(1);
     expect(parentPrompts[0]).toContain(`source-agent-id="${leadId}"`);
@@ -2795,15 +2885,7 @@ test.each([
 
   const [stored] = await storedReports();
   const report = AgentFinishReportSchema.parse(stored?.report);
-  const sendLegacy = () =>
-    origin.client.sendMessage(parent.id, report.prompt, {
-      messageId: report.id,
-      sourceAgentId: leadId,
-      sourceAgentServerId: serverId,
-      activeTurnBehavior: "steer",
-      waitForDispatch: true,
-    });
-  if (when === "legacy text then pull") await sendLegacy();
+  if (when === "legacy text then pull") await sendLegacy(report);
 
   await origin.paseo.hosts.update(saved.registrationId, { enabled: true });
   await online(origin.paseo);
@@ -2814,7 +2896,7 @@ test.each([
     expect(parentPrompts[1]).not.toContain('event="finished"');
   } else {
     expect(parentPrompts[1]).toContain('event="finished"');
-    await sendLegacy();
+    await sendLegacy(report);
   }
   await destination.client.detachAgent(leadId);
   await expect.poll(storedWatches, { timeout: 10000 }).toEqual([]);

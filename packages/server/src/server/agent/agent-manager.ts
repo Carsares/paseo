@@ -221,6 +221,16 @@ export class AgentManagerShuttingDownError extends Error {
   }
 }
 
+// Preserve the shutdown classification for durable queued sends while retaining a
+// display message for timeline consumers.
+function foregroundStartFailure(error: unknown, message: string) {
+  return {
+    status: "failed" as const,
+    error: message,
+    admissionError: error instanceof AgentManagerShuttingDownError ? error : undefined,
+  };
+}
+
 export class AgentRunCancellationError extends Error {
   constructor(agentId: string, action: "reload" | "replace" | "rewind" | "stop") {
     super(
@@ -5310,7 +5320,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
     onAccepted?: () => void | Promise<void>,
-    assertDispatchAllowed?: () => void,
+    commandDispatch?: { waitForProviderOutcome?: boolean; assertAllowed?: () => void },
   ): Promise<boolean> {
     this.assertAcceptingAgentRuns();
     if (this.collectingRuntimes.has(agentId) || !this.agents.has(agentId)) {
@@ -5335,7 +5345,8 @@ export class AgentManager {
     if (!handler) {
       return false;
     }
-    const requiresProviderHandoff = assertDispatchAllowed !== undefined;
+    const requiresProviderHandoff = commandDispatch?.waitForProviderOutcome === true;
+    const assertDispatchAllowed = commandDispatch?.assertAllowed;
     if (!requiresProviderHandoff) {
       const acceptedCallback = onAccepted?.();
       if (acceptedCallback) await acceptedCallback;
@@ -5365,10 +5376,10 @@ export class AgentManager {
       }
       this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
     };
-    // Ordinary commands acknowledge queueing. A withdrawable command must wait
-    // until it reaches the provider so its caller can safely consume recovery intent.
+    // Manual commands acknowledge queueing. Startup recovery consumes its record
+    // only once the provider acknowledges the command or its outcome is unknown.
     let markCommandStarted: (() => void) | undefined;
-    const commandStarted = assertDispatchAllowed
+    const commandStarted = requiresProviderHandoff
       ? new Promise<void>((resolveStarted) => {
           markCommandStarted = resolveStarted;
         })
@@ -5376,9 +5387,11 @@ export class AgentManager {
     let providerHandoffAccepted = false;
     const beforeProviderDispatch = requiresProviderHandoff
       ? async () => {
+          this.assertAcceptingAgentRuns();
           assertDispatchAllowed?.();
           const accepted = onAccepted?.();
           if (accepted) await accepted;
+          this.assertAcceptingAgentRuns();
           assertDispatchAllowed?.();
         }
       : undefined;
@@ -5561,7 +5574,7 @@ export class AgentManager {
       }
       agent.pendingReplacement = false;
       const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
-      this.runs.settleForegroundStart(pendingRun, { status: "failed", error: errorMsg });
+      this.runs.settleForegroundStart(pendingRun, foregroundStartFailure(error, errorMsg));
       try {
         // A terminal rejection belongs after the submitted prompt even though no provider turn exists.
         if (options?.clientMessageId) {

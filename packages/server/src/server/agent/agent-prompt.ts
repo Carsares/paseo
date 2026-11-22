@@ -32,8 +32,7 @@ export interface StartAgentRunOptions {
   /** If busy, try an admitted steer without replacing or switching the active turn. */
   admitSteer?: () => Promise<boolean>;
   beforeHandoff?: () => Promise<void>;
-  /** Rechecked synchronously when a queued command reaches the provider. */
-  assertCommandDispatchAllowed?: () => void;
+  commandDispatch?: Parameters<AgentRunController["tryRunOutOfBand"]>[4];
   onSteerDeclined?: () => Promise<void>;
   admit?: () => boolean;
   /** Called after selecting the run, before consuming its events. */
@@ -152,7 +151,7 @@ export async function startAgentRun(
       prompt,
       options?.runOptions,
       admitCommand,
-      options?.assertCommandDispatchAllowed,
+      options?.commandDispatch,
     )
   ) {
     options?.onDispatch?.("out_of_band");
@@ -285,6 +284,8 @@ export interface SendPromptToAgentParams {
   beforeDispatch?: () => Promise<void>;
   /** Throws if the caller withdrew this prompt during loading or before provider handoff. */
   assertDispatchAllowed?: () => void;
+  /** Wait for provider acknowledgment or an unknown outcome for out-of-band commands. */
+  waitForCommandOutcome?: boolean;
   onDispatch?: StartAgentRunOptions["onDispatch"];
   agentManager: AgentManager;
   agentStorage: AgentStorage;
@@ -493,7 +494,10 @@ export async function sendPreparedPromptToAgent(
         }
       : undefined,
     beforeHandoff,
-    assertCommandDispatchAllowed: params.assertDispatchAllowed,
+    commandDispatch: {
+      waitForProviderOutcome: params.waitForCommandOutcome,
+      assertAllowed: params.assertDispatchAllowed,
+    },
     onSteerDeclined: params.handoff?.declined,
     admit: params.admit,
     onDispatch: params.onDispatch,

@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import type { CheckoutWorktree } from "@getpaseo/protocol/messages";
+import type { ForkWorktreeSubmission } from "@/stores/workspace-draft-submission-store";
 import { applyMetadataPatch } from "@/composer/draft/metadata";
 import {
   branchNameFromRef,
@@ -91,7 +92,10 @@ export interface NewWorkspaceSetup {
   chooseRefAction(kind: RefKind, action: RefAction): void;
   refActionFor(kind: RefKind): RefAction;
   /** What creating a new worktree from `item` asks the host for. */
-  checkoutRequestFor(item: PickerItem | null): PickerCheckoutRequest | undefined;
+  checkoutRequestFor(
+    item: PickerItem | null,
+    submittedSource?: ForkWorktreeSubmission["source"],
+  ): PickerCheckoutRequest | undefined;
   syncInputs(inputs: SetupInputs): void;
   /**
    * Commands for the items mounted for `target`. Once the screen is on another project or host
@@ -153,14 +157,17 @@ const LOCKED_MESSAGE = "The New workspace screen is locked while the workspace i
 export function createNewWorkspaceSetup(
   initial: SetupInputs,
   effects: SetupEffects,
+  restored?: ForkWorktreeSubmission,
 ): NewWorkspaceSetup {
+  const restoredItem = restored?.baseItem ?? null;
+  const restoredAction = restored?.source.action;
   let state: SetupState = {
-    pickerSelection: initialPickerSelectionState,
+    pickerSelection: { ...initialPickerSelectionState, selectedItem: restoredItem },
     manualIsolation: null,
-    branch: null,
-    metadata: {},
+    branch: restored?.source.branchName ?? null,
+    metadata: restored?.metadata ?? {},
     existingWorktreePath: null,
-    refActions: {},
+    refActions: restoredItem && restoredAction ? { [restoredItem.kind]: restoredAction } : {},
   };
   let inputs = initial;
   let screenTarget = initial.project ? `${initial.serverId}\n${initial.project.id}` : null;
@@ -262,13 +269,20 @@ export function createNewWorkspaceSetup(
     chooseRefAction: (kind, action) =>
       update({ refActions: { ...state.refActions, [kind]: action } }),
     refActionFor,
-    checkoutRequestFor: (item) => {
+    checkoutRequestFor: (item, submittedSource) => {
       if (!item) return undefined;
+      const request = pickerItemToCheckoutRequest(item, refActionFor(item.kind));
       const holder = worktreeHolding(item);
-      if (holder?.branchName) {
+      // The submitted request might already have checked out this branch. Replaying that
+      // checkout lets the host check the original request key before attempting worktree creation.
+      const replaysCheckout =
+        submittedSource?.action === "checkout" &&
+        request?.action === "checkout" &&
+        request.refName === submittedSource.refName;
+      if (holder?.branchName && !replaysCheckout) {
         throw new BranchInWorktreeError({ branchName: holder.branchName, worktree: holder });
       }
-      return pickerItemToCheckoutRequest(item, refActionFor(item.kind));
+      return request;
     },
     syncInputs: (next) => {
       inputs = next;

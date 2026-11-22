@@ -62,6 +62,21 @@ const mocks = vi.hoisted(() => ({
   installUpdate: vi.fn(),
 }));
 
+const { nativeUpdater, updateSource } = await vi.hoisted(async () => {
+  const { EventEmitter } = await import("node:events");
+  return {
+    nativeUpdater: Object.assign(new EventEmitter(), {
+      checkForUpdates: vi.fn(),
+      getFeedURL: vi.fn(() => "http://127.0.0.1:32100"),
+    }),
+    updateSource: Object.assign(new EventEmitter(), {
+      checkForUpdates: vi.fn(),
+      downloadUpdate: vi.fn(),
+      quitAndInstall: vi.fn(),
+    }),
+  };
+});
+
 const approvedUpdate = { version: "1.2.4" };
 
 vi.mock("node:os", async (importOriginal) => ({
@@ -76,9 +91,12 @@ vi.mock("electron", () => ({
     getVersion: vi.fn(() => mocks.appVersion),
     isPackaged: true,
   },
+  autoUpdater: nativeUpdater,
   ipcMain: { handle: vi.fn() },
   powerMonitor: { getSystemIdleTime: vi.fn(() => 0) },
 }));
+
+vi.mock("electron-updater", () => ({ autoUpdater: updateSource }));
 
 vi.mock("electron-log/main", () => ({
   default: {
@@ -102,6 +120,7 @@ vi.mock("@getpaseo/server/daemon-control", async (importOriginal) => ({
 
 vi.mock("../settings/desktop-settings-electron.js", () => ({
   getDesktopSettingsStore: () => ({
+    beginOfficialUpdateInstall: async () => () => {},
     get: async () => mocks.settings,
     patch: vi.fn(),
     migrateLegacyRendererSettings: vi.fn(),
@@ -421,6 +440,250 @@ describe("daemon-manager commands", () => {
       expect(mocks.startDaemonInstance).toHaveBeenCalledTimes(2);
       expect(dispatch.mock.calls).toEqual(expectedAgent ? [[expectedAgent, "Continue."]] : []);
       expect(report).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { outcome: "unavailable", shouldRestore: true },
+    { outcome: "failed HTTP download", shouldRestore: true },
+    { outcome: "native download timeout", shouldRestore: true },
+    { outcome: "native download disconnected", shouldRestore: true },
+    { outcome: "missing application bundle", shouldRestore: true },
+    { outcome: "no native terminal event", shouldRestore: false },
+    { outcome: "error", shouldRestore: false },
+    { outcome: "ready", shouldRestore: false },
+    { outcome: "other feed then unavailable", shouldRestore: false },
+    { outcome: "unavailable after feed replacement", shouldRestore: false },
+    { outcome: "unavailable during quit", shouldRestore: false },
+  ] as const)(
+    "handles a timed-out manual macOS update: $outcome",
+    async ({ outcome, shouldRestore }) => {
+      const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        vi.resetModules();
+        const updater = await vi.importActual<typeof import("../features/auto-updater")>(
+          "../features/auto-updater",
+        );
+        mocks.installUpdate.mockImplementation(updater.downloadAndInstallUpdate);
+        const home = mocks.paseoHome;
+        mkdirSync(home);
+        const lockPath = path.join(home, "paseo.pid");
+        const markerPath = path.join(home, "restart-recovery-once.json");
+        const recoveryPath = path.join(home, "app-update-recovery.json");
+        const instance = {
+          pid: process.pid,
+          startedAt: new Date(Date.now() - 1_000).toISOString(),
+          hostname: hostname(),
+          uid: process.getuid?.() ?? 0,
+          listen: `127.0.0.1:${49152 + (process.pid % 16384)}`,
+          desktopManaged: true,
+        };
+        writeFileSync(lockPath, JSON.stringify(instance));
+        mocks.settings = { ...DEFAULT_DESKTOP_SETTINGS, officialUpdatesEnabled: true };
+        mocks.confirmUpdate.mockResolvedValue(true);
+        const storage = new AgentStorage(path.join(home, "agents"), createTestLogger());
+        await storage.upsert(
+          parseStoredAgentRecord({
+            id: "running-agent",
+            lastStatus: "running",
+            provider: "codex",
+            cwd: home,
+            createdAt: instance.startedAt,
+            updatedAt: instance.startedAt,
+          }),
+        );
+        const dispatch = vi.fn(async (_id: string, _prompt: string) => {});
+        const recovery = () =>
+          createRestartRecovery({
+            storage,
+            oneShotMarkerPath: markerPath,
+            settings: () => ({ enabled: false, prompt: "Continue." }),
+            eligible: async () => true,
+            dispatch,
+            report: vi.fn(),
+          });
+        mocks.stopDaemonInstance.mockImplementation(async () => {
+          await recovery().captureRunningAgents({ force: true });
+          rmSync(lockPath);
+          return { action: "stopped", pid: instance.pid, forced: false, usedLifecycleRpc: true };
+        });
+        const parkedRecord = {
+          sourceVersion: "1.2.3",
+          targetVersion: "1.2.4",
+          marker: '{"version":2,"agentIds":["running-agent"]}',
+        };
+        mocks.startDaemonInstance.mockImplementation(async () => {
+          expect(isManualUpdateHandoffInProgress()).toBe(true);
+          expect(readFileSync(markerPath, "utf8")).toBe(parkedRecord.marker);
+          expect(existsSync(recoveryPath)).toBe(false);
+          const startupRecovery = recovery();
+          await startupRecovery.prepareStartup();
+          startupRecovery.resumePending();
+          await startupRecovery.waitForResume("running-agent", new AbortController().signal);
+          const restored = { ...instance, startedAt: new Date().toISOString() };
+          writeFileSync(lockPath, JSON.stringify(restored));
+          return { instance: restored, spawned: true };
+        });
+        updateSource.checkForUpdates.mockResolvedValue({
+          isUpdateAvailable: true,
+          updateInfo: approvedUpdate,
+        });
+        updateSource.downloadUpdate.mockImplementation(async () => {
+          updateSource.emit("update-downloaded", approvedUpdate);
+        });
+
+        const quitting = Promise.withResolvers<boolean>();
+        const exit = vi.fn();
+        const lifecycle = createQuitLifecycle({
+          app: { exit },
+          closeTransportSessions: vi.fn(),
+          stopDesktopManagedDaemonIfNeeded: async () => false,
+          installAppUpdateOnQuit: () => quitting.promise,
+          createUpdateDeadlineSignal: () => new AbortController().signal,
+          isManualUpdateHandoffInProgress,
+          onStopError: vi.fn(),
+          onUpdateError: vi.fn(),
+        });
+        const handlers = createDaemonCommandHandlers(undefined, lifecycle.isQuitting);
+        const install = handlers.install_app_update();
+        await vi.waitFor(() => expect(nativeUpdater.checkForUpdates).toHaveBeenCalledOnce());
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(await install).toMatchObject({
+          installed: false,
+          message: expect.stringContaining("macOS may install the update on exit"),
+        });
+        expect(mocks.confirmUpdate).toHaveBeenCalledExactlyOnceWith(approvedUpdate, "Cancel");
+        expect(JSON.parse(readFileSync(recoveryPath, "utf8"))).toEqual(parkedRecord);
+        expect(existsSync(markerPath)).toBe(false);
+        expect(mocks.startDaemonInstance).not.toHaveBeenCalled();
+        await expect(handlers.restart_desktop_daemon()).rejects.toThrow(
+          "stopped for an app update",
+        );
+
+        if (outcome === "unavailable during quit") {
+          lifecycle.handleBeforeQuit({ preventDefault: vi.fn() });
+          expect(lifecycle.isQuitting()).toBe(true);
+          expect(exit).not.toHaveBeenCalled();
+        }
+        if (outcome === "error") {
+          nativeUpdater.emit("error", new Error("Native preparation failed"));
+        } else if (outcome === "failed HTTP download") {
+          nativeUpdater.emit(
+            "error",
+            Object.assign(new Error("Update download failed"), {
+              domain: "SQRLUpdaterErrorDomain",
+              code: 5,
+            }),
+          );
+        } else if (
+          outcome === "native download timeout" ||
+          outcome === "native download disconnected"
+        ) {
+          nativeUpdater.emit(
+            "error",
+            Object.assign(new Error(outcome), {
+              domain: "NSURLErrorDomain",
+              code: outcome === "native download timeout" ? -1001 : -1005,
+            }),
+          );
+        } else if (outcome === "missing application bundle") {
+          nativeUpdater.emit(
+            "error",
+            Object.assign(new Error("Could not locate update bundle"), {
+              domain: "SQRLUpdaterErrorDomain",
+              code: 2,
+            }),
+          );
+        } else if (outcome === "ready") {
+          nativeUpdater.emit(
+            "update-downloaded",
+            {},
+            "",
+            "",
+            new Date(0),
+            "http://127.0.0.1:32100/update.zip",
+          );
+        } else if (outcome !== "no native terminal event") {
+          if (outcome === "unavailable after feed replacement") {
+            nativeUpdater.getFeedURL.mockReturnValue("http://127.0.0.1:32101");
+          }
+          if (outcome === "other feed then unavailable") {
+            nativeUpdater.emit(
+              "update-downloaded",
+              {},
+              "",
+              "",
+              new Date(0),
+              "http://127.0.0.1:32101/update.zip",
+            );
+          }
+          nativeUpdater.emit("update-not-available");
+        }
+        if (outcome === "no native terminal event") {
+          await vi.advanceTimersByTimeAsync(30_000);
+        } else {
+          // Native notifications may repeat, but a timed-out attempt can only restore once.
+          nativeUpdater.emit("update-not-available");
+          await vi.advanceTimersByTimeAsync(0);
+        }
+
+        if (shouldRestore) {
+          await vi.waitFor(() => {
+            expect(mocks.startDaemonInstance).toHaveBeenCalledOnce();
+            expect(isManualUpdateHandoffInProgress()).toBe(false);
+          });
+          expect(dispatch).toHaveBeenCalledExactlyOnceWith("running-agent", "Continue.");
+          expect(existsSync(markerPath)).toBe(false);
+          expect(existsSync(recoveryPath)).toBe(false);
+          mocks.runExternalCliJsonCommand.mockImplementation(async (args: string[]) =>
+            args[1] === "status"
+              ? {
+                  ...JSON.parse(readFileSync(lockPath, "utf8")),
+                  localDaemon: "running",
+                  daemonVersion: "1.2.3",
+                }
+              : {},
+          );
+          await expect(handlers.restart_desktop_daemon()).resolves.toMatchObject({
+            status: "running",
+            desktopManaged: true,
+            listen: instance.listen,
+          });
+          expect(mocks.runExternalCliJsonCommand).toHaveBeenCalledWith([
+            "daemon",
+            "restart",
+            "--home",
+            home,
+            "--json",
+          ]);
+          expect(mocks.startDaemonInstance).toHaveBeenCalledOnce();
+        } else {
+          expect(isManualUpdateHandoffInProgress()).toBe(false);
+          expect(mocks.startDaemonInstance).not.toHaveBeenCalled();
+          expect(dispatch).not.toHaveBeenCalled();
+          expect(JSON.parse(readFileSync(recoveryPath, "utf8"))).toEqual(parkedRecord);
+          await expect(handlers.restart_desktop_daemon()).rejects.toThrow(
+            "stopped for an app update",
+          );
+        }
+        expect(updateSource.quitAndInstall).not.toHaveBeenCalled();
+        quitting.resolve(false);
+        if (outcome === "unavailable during quit") {
+          await vi.waitFor(() => expect(exit).toHaveBeenCalledExactlyOnceWith(0));
+        }
+      } finally {
+        Object.defineProperty(process, "platform", platform);
+        vi.useRealTimers();
+        nativeUpdater.checkForUpdates.mockReset();
+        nativeUpdater.getFeedURL.mockReset();
+        nativeUpdater.removeAllListeners();
+        updateSource.checkForUpdates.mockReset();
+        updateSource.downloadUpdate.mockReset();
+        updateSource.quitAndInstall.mockReset();
+        updateSource.removeAllListeners();
+      }
     },
   );
 

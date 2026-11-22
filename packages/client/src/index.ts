@@ -225,6 +225,8 @@ export interface PaseoProjectActions {
 }
 
 export interface PaseoWorkspaceActions {
+  /** Checks the connected host's support for inclusive workspace discovery. Older SDKs omit this method. */
+  supportsBackgroundWorkspaces?(): boolean;
   list(options: PaseoWorkspaceListOptions & { subscribe: {} }): Promise<
     PaseoWorkspaceListResult & {
       subscriptionId: string;
@@ -883,6 +885,7 @@ export function createPaseoApi(
       },
     },
     workspaces: {
+      supportsBackgroundWorkspaces: () => daemonClient.supportsBackgroundWorkspaces(),
       list: listWorkspaces,
       ref: (workspace) => createWorkspaceHandle(workspace),
       open: (input, requestId) =>

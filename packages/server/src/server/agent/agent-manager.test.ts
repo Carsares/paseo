@@ -14104,7 +14104,7 @@ test("automatic out-of-band recovery waits for the provider handoff", async () =
       "/recovery",
       { recoveryIntent: "automatic" },
       () => order.push("accepted"),
-      () => {},
+      { waitForProviderOutcome: true, assertAllowed: () => {} },
     );
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(order).toEqual(["run", "accepted", "provider-request"]);

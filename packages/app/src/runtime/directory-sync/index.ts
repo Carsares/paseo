@@ -632,9 +632,11 @@ export class DirectorySync {
   ): Promise<void> {
     let cursor: string | null = null;
     let subscribe = initialSubscribe;
+    // A directory cursor is only valid for the visibility scope that produced it.
+    const includeBackground = client.supportsBackgroundWorkspaces();
     while (true) {
       const query: Parameters<DaemonClient["observeWorkspaces"]>[0] = {
-        ...(client.supportsBackgroundWorkspaces() ? { includeBackground: true } : {}),
+        ...(includeBackground ? { includeBackground: true } : {}),
         sort: [{ key: "activity_at", direction: "desc" }],
         page: cursor ? { limit: PAGE_LIMIT, cursor } : { limit: PAGE_LIMIT },
         ...(supportsDirectorySync

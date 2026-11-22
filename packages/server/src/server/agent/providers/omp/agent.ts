@@ -27,6 +27,7 @@ import {
   type AgentRunResult,
   type AgentRuntimeInfo,
   type AgentSession,
+  type OutOfBandCommandContext,
   type AgentSessionConfig,
   type AgentSlashCommand,
   type AgentStreamEvent,
@@ -80,6 +81,7 @@ import { getUserMessageText } from "./message-history.js";
 import { mapOmpSystemNoticeToNotification } from "./system-notice.js";
 import { materializeProviderImage } from "../provider-image-output.js";
 import { OmpCliRuntime } from "./cli-runtime.js";
+import { JsonlRpcRequestNotSentError, JsonlRpcResponseError } from "../jsonl-rpc-process.js";
 import { createOmpInstallation } from "./installation.js";
 import { listOmpImportableSessions, readOmpImportSessionConfig } from "./session-descriptor.js";
 import type { OmpRuntime, OmpRuntimeSession, OmpStartSessionInput } from "./runtime.js";
@@ -468,8 +470,7 @@ function isOmpRequestAbortError(error: unknown): boolean {
 }
 
 function isOmpSteerTransportFailure(error: unknown): boolean {
-  // JsonlRpcProcess currently uses plain Error for both RPC rejections and transport failures.
-  // Only its own timeout/closed-process messages are transport failures; OMP rejections are unavailable.
+  // Steering propagates timeout/closed-process diagnostics; other failures report unavailable.
   const message = toDiagnosticErrorMessage(error);
   return (
     /^OMP RPC request timed out phase=steer\b/.test(message) ||
@@ -865,11 +866,13 @@ export class OmpAgentSession implements AgentSession {
     options,
     streamingBehavior,
     announceTurn = false,
+    commandContext,
   }: {
     prompt: AgentPromptInput;
     options?: AgentRunOptions;
     streamingBehavior?: "steer" | "followUp";
     announceTurn?: boolean;
+    commandContext?: OutOfBandCommandContext;
   }): Promise<StartTurnResult> {
     if (this.activeTurnId) {
       throw new Error("An OMP turn is already active");
@@ -896,15 +899,9 @@ export class OmpAgentSession implements AgentSession {
       this.emit({ type: "turn_started", provider: this.provider, turnId });
     }
 
-    void (async () => {
+    const submit = async () => {
       try {
-        if (this.runtimeDead) await this.replaceRuntime(this.currentModeId ?? "full");
-        if (this.closed) throw new Error("OMP session is closed");
-        const ack = await this.runtimeSession.prompt({
-          message: payload.text,
-          images: payload.images,
-          streamingBehavior,
-        });
+        const ack = await this.submitPrompt(payload, streamingBehavior, commandContext);
         this.activePromptRequestId = ack.requestId ?? null;
         const correlatedResult = ack.requestId
           ? this.pendingPromptResults.get(ack.requestId)
@@ -944,9 +941,32 @@ export class OmpAgentSession implements AgentSession {
           error: toDiagnosticErrorMessage(error),
         });
       }
-    })();
+    };
+
+    // Recovery callers wait for the prompt RPC; ordinary starts publish its eventual result.
+    const submission = submit();
+    if (commandContext?.onProviderOutcome) await submission;
+    else void submission;
 
     return { turnId };
+  }
+
+  private async submitPrompt(
+    payload: Awaited<ReturnType<typeof convertPromptInput>>,
+    streamingBehavior?: "steer" | "followUp",
+    commandContext?: OutOfBandCommandContext,
+  ) {
+    if (this.runtimeDead) await this.replaceRuntime(this.currentModeId ?? "full");
+    if (this.closed) throw new Error("OMP session is closed");
+    const send = () =>
+      this.runtimeSession.prompt({
+        message: payload.text,
+        images: payload.images,
+        streamingBehavior,
+      });
+    if (!commandContext) return send();
+    if (commandContext.beforeProviderDispatch) await commandContext.beforeProviderDispatch();
+    return this.runCommandRequest(send, commandContext);
   }
 
   async steerActiveTurn(
@@ -1263,7 +1283,7 @@ export class OmpAgentSession implements AgentSession {
 
   tryHandleOutOfBand(
     prompt: AgentPromptInput,
-  ): { run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void> } | null {
+  ): ReturnType<NonNullable<AgentSession["tryHandleOutOfBand"]>> {
     if (typeof prompt !== "string") {
       return null;
     }
@@ -1275,16 +1295,12 @@ export class OmpAgentSession implements AgentSession {
     const commandName = parsed.commandName.toLowerCase();
     if (commandName === "compact") {
       return {
-        run: async ({ emit }) => {
-          await this.executeCompactCommand(parsed.args, emit);
-        },
+        run: (context) => this.executeCompactCommand(parsed.args, context),
       };
     }
     if (commandName === "autocompact") {
       return {
-        run: async ({ emit }) => {
-          await this.executeAutoCompactCommand(parsed.args, emit);
-        },
+        run: (context) => this.executeAutoCompactCommand(parsed.args, context),
       };
     }
     if (commandName === "steer" || commandName === "follow-up") {
@@ -1294,20 +1310,27 @@ export class OmpAgentSession implements AgentSession {
       }
       const streamingBehavior = commandName === "steer" ? "steer" : "followUp";
       return {
-        run: async () => {
+        run: async (context) => {
           if (!this.activeTurnId && !this.activeTurnStarted) {
-            await this.startPrompt({ prompt: message, streamingBehavior, announceTurn: true });
+            await this.startPrompt({
+              prompt: message,
+              streamingBehavior,
+              announceTurn: true,
+              commandContext: context,
+            });
           } else {
-            await this.runtimeSession.prompt({ message, streamingBehavior });
+            if (context.beforeProviderDispatch) await context.beforeProviderDispatch();
+            await this.runCommandRequest(
+              () => this.runtimeSession.prompt({ message, streamingBehavior }),
+              context,
+            );
           }
         },
       };
     }
     if (commandName === "handoff") {
       return {
-        run: async ({ emit }) => {
-          await this.executeHandoffCommand(parsed.args, emit);
-        },
+        run: (context) => this.executeHandoffCommand(parsed.args, context),
       };
     }
     return null;
@@ -1460,10 +1483,37 @@ export class OmpAgentSession implements AgentSession {
     return rawArgs.length > 0 ? { commandName, args: rawArgs } : { commandName };
   }
 
+  private async runCommandRequest<T>(
+    send: () => Promise<T>,
+    { onProviderOutcome }: OutOfBandCommandContext,
+  ): Promise<T> {
+    if (this.closed || this.runtimeDead) {
+      throw new Error("OMP session is closed");
+    }
+    let result: T;
+    try {
+      result = await send();
+    } catch (error) {
+      if (
+        !(error instanceof JsonlRpcRequestNotSentError || error instanceof JsonlRpcResponseError)
+      ) {
+        onProviderOutcome?.();
+      }
+      throw error;
+    }
+    onProviderOutcome?.();
+    return result;
+  }
+
   private async executeCompactCommand(
     customInstructions: string | undefined,
-    emit: (event: AgentStreamEvent) => void,
+    context: OutOfBandCommandContext,
   ): Promise<void> {
+    const { emit } = context;
+    if (context.beforeProviderDispatch) await context.beforeProviderDispatch();
+    if (this.closed || this.runtimeDead) {
+      throw new Error("OMP session is closed");
+    }
     if (this.manualCompactionRunning) {
       throw new Error("An OMP compact command is already running");
     }
@@ -1478,7 +1528,7 @@ export class OmpAgentSession implements AgentSession {
       });
     emitCompaction("loading");
     try {
-      await this.runtimeSession.compact(customInstructions);
+      await this.runCommandRequest(() => this.runtimeSession.compact(customInstructions), context);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       emitCompaction("completed");
@@ -1500,8 +1550,9 @@ export class OmpAgentSession implements AgentSession {
 
   private async executeAutoCompactCommand(
     mode: string | undefined,
-    emit: (event: AgentStreamEvent) => void,
+    context: OutOfBandCommandContext,
   ): Promise<void> {
+    const { emit } = context;
     let enabled = parseAutoCompactMode(mode);
     if (enabled === "unknown") {
       emit({
@@ -1530,8 +1581,9 @@ export class OmpAgentSession implements AgentSession {
       enabled = !state.autoCompactionEnabled;
     }
 
+    if (context.beforeProviderDispatch) await context.beforeProviderDispatch();
     try {
-      await this.runtimeSession.setAutoCompaction(enabled);
+      await this.runCommandRequest(() => this.runtimeSession.setAutoCompaction(enabled), context);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       emit({
@@ -1560,10 +1612,12 @@ export class OmpAgentSession implements AgentSession {
 
   private async executeHandoffCommand(
     instructions: string | undefined,
-    emit: (event: AgentStreamEvent) => void,
+    context: OutOfBandCommandContext,
   ): Promise<void> {
+    const { emit } = context;
+    if (context.beforeProviderDispatch) await context.beforeProviderDispatch();
     try {
-      await this.runtimeSession.handoff(instructions);
+      await this.runCommandRequest(() => this.runtimeSession.handoff(instructions), context);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       emit({

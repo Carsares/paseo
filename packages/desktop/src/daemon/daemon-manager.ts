@@ -68,13 +68,13 @@ const DAEMON_LOG_FILENAME = "daemon.log";
 const RECOVERY_MARKER_FILENAME = "restart-recovery-once.json";
 const UPDATE_RECOVERY_FILENAME = "app-update-recovery.json";
 let ownedLaunch: { home: string; instance: DaemonInstance } | null = null;
-let manualUpdateHandoffInProgress = false;
+let manualUpdateHandoffsInProgress = 0;
 const daemonUpdateStops = new Set<string>();
 const updateRecoveryRestores = new Map<string, Promise<void>>();
 let daemonLaunchesInProgress = 0;
 
 export function isManualUpdateHandoffInProgress(): boolean {
-  return manualUpdateHandoffInProgress;
+  return manualUpdateHandoffsInProgress > 0;
 }
 
 type DesktopDaemonState = "starting" | "running" | "stopped" | "errored";
@@ -902,17 +902,30 @@ export function createDaemonCommandHandlers(
             }
             if (isQuitting()) return false;
             ownsHandoff = true;
-            manualUpdateHandoffInProgress = true;
-            return withDaemonUpdateLock(home, async () => {
-              const shutdown = instance?.desktopManaged
+            manualUpdateHandoffsInProgress++;
+            const shutdown = await withDaemonUpdateLock(home, async () => {
+              const stopped = instance?.desktopManaged
                 ? await captureDaemonUpdateShutdown(home, instance, target)
                 : undefined;
-              return shutdown ?? holdDaemonLaunchForUpdate(home);
+              return stopped ?? holdDaemonLaunchForUpdate(home);
             });
+            return {
+              ...shutdown,
+              async restore() {
+                // A timed-out preparation can finish after a user quit has begun.
+                if (isQuitting()) return;
+                manualUpdateHandoffsInProgress++;
+                try {
+                  await shutdown.restore();
+                } finally {
+                  manualUpdateHandoffsInProgress--;
+                }
+              },
+            };
           },
         );
       } finally {
-        if (ownsHandoff) manualUpdateHandoffInProgress = false;
+        if (ownsHandoff) manualUpdateHandoffsInProgress--;
       }
     },
     get_local_daemon_version: () => getLocalDaemonVersion(),

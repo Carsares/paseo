@@ -1,4 +1,9 @@
-import { AgentForkSourceSchema, type AgentSnapshotPayload } from "@getpaseo/protocol/messages";
+import {
+  AgentForkSourceSchema,
+  ForgeSearchItemSchema,
+  WorkspaceCreateRequestSchema,
+  type AgentSnapshotPayload,
+} from "@getpaseo/protocol/messages";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { create } from "zustand";
 import { z } from "zod";
@@ -32,10 +37,35 @@ export interface PendingWorkspaceDraftSetup {
   sourceDirectory?: string | null;
 }
 
+const ForkWorktreeSubmissionSchema = z.object({
+  source: WorkspaceCreateRequestSchema.shape.source.options[1].required({
+    cwd: true,
+    projectId: true,
+    worktreeSlug: true,
+  }),
+  baseItem: z
+    .discriminatedUnion("kind", [
+      z.object({
+        kind: z.literal("branch"),
+        name: z.string(),
+        refName: z.string(),
+        accessibilityLabel: z.string(),
+        divergenceLabel: z.string().optional(),
+        committerDate: z.number().optional(),
+      }),
+      z.object({ kind: z.literal("github-pr"), item: ForgeSearchItemSchema }),
+    ])
+    .nullable(),
+  metadata: z.record(z.string(), z.json()),
+});
+
+export type ForkWorktreeSubmission = z.infer<typeof ForkWorktreeSubmissionSchema>;
+
 const StoredForkDraftSchema = z.object({
   sourceServerId: z.string().min(1),
   sourceDirectory: z.string().nullable(),
   worktreeSlug: z.string().min(1).optional(),
+  worktreeSubmission: ForkWorktreeSubmissionSchema.optional(),
   setup: z.object({
     provider: z.string().min(1),
     cwd: z.string().min(1),
@@ -50,7 +80,11 @@ const StoredForkDraftSchema = z.object({
 type DraftSetupStatus =
   | "loading"
   | "unavailable"
-  | { sourceServerId: string | null; worktreeSlug?: string };
+  | {
+      sourceServerId: string | null;
+      worktreeSlug?: string;
+      worktreeSubmission?: ForkWorktreeSubmission;
+    };
 
 interface WorkspaceDraftSubmissionState {
   pendingByDraftId: Record<string, PendingWorkspaceDraftSubmission>;
@@ -68,10 +102,10 @@ interface WorkspaceDraftSubmissionState {
       sourceServerId: string;
     },
   ) => Promise<void>;
-  reserveForkWorktreeSlug: (input: {
+  reserveForkWorktree: (input: {
     draftId: string;
     serverId: string;
-    worktreeSlug: string;
+    submission: ForkWorktreeSubmission;
   }) => Promise<string>;
   hydrateDraftSetup: (draftId: string) => Promise<void>;
   clearDraftSetup: (input: { draftId: string }) => Promise<void>;
@@ -149,13 +183,13 @@ export function createWorkspaceDraftSubmissionStore(
         };
       });
     },
-    reserveForkWorktreeSlug: async ({ draftId, serverId, worktreeSlug }) => {
+    reserveForkWorktree: async ({ draftId, serverId, submission }) => {
       const id = normalizeDraftId(draftId);
       const status = get().draftSetupStatusById[id];
       if (typeof status !== "object" || status.sourceServerId !== serverId) {
         throw new Error("The Fork draft is not available on this host.");
       }
-      if (status.worktreeSlug) return status.worktreeSlug;
+      if (status.worktreeSubmission) return status.worktreeSubmission.source.worktreeSlug;
       // Read the saved source here so this reservation doesn't replace the setup used
       // to track ownership of the composer's draft and attachments.
       const raw = await storage.getItem(forkDraftStorageKey(id));
@@ -163,17 +197,34 @@ export function createWorkspaceDraftSubmissionStore(
       if (stored.sourceServerId !== serverId || get().draftSetupStatusById[id] !== status) {
         throw new Error("The Fork draft changed before the worktree was created.");
       }
-      const slug = stored.worktreeSlug ?? worktreeSlug;
-      await storage.setItem(
-        forkDraftStorageKey(id),
-        JSON.stringify({ ...stored, worktreeSlug: slug }),
-      );
+      const slug =
+        stored.worktreeSubmission?.source.worktreeSlug ??
+        stored.worktreeSlug ??
+        submission.source.worktreeSlug;
+      // Keep the first submitted source for recovery. Later edits still go to the host under
+      // the same request key so it can compare their intent against the accepted request.
+      const worktreeSubmission =
+        stored.worktreeSubmission ??
+        ForkWorktreeSubmissionSchema.parse({
+          ...submission,
+          source: { ...submission.source, worktreeSlug: slug },
+        });
+      if (!stored.worktreeSubmission) {
+        await storage.setItem(
+          forkDraftStorageKey(id),
+          JSON.stringify({ ...stored, worktreeSlug: slug, worktreeSubmission }),
+        );
+      }
       set((state) =>
         state.draftSetupStatusById[id] === status
           ? {
               draftSetupStatusById: {
                 ...state.draftSetupStatusById,
-                [id]: { ...status, worktreeSlug: slug },
+                [id]: {
+                  ...status,
+                  worktreeSlug: slug,
+                  worktreeSubmission,
+                },
               },
             }
           : state,
@@ -198,6 +249,7 @@ export function createWorkspaceDraftSubmissionStore(
           status = {
             sourceServerId: stored.sourceServerId,
             ...(stored.worktreeSlug ? { worktreeSlug: stored.worktreeSlug } : {}),
+            ...(stored.worktreeSubmission ? { worktreeSubmission: stored.worktreeSubmission } : {}),
           };
           pending = { setup: stored.setup, sourceDirectory: stored.sourceDirectory };
         }

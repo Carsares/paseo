@@ -115,19 +115,37 @@ test("a new process restores a fork's host and boundary without replaying pendin
   });
   expect(reader.getState().pendingByDraftId).toEqual({});
 
+  const submission = {
+    source: {
+      kind: "worktree",
+      cwd: "/repo",
+      projectId: "project-1",
+      worktreeSlug: "first-worktree",
+      action: "branch-off",
+      refName: "refs/heads/selected-base",
+      branchName: "named-fork",
+    },
+    baseItem: {
+      kind: "branch",
+      refName: "refs/heads/selected-base",
+      name: "selected-base",
+      accessibilityLabel: "selected-base, local branch",
+    },
+    metadata: { issue: "PAS-101" },
+  } satisfies StoreModule.ForkWorktreeSubmission;
   await expect(
-    reader.getState().reserveForkWorktreeSlug({
+    reader.getState().reserveForkWorktree({
       draftId: fork.draftId,
       serverId: "host-2",
-      worktreeSlug: "wrong-host",
+      submission: { ...submission, source: { ...submission.source, worktreeSlug: "wrong-host" } },
     }),
   ).rejects.toThrow("The Fork draft is not available on this host.");
   const setup = reader.getState().setupByDraftId[fork.draftId];
   await expect(
-    reader.getState().reserveForkWorktreeSlug({
+    reader.getState().reserveForkWorktree({
       draftId: fork.draftId,
       serverId: fork.sourceServerId,
-      worktreeSlug: "first-worktree",
+      submission,
     }),
   ).resolves.toBe("first-worktree");
   expect(reader.getState().setupByDraftId[fork.draftId]).toBe(setup);
@@ -137,14 +155,30 @@ test("a new process restores a fork's host and boundary without replaying pendin
   expect(reloaded.getState().draftSetupStatusById[fork.draftId]).toEqual({
     sourceServerId: "host-1",
     worktreeSlug: "first-worktree",
+    worktreeSubmission: submission,
   });
   await expect(
-    reloaded.getState().reserveForkWorktreeSlug({
+    reloaded.getState().reserveForkWorktree({
       draftId: fork.draftId,
       serverId: fork.sourceServerId,
-      worktreeSlug: "newly-generated-after-reload",
+      submission: {
+        ...submission,
+        source: {
+          ...submission.source,
+          worktreeSlug: "newly-generated-after-reload",
+          branchName: "edited-fork",
+        },
+      },
     }),
   ).resolves.toBe("first-worktree");
+
+  const afterEdit = createWorkspaceDraftSubmissionStore(storage);
+  await afterEdit.getState().hydrateDraftSetup(fork.draftId);
+  expect(afterEdit.getState().draftSetupStatusById[fork.draftId]).toEqual({
+    sourceServerId: "host-1",
+    worktreeSlug: "first-worktree",
+    worktreeSubmission: submission,
+  });
 
   // A destination workspace can finish in another process without loading /new.
   const destination = createWorkspaceDraftSubmissionStore(storage);

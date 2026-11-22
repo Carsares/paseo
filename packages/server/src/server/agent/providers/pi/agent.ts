@@ -29,6 +29,7 @@ import {
   type AgentRuntimeInfo,
   type AgentSelectOption,
   type AgentSession,
+  type OutOfBandCommandContext,
   type AgentSessionConfig,
   type AgentSlashCommand,
   type AgentSlashCommandKind,
@@ -79,6 +80,7 @@ import {
   type ProviderImageOutput,
 } from "../provider-image-output.js";
 import { PiCliRuntime } from "./cli-runtime.js";
+import { JsonlRpcRequestNotSentError, JsonlRpcResponseError } from "../jsonl-rpc-process.js";
 import {
   createPiExtensionHost,
   piExtensionRuntimeBridge,
@@ -1667,7 +1669,7 @@ export class PiRpcAgentSession implements AgentSession {
 
   tryHandleOutOfBand(
     prompt: AgentPromptInput,
-  ): { run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void> } | null {
+  ): ReturnType<NonNullable<AgentSession["tryHandleOutOfBand"]>> {
     if (typeof prompt !== "string") {
       return null;
     }
@@ -1678,16 +1680,12 @@ export class PiRpcAgentSession implements AgentSession {
     const commandName = parsed.commandName.toLowerCase();
     if (commandName === "compact") {
       return {
-        run: async ({ emit }) => {
-          await this.executeCompactCommand(parsed.args, emit);
-        },
+        run: (context) => this.executeCompactCommand(parsed.args, context),
       };
     }
     if (commandName === "autocompact") {
       return {
-        run: async ({ emit }) => {
-          await this.executeAutoCompactCommand(parsed.args, emit);
-        },
+        run: (context) => this.executeAutoCompactCommand(parsed.args, context),
       };
     }
     return null;
@@ -1858,10 +1856,39 @@ export class PiRpcAgentSession implements AgentSession {
     return rawArgs.length > 0 ? { commandName, args: rawArgs } : { commandName };
   }
 
+  private async runCommandRequest<T>(
+    send: () => Promise<T>,
+    { onProviderOutcome }: OutOfBandCommandContext,
+    providerStarted?: () => boolean,
+  ): Promise<T> {
+    if (this.closed || this.runtimeDead) {
+      throw new Error("Pi session is closed");
+    }
+    let result: T;
+    try {
+      result = await send();
+    } catch (error) {
+      if (
+        !(error instanceof JsonlRpcRequestNotSentError) &&
+        (providerStarted?.() || !(error instanceof JsonlRpcResponseError))
+      ) {
+        onProviderOutcome?.();
+      }
+      throw error;
+    }
+    onProviderOutcome?.();
+    return result;
+  }
+
   private async executeCompactCommand(
     customInstructions: string | undefined,
-    emit: (event: AgentStreamEvent) => void,
+    context: OutOfBandCommandContext,
   ): Promise<void> {
+    const { emit } = context;
+    if (context.beforeProviderDispatch) await context.beforeProviderDispatch();
+    if (this.closed || this.runtimeDead) {
+      throw new Error("Pi session is closed");
+    }
     if (this.outOfBandCompactionEmit) {
       throw new Error("A Pi compact command is already running");
     }
@@ -1869,7 +1896,11 @@ export class PiRpcAgentSession implements AgentSession {
     this.outOfBandCompactionStarted = false;
     this.outOfBandCompactionCompleted = false;
     try {
-      this.compactionPromise = this.runtimeSession.compact(customInstructions);
+      this.compactionPromise = this.runCommandRequest(
+        () => this.runtimeSession.compact(customInstructions),
+        context,
+        () => this.outOfBandCompactionStarted,
+      );
       await this.compactionPromise;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1907,8 +1938,9 @@ export class PiRpcAgentSession implements AgentSession {
 
   private async executeAutoCompactCommand(
     mode: string | undefined,
-    emit: (event: AgentStreamEvent) => void,
+    context: OutOfBandCommandContext,
   ): Promise<void> {
+    const { emit } = context;
     let enabled = parseAutoCompactMode(mode);
     if (enabled === "unknown") {
       emit({
@@ -1937,8 +1969,9 @@ export class PiRpcAgentSession implements AgentSession {
       enabled = !state.autoCompactionEnabled;
     }
 
+    if (context.beforeProviderDispatch) await context.beforeProviderDispatch();
     try {
-      await this.runtimeSession.setAutoCompaction(enabled);
+      await this.runCommandRequest(() => this.runtimeSession.setAutoCompaction(enabled), context);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       emit({

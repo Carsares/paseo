@@ -1125,6 +1125,7 @@ export async function createPaseoDaemon(
           // A user can start work while automatic recovery is opening the session.
           idleOnly: canDispatch !== undefined,
           assertDispatchAllowed,
+          waitForCommandOutcome: true,
           runOptions: { recoveryIntent: "automatic" },
         });
         if (result.disposition !== "turn_started") return;

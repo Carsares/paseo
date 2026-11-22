@@ -10524,14 +10524,14 @@ export class Session {
         logger: this.sessionLogger,
       };
       const recoverable = this.recoverableAgentMessage(msg, prompt, directParent, sourceAgentEvent);
-      const send = async (beforeDispatch: () => Promise<void>) => {
+      const send = async (handoff?: QueueHandoff) => {
         if (msg.sourceAgentId) {
           const validateDispatch = directParent
             ? () => validateDirectParentPrompt(queuedContext, agentId, directParent)
             : undefined;
           await validateDispatch?.();
           const confirmAtDispatch = Boolean(msg.waitForDispatch || directParent);
-          if (!confirmAtDispatch) await beforeDispatch();
+          if (!confirmAtDispatch) await handoff?.begin();
           const notification = await registerDirectParentPromptNotification(
             this.finishSubscriptions,
             agentId,
@@ -10539,30 +10539,22 @@ export class Session {
             msg.notifyDirectParentOnFinish,
           );
           try {
+            const source = {
+              agentId: msg.sourceAgentId,
+              serverId: msg.sourceAgentServerId,
+              title: !msg.sourceAgentServerId
+                ? (this.agentManager.getAgent(msg.sourceAgentId)?.config.title ?? undefined)
+                : undefined,
+            };
             const receipt = this.agentMessages.enqueue({
               recipientId: agentId,
               messageId: msg.messageId,
-              beforeProviderDispatch: confirmAtDispatch ? beforeDispatch : undefined,
+              handoff: confirmAtDispatch ? handoff : undefined,
               validateDispatch,
               prompt,
               source: sourceAgentEvent
-                ? {
-                    kind: "agent-notification",
-                    agentId: msg.sourceAgentId,
-                    serverId: msg.sourceAgentServerId,
-                    title: !msg.sourceAgentServerId
-                      ? (this.agentManager.getAgent(msg.sourceAgentId)?.config.title ?? undefined)
-                      : undefined,
-                    event: sourceAgentEvent,
-                  }
-                : {
-                    kind: "agent-message",
-                    agentId: msg.sourceAgentId,
-                    serverId: msg.sourceAgentServerId,
-                    title: !msg.sourceAgentServerId
-                      ? (this.agentManager.getAgent(msg.sourceAgentId)?.config.title ?? undefined)
-                      : undefined,
-                  },
+                ? { kind: "agent-notification", ...source, event: sourceAgentEvent }
+                : { kind: "agent-message", ...source },
               activeTurnBehavior: msg.activeTurnBehavior ?? "steer",
               sessionMode: msg.sessionMode,
               clearPendingPermissions: false,
@@ -10590,7 +10582,7 @@ export class Session {
           activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
           sessionMode: msg.sessionMode,
           clearPendingPermissions: true,
-          beforeDispatch,
+          beforeDispatch: handoff?.begin,
         });
         if (result.disposition === "turn_started") {
           await waitForAgentRunStartWithTimeout(
@@ -10629,9 +10621,9 @@ export class Session {
               activeTurnBehavior:
                 msg.activeTurnBehavior ?? (msg.sourceAgentId ? "steer" : "interrupt"),
             },
-            send: async (beforeDispatch) => {
+            send: async (begin, declined) => {
               if (!msg.sourceAgentId) await this.prepareAgentMessage(agentId, msg.text);
-              await send(beforeDispatch);
+              await send({ begin, declined });
             },
             retryIfUnsent:
               (msg.waitForDispatch || directParent) && msg.sourceAgentId
@@ -10642,7 +10634,7 @@ export class Session {
             retryIfNotAdmitted: (error) =>
               deliveryStatus !== "queued" && error instanceof AgentMessageAdmissionError,
           })
-        : send(async () => {});
+        : send();
       void sent.catch((error) => {
         if (!msg.waitForDispatch && deliveryStatus === "queued") {
           this.handleAgentRunError(agentId, error, "Failed to dispatch queued agent message");

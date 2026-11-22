@@ -1,3 +1,4 @@
+import equal from "fast-deep-equal";
 import { useAddHost } from "@/hosts/add-host";
 import type { CreateWorkspaceRequestOptions } from "@getpaseo/client/internal/daemon-client";
 import type { AgentSnapshotPayload, CreationSnapshot } from "@getpaseo/protocol/messages";
@@ -60,6 +61,7 @@ import { useOpenAddProject } from "@/hooks/use-open-add-project";
 import { isActiveCreateFlowForDraft, useCreateFlowStore } from "@/stores/create-flow-store";
 import {
   useWorkspaceDraftSubmissionStore,
+  type ForkWorktreeSubmission,
   type PendingWorkspaceDraftSetup,
 } from "@/stores/workspace-draft-submission-store";
 import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
@@ -102,6 +104,7 @@ import {
   defaultBasePickerItem,
   pickerItemLabel,
   startsNewBranch,
+  type BaseRefCheckoutStatus,
   type BranchPickerDetail,
   type PickerCheckoutRequest,
   type PickerItem,
@@ -293,6 +296,51 @@ function checkoutRequestOrExplain(
   }
 }
 
+function resolveStartingRef(
+  selected: PickerItem | null,
+  submitted: ForkWorktreeSubmission | undefined,
+  status?: BaseRefCheckoutStatus | null,
+): PickerItem | null {
+  if (selected) return selected;
+  if (submitted) return submitted.baseItem;
+  return status ? defaultBasePickerItem(status) : null;
+}
+
+async function resolveWorktreeCreationSource(input: {
+  setup: NewWorkspaceSetup;
+  submittedWorktree?: ForkWorktreeSubmission;
+  readCheckoutStatus: () => Promise<BaseRefCheckoutStatus>;
+  sourceDirectory: string;
+  projectId: string;
+  worktreeSlug: string;
+  forkIdentity?: { draftId: string; serverId: string };
+  t: TFunction;
+}): Promise<ForkWorktreeSubmission["source"]> {
+  const { setup, submittedWorktree } = input;
+  const status = submittedWorktree ? null : await input.readCheckoutStatus();
+  const { pickerSelection, branch, metadata } = setup.getSnapshot();
+  const baseItem = resolveStartingRef(pickerSelection.selectedItem, submittedWorktree, status);
+  const checkout = checkoutRequestOrExplain(
+    () => setup.checkoutRequestFor(baseItem, submittedWorktree?.source),
+    input.t,
+  );
+  const source: ForkWorktreeSubmission["source"] = {
+    kind: "worktree",
+    cwd: input.sourceDirectory,
+    projectId: input.projectId,
+    worktreeSlug: input.worktreeSlug,
+    ...checkout,
+    ...(branch && startsNewBranch(checkout) ? { branchName: branch } : {}),
+  };
+  if (submittedWorktree && equal(source, submittedWorktree.source)) return submittedWorktree.source;
+  if (!input.forkIdentity) return source;
+  const worktreeSlug = await useWorkspaceDraftSubmissionStore.getState().reserveForkWorktree({
+    ...input.forkIdentity,
+    submission: { source, baseItem, metadata },
+  });
+  return { ...source, worktreeSlug };
+}
+
 function normalizeBranchDetails(
   data: { branchDetails?: BranchPickerDetail[]; branches?: string[] } | undefined,
 ): BranchPickerDetail[] {
@@ -352,14 +400,8 @@ interface WorkspaceCreationResult {
 
 async function createMultiplicityWorkspace(input: {
   idempotencyKey: string;
-  worktreeSlug: string;
   client: NonNullable<ReturnType<typeof useHostRuntimeClient>>;
-  isolation: "local" | "worktree";
-  project: HostProjectListItem;
-  sourceDirectory: string;
-  checkoutRequest: PickerCheckoutRequest | undefined;
-  /** Names the new branch of a worktree cut from a branch. */
-  branchName: string | null;
+  source: CreateWorkspaceRequestOptions["source"];
   /** Stored on the created workspace. */
   metadata: Readonly<Record<string, JsonValue>>;
   withInitialAgent: boolean;
@@ -375,9 +417,6 @@ async function createMultiplicityWorkspace(input: {
   serverId: string;
   createFailedMessage: string;
 }): Promise<WorkspaceCreationResult> {
-  const projectId = getHostProjectId(input.project, input.serverId);
-  if (!projectId) throw new Error("Project is not available on the selected host");
-  const isWorktree = input.isolation === "worktree";
   const firstAgentContext = buildFirstAgentContext({
     prompt: input.prompt,
     attachments: input.attachments,
@@ -398,22 +437,7 @@ async function createMultiplicityWorkspace(input: {
       acceptMainAgent(snapshot.mainAgent);
       input.onEvent?.(snapshot);
     },
-    source: isWorktree
-      ? {
-          kind: "worktree",
-          cwd: input.sourceDirectory,
-          projectId,
-          worktreeSlug: input.worktreeSlug,
-          ...input.checkoutRequest,
-          ...(input.branchName && startsNewBranch(input.checkoutRequest)
-            ? { branchName: input.branchName }
-            : {}),
-        }
-      : {
-          kind: "directory",
-          path: input.sourceDirectory,
-          projectId,
-        },
+    source: input.source,
     ...(firstAgentContext ? { firstAgentContext } : {}),
     ...(Object.keys(input.metadata).length > 0 ? { metadata: { ...input.metadata } } : {}),
   });
@@ -658,14 +682,45 @@ function usePendingWorkspaceDraftSetup(draftId: string | undefined) {
   const forkDraftSetup = useWorkspaceDraftSubmissionStore((state) =>
     normalizedDraftId ? (state.setupByDraftId[normalizedDraftId] ?? null) : null,
   );
-  const hasReservedForkWorktree = useWorkspaceDraftSubmissionStore((state) => {
-    const status = state.draftSetupStatusById[normalizedDraftId];
-    return typeof status === "object" && Boolean(status.worktreeSlug);
-  });
+  const draftStatus = useWorkspaceDraftSubmissionStore(
+    (state) => state.draftSetupStatusById[normalizedDraftId],
+  );
+  const storedDraft = typeof draftStatus === "object" ? draftStatus : null;
   return {
     forkDraftSetup,
     isTimelineFork: Boolean(forkDraftSetup?.setup.forkFrom),
-    hasReservedForkWorktree,
+    reservedWorktreeSlug: storedDraft?.worktreeSlug,
+    storedDraft,
+  };
+}
+
+function forkWorktreeAtTarget(
+  draft: ReturnType<typeof usePendingWorkspaceDraftSetup>["storedDraft"],
+  serverId: string,
+  projectId: string | null,
+  directory: string | null,
+): ForkWorktreeSubmission | undefined {
+  const submitted = draft?.worktreeSubmission;
+  if (
+    draft?.sourceServerId === serverId &&
+    submitted?.source.projectId === projectId &&
+    submitted.source.cwd === directory
+  ) {
+    return submitted;
+  }
+  return undefined;
+}
+
+function restoreForkWorktreeProject(
+  route: NewWorkspaceScreenProps,
+  restored: ForkWorktreeSubmission | undefined,
+): NewWorkspaceScreenProps {
+  if (!restored) return route;
+  return {
+    ...route,
+    sourceDirectory: restored.source.cwd,
+    projectId: restored.source.projectId,
+    displayName: restored.source.projectId === route.projectId ? route.displayName : undefined,
   };
 }
 
@@ -986,8 +1041,9 @@ export function NewWorkspaceScreen({
   const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
   const toast = useToast();
-  const { forkDraftSetup, isTimelineFork, hasReservedForkWorktree } =
+  const { forkDraftSetup, isTimelineFork, reservedWorktreeSlug, storedDraft } =
     usePendingWorkspaceDraftSetup(draftId);
+  const [restoredWorktree] = useState(() => storedDraft?.worktreeSubmission);
   const composerEditing = useNewWorkspaceComposerEditing();
   const { leaveFullscreen } = composerEditing;
   const mergeWorkspaces = useCallback(
@@ -1008,7 +1064,10 @@ export function NewWorkspaceScreen({
     routeProjectContextViewKey,
     lastActiveProject,
   } = useNewWorkspaceInitialContext(
-    { serverId, sourceDirectory: sourceDirectoryProp, projectId, displayName: displayNameProp },
+    restoreForkWorktreeProject(
+      { serverId, sourceDirectory: sourceDirectoryProp, projectId, displayName: displayNameProp },
+      restoredWorktree,
+    ),
     isTimelineFork,
   );
   // COMPAT(workspaceMultiplicity): added in v0.1.97, drop the gate when floor >= v0.1.97
@@ -1141,16 +1200,29 @@ export function NewWorkspaceScreen({
     cwd: selectedSourceDirectory,
     enabled: supportsWorktreeList && isConnected,
   });
-  const { setup, pluginProject, canCreateWorktree, isPending } = usePluginSetup({
+  const {
+    setup,
+    pluginProject,
+    projectId: selectedProjectId,
+    canCreateWorktree,
+    isPending,
+  } = usePluginSetup({
     serverId: selectedServerId,
     project: selectedProject,
     worktrees: projectWorktrees,
     supportsMultiplicity: supportsWorkspaceMultiplicity,
+    restoredWorktree,
     pendingAction,
     isDraftHandoffActive,
     updatePreferences: updateFormPreferences,
     setAttachments: chatDraft.setAttachments,
   });
+  const submittedWorktreeAtTarget = forkWorktreeAtTarget(
+    storedDraft,
+    selectedServerId,
+    selectedProjectId,
+    selectedSourceDirectory,
+  );
   const launchControl = useMemo(
     () => ({
       serverId: selectedServerId,
@@ -1219,7 +1291,7 @@ export function NewWorkspaceScreen({
     canCreateWorktree,
     existingWorktrees,
     projectDirectory: selectedSourceDirectory,
-    hasReservedForkWorktree,
+    hasReservedForkWorktree: Boolean(reservedWorktreeSlug),
   });
 
   const branchSuggestionsQuery = useQuery({
@@ -1273,8 +1345,8 @@ export function NewWorkspaceScreen({
   }, [forgeSearchAuthenticated, githubPrSearchQuery.data?.items]);
 
   const baseItem = useMemo(
-    () => selectedItem ?? (checkoutStatus ? defaultBasePickerItem(checkoutStatus) : null),
-    [checkoutStatus, selectedItem],
+    () => resolveStartingRef(selectedItem, submittedWorktreeAtTarget, checkoutStatus),
+    [checkoutStatus, selectedItem, submittedWorktreeAtTarget],
   );
   const { options, itemById, selectedOptionId }: PickerOptionData = useMemo(
     () =>
@@ -1423,23 +1495,32 @@ export function NewWorkspaceScreen({
       }
       const connectedClient = withConnectedClient();
       const createsWorktree = !supportsWorkspaceMultiplicity || effectiveIsolation === "worktree";
-      const checkoutStatusForCreate = createsWorktree
-        ? await ensureCheckoutStatus({
-            queryClient,
-            client: connectedClient,
-            serverId: selectedServerId,
-            cwd: selectedSourceDirectory,
-          })
-        : null;
-      const checkoutRequest = checkoutStatusForCreate
-        ? checkoutRequestOrExplain(
-            () =>
-              setup.checkoutRequestFor(
-                selectedItem ?? defaultBasePickerItem(checkoutStatusForCreate),
-              ),
-            t,
-          )
-        : undefined;
+      if (!selectedProjectId) throw new Error("Project is not available on the selected host");
+      let source: CreateWorkspaceRequestOptions["source"] = {
+        kind: "directory",
+        path: workingDirectory,
+        projectId: selectedProjectId,
+      };
+      if (createsWorktree) {
+        source = await resolveWorktreeCreationSource({
+          setup,
+          submittedWorktree: submittedWorktreeAtTarget,
+          readCheckoutStatus: () =>
+            ensureCheckoutStatus({
+              queryClient,
+              client: connectedClient,
+              serverId: selectedServerId,
+              cwd: selectedSourceDirectory,
+            }),
+          sourceDirectory: workingDirectory,
+          projectId: selectedProjectId,
+          worktreeSlug: reservedWorktreeSlug ?? creationIdentity.worktreeSlug,
+          forkIdentity: isTimelineFork
+            ? { draftId: creationIdentity.draftId, serverId: selectedServerId }
+            : undefined,
+          t,
+        });
+      }
       let mainAgent = input.mainAgent;
       if (createMainAgent && !input.withInitialAgent) {
         const selectedProvider = composerState?.selectedProvider ?? null;
@@ -1452,25 +1533,10 @@ export function NewWorkspaceScreen({
         const matchingComposer = provider === selectedProvider ? composerState : null;
         mainAgent = { config: buildWorkspaceAgentConfig(input.cwd, provider, matchingComposer) };
       }
-      // The request key already comes from the draft URL. Keep its generated worktree
-      // slug durable too, so a refresh can replay the same intent and obtain the result.
-      const worktreeSlug =
-        isTimelineFork && createsWorktree
-          ? await useWorkspaceDraftSubmissionStore.getState().reserveForkWorktreeSlug({
-              draftId: creationIdentity.draftId,
-              serverId: selectedServerId,
-              worktreeSlug: creationIdentity.worktreeSlug,
-            })
-          : creationIdentity.worktreeSlug;
       const normalizedWorkspace = await createMultiplicityWorkspace({
         idempotencyKey: creationIdentity.draftId,
-        worktreeSlug,
         client: connectedClient,
-        isolation: createsWorktree ? "worktree" : "local",
-        project: selectedProject,
-        sourceDirectory: workingDirectory,
-        checkoutRequest,
-        branchName: setup.getSnapshot().branch,
+        source,
         metadata: setup.getSnapshot().metadata,
         withInitialAgent: input.withInitialAgent,
         prompt: input.prompt,
@@ -1495,11 +1561,13 @@ export function NewWorkspaceScreen({
       isTimelineFork,
       mergeWorkspaces,
       queryClient,
-      selectedItem,
+      reservedWorktreeSlug,
       selectedProject,
+      selectedProjectId,
       selectedServerId,
       selectedSourceDirectory,
       setup,
+      submittedWorktreeAtTarget,
       supportsWorkspaceMultiplicity,
       t,
       withConnectedClient,
@@ -1847,6 +1915,7 @@ function usePluginSetup(input: {
   project: Parameters<typeof getHostProjectId>[0] | null;
   worktrees: SetupInputs["worktrees"];
   supportsMultiplicity: boolean;
+  restoredWorktree?: ForkWorktreeSubmission;
   pendingAction: Parameters<typeof isNewWorkspacePending>[0]["pendingAction"];
   isDraftHandoffActive: boolean;
   updatePreferences: ReturnType<typeof useFormPreferences>["updatePreferences"];
@@ -1857,6 +1926,7 @@ function usePluginSetup(input: {
     project,
     worktrees,
     supportsMultiplicity,
+    restoredWorktree,
     pendingAction,
     isDraftHandoffActive,
     updatePreferences,
@@ -1887,14 +1957,18 @@ function usePluginSetup(input: {
   // Both are stable for the life of the screen: preferences write through the query client, and
   // the draft is keyed per mount. A command and a pick run the same effects.
   const [setup] = useState(() =>
-    createNewWorkspaceSetup(inputs, {
-      persistIsolation: (isolation) => void updatePreferences({ isolation }),
-      syncBaseAttachment: (item) =>
-        setAttachments((attachments) => syncPickerPrAttachment({ attachments, item })),
-    }),
+    createNewWorkspaceSetup(
+      inputs,
+      {
+        persistIsolation: (isolation) => void updatePreferences({ isolation }),
+        syncBaseAttachment: (item) =>
+          setAttachments((attachments) => syncPickerPrAttachment({ attachments, item })),
+      },
+      restoredWorktree,
+    ),
   );
   useLayoutEffect(() => setup.syncInputs(inputs));
-  return { setup, pluginProject, canCreateWorktree, isPending: locked };
+  return { setup, pluginProject, projectId, canCreateWorktree, isPending: locked };
 }
 
 /** Terminal and chat launches edit in separate sessions; the screen follows the mounted one. */

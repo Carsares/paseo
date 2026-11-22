@@ -5,6 +5,19 @@ import { once } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeAgentClient } from "./agent/providers/claude/agent.js";
+import { CodexAppServerAgentClient } from "./agent/providers/codex-app-server-agent.js";
+import {
+  createFakeCodexAppServer,
+  type FakeCodexAppServer,
+} from "./agent/providers/codex/test-utils/fake-app-server.js";
+import { PiRpcAgentClient } from "./agent/providers/pi/agent.js";
+import {
+  JsonlRpcRequestNotSentError,
+  JsonlRpcResponseError,
+} from "./agent/providers/jsonl-rpc-process.js";
+import { FakePi } from "./agent/providers/pi/test-utils/fake-pi.js";
+import { OmpAgentClient } from "./agent/providers/omp/agent.js";
+import { FakeOmp } from "./agent/providers/omp/test-utils/fake-omp.js";
 import http from "node:http";
 import path from "node:path";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -71,6 +84,40 @@ interface BlockedDaemonShutdown {
 type WebSocketProbeResult =
   | { status: "connected" }
   | { status: "rejected"; statusCode: number | null };
+
+function localCodexClient(root: string, spawn: () => FakeCodexAppServer) {
+  return new CodexAppServerAgentClient(
+    pino({ level: "silent" }),
+    { command: { mode: "replace", argv: [process.execPath] }, env: { CODEX_HOME: root } },
+    {
+      appServerProcess: {
+        resolvePrefix: async () => ({ command: process.execPath, args: [] }),
+        spawn: () => spawn().child,
+      },
+    },
+  );
+}
+
+function ignoreError() {}
+
+function hasCodexCompaction(server: FakeCodexAppServer): boolean {
+  return server.requests().some(({ method }) => method === "thread/compact/start");
+}
+
+function codexTurnCount(server: FakeCodexAppServer): number {
+  return server.requests().filter(({ method }) => method === "turn/start").length;
+}
+
+function throwRecoverySetupError(error: unknown): never {
+  throw error;
+}
+
+async function fileExists(file: string): Promise<boolean> {
+  return access(file).then(
+    () => true,
+    () => false,
+  );
+}
 
 describe("paseo daemon bootstrap", () => {
   afterEach(() => {
@@ -873,6 +920,152 @@ describe("paseo daemon bootstrap", () => {
     }
   });
 
+  test("ordinary shutdown replays a queued Codex turn claimed before shutdown but never sent", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-claimed-queue-"));
+    const release = Promise.withResolvers<void>();
+    const preparing = Promise.withResolvers<void>();
+    const admissionPaused = Promise.withResolvers<void>();
+    let holdNextLoad = false;
+    const firstServers: FakeCodexAppServer[] = [];
+    const replayServers: FakeCodexAppServer[] = [];
+    const makeFirstServer = () =>
+      createFakeCodexAppServer({
+        "thread/loaded/list": async () => {
+          if (holdNextLoad) {
+            holdNextLoad = false;
+            preparing.resolve();
+            await release.promise;
+          }
+          return { data: ["thread-1"] };
+        },
+      });
+    const replayed: string[] = [];
+    const makeReplayServer = () =>
+      createFakeCodexAppServer({
+        "turn/start": (params) => {
+          const input = (params as { input: Array<{ type: string; text?: string }> }).input;
+          for (const part of input) {
+            if (part.type === "text") {
+              for (const message of parseAgentMessages(part.text ?? "") ?? []) {
+                replayed.push(message.text);
+              }
+            }
+          }
+          return {};
+        },
+      });
+
+    const handles: Awaited<ReturnType<typeof createTestPaseoDaemon>>[] = [];
+    const clients: DaemonClient[] = [];
+    async function open(makeServer: () => FakeCodexAppServer, servers: FakeCodexAppServer[]) {
+      const handle = await createTestPaseoDaemon({
+        paseoHomeRoot: root,
+        staticDir: root,
+        cleanup: false,
+        resumeOnStartup: false,
+        agentClients: {
+          codex: localCodexClient(root, () => {
+            const server = makeServer();
+            servers.push(server);
+            return server;
+          }),
+        },
+      });
+      handles.push(handle);
+      const client = new DaemonClient({ url: "ws://127.0.0.1:" + handle.port + "/ws" });
+      clients.push(client);
+      await client.connect();
+      return { ...handle, client };
+    }
+    const submitted: Promise<unknown>[] = [];
+    const sendQueued = MessageReceipts.prototype.sendQueued;
+    const trackSends = vi
+      .spyOn(MessageReceipts.prototype, "sendQueued")
+      .mockImplementation(function (this: MessageReceipts, input) {
+        const sent = sendQueued.call(this, input);
+        submitted.push(sent);
+        void sent.catch(ignoreError);
+        return sent;
+      });
+    let stopping: Promise<void> | undefined;
+    try {
+      const first = await open(makeFirstServer, firstServers);
+      const manager = first.daemon.agentManager;
+      const agent = await manager.createAgent({ provider: "codex", cwd: root }, undefined, {
+        workspaceId: undefined,
+      });
+      const original = manager.runAgent(agent.id, "Establish a saved thread");
+      void original.catch(() => undefined);
+      await expect.poll(() => firstServers.some(codexTurnCount)).toBe(true);
+      const firstServer = firstServers.find(codexTurnCount)!;
+      firstServer.startsTurn({ threadId: "thread-1", turnId: "initial-turn" });
+      firstServer.completeTurn({ threadId: "thread-1" });
+      await original;
+
+      holdNextLoad = true;
+      const expected = ["first queued prompt", "second queued prompt"];
+      for (const prompt of expected) {
+        await expect(
+          first.client.sendAgentMessage(agent.id, prompt, {
+            sourceAgentId: agent.id,
+            messageId: prompt,
+          }),
+        ).resolves.toEqual({ deliveryStatus: "queued" });
+      }
+      await preparing.promise;
+      const pause = manager.pauseRunAdmission.bind(manager);
+      vi.spyOn(manager, "pauseRunAdmission").mockImplementation(() => {
+        const undoPause = pause();
+        admissionPaused.resolve();
+        return undoPause;
+      });
+      const persisted = new MessageReceipts(path.join(first.paseoHome, "agent-requests"));
+      // Let the claimed run reach the real handoff after the drain budget, before session teardown.
+      const close = manager.closeAgent.bind(manager);
+      const closing = vi.spyOn(manager, "closeAgent").mockImplementation(async (...args) => {
+        await Promise.allSettled(submitted);
+        await close(...args);
+      });
+      stopping = first.daemon.stop();
+      await admissionPaused.promise;
+      release.resolve();
+      await stopping;
+      closing.mockRestore();
+      trackSends.mockRestore();
+      expect(firstServers.map(codexTurnCount).reduce((a, b) => a + b, 0)).toBe(1);
+      expect((await persisted.queuedMessages()).map(({ queued }) => queued.message.prompt)).toEqual(
+        expected,
+      );
+
+      const second = await open(makeReplayServer, replayServers);
+      await expect.poll(() => replayed[0], { timeout: 8_000 }).toBe(expected[0]);
+      const server = replayServers.find(codexTurnCount)!;
+      server.startsTurn({ threadId: "thread-1", turnId: "replayed-first" });
+      server.completeTurn({ threadId: "thread-1" });
+      await expect.poll(() => replayed, { timeout: 8_000 }).toEqual(expected);
+      if (codexTurnCount(server) > 1) {
+        server.startsTurn({ threadId: "thread-1", turnId: "replayed-second" });
+        server.completeTurn({ threadId: "thread-1" });
+      }
+      await expect.poll(() => persisted.queuedMessages()).toEqual([]);
+      for (const prompt of expected) {
+        await second.client.sendAgentMessage(agent.id, prompt, {
+          sourceAgentId: agent.id,
+          messageId: prompt,
+        });
+      }
+      expect(replayed).toEqual(expected);
+      firstServer.assertNoErrors();
+      server.assertNoErrors();
+    } finally {
+      release.resolve();
+      await stopping?.catch(() => undefined);
+      for (const client of clients) await client.close();
+      for (const handle of handles.toReversed()) await handle.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("ordinary shutdown restores non-steerable queued messages in order before new ingress", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paseo-queue-recovery-"));
     const running = Promise.withResolvers<void>();
@@ -1393,6 +1586,175 @@ describe("paseo daemon bootstrap", () => {
       await handle.close();
     }
   });
+
+  test.each([
+    { provider: "pi", mode: "automatic", outcome: "accepted" },
+    { provider: "pi", mode: "automatic", outcome: "rejected" },
+    { provider: "pi", mode: "automatic", outcome: "unknown" },
+    { provider: "pi", mode: "automatic", outcome: "unsent" },
+    { provider: "omp", mode: "automatic", outcome: "accepted" },
+    { provider: "omp", mode: "automatic", outcome: "rejected" },
+    { provider: "omp", mode: "automatic", outcome: "unknown" },
+    { provider: "omp", mode: "automatic", outcome: "unsent" },
+    { provider: "codex", mode: "once", outcome: "accepted" },
+    { provider: "codex", mode: "once", outcome: "rejected" },
+    { provider: "codex", mode: "once", outcome: "unknown" },
+  ] as const)(
+    "$provider $mode recovery of /compact waits for an $outcome provider outcome",
+    async ({ provider, mode, outcome }) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paseo-recovery-compact-"));
+      const paseoHome = path.join(root, ".paseo");
+      const marker = path.join(
+        paseoHome,
+        mode === "once" ? "restart-recovery-once.json" : "restart-recovery-pending.json",
+      );
+      const agentId = randomUUID();
+      const timestamp = new Date().toISOString();
+      const seed = new AgentStorage(path.join(paseoHome, "agents"), pino({ level: "silent" }));
+      const providerEntered = Promise.withResolvers<void>();
+      const respond = Promise.withResolvers<void>();
+      const requests: string[] = [];
+      let retrying = false;
+      const retryOnRestart = outcome === "rejected" || outcome === "unsent";
+      const nativeHandle = path.join(root, "provider-session.jsonl");
+      const codex = () =>
+        createFakeCodexAppServer({
+          "thread/compact/start": async () => {
+            requests.push("/compact");
+            providerEntered.resolve();
+            await respond.promise;
+            if (!retrying && outcome === "rejected") {
+              return { __jsonRpcError: { code: -32602, message: "Compaction not available" } };
+            }
+            if (outcome === "unknown") {
+              return { __jsonRpcError: { code: -32603, message: "Outcome unknown" } };
+            }
+            return {};
+          },
+        });
+      const codexServers: FakeCodexAppServer[] = [];
+      const createCodex = () => {
+        const server = codex();
+        codexServers.push(server);
+        return server;
+      };
+      const respondLocally = async () => {
+        requests.push("/compact");
+        providerEntered.resolve();
+        await respond.promise;
+        if (!retrying && outcome === "rejected") {
+          throw new JsonlRpcResponseError("Compaction not available");
+        }
+        if (!retrying && outcome === "unsent") {
+          throw new JsonlRpcRequestNotSentError("Provider stdin is not writable");
+        }
+        if (outcome === "unknown") {
+          throw new Error("Provider process exited before replying");
+        }
+      };
+      const failed = Promise.withResolvers<unknown>();
+      let recoveryError: unknown;
+      const logger = pino({ level: "silent" });
+      const childLogger = logger.child({ module: "bootstrap" });
+      vi.spyOn(logger, "child").mockReturnValueOnce(childLogger);
+      vi.spyOn(childLogger, "error").mockImplementation((fields, message) => {
+        if (message === "Agent restart recovery failed") {
+          recoveryError = (fields as { err?: unknown }).err;
+          failed.resolve(recoveryError);
+        }
+      });
+      let handle: Awaited<ReturnType<typeof createTestPaseoDaemon>> | undefined;
+      const openDaemon = () => {
+        const pi = new FakePi();
+        const omp = new FakeOmp();
+        // The runtime boundary is controlled, while session restore and command handling are real.
+        for (let i = 0; i < 2; i++) {
+          pi.queueSessionSetup((session) => {
+            session.compact = respondLocally;
+          });
+          omp.queueSessionSetup((session) => {
+            session.compact = respondLocally;
+          });
+        }
+        const adapterLogger = pino({ level: "silent" });
+        const runtimeSettings = { command: { mode: "replace" as const, argv: [process.execPath] } };
+        const adapters = {
+          codex: localCodexClient(root, createCodex),
+          pi: new PiRpcAgentClient({ logger: adapterLogger, runtimeSettings, runtime: pi }),
+          omp: new OmpAgentClient({ logger: adapterLogger, runtimeSettings, runtime: omp }),
+        };
+        const agentClients = { [provider]: adapters[provider] };
+        return createTestPaseoDaemon({
+          paseoHomeRoot: root,
+          staticDir: root,
+          cleanup: false,
+          mcpEnabled: false,
+          resumeOnStartup: mode === "automatic",
+          resumePrompt: "/compact",
+          agentClients,
+          logger,
+        });
+      };
+      try {
+        await writeFile(
+          nativeHandle,
+          JSON.stringify({ type: "session", version: 3, id: "thread-1", cwd: root, timestamp }) +
+            "\n",
+        );
+        await seed.upsert(
+          parseStoredAgentRecord({
+            id: agentId,
+            provider,
+            cwd: root,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            lastStatus: "closed",
+            resumeOnStartup: true,
+            persistence: {
+              provider,
+              sessionId: "thread-1",
+              ...(provider === "codex" ? {} : { nativeHandle }),
+            },
+          }),
+        );
+        await seed.flush();
+        await writeFile(marker, JSON.stringify({ version: 2, agentIds: [agentId] }));
+        handle = await openDaemon();
+        await Promise.race([providerEntered.promise, failed.promise.then(throwRecoverySetupError)]);
+        await expect(handle.daemon.stop({ resumeAgents: true })).rejects.toThrow(
+          "startup recovery is still in progress",
+        );
+        await expect(access(marker)).resolves.toBeUndefined();
+        respond.resolve();
+        if (retryOnRestart) {
+          await expect.poll(() => recoveryError).toBeInstanceOf(Error);
+          await expect(access(marker)).resolves.toBeUndefined();
+        } else {
+          await expect.poll(() => fileExists(marker)).toBe(false);
+        }
+        expect(requests).toEqual(["/compact"]);
+        await handle.close();
+        retrying = true;
+        handle = await openDaemon();
+        if (retryOnRestart) {
+          await expect.poll(() => requests).toEqual(["/compact", "/compact"]);
+          await expect.poll(() => fileExists(marker)).toBe(false);
+        }
+        await expect
+          .poll(async () => (await handle!.daemon.agentStorage.get(agentId))?.resumeOnStartup)
+          .toBe(false);
+        await expect(handle.daemon.stop({ resumeAgents: true })).resolves.toBeUndefined();
+        expect(requests).toHaveLength(retryOnRestart ? 2 : 1);
+        for (const commandServer of codexServers.filter(hasCodexCompaction)) {
+          commandServer.assertNoErrors();
+        }
+      } finally {
+        respond.resolve();
+        await handle?.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test.each(["rejected", "late-start", "late-rejection"] as const)(
     "startup recovery confirms provider outcome %s before consuming its record",

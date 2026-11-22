@@ -14,6 +14,12 @@ export const JSONL_RPC_DEFAULT_TIMEOUT_MS = 30_000;
  */
 export const JSONL_RPC_NO_TIMEOUT = null;
 
+/** The transport did not call stdin.write for this request. */
+export class JsonlRpcRequestNotSentError extends Error {}
+
+/** The provider explicitly replied that this request failed. */
+export class JsonlRpcResponseError extends Error {}
+
 const STDERR_BUFFER_LIMIT = 8192;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 2_000;
 const FORCE_SHUTDOWN_TIMEOUT_MS = 1_000;
@@ -38,6 +44,7 @@ interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout | null;
+  writeStarted: boolean;
 }
 
 export interface JsonlRpcExit {
@@ -157,7 +164,9 @@ export class JsonlRpcProcess {
     if (this.disposed) {
       return {
         id: "",
-        promise: Promise.reject(new Error(`${this.diagnosticName} process is closed`)),
+        promise: Promise.reject(
+          new JsonlRpcRequestNotSentError(`${this.diagnosticName} process is closed`),
+        ),
       };
     }
     const id = `req_${this.nextRequestId}`;
@@ -176,8 +185,9 @@ export class JsonlRpcProcess {
           ),
         );
       });
-      this.pending.set(id, { resolve, reject, timer });
-      this.send({ ...command, id });
+      const pending = { resolve, reject, timer, writeStarted: false };
+      this.pending.set(id, pending);
+      this.write({ ...command, id }, pending);
     });
     return { id, promise };
   }
@@ -220,15 +230,23 @@ export class JsonlRpcProcess {
   }
 
   send(message: Record<string, unknown>): void {
+    this.write(message);
+  }
+
+  private write(message: Record<string, unknown>, pending?: PendingRequest): void {
     if (this.disposed) {
       return;
     }
-    if (this.child.stdin.destroyed || !this.child.stdin.writable) {
-      this.handleStdinError(new Error(`${this.diagnosticName} stdin is not writable`));
-      return;
-    }
     try {
-      this.child.stdin.write(`${JSON.stringify(message)}\n`);
+      const line = `${JSON.stringify(message)}\n`;
+      if (this.disposed) return;
+      if (this.child.stdin.destroyed || !this.child.stdin.writable) {
+        this.handleStdinError(new Error(`${this.diagnosticName} stdin is not writable`));
+        return;
+      }
+      // Once write is attempted, even a pipe error cannot prove this request was unsent.
+      if (pending) pending.writeStarted = true;
+      this.child.stdin.write(line);
     } catch (error) {
       this.handleStdinError(error);
     }
@@ -295,10 +313,10 @@ export class JsonlRpcProcess {
     }
     this.pending.delete(response.id);
     if (!response.success) {
+      const message =
+        response.error ?? `${this.diagnosticName} ${response.command ?? "request"} failed`;
       pending.reject(
-        new Error(
-          response.error ?? `${this.diagnosticName} ${response.command ?? "request"} failed`,
-        ),
+        response.success === false ? new JsonlRpcResponseError(message) : new Error(message),
       );
       return;
     }
@@ -323,7 +341,11 @@ export class JsonlRpcProcess {
       if (pending.timer) {
         clearTimeout(pending.timer);
       }
-      pending.reject(error);
+      pending.reject(
+        pending.writeStarted
+          ? error
+          : new JsonlRpcRequestNotSentError(error.message, { cause: error }),
+      );
     }
     this.pending.clear();
   }

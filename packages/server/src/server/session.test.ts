@@ -75,7 +75,7 @@ import type {
   AgentTimelineItem,
 } from "./agent/agent-sdk-types.js";
 import { parseAgentMessage } from "./agent/agent-messages/index.js";
-import { MessageReceipts } from "./message-receipts/index.js";
+import { MessageReceipts, type QueueHandoff } from "./message-receipts/index.js";
 import { REMOTE_HIERARCHY_DEPTH_LABEL } from "./agent/hierarchy-policy.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
@@ -1307,8 +1307,9 @@ test("agent message retries distinguish admission refusal from unconfirmed dispa
   const directory = mkdtempSync(join(tmpdir(), "paseo-session-message-receipts-"));
   const agentId = "11111111-1111-4111-8111-111111111111";
   const messages: SessionOutboundMessage[] = [];
-  const dispatch = vi.fn(async (request: { beforeProviderDispatch(): Promise<void> }) => {
-    await request.beforeProviderDispatch();
+  const dispatch = vi.fn(async (request: { handoff?: QueueHandoff }) => {
+    if (!request.handoff) throw new Error("Expected a message receipt at provider handoff");
+    await request.handoff.begin();
     return "steered" as const;
   });
   const delivery = createAgentMessageDelivery({
@@ -1369,7 +1370,8 @@ test("agent message retries distinguish admission refusal from unconfirmed dispa
     expect(dispatch).toHaveBeenCalledTimes(2);
 
     dispatch.mockImplementationOnce(async (request) => {
-      await request.beforeProviderDispatch();
+      if (!request.handoff) throw new Error("Expected a message receipt at provider handoff");
+      await request.handoff.begin();
       throw new AgentRunCancellationError(agentId, "replace");
     });
     const canceled = send("waited", true);

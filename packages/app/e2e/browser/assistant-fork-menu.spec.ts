@@ -31,6 +31,8 @@ import { getServerId } from "../support/helpers/server-id";
 import { seedSavedSettingsHosts } from "../support/helpers/settings";
 import {
   expectWorkspaceIsolationSelected,
+  openStartingRefPicker,
+  selectBranchInPicker,
   selectWorkspaceIsolation,
   submitNewWorkspaceEmpty,
 } from "../support/helpers/new-workspace";
@@ -149,10 +151,12 @@ test.describe("Timeline Fork", () => {
     const later = "emit 1 coalesced agent stream updates beyond the accepted fork turn.";
     const prompt = "Continue the accepted worktree Fork.";
     const filename = "accepted-fork-notes.txt";
+    const selectedBranch = "fork-retry-base";
     const creation = await holdInitialWorkspaceCreation(page);
     const { requests } = creation;
     const session = await seedForkWorkspace({
       repoPrefix: "assistant-fork-accepted-worktree-",
+      repo: { branches: [selectedBranch] },
       title: "Accepted worktree Fork",
       initialPrompt: earlier,
       model: "ten-second-stream",
@@ -168,6 +172,10 @@ test.describe("Timeline Fork", () => {
         .split("\n")
         .filter((line) => line.startsWith("worktree "));
     const originalWorktrees = listWorktrees();
+    const gitRev = (cwd: string, ref: string) =>
+      execFileSync("git", ["rev-parse", ref], { cwd, encoding: "utf8" }).trim();
+    const selectedCommit = gitRev(session.cwd, selectedBranch);
+    expect(selectedCommit).not.toBe(gitRev(session.cwd, "main"));
 
     await openAgentRoute(page, session);
     await awaitAssistantMessage(page);
@@ -179,6 +187,12 @@ test.describe("Timeline Fork", () => {
     expect((await session.client.waitForFinish(session.agentId, 45_000)).status).toBe("idle");
     await selectWorkspaceIsolation(page, "worktree");
     await expectWorkspaceIsolationSelected(page, "worktree");
+    const basePicker = page.getByTestId("new-workspace-ref-picker-trigger");
+    await expect(basePicker).toContainText("main");
+    await openStartingRefPicker(page);
+    await page.getByTestId("new-workspace-ref-picker-checkout").click();
+    await selectBranchInPicker(page, selectedBranch);
+    await expect(basePicker).toContainText(selectedBranch);
     await fillComposerDraft(page, prompt);
     await dropFileOnComposer(page, {
       name: filename,
@@ -197,7 +211,12 @@ test.describe("Timeline Fork", () => {
     });
     expect(requests[0]).toMatchObject({
       idempotencyKey: draftId,
-      source: { kind: "worktree", worktreeSlug: expect.any(String) },
+      source: {
+        kind: "worktree",
+        action: "checkout",
+        refName: selectedBranch,
+        worktreeSlug: expect.any(String),
+      },
       agent: {
         forkFrom: { sourceAgentId: session.agentId },
         initialPrompt: prompt,
@@ -211,6 +230,7 @@ test.describe("Timeline Fork", () => {
     await expectComposerDraft(page, prompt);
     await expect(attachment).toContainText(filename);
     await expectWorkspaceIsolationSelected(page, "worktree");
+    await expect(basePicker).toContainText(selectedBranch);
     const changedPrompt = "Continue the Fork using a changed prompt.";
     await fillComposerDraft(page, changedPrompt);
     await submit.click();
@@ -229,6 +249,28 @@ test.describe("Timeline Fork", () => {
     await expect(attachment).toContainText(filename);
 
     await fillComposerDraft(page, prompt);
+    await openStartingRefPicker(page);
+    await page.getByTestId("new-workspace-ref-picker-branch-off").click();
+    await selectBranchInPicker(page, selectedBranch);
+    await submit.click();
+    await expect.poll(() => requests.length).toBe(3);
+    expect(requests[2]).toMatchObject({
+      idempotencyKey: draftId,
+      source: {
+        kind: "worktree",
+        action: "branch-off",
+        refName: `refs/heads/${selectedBranch}`,
+        worktreeSlug:
+          requests[0]!.source.kind === "worktree" ? requests[0]!.source.worktreeSlug : undefined,
+      },
+      agent: { initialPrompt: prompt },
+    });
+    await expect(
+      page.getByText("workspace_request_key_conflict", { exact: true }).first(),
+    ).toBeVisible();
+    await expect(page).toHaveURL(draftUrl);
+    await expect(attachment).toContainText(filename);
+
     const retryPage = await page.context().newPage();
     // A manually opened page does not get the page fixture's main daemon guard.
     await retryPage.route(/:6767\b/, (route) => route.abort());
@@ -239,7 +281,22 @@ test.describe("Timeline Fork", () => {
     await expectComposerDraft(retryPage, prompt);
     await expect(retryPage.getByTestId("composer-file-attachment-pill")).toContainText(filename);
     await expectWorkspaceIsolationSelected(retryPage, "worktree");
+    await expect(retryPage.getByTestId("new-workspace-ref-picker-trigger")).toContainText(
+      selectedBranch,
+    );
+    // Retry after the original request has finished checking out the selected branch.
+    const fetchWorkspaceEntries = async () => (await session.client.fetchWorkspaces()).entries;
+    await expect
+      .poll(fetchWorkspaceEntries)
+      .toContainEqual(expect.objectContaining({ id: receipt.workspaceId }));
     await expect(retryPage.getByTestId("compact-shell")).toBeVisible();
+    await openStartingRefPicker(retryPage);
+    const occupiedBranch = retryPage.getByTestId(
+      `new-workspace-ref-picker-branch-${selectedBranch}`,
+    );
+    await expect(occupiedBranch.getByText("In a worktree", { exact: true })).toBeVisible();
+    await retryPage.keyboard.press("Escape");
+    await expect(occupiedBranch).toBeHidden();
     await retryPage.getByTestId("workspace-create-submit").click();
 
     await expect.poll(() => retryRequests.length).toBe(1);
@@ -267,6 +324,7 @@ test.describe("Timeline Fork", () => {
       (w) => !knownWorkspaces.has(w.id),
     );
     expect(created).toMatchObject([{ id: receipt.workspaceId, workspaceKind: "worktree" }]);
+    expect(gitRev(created[0]!.workspaceDirectory, "HEAD")).toBe(selectedCommit);
     expect(listWorktrees().filter((entry) => !originalWorktrees.includes(entry))).toEqual([
       `worktree ${created[0]!.workspaceDirectory}`,
     ]);
@@ -538,6 +596,10 @@ test.describe("Assistant fork menu with a legacy host", () => {
 
     await page.reload();
     await expectChatHistoryAttachment(page);
+    // The retained attachment can render before the host's model list has loaded.
+    await expect(
+      page.getByRole("button", { name: "Select model (Ten second stream)" }),
+    ).toBeVisible();
     await submitNewWorkspaceEmpty(page);
 
     const userMessage = page.getByTestId("user-message").filter({ hasText: "Chat history" }).last();
