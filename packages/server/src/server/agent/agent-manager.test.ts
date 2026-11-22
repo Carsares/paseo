@@ -13822,6 +13822,55 @@ test("tryRunOutOfBand gives providers the command another agent sent, not its en
   }
 });
 
+test("automatic out-of-band recovery waits for the provider handoff", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-recovery-handoff-"));
+  const order: string[] = [];
+
+  class RecoveryCommandSession extends TestAgentSession {
+    override tryHandleOutOfBand(prompt: AgentPromptInput) {
+      if (prompt !== "/recovery") return null;
+      return {
+        run: async ({
+          beforeProviderDispatch,
+          onProviderOutcome,
+        }: {
+          beforeProviderDispatch?: () => Promise<void>;
+          onProviderOutcome?: () => void;
+        }) => {
+          order.push("run");
+          await beforeProviderDispatch?.();
+          order.push("provider-request");
+          onProviderOutcome?.();
+        },
+      };
+    }
+  }
+  class RecoveryCommandClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      return new RecoveryCommandSession(config);
+    }
+  }
+
+  const manager = new AgentManager({ clients: { codex: new RecoveryCommandClient() }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    await manager.tryRunOutOfBand(
+      agent.id,
+      "/recovery",
+      { recoveryIntent: "automatic" },
+      () => order.push("accepted"),
+      () => {},
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(order).toEqual(["run", "accepted", "provider-request"]);
+  } finally {
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("replaceAgentRun succeeds when foreground turn terminal event is never delivered", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-stale-fg-"));
   const storagePath = join(workdir, "agents");

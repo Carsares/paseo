@@ -1113,6 +1113,7 @@ export async function createPaseoDaemon(
           // A user can start work while automatic recovery is opening the session.
           idleOnly: canDispatch !== undefined,
           assertDispatchAllowed,
+          runOptions: { recoveryIntent: "automatic" },
         });
         if (result.disposition !== "turn_started") return;
         try {
@@ -1130,6 +1131,9 @@ export async function createPaseoDaemon(
     },
     report: (agentId, err) => logger.error({ agentId, err }, "Agent restart recovery failed"),
   });
+  agentManager.setAgentRunAcceptedCallback((agentId) =>
+    restartRecovery.consumeAutomaticRecovery(agentId),
+  );
   await restartRecovery.prepareStartup();
   daemonConfigStore.setRestartRecoveryCleanup(restartRecovery.cancelAutomaticRecovery);
   const lifecyclePreparation = createLifecyclePreparation({

@@ -21,6 +21,8 @@ the prompt with `agents.resumePrompt` or the same settings page.
 Disabling recovery withdraws pending automatic prompts, even while the provider opens the
 session. Enabling it later does not revive those prompts. Turns already handed to the provider
 and explicit one-time recovery continue independently.
+An accepted human turn supersedes older automatic recovery for that agent. Queueing a
+background command leaves the recovery intent in place.
 
 Only agents recorded as running qualify. Idle and initializing agents stay inactive. Archived
 agents or workspaces, private helpers and Hub-owned executions retain their own lifecycle.
@@ -187,9 +189,10 @@ notification. Clean shutdown can also flush an already queued callback while ret
 so that callback can repeat after restart. This is an at-least-once wakeup, without turn attribution or exactly-once delivery.
 
 `report_to_parent` durably records a `completed` or `blocked` report before returning its queued
-receipt. The recipient rechecks the current parent relationship before dispatch and skips archived
-parents. A stable report ID lets the recipient acknowledge a repeated report without re-running
-a message already confirmed by the provider.
+receipt. The recipient rechecks the current parent relationship and archive state at provider
+handoff. A stable report ID lets the recipient acknowledge a repeated report without re-running
+a message already confirmed by the provider. A confirmed refusal to start leaves the report
+eligible for retry. An unknown provider outcome keeps the receipt pending.
 
 Permission requests are notification checkpoints, not the end of that subscription. The caller is notified again after a permission response when the child finishes, errors, or requests another permission.
 The permission notification includes the normalized request plus the child and request IDs, so the caller can inspect it and respond without fetching agent status.

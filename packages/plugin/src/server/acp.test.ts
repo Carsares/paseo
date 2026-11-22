@@ -2154,6 +2154,29 @@ function timelineProjection(events: ProviderEvent[]): Array<Record<string, strin
 }
 
 describe("ACP session history replay", () => {
+  it("keeps the default provider's replay message identities", async () => {
+    const { connection, events } = await openReplaySession(
+      [userChunk("Question"), textChunk("Answer"), userChunk("Next", "native-user")],
+      "replay",
+    );
+    try {
+      expect(
+        events.flatMap((event) => (event.type === "timeline.item" ? [event.item] : [])),
+      ).toEqual([
+        { type: "user_message", id: "user_message_chunk:1", text: "Question" },
+        { type: "assistant_message", id: "agent_message_chunk:2", text: "Answer" },
+        {
+          type: "user_message",
+          id: '["user_message_chunk","native-user"]',
+          messageId: "native-user",
+          text: "Next",
+        },
+      ]);
+    } finally {
+      await connection.close();
+    }
+  });
+
   it("restores the timeline replayed before session/load resolves", async () => {
     const { connection, events } = await openReplaySession(
       [

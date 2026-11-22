@@ -3,10 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { UUID } from "builder-util-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDesktopSettingsStore } from "../settings/desktop-settings.js";
+import { createDesktopSettingsCommandHandlers } from "../settings/desktop-settings-commands.js";
 
 const {
   autoUpdaterMock,
   settingsMock,
+  realSettings,
   releaseInstallLock,
   appEvents,
   nativeUpdateEvents,
@@ -23,6 +26,7 @@ const {
     }),
     updateEvents: updaterEmitter,
     settingsMock: { officialUpdatesEnabled: true },
+    realSettings: { store: null as ReturnType<typeof createDesktopSettingsStore> | null },
     releaseInstallLock: vi.fn(),
     autoUpdaterMock: {
       autoDownload: true,
@@ -46,11 +50,12 @@ const {
 });
 
 vi.mock("../settings/desktop-settings-electron.js", () => ({
-  getDesktopSettingsStore: () => ({
-    get: async () => settingsMock,
-    beginOfficialUpdateInstall: async () =>
-      settingsMock.officialUpdatesEnabled ? releaseInstallLock : null,
-  }),
+  getDesktopSettingsStore: () =>
+    realSettings.store ?? {
+      get: async () => settingsMock,
+      beginOfficialUpdateInstall: async () =>
+        settingsMock.officialUpdatesEnabled ? releaseInstallLock : null,
+    },
 }));
 
 vi.mock("electron", () => ({
@@ -66,6 +71,8 @@ vi.mock("electron", () => ({
 vi.mock("electron-updater", () => ({
   autoUpdater: autoUpdaterMock,
 }));
+
+vi.mock("electron-log/main", () => ({ default: { info: vi.fn() } }));
 
 import {
   bucketFromStagingUserId,
@@ -231,6 +238,7 @@ describe("manual installer handoff", () => {
     autoUpdaterMock.quitAndInstall.mockReset();
     autoUpdaterMock.downloadUpdate.mockReset();
     nativeUpdateEvents.checkForUpdates.mockReset();
+    nativeUpdateEvents.removeAllListeners();
   });
 
   it("waits for Electron to accept the installer and restores the daemon after an async error", async () => {
@@ -617,6 +625,96 @@ describe("manual installer handoff", () => {
     expect(autoUpdaterMock.quitAndInstall).not.toHaveBeenCalled();
   });
 
+  it.each(["error", "update-not-available", "update-downloaded"] as const)(
+    "blocks disabling official updates until macOS preparation finishes with %s, even after timing out",
+    async (terminalEvent) => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+      const userDataPath = await mkdtemp(path.join(os.tmpdir(), "paseo-native-update-settings-"));
+      try {
+        const store = createDesktopSettingsStore({ userDataPath });
+        realSettings.store = store;
+        await store.patch({ officialUpdatesEnabled: true });
+        const onSettingsChanged = vi.fn();
+        const settings = createDesktopSettingsCommandHandlers({
+          settingsStore: store,
+          onSettingsChanged,
+        });
+        const disableUpdates = () =>
+          settings.patch_desktop_settings({ officialUpdatesEnabled: false });
+        const persistedSettings = async () =>
+          JSON.parse(await readFile(path.join(userDataPath, "desktop-settings.json"), "utf8"));
+
+        const info = { version: "1.2.15" };
+        const input = { currentVersion: "1.2.3", releaseChannel: "stable" } as const;
+        autoUpdaterMock.checkForUpdates.mockResolvedValue({
+          isUpdateAvailable: true,
+          updateInfo: info,
+        });
+        autoUpdaterMock.downloadUpdate.mockImplementation(async () => {
+          autoUpdaterMock.handlers.get("update-downloaded")?.(info);
+        });
+        const beforeHandoff = Promise.withResolvers<void>();
+        const validate = vi.fn(() => beforeHandoff.promise);
+        const restore = vi.fn(async () => {});
+        const preserveForNextLaunch = vi.fn(async () => {});
+        const approvedVersion = vi.fn(async () => ({
+          beforeHandoff: validate,
+          restore,
+          preserveForNextLaunch,
+        }));
+        const installing = updater.downloadAndInstallUpdate(input, approvedVersion);
+        await vi.waitFor(() => expect(validate).toHaveBeenCalledOnce());
+        expect(nativeUpdateEvents.checkForUpdates).not.toHaveBeenCalled();
+        await expect(disableUpdates()).resolves.toMatchObject({ officialUpdatesEnabled: false });
+        expect((await persistedSettings()).settings.officialUpdatesEnabled).toBe(false);
+        await store.patch({ officialUpdatesEnabled: true });
+        onSettingsChanged.mockClear();
+        beforeHandoff.resolve();
+        await vi.waitFor(() => expect(nativeUpdateEvents.checkForUpdates).toHaveBeenCalledOnce());
+        expect(approvedVersion).toHaveBeenCalledExactlyOnceWith({ version: "1.2.15" });
+        await expect(disableUpdates()).rejects.toThrow(/being prepared/);
+
+        await vi.advanceTimersByTimeAsync(30_000);
+        await expect(installing).resolves.toMatchObject({
+          installed: false,
+          version: "1.2.3",
+          message: expect.stringContaining("macOS may install the update on exit"),
+        });
+        expect(preserveForNextLaunch).toHaveBeenCalledOnce();
+        expect(restore).not.toHaveBeenCalled();
+        await expect(disableUpdates()).rejects.toThrow(/being prepared/);
+        expect((await persistedSettings()).settings.officialUpdatesEnabled).toBe(true);
+        expect(onSettingsChanged).not.toHaveBeenCalled();
+
+        await expect(
+          updater.downloadAndInstallUpdate(input, approvedVersion),
+        ).resolves.toMatchObject({
+          installed: false,
+          message: expect.stringContaining("Restart Paseo"),
+        });
+        expect(approvedVersion).toHaveBeenCalledOnce();
+        if (terminalEvent === "update-downloaded") {
+          emitMacUpdateDownloaded();
+        } else if (terminalEvent === "error") {
+          nativeUpdateEvents.emit("error", new Error("Squirrel failed to stage the update"));
+        } else {
+          nativeUpdateEvents.emit("update-not-available");
+        }
+        await expect(disableUpdates()).resolves.toMatchObject({ officialUpdatesEnabled: false });
+        expect((await persistedSettings()).settings.officialUpdatesEnabled).toBe(false);
+        expect(onSettingsChanged).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({ officialUpdatesEnabled: false }),
+        );
+        expect(autoUpdaterMock.quitAndInstall).not.toHaveBeenCalled();
+        expect(nativeUpdateEvents.checkForUpdates).toHaveBeenCalledOnce();
+      } finally {
+        realSettings.store = null;
+        await rm(userDataPath, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("bounds macOS preparation, preserves recovery for next launch and ignores late native events", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
@@ -661,11 +759,11 @@ describe("manual installer handoff", () => {
     expect(exit).toHaveBeenCalledExactlyOnceWith(0);
     expect(restore).not.toHaveBeenCalled();
     expect(preserveForNextLaunch).toHaveBeenCalledOnce();
-    expect(releaseInstallLock).toHaveBeenCalledOnce();
+    emitMacUpdateDownloaded();
+    await vi.waitFor(() => expect(releaseInstallLock).toHaveBeenCalledOnce());
     expect(nativeUpdateEvents.listenerCount("update-downloaded")).toBe(0);
     expect(nativeUpdateEvents.listenerCount("update-not-available")).toBe(0);
     expect(nativeUpdateEvents.listenerCount("error")).toBe(0);
-    emitMacUpdateDownloaded();
     expect(stopDaemon).not.toHaveBeenCalled();
     expect(autoUpdaterMock.quitAndInstall).not.toHaveBeenCalled();
   });

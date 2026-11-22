@@ -863,6 +863,7 @@ export class VoiceAssistantWebSocketServer {
               if (batch.sessionMode)
                 await agentManager.setAgentMode(batch.recipientId, batch.sessionMode);
             }
+            // Run queue preparation before reserving a turn so it can be deferred at shutdown.
             await batch.beforeProviderDispatch();
             await batch.validateDispatch?.();
             prepared = true;
@@ -3073,7 +3074,7 @@ export class VoiceAssistantWebSocketServer {
         sourceAgentServerId: record.serverId,
         activeTurnBehavior: "steer",
       },
-      send: async (beforeProviderDispatch) => {
+      send: async (beforeProviderDispatch, declined) => {
         await validateDispatch?.();
         const receipt = this.agentMessages.enqueue({
           recipientId: record.callerAgentId,
@@ -3097,17 +3098,15 @@ export class VoiceAssistantWebSocketServer {
           validateDispatch,
           activeTurnBehavior: "steer",
           unarchive: false,
-          beforeProviderDispatch: async () => {
-            await beforeProviderDispatch();
-            await options.confirmBeforeDispatch?.();
+          handoff: {
+            begin: async () => {
+              await beforeProviderDispatch();
+              await options.confirmBeforeDispatch?.();
+            },
+            declined,
           },
         });
-        try {
-          await receipt.dispatched;
-        } catch (error) {
-          await validateDispatch?.();
-          throw error;
-        }
+        await receipt.dispatched;
       },
     });
   }

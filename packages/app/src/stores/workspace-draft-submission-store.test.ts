@@ -115,6 +115,37 @@ test("a new process restores a fork's host and boundary without replaying pendin
   });
   expect(reader.getState().pendingByDraftId).toEqual({});
 
+  await expect(
+    reader.getState().reserveForkWorktreeSlug({
+      draftId: fork.draftId,
+      serverId: "host-2",
+      worktreeSlug: "wrong-host",
+    }),
+  ).rejects.toThrow("The Fork draft is not available on this host.");
+  const setup = reader.getState().setupByDraftId[fork.draftId];
+  await expect(
+    reader.getState().reserveForkWorktreeSlug({
+      draftId: fork.draftId,
+      serverId: fork.sourceServerId,
+      worktreeSlug: "first-worktree",
+    }),
+  ).resolves.toBe("first-worktree");
+  expect(reader.getState().setupByDraftId[fork.draftId]).toBe(setup);
+
+  const reloaded = createWorkspaceDraftSubmissionStore(storage);
+  await reloaded.getState().hydrateDraftSetup(fork.draftId);
+  expect(reloaded.getState().draftSetupStatusById[fork.draftId]).toEqual({
+    sourceServerId: "host-1",
+    worktreeSlug: "first-worktree",
+  });
+  await expect(
+    reloaded.getState().reserveForkWorktreeSlug({
+      draftId: fork.draftId,
+      serverId: fork.sourceServerId,
+      worktreeSlug: "newly-generated-after-reload",
+    }),
+  ).resolves.toBe("first-worktree");
+
   // A destination workspace can finish in another process without loading /new.
   const destination = createWorkspaceDraftSubmissionStore(storage);
   await destination.getState().clearDraftSetup({ draftId: fork.draftId });

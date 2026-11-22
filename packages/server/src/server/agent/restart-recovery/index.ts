@@ -205,6 +205,16 @@ export function createRestartRecovery(deps: Dependencies) {
         automatic.agentIds.clear();
       });
     },
+    consumeAutomaticRecovery(agentId: string) {
+      const intent = resuming.get(agentId);
+      if (intent?.forced || oneShot.agentIds.has(agentId)) return;
+      if (intent) intent.canceled = true;
+      return serializeRecoveryWrites(async () => {
+        if (!intent && !automatic.agentIds.has(agentId)) return;
+        await consumeMarkerAgent(automatic, agentId);
+        await deps.storage.clearAgentRecovery(agentId);
+      });
+    },
     captureRunningAgents(options?: {
       force?: boolean;
       listRunningAgents?: () => readonly RecoveryCandidate[];

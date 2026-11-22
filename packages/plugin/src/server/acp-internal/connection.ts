@@ -1,4 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import { spawnProcess, terminateProcess } from "../process.js";
 import { Readable, Writable } from "node:stream";
 import {
@@ -442,6 +443,7 @@ class AcpRuntime {
    * Once ready, suppress late replay rows until the first prompt.
    */
   private replayWindow: "replay" | "skip" | null = null;
+  private replayMessageScope: string | undefined;
   private sawLoadTimeline = false;
   private lastLoadUpdateAt = 0;
   private closing = false;
@@ -606,6 +608,14 @@ class AcpRuntime {
       // so the native id must be registered first for them to pass the session filter.
       this.nativeSessionId = nativeSessionId;
       this.replayWindow = input.history === "replay" ? "replay" : "skip";
+      if (
+        this.replayWindow === "replay" &&
+        this.options.options.acpOptions?.scopeAnonymousReplayMessageIds
+      ) {
+        this.replayMessageScope = createHash("sha256")
+          .update(JSON.stringify([this.options.options.id, nativeSessionId]))
+          .digest("base64url");
+      }
       response = await this.call(
         this.connection.loadSession({
           sessionId: nativeSessionId,
@@ -1348,7 +1358,7 @@ class AcpRuntime {
           id,
           text,
           ...(update.sessionUpdate === "agent_message_chunk"
-            ? { messageId: update.messageId ?? undefined }
+            ? { messageId: this.timelineMessageId(id, update.messageId) }
             : {}),
         },
       });
@@ -1373,6 +1383,7 @@ class AcpRuntime {
     this.fallbackChunkIds.delete("agent_thought_chunk");
     if (update.content.type !== "text") return;
     const id = this.resolveChunkId("user_message_chunk", update.messageId);
+    const messageId = this.timelineMessageId(id, update.messageId);
     const text = `${this.messages.get(id) ?? ""}${update.content.text}`;
     this.messages.set(id, text);
     this.emit({
@@ -1382,9 +1393,19 @@ class AcpRuntime {
         type: "user_message",
         id,
         text,
-        ...(update.messageId ? { messageId: update.messageId } : {}),
+        ...(messageId ? { messageId } : {}),
       },
     });
+  }
+
+  private timelineMessageId(id: string, nativeId: string | null | undefined): string | undefined {
+    if (nativeId) return nativeId;
+    // Only a full replay has a conversation-relative chunk sequence. A live
+    // connection can start partway through the conversation with a fresh counter.
+    if (this.replayWindow === "replay" && this.replayMessageScope) {
+      return `acp:history:${this.replayMessageScope}:${id}`;
+    }
+    return nativeId ?? undefined;
   }
 
   private resolveChunkId(

@@ -134,7 +134,7 @@ export async function startAgentRun(
     {
       agentId,
       provider: snapshot?.provider,
-      providerSessionId: snapshot?.persistence?.sessionId ?? undefined,
+      providerSessionId: snapshot?.persistence?.sessionId,
       turnId: snapshot?.activeForegroundTurnId ?? undefined,
       promptType: typeof prompt === "string" ? "string" : "structured",
       hasRunOptions: Boolean(options?.runOptions),
@@ -158,7 +158,12 @@ export async function startAgentRun(
     options?.onDispatch?.("out_of_band");
     return { disposition: "out_of_band" };
   }
-  const promptStart = new ForegroundPromptStart(agentId, options?.admit, options?.beforeHandoff);
+  const promptStart = new ForegroundPromptStart(
+    agentId,
+    options?.admit,
+    options?.beforeHandoff,
+    options?.onSteerDeclined,
+  );
   try {
     try {
       await agentManager.reloadStalePluginSession(agentId);
@@ -412,14 +417,18 @@ function preparePromptHandoff({
 }: Pick<SendPromptToAgentParams, "handoff" | "validateDispatch" | "assertDispatchAllowed">):
   | (() => Promise<void>)
   | undefined {
-  if (!handoff && !assertDispatchAllowed) return undefined;
+  if (!handoff && !validateDispatch && !assertDispatchAllowed) return undefined;
   return async () => {
-    if (handoff) {
-      await validateDispatch?.();
-      await handoff.begin();
-      await validateDispatch?.();
-    }
+    await validateDispatch?.();
     assertDispatchAllowed?.();
+    try {
+      await handoff?.begin();
+      await validateDispatch?.();
+      assertDispatchAllowed?.();
+    } catch (error) {
+      await handoff?.declined();
+      throw error;
+    }
   };
 }
 
@@ -480,7 +489,6 @@ export async function sendPreparedPromptToAgent(
           await params.validateDispatch?.();
           if (!params.canSteerDuringDrain?.()) return false;
           if (params.admit?.() === false) throw new Error("Queued agent message was withdrawn");
-          await beforeHandoff?.();
           return true;
         }
       : undefined,

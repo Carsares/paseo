@@ -41,6 +41,7 @@ import type { TerminalManager } from "../../terminal/terminal-manager.js";
 
 import {
   AgentTurnStartCanceledError,
+  AgentTurnStartRejectedError,
   getAgentStreamEventTurnId,
   type AgentCapabilityFlags,
   type AgentClient,
@@ -113,7 +114,11 @@ import {
   type PendingForegroundRun,
 } from "./agent-run-state.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
-import { parseAgentMessage, projectAgentMessages } from "./agent-messages/index.js";
+import {
+  parseAgentMessage,
+  parseAgentMessages,
+  projectAgentMessages,
+} from "./agent-messages/index.js";
 import {
   extractSubmittedPromptForkContext,
   stripContextHandoffEnvelope,
@@ -428,6 +433,7 @@ export type AgentAttentionCallback = (params: {
 }) => void;
 
 export type AgentArchivedCallback = (agentId: string) => Promise<void> | void;
+export type AgentRunAcceptedCallback = (agentId: string) => Promise<void> | void;
 
 export interface ProviderAvailability {
   provider: AgentProvider;
@@ -546,6 +552,7 @@ export interface AgentManagerOptions {
   registry?: AgentStorage;
   onAgentAttention?: AgentAttentionCallback;
   onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
+  onAgentRunAccepted?: AgentRunAcceptedCallback;
   timelineStore?: InMemoryAgentTimelineStore;
   durableTimelineStore?: AgentTimelineStore;
   terminalManager?: TerminalManager | null;
@@ -1215,6 +1222,7 @@ export class AgentManager {
   private appendSystemPrompt: string;
   private onAgentAttention?: AgentAttentionCallback;
   private onAgentArchived?: AgentArchivedCallback;
+  private onAgentRunAccepted?: AgentRunAcceptedCallback;
   private onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   private logger: Logger;
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
@@ -1232,6 +1240,7 @@ export class AgentManager {
     this.timelinePrefixes = this.registry?.timelinePrefixes ?? new TimelinePrefixStore();
     this.durableTimelineStore = options.durableTimelineStore;
     this.onAgentAttention = options.onAgentAttention;
+    this.onAgentRunAccepted = options.onAgentRunAccepted;
     this.onWorkspaceStateMayHaveChanged = options.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options.mcpBaseUrl ?? null;
     this.mcpAuthToken = options.mcpAuthToken ?? null;
@@ -1313,6 +1322,10 @@ export class AgentManager {
 
   setAgentArchivedCallback(callback: AgentArchivedCallback): void {
     this.onAgentArchived = callback;
+  }
+
+  setAgentRunAcceptedCallback(callback: AgentRunAcceptedCallback): void {
+    this.onAgentRunAccepted = callback;
   }
 
   setMcpBaseUrl(url: string | null): void {
@@ -5256,8 +5269,11 @@ export class AgentManager {
     if (!handler) {
       return false;
     }
-    const accepted = onAccepted?.();
-    if (accepted) await accepted;
+    const requiresProviderHandoff = assertDispatchAllowed !== undefined;
+    if (!requiresProviderHandoff) {
+      const acceptedCallback = onAccepted?.();
+      if (acceptedCallback) await acceptedCallback;
+    }
     this.assertAcceptingAgentRuns();
     this.touchUpdatedAt(agent);
     if (options?.clientMessageId) {
@@ -5291,12 +5307,27 @@ export class AgentManager {
           markCommandStarted = resolveStarted;
         })
       : undefined;
+    let providerHandoffAccepted = false;
+    const beforeProviderDispatch = requiresProviderHandoff
+      ? async () => {
+          assertDispatchAllowed?.();
+          const accepted = onAccepted?.();
+          if (accepted) await accepted;
+          assertDispatchAllowed?.();
+        }
+      : undefined;
+    const onProviderOutcome = requiresProviderHandoff
+      ? () => {
+          providerHandoffAccepted = true;
+          markCommandStarted?.();
+        }
+      : undefined;
     const command = this.runForegroundMutation(agentId, async () => {
       assertDispatchAllowed?.();
-      markCommandStarted?.();
       try {
-        await handler.run({ emit: dispatch });
+        await handler.run({ emit: dispatch, beforeProviderDispatch, onProviderOutcome });
       } catch (error) {
+        if (requiresProviderHandoff && !providerHandoffAccepted) throw error;
         const text = error instanceof Error ? error.message : "Out-of-band command failed";
         dispatch({
           type: "timeline",
@@ -5304,9 +5335,28 @@ export class AgentManager {
           item: { type: "assistant_message", text: `[Error] ${text}` },
         });
       }
+      if (requiresProviderHandoff && !providerHandoffAccepted) {
+        throw new Error("Out-of-band command did not reach the provider");
+      }
     });
     if (commandStarted) await Promise.race([commandStarted, command]);
     return true;
+  }
+
+  private notifyAgentRunAccepted(
+    agentId: string,
+    options: AgentRunOptions | undefined,
+    prompt: AgentPromptInput,
+  ): Promise<void> | undefined {
+    if (
+      options?.recoveryIntent === "automatic" ||
+      !this.onAgentRunAccepted ||
+      parseAgentMessages(submittedPromptText(prompt))?.some((message) => message.source)
+    )
+      return undefined;
+    return Promise.resolve(this.onAgentRunAccepted(agentId)).catch((error) => {
+      this.logger.warn({ err: error, agentId }, "Failed to consume automatic recovery intent");
+    });
   }
 
   async appendTimelineItem(
@@ -5471,16 +5521,33 @@ export class AgentManager {
     providerPrompt: AgentPromptInput,
   ) {
     const { agent, agentId, pendingRun, options, promptStart } = params;
-    const start = () => {
+    const validate = () => {
       this.assertPendingTurnStart(agentId, pendingRun);
-      return agent.session.startTurn(providerPrompt, options);
     };
+    validate();
+    const start = (runOptions = options) => agent.session.startTurn(providerPrompt, runOptions);
     if (!promptStart?.beforeHandoff) return start();
-    this.assertPendingTurnStart(agentId, pendingRun);
     this.assertAcceptingAgentRuns();
-    return promptStart.beforeHandoff().then(() => {
+    const validateHandoff = () => {
       this.assertAcceptingAgentRuns();
-      return start();
+      validate();
+    };
+    return (
+      agent.session.capabilities.defersPromptHandoff
+        ? start({
+            ...options,
+            beforeProviderDispatch: () => promptStart.handoff(async () => {}, validateHandoff),
+          })
+        : promptStart.handoff(start, validateHandoff)
+    ).catch(async (error) => {
+      if (
+        isStaleProviderSessionError(error) ||
+        error instanceof AgentTurnStartCanceledError ||
+        error instanceof AgentTurnStartRejectedError
+      ) {
+        await promptStart.onHandoffDeclined?.();
+      }
+      throw error;
     });
   }
 
@@ -5744,11 +5811,13 @@ export class AgentManager {
         return;
       }
 
+      const turnStartedAt = new Date();
+      this.runs.settleForegroundStart(pendingRun, { status: "started", turnId });
+      const accepted = this.notifyAgentRunAccepted(agentId, options, prompt);
+
       if (isReplacement) {
         agent.pendingReplacement = false;
       }
-      const turnStartedAt = new Date();
-      this.runs.settleForegroundStart(pendingRun, { status: "started", turnId });
       agent.activeForegroundTurnId = turnId;
       this.openActiveTurn(agent, turnId, turnStartedAt);
       agent.attention = { requiresAttention: false };
@@ -5805,6 +5874,7 @@ export class AgentManager {
       this.runs.addWaiter(agent, turnStream.waiter);
 
       try {
+        if (accepted) await accepted;
         const acceptedTurnStartedEvent: AgentStreamEvent = {
           type: "turn_started",
           provider: agent.provider,
@@ -5928,6 +5998,8 @@ export class AgentManager {
           expectedTurnId,
           admission.providerMessageId,
         );
+        const accepted = this.notifyAgentRunAccepted(agentId, options, prompt);
+        if (accepted) await accepted;
       }
       return admission;
     });
@@ -5965,14 +6037,36 @@ export class AgentManager {
           async () => {
             if (admitSteer) {
               if (!(await admitSteer())) return { status: "unavailable" };
-            } else if (promptStart?.beforeHandoff) {
-              await promptStart.beforeHandoff();
             }
-            this.assertAcceptingAgentRuns();
-            const admission = await agent.session.steerActiveTurn!(prompt, {
-              ...options,
-              expectedTurnId,
-            });
+            const assertSteerAllowed = () => {
+              this.assertAcceptingAgentRuns();
+              this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
+            };
+            const steer = (beforeProviderDispatch?: () => Promise<void>) =>
+              agent.session.steerActiveTurn!(prompt, {
+                ...options,
+                expectedTurnId,
+                beforeProviderDispatch,
+              });
+            let admission: SteerResult;
+            try {
+              if (promptStart?.beforeHandoff) {
+                admission = agent.session.capabilities.defersPromptHandoff
+                  ? await steer(() => promptStart.handoff(async () => {}, assertSteerAllowed))
+                  : await promptStart.handoff(steer, assertSteerAllowed);
+              } else {
+                assertSteerAllowed();
+                admission = await steer();
+              }
+            } catch (error) {
+              if (
+                isStaleProviderSessionError(error) ||
+                error instanceof AgentTurnStartCanceledError
+              ) {
+                await onSteerDeclined?.();
+              }
+              throw error;
+            }
             if (admission.status === "unavailable") await onSteerDeclined?.();
             if (admission.status === "accepted") {
               await this.recordAcceptedSteer(
@@ -5982,6 +6076,8 @@ export class AgentManager {
                 expectedTurnId,
                 admission.providerMessageId,
               );
+              const accepted = this.notifyAgentRunAccepted(agentId, options, prompt);
+              if (accepted) await accepted;
             }
             return admission;
           },

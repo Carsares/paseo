@@ -35,6 +35,7 @@ export interface PendingWorkspaceDraftSetup {
 const StoredForkDraftSchema = z.object({
   sourceServerId: z.string().min(1),
   sourceDirectory: z.string().nullable(),
+  worktreeSlug: z.string().min(1).optional(),
   setup: z.object({
     provider: z.string().min(1),
     cwd: z.string().min(1),
@@ -46,7 +47,10 @@ const StoredForkDraftSchema = z.object({
   }),
 });
 
-type DraftSetupStatus = "loading" | "unavailable" | { sourceServerId: string | null };
+type DraftSetupStatus =
+  | "loading"
+  | "unavailable"
+  | { sourceServerId: string | null; worktreeSlug?: string };
 
 interface WorkspaceDraftSubmissionState {
   pendingByDraftId: Record<string, PendingWorkspaceDraftSubmission>;
@@ -64,6 +68,11 @@ interface WorkspaceDraftSubmissionState {
       sourceServerId: string;
     },
   ) => Promise<void>;
+  reserveForkWorktreeSlug: (input: {
+    draftId: string;
+    serverId: string;
+    worktreeSlug: string;
+  }) => Promise<string>;
   hydrateDraftSetup: (draftId: string) => Promise<void>;
   clearDraftSetup: (input: { draftId: string }) => Promise<void>;
   consumePending: (input: {
@@ -140,6 +149,37 @@ export function createWorkspaceDraftSubmissionStore(
         };
       });
     },
+    reserveForkWorktreeSlug: async ({ draftId, serverId, worktreeSlug }) => {
+      const id = normalizeDraftId(draftId);
+      const status = get().draftSetupStatusById[id];
+      if (typeof status !== "object" || status.sourceServerId !== serverId) {
+        throw new Error("The Fork draft is not available on this host.");
+      }
+      if (status.worktreeSlug) return status.worktreeSlug;
+      // Read the saved source here so this reservation doesn't replace the setup used
+      // to track ownership of the composer's draft and attachments.
+      const raw = await storage.getItem(forkDraftStorageKey(id));
+      const stored = StoredForkDraftSchema.parse(raw === null ? null : JSON.parse(raw));
+      if (stored.sourceServerId !== serverId || get().draftSetupStatusById[id] !== status) {
+        throw new Error("The Fork draft changed before the worktree was created.");
+      }
+      const slug = stored.worktreeSlug ?? worktreeSlug;
+      await storage.setItem(
+        forkDraftStorageKey(id),
+        JSON.stringify({ ...stored, worktreeSlug: slug }),
+      );
+      set((state) =>
+        state.draftSetupStatusById[id] === status
+          ? {
+              draftSetupStatusById: {
+                ...state.draftSetupStatusById,
+                [id]: { ...status, worktreeSlug: slug },
+              },
+            }
+          : state,
+      );
+      return slug;
+    },
     hydrateDraftSetup: async (draftId) => {
       const id = normalizeDraftId(draftId);
       if (!id || Object.hasOwn(get().draftSetupStatusById, id)) return;
@@ -155,7 +195,10 @@ export function createWorkspaceDraftSubmissionStore(
           status = { sourceServerId: null };
         } else {
           const stored = StoredForkDraftSchema.parse(JSON.parse(raw));
-          status = { sourceServerId: stored.sourceServerId };
+          status = {
+            sourceServerId: stored.sourceServerId,
+            ...(stored.worktreeSlug ? { worktreeSlug: stored.worktreeSlug } : {}),
+          };
           pending = { setup: stored.setup, sourceDirectory: stored.sourceDirectory };
         }
       } catch {

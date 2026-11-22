@@ -55,6 +55,8 @@ export interface AcpOptions {
   initialCommandsTimeoutMs?: number;
   /** Allow delayed session/load updates before publishing the session as ready. */
   loadReplayQuietPeriodMs?: number;
+  /** Scope anonymous replay message IDs to the native session when replay order is stable. */
+  scopeAnonymousReplayMessageIds?: boolean;
   /**
    * Keep a turn open after `end_turn` while qualifying tool calls are still running,
    * settling once those tools finish and the agent finishes its follow-up reply.

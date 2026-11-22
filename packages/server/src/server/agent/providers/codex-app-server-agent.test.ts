@@ -8,6 +8,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { CodexInstructionSnapshot } from "./codex/instruction-snapshot.js";
+import { CodexAppServerRpcError } from "./codex/app-server-transport.js";
 
 import type {
   AgentClient,
@@ -7186,11 +7187,75 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test.each([
+    ["/compact", "thread/compact/start"],
+    ["/goal resume", "thread/goal/set"],
+  ])("checks recovery intent and provider outcome for %s", async (command, method) => {
+    const session = createSession({}, { goalsEnabled: true });
+    const loading = Promise.withResolvers<void>();
+    const opened = Promise.withResolvers<void>();
+    let enabled = true;
+    const request = vi.fn(async (name: string) => {
+      if (name === "thread/loaded/list") {
+        loading.resolve();
+        await opened.promise;
+        return { data: ["test-thread"] };
+      }
+      return {};
+    });
+    session.client = { request };
+    const emit = vi.fn();
+    const beforeProviderDispatch = vi.fn(async () => {
+      if (!enabled) throw new Error("Recovery withdrawn");
+    });
+    const onProviderOutcome = vi.fn();
+    const handler = session.tryHandleOutOfBand(command)!;
+    const run = () => handler.run({ emit, beforeProviderDispatch, onProviderOutcome });
+    const withdrawn = run();
+    try {
+      await loading.promise;
+      enabled = false;
+    } finally {
+      opened.resolve();
+    }
+    await withdrawn;
+    expect(request.mock.calls.map(([name]) => name)).not.toContain(method);
+    expect(onProviderOutcome).not.toHaveBeenCalled();
+
+    enabled = true;
+    const start = request.getMockImplementation()!;
+    const response = Promise.withResolvers<never>();
+    const submitted = Promise.withResolvers<void>();
+    request.mockImplementation(async (name) => {
+      if (name !== method) return start(name);
+      submitted.resolve();
+      return response.promise;
+    });
+    const refused = run();
+    await submitted.promise;
+    expect(onProviderOutcome).not.toHaveBeenCalled();
+    response.reject(new CodexAppServerRpcError("Method not found", -32601, undefined));
+    await refused;
+    expect(onProviderOutcome).not.toHaveBeenCalled();
+
+    request.mockImplementation(async (name) => {
+      if (name === method) throw new Error("Provider disconnected after submission");
+      return start(name);
+    });
+    await run();
+    expect(onProviderOutcome).toHaveBeenCalledTimes(1);
+    request.mockImplementation(start);
+    await run();
+    expect(onProviderOutcome).toHaveBeenCalledTimes(2);
+  });
+
   test("lists /compact and sends Codex compaction out of band", async () => {
     const requests: Array<{ method: string; params: unknown }> = [];
+    const order: string[] = [];
     const session = createSession();
     session.client = {
       request: vi.fn(async (method: string, params: unknown) => {
+        order.push(method);
         requests.push({ method, params });
         if (method === "thread/loaded/list") {
           return { data: ["test-thread"] };
@@ -7214,7 +7279,10 @@ describe("Codex app-server provider", () => {
 
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
-    await handler?.run({ emit: (event) => events.push(event) });
+    await handler?.run({
+      emit: (event) => events.push(event),
+      beforeProviderDispatch: async () => order.push("provider-handoff"),
+    });
     await asInternals(session).handleNotification("item/started", {
       threadId: "test-thread",
       item: {
@@ -7234,6 +7302,7 @@ describe("Codex app-server provider", () => {
       method: "thread/compact/start",
       params: { threadId: "test-thread" },
     });
+    expect(order.indexOf("provider-handoff")).toBeLessThan(order.indexOf("thread/compact/start"));
     expect(events).toEqual([
       {
         type: "timeline",

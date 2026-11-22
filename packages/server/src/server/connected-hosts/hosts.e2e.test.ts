@@ -9,6 +9,8 @@ import { createHostClient, createHostChannelTransport } from "@getpaseo/client/n
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import type { HostDirectory } from "@getpaseo/protocol/hosts";
 import { AgentFinishReportSchema } from "@getpaseo/protocol/messages";
+import { AgentTurnStartRejectedError } from "../agent/agent-sdk-types.js";
+import { StaleProviderSessionError } from "../agent/stale-provider-session-error.js";
 
 const cleanup: (() => Promise<unknown>)[] = [];
 
@@ -2201,6 +2203,120 @@ test.each([
     expect(JSON.parse(registeredWatches)).toMatchObject([
       { callerAgentId: parent.id, childAgentId: childId, serverId: bId },
     ]);
+  },
+);
+
+test.each(["cold reopen", "definite rejection", "stale retry", "unknown"] as const)(
+  "an authorized local report handles provider %s",
+  { timeout: 25000 },
+  async (failure) => {
+    const summary = "Keep the report until its delivery is confirmed.";
+    const accepted: string[] = [];
+    const failed = Promise.withResolvers<void>();
+    let attempts = 0;
+    let parentId: string | undefined;
+    let parentOpens = 0;
+    const clients = createTestAgentClients({
+      onStartTurn: (prompt) => {
+        if (String(prompt).includes(summary)) accepted.push(String(prompt));
+      },
+    });
+    const provider = clients.claude!;
+    const resume = provider.resumeSession.bind(provider);
+    vi.spyOn(provider, "resumeSession").mockImplementation(async (handle, ...args) => {
+      if (args[1]?.agentId !== parentId) return resume(handle, ...args);
+      parentOpens++;
+      if (
+        (failure === "cold reopen" && parentOpens === 1) ||
+        (failure === "stale retry" && parentOpens === 2)
+      ) {
+        failed.resolve();
+        throw new Error("Provider did not reopen");
+      }
+      const session = await resume(handle, ...args);
+      const start = session.startTurn.bind(session);
+      session.startTurn = async (prompt, options) => {
+        if (String(prompt).includes(summary) && ++attempts === 1) {
+          if (failure === "stale retry") throw new StaleProviderSessionError(handle.sessionId);
+          if (failure === "definite rejection") {
+            failed.resolve();
+            throw new AgentTurnStartRejectedError("Provider refused the request");
+          }
+          if (failure === "unknown") {
+            failed.resolve();
+            throw new Error("Provider transport interrupted after submission");
+          }
+        }
+        return start(prompt, options);
+      };
+      return session;
+    });
+    const host = await daemon({ agentClients: clients });
+    const { paseo, client } = await api(host);
+    const workspace = await paseo.workspaces.create({
+      source: { kind: "directory", path: host.staticDir },
+    });
+    const config = { provider: "claude/claude-test", modeId: "full-access" };
+    const parent = await workspace.agents.create({
+      config,
+      prompt: "Prepare to receive a report.",
+    });
+    parentId = parent.id;
+    expect((await client.waitForFinish(parent.id, 5000)).status).toBe("idle");
+    const child = await workspace.agents.create({ config, parent, parentReporting: "explicit" });
+    await host.daemon.agentManager.closeAgent(parent.id);
+    const tools = new Client({ name: "provider-outcome-report", version: "1" });
+    cleanup.push(() => tools.close());
+    await tools.connect(
+      new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${host.port}/mcp/agents?callerAgentId=${child.id}`),
+      ),
+    );
+    const result = await tools.callTool({
+      name: "report_to_parent",
+      arguments: { status: "completed", summary },
+    });
+    expect(result.structuredContent).toMatchObject({ deliveryStatus: "queued" });
+    const reportLog = join(host.paseoHome, "finish-followup-reports.json");
+    const reports = async () => JSON.parse(await readFile(reportLog, "utf8"));
+    expect(await reports()).toMatchObject([{ id: expect.any(String) }]);
+    await expect.poll(() => parentOpens, { timeout: 6000 }).toBeGreaterThan(0);
+    await failed.promise;
+    if (failure === "unknown") {
+      const receiptDir = join(host.paseoHome, "parent-report-receipts");
+      const [file] = await readdir(receiptDir);
+      expect(JSON.parse(await readFile(join(receiptDir, file!), "utf8"))).toMatchObject({
+        state: "pending",
+      });
+      await host.daemon.stop();
+      const recoveryErrors: string[] = [];
+      const restarted = await daemon({
+        paseoHomeRoot: dirname(host.paseoHome),
+        cleanup: false,
+        agentClients: clients,
+        logger: pino(
+          { level: "warn" },
+          {
+            write(line) {
+              const { msg, err } = JSON.parse(line);
+              if (msg === "Retrying parent report" && err?.message)
+                recoveryErrors.push(err.message);
+            },
+          },
+        ),
+      });
+      cleanup.splice(cleanup.length - 1, 0, () =>
+        rm(restarted.staticDir, { recursive: true, force: true }),
+      );
+      await expect.poll(() => recoveryErrors).toContain("agent_request_outcome_unknown");
+      expect(await reports()).toHaveLength(1);
+      expect(accepted).toEqual([]);
+      expect(attempts).toBe(1);
+      return;
+    }
+    await expect.poll(reports, { timeout: 16000 }).toEqual([]);
+    expect(accepted).toHaveLength(1);
+    expect(attempts).toBe(failure === "cold reopen" ? 1 : 2);
   },
 );
 

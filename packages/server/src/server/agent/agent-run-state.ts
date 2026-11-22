@@ -360,6 +360,7 @@ export class ForegroundPromptStart {
     private readonly agentId: string,
     readonly admit?: () => boolean,
     readonly beforeHandoff?: () => Promise<void>,
+    readonly onHandoffDeclined?: () => Promise<void>,
   ) {
     this.started = new Promise<void>((resolve, reject) => {
       this.resolveStarted = resolve;
@@ -367,6 +368,21 @@ export class ForegroundPromptStart {
     });
     // Steered and fire-and-forget dispatches never wait on the start.
     this.started.catch(() => undefined);
+  }
+
+  async handoff<T>(dispatch: () => Promise<T>, validate?: () => void): Promise<T> {
+    if (this.beforeHandoff) {
+      await this.beforeHandoff();
+      try {
+        validate?.();
+      } catch (error) {
+        await this.onHandoffDeclined?.();
+        throw error;
+      }
+    } else {
+      validate?.();
+    }
+    return dispatch();
   }
 
   /** A run was created for this prompt. */

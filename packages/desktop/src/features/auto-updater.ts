@@ -157,6 +157,7 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
   private configured = false;
   private macDownloadedInfo: RuntimeUpdateInfo | null = null;
   private macNativeInstallPending = false;
+  private macPreparationTimedOut = false;
   private nativeHandoffTimedOut = false;
   private onUpdateDownloaded?: AppUpdateRuntimeConfiguration["onUpdateDownloaded"];
 
@@ -253,10 +254,8 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
 
     // Squirrel schedules installation before emitting update-downloaded, so
     // call it only after consent, shutdown and the final settings check.
-    // Own the readiness listener so a failed attempt leaves no install callback.
     await new Promise<void>((resolve, reject) => {
       const cleanup = () => {
-        clearTimeout(timeout);
         electronAutoUpdater.removeListener("update-downloaded", onReady);
         electronAutoUpdater.removeListener("update-not-available", onUnavailable);
         electronAutoUpdater.removeListener("error", onError);
@@ -280,12 +279,6 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
       };
       const onUnavailable = () =>
         onError(new Error(`Squirrel did not find Paseo ${targetVersion}.`));
-      const timeout = setTimeout(() => {
-        // Electron cannot cancel a native check. An event from this attempt
-        // cannot authorize a retry, even if it uses the same feed URL.
-        this.macNativeInstallPending = true;
-        onError(new Error("macOS did not finish preparing the update in time."));
-      }, MAC_UPDATE_PREPARATION_TIMEOUT_MS);
       electronAutoUpdater.on("update-downloaded", onReady);
       electronAutoUpdater.once("update-not-available", onUnavailable);
       electronAutoUpdater.once("error", onError);
@@ -300,12 +293,28 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
     }
   }
 
+  private async waitForMacPreparation(preparation: Promise<void>): Promise<void> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        this.macPreparationTimedOut = true;
+        reject(new Error("macOS did not finish preparing the update in time."));
+      }, MAC_UPDATE_PREPARATION_TIMEOUT_MS);
+    });
+    try {
+      await Promise.race([preparation, deadline]);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   getInstallBlockReason(): string | undefined {
     // Native events have no attempt identifier. A late event must not
     // acknowledge a second install in this process.
     if (
       this.nativeHandoffTimedOut ||
-      (process.platform === "darwin" && this.macNativeInstallPending)
+      (process.platform === "darwin" &&
+        (this.macNativeInstallPending || this.macPreparationTimedOut))
     ) {
       return "Restart Paseo before retrying the update.";
     }
@@ -320,22 +329,35 @@ class ElectronAppUpdateRuntime implements AppUpdateRuntime {
     await beforeHandoff?.();
     const release = isMac ? await getDesktopSettingsStore().beginOfficialUpdateInstall() : null;
     if (isMac && !release) throw new Error("Official updates are disabled.");
+    let macPreparation: Promise<void> | undefined;
     try {
-      if (isMac) await this.prepareMacUpdate(request.targetVersion);
+      if (isMac) {
+        macPreparation = this.prepareMacUpdate(request.targetVersion);
+        await this.waitForMacPreparation(macPreparation);
+      }
       if (!isMac && !(await isOfficialUpdatesEnabled())) {
         throw new Error("Official updates are disabled.");
       }
       await this.handoffUpdate(request, isMac);
     } catch (error) {
-      if (isMac && this.macNativeInstallPending) {
+      if (isMac && (this.macNativeInstallPending || this.macPreparationTimedOut)) {
+        const timeoutMessage = this.macPreparationTimedOut
+          ? "macOS did not finish preparing the update in time. "
+          : "";
         throw new AppUpdateHandoffUncertainError(
-          "macOS may install the update on exit. Quit and reopen Paseo before retrying.",
+          `${timeoutMessage}macOS may install the update on exit. Quit and reopen Paseo before retrying.`,
           { cause: error },
         );
       }
       throw error;
     } finally {
-      release?.();
+      if (release && macPreparation && this.macPreparationTimedOut) {
+        // Electron cannot cancel the native check. Its terminal event can
+        // unlock settings, but only the original caller can start a handoff.
+        void macPreparation.then(release, release);
+      } else {
+        release?.();
+      }
     }
   }
 

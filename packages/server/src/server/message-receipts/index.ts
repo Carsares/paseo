@@ -57,7 +57,7 @@ interface SendMessageInput {
    * Delivers the message. It awaits `beforeDispatch` immediately before the provider can receive
    * the message; a failure before that call proves nothing was submitted and leaves no receipt.
    */
-  send: (beforeDispatch: () => Promise<void>) => Promise<void>;
+  send: (beforeDispatch: () => Promise<void>, declined: () => Promise<void>) => Promise<void>;
   /** Admission was refused before the message could enter the delivery queue. */
   retryIfNotAdmitted?: (error: unknown) => boolean;
   /** Only errors that prove the provider never received the message may clear a pending receipt. */
@@ -247,14 +247,19 @@ export class MessageReceipts {
     }
     const receipt = { fingerprint, agentId: input.agentId };
     let pending: Promise<void> | null = null;
+    const declined = async () => {
+      if (!pending) return;
+      await pending.catch(() => undefined);
+      await rm(file, { force: true });
+      pending = null;
+    };
     try {
       await input.send(() => {
         pending ??= writeJsonFileAtomic(file, { ...receipt, state: "pending" });
         return pending;
-      });
+      }, declined);
     } catch (error) {
-      if (pending && (input.retryIfNotAdmitted?.(error) || input.retryIfUnsent?.(error)))
-        await rm(file, { force: true });
+      if (input.retryIfNotAdmitted?.(error) || input.retryIfUnsent?.(error)) await declined();
       throw error;
     }
     if (input.retryIfUnsent) this.awaitingCommit.set(key, receipt);

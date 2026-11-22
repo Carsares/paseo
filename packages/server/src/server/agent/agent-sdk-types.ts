@@ -174,6 +174,8 @@ export interface AgentCreateConfigUnattendedInput {
 }
 
 export interface AgentCapabilityFlags {
+  /** Invoke the prompt guard immediately before the provider's start or steer request. */
+  defersPromptHandoff?: boolean;
   [capability: string]: boolean | undefined;
   supportsStreaming: boolean;
   supportsSessionPersistence: boolean;
@@ -208,6 +210,10 @@ export interface AgentRunOptions {
   resumeFrom?: AgentPersistenceHandle;
   maxThinkingTokens?: number;
   clientMessageId?: string;
+  /** Internal marker used while dispatching a daemon-started automatic recovery. */
+  recoveryIntent?: "automatic";
+  /** Internal guard used by sessions that defer handoff until their provider request. */
+  beforeProviderDispatch?: () => Promise<void>;
 }
 
 export interface AgentSteerOptions extends AgentRunOptions {
@@ -556,6 +562,9 @@ export class AgentTurnStartCanceledError extends Error {
   }
 }
 
+/** The provider explicitly rejected the request before creating a turn. */
+export class AgentTurnStartRejectedError extends Error {}
+
 export interface AgentRunResult {
   sessionId: string;
   finalText: string;
@@ -800,7 +809,13 @@ export interface AgentSession {
    * (e.g. /goal pause) reach the provider without canceling the running turn.
    */
   tryHandleOutOfBand?(prompt: AgentPromptInput): {
-    run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void>;
+    run(ctx: {
+      emit: (event: AgentStreamEvent) => void;
+      /** Called immediately before a provider request makes the command irreversible. */
+      beforeProviderDispatch?: () => Promise<void>;
+      /** Called after the provider acknowledges the request, or if its outcome is unknown. */
+      onProviderOutcome?: () => void;
+    }): Promise<void>;
   } | null;
 }
 

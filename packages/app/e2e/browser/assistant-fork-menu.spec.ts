@@ -1,4 +1,6 @@
+import { execFileSync } from "node:child_process";
 import { rename } from "node:fs/promises";
+import type { CreationSnapshot, WorkspaceCreateRequest } from "@getpaseo/protocol/messages";
 import { expect, test as base, type Page } from "../support/fixtures";
 import { awaitAssistantMessage } from "../support/helpers/agent-stream";
 import {
@@ -15,6 +17,7 @@ import {
   expectComposerDraft,
   expectComposerVisible,
   fillComposerDraft,
+  resizeComposerViewport,
   submitMessage,
 } from "../support/helpers/composer";
 import { daemonWsRoutePattern, getE2EDaemonPort } from "../support/helpers/daemon-port";
@@ -26,7 +29,11 @@ import {
 } from "../support/helpers/mock-agent";
 import { getServerId } from "../support/helpers/server-id";
 import { seedSavedSettingsHosts } from "../support/helpers/settings";
-import { submitNewWorkspaceEmpty } from "../support/helpers/new-workspace";
+import {
+  expectWorkspaceIsolationSelected,
+  selectWorkspaceIsolation,
+  submitNewWorkspaceEmpty,
+} from "../support/helpers/new-workspace";
 
 const test = base.extend<{
   seedForkWorkspace: (options: MockAgentOptions) => Promise<MockAgentWorkspace>;
@@ -80,8 +87,194 @@ function readStoredForkDraft(page: Page, draftId: string | null) {
   return page.evaluate((key) => localStorage.getItem(key), `paseo:workspace-fork-draft:${draftId}`);
 }
 
+async function holdInitialWorkspaceCreation(page: Page) {
+  const requests: WorkspaceCreateRequest[] = [];
+  const accepted = Promise.withResolvers<CreationSnapshot>();
+  let holdFirstSocket = true;
+  await page.routeWebSocket(daemonWsRoutePattern(), (browser) => {
+    const daemon = browser.connectToServer();
+    let original: WorkspaceCreateRequest | undefined;
+    browser.onMessage((raw) => {
+      if (typeof raw === "string") {
+        const envelope = JSON.parse(raw);
+        const request = envelope.message ?? envelope;
+        if (request.type === "workspace.create.request") {
+          requests.push(request);
+          if (holdFirstSocket && !original) original = request;
+        }
+      }
+      daemon.send(raw);
+    });
+    daemon.onMessage((raw) => {
+      if (original && typeof raw === "string") {
+        const envelope = JSON.parse(raw);
+        const message = envelope.message ?? envelope;
+        if (
+          message.type === "workspace.create.update" &&
+          message.payload.idempotencyKey === original.idempotencyKey
+        ) {
+          // The host emits accepted only after persisting the creation record. The old
+          // connection never receives workspace_ready or the create response.
+          if (message.payload.phase === "accepted") accepted.resolve(message.payload);
+          return;
+        }
+        if (
+          message.type === "workspace.create.response" &&
+          message.payload.requestId === original.requestId
+        ) {
+          return;
+        }
+      }
+      browser.send(raw);
+    });
+  });
+  return {
+    requests,
+    accepted: accepted.promise,
+    allowRetry() {
+      holdFirstSocket = false;
+    },
+  };
+}
+
 test.describe("Timeline Fork", () => {
   test.describe.configure({ timeout: 180_000 });
+
+  test("recovers an accepted worktree Fork after refreshing before workspace readiness", async ({
+    page,
+    seedForkWorkspace,
+  }) => {
+    test.setTimeout(120_000);
+    const earlier = "emit 1 coalesced agent stream updates for the accepted fork turn.";
+    const later = "emit 1 coalesced agent stream updates beyond the accepted fork turn.";
+    const prompt = "Continue the accepted worktree Fork.";
+    const filename = "accepted-fork-notes.txt";
+    const creation = await holdInitialWorkspaceCreation(page);
+    const { requests } = creation;
+    const session = await seedForkWorkspace({
+      repoPrefix: "assistant-fork-accepted-worktree-",
+      title: "Accepted worktree Fork",
+      initialPrompt: earlier,
+      model: "ten-second-stream",
+    });
+    const knownWorkspaces = new Set(
+      (await session.client.fetchWorkspaces()).entries.map((w) => w.id),
+    );
+    const listWorktrees = () =>
+      execFileSync("git", ["worktree", "list", "--porcelain"], {
+        cwd: session.cwd,
+        encoding: "utf8",
+      })
+        .split("\n")
+        .filter((line) => line.startsWith("worktree "));
+    const originalWorktrees = listWorktrees();
+
+    await openAgentRoute(page, session);
+    await awaitAssistantMessage(page);
+    expect((await session.client.waitForFinish(session.agentId, 45_000)).status).toBe("idle");
+    await forkMostRecentAssistantTurnToNewWorkspace(page);
+    await expect(page).toHaveURL(/\/new\?.*draftId=/);
+    const draftId = new URL(page.url()).searchParams.get("draftId");
+    await session.client.sendAgentMessage(session.agentId, later);
+    expect((await session.client.waitForFinish(session.agentId, 45_000)).status).toBe("idle");
+    await selectWorkspaceIsolation(page, "worktree");
+    await expectWorkspaceIsolationSelected(page, "worktree");
+    await fillComposerDraft(page, prompt);
+    await dropFileOnComposer(page, {
+      name: filename,
+      mimeType: "text/plain",
+      buffer: Buffer.from("Retain this file while recovering the accepted worktree."),
+    });
+    const attachment = page.getByTestId("composer-file-attachment-pill");
+    await expect(attachment).toContainText(filename);
+    const submit = page.getByTestId("workspace-create-submit");
+    await submit.click();
+    const receipt = await creation.accepted;
+    expect(receipt).toMatchObject({
+      idempotencyKey: draftId,
+      workspaceId: expect.any(String),
+      agentId: expect.any(String),
+    });
+    expect(requests[0]).toMatchObject({
+      idempotencyKey: draftId,
+      source: { kind: "worktree", worktreeSlug: expect.any(String) },
+      agent: {
+        forkFrom: { sourceAgentId: session.agentId },
+        initialPrompt: prompt,
+      },
+    });
+    await expect(page).toHaveURL(/\/new\?.*draftId=/);
+
+    const draftUrl = page.url();
+    creation.allowRetry();
+    await page.reload();
+    await expectComposerDraft(page, prompt);
+    await expect(attachment).toContainText(filename);
+    await expectWorkspaceIsolationSelected(page, "worktree");
+    const changedPrompt = "Continue the Fork using a changed prompt.";
+    await fillComposerDraft(page, changedPrompt);
+    await submit.click();
+
+    await expect.poll(() => requests.length).toBe(2);
+    expect(requests[1]).toMatchObject({
+      idempotencyKey: draftId,
+      source: requests[0]!.source,
+      agent: { initialPrompt: changedPrompt },
+    });
+    await expect(
+      page.getByText("workspace_request_key_conflict", { exact: true }).first(),
+    ).toBeVisible();
+    await expect(page).toHaveURL(draftUrl);
+    await expectComposerDraft(page, changedPrompt);
+    await expect(attachment).toContainText(filename);
+
+    await fillComposerDraft(page, prompt);
+    const retryPage = await page.context().newPage();
+    // A manually opened page does not get the page fixture's main daemon guard.
+    await retryPage.route(/:6767\b/, (route) => route.abort());
+    await retryPage.routeWebSocket(/:6767\b/, (socket) => socket.close());
+    await resizeComposerViewport(retryPage, "portrait");
+    const retryRequests = observeWorkspaceRequests(retryPage);
+    await retryPage.goto(draftUrl);
+    await expectComposerDraft(retryPage, prompt);
+    await expect(retryPage.getByTestId("composer-file-attachment-pill")).toContainText(filename);
+    await expectWorkspaceIsolationSelected(retryPage, "worktree");
+    await expect(retryPage.getByTestId("compact-shell")).toBeVisible();
+    await retryPage.getByTestId("workspace-create-submit").click();
+
+    await expect.poll(() => retryRequests.length).toBe(1);
+    const { requestId: _firstRequestId, ...acceptedIntent } = requests[0]!;
+    const { requestId: _retryRequestId, ...retryIntent } =
+      retryRequests[0] as WorkspaceCreateRequest;
+    expect(retryIntent).toEqual(acceptedIntent);
+    await expect(retryPage).toHaveURL(/\/workspace\//, { timeout: 30_000 });
+    // The selected-tab marker lives in the wide layout's tab row.
+    await resizeComposerViewport(retryPage, "landscape");
+    await expect(retryPage.getByTestId(`workspace-tab-agent_${receipt.agentId}`)).toHaveAttribute(
+      "aria-selected",
+      "true",
+      { timeout: 30_000 },
+    );
+    const userMessages = retryPage.getByTestId("user-message");
+    await expect(userMessages.filter({ hasText: earlier })).toBeVisible();
+    await expect(userMessages.filter({ hasText: later })).toHaveCount(0);
+    const initialMessage = userMessages.filter({ hasText: prompt });
+    await expect(initialMessage).toHaveCount(1);
+    await expect(initialMessage).toContainText(filename);
+    await expect.poll(() => readStoredForkDraft(retryPage, draftId)).toBeNull();
+
+    const created = (await session.client.fetchWorkspaces()).entries.filter(
+      (w) => !knownWorkspaces.has(w.id),
+    );
+    expect(created).toMatchObject([{ id: receipt.workspaceId, workspaceKind: "worktree" }]);
+    expect(listWorktrees().filter((entry) => !originalWorktrees.includes(entry))).toEqual([
+      `worktree ${created[0]!.workspaceDirectory}`,
+    ]);
+    const agents = (await session.client.fetchAgents()).entries
+      .map((entry) => entry.agent)
+      .filter((agent) => agent.workspaceId === receipt.workspaceId);
+    expect(agents.map((agent) => agent.id)).toEqual([receipt.agentId]);
+  });
 
   test("restores the selected Fork boundary before submitting a refreshed workspace draft", async ({
     page,

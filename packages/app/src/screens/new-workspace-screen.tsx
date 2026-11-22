@@ -239,6 +239,7 @@ function useWorkspaceIsolation(input: {
   canCreateWorktree: boolean;
   existingWorktrees: readonly ExistingWorktree[];
   projectDirectory: string | null;
+  hasReservedForkWorktree: boolean;
 }): WorkspaceIsolationState {
   const { setup, supportsMultiplicity, canCreateWorktree, existingWorktrees } = input;
   // The last isolation choice is remembered alongside the other New Workspace
@@ -246,7 +247,10 @@ function useWorkspaceIsolation(input: {
   // the remembered default until the screen remounts.
   const { preferences } = useFormPreferences();
   const { manualIsolation, existingWorktreePath: chosenPath } = useNewWorkspaceSetupState(setup);
-  const isolation = manualIsolation ?? preferences.isolation ?? "local";
+  const isolation =
+    manualIsolation ??
+    (input.hasReservedForkWorktree ? "worktree" : preferences.isolation) ??
+    "local";
   // A worktree that left the list (removed since it was chosen) is no choice.
   const existingWorktreePath =
     canCreateWorktree && existingWorktrees.some((worktree) => worktree.path === chosenPath)
@@ -654,7 +658,15 @@ function usePendingWorkspaceDraftSetup(draftId: string | undefined) {
   const forkDraftSetup = useWorkspaceDraftSubmissionStore((state) =>
     normalizedDraftId ? (state.setupByDraftId[normalizedDraftId] ?? null) : null,
   );
-  return { forkDraftSetup, isTimelineFork: Boolean(forkDraftSetup?.setup.forkFrom) };
+  const hasReservedForkWorktree = useWorkspaceDraftSubmissionStore((state) => {
+    const status = state.draftSetupStatusById[normalizedDraftId];
+    return typeof status === "object" && Boolean(status.worktreeSlug);
+  });
+  return {
+    forkDraftSetup,
+    isTimelineFork: Boolean(forkDraftSetup?.setup.forkFrom),
+    hasReservedForkWorktree,
+  };
 }
 
 function resolveWorkspaceDraftSubmissionConfig(input: {
@@ -974,7 +986,8 @@ export function NewWorkspaceScreen({
   const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
   const toast = useToast();
-  const { forkDraftSetup, isTimelineFork } = usePendingWorkspaceDraftSetup(draftId);
+  const { forkDraftSetup, isTimelineFork, hasReservedForkWorktree } =
+    usePendingWorkspaceDraftSetup(draftId);
   const composerEditing = useNewWorkspaceComposerEditing();
   const { leaveFullscreen } = composerEditing;
   const mergeWorkspaces = useCallback(
@@ -1206,6 +1219,7 @@ export function NewWorkspaceScreen({
     canCreateWorktree,
     existingWorktrees,
     projectDirectory: selectedSourceDirectory,
+    hasReservedForkWorktree,
   });
 
   const branchSuggestionsQuery = useQuery({
@@ -1438,9 +1452,19 @@ export function NewWorkspaceScreen({
         const matchingComposer = provider === selectedProvider ? composerState : null;
         mainAgent = { config: buildWorkspaceAgentConfig(input.cwd, provider, matchingComposer) };
       }
+      // The request key already comes from the draft URL. Keep its generated worktree
+      // slug durable too, so a refresh can replay the same intent and obtain the result.
+      const worktreeSlug =
+        isTimelineFork && createsWorktree
+          ? await useWorkspaceDraftSubmissionStore.getState().reserveForkWorktreeSlug({
+              draftId: creationIdentity.draftId,
+              serverId: selectedServerId,
+              worktreeSlug: creationIdentity.worktreeSlug,
+            })
+          : creationIdentity.worktreeSlug;
       const normalizedWorkspace = await createMultiplicityWorkspace({
         idempotencyKey: creationIdentity.draftId,
-        worktreeSlug: creationIdentity.worktreeSlug,
+        worktreeSlug,
         client: connectedClient,
         isolation: createsWorktree ? "worktree" : "local",
         project: selectedProject,
@@ -1468,6 +1492,7 @@ export function NewWorkspaceScreen({
       createMainAgent,
       effectiveIsolation,
       formPreferences.provider,
+      isTimelineFork,
       mergeWorkspaces,
       queryClient,
       selectedItem,

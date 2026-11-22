@@ -431,6 +431,65 @@ test.each([true, false])(
   },
 );
 
+test("a manually accepted run consumes only its pending automatic recovery intent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "restart-recovery-manual-accept-"));
+  try {
+    const markerPath = join(root, "restart-recovery-pending.json");
+    const storage = new AgentStorage(join(root, "agents"), createTestLogger());
+    const timestamp = new Date().toISOString();
+    await storage.upsert(
+      parseStoredAgentRecord({
+        id: "manual",
+        provider: "codex",
+        cwd: root,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        lastStatus: "closed",
+        resumeOnStartup: true,
+      }),
+    );
+    await writeFile(markerPath, JSON.stringify({ version: 2, agentIds: ["manual"] }));
+    const dispatch = vi.fn(async () => {});
+    const recovery = createRestartRecovery({
+      storage,
+      automaticMarkerPath: markerPath,
+      settings: () => ({ enabled: true, prompt: "Continue." }),
+      eligible: async () => true,
+      dispatch,
+      report: () => {},
+    });
+
+    await recovery.prepareStartup();
+    await recovery.consumeAutomaticRecovery("manual");
+    recovery.resumePending();
+    await recovery.waitForResume("manual", new AbortController().signal);
+
+    expect(dispatch).not.toHaveBeenCalled();
+    await expect(readFile(markerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await storage.get("manual"))?.resumeOnStartup).toBe(false);
+
+    // A later interruption creates fresh recovery work for the same agent.
+    const record = (await storage.get("manual"))!;
+    await storage.upsert({ ...record, lastStatus: "running" });
+    await recovery.captureRunningAgents();
+    const nextStartup = createRestartRecovery({
+      storage,
+      automaticMarkerPath: markerPath,
+      settings: () => ({ enabled: true, prompt: "Continue." }),
+      eligible: async () => true,
+      dispatch,
+      report: () => {},
+    });
+    await nextStartup.prepareStartup();
+    nextStartup.resumePending();
+    await nextStartup.waitForResume("manual", new AbortController().signal);
+    expect(dispatch).toHaveBeenCalledExactlyOnceWith("manual", "Continue.", expect.any(Function));
+    await expect(readFile(markerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("does not dispatch a completed one-shot recovery again if clearing its agent flag fails", async () => {
   const root = await mkdtemp(join(tmpdir(), "restart-recovery-flag-write-"));
   try {

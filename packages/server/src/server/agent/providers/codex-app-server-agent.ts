@@ -4,6 +4,7 @@ import { assertChangesAreLive, validateProviderOptions } from "../provider-optio
 import { CodexBackgroundInventory } from "./codex/background-inventory.js";
 import {
   AgentTurnStartCanceledError,
+  AgentTurnStartRejectedError,
   getAgentStreamEventTurnId,
   type AgentPermissionAction,
   type AgentCapabilityFlags,
@@ -280,6 +281,7 @@ function formatOutOfBandStatusMessage(text: string): string {
 }
 
 const CODEX_APP_SERVER_CAPABILITIES: AgentCapabilityFlags = {
+  defersPromptHandoff: true,
   supportsStreaming: true,
   supportsSessionPersistence: true,
   supportsSessionListing: true,
@@ -1013,6 +1015,13 @@ function isCodexAlreadyIdleInterrupt(error: unknown): boolean {
     error instanceof CodexAppServerRpcError &&
     error.code === -32600 &&
     error.message === "no active turn to interrupt"
+  );
+}
+
+function isCodexRequestRejected(error: unknown): error is CodexAppServerRpcError {
+  return (
+    error instanceof CodexAppServerRpcError &&
+    (error.code === -32600 || error.code === -32601 || error.code === -32602)
   );
 }
 
@@ -5140,10 +5149,18 @@ export class CodexAppServerAgentSession implements AgentSession {
       // The interrupted turn's commands end before this turn begins, so none of them
       // outlives it into the new turn.
       await this.waitForInterruptedTurnCleanup();
+      if (options?.beforeProviderDispatch) await options.beforeProviderDispatch();
       if (pendingStart.cancelRequested) {
         throw new AgentTurnStartCanceledError();
       }
-      await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS);
+      try {
+        await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS);
+      } catch (error) {
+        if (options?.beforeProviderDispatch && isCodexRequestRejected(error)) {
+          throw new AgentTurnStartRejectedError(error.message, { cause: error });
+        }
+        throw error;
+      }
       return { turnId };
     } catch (error) {
       this.pendingForegroundTurnIdentification?.resolve(null);
@@ -5184,7 +5201,8 @@ export class CodexAppServerAgentSession implements AgentSession {
       return { status: "unavailable" };
     }
     const input = await this.buildUserInput(prompt);
-    if (!this.matchesSteerAdmission({ client, threadId, nativeTurnId, foregroundTurnId })) {
+    const admission = { client, threadId, nativeTurnId, foregroundTurnId };
+    if (!(await this.prepareSteerHandoff(admission, options.beforeProviderDispatch))) {
       return { status: "unavailable" };
     }
     try {
@@ -5212,6 +5230,17 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (isDefinitiveCodexSteerRejection(error)) return { status: "unavailable" };
       throw error;
     }
+  }
+
+  private async prepareSteerHandoff(
+    admission: Parameters<CodexAppServerAgentSession["matchesSteerAdmission"]>[0],
+    beforeProviderDispatch?: () => Promise<void>,
+  ): Promise<boolean> {
+    if (beforeProviderDispatch) {
+      if (!this.matchesSteerAdmission(admission)) return false;
+      await beforeProviderDispatch();
+    }
+    return this.matchesSteerAdmission(admission);
   }
 
   private matchesSteerAdmission(admission: {
@@ -6076,15 +6105,15 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   tryHandleOutOfBand(
     prompt: AgentPromptInput,
-  ): { run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void> } | null {
+  ): ReturnType<NonNullable<AgentSession["tryHandleOutOfBand"]>> {
     if (typeof prompt !== "string") return null;
     const parsed = this.parseSlashCommandInput(prompt);
     if (!parsed) return null;
 
     if (parsed.commandName === "compact") {
       return {
-        run: async ({ emit }) => {
-          const error = await this.executeCompactCommand();
+        run: async ({ emit, beforeProviderDispatch, onProviderOutcome }) => {
+          const error = await this.executeCompactCommand(beforeProviderDispatch, onProviderOutcome);
           if (error) {
             emit({
               type: "timeline",
@@ -6100,8 +6129,10 @@ export class CodexAppServerAgentSession implements AgentSession {
 
     const subcommand = parseGoalSubcommand(parsed.args);
     return {
-      run: async ({ emit }) => {
-        const text = formatOutOfBandStatusMessage(await this.executeGoalSubcommand(subcommand));
+      run: async ({ emit, beforeProviderDispatch, onProviderOutcome }) => {
+        const text = formatOutOfBandStatusMessage(
+          await this.executeGoalSubcommand(subcommand, beforeProviderDispatch, onProviderOutcome),
+        );
         emit({
           type: "timeline",
           provider: CODEX_PROVIDER,
@@ -6111,7 +6142,29 @@ export class CodexAppServerAgentSession implements AgentSession {
     };
   }
 
-  private async executeCompactCommand(): Promise<string | null> {
+  private async dispatchCommandRequest(
+    request: () => Promise<unknown>,
+    beforeProviderDispatch?: () => Promise<void>,
+    onProviderOutcome?: () => void,
+  ): Promise<void> {
+    if (beforeProviderDispatch) await beforeProviderDispatch();
+    try {
+      await request();
+    } catch (error) {
+      // Protocol-level request rejection proves the command did not execute.
+      // Transport failures and other server errors leave the outcome unknown.
+      if (!isCodexRequestRejected(error)) {
+        onProviderOutcome?.();
+      }
+      throw error;
+    }
+    onProviderOutcome?.();
+  }
+
+  private async executeCompactCommand(
+    beforeProviderDispatch?: () => Promise<void>,
+    onProviderOutcome?: () => void,
+  ): Promise<string | null> {
     try {
       await this.connect();
       if (this.currentThreadId) {
@@ -6124,9 +6177,12 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       this.pendingManualCompactionStarts += 1;
       try {
-        await this.client.request("thread/compact/start", {
-          threadId: this.currentThreadId,
-        });
+        const { client, currentThreadId: threadId } = this;
+        await this.dispatchCommandRequest(
+          () => client.request("thread/compact/start", { threadId }),
+          beforeProviderDispatch,
+          onProviderOutcome,
+        );
       } catch (error) {
         this.pendingManualCompactionStarts = Math.max(0, this.pendingManualCompactionStarts - 1);
         throw error;
@@ -6138,7 +6194,11 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
   }
 
-  private async executeGoalSubcommand(subcommand: GoalSubcommand): Promise<string> {
+  private async executeGoalSubcommand(
+    subcommand: GoalSubcommand,
+    beforeProviderDispatch?: () => Promise<void>,
+    onProviderOutcome?: () => void,
+  ): Promise<string> {
     if (subcommand.kind === "usage") {
       return "Usage: /goal <objective>|pause|resume|clear";
     }
@@ -6154,33 +6214,35 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (!this.client || !this.currentThreadId) {
         throw new Error("Codex thread is not available");
       }
+      const { client, currentThreadId: threadId } = this;
+      const request = (method: string, params: Record<string, unknown>) =>
+        this.dispatchCommandRequest(
+          () => client.request(method, { threadId, ...params }),
+          beforeProviderDispatch,
+          onProviderOutcome,
+        );
       switch (subcommand.kind) {
         case "set": {
-          await this.client.request("thread/goal/set", {
-            threadId: this.currentThreadId,
+          await request("thread/goal/set", {
             objective: subcommand.objective,
             status: "active",
           });
           return `Goal set: ${subcommand.objective}`;
         }
         case "pause": {
-          await this.client.request("thread/goal/set", {
-            threadId: this.currentThreadId,
+          await request("thread/goal/set", {
             status: "paused",
           });
           return "Goal paused.";
         }
         case "resume": {
-          await this.client.request("thread/goal/set", {
-            threadId: this.currentThreadId,
+          await request("thread/goal/set", {
             status: "active",
           });
           return "Goal resumed.";
         }
         case "clear": {
-          await this.client.request("thread/goal/clear", {
-            threadId: this.currentThreadId,
-          });
+          await request("thread/goal/clear", {});
           return "Goal cleared.";
         }
       }

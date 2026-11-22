@@ -1189,6 +1189,7 @@ test("agent and workspace creation inherit a closed fork source by message ID", 
     agentStorage: storage,
     workspaceRegistry: {
       get: vi.fn(registry.get.bind(registry)),
+      listAll: registry.listAll.bind(registry),
       listActive: registry.listActive.bind(registry),
       upsert: registry.upsert.bind(registry),
     },
@@ -4282,6 +4283,7 @@ describe("agent move to workspace RPC", () => {
       },
       workspaceRegistry: {
         get: vi.fn(registry.get.bind(registry)),
+        listAll: registry.listAll.bind(registry),
         listActive: registry.listActive.bind(registry),
         upsert: registry.upsert.bind(registry),
         archive: registry.archive.bind(registry),

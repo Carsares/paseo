@@ -1691,8 +1691,10 @@ describe("paseo daemon bootstrap", () => {
           if (typeof prompt !== "string") return null;
           if (prompt === "/goal pause") recoveryParsed.resolve();
           return {
-            run: async () => {
+            run: async ({ beforeProviderDispatch, onProviderOutcome }) => {
+              if (prompt === "/goal pause") await beforeProviderDispatch?.();
               commands.push(prompt);
+              if (prompt === "/goal pause") onProviderOutcome?.();
               if (prompt === "/compact") {
                 ordinaryRunning.resolve();
                 await allowOrdinary.promise;
@@ -1800,6 +1802,115 @@ describe("paseo daemon bootstrap", () => {
       }
     },
     12_000,
+  );
+
+  test.each(["before recovery", "after rejection"] as const)(
+    "an accepted foreground turn takes over automatic startup recovery %s",
+    async (timing) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paseo-manual-recovery-takeover-"));
+      const home = path.join(root, ".paseo");
+      const id = randomUUID();
+      const marker = path.join(home, "restart-recovery-pending.json");
+      const logger = pino({ level: "silent" });
+      const timestamp = new Date().toISOString();
+      const seed = new AgentStorage(path.join(home, "agents"), logger);
+      const waiting = Promise.withResolvers<void>();
+      const continueRecovery = Promise.withResolvers<void>();
+      const manual = "Continue with my instructions.";
+      const attempts: string[] = [];
+      const providers = createTestAgentClients();
+      const provider = providers.codex!;
+      const resume = provider.resumeSession.bind(provider);
+      vi.spyOn(provider, "resumeSession").mockImplementation(async (...args) => {
+        const session = await resume(...args);
+        const start = session.startTurn.bind(session);
+        session.startTurn = async (prompt, options) => {
+          attempts.push(String(prompt));
+          if (prompt === "Resume working.") throw new Error("Provider refused automatic start");
+          return start(prompt, options);
+        };
+        return session;
+      });
+      let first: Awaited<ReturnType<typeof createPaseoDaemon>> | undefined;
+      let second: Awaited<ReturnType<typeof createTestPaseoDaemon>> | undefined;
+      let client: DaemonClient | undefined;
+      try {
+        await seed.upsert(
+          parseStoredAgentRecord({
+            id,
+            provider: "codex",
+            cwd: root,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            lastStatus: "closed",
+            persistence: { provider: "codex", sessionId: id },
+          }),
+        );
+        await writeFile(marker, JSON.stringify({ version: 2, agentIds: [id] }));
+        first = await createPaseoDaemon(
+          {
+            ...loadConfig(home, { env: {} }),
+            listen: "127.0.0.1:0",
+            staticDir: root,
+            agentStoragePath: path.join(home, "agents"),
+            agentClients: providers,
+            mcpEnabled: false,
+            relayEnabled: false,
+            pluginsEnabled: false,
+            resumeOnStartup: true,
+          },
+          logger,
+        );
+        const read = first.agentStorage.get.bind(first.agentStorage);
+        let firstRead = true;
+        vi.spyOn(first.agentStorage, "get").mockImplementation(async (agentId) => {
+          if (agentId === id && firstRead && first?.getListenTarget()) {
+            firstRead = false;
+            waiting.resolve();
+            await continueRecovery.promise;
+          }
+          return read(agentId);
+        });
+        await first.start();
+        await waiting.promise;
+        const listen = first.getListenTarget();
+        if (listen?.type !== "tcp") throw new Error("Expected an isolated TCP listener");
+        client = new DaemonClient({ url: `ws://127.0.0.1:${listen.port}/ws` });
+        await client.connect();
+        if (timing === "after rejection") {
+          continueRecovery.resolve();
+          await vi.waitFor(() => expect(first?.agentManager.getAgent(id)?.lifecycle).toBe("error"));
+          expect(JSON.parse(await readFile(marker, "utf8"))).toMatchObject({ agentIds: [id] });
+        }
+        await client.sendMessage(id, manual);
+        expect((await client.waitForFinish(id, 5000)).status).toBe("idle");
+        continueRecovery.resolve();
+        await vi.waitFor(() =>
+          expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" }),
+        );
+        await client.close();
+        await vi.waitFor(() => first!.stop({ resumeAgents: true }));
+        expect(attempts).toEqual(
+          timing === "after rejection" ? ["Resume working.", manual] : [manual],
+        );
+        const restarted = vi.fn();
+        second = await createTestPaseoDaemon({
+          paseoHomeRoot: root,
+          cleanup: false,
+          resumeOnStartup: true,
+          agentClients: createTestAgentClients({ onStartTurn: restarted }),
+        });
+        await second.daemon.stop({ resumeAgents: true });
+        expect(restarted).not.toHaveBeenCalled();
+      } finally {
+        continueRecovery.resolve();
+        await client?.close();
+        await first?.stop();
+        await second?.close();
+        if (second) await rm(second.staticDir, { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true });
+      }
+    },
   );
 
   test.each([

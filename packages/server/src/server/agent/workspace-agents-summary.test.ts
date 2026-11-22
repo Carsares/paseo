@@ -4,11 +4,12 @@ import {
   WORKSPACE_ROLE_LABEL,
   WORKSPACE_MAIN_ROLE,
 } from "@getpaseo/protocol/agent-labels";
-import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pino from "pino";
 import { expect, test } from "vitest";
+import { createAntigravityProvider } from "../../../../../plugins/antigravity-provider/server/provider.js";
 import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
 import { createPersistedWorkspaceRecord } from "../workspace-registry.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
@@ -16,8 +17,254 @@ import { AgentManager } from "./agent-manager.js";
 import { formatAgentMessage } from "./agent-messages/envelope.js";
 import type { AgentStreamEvent, AgentTimelineItem } from "./agent-sdk-types.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
+import { PluginAgentClientRegistry } from "./plugin-provider.js";
 import { sliceTimelineRowsAtBoundary } from "./timeline-prefix-store.js";
 import { summarizeWorkspaceAgents } from "./workspace-agents-summary.js";
+
+test.each(["legacy", "scoped"] as const)(
+  "retains independent Antigravity protocol messages in chat and cold summary with a %s prefix",
+  async (prefixFormat) => {
+    const cwd = await mkdtemp(join(tmpdir(), "antigravity-protocol-history-"));
+    const logger = pino({ level: "silent" });
+    const storage = new AgentStorage(join(cwd, "agents"), logger);
+    const providers = new PluginAgentClientRegistry(logger);
+    const executable = join(cwd, "agy.cjs");
+    const provider = createAntigravityProvider();
+    providers.replace([
+      {
+        ...provider,
+        command: [process.execPath, executable],
+        connect: (options) =>
+          provider.connect({
+            ...options,
+            launch: options.launch && {
+              ...options.launch,
+              env: { ...options.launch.env, HOME: cwd },
+            },
+          }),
+      },
+    ]);
+    const newManager = () =>
+      new AgentManager({
+        clients: providers.clients(),
+        providerDefinitions: providers.definitions(),
+        registry: storage,
+        logger,
+      });
+    const original = newManager();
+    const manager = newManager();
+    const reopened = newManager();
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    const workspace = createPersistedWorkspaceRecord({
+      workspaceId: "wks_1234567890abcdef",
+      projectId: "prj_1234567890abcdef",
+      cwd,
+      kind: "directory",
+      displayName: "Antigravity",
+      createdAt,
+      updatedAt: createdAt,
+    });
+    const { workspaceId } = workspace;
+    const loadChat = async (agentManager: AgentManager, agentId: string) => {
+      await ensureAgentLoaded(agentId, {
+        agentManager,
+        agentStorage: storage,
+        logger,
+        purpose: "history",
+      });
+      return agentManager.fetchTimeline(agentId, { limit: 0 });
+    };
+    const sourceId = "00000000-0000-4000-8000-000000000101";
+    const targetId = "00000000-0000-4000-8000-000000000102";
+    try {
+      // Only the external command is substituted. Both readers use Antigravity's
+      // actual ACP connection, plugin bridge and timeline loading paths.
+      await writeFile(
+        executable,
+        `
+        const { createInterface } = require("node:readline");
+        const { appendFileSync } = require("node:fs");
+        createInterface({ input: process.stdin }).on("line", (line) => {
+          const { id, method, params } = JSON.parse(line);
+          if (method === "initialize") {
+            send({ id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
+            return;
+          }
+          if (method === "session/load") {
+            const source = params.sessionId === "source-native";
+            appendFileSync("replay-processes.log", JSON.stringify({ pid: process.pid, source }) + "\\n");
+            const update = (update) => send({ method: "session/update", params: { sessionId: params.sessionId, update } });
+            const user = (text) => update({ sessionUpdate: "user_message_chunk", content: { type: "text", text } });
+            const reply = (text, messageId) => update({ sessionUpdate: "agent_message_chunk", messageId, content: { type: "text", text } });
+            user(source ? "Source prompt." : "Target prompt.");
+            reply(source ? "Source reply." : "Target reply.");
+            user("Continue.");
+            reply("Do");
+            reply("ne.");
+            if (source) reply("Source boundary.", "native-boundary");
+            update({ sessionUpdate: "available_commands_update", availableCommands: [] });
+            send({ id, result: { modes: { currentModeId: "default", availableModes: [{ id: "default", name: "Default" }] } } });
+            return;
+          }
+          if (method === "session/prompt") {
+            for (const text of ["Do", "ne."]) {
+              send({ method: "session/update", params: { sessionId: params.sessionId, update: {
+                sessionUpdate: "agent_message_chunk", content: { type: "text", text },
+              } } });
+            }
+            send({ id, result: { stopReason: "end_turn" } });
+            return;
+          }
+          send({ id, result: {} });
+        });
+        function send(message) { process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n"); }
+      `,
+      );
+      for (const [id, nativeId] of [
+        [sourceId, "source-native"],
+        [targetId, "target-native"],
+      ]) {
+        await storage.upsert({
+          id,
+          provider: "antigravity",
+          cwd,
+          workspaceId,
+          labels: {},
+          metadata: {},
+          lastStatus: "closed",
+          createdAt,
+          updatedAt: createdAt,
+          persistence: {
+            provider: "antigravity",
+            sessionId: `plugin:${JSON.stringify({ version: 1, data: { sessionId: nativeId } })}`,
+          },
+        });
+      }
+      const source = await loadChat(original, sourceId);
+      const target = await loadChat(original, targetId);
+      const sourceRows = sliceTimelineRowsAtBoundary(source.rows, {
+        boundaryMessageId: "native-boundary",
+      });
+      const targetFirstReply = target.rows[1]?.item;
+      if (targetFirstReply?.type !== "assistant_message" || !targetFirstReply.messageId) {
+        throw new Error("Target's first assistant reply must be addressable");
+      }
+      const targetRows = sliceTimelineRowsAtBoundary(target.rows, {
+        boundaryMessageId: targetFirstReply.messageId,
+      });
+      const prefixRows = [
+        ...sourceRows.map(({ item, timestamp }, index) => ({
+          seq: index + 1,
+          timestamp,
+          item:
+            prefixFormat === "legacy" && (index === 2 || index === 3)
+              ? {
+                  ...item,
+                  messageId: index === 2 ? "user_message_chunk:3" : "agent_message_chunk:4",
+                }
+              : item,
+        })),
+        ...targetRows.map(({ item, timestamp }, index) => ({
+          seq: sourceRows.length + index + 1,
+          timestamp,
+          item,
+        })),
+      ];
+      await storage.timelinePrefixes.save(targetId, { version: 1, rows: prefixRows });
+
+      const summary = await summarizeWorkspaceAgents({
+        workspaceId,
+        agentManager: manager,
+        agentStorage: storage,
+        workspaceRegistry: { get: async () => workspace },
+        logger,
+      });
+      expect.soft(summary.entries.find(({ agentId }) => agentId === targetId)).toMatchObject({
+        firstUserPrompt: "Source prompt.",
+        lastAssistantSummary: "Done.",
+      });
+      expect(manager.getAgent(targetId)).toBeNull();
+      const coldItems = await manager.readTimelineForSummary(targetId, workspaceId);
+      const chat = await loadChat(manager, targetId);
+      const expected = [
+        ...prefixRows.map(({ item }) => item),
+        ...target.rows.slice(2).map(({ item }) => item),
+      ];
+      expect.soft(coldItems).toEqual(expected);
+      expect.soft(chat.rows.map(({ item }) => item)).toEqual(expected);
+      expect(chat.rows.map(({ item }) => ("text" in item ? item.text : item.type))).toEqual([
+        "Source prompt.",
+        "Source reply.",
+        "Continue.",
+        "Done.",
+        "Source boundary.",
+        "Target prompt.",
+        "Target reply.",
+        "Continue.",
+        "Done.",
+      ]);
+      const earlierReplies = chat.rows
+        .map(({ item }) => item)
+        .filter((item) => item.type === "assistant_message" && item.text === "Done.");
+      expect(earlierReplies).toHaveLength(2);
+      expect(earlierReplies[0]?.messageId).not.toBe(earlierReplies[1]?.messageId);
+      for (const item of earlierReplies) {
+        const located = sliceTimelineRowsAtBoundary(chat.rows, {
+          boundaryMessageId: item.messageId!,
+        });
+        expect(located.at(-1)?.item).toEqual(item);
+      }
+
+      if (prefixFormat === "scoped") {
+        const withSameSourceReply = [
+          ...prefixRows,
+          ...target.rows.slice(2).map(({ item, timestamp }, index) => ({
+            seq: prefixRows.length + index + 1,
+            timestamp,
+            item,
+          })),
+        ];
+        await storage.timelinePrefixes.save(targetId, { version: 1, rows: withSameSourceReply });
+        expect(await reopened.readTimelineForSummary(targetId, workspaceId)).toEqual(expected);
+
+        // The cold summary releases its ACP process before interactive chat opens.
+        const replayProcesses = (await readFile(join(cwd, "replay-processes.log"), "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as { pid: number; source: boolean });
+        const reader = replayProcesses.at(-1)!;
+        expect(reader.source).toBe(false);
+        expect(() => process.kill(reader.pid, 0)).toThrow(
+          expect.objectContaining({ code: "ESRCH" }),
+        );
+        expect((await loadChat(reopened, targetId)).rows.map(({ item }) => item)).toEqual(expected);
+        await reopened.runAgent(targetId, "Run it again.", { clientMessageId: "live-prompt" });
+        const liveRows = reopened.fetchTimeline(targetId, { limit: 0 }).rows;
+        expect(liveRows.slice(0, expected.length).map(({ item }) => item)).toEqual(expected);
+        expect(liveRows.slice(expected.length).map(({ item }) => item)).toEqual([
+          {
+            type: "user_message",
+            text: "Run it again.",
+            messageId: "live-prompt",
+            clientMessageId: "live-prompt",
+          },
+          {
+            type: "assistant_message",
+            text: "Done.",
+            messageId: expect.stringMatching(/^agent_message_chunk:\d+$/),
+          },
+        ]);
+      }
+    } finally {
+      for (const instance of [original, manager, reopened]) {
+        await Promise.all(instance.listAgents().map(({ id }) => instance.closeAgent(id)));
+        await instance.flush();
+      }
+      await providers.shutdown();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  },
+);
 
 test("summarizes only the selected workspace and releases successful and failed cold readers", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "workspace-summary-"));
