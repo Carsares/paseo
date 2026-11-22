@@ -8,7 +8,7 @@ import {
   applyMutableProviderConfigToOverrides,
   toWireDaemonConfig,
 } from "./daemon-config-store.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, resolveReloadableConfig } from "./config.js";
 import { loadPersistedConfig } from "./persisted-config.js";
 import { readSpeechSettings } from "./speech/speech-settings.js";
 import type { PersistedConfig } from "./persisted-config.js";
@@ -39,6 +39,8 @@ function reloadableConfig(
     enableTerminalAgentHooks: daemon.enableTerminalAgentHooks ?? false,
     idleRuntimeCleanup: agents.idleRuntimeCleanup !== false,
     appendSystemPrompt: daemon.appendSystemPrompt ?? "",
+    mainControlAppendSystemPrompt: resolveReloadableConfig(persisted, { env: {} })
+      .mainControlAppendSystemPrompt,
     terminalProfiles: daemon.terminalProfiles,
     agentProfiles: daemon.agentProfiles,
     cors: { allowedOrigins: [] },
@@ -1399,6 +1401,41 @@ describe("DaemonConfigStore reload", () => {
       appendSystemPrompt: "first",
       browserTools: { enabled: true },
     });
+  });
+
+  test("saves and reloads the Main Control prompt independently, including an empty value", async () => {
+    const { paseoHome, store } = createReloadableStore({
+      initialPersisted: { daemon: { appendSystemPrompt: "General instructions" } },
+    });
+    expect(loadConfig(paseoHome, { env: {} }).mainControlAppendSystemPrompt).toBe("");
+    const changes: unknown[] = [];
+    store.onFieldChange("mainControlAppendSystemPrompt", (value) => changes.push(value));
+
+    await store.patch({ mainControlAppendSystemPrompt: "" });
+    expect(loadPersistedConfig(paseoHome).daemon?.mainControlAppendSystemPrompt).toBe("");
+    await store.patch({ mainControlAppendSystemPrompt: "First line\nSecond line" });
+    expect(loadConfig(paseoHome, { env: {} }).mainControlAppendSystemPrompt).toBe(
+      "First line\nSecond line",
+    );
+    expect(toWireDaemonConfig(store.get()).mainControlAppendSystemPrompt).toBe(
+      "First line\nSecond line",
+    );
+    await store.patch({ mainControlAppendSystemPrompt: "" });
+    expect(loadPersistedConfig(paseoHome).daemon).toMatchObject({
+      appendSystemPrompt: "General instructions",
+      mainControlAppendSystemPrompt: "",
+    });
+
+    const persisted = loadPersistedConfig(paseoHome);
+    writeConfig(paseoHome, {
+      ...persisted,
+      daemon: { ...persisted.daemon, mainControlAppendSystemPrompt: "Config file edit" },
+    });
+    await expect(store.reload()).resolves.toMatchObject({
+      appliedPaths: ["daemon.mainControlAppendSystemPrompt"],
+      restartRequiredPaths: [],
+    });
+    expect(changes).toEqual(["First line\nSecond line", "", "Config file edit"]);
   });
 
   test("applies mutable edits and reports startup-only edits", async () => {

@@ -3032,7 +3032,13 @@ export const ar: TranslationResources = {
           accessibilityLabel: "حقن أدوات Paseo",
           updateFailed: "تعذر تحديث أدوات Paseo.",
         },
+        mainControlSystemPrompt: {
+          title: "موجه النظام للتحكم الرئيسي",
+          hint: "يُطبَّق عندما تتولى جلسة دور التحكم الرئيسي. لا تتأثر جلسات التحكم الرئيسي الحالية ولا الوكلاء الفرعيون.",
+          sheetTitle: "تحرير موجه النظام للتحكم الرئيسي",
+        },
         systemPrompt: {
+          loadFailed: "تعذّر تحميل إعدادات المضيف.",
           title: "موجه النظام",
           hint: "إضافة موجه النظام إلى كافة الوكلاء",
           sheetTitle: "إلحاق موجه النظام",

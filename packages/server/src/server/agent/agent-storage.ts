@@ -58,6 +58,7 @@ const RAW_STORED_AGENT_SCHEMA = z.object({
   lastUserMessageAt: z.string().nullable().optional(),
   title: z.string().nullable().optional(),
   labels: z.record(z.string(), z.string()).default({}),
+  mainControlSystemPrompt: z.string().optional(),
   metadata: z.record(z.string(), z.custom<JsonValue>()).default({}),
   lastStatus: AgentStatusSchema.default("closed"),
   resumeOnStartup: z.boolean().optional(),
@@ -439,6 +440,7 @@ export class AgentStorage {
         createdAt: existing?.createdAt,
         internal: hasInternalOverride ? internalOverride : (agent.internal ?? existing?.internal),
       });
+      record.mainControlSystemPrompt = agent.mainControlSystemPrompt;
 
       // Preserve soft-delete/archive status across snapshot flushes. The
       // projection runs inside the per-agent write queue so it cannot commit a

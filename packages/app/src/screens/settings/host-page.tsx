@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Alert, Pressable, Text, View } from "react-native";
 import { StyleSheet, useUnistyles, withUnistyles } from "react-native-unistyles";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type { TerminalProfile } from "@getpaseo/protocol/messages";
 import {
   getTerminalProfileIcon,
@@ -24,11 +25,12 @@ import {
 import { AgentProfilesSection } from "@/agent-profiles";
 import { AgentSkillsSection } from "@/agent-skills";
 import { AdaptiveModalSheet, type SheetHeader } from "@/components/adaptive-modal-sheet";
-import { SettingsTextAreaCard } from "@/components/settings-textarea";
 import { Alert as InlineAlert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/status-badge";
 import { Switch } from "@/components/ui/switch";
+import { EditingTextInput, type EditingTextInputHandle } from "@/components/ui/text-input";
+import { daemonConfigQueryKey } from "@/data/daemon-config";
 import {
   ProfileDraft,
   TerminalProfileEditModal,
@@ -40,6 +42,7 @@ import { useDesktopSettings } from "@/desktop/settings/desktop-settings";
 import { PairDeviceModal } from "@/desktop/components/pair-device-modal";
 import { useDaemonConfig } from "@/hooks/use-daemon-config";
 import { useIsLocalDaemon } from "@/hooks/use-is-local-daemon";
+import { useHostFeature } from "@/runtime/host-features";
 import {
   getHostRuntimeStore,
   isHostRuntimeConnected,
@@ -73,6 +76,9 @@ import { restartDaemonFromSettings, updateDaemonFromSettings } from "./daemon-li
 
 const ThemedRestart = withUnistyles(RotateCw);
 const ThemedUpdate = withUnistyles(ArrowUpToLine);
+const ThemedSystemPromptInput = withUnistyles(EditingTextInput, (theme) => ({
+  placeholderTextColor: theme.colors.foregroundMuted,
+}));
 const lifecycleIconProps = (theme: Theme) => ({
   size: theme.iconSize.sm,
   color: theme.colors.foreground,
@@ -294,7 +300,7 @@ export function HostAgentsPage({ serverId }: { serverId: string }) {
         <SettingsSection title={t("settings.hostSections.agents")}>
           <PaseoToolsCard serverId={serverId} />
           <BrowserToolsOptInCard serverId={serverId} />
-          <AppendSystemPromptCard serverId={serverId} />
+          <HostSystemPromptCards key={serverId} serverId={serverId} />
           <RestartRecoveryCard serverId={serverId} />
           <IdleRuntimeCleanupCard serverId={serverId} />
         </SettingsSection>
@@ -996,108 +1002,175 @@ function EnableTerminalAgentHooksCard({ serverId }: { serverId: string }) {
   );
 }
 
-function AppendSystemPromptCard({ serverId }: { serverId: string }) {
+function HostSystemPromptCards({ serverId }: { serverId: string }) {
   const { t } = useTranslation();
-  const isConnected = useHostRuntimeIsConnected(serverId);
-  const { config, patchConfig } = useDaemonConfig(serverId);
-  const persistedPrompt = config?.appendSystemPrompt ?? "";
-  const [draft, setDraft] = useState(persistedPrompt);
-  const [isEditing, setIsEditing] = useState(false);
-  const [isSaving, setIsSaving] = useState(false);
-  const header = useMemo<SheetHeader>(
-    () => ({ title: t("settings.host.orchestration.systemPrompt.sheetTitle") }),
-    [t],
-  );
-
-  useEffect(() => {
-    setDraft(persistedPrompt);
-  }, [persistedPrompt]);
-
-  const hasChanges = draft !== persistedPrompt;
-
-  const handleOpen = useCallback(() => {
-    setDraft(persistedPrompt);
-    setIsEditing(true);
-  }, [persistedPrompt]);
-
-  const handleClose = useCallback(() => {
-    if (isSaving) return;
-    setDraft(persistedPrompt);
-    setIsEditing(false);
-  }, [isSaving, persistedPrompt]);
-
-  const handleSave = useCallback(() => {
-    setIsSaving(true);
-    void patchConfig({ appendSystemPrompt: draft })
-      .then(() => {
-        setIsEditing(false);
-        return;
-      })
-      .catch((error) => {
-        console.error("[HostPage] Failed to save append system prompt", error);
-      })
-      .finally(() => setIsSaving(false));
-  }, [draft, patchConfig]);
-
-  const handleReset = useCallback(() => {
-    setDraft(persistedPrompt);
-  }, [persistedPrompt]);
-
-  if (!isConnected) return null;
+  const { config, isLoading, patchConfig } = useDaemonConfig(serverId);
+  const queryClient = useQueryClient();
+  // COMPAT(mainControlAppendSystemPrompt): added in v0.17.0, remove after 2027-05-22 once daemon floor >= v0.17.0.
+  const supportsMainControlPrompt = useHostFeature(serverId, "mainControlAppendSystemPrompt");
+  const retryLoad = useCallback(() => {
+    void queryClient.refetchQueries({ queryKey: daemonConfigQueryKey(serverId), exact: true });
+  }, [queryClient, serverId]);
 
   return (
     <>
-      <View style={settingsStyles.card} testID="host-page-append-system-prompt-card">
+      <SystemPromptCard
+        configField="appendSystemPrompt"
+        persistedPrompt={config ? (config.appendSystemPrompt ?? "") : null}
+        patchConfig={patchConfig}
+      />
+      {supportsMainControlPrompt ? (
+        <SystemPromptCard
+          configField="mainControlAppendSystemPrompt"
+          persistedPrompt={config ? (config.mainControlAppendSystemPrompt ?? "") : null}
+          patchConfig={patchConfig}
+        />
+      ) : null}
+      {config === null && !isLoading ? (
+        <InlineAlert
+          size="sm"
+          variant="error"
+          title={t("settings.host.orchestration.systemPrompt.loadFailed")}
+        >
+          <Button size="sm" variant="outline" onPress={retryLoad}>
+            {t("common.actions.retry")}
+          </Button>
+        </InlineAlert>
+      ) : null}
+    </>
+  );
+}
+
+interface SystemPromptEditor {
+  initialPrompt: string;
+  draft: string;
+}
+
+function SystemPromptCard({
+  configField,
+  persistedPrompt,
+  patchConfig,
+}: {
+  configField: "appendSystemPrompt" | "mainControlAppendSystemPrompt";
+  persistedPrompt: string | null;
+  patchConfig: ReturnType<typeof useDaemonConfig>["patchConfig"];
+}) {
+  const { t } = useTranslation();
+  const [editor, setEditor] = useState<SystemPromptEditor | null>(null);
+  const inputRef = useRef<EditingTextInputHandle>(null);
+  const isMainControl = configField === "mainControlAppendSystemPrompt";
+  const copy = isMainControl
+    ? "settings.host.orchestration.mainControlSystemPrompt"
+    : "settings.host.orchestration.systemPrompt";
+  const testId = isMainControl
+    ? "host-page-main-control-system-prompt"
+    : "host-page-append-system-prompt";
+  const sheetTitle = t(`${copy}.sheetTitle`);
+  const header = useMemo<SheetHeader>(() => ({ title: sheetTitle }), [sheetTitle]);
+  const inputLabel = isMainControl
+    ? sheetTitle
+    : t("settings.host.orchestration.systemPrompt.accessibilityLabel");
+  const hasChanges = editor !== null && editor.draft !== editor.initialPrompt;
+  const { mutate, reset, isPending, isError } = useMutation({
+    mutationFn: async (prompt: string) => {
+      const saved = await patchConfig({ [configField]: prompt });
+      if (!saved) throw new Error(t("workspace.terminal.hostDisconnected"));
+      return saved;
+    },
+    onSuccess: (saved, submittedPrompt) => {
+      setEditor((current) =>
+        current && current.draft !== submittedPrompt
+          ? { ...current, initialPrompt: saved[configField] ?? "" }
+          : null,
+      );
+    },
+  });
+
+  const handleOpen = useCallback(() => {
+    if (persistedPrompt === null) return;
+    reset();
+    setEditor({ initialPrompt: persistedPrompt, draft: persistedPrompt });
+  }, [persistedPrompt, reset]);
+
+  const handleClose = useCallback(() => {
+    if (isPending) return;
+    setEditor(null);
+  }, [isPending]);
+
+  const handleReset = useCallback(() => {
+    if (persistedPrompt === null || isPending) return;
+    inputRef.current?.replaceText(persistedPrompt);
+    setEditor({ initialPrompt: persistedPrompt, draft: persistedPrompt });
+    reset();
+  }, [isPending, persistedPrompt, reset]);
+
+  const handleDraftChange = useCallback((draft: string) => {
+    setEditor((current) => current && { ...current, draft });
+  }, []);
+
+  const draft = editor?.draft;
+  const handleSave = useCallback(() => {
+    if (draft !== undefined && hasChanges && !isPending) mutate(draft);
+  }, [draft, hasChanges, isPending, mutate]);
+
+  return (
+    <>
+      <View style={settingsStyles.card} testID={`${testId}-card`}>
         <View style={settingsStyles.row}>
           <View style={settingsStyles.rowContent}>
-            <Text style={settingsStyles.rowTitle}>
-              {t("settings.host.orchestration.systemPrompt.title")}
-            </Text>
-            <Text style={settingsStyles.rowHint}>
-              {t("settings.host.orchestration.systemPrompt.hint")}
-            </Text>
+            <Text style={settingsStyles.rowTitle}>{t(`${copy}.title`)}</Text>
+            <Text style={settingsStyles.rowHint}>{t(`${copy}.hint`)}</Text>
           </View>
           <Button
             variant="outline"
             onPress={handleOpen}
-            testID="host-page-append-system-prompt-edit"
+            disabled={persistedPrompt === null}
+            testID={`${testId}-edit`}
           >
             {t("settings.host.orchestration.systemPrompt.edit")}
           </Button>
         </View>
       </View>
 
-      {isEditing ? (
+      {editor ? (
         <AdaptiveModalSheet
           header={header}
           visible
           onClose={handleClose}
-          testID="host-page-append-system-prompt-sheet"
+          testID={`${testId}-sheet`}
           desktopMaxWidth={560}
         >
-          <SettingsTextAreaCard
-            testID="host-page-append-system-prompt-input"
-            accessibilityLabel={t("settings.host.orchestration.systemPrompt.accessibilityLabel")}
-            value={draft}
-            onChangeText={setDraft}
-            placeholder={t("settings.host.orchestration.systemPrompt.placeholder")}
-          />
+          <View style={settingsStyles.card}>
+            <ThemedSystemPromptInput
+              ref={inputRef}
+              testID={`${testId}-input`}
+              accessibilityLabel={inputLabel}
+              initialValue={editor.draft}
+              multiline
+              onChangeText={handleDraftChange}
+              placeholder={t("settings.host.orchestration.systemPrompt.placeholder")}
+              style={styles.systemPromptInput}
+            />
+          </View>
+          {isError ? (
+            <InlineAlert size="sm" variant="error" title={t("common.errors.unableToSave")} />
+          ) : null}
           <View style={styles.appendPromptActions}>
             <Button
               variant="ghost"
               onPress={handleReset}
-              disabled={!hasChanges || isSaving}
-              testID="host-page-append-system-prompt-reset"
+              disabled={editor.draft === persistedPrompt || persistedPrompt === null || isPending}
+              testID={`${testId}-reset`}
             >
               {t("settings.host.orchestration.systemPrompt.reset")}
             </Button>
             <Button
               variant="default"
               onPress={handleSave}
-              disabled={!hasChanges || isSaving}
-              testID="host-page-append-system-prompt-save"
+              disabled={!hasChanges || isPending}
+              testID={`${testId}-save`}
             >
-              {isSaving
+              {isPending
                 ? t("settings.host.orchestration.systemPrompt.saving")
                 : t("settings.host.orchestration.systemPrompt.save")}
             </Button>
@@ -1762,6 +1835,14 @@ const styles = StyleSheet.create((theme) => ({
     flexDirection: "row",
     justifyContent: "flex-end",
     gap: theme.spacing[2],
+  },
+  systemPromptInput: {
+    color: theme.colors.foreground,
+    fontSize: theme.fontSize.base,
+    paddingVertical: theme.spacing[3],
+    paddingHorizontal: theme.spacing[4],
+    minHeight: 96,
+    textAlignVertical: "top",
   },
   emptyCard: {
     padding: theme.spacing[4],

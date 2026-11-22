@@ -296,6 +296,7 @@ interface NormalizeConfigOptions {
 
 interface PrepareSessionConfigOptions extends NormalizeConfigOptions {
   labels?: Record<string, string>;
+  mainControlSystemPrompt?: string;
 }
 
 interface AgentRelationshipUpdate {
@@ -309,6 +310,13 @@ interface MainControlRoleChange {
   enabled: boolean;
   workspaceId: string | undefined;
   previousMainIds: string[];
+}
+
+interface MainControlRoleUpdate {
+  labels: Record<string, string>;
+  modeId?: string;
+  enabled: boolean;
+  mainControlSystemPrompt?: string;
 }
 
 interface AgentParentUpdate extends AgentRelationshipUpdate {
@@ -563,6 +571,7 @@ export interface AgentManagerOptions {
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   resolvePaseoToolPolicy?: (provider: AgentProvider) => ProviderPaseoToolsPolicy | undefined;
   appendSystemPrompt?: string;
+  mainControlAppendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
   rescueTimeouts?: AgentManagerRescueTimeouts;
   beforeSteerUnavailableFallback?: (input: {
@@ -643,6 +652,7 @@ interface HandleStreamEventOptions {
 
 interface ManagedAgentBase {
   id: string;
+  mainControlSystemPrompt?: string;
   provider: AgentProvider;
   providerAdapter?: AgentProvider;
   cwd: string;
@@ -1220,6 +1230,7 @@ export class AgentManager {
     provider: AgentProvider,
   ) => ProviderPaseoToolsPolicy | undefined;
   private appendSystemPrompt: string;
+  private mainControlAppendSystemPrompt: string;
   private onAgentAttention?: AgentAttentionCallback;
   private onAgentArchived?: AgentArchivedCallback;
   private onAgentRunAccepted?: AgentRunAcceptedCallback;
@@ -1247,6 +1258,7 @@ export class AgentManager {
     this.configurePaseoTools(options);
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
+    this.mainControlAppendSystemPrompt = options.mainControlAppendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
     this.rescueTimeouts = {
       reloadSessionCloseMs:
@@ -1478,6 +1490,18 @@ export class AgentManager {
 
   setAppendSystemPrompt(prompt: string | null | undefined): void {
     this.appendSystemPrompt = prompt ?? "";
+  }
+
+  setMainControlAppendSystemPrompt(prompt: string): void {
+    this.mainControlAppendSystemPrompt = prompt;
+  }
+
+  private snapshotMainControlPrompt(
+    labels: Record<string, string> | undefined,
+  ): string | undefined {
+    return isMainControlAgentLabels(labels) && !getParentAgentIdFromLabels(labels)
+      ? this.mainControlAppendSystemPrompt
+      : undefined;
   }
 
   public getMetricsSnapshot(): AgentMetricsSnapshot {
@@ -2067,7 +2091,10 @@ export class AgentManager {
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
     const createInLifecycleLane = (resolvedOptions: CreateAgentOptions = options) =>
       this.runLifecycleMutation(resolvedAgentId, () =>
-        this.createAgentInternal(config, resolvedAgentId, resolvedOptions),
+        this.createAgentInternal(config, resolvedAgentId, {
+          ...resolvedOptions,
+          mainControlSystemPrompt: this.snapshotMainControlPrompt(resolvedOptions.labels),
+        }),
       );
     const parentId = this.localHierarchyParentId(options.labels);
     return this.trackAgentRegistrationOperation(
@@ -2123,6 +2150,7 @@ export class AgentManager {
           resolvedAgentId,
           {
             labels: record.labels,
+            mainControlSystemPrompt: record.mainControlSystemPrompt,
             metadata: record.metadata,
             workspaceId: record.workspaceId,
             owner: record.owner,
@@ -2138,7 +2166,7 @@ export class AgentManager {
   private async createAgentInternal(
     config: AgentSessionConfig,
     resolvedAgentId: string,
-    options: CreateAgentOptions,
+    options: CreateAgentOptions & Pick<StoredAgentRecord, "mainControlSystemPrompt">,
     retainedPrefix?: PersistedTimelinePrefix | null,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
@@ -2168,7 +2196,11 @@ export class AgentManager {
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       config,
       resolvedAgentId,
-      { env: options.env, labels: options.labels },
+      {
+        env: options.env,
+        labels: options.labels,
+        mainControlSystemPrompt: options.mainControlSystemPrompt,
+      },
     );
     this.requireEnabledProvider(storedConfig.provider);
     const client = await this.requireAvailableClient({
@@ -2209,6 +2241,7 @@ export class AgentManager {
     const agent = await this.registerSession(session, storedConfig, resolvedAgentId, {
       launchedOptions,
       labels: options.labels,
+      mainControlSystemPrompt: options.mainControlSystemPrompt,
       metadata: options.metadata,
       initialTitle: options.initialTitle,
       workspaceId: options.workspaceId,
@@ -2345,12 +2378,17 @@ export class AgentManager {
     const purpose = await resolveResumePurpose(record, resumeOptions?.purpose, mergedConfig.cwd);
     const currentResumeOptions = { purpose } satisfies AgentResumeSessionOptions;
 
-    const launchEnv = record?.launchEnv;
+    const { launchEnv, mainControlSystemPrompt } = record ?? {};
     const workspaceId = resolveResumeWorkspaceId({ options, record });
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       mergedConfig,
       resolvedAgentId,
-      { purpose, env: launchEnv, labels: record?.labels ?? options?.labels },
+      {
+        purpose,
+        env: launchEnv,
+        labels: record?.labels ?? options?.labels,
+        mainControlSystemPrompt,
+      },
     );
     const client = this.requireClient(handle.provider);
     const available = await client.isAvailable();
@@ -2398,6 +2436,7 @@ export class AgentManager {
         : {}),
       workspaceId,
       launchEnv,
+      mainControlSystemPrompt,
       persistence:
         purpose === "interactive" && session.persistenceUpdatedOnResume
           ? (session.describePersistence() ?? handle)
@@ -2432,13 +2471,14 @@ export class AgentManager {
       throw new Error(`Provider '${input.provider}' does not support importing sessions`);
     }
 
+    const mainControlSystemPrompt = this.snapshotMainControlPrompt(input.labels);
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       {
         provider: input.provider,
         cwd: input.cwd,
       },
       resolvedAgentId,
-      { resolveDefaultModel: false, labels: input.labels },
+      { resolveDefaultModel: false, labels: input.labels, mainControlSystemPrompt },
     );
     this.paseoToolPolicies.set(resolvedAgentId, paseoToolPolicy);
     const launchContext = await this.buildLaunchContext(
@@ -2486,6 +2526,7 @@ export class AgentManager {
 
       handedToRegistration = true;
       const agent = await this.registerSession(imported.session, importedConfig, resolvedAgentId, {
+        mainControlSystemPrompt,
         launchedOptions,
         labels: input.labels,
         workspaceId: input.workspaceId,
@@ -2531,17 +2572,17 @@ export class AgentManager {
     overrides?: Partial<AgentSessionConfig>,
     {
       rehydrateFromDisk = false,
-      hierarchyLabels,
+      mainControlRole,
       refreshHierarchy = false,
     }: {
       rehydrateFromDisk?: boolean;
-      hierarchyLabels?: Record<string, string>;
+      mainControlRole?: MainControlRoleUpdate;
       refreshHierarchy?: boolean;
     } = {},
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     let existing = this.requireSessionAgent(agentId);
-    if (this.shouldCancelRunForReload(existing, { hierarchyLabels, refreshHierarchy })) {
+    if (this.shouldCancelRunForReload(existing, { mainControlRole, refreshHierarchy })) {
       await this.cancelAgentRunBefore(agentId, "reload");
       existing = this.requireSessionAgent(agentId);
     }
@@ -2557,11 +2598,11 @@ export class AgentManager {
       ...overrides,
       provider,
     } as AgentSessionConfig;
-    const labels = hierarchyLabels ?? existing.labels;
+    const { labels, mainControlSystemPrompt } = mainControlRole ?? existing;
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       refreshConfig,
       agentId,
-      { env: existing.launchEnv, labels },
+      { env: existing.launchEnv, labels, mainControlSystemPrompt },
     );
     const hadPreviousPaseoToolPolicy = this.paseoToolPolicies.has(agentId);
     const previousPaseoToolPolicy = this.paseoToolPolicies.get(agentId);
@@ -2599,7 +2640,7 @@ export class AgentManager {
       this.cancelRunningProviderSubagents(agentId);
       this.clearProviderBackgroundWork(agentId);
       closedExisting = this.prepareAgentForClosure(existing, "agent reloaded");
-      this.applyReloadedHierarchy(closedExisting, storedConfig, hierarchyLabels);
+      this.applyReloadedHierarchy(closedExisting, storedConfig, mainControlRole);
       await this.persistSnapshot(closedExisting);
       this.assertAcceptingAgentRegistrations();
 
@@ -2628,6 +2669,7 @@ export class AgentManager {
       return this.registerSession(session, storedConfig, agentId, {
         launchedOptions,
         labels,
+        mainControlSystemPrompt,
         metadata: existing.metadata,
         workspaceId: existing.workspaceId,
         owner: existing.owner,
@@ -2661,7 +2703,7 @@ export class AgentManager {
           hadPreviousPaseoToolPolicy,
           previousPaseoToolPolicy,
           closedExisting,
-          hierarchyLabels,
+          mainControlRole,
         );
       }
     }
@@ -2670,10 +2712,11 @@ export class AgentManager {
   private applyReloadedHierarchy(
     agent: ManagedAgentClosed,
     config: AgentSessionConfig,
-    labels?: Record<string, string>,
+    role?: MainControlRoleUpdate,
   ): void {
-    if (!labels) return;
-    agent.labels = labels;
+    if (!role) return;
+    agent.labels = role.labels;
+    agent.mainControlSystemPrompt = role.mainControlSystemPrompt;
     agent.config = config;
     agent.currentModeId = config.modeId ?? null;
     if (agent.runtimeInfo)
@@ -2683,9 +2726,9 @@ export class AgentManager {
 
   private shouldCancelRunForReload(
     agent: ManagedAgent,
-    options: { hierarchyLabels?: Record<string, string>; refreshHierarchy: boolean },
+    options: { mainControlRole?: MainControlRoleUpdate; refreshHierarchy: boolean },
   ): boolean {
-    if (options.hierarchyLabels) {
+    if (options.mainControlRole) {
       this.assertMainControlAgentIdle(agent.id);
       return false;
     }
@@ -2704,9 +2747,9 @@ export class AgentManager {
     hadPreviousPolicy: boolean,
     previousPolicy: ProviderPaseoToolsPolicy | undefined,
     closedExisting?: ManagedAgentClosed,
-    hierarchyLabels?: Record<string, string>,
+    mainControlRole?: MainControlRoleUpdate,
   ): Promise<void> {
-    if (hadPreviousPolicy && !(closedExisting && hierarchyLabels)) {
+    if (hadPreviousPolicy && !(closedExisting && mainControlRole)) {
       this.paseoToolPolicies.set(agentId, previousPolicy);
     } else {
       this.paseoToolPolicies.delete(agentId);
@@ -3229,7 +3272,7 @@ export class AgentManager {
 
   private async switchAgentSession(agent: ActiveManagedAgent, input: SwitchAgentProviderInput) {
     this.assertAcceptingAgentRegistrations();
-    const { id, cwd, labels, launchEnv } = agent;
+    const { id, cwd, labels, launchEnv, mainControlSystemPrompt } = agent;
     const record = await this.registry?.get(id);
     const config: AgentSessionConfig = {
       cwd,
@@ -3250,7 +3293,7 @@ export class AgentManager {
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       config,
       id,
-      { env: launchEnv, labels },
+      { env: launchEnv, labels, mainControlSystemPrompt },
     );
     this.requireEnabledProvider(storedConfig.provider);
     const client = await this.requireAvailableClient({ provider: storedConfig.provider });
@@ -3793,6 +3836,7 @@ export class AgentManager {
         workspaceId,
         title: storedConfig.title?.trim() || "Main Session",
         labels,
+        mainControlSystemPrompt: this.mainControlAppendSystemPrompt,
         metadata: {},
         createdAt: now,
         updatedAt: now,
@@ -4055,11 +4099,11 @@ export class AgentManager {
       this.hierarchySessionUpdates.add(id);
       this.mainControlRoleUpdates.add(id);
     }
-    const demoted: string[] = [];
+    const demoted: StoredAgentRecord[] = [];
     let attemptedTargetChange = false;
     try {
       for (const previousMain of previousMains) {
-        demoted.push(previousMain.id);
+        demoted.push(previousMain);
         await this.writeMainControlRole(previousMain.id, false);
       }
       attemptedTargetChange = targetChanges;
@@ -4070,14 +4114,16 @@ export class AgentManager {
       if (handoff && !handoff.canRestore()) throw error;
       const restoreFailures: string[] = [];
       if (attemptedTargetChange) {
-        await this.writeMainControlRole(agentId, !enabled).catch((restoreError) => {
+        await this.writeMainControlRole(agentId, !enabled, targetRecord).catch((restoreError) => {
           restoreFailures.push(`role of ${agentId}: ${getErrorMessage(restoreError)}`);
         });
       }
       for (const previousMain of demoted.toReversed()) {
-        await this.writeMainControlRole(previousMain, true).catch((restoreError) => {
-          restoreFailures.push(`role of ${previousMain}: ${getErrorMessage(restoreError)}`);
-        });
+        await this.writeMainControlRole(previousMain.id, true, previousMain).catch(
+          (restoreError) => {
+            restoreFailures.push(`role of ${previousMain.id}: ${getErrorMessage(restoreError)}`);
+          },
+        );
       }
       if (restoreFailures.length) {
         throw new Error(
@@ -4128,6 +4174,7 @@ export class AgentManager {
   private async writeMainControlRole(
     agentId: string,
     enabled: boolean,
+    restore?: Pick<StoredAgentRecord, "mainControlSystemPrompt">,
   ): Promise<AgentRelationshipUpdate> {
     const registry = this.requireRegistry();
     const record = await registry.get(agentId);
@@ -4149,13 +4196,26 @@ export class AgentManager {
       currentMode,
       priorMode,
     });
+    let mainControlSystemPrompt: string | undefined;
+    if (enabled) {
+      // A rollback must restore the missing field on pre-snapshot records too.
+      mainControlSystemPrompt = restore
+        ? restore.mainControlSystemPrompt
+        : this.mainControlAppendSystemPrompt;
+    }
     if (current) {
-      return this.applyLiveMainControlRole(current, { labels, modeId, enabled });
+      return this.applyLiveMainControlRole(current, {
+        labels,
+        modeId,
+        enabled,
+        mainControlSystemPrompt,
+      });
     }
 
     const next: StoredAgentRecord = {
       ...record,
       labels,
+      mainControlSystemPrompt,
       config: { ...record.config, modeId },
       lastModeId: modeId ?? null,
       runtimeInfo: record.runtimeInfo
@@ -4189,7 +4249,7 @@ export class AgentManager {
 
   private applyLiveMainControlRole(
     current: ActiveManagedAgent,
-    role: { labels: Record<string, string>; modeId?: string; enabled: boolean },
+    role: MainControlRoleUpdate,
   ): Promise<AgentRelationshipUpdate> {
     const shouldReload =
       Boolean(current.persistence && current.capabilities.supportsSessionPersistence) &&
@@ -4201,14 +4261,11 @@ export class AgentManager {
 
   private async updateLiveMainControlRole(
     current: ActiveManagedAgent,
-    {
-      labels,
-      modeId,
-      enabled,
-    }: { labels: Record<string, string>; modeId?: string; enabled: boolean },
+    { labels, modeId, enabled, mainControlSystemPrompt }: MainControlRoleUpdate,
   ): Promise<AgentRelationshipUpdate> {
     const agentId = current.id;
     const previousLabels = current.labels;
+    const previousMainControlSystemPrompt = current.mainControlSystemPrompt;
     const previousConfig = current.config;
     const previousModeId = current.currentModeId;
     const previousRuntimeInfo = current.runtimeInfo;
@@ -4218,6 +4275,7 @@ export class AgentManager {
     const wasInPlaceSession = this.inPlaceMainControlSessions.has(current.session);
 
     current.labels = labels;
+    current.mainControlSystemPrompt = mainControlSystemPrompt;
     current.config = { ...current.config, modeId };
     current.currentModeId = modeId ?? null;
     if (current.runtimeInfo) {
@@ -4241,6 +4299,7 @@ export class AgentManager {
       await this.persistSnapshot(current);
     } catch (error) {
       current.labels = previousLabels;
+      current.mainControlSystemPrompt = previousMainControlSystemPrompt;
       current.config = previousConfig;
       current.currentModeId = previousModeId;
       current.runtimeInfo = previousRuntimeInfo;
@@ -4279,22 +4338,22 @@ export class AgentManager {
 
   private async reloadWithMainControlRole(
     agentId: string,
-    {
-      labels,
-      modeId,
-      enabled,
-    }: { labels: Record<string, string>; modeId?: string; enabled: boolean },
+    role: MainControlRoleUpdate,
   ): Promise<AgentRelationshipUpdate> {
     try {
       await this.trackAgentRegistrationOperation(
-        this.reloadAgentSessionInternal(agentId, { modeId }, { hierarchyLabels: labels }),
+        this.reloadAgentSessionInternal(
+          agentId,
+          { modeId: role.modeId },
+          { mainControlRole: role },
+        ),
       );
     } catch (error) {
       const committed = await this.requireRegistry().get(agentId);
       if (
         this.agents.has(agentId) ||
         !committed ||
-        isMainControlAgentLabels(committed.labels) !== enabled
+        isMainControlAgentLabels(committed.labels) !== role.enabled
       ) {
         throw error;
       }
@@ -5069,32 +5128,25 @@ export class AgentManager {
     if (this.agents.has(agentId)) await this.closeAgentRuntime(agentId);
     await this.syncNativeArchiveState(record.provider, record.persistence, "restore");
 
-    if (nextRecord.workspaceId && isMainControlAgentLabels(nextRecord.labels)) {
-      const hierarchy = await this.readHierarchyAgents();
-      const hasMain = [...hierarchy.values()].some(
-        (other) =>
-          other.id !== agentId &&
-          !other.archivedAt &&
-          other.workspaceId === nextRecord.workspaceId &&
-          isMainControlAgentLabels(other.labels),
-      );
-      if (hasMain) {
-        const modeId = this.resolveMainControlMode({
-          enabled: false,
-          provider: record.provider,
-          currentMode: record.lastModeId ?? record.config?.modeId,
-          priorMode: getMainPriorModeIdFromLabels(nextRecord.labels),
-        });
-        nextRecord.labels = applyRecordPatch(nextRecord.labels, {
-          [WORKSPACE_ROLE_LABEL]: null,
-          [MAIN_PRIOR_MODE_ID_LABEL]: null,
-        });
-        nextRecord.config = { ...record.config, modeId };
-        nextRecord.lastModeId = modeId ?? null;
-        if (record.runtimeInfo) {
-          nextRecord.runtimeInfo = { ...record.runtimeInfo, modeId: modeId ?? null };
-        }
+    if (await this.shouldDemoteRestoredMainControl(nextRecord)) {
+      const modeId = this.resolveMainControlMode({
+        enabled: false,
+        provider: record.provider,
+        currentMode: record.lastModeId ?? record.config?.modeId,
+        priorMode: getMainPriorModeIdFromLabels(nextRecord.labels),
+      });
+      nextRecord.labels = applyRecordPatch(nextRecord.labels, {
+        [WORKSPACE_ROLE_LABEL]: null,
+        [MAIN_PRIOR_MODE_ID_LABEL]: null,
+      });
+      nextRecord.config = { ...record.config, modeId };
+      nextRecord.lastModeId = modeId ?? null;
+      if (record.runtimeInfo) {
+        nextRecord.runtimeInfo = { ...record.runtimeInfo, modeId: modeId ?? null };
       }
+    }
+    if (!isMainControlAgentLabels(nextRecord.labels)) {
+      nextRecord.mainControlSystemPrompt = undefined;
     }
     await registry.upsert(nextRecord);
 
@@ -5105,6 +5157,20 @@ export class AgentManager {
       this.dispatchStoredAgentState(nextRecord);
     }
     return true;
+  }
+
+  private async shouldDemoteRestoredMainControl(record: StoredAgentRecord): Promise<boolean> {
+    if (!isMainControlAgentLabels(record.labels)) return false;
+    if (getParentAgentIdFromLabels(record.labels)) return true;
+    if (!record.workspaceId) return false;
+    const hierarchy = await this.readHierarchyAgents();
+    return [...hierarchy.values()].some(
+      (other) =>
+        other.id !== record.id &&
+        !other.archivedAt &&
+        other.workspaceId === record.workspaceId &&
+        isMainControlAgentLabels(other.labels),
+    );
   }
 
   async unarchiveSnapshotByHandle(handle: AgentPersistenceHandle): Promise<void> {
@@ -5407,6 +5473,7 @@ export class AgentManager {
     const hierarchy = await this.readHierarchyAgents();
     const instructions = buildHierarchyAppendSystemPrompt({
       agent,
+      mainControlSystemPrompt: agent.mainControlSystemPrompt,
       serverId: this.serverId,
       readAgent: (id) => hierarchy.get(id),
       listActiveAgents: () => hierarchy.values(),
@@ -7181,6 +7248,7 @@ export class AgentManager {
       updatedAt?: Date;
       lastUserMessageAt?: Date | null;
       labels?: Record<string, string>;
+      mainControlSystemPrompt?: string;
       metadata?: AgentMetadata;
       timeline?: AgentTimelineItem[];
       timelineRows?: AgentTimelineRow[];
@@ -7405,6 +7473,7 @@ export class AgentManager {
           updatedAt?: Date;
           lastUserMessageAt?: Date | null;
           labels?: Record<string, string>;
+          mainControlSystemPrompt?: string;
           metadata?: AgentMetadata;
           historyPrimed?: boolean;
           lastUsage?: AgentUsage;
@@ -7432,6 +7501,7 @@ export class AgentManager {
       providerAdapter: this.adapterOf(config.provider),
       cwd: config.cwd,
       workspaceId: options?.workspaceId,
+      mainControlSystemPrompt: options?.mainControlSystemPrompt,
       owner: options?.owner,
       launchEnv: options?.launchEnv,
       session,
@@ -9238,13 +9308,17 @@ export class AgentManager {
     const agent = { id: agentId, labels: options.labels };
     const readAgent = (id: string) => (id === agentId ? agent : hierarchy.get(id));
     const depth = computeAgentDepth(agentId, readAgent);
+    const adapter = this.adapterOf(storedConfig.provider);
     const hierarchyPrompt = buildHierarchyAppendSystemPrompt({
       agent,
+      // Other adapters already get these instructions on the first turn.
+      mainControlSystemPrompt: HIERARCHY_SYSTEM_PROMPT_ADAPTERS.has(adapter)
+        ? options.mainControlSystemPrompt
+        : undefined,
       serverId: this.serverId,
       readAgent,
       listActiveAgents: () => hierarchy.values(),
     });
-    const adapter = this.adapterOf(storedConfig.provider);
     const mainControl = isMainControlAgentLabels(agent.labels);
     if (mainControl && adapter === "codex") storedConfig = { ...storedConfig, modeId: "read-only" };
     const rawEffectiveOptions = mainControl

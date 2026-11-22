@@ -3058,7 +3058,13 @@ export const es: TranslationResources = {
           accessibilityLabel: "Inyectar herramientasPaseo",
           updateFailed: "No se pudieron actualizar las herramientas de Paseo.",
         },
+        mainControlSystemPrompt: {
+          title: "Mensaje del sistema para el control principal",
+          hint: "Se aplica cuando una sesión asume el rol de control principal. No afecta a las sesiones que ya tienen ese rol ni a los subagentes.",
+          sheetTitle: "Editar mensaje del sistema para el control principal",
+        },
         systemPrompt: {
+          loadFailed: "No se pudo cargar la configuración del host.",
           title: "Aviso del sistema",
           hint: "Agrega un mensaje del sistema a todos los agentes.",
           sheetTitle: "Agregar mensaje del sistema",

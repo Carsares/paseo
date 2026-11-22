@@ -519,8 +519,11 @@ function resolveWorktreesRoot(
     : path.resolve(paseoHome, expandedRoot);
 }
 
-function resolveAppendSystemPrompt(persisted: ReturnType<typeof loadPersistedConfig>): string {
-  return persisted.daemon?.appendSystemPrompt ?? "";
+function resolveAppendSystemPrompts(persisted: PersistedConfig) {
+  return {
+    appendSystemPrompt: persisted.daemon?.appendSystemPrompt ?? "",
+    mainControlAppendSystemPrompt: persisted.daemon?.mainControlAppendSystemPrompt ?? "",
+  };
 }
 
 function resolveUsageEnabled(persisted: ReturnType<typeof loadPersistedConfig>): boolean {
@@ -555,7 +558,7 @@ function resolveStaticLoadConfigSettings(
     usageEnabled: resolveUsageEnabled(persisted),
     browserToolsEnabled: resolveBrowserToolsEnabled(persisted),
     autoArchiveAfterMerge: persisted.daemon?.autoArchiveAfterMerge ?? false,
-    appendSystemPrompt: resolveAppendSystemPrompt(persisted),
+    ...resolveAppendSystemPrompts(persisted),
     ...resolveProfileLists(persisted),
     hostnames: mergeHostnames([
       persisted.daemon?.hostnames,
@@ -587,6 +590,7 @@ export type ResolvedDaemonSettings = Pick<
   | "autoArchiveAfterMerge"
   | "enableTerminalAgentHooks"
   | "appendSystemPrompt"
+  | "mainControlAppendSystemPrompt"
   | "terminalProfiles"
   | "agentProfiles"
   | "skillSelection"

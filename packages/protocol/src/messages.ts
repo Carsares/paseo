@@ -249,6 +249,8 @@ export const MutableDaemonConfigSchema = z
     resumeOnStartup: z.boolean().optional(),
     resumePrompt: z.string().optional(),
     appendSystemPrompt: z.string().default(""),
+    // COMPAT(mainControlAppendSystemPrompt): added in v0.17.0, keep optional while old daemons are supported.
+    mainControlAppendSystemPrompt: z.string().optional(),
     terminalProfiles: z.array(TerminalProfileSchema).optional(),
     agentProfiles: z.array(AgentProfileSchema).optional(),
     skills: z.object({ selection: AgentSkillSelectionSchema.optional() }).strict().optional(),
@@ -277,6 +279,8 @@ export const MutableDaemonConfigPatchSchema = z
     resumeOnStartup: z.boolean().optional(),
     resumePrompt: z.string().optional(),
     appendSystemPrompt: z.string().optional(),
+    // COMPAT(mainControlAppendSystemPrompt): added in v0.17.0, keep optional while old daemons are supported.
+    mainControlAppendSystemPrompt: z.string().optional(),
     terminalProfiles: z.array(TerminalProfileSchema).optional(),
     agentProfiles: z.array(AgentProfileSchema).optional(),
     pluginsEnabled: z.boolean().optional(),
@@ -4462,6 +4466,8 @@ export const ServerInfoStatusPayloadSchema = z
         entityMetadata: z.boolean().optional(),
         diffSubscription: z.boolean().optional(),
         binaryChunkingV1: z.boolean().optional(),
+        // COMPAT(mainControlAppendSystemPrompt): added in v0.17.0, keep optional while old daemons are supported.
+        mainControlAppendSystemPrompt: z.boolean().optional(),
         workspaceSetupObservation: z.boolean().optional(),
         workspaceSortTimes: z.boolean().optional(),
         // COMPAT(canonicalSubmittedPrompts): added in v0.2.6, remove gate after 2027-01-30.

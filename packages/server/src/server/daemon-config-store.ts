@@ -41,6 +41,7 @@ interface SupportedMutableConfigPatch {
   resumeOnStartup?: boolean;
   resumePrompt?: string;
   appendSystemPrompt?: string;
+  mainControlAppendSystemPrompt?: string;
   terminalProfiles?: MutableDaemonConfig["terminalProfiles"];
   agentProfiles?: MutableDaemonConfig["agentProfiles"];
   skills?: MutableDaemonConfig["skills"];
@@ -257,6 +258,7 @@ const RELOADABLE_PATHS = [
   "daemon.autoArchiveAfterMerge",
   "daemon.enableTerminalAgentHooks",
   "daemon.appendSystemPrompt",
+  "daemon.mainControlAppendSystemPrompt",
   "daemon.terminalProfiles",
   "daemon.agentProfiles",
   "app.baseUrl",
@@ -285,6 +287,7 @@ const PERSISTED_TO_MUTABLE_PATH = new Map<string, string>([
   ["daemon.autoArchiveAfterMerge", "autoArchiveAfterMerge"],
   ["daemon.enableTerminalAgentHooks", "enableTerminalAgentHooks"],
   ["daemon.appendSystemPrompt", "appendSystemPrompt"],
+  ["daemon.mainControlAppendSystemPrompt", "mainControlAppendSystemPrompt"],
   ["daemon.terminalProfiles", "terminalProfiles"],
   ["daemon.agentProfiles", "agentProfiles"],
   ["app.baseUrl", "app.baseUrl"],
@@ -374,6 +377,7 @@ function pickSupportedPatchFields(patch: MutableDaemonConfigPatch): SupportedMut
     ...(patch.appendSystemPrompt !== undefined
       ? { appendSystemPrompt: patch.appendSystemPrompt }
       : {}),
+    mainControlAppendSystemPrompt: patch.mainControlAppendSystemPrompt,
     ...(patch.terminalProfiles !== undefined ? { terminalProfiles: patch.terminalProfiles } : {}),
     ...(patch.agentProfiles !== undefined ? { agentProfiles: patch.agentProfiles } : {}),
     ...(patch.pluginsEnabled !== undefined ? { pluginsEnabled: patch.pluginsEnabled } : {}),
@@ -522,15 +526,11 @@ export class DaemonConfigStore {
       this.current.resumeOnStartup === true && next.resumeOnStartup !== true;
 
     // A replaced API key leaves the speech view unchanged, so a speech patch always persists.
-    // Profiles held folded in memory may still be on disk with `featureValues`; saving them writes `options`.
-    const profilesStaleOnDisk =
-      patch.agentProfiles !== undefined &&
-      !isEqualValue(patch.agentProfiles, this.lastKnownPersisted.daemon?.agentProfiles);
     if (
       !configChanged &&
       removedProviders.length === 0 &&
       speechPatch === undefined &&
-      !profilesStaleOnDisk
+      !this.needsDiskUpdate(patch)
     ) {
       return this.current;
     }
@@ -553,6 +553,22 @@ export class DaemonConfigStore {
     if (speechChanged) this.speechOwner?.apply(knownNext);
 
     return this.current;
+  }
+
+  private needsDiskUpdate(patch: SupportedMutableConfigPatch): boolean {
+    const daemon = this.lastKnownPersisted.daemon;
+    // Profiles held folded in memory may still use `featureValues` on disk.
+    if (
+      patch.agentProfiles !== undefined &&
+      !isEqualValue(patch.agentProfiles, daemon?.agentProfiles)
+    ) {
+      return true;
+    }
+    // An explicit empty prompt must be saved even when it equals the runtime default.
+    return (
+      patch.mainControlAppendSystemPrompt !== undefined &&
+      patch.mainControlAppendSystemPrompt !== daemon?.mainControlAppendSystemPrompt
+    );
   }
 
   private readSpeech(
@@ -898,6 +914,9 @@ function mergeMutableDaemonPatch(
     next.enableTerminalAgentHooks = patch.enableTerminalAgentHooks;
   }
   if (patch.appendSystemPrompt !== undefined) next.appendSystemPrompt = patch.appendSystemPrompt;
+  if (patch.mainControlAppendSystemPrompt !== undefined) {
+    next.mainControlAppendSystemPrompt = patch.mainControlAppendSystemPrompt;
+  }
   if (patch.terminalProfiles !== undefined) next.terminalProfiles = patch.terminalProfiles;
   if (patch.agentProfiles !== undefined) next.agentProfiles = patch.agentProfiles;
   return Object.keys(next).length > 0 ? next : undefined;

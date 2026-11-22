@@ -3061,7 +3061,13 @@ export const fr: TranslationResources = {
           accessibilityLabel: "Injecter les outils Paseo",
           updateFailed: "Impossible de mettre à jour les outils Paseo.",
         },
+        mainControlSystemPrompt: {
+          title: "Prompt système du contrôle principal",
+          hint: "S’applique quand une session prend le rôle de contrôle principal. Les sessions qui ont déjà ce rôle et les sous-agents ne sont pas affectés.",
+          sheetTitle: "Modifier le prompt système du contrôle principal",
+        },
         systemPrompt: {
+          loadFailed: "Impossible de charger les paramètres de l’hôte.",
           title: "Prompt système",
           hint: "Ajoute un prompt système à tous les agents",
           sheetTitle: "Ajouter un prompt système",

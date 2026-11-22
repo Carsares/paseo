@@ -3024,7 +3024,13 @@ export const ja: TranslationResources = {
           accessibilityLabel: "Paseoツールを有効にする",
           updateFailed: "Paseoツールを更新できませんでした。",
         },
+        mainControlSystemPrompt: {
+          title: "メイン制御用のシステムプロンプト",
+          hint: "セッションがメイン制御の役割に就くときに適用されます。既存のメイン制御セッションと子エージェントには影響しません。",
+          sheetTitle: "メイン制御用のシステムプロンプトを編集",
+        },
         systemPrompt: {
+          loadFailed: "ホスト設定を読み込めませんでした。",
           title: "システムプロンプト",
           hint: "すべてのエージェントにシステムプロンプトを追加します",
           sheetTitle: "システムプロンプトを追加",

@@ -2205,6 +2205,7 @@ export class VoiceAssistantWebSocketServer {
         ownedSubscriptions: true,
         // COMPAT(agentHierarchyControl): added in v0.16.0, remove gate after 2027-05-19.
         agentHierarchyControl: true,
+        mainControlAppendSystemPrompt: true,
         workspaceMainAgentDefault: true,
         workspaceAgentsSummary: true,
         agentHistoryWorkspaceFilter: true,

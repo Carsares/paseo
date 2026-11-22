@@ -1239,11 +1239,18 @@ test("a failed switch preserves the original session and pending sidecar", async
   const cwd = mkdtempSync(join(tmpdir(), "paseo-failed-switch-"));
   const storage = new AgentStorage(join(cwd, "agents"), logger);
   const client = new TestAgentClient();
-  const manager = new AgentManager({ clients: { codex: client }, logger, registry: storage });
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    registry: storage,
+    mainControlAppendSystemPrompt: "First policy",
+  });
   const { id } = await manager.createAgent({ cwd, provider: "codex" }, undefined, {
     workspaceId: "workspace",
+    labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
   });
   try {
+    manager.setMainControlAppendSystemPrompt("Current host policy");
     await manager.appendTimelineItem(id, { type: "user_message", text: "Keep this message" });
     const switched = await manager.switchAgentProvider(id, {
       provider: "codex",
@@ -1252,6 +1259,11 @@ test("a failed switch preserves the original session and pending sidecar", async
     const rows = manager.fetchTimeline(id, { limit: 0 });
     const prefix = await storage.timelinePrefixes.load(id);
     const record = await storage.get(id);
+    expect(client.createdConfigs.at(-1)?.daemonAppendSystemPrompt).toContain("First policy");
+    expect(client.createdConfigs.at(-1)?.daemonAppendSystemPrompt).not.toContain(
+      "Current host policy",
+    );
+    expect(record?.mainControlSystemPrompt).toBe("First policy");
     vi.spyOn(client, "createSession").mockRejectedValueOnce(new Error("Model unavailable"));
     const switchAgain = () =>
       manager.switchAgentProvider(id, { provider: "codex", model: "gpt-5.2-codex" });
@@ -1259,6 +1271,7 @@ test("a failed switch preserves the original session and pending sidecar", async
     vi.spyOn(switched.agent.session!, "close").mockRejectedValueOnce(new Error("Close failed"));
     await expect(switchAgain()).rejects.toThrow("Close failed");
     expect(manager.getAgent(id)?.session).toBe(switched.agent.session);
+    expect(manager.getAgent(id)?.mainControlSystemPrompt).toBe("First policy");
     expect(manager.fetchTimeline(id, { limit: 0 })).toEqual(rows);
     expect(await storage.timelinePrefixes.load(id)).toEqual(prefix);
     expect(await storage.get(id)).toEqual(record);
@@ -5713,6 +5726,7 @@ test("importProviderSession imports the selected session without listing and pub
     listCalls = 0;
     importInput: unknown = null;
     importLaunchContext: AgentLaunchContext | undefined;
+    importConfig: AgentSessionConfig | undefined;
 
     async listImportableSessions() {
       this.listCalls += 1;
@@ -5722,6 +5736,7 @@ test("importProviderSession imports the selected session without listing and pub
     async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
       this.importInput = input;
       this.importLaunchContext = context.launchContext;
+      this.importConfig = context.config;
       return {
         session,
         config: { provider: "codex" as const, cwd: workdir },
@@ -5789,6 +5804,7 @@ test("importProviderSession imports the selected session without listing and pub
     },
     registry: storage,
     logger,
+    mainControlAppendSystemPrompt: "Main Control only",
   });
   manager.subscribe((event) => events.push(event), { replayState: false });
 
@@ -5801,6 +5817,7 @@ test("importProviderSession imports the selected session without listing and pub
 
   expect(client.listCalls).toBe(0);
   expect(client.importInput).toEqual({ providerHandleId: "thread-selected", cwd: workdir });
+  expect(client.importConfig?.daemonAppendSystemPrompt).toBeUndefined();
   expect(client.importLaunchContext).toEqual({
     agentId: imported.id,
     env: {
@@ -5844,6 +5861,7 @@ test("importProviderSession imports the selected session without listing and pub
     },
   });
   expect((await storage.get(imported.id))?.title).toBe("Trace provider imports");
+  expect((await storage.get(imported.id))?.mainControlSystemPrompt).toBeUndefined();
 });
 
 test("reloadAgentSession passes daemon launch env through the provider launch context", async () => {
@@ -6908,51 +6926,276 @@ test("OpenCode Main Control applies default non-write permissions and blocks run
   expect(manager.getAgent(agent.id)?.labels[DESKTOP_OPEN_AGENT_TAB_LABEL]).toBe("true");
 });
 
-test("failed promotion restores Main Control and unarchive keeps the existing main", async () => {
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-main-rollback-"));
-  const storage = new AgentStorage(join(workdir, "agents"), logger);
+test.each(["Original instructions", "", undefined])(
+  "failed promotion restores the Main Control snapshot %j and unarchive keeps the existing main",
+  async (originalPrompt) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-main-rollback-"));
+    const storage = new AgentStorage(join(workdir, "agents"), logger);
+    const client = new TestAgentClient();
+    const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+    onTestFinished(async () => {
+      await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+      rmSync(workdir, { recursive: true, force: true });
+    });
+    const create = (title: string) =>
+      manager.createAgent(
+        { provider: "codex", cwd: workdir, title, modeId: "workspace-write" },
+        undefined,
+        { workspaceId: "workspace" },
+      );
+    const old = await create("Old");
+    const next = await create("Next");
+    await manager.closeAgent(old.id);
+    await manager.closeAgent(next.id);
+    manager.setMainControlAppendSystemPrompt(originalPrompt ?? "");
+    const oldMain = await manager.setAgentMainControl(old.id, true);
+    if (originalPrompt === undefined) {
+      await storage.upsert({ ...oldMain.record, mainControlSystemPrompt: undefined });
+    }
+    manager.setMainControlAppendSystemPrompt("Updated instructions");
+    const upsert = storage.upsert.bind(storage);
+    const failPromotion = vi.spyOn(storage, "upsert").mockImplementation(async (record) => {
+      if (record.id === next.id && record.labels[WORKSPACE_ROLE_LABEL] === WORKSPACE_MAIN_ROLE) {
+        throw new Error("Promotion failed");
+      }
+      await upsert(record);
+    });
+    try {
+      await expect(manager.setAgentMainControl(next.id, true)).rejects.toThrow("Promotion failed");
+    } finally {
+      failPromotion.mockRestore();
+    }
+    expect(await storage.get(old.id)).toMatchObject({
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+      lastModeId: "read-only",
+    });
+    expect((await storage.get(old.id))?.mainControlSystemPrompt).toBe(originalPrompt);
+    await manager.archiveSnapshot(old.id, new Date().toISOString());
+    await manager.setAgentMainControl(next.id, true);
+    await expect(manager.unarchiveSnapshot(old.id)).resolves.toBe(true);
+    expect((await storage.get(old.id))?.labels).not.toHaveProperty(WORKSPACE_ROLE_LABEL);
+    expect((await storage.get(old.id))?.mainControlSystemPrompt).toBeUndefined();
+    expect(await storage.get(old.id)).toMatchObject({
+      archivedAt: null,
+      lastModeId: "workspace-write",
+    });
+    expect((await storage.get(next.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+    expect((await storage.get(next.id))?.mainControlSystemPrompt).toBe("Updated instructions");
+  },
+);
+
+test("Main Control prompt snapshots survive reloads and disk reopen without affecting other roles", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-main-prompt-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
   const client = new TestAgentClient();
+  const lastResumePrompt = () => client.resumeOverrides.at(-1)?.daemonAppendSystemPrompt;
+  const buildManager = (registry: AgentStorage, mainControlAppendSystemPrompt: string) =>
+    new AgentManager({
+      clients: { codex: client },
+      registry,
+      logger,
+      mainControlAppendSystemPrompt,
+    });
+  const manager = buildManager(storage, "First policy");
+  const config = { provider: "codex", cwd: workdir } as const;
+  const labels = { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE };
+  const createMain = (workspaceId: string) =>
+    manager.createAgent(config, undefined, { workspaceId, labels });
+  const createSilent = (workspaceId: string) =>
+    manager.createSilentWorkspaceMainAgent({ config, workspaceId });
+  const closeAll = (owner: AgentManager) =>
+    Promise.all(owner.listAgents().map(({ id }) => owner.closeAgent(id)));
+  const managers = [manager];
+  onTestFinished(async () => {
+    for (const owner of managers) await closeAll(owner);
+    rmSync(workdir, { recursive: true, force: true });
+  });
+
+  const live = await createMain("first");
+  expect(client.createdConfigs.at(-1)?.daemonAppendSystemPrompt).toContain(
+    "summarizing workspace state.\nFirst policy\nDirect Level-1 children: []",
+  );
+  const silent = await createSilent("silent");
+  const legacy = await createSilent("legacy");
+  await storage.upsert({ ...legacy, mainControlSystemPrompt: undefined });
+
+  manager.setMainControlAppendSystemPrompt("Second policy");
+  await manager.setAgentMainControl(live.id, true);
+  await manager.reloadAgentSession(live.id);
+  expect(lastResumePrompt()).toContain("First policy");
+  expect(lastResumePrompt()).not.toContain("Second policy");
+  const collected = await runtimeCleanup(manager)({ now: new Date(Date.now() + 61 * 60_000) });
+  expect(collected.collected.map(({ agentId }) => agentId)).toEqual([live.id]);
+  expect(manager.getAgent(live.id)).toBeNull();
+  await ensureAgentLoaded(live.id, { agentManager: manager, agentStorage: storage, logger });
+  expect(lastResumePrompt()).toContain("First policy");
+
+  const second = await createMain("second");
+  expect(client.createdConfigs.at(-1)?.daemonAppendSystemPrompt).toContain("Second policy");
+  const child = await manager.createAgent(config, undefined, {
+    workspaceId: "second",
+    labels: { [PARENT_AGENT_ID_LABEL]: second.id },
+  });
+  const childPrompt = client.createdConfigs.at(-1)?.daemonAppendSystemPrompt;
+  expect(childPrompt).toContain("Role: Level-1 Module Lead");
+  expect(childPrompt).not.toContain("Second policy");
+  const grandchild = await manager.createAgent(config, undefined, {
+    workspaceId: "second",
+    labels: { [PARENT_AGENT_ID_LABEL]: child.id },
+  });
+  expect(client.createdConfigs.at(-1)?.daemonAppendSystemPrompt).toBeUndefined();
+  const independent = await manager.createAgent(config, undefined, { workspaceId: "second" });
+  expect(client.createdConfigs.at(-1)?.daemonAppendSystemPrompt).toBeUndefined();
+
+  manager.setMainControlAppendSystemPrompt("");
+  const blank = await createMain("blank");
+  const builtInPrompt = client.createdConfigs.at(-1)?.daemonAppendSystemPrompt;
+  expect(builtInPrompt?.split("\n")).toHaveLength(6);
+  await closeAll(manager);
+
+  const reloadedStorage = new AgentStorage(storagePath, logger);
+  const reopened = buildManager(reloadedStorage, "Restarted with different policy");
+  managers.push(reopened);
+  const liveRecord = await reloadedStorage.get(live.id);
+  if (!liveRecord?.persistence) throw new Error("Main Control persistence handle was not saved");
+  expect(liveRecord.mainControlSystemPrompt).toBe("First policy");
+  await reopened.resumeAgentFromPersistence(liveRecord.persistence, config, live.id);
+  expect(lastResumePrompt()).toContain("First policy");
+
+  await reopened.createAgentFromRecord(silent.id);
+  expect(client.createdConfigs.at(-1)?.daemonAppendSystemPrompt).toContain("First policy");
+  await reopened.createAgentFromRecord(legacy.id);
+  expect(client.createdConfigs.at(-1)?.daemonAppendSystemPrompt).toBe(builtInPrompt);
+  expect((await reloadedStorage.get(legacy.id))?.mainControlSystemPrompt).toBeUndefined();
+  await reopened.archiveSnapshot(blank.id, new Date().toISOString());
+  await expect(reopened.unarchiveSnapshot(blank.id)).resolves.toBe(true);
+  await ensureAgentLoaded(blank.id, {
+    agentManager: reopened,
+    agentStorage: reloadedStorage,
+    logger,
+  });
+  expect(lastResumePrompt()).toBe(builtInPrompt);
+  expect((await reloadedStorage.get(blank.id))?.mainControlSystemPrompt).toBe("");
+  for (const agent of [child, grandchild, independent]) {
+    expect((await reloadedStorage.get(agent.id))?.mainControlSystemPrompt).toBeUndefined();
+  }
+});
+
+test("a live promotion delivers its saved Main Control prompt on the next provider turn", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-main-turn-prompt-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const received: AgentPromptInput[] = [];
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig) {
+      return new (class extends TestAgentSession {
+        override async startTurn(prompt?: AgentPromptInput) {
+          if (prompt === undefined) throw new Error("Expected a provider prompt");
+          received.push(prompt);
+          return super.startTurn();
+        }
+      })(config);
+    }
+  })();
   const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
   onTestFinished(async () => {
     await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
     rmSync(workdir, { recursive: true, force: true });
   });
-  const create = (title: string) =>
-    manager.createAgent(
-      { provider: "codex", cwd: workdir, title, modeId: "workspace-write" },
-      undefined,
-      { workspaceId: "workspace" },
-    );
-  const old = await create("Old");
-  const next = await create("Next");
-  await manager.closeAgent(old.id);
-  await manager.closeAgent(next.id);
-  await manager.setAgentMainControl(old.id, true);
-  const upsert = storage.upsert.bind(storage);
-  const failPromotion = vi.spyOn(storage, "upsert").mockImplementation(async (record) => {
-    if (record.id === next.id && record.labels[WORKSPACE_ROLE_LABEL] === WORKSPACE_MAIN_ROLE) {
-      throw new Error("Promotion failed");
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: "workspace",
+  });
+  manager.setMainControlAppendSystemPrompt("At promotion");
+  await manager.setAgentMainControl(agent.id, true);
+  manager.setMainControlAppendSystemPrompt("After promotion");
+  await manager.runAgent(agent.id, "First turn");
+  expect(received[0]).toEqual(
+    expect.stringContaining("\nAt promotion\nDirect Level-1 children: []"),
+  );
+  await manager.runAgent(agent.id, "Second turn");
+  expect(received[1]).toBe("Second turn");
+
+  await manager.setAgentMainControl(agent.id, false);
+  expect((await storage.get(agent.id))?.mainControlSystemPrompt).toBeUndefined();
+  await manager.runAgent(agent.id, "After demotion");
+  expect(received[2]).toBe("After demotion");
+  await manager.setAgentMainControl(agent.id, true);
+  await manager.runAgent(agent.id, "After re-promotion");
+  expect(received[3]).toEqual(
+    expect.stringContaining("\nAfter promotion\nDirect Level-1 children: []"),
+  );
+});
+
+test("Main Control sends the saved prompt once for providers using the first turn", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-main-turn-fallback-"));
+  const received: AgentPromptInput[] = [];
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig) {
+      this.createdConfigs.push(config);
+      return new (class extends TestAgentSession {
+        override async startTurn(prompt?: AgentPromptInput) {
+          if (prompt === undefined) throw new Error("Expected a provider prompt");
+          received.push(prompt);
+          return super.startTurn();
+        }
+      })(config);
     }
-    await upsert(record);
+  })("antigravity");
+  const manager = new AgentManager({
+    clients: { antigravity: client },
+    logger,
+    mainControlAppendSystemPrompt: "Saved policy",
   });
-  try {
-    await expect(manager.setAgentMainControl(next.id, true)).rejects.toThrow("Promotion failed");
-  } finally {
-    failPromotion.mockRestore();
-  }
-  expect(await storage.get(old.id)).toMatchObject({
+  onTestFinished(async () => {
+    for (const { id } of manager.listAgents()) await manager.closeAgent(id);
+    rmSync(workdir, { recursive: true, force: true });
+  });
+  const agent = await manager.createAgent({ provider: "antigravity", cwd: workdir }, undefined, {
+    workspaceId: "workspace",
     labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
-    lastModeId: "read-only",
   });
-  await manager.archiveSnapshot(old.id, new Date().toISOString());
-  await manager.setAgentMainControl(next.id, true);
-  await expect(manager.unarchiveSnapshot(old.id)).resolves.toBe(true);
-  expect((await storage.get(old.id))?.labels).not.toHaveProperty(WORKSPACE_ROLE_LABEL);
-  expect(await storage.get(old.id)).toMatchObject({
-    archivedAt: null,
+  manager.setMainControlAppendSystemPrompt("Current host policy");
+  await manager.runAgent(agent.id, "First turn");
+  await manager.runAgent(agent.id, "Second turn");
+
+  expect(client.createdConfigs[0]?.daemonAppendSystemPrompt).not.toContain("Saved policy");
+  expect(received).toEqual([
+    expect.stringContaining("\nSaved policy\nDirect Level-1 children: []"),
+    "Second turn",
+  ]);
+});
+
+test("restoring an archived Main Control agent as a child clears its saved prompt", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-main-restore-child-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    mainControlAppendSystemPrompt: "Saved policy",
+  });
+  onTestFinished(async () => {
+    for (const { id } of manager.listAgents()) await manager.closeAgent(id);
+    rmSync(workdir, { recursive: true, force: true });
+  });
+  const config = { provider: "codex", cwd: workdir, modeId: "workspace-write" } as const;
+  const parent = await manager.createAgent(config, undefined, { workspaceId: "workspace" });
+  const main = await manager.createSilentWorkspaceMainAgent({ config, workspaceId: "workspace" });
+  expect(main.mainControlSystemPrompt).toBe("Saved policy");
+  await manager.archiveSnapshot(main.id, new Date().toISOString());
+
+  await expect(
+    manager.unarchiveSnapshot(main.id, { labels: { [PARENT_AGENT_ID_LABEL]: parent.id } }),
+  ).resolves.toBe(true);
+  expect(await storage.get(main.id)).toMatchObject({
+    labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
     lastModeId: "workspace-write",
   });
-  expect((await storage.get(next.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+  expect((await storage.get(main.id))?.labels).not.toHaveProperty(WORKSPACE_ROLE_LABEL);
+  expect((await storage.get(main.id))?.mainControlSystemPrompt).toBeUndefined();
+  await manager.createAgentFromRecord(main.id);
+  expect(client.createdConfigs.at(-1)?.daemonAppendSystemPrompt).toBeUndefined();
 });
 
 test("adoption and an in-flight move refresh the persisted session before its next turn", async () => {

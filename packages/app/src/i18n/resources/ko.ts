@@ -3010,7 +3010,13 @@ export const ko: TranslationResources = {
           accessibilityLabel: "Paseo 도구 주입",
           updateFailed: "Paseo 도구를 업데이트할 수 없습니다.",
         },
+        mainControlSystemPrompt: {
+          title: "주 제어 시스템 프롬프트",
+          hint: "세션이 주 제어 역할을 맡을 때 적용됩니다. 기존 주 제어 세션과 하위 에이전트에는 영향을 주지 않습니다.",
+          sheetTitle: "주 제어 시스템 프롬프트 편집",
+        },
         systemPrompt: {
+          loadFailed: "호스트 설정을 불러올 수 없습니다.",
           title: "시스템 프롬프트",
           hint: "모든 에이전트에 시스템 프롬프트를 추가합니다",
           sheetTitle: "시스템 프롬프트 추가",

@@ -3129,7 +3129,13 @@ export const en = {
           accessibilityLabel: "Inject Paseo tools",
           updateFailed: "Unable to update Paseo tools.",
         },
+        mainControlSystemPrompt: {
+          title: "Main control system prompt",
+          hint: "Applies when a session takes on the main control role. Existing main control sessions and subagents are unaffected.",
+          sheetTitle: "Edit main control system prompt",
+        },
         systemPrompt: {
+          loadFailed: "Unable to load host settings.",
           title: "System prompt",
           hint: "Adds a system prompt to all agents",
           sheetTitle: "Append system prompt",

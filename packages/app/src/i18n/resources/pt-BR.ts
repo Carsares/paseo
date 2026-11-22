@@ -3039,7 +3039,13 @@ export const ptBR: TranslationResources = {
           accessibilityLabel: "Injetar ferramentas do Paseo",
           updateFailed: "Não foi possível atualizar as ferramentas do Paseo.",
         },
+        mainControlSystemPrompt: {
+          title: "Prompt do sistema para controle principal",
+          hint: "Aplica-se quando uma sessão assume a função de controle principal. Sessões que já têm essa função e subagentes não são afetados.",
+          sheetTitle: "Editar prompt do sistema para controle principal",
+        },
         systemPrompt: {
+          loadFailed: "Não foi possível carregar as configurações do host.",
           title: "Prompt do sistema",
           hint: "Adiciona um prompt do sistema a todos os agentes",
           sheetTitle: "Acrescentar prompt do sistema",

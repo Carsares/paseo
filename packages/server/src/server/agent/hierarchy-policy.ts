@@ -399,11 +399,13 @@ export function isMainControlWritePermissionBlocked(
 
 export function buildHierarchyAppendSystemPrompt({
   agent,
+  mainControlSystemPrompt,
   serverId = "self",
   readAgent,
   listActiveAgents,
 }: {
   agent: HierarchyAgent;
+  mainControlSystemPrompt?: string;
   readAgent: ReadAgent;
   listActiveAgents: ListActiveAgents;
   serverId?: string;
@@ -424,6 +426,7 @@ export function buildHierarchyAppendSystemPrompt({
       "Summarize the lead's report for the user.",
       "Use summarize_workspace_agents to review active and closed workspace sessions, tasks, and touched files. Cross-check uncommitted changes with read-only git status and git diff when summarizing workspace state.",
     ];
+    if (mainControlSystemPrompt) contract.push(mainControlSystemPrompt);
     childRole = "Level-1";
   } else if (
     parent &&

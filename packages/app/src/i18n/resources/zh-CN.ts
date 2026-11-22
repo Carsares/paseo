@@ -2964,7 +2964,13 @@ export const zhCN: TranslationResources = {
           accessibilityLabel: "注入 Paseo tools",
           updateFailed: "无法更新 Paseo 工具。",
         },
+        mainControlSystemPrompt: {
+          title: "主控专属系统提示词",
+          hint: "仅在会话成为主控时生效。已有主控会话和子会话不受影响。",
+          sheetTitle: "编辑主控专属系统提示词",
+        },
         systemPrompt: {
+          loadFailed: "无法加载宿主设置。",
           title: "System prompt",
           hint: "为所有 Agent 添加 system prompt",
           sheetTitle: "追加 system prompt",

@@ -453,6 +453,7 @@ export interface PaseoDaemonConfig {
   autoArchiveAfterMerge?: boolean;
   enableTerminalAgentHooks?: boolean;
   appendSystemPrompt?: string;
+  mainControlAppendSystemPrompt?: string;
   terminalProfiles?: TerminalProfile[];
   agentProfiles?: AgentProfile[];
   skillSelection?: AgentSkillSelection;
@@ -598,6 +599,13 @@ function resolveReloadEnv(config: PaseoDaemonConfig): NodeJS.ProcessEnv {
   return config.configReload?.env ?? process.env;
 }
 
+function createInitialAppendSystemPrompts(config: ResolvedDaemonSettings) {
+  return {
+    appendSystemPrompt: config.appendSystemPrompt ?? "",
+    mainControlAppendSystemPrompt: config.mainControlAppendSystemPrompt ?? "",
+  };
+}
+
 function createInitialMutableDaemonConfig(config: ResolvedDaemonSettings): MutableDaemonConfig {
   const providers = config.providerOverrides ?? {};
 
@@ -626,7 +634,7 @@ function createInitialMutableDaemonConfig(config: ResolvedDaemonSettings): Mutab
     idleRuntimeCleanup: config.idleRuntimeCleanup !== false,
     resumeOnStartup: config.resumeOnStartup === true,
     resumePrompt: config.resumePrompt ?? "Resume working.",
-    appendSystemPrompt: config.appendSystemPrompt ?? "",
+    ...createInitialAppendSystemPrompts(config),
     pluginsEnabled: config.pluginsEnabled ?? false,
     plugins: config.plugins ?? {},
     skills: { selection: config.skillSelection },
@@ -1057,6 +1065,7 @@ export async function createPaseoDaemon(
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,
     appendSystemPrompt: config.appendSystemPrompt,
+    mainControlAppendSystemPrompt: daemonConfigStore.get().mainControlAppendSystemPrompt,
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
     },
@@ -1064,6 +1073,9 @@ export async function createPaseoDaemon(
     resolvePaseoToolPolicy: (provider) =>
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     logger,
+  });
+  daemonConfigStore.onFieldChange("mainControlAppendSystemPrompt", (value) => {
+    agentManager.setMainControlAppendSystemPrompt(typeof value === "string" ? value : "");
   });
   const syncPluginProviders = () => {
     agentManager.updateProviderRegistry(

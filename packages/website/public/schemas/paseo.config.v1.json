@@ -112,6 +112,9 @@
         "appendSystemPrompt": {
           "type": "string"
         },
+        "mainControlAppendSystemPrompt": {
+          "type": "string"
+        },
         "terminalProfiles": {
           "type": "array",
           "items": {

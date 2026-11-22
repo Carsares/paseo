@@ -5,7 +5,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createJiti } from "jiti";
 import type { z } from "zod";
 import { describe, expect, it } from "vitest";
-import { PluginRpcInvokeResponseSchema, WSOutboundMessageSchema } from "../../src/messages.js";
+import {
+  parseServerInfoStatusPayload,
+  PluginRpcInvokeResponseSchema,
+  WSInboundMessageSchema,
+  WSOutboundMessageSchema,
+} from "../../src/messages.js";
 import { validateWSOutboundMessage } from "../../src/validation/ws-outbound.js";
 
 interface GeneratedSchema {
@@ -136,6 +141,57 @@ const SourceSchema = z.object({
   it("accepts a minimal valid envelope and rejects a corrupted envelope", () => {
     expect(validateWSOutboundMessage({ type: "pong" }).success).toBe(true);
     expect(validateWSOutboundMessage({ type: "not_a_message" }).success).toBe(false);
+  });
+
+  it("accepts hosts with or without the Main Control system prompt capability", () => {
+    const payload = { status: "server_info", serverId: "host", features: { agentProfiles: true } };
+    expect(parseServerInfoStatusPayload(payload)?.features).toEqual({ agentProfiles: true });
+    for (const supported of [true, false]) {
+      const features = { ...payload.features, mainControlAppendSystemPrompt: supported };
+      expect(parseServerInfoStatusPayload({ ...payload, features })?.features).toEqual(features);
+    }
+    expect(
+      parseServerInfoStatusPayload({
+        ...payload,
+        features: { mainControlAppendSystemPrompt: "true" },
+      }),
+    ).toBeNull();
+  });
+
+  it("preserves an empty Main Control system prompt and rejects non-string config values", () => {
+    const envelope = (config: unknown) => ({
+      type: "session",
+      message: { type: "get_daemon_config_response", payload: { requestId: "config", config } },
+    });
+    const config = { mcp: { injectIntoAgents: true } };
+    expect(validateWSOutboundMessage(envelope(config)).success).toBe(true);
+    expect(
+      validateWSOutboundMessage(envelope({ ...config, mainControlAppendSystemPrompt: "" })),
+    ).toMatchObject({
+      success: true,
+      data: { message: { payload: { config: { mainControlAppendSystemPrompt: "" } } } },
+    });
+    expect(
+      validateWSOutboundMessage(envelope({ ...config, mainControlAppendSystemPrompt: true }))
+        .success,
+    ).toBe(false);
+  });
+
+  it("accepts explicit empty prompt patches and patches from existing clients", () => {
+    const asRequest = (config: unknown) => ({
+      type: "session",
+      message: { type: "set_daemon_config_request", requestId: "patch", config },
+    });
+    for (const config of [
+      { appendSystemPrompt: "Existing client" },
+      { mainControlAppendSystemPrompt: "" },
+    ]) {
+      const request = asRequest(config);
+      expect(WSInboundMessageSchema.parse(request)).toEqual(request);
+    }
+    expect(
+      WSInboundMessageSchema.safeParse(asRequest({ mainControlAppendSystemPrompt: false })).success,
+    ).toBe(false);
   });
 
   it("validates a workspace summary with a text attachment", () => {

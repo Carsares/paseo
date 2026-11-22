@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test, onTestFinished } from "vitest";
@@ -10,8 +10,43 @@ import {
   type RuntimeCleanupCandidate,
 } from "./agent/idle-runtime-cleanup/index.js";
 import { createTestLogger } from "../test-utils/test-logger.js";
+import { createDaemonTestContext } from "./test-utils/daemon-test-context.js";
 
 import { fanOutReconciledWorkspaceUpdates, connectIdleRuntimeCleanupConfig } from "./bootstrap.js";
+
+test("the connected client can save Main Control instructions for future sessions", async () => {
+  const { client, daemon, cleanup } = await createDaemonTestContext();
+  onTestFinished(cleanup);
+
+  expect(client.getLastServerInfoMessage()?.features?.mainControlAppendSystemPrompt).toBe(true);
+  expect((await client.getDaemonConfig()).config.mainControlAppendSystemPrompt).toBe("");
+
+  const createMain = async (directory: string) => {
+    const cwd = path.join(daemon.paseoHome, directory);
+    mkdirSync(cwd);
+    const result = await client.createWorkspace({
+      source: { kind: "directory", path: cwd },
+      mainAgent: { config: { provider: "codex", cwd } },
+    });
+    expect(result.error).toBeNull();
+    if (!result.mainAgent) throw new Error("Workspace did not create a Main Control agent");
+    expect(result.mainAgent.status).toBe("closed");
+    const record = await daemon.daemon.agentStorage.get(result.mainAgent.id);
+    expect(record?.persistence).toBeUndefined();
+    return record;
+  };
+  const saved = await client.patchDaemonConfig({ mainControlAppendSystemPrompt: "Host policy" });
+  expect(saved.config.mainControlAppendSystemPrompt).toBe("Host policy");
+  const first = await createMain("first");
+
+  const cleared = await client.patchDaemonConfig({ mainControlAppendSystemPrompt: "" });
+  expect(cleared.config.mainControlAppendSystemPrompt).toBe("");
+  expect((await createMain("second"))?.mainControlSystemPrompt).toBe("");
+  if (!first) throw new Error("First Main Control record was not saved");
+  expect((await daemon.daemon.agentStorage.get(first.id))?.mainControlSystemPrompt).toBe(
+    "Host policy",
+  );
+});
 
 test("reconciliation emits workspace updates when observer sync fails", async () => {
   const emittedWorkspaceIds: string[][] = [];
