@@ -65,6 +65,8 @@ import {
   AgentRunCancellationError,
   type AgentManagerEvent,
 } from "./agent/agent-manager.js";
+import { PluginAgentClientRegistry } from "./agent/plugin-provider.js";
+import { createAntigravityProvider } from "../../../../plugins/antigravity-provider/server/provider.js";
 import { createAgentMessageDelivery } from "./agent/agent-messages/delivery.js";
 import { sendPromptToAgent, waitForAgentRunStartWithTimeout } from "./agent/agent-prompt.js";
 import type {
@@ -524,6 +526,386 @@ const CONTEXT_HANDOFF_ITEMS: AgentTimelineItem[] = [
   { type: "user_message", text: "Original question", clientMessageId: "original" },
   { type: "assistant_message", text: "Original answer", messageId: "checkpoint" },
 ];
+
+test.each(["still open", "closed", "history only"] as const)(
+  "public timeline retries a failed replay with the session %s",
+  async (state) => {
+    const cwd = mkdtempSync(join(tmpdir(), "paseo-timeline-retry-"));
+    const worktree = join(cwd, "worktree");
+    mkdirSync(worktree);
+    const logger = pino({ level: "silent" });
+    const workspaceId = "retry-workspace";
+    const storage = new AgentStorage(join(cwd, "agents"), logger);
+    const codex = createTestAgentClient("codex");
+    const claude = createTestAgentClient("claude");
+    const resume = claude.resumeSession.bind(claude);
+    let opens = 0;
+    let reads = 0;
+    const purposes: (string | undefined)[] = [];
+    const followup = {
+      type: "assistant_message",
+      text: "Recovered from the provider",
+      messageId: "new-reply",
+    } as const;
+    const firstReplayStarted = Promise.withResolvers<void>();
+    const failReplay = Promise.withResolvers<void>();
+    const releaseReplay = Promise.withResolvers<void>();
+    const retryStarted = Promise.withResolvers<void>();
+    claude.resumeSession = async (...args) => {
+      opens++;
+      const purpose = args[3]?.purpose;
+      purposes.push(purpose);
+      const runtime = await resume(...args);
+      let historyReaderClosed = false;
+      runtime.streamHistory = async function* () {
+        if (historyReaderClosed) throw new Error("History reader already closed");
+        const attempt = ++reads;
+        if (attempt === 1) {
+          yield {
+            type: "timeline",
+            provider: "claude",
+            item: { type: "assistant_message", text: "Discard this partial response" },
+          } as const;
+          firstReplayStarted.resolve();
+          await failReplay.promise;
+          // A read-only Pi session closes its temporary reader when history exits.
+          if (purpose === "history") {
+            historyReaderClosed = true;
+            await runtime.close();
+          }
+          throw new Error("Temporary replay failure");
+        }
+        yield { type: "timeline", provider: "claude", item: followup } as const;
+        if (attempt === 2) {
+          retryStarted.resolve();
+          await releaseReplay.promise;
+        }
+        for (const item of CONTEXT_HANDOFF_ITEMS) {
+          yield { type: "timeline", provider: "claude", item } as const;
+        }
+      };
+      return runtime;
+    };
+    const original = new AgentManager({ logger, registry: storage, clients: { codex, claude } });
+    const manager = new AgentManager({ logger, registry: storage, clients: { codex, claude } });
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({
+      messages,
+      agentManager: manager,
+      agentStorage: storage,
+    });
+    try {
+      const { id } = await original.createAgent({ provider: "codex", cwd: worktree }, undefined, {
+        workspaceId,
+      });
+      for (const item of CONTEXT_HANDOFF_ITEMS) await original.appendTimelineItem(id, item);
+      await original.switchAgentProvider(id, { provider: "claude", model: "sonnet" });
+      await original.closeAgent(id);
+      await original.flush();
+      if (state === "history only") rmSync(worktree, { recursive: true });
+      const fetchTimeline = async (requestId: string) => {
+        await session.handleMessage({
+          type: "fetch_agent_timeline_request",
+          agentId: id,
+          requestId,
+          limit: 0,
+        });
+        return filterByType(messages, "fetch_agent_timeline_response").find(
+          ({ payload }) => payload.requestId === requestId,
+        )?.payload;
+      };
+      const waitForClose = vi.spyOn(manager, "waitForAgentClose");
+      const failedFirst = fetchTimeline("failure-a");
+      await firstReplayStarted.promise;
+      const waitsBeforeSecond = waitForClose.mock.calls.length;
+      const failedSecond = fetchTimeline("failure-b");
+      await vi.waitFor(() =>
+        expect(waitForClose.mock.calls.length).toBeGreaterThan(waitsBeforeSecond),
+      );
+      failReplay.resolve();
+      for (const response of await Promise.all([failedFirst, failedSecond])) {
+        expect(response).toMatchObject({ error: "Temporary replay failure", entries: [] });
+      }
+      expect(reads).toBe(1);
+      if (state !== "history only") {
+        expect(manager.getAgent(id)).not.toBeNull();
+        expect(manager.getTimeline(id)).toEqual([]);
+      }
+      if (state === "closed") {
+        await manager.closeAgent(id);
+      }
+      expect(await manager.readTimelineForSummary(id, workspaceId)).toEqual(CONTEXT_HANDOFF_ITEMS);
+
+      const first = fetchTimeline("refresh-a");
+      // If a refresh returned without attempting replay, keep the error at the public response.
+      await Promise.race([retryStarted.promise, first]);
+      const readingSummary = manager.readTimelineForSummary(id, workspaceId);
+      const second = fetchTimeline("refresh-b");
+      releaseReplay.resolve();
+      const expected = [...CONTEXT_HANDOFF_ITEMS, followup];
+      for (const response of await Promise.all([first, second])) {
+        expect(response?.error).toBeNull();
+        expect(response?.entries.map(({ item }) => item)).toEqual(expected);
+      }
+      expect(await readingSummary).toEqual(expected);
+      const opensAfterRetry = state === "still open" ? 1 : 2;
+      expect(opens).toBe(opensAfterRetry);
+      expect(reads).toBe(2);
+      expect(purposes).toEqual(
+        Array.from({ length: opensAfterRetry }, () =>
+          state === "history only" ? "history" : "interactive",
+        ),
+      );
+
+      const closing = manager.closeAgent(id);
+      const reopened = fetchTimeline("during-close");
+      await closing;
+      expect((await reopened)?.entries.map(({ item }) => item)).toEqual(expected);
+      expect(opens).toBe(opensAfterRetry + 1);
+      expect(reads).toBe(2);
+    } finally {
+      failReplay.resolve();
+      releaseReplay.resolve();
+      await session.cleanup();
+      for (const instance of [original, manager]) {
+        await Promise.all(instance.listAgents().map(({ id }) => instance.closeAgent(id)));
+        await instance.flush();
+      }
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(["legacy", "scoped"] as const)(
+  "Antigravity cold summary and chat retain independent transcript messages with a %s prefix",
+  async (prefixFormat) => {
+    const cwd = mkdtempSync(join(tmpdir(), "paseo-antigravity-history-"));
+    const logger = pino({ level: "silent" });
+    const storage = new AgentStorage(join(cwd, "agents"), logger);
+    const providers = new PluginAgentClientRegistry(logger);
+    const executable = join(cwd, "agy.cjs");
+    writeFileSync(
+      executable,
+      `
+      const { createInterface } = require("node:readline");
+      createInterface({ input: process.stdin }).on("line", (line) => {
+        const { id, method, params } = JSON.parse(line);
+        if (method === "session/load") {
+          process.stdout.write(JSON.stringify({
+            jsonrpc: "2.0", method: "session/update",
+            params: { sessionId: params.sessionId, update: {
+              sessionUpdate: "available_commands_update", availableCommands: [],
+            } },
+          }) + "\\n");
+        }
+        const result = method === "initialize"
+          ? { protocolVersion: 1, agentCapabilities: { loadSession: true } }
+          : method === "session/load"
+            ? { modes: { currentModeId: "default", availableModes: [{ id: "default", name: "Default" }] } }
+            : {};
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
+      });
+    `,
+    );
+    const provider = createAntigravityProvider();
+    providers.replace([
+      {
+        ...provider,
+        command: [process.execPath, executable],
+        connect: (options) =>
+          provider.connect({
+            ...options,
+            launch: options.launch && {
+              ...options.launch,
+              env: { ...options.launch.env, HOME: cwd },
+            },
+          }),
+      },
+    ]);
+    const newManager = () =>
+      new AgentManager({
+        logger,
+        registry: storage,
+        clients: providers.clients(),
+        providerDefinitions: providers.definitions(),
+      });
+    const original = newManager();
+    const manager = newManager();
+    const messages: SessionOutboundMessage[] = [];
+    const originalSession = createSessionForTest({
+      messages,
+      agentManager: original,
+      agentStorage: storage,
+    });
+    const workspaceId = "wks_1234567890abcdef";
+    const timestamp = "2026-01-02T00:00:00.000Z";
+    const workspace = createPersistedWorkspaceRecord({
+      workspaceId,
+      projectId: "prj_1234567890abcdef",
+      kind: "directory",
+      cwd,
+      displayName: "Antigravity",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    const session = createSessionForTest({
+      messages,
+      agentManager: manager,
+      agentStorage: storage,
+      workspaceRegistry: { get: vi.fn(async () => workspace) },
+    });
+    const record = {
+      provider: "antigravity",
+      cwd,
+      workspaceId,
+      labels: {},
+      metadata: {},
+      lastStatus: "closed",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    } as const;
+    const sourceId = "00000000-0000-4000-8000-000000000101";
+    const targetId = "00000000-0000-4000-8000-000000000102";
+    const shared = [
+      { step_index: 2, source: "USER_EXPLICIT", type: "USER_INPUT", content: "Continue." },
+      // The assistant row uses its position within each transcript as the fallback ID.
+      { source: "MODEL", type: "PLANNER_RESPONSE", content: "Done." },
+    ];
+    const ignored = { source: "SYSTEM", type: "GENERIC", content: "Transcript metadata" };
+    const earlier = [
+      { step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", content: "Review." },
+      { step_index: 1, source: "MODEL", type: "PLANNER_RESPONSE", content: "Reviewed." },
+    ];
+    const seedConversation = async (
+      id: string,
+      nativeId: string,
+      steps: typeof shared,
+      filename: string,
+    ) => {
+      const logs = join(
+        cwd,
+        ".gemini",
+        "antigravity-cli",
+        "brain",
+        nativeId,
+        ".system_generated",
+        "logs",
+      );
+      mkdirSync(logs, { recursive: true });
+      writeFileSync(
+        join(logs, filename),
+        steps
+          .map((step) =>
+            JSON.stringify({
+              ...step,
+              created_at: timestamp,
+            }),
+          )
+          .join("\n"),
+      );
+      await storage.upsert({
+        ...record,
+        id,
+        persistence: {
+          provider: "antigravity",
+          sessionId: `plugin:${JSON.stringify({ version: 1, data: { conversationId: nativeId } })}`,
+        },
+      });
+    };
+    try {
+      await seedConversation(
+        sourceId,
+        "source-native",
+        [ignored, ignored, ...shared],
+        "transcript_full.jsonl",
+      );
+      await seedConversation(
+        targetId,
+        "target-native",
+        [...earlier, ...shared],
+        "transcript.jsonl",
+      );
+      const fetchTimeline = async (viewer: Session, agentId: string, requestId: string) => {
+        await viewer.handleMessage({
+          type: "fetch_agent_timeline_request",
+          agentId,
+          requestId,
+          limit: 0,
+        });
+        const response = filterByType(messages, "fetch_agent_timeline_response").find(
+          ({ payload }) => payload.requestId === requestId,
+        )?.payload;
+        expect(response?.error).toBeNull();
+        return response?.entries.map(({ item }) => item);
+      };
+      await fetchTimeline(originalSession, sourceId, "source");
+      const targetBefore = await fetchTimeline(originalSession, targetId, "target-before");
+      expect(targetBefore).toMatchObject([
+        { type: "user_message", text: "Review." },
+        { type: "assistant_message", text: "Reviewed." },
+        { type: "user_message", text: "Continue." },
+        { type: "assistant_message", text: "Done." },
+      ]);
+      const sourceRows = original.fetchTimeline(sourceId, { limit: 0 }).rows;
+      const targetRows = original.fetchTimeline(targetId, { limit: 0 }).rows;
+      const collisionCandidates = [...sourceRows, ...targetRows.slice(2)].flatMap(({ item }) =>
+        item.type === "user_message" || item.type === "assistant_message" ? [item.messageId] : [],
+      );
+      expect.soft(collisionCandidates).toHaveLength(4);
+      expect.soft(collisionCandidates).not.toContain(undefined);
+      expect.soft(new Set(collisionCandidates).size).toBe(4);
+      await Promise.all([original.closeAgent(sourceId), original.closeAgent(targetId)]);
+      await original.flush();
+      const retainedRows = [
+        ...sourceRows.map((row, index) =>
+          prefixFormat === "legacy" &&
+          (row.item.type === "user_message" || row.item.type === "assistant_message")
+            ? {
+                ...row,
+                item: {
+                  ...row.item,
+                  messageId: index === 0 ? "history:user:2" : "history:assistant:3",
+                },
+              }
+            : row,
+        ),
+        ...targetRows.slice(0, 2).map((row) => ({
+          // Keep the already imported messages from the very same native conversation.
+          item: row.item,
+          timestamp: row.timestamp,
+          seq: row.seq + sourceRows.length,
+        })),
+      ];
+      await storage.timelinePrefixes.save(targetId, { version: 1, rows: retainedRows });
+      await session.handleMessage({
+        type: "workspace.agents.summary.request",
+        workspaceId,
+        requestId: "cold-summary",
+      });
+      const summary = findByType(messages, "workspace.agents.summary.response")?.payload;
+      expect(summary?.error).toBeNull();
+      expect.soft(summary?.entries.find(({ agentId }) => agentId === targetId)).toMatchObject({
+        firstUserPrompt: "Continue.",
+        lastAssistantSummary: "Done.",
+      });
+      expect(manager.getAgent(targetId)).toBeNull();
+      const coldItems = await manager.readTimelineForSummary(targetId, workspaceId);
+      const chat = await fetchTimeline(session, targetId, "combined");
+      const expected = [...retainedRows.map(({ item }) => item), ...targetBefore!.slice(2)];
+      expect.soft(coldItems).toEqual(expected);
+      expect(chat).toEqual(expected);
+    } finally {
+      await session.cleanup();
+      await originalSession.cleanup();
+      for (const instance of [original, manager]) {
+        await Promise.all(instance.listAgents().map(({ id }) => instance.closeAgent(id)));
+        await instance.flush();
+      }
+      await providers.shutdown();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
 
 test("provider switch rejects a session with read-only workspace permission", async () => {
   const switchAgentProvider = vi.fn();

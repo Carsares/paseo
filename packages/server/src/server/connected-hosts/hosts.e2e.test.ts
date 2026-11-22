@@ -1141,6 +1141,12 @@ test("source-key registration remains idempotent at directory capacity", async (
   ).rejects.toMatchObject({ code: "resource_limit" });
 });
 
+function isAgentCreationResponseFrame(bytes: Buffer): boolean {
+  const envelope = JSON.parse(bytes.toString());
+  if (envelope.message?.type !== "hosts.route.frame") return false;
+  return JSON.parse(envelope.message.payload.data).message?.type === "agent.create.response";
+}
+
 /** Real WebSocket proxy records the A–B physical wire without replacing either daemon. */
 async function hostWire(
   b: TestPaseoDaemon,
@@ -1149,6 +1155,7 @@ async function hostWire(
     withoutHierarchyControl?: boolean;
     omitReportAcknowledgments?: () => boolean;
     omitSendConfirmation?: boolean;
+    omitAgentCreationResponse?: () => boolean;
   } = {},
 ) {
   const http = createServer();
@@ -1213,6 +1220,8 @@ async function hostWire(
         }
       }
       frames.push({ binary, bytes, direction: "fromB" });
+      if (!binary && options.omitAgentCreationResponse?.() && isAgentCreationResponseFrame(bytes))
+        return;
       if (downstream.readyState === 1) downstream.send(bytes, { binary });
     });
     upstream.on("error", () => downstream.close());
@@ -1233,6 +1242,9 @@ async function hostWire(
     frames,
     connections: () => connections,
     active: () => wss.clients.size,
+    disconnect: () => {
+      for (const socket of wss.clients) socket.terminate();
+    },
   };
 }
 
@@ -2276,6 +2288,119 @@ test.each(["automatic", "explicit"] as const)(
         .toBe(true);
       expect(notifications()).toEqual([]);
     }
+  },
+);
+
+test.each(["same host", "reverse link", "forward link"] as const)(
+  "delivers a queued parent report after child archive over %s",
+  { timeout: 30000 },
+  async (route) => {
+    const parentPrompts: string[] = [];
+    const held = Promise.withResolvers<void>();
+    const a = await daemon({
+      agentClients: createTestAgentClients({
+        onStartTurn: (prompt) => parentPrompts.push(String(prompt)),
+        beforeTurnComplete: async (prompt) => {
+          if (String(prompt) === "Hold parent turn") await held.promise;
+        },
+      }),
+    });
+    cleanup.push(async () => held.resolve());
+    const origin = await api(a);
+    const b = route === "same host" ? a : await daemon();
+    const destination = b === a ? origin : await api(b);
+    const parentWorkspace = await origin.paseo.workspaces.create({
+      source: { kind: "directory", path: a.staticDir },
+    });
+    const config = { provider: "claude/claude-test", modeId: "full-access" };
+    const parent = await parentWorkspace.agents.create({ config });
+    if (route === "same host") {
+      await origin.client.sendMessage(parent.id, "Hold parent turn");
+      await expect.poll(() => parentPrompts).toEqual(["Hold parent turn"]);
+    }
+    const options = {
+      config,
+      cwd: b.staticDir,
+      title: "Child with a queued report",
+      parent: parent.address,
+      parentReporting: "explicit" as const,
+    };
+    let childId: string;
+    let resumeDelivery: () => Promise<void>;
+    if (route === "forward link") {
+      let omitResponse = true;
+      const wire = await hostWire(b, { omitAgentCreationResponse: () => omitResponse });
+      await origin.paseo.hosts.add({ connection: wire.connection });
+      const bId = (await online(origin.paseo)).hosts[0]!.serverId!;
+      const remote = await origin.paseo.hosts.client(bId);
+      const creation = remote.agents.create(options);
+      void creation.catch(() => undefined);
+      await expect
+        .poll(() =>
+          wire.frames.some(
+            (frame) =>
+              frame.direction === "fromB" &&
+              !frame.binary &&
+              isAgentCreationResponseFrame(frame.bytes),
+          ),
+        )
+        .toBe(true);
+      const { entries } = await destination.paseo.agents.list();
+      childId = entries.find(({ agent }) => agent.title === options.title)!.agent.id;
+      resumeDelivery = async () => {
+        omitResponse = false;
+        const connections = wire.connections();
+        wire.disconnect();
+        expect((await creation).id).toBe(childId);
+        expect(wire.connections()).toBeGreaterThan(connections);
+      };
+    } else {
+      if (route === "reverse link") {
+        const saved = await destination.paseo.hosts.add({ connection: `127.0.0.1:${a.port}` });
+        await online(destination.paseo);
+        await destination.paseo.hosts.update(saved.registrationId, { enabled: false });
+        resumeDelivery = async () => {
+          await destination.paseo.hosts.update(saved.registrationId, { enabled: true });
+          await online(destination.paseo);
+        };
+      } else {
+        resumeDelivery = async () => held.resolve();
+      }
+      childId = (await destination.paseo.agents.create(options)).id;
+    }
+    if (route === "forward link") expect((await destination.paseo.hosts.list()).hosts).toEqual([]);
+    else expect((await origin.paseo.hosts.list()).hosts).toEqual([]);
+
+    const childTools = new Client({ name: "archived-child-report", version: "1" });
+    cleanup.push(() => childTools.close());
+    await childTools.connect(
+      new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${b.port}/mcp/agents?callerAgentId=${childId}`),
+      ),
+    );
+    const summary = "Deliver the accepted report after child archive";
+    const submitted = await childTools.callTool({
+      name: "report_to_parent",
+      arguments: { status: "blocked", summary },
+    });
+    expect(submitted.structuredContent).toMatchObject({ deliveryStatus: "queued" });
+    const { messageId } = submitted.structuredContent as { messageId: string };
+    const readReports = () =>
+      readFile(join(b.paseoHome, "finish-followup-reports.json"), "utf8").then(JSON.parse);
+    expect(await readReports()).toMatchObject([{ id: messageId, childAgentId: childId }]);
+
+    await destination.client.archiveAgent(childId);
+    expect((await destination.client.fetchAgent(childId))?.agent.archivedAt).toEqual(
+      expect.any(String),
+    );
+    const received = () => parentPrompts.filter((prompt) => prompt.includes(summary));
+    expect(received()).toEqual([]);
+    expect(await readReports()).toMatchObject([{ id: messageId }]);
+    await resumeDelivery();
+    await expect.poll(readReports, { timeout: 15000 }).toEqual([]);
+    expect(received()).toHaveLength(1);
+    expect(received()[0]).toContain(`source-agent-id="${childId}"`);
+    expect(received()[0]).toContain("Report to parent (blocked):");
   },
 );
 

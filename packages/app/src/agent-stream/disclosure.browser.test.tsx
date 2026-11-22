@@ -107,10 +107,11 @@ describe("timeline disclosures hold their row", () => {
     ]);
   });
 
-  it("reveals capped assistant messages in 32,000-character steps, holds the row, and survives remount", () => {
+  it("reveals capped assistant messages in 32,000-character steps, holds the row, and survives remount", async () => {
     const firstChunk = `${"a".repeat(ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT - 10)}\n`;
     const secondChunk = `${"b".repeat(ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT - 10)}\n`;
-    const finalTail = "FINAL_VISIBLE_TAIL";
+    // The full message must exceed 64,000 characters to require two expansions.
+    const finalTail = "FINAL_VISIBLE_ASSISTANT_MESSAGE_TAIL";
     const fullMessage = `${firstChunk}${secondChunk}${finalTail}`;
     const expansion = createAssistantMessageExpansion();
     const renderAssistant = () => (
@@ -129,6 +130,9 @@ describe("timeline disclosures hold their row", () => {
       () => view().queryByRole("button", { name: "Show less" }) !== null,
       renderAssistant(),
     );
+
+    // The Markdown parser initializes asynchronously on its first render.
+    await expect.poll(() => container.textContent).toContain(firstChunk.trimEnd());
 
     expect(view().getByTestId("assistant-message-capped-notice")).toBeTruthy();
     expect(container.textContent).not.toContain(finalTail);

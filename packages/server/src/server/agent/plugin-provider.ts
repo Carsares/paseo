@@ -1685,7 +1685,11 @@ class PluginAgentSession implements AgentSession {
   private translateTimeline(
     event: Extract<ProviderEvent, { type: "timeline.item" }>,
   ): AgentStreamEvent[] {
-    const item = mapTimelineItem(event.item, this.timelineSnapshots, this.revertTokens);
+    const item = mapTimelineItem(
+      this.scopeTranscriptMessage(event.item),
+      this.timelineSnapshots,
+      this.revertTokens,
+    );
     return item
       ? [
           {
@@ -1697,6 +1701,30 @@ class PluginAgentSession implements AgentSession {
           },
         ]
       : [];
+  }
+
+  private scopeTranscriptMessage(item: ProviderTimelineItem): ProviderTimelineItem {
+    if (this.provider !== "antigravity") return item;
+    if (item.type !== "user_message" && item.type !== "assistant_message") return item;
+    if (item.messageId !== item.id) return item;
+    const role = item.type === "user_message" ? "user" : "assistant";
+    const prefix = `history:${role}:`;
+    if (!item.id.startsWith(prefix)) return item;
+    const persistence = this.bridge.persistence?.data;
+    const nativeSessionId =
+      persistence && typeof persistence === "object" && !Array.isArray(persistence)
+        ? persistence.sessionId
+        : undefined;
+    if (typeof nativeSessionId !== "string" || !nativeSessionId) return item;
+
+    // Transcript step IDs are local to a native conversation. Keep the plugin
+    // event shape while carrying the conversation identity into saved rows.
+    // Old unscoped rows remain readable but cannot prove a same-source replay.
+    const source = Buffer.from(nativeSessionId, "utf16le").toString("base64url");
+    return {
+      ...item,
+      messageId: `history:antigravity:${source}:${role}:${item.id.slice(prefix.length)}`,
+    };
   }
 
   private translatePermission(

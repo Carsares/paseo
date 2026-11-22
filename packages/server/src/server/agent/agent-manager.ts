@@ -393,6 +393,8 @@ interface HydrateTimelineOptions {
   force?: boolean;
   broadcast?: boolean | (() => boolean);
   broadcastTimeline?: boolean;
+  /** The loader already opened a session. A concurrent archive may have closed it. */
+  whileRegistered?: boolean;
 }
 
 export type ImportablePersistedAgentQueryOptions = ListImportableSessionsOptions & {
@@ -1152,6 +1154,7 @@ export class AgentManager {
   private readonly providerDefinitions = new Map<AgentProvider, ProviderEnabledFlag>();
   private readonly agents = new Map<string, LiveManagedAgent>();
   private readonly timelineStore: InMemoryAgentTimelineStore;
+  private readonly unprimedRetainedTimelines = new Set<string>();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly backgroundWork = new AgentBackgroundWorkStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
@@ -1819,10 +1822,12 @@ export class AgentManager {
     if (this.timelineStore.getSealedThrough(agentId)) return this.timelineStore.getItems(agentId);
 
     const items = projectSummaryTimelineItems(this.timelineStore.getRows(agentId));
-    if (this.agents.get(agentId)?.historyPrimed !== false) return items;
+    const historyPrimed =
+      this.agents.get(agentId)?.historyPrimed ?? !this.unprimedRetainedTimelines.has(agentId);
+    if (historyPrimed) return items;
 
-    // A resumed session is registered before replay completes. A failed replay leaves
-    // its timeline unprimed, so the retained prefix is still on disk.
+    // A failed replay leaves its timeline unprimed, even if the session has
+    // since closed. The retained prefix is still on disk.
     const prefix = await this.timelinePrefixes.load(agentId);
     return prefix?.rows.length ? [...prefix.rows.map(({ item }) => item), ...items] : items;
   }
@@ -5226,6 +5231,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
     onAccepted?: () => void | Promise<void>,
+    assertDispatchAllowed?: () => void,
   ): Promise<boolean> {
     this.assertAcceptingAgentRuns();
     if (this.collectingRuntimes.has(agentId) || !this.agents.has(agentId)) {
@@ -5277,7 +5283,17 @@ export class AgentManager {
       }
       this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
     };
-    void this.runForegroundMutation(agentId, async () => {
+    // Ordinary commands acknowledge queueing. A withdrawable command must wait
+    // until it reaches the provider so its caller can safely consume recovery intent.
+    let markCommandStarted: (() => void) | undefined;
+    const commandStarted = assertDispatchAllowed
+      ? new Promise<void>((resolveStarted) => {
+          markCommandStarted = resolveStarted;
+        })
+      : undefined;
+    const command = this.runForegroundMutation(agentId, async () => {
+      assertDispatchAllowed?.();
+      markCommandStarted?.();
       try {
         await handler.run({ emit: dispatch });
       } catch (error) {
@@ -5289,6 +5305,7 @@ export class AgentManager {
         });
       }
     });
+    if (commandStarted) await Promise.race([commandStarted, command]);
     return true;
   }
 
@@ -6463,8 +6480,27 @@ export class AgentManager {
     agentId: string,
     options?: HydrateTimelineOptions,
   ): Promise<void> {
-    const agent = this.requireSessionAgent(agentId);
-    await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
+    if (options?.whileRegistered) {
+      return this.runLifecycleMutation(agentId, async () => {
+        // Whichever operation entered the lane first gets to finish. An
+        // archive that already closed this session wins over initial replay.
+        const agent = this.agents.get(agentId);
+        if (!agent) return;
+        try {
+          await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
+        } catch (error) {
+          // Some temporary readers (such as Pi) shut down when history exits.
+          // Discard a failed reader so the next load can open a fresh one.
+          if (!agent.historyPrimed && this.historySessions.has(agent.session)) {
+            await this.closeAgentRuntime(agentId).catch((closeError: unknown) => {
+              this.logger.warn({ err: closeError, agentId }, "Failed to close history reader");
+            });
+          }
+          throw error;
+        }
+      });
+    }
+    await this.hydrateTimelineFromLegacyProviderHistory(this.requireSessionAgent(agentId), options);
   }
 
   private buildPendingTimelinePrefix(
@@ -7327,7 +7363,9 @@ export class AgentManager {
         options?.persistence ?? session.describePersistence(),
         config,
       ),
-      historyPrimed: options?.historyPrimed ?? durableTimelineHasRows,
+      historyPrimed:
+        options?.historyPrimed ??
+        (durableTimelineHasRows && !this.unprimedRetainedTimelines.has(resolvedAgentId)),
       lastUserMessageAt: options?.lastUserMessageAt ?? null,
       lastUsage: options?.lastUsage,
       lastError: options?.lastError,
@@ -7355,6 +7393,11 @@ export class AgentManager {
     agent: LiveManagedAgent,
     cancelReason: string,
   ): ManagedAgentClosed {
+    if (agent.historyPrimed) {
+      this.unprimedRetainedTimelines.delete(agent.id);
+    } else {
+      this.unprimedRetainedTimelines.add(agent.id);
+    }
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     this.agents.delete(agent.id);
     this.pendingHierarchySessionReloads.delete(agent.id);
@@ -7388,6 +7431,7 @@ export class AgentManager {
   }
 
   private discardRetainedAgentState(agentId: string): void {
+    this.unprimedRetainedTimelines.delete(agentId);
     this.cancelContextHandoff(agentId);
     this.timelineStore.delete(agentId);
     this.paseoToolPolicies.delete(agentId);

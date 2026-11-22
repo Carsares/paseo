@@ -36,6 +36,7 @@ export const CircleX = StubIcon;
 export const ClipboardPaste = StubIcon;
 export const Copy = StubIcon;
 export const CornerDownLeft = StubIcon;
+export const Crown = StubIcon;
 export const Download = StubIcon;
 export const ExternalLink = StubIcon;
 export const Eye = StubIcon;

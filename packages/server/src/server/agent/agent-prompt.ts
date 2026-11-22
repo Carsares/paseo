@@ -32,6 +32,8 @@ export interface StartAgentRunOptions {
   /** If busy, try an admitted steer without replacing or switching the active turn. */
   admitSteer?: () => Promise<boolean>;
   beforeHandoff?: () => Promise<void>;
+  /** Rechecked synchronously when a queued command reaches the provider. */
+  assertCommandDispatchAllowed?: () => void;
   onSteerDeclined?: () => Promise<void>;
   admit?: () => boolean;
   /** Called after selecting the run, before consuming its events. */
@@ -144,7 +146,15 @@ export async function startAgentRun(
   // in-flight turn — replaceAgentRun would interrupt the running turn. The
   // intercept lives at this layer so it covers every prompt entrypoint.
   const admitCommand = admitOutOfBand(options);
-  if (await agentManager.tryRunOutOfBand(agentId, prompt, options?.runOptions, admitCommand)) {
+  if (
+    await agentManager.tryRunOutOfBand(
+      agentId,
+      prompt,
+      options?.runOptions,
+      admitCommand,
+      options?.assertCommandDispatchAllowed,
+    )
+  ) {
     options?.onDispatch?.("out_of_band");
     return { disposition: "out_of_band" };
   }
@@ -268,6 +278,8 @@ export interface SendPromptToAgentParams {
   admit?: StartAgentRunOptions["admit"];
   /** Awaited after the agent is loaded and its mode is set, before the prompt is handed to a run. */
   beforeDispatch?: () => Promise<void>;
+  /** Throws if the caller withdrew this prompt during loading or before provider handoff. */
+  assertDispatchAllowed?: () => void;
   onDispatch?: StartAgentRunOptions["onDispatch"];
   agentManager: AgentManager;
   agentStorage: AgentStorage;
@@ -393,6 +405,24 @@ export async function sendPromptToAgent(
   });
 }
 
+function preparePromptHandoff({
+  handoff,
+  validateDispatch,
+  assertDispatchAllowed,
+}: Pick<SendPromptToAgentParams, "handoff" | "validateDispatch" | "assertDispatchAllowed">):
+  | (() => Promise<void>)
+  | undefined {
+  if (!handoff && !assertDispatchAllowed) return undefined;
+  return async () => {
+    if (handoff) {
+      await validateDispatch?.();
+      await handoff.begin();
+      await validateDispatch?.();
+    }
+    assertDispatchAllowed?.();
+  };
+}
+
 /** Dispatch daemon-prepared context without reclassifying it as human input. */
 export async function sendPreparedPromptToAgent(
   params: Omit<SendPromptToAgentParams, "source" | "messageId">,
@@ -425,6 +455,7 @@ export async function sendPreparedPromptToAgent(
     throw error;
   }
 
+  params.assertDispatchAllowed?.();
   if (
     params.idleOnly &&
     !params.canSteerDuringDrain?.() &&
@@ -440,13 +471,7 @@ export async function sendPreparedPromptToAgent(
   if (!params.idleOnly && params.admit?.() === false) {
     throw new Error("Queued agent message was withdrawn");
   }
-  const beforeHandoff = params.handoff
-    ? async () => {
-        await params.validateDispatch?.();
-        await params.handoff!.begin();
-        await params.validateDispatch?.();
-      }
-    : undefined;
+  const beforeHandoff = preparePromptHandoff(params);
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
     replaceRunning: !params.idleOnly,
     idleOnly: params.idleOnly,
@@ -460,6 +485,7 @@ export async function sendPreparedPromptToAgent(
         }
       : undefined,
     beforeHandoff,
+    assertCommandDispatchAllowed: params.assertDispatchAllowed,
     onSteerDeclined: params.handoff?.declined,
     admit: params.admit,
     onDispatch: params.onDispatch,

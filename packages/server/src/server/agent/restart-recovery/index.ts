@@ -13,8 +13,8 @@ interface Dependencies {
   automaticMarkerPath?: string;
   settings(): { enabled: boolean; prompt: string };
   eligible(record: RecoveryCandidate): Promise<boolean>;
-  /** Resolves once the provider has accepted the continuation. */
-  dispatch(agentId: string, prompt: string): Promise<void>;
+  /** Resolves once the provider has accepted the continuation or the intent was withdrawn. */
+  dispatch(agentId: string, prompt: string, canDispatch?: () => boolean): Promise<void>;
   report(agentId: string, error: unknown): void;
 }
 interface StartupRecovery {
@@ -118,14 +118,16 @@ export function createRestartRecovery(deps: Dependencies) {
     const record = await deps.storage.get(agentId);
     const { forced } = intent;
     const marker = forced ? oneShot : automatic;
+    const canDispatch = forced ? undefined : () => !intent.canceled && deps.settings().enabled;
     if (
       record &&
       (forced || record.resumeOnStartup || automatic.agentIds.has(agentId)) &&
       (await eligible(record)) &&
-      !intent.canceled &&
-      (forced || deps.settings().enabled)
+      canDispatch?.() !== false
     ) {
-      await deps.dispatch(agentId, deps.settings().prompt);
+      const { prompt } = deps.settings();
+      if (canDispatch) await deps.dispatch(agentId, prompt, canDispatch);
+      else await deps.dispatch(agentId, prompt);
     }
     await serializeRecoveryWrites(async () => {
       if (intent.canceled) return;

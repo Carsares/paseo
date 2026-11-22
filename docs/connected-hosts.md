@@ -63,12 +63,14 @@ Explicit parent reporting requires a destination that advertises `agentExplicitP
 The child saves the report on its own host. The parent can pull it over its authenticated
 connection to the child, and the child can push it over an existing authenticated connection to
 the parent. Both routes share the same delivery receipt. The child keeps the report until
-the parent acknowledges dispatch or the relationship no longer permits delivery.
+the parent acknowledges dispatch or the relationship no longer permits delivery. Archiving
+the child leaves an already queued report available for its direct parent.
 
 When a parent host advertises `agentTrackRemoteParentReports`, SDK creation through
 `hosts.client` registers a durable pull watch on that host for an explicit child of one of
 its agents. This also applies to workspace creation with an initial agent. Registration
-checks both hosts' workspace grants and the relationship saved by the destination.
+checks both hosts' workspace grants and the relationship saved by the destination. A
+creation recovered after child archive can still register to collect queued reports.
 
 Remote creation and local subscription persistence are separate commits. A failed local write reports
 failure even if the destination already created the child; inspect it before retrying creation.

@@ -874,12 +874,15 @@ interface NewWorkspaceInitialContextState {
   lastActiveProject: HostProjectListItem | null;
 }
 
-function useNewWorkspaceInitialContext({
-  serverId,
-  sourceDirectory: sourceDirectoryProp,
-  projectId,
-  displayName: displayNameProp,
-}: NewWorkspaceScreenProps): NewWorkspaceInitialContextState {
+function useNewWorkspaceInitialContext(
+  {
+    serverId,
+    sourceDirectory: sourceDirectoryProp,
+    projectId,
+    displayName: displayNameProp,
+  }: NewWorkspaceScreenProps,
+  isTimelineFork: boolean,
+): NewWorkspaceInitialContextState {
   const allHosts = useHosts();
   const allServerIds = useMemo(() => allHosts.map((h) => h.serverId), [allHosts]);
   const projects = useHostProjects(allServerIds);
@@ -940,7 +943,8 @@ function useNewWorkspaceInitialContext({
 
   return {
     allHosts,
-    selectedServerId,
+    // The selected history belongs to its source host, including while that host is offline.
+    selectedServerId: isTimelineFork ? serverId.trim() : selectedServerId,
     hostPickerOpen,
     handleSelectHost,
     handleHostPickerOpenChange,
@@ -990,12 +994,10 @@ export function NewWorkspaceScreen({
     routeProject,
     routeProjectContextViewKey,
     lastActiveProject,
-  } = useNewWorkspaceInitialContext({
-    serverId,
-    sourceDirectory: sourceDirectoryProp,
-    projectId,
-    displayName: displayNameProp,
-  });
+  } = useNewWorkspaceInitialContext(
+    { serverId, sourceDirectory: sourceDirectoryProp, projectId, displayName: displayNameProp },
+    isTimelineFork,
+  );
   // COMPAT(workspaceMultiplicity): added in v0.1.97, drop the gate when floor >= v0.1.97
   const supportsWorkspaceMultiplicity = useHostFeature(selectedServerId, "workspaceMultiplicity");
   const supportsForgeSearch = useHostFeature(selectedServerId, "forgeSearch");

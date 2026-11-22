@@ -67,12 +67,8 @@ export class PluginSettingsStore {
     const read = () =>
       this.serial(async () => {
         const state = await this.read(definition, notify);
-        if (
-          state.status === "ready" &&
-          observedRevision !== undefined &&
-          state.revision !== observedRevision
-        ) {
-          // Publish a repaired or edited file to existing subscribers. A read need not invalidate client queries.
+        if (observedRevision !== undefined && state.revision !== observedRevision) {
+          // Publish external edits, including invalid states, without invalidating client queries.
           notify(state);
         } else {
           observedRevision = state.revision;

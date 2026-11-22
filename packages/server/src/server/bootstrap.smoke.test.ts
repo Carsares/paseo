@@ -29,6 +29,7 @@ import {
 import { parseAgentMessages } from "./agent/agent-messages/index.js";
 import { ensureAgentLoaded } from "./agent/agent-loading.js";
 import { AgentManagerShuttingDownError } from "./agent/agent-manager.js";
+import { StaleProviderSessionError } from "./agent/stale-provider-session-error.js";
 import { hashDaemonPassword } from "./auth.js";
 import { generateLocalPairingOffer } from "./pairing-offer.js";
 import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
@@ -1520,7 +1521,13 @@ describe("paseo daemon bootstrap", () => {
     },
   );
 
-  test.each(["stay-enabled", "toggle-after-rejection", "toggle-before-rejection"] as const)(
+  const automaticRecoverySettingsChanges = [
+    "stay-enabled",
+    "toggle-after-rejection",
+    "toggle-before-rejection",
+    "toggle-before-confirmation",
+  ] as const;
+  test.each(automaticRecoverySettingsChanges)(
     "automatic startup recovery handles live settings change (%s)",
     async (scenario) => {
       const root = await mkdtemp(path.join(os.tmpdir(), "paseo-auto-opt-out-"));
@@ -1534,6 +1541,7 @@ describe("paseo daemon bootstrap", () => {
       const entered = Promise.withResolvers<void>();
       const pending = Promise.withResolvers<void>();
       const reported = Promise.withResolvers<void>();
+      const automaticPrompts: unknown[] = [];
       const logger = pino({ level: "silent" });
       const bootstrapLogger = logger.child({ module: "bootstrap" });
       vi.spyOn(logger, "child").mockReturnValueOnce(bootstrapLogger);
@@ -1549,6 +1557,7 @@ describe("paseo daemon bootstrap", () => {
         if (!start) throw new Error("Test session must support starting a turn");
         session.startTurn = async (...turn) => {
           if (args[0].sessionId === id) {
+            automaticPrompts.push(turn[0]);
             entered.resolve();
             await pending.promise;
           } else {
@@ -1600,7 +1609,14 @@ describe("paseo daemon bootstrap", () => {
             .toBe("error");
           await reported.promise;
         };
-        if (scenario === "toggle-before-rejection") {
+        if (scenario === "toggle-before-confirmation") {
+          await client.patchDaemonConfig({ resumeOnStartup: false });
+          await client.patchDaemonConfig({ resumeOnStartup: true });
+          pending.resolve();
+          await expect
+            .poll(async () => (await first.daemon.agentStorage.get(id))?.lastStatus)
+            .toBe("idle");
+        } else if (scenario === "toggle-before-rejection") {
           await client.patchDaemonConfig({ resumeOnStartup: false });
           await client.patchDaemonConfig({ resumeOnStartup: true });
           await reject();
@@ -1634,6 +1650,7 @@ describe("paseo daemon bootstrap", () => {
         expect(resumed.toSorted()).toEqual(
           (scenario === "stay-enabled" ? [id, explicitId] : [explicitId]).toSorted(),
         );
+        expect(automaticPrompts).toEqual(["Resume working."]);
       } finally {
         pending.resolve();
         await client?.close();
@@ -1645,6 +1662,245 @@ describe("paseo daemon bootstrap", () => {
       }
     },
   );
+
+  test.each([
+    { settings: "disabled then enabled", changes: [false, true], automaticCommands: [] },
+    { settings: "kept enabled", changes: [], automaticCommands: ["/goal pause"] },
+  ])(
+    "custom automatic recovery command queued behind an ordinary command with settings $settings",
+    async (scenario) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), "paseo-recovery-command-"));
+      const home = path.join(root, ".paseo");
+      const marker = path.join(home, "restart-recovery-pending.json");
+      const id = randomUUID();
+      const waitingForRecoveryRead = Promise.withResolvers<void>();
+      const allowRecoveryRead = Promise.withResolvers<void>();
+      const ordinaryRunning = Promise.withResolvers<void>();
+      const allowOrdinary = Promise.withResolvers<void>();
+      const recoveryParsed = Promise.withResolvers<void>();
+      const recoveryRunning = Promise.withResolvers<void>();
+      const allowRecoveryCommand = Promise.withResolvers<void>();
+      const fenceRan = Promise.withResolvers<void>();
+      const commands: string[] = [];
+      const clients = createTestAgentClients();
+      const codex = clients.codex!;
+      const resume = codex.resumeSession.bind(codex);
+      vi.spyOn(codex, "resumeSession").mockImplementation(async (...args) => {
+        const provider = await resume(...args);
+        provider.tryHandleOutOfBand = (prompt) => {
+          if (typeof prompt !== "string") return null;
+          if (prompt === "/goal pause") recoveryParsed.resolve();
+          return {
+            run: async () => {
+              commands.push(prompt);
+              if (prompt === "/compact") {
+                ordinaryRunning.resolve();
+                await allowOrdinary.promise;
+              }
+              if (prompt === "/goal pause") {
+                recoveryRunning.resolve();
+                await allowRecoveryCommand.promise;
+              }
+              if (prompt === "/goal resume") fenceRan.resolve();
+            },
+          };
+        };
+        return provider;
+      });
+      let daemon: Awaited<ReturnType<typeof createPaseoDaemon>> | undefined;
+      let client: DaemonClient | undefined;
+      try {
+        const storage = new AgentStorage(path.join(home, "agents"), pino({ level: "silent" }));
+        const timestamp = new Date().toISOString();
+        await storage.upsert(
+          parseStoredAgentRecord({
+            id,
+            provider: "codex",
+            cwd: root,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            lastStatus: "error",
+            persistence: { provider: "codex", sessionId: id },
+          }),
+        );
+        await writeFile(marker, JSON.stringify({ version: 2, agentIds: [id] }));
+        daemon = await createPaseoDaemon(
+          {
+            ...loadConfig(home, { env: {} }),
+            listen: "127.0.0.1:0",
+            staticDir: root,
+            agentStoragePath: path.join(home, "agents"),
+            agentClients: clients,
+            mcpEnabled: false,
+            relayEnabled: false,
+            pluginsEnabled: false,
+            resumeOnStartup: true,
+            resumePrompt: "/goal pause",
+          },
+          pino({ level: "silent" }),
+        );
+        const read = daemon.agentStorage.get.bind(daemon.agentStorage);
+        let pauseRead = true;
+        vi.spyOn(daemon.agentStorage, "get").mockImplementation(async (agentId) => {
+          if (agentId === id && pauseRead && daemon?.getListenTarget()) {
+            pauseRead = false;
+            waitingForRecoveryRead.resolve();
+            await allowRecoveryRead.promise;
+          }
+          return read(agentId);
+        });
+        await daemon.start();
+        await waitingForRecoveryRead.promise;
+        const listen = daemon.getListenTarget();
+        if (listen?.type !== "tcp") throw new Error("Expected an isolated TCP listener");
+        client = new DaemonClient({ url: `ws://127.0.0.1:${listen.port}/ws` });
+        await client.connect();
+        await client.sendMessage(id, "/compact");
+        await ordinaryRunning.promise;
+        allowRecoveryRead.resolve();
+        await recoveryParsed.promise;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(commands).toEqual(["/compact"]);
+        if (scenario.changes.length) {
+          for (const enabled of scenario.changes) {
+            const updated = await client.patchDaemonConfig({ resumeOnStartup: enabled });
+            expect(updated.config.resumeOnStartup).toBe(enabled);
+          }
+          await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
+        } else {
+          await expect(daemon.stop({ resumeAgents: true })).rejects.toThrow(
+            "startup recovery is still in progress",
+          );
+          expect(JSON.parse(await readFile(marker, "utf8"))).toEqual({
+            version: 2,
+            agentIds: [id],
+          });
+        }
+        // The manual command still acknowledges queueing while the first command is running.
+        await client.sendMessage(id, "/goal resume");
+        expect(commands).toEqual(["/compact"]);
+        allowOrdinary.resolve();
+        if (scenario.automaticCommands.length) {
+          await recoveryRunning.promise;
+          // Handoff is enough to consume the marker while the command remains active.
+          await vi.waitFor(() =>
+            expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" }),
+          );
+        }
+        allowRecoveryCommand.resolve();
+        await fenceRan.promise;
+        expect(commands).toEqual(["/compact", ...scenario.automaticCommands, "/goal resume"]);
+      } finally {
+        allowRecoveryRead.resolve();
+        allowOrdinary.resolve();
+        allowRecoveryCommand.resolve();
+        await client?.close();
+        await daemon?.stop();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    12_000,
+  );
+
+  test.each([
+    { settings: "kept enabled", changes: [], automaticStarts: ["Resume working."], retry: false },
+    { settings: "disabled", changes: [false], automaticStarts: [], retry: false },
+    {
+      settings: "disabled then enabled",
+      changes: [false, true],
+      automaticStarts: [],
+      retry: false,
+    },
+    {
+      settings: "disabled then enabled during reopen",
+      changes: [false, true],
+      automaticStarts: [],
+      retry: true,
+    },
+  ])("startup recovery while opening sessions with settings $settings", async (scenario) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-recovery-opening-"));
+    const home = path.join(root, ".paseo");
+    const automaticMarker = path.join(home, "restart-recovery-pending.json");
+    const oneShotMarker = path.join(home, "restart-recovery-once.json");
+    const automaticId = randomUUID();
+    const oneShotId = randomUUID();
+    const storage = new AgentStorage(path.join(home, "agents"), pino({ level: "silent" }));
+    const allowOpen = Promise.withResolvers<void>();
+    const automaticOpening = Promise.withResolvers<void>();
+    const oneShotOpening = Promise.withResolvers<void>();
+    const starts = vi.fn<(id: string, prompt: unknown) => void>();
+    const providers = createTestAgentClients();
+    const codex = providers.codex!;
+    const resume = codex.resumeSession.bind(codex);
+    let automaticOpens = 0;
+    vi.spyOn(codex, "resumeSession").mockImplementation(async (handle, ...args) => {
+      const automatic = handle.sessionId === automaticId;
+      const stale = automatic && scenario.retry && ++automaticOpens === 1;
+      if (!stale) {
+        (automatic ? automaticOpening : oneShotOpening).resolve();
+        await allowOpen.promise;
+      }
+      const session = await resume(handle, ...args);
+      const start = session.startTurn.bind(session);
+      session.startTurn = (prompt, options) => {
+        if (stale) return Promise.reject(new StaleProviderSessionError(handle.sessionId));
+        starts(handle.sessionId, prompt);
+        return start(prompt, options);
+      };
+      return session;
+    });
+    let daemon: Awaited<ReturnType<typeof createTestPaseoDaemon>> | undefined;
+    let client: DaemonClient | undefined;
+    try {
+      const timestamp = new Date().toISOString();
+      for (const id of [automaticId, oneShotId]) {
+        await storage.upsert(
+          parseStoredAgentRecord({
+            id,
+            provider: "codex",
+            cwd: root,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            lastStatus: id === automaticId ? "error" : "closed",
+            persistence: { provider: "codex", sessionId: id },
+          }),
+        );
+      }
+      await writeFile(automaticMarker, JSON.stringify({ version: 2, agentIds: [automaticId] }));
+      await writeFile(oneShotMarker, JSON.stringify({ version: 2, agentIds: [oneShotId] }));
+      const handle = await createTestPaseoDaemon({
+        paseoHomeRoot: root,
+        resumeOnStartup: true,
+        agentClients: providers,
+      });
+      daemon = handle;
+      await Promise.all([automaticOpening.promise, oneShotOpening.promise]);
+      client = new DaemonClient({ url: `ws://127.0.0.1:${handle.port}/ws` });
+      await client.connect();
+      for (const enabled of scenario.changes) {
+        const updated = await client.patchDaemonConfig({ resumeOnStartup: enabled });
+        expect(updated.config.resumeOnStartup).toBe(enabled);
+      }
+      allowOpen.resolve();
+      const promptsFor = (id: string) =>
+        starts.mock.calls.filter(([agentId]) => agentId === id).map(([, prompt]) => prompt);
+      const manualPrompts = scenario.changes.length ? ["Continue with my instructions."] : [];
+      for (const prompt of manualPrompts) {
+        await client.sendMessage(automaticId, prompt);
+        await vi.waitFor(() => expect(promptsFor(automaticId)).toContain(prompt));
+      }
+      // A stop with recovery is refused until both startup attempts settle.
+      await vi.waitFor(() => handle.daemon.stop({ resumeAgents: true }), { timeout: 5_000 });
+      expect(promptsFor(automaticId)).toEqual([...scenario.automaticStarts, ...manualPrompts]);
+      expect(promptsFor(oneShotId)).toEqual(["Resume working."]);
+      await expect(readFile(automaticMarker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      allowOpen.resolve();
+      await client?.close();
+      await daemon?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   test("standalone listener exposes services only", async () => {
     const standalonePort = await findFreePort();

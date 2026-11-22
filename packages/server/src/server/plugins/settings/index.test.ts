@@ -141,6 +141,41 @@ test("rereading repaired settings updates existing listeners once on the same in
   expect(notifications).toHaveLength(1);
 });
 
+test("rereading invalid and restored settings notifies existing listeners once per revision", async () => {
+  const { directory, changes, handlers } = await setup();
+  const file = path.join(directory, "display.json");
+  const originalRaw = JSON.stringify({ version: 1, values: { enabled: false, count: 9 } });
+  await writeFile(file, originalRaw);
+  const notifications: DisplaySettingsState[] = [];
+  handlers.settings.subscribe((state) => {
+    notifications.push(state);
+  });
+  const original = await handlers.settings.read();
+  expect(original).toMatchObject({ status: "ready", values: { enabled: false, count: 9 } });
+  expect(notifications).toEqual([]);
+
+  const invalidRaw = JSON.stringify({ version: 1, values: { count: 0 } });
+  await writeFile(file, invalidRaw);
+  const invalid = await handlers.read.handle();
+  expect(invalid).toEqual({
+    status: "invalid",
+    revision: expect.any(String),
+    error: expect.any(String),
+  });
+  expect(await handlers.read.handle()).toEqual(invalid);
+  expect(notifications).toEqual([invalid]);
+  expect(
+    await handlers.write.handle({ revision: original.revision, values: { count: 10 } }),
+  ).toMatchObject({ status: "conflict" });
+  expect(await readFile(file, "utf8")).toBe(invalidRaw);
+
+  await writeFile(file, originalRaw);
+  expect(await handlers.read.handle()).toEqual(original);
+  expect(await handlers.settings.read()).toEqual(original);
+  expect(notifications).toEqual([invalid, original]);
+  expect(changes).toEqual([]);
+});
+
 test("validation failure preserves disk and leaves the writer usable", async () => {
   const { handlers, changes } = await setup();
   expect(await handlers.write.handle({ revision: "missing", values: { count: -1 } })).toMatchObject(

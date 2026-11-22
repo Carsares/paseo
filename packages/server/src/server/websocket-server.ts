@@ -2931,15 +2931,11 @@ export class VoiceAssistantWebSocketServer {
   private async confirmParentReport(
     request: AgentFinishReportConfirmRequest,
   ): Promise<AgentFinishReportConfirmResult> {
-    const storedChild = await this.agentStorage.get(request.childAgentId);
-    const child = this.agentManager.getAgent(request.childAgentId) ?? storedChild;
+    const child =
+      this.agentManager.getAgent(request.childAgentId) ??
+      (await this.agentStorage.get(request.childAgentId));
     const parent = getParentAddressFromLabels(child?.labels, this.serverId);
-    if (
-      !child ||
-      storedChild?.archivedAt ||
-      parent?.agentId !== request.parentAgentId ||
-      parent.serverId !== request.parentServerId
-    ) {
+    if (parent?.agentId !== request.parentAgentId || parent.serverId !== request.parentServerId) {
       return { accepted: false, error: "The child is no longer assigned to this parent." };
     }
     const accepted = await this.finishSubscriptions?.confirmParentReport(
@@ -3046,22 +3042,15 @@ export class VoiceAssistantWebSocketServer {
       ? async () => {
           await this.assertParentReportRecipientAvailable(record.callerAgentId);
           if (options.confirmBeforeDispatch) return;
-          const localChild = record.serverId
-            ? null
-            : await this.agentStorage.get(record.childAgentId);
           const child = record.serverId
             ? await this.toolHosts().use(
                 record.serverId,
                 async (client) => (await client.fetchAgent(record.childAgentId))?.agent,
               )
-            : (this.agentManager.getAgent(record.childAgentId) ?? localChild);
+            : (this.agentManager.getAgent(record.childAgentId) ??
+              (await this.agentStorage.get(record.childAgentId)));
           const parent = getParentAddressFromLabels(child?.labels, childServerId);
-          if (
-            !child ||
-            localChild?.archivedAt ||
-            parent?.agentId !== record.callerAgentId ||
-            parent.serverId !== this.serverId
-          ) {
+          if (parent?.agentId !== record.callerAgentId || parent.serverId !== this.serverId) {
             throw new ParentReportRecipientUnavailableError(
               "You can only manage your direct subagents.",
             );
@@ -3236,7 +3225,8 @@ export class VoiceAssistantWebSocketServer {
       )
         throw new Error("Permission denied for remote parent report registration.");
       await this.assertParentReportRecipientAvailable(parentAgentId);
-      // The normal route is bounded by the saved host link grants on the child host.
+      // A recovered creation can return after the child has archived. The source
+      // pull closes an archived child's watch once its persisted reports are drained.
       await this.toolHosts().use(
         childServerId,
         async (client) => {
@@ -3249,14 +3239,11 @@ export class VoiceAssistantWebSocketServer {
             !info.permissions?.includes("workspace.read") ||
             !info.permissions.includes("workspace.write") ||
             !child ||
-            child.archivedAt ||
             !isExplicitParentReportingLabels(child.labels) ||
             parent?.agentId !== parentAgentId ||
             parent.serverId !== this.serverId
           )
-            throw new Error(
-              "Could not verify an active explicit-reporting child on the destination.",
-            );
+            throw new Error("Could not verify an explicit-reporting child on the destination.");
         },
         session.delivery.requestSignal,
       );

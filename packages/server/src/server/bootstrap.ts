@@ -205,7 +205,11 @@ import { admitSecuredRelaySocket } from "./websocket/secure-relay-ingress.js";
 import type { PushNotificationSender } from "./push/index.js";
 import { getOrCreateServerId } from "./server-id.js";
 import { resolveDaemonVersion } from "./daemon-version.js";
-import type { AgentClient, AgentProvider } from "./agent/agent-sdk-types.js";
+import {
+  AgentTurnStartCanceledError,
+  type AgentClient,
+  type AgentProvider,
+} from "./agent/agent-sdk-types.js";
 import type {
   AgentProfile,
   AgentSkillSelection,
@@ -1089,24 +1093,39 @@ export async function createPaseoDaemon(
     }),
     eligible: async (record) =>
       !record.workspaceId || !(await workspaceRegistry?.get(record.workspaceId))?.archivedAt,
-    dispatch: async (agentId, prompt) => {
-      const result = await sendPromptToAgent({
-        agentId,
-        prompt,
-        agentManager,
-        agentStorage,
-        logger,
-        unarchive: false,
-      });
-      if (result.disposition !== "turn_started") return;
+    dispatch: async (agentId, prompt, canDispatch) => {
+      let withdrawn = false;
+      const assertDispatchAllowed = canDispatch
+        ? () => {
+            if (canDispatch()) return;
+            withdrawn = true;
+            throw new AgentTurnStartCanceledError();
+          }
+        : undefined;
       try {
-        await waitForAgentRunStartWithTimeout(agentManager, agentId, result.started);
+        const result = await sendPromptToAgent({
+          agentId,
+          prompt,
+          agentManager,
+          agentStorage,
+          logger,
+          unarchive: false,
+          // A user can start work while automatic recovery is opening the session.
+          idleOnly: canDispatch !== undefined,
+          assertDispatchAllowed,
+        });
+        if (result.disposition !== "turn_started") return;
+        try {
+          await waitForAgentRunStartWithTimeout(agentManager, agentId, result.started);
+        } catch (error) {
+          if (!(error instanceof Error) || error.name !== "AbortError") throw error;
+          // A wait timeout does not cancel the start. Keep the recovery intent and
+          // finish observers pending so a late success can consume it exactly once.
+          logger.warn({ agentId, err: error }, "Agent restart recovery start is unconfirmed");
+          await result.started;
+        }
       } catch (error) {
-        if (!(error instanceof Error) || error.name !== "AbortError") throw error;
-        // A wait timeout does not cancel the start. Keep the recovery intent and
-        // finish observers pending so a late success can consume it exactly once.
-        logger.warn({ agentId, err: error }, "Agent restart recovery start is unconfirmed");
-        await result.started;
+        if (!withdrawn) throw error;
       }
     },
     report: (agentId, err) => logger.error({ agentId, err }, "Agent restart recovery failed"),

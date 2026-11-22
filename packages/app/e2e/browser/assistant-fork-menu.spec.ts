@@ -1,4 +1,5 @@
-import { expect, test as base } from "../support/fixtures";
+import { rename } from "node:fs/promises";
+import { expect, test as base, type Page } from "../support/fixtures";
 import { awaitAssistantMessage } from "../support/helpers/agent-stream";
 import {
   expectChatHistoryAttachment,
@@ -9,8 +10,14 @@ import {
   forkMostRecentAssistantTurnToNewWorkspace,
   observeForkAttachment,
 } from "../support/helpers/assistant-fork";
-import { expectComposerVisible, submitMessage } from "../support/helpers/composer";
-import { getE2EDaemonPort } from "../support/helpers/daemon-port";
+import {
+  dropFileOnComposer,
+  expectComposerDraft,
+  expectComposerVisible,
+  fillComposerDraft,
+  submitMessage,
+} from "../support/helpers/composer";
+import { daemonWsRoutePattern, getE2EDaemonPort } from "../support/helpers/daemon-port";
 import {
   openAgentRoute,
   seedMockAgentWorkspace,
@@ -35,8 +42,130 @@ const test = base.extend<{
   },
 });
 
-test.describe("Assistant fork menu", () => {
+function observeWorkspaceRequests(page: Page): unknown[] {
+  const requests: unknown[] = [];
+  const sourcePort = String(getE2EDaemonPort());
+  page.on("websocket", (socket) => {
+    if (new URL(socket.url()).port !== sourcePort) return;
+    socket.on("framesent", ({ payload }) => {
+      if (typeof payload !== "string") return;
+      const envelope = JSON.parse(payload);
+      const request = envelope.message ?? envelope;
+      if (request.type === "workspace.create.request") requests.push(request);
+    });
+  });
+  return requests;
+}
+
+async function simulateLegacyForkHost(page: Page): Promise<void> {
+  // These cases pin the history attachment fallback on a host without timeline Fork.
+  await page.routeWebSocket(daemonWsRoutePattern(), (browser) => {
+    const daemon = browser.connectToServer();
+    daemon.onMessage((raw) => {
+      if (typeof raw === "string") {
+        const envelope = JSON.parse(raw);
+        const message = envelope.message ?? envelope;
+        if (message.type === "status" && message.payload?.status === "server_info") {
+          delete message.payload.features?.agentSeamlessContextSwitch;
+          browser.send(JSON.stringify(envelope));
+          return;
+        }
+      }
+      browser.send(raw);
+    });
+  });
+}
+
+function readStoredForkDraft(page: Page, draftId: string | null) {
+  return page.evaluate((key) => localStorage.getItem(key), `paseo:workspace-fork-draft:${draftId}`);
+}
+
+test.describe("Timeline Fork", () => {
   test.describe.configure({ timeout: 180_000 });
+
+  test("restores the selected Fork boundary before submitting a refreshed workspace draft", async ({
+    page,
+    seedForkWorkspace,
+  }) => {
+    const earlier = "emit 1 coalesced agent stream updates for the selected fork turn.";
+    const later = "emit 1 coalesced agent stream updates for the excluded fork turn.";
+    const draftText = "Continue from the selected turn.";
+    const attachmentName = "fork-draft-notes.json";
+    const requests = observeWorkspaceRequests(page);
+    const session = await seedForkWorkspace({
+      repoPrefix: "assistant-fork-reload-",
+      title: "Assistant fork reload",
+      initialPrompt: earlier,
+      model: "ten-second-stream",
+    });
+
+    await openAgentRoute(page, session);
+    await awaitAssistantMessage(page);
+    await session.client.waitForFinish(session.agentId, 45_000);
+    await forkMostRecentAssistantTurnToNewWorkspace(page);
+    await expect(page).toHaveURL(/\/new\?.*draftId=/);
+    const draftId = new URL(page.url()).searchParams.get("draftId");
+
+    await session.client.sendAgentMessage(session.agentId, later);
+    expect((await session.client.waitForFinish(session.agentId, 45_000)).status).toBe("idle");
+    await fillComposerDraft(page, draftText);
+    await dropFileOnComposer(page, {
+      name: attachmentName,
+      mimeType: "application/json",
+      buffer: Buffer.from('{"note":"retained through Fork retry"}'),
+    });
+    const attachment = page.getByTestId("composer-file-attachment-pill");
+    await expect(attachment).toContainText(attachmentName);
+    await page.reload();
+    await expectComposerDraft(page, draftText);
+    await expect(attachment).toContainText(attachmentName);
+
+    const submit = page.getByTestId("workspace-create-submit");
+    const movedDirectory = `${session.cwd}-temporarily-moved`;
+    await rename(session.cwd, movedDirectory);
+    try {
+      await submit.click();
+      await expect(page.getByText(/Directory not found/).first()).toBeVisible({ timeout: 20_000 });
+      await expect(page).toHaveURL(/\/new\?.*draftId=/);
+      await expectComposerDraft(page, draftText);
+      await expect(attachment).toContainText(attachmentName);
+    } finally {
+      await rename(movedDirectory, session.cwd);
+    }
+    await page.reload();
+    await expectComposerDraft(page, draftText);
+    await expect(attachment).toContainText(attachmentName);
+    await submit.click();
+
+    const forkRequest = expect.objectContaining({
+      idempotencyKey: draftId,
+      agent: expect.objectContaining({
+        initialPrompt: draftText,
+        forkFrom: expect.objectContaining({ sourceAgentId: session.agentId }),
+        attachments: expect.arrayContaining([
+          expect.objectContaining({ type: "uploaded_file", fileName: attachmentName }),
+        ]),
+      }),
+    });
+    await expect.poll(() => requests).toEqual([forkRequest, forkRequest]);
+    await expect(page).toHaveURL(/\/workspace\//, { timeout: 30_000 });
+    await expect(page.getByTestId("user-message").filter({ hasText: earlier })).toBeVisible({
+      timeout: 30_000,
+    });
+    await expect(page.getByTestId("user-message").filter({ hasText: later })).toHaveCount(0);
+    const newMessage = page.getByTestId("user-message").filter({ hasText: draftText });
+    await expect(newMessage).toBeVisible();
+    await expect(newMessage).toContainText(attachmentName);
+    await expect.poll(() => readStoredForkDraft(page, draftId)).toBeNull();
+  });
+});
+
+test.describe("Assistant fork menu with a legacy host", () => {
+  test.describe.configure({ timeout: 180_000 });
+
+  test.beforeEach(async ({ page }) => {
+    await simulateLegacyForkHost(page);
+  });
 
   test("forks a failed assistant turn that has no provider message id", async ({
     page,
@@ -214,6 +343,8 @@ test.describe("Assistant fork menu", () => {
     await forkMostRecentAssistantTurnToNewWorkspace(page);
     await expectChatHistoryAttachment(page);
 
+    await page.reload();
+    await expectChatHistoryAttachment(page);
     await submitNewWorkspaceEmpty(page);
 
     const userMessage = page.getByTestId("user-message").filter({ hasText: "Chat history" }).last();

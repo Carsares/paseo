@@ -20,10 +20,10 @@ export class AgentNotFoundError extends Error {
 
 interface PendingAgentInitialization {
   promise: Promise<ManagedAgent>;
-  options: { broadcastTimeline: boolean };
+  state: { broadcastTimeline: boolean; session: ManagedAgent["session"]; failed: boolean };
 }
 
-const pendingAgentInitializations = new Map<string, PendingAgentInitialization>();
+const pendingByManager = new WeakMap<AgentLoaderManager, Map<string, PendingAgentInitialization>>();
 
 export type AgentLoaderManager = Pick<
   AgentManager,
@@ -71,34 +71,49 @@ export async function ensureAgentLoaded(
   agentId: string,
   deps: EnsureAgentLoadedDeps,
 ): Promise<ManagedAgent> {
-  await deps.agentManager.waitForAgentClose?.(agentId);
+  let pendingAgentInitializations = pendingByManager.get(deps.agentManager);
+  if (!pendingAgentInitializations) {
+    pendingAgentInitializations = new Map();
+    pendingByManager.set(deps.agentManager, pendingAgentInitializations);
+  }
 
-  const inflight = pendingAgentInitializations.get(agentId);
+  // A caller can arrive during the hydration part of initialization, which also
+  // occupies the lifecycle lane. Record its broadcast need before waiting.
+  const observed = pendingAgentInitializations.get(agentId);
+  if (observed) observed.state.broadcastTimeline ||= deps.broadcastTimeline === true;
+  await deps.agentManager.waitForAgentClose?.(agentId);
+  // A failed attempt can close its temporary history reader before the lane
+  // releases. Callers already waiting on that attempt share its error.
+  if (observed?.state.failed) return observed.promise;
+
+  let inflight = pendingAgentInitializations.get(agentId);
+  let existing = deps.agentManager.getAgent(agentId);
+  if (!inflight && !existing) {
+    // A close can start after the first barrier and remove the runtime before
+    // the lookup. Recheck after it finishes before opening the persisted session.
+    await deps.agentManager.waitForAgentClose?.(agentId);
+    inflight = pendingAgentInitializations.get(agentId);
+    existing = deps.agentManager.getAgent(agentId);
+  }
+
   if (inflight) {
-    inflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
+    inflight.state.broadcastTimeline ||= deps.broadcastTimeline === true;
     return inflight.promise;
   }
 
-  const existing = deps.agentManager.getAgent(agentId);
-  if (existing) {
-    return existing;
+  // Concurrent callers share the outcome even if the initialization finished
+  // while they waited. A close/reopen may instead have installed a new runtime.
+  if (existing?.session && existing.session === observed?.state.session) {
+    return observed.promise;
   }
+  if (existing && existing.historyPrimed !== false) return existing;
 
-  // A close may have started after the first barrier observed no in-flight
-  // work. Once the live lookup is empty, this second barrier closes that gap
-  // before storage-backed resume begins.
-  await deps.agentManager.waitForAgentClose?.(agentId);
-
-  const laterInflight = pendingAgentInitializations.get(agentId);
-  if (laterInflight) {
-    laterInflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;
-    return laterInflight.promise;
-  }
-
-  const pendingOptions = {
+  const state: PendingAgentInitialization["state"] = {
     broadcastTimeline: deps.broadcastTimeline === true,
+    session: null,
+    failed: false,
   };
-  const initPromise = (async () => {
+  const openStoredAgent = async () => {
     const record = await deps.agentStorage.get(agentId);
     if (!record) {
       throw new AgentNotFoundError(agentId);
@@ -111,9 +126,8 @@ export async function ensureAgentLoaded(
 
     const handle = toAgentPersistenceHandle(validProviders, record.persistence);
 
-    let snapshot: ManagedAgent;
     if (handle) {
-      snapshot = await deps.agentManager.resumeAgentFromPersistence(
+      const snapshot = await deps.agentManager.resumeAgentFromPersistence(
         handle,
         buildConfigOverrides(record),
         agentId,
@@ -121,22 +135,29 @@ export async function ensureAgentLoaded(
         deps.purpose ? { purpose: deps.purpose } : undefined,
       );
       deps.logger.info({ agentId, provider: record.provider }, "Agent resumed from persistence");
-    } else {
-      // No provider handle to resume: this starts the agent's first session rather than
-      // bringing one back, so it stamps activity and carries no stored attention. Records
-      // without a handle never got far enough to accumulate either. The manager rereads the
-      // record inside the agent's lane, so a write that lands after this read is not lost.
-      snapshot = await deps.agentManager.createAgentFromRecord(agentId);
-      deps.logger.info({ agentId, provider: record.provider }, "Agent created from stored config");
+      return snapshot;
     }
 
+    // No provider handle: the manager rereads the record in its lifecycle lane to
+    // preserve any intervening metadata writes while starting the first session.
+    const snapshot = await deps.agentManager.createAgentFromRecord(agentId);
+    deps.logger.info({ agentId, provider: record.provider }, "Agent created from stored config");
+    return snapshot;
+  };
+  const initPromise = (async () => {
+    const snapshot = existing ?? (await openStoredAgent());
+    state.session = snapshot.session;
     await deps.agentManager.hydrateTimelineFromProvider(agentId, {
-      broadcast: () => pendingOptions.broadcastTimeline,
+      broadcast: () => state.broadcastTimeline,
+      whileRegistered: true,
     });
     return deps.agentManager.getAgent(agentId) ?? snapshot;
-  })();
+  })().catch((error: unknown) => {
+    state.failed = true;
+    throw error;
+  });
 
-  const pending: PendingAgentInitialization = { promise: initPromise, options: pendingOptions };
+  const pending: PendingAgentInitialization = { promise: initPromise, state };
   pendingAgentInitializations.set(agentId, pending);
 
   try {

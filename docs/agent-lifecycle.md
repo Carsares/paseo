@@ -18,7 +18,9 @@ Restart recovery is off by default. Enable `agents.resumeOnStartup` in host conf
 Host settings → Agents to resume interrupted agents after graceful shutdown or a crash. The daemon
 reopens the saved provider conversation and settings, then sends `Resume working.`. Customize
 the prompt with `agents.resumePrompt` or the same settings page.
-Disabling recovery consumes pending intent; enabling it later does not revive old work.
+Disabling recovery withdraws pending automatic prompts, even while the provider opens the
+session. Enabling it later does not revive those prompts. Turns already handed to the provider
+and explicit one-time recovery continue independently.
 
 Only agents recorded as running qualify. Idle and initializing agents stay inactive. Archived
 agents or workspaces, private helpers and Hub-owned executions retain their own lifecycle.

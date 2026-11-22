@@ -332,7 +332,7 @@ export async function prepareForkDraft(input: {
   return draftId;
 }
 
-function openForkDraftInNewWorkspace(input: {
+async function openForkDraftInNewWorkspace(input: {
   router: ReturnType<typeof useRouter>;
   serverId: string;
   draftId: string;
@@ -342,12 +342,16 @@ function openForkDraftInNewWorkspace(input: {
   const { router, serverId, draftId, agent, draftSetup } = input;
   const sourceDirectory =
     agent.projectPlacement?.checkout?.cwd?.trim() || agent.cwd.trim() || undefined;
-  if (draftSetup) {
-    useWorkspaceDraftSubmissionStore.getState().setDraftSetup({
+  const store = useWorkspaceDraftSubmissionStore.getState();
+  if (draftSetup?.forkFrom) {
+    await store.saveForkDraftSetup({
       draftId,
+      sourceServerId: serverId,
       setup: draftSetup,
       sourceDirectory,
     });
+  } else if (draftSetup) {
+    store.setDraftSetup({ draftId, setup: draftSetup, sourceDirectory });
   }
   router.push(
     buildNewWorkspaceRoute({
@@ -387,7 +391,7 @@ async function openSeamlessFork(input: {
     if (quoteText !== undefined) {
       await seedDraftQuoteAttachment(buildNewWorkspaceDraftKey(draftId), quoteText);
     }
-    openForkDraftInNewWorkspace({
+    await openForkDraftInNewWorkspace({
       router,
       serverId,
       draftId,
@@ -537,7 +541,7 @@ export function useForkAgent(
       }
 
       const draftId = await prepareDraft();
-      openForkDraftInNewWorkspace({ router, serverId, draftId, agent, draftSetup });
+      await openForkDraftInNewWorkspace({ router, serverId, draftId, agent, draftSetup });
     } catch (error) {
       toast?.error(toErrorMessage(error) || t("message.actions.forkFailed"));
     } finally {
