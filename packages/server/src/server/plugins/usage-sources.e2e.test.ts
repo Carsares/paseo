@@ -428,9 +428,9 @@ test("resolves a plugin provider launch for cold usage discovery", async () => {
 import { z } from 'zod';
 export default function contribute(server) {
   server.registerProvider({ id: 'usage-launch-fixture', label: 'Launch fixture', command: [${JSON.stringify(process.execPath)}, 'fixture-arg'], connect: async () => { throw new Error('Must not connect'); } });
-  server.registerUsageSource({ id: 'launch-fixture', label: 'Launch fixture', provider: 'usage-launch-fixture', input: z.object({}),
-    discover: async scope => scope.kind === 'global' && scope.launch?.args[0] === 'fixture-arg' ? [{ key: 'default', input: {} }] : [],
-    fetch: async () => ({ status: 'available', windows: [{ id: 'weekly', label: 'Weekly', usedPct: 12 }] }) });
+  server.registerUsageSource({ id: 'launch-fixture', label: 'Launch fixture', provider: 'usage-launch-fixture', input: z.object({ usedPct: z.number() }),
+    discover: async scope => scope.kind === 'global' && scope.launch?.args[0] === 'fixture-arg' ? [{ key: 'default', input: { usedPct: Number(scope.launch.env.PASEO_TEST_USAGE_LAUNCH_PERCENT ?? 12) } }] : [],
+    fetch: async input => ({ status: 'available', windows: [{ id: 'weekly', label: 'Weekly', usedPct: input.usedPct }] }) });
   return () => {};
 }`,
   );
@@ -456,11 +456,35 @@ export default function contribute(server) {
       }),
     );
     await client.patchDaemonConfig({
+      providers: { "usage-launch-fixture": { label: "Renamed provider" } },
+    });
+    expect(
+      (await client.listUsageReports({ reportIds: ["launch-fixture:default"] })).reports,
+    ).toEqual(result.reports);
+    await client.patchDaemonConfig({
+      providers: {
+        "usage-launch-fixture": { env: { PASEO_TEST_USAGE_LAUNCH_PERCENT: "26" } },
+      },
+    });
+    expect((await client.listUsageReports()).reports).toContainEqual(
+      expect.objectContaining({
+        id: "launch-fixture:default",
+        report: expect.objectContaining({
+          status: "available",
+          windows: [{ id: "weekly", label: "Weekly", usedPct: 26 }],
+        }),
+      }),
+    );
+    await client.patchDaemonConfig({
       providers: {
         "usage-launch-fixture": { command: [path.join(root, "missing-cli")] },
       },
     });
     expect((await client.listUsageReports()).reports).toEqual([]);
+    await client.patchDaemonConfig({ removeProviders: ["usage-launch-fixture"] });
+    expect(
+      (await client.listUsageReports()).reports.map(({ id, report }) => ({ id, report })),
+    ).toEqual(result.reports.map(({ id, report }) => ({ id, report })));
   } finally {
     await client.close();
     await daemon.close();

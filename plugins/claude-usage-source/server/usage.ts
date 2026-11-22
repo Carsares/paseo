@@ -641,8 +641,20 @@ function formatWait(ms: number): string {
 // The OAuth usage endpoint meters the active organization selected by the token.
 type ClaudeIdentity = { key: string; label?: string } | { status: number };
 const PROFILE_TTL_MS = 300_000;
+const PROFILE_RETRY_MS = 5_000;
 const PROFILE_CACHE_LIMIT = 128;
-const profileCache = new Map<string, { at: number; result: Promise<ClaudeIdentity> }>();
+
+interface CachedProfile {
+  expiresAt: number;
+  identity: ClaudeIdentity | null;
+}
+
+interface ProfileCache {
+  profiles: Map<string, CachedProfile>;
+  pending: Map<string, Promise<ClaudeIdentity>>;
+}
+
+const profileCaches = new WeakMap<typeof fetch, ProfileCache>();
 
 async function verifyLoginAccount(
   token: string,
@@ -650,10 +662,9 @@ async function verifyLoginAccount(
   fetchApi: typeof fetch,
   now: () => number,
 ): Promise<number | undefined> {
-  pruneProfileCache(now());
   const profile = accountKey
     ? await readProfile(token, fetchApi, now)
-    : await profileCache.get(hashAccountKey(token))?.result;
+    : await observedProfile(token, fetchApi, now);
   if (profile && "status" in profile) return profile.status;
   if (accountKey && profile?.key !== accountKey)
     throw new Error(
@@ -661,54 +672,86 @@ async function verifyLoginAccount(
     );
 }
 
-function pruneProfileCache(now: number): void {
-  for (const [key, entry] of profileCache) {
-    if (now - entry.at >= PROFILE_TTL_MS) profileCache.delete(key);
-  }
+async function observedProfile(token: string, fetchApi: typeof fetch, now: () => number) {
+  const cache = profileCaches.get(fetchApi);
+  if (!cache) return;
+  const tokenHash = hashAccountKey(token);
+  const pending = cache.pending.get(tokenHash);
+  if (pending) return pending.catch(() => undefined);
+  return cachedProfile(cache, tokenHash, now())?.identity;
 }
 
-async function readProfile(
+function cachedProfile(
+  cache: ProfileCache,
+  tokenHash: string,
+  now: number,
+): CachedProfile | undefined {
+  const entry = cache.profiles.get(tokenHash);
+  if (entry && now < entry.expiresAt) return entry;
+  cache.profiles.delete(tokenHash);
+}
+
+function readProfile(
   token: string,
   fetchApi: typeof fetch,
   now: () => number,
 ): Promise<ClaudeIdentity> {
   const tokenHash = hashAccountKey(token);
-  pruneProfileCache(now());
-  const pending = profileCache.get(tokenHash);
-  if (pending) return pending.result;
-  while (profileCache.size >= PROFILE_CACHE_LIMIT) {
-    const oldest = profileCache.keys().next().value;
-    if (oldest === undefined) break;
-    profileCache.delete(oldest);
+  let cache = profileCaches.get(fetchApi);
+  if (!cache) {
+    cache = { profiles: new Map(), pending: new Map() };
+    profileCaches.set(fetchApi, cache);
   }
-  const request = (async () => {
-    const response = await fetchApi("https://api.anthropic.com/api/oauth/profile", {
-      signal: AbortSignal.timeout(15_000),
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/json",
-        "anthropic-beta": CLAUDE_OAUTH_BETA,
-      },
-    });
-    if (response.status === 401 || response.status === 403) return { status: response.status };
-    if (!response.ok) throw new Error(`Claude profile API returned ${response.status}`);
-    const profile = z
-      .object({
-        account: z.object({ uuid: z.string().min(1), email: z.string().optional() }),
-        organization: z.object({ uuid: z.string().min(1) }),
-      })
-      .parse(await response.json());
-    const account = profile.account;
-    return {
-      key: `${account.uuid}.${profile.organization.uuid}`,
-      ...(account.email ? { label: account.email } : {}),
-    };
-  })();
-  profileCache.set(tokenHash, { at: now(), result: request });
-  try {
-    return await request;
-  } catch (error) {
-    if (profileCache.get(tokenHash)?.result === request) profileCache.delete(tokenHash);
-    throw error;
+  const cached = cachedProfile(cache, tokenHash, now());
+  if (cached) {
+    if (cached.identity) return Promise.resolve(cached.identity);
+    return Promise.reject(new Error("Claude profile lookup failed. Try again shortly."));
   }
+  const pending = cache.pending.get(tokenHash);
+  if (pending) return pending;
+  const complete = (identity: ClaudeIdentity | null) => {
+    cache.pending.delete(tokenHash);
+    const ttl = identity && "key" in identity ? PROFILE_TTL_MS : PROFILE_RETRY_MS;
+    if (cache.profiles.size >= PROFILE_CACHE_LIMIT) {
+      const oldest = cache.profiles.keys().next().value;
+      if (oldest !== undefined) cache.profiles.delete(oldest);
+    }
+    cache.profiles.set(tokenHash, { identity, expiresAt: now() + ttl });
+  };
+  const result = fetchProfile(token, fetchApi).then(
+    (profile) => {
+      complete(profile);
+      return profile;
+    },
+    (error) => {
+      complete(null);
+      throw error;
+    },
+  );
+  cache.pending.set(tokenHash, result);
+  return result;
+}
+
+async function fetchProfile(token: string, fetchApi: typeof fetch): Promise<ClaudeIdentity> {
+  const response = await fetchApi("https://api.anthropic.com/api/oauth/profile", {
+    signal: AbortSignal.timeout(15_000),
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "anthropic-beta": CLAUDE_OAUTH_BETA,
+    },
+  });
+  if (response.status === 401 || response.status === 403) return { status: response.status };
+  if (!response.ok) throw new Error(`Claude profile API returned ${response.status}`);
+  const profile = z
+    .object({
+      account: z.object({ uuid: z.string().min(1), email: z.string().optional() }),
+      organization: z.object({ uuid: z.string().min(1) }),
+    })
+    .parse(await response.json());
+  const account = profile.account;
+  return {
+    key: `${account.uuid}.${profile.organization.uuid}`,
+    ...(account.email ? { label: account.email } : {}),
+  };
 }

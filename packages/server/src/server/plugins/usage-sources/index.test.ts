@@ -1,5 +1,5 @@
-import { expect, test } from "vitest";
-import { UsageSourceRegistry } from "./index.js";
+import { expect, test, vi } from "vitest";
+import { UsageSourceRegistry, type UsageSource } from "./index.js";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -288,6 +288,308 @@ test("concurrent requests for the same ID share one vendor fetch", async () => {
   expect(fetches).toBe(1);
 });
 
+test("shares discovery in progress and expires completed discovery with the usage TTL", async () => {
+  let now = 0;
+  const discover = vi.fn(async () => [{ key: "account", input: {} }]);
+  const registry = new UsageSourceRegistry(() => now, 100);
+  registry.register(source({ id: "source", discover }));
+  await Promise.all([registry.listReports(), registry.listReports({ forceRefresh: true })]);
+  expect(discover).toHaveBeenCalledTimes(1);
+  now = 99;
+  await registry.listReports();
+  expect(discover).toHaveBeenCalledTimes(1);
+  now = 100;
+  await registry.listReports();
+  expect(discover).toHaveBeenCalledTimes(2);
+  await registry.listReports({ forceRefresh: true });
+  expect(discover).toHaveBeenCalledTimes(3);
+});
+
+test("a warm Claude listing skips the discovery and fetch Keychain reads", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-usage-keychain-"));
+  try {
+    const readKeychainCredentials = vi.fn(async () => ({
+      claudeAiOauth: { accessToken: "keychain-cache-fixture" },
+    }));
+    const lookup = {
+      home,
+      platform: "darwin" as const,
+      env: { USER: "fixture" },
+      readKeychainCredentials,
+    };
+    const api = vi.fn<typeof fetch>(async (url) =>
+      Response.json(
+        String(url).endsWith("/profile")
+          ? { account: { uuid: "fixture" }, organization: { uuid: "org" } }
+          : { five_hour: { utilization: 10 } },
+      ),
+    );
+    const registry = new UsageSourceRegistry();
+    registry.register({
+      id: "claude",
+      label: "Claude",
+      discover: (scope) => discoverClaude(scope, lookup, api),
+      fetch: (input) => fetchClaudeUsage(claudeInputSchema.parse(input), api, lookup),
+    });
+    const first = await registry.listReports();
+    expect(first.map(({ id }) => id)).toEqual(["claude:fixture.org"]);
+    expect(readKeychainCredentials).toHaveBeenCalledTimes(3);
+    expect(await registry.listReports()).toEqual(first);
+    expect(readKeychainCredentials).toHaveBeenCalledTimes(3);
+    expect((await registry.listReports({ forceRefresh: true }))[0]?.report).toEqual(
+      first[0]?.report,
+    );
+    expect(readKeychainCredentials).toHaveBeenCalledTimes(6);
+    expect(api.mock.calls.map(([url]) => String(url).split("/").at(-1))).toEqual([
+      "profile",
+      "usage",
+      "usage",
+    ]);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("cools down empty and failed discovery independently of a healthy source", async () => {
+  let now = 0;
+  const warn = vi.fn();
+  const registry = new UsageSourceRegistry(() => now, 300_000, { warn });
+  const empty = vi.fn(async () => []);
+  const failed = vi.fn(async () => {
+    throw new Error("Temporary store failure");
+  });
+  const healthy = vi.fn(async () => [{ key: "account", input: {} }]);
+  registry.register(source({ id: "empty", discover: empty }));
+  registry.register(source({ id: "failed", discover: failed }));
+  registry.register(source({ id: "healthy", discover: healthy }));
+  const expected = ["healthy:account"];
+  expect((await registry.listReports()).map(({ id }) => id)).toEqual(expected);
+  now = 4_999;
+  expect((await registry.listReports()).map(({ id }) => id)).toEqual(expected);
+  expect(warn).toHaveBeenCalledTimes(1);
+  expect(empty).toHaveBeenCalledTimes(1);
+  now = 5_000;
+  expect((await registry.listReports()).map(({ id }) => id)).toEqual(expected);
+  expect(empty).toHaveBeenCalledTimes(2);
+  expect(failed).toHaveBeenCalledTimes(2);
+  expect(healthy).toHaveBeenCalledTimes(1);
+});
+
+test("a forced list bypasses fresh discoveries while joining a source already refreshing", async () => {
+  let now = 0;
+  const registry = new UsageSourceRegistry(() => now);
+  const retry = Promise.withResolvers<unknown>();
+  const empty = vi
+    .fn(async (): Promise<unknown> => [])
+    .mockResolvedValueOnce([])
+    .mockImplementationOnce(() => retry.promise);
+  const healthy = vi
+    .fn(async () => [{ key: "new", input: {} }])
+    .mockResolvedValueOnce([{ key: "old", input: {} }]);
+  registry.register(source({ id: "empty", discover: empty }));
+  registry.register(source({ id: "healthy", discover: healthy }));
+  expect((await registry.listReports()).map(({ id }) => id)).toEqual(["healthy:old"]);
+  now = 5_000;
+  const ordinary = registry.listReports();
+  const forced = registry.listReports({ forceRefresh: true });
+  retry.resolve([]);
+  const [, refreshed] = await Promise.all([ordinary, forced]);
+  expect(empty).toHaveBeenCalledTimes(2);
+  expect(healthy).toHaveBeenCalledTimes(2);
+  expect(refreshed.map(({ id }) => id)).toEqual(["healthy:new"]);
+  expect((await registry.listReports()).map(({ id }) => id)).toEqual(["healthy:new"]);
+});
+
+test("a host list drops cached session reports retired while global discovery is pending", async () => {
+  let now = 0;
+  const env = { HOME: "/old" };
+  const registry = new UsageSourceRegistry(() => now, 300_000, undefined, {
+    hasAgent: () => true,
+    usageSession: () => ({ provider: "fixture", env, sessionKey: "session" }),
+  });
+  const retry = Promise.withResolvers<unknown>();
+  registry.register(
+    source({
+      id: "fixture",
+      discover: async (scope) => {
+        if (scope.kind === "global") return now === 0 ? [] : retry.promise;
+        return [{ key: scope.env.HOME.slice(1), input: scope.env.HOME }];
+      },
+    }),
+  );
+  await registry.listReports({ agentId: "agent" });
+  expect((await registry.listReports()).map(({ id }) => id)).toEqual(["fixture:old"]);
+  now = 5_000;
+  const onReport = vi.fn();
+  const listing = registry.listReports({ onReport });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  env.HOME = "/new";
+  retry.resolve([]);
+  expect(await listing).toEqual([]);
+  expect(onReport).not.toHaveBeenCalled();
+  expect((await registry.listReports({ agentId: "agent" })).map(({ id }) => id)).toEqual([
+    "fixture:new",
+  ]);
+});
+
+test("registering and unregistering sources cannot restore a retired discovery", async () => {
+  const registry = new UsageSourceRegistry();
+  const oldDiscovery = Promise.withResolvers<Array<{ key: string; input: string }>>();
+  const discover = vi
+    .fn()
+    .mockImplementationOnce(() => oldDiscovery.promise)
+    .mockResolvedValue([{ key: "new", input: "new" }]);
+  const fixture = source({ id: "source", discover });
+  registry.register(fixture);
+  const old = registry.listReports();
+  registry.unregister("source");
+  registry.register(fixture);
+  registry.register(source({ id: "other", discover: async () => [{ key: "account", input: {} }] }));
+  const expected = ["source:new", "other:account"];
+  expect((await registry.listReports()).map(({ id }) => id)).toEqual(expected);
+  oldDiscovery.resolve([{ key: "old", input: "old" }]);
+  await old;
+  expect(
+    (await registry.listReports({ reportIds: ["source:old", ...expected] })).map(({ id }) => id),
+  ).toEqual(expected);
+  expect(discover).toHaveBeenCalledTimes(2);
+});
+
+test("a retired registration cannot deliver or overwrite a pending fetch for the same login", async () => {
+  const registry = new UsageSourceRegistry();
+  const oldFetch = Promise.withResolvers<unknown>();
+  const started = Promise.withResolvers<void>();
+  const updated = { status: "available", windows: [{ id: "updated", label: "Updated" }] };
+  const fetch = vi
+    .fn(async (): Promise<unknown> => updated)
+    .mockImplementationOnce(async () => {
+      started.resolve();
+      return oldFetch.promise;
+    });
+  const fixture = source({
+    id: "source",
+    discover: async () => [{ key: "same", input: {} }],
+    fetch,
+  });
+  registry.register(fixture);
+  const onReport = vi.fn();
+  const old = registry.listReports({ onReport });
+  await started.promise;
+  registry.unregister("source");
+  registry.register(fixture);
+  expect((await registry.listReports())[0]?.report).toEqual(updated);
+  oldFetch.resolve({ status: "available", windows: [] });
+  expect(await old).toEqual([]);
+  expect(onReport).not.toHaveBeenCalled();
+  expect((await registry.listReports())[0]?.report).toEqual(updated);
+});
+
+test("a launch change retires pending usage work while unrelated sources stay cached", async () => {
+  const registry = new UsageSourceRegistry();
+  const accounts = [{ key: "same", input: {} }];
+  const updated = { status: "available", windows: [{ id: "updated", label: "Updated" }] };
+  const oldDiscovery = Promise.withResolvers<typeof accounts>();
+  const newDiscovery = Promise.withResolvers<typeof accounts>();
+  const oldFetch = Promise.withResolvers<unknown>();
+  const fetching = Promise.withResolvers<void>();
+  const discover = vi.fn(async () => accounts);
+  const fetch = vi.fn(async (): Promise<unknown> => updated);
+  const unrelated = vi.fn(async () => [{ key: "unaffected", input: {} }]);
+  registry.register({ ...source({ id: "source", discover, fetch }), provider: "provider" });
+  registry.register({ ...source({ id: "other", discover: unrelated }), provider: "other" });
+  await registry.listReports();
+
+  fetch.mockImplementationOnce(async () => {
+    fetching.resolve();
+    return oldFetch.promise;
+  });
+  const onReport = vi.fn();
+  const refreshing = registry.listReports({
+    reportIds: ["source:same"],
+    forceRefresh: true,
+    onReport,
+  });
+  await fetching.promise;
+  discover.mockImplementationOnce(() => oldDiscovery.promise);
+  const discovering = registry.listReports({ forceRefresh: true });
+
+  registry.invalidateProviderLaunches(new Set(["provider"]));
+  const reports = await registry.listReports({ reportIds: ["source:same", "other:unaffected"] });
+  expect(reports.map(({ id }) => id)).toEqual(["other:unaffected"]);
+  discover.mockImplementationOnce(() => newDiscovery.promise);
+  const current = registry.listReports();
+  oldDiscovery.resolve([{ key: "retired", input: {} }]);
+  expect((await discovering).map(({ id }) => id)).toEqual(["other:unaffected"]);
+  const joined = registry.listReports();
+  newDiscovery.resolve(accounts);
+  for (const listing of [current, joined]) {
+    expect((await listing).find(({ id }) => id === "source:same")?.report).toEqual(updated);
+  }
+  expect(discover).toHaveBeenCalledTimes(3); // The third discovery is shared across both lists.
+  expect(unrelated).toHaveBeenCalledTimes(2); // Initial and forced lists only.
+
+  oldFetch.resolve({ status: "available", windows: [] });
+  expect(await refreshing).toEqual([]);
+  expect(onReport).not.toHaveBeenCalled();
+  expect(
+    (await registry.listReports({ reportIds: ["source:retired", "source:same"] })).map(
+      ({ id, report }) => ({ id, report }),
+    ),
+  ).toEqual([{ id: "source:same", report: updated }]);
+});
+
+test("a provider override keeps reports discovered from a running session's launch", async () => {
+  const registry = new UsageSourceRegistry(Date.now, 300_000, undefined, {
+    hasAgent: (id) => id === "running",
+    usageSession: () => ({ provider: "provider", env: { HOME: "/agent" }, sessionKey: "open" }),
+  });
+  let hostAccount = "old";
+  const discover = vi.fn(async (scope: Parameters<UsageSource["discover"]>[0]) => {
+    const key = scope.kind === "global" ? hostAccount : "agent";
+    return [{ key, input: key }];
+  });
+  registry.register({ ...source({ id: "source", discover }), provider: "provider" });
+  await registry.listReports({ agentId: "running" });
+  await registry.listReports();
+
+  hostAccount = "new";
+  registry.invalidateProviderLaunches(new Set(["provider"]));
+  const selected = await registry.listReports({
+    reportIds: ["source:old", "source:agent"],
+    forceRefresh: true,
+  });
+  expect(selected.map(({ id }) => id)).toEqual(["source:agent"]);
+  expect((await registry.listReports()).map(({ id }) => id)).toEqual([
+    "source:new",
+    "source:agent",
+  ]);
+  expect(discover.mock.calls.map(([scope]) => scope.kind)).toEqual(["session", "global", "global"]);
+});
+
+test("an expired list streams existing usage and finishes while a slow source refreshes", async () => {
+  let now = 0;
+  const registry = new UsageSourceRegistry(() => now, 100, undefined, undefined, 25);
+  const initial = { status: "available", windows: [] };
+  const refreshed = { status: "available", windows: [{ id: "new", label: "New" }] };
+  const refresh = Promise.withResolvers<unknown>();
+  const fetch = vi.fn(async () => (now === 0 ? initial : refresh.promise));
+  registry.register(
+    source({ id: "slow", discover: async () => [{ key: "account", input: {} }], fetch }),
+  );
+  registry.register(source({ id: "fast", discover: async () => [{ key: "account", input: {} }] }));
+  const first = await registry.listReports();
+  now = 100;
+  const updates = vi.fn();
+  expect(await registry.listReports({ onReport: updates })).toEqual(first);
+  expect(updates.mock.calls).toEqual([[first[0]], [first[1]]]);
+  expect(fetch).toHaveBeenCalledTimes(2);
+  const forced = registry.listReports({ reportIds: ["slow:account"], forceRefresh: true });
+  refresh.resolve(refreshed);
+  expect((await forced)[0]?.report).toEqual(refreshed);
+  expect(fetch).toHaveBeenCalledTimes(2);
+  expect(updates).toHaveBeenCalledTimes(2);
+});
+
 test("rediscovery removes an old account from targeted refreshes", async () => {
   let now = 0;
   const registry = new UsageSourceRegistry(() => now, 100);
@@ -482,7 +784,7 @@ test("failed fallbacks preserve the final problem", async () => {
   });
 });
 
-test("session discovery rechecks logins, reuses cached usage, and includes live agent reports globally", async () => {
+test("session discovery caches each environment and includes live agent reports globally", async () => {
   const sessions = new Map([
     ["one", { provider: "claude", env: { HOME: "/one" }, sessionKey: "launch-1" }],
     ["two", { provider: "claude", env: { HOME: "/two" }, sessionKey: "launch-2" }],
@@ -513,7 +815,7 @@ test("session discovery rechecks logins, reuses cached usage, and includes live 
   ]);
   await registry.listReports({ agentId: "one" });
   await registry.listReports({ agentId: "two" });
-  expect(discoveries).toEqual(["/one", "/one", "/two"]);
+  expect(discoveries).toEqual(["/one", "/two"]);
   expect(fetches).toBe(2);
   expect((await registry.listReports()).map((r) => r.id)).toEqual([
     "claude:default",
@@ -526,6 +828,102 @@ test("session discovery rechecks logins, reuses cached usage, and includes live 
   expect((await registry.listReports()).map((r) => r.id)).toEqual(["claude:default", "claude:new"]);
   await expect(registry.listReports({ agentId: "missing" })).rejects.toThrow("Unknown agent");
   await expect(registry.listReports({ agentId: "one", reportIds: [] })).rejects.toThrow("agentId");
+});
+
+test("shared session signatures coalesce and environment changes retire old discoveries", async () => {
+  const oldDiscovery = Promise.withResolvers<Array<{ key: string; input: string }>>();
+  const envOne = { HOME: "/old", TEST_LOCATION: "/fixture" };
+  const envTwo = { TEST_LOCATION: "/fixture", HOME: "/old" };
+  const sessions = new Map([
+    ["one", { provider: "claude", env: envOne, sessionKey: "one" }],
+    ["two", { provider: "claude", env: envTwo, sessionKey: "two" }],
+  ]);
+  const registry = new UsageSourceRegistry(Date.now, 300_000, undefined, {
+    hasAgent: (id) => sessions.has(id),
+    usageSession: (id) => sessions.get(id) ?? null,
+  });
+  const discoveries: string[] = [];
+  registry.register({
+    id: "fixture",
+    label: "Fixture",
+    discover: async (scope) => {
+      if (scope.kind === "global") return [];
+      const home = scope.env.HOME;
+      discoveries.push(home);
+      if (home === "/old" && discoveries.length === 1) return oldDiscovery.promise;
+      const key = home.slice(1);
+      return [{ key, input: key }];
+    },
+    fetch: async () => ({ status: "available", windows: [] }),
+  });
+  const oldOne = registry.listReports({ agentId: "one" });
+  const oldTwo = registry.listReports({ agentId: "two" });
+  expect(discoveries).toEqual(["/old"]);
+  envOne.HOME = "/new";
+  envTwo.HOME = "/new";
+  const reports = await registry.listReports({ agentId: "one" });
+  expect(reports.map(({ id }) => id)).toEqual(["fixture:new"]);
+  oldDiscovery.resolve([{ key: "retired", input: "retired" }]);
+  expect(await Promise.all([oldOne, oldTwo])).toEqual([[], []]);
+  expect((await registry.listReports({ agentId: "two" })).map(({ id }) => id)).toEqual([
+    "fixture:new",
+  ]);
+  envOne.HOME = "/old";
+  expect((await registry.listReports({ agentId: "one" })).map(({ id }) => id)).toEqual([
+    "fixture:old",
+  ]);
+  expect(discoveries).toEqual(["/old", "/new", "/old"]);
+});
+
+test("a pending discovery reads the environment that its shared cache key describes", async () => {
+  const ready = Promise.withResolvers<void>();
+  const env = { HOME: "/old" };
+  const registry = new UsageSourceRegistry(Date.now, 300_000, undefined, {
+    hasAgent: () => true,
+    usageSession: (id) => ({
+      provider: "fixture",
+      sessionKey: id,
+      env: id === "changing" ? env : { HOME: "/old" },
+    }),
+  });
+  const discover = vi.fn<UsageSource["discover"]>(async (scope) => {
+    if (scope.kind === "global") return [];
+    await ready.promise;
+    return [{ key: scope.env.HOME.slice(1), input: scope.env.HOME }];
+  });
+  registry.register(source({ id: "fixture", discover }));
+  const changing = registry.listReports({ agentId: "changing" });
+  const stable = registry.listReports({ agentId: "stable" });
+  env.HOME = "/new";
+  ready.resolve();
+  expect(await changing).toEqual([]);
+  expect((await stable).map(({ id }) => id)).toEqual(["fixture:old"]);
+  expect(discover).toHaveBeenCalledTimes(1);
+  expect((await registry.listReports({ agentId: "changing" })).map(({ id }) => id)).toEqual([
+    "fixture:new",
+  ]);
+});
+
+test("session discovery evicts the least recently used completed signature at capacity", async () => {
+  const registry = new UsageSourceRegistry(() => 0, 300_000, undefined, {
+    hasAgent: () => true,
+    usageSession: (id) => ({
+      provider: "fixture",
+      sessionKey: id,
+      env: { HOME: id },
+    }),
+  });
+  const discover = vi.fn<UsageSource["discover"]>(async (scope) =>
+    scope.kind === "session" ? [{ key: scope.env.HOME, input: scope.env.HOME }] : [],
+  );
+  registry.register(source({ id: "fixture", discover }));
+  for (let i = 0; i < 128; i++) await registry.listReports({ agentId: String(i) });
+  await registry.listReports({ agentId: "0" });
+  await registry.listReports({ agentId: "128" });
+  await registry.listReports({ agentId: "0" });
+  expect(discover).toHaveBeenCalledTimes(129);
+  expect((await registry.listReports({ agentId: "1" })).map(({ id }) => id)).toEqual(["fixture:1"]);
+  expect(discover).toHaveBeenCalledTimes(130);
 });
 
 test("reports arrive independently and a hung fetch settles as an error before completion", async () => {
@@ -750,7 +1148,7 @@ test("retains the last successful poll across failures, cache expiry, and recove
   registry.register(source({ id: "other", discover: async () => [{ key: "account", input: {} }] }));
   const [success] = await registry.listReports();
   now = 360_000;
-  // An unrelated write evicts the expired fetch result, but must not discard its snapshot.
+  // Refreshing an unrelated account must not discard the expired account's snapshot.
   await registry.listReports({ reportIds: ["other:account"], forceRefresh: true });
   report = { status: "error", error: "Rate limited" };
   const [failure] = await registry.listReports({ reportIds: ["quota:account"] });
@@ -780,10 +1178,11 @@ test("retains the last successful poll across failures, cache expiry, and recove
 });
 
 test("successful history is isolated by login set and pruned when identities retire", async () => {
+  let now = 0;
   let login = "old";
   let present = true;
   let available = true;
-  const registry = new UsageSourceRegistry();
+  const registry = new UsageSourceRegistry(() => now, 100);
   const fixture = source({
     id: "source",
     discover: async () => (present ? [{ key: "same", input: login }] : []),
@@ -800,9 +1199,11 @@ test("successful history is isolated by login set and pruned when identities ret
   available = true;
   await registry.listReports({ forceRefresh: true });
   present = false;
+  now = 100;
   expect(await registry.listReports()).toEqual([]);
   present = true;
   available = false;
+  now = 200;
   expect((await registry.listReports())[0]?.lastSuccessful).toBeUndefined();
   available = true;
   await registry.listReports({ forceRefresh: true });
@@ -903,10 +1304,11 @@ test("attempt ordering keeps its timestamp while retained freshness records succ
 });
 
 test("failed discovery preserves history until discovery confirms account removal", async () => {
+  let now = 1000;
   let discoveryFails = false;
   let present = true;
   let available = true;
-  const registry = new UsageSourceRegistry(() => 1000, 300_000, { warn: () => {} });
+  const registry = new UsageSourceRegistry(() => now, 300_000, { warn: () => {} });
   registry.register(
     source({
       id: "source",
@@ -933,7 +1335,9 @@ test("failed discovery preserves history until discovery confirms account remova
   expect(afterDiscoveryRecovery?.lastSuccessful).toEqual(duringDiscoveryFailure?.lastSuccessful);
   expect(afterDiscoveryRecovery?.report).toEqual({ status: "error", error: "Rate limited" });
   present = false;
+  now += 300_000;
   expect(await registry.listReports()).toEqual([]);
   present = true;
+  now += 5_000;
   expect((await registry.listReports())[0]?.lastSuccessful).toBeUndefined();
 });

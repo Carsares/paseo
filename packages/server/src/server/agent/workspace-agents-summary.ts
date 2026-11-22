@@ -5,11 +5,15 @@ import {
   isMainControlAgentLabels,
 } from "@getpaseo/protocol/agent-labels";
 import type { AgentAttachment, WorkspaceAgentSummaryEntry } from "@getpaseo/protocol/messages";
+import pLimit from "p-limit";
 import type { Logger } from "pino";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
+import { SUMMARY_TIMELINE_READ_CONCURRENCY } from "./agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type { WorkspaceRegistry } from "../workspace-registry.js";
+
+const ARCHIVED_SUMMARY_LIMIT = 30;
 
 type SummaryDetails = Pick<
   WorkspaceAgentSummaryEntry,
@@ -212,12 +216,14 @@ function compareEntries(left: SummaryMetadata, right: SummaryMetadata): number {
 
 export async function summarizeWorkspaceAgents({
   workspaceId,
+  includeArchived = false,
   agentManager,
   agentStorage,
   workspaceRegistry,
   logger,
 }: {
   workspaceId: string;
+  includeArchived?: boolean;
   agentManager: Pick<AgentManager, "listAgents" | "readTimelineForSummary">;
   agentStorage: Pick<AgentStorage, "listByWorkspaces">;
   workspaceRegistry: Pick<WorkspaceRegistry, "get">;
@@ -230,10 +236,15 @@ export async function summarizeWorkspaceAgents({
 }> {
   const workspace = workspaceId.trim() && (await workspaceRegistry.get(workspaceId));
   if (!workspace) throw new Error(`Workspace not found: ${workspaceId}`);
-  const entries: WorkspaceAgentSummaryEntry[] = [];
+  let entries: WorkspaceAgentSummaryEntry[] = [];
   if (!workspace.background) {
+    // Archived records still supply parent links and mark corresponding live agents as archived.
     const records = await agentStorage.listByWorkspaces([workspaceId], { includeArchived: true });
-    const agents = collectWorkspaceAgents(workspaceId, agentManager.listAgents(), records);
+    const agents = collectWorkspaceAgents(
+      workspaceId,
+      agentManager.listAgents({ includeInternal: true }),
+      records,
+    );
     const mainAgent = agents.find(
       ({ live, record }) =>
         !record?.archivedAt && isMainControlAgentLabels((live ?? record)?.labels),
@@ -244,34 +255,52 @@ export async function summarizeWorkspaceAgents({
         getParentAgentIdFromLabels((live ?? record)?.labels),
       ]),
     );
-    for (const agent of agents) {
-      if (isMainControlAgentLabels((agent.live ?? agent.record)?.labels)) continue;
-      const agentId = agent.id;
-      const items = await agentManager
-        .readTimelineForSummary(agentId, workspaceId)
-        .catch((error: unknown) => {
-          logger.warn(
-            { err: error, workspaceId, agentId },
-            "Failed to read timeline for workspace summary",
-          );
-          return [];
-        });
-      if (items === null) continue;
-      const metadata = summarizeAgentMetadata(agent, mainAgent?.id, parentByAgentId);
-      const timeline = summarizeTimeline(
-        items,
-        metadata.parentAgentId,
-        getParentAddressFromLabels((agent.live ?? agent.record)?.labels, "")?.serverId,
-      );
-      entries.push({
-        ...metadata,
-        ...timeline,
-        ...(metadata.relationship === "level2"
-          ? { firstUserPrompt: null, lastAssistantSummary: null, todos: [] }
-          : {}),
-      });
-    }
-    entries.sort(compareEntries);
+    const candidates = agents
+      .filter(({ live, record }) => {
+        if (!includeArchived && record?.archivedAt) return false;
+        return !isMainControlAgentLabels((live ?? record)?.labels);
+      })
+      .map((agent) => ({
+        metadata: summarizeAgentMetadata(agent, mainAgent?.id, parentByAgentId),
+        parentServerId: getParentAddressFromLabels((agent.live ?? agent.record)?.labels, "")
+          ?.serverId,
+      }))
+      .sort((left, right) => compareEntries(left.metadata, right.metadata));
+    let archivedCount = 0;
+    const limit = pLimit(SUMMARY_TIMELINE_READ_CONCURRENCY);
+    const selected = candidates.filter(({ metadata }) => {
+      if (!metadata.archivedAt) return true;
+      return archivedCount++ < ARCHIVED_SUMMARY_LIMIT;
+    });
+    const results = await Promise.all(
+      selected.map(({ metadata, parentServerId }) =>
+        limit(async () => {
+          const { agentId, archivedAt, relationship } = metadata;
+          const items = await agentManager
+            .readTimelineForSummary(agentId, workspaceId, {
+              includeArchived: Boolean(archivedAt),
+              retainedOnly: Boolean(archivedAt) || relationship === "level2",
+            })
+            .catch((error: unknown) => {
+              logger.warn(
+                { err: error, workspaceId, agentId },
+                "Failed to read timeline for workspace summary",
+              );
+              return [];
+            });
+          if (items === null) return null;
+          const timeline = summarizeTimeline(items, metadata.parentAgentId, parentServerId);
+          return {
+            ...metadata,
+            ...timeline,
+            ...(relationship === "level2"
+              ? { firstUserPrompt: null, lastAssistantSummary: null, todos: [] }
+              : {}),
+          };
+        }),
+      ),
+    );
+    entries = results.filter((entry) => entry !== null);
   }
   const start = "<workspace-agents-summary>\n";
   const end = "\n</workspace-agents-summary>";

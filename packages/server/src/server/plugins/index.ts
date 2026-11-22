@@ -2,6 +2,7 @@ import type { PluginAgentToolsRuntime } from "./agent-tools.js";
 import type { PluginLifecycle } from "./lifecycle/index.js";
 import path from "node:path";
 import { stat, rm } from "node:fs/promises";
+import { isDeepStrictEqual } from "node:util";
 import type pino from "pino";
 import type { ProviderInstallation, ProviderRegistration } from "@getpaseo/plugin/server/provider";
 import {
@@ -19,7 +20,7 @@ import {
 import { parsePluginSourceReference } from "@getpaseo/protocol/plugin-source-reference";
 import { assertPluginCompatibility } from "@getpaseo/protocol/plugin-requirements";
 import { BUILTIN_PROVIDER_IDS } from "@getpaseo/protocol/provider-manifest";
-import type { DaemonConfigStore } from "../daemon-config-store.js";
+import type { DaemonConfigStore, MutableDaemonConfig } from "../daemon-config-store.js";
 import { type ManagedPluginCandidate, ManagedPluginSources } from "./managed-source.js";
 import { readPluginManifest } from "./manifest.js";
 import { expandTilde } from "../../utils/path.js";
@@ -95,6 +96,19 @@ function resolvePluginStatus(input: {
   return input.running ? "running" : "failed";
 }
 
+function usageLaunchSettings(
+  override: MutableDaemonConfig["providers"][string] | undefined,
+  requiresConfiguration: boolean | undefined,
+) {
+  return {
+    command: override?.command,
+    env: override?.env ?? {},
+    extends: override?.extends,
+    enabled: override?.enabled ?? true,
+    configured: !requiresConfiguration || override !== undefined,
+  };
+}
+
 export class PluginService {
   private readonly runtime: PluginRuntimePort;
   private readonly managedSources: ManagedPluginSources | null;
@@ -115,6 +129,7 @@ export class PluginService {
     { kind: "disable" | "remove"; completion: Promise<void> }
   >();
   private started = false;
+  private unsubscribeUsageConfig?: () => void;
   private readonly settingsListeners = new Set<(pluginId: string, settingsId: string) => void>();
 
   constructor(
@@ -256,6 +271,20 @@ export class PluginService {
     if (this.started) return;
     this.started = true;
     const config = this.configStore.get();
+    let previousProviders = config.providers;
+    this.unsubscribeUsageConfig = this.configStore.onChange(({ providers }) => {
+      const changed = new Set<string>();
+      for (const [id, registration] of this.providers) {
+        const previous = usageLaunchSettings(
+          previousProviders[id],
+          registration.requiresConfiguration,
+        );
+        const current = usageLaunchSettings(providers[id], registration.requiresConfiguration);
+        if (!isDeepStrictEqual(previous, current)) changed.add(id);
+      }
+      previousProviders = providers;
+      if (changed.size > 0) this.usageSources.invalidateProviderLaunches(changed);
+    });
     this.globalStartsBlocked = config.pluginsEnabled !== true;
     await this.builtinPlugins.load(async (plugin) => {
       try {
@@ -590,6 +619,8 @@ export class PluginService {
   }
 
   async stopAllPlugins(): Promise<void> {
+    this.unsubscribeUsageConfig?.();
+    this.unsubscribeUsageConfig = undefined;
     this.globalStartsBlocked = true;
     const stopping = this.stopAll();
     await this.enqueue(async () => {
@@ -712,6 +743,7 @@ export class PluginService {
           id: source.id,
           label: source.label,
           icon: source.icon,
+          provider: source.provider,
           discover: async (scope) => {
             const launch =
               scope.kind === "global" && source.provider

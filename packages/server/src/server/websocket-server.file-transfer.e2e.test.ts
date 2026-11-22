@@ -1,8 +1,10 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { WebSocket, type RawData } from "ws";
+import { ChunkedTransport } from "@getpaseo/protocol/chunked-transport";
+import { WebSocketRuntimeMetricsWindow } from "./websocket/runtime-metrics.js";
 import {
   decodeFileTransferFrame,
   FileTransferOpcode,
@@ -264,3 +266,144 @@ test("malformed chunk metadata closes the daemon socket with a protocol error", 
   source.send(new Uint8Array([0x31, 2, 0, 3, 65]));
   expect(await closed).toBe(1002);
 });
+
+test.each([
+  { state: "open", closeCode: 1006, writeFails: true },
+  { state: "closing", closeCode: 1000, writeFails: true },
+  { state: "disconnected with no write callback", closeCode: 1000, writeFails: false },
+])(
+  "a failed file write while $state cancels queued replies and allows reconnect",
+  async ({ state, closeCode, writeFails }) => {
+    const { default: pino } = await import("pino");
+    const messages: { msg: string; err?: { code?: string } }[] = [];
+    const logger = pino(
+      { level: "warn" },
+      {
+        write(line) {
+          messages.push(JSON.parse(line));
+        },
+      },
+    );
+    const cwd = mkdtempSync(join(tmpdir(), "paseo-interrupted-file-transfer-"));
+    temporaryDirectories.push(cwd);
+    writeFileSync(join(cwd, "file.bin"), Buffer.alloc(512 * 1024));
+    daemon = await createTestPaseoDaemon({ logger });
+
+    const clientId = "interrupted-transfer";
+    const burst = 32;
+    const originalSend = WebSocket.prototype.send;
+    const transportSend = vi.spyOn(ChunkedTransport.prototype, "send");
+    const recordBinary = vi.spyOn(
+      WebSocketRuntimeMetricsWindow.prototype,
+      "recordOutboundBinaryFrame",
+    );
+    const recordJson = vi.spyOn(WebSocketRuntimeMetricsWindow.prototype, "recordOutboundMessage");
+    const writeStarted = Promise.withResolvers<{
+      socket: WebSocket;
+      failWrite: (error: Error) => void;
+    }>();
+    const physicalFileWrites: number[] = [];
+    const physicalSend = vi
+      .spyOn(WebSocket.prototype, "send")
+      .mockImplementation(function (this: WebSocket, data, options, callback) {
+        const frame = data instanceof Uint8Array ? decodeFileTransferFrame(data) : null;
+        const done = typeof options === "function" ? options : callback;
+        if (frame?.requestId === "interrupted-file") {
+          physicalFileWrites.push(frame.opcode);
+          if (frame.opcode === FileTransferOpcode.FileBegin) {
+            if (!done) throw new Error("The file writer did not await physical completion");
+            writeStarted.resolve({ socket: this, failWrite: done });
+            return;
+          }
+        }
+        originalSend.call(this, data, typeof options === "function" ? undefined : options, done);
+      });
+    try {
+      const source = await connectSocket(daemon.port, clientId);
+      sockets.push(source);
+      const closed = new Promise<number>((resolve) => source.once("close", resolve));
+      source.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "file_explorer_request",
+            cwd,
+            path: "file.bin",
+            mode: "file",
+            acceptBinary: true,
+            requestId: "interrupted-file",
+          },
+        }),
+      );
+      const { socket, failWrite } = await writeStarted.promise;
+      for (let index = 0; index < burst; index++) {
+        source.send(
+          JSON.stringify({
+            type: "session",
+            message: { type: "ping", requestId: `queued-after-file-${index}`, clientSentAt: 1 },
+          }),
+        );
+      }
+      await expect
+        .poll(
+          () =>
+            transportSend.mock.calls.filter(
+              ([data]) =>
+                typeof data === "string" && data.includes('"requestId":"queued-after-file-'),
+            ).length,
+        )
+        .toBe(burst);
+
+      if (state !== "open") socket.close(1000);
+      if (writeFails) failWrite(Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+      expect(await closed).toBe(closeCode);
+      const replacement = await connectSocket(daemon.port, clientId);
+      sockets.push(replacement);
+      await sendAndWait(
+        replacement,
+        { type: "session", message: { type: "ping", requestId: "reconnected", clientSentAt: 1 } },
+        (message) =>
+          message.type === "session" &&
+          message.message.type === "pong" &&
+          message.message.payload.requestId === "reconnected",
+      );
+
+      expect(physicalFileWrites).toEqual([FileTransferOpcode.FileBegin]);
+      expect(recordBinary).not.toHaveBeenCalled();
+      expect(
+        recordJson.mock.calls.filter(
+          ([message]) =>
+            message.type === "session" &&
+            ((message.message.type === "pong" &&
+              message.message.payload.requestId.startsWith("queued-after-file-")) ||
+              (message.message.type === "file_explorer_response" &&
+                message.message.payload.requestId === "interrupted-file")),
+        ),
+      ).toHaveLength(0);
+      await expect
+        .poll(() =>
+          messages.filter(({ msg }) => msg.startsWith("Failed to fulfill file explorer request")),
+        )
+        .toHaveLength(1);
+      expect(
+        messages.filter(
+          ({ msg }) => msg === "Closing physical WebSocket after outbound framing failure",
+        ),
+      ).toMatchObject(writeFails ? [{ err: { code: "EPIPE" } }] : []);
+      expect(
+        messages.filter(
+          ({ msg }) =>
+            msg === "ws_send_failed" ||
+            msg === "Failed to emit source frame" ||
+            msg === "ws_application_delivery_denied" ||
+            msg === "ws_application_binary_delivery_denied",
+        ),
+      ).toEqual([]);
+    } finally {
+      physicalSend.mockRestore();
+      transportSend.mockRestore();
+      recordBinary.mockRestore();
+      recordJson.mockRestore();
+    }
+  },
+);

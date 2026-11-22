@@ -985,6 +985,12 @@ interface ClientActivity {
   appVisibilityChangedAt: Date;
 }
 
+export class SourceDeliveryClosedError extends Error {
+  constructor(cause?: unknown) {
+    super("Source is closed", { cause });
+  }
+}
+
 export class Session {
   private readonly connectedHostSession: ConnectedHostSession | null;
   private routed = false;
@@ -11004,9 +11010,11 @@ export class Session {
       pending = Promise.reject(error);
     }
     // Legacy producers fire and forget; owned streams await the same failure.
-    void pending.catch((error) =>
-      this.sessionLogger.warn({ err: error }, "Failed to emit source frame"),
-    );
+    void pending.catch((error) => {
+      if (!(error instanceof SourceDeliveryClosedError)) {
+        this.sessionLogger.warn({ err: error }, "Failed to emit source frame");
+      }
+    });
     return pending;
   }
 

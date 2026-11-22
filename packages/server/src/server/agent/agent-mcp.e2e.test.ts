@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import { experimental_createMCPClient } from "ai";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import pino from "pino";
 
@@ -12,6 +13,7 @@ import { withTimeout } from "../../utils/promise-timeout.js";
 import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
+import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import type {
   AgentClient,
   AgentPersistenceHandle,
@@ -231,6 +233,161 @@ async function waitForAgentFinish(options: { client: McpClient; agentId: string 
 }
 
 describe("agent MCP end-to-end (offline)", () => {
+  test("negotiates a 2025 tool call after a 2026-07-28 discovery probe", async () => {
+    const errors: string[] = [];
+    const clientInfo = { name: "agent-mcp-test", version: "1.0.0" };
+    const daemon = await createTestPaseoDaemon({
+      logger: pino({ level: "error" }, { write: (line: string) => errors.push(line) }),
+    });
+    const url = new URL(`http://127.0.0.1:${daemon.port}/mcp/agents`);
+    const client = new Client(clientInfo);
+
+    try {
+      const probe = await fetch(url, {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+          "MCP-Protocol-Version": "2026-07-28",
+          "Mcp-Method": "server/discover",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "server/discover",
+          params: {
+            _meta: {
+              "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+              "io.modelcontextprotocol/clientInfo": clientInfo,
+              "io.modelcontextprotocol/clientCapabilities": {},
+            },
+          },
+        }),
+      });
+      // A legacy HTTP 400 tells a dual-era client to retry with initialize.
+      expect(probe.status).toBe(400);
+      expect(await probe.json()).toMatchObject({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32000, message: expect.stringContaining("2025-11-25") },
+      });
+
+      // SDK 1.29 only implements the legacy handshake. Drive the modern probe
+      // above and use the SDK for the real legacy requests after the rejection.
+      const transport = new StreamableHTTPClientTransport(url);
+      await client.connect(transport);
+      expect(transport.protocolVersion).toBe("2025-11-25");
+      expect(await client.callTool({ name: "list_workspaces", arguments: {} })).toMatchObject({
+        structuredContent: { workspaces: [] },
+      });
+      expect(errors.join("\n")).not.toContain("Agent MCP transport error");
+    } finally {
+      try {
+        await client.close();
+      } finally {
+        await daemon.close();
+      }
+    }
+  });
+
+  test("rejects invalid and unsupported versions while logging other transport errors", async () => {
+    const errors: string[] = [];
+    const daemon = await createTestPaseoDaemon({
+      logger: pino({ level: "error" }, { write: (line: string) => errors.push(line) }),
+    });
+    const url = `http://127.0.0.1:${daemon.port}/mcp/agents`;
+    const post = (body: object, headers?: Record<string, string>) =>
+      fetch(url, {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+          ...headers,
+        },
+        body: JSON.stringify(body),
+      });
+
+    try {
+      for (const method of ["GET", "DELETE"]) {
+        const response = await fetch(url, { method });
+        expect(response.status).toBe(405);
+        expect(await response.json()).toEqual({
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32000, message: "Method not allowed" },
+        });
+      }
+
+      // During initialize the version in the body is a proposal. The SDK can
+      // counter-offer a supported version before any version header is required.
+      const initialize = await post({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2099-01-01",
+          capabilities: {},
+          clientInfo: { name: "agent-mcp-test", version: "1.0.0" },
+        },
+      });
+      expect(initialize.status).toBe(200);
+      expect(initialize.headers.get("mcp-session-id")).toBeNull();
+      const initializeEvent = (await initialize.text())
+        .split("\n")
+        .find((line) => line.startsWith("data: "));
+      expect(JSON.parse(initializeEvent?.slice("data: ".length) ?? "null")).toMatchObject({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { protocolVersion: "2025-11-25" },
+      });
+
+      for (const version of ["2026-07-28", "2099-01-01", "invalid-version"]) {
+        const response = await post(
+          {
+            jsonrpc: "2.0",
+            id: 2,
+            method: "tools/call",
+            params: {
+              name: "list_workspaces",
+              arguments: {},
+              _meta: { "io.modelcontextprotocol/protocolVersion": version },
+            },
+          },
+          {
+            "MCP-Protocol-Version": version,
+            "Mcp-Method": "tools/call",
+            "Mcp-Name": "list_workspaces",
+          },
+        );
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: -32000,
+            message: expect.stringContaining(`Unsupported protocol version: ${version}`),
+          },
+        });
+      }
+      expect(errors.join("\n")).not.toContain("Agent MCP transport error");
+
+      // A rejected version header must not hide a different transport error
+      // raised before the SDK gets to validate the version.
+      const invalidMessage = await post({}, { "MCP-Protocol-Version": "2026-07-28" });
+      expect(invalidMessage.status).toBe(400);
+      expect(await invalidMessage.json()).toMatchObject({ error: { code: -32700 } });
+      expect(errors.map((line) => JSON.parse(line))).toContainEqual(
+        expect.objectContaining({
+          level: 50,
+          msg: "Agent MCP transport error",
+          err: expect.objectContaining({ message: "Parse error: Invalid JSON-RPC message" }),
+        }),
+      );
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("create_agent runs initial prompt and affects filesystem", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));

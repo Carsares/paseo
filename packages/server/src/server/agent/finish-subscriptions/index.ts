@@ -311,6 +311,34 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     return requests.filter((request) => !notified.has(request.id));
   }
 
+  function enqueueLocalNotification(
+    record: FinishSubscription,
+    report: AgentFinishReport,
+    hasFinalSnapshot: boolean,
+  ) {
+    const messages = deps.messages();
+    const validateParentOwnership = messages.validateParentOwnership;
+    return messages.enqueue({
+      recipientId: record.callerAgentId,
+      prompt: report.prompt,
+      source: {
+        kind: "agent-notification",
+        agentId: record.childAgentId,
+        serverId: record.serverId ?? deps.serverId,
+        title: report.title,
+        event: report.event,
+      },
+      activeTurnBehavior: "steer",
+      unarchive: false,
+      // The observation's snapshot cannot authorize a notification that
+      // waited behind another turn or the recipient's quiet window.
+      validateDispatch:
+        record.requireParentOwnership && hasFinalSnapshot && validateParentOwnership
+          ? () => validateParentOwnership(record)
+          : undefined,
+    });
+  }
+
   async function deliver(
     record: FinishSubscription,
     result: FinishObservationResult,
@@ -369,19 +397,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         if (request) permissions.add(request.id);
         continue;
       }
-      const receipt = deps.messages().enqueue({
-        recipientId: record.callerAgentId,
-        prompt,
-        source: {
-          kind: "agent-notification",
-          agentId: record.childAgentId,
-          serverId: childServerId,
-          title,
-          event: finishNotificationEvents[reason],
-        },
-        activeTurnBehavior: "steer",
-        unarchive: false,
-      });
+      const receipt = enqueueLocalNotification(record, report, Boolean(result.final));
       acknowledgments.push(
         receipt.dispatched.then(() => {
           if (request) permissions.add(request.id);
@@ -389,7 +405,12 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         }),
       );
     }
-    await abortable(Promise.all(acknowledgments), signal);
+    try {
+      await abortable(Promise.all(acknowledgments), signal);
+    } catch (error) {
+      if (error instanceof ParentReportRecipientUnavailableError) return true;
+      throw error;
+    }
     return !signal.aborted && reason !== "needs permission";
   }
   async function run(watch: Watch, group: Set<Watch>): Promise<void> {

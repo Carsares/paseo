@@ -24,6 +24,7 @@ import { randomUUID } from "node:crypto";
 import { getHostName } from "./host-name.js";
 import path from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
 import type { Logger } from "pino";
 import { z } from "zod";
 import { createBranchChangeRouteHandler } from "./script-route-branch-handler.js";
@@ -1801,7 +1802,10 @@ export async function createPaseoDaemon(
   {
     const agentMcpRoute = "/mcp/agents";
 
-    const createAgentMcpSession = async (callerAgentId?: string) => {
+    const createAgentMcpSession = async (
+      callerAgentId: string | undefined,
+      protocolVersion: string | undefined,
+    ) => {
       const agentMcpServer = await createAgentMcpServer(
         createAgentToolHostDependencies({
           callerAgentId,
@@ -1822,8 +1826,19 @@ export async function createPaseoDaemon(
         // StreamableHTTPServerTransport's built-in check requires exact Host header matches.
         enableDnsRebindingProtection: false,
       });
+      // SDK 1.29 reports the version rejection through onerror before returning its
+      // legacy HTTP 400. Match the full diagnostic for this request so other transport
+      // failures still get logged, including failures before the version check.
+      const versionRejection =
+        protocolVersion !== undefined && !SUPPORTED_PROTOCOL_VERSIONS.includes(protocolVersion)
+          ? `Bad Request: Unsupported protocol version: ${protocolVersion} (supported versions: ${SUPPORTED_PROTOCOL_VERSIONS.join(", ")})`
+          : undefined;
       Object.assign(transport, {
         onerror: (err: Error) => {
+          if (err.message === versionRejection) {
+            logger.debug("Agent MCP rejected unsupported protocol version");
+            return;
+          }
           logger.error({ err }, "Agent MCP transport error");
         },
       });
@@ -1888,10 +1903,19 @@ export async function createPaseoDaemon(
         } else if (Array.isArray(callerAgentIdRaw) && typeof callerAgentIdRaw[0] === "string") {
           callerAgentId = callerAgentIdRaw[0];
         }
-        const { server, transport } = await createAgentMcpSession(callerAgentId);
-        res.on("close", () => {
-          void transport.close();
-          void server.close();
+        const { server, transport } = await createAgentMcpSession(
+          callerAgentId,
+          req.header("mcp-protocol-version"),
+        );
+        if (res.destroyed) {
+          await server.close();
+          return;
+        }
+        res.once("close", () => {
+          // Closing the SDK server also closes the transport it owns.
+          void server
+            .close()
+            .catch((err) => logger.error({ err }, "Failed to close Agent MCP server"));
         });
 
         await transport.handleRequest(
@@ -1901,7 +1925,7 @@ export async function createPaseoDaemon(
         );
       } catch (err) {
         logger.error({ err }, "Failed to handle Agent MCP request");
-        if (!res.headersSent) {
+        if (!res.headersSent && !res.destroyed) {
           res.status(500).json({
             jsonrpc: "2.0",
             error: {

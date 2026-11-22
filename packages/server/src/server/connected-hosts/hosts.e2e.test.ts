@@ -2534,6 +2534,155 @@ test.each(["same host", "reverse link", "forward link"] as const)(
   },
 );
 
+test.each([
+  { change: "archive child", expectsDelivery: true, automatic: false },
+  { change: "close child", expectsDelivery: true, automatic: false },
+  { change: "detach child", expectsDelivery: false, automatic: false },
+  { change: "reparent child", expectsDelivery: false, automatic: false },
+  { change: "change parent host", expectsDelivery: false, automatic: false },
+  { change: "archive parent", expectsDelivery: false, automatic: false },
+  { change: "archive child", expectsDelivery: true, automatic: true },
+  { change: "detach child", expectsDelivery: false, automatic: true },
+  { change: "archive parent", expectsDelivery: false, automatic: true },
+])(
+  "rechecks $change during the idle parent's merge window (automatic=$automatic)",
+  async ({ change, expectsDelivery, automatic }) => {
+    const prompts: string[] = [];
+    const holdChild = Promise.withResolvers<void>();
+    const host = await daemon({
+      agentClients: createTestAgentClients({
+        onStartTurn: (prompt) => prompts.push(String(prompt)),
+        beforeTurnComplete: async (prompt) => {
+          if (String(prompt) === "Finish the delegated turn") await holdChild.promise;
+        },
+      }),
+    });
+    cleanup.push(async () => holdChild.resolve());
+    const { client, paseo } = await api(host);
+    const workspace = await paseo.workspaces.create({
+      source: { kind: "directory", path: host.staticDir },
+    });
+    const config = { provider: "claude/claude-test", modeId: "full-access" };
+    const parent = await workspace.agents.create({ config });
+    const otherParent = await workspace.agents.create({ config });
+    const tools = new Client({ name: "merge-window-report", version: "1" });
+    cleanup.push(() => tools.close());
+    const connectTools = (agentId: string) =>
+      tools.connect(
+        new StreamableHTTPClientTransport(
+          new URL(`http://127.0.0.1:${host.port}/mcp/agents?callerAgentId=${agentId}`),
+        ),
+      );
+    let childId: string;
+    if (automatic) {
+      await connectTools(parent.id);
+      const creation = await tools.callTool({
+        name: "create_agent",
+        arguments: {
+          provider: config.provider,
+          title: "Child with automatic completion reports",
+          initialPrompt: "Finish the delegated turn",
+          settings: { modeId: config.modeId },
+        },
+      });
+      expect(creation.isError, JSON.stringify(creation)).not.toBe(true);
+      childId = (creation.structuredContent as { agentId: string }).agentId;
+    } else {
+      childId = (await workspace.agents.create({ config, parent, parentReporting: "explicit" })).id;
+      await connectTools(childId);
+    }
+    expect(host.daemon.agentManager.hasInFlightRun(parent.id)).toBe(false);
+    const summary = "The child submitted this report before the merge window closed";
+    const reportFile = join(
+      host.paseoHome,
+      automatic ? "finish-subscriptions.json" : "finish-followup-reports.json",
+    );
+    const readReports = (): Promise<{ id: string; childAgentId: string }[]> =>
+      readFile(reportFile, "utf8").then(JSON.parse);
+    const received = () =>
+      prompts.filter(
+        (prompt) =>
+          prompt.includes(`source-agent-id="${childId}"`) &&
+          prompt.includes(automatic ? 'event="finished"' : summary),
+      );
+
+    // Hold the daemon's timer, leaving HTTP, WebSocket, and filesystem I/O real.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const scheduled = Promise.withResolvers<void>();
+    const setTimer = globalThis.setTimeout;
+    const timers = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      callback,
+      delay,
+      ...args
+    ) => {
+      const timer = setTimer(callback, delay, ...args);
+      if (
+        delay === 2000 &&
+        new Error().stack?.replaceAll("\\", "/").includes("/agent/agent-messages/delivery.ts")
+      ) {
+        scheduled.resolve();
+      }
+      return timer;
+    }) as typeof globalThis.setTimeout);
+    try {
+      let messageId: string | undefined;
+      if (automatic) {
+        holdChild.resolve();
+      } else {
+        const result = await tools.callTool({
+          name: "report_to_parent",
+          arguments: { status: "completed", summary },
+        });
+        expect(result.structuredContent).toMatchObject({ deliveryStatus: "queued" });
+        messageId = (result.structuredContent as { messageId: string }).messageId;
+      }
+      expect(await readReports()).toMatchObject([
+        { childAgentId: childId, ...(messageId ? { id: messageId } : {}) },
+      ]);
+      await scheduled.promise;
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(received()).toEqual([]);
+
+      switch (change) {
+        case "archive child":
+          await client.archiveAgent(childId);
+          break;
+        case "close child":
+          await host.daemon.agentManager.closeAgent(childId);
+          break;
+        case "detach child":
+          await client.detachAgent(childId);
+          break;
+        case "reparent child":
+          await client.setAgentParent(childId, otherParent.id);
+          break;
+        case "change parent host": {
+          // Simulate a stored relationship pointing at the same agent ID on
+          // another host. The local hierarchy API only moves local agents.
+          await host.daemon.agentManager.closeAgent(childId);
+          const child = await host.daemon.agentStorage.get(childId);
+          if (!child) throw new Error("Expected the child to survive close in storage");
+          await host.daemon.agentStorage.upsert({
+            ...child,
+            labels: { ...child.labels, "paseo.parent-server-id": "different-parent-host" },
+          });
+          break;
+        }
+        case "archive parent":
+          await client.archiveAgent(parent.id);
+          break;
+      }
+      expect(received()).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect.poll(readReports).toEqual([]);
+      expect(received()).toHaveLength(expectsDelivery ? 1 : 0);
+    } finally {
+      timers.mockRestore();
+      vi.useRealTimers();
+    }
+  },
+);
+
 test.each(["completed", "blocked", "archive", "detach"] as const)(
   "handles %s parent report delivery on a one-way link across reconnect",
   { timeout: 30000 },
@@ -3434,6 +3583,96 @@ test(
       .toEqual([]);
   },
 );
+
+test("a direct-parent permission lookup stops when its host channel closes", async () => {
+  const errors: string[] = [];
+  const host = await daemon({
+    logger: pino({ level: "error" }, { write: (line) => errors.push(JSON.parse(line).msg) }),
+  });
+  const { client } = await api(host);
+  const routeId = await client.openHostLink("permission-lookup-close");
+  const responses: WSOutboundMessage[] = [];
+  const closed = Promise.withResolvers<void>();
+  const unsubscribe = client.subscribeRawMessages((message) => {
+    if (message.type === "hosts.route.frame" && message.payload.subscriptionId === routeId)
+      responses.push(WSOutboundMessageSchema.parse(JSON.parse(message.payload.data)));
+    if (message.type === "hosts.route.closed" && message.payload.subscriptionId === routeId)
+      closed.resolve();
+  });
+  cleanup.push(async () => unsubscribe());
+  await client.sendHostFrame(
+    routeId,
+    JSON.stringify({
+      type: "hello",
+      clientId: "permission-lookup-close",
+      clientType: "mcp",
+      protocolVersion: 1,
+      producer: { serverId: "parent-host", sourceId: "mcp-direct-parent:parent" },
+    }),
+  );
+  await expect
+    .poll(() => responses)
+    .toContainEqual(
+      expect.objectContaining({
+        type: "session",
+        message: expect.objectContaining({
+          payload: expect.objectContaining({
+            status: "server_info",
+            sourceId: "route:owner:parent-host:mcp-direct-parent%3Aparent:direct-parent",
+          }),
+        }),
+      }),
+    );
+  const respond = (requestId: string) =>
+    client.sendHostFrame(
+      routeId,
+      JSON.stringify({
+        type: "session",
+        message: {
+          type: "agent_permission_response",
+          agentId: "missing-child",
+          requestId,
+          response: { behavior: "allow" },
+        },
+      }),
+    );
+  await respond("connected-denial");
+  await expect
+    .poll(() => responses)
+    .toContainEqual({
+      type: "session",
+      message: {
+        type: "rpc_error",
+        payload: {
+          requestId: "connected-denial",
+          requestType: "agent_permission_response",
+          code: "access_denied",
+          error: "You can only manage your direct subagents.",
+        },
+      },
+    });
+
+  const started = Promise.withResolvers<void>();
+  const pending = Promise.withResolvers<Awaited<ReturnType<typeof host.daemon.agentStorage.get>>>();
+  const lookup = vi.spyOn(host.daemon.agentStorage, "get").mockImplementationOnce(() => {
+    started.resolve();
+    return pending.promise;
+  });
+  try {
+    await respond("denial-after-close");
+    await started.promise;
+    client.closeHostRoute(routeId);
+    await closed.promise;
+    pending.resolve(null);
+    // Drain the lookup and dispatch continuations after the server confirms close.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(errors).not.toContain("Failed to parse/handle message");
+    await client.ping();
+  } finally {
+    lookup.mockRestore();
+    pending.resolve(null);
+  }
+});
 
 test(
   "disabled remote send rejects unsent finish intent before reconnecting to an idle child",

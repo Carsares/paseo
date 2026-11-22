@@ -1167,6 +1167,62 @@ function projectSummaryTimelineItems(rows: AgentTimelineRow[]): AgentTimelineIte
   return projectTimelineRows({ rows, mode: "projected" }).map(({ item }) => item);
 }
 
+export const SUMMARY_TIMELINE_READ_CONCURRENCY = 4;
+const SUMMARY_TIMELINE_READ_TIMEOUT_MS = 5_000;
+
+interface SummaryTimelineReadOptions {
+  includeArchived?: boolean;
+  retainedOnly?: boolean;
+}
+
+interface SummaryTimelineRead extends Required<SummaryTimelineReadOptions> {
+  agentId: string;
+  workspaceId: string;
+  signal: AbortSignal;
+}
+
+class SummaryTimelineReadPool {
+  private readonly active = new Map<string, AbortSignal>();
+  private readonly waiters = new Set<() => void>();
+
+  async run<T>(agentId: string, signal: AbortSignal, read: () => Promise<T>): Promise<T> {
+    while (this.active.size >= SUMMARY_TIMELINE_READ_CONCURRENCY || this.active.has(agentId)) {
+      signal.throwIfAborted();
+      const sameAgent = this.active.get(agentId);
+      const blocked = sameAgent
+        ? sameAgent.aborted
+        : Array.from(this.active.values()).every((activeSignal) => activeSignal.aborted);
+      if (blocked) {
+        throw new Error("Timed-out workspace summary timeline readers have not finished");
+      }
+      await new Promise<void>((resume) => {
+        const wake = () => {
+          this.waiters.delete(wake);
+          signal.removeEventListener("abort", wake);
+          resume();
+        };
+        this.waiters.add(wake);
+        signal.addEventListener("abort", wake, { once: true });
+      });
+    }
+
+    signal.throwIfAborted();
+    this.active.set(agentId, signal);
+    const wakeWaiters = () => {
+      for (const wake of this.waiters) wake();
+    };
+    signal.addEventListener("abort", wakeWaiters, { once: true });
+    try {
+      return await read();
+    } finally {
+      // Keep the slot until the read settles, even after its caller timed out.
+      this.active.delete(agentId);
+      signal.removeEventListener("abort", wakeWaiters);
+      wakeWaiters();
+    }
+  }
+}
+
 export class AgentManager {
   private readonly timelinePrefixes: TimelinePrefixStore;
   private readonly contextHandoffs = new Map<string, PendingContextHandoff>();
@@ -1189,6 +1245,10 @@ export class AgentManager {
   private readonly providerDefinitions = new Map<AgentProvider, ProviderEnabledFlag>();
   private readonly agents = new Map<string, LiveManagedAgent>();
   private readonly timelineStore: InMemoryAgentTimelineStore;
+  private readonly summaryLocalReads = new SummaryTimelineReadPool();
+  private readonly summaryProviderReads = new SummaryTimelineReadPool();
+  private readonly summaryProviderLifecycle = new Set<string>();
+  private readonly summaryLifecycleWaits = new WeakMap<Promise<void>, Set<() => void>>();
   private readonly unprimedRetainedTimelines = new Set<string>();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly backgroundWork = new AgentBackgroundWorkStore();
@@ -1857,19 +1917,163 @@ export class AgentManager {
   async readTimelineForSummary(
     agentId: string,
     workspaceId: string,
+    { includeArchived = false, retainedOnly = false }: SummaryTimelineReadOptions = {},
   ): Promise<AgentTimelineItem[] | null> {
-    return this.runLifecycleMutation(agentId, async () => {
-      const record = await this.registry?.get(agentId);
-      const current = this.agents.get(agentId) ?? record;
-      if (current?.workspaceId !== workspaceId || current.internal || current.background)
-        return null;
+    const controller = new AbortController();
+    const { signal } = controller;
+    const request = { agentId, workspaceId, includeArchived, retainedOnly, signal };
+    let checkedVisibility = false;
+    const read = async () => {
+      const visible = await this.getSummaryTimelineRecord(request);
+      checkedVisibility = true;
+      signal.throwIfAborted();
+      return visible ? this.readSummaryTimeline(request) : null;
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error("Workspace summary timeline read timed out");
+        reject(error);
+        controller.abort(error);
+      }, SUMMARY_TIMELINE_READ_TIMEOUT_MS);
+    });
+    try {
+      const items = await Promise.race([read(), deadline]);
+      return items !== null && (await this.getSummaryTimelineRecord(request)) ? items : null;
+    } catch (error) {
+      // The registry is already initialized after the initial check, so this
+      // recheck can read visibility without waiting for the lifecycle lane.
+      if (checkedVisibility && (await this.getSummaryTimelineRecord(request))) throw error;
+      this.logger.warn(
+        { err: error, agentId, workspaceId },
+        "Workspace summary visibility unavailable",
+      );
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async getSummaryTimelineRecord({
+    agentId,
+    workspaceId,
+    includeArchived,
+  }: SummaryTimelineRead): Promise<{ record: StoredAgentRecord | null | undefined } | null> {
+    const record = await this.registry?.get(agentId);
+    const current = this.agents.get(agentId) ?? record;
+    if (
+      current?.workspaceId !== workspaceId ||
+      (record?.workspaceId && record.workspaceId !== workspaceId) ||
+      current.internal ||
+      current.background ||
+      record?.internal ||
+      record?.background ||
+      isMainControlAgentLabels(current.labels) ||
+      (record?.archivedAt && !includeArchived) ||
+      this.pendingSubagentMoveSnapshots.has(agentId)
+    ) {
+      return null;
+    }
+    return { record };
+  }
+
+  private async waitForSummaryLifecycle(agentId: string, signal: AbortSignal): Promise<void> {
+    while (!signal.aborted) {
+      const tail = this.lifecycleMutationTails.get(agentId);
+      if (!tail) return;
+      // Attach one completion callback to each lifecycle tail. Timed-out
+      // readers remove their listener and leave nothing queued on that lane.
+      let waiters = this.summaryLifecycleWaits.get(tail);
+      if (!waiters) {
+        waiters = new Set();
+        this.summaryLifecycleWaits.set(tail, waiters);
+        const currentWaiters = waiters;
+        void tail.finally(() => {
+          for (const wake of currentWaiters) wake();
+        });
+      }
+      await new Promise<void>((resume) => {
+        const wake = () => {
+          waiters.delete(wake);
+          signal.removeEventListener("abort", wake);
+          resume();
+        };
+        waiters.add(wake);
+        signal.addEventListener("abort", wake, { once: true });
+      });
+    }
+    signal.throwIfAborted();
+  }
+
+  private async readSummaryTimeline(
+    request: SummaryTimelineRead,
+  ): Promise<AgentTimelineItem[] | null> {
+    const { agentId, signal } = request;
+    // Preserve the result of interactive hydration already in progress. A
+    // summary's own provider replay does not update any local timeline.
+    if (!this.summaryProviderLifecycle.has(agentId)) {
+      await this.waitForSummaryLifecycle(agentId, signal);
+    }
+    const local = await this.readLocalSummaryTimeline(request);
+    if (!local?.replay) return local?.items ?? null;
+    const { record } = local.replay;
+
+    return this.summaryProviderReads.run(agentId, signal, async () => {
+      // Taking a provider slot does not put a read behind a stalled mutation.
+      // Once started, serialize replay with normal open, close and archive.
+      while (this.lifecycleMutationTails.has(agentId)) {
+        await this.waitForSummaryLifecycle(agentId, signal);
+      }
+      signal.throwIfAborted();
+      this.summaryProviderLifecycle.add(agentId);
+      try {
+        return await this.runLifecycleMutation(agentId, async () => {
+          signal.throwIfAborted();
+          const visible = await this.getSummaryTimelineRecord(request);
+          signal.throwIfAborted();
+          if (!visible) return null;
+          const latest =
+            this.timelineStore.has(agentId) || visible.record !== record
+              ? await this.readLocalSummaryTimeline(request)
+              : local;
+          signal.throwIfAborted();
+          return latest?.replay
+            ? this.readStoredTimelineForSummary({ ...latest.replay, signal })
+            : (latest?.items ?? null);
+        });
+      } finally {
+        this.summaryProviderLifecycle.delete(agentId);
+      }
+    });
+  }
+
+  private async readLocalSummaryTimeline(request: SummaryTimelineRead) {
+    const { agentId, retainedOnly, signal } = request;
+    return this.summaryLocalReads.run(agentId, signal, async () => {
+      const visible = await this.getSummaryTimelineRecord(request);
+      signal.throwIfAborted();
+      if (!visible) return null;
       if (this.timelineStore.has(agentId)) {
-        return this.readLoadedTimelineForSummary(agentId);
+        return { items: await this.readLoadedTimelineForSummary(agentId), replay: null };
       }
       const committed = await this.durableTimelineStore?.getCommittedRows(agentId);
-      if (committed?.length) return projectSummaryTimelineItems(committed);
-
-      return record ? this.readStoredTimelineForSummary(record) : [];
+      signal.throwIfAborted();
+      if (this.timelineStore.has(agentId)) {
+        return { items: await this.readLoadedTimelineForSummary(agentId), replay: null };
+      }
+      if (committed?.length) return { items: projectSummaryTimelineItems(committed), replay: null };
+      const { record } = visible;
+      if (!record) return { items: [], replay: null };
+      const prefix = await this.timelinePrefixes.load(agentId);
+      signal.throwIfAborted();
+      const handle =
+        retainedOnly || record.archivedAt
+          ? null
+          : toAgentPersistenceHandle(this.getRegisteredProviderIds(), record.persistence);
+      return {
+        items: prefix?.rows.map(({ item }) => item) ?? [],
+        replay: handle ? { record, handle, prefix } : null,
+      };
     });
   }
 
@@ -1887,18 +2091,24 @@ export class AgentManager {
     return prefix?.rows.length ? [...prefix.rows.map(({ item }) => item), ...items] : items;
   }
 
-  private async readStoredTimelineForSummary(
-    record: StoredAgentRecord,
-  ): Promise<AgentTimelineItem[]> {
+  private async readStoredTimelineForSummary({
+    record,
+    handle,
+    prefix,
+    signal,
+  }: {
+    record: StoredAgentRecord;
+    handle: AgentPersistenceHandle;
+    prefix: PersistedTimelinePrefix | null;
+    signal: AbortSignal;
+  }): Promise<AgentTimelineItem[]> {
     const agentId = record.id;
-    const prefix = await this.timelinePrefixes.load(agentId);
-    const handle = toAgentPersistenceHandle(this.getRegisteredProviderIds(), record.persistence);
-    if (!handle) return prefix?.rows.map(({ item }) => item) ?? [];
 
     let events: Extract<AgentStreamEvent, { type: "timeline" }>[];
     try {
-      events = await this.readSummaryProviderHistory(record, handle);
+      events = await this.readSummaryProviderHistory({ record, handle, signal });
     } catch (error) {
+      signal.throwIfAborted();
       if (!prefix?.rows.length) throw error;
       this.logger.warn({ err: error, agentId }, "Using retained history for workspace summary");
       return prefix.rows.map(({ item }) => item);
@@ -1927,10 +2137,15 @@ export class AgentManager {
     return timeline.getItems(agentId);
   }
 
-  private async readSummaryProviderHistory(
-    record: StoredAgentRecord,
-    handle: AgentPersistenceHandle,
-  ): Promise<Extract<AgentStreamEvent, { type: "timeline" }>[]> {
+  private async readSummaryProviderHistory({
+    record,
+    handle,
+    signal,
+  }: {
+    record: StoredAgentRecord;
+    handle: AgentPersistenceHandle;
+    signal: AbortSignal;
+  }): Promise<Extract<AgentStreamEvent, { type: "timeline" }>[]> {
     const client = this.requireClient(handle.provider);
     const config = await this.normalizeConfig(
       {
@@ -1941,15 +2156,26 @@ export class AgentManager {
       },
       { purpose: "history", resolveDefaultModel: false },
     );
+    signal.throwIfAborted();
     const reader = await client.resumeSession(
       handle,
       config,
       { agentId: record.id, env: record.launchEnv },
       { purpose: "history" },
     );
+    let closing: Promise<void> | undefined;
+    const closeReader = () => (closing ??= Promise.resolve().then(() => reader.close()));
+    const onAbort = () => {
+      void closeReader().catch((err: unknown) => {
+        this.logger.warn({ err, agentId: record.id }, "Failed to close workspace summary reader");
+      });
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
     try {
+      signal.throwIfAborted();
       const events: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
       for await (const rawEvent of reader.streamHistory()) {
+        signal.throwIfAborted();
         const event = limitAgentStreamEventContent(rawEvent, record.id);
         if (event.type !== "timeline") continue;
         for (const item of projectAgentMessages(event.item)) {
@@ -1958,7 +2184,11 @@ export class AgentManager {
       }
       return events;
     } finally {
-      await reader.close();
+      try {
+        await closeReader();
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+      }
     }
   }
 

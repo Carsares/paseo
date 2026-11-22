@@ -4,21 +4,28 @@ import {
   WORKSPACE_ROLE_LABEL,
   WORKSPACE_MAIN_ROLE,
 } from "@getpaseo/protocol/agent-labels";
+import { WorkspaceAgentSummaryEntrySchema } from "@getpaseo/protocol/messages";
 import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pino from "pino";
 import { expect, test } from "vitest";
+import { z } from "zod";
 import { createAntigravityProvider } from "../../../../../plugins/antigravity-provider/server/provider.js";
 import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
-import { createPersistedWorkspaceRecord } from "../workspace-registry.js";
+import {
+  createPersistedWorkspaceRecord,
+  FileBackedWorkspaceRegistry,
+} from "../workspace-registry.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { AgentManager } from "./agent-manager.js";
 import { formatAgentMessage } from "./agent-messages/envelope.js";
 import type { AgentStreamEvent, AgentTimelineItem } from "./agent-sdk-types.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
 import { PluginAgentClientRegistry } from "./plugin-provider.js";
+import { ProviderSnapshotManager } from "./provider-snapshot-manager.js";
 import { sliceTimelineRowsAtBoundary } from "./timeline-prefix-store.js";
+import { createPaseoToolCatalog } from "./tools/paseo-tools.js";
 import { summarizeWorkspaceAgents } from "./workspace-agents-summary.js";
 
 test.each(["legacy", "scoped"] as const)(
@@ -266,7 +273,7 @@ test.each(["legacy", "scoped"] as const)(
   },
 );
 
-test("summarizes only the selected workspace and releases successful and failed cold readers", async () => {
+test("summarizes only the selected workspace and releases a failed cold reader", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "workspace-summary-"));
   const logger = pino({ level: "silent" });
   const agentStorage = new AgentStorage(join(cwd, "agents"), logger);
@@ -418,6 +425,10 @@ test("summarizes only the selected workspace and releases successful and failed 
       labels: { [PARENT_AGENT_ID_LABEL]: live.id },
       persistence: { provider: "codex", sessionId: "archived-history" },
     });
+    await agentStorage.timelinePrefixes.save("archived", {
+      version: 1,
+      rows: items.map((item, index) => ({ seq: index + 1, timestamp: createdAt, item })),
+    });
     await agentStorage.upsert({
       ...base,
       id: "closed",
@@ -428,10 +439,22 @@ test("summarizes only the selected workspace and releases successful and failed 
     await agentStorage.upsert({ ...base, id: "same-cwd", workspaceId: "other-workspace" });
     await agentStorage.upsert({ ...base, id: "background", background: true });
     await agentStorage.upsert({ ...base, id: "private", internal: true });
+    await agentStorage.upsert({
+      ...base,
+      id: "moved",
+      persistence: { provider: "codex", sessionId: "moved-history" },
+    });
     const result = await summarizeWorkspaceAgents({
       workspaceId,
+      includeArchived: true,
       agentManager,
-      agentStorage,
+      agentStorage: {
+        async listByWorkspaces(ids, options) {
+          const records = await agentStorage.listByWorkspaces(ids, options);
+          await agentStorage.upsert({ ...base, id: "moved", workspaceId: "other-workspace" });
+          return records;
+        },
+      },
       workspaceRegistry: { get: async (id) => (id === workspaceId ? workspace : null) },
       logger,
     });
@@ -463,11 +486,8 @@ test("summarizes only the selected workspace and releases successful and failed 
     expect(result.attachment.text).toBe(
       "<workspace-agents-summary>\n" + result.summaryText + "\n</workspace-agents-summary>",
     );
-    expect(resumed).toEqual([
-      ["archived-history", "history"],
-      ["unsupported", "history"],
-    ]);
-    expect(closed).toEqual(["archived-history", "unsupported"]);
+    expect(resumed).toEqual([["unsupported", "history"]]);
+    expect(closed).toEqual(["unsupported"]);
     expect(agentManager.listAgents().map(({ id }) => id)).toEqual([live.id]);
     expect((await agentStorage.get("archived"))?.archivedAt).toBe(archivedAt);
     expect(createdSessions).toBe(1);
@@ -476,6 +496,289 @@ test("summarizes only the selected workspace and releases successful and failed 
     await rm(cwd, { recursive: true, force: true });
   }
 });
+
+test("limits archived results by update time and keeps filtered ancestors for hierarchy", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workspace-summary-archive-"));
+  const logger = pino({ level: "silent" });
+  const agentStorage = new AgentStorage(join(cwd, "agents"), logger);
+  const createdAt = "2026-01-01T00:00:00.000Z";
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "wks_1234567890abcdef",
+    projectId: "prj_1234567890abcdef",
+    cwd,
+    kind: "directory",
+    displayName: "Summary workspace",
+    createdAt,
+    updatedAt: createdAt,
+  });
+  const { workspaceId } = workspace;
+  const base: Omit<StoredAgentRecord, "id"> = {
+    provider: "codex",
+    cwd,
+    workspaceId,
+    labels: {},
+    metadata: {},
+    createdAt,
+    updatedAt: createdAt,
+    lastStatus: "closed",
+  };
+  const resumes: string[] = [];
+  const client = createTestAgentClient("codex");
+  const resume = client.resumeSession.bind(client);
+  client.resumeSession = async (handle, ...args) => {
+    resumes.push(handle.sessionId);
+    return resume(handle, ...args);
+  };
+  const agentManager = new AgentManager({
+    clients: { codex: client },
+    registry: agentStorage,
+    logger,
+  });
+  const workspaceRegistry = new FileBackedWorkspaceRegistry(join(cwd, "workspaces.json"), logger);
+  const providerSnapshotManager = new ProviderSnapshotManager({ logger });
+  const catalog = createPaseoToolCatalog({
+    agentManager,
+    agentStorage,
+    workspaceRegistry,
+    providerSnapshotManager,
+    logger,
+  });
+  const schema = z.object({ entries: z.array(WorkspaceAgentSummaryEntrySchema) });
+  async function summarize(includeArchived?: boolean) {
+    const result = await catalog.executeTool("summarize_workspace_agents", {
+      workspaceId,
+      ...(includeArchived !== undefined && { includeArchived }),
+    });
+    return schema.parse(result.structuredContent);
+  }
+  const archivedIds = Array.from({ length: 35 }, (_, i) => `archive-${i}`);
+  try {
+    await workspaceRegistry.upsert(workspace);
+    await agentStorage.upsert({
+      ...base,
+      id: "main",
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
+    for (const [i, id] of archivedIds.entries()) {
+      await agentStorage.upsert({
+        ...base,
+        id,
+        labels: { [PARENT_AGENT_ID_LABEL]: "main" },
+        archivedAt: createdAt,
+        updatedAt: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+        persistence: { provider: "codex", sessionId: id },
+      });
+    }
+    await agentStorage.upsert({
+      ...base,
+      id: "hidden-archive",
+      archivedAt: createdAt,
+      updatedAt: "2026-01-02T00:00:00.000Z",
+      background: true,
+    });
+    const live = await agentManager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId,
+    });
+    const liveRecord = (await agentStorage.get(live.id))!;
+    await agentStorage.upsert({ ...liveRecord, archivedAt: createdAt });
+    expect((await agentStorage.get(live.id))?.archivedAt).toBe(createdAt);
+    await agentStorage.upsert({
+      ...base,
+      id: "descendant",
+      labels: { [PARENT_AGENT_ID_LABEL]: archivedIds[0]! },
+      persistence: { provider: "codex", sessionId: "descendant-native" },
+    });
+    await agentStorage.timelinePrefixes.save("descendant", {
+      version: 1,
+      rows: [
+        {
+          seq: 1,
+          timestamp: createdAt,
+          item: {
+            type: "tool_call",
+            name: "Edit",
+            callId: "retained",
+            status: "completed",
+            error: null,
+            detail: { type: "edit", filePath: "src/retained.ts" },
+          },
+        },
+      ],
+    });
+    const defaultSummary = await summarize();
+    expect.soft(defaultSummary.entries.map(({ agentId }) => agentId)).toEqual(["descendant"]);
+    expect
+      .soft(defaultSummary.entries.find(({ agentId }) => agentId === "descendant"))
+      .toMatchObject({
+        relationship: "level2",
+        parentAgentId: archivedIds[0],
+        touchedFiles: ["src/retained.ts"],
+        firstUserPrompt: null,
+        lastAssistantSummary: null,
+        todos: [],
+      });
+    expect.soft(resumes).toEqual([]);
+    const withArchives = await summarize(true);
+    expect(withArchives.entries.map(({ agentId }) => agentId)).toEqual([
+      live.id,
+      ...archivedIds.slice(-29).toReversed(),
+      "descendant",
+    ]);
+    expect((await summarize(false)).entries).toEqual(defaultSummary.entries);
+    await expect(
+      catalog.executeTool("summarize_workspace_agents", { workspaceId, includeArchived: "true" }),
+    ).rejects.toThrow(/expected boolean/);
+    expect(resumes).toEqual([]);
+  } finally {
+    providerSnapshotManager.destroy();
+    await Promise.all(agentManager.listAgents().map(({ id }) => agentManager.closeAgent(id)));
+    await agentManager.flush();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("returns summary metadata at the deadline without releasing unfinished readers' slots", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "workspace-summary-deadline-"));
+  const warnings: string[] = [];
+  const logger = pino({ level: "warn" }, { write: (line: string) => warnings.push(line) });
+  const agentStorage = new AgentStorage(join(cwd, "agents"), logger);
+  const createdAt = "2026-01-01T00:00:00.000Z";
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "wks_1234567890abcdef",
+    projectId: "prj_1234567890abcdef",
+    cwd,
+    kind: "directory",
+    displayName: "Summary workspace",
+    createdAt,
+    updatedAt: createdAt,
+  });
+  const { workspaceId } = workspace;
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const ids = ["opening", "stream-a", "stream-b", "stream-c", "waiting"];
+  const slowIds = ids.slice(0, 4);
+  const reads = new Map<string, number>();
+  const closed: string[] = [];
+  let active = 0;
+  let peak = 0;
+  const client = createTestAgentClient("codex");
+  const resume = client.resumeSession.bind(client);
+  client.resumeSession = async (handle, ...args) => {
+    const id = handle.sessionId;
+    const count = (reads.get(id) ?? 0) + 1;
+    reads.set(id, count);
+    const slow = slowIds.includes(id) && count === 1;
+    active++;
+    peak = Math.max(peak, active);
+    if (slow && id === "opening") {
+      if (reads.size === 4) started.resolve();
+      await release.promise;
+    }
+    const reader = await resume(handle, ...args);
+    const close = reader.close.bind(reader);
+    reader.close = async () => {
+      if (slow && id === "stream-c") await release.promise;
+      await close();
+      closed.push(id);
+      active--;
+    };
+    reader.streamHistory = async function* (): AsyncGenerator<AgentStreamEvent> {
+      if (reads.size === 4) started.resolve();
+      if (slow && id !== "stream-c") await release.promise;
+      yield { type: "timeline", provider: "codex", item: { type: "user_message", text: id } };
+    };
+    return reader;
+  };
+  const agentManager = new AgentManager({
+    clients: { codex: client },
+    registry: agentStorage,
+    logger,
+  });
+  const summarize = () =>
+    summarizeWorkspaceAgents({
+      workspaceId,
+      agentManager,
+      agentStorage,
+      workspaceRegistry: { get: async () => workspace },
+      logger,
+    });
+
+  try {
+    for (const id of ids) {
+      await agentStorage.upsert({
+        id,
+        title: id,
+        provider: "codex",
+        cwd,
+        workspaceId,
+        labels: {},
+        metadata: {},
+        createdAt,
+        updatedAt: createdAt,
+        lastStatus: "closed",
+        persistence: { provider: "codex", sessionId: id },
+      });
+    }
+    const retainedRecord = (await agentStorage.get("waiting"))!;
+    await agentStorage.upsert({
+      ...retainedRecord,
+      id: "surviving-local",
+      title: "surviving-local",
+      persistence: undefined,
+    });
+    await agentStorage.timelinePrefixes.save("surviving-local", {
+      version: 1,
+      rows: [
+        { seq: 1, timestamp: createdAt, item: { type: "user_message", text: "local history" } },
+      ],
+    });
+    const transferred = {
+      ...retainedRecord,
+      id: "transferred",
+      title: "transferred",
+      persistence: { provider: "codex", sessionId: "transferred" },
+    };
+    await agentStorage.upsert(transferred);
+    const pending = summarize();
+    await started.promise;
+    expect(peak).toBe(4);
+    expect(await agentManager.readTimelineForSummary("surviving-local", workspaceId)).toEqual([
+      { type: "user_message", text: "local history" },
+    ]);
+    await agentStorage.upsert({ ...retainedRecord, archivedAt: createdAt });
+    await agentStorage.upsert({ ...transferred, workspaceId: "wks_fedcba0987654321" });
+    const timedOut = await pending;
+    expect(timedOut.entries.map(({ title, firstUserPrompt }) => [title, firstUserPrompt])).toEqual([
+      ...slowIds.map((id) => [id, null]),
+      ["surviving-local", "local history"],
+    ]);
+    expect(warnings.filter((line) => line.includes("read timed out"))).toHaveLength(4);
+    expect(closed.sort()).toEqual(slowIds.slice(1, -1));
+    expect(
+      (await summarize()).entries.find(({ agentId }) => agentId === "surviving-local")
+        ?.firstUserPrompt,
+    ).toBe("local history");
+    expect([...reads.keys()].sort()).toEqual(slowIds);
+
+    await agentStorage.upsert(retainedRecord);
+    release.resolve();
+    await Promise.all(slowIds.map((id) => agentManager.waitForAgentClose(id)));
+    expect(closed.sort()).toEqual(slowIds);
+    const [recovered, parallel] = await Promise.all([summarize(), summarize()]);
+    expect(recovered.entries.map(({ firstUserPrompt }) => firstUserPrompt)).toEqual([
+      ...slowIds,
+      "local history",
+      "waiting",
+    ]);
+    expect(parallel.entries).toEqual(recovered.entries);
+    expect(peak).toBe(4);
+    expect(closed.sort()).toEqual([...slowIds, ...ids, ...ids].sort());
+  } finally {
+    release.resolve();
+    await Promise.all(ids.map((id) => agentManager.waitForAgentClose(id)));
+    await rm(cwd, { recursive: true, force: true });
+  }
+}, 15_000);
 
 async function readStoredFiles(dir: string) {
   const names = (await readdir(dir, { recursive: true, withFileTypes: true }))

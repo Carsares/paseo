@@ -1870,19 +1870,26 @@ function createToolCatalog(
     {
       title: "Summarize workspace sessions",
       description:
-        "Read active and closed sessions, their latest progress, tasks, and touched files.",
-      inputSchema: { workspaceId: z.string().trim().min(1).optional() },
+        "Read active and closed sessions, their latest progress, tasks, and touched files. Archived sessions are omitted by default.",
+      inputSchema: {
+        workspaceId: z.string().trim().min(1).optional(),
+        includeArchived: z
+          .boolean()
+          .optional()
+          .describe("Include up to 30 recently updated archived sessions."),
+      },
       outputSchema: {
         workspaceId: z.string(),
         summaryText: z.string(),
         entries: z.array(WorkspaceAgentSummaryEntrySchema),
       },
     },
-    async ({ workspaceId: requestedWorkspaceId }) => {
+    async ({ workspaceId: requestedWorkspaceId, includeArchived }) => {
       if (!options.workspaceRegistry) throw new Error("Workspace registry is not configured");
       const workspaceId = resolveWorkspaceIdForRename(requestedWorkspaceId);
       const { summaryText, entries } = await summarizeWorkspaceAgents({
         workspaceId,
+        includeArchived,
         agentManager,
         agentStorage,
         workspaceRegistry: options.workspaceRegistry,

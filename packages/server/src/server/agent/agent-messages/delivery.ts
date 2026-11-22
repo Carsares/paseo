@@ -59,6 +59,11 @@ interface DispatchRequest {
   waitForProviderOutcome: boolean;
   handoff?: QueueHandoff;
 }
+interface ParentNotificationAddress {
+  callerAgentId: string;
+  childAgentId: string;
+  serverId?: string;
+}
 interface Dependencies {
   /** Includes admitted starts and provider turns, including compaction. */
   isRunning?: (recipientId: string) => boolean;
@@ -74,6 +79,7 @@ interface Dependencies {
     },
   ): Promise<boolean>;
   dispatch(request: DispatchRequest): Promise<PromptDispatchDisposition>;
+  validateParentOwnership?(address: ParentNotificationAddress): Promise<void>;
   onError(error: unknown, request: DispatchRequest): void;
   /** Return a cancellation function. Production uses the daemon's event loop. */
   schedule?: (delayMs: number, callback: () => void) => () => void;
@@ -87,6 +93,7 @@ export class AgentMessageAdmissionError extends Error {
 
 export interface AgentMessageDelivery {
   enqueue(message: Message): Receipt;
+  validateParentOwnership?(address: ParentNotificationAddress): Promise<void>;
   /** Remove matching messages that the queue still owns before dispatcher handoff. */
   withdrawPending(recipientId: string, matches: (source: AgentPromptSource) => boolean): number;
   /** Queued messages and provider dispatches still owned by this recipient. */
@@ -442,6 +449,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   });
 
   return {
+    validateParentOwnership: dependencies.validateParentOwnership,
     withdrawPending: (recipientId, matches) =>
       withdrawPending(recipientId, (message) => matches(message.source)),
     hasPending: (recipientId) => pending.has(recipientId) || dispatching.has(recipientId),

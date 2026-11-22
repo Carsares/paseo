@@ -755,6 +755,103 @@ it("expires cached token profiles after five minutes", async () => {
   expect(calls).toBe(2);
 });
 
+it("shares an in-progress profile only for the same token and fetch implementation", async () => {
+  const response = Promise.withResolvers<Response>();
+  const requested = Promise.withResolvers<void>();
+  const api = vi.fn<typeof fetch>(async () => {
+    requested.resolve();
+    return response.promise;
+  });
+  const otherApi = vi.fn<typeof fetch>(async () =>
+    jsonResponse({ account: { uuid: "other" }, organization: { uuid: "org" } }),
+  );
+  const lookup = tokenLookup("isolated-profile-token");
+  const input = credentialInput(lookup.claudeHome);
+  const first = accountFor(input, api, Date.now, lookup);
+  await requested.promise;
+  const joined = Promise.withResolvers<void>();
+  const second = accountFor(
+    input,
+    api,
+    () => {
+      joined.resolve();
+      return Date.now();
+    },
+    lookup,
+  );
+  await joined.promise;
+  expect(await accountFor(input, otherApi, Date.now, lookup)).toEqual({ key: "other.org" });
+  response.resolve(jsonResponse({ account: { uuid: "shared" }, organization: { uuid: "org" } }));
+  expect(await Promise.all([first, second])).toEqual([
+    { key: "shared.org" },
+    { key: "shared.org" },
+  ]);
+  expect(await accountFor(input, api, Date.now, lookup)).toEqual({ key: "shared.org" });
+  expect(api).toHaveBeenCalledTimes(1);
+  expect(otherApi).toHaveBeenCalledTimes(1);
+});
+
+it("does not evict an in-progress profile when completed profiles fill the cache", async () => {
+  const response = Promise.withResolvers<void>();
+  const requested = Promise.withResolvers<void>();
+  const api = vi.fn<typeof fetch>(async (_url, init) => {
+    const token = new Headers(init?.headers).get("Authorization")?.split(" ").at(-1);
+    if (token === "pending-profile") {
+      requested.resolve();
+      await response.promise;
+    }
+    return jsonResponse({ account: { uuid: token }, organization: { uuid: "org" } });
+  });
+  const lookup = tokenLookup("pending-profile");
+  const input = credentialInput(lookup.claudeHome);
+  const first = accountFor(input, api, Date.now, lookup);
+  await requested.promise;
+  for (let i = 0; i < 128; i++) {
+    writeClaudeCredentials(lookup.claudeHome, `completed-${i}`);
+    expect(await accountFor(input, api, Date.now, lookup)).toEqual({ key: `completed-${i}.org` });
+  }
+  writeClaudeCredentials(lookup.claudeHome, "pending-profile");
+  const joined = Promise.withResolvers<void>();
+  const second = accountFor(
+    input,
+    api,
+    () => {
+      joined.resolve();
+      return Date.now();
+    },
+    lookup,
+  );
+  await joined.promise;
+  response.resolve();
+  expect(await Promise.all([first, second])).toEqual([
+    { key: "pending-profile.org" },
+    { key: "pending-profile.org" },
+  ]);
+  expect(api).toHaveBeenCalledTimes(129);
+});
+
+it.each([403, 500])(
+  "rechecks a failed profile after a short cooldown (HTTP %i)",
+  async (status) => {
+    let now = 0;
+    const lookup = tokenLookup(`retry-profile-${status}`);
+    const input = credentialInput(lookup.claudeHome);
+    const api = vi
+      .fn<typeof fetch>(async () =>
+        jsonResponse({ account: { uuid: "recovered" }, organization: { uuid: "org" } }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status }));
+    const fallback = { key: hashAccountKey(JSON.stringify(input.route)) };
+    expect(await accountFor(input, api, () => now, lookup)).toEqual(fallback);
+    now = 4_999;
+    expect(await accountFor(input, api, () => now, lookup)).toEqual(fallback);
+    expect(api).toHaveBeenCalledTimes(1);
+    now = 5_000;
+    expect(await accountFor(input, api, () => now, lookup)).toEqual({ key: "recovered.org" });
+    expect(api).toHaveBeenCalledTimes(2);
+  },
+);
+
 it("discovery and fetch share the explicit macOS keychain route", async () => {
   const directory = mkdtempSync(join(tmpdir(), "claude-keychain-identity-"));
   try {
@@ -866,7 +963,7 @@ function tokenLookup(accessToken: string) {
   const directory = mkdtempSync(join(tmpdir(), "claude-profile-token-"));
   tokenDirectories.push(directory);
   writeClaudeCredentials(directory, accessToken);
-  return { claudeHome: directory, home: directory };
+  return { claudeHome: directory, home: directory, env: {}, platform: "linux" as const };
 }
 
 it("discovers a Pi OAuth login independently of the CLI login", async () => {
@@ -883,6 +980,7 @@ it("discovers a Pi OAuth login independently of the CLI login", async () => {
     const inputs = await discover(
       { kind: "global" },
       { home: directory, env: {}, platform: "linux" },
+      async () => new Response(null, { status: 500 }),
     );
     expect(inputs.map((account) => account.input)).toContainEqual({
       route: { store: "pi", path: join(directory, ".pi", "agent", "auth.json") },
@@ -935,9 +1033,13 @@ async function accountFor(
   input: UsageInput,
   fetchApi: typeof fetch,
   now: () => number,
-  lookup: Parameters<typeof discover>[0] = {},
+  lookup: NonNullable<Parameters<typeof discover>[1]> = {},
 ) {
-  const accounts = await discover({ kind: "global" }, { ...lookup, now }, fetchApi);
+  const accounts = await discover(
+    { kind: "global" },
+    { env: {}, platform: "linux", ...lookup, now },
+    fetchApi,
+  );
   const account = accounts.find((candidate) =>
     isDeepStrictEqual(inputSchema.parse(candidate.input).route, input.route),
   );
@@ -960,7 +1062,10 @@ it.each([401, 403])("fetch reports rejected usage HTTP %i", async (status) => {
 
 it.each([401, 403])("a rejected profile HTTP %i keeps a locator-keyed account", async (status) => {
   const lookup = tokenLookup(`profile-rejection-${status}`);
-  const api: typeof fetch = async () => new Response(null, { status });
+  const api = vi.fn<typeof fetch>(async (url) => {
+    if (!String(url).endsWith("/profile")) throw new Error("profile already rejected");
+    return new Response(null, { status });
+  });
   const accounts = await discover({ kind: "global" }, lookup, api);
   expect(accounts).toEqual([
     {
@@ -969,21 +1074,11 @@ it.each([401, 403])("a rejected profile HTTP %i keeps a locator-keyed account", 
       input: credentialInput(lookup.claudeHome),
     },
   ]);
-  let fetches = 0;
-  expect(
-    await fetchUsage(
-      credentialInput(lookup.claudeHome),
-      async () => {
-        fetches++;
-        throw new Error("profile already rejected");
-      },
-      lookup,
-    ),
-  ).toEqual({
+  expect(await fetchUsage(credentialInput(lookup.claudeHome), api, lookup)).toEqual({
     status: "unavailable",
     problem: { kind: "rejected", status, refreshedBy: "claude" },
   });
-  expect(fetches).toBe(0);
+  expect(api).toHaveBeenCalledTimes(1);
 });
 
 it.each([
@@ -1044,10 +1139,14 @@ it("re-reads a refreshed login at the original locator", async () => {
   const [account] = await discover({ kind: "global" }, lookup, async () => {
     throw new Error("expired token must not fetch");
   });
-  expect(await fetchUsage(account!.input as UsageInput, fetch, lookup)).toEqual({
+  const network = vi.fn<typeof fetch>(async () => {
+    throw new Error("expired token must not fetch");
+  });
+  expect(await fetchUsage(account!.input as UsageInput, network, lookup)).toEqual({
     status: "unavailable",
     problem: { kind: "expired", expiresAt: "1970-01-01T00:00:00.000Z", refreshedBy: "claude" },
   });
+  expect(network).not.toHaveBeenCalled();
   writeClaudeCredentials(lookup.claudeHome, "rotated-token");
   const report = await fetchUsage(
     account!.input as UsageInput,
@@ -1124,15 +1223,25 @@ it("session Keychain input retains the selected config-directory locator through
       return { claudeAiOauth: { accessToken: "scoped-keychain-fixture" } };
     },
   };
-  const accounts = await discover(scope, lookup, async () =>
-    jsonResponse({ account: { uuid: "keychain-scoped" }, organization: { uuid: "org" } }),
+  const api = vi.fn<typeof fetch>(async (url) =>
+    jsonResponse(
+      String(url).endsWith("/profile")
+        ? { account: { uuid: "keychain-scoped" }, organization: { uuid: "org" } }
+        : makeClaudeResponse(),
+    ),
   );
+  const accounts = await discover(scope, lookup, api);
   expect(accounts).toHaveLength(1);
   const input = inputSchema.parse(accounts[0]?.input);
   expect(input.route).toEqual({ store: "keychain", service, account: "fixture-user" });
-  await fetchUsage(input, async () => jsonResponse(makeClaudeResponse()), {
-    ...lookup,
-    env: { CLAUDE_CONFIG_DIR: "/somewhere-else" },
-  });
+  expect(
+    (
+      await fetchUsage(input, api, {
+        ...lookup,
+        env: { CLAUDE_CONFIG_DIR: "/somewhere-else" },
+      })
+    ).status,
+  ).toBe("available");
+  expect(api).toHaveBeenCalledTimes(2);
   expect(reads).toEqual(Array(3).fill(`${service}:fixture-user`));
 });

@@ -1,9 +1,10 @@
-import { expect, test } from "vitest";
+import pino from "pino";
+import { expect, test, vi } from "vitest";
 import { WebSocket, type RawData } from "ws";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "./test-utils/index.js";
 import { WSOutboundMessageSchema, type WSOutboundMessage } from "./messages.js";
+import { MAX_PHYSICAL_SOCKET_BUFFERED_BYTES } from "./websocket/physical-socket.js";
 
-const LARGE_REQUEST_BYTES = 512 * 1024;
 const BURST_MESSAGE_COUNT = 32;
 const TEST_TIMEOUT_MS = 30_000;
 
@@ -18,12 +19,43 @@ class ResumedPhysicalSocketSession {
   private constructor(
     private readonly daemon: TestPaseoDaemon,
     private readonly original: WebSocket,
+    private readonly physicalSocket: WebSocket,
+    readonly logs: string[],
   ) {}
 
   static async launch(): Promise<ResumedPhysicalSocketSession> {
-    const daemon = await createTestPaseoDaemon();
-    const original = await connectSocket(daemon.port, "stale-physical-socket");
-    return new ResumedPhysicalSocketSession(daemon, original);
+    const logs: string[] = [];
+    const logger = pino(
+      { level: "warn" },
+      {
+        write(line) {
+          logs.push(JSON.parse(line).msg);
+        },
+      },
+    );
+    const daemon = await createTestPaseoDaemon({ logger });
+    const serverSocket = Promise.withResolvers<WebSocket>();
+    const send = WebSocket.prototype.send;
+    const spy = vi
+      .spyOn(WebSocket.prototype, "send")
+      .mockImplementation(function (this: WebSocket, data, options, callback) {
+        if (data === '{"type":"pong"}') serverSocket.resolve(this);
+        send.call(
+          this,
+          data,
+          typeof options === "function" ? undefined : options,
+          typeof options === "function" ? options : callback,
+        );
+      });
+    try {
+      const original = await connectSocket(daemon.port, "stale-physical-socket");
+      return new ResumedPhysicalSocketSession(daemon, original, await serverSocket.promise, logs);
+    } catch (error) {
+      await daemon.close();
+      throw error;
+    } finally {
+      spy.mockRestore();
+    }
   }
 
   async abandonOriginal(): Promise<void> {
@@ -34,34 +66,20 @@ class ResumedPhysicalSocketSession {
     this.replacement = await connectSocket(this.daemon.port, "stale-physical-socket");
   }
 
-  async broadcastUntilOriginalCloses(): Promise<SocketClose> {
-    const replacement = this.requireReplacement();
+  async sendBurstToOriginal(): Promise<SocketClose> {
     const originalClose = waitForClose(this.original);
-    const finalRequestId = largeRequestId(BURST_MESSAGE_COUNT - 1);
-    const finalResponse = waitForMessage(replacement, (message) => {
-      return (
-        message.type === "session" &&
-        message.message.type === "pong" &&
-        message.message.payload.requestId === finalRequestId
-      );
-    });
-
-    for (let index = 0; index < BURST_MESSAGE_COUNT; index += 1) {
-      replacement.send(
-        JSON.stringify({
-          type: "session",
-          message: {
-            type: "ping",
-            requestId: largeRequestId(index),
-            clientSentAt: index,
-          },
-        }),
-      );
+    // Model a client at the buffer limit without allocating 64 MiB on real sockets.
+    const buffered = vi.spyOn(this.physicalSocket, "bufferedAmount", "get");
+    buffered.mockReturnValue(MAX_PHYSICAL_SOCKET_BUFFERED_BYTES);
+    try {
+      for (let index = 0; index < BURST_MESSAGE_COUNT; index++) {
+        this.original.send('{"type":"ping"}');
+      }
+      this.original.resume();
+      return await originalClose;
+    } finally {
+      buffered.mockRestore();
     }
-
-    await finalResponse;
-    this.original.resume();
-    return originalClose;
   }
 
   async replacementRoundTrip(): Promise<void> {
@@ -100,9 +118,13 @@ test(
       await session.abandonOriginal();
       await session.resumeSameClient();
 
-      const originalClose = await session.broadcastUntilOriginalCloses();
+      const originalClose = await session.sendBurstToOriginal();
 
       expect(originalClose).toEqual({ code: 1006, reason: "" });
+      expect(session.logs.filter((msg) => msg.startsWith("Closing physical WebSocket"))).toEqual([
+        "Closing physical WebSocket at outbound high-water mark",
+      ]);
+      expect(session.logs).not.toContain("ws_send_failed");
       await session.replacementRoundTrip();
     } finally {
       await session.close();
@@ -129,10 +151,6 @@ async function connectSocket(port: number, clientId: string): Promise<WebSocket>
   );
   await sendAndWait(socket, { type: "ping" }, (message) => message.type === "pong");
   return socket;
-}
-
-function largeRequestId(index: number): string {
-  return `${index}:`.padEnd(LARGE_REQUEST_BYTES, "x");
 }
 
 function sendAndWait(

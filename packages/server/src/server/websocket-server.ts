@@ -82,6 +82,7 @@ import {
   enqueueRecoverableAgentMessage,
   retainQueuedAgentMessage,
   Session,
+  SourceDeliveryClosedError,
   type SessionLifecycleIntent,
   type SessionOptions,
   type SessionRuntimeMetrics,
@@ -165,7 +166,6 @@ import {
   outboundFrameByteLength,
   physicalSocketHasCapacity,
   sendBoundedPhysicalFrameAndWait,
-  sendBoundedPhysicalFrame,
 } from "./websocket/physical-socket.js";
 
 const WS_CLOSE_DAEMON_AUTH_FAILED = 4401;
@@ -575,6 +575,7 @@ interface ClosePhysicalSocketParams {
   ws: WebSocketLike;
   logMessage: string;
   logFields?: Record<string, unknown>;
+  reportWhileClosing?: boolean;
 }
 
 const SLOW_REQUEST_THRESHOLD_MS = 500;
@@ -816,6 +817,7 @@ export class VoiceAssistantWebSocketServer {
         ),
       isRunning: (agentId) => agentManager.hasInFlightRun(agentId),
       hasPendingPermission: (agentId) => agentManager.hasPendingPermissions(agentId),
+      validateParentOwnership: (address) => this.assertCurrentReportParent(address),
       subscribe: (notify) =>
         agentManager.subscribe(
           (event) => {
@@ -1425,6 +1427,7 @@ export class VoiceAssistantWebSocketServer {
     reportRejection: boolean,
   ): { sockets: WebSocketLike[]; payload: string; bytes: number } | null {
     const writableSockets = [...sockets].filter((ws) => {
+      if (!this.canSendSocketFrame(ws)) return false;
       if (
         message.type === "session" &&
         this.sessions.get(ws)?.session.delivery.permits(ws, message.message) !== true
@@ -1466,31 +1469,45 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private readonly chunkedSockets = new WeakMap<WebSocketLike, ChunkedTransport>();
+  private readonly closedSocketDelivery = new WeakSet<WebSocketLike>();
+  private readonly socketDrainCancellations = new WeakMap<WebSocketLike, Set<() => void>>();
 
   private chunkedSocket(ws: WebSocketLike): ChunkedTransport {
     let transport = this.chunkedSockets.get(ws);
     if (!transport) {
+      const onWriteFailure = (err: unknown) => {
+        if (err instanceof SourceDeliveryClosedError) return;
+        this.closePhysicalSocket({
+          ws,
+          logMessage: "Closing physical WebSocket after outbound framing failure",
+          logFields: { err },
+          // A transport can start closing before the failed write's callback runs.
+          reportWhileClosing: true,
+        });
+      };
+      const onWrite = (err?: Error) => {
+        if (err) onWriteFailure(err);
+      };
       transport = new ChunkedTransport({
         frameBytes: ws.maxFrameBytes ?? 32 * 1024 * 1024,
         supportsConcurrentWrites: ws.supportsConcurrentWrites,
-        onFailure: (err) =>
-          this.closePhysicalSocket({
-            ws,
-            logMessage: "Closing physical WebSocket after outbound framing failure",
-            logFields: { err },
-          }),
+        onFailure: onWriteFailure,
         send: (frame, waitForDrain) => {
-          const params = {
-            socket: ws,
-            frame,
-            onHighWater: () => this.closeAtOutboundHighWater(ws),
-          };
-          if (waitForDrain)
-            return sendBoundedPhysicalFrameAndWait(params).then((sent) => {
-              if (!sent) throw new Error("Source is closed");
-              return undefined;
-            });
-          if (!sendBoundedPhysicalFrame(params)) throw new Error("Source is closed");
+          if (!this.canSendSocketFrame(ws)) throw new SourceDeliveryClosedError();
+          if (waitForDrain) return this.sendPhysicalFrameAndWait(ws, frame);
+          if (!physicalSocketHasCapacity(ws, outboundFrameByteLength(frame))) {
+            this.closeAtOutboundHighWater(ws);
+            throw new SourceDeliveryClosedError();
+          }
+          try {
+            // Observe physical failures without making these frames wait for drain.
+            const sent = ws.send(frame, onWrite);
+            void sent?.catch(onWriteFailure);
+            if (!this.canSendSocketFrame(ws)) throw new SourceDeliveryClosedError();
+          } catch (err) {
+            onWriteFailure(err);
+            throw err;
+          }
         },
         deliver: (frame) =>
           this.handleRawMessage(ws, typeof frame === "string" ? frame : Buffer.from(frame)),
@@ -1506,37 +1523,73 @@ export class VoiceAssistantWebSocketServer {
     return queued > 0 ? queued : null;
   }
 
-  private sendSocketFrame(
+  private canSendSocketFrame(ws: WebSocketLike): boolean {
+    return ws.readyState === 1 && !this.closedSocketDelivery.has(ws);
+  }
+
+  private sendPhysicalFrameAndWait(ws: WebSocketLike, frame: string | Uint8Array): Promise<void> {
+    const waiters = this.socketDrainCancellations.get(ws) ?? new Set<() => void>();
+    this.socketDrainCancellations.set(ws, waiters);
+    return new Promise<void>((resolve, reject) => {
+      const fail = (error: unknown) => {
+        waiters.delete(cancel);
+        reject(error);
+      };
+      const cancel = () => fail(new SourceDeliveryClosedError());
+      // Closing the socket must release the framing queue even if a write
+      // callback never runs. Remove settled waiters so idle sockets retain none.
+      waiters.add(cancel);
+      void sendBoundedPhysicalFrameAndWait({
+        socket: ws,
+        frame,
+        onHighWater: () => this.closeAtOutboundHighWater(ws),
+      }).then((sent) => {
+        waiters.delete(cancel);
+        if (sent) resolve();
+        else cancel();
+        return undefined;
+      }, fail);
+    });
+  }
+
+  private async sendSocketFrame(
     ws: WebSocketLike,
     frame: string | Uint8Array,
     bytes: number,
     waitForDrain = false,
   ): Promise<void> {
+    if (!this.canSendSocketFrame(ws)) throw new SourceDeliveryClosedError();
     const transport = this.chunkedSocket(ws);
     const admittedBytes = transport.isWriting
       ? bytes
       : Math.min(bytes, ws.maxFrameBytes ?? 32 * 1024 * 1024);
-    if (!this.ensureOutboundCapacity(ws, admittedBytes))
-      return Promise.reject(new Error("Source is closed"));
-    return transport.send(frame, { waitForDrain, byteLength: bytes });
+    if (!this.ensureOutboundCapacity(ws, admittedBytes)) throw new SourceDeliveryClosedError();
+    try {
+      await transport.send(frame, { waitForDrain, byteLength: bytes });
+    } catch (err) {
+      if (err instanceof SourceDeliveryClosedError) throw err;
+      if (!this.canSendSocketFrame(ws)) throw new SourceDeliveryClosedError(err);
+      this.logger.warn({ err }, "ws_send_failed");
+      throw err;
+    }
   }
 
   private async sendMessageToClientAndWait(
     ws: WebSocketLike,
     message: WSOutboundMessage,
   ): Promise<void> {
+    if (!this.canSendSocketFrame(ws)) throw new SourceDeliveryClosedError();
     const prepared = this.prepareJsonDelivery([ws], message, true);
-    if (!prepared) throw new Error("Source message delivery unavailable");
-    try {
-      await this.sendSocketFrame(ws, prepared.payload, prepared.bytes, true);
-      this.runtimeMetrics.recordOutboundMessage(message, ws.bufferedAmount);
-    } catch (err) {
-      this.logger.warn({ err }, "ws_send_failed");
-      throw err;
+    if (!prepared) {
+      if (!this.canSendSocketFrame(ws)) throw new SourceDeliveryClosedError();
+      throw new Error("Source message delivery unavailable");
     }
+    await this.sendSocketFrame(ws, prepared.payload, prepared.bytes, true);
+    this.runtimeMetrics.recordOutboundMessage(message, ws.bufferedAmount);
   }
 
   private sendBinaryToClient(ws: WebSocketLike, frame: Uint8Array, reportRejection = true): void {
+    if (!this.canSendSocketFrame(ws)) return;
     if (!this.sessions.get(ws)?.session.delivery.permitsBinary(ws, frame)) {
       this.incrementRuntimeCounter("applicationBinaryRejected");
       if (reportRejection)
@@ -1549,18 +1602,14 @@ export class VoiceAssistantWebSocketServer {
   }
 
   private async sendBinaryToClientAndWait(ws: WebSocketLike, frame: Uint8Array): Promise<void> {
+    if (!this.canSendSocketFrame(ws)) throw new SourceDeliveryClosedError();
     if (!this.sessions.get(ws)?.session.delivery.permitsBinary(ws, frame)) {
       this.incrementRuntimeCounter("applicationBinaryRejected");
       this.logger.warn({ bytes: frame.byteLength }, "ws_application_binary_delivery_denied");
-      return;
+      throw new Error("Source binary delivery denied");
     }
-    try {
-      await this.sendSocketFrame(ws, frame, frame.byteLength, true);
-      this.runtimeMetrics.recordOutboundBinaryFrame(ws.bufferedAmount);
-    } catch (err) {
-      this.logger.warn({ err }, "ws_send_failed");
-      throw err;
-    }
+    await this.sendSocketFrame(ws, frame, frame.byteLength, true);
+    this.runtimeMetrics.recordOutboundBinaryFrame(ws.bufferedAmount);
   }
 
   private sendFrameToClient(
@@ -1569,17 +1618,11 @@ export class VoiceAssistantWebSocketServer {
     frameBytes: number,
     recordSent: () => void,
   ): void {
-    try {
-      void this.sendSocketFrame(ws, frame, frameBytes).then(recordSent, (err) => {
-        this.logger.warn({ err }, "ws_send_failed");
-      });
-    } catch (err) {
-      this.logger.warn({ err }, "ws_send_failed");
-    }
+    void this.sendSocketFrame(ws, frame, frameBytes).then(recordSent, () => {});
   }
 
   private ensureOutboundCapacity(ws: WebSocketLike, frameBytes: number): boolean {
-    if (ws.readyState !== 1) return false;
+    if (!this.canSendSocketFrame(ws)) return false;
     if (
       physicalSocketHasCapacity(
         { bufferedAmount: this.socketBufferedAmount(ws) ?? undefined },
@@ -1603,12 +1646,21 @@ export class VoiceAssistantWebSocketServer {
     });
   }
 
-  private closePhysicalSocket(params: ClosePhysicalSocketParams): void {
-    const { ws, logMessage, logFields } = params;
+  private stopSocketDelivery(ws: WebSocketLike): void {
+    this.closedSocketDelivery.add(ws);
+    this.chunkedSockets.get(ws)?.close();
+    const waiters = this.socketDrainCancellations.get(ws);
+    this.socketDrainCancellations.delete(ws);
+    for (const cancel of waiters ?? []) cancel();
     this.applicationSocketLease.release(ws);
-    if (ws.readyState !== 1) {
-      return;
-    }
+  }
+
+  private closePhysicalSocket(params: ClosePhysicalSocketParams): void {
+    const { ws, logMessage, logFields, reportWhileClosing } = params;
+    if (this.closedSocketDelivery.has(ws)) return;
+    const isOpen = ws.readyState === 1;
+    this.stopSocketDelivery(ws);
+    if (!isOpen && !reportWhileClosing) return;
     const identity = this.socketIdentities.get(ws);
     this.logger.warn(
       {
@@ -1617,6 +1669,7 @@ export class VoiceAssistantWebSocketServer {
       },
       logMessage,
     );
+    if (!isOpen) return;
     try {
       // A close frame queues behind application data, so it cannot enforce a
       // hard memory cutoff. Production transports expose terminate().
@@ -1739,7 +1792,7 @@ export class VoiceAssistantWebSocketServer {
       },
       onMessageToSource: async (source, msg) => {
         if (!connection || !connection.sockets.has(source as WebSocketLike)) {
-          return;
+          throw new SourceDeliveryClosedError();
         }
         await this.sendMessageToClientAndWait(source as WebSocketLike, wrapSessionMessage(msg));
       },
@@ -1751,7 +1804,7 @@ export class VoiceAssistantWebSocketServer {
       },
       onBinaryMessageToSource: async (source, frame) => {
         if (!connection || !connection.sockets.has(source as WebSocketLike)) {
-          throw new Error("File transfer source socket is no longer attached");
+          throw new SourceDeliveryClosedError();
         }
         await this.sendBinaryToClientAndWait(source as WebSocketLike, frame);
       },
@@ -2474,17 +2527,18 @@ export class VoiceAssistantWebSocketServer {
 
   private bindSocketHandlers(ws: WebSocketLike): void {
     ws.on("message", (...args: unknown[]) => {
+      if (!this.canSendSocketFrame(ws)) return;
       const data = args[0] as Buffer | ArrayBuffer | Buffer[] | string;
       try {
         this.chunkedSocket(ws).receive(typeof data === "string" ? data : bufferFromWsData(data));
       } catch (error) {
         if (!(error instanceof ChunkedTransportProtocolError)) throw error;
+        this.stopSocketDelivery(ws);
         ws.close(1002, "Invalid chunked transport");
       }
     });
 
     ws.on("close", async (...args: unknown[]) => {
-      this.chunkedSockets.get(ws)?.close();
       const code = args[0];
       const reason = args[1];
       await this.detachSocket(ws, {
@@ -2520,10 +2574,10 @@ export class VoiceAssistantWebSocketServer {
       error?: Error;
     },
   ): Promise<void> {
+    this.stopSocketDelivery(ws);
     this.hostLinks.get(ws)?.close();
     this.hostLinks.delete(ws);
 
-    this.applicationSocketLease.release(ws);
     const identity = this.socketIdentities.get(ws);
     const identityFields = identity ? toConnectionLogFields(identity) : {};
     const pending = this.clearPendingConnection(ws);
@@ -2935,13 +2989,6 @@ export class VoiceAssistantWebSocketServer {
   private async confirmParentReport(
     request: AgentFinishReportConfirmRequest,
   ): Promise<AgentFinishReportConfirmResult> {
-    const child =
-      this.agentManager.getAgent(request.childAgentId) ??
-      (await this.agentStorage.get(request.childAgentId));
-    const parent = getParentAddressFromLabels(child?.labels, this.serverId);
-    if (parent?.agentId !== request.parentAgentId || parent.serverId !== request.parentServerId) {
-      return { accepted: false, error: "The child is no longer assigned to this parent." };
-    }
     const accepted = await this.finishSubscriptions?.confirmParentReport(
       {
         childAgentId: request.childAgentId,
@@ -2950,9 +2997,16 @@ export class VoiceAssistantWebSocketServer {
       },
       request.reportId,
     );
-    return accepted
-      ? { accepted: true, error: null }
-      : { accepted: false, error: "The parent report is no longer registered." };
+    if (!accepted) return { accepted: false, error: "The parent report is no longer registered." };
+    // Report lookup can wait for storage. Read the relationship after that wait.
+    const child =
+      this.agentManager.getAgent(request.childAgentId) ??
+      (await this.agentStorage.get(request.childAgentId));
+    const parent = getParentAddressFromLabels(child?.labels, this.serverId);
+    if (parent?.agentId !== request.parentAgentId || parent.serverId !== request.parentServerId) {
+      return { accepted: false, error: "The child is no longer assigned to this parent." };
+    }
+    return { accepted: true, error: null };
   }
 
   private async requestParentReportConfirmation(
@@ -3027,6 +3081,23 @@ export class VoiceAssistantWebSocketServer {
     }
   }
 
+  private async assertCurrentReportParent(
+    record: Pick<FinishSubscription, "callerAgentId" | "childAgentId" | "serverId">,
+  ): Promise<void> {
+    const child = record.serverId
+      ? await this.toolHosts().use(
+          record.serverId,
+          async (client) => (await client.fetchAgent(record.childAgentId))?.agent,
+        )
+      : (this.agentManager.getAgent(record.childAgentId) ??
+        (await this.agentStorage.get(record.childAgentId)));
+    const parent = getParentAddressFromLabels(child?.labels, record.serverId ?? this.serverId);
+    if (parent?.agentId !== record.callerAgentId || parent.serverId !== this.serverId) {
+      throw new ParentReportRecipientUnavailableError("You can only manage your direct subagents.");
+    }
+    await this.assertParentReportRecipientAvailable(record.callerAgentId);
+  }
+
   async dispatchFinishReport(
     record: FinishSubscription,
     report: AgentFinishReport,
@@ -3042,25 +3113,14 @@ export class VoiceAssistantWebSocketServer {
     const messageId = explicit
       ? JSON.stringify([childServerId, record.childAgentId, report.id])
       : report.id;
-    const validateDispatch = explicit
-      ? async () => {
-          await this.assertParentReportRecipientAvailable(record.callerAgentId);
-          if (options.confirmBeforeDispatch) return;
-          const child = record.serverId
-            ? await this.toolHosts().use(
-                record.serverId,
-                async (client) => (await client.fetchAgent(record.childAgentId))?.agent,
-              )
-            : (this.agentManager.getAgent(record.childAgentId) ??
-              (await this.agentStorage.get(record.childAgentId)));
-          const parent = getParentAddressFromLabels(child?.labels, childServerId);
-          if (parent?.agentId !== record.callerAgentId || parent.serverId !== this.serverId) {
-            throw new ParentReportRecipientUnavailableError(
-              "You can only manage your direct subagents.",
-            );
+    const validateDispatch =
+      explicit || record.requireParentOwnership
+        ? async () => {
+            if (options.confirmBeforeDispatch)
+              await this.assertParentReportRecipientAvailable(record.callerAgentId);
+            else await this.assertCurrentReportParent(record);
           }
-        }
-      : undefined;
+        : undefined;
     const receipts = explicit ? this.parentReportReceipts : this.messageReceipts;
     await receipts.send({
       agentId: record.callerAgentId,
@@ -3318,11 +3378,11 @@ export class VoiceAssistantWebSocketServer {
     });
   }
 
-  private async allowsDirectParentRequest(
+  private allowsDirectParentRequest(
     ws: WebSocketLike,
     session: Session,
-    request: Extract<WSInboundMessage, { type: "session" }>["message"],
-  ): Promise<boolean> {
+    request: SessionInboundMessage,
+  ): boolean | Promise<boolean> {
     const directParent = readDirectParentRoute(session.getHostSourceId());
     if (!directParent) return true;
     if (request.type === "send_agent_message_request") {
@@ -3344,34 +3404,45 @@ export class VoiceAssistantWebSocketServer {
       }
     }
     if (request.type === "agent_permission_response") {
-      try {
-        if (
-          !(ws instanceof VirtualHostSocket) ||
-          !session.isRouted() ||
-          !session.allowsInbound(request)
-        ) {
-          throw new Error("Permission denied for direct-parent operations.");
-        }
-        const stored = await this.agentStorage.get(request.agentId);
-        const child = this.agentManager.getAgent(request.agentId);
-        assertDirectParent(child?.labels, this.serverId, directParent);
-        if (stored?.archivedAt || !child?.pendingPermissions.has(request.requestId)) {
-          throw new Error("Permission request is no longer pending.");
-        }
-      } catch (error) {
-        await session.delivery.request(ws, request, async () => {
-          session.delivery.reply({
-            type: "rpc_error",
-            payload: {
-              requestId: request.requestId,
-              requestType: request.type,
-              error: error instanceof Error ? error.message : "Permission response denied",
-              code: "access_denied",
-            },
-          });
-        });
-        return false;
+      return this.allowsDirectParentPermissionResponse(ws, session, request, directParent);
+    }
+    return true;
+  }
+
+  private async allowsDirectParentPermissionResponse(
+    ws: WebSocketLike,
+    session: Session,
+    request: Extract<SessionInboundMessage, { type: "agent_permission_response" }>,
+    directParent: NonNullable<ReturnType<typeof readDirectParentRoute>>,
+  ): Promise<boolean> {
+    try {
+      if (
+        !(ws instanceof VirtualHostSocket) ||
+        !session.isRouted() ||
+        !session.allowsInbound(request)
+      ) {
+        throw new Error("Permission denied for direct-parent operations.");
       }
+      const stored = await this.agentStorage.get(request.agentId);
+      const child = this.agentManager.getAgent(request.agentId);
+      assertDirectParent(child?.labels, this.serverId, directParent);
+      if (stored?.archivedAt || !child?.pendingPermissions.has(request.requestId)) {
+        throw new Error("Permission request is no longer pending.");
+      }
+    } catch (error) {
+      if (!this.canSendSocketFrame(ws)) return false;
+      await session.delivery.request(ws, request, async () => {
+        session.delivery.reply({
+          type: "rpc_error",
+          payload: {
+            requestId: request.requestId,
+            requestType: request.type,
+            error: error instanceof Error ? error.message : "Permission response denied",
+            code: "access_denied",
+          },
+        });
+      });
+      return false;
     }
     return true;
   }
@@ -3393,8 +3464,10 @@ export class VoiceAssistantWebSocketServer {
       }
       return;
     }
-    if (!(await this.allowsDirectParentRequest(ws, activeConnection.session, message.message)))
-      return;
+    // Upload requests must register before the next binary frame is dispatched.
+    const allowed = this.allowsDirectParentRequest(ws, activeConnection.session, message.message);
+    if (!allowed) return;
+    if (typeof allowed !== "boolean" && (!(await allowed) || !this.canSendSocketFrame(ws))) return;
     const link = this.hostLink(ws, activeConnection);
     if (link.handles(message.message)) {
       await activeConnection.session.delivery.request(ws, message.message, () =>
