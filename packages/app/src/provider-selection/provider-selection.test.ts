@@ -3,6 +3,7 @@ import type { AgentModelDefinition, ProviderSnapshotEntry } from "@getpaseo/prot
 import type { AgentProviderDefinition } from "@getpaseo/protocol/provider-manifest";
 import { i18n } from "@/i18n/i18next";
 import {
+  buildDraftCommandTarget,
   buildProviderQualifiedDescription,
   buildProviderSelectorProviders,
   buildSelectableProviderSelectorProviders,
@@ -11,6 +12,7 @@ import {
   filterAndRankModelRows,
   matchesModelSearch,
   resolveEffectiveComposerModeId,
+  resolveEffectiveComposerThinkingOptionId,
   resolveSelectedModelLabel,
   resolveSubmissionReadiness,
 } from "./provider-selection";
@@ -512,6 +514,48 @@ function getAllModelLabels(providers: ReturnType<typeof buildSelectableProviderS
       : [],
   );
 }
+
+describe("composer thinking on submission", () => {
+  const model = {
+    provider: "antigravity",
+    id: "orchestrator",
+    label: "Orchestrator",
+    aliases: ["saved-model"],
+  };
+  const selection = {
+    provider: model.provider,
+    modelId: "saved-model",
+    modeId: "",
+    modeOptions: [],
+    thinkingOptionId: "high",
+    availableModels: [{ ...model, thinkingOptions: [] }],
+  };
+
+  it("omits stale thinking for an explicitly tierless model selected by alias", () => {
+    expect(resolveEffectiveComposerThinkingOptionId(selection, selection.modelId)).toBe("");
+    expect(
+      buildDraftCommandTarget({
+        selection,
+        effectiveModelId: selection.modelId,
+        effectiveThinkingOptionId: "high",
+        cwd: "/repo",
+      }),
+    ).toEqual({
+      status: "ready",
+      config: { provider: model.provider, model: selection.modelId, cwd: "/repo" },
+    });
+  });
+
+  it("keeps saved thinking for an unknown model or unspecified tiers", () => {
+    expect(resolveEffectiveComposerThinkingOptionId(selection, "unknown")).toBe("high");
+    expect(
+      resolveEffectiveComposerThinkingOptionId(
+        { ...selection, availableModels: [model] },
+        model.id,
+      ),
+    ).toBe("high");
+  });
+});
 
 describe("resolveEffectiveComposerModeId", () => {
   const selection = {

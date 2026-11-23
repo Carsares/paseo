@@ -229,25 +229,19 @@ it.each([
   },
 );
 
-it.each([
-  ["gemini-3.8-flash-high", undefined, "gemini-3.8-flash", "high"],
-  ["gemini-3.8-flash-high", "low", "gemini-3.8-flash", "low"],
-  ["gpt-oss-120b-medium", undefined, "gpt-oss-120b-medium", "low"],
-  ["gemini-3.8-flash-xhigh", undefined, undefined, undefined],
-  ["gemini-3.8-flash-ultra", undefined, undefined, undefined],
-  ["gemini-3.8-flash-high", "removed-tier", undefined, undefined],
-])("opens model %s with explicit thinking %s", async (requested, explicit, model, thinking) => {
-  const { directory, launch } = await launchAgent(`
+async function launchConfigurableAgent() {
+  return launchAgent(`
     const { createInterface } = require("node:readline");
     const model = {
       id: "model", name: "Model", category: "model", type: "select", currentValue: "gpt-oss-120b",
-      options: ["gemini-3.8-flash", "gpt-oss-120b", "gpt-oss-120b-medium"].map(value => ({ value, name: value })),
+      options: ["gemini-3.8-flash", "gpt-oss-120b", "gpt-oss-120b-medium", "gemini-pro-orchestrator",
+        "gemini-pro-orchestrator-preview", "gemini-pro-orchestratorish"].map(value => ({ value, name: value })),
     };
     const thought = {
       id: "thought_level", name: "Thinking", category: "thought_level", type: "select", currentValue: "low",
       options: ["low", "medium"].map(value => ({ value, name: value })),
     };
-    const configOptions = [model, thought];
+    let configOptions = [model, thought];
     const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
     createInterface({ input: process.stdin }).on("line", (line) => {
       const { id, method, params } = JSON.parse(line);
@@ -265,6 +259,10 @@ it.each([
             break;
           }
           option.currentValue = params.value;
+          if (option === model) {
+            configOptions = ["gemini-pro-orchestrator", "gemini-pro-orchestrator-preview"].includes(params.value)
+              ? [model] : [model, thought];
+          }
           if (option === model && model.currentValue === "gemini-3.8-flash") {
             thought.options = ["low", "high"].map(value => ({ value, name: value }));
           }
@@ -280,6 +278,18 @@ it.each([
       }
     });
   `);
+}
+
+it.each([
+  ["gemini-3.8-flash-high", undefined, "gemini-3.8-flash", "high"],
+  ["gemini-3.8-flash-high", "low", "gemini-3.8-flash", "low"],
+  ["gpt-oss-120b-medium", undefined, "gpt-oss-120b-medium", "low"],
+  ["gemini-pro-orchestrator", "high", "gemini-pro-orchestrator", undefined],
+  ["gemini-3.8-flash-xhigh", undefined, undefined, undefined],
+  ["gemini-3.8-flash-ultra", undefined, undefined, undefined],
+  ["gemini-3.8-flash-high", "removed-tier", undefined, undefined],
+])("opens model %s with explicit thinking %s", async (requested, explicit, model, thinking) => {
+  const { directory, launch } = await launchConfigurableAgent();
   const connection = await createAntigravityProvider().connect({
     launch,
     versions: [1],
@@ -320,6 +330,78 @@ it.each([
         error: { message: expect.stringContaining(`Unsupported value: ${explicit ?? requested}`) },
       });
     }
+  } finally {
+    await connection.close();
+  }
+});
+
+it("limits empty catalog tiers to orchestrators and drops the stale tier on a live switch", async () => {
+  const { directory, launch } = await launchConfigurableAgent();
+  const connection = await createAntigravityProvider().connect({
+    launch,
+    versions: [1],
+    capabilities: ["session.configure"],
+  });
+  const events: ProviderEvent[] = [];
+  connection.onEvent((event) => events.push(event));
+  try {
+    await connection.send({ type: "catalog", cwd: directory, requestId: "catalog" });
+    await expect
+      .poll(() => events.find((event) => event.type === "catalog"))
+      .toMatchObject({
+        catalog: {
+          models: expect.arrayContaining([
+            {
+              id: "gemini-pro-orchestrator",
+              label: "gemini-pro-orchestrator",
+              thinkingOptions: [],
+            },
+            {
+              id: "gemini-pro-orchestrator-preview",
+              label: "gemini-pro-orchestrator-preview",
+              thinkingOptions: [],
+            },
+            { id: "gemini-pro-orchestratorish", label: "gemini-pro-orchestratorish" },
+          ]),
+          thinkingOptions: [
+            { id: "low", label: "low" },
+            { id: "medium", label: "medium" },
+          ],
+          defaultThinkingOption: "low",
+        },
+      });
+    await connection.send({
+      type: "session.open",
+      sessionId: "test",
+      requestId: "open",
+      history: "skip",
+      config: {
+        cwd: directory,
+        persist: true,
+        mode: "",
+        thinkingOption: "medium",
+        env: {},
+        mcpServers: {},
+        settings: {},
+      },
+    });
+    await expect.poll(() => events.some((event) => event.type === "session.ready")).toBe(true);
+    await connection.send({
+      type: "session.configure",
+      sessionId: "test",
+      requestId: "switch",
+      changes: { model: "gemini-pro-orchestrator-preview", thinkingOption: "medium" },
+    });
+    await expect
+      .poll(() => events.find((event) => "requestId" in event && event.requestId === "switch"))
+      .toMatchObject({ type: "request.completed" });
+    expect(events.findLast((event) => event.type === "session.config")).toMatchObject({
+      config: {
+        model: "gemini-pro-orchestrator-preview",
+        thinkingOptions: [],
+        thinkingOption: undefined,
+      },
+    });
   } finally {
     await connection.close();
   }

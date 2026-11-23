@@ -2053,13 +2053,18 @@ function mapModel(
   catalogDefaultThinkingOption: string | undefined,
 ): AgentModelDefinition {
   const thinkingOptions = model.thinkingOptions ?? catalogThinkingOptions;
+  const defaultThinkingOptionId = model.defaultThinkingOptionId ?? catalogDefaultThinkingOption;
   return {
     ...model,
     provider,
     isDefault: model.isDefault ?? model.id === defaultModel,
     metadata: model.metadata ? { ...model.metadata } : undefined,
     thinkingOptions: thinkingOptions?.map((option) => Object.assign({}, option)),
-    defaultThinkingOptionId: model.defaultThinkingOptionId ?? catalogDefaultThinkingOption,
+    defaultThinkingOptionId:
+      !model.thinkingOptions ||
+      model.thinkingOptions.some((option) => option.id === defaultThinkingOptionId)
+        ? defaultThinkingOptionId
+        : undefined,
   };
 }
 

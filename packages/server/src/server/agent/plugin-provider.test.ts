@@ -2187,6 +2187,41 @@ describe("PluginAgentClientRegistry", () => {
     expect(harness.inputs.map((input) => input.type)).toContain("session.close");
   });
 
+  test("only inherits a catalog thinking default offered by a model with explicit options", async () => {
+    await withObservedProvider(
+      {
+        async handleInput(input, emit) {
+          if (input.type !== "catalog") return false;
+          const high = { id: "high", label: "High" };
+          const low = { id: "low", label: "Low" };
+          emit({
+            type: "catalog",
+            requestId: input.requestId,
+            catalog: {
+              models: [
+                { id: "fixed", label: "Fixed", thinkingOptions: [] },
+                { id: "low-only", label: "Low only", thinkingOptions: [low] },
+                { id: "adjustable", label: "Adjustable", thinkingOptions: [low, high] },
+              ],
+              modes: [],
+              thinkingOptions: [low, high],
+              defaultThinkingOption: "high",
+            },
+          });
+          return true;
+        },
+      },
+      async (client) => {
+        const { models } = await client.fetchCatalog({ scope: "global" });
+        expect(models).toMatchObject([
+          { id: "fixed", defaultThinkingOptionId: undefined, thinkingOptions: [] },
+          { id: "low-only", defaultThinkingOptionId: undefined },
+          { id: "adjustable", defaultThinkingOptionId: "high" },
+        ]);
+      },
+    );
+  });
+
   test("delivers a supported steer to the active turn", async () => {
     const harness = createProviderHarness({
       capabilities: [...CAPABILITIES, "prompt.steer"],

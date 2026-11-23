@@ -18,7 +18,19 @@ const systemPromptCapability = z.object({
 
 const fileWrite = z.object({ Path: z.string(), Content: z.string().optional() });
 
+function isOrchestrator(model: string | undefined): boolean {
+  return model !== undefined && /^gemini-pro-orchestrator(?:-|$)/.test(model);
+}
+
 const antigravity: AcpTransformer = {
+  discover(catalog) {
+    return {
+      ...catalog,
+      models: catalog.models.map((model) =>
+        isOrchestrator(model.id) ? { ...model, thinkingOptions: [] } : model,
+      ),
+    };
+  },
   toolCall(call) {
     if (call.name === "write_file") {
       const input = fileWrite.safeParse(call.input);
@@ -48,7 +60,19 @@ const antigravity: AcpTransformer = {
   loadHistoryFallback({ nativeSessionId, launch, config }) {
     return readHistory({ conversationId: nativeSessionId, launch, config });
   },
-  async configure(change, { apply, catalog }) {
+  async configure(change, { apply, catalog, config }) {
+    if (change.target === "thinking") {
+      const current = catalog();
+      // A saved tier can follow a model switch even after agy removes its selector.
+      if (
+        isOrchestrator(current.defaultModel) &&
+        !current.thinkingOptions?.length &&
+        !Object.hasOwn(await config.read(), "thought_level")
+      ) {
+        return "handled";
+      }
+      return "pass";
+    }
     // COMPAT(antigravityLegacyTieredModelId): added in v0.17.0, remove after 2027-06-01.
     if (change.target !== "model" || !change.value) return "pass";
     const requestedModel = change.value;

@@ -8,7 +8,7 @@ import type { AgentProviderDefinition } from "@getpaseo/protocol/provider-manife
 import type { DraftCommandTarget } from "@/agent-commands";
 import { i18n } from "@/i18n/i18next";
 import { compareMatchScores, scoreTextFields } from "@getpaseo/protocol/search/text-match";
-import { filterSelectableModels } from "./model-catalog";
+import { filterSelectableModels, findModelByReference } from "./model-catalog";
 
 export interface ProviderSelectionModelRow {
   /**
@@ -312,14 +312,14 @@ export function resolveEffectiveComposerThinkingOptionId(
   selection: ProviderSelectionState,
   effectiveModelId: string,
 ): string {
+  const model = findModelByReference(selection.availableModels, effectiveModelId);
+  if (model?.thinkingOptions?.length === 0) return "";
   const selectedThinkingOptionId = selection.thinkingOptionId.trim();
   if (selectedThinkingOptionId) {
     return selectedThinkingOptionId;
   }
 
-  const selectedModelDefinition =
-    selection.availableModels.find((model) => model.id === effectiveModelId) ?? null;
-  return selectedModelDefinition?.defaultThinkingOptionId ?? "";
+  return model?.id === effectiveModelId ? (model.defaultThinkingOptionId ?? "") : "";
 }
 
 export function buildDraftCommandTarget(input: {
@@ -337,6 +337,7 @@ export function buildDraftCommandTarget(input: {
     return { status: "needs-provider" };
   }
 
+  const model = findModelByReference(input.selection.availableModels, input.effectiveModelId);
   const config = {
     provider: input.selection.provider,
     cwd,
@@ -344,7 +345,7 @@ export function buildDraftCommandTarget(input: {
       ? { modeId: input.selection.modeId }
       : {}),
     ...(input.effectiveModelId ? { model: input.effectiveModelId } : {}),
-    ...(input.effectiveThinkingOptionId
+    ...(input.effectiveThinkingOptionId && model?.thinkingOptions?.length !== 0
       ? { thinkingOptionId: input.effectiveThinkingOptionId }
       : {}),
     ...(input.providerOptions ? { providerOptions: input.providerOptions } : {}),

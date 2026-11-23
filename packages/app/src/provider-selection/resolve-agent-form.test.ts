@@ -1315,6 +1315,66 @@ it("owns input readiness, reopening and user edits in the reducer", () => {
 });
 
 describe("Antigravity profiles and drafts saved with tiered model ids", () => {
+  const orchestrator: AgentModelDefinition = {
+    provider: "antigravity",
+    id: "orchestrator",
+    label: "Orchestrator",
+    thinkingOptions: [],
+  };
+  const models = [...ANTIGRAVITY_MODELS, orchestrator];
+
+  it("clears stale profile and draft thinking once the model declares no tiers", () => {
+    const initialValues = {
+      provider: orchestrator.provider,
+      model: orchestrator.id,
+      thinkingOptionId: "high",
+    };
+    const profile = {
+      type: "APPLY_PROFILE_FROM_USER" as const,
+      provider: orchestrator.provider,
+      providerDef: undefined,
+      modelId: orchestrator.id,
+      modeId: "",
+      thinkingOptionId: "high",
+    };
+    const draft = {
+      type: "COMPLETE_RESOLUTION" as const,
+      initialValues,
+      preferences: null,
+      allowedProviderMap: makeProviderMap(),
+      providerModelsByProvider: makeProviderModelsByProvider([[orchestrator.provider, null]]),
+    };
+    const ready = {
+      ...draft,
+      providerModelsByProvider: makeProviderModelsByProvider([[orchestrator.provider, models]]),
+    };
+    const waiting = resolveAgentForm(makeState(), draft);
+    const applied = resolveAgentForm(waiting, { ...profile, providerModels: null });
+    for (const state of [waiting, applied]) {
+      expect(state.form.thinkingOptionId).toBe("high");
+      expect(resolveAgentForm(state, ready).form.thinkingOptionId).toBe("");
+    }
+    expect(resolveAgentForm(makeState(), ready).form.thinkingOptionId).toBe("");
+    expect(
+      resolveAgentForm(waiting, { ...profile, providerModels: models }).form.thinkingOptionId,
+    ).toBe("");
+  });
+
+  it("drops the previous model's tier and a stale preference when switching models", () => {
+    const state = makeState({
+      provider: orchestrator.provider,
+      model: ANTIGRAVITY_MODELS[0].id,
+      thinkingOptionId: "high",
+    });
+    const next = resolveAgentForm(state, {
+      type: "SET_MODEL_FROM_USER",
+      modelId: orchestrator.id,
+      availableModels: models,
+      providerPrefs: { thinkingByModel: { [orchestrator.id]: "high" } },
+    });
+    expect(next.form).toMatchObject({ model: orchestrator.id, thinkingOptionId: "" });
+  });
+
   it.each([
     ["gemini-4-neon-xhigh", "", "gemini-4-neon", "xhigh"],
     ["gemini-4-carbon-high", "", "gemini-4-carbon", "high"],

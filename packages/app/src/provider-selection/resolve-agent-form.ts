@@ -569,8 +569,14 @@ function completeResolution(
     // The snapshot can arrive before the selected provider's models. Reconcile
     // the stored model and its tier in place without reapplying preferences.
     const { form } = state;
-    if (form.provider !== "antigravity") return state;
+    if (!form.provider) return state;
     const availableModels = action.providerModelsByProvider.get(form.provider) ?? null;
+    const knownModel = findModelByReference(availableModels, form.model);
+    if (form.thinkingOptionId && knownModel?.thinkingOptions?.length === 0) {
+      const model = form.provider === "antigravity" ? knownModel.id : form.model;
+      return { ...state, form: { ...form, model, thinkingOptionId: "" } };
+    }
+    if (form.provider !== "antigravity") return state;
     const selection = resolveDraftModelSelection(
       form,
       availableModels,
@@ -622,6 +628,14 @@ function resolveUserModelSelection(
   };
 }
 
+function resolveProfileModeId(action: ApplyProfileAction): string {
+  const availableModeIds = new Set(action.providerDef?.modes.map((mode) => mode.id) ?? []);
+  const preferredModeId = action.modeId || action.providerPrefs?.mode || "";
+  if (availableModeIds.has(preferredModeId)) return preferredModeId;
+  const defaultModeId = action.providerDef?.defaultModeId ?? "";
+  return availableModeIds.has(defaultModeId) ? defaultModeId : "";
+}
+
 function applyProfile(state: AgentFormReducerState, action: ApplyProfileAction) {
   const preferredModelId = action.modelId || action.providerPrefs?.model || "";
   const providerModels =
@@ -634,18 +648,10 @@ function applyProfile(state: AgentFormReducerState, action: ApplyProfileAction) 
     preferredModelId,
     action.thinkingOptionId,
   );
-  const availableModeIds = new Set(action.providerDef?.modes.map((mode) => mode.id) ?? []);
-  const preferredModeId = action.modeId || action.providerPrefs?.mode || "";
-  const defaultModeId = action.providerDef?.defaultModeId ?? "";
-  let nextModeId = "";
-  if (availableModeIds.has(preferredModeId)) {
-    nextModeId = preferredModeId;
-  } else if (availableModeIds.has(defaultModeId)) {
-    nextModeId = defaultModeId;
-  }
   const nextThinkingOptionId =
     legacyThinkingOptionId ||
-    action.thinkingOptionId ||
+    (findModelByReference(providerModels, nextModelId)?.thinkingOptions?.length !== 0 &&
+      action.thinkingOptionId) ||
     pickNextThinkingOptionForProvider({
       providerModels,
       providerPrefs: action.providerPrefs,
@@ -657,7 +663,7 @@ function applyProfile(state: AgentFormReducerState, action: ApplyProfileAction) 
       ...state.form,
       provider: action.provider,
       model: nextModelId,
-      modeId: nextModeId,
+      modeId: resolveProfileModeId(action),
       thinkingOptionId: nextThinkingOptionId,
     },
     userModified: {
