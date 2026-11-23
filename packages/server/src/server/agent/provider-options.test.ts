@@ -173,6 +173,31 @@ describe("exact MCP preapproval mappings", () => {
     });
   });
 
+  test("Codex explicit Paseo grants override its injected default approval", () => {
+    expect(
+      applyCodexToolPolicy(
+        {
+          mcp_servers: {
+            paseo: {
+              url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=agent-1",
+              default_tools_approval_mode: "approve",
+            },
+          },
+        },
+        { preapproved: [{ kind: "mcp", server: "paseo", tool: "finish_execution" }] },
+      ),
+    ).toEqual({
+      mcp_servers: {
+        paseo: {
+          url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=agent-1",
+          enabled_tools: ["finish_execution"],
+          default_tools_approval_mode: "prompt",
+          tools: { finish_execution: { approval_mode: "approve" } },
+        },
+      },
+    });
+  });
+
   test("Claude adds the exact MCP identity without replacing deny rules", () => {
     expect(
       applyClaudeToolPolicy(

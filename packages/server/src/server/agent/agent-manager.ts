@@ -149,9 +149,9 @@ import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import type { PaseoToolCatalogFactory } from "./tools/types.js";
 import { isPaseoToolPolicyEnabled, resolveAgentPaseoToolPolicy } from "./paseo-tool-policy.js";
 import {
-  applyMainControlReadOnlyConfig,
   buildHierarchyAppendSystemPrompt,
   computeAgentDepth,
+  getLegacyMainControlPriorMode,
   hasReservedHierarchyLabels,
   type HierarchyAgent,
   isMainControlWritePermissionBlocked,
@@ -335,6 +335,33 @@ interface MainControlRoleUpdate {
   modeId?: string;
   enabled: boolean;
   mainControlSystemPrompt?: string;
+}
+
+function mainControlRoleUpdateSettings(input: {
+  enabled: boolean;
+  currentLabels: Record<string, string>;
+  currentMode: string | null | undefined;
+  restore?: StoredAgentRecord;
+}): Pick<MainControlRoleUpdate, "labels" | "modeId"> {
+  const { enabled, currentLabels, currentMode, restore } = input;
+  const patch: AgentLabelPatch = { [WORKSPACE_ROLE_LABEL]: enabled ? WORKSPACE_MAIN_ROLE : null };
+  // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+  let modeId: string | undefined;
+  if (!enabled) {
+    modeId = getLegacyMainControlPriorMode(currentMode, currentLabels) ?? undefined;
+    patch[MAIN_PRIOR_MODE_ID_LABEL] = null;
+  }
+  if (restore) {
+    // Rollback restores the original marker and mode together.
+    patch[MAIN_PRIOR_MODE_ID_LABEL] = restore.labels[MAIN_PRIOR_MODE_ID_LABEL] ?? null;
+    if (
+      enabled &&
+      getLegacyMainControlPriorMode(restore.lastModeId ?? restore.config?.modeId, restore.labels)
+    ) {
+      modeId = "read-only";
+    }
+  }
+  return { labels: applyRecordPatch(currentLabels, patch), modeId };
 }
 
 interface AgentParentUpdate extends AgentRelationshipUpdate {
@@ -2966,9 +2993,12 @@ export class AgentManager {
     agent.labels = role.labels;
     agent.mainControlSystemPrompt = role.mainControlSystemPrompt;
     agent.config = config;
-    agent.currentModeId = config.modeId ?? null;
-    if (agent.runtimeInfo)
-      agent.runtimeInfo = { ...agent.runtimeInfo, modeId: agent.currentModeId };
+    if (role.modeId !== undefined) {
+      agent.currentModeId = role.modeId;
+      if (agent.runtimeInfo) {
+        agent.runtimeInfo = { ...agent.runtimeInfo, modeId: role.modeId };
+      }
+    }
     this.touchUpdatedAt(agent);
   }
 
@@ -3728,12 +3758,9 @@ export class AgentManager {
   async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {
     return this.runLifecycleMutation(agentId, () =>
       this.withLiveInteractiveSessionUnlocked(agentId, async (agent) => {
-        if (
-          isMainControlAgentLabels(agent.labels) &&
-          this.adapterOf(agent.provider) === "codex" &&
-          modeId !== "read-only"
-        ) {
-          throw new Error(MAIN_CONTROL_WRITE_DENIAL);
+        // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+        if (getMainPriorModeIdFromLabels(agent.labels)) {
+          return this.setAgentModeAndClearLegacyMainControlMarker(agent, modeId);
         }
         const notice = (await agent.session.setMode(modeId)) ?? null;
         await this.drainSessionEvents(agentId);
@@ -3749,6 +3776,41 @@ export class AgentManager {
         return notice;
       }),
     );
+  }
+
+  // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+  private async setAgentModeAndClearLegacyMainControlMarker(
+    agent: ActiveManagedAgent,
+    modeId: string,
+  ): Promise<AgentProviderNotice | null> {
+    const previousMode = agent.currentModeId ?? agent.config.modeId;
+    const notice = (await agent.session.setMode(modeId)) ?? null;
+    await this.drainSessionEvents(agent.id);
+    const previous = {
+      labels: agent.labels,
+      currentModeId: agent.currentModeId,
+      config: agent.config,
+      runtimeInfo: agent.runtimeInfo,
+      updatedAt: agent.updatedAt,
+    };
+    try {
+      const currentModeId = (await agent.session.getCurrentMode()) ?? modeId;
+      agent.labels = applyRecordPatch(agent.labels, { [MAIN_PRIOR_MODE_ID_LABEL]: null });
+      agent.config = { ...agent.config, modeId: currentModeId };
+      agent.currentModeId = currentModeId;
+      if (agent.runtimeInfo) agent.runtimeInfo = { ...agent.runtimeInfo, modeId: currentModeId };
+      this.touchUpdatedAt(agent);
+      // A role switch may read the saved marker as soon as this lifecycle mutation completes.
+      await this.persistSnapshot(agent);
+    } catch (error) {
+      Object.assign(agent, previous);
+      if (previousMode != null) {
+        await this.restoreLegacyMainControlSessionMode(agent, previousMode, error);
+      }
+      throw error;
+    }
+    this.emitState(agent, { persist: false });
+    return notice;
   }
 
   async setAgentModel(agentId: string, modelId: string | null): Promise<void> {
@@ -3822,17 +3884,6 @@ export class AgentManager {
     return this.runLifecycleMutation(agentId, () =>
       this.withLiveInteractiveSessionUnlocked(agentId, async (agent) => {
         const patch = this.convertLegacyOptions(agent.provider, requested);
-        if (isMainControlAgentLabels(agent.labels)) {
-          const adapter = this.adapterOf(agent.provider);
-          if (
-            patch.auto_accept === true ||
-            (adapter === "codex" && ("sandbox_mode" in patch || "approval_policy" in patch)) ||
-            (adapter === "claude" && "disallowedTools" in patch) ||
-            (adapter === "opencode" && ("auto_accept" in patch || "permission" in patch))
-          ) {
-            throw new Error(MAIN_CONTROL_WRITE_DENIAL);
-          }
-        }
         let ended: ProviderOptionsPatch = {};
         let sent: ProviderOptionsPatch = {};
         if (Object.keys(patch).length > 0) {
@@ -4060,20 +4111,10 @@ export class AgentManager {
       if (this.agents.has(id) || (await registry.get(id))) {
         throw new Error("Agent ID is already in use.");
       }
-      const priorMode = config.modeId?.trim();
-      const labels = {
-        [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
-        ...(priorMode ? { [MAIN_PRIOR_MODE_ID_LABEL]: priorMode } : {}),
-      };
-      const modeId = this.resolveMainControlMode({
-        enabled: true,
-        provider: config.provider,
-        currentMode: priorMode,
-        priorMode: null,
-      });
+      const labels = { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE };
       // Discover the provider's default model when the first turn opens its session.
       const storedConfig = await this.normalizeConfig(
-        stripInternalPaseoMcpServer(foldFeatureValues({ ...config, modeId })),
+        stripInternalPaseoMcpServer(foldFeatureValues(config)),
         { resolveDefaultModel: false },
       );
       const now = new Date().toISOString();
@@ -4422,7 +4463,7 @@ export class AgentManager {
   private async writeMainControlRole(
     agentId: string,
     enabled: boolean,
-    restore?: Pick<StoredAgentRecord, "mainControlSystemPrompt">,
+    restore?: StoredAgentRecord,
   ): Promise<AgentRelationshipUpdate> {
     const registry = this.requireRegistry();
     const record = await registry.get(agentId);
@@ -4432,17 +4473,17 @@ export class AgentManager {
       return { record, live: Boolean(current) };
     }
 
-    const currentMode = current?.currentModeId ?? record.lastModeId ?? record.config?.modeId;
-    const priorMode = getMainPriorModeIdFromLabels(record.labels);
-    const labels = applyRecordPatch(current?.labels ?? record.labels, {
-      [WORKSPACE_ROLE_LABEL]: enabled ? WORKSPACE_MAIN_ROLE : null,
-      [MAIN_PRIOR_MODE_ID_LABEL]: enabled ? currentMode?.trim() || null : null,
-    });
-    const modeId = this.resolveMainControlMode({
+    const currentLabels = current?.labels ?? record.labels;
+    const currentMode =
+      current?.currentModeId ??
+      current?.config.modeId ??
+      record.lastModeId ??
+      record.config?.modeId;
+    const { labels, modeId } = mainControlRoleUpdateSettings({
       enabled,
-      provider: record.provider,
+      currentLabels,
       currentMode,
-      priorMode,
+      restore,
     });
     let mainControlSystemPrompt: string | undefined;
     if (enabled) {
@@ -4460,39 +4501,33 @@ export class AgentManager {
       });
     }
 
-    const next: StoredAgentRecord = {
-      ...record,
-      labels,
-      mainControlSystemPrompt,
-      config: { ...record.config, modeId },
-      lastModeId: modeId ?? null,
-      runtimeInfo: record.runtimeInfo
-        ? { ...record.runtimeInfo, modeId: modeId ?? null }
-        : undefined,
-      updatedAt: this.nextStoredUpdatedAt(record),
-    };
+    const next: StoredAgentRecord = this.withMainControlModeRestored(
+      {
+        ...record,
+        labels,
+        mainControlSystemPrompt,
+        updatedAt: this.nextStoredUpdatedAt(record),
+      },
+      modeId,
+    );
     await registry.upsert(next);
     this.paseoToolPolicies.delete(agentId);
     this.dispatchStoredAgentState(next);
     return { record: next, live: false };
   }
 
-  private resolveMainControlMode({
-    enabled,
-    provider,
-    currentMode,
-    priorMode,
-  }: {
-    enabled: boolean;
-    provider: AgentProvider;
-    currentMode: string | null | undefined;
-    priorMode: string | null;
-  }): string | undefined {
-    if (this.adapterOf(provider) === "codex") {
-      return enabled ? "read-only" : (priorMode ?? undefined);
-    }
-    if (!enabled && priorMode) return priorMode;
-    return currentMode ?? undefined;
+  // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+  private withMainControlModeRestored(
+    record: StoredAgentRecord,
+    modeId: string | null | undefined,
+  ): StoredAgentRecord {
+    if (modeId == null) return record;
+    return {
+      ...record,
+      config: { ...record.config, modeId },
+      lastModeId: modeId,
+      runtimeInfo: record.runtimeInfo ? { ...record.runtimeInfo, modeId } : undefined,
+    };
   }
 
   private applyLiveMainControlRole(
@@ -4522,12 +4557,17 @@ export class AgentManager {
     const previousPolicy = this.paseoToolPolicies.get(agentId);
     const wasInPlaceSession = this.inPlaceMainControlSessions.has(current.session);
 
+    // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+    const restoreMode = modeId !== undefined && modeId !== previousModeId;
+    if (restoreMode) await current.session.setMode(modeId);
     current.labels = labels;
     current.mainControlSystemPrompt = mainControlSystemPrompt;
-    current.config = { ...current.config, modeId };
-    current.currentModeId = modeId ?? null;
-    if (current.runtimeInfo) {
-      current.runtimeInfo = { ...current.runtimeInfo, modeId: current.currentModeId };
+    if (modeId !== undefined) {
+      current.config = { ...current.config, modeId };
+      current.currentModeId = modeId;
+      if (current.runtimeInfo) {
+        current.runtimeInfo = { ...current.runtimeInfo, modeId };
+      }
     }
     this.touchUpdatedAt(current);
     const policy = resolveAgentPaseoToolPolicy(
@@ -4556,32 +4596,35 @@ export class AgentManager {
       else this.paseoToolPolicies.delete(agentId);
       if (wasInPlaceSession) this.inPlaceMainControlSessions.add(current.session);
       else this.inPlaceMainControlSessions.delete(current.session);
-      throw error;
-    }
-
-    if (enabled && current.effectiveOptions?.auto_accept === true) {
-      await current.session.applyOptions?.({ auto_accept: false }).catch(() => undefined);
-      current.effectiveOptions = { ...current.effectiveOptions, auto_accept: false };
-    } else if (!enabled) {
-      const restoredEffective = this.effectiveOptionsFor(
-        current.provider,
-        current.config.providerOptions,
-      );
-      if (
-        "auto_accept" in restoredEffective &&
-        restoredEffective.auto_accept !== current.effectiveOptions?.auto_accept
-      ) {
-        await current.session
-          .applyOptions?.({ auto_accept: restoredEffective.auto_accept })
-          .catch(() => undefined);
-        current.effectiveOptions = restoredEffective;
+      // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+      const previousMode = previousModeId ?? previousConfig.modeId;
+      if (restoreMode && previousMode != null) {
+        await this.restoreLegacyMainControlSessionMode(current, previousMode, error);
       }
+      throw error;
     }
 
     this.emitState(current);
     const record = await this.requireRegistry().get(agentId);
     if (!record) throw new Error(`Agent not found after updating Main Control: ${agentId}`);
     return { record, live: true };
+  }
+
+  // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+  private async restoreLegacyMainControlSessionMode(
+    agent: ActiveManagedAgent,
+    modeId: string,
+    error: unknown,
+  ): Promise<void> {
+    try {
+      await agent.session.setMode(modeId);
+      await this.drainSessionEvents(agent.id);
+    } catch (restoreError) {
+      throw new Error(
+        `${getErrorMessage(error)}. Failed to restore session mode: ${getErrorMessage(restoreError)}`,
+        { cause: restoreError },
+      );
+    }
   }
 
   private async reloadWithMainControlRole(
@@ -4592,7 +4635,7 @@ export class AgentManager {
       await this.trackAgentRegistrationOperation(
         this.reloadAgentSessionInternal(
           agentId,
-          { modeId: role.modeId },
+          role.modeId === undefined ? undefined : { modeId: role.modeId },
           { mainControlRole: role },
         ),
       );
@@ -5349,7 +5392,7 @@ export class AgentManager {
       return false;
     }
 
-    const nextRecord: StoredAgentRecord = {
+    let nextRecord: StoredAgentRecord = {
       ...record,
       ...(updates?.workspaceId ? { workspaceId: updates.workspaceId } : {}),
       ...(updates?.labels ? { labels: applyRecordPatch(record.labels, updates.labels) } : {}),
@@ -5376,22 +5419,18 @@ export class AgentManager {
     if (this.agents.has(agentId)) await this.closeAgentRuntime(agentId);
     await this.syncNativeArchiveState(record.provider, record.persistence, "restore");
 
-    if (await this.shouldDemoteRestoredMainControl(nextRecord)) {
-      const modeId = this.resolveMainControlMode({
-        enabled: false,
-        provider: record.provider,
-        currentMode: record.lastModeId ?? record.config?.modeId,
-        priorMode: getMainPriorModeIdFromLabels(nextRecord.labels),
-      });
+    const demoted =
+      isMainControlAgentLabels(record.labels) && !isMainControlAgentLabels(nextRecord.labels);
+    if (demoted || (await this.shouldDemoteRestoredMainControl(nextRecord))) {
+      // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+      nextRecord = this.withMainControlModeRestored(
+        nextRecord,
+        getLegacyMainControlPriorMode(record.lastModeId ?? record.config?.modeId, record.labels),
+      );
       nextRecord.labels = applyRecordPatch(nextRecord.labels, {
         [WORKSPACE_ROLE_LABEL]: null,
         [MAIN_PRIOR_MODE_ID_LABEL]: null,
       });
-      nextRecord.config = { ...record.config, modeId };
-      nextRecord.lastModeId = modeId ?? null;
-      if (record.runtimeInfo) {
-        nextRecord.runtimeInfo = { ...record.runtimeInfo, modeId: modeId ?? null };
-      }
     }
     if (!isMainControlAgentLabels(nextRecord.labels)) {
       nextRecord.mainControlSystemPrompt = undefined;
@@ -9563,7 +9602,7 @@ export class AgentManager {
     agentId: string,
     options: PrepareSessionConfigOptions = {},
   ): Promise<PreparedSessionConfig> {
-    let storedConfig = await this.normalizeConfig(stripInternalPaseoMcpServer(config), {
+    const storedConfig = await this.normalizeConfig(stripInternalPaseoMcpServer(config), {
       env: options.env,
       purpose: options.purpose,
       resolveDefaultModel: options.resolveDefaultModel,
@@ -9587,21 +9626,6 @@ export class AgentManager {
       readAgent,
       listActiveAgents: () => hierarchy.values(),
     });
-    const mainControl = isMainControlAgentLabels(agent.labels);
-    if (mainControl && adapter === "codex") storedConfig = { ...storedConfig, modeId: "read-only" };
-    const rawEffectiveOptions = mainControl
-      ? this.effectiveOptionsFor(storedConfig.provider, storedConfig.providerOptions)
-      : undefined;
-    const effectiveOptions =
-      mainControl &&
-      (adapter === "claude" || adapter === "opencode" || rawEffectiveOptions?.auto_accept === true)
-        ? rawEffectiveOptions
-        : undefined;
-    const restrictedConfig = applyMainControlReadOnlyConfig(
-      effectiveOptions ? { ...storedConfig, providerOptions: effectiveOptions } : storedConfig,
-      agent.labels,
-      adapter,
-    );
     const paseoToolPolicy = resolveAgentPaseoToolPolicy(
       this.basePaseoToolPolicy(storedConfig.provider),
       agent,
@@ -9609,7 +9633,7 @@ export class AgentManager {
     );
     const launchConfig = this.applyDaemonAppendSystemPrompt(
       withRuntimePaseoMcpServer({
-        config: restrictedConfig,
+        config: storedConfig,
         agentId,
         mcpBaseUrl:
           this.paseoToolsEnabled && isPaseoToolPolicyEnabled(paseoToolPolicy)

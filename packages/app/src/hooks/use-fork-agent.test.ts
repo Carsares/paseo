@@ -4,6 +4,7 @@ import { renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
+  MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
@@ -90,6 +91,69 @@ describe("drafts from Main Control", () => {
         thinkingOptionId: null,
         providerOptions: {},
       });
+    },
+  );
+
+  it.each([
+    {
+      modeId: "read-only",
+      priorMode: "full-access",
+      inheritedMode: "full-access",
+      preferredProvider: "codex",
+    },
+    {
+      modeId: "workspace-write",
+      priorMode: "full-access",
+      inheritedMode: "workspace-write",
+      preferredProvider: undefined,
+    },
+    {
+      modeId: "read-only",
+      priorMode: null,
+      inheritedMode: "read-only",
+      preferredProvider: undefined,
+    },
+  ])(
+    "inherits $inheritedMode from Main Control with current mode $modeId",
+    ({ modeId, priorMode, inheritedMode, preferredProvider }) => {
+      const options = {
+        sandbox_mode: "read-only",
+        approval_policy: "never",
+        service_tier: "priority",
+      };
+      const setup = buildSubagentDraftSetup(
+        {
+          ...mainAgent,
+          provider: "codex",
+          currentModeId: modeId,
+          options,
+          labels: {
+            ...mainAgent.labels,
+            ...(priorMode ? { [MAIN_PRIOR_MODE_ID_LABEL]: priorMode } : {}),
+          },
+        },
+        "main-1",
+        preferredProvider,
+      );
+      expect(setup?.modeId).toBe(inheritedMode);
+      expect(setup?.providerOptions).toEqual(options);
+    },
+  );
+
+  it.each(["codex", "claude"])(
+    "prefers the configured %s options when an older host provides them",
+    (provider) => {
+      const options =
+        provider === "codex"
+          ? { sandbox_mode: "read-only", approval_policy: "never" }
+          : { disallowedTools: ["WebFetch", "Edit", "MultiEdit", "Write", "NotebookEdit", "Bash"] };
+      const subagentDraftOptions =
+        provider === "codex" ? { approval_policy: "on-request" } : { disallowedTools: ["Bash"] };
+      const setup = buildSubagentDraftSetup(
+        { ...mainAgent, provider, options, subagentDraftOptions },
+        "main-1",
+      );
+      expect(setup?.providerOptions).toEqual(subagentDraftOptions);
     },
   );
 

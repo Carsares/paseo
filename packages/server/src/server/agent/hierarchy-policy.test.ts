@@ -20,7 +20,7 @@ import { AgentManager } from "./agent-manager.js";
 import { createAgentMessageDelivery, parseAgentMessages } from "./agent-messages/index.js";
 import { toAgentPayload } from "./agent-projections.js";
 import type { AgentPromptInput, AgentSessionConfig } from "./agent-sdk-types.js";
-import { AgentStorage } from "./agent-storage.js";
+import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
 import { createAgentCommand, registerParentFinishSubscription } from "./create-agent/create.js";
 import {
   createFinishSubscriptions,
@@ -31,12 +31,10 @@ import {
 import { createPaseoToolCatalog } from "./tools/paseo-tools.js";
 import {
   applyHierarchyPaseoToolPolicy,
-  applyMainControlReadOnlyConfig,
   buildHierarchyAppendSystemPrompt,
   computeAgentDepth,
   computeMaxSubtreeDepth,
   isMainControlWritePermissionBlocked,
-  MAIN_CONTROL_WRITE_DENIAL,
   REMOTE_HIERARCHY_DEPTH_LABEL,
   resolveInheritedHierarchyMode,
   validateCanSpawnChild,
@@ -59,7 +57,7 @@ const worker = child("worker", lead);
 const sibling = child("other-lead", main);
 const root: HierarchyAgent = { id: "ordinary-root" };
 
-it("allows silent creation, in-place promotion, and soft read-only constraints for providers without hard read-only support", async () => {
+it("preserves options in place and sends Main Control instructions on the first turn", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "main-control-first-turn-"));
   const provider = "antigravity";
   const providerPrompts: AgentPromptInput[] = [];
@@ -80,9 +78,12 @@ it("allows silent creation, in-place promotion, and soft read-only constraints f
     });
     expect(silentMain.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
 
-    const agent = await manager.createAgent({ provider, cwd, modeId: "default" }, undefined, {
-      workspaceId: "workspace",
-    });
+    const providerOptions = { auto_accept: true };
+    const agent = await manager.createAgent(
+      { provider, cwd, modeId: "default", providerOptions },
+      undefined,
+      { workspaceId: "workspace" },
+    );
     const initialSession = manager.getAgent(agent.id)?.session;
     const run = async (prompt: string) => {
       for await (const _event of manager.streamAgent(agent.id, prompt, {
@@ -95,7 +96,9 @@ it("allows silent creation, in-place promotion, and soft read-only constraints f
     const promoted = await manager.setAgentMainControl(agent.id, true);
     expect(promoted.live).toBe(true);
     expect(manager.getAgent(agent.id)?.session).toBe(initialSession);
-    expect((await storage.get(agent.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+    expect(promoted.record.labels).toEqual(main.labels);
+    expect(promoted.record.config).toMatchObject({ modeId: "default", providerOptions });
+    expect(manager.getAgent(agent.id)?.effectiveOptions).toEqual(providerOptions);
     expect(manager.getPaseoToolPolicy(agent.id)?.disabledTools).toContain("archive_workspace");
 
     const quoted =
@@ -327,94 +330,13 @@ it("launches explicit reporting instructions for a level-two or remote child", a
   });
 });
 
-describe("Main Control read-only configuration", () => {
-  it("forces Codex sandbox and approval settings over previous overrides", () => {
-    const config = {
-      provider: "codex",
-      cwd: "/repo",
-      modeId: "full-access",
-      providerOptions: { sandbox_mode: "danger-full-access", approval_policy: "on-request" },
-    };
-    expect(applyMainControlReadOnlyConfig(config, main.labels)).toEqual({
-      ...config,
-      modeId: "read-only",
-      providerOptions: { sandbox_mode: "read-only", approval_policy: "never" },
-    });
-    expect(applyMainControlReadOnlyConfig(config, lead.labels)).toBe(config);
-  });
-
-  it("preserves existing Claude tool restrictions alongside file and shell restrictions", () => {
-    const config = {
-      provider: "claude",
-      cwd: "/repo",
-      providerOptions: { disallowedTools: ["WebFetch", "Edit"] },
-    };
-    expect(
-      applyMainControlReadOnlyConfig(config, main.labels).providerOptions?.disallowedTools,
-    ).toEqual(["WebFetch", "Edit", "MultiEdit", "Write", "NotebookEdit", "Bash"]);
-  });
-
-  it("locks OpenCode Main Control permissions and restores the inherited mode for children", () => {
-    const opencodeConfig = {
-      provider: "opencode",
-      cwd: "/repo",
-      providerOptions: { auto_accept: true, permission: "allow" },
-    };
-    expect(
-      applyMainControlReadOnlyConfig(opencodeConfig, main.labels).providerOptions,
-    ).toMatchObject({
-      auto_accept: false,
-      permission: {
-        read: "allow",
-        grep: "allow",
-        edit: "deny",
-        bash: "deny",
-        todowrite: "deny",
-      },
-    });
-    const mainWithPriorLabels = {
-      [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
-      [MAIN_PRIOR_MODE_ID_LABEL]: "full-access",
-    };
-    expect(resolveInheritedHierarchyMode("read-only", mainWithPriorLabels)).toBe("full-access");
-    expect(resolveInheritedHierarchyMode("read-only", main.labels)).toBeNull();
-  });
-
-  it("falls back to soft constraints without failing config setup on unsupported or custom provider options", () => {
-    const antigravityConfig = {
-      provider: "antigravity",
-      cwd: "/repo",
-      modeId: "full-access",
-    };
-    expect(applyMainControlReadOnlyConfig(antigravityConfig, main.labels)).toBe(antigravityConfig);
-
-    const acpAutoAcceptConfig = {
-      provider: "copilot",
-      cwd: "/repo",
-      providerOptions: { auto_accept: true, agent: "custom" },
-    };
-    expect(applyMainControlReadOnlyConfig(acpAutoAcceptConfig, main.labels)).toEqual({
-      ...acpAutoAcceptConfig,
-      providerOptions: { auto_accept: false, agent: "custom" },
-    });
-
-    const staleOpenCodeConfig = {
-      provider: "opencode",
-      cwd: "/repo",
-      providerOptions: { unknownOption: true, permission: { read: "allow" } },
-    };
-    expect(
-      applyMainControlReadOnlyConfig(staleOpenCodeConfig, main.labels).providerOptions,
-    ).toMatchObject({
-      unknownOption: true,
-      auto_accept: false,
-      permission: {
-        read: "allow",
-        edit: "deny",
-        bash: "deny",
-        todowrite: "deny",
-      },
-    });
+describe("Main Control mode inheritance and permission requests", () => {
+  it("inherits the mode the caller chose, or the saved mode for a legacy read-only caller", () => {
+    const legacyLabels = { ...main.labels, [MAIN_PRIOR_MODE_ID_LABEL]: "full-access" };
+    expect(resolveInheritedHierarchyMode("read-only", legacyLabels)).toBe("full-access");
+    expect(resolveInheritedHierarchyMode("workspace-write", legacyLabels)).toBe("workspace-write");
+    expect(resolveInheritedHierarchyMode("read-only", main.labels)).toBe("read-only");
+    expect(resolveInheritedHierarchyMode("read-only", lead.labels)).toBe("read-only");
   });
 
   it.each([
@@ -432,11 +354,12 @@ describe("Main Control read-only configuration", () => {
     "mcp__filesystem__edit_file",
     "apply_patch",
     "CodexFileChange",
+    "TodoWrite",
   ])("denies %s approval", (name) =>
     expect(isMainControlWritePermissionBlocked({ kind: "tool", name })).toBe(true),
   );
 
-  it("uses structured edit details and allows read-only tools and questions", () => {
+  it("uses structured file details and allows shell commands and questions", () => {
     expect(
       isMainControlWritePermissionBlocked({
         kind: "tool",
@@ -448,9 +371,26 @@ describe("Main Control read-only configuration", () => {
       isMainControlWritePermissionBlocked({
         kind: "tool",
         name: "custom",
-        detail: { type: "shell", command: "example" },
+        detail: { type: "write", filePath: "/repo/file" },
       }),
     ).toBe(true);
+    expect(
+      isMainControlWritePermissionBlocked({
+        kind: "tool",
+        name: "custom",
+        detail: { type: "shell", command: "pwd" },
+      }),
+    ).toBe(false);
+    for (const name of [
+      "Bash",
+      "shell",
+      "exec",
+      "run-command",
+      "executeCommand",
+      "run_terminal_cmd",
+    ]) {
+      expect(isMainControlWritePermissionBlocked({ kind: "tool", name })).toBe(false);
+    }
     expect(isMainControlWritePermissionBlocked({ kind: "tool", name: "Read" })).toBe(false);
     expect(isMainControlWritePermissionBlocked({ kind: "question", name: "AskUserQuestion" })).toBe(
       false,
@@ -508,12 +448,18 @@ async function withAgents(
   }
 }
 
-it("switches a live workspace's Main Control and restores the previous agent's mode", async () => {
-  await withAgents(async ({ manager, storage, cwd }) => {
+it("switches live Main Control without overriding either agent's mode or Codex options", async () => {
+  await withAgents(async ({ manager, storage, cwd, launchedConfigs }) => {
     const options = { workspaceId: "workspace" };
     const make = (title: string) =>
       manager.createAgent(
-        { provider: "codex", cwd, title, modeId: "full-access" },
+        {
+          provider: "codex",
+          cwd,
+          title,
+          modeId: "full-access",
+          providerOptions: { sandbox_mode: "danger-full-access", approval_policy: "on-request" },
+        },
         undefined,
         options,
       );
@@ -522,16 +468,181 @@ it("switches a live workspace's Main Control and restores the previous agent's m
 
     await manager.setAgentMainControl(first.id, true);
     await manager.setAgentMainControl(first.id, true);
-    expect(manager.getAgent(first.id)?.currentModeId).toBe("read-only");
-    expect((await storage.get(first.id))?.labels[MAIN_PRIOR_MODE_ID_LABEL]).toBe("full-access");
-    await expect(manager.setAgentMode(first.id, "full-access")).rejects.toThrow("read-only");
+    expect(manager.getAgent(first.id)?.currentModeId).toBe("full-access");
+    expect((await storage.get(first.id))?.labels).toEqual(main.labels);
+    expect(launchedConfigs.get("codex")?.at(-1)).toMatchObject({
+      modeId: "full-access",
+      providerOptions: { sandbox_mode: "danger-full-access", approval_policy: "on-request" },
+      daemonAppendSystemPrompt: expect.stringContaining("Workspace Main Control Coordinator"),
+    });
+    await expect(manager.setAgentMode(first.id, "workspace-write")).resolves.toBeNull();
+    await expect(
+      manager.setAgentOptions(first.id, {
+        sandbox_mode: "workspace-write",
+        approval_policy: "never",
+      }),
+    ).resolves.toBeUndefined();
     expect(manager.getPaseoToolPolicy(first.id)?.disabledTools).toContain("send_terminal_keys");
     await manager.setAgentMainControl(second.id, true);
-    expect(manager.getAgent(first.id)?.currentModeId).toBe("full-access");
+    expect(manager.getAgent(first.id)?.currentModeId).toBe("workspace-write");
+    expect(manager.getAgent(first.id)?.config.providerOptions).toEqual({
+      sandbox_mode: "workspace-write",
+      approval_policy: "never",
+    });
     expect((await storage.get(first.id))?.labels).toEqual({});
     expect(manager.getPaseoToolPolicy(first.id)).toBeUndefined();
-    expect(manager.getAgent(second.id)?.currentModeId).toBe("read-only");
+    expect(manager.getAgent(second.id)?.currentModeId).toBe("full-access");
     expect((await storage.get(second.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+  });
+});
+
+function legacyReadOnlyMain(record: StoredAgentRecord): StoredAgentRecord {
+  return {
+    ...record,
+    labels: { ...record.labels, [MAIN_PRIOR_MODE_ID_LABEL]: "full-access" },
+    config: { ...record.config, modeId: "read-only" },
+    lastModeId: "read-only",
+  };
+}
+
+it.each([true, false])(
+  "passes the saved mode to same-host child creation for legacy=$legacy",
+  async (legacy) => {
+    await withAgents(async ({ manager, storage, cwd }) => {
+      const record = await manager.createSilentWorkspaceMainAgent({
+        config: { provider: "codex", cwd, modeId: "read-only" },
+        workspaceId: "workspace",
+      });
+      if (legacy) await storage.upsert(legacyReadOnlyMain(record));
+      await manager.createAgentFromRecord(record.id);
+      const { manager: providerSnapshotManager, resolveCreateConfig } =
+        createProviderSnapshotManagerStub();
+      resolveCreateConfig.mockImplementation(async ({ parent }) => ({
+        modeId: parent?.currentModeId ?? undefined,
+      }));
+      const catalog = createPaseoToolCatalog({
+        agentManager: manager,
+        agentStorage: storage,
+        providerSnapshotManager,
+        callerAgentId: record.id,
+        logger: createTestLogger(),
+      });
+      const result = await catalog.executeTool("create_agent", {
+        provider: "codex/gpt-5",
+        title: "Inherited mode",
+        initialPrompt: "Inspect the workspace",
+        notifyOnFinish: false,
+      });
+      expect(result.isError).not.toBe(true);
+      const childId = (result.structuredContent as { agentId: string }).agentId;
+      expect((await storage.get(childId))?.config?.modeId).toBe(
+        legacy ? "full-access" : "read-only",
+      );
+    });
+  },
+);
+
+it.each([
+  { live: false, selectMode: null, finalMode: "full-access" },
+  { live: true, selectMode: null, finalMode: "full-access" },
+  { live: true, selectMode: "workspace-write", finalMode: "workspace-write" },
+  { live: true, selectMode: "read-only", finalMode: "read-only" },
+])(
+  "disables a legacy Main Control with live=$live and selection=$selectMode",
+  async ({ live, selectMode, finalMode }) => {
+    await withAgents(async ({ manager, storage, cwd, launchedConfigs }) => {
+      const config = {
+        provider: "codex",
+        cwd,
+        modeId: "full-access",
+        providerOptions: { approval_policy: "on-request" },
+      };
+      const mainAgent = await manager.createSilentWorkspaceMainAgent({
+        config,
+        workspaceId: "workspace",
+      });
+      expect(mainAgent.labels).toEqual(main.labels);
+      expect(mainAgent.config).toMatchObject({
+        modeId: "full-access",
+        providerOptions: config.providerOptions,
+      });
+      await storage.upsert(legacyReadOnlyMain(mainAgent));
+      if (live) {
+        await manager.createAgentFromRecord(mainAgent.id);
+        expect(manager.getAgent(mainAgent.id)?.currentModeId).toBe("read-only");
+        expect(launchedConfigs.get("codex")?.at(-1)?.providerOptions).toEqual(
+          config.providerOptions,
+        );
+      }
+      if (selectMode) {
+        await manager.setAgentMode(mainAgent.id, selectMode);
+        expect(manager.getAgent(mainAgent.id)?.labels).toEqual(main.labels);
+        expect(await storage.get(mainAgent.id)).toMatchObject({
+          labels: main.labels,
+          lastModeId: selectMode,
+        });
+      }
+      const result = await manager.setAgentMainControl(mainAgent.id, false);
+      expect(result.record).toMatchObject({
+        labels: {},
+        lastModeId: finalMode,
+        config: { modeId: finalMode, providerOptions: config.providerOptions },
+      });
+      if (live) {
+        expect(await manager.getAgent(mainAgent.id)?.session?.getCurrentMode()).toBe(finalMode);
+      }
+    });
+  },
+);
+
+it("keeps the old mode and marker when saving an explicit replacement mode fails", async () => {
+  await withAgents(async ({ manager, storage, cwd }) => {
+    const mainAgent = await manager.createSilentWorkspaceMainAgent({
+      config: { provider: "codex", cwd, modeId: "read-only" },
+      workspaceId: "workspace",
+    });
+    const legacy = legacyReadOnlyMain(mainAgent);
+    await storage.upsert(legacy);
+    await manager.createAgentFromRecord(mainAgent.id);
+
+    vi.spyOn(storage, "applySnapshot").mockRejectedValueOnce(new Error("Save failed"));
+    await expect(manager.setAgentMode(mainAgent.id, "workspace-write")).rejects.toThrow(
+      "Save failed",
+    );
+    const live = manager.getAgent(mainAgent.id);
+    expect(await live?.session?.getCurrentMode()).toBe("read-only");
+    expect(live?.labels).toEqual(legacy.labels);
+    expect(await storage.get(mainAgent.id)).toMatchObject({
+      labels: legacy.labels,
+      lastModeId: "read-only",
+    });
+
+    const demoted = await manager.setAgentMainControl(mainAgent.id, false);
+    expect(demoted.record).toMatchObject({ labels: {}, lastModeId: "full-access" });
+  });
+});
+
+it("serializes an explicit mode selection with a failed Main Control handoff", async () => {
+  await withAgents(async ({ manager, storage, cwd }) => {
+    const workspaceId = "workspace";
+    const config = { provider: "codex", cwd, modeId: "read-only" };
+    const mainAgent = await manager.createSilentWorkspaceMainAgent({ config, workspaceId });
+    await storage.upsert(legacyReadOnlyMain(mainAgent));
+    await manager.createAgentFromRecord(mainAgent.id);
+    const next = await manager.createAgent(config, undefined, { workspaceId });
+    await manager.closeAgent(next.id);
+
+    vi.spyOn(storage, "upsert").mockRejectedValueOnce(new Error("Promotion failed"));
+    const selection = manager.setAgentMode(mainAgent.id, "read-only");
+    const promotion = manager.setAgentMainControl(next.id, true);
+    await expect(promotion).rejects.toThrow("Promotion failed");
+    await selection;
+
+    const restored = await storage.get(mainAgent.id);
+    expect(restored?.labels).toEqual(main.labels);
+    expect(restored?.lastModeId).toBe("read-only");
+    const demoted = await manager.setAgentMainControl(mainAgent.id, false);
+    expect(demoted.record).toMatchObject({ labels: {}, lastModeId: "read-only" });
   });
 });
 
@@ -626,9 +737,7 @@ it.each(["before archive", "after archive", "during compensation"] as const)(
       expect((await storage.get(target.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(
         committed ? WORKSPACE_MAIN_ROLE : undefined,
       );
-      expect(manager.getAgent(target.id)?.currentModeId).toBe(
-        committed ? "read-only" : "full-access",
-      );
+      expect(manager.getAgent(target.id)?.currentModeId).toBe("full-access");
       expect((await storage.get(childAgent.id))?.labels[PARENT_AGENT_ID_LABEL]).toBe(
         failure === "before archive" ? source.id : target.id,
       );
@@ -774,6 +883,7 @@ it("restores an archived former Main as an ordinary session when a new Main exis
     const workspaceId = "workspace";
     const config = { provider: "codex", cwd, modeId: "full-access" };
     const former = await manager.createSilentWorkspaceMainAgent({ workspaceId, config });
+    await storage.upsert(legacyReadOnlyMain(former));
     await manager.archiveSnapshot(former.id, new Date().toISOString());
     const current = await manager.createSilentWorkspaceMainAgent({ workspaceId, config });
 
@@ -829,9 +939,13 @@ it("keeps pending turns intact when either Main Control role is busy", async () 
 
 it("starts a new prompt on the replacement session when a Main Control switch is in progress", async () => {
   await withAgents(async ({ manager, cwd }) => {
-    const agent = await manager.createAgent({ provider: "codex", cwd }, undefined, {
-      workspaceId: "workspace",
-    });
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd, modeId: "workspace-write" },
+      undefined,
+      {
+        workspaceId: "workspace",
+      },
+    );
     const session = manager.getAgent(agent.id)?.session;
     if (!session) throw new Error("Expected a live session");
     const closing = Promise.withResolvers<void>();
@@ -851,7 +965,7 @@ it("starts a new prompt on the replacement session when a Main Control switch is
       await switchRole;
       await expect(run).resolves.toMatchObject({ canceled: false });
       expect(manager.getAgent(agent.id)?.session).not.toBe(session);
-      expect(manager.getAgent(agent.id)?.currentModeId).toBe("read-only");
+      expect(manager.getAgent(agent.id)?.currentModeId).toBe("workspace-write");
     } finally {
       releaseClose.resolve();
       await switchRole;
@@ -905,9 +1019,13 @@ it("refreshes both sets of direct children before their next turns after switchi
 
 it("queues an explicit replacement while the Main Control runtime is reopening", async () => {
   await withAgents(async ({ manager, cwd, codex }) => {
-    const agent = await manager.createAgent({ provider: "codex", cwd }, undefined, {
-      workspaceId: "workspace",
-    });
+    const agent = await manager.createAgent(
+      { provider: "codex", cwd, modeId: "workspace-write" },
+      undefined,
+      {
+        workspaceId: "workspace",
+      },
+    );
     const reopening = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const resume = codex.resumeSession.bind(codex);
@@ -925,7 +1043,7 @@ it("queues an explicit replacement while the Main Control runtime is reopening",
       release.resolve();
       const events = await Array.fromAsync(turn);
       expect(events.some((event) => event.type === "turn_completed")).toBe(true);
-      expect(manager.getAgent(agent.id)?.currentModeId).toBe("read-only");
+      expect(manager.getAgent(agent.id)?.currentModeId).toBe("workspace-write");
     } finally {
       release.resolve();
       await switchRole;
@@ -1248,13 +1366,12 @@ it("rejects non-root Main Control without demoting existing Main Control and tog
 
     const reenabled = await manager.setAgentMainControl(mainAgent.id, true);
     expect(reenabled.live).toBe(false);
-    expect(reenabled.record.lastModeId).toBe("read-only");
-    expect(reenabled.record.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
-    expect(reenabled.record.labels[MAIN_PRIOR_MODE_ID_LABEL]).toBe("full-access");
+    expect(reenabled.record.lastModeId).toBe("full-access");
+    expect(reenabled.record.labels).toEqual(main.labels);
   });
 });
 
-it("enforces Claude Main Control disallowedTools, auto-denies write permissions, and restores cleanly", async () => {
+it("preserves Claude options, surfaces shell requests, and auto-denies file writes", async () => {
   await withAgents(async ({ manager, storage, cwd, launchedConfigs }) => {
     const claudeAgent = await manager.createAgent(
       {
@@ -1271,14 +1388,7 @@ it("enforces Claude Main Control disallowedTools, auto-denies write permissions,
 
     await manager.setAgentMainControl(claudeAgent.id, true);
     const mainLaunch = launchedConfigs.get("claude")?.at(-1);
-    expect(mainLaunch?.providerOptions?.disallowedTools).toEqual([
-      "WebFetch",
-      "Bash",
-      "Edit",
-      "MultiEdit",
-      "Write",
-      "NotebookEdit",
-    ]);
+    expect(mainLaunch?.providerOptions?.disallowedTools).toEqual(["WebFetch", "Bash"]);
     expect(mainLaunch?.daemonAppendSystemPrompt).toContain("Workspace Main Control Coordinator");
     expect(manager.getPaseoToolPolicy(claudeAgent.id)?.disabledTools).toEqual(
       expect.arrayContaining([
@@ -1289,11 +1399,10 @@ it("enforces Claude Main Control disallowedTools, auto-denies write permissions,
         "stop_workspace_script",
       ]),
     );
-    await expect(manager.setAgentOptions(claudeAgent.id, { disallowedTools: [] })).rejects.toThrow(
-      MAIN_CONTROL_WRITE_DENIAL,
-    );
+    await expect(
+      manager.setAgentOptions(claudeAgent.id, { disallowedTools: ["WebFetch"] }),
+    ).resolves.toBeUndefined();
 
-    // Trigger a write permission request in default mode; it must auto-deny without surfacing.
     const surfacedPermissions: string[] = [];
     const unsubscribe = manager.subscribe(
       (event) => {
@@ -1303,14 +1412,31 @@ it("enforces Claude Main Control disallowedTools, auto-denies write permissions,
       },
       { agentId: claudeAgent.id, replayState: false },
     );
+    const shellPermission = Promise.withResolvers<string>();
+    const unsubscribeShell = manager.subscribe(
+      (event) => {
+        if (
+          event.type === "agent_stream" &&
+          event.event.type === "permission_requested" &&
+          event.event.request.name === "Bash"
+        ) {
+          shellPermission.resolve(event.event.request.id);
+        }
+      },
+      { agentId: claudeAgent.id, replayState: false },
+    );
     try {
-      for await (const _ of manager.streamAgent(claudeAgent.id, "edit test.txt")) {
-        // drain
-      }
+      const shell = manager.runAgent(claudeAgent.id, "echo hello");
+      await manager.respondToPermission(claudeAgent.id, await shellPermission.promise, {
+        behavior: "allow",
+      });
+      await expect(shell).resolves.toMatchObject({ canceled: false });
+      await manager.runAgent(claudeAgent.id, "edit test.txt");
     } finally {
+      unsubscribeShell();
       unsubscribe();
     }
-    expect(surfacedPermissions).toEqual([]);
+    expect(surfacedPermissions).toEqual(["Bash"]);
     expect(manager.getAgent(claudeAgent.id)?.pendingPermissions.size).toBe(0);
 
     const catalog = createPaseoToolCatalog({
@@ -1333,12 +1459,11 @@ it("enforces Claude Main Control disallowedTools, auto-denies write permissions,
     );
     expect(launchedConfigs.get("claude")?.at(-1)?.providerOptions?.disallowedTools).toEqual([
       "WebFetch",
-      "Bash",
     ]);
 
     await manager.setAgentMainControl(claudeAgent.id, false);
     const restoredLaunch = launchedConfigs.get("claude")?.at(-1);
-    expect(restoredLaunch?.providerOptions?.disallowedTools).toEqual(["WebFetch", "Bash"]);
+    expect(restoredLaunch?.providerOptions?.disallowedTools).toEqual(["WebFetch"]);
     expect(restoredLaunch?.daemonAppendSystemPrompt).toBeUndefined();
     expect(manager.getAgent(claudeAgent.id)?.currentModeId).toBe("default");
     expect((await storage.get(claudeAgent.id))?.labels).toEqual({});

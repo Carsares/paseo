@@ -12,8 +12,7 @@ import {
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
-import type { AgentPermissionRequest, AgentSessionConfig } from "./agent-sdk-types.js";
-import { OpenCodeProviderOptionsSchema } from "./providers/opencode/options.js";
+import type { AgentPermissionRequest } from "./agent-sdk-types.js";
 
 export const MAX_SUBAGENT_DEPTH = 2;
 export const MAIN_CONTROL_WRITE_DENIAL = "Main Control agents are read-only.";
@@ -237,32 +236,23 @@ const MAIN_CONTROL_DISABLED_TOOLS = [
   "start_workspace_script",
   "stop_workspace_script",
 ];
-const MAIN_CONTROL_CLAUDE_DENIED_TOOLS = ["Edit", "MultiEdit", "Write", "NotebookEdit", "Bash"];
-const OPENCODE_NON_WRITE_PERMISSIONS = [
-  "read",
-  "glob",
-  "grep",
-  "list",
-  "task",
-  "external_directory",
-  "question",
-  "webfetch",
-  "websearch",
-  "codesearch",
-  "repo_clone",
-  "repo_overview",
-  "lsp",
-  "doom_loop",
-  "skill",
-] as const;
+
+// COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+export function getLegacyMainControlPriorMode(
+  mode: string | null | undefined,
+  labels: HierarchyAgent["labels"],
+): string | null {
+  return isMainControlAgentLabels(labels) && mode === "read-only"
+    ? getMainPriorModeIdFromLabels(labels)
+    : null;
+}
 
 export function resolveInheritedHierarchyMode(
   mode: string | null | undefined,
   labels: HierarchyAgent["labels"],
 ): string | null | undefined {
-  return isMainControlAgentLabels(labels) && mode === "read-only"
-    ? getMainPriorModeIdFromLabels(labels)
-    : mode;
+  // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+  return getLegacyMainControlPriorMode(mode, labels) ?? mode;
 }
 
 const LEVEL_TWO_DISABLED_TOOLS = [
@@ -295,94 +285,10 @@ export function applyHierarchyPaseoToolPolicy(
   };
 }
 
-function resolveOpenCodePermissionRules(rawPermission: unknown): Record<string, unknown> {
-  if (typeof rawPermission === "string") {
-    return Object.fromEntries(OPENCODE_NON_WRITE_PERMISSIONS.map((name) => [name, rawPermission]));
-  }
-  if (rawPermission && typeof rawPermission === "object" && !Array.isArray(rawPermission)) {
-    return rawPermission as Record<string, unknown>;
-  }
-  return {};
-}
-
-export function applyMainControlReadOnlyConfig(
-  config: AgentSessionConfig,
-  labels: HierarchyAgent["labels"],
-  provider = config.provider,
-): AgentSessionConfig {
-  if (!isMainControlAgentLabels(labels)) return config;
-  if (provider === "pi") {
-    return {
-      ...config,
-      providerOptions: { ...config.providerOptions, mainControlReadOnly: true },
-    };
-  }
-  if (provider === "codex") {
-    return {
-      ...config,
-      modeId: "read-only",
-      providerOptions: {
-        ...config.providerOptions,
-        sandbox_mode: "read-only",
-        approval_policy: "never",
-      },
-    };
-  }
-  if (provider === "claude") {
-    const existing = config.providerOptions?.disallowedTools;
-    return {
-      ...config,
-      providerOptions: {
-        ...config.providerOptions,
-        disallowedTools: [
-          ...new Set([
-            ...(Array.isArray(existing) ? existing : []),
-            ...MAIN_CONTROL_CLAUDE_DENIED_TOOLS,
-          ]),
-        ],
-      },
-    };
-  }
-  if (provider === "opencode") {
-    const parsed = OpenCodeProviderOptionsSchema.safeParse(config.providerOptions ?? {});
-    const rawPermission = parsed.success
-      ? parsed.data.permission
-      : config.providerOptions?.permission;
-    const rules = resolveOpenCodePermissionRules(rawPermission);
-    return {
-      ...config,
-      providerOptions: {
-        ...config.providerOptions,
-        auto_accept: false,
-        permission: {
-          ...rules,
-          edit: "deny",
-          bash: "deny",
-          todowrite: "deny",
-        },
-      },
-    };
-  }
-  if (config.providerOptions?.auto_accept === true) {
-    return {
-      ...config,
-      providerOptions: {
-        ...config.providerOptions,
-        auto_accept: false,
-      },
-    };
-  }
-  return config;
-}
-
 export function isMainControlWritePermissionBlocked(
   request: Pick<AgentPermissionRequest, "kind" | "name" | "detail">,
 ): boolean {
-  if (
-    request.detail?.type === "edit" ||
-    request.detail?.type === "write" ||
-    request.detail?.type === "shell"
-  ) {
+  if (request.detail?.type === "edit" || request.detail?.type === "write") {
     return true;
   }
   if (request.kind !== "tool") return false;
@@ -392,7 +298,7 @@ export function isMainControlWritePermissionBlocked(
     .toLowerCase()
     .split(/__|[./:]+/)
     .at(-1);
-  return /^(?:(?:multi_|notebook_)?edit|(?:file_|filesystem_|fs_)?(?:edit|write|patch)|(?:edit|write|patch|create|delete|remove|move|rename)_file|write_to_file|(?:multi_)?replace_file_content|replace|str_replace_editor|apply_patch|(?:codex_)?file_change|bash|shell|exec|run_command|execute_command|run_terminal_cmd|todo_?write)(?:_tool)?$/.test(
+  return /^(?:(?:multi_|notebook_)?edit|(?:file_|filesystem_|fs_)?(?:edit|write|patch)|(?:edit|write|patch|create|delete|remove|move|rename)_file|write_to_file|(?:multi_)?replace_file_content|replace|str_replace_editor|apply_patch|(?:codex_)?file_change|todo_?write)(?:_tool)?$/.test(
     name ?? "",
   );
 }

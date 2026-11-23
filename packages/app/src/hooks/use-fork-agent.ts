@@ -6,6 +6,7 @@ import type {
   DaemonClient,
 } from "@getpaseo/client/internal/daemon-client";
 import {
+  getMainPriorModeIdFromLabels,
   isMainControlAgent,
   PARENT_AGENT_ID_LABEL,
   type AgentLabelSource,
@@ -133,53 +134,36 @@ export function buildChatHistoryAttachment(input: {
   };
 }
 
-function buildForkDraftSetup(agent: ForkAgentSource): WorkspaceDraftTabSetup | undefined {
+function buildForkDraftSetup(
+  agent: ForkAgentSource & AgentLabelSource,
+): WorkspaceDraftTabSetup | undefined {
   if (!agent.provider) {
     return undefined;
   }
 
+  const currentMode = agent.currentModeId ?? agent.runtimeInfo?.modeId ?? null;
+  // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+  const priorMode = legacyMainControlPriorMode(agent, currentMode);
   return {
     provider: agent.provider,
     cwd: agent.cwd,
-    modeId: agent.currentModeId ?? agent.runtimeInfo?.modeId ?? null,
+    modeId: priorMode ?? currentMode,
     model: agent.model ?? agent.runtimeInfo?.model ?? null,
     thinkingOptionId: agent.thinkingOptionId ?? agent.runtimeInfo?.thinkingOptionId ?? null,
-    providerOptions: { ...agent.options },
+    providerOptions: {
+      ...(priorMode ? (agent.subagentDraftOptions ?? agent.options) : agent.options),
+    },
   };
 }
 
-const MAIN_CONTROL_CLAUDE_DISALLOWED_TOOLS = new Set([
-  "Edit",
-  "MultiEdit",
-  "Write",
-  "NotebookEdit",
-  "Bash",
-]);
-
-function stripMainControlReadOnlyProviderOptions(
-  providerOptions: Record<string, unknown>,
-): Record<string, unknown> {
-  const next: Record<string, unknown> = { ...providerOptions };
-  if (next.mainControlReadOnly === true) {
-    delete next.mainControlReadOnly;
-  }
-  if (next.sandbox_mode === "read-only") {
-    delete next.sandbox_mode;
-  }
-  if (next.approval_policy === "never") {
-    delete next.approval_policy;
-  }
-  if (Array.isArray(next.disallowedTools)) {
-    const remaining = next.disallowedTools.filter(
-      (tool) => typeof tool !== "string" || !MAIN_CONTROL_CLAUDE_DISALLOWED_TOOLS.has(tool),
-    );
-    if (remaining.length > 0) {
-      next.disallowedTools = remaining;
-    } else {
-      delete next.disallowedTools;
-    }
-  }
-  return next;
+// COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+function legacyMainControlPriorMode(
+  agent: AgentLabelSource,
+  currentMode: string | null,
+): string | null {
+  return isMainControlAgent(agent) && currentMode === "read-only"
+    ? getMainPriorModeIdFromLabels(agent.labels)
+    : null;
 }
 
 export function buildMainSubagentTabDraftSetup(input: {
@@ -208,9 +192,19 @@ export function buildSubagentDraftSetup(
   preferredProvider?: string,
 ): WorkspaceDraftTabSetup | undefined {
   const isMainControl = isMainControlAgent(agent);
+  // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
+  const priorMode = legacyMainControlPriorMode(
+    agent,
+    agent.currentModeId ?? agent.runtimeInfo?.modeId ?? null,
+  );
   const hasSafeInheritedOptions =
-    agent.subagentDraftOptions || agent.provider === "codex" || agent.provider === "claude";
-  if (isMainControl && (preferredProvider || !hasSafeInheritedOptions)) {
+    agent.subagentDraftOptions ||
+    priorMode ||
+    agent.provider === "codex" ||
+    agent.provider === "claude";
+  const usePreferredDefaults =
+    preferredProvider && (!priorMode || preferredProvider !== agent.provider);
+  if (isMainControl && (usePreferredDefaults || !hasSafeInheritedOptions)) {
     return buildMainSubagentTabDraftSetup({
       mainAgent: agent,
       mainAgentId: parentAgentId,
@@ -221,22 +215,13 @@ export function buildSubagentDraftSetup(
   if (!normalizedParentId) return undefined;
   const setup = buildForkDraftSetup(agent);
   if (!setup) return undefined;
-  if (!isMainControl) return { ...setup, parentAgentId: normalizedParentId };
-  const modeId = setup.modeId === "read-only" ? null : setup.modeId;
-  if (agent.subagentDraftOptions) {
-    return {
-      ...setup,
-      modeId,
-      parentAgentId: normalizedParentId,
-      providerOptions: agent.subagentDraftOptions,
-    };
-  }
-  // COMPAT(subagentDraftOptions): added in v0.16.0, remove after 2027-05-01.
   return {
     ...setup,
     parentAgentId: normalizedParentId,
-    modeId,
-    providerOptions: stripMainControlReadOnlyProviderOptions(setup.providerOptions),
+    // Use the configured settings when the host provides them. A value in the
+    // effective options can also be an explicit restriction chosen by the user.
+    providerOptions:
+      (isMainControl ? agent.subagentDraftOptions : undefined) ?? setup.providerOptions,
   };
 }
 

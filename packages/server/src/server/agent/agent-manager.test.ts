@@ -34,16 +34,13 @@ import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { projectTimelineRows } from "./timeline-projection.js";
 import {
   getOpenAgentTabLabel,
+  MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
   PARENT_SERVER_ID_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
-import {
-  isMainControlWritePermissionBlocked,
-  MAIN_CONTROL_WRITE_DENIAL,
-  REMOTE_HIERARCHY_DEPTH_LABEL,
-} from "./hierarchy-policy.js";
+import { REMOTE_HIERARCHY_DEPTH_LABEL } from "./hierarchy-policy.js";
 import { AgentTurnBusyError, sendPreparedPromptToAgent, startAgentRun } from "./agent-prompt.js";
 import { StaleProviderSessionError } from "./stale-provider-session-error.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
@@ -6873,9 +6870,14 @@ test("detachAgent removes relationship lifecycle labels from a live agent and em
   expect(emittedLabels).toContainEqual({ team: "infra" });
 });
 
-test("OpenCode Main Control applies default non-write permissions and blocks runtime overrides", async () => {
+test("OpenCode Main Control preserves provider defaults and accepts option updates", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-opencode-main-"));
+  const applyOptions = vi.fn(async (_options: ProviderOptions) => {});
   const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig) {
+      return Object.assign(await super.createSession(config), { applyOptions });
+    }
+
     effectiveOptions(own?: ProviderOptions) {
       return mergeProviderOptions({ auto_accept: true, permission: "allow" }, own);
     }
@@ -6893,28 +6895,14 @@ test("OpenCode Main Control applies default non-write permissions and blocks run
     workspaceId: "workspace",
     labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
   });
-  expect(client.createdConfigs.at(-1)?.providerOptions).toMatchObject({
-    auto_accept: false,
-    permission: { read: "allow", grep: "allow", edit: "deny", bash: "deny", todowrite: "deny" },
+  expect(client.createdConfigs.at(-1)?.providerOptions).toBeUndefined();
+  expect(manager.getAgent(agent.id)?.effectiveOptions).toMatchObject({
+    auto_accept: true,
+    permission: "allow",
   });
-  await expect(manager.setAgentOptions(agent.id, { auto_accept: true })).rejects.toThrow(
-    MAIN_CONTROL_WRITE_DENIAL,
-  );
-  await expect(manager.setAgentOptions(agent.id, { permission: null })).rejects.toThrow(
-    MAIN_CONTROL_WRITE_DENIAL,
-  );
-  for (const name of [
-    "Bash",
-    "shell",
-    "exec",
-    "run-command",
-    "executeCommand",
-    "run_terminal_cmd",
-    "TodoWrite",
-  ]) {
-    expect(isMainControlWritePermissionBlocked({ name, kind: "tool" })).toBe(true);
-  }
-  expect(isMainControlWritePermissionBlocked({ name: "Read", kind: "tool" })).toBe(false);
+  await manager.setAgentOptions(agent.id, { auto_accept: false });
+  expect(applyOptions).toHaveBeenCalledWith({ auto_accept: false });
+  expect(manager.getAgent(agent.id)?.config.providerOptions).toEqual({ auto_accept: false });
   await expect(
     manager.updateAgentMetadata(agent.id, {
       labels: { [PARENT_SERVER_ID_LABEL]: "forged" },
@@ -6949,8 +6937,15 @@ test.each(["Original instructions", "", undefined])(
     await manager.closeAgent(next.id);
     manager.setMainControlAppendSystemPrompt(originalPrompt ?? "");
     const oldMain = await manager.setAgentMainControl(old.id, true);
-    if (originalPrompt === undefined) {
-      await storage.upsert({ ...oldMain.record, mainControlSystemPrompt: undefined });
+    const isLegacy = originalPrompt === undefined;
+    if (isLegacy) {
+      await storage.upsert({
+        ...oldMain.record,
+        labels: { ...oldMain.record.labels, [MAIN_PRIOR_MODE_ID_LABEL]: "workspace-write" },
+        config: { ...oldMain.record.config, modeId: "read-only" },
+        lastModeId: "read-only",
+        mainControlSystemPrompt: undefined,
+      });
     }
     manager.setMainControlAppendSystemPrompt("Updated instructions");
     const upsert = storage.upsert.bind(storage);
@@ -6966,8 +6961,13 @@ test.each(["Original instructions", "", undefined])(
       failPromotion.mockRestore();
     }
     expect(await storage.get(old.id)).toMatchObject({
-      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
-      lastModeId: "read-only",
+      labels: isLegacy
+        ? {
+            [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
+            [MAIN_PRIOR_MODE_ID_LABEL]: "workspace-write",
+          }
+        : { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+      lastModeId: isLegacy ? "read-only" : "workspace-write",
     });
     expect((await storage.get(old.id))?.mainControlSystemPrompt).toBe(originalPrompt);
     await manager.archiveSnapshot(old.id, new Date().toISOString());

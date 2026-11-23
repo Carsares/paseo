@@ -104,6 +104,7 @@ import { asInternals as castInternals, createStub } from "../../test-utils/class
 import { AgentManager } from "../agent-manager.js";
 import { AgentStorage } from "../agent-storage.js";
 import { buildProviderRegistry } from "../provider-registry.js";
+import { withRuntimePaseoMcpServer } from "../runtime-mcp-config.js";
 
 interface CollaborationModeRecord {
   name: string;
@@ -689,7 +690,10 @@ function codexAgentItem(text: string) {
 
 // An AgentManager over a real Codex provider whose every spawn gets a fresh fake
 // app-server serving `threads` from thread/read.
-function createReopenableCodexAgent(threads: Record<string, unknown[]>, registry?: AgentStorage) {
+function createReopenableCodexAgent(
+  threads: Record<string, unknown[]>,
+  options?: { registry?: AgentStorage; mcpBaseUrl?: string },
+) {
   const appServers: FakeCodexAppServer[] = [];
   const provider = new CodexAppServerAgentClient(createTestLogger(), undefined, {
     appServerProcess: createFakeCodexAppServerProcess(() => {
@@ -723,7 +727,7 @@ function createReopenableCodexAgent(threads: Record<string, unknown[]>, registry
   };
   const manager = new AgentManager({
     clients: { codex: client },
-    registry,
+    ...options,
     logger: createTestLogger(),
   });
   const agentId = "00000000-0000-4000-8000-000000000001";
@@ -1806,6 +1810,175 @@ describe("Codex app-server provider", () => {
     expect(turnStart).not.toHaveProperty("config.mcp_servers.hub.tools.reply");
   });
 
+  test("approves the injected Paseo MCP server in the normal Codex startup config", async () => {
+    const appServer = createFakeCodexAppServer();
+    const config = withRuntimePaseoMcpServer({
+      config: createConfig({
+        providerOptions: { sandbox_mode: "read-only", approval_policy: "never" },
+        mcpServers: { other: { type: "http", url: "https://example.com/mcp/agents" } },
+      }),
+      agentId: "agent-1",
+      mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+      mcpAuthToken: "cap-token",
+    });
+    const session = await createProviderWithFakeAppServer(appServer).createSession(config);
+
+    try {
+      await session.startTurn("use the injected Paseo tools");
+      const threadStart = appServer.requests().find((request) => request.method === "thread/start");
+      expect(threadStart?.params).toMatchObject({
+        config: {
+          approval_policy: "never",
+          sandbox_mode: "read-only",
+          mcp_servers: {
+            paseo: {
+              url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=agent-1",
+              http_headers: { Authorization: "Bearer cap-token" },
+              default_tools_approval_mode: "approve",
+            },
+          },
+        },
+      });
+      expect(threadStart?.params).toHaveProperty("config.mcp_servers.other", {
+        url: "https://example.com/mcp/agents",
+      });
+      await expect(appServer.waitForTurnStart()).resolves.toMatchObject({
+        sandboxPolicy: { type: "readOnly" },
+      });
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("resumes through AgentManager with default approval for the injected Paseo server", async () => {
+    const mcpBaseUrl = "http://127.0.0.1:6767/mcp/agents";
+    const codex = createReopenableCodexAgent({}, { mcpBaseUrl });
+
+    try {
+      await codex.manager.resumeAgentFromPersistence(
+        codex.handle,
+        {
+          ...codex.config,
+          providerOptions: { sandbox_mode: "read-only", approval_policy: "never" },
+        },
+        codex.agentId,
+      );
+      const appServer = codex.latestAppServer();
+      const resume = appServer.requests().find((request) => request.method === "thread/resume");
+      expect(resume?.params).toMatchObject({
+        config: {
+          approval_policy: "never",
+          sandbox_mode: "read-only",
+        },
+      });
+      expect(resume?.params).toHaveProperty("config.mcp_servers.paseo", {
+        url: `${mcpBaseUrl}?callerAgentId=${codex.agentId}`,
+        default_tools_approval_mode: "approve",
+      });
+    } finally {
+      await codex.close();
+    }
+  });
+
+  test("lets an explicit Paseo tool policy override the default in the Codex resume config", async () => {
+    const appServer = createFakeCodexAppServer();
+    const config = withRuntimePaseoMcpServer({
+      config: createConfig({
+        toolPolicy: {
+          preapproved: [{ kind: "mcp", server: "paseo", tool: "finish_execution" }],
+        },
+      }),
+      agentId: "agent-1",
+      mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+      mcpAuthToken: null,
+    });
+    const session = await createProviderWithFakeAppServer(appServer).resumeSession(
+      { sessionId: "saved-thread" },
+      config,
+    );
+
+    try {
+      const resume = appServer.requests().find((request) => request.method === "thread/resume");
+      expect(resume?.params).toHaveProperty("config.mcp_servers.paseo", {
+        url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=agent-1",
+        default_tools_approval_mode: "prompt",
+        enabled_tools: ["finish_execution"],
+        tools: { finish_execution: { approval_mode: "approve" } },
+      });
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("does not create a Paseo MCP config when no internal server is injected", async () => {
+    const appServer = createFakeCodexAppServer();
+    const session = await createProviderWithFakeAppServer(appServer).createSession(
+      createConfig({
+        providerOptions: { sandbox_mode: "read-only", approval_policy: "never" },
+      }),
+    );
+
+    try {
+      await session.startTurn("without Paseo tools");
+      const threadStart = appServer.requests().find((request) => request.method === "thread/start");
+      expect(threadStart?.params).toMatchObject({
+        config: { approval_policy: "never", sandbox_mode: "read-only" },
+      });
+      expect(threadStart?.params).not.toHaveProperty("config.mcp_servers");
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("does not autoapprove an authored Paseo server with the internal endpoint path", async () => {
+    const appServer = createFakeCodexAppServer();
+    const url = "https://example.com/mcp/agents";
+    const session = await createProviderWithFakeAppServer(appServer).createSession(
+      createConfig({ mcpServers: { paseo: { type: "http", url } } }),
+    );
+
+    try {
+      await session.startTurn("use the authored Paseo server");
+      const threadStart = appServer.requests().find((request) => request.method === "thread/start");
+      expect(threadStart?.params).toMatchObject({ config: { mcp_servers: { paseo: { url } } } });
+      expect(threadStart?.params).not.toHaveProperty(
+        "config.mcp_servers.paseo.default_tools_approval_mode",
+      );
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("does not restore a stale internal Paseo server from saved Codex metadata", async () => {
+    const appServer = createFakeCodexAppServer();
+    const session = await createProviderWithFakeAppServer(appServer).resumeSession(
+      {
+        sessionId: "saved-thread",
+        metadata: {
+          mcpServers: {
+            paseo: { type: "http", url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=old" },
+            custom: { type: "http", url: "https://example.com/mcp" },
+          },
+        },
+      },
+      createConfig(),
+    );
+
+    try {
+      const resume = appServer.requests().find((request) => request.method === "thread/resume");
+      expect(resume?.params).toHaveProperty("config.mcp_servers", {
+        custom: { url: "https://example.com/mcp" },
+      });
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
   test("passes ephemeral: true to thread/start when constructed as ephemeral", async () => {
     const requests: Array<{ method: string; params: unknown }> = [];
     const fakeClient: CodexClientLike = {
@@ -2562,7 +2735,7 @@ describe("Codex app-server provider", () => {
     mkdirSync(artifactDir, { recursive: true });
     const dir = await mkdtemp(path.join(artifactDir, "codex-receipt-"));
     const storage = new AgentStorage(dir, createTestLogger());
-    const codex = createReopenableCodexAgent({}, storage);
+    const codex = createReopenableCodexAgent({}, { registry: storage });
     try {
       let handle = codex.handle;
       for (let i = 0; i < 3; i++) {

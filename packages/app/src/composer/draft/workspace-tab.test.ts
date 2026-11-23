@@ -68,6 +68,7 @@ vi.mock("@/stores/session-store-hooks", async (importOriginal) => ({
 vi.mock("@/subagents/parent", () => ({ ParentAgentPill: () => null }));
 vi.mock("lucide-react-native", async (importOriginal) => ({
   ...(await importOriginal<typeof import("lucide-react-native")>()),
+  AlertCircle: () => null,
   TextQuote: () => null,
 }));
 
@@ -604,7 +605,7 @@ describe("workspace subagent draft", () => {
     expect(retry).toEqual(secondFork);
   });
 
-  test("resets read-only mode and Main Control restrictions when spawning from Main Control", () => {
+  test("inherits the selected read-only mode and saved options when spawning from Main Control", () => {
     const mainCodexSetup = buildSubagentDraftSetup(
       {
         provider: "codex",
@@ -624,10 +625,14 @@ describe("workspace subagent draft", () => {
     expect(mainCodexSetup).toEqual({
       provider: "codex",
       cwd: "/tmp/project",
-      modeId: null,
+      modeId: "read-only",
       model: "gpt-5",
       thinkingOptionId: "high",
-      providerOptions: { service_tier: "priority" },
+      providerOptions: {
+        sandbox_mode: "read-only",
+        approval_policy: "never",
+        service_tier: "priority",
+      },
       parentAgentId: "main-1",
     });
 
@@ -645,7 +650,9 @@ describe("workspace subagent draft", () => {
       },
       "main-2",
     );
-    expect(mainClaudeSetup?.providerOptions).toEqual({ disallowedTools: ["WebFetch"] });
+    expect(mainClaudeSetup?.providerOptions).toEqual({
+      disallowedTools: ["WebFetch", "Edit", "MultiEdit", "Write", "NotebookEdit", "Bash"],
+    });
 
     const regularReadOnlySetup = buildSubagentDraftSetup(
       {

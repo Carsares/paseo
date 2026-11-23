@@ -147,6 +147,11 @@ import {
   CodexProviderOptionsSchema,
   type CodexProviderOptions,
 } from "./codex/options.js";
+import {
+  isRuntimePaseoMcpServer,
+  PASEO_MCP_SERVER_NAME,
+  stripInternalPaseoMcpServer,
+} from "../runtime-mcp-config.js";
 
 function assertChildWithPipes(
   child: ChildProcess,
@@ -962,6 +967,7 @@ interface CodexMcpServerConfig {
   args?: string[];
   env?: Record<string, string>;
   tool_timeout_sec?: number;
+  default_tools_approval_mode?: "approve" | "prompt";
 }
 
 function toCodexMcpConfig(config: McpServerConfig): CodexMcpServerConfig {
@@ -6387,7 +6393,11 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (this.config.mcpServers) {
       const mcpServers: Record<string, CodexMcpServerConfig> = {};
       for (const [name, serverConfig] of Object.entries(this.config.mcpServers)) {
-        mcpServers[name] = toCodexMcpConfig(serverConfig);
+        const codexServerConfig = toCodexMcpConfig(serverConfig);
+        mcpServers[name] =
+          name === PASEO_MCP_SERVER_NAME && isRuntimePaseoMcpServer(serverConfig)
+            ? { ...codexServerConfig, default_tools_approval_mode: "approve" }
+            : codexServerConfig;
       }
       innerConfig.mcp_servers = mcpServers;
     }
@@ -8641,12 +8651,13 @@ export class CodexAppServerAgentClient implements AgentClient {
     launchContext?: AgentLaunchContext,
     options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
-    const storedConfig = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
+    const metadata = (handle.metadata ?? {}) as Partial<AgentSessionConfig>;
+    const cwd = overrides?.cwd ?? metadata.cwd ?? process.cwd();
     const merged: AgentSessionConfig = {
-      ...storedConfig,
+      ...stripInternalPaseoMcpServer({ ...metadata, provider: CODEX_PROVIDER, cwd }),
       ...overrides,
       provider: CODEX_PROVIDER,
-      cwd: overrides?.cwd ?? storedConfig.cwd ?? process.cwd(),
+      cwd,
     };
     const goalsEnabled = await this.resolveGoalsEnabled();
     const autoReviewEnabled = await this.resolveAutoReviewEnabled();

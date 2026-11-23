@@ -2,6 +2,11 @@ import type { AgentSessionConfig, McpServerConfig } from "./agent-sdk-types.js";
 
 export const PASEO_MCP_SERVER_NAME = "paseo";
 const PASEO_MCP_PATHNAME = "/mcp/agents";
+const runtimePaseoMcpServers = new WeakSet<McpServerConfig>();
+
+export function isRuntimePaseoMcpServer(config: McpServerConfig): boolean {
+  return runtimePaseoMcpServers.has(config);
+}
 
 export function stripInternalPaseoMcpServer(config: AgentSessionConfig): AgentSessionConfig {
   const mcpServers = config.mcpServers;
@@ -10,7 +15,10 @@ export function stripInternalPaseoMcpServer(config: AgentSessionConfig): AgentSe
   }
 
   const paseoServer = mcpServers[PASEO_MCP_SERVER_NAME];
-  if (!paseoServer || !isInternalPaseoMcpServer(paseoServer)) {
+  if (
+    !paseoServer ||
+    (!isRuntimePaseoMcpServer(paseoServer) && !hasLegacyPaseoMcpPath(paseoServer))
+  ) {
     return config;
   }
 
@@ -42,22 +50,24 @@ export function withRuntimePaseoMcpServer(params: {
     return storedConfig;
   }
 
+  // Trust only the object produced by this injection. Keep the shared provider
+  // config serializable and don't grant approvals based on its name or URL.
+  const runtimeServer: McpServerConfig = {
+    type: "http",
+    url: `${params.mcpBaseUrl}?callerAgentId=${params.agentId}`,
+    ...(params.mcpAuthToken ? { headers: { Authorization: `Bearer ${params.mcpAuthToken}` } } : {}),
+  };
+  runtimePaseoMcpServers.add(runtimeServer);
   return {
     ...storedConfig,
     mcpServers: {
-      [PASEO_MCP_SERVER_NAME]: {
-        type: "http",
-        url: `${params.mcpBaseUrl}?callerAgentId=${params.agentId}`,
-        ...(params.mcpAuthToken
-          ? { headers: { Authorization: `Bearer ${params.mcpAuthToken}` } }
-          : {}),
-      },
+      [PASEO_MCP_SERVER_NAME]: runtimeServer,
       ...storedConfig.mcpServers,
     },
   };
 }
 
-function isInternalPaseoMcpServer(config: McpServerConfig): boolean {
+function hasLegacyPaseoMcpPath(config: McpServerConfig): boolean {
   if (config.type !== "http" && config.type !== "sse") {
     return false;
   }

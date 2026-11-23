@@ -256,27 +256,25 @@ test("a remote create without a caller agent leaves its mode to the host", async
   expect(await forwardedMode(null)).toBeUndefined();
 });
 
-test("a Main Control caller forwards its prior mode instead of read-only to a remote child", async () => {
-  expect(
-    await forwardedMode({
-      ...visibleCodexCaller,
-      currentModeId: "read-only",
-      labels: {
-        [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
-        [MAIN_PRIOR_MODE_ID_LABEL]: "full-access",
-      },
-    }),
-  ).toBe("full-access");
-  expect(
-    await forwardedMode({
-      ...visibleCodexCaller,
-      currentModeId: "read-only",
-      labels: {
-        [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
-      },
-    }),
-  ).toBeUndefined();
-});
+test.each([
+  { currentModeId: "read-only", priorMode: "full-access", expected: "full-access" },
+  { currentModeId: "workspace-write", priorMode: "full-access", expected: "workspace-write" },
+  { currentModeId: "read-only", priorMode: null, expected: "read-only" },
+])(
+  "a remote child inherits $expected from a Main Control caller",
+  async ({ currentModeId, priorMode, expected }) => {
+    expect(
+      await forwardedMode({
+        ...visibleCodexCaller,
+        currentModeId,
+        labels: {
+          [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
+          ...(priorMode ? { [MAIN_PRIOR_MODE_ID_LABEL]: priorMode } : {}),
+        },
+      }),
+    ).toBe(expected);
+  },
+);
 
 async function forwardedWorktreeSource(args: Record<string, unknown>) {
   const { client, socket } = await olderHost();

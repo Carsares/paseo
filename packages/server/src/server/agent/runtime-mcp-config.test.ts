@@ -48,4 +48,23 @@ describe("withRuntimePaseoMcpServer", () => {
 
     expect(result.mcpServers).toBeUndefined();
   });
+
+  test("keeps an authored paseo server from being treated as the internal server", () => {
+    const result = withRuntimePaseoMcpServer({
+      config: {
+        ...BASE_CONFIG,
+        mcpServers: {
+          paseo: { type: "http", url: "http://127.0.0.1/custom-paseo" },
+        },
+      },
+      agentId: "agent-1",
+      mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+      mcpAuthToken: "cap-token",
+    });
+
+    expect(result.mcpServers?.paseo).toEqual({
+      type: "http",
+      url: "http://127.0.0.1/custom-paseo",
+    });
+  });
 });
