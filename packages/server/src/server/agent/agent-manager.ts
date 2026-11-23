@@ -18,6 +18,7 @@ import {
   type AgentLifecycleStatus,
 } from "@getpaseo/protocol/agent-lifecycle";
 import {
+  EXPLICIT_PARENT_REPORTING,
   getMainPriorModeIdFromLabels,
   getParentAddressFromLabels,
   getParentAgentIdFromLabels,
@@ -28,6 +29,7 @@ import {
   isOpenAgentTabLabel,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
@@ -188,6 +190,8 @@ import {
 } from "../persistence-hooks.js";
 
 const HIERARCHY_SYSTEM_PROMPT_ADAPTERS = new Set(["claude", "codex", "opencode", "pi", "omp"]);
+// Retain the migrated pair so stale observers can be retired after a crash.
+const MIGRATED_REPORTING_PARENT_LABEL = "paseo.migrated-reporting-parent";
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
 const IMPORTABLE_SESSION_LIST_TIMEOUT_MS = 90_000;
@@ -2409,7 +2413,7 @@ export class AgentManager {
     const resolvedAgentId = validateAgentId(agentId, "createAgentFromRecord");
     return this.trackAgentRegistrationOperation(
       this.runLifecycleMutation(resolvedAgentId, async () => {
-        const record = await this.requireRegistry().get(resolvedAgentId);
+        const record = await this.readRecordForAgentOpen(resolvedAgentId);
         if (!record) throw new AgentNotFoundError(resolvedAgentId);
         const config = buildSessionConfig(record, {
           validProviders: this.getRegisteredProviderIds(),
@@ -2649,7 +2653,7 @@ export class AgentManager {
     // have read the record before a queued archive or restore completed. Residency is
     // settled before the config is prepared, because a history load reads an archived
     // agent whose working directory may be gone.
-    const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
+    const record = await this.readRecordForAgentOpen(resolvedAgentId);
     const purpose = await resolveResumePurpose(record, resumeOptions?.purpose, mergedConfig.cwd);
     const currentResumeOptions = { purpose } satisfies AgentResumeSessionOptions;
 
@@ -4029,6 +4033,92 @@ export class AgentManager {
       const agent = this.requireAgent(agentId);
       await this.writeLabels(agent.id, labels);
     });
+  }
+
+  /** Returns the local parent whose old automatic observations need retirement. */
+  async convergeLegacyParentReporting(
+    agentId: string,
+    humanPrompt = false,
+  ): Promise<string | null> {
+    return this.runLifecycleMutation(agentId, async () =>
+      this.convergeLegacyParentReportingUnlocked(
+        agentId,
+        (await this.registry?.get(agentId)) ?? null,
+        humanPrompt,
+      ),
+    );
+  }
+
+  private async readRecordForAgentOpen(agentId: string): Promise<StoredAgentRecord | null> {
+    if (!this.registry) return null;
+    const record = await this.registry.get(agentId);
+    if (await this.convergeLegacyParentReportingUnlocked(agentId, record, false)) {
+      return (await this.registry.get(agentId)) ?? record;
+    }
+    return record;
+  }
+
+  private async isActiveLocalMainControl(parentId: string): Promise<boolean> {
+    const stored = await this.registry?.get(parentId);
+    if (stored?.archivedAt) return false;
+    const labels = this.agents.get(parentId)?.labels ?? stored?.labels;
+    return isMainControlAgentLabels(labels) && !getParentAgentIdFromLabels(labels);
+  }
+
+  private async convergeLegacyParentReportingUnlocked(
+    agentId: string,
+    record: StoredAgentRecord | null,
+    humanPrompt: boolean,
+  ): Promise<string | null> {
+    if (!record || record.archivedAt || record.internal) return null;
+    const live = this.agents.get(agentId);
+    const labels = live?.labels ?? record.labels;
+    const parentId = this.localHierarchyParentId(labels);
+    if (!parentId || parentId === agentId) return null;
+    if (isExplicitParentReportingLabels(labels)) {
+      return labels[MIGRATED_REPORTING_PARENT_LABEL] === parentId ? parentId : null;
+    }
+    if (labels[PARENT_REPORTING_LABEL] !== undefined) return null;
+    if (!(await this.isActiveLocalMainControl(parentId))) return null;
+    if (!humanPrompt && !(await this.hasLegacyHumanChildEvidence(record))) return null;
+
+    const patch = {
+      [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+      [MIGRATED_REPORTING_PARENT_LABEL]: parentId,
+    };
+    const { record: updated } = await this.commitAgentParent(agentId, labels, patch, undefined);
+    if (live) {
+      this.markHierarchySessionForRefresh(live);
+    } else {
+      this.dispatchStoredAgentState(updated);
+    }
+    return parentId;
+  }
+
+  private async hasLegacyHumanChildEvidence(record: StoredAgentRecord): Promise<boolean> {
+    const prefix = await this.timelinePrefixes.load(record.id);
+    // A prefix without a provider-switch commit comes from the session fork request.
+    if (prefix && !record.timelinePrefixSwitchId) return true;
+
+    // MCP prompts project as agent-message tool calls. Recovery and provider-only
+    // history can have user rows, but do not have a local submitted-message identity.
+    const sealedThrough = prefix ? maxTimelineSeq(prefix.rows) : 0;
+    const isOwnSubmittedUserMessage = ({ seq, item }: AgentTimelineRow) =>
+      seq > sealedThrough &&
+      item.type === "user_message" &&
+      item.clientMessageId !== undefined &&
+      item.messageId === item.clientMessageId;
+    if (
+      this.timelineStore.has(record.id) &&
+      this.timelineStore.getRows(record.id).some(isOwnSubmittedUserMessage)
+    )
+      return true;
+    await this.durableTimelineWriteTails.get(record.id);
+    return (
+      (await this.durableTimelineStore?.getCommittedRows(record.id))?.some(
+        isOwnSubmittedUserMessage,
+      ) ?? false
+    );
   }
 
   /** Applies a plugin-metadata patch (null removes a key) and returns the stored result. */
@@ -6958,6 +7048,11 @@ export class AgentManager {
         if (!agent) return;
         try {
           await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
+          await this.convergeLegacyParentReportingUnlocked(
+            agentId,
+            (await this.registry?.get(agentId)) ?? null,
+            false,
+          );
         } catch (error) {
           // Some temporary readers (such as Pi) shut down when history exits.
           // Discard a failed reader so the next load can open a fresh one.

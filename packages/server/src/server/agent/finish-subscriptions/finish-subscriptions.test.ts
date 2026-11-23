@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import type { DaemonClient, WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
-import type { AgentMessageDelivery } from "../agent-messages/index.js";
+import { createAgentMessageDelivery, type AgentMessageDelivery } from "../agent-messages/index.js";
 import { buildStoredAgentPayload } from "../agent-projections.js";
 import { registerParentFinishSubscription } from "../create-agent/create.js";
 import { MessageReceipts } from "../../message-receipts/index.js";
@@ -64,6 +64,9 @@ class Delivery implements AgentMessageDelivery {
   }
   async close() {}
   async waitForDispatch() {}
+  withdrawPending() {
+    return 0;
+  }
 }
 const homes: string[] = [];
 const services: FinishSubscriptions[] = [];
@@ -313,7 +316,7 @@ test.each(["finished", "permission-required"] as const)(
     const registration = await registerParentFinishSubscription({
       agentId: pair.childAgentId,
       serverId: "origin",
-      agentManager: { getAgent: () => null },
+      agentManager: { getAgent: () => null, convergeLegacyParentReporting: async () => null },
       agentStorage: {
         get: async (id) => ({
           id,
@@ -602,6 +605,162 @@ test("coalesced unconditional follow-up survives detachment of a parent-owned cr
   detached.final!.labels = {};
   restarted.observation.waits[0]!.result.resolve(detached);
   await until(() => restarted.delivery.prompts.length === 1);
+});
+
+test("retiring automatic observations withdraws a queued notification and preserves explicit watches", async () => {
+  const home = await mkdtemp(join(tmpdir(), "finish-retire-"));
+  homes.push(home);
+  const durable = createJsonFinishSubscriptionStore(home);
+  const old = { ...intent, id: "automatic-parent:old-watch", requireParentOwnership: true };
+  const unrelated = { ...old, id: "other-watch", childAgentId: "other-child" };
+  const formerParent = {
+    ...old,
+    id: "automatic-parent:other-parent",
+    callerAgentId: "other-parent",
+  };
+  const remoteChild = { ...old, id: "automatic-parent:remote-child", serverId: "other-host" };
+  await durable.put(old);
+  const firstDispatch = Promise.withResolvers<void>();
+  const queue = createAgentMessageDelivery({
+    schedule: () => () => {},
+    dispatch: async () => {
+      firstDispatch.resolve();
+      return "turn_started";
+    },
+    onError: vi.fn(),
+  });
+  const observation = new Observation();
+  let failRemoval = true;
+  const service = createFinishSubscriptions({
+    store: {
+      ...durable,
+      remove: async (id) => {
+        if (failRemoval && id === old.id) throw new Error("Cannot remove old watch");
+        await durable.remove(id);
+      },
+    },
+    messages: () => queue,
+    open: observation.open.bind(observation),
+    callerIsActive: async () => true,
+    serverId: "origin",
+    logger: createTestLogger(),
+  });
+  services.push(service);
+  await service.start();
+  try {
+    await until(() => observation.waits.length === 1);
+    observation.waits[0]!.result.resolve(outcome("idle"));
+    await until(() => queue.hasPending(intent.callerAgentId));
+    const explicit = await service.register({ ...intent, requireParentOwnership: true }, true);
+    await service.register({ ...unrelated, automaticParent: true }, true);
+    await durable.put(formerParent);
+    await durable.put(remoteChild);
+
+    await expect(
+      service.cancelAutomaticParent(intent.childAgentId, intent.callerAgentId),
+    ).rejects.toThrow("Cannot remove old watch");
+    expect(queue.hasPending(intent.callerAgentId)).toBe(false);
+    expect(observation.waits[0]!.signal.aborted).toBe(true);
+
+    failRemoval = false;
+    await service.cancelAutomaticParent(intent.childAgentId, intent.callerAgentId);
+    const saved = await durable.list();
+    expect(saved).toEqual([
+      expect.objectContaining(intent),
+      expect.objectContaining({ childAgentId: unrelated.childAgentId }),
+      formerParent,
+      remoteChild,
+    ]);
+    expect(saved.some(({ id }) => id === old.id)).toBe(false);
+
+    explicit.accept();
+    await until(() => observation.waits.length === 2);
+    observation.waits[1]!.result.resolve(outcome("idle"));
+    await until(() => queue.hasPending(intent.callerAgentId));
+    await queue.close();
+    await firstDispatch.promise;
+  } finally {
+    await service.close();
+    await queue.close();
+  }
+});
+
+test("retiring automatic observations keeps a restored watch with no recorded source", async () => {
+  const first = await scenario();
+  const legacy = { ...intent, id: "legacy-watch", requireParentOwnership: true };
+  await first.store.put(legacy);
+  await first.service.close();
+  const restarted = await scenario(first.home);
+  await until(() => restarted.observation.waits.length === 1);
+  await restarted.service.cancelAutomaticParent(intent.childAgentId, intent.callerAgentId);
+  expect(await restarted.store.list()).toEqual([legacy]);
+  restarted.observation.waits[0]!.result.resolve(outcome("idle"));
+  await until(() => restarted.delivery.prompts.length === 1);
+  restarted.delivery.acknowledgments[0]!.resolve("steered");
+  await expect.poll(async () => await restarted.store.list()).toEqual([]);
+});
+
+test.each([false, true])(
+  "an accepted automatic replacement carries forward a requested observation (pending: %s)",
+  async (pending) => {
+    const state = await scenario();
+    const owned = { ...intent, requireParentOwnership: true };
+    const registration = await state.service.register(owned, pending);
+    const requested = (await state.store.list())[0]!;
+    if (!pending) await until(() => state.observation.waits.length === 1);
+    await state.service.register({ ...owned, automaticParent: true });
+    registration.accept();
+    await state.service.cancelAutomaticParent(intent.childAgentId, intent.callerAgentId);
+    expect(await state.store.list()).toEqual([requested]);
+    await until(() => state.observation.waits.some(({ signal }) => !signal.aborted));
+    const current = state.observation.waits.find(({ signal }) => !signal.aborted)!;
+    current.result.resolve(outcome("idle"));
+    await until(() => state.delivery.prompts.length === 1);
+    state.delivery.acknowledgments[0]!.resolve("steered");
+    await expect.poll(async () => await state.store.list()).toEqual([]);
+  },
+);
+
+test("reporting migration prevents an automatic registration that is writing to disk", async () => {
+  const home = await mkdtemp(join(tmpdir(), "finish-retire-concurrent-"));
+  homes.push(home);
+  const durable = createJsonFinishSubscriptionStore(home);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const observation = new Observation();
+  let explicit = false;
+  const service = createFinishSubscriptions({
+    store: {
+      ...durable,
+      put: async (record) => {
+        entered.resolve();
+        await release.promise;
+        await durable.put(record);
+      },
+    },
+    messages: () => new Delivery(),
+    open: observation.open.bind(observation),
+    callerIsActive: async () => true,
+    serverId: "origin",
+    logger: createTestLogger(),
+  });
+  services.push(service);
+  await service.start();
+  const registration = service.register({
+    ...intent,
+    requireParentOwnership: true,
+    automaticParent: true,
+    canRegister: () => !explicit,
+  });
+  await entered.promise;
+  explicit = true;
+  const retired = service.cancelAutomaticParent(intent.childAgentId, intent.callerAgentId);
+  release.resolve();
+  (await registration).accept();
+  await retired;
+  expect(observation.openedSignals).toHaveLength(0);
+  expect(await durable.list()).toEqual([]);
+  expect(service.hasPendingForCaller(intent.callerAgentId)).toBe(false);
 });
 
 test.each([{}, { "paseo.parent-agent-id": "new-parent" }])(

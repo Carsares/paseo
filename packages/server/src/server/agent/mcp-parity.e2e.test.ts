@@ -11,9 +11,14 @@ import { AGENT_WAIT_TIMEOUT_MS } from "./mcp-shared.js";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import type { AgentClient, AgentProvider, AgentSessionConfig } from "./agent-sdk-types.js";
-import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  EXPLICIT_PARENT_REPORTING,
+  PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { parseAgentMessage } from "./agent-messages/index.js";
+import { createJsonFinishSubscriptionStore } from "./finish-subscriptions/index.js";
 
 interface StructuredContent {
   [key: string]: unknown;
@@ -1307,6 +1312,7 @@ describe("Suite E: Workspace Tools", () => {
         },
       }),
     });
+
     const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
     let mcp: McpClient | undefined;
     try {
@@ -1375,4 +1381,186 @@ describe("Suite E: Workspace Tools", () => {
       await daemon.close();
     }
   }, 30_000);
+
+  test.each([undefined, "auto"] as const)(
+    "Main Control receives MCP completion with reporting option %s and only unlabeled children can be taken over",
+    async (parentReporting) => {
+      const daemon = await createTestPaseoDaemon();
+      const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+      let scoped: McpClient | undefined;
+      try {
+        await client.connect();
+        const main = await client.createAgent({
+          provider: "codex",
+          cwd: daemon.staticDir,
+          modeId: "full-access",
+          title: "Delegating main",
+        });
+        await client.setAgentMainControl(main.id, true);
+        scoped = await createMcpClient(
+          buildExpectedAgentMcpUrl({ host: "127.0.0.1", port: daemon.port, agentId: main.id }),
+        );
+        const created = await callToolStructured(scoped, "create_agent", {
+          relationship: { kind: "subagent" },
+          workspace: { kind: "current" },
+          provider: "codex/gpt-5.4",
+          title: "Automatic child",
+          initialPrompt: "Finish the delegation",
+          ...(parentReporting ? { parentReporting, notifyOnFinish: true } : {}),
+        });
+        const childId = str(created.agentId);
+        const { agentManager, agentStorage } = daemon.daemon;
+        const finished = () =>
+          agentManager
+            .getTimeline(main.id)
+            .filter(
+              (item) =>
+                item.type === "tool_call" &&
+                item.agentMessage?.sender.id === childId &&
+                item.agentMessage.event === "finished",
+            );
+        await waitFor({
+          timeoutMs: 10000,
+          label: "MCP delegation completion",
+          check: () => (finished().length === 1 ? true : null),
+        });
+        expect((await agentStorage.get(childId))?.labels[PARENT_REPORTING_LABEL]).toBe(
+          parentReporting,
+        );
+        await client.sendAgentMessage(childId, "Continue with my instructions");
+        expect((await client.waitForFinish(childId, 5000)).status).toBe("idle");
+        expect((await agentStorage.get(childId))?.labels[PARENT_REPORTING_LABEL]).toBe(
+          parentReporting ?? EXPLICIT_PARENT_REPORTING,
+        );
+        if (parentReporting) {
+          await waitFor({
+            timeoutMs: 10000,
+            label: "automatic completion after direct input on an explicitly automatic child",
+            check: () => (finished().length === 2 ? true : null),
+          });
+        } else {
+          const watches = await createJsonFinishSubscriptionStore(daemon.paseoHome).list();
+          expect(watches).not.toContainEqual(expect.objectContaining({ childAgentId: childId }));
+        }
+      } finally {
+        await scoped?.close();
+        await client.close();
+        await daemon.close();
+      }
+    },
+  );
+
+  test("a legacy user fork receives its own delegate's finish and reports upward only explicitly", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paseo-reporting-upgrade-"));
+    const start = () =>
+      createTestPaseoDaemon({
+        paseoHomeRoot: root,
+        staticDir: root,
+        cleanup: false,
+      });
+    let daemon: TestPaseoDaemon | undefined;
+    let client: DaemonClient | undefined;
+    let scoped: McpClient | undefined;
+    try {
+      daemon = await start();
+      client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+      await client.connect();
+      const config = { provider: "codex", cwd: root, modeId: "full-access" };
+      const main = await client.createAgent({ ...config, title: "Reporting main" });
+      await client.setAgentMainControl(main.id, true);
+      const legacy = await daemon.daemon.agentManager.createAgent(
+        { ...config, title: "Legacy user fork" },
+        undefined,
+        {
+          workspaceId: main.workspaceId ?? undefined,
+          labels: { [PARENT_AGENT_ID_LABEL]: main.id },
+          // The pre-upgrade fork saved inherited rows without a reporting label.
+          forkedTimelineRows: [],
+        },
+      );
+      expect((await daemon.daemon.agentStorage.get(legacy.id))?.labels).not.toHaveProperty(
+        PARENT_REPORTING_LABEL,
+      );
+      const legacyWatch = "automatic-parent:restored-watch";
+      const oldStore = createJsonFinishSubscriptionStore(daemon.paseoHome);
+      await oldStore.put({
+        id: legacyWatch,
+        callerAgentId: main.id,
+        childAgentId: legacy.id,
+        requireParentOwnership: true,
+      });
+      await client.close();
+      await daemon.close();
+
+      daemon = await start();
+      const current = daemon;
+      client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+      await client.connect();
+      scoped = await createMcpClient(
+        buildExpectedAgentMcpUrl({ host: "127.0.0.1", port: daemon.port, agentId: legacy.id }),
+      );
+      const grandchild = await client.createAgent({
+        ...config,
+        callerAgentId: legacy.id,
+        workspaceId: main.workspaceId,
+        title: "Automatic grandchild",
+        initialPrompt: "Finish this delegated step",
+        initialPromptOrigin: "agent",
+      });
+      const grandchildId = grandchild.id;
+      const messagesFrom = (recipientId: string, senderId: string) =>
+        current.daemon.agentManager.getAgent(recipientId)
+          ? current.daemon.agentManager
+              .getTimeline(recipientId)
+              .flatMap((item) =>
+                item.type === "tool_call" && item.agentMessage?.sender.id === senderId
+                  ? [item.agentMessage]
+                  : [],
+              )
+          : [];
+      await waitFor({
+        timeoutMs: 10000,
+        label: "grandchild's finish reaching the legacy child",
+        check: () =>
+          messagesFrom(legacy.id, grandchildId).some(({ event }) => event === "finished")
+            ? true
+            : null,
+      });
+      expect(
+        (await current.daemon.agentStorage.get(legacy.id))?.labels[PARENT_REPORTING_LABEL],
+      ).toBe(EXPLICIT_PARENT_REPORTING);
+      expect((await current.daemon.agentStorage.get(grandchildId))?.labels).not.toHaveProperty(
+        PARENT_REPORTING_LABEL,
+      );
+      expect(
+        (await createJsonFinishSubscriptionStore(current.paseoHome).list()).some(
+          ({ id }) => id === legacyWatch,
+        ),
+      ).toBe(false);
+      const report = await callToolStructured(scoped, "report_to_parent", {
+        status: "completed",
+        summary: "Here is the explicit result",
+      });
+      expect(report.success).toBe(true);
+      await waitFor({
+        timeoutMs: 10000,
+        label: "explicit report reaching Main Control",
+        check: () =>
+          messagesFrom(main.id, legacy.id).find(({ text }) =>
+            text.includes("Here is the explicit result"),
+          ) ?? null,
+      });
+      expect(messagesFrom(main.id, legacy.id)).toEqual([
+        expect.objectContaining({
+          event: "message",
+          text: expect.stringContaining("Here is the explicit result"),
+        }),
+      ]);
+    } finally {
+      await scoped?.close();
+      await client?.close();
+      await daemon?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

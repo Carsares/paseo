@@ -126,7 +126,6 @@ import {
   PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
   getParentAgentIdFromLabels,
-  isExplicitParentReportingLabels,
   isMainControlAgentLabels,
 } from "@getpaseo/protocol/agent-labels";
 import { applyRecordPatch } from "./record-patch.js";
@@ -525,6 +524,13 @@ function agentDirectoryArchiveOptions(request: AgentDirectoryRequestMessage): {
 }
 
 type CreateAgentRequestMessage = Extract<SessionInboundMessage, { type: "create_agent_request" }>;
+
+function isUserAgentCreation(request: CreateAgentRequestMessage): boolean {
+  return (
+    request.initialPromptOrigin === "user" ||
+    (request.initialPromptOrigin === undefined && request.forkFrom !== undefined)
+  );
+}
 
 interface ResolvedSessionCreateAgentIntent {
   config: AgentSessionConfig;
@@ -4296,6 +4302,7 @@ export class Session {
                   childAgentId: agentId,
                   callerAgentId: parentAgentId,
                   requireParentOwnership: true,
+                  automaticParent: true,
                 },
                 true,
               )
@@ -5533,6 +5540,8 @@ export class Session {
             agentManager: this.agentManager,
             agentStorage: this.agentStorage,
             finishSubscriptions: this.finishSubscriptions,
+            humanPrompt: true,
+            logger: this.sessionLogger,
           });
           await params.beforeDispatch?.();
         },
@@ -5995,6 +6004,7 @@ export class Session {
         throw new Error(`Working directory does not exist or is not a directory: ${resolvedCwd}`);
       }
 
+      const userCreation = isUserAgentCreation(msg);
       const { snapshot, liveSnapshot, initialPromptStarted } = await createAgentCommand(
         {
           serverId: this.serverId,
@@ -6021,7 +6031,7 @@ export class Session {
           initialPrompt,
           forkedTimelineRows,
           source:
-            msg.callerAgentId && msg.initialPromptOrigin !== "user"
+            msg.callerAgentId && !userCreation
               ? { kind: "agent-message", agentId: msg.callerAgentId }
               : undefined,
           clientMessageId,
@@ -6113,8 +6123,16 @@ export class Session {
         cwd: config.cwd,
       }),
     });
-    if (isExplicitParentReportingLabels(request.labels)) {
-      intent.labels[PARENT_REPORTING_LABEL] = EXPLICIT_PARENT_REPORTING;
+    if (getParentAgentIdFromLabels(intent.labels)) {
+      const reporting = request.labels?.[PARENT_REPORTING_LABEL];
+      if (isUserAgentCreation(request)) {
+        intent.labels[PARENT_REPORTING_LABEL] = reporting ?? EXPLICIT_PARENT_REPORTING;
+      } else if (reporting === "auto" || reporting === EXPLICIT_PARENT_REPORTING) {
+        intent.labels[PARENT_REPORTING_LABEL] = reporting;
+      } else if (request.forkFrom) {
+        // An explicitly agent-originated fork also stores a timeline prefix.
+        intent.labels[PARENT_REPORTING_LABEL] = "auto";
+      }
     }
     config = { ...config, cwd: intent.cwd };
 

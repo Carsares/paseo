@@ -28,8 +28,10 @@ import {
   assertPullRequestAutoMergeEnableReady,
 } from "../services/github-service.js";
 import {
+  EXPLICIT_PARENT_REPORTING,
   getOpenAgentTabLabel,
   PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
@@ -2895,6 +2897,7 @@ test("creation preserves the human first prompt while assigning validated local 
       labels: {
         [PARENT_AGENT_ID_LABEL]: parent.id,
         [PARENT_SERVER_ID_LABEL]: "local-host",
+        [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
         [getOpenAgentTabLabel("client")]: "true",
       },
     });
@@ -2902,6 +2905,58 @@ test("creation preserves the human first prompt while assigning validated local 
     expect((await storage.get(human!.agentId!))?.labels).not.toHaveProperty(
       REMOTE_HIERARCHY_DEPTH_LABEL,
     );
+
+    for (const reporting of ["auto", "custom"] as const) {
+      const requestId = `create-user-${reporting}`;
+      await session.handleMessage({
+        type: "create_agent_request",
+        config,
+        workspaceId: workspace.workspaceId,
+        callerAgentId: parent.id,
+        initialPromptOrigin: "user",
+        labels: { [PARENT_REPORTING_LABEL]: reporting },
+        requestId,
+      });
+      const result = filterByType(messages, "status").find(
+        ({ payload }) => payload.requestId === requestId,
+      );
+      expect((await storage.get(result!.payload.agentId!))?.labels[PARENT_REPORTING_LABEL]).toBe(
+        reporting,
+      );
+    }
+    await session.handleMessage({
+      type: "create_agent_request",
+      config,
+      workspaceId: workspace.workspaceId,
+      initialPromptOrigin: "user",
+      labels: { [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING },
+      requestId: "create-user-root",
+    });
+    const root = filterByType(messages, "status").find(
+      ({ payload }) => payload.requestId === "create-user-root",
+    );
+    expect((await storage.get(root!.payload.agentId!))?.labels).not.toHaveProperty(
+      PARENT_REPORTING_LABEL,
+    );
+
+    for (const origin of [undefined, "agent"] as const) {
+      const requestId = `create-fork-${origin ?? "legacy"}`;
+      await session.handleMessage({
+        type: "create_agent_request",
+        config,
+        workspaceId: workspace.workspaceId,
+        callerAgentId: parent.id,
+        initialPromptOrigin: origin,
+        forkFrom: { sourceAgentId: parent.id },
+        requestId,
+      });
+      const result = filterByType(messages, "status").find(
+        ({ payload }) => payload.requestId === requestId,
+      );
+      expect((await storage.get(result!.payload.agentId!))?.labels[PARENT_REPORTING_LABEL]).toBe(
+        origin === "agent" ? "auto" : EXPLICIT_PARENT_REPORTING,
+      );
+    }
 
     // Move after the request resolved placement and before it enters the creation lock.
     const destinationWorkspaceId = "destination-workspace";
@@ -2928,6 +2983,9 @@ test("creation preserves the human first prompt while assigning validated local 
       workspaceId: destinationWorkspaceId,
       labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
     });
+    expect((await storage.get(delegated!.payload.agentId!))?.labels).not.toHaveProperty(
+      PARENT_REPORTING_LABEL,
+    );
     expect(parseAgentMessage(onStartTurn.mock.lastCall?.[0])).toMatchObject({
       source: { kind: "agent-message", agentId: parent.id },
       text: "Delegated by the parent",

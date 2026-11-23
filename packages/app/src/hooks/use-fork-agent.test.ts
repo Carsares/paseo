@@ -4,8 +4,10 @@ import { renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
+  EXPLICIT_PARENT_REPORTING,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
@@ -383,7 +385,10 @@ describe("seamless timeline forks", () => {
         forkFrom,
         callerAgentId: sharedParentId,
         initialPromptOrigin: "user",
-        labels: { [PARENT_AGENT_ID_LABEL]: sharedParentId },
+        labels: {
+          [PARENT_AGENT_ID_LABEL]: sharedParentId,
+          [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+        },
       });
       expect(open).toHaveBeenCalledExactlyOnceWith({
         workspaceKey,

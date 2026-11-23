@@ -158,6 +158,18 @@ export function shouldUseExplicitParentReporting(
   );
 }
 
+function applyMcpParentReporting(
+  labels: Record<string, string>,
+  input: CreateAgentFromMcpInput,
+  parentLabels: ManagedAgent["labels"] | undefined,
+): void {
+  if (shouldUseExplicitParentReporting(input, parentLabels)) {
+    labels[PARENT_REPORTING_LABEL] = EXPLICIT_PARENT_REPORTING;
+  } else if (input.parentReporting === "auto") {
+    labels[PARENT_REPORTING_LABEL] = input.parentReporting;
+  }
+}
+
 export interface CreateAgentCommandResult {
   snapshot: ManagedAgent;
   liveSnapshot: ManagedAgent;
@@ -176,13 +188,27 @@ export async function registerParentFinishSubscription({
   agentManager,
   agentStorage,
   finishSubscriptions,
+  humanPrompt,
+  logger,
 }: {
   agentId: string;
   serverId?: string;
-  agentManager: Pick<AgentManager, "getAgent">;
+  agentManager: Pick<AgentManager, "getAgent" | "convergeLegacyParentReporting">;
   agentStorage: Pick<AgentStorage, "get">;
   finishSubscriptions?: FinishSubscriptions;
+  humanPrompt?: boolean;
+  logger?: Logger;
 }): Promise<FinishRegistration | undefined> {
+  const migratedParent = await agentManager.convergeLegacyParentReporting(agentId, humanPrompt);
+  if (migratedParent) {
+    await finishSubscriptions?.cancelAutomaticParent(agentId, migratedParent).catch((error) => {
+      logger?.warn(
+        { err: error, agentId, parentId: migratedParent },
+        "Failed to retire parent finish subscription",
+      );
+    });
+    return;
+  }
   if (!finishSubscriptions) return;
   const agent = agentManager.getAgent(agentId) ?? (await agentStorage.get(agentId));
   if (isExplicitParentReportingLabels(agent?.labels)) return;
@@ -205,7 +231,20 @@ export async function registerParentFinishSubscription({
   const storedParent = await agentStorage.get(parentId);
   if (storedParent ? storedParent.archivedAt : !agentManager.getAgent(parentId)) return;
   return finishSubscriptions.register(
-    { childAgentId: agentId, callerAgentId: parentId, requireParentOwnership: true },
+    {
+      childAgentId: agentId,
+      callerAgentId: parentId,
+      requireParentOwnership: true,
+      automaticParent: true,
+      canRegister: () => {
+        const labels = agentManager.getAgent(agentId)?.labels ?? agent?.labels;
+        return (
+          !isExplicitParentReportingLabels(labels) &&
+          getParentAgentIdFromLabels(labels) === parentId &&
+          (!serverId || getParentAddressFromLabels(labels, serverId)?.serverId === serverId)
+        );
+      },
+    },
     true,
   );
 }
@@ -332,11 +371,22 @@ function registerInitialPromptFinish(
     input.kind === "mcp"
       ? requireFinishSubscriptions(dependencies)
       : dependencies.finishSubscriptions;
+  const automaticParent = notify === undefined && (input.kind === "session" || !input.detached);
   return subscriptions?.register(
     {
       childAgentId: child.id,
       callerAgentId: input.callerAgentId,
       requireParentOwnership: input.kind === "session" || !input.detached,
+      automaticParent,
+      canRegister: automaticParent
+        ? () => {
+            const labels = dependencies.agentManager.getAgent(child.id)?.labels ?? child.labels;
+            return (
+              !isExplicitParentReportingLabels(labels) &&
+              getParentAgentIdFromLabels(labels) === input.callerAgentId
+            );
+          }
+        : undefined,
     },
     true,
   );
@@ -380,7 +430,7 @@ async function resolveSessionCreateAgent(
   const parent = getParentAddressFromLabels(labels, dependencies.serverId ?? "");
   const isRemoteChild =
     parent && dependencies.serverId && parent.serverId !== dependencies.serverId;
-  if (!isExplicitParentReportingLabels(labels) || (!input.callerAgentId && !isRemoteChild)) {
+  if (!input.callerAgentId && !isRemoteChild) {
     delete labels[PARENT_REPORTING_LABEL];
   }
 
@@ -453,9 +503,7 @@ async function resolveMcpCreateAgent(
       cwd: resolvedCwd,
     }),
   });
-  if (intent.parentAgentId && shouldUseExplicitParentReporting(input, parentAgent?.labels)) {
-    intent.labels[PARENT_REPORTING_LABEL] = EXPLICIT_PARENT_REPORTING;
-  }
+  if (intent.parentAgentId) applyMcpParentReporting(intent.labels, input, parentAgent?.labels);
   const resolvedCreateConfig = await resolveMcpProviderCreateConfig({
     dependencies,
     input,

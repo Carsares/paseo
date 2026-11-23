@@ -5,7 +5,7 @@ import type { Logger } from "pino";
 import type { AgentExplicitFinishReport, AgentFinishReport } from "@getpaseo/protocol/messages";
 import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
 import type { FinishObservationResult } from "./internal/observation-buffer.js";
-import type { AgentMessageDelivery } from "../agent-messages/index.js";
+import type { AgentMessageDelivery, AgentPromptSource } from "../agent-messages/index.js";
 import { getParentAddressFromLabels } from "@getpaseo/protocol/agent-labels";
 import { AgentRequestOutcomeUnknownError } from "../../message-receipts/index.js";
 import {
@@ -68,9 +68,13 @@ export interface FinishSubscriptions {
   /** Pending notification intent, including registration, recovery and unacknowledged delivery. */
   hasPendingForCaller(agentId: string): boolean;
   register(
-    input: Omit<FinishSubscription, "id">,
+    input: Omit<FinishSubscription, "id"> & {
+      automaticParent?: boolean;
+      canRegister?: () => boolean;
+    },
     pendingDispatch?: boolean,
   ): Promise<FinishRegistration>;
+  cancelAutomaticParent(childAgentId: string, callerAgentId: string): Promise<void>;
   trackRemoteChild(input: Omit<FinishSubscription, "id">): Promise<void>;
   queueParentReport(
     address: Pick<FinishSubscription, "childAgentId" | "callerAgentId" | "callerServerId">,
@@ -104,7 +108,22 @@ interface Watch {
   decision: Promise<boolean>;
   decide(accepted: boolean): void;
   pending: boolean;
+  acknowledged?: boolean;
   task?: Promise<void>;
+  queued: Set<AgentPromptSource>;
+}
+const AUTOMATIC_PARENT_PREFIX = "automatic-parent:";
+const REQUESTED_PARENT_PREFIX = "requested-parent:";
+
+export function isAutomaticLocalParentSubscription(record: FinishSubscription): boolean {
+  // Older IDs cannot distinguish a default watch from an explicit request.
+  // Keep that existing intent until it settles without renewing it automatically.
+  return (
+    !record.serverId &&
+    !record.callerServerId &&
+    record.requireParentOwnership === true &&
+    record.id.startsWith(AUTOMATIC_PARENT_PREFIX)
+  );
 }
 function key(record: Omit<FinishSubscription, "id">): string {
   return JSON.stringify([
@@ -151,6 +170,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
   let recovering = true;
   const registering = new Map<string, number>();
   let mutations = Promise.resolve();
+  const skippedRegistration: FinishRegistration = { accept() {}, reject: async () => {} };
   function serialize<T>(action: () => Promise<T>): Promise<T> {
     const result = mutations.then(action);
     mutations = result.then(
@@ -164,7 +184,14 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     const decision = new Promise<boolean>((resolve) => {
       decide = resolve;
     });
-    const watch: Watch = { records, controller: new AbortController(), pending, decision, decide };
+    const watch: Watch = {
+      records,
+      controller: new AbortController(),
+      pending,
+      decision,
+      decide,
+      queued: new Set(),
+    };
     const group = watches.get(key(records[0]!)) ?? new Set<Watch>();
     group.add(watch);
     watches.set(key(records[0]!), group);
@@ -182,6 +209,14 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     group.delete(watch);
     if (!group.size && watches.get(key(watch.records[0]!)) === group)
       watches.delete(key(watch.records[0]!));
+  }
+  function stopAutomatic(watch: Watch, group: Set<Watch>): void {
+    stop(watch, group);
+    if (watch.queued.size) {
+      deps
+        .messages()
+        .withdrawPending(watch.records[0]!.callerAgentId, (source) => watch.queued.has(source));
+    }
   }
   async function remove(watch: Watch): Promise<void> {
     // Only IDs captured by this observer are eligible; newer registrations survive.
@@ -315,28 +350,38 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     record: FinishSubscription,
     report: AgentFinishReport,
     hasFinalSnapshot: boolean,
+    watch: Watch,
   ) {
     const messages = deps.messages();
     const validateParentOwnership = messages.validateParentOwnership;
-    return messages.enqueue({
+    const validate =
+      record.requireParentOwnership &&
+      (hasFinalSnapshot || isAutomaticLocalParentSubscription(record));
+    const validation = { ...record, hasFinalSnapshot };
+    const source: AgentPromptSource = {
+      kind: "agent-notification",
+      agentId: record.childAgentId,
+      serverId: record.serverId ?? deps.serverId,
+      title: report.title,
+      event: report.event,
+    };
+    const receipt = messages.enqueue({
       recipientId: record.callerAgentId,
       prompt: report.prompt,
-      source: {
-        kind: "agent-notification",
-        agentId: record.childAgentId,
-        serverId: record.serverId ?? deps.serverId,
-        title: report.title,
-        event: report.event,
-      },
+      source,
       activeTurnBehavior: "steer",
       unarchive: false,
       // The observation's snapshot cannot authorize a notification that
       // waited behind another turn or the recipient's quiet window.
       validateDispatch:
-        record.requireParentOwnership && hasFinalSnapshot && validateParentOwnership
-          ? () => validateParentOwnership(record)
-          : undefined,
+        validate && validateParentOwnership ? () => validateParentOwnership(validation) : undefined,
     });
+    watch.queued.add(source);
+    void receipt.dispatched.then(
+      () => watch.queued.delete(source),
+      () => watch.queued.delete(source),
+    );
+    return receipt;
   }
 
   async function deliver(
@@ -344,8 +389,9 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     result: FinishObservationResult,
     permissions: Set<string>,
     savedFollowups: Set<string>,
-    signal: AbortSignal,
+    watch: Watch,
   ): Promise<boolean> {
+    const { signal } = watch.controller;
     const requests = permissionRequests(result, permissions);
     const reason = reasonFor(result);
     const acknowledgments: Promise<unknown>[] = [];
@@ -397,7 +443,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         if (request) permissions.add(request.id);
         continue;
       }
-      const receipt = enqueueLocalNotification(record, report, Boolean(result.final));
+      const receipt = enqueueLocalNotification(record, report, Boolean(result.final), watch);
       acknowledgments.push(
         receipt.dispatched.then(() => {
           if (request) permissions.add(request.id);
@@ -417,7 +463,8 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     const signal = watch.controller.signal;
     if (!(await watch.decision) || signal.aborted) return;
     const record = {
-      ...watch.records[0]!,
+      ...(watch.records.find((intent) => !isAutomaticLocalParentSubscription(intent)) ??
+        watch.records[0]!),
       requireParentOwnership: watch.records.every(
         (intent) => intent.requireParentOwnership === true,
       ),
@@ -426,7 +473,6 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     const savedFollowups = new Set<string>();
     let observation: FinishObservationSession | undefined;
     let pending: FinishObservationResult | undefined;
-    let acknowledged = false;
     let remoteFailures = 0;
     let retries = 0;
     let warned = false;
@@ -476,9 +522,9 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
             stop(watch, group);
             return;
           }
-          if (!acknowledged)
-            acknowledged = await deliver(record, pending, permissions, savedFollowups, signal);
-          if (acknowledged) {
+          if (!watch.acknowledged)
+            watch.acknowledged = await deliver(record, pending, permissions, savedFollowups, watch);
+          if (watch.acknowledged) {
             // A removal failure retries only the commit, never the already accepted callback.
             await remove(watch);
             stop(watch, group);
@@ -723,33 +769,92 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         }
         recovering = false;
       }),
-    register: (input, pendingDispatch = false) => {
+    register: ({ automaticParent, canRegister, ...input }, pendingDispatch = false) => {
       registering.set(input.callerAgentId, (registering.get(input.callerAgentId) ?? 0) + 1);
       return serialize(async () => {
         if (closed) throw new Error("Finish subscriptions are closed");
+        if (canRegister && !canRegister()) {
+          return skippedRegistration;
+        }
+        // The ID is the durable notification identity. Namespacing it keeps the
+        // persisted record compatible with older readers.
+        let prefix = "";
+        if (input.requireParentOwnership) {
+          prefix = automaticParent ? AUTOMATIC_PARENT_PREFIX : REQUESTED_PARENT_PREFIX;
+        }
         const record: FinishSubscription = {
           ...input,
           serverId: input.serverId === deps.serverId ? undefined : input.serverId,
           callerServerId: input.callerServerId === deps.serverId ? undefined : input.callerServerId,
-          id: randomUUID(),
+          id: prefix + randomUUID(),
         };
         await deps.store.put(record);
+        if (canRegister && !canRegister()) {
+          await deps.store.remove(record.id);
+          return skippedRegistration;
+        }
         const group = watches.get(key(record)) ?? new Set<Watch>();
         const predecessors = [...group];
         const watch = attach([record], true);
         const actualGroup = watches.get(key(record))!;
-        const registration: FinishRegistration = {
-          accept() {
-            if (!watch.pending || closed) return;
-            watch.pending = false;
-            for (const prior of predecessors) stop(prior, actualGroup);
-            watch.decide(true);
-            void serialize(async () => {
-              for (const prior of predecessors) await remove(prior);
-            }).catch((error) =>
-              deps.logger.error({ err: error }, "Failed to remove superseded finish subscriptions"),
+        const automatic = isAutomaticLocalParentSubscription(record);
+        function removeSuperseded(records: FinishSubscription[]) {
+          if (!records.length) return;
+          void serialize(async () => {
+            for (const prior of records) await deps.store.remove(prior.id);
+          }).catch((error) =>
+            deps.logger.error({ err: error }, "Failed to remove superseded finish subscriptions"),
+          );
+        }
+        function accept() {
+          if (!watch.pending || watch.controller.signal.aborted || closed) return;
+          if (canRegister && !canRegister()) {
+            stop(watch, actualGroup);
+            removeSuperseded([record]);
+            return;
+          }
+          const activePredecessors = predecessors.filter((prior) => actualGroup.has(prior));
+          if (automatic) {
+            const requested = activePredecessors.filter(
+              (prior) =>
+                !prior.acknowledged &&
+                prior.records.some((intent) => !isAutomaticLocalParentSubscription(intent)),
             );
-          },
+            const undecided = requested.filter((prior) => prior.pending);
+            if (undecided.length) {
+              // Wait for the requested prompt's admission before replacing its observer.
+              void Promise.all(undecided.map((prior) => prior.decision)).then(accept);
+              return;
+            }
+            if (requested.some((prior) => prior.queued.size)) {
+              // The requested result is already queued. Let that delivery settle.
+              stop(watch, actualGroup);
+              removeSuperseded([record]);
+              return;
+            }
+            watch.records.push(
+              ...requested.flatMap((prior) =>
+                prior.records.filter((intent) => !isAutomaticLocalParentSubscription(intent)),
+              ),
+            );
+          }
+          watch.pending = false;
+          for (const prior of activePredecessors) {
+            if (prior.records.every(isAutomaticLocalParentSubscription)) {
+              stopAutomatic(prior, actualGroup);
+            } else {
+              stop(prior, actualGroup);
+            }
+          }
+          watch.decide(true);
+          removeSuperseded(
+            activePredecessors.flatMap((prior) =>
+              prior.records.filter((intent) => !watch.records.includes(intent)),
+            ),
+          );
+        }
+        const registration: FinishRegistration = {
+          accept,
           reject: () =>
             serialize(async () => {
               stop(watch, actualGroup);
@@ -764,6 +869,25 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         else registering.delete(input.callerAgentId);
       });
     },
+    cancelAutomaticParent: (childAgentId, callerAgentId) =>
+      serialize(async () => {
+        const address = { childAgentId, callerAgentId };
+        const group = watches.get(key(address));
+        for (const watch of group ?? []) {
+          const retained = watch.records.filter(
+            (record) => !isAutomaticLocalParentSubscription(record),
+          );
+          if (retained.length === watch.records.length) continue;
+          if (retained.length) watch.records = retained;
+          else stopAutomatic(watch, group!);
+        }
+        // A failed removal is retried by the next recovery or dispatch for this
+        // pair. The agent's committed reporting label prevents stale delivery.
+        for (const record of await deps.store.list()) {
+          if (key(record) === key(address) && isAutomaticLocalParentSubscription(record))
+            await deps.store.remove(record.id);
+        }
+      }),
     trackRemoteChild: (input) =>
       serialize(async () => {
         if (closed || !deps.followups)

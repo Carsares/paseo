@@ -6,9 +6,11 @@ import type {
   DaemonClient,
 } from "@getpaseo/client/internal/daemon-client";
 import {
+  EXPLICIT_PARENT_REPORTING,
   getMainPriorModeIdFromLabels,
   isMainControlAgent,
   PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
   type AgentLabelSource,
 } from "@getpaseo/protocol/agent-labels";
 import type { AgentForkSource } from "@getpaseo/protocol/messages";
@@ -403,7 +405,10 @@ async function openSeamlessFork(input: {
       ? {
           callerAgentId: parentAgentId,
           initialPromptOrigin: "user",
-          labels: { [PARENT_AGENT_ID_LABEL]: parentAgentId },
+          labels: {
+            [PARENT_AGENT_ID_LABEL]: parentAgentId,
+            [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+          },
         }
       : {}),
   });

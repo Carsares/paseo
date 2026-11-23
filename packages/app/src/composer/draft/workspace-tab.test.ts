@@ -6,7 +6,10 @@ import { I18nextProvider } from "react-i18next";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { AgentForkSource, AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import {
+  EXPLICIT_PARENT_REPORTING,
   getOpenAgentTabLabel,
+  PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
@@ -27,6 +30,7 @@ import { buildSubagentDraftSetup } from "@/hooks/use-fork-agent";
 import { DEFAULT_OPEN_IN_SIDE_PANE_PREFERENCES } from "@/hooks/use-settings/storage";
 import { en } from "@/i18n/resources/en";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
+import { useDraftAgentCreateFlow } from "./create-flow";
 import { useSessionStore, type Agent } from "@/stores/session-store";
 import { WorkspaceLayoutPersistedStateSchema } from "@/stores/workspace-layout-storage";
 import {
@@ -49,6 +53,10 @@ import {
 import { shouldAllowEmptyDraftText, validateDraftSubmission } from "./workspace-tab-core";
 
 vi.mock("@/composer", () => ({ Composer: vi.fn(() => null) }));
+vi.mock("./create-flow", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./create-flow")>();
+  return { ...actual, useDraftAgentCreateFlow: vi.fn(actual.useDraftAgentCreateFlow) };
+});
 vi.mock("@/composer/draft/input-draft", () => ({ useAgentInputDraft: vi.fn() }));
 vi.mock("@/command-center/agent-control-registration", () => ({
   useAgentControlCommandCenterActions: vi.fn(),
@@ -289,7 +297,8 @@ describe("workspace draft empty text readiness", () => {
       forkFrom,
     };
     const created = { id: "forked-agent", workspaceId: "workspace-1" } as AgentSnapshotPayload;
-    const createAgent = vi.fn<DaemonClient["createAgent"]>().mockResolvedValue(created);
+    const response = Promise.withResolvers<AgentSnapshotPayload>();
+    const createAgent = vi.fn<DaemonClient["createAgent"]>().mockReturnValue(response.promise);
     const onCreated = vi.fn();
     const host = useSessionStore.getState();
     host.initializeSession("host-1", { createAgent } as unknown as DaemonClient);
@@ -314,8 +323,9 @@ describe("workspace draft empty text readiness", () => {
       if (!props?.onSubmitMessage) throw new Error("Expected the composer submit handler");
       expect(props.isSubmitLoading).toBe(false);
       expect(props.allowEmptySubmit).toBe(true);
+      let submitted: Promise<unknown> | undefined;
       await act(async () => {
-        await props.onSubmitMessage?.({ text: "", cwd: setup.cwd, attachments: [] });
+        submitted = props.onSubmitMessage?.({ text: "", cwd: setup.cwd, attachments: [] });
       });
       expect(createAgent).toHaveBeenCalledExactlyOnceWith({
         config: { provider: "codewhale", cwd: setup.cwd },
@@ -323,9 +333,30 @@ describe("workspace draft empty text readiness", () => {
         initialPrompt: "",
         callerAgentId: "main-1",
         initialPromptOrigin: "user",
+        labels: {
+          [PARENT_AGENT_ID_LABEL]: "main-1",
+          [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+        },
         clientMessageId: expect.any(String),
         idempotencyKey: expect.any(String),
         forkFrom,
+      });
+      expect(vi.mocked(useDraftAgentCreateFlow).mock.results).toContainEqual(
+        expect.objectContaining({
+          value: expect.objectContaining({
+            draftAgent: expect.objectContaining({
+              parentAgentId: "main-1",
+              labels: {
+                [PARENT_AGENT_ID_LABEL]: "main-1",
+                [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+              },
+            }),
+          }),
+        }),
+      );
+      await act(async () => {
+        response.resolve(created);
+        await submitted;
       });
       expect(onCreated).toHaveBeenCalledExactlyOnceWith(created);
       expect(
@@ -510,10 +541,15 @@ describe("workspace subagent draft", () => {
         expect(request).toMatchObject({
           callerAgentId: parentAgentId,
           initialPromptOrigin: "user",
+          labels: {
+            [PARENT_AGENT_ID_LABEL]: parentAgentId,
+            [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+          },
         });
       } else {
         expect(request).not.toHaveProperty("callerAgentId");
         expect(request).not.toHaveProperty("initialPromptOrigin");
+        expect(request).not.toHaveProperty("labels");
       }
     },
   );

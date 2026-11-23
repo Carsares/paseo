@@ -1,6 +1,10 @@
 import type { ComposerOptionControls } from "@/agent-controls/option-controls";
 import { useCallback, useEffect, useMemo, useRef } from "react";
-import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  EXPLICIT_PARENT_REPORTING,
+  PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { Keyboard, StyleSheet as RNStyleSheet, Text, View } from "react-native";
 import { useTranslation } from "react-i18next";
@@ -143,14 +147,27 @@ function buildDraftCaller(input: {
   requiresUserPromptOrigin: boolean;
   supportsAgentInitialPromptOrigin: () => boolean;
   initialPromptOriginUnavailableMessage: string;
-}): { callerAgentId?: string; initialPromptOrigin?: "user" } {
+}): { callerAgentId?: string; initialPromptOrigin?: "user"; labels?: Record<string, string> } {
   const callerAgentId = normalizeParentAgentId(input.parentAgentId);
   if (!callerAgentId) return {};
   // COMPAT(agentInitialPromptOrigin): added in v0.16.0, remove gate after 2027-05-19.
   if (input.requiresUserPromptOrigin && !input.supportsAgentInitialPromptOrigin()) {
     throw new Error(input.initialPromptOriginUnavailableMessage);
   }
-  return { callerAgentId, initialPromptOrigin: "user" };
+  return {
+    callerAgentId,
+    initialPromptOrigin: "user",
+    labels: draftParentLabels(callerAgentId),
+  };
+}
+
+function draftParentLabels(parentAgentId: string | null): Record<string, string> {
+  return parentAgentId
+    ? {
+        [PARENT_AGENT_ID_LABEL]: parentAgentId,
+        [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+      }
+    : {};
 }
 
 function resolveDraftSubmitPolicy(
@@ -315,7 +332,7 @@ function buildDraftAgentSnapshot(input: {
     controls: composerState.agentControls.optionControls?.controls,
     thinkingOptionId,
     parentAgentId: normalizedParentAgentId,
-    labels: normalizedParentAgentId ? { [PARENT_AGENT_ID_LABEL]: normalizedParentAgentId } : {},
+    labels: draftParentLabels(normalizedParentAgentId),
   };
 }
 

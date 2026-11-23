@@ -15,6 +15,7 @@ import {
   readDirectParentRoute,
 } from "./agent/host-operations/index.js";
 import {
+  isAutomaticLocalParentSubscription,
   ParentReportRecipientUnavailableError,
   type FinishRegistration,
   type FinishSubscription,
@@ -817,7 +818,7 @@ export class VoiceAssistantWebSocketServer {
         ),
       isRunning: (agentId) => agentManager.hasInFlightRun(agentId),
       hasPendingPermission: (agentId) => agentManager.hasPendingPermissions(agentId),
-      validateParentOwnership: (address) => this.assertCurrentReportParent(address),
+      validateParentOwnership: (address) => this.validateFinishSubscriptionParent(address),
       subscribe: (notify) =>
         agentManager.subscribe(
           (event) => {
@@ -854,6 +855,7 @@ export class VoiceAssistantWebSocketServer {
                   agentManager,
                   agentStorage,
                   finishSubscriptions,
+                  logger: this.logger,
                 });
               } catch (error) {
                 this.logger.warn(
@@ -3096,6 +3098,48 @@ export class VoiceAssistantWebSocketServer {
       throw new ParentReportRecipientUnavailableError("You can only manage your direct subagents.");
     }
     await this.assertParentReportRecipientAvailable(record.callerAgentId);
+  }
+
+  private async validateFinishSubscriptionParent(
+    record: Pick<FinishSubscription, "callerAgentId" | "childAgentId" | "serverId"> &
+      Partial<Pick<FinishSubscription, "id" | "requireParentOwnership" | "callerServerId">> & {
+        hasFinalSnapshot?: boolean;
+      },
+  ): Promise<void> {
+    if (record.id && isAutomaticLocalParentSubscription({ ...record, id: record.id })) {
+      const migratedParent = await this.agentManager.convergeLegacyParentReporting(
+        record.childAgentId,
+      );
+      const child =
+        this.agentManager.getAgent(record.childAgentId) ??
+        (await this.agentStorage.get(record.childAgentId));
+      const parent = getParentAddressFromLabels(child?.labels, this.serverId);
+      if (
+        child &&
+        (parent?.agentId !== record.callerAgentId || parent.serverId !== this.serverId)
+      ) {
+        throw new ParentReportRecipientUnavailableError(
+          "You can only manage your direct subagents.",
+        );
+      }
+      if (
+        migratedParent === record.callerAgentId ||
+        isExplicitParentReportingLabels(child?.labels)
+      ) {
+        await this.finishSubscriptions
+          ?.cancelAutomaticParent(record.childAgentId, record.callerAgentId)
+          .catch((error) => {
+            this.logger.warn(
+              { err: error, subscription: record.id },
+              "Failed to retire parent finish subscription",
+            );
+          });
+        throw new ParentReportRecipientUnavailableError("Child uses explicit parent reporting.");
+      }
+      await this.assertParentReportRecipientAvailable(record.callerAgentId);
+      return;
+    }
+    if (record.hasFinalSnapshot !== false) await this.assertCurrentReportParent(record);
   }
 
   async dispatchFinishReport(

@@ -33,9 +33,11 @@ import { buildStoredAgentPayload, toAgentPayload } from "./agent-projections.js"
 import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { projectTimelineRows } from "./timeline-projection.js";
 import {
+  EXPLICIT_PARENT_REPORTING,
   getOpenAgentTabLabel,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
+  PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
@@ -6983,6 +6985,80 @@ test.each(["Original instructions", "", undefined])(
     expect((await storage.get(next.id))?.mainControlSystemPrompt).toBe("Updated instructions");
   },
 );
+
+test("cold reporting migration uses the child's own submitted human input and preserves concurrent labels", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reporting-"));
+  const storagePath = join(workdir, "agents");
+  const timeline = new RecordingTimelineStore();
+  const open = () => {
+    const registry = new AgentStorage(storagePath, logger);
+    const manager = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry,
+      durableTimelineStore: timeline,
+      logger,
+    });
+    return { manager, registry };
+  };
+  const first = open();
+  const second = open();
+  const close = (manager: AgentManager) =>
+    Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+  onTestFinished(async () => {
+    await close(second.manager);
+    await close(first.manager);
+    rmSync(workdir, { recursive: true, force: true });
+  });
+  const workspaceId = "reporting-workspace";
+  const config = { provider: "codex", cwd: workdir } as const;
+  const main = await first.manager.createAgent(config, undefined, {
+    workspaceId,
+    labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+  });
+  const createChild = (parentId: string) =>
+    first.manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: { [PARENT_AGENT_ID_LABEL]: parentId, [DESKTOP_OPEN_AGENT_TAB_LABEL]: "true" },
+    });
+  const human = await createChild(main.id);
+  const automatic = await createChild(main.id);
+  const grandchild = await createChild(automatic.id);
+  await first.manager.runAgent(human.id, "Human input", { clientMessageId: "human" });
+  await first.manager.runAgent(
+    automatic.id,
+    prepareAgentMessage("Finished delegated work", {
+      kind: "agent-notification",
+      agentId: grandchild.id,
+      event: "finished",
+    }).prompt,
+    { clientMessageId: "automatic" },
+  );
+  await first.manager.getTimelineRows(human.id);
+  await first.manager.getTimelineRows(automatic.id);
+  await close(first.manager);
+  expect((await second.registry.get(human.id))?.labels).not.toHaveProperty(PARENT_REPORTING_LABEL);
+
+  await Promise.all([
+    second.manager.createAgentFromRecord(human.id),
+    second.manager.updateAgentMetadata(human.id, {
+      labels: { [MOBILE_OPEN_AGENT_TAB_LABEL]: "true" },
+    }),
+    second.manager.createAgentFromRecord(automatic.id),
+  ]);
+  const disk = new AgentStorage(storagePath, logger);
+  const humanLabels = {
+    [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+    [DESKTOP_OPEN_AGENT_TAB_LABEL]: "true",
+    [MOBILE_OPEN_AGENT_TAB_LABEL]: "true",
+  };
+  expect((await disk.get(human.id))?.labels).toMatchObject(humanLabels);
+  expect(second.manager.getAgent(human.id)?.labels).toMatchObject(humanLabels);
+  expect((await disk.get(automatic.id))?.labels).not.toHaveProperty(PARENT_REPORTING_LABEL);
+  expect(await second.manager.convergeLegacyParentReporting(grandchild.id, true)).toBeNull();
+  expect((await second.registry.get(grandchild.id))?.labels).not.toHaveProperty(
+    PARENT_REPORTING_LABEL,
+  );
+});
 
 test("Main Control prompt snapshots survive reloads and disk reopen without affecting other roles", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-main-prompt-"));
