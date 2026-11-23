@@ -232,6 +232,13 @@ export const fr: TranslationResources = {
     },
   },
   agentControls: {
+    workspaceMain: {
+      label: "Définir comme session principale",
+      occupied: "Cet espace de travail a déjà une session principale active.",
+      unknown: "Impossible de confirmer si cet espace de travail a une session principale active.",
+      unsupported:
+        "Mettez à jour l’hôte pour créer une session principale à partir d’un brouillon.",
+    },
     provider: {
       fallback: "Fournisseur",
       select: "Choisir le fournisseur d’agent",

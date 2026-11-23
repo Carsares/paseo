@@ -17,8 +17,11 @@ export interface LifecycleAgentManager {
   getAgent(agentId: string): LifecycleAgentSnapshot | null;
   hasInFlightRun(agentId: string): boolean;
   cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
-  clearAgentAttention(agentId: string): Promise<void>;
-  archiveAgent(agentId: string): Promise<{ archivedAt: string }>;
+  archiveAgent(
+    agentId: string,
+    archivedAt?: string,
+    options?: { cancelActiveRun?: boolean },
+  ): Promise<{ archivedAt: string }>;
   archiveAgentInWorkspace(
     agentId: string,
     expectedWorkspaceId: string,
@@ -141,9 +144,9 @@ export async function archiveAgentCommand(
   const liveAgent = dependencies.agentManager.getAgent(agentId);
   let record: StoredAgentRecord | null;
   if (liveAgent) {
-    await requestAgentRunCancellation(dependencies, agentId);
-    await dependencies.agentManager.clearAgentAttention(agentId).catch(() => undefined);
-    const archived = await dependencies.agentManager.archiveAgent(agentId);
+    const archived = await dependencies.agentManager.archiveAgent(agentId, undefined, {
+      cancelActiveRun: true,
+    });
     if (liveAgent.internal) {
       return { agentId, archivedAt: archived.archivedAt, record: null };
     }

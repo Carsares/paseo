@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import type { z } from "zod";
 import { BUILTIN_PROVIDER_IDS } from "@getpaseo/protocol/provider-manifest";
 import {
+  AGENT_PROFILE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
   WORKSPACE_ROLE_LABEL,
   WORKSPACE_MAIN_ROLE,
@@ -16,6 +17,9 @@ import { expect, test, vi } from "vitest";
 import pino from "pino";
 import type { CreationSnapshot, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import type { AgentTimelineItem } from "../agent/agent-sdk-types.js";
+import { isPaseoToolEnabled } from "../agent/paseo-tool-policy.js";
+import { CodexAppServerAgentClient } from "../agent/providers/codex-app-server-agent.js";
+import { createFakeCodexAppServer } from "../agent/providers/codex/test-utils/fake-app-server.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
@@ -121,6 +125,524 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
+
+test("explicit Main creation admits one root and preserves the first turn and receipt", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "creation-explicit-main-"));
+  const releaseTurn = deferred<void>();
+  const opening = deferred<void>();
+  const releaseOpening = deferred<void>();
+  const prompts: unknown[] = [];
+  const daemon = await createCreationDaemon({
+    agentProfiles: [
+      { id: "review", name: "Reviewer", provider: "claude", defaultResident: true },
+      { id: "ordinary", name: "Ordinary", provider: "claude" },
+    ],
+    agentClients: createTestAgentClients({
+      beforeCreateSession: async (config) => {
+        if (config.internal || config.title !== "Review lead") return;
+        opening.resolve();
+        await releaseOpening.promise;
+      },
+      onStartTurn: (prompt, config) => {
+        if (!config.internal) prompts.push(prompt);
+      },
+      beforeTurnComplete: () => releaseTurn.promise,
+    }),
+  });
+  const url = `ws://127.0.0.1:${daemon.port}/ws`;
+  const client = new DaemonClient({ url, clientId: "explicit-main-creator" });
+  const observer = new DaemonClient({ url, clientId: "explicit-main-observer" });
+  const peer = await connectCreationPeer(daemon.port);
+  const updates: SessionOutboundMessage[] = [];
+  const unsubscribe = observer.subscribeRawMessages((message) => updates.push(message));
+  const mainAgentId = randomUUID();
+  try {
+    await client.connect();
+    await observer.connect();
+    expect(client.getLastServerInfoMessage()?.features?.agentCreateAsMain).toBe(true);
+    await client.patchDaemonConfig({ mainControlAppendSystemPrompt: "Frozen test policy" });
+    const { workspace } = await client.createWorkspace({
+      source: { kind: "directory", path: directory },
+    });
+    if (!workspace) throw new Error("Missing workspace");
+    const observed = await observer.fetchWorkspaces({
+      subscribe: {},
+      filter: { query: workspace.id },
+    });
+    expect(observed.entries.find(({ id }) => id === workspace.id)?.hasActiveMainAgent).toBe(false);
+    const { workspace: otherWorkspace } = await client.createWorkspace({
+      source: { kind: "directory", path: directory },
+    });
+    if (!otherWorkspace) throw new Error("Missing other workspace");
+    const request = {
+      workspaceId: workspace.id,
+      workspaceRole: "main" as const,
+      agentId: mainAgentId,
+      idempotencyKey: "explicit-main",
+      clientMessageId: "explicit-main-message",
+      initialPrompt: "Review the changes",
+      config: {
+        provider: "codex",
+        cwd: directory,
+        model: "gpt-5.4",
+        modeId: "default",
+        thinkingOptionId: "high",
+        title: "Review lead",
+      },
+      metadata: { feature: "test" },
+      labels: { [AGENT_PROFILE_ID_LABEL]: "main-preset" },
+      attachments: [
+        { type: "text" as const, mimeType: "text/plain" as const, text: "Review context" },
+      ],
+    };
+    const first = client.createAgent(request);
+    void first.catch(() => undefined);
+    await opening.promise;
+    const denied = await observer
+      .createAgent({
+        ...request,
+        agentId: randomUUID(),
+        idempotencyKey: "competing-main",
+      })
+      .catch((error: unknown) => error);
+    expect(denied).toMatchObject({ code: "workspace_main_exists", outcome: "rejected" });
+    const otherMain = await observer.createAgent({
+      workspaceId: otherWorkspace.id,
+      workspaceRole: "main",
+      config: { provider: "codex", cwd: directory, title: "Other main" },
+    });
+    expect(otherMain.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+    expect(await daemon.daemon.agentStorage.get(mainAgentId)).toBeNull();
+    releaseOpening.resolve();
+    await expect.poll(() => prompts.length).toBe(1);
+    const receipt = await peer.request({
+      type: "creation.subscribe.request",
+      requestId: "competing-main-receipt",
+      kind: "agent",
+      idempotencyKey: "competing-main",
+      subscribe: false,
+    });
+    if (receipt.type !== "creation.subscribe.response") throw new Error("Missing creation receipt");
+    expect(receipt.payload.snapshot).toMatchObject({
+      phase: "failed",
+      failedStage: "agent",
+      errorCode: "workspace_main_exists",
+      outcomeUnknown: false,
+    });
+    await expect
+      .poll(() =>
+        updates.some(
+          (message) =>
+            message.type === "workspace_update" &&
+            message.payload.kind === "upsert" &&
+            message.payload.workspace.id === workspace.id &&
+            message.payload.workspace.hasActiveMainAgent === true,
+        ),
+      )
+      .toBe(true);
+    const created = await first;
+    releaseTurn.resolve();
+    const retry = await observer.createAgent(request);
+    expect(retry.id).toBe(created.id);
+    await observer.sendAgentMessage(mainAgentId, request.initialPrompt, {
+      messageId: request.clientMessageId,
+      attachments: request.attachments,
+    });
+    expect(prompts).toHaveLength(1);
+    expect(JSON.stringify(prompts[0])).toContain("Review context");
+    expect(JSON.stringify(prompts[0])).toContain("Reviewer");
+    expect(created).toMatchObject({
+      id: mainAgentId,
+      title: "Review lead",
+      workspaceId: workspace.id,
+      labels: {
+        [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
+        [AGENT_PROFILE_ID_LABEL]: "main-preset",
+      },
+      metadata: { feature: "test" },
+    });
+    expect(created.labels?.[PARENT_AGENT_ID_LABEL]).toBeUndefined();
+    expect(
+      isPaseoToolEnabled(
+        daemon.daemon.agentManager.getPaseoToolPolicy(mainAgentId),
+        "archive_workspace",
+      ),
+    ).toBe(false);
+    await client.patchDaemonConfig({ mainControlAppendSystemPrompt: "Changed policy" });
+    expect(await daemon.daemon.agentStorage.get(mainAgentId)).toMatchObject({
+      mainControlSystemPrompt: "Frozen test policy",
+      config: { model: "gpt-5.4", modeId: "default", thinkingOptionId: "high" },
+    });
+    const records = await daemon.daemon.agentStorage.listByWorkspaces([workspace.id]);
+    expect(records.map((record) => record.labels)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          [PARENT_AGENT_ID_LABEL]: mainAgentId,
+          [AGENT_PROFILE_ID_LABEL]: "review",
+        }),
+      ]),
+    );
+    expect(records).toHaveLength(2);
+  } finally {
+    releaseOpening.resolve();
+    releaseTurn.resolve();
+    unsubscribe();
+    peer.close();
+    await client.close();
+    await observer.close();
+    await daemon.close();
+    await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  }
+}, 60_000);
+
+test("explicit Main creation starts its first turn before a concurrent archive", async () => {
+  const residentRequested = deferred<void>();
+  const releaseResident = deferred<void>();
+  const events: string[] = [];
+  const daemon = await createCreationDaemon({
+    agentProfiles: [{ id: "review", name: "Reviewer", provider: "claude", defaultResident: true }],
+    agentClients: createTestAgentClients({
+      onStartTurn: (_prompt, config) => {
+        if (config.title === "Review lead") events.push("turn started");
+      },
+    }),
+  });
+  const { agentManager, agentStorage } = daemon.daemon;
+  const createResident = agentManager.createSilentResidentSubagent.bind(agentManager);
+  const residentSpy = vi
+    .spyOn(agentManager, "createSilentResidentSubagent")
+    .mockImplementationOnce(async (input) => {
+      residentRequested.resolve();
+      await releaseResident.promise;
+      const result = await createResident(input);
+      if (result.created) events.push("resident created");
+      return result;
+    });
+  const client = new DaemonClient({
+    url: `ws://127.0.0.1:${daemon.port}/ws`,
+    clientId: "explicit-main-archive-race",
+  });
+  const config = { provider: "codex", cwd: daemon.staticDir };
+  const source = { kind: "directory", path: config.cwd } as const;
+  const mainAgentId = randomUUID();
+  try {
+    await client.connect();
+    const { workspace } = await client.createWorkspace({ source });
+    const { workspace: otherWorkspace, agent: otherAgent } = await client.createWorkspace({
+      source,
+      agent: { config },
+    });
+    if (!workspace || !otherWorkspace || !otherAgent)
+      throw new Error("Missing workspaces or agent");
+    const creation = client.createAgent({
+      config: { ...config, title: "Review lead" },
+      agentId: mainAgentId,
+      workspaceId: workspace.id,
+      workspaceRole: "main",
+      initialPrompt: "Review the changes",
+    });
+    void creation.catch(() => undefined);
+    await residentRequested.promise;
+    expect(await agentStorage.get(mainAgentId)).toMatchObject({
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
+
+    const archivedAt = new Date().toISOString();
+    const archive = agentManager.archiveSnapshot(mainAgentId, archivedAt).then((record) => {
+      events.push("archived");
+      return record;
+    });
+    void archive.catch(() => undefined);
+    // The unrelated promotion must pass the queued archive while creation is paused.
+    await agentManager.setAgentMainControl(otherAgent.id, true);
+    expect(await agentStorage.get(otherAgent.id)).toMatchObject({
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
+    expect((await agentStorage.get(mainAgentId))?.archivedAt).toBeFalsy();
+    expect(events).toEqual([]);
+
+    releaseResident.resolve();
+    await expect(creation).resolves.toMatchObject({ id: mainAgentId });
+    await expect(archive).resolves.toMatchObject({ archivedAt });
+    expect(events).toEqual(["resident created", "turn started", "archived"]);
+  } finally {
+    releaseResident.resolve();
+    residentSpy.mockRestore();
+    await client.close();
+    await daemon.close();
+  }
+}, 60_000);
+
+test.each(["Main", "unrelated session"])(
+  "explicit Main creation coordinates public archive of %s",
+  async (target) => {
+    const preparingTurn = deferred<void>();
+    const releaseStart = deferred<void>();
+    const releaseTurn = deferred<void>();
+    const events: string[] = [];
+    const agentClients = createTestAgentClients({
+      beforeTurnComplete: () => releaseTurn.promise,
+      onInterrupt: () => events.push("interrupted"),
+    });
+    const codex = agentClients.codex!;
+    const createSession = codex.createSession.bind(codex);
+    vi.spyOn(codex, "createSession").mockImplementation(async (...args) => {
+      const agent = await createSession(...args);
+      if (args[0].title === "Review lead") {
+        const startTurn = agent.startTurn.bind(agent);
+        agent.startTurn = async (...turnArgs) => {
+          preparingTurn.resolve();
+          await releaseStart.promise;
+          events.push("turn started");
+          return startTurn(...turnArgs);
+        };
+      }
+      return agent;
+    });
+    const daemon = await createCreationDaemon({ agentClients });
+    const url = `ws://127.0.0.1:${daemon.port}/ws`;
+    const creator = new DaemonClient({ url });
+    const peer = new DaemonClient({ url });
+    const mainId = randomUUID();
+    const manager = daemon.daemon.agentManager;
+    const archiveAgent = manager.archiveAgent.bind(manager);
+    vi.spyOn(manager, "archiveAgent").mockImplementation((...args) => {
+      if (args[0] === mainId) events.push("archive entered");
+      return archiveAgent(...args);
+    });
+    try {
+      await Promise.all([creator.connect(), peer.connect()]);
+      const config = { provider: "codex", cwd: daemon.staticDir };
+      const { workspace, agent: regular } = await creator.createWorkspace({
+        source: { kind: "directory", path: config.cwd },
+        agent: { config },
+      });
+      if (!workspace || !regular) throw new Error("Missing workspace or regular agent");
+      const creation = creator.createAgent({
+        config: { ...config, title: "Review lead" },
+        workspaceId: workspace.id,
+        workspaceRole: "main",
+        agentId: mainId,
+        clientMessageId: "first-main-message",
+        initialPrompt: "Review the changes",
+      });
+      void creation.catch(() => undefined);
+      await preparingTurn.promise;
+
+      const archive = peer.archiveAgent(target === "Main" ? mainId : regular.id);
+      void archive.catch(() => undefined);
+      if (target === "Main") {
+        // Detect the first action of the public archive while provider startup is paused.
+        await vi.waitFor(() => expect(events).toEqual(["archive entered"]));
+        expect((await daemon.daemon.agentStorage.get(mainId))?.archivedAt).toBeFalsy();
+        releaseStart.resolve();
+        await expect(creation).resolves.toMatchObject({ id: mainId });
+        await archive;
+        expect(events).toEqual(["archive entered", "turn started", "interrupted"]);
+      } else {
+        await expect
+          .poll(async () => (await daemon.daemon.agentStorage.get(regular.id))?.archivedAt)
+          .toEqual(expect.any(String));
+        await archive;
+        expect(events).toEqual([]);
+        releaseStart.resolve();
+        await expect(creation).resolves.toMatchObject({ id: mainId });
+      }
+    } finally {
+      releaseStart.resolve();
+      releaseTurn.resolve();
+      await Promise.all([creator.close(), peer.close()]);
+      await daemon.close();
+    }
+  },
+  60_000,
+);
+
+test.each(["accepted", "rejected", "unknown"] as const)(
+  "explicit Main creation records a first Codex command with %s outcome",
+  async (outcome) => {
+    const root = await mkdtemp(join(tmpdir(), "creation-main-command-"));
+    const commandReceived = deferred<void>();
+    const reply = deferred<void>();
+    let commandCount = 0;
+    const codex = new CodexAppServerAgentClient(
+      pino({ level: "silent" }),
+      { command: { mode: "replace", argv: [process.execPath] }, env: { CODEX_HOME: root } },
+      {
+        appServerProcess: {
+          resolvePrefix: async () => ({ command: process.execPath, args: [] }),
+          spawn: () =>
+            createFakeCodexAppServer({
+              "thread/loaded/list": () => ({ data: ["thread-1"] }),
+              "thread/compact/start": async () => {
+                commandCount += 1;
+                if (commandCount > 1) return {};
+                commandReceived.resolve();
+                await reply.promise;
+                if (outcome === "accepted") return {};
+                return {
+                  __jsonRpcError: {
+                    code: outcome === "rejected" ? -32602 : -32603,
+                    message: `Compaction ${outcome}`,
+                  },
+                };
+              },
+            }).child,
+        },
+      },
+    );
+    const daemon = await createCreationDaemon({ agentClients: { codex }, mcpEnabled: false });
+    const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+    const observer = await connectCreationPeer(daemon.port);
+    const messageId = "initial-compact";
+    const key = "create-main-with-compact";
+    const phases: string[] = [];
+    try {
+      await client.connect();
+      const { workspace } = await client.createWorkspace({
+        source: { kind: "directory", path: root },
+      });
+      if (!workspace) throw new Error("Missing workspace");
+      const creation = client.createAgent({
+        config: { provider: "codex", cwd: root },
+        workspaceId: workspace.id,
+        workspaceRole: "main",
+        idempotencyKey: key,
+        clientMessageId: messageId,
+        initialPrompt: "/compact",
+        onEvent: (snapshot) => phases.push(snapshot.phase),
+      });
+      void creation.catch(() => undefined);
+      await commandReceived.promise;
+      const status = await observer.request({
+        type: "creation.subscribe.request",
+        requestId: "compact-creation-status",
+        kind: "agent",
+        idempotencyKey: key,
+        subscribe: false,
+      });
+      expect(status).toMatchObject({ payload: { snapshot: { phase: "agent_ready" } } });
+      reply.resolve();
+      const { id } = await creation;
+      if (outcome === "accepted") expect(phases).toContain("prompt_started");
+      else expect(phases).not.toContain("prompt_started");
+
+      const retry = client.sendAgentMessage(id, "/compact", { messageId, waitForDispatch: true });
+      if (outcome === "unknown") {
+        await expect(retry).rejects.toThrow("agent_request_outcome_unknown");
+      } else {
+        await retry;
+      }
+      if (outcome === "rejected") await expect.poll(() => commandCount).toBe(2);
+      else expect(commandCount).toBe(1);
+    } finally {
+      reply.resolve();
+      observer.close();
+      await client.close();
+      await daemon.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+test("explicit Main occupancy survives closing and follows archive, promotion and restore", async () => {
+  const daemon = await createCreationDaemon();
+  const url = `ws://127.0.0.1:${daemon.port}/ws`;
+  const client = new DaemonClient({ url, clientId: "main-lifecycle-creator" });
+  const observer = new DaemonClient({ url, clientId: "main-lifecycle-observer" });
+  const updates: SessionOutboundMessage[] = [];
+  const unsubscribe = observer.subscribeRawMessages((message) => updates.push(message));
+  const { agentManager, agentStorage } = daemon.daemon;
+  const config = { provider: "codex", cwd: daemon.staticDir };
+  const source = { kind: "directory", path: config.cwd } as const;
+  try {
+    await client.connect();
+    await observer.connect();
+    const created = await client.createWorkspace({
+      source,
+      agent: { config, workspaceRole: "main" },
+    });
+    if (!created.workspace || !created.agent)
+      throw new Error(created.error ?? "Missing workspace or Main");
+    expect(created.mainAgent).toBeUndefined();
+    expect(created.workspace.hasActiveMainAgent).toBe(true);
+    expect(created.agent.labels[WORKSPACE_ROLE_LABEL]).toBe(WORKSPACE_MAIN_ROLE);
+
+    const { workspace } = await client.createWorkspace({ source });
+    if (!workspace) throw new Error("Missing second workspace");
+    const main = await client.createAgent({
+      config,
+      workspaceId: workspace.id,
+      workspaceRole: "main",
+      background: true,
+    });
+    expect(main.background).toBe(true);
+    await agentManager.closeAgent(main.id);
+    expect((await agentStorage.get(main.id))?.lastStatus).toBe("closed");
+    const observed = await observer.fetchWorkspaces({
+      subscribe: {},
+      filter: { query: workspace.id },
+    });
+    expect(observed.entries.find(({ id }) => id === workspace.id)?.hasActiveMainAgent).toBe(true);
+    await expect(
+      client.createAgent({ config, workspaceId: workspace.id, workspaceRole: "main" }),
+    ).rejects.toMatchObject({ code: "workspace_main_exists" });
+
+    const waitForOccupancy = async (after: number, occupied: boolean) =>
+      expect
+        .poll(() =>
+          updates
+            .slice(after)
+            .some(
+              (message) =>
+                message.type === "workspace_update" &&
+                message.payload.kind === "upsert" &&
+                message.payload.workspace.id === workspace.id &&
+                message.payload.workspace.hasActiveMainAgent === occupied,
+            ),
+        )
+        .toBe(true);
+    let before = updates.length;
+    await agentManager.archiveSnapshot(main.id, new Date().toISOString());
+    await waitForOccupancy(before, false);
+
+    const regular = await client.createAgent({ config, workspaceId: workspace.id });
+    await agentManager.closeAgent(regular.id);
+    before = updates.length;
+    await client.setAgentMainControl(regular.id, true);
+    await waitForOccupancy(before, true);
+
+    await agentManager.unarchiveSnapshot(main.id);
+    expect((await agentStorage.get(main.id))?.labels[WORKSPACE_ROLE_LABEL]).toBeUndefined();
+    expect((await agentStorage.get(regular.id))?.labels[WORKSPACE_ROLE_LABEL]).toBe(
+      WORKSPACE_MAIN_ROLE,
+    );
+
+    before = updates.length;
+    await agentManager.archiveSnapshot(regular.id, new Date().toISOString());
+    await waitForOccupancy(before, false);
+    before = updates.length;
+    await agentManager.unarchiveSnapshot(regular.id);
+    await waitForOccupancy(before, true);
+
+    await client.createAgent({ config, workspaceId: workspace.id });
+    before = updates.length;
+    const moved = await client.moveAgentToWorkspace(regular.id, {
+      expectedWorkspaceId: workspace.id,
+    });
+    await waitForOccupancy(before, false);
+    expect((await observer.findWorkspace(moved.workspaceId))?.hasActiveMainAgent).toBe(true);
+    await expect(
+      client.createAgent({ config, workspaceId: moved.workspaceId, workspaceRole: "main" }),
+    ).rejects.toMatchObject({ code: "workspace_main_exists" });
+  } finally {
+    unsubscribe();
+    await client.close();
+    await observer.close();
+    await daemon.close();
+  }
+}, 60_000);
 
 test("creation progresses before agent readiness and continues after the disconnected Session is cleaned up", async () => {
   const provider = deferred<void>();

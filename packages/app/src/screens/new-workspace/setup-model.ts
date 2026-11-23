@@ -106,6 +106,8 @@ export interface NewWorkspaceSetup {
 
 /** What a pick does beyond changing the model, the same for the picker and for a command. */
 export interface SetupEffects {
+  /** Allows a new target selection to release the restored Main selection. */
+  beforeIsolationChange?(isolation: Isolation | { path: string }): boolean;
   /** Remembers the isolation as the default for the next New workspace screen. */
   persistIsolation(isolation: Isolation): void;
   /** Keeps the picker's change-request attachment in step with the chosen base. */
@@ -187,8 +189,13 @@ export function createNewWorkspaceSetup(
     effects.syncBaseAttachment(item);
   };
   const chooseIsolation = (isolation: Isolation) => {
+    if (effects.beforeIsolationChange?.(isolation) === false) return;
     update({ manualIsolation: isolation, existingWorktreePath: null });
     effects.persistIsolation(isolation);
+  };
+  const chooseExistingWorktree = (path: string) => {
+    if (effects.beforeIsolationChange?.({ path }) === false) return;
+    update({ existingWorktreePath: path });
   };
   const refActionFor = (kind: RefKind): RefAction =>
     refActionOf({
@@ -208,11 +215,13 @@ export function createNewWorkspaceSetup(
       return;
     }
     // The project directory is Project directory, not one of the existing worktrees.
-    update(
-      holder.containsCwd
-        ? { manualIsolation: "local", existingWorktreePath: null }
-        : { existingWorktreePath: holder.path },
-    );
+    if (holder.containsCwd) {
+      if (effects.beforeIsolationChange?.("local") !== false) {
+        update({ manualIsolation: "local", existingWorktreePath: null });
+      }
+    } else {
+      chooseExistingWorktree(holder.path);
+    }
   };
   const commandsFor = (target: SetupTarget): SetupCommands => {
     const unlocked = (): SetupInputs => {
@@ -264,7 +273,7 @@ export function createNewWorkspaceSetup(
     dispatchPicker,
     chooseBase,
     chooseIsolation,
-    chooseExistingWorktree: (path) => update({ existingWorktreePath: path }),
+    chooseExistingWorktree,
     chooseRef,
     chooseRefAction: (kind, action) =>
       update({ refActions: { ...state.refActions, [kind]: action } }),

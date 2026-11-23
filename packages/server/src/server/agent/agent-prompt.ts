@@ -1,14 +1,14 @@
 import { prepareAgentMessage, type AgentPromptSource } from "./agent-messages/index.js";
 import type { Logger } from "pino";
 
-import type { AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
+import type { AgentCommandOutcome, AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import { ForegroundPromptStart } from "./agent-run-state.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { AgentNotFoundError, ensureAgentLoaded } from "./agent-loading.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
-import type { QueueHandoff } from "../message-receipts/index.js";
+import { AgentRequestOutcomeUnknownError, type QueueHandoff } from "../message-receipts/index.js";
 
 export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "unarchiveSnapshot">;
 
@@ -324,6 +324,8 @@ export interface StartCreatedAgentInitialPromptParams {
   prompt: AgentPromptInput | null;
   source?: AgentPromptSource;
   runOptions?: AgentRunOptions;
+  handoff?: QueueHandoff;
+  waitForCommandOutcome?: boolean;
   logger: Logger;
 }
 
@@ -560,14 +562,29 @@ export async function startCreatedAgentInitialPrompt(
     await resolvePromptSource(params.source, params.agentManager, params.agentStorage),
     params.runOptions?.clientMessageId,
   );
+  let commandOutcome: AgentCommandOutcome | undefined;
   const dispatchResult = await startAgentRun(
     params.agentManager,
     params.agentId,
     delivery.prompt,
     params.logger,
-    { runOptions: { ...params.runOptions, clientMessageId: delivery.messageId } },
+    {
+      runOptions: { ...params.runOptions, clientMessageId: delivery.messageId },
+      beforeHandoff: params.handoff?.begin,
+      onSteerDeclined: params.handoff?.declined,
+      commandDispatch: params.waitForCommandOutcome
+        ? {
+            waitForProviderOutcome: true,
+            onProviderOutcome: async (outcome) => {
+              commandOutcome = outcome;
+              await params.handoff?.onProviderOutcome?.(outcome);
+            },
+          }
+        : undefined,
+    },
   );
 
+  if (commandOutcome === "unknown") throw new AgentRequestOutcomeUnknownError();
   if (dispatchResult.disposition === "turn_started") {
     await waitForAgentRunStartWithTimeout(
       params.agentManager,

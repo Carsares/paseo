@@ -227,6 +227,12 @@ export const en = {
     },
   },
   agentControls: {
+    workspaceMain: {
+      label: "Set as main session",
+      occupied: "This workspace already has an active main session.",
+      unknown: "Could not confirm whether this workspace has an active main session.",
+      unsupported: "Update the host to create a main session from a draft.",
+    },
     provider: {
       fallback: "Provider",
       select: "Select agent provider",

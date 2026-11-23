@@ -60,6 +60,7 @@ import type {
   WorkspaceAgentSummaryEntry,
   AgentStreamEventPayload,
   AgentSnapshotPayload,
+  AgentCreateRequest,
   ProjectPlacementPayload,
   AgentPermissionResolvedMessage,
   CreateAgentRequestMessage,
@@ -562,6 +563,7 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
   labels?: Record<string, string>;
   /** Plugin-owned data stored on the agent. Needs a host with `entityMetadata`. */
   metadata?: CreateAgentRequestMessage["metadata"];
+  workspaceRole?: AgentCreateRequest["workspaceRole"];
 }
 
 export type CreateWorkspaceAgentConfig = AgentSessionConfig;
@@ -3547,6 +3549,18 @@ export class DaemonClient {
   // Agent Lifecycle
   // ============================================================================
 
+  async getCreationSnapshot(
+    kind: CreationSnapshot["kind"],
+    idempotencyKey: string,
+  ): Promise<CreationSnapshot | null> {
+    const result = await this.sendCorrelatedSessionRequest({
+      message: { type: "creation.subscribe.request", kind, idempotencyKey, subscribe: false },
+      responseType: "creation.subscribe.response",
+    });
+    if (result.error) throw new Error(result.error);
+    return result.snapshot;
+  }
+
   private readonly creations = new CreationClient({
     supports: (feature) => {
       return this.lastServerInfoMessage?.features?.[feature] === true;
@@ -3624,8 +3638,15 @@ export class DaemonClient {
   }
 
   private assertAgentCreationFeatures(
-    options?: Pick<CreateAgentRequestOptions, "forkFrom" | "labels">,
+    options?: Pick<CreateAgentRequestOptions, "forkFrom" | "labels" | "workspaceRole">,
   ): void {
+    const workspaceRole = options?.workspaceRole;
+    if (workspaceRole !== undefined && workspaceRole !== "main") {
+      throw Object.assign(new Error('workspaceRole must be "main".'), {
+        code: "INVALID_WORKSPACE_ROLE" as const,
+        outcome: "rejected" as const,
+      });
+    }
     const features = this.lastServerInfoMessage?.features;
     // COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
     if (options?.forkFrom && features?.agentSeamlessContextSwitch !== true) {
@@ -3639,6 +3660,13 @@ export class DaemonClient {
       features?.agentExplicitParentReports !== true
     ) {
       throw Object.assign(new Error("Update the host to use explicit parent reporting."), {
+        outcome: "rejected" as const,
+      });
+    }
+    // COMPAT(agentCreateAsMain): added in v0.17.0-beta.1, remove gate after 2027-05-22.
+    if (workspaceRole === "main" && features?.agentCreateAsMain !== true) {
+      throw Object.assign(new Error("Update the host to create an agent as Main."), {
+        code: "AGENT_CREATE_AS_MAIN_UNSUPPORTED" as const,
         outcome: "rejected" as const,
       });
     }
@@ -3662,6 +3690,8 @@ export class DaemonClient {
     });
     if (result.error || !result.agent) {
       const error = new Error(result.error ?? "Agent creation failed");
+      const errorCode = result.errorCode ?? result.creation?.errorCode;
+      if (errorCode) Object.assign(error, { code: errorCode });
       if (
         result.creation?.phase === "failed" &&
         result.creation.outcomeUnknown === false &&
@@ -8836,6 +8866,7 @@ function resolveAgentConfig(options: CreateAgentRequestOptions): AgentSessionCon
     requestId: _requestId,
     labels: _labels,
     metadata: _metadata,
+    workspaceRole: _workspaceRole,
     ...overrides
   } = options;
 

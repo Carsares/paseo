@@ -19,7 +19,9 @@ export interface CreationResult {
   requestId?: string;
 }
 interface Dependencies {
-  supports: (feature: "creationLifecycle" | "agentRequestReceipts") => boolean;
+  supports: (
+    feature: "creationLifecycle" | "agentRequestReceipts" | "agentCreateAsMain",
+  ) => boolean;
   requestId: () => string;
   request: (kind: Kind, input: Record<string, unknown>) => Promise<CreationResult>;
   observe: (
@@ -150,7 +152,9 @@ export class CreationClient {
       reject,
       settled: false,
       modern:
-        this.deps.supports("creationLifecycle") || (kind === "workspace" && !!input.mainAgent),
+        this.deps.supports("creationLifecycle") ||
+        (this.hasExplicitMainRole(kind, input) && this.deps.supports("agentCreateAsMain")) ||
+        (kind === "workspace" && !!input.mainAgent),
       recovering: false,
     };
     this.operations.set(identity, operation);
@@ -161,6 +165,11 @@ export class CreationClient {
         (error) => this.fail(operation, error),
       );
     return result;
+  }
+
+  private hasExplicitMainRole(kind: Kind, input: Record<string, unknown>): boolean {
+    if (kind === "agent") return input.workspaceRole === "main";
+    return (input.agent as { workspaceRole?: unknown } | undefined)?.workspaceRole === "main";
   }
 
   private async submit(operation: Operation): Promise<void> {

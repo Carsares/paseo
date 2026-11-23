@@ -785,6 +785,39 @@ describe("workspace message schemas", () => {
     ).toBeUndefined();
   });
 
+  test("keeps the optional active main agent state in workspace snapshots", () => {
+    const workspace = {
+      id: "workspace-main-state",
+      projectId: "project",
+      projectDisplayName: "repo",
+      projectRootPath: "/repo",
+      projectKind: "directory" as const,
+      workspaceKind: "directory" as const,
+      name: "repo",
+      status: "done" as const,
+      activityAt: null,
+    };
+
+    const update = (descriptor: object) => ({
+      type: "session",
+      message: { type: "workspace_update", payload: { kind: "upsert", workspace: descriptor } },
+    });
+    for (const descriptor of [
+      workspace,
+      { ...workspace, hasActiveMainAgent: true },
+      { ...workspace, hasActiveMainAgent: false },
+    ]) {
+      expect(WorkspaceDescriptorPayloadSchema.parse(descriptor)).toMatchObject(descriptor);
+      expect(validateWSOutboundMessage(update(descriptor))).toMatchObject({
+        success: true,
+        data: update(descriptor),
+      });
+    }
+    expect(
+      validateWSOutboundMessage(update({ ...workspace, hasActiveMainAgent: "false" })).success,
+    ).toBe(false);
+  });
+
   test("parses legacy workspace descriptors without workspaceDirectory", () => {
     const parsed = SessionOutboundMessageSchema.parse({
       type: "workspace_update",

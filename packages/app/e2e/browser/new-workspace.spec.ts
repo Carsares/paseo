@@ -1,10 +1,13 @@
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { getParentAgentIdFromLabels, isMainControlAgent } from "@getpaseo/protocol/agent-labels";
 import { buildHostWorkspaceRoute, parseHostWorkspaceRouteFromPathname } from "@/utils/host-routes";
 import { expect, test, type Page } from "../support/fixtures";
 import { gotoAppShell } from "../support/helpers/app";
+import { connectDaemonClient } from "../support/helpers/daemon-client-loader";
 import {
   archiveWorkspaceFromDaemon,
   archiveLocalWorkspaceFromDaemon,
@@ -365,6 +368,79 @@ titleTest.describe("New workspace title", () => {
       expect(titles).not.toContain("Unsubmitted title");
     },
   );
+});
+
+test("restores the new workspace main session switch and opens the root session on empty submit", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  const project = await seedWorkspace({ repoPrefix: "new-workspace-main-", git: false });
+  try {
+    await page.setViewportSize({ width: 1600, height: 900 });
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    await openNewWorkspaceComposer(page, project);
+
+    const mainSwitch = page.getByRole("switch", { name: "Set as main session" });
+    const toolbarSwitch = page
+      .getByTestId("agent-controls-toolbar")
+      .getByTestId("composer-workspace-main")
+      .and(mainSwitch);
+    await expect(toolbarSwitch).toHaveAttribute("aria-checked", "false");
+    await toolbarSwitch.click();
+    await expect(toolbarSwitch).toHaveAttribute("aria-checked", "true");
+
+    await resizeComposerViewport(page, "portrait");
+    await page.reload();
+    await expect(mainSwitch).toBeHidden();
+    await page.getByTestId("combined-model-selector").click();
+    const sheetSwitch = page
+      .getByTestId("agent-controls-settings-list")
+      .getByTestId("composer-workspace-main")
+      .and(mainSwitch);
+    await expect(sheetSwitch).toHaveAttribute("aria-checked", "true");
+    await sheetSwitch.click();
+    await expect(sheetSwitch).toHaveAttribute("aria-checked", "false");
+    await sheetSwitch.click();
+    await expect(sheetSwitch).toHaveAttribute("aria-checked", "true");
+
+    await page
+      .getByTestId("agent-controls-model-sheet")
+      .getByRole("button", { name: "Close", exact: true })
+      .click();
+    await expect(sheetSwitch).toBeHidden();
+    await page.setViewportSize({ width: 1600, height: 900 });
+    await expect(toolbarSwitch).toHaveAttribute("aria-checked", "true");
+    await submitNewWorkspaceEmpty(page);
+
+    await expect(page).toHaveURL(/\/workspace\//u, { timeout: 30_000 });
+    const route = parseHostWorkspaceRouteFromPathname(new URL(page.url()).pathname);
+    expect(route?.serverId).toBe(getServerId());
+    expect(route?.workspaceId).not.toBe(project.workspaceId);
+    const client = await connectDaemonClient<
+      Pick<DaemonClient, "connect" | "close" | "fetchAgents">
+    >({
+      clientIdPrefix: "e2e-verify-new-workspace-main",
+    });
+    try {
+      const { entries } = await client.fetchAgents();
+      const agents = entries
+        .map(({ agent }) => agent)
+        .filter((agent) => agent.workspaceId === route?.workspaceId);
+      expect(agents).toHaveLength(1);
+      const [agent] = agents;
+      expect(agent.provider).toBe("mock");
+      expect(isMainControlAgent(agent)).toBe(true);
+      expect(getParentAgentIdFromLabels(agent.labels)).toBeNull();
+      expect(agent.lastUserMessageAt).toBeNull();
+      const tab = page.getByTestId(`workspace-tab-agent_${agent.id}`).filter({ visible: true });
+      await expect(tab).toHaveAttribute("aria-selected", "true", { timeout: 30_000 });
+    } finally {
+      await client.close();
+    }
+  } finally {
+    await project.cleanup();
+  }
 });
 
 test.describe("New workspace flow", () => {
@@ -1091,6 +1167,75 @@ test.describe("New workspace flow", () => {
       await expect(agentTabs).toHaveCount(1, { timeout: 30_000 });
     } finally {
       await tempRepo.cleanup();
+    }
+  });
+
+  test("restores the chosen existing worktree and its main session switch after reload", async ({
+    page,
+  }) => {
+    const repo = await createTempGitRepo("existing-worktree-main-");
+    try {
+      const checkouts = ["checkout-a", "checkout-b"].map((branch) => ({
+        branch,
+        directory: path.join(repo.path, branch),
+      }));
+      for (const { branch, directory } of checkouts) {
+        execFileSync("git", ["worktree", "add", "-b", branch, directory], {
+          cwd: repo.path,
+          stdio: "ignore",
+        });
+      }
+      const project = await openProjectViaDaemon(client, repo.path);
+      localProjectIds.add(project.projectId);
+      localWorkspaceIds.add(project.workspaceId);
+
+      await page.setViewportSize({ width: 1600, height: 900 });
+      await gotoAppShell(page);
+      await waitForSidebarHydration(page);
+      await openNewWorkspaceComposer(page, project);
+      await selectWorkspaceIsolation(page, "existing");
+
+      const worktreePicker = page.getByTestId("new-workspace-worktree-picker-trigger");
+      await expect(worktreePicker).toBeVisible();
+      const [first, second] = checkouts;
+      const target = (await worktreePicker.textContent())?.includes(first.branch) ? second : first;
+      await worktreePicker.click();
+      await page.getByTestId(`new-workspace-worktree-picker-option-${target.branch}`).click();
+      await expect(worktreePicker).toContainText(target.branch);
+
+      const mainSwitch = page
+        .getByTestId("composer-workspace-main")
+        .and(page.getByRole("switch", { name: "Set as main session" }));
+      await mainSwitch.click();
+      await expect(mainSwitch).toHaveAttribute("aria-checked", "true");
+      await page.reload();
+      await expect(worktreePicker).toContainText(target.branch);
+      await expect(mainSwitch).toHaveAttribute("aria-checked", "true");
+      await submitNewWorkspaceEmpty(page);
+
+      await expect(page).toHaveURL(/\/workspace\//u, { timeout: 30_000 });
+      const route = parseHostWorkspaceRouteFromPathname(new URL(page.url()).pathname);
+      expect(route?.serverId).toBe(getServerId());
+      expect(route?.workspaceId).not.toBe(project.workspaceId);
+      const { entries } = await client.fetchWorkspaces();
+      const workspace = entries.find((entry) => entry.id === route?.workspaceId);
+      expect(workspace).toBeDefined();
+      localWorkspaceIds.add(workspace!.id);
+      const targetDirectory = await realpath(target.directory);
+      expect(await realpath(workspace!.workspaceDirectory)).toBe(targetDirectory);
+
+      const agents = (await client.fetchAgents()).entries
+        .map(({ agent }) => agent)
+        .filter((agent) => agent.workspaceId === workspace!.id);
+      expect(agents).toHaveLength(1);
+      const [agent] = agents;
+      expect(await realpath(agent.cwd)).toBe(targetDirectory);
+      expect(isMainControlAgent(agent)).toBe(true);
+      expect(getParentAgentIdFromLabels(agent.labels)).toBeNull();
+      const tab = page.getByTestId(`workspace-tab-agent_${agent.id}`).filter({ visible: true });
+      await expect(tab).toHaveAttribute("aria-selected", "true", { timeout: 30_000 });
+    } finally {
+      await repo.cleanup();
     }
   });
 

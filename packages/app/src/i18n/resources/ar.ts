@@ -229,6 +229,12 @@ export const ar: TranslationResources = {
     },
   },
   agentControls: {
+    workspaceMain: {
+      label: "تعيين كجلسة رئيسية",
+      occupied: "توجد بالفعل جلسة رئيسية نشطة في مساحة العمل هذه.",
+      unknown: "تعذّر التأكد من وجود جلسة رئيسية نشطة في مساحة العمل هذه.",
+      unsupported: "حدّث المضيف لإنشاء جلسة رئيسية من مسودة.",
+    },
     provider: {
       fallback: "مزود",
       select: "حدد مزود الوكيل",

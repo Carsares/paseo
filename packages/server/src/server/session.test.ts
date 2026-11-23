@@ -1985,6 +1985,110 @@ describe("session authorization permissions", () => {
     ]);
   });
 
+  test.each([
+    { permissions: ["hub.execute"] as const, placement: "existing" },
+    { permissions: ["workspace.write"] as const, placement: "implicit-new" },
+    { permissions: ["workspace.manage", "hub.execute"] as const, placement: "workspace-create" },
+  ])(
+    "rejects explicit Main creation without both required permissions ($placement)",
+    async ({ permissions, placement }) => {
+      const messages: SessionOutboundMessage[] = [];
+      const listWorkspaces = vi.fn();
+      const session = createSessionForTest({
+        messages,
+        permissions,
+        workspaceRegistry: { get: listWorkspaces },
+      });
+      const agent = {
+        config: { provider: "codex", cwd: "/tmp" },
+        labels: {},
+        workspaceRole: "main" as const,
+      };
+      try {
+        if (placement === "workspace-create") {
+          await session.handleMessage({
+            type: "workspace.create.request",
+            requestId: "create-main",
+            source: { kind: "directory", path: "/tmp" },
+            agent,
+          });
+          expect(findByType(messages, "workspace.create.response")?.payload).toMatchObject({
+            errorCode: "access_denied",
+            workspace: null,
+          });
+        } else {
+          await session.handleMessage({
+            ...agent,
+            type: "agent.create.request",
+            requestId: "create-main",
+            ...(placement === "existing" ? { workspaceId: "workspace" } : {}),
+          });
+          expect(findByType(messages, "agent.create.response")?.payload).toMatchObject({
+            errorCode: "access_denied",
+            agent: null,
+          });
+        }
+        expect(listWorkspaces).not.toHaveBeenCalled();
+      } finally {
+        await session.cleanup();
+      }
+    },
+  );
+
+  test("rejects conflicting Main options and caller, origin or parent inputs", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const session = createSessionForTest({ messages });
+    const config = { provider: "codex", cwd: "/tmp" };
+    const agent = { config, labels: {}, workspaceRole: "main" as const };
+    try {
+      for (const intent of [
+        { callerAgentId: "caller" },
+        { initialPromptOrigin: "agent" as const },
+        { labels: { [PARENT_AGENT_ID_LABEL]: "parent" } },
+        { labels: { [PARENT_SERVER_ID_LABEL]: "remote" } },
+        { internal: true },
+      ]) {
+        messages.length = 0;
+        await session.handleMessage({
+          ...agent,
+          ...intent,
+          type: "agent.create.request",
+          requestId: "create-main",
+          workspaceId: "workspace",
+        });
+        expect(findByType(messages, "agent.create.response")?.payload).toMatchObject({
+          errorCode: "invalid_request",
+          agent: null,
+        });
+      }
+      await session.handleMessage({
+        type: "workspace.create.request",
+        requestId: "create-workspace",
+        source: { kind: "directory", path: "/tmp" },
+        mainAgent: { config },
+        agent,
+      });
+      expect(findByType(messages, "workspace.create.response")?.payload).toMatchObject({
+        errorCode: "invalid_request",
+        workspace: null,
+      });
+      messages.length = 0;
+      await session.handleMessage({
+        type: "workspace.create.request",
+        requestId: "create-workspace-on-behalf-of-agent",
+        source: { kind: "directory", path: "/tmp" },
+        callerAgentId: "caller",
+        agent,
+      });
+      expect(findByType(messages, "workspace.create.response")?.payload).toMatchObject({
+        errorCode: "invalid_request",
+        workspace: null,
+      });
+    } finally {
+      await session.cleanup();
+    }
+  });
+
   test.each(["workspace.write", "workspace.manage"] as const)(
     "refuses a move with only %s before looking up the agent",
     async (permission) => {

@@ -5,6 +5,7 @@ export type WorktreeWireErrorCode =
   | "branch_already_checked_out"
   | "missing_checkout_target"
   | "unknown_branch"
+  | "workspace_main_exists"
   | "unknown";
 
 export interface WorktreeWireError {
@@ -23,6 +24,7 @@ export class WorktreeRequestError extends Error {
 }
 
 export function toWorktreeWireError(error: unknown): WorktreeWireError {
+  if (error instanceof WorktreeRequestError) return { code: error.code, message: error.message };
   if (error instanceof BranchAlreadyCheckedOutError) {
     return { code: "branch_already_checked_out", message: error.message };
   }

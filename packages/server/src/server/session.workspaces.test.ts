@@ -2241,7 +2241,14 @@ test("close_items_request archives agents and kills terminals in one batch", asy
         getAgent: (agentId: string) => (agentId === "agent-1" ? { id: agentId } : null),
         hasInFlightRun: (agentId: string) => agentId === "agent-1",
         cancelAgentRun,
-        archiveAgent: async () => ({ archivedAt }),
+        archiveAgent: async (
+          agentId: string,
+          _archivedAt?: string,
+          options?: { cancelActiveRun?: boolean },
+        ) => {
+          if (options?.cancelActiveRun) await cancelAgentRun(agentId);
+          return { archivedAt };
+        },
         clearAgentAttention: async () => {},
         notifyAgentState: () => {},
       }),
@@ -8446,6 +8453,52 @@ test("workspace mutation handling drops queued observer sync after session clean
 
   expect(registerCalls).toEqual([REPO_CWD]);
   expect(unsubscribeCalls).toEqual([REPO_CWD]);
+});
+
+test("a main occupancy change buffered during the initial workspace listing reaches the client", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = asTestSession(
+    createSessionForWorkspaceTests({ onMessage: (message) => emitted.push(message) }),
+  );
+  const initial = {
+    id: "ws-main",
+    projectId: "proj-main",
+    projectDisplayName: "repo",
+    projectRootPath: REPO_CWD,
+    workspaceDirectory: REPO_CWD,
+    projectKind: "git" as const,
+    workspaceKind: "local_checkout" as const,
+    name: "repo",
+    status: "done" as const,
+    activityAt: null,
+    diffStat: null,
+    hasActiveMainAgent: true,
+  };
+  const afterArchive = { ...initial, hasActiveMainAgent: false };
+  const listing = deferred<ListFetchResult>();
+  const listingStarted = deferred<void>();
+  session.listFetchWorkspacesEntries = async () => {
+    listingStarted.resolve();
+    return listing.promise;
+  };
+  session.buildWorkspaceDescriptorMap = async () => new Map([[initial.id, afterArchive]]);
+  const subscribing = session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "req-main-bootstrap",
+    subscribe: { subscriptionId: "sub-main-bootstrap" },
+  });
+  await listingStarted.promise;
+  await session.emitWorkspaceUpdatesForWorkspaceIds([initial.id]);
+  listing.resolve({
+    entries: [initial],
+    emptyProjects: [],
+    pageInfo: { nextCursor: null, prevCursor: null, hasMore: false },
+  });
+  await subscribing;
+  expect(filterByType(emitted, "rpc_error")).toEqual([]);
+  expect(filterByType(emitted, "workspace_update")).toEqual([
+    { type: "workspace_update", payload: { kind: "upsert", workspace: afterArchive } },
+  ]);
 });
 
 test("a workspace leaving a filtered subscription after bootstrap emits a removal", async () => {

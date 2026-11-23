@@ -27,6 +27,11 @@ import { MenuHeader } from "@/components/headers/menu-header";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { useToast } from "@/contexts/toast-context";
 import { useAgentInputDraft } from "@/composer/draft/input-draft";
+import {
+  canChooseWorkspaceMain,
+  workspaceMainBlockMessage,
+  workspaceMainErrorBlock,
+} from "@/composer/draft/workspace-main-intent";
 import { useForgeSearchQuery } from "@/git/use-forge-search-query";
 import { getForgePresentation } from "@/git/forge";
 import { useCheckoutPrStatusQuery } from "@/git/use-pr-status-query";
@@ -49,13 +54,17 @@ import {
   useHosts,
   type HostRuntimeConnectionStatus,
 } from "@/runtime/host-runtime";
-import { useHostFeature, useHostFeatureMap } from "@/runtime/host-features";
+import { selectHostFeature, useHostFeature, useHostFeatureMap } from "@/runtime/host-features";
 import type { HostProfile } from "@/types/host-connection";
 import {
   navigateToWorkspace,
   useLastWorkspaceSelection,
 } from "@/stores/navigation-active-workspace-store";
-import { normalizeWorkspaceDescriptor, type WorkspaceDescriptor } from "@/stores/session-store";
+import {
+  normalizeWorkspaceDescriptor,
+  useSessionStore,
+  type WorkspaceDescriptor,
+} from "@/stores/session-store";
 import { useWorkspace } from "@/stores/session-store-hooks";
 import { buildNewWorkspaceDraftKey, generateDraftId } from "@/stores/draft-keys";
 import { useOpenAddProject } from "@/hooks/use-open-add-project";
@@ -128,6 +137,7 @@ import {
   refActionOf,
   useNewWorkspaceSetupState,
   type NewWorkspaceSetup,
+  type SetupEffects,
   type SetupInputs,
 } from "./new-workspace/setup-model";
 import type { IsolationChoice } from "./new-workspace/form";
@@ -145,6 +155,14 @@ import {
 } from "./new-workspace/existing-worktrees";
 import { useNewWorkspaceForm } from "./new-workspace/form";
 import { DraftTitleEditor } from "./new-workspace/draft-title-editor";
+import { createOrRetryWorkspaceMain } from "./new-workspace/create-explicit-main";
+import {
+  readMainDraft,
+  restoreMainDraftAtTarget,
+  writeMainDraft,
+  type MainDraft,
+  type MainDraftTarget,
+} from "./new-workspace/main-draft";
 import { ImportSessionButton } from "./new-workspace/import-session-button";
 import { useImportSession } from "@/hooks/use-import-session";
 import {
@@ -248,15 +266,30 @@ function useWorkspaceIsolation(input: {
   existingWorktrees: readonly ExistingWorktree[];
   projectDirectory: string | null;
   submittedForkIsolation?: "local" | "worktree";
+  restoredMainTarget: MainDraftTarget | null;
 }): WorkspaceIsolationState {
   const { setup, supportsMultiplicity, canCreateWorktree, existingWorktrees } = input;
   // The last isolation choice is remembered alongside the other New Workspace
   // form preferences (provider, model, mode). A manual in-screen pick overrides
   // the remembered default until the screen remounts.
   const { preferences } = useFormPreferences();
-  const { manualIsolation, existingWorktreePath: chosenPath } = useNewWorkspaceSetupState(setup);
+  const { manualIsolation, existingWorktreePath: manuallyChosenPath } =
+    useNewWorkspaceSetupState(setup);
+  const chosenPath =
+    manuallyChosenPath ??
+    (input.restoredMainTarget?.isolation === "existing"
+      ? input.restoredMainTarget.directory
+      : null);
+  const restoredIsolation =
+    input.restoredMainTarget?.isolation === "existing"
+      ? "local"
+      : input.restoredMainTarget?.isolation;
   const isolation =
-    manualIsolation ?? input.submittedForkIsolation ?? preferences.isolation ?? "local";
+    manualIsolation ??
+    input.submittedForkIsolation ??
+    restoredIsolation ??
+    preferences.isolation ??
+    "local";
   // A worktree that left the list (removed since it was chosen) is no choice.
   const existingWorktreePath =
     canCreateWorktree && existingWorktrees.some((worktree) => worktree.path === chosenPath)
@@ -460,7 +493,8 @@ async function createMultiplicityWorkspace(input: {
     ...(Object.keys(input.metadata).length > 0 ? { metadata: { ...input.metadata } } : {}),
   });
   if (payload.error || !payload.workspace) {
-    throw new Error(payload.error ?? input.createFailedMessage);
+    const code = payload.errorCode ?? payload.creation?.errorCode;
+    throw Object.assign(new Error(payload.error ?? input.createFailedMessage), { code });
   }
   const normalizedWorkspace = normalizeWorkspaceDescriptor(payload.workspace);
   const workspaceForInitialMerge = input.withInitialAgent
@@ -468,12 +502,45 @@ async function createMultiplicityWorkspace(input: {
     : normalizedWorkspace;
   input.mergeWorkspaces(input.serverId, [workspaceForInitialMerge]);
   acceptMainAgent(payload.mainAgent);
+  if (input.agent?.workspaceRole === "main") acceptMainAgent(payload.agent);
   return { workspace: normalizedWorkspace, agent: payload.agent, mainAgent: payload.mainAgent };
 }
 
 type EnsureWorkspace = (
   input: EnsureNewWorkspaceRequest & Pick<CreateWorkspaceRequestOptions, "agent" | "onEvent">,
 ) => Promise<WorkspaceCreationResult>;
+
+function readCachedWorkspaceCreation(
+  result: WorkspaceCreationResult | { workspace: null },
+  agent: CreateWorkspaceRequestOptions["agent"],
+  t: TFunction,
+): WorkspaceCreationResult | null {
+  if (!result.workspace) return null;
+  if (agent?.workspaceRole === "main") {
+    throw new Error(workspaceMainBlockMessage(t, "unknown"));
+  }
+  return result;
+}
+
+function resolveSeparateMainAgent(input: {
+  request: EnsureNewWorkspaceRequest;
+  createMainAgent: boolean;
+  composerState: NewWorkspaceComposerState | null;
+  preferredProvider?: AgentProvider;
+  t: TFunction;
+}): CreateWorkspaceRequestOptions["mainAgent"] {
+  const { request, createMainAgent, composerState, preferredProvider, t } = input;
+  if (!createMainAgent || request.withInitialAgent) return request.mainAgent;
+  const selectedProvider = composerState?.selectedProvider ?? null;
+  const provider = resolveEmptyWorkspaceMainProvider({
+    selectedProvider,
+    preferredProvider,
+    entries: composerState?.allProviderEntries ?? [],
+  });
+  if (!provider) throw new Error(t("newWorkspace.errors.selectModel"));
+  const matchingComposer = provider === selectedProvider ? composerState : null;
+  return { config: buildWorkspaceAgentConfig(request.cwd, provider, matchingComposer) };
+}
 
 interface CreateChatAgentInput {
   finishTitle: () => void;
@@ -494,6 +561,7 @@ interface CreateChatAgentInput {
   labels: {
     composerStateRequired: string;
     selectModel: string;
+    missingAgent: string;
   };
 }
 
@@ -554,6 +622,7 @@ function buildComposerInitialValues(input: {
   return undefined;
 }
 
+const pendingExplicitMainSubmissions = new Set<string>();
 const pendingWorkspaceSubmissions = new Map<string, Promise<SubmitOutcome>>();
 function runCreateChatAgent(input: CreateChatAgentInput): Promise<SubmitOutcome> {
   const key = JSON.stringify([input.serverId, input.draftId]);
@@ -1046,6 +1115,18 @@ function useDefaultWorkspaceMainAgent(serverId: string) {
   return supported && settings.defaultWorkspaceMainAgent;
 }
 
+function readSubmittedForkIntent(draftId: string, serverId: string) {
+  const stored = useWorkspaceDraftSubmissionStore.getState().draftSetupStatusById[draftId];
+  return typeof stored === "object" && stored.sourceServerId === serverId
+    ? readForkAgentIntent(stored)
+    : undefined;
+}
+
+function workspaceCreationErrorMessage(t: TFunction, error: unknown, explicitMain: boolean) {
+  const block = explicitMain ? workspaceMainErrorBlock(error) : null;
+  return block ? workspaceMainBlockMessage(t, block) : toErrorMessage(error);
+}
+
 export function NewWorkspaceScreen({
   creationDraftId,
   rememberCreationDraft,
@@ -1063,6 +1144,13 @@ export function NewWorkspaceScreen({
   const { t } = useTranslation();
   const [error, setError] = useState<string | null>(null);
   const retry = useCallback(() => setError(null), []);
+  const mainDraft = useQuery({
+    queryKey: ["new-workspace-main-draft", id],
+    queryFn: () => (id ? readMainDraft(id) : null),
+    enabled: Boolean(title && !forkDraftId),
+    gcTime: 0,
+    retry: false,
+  });
   useEffect(() => {
     if (!focused || title || error) return;
     let active = true;
@@ -1083,7 +1171,9 @@ export function NewWorkspaceScreen({
       active = false;
     };
   }, [creationDraftId, forkDraftId, focused, error, title, rememberCreationDraft]);
-  if (!title) {
+  const { refetch: refetchMainDraft } = mainDraft;
+  const retryMainDraft = useCallback(() => void refetchMainDraft(), [refetchMainDraft]);
+  if (!title || (!forkDraftId && !mainDraft.isFetchedAfterMount)) {
     return (
       <View style={styles.titleLoading}>
         {error ? (
@@ -1101,7 +1191,54 @@ export function NewWorkspaceScreen({
       </View>
     );
   }
-  return <NewWorkspaceForm key={title.draftId} {...props} creationIdentity={title} />;
+  if (!forkDraftId && mainDraft.isError) {
+    return (
+      <View style={styles.titleLoading}>
+        <Text accessibilityRole="alert" style={styles.errorText}>
+          {workspaceMainBlockMessage(t, "unknown")}
+        </Text>
+        <Button variant="ghost" onPress={retryMainDraft}>
+          {t("common.actions.retry")}
+        </Button>
+      </View>
+    );
+  }
+  return (
+    <NewWorkspaceForm
+      key={title.draftId}
+      {...props}
+      creationIdentity={title}
+      restoredMainDraft={mainDraft.data ?? null}
+    />
+  );
+}
+
+function initialNewWorkspaceRoute(main: MainDraft | null, route: NewWorkspaceScreenProps) {
+  if (!main) return route;
+  const { serverId, sourceDirectory, projectId } = main.target;
+  return { serverId, sourceDirectory, projectId };
+}
+
+function useMainDraftSelection(id: string, initial: MainDraft | null) {
+  const [restoredMainTarget, setRestoredMainTarget] = useState(() => initial?.target ?? null);
+  const [mainDraft, setMainDraft] = useState(initial);
+  const mainDraftRef = useRef(initial);
+  const saveMainDraft = useCallback(
+    (next: MainDraft | null) => {
+      mainDraftRef.current = next;
+      setMainDraft(next);
+      return writeMainDraft(id, next);
+    },
+    [id],
+  );
+  return {
+    restoredMainTarget,
+    setRestoredMainTarget,
+    mainDraft,
+    mainDraftRef,
+    mainAttempt: mainDraft?.attempt,
+    saveMainDraft,
+  };
 }
 
 function NewWorkspaceForm({
@@ -1111,11 +1248,24 @@ function NewWorkspaceForm({
   displayName: displayNameProp,
   draftId,
   creationIdentity,
-}: NewWorkspaceScreenProps & { creationIdentity: WorkspaceDraftTitle }) {
+  restoredMainDraft,
+}: NewWorkspaceScreenProps & {
+  creationIdentity: WorkspaceDraftTitle;
+  restoredMainDraft: MainDraft | null;
+}) {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
   const toast = useToast();
+  const {
+    restoredMainTarget,
+    setRestoredMainTarget,
+    mainDraft,
+    mainDraftRef,
+    mainAttempt,
+    saveMainDraft,
+  } = useMainDraftSelection(creationIdentity.draftId, restoredMainDraft);
+  const beforeIsolationChange = useRef<SetupEffects["beforeIsolationChange"]>(undefined);
   const {
     forkDraftSetup,
     isTimelineFork,
@@ -1151,7 +1301,12 @@ function NewWorkspaceForm({
     lastActiveProject,
   } = useNewWorkspaceInitialContext(
     restoreForkWorktreeProject(
-      { serverId, sourceDirectory: sourceDirectoryProp, projectId, displayName: displayNameProp },
+      initialNewWorkspaceRoute(restoredMainDraft, {
+        serverId,
+        sourceDirectory: sourceDirectoryProp,
+        projectId,
+        displayName: displayNameProp,
+      }),
       restoredWorktree,
     ),
     isTimelineFork,
@@ -1216,10 +1371,10 @@ function NewWorkspaceForm({
   const [manualLaunchTarget, setManualLaunchTarget] = useState<LaunchTarget | null>(null);
   const launchTarget = useMemo(
     () =>
-      isTimelineFork
+      isTimelineFork || (mainDraft && !manualLaunchTarget)
         ? CHAT_LAUNCH_TARGET
         : resolveLaunchTarget(manualLaunchTarget ?? formPreferences.launchTarget, terminalProfiles),
-    [isTimelineFork, manualLaunchTarget, formPreferences.launchTarget, terminalProfiles],
+    [isTimelineFork, mainDraft, manualLaunchTarget, formPreferences.launchTarget, terminalProfiles],
   );
   const [terminalPromptText, setTerminalPromptText] = useState("");
   const {
@@ -1249,7 +1404,7 @@ function NewWorkspaceForm({
     return () => clearTimeout(timer);
   }, [pickerSearchQuery]);
 
-  const { workspace } = creationResult;
+  const { workspace: createdWorkspace } = creationResult;
   const client = useHostRuntimeClient(selectedServerId);
   const isConnected = useHostRuntimeIsConnected(selectedServerId);
   const {
@@ -1285,7 +1440,7 @@ function NewWorkspaceForm({
     draftKey,
     composer: buildComposerConfig({
       serverId: selectedServerId,
-      workspaceDirectory: workspace?.workspaceDirectory ?? null,
+      workspaceDirectory: createdWorkspace?.workspaceDirectory ?? null,
       sourceDirectory: selectedSourceDirectory,
       initialSetup: forkDraftSetup?.setup,
       restoredAgentIntent,
@@ -1313,6 +1468,7 @@ function NewWorkspaceForm({
     restoredWorktree,
     pendingAction,
     isDraftHandoffActive,
+    beforeIsolationChange,
     updatePreferences: updateFormPreferences,
     setAttachments: chatDraft.setAttachments,
   });
@@ -1321,16 +1477,6 @@ function NewWorkspaceForm({
     selectedServerId,
     selectedProjectId,
     selectedSourceDirectory,
-  );
-  const launchControl = useMemo(
-    () => ({
-      serverId: selectedServerId,
-      target: launchTarget,
-      onChange: setManualLaunchTarget,
-      profiles: terminalProfiles,
-      disabled: isPending || isTimelineFork,
-    }),
-    [isPending, isTimelineFork, launchTarget, selectedServerId, terminalProfiles],
   );
   const dispatchPickerSelection = setup.dispatchPicker;
   const setupState = useNewWorkspaceSetupState(setup);
@@ -1377,6 +1523,15 @@ function NewWorkspaceForm({
     cwd: selectedSourceDirectory ?? "",
   });
 
+  const matchedMainTarget = useMemo(
+    () =>
+      restoredMainTarget?.serverId === selectedServerId &&
+      restoredMainTarget.projectId === selectedProjectId &&
+      restoredMainTarget.sourceDirectory === selectedSourceDirectory
+        ? restoredMainTarget
+        : null,
+    [restoredMainTarget, selectedProjectId, selectedServerId, selectedSourceDirectory],
+  );
   const {
     effectiveIsolation,
     setIsolation,
@@ -1391,7 +1546,104 @@ function NewWorkspaceForm({
     existingWorktrees,
     projectDirectory: selectedSourceDirectory,
     submittedForkIsolation,
+    restoredMainTarget: matchedMainTarget,
   });
+  const mainTarget = useMemo(
+    () =>
+      selectedProjectId && selectedSourceDirectory && workingDirectory
+        ? {
+            serverId: selectedServerId,
+            projectId: selectedProjectId,
+            sourceDirectory: selectedSourceDirectory,
+            directory: workingDirectory,
+            isolation: choice,
+          }
+        : null,
+    [choice, selectedProjectId, selectedServerId, selectedSourceDirectory, workingDirectory],
+  );
+  const supportsCreateAsMain = useHostFeature(selectedServerId, "agentCreateAsMain");
+  const assertExplicitMainSupported = useCallback(() => {
+    // COMPAT(agentCreateAsMain): added in v0.17.0-beta.1, remove gate after 2027-05-22.
+    if (!selectHostFeature(useSessionStore.getState(), selectedServerId, "agentCreateAsMain")) {
+      throw new Error(workspaceMainBlockMessage(t, "unsupported"));
+    }
+  }, [selectedServerId, t]);
+  const reportMainDraftStorageError = useCallback(() => {
+    toast.error(workspaceMainBlockMessage(t, "unknown"));
+  }, [t, toast]);
+  const forgetMainTarget = useCallback(() => {
+    if (mainDraftRef.current?.attempt || pendingExplicitMainSubmissions.has(creationDraftId))
+      return false;
+    setRestoredMainTarget(null);
+    if (mainDraftRef.current) void saveMainDraft(null).catch(reportMainDraftStorageError);
+    return true;
+  }, [
+    creationDraftId,
+    mainDraftRef,
+    reportMainDraftStorageError,
+    saveMainDraft,
+    setRestoredMainTarget,
+  ]);
+  useLayoutEffect(() => {
+    beforeIsolationChange.current = (next) => {
+      if (mainDraftRef.current?.attempt || pendingExplicitMainSubmissions.has(creationDraftId))
+        return false;
+      if (typeof next === "string" ? next === choice : next.path === existingWorktreePath)
+        return true;
+      return forgetMainTarget();
+    };
+  }, [choice, creationDraftId, existingWorktreePath, forgetMainTarget, mainDraftRef]);
+  const workspaceMain = useMemo(() => {
+    if (
+      !mainTarget ||
+      !canChooseWorkspaceMain({
+        setup: forkDraftSetup?.setup,
+        isTerminal: isTerminalLaunch,
+        isHandoff: Boolean(draftId),
+      })
+    )
+      return undefined;
+    const checked = Boolean(restoreMainDraftAtTarget(mainDraft, mainTarget));
+    return {
+      checked,
+      disabled: Boolean(mainAttempt) || (!checked && !supportsCreateAsMain),
+      hint: supportsCreateAsMain ? undefined : workspaceMainBlockMessage(t, "unsupported"),
+      onChange: (next: boolean) => {
+        if (mainAttempt || pendingExplicitMainSubmissions.has(creationDraftId)) return;
+        if (next && !supportsCreateAsMain) return;
+        setRestoredMainTarget(null);
+        if (mainTarget.isolation === "existing") setup.chooseExistingWorktree(mainTarget.directory);
+        else if (restoredMainTarget) setIsolation(mainTarget.isolation);
+        void saveMainDraft(next ? { target: mainTarget } : null).catch(reportMainDraftStorageError);
+      },
+    };
+  }, [
+    creationDraftId,
+    draftId,
+    forkDraftSetup?.setup,
+    isTerminalLaunch,
+    mainAttempt,
+    mainDraft,
+    mainTarget,
+    reportMainDraftStorageError,
+    restoredMainTarget,
+    saveMainDraft,
+    setIsolation,
+    setRestoredMainTarget,
+    setup,
+    supportsCreateAsMain,
+    t,
+  ]);
+  const launchControl = useMemo(
+    () => ({
+      serverId: selectedServerId,
+      target: launchTarget,
+      onChange: setManualLaunchTarget,
+      profiles: terminalProfiles,
+      disabled: isPending || isTimelineFork || Boolean(mainAttempt),
+    }),
+    [isPending, isTimelineFork, launchTarget, mainAttempt, selectedServerId, terminalProfiles],
+  );
 
   const branchSuggestionsQuery = useQuery({
     queryKey: [
@@ -1501,11 +1753,17 @@ function NewWorkspaceForm({
       // selectProjectOption enforces selectability (worktree-only when
       // multiplicity is off, any project when it's on); don't re-gate here on
       // canCreateWorktree or non-git projects become unselectable.
+      if (id !== selectedProjectOptionId && !forgetMainTarget()) return;
       selectProjectOption(id);
       setProjectPickerOpen(false);
       clearPickerSelectionForTargetChange(selectedProjectOptionId, id);
     },
-    [clearPickerSelectionForTargetChange, selectProjectOption, selectedProjectOptionId],
+    [
+      clearPickerSelectionForTargetChange,
+      forgetMainTarget,
+      selectProjectOption,
+      selectedProjectOptionId,
+    ],
   );
 
   const handleSelectWorkspaceHost = useCallback(
@@ -1514,11 +1772,13 @@ function NewWorkspaceForm({
         toast.error(t("message.actions.forkUnavailable"));
         return;
       }
+      if (id !== selectedServerId && !forgetMainTarget()) return;
       handleSelectHost(id);
       clearPickerSelectionForTargetChange(selectedServerId, id);
     },
     [
       clearPickerSelectionForTargetChange,
+      forgetMainTarget,
       handleSelectHost,
       isTimelineFork,
       selectedServerId,
@@ -1581,20 +1841,15 @@ function NewWorkspaceForm({
     setProjectPickerOpen(nextOpen);
   }, []);
 
-  const ensureWorkspace = useCallback<EnsureWorkspace>(
-    async (input) => {
-      if (creationResult.workspace) {
-        return creationResult;
-      }
-      if (!selectedProject) {
-        throw new Error("Choose a project");
-      }
+  const prepareWorkspacePlacement = useCallback(
+    async (createSeparateMain: boolean, agentConfig?: ForkAgentIntent["config"]) => {
+      if (!selectedProject || !selectedProjectId) throw new Error("Choose a project");
       if (!selectedSourceDirectory || !workingDirectory) {
         throw new Error("Choose a host for this project");
       }
       const connectedClient = withConnectedClient();
+      const metadata = setup.getSnapshot().metadata;
       const createsWorktree = !supportsWorkspaceMultiplicity || effectiveIsolation === "worktree";
-      if (!selectedProjectId) throw new Error("Project is not available on the selected host");
       const worktree = createsWorktree
         ? await resolveWorktreeSubmission({
             setup,
@@ -1612,58 +1867,25 @@ function NewWorkspaceForm({
             t,
           })
         : undefined;
-      let mainAgent = input.mainAgent;
-      if (createMainAgent && !input.withInitialAgent) {
-        const selectedProvider = composerState?.selectedProvider ?? null;
-        const provider = resolveEmptyWorkspaceMainProvider({
-          selectedProvider,
-          preferredProvider: formPreferences.provider,
-          entries: composerState?.allProviderEntries ?? [],
-        });
-        if (!provider) throw new Error(t("newWorkspace.errors.selectModel"));
-        const matchingComposer = provider === selectedProvider ? composerState : null;
-        mainAgent = { config: buildWorkspaceAgentConfig(input.cwd, provider, matchingComposer) };
-      }
       const source = await recordWorkspaceCreationSource({
         directory: { kind: "directory", path: workingDirectory, projectId: selectedProjectId },
         worktree,
         forkDraft: isTimelineFork
-          ? { draftId: creationIdentity.draftId, serverId: selectedServerId }
+          ? { draftId: creationDraftId, serverId: selectedServerId }
           : undefined,
-        agentConfig: input.agent?.config,
-        createMainAgent: Boolean(mainAgent),
+        agentConfig,
+        createMainAgent: createSeparateMain,
       });
       const title = await useWorkspaceDraftSubmissionStore
         .getState()
-        .submitDraftTitle(creationIdentity.draftId);
-      const normalizedWorkspace = await createMultiplicityWorkspace({
-        title,
-        idempotencyKey: creationIdentity.draftId,
-        client: connectedClient,
-        source,
-        metadata: setup.getSnapshot().metadata,
-        withInitialAgent: input.withInitialAgent,
-        prompt: input.prompt,
-        attachments: input.attachments,
-        agent: input.agent,
-        mainAgent,
-        onEvent: input.onEvent,
-        mergeWorkspaces,
-        serverId: selectedServerId,
-        createFailedMessage: t("newWorkspace.errors.createWorktreeFailed"),
-      });
-      setCreationResult(normalizedWorkspace);
-      return normalizedWorkspace;
+        .submitDraftTitle(creationDraftId);
+      return { source, title, metadata };
     },
     [
-      creationIdentity,
-      creationResult,
-      composerState,
-      createMainAgent,
+      creationDraftId,
+      creationIdentity.worktreeSlug,
       effectiveIsolation,
-      formPreferences.provider,
       isTimelineFork,
-      mergeWorkspaces,
       queryClient,
       reservedWorktreeSlug,
       selectedProject,
@@ -1679,14 +1901,185 @@ function NewWorkspaceForm({
     ],
   );
 
+  const assertNoMainAttempt = useCallback(async () => {
+    if (draftId) return;
+    if (
+      pendingExplicitMainSubmissions.has(creationDraftId) ||
+      (await readMainDraft(creationDraftId))?.attempt
+    ) {
+      throw new Error(workspaceMainBlockMessage(t, "unknown"));
+    }
+  }, [creationDraftId, draftId, t]);
+
+  const ensureWorkspace = useCallback<EnsureWorkspace>(
+    async (input) => {
+      await assertNoMainAttempt();
+      const cached = readCachedWorkspaceCreation(creationResult, input.agent, t);
+      if (cached) return cached;
+      const mainAgent = resolveSeparateMainAgent({
+        request: input,
+        createMainAgent,
+        composerState,
+        preferredProvider: formPreferences.provider,
+        t,
+      });
+      const placement = await prepareWorkspacePlacement(Boolean(mainAgent), input.agent?.config);
+      const normalizedWorkspace = await createMultiplicityWorkspace({
+        ...placement,
+        idempotencyKey: creationDraftId,
+        client: withConnectedClient(),
+        withInitialAgent: input.withInitialAgent,
+        prompt: input.prompt,
+        attachments: input.attachments,
+        agent: input.agent,
+        mainAgent,
+        onEvent: input.onEvent,
+        mergeWorkspaces,
+        serverId: selectedServerId,
+        createFailedMessage: t("newWorkspace.errors.createWorktreeFailed"),
+      });
+      setCreationResult(normalizedWorkspace);
+      return normalizedWorkspace;
+    },
+    [
+      assertNoMainAttempt,
+      creationDraftId,
+      creationResult,
+      composerState,
+      createMainAgent,
+      formPreferences.provider,
+      mergeWorkspaces,
+      prepareWorkspacePlacement,
+      selectedServerId,
+      t,
+      withConnectedClient,
+    ],
+  );
+
+  const submitExplicitMain = useCallback(
+    async (payload: MessagePayload, target: MainDraftTarget) => {
+      const clearConsumedDraft = captureWorkspaceDraftCleanup({
+        draftId: creationDraftId,
+        draftKey,
+        draftContextScopeKey,
+        clearDraft: chatDraft.clear,
+      });
+      const provider = composerState?.selectedProvider;
+      const config = provider
+        ? buildWorkspaceAgentConfig(target.directory, provider, composerState)
+        : null;
+      const metadata = composerState?.metadata;
+      const format = resolveComposerAttachmentSubmitFormat({
+        supportsForgeAttachments: supportsForgeSearch,
+      });
+      const wire = splitComposerAttachmentsForSubmit(payload.attachments, { format });
+      const unavailableMessage = workspaceMainBlockMessage(t, "unknown");
+      const previous = restoreMainDraftAtTarget(await readMainDraft(creationDraftId), target);
+      if (!previous) throw new Error(unavailableMessage);
+      const { workspace, agent } = await createOrRetryWorkspaceMain({
+        client: withConnectedClient(),
+        target,
+        previous,
+        save: saveMainDraft,
+        prepareAgent: async () => {
+          if (!composerState) throw new Error(t("newWorkspace.errors.composerStateRequired"));
+          if (!config) throw new Error(t("newWorkspace.errors.selectModel"));
+          const images = await encodeImages(wire.images, t("composer.errors.failedToSend"));
+          await composerState.persistFormPreferences();
+          await updateFormPreferences({ launchTarget });
+          return {
+            config,
+            ...(metadata && Object.keys(metadata).length > 0 ? { metadata } : {}),
+            initialPrompt: payload.text,
+            clientMessageId: `${creationDraftId}:initial-message`,
+            images: images?.length ? images : undefined,
+            attachments: wire.attachments?.length ? wire.attachments : undefined,
+          };
+        },
+        prepareWorkspace: () => prepareWorkspacePlacement(false),
+        canCreateWorkspace: Boolean(restoreMainDraftAtTarget(previous, mainTarget)),
+        assertSupported: assertExplicitMainSupported,
+        unavailableMessage,
+        inProgressMessage: t("panels.draft.creatingAgent"),
+        failedMessage: t("composer.errors.failedToCreateAgent"),
+      });
+      const normalizedWorkspace = normalizeWorkspaceDescriptor(workspace);
+      mergeWorkspaces(selectedServerId, [{ ...normalizedWorkspace, hasActiveMainAgent: true }]);
+      getHostRuntimeStore().acceptAgentSnapshot(
+        selectedServerId,
+        normalizeAgentSnapshot(agent, selectedServerId),
+      );
+      clearConsumedDraft();
+      if (isStillOnCreateScreen()) {
+        leaveFullscreen();
+        navigateToWorkspace({
+          serverId: selectedServerId,
+          workspaceId: workspace.id,
+          target: { kind: "agent", agentId: agent.id },
+        });
+      }
+      await useWorkspaceDraftSubmissionStore
+        .getState()
+        .finishDraftTitle(creationDraftId)
+        .then(() => writeMainDraft(creationDraftId, null))
+        .catch(reportMainDraftStorageError);
+    },
+    [
+      assertExplicitMainSupported,
+      chatDraft.clear,
+      composerState,
+      creationDraftId,
+      draftContextScopeKey,
+      draftKey,
+      isStillOnCreateScreen,
+      launchTarget,
+      leaveFullscreen,
+      mainTarget,
+      mergeWorkspaces,
+      prepareWorkspacePlacement,
+      reportMainDraftStorageError,
+      saveMainDraft,
+      selectedServerId,
+      supportsForgeSearch,
+      t,
+      updateFormPreferences,
+      withConnectedClient,
+    ],
+  );
+
+  const handleSubmitExplicitMain = useCallback(
+    async (payload: MessagePayload, draft: MainDraft) => {
+      const canRecover = draft.attempt && draft.target.serverId === selectedServerId;
+      const canCreate = restoreMainDraftAtTarget(draft, mainTarget);
+      if ((!canRecover && !canCreate) || pendingExplicitMainSubmissions.has(creationDraftId)) {
+        throw new Error(workspaceMainBlockMessage(t, "unknown"));
+      }
+      pendingExplicitMainSubmissions.add(creationDraftId);
+      setPendingAction("chat");
+      try {
+        await submitExplicitMain(payload, draft.target);
+      } finally {
+        pendingExplicitMainSubmissions.delete(creationDraftId);
+        setPendingAction(null);
+      }
+    },
+    [creationDraftId, mainTarget, selectedServerId, submitExplicitMain, t],
+  );
+
   const handleSubmitNewWorkspace = useCallback(
     async (payload: MessagePayload) => {
+      const armedMain = mainDraftRef.current;
       try {
         setErrorMessage(null);
         // The source agent ID is local to the host that opened this draft.
         if (isTimelineFork && selectedServerId !== serverId.trim()) {
           throw new Error(t("message.actions.forkUnavailable"));
         }
+        if (armedMain) {
+          await handleSubmitExplicitMain(payload, armedMain);
+          return;
+        }
+        await assertNoMainAttempt();
         await composerState?.persistFormPreferences();
         if (!isTimelineFork) await updateFormPreferences({ launchTarget });
         if (!isTimelineFork && isEmptyWorkspaceSubmission(payload)) {
@@ -1719,14 +2112,7 @@ function NewWorkspaceForm({
         }
 
         setPendingAction("chat");
-        const stored =
-          useWorkspaceDraftSubmissionStore.getState().draftSetupStatusById[
-            creationIdentity.draftId
-          ];
-        const submittedAgentIntent =
-          typeof stored === "object" && stored.sourceServerId === selectedServerId
-            ? readForkAgentIntent(stored)
-            : undefined;
+        const submittedAgentIntent = readSubmittedForkIntent(creationDraftId, selectedServerId);
         if (!submittedAgentIntent) {
           submittedAgentConfigRevision.current = agentConfigRevision.current;
         }
@@ -1747,7 +2133,7 @@ function NewWorkspaceForm({
           serverId: selectedServerId,
           clearDraft: chatDraft.clear,
           draftKey,
-          draftId: creationIdentity.draftId,
+          draftId: creationDraftId,
           draftContextScopeKey,
           supportsForgeSearch,
           resolveClient: withConnectedClient,
@@ -1755,23 +2141,26 @@ function NewWorkspaceForm({
           labels: {
             composerStateRequired: t("newWorkspace.errors.composerStateRequired"),
             selectModel: t("newWorkspace.errors.selectModel"),
+            missingAgent: t("composer.errors.failedToCreateAgent"),
           },
         });
         if (outcome === "background") {
           setPendingAction(null);
         }
       } catch (error) {
-        const message = toErrorMessage(error);
+        const message = workspaceCreationErrorMessage(t, error, Boolean(armedMain));
         setPendingAction(null);
         setErrorMessage(message);
         toast.error(message);
+        if (armedMain) throw new Error(message, { cause: error });
       }
     },
     [
+      assertNoMainAttempt,
       composerState,
       createMainAgent,
       draftContextScopeKey,
-      creationIdentity,
+      creationDraftId,
       chatDraft.clear,
       draftKey,
       finishTitle,
@@ -1781,6 +2170,8 @@ function NewWorkspaceForm({
       isTimelineFork,
       launchTarget,
       leaveFullscreen,
+      handleSubmitExplicitMain,
+      mainDraftRef,
       selectedServerId,
       serverId,
       supportsForgeSearch,
@@ -1843,6 +2234,7 @@ function NewWorkspaceForm({
         },
       });
       finishTitle();
+      if (mainDraftRef.current) void saveMainDraft(null).catch(reportMainDraftStorageError);
       if (outcome === "background") {
         setPendingAction(null);
       }
@@ -1857,7 +2249,10 @@ function NewWorkspaceForm({
     finishTitle,
     isStillOnCreateScreen,
     launchTarget,
+    mainDraftRef,
     queryClient,
+    reportMainDraftStorageError,
+    saveMainDraft,
     selectedServerId,
     selectedTerminalProfile,
     t,
@@ -1872,7 +2267,7 @@ function NewWorkspaceForm({
   const agentControlsWithDisabled = useMemo(() => {
     if (!composerState) return undefined;
     const controls = composerState.agentControls;
-    if (!isTimelineFork) return { ...controls, disabled: isPending };
+    if (!isTimelineFork) return { ...controls, disabled: isPending, workspaceMain };
     function trackEdit<Args extends unknown[], Result>(action: (...args: Args) => Result) {
       return (...args: Args) => {
         const result = action(...args);
@@ -1894,7 +2289,7 @@ function NewWorkspaceForm({
         onSetOption: trackEdit(controls.optionControls.onSetOption),
       },
     };
-  }, [composerState, isPending, isTimelineFork, markAgentConfigEdited]);
+  }, [composerState, isPending, isTimelineFork, workspaceMain, markAgentConfigEdited]);
 
   const pickerEmptyText =
     branchSuggestionsQuery.isFetching || githubPrSearchQuery.isFetching
@@ -1972,6 +2367,7 @@ function NewWorkspaceForm({
   const importSession = useImportSession({ serverId: selectedServerId });
 
   const isComposerFullscreen = composerEditing.isFullscreen(isTerminalLaunch);
+  const composerCwd = workingDirectory ?? "";
   const composer = isTerminalLaunch ? (
     <Composer
       key="terminal"
@@ -1995,7 +2391,7 @@ function NewWorkspaceForm({
       textReplacement={terminalTextReplacement}
       attachments={NO_TERMINAL_ATTACHMENTS}
       onChangeAttachments={noopChangeAttachments}
-      cwd={workingDirectory ?? ""}
+      cwd={composerCwd}
       clearDraft={noopClearDraft}
       autoFocus={terminalTakesPrompt}
       autoFocusKey={launchFocusKey}
@@ -2024,7 +2420,7 @@ function NewWorkspaceForm({
       onChangeAttachments={chatDraft.setAttachments}
       onForgeChangeRequestDetected={handleForgeChangeRequestDetected}
       onForgeChangeRequestAutoAttach={handleForgeChangeRequestAutoAttach}
-      cwd={workingDirectory ?? ""}
+      cwd={composerCwd}
       clearDraft={handleClearDraft}
       autoFocus
       autoFocusKey={launchFocusKey}
@@ -2053,7 +2449,11 @@ function NewWorkspaceForm({
         onImportSession={importSession.open}
       >
         {composer}
-        {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+        {errorMessage ? (
+          <Text accessibilityRole="alert" style={styles.errorText}>
+            {errorMessage}
+          </Text>
+        ) : null}
       </NewWorkspaceLayout>
       {importSession.sheet}
     </FileDropZone>
@@ -2072,6 +2472,7 @@ function usePluginSetup(input: {
   restoredWorktree?: ForkWorktreeSubmission;
   pendingAction: Parameters<typeof isNewWorkspacePending>[0]["pendingAction"];
   isDraftHandoffActive: boolean;
+  beforeIsolationChange: { current: SetupEffects["beforeIsolationChange"] };
   updatePreferences: ReturnType<typeof useFormPreferences>["updatePreferences"];
   setAttachments: ReturnType<typeof useAgentInputDraft>["setAttachments"];
 }) {
@@ -2114,6 +2515,7 @@ function usePluginSetup(input: {
     createNewWorkspaceSetup(
       inputs,
       {
+        beforeIsolationChange: (next) => input.beforeIsolationChange.current?.(next) !== false,
         persistIsolation: (isolation) => void updatePreferences({ isolation }),
         syncBaseAttachment: (item) =>
           setAttachments((attachments) => syncPickerPrAttachment({ attachments, item })),

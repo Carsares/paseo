@@ -3,6 +3,7 @@ import path from "node:path";
 import { z } from "zod";
 import type { Logger } from "pino";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
+import { isMainControlAgentLabels } from "@getpaseo/protocol/agent-labels";
 
 import { writeJsonFileAtomic } from "../atomic-file.js";
 import { AgentFeatureSchema, AgentOptionControlSchema, AgentStatusSchema } from "../messages.js";
@@ -125,6 +126,13 @@ export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
   return STORED_AGENT_SCHEMA.parse(value);
 }
 
+function activeMainWorkspaceId(record: StoredAgentRecord | undefined): string | undefined {
+  if (record && !record.archivedAt && !record.internal && isMainControlAgentLabels(record.labels)) {
+    return record.workspaceId;
+  }
+  return undefined;
+}
+
 export class AgentStorage {
   readonly timelinePrefixes: TimelinePrefixStore;
   private cache: Map<string, StoredAgentRecord> = new Map();
@@ -137,6 +145,7 @@ export class AgentStorage {
   private readonly idsByWorkspace = new Map<string, Set<string>>();
   private readonly workspaceById = new Map<string, string>();
   private readonly activeIds = new Set<string>();
+  private readonly mainWorkspaceListeners = new Set<(workspaceIds: readonly string[]) => void>();
   private readonly promptTimeByAgent = new Map<string, string>();
   private readonly promptTimes = new Map<string, string>();
   private loaded = false;
@@ -155,6 +164,17 @@ export class AgentStorage {
 
   async initialize(): Promise<void> {
     await this.load();
+  }
+
+  subscribeToMainWorkspaceChanges(listener: (workspaceIds: readonly string[]) => void): () => void {
+    this.mainWorkspaceListeners.add(listener);
+    return () => this.mainWorkspaceListeners.delete(listener);
+  }
+
+  private publishMainWorkspaceChange(before?: string, after?: string): void {
+    if (before === after) return;
+    const workspaceIds = [before, after].filter((id): id is string => id !== undefined);
+    for (const listener of this.mainWorkspaceListeners) listener(workspaceIds);
   }
 
   async listAll(): Promise<StoredAgentRecord[]> {
@@ -374,9 +394,11 @@ export class AgentStorage {
       this.removeIndexedPath(agentId, previousPath);
     }
 
+    const previousMainWorkspaceId = activeMainWorkspaceId(this.cache.get(agentId));
     this.cache.set(agentId, record);
     this.indexOwner(record);
     this.pathById.set(agentId, nextPath);
+    this.publishMainWorkspaceChange(previousMainWorkspaceId, activeMainWorkspaceId(record));
   }
 
   beginDelete(agentId: string): void {
@@ -413,10 +435,12 @@ export class AgentStorage {
       this.idsByWorkspace.get(workspaceId)?.delete(agentId);
       this.refreshPromptTime(workspaceId);
     }
+    const previousMainWorkspaceId = activeMainWorkspaceId(this.cache.get(agentId));
     this.cache.delete(agentId);
     this.removeOwnerIndex(agentId);
     this.pathById.delete(agentId);
     this.pathsById.delete(agentId);
+    this.publishMainWorkspaceChange(previousMainWorkspaceId);
   }
 
   async applySnapshot(

@@ -132,6 +132,7 @@ export interface WorkspaceDescriptor {
   projectKind: WorkspaceDescriptorPayload["projectKind"];
   workspaceKind: WorkspaceDescriptorPayload["workspaceKind"];
   background?: boolean;
+  hasActiveMainAgent?: boolean;
   name: string;
   title?: string | null;
   pinnedAt?: string | null;
@@ -176,6 +177,9 @@ export function normalizeWorkspaceDescriptor(
     projectKind: payload.projectKind,
     workspaceKind: payload.workspaceKind,
     background: payload.background ?? false,
+    ...(payload.hasActiveMainAgent !== undefined
+      ? { hasActiveMainAgent: payload.hasActiveMainAgent }
+      : {}),
     parentWorkspaceId: payload.parentWorkspaceId,
     name: payload.name,
     title: payload.title ?? null,

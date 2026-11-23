@@ -6,7 +6,11 @@ import {
   resolveComposerAttachmentSubmitFormat,
   splitComposerAttachmentsForSubmit,
 } from "@/composer/attachments/submit";
-import { isActiveCreateFlowForDraft, useCreateFlowStore } from "@/stores/create-flow-store";
+import {
+  isActiveCreateFlowForDraft,
+  useCreateFlowStore,
+  type PendingCreateAttempt,
+} from "@/stores/create-flow-store";
 import { handoffCreatedAgentMessageSubmission } from "@/composer/submission/writer";
 import { useSessionStore } from "@/stores/session-store";
 import { createUserMessage, type UserMessageImageAttachment } from "@/types/stream";
@@ -16,8 +20,42 @@ interface CreateAttempt {
   clientMessageId: string;
   text: string;
   timestamp: Date;
+  workspaceRole?: "main";
   images?: UserMessageImageAttachment[];
   attachments?: AgentAttachment[];
+}
+
+export function restoreDraftCreateAttempt(
+  pending: PendingCreateAttempt | null,
+): CreateAttempt | null {
+  if (!pending) return null;
+  const { clientMessageId, text, timestamp, workspaceRole, images, attachments } = pending;
+  return {
+    clientMessageId,
+    text,
+    timestamp: new Date(timestamp),
+    ...(workspaceRole ? { workspaceRole } : {}),
+    ...(images?.length ? { images } : {}),
+    ...(attachments?.length ? { attachments } : {}),
+  };
+}
+
+function buildCreateAttempt(input: {
+  draftId: string;
+  text: string;
+  workspaceRole?: CreateAttempt["workspaceRole"];
+  images: UserMessageImageAttachment[];
+  attachments: AgentAttachment[];
+}): CreateAttempt {
+  const { draftId, text, workspaceRole, images, attachments } = input;
+  return {
+    clientMessageId: `${draftId}:initial-message`,
+    text,
+    timestamp: new Date(),
+    ...(workspaceRole ? { workspaceRole } : {}),
+    ...(images.length ? { images } : {}),
+    ...(attachments.length ? { attachments } : {}),
+  };
 }
 
 type DraftAgentMachineState<TDraftAgent> =
@@ -78,6 +116,7 @@ interface SubmitContext {
   text: string;
   attachments: ComposerAttachment[];
   cwd: string;
+  workspaceRole?: "main";
 }
 
 interface CreateRequestContext {
@@ -229,7 +268,7 @@ export function useDraftAgentCreateFlow<TDraftAgent, TCreateResult>({
   );
 
   const handleCreateFromInput = useCallback(
-    async ({ text, attachments, cwd }: SubmitContext) => {
+    async ({ text, attachments, cwd, workspaceRole }: SubmitContext) => {
       const existing = useCreateFlowStore.getState().pendingByDraftId[draftId];
       if (
         isSubmitting ||
@@ -258,7 +297,7 @@ export function useDraftAgentCreateFlow<TDraftAgent, TCreateResult>({
       const images = wirePayload.images;
 
       const hasAttachmentContent = images.length > 0 || wirePayload.attachments.length > 0;
-      if (!submittedPrompt && !hasAttachmentContent && !allowEmptyText) {
+      if (!submittedPrompt && !hasAttachmentContent && !allowEmptyText && !workspaceRole) {
         const error = new Error(t("composer.errors.initialPromptRequired"));
         dispatch({ type: "DRAFT_SET_ERROR", message: error.message });
         throw error;
@@ -268,6 +307,7 @@ export function useDraftAgentCreateFlow<TDraftAgent, TCreateResult>({
         text: trimmedPrompt,
         attachments,
         cwd,
+        ...(workspaceRole ? { workspaceRole } : {}),
       });
       if (validationError) {
         const error = new Error(validationError);
@@ -275,26 +315,21 @@ export function useDraftAgentCreateFlow<TDraftAgent, TCreateResult>({
         throw error;
       }
 
-      const attempt: CreateAttempt = {
-        clientMessageId: `${draftId}:initial-message`,
+      const attempt = buildCreateAttempt({
+        draftId,
         text: submittedPrompt,
-        timestamp: new Date(),
-        ...(images.length > 0 ? { images } : {}),
-        ...(wirePayload.attachments.length > 0 ? { attachments: wirePayload.attachments } : {}),
-      };
+        workspaceRole,
+        images,
+        attachments: wirePayload.attachments,
+      });
 
       startCreateAttempt(attempt);
       setPendingCreateAttempt({
         draftId,
         serverId: pendingServerId,
         agentId: null,
-        clientMessageId: attempt.clientMessageId,
-        text: attempt.text,
+        ...attempt,
         timestamp: attempt.timestamp.getTime(),
-        ...(attempt.images && attempt.images.length > 0 ? { images: attempt.images } : {}),
-        ...(attempt.attachments && attempt.attachments.length > 0
-          ? { attachments: attempt.attachments }
-          : {}),
       });
 
       onCreateStart?.();

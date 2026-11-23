@@ -1,6 +1,7 @@
 import type { FinishRegistration, FinishSubscriptions } from "../finish-subscriptions/index.js";
 import type { AgentPromptSource } from "../agent-messages/index.js";
 import type { AgentTimelineRow } from "../agent-timeline-store-types.js";
+import type { MessageReceipts, QueueHandoff } from "../../message-receipts/index.js";
 import type { Logger } from "pino";
 
 import type { TerminalManager } from "../../../terminal/terminal-manager.js";
@@ -12,7 +13,13 @@ import type {
   CreatePaseoWorktreeWorkflowResult,
 } from "../../worktree-session.js";
 import type { AgentAttachment, FirstAgentContext } from "../../messages.js";
-import type { AgentManager, CreateAgentOptions, ManagedAgent } from "../agent-manager.js";
+import {
+  AgentCommandNotDispatchedError,
+  type AgentManager,
+  type CreateAgentOptions,
+  type CreateReservedWorkspaceMain,
+  type ManagedAgent,
+} from "../agent-manager.js";
 import type { AgentPromptInput, AgentRunOptions, AgentSessionConfig } from "../agent-sdk-types.js";
 import type { AgentStorage } from "../agent-storage.js";
 import { ensureAgentLoaded } from "../agent-loading.js";
@@ -33,6 +40,7 @@ import {
 import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { foldFeatureValues, type LegacyFeatureValues } from "../option-controls.js";
 import {
+  AGENT_PROFILE_ID_LABEL,
   EXPLICIT_PARENT_REPORTING,
   getParentAddressFromLabels,
   isExplicitParentReportingLabels,
@@ -64,6 +72,7 @@ export interface CreateAgentCommandDependencies {
   finishSubscriptions?: FinishSubscriptions;
   agentManager: AgentManager;
   agentStorage: AgentStorage;
+  initialPromptReceipts?: Pick<MessageReceipts, "send">;
   logger: Logger;
   paseoHome?: string;
   worktreesRoot?: string;
@@ -90,6 +99,8 @@ export interface CreateAgentFromSessionInput {
   /** Wire configs from older clients can still carry `featureValues`; they are folded on entry. */
   config: AgentSessionConfig & LegacyFeatureValues;
   workspaceId: string;
+  workspaceRole?: "main";
+  profileId?: string;
   background: boolean;
   initialPrompt?: string;
   forkedTimelineRows?: AgentTimelineRow[];
@@ -303,19 +314,23 @@ export async function createAgentCommand(
       ? await resolveSessionCreateAgent(dependencies, input, options)
       : await resolveMcpCreateAgent(dependencies, input);
 
-  if (resolved.createOptions.labels) {
-    delete resolved.createOptions.labels[WORKSPACE_ROLE_LABEL];
-    delete resolved.createOptions.labels[MAIN_PRIOR_MODE_ID_LABEL];
-    for (const label of RESERVED_RESIDENT_LABELS) delete resolved.createOptions.labels[label];
+  applyCreateLabelPolicy(resolved.createOptions.labels, input);
+  if (input.kind === "session" && input.workspaceRole === "main") {
+    return dependencies.agentManager.withWorkspaceMainCreation(
+      { workspaceId: input.workspaceId, agentId: input.agentId },
+      (createMain) => createResolvedAgent(dependencies, input, resolved, createMain),
+    );
   }
-  const snapshot =
-    input.kind === "mcp" && input.resident
-      ? await createMcpResident(dependencies, input, resolved)
-      : await dependencies.agentManager.createAgent(
-          resolved.config,
-          input.kind === "session" ? input.agentId : undefined,
-          resolved.createOptions,
-        );
+  return createResolvedAgent(dependencies, input, resolved);
+}
+
+async function createResolvedAgent(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentCommandInput,
+  resolved: ResolvedCreateAgent,
+  createMain?: CreateReservedWorkspaceMain,
+): Promise<CreateAgentCommandResult> {
+  const snapshot = await registerResolvedAgent(dependencies, input, resolved, createMain);
 
   if (input.kind === "session") await input.onAgentReady?.(snapshot);
 
@@ -335,12 +350,15 @@ export async function createAgentCommand(
         );
       });
     };
-    const sendResult = await sendInitialPrompt(dependencies, resolved, snapshot).catch(
-      async (error) => {
-        await rejectNotification();
-        throw error;
-      },
-    );
+    const sendResult = await sendInitialPrompt(
+      dependencies,
+      resolved,
+      snapshot,
+      !!createMain,
+    ).catch(async (error) => {
+      await rejectNotification();
+      throw error;
+    });
     if (sendResult.started) notification?.accept();
     else await rejectNotification();
     initialPromptStarted = sendResult.started;
@@ -355,6 +373,35 @@ export async function createAgentCommand(
     initialPromptError,
     ...(resolved.createdWorktree ? { createdWorktree: resolved.createdWorktree } : {}),
   };
+}
+
+function registerResolvedAgent(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentCommandInput,
+  resolved: ResolvedCreateAgent,
+  createMain?: CreateReservedWorkspaceMain,
+): Promise<ManagedAgent> {
+  if (createMain) return createMain(resolved.config, resolved.createOptions);
+  if (input.kind === "mcp" && input.resident)
+    return createMcpResident(dependencies, input, resolved);
+  return dependencies.agentManager.createAgent(
+    resolved.config,
+    input.kind === "session" ? input.agentId : undefined,
+    resolved.createOptions,
+  );
+}
+
+function applyCreateLabelPolicy(
+  labels: CreateAgentOptions["labels"],
+  input: CreateAgentCommandInput,
+): void {
+  if (!labels) return;
+  delete labels[WORKSPACE_ROLE_LABEL];
+  delete labels[MAIN_PRIOR_MODE_ID_LABEL];
+  for (const label of RESERVED_RESIDENT_LABELS) delete labels[label];
+  if (input.kind === "session" && input.workspaceRole === "main" && input.profileId) {
+    labels[AGENT_PROFILE_ID_LABEL] = input.profileId;
+  }
 }
 
 async function createMcpResident(
@@ -719,22 +766,42 @@ async function sendInitialPrompt(
   dependencies: CreateAgentCommandDependencies,
   resolved: ResolvedCreateAgent,
   snapshot: ManagedAgent,
+  waitForCommandOutcome: boolean,
 ): Promise<{ started: boolean; liveSnapshot: ManagedAgent; error?: unknown }> {
   try {
     const prompt = resolved.prompt;
     if (prompt === undefined) {
       return { started: false, liveSnapshot: snapshot };
     }
-    const liveSnapshot = await startCreatedAgentInitialPrompt({
-      agentStorage: dependencies.agentStorage,
-      agentManager: dependencies.agentManager,
-      agentId: snapshot.id,
-      snapshot,
-      prompt,
-      source: resolved.source,
-      runOptions: resolved.runOptions,
-      logger: resolved.promptLogger ?? dependencies.logger,
-    });
+    const start = (handoff?: QueueHandoff) =>
+      startCreatedAgentInitialPrompt({
+        agentStorage: dependencies.agentStorage,
+        agentManager: dependencies.agentManager,
+        agentId: snapshot.id,
+        snapshot,
+        prompt,
+        source: resolved.source,
+        runOptions: resolved.runOptions,
+        handoff,
+        waitForCommandOutcome,
+        logger: resolved.promptLogger ?? dependencies.logger,
+      });
+    const messageId = resolved.runOptions?.clientMessageId;
+    let liveSnapshot = snapshot;
+    if (messageId && dependencies.initialPromptReceipts) {
+      await dependencies.initialPromptReceipts.send({
+        agentId: snapshot.id,
+        messageId,
+        // Match a normal human send, so a retry of the first message uses the same receipt.
+        request: { prompt, activeTurnBehavior: "interrupt" },
+        retryIfUnsent: (error) => error instanceof AgentCommandNotDispatchedError,
+        send: async (begin, declined, onProviderOutcome) => {
+          liveSnapshot = await start({ begin, declined, onProviderOutcome });
+        },
+      });
+    } else {
+      liveSnapshot = await start();
+    }
     return { started: true, liveSnapshot };
   } catch (error) {
     if (resolved.promptFailure === "throw") {

@@ -66,6 +66,55 @@ test("agent and workspace creation accept and preserve optional fork sources", (
   }
 });
 
+test("only modern creation requests preserve an explicit main workspace role", () => {
+  const requestId = "creation-main-1";
+  const config = { provider: "codex", cwd: "/repo" };
+  const agent = { type: "agent.create.request", requestId, config };
+  const workspace = {
+    type: "workspace.create.request",
+    requestId,
+    source: { kind: "directory", path: "/repo" },
+  };
+
+  for (const workspaceRole of [undefined, "main", "member", false, null]) {
+    const fields = workspaceRole === undefined ? { config } : { config, workspaceRole };
+    for (const request of [
+      { ...agent, ...fields },
+      { ...workspace, agent: fields },
+    ]) {
+      if (workspaceRole === undefined || workspaceRole === "main") {
+        expect(SessionInboundMessageSchema.parse(request)).toMatchObject(request);
+      } else {
+        expect(SessionInboundMessageSchema.safeParse(request).success).toBe(false);
+      }
+    }
+  }
+  expect(
+    SessionInboundMessageSchema.parse({
+      ...agent,
+      type: "create_agent_request",
+      workspaceRole: "main",
+    }),
+  ).not.toHaveProperty("workspaceRole");
+});
+
+test("modern creation responses preserve the structured workspace main conflict code", () => {
+  const response = {
+    type: "agent.create.response",
+    payload: {
+      requestId: "creation-main-2",
+      agent: null,
+      error: "This workspace already has an active Main Session.",
+      errorCode: "workspace_main_exists",
+    },
+  } as const;
+
+  expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
+  expect(validateWSOutboundMessage({ type: "session", message: response })).toMatchObject({
+    success: true,
+  });
+});
+
 test("provider switch is a registered request and response with optional settings and notice", () => {
   const request = {
     type: "agent.provider.switch.request",
@@ -117,6 +166,19 @@ test("server info preserves the optional seamless context switch capability", ()
   ]) {
     expect(ServerInfoStatusPayloadSchema.parse({ ...info, features }).features).toEqual(features);
   }
+});
+
+test("server info keeps agentCreateAsMain independent and optional", () => {
+  const info = { status: "server_info", serverId: "server-1" };
+  expect(ServerInfoStatusPayloadSchema.parse(info).features).toBeUndefined();
+  expect(
+    ServerInfoStatusPayloadSchema.parse({ ...info, features: { agentCreateAsMain: true } })
+      .features,
+  ).toEqual({ agentCreateAsMain: true });
+  expect(
+    ServerInfoStatusPayloadSchema.parse({ ...info, features: { agentCreateAsMain: false } })
+      .features,
+  ).toEqual({ agentCreateAsMain: false });
 });
 
 test("resident specialist and reset capabilities are optional booleans", () => {

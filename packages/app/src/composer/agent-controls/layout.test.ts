@@ -375,6 +375,28 @@ describe("composer control layout", () => {
     expect(resolveComposerControlDensity({ ...input, availableWidth: 96 })).toBe("compact");
     expect(resolveComposerControlDensity({ ...input, availableWidth: 64 })).toBe("iconOnly");
   });
+
+  it("budgets the Main Session control alongside plugins and moves it into the panel when narrow", () => {
+    const input = {
+      currentDensity: "full" as const,
+      geometry: POINTER,
+      controls: {
+        hasModel: true,
+        hasThinking: true,
+        hasMode: true,
+        features: [],
+        fontScale: 1,
+        pluginItemsWidth: 28,
+        workspaceMainWidth: 148,
+      },
+    };
+    expect(resolveComposerControlDensity({ ...input, availableWidth: 600 })).toBe("full");
+    expect(resolveComposerControlDensity({ ...input, availableWidth: 440 })).toBe("condensed");
+    expect(
+      resolveComposerControlDensity({ ...input, availableWidth: 600, minimumDensity: "compact" }),
+    ).toBe("compact");
+    expect(resolveComposerControlDensity({ ...input, availableWidth: 70 })).toBe("iconOnly");
+  });
 });
 
 describe("folded model control labels", () => {

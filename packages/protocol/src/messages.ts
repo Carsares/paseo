@@ -2017,6 +2017,7 @@ export const AgentCreateRequestSchema = CreateAgentRequestMessageSchema.extend({
   agentId: z.uuid().optional(),
   attachments: z.array(LegacyAgentAttachmentSchema).optional(),
   subscribe: z.boolean().optional(),
+  workspaceRole: z.literal("main").optional(),
 });
 
 export const WorkspaceInitialAgentSchema = AgentCreateRequestSchema.omit({
@@ -4498,6 +4499,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentHierarchyControl: z.boolean().optional(),
         // COMPAT(workspaceMainAgentDefault): added in v0.16.0, remove gate after 2027-05-20.
         workspaceMainAgentDefault: z.boolean().optional(),
+        // COMPAT(agentCreateAsMain): added in v0.17.0-beta.1, remove gate after 2027-05-22.
+        agentCreateAsMain: z.boolean().optional(),
         // COMPAT(workspaceAgentsSummary): added in v0.16.0, remove gate after 2027-05-20.
         workspaceAgentsSummary: z.boolean().optional(),
         // COMPAT(agentHistoryWorkspaceFilter): added in v0.16.0, remove gate after 2027-05-20.
@@ -4949,6 +4952,8 @@ export const WorkspaceDescriptorPayloadSchema = z
     // COMPAT(workspaceLabels): added in v0.5.0, remove optional after 2027-08-14.
     labels: z.array(z.string()).optional(),
     metadata: EntityMetadataSchema.optional(),
+    // Older daemons omit whether this workspace has an active main agent.
+    hasActiveMainAgent: z.boolean().optional(),
     // Retained for wire parsing of older daemon descriptors.
     internal: z.boolean().optional(),
     background: z.boolean().optional(),
@@ -5897,6 +5902,7 @@ export const AgentCreateResponseSchema = z.object({
     requestId: z.string(),
     agent: AgentSnapshotPayloadSchema.nullable(),
     error: z.string().nullable(),
+    errorCode: z.string().optional(),
     creation: CreationSnapshotSchema.optional(),
   }),
 });

@@ -12,6 +12,7 @@ export interface PendingCreateAttempt {
   clientMessageId: string;
   text: string;
   timestamp: number;
+  workspaceRole?: "main";
   lifecycle: CreateFlowLifecycleState;
   errorMessage?: string;
   images?: UserMessageImageAttachment[];

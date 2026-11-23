@@ -8,7 +8,7 @@ import {
   useWindowDimensions,
   type LayoutChangeEvent,
 } from "react-native";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { StyleSheet } from "react-native-unistyles";
 import { useShallow } from "zustand/shallow";
 import { Settings2 } from "lucide-react-native";
 import { readSelectOption, type ComposerOptionControls } from "@/agent-controls/option-controls";
@@ -44,7 +44,6 @@ import { useIsCompactFormFactor } from "@/constants/layout";
 import {
   controlSizingForLayout,
   TOOLBAR_CONTROL_GAP,
-  toolbarGlyphColor,
   type ToolbarGlyphs,
   toolbarSlot,
 } from "@/components/ui/control-geometry";
@@ -93,8 +92,10 @@ import { ComposerAgentProvider, useComposerInput } from "@/composer/session";
 import { PluginComposerItems, usePluginComposerItemCount } from "@/plugins/composer-items";
 import {
   PluginToolbarSlot,
-  usePluginToolbarWidth,
+  useToolbarSlotWidth,
 } from "@/composer/agent-controls/plugin-toolbar-slot";
+import { WorkspaceMainSheetControl, WorkspaceMainToolbarSlot } from "./workspace-main-control";
+import type { WorkspaceMainControlValue } from "@/composer/draft/workspace-main-preference";
 import {
   useAgentProfileEditor,
   useAgentProfilePicker,
@@ -140,6 +141,7 @@ interface ControlledAgentControlsProps {
   modeControl?: AgentModeControlValue | null;
   modelSelectorServerId?: string | null;
   isCompactLayout?: boolean;
+  workspaceMain?: WorkspaceMainControlValue;
 }
 
 export interface DraftAgentControlsProps {
@@ -173,6 +175,7 @@ export interface DraftAgentControlsProps {
   disabled?: boolean;
   modelSelectorServerId?: string | null;
   isCompactLayout?: boolean;
+  workspaceMain?: WorkspaceMainControlValue;
   /** Which composer a plugin's `useComposer()` reports. */
   context?: "draft" | "new-workspace";
   /** What plugins set on the agent this draft creates. */
@@ -239,19 +242,22 @@ function resolveHasAnyControl({
   controls,
   hasMode,
   pluginItemCount,
+  hasWorkspaceMain,
 }: {
   canSelectModel: boolean;
   thinkingOptions: AgentControlOption[] | undefined;
   controls: readonly AgentOptionControl[] | undefined;
   hasMode: boolean;
   pluginItemCount: number;
+  hasWorkspaceMain: boolean;
 }) {
   return (
     canSelectModel ||
     Boolean(thinkingOptions?.length) ||
     Boolean(controls?.length) ||
     hasMode ||
-    pluginItemCount > 0
+    pluginItemCount > 0 ||
+    hasWorkspaceMain
   );
 }
 
@@ -415,6 +421,7 @@ function ControlledAgentControls({
   modeControl,
   modelSelectorServerId = null,
   isCompactLayout,
+  workspaceMain,
 }: ControlledAgentControlsProps) {
   const { t } = useTranslation();
   const isCompactFormFactor = useIsCompactFormFactor();
@@ -439,7 +446,10 @@ function ControlledAgentControls({
     onSelectThinkingOption && thinkingOptions && thinkingOptions.length > 0,
   );
   const pluginItemCount = usePluginComposerItemCount(modelSelectorServerId);
-  const { width: pluginItemsWidth, onLayout: handlePluginItemsLayout } = usePluginToolbarWidth();
+  const { width: pluginItemsWidth, onLayout: handlePluginItemsLayout } = useToolbarSlotWidth();
+  const { width: workspaceMainWidth, onLayout: handleWorkspaceMainLayout } = useToolbarSlotWidth();
+  const hasWorkspaceMain = Boolean(workspaceMain);
+  const hasMode = Boolean(modeControl);
 
   const formattedThinkingOptions = useMemo(
     () => toThinkingControlOptions(thinkingOptions),
@@ -455,8 +465,9 @@ function ControlledAgentControls({
     canSelectModel,
     thinkingOptions,
     controls: optionControls?.controls,
-    hasMode: modeControl !== null && modeControl !== undefined,
+    hasMode,
     pluginItemCount,
+    hasWorkspaceMain,
   });
   const featureControls = useMemo(
     () =>
@@ -476,12 +487,22 @@ function ControlledAgentControls({
     () => ({
       hasModel: canSelectModel,
       hasThinking: canSelectThinking,
-      hasMode: modeControl !== null && modeControl !== undefined,
+      hasMode,
       features: featureControls,
       pluginItemsWidth,
+      workspaceMainWidth: hasWorkspaceMain ? Math.max(1, workspaceMainWidth) : 0,
       fontScale,
     }),
-    [canSelectModel, canSelectThinking, featureControls, fontScale, modeControl, pluginItemsWidth],
+    [
+      canSelectModel,
+      canSelectThinking,
+      featureControls,
+      fontScale,
+      hasWorkspaceMain,
+      hasMode,
+      pluginItemsWidth,
+      workspaceMainWidth,
+    ],
   );
   const presentation = useMemo(() => resolveComposerControlPresentation(density), [density]);
   const layoutContextValue = useMemo(
@@ -600,7 +621,7 @@ function ControlledAgentControls({
   return (
     <ComposerControlLayoutProvider value={layoutContextValue}>
       <View style={styles.container} onLayout={handleLayout} testID="agent-controls-toolbar">
-        {!presentation.foldControls ? (
+        {!presentation.foldControls || (!canSelectModel && workspaceMain) ? (
           <DesktopAgentControlsContent
             provider={provider}
             selectedModelId={selectedModelId}
@@ -632,6 +653,7 @@ function ControlledAgentControls({
             handleOpenSheet={handleOpenSheet}
             handleCloseSheet={handleCloseSheet}
             modelSelectorServerId={modelSelectorServerId}
+            workspaceMain={workspaceMain}
           />
         ) : (
           <SheetAgentControlsContent
@@ -662,18 +684,64 @@ function ControlledAgentControls({
             showLabels={presentation.showModelLabel}
             modelSelectorServerId={modelSelectorServerId}
             canSwitchProvider={Boolean(onSelectProviderAndModel)}
+            workspaceMain={workspaceMain}
           />
         )}
-        {!isCompact ? (
-          <PluginToolbarSlot
-            serverId={modelSelectorServerId}
-            width={pluginItemsWidth}
-            fits={!presentation.aggregateFeatures}
-            onLayout={handlePluginItemsLayout}
-          />
-        ) : null}
+        <TrailingAgentControls
+          serverId={modelSelectorServerId}
+          disabled={disabled}
+          compact={isCompact}
+          showInline={!presentation.aggregateFeatures}
+          pluginItemsWidth={pluginItemsWidth}
+          measurePlugins={handlePluginItemsLayout}
+          workspaceMain={workspaceMain}
+          workspaceMainWidth={workspaceMainWidth}
+          measureWorkspaceMain={handleWorkspaceMainLayout}
+        />
       </View>
     </ComposerControlLayoutProvider>
+  );
+}
+
+function TrailingAgentControls({
+  serverId,
+  disabled,
+  compact,
+  showInline,
+  pluginItemsWidth,
+  measurePlugins,
+  workspaceMain,
+  workspaceMainWidth,
+  measureWorkspaceMain,
+}: {
+  serverId: string | null;
+  disabled: boolean;
+  compact: boolean;
+  showInline: boolean;
+  pluginItemsWidth: number;
+  measurePlugins: (event: LayoutChangeEvent) => void;
+  workspaceMain?: WorkspaceMainControlValue;
+  workspaceMainWidth: number;
+  measureWorkspaceMain: (event: LayoutChangeEvent) => void;
+}) {
+  if (compact) return null;
+  return (
+    <>
+      <PluginToolbarSlot
+        serverId={serverId}
+        width={pluginItemsWidth}
+        fits={showInline}
+        onLayout={measurePlugins}
+      />
+      {workspaceMain ? (
+        <WorkspaceMainToolbarSlot
+          control={workspaceMain}
+          disabled={disabled}
+          visible={showInline && workspaceMainWidth > 0}
+          onLayout={measureWorkspaceMain}
+        />
+      ) : null}
+    </>
   );
 }
 
@@ -701,6 +769,7 @@ interface AgentControlsContentProps {
   modeControl?: AgentModeControlValue | null;
   glyphs: ToolbarGlyphs;
   modelSelectorServerId: string | null;
+  workspaceMain?: WorkspaceMainControlValue;
 }
 
 interface DesktopAgentControlsContentProps extends AgentControlsContentProps {
@@ -715,7 +784,6 @@ interface DesktopAgentControlsContentProps extends AgentControlsContentProps {
 
 function DesktopAgentControlsContent(props: DesktopAgentControlsContentProps) {
   const sheetBridge = useComposerSheetBridge();
-  const { theme } = useUnistyles();
   const { t } = useTranslation();
   const {
     provider,
@@ -748,6 +816,7 @@ function DesktopAgentControlsContent(props: DesktopAgentControlsContentProps) {
     handleOpenSheet,
     handleCloseSheet,
     modelSelectorServerId,
+    workspaceMain,
   } = props;
   const { action: toggleAction, keys: modelKeys } = useModelPickerShortcut(disabled);
   const modelTooltipLabel = t(getAgentControlHintKey("model"));
@@ -764,7 +833,7 @@ function DesktopAgentControlsContent(props: DesktopAgentControlsContentProps) {
     [t],
   );
   const handleOpenFeatures = useCallback(() => handleOpenSheet("features"), [handleOpenSheet]);
-  const hasFeatures = featureItems.length > 0 || hasPluginItems;
+  const hasFeatures = featureItems.length > 0 || hasPluginItems || Boolean(workspaceMain);
   return (
     <>
       {canSelectModel ? (
@@ -819,7 +888,7 @@ function DesktopAgentControlsContent(props: DesktopAgentControlsContentProps) {
               <Settings2
                 size={glyphs.icon.size}
                 strokeWidth={glyphs.icon.strokeWidth}
-                color={toolbarGlyphColor(theme, glyphs.icon.tone)}
+                color={(glyphs.icon.tone === "foreground" ? styles.glyph : styles.mutedGlyph).color}
               />
             </ComposerToolbarGlyph>
           </Pressable>
@@ -838,6 +907,9 @@ function DesktopAgentControlsContent(props: DesktopAgentControlsContentProps) {
               onOpenIdChange={handleSheetOpenChange}
             />
             <PluginComposerItems serverId={modelSelectorServerId} surface="sheet" />
+            {workspaceMain ? (
+              <WorkspaceMainSheetControl control={workspaceMain} disabled={disabled} />
+            ) : null}
           </AdaptiveModalSheet>
         </>
       ) : (
@@ -891,6 +963,7 @@ function SheetAgentControlsContent(props: SheetAgentControlsContentProps) {
     showLabels,
     modelSelectorServerId,
     canSwitchProvider,
+    workspaceMain,
   } = props;
 
   const sheetControls = (
@@ -913,6 +986,9 @@ function SheetAgentControlsContent(props: SheetAgentControlsContentProps) {
         onOpenIdChange={handleSheetOpenChange}
       />
       <PluginComposerItems serverId={modelSelectorServerId} surface="sheet" />
+      {workspaceMain ? (
+        <WorkspaceMainSheetControl control={workspaceMain} disabled={disabled} />
+      ) : null}
     </View>
   );
 
@@ -1349,6 +1425,7 @@ export function DraftAgentControls({
   modelSelectorServerId = null,
   isCompactLayout,
   context = "draft",
+  workspaceMain,
   metadata,
   onSetMetadata,
 }: DraftAgentControlsProps & { draftId: string; serverId: string; showToolbar: boolean }) {
@@ -1533,6 +1610,7 @@ export function DraftAgentControls({
               modeControl={modeControl}
               modelSelectorServerId={modelSelectorServerId}
               isCompactLayout={isCompactLayout}
+              workspaceMain={workspaceMain}
             />
           </>
         ) : null}
@@ -1568,4 +1646,6 @@ const styles = StyleSheet.create((theme) => ({
   combinedSheetControls: {
     gap: theme.spacing[1],
   },
+  glyph: { color: theme.colors.foreground },
+  mutedGlyph: { color: theme.colors.foregroundMuted },
 }));

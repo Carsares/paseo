@@ -18,6 +18,7 @@ import type { DaemonClientConfig } from "./daemon-client.js";
 import type { AgentPermissionResponse, JsonValue } from "@getpaseo/protocol/agent-types";
 import type {
   AgentSnapshotPayload,
+  AgentCreateRequest,
   CreationSnapshot,
   CreateAgentRequestMessage,
   FetchWorkspacesRequestMessage,
@@ -311,6 +312,7 @@ export interface PaseoAgentCreateOptions {
   labels?: Record<string, string>;
   /** Data plugins store on the agent: JSON values under keys such as `"linear.issue"`. */
   metadata?: CreateAgentRequestMessage["metadata"];
+  workspaceRole?: AgentCreateRequest["workspaceRole"];
 }
 
 export type PaseoWorkspaceAgentCreateOptions = Omit<PaseoAgentCreateOptions, "cwd">;
@@ -926,7 +928,10 @@ export function createPaseoApi(
           requestId,
         );
         if (result.error || !result.workspace) {
-          throw new Error(result.error ?? "The daemon did not create a workspace");
+          const error = new Error(result.error ?? "The daemon did not create a workspace");
+          const errorCode = result.errorCode ?? result.creation?.errorCode;
+          if (errorCode) Object.assign(error, { code: errorCode });
+          throw error;
         }
         if (result.agent) await trackExplicitChild(result.agent, result.workspace.id);
         return createWorkspaceHandle(result.workspace);

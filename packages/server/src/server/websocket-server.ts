@@ -2312,6 +2312,7 @@ export class VoiceAssistantWebSocketServer {
         // COMPAT(agentSessionReset): added in v0.18.0, remove gate after 2027-06-01.
         agentSessionReset: true,
         workspaceMainAgentDefault: true,
+        agentCreateAsMain: true,
         workspaceAgentsSummary: true,
         agentHistoryWorkspaceFilter: true,
         // COMPAT(agentInitialPromptOrigin): added in v0.16.0, remove gate after 2027-05-19.

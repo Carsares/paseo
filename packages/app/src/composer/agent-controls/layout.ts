@@ -29,6 +29,8 @@ export interface ComposerControlPresence {
   features: readonly ComposerFeatureControlPresence[];
   /** The plugin items' measured width in the toolbar row; 0 when none of them renders anything. */
   pluginItemsWidth: number;
+  /** Intrinsic width of the native Main Session toggle, or 0 when absent. */
+  workspaceMainWidth?: number;
   fontScale: number;
 }
 
@@ -119,7 +121,11 @@ function resolveCondensedFloor(
   if (controls.hasModel) widths.push(chrome + 60 * fontScale);
   if (controls.hasThinking) widths.push(geometry.controlSize);
   if (controls.hasMode) widths.push(chrome + 96 * fontScale);
-  if (controls.features.length > 0 || controls.pluginItemsWidth > 0) {
+  if (
+    controls.features.length > 0 ||
+    controls.pluginItemsWidth > 0 ||
+    controls.workspaceMainWidth
+  ) {
     widths.push(geometry.controlSize);
   }
   return sumControlWidths(widths, geometry);
@@ -140,6 +146,7 @@ function resolveFullFloor(
     widths.push(resolveFeatureControlWidth(feature, fontScale, geometry));
   }
   if (controls.pluginItemsWidth > 0) widths.push(controls.pluginItemsWidth);
+  if (controls.workspaceMainWidth) widths.push(controls.workspaceMainWidth);
   return sumControlWidths(widths, geometry);
 }
 
@@ -155,7 +162,11 @@ function resolveTightFloor(
   }
   if (controls.hasThinking) widths.push(geometry.controlSize);
   if (controls.hasMode) widths.push(geometry.controlSize);
-  if (controls.features.length > 0 || controls.pluginItemsWidth > 0) {
+  if (
+    controls.features.length > 0 ||
+    controls.pluginItemsWidth > 0 ||
+    controls.workspaceMainWidth
+  ) {
     widths.push(geometry.controlSize);
   }
   return sumControlWidths(widths, geometry);

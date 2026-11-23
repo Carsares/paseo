@@ -11,6 +11,7 @@ import {
 } from "@getpaseo/protocol/messages";
 import { writeFileAtomic } from "../atomic-file.js";
 import { generateWorkspaceId } from "../workspace-registry-model.js";
+import { isMainControlAgentLabels } from "@getpaseo/protocol/agent-labels";
 
 type Observer = (snapshot: CreationSnapshot) => void;
 export interface CreatedAgent {
@@ -191,6 +192,9 @@ export class CreationService {
               phase: "agent_ready",
               agent: readyAgent,
               workspaceId: readyAgent.workspaceId ?? record.snapshot.workspaceId,
+              ...(record.snapshot.workspace && isMainControlAgentLabels(readyAgent.labels)
+                ? { workspace: { ...record.snapshot.workspace, hasActiveMainAgent: true } }
+                : {}),
             });
           },
           record.snapshot.mainAgent,
@@ -249,7 +253,10 @@ export class CreationService {
     await this.write(identity, record);
     const mainAgent = await create(record.snapshot.workspace, record.mainAgentId);
     record.inFlight = null;
-    await this.publish(identity, record, { mainAgent });
+    await this.publish(identity, record, {
+      mainAgent,
+      workspace: { ...record.snapshot.workspace, hasActiveMainAgent: true },
+    });
   }
 
   // COMPAT(agentRequestReceipts): added in v0.8.0, remove after 2027-03-11 once old creation receipts can expire.
@@ -302,7 +309,9 @@ export class CreationService {
       errorCode: undefined,
       failedStage: undefined,
       outcomeUnknown: undefined,
-      ...(mainAgent ? { mainAgent } : {}),
+      ...(mainAgent && snapshot.workspace
+        ? { mainAgent, workspace: { ...snapshot.workspace, hasActiveMainAgent: true } }
+        : {}),
     });
   }
 

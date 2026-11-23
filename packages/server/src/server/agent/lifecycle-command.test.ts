@@ -86,7 +86,15 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
     this.clearedAttentionAgentIds.push(agentId);
   }
 
-  async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
+  async archiveAgent(
+    agentId: string,
+    _archivedAt?: string,
+    options?: { cancelActiveRun?: boolean },
+  ): Promise<{ archivedAt: string }> {
+    if (options?.cancelActiveRun) {
+      if (this.hasInFlightRun(agentId)) await this.cancelAgentRun(agentId);
+      await this.clearAgentAttention(agentId);
+    }
     this.archivedAgentIds.push(agentId);
     this.liveAgents.delete(agentId);
     const archivedAt = "2026-05-10T10:00:00.000Z";

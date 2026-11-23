@@ -231,6 +231,12 @@ export const ja: TranslationResources = {
     },
   },
   agentControls: {
+    workspaceMain: {
+      label: "メインセッションに設定",
+      occupied: "このワークスペースにはすでにアクティブなメインセッションがあります。",
+      unknown: "このワークスペースにアクティブなメインセッションがあるか確認できません。",
+      unsupported: "下書きからメインセッションを作成するには、ホストを更新してください。",
+    },
     provider: {
       fallback: "プロバイダー",
       select: "エージェントプロバイダーを選択",

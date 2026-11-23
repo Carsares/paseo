@@ -8,6 +8,7 @@ import {
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { Keyboard, StyleSheet as RNStyleSheet, Text, View } from "react-native";
 import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import { StyleSheet } from "react-native-unistyles";
 import { CHAT_COLUMN_RAIL_DATASET } from "@/chat-rail";
 import { useContainerWidthBelow } from "@/hooks/use-container-width";
@@ -18,9 +19,18 @@ import { ComposerImportPill } from "@/composer/draft/import-pill";
 import { COMPOSER_PILL_CLEARANCE } from "@/composer/pill-styles";
 import { composerWorkspaceAttachment } from "@/composer/attachments/workspace";
 import { useAgentInputDraft } from "@/composer/draft/input-draft";
+import { useWorkspaceMainPreference } from "@/composer/draft/workspace-main-preference";
+import {
+  canChooseWorkspaceMain,
+  workspaceMainBlock,
+  workspaceMainBlockMessage,
+  workspaceMainDraftKey,
+  workspaceMainErrorBlock,
+} from "@/composer/draft/workspace-main-intent";
 import type { CreateAgentInitialValues } from "@/hooks/use-agent-form-state";
-import { useDraftAgentCreateFlow, type DraftCreateAttempt } from "@/composer/draft/create-flow";
-import { selectHostFeature } from "@/runtime/host-features";
+import { restoreDraftCreateAttempt, useDraftAgentCreateFlow } from "@/composer/draft/create-flow";
+import type { MessagePayload } from "@/composer/types";
+import { selectHostFeature, useHostFeature } from "@/runtime/host-features";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { buildWorkspaceDraftAgentConfig } from "@/screens/workspace/workspace-draft-agent-config";
 import { buildDraftStoreKey } from "@/stores/draft-keys";
@@ -28,6 +38,7 @@ import { flushDraftPersistStorage } from "@/stores/draft-store";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
 import { useSessionStore, type Agent } from "@/stores/session-store";
 import { useWorkspaceFields } from "@/stores/session-store-hooks";
+import { selectWorkspace } from "@/stores/session-store-hooks/selectors";
 import { useWorkspaceDraftSubmissionStore } from "@/stores/workspace-draft-submission-store";
 import { collectAllTabs, useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
 import { encodeImages } from "@/utils/encode-images";
@@ -182,11 +193,13 @@ function resolveDraftSubmitPolicy(
   };
 }
 
-export async function submitDraftCreateRequest(input: {
+interface DraftCreateRequestInput {
   draftId: string;
   parentAgentId?: string | null;
   forkFrom?: AgentForkSource;
-  attempt: { clientMessageId: string };
+  attempt: { clientMessageId: string; workspaceRole?: "main" };
+  assertWorkspaceMainAvailable?: () => void;
+  imageEncodingFailedMessage?: string;
   text: string;
   images?: UserMessageImageAttachment[];
   attachments?: unknown;
@@ -208,26 +221,10 @@ export async function submitDraftCreateRequest(input: {
   requiresUserPromptOrigin: boolean;
   supportsAgentInitialPromptOrigin: () => boolean;
   initialPromptOriginUnavailableMessage: string;
-}): Promise<{ agentId: string | null; result: AgentSnapshotPayload }> {
-  const {
-    attempt,
-    text,
-    images,
-    attachments,
-    cwd,
-    client,
-    workspaceDirectory,
-    workspaceId,
-    autoSubmitConfig,
-    composerState,
-  } = input;
+}
 
-  invariant(workspaceDirectory, "Workspace directory is required");
-  invariant(workspaceId, "Workspace id is required");
-  if (!client) {
-    throw new Error(input.hostDisconnectedMessage);
-  }
-
+function buildDraftRequestConfig(input: DraftCreateRequestInput) {
+  const { cwd, autoSubmitConfig, composerState } = input;
   const provider = autoSubmitConfig?.provider ?? composerState.selectedProvider;
   if (!provider) {
     throw new Error(input.selectModelMessage);
@@ -236,7 +233,7 @@ export async function submitDraftCreateRequest(input: {
     autoSubmitConfig,
     effectiveModeId: composerState.effectiveModeId,
   });
-  const config = buildWorkspaceDraftAgentConfig({
+  return buildWorkspaceDraftAgentConfig({
     provider,
     cwd,
     ...modeIdOverride,
@@ -245,19 +242,53 @@ export async function submitDraftCreateRequest(input: {
       autoSubmitConfig?.thinkingOptionId ?? (composerState.effectiveThinkingOptionId || undefined),
     providerOptions: autoSubmitConfig?.providerOptions ?? composerState.providerOptions,
   });
+}
 
+async function buildDraftRequestMessage(input: DraftCreateRequestInput) {
+  const { attempt, images, attachments, text } = input;
   const attachmentsArray = Array.isArray(attachments) ? attachments : undefined;
-  const imagesData = await encodeImages(images);
+  const workspaceRole = attempt.workspaceRole;
+  const imagesData = await encodeImages(
+    images,
+    workspaceRole ? input.imageEncodingFailedMessage : undefined,
+  );
+  if (workspaceRole) {
+    invariant(
+      !input.parentAgentId?.trim() && !input.forkFrom,
+      "Main Session cannot have a parent or fork source",
+    );
+    input.assertWorkspaceMainAvailable?.();
+  }
+  const silent =
+    workspaceRole === "main" && !text.trim() && !imagesData?.length && !attachmentsArray?.length;
+  return {
+    silent,
+    fields: {
+      ...(workspaceRole ? { workspaceRole } : {}),
+      ...(silent ? {} : { initialPrompt: text, clientMessageId: attempt.clientMessageId }),
+      ...(imagesData?.length ? { images: imagesData } : {}),
+      ...(attachmentsArray?.length ? { attachments: attachmentsArray } : {}),
+    },
+  };
+}
+
+export async function submitDraftCreateRequest(
+  input: DraftCreateRequestInput,
+): Promise<{ agentId: string | null; result: AgentSnapshotPayload }> {
+  const { client, workspaceDirectory, workspaceId, composerState, forkFrom } = input;
+  invariant(workspaceDirectory, "Workspace directory is required");
+  invariant(workspaceId, "Workspace id is required");
+  if (!client) throw new Error(input.hostDisconnectedMessage);
+
+  const config = buildDraftRequestConfig(input);
+  const { silent, fields } = await buildDraftRequestMessage(input);
   const request = {
     config,
     workspaceId,
+    ...fields,
     ...buildDraftCaller(input),
-    initialPrompt: text,
-    clientMessageId: attempt.clientMessageId,
-    ...(input.forkFrom ? { forkFrom: input.forkFrom } : {}),
+    ...(forkFrom ? { forkFrom } : {}),
     ...(Object.keys(composerState.metadata).length > 0 ? { metadata: composerState.metadata } : {}),
-    ...(imagesData?.length ? { images: imagesData } : {}),
-    ...(attachmentsArray?.length ? { attachments: attachmentsArray } : {}),
   };
   const result = await client.createAgent({
     ...request,
@@ -265,7 +296,7 @@ export async function submitDraftCreateRequest(input: {
   });
 
   return {
-    agentId: result.id,
+    agentId: silent ? null : result.id,
     result,
   };
 }
@@ -409,6 +440,48 @@ function resolveImportPillPress(
   return onOpenImportSheet ?? null;
 }
 
+function useExistingWorkspaceMainPreference(input: {
+  draftId: string;
+  serverId: string;
+  workspaceId: string;
+  setup: WorkspaceDraftTabSetup | null;
+  isHandoff: boolean;
+  hasActiveMainAgent?: boolean;
+  t: TFunction;
+}) {
+  const { draftId, serverId, workspaceId, setup, isHandoff, hasActiveMainAgent, t } = input;
+  const supportsCreateAsMain = useHostFeature(serverId, "agentCreateAsMain");
+  const preference = useWorkspaceMainPreference(
+    workspaceMainDraftKey({
+      draftId,
+      serverId,
+      target: canChooseWorkspaceMain({ setup, isHandoff })
+        ? { kind: "workspace", workspaceId }
+        : null,
+    }),
+    workspaceMainBlock({ supportsCreateAsMain, target: { kind: "workspace", hasActiveMainAgent } }),
+    t,
+  );
+  const getMainBlock = useCallback(() => {
+    const state = useSessionStore.getState();
+    return workspaceMainBlock({
+      // COMPAT(agentCreateAsMain): added in v0.17.0-beta.1, remove gate after 2027-05-22.
+      supportsCreateAsMain: selectHostFeature(state, serverId, "agentCreateAsMain"),
+      target: {
+        kind: "workspace",
+        hasActiveMainAgent: selectWorkspace(state, serverId, workspaceId)?.hasActiveMainAgent,
+      },
+    });
+  }, [serverId, workspaceId]);
+  return { ...preference, getMainBlock };
+}
+
+const UNKNOWN_WORKSPACE_FIELDS = {
+  workspaceDirectory: null,
+  id: null,
+  hasActiveMainAgent: undefined,
+};
+
 /**
  * Creates the agent from the draft's first prompt. The conversation panel shows that prompt in
  * the timeline from the create-flow store while the agent is created.
@@ -418,7 +491,7 @@ export function WorkspaceDraftComposer({
   workspaceId,
   tabId,
   draftId,
-  initialSetup = undefined,
+  initialSetup,
   isPaneFocused,
   editingSession,
   onCreated,
@@ -427,11 +500,13 @@ export function WorkspaceDraftComposer({
   const { t } = useTranslation();
   const client = useHostRuntimeClient(serverId);
   const isConnected = useHostRuntimeIsConnected(serverId);
-  const workspaceFields = useWorkspaceFields(serverId, workspaceId, (w) => ({
-    workspaceDirectory: w.workspaceDirectory,
-    id: w.id,
-  }));
-  const workspaceDirectory = workspaceFields?.workspaceDirectory || null;
+  const workspaceFields =
+    useWorkspaceFields(serverId, workspaceId, (w) => ({
+      workspaceDirectory: w.workspaceDirectory || null,
+      id: w.id,
+      hasActiveMainAgent: w.hasActiveMainAgent,
+    })) ?? UNKNOWN_WORKSPACE_FIELDS;
+  const { workspaceDirectory } = workspaceFields;
   const draftSetup = initialSetup ?? null;
   const draftWorkingDirectory = resolveDraftWorkingDirectory({
     workspaceDirectory,
@@ -491,26 +566,23 @@ export function WorkspaceDraftComposer({
     const pending = state.pendingByDraftId[draftId] ?? null;
     return pending?.serverId === serverId && pending.lifecycle === "active" ? pending : null;
   });
+  const { getMainBlock, ...mainPreference } = useExistingWorkspaceMainPreference({
+    draftId,
+    serverId,
+    workspaceId,
+    setup: draftSetup,
+    isHandoff: Boolean(pendingAutoSubmit),
+    hasActiveMainAgent: workspaceFields.hasActiveMainAgent,
+    t,
+  });
   const consumePendingAutoSubmit = useWorkspaceDraftSubmissionStore(
     (state) => state.consumePending,
   );
   const autoSubmitConfig = resolveAutoSubmitConfig(pendingAutoSubmit);
-  const initialCreateAttempt = useMemo<DraftCreateAttempt | null>(() => {
-    if (!pendingCreateAttempt) {
-      return null;
-    }
-    return {
-      clientMessageId: pendingCreateAttempt.clientMessageId,
-      text: pendingCreateAttempt.text,
-      timestamp: new Date(pendingCreateAttempt.timestamp),
-      ...(pendingCreateAttempt.images && pendingCreateAttempt.images.length > 0
-        ? { images: pendingCreateAttempt.images }
-        : {}),
-      ...(pendingCreateAttempt.attachments && pendingCreateAttempt.attachments.length > 0
-        ? { attachments: pendingCreateAttempt.attachments }
-        : {}),
-    };
-  }, [pendingCreateAttempt]);
+  const initialCreateAttempt = useMemo(
+    () => restoreDraftCreateAttempt(pendingCreateAttempt),
+    [pendingCreateAttempt],
+  );
   const { isTimelineFork, allowEmptyText, requiresUserPromptOrigin } = resolveDraftSubmitPolicy(
     draftSetup,
     pendingAutoSubmit,
@@ -558,10 +630,12 @@ export function WorkspaceDraftComposer({
       getPendingServerId: () => serverId,
       initialAttempt: initialCreateAttempt,
       allowEmptyText,
-      validateBeforeSubmit: ({ text, attachments }) => {
+      validateBeforeSubmit: ({ text, attachments, workspaceRole }) => {
+        const block = workspaceRole ? getMainBlock() : null;
+        if (block) return workspaceMainBlockMessage(t, block);
         if (!areDraftAttachmentsReady) return t("common.loading");
         const allowsEmptyDraftText = shouldAllowEmptyDraftText({
-          allowsEmptyAutoSubmit: allowEmptyText,
+          allowsEmptyAutoSubmit: allowEmptyText || workspaceRole === "main",
           attachments,
         });
         return validateDraftSubmission({
@@ -604,13 +678,18 @@ export function WorkspaceDraftComposer({
           parentAgentId,
           forkFrom: draftSetup?.forkFrom,
           attempt,
+          assertWorkspaceMainAvailable: () => {
+            const block = getMainBlock();
+            if (block) throw new Error(workspaceMainBlockMessage(t, block));
+          },
+          imageEncodingFailedMessage: t("composer.errors.failedToSend"),
           text,
           images,
           attachments,
           cwd,
           client,
           workspaceDirectory: draftWorkingDirectory,
-          workspaceId: workspaceFields?.id ?? null,
+          workspaceId: workspaceFields.id,
           autoSubmitConfig,
           composerState,
           hostDisconnectedMessage: t("workspace.terminal.hostDisconnected"),
@@ -619,17 +698,22 @@ export function WorkspaceDraftComposer({
           supportsAgentInitialPromptOrigin: () =>
             selectHostFeature(useSessionStore.getState(), serverId, "agentInitialPromptOrigin"),
           initialPromptOriginUnavailableMessage: t("message.actions.forkUnavailable"),
+        }).catch((error: unknown) => {
+          const block = attempt.workspaceRole ? workspaceMainErrorBlock(error) : null;
+          if (block) throw new Error(workspaceMainBlockMessage(t, block));
+          throw error;
         });
         return forkOnly ? { ...created, agentId: null } : created;
       },
-      onCreateSuccess: ({ result }) => {
-        if (isTimelineFork) {
+      onCreateSuccess: ({ result, attempt }) => {
+        if (isTimelineFork || attempt.workspaceRole === "main") {
           const createFlow = useCreateFlowStore.getState();
           if (!createFlow.pendingByDraftId[draftId]?.agentId) {
             createFlow.updateAgentId({ draftId, agentId: result.id });
             createFlow.markLifecycle({ draftId, lifecycle: "sent" });
           }
         }
+        if (attempt.workspaceRole === "main") mainPreference.clear();
         clearDraftInput("sent");
         clearWorkspaceAttachments({ scopeKey: draftAttachmentScopeKey });
         useWorkspaceDraftSubmissionStore.getState().clearDraftSetup({ draftId });
@@ -702,13 +786,22 @@ export function WorkspaceDraftComposer({
     focusInputRef.current?.();
   }, []);
   const importPillPress = resolveImportPillPress(onOpenImportSheet, isSubmitting);
+  const { readForSubmit } = mainPreference;
+  const submitDraft = useCallback(
+    async (payload: MessagePayload) => {
+      const createAsMain = await readForSubmit();
+      return handleCreateFromInput(createAsMain ? { ...payload, workspaceRole: "main" } : payload);
+    },
+    [handleCreateFromInput, readForSubmit],
+  );
   const composerAgentControls = useMemo(
     () => ({
       ...composerState.agentControls,
       onDropdownClose: handleDropdownCloseFocus,
       disabled: isSubmitting,
+      workspaceMain: mainPreference.control,
     }),
-    [composerState.agentControls, handleDropdownCloseFocus, isSubmitting],
+    [composerState.agentControls, handleDropdownCloseFocus, isSubmitting, mainPreference.control],
   );
   return (
     <View style={animatedStaticStyles.inputAreaWrapper} onLayout={onInputAreaLayout}>
@@ -734,8 +827,9 @@ export function WorkspaceDraftComposer({
         serverId={serverId}
         workspaceId={workspaceId}
         isPaneFocused={isPaneFocused}
-        onSubmitMessage={handleCreateFromInput}
-        allowEmptySubmit={isTimelineFork}
+        onSubmitMessage={submitDraft}
+        allowEmptySubmit={isTimelineFork || mainPreference.checked}
+        submitBehavior={mainPreference.checked ? "preserve-and-lock" : "clear"}
         isSubmitLoading={isSubmitting || !areDraftAttachmentsReady}
         blurOnSubmit={true}
         textSource={draftInput.textSource}

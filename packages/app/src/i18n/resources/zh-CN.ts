@@ -229,6 +229,12 @@ export const zhCN: TranslationResources = {
     },
   },
   agentControls: {
+    workspaceMain: {
+      label: "设为主控会话",
+      occupied: "此工作区已有活跃的主控会话。",
+      unknown: "暂时无法确认此工作区是否已有活跃的主控会话。",
+      unsupported: "请更新主机，以便从草稿创建主控会话。",
+    },
     provider: {
       fallback: "Provider",
       select: "选择 Agent Provider",

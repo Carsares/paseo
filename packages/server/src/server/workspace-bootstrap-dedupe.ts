@@ -10,18 +10,18 @@
  *   - the status changed from the snapshot
  *   - the statusEnteredAt changed from the snapshot (including the
  *     null↔value transition that the unmask case produces)
+ *   - Main Control occupancy changed
  *   - the update's activityAtMs is strictly newer than the snapshot's
  *   - the snapshot has no activityAtMs and the update has one (new activity
  *     where there was none)
  *
- * Returns `false` (drop) when the status pair is unchanged AND the update
- * is not strictly newer than the snapshot in activity. The both-null
- * activity case falls through to drop — there is genuinely no new info.
+ * Otherwise returns `false` (drop).
  */
 export interface BootstrapUpdateSnapshot {
   status: string;
   statusEnteredAt: string | null;
   activityAtMs: number | null;
+  hasActiveMainAgent?: boolean;
 }
 
 export interface BootstrapUpdateCheckInput {
@@ -48,7 +48,10 @@ export function shouldEmitPendingBootstrapUpdate(input: BootstrapUpdateCheckInpu
     return true;
   }
 
-  // Status pair is unchanged. The only remaining signal is activity.
+  if (snapshot.hasActiveMainAgent !== update.hasActiveMainAgent) {
+    return true;
+  }
+
   if (update.activityAtMs === null) {
     return false;
   }

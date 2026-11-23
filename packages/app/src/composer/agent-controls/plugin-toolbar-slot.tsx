@@ -12,8 +12,8 @@ function readSlotWidth(event: LayoutChangeEvent): number | null {
   return height > 0 ? width : null;
 }
 
-/** What the plugin items take up in the toolbar row, in points, as `PluginToolbarSlot` reports it. */
-export function usePluginToolbarWidth(): {
+/** Measures a toolbar slot even when its controls are folded into a sheet. */
+export function useToolbarSlotWidth(): {
   width: number;
   onLayout: (event: LayoutChangeEvent) => void;
 } {

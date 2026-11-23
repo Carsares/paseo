@@ -229,6 +229,12 @@ export const ko: TranslationResources = {
     },
   },
   agentControls: {
+    workspaceMain: {
+      label: "메인 세션으로 설정",
+      occupied: "이 작업 공간에 이미 활성 메인 세션이 있습니다.",
+      unknown: "이 작업 공간에 활성 메인 세션이 있는지 확인할 수 없습니다.",
+      unsupported: "초안에서 메인 세션을 만들려면 호스트를 업데이트하세요.",
+    },
     provider: {
       fallback: "프로바이더",
       select: "에이전트 프로바이더 선택",

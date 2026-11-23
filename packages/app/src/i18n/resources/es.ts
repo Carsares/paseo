@@ -231,6 +231,12 @@ export const es: TranslationResources = {
     },
   },
   agentControls: {
+    workspaceMain: {
+      label: "Establecer como sesión principal",
+      occupied: "Este espacio de trabajo ya tiene una sesión principal activa.",
+      unknown: "No se pudo confirmar si este espacio de trabajo tiene una sesión principal activa.",
+      unsupported: "Actualiza el host para crear una sesión principal a partir de un borrador.",
+    },
     provider: {
       fallback: "Proveedor",
       select: "Seleccionar proveedor de agente",

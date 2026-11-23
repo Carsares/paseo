@@ -64,6 +64,24 @@ describe("shouldEmitPendingBootstrapUpdate", () => {
     ).toBe(true);
   });
 
+  test.each([
+    [true, false],
+    [false, true],
+    [undefined, false],
+  ])("emits when Main Control occupancy changes from %s to %s", (before, after) => {
+    expect(
+      shouldEmitPendingBootstrapUpdate({
+        snapshot: { ...SNAPSHOT_DONE_10_30, hasActiveMainAgent: before },
+        update: { ...SNAPSHOT_DONE_10_30, hasActiveMainAgent: after },
+      }),
+    ).toBe(true);
+  });
+
+  test("drops when Main Control occupancy, status and activity all match", () => {
+    const snapshot = { ...SNAPSHOT_DONE_10_30, hasActiveMainAgent: true };
+    expect(shouldEmitPendingBootstrapUpdate({ snapshot, update: { ...snapshot } })).toBe(false);
+  });
+
   test("emits when update activity is strictly newer than snapshot activity", () => {
     expect(
       shouldEmitPendingBootstrapUpdate({

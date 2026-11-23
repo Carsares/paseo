@@ -8811,6 +8811,279 @@ test("creation lifecycle sends the keyed agent, fork source, and initial prompt 
   expect(transport.sent).toHaveLength(1);
 });
 
+test("explicit main creation uses its independent capability and preserves the conflict code", async () => {
+  const transport = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "creation-main-role",
+    transportFactory: () => transport.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connected = client.connect();
+  transport.triggerOpen({ features: { agentCreateAsMain: true } });
+  await connected;
+
+  const agentCreation = client.createAgent({
+    provider: "codex",
+    cwd: "/project",
+    workspaceId: "workspace-main",
+    workspaceRole: "main",
+  });
+  void agentCreation.catch(() => undefined);
+  const agentRequest = parseSentFrame(transport.sent[0]);
+  expect(agentRequest).toMatchObject({
+    type: "agent.create.request",
+    workspaceId: "workspace-main",
+    workspaceRole: "main",
+  });
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.create.response",
+      payload: {
+        requestId: agentRequest.requestId,
+        agent: null,
+        error: "This workspace already has an active Main Session.",
+        errorCode: "workspace_main_exists",
+      },
+    }),
+  );
+  await expect(agentCreation).rejects.toMatchObject({ code: "workspace_main_exists" });
+
+  const workspaceCreation = client.createWorkspace({
+    source: { kind: "directory", path: "/project" },
+    agent: {
+      provider: "codex",
+      cwd: "/project",
+      workspaceRole: "main",
+    },
+  });
+  const workspaceRequest = parseSentFrame(transport.sent[1]);
+  expect(workspaceRequest).toMatchObject({
+    type: "workspace.create.request",
+    agent: { workspaceRole: "main" },
+  });
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "workspace.create.response",
+      payload: {
+        requestId: workspaceRequest.requestId,
+        workspace: null,
+        setupTerminalId: null,
+        error: "This workspace already has an active Main Session.",
+        errorCode: "workspace_main_exists",
+      },
+    }),
+  );
+  await expect(workspaceCreation).resolves.toMatchObject({
+    error: "This workspace already has an active Main Session.",
+    errorCode: "workspace_main_exists",
+  });
+});
+
+test.each([
+  {},
+  { creationLifecycle: true, workspaceMainAgentDefault: true },
+  { creationLifecycle: true, agentCreateAsMain: false },
+] as Record<string, boolean>[])(
+  "explicit main creation rejects unsupported host features %j",
+  async (features) => {
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "creation-main-role-old",
+      transportFactory: () => transport.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connected = client.connect();
+    transport.triggerOpen({ features });
+    await connected;
+
+    await expect(
+      client.createAgent({ provider: "codex", cwd: "/project", workspaceRole: "main" }),
+    ).rejects.toMatchObject({ code: "AGENT_CREATE_AS_MAIN_UNSUPPORTED" });
+    await expect(
+      client.createWorkspace({
+        source: { kind: "directory", path: "/project" },
+        agent: { provider: "codex", cwd: "/project", workspaceRole: "main" },
+      }),
+    ).rejects.toMatchObject({ code: "AGENT_CREATE_AS_MAIN_UNSUPPORTED" });
+    expect(transport.sent).toHaveLength(0);
+  },
+);
+
+test("reading a creation receipt after reopening a draft does not subscribe or create", async () => {
+  const transport = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "creation-receipt-once",
+    transportFactory: () => transport.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connected = client.connect();
+  transport.triggerOpen({ features: { creationLifecycle: true } });
+  await connected;
+  const receipt = client.getCreationSnapshot("workspace", "reopened-workspace");
+  const request = parseSentFrame(transport.sent[0]);
+  expect(request).toMatchObject({
+    type: "creation.subscribe.request",
+    kind: "workspace",
+    idempotencyKey: "reopened-workspace",
+    subscribe: false,
+  });
+  transport.triggerMessage(
+    wrapSessionMessage({
+      type: "creation.subscribe.response",
+      payload: { requestId: request.requestId, snapshot: null, error: null },
+    }),
+  );
+  await expect(receipt).resolves.toBeNull();
+  expect(transport.sent).toHaveLength(1);
+});
+
+test.each(["member", false, null])(
+  "invalid workspace role %j is rejected before a legacy create can discard it",
+  async (role) => {
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "creation-invalid-workspace-role",
+      transportFactory: () => transport.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connected = client.connect();
+    transport.triggerOpen({ features: {} });
+    await connected;
+
+    // Untyped SDK callers can pass values TypeScript rejects.
+    const agent = { provider: "codex", cwd: "/project", workspaceRole: role as unknown as "main" };
+    const agentCreation = client.createAgent(agent);
+    const workspaceCreation = client.createWorkspace({
+      source: { kind: "directory", path: "/project" },
+      agent,
+    });
+    void agentCreation.catch(() => undefined);
+    void workspaceCreation.catch(() => undefined);
+
+    expect(transport.sent).toHaveLength(0);
+    await expect(agentCreation).rejects.toMatchObject({ code: "INVALID_WORKSPACE_ROLE" });
+    await expect(workspaceCreation).rejects.toMatchObject({ code: "INVALID_WORKSPACE_ROLE" });
+  },
+);
+
+test.each([
+  ["agent", "receipt"],
+  ["agent", "retry"],
+  ["workspace", "receipt"],
+  ["workspace", "retry"],
+] as const)(
+  "explicit main %s creation preserves the conflict code after reconnect by %s",
+  async (kind, recovery) => {
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "creation-main-role-reconnect",
+      transportFactory: () => transport.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const features = { agentCreateAsMain: true, ownedSubscriptions: true };
+    const connected = client.connect();
+    transport.triggerOpen({ features });
+    await connected;
+
+    const idempotencyKey = "explicit-main-reconnect";
+    const agent = { provider: "codex", cwd: "/project", workspaceRole: "main" as const };
+    const creation =
+      kind === "agent"
+        ? client.createAgent({ ...agent, idempotencyKey })
+        : client.createWorkspace({
+            source: { kind: "directory", path: "/project" },
+            agent,
+            idempotencyKey,
+          });
+    void creation.catch(() => undefined);
+    const original = parseSentFrame(transport.sent[0]);
+    expect(original).toMatchObject({ type: `${kind}.create.request`, idempotencyKey });
+
+    transport.triggerClose();
+    const reconnected = client.connect();
+    transport.triggerOpen({ features });
+    await reconnected;
+    await expect.poll(() => transport.sent.length).toBe(1);
+    const subscription = parseSentFrame(transport.sent[0]);
+    expect(subscription).toMatchObject({
+      type: "creation.subscribe.request",
+      kind,
+      idempotencyKey,
+    });
+
+    const error = "This workspace already has an active Main Session.";
+    const errorCode = "workspace_main_exists";
+    const snapshot = {
+      kind,
+      idempotencyKey,
+      phase: "failed",
+      revision: 1,
+      workspaceId: null,
+      agentId: null,
+      error,
+      errorCode,
+      outcomeUnknown: false,
+    };
+    transport.triggerMessage(
+      wrapSessionMessage({
+        type: "creation.subscribe.response",
+        payload: {
+          requestId: subscription.requestId,
+          subscriptionId: "main-creation-observation",
+          snapshot: recovery === "receipt" ? snapshot : null,
+          error: null,
+        },
+      }),
+    );
+    if (recovery === "retry") {
+      await expect.poll(() => transport.sent.length).toBe(2);
+      const replay = parseSentFrame(transport.sent[1]);
+      expect({ ...replay, requestId: original.requestId }).toEqual(original);
+      transport.triggerMessage(
+        wrapSessionMessage({
+          type: `${kind}.create.response`,
+          payload: {
+            requestId: replay.requestId,
+            ...(kind === "agent"
+              ? { agent: null }
+              : { workspace: null, setupTerminalId: null, errorCode }),
+            error,
+            creation: snapshot,
+          },
+        }),
+      );
+    }
+
+    if (kind === "agent") {
+      await expect(creation).rejects.toMatchObject({ code: errorCode, outcome: "rejected" });
+    } else {
+      await expect(creation).resolves.toMatchObject({ error, errorCode, creation: { errorCode } });
+    }
+    await expect.poll(() => transport.sent.length).toBe(recovery === "receipt" ? 2 : 3);
+    const release = parseSentFrame(transport.sent.at(-1));
+    expect(release).toMatchObject({
+      type: "subscription.release.request",
+      subscriptionId: "main-creation-observation",
+    });
+    transport.triggerMessage(
+      wrapSessionMessage({
+        type: "subscription.release.response",
+        payload: { requestId: release.requestId, subscriptionId: "main-creation-observation" },
+      }),
+    );
+  },
+);
+
 test("creation lifecycle acknowledgement reaches the observer before the final response", async () => {
   const transport = createMockTransport();
   const client = new DaemonClient({

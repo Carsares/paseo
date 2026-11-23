@@ -673,7 +673,7 @@ test("workspace handles keep identity and refresh snapshots through existing dri
   expect(workspace.directory).toBe("/repo/sdk");
   expect(workspace.current()).toEqual(openedWorkspace);
 
-  const refreshedWorkspace = createWorkspace({ name: "sdk refreshed" });
+  const refreshedWorkspace = createWorkspace({ name: "sdk refreshed", hasActiveMainAgent: true });
   const refetchPromise = workspace.refresh({ requestId: "workspace-refetch-request" });
   expect(parseSentSessionMessage(ws.sent.at(-1))).toMatchObject({
     type: "fetch_workspaces_request",
@@ -729,7 +729,7 @@ test("workspace handles keep identity and refresh snapshots through existing dri
       updates.push(update.workspace.name);
     }
   });
-  const pushedWorkspace = createWorkspace({ name: "sdk pushed" });
+  const pushedWorkspace = createWorkspace({ name: "sdk pushed", hasActiveMainAgent: false });
   ws.message(
     sessionMessage({
       type: "workspace_update",
@@ -941,6 +941,74 @@ async function createWorkspaceHandle(features: Record<string, boolean>) {
   );
   return { client, ws, workspace: await creating };
 }
+
+test("SDK creation entry points pass the explicit main role and expose the daemon error code", async () => {
+  const { client, ws } = await connectClient({
+    providerUsageList: true,
+    providersSnapshotCwd: true,
+    ownedSubscriptions: true,
+    agentCreateAsMain: true,
+  });
+
+  const agentOptions = { config: { provider: "codex/gpt-5.4" }, workspaceRole: "main" as const };
+  const workspace = client.workspaces.ref(createWorkspace());
+  for (const scope of ["global", "workspace"] as const) {
+    const agentCreation =
+      scope === "global"
+        ? client.agents.create({ ...agentOptions, cwd: "/repo/sdk" })
+        : workspace.agents.create(agentOptions);
+    const agentRequest = parseSentSessionMessage(ws.sent.at(-1));
+    expect(agentRequest).toMatchObject({
+      type: "agent.create.request",
+      config: { provider: "codex", model: "gpt-5.4", cwd: "/repo/sdk" },
+      workspaceRole: "main",
+    });
+    expect(agentRequest.workspaceId).toBe(scope === "workspace" ? workspace.id : undefined);
+    ws.message(
+      sessionMessage({
+        type: "agent.create.response",
+        payload: {
+          requestId: agentRequest.requestId,
+          agent: null,
+          error: "This workspace already has an active Main Session.",
+          errorCode: "workspace_main_exists",
+        },
+      }),
+    );
+    await expect(agentCreation).rejects.toMatchObject({ code: "workspace_main_exists" });
+  }
+
+  const workspaceCreation = client.workspaces.create({
+    source: { kind: "directory", path: "/repo/sdk" },
+    agent: {
+      config: { provider: "codex/gpt-5.4" },
+      cwd: "/repo/sdk",
+      workspaceRole: "main",
+    },
+  });
+  const workspaceRequest = parseSentSessionMessage(ws.sent.at(-1));
+  expect(workspaceRequest).toMatchObject({
+    type: "workspace.create.request",
+    agent: {
+      config: { provider: "codex", model: "gpt-5.4", cwd: "/repo/sdk" },
+      workspaceRole: "main",
+    },
+  });
+  ws.message(
+    sessionMessage({
+      type: "workspace.create.response",
+      payload: {
+        requestId: workspaceRequest.requestId,
+        workspace: null,
+        setupTerminalId: null,
+        error: "This workspace already has an active Main Session.",
+        errorCode: "workspace_main_exists",
+      },
+    }),
+  );
+  await expect(workspaceCreation).rejects.toMatchObject({ code: "workspace_main_exists" });
+  await client.close();
+});
 
 test("a background agent in an existing workspace fails before sending on a host without background agents", async () => {
   const { client, ws, workspace } = await createWorkspaceHandle({

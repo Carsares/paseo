@@ -121,6 +121,7 @@ import { getErrorMessage, getErrorMessageOr } from "@getpaseo/protocol/error-uti
 import { getAgentStatusPriority } from "@getpaseo/protocol/agent-state-bucket";
 import {
   EXPLICIT_PARENT_REPORTING,
+  getAgentProfileIdFromLabels,
   getParentAddressFromLabels,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
@@ -185,7 +186,10 @@ import {
   updateAgentCommand,
 } from "./agent/lifecycle-command.js";
 import { buildStoredAgentPayload, toAgentPayload } from "./agent/agent-projections.js";
-import { hasReservedHierarchyLabels } from "./agent/hierarchy-policy.js";
+import {
+  hasReservedHierarchyLabels,
+  REMOTE_HIERARCHY_DEPTH_LABEL,
+} from "./agent/hierarchy-policy.js";
 import {
   assertPluginTimelineDataSize,
   assertPluginTimelineKind,
@@ -320,7 +324,10 @@ import {
   WorkspaceDirectory,
   type WorkspaceUpdatesFilter,
 } from "./workspace-directory.js";
-import { shouldEmitPendingBootstrapUpdate } from "./workspace-bootstrap-dedupe.js";
+import {
+  type BootstrapUpdateSnapshot,
+  shouldEmitPendingBootstrapUpdate,
+} from "./workspace-bootstrap-dedupe.js";
 import {
   createPaseoWorktree,
   type CreatePaseoWorktreeInput,
@@ -985,6 +992,16 @@ function hasInitialCreationPrompt(
   );
 }
 
+function getFirstAgentContext(
+  trimmedPrompt: string | undefined,
+  attachments: AgentCreateRequest["attachments"],
+): FirstAgentContext {
+  return {
+    ...(trimmedPrompt ? { prompt: trimmedPrompt } : {}),
+    ...(attachments?.length ? { attachments } : {}),
+  };
+}
+
 function workspaceLabelErrorCode(error: unknown): string {
   if (
     error instanceof WorkspaceLabelError ||
@@ -1101,6 +1118,7 @@ export class Session {
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
   private unsubscribeAgentEvents: (() => void) | null = null;
+  private unsubscribeMainWorkspaceChanges: (() => void) | null = null;
   private unsubscribeProjectMutations: (() => void) | null = null;
   private unsubscribePluginChanges: (() => void) | null = null;
   private unsubscribeWorkspaceMutations: (() => void) | null = null;
@@ -1497,6 +1515,7 @@ export class Session {
           this.unsubscribeAgentEvents,
           this.unsubscribeProjectMutations,
           this.unsubscribeWorkspaceMutations,
+          this.unsubscribeMainWorkspaceChanges,
           this.unsubscribePluginChanges,
           this.unsubscribeTerminalWorkspaceContributionEvents,
           this.providerCatalogSession.isObserving,
@@ -2222,6 +2241,15 @@ export class Session {
         this.workspaceRegistry.subscribeToMutations?.((mutation) =>
           this.enqueueRegistryMutation(() => this.handleWorkspaceMutation(mutation)),
         ) ?? null;
+      this.unsubscribeMainWorkspaceChanges ??=
+        this.agentManager.subscribeToMainWorkspaceChanges?.((workspaceIds) => {
+          void this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds).catch((error) => {
+            this.sessionLogger.warn(
+              { err: error, workspaceIds },
+              "Failed to emit Main Control occupancy",
+            );
+          });
+        }) ?? null;
       this.unsubscribeTerminalWorkspaceContributionEvents ??=
         this.terminalManager?.subscribeTerminalWorkspaceContributionChanged((event) => {
           void this.emitWorkspaceUpdateForTerminalContribution(event).catch((error) =>
@@ -2236,6 +2264,8 @@ export class Session {
       this.unsubscribeProjectMutations = null;
       this.unsubscribeWorkspaceMutations?.();
       this.unsubscribeWorkspaceMutations = null;
+      this.unsubscribeMainWorkspaceChanges?.();
+      this.unsubscribeMainWorkspaceChanges = null;
       this.unsubscribeTerminalWorkspaceContributionEvents?.();
       this.unsubscribeTerminalWorkspaceContributionEvents = null;
     }
@@ -5801,6 +5831,10 @@ export class Session {
     request: AgentCreateRequest,
     observer?: (snapshot: CreationSnapshot) => void,
   ): Promise<CreationSnapshot> {
+    const { workspaceRole } = request;
+    if (workspaceRole === "main") {
+      this.assertExplicitMainCreationAllowed(request, !request.workspaceId || !!request.worktree);
+    }
     await this.preflightAgentWorkspace(request);
     const { requestId, type: _type, subscribe: _subscribe, idempotencyKey, ...intent } = request;
     return this.creationService.create(
@@ -5823,6 +5857,7 @@ export class Session {
               { ...request, type: "create_agent_request" },
               id,
               onReady,
+              { workspaceRole },
             );
           } catch (error) {
             throw new WorktreeRequestError(toWorktreeWireError(error));
@@ -5850,7 +5885,13 @@ export class Session {
       this.emitForSource(
         {
           type: "agent.create.response",
-          payload: { requestId, agent: creation.agent ?? null, error: creation.error, creation },
+          payload: {
+            requestId,
+            agent: creation.agent ?? null,
+            error: creation.error,
+            errorCode: creation.errorCode,
+            creation,
+          },
         },
         source,
       );
@@ -5862,6 +5903,7 @@ export class Session {
             requestId,
             agent: null,
             error: error instanceof Error ? error.message : String(error),
+            errorCode: error instanceof SessionRequestError ? error.code : undefined,
           },
         },
         source,
@@ -5884,24 +5926,7 @@ export class Session {
         )
       : undefined;
     try {
-      this.assertWorkspaceCreationAllowed(request);
-      if (
-        request.mainAgent &&
-        (!this.authorization.allowsPermission("workspace.write") ||
-          !this.authorization.allowsPermission("workspace.manage"))
-      ) {
-        throw new SessionRequestError(
-          "access_denied",
-          "Creating a Main Session requires workspace.write and workspace.manage.",
-        );
-      }
-      if (
-        request.agent &&
-        !this.authorization.allowsPermission("workspace.write") &&
-        !this.authorization.allowsPermission("hub.execute")
-      ) {
-        throw new Error("Session is not authorized to create an agent");
-      }
+      this.assertWorkspaceCreationWithAgentsAllowed(request);
       const agentInput = request.agent;
       const mainAgentInput = request.mainAgent;
       const resolveAgentCwd = async (
@@ -5997,7 +6022,10 @@ export class Session {
                   },
                   id,
                   onReady,
-                  mainAgent ? { notifyParentOnInitialPrompt: false } : undefined,
+                  {
+                    workspaceRole: agentInput.workspaceRole,
+                    notifyParentOnInitialPrompt: mainAgent ? false : undefined,
+                  },
                 );
               }
             : undefined,
@@ -6112,7 +6140,7 @@ export class Session {
     msg: CreateAgentRequestMessage,
     agentId?: string,
     onAgentReady?: (agent: AgentSnapshotPayload) => Promise<void>,
-    options?: { notifyParentOnInitialPrompt?: boolean },
+    options?: { notifyParentOnInitialPrompt?: boolean; workspaceRole?: "main" },
   ): Promise<CreatedAgent> {
     const {
       config,
@@ -6135,14 +6163,11 @@ export class Session {
 
     let createdWorktreeForCleanup: CreatePaseoWorktreeWorkflowResult | null = null;
     let createdAgentId: string | null = null;
+    let releaseWorkspace: (() => void) | undefined;
     try {
       const callerAgent = await this.preflightAgentWorkspace(msg);
       const forkedTimelineRows = await this.readForkedTimeline(msg.forkFrom);
-      const requestedCwd = resolve(config.cwd);
-      const needsRequestedDirectory = Boolean(worktree) || (!msg.workspaceId && !msg.callerAgentId);
-      if (needsRequestedDirectory && !(await this.filesystem.isDirectory(requestedCwd))) {
-        throw new Error(`Working directory does not exist or is not a directory: ${requestedCwd}`);
-      }
+      await this.validateRequestedAgentDirectory(msg);
       this.validatePublicAgentWorkspaceIntent(msg);
       const trimmedPrompt = initialPrompt?.trim();
       const { provisionalTitle } = resolveCreateAgentTitles({
@@ -6150,10 +6175,7 @@ export class Session {
         initialPrompt: trimmedPrompt,
       });
 
-      const firstAgentContext: FirstAgentContext = {
-        ...(trimmedPrompt ? { prompt: trimmedPrompt } : {}),
-        ...(attachments && attachments.length > 0 ? { attachments } : {}),
-      };
+      const firstAgentContext = getFirstAgentContext(trimmedPrompt, attachments);
       const workspacePromptTitle = resolveFirstAgentPromptTitle(firstAgentContext);
       const createdWorktree = await this.createAgentLifecycleDispatch.createWorktreeForRequest({
         cwd: config.cwd,
@@ -6168,11 +6190,15 @@ export class Session {
         createdWorktree,
         workspacePromptTitle,
       });
-      const resolvedCwd = resolve(resolvedIntent.config.cwd);
-      if (!(await this.filesystem.isDirectory(resolvedCwd))) {
-        throw new Error(`Working directory does not exist or is not a directory: ${resolvedCwd}`);
-      }
+      await this.requireAgentDirectory(resolvedIntent.config.cwd);
 
+      const workspaceId = resolvedIntent.intent.workspaceId;
+      const workspaceRole = options?.workspaceRole;
+      const createAsMain = workspaceRole === "main";
+      if (createAsMain) {
+        releaseWorkspace = this.reserveWorkspaceMove(workspaceId);
+        await this.requireMoveSourceWorkspace(workspaceId);
+      }
       const userCreation = isUserAgentCreation(msg);
       const { snapshot, liveSnapshot, initialPromptStarted } = await createAgentCommand(
         {
@@ -6184,6 +6210,7 @@ export class Session {
           paseoHome: this.paseoHome,
           worktreesRoot: this.worktreesRoot,
           providerSnapshotManager: this.providerSnapshotManager,
+          initialPromptReceipts: createAsMain ? this.messageReceipts : undefined,
         },
         {
           kind: "session",
@@ -6191,11 +6218,18 @@ export class Session {
           notifyParentOnInitialPrompt: options?.notifyParentOnInitialPrompt,
           onAgentReady: async (agent) => {
             createdAgentId = agent.id;
+            if (createAsMain) {
+              await this.createDefaultMainResidents(agent.id, workspaceId);
+            }
             await onAgentReady?.(await this.buildAgentPayload(agent));
           },
           agentId,
           config: resolvedIntent.config,
-          workspaceId: resolvedIntent.intent.workspaceId,
+          workspaceId,
+          workspaceRole,
+          ...(createAsMain
+            ? { profileId: getAgentProfileIdFromLabels(msg.labels) ?? undefined }
+            : {}),
           background: resolvedIntent.background,
           initialPrompt,
           forkedTimelineRows,
@@ -6217,6 +6251,8 @@ export class Session {
           inheritParentWorkspace: Boolean(callerAgent && msg.workspaceId === undefined),
         },
       );
+      releaseWorkspace?.();
+      releaseWorkspace = undefined;
       createdAgentId = snapshot.id;
       // `snapshot` predates the initial prompt; subscribers keep the last state they receive.
       await this.agentUpdates.forwardLiveAgent(
@@ -6243,11 +6279,47 @@ export class Session {
       );
       return { agent: await this.buildAgentPayload(liveSnapshot), initialPromptStarted };
     } catch (error) {
+      releaseWorkspace?.();
       await this.createAgentLifecycleDispatch.cleanupCreatedWorktreeAfterFailedAgentCreate({
         createdWorktree: createdWorktreeForCleanup,
         createdAgentId,
       });
       throw error;
+    }
+  }
+
+  private async validateRequestedAgentDirectory(request: CreateAgentRequestMessage): Promise<void> {
+    if (request.worktree || (!request.workspaceId && !request.callerAgentId)) {
+      await this.requireAgentDirectory(request.config.cwd);
+    }
+  }
+
+  private async requireAgentDirectory(cwd: string): Promise<void> {
+    const directory = resolve(cwd);
+    if (!(await this.filesystem.isDirectory(directory))) {
+      throw new Error(`Working directory does not exist or is not a directory: ${directory}`);
+    }
+  }
+
+  private async createDefaultMainResidents(
+    mainAgentId: string,
+    workspaceId: string,
+  ): Promise<void> {
+    for (const profile of this.daemonConfigStore.get().agentProfiles ?? []) {
+      if (!profile.defaultResident) continue;
+      try {
+        await this.agentManager.createSilentResidentSubagent({
+          parentAgentId: mainAgentId,
+          expectedWorkspaceId: workspaceId,
+          profileId: profile.id,
+          defaultForMain: true,
+        });
+      } catch (error) {
+        this.sessionLogger.warn(
+          { err: error, mainAgentId, profileId: profile.id },
+          "Failed to create default Main Control resident",
+        );
+      }
     }
   }
 
@@ -7630,6 +7702,9 @@ export class Session {
       workspaceKind: workspace.kind,
       name: resolveWorkspaceDisplayName(workspace),
       title: workspace.title,
+      hasActiveMainAgent: (
+        await this.listWorkspaceMoveVisibleRecords([workspace.workspaceId])
+      ).some((agent) => !agent.internal && isMainControlAgentLabels(agent.labels)),
       pinnedAt: workspace.pinnedAt,
       ...(workspace.labels && workspace.labels.length > 0 ? { labels: workspace.labels } : {}),
       metadata: workspace.metadata,
@@ -7730,6 +7805,7 @@ export class Session {
         derivedDisplayName: result.worktree.branchName || result.workspace.displayName,
       }),
       title: result.workspace.title,
+      hasActiveMainAgent: false,
       pinnedAt: result.workspace.pinnedAt,
       ...(result.workspace.labels && result.workspace.labels.length > 0
         ? { labels: result.workspace.labels }
@@ -7886,10 +7962,7 @@ export class Session {
   private flushBootstrappedWorkspaceUpdates(
     subscription: WorkspaceUpdatesSubscriptionState,
     options?: {
-      snapshotByWorkspaceId?: Map<
-        string,
-        { status: string; statusEnteredAt: string | null; activityAtMs: number | null }
-      >;
+      snapshotByWorkspaceId?: Map<string, BootstrapUpdateSnapshot>;
     },
   ): void {
     if (
@@ -7910,15 +7983,10 @@ export class Session {
           ? Date.parse(payload.workspace.activityAt)
           : null;
         const shouldEmit = shouldEmitPendingBootstrapUpdate({
-          snapshot: snapshot
-            ? {
-                status: snapshot.status,
-                statusEnteredAt: snapshot.statusEnteredAt,
-                activityAtMs: snapshot.activityAtMs,
-              }
-            : null,
+          snapshot: snapshot ?? null,
           update: {
             status: payload.workspace.status,
+            hasActiveMainAgent: payload.workspace.hasActiveMainAgent,
             statusEnteredAt: payload.workspace.statusEnteredAt ?? null,
             activityAtMs: Number.isNaN(updateActivityAtMs) ? null : updateActivityAtMs,
           },
@@ -8841,26 +8909,15 @@ export class Session {
     };
   }
 
-  // Build the bootstrap snapshot used by `flushBootstrappedWorkspaceUpdates`
-  // to decide which pending updates to drop. Captures the status,
-  // statusEnteredAt, and activityAt (parsed to ms) for each workspace entry
-  // so a status-only change (e.g. the unmask case), a statusEnteredAt-only
-  // change (e.g. a fresh unmask time), AND a fresher activity all still
-  // ship to the client.
   private buildBootstrapSnapshot(entries: FetchWorkspacesResponseEntry[]): {
-    snapshotByWorkspaceId: Map<
-      string,
-      { status: string; statusEnteredAt: string | null; activityAtMs: number | null }
-    >;
+    snapshotByWorkspaceId: Map<string, BootstrapUpdateSnapshot>;
   } {
-    const snapshotByWorkspaceId = new Map<
-      string,
-      { status: string; statusEnteredAt: string | null; activityAtMs: number | null }
-    >();
+    const snapshotByWorkspaceId = new Map<string, BootstrapUpdateSnapshot>();
     for (const entry of entries) {
       const parsedActivity = entry.activityAt ? Date.parse(entry.activityAt) : null;
       snapshotByWorkspaceId.set(entry.id, {
         status: entry.status,
+        hasActiveMainAgent: entry.hasActiveMainAgent,
         statusEnteredAt: entry.statusEnteredAt ?? null,
         activityAtMs: Number.isNaN(parsedActivity) ? null : parsedActivity,
       });
@@ -8939,14 +8996,84 @@ export class Session {
   private assertWorkspaceCreationAllowed(
     request?: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
   ): void {
+    if (request?.callerAgentId !== undefined) {
+      throw new SessionRequestError("invalid_request", AGENT_WORKSPACE_CREATION_ERROR);
+    }
     if (
       readDirectParentRoute(this.getHostSourceId()) ||
-      request?.callerAgentId !== undefined ||
       request?.agent?.callerAgentId !== undefined ||
       request?.agent?.initialPromptOrigin === "agent" ||
       this.hasRemoteCreationParent(request?.agent?.labels)
     ) {
       throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+    }
+  }
+
+  private assertExplicitMainCreationAllowed(
+    request: Pick<
+      AgentCreateRequest,
+      "callerAgentId" | "initialPromptOrigin" | "labels" | "internal"
+    >,
+    createsWorkspace: boolean,
+  ): void {
+    if (
+      readDirectParentRoute(this.getHostSourceId()) ||
+      request.callerAgentId !== undefined ||
+      request.initialPromptOrigin === "agent" ||
+      request.internal ||
+      request.labels?.[PARENT_AGENT_ID_LABEL] !== undefined ||
+      request.labels?.[PARENT_SERVER_ID_LABEL] !== undefined ||
+      request.labels?.[PARENT_REPORTING_LABEL] !== undefined ||
+      request.labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] !== undefined ||
+      request.labels?.[REMOTE_CHILD_RESERVATION_LABEL] !== undefined
+    ) {
+      throw new SessionRequestError(
+        "invalid_request",
+        "Only a user can create a workspace root agent as Main Control.",
+      );
+    }
+    if (
+      !this.authorization.allowsPermission("workspace.write") ||
+      (createsWorkspace && !this.authorization.allowsPermission("workspace.manage"))
+    ) {
+      throw new SessionRequestError(
+        "access_denied",
+        createsWorkspace
+          ? "Creating a workspace with a Main Session requires workspace.write and workspace.manage."
+          : "Creating a Main Session requires workspace.write.",
+      );
+    }
+  }
+
+  private assertWorkspaceCreationWithAgentsAllowed(
+    request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+  ): void {
+    if (request.agent?.workspaceRole === "main") {
+      if (request.mainAgent) {
+        throw new SessionRequestError(
+          "invalid_request",
+          "Choose either an explicit Main Session or a separate default Main Session.",
+        );
+      }
+      this.assertExplicitMainCreationAllowed(request.agent, true);
+    }
+    this.assertWorkspaceCreationAllowed(request);
+    if (
+      request.mainAgent &&
+      (!this.authorization.allowsPermission("workspace.write") ||
+        !this.authorization.allowsPermission("workspace.manage"))
+    ) {
+      throw new SessionRequestError(
+        "access_denied",
+        "Creating a Main Session requires workspace.write and workspace.manage.",
+      );
+    }
+    if (
+      request.agent &&
+      !this.authorization.allowsPermission("workspace.write") &&
+      !this.authorization.allowsPermission("hub.execute")
+    ) {
+      throw new Error("Session is not authorized to create an agent");
     }
   }
 
@@ -11337,6 +11464,8 @@ export class Session {
     this.unsubscribePluginChanges = null;
     this.unsubscribeWorkspaceMutations?.();
     this.unsubscribeWorkspaceMutations = null;
+    this.unsubscribeMainWorkspaceChanges?.();
+    this.unsubscribeMainWorkspaceChanges = null;
     this.agentUpdates.dispose();
     await this.hubExecutionController?.cleanup();
     if (this.unsubscribeTerminalWorkspaceContributionEvents) {

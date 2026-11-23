@@ -1,5 +1,5 @@
 /** @vitest-environment jsdom */
-import { act, fireEvent, render, renderHook, screen } from "@testing-library/react";
+import { act, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createInstance } from "i18next";
 import { createElement, createRef } from "react";
 import { I18nextProvider } from "react-i18next";
@@ -31,7 +31,7 @@ import { DEFAULT_OPEN_IN_SIDE_PANE_PREFERENCES } from "@/hooks/use-settings/stor
 import { en } from "@/i18n/resources/en";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
 import { useDraftAgentCreateFlow } from "./create-flow";
-import { useSessionStore, type Agent } from "@/stores/session-store";
+import { normalizeWorkspaceDescriptor, useSessionStore, type Agent } from "@/stores/session-store";
 import { WorkspaceLayoutPersistedStateSchema } from "@/stores/workspace-layout-storage";
 import {
   collectAllTabs,
@@ -69,10 +69,17 @@ vi.mock("@/runtime/host-runtime", async (importOriginal) => ({
   useHostRuntimeClient: vi.fn(),
   useHostRuntimeIsConnected: () => true,
 }));
-vi.mock("@/stores/session-store-hooks", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/stores/session-store-hooks")>()),
-  useWorkspaceFields: () => ({ id: "workspace-1", workspaceDirectory: "/tmp/project" }),
-}));
+vi.mock("@/stores/session-store-hooks", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/stores/session-store-hooks")>();
+  return {
+    ...actual,
+    useWorkspaceFields: (...args: Parameters<typeof actual.useWorkspaceFields>) =>
+      actual.useWorkspaceFields(...args) ?? {
+        id: "workspace-1",
+        workspaceDirectory: "/tmp/project",
+      },
+  };
+});
 vi.mock("@/subagents/parent", () => ({ ParentAgentPill: () => null }));
 vi.mock("lucide-react-native", async (importOriginal) => ({
   ...(await importOriginal<typeof import("lucide-react-native")>()),
@@ -88,8 +95,8 @@ const baseComposerState = {
   availableModels: [],
 };
 
-function mockWorkspaceDraftInput() {
-  vi.mocked(useAgentInputDraft).mockReturnValue({
+function mockWorkspaceDraftInput(): AgentInputDraft {
+  const inputDraft: AgentInputDraft = {
     isHydrated: true,
     textSource: {
       getSnapshot: () => "Continue here",
@@ -113,7 +120,9 @@ function mockWorkspaceDraftInput() {
       agentControls: {},
       persistFormPreferences: async () => {},
     } as unknown as NonNullable<AgentInputDraft["composerState"]>,
-  });
+  };
+  vi.mocked(useAgentInputDraft).mockReturnValue(inputDraft);
+  return inputDraft;
 }
 
 function validate(overrides = {}) {
@@ -423,6 +432,171 @@ describe("workspace draft empty text readiness", () => {
         attachments: [],
       }),
     ).toBe(false);
+  });
+});
+
+describe("workspace draft main session", () => {
+  test("preserves a checked draft when availability changes or the host rejects the request", async () => {
+    const serverId = "main-draft-host";
+    const draftId = "main-draft";
+    const workspaceId = "workspace-1";
+    const created = { id: "created-main", workspaceId } as AgentSnapshotPayload;
+    const createAgent = vi.fn<DaemonClient["createAgent"]>();
+    const daemon = { createAgent } as unknown as DaemonClient;
+    const onCreated = vi.fn();
+    const store = useSessionStore.getState();
+    const setCapability = (supported: boolean) =>
+      store.updateSessionServerInfo(serverId, {
+        serverId,
+        hostname: null,
+        version: null,
+        features: { agentCreateAsMain: supported },
+      });
+    const setOccupancy = (value?: boolean) => {
+      store.mergeWorkspaces(serverId, [
+        normalizeWorkspaceDescriptor({
+          id: workspaceId,
+          projectId: "project",
+          projectDisplayName: "project",
+          projectRootPath: "/tmp/project",
+          workspaceDirectory: "/tmp/project",
+          workspaceKind: "local_checkout",
+          projectKind: "git",
+          status: "done",
+          hasActiveMainAgent: value,
+          activityAt: null,
+          statusEnteredAt: null,
+          name: "project",
+          archivingAt: null,
+          diffStat: null,
+          scripts: [],
+        }),
+      ]);
+    };
+    store.initializeSession(serverId, daemon);
+    setCapability(true);
+    setOccupancy();
+    vi.mocked(useHostRuntimeClient).mockReturnValue(daemon);
+    const inputDraft = mockWorkspaceDraftInput();
+    const storedAttachments = useWorkspaceAttachmentsStore.getState();
+    useWorkspaceAttachmentsStore.setState({ draftHistoryHydrated: true, attachmentsByScope: {} });
+    const mount = () =>
+      render(
+        createElement(WorkspaceDraftComposer, {
+          serverId,
+          workspaceId,
+          draftId,
+          tabId: "main-tab",
+          onCreated,
+          isPaneFocused: false,
+          editingSession: new ComposerEditingSession(),
+        }),
+      );
+    let view = mount();
+    const props = () => vi.mocked(Composer).mock.lastCall![0];
+    const submit = (text: string) =>
+      props().onSubmitMessage!({ text, cwd: "/tmp/project", attachments: [] });
+    try {
+      await waitFor(() =>
+        expect(props().agentControls?.workspaceMain).toMatchObject({
+          checked: false,
+          disabled: true,
+          hint: en.agentControls.workspaceMain.unknown,
+        }),
+      );
+      act(() => setOccupancy(true));
+      expect(props().agentControls?.workspaceMain).toMatchObject({
+        checked: false,
+        disabled: true,
+        hint: en.agentControls.workspaceMain.occupied,
+      });
+      act(() => setOccupancy(false));
+      act(() => props().agentControls?.workspaceMain?.onChange(true));
+      expect(props().allowEmptySubmit).toBe(true);
+      expect(props().submitBehavior).toBe("preserve-and-lock");
+
+      act(() => setOccupancy(true));
+      await act(async () => {
+        await expect(submit("Keep my draft")).rejects.toThrow(
+          en.agentControls.workspaceMain.occupied,
+        );
+      });
+      act(() => {
+        setOccupancy(false);
+        setCapability(false);
+      });
+      await act(async () => {
+        await expect(submit("Keep my draft")).rejects.toThrow(
+          en.agentControls.workspaceMain.unsupported,
+        );
+      });
+      expect(createAgent).not.toHaveBeenCalled();
+
+      act(() => setCapability(true));
+      createAgent.mockRejectedValueOnce(
+        Object.assign(new Error("server rejected"), {
+          code: "workspace_main_exists",
+        }),
+      );
+      await act(async () => {
+        await expect(submit("Keep my draft")).rejects.toThrow(
+          en.agentControls.workspaceMain.occupied,
+        );
+      });
+      expect(props().agentControls?.workspaceMain?.checked).toBe(true);
+      expect(inputDraft.clear).not.toHaveBeenCalled();
+      expect(onCreated).not.toHaveBeenCalled();
+      expect(createAgent.mock.calls[0]?.[0]).toMatchObject({
+        workspaceRole: "main",
+        initialPrompt: "Keep my draft",
+      });
+
+      createAgent.mockRejectedValueOnce(
+        Object.assign(new Error("capability lost"), {
+          code: "AGENT_CREATE_AS_MAIN_UNSUPPORTED",
+        }),
+      );
+      await act(async () => {
+        await expect(submit("Keep my draft")).rejects.toThrow(
+          en.agentControls.workspaceMain.unsupported,
+        );
+      });
+      expect(props().agentControls?.workspaceMain?.checked).toBe(true);
+      expect(inputDraft.clear).not.toHaveBeenCalled();
+
+      const response = Promise.withResolvers<AgentSnapshotPayload>();
+      createAgent.mockReturnValueOnce(response.promise);
+      let submission: Promise<void> | undefined;
+      await act(async () => {
+        submission = submit("");
+      });
+      expect(useCreateFlowStore.getState().pendingByDraftId[draftId]).toMatchObject({
+        workspaceRole: "main",
+      });
+      view.unmount();
+      view = mount();
+      expect(vi.mocked(useDraftAgentCreateFlow).mock.lastCall?.[0].initialAttempt).toMatchObject({
+        workspaceRole: "main",
+      });
+      await act(async () => {
+        response.resolve(created);
+        await submission;
+      });
+      expect(createAgent).toHaveBeenCalledTimes(3);
+      expect(createAgent.mock.calls[2]?.[0]).toMatchObject({ workspaceRole: "main", workspaceId });
+      expect(createAgent.mock.calls[2]?.[0]).not.toHaveProperty("initialPrompt");
+      expect(createAgent.mock.calls[2]?.[0]).not.toHaveProperty("callerAgentId");
+      expect(onCreated).toHaveBeenCalledExactlyOnceWith(created);
+      expect(store.sessions[serverId]?.agentStreamTail.get(created.id)).toBeUndefined();
+      expect(inputDraft.clear).toHaveBeenCalledWith("sent");
+    } finally {
+      view.unmount();
+      store.clearSession(serverId);
+      useCreateFlowStore.getState().clear({ draftId });
+      useWorkspaceAttachmentsStore.setState(storedAttachments);
+      vi.mocked(useHostRuntimeClient).mockReset();
+      vi.mocked(useAgentInputDraft).mockReset();
+    }
   });
 });
 

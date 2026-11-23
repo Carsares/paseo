@@ -228,13 +228,20 @@ describe("useDraftAgentCreateFlow", () => {
       attachments: [attachment],
       cwd: "/repo",
     });
+    const wireAttachment = {
+      ...attachment.attachment,
+      forkContext: {
+        sourceAgentId: attachment.source.agentId,
+        sourceServerId: attachment.source.serverId,
+      },
+    };
     expect(createRequest).toHaveBeenCalledWith({
       attempt: expect.objectContaining({
         text: "",
-        attachments: [attachment.attachment],
+        attachments: [wireAttachment],
       }),
       text: "",
-      attachments: [attachment.attachment],
+      attachments: [wireAttachment],
       cwd: "/repo",
     });
     expect(onCreateSuccess).toHaveBeenCalledTimes(1);
