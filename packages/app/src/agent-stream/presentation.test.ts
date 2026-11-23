@@ -16,6 +16,8 @@ import { describe, expect, it } from "vitest";
 import { buildAgentStreamRenderModel } from "./model";
 import { createStreamPresentation } from "./presentation";
 import { createReadingAnchor } from "./reading-anchor";
+import { getAgentSourceGroup } from "./agent-interactions";
+import type { AgentMessage } from "@getpaseo/protocol/agent-message";
 
 const runtime = {
   paseo: {},
@@ -831,6 +833,166 @@ it("presents received agent messages as attributed bubbles with the original tur
     text: "Ready",
     sender: { id: "sender", title: "Reviewer" },
   });
+});
+
+it("reprojects retained source rows when interaction visibility changes", () => {
+  const call = toolCall("received-finished", "agent_message");
+  if (call.payload.source !== "agent") throw new Error("Expected agent tool");
+  call.payload.data.agentMessage = {
+    event: "finished",
+    sender: { id: "sender", title: "Reviewer" },
+    text: "Done",
+  };
+  const present = createStreamPresentation();
+  const input = {
+    ...presentationOptions,
+    display: "full" as const,
+    transform: undefined,
+    tail: [call],
+    head: [],
+  };
+
+  const hidden = present({ ...input, showAgentInteractions: false });
+  expect(hidden.tail).toMatchObject([{ kind: "user_message", id: call.id, text: "Done" }]);
+
+  const shown = present({ ...input, showAgentInteractions: true });
+  expect(shown.tail).toEqual([call]);
+});
+
+function sourceReport(id: string, turnId: string | undefined, message: AgentMessage) {
+  const call = toolCall(id, "agent_message");
+  if (call.payload.source !== "agent") throw new Error("Expected agent tool");
+  call.turnId = turnId;
+  call.payload.data.agentMessage = message;
+  return call;
+}
+
+const reviewReport: AgentMessage = {
+  event: "message",
+  reportStatus: "completed",
+  sender: { id: "reviewer" },
+  text: "The review passed.",
+};
+
+it("keeps all source links across the live boundary, then folds exactly the settled source run", () => {
+  const first = sourceReport("review", "reports", reviewReport);
+  const second = sourceReport("tests", "reports", {
+    event: "finished",
+    sender: { id: "tester", serverId: "remote" },
+    text: "Deep match in the second report",
+  });
+  const timestamp = new Date(0);
+  const reply = {
+    kind: "assistant_message" as const,
+    id: "reply",
+    timestamp,
+    turnId: "reports",
+    text: "Aggregated report",
+  };
+  const human = {
+    kind: "user_message" as const,
+    id: "human",
+    timestamp,
+    turnId: "human",
+    text: "Next prompt",
+  };
+  const present = createStreamPresentation();
+  const input = { ...presentationOptions, display: "collapseTurns" as const, transform: undefined };
+  const live = present({ ...input, tail: [first], head: [second, reply], activeTurnId: "reports" });
+  expect(rows(live).map((row) => row.id)).toEqual([first.id, second.id, reply.id]);
+  expect(getAgentSourceGroup(live.tail[0]!)?.sources.map((source) => source.status)).toEqual([
+    "completed",
+    "finished",
+  ]);
+
+  const settled = { ...input, isTurnActive: false, tail: [first, second, reply, human], head: [] };
+  const folded = present(settled);
+  const summary = folded.tail[0]!;
+  expect(folded.tail.map((row) => row.id)).toEqual([`turn-summary:${first.id}`, human.id]);
+  expect(getAgentSourceGroup(summary)?.sources.map((source) => source.sender.id)).toEqual([
+    "reviewer",
+    "tester",
+  ]);
+  expect(folded.readingRowReplacements.get(second.id)).toBe(summary.id);
+  expect(folded.turns.hostIdByFoldedMessageId.get(second.id)).toBe(first.id);
+  expect(folded.turns.hostIdByFoldedMessageId.get(reply.id)).toBe(first.id);
+
+  const opened = present({ ...settled, expandedTurnHostIds: new Set([first.id]) });
+  expect(opened.tail.map((row) => row.id)).toEqual([
+    summary.id,
+    first.id,
+    second.id,
+    reply.id,
+    human.id,
+  ]);
+  expect(opened.turns.summaryRowsByHostId.get(first.id)?.expanded).toBe(true);
+  expect(present(settled).readingRowReplacements.get(second.id)).toBe(summary.id);
+
+  const interactions = present({ ...settled, showAgentInteractions: true });
+  expect(interactions.tail.find((row) => row.id === second.id)).toBe(second);
+  expect(interactions.tail.some((row) => getAgentSourceGroup(row))).toBe(false);
+  expect(present(settled).tail.map((row) => row.id)).toEqual([summary.id, human.id]);
+});
+
+it("preserves human turns, warnings from a repeated sender, and independent legacy sources", () => {
+  const timestamp = new Date(0);
+  const human = {
+    kind: "user_message" as const,
+    id: "human",
+    timestamp,
+    turnId: "human",
+    text: "Keep this prompt",
+  };
+  const humanReply = {
+    kind: "assistant_message" as const,
+    id: "human-reply",
+    timestamp,
+    turnId: "human",
+    text: "Keep this reply",
+  };
+  const inHuman = sourceReport("interrupt", "human", reviewReport);
+  const finished = sourceReport("finished", "background", reviewReport);
+  const warning = sourceReport("blocked", "background", {
+    ...reviewReport,
+    reportStatus: "blocked",
+  });
+  const legacy = sourceReport("legacy", undefined, {
+    ...reviewReport,
+    reportStatus: undefined,
+    text: "Ordinary message",
+  });
+  const secondLegacy = sourceReport("legacy-again", undefined, {
+    ...reviewReport,
+    reportStatus: undefined,
+  });
+  const present = createStreamPresentation();
+  const result = present({
+    ...presentationOptions,
+    display: "collapseTurns",
+    isTurnActive: false,
+    transform: undefined,
+    tail: [human, inHuman, humanReply, finished, warning, legacy, secondLegacy],
+    head: [],
+  });
+  expect(result.tail.map((row) => row.id)).toEqual([
+    human.id,
+    `turn-summary:${inHuman.id}`,
+    humanReply.id,
+    finished.id,
+    warning.id,
+    legacy.id,
+    secondLegacy.id,
+  ]);
+  expect(getAgentSourceGroup(result.tail[3]!)?.sources.map((source) => source.status)).toEqual([
+    "completed",
+    "blocked",
+  ]);
+  expect(getAgentSourceGroup(result.tail[5]!)).toMatchObject({
+    firstItemId: legacy.id,
+    itemCount: 1,
+    sources: [{ status: "message" }],
+  });
+  expect(getAgentSourceGroup(result.tail[6]!)?.firstItemId).toBe(secondLegacy.id);
 });
 
 it("does not reopen the previous turn while a new run waits for its first row", () => {

@@ -21,6 +21,7 @@ interface SearchInput {
   query: string;
   cursor?: number;
   hideAgentInteractions?: boolean;
+  includeAgentSourceBodies?: boolean;
   provider?: string;
 }
 
@@ -49,11 +50,17 @@ function isHiddenInteraction(item: AgentTimelineItem, provider: string | undefin
   return normalized.startsWith("paseo_") && PASEO_INTERACTION_TOOLS.has(normalized.slice(6));
 }
 
-function* hideInteractionRows(entries: TimelineProjectionEntry[], provider: string | undefined) {
+function* hideInteractionRows(
+  entries: TimelineProjectionEntry[],
+  provider: string | undefined,
+  includeAgentSourceBodies: boolean,
+) {
   let previous: TimelineProjectionEntry | undefined;
   for (const entry of entries) {
     const { item } = entry;
-    if (isHiddenInteraction(item, provider)) continue;
+    const isVisibleSource =
+      includeAgentSourceBodies && item.type === "tool_call" && item.agentMessage;
+    if (!isVisibleSource && isHiddenInteraction(item, provider)) continue;
     // A tool update can fold into a row before both fragments, leaving a sequence
     // gap between otherwise adjacent fragments that the client hydrates together.
     if (
@@ -113,11 +120,30 @@ function countMatches(text: string, pattern: RegExp): number {
   return count;
 }
 
+function searchEntry(
+  item: AgentTimelineItem,
+  includeAgentSourceBodies: boolean,
+): { role: SearchLocation["role"]; blocks: string[] } | undefined {
+  if (item.type === "assistant_message") {
+    return { role: "assistant", blocks: searchableBlocks(item.text.replace(/\r/g, "")) };
+  }
+  const text =
+    item.type === "user_message" ? item.text : visibleSourceBody(item, includeAgentSourceBodies);
+  if (text === undefined) return undefined;
+  return { role: "user", blocks: parseUserMessageSegments(text).map((segment) => segment.text) };
+}
+
+function visibleSourceBody(item: AgentTimelineItem, includeAgentSourceBodies: boolean) {
+  if (includeAgentSourceBodies && item.type === "tool_call") return item.agentMessage?.text;
+  return undefined;
+}
+
 export async function searchTimeline({
   rows,
   query,
   cursor = 0,
   hideAgentInteractions,
+  includeAgentSourceBodies = false,
   provider,
 }: SearchInput) {
   const locations: SearchLocation[] = [];
@@ -125,14 +151,14 @@ export async function searchTimeline({
   const pattern = searchPattern(query);
   let lastYield = performance.now();
   const entries = projectTimelineRows({ rows, mode: "projected" });
-  for (const entry of hideAgentInteractions ? hideInteractionRows(entries, provider) : entries) {
+  const visibleEntries = hideAgentInteractions
+    ? hideInteractionRows(entries, provider, includeAgentSourceBodies)
+    : entries;
+  for (const entry of visibleEntries) {
     if (entry.seqEnd <= cursor) continue;
-    const item = entry.item;
-    if (item.type !== "user_message" && item.type !== "assistant_message") continue;
-    const blocks =
-      item.type === "assistant_message"
-        ? searchableBlocks(item.text.replace(/\r/g, ""))
-        : parseUserMessageSegments(item.text).map((segment) => segment.text);
+    const searchable = searchEntry(entry.item, includeAgentSourceBodies);
+    if (!searchable) continue;
+    const { blocks, role } = searchable;
     const count = blocks.reduce((sum, block) => sum + countMatches(block, pattern), 0);
     if (count) {
       if (locations.length === PAGE_SIZE) {
@@ -140,7 +166,7 @@ export async function searchTimeline({
       }
       locations.push({
         seq: entry.seqEnd,
-        role: item.type === "user_message" ? "user" : "assistant",
+        role,
         count,
       });
     }

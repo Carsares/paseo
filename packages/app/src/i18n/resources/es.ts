@@ -266,6 +266,23 @@ export const es: TranslationResources = {
     empty: "Comience a chatear con este agente...",
     scrollToBottom: "Desplazarse hacia abajo",
     historyLoadFailed: "No se pudo cargar el historial del agente",
+    inbox: {
+      pending: "{{count}} informes pendientes",
+      flush: "Resumir ahora",
+      flushing: "Resumiendo…",
+      failed: "No se pudieron resumir los informes. Reintenta.",
+    },
+    source: {
+      status: {
+        message: "Mensaje",
+        finished: "Finalizado",
+        completed: "Completado",
+        blocked: "Bloqueado",
+        error: "Error",
+        permission: "Permiso necesario",
+        closed: "Cerrado",
+      },
+    },
     messageCapped: "Este mensaje fue truncado ({{bytes}} bytes).",
     quote: {
       action: "Citar",

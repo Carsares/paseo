@@ -5,11 +5,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import type { DaemonClient, WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
-import { createAgentMessageDelivery, type AgentMessageDelivery } from "../agent-messages/index.js";
+import {
+  createAgentMessageDelivery,
+  parseAgentMessages,
+  type AgentMessageDelivery,
+} from "../agent-messages/index.js";
 import { buildStoredAgentPayload } from "../agent-projections.js";
 import { registerParentFinishSubscription } from "../create-agent/create.js";
 import { MessageReceipts } from "../../message-receipts/index.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
+import { decodeParentReportIdentity } from "./report-identity.js";
 import {
   createFinishSubscriptions,
   createJsonFinishSubscriptionStore,
@@ -138,6 +143,164 @@ function outcome(status: "idle" | "running" | "closed" | "error" = "closed"): Wa
 async function until(check: () => boolean) {
   await expect.poll(check).toBe(true);
 }
+
+test("a durable explicit report keeps the active approval and suppresses only its turn's automatic finish", async () => {
+  const home = await mkdtemp(join(tmpdir(), "finish-suppression-"));
+  homes.push(home);
+  const store = createJsonFinishSubscriptionStore(home);
+  const persisted = createJsonFinishSubscriptionStore(home, "reports.json");
+  const reports = vi.fn(async () => {});
+  const observation = new Observation();
+  const delivery = new Delivery();
+  const service = createFinishSubscriptions({
+    store,
+    followups: {
+      watches: createJsonFinishSubscriptionStore(home, "watches.json"),
+      reports: persisted,
+      dispatch: reports,
+    },
+    open: observation.open.bind(observation),
+    messages: () => delivery,
+    callerIsActive: async () => true,
+    serverId: "origin",
+    logger: createTestLogger(),
+    retryDelayMs: 1,
+  });
+  services.push(service);
+  await service.start();
+  const automatic = { ...intent, requireParentOwnership: true, automaticParent: true };
+  await service.register(automatic);
+  await until(() => observation.waits.length === 1);
+  const permission = outcome("running");
+  permission.status = "permission";
+  permission.final!.pendingPermissions = [
+    { id: "approval", provider: "codex", name: "Write", kind: "tool", input: {} },
+  ];
+  observation.waits[0]!.result.resolve(permission);
+  await until(() => delivery.prompts.length === 1);
+  expect(delivery.prompts[0]).toContain("approval");
+  const reportId = await service.queueParentReport(intent, {
+    title: "Child",
+    summary: "Waiting for approval",
+    status: "blocked",
+    turnId: "first",
+  });
+  await expect.poll(() => reports.mock.calls.length).toBe(1);
+  expect(await store.list()).toHaveLength(1);
+  delivery.acknowledgments[0]!.resolve("steered");
+  await until(() => observation.waits.length === 2);
+  observation.waits[1]!.result.resolve({
+    ...outcome("idle"),
+    turnId: "first",
+  } as WaitForFinishResult);
+  await expect.poll(() => store.list()).toEqual([]);
+  expect(delivery.prompts).toHaveLength(1);
+  await expect.poll(() => persisted.list()).toEqual([]);
+  expect(reportId).toBeTruthy();
+  await service.register(automatic);
+  await until(() => observation.waits.length === 3);
+  observation.waits[2]!.result.resolve({
+    ...outcome("idle"),
+    turnId: "second",
+  } as WaitForFinishResult);
+  await until(() => delivery.prompts.length === 2);
+  expect(delivery.prompts[1]).toContain("finished");
+  delivery.acknowledgments[1]!.resolve("steered");
+  await expect.poll(() => store.list()).toEqual([]);
+});
+
+test.each(["restart", "reporting migration"] as const)(
+  "multiple held finishes from the same child survive registration until %s",
+  async (action) => {
+    const home = await mkdtemp(join(tmpdir(), "finish-inbox-recovery-"));
+    homes.push(home);
+    async function open() {
+      const observation = new Observation();
+      const store = createJsonFinishSubscriptionStore(home);
+      const dispatched: string[] = [];
+      const delivery = createAgentMessageDelivery({
+        shouldHoldInbox: () => true,
+        classifyInbox: async () => "ordinary",
+        dispatch: async (batch) => {
+          dispatched.push(String(batch.prompt));
+          return "turn_started";
+        },
+        onError: () => {},
+      });
+      const service = createFinishSubscriptions({
+        store,
+        followups: {
+          watches: createJsonFinishSubscriptionStore(home, "watches.json"),
+          reports: createJsonFinishSubscriptionStore(home, "reports.json"),
+          async dispatch(record, report) {
+            await delivery.enqueue({
+              recipientId: record.callerAgentId,
+              messageId: report.id,
+              source: {
+                kind: "agent-notification",
+                agentId: record.childAgentId,
+                event: "finished",
+              },
+              prompt: report.prompt,
+              subagentInbox: "ordinary",
+            }).dispatched;
+          },
+        },
+        open: observation.open.bind(observation),
+        messages: () => delivery,
+        callerIsActive: async () => true,
+        serverId: "origin",
+        logger: createTestLogger(),
+        retryDelayMs: 1,
+      });
+      services.push(service);
+      await service.start();
+      return { observation, store, dispatched, delivery, service };
+    }
+    const first = await open();
+    const automatic = { ...intent, requireParentOwnership: true, automaticParent: true };
+    await first.service.register(automatic);
+    await until(() => first.observation.waits.length === 1);
+    first.observation.waits[0]!.result.resolve({
+      ...outcome("idle"),
+      turnId: "first",
+      lastMessage: "First turn result",
+    });
+    await expect.poll(() => first.delivery.getInbox?.("parent")?.count).toBe(1);
+    await first.service.register(automatic);
+    await until(() => first.observation.waits.length === 2);
+    first.observation.waits[1]!.result.resolve({
+      ...outcome("idle"),
+      turnId: "second",
+      lastMessage: "Second turn result",
+    });
+    await expect.poll(() => first.delivery.getInbox?.("parent")?.count).toBe(2);
+    const captured = async () => (await first.store.list()).map((record) => record.reportTurnId);
+    expect(await captured()).toEqual(["first", "second"]);
+    if (action === "reporting migration") {
+      await first.service.cancelAutomaticParent(intent.childAgentId, intent.callerAgentId);
+      expect(first.delivery.getInbox?.("parent")).toBeUndefined();
+      expect(await captured()).toEqual([]);
+      await first.delivery.close();
+      expect(first.dispatched).toEqual([]);
+      return;
+    }
+    await first.service.close();
+    await first.delivery.close();
+    const recovered = await open();
+    await expect.poll(() => recovered.delivery.getInbox?.("parent")?.count).toBe(2);
+    expect(recovered.observation.waits).toEqual([]);
+    recovered.delivery.flushInbox?.("parent");
+    await recovered.delivery.close();
+    await expect.poll(() => recovered.store.list()).toEqual([]);
+    expect(recovered.dispatched).toHaveLength(1);
+    const reports = parseAgentMessages(recovered.dispatched[0]!)?.map(({ text }) => text);
+    expect(reports).toEqual([
+      expect.stringContaining("First turn result"),
+      expect.stringContaining("Second turn result"),
+    ]);
+  },
+);
 
 test("restores a remote parent subscription and delivers to the owning host", async () => {
   const first = await scenario();
@@ -1086,4 +1249,58 @@ test("explicit reports survive a restart and an unacknowledged pull without reac
     ownsBinding: true,
     reports: [],
   });
+});
+
+test("push and pull confirm the same report while its push is still pending", async () => {
+  const home = await mkdtemp(join(tmpdir(), "parent-report-identity-"));
+  homes.push(home);
+  const pushed = deferred<string>();
+  const pair = { ...intent, callerServerId: "parent-host" };
+  const address = { ...pair, sourceId: "parent-source" };
+  const client = {
+    async pushAgentFinishReport(_child: string, _parent: string, report: { id: string }) {
+      pushed.resolve(report.id);
+      return await new Promise<never>(() => {});
+    },
+  } as DaemonClient;
+  const service = createFinishSubscriptions({
+    store: createJsonFinishSubscriptionStore(home),
+    followups: {
+      watches: createJsonFinishSubscriptionStore(home, "watches.json"),
+      reports: createJsonFinishSubscriptionStore(home, "reports.json"),
+      dispatch: async () => {},
+    },
+    hosts: () => ({
+      directory: async () => {
+        throw new Error("Unexpected host listing");
+      },
+      use: async (_id, action) => action(client),
+    }),
+    serverId: "child-host",
+    callerIsActive: async () => true,
+    messages: () => new Delivery(),
+    open: new Observation().open,
+    logger: createTestLogger(),
+  });
+  services.push(service);
+  await service.start();
+  const id = await service.queueParentReport(pair, {
+    status: "completed",
+    title: "Child",
+    summary: "Ready",
+    turnId: "turn-1",
+  });
+  const pushedId = await pushed.promise;
+  expect(decodeParentReportIdentity(pushedId)).toEqual({ id, turnId: "turn-1", finishedIds: [] });
+  const pulled = await service.pullReports(address, [], true, "active", true);
+  expect(pulled.reports).toMatchObject([{ id: pushedId }]);
+  expect(await service.confirmParentReport(pair, pushedId)).toBe(true);
+  expect(await service.confirmParentReport({ ...pair, childAgentId: "other" }, pushedId)).toBe(
+    false,
+  );
+  expect(await service.pullReports(address, [pushedId], true, "archived", true)).toEqual({
+    ownsBinding: false,
+    reports: [],
+  });
+  expect(await service.confirmParentReport(pair, pushedId)).toBe(false);
 });

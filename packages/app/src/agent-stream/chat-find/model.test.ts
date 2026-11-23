@@ -23,6 +23,60 @@ function message(seq: number, text = "target"): StreamItem {
   };
 }
 
+it("finds all loaded source bodies by their exact cursor, even when an older host omits them", async () => {
+  const reports = hydrateStreamState(
+    ["one", "two"].map((name, index) => ({
+      event: {
+        type: "timeline" as const,
+        provider: "codex" as const,
+        item: {
+          type: "tool_call" as const,
+          callId: name,
+          name: "agent_message",
+          status: "completed" as const,
+          error: null,
+          detail: { type: "unknown" as const, input: null, output: null },
+          agentMessage: {
+            event: "message" as const,
+            sender: { id: name },
+            reportStatus: "completed" as const,
+            text: `Report ${name}. Deep [needle](https://example.com).`,
+          },
+        },
+      },
+      timestamp: new Date(0),
+      timelineCursor: { epoch: "epoch", seq: index + 7 },
+    })),
+    { source: "canonical" },
+  );
+  const revealed: string[] = [];
+  const model = new ChatFindModel({
+    async search() {
+      // Mixed-version result: the first report is already indexed, the second is missing.
+      return { ...response([{ seq: 7, role: "user" }]), agentInteractionsHidden: true };
+    },
+    async load() {
+      throw new Error("These reports are already loaded");
+    },
+    async reveal(id) {
+      revealed.push(id);
+      return { count: 1, occurrence: 0 };
+    },
+    clear() {},
+  });
+  try {
+    model.updateHistory("epoch", reports, true);
+    model.open();
+    model.setQuery("needle");
+    await expect.poll(() => model.getSnapshot().phase).toBe("ready");
+    expect(model.getSnapshot().count).toBe(2);
+    model.next();
+    await expect.poll(() => revealed).toEqual(reports.map((row) => row.id));
+  } finally {
+    model.close();
+  }
+});
+
 it("loads an older location and searches a response merged across suppressed tasks once", async () => {
   const source = [
     { type: "assistant_message" as const, text: "first **target** " },

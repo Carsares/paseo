@@ -31,6 +31,187 @@ function createClock() {
   };
 }
 
+function inboxScenario() {
+  const clock = createClock();
+  const workers = new Set(["first", "second"]);
+  const changes = vi.fn();
+  const dispatch = vi.fn<Parameters<typeof createAgentMessageDelivery>[0]["dispatch"]>(
+    async (batch) => {
+      if (!batch.admit()) throw new Error("Withdrawn");
+      await batch.handoff?.begin();
+      await batch.handoff?.onProviderOutcome?.("accepted");
+      return "turn_started";
+    },
+  );
+  let parentRunning = false;
+  let notify: (agentId: string, releaseInbox?: boolean) => void = () => {};
+  const delivery = createAgentMessageDelivery({
+    schedule: clock.schedule,
+    shouldHoldInbox: (_, source) => [...workers].some((worker) => worker !== source?.agentId),
+    onInboxChange: changes,
+    isRunning: () => parentRunning,
+    subscribe: (listener) => {
+      notify = listener;
+      return () => {};
+    },
+    dispatch,
+    onError: () => {},
+  });
+  return {
+    clock,
+    workers,
+    changes,
+    delivery,
+    dispatch,
+    notify: (agentId: string, releaseInbox?: boolean) => notify(agentId, releaseInbox),
+    setParentRunning: (running: boolean) => {
+      parentRunning = running;
+    },
+    report(agentId: string, options: Partial<Parameters<typeof delivery.enqueue>[0]> = {}) {
+      return delivery.enqueue({
+        recipientId: "main",
+        messageId: agentId,
+        source: { kind: "agent-message", agentId, reportStatus: "completed" },
+        subagentInbox: "ordinary",
+        prompt: agentId,
+        ...options,
+      });
+    },
+  };
+}
+
+test("each report projects its own status, with legacy reports left unannotated", () => {
+  const message = (id: string, reportStatus?: "completed" | "blocked") =>
+    formatAgentMessage({
+      id,
+      source: { kind: "agent-message", agentId: id, reportStatus },
+      text: "<result>",
+    });
+  const timeline = projectAgentMessages({
+    type: "user_message",
+    text: [message("done", "completed"), message("help", "blocked"), message("legacy")].join("\n"),
+  });
+  expect(timeline).toHaveLength(3);
+  expect(timeline[0]).toMatchObject({
+    agentMessage: { reportStatus: "completed", text: "<result>" },
+  });
+  expect(timeline[1]).toMatchObject({ agentMessage: { reportStatus: "blocked" } });
+  expect(timeline[2]).not.toHaveProperty("agentMessage.reportStatus");
+  expect(message("legacy")).not.toContain("report-status");
+});
+
+test("only another running child holds a report and terminal state releases the ordered batch", async () => {
+  const scenario = inboxScenario();
+  const first = scenario.report("first");
+  expect(scenario.delivery.getInbox?.("main")).toMatchObject({
+    count: 1,
+    items: [{ agentId: "first", reportStatus: "completed" }],
+  });
+  scenario.clock.advance(20_000);
+  expect(scenario.dispatch).not.toHaveBeenCalled();
+  scenario.workers.delete("first");
+  scenario.report("second");
+  expect(scenario.delivery.getInbox?.("main")).toBeUndefined();
+  scenario.clock.advance(2000);
+  await first.dispatched;
+  expect(scenario.dispatch).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ messageIds: ["first", "second"] }),
+  );
+  expect(scenario.changes.mock.calls).toEqual([["main"], ["main"]]);
+  await scenario.delivery.close();
+});
+
+test.each(["blocked", "permission-required", "errored", "manual", "child exited", "role disabled"])(
+  "%s releases held reports and waits for the user's turn",
+  async (reason) => {
+    const scenario = inboxScenario();
+    scenario.setParentRunning(true);
+    const normal = scenario.report("first");
+    if (reason === "manual") {
+      scenario.delivery.flushInbox?.("main");
+      scenario.delivery.flushInbox?.("main");
+    } else if (reason === "child exited") {
+      scenario.workers.delete("second");
+      scenario.notify("second");
+    } else if (reason === "role disabled") {
+      scenario.notify("main", true);
+    } else {
+      scenario.report("urgent", {
+        subagentInbox: "urgent",
+        source:
+          reason === "blocked"
+            ? { kind: "agent-message", agentId: "second", reportStatus: "blocked" }
+            : { kind: "agent-notification", agentId: "second", event: reason },
+      });
+    }
+    expect(scenario.delivery.getInbox?.("main")).toBeUndefined();
+    scenario.clock.advance(2000);
+    expect(scenario.dispatch).not.toHaveBeenCalled();
+    scenario.setParentRunning(false);
+    scenario.notify("main");
+    await normal.dispatched;
+    const expected = ["blocked", "permission-required", "errored"].includes(reason)
+      ? ["first", "urgent"]
+      : ["first"];
+    expect(scenario.dispatch).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ messageIds: expected }),
+    );
+    await scenario.delivery.close();
+  },
+);
+
+test("a failed confirmation retries the other envelope with its own receipt", async () => {
+  const scenario = inboxScenario();
+  const good = {
+    begin: vi.fn(async () => {}),
+    declined: vi.fn(async () => {}),
+    onProviderOutcome: vi.fn(async () => {}),
+  };
+  const revoked = new Error("Parent relationship changed");
+  const bad = {
+    begin: vi.fn(async () => {
+      throw revoked;
+    }),
+    declined: vi.fn(async () => {}),
+    onProviderOutcome: vi.fn(async () => {}),
+  };
+  const first = scenario.report("first", { handoff: good });
+  const second = scenario.report("second", { handoff: bad });
+  scenario.delivery.flushInbox?.("main");
+  scenario.clock.advance(2000);
+  await expect(second.dispatched).rejects.toThrow(revoked);
+  scenario.clock.advance(2000);
+  await first.dispatched;
+  expect(good.begin).toHaveBeenCalledTimes(2);
+  expect(good.declined).toHaveBeenCalledOnce();
+  expect(good.onProviderOutcome).toHaveBeenCalledOnce();
+  expect(bad.onProviderOutcome).not.toHaveBeenCalled();
+  await scenario.delivery.close();
+});
+
+test("an unrelated queued message does not split a released inbox", async () => {
+  const scenario = inboxScenario();
+  const first = scenario.report("first");
+  const unrelated = scenario.delivery.enqueue({
+    recipientId: "main",
+    messageId: "unrelated",
+    source: { kind: "agent-message", agentId: "other" },
+    prompt: "Unrelated message",
+  });
+  const urgent = scenario.report("urgent", {
+    subagentInbox: "urgent",
+    source: { kind: "agent-notification", agentId: "second", event: "permission-required" },
+  });
+
+  // Both groups finish when delivery drains, with the digest dispatched as one turn.
+  await scenario.delivery.close();
+  await Promise.all([first.dispatched, unrelated.dispatched, urgent.dispatched]);
+  expect(scenario.dispatch.mock.calls.map(([batch]) => batch.messageIds)).toEqual([
+    ["unrelated"],
+    ["first", "urgent"],
+  ]);
+});
+
 test("a queued child report and completion reach the recipient in one steer after two quiet seconds", async () => {
   const clock = createClock();
   const sent: Array<{ recipientId: string; prompt: AgentPromptInput }> = [];

@@ -371,6 +371,97 @@ test("agent handles send permission responses for their agent", async () => {
   await client.close();
 });
 
+test("concurrent inbox flushes require both the request ID and agent ID to match", async () => {
+  const { client, ws } = await connectClient({ subagentInbox: true });
+  try {
+    const agent = client.agents.ref("parent");
+    const first = agent.flushInbox();
+    const firstRequest = parseSentSessionMessage(ws.sent.at(-1));
+    expect(firstRequest).toEqual({
+      type: "agent.inbox.flush.request",
+      agentId: "parent",
+      requestId: expect.any(String),
+    });
+
+    const second = agent.flushInbox();
+    const secondRequest = parseSentSessionMessage(ws.sent.at(-1));
+    expect(secondRequest).toEqual({
+      type: "agent.inbox.flush.request",
+      agentId: "parent",
+      requestId: expect.any(String),
+    });
+    expect(firstRequest.requestId).not.toBe(secondRequest.requestId);
+
+    ws.message(
+      sessionMessage({
+        type: "agent.inbox.flush.response",
+        payload: {
+          agentId: "other-agent",
+          requestId: secondRequest.requestId,
+          success: true,
+          error: null,
+        },
+      }),
+    );
+    ws.message(
+      sessionMessage({
+        type: "agent.inbox.flush.response",
+        payload: {
+          agentId: "parent",
+          requestId: secondRequest.requestId,
+          success: false,
+          error: "Agent is busy",
+        },
+      }),
+    );
+    ws.message(
+      sessionMessage({
+        type: "agent.inbox.flush.response",
+        payload: {
+          agentId: "parent",
+          requestId: firstRequest.requestId,
+          success: true,
+          error: null,
+        },
+      }),
+    );
+    await Promise.all([
+      expect(first).resolves.toBeUndefined(),
+      expect(second).rejects.toThrow("Agent is busy"),
+    ]);
+  } finally {
+    await client.close();
+  }
+});
+
+test("agent inbox flush rejects a failure without an error string", async () => {
+  const { client, ws } = await connectClient({ subagentInbox: true });
+  try {
+    const pending = client.agents.ref("parent").flushInbox();
+    const { requestId } = parseSentSessionMessage(ws.sent.at(-1));
+    ws.message(
+      sessionMessage({
+        type: "agent.inbox.flush.response",
+        payload: { agentId: "parent", requestId, success: false, error: null },
+      }),
+    );
+    await expect(pending).rejects.toThrow("Failed to flush the agent inbox");
+  } finally {
+    await client.close();
+  }
+});
+
+test("agent inbox flush asks for a host update without sending to an older daemon", async () => {
+  const { client, ws } = await connectClient();
+  try {
+    const sentBefore = ws.sent.length;
+    await expect(client.agents.ref("parent").flushInbox()).rejects.toThrow("Update the Paseo host");
+    expect(ws.sent).toHaveLength(sentBefore);
+  } finally {
+    await client.close();
+  }
+});
+
 test("project actions list registered projects through the existing RPC", async () => {
   const { client, ws } = await connectClient();
 

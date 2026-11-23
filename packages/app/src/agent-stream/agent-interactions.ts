@@ -3,6 +3,7 @@ import {
   normalizeToolName,
 } from "@getpaseo/protocol/tool-name-normalization";
 import type { StreamItem } from "@/types/stream";
+import type { AgentMessage } from "@getpaseo/protocol/agent-message";
 
 // Agent lifecycle and messaging tools in the Paseo catalog. Permission tools stay visible.
 // Keep the persisted tool classification in the server's agent/chat-search/index.ts in sync.
@@ -39,6 +40,187 @@ export function isAgentInteraction(item: StreamItem): boolean {
   const nativeClaudeDispatch =
     data.provider === "claude" && (data.name === "Task" || data.name === "Agent");
   return nativeClaudeDispatch || isPaseoInteractionTool(data.name);
+}
+
+export type AgentSourceStatus =
+  | "message"
+  | "finished"
+  | "completed"
+  | "blocked"
+  | "error"
+  | "permission-required"
+  | "closed";
+
+export interface AgentSourceInfo {
+  event: AgentMessage["event"];
+  sender: AgentMessage["sender"];
+  text: string;
+  reportStatus?: AgentMessage["reportStatus"];
+  status: AgentSourceStatus;
+}
+
+export interface AgentSourceGroup {
+  firstItemId: string;
+  itemCount: number;
+  sources: readonly AgentSourceInfo[];
+  requiresExpansion: boolean;
+}
+
+export interface AgentSourcePresentation {
+  group: AgentSourceGroup;
+  isGroupStart: boolean;
+}
+
+// History row revisions clone items to refresh their render identity. Keep
+// presentation metadata on the row so those copies retain their source.
+const sourcePresentationKey = Symbol("sourcePresentation");
+const sourceGroupKey = Symbol("sourceGroup");
+type SourceRow = StreamItem & {
+  [sourcePresentationKey]?: AgentSourcePresentation;
+  [sourceGroupKey]?: AgentSourceGroup;
+};
+
+export function getAgentMessage(item: StreamItem): AgentMessage | undefined {
+  if (item.kind !== "tool_call" || item.payload.source !== "agent") return undefined;
+  return item.payload.data.agentMessage;
+}
+
+export function resolveAgentSourceStatus(message: AgentMessage): AgentSourceStatus {
+  if (message.event === "errored") return "error";
+  if (message.event === "permission-required") return "permission-required";
+  if (message.reportStatus === "blocked") return "blocked";
+  if (message.reportStatus === "completed") return "completed";
+  switch (message.event) {
+    case "message":
+      return "message";
+    case "finished":
+      return "finished";
+    case "closed":
+      return "closed";
+  }
+}
+
+export function requiresAgentSourceExpansion(status: AgentSourceStatus): boolean {
+  return (
+    status === "message" ||
+    status === "blocked" ||
+    status === "error" ||
+    status === "permission-required"
+  );
+}
+
+function sourceInfo(message: AgentMessage): AgentSourceInfo {
+  return {
+    event: message.event,
+    sender: message.sender,
+    text: message.text,
+    ...(message.reportStatus ? { reportStatus: message.reportStatus } : {}),
+    status: resolveAgentSourceStatus(message),
+  };
+}
+
+export function agentSourceKey(source: AgentSourceInfo, fallbackServerId?: string): string {
+  return JSON.stringify([
+    source.sender.serverId ?? fallbackServerId,
+    source.sender.id,
+    source.status,
+  ]);
+}
+
+function sameSourceTurn(previous: StreamItem | undefined, current: StreamItem): boolean {
+  return previous?.turnId !== undefined && previous.turnId === current.turnId;
+}
+
+function makeSourceGroup(
+  firstItemId: string,
+  itemCount: number,
+  sources: readonly AgentSourceInfo[],
+): AgentSourceGroup {
+  return {
+    firstItemId,
+    itemCount,
+    sources: [...new Map(sources.map((source) => [agentSourceKey(source), source])).values()],
+    requiresExpansion: sources.some((source) => requiresAgentSourceExpansion(source.status)),
+  };
+}
+
+/** Builds source chips from adjacent source events without crossing a visible timeline row. */
+function buildAgentSourceGroups(
+  items: readonly StreamItem[],
+): ReadonlyMap<string, AgentSourceGroup> {
+  const groups = new Map<string, AgentSourceGroup>();
+  let run: StreamItem[] = [];
+  let infos: AgentSourceInfo[] = [];
+  function finishRun() {
+    const first = run[0];
+    if (!first) return;
+    const group = makeSourceGroup(first.id, run.length, infos);
+    for (const item of run) groups.set(item.id, group);
+    run = [];
+    infos = [];
+  }
+
+  for (const item of items) {
+    const message = getAgentMessage(item);
+    if (!message || !sameSourceTurn(run.at(-1), item)) finishRun();
+    if (!message) continue;
+    run.push(item);
+    infos.push(sourceInfo(message));
+  }
+  finishRun();
+  return groups;
+}
+
+export function createAgentSourceGrouping() {
+  let historySource: StreamItem[] | undefined;
+  let history = buildAgentSourceGroups([]);
+  let boundaryItems: StreamItem[] = [];
+  let boundary = new Map<string, AgentSourceGroup>();
+
+  return (tail: StreamItem[], head: StreamItem[]) => {
+    if (historySource !== tail) {
+      history = buildAgentSourceGroups(tail);
+      historySource = tail;
+      boundaryItems = [];
+      boundary = new Map();
+    }
+    const live = buildAgentSourceGroups(head);
+    const last = tail.at(-1);
+    const first = head[0];
+    const trailing = last && history.get(last.id);
+    const leading = first && live.get(first.id);
+    const joined =
+      first && trailing && leading && sameSourceTurn(last, first)
+        ? [...tail.slice(-trailing.itemCount), ...head.slice(0, leading.itemCount)]
+        : [];
+    if (
+      joined.length !== boundaryItems.length ||
+      joined.some((item, index) => item !== boundaryItems[index])
+    ) {
+      boundary = new Map(buildAgentSourceGroups(joined));
+      boundaryItems = joined;
+    }
+    return { history, live, boundary };
+  };
+}
+
+export function setAgentSourcePresentation(
+  item: StreamItem,
+  presentation: AgentSourcePresentation,
+): void {
+  (item as SourceRow)[sourcePresentationKey] = presentation;
+}
+
+export function getAgentSourcePresentation(item: StreamItem): AgentSourcePresentation | undefined {
+  return (item as SourceRow)[sourcePresentationKey];
+}
+
+export function getAgentSourceGroup(item: StreamItem): AgentSourceGroup | undefined {
+  return (item as SourceRow)[sourceGroupKey] ?? getAgentSourcePresentation(item)?.group;
+}
+
+export function setAgentSourceGroup(item: StreamItem, group: AgentSourceGroup): void {
+  (item as SourceRow)[sourceGroupKey] = group;
 }
 
 interface ProjectionInput {
@@ -112,7 +294,8 @@ function projectSegment({ source, preceding, trailingGap = false }: SegmentInput
   let gap = trailingGap;
   for (const item of source) {
     const previous = rows.at(-1);
-    if (isAgentInteraction(item)) {
+    const sourceMessage = getAgentMessage(item);
+    if (isAgentInteraction(item) && !sourceMessage) {
       hidden.add(item.id);
       if (previous) replacements.set(item.id, previous.id);
       else leadingHidden.push(item.id);

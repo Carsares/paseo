@@ -35,6 +35,17 @@ function outboundMessage(type: SessionOutboundMessage["type"]): SessionOutboundM
 }
 
 describe("SessionAuthorization", () => {
+  test("flushing a Main Control inbox requires workspace write", () => {
+    const request = inboundMessage("agent.inbox.flush.request");
+    const response = outboundMessage("agent.inbox.flush.response");
+    const readOnly = new SessionAuthorization(["workspace.read"]);
+    const writer = new SessionAuthorization(["workspace.write"]);
+    expect(readOnly.allowsInbound(request)).toBe(false);
+    expect(readOnly.allowsOutbound(response)).toBe(false);
+    expect(writer.allowsInbound(request)).toBe(true);
+    expect(writer.allowsOutbound(response)).toBe(true);
+  });
+
   test("owner authority covers every session operation", () => {
     const authorization = new SessionAuthorization(OWNER_PERMISSIONS);
 

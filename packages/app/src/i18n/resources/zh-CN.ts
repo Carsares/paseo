@@ -264,6 +264,23 @@ export const zhCN: TranslationResources = {
     empty: "开始和这个 Agent 对话...",
     scrollToBottom: "滚动到底部",
     historyLoadFailed: "无法加载智能体历史记录",
+    inbox: {
+      pending: "{{count}} 条待汇总报告",
+      flush: "立即汇总",
+      flushing: "正在汇总…",
+      failed: "报告汇总失败，请重试。",
+    },
+    source: {
+      status: {
+        message: "消息",
+        finished: "已结束",
+        completed: "已完成",
+        blocked: "已阻塞",
+        error: "错误",
+        permission: "需要权限",
+        closed: "已关闭",
+      },
+    },
     messageCapped: "此消息已被截断（{{bytes}} 字节）。",
     quote: {
       action: "引用",

@@ -62,6 +62,7 @@ export function createFinishObservation(input: {
             : null,
           lastMessage: result.lastMessage,
           error: current?.lastError ?? null,
+          turnId: current?.lastTurnCompletion?.event.turnId,
         };
       },
       async observe(agentId, handler, signal, onError) {

@@ -46,6 +46,7 @@ function observeState(
       final: snapshot,
       lastMessage,
       error: snapshot.lastError ?? null,
+      ...(event && "turnId" in event ? { turnId: event.turnId } : {}),
       ...(event?.type === "turn_canceled" ? { reason: "was canceled" as const } : {}),
     });
   }

@@ -82,6 +82,8 @@ import { createStreamPresentation } from "./presentation";
 import { OverviewToolCallGroupView } from "@/tool-calls/detail-level/overview/view";
 import { IndentRail } from "@/components/indent-rail";
 import { TurnSummaryLine } from "./turn-collapse/summary-line";
+import { getAgentSourcePresentation } from "./agent-interactions";
+import { AgentSourceHeader } from "./source-header";
 import { type AgentStreamRenderModel, buildAgentStreamRenderModel } from "./model";
 import { resolveStreamRenderStrategy } from "./strategy-resolver";
 import { type StreamSegmentRenderers, type StreamViewportHandle } from "./strategy";
@@ -843,7 +845,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     // Chat find reveals a match inside a collapsed turn by opening the turn first.
     const revealLoadedMessage = useStableEvent((messageId: string): boolean => {
       const hostId = presentation.turns.hostIdByFoldedMessageId.get(messageId);
-      if (hostId && !expandedTurnHostIds.has(hostId)) {
+      if (hostId && presentation.turns.summaryRowsByHostId.get(hostId)?.expanded === false) {
         setTurnExpanded(hostId, true);
         return true;
       }
@@ -865,20 +867,22 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
     const renderUserMessageItem = useCallback(
       (layoutItem: StreamLayoutItem, item: Extract<StreamItem, { kind: "user_message" }>) => {
-        return (
+        const sourcePresentation = getAgentSourcePresentation(item);
+        const { nestedItemIds } = presentation.turns;
+        const message = (
           <UserMessage
             itemId={item.id}
             serverId={resolvedServerId}
             agentId={agentId}
             messageId={item.messageId}
             message={item.text}
-            sender={item.sender}
+            sender={sourcePresentation ? undefined : item.sender}
             images={item.images}
             attachments={item.attachments}
             timestamp={item.timestamp.getTime()}
             capabilities={context.capabilities}
             client={client}
-            isFirstInGroup={layoutItem.isFirstInUserGroup}
+            isFirstInGroup={sourcePresentation ? false : layoutItem.isFirstInUserGroup}
             isLastInGroup={layoutItem.isLastInUserGroup}
             isPending={
               item.clientMessageId !== undefined &&
@@ -886,8 +890,25 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             }
           />
         );
+        if (!sourcePresentation?.isGroupStart || nestedItemIds.has(item.id)) return message;
+        return (
+          <>
+            <AgentSourceHeader
+              group={sourcePresentation.group}
+              fallbackServerId={resolvedServerId}
+            />
+            {message}
+          </>
+        );
       },
-      [context.capabilities, agentId, client, pendingClientMessageIds, resolvedServerId],
+      [
+        context.capabilities,
+        agentId,
+        client,
+        pendingClientMessageIds,
+        presentation.turns.nestedItemIds,
+        resolvedServerId,
+      ],
     );
 
     const renderAssistantMessageItem = useCallback(
@@ -1077,7 +1098,13 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
             return renderToolCallItem(layoutItem, item);
 
           case "turn_summary":
-            return <TurnSummaryLine item={item} onExpandedChange={setTurnExpanded} />;
+            return (
+              <TurnSummaryLine
+                item={item}
+                serverId={resolvedServerId}
+                onExpandedChange={setTurnExpanded}
+              />
+            );
 
           case "notification":
             return <Notification level={item.level} message={item.message} />;

@@ -1,9 +1,21 @@
 import type { AgentTimelineSearchPayload } from "@getpaseo/client/internal/daemon-client";
+import { parseUserMessageSegments } from "@getpaseo/protocol/user-message-segments";
 import type { StreamItem } from "@/types/stream";
 import { createMarkdownParser } from "@/utils/markdown-parser";
-import { getMergedAssistantFragmentSeqs } from "../agent-interactions";
+import { getAgentMessage, getMergedAssistantFragmentSeqs } from "../agent-interactions";
 
 const markdown = createMarkdownParser({ linkify: false });
+
+function searchPattern(query: string): RegExp {
+  return new RegExp(
+    query
+      .trim()
+      .split(/\s+/)
+      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join("\\s+"),
+    "giu",
+  );
+}
 
 function countMergedMatches(text: string, pattern: RegExp): number {
   let visibleCount = 0;
@@ -116,6 +128,7 @@ export class ChatFindModel {
   private listeners = new Set<() => void>();
   private historyListeners = new Set<() => void>();
   private items: StreamItem[] = [];
+  private includeAgentSourceBodies = false;
   private epoch: string | null = null;
   private resultEpoch: string | null = null;
   private locations: Location[] = [];
@@ -209,12 +222,13 @@ export class ChatFindModel {
       } while (cursor !== undefined);
       // COMPAT(timelineSearchInteractionProjection): added in v0.16.0, remove the loaded-row fallback after 2027-05-20.
       if (!agentInteractionsHidden) this.addLoadedMergedMatches();
+      if (this.includeAgentSourceBodies) this.addLoadedAgentSourceMatches();
       await this.navigate(0, 1, signal);
     } catch (error) {
       this.fail(error, signal);
     }
   }
-  updateHistory(epoch: string | null, items: StreamItem[]) {
+  updateHistory(epoch: string | null, items: StreamItem[], includeAgentSourceBodies = false) {
     if (
       this.resultEpoch !== null &&
       epoch !== null &&
@@ -225,18 +239,13 @@ export class ChatFindModel {
     }
     this.epoch = epoch;
     this.items = items;
+    this.includeAgentSourceBodies = includeAgentSourceBodies;
     this.historyListeners.forEach((listener) => listener());
   }
   private addLoadedMergedMatches() {
     const query = this.state.query.trim();
     if (!query) return;
-    const pattern = new RegExp(
-      query
-        .split(/\s+/)
-        .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-        .join("\\s+"),
-      "giu",
-    );
+    const pattern = searchPattern(query);
     const assistantSeqs = new Set(
       this.locations.filter((location) => location.role === "assistant").map(({ seq }) => seq),
     );
@@ -257,6 +266,26 @@ export class ChatFindModel {
     }
     this.locations.sort((a, b) => a.seq - b.seq);
   }
+  private addLoadedAgentSourceMatches() {
+    const pattern = searchPattern(this.state.query);
+    const userSeqs = new Set(
+      this.locations.filter((location) => location.role === "user").map(({ seq }) => seq),
+    );
+    for (const item of this.items) {
+      const cursor = item.timelineCursor;
+      if (!cursor || cursor.epoch !== this.resultEpoch || userSeqs.has(cursor.seq)) continue;
+      const source = getAgentMessage(item);
+      if (!source) continue;
+      const count = parseUserMessageSegments(source.text).reduce(
+        (total, segment) => total + [...segment.text.matchAll(pattern)].length,
+        0,
+      );
+      if (!count) continue;
+      userSeqs.add(cursor.seq);
+      this.locations.push({ seq: cursor.seq, role: "user", count });
+    }
+    this.locations.sort((a, b) => a.seq - b.seq);
+  }
   private target(location: Location, exact: boolean): Target | null {
     let before = 0;
     for (const item of this.items) {
@@ -267,6 +296,14 @@ export class ChatFindModel {
       if (seq < location.seq) {
         before = Math.max(before, seq);
         continue;
+      }
+      if (
+        this.includeAgentSourceBodies &&
+        seq === location.seq &&
+        location.role === "user" &&
+        getAgentMessage(item)
+      ) {
+        return { id: item.id, seq, before: seq - 1 };
       }
       const sameRole = item.kind === `${location.role}_message`;
       if (sameRole && (!exact || seq === location.seq)) return { id: item.id, seq, before };

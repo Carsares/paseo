@@ -6,8 +6,10 @@ import type { AgentExplicitFinishReport, AgentFinishReport } from "@getpaseo/pro
 import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
 import type { FinishObservationResult } from "./internal/observation-buffer.js";
 import type { AgentMessageDelivery, AgentPromptSource } from "../agent-messages/index.js";
-import { getParentAddressFromLabels } from "@getpaseo/protocol/agent-labels";
+import { getParentAddressFromLabels, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { AgentRequestOutcomeUnknownError } from "../../message-receipts/index.js";
+import { decodeParentReportIdentity, encodeParentReportIdentity } from "./report-identity.js";
 import {
   formatFinishNotificationBody,
   finishNotificationEvents,
@@ -28,6 +30,11 @@ export interface FinishSubscription {
   /** Authenticated source of a remote observation binding. */
   pullSourceId?: string;
   report?: AgentFinishReport;
+  /** An explicit report covered this watch's current result; keep permission checkpoints. */
+  suppressFinished?: boolean;
+  /** Carries the suppression across a crash between the two stores. */
+  supersedesFinished?: string[];
+  reportTurnId?: string;
 }
 export interface FinishSubscriptionStore {
   list(): Promise<FinishSubscription[]>;
@@ -75,6 +82,7 @@ export interface FinishSubscriptions {
     pendingDispatch?: boolean,
   ): Promise<FinishRegistration>;
   cancelAutomaticParent(childAgentId: string, callerAgentId: string): Promise<void>;
+  isFinishedSuppressed?(id: string): boolean;
   trackRemoteChild(input: Omit<FinishSubscription, "id">): Promise<void>;
   queueParentReport(
     address: Pick<FinishSubscription, "childAgentId" | "callerAgentId" | "callerServerId">,
@@ -82,12 +90,17 @@ export interface FinishSubscriptions {
       status: NonNullable<AgentFinishReport["parentReportStatus"]>;
       title: string;
       summary: string;
+      turnId?: string;
     },
   ): Promise<string>;
   confirmParentReport(
     address: Pick<FinishSubscription, "childAgentId" | "callerAgentId" | "callerServerId">,
     reportId: string,
   ): Promise<boolean>;
+  suppressRemoteFinished?(
+    address: Pick<FinishSubscription, "childAgentId" | "callerAgentId" | "serverId">,
+    turnId: string,
+  ): Promise<void>;
   pullReports(
     address: {
       childAgentId: string;
@@ -111,9 +124,18 @@ interface Watch {
   acknowledged?: boolean;
   task?: Promise<void>;
   queued: Set<AgentPromptSource>;
+  resultTurnId?: string;
+  captured?: FinishSubscription & { report: AgentFinishReport };
 }
 const AUTOMATIC_PARENT_PREFIX = "automatic-parent:";
 const REQUESTED_PARENT_PREFIX = "requested-parent:";
+const REPORT_PAGE_SIZE = 8;
+
+function remoteReportId(record: FinishSubscription): string {
+  return record.report?.parentReportStatus
+    ? encodeParentReportIdentity(record.id, record.supersedesFinished ?? [], record.reportTurnId)
+    : record.id;
+}
 
 export function isAutomaticLocalParentSubscription(record: FinishSubscription): boolean {
   // Older IDs cannot distinguish a default watch from an explicit request.
@@ -124,6 +146,9 @@ export function isAutomaticLocalParentSubscription(record: FinishSubscription): 
     record.requireParentOwnership === true &&
     record.id.startsWith(AUTOMATIC_PARENT_PREFIX)
   );
+}
+function isAutomaticParentSubscription(record: FinishSubscription): boolean {
+  return record.requireParentOwnership === true && record.id.startsWith(AUTOMATIC_PARENT_PREFIX);
 }
 function key(record: Omit<FinishSubscription, "id">): string {
   return JSON.stringify([
@@ -157,6 +182,8 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
   const followupWatches = new Map<string, AbortController>();
   const remoteReportTasks = new Map<string, AbortController>();
   const lastReportByBinding = new Map<string, string>();
+  const suppressedFinished = new Set<string>();
+  const remoteExplicitTurns = new Set<string>();
   let reportMutations = Promise.resolve();
   function serializeReports<T>(action: () => Promise<T>): Promise<T> {
     const result = reportMutations.then(action);
@@ -191,7 +218,10 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       decision,
       decide,
       queued: new Set(),
+      resultTurnId: records[0]?.reportTurnId,
     };
+    const stored = records[0]!;
+    if (stored.report) watch.captured = { ...stored, report: stored.report };
     const group = watches.get(key(records[0]!)) ?? new Set<Watch>();
     group.add(watch);
     watches.set(key(records[0]!), group);
@@ -212,6 +242,8 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
   }
   function stopAutomatic(watch: Watch, group: Set<Watch>): void {
     stop(watch, group);
+    if (watch.captured)
+      deps.messages().withdrawInboxReport?.(watch.captured.callerAgentId, watch.captured.id);
     if (watch.queued.size) {
       deps
         .messages()
@@ -220,7 +252,12 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
   }
   async function remove(watch: Watch): Promise<void> {
     // Only IDs captured by this observer are eligible; newer registrations survive.
-    for (const record of watch.records) await deps.store.remove(record.id);
+    for (const record of watch.records) {
+      await deps.store.remove(record.id);
+      if (record.followupReport && suppressedFinished.has(record.id) && deps.followups)
+        await serializeReports(() => deps.followups!.reports.remove(record.id));
+      suppressedFinished.delete(record.id);
+    }
   }
   async function delay(signal: AbortSignal, attempt: number): Promise<void> {
     try {
@@ -288,6 +325,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     childServerId: string,
     report: AgentFinishReport,
     signal: AbortSignal,
+    preferPull = false,
   ): Promise<boolean> {
     if (!deps.hosts) throw new Error("Remote finish delivery is unavailable");
     return deps.hosts().use(
@@ -295,6 +333,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       async (client) => {
         const caller = (await client.fetchAgent(record.callerAgentId))?.agent;
         if (!caller || caller.archivedAt) return false;
+        if (preferPull && client.getLastServerInfoMessage()?.features?.subagentInbox) return false;
         const receipt = await client.sendMessage(record.callerAgentId, report.prompt, {
           messageId: report.id,
           sourceAgentId: record.childAgentId,
@@ -331,7 +370,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         )
       )
         return false;
-      return await deliverRemote(record, childServerId, report, signal);
+      return await deliverRemote(record, childServerId, report, signal, true);
     } catch (error) {
       if (signal.aborted) throw error;
       // The parent can still pull the saved report if reverse dispatch is unconfirmed.
@@ -346,7 +385,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     return requests.filter((request) => !notified.has(request.id));
   }
 
-  function enqueueLocalNotification(
+  async function enqueueLocalNotification(
     record: FinishSubscription,
     report: AgentFinishReport,
     hasFinalSnapshot: boolean,
@@ -365,10 +404,21 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       title: report.title,
       event: report.event,
     };
+    const subagentInbox =
+      record.requireParentOwnership &&
+      (report.event !== "finished" || isAutomaticParentSubscription(record))
+        ? await messages.classifyInbox?.(record.callerAgentId, source)
+        : undefined;
+    if (
+      watch.controller.signal.aborted ||
+      (report.event === "finished" && suppressedFinished.has(record.id))
+    )
+      return undefined;
     const receipt = messages.enqueue({
       recipientId: record.callerAgentId,
       prompt: report.prompt,
       source,
+      subagentInbox,
       activeTurnBehavior: "steer",
       unarchive: false,
       // The observation's snapshot cannot authorize a notification that
@@ -382,6 +432,112 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       () => watch.queued.delete(source),
     );
     return receipt;
+  }
+
+  function isSuppressedFinish(
+    record: FinishSubscription,
+    result: FinishObservationResult,
+    report: AgentFinishReport,
+  ): boolean {
+    return (
+      report.event === "finished" &&
+      (suppressedFinished.has(record.id) ||
+        (isAutomaticParentSubscription(record) &&
+          !!result.turnId &&
+          remoteExplicitTurns.has(JSON.stringify([key(record), result.turnId]))))
+    );
+  }
+
+  async function saveRemoteFollowup(
+    record: FinishSubscription,
+    report: AgentFinishReport,
+    saved: Set<string>,
+    turnId?: string,
+  ): Promise<boolean> {
+    const followups = deps.followups;
+    if (!followups || !record.followupReport) return false;
+    return serializeReports(async () => {
+      if (report.event === "finished" && suppressedFinished.has(record.id)) return false;
+      const binding = (await followups.watches.list()).find((entry) => entry.id === key(record));
+      if (!saved.has(report.id)) {
+        // The result can precede the parent's first pull.
+        await followups.reports.put({
+          ...record,
+          id: report.id,
+          pullSourceId: binding?.pullSourceId,
+          report,
+          reportTurnId: turnId,
+        });
+        saved.add(report.id);
+      }
+      return Boolean(binding);
+    });
+  }
+
+  async function dispatchRemoteNotification(
+    record: FinishSubscription & { callerServerId: string },
+    childServerId: string,
+    report: AgentFinishReport,
+    bound: boolean,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const dispatched = await tryReverseNotification(record, childServerId, report, bound, signal);
+    if (record.followupReport && dispatched)
+      await serializeReports(async () => {
+        await deps.followups?.reports.remove(report.id);
+      });
+    return bound || dispatched;
+  }
+
+  async function dispatchCapturedReport(
+    record: FinishSubscription,
+    report: AgentFinishReport,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!deps.followups || suppressedFinished.has(record.id)) return;
+    try {
+      await abortable(deps.followups.dispatch(record, report), signal);
+    } catch (error) {
+      if (
+        !suppressedFinished.has(record.id) &&
+        !(error instanceof ParentReportRecipientUnavailableError)
+      )
+        throw error;
+    }
+  }
+
+  async function captureLocalFinish(
+    record: FinishSubscription,
+    report: AgentFinishReport,
+    result: FinishObservationResult,
+    watch: Watch,
+  ): Promise<boolean> {
+    const { signal } = watch.controller;
+    if (
+      report.event !== "finished" ||
+      !result.final ||
+      !deps.followups ||
+      !isAutomaticParentSubscription(record)
+    )
+      return false;
+    const inbox = await deps.messages().classifyInbox?.(record.callerAgentId, {
+      kind: "agent-notification",
+      agentId: record.childAgentId,
+      serverId: record.serverId ?? deps.serverId,
+      title: report.title,
+      event: "finished",
+    });
+    if (!inbox) return false;
+    const captured = { ...record, report, reportTurnId: result.turnId };
+    await serialize(async () => {
+      if (!signal.aborted && !isSuppressedFinish(record, result, report)) {
+        await deps.store.put(captured);
+        watch.captured = captured;
+      }
+    });
+    if (!signal.aborted && !isSuppressedFinish(record, result, report))
+      await dispatchCapturedReport(captured, report, signal);
+    return true;
   }
 
   async function deliver(
@@ -409,41 +565,24 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       });
       const id = notificationId(record.id, request?.id);
       const report = { id, prompt, title, event: finishNotificationEvents[reason] };
-      const followups = record.followupReport ? deps.followups : undefined;
-      let bound = false;
-      if (followups) {
-        bound = await serializeReports(async () => {
-          const binding = (await followups.watches.list()).find(
-            (entry) => entry.id === key(record),
-          );
-          if (!savedFollowups.has(id)) {
-            // The turn can finish before the origin's first poll. Keep the result across
-            // supersession and restart, even if a reverse route cannot be opened.
-            await followups.reports.put({
-              ...record,
-              id,
-              pullSourceId: binding?.pullSourceId,
-              report,
-            });
-            savedFollowups.add(id);
-          }
-          return Boolean(binding);
-        });
-      }
+      if (isSuppressedFinish(record, result, report)) return true;
+      const bound = await saveRemoteFollowup(record, report, savedFollowups, result.turnId);
+      if (signal.aborted || isSuppressedFinish(record, result, report)) return true;
       if (record.callerServerId) {
-        const dispatched = await tryReverseNotification(
+        const handled = await dispatchRemoteNotification(
           { ...record, callerServerId: record.callerServerId },
           childServerId,
           report,
           bound,
           signal,
         );
-        if (followups && dispatched) await serializeReports(() => followups.reports.remove(id));
-        if (!bound && !dispatched) return true;
+        if (!handled) return true;
         if (request) permissions.add(request.id);
         continue;
       }
-      const receipt = enqueueLocalNotification(record, report, Boolean(result.final), watch);
+      if (await captureLocalFinish(record, report, result, watch)) return true;
+      const receipt = await enqueueLocalNotification(record, report, Boolean(result.final), watch);
+      if (!receipt) return !signal.aborted;
       acknowledgments.push(
         receipt.dispatched.then(() => {
           if (request) permissions.add(request.id);
@@ -476,11 +615,51 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     let remoteFailures = 0;
     let retries = 0;
     let warned = false;
+    async function deliverCapturedResult(
+      captured: FinishSubscription & { report: AgentFinishReport },
+    ): Promise<void> {
+      if (watch.acknowledged) return;
+      await dispatchCapturedReport(captured, captured.report, signal);
+      watch.acknowledged = true;
+    }
     async function observeNext(): Promise<FinishObservationResult | undefined> {
       try {
         observation ??= await deps.open(record, signal);
         const result = await abortable(observation.next(), signal);
         remoteFailures = 0;
+        // An observation opened after a fast remote turn sees the settled snapshot
+        // without a terminal event. Recover its identity from the same timeline.
+        if (
+          !result.turnId &&
+          result.final?.status === "idle" &&
+          record.serverId &&
+          isAutomaticParentSubscription(record) &&
+          deps.hosts
+        ) {
+          const settled = result.final;
+          const turnId = await deps
+            .hosts()
+            .use(
+              record.serverId,
+              async (client) => {
+                const timeline = await client.fetchAgentTimeline(record.childAgentId, {
+                  direction: "tail",
+                  limit: 1,
+                });
+                const current = (await client.fetchAgent(record.childAgentId))?.agent;
+                if (
+                  current?.status === "idle" &&
+                  current.lastUserMessageAt === settled.lastUserMessageAt &&
+                  current.updatedAt === settled.updatedAt
+                )
+                  return timeline.entries.at(-1)?.turnId;
+                return undefined;
+              },
+              signal,
+            )
+            .catch(() => undefined);
+          return { ...result, turnId };
+        }
         return result;
       } catch (error) {
         await observation?.close();
@@ -507,16 +686,22 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
             stop(watch, group);
             return;
           }
-          if (!pending) pending = await observeNext();
+          if (watch.captured) {
+            await deliverCapturedResult(watch.captured);
+            await remove(watch);
+            stop(watch, group);
+            return;
+          }
+          pending ??= await observeNext();
           if (!pending) {
             await delay(signal, retries++);
             continue;
           }
+          watch.resultTurnId = pending.turnId;
           if (signal.aborted) return;
           // A queued follow-up cannot start until the current permission is answered.
           // Its pending registration must not hold the running turn's checkpoint.
           if (pending.status !== "permission" || watch.pending) await decisions(group);
-          if (signal.aborted) return;
           if (await suppressed(record, pending)) {
             await remove(watch);
             stop(watch, group);
@@ -561,9 +746,27 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
   }
 
   const localReportTasks = new Map<string, AbortController>();
+  async function removeDeliveredReport(record: FinishSubscription): Promise<void> {
+    const reports = deps.followups!.reports;
+    if (record.callerServerId)
+      for (const id of record.supersedesFinished ?? []) await reports.remove(id);
+    await reports.remove(record.id);
+  }
+  async function finishParentReport(record: FinishSubscription): Promise<void> {
+    await serialize(async () => {
+      if (record.supersedesFinished?.length) {
+        const covered = new Set(record.supersedesFinished);
+        for (const entry of await deps.store.list()) {
+          if (!entry.suppressFinished && covered.has(entry.id))
+            await deps.store.put({ ...entry, suppressFinished: true });
+        }
+      }
+      await serializeReports(() => removeDeliveredReport(record));
+    });
+  }
   function startLocalReport(record: FinishSubscription, report: AgentFinishReport): void {
     if (!deps.followups || localReportTasks.has(record.id)) return;
-    const { dispatch, reports } = deps.followups;
+    const { dispatch } = deps.followups;
     const controller = new AbortController();
     const { signal } = controller;
     localReportTasks.set(record.id, controller);
@@ -576,7 +779,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           } catch (error) {
             if (!(error instanceof ParentReportRecipientUnavailableError)) throw error;
           }
-          await serializeReports(() => reports.remove(record.id));
+          await finishParentReport(record);
           return;
         } catch (error) {
           if (signal.aborted) return;
@@ -602,7 +805,6 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
   ): void {
     if (!deps.followups || !deps.hosts || remoteReportTasks.has(record.id)) return;
     if (report.parentReportStatus === undefined) return;
-    const { reports } = deps.followups;
     const controller = new AbortController();
     const { signal } = controller;
     remoteReportTasks.set(record.id, controller);
@@ -616,17 +818,16 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
             hosts.use(
               record.callerServerId,
               (client) =>
-                client.pushAgentFinishReport(
-                  record.childAgentId,
-                  record.callerAgentId,
-                  report as AgentExplicitFinishReport,
-                ),
+                client.pushAgentFinishReport(record.childAgentId, record.callerAgentId, {
+                  ...report,
+                  id: remoteReportId(record),
+                } as AgentExplicitFinishReport),
               signal,
               record.childAgentId,
             ),
             signal,
           );
-          await serializeReports(() => reports.remove(record.id));
+          await finishParentReport(record);
           if (!response.accepted) return;
           return;
         } catch (error) {
@@ -659,31 +860,107 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     const controller = new AbortController();
     const { signal } = controller;
     followupWatches.set(record.id, controller);
+    const { callerAgentId, childAgentId } = record;
+    const reportChildState = deps.messages().observeRemoteChild;
+    const observeChildState = async () => {
+      if (!reportChildState) return;
+      try {
+        await deps.hosts!().use(
+          serverId,
+          async (client) => {
+            const observation = client.observeAgents({
+              filter: { labels: { [PARENT_AGENT_ID_LABEL]: callerAgentId } },
+              signal,
+            });
+            const publish = (child?: AgentSnapshotPayload) => {
+              const parent = getParentAddressFromLabels(child?.labels, serverId);
+              reportChildState(
+                callerAgentId,
+                serverId,
+                childAgentId,
+                Boolean(
+                  child &&
+                  !child.archivedAt &&
+                  parent?.serverId === deps.serverId &&
+                  parent.agentId === callerAgentId &&
+                  (child.status === "running" ||
+                    child.status === "initializing" ||
+                    child.activeTurn),
+                ),
+              );
+            };
+            let disconnect!: (error: unknown) => void;
+            const disconnected = new Promise<never>((_resolve, reject) => {
+              disconnect = reject;
+            });
+            const unsubscribe = observation.subscribe({
+              snapshot: (snapshot) =>
+                publish(snapshot.entries.find(({ agent }) => agent.id === childAgentId)?.agent),
+              update: (update) => {
+                if (update.type !== "agent_update") return;
+                const payload = update.payload;
+                if (payload.kind === "upsert" && payload.agent.id === childAgentId)
+                  publish(payload.agent);
+                if (payload.kind === "remove" && payload.agentId === childAgentId) publish();
+              },
+              error: disconnect,
+            });
+            try {
+              await abortable(Promise.all([observation.ready, disconnected]), signal);
+            } finally {
+              unsubscribe();
+              await observation.release();
+            }
+          },
+          signal,
+        );
+      } catch (error) {
+        if (!signal.aborted)
+          deps.logger.debug(
+            { err: error, subscription: record.id },
+            "Remote child state observation disconnected",
+          );
+      } finally {
+        reportChildState(callerAgentId, serverId, childAgentId, false);
+      }
+    };
+    let stateTask: Promise<void> | undefined;
     const task = (async () => {
       let acknowledged: string[] = [];
       const outcomesUnknown = new Set<string>();
-      async function dispatchReports(reports: AgentFinishReport[]): Promise<void> {
+      const pendingReports = new Map<string, Promise<void>>();
+      function dispatchReports(reports: AgentFinishReport[]): void {
         for (const report of reports) {
-          signal.throwIfAborted();
-          if (!(await deps.callerIsActive(record.callerAgentId))) return;
-          try {
-            await abortable(followups.dispatch(record, report), signal);
-            outcomesUnknown.delete(report.id);
-            acknowledged.push(report.id);
-          } catch (error) {
-            if (error instanceof ParentReportRecipientUnavailableError) {
-              acknowledged.push(report.id);
-              continue;
-            }
-            if (!(error instanceof AgentRequestOutcomeUnknownError)) throw error;
-            if (!outcomesUnknown.has(report.id)) {
-              outcomesUnknown.add(report.id);
-              deps.logger.warn(
-                { reportId: report.id, subscription: record.id },
-                "Remote finish report awaits delivery verification",
+          if (signal.aborted || pendingReports.has(report.id) || acknowledged.includes(report.id))
+            continue;
+          const dispatch = (async () => {
+            if (!(await deps.callerIsActive(record.callerAgentId))) return;
+            try {
+              await abortable(
+                followups.dispatch({ ...record, requireParentOwnership: true }, report),
+                signal,
               );
+              outcomesUnknown.delete(report.id);
+              acknowledged.push(report.id);
+            } catch (error) {
+              if (signal.aborted) return;
+              if (error instanceof ParentReportRecipientUnavailableError) {
+                acknowledged.push(report.id);
+              } else if (!outcomesUnknown.has(report.id)) {
+                outcomesUnknown.add(report.id);
+                deps.logger.warn(
+                  { err: error, reportId: report.id, subscription: record.id },
+                  error instanceof AgentRequestOutcomeUnknownError
+                    ? "Remote finish report awaits delivery verification"
+                    : "Retrying remote finish report",
+                );
+              }
             }
-          }
+          })().finally(() => pendingReports.delete(report.id));
+          pendingReports.set(report.id, dispatch);
+          void dispatch.catch((err) =>
+            deps.logger.warn({ err }, "Failed to dispatch remote finish report"),
+          );
         }
       }
       let warned = false;
@@ -696,25 +973,37 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
             return;
           }
           if (host.status === "online") {
-            const response = await hosts.use(
-              serverId,
-              (client) =>
-                client.pullAgentFinishReports(
-                  record.childAgentId,
-                  record.callerAgentId,
-                  acknowledged,
-                  true,
-                ),
-              signal,
-            );
+            if (!stateTask && reportChildState)
+              stateTask = observeChildState().finally(() => {
+                stateTask = undefined;
+              });
+            const sentAcknowledgments = acknowledged.splice(0, REPORT_PAGE_SIZE);
+            const response = await hosts
+              .use(
+                serverId,
+                (client) =>
+                  client.pullAgentFinishReports(
+                    record.childAgentId,
+                    record.callerAgentId,
+                    sentAcknowledgments,
+                    true,
+                  ),
+                signal,
+              )
+              .catch((error) => {
+                acknowledged.unshift(...sentAcknowledgments);
+                throw error;
+              });
             signal.throwIfAborted();
-            if (response.error) throw new Error(response.error);
+            if (response.error) {
+              acknowledged.unshift(...sentAcknowledgments);
+              throw new Error(response.error);
+            }
             if (!response.ownsChild) {
               await followups.watches.remove(record.id);
               return;
             }
-            acknowledged = [];
-            await dispatchReports(response.reports);
+            dispatchReports(response.reports);
             warned = false;
             if (acknowledged.length) continue;
           }
@@ -732,14 +1021,70 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       }
     })();
     tasks.add(task);
-    void task.then(() => {
-      followupWatches.delete(record.id);
-      tasks.delete(task);
-      return undefined;
-    });
+    void task
+      .finally(() => {
+        controller.abort();
+        followupWatches.delete(record.id);
+        tasks.delete(task);
+      })
+      .catch(() => undefined);
+  }
+
+  async function restoreFinishWatches(): Promise<void> {
+    const groups = new Map<string, FinishSubscription[]>();
+    for (const record of await deps.store.list()) {
+      if (record.suppressFinished) suppressedFinished.add(record.id);
+      if (record.report) {
+        attach([record], false);
+        continue;
+      }
+      const records = groups.get(key(record)) ?? [];
+      records.push(record);
+      groups.set(key(record), records);
+    }
+    for (const records of groups.values()) attach(records, false);
   }
 
   return {
+    isFinishedSuppressed: (id) => suppressedFinished.has(id),
+    async suppressRemoteFinished(address, turnId) {
+      const pair = key(address);
+      const turn = JSON.stringify([pair, turnId]);
+      remoteExplicitTurns.delete(turn);
+      remoteExplicitTurns.add(turn);
+      if (remoteExplicitTurns.size > 1024)
+        remoteExplicitTurns.delete(remoteExplicitTurns.values().next().value!);
+      await serialize(async () => {
+        // The parent may restart after acknowledging the explicit report on
+        // the child host. Do not recover a captured finish it already replaced.
+        for (const entry of await deps.store.list()) {
+          if (
+            key(entry) === pair &&
+            entry.reportTurnId === turnId &&
+            entry.report?.event === "finished" &&
+            isAutomaticParentSubscription(entry) &&
+            !entry.suppressFinished
+          )
+            await deps.store.put({ ...entry, suppressFinished: true });
+        }
+      });
+      for (const watch of watches.get(pair) ?? []) {
+        if (watch.resultTurnId !== turnId || !watch.records.every(isAutomaticParentSubscription))
+          continue;
+        for (const entry of watch.records) suppressedFinished.add(entry.id);
+        deps
+          .messages()
+          .withdrawPending(
+            address.callerAgentId,
+            (source) =>
+              source.kind === "agent-notification" &&
+              source.event === "finished" &&
+              watch.queued.has(source),
+          );
+        for (const entry of watch.records)
+          deps.messages().withdrawInboxReport?.(address.callerAgentId, entry.id);
+      }
+    },
     hasPendingForCaller(agentId) {
       if (recovering || registering.has(agentId)) return true;
       for (const group of watches.values()) {
@@ -752,16 +1097,13 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     },
     start: () =>
       serialize(async () => {
-        const groups = new Map<string, FinishSubscription[]>();
-        for (const record of await deps.store.list()) {
-          const records = groups.get(key(record)) ?? [];
-          records.push(record);
-          groups.set(key(record), records);
-        }
-        for (const records of groups.values()) attach(records, false);
+        const storedReports = (await deps.followups?.reports.list()) ?? [];
+        for (const stored of storedReports)
+          for (const id of stored.supersedesFinished ?? []) suppressedFinished.add(id);
+        await restoreFinishWatches();
         for (const record of (await deps.followups?.watches.list()) ?? [])
           startFollowupWatch(record);
-        for (const record of (await deps.followups?.reports.list()) ?? []) {
+        for (const record of storedReports) {
           if (!record.callerServerId && record.report?.parentReportStatus)
             startLocalReport(record, record.report);
           if (record.callerServerId && record.report?.parentReportStatus)
@@ -780,7 +1122,10 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         // persisted record compatible with older readers.
         let prefix = "";
         if (input.requireParentOwnership) {
-          prefix = automaticParent ? AUTOMATIC_PARENT_PREFIX : REQUESTED_PARENT_PREFIX;
+          prefix =
+            (automaticParent ?? input.followupReport)
+              ? AUTOMATIC_PARENT_PREFIX
+              : REQUESTED_PARENT_PREFIX;
         }
         const record: FinishSubscription = {
           ...input,
@@ -794,7 +1139,9 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           return skippedRegistration;
         }
         const group = watches.get(key(record)) ?? new Set<Watch>();
-        const predecessors = [...group];
+        // A captured result belongs to an earlier turn and may still be held
+        // in the parent's inbox when a new foreground turn is accepted.
+        const predecessors = [...group].filter((prior) => !prior.captured);
         const watch = attach([record], true);
         const actualGroup = watches.get(key(record))!;
         const automatic = isAutomaticLocalParentSubscription(record);
@@ -813,7 +1160,9 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
             removeSuperseded([record]);
             return;
           }
-          const activePredecessors = predecessors.filter((prior) => actualGroup.has(prior));
+          const activePredecessors = predecessors.filter(
+            (prior) => actualGroup.has(prior) && !prior.captured,
+          );
           if (automatic) {
             const requested = activePredecessors.filter(
               (prior) =>
@@ -896,7 +1245,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         await deps.followups.watches.put(record);
         startFollowupWatch(record);
       }),
-    queueParentReport: (address, { status, title, summary }) =>
+    queueParentReport: (address, { status, title, summary, turnId }) =>
       serialize(async () => {
         if (closed || !deps.followups) throw new Error("Parent report delivery is unavailable");
         const id = randomUUID();
@@ -907,8 +1256,58 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           event: "finished",
           parentReportStatus: status,
         };
-        const record = { ...address, id, report };
-        await serializeReports(() => deps.followups!.reports.put(record));
+        const group = watches.get(key(address));
+        const covered = [...(group ?? [])]
+          .filter(
+            (watch) =>
+              !watch.pending &&
+              watch.records.every(isAutomaticParentSubscription) &&
+              (!watch.resultTurnId || turnId === watch.resultTurnId),
+          )
+          .flatMap((watch) => watch.records);
+        const record = {
+          ...address,
+          id,
+          report,
+          reportTurnId: turnId,
+          supersedesFinished: covered.map((entry) => entry.id),
+        };
+        await serializeReports(async () => {
+          if (address.callerServerId && turnId) {
+            for (const saved of await deps.followups!.reports.list()) {
+              if (
+                key(saved) === key(address) &&
+                saved.reportTurnId === turnId &&
+                saved.report?.event === "finished" &&
+                !saved.report.parentReportStatus &&
+                isAutomaticParentSubscription(saved) &&
+                !record.supersedesFinished.includes(saved.id)
+              )
+                record.supersedesFinished.push(saved.id);
+            }
+          }
+          await deps.followups!.reports.put(record);
+          for (const finishedId of record.supersedesFinished) suppressedFinished.add(finishedId);
+        });
+        // Suppress only finished notifications. A blocked tool report is not a
+        // response to the provider's permission checkpoint.
+        if (covered.length && !record.callerServerId) {
+          const queued = new Set<AgentPromptSource>();
+          for (const watch of group ?? [])
+            if (watch.records.every((entry) => suppressedFinished.has(entry.id)))
+              for (const source of watch.queued) queued.add(source);
+          deps
+            .messages()
+            .withdrawPending(
+              record.callerAgentId,
+              (source) =>
+                source.kind === "agent-notification" &&
+                source.event === "finished" &&
+                queued.has(source),
+            );
+          for (const entry of covered)
+            deps.messages().withdrawInboxReport?.(record.callerAgentId, entry.id);
+        }
         if (!record.callerServerId) startLocalReport(record, report);
         else startRemoteReport({ ...record, callerServerId: record.callerServerId }, report);
         return id;
@@ -918,14 +1317,17 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         const reports = deps.followups?.reports;
         if (!reports) return false;
         const expected = key(address);
+        const identity = decodeParentReportIdentity(reportId);
         const record = (await reports.list()).find(
           (entry) =>
-            entry.id === reportId &&
+            entry.id === identity.id &&
             key(entry) === expected &&
-            entry.report?.id === reportId &&
+            entry.report?.id === identity.id &&
             entry.report.parentReportStatus !== undefined,
         );
-        return record !== undefined;
+        return (
+          record !== undefined && (reportId === identity.id || reportId === remoteReportId(record))
+        );
       }),
     pullReports: (address, acknowledged, observe, childState, includeParentReports = false) =>
       serializeReports(async () => {
@@ -955,17 +1357,26 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           await followups.watches.put({ ...pair, id: bindingId, pullSourceId: sourceId });
         }
         const eligible = matching.filter(
-          (record) => includeParentReports || !record.report?.parentReportStatus,
+          (record) =>
+            !suppressedFinished.has(record.id) &&
+            (includeParentReports || !record.report?.parentReportStatus),
         );
-        const consumed = new Set(acknowledged);
-        for (const record of eligible) if (consumed.has(record.id)) await reports.remove(record.id);
+        const confirmedIds = new Set(acknowledged);
+        const consumed = new Set(
+          eligible
+            .filter(
+              (record) => confirmedIds.has(record.id) || confirmedIds.has(remoteReportId(record)),
+            )
+            .map((record) => record.id),
+        );
+        for (const record of eligible)
+          if (consumed.has(record.id)) await removeDeliveredReport(record);
         const remaining = eligible.filter((record) => !consumed.has(record.id));
         const lastReportId = lastReportByBinding.get(bindingId);
         const cursor = eligible.findIndex((record) => record.id === lastReportId);
         const page = [...eligible.slice(cursor + 1), ...eligible.slice(0, cursor + 1)]
           .filter((record) => !consumed.has(record.id))
-          .slice(0, 8)
-          .map((record) => record.report!);
+          .slice(0, REPORT_PAGE_SIZE);
         // An unacknowledged report stays durable. Rotate through remaining pages even
         // when an entire page is awaiting delivery verification.
         if (page.length && remaining.length > page.length)
@@ -973,10 +1384,16 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         else lastReportByBinding.delete(bindingId);
         if (
           childState === "archived" &&
-          matching.every((record) => eligible.includes(record) && consumed.has(record.id))
+          !remaining.length &&
+          matching.every((record) => suppressedFinished.has(record.id) || consumed.has(record.id))
         )
           await followups.watches.remove(bindingId);
-        return { ownsBinding: childState === "active" || remaining.length > 0, reports: page };
+        return {
+          ownsBinding: childState === "active" || remaining.length > 0,
+          reports: page.map((record) =>
+            Object.assign({}, record.report!, { id: remoteReportId(record) }),
+          ),
+        };
       }),
     async close() {
       closed = true;

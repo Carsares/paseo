@@ -264,6 +264,23 @@ export const ko: TranslationResources = {
     empty: "이 에이전트와 대화를 시작하세요...",
     scrollToBottom: "맨 아래로 스크롤",
     historyLoadFailed: "에이전트 기록을 로드할 수 없습니다.",
+    inbox: {
+      pending: "대기 중인 보고서 {{count}}개",
+      flush: "지금 요약",
+      flushing: "요약 중…",
+      failed: "보고서를 요약할 수 없습니다. 다시 시도하세요.",
+    },
+    source: {
+      status: {
+        message: "메시지",
+        finished: "종료됨",
+        completed: "완료됨",
+        blocked: "차단됨",
+        error: "오류",
+        permission: "권한 필요",
+        closed: "닫힘",
+      },
+    },
     messageCapped: "이 메시지는 길이 제한으로 잘렸습니다({{bytes}}바이트).",
     quote: {
       action: "인용",

@@ -264,6 +264,23 @@ export const ar: TranslationResources = {
     empty: "ابدأ الدردشة مع هذا الوكيل...",
     scrollToBottom: "قم بالتمرير إلى الأسفل",
     historyLoadFailed: "تعذر تحميل سجل الوكيل",
+    inbox: {
+      pending: "{{count}} من التقارير المعلقة",
+      flush: "تلخيص الآن",
+      flushing: "جارٍ التلخيص…",
+      failed: "تعذر تلخيص التقارير. أعد المحاولة.",
+    },
+    source: {
+      status: {
+        message: "رسالة",
+        finished: "اكتمل",
+        completed: "مكتمل",
+        blocked: "محظور",
+        error: "خطأ",
+        permission: "الإذن مطلوب",
+        closed: "مغلق",
+      },
+    },
     messageCapped: "تم اقتطاع هذه الرسالة ({{bytes}} بايت).",
     quote: {
       action: "اقتباس",

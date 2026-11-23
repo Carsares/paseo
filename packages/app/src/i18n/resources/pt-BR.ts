@@ -265,6 +265,23 @@ export const ptBR: TranslationResources = {
     empty: "Comece a conversar com este agente...",
     scrollToBottom: "Rolar para o fim",
     historyLoadFailed: "Não foi possível carregar o histórico do agente",
+    inbox: {
+      pending: "{{count}} relatórios pendentes",
+      flush: "Resumir agora",
+      flushing: "Resumindo…",
+      failed: "Não foi possível resumir os relatórios. Tente novamente.",
+    },
+    source: {
+      status: {
+        message: "Mensagem",
+        finished: "Finalizado",
+        completed: "Concluído",
+        blocked: "Bloqueado",
+        error: "Erro",
+        permission: "Permissão necessária",
+        closed: "Fechado",
+      },
+    },
     messageCapped: "Esta mensagem foi truncada ({{bytes}} bytes).",
     quote: {
       action: "Citar",

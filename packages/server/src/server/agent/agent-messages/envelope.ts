@@ -19,6 +19,7 @@ const sourceSchema = z.discriminatedUnion("kind", [
     agentId: agentIdSchema,
     serverId: z.string().min(1).optional(),
     title: z.string().min(1).optional(),
+    reportStatus: z.enum(["completed", "blocked"]).optional(),
   }),
   z.object({
     kind: z.literal("agent-notification"),
@@ -93,7 +94,11 @@ export function formatAgentMessage(message: AgentMessage): string {
   const server = source?.serverId ? ` source-server-id="${escapeXml(source.serverId)}"` : "";
   const title = source?.title ? ` source-agent-title="${escapeXml(source.title)}"` : "";
   const event = source?.kind === "agent-notification" ? ` event="${source.event}"` : "";
-  return `<paseo-system version="1" ${attributes} message-id="${escapeXml(message.id)}"${server}${title}${event}>\n${escapeXml(message.text)}\n</paseo-system>`;
+  const status =
+    source?.kind === "agent-message" && source.reportStatus
+      ? ` report-status="${source.reportStatus}"`
+      : "";
+  return `<paseo-system version="1" ${attributes} message-id="${escapeXml(message.id)}"${server}${title}${event}${status}>\n${escapeXml(message.text)}\n</paseo-system>`;
 }
 
 export function parseAgentMessage(text: string): AgentMessage | null {
@@ -122,6 +127,7 @@ export function parseAgentMessage(text: string): AgentMessage | null {
     event: attributes.get("event"),
     title: attributes.get("source-agent-title"),
     url: attributes.get("source-url"),
+    ...(attributes.has("report-status") ? { reportStatus: attributes.get("report-status") } : {}),
   });
   if (!source.success) return null;
   return { id, source: source.data, text: body };
@@ -386,6 +392,9 @@ function projectAgentMessage(item: AgentTimelineItem): AgentTimelineItem | null 
         ...(source.title ? { title: source.title } : {}),
       },
       text: message.text,
+      ...(source.kind === "agent-message" && source.reportStatus
+        ? { reportStatus: source.reportStatus }
+        : {}),
     },
     // COMPAT(agentMessageToolEnvelope): added in v0.11.1; remove after 2027-04-08
     // once clients can accept a dedicated timeline variant. Older clients still

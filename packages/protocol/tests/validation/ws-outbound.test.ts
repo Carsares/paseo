@@ -143,6 +143,75 @@ const SourceSchema = z.object({
     expect(validateWSOutboundMessage({ type: "not_a_message" }).success).toBe(false);
   });
 
+  it("validates both directions of the inbox flush RPC", () => {
+    const request = {
+      type: "session",
+      message: { type: "agent.inbox.flush.request", agentId: "parent", requestId: "flush-1" },
+    };
+    expect(WSInboundMessageSchema.parse(request)).toEqual(request);
+    expect(
+      WSInboundMessageSchema.safeParse({
+        ...request,
+        message: { ...request.message, agentId: null },
+      }).success,
+    ).toBe(false);
+
+    const response = {
+      type: "session",
+      message: {
+        type: "agent.inbox.flush.response",
+        payload: { agentId: "parent", requestId: "flush-1", success: true, error: null },
+      },
+    };
+    expect(validateWSOutboundMessage(response)).toEqual({ success: true, data: response });
+    expect(
+      validateWSOutboundMessage({
+        ...response,
+        message: {
+          ...response.message,
+          payload: { ...response.message.payload, error: undefined },
+        },
+      }).success,
+    ).toBe(false);
+  });
+
+  it.each([undefined, "completed", "blocked", "invalid"])(
+    "validates agent message provenance with report status %s on timeline events",
+    (reportStatus) => {
+      const envelope = {
+        type: "session",
+        message: {
+          type: "agent_stream",
+          payload: {
+            agentId: "parent",
+            timestamp: "2026-11-23T00:00:00.000Z",
+            event: {
+              type: "timeline",
+              provider: "claude",
+              item: {
+                type: "tool_call",
+                name: "send_agent_message",
+                callId: "report-1",
+                status: "completed",
+                error: null,
+                detail: { type: "plain_text", text: "Report" },
+                agentMessage: {
+                  event: "finished",
+                  sender: { id: "child" },
+                  text: "Report",
+                  ...(reportStatus === undefined ? {} : { reportStatus }),
+                },
+              },
+            },
+          },
+        },
+      };
+      const result = validateWSOutboundMessage(envelope);
+      if (reportStatus === "invalid") expect(result.success).toBe(false);
+      else expect(result).toEqual({ success: true, data: envelope });
+    },
+  );
+
   it("accepts hosts with or without the Main Control system prompt capability", () => {
     const payload = { status: "server_info", serverId: "host", features: { agentProfiles: true } };
     expect(parseServerInfoStatusPayload(payload)?.features).toEqual({ agentProfiles: true });
@@ -443,7 +512,27 @@ const SourceSchema = z.object({
     ]);
   });
 
-  it("applies defaults from the matching session message schema", () => {
+  it.each([
+    { name: "a legacy agent", inbox: {} },
+    {
+      name: "an agent with a pending subagent inbox",
+      inbox: {
+        pendingSubagentInbox: {
+          count: 2,
+          items: [
+            { agentId: "child-1", event: "message" },
+            {
+              agentId: "child-2",
+              serverId: "host-2",
+              title: "Remote child",
+              event: "finished",
+              reportStatus: "blocked",
+            },
+          ],
+        },
+      },
+    },
+  ])("validates $name in an agent broadcast and applies defaults", ({ inbox }) => {
     const envelope = {
       type: "session",
       message: {
@@ -472,6 +561,7 @@ const SourceSchema = z.object({
             pendingPermissions: [],
             persistence: { provider: "claude", sessionId: "session-1" },
             title: "Agent",
+            ...inbox,
           },
         },
       },
@@ -483,7 +573,9 @@ const SourceSchema = z.object({
     expect(expected.success).toBe(true);
     expect(result).toEqual(expected);
     expect(result.success && result.data).toMatchObject({
-      message: { payload: { agent: { capabilities: { supportsRewindConversation: false } } } },
+      message: {
+        payload: { agent: { capabilities: { supportsRewindConversation: false }, ...inbox } },
+      },
     });
   });
 });

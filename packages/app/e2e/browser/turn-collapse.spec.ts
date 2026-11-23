@@ -245,7 +245,7 @@ export default function contribute(client) {
   });
 });
 
-test("received messages show their sender and open that agent", async ({ page }) => {
+test("received messages show their source status and open that agent", async ({ page }) => {
   await page.addInitScript(() =>
     localStorage.setItem("@paseo:app-settings", JSON.stringify({ theme: "dark" })),
   );
@@ -269,26 +269,27 @@ test("received messages show their sender and open that agent", async ({ page })
     );
     await openAgentRoute(page, recipient);
     await expectComposerVisible(page);
-    const attribution = page.getByRole("button", { name: "Sent by Reviewer", exact: true });
-    await expect(attribution).toBeVisible();
-    await expect(page.getByTestId("user-message").filter({ has: attribution })).toContainText(
-      "I reviewed the turn-grouping changes.",
-    );
-    const labelColor = await attribution
-      .getByText("Sent by Reviewer", { exact: true })
+    const sourceTag = page
+      .getByTestId("agent-source-tag")
+      .filter({ hasText: "Reviewer · Message" });
+    await expect(sourceTag).toBeVisible();
+    const bubble = page.getByTestId("user-message-bubble").filter({ hasText: "I reviewed" });
+    await expect(bubble).toContainText("I reviewed the turn-grouping changes.");
+    const labelColor = await sourceTag
+      .getByText("Reviewer · Message", { exact: true })
       .evaluate((element) => getComputedStyle(element).color);
-    await expect(attribution.locator("svg")).toHaveCSS("fill", labelColor);
-    await expectSenderAlignedWithBubble(attribution);
-    await attribution.scrollIntoViewIfNeeded();
-    await page.screenshot({ path: "/tmp/sender-attribution.png" });
-    await attribution.click();
+    await expect(sourceTag.locator("svg")).toHaveCSS("stroke", labelColor);
+    await expectSenderAlignedWithBubble(sourceTag, bubble);
+    await sourceTag.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: "/tmp/source-header.png" });
+    await sourceTag.click();
     await expect.poll(() => getActiveTabTestId(page)).toContain(sender.id);
   } finally {
     await recipient.cleanup();
   }
 });
 
-test("long sender attribution stays on one line in compact chat", async ({ page }, testInfo) => {
+test("long source headers stay on one line in compact chat", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.addInitScript(() =>
     localStorage.setItem("@paseo:app-settings", JSON.stringify({ theme: "dark" })),
@@ -314,16 +315,17 @@ test("long sender attribution stays on one line in compact chat", async ({ page 
     );
     await openAgentRoute(page, recipient);
     await expectComposerVisible(page);
-    const attribution = page.getByRole("button", { name: `Sent by ${title}`, exact: true });
-    await expect(attribution).toBeVisible();
-    await expectSenderTruncatedWithinMessage(attribution, title);
-    await expectSenderAlignedWithBubble(attribution);
-    await attribution.scrollIntoViewIfNeeded();
-    await page.screenshot({ path: testInfo.outputPath("sender-compact-390.png") });
+    const sourceTag = page.getByTestId("agent-source-tag").filter({ hasText: "Message" });
+    await expect(sourceTag).toBeVisible();
+    const bubble = page.getByTestId("user-message-bubble").filter({ hasText: "The sender label" });
+    await expectSourceTagOnOneLine(sourceTag, title);
+    await expectSenderAlignedWithBubble(sourceTag, bubble);
+    await sourceTag.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath("source-compact-390.png") });
     await page.setViewportSize({ width: 320, height: 740 });
-    await expectSenderTruncatedWithinMessage(attribution, title);
-    await expectSenderAlignedWithBubble(attribution);
-    await page.screenshot({ path: testInfo.outputPath("sender-compact-320.png") });
+    await expectSourceTagOnOneLine(sourceTag, title);
+    await expectSenderAlignedWithBubble(sourceTag, bubble);
+    await page.screenshot({ path: testInfo.outputPath("source-compact-320.png") });
   } finally {
     await recipient.cleanup();
   }
@@ -426,10 +428,13 @@ test("opening a turn keeps the received message above it clipped on every frame"
     });
     const bubble = page
       .getByTestId("user-message")
-      .filter({ has: page.getByRole("button", { name: "Sent by Reviewer", exact: true }) });
+      .filter({ hasText: "Review complete: the regression is red" });
     await expect(bubble.getByRole("button", { name: "Show more", exact: true })).toBeVisible();
 
-    await watchReceivedMessagePreview(page, "Sent by Reviewer");
+    await expect(
+      page.getByTestId("agent-source-tag").filter({ hasText: "Reviewer · Message" }),
+    ).toBeVisible();
+    await watchReceivedMessagePreview(page, "Review complete:");
     await page
       .getByTestId("turn-summary")
       .getByRole("button", { name: "Ran 7 commands", exact: true })
@@ -441,34 +446,32 @@ test("opening a turn keeps the received message above it clipped on every frame"
   }
 });
 
-async function expectSenderTruncatedWithinMessage(attribution: Locator, title: string) {
-  const label = attribution.getByText(`Sent by ${title}`, { exact: true });
+async function expectSourceTagOnOneLine(sourceTag: Locator, title: string) {
+  const visibleTitle = `${title.slice(0, 25)}…`;
+  const label = sourceTag.getByText(`${visibleTitle} · Message`, { exact: true });
+  await expect(sourceTag).toHaveAccessibleName(`${title}, Message`);
   await expect(label).toHaveCSS("white-space", "nowrap");
   await expect(label).toHaveCSS("text-overflow", "ellipsis");
   const bounds = await label.evaluate((element) => ({
-    textWidth: element.scrollWidth,
-    visibleWidth: element.clientWidth,
     right: element.getBoundingClientRect().right,
     viewportWidth: document.documentElement.clientWidth,
   }));
-  expect(bounds.textWidth).toBeGreaterThan(bounds.visibleWidth);
   expect(bounds.right).toBeLessThanOrEqual(bounds.viewportWidth);
 }
 
-async function expectSenderAlignedWithBubble(attribution: Locator) {
-  const edges = await attribution.evaluate((button) => {
-    const bubble = button.nextElementSibling;
-    const label = button.querySelector('[dir="auto"]');
-    if (!bubble || !label) throw new Error("Sender label or message bubble missing");
-    return {
-      labelRight: label.getBoundingClientRect().right,
-      bubbleRight: bubble.getBoundingClientRect().right,
-    };
-  });
-  expect(
-    Math.abs(edges.labelRight - edges.bubbleRight),
-    "sender and bubble share the right edge",
-  ).toBeLessThanOrEqual(1);
+async function expectSenderAlignedWithBubble(sourceTag: Locator, bubble: Locator) {
+  await expect
+    .poll(
+      async () => {
+        const labelRight = await sourceTag
+          .locator('[dir="auto"]')
+          .evaluate((label) => label.getBoundingClientRect().right);
+        const bubbleRight = await bubble.evaluate((body) => body.getBoundingClientRect().right);
+        return Math.abs(labelRight - bubbleRight);
+      },
+      { message: "sender and bubble share the right edge" },
+    )
+    .toBeLessThanOrEqual(1);
 }
 
 async function seedWholeTurnHistory() {

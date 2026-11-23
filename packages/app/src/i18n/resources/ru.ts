@@ -266,6 +266,23 @@ export const ru: TranslationResources = {
     empty: "Начните общаться с этим агентом...",
     scrollToBottom: "Прокрутить вниз",
     historyLoadFailed: "Не удалось загрузить историю агента",
+    inbox: {
+      pending: "Ожидающих отчётов: {{count}}",
+      flush: "Суммировать сейчас",
+      flushing: "Суммирование…",
+      failed: "Не удалось суммировать отчёты. Повторите попытку.",
+    },
+    source: {
+      status: {
+        message: "Сообщение",
+        finished: "Завершено",
+        completed: "Выполнено",
+        blocked: "Заблокировано",
+        error: "Ошибка",
+        permission: "Нужно разрешение",
+        closed: "Закрыто",
+      },
+    },
     messageCapped: "Это сообщение было обрезано ({{bytes}} байт).",
     quote: {
       action: "Цитировать",

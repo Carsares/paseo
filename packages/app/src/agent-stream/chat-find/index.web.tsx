@@ -91,6 +91,7 @@ export function ChatFind({
             query,
             cursor,
             hideAgentInteractions: !showInteractions.current,
+            includeAgentSourceBodies: !showInteractions.current || undefined,
           });
         },
         load(targetEpoch, seq) {
@@ -111,8 +112,8 @@ export function ChatFind({
   );
   const state = useSyncExternalStore(model.subscribe, model.getSnapshot, model.getSnapshot);
   useEffect(() => {
-    model.updateHistory(epoch, items);
-  }, [model, epoch, items]);
+    model.updateHistory(epoch, items, !showAgentInteractions);
+  }, [model, epoch, items, showAgentInteractions]);
   useLayoutEffect(() => {
     showInteractions.current = showAgentInteractions;
     return () => model.close();

@@ -2,6 +2,8 @@ import { afterEach, expect, it } from "vitest";
 import { createFindViewport } from "./viewport.web";
 import type { ChatFindProps } from "./types";
 import type { StreamViewportHandle } from "../strategy";
+import { createStreamPresentation } from "../presentation";
+import type { ToolCallItem } from "@/types/stream";
 
 interface Capture {
   occurrence?: { signal: AbortSignal; targetTop(): number | null };
@@ -120,4 +122,69 @@ it("waits for an asynchronous renderer before counting its matches", async () =>
   content.textContent = "needle and another needle";
   content.removeAttribute("aria-busy");
   expect(await reveal).toEqual({ occurrence: 0, count: 2 });
+});
+
+it("opens a settled source block and highlights the exact occurrence in its second report", async () => {
+  const items = ["reviewer", "tester"].map(
+    (id): ToolCallItem => ({
+      kind: "tool_call",
+      id,
+      timestamp: new Date(0),
+      turnId: "reports",
+      payload: {
+        source: "agent",
+        data: {
+          provider: "codex",
+          callId: id,
+          name: "agent_message",
+          status: "completed",
+          error: null,
+          detail: { type: "unknown", input: null, output: null },
+          agentMessage: {
+            event: "message",
+            reportStatus: "completed",
+            sender: { id },
+            text: `Report from ${id}, containing a needle.`,
+          },
+        },
+      },
+    }),
+  );
+  const present = createStreamPresentation();
+  const input = {
+    tail: items,
+    head: [],
+    transform: undefined,
+    display: "collapseTurns" as const,
+    isTurnActive: false,
+  };
+  let projected = present({ ...input, expandedTurnHostIds: new Set() });
+  expect(projected.tail.map((item) => item.id)).toEqual(["turn-summary:reviewer"]);
+  const viewportRef = { current: null };
+  const root = document.createElement("div");
+  document.body.append(root);
+  const find = createFindViewport({
+    getBindings: () => ({
+      viewportRef,
+      visibleMessageIds: new Set(projected.tail.map((item) => item.id)),
+      revealLoadedMessage(messageId) {
+        const host = projected.turns.hostIdByFoldedMessageId.get(messageId);
+        if (!host) return false;
+        projected = present({ ...input, expandedTurnHostIds: new Set([host]) });
+        for (const item of projected.tail) {
+          if (item.kind !== "user_message") continue;
+          const message = transcript(item.id, [item.text]);
+          root.append(...message.children);
+          message.remove();
+        }
+        return true;
+      },
+    }),
+    getRoot: () => root,
+    highlightName: "paseo-chat-find-test",
+  });
+  const found = await find.reveal("tester", "needle", 0, new AbortController().signal);
+  expect(found).toEqual({ occurrence: 0, count: 1 });
+  expect(highlightedText()).toEqual(["needle"]);
+  expect(highlightedRow()).toBe("tester:block:0");
 });

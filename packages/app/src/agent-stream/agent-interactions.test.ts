@@ -51,20 +51,24 @@ function ids(rows: StreamItem[]) {
 describe("agent interaction projection", () => {
   it("defaults to hidden when an older configuration omits the setting", () => {
     const result = createAgentInteractionProjection()({ tail: [message("notice")], head: [] });
-    expect(result.tail).toEqual([]);
-    expect(result.hiddenItemIds.has("notice")).toBe(true);
+    expect(ids(result.tail)).toEqual(["notice"]);
+    expect(result.hiddenItemIds.has("notice")).toBe(false);
   });
 
-  it("preserves visible array references through hidden-only live updates", () => {
+  it("revises visible source events when their status changes", () => {
     const tail = [assistant("history", "history")];
     const present = createAgentInteractionProjection();
     const first = present({ tail, head: [message("notice")] });
     const next = present({ tail, head: [message("notice", "finished")] });
     expect(next.tail).toBe(first.tail);
-    expect(next.head).toBe(first.head);
+    expect(next.head).not.toBe(first.head);
+    expect(next.head[0]).toMatchObject({
+      id: "notice",
+      payload: { data: { agentMessage: { event: "finished" } } },
+    });
   });
 
-  it("hides dispatch, wait, replies and all lifecycle notifications without summary rows", () => {
+  it("hides orchestration tools while retaining source messages and lifecycle boundaries", () => {
     const human: StreamItem = { kind: "user_message", id: "human", text: "start", timestamp };
     const tail = [
       human,
@@ -79,32 +83,32 @@ describe("agent interaction projection", () => {
     ];
     const head = [assistant("summary", "Here is my summary", "summary")];
     const result = project(tail, head);
-    expect(ids(result.tail)).toEqual(["human", "intro"]);
-    expect(result.head).toBe(head);
-    expect([...result.hiddenItemIds]).toEqual([
-      "dispatch",
-      "wait",
+    expect(ids(result.tail)).toEqual([
+      "human",
+      "intro",
       "reply",
       "finish",
       "failure",
       "permission",
       "closed",
     ]);
-    expect(result.readingRowReplacements.get("failure")).toBe("intro");
+    expect(result.head).toBe(head);
+    expect([...result.hiddenItemIds]).toEqual(["dispatch", "wait"]);
+    expect(result.readingRowReplacements.get("dispatch")).toBe("intro");
   });
 
   it("restores original arrays and objects when enabled, including after switching back", () => {
     const tail = [assistant("a", "before"), message("notice")];
     const head = [assistant("b", "after")];
     const present = createAgentInteractionProjection();
-    expect(present({ tail, head, showAgentInteractions: false }).head[0].id).toBe("a");
+    expect(present({ tail, head, showAgentInteractions: false }).head[0].id).toBe("b");
     const shown = present({ tail, head, showAgentInteractions: true });
     expect(shown.tail).toBe(tail);
     expect(shown.head).toBe(head);
     expect(shown.hiddenItemIds.size).toBe(0);
     expect(shown.readingRowReplacements.size).toBe(0);
     expect(present({ tail, head, showAgentInteractions: false }).head[0]).toEqual(
-      assistant("a", "beforeafter"),
+      assistant("b", "after"),
     );
   });
 
@@ -225,10 +229,10 @@ describe("agent interaction projection", () => {
   it.each([
     ["| Name | Value |\n| --- | --- |\n", "| A | B |\n"],
     ["```ts\nconst answer = ", "42;\n```"],
-  ])("rejoins Markdown exactly without injecting whitespace", (before, after) => {
+  ])("keeps Markdown fragments apart around a visible source message", (before, after) => {
     const result = project([assistant("a", before), message("notice"), assistant("b", after)]);
-    expect(result.tail).toEqual([assistant("a", before + after)]);
-    expect(result.readingRowReplacements.get("b")).toBe("a");
+    expect(result.tail).toEqual([assistant("a", before), message("notice"), assistant("b", after)]);
+    expect(result.readingRowReplacements.get("b")).toBeUndefined();
     expect(result.hiddenItemIds.has("b")).toBe(false);
   });
 
@@ -240,7 +244,9 @@ describe("agent interaction projection", () => {
       const second = assistant("b", "second");
       expect(project([first, message("one"), boundary, message("two"), second]).tail).toEqual([
         first,
+        message("one"),
         boundary,
+        message("two"),
         second,
       ]);
     }
@@ -253,13 +259,17 @@ describe("agent interaction projection", () => {
     const missingTurn = { ...assistant("b", "second"), turnId: undefined };
     const missingMessage = { ...assistant("b", "second"), messageId: undefined };
     for (const second of [differentTurn, differentMessage, missingTurn, missingMessage]) {
-      expect(project([first, message("notice"), second]).tail).toEqual([first, second]);
+      expect(project([first, message("notice"), second]).tail).toEqual([
+        first,
+        message("notice"),
+        second,
+      ]);
     }
     const second = assistant("b", "second");
     expect(project([first, second]).tail).toEqual([first, second]);
     expect(
       project([{ ...first, turnId: undefined }, message("notice"), missingTurn]).tail,
-    ).toHaveLength(2);
+    ).toHaveLength(3);
   });
 
   it.each([1, 2, 3, 4, 5])(
@@ -279,39 +289,36 @@ describe("agent interaction projection", () => {
       Object.freeze(head);
       for (const item of source) Object.freeze(item);
       const result = project(tail, head);
-      expect([...result.tail, ...result.head]).toEqual([assistant("a", "ABC")]);
-      expect([...result.readingRowReplacements]).toEqual(
-        expect.arrayContaining([
-          ["one", "a"],
-          ["two", "a"],
-          ["b", "a"],
-          ["c", "a"],
-        ]),
-      );
+      expect([...result.tail, ...result.head]).toEqual([
+        assistant("a", "A"),
+        message("one"),
+        assistant("b", "B"),
+        message("two"),
+        assistant("c", "C"),
+      ]);
+      expect(result.readingRowReplacements.size).toBe(0);
       expect(source).toEqual(original);
     },
   );
 
-  it("keeps the first id and ending cursor so search can locate every merged fragment", () => {
+  it("keeps source messages as boundaries for Markdown search", () => {
     const first = { ...assistant("a", "A"), timelineCursor: { epoch: "epoch", seq: 1 } };
     const second = { ...assistant("b", "B"), timelineCursor: { epoch: "epoch", seq: 3 } };
     const result = project([first, message("notice")], [second]);
-    expect(result.head[0]).toEqual({ ...first, text: "AB", timelineCursor: second.timelineCursor });
-    expect(project([first, message("notice"), assistant("b", "B")]).tail[0]).toEqual({
-      ...first,
-      text: "AB",
-    });
+    expect(result.head[0]).toEqual(second);
+    expect(project([first, message("notice"), assistant("b", "B")]).tail).toEqual([
+      first,
+      message("notice"),
+      assistant("b", "B"),
+    ]);
   });
 
   it("resolves leading and all-hidden rows to a visible neighbor when one exists", () => {
     const head = [message("live-notice"), assistant("a", "answer")];
     const result = project([message("old-notice")], head);
-    expect(result.readingRowReplacements.get("old-notice")).toBe("a");
-    expect(result.readingRowReplacements.get("live-notice")).toBe("a");
+    expect(result.readingRowReplacements.size).toBe(0);
     expect(project([message("only")]).readingRowReplacements.size).toBe(0);
-    expect(
-      project([message("first"), assistant("a", "A")]).readingRowReplacements.get("first"),
-    ).toBe("a");
+    expect(project([message("first"), assistant("a", "A")]).readingRowReplacements.size).toBe(0);
   });
 
   it("caches unchanged inputs and retains history arrays during cross-boundary streaming", () => {
@@ -322,20 +329,17 @@ describe("agent interaction projection", () => {
     const input = { tail, head, showAgentInteractions: false };
     const first = present(input);
     expect(present(input)).toBe(first);
-    expect(first.tail).toEqual([retained]);
+    expect(first.tail).toEqual([retained, assistant("a", "```ts\n"), message("notice")]);
     const grown = present({
       ...input,
       head: [assistant("b", "const value = 42;\n```"), message("done")],
     });
     expect(grown.tail).toBe(first.tail);
-    expect(grown.head).toEqual([assistant("a", "```ts\nconst value = 42;\n```")]);
-    expect(grown.readingRowReplacements.get("done")).toBe("a");
-    expect(grown.readingRowReplacements.get("b")).toBe("a");
-    expect([...grown.hiddenItemIds]).toEqual(["notice", "done"]);
-    expect(grown.hiddenItemIds.size).toBe(2);
-    expect(grown.readingRowReplacements.size).toBe(3);
+    expect(grown.head).toEqual([assistant("b", "const value = 42;\n```"), message("done")]);
+    expect(grown.hiddenItemIds.size).toBe(0);
+    expect(grown.readingRowReplacements.size).toBe(0);
     // Previously returned projections remain immutable snapshots.
-    expect(first.head).toEqual([assistant("a", "```ts\nconst value")]);
+    expect(first.head).toEqual([assistant("b", "const value")]);
     expect(first.readingRowReplacements.has("done")).toBe(false);
   });
 

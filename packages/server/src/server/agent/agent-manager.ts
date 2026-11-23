@@ -5336,6 +5336,17 @@ export class AgentManager {
     this.emitState(agent);
   }
 
+  async notifyAgentInboxChanged(agentId: string): Promise<void> {
+    const stored = await this.registry?.get(agentId);
+    if (stored?.archivedAt) return;
+    const live = this.agents.get(agentId);
+    if (live && !live.internal) {
+      this.dispatch({ type: "agent_state", agent: { ...live } });
+    } else if (stored && !stored.internal) {
+      this.dispatchStoredAgentState(stored);
+    }
+  }
+
   async clearAgentAttention(agentId: string): Promise<void> {
     return this.runLifecycleMutation(agentId, () => this.clearAgentAttentionUnlocked(agentId));
   }

@@ -21,9 +21,11 @@ import {
   type FinishSubscription,
   type FinishSubscriptions,
 } from "./agent/finish-subscriptions/index.js";
+import { decodeParentReportIdentity } from "./agent/finish-subscriptions/report-identity.js";
 import {
   getParentAddressFromLabels,
   isExplicitParentReportingLabels,
+  isMainControlAgentLabels,
 } from "@getpaseo/protocol/agent-labels";
 import { registerParentFinishSubscription } from "./agent/create-agent/create.js";
 import { HOST_ROUTE_OPCODE } from "@getpaseo/protocol/binary-frames/index";
@@ -651,6 +653,9 @@ export class VoiceAssistantWebSocketServer {
   private readonly messageReceipts: MessageReceipts;
   private readonly parentReportReceipts: MessageReceipts;
   readonly agentMessages: ReturnType<typeof createAgentMessageDelivery>;
+  private readonly remoteInboxChildren = new Map<string, Set<string>>();
+  private readonly remoteFinishedSupersessions = new Set<string>();
+  private readonly parentReportSockets = new Map<string, VirtualHostSocket>();
   private readonly creationService: CreationService;
   private readonly projectRegistry: ProjectRegistry;
   private readonly workspaceRegistry: WorkspaceRegistry;
@@ -808,6 +813,26 @@ export class VoiceAssistantWebSocketServer {
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
     this.agentMessages = createAgentMessageDelivery({
+      shouldHoldInbox: (parentId, source) => {
+        const live = agentManager.getAgent(parentId);
+        if (live && !isMainControlAgentLabels(live.labels)) return false;
+        for (const child of agentManager.listAgents()) {
+          if (source?.agentId === child.id && (source.serverId ?? serverId) === serverId) continue;
+          if (child.lifecycle !== "initializing" && !agentManager.hasInFlightRun(child.id))
+            continue;
+          const parent = getParentAddressFromLabels(child.labels, serverId);
+          if (parent?.agentId === parentId && parent.serverId === serverId) return true;
+        }
+        return [...(this.remoteInboxChildren.get(parentId) ?? [])].some(
+          (id) => id !== JSON.stringify([source?.serverId ?? serverId, source?.agentId]),
+        );
+      },
+      onInboxChange: (agentId) => {
+        void agentManager.notifyAgentInboxChanged(agentId).catch((err) => {
+          this.logger.warn({ err, agentId }, "Failed to publish subagent inbox update");
+        });
+      },
+      classifyInbox: (parentId, source) => this.classifySubagentInbox(parentId, source),
       tryRunOutOfBand: (request, onAccepted, commandDispatch) =>
         agentManager.tryRunOutOfBand(
           request.recipientId,
@@ -822,7 +847,9 @@ export class VoiceAssistantWebSocketServer {
       subscribe: (notify) =>
         agentManager.subscribe(
           (event) => {
-            if (event.type === "agent_state") notify(event.agent.id);
+            if (event.type === "agent_state")
+              notify(event.agent.id, !isMainControlAgentLabels(event.agent.labels));
+            if (event.type === "agent_removed") notify(event.agentId, true);
           },
           { replayState: false },
         ),
@@ -909,6 +936,20 @@ export class VoiceAssistantWebSocketServer {
           "Agent message batch dispatch failed",
         ),
     });
+    this.agentMessages.observeRemoteChild = (parentId, childServerId, childId, active) => {
+      const children = this.remoteInboxChildren.get(parentId) ?? new Set<string>();
+      const key = JSON.stringify([childServerId, childId]);
+      if (active) {
+        children.add(key);
+        this.remoteInboxChildren.set(parentId, children);
+      } else {
+        children.delete(key);
+        if (!children.size) this.remoteInboxChildren.delete(parentId);
+      }
+      this.agentMessages.refreshInbox?.();
+    };
+    this.agentMessages.isRemoteFinishSuperseded = (address, messageId) =>
+      this.isRemoteFinishedSuperseded(address, messageId);
     const receiptStores = resolveAgentMessageReceiptStores(paseoHome, wsConfig.messageReceipts);
     this.messageReceipts = receiptStores.messages;
     this.parentReportReceipts = receiptStores.parentReports;
@@ -2460,6 +2501,7 @@ export class VoiceAssistantWebSocketServer {
         canonicalSubmittedPrompts: true,
         agentMessageProvenance: true,
         agentMessageBatching: true,
+        subagentInbox: this.finishSubscriptions !== undefined,
         agentMessageDispatchConfirmation: true,
         // COMPAT(agentNotificationEvents): added in v0.16.0, remove after 2027-05-19.
         agentNotificationEvents: true,
@@ -3083,6 +3125,22 @@ export class VoiceAssistantWebSocketServer {
     }
   }
 
+  private async classifySubagentInbox(
+    parentId: string,
+    source: Parameters<
+      NonNullable<VoiceAssistantWebSocketServer["agentMessages"]["classifyInbox"]>
+    >[1],
+  ): Promise<"ordinary" | "urgent" | undefined> {
+    const stored = await this.agentStorage.get(parentId);
+    const live = this.agentManager.getAgent(parentId);
+    if (stored?.archivedAt || !isMainControlAgentLabels(live?.labels ?? stored?.labels))
+      return undefined;
+    if (source.kind === "agent-message")
+      return source.reportStatus === "blocked" ? "urgent" : "ordinary";
+    if (source.event === "permission-required" || source.event === "errored") return "urgent";
+    return source.event === "finished" ? "ordinary" : undefined;
+  }
+
   private async assertCurrentReportParent(
     record: Pick<FinishSubscription, "callerAgentId" | "childAgentId" | "serverId">,
   ): Promise<void> {
@@ -3106,6 +3164,8 @@ export class VoiceAssistantWebSocketServer {
         hasFinalSnapshot?: boolean;
       },
   ): Promise<void> {
+    if (record.serverId && record.id && this.isRemoteFinishedSuperseded(record, record.id))
+      throw new ParentReportRecipientUnavailableError("Child already reported this result.");
     if (record.id && isAutomaticLocalParentSubscription({ ...record, id: record.id })) {
       const migratedParent = await this.agentManager.convergeLegacyParentReporting(
         record.childAgentId,
@@ -3142,6 +3202,39 @@ export class VoiceAssistantWebSocketServer {
     if (record.hasFinalSnapshot !== false) await this.assertCurrentReportParent(record);
   }
 
+  private isRemoteFinishedSuperseded(
+    record: Pick<FinishSubscription, "callerAgentId" | "childAgentId" | "serverId">,
+    reportId: string,
+  ): boolean {
+    return this.remoteFinishedSupersessions.has(
+      JSON.stringify([record.callerAgentId, record.serverId, record.childAgentId, reportId]),
+    );
+  }
+
+  private async applyRemoteReportSupersession(
+    record: FinishSubscription,
+    reportId: string,
+  ): Promise<void> {
+    if (!record.serverId) return;
+    const { turnId, finishedIds } = decodeParentReportIdentity(reportId);
+    if (turnId) await this.finishSubscriptions?.suppressRemoteFinished?.(record, turnId);
+    for (const id of finishedIds) {
+      this.remoteFinishedSupersessions.add(
+        JSON.stringify([record.callerAgentId, record.serverId, record.childAgentId, id]),
+      );
+      this.agentMessages.withdrawInboxReport?.(record.callerAgentId, id, {
+        kind: "agent-notification",
+        agentId: record.childAgentId,
+        serverId: record.serverId,
+        event: "finished",
+      });
+    }
+    while (this.remoteFinishedSupersessions.size > 4096)
+      this.remoteFinishedSupersessions.delete(
+        this.remoteFinishedSupersessions.values().next().value!,
+      );
+  }
+
   async dispatchFinishReport(
     record: FinishSubscription,
     report: AgentFinishReport,
@@ -3157,15 +3250,42 @@ export class VoiceAssistantWebSocketServer {
     const messageId = explicit
       ? JSON.stringify([childServerId, record.childAgentId, report.id])
       : report.id;
+    const assertNotSuperseded = () => {
+      if (
+        !explicit &&
+        report.event === "finished" &&
+        (this.finishSubscriptions?.isFinishedSuppressed?.(record.id) ||
+          (record.serverId && this.isRemoteFinishedSuperseded(record, report.id)))
+      )
+        throw new ParentReportRecipientUnavailableError("Child already reported this result.");
+    };
     const validateDispatch =
       explicit || record.requireParentOwnership
         ? async () => {
             if (options.confirmBeforeDispatch)
               await this.assertParentReportRecipientAvailable(record.callerAgentId);
+            else if (!explicit && isAutomaticLocalParentSubscription(record))
+              await this.validateFinishSubscriptionParent(record);
             else await this.assertCurrentReportParent(record);
+            assertNotSuperseded();
           }
         : undefined;
     const receipts = explicit ? this.parentReportReceipts : this.messageReceipts;
+    const source = explicit
+      ? ({
+          kind: "agent-message",
+          agentId: record.childAgentId,
+          serverId: childServerId,
+          title: report.title,
+          reportStatus: report.parentReportStatus,
+        } as const)
+      : ({
+          kind: "agent-notification",
+          agentId: record.childAgentId,
+          serverId: record.serverId,
+          title: report.title,
+          event: report.event,
+        } as const);
     await receipts.send({
       agentId: record.callerAgentId,
       messageId,
@@ -3184,25 +3304,23 @@ export class VoiceAssistantWebSocketServer {
       },
       send: async (beforeProviderDispatch, declined, onProviderOutcome) => {
         await validateDispatch?.();
+        if (options.confirmBeforeDispatch) await options.confirmBeforeDispatch();
+        if (explicit && record.serverId)
+          await this.applyRemoteReportSupersession(record, report.id);
+        const subagentInbox =
+          explicit ||
+          (record.requireParentOwnership &&
+            (report.event !== "finished" || !report.id.startsWith("requested-parent:")))
+            ? await this.classifySubagentInbox(record.callerAgentId, source)
+            : undefined;
+        assertNotSuperseded();
         const receipt = this.agentMessages.enqueue({
           recipientId: record.callerAgentId,
           messageId,
           prompt: report.prompt,
           childReported: explicit,
-          source: explicit
-            ? {
-                kind: "agent-message",
-                agentId: record.childAgentId,
-                serverId: childServerId,
-                title: report.title,
-              }
-            : {
-                kind: "agent-notification",
-                agentId: record.childAgentId,
-                serverId: record.serverId,
-                title: report.title,
-                event: report.event,
-              },
+          source,
+          subagentInbox,
           validateDispatch,
           activeTurnBehavior: "steer",
           unarchive: false,
@@ -3256,22 +3374,31 @@ export class VoiceAssistantWebSocketServer {
       id: request.report.id,
       childAgentId: request.childAgentId,
       callerAgentId: request.parentAgentId,
-      callerServerId: this.serverId,
       serverId: directParent.serverId,
       requireParentOwnership: true,
     };
+    const routeKey = JSON.stringify([
+      record.callerAgentId,
+      directParent.serverId,
+      record.childAgentId,
+      request.report.id,
+    ]);
+    this.parentReportSockets.set(routeKey, ws);
     try {
       await this.dispatchFinishReport(record, request.report, {
         childServerId: directParent.serverId,
-        confirmBeforeDispatch: () =>
-          this.requestParentReportConfirmation(ws, {
+        confirmBeforeDispatch: async () => {
+          const socket = this.parentReportSockets.get(routeKey);
+          if (!socket) throw new ParentReportConfirmationUnavailableError();
+          await this.requestParentReportConfirmation(socket, {
             type: "agent.finish_reports.confirm.request",
             requestId: randomUUID(),
             childAgentId: request.childAgentId,
             parentAgentId: request.parentAgentId,
             parentServerId: this.serverId,
             reportId: request.report.id,
-          }),
+          });
+        },
       });
     } catch (error) {
       if (!(error instanceof ParentReportRecipientUnavailableError)) throw error;
@@ -3284,6 +3411,8 @@ export class VoiceAssistantWebSocketServer {
         },
       });
       return;
+    } finally {
+      if (this.parentReportSockets.get(routeKey) === ws) this.parentReportSockets.delete(routeKey);
     }
     session.delivery.reply({
       type: "agent.finish_reports.push.response",

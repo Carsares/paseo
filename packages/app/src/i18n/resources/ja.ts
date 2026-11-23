@@ -266,6 +266,23 @@ export const ja: TranslationResources = {
     empty: "このエージェントとチャットを始めましょう...",
     scrollToBottom: "下にスクロール",
     historyLoadFailed: "エージェントの履歴を読み込めませんでした",
+    inbox: {
+      pending: "保留中のレポート {{count}} 件",
+      flush: "今すぐ要約",
+      flushing: "要約中…",
+      failed: "レポートを要約できませんでした。再試行してください。",
+    },
+    source: {
+      status: {
+        message: "メッセージ",
+        finished: "終了",
+        completed: "完了",
+        blocked: "ブロック済み",
+        error: "エラー",
+        permission: "権限が必要",
+        closed: "終了済み",
+      },
+    },
     messageCapped: "このメッセージは上限で切り詰められました（{{bytes}}バイト）。",
     quote: {
       action: "引用",

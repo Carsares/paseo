@@ -267,6 +267,23 @@ export const fr: TranslationResources = {
     empty: "Commencez à discuter avec cet agent…",
     scrollToBottom: "Faire défiler vers le bas",
     historyLoadFailed: "Impossible de charger l’historique de l’agent",
+    inbox: {
+      pending: "{{count}} rapports en attente",
+      flush: "Résumer maintenant",
+      flushing: "Résumé en cours…",
+      failed: "Impossible de résumer les rapports. Réessayez.",
+    },
+    source: {
+      status: {
+        message: "Message",
+        finished: "Terminé",
+        completed: "Achevé",
+        blocked: "Bloqué",
+        error: "Erreur",
+        permission: "Autorisation requise",
+        closed: "Fermé",
+      },
+    },
     messageCapped: "Ce message a été tronqué ({{bytes}} octets).",
     quote: {
       action: "Citer",

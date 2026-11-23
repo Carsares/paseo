@@ -12,7 +12,14 @@ import {
 import { getStreamItemMessageId, type StreamItem, type UserMessageItem } from "@/types/stream";
 import { collapseTurns, type TurnCollapse } from "./turn-collapse/model";
 import type { ReadingRowReplacements } from "./reading-anchor";
-import { createAgentInteractionProjection, type HiddenItemIds } from "./agent-interactions";
+import {
+  createAgentInteractionProjection,
+  createAgentSourceGrouping,
+  getAgentMessage,
+  setAgentSourcePresentation,
+  type AgentSourceGroup,
+  type HiddenItemIds,
+} from "./agent-interactions";
 
 interface PresentationInput {
   tail: StreamItem[];
@@ -118,6 +125,22 @@ function readingRowReplacements(input: ReadingProjectionInput): ReadingRowReplac
   };
 }
 
+function latestRetainedTurnIsOpen(
+  projection: ToolCallDetailProjection,
+  input: PresentationInput,
+): boolean {
+  const last = projection.tail.at(-1) ?? null;
+  const first = projection.head[0] ?? null;
+  // Without head rows, the latest retained turn is live only while the active run is that
+  // turn. A run that has not opened yet carries no id and belongs to the next turn.
+  if (!first) {
+    return input.isTurnActive && (last?.turnId === undefined || input.activeTurnId === last.turnId);
+  }
+  const activeTurnIsAnother =
+    input.activeTurnId && last?.turnId && input.activeTurnId !== last.turnId;
+  return !isTurnBoundary(last, first) && !activeTurnIsAnother;
+}
+
 const NO_COLLAPSED_TURNS: StreamPresentation["turns"] = collapseTurns({
   tail: [],
   isLatestTurnOpen: false,
@@ -129,6 +152,7 @@ const NO_COLLAPSED_TURNS: StreamPresentation["turns"] = collapseTurns({
 /** Source messages reach plugins before display projection. */
 export function createStreamPresentation() {
   const projectAgentInteractions = createAgentInteractionProjection();
+  const groupAgentSources = createAgentSourceGrouping();
   const userMessageCache = new WeakMap<UserMessageItem, UserMessageItem>();
 
   function presentUserMessage(item: UserMessageItem): UserMessageItem {
@@ -148,7 +172,10 @@ export function createStreamPresentation() {
 
   let historySource: StreamItem[] | undefined;
   let historyTransform: TimelineItemTransform | undefined;
+  let historyShowInteractions: boolean | undefined;
+  let historySourceBoundary: ReadonlyMap<string, AgentSourceGroup> | undefined;
   let historyRows: StreamItem[] = [];
+  let hasHistorySources = false;
   let preparedTail: StreamItem[] | undefined;
   let preparedAutoExpandReasoning: boolean | undefined;
   let preparedLevel: ToolCallDetailLevel | undefined;
@@ -156,6 +183,7 @@ export function createStreamPresentation() {
   let historyGroupHosts: ReadonlyMap<string, string> = new Map();
   let collapsedSource: StreamItem[] | undefined;
   let collapsedIsLatestTurnOpen = false;
+  let collapsedRegularTurns = false;
   let collapsedExpandedHostIds: ReadonlySet<string> | undefined;
   let collapsed: TurnCollapse | undefined;
   const indexHistory = createRowIdentityIndex();
@@ -163,25 +191,66 @@ export function createStreamPresentation() {
   const indexDisplayedTail = createRowIdentityIndex();
   const indexDisplayedHead = createRowIdentityIndex();
   let previousDisplayedRows: StreamRowIdentities | undefined;
+  let originalTransform: TimelineItemTransform | undefined;
+  let simplifiedTransform: TimelineItemTransform | undefined;
 
-  function presentRows(item: StreamItem): StreamItem[] {
-    if (item.kind === "tool_call" && item.payload.source === "agent") {
-      const message = item.payload.data.agentMessage;
-      if (message?.event === "message") {
-        return [
-          {
-            kind: "user_message",
-            id: item.id,
-            turnId: item.turnId,
-            timelineCursor: item.timelineCursor,
-            timestamp: item.timestamp,
-            text: message.text,
-            sender: message.sender,
-          },
-        ];
-      }
+  function withoutSourceTransform(transform: TimelineItemTransform | undefined) {
+    if (originalTransform !== transform) {
+      originalTransform = transform;
+      simplifiedTransform = transform
+        ? (input) => {
+            if (input.item.type === "tool_call" && input.item.agentMessage) return undefined;
+            return transform(input);
+          }
+        : undefined;
     }
-    return [item.kind === "user_message" ? presentUserMessage(item) : item];
+    return simplifiedTransform;
+  }
+
+  function presentRows(
+    item: StreamItem,
+    group: AgentSourceGroup | undefined,
+    showAgentInteractions: boolean,
+  ): StreamItem[] {
+    const message = getAgentMessage(item);
+    if (!message || (showAgentInteractions && message.event !== "message")) {
+      return [item.kind === "user_message" ? presentUserMessage(item) : item];
+    }
+    const projected: UserMessageItem = {
+      kind: "user_message",
+      id: item.id,
+      turnId: item.turnId,
+      timelineCursor: item.timelineCursor,
+      timestamp: item.timestamp,
+      text: message.text,
+      sender: message.sender,
+    };
+    if (group) {
+      setAgentSourcePresentation(projected, {
+        group,
+        isGroupStart: group.firstItemId === item.id,
+      });
+    }
+    return [projected];
+  }
+
+  function projectRows(
+    items: StreamItem[],
+    transform: TimelineItemTransform | undefined,
+    showInteractions: boolean,
+    getSourceGroup: (id: string) => AgentSourceGroup | undefined,
+    streaming = false,
+  ): StreamItem[] {
+    // In simplified mode an incoming event is a prompt. Preserve provenance even
+    // if an installed plugin handles the underlying tool type.
+    const transformable = projectPluginTimelineItems(
+      items,
+      showInteractions ? transform : withoutSourceTransform(transform),
+      streaming ? "streaming" : "complete",
+    );
+    return transformable.flatMap((item) =>
+      presentRows(item, getSourceGroup(item.id), showInteractions),
+    );
   }
 
   function collapse(
@@ -191,30 +260,24 @@ export function createStreamPresentation() {
     StreamPresentation,
     "readingRowReplacements" | "sourceTail" | "sourceHead" | "hiddenItemIds"
   > {
-    if (input.display !== "collapseTurns") {
+    const collapseRegularTurns = input.display === "collapseTurns";
+    if (!collapseRegularTurns && (input.showAgentInteractions || !hasHistorySources)) {
       return { ...projection, turns: NO_COLLAPSED_TURNS };
     }
     // Live text updates reach the head only, so the folded history is reused until the
     // retained rows, the latest turn's liveness, or the reader's expanded turns change.
-    const last = projection.tail.at(-1) ?? null;
-    const first = projection.head[0] ?? null;
-    const activeTurnIsAnother = Boolean(
-      input.activeTurnId && last?.turnId && input.activeTurnId !== last.turnId,
-    );
-    // Without head rows, the latest retained turn is live only while the active run is that
-    // turn. A run that has not opened yet carries no id and belongs to the next turn.
-    const isLatestTurnOpen = first
-      ? !isTurnBoundary(last, first) && !activeTurnIsAnother
-      : input.isTurnActive && (last?.turnId === undefined || input.activeTurnId === last.turnId);
+    const isLatestTurnOpen = latestRetainedTurnIsOpen(projection, input);
     if (
       !collapsed ||
       collapsedSource !== projection.tail ||
       collapsedIsLatestTurnOpen !== isLatestTurnOpen ||
+      collapsedRegularTurns !== collapseRegularTurns ||
       collapsedExpandedHostIds !== input.expandedTurnHostIds
     ) {
       collapsed = collapseTurns({
         tail: projection.tail,
         isLatestTurnOpen,
+        collapseRegularTurns,
         expandedHostIds: input.expandedTurnHostIds,
         getGroupedCalls: (itemId) => projection.groupsByHostId.get(itemId)?.run.calls,
         previousSummaryRowsByHostId:
@@ -222,6 +285,7 @@ export function createStreamPresentation() {
       });
       collapsedSource = projection.tail;
       collapsedIsLatestTurnOpen = isLatestTurnOpen;
+      collapsedRegularTurns = collapseRegularTurns;
       collapsedExpandedHostIds = input.expandedTurnHostIds;
     }
     const { tail, ...turns } = collapsed;
@@ -252,20 +316,35 @@ export function createStreamPresentation() {
     });
     const sourceTail = interactionProjection.tail;
     const sourceHead = interactionProjection.head;
+    const showInteractions = input.showAgentInteractions === true;
+    const sources = showInteractions ? undefined : groupAgentSources(sourceTail, sourceHead);
     const level: ToolCallDetailLevel = input.display === "full" ? "detailed" : "overview";
     // Retained history is not reprojected or regrouped on each live text update.
-    if (historySource !== sourceTail || historyTransform !== input.transform) {
-      historyRows = projectPluginTimelineItems(sourceTail, input.transform).flatMap<StreamItem>(
-        (item) => presentRows(item),
+    if (
+      historySource !== sourceTail ||
+      historyTransform !== input.transform ||
+      historyShowInteractions !== showInteractions ||
+      historySourceBoundary !== sources?.boundary
+    ) {
+      historyRows = projectRows(
+        sourceTail,
+        input.transform,
+        showInteractions,
+        (id) => sources?.boundary.get(id) ?? sources?.history.get(id),
       );
       historySource = sourceTail;
       historyTransform = input.transform;
+      historyShowInteractions = showInteractions;
+      historySourceBoundary = sources?.boundary;
+      hasHistorySources = historyRows.some((item) => sources?.history.has(item.id));
     }
-    const head: StreamItem[] = [];
-    for (const item of projectPluginTimelineItems(sourceHead, input.transform, "streaming")) {
-      const blocks = presentRows(item);
-      head.push(...blocks);
-    }
+    const head = projectRows(
+      sourceHead,
+      input.transform,
+      showInteractions,
+      (id) => sources?.boundary.get(id) ?? sources?.live.get(id),
+      true,
+    );
     if (
       preparedTail !== historyRows ||
       preparedLevel !== level ||

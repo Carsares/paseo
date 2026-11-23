@@ -1,6 +1,6 @@
 import { DiffSession } from "./diff/index.js";
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
-import type { AgentMessageDelivery } from "./agent/agent-messages/index.js";
+import type { AgentMessageDelivery, AgentPromptSource } from "./agent/agent-messages/index.js";
 import { AgentMessageAdmissionError } from "./agent/agent-messages/delivery.js";
 import { AgentDirectory, type BackgroundVisibility } from "./agent/directory.js";
 import { ConnectedHostSession } from "./connected-hosts/index.js";
@@ -102,6 +102,7 @@ import type {
   FinishRegistration,
   FinishSubscriptions,
 } from "./agent/finish-subscriptions/index.js";
+import { ParentReportRecipientUnavailableError } from "./agent/finish-subscriptions/index.js";
 import {
   resolveCreateAgentTitles,
   resolveFirstAgentPromptTitle,
@@ -126,6 +127,7 @@ import {
   PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
   getParentAgentIdFromLabels,
+  isExplicitParentReportingLabels,
   isMainControlAgentLabels,
 } from "@getpaseo/protocol/agent-labels";
 import { applyRecordPatch } from "./record-patch.js";
@@ -608,11 +610,19 @@ async function validateDirectParentPrompt(
   assertDirectParent(labels, context.serverId, parent);
 }
 
+async function usesDefaultParentReporting(context: QueuedMessageContext, agentId: string) {
+  const labels =
+    context.agentManager.getAgent(agentId)?.labels ??
+    (await context.agentStorage.get(agentId))?.labels;
+  return !isExplicitParentReportingLabels(labels);
+}
+
 function registerDirectParentPromptNotification(
   finishSubscriptions: FinishSubscriptions | undefined,
   agentId: string,
   parent: ReturnType<typeof readDirectParentRoute>,
   notify?: boolean,
+  automaticParent = false,
 ) {
   if (!parent || notify !== true) return undefined;
   if (!finishSubscriptions) throw new Error("Finish subscriptions are unavailable");
@@ -622,6 +632,7 @@ function registerDirectParentPromptNotification(
       callerAgentId: parent.agentId,
       callerServerId: parent.serverId,
       requireParentOwnership: true,
+      automaticParent,
       followupReport: true,
     },
     true,
@@ -632,6 +643,7 @@ function registerQueuedPromptNotification(
   finishSubscriptions: FinishSubscriptions | undefined,
   agentId: string,
   message: RecoverableAgentMessage,
+  automaticParent: boolean,
 ) {
   if (!message.notifyLocalCaller) {
     return registerDirectParentPromptNotification(
@@ -639,6 +651,7 @@ function registerQueuedPromptNotification(
       agentId,
       message.directParent,
       message.notifyOnFinish,
+      automaticParent,
     );
   }
   if (!finishSubscriptions) throw new Error("Finish subscriptions are not configured");
@@ -647,6 +660,7 @@ function registerQueuedPromptNotification(
       childAgentId: agentId,
       callerAgentId: message.source.agentId,
       ...(message.directParent ? { requireParentOwnership: true } : {}),
+      automaticParent: !!message.directParent && message.notifyOnFinish === undefined,
     },
     true,
   );
@@ -681,6 +695,7 @@ export async function enqueueRecoverableAgentMessage(
     context.finishSubscriptions,
     agentId,
     message,
+    await usesDefaultParentReporting(context, agentId),
   );
   const rejectNotification = () =>
     notification
@@ -2666,6 +2681,8 @@ export class Session {
     payload.archivedAt = storedRecord?.archivedAt ?? null;
     if (!payload.internal && !storedRecord?.internal && !payload.archivedAt) {
       payload.backgroundWork = this.agentManager.getAgentBackgroundWorkSummary(payload.id);
+      const inbox = this.agentMessages.getInbox?.(payload.id);
+      if (inbox) payload.pendingSubagentInbox = inbox;
     }
     return payload;
   }
@@ -2678,13 +2695,16 @@ export class Session {
     record: StoredAgentRecord,
     registeredProviderIds = new Set(this.providerSnapshotManager.listRegisteredProviderIds()),
   ): AgentSnapshotPayload {
-    return buildStoredAgentPayload(
+    const payload = buildStoredAgentPayload(
       record,
       registeredProviderIds,
       (provider, own) => this.agentManager.effectiveOptionsFor(provider, own),
       this.agentManager.getAgentBackgroundWorkSummary(record.id),
       (provider) => this.agentManager.adapterOf(provider),
     );
+    const inbox =
+      !record.archivedAt && !record.internal ? this.agentMessages.getInbox?.(record.id) : undefined;
+    return inbox ? { ...payload, pendingSubagentInbox: inbox } : payload;
   }
 
   private isProviderVisibleToClient(provider: string): boolean {
@@ -3494,6 +3514,8 @@ export class Session {
         return this.handleDetachAgentRequest(msg.agentId, msg.requestId);
       case "agent.set_main.request":
         return this.handleSetAgentMainRequest(msg);
+      case "agent.inbox.flush.request":
+        return this.handleAgentInboxFlush(msg);
       case "agent.set_parent.request":
         return this.handleSetAgentParentRequest(msg);
       case "agent.move_to_workspace.request":
@@ -4281,6 +4303,36 @@ export class Session {
         accepted: failure === null,
         error: failure,
       },
+    });
+  }
+
+  private async handleAgentInboxFlush({
+    agentId,
+    requestId,
+  }: Extract<SessionInboundMessage, { type: "agent.inbox.flush.request" }>): Promise<void> {
+    let error: string | null = null;
+    try {
+      if (readDirectParentRoute(this.getHostSourceId()))
+        throw new Error("A direct-parent route cannot flush a subagent inbox.");
+      const stored = await this.agentStorage.get(agentId);
+      const live = this.agentManager.getAgent(agentId);
+      if (
+        stored?.archivedAt ||
+        stored?.internal ||
+        live?.internal ||
+        (!stored && !live) ||
+        !isMainControlAgentLabels(live?.labels ?? stored?.labels) ||
+        !this.agentMessages.flushInbox
+      ) {
+        throw new Error("Main Control inbox is unavailable.");
+      }
+      this.agentMessages.flushInbox(agentId);
+    } catch (failure) {
+      error = getErrorMessageOr(failure, "Failed to flush Main Control inbox");
+    }
+    this.emit({
+      type: "agent.inbox.flush.response",
+      payload: { agentId, requestId, success: error === null, error },
     });
   }
 
@@ -10040,6 +10092,7 @@ export class Session {
         query: msg.query,
         cursor: msg.cursor,
         hideAgentInteractions: msg.hideAgentInteractions,
+        includeAgentSourceBodies: msg.includeAgentSourceBodies,
         provider: agent.provider,
       });
       if (this.agentManager.getLoadedTimelineHead(msg.agentId)?.epoch !== epoch) {
@@ -10509,6 +10562,62 @@ export class Session {
     };
   }
 
+  private async classifyReverseNotification(
+    agentId: string,
+    source: AgentPromptSource,
+    messageId?: string,
+  ) {
+    const validateParent = this.agentMessages.validateParentOwnership;
+    if (!validateParent || source.kind !== "agent-notification" || !source.serverId)
+      return undefined;
+    if (source.event === "finished" && !messageId?.startsWith("automatic-parent:"))
+      return undefined;
+    const subagentInbox = await this.agentMessages.classifyInbox?.(agentId, source);
+    if (!subagentInbox) return undefined;
+    // An older remote route can push before the parent's pull is bound.
+    const validateDispatch = () =>
+      validateParent({
+        childAgentId: source.agentId,
+        callerAgentId: agentId,
+        serverId: source.serverId,
+      });
+    try {
+      await validateDispatch();
+      return { subagentInbox, validateDispatch };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async prepareAgentMessageDispatch(
+    agentId: string,
+    source: AgentPromptSource,
+    messageId?: string,
+    validateDirectParent?: () => Promise<void>,
+  ) {
+    const inbox = await this.classifyReverseNotification(agentId, source, messageId);
+    const verify = inbox?.validateDispatch ?? validateDirectParent;
+    if (source.kind !== "agent-notification" || source.event !== "finished" || !messageId)
+      return { subagentInbox: inbox?.subagentInbox, validateDispatch: verify };
+    const address = {
+      callerAgentId: agentId,
+      childAgentId: source.agentId,
+      serverId: source.serverId,
+    };
+    const assertNotSuperseded = () => {
+      if (this.agentMessages.isRemoteFinishSuperseded?.(address, messageId))
+        throw new ParentReportRecipientUnavailableError("Child already reported this result.");
+    };
+    assertNotSuperseded();
+    return {
+      subagentInbox: inbox?.subagentInbox,
+      async validateDispatch() {
+        await verify?.();
+        assertNotSuperseded();
+      },
+    };
+  }
+
   private async handleSendAgentMessageRequest(
     msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
   ): Promise<void> {
@@ -10568,6 +10677,7 @@ export class Session {
             agentId,
             directParent,
             msg.notifyDirectParentOnFinish,
+            await usesDefaultParentReporting(queuedContext, agentId),
           );
           try {
             const source = {
@@ -10577,15 +10687,22 @@ export class Session {
                 ? (this.agentManager.getAgent(msg.sourceAgentId)?.config.title ?? undefined)
                 : undefined,
             };
+            const promptSource = sourceAgentEvent
+              ? { kind: "agent-notification" as const, ...source, event: sourceAgentEvent }
+              : { kind: "agent-message" as const, ...source };
+            const admission = await this.prepareAgentMessageDispatch(
+              agentId,
+              promptSource,
+              msg.messageId,
+              validateDispatch,
+            );
             const receipt = this.agentMessages.enqueue({
               recipientId: agentId,
               messageId: msg.messageId,
               handoff: confirmAtDispatch ? handoff : undefined,
-              validateDispatch,
               prompt,
-              source: sourceAgentEvent
-                ? { kind: "agent-notification", ...source, event: sourceAgentEvent }
-                : { kind: "agent-message", ...source },
+              source: promptSource,
+              ...admission,
               activeTurnBehavior: msg.activeTurnBehavior ?? "steer",
               sessionMode: msg.sessionMode,
               clearPendingPermissions: false,
@@ -10662,6 +10779,7 @@ export class Session {
                 ? (error) =>
                     error instanceof AgentRunCancellationError ||
                     error instanceof DirectParentRequiredError ||
+                    error instanceof ParentReportRecipientUnavailableError ||
                     retainQueuedAgentMessage(error)
                 : undefined,
             retryIfNotAdmitted: (error) =>

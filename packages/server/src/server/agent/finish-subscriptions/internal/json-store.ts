@@ -16,6 +16,9 @@ const recordsSchema = z.array(
     followupReport: z.boolean().optional(),
     pullSourceId: z.string().optional(),
     report: AgentFinishReportSchema.optional(),
+    suppressFinished: z.boolean().optional(),
+    supersedesFinished: z.array(z.string()).optional(),
+    reportTurnId: z.string().optional(),
   }),
 );
 

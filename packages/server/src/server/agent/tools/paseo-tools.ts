@@ -713,6 +713,7 @@ function createToolCatalog(
     destination: string | undefined,
     input: Record<string, unknown>,
     requireParentOwnership: boolean,
+    automaticParent: boolean,
   ): Promise<FinishRegistration | undefined> {
     if (name !== "send_agent_prompt" || destination === options.serverId || !callerAgentId) {
       return undefined;
@@ -724,6 +725,7 @@ function createToolCatalog(
         callerAgentId,
         serverId: destination,
         ...(requireParentOwnership ? { requireParentOwnership: true } : {}),
+        automaticParent,
       },
       true,
     );
@@ -733,6 +735,7 @@ function createToolCatalog(
     destination: string | undefined,
     input: Record<string, unknown>,
     response: PaseoToolResult,
+    automaticParent: boolean,
   ): Promise<void> {
     if (
       name !== "create_agent" ||
@@ -748,6 +751,7 @@ function createToolCatalog(
       callerAgentId,
       serverId: destination,
       requireParentOwnership: true,
+      automaticParent,
     });
   }
   function defaultRemotePromptNotification(
@@ -1027,6 +1031,7 @@ function createToolCatalog(
             : { ...(original as z.ZodRawShape), ...selector },
       };
       handler = async ({ serverId, ...input }, context) => {
+        const automaticParent = input.notifyOnFinish === undefined;
         const destination = serverId ?? options.serverId;
         const { requireParentOwnership, targetLabels, allowLegacyDirectPrompt } =
           await checkHierarchy(name, { ...input, serverId }, context);
@@ -1040,6 +1045,7 @@ function createToolCatalog(
               destination,
               input,
               restrictedSend,
+              automaticParent,
             );
           } catch (error) {
             throw new HostOperationRejectedError(error);
@@ -1068,7 +1074,7 @@ function createToolCatalog(
           const response = await withRemoteChildReservation(name, destination, input, forward);
           if (response.isError) await remoteNotification?.reject();
           else remoteNotification?.accept();
-          await registerRemoteCreation(name, destination, input, response);
+          await registerRemoteCreation(name, destination, input, response, automaticParent);
           return {
             ...response,
             structuredContent: {
@@ -2329,6 +2335,7 @@ function createToolCatalog(
             childAgentId: agentId,
             callerAgentId: message.source.agentId,
             ...(message.directParent ? { requireParentOwnership: true } : {}),
+            automaticParent: !!message.directParent && message.notifyOnFinish === undefined,
           },
           true,
         )
@@ -2410,6 +2417,7 @@ function createToolCatalog(
           activeTurnBehavior,
           unarchive: true,
           notifyLocalCaller: notifying,
+          notifyOnFinish,
         });
         return queuedPromptResponse(agentId, messageId, notifying);
       }
@@ -2452,6 +2460,30 @@ function createToolCatalog(
     },
   );
 
+  async function readRemoteParentForReport(parent: { agentId: string; serverId: string }) {
+    if (!options.hosts) return undefined;
+    const hosts = options.hosts();
+    // Reverse-link absence does not prevent the parent from receiving the report.
+    const directory = await hosts.directory();
+    if (
+      !directory.hosts.some((host) => host.serverId === parent.serverId && host.status === "online")
+    )
+      return undefined;
+    return hosts.use(
+      parent.serverId,
+      async (client) => (await client.fetchAgent(parent.agentId))?.agent ?? null,
+    );
+  }
+
+  function reportTurnId(agentId: string): string | undefined {
+    const runtime = agentManager.getAgent(agentId);
+    return (
+      runtime?.activeForegroundTurnId ??
+      runtime?.activeTurnId ??
+      runtime?.lastTurnCompletion?.event.turnId
+    );
+  }
+
   registerTool(
     "report_to_parent",
     {
@@ -2473,6 +2505,7 @@ function createToolCatalog(
     },
     async ({ status, summary }) => {
       if (!callerAgentId) throw new PaseoToolInputError("Only subagents can report to a parent.");
+      const turnId = reportTurnId(callerAgentId);
       const localServer = options.serverId ?? "self";
       const caller = await readHierarchyAgent(callerAgentId);
       const parent = getParentAddressFromLabels(caller?.labels, localServer);
@@ -2490,23 +2523,8 @@ function createToolCatalog(
         if (!target || target.archivedAt) {
           throw new PaseoToolInputError(`Parent agent ${parent.agentId} is unavailable`);
         }
-      } else if (options.hosts) {
-        // A reverse link can confirm that a parent is unavailable. Its absence
-        // does not block the parent's forward-link delivery.
-        const hosts = options.hosts();
-        const target = await (async () => {
-          const directory = await hosts.directory();
-          if (
-            !directory.hosts.some(
-              (host) => host.serverId === parent.serverId && host.status === "online",
-            )
-          )
-            return undefined;
-          return hosts.use(
-            parent.serverId,
-            async (client) => (await client.fetchAgent(parent.agentId))?.agent ?? null,
-          );
-        })().catch(() => undefined);
+      } else {
+        const target = await readRemoteParentForReport(parent).catch(() => undefined);
         if (target === null || target?.archivedAt) {
           throw new PaseoToolInputError(`Parent agent ${parent.agentId} is unavailable`);
         }
@@ -2517,7 +2535,12 @@ function createToolCatalog(
           callerAgentId: parent.agentId,
           ...(parent.serverId === localServer ? {} : { callerServerId: parent.serverId }),
         },
-        { status, summary, title: caller.title ?? callerAgentId },
+        {
+          status,
+          summary,
+          title: caller.title ?? callerAgentId,
+          turnId,
+        },
       );
       return {
         content: [],

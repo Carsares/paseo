@@ -33,6 +33,7 @@ function createSnapshot(
     persistence: input.persistence ?? null,
     title: input.title ?? null,
     labels: (input.labels ?? {}) as AgentSnapshotPayload["labels"],
+    ...(input.pendingSubagentInbox ? { pendingSubagentInbox: input.pendingSubagentInbox } : {}),
     ...(input.controls ? { controls: input.controls } : {}),
     ...(input.options ? { options: input.options } : {}),
   };
@@ -106,6 +107,30 @@ describe("normalizeAgentSnapshot", () => {
       startedAt: new Date(startedAt),
       cancellationRequestId: null,
     });
+  });
+
+  it("round-trips pending subagent inbox summaries without losing source status", () => {
+    const pendingSubagentInbox = {
+      count: 2,
+      items: [
+        {
+          agentId: "child-1",
+          title: "Reviewer",
+          event: "finished",
+          reportStatus: "completed" as const,
+        },
+        { agentId: "child-2", event: "errored", reportStatus: "blocked" as const },
+      ],
+    };
+    const snapshot = createSnapshot({ pendingSubagentInbox });
+    const agent = normalizeAgentSnapshot(snapshot, "server-1");
+
+    expect(agent.pendingSubagentInbox).toEqual(pendingSubagentInbox);
+    expect(projectAgentSnapshot(agent).pendingSubagentInbox).toEqual(pendingSubagentInbox);
+
+    const cleared = normalizeAgentSnapshot(createSnapshot(), "server-1");
+    expect({ ...agent, ...cleared }.pendingSubagentInbox).toBeUndefined();
+    expect(JSON.stringify(projectAgentSnapshot(cleared))).not.toContain("pendingSubagentInbox");
   });
 
   it("derives parentAgentId from the parent label while preserving labels", () => {

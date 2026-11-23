@@ -784,6 +784,7 @@ export interface AgentTimelineSearchOptions {
   query: string;
   cursor?: number;
   hideAgentInteractions?: boolean;
+  includeAgentSourceBodies?: boolean;
 }
 
 export type AgentTimelineSearchPayload = Extract<
@@ -4251,6 +4252,7 @@ export class DaemonClient {
     query,
     cursor,
     hideAgentInteractions,
+    includeAgentSourceBodies,
   }: AgentTimelineSearchOptions): Promise<AgentTimelineSearchPayload> {
     const requestId = this.createRequestId();
     const payload = await this.sendCorrelatedSessionRequest({
@@ -4262,6 +4264,7 @@ export class DaemonClient {
         query,
         cursor,
         hideAgentInteractions,
+        includeAgentSourceBodies,
       },
       responseType: "agent.timeline.search.response",
     });
@@ -4482,6 +4485,20 @@ export class DaemonClient {
   // ============================================================================
   // Agent Interaction
   // ============================================================================
+
+  async flushAgentInbox(agentId: string): Promise<void> {
+    if (!this.isConnected || !this.lastServerInfoMessage) throw this.unavailableError();
+    // COMPAT(subagentInbox): added in v0.17.0, remove gate once the host floor includes it.
+    if (this.lastServerInfoMessage.features?.subagentInbox !== true) {
+      throw new Error("Update the Paseo host to flush the agent inbox.");
+    }
+    const { success, error } = await this.sendCorrelatedSessionRequest({
+      message: { type: "agent.inbox.flush.request", agentId },
+      responseType: "agent.inbox.flush.response",
+      selectPayload: (payload) => (payload.agentId === agentId ? payload : null),
+    });
+    if (!success || error !== null) throw new Error(error || "Failed to flush the agent inbox.");
+  }
 
   async trackAgentFinishReports(
     childServerId: string,

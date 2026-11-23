@@ -8,6 +8,11 @@ import {
   type TurnSummaryItem,
 } from "@/types/stream";
 import { summarizeToolCalls, type OverviewSummary } from "@/tool-calls/detail-level/overview/model";
+import {
+  getAgentSourceGroup,
+  setAgentSourceGroup,
+  type AgentSourceGroup,
+} from "../agent-interactions";
 
 export interface TurnCollapse {
   tail: StreamItem[];
@@ -28,6 +33,7 @@ export interface CollapseTurnsInput {
   tail: StreamItem[];
   /** The latest turn is still producing output, so it stays unfolded. */
   isLatestTurnOpen: boolean;
+  collapseRegularTurns?: boolean;
   expandedHostIds: ReadonlySet<string>;
   /** The calls a tool-call group row stands for; undefined for a single call. */
   getGroupedCalls: (itemId: string) => readonly (ToolCallItem | ThoughtItem)[] | undefined;
@@ -38,6 +44,7 @@ export interface CollapseTurnsInput {
 const EMPTY_IDS: ReadonlySet<string> = new Set();
 const EMPTY_ROWS: ReadonlyMap<string, TurnSummaryItem> = new Map();
 const EMPTY_HOSTS: ReadonlyMap<string, string> = new Map();
+const NO_TOOLS = summarizeToolCalls([]);
 
 function summarizeTurn(
   items: readonly StreamItem[],
@@ -76,16 +83,18 @@ function summaryRow(
   expanded: boolean,
   tools: OverviewSummary,
   previous: TurnSummaryItem | undefined,
+  sourceGroup?: AgentSourceGroup,
 ): TurnSummaryItem {
   if (
     previous &&
     previous.expanded === expanded &&
+    getAgentSourceGroup(previous) === sourceGroup &&
     hasSameWork(previous.tools, tools) &&
     hasSamePosition(previous.timelineCursor, host.timelineCursor)
   ) {
     return previous;
   }
-  return {
+  const row: TurnSummaryItem = {
     kind: "turn_summary",
     id: `turn-summary:${host.id}`,
     // The row stands at its host's place in the timeline, so the reading position over it
@@ -97,6 +106,8 @@ function summaryRow(
     expanded,
     tools,
   };
+  if (sourceGroup) setAgentSourceGroup(row, sourceGroup);
+  return row;
 }
 
 function staysVisibleWhenCollapsed(item: StreamItem): boolean {
@@ -140,24 +151,74 @@ export function collapseTurns(input: CollapseTurnsInput): TurnCollapse {
   const hostIdByFoldedMessageId = new Map<string, string>();
   const hostIdByHiddenRowId = new Map<string, string>();
 
+  const appendSourceBlocks = (items: StreamItem[], isClosed: boolean, sourceLed: boolean) => {
+    for (let index = 0; index < items.length; ) {
+      const host = items[index]!;
+      const group = getAgentSourceGroup(host);
+      if (
+        !isClosed ||
+        !group ||
+        group.requiresExpansion ||
+        group.firstItemId !== host.id ||
+        index + group.itemCount > items.length
+      ) {
+        output.push(host);
+        index += 1;
+        continue;
+      }
+      let end = index + group.itemCount;
+      if (sourceLed && index === 0) {
+        // A source that starts a run owns its response. A source steered into a
+        // human run owns only its incoming messages.
+        while (end < items.length && !isTurnTrigger(items[end]!)) end += 1;
+      }
+      const expanded = input.expandedHostIds.has(host.id);
+      const summary = summaryRow(
+        host,
+        expanded,
+        NO_TOOLS,
+        input.previousSummaryRowsByHostId.get(host.id),
+        group,
+      );
+      output.push(summary);
+      summaryRowsByHostId.set(host.id, summary);
+      for (const row of items.slice(index, end)) {
+        const revealed = input.getGroupedCalls(row.id) ?? [row];
+        for (const item of revealed) {
+          hostIdByFoldedMessageId.set(getStreamItemMessageId(item), host.id);
+          if (expanded) nestedItemIds.add(item.id);
+          else hostIdByHiddenRowId.set(item.id, summary.id);
+        }
+        if (expanded) output.push(...revealed);
+      }
+      index = end;
+    }
+  };
+
   let runStart = 0;
   const flushRun = (runEnd: number) => {
-    const host = tail[runStart - 1];
+    if (runEnd <= runStart) return;
+    const host = tail[runStart]!;
     const isClosed = runEnd < tail.length || !input.isLatestTurnOpen;
-    const replyIndex = findLastReplyIndex(tail, runStart, runEnd);
+    const replyIndex = findLastReplyIndex(tail, runStart + 1, runEnd);
+    const sourceGroup = getAgentSourceGroup(host);
+    const sourceLed = sourceGroup !== undefined;
+    const structuredSourceLed = sourceGroup?.sources.some((source) => source.status !== "message");
     if (
-      !host ||
+      input.collapseRegularTurns === false ||
+      structuredSourceLed ||
+      (runStart === 0 && !isTurnTrigger(host)) ||
       (host.kind !== "user_message" && host.kind !== "tool_call") ||
       !isClosed ||
-      replyIndex <= runStart
+      replyIndex <= runStart + 1
     ) {
-      output.push(...tail.slice(runStart, runEnd));
+      appendSourceBlocks(tail.slice(runStart, runEnd), isClosed, sourceLed);
       return;
     }
-    const folded = tail.slice(runStart, replyIndex);
+    const folded = tail.slice(runStart + 1, replyIndex);
     const tools = summarizeTurn(folded, input.getGroupedCalls);
     if (!hasWork(tools) && !folded.some(isAssistantReply)) {
-      output.push(...tail.slice(runStart, runEnd));
+      appendSourceBlocks(tail.slice(runStart, runEnd), isClosed, false);
       return;
     }
     const expanded = input.expandedHostIds.has(host.id);
@@ -181,22 +242,21 @@ export function collapseTurns(input: CollapseTurnsInput): TurnCollapse {
       if (expanded) nestedItemIds.add(item.id);
       else hostIdByHiddenRowId.set(item.id, host.id);
     }
-    output.push(
-      summary,
-      ...(expanded ? revealed : folded.filter((item) => staysVisibleWhenCollapsed(item))),
+    output.push(host, summary);
+    appendSourceBlocks(
+      [
+        ...(expanded ? revealed : folded.filter(staysVisibleWhenCollapsed)),
+        ...tail.slice(replyIndex, runEnd),
+      ],
+      isClosed,
+      false,
     );
-    output.push(...tail.slice(replyIndex, runEnd));
   };
 
-  for (let index = 0; index < tail.length; index += 1) {
-    if (
-      !(index === 0 && isTurnTrigger(tail[index]!)) &&
-      !isTurnBoundary(tail[index - 1] ?? null, tail[index] ?? null)
-    )
-      continue;
+  for (let index = 1; index < tail.length; index += 1) {
+    if (!isTurnBoundary(tail[index - 1]!, tail[index]!)) continue;
     flushRun(index);
-    output.push(tail[index]!);
-    runStart = index + 1;
+    runStart = index;
   }
   flushRun(tail.length);
 

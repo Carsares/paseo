@@ -37,6 +37,7 @@ import type {
 } from "@getpaseo/protocol/agent-types";
 import type {
   AgentBackgroundWorkSummary,
+  PendingSubagentInbox,
   ServerInfoStatusPayload,
   ProjectPlacementPayload,
   ServerCapabilities,
@@ -80,6 +81,7 @@ export interface Agent {
   provider: AgentProvider;
   status: AgentLifecycleStatus;
   backgroundWork?: AgentBackgroundWorkSummary;
+  pendingSubagentInbox?: PendingSubagentInbox;
   turn: TurnLiveness;
   createdAt: Date;
   updatedAt: Date;

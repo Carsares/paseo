@@ -262,6 +262,23 @@ export const en = {
     empty: "Start chatting with this agent...",
     scrollToBottom: "Scroll to bottom",
     historyLoadFailed: "Couldn't load agent history",
+    inbox: {
+      pending: "{{count}} pending reports",
+      flush: "Summarize now",
+      flushing: "Summarizing…",
+      failed: "Couldn't summarize reports. Retry.",
+    },
+    source: {
+      status: {
+        message: "Message",
+        finished: "Finished",
+        completed: "Completed",
+        blocked: "Blocked",
+        error: "Error",
+        permission: "Permission needed",
+        closed: "Closed",
+      },
+    },
     messageCapped: "This message was capped ({{bytes}} bytes).",
     quote: {
       action: "Quote",

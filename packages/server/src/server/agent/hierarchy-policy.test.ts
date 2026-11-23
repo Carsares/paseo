@@ -1324,6 +1324,8 @@ it("applies the Level-2 restrictions after adoption and subscribes a UI child's 
         childAgentId: workerAgent.id,
         callerAgentId: leadAgent.id,
         requireParentOwnership: true,
+        automaticParent: true,
+        canRegister: expect.any(Function),
       },
       true,
     );

@@ -1,4 +1,4 @@
-import { AgentMessageSchema } from "./agent-message.js";
+import { AgentMessageSchema, AgentReportStatusSchema } from "./agent-message.js";
 import {
   HostsListRequestSchema,
   HostsAddRequestSchema,
@@ -924,6 +924,21 @@ export const AgentBackgroundWorkSummarySchema = z.object({
 
 export type AgentBackgroundWorkSummary = z.infer<typeof AgentBackgroundWorkSummarySchema>;
 
+export const PendingSubagentInboxSchema = z.object({
+  count: z.number(),
+  items: z.array(
+    z.object({
+      agentId: z.string(),
+      serverId: z.string().optional(),
+      title: z.string().optional(),
+      event: z.string(),
+      reportStatus: AgentReportStatusSchema.optional(),
+    }),
+  ),
+});
+
+export type PendingSubagentInbox = z.infer<typeof PendingSubagentInboxSchema>;
+
 export const AgentSnapshotPayloadSchema = z.object({
   id: z.string(),
   provider: AgentProviderSchema,
@@ -948,6 +963,7 @@ export const AgentSnapshotPayloadSchema = z.object({
   currentModeId: z.string().nullable(),
   availableModes: z.array(AgentModeSchema),
   pendingPermissions: z.array(AgentPermissionRequestPayloadSchema),
+  pendingSubagentInbox: PendingSubagentInboxSchema.optional(),
   persistence: AgentPersistenceHandleSchema.nullable(),
   runtimeInfo: AgentRuntimeInfoSchema.optional(),
   /** Opaque. Changes whenever the accounts this agent reports usage for can change. */
@@ -2178,6 +2194,7 @@ export const AgentTimelineSearchRequestMessageSchema = z.object({
   query: z.string(),
   cursor: z.number().int().nonnegative().optional(),
   hideAgentInteractions: z.boolean().optional(),
+  includeAgentSourceBodies: z.boolean().optional(),
 });
 
 export const AgentTimelineListPromptsRequestMessageSchema = z.object({
@@ -2419,13 +2436,32 @@ export const AgentFinishReportSchema = z.object({
   prompt: z.string(),
   title: z.string(),
   event: z.enum(["finished", "errored", "permission-required", "closed"]),
-  parentReportStatus: z.enum(["completed", "blocked"]).optional(),
+  parentReportStatus: AgentReportStatusSchema.optional(),
 });
 export type AgentFinishReport = z.infer<typeof AgentFinishReportSchema>;
 export const AgentExplicitFinishReportSchema = AgentFinishReportSchema.extend({
-  parentReportStatus: z.enum(["completed", "blocked"]),
+  parentReportStatus: AgentReportStatusSchema,
 });
 export type AgentExplicitFinishReport = z.infer<typeof AgentExplicitFinishReportSchema>;
+
+export const AgentInboxFlushRequestSchema = z.object({
+  type: z.literal("agent.inbox.flush.request"),
+  agentId: z.string(),
+  requestId: z.string(),
+});
+
+export const AgentInboxFlushResponseSchema = z.object({
+  type: z.literal("agent.inbox.flush.response"),
+  payload: z.object({
+    agentId: z.string(),
+    success: z.boolean(),
+    error: z.string().nullable(),
+    requestId: z.string(),
+  }),
+});
+
+export type AgentInboxFlushRequest = z.infer<typeof AgentInboxFlushRequestSchema>;
+export type AgentInboxFlushResponse = z.infer<typeof AgentInboxFlushResponseSchema>;
 
 export const AgentPushFinishReportRequestSchema = z.object({
   type: z.literal("agent.finish_reports.push.request"),
@@ -3951,6 +3987,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   AgentMoveToWorkspaceRequestMessageSchema,
   AgentSetMainRequestMessageSchema,
   AgentSetParentRequestMessageSchema,
+  AgentInboxFlushRequestSchema,
   AgentPushFinishReportRequestSchema,
   AgentConfirmFinishReportResponseSchema,
   AgentPullFinishReportsRequestSchema,
@@ -4481,6 +4518,7 @@ export const ServerInfoStatusPayloadSchema = z
         agentExplicitParentReports: z.boolean().optional(),
         agentTrackRemoteParentReports: z.boolean().optional(),
         agentDirectParentQueuedDelivery: z.boolean().optional(),
+        subagentInbox: z.boolean().optional(),
         // COMPAT(agentTurnIdentity): accept peers that observed pre-release v0.2.6 through 2027-01-31.
         agentTurnIdentity: z.boolean().optional(),
         // COMPAT(stableProjectIdentity): added in v0.1.109, remove gate after 2027-01-15.
@@ -8117,6 +8155,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentMoveToWorkspaceResponseMessageSchema,
   AgentSetMainResponseMessageSchema,
   AgentSetParentResponseMessageSchema,
+  AgentInboxFlushResponseSchema,
   AgentPushFinishReportResponseSchema,
   AgentConfirmFinishReportRequestSchema,
   AgentPullFinishReportsResponseSchema,

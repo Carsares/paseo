@@ -260,6 +260,7 @@ describe("toAgentPayload", () => {
         toStoredAgentRecord(agent),
         [provider],
         ownOptionsOnly,
+        undefined,
         () => "opencode",
       ).subagentDraftOptions,
     ).toEqual(own);

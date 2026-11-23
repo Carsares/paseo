@@ -5,6 +5,7 @@ import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { getParentAddressFromLabels, isMainControlAgent } from "@getpaseo/protocol/agent-labels";
 import type { TFunction } from "i18next";
 import { SquarePen } from "lucide-react-native";
+import { PendingSubagentInboxBar } from "./agent-panel-inbox";
 import React, {
   memo,
   type ReactNode,
@@ -1802,6 +1803,11 @@ function ActiveAgentComposer({
 
   return (
     <View style={animatedStaticStyles.inputAreaWrapper} onLayout={onInputAreaLayout}>
+      <PendingSubagentInboxBar
+        key={JSON.stringify([serverId, agentId])}
+        serverId={serverId}
+        agentId={agentId}
+      />
       <Composer
         agentId={agentId}
         serverId={serverId}

@@ -187,6 +187,47 @@ it("finds adjacent displayed fragments when the hidden tool update folds into an
   });
 });
 
+it("locates an old source body using its own timeline cursor when the app displays source bodies", async () => {
+  const report: AgentTimelineItem = {
+    type: "tool_call",
+    name: "agent_message",
+    callId: "report",
+    status: "completed",
+    detail: { type: "plain_text", text: "older report" },
+    agentMessage: {
+      sender: { id: "child" },
+      event: "message",
+      reportStatus: "completed",
+      text: "older report older report",
+    },
+    error: null,
+  };
+  const source = rows([
+    { type: "user_message", text: "start work" },
+    report,
+    ...Array.from(
+      { length: 50 },
+      (_, index): AgentTimelineItem => ({
+        type: "user_message",
+        text: `newer message ${index}`,
+      }),
+    ),
+  ]);
+  const store = new InMemoryAgentTimelineStore();
+  store.initialize("agent", { rows: source, epoch: "epoch" });
+  expect(store.fetch("agent", { limit: 40 }).startSeq).toBeGreaterThan(2);
+  const input = {
+    rows: store.getRows("agent"),
+    query: "older report",
+    hideAgentInteractions: true,
+  };
+  await expect(searchTimeline(input)).resolves.toEqual({ locations: [], nextCursor: null });
+  await expect(searchTimeline({ ...input, includeAgentSourceBodies: true })).resolves.toEqual({
+    locations: [{ seq: 2, role: "user", count: 2 }],
+    nextCursor: null,
+  });
+});
+
 it("uses the final fragment sequence to load a whole old reply longer than a timeline page", async () => {
   const source = rows([
     { type: "assistant_message", text: "proto", messageId: "reply" },
