@@ -1,6 +1,7 @@
 import type { ProviderSnapshotEntry } from "@getpaseo/protocol/agent-types";
 import type { AgentProfile } from "@getpaseo/protocol/messages";
 import { formatAgentModeLabel, formatThinkingOptionLabel } from "@/agent-controls/labels";
+import { materializeAgentProfile, resolveProfileModelSelection } from "./materialize-profile";
 
 export interface AgentProfileTag {
   id: string;
@@ -12,6 +13,14 @@ function findEntry(
   provider: string,
 ): ProviderSnapshotEntry | null {
   return entries.find((entry) => entry.provider === provider) ?? null;
+}
+
+function resolveModelLabel(
+  entry: ProviderSnapshotEntry | null,
+  modelId: string,
+  selectedLabel: string | undefined,
+): string {
+  return selectedLabel ?? entry?.models?.find((model) => model.id === modelId)?.label ?? modelId;
 }
 
 /**
@@ -30,10 +39,13 @@ export function buildAgentProfileTags(input: {
     { id: "provider", label: entry?.label ?? input.profile.provider },
   ];
 
-  const modelId = input.profile.model?.trim();
-  if (modelId) {
-    const model = entry?.models?.find((candidate) => candidate.id === modelId);
-    tags.push({ id: "model", label: model?.label ?? modelId });
+  const profile = materializeAgentProfile(input.profile);
+  const selection = resolveProfileModelSelection(profile, entries);
+  if (profile.modelId) {
+    tags.push({
+      id: "model",
+      label: resolveModelLabel(entry, profile.modelId, selection?.model.label),
+    });
   }
 
   const modeId = input.profile.modeId?.trim();
@@ -42,7 +54,7 @@ export function buildAgentProfileTags(input: {
     tags.push({ id: "mode", label: mode ? formatAgentModeLabel(mode) : modeId });
   }
 
-  const thinkingOptionId = input.profile.thinkingOptionId?.trim();
+  const thinkingOptionId = selection?.legacyThinkingOptionId ?? profile.thinkingOptionId;
   if (thinkingOptionId) {
     tags.push({ id: "thinking", label: formatThinkingOptionLabel({ id: thinkingOptionId }) });
   }

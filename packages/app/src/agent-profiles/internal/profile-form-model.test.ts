@@ -238,6 +238,48 @@ describe("openAgentProfileForm", () => {
     expect(model.getState().disclosure.showModelField).toBe(true);
   });
 
+  it("selects the canonical model and thinking rows when an old Antigravity profile loads", () => {
+    const model = openAgentProfileForm({
+      mode: "edit",
+      profile: {
+        id: "p1",
+        name: "Carbon High",
+        provider: "antigravity",
+        model: "gemini-4-carbon-high",
+        thinkingOptionId: "unavailable",
+      },
+    });
+    expect(model.getState().modelDisplay).toEqual({ label: "gemini-4-carbon-high" });
+    model.applyProviderCatalog([{ provider: "antigravity", status: "loading", enabled: true }]);
+    expect(model.getState().modelId).toBe("gemini-4-carbon-high");
+    model.applyProviderCatalog([
+      {
+        provider: "antigravity",
+        status: "ready",
+        enabled: true,
+        models: [
+          {
+            provider: "antigravity",
+            id: "gemini-4-carbon",
+            label: "Gemini 4 Carbon",
+            thinkingOptions: [{ id: "high", label: "High" }],
+          },
+        ],
+      },
+    ]);
+
+    const state = model.getState();
+    expect(state.modelDisplay).toEqual({ label: "Gemini 4 Carbon" });
+    expect(state.thinkingDisplay).toEqual({ label: "High" });
+    expect(optionValues(state.modelOptions)).toContain(state.modelId);
+    expect(optionValues(state.thinkingOptions)).toContain(state.thinkingOptionId);
+    expect(state.controlsRequest).toMatchObject({
+      model: "gemini-4-carbon",
+      thinkingOptionId: "high",
+    });
+    expect(state.submitValue).toMatchObject({ model: "gemini-4-carbon", thinkingOptionId: "high" });
+  });
+
   describe("provider cascade", () => {
     it("reseeds every provider-scoped selection when the provider changes", () => {
       const model = openWithCatalog({ mode: "create" });

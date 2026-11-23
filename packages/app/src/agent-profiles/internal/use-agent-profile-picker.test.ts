@@ -2,6 +2,7 @@ import type { ProviderSnapshotEntry } from "@getpaseo/protocol/agent-types";
 import type { AgentConfigApply } from "@getpaseo/protocol/messages";
 import { describe, expect, it, vi } from "vitest";
 import type { MaterializedAgentProfile } from "./materialize-profile";
+import { buildAgentProfileTags } from "./profile-summary";
 import {
   applyProfileToTarget,
   resolveAgentProfileApplication,
@@ -48,7 +49,19 @@ const ANTIGRAVITY_ENTRY: ProviderSnapshotEntry = {
   provider: "antigravity",
   status: "ready",
   enabled: true,
+  label: "Antigravity",
   modes: [{ id: "plan", label: "Plan" }],
+  models: [
+    {
+      provider: "antigravity",
+      id: "gemini-4-carbon",
+      label: "Gemini 4 Carbon",
+      thinkingOptions: [
+        { id: "low", label: "Low" },
+        { id: "high", label: "High" },
+      ],
+    },
+  ],
 };
 
 interface SwitchProviderModeCase {
@@ -71,6 +84,51 @@ function applicationDependencies() {
 }
 
 describe("applyProfileToTarget", () => {
+  it("applies the same Antigravity model and tier displayed by the profile picker", async () => {
+    const deps = applicationDependencies();
+    const resolved = {
+      ...ANTIGRAVITY_PROFILE,
+      modelId: "gemini-4-carbon-high",
+      thinkingOptionId: "low",
+    };
+    const entries = [ANTIGRAVITY_ENTRY];
+    const tags = buildAgentProfileTags({
+      profile: {
+        id: "carbon",
+        name: "Carbon",
+        provider: resolved.provider,
+        model: resolved.modelId,
+        modeId: resolved.modeId,
+        thinkingOptionId: resolved.thinkingOptionId,
+      },
+      entries,
+      formatFeatureCount: String,
+    });
+    expect(tags.map((tag) => tag.label)).toEqual(["Antigravity", "Gemini 4 Carbon", "Plan", "Low"]);
+
+    await applyProfileToTarget({
+      ...deps,
+      target: {
+        kind: "agent",
+        agentId: "agent-1",
+        currentProvider: "antigravity",
+        availableModeIds: ["plan"],
+      },
+      resolved,
+      entries,
+    });
+
+    expect(deps.client.applyAgentConfig).toHaveBeenCalledExactlyOnceWith("agent-1", {
+      modelId: "gemini-4-carbon",
+      modeId: "plan",
+      thinkingOptionId: "low",
+    });
+    expect(deps.persistSelection).toHaveBeenCalledExactlyOnceWith({
+      ...resolved,
+      modelId: "gemini-4-carbon",
+    });
+  });
+
   it("passes the profile directly to the draft controls", () => {
     const applyProfile = vi.fn();
     const deps = applicationDependencies();

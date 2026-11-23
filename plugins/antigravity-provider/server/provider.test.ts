@@ -43,17 +43,49 @@ it("reports a CLI without the acp subcommand as unavailable", async () => {
   });
 });
 
-it.each([true, false])(
-  "loads a saved stream-JSON session with ACP system prompt support %s",
-  async (supportsSystemPrompt) => {
+it.each([
+  {
+    supportsSystemPrompt: true,
+    savedModel: "gemini-3.8-flash-high",
+    model: "gemini-3.8-flash",
+    thinkingOption: "high",
+  },
+  {
+    supportsSystemPrompt: false,
+    savedModel: "gemini-3.8-flash-high",
+    model: "gemini-3.8-flash",
+    thinkingOption: "high",
+  },
+  {
+    supportsSystemPrompt: true,
+    savedModel: "gpt-oss-120b-medium",
+    model: "gpt-oss-120b-medium",
+    thinkingOption: "low",
+  },
+  {
+    supportsSystemPrompt: true,
+    savedModel: "gemini-3.8-flash-high",
+    model: "gemini-3.8-flash",
+    explicitThinking: "low",
+    thinkingOption: "low",
+  },
+])(
+  "loads saved model $savedModel with ACP system prompt support $supportsSystemPrompt",
+  async ({ supportsSystemPrompt, savedModel, model, thinkingOption, explicitThinking }) => {
     const { directory, launch } = await launchAgent(`
       const { appendFileSync } = require("node:fs");
       const { createInterface } = require("node:readline");
       const configOptions = [
         { id: "model", name: "Model", category: "model", type: "select", currentValue: "gemini-4-neon",
-          options: [{ value: "gemini-4-neon", name: "Gemini 4 Neon" }, { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" }, { value: "gemini-4-neon-high", name: "Gemini 4 Neon High" }] },
+          options: [
+            { value: "gemini-4-neon", name: "Gemini 4 Neon" },
+            { value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
+            { value: "gemini-4-neon-high", name: "Gemini 4 Neon High" },
+            { value: "gpt-oss-120b", name: "GPT OSS 120B" },
+            { value: "gpt-oss-120b-medium", name: "GPT OSS 120B Medium" },
+          ] },
         { id: "thought_level", name: "Thinking", category: "thought_level", type: "select", currentValue: "low",
-          options: [{ value: "low", name: "Low" }, { value: "high", name: "High" }] },
+          options: [{ value: "low", name: "Low" }, { value: "medium", name: "Medium" }, { value: "high", name: "High" }] },
         { id: "mode", name: "Mode", category: "mode", type: "select", currentValue: "accept-edits",
           options: [{ value: "default", name: "Default" }, { value: "accept-edits", name: "Accept edits" }] },
       ];
@@ -81,6 +113,9 @@ it.each([true, false])(
           case "session/set_config_option":
             configOptions.find(option => option.id === params.configId).currentValue = params.value;
             send({ id, result: { configOptions } });
+            send({ method: "session/update", params: { sessionId: params.sessionId, update: {
+              sessionUpdate: "available_commands_update", availableCommands: [],
+            } } });
             break;
           case "session/close":
             send({ id, result: {} });
@@ -106,7 +141,8 @@ it.each([true, false])(
         persistence: { version: 1, data: { conversationId: "saved-conversation" } },
         config: {
           cwd: directory,
-          model: "gemini-3.8-flash-high",
+          model: savedModel,
+          thinkingOption: explicitThinking,
           mode: "full-access",
           systemPrompt: "A test system instruction",
           env: {},
@@ -144,8 +180,8 @@ it.each([true, false])(
             modes: expect.arrayContaining([
               expect.objectContaining({ id: "full-access", isUnattended: true }),
             ]),
-            model: "gemini-3.8-flash",
-            thinkingOption: "high",
+            model,
+            thinkingOption,
           }),
         }),
       );
@@ -165,13 +201,17 @@ it.each([true, false])(
         changes: { model: "gemini-4-neon-high" },
       });
       await expect
-        .poll(() =>
-          events.find(
-            (event) =>
-              event.type === "session.config" && event.config.model === "gemini-4-neon-high",
-          ),
+        .poll(
+          () => events.find((event) => "requestId" in event && event.requestId === "native-model"),
+          { timeout: 3_000 },
         )
-        .toBeDefined();
+        .toMatchObject({ type: "request.completed" });
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "session.config",
+          config: expect.objectContaining({ model: "gemini-4-neon-high" }),
+        }),
+      );
       const requests = (await readFile(launch.env.CAPTURE, "utf8"))
         .trim()
         .split("\n")
@@ -188,6 +228,102 @@ it.each([true, false])(
     }
   },
 );
+
+it.each([
+  ["gemini-3.8-flash-high", undefined, "gemini-3.8-flash", "high"],
+  ["gemini-3.8-flash-high", "low", "gemini-3.8-flash", "low"],
+  ["gpt-oss-120b-medium", undefined, "gpt-oss-120b-medium", "low"],
+  ["gemini-3.8-flash-xhigh", undefined, undefined, undefined],
+  ["gemini-3.8-flash-ultra", undefined, undefined, undefined],
+  ["gemini-3.8-flash-high", "removed-tier", undefined, undefined],
+])("opens model %s with explicit thinking %s", async (requested, explicit, model, thinking) => {
+  const { directory, launch } = await launchAgent(`
+    const { createInterface } = require("node:readline");
+    const model = {
+      id: "model", name: "Model", category: "model", type: "select", currentValue: "gpt-oss-120b",
+      options: ["gemini-3.8-flash", "gpt-oss-120b", "gpt-oss-120b-medium"].map(value => ({ value, name: value })),
+    };
+    const thought = {
+      id: "thought_level", name: "Thinking", category: "thought_level", type: "select", currentValue: "low",
+      options: ["low", "medium"].map(value => ({ value, name: value })),
+    };
+    const configOptions = [model, thought];
+    const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\\n");
+    createInterface({ input: process.stdin }).on("line", (line) => {
+      const { id, method, params } = JSON.parse(line);
+      switch (method) {
+        case "initialize":
+          send({ id, result: { protocolVersion: 1, agentCapabilities: {} } });
+          break;
+        case "session/new":
+          send({ id, result: { sessionId: "new", configOptions } });
+          break;
+        case "session/set_config_option": {
+          const option = configOptions.find(option => option.id === params.configId);
+          if (!option?.options.some(option => option.value === params.value)) {
+            send({ id, error: { code: -32602, message: "Unsupported value: " + params.value } });
+            break;
+          }
+          option.currentValue = params.value;
+          if (option === model && model.currentValue === "gemini-3.8-flash") {
+            thought.options = ["low", "high"].map(value => ({ value, name: value }));
+          }
+          send({ id, result: { configOptions } });
+          send({ method: "session/update", params: { sessionId: params.sessionId, update: {
+            sessionUpdate: "available_commands_update", availableCommands: [],
+          } } });
+          break;
+        }
+        case "session/close":
+          send({ id, result: {} });
+          break;
+      }
+    });
+  `);
+  const connection = await createAntigravityProvider().connect({
+    launch,
+    versions: [1],
+    capabilities: ["session.configure"],
+  });
+  const events: ProviderEvent[] = [];
+  connection.onEvent((event) => events.push(event));
+  try {
+    await connection.send({
+      type: "session.open",
+      sessionId: "test",
+      requestId: "open",
+      history: "skip",
+      config: {
+        cwd: directory,
+        persist: true,
+        model: requested,
+        thinkingOption: explicit,
+        env: {},
+        mcpServers: {},
+        settings: {},
+        mode: "",
+      },
+    });
+    const outcome = () =>
+      events.find((event) => event.type === "session.ready" || event.type === "request.failed");
+    if (model) {
+      await expect.poll(outcome, { timeout: 3_000 }).toMatchObject({ type: "session.ready" });
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "session.config",
+          config: expect.objectContaining({ model, thinkingOption: thinking }),
+        }),
+      );
+    } else {
+      await expect.poll(outcome, { timeout: 3_000 }).toMatchObject({
+        type: "request.failed",
+        error: { message: expect.stringContaining(`Unsupported value: ${explicit ?? requested}`) },
+      });
+    }
+  } finally {
+    await connection.close();
+  }
+});
 
 describe("installation", () => {
   const signal = new AbortController().signal;

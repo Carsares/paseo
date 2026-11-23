@@ -1,4 +1,4 @@
-import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
+import type { AgentModelDefinition, ProviderOptions } from "@getpaseo/protocol/agent-types";
 import type { HubExecutionAgentValidationIssue } from "@getpaseo/protocol/messages";
 
 import type { ProviderSnapshotEntry } from "./agent-sdk-types.js";
@@ -17,6 +17,29 @@ interface AgentConfigurationValidationContext {
   provider: ProviderSnapshotEntry;
 }
 
+function findAntigravityModel(
+  models: AgentModelDefinition[],
+  id: string,
+): AgentModelDefinition | undefined {
+  const reference = id.trim();
+  return (
+    models.find((model) => model.id === reference) ??
+    models.find((model) => model.aliases?.includes(reference))
+  );
+}
+
+// COMPAT(antigravityLegacyTieredModelId): added in v0.17.0, remove after 2027-06-01.
+function findAntigravityLegacyModel(
+  models: AgentModelDefinition[],
+  requestedModel: string,
+): AgentModelDefinition | undefined {
+  const legacy = /^(.+)-(minimal|low|medium|high|xhigh)$/.exec(requestedModel.trim());
+  if (!legacy) return undefined;
+  const [, baseId, tier] = legacy;
+  const model = findAntigravityModel(models, baseId);
+  return model?.thinkingOptions?.some((option) => option.id === tier) ? model : undefined;
+}
+
 export function validateAgentConfigurationAgainstProvider({
   input,
   provider,
@@ -24,9 +47,18 @@ export function validateAgentConfigurationAgainstProvider({
   const issues: HubExecutionAgentValidationIssue[] = [];
   const models = filterSelectableAgentModels(provider.models);
   const requestedModel = input.model;
-  const selectedModel = requestedModel
-    ? models.find((model) => model.id === requestedModel || model.aliases?.includes(requestedModel))
-    : (models.find((model) => model.isDefault) ?? models[0]);
+  let selectedModel: AgentModelDefinition | undefined;
+  if (!requestedModel) {
+    selectedModel = models.find((model) => model.isDefault) ?? models[0];
+  } else if (provider.provider === "antigravity") {
+    selectedModel =
+      findAntigravityModel(models, requestedModel) ??
+      findAntigravityLegacyModel(models, requestedModel);
+  } else {
+    selectedModel = models.find(
+      (model) => model.id === requestedModel || model.aliases?.includes(requestedModel),
+    );
+  }
 
   if (requestedModel && !selectedModel) {
     issues.push({

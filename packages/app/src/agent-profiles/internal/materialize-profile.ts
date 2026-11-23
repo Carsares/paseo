@@ -1,4 +1,6 @@
+import type { ProviderSnapshotEntry } from "@getpaseo/protocol/agent-types";
 import type { AgentConfigApply, AgentProfile } from "@getpaseo/protocol/messages";
+import { filterSelectableModels, resolveModelSelection } from "@/provider-selection/model-catalog";
 
 /**
  * A profile with its blank fields resolved away. Storage keeps every field
@@ -27,6 +29,21 @@ export function materializeAgentProfile(profile: AgentProfile): MaterializedAgen
     thinkingOptionId: trimmed(profile.thinkingOptionId),
     options: profile.options ?? {},
   };
+}
+
+export function resolveProfileModelSelection(
+  profile: MaterializedAgentProfile,
+  entries: readonly ProviderSnapshotEntry[] | undefined,
+) {
+  if (profile.provider !== "antigravity") return null;
+  const entry = entries?.find((item) => item.provider === profile.provider);
+  if (entry?.status !== "ready") return null;
+  return resolveModelSelection({
+    provider: profile.provider,
+    models: filterSelectableModels(entry.models ?? null),
+    modelId: profile.modelId,
+    thinkingOptionId: profile.thinkingOptionId,
+  });
 }
 
 export function reconcileMaterializedProfileMode(

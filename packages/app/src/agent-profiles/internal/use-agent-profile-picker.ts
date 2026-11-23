@@ -13,6 +13,7 @@ import { showProviderNoticeToast } from "@/utils/provider-notice-toast";
 import {
   materializeAgentProfile,
   reconcileMaterializedProfileMode,
+  resolveProfileModelSelection,
   toAgentConfigApply,
   type MaterializedAgentProfile,
 } from "./materialize-profile";
@@ -80,6 +81,15 @@ export function resolveAgentProfileApplication({
 }: AgentProfileApplicationInput): AgentProfileApplication | null {
   if (target.kind === "draft") {
     return { kind: "draft", controls: target.controls, profile: resolved };
+  }
+
+  const selection = resolveProfileModelSelection(resolved, entries);
+  if (selection && selection.model.id !== resolved.modelId) {
+    resolved = {
+      ...resolved,
+      modelId: selection.model.id,
+      thinkingOptionId: selection.legacyThinkingOptionId ?? resolved.thinkingOptionId,
+    };
   }
 
   const isCrossProvider =
@@ -237,7 +247,10 @@ export function useAgentProfilePicker(
       applicableProfiles.map((profile) => ({
         id: profile.id,
         provider: profile.provider,
-        modelId: profile.model?.trim() ?? "",
+        modelId:
+          resolveProfileModelSelection(materializeAgentProfile(profile), entries)?.model.id ??
+          profile.model?.trim() ??
+          "",
         icon: profile.icon ?? "",
         color: profile.color ?? "",
         name: profile.name,

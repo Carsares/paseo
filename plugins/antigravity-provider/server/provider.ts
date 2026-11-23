@@ -49,25 +49,34 @@ const antigravity: AcpTransformer = {
     return readHistory({ conversationId: nativeSessionId, launch, config });
   },
   async configure(change, { apply, catalog }) {
-    // COMPAT(antigravityStreamJson): added in v0.16.2, remove after 2027-11-19.
-    if (change.target === "model" && change.value) {
-      const legacyModel = /^(.*)-(xhigh|high|medium|low|minimal)$/.exec(change.value);
-      if (legacyModel) {
-        const { models } = catalog();
-        const [, model, effort] = legacyModel;
-        if (
-          !models.some((option) => option.id === change.value) &&
-          models.some((option) => option.id === model)
-        ) {
-          await apply({ target: "model", value: model });
-          if (catalog().thinkingOptions?.some((option) => option.id === effort)) {
-            await apply({ target: "thinking", value: effort });
-          }
-          return "handled";
-        }
-      }
+    // COMPAT(antigravityLegacyTieredModelId): added in v0.17.0, remove after 2027-06-01.
+    if (change.target !== "model" || !change.value) return "pass";
+    const requestedModel = change.value;
+    const legacyModel = /^(.+)-(minimal|low|medium|high|xhigh)$/.exec(requestedModel);
+    if (!legacyModel) return "pass";
+
+    const current = catalog();
+    if (
+      current.models.some(
+        (model) => model.id === requestedModel || model.aliases?.includes(requestedModel),
+      )
+    ) {
+      return "pass";
     }
-    return "pass";
+    const [, baseId, effort] = legacyModel;
+    const model =
+      current.models.find((candidate) => candidate.id === baseId) ??
+      current.models.find((candidate) => candidate.aliases?.includes(baseId));
+    if (!model) return "pass";
+
+    // ACP exposes the thinking options for the current model. Switching models
+    // can change that list, so check the tier only after the base model is active.
+    if (current.defaultModel !== model.id) {
+      await apply({ target: "model", value: model.id });
+    }
+    if (!catalog().thinkingOptions?.some((option) => option.id === effort)) return "pass";
+    await apply({ target: "thinking", value: effort });
+    return "handled";
   },
 };
 

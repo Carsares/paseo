@@ -73,6 +73,50 @@ const ALIASED_CODEX_MODELS: AgentModelDefinition[] = [
   { ...CODEX_MODELS[0], aliases: ["gpt-5.3-codex-legacy"] },
 ];
 
+const ANTIGRAVITY_MODELS: AgentModelDefinition[] = [
+  {
+    provider: "antigravity",
+    id: "gemini-4-neon",
+    label: "Gemini 4 Neon",
+    isDefault: true,
+    defaultThinkingOptionId: "high",
+    thinkingOptions: [
+      { id: "high", label: "High" },
+      { id: "xhigh", label: "Extra high" },
+    ],
+  },
+  {
+    provider: "antigravity",
+    id: "gemini-4-carbon",
+    aliases: ["carbon"],
+    label: "Gemini 4 Carbon",
+    defaultThinkingOptionId: "low",
+    thinkingOptions: [
+      { id: "low", label: "Low" },
+      { id: "high", label: "High" },
+    ],
+  },
+  {
+    provider: "antigravity",
+    id: "claude-opus-5-5",
+    label: "Claude Opus 5.5",
+    thinkingOptions: [{ id: "high", label: "High" }],
+  },
+  {
+    provider: "antigravity",
+    id: "gpt-oss-120b",
+    aliases: ["gpt-oss-native"],
+    label: "GPT OSS 120B",
+    thinkingOptions: [{ id: "medium", label: "Medium" }],
+  },
+  {
+    provider: "antigravity",
+    id: "gpt-oss-120b-medium",
+    aliases: ["gpt-oss-native-medium"],
+    label: "GPT OSS 120B Medium",
+  },
+];
+
 function makeProviderMap(
   ...definitions: AgentProviderDefinition[]
 ): Map<AgentProvider, AgentProviderDefinition> {
@@ -1268,4 +1312,120 @@ it("owns input readiness, reopening and user edits in the reducer", () => {
   expect(state.resolution.status).toBe("pending");
   state = resolveAgentForm(state, { ...inputs, isPreferencesLoading: false, hasSnapshot: true });
   expect(state.form).toMatchObject({ provider: "codex", model: "astra" });
+});
+
+describe("Antigravity profiles and drafts saved with tiered model ids", () => {
+  it.each([
+    ["gemini-4-neon-xhigh", "", "gemini-4-neon", "xhigh"],
+    ["gemini-4-carbon-high", "", "gemini-4-carbon", "high"],
+    ["claude-opus-5-5-high", "", "claude-opus-5-5", "high"],
+    ["carbon-high", " low ", "gemini-4-carbon", "low"],
+    ["carbon-high", "unavailable", "gemini-4-carbon", "high"],
+    ["gemini-4-carbon-ultra", "", "gemini-4-neon", "high"],
+    ["gemini-4-carbon-xhigh", "", "gemini-4-neon", "high"],
+    ["gpt-oss-120b-medium", "", "gpt-oss-120b-medium", ""],
+    ["gpt-oss-native-medium", "", "gpt-oss-120b-medium", ""],
+  ])(
+    "applies profile %s with explicit thinking %j",
+    (modelId, thinkingOptionId, model, thinking) => {
+      const state = resolveAgentForm(makeState(), {
+        type: "APPLY_PROFILE_FROM_USER",
+        provider: "antigravity",
+        providerDef: undefined,
+        providerModels: ANTIGRAVITY_MODELS,
+        providerPrefs: { thinkingByModel: { "gemini-4-carbon": "low" } },
+        modelId,
+        modeId: "",
+        thinkingOptionId,
+      });
+
+      expect(state.form).toMatchObject({ model, thinkingOptionId: thinking });
+    },
+  );
+
+  const inputs = {
+    type: "INPUTS_CHANGED" as const,
+    serverId: "host",
+    isVisible: true,
+    isCreateFlow: true,
+    isPreferencesLoading: false,
+    hasSnapshot: true,
+    initialValues: { provider: "antigravity", model: "gemini-4-carbon-high" },
+    preferences: {
+      provider: "antigravity",
+      providerPreferences: { antigravity: { thinkingByModel: { "gemini-4-carbon": "low" } } },
+    },
+    providerModelsByProvider: makeProviderModelsByProvider([["antigravity", null]]),
+    allowedProviderMap: makeProviderMap(),
+  };
+  const readyModels = makeProviderModelsByProvider([["antigravity", ANTIGRAVITY_MODELS]]);
+
+  it.each([
+    [undefined, "high"],
+    ["low", "low"],
+    ["unavailable", "high"],
+  ])(
+    "resolves draft thinking %j on opening or when the catalog arrives",
+    (thinkingOptionId, thinking) => {
+      const draft = { ...inputs, initialValues: { ...inputs.initialValues, thinkingOptionId } };
+      const ready = { ...draft, providerModelsByProvider: readyModels };
+      const waiting = resolveAgentForm(makeState(), draft);
+      expect(waiting.form.model).toBe("gemini-4-carbon-high");
+      expect(waiting.resolution.status).toBe("completed");
+      const updated = resolveAgentForm(waiting, ready);
+      expect(updated.form).toMatchObject({ model: "gemini-4-carbon", thinkingOptionId: thinking });
+      expect(resolveAgentForm(makeState(), ready).form).toEqual(updated.form);
+      expect(resolveAgentForm(updated, ready)).toBe(updated);
+    },
+  );
+
+  it("resolves a profile applied before the directory lists any models", () => {
+    const waiting = resolveAgentForm(makeState(), { ...inputs, initialValues: undefined });
+    const profile = resolveAgentForm(waiting, {
+      type: "APPLY_PROFILE_FROM_USER",
+      provider: "antigravity",
+      providerDef: undefined,
+      providerModels: [],
+      modelId: "gemini-4-carbon-high",
+      modeId: "",
+      thinkingOptionId: "low",
+    });
+    expect(profile.form).toMatchObject({ model: "gemini-4-carbon-high", thinkingOptionId: "low" });
+    const ready = {
+      ...inputs,
+      initialValues: undefined,
+      providerModelsByProvider: readyModels,
+    };
+    const updated = resolveAgentForm(profile, ready);
+    expect(updated.form).toMatchObject({ model: "gemini-4-carbon", thinkingOptionId: "low" });
+  });
+
+  it("keeps a user model change when the saved model becomes recognizable", () => {
+    const waiting = resolveAgentForm(makeState(), inputs);
+    const edited = resolveAgentForm(waiting, {
+      type: "SET_MODEL_FROM_USER",
+      modelId: "gpt-oss-120b-medium",
+      availableModels: null,
+      providerPrefs: undefined,
+    });
+    expect(resolveAgentForm(edited, { ...inputs, providerModelsByProvider: readyModels })).toBe(
+      edited,
+    );
+  });
+
+  it.each(["gpt-oss-120b-medium", "gpt-oss-native-medium"])(
+    "reconciles unsupported draft thinking when the full reference %s arrives",
+    (model) => {
+      const draft = {
+        ...inputs,
+        initialValues: { ...inputs.initialValues, model, thinkingOptionId: "medium" },
+      };
+      const waiting = resolveAgentForm(makeState(), draft);
+      const ready = { ...draft, providerModelsByProvider: readyModels };
+      const updated = resolveAgentForm(waiting, ready);
+
+      expect(updated.form).toMatchObject({ model: "gpt-oss-120b-medium", thinkingOptionId: "" });
+      expect(updated.form).toEqual(resolveAgentForm(makeState(), ready).form);
+    },
+  );
 });

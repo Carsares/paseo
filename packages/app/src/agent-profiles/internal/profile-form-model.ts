@@ -9,7 +9,7 @@ import type {
 import type { AgentProfile } from "@getpaseo/protocol/messages";
 import { withoutLostControls } from "@/agent-controls/lost-controls";
 import { formatAgentModeLabel, formatThinkingOptionLabel } from "@/agent-controls/labels";
-import { filterSelectableModels } from "@/provider-selection/model-catalog";
+import { filterSelectableModels, resolveModelSelection } from "@/provider-selection/model-catalog";
 
 /**
  * The persisted profile minus the id; the list owns identity.
@@ -129,7 +129,7 @@ export interface AgentProfileFormModel {
   getState: () => AgentProfileFormState;
   subscribe: (listener: () => void) => () => void;
   close: () => void;
-  /** Late input: the host-scoped provider catalog. Never touches selections. */
+  /** Late input: the host-scoped provider catalog. */
   applyProviderCatalog: (entries: readonly ProviderSnapshotEntry[]) => void;
   /** Late input: the feature list for one request. Stale keys are ignored. */
   applyControls: (
@@ -285,6 +285,26 @@ function defaultThinkingOptionId(model: AgentModelDefinition | null): string {
     options[0]?.id ??
     ""
   );
+}
+
+function resolveStoredModelSelection(
+  state: AgentProfileFormState,
+  entry: ProviderSnapshotEntry | null,
+  models: readonly AgentModelDefinition[],
+): AgentProfileFormState {
+  if (entry?.status !== "ready" || state.provider !== "antigravity") return state;
+  const selection = resolveModelSelection({
+    provider: state.provider,
+    models,
+    modelId: state.modelId,
+    thinkingOptionId: state.thinkingOptionId,
+  });
+  if (!selection || selection.model.id === state.modelId) return state;
+  return {
+    ...state,
+    modelId: selection.model.id,
+    thinkingOptionId: selection.legacyThinkingOptionId ?? state.thinkingOptionId,
+  };
 }
 
 function seedSelections(
@@ -487,11 +507,12 @@ export function openAgentProfileForm(snapshot: AgentProfileFormSnapshot): AgentP
   let closed = false;
 
   function derive(incoming: AgentProfileFormState): AgentProfileFormState {
+    const providerEntry = findEntry(entries, incoming.provider);
     const models = resolveModels(entries, incoming.provider);
     const modes = resolveModes(entries, incoming.provider);
     const next: AgentProfileFormState = {
-      ...seedSelections(incoming, {
-        entry: findEntry(entries, incoming.provider),
+      ...seedSelections(resolveStoredModelSelection(incoming, providerEntry, models), {
+        entry: providerEntry,
         models,
         modes,
       }),

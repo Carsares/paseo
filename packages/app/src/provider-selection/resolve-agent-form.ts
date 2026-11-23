@@ -9,7 +9,7 @@ import {
   type FormPreferences,
   type ProviderPreferences,
 } from "@/hooks/use-form-preferences";
-import { findModelByReference } from "./model-catalog";
+import { findModelByReference, resolveModelSelection } from "./model-catalog";
 
 export interface FormInitialValues {
   provider?: AgentProvider;
@@ -369,6 +369,23 @@ function resolveThinkingOption(input: {
   return "";
 }
 
+function resolveDraftModelSelection(
+  form: FormState,
+  models: AgentModelDefinition[] | null,
+  initialValues: FormInitialValues | undefined,
+  userModified: UserModifiedFields,
+) {
+  if (form.provider !== "antigravity") return null;
+  return resolveModelSelection({
+    provider: form.provider,
+    models,
+    modelId: form.model,
+    thinkingOptionId: userModified.thinkingOptionId
+      ? form.thinkingOptionId
+      : initialValues?.thinkingOptionId,
+  });
+}
+
 export function resolveFormState(
   initialValues: FormInitialValues | undefined,
   preferences: FormPreferences | null,
@@ -409,6 +426,18 @@ export function resolveFormState(
     availableModels,
   });
 
+  const selection = resolveDraftModelSelection(
+    result,
+    availableModels,
+    initialValues,
+    userModified,
+  );
+  if (selection?.legacyThinkingOptionId !== undefined) {
+    result.model = selection.model.id;
+    result.thinkingOptionId = selection.legacyThinkingOptionId;
+    return result;
+  }
+
   result.thinkingOptionId = resolveThinkingOption({
     provider: result.provider,
     userModified: userModified.thinkingOptionId,
@@ -419,7 +448,11 @@ export function resolveFormState(
     availableModels,
   });
 
-  if (result.provider && availableModels) {
+  if (
+    result.provider &&
+    availableModels &&
+    (result.provider !== "antigravity" || availableModels.length > 0)
+  ) {
     result.thinkingOptionId = resolveThinkingOptionId({
       availableModels,
       modelId: result.model,
@@ -533,7 +566,33 @@ function completeResolution(
   action: CompleteResolutionAction,
 ): AgentFormReducerState {
   if (state.resolution.status === "completed") {
-    return state;
+    // The snapshot can arrive before the selected provider's models. Reconcile
+    // the stored model and its tier in place without reapplying preferences.
+    const { form } = state;
+    if (form.provider !== "antigravity") return state;
+    const availableModels = action.providerModelsByProvider.get(form.provider) ?? null;
+    const selection = resolveDraftModelSelection(
+      form,
+      availableModels,
+      action.initialValues,
+      state.userModified,
+    );
+    if (!selection) return state;
+    const model = selection.model.id;
+    const thinkingOptionId =
+      selection.legacyThinkingOptionId ??
+      (state.userModified.model || state.userModified.thinkingOptionId
+        ? form.thinkingOptionId
+        : resolveThinkingOptionId({
+            availableModels,
+            modelId: model,
+            requestedThinkingOptionId: form.thinkingOptionId,
+          }));
+    if (model === form.model && thinkingOptionId === form.thinkingOptionId) return state;
+    return {
+      ...state,
+      form: { ...form, model, thinkingOptionId },
+    };
   }
   const resolved = resolveFormStateFromProviderModels(
     action.initialValues,
@@ -548,10 +607,33 @@ function completeResolution(
   return { ...nextState, form: resolved };
 }
 
+function resolveUserModelSelection(
+  provider: AgentProvider | null,
+  models: AgentModelDefinition[] | null,
+  modelId: string,
+  thinkingOptionId?: string,
+) {
+  const selection = resolveModelSelection({ provider, models, modelId, thinkingOptionId });
+  return {
+    modelId:
+      selection?.model.id ??
+      (models ? resolveDefaultModelId(models) : normalizeSelectedModelId(modelId)),
+    legacyThinkingOptionId: selection?.legacyThinkingOptionId,
+  };
+}
+
 function applyProfile(state: AgentFormReducerState, action: ApplyProfileAction) {
   const preferredModelId = action.modelId || action.providerPrefs?.model || "";
-  const normalizedModelId = resolveCanonicalModelId(action.providerModels, preferredModelId);
-  const nextModelId = normalizedModelId || resolveDefaultModelId(action.providerModels);
+  const providerModels =
+    action.provider === "antigravity" && !action.providerModels?.length
+      ? null
+      : action.providerModels;
+  const { modelId: nextModelId, legacyThinkingOptionId } = resolveUserModelSelection(
+    action.provider,
+    providerModels,
+    preferredModelId,
+    action.thinkingOptionId,
+  );
   const availableModeIds = new Set(action.providerDef?.modes.map((mode) => mode.id) ?? []);
   const preferredModeId = action.modeId || action.providerPrefs?.mode || "";
   const defaultModeId = action.providerDef?.defaultModeId ?? "";
@@ -562,9 +644,10 @@ function applyProfile(state: AgentFormReducerState, action: ApplyProfileAction) 
     nextModeId = defaultModeId;
   }
   const nextThinkingOptionId =
+    legacyThinkingOptionId ||
     action.thinkingOptionId ||
     pickNextThinkingOptionForProvider({
-      providerModels: action.providerModels,
+      providerModels,
       providerPrefs: action.providerPrefs,
       modelId: nextModelId,
     });
@@ -637,16 +720,21 @@ export function resolveAgentForm(
       return completeResolution(state, action);
 
     case "SET_PROVIDER_AND_MODEL_FROM_USER": {
-      const normalizedModelId = resolveCanonicalModelId(action.providerModels, action.modelId);
-      const nextModelId = normalizedModelId || resolveDefaultModelId(action.providerModels);
-      const nextThinkingOptionId = pickNextThinkingOptionForTarget({
-        availableModels: action.providerModels,
-        modelId: nextModelId,
-        providerPrefs: action.providerPrefs,
-        currentModelId: state.form.model,
-        currentThinkingOptionId: state.form.thinkingOptionId,
-        isSameProvider: state.form.provider === action.provider,
-      });
+      const { modelId: nextModelId, legacyThinkingOptionId } = resolveUserModelSelection(
+        action.provider,
+        action.providerModels,
+        action.modelId,
+      );
+      const nextThinkingOptionId =
+        legacyThinkingOptionId ??
+        pickNextThinkingOptionForTarget({
+          availableModels: action.providerModels,
+          modelId: nextModelId,
+          providerPrefs: action.providerPrefs,
+          currentModelId: state.form.model,
+          currentThinkingOptionId: state.form.thinkingOptionId,
+          isSameProvider: state.form.provider === action.provider,
+        });
       const nextModeId = pickNextModeForProviderAndModel({
         currentProvider: state.form.provider,
         currentModeId: state.form.modeId,
@@ -679,16 +767,21 @@ export function resolveAgentForm(
       };
 
     case "SET_MODEL_FROM_USER": {
-      const normalizedModelId = resolveCanonicalModelId(action.availableModels, action.modelId);
-      const nextModelId = normalizedModelId || resolveDefaultModelId(action.availableModels);
-      const nextThinkingOptionId = pickNextThinkingOptionForTarget({
-        availableModels: action.availableModels,
-        modelId: nextModelId,
-        providerPrefs: action.providerPrefs,
-        currentModelId: state.form.model,
-        currentThinkingOptionId: state.form.thinkingOptionId,
-        isSameProvider: true,
-      });
+      const { modelId: nextModelId, legacyThinkingOptionId } = resolveUserModelSelection(
+        state.form.provider,
+        action.availableModels,
+        action.modelId,
+      );
+      const nextThinkingOptionId =
+        legacyThinkingOptionId ??
+        pickNextThinkingOptionForTarget({
+          availableModels: action.availableModels,
+          modelId: nextModelId,
+          providerPrefs: action.providerPrefs,
+          currentModelId: state.form.model,
+          currentThinkingOptionId: state.form.thinkingOptionId,
+          isSameProvider: true,
+        });
       return {
         ...state,
         form: {
