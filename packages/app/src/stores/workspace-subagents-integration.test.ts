@@ -1,5 +1,9 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import { parentAddressLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  parentAddressLabels,
+  RESIDENT_AGENT_LABEL,
+  RESIDENT_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildWorkspaceTabSnapshot,
@@ -176,6 +180,24 @@ describe("workspace subagents integration", () => {
         new Set(),
       ).map((row) => row.id),
     ).toEqual(["child-agent"]);
+
+    appendAgent({
+      ...child,
+      labels: {
+        ...child.labels,
+        [RESIDENT_AGENT_LABEL]: "true",
+        [RESIDENT_ROLE_LABEL]: "Reviewer",
+      },
+    });
+    reconcileWorkspaceTabs(workspaceKey!, deriveVisibilityFromSession());
+    expect(getWorkspaceAgentTabIds(workspaceKey!)).toEqual(["agent_parent-agent"]);
+    expect(
+      selectSubagentsForParent(
+        useSessionStore.getState(),
+        { serverId: SERVER_ID, parentAgentId: "parent-agent" },
+        new Set(),
+      ),
+    ).toMatchObject([{ id: "child-agent", resident: { role: "Reviewer" } }]);
   });
 
   it("moves a detached child out of the parent section and back into normal workspace tabs", () => {

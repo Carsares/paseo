@@ -1,4 +1,5 @@
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
+import { isResidentAgent } from "@getpaseo/protocol/agent-labels";
 import type { Agent } from "@/stores/session-store";
 import type { SubagentRow } from "./select";
 
@@ -22,7 +23,8 @@ export interface ArchiveFinishedOutcome {
 export type ManagedSubagentSnapshot = Pick<
   Agent,
   "id" | "status" | "parentAgentId" | "archivedAt" | "backgroundWork"
->;
+> &
+  Partial<Pick<Agent, "labels">>;
 
 export interface ArchiveFinishedSubagentsDeps {
   parentAgentId: string;
@@ -41,7 +43,9 @@ export interface ArchiveFinishedSubagents {
 export function isFinishedSubagent(row: SubagentRow): boolean {
   if (row.kind === "paseo")
     return (
-      (row.status === "idle" || row.status === "error") && (row.backgroundWork?.count ?? 0) === 0
+      !row.resident &&
+      (row.status === "idle" || row.status === "error") &&
+      (row.backgroundWork?.count ?? 0) === 0
     );
   return row.status === "completed" || row.status === "failed" || row.status === "canceled";
 }
@@ -53,6 +57,7 @@ function canArchiveManagedSubagent(
   return Boolean(
     agent &&
     !agent.archivedAt &&
+    !isResidentAgent(agent) &&
     agent.parentAgentId === parentAgentId &&
     (agent.backgroundWork?.count ?? 0) === 0 &&
     (agent.status === "idle" || agent.status === "error"),

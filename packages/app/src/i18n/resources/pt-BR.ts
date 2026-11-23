@@ -2193,6 +2193,36 @@ export const ptBR: TranslationResources = {
     backdrop: "Fundo do menu",
   },
   subagents: {
+    resident: {
+      groupTitle: "Especialistas residentes",
+      createAction: "Criar especialista residente",
+      bindAction: "Marcar como residente",
+      unbindAction: "Remover status de residente",
+      resetAction: "Redefinir sessão",
+      createTitle: "Criar um especialista residente",
+      bindTitle: "Marcar subagente como residente",
+      unbindTitle: "Remover o status de residente?",
+      resetTitle: "Redefinir a sessão do agente?",
+      profile: "Perfil de agente",
+      role: "Função",
+      roleSlug: "Identificador da função",
+      urgentReport: "Relatórios urgentes",
+      keepAlive: "Manter ativo",
+      interrupt: "Interromper o trabalho atual",
+      clearVisibleTimeline: "Limpar a linha do tempo visível",
+      resetDescription: "Inicia uma nova sessão e mantém a identidade deste agente.",
+      clearVisibleTimelineDescription:
+        "Limpa as mensagens exibidas na linha do tempo deste agente.",
+      unbindDescription:
+        "Este subagente continuará vinculado ao agente pai como um subagente comum.",
+      confirmCreate: "Criar especialista",
+      confirmBind: "Marcar como residente",
+      confirmUnbind: "Remover status de residente",
+      confirmReset: "Redefinir sessão",
+      emptyProfiles: "Primeiro, adicione um perfil de agente nas configurações do host.",
+      updateHost: "Atualize este host para usar especialistas residentes ou redefinir sessões.",
+      error: "Falha ao executar a ação: {{message}}",
+    },
     parent: {
       backToParent: "Voltar ao pai",
       backTo: "Voltar para {{label}}",
@@ -3127,6 +3157,20 @@ export const ptBR: TranslationResources = {
           "Nenhum perfil ainda. Adicione um para abrir terminais com um comando específico.",
       },
       agentProfiles: {
+        residentRole: {
+          slug: "Identificador da função",
+          slugHint:
+            "Até {{max}} caracteres. Comece e termine com uma letra minúscula ou um número. Use - ou _ no meio.",
+          slugError: "Confira o tamanho e o formato do identificador.",
+          prompt: "Instruções da função",
+          promptHint:
+            "São usadas quando a ferramenta create_agent usa este perfil, ao criar um especialista residente a partir dele ou ao redefinir uma sessão vinculada.",
+          promptError: "Use no máximo {{max}} caracteres.",
+          defaults: "Configurações padrão de residência",
+          defaultResident: "Marcar como residente por padrão",
+          urgentReport: "Relatórios urgentes",
+          keepAlive: "Manter ativo",
+        },
         sectionTitle: "Perfis de agente",
         unavailable: "Conecte-se a este host para gerenciar perfis de agente",
         unsupported: "Este host executa um daemon que ainda não é compatível com perfis de agente",

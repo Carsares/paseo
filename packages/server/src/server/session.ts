@@ -87,7 +87,6 @@ import {
   buildConfigOverrides,
   isStoredAgentProviderAvailable,
   resolveStoredAgentUpdatedAt,
-  toAgentPersistenceHandle,
 } from "./persistence-hooks.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
 import { summarizeWorkspaceAgents } from "./agent/workspace-agents-summary.js";
@@ -3518,6 +3517,12 @@ export class Session {
         return this.handleAgentInboxFlush(msg);
       case "agent.set_parent.request":
         return this.handleSetAgentParentRequest(msg);
+      case "agent.resident.set.request":
+        return this.handleSetAgentResidentRequest(msg);
+      case "agent.resident.create.request":
+        return this.handleCreateResidentAgentRequest(msg);
+      case "agent.session.reset.request":
+        return this.handleResetAgentSessionRequest(msg);
       case "agent.move_to_workspace.request":
         return this.handleMoveAgentToWorkspaceRequest(
           msg.agentId,
@@ -4275,6 +4280,97 @@ export class Session {
     }
 
     return { agentId, archivedAt };
+  }
+
+  private async requireResidentOperationWorkspace(agentId: string) {
+    if (readDirectParentRoute(this.getHostSourceId())) {
+      throw new Error("A direct-parent route cannot manage resident agents or reset sessions.");
+    }
+    const stored = await this.agentStorage.get(agentId);
+    const agent = this.agentManager.getAgent(agentId) ?? stored;
+    if (!agent?.workspaceId || agent.internal || stored?.archivedAt) {
+      throw new Error("Agent is unavailable in an active workspace.");
+    }
+    return this.requireMoveSourceWorkspace(agent.workspaceId);
+  }
+
+  private async handleSetAgentResidentRequest({
+    agentId,
+    resident,
+    requestId,
+    type: _type,
+    ...options
+  }: Extract<SessionInboundMessage, { type: "agent.resident.set.request" }>) {
+    let error: string | null = null;
+    try {
+      await this.requireResidentOperationWorkspace(agentId);
+      await this.agentManager.setAgentResident(agentId, resident, options);
+    } catch (failure) {
+      error = getErrorMessageOr(failure, "Failed to change agent residency");
+    }
+    this.emit({
+      type: "agent.resident.set.response",
+      payload: { agentId, requestId, accepted: error === null, error },
+    });
+  }
+
+  private async handleCreateResidentAgentRequest({
+    parentAgentId,
+    requestId,
+    type: _type,
+    ...options
+  }: Extract<SessionInboundMessage, { type: "agent.resident.create.request" }>) {
+    try {
+      const workspace = await this.requireResidentOperationWorkspace(parentAgentId);
+      const release = this.reserveWorkspaceMove(workspace.workspaceId);
+      try {
+        const result = await this.agentManager.createSilentResidentSubagent({
+          ...options,
+          parentAgentId,
+          expectedWorkspaceId: workspace.workspaceId,
+        });
+        this.emit({
+          type: "agent.resident.create.response",
+          payload: { requestId, accepted: true, ...result, error: null },
+        });
+      } finally {
+        release();
+      }
+    } catch (failure) {
+      this.emit({
+        type: "agent.resident.create.response",
+        payload: {
+          requestId,
+          accepted: false,
+          agentId: null,
+          created: false,
+          error: getErrorMessageOr(failure, "Failed to create resident agent"),
+        },
+      });
+    }
+  }
+
+  private async handleResetAgentSessionRequest({
+    agentId,
+    requestId,
+    interrupt,
+    clearVisibleTimeline,
+  }: Extract<SessionInboundMessage, { type: "agent.session.reset.request" }>) {
+    let error: string | null = null;
+    try {
+      const workspace = await this.requireResidentOperationWorkspace(agentId);
+      await this.agentManager.resetAgentSession(agentId, {
+        interrupt,
+        clearVisibleTimeline,
+        expectedWorkspaceId: workspace.workspaceId,
+      });
+    } catch (failure) {
+      error = getErrorMessageOr(failure, "Failed to reset agent session");
+    }
+    this.emit({
+      type: "agent.session.reset.response",
+      payload: { agentId, requestId, accepted: error === null, error },
+    });
   }
 
   private async handleSetAgentMainRequest(
@@ -6385,7 +6481,7 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "refresh_agent_request" }>,
   ): Promise<void> {
     const { agentId, requestId } = msg;
-    this.sessionLogger.info({ agentId }, `Refreshing agent ${agentId} from persistence`);
+    this.sessionLogger.info({ agentId }, `Refreshing agent ${agentId}`);
 
     try {
       await this.restoreOwningWorkspaceForLegacyAgentRefresh(agentId);
@@ -6398,17 +6494,7 @@ export class Session {
           rehydrateFromDisk: true,
         });
       } else {
-        const record = await this.agentStorage.get(agentId);
-        if (!record) {
-          throw new Error(`Agent not found: ${agentId}`);
-        }
-        const registeredProviderIds = this.providerSnapshotManager.listRegisteredProviderIds();
-        if (!isStoredAgentProviderAvailable(record, registeredProviderIds)) {
-          throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
-        }
-        if (!toAgentPersistenceHandle(registeredProviderIds, record.persistence)) {
-          throw new Error(`Agent ${agentId} cannot be refreshed because it lacks persistence`);
-        }
+        // The loader can open a fresh provider session from the stored config when no handle exists.
         // Share the loader's per-agent in-flight operation with timeline fetches.
         // Unarchiving publishes the record before provider resume finishes, so
         // the agent pane can otherwise race this request and resume it twice.

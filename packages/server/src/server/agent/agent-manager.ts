@@ -19,21 +19,34 @@ import {
 } from "@getpaseo/protocol/agent-lifecycle";
 import {
   EXPLICIT_PARENT_REPORTING,
+  getAgentProfileIdFromLabels,
   getMainPriorModeIdFromLabels,
   getParentAddressFromLabels,
   getParentAgentIdFromLabels,
+  getResidentRoleFromLabels,
+  getResidentRoleSlugFromLabels,
+  hasResidentKeepAlive,
   isExplicitParentReportingLabels,
   hasOpenAgentTab,
   isDelegatedAgent,
   isMainControlAgentLabels,
   isOpenAgentTabLabel,
+  isResidentAgentLabels,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
+  RESIDENT_SLUG_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
+import type { AgentProfile } from "@getpaseo/protocol/agent-profile";
+import {
+  buildResidentSpecialistsPrompt,
+  clearResidentLabels,
+  residentLabelPatch,
+  type ResidentOptions,
+} from "./resident-specialists.js";
 import type { Logger } from "pino";
 import type { ToolPolicy } from "@getpaseo/protocol/agent-types";
 import { getErrorMessage } from "@getpaseo/protocol/error-utils";
@@ -252,7 +265,7 @@ function foregroundStartFailure(error: unknown, message: string) {
 }
 
 export class AgentRunCancellationError extends Error {
-  constructor(agentId: string, action: "reload" | "replace" | "rewind" | "stop") {
+  constructor(agentId: string, action: "reload" | "replace" | "rewind" | "stop" | "reset") {
     super(
       `Cannot ${action} agent ${agentId} because its active run cancellation was not acknowledged`,
     );
@@ -425,6 +438,21 @@ function buildStoredAgentConfig(record: StoredAgentRecord): AgentSessionConfig {
   return stripInternalPaseoMcpServer(config);
 }
 
+function assertCurrentStoredSession(
+  record: StoredAgentRecord | null,
+  handle: AgentPersistenceHandle,
+): void {
+  if (
+    record?.timelinePrefixSwitchId &&
+    (record.persistence?.sessionId !== handle.sessionId ||
+      record.persistence?.provider !== handle.provider)
+  ) {
+    throw new Error(
+      `Agent ${record.id} changed sessions while it was being loaded. Retry the request.`,
+    );
+  }
+}
+
 export { AGENT_LIFECYCLE_STATUSES, type AgentLifecycleStatus };
 export type {
   AgentTimelineCursor,
@@ -546,6 +574,20 @@ interface SwitchAgentProviderInput {
   options?: ProviderOptionsPatch;
 }
 
+interface CreateResidentAgentInput extends ResidentOptions {
+  parentAgentId: string;
+  expectedWorkspaceId?: string;
+  provider?: AgentProvider;
+  config?: AgentSessionConfig & LegacyFeatureValues;
+}
+
+interface ResetAgentSessionOptions {
+  interrupt?: boolean;
+  clearVisibleTimeline?: boolean;
+  expectedParentAgentId?: string;
+  expectedWorkspaceId?: string;
+}
+
 export interface MoveSubagentToWorkspaceSource {
   agentId: string;
   cwd: string;
@@ -616,6 +658,7 @@ export interface AgentManagerOptions {
   idFactory?: () => string;
   registry?: AgentStorage;
   workspaceRegistry?: Pick<WorkspaceRegistry, "get">;
+  getAgentProfile?: (id: string) => AgentProfile | undefined;
   onAgentAttention?: AgentAttentionCallback;
   onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   onAgentRunAccepted?: AgentRunAcceptedCallback;
@@ -1094,7 +1137,13 @@ function shouldDetachFromArchivedParent(
     parent.workspaceId !== undefined &&
     child.workspaceId !== undefined &&
     parent.workspaceId !== child.workspaceId;
-  return isCrossWorkspace || hasOpenAgentTab(child.labels);
+  return isCrossWorkspace || hasOpenAgentTab(child.labels) || isResidentAgentLabels(child.labels);
+}
+
+function parentReportingForReparent(labels?: Record<string, string>): string {
+  return !isResidentAgentLabels(labels) && labels?.[PARENT_REPORTING_LABEL] === "auto"
+    ? "auto"
+    : EXPLICIT_PARENT_REPORTING;
 }
 
 function clearOpenAgentTabLabelPatch(labels: Record<string, string>): AgentLabelPatch {
@@ -1109,7 +1158,8 @@ function clearOpenAgentTabLabelPatch(labels: Record<string, string>): AgentLabel
 
 function detachedAgentLabelPatch(labels: Record<string, string>): AgentLabelPatch {
   return {
-    ...clearOpenAgentTabLabelPatch(labels),
+    // Resident specialists keep their role and tab when they lose a parent.
+    ...(isResidentAgentLabels(labels) ? {} : clearOpenAgentTabLabelPatch(labels)),
     [PARENT_AGENT_ID_LABEL]: null,
     [PARENT_SERVER_ID_LABEL]: null,
     [REMOTE_HIERARCHY_DEPTH_LABEL]: null,
@@ -1340,6 +1390,8 @@ export class AgentManager {
   private readonly mainControlRoleUpdates = new Set<string>();
   private readonly mainControlRoleVersions = new Map<string, number>();
   private readonly promptedMainControlRoleVersions = new Map<string, number>();
+  private readonly promptedResidentSpecialists = new WeakMap<AgentSession, string>();
+  private readonly resumedProviderSessions = new WeakSet<AgentSession>();
   private readonly inPlaceMainControlSessions = new WeakSet<AgentSession>();
   private readonly launchMainControlRoleVersions = new WeakMap<AgentSessionConfig, number>();
   private readonly pendingCancellations = new Map<string, Promise<unknown>>();
@@ -1367,6 +1419,8 @@ export class AgentManager {
   private logger: Logger;
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
   private readonly beforeSteerUnavailableFallback?: AgentManagerOptions["beforeSteerUnavailableFallback"];
+  private readonly getAgentProfile?: AgentManagerOptions["getAgentProfile"];
+  private cancelAutomaticParentSubscription?: (childId: string, parentId: string) => Promise<void>;
   private acceptingAgentRegistrations = true;
   private runAdmissionPaused = false;
 
@@ -1378,6 +1432,7 @@ export class AgentManager {
     this.idFactory = options.idFactory ?? (() => randomUUID());
     this.registry = options.registry;
     this.workspaceRegistry = options.workspaceRegistry;
+    this.getAgentProfile = options.getAgentProfile;
     this.timelinePrefixes = this.registry?.timelinePrefixes ?? new TimelinePrefixStore();
     this.durableTimelineStore = options.durableTimelineStore;
     this.onAgentAttention = options.onAgentAttention;
@@ -1460,6 +1515,12 @@ export class AgentManager {
 
   setAgentAttentionCallback(callback: AgentAttentionCallback): void {
     this.onAgentAttention = callback;
+  }
+
+  setCancelAutomaticParentSubscription(
+    callback: (childId: string, parentId: string) => Promise<void>,
+  ): void {
+    this.cancelAutomaticParentSubscription = callback;
   }
 
   setAgentArchivedCallback(callback: AgentArchivedCallback): void {
@@ -2688,6 +2749,7 @@ export class AgentManager {
     // settled before the config is prepared, because a history load reads an archived
     // agent whose working directory may be gone.
     const record = await this.readRecordForAgentOpen(resolvedAgentId);
+    assertCurrentStoredSession(record, handle);
     const purpose = await resolveResumePurpose(record, resumeOptions?.purpose, mergedConfig.cwd);
     const currentResumeOptions = { purpose } satisfies AgentResumeSessionOptions;
 
@@ -2755,6 +2817,7 @@ export class AgentManager {
           ? (session.describePersistence() ?? handle)
           : handle,
       restoring: true,
+      resumedProviderSession: purpose === "interactive",
     });
   }
 
@@ -2996,6 +3059,7 @@ export class AgentManager {
         lastError: preservedLastError,
         attention: preservedAttention,
         restoring: true,
+        resumedProviderSession: Boolean(handle),
       });
     } catch (error) {
       if (closedExisting) {
@@ -3183,6 +3247,7 @@ export class AgentManager {
         parentAgentId: getParentAgentIdFromLabels(agent.labels) ?? undefined,
         provider: agent.provider,
         sessionId: agent.persistence?.sessionId ?? null,
+        keepAlive: hasResidentKeepAlive(agent.labels),
         lastActivityAt: Math.max(updatedAt.getTime(), identity.openedAt),
         isEligible,
         canStopRuntime: agent.session.canStopRuntime?.bind(agent.session),
@@ -3341,6 +3406,7 @@ export class AgentManager {
 
   private assertAgentArchiveAllowed(agentId: string, stored?: StoredAgentRecord): void {
     const live = this.agents.get(agentId);
+    this.assertNotResidentForArchive(live?.labels ?? stored?.labels);
     const status = live?.lifecycle ?? stored?.lastStatus;
     if (
       (status && isAgentBusy(status)) ||
@@ -3354,6 +3420,12 @@ export class AgentManager {
     }
     if (hasOpenAgentTab(live?.labels ?? stored?.labels)) {
       throw new Error(`Cannot archive agent ${agentId}: its tab is open in a client.`);
+    }
+  }
+
+  private assertNotResidentForArchive(labels?: Record<string, string>): void {
+    if (isResidentAgentLabels(labels)) {
+      throw new Error("Remove the resident role before archiving this agent.");
     }
   }
 
@@ -3382,6 +3454,7 @@ export class AgentManager {
       if (workspaceId !== expectedWorkspaceId) {
         throw new Error(`Agent ${agentId} is no longer in workspace ${expectedWorkspaceId}`);
       }
+      this.assertNotResidentForArchive(live?.labels ?? stored?.labels);
       if (!live) {
         if (!stored) throw new Error(`Agent not found: ${agentId}`);
         if (stored.archivedAt) return { archivedAt: stored.archivedAt, record: stored };
@@ -3405,9 +3478,14 @@ export class AgentManager {
   private async archiveAgentUnlocked(
     agentId: string,
     requestedArchivedAt?: string,
-    options?: { retainForkContext?: boolean; requireInactiveTarget?: boolean },
+    options?: {
+      retainForkContext?: boolean;
+      requireInactiveTarget?: boolean;
+      workspaceArchive?: boolean;
+    },
   ): Promise<{ archivedAt: string }> {
     const agent = this.requireAgent(agentId);
+    if (!options?.workspaceArchive) this.assertNotResidentForArchive(agent.labels);
     if (agent.internal) {
       // Nothing about an internal agent is on disk, and archiving must not put
       // it there. Its final snapshot is kept in memory for a while (see
@@ -3498,6 +3576,11 @@ export class AgentManager {
         ) {
           return;
         }
+        if (
+          isResidentAgentLabels(currentChild.labels) &&
+          this.localHierarchyParentId(currentChild.labels) !== parentAgentId
+        )
+          return;
         if (shouldDetachFromArchivedParent(parent, currentChild)) {
           const detached = await this.detachAgentUnlocked(currentChild.id);
           if (!detached.live) {
@@ -3658,7 +3741,7 @@ export class AgentManager {
             throw new Error(`Agent ${agentId} must be idle before switching providers`);
           }
           await this.hydrateTimelineFromLegacyProviderHistory(agent);
-          return await this.switchAgentSession(agent, input);
+          return await this.switchAgentProviderSession(agent, input);
         } finally {
           this.providerSwitches.delete(agentId);
         }
@@ -3666,9 +3749,237 @@ export class AgentManager {
     );
   }
 
-  private async switchAgentSession(agent: ActiveManagedAgent, input: SwitchAgentProviderInput) {
+  async resetAgentSession(agentId: string, options: ResetAgentSessionOptions = {}): Promise<void> {
+    // Take the hierarchy lock before the agent lock, in the same order as reparenting and moves.
+    await this.trackAgentRegistrationOperation(
+      this.runHierarchyMutation(() =>
+        this.runLifecycleMutation(agentId, async () => {
+          this.providerSwitches.add(agentId);
+          try {
+            this.assertAcceptingAgentRegistrations();
+            const { record, agent } = await this.requireResetAgent(agentId, options);
+            const profileId = getAgentProfileIdFromLabels(agent?.labels ?? record.labels);
+            const profile = profileId ? this.getAgentProfile?.(profileId) : undefined;
+            const config = { ...(agent?.config ?? buildStoredAgentConfig(record)) };
+            if (profile) config.systemPrompt = profile.rolePrompt;
+            if (!agent) {
+              await this.resetClosedAgentSession(record, config, options);
+              return;
+            }
+
+            await this.drainSessionEvents(agentId);
+            if (
+              agent.lifecycle === "running" ||
+              this.hasInFlightRun(agentId) ||
+              agent.activeTurnId ||
+              this.foregroundMutationTails.has(agentId)
+            ) {
+              if (!options.interrupt)
+                throw new Error(`Agent ${agentId} must be idle before resetting its session`);
+              await this.cancelAgentRunBefore(agentId, "reset");
+              await this.drainSessionEvents(agentId);
+            }
+            if (!options.clearVisibleTimeline)
+              await this.hydrateTimelineFromLegacyProviderHistory(agent);
+            await this.switchAgentSession(agent, config, { reset: options });
+          } finally {
+            this.providerSwitches.delete(agentId);
+          }
+        }),
+      ),
+    );
+  }
+
+  private async requireResetAgent(agentId: string, options: ResetAgentSessionOptions) {
+    const record = await this.requireRegistry().get(agentId);
+    if (
+      !record ||
+      record.internal ||
+      record.archivedAt ||
+      this.pendingHierarchyArchives.has(agentId)
+    ) {
+      throw new Error("Agent is missing or archived.");
+    }
+    const agent = this.agents.get(agentId);
+    const current = agent ?? record;
+    this.assertExpectedAgentWorkspace(current, options.expectedWorkspaceId);
+    if (
+      options.expectedParentAgentId !== undefined &&
+      this.localHierarchyParentId(current.labels) !== options.expectedParentAgentId
+    ) {
+      throw new Error(
+        `Agent ${agentId} is no longer a direct subagent of ${options.expectedParentAgentId}`,
+      );
+    }
+    return { record, agent };
+  }
+
+  private assertExpectedAgentWorkspace(
+    agent: { id: string; workspaceId?: string },
+    expectedWorkspaceId: string | undefined,
+  ): void {
+    if (expectedWorkspaceId !== undefined && agent.workspaceId !== expectedWorkspaceId) {
+      throw new Error(`Agent ${agent.id} is no longer in workspace ${expectedWorkspaceId}`);
+    }
+  }
+
+  private async resetClosedAgentSession(
+    record: StoredAgentRecord,
+    config: AgentSessionConfig,
+    options: ResetAgentSessionOptions,
+  ): Promise<void> {
+    const { id } = record;
+    const registry = this.requireRegistry();
+    const storedPrefix = await this.timelinePrefixes.load(id);
+    await this.durableTimelineWriteTails.get(id);
+    const durableRows = (await this.durableTimelineStore?.getCommittedRows(id)) ?? [];
+    const rows = options.clearVisibleTimeline
+      ? []
+      : await this.readClosedResetTimeline(record, storedPrefix, durableRows);
+    const updatedAt = this.nextStoredUpdatedAt(record);
+    const prefix = this.buildResetTimelinePrefix(rows, updatedAt, options);
+    const switchId = randomUUID();
+    const next: StoredAgentRecord = {
+      ...record,
+      config: buildSerializableConfig(config),
+      controls: undefined,
+      persistence: null,
+      runtimeInfo: undefined,
+      timelinePrefixSwitchId: switchId,
+      lastStatus: "closed",
+      resumeOnStartup: undefined,
+      lastError: null,
+      requiresAttention: false,
+      attentionReason: null,
+      attentionTimestamp: null,
+      updatedAt,
+    };
+    const oldHandoff = this.contextHandoffs.get(id);
+    const previousPrefix = oldHandoff?.prefix ?? storedPrefix;
+    this.cancelContextHandoff(id, { replaceTimeline: false });
+    let prefixWritten = false;
+    let persisted = false;
+    try {
+      await this.timelinePrefixes.stageSwitch(id, switchId, previousPrefix, prefix);
+      prefixWritten = true;
+      await registry.upsert(next);
+      persisted = true;
+      if (options.clearVisibleTimeline) await this.deleteCommittedTimeline(id);
+    } catch (error) {
+      if (persisted) await registry.upsert(record);
+      if (prefixWritten) {
+        if (previousPrefix) await this.timelinePrefixes.save(id, previousPrefix);
+        else await this.timelinePrefixes.delete(id);
+      }
+      if (oldHandoff?.compactionRow) this.replaceContextCompactionRow(id, oldHandoff.compactionRow);
+      throw error;
+    }
+    await this.publishResetTimeline(id, prefix, options);
+    this.dispatchStoredAgentState(next);
+  }
+
+  private async readClosedResetTimeline(
+    record: StoredAgentRecord,
+    prefix: PersistedTimelinePrefix | null,
+    durableRows: readonly AgentTimelineRow[],
+  ): Promise<AgentTimelineRow[]> {
+    const id = record.id;
+    const hasTimeline = this.timelineStore.has(id);
+    const local = hasTimeline ? this.timelineStore.getRows(id) : [];
+    if (hasTimeline && !this.unprimedRetainedTimelines.has(id)) {
+      return this.mergeResetTimelineRows(durableRows, local);
+    }
+    const handle = toAgentPersistenceHandle(this.getRegisteredProviderIds(), record.persistence);
+    if (!handle) return this.mergeResetTimelineRows(durableRows, prefix?.rows ?? [], local);
+    const retained = this.mergeResetTimelineRows(durableRows, prefix?.rows ?? []);
+    const sealedThrough = maxTimelineSeq(prefix?.rows ?? []);
+    if (retained.some((row) => row.seq > sealedThrough)) return retained;
+
+    // A history reader never registers a session or republishes agent state.
+    const events = await this.readSummaryProviderHistory({
+      record,
+      handle,
+      signal: new AbortController().signal,
+    });
+    const timeline = new InMemoryAgentTimelineStore();
+    timeline.initialize(id, { rows: retained, sealedThrough: maxTimelineSeq(retained) });
+    for (const { item, timestamp } of this.excludePrefixReplay(prefix, events)) {
+      timeline.append(id, limitAgentTimelineItemContent(item), { timestamp });
+    }
+    return timeline.getRows(id);
+  }
+
+  private mergeResetTimelineRows(
+    ...sources: readonly (readonly AgentTimelineRow[])[]
+  ): AgentTimelineRow[] {
+    const rows = new Map<number, AgentTimelineRow>();
+    for (const source of sources) for (const row of source) rows.set(row.seq, row);
+    return [...rows.values()].sort((a, b) => a.seq - b.seq);
+  }
+
+  private buildResetTimelinePrefix(
+    rows: readonly AgentTimelineRow[],
+    timestamp: string,
+    options: ResetAgentSessionOptions,
+    lastSeq = maxTimelineSeq(rows),
+  ): PersistedTimelinePrefix {
+    return {
+      version: 1,
+      rows: options.clearVisibleTimeline
+        ? []
+        : [
+            ...retainTimelinePrefixRows(rows),
+            {
+              seq: lastSeq + 1,
+              timestamp,
+              turnId: randomUUID(),
+              item: {
+                type: "notification",
+                level: "info",
+                message: "Session context reset. Subsequent turns run in a fresh provider session.",
+              },
+            },
+          ],
+      pendingContextHandoff: null,
+    };
+  }
+
+  private async publishResetTimeline(
+    id: string,
+    prefix: PersistedTimelinePrefix,
+    options: ResetAgentSessionOptions,
+  ): Promise<void> {
+    this.cancelContextHandoff(id, { replaceTimeline: false });
+    this.unprimedRetainedTimelines.delete(id);
+    this.clearProviderBackgroundWork(id);
+    for (const event of this.providerSubagents.deleteParent(id)) {
+      this.dispatch({ type: "provider_subagent", event });
+    }
+    this.timelineStore.initialize(id, { rows: prefix.rows });
+    this.timelineStore.sealPrefix(id);
+    if (!options.clearVisibleTimeline) {
+      await this.seedDurableTimelinePrefix(id, prefix.rows);
+    }
+    // The staged sidecar already reflects the snapshot's commit if finalization fails.
+    const finalize = options.clearVisibleTimeline
+      ? this.timelinePrefixes.delete(id)
+      : this.timelinePrefixes.save(id, prefix);
+    await finalize.catch((err) =>
+      this.logger.warn({ err, agentId: id }, "Failed to finalize the reset timeline prefix"),
+    );
+    this.dispatch({
+      type: "timeline_replacement",
+      agentId: id,
+      epoch: this.timelineStore.getEpoch(id),
+    });
+  }
+
+  private async switchAgentProviderSession(
+    agent: ActiveManagedAgent,
+    input: SwitchAgentProviderInput,
+  ) {
     this.assertAcceptingAgentRegistrations();
-    const { id, cwd, labels, launchEnv, mainControlSystemPrompt } = agent;
+    const { id, cwd } = agent;
     const record = await this.registry?.get(id);
     const config: AgentSessionConfig = {
       cwd,
@@ -3686,6 +3997,15 @@ export class AgentManager {
       mcpServers: agent.config.mcpServers,
       toolPolicy: agent.config.toolPolicy,
     };
+    return this.switchAgentSession(agent, config);
+  }
+
+  private async switchAgentSession(
+    agent: ActiveManagedAgent,
+    config: AgentSessionConfig,
+    { reset }: { reset?: ResetAgentSessionOptions } = {},
+  ) {
+    const { id, cwd, labels, launchEnv, mainControlSystemPrompt } = agent;
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       config,
       id,
@@ -3698,7 +4018,9 @@ export class AgentManager {
     const switchId = randomUUID();
     let opened: AgentSession | undefined;
     let previousPrefix: PersistedTimelinePrefix | null = null;
-    let handoffCanceled = false;
+    let restoreHandoff: PersistedTimelinePrefix | null = null;
+    let oldSessionUnsubscribed = false;
+    let loadingCompaction: AgentTimelineRow | undefined;
     let prefixWritten = false;
     let installed = false;
     try {
@@ -3717,10 +4039,17 @@ export class AgentManager {
       );
       const providerConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
       const session = await client.createSession(providerConfig, launchContext);
-      await this.requireExternalMcpSupport(session, providerConfig, launchContext);
       opened = session;
+      await this.requireExternalMcpSupport(session, providerConfig, launchContext);
       const next = this.buildSwitchedAgent(agent, session, storedConfig, providerConfig, client);
       const notice = await this.initializeSwitchedAgent(next, storedConfig);
+      if (reset) {
+        next.lastUsage = undefined;
+        next.lastTurnCompletion = undefined;
+        next.attention = { requiresAttention: false };
+        next.historyPrimed = true;
+        next.finalizedForegroundTurnIds = new Set();
+      }
       this.assertAgentRegistrationActive(agent);
 
       previousPrefix = await this.timelinePrefixes.load(id);
@@ -3728,48 +4057,69 @@ export class AgentManager {
       await this.drainSessionEvents(id);
       agent.unsubscribeSession?.();
       agent.unsubscribeSession = null;
+      oldSessionUnsubscribed = true;
       this.agentStreamCoalescer.flushAndDiscard(id);
+      if (reset) await this.durableTimelineWriteTails.get(id);
+      const durableRows = reset
+        ? ((await this.durableTimelineStore?.getCommittedRows(id)) ?? [])
+        : [];
       const cache = this.contextHandoffs.get(id);
-      const prefix = this.buildPendingTimelinePrefix(this.timelineStore.getRows(id), cache);
-      this.cancelContextHandoff(id);
-      handoffCanceled = true;
+      const liveRows = this.timelineStore.getRows(id);
+      next.updatedAt = new Date();
+      const prefix = reset
+        ? this.buildResetTimelinePrefix(
+            this.mergeResetTimelineRows(durableRows, liveRows),
+            next.updatedAt.toISOString(),
+            reset,
+            Math.max(this.timelineStore.getHead(id).seq, maxTimelineSeq(durableRows)),
+          )
+        : this.buildPendingTimelinePrefix(liveRows, cache);
+      if (reset) loadingCompaction = cache?.compactionRow;
+      this.cancelContextHandoff(id, { replaceTimeline: !reset });
       // Compaction could have completed while the previous sidecar was being read.
       previousPrefix = cache?.prefix ?? previousPrefix;
+      restoreHandoff = previousPrefix;
       await this.timelinePrefixes.stageSwitch(id, switchId, previousPrefix, prefix);
       prefixWritten = true;
-      next.updatedAt = new Date();
-      await this.commitSwitchedSession(agent, next, switchId, record?.timelinePrefixSwitchId);
-      // The staged file is already readable as committed if this cleanup fails.
-      await this.timelinePrefixes.save(id, prefix).catch((err) => {
-        this.logger.warn({ err, agentId: id }, "Failed to finalize the timeline prefix");
-      });
-      this.clearProviderBackgroundWork(id);
-      this.cancelRunningProviderSubagents(id);
+      await this.commitSwitchedSession(
+        agent,
+        next,
+        switchId,
+        reset?.clearVisibleTimeline ? durableRows : undefined,
+      );
+      if (!reset) {
+        // The staged file is already readable as committed if this cleanup fails.
+        await this.timelinePrefixes.save(id, prefix).catch((err) => {
+          this.logger.warn({ err, agentId: id }, "Failed to finalize the timeline prefix");
+        });
+        this.clearProviderBackgroundWork(id);
+        this.cancelRunningProviderSubagents(id);
+        this.timelineStore.sealPrefix(id);
+      }
       this.paseoToolPolicies.set(id, paseoToolPolicy);
       this.promptedMainControlRoleVersions.delete(id);
       this.pendingHierarchySessionReloads.delete(id);
       this.runtimeCleanupIdentities.set(session, Object.freeze({ openedAt: Date.now() }));
-      this.timelineStore.sealPrefix(id);
       Object.assign(agent, next);
       installed = true;
+      if (reset) await this.publishResetTimeline(id, prefix, reset);
       this.refreshIfMainControlChangedWhileOpening(agent, storedConfig);
       this.subscribeToSession(agent);
-      this.installContextHandoff(agent, prefix);
+      if (!reset) this.installContextHandoff(agent, prefix);
       this.emitState(agent, { persist: false });
       return { agent: { ...agent }, notice };
     } catch (error) {
       if (!installed) {
-        await this.rollbackProviderSwitch(id, {
+        await this.rollbackProviderSwitch(agent, {
           opened,
           prefixWritten,
           previousPrefix,
           priorTools,
           priorGeneration,
+          oldSessionUnsubscribed,
+          restoreHandoff,
+          loadingCompaction,
         });
-        if (handoffCanceled) {
-          this.subscribeToSession(agent);
-          if (previousPrefix) this.installContextHandoff(agent, previousPrefix);
-        }
       }
       throw error;
     }
@@ -3832,40 +4182,63 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     replacement: ActiveManagedAgent,
     switchId: string,
-    priorSwitchId?: string | null,
+    clearDurableRows?: readonly AgentTimelineRow[],
   ): Promise<void> {
+    const previousRecord = await this.registry?.get(agent.id);
     let persisted = false;
+    let cleared = false;
     try {
       // The old provider remains available if committing the new record fails.
       await this.persistSnapshot(replacement, { timelinePrefixSwitchId: switchId });
       persisted = true;
+      if (clearDurableRows) {
+        await this.deleteCommittedTimeline(agent.id);
+        cleared = true;
+      }
       await agent.session.close();
     } catch (error) {
-      if (persisted) {
-        await this.persistSnapshot(agent, { timelinePrefixSwitchId: priorSwitchId ?? null });
+      if (persisted && previousRecord) await this.requireRegistry().upsert(previousRecord);
+      const store = this.durableTimelineStore;
+      if (cleared && store && clearDurableRows?.length) {
+        await this.writeDurableTimeline(agent.id, () =>
+          store.bulkInsert(agent.id, clearDurableRows),
+        );
       }
       throw error;
     }
   }
 
   private async rollbackProviderSwitch(
-    id: string,
+    agent: ActiveManagedAgent,
     previous: {
       opened?: AgentSession;
       prefixWritten: boolean;
       previousPrefix: PersistedTimelinePrefix | null;
       priorTools?: AttachedAgentTool[];
       priorGeneration?: number;
+      oldSessionUnsubscribed: boolean;
+      restoreHandoff: PersistedTimelinePrefix | null;
+      loadingCompaction?: AgentTimelineRow;
     },
   ): Promise<void> {
-    this.detachPluginTools(id);
-    if (previous.priorTools) this.attachedPluginTools.set(id, previous.priorTools);
-    if (previous.priorGeneration !== undefined)
-      this.sessionOpenGenerations.set(id, previous.priorGeneration);
-    if (previous.opened) await this.closeUnregisteredSession(previous.opened);
-    if (!previous.prefixWritten) return;
-    if (previous.previousPrefix) await this.timelinePrefixes.save(id, previous.previousPrefix);
-    else await this.timelinePrefixes.delete(id);
+    const { id } = agent;
+    try {
+      this.detachPluginTools(id);
+      if (previous.priorTools) this.attachedPluginTools.set(id, previous.priorTools);
+      if (previous.priorGeneration !== undefined)
+        this.sessionOpenGenerations.set(id, previous.priorGeneration);
+      if (previous.opened) await this.closeUnregisteredSession(previous.opened);
+      if (!previous.prefixWritten) return;
+      if (previous.previousPrefix) await this.timelinePrefixes.save(id, previous.previousPrefix);
+      else await this.timelinePrefixes.delete(id);
+    } finally {
+      if (previous.oldSessionUnsubscribed) this.subscribeToSession(agent);
+      if (previous.restoreHandoff) {
+        if (previous.loadingCompaction)
+          this.replaceContextCompactionRow(id, previous.loadingCompaction);
+        this.installContextHandoff(agent, previous.restoreHandoff);
+      }
+    }
   }
 
   // Mode, model, thinking and options change inside the agent's lifecycle lane, like every other
@@ -4344,6 +4717,200 @@ export class AgentManager {
     });
   }
 
+  async createSilentResidentSubagent({
+    parentAgentId,
+    expectedWorkspaceId,
+    provider,
+    config,
+    ...options
+  }: CreateResidentAgentInput): Promise<{ agentId: string; created: boolean }> {
+    return this.runHierarchyMutation(async () => {
+      this.assertAcceptingAgentRegistrations();
+      const registry = this.requireRegistry();
+      const parent = await this.requireResidentParent(parentAgentId);
+      this.assertExpectedAgentWorkspace(parent, expectedWorkspaceId);
+      await this.requireActiveParentWorkspace(parent.workspaceId);
+      const hierarchy = await this.readHierarchyAgents();
+      validateCanSpawnChild(parent, (id) => hierarchy.get(id));
+      const profile = this.resolveResidentProfile(options.profileId);
+      const providerId = provider ?? config?.provider ?? profile?.provider;
+      if (!providerId) throw new Error("A resident specialist requires a provider or profile.");
+      const labels = applyRecordPatch(
+        {
+          [PARENT_AGENT_ID_LABEL]: parentAgentId,
+          ...(this.serverId ? { [PARENT_SERVER_ID_LABEL]: this.serverId } : {}),
+        },
+        residentLabelPatch(options, profile, undefined, config?.title?.trim() || providerId),
+      );
+      const existing = this.findResidentBySlug(
+        hierarchy.values(),
+        parentAgentId,
+        labels[RESIDENT_SLUG_LABEL],
+      );
+      if (existing) return { agentId: existing.id, created: false };
+
+      this.requireEnabledProvider(providerId);
+      this.requireClient(providerId);
+      const id = validateAgentId(this.idFactory(), "createSilentResidentSubagent");
+      if (this.agents.has(id) || (await registry.get(id))) {
+        throw new Error("Agent ID is already in use.");
+      }
+      const storedConfig = await this.normalizeConfig(
+        this.buildResidentConfig(profile, config, providerId, parent.cwd),
+        { resolveDefaultModel: false },
+      );
+      // The hierarchy lane prevents a concurrent parent move, and queued archives
+      // mark their target before acquiring that lane.
+      await this.requireActiveParentWorkspace(parent.workspaceId);
+      await this.requireActiveCreationParent(parentAgentId);
+      const now = new Date().toISOString();
+      const record: StoredAgentRecord = {
+        id,
+        provider: providerId,
+        cwd: storedConfig.cwd,
+        workspaceId: parent.workspaceId,
+        title: storedConfig.title?.trim() || getResidentRoleFromLabels(labels),
+        labels,
+        metadata: {},
+        createdAt: now,
+        updatedAt: now,
+        lastStatus: "closed",
+        lastModeId: storedConfig.modeId ?? null,
+        config: buildSerializableConfig(storedConfig),
+      };
+      await registry.upsert(record);
+      this.dispatchStoredAgentState(record);
+      return { agentId: id, created: true };
+    });
+  }
+
+  private async requireResidentParent(parentId: string) {
+    const parent = await this.requireActiveCreationParent(parentId);
+    if (parent.internal || parent.background) throw new Error("Parent agent is not public.");
+    return parent;
+  }
+
+  private buildResidentConfig(
+    profile: AgentProfile | undefined,
+    config: CreateResidentAgentInput["config"],
+    provider: AgentProvider,
+    cwd: string,
+  ): AgentSessionConfig {
+    return stripInternalPaseoMcpServer(
+      foldFeatureValues({
+        model: profile?.model,
+        modeId: profile?.modeId,
+        thinkingOptionId: profile?.thinkingOptionId,
+        providerOptions: profile?.options,
+        featureValues: profile?.featureValues,
+        ...config,
+        provider,
+        cwd,
+        internal: false,
+        systemPrompt: profile?.rolePrompt ?? config?.systemPrompt,
+      }),
+    );
+  }
+
+  async setAgentResident(
+    agentId: string,
+    resident: boolean,
+    options: ResidentOptions = {},
+  ): Promise<void> {
+    await this.runHierarchyMutation(() =>
+      this.runLifecycleMutation(agentId, async () => {
+        const record = await this.requireRegistry().get(agentId);
+        if (
+          !record ||
+          record.internal ||
+          record.background ||
+          record.archivedAt ||
+          this.pendingHierarchyArchives.has(agentId)
+        ) {
+          throw new Error("Agent is missing or archived.");
+        }
+        const agent = this.agents.get(agentId) ?? record;
+        if (!resident && !isResidentAgentLabels(agent.labels)) return;
+        const parentId = this.localHierarchyParentId(agent.labels);
+        let patch = clearResidentLabels;
+        if (resident) {
+          if (!parentId || isMainControlAgentLabels(agent.labels)) {
+            throw new Error("A resident specialist must have a local parent.");
+          }
+          const parent = await this.requireResidentParent(parentId);
+          if (agent.workspaceId !== parent.workspaceId) {
+            throw new Error("A resident specialist must belong to its parent's workspace.");
+          }
+          await this.requireActiveParentWorkspace(agent.workspaceId);
+          const profile = this.resolveResidentProfile(options.profileId);
+          patch = residentLabelPatch(
+            options,
+            profile,
+            agent.labels,
+            record.title?.trim() || agent.provider,
+          );
+          const duplicate = this.findResidentBySlug(
+            (await this.readHierarchyAgents()).values(),
+            parentId,
+            patch[RESIDENT_SLUG_LABEL],
+            new Set([agentId]),
+          );
+          if (duplicate) throw new Error("The parent already has a resident with that role slug.");
+        }
+        const { record: updated, live } = await this.commitAgentParent(
+          agentId,
+          agent.labels,
+          patch,
+          undefined,
+        );
+        if (resident && parentId) await this.retireAutomaticParentSubscription(agentId, parentId);
+        const hierarchy = await this.readHierarchyAgents();
+        this.refreshHierarchyToolPolicies(hierarchy);
+        if (live) await this.refreshHierarchySessionUnlocked(agentId);
+        else this.dispatchStoredAgentState(updated);
+      }),
+    );
+  }
+
+  private findResidentBySlug(
+    agents: Iterable<WorkspaceHierarchyAgent>,
+    parentId: string,
+    slug: string | null,
+    except?: ReadonlySet<string>,
+  ): WorkspaceHierarchyAgent | undefined {
+    if (!slug) return undefined;
+    for (const agent of agents) {
+      if (
+        !agent.archivedAt &&
+        !except?.has(agent.id) &&
+        isResidentAgentLabels(agent.labels) &&
+        this.localHierarchyParentId(agent.labels) === parentId &&
+        getResidentRoleSlugFromLabels(agent.labels) === slug
+      )
+        return agent;
+    }
+    return undefined;
+  }
+
+  private resolveResidentProfile(profileId?: string): AgentProfile | undefined {
+    if (profileId === undefined) return undefined;
+    const profile = this.getAgentProfile?.(profileId);
+    if (!profile) throw new Error(`Agent profile not found: ${profileId}`);
+    return profile;
+  }
+
+  private async retireAutomaticParentSubscription(
+    childId: string,
+    parentId: string,
+  ): Promise<void> {
+    await this.cancelAutomaticParentSubscription?.(childId, parentId).catch((err) =>
+      this.logger.warn(
+        { err, childId, parentId },
+        "Failed to retire automatic parent subscription",
+      ),
+    );
+  }
+
   async setAgentMainControl(
     agentId: string,
     enabled: boolean,
@@ -4406,6 +4973,9 @@ export class AgentManager {
             child.workspaceId === workspaceId &&
             this.localHierarchyParentId(child.labels) === sourceId,
         );
+        for (const child of children) {
+          this.assertResidentCanReparent(child, agentId, hierarchy.values());
+        }
         return this.withHierarchyLifecycleLanes(
           [...roleLanes, ...children.map(({ id }) => id)],
           () =>
@@ -4456,6 +5026,7 @@ export class AgentManager {
                   [PARENT_AGENT_ID_LABEL]: roleChange.targetRecord.id,
                   [PARENT_SERVER_ID_LABEL]: this.serverId ?? null,
                   [REMOTE_HIERARCHY_DEPTH_LABEL]: null,
+                  [PARENT_REPORTING_LABEL]: parentReportingForReparent(child.labels),
                 },
                 undefined,
               );
@@ -4501,6 +5072,7 @@ export class AgentManager {
                 [PARENT_SERVER_ID_LABEL]: child.labels?.[PARENT_SERVER_ID_LABEL] ?? null,
                 [REMOTE_HIERARCHY_DEPTH_LABEL]:
                   child.labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] ?? null,
+                [PARENT_REPORTING_LABEL]: child.labels?.[PARENT_REPORTING_LABEL] ?? null,
               },
               undefined,
             );
@@ -4519,6 +5091,13 @@ export class AgentManager {
       }
       throw error;
     } finally {
+      for (const child of changed) {
+        const labels =
+          this.agents.get(child.id)?.labels ?? (await this.registry?.get(child.id))?.labels;
+        if (this.localHierarchyParentId(labels) !== sourceId) {
+          await this.retireAutomaticParentSubscription(child.id, sourceId);
+        }
+      }
       await this.publishHandoffChildren(changed).catch((error) =>
         this.logger.warn(
           { err: error, sourceId },
@@ -4877,6 +5456,7 @@ export class AgentManager {
         if (!agent.workspaceId || agent.workspaceId !== parentAgent.workspaceId) {
           throw new Error("An agent and its new parent must belong to the same workspace.");
         }
+        this.assertResidentCanReparent(agent, parentAgentId, hierarchy.values());
         validateSetAgentParent({
           agent,
           parentAgent,
@@ -4895,10 +5475,11 @@ export class AgentManager {
           await assertRemoteDepthCanChange?.(parentIds);
         }
         const previousParentAgentId = getParentAgentIdFromLabels(agent.labels);
+        const previousLocalParent = this.localHierarchyParentId(agent.labels);
+        const parentReporting = parentReportingForReparent(agent.labels);
         const wasRunning = this.agents.get(agentId)?.lifecycle === "running";
         const registration =
-          !isExplicitParentReportingLabels(agent.labels) &&
-          (wasRunning || this.hasInFlightRun(agentId))
+          parentReporting === "auto" && (wasRunning || this.hasInFlightRun(agentId))
             ? await prepareFinishSubscription?.()
             : undefined;
         const { record, live } = await this.commitAgentParent(
@@ -4908,9 +5489,16 @@ export class AgentManager {
             [PARENT_AGENT_ID_LABEL]: parentAgentId,
             [PARENT_SERVER_ID_LABEL]: serverId ?? null,
             [REMOTE_HIERARCHY_DEPTH_LABEL]: null,
+            [PARENT_REPORTING_LABEL]: parentReporting,
           },
           registration,
         );
+        if (
+          previousLocalParent &&
+          (previousLocalParent !== parentAgentId || parentReporting !== "auto")
+        ) {
+          await this.retireAutomaticParentSubscription(agentId, previousLocalParent);
+        }
         if (!live) {
           this.paseoToolPolicies.delete(agentId);
           if (!record.internal) this.dispatchStoredAgentState(record);
@@ -4921,6 +5509,21 @@ export class AgentManager {
         return { record, live, previousParentAgentId, wasRunning };
       }),
     );
+  }
+
+  private assertResidentCanReparent(
+    agent: WorkspaceHierarchyAgent,
+    parentId: string,
+    hierarchy: Iterable<WorkspaceHierarchyAgent>,
+  ): void {
+    if (!isResidentAgentLabels(agent.labels)) return;
+    const conflict = this.findResidentBySlug(
+      hierarchy,
+      parentId,
+      getResidentRoleSlugFromLabels(agent.labels),
+      new Set([agent.id]),
+    );
+    if (conflict) throw new Error("The new parent already has a resident with that role slug.");
   }
 
   private async commitAgentParent(
@@ -5057,6 +5660,7 @@ export class AgentManager {
       if (!record) {
         throw new Error(`Agent not found in storage after detach: ${agentId}`);
       }
+      await this.retireAutomaticParentSubscription(agentId, previousParentAgentId);
       if (this.agents.size > 0) this.refreshHierarchyToolPolicies(await this.readHierarchyAgents());
       await this.refreshHierarchySessionUnlocked(agentId);
       return { record, live: true, previousParentAgentId };
@@ -5075,6 +5679,7 @@ export class AgentManager {
     if (!result.record) {
       throw new Error(`Agent not found in storage after detach: ${agentId}`);
     }
+    await this.retireAutomaticParentSubscription(agentId, previousParentAgentId);
     this.paseoToolPolicies.delete(agentId);
     if (this.agents.size > 0) this.refreshHierarchyToolPolicies(await this.readHierarchyAgents());
     return { record: result.record, live: false, previousParentAgentId };
@@ -5132,6 +5737,9 @@ export class AgentManager {
     const registry = this.requireRegistry();
     const liveAgent = this.agents.get(agentId);
     const storedRecord = await registry.get(agentId);
+    if (isResidentAgentLabels(liveAgent?.labels ?? storedRecord?.labels)) {
+      throw new Error("Remove the resident role before moving this agent.");
+    }
     const source = describeSubagentMoveSource(agentId, liveAgent, storedRecord, serverId);
     const { sourceWorkspaceId, previousParentAgentId } = source;
     if (
@@ -5178,6 +5786,11 @@ export class AgentManager {
           stored: await registry.get(id),
         })),
       );
+      if (
+        members.some(({ live, stored }) => isResidentAgentLabels(live?.labels ?? stored?.labels))
+      ) {
+        throw new Error("Remove resident roles before moving this agent and its children.");
+      }
       await assertMoveSharesWorktree(
         source.cwd,
         members.map(({ live, stored }) => (live ?? stored)?.cwd),
@@ -5538,6 +6151,26 @@ export class AgentManager {
     );
   }
 
+  /** A workspace archive owns every member, including residents protected from direct archive. */
+  async archiveAgentForWorkspace(
+    agentId: string,
+    workspaceId: string,
+    archivedAt: string,
+  ): Promise<void> {
+    await this.runHierarchyArchive(agentId, async () => {
+      const agent = this.agents.get(agentId);
+      const record = await this.requireRegistry().get(agentId);
+      if ((agent ?? record)?.workspaceId !== workspaceId) {
+        throw new Error(`Agent ${agentId} is no longer in workspace ${workspaceId}`);
+      }
+      if (agent) {
+        await this.archiveAgentUnlocked(agentId, archivedAt, { workspaceArchive: true });
+      } else if (record && !record.archivedAt) {
+        await this.archiveStoredRecordUnlocked(record, archivedAt, { workspaceArchive: true });
+      }
+    });
+  }
+
   private async runHierarchyArchive<T>(agentId: string, archive: () => Promise<T>): Promise<T> {
     this.pendingHierarchyArchives.set(
       agentId,
@@ -5577,7 +6210,9 @@ export class AgentManager {
   private async archiveStoredRecordUnlocked(
     record: StoredAgentRecord,
     archivedAt: string,
+    { workspaceArchive = false } = {},
   ): Promise<StoredAgentRecord> {
+    if (!workspaceArchive) this.assertNotResidentForArchive(record.labels);
     // Archiving is the agent's latest change, as markRecordArchived records it for a loaded agent.
     const nextRecord = await this.persistArchivedRecord(record, {
       archivedAt,
@@ -5996,17 +6631,43 @@ export class AgentManager {
     prompt: AgentPromptInput,
     handoff: PendingContextHandoff | undefined,
     addMainControl: boolean,
+    residentSpecialists: string,
   ): Promise<AgentPromptInput> {
     const envelope = handoff && (await this.prepareContextForSend(agent, handoff));
     const providerPrompt = envelope ? injectContextHandoffIntoPrompt(prompt, envelope) : prompt;
-    if (!addMainControl) return providerPrompt;
-    const instructions = buildMainControlInstructions(agent.mainControlSystemPrompt);
-    const prefix = `${MAIN_CONTROL_PROMPT_HEADER}\n${instructions}${mainControlPromptEnd(agent.id)}\n\n`;
+    let prefix = residentSpecialists;
+    if (addMainControl) {
+      const instructions = buildMainControlInstructions(agent.mainControlSystemPrompt);
+      prefix = `${MAIN_CONTROL_PROMPT_HEADER}\n${instructions}${mainControlPromptEnd(agent.id)}\n\n${prefix}`;
+    }
+    if (!prefix) return providerPrompt;
     if (typeof providerPrompt === "string") return prefix + providerPrompt;
     const [first, ...rest] = providerPrompt;
     return first?.type === "text" && !("mimeType" in first)
       ? [{ ...first, text: prefix + first.text }, ...rest]
       : [{ type: "text", text: prefix }, ...providerPrompt];
+  }
+
+  private async residentSpecialistsPrompt(agent: ActiveManagedAgent): Promise<string> {
+    const previous = this.promptedResidentSpecialists.get(agent.session);
+    const specialists = [];
+    for (const child of (await this.readHierarchyAgents()).values()) {
+      if (
+        child.archivedAt ||
+        !isResidentAgentLabels(child.labels) ||
+        this.localHierarchyParentId(child.labels) !== agent.id
+      )
+        continue;
+      const role = getResidentRoleFromLabels(child.labels);
+      const roleSlug = getResidentRoleSlugFromLabels(child.labels);
+      if (role && roleSlug) specialists.push({ agentId: child.id, role, roleSlug });
+    }
+    // A resumed conversation can still contain an older roster even when the current list is empty.
+    if (!previous && !specialists.length && !this.resumedProviderSessions.has(agent.session)) {
+      return "";
+    }
+    const next = buildResidentSpecialistsPrompt(specialists);
+    return next === previous ? "" : next;
   }
 
   private needsMainControlPrompt(agent: ActiveManagedAgent, roleVersion: number): boolean {
@@ -6041,32 +6702,28 @@ export class AgentManager {
       const handoff = this.contextHandoffs.get(agentId);
       const roleVersion = this.mainControlRoleVersions.get(agentId) ?? 0;
       const addedMainControl = this.needsMainControlPrompt(agent, roleVersion);
+      const specialists = isMainControlAgentLabels(agent.labels)
+        ? await this.residentSpecialistsPrompt(agent)
+        : "";
       const providerPrompt =
-        handoff || addedMainControl
-          ? await this.prepareProviderTurnPrompt(agent, prompt, handoff, addedMainControl)
+        handoff || addedMainControl || specialists
+          ? await this.prepareProviderTurnPrompt(
+              agent,
+              prompt,
+              handoff,
+              addedMainControl,
+              specialists,
+            )
           : prompt;
       const result = await this.startAdmittedProviderTurn(params, providerPrompt);
+      if (specialists) this.promptedResidentSpecialists.set(agent.session, specialists);
       if (addedMainControl) this.promptedMainControlRoleVersions.set(agentId, roleVersion);
       if (handoff) await this.consumeContextHandoff(agentId, handoff);
       this.assertPendingTurnStart(agentId, pendingRun);
       return result.turnId;
     } catch (error) {
       if (error instanceof AgentTurnStartCanceledError) {
-        if (!pendingRun.settled) {
-          if (options?.clientMessageId) {
-            this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "rejected", {
-              messageId: options.clientMessageId,
-            });
-          }
-          await this.handleStreamEvent(agent, {
-            type: "turn_canceled",
-            provider: agent.provider,
-            reason: "interrupted",
-          });
-          this.finalizeForegroundTurn(agent);
-          this.runs.settleForegroundRun(agentId, pendingRun.token);
-        }
-        return null;
+        return this.finishCanceledForegroundStart(params);
       }
       if (pendingRun.settled) {
         throw error;
@@ -6104,6 +6761,29 @@ export class AgentManager {
       }
       throw error;
     }
+  }
+
+  private async finishCanceledForegroundStart({
+    agent,
+    agentId,
+    pendingRun,
+    prompt,
+    options,
+  }: Parameters<AgentManager["startPendingForegroundTurn"]>[0]): Promise<null> {
+    if (pendingRun.settled) return null;
+    if (options?.clientMessageId) {
+      this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "rejected", {
+        messageId: options.clientMessageId,
+      });
+    }
+    await this.handleStreamEvent(agent, {
+      type: "turn_canceled",
+      provider: agent.provider,
+      reason: "interrupted",
+    });
+    this.finalizeForegroundTurn(agent);
+    this.runs.settleForegroundRun(agentId, pendingRun.token);
+    return null;
   }
 
   private startAdmittedProviderTurn(
@@ -7116,7 +7796,7 @@ export class AgentManager {
 
   private async cancelAgentRunBefore(
     agentId: string,
-    action: "reload" | "replace" | "rewind",
+    action: "reload" | "replace" | "rewind" | "reset",
   ): Promise<void> {
     const result = await this.cancelAgentRun(agentId);
     if (result.status === "refused") {
@@ -7327,6 +8007,7 @@ export class AgentManager {
     handoff: PendingContextHandoff,
     olderSummary: string,
   ): Promise<void> {
+    if (this.contextHandoffs.get(agentId) !== handoff) return;
     const pending = handoff.prefix.pendingContextHandoff;
     const loading = handoff.compactionRow;
     if (!loading || !pending) return;
@@ -7386,12 +8067,13 @@ export class AgentManager {
     return buildContextHandoffEnvelope(handoff.context, summary);
   }
 
-  private cancelContextHandoff(agentId: string): void {
+  private cancelContextHandoff(agentId: string, { replaceTimeline = true } = {}): void {
     const handoff = this.contextHandoffs.get(agentId);
     if (!handoff) return;
     this.contextHandoffs.delete(agentId);
     handoff.controller?.abort();
-    if (handoff.compactionRow) this.replaceContextCompactionRow(agentId, handoff.compactionRow);
+    if (replaceTimeline && handoff.compactionRow)
+      this.replaceContextCompactionRow(agentId, handoff.compactionRow);
   }
 
   private async consumeContextHandoff(agentId: string, handoff: PendingContextHandoff) {
@@ -7801,6 +8483,7 @@ export class AgentManager {
        */
       launchedOptions: ProviderOptions;
       restoring?: boolean;
+      resumedProviderSession?: boolean;
       initialTitle?: string | null;
       publishWhenReady?: boolean;
       workspaceId?: string;
@@ -7853,6 +8536,7 @@ export class AgentManager {
       }
 
       this.assertAcceptingAgentRegistrations();
+      if (options.resumedProviderSession) this.resumedProviderSessions.add(session);
       this.runtimeCleanupIdentities.set(session, Object.freeze({ openedAt: Date.now() }));
       this.agents.set(resolvedAgentId, managed);
       this.refreshIfMainControlChangedWhileOpening(managed, openedConfig);
@@ -7967,8 +8651,7 @@ export class AgentManager {
     const explicitTimelineSeed = preserveExistingPrefix
       ? null
       : buildExplicitTimelineSeedForRegister(now, options);
-    const shouldSeedFromDurable =
-      !explicitTimelineSeed && !this.timelineStore.has(agentId) && this.durableTimelineStore;
+    const shouldSeedFromDurable = !explicitTimelineSeed && !timelineAlreadyPrimed;
     const durableTimelineSeed = shouldSeedFromDurable
       ? await this.loadCommittedTimelineSeed(agentId, now)
       : null;
@@ -7984,7 +8667,9 @@ export class AgentManager {
       });
     }
     if (explicitTimelineSeed && options?.timelineRows?.length) {
-      this.enqueueDurableTimelineBulkInsert(agentId, options.timelineRows);
+      if (options.contextPrefix)
+        await this.seedDurableTimelinePrefix(agentId, options.timelineRows);
+      else this.enqueueDurableTimelineBulkInsert(agentId, options.timelineRows);
     }
     return { durableTimelineHasRows };
   }
@@ -8597,8 +9282,23 @@ export class AgentManager {
       nextSeq: seq + 1,
       sealedThrough: maxTimelineSeq(prefix.rows),
     });
-    this.enqueueDurableTimelineBulkInsert(agentId, prefix.rows);
+    await this.seedDurableTimelinePrefix(agentId, prefix.rows);
     return prefix;
+  }
+
+  private async seedDurableTimelinePrefix(
+    agentId: string,
+    rows: readonly AgentTimelineRow[],
+  ): Promise<void> {
+    const store = this.durableTimelineStore;
+    if (!store || !rows.length) return;
+    await this.writeDurableTimeline(agentId, async () => {
+      const latestCommittedSeq = await store.getLatestCommittedSeq(agentId);
+      const newRows = rows.filter(({ seq }) => seq > latestCommittedSeq);
+      if (newRows.length) await store.bulkInsert(agentId, newRows);
+    }).catch((err) => {
+      this.logger.error({ err, agentId }, "Failed to seed durable timeline prefix");
+    });
   }
 
   private excludePrefixReplay(

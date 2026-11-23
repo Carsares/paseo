@@ -2,6 +2,8 @@ import {
   getOpenAgentTabLabel,
   PARENT_AGENT_ID_LABEL,
   parentAddressLabels,
+  RESIDENT_AGENT_LABEL,
+  RESIDENT_ROLE_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
@@ -53,6 +55,46 @@ function selectSections(
 }
 
 describe("main control sessions", () => {
+  it("groups unarchived residents by their actual parent even after their tabs close", () => {
+    const resident = (id: string, parentId: string, archived?: Date) =>
+      agent(id, {
+        labels: { ...parent(parentId), [RESIDENT_AGENT_LABEL]: "true", [RESIDENT_ROLE_LABEL]: id },
+        archivedAt: archived,
+      });
+    const sections = selectSections(
+      session(
+        main,
+        agent("lead", { labels: parent("main") }),
+        resident("review", "main"),
+        resident("search", "lead"),
+        resident("archived resident", "main", archivedAt),
+        agent("detached", {
+          status: "closed",
+          labels: { [RESIDENT_AGENT_LABEL]: "true", [RESIDENT_ROLE_LABEL]: "Independent review" },
+        }),
+      ),
+    );
+
+    expect(sections?.residentGroups).toMatchObject([
+      {
+        parent: { serverId: "host", agentId: "main" },
+        nodes: [{ agentId: "review", depth: 1, processState: "closed" }],
+      },
+      {
+        parent: { serverId: "host", agentId: "lead" },
+        nodes: [{ agentId: "search", depth: 2, residentRole: "search" }],
+      },
+      {
+        parent: null,
+        nodes: [
+          { agentId: "detached", residentRole: "Independent review", processState: "closed" },
+        ],
+      },
+    ]);
+    expect(sections?.active.map((node) => node.agentId)).toEqual(["main"]);
+    expect(sections?.closed.map((node) => node.agentId)).toEqual(["archived resident", "lead"]);
+  });
+
   it("groups workspace sessions with the main first and preserves descendant order and depth", () => {
     const sections = selectSections(
       session(

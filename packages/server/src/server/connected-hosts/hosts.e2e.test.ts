@@ -9,7 +9,12 @@ import { createHostClient, createHostChannelTransport } from "@getpaseo/client/n
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import type { HostDirectory } from "@getpaseo/protocol/hosts";
 import { AgentFinishReportSchema } from "@getpaseo/protocol/messages";
-import { parentAddressLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  getResidentRoleFromLabels,
+  isResidentAgentLabels,
+  parentAddressLabels,
+  RESIDENT_AGENT_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import { AGENT_WORKSPACE_CREATION_ERROR } from "../agent/create-agent/intent.js";
 import { REMOTE_HIERARCHY_DEPTH_LABEL } from "../agent/hierarchy-policy.js";
@@ -145,6 +150,140 @@ async function online(paseo: ReturnType<typeof createPaseoApi>): Promise<HostDir
     .toBe("online");
   return directory;
 }
+
+test("routes resident lifecycle requests to the owning workspace and intersects their grants", async () => {
+  const b = await daemon({
+    agentProfiles: [
+      {
+        id: "build",
+        name: "Build specialist",
+        roleSlug: "build",
+        provider: "claude",
+        model: "claude-test",
+        modeId: "full-access",
+      },
+    ],
+  });
+  const a = await daemon();
+  const origin = await api(a);
+  const destination = await api(b);
+  await origin.paseo.hosts.add({ connection: `127.0.0.1:${b.port}` });
+  const serverId = (await online(origin.paseo)).hosts[0]!.serverId!;
+  const workspace = await destination.paseo.workspaces.create({
+    source: { kind: "directory", path: b.staticDir },
+  });
+  const parent = await workspace.agents.create({
+    config: { provider: "claude/claude-test", modeId: "full-access" },
+  });
+
+  async function connectRoute(sessionPermissions?: ["workspace.write"]) {
+    const clientId = crypto.randomUUID();
+    const originClient = sessionPermissions
+      ? createHostClient(`127.0.0.1:${a.port}`, {
+          clientId,
+          sessionPermissions,
+          reconnect: { enabled: false },
+        })
+      : origin.client;
+    if (sessionPermissions) {
+      cleanup.push(() => originClient.close());
+      await originClient.connect();
+    }
+    const route = new DaemonClient({
+      url: "ws://logical/ws",
+      clientId,
+      transportFactory: createHostChannelTransport(originClient, serverId, clientId, null),
+      reconnect: { enabled: false },
+    });
+    cleanup.push(() => route.close());
+    await route.connect();
+    return route;
+  }
+  const route = await connectRoute();
+  expect(route.getLastServerInfoMessage()?.features).toMatchObject({
+    agentResidentSpecialists: true,
+    agentSessionReset: true,
+  });
+  const ordinary = await route.createAgent({
+    workspaceId: workspace.id,
+    config: { provider: "claude", cwd: b.staticDir, modeId: "full-access" },
+    labels: { [RESIDENT_AGENT_LABEL]: "true" },
+  });
+  expect(isResidentAgentLabels(ordinary.labels)).toBe(false);
+  await expect(
+    route.updateAgent(ordinary.id, { labels: { [RESIDENT_AGENT_LABEL]: "true" } }),
+  ).rejects.toThrow("Change agent hierarchy");
+  const writer = await connectRoute(["workspace.write"]);
+  expect(writer.getLastServerInfoMessage()?.permissions).toEqual(["workspace.write"]);
+  await expect(writer.createResidentAgent(parent.id, "build")).rejects.toMatchObject({
+    code: "access_denied",
+  });
+  await expect(writer.resetAgentSession(parent.id)).rejects.toMatchObject({
+    code: "access_denied",
+  });
+  await expect(route.createResidentAgent("missing-parent", "build")).rejects.toThrow(
+    "active workspace",
+  );
+  const { agentId, created } = await route.createResidentAgent(parent.id, "build", {
+    role: "Build lead",
+  });
+  expect(created).toBe(true);
+  await expect(route.createResidentAgent(parent.id, "build")).resolves.toEqual({
+    agentId,
+    created: false,
+  });
+  const record = await b.daemon.agentStorage.get(agentId);
+  expect(record).toMatchObject({ workspaceId: workspace.id, lastStatus: "closed" });
+  expect(getResidentRoleFromLabels(record?.labels)).toBe("Build lead");
+  await expect(route.refreshAgent(agentId)).resolves.toMatchObject({ status: "agent_refreshed" });
+  await route.resetAgentSession(agentId);
+  await writer.setAgentResident(agentId, false);
+  expect(isResidentAgentLabels((await b.daemon.agentStorage.get(agentId))?.labels)).toBe(false);
+  expect(await a.daemon.agentStorage.get(agentId)).toBeNull();
+
+  const storage = b.daemon.agentStorage;
+  const manager = b.daemon.agentManager;
+  await route.setAgentParent(ordinary.id, parent.id);
+  await manager.closeAgent(ordinary.id);
+  expect((await storage.get(ordinary.id))?.persistence).toBeTruthy();
+  await route.resetAgentSession(ordinary.id);
+  expect(await storage.get(ordinary.id)).toMatchObject({ lastStatus: "closed", persistence: null });
+  expect(manager.getAgent(ordinary.id)).toBeNull();
+  await expect.soft(route.refreshAgent(ordinary.id)).resolves.toMatchObject({
+    status: "agent_refreshed",
+    agentId: ordinary.id,
+  });
+
+  const { agentId: standbyId } = await route.createResidentAgent(parent.id, "build", {
+    roleSlug: "standby",
+  });
+  await writer.setAgentResident(standbyId, false);
+  expect(manager.getAgent(standbyId)).toBeNull();
+  expect(isResidentAgentLabels((await storage.get(standbyId))?.labels)).toBe(false);
+  await expect.soft(route.refreshAgent(standbyId)).resolves.toMatchObject({
+    status: "agent_refreshed",
+    agentId: standbyId,
+  });
+
+  const unsupportedId = crypto.randomUUID();
+  await storage.upsert({
+    ...record!,
+    id: unsupportedId,
+    provider: "unregistered-test-provider",
+    persistence: null,
+  });
+  await expect(route.refreshAgent(unsupportedId)).rejects.toMatchObject({
+    code: "agent_refresh_failed",
+    message: expect.stringContaining(
+      "references unavailable provider 'unregistered-test-provider'",
+    ),
+  });
+  const missingId = crypto.randomUUID();
+  await expect(route.refreshAgent(missingId)).rejects.toMatchObject({
+    code: "agent_refresh_failed",
+    message: expect.stringContaining(`Agent not found: ${missingId}`),
+  });
+});
 
 test("SDK saves unreachable hosts, rejects syntax and preserves source identity without exposing secrets", async () => {
   const a = await daemon();

@@ -40,7 +40,9 @@ vi.mock("lucide-react-native", () => {
     ExternalLink: StubIcon,
     GitMerge: StubIcon,
     Pencil: StubIcon,
+    Plus: StubIcon,
     RotateCw: StubIcon,
+    Unlink: StubIcon,
     X: StubIcon,
   };
 });

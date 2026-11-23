@@ -51,7 +51,11 @@ import {
   requireActiveWorkspaceForArchive,
   type ArchiveDependencies,
 } from "../../workspace-archive-service.js";
-import { createAgentCommand } from "../create-agent/create.js";
+import {
+  createAgentCommand,
+  formatProviderModel,
+  type CreateAgentFromMcpInput,
+} from "../create-agent/create.js";
 import {
   AGENT_WORKSPACE_CREATION_ERROR,
   inheritWorkspaceBackground,
@@ -141,6 +145,8 @@ import {
   isExplicitParentReportingLabels,
   isMainControlAgentLabels,
   isOpenAgentTabLabel,
+  AGENT_PROFILE_ID_MAX_LENGTH,
+  RESIDENT_ROLE_MAX_LENGTH,
 } from "@getpaseo/protocol/agent-labels";
 
 export interface PaseoToolHostDependencies {
@@ -923,7 +929,12 @@ function createToolCatalog(
   async function assertHostCreationAllowed(
     name: string,
     destination: string,
-    input: LegacyPlacement & { labels?: Record<string, string> },
+    input: LegacyPlacement & {
+      labels?: Record<string, string>;
+      profileId?: string;
+      resident?: boolean;
+      residentRole?: string;
+    },
   ): Promise<void> {
     if (scope === "agent" && name === "create_workspace") {
       throw new PaseoToolInputError(AGENT_WORKSPACE_CREATION_ERROR);
@@ -935,6 +946,16 @@ function createToolCatalog(
       }
       await assertAgentCreatePlacement(input);
       return;
+    }
+    if (
+      destination !== (options.serverId ?? "self") &&
+      (input.profileId !== undefined ||
+        input.resident !== undefined ||
+        input.residentRole !== undefined)
+    ) {
+      throw new PaseoToolInputError(
+        "Profile and resident options require create_agent on the destination host.",
+      );
     }
     const parent = getParentAddressFromLabels(input.labels, destination);
     if (parent && parent.serverId !== destination) {
@@ -1456,9 +1477,27 @@ function createToolCatalog(
       .min(1, "Title is required")
       .max(60, "Title must be 60 characters or fewer")
       .describe("Short descriptive title (<= 60 chars) summarizing the agent's focus."),
-    provider: ProviderModelInputSchema.describe(
-      "Required provider/model pair, for example codex/gpt-5.4.",
+    provider: ProviderModelInputSchema.optional().describe(
+      "Provider/model pair, for example codex/gpt-5.4. Required when profileId is omitted.",
     ),
+    profileId: z
+      .string()
+      .trim()
+      .min(1)
+      .max(AGENT_PROFILE_ID_MAX_LENGTH)
+      .optional()
+      .describe("Preset ID from list_profiles. Applies its provider settings and role defaults."),
+    resident: z
+      .boolean()
+      .optional()
+      .describe("Create a lasting specialist in your workspace. Omit to use the profile default."),
+    residentRole: z
+      .string()
+      .trim()
+      .min(1)
+      .max(RESIDENT_ROLE_MAX_LENGTH)
+      .optional()
+      .describe("Display role for a resident specialist. Omit to use the profile name."),
     labels: z.record(z.string(), z.string()).optional().describe("Labels to set on the agent"),
     settings: CreateAgentSettingsInputSchema.optional().describe(
       "Initial runtime settings for the new agent.",
@@ -1937,7 +1976,7 @@ function createToolCatalog(
           "Create a subagent in your current workspace on this host. ",
           "Create an agent. Omit workspaceId to create a new local workspace on this host. ",
         ) +
-        "Requires provider/model (for example codex/gpt-5.4) and an initial prompt. For a different provider, set settings.modeId from inspect_provider; omission is accepted for targets with no modes and for unattended execution supported by the target. Do not guess; call list_providers and list_models first if uncertain.",
+        "Provide profileId from list_profiles or provider/model, and an initial prompt. Reuse an existing resident specialist with send_agent_prompt. For a different provider, use inspect_provider to choose a supported mode.",
       inputSchema: createAgentInputSchema,
       outputSchema: {
         agentId: z.string(),
@@ -1956,8 +1995,6 @@ function createToolCatalog(
       const notifyOnFinish = parsedArgs.notifyOnFinish;
       const parentReporting =
         resolvedArgs.kind === "agent-scoped" ? resolvedArgs.parsedArgs.parentReporting : undefined;
-      const selectedProvider = resolveRequiredProviderModel(parsedArgs.provider).provider;
-      const inheritedConfig = resolveInheritedProviderConfig(selectedProvider);
       const { snapshot, initialPromptStarted } = await createAgentCommand(
         {
           serverId: options.serverId,
@@ -1977,17 +2014,13 @@ function createToolCatalog(
         },
         {
           kind: "mcp",
-          provider: parsedArgs.provider,
+          ...resolveCreateToolProviderSettings(parsedArgs),
           title: parsedArgs.title,
           initialPrompt: parsedArgs.initialPrompt,
-          config: inheritedConfig,
           cwd: resolvedArgs.kind === "top-level" ? resolvedArgs.cwd : undefined,
           // Keep explicit placement for the final comparison after a concurrent parent move.
           workspaceId: resolvedArgs.workspaceId,
-          thinking: parsedArgs.settings?.thinkingOptionId,
-          providerOptions: parsedArgs.settings?.features,
           labels: parsedArgs.labels,
-          mode: parsedArgs.settings?.modeId,
           promptFailure: "throw",
           notifyOnFinish,
           parentReporting,
@@ -2022,6 +2055,67 @@ function createToolCatalog(
       return response;
     },
   );
+
+  function getCreateToolProfile(profileId?: string) {
+    if (!profileId) return undefined;
+    const profile = daemonConfigStore?.get().agentProfiles?.find((entry) => entry.id === profileId);
+    if (!profile) throw new PaseoToolInputError(`Unknown agent profile: ${profileId}`);
+    return profile;
+  }
+
+  function resolveCreateToolProviderSettings(
+    input: ResolvedCreateAgentToolArgs["parsedArgs"],
+  ): Pick<
+    CreateAgentFromMcpInput,
+    "provider" | "config" | "resident" | "mode" | "thinking" | "providerOptions"
+  > {
+    const profile = getCreateToolProfile(input.profileId);
+    const { provider: providerId, model } = selectCreateToolProvider(input.provider, profile);
+    const providerProfile = providerId === profile?.provider ? profile : undefined;
+    const inheritedConfig = resolveInheritedProviderConfig(providerId);
+    return {
+      provider: formatProviderModel(providerId, model),
+      config: profile
+        ? { ...inheritedConfig, model, systemPrompt: profile.rolePrompt }
+        : inheritedConfig,
+      resident: resolveCreateToolResidency(input, profile),
+      mode: input.settings?.modeId ?? providerProfile?.modeId,
+      thinking: input.settings?.thinkingOptionId ?? providerProfile?.thinkingOptionId,
+      providerOptions: providerProfile
+        ? {
+            ...providerProfile.featureValues,
+            ...providerProfile.options,
+            ...input.settings?.features,
+          }
+        : input.settings?.features,
+    };
+  }
+
+  function selectCreateToolProvider(
+    provider: string | undefined,
+    profile: ReturnType<typeof getCreateToolProfile>,
+  ) {
+    if (provider) return resolveRequiredProviderModel(provider);
+    if (profile) return { provider: profile.provider, model: profile.model };
+    throw new PaseoToolInputError("Provide provider/model or profileId.");
+  }
+
+  function resolveCreateToolResidency(
+    input: ResolvedCreateAgentToolArgs["parsedArgs"],
+    profile: ReturnType<typeof getCreateToolProfile>,
+  ) {
+    if (input.resident ?? profile?.defaultResident) {
+      if (!callerAgentId) {
+        throw new PaseoToolInputError(
+          "Resident specialists require a parent agent in an active workspace.",
+        );
+      }
+      return { profileId: profile?.id, role: input.residentRole };
+    }
+    if (input.residentRole) {
+      throw new PaseoToolInputError("residentRole requires resident: true or a resident profile.");
+    }
+  }
 
   type ResolvedCreateAgentToolArgs =
     | {
@@ -2111,6 +2205,7 @@ function createToolCatalog(
       const parsedArgs = normalizeTopLevelCreateAgentArgs(
         parseToolArguments(legacyTopLevelCreateAgentArgsSchema, args),
       );
+      resolveCreateToolProviderSettings(parsedArgs);
       if (parsedArgs.relationship?.kind === "subagent") {
         throw new PaseoToolInputError(
           "relationship subagent requires an agent-scoped tool session",
@@ -2131,6 +2226,7 @@ function createToolCatalog(
       };
     }
     const parsedArgs = parseToolArguments(canonicalTopLevelCreateAgentArgsSchema, args);
+    resolveCreateToolProviderSettings(parsedArgs);
     const { cwd, workspaceId } = await resolveCanonicalCreateAgentWorkspace(
       parsedArgs.workspaceId,
       { prompt: parsedArgs.initialPrompt },
@@ -2461,6 +2557,45 @@ function createToolCatalog(
       runtime?.lastTurnCompletion?.event.turnId
     );
   }
+
+  registerTool(
+    "reset_agent_session",
+    {
+      title: "Reset agent session",
+      description:
+        "Start a fresh provider conversation for one of your direct subagents. The agent ID and role stay the same.",
+      inputSchema: {
+        agentId: z.string().min(1),
+        interrupt: z.boolean().optional().describe("Interrupt an active turn before resetting."),
+        clearVisibleTimeline: z
+          .boolean()
+          .optional()
+          .describe("Also clear the visible conversation history."),
+      },
+      outputSchema: { success: z.boolean() },
+    },
+    async ({ agentId, interrupt, clearVisibleTimeline }) => {
+      if (!callerAgentId) throw new PaseoToolInputError("Reset requires an agent-scoped session.");
+      const workspaceId = await requireCallerWorkspace();
+      const localServer = options.serverId ?? "self";
+      const stored = await agentStorage.get(agentId);
+      const target = agentManager.getAgent(agentId) ?? stored;
+      if (!target || target.internal || stored?.archivedAt || target.workspaceId !== workspaceId) {
+        throw new PaseoToolInputError("Target agent is unavailable in the caller's workspace.");
+      }
+      assertDirectParent(target.labels, localServer, {
+        serverId: localServer,
+        agentId: callerAgentId,
+      });
+      await agentManager.resetAgentSession(agentId, {
+        interrupt,
+        clearVisibleTimeline,
+        expectedParentAgentId: callerAgentId,
+        expectedWorkspaceId: workspaceId,
+      });
+      return { content: [], structuredContent: { success: true } };
+    },
+  );
 
   registerTool(
     "report_to_parent",
@@ -3593,10 +3728,9 @@ function createToolCatalog(
     {
       title: "List agent profiles",
       description:
-        "List agent profiles: named provider/model/mode bundles a human configured for specific " +
-        "kinds of work. Read each profile's `notes` to pick the one that fits the task you're " +
-        "delegating, then copy its `provider`, `model`, `modeId`, `thinkingOptionId`, and " +
-        "`options` into create_agent as `settings.features` (there is no `profile` parameter). " +
+        "List the provider settings and role defaults configured by a human. Use `notes` to pick a profile " +
+        "and pass its `id` to create_agent as `profileId`. The role prompt and provider options apply automatically. " +
+        "Use `resident` to override `defaultResident`. Reuse an existing resident with send_agent_prompt. " +
         "Returns an empty list if none are configured.",
       inputSchema: {},
       outputSchema: {

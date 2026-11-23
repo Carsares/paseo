@@ -479,9 +479,10 @@ describe("create-agent worktree setup boundary", () => {
   });
 });
 
-function createAgentStorageStub(): Pick<AgentStorage, "listAll"> {
+function createAgentStorageStub(): Pick<AgentStorage, "listActive" | "listByWorkspace"> {
   return {
-    listAll: async (): Promise<StoredAgentRecord[]> => [],
+    listActive: async (): Promise<StoredAgentRecord[]> => [],
+    listByWorkspace: async (): Promise<StoredAgentRecord[]> => [],
   };
 }
 
@@ -1739,8 +1740,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         },
         agentManager: {
           listAgents: () => [],
-          archiveAgent: vi.fn(async () => ({ archivedAt: new Date().toISOString() })),
-          archiveSnapshot: vi.fn(async () => {
+          archiveAgentForWorkspace: vi.fn(async () => {
             throw new Error("not expected for empty agent list");
           }),
         },
@@ -1811,8 +1811,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         },
         agentManager: {
           listAgents: () => [],
-          archiveAgent: vi.fn(async () => ({ archivedAt: new Date().toISOString() })),
-          archiveSnapshot: vi.fn(async () => {
+          archiveAgentForWorkspace: vi.fn(async () => {
             throw new Error("not expected for empty agent list");
           }),
         },
@@ -1888,8 +1887,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
         },
         agentManager: {
           listAgents: () => [],
-          archiveAgent: vi.fn(async () => ({ archivedAt: new Date().toISOString() })),
-          archiveSnapshot: vi.fn(async () => {
+          archiveAgentForWorkspace: vi.fn(async () => {
             throw new Error("not expected for empty agent list");
           }),
         },
@@ -1965,8 +1963,7 @@ describe("handlePaseoWorktreeArchiveRequest worktree scope", () => {
       },
       agentManager: {
         listAgents: () => [],
-        archiveAgent: vi.fn(async () => ({ archivedAt: new Date().toISOString() })),
-        archiveSnapshot: vi.fn(async () => {
+        archiveAgentForWorkspace: vi.fn(async () => {
           throw new Error("not expected for empty agent list");
         }),
       },

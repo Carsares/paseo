@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { z } from "zod";
 import {
+  AgentProfileSchema,
   MutableDaemonConfigSchema,
   MutableDaemonConfigPatchSchema,
   UsageReportEntrySchema,
@@ -115,6 +116,116 @@ test("server info preserves the optional seamless context switch capability", ()
     { agentSeamlessContextSwitch: false },
   ]) {
     expect(ServerInfoStatusPayloadSchema.parse({ ...info, features }).features).toEqual(features);
+  }
+});
+
+test("resident specialist and reset capabilities are optional booleans", () => {
+  const info = { status: "server_info", serverId: "server-1" };
+  expect(ServerInfoStatusPayloadSchema.parse(info).features).toBeUndefined();
+  const features = { agentResidentSpecialists: true, agentSessionReset: false };
+  expect(ServerInfoStatusPayloadSchema.parse({ ...info, features }).features).toEqual(features);
+  for (const key of Object.keys(features)) {
+    expect(
+      ServerInfoStatusPayloadSchema.safeParse({ ...info, features: { [key]: "true" } }).success,
+    ).toBe(false);
+  }
+});
+
+test("profiles preserve legacy IDs and accept optional role defaults", () => {
+  const profile = { id: "p".repeat(129), provider: "codex", name: "Review" };
+  const defaults = {
+    roleSlug: "a".repeat(64),
+    rolePrompt: "p".repeat(16384),
+    defaultResident: true,
+    residentUrgentReport: false,
+    residentKeepAlive: true,
+  };
+  expect(AgentProfileSchema.parse(profile)).toEqual(profile);
+  expect(
+    MutableDaemonConfigPatchSchema.parse({ agentProfiles: [{ ...profile, ...defaults }] }),
+  ).toEqual({ agentProfiles: [{ ...profile, ...defaults }] });
+  for (const invalid of [
+    { roleSlug: "-review" },
+    { roleSlug: defaults.roleSlug + "a" },
+    { rolePrompt: defaults.rolePrompt + "p" },
+    { defaultResident: "true" },
+  ]) {
+    expect(AgentProfileSchema.safeParse({ ...profile, ...invalid }).success).toBe(false);
+  }
+});
+
+test("resident specialist and session reset RPCs are registered in both directions", () => {
+  const requestId = "r-1";
+  const agentId = "child-1";
+  const requests = [
+    {
+      type: "agent.resident.set.request",
+      requestId,
+      agentId,
+      resident: true,
+      role: "Review code",
+      roleSlug: "review",
+      profileId: "profile-1",
+      urgentReport: false,
+    },
+    { type: "agent.resident.set.request", requestId, agentId, resident: false },
+    {
+      type: "agent.resident.create.request",
+      requestId,
+      parentAgentId: "parent-1",
+      profileId: "p".repeat(128),
+      role: "r".repeat(500),
+      roleSlug: "a".repeat(64),
+      keepAlive: true,
+    },
+    { type: "agent.session.reset.request", requestId, agentId },
+    {
+      type: "agent.session.reset.request",
+      requestId,
+      agentId,
+      interrupt: false,
+      clearVisibleTimeline: true,
+    },
+  ];
+  for (const request of requests) {
+    expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+  }
+  for (const invalid of [
+    { ...requests[0], role: " " },
+    { ...requests[0], role: "r".repeat(501) },
+    { ...requests[2], profileId: "p".repeat(129) },
+    { ...requests[2], profileId: undefined },
+    { ...requests[2], roleSlug: "Not-a-slug" },
+    { ...requests[4], clearVisibleTimeline: "true" },
+  ]) {
+    expect(SessionInboundMessageSchema.safeParse(invalid).success).toBe(false);
+  }
+
+  const success = { requestId, agentId, accepted: true, error: null };
+  const error = { requestId, accepted: false, error: "Cannot complete request" };
+  const messages = [
+    { type: "agent.resident.set.response", payload: success },
+    { type: "agent.resident.create.response", payload: { ...success, created: true } },
+    { type: "agent.resident.create.response", payload: { ...success, created: false } },
+    {
+      type: "agent.resident.create.response",
+      payload: { ...error, agentId: null, created: false },
+    },
+    { type: "agent.session.reset.response", payload: { ...error, agentId } },
+  ];
+  for (const message of messages) {
+    const frame = { type: "session", message };
+    expect(SessionOutboundMessageSchema.parse(message)).toEqual(message);
+    expect(validateWSOutboundMessage(frame)).toEqual({ success: true, data: frame });
+  }
+  for (const payload of [
+    { ...success, agentId: null, created: false },
+    { ...success, created: true, error: "Failed" },
+    { ...error, agentId: null, created: true },
+  ]) {
+    const message = { type: "agent.resident.create.response", payload };
+    expect(SessionOutboundMessageSchema.safeParse(message).success).toBe(false);
+    expect(validateWSOutboundMessage({ type: "session", message }).success).toBe(false);
   }
 });
 

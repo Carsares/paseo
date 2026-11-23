@@ -19,11 +19,13 @@ import { createRealpathAwarePathMatcher } from "../utils/path.js";
 import { getPaseoWorktreeMetadataPath } from "../utils/worktree-metadata.js";
 import { archiveCommand } from "./worktree/commands.js";
 import { createWorktree, listPaseoWorktrees, type WorktreeConfig } from "../utils/worktree.js";
-import type { ManagedAgent } from "./agent/agent-manager.js";
-import type { StoredAgentRecord } from "./agent/agent-storage.js";
+import { AgentManager, type ManagedAgent } from "./agent/agent-manager.js";
+import { AgentStorage, type StoredAgentRecord } from "./agent/agent-storage.js";
+import { createTestAgentClient } from "./test-utils/fake-agent-client.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import {
   archiveByScope,
+  archiveWorkspaceContents,
   unarchiveWorkspaceAgents,
   type ActiveWorkspaceRef,
   type ArchiveDependencies,
@@ -38,6 +40,54 @@ const cleanupPaths: string[] = [];
 afterEach(() => {
   for (const target of cleanupPaths.splice(0)) {
     rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("workspace teardown archives live and cold resident specialists", async () => {
+  const cwd = mkdtempSync(path.join(tmpdir(), "workspace-archive-residents-"));
+  cleanupPaths.push(cwd);
+  const logger = createLogger();
+  const storage = new AgentStorage(path.join(cwd, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: createTestAgentClient("codex") },
+    logger,
+    registry: storage,
+  });
+  const workspaceId = "target-workspace";
+  const config = { cwd, provider: "codex" };
+  const parent = await manager.createSilentWorkspaceMainAgent({ workspaceId, config });
+  const sibling = await manager.createSilentWorkspaceMainAgent({
+    workspaceId: "other-workspace",
+    config,
+  });
+  const createResident = (role: string) =>
+    manager.createSilentResidentSubagent({ parentAgentId: parent.id, provider: "codex", role });
+  const { agentId: liveId } = await createResident("Reviewer");
+  const { agentId: closedId } = await createResident("Writer");
+  try {
+    const { session } = await manager.createAgentFromRecord(liveId);
+    const close = vi.spyOn(session!, "close");
+    const archivedAt = new Date().toISOString();
+    const archived = await archiveWorkspaceContents(
+      {
+        agentManager: manager,
+        agentStorage: storage,
+        killTerminalsForWorkspace: async () => {},
+        sessionLogger: logger,
+      },
+      workspaceId,
+      archivedAt,
+    );
+    expect(archived).toEqual(new Set([parent.id, liveId, closedId]));
+    expect((await storage.get(liveId))?.archivedAt).toBe(archivedAt);
+    expect((await storage.get(closedId))?.archivedAt).toBe(archivedAt);
+    expect((await storage.get(parent.id))?.archivedAt).toBe(archivedAt);
+    expect((await storage.get(sibling.id))?.archivedAt).toBeUndefined();
+    expect(manager.getAgent(liveId)).toBeNull();
+    expect(close).toHaveBeenCalledOnce();
+  } finally {
+    await manager.closeAgent(liveId);
+    await manager.flush();
   }
 });
 
@@ -157,14 +207,8 @@ function createArchiveDeps(input: ArchiveDepsInput): ArchiveTestDependencies {
     } as unknown as Pick<WorkspaceGitService, "getSnapshot" | "invalidateWorktrees">,
     agentManager: {
       listAgents: () => [],
-      getAgent: () => null,
-      archiveAgent: vi.fn(async (agentId: string) => {
-        archivedAgentIds.push(agentId);
-        return { archivedAt: new Date().toISOString() };
-      }),
-      archiveSnapshot: vi.fn(async (agentId: string, _archivedAt: string) => {
+      archiveAgentForWorkspace: vi.fn(async (agentId: string) => {
         archivedSnapshotIds.push(agentId);
-        return {};
       }),
     },
     agentStorage: {
@@ -1030,15 +1074,8 @@ describe("archiveByScope", () => {
           : ([
               { id: liveAgentId, workspaceId: targetWorkspaceId, cwd: worktree.worktreePath },
             ] as ManagedAgent[]),
-      getAgent: (agentId: string) =>
-        agentId === liveAgentId ? ({ id: liveAgentId } as ManagedAgent) : null,
-      archiveAgent: vi.fn(async (agentId: string) => {
-        deps.archivedAgentIds.push(agentId);
-        return { archivedAt: new Date().toISOString() };
-      }),
-      archiveSnapshot: vi.fn(async (agentId: string, _archivedAt: string) => {
-        deps.archivedSnapshotIds.push(agentId);
-        return {};
+      archiveAgentForWorkspace: vi.fn(async (agentId: string) => {
+        (agentId === liveAgentId ? deps.archivedAgentIds : deps.archivedSnapshotIds).push(agentId);
       }),
     };
     deps.agentStorage = {
@@ -1070,37 +1107,42 @@ describe("archiveByScope", () => {
   });
 
   test("archives the durable snapshot when an observed live agent closes before teardown", async () => {
-    const { tempDir, repoDir } = createGitRepo();
-    const paseoHome = path.join(tempDir, ".paseo");
+    const cwd = mkdtempSync(path.join(tmpdir(), "workspace-archive-close-race-"));
+    cleanupPaths.push(cwd);
+    const logger = createLogger();
+    const storage = new AgentStorage(path.join(cwd, "agents"), logger);
+    const manager = new AgentManager({
+      clients: { codex: createTestAgentClient("codex") },
+      logger,
+      registry: storage,
+    });
     const workspaceId = "ws-live-teardown-race";
-    const agentId = "agent-live-teardown-race";
-    const deps = createArchiveDeps({
-      paseoHome,
-      activeWorkspaces: [{ workspaceId, cwd: repoDir, kind: "local_checkout" }],
+    const { id } = await manager.createAgent({ cwd, provider: "codex" }, undefined, {
+      workspaceId,
     });
-    deps.agentManager = {
-      listAgents: () => [{ id: agentId, workspaceId }] as ManagedAgent[],
-      getAgent: () => null,
-      archiveAgent: vi.fn(async () => ({ archivedAt: new Date().toISOString() })),
-      archiveSnapshot: vi.fn(async (id: string) => {
-        deps.archivedSnapshotIds.push(id);
-        return {};
-      }),
-    };
-    deps.agentStorage = {
-      ...deps.agentStorage,
-      listByWorkspace: async () =>
-        [{ id: agentId, workspaceId, archivedAt: null }] as StoredAgentRecord[],
-    };
-
-    const result = await archiveByScope(deps, {
-      scope: { kind: "workspace", workspaceId },
-      requestId: "req-live-teardown-race",
-    });
-
-    expect(result.archivedAgentIds).toContain(agentId);
-    expect(deps.archivedSnapshotIds).toEqual([agentId]);
-    expect(deps.agentManager.archiveAgent).not.toHaveBeenCalled();
+    const archivedAt = new Date().toISOString();
+    try {
+      const archived = await archiveWorkspaceContents(
+        {
+          agentManager: manager,
+          agentStorage: {
+            async listByWorkspace(requestedWorkspaceId) {
+              await manager.closeAgent(id);
+              return storage.listByWorkspace(requestedWorkspaceId);
+            },
+          },
+          killTerminalsForWorkspace: async () => {},
+        },
+        workspaceId,
+        archivedAt,
+      );
+      expect(archived).toEqual(new Set([id]));
+      expect((await storage.get(id))?.archivedAt).toBe(archivedAt);
+      expect(manager.getAgent(id)).toBeNull();
+    } finally {
+      await manager.closeAgent(id);
+      await manager.flush();
+    }
   });
 
   test("worktree scope archives three workspaces on the directory and removes it", async () => {
@@ -1189,11 +1231,10 @@ describe("archiveByScope cancellation", () => {
       { id: "agent-already-archived", archivedAt: "2026-01-01T00:00:00.000Z" },
     ]);
     const agentArchive = gate();
-    deps.agentManager.archiveSnapshot = vi.fn(async (agentId: string) => {
+    deps.agentManager.archiveAgentForWorkspace = vi.fn(async (agentId: string) => {
       agentArchive.reach();
       await agentArchive.wait;
       deps.archivedSnapshotIds.push(agentId);
-      return {} as StoredAgentRecord;
     });
     const controller = new AbortController();
 
@@ -1322,20 +1363,14 @@ test("uses the operation timestamp for live agents, snapshots, and the workspace
   });
   const stamps: Array<string | undefined> = [];
   deps.agentManager.listAgents = () => [{ id: "live", workspaceId: "stamped" }] as ManagedAgent[];
-  deps.agentManager.getAgent = () => ({ id: "live" }) as ManagedAgent;
-  deps.agentManager.archiveAgent = async (_id, stamp) => {
-    stamps.push(stamp);
-    return { archivedAt: stamp! };
-  };
   deps.agentStorage.listByWorkspace = async () =>
     [
       { id: "stored", workspaceId: "stamped", archivedAt: null },
       { id: "closed", workspaceId: "stamped", archivedAt: "2020-01-01T00:00:00.000Z" },
     ] as StoredAgentRecord[];
-  deps.agentManager.getAgent = (id) => (id === "live" ? ({ id } as ManagedAgent) : null);
-  deps.agentManager.archiveSnapshot = async (_id, stamp) => {
+  deps.agentManager.archiveAgentForWorkspace = async (_id, workspaceId, stamp) => {
+    expect(workspaceId).toBe("stamped");
     stamps.push(stamp);
-    return {} as StoredAgentRecord;
   };
   deps.archiveWorkspaceRecord = async (_id, stamp) => {
     stamps.push(stamp);

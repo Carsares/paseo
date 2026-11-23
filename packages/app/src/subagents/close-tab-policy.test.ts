@@ -1,3 +1,4 @@
+import { RESIDENT_AGENT_LABEL } from "@getpaseo/protocol/agent-labels";
 import { describe, expect, it } from "vitest";
 import { resolveCloseAgentTabPolicy } from "./close-tab-policy";
 
@@ -12,6 +13,15 @@ describe("resolveCloseAgentTabPolicy", () => {
     expect(resolveCloseAgentTabPolicy({ parentAgentId: "parent-agent" })).toEqual({
       kind: "layout-only",
     });
+  });
+
+  it("keeps a parentless specialist alive when its tab closes", () => {
+    expect(
+      resolveCloseAgentTabPolicy({
+        parentAgentId: null,
+        labels: { [RESIDENT_AGENT_LABEL]: "true" },
+      }),
+    ).toEqual({ kind: "layout-only" });
   });
 
   it("preserves the existing archive fallback when the agent is missing", () => {

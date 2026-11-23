@@ -5,7 +5,7 @@ import {
   type SheetTab,
 } from "@/stores/workspace-layout-store";
 import { buildDeterministicWorkspaceTabId } from "@/workspace-tabs/identity";
-import type { WorkspaceTabTarget } from "@/workspace-tabs/model";
+import { buildWorkspaceTabPersistenceKey, type WorkspaceTabTarget } from "@/workspace-tabs/model";
 import type { SubagentRow } from "./select";
 
 /** The workspace target a subagent row opens. */
@@ -42,6 +42,19 @@ export function useSubagentSheetTab(
     const answers = new Map<string, SheetTab | null>();
     return (row) => {
       if (!workspaceKey) return null;
+      if (row.kind === "paseo") {
+        // Sheet targets are local to this workspace. Let the row's address-aware opener
+        // handle agents elsewhere, even if a local agent has the same ID.
+        if (
+          !row.workspaceId ||
+          buildWorkspaceTabPersistenceKey({
+            serverId: row.address.serverId,
+            workspaceId: row.workspaceId,
+          }) !== workspaceKey
+        ) {
+          return null;
+        }
+      }
       const state = {
         layoutMode,
         layoutByWorkspace: layout ? { [workspaceKey]: layout } : {},

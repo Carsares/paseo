@@ -44,7 +44,7 @@ export function buildSubagentRowPresentationData(row: SubagentRow): SubagentRowP
   // own the compact secondary context because model, effort, and usage semantics differ.
   const description = resolveRowLabel(row.description);
   const title = resolveRowLabel(row.title);
-  const label = description ?? title;
+  const label = row.kind === "paseo" ? (row.resident?.role ?? title) : (description ?? title);
   const providerSubtitle = row.kind === "provider" ? resolveRowLabel(row.subtitle) : null;
   const subtitle = providerSubtitle ?? (description ? title : null);
   const status = presentationStatus(row);

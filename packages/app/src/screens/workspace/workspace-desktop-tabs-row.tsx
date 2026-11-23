@@ -30,6 +30,7 @@ import {
   Maximize,
   Minimize,
   Plus,
+  Unlink,
   X,
 } from "lucide-react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
@@ -105,6 +106,7 @@ import {
   useCanMoveSubagentToWorkspace,
   useMoveSubagentToWorkspace,
 } from "@/subagents/use-move-subagent-to-workspace";
+import { useResidentActions } from "@/subagents/resident-dialog";
 import { CrownOffIcon } from "@/components/icons/crown-off-icon";
 
 const DROPDOWN_WIDTH = 220;
@@ -151,6 +153,7 @@ const ThemedArrowRightToLine = withUnistyles(ArrowRightToLine);
 const ThemedCopyX = withUnistyles(CopyX);
 const ThemedPencil = withUnistyles(Pencil);
 const ThemedPlus = withUnistyles(Plus);
+const ThemedUnlink = withUnistyles(Unlink);
 const ThemedColumns2 = withUnistyles(Columns2);
 const ThemedRows2 = withUnistyles(Rows2);
 const ThemedEllipsis = withUnistyles(Ellipsis);
@@ -462,6 +465,10 @@ function TabContextMenuItem({
         return <ThemedExternalLink size={16} uniProps={mutedColorMapping} />;
       case "pencil":
         return <ThemedPencil size={16} uniProps={mutedColorMapping} />;
+      case "plus":
+        return <ThemedPlus size={16} uniProps={mutedColorMapping} />;
+      case "unlink":
+        return <ThemedUnlink size={16} uniProps={mutedColorMapping} />;
       case "x":
         return <ThemedX size={16} uniProps={mutedColorMapping} />;
     }
@@ -1592,6 +1599,7 @@ function ResolvedDesktopTabChip({
     [isMain, item.presentation],
   );
   const targetAgentId = item.tab.target.kind === "agent" ? item.tab.target.agentId : null;
+  const residentActions = useResidentActions(serverId, targetAgentId);
   const canMoveAgentToWorkspace = useCanMoveSubagentToWorkspace(
     serverId,
     workspaceId,
@@ -1612,6 +1620,7 @@ function ResolvedDesktopTabChip({
         tabCount,
         mainTabIndex,
         hierarchyActions: mainTab?.actionsForTab(item.tab),
+        residentActions,
         hierarchyLabels,
         onCopyResumeCommand,
         onCopyAgentId,
@@ -1645,6 +1654,7 @@ function ResolvedDesktopTabChip({
       labels,
       onReloadAgent,
       onRenameTab,
+      residentActions,
       tabCount,
     ],
   );

@@ -1,6 +1,7 @@
 import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-types";
 import { createContext } from "react";
 import { i18n } from "@/i18n/i18next";
+import { residentActionLabel, type ResidentAction } from "@/subagents/resident-actions";
 import { encodeFilePathForPathSegment, encodeWorkspaceIdForPathSegment } from "@/utils/host-routes";
 import { buildDeterministicWorkspaceTabId } from "@/workspace-tabs/identity";
 
@@ -120,6 +121,8 @@ export type WorkspaceTabMenuIcon =
   | "copy-x"
   | "external-link"
   | "pencil"
+  | "plus"
+  | "unlink"
   | "x";
 
 export type WorkspaceTabMenuEntry =
@@ -152,6 +155,7 @@ interface BuildWorkspaceTabMenuEntriesInput {
   tabCount: number;
   mainTabIndex?: number;
   hierarchyActions?: WorkspaceHierarchyActions;
+  residentActions?: readonly { action: ResidentAction; onSelect: () => void }[];
   hierarchyLabels?: ReturnType<typeof getWorkspaceTabHierarchyLabels>;
   menuTestIDBase: string;
   onCopyResumeCommand: (agentId: string) => Promise<void> | void;
@@ -174,6 +178,7 @@ interface BuildWorkspaceDesktopTabActionsInput {
   tabCount: number;
   mainTabIndex?: number;
   hierarchyActions?: WorkspaceHierarchyActions;
+  residentActions?: BuildWorkspaceTabMenuEntriesInput["residentActions"];
   hierarchyLabels?: ReturnType<typeof getWorkspaceTabHierarchyLabels>;
   onCopyResumeCommand: (agentId: string) => Promise<void> | void;
   onCopyAgentId: (agentId: string) => Promise<void> | void;
@@ -254,6 +259,26 @@ function getCloseButtonTestId(tab: WorkspaceTabDescriptor): string {
   return `workspace-file-close-${encodeFilePathForPathSegment(tab.target.path)}`;
 }
 
+function residentMenuEntries(
+  actions: BuildWorkspaceTabMenuEntriesInput["residentActions"] = [],
+  menuTestIDBase: string,
+): WorkspaceTabMenuEntry[] {
+  const icons = {
+    create: "plus",
+    bind: "git-merge",
+    unbind: "unlink",
+    reset: "rotate-cw",
+  } as const;
+  return actions.map(({ action, onSelect }) => ({
+    kind: "item",
+    key: `resident-${action}`,
+    label: i18n.t(residentActionLabel(action)),
+    icon: icons[action],
+    testID: `${menuTestIDBase}-resident-${action}`,
+    onSelect,
+  }));
+}
+
 export function buildWorkspaceTabMenuEntries(
   input: BuildWorkspaceTabMenuEntriesInput,
 ): WorkspaceTabMenuEntry[] {
@@ -264,6 +289,7 @@ export function buildWorkspaceTabMenuEntries(
     tabCount,
     mainTabIndex = -1,
     hierarchyActions,
+    residentActions,
     menuTestIDBase,
     onCopyResumeCommand,
     onCopyAgentId,
@@ -305,6 +331,7 @@ export function buildWorkspaceTabMenuEntries(
         void onCopyAgentId(agentId);
       },
     });
+    entries.push(...residentMenuEntries(residentActions, menuTestIDBase));
   }
 
   if (tab.target.kind === "agent" && hierarchyActions) {
@@ -465,6 +492,7 @@ export function buildWorkspaceDesktopTabActions(
       tabCount: input.tabCount,
       mainTabIndex: input.mainTabIndex,
       hierarchyActions: input.hierarchyActions,
+      residentActions: input.residentActions,
       hierarchyLabels: input.hierarchyLabels,
       menuTestIDBase: contextMenuTestId,
       onCopyResumeCommand: input.onCopyResumeCommand,

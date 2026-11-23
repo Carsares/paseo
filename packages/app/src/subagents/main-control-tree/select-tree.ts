@@ -2,8 +2,10 @@ import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import {
   getParentAddressFromLabels,
   getParentAgentIdFromLabels,
+  getResidentRoleFromLabels,
   hasOpenAgentTab,
   isMainControlAgent,
+  isResidentAgent,
   resolveAgentHierarchyDepth,
 } from "@getpaseo/protocol/agent-labels";
 import type { Agent } from "@/stores/session-store";
@@ -33,13 +35,21 @@ export interface MainControlTreeNode extends AgentAddress {
   title: string;
   processState: "running" | "idle" | "closed";
   roleBadge?: "main" | "standalone";
+  residentRole?: string | null;
   isArchived: boolean;
   lastActivityAt: Date;
 }
 
 export interface MainControlWorkspaceSections {
+  residentGroups: MainControlResidentGroup[];
   active: MainControlTreeNode[];
   closed: MainControlTreeNode[];
+}
+
+export interface MainControlResidentGroup {
+  parent: AgentAddress | null;
+  parentTitle: string | null;
+  nodes: MainControlTreeNode[];
 }
 
 export function mainControlTreeNodeKey({ serverId, agentId }: AgentAddress): string {
@@ -198,9 +208,29 @@ export function selectMainControlWorkspaceSections({
     workspaceAddress,
   });
   const childrenByParent = indexLocatedChildren(entries);
+  const entriesByAddress = new Map(entries.map((entry) => [mainControlTreeNodeKey(entry), entry]));
+  const residentGroups = new Map<string | null, MainControlResidentGroup>();
   const active: MainControlTreeNode[] = [];
   const closed: MainControlTreeNode[] = [];
   const visited = new Set<string>();
+  function addResident(entry: LocatedAgent, node: MainControlTreeNode): boolean {
+    if (node.isArchived || !isResidentAgent(entry.agent)) return false;
+    const parent = getParentAddressFromLabels(entry.agent.labels, entry.serverId);
+    const parentKey = parent ? mainControlTreeNodeKey(parent) : null;
+    let group = residentGroups.get(parentKey);
+    if (!group) {
+      const parentAgent = parentKey ? entriesByAddress.get(parentKey)?.agent : undefined;
+      group = {
+        parent,
+        parentTitle: parent ? parentAgent?.title?.trim() || fallbackTitle : null,
+        nodes: [],
+      };
+      residentGroups.set(parentKey, group);
+    }
+    group.nodes.push({ ...node, residentRole: getResidentRoleFromLabels(entry.agent.labels) });
+    return true;
+  }
+
   function add(entry: LocatedAgent, depth: MainControlTreeNode["depth"]) {
     const { agent, agentId, serverId } = entry;
     const key = mainControlTreeNodeKey(entry);
@@ -222,8 +252,7 @@ export function selectMainControlWorkspaceSections({
     });
     const isStandalone = !getParentAgentIdFromLabels(agent.labels) && !isMain;
     const roleBadge = isStandalone ? "standalone" : undefined;
-    const isActive = processState !== "closed";
-    (isActive ? active : closed).push({
+    const node: MainControlTreeNode = {
       agentId,
       serverId,
       depth,
@@ -232,7 +261,9 @@ export function selectMainControlWorkspaceSections({
       roleBadge: isMain ? "main" : roleBadge,
       isArchived,
       lastActivityAt: lastActivity(agent),
-    });
+    };
+    if (addResident(entry, node)) return;
+    (processState !== "closed" ? active : closed).push(node);
   }
 
   const pending: { entry: LocatedAgent; depth: MainControlTreeNode["depth"] }[] = [
@@ -253,7 +284,13 @@ export function selectMainControlWorkspaceSections({
     if (belongsToWorkspace(entry, workspaceAddress)) add(entry, 0);
   }
   closed.sort((a, b) => b.lastActivityAt.getTime() - a.lastActivityAt.getTime());
-  return { active, closed };
+  const orderedResidentGroups = [...visited].flatMap((key) => {
+    const group = residentGroups.get(key);
+    if (!group) return [];
+    residentGroups.delete(key);
+    return [group];
+  });
+  return { residentGroups: [...orderedResidentGroups, ...residentGroups.values()], active, closed };
 }
 
 export function isWorkspaceRootAgent(

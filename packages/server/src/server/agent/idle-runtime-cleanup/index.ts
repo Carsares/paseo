@@ -8,6 +8,7 @@ export interface RuntimeCleanupCandidate {
   readonly parentAgentId: string | undefined;
   readonly provider: string;
   readonly sessionId: string | null;
+  readonly keepAlive?: boolean;
   readonly lastActivityAt: number;
   isEligible(): boolean;
   canStopRuntime?(): Promise<boolean>;
@@ -79,7 +80,7 @@ export function createIdleRuntimeCleanup(options: Options) {
     const runtimes = options.runtimes();
     for (const runtime of runtimes) {
       if (!isCurrent()) break;
-      if (!runtime.sessionId) continue;
+      if (!runtime.sessionId || runtime.keepAlive) continue;
       const family = familyOf(runtime, runtimes);
       try {
         const allowed = baselineAllows(family) && (await providersAllow(family, isCurrent));
@@ -104,6 +105,7 @@ export function createIdleRuntimeCleanup(options: Options) {
           const currentFamily = familyOf(runtime, options.runtimes());
           return (
             isCurrent() &&
+            !currentFamily[0]?.keepAlive &&
             currentFamily.length === family.length &&
             currentFamily.every((current) =>
               family.some((captured) => captured.identity === current.identity),

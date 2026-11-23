@@ -64,6 +64,7 @@ export type {
 import type { PluginTimelineItem } from "@getpaseo/protocol/agent-types";
 import type {
   AgentBackgroundWorkItem,
+  CreateResidentAgentOptions,
   FetchAgentsEntry,
   FetchAgentsOptions,
   FetchAgentsPageInfo,
@@ -71,7 +72,9 @@ import type {
   FetchAgentTimelineDirection,
   FetchAgentTimelinePayload,
   FetchAgentTimelineProjection,
+  ResetAgentSessionOptions,
   SendMessageOptions,
+  SetAgentResidentOptions,
   WaitForFinishResult,
 } from "./daemon-client.js";
 
@@ -122,6 +125,12 @@ export interface PaseoClientConfig {
 export type PaseoWorkspace = WorkspaceDescriptorPayload;
 export type PaseoAgent = AgentSnapshotPayload;
 export type PaseoAgentListOptions = FetchAgentsOptions;
+export type PaseoAgentSetResidentOptions = SetAgentResidentOptions;
+export type PaseoAgentResetSessionOptions = ResetAgentSessionOptions;
+export type PaseoResidentAgentCreateOptions = CreateResidentAgentOptions & {
+  parentAgentId: string;
+  profileId: string;
+};
 export type PaseoProject = WorkspaceProjectDescriptorPayload;
 export type PaseoProjectListOptions = Omit<ProjectListRequestMessage, "type" | "requestId"> & {
   requestId?: string;
@@ -455,6 +464,10 @@ export interface PaseoAgentHandle {
   send(text: string, options?: PaseoAgentSendOptions): Promise<void>;
   /** Sends pending subagent reports. Requires a host with `subagentInbox`. */
   flushInbox(): Promise<void>;
+  /** Bind or remove a resident role for a child agent. */
+  setResident(resident: boolean, options?: PaseoAgentSetResidentOptions): Promise<void>;
+  /** Start a new provider context while keeping the same agent identity. */
+  resetSession(options?: PaseoAgentResetSessionOptions): Promise<void>;
   respondToPermission(options: PaseoAgentRespondToPermissionOptions): Promise<void>;
   /**
    * Changes the agent's own options: top-level keys replace, `null` removes the key so the
@@ -491,6 +504,10 @@ export interface PaseoAgentActions {
   list(options?: PaseoAgentListOptions): Promise<PaseoAgentListResult>;
   ref(agent: string | PaseoAgent): PaseoAgentHandle;
   create(options: PaseoAgentCreateOptions): Promise<PaseoAgentHandle>;
+  /** Create a resident specialist or return the parent's existing specialist with that slug. */
+  createResident(
+    options: PaseoResidentAgentCreateOptions,
+  ): Promise<{ agentId: string; created: boolean }>;
   /**
    * Local event subscription over the low-level driver's agent_update stream.
    * The returned function only removes this SDK listener.
@@ -922,6 +939,8 @@ export function createPaseoApi(
       list: listAgents,
       ref: (agent) => createAgentHandle(agent),
       create: (options) => createAgent(options),
+      createResident: ({ parentAgentId, profileId, ...options }) =>
+        daemonClient.createResidentAgent(parentAgentId, profileId, options),
       subscribe: listenAgents,
     },
     providers: {
@@ -1207,6 +1226,8 @@ function createAgentHandleFactory(
         await daemonClient.sendAgentMessage(id, text, options);
       },
       flushInbox: () => daemonClient.flushAgentInbox(id),
+      setResident: (resident, options) => daemonClient.setAgentResident(id, resident, options),
+      resetSession: (options) => daemonClient.resetAgentSession(id, options),
       setOptions: async (patch) => {
         await daemonClient.setAgentOptions(id, patch);
       },

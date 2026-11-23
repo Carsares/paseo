@@ -1999,18 +1999,14 @@ describe("create_agent MCP tool", () => {
     });
     const tool = registeredTool(server, "create_agent");
 
-    const missingProvider = await tool.inputSchema.safeParseAsync({
-      ...detachedDirectoryWorkspace(existingCwd),
-      settings: { modeId: "default" },
-      title: "Short title",
-      initialPrompt: "test",
-    });
-    expect(missingProvider.success).toBe(false);
-    expect(
-      missingProvider.error.issues.some(
-        (issue: { path: Array<string | number> }) => issue.path[0] === "provider",
-      ),
-    ).toBe(true);
+    await expect(
+      tool.handler({
+        ...detachedDirectoryWorkspace(existingCwd),
+        settings: { modeId: "default" },
+        title: "Short title",
+        initialPrompt: "test",
+      }),
+    ).rejects.toThrow("Provide provider/model or profileId");
 
     const providerWithoutModel = await tool.inputSchema.safeParseAsync({
       ...detachedDirectoryWorkspace(existingCwd),

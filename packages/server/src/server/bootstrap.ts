@@ -1066,6 +1066,8 @@ export async function createPaseoDaemon(
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,
     workspaceRegistry,
+    getAgentProfile: (id) =>
+      daemonConfigStore.get().agentProfiles?.find((profile) => profile.id === id),
     appendSystemPrompt: config.appendSystemPrompt,
     mainControlAppendSystemPrompt: daemonConfigStore.get().mainControlAppendSystemPrompt,
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
@@ -1671,6 +1673,8 @@ export async function createPaseoDaemon(
       },
     }),
   });
+
+  agentManager.setCancelAutomaticParentSubscription(finishSubscriptions.cancelAutomaticParent);
 
   const idleRuntimeCleanup = createIdleRuntimeCleanup({
     enabled: daemonConfigStore.get().idleRuntimeCleanup !== false,

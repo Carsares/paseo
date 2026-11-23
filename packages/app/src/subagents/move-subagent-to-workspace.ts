@@ -1,4 +1,5 @@
 import { DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
+import { isResidentAgent } from "@getpaseo/protocol/agent-labels";
 import type { Agent } from "@/stores/session-store";
 import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
 import { isWorkspaceRootAgent } from "./workspace-root-policy";
@@ -6,7 +7,8 @@ import { isWorkspaceRootAgent } from "./workspace-root-policy";
 export type MovableWorkspaceAgent = Pick<
   Agent,
   "id" | "parentAgentId" | "workspaceId" | "archivedAt" | "background"
->;
+> &
+  Partial<Pick<Agent, "labels">>;
 
 interface MoveSubagentSessionEntry {
   serverInfo?: { features?: { agentMoveToWorkspace?: boolean } } | null;
@@ -81,6 +83,7 @@ export function canMoveSubagentToWorkspace(input: {
     | (Pick<Agent, "parentAgentId" | "workspaceId" | "archivedAt"> & {
         id?: string;
         background?: boolean;
+        labels?: Agent["labels"];
       })
     | null
     | undefined;
@@ -90,7 +93,7 @@ export function canMoveSubagentToWorkspace(input: {
   if (!input.featureEnabled || !input.agent) {
     return false;
   }
-  if (input.agent.archivedAt || input.agent.background) {
+  if (input.agent.archivedAt || input.agent.background || isResidentAgent(input.agent)) {
     return false;
   }
   if (input.workspaceId !== undefined) {

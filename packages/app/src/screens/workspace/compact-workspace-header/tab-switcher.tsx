@@ -26,6 +26,7 @@ import {
   useCanMoveSubagentToWorkspace,
   useMoveSubagentToWorkspace,
 } from "@/subagents/use-move-subagent-to-workspace";
+import { useResidentActions } from "@/subagents/resident-dialog";
 
 // The trigger draws at 32pt beside its island neighbours, so only vertical slop is free.
 const TAB_SWITCHER_TRIGGER_HIT_SLOP = { top: 8, bottom: 8 } as const;
@@ -227,6 +228,7 @@ function MobileWorkspaceTabOption({
     [t],
   );
   const targetAgentId = tab.target.kind === "agent" ? tab.target.agentId : null;
+  const residentActions = useResidentActions(normalizedServerId, targetAgentId);
   const canMoveAgentToWorkspace = useCanMoveSubagentToWorkspace(
     normalizedServerId,
     normalizedWorkspaceId,
@@ -249,6 +251,7 @@ function MobileWorkspaceTabOption({
         tabCount,
         mainTabIndex,
         hierarchyActions: mainTab?.actionsForTab(tab),
+        residentActions,
         hierarchyLabels,
         menuTestIDBase,
         onCopyResumeCommand,
@@ -281,6 +284,7 @@ function MobileWorkspaceTabOption({
       onCopyTerminalId,
       onReloadAgent,
       onRenameTab,
+      residentActions,
       tab,
       tabCount,
       tabIndex,

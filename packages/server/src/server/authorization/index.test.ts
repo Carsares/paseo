@@ -35,6 +35,25 @@ function outboundMessage(type: SessionOutboundMessage["type"]): SessionOutboundM
 }
 
 describe("SessionAuthorization", () => {
+  test("resident creation and reset require both workspace and Hub execution authority", () => {
+    const writeOnly = new SessionAuthorization(["workspace.write"]);
+    const hubOnly = new SessionAuthorization(["hub.execute"]);
+    const both = new SessionAuthorization(["workspace.write", "hub.execute"]);
+    for (const [request, response] of [
+      ["agent.resident.create.request", "agent.resident.create.response"],
+      ["agent.session.reset.request", "agent.session.reset.response"],
+    ] as const) {
+      for (const authorization of [writeOnly, hubOnly]) {
+        expect(authorization.allowsInbound(inboundMessage(request))).toBe(false);
+        expect(authorization.allowsOutbound(outboundMessage(response))).toBe(false);
+      }
+      expect(both.allowsInbound(inboundMessage(request))).toBe(true);
+      expect(both.allowsOutbound(outboundMessage(response))).toBe(true);
+    }
+    expect(writeOnly.allowsInbound(inboundMessage("agent.resident.set.request"))).toBe(true);
+    expect(hubOnly.allowsInbound(inboundMessage("agent.resident.set.request"))).toBe(false);
+  });
+
   test("flushing a Main Control inbox requires workspace write", () => {
     const request = inboundMessage("agent.inbox.flush.request");
     const response = outboundMessage("agent.inbox.flush.response");

@@ -153,6 +153,7 @@ import { buildProviderCommand } from "@/utils/provider-command-templates";
 import { generateDraftId } from "@/stores/draft-keys";
 import { resolveWorkspaceRouteId } from "@/utils/workspace-identity";
 import { clearSubagentOpenTabLabel } from "@/subagents/open-tab-labels";
+import { ResidentDialogProvider } from "@/subagents/resident-dialog";
 import { useOpenAgentTabLabels } from "@/subagents/use-open-agent-tab-labels";
 import {
   canAdoptTabUnderMainAgent,
@@ -811,7 +812,7 @@ function WorkspaceContentProviders({
       <DiffDocumentWorkspaceCacheProvider>
         <SheetPaneHostProvider value={sheetPaneHost}>
           <WorkspaceMainTabContext.Provider value={mainTab}>
-            {children}
+            <ResidentDialogProvider>{children}</ResidentDialogProvider>
           </WorkspaceMainTabContext.Provider>
         </SheetPaneHostProvider>
       </DiffDocumentWorkspaceCacheProvider>

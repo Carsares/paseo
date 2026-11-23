@@ -14,6 +14,11 @@ export function useAgentProfileFormModel(
   snapshot: AgentProfileFormSnapshot,
 ): AgentProfileFormModel {
   const [model] = useState(() => openAgentProfileForm(snapshot));
+  const supportsResidentRoles = snapshot.supportsResidentRoles === true;
+
+  useEffect(() => {
+    model.applyResidentRoleSupport(supportsResidentRoles);
+  }, [model, supportsResidentRoles]);
 
   useEffect(() => {
     return () => {

@@ -13,6 +13,7 @@ import {
   type PluginClientBundleStore,
 } from "./daemon-client";
 import { createHostChannelTransport } from "./hosts/index.js";
+import { createPaseoApi } from "./index.js";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { ChunkedTransport } from "@getpaseo/protocol/chunked-transport";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
@@ -6581,6 +6582,111 @@ describe("moving an agent to a workspace", () => {
       await expect(move).rejects.toThrow(expectedError);
     },
   );
+});
+
+describe("resident specialists and session reset", () => {
+  async function connectClient(features: Record<string, boolean> = {}) {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "clsk_unit_test",
+      logger: createMockLogger(),
+      reconnect: { enabled: false },
+      transportFactory: () => mock.transport,
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    mock.triggerOpen({ features });
+    await connecting;
+    return { client, mock };
+  }
+
+  test("does not send requests to a host that has not advertised the capability", async () => {
+    const { client, mock } = await connectClient();
+    await expect(client.setAgentResident("child", true)).rejects.toThrow("Update the host");
+    await expect(client.createResidentAgent("parent", "review")).rejects.toThrow("Update the host");
+    await expect(client.resetAgentSession("child")).rejects.toThrow("Update the host");
+    expect(mock.sent).toHaveLength(0);
+  });
+
+  test("unbinds an existing specialist and returns a reused specialist from its matching reply", async () => {
+    const { client, mock } = await connectClient({ agentResidentSpecialists: true });
+    const { agents } = createPaseoApi(client);
+    const unset = agents.ref("child").setResident(false, { requestId: "unset" });
+    const create = agents.createResident({
+      parentAgentId: "parent",
+      profileId: "review-profile",
+      requestId: "create",
+      roleSlug: "code-review",
+      urgentReport: false,
+      keepAlive: true,
+    });
+    expect(mock.sent.map(parseSentFrame)).toEqual([
+      { type: "agent.resident.set.request", agentId: "child", resident: false, requestId: "unset" },
+      {
+        type: "agent.resident.create.request",
+        parentAgentId: "parent",
+        profileId: "review-profile",
+        roleSlug: "code-review",
+        urgentReport: false,
+        keepAlive: true,
+        requestId: "create",
+      },
+    ]);
+
+    const reply = (type: string, payload: Record<string, unknown>) =>
+      mock.triggerMessage(wrapSessionMessage({ type, payload }));
+    reply("agent.resident.create.response", {
+      agentId: "other-child",
+      accepted: true,
+      created: true,
+      error: null,
+      requestId: "unset",
+    });
+    reply("agent.resident.create.response", {
+      agentId: "existing-child",
+      accepted: true,
+      created: false,
+      error: null,
+      requestId: "create",
+    });
+    reply("agent.resident.set.response", {
+      agentId: "child",
+      accepted: true,
+      error: null,
+      requestId: "unset",
+    });
+    await expect(unset).resolves.toBeUndefined();
+    await expect(create).resolves.toEqual({ agentId: "existing-child", created: false });
+  });
+
+  test("forwards reset flags and surfaces the host's error", async () => {
+    const { client, mock } = await connectClient({ agentSessionReset: true });
+    const result = createPaseoApi(client).agents.ref("agent").resetSession({
+      interrupt: false,
+      clearVisibleTimeline: true,
+    });
+    const request = parseSentFrame(mock.sent[0]);
+    expect(request).toEqual({
+      type: "agent.session.reset.request",
+      agentId: "agent",
+      interrupt: false,
+      clearVisibleTimeline: true,
+      requestId: expect.any(String),
+    });
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "agent.session.reset.response",
+        payload: {
+          requestId: request.requestId,
+          agentId: "agent",
+          accepted: false,
+          error: "Agent is running",
+        },
+      }),
+    );
+    await expect(result).rejects.toThrow("Agent is running");
+  });
 });
 
 describe("agent hierarchy control", () => {

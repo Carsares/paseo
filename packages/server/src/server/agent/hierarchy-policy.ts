@@ -1,4 +1,5 @@
 import {
+  AGENT_PROFILE_ID_LABEL,
   getMainPriorModeIdFromLabels,
   getParentAddressFromLabels,
   getParentAgentIdFromLabels,
@@ -8,6 +9,11 @@ import {
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
+  RESIDENT_AGENT_LABEL,
+  RESIDENT_INBOX_BYPASS_LABEL,
+  RESIDENT_KEEPALIVE_LABEL,
+  RESIDENT_ROLE_LABEL,
+  RESIDENT_SLUG_LABEL,
   resolveAgentHierarchyDepth,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
@@ -23,14 +29,32 @@ export function mainControlPromptEnd(agentId: string): string {
 }
 
 export function stripMainControlPromptHeader(text: string, agentId: string): string {
-  if (!text.startsWith(MAIN_CONTROL_PROMPT_HEADER + "\n")) return text;
   const delimiter = mainControlPromptEnd(agentId);
-  const end = text.indexOf(delimiter);
-  if (end === -1) return text;
-  return text.slice(end + delimiter.length).replace(/^\n\n/, "");
+  while (true) {
+    if (text.startsWith(MAIN_CONTROL_PROMPT_HEADER + "\n")) {
+      const end = text.indexOf(delimiter);
+      if (end === -1) return text;
+      text = text.slice(end + delimiter.length).replace(/^\n\n/, "");
+      continue;
+    }
+    const specialists =
+      /^\[Workspace Resident Specialists\]\n[^\n]*\n\[\/Workspace Resident Specialists\]\n\n/.exec(
+        text,
+      );
+    if (!specialists) return text;
+    text = text.slice(specialists[0].length);
+  }
 }
 /** Absolute depth supplied by the parent host when it creates a remote child. */
 export const REMOTE_HIERARCHY_DEPTH_LABEL = "paseo.remote-hierarchy-depth";
+export const RESERVED_RESIDENT_LABELS = [
+  RESIDENT_AGENT_LABEL,
+  RESIDENT_ROLE_LABEL,
+  RESIDENT_SLUG_LABEL,
+  AGENT_PROFILE_ID_LABEL,
+  RESIDENT_INBOX_BYPASS_LABEL,
+  RESIDENT_KEEPALIVE_LABEL,
+] as const;
 export const RESERVED_HIERARCHY_LABELS = [
   PARENT_AGENT_ID_LABEL,
   PARENT_SERVER_ID_LABEL,
@@ -38,6 +62,7 @@ export const RESERVED_HIERARCHY_LABELS = [
   WORKSPACE_ROLE_LABEL,
   MAIN_PRIOR_MODE_ID_LABEL,
   REMOTE_HIERARCHY_DEPTH_LABEL,
+  ...RESERVED_RESIDENT_LABELS,
 ] as const;
 
 export function hasReservedHierarchyLabels(labels?: Record<string, string>): boolean {
@@ -232,6 +257,7 @@ const MAIN_CONTROL_TOOLS: readonly string[] = [
   "list_agents",
   "summarize_workspace_agents",
   "archive_agent",
+  "reset_agent_session",
 ];
 
 export interface PaseoToolPolicy extends ProviderPaseoToolsPolicy {
@@ -268,6 +294,7 @@ const LEVEL_TWO_DISABLED_TOOLS = [
   "cancel_agent",
   "archive_agent",
   "kill_agent",
+  "reset_agent_session",
 ];
 
 export function applyHierarchyPaseoToolPolicy(
@@ -367,7 +394,8 @@ export function buildMainControlInstructions(mainControlSystemPrompt?: string): 
   return [
     "Role: Workspace Main Control Coordinator. Coordinate work and stay read-only regardless of provider mode. Delegate source, log, and data inspection, shell commands, builds, tests, and all writes.",
     `Use only these Paseo orchestration tools: ${MAIN_CONTROL_TOOLS.join(", ")}. Call list_profiles to select the preset whose description fits the task and its authorized scope.`,
-    'For each task you delegate, use create_agent with parentReporting: "explicit" and notifyOnFinish: false to create exactly one direct Level-1 lead.',
+    "Reuse a matching Workspace Resident Specialist with send_agent_prompt. Use reset_agent_session for a fresh conversation with the same specialist when needed.",
+    'For other tasks, use create_agent with parentReporting: "explicit" and notifyOnFinish: false to create exactly one direct Level-1 lead.',
     "Coordinate through that lead with send_agent_prompt and update_agent. Keep notifyOnFinish: false for follow-ups. End your turn to wait for the lead to call report_to_parent with the outcome or a blocking question. Do not poll or use a blocking wait.",
     "Summarize the lead's report for the user.",
     mainControlSystemPrompt,

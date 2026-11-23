@@ -25,7 +25,12 @@ import {
   PluginListingDetailSchema,
   PluginListingIndexSchema,
 } from "./plugin-registry.js";
-import { AgentProfileSchema, AgentSkillSelectionSchema } from "./agent-profile.js";
+import {
+  AgentProfileSchema,
+  AgentSkillSelectionSchema,
+  ResidentRoleSlugSchema,
+} from "./agent-profile.js";
+import { AGENT_PROFILE_ID_MAX_LENGTH, RESIDENT_ROLE_MAX_LENGTH } from "./agent-labels.js";
 export {
   AgentProfileSchema,
   AgentSkillSelectionSchema,
@@ -2431,6 +2436,76 @@ export const AgentSetMainResponseMessageSchema = z.object({
   }),
 });
 
+const ResidentProfileIdSchema = z.string().max(AGENT_PROFILE_ID_MAX_LENGTH).regex(/\S/);
+const ResidentRoleOverridesSchema = z.object({
+  role: z
+    .string()
+    .max(RESIDENT_ROLE_MAX_LENGTH)
+    .regex(/^\S(?:[\s\S]*\S)?$/)
+    .optional(),
+  roleSlug: ResidentRoleSlugSchema.optional(),
+  urgentReport: z.boolean().optional(),
+  keepAlive: z.boolean().optional(),
+});
+
+export const AgentResidentSetRequestSchema = ResidentRoleOverridesSchema.extend({
+  type: z.literal("agent.resident.set.request"),
+  agentId: z.string().min(1),
+  resident: z.boolean(),
+  profileId: ResidentProfileIdSchema.optional(),
+  requestId: z.string(),
+});
+export const AgentResidentSetResponseSchema = z.object({
+  type: z.literal("agent.resident.set.response"),
+  payload: AgentActionResponsePayloadSchema,
+});
+export type AgentResidentSetRequest = z.infer<typeof AgentResidentSetRequestSchema>;
+export type AgentResidentSetResponse = z.infer<typeof AgentResidentSetResponseSchema>;
+
+export const AgentResidentCreateRequestSchema = ResidentRoleOverridesSchema.extend({
+  type: z.literal("agent.resident.create.request"),
+  parentAgentId: z.string().min(1),
+  profileId: ResidentProfileIdSchema,
+  requestId: z.string(),
+});
+export const AgentResidentCreateResponseSchema = z.object({
+  type: z.literal("agent.resident.create.response"),
+  // zod-aot emits string cases for boolean discriminators.
+  payload: z.union([
+    z.object({
+      requestId: z.string(),
+      accepted: z.literal(true),
+      agentId: z.string().min(1),
+      // False when the parent's matching role already has an agent.
+      created: z.boolean(),
+      error: z.null(),
+    }),
+    z.object({
+      requestId: z.string(),
+      accepted: z.literal(false),
+      agentId: z.string().min(1).nullable(),
+      created: z.literal(false),
+      error: z.string().nullable(),
+    }),
+  ]),
+});
+export type AgentResidentCreateRequest = z.infer<typeof AgentResidentCreateRequestSchema>;
+export type AgentResidentCreateResponse = z.infer<typeof AgentResidentCreateResponseSchema>;
+
+export const AgentSessionResetRequestSchema = z.object({
+  type: z.literal("agent.session.reset.request"),
+  agentId: z.string().min(1),
+  interrupt: z.boolean().optional(),
+  clearVisibleTimeline: z.boolean().optional(),
+  requestId: z.string(),
+});
+export const AgentSessionResetResponseSchema = z.object({
+  type: z.literal("agent.session.reset.response"),
+  payload: AgentActionResponsePayloadSchema,
+});
+export type AgentSessionResetRequest = z.infer<typeof AgentSessionResetRequestSchema>;
+export type AgentSessionResetResponse = z.infer<typeof AgentSessionResetResponseSchema>;
+
 export const AgentFinishReportSchema = z.object({
   id: z.string(),
   prompt: z.string(),
@@ -3987,6 +4062,9 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   AgentMoveToWorkspaceRequestMessageSchema,
   AgentSetMainRequestMessageSchema,
   AgentSetParentRequestMessageSchema,
+  AgentResidentSetRequestSchema,
+  AgentResidentCreateRequestSchema,
+  AgentSessionResetRequestSchema,
   AgentInboxFlushRequestSchema,
   AgentPushFinishReportRequestSchema,
   AgentConfirmFinishReportResponseSchema,
@@ -4440,6 +4518,10 @@ export const ServerInfoStatusPayloadSchema = z
         agentForkContextCursor: z.boolean().optional(),
         // COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
         agentSeamlessContextSwitch: z.boolean().optional(),
+        // COMPAT(agentResidentSpecialists): added in v0.18.0, remove gate after 2027-06-01.
+        agentResidentSpecialists: z.boolean().optional(),
+        // COMPAT(agentSessionReset): added in v0.18.0, remove gate after 2027-06-01.
+        agentSessionReset: z.boolean().optional(),
         // COMPAT(agentInitialPromptOrigin): added in v0.16.0, remove gate after 2027-05-19.
         agentInitialPromptOrigin: z.boolean().optional(),
         // COMPAT(providerSubagents): added in v0.1.107, remove gate after 2027-01-12.
@@ -8155,6 +8237,9 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentMoveToWorkspaceResponseMessageSchema,
   AgentSetMainResponseMessageSchema,
   AgentSetParentResponseMessageSchema,
+  AgentResidentSetResponseSchema,
+  AgentResidentCreateResponseSchema,
+  AgentSessionResetResponseSchema,
   AgentInboxFlushResponseSchema,
   AgentPushFinishReportResponseSchema,
   AgentConfirmFinishReportRequestSchema,

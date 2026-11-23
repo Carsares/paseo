@@ -10,6 +10,7 @@ import { useDiffDocumentWorkspaceCacheBridge } from "@/git/diff-document/workspa
 import { HostRouteProvider, useHostRouteServerId } from "@/navigation/host-route-context";
 import type { WorkspacePaneContentModel } from "@/screens/workspace/workspace-pane-content";
 import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-types";
+import { useResidentDialogBridge } from "@/subagents/resident-dialog";
 
 /** What a sheet pane needs from the workspace it shows a tab of. */
 export interface SheetPaneHost {
@@ -58,13 +59,14 @@ export function useSheetPaneBridge(): ContextBridge {
   const cache = useDiffDocumentWorkspaceCacheBridge();
   const files = useAssistantFileLinkEnvironmentBridge();
   const forgeShorthand = useForgeShorthandBridge();
+  const residentDialog = useResidentDialogBridge();
   const active = useRetainedPanelActive();
   const serverId = useHostRouteServerId();
   const navigation = useContext(NavigationContext);
   const route = useContext(NavigationRouteContext);
   return useCallback(
     (children) => {
-      const content = editing(cache(files(forgeShorthand(children))));
+      const content = editing(cache(files(forgeShorthand(residentDialog(children)))));
       return (
         <SheetPaneHostContext.Provider value={host}>
           <NavigationContext.Provider value={navigation}>
@@ -81,6 +83,17 @@ export function useSheetPaneBridge(): ContextBridge {
         </SheetPaneHostContext.Provider>
       );
     },
-    [host, editing, cache, files, forgeShorthand, active, serverId, navigation, route],
+    [
+      host,
+      editing,
+      cache,
+      files,
+      forgeShorthand,
+      residentDialog,
+      active,
+      serverId,
+      navigation,
+      route,
+    ],
   );
 }

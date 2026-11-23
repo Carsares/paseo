@@ -189,6 +189,11 @@ describe("DaemonConfigStore", () => {
           thinkingOptionId: "think-hard",
           featureValues: { webSearch: true },
           notes: "Use for components, layout and design tokens.",
+          roleSlug: "ui-review",
+          rolePrompt: "Review layout and accessibility.",
+          defaultResident: true,
+          residentUrgentReport: false,
+          residentKeepAlive: true,
         },
       ],
     });
@@ -204,6 +209,11 @@ describe("DaemonConfigStore", () => {
         thinkingOptionId: "think-hard",
         options: { webSearch: true },
         notes: "Use for components, layout and design tokens.",
+        roleSlug: "ui-review",
+        rolePrompt: "Review layout and accessibility.",
+        defaultResident: true,
+        residentUrgentReport: false,
+        residentKeepAlive: true,
       },
     ]);
     expect(store.get().agentProfiles).toHaveLength(1);

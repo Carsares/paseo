@@ -203,6 +203,156 @@ describe("openAgentProfileForm", () => {
     expect(state.catalogResolution).toBe("idle");
   });
 
+  describe("resident role defaults", () => {
+    it("omits unset defaults when an older profile is edited on a capable host", () => {
+      const model = openAgentProfileForm({
+        mode: "edit",
+        profile: { id: "p1", name: "Reviewer", provider: "codex" },
+        supportsResidentRoles: true,
+      });
+
+      expect(model.getState().disclosure.showResidentRoleFields).toBe(true);
+      expect(model.getState().residentRole).toEqual({ roleSlug: "", rolePrompt: "" });
+      expect(model.getState().submitValue).toEqual({
+        name: "Reviewer",
+        provider: "codex",
+        options: {},
+      });
+    });
+
+    it("rejects invalid slugs and overlong prompts while allowing the protocol limits", () => {
+      const model = openAgentProfileForm({
+        mode: "create",
+        seed: { name: "Reviewer", provider: "codex" },
+        supportsResidentRoles: true,
+      });
+
+      for (const slug of ["Review", "-review", "review_", "review role", "a".repeat(65)]) {
+        model.setResidentRoleField("roleSlug", slug);
+        expect(model.getState().roleSlugInvalid).toBe(true);
+        expect(model.getState().submitValue).toBeNull();
+      }
+      const slug = `a-${"r".repeat(60)}_0`;
+      const prompt = "p".repeat(16_384);
+      model.setResidentRoleField("roleSlug", slug);
+      model.setResidentRoleField("rolePrompt", prompt + "p");
+      expect(model.getState().rolePromptInvalid).toBe(true);
+      expect(model.getState().canSubmit).toBe(false);
+
+      model.setResidentRoleField("rolePrompt", prompt);
+      model.setResidentRoleField("defaultResident", true);
+      model.setResidentRoleField("residentUrgentReport", true);
+      model.setResidentRoleField("residentKeepAlive", true);
+      expect(model.getState().submitValue).toMatchObject({
+        roleSlug: slug,
+        rolePrompt: prompt,
+        defaultResident: true,
+        residentUrgentReport: true,
+        residentKeepAlive: true,
+      });
+    });
+
+    it("round-trips stored choices and clears role text without losing existing profile settings", () => {
+      const model = openAgentProfileForm({
+        mode: "edit",
+        supportsResidentRoles: true,
+        profile: {
+          id: "p1",
+          name: "Reviewer",
+          icon: "palette",
+          color: "blue",
+          provider: "claude",
+          model: "claude-opus-5",
+          modeId: "plan",
+          thinkingOptionId: "think-hard",
+          options: { webSearch: true },
+          notes: "Review UI work.",
+          roleSlug: "review-ui",
+          rolePrompt: "Review the change.\n  Preserve this indentation.\n",
+          defaultResident: true,
+          residentUrgentReport: false,
+          residentKeepAlive: true,
+        },
+      });
+
+      expect(model.getState().residentRole).toEqual({
+        roleSlug: "review-ui",
+        rolePrompt: "Review the change.\n  Preserve this indentation.\n",
+        defaultResident: true,
+        residentUrgentReport: false,
+        residentKeepAlive: true,
+      });
+      expect(model.getState().submitValue).toMatchObject(model.getState().residentRole);
+      model.setResidentRoleField("roleSlug", " ");
+      model.setResidentRoleField("rolePrompt", " ");
+      model.setResidentRoleField("defaultResident", false);
+      model.setResidentRoleField("residentKeepAlive", false);
+
+      expect(model.getState().submitValue).toEqual({
+        name: "Reviewer",
+        icon: "palette",
+        color: "blue",
+        provider: "claude",
+        model: "claude-opus-5",
+        modeId: "plan",
+        thinkingOptionId: "think-hard",
+        options: { webSearch: true },
+        notes: "Review UI work.",
+        defaultResident: false,
+        residentUrgentReport: false,
+        residentKeepAlive: false,
+      });
+    });
+
+    it.each(["", " \n "])(
+      "preserves an untouched stored prompt %j until it is edited",
+      (prompt) => {
+        const model = openAgentProfileForm({
+          mode: "edit",
+          supportsResidentRoles: true,
+          profile: { id: "p1", name: "Reviewer", provider: "codex", rolePrompt: prompt },
+        });
+
+        model.setName("Code reviewer");
+        expect(model.getState().submitValue).toHaveProperty("rolePrompt", prompt);
+
+        model.setResidentRoleField("rolePrompt", "Temporary prompt");
+        model.setResidentRoleField("rolePrompt", "");
+        expect(model.getState().submitValue).not.toHaveProperty("rolePrompt");
+      },
+    );
+
+    it("preserves stored role defaults when the host capability is unavailable", () => {
+      const model = openAgentProfileForm({
+        mode: "edit",
+        profile: {
+          id: "p1",
+          name: "Reviewer",
+          provider: "codex",
+          roleSlug: "review",
+          rolePrompt: "Review this.",
+          residentKeepAlive: false,
+        },
+      });
+
+      expect(model.getState().disclosure.showResidentRoleFields).toBe(false);
+      model.applyResidentRoleSupport(true);
+      model.setResidentRoleField("roleSlug", "!unsaved");
+      expect(model.getState().canSubmit).toBe(false);
+      model.applyResidentRoleSupport(false);
+      model.setName("Code reviewer");
+      expect(model.getState().disclosure.showResidentRoleFields).toBe(false);
+      expect(model.getState().submitValue).toEqual({
+        name: "Code reviewer",
+        provider: "codex",
+        options: {},
+        roleSlug: "review",
+        rolePrompt: "Review this.",
+        residentKeepAlive: false,
+      });
+    });
+  });
+
   it("upgrades seeded displays to catalog labels without touching selections", () => {
     const model = openAgentProfileForm({
       mode: "edit",

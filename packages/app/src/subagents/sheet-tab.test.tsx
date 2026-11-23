@@ -116,6 +116,19 @@ afterEach(() => {
 });
 
 describe("useSubagentSheetTab", () => {
+  it("leaves foreign rows to the address-aware opener even when their IDs match a local agent", () => {
+    const row = seedParentWithChild();
+    if (row.kind !== "paseo") throw new Error("Expected a managed agent");
+    useWorkspaceLayoutStore.getState().setLayoutMode("compact");
+    const { result } = renderHook(() => useSubagentSheetTab(workspaceKey, "parent-tab"));
+
+    expect(result.current(row)).not.toBeNull();
+    expect(
+      result.current({ ...row, address: { ...row.address, serverId: "other-host" } }),
+    ).toBeNull();
+    expect(result.current({ ...row, workspaceId: "other-workspace" })).toBeNull();
+  });
+
   it("re-renders the row's sheet as the child's tab opens and closes", () => {
     const row = seedParentWithChild();
     const store = useWorkspaceLayoutStore.getState();

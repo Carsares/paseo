@@ -17,10 +17,13 @@ import {
 } from "@/screens/workspace/workspace-tab-presentation";
 import type { Theme } from "@/styles/theme";
 import { useAgentFactsLine } from "@/panels/agent-facts-line";
+import { useOptionalPaneContext } from "@/panels/pane-context";
 import { getPanelManifest } from "@/panels/panel-manifest";
 import { useSheetPanePage } from "@/screens/workspace/sheet-pane";
 import type { SheetTab } from "@/stores/workspace-layout-store";
 import type { SubagentRow } from "./select";
+import { residentActionLabel } from "./resident-actions";
+import { useResidentActions } from "./resident-dialog";
 import type { ArchiveFinishedStatus } from "./use-archive-finished";
 import {
   buildSubagentPillPresentation,
@@ -81,10 +84,20 @@ export function SubagentsTrack({
 }: SubagentsTrackProps): ReactElement | null {
   const { t } = useTranslation();
   const sheetPanePage = useSheetPanePage();
+  const pane = useOptionalPaneContext();
+  const actions = useResidentActions(
+    serverId,
+    pane?.target.kind === "agent" ? pane.target.agentId : null,
+  ).filter(({ action, supported }) => supported && (action === "create" || pane?.host === "sheet"));
 
   const isArchivingFinished = archiveFinishedStatus.kind === "archiving";
   const isArchiveFinishedFailed = archiveFinishedStatus.kind === "failed";
-  if (rows.length === 0 && !isArchivingFinished && !isArchiveFinishedFailed) {
+  if (
+    rows.length === 0 &&
+    actions.length === 0 &&
+    !isArchivingFinished &&
+    !isArchiveFinishedFailed
+  ) {
     return null;
   }
 
@@ -93,6 +106,21 @@ export function SubagentsTrack({
   const showArchiveFinished = finishedCount > 0 || isArchivingFinished || isArchiveFinishedFailed;
   const sheets = rows.map(sheetTabFor);
   const pages = sheets.flatMap((sheet) => (sheet ? [sheetPanePage(sheet)] : []));
+  const residentRows = rows.filter((row) => row.kind === "paseo" && row.resident);
+  const otherRows = rows.filter((row) => row.kind !== "paseo" || !row.resident);
+  const sheetIdByRow = new Map(rows.map((row, index) => [row, sheets[index]?.tab.tabId ?? null]));
+  const renderRow = (row: SubagentRow) => (
+    <SubagentsTrackRow
+      key={row.kind === "paseo" ? `${row.address.serverId}:${row.id}` : row.id}
+      row={row}
+      serverId={serverId}
+      onOpenSubagent={onOpenSubagent}
+      onOpenProviderSubagent={onOpenProviderSubagent}
+      sheetTabId={sheetIdByRow.get(row) ?? null}
+      onArchiveSubagent={onArchiveSubagent}
+      onDetachSubagent={onDetachSubagent}
+    />
+  );
 
   return (
     <ComposerTrackPill
@@ -102,27 +130,37 @@ export function SubagentsTrack({
       accessibilityLabel={pill.accessibilityLabel}
       panelTitle={t("subagents.title")}
     >
-      {showArchiveFinished && onArchiveFinished ? (
+      {actions.length > 0 || (showArchiveFinished && onArchiveFinished) ? (
         <ComposerTrackActions divided={rows.length > 0}>
-          <ArchiveFinishedRow
-            status={archiveFinishedStatus}
-            disabled={isArchivingFinished}
-            onPress={onArchiveFinished}
-          />
+          {actions.map(({ action, onSelect }) => (
+            <ComposerTrackRow
+              key={action}
+              onPress={onSelect}
+              testID={`subagents-track-resident-${action}`}
+            >
+              <Text style={styles.rowTitle}>{t(residentActionLabel(action))}</Text>
+            </ComposerTrackRow>
+          ))}
+          {showArchiveFinished && onArchiveFinished ? (
+            <ArchiveFinishedRow
+              status={archiveFinishedStatus}
+              disabled={isArchivingFinished}
+              onPress={onArchiveFinished}
+            />
+          ) : null}
         </ComposerTrackActions>
       ) : null}
-      {rows.map((row, index) => (
-        <SubagentsTrackRow
-          key={row.kind === "paseo" ? `${row.address.serverId}:${row.id}` : row.id}
-          row={row}
-          serverId={serverId}
-          onOpenSubagent={onOpenSubagent}
-          onOpenProviderSubagent={onOpenProviderSubagent}
-          sheetTabId={sheets[index]?.tab.tabId ?? null}
-          onArchiveSubagent={onArchiveSubagent}
-          onDetachSubagent={onDetachSubagent}
-        />
-      ))}
+      {residentRows.length > 0 ? (
+        <>
+          <ComposerTrackRow>
+            <Text accessibilityRole="header" style={styles.rowTrailing}>
+              {t("subagents.resident.groupTitle")}
+            </Text>
+          </ComposerTrackRow>
+          {residentRows.map(renderRow)}
+        </>
+      ) : null}
+      {otherRows.map(renderRow)}
     </ComposerTrackPill>
   );
 }
@@ -226,6 +264,7 @@ function SubagentsTrackRow({
     if (row.kind === "paseo") onDetachSubagent?.(row.address);
   }, [onDetachSubagent, row]);
   const actionsAlwaysVisible = isNative || isCompact;
+  const showRowActions = row.kind === "paseo" && !row.resident;
 
   const renderRow = useCallback(
     ({ active }: { active: boolean }) => (
@@ -244,7 +283,7 @@ function SubagentsTrackRow({
             <SubagentFacts rowId={row.id} text={presentation.subtitle} />
           )}
         </View>
-        {row.kind === "paseo" ? (
+        {showRowActions ? (
           <SubagentRowActions
             rowId={row.id}
             displayLabel={displayLabel}
@@ -266,6 +305,7 @@ function SubagentsTrackRow({
       presentation,
       row.kind,
       row.id,
+      showRowActions,
       serverId,
       rowServerId,
       hostLabel,

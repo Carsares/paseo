@@ -6,6 +6,16 @@ export const EXPLICIT_PARENT_REPORTING = "explicit";
 export const WORKSPACE_ROLE_LABEL = "paseo.workspace-role";
 export const WORKSPACE_MAIN_ROLE = "main";
 export const MAIN_PRIOR_MODE_ID_LABEL = "paseo.main-prior-mode-id";
+export const RESIDENT_AGENT_LABEL = "paseo.resident";
+export const RESIDENT_ROLE_LABEL = "paseo.resident-role";
+export const RESIDENT_SLUG_LABEL = "paseo.resident-slug";
+export const AGENT_PROFILE_ID_LABEL = "paseo.profile-id";
+export const RESIDENT_INBOX_BYPASS_LABEL = "paseo.resident-urgent-report";
+export const RESIDENT_KEEPALIVE_LABEL = "paseo.resident-keepalive";
+export const RESIDENT_ROLE_MAX_LENGTH = 500;
+export const RESIDENT_ROLE_SLUG_MAX_LENGTH = 64;
+export const RESIDENT_ROLE_SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/;
+export const AGENT_PROFILE_ID_MAX_LENGTH = 128;
 const OPEN_AGENT_TAB_LABEL_PREFIX = "paseo.open-agent-tab.";
 
 export function getOpenAgentTabLabel(clientId: string): string {
@@ -18,6 +28,41 @@ export function isOpenAgentTabLabel(label: string): boolean {
 
 export interface AgentLabelSource {
   labels?: Record<string, unknown> | null;
+}
+
+export function isResidentAgentLabels(labels: AgentLabelSource["labels"]): boolean {
+  return labels?.[RESIDENT_AGENT_LABEL] === "true";
+}
+
+export function isResidentAgent(agent: AgentLabelSource): boolean {
+  return isResidentAgentLabels(agent.labels);
+}
+
+export function getResidentRoleFromLabels(labels: AgentLabelSource["labels"]): string | null {
+  const raw = labels?.[RESIDENT_ROLE_LABEL];
+  if (typeof raw !== "string") return null;
+  const role = raw.trim();
+  return role.length > 0 && role.length <= RESIDENT_ROLE_MAX_LENGTH ? role : null;
+}
+
+export function getResidentRoleSlugFromLabels(labels: AgentLabelSource["labels"]): string | null {
+  const slug = labels?.[RESIDENT_SLUG_LABEL];
+  return typeof slug === "string" && RESIDENT_ROLE_SLUG_PATTERN.test(slug) ? slug : null;
+}
+
+export function getAgentProfileIdFromLabels(labels: AgentLabelSource["labels"]): string | null {
+  const id = labels?.[AGENT_PROFILE_ID_LABEL];
+  return typeof id === "string" && id.length <= AGENT_PROFILE_ID_MAX_LENGTH && id.trim().length > 0
+    ? id
+    : null;
+}
+
+export function hasResidentInboxBypass(labels: AgentLabelSource["labels"]): boolean {
+  return labels?.[RESIDENT_INBOX_BYPASS_LABEL] === "true";
+}
+
+export function hasResidentKeepAlive(labels: AgentLabelSource["labels"]): boolean {
+  return labels?.[RESIDENT_KEEPALIVE_LABEL] === "true";
 }
 
 export function isExplicitParentReportingLabels(

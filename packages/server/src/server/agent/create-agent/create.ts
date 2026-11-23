@@ -15,6 +15,7 @@ import type { AgentAttachment, FirstAgentContext } from "../../messages.js";
 import type { AgentManager, CreateAgentOptions, ManagedAgent } from "../agent-manager.js";
 import type { AgentPromptInput, AgentRunOptions, AgentSessionConfig } from "../agent-sdk-types.js";
 import type { AgentStorage } from "../agent-storage.js";
+import { ensureAgentLoaded } from "../agent-loading.js";
 import type { AgentOwner } from "../agent-owner.js";
 import type { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
 import type { WorkspaceRegistry } from "../../workspace-registry.js";
@@ -46,6 +47,8 @@ import {
   readAgentHierarchyPath,
   MAX_SUBAGENT_DEPTH,
   REMOTE_HIERARCHY_DEPTH_LABEL,
+  RESERVED_HIERARCHY_LABELS,
+  RESERVED_RESIDENT_LABELS,
   resolveInheritedHierarchyMode,
   validateCanSpawnChild,
 } from "../hierarchy-policy.js";
@@ -118,6 +121,7 @@ export interface CreateAgentFromMcpInput {
   promptFailure?: CreateAgentPromptFailureMode;
   notifyOnFinish?: boolean;
   parentReporting?: "auto" | "explicit";
+  resident?: { profileId?: string; role?: string };
   internal?: boolean;
   /** Omitted with a caller, the caller agent's own background applies. */
   background?: boolean;
@@ -302,12 +306,16 @@ export async function createAgentCommand(
   if (resolved.createOptions.labels) {
     delete resolved.createOptions.labels[WORKSPACE_ROLE_LABEL];
     delete resolved.createOptions.labels[MAIN_PRIOR_MODE_ID_LABEL];
+    for (const label of RESERVED_RESIDENT_LABELS) delete resolved.createOptions.labels[label];
   }
-  const snapshot = await dependencies.agentManager.createAgent(
-    resolved.config,
-    input.kind === "session" ? input.agentId : undefined,
-    resolved.createOptions,
-  );
+  const snapshot =
+    input.kind === "mcp" && input.resident
+      ? await createMcpResident(dependencies, input, resolved)
+      : await dependencies.agentManager.createAgent(
+          resolved.config,
+          input.kind === "session" ? input.agentId : undefined,
+          resolved.createOptions,
+        );
 
   if (input.kind === "session") await input.onAgentReady?.(snapshot);
 
@@ -347,6 +355,42 @@ export async function createAgentCommand(
     initialPromptError,
     ...(resolved.createdWorktree ? { createdWorktree: resolved.createdWorktree } : {}),
   };
+}
+
+async function createMcpResident(
+  dependencies: CreateAgentCommandDependencies,
+  input: CreateAgentFromMcpInput,
+  resolved: ResolvedCreateAgent,
+): Promise<ManagedAgent> {
+  if (!input.callerAgentId || input.detached || resolved.createOptions.background) {
+    throw new Error("Resident specialists must be visible subagents in the caller's workspace.");
+  }
+  const { agentManager, agentStorage, logger } = dependencies;
+  const { inheritParentWorkspace, workspaceId: resolvedWorkspaceId } = resolved.createOptions;
+  const expectedWorkspaceId = inheritParentWorkspace ? undefined : resolvedWorkspaceId;
+  const { agentId, created } = await agentManager.createSilentResidentSubagent({
+    ...input.resident,
+    parentAgentId: input.callerAgentId,
+    expectedWorkspaceId,
+    provider: resolved.config.provider,
+    config: resolved.config,
+  });
+  if (!created) {
+    throw new Error(
+      `Resident specialist ${agentId} already exists. Use send_agent_prompt with its agentId.`,
+    );
+  }
+  const record = await agentStorage.get(agentId);
+  const workspaceId = record?.workspaceId;
+  if (!workspaceId || (expectedWorkspaceId !== undefined && expectedWorkspaceId !== workspaceId)) {
+    throw new Error("The caller's workspace changed during resident creation.");
+  }
+  const labels = { ...resolved.createOptions.labels };
+  for (const key of RESERVED_HIERARCHY_LABELS) delete labels[key];
+  if (Object.keys(labels).length) {
+    await agentManager.updateAgentMetadata(agentId, { labels, expectedWorkspaceId: workspaceId });
+  }
+  return ensureAgentLoaded(agentId, { agentManager, agentStorage, logger });
 }
 
 async function validateCreateCaller(

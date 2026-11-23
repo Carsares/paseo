@@ -54,6 +54,9 @@ import {
 import { validateWSOutboundMessage } from "@getpaseo/protocol/validation/ws-outbound";
 import type {
   AgentAttachment,
+  AgentResidentCreateRequest,
+  AgentResidentSetRequest,
+  AgentSessionResetRequest,
   WorkspaceAgentSummaryEntry,
   AgentStreamEventPayload,
   AgentSnapshotPayload,
@@ -516,6 +519,19 @@ export interface AgentAttentionRequiredNotification {
 }
 
 type AgentConfigOverrides = Partial<Omit<AgentSessionConfig, "provider" | "cwd">>;
+
+export type SetAgentResidentOptions = Omit<
+  AgentResidentSetRequest,
+  "type" | "requestId" | "agentId" | "resident"
+> & { requestId?: string };
+export type CreateResidentAgentOptions = Omit<
+  AgentResidentCreateRequest,
+  "type" | "requestId" | "parentAgentId" | "profileId"
+> & { requestId?: string };
+export type ResetAgentSessionOptions = Omit<
+  AgentSessionResetRequest,
+  "type" | "requestId" | "agentId"
+> & { requestId?: string };
 
 export interface CreateAgentRequestOptions extends AgentConfigOverrides {
   agentId?: string;
@@ -3865,6 +3881,62 @@ export class DaemonClient {
       throw new Error(payload.error ?? "setAgentParent rejected");
     }
     return { parentAgentId: payload.parentAgentId };
+  }
+
+  private requireAgentResidentSpecialists(): void {
+    if (!this.isConnected || !this.lastServerInfoMessage) throw this.unavailableError();
+    // COMPAT(agentResidentSpecialists): added in v0.18.0, remove gate after 2027-06-01.
+    if (this.lastServerInfoMessage.features?.agentResidentSpecialists !== true) {
+      throw new Error("Update the host to use resident specialists.");
+    }
+  }
+
+  async setAgentResident(
+    agentId: string,
+    resident: boolean,
+    { requestId, ...overrides }: SetAgentResidentOptions = {},
+  ): Promise<void> {
+    this.requireAgentResidentSpecialists();
+    const { accepted, error } =
+      await this.sendNamespacedCorrelatedSessionRequest<"agent.resident.set.response">({
+        requestId,
+        message: { ...overrides, type: "agent.resident.set.request", agentId, resident },
+      });
+    if (!accepted || error !== null) throw new Error(error ?? "setAgentResident rejected");
+  }
+
+  async createResidentAgent(
+    parentAgentId: string,
+    profileId: string,
+    { requestId, ...overrides }: CreateResidentAgentOptions = {},
+  ): Promise<{ agentId: string; created: boolean }> {
+    this.requireAgentResidentSpecialists();
+    const { accepted, agentId, created, error } =
+      await this.sendNamespacedCorrelatedSessionRequest<"agent.resident.create.response">({
+        requestId,
+        message: { ...overrides, type: "agent.resident.create.request", parentAgentId, profileId },
+      });
+    if (!accepted || error !== null || !agentId) {
+      throw new Error(error ?? "createResidentAgent rejected");
+    }
+    return { agentId, created };
+  }
+
+  async resetAgentSession(
+    agentId: string,
+    { requestId, interrupt, clearVisibleTimeline }: ResetAgentSessionOptions = {},
+  ): Promise<void> {
+    if (!this.isConnected || !this.lastServerInfoMessage) throw this.unavailableError();
+    // COMPAT(agentSessionReset): added in v0.18.0, remove gate after 2027-06-01.
+    if (this.lastServerInfoMessage.features?.agentSessionReset !== true) {
+      throw new Error("Update the host to reset agent sessions.");
+    }
+    const { accepted, error } =
+      await this.sendNamespacedCorrelatedSessionRequest<"agent.session.reset.response">({
+        requestId,
+        message: { type: "agent.session.reset.request", agentId, interrupt, clearVisibleTimeline },
+      });
+    if (!accepted || error !== null) throw new Error(error ?? "resetAgentSession rejected");
   }
 
   async updateAgent(

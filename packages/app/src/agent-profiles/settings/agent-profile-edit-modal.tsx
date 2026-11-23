@@ -3,11 +3,13 @@ import { Text, View } from "react-native";
 import { useTranslation } from "react-i18next";
 import { StyleSheet } from "react-native-unistyles";
 import type { AgentOptionControl, ProviderOptions } from "@getpaseo/protocol/agent-types";
+import { RESIDENT_ROLE_SLUG_MAX_LENGTH } from "@getpaseo/protocol/agent-labels";
 import { readSelectOption, readToggleOption } from "@/agent-controls/option-controls";
 import type { AgentProfile } from "@getpaseo/protocol/messages";
 import { AdaptiveModalSheet, type SheetHeader } from "@/components/adaptive-modal-sheet";
 import { Button } from "@/components/ui/button";
 import { type ControlSize } from "@/components/ui/control-geometry";
+import { ControlSizeProvider } from "@/components/ui/control-size";
 import { Field, FormTextInput } from "@/components/ui/form-field";
 import {
   SelectField,
@@ -15,13 +17,17 @@ import {
   type SelectFieldOption,
 } from "@/components/ui/select-field";
 import { Switch } from "@/components/ui/switch";
+import { useIsCompactFormFactor } from "@/constants/layout";
+import { useSessionStore } from "@/stores/session-store";
 import { toErrorMessage } from "@/utils/error-messages";
 import { AgentProfileAppearanceField } from "./agent-profile-appearance-field";
-import type {
-  AgentProfileFormModel,
-  AgentProfileFormOption,
-  AgentProfileSeed,
-  AgentProfileValue,
+import {
+  ROLE_PROMPT_MAX_LENGTH,
+  type AgentProfileFormModel,
+  type AgentProfileFormOption,
+  type AgentProfileFormState,
+  type AgentProfileSeed,
+  type AgentProfileValue,
 } from "../internal/profile-form-model";
 import {
   useAgentProfileFormCatalog,
@@ -133,10 +139,14 @@ function OpenAgentProfileEditModal({
   onSave,
 }: AgentProfileEditModalProps & { onDismiss: () => void }): ReactElement {
   const { t } = useTranslation();
-  const controlSize: ControlSize = "md";
+  const controlSize: ControlSize = useIsCompactFormFactor() ? "md" : "sm";
+  // COMPAT(agentResidentSpecialists): added in v0.18.0, remove gate after 2027-06-01.
+  const supportsResidentRoles = useSessionStore(
+    (state) => state.sessions[serverId]?.serverInfo?.features?.agentResidentSpecialists === true,
+  );
   const snapshot = useMemo(
-    () => ({ mode, ...(profile ? { profile } : {}), ...(seed ? { seed } : {}) }),
-    [mode, profile, seed],
+    () => ({ mode, profile, seed, supportsResidentRoles }),
+    [mode, profile, seed, supportsResidentRoles],
   );
   const model = useAgentProfileFormModel(snapshot);
   const state = useAgentProfileFormState(model);
@@ -368,6 +378,10 @@ function OpenAgentProfileEditModal({
           />
         </Field>
 
+        {state.disclosure.showResidentRoleFields ? (
+          <AgentProfileResidentRoleFields model={model} state={state} size={controlSize} />
+        ) : null}
+
         {state.submitError ? (
           <Text style={styles.submitError} testID="agent-profile-submit-error">
             {state.submitError}
@@ -398,6 +412,151 @@ function OpenAgentProfileEditModal({
         </View>
       </View>
     </AdaptiveModalSheet>
+  );
+}
+
+const residentToggleFields = [
+  {
+    field: "defaultResident",
+    label: "settings.host.agentProfiles.residentRole.defaultResident",
+  },
+  {
+    field: "residentUrgentReport",
+    label: "settings.host.agentProfiles.residentRole.urgentReport",
+  },
+  {
+    field: "residentKeepAlive",
+    label: "settings.host.agentProfiles.residentRole.keepAlive",
+  },
+] as const;
+
+function AgentProfileResidentRoleFields({
+  model,
+  state,
+  size,
+}: {
+  model: AgentProfileFormModel;
+  state: AgentProfileFormState;
+  size: ControlSize;
+}) {
+  const { t } = useTranslation();
+  const { residentRole, isSubmitting, roleSlugInvalid, rolePromptInvalid } = state;
+  const slugLabel = t("settings.host.agentProfiles.residentRole.slug");
+  const promptLabel = t("settings.host.agentProfiles.residentRole.prompt");
+  const setRoleSlug = useCallback(
+    (value: string) => model.setResidentRoleField("roleSlug", value),
+    [model],
+  );
+  const setRolePrompt = useCallback(
+    (value: string) => model.setResidentRoleField("rolePrompt", value),
+    [model],
+  );
+
+  return (
+    <>
+      <Field
+        label={slugLabel}
+        hint={t("settings.host.agentProfiles.residentRole.slugHint", {
+          max: RESIDENT_ROLE_SLUG_MAX_LENGTH,
+        })}
+        error={roleSlugInvalid ? t("settings.host.agentProfiles.residentRole.slugError") : null}
+        testID="agent-profile-role-slug-field"
+      >
+        <FormTextInput
+          initialValue={residentRole.roleSlug}
+          onChangeText={setRoleSlug}
+          autoCapitalize="none"
+          autoCorrect={false}
+          editable={!isSubmitting}
+          size={size}
+          accessibilityLabel={slugLabel}
+          testID="agent-profile-role-slug-input"
+        />
+      </Field>
+      <Field
+        label={promptLabel}
+        hint={t("settings.host.agentProfiles.residentRole.promptHint")}
+        error={
+          rolePromptInvalid
+            ? t("settings.host.agentProfiles.residentRole.promptError", {
+                max: ROLE_PROMPT_MAX_LENGTH,
+              })
+            : null
+        }
+        testID="agent-profile-role-prompt-field"
+      >
+        <FormTextInput
+          initialValue={residentRole.rolePrompt}
+          onChangeText={setRolePrompt}
+          multiline
+          numberOfLines={4}
+          style={styles.notesInput}
+          editable={!isSubmitting}
+          size={size}
+          accessibilityLabel={promptLabel}
+          testID="agent-profile-role-prompt-input"
+        />
+      </Field>
+      <Field
+        label={t("settings.host.agentProfiles.residentRole.defaults")}
+        testID="agent-profile-resident-defaults-field"
+      >
+        <ControlSizeProvider size={size}>
+          <View style={styles.featureCard}>
+            {residentToggleFields.map(({ field, label }, index) => (
+              <ResidentToggleRow
+                key={field}
+                field={field}
+                label={t(label)}
+                value={residentRole[field] ?? false}
+                isFirst={index === 0}
+                disabled={isSubmitting}
+                model={model}
+              />
+            ))}
+          </View>
+        </ControlSizeProvider>
+      </Field>
+    </>
+  );
+}
+
+function ResidentToggleRow({
+  field,
+  label,
+  value,
+  isFirst,
+  disabled,
+  model,
+}: {
+  field: (typeof residentToggleFields)[number]["field"];
+  label: string;
+  value: boolean;
+  isFirst: boolean;
+  disabled: boolean;
+  model: AgentProfileFormModel;
+}) {
+  const rowStyle = useMemo(
+    () => [styles.featureRow, isFirst ? null : styles.featureRowBorder],
+    [isFirst],
+  );
+  const handleToggle = useCallback(
+    (next: boolean) => model.setResidentRoleField(field, next),
+    [field, model],
+  );
+  return (
+    <View style={rowStyle}>
+      <View style={styles.featureMeta}>
+        <Text style={styles.featureLabel}>{label}</Text>
+      </View>
+      <Switch
+        value={value}
+        onValueChange={handleToggle}
+        disabled={disabled}
+        accessibilityLabel={label}
+        testID={`agent-profile-resident-switch-${field}`}
+      />
+    </View>
   );
 }
 

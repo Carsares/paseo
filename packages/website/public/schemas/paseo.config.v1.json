@@ -188,6 +188,24 @@
               },
               "notes": {
                 "type": "string"
+              },
+              "roleSlug": {
+                "type": "string",
+                "maxLength": 64,
+                "pattern": "^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
+              },
+              "rolePrompt": {
+                "type": "string",
+                "maxLength": 16384
+              },
+              "defaultResident": {
+                "type": "boolean"
+              },
+              "residentUrgentReport": {
+                "type": "boolean"
+              },
+              "residentKeepAlive": {
+                "type": "boolean"
               }
             },
             "required": ["id", "name", "provider"],

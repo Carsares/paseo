@@ -46,7 +46,7 @@ export interface ArchiveDependencies {
   workspaceArchiveOperations?: Pick<WorkspaceArchiveOperations, "withCheckout">;
   github: ForgeService;
   workspaceGitService: Pick<WorkspaceGitService, "getSnapshot" | "invalidateWorktrees">;
-  agentManager: Pick<AgentManager, "listAgents" | "getAgent" | "archiveAgent" | "archiveSnapshot">;
+  agentManager: Pick<AgentManager, "listAgents" | "archiveAgentForWorkspace">;
   agentStorage: Pick<AgentStorage, "listActive" | "listByWorkspace">;
   // Resolves the worktree at a path to its workspaceId for archive-by-path. The
   // path uniquely identifies a worktree workspace; this is a directory lookup for
@@ -675,9 +675,7 @@ export async function archiveWorkspaceContents(
   const [agentResults, [terminalResult]] = await Promise.all([
     Promise.allSettled(
       agentIdsToArchive.map((agentId) =>
-        dependencies.agentManager.getAgent(agentId)
-          ? dependencies.agentManager.archiveAgent(agentId, archivedAt)
-          : dependencies.agentManager.archiveSnapshot(agentId, archivedAt),
+        dependencies.agentManager.archiveAgentForWorkspace(agentId, workspaceId, archivedAt),
       ),
     ),
     Promise.allSettled([dependencies.killTerminalsForWorkspace(workspaceId)]),

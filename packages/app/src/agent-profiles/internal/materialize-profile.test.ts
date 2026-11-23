@@ -53,6 +53,23 @@ describe("materializeAgentProfile", () => {
 });
 
 describe("toAgentConfigApply", () => {
+  it("keeps resident role settings out of the running session update", () => {
+    expect(
+      toAgentConfigApply(
+        materializeAgentProfile(
+          profile({
+            model: "claude-opus-5",
+            roleSlug: "review",
+            rolePrompt: "Review the change.",
+            defaultResident: true,
+            residentUrgentReport: true,
+            residentKeepAlive: true,
+          }),
+        ),
+      ),
+    ).toEqual({ modelId: "claude-opus-5" });
+  });
+
   it("sends every value the profile names", () => {
     expect(
       toAgentConfigApply(

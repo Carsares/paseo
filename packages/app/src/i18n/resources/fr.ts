@@ -2207,6 +2207,37 @@ export const fr: TranslationResources = {
     backdrop: "Arrière-plan du menu",
   },
   subagents: {
+    resident: {
+      groupTitle: "Spécialistes résidents",
+      createAction: "Créer un spécialiste résident",
+      bindAction: "Marquer comme résident",
+      unbindAction: "Retirer le statut de résident",
+      resetAction: "Réinitialiser la session",
+      createTitle: "Créer un spécialiste résident",
+      bindTitle: "Marquer le sous-agent comme résident",
+      unbindTitle: "Retirer le statut de résident ?",
+      resetTitle: "Réinitialiser la session de l’agent ?",
+      profile: "Profil d’agent",
+      role: "Rôle",
+      roleSlug: "Identifiant du rôle",
+      urgentReport: "Rapports urgents",
+      keepAlive: "Maintenir actif",
+      interrupt: "Interrompre le travail en cours",
+      clearVisibleTimeline: "Effacer l’historique affiché",
+      resetDescription: "Démarre une nouvelle session et conserve l’identité de cet agent.",
+      clearVisibleTimelineDescription:
+        "Efface les messages affichés dans l’historique de cet agent.",
+      unbindDescription:
+        "Ce sous-agent restera rattaché à son agent parent en tant que sous-agent ordinaire.",
+      confirmCreate: "Créer le spécialiste",
+      confirmBind: "Marquer comme résident",
+      confirmUnbind: "Retirer le statut de résident",
+      confirmReset: "Réinitialiser la session",
+      emptyProfiles: "Ajoutez d’abord un profil d’agent dans les paramètres de l’hôte.",
+      updateHost:
+        "Mettez à jour cet hôte pour utiliser des spécialistes résidents ou réinitialiser des sessions.",
+      error: "Échec de l’action : {{message}}",
+    },
     parent: {
       backToParent: "Retour au parent",
       backTo: "Retour à {{label}}",
@@ -3149,6 +3180,20 @@ export const fr: TranslationResources = {
           "Aucun profil pour le moment. Ajoutez-en un pour lancer des terminaux avec une commande précise.",
       },
       agentProfiles: {
+        residentRole: {
+          slug: "Identifiant du rôle",
+          slugHint:
+            "Au plus {{max}} caractères. Commencez et terminez par une lettre minuscule ou un chiffre. Vous pouvez utiliser - ou _ entre les deux.",
+          slugError: "Vérifiez la longueur et le format de l’identifiant.",
+          prompt: "Instructions du rôle",
+          promptHint:
+            "Utilisées quand l’outil create_agent utilise ce profil, à la création d’un spécialiste résident à partir de ce profil ou à la réinitialisation d’une session associée.",
+          promptError: "Utilisez au plus {{max}} caractères.",
+          defaults: "Réglages de résidence par défaut",
+          defaultResident: "Marquer comme résident par défaut",
+          urgentReport: "Rapports urgents",
+          keepAlive: "Maintenir actif",
+        },
         sectionTitle: "Profils d’agent",
         unavailable: "Connectez-vous à cet hôte pour gérer les profils d’agent",
         unsupported: "Le daemon de cet hôte ne prend pas encore en charge les profils d’agent",

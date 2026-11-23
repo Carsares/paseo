@@ -24,8 +24,10 @@ import {
 import { decodeParentReportIdentity } from "./agent/finish-subscriptions/report-identity.js";
 import {
   getParentAddressFromLabels,
+  hasResidentInboxBypass,
   isExplicitParentReportingLabels,
   isMainControlAgentLabels,
+  isResidentAgentLabels,
 } from "@getpaseo/protocol/agent-labels";
 import { registerParentFinishSubscription } from "./agent/create-agent/create.js";
 import { HOST_ROUTE_OPCODE } from "@getpaseo/protocol/binary-frames/index";
@@ -818,6 +820,7 @@ export class VoiceAssistantWebSocketServer {
         if (live && !isMainControlAgentLabels(live.labels)) return false;
         for (const child of agentManager.listAgents()) {
           if (source?.agentId === child.id && (source.serverId ?? serverId) === serverId) continue;
+          if (isResidentAgentLabels(child.labels) && hasResidentInboxBypass(child.labels)) continue;
           if (child.lifecycle !== "initializing" && !agentManager.hasInFlightRun(child.id))
             continue;
           const parent = getParentAddressFromLabels(child.labels, serverId);
@@ -2304,6 +2307,10 @@ export class VoiceAssistantWebSocketServer {
         // COMPAT(agentHierarchyControl): added in v0.16.0, remove gate after 2027-05-19.
         agentHierarchyControl: true,
         mainControlAppendSystemPrompt: true,
+        // COMPAT(agentResidentSpecialists): added in v0.18.0, remove gate after 2027-06-01.
+        agentResidentSpecialists: true,
+        // COMPAT(agentSessionReset): added in v0.18.0, remove gate after 2027-06-01.
+        agentSessionReset: true,
         workspaceMainAgentDefault: true,
         workspaceAgentsSummary: true,
         agentHistoryWorkspaceFilter: true,
@@ -3135,10 +3142,29 @@ export class VoiceAssistantWebSocketServer {
     const live = this.agentManager.getAgent(parentId);
     if (stored?.archivedAt || !isMainControlAgentLabels(live?.labels ?? stored?.labels))
       return undefined;
-    if (source.kind === "agent-message")
-      return source.reportStatus === "blocked" ? "urgent" : "ordinary";
+    if (source.kind === "agent-message") {
+      if (source.reportStatus === "blocked") return "urgent";
+      if (
+        source.reportStatus &&
+        (source.serverId ?? this.serverId) === this.serverId &&
+        (await this.isUrgentResidentReport(parentId, source.agentId))
+      )
+        return "urgent";
+      return "ordinary";
+    }
     if (source.event === "permission-required" || source.event === "errored") return "urgent";
     return source.event === "finished" ? "ordinary" : undefined;
+  }
+
+  private async isUrgentResidentReport(parentId: string, childId: string): Promise<boolean> {
+    const child = this.agentManager.getAgent(childId) ?? (await this.agentStorage.get(childId));
+    const parent = getParentAddressFromLabels(child?.labels, this.serverId);
+    return (
+      parent?.serverId === this.serverId &&
+      parent.agentId === parentId &&
+      isResidentAgentLabels(child?.labels) &&
+      hasResidentInboxBypass(child?.labels)
+    );
   }
 
   private async assertCurrentReportParent(

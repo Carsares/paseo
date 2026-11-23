@@ -2208,6 +2208,36 @@ export const es: TranslationResources = {
     backdrop: "Fondo del menú",
   },
   subagents: {
+    resident: {
+      groupTitle: "Especialistas residentes",
+      createAction: "Crear especialista residente",
+      bindAction: "Marcar como residente",
+      unbindAction: "Quitar estado de residente",
+      resetAction: "Reiniciar sesión",
+      createTitle: "Crear un especialista residente",
+      bindTitle: "Marcar subagente como residente",
+      unbindTitle: "¿Quitar el estado de residente?",
+      resetTitle: "¿Reiniciar la sesión del agente?",
+      profile: "Perfil de agente",
+      role: "Rol",
+      roleSlug: "Identificador del rol",
+      urgentReport: "Informes urgentes",
+      keepAlive: "Mantener activo",
+      interrupt: "Interrumpir el trabajo en curso",
+      clearVisibleTimeline: "Borrar la cronología visible",
+      resetDescription: "Inicia una nueva sesión y conserva la identidad de este agente.",
+      clearVisibleTimelineDescription:
+        "Borra los mensajes que se muestran en la cronología de este agente.",
+      unbindDescription:
+        "El subagente seguirá vinculado a su agente principal como subagente normal.",
+      confirmCreate: "Crear especialista",
+      confirmBind: "Marcar como residente",
+      confirmUnbind: "Quitar estado de residente",
+      confirmReset: "Reiniciar sesión",
+      emptyProfiles: "Primero añade un perfil de agente en los ajustes del host.",
+      updateHost: "Actualiza este host para usar especialistas residentes o reiniciar sesiones.",
+      error: "No se pudo completar la acción: {{message}}",
+    },
     parent: {
       backToParent: "Volver al padre",
       backTo: "Volver a {{label}}",
@@ -3145,6 +3175,20 @@ export const es: TranslationResources = {
         emptyState: "No profiles yet. Add one to launch terminals with a specific command.",
       },
       agentProfiles: {
+        residentRole: {
+          slug: "Identificador del rol",
+          slugHint:
+            "Hasta {{max}} caracteres. Empieza y termina con una letra minúscula o un número. Puedes usar - o _ en medio.",
+          slugError: "Revisa la longitud y el formato del identificador.",
+          prompt: "Instrucciones del rol",
+          promptHint:
+            "Se usan cuando la herramienta create_agent usa este perfil, al crear un especialista residente con él o al reiniciar una sesión vinculada.",
+          promptError: "Usa como máximo {{max}} caracteres.",
+          defaults: "Ajustes de residencia predeterminados",
+          defaultResident: "Marcar como residente por defecto",
+          urgentReport: "Informes urgentes",
+          keepAlive: "Mantener activo",
+        },
         sectionTitle: "Perfiles de agente",
         unavailable: "Conéctese a este host para administrar perfiles de agente",
         unsupported: "Este host ejecuta un daemon que aún no admite perfiles de agente",

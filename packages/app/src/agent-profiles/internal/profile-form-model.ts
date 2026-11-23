@@ -7,6 +7,7 @@ import type {
   ProviderSnapshotEntry,
 } from "@getpaseo/protocol/agent-types";
 import type { AgentProfile } from "@getpaseo/protocol/messages";
+import { AgentProfileSchema } from "@getpaseo/protocol/agent-profile";
 import { withoutLostControls } from "@/agent-controls/lost-controls";
 import { formatAgentModeLabel, formatThinkingOptionLabel } from "@/agent-controls/labels";
 import { filterSelectableModels, resolveModelSelection } from "@/provider-selection/model-catalog";
@@ -55,6 +56,17 @@ export interface AgentProfileFormSnapshot {
   mode: "create" | "edit";
   profile?: AgentProfile;
   seed?: AgentProfileSeed;
+  supportsResidentRoles?: boolean;
+}
+
+type ResidentRoleFields = Pick<
+  AgentProfileValue,
+  "roleSlug" | "rolePrompt" | "defaultResident" | "residentUrgentReport" | "residentKeepAlive"
+>;
+
+interface ResidentRoleDraft extends ResidentRoleFields {
+  roleSlug: string;
+  rolePrompt: string;
 }
 
 /**
@@ -79,6 +91,7 @@ export interface AgentProfileFormDisclosure {
   showModeField: boolean;
   showThinkingField: boolean;
   showControlsField: boolean;
+  showResidentRoleFields: boolean;
 }
 
 export interface AgentProfileFormState {
@@ -87,6 +100,9 @@ export interface AgentProfileFormState {
   icon: string;
   color: string;
   notes: string;
+  residentRole: ResidentRoleDraft;
+  roleSlugInvalid: boolean;
+  rolePromptInvalid: boolean;
   provider: string;
   modelId: string;
   modeId: string;
@@ -138,9 +154,14 @@ export interface AgentProfileFormModel {
   ) => void;
   /** Resolve a request that produced no usable features (provider error). */
   applyControlsUnavailable: (requestKey: string) => void;
+  applyResidentRoleSupport: (supported: boolean) => void;
   setName: (value: string) => void;
   setAppearance: (value: { icon: string; color: string }) => void;
   setNotes: (value: string) => void;
+  setResidentRoleField: <K extends keyof ResidentRoleDraft>(
+    field: K,
+    value: ResidentRoleDraft[K],
+  ) => void;
   setProvider: (providerId: string, display: AgentProfileFormDisplay) => void;
   setModel: (modelId: string, display: AgentProfileFormDisplay | null) => void;
   setMode: (modeId: string, display: AgentProfileFormDisplay | null) => void;
@@ -405,7 +426,10 @@ export function buildControlsRequestKey(
     : scope;
 }
 
-function buildSubmitValue(state: AgentProfileFormState): AgentProfileValue | null {
+function buildSubmitValue(
+  state: AgentProfileFormState,
+  residentRole: ResidentRoleFields,
+): AgentProfileValue | null {
   const name = state.name.trim();
   const notes = state.notes.trim();
   if (!name || !state.provider) {
@@ -423,6 +447,62 @@ function buildSubmitValue(state: AgentProfileFormState): AgentProfileValue | nul
     // app that predates them and keeps the profile's stored options.
     options: ownOptionsOf(state),
     ...(notes ? { notes } : {}),
+    ...residentRole,
+  };
+}
+
+function residentRoleFieldsOf(profile: ResidentRoleFields): ResidentRoleFields {
+  const { roleSlug, rolePrompt, defaultResident, residentUrgentReport, residentKeepAlive } =
+    profile;
+  return {
+    ...(roleSlug !== undefined ? { roleSlug } : {}),
+    ...(rolePrompt !== undefined ? { rolePrompt } : {}),
+    ...(defaultResident !== undefined ? { defaultResident } : {}),
+    ...(residentUrgentReport !== undefined ? { residentUrgentReport } : {}),
+    ...(residentKeepAlive !== undefined ? { residentKeepAlive } : {}),
+  };
+}
+
+const { roleSlug: roleSlugSchema, rolePrompt: rolePromptSchema } = AgentProfileSchema.shape;
+export const ROLE_PROMPT_MAX_LENGTH = rolePromptSchema.unwrap().maxLength;
+
+function deriveSubmission(
+  state: AgentProfileFormState,
+  supportsResidentRoles: boolean,
+  storedResidentRole: ResidentRoleFields,
+  rolePromptEdited: boolean,
+): AgentProfileFormState {
+  const roleDraft = state.residentRole;
+  const roleSlug = roleDraft.roleSlug.trim();
+  // An explicit blank from storage is distinct from clearing the input.
+  let rolePrompt = storedResidentRole.rolePrompt;
+  if (rolePromptEdited) {
+    rolePrompt = roleDraft.rolePrompt.trim() ? roleDraft.rolePrompt : undefined;
+  }
+  const roleSlugInvalid =
+    supportsResidentRoles && !roleSlugSchema.safeParse(roleSlug || undefined).success;
+  const rolePromptInvalid =
+    supportsResidentRoles && !rolePromptSchema.safeParse(roleDraft.rolePrompt).success;
+  const canSubmit =
+    state.name.trim().length > 0 &&
+    state.provider.length > 0 &&
+    !roleSlugInvalid &&
+    !rolePromptInvalid &&
+    !state.isSubmitting;
+  // A host that cannot edit role defaults should keep the values it originally loaded.
+  const residentRole = supportsResidentRoles
+    ? residentRoleFieldsOf({
+        ...roleDraft,
+        roleSlug: roleSlug || undefined,
+        rolePrompt,
+      })
+    : storedResidentRole;
+  return {
+    ...state,
+    roleSlugInvalid,
+    rolePromptInvalid,
+    canSubmit,
+    submitValue: canSubmit ? buildSubmitValue(state, residentRole) : null,
   };
 }
 
@@ -447,8 +527,11 @@ function seedDisplay(value: string | undefined): AgentProfileFormDisplay | null 
  * Edit mode seeds every value AND display from the stored profile alone: the
  * catalog is not loaded yet, so `applyProviderCatalog` does the upgrading later.
  */
-function buildInitialState(snapshot: AgentProfileFormSnapshot): AgentProfileFormState {
-  const profile = snapshot.profile ?? BLANK_PROFILE;
+function buildInitialState(
+  snapshot: AgentProfileFormSnapshot,
+  profile: AgentProfileValue,
+  storedResidentRole: ResidentRoleFields,
+): AgentProfileFormState {
   const seed = snapshot.mode === "create" ? snapshot.seed : undefined;
   const name = seed?.name ?? profile.name;
   const provider = seed?.provider ?? profile.provider;
@@ -459,6 +542,9 @@ function buildInitialState(snapshot: AgentProfileFormSnapshot): AgentProfileForm
     icon: profile.icon ?? "",
     color: profile.color ?? "",
     notes: profile.notes ?? "",
+    residentRole: { roleSlug: "", rolePrompt: "", ...storedResidentRole },
+    roleSlugInvalid: false,
+    rolePromptInvalid: false,
     provider,
     modelId,
     modeId: profile.modeId ?? "",
@@ -486,6 +572,7 @@ function buildInitialState(snapshot: AgentProfileFormSnapshot): AgentProfileForm
       showModeField: false,
       showThinkingField: false,
       showControlsField: false,
+      showResidentRoleFields: false,
     },
     isSubmitting: false,
     submitError: null,
@@ -495,6 +582,10 @@ function buildInitialState(snapshot: AgentProfileFormSnapshot): AgentProfileForm
 }
 
 export function openAgentProfileForm(snapshot: AgentProfileFormSnapshot): AgentProfileFormModel {
+  const profile = snapshot.profile ?? BLANK_PROFILE;
+  const storedResidentRole = residentRoleFieldsOf(profile);
+  let supportsResidentRoles = snapshot.supportsResidentRoles === true;
+  let rolePromptEdited = false;
   let entries: readonly ProviderSnapshotEntry[] = [];
   let catalogResolution: AgentProfileResolutionStatus = "idle";
   let resolvedControlsKey: string | null = null;
@@ -587,16 +678,17 @@ export function openAgentProfileForm(snapshot: AgentProfileFormSnapshot): AgentP
       showThinkingField:
         hasProvider && (thinking.length > 0 || Boolean(withOptions.thinkingOptionId)),
       showControlsField: hasProvider && controls.length > 0,
+      showResidentRoleFields: supportsResidentRoles,
     };
-    const canSubmit =
-      withOptions.name.trim().length > 0 &&
-      withOptions.provider.length > 0 &&
-      !withOptions.isSubmitting;
-    const resolved: AgentProfileFormState = { ...withOptions, disclosure, canSubmit };
-    return { ...resolved, submitValue: canSubmit ? buildSubmitValue(resolved) : null };
+    return deriveSubmission(
+      { ...withOptions, disclosure },
+      supportsResidentRoles,
+      storedResidentRole,
+      rolePromptEdited,
+    );
   }
 
-  let state: AgentProfileFormState = derive(buildInitialState(snapshot));
+  let state = derive(buildInitialState(snapshot, profile, storedResidentRole));
 
   function publish(mutate: (current: AgentProfileFormState) => AgentProfileFormState): void {
     if (closed) {
@@ -647,10 +739,23 @@ export function openAgentProfileForm(snapshot: AgentProfileFormSnapshot): AgentP
       resolvedOptions = {};
       publish((current) => current);
     },
+    applyResidentRoleSupport: (supported) => {
+      if (supportsResidentRoles !== supported) {
+        supportsResidentRoles = supported;
+        publish((current) => current);
+      }
+    },
     setName: (value) => publish((current) => ({ ...current, name: value })),
     setAppearance: (value) =>
       publish((current) => ({ ...current, icon: value.icon, color: value.color })),
     setNotes: (value) => publish((current) => ({ ...current, notes: value })),
+    setResidentRoleField: (field, value) =>
+      publish((current) => {
+        if (field === "rolePrompt") {
+          rolePromptEdited = true;
+        }
+        return { ...current, residentRole: { ...current.residentRole, [field]: value } };
+      }),
     setProvider: (providerId, display) =>
       publish((current) => {
         if (current.provider === providerId) {

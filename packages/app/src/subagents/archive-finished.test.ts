@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { RESIDENT_AGENT_LABEL } from "@getpaseo/protocol/agent-labels";
+import { describe, expect, it, vi } from "vitest";
 import { createArchiveFinishedSubagents, type ManagedSubagentSnapshot } from "./archive-finished";
 import type { PaseoSubagentRow, ProviderSubagentRow } from "./select";
 
@@ -64,6 +65,37 @@ function deferred<T>() {
 }
 
 describe("createArchiveFinishedSubagents", () => {
+  it("skips a resident shown in the track and a subagent bound while the batch runs", async () => {
+    const bound = { [RESIDENT_AGENT_LABEL]: "true" };
+    const live = new Map([
+      ["first", managed("first")],
+      ["binding", managed("binding")],
+      ["resident", managed("resident", "idle", { labels: bound })],
+    ]);
+    const archiveManagedSubagent = vi.fn(async () => {
+      live.set("binding", managed("binding", "idle", { labels: bound }));
+    });
+    const archive = createArchiveFinishedSubagents(
+      [paseo("first"), paseo("binding"), { ...paseo("resident"), resident: { role: null } }],
+      {
+        parentAgentId: "parent",
+        getManagedSubagent: ({ agentId }) => live.get(agentId),
+        archiveManagedSubagent,
+        dismissProviderSubagents: vi.fn(),
+      },
+    );
+    expect(archive.getState().eligibleCount).toBe(2);
+    expect(await archive.archiveFinished()).toMatchObject({
+      archivedPaseoIds: ["first"],
+      skippedPaseoIds: ["binding"],
+      failures: [],
+    });
+    expect(archiveManagedSubagent).toHaveBeenCalledExactlyOnceWith({
+      serverId: "server-1",
+      agentId: "first",
+    });
+  });
+
   it("dismisses provider rows before sequential managed archives and reports combined progress", async () => {
     const first = deferred<void>();
     const second = deferred<void>();

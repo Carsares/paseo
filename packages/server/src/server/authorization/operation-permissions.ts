@@ -3,7 +3,13 @@ import type { DaemonPermission } from "./index.js";
 
 type InboundOperation = SessionInboundMessage["type"];
 type OutboundOperation = SessionOutboundMessage["type"];
-export type PermissionRequirement = DaemonPermission | readonly DaemonPermission[] | null;
+export type PermissionRequirement =
+  | DaemonPermission
+  | readonly DaemonPermission[]
+  | { readonly all: readonly DaemonPermission[] }
+  | null;
+
+const RESIDENT_LIFECYCLE_PERMISSION = { all: ["workspace.write", "hub.execute"] } as const;
 
 const INBOUND_PERMISSION = {
   "hosts.list.request": "daemon.read",
@@ -22,6 +28,9 @@ const INBOUND_PERMISSION = {
   "agent.set_main.request": "workspace.write",
   "agent.inbox.flush.request": "workspace.write",
   "agent.set_parent.request": "workspace.write",
+  "agent.resident.set.request": "workspace.write",
+  "agent.resident.create.request": RESIDENT_LIFECYCLE_PERMISSION,
+  "agent.session.reset.request": RESIDENT_LIFECYCLE_PERMISSION,
   "agent.finish_reports.push.request": "workspace.write",
   "agent.finish_reports.confirm.response": "workspace.write",
   "agent.finish_reports.pull.request": "workspace.write",
@@ -277,6 +286,9 @@ const OUTBOUND_PERMISSION = {
   "agent.set_main.response": "workspace.write",
   "agent.inbox.flush.response": "workspace.write",
   "agent.set_parent.response": "workspace.write",
+  "agent.resident.set.response": "workspace.write",
+  "agent.resident.create.response": RESIDENT_LIFECYCLE_PERMISSION,
+  "agent.session.reset.response": RESIDENT_LIFECYCLE_PERMISSION,
   "agent.finish_reports.push.response": "workspace.write",
   "agent.finish_reports.confirm.request": "workspace.read",
   "agent.finish_reports.pull.response": "workspace.write",

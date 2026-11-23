@@ -1,5 +1,9 @@
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
-import { getParentAddressFromLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  getParentAddressFromLabels,
+  getResidentRoleFromLabels,
+  isResidentAgent,
+} from "@getpaseo/protocol/agent-labels";
 import { useEffect, useMemo } from "react";
 import { usePendingArchiveAgentKeys } from "@/hooks/use-archive-agent";
 import equal from "fast-deep-equal";
@@ -12,6 +16,7 @@ export interface PaseoSubagentRow {
   kind: "paseo";
   address: AgentAddress;
   id: Agent["id"];
+  workspaceId?: Agent["workspaceId"];
   provider: Agent["provider"];
   title: Agent["title"];
   /** Managed agents have a real title, so the union's task line is always absent for them. */
@@ -19,6 +24,7 @@ export interface PaseoSubagentRow {
   subtitle: null;
   status: Agent["status"];
   backgroundWork?: Agent["backgroundWork"];
+  resident?: { role: string | null };
   turn: Agent["turn"];
   requiresAttention: Agent["requiresAttention"];
   createdAt: Agent["createdAt"];
@@ -61,12 +67,16 @@ function toSubagentRow(agent: Agent): SubagentRow {
     kind: "paseo",
     address: { serverId: agent.serverId, agentId: agent.id },
     id: agent.id,
+    workspaceId: agent.workspaceId,
     provider: agent.provider,
     title: agent.title,
     description: null,
     subtitle: null,
     status: agent.status,
     backgroundWork: agent.backgroundWork,
+    ...(isResidentAgent(agent)
+      ? { resident: { role: getResidentRoleFromLabels(agent.labels) } }
+      : {}),
     turn: agent.turn,
     requiresAttention: agent.requiresAttention,
     createdAt: agent.createdAt,

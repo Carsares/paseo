@@ -1,5 +1,7 @@
 import {
   getOpenAgentTabLabel,
+  getResidentRoleFromLabels,
+  hasResidentInboxBypass,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
 } from "@getpaseo/protocol/agent-labels";
@@ -8,8 +10,186 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { expect, test } from "vitest";
 import type { AgentManager } from "./agent/agent-manager.js";
+import { createJsonFinishSubscriptionStore } from "./agent/finish-subscriptions/internal/json-store.js";
 import { DaemonClient, createTestPaseoDaemon } from "./test-utils/index.js";
 import { createTestAgentClients } from "./test-utils/fake-agent-client.js";
+
+test.each(["reparent", "handoff", "resident conversion"] as const)(
+  "retires the parent's automatic completion subscription after %s",
+  async (operation) => {
+    const release = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    const handle = await createTestPaseoDaemon({
+      agentClients: createTestAgentClients({
+        async beforeTurnComplete(prompt) {
+          if (prompt !== "Keep running") return;
+          started.resolve();
+          await release.promise;
+        },
+      }),
+    });
+    const client = new DaemonClient({ url: `ws://127.0.0.1:${handle.port}/ws` });
+    try {
+      await client.connect();
+      const manager = handle.daemon.agentManager;
+      const previous = await client.createAgent({ provider: "codex", cwd: handle.staticDir });
+      const workspaceId = (await handle.daemon.agentStorage.get(previous.id))!.workspaceId;
+      await manager.setAgentMainControl(previous.id, true);
+      const config = { provider: "codex", cwd: previous.cwd };
+      const next = await manager.createAgent(config, undefined, { workspaceId });
+      const child = await manager.createAgent(config, undefined, {
+        workspaceId,
+        labels: { [PARENT_AGENT_ID_LABEL]: previous.id, [PARENT_REPORTING_LABEL]: "auto" },
+      });
+      const previousSubscriptions = async () =>
+        (await createJsonFinishSubscriptionStore(handle.paseoHome).list()).filter(
+          (record) => record.childAgentId === child.id && record.callerAgentId === previous.id,
+        );
+      await client.sendMessage(child.id, "Keep running");
+      await started.promise;
+      await expect.poll(previousSubscriptions).toHaveLength(1);
+      if (operation === "reparent") {
+        await client.setAgentParent(child.id, next.id);
+      } else if (operation === "handoff") {
+        await client.setAgentMainControl(next.id, true, { handoffFromAgentId: previous.id });
+      } else {
+        await client.setAgentResident(child.id, true, { role: "Build specialist" });
+      }
+      expect(await previousSubscriptions()).toEqual([]);
+      expect(manager.hasInFlightRun(child.id)).toBe(true);
+    } finally {
+      release.resolve();
+      await client.close();
+      await handle.close();
+    }
+  },
+);
+
+test("a resident specialist can report urgently and does not hold sibling results", async () => {
+  const release = Promise.withResolvers<void>();
+  const holding = new Map([
+    ["Hold specialist open", Promise.withResolvers<void>()],
+    ["Hold sibling open", Promise.withResolvers<void>()],
+  ]);
+  const handle = await createTestPaseoDaemon({
+    mcpEnabled: true,
+    agentProfiles: [
+      {
+        id: "build",
+        name: "Build specialist",
+        provider: "codex",
+        model: "codex-test",
+        roleSlug: "build",
+        defaultResident: true,
+        residentUrgentReport: true,
+      },
+    ],
+    agentClients: createTestAgentClients({
+      async beforeTurnComplete(prompt) {
+        if (typeof prompt !== "string") return;
+        const started = [...holding].find(([text]) => prompt.includes(text))?.[1];
+        if (started) {
+          started.resolve();
+          await release.promise;
+        }
+      },
+    }),
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${handle.port}/ws` });
+  const parentTools = new Client({ name: "parent", version: "1" });
+  const specialistTools = new Client({ name: "specialist", version: "1" });
+  const connectTools = (tools: Client, agentId: string) =>
+    tools.connect(
+      new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${handle.port}/mcp/agents?callerAgentId=${agentId}`),
+      ),
+    );
+  try {
+    await client.connect();
+    const manager = handle.daemon.agentManager;
+    const main = await client.createAgent({ provider: "codex", cwd: handle.staticDir });
+    const workspaceId = (await handle.daemon.agentStorage.get(main.id))!.workspaceId;
+    await manager.setAgentMainControl(main.id, true);
+    await connectTools(parentTools, main.id);
+    const create = () =>
+      parentTools.callTool({
+        name: "create_agent",
+        arguments: {
+          profileId: "build",
+          title: "Build helper",
+          residentRole: "Build lead",
+          initialPrompt: "Hold specialist open",
+        },
+      });
+    const result = await create();
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const specialist = (result.structuredContent as { agentId: string }).agentId;
+    await holding.get("Hold specialist open")!.promise;
+    const labels = (await handle.daemon.agentStorage.get(specialist))?.labels;
+    expect(getResidentRoleFromLabels(labels)).toBe("Build lead");
+    expect(hasResidentInboxBypass(labels)).toBe(true);
+    expect(await create()).toMatchObject({
+      isError: true,
+      structuredContent: { error: expect.stringContaining("send_agent_prompt") },
+    });
+    const createChild = () =>
+      manager.createAgent({ provider: "codex", cwd: main.cwd }, undefined, {
+        workspaceId,
+        labels: { [PARENT_AGENT_ID_LABEL]: main.id, [PARENT_REPORTING_LABEL]: "auto" },
+      });
+    const finisher = await createChild();
+    const delivered = () =>
+      manager
+        .getTimeline(main.id)
+        .flatMap((item) =>
+          item.type === "tool_call" && item.agentMessage ? [item.agentMessage] : [],
+        );
+    await client.sendMessage(finisher.id, "Finish while the specialist runs");
+    await expect.poll(delivered, { timeout: 8000 }).toEqual([
+      expect.objectContaining({
+        sender: expect.objectContaining({ id: finisher.id }),
+        event: "finished",
+      }),
+    ]);
+    expect(manager.hasInFlightRun(specialist)).toBe(true);
+
+    const sibling = await createChild();
+    await client.sendMessage(sibling.id, "Hold sibling open");
+    await holding.get("Hold sibling open")!.promise;
+    await connectTools(specialistTools, specialist);
+    const report = await specialistTools.callTool({
+      name: "report_to_parent",
+      arguments: { summary: "Build checks passed" },
+    });
+    expect(report.isError, JSON.stringify(report)).not.toBe(true);
+    await expect.poll(delivered, { timeout: 8000 }).toContainEqual(
+      expect.objectContaining({
+        sender: expect.objectContaining({ id: specialist }),
+        reportStatus: "completed",
+      }),
+    );
+    expect(manager.hasInFlightRun(sibling.id)).toBe(true);
+
+    const denied = await specialistTools.callTool({
+      name: "reset_agent_session",
+      arguments: { agentId: sibling.id, interrupt: true },
+    });
+    expect(denied.isError).toBe(true);
+    expect(manager.hasInFlightRun(sibling.id)).toBe(true);
+
+    release.resolve();
+    await expect.poll(() => manager.hasInFlightRun(specialist)).toBe(false);
+    const reset = await parentTools.callTool({
+      name: "reset_agent_session",
+      arguments: { agentId: specialist },
+    });
+    expect(reset.structuredContent).toEqual({ success: true });
+  } finally {
+    release.resolve();
+    await Promise.allSettled([specialistTools.close(), parentTools.close(), client.close()]);
+    await handle.close();
+  }
+}, 30_000);
 
 async function expectApprovalWithReport(
   manager: AgentManager,

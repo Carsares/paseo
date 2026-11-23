@@ -16,6 +16,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
 import { createProviderSnapshotManagerStub } from "../test-utils/session-stubs.js";
+import { createPersistedWorkspaceRecord } from "../workspace-registry.js";
 import { AgentManager } from "./agent-manager.js";
 import { createAgentMessageDelivery, parseAgentMessages } from "./agent-messages/index.js";
 import { toAgentPayload } from "./agent-projections.js";
@@ -39,6 +40,7 @@ import {
   isMainControlWritePermissionBlocked,
   REMOTE_HIERARCHY_DEPTH_LABEL,
   resolveInheritedHierarchyMode,
+  stripMainControlPromptHeader,
   validateCanSpawnChild,
   validateSetAgentParent,
   validateSingleHopOrchestration,
@@ -67,7 +69,40 @@ const mainControlTools = [
   "list_agents",
   "summarize_workspace_agents",
   "archive_agent",
+  "reset_agent_session",
 ];
+
+function testWorkspaceRegistry(cwd: string) {
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "workspace",
+    projectId: "project",
+    cwd,
+    kind: "directory",
+    displayName: "Hierarchy test",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  });
+  return {
+    get: async (id: string) => (id === workspace.workspaceId ? workspace : null),
+    listActive: async () => [workspace],
+    update: async () => null,
+  };
+}
+
+it("strips resident specialist instructions from replay with or without the Main Control header", () => {
+  const specialistPrefix =
+    "[Workspace Resident Specialists]\nRole: Build\n[/Workspace Resident Specialists]\n\n";
+  const mainPrefix =
+    "[Workspace Main Control Instructions]\nDelegate.\n[/Workspace Main Control Instructions: main]\n\n";
+  const prompt = "Run the checks.";
+  expect(stripMainControlPromptHeader(specialistPrefix + prompt, main.id)).toBe(prompt);
+  expect(stripMainControlPromptHeader(mainPrefix + specialistPrefix + prompt, main.id)).toBe(
+    prompt,
+  );
+  expect(stripMainControlPromptHeader(prompt + "\n" + specialistPrefix, main.id)).toBe(
+    prompt + "\n" + specialistPrefix,
+  );
+});
 
 it("preserves options in place and sends Main Control instructions on the first turn", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "main-control-first-turn-"));
@@ -268,6 +303,7 @@ describe("agent orchestration", () => {
         "cancel_agent",
         "archive_agent",
         "kill_agent",
+        "reset_agent_session",
       ],
     });
   });
@@ -560,6 +596,7 @@ it.each([true, false])(
         agentStorage: storage,
         providerSnapshotManager,
         callerAgentId: record.id,
+        workspaceRegistry: testWorkspaceRegistry(cwd),
         logger: createTestLogger(),
       });
       const result = await catalog.executeTool("create_agent", {
@@ -907,9 +944,12 @@ it("resolves an inherited workspace after the parent's queued move", async () =>
       labels,
     });
     const explicit = manager.createAgent(config, undefined, { workspaceId, labels });
-    const [, inheritedAgent, explicitAgent] = await Promise.all([move, inherited, explicit]);
+    const [, inheritedAgent] = await Promise.all([
+      move,
+      inherited,
+      expect(explicit).rejects.toThrow("Subagents must reuse the current workspace"),
+    ]);
     expect((await storage.get(inheritedAgent.id))?.workspaceId).toBe("destination");
-    expect((await storage.get(explicitAgent.id))?.workspaceId).toBe("origin");
   });
 });
 
@@ -1201,7 +1241,7 @@ it("denies workspace archive and worktree creation for Main Control before looki
     for (const target of [{}, { serverId: "remote-host" }]) {
       await expect(
         openMainCatalog.executeTool("create_workspace", { isolation: "worktree", ...target }),
-      ).rejects.toThrow("Paseo tool is disabled for your hierarchy role: create_workspace");
+      ).rejects.toThrow("Agent sessions cannot create a project or workspace");
     }
     expect(listActiveWorkspaces).not.toHaveBeenCalled();
     await expect(catalog(ordinary.id).executeTool("archive_workspace", request)).rejects.toThrow(
@@ -1245,6 +1285,7 @@ it("restores a remote child without counting an unrelated local parent with the 
     const config = { provider: "codex", cwd };
     const createLocal = (parentId?: string) =>
       manager.createAgent(config, undefined, {
+        workspaceId: "workspace",
         labels: parentId ? { [PARENT_AGENT_ID_LABEL]: parentId } : undefined,
       });
     const localRoot = await createLocal();
@@ -1484,6 +1525,7 @@ it("preserves Claude options, surfaces shell requests, and auto-denies file writ
       agentStorage: storage,
       providerSnapshotManager: createProviderSnapshotManagerStub().manager,
       callerAgentId: claudeAgent.id,
+      workspaceRegistry: testWorkspaceRegistry(cwd),
       logger: createTestLogger(),
     });
     const childResult = await catalog.executeTool("create_agent", {
@@ -1566,6 +1608,7 @@ it("enforces single-hop MCP orchestration, self mode changes, and refreshes poli
         agentStorage: storage,
         providerSnapshotManager: createProviderSnapshotManagerStub().manager,
         callerAgentId,
+        workspaceRegistry: testWorkspaceRegistry(cwd),
         paseoToolPolicy: filterTools ? manager.getPaseoToolPolicy(callerAgentId) : undefined,
         logger,
       });
@@ -2119,7 +2162,7 @@ it.each([true, false])("reparents a running child with explicit reporting %s", a
       workspaceId,
       labels: {
         [PARENT_AGENT_ID_LABEL]: parent.id,
-        ...(explicit ? { [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING } : {}),
+        [PARENT_REPORTING_LABEL]: explicit ? EXPLICIT_PARENT_REPORTING : "auto",
       },
     });
     const permission = Promise.withResolvers<void>();

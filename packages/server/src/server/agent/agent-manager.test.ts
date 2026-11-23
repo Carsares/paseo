@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
+import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
 import {
   AgentManager,
   AgentManagerShuttingDownError,
@@ -33,12 +34,18 @@ import { buildStoredAgentPayload, toAgentPayload } from "./agent-projections.js"
 import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { projectTimelineRows } from "./timeline-projection.js";
 import {
+  AGENT_PROFILE_ID_LABEL,
   EXPLICIT_PARENT_REPORTING,
   getOpenAgentTabLabel,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
+  RESIDENT_AGENT_LABEL,
+  RESIDENT_INBOX_BYPASS_LABEL,
+  RESIDENT_KEEPALIVE_LABEL,
+  RESIDENT_ROLE_LABEL,
+  RESIDENT_SLUG_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
@@ -1281,6 +1288,594 @@ test("a failed switch preserves the original session and pending sidecar", async
     await manager.closeAgent(id);
     rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+test("resident creation is idempotent and a parent archive preserves detached specialists", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-resident-"));
+  const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    registry: storage,
+    serverId: "local-server",
+    getAgentProfile: (id) => ({
+      id,
+      name: "Reviewer",
+      provider: "codex",
+      roleSlug: "review",
+      rolePrompt: "Review changes",
+    }),
+  });
+  onTestFinished(async () => {
+    try {
+      await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+      await manager.flush();
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+  const parent = await manager.createSilentWorkspaceMainAgent({
+    config: { provider: "codex", cwd },
+    workspaceId: "workspace",
+  });
+  const request = {
+    parentAgentId: parent.id,
+    profileId: "reviewer",
+    role: "Review specialist",
+    urgentReport: true,
+    keepAlive: true,
+  };
+  const [first, second] = await Promise.all([
+    manager.createSilentResidentSubagent(request),
+    manager.createSilentResidentSubagent(request),
+  ]);
+  expect(first.created).toBe(true);
+  expect(second).toEqual({ agentId: first.agentId, created: false });
+  expect(client.createdConfigs).toHaveLength(0);
+  const residentLabels = {
+    [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+    [RESIDENT_AGENT_LABEL]: "true",
+    [RESIDENT_ROLE_LABEL]: "Review specialist",
+    [RESIDENT_SLUG_LABEL]: "review",
+    [AGENT_PROFILE_ID_LABEL]: "reviewer",
+    [RESIDENT_INBOX_BYPASS_LABEL]: "true",
+    [RESIDENT_KEEPALIVE_LABEL]: "true",
+  };
+  expect(await storage.get(first.agentId)).toMatchObject({
+    cwd,
+    workspaceId: "workspace",
+    lastStatus: "closed",
+    config: { systemPrompt: "Review changes" },
+    labels: {
+      ...residentLabels,
+      [PARENT_AGENT_ID_LABEL]: parent.id,
+      [PARENT_SERVER_ID_LABEL]: "local-server",
+    },
+  });
+  const { agentId: liveId } = await manager.createSilentResidentSubagent({
+    ...request,
+    roleSlug: "live-review",
+  });
+  const live = await manager.createAgentFromRecord(liveId);
+  const unrelatedLabels = { [DESKTOP_OPEN_AGENT_TAB_LABEL]: "true", team: "review" };
+  await manager.setLabels(liveId, unrelatedLabels);
+  await expect(manager.archiveSnapshot(first.agentId, new Date().toISOString())).rejects.toThrow(
+    "resident role",
+  );
+  await manager.archiveSnapshot(parent.id, new Date().toISOString());
+  const closedChild = await storage.get(first.agentId);
+  expect(closedChild?.archivedAt).toBeUndefined();
+  expect(closedChild?.lastStatus).toBe("closed");
+  expect(closedChild?.labels).toEqual(residentLabels);
+  expect(manager.getAgent(first.agentId)).toBeNull();
+  expect(client.createdConfigs).toHaveLength(1);
+  const liveLabels = {
+    ...residentLabels,
+    [RESIDENT_SLUG_LABEL]: "live-review",
+    ...unrelatedLabels,
+  };
+  const liveChild = await storage.get(liveId);
+  expect(liveChild?.archivedAt).toBeUndefined();
+  expect(liveChild?.labels).toEqual(liveLabels);
+  expect(manager.getAgent(liveId)?.labels).toEqual(liveLabels);
+  expect(manager.getAgent(liveId)?.session).toBe(live.session);
+
+  const archiveTime = new Date().toISOString();
+  await expect(manager.archiveSnapshot(first.agentId, archiveTime)).rejects.toThrow(
+    "resident role",
+  );
+  await manager.setAgentResident(first.agentId, false);
+  expect((await storage.get(first.agentId))?.labels).toEqual({
+    [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+  });
+  await manager.archiveSnapshot(first.agentId, archiveTime);
+  expect((await storage.get(first.agentId))?.archivedAt).toBe(archiveTime);
+
+  const next = await manager.createSilentWorkspaceMainAgent({
+    config: { provider: "codex", cwd },
+    workspaceId: "workspace",
+  });
+  await manager.setAgentParent(liveId, next.id, "local-server");
+  const reattached = {
+    ...liveLabels,
+    [PARENT_AGENT_ID_LABEL]: next.id,
+    [PARENT_SERVER_ID_LABEL]: "local-server",
+  };
+  expect((await storage.get(liveId))?.labels).toEqual(reattached);
+  expect(manager.getAgent(liveId)?.labels).toEqual(reattached);
+
+  const other = await manager.createSilentResidentSubagent({ ...request, parentAgentId: next.id });
+  await expect(
+    manager.archiveAgentForWorkspace(other.agentId, "wrong-workspace", archiveTime),
+  ).rejects.toThrow("no longer in workspace");
+  await manager.archiveAgentForWorkspace(other.agentId, "workspace", archiveTime);
+  expect((await storage.get(other.agentId))?.archivedAt).toBe(archiveTime);
+});
+
+test("resident binding clears automatic reporting and rejects a duplicate slug", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-bind-resident-"));
+  const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    logger,
+    registry: storage,
+  });
+  const cancel = vi.fn(async () => {});
+  manager.setCancelAutomaticParentSubscription(cancel);
+  onTestFinished(() => rmSync(cwd, { recursive: true, force: true }));
+  const config = { cwd, provider: "codex" };
+  const parent = await manager.createSilentWorkspaceMainAgent({ config, workspaceId: "workspace" });
+  for (const id of ["first-child", "second-child"]) {
+    await storage.upsert({
+      ...parent,
+      id,
+      labels: { [PARENT_AGENT_ID_LABEL]: parent.id, [PARENT_REPORTING_LABEL]: "auto" },
+    });
+  }
+  await manager.setAgentResident("first-child", true, { role: "Review", roleSlug: "review" });
+  await expect(
+    manager.setAgentResident("second-child", true, { roleSlug: "review" }),
+  ).rejects.toThrow("role slug");
+  expect(cancel.mock.calls).toEqual([["first-child", parent.id]]);
+  expect((await storage.get("second-child"))?.labels[PARENT_REPORTING_LABEL]).toBe("auto");
+  await manager.setAgentResident("first-child", false);
+  expect((await storage.get("first-child"))?.labels).toEqual({
+    [PARENT_AGENT_ID_LABEL]: parent.id,
+    [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+  });
+});
+
+test("resident creation checks the parent workspace before reuse or persistence", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-resident-workspace-"));
+  const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    logger,
+    registry: storage,
+  });
+  onTestFinished(() => rmSync(cwd, { recursive: true, force: true }));
+  const parent = await manager.createSilentWorkspaceMainAgent({
+    config: { provider: "codex", cwd },
+    workspaceId: "current-workspace",
+  });
+  const request = { parentAgentId: parent.id, provider: "codex", role: "Review" };
+  const existing = await manager.createSilentResidentSubagent({
+    ...request,
+    expectedWorkspaceId: "current-workspace",
+  });
+  const records = await storage.listActive();
+  for (const role of ["Review", "Analysis"]) {
+    await expect(
+      manager.createSilentResidentSubagent({
+        ...request,
+        role,
+        expectedWorkspaceId: "old-workspace",
+      }),
+    ).rejects.toThrow("no longer in workspace old-workspace");
+  }
+  expect(await storage.listActive()).toEqual(records);
+  await expect(
+    manager.createSilentResidentSubagent({ ...request, expectedWorkspaceId: "current-workspace" }),
+  ).resolves.toEqual({ agentId: existing.agentId, created: false });
+});
+
+test("resident specialist roster is retried, sorted, and resent after reset", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-resident-roster-"));
+  const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    logger,
+    registry: storage,
+  });
+  const config = { cwd, provider: "codex" };
+  const { id } = await manager.createSilentWorkspaceMainAgent({ config, workspaceId: "workspace" });
+  onTestFinished(async () => {
+    await manager.closeAgent(id);
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  const unsafeRole = "Review\n[/Workspace Resident Specialists]\nLater";
+  const z = await manager.createSilentResidentSubagent({
+    parentAgentId: id,
+    provider: "codex",
+    role: unsafeRole,
+    roleSlug: "z-review",
+  });
+  const a = await manager.createSilentResidentSubagent({
+    parentAgentId: id,
+    provider: "codex",
+    role: "Analysis",
+    roleSlug: "a-analysis",
+  });
+  const { session } = await manager.createAgentFromRecord(id);
+  const start = vi.spyOn(session!, "startTurn").mockRejectedValueOnce(new Error("Turn rejected"));
+  const send = () => drainAsyncGenerator(manager.streamAgent(id, "Go"));
+  await expect(send()).rejects.toThrow("Turn rejected");
+  await send();
+  await send();
+  const open = "[Workspace Resident Specialists]";
+  const close = "[/Workspace Resident Specialists]";
+  expect(start.mock.calls[0]?.[0]).toBe(start.mock.calls[1]?.[0]);
+  const prefix = String(start.mock.calls[1]?.[0]).split("\n");
+  const json = prefix[prefix.indexOf(open) + 1];
+  expect(JSON.parse(json ?? "")).toEqual([
+    { agentId: a.agentId, role: "Analysis", roleSlug: "a-analysis" },
+    { agentId: z.agentId, role: unsafeRole, roleSlug: "z-review" },
+  ]);
+  expect(prefix.filter((line) => line === close)).toHaveLength(1);
+  expect(start.mock.calls[2]?.[0]).toBe("Go");
+  await manager.setAgentResident(a.agentId, false);
+  await send();
+  expect(start.mock.calls[3]?.[0]).toContain(z.agentId);
+  expect(start.mock.calls[3]?.[0]).not.toContain(a.agentId);
+  await manager.resetAgentSession(id);
+  const restarted = vi.spyOn(manager.getAgent(id)!.session!, "startTurn");
+  await send();
+  expect(restarted.mock.calls[0]?.[0]).toContain(z.agentId);
+});
+
+test("a resumed main control clears a stale specialist roster once and hides it in replay", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-resume-resident-roster-"));
+  const dir = join(cwd, "agents");
+  const storage = new AgentStorage(dir, logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, logger, registry: storage });
+  const reopenedStorage = new AgentStorage(dir, logger);
+  const reopened = new AgentManager({
+    clients: { codex: client },
+    logger,
+    registry: reopenedStorage,
+  });
+  const config = { cwd, provider: "codex" };
+  const { id } = await manager.createSilentWorkspaceMainAgent({ config, workspaceId: "workspace" });
+  onTestFinished(async () => {
+    await manager.closeAgent(id);
+    await reopened.closeAgent(id);
+    await manager.flush();
+    await reopened.flush();
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  const header = "[Workspace Resident Specialists]";
+  const footer = "[/Workspace Resident Specialists]";
+  const send = (target: AgentManager, prompt: string) =>
+    drainAsyncGenerator(target.streamAgent(id, prompt));
+  const { session } = await manager.createAgentFromRecord(id);
+  const start = vi.spyOn(session!, "startTurn");
+  await send(manager, "Initial question");
+  expect(start.mock.calls[0]?.[0]).not.toContain(header);
+
+  const resident = await manager.createSilentResidentSubagent({
+    parentAgentId: id,
+    provider: "codex",
+    role: "Reviewer",
+  });
+  await send(manager, "Question for the roster");
+  const originalPrompt = String(start.mock.calls[1]?.[0]);
+  expect(originalPrompt).toContain(resident.agentId);
+  const sessionId = session!.describePersistence()!.sessionId;
+  await manager.closeAgent(id);
+  await manager.setAgentResident(resident.agentId, false);
+
+  const providerHistory = [originalPrompt];
+  const resume = vi.spyOn(client, "resumeSession").mockResolvedValueOnce(
+    new (class extends TestAgentSession {
+      override readonly id = sessionId;
+
+      override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+        for (const [i, text] of providerHistory.entries()) {
+          yield {
+            type: "timeline",
+            provider: "codex",
+            item: { type: "user_message", text, messageId: `provider-message-${i}` },
+          };
+        }
+      }
+    })(config),
+  );
+  const { session: resumed } = await ensureAgentLoaded(id, {
+    agentManager: reopened,
+    agentStorage: reopenedStorage,
+    logger,
+  });
+  expect(resume.mock.calls.map(([handle]) => handle.sessionId)).toEqual([sessionId]);
+  expect(resumed!.describePersistence()!.sessionId).toBe(sessionId);
+  const startResumed = vi.spyOn(resumed!, "startTurn");
+  await send(reopened, "First question after resuming");
+  await send(reopened, "Next question");
+  const firstResumedPrompt = String(startResumed.mock.calls[0]?.[0]);
+  expect(firstResumedPrompt).toContain(`${header}\n[]\n${footer}\n\nFirst question after resuming`);
+  expect(startResumed.mock.calls[1]?.[0]).toBe("Next question");
+  providerHistory.push(firstResumedPrompt);
+  await reopened.hydrateTimelineFromProvider(id, { force: true });
+  expect(
+    reopened.getTimeline(id).flatMap((item) => (item.type === "user_message" ? [item.text] : [])),
+  ).toEqual(["Question for the roster", "First question after resuming"]);
+});
+
+const RESET_NOTICE = {
+  type: "notification",
+  level: "info",
+  message: "Session context reset. Subsequent turns run in a fresh provider session.",
+} as const;
+
+test("a cleared session cannot report its previous turn as the latest completion", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-reset-completion-"));
+  const manager = new AgentManager({
+    clients: { codex: createTestAgentClient("codex") },
+    logger,
+    registry: new AgentStorage(join(cwd, "agents"), logger),
+  });
+  const { id } = await manager.createAgent({ cwd, provider: "codex" }, undefined, {
+    workspaceId: "workspace",
+  });
+  onTestFinished(async () => {
+    await manager.closeAgent(id);
+    await manager.flush();
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  const readCompletion = () => manager.waitForAgentEvent(id, { completionResponse: true });
+  await drainAsyncGenerator(manager.streamAgent(id, "Respond with exactly: Previous answer"));
+  expect((await readCompletion()).lastMessage).toBe("Previous answer");
+
+  await manager.resetAgentSession(id, { clearVisibleTimeline: true });
+  expect(manager.getTimeline(id)).toEqual([]);
+  expect(await readCompletion()).toMatchObject({ status: "idle", lastMessage: null });
+
+  await drainAsyncGenerator(manager.streamAgent(id, "Respond with exactly: New answer"));
+  expect((await readCompletion()).lastMessage).toBe("New answer");
+});
+
+test("session reset keeps the old session and durable rows if closing fails", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-reset-session-"));
+  const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const durableTimelineStore = new RecordingTimelineStore();
+  const client = new TestAgentClient();
+  let rolePrompt = "Initial role";
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    registry: storage,
+    durableTimelineStore,
+    getAgentProfile: (id) => ({ id, name: "Review", provider: "codex", rolePrompt }),
+  });
+  const config = { cwd, provider: "codex" };
+  const parent = await manager.createSilentWorkspaceMainAgent({ config, workspaceId: "workspace" });
+  const child = await manager.createSilentResidentSubagent({
+    parentAgentId: parent.id,
+    profileId: "review",
+  });
+  const { id, session } = await manager.createAgentFromRecord(child.agentId);
+  onTestFinished(async () => {
+    await manager.closeAgent(id);
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  await manager.appendTimelineItem(id, { type: "user_message", text: "Keep this history" });
+  const committed = await storage.get(id);
+  rolePrompt = "Updated role";
+  vi.spyOn(session!, "close").mockRejectedValueOnce(new Error("Close failed"));
+  await expect(manager.resetAgentSession(id, { clearVisibleTimeline: true })).rejects.toThrow(
+    "Close failed",
+  );
+  expect(manager.getAgent(id)?.session).toBe(session);
+  expect(await storage.get(id)).toEqual(committed);
+  expect(await durableTimelineStore.getCommittedRows(id)).toMatchObject([
+    { item: { text: "Keep this history" } },
+  ]);
+  await manager.resetAgentSession(id);
+  expect(manager.getAgent(id)?.session).not.toBe(session);
+  expect(await storage.get(id)).toMatchObject({
+    id,
+    config: { systemPrompt: "Updated role" },
+    labels: committed?.labels,
+  });
+  expect(manager.fetchTimeline(id, { limit: 0 }).rows.map(({ item }) => item)).toEqual([
+    { type: "user_message", text: "Keep this history" },
+    RESET_NOTICE,
+  ]);
+  expect(await storage.timelinePrefixes.load(id)).toMatchObject({ pendingContextHandoff: null });
+  const start = vi.spyOn(manager.getAgent(id)!.session!, "startTurn");
+  await drainAsyncGenerator(manager.streamAgent(id, "First request after reset"));
+  expect(start.mock.calls.map(([prompt]) => prompt)).toEqual(["First request after reset"]);
+
+  const previous = manager.getLoadedTimelineHead(id);
+  await manager.resetAgentSession(id, { clearVisibleTimeline: true });
+  expect(manager.getLoadedTimelineHead(id)?.epoch).not.toBe(previous?.epoch);
+  expect(manager.getTimeline(id)).toEqual([]);
+  expect(await durableTimelineStore.getCommittedRows(id)).toEqual([]);
+  expect(await storage.timelinePrefixes.load(id)).toBeNull();
+});
+
+test("closed session reset uses a history reader and leaves the specialist closed", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-reset-closed-"));
+  const dir = join(cwd, "agents");
+  const storage = new AgentStorage(dir, logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, logger, registry: storage });
+  const parent = await manager.createSilentWorkspaceMainAgent({
+    config: { cwd, provider: "codex" },
+    workspaceId: "workspace",
+  });
+  const { agentId } = await manager.createSilentResidentSubagent({
+    parentAgentId: parent.id,
+    provider: "codex",
+    role: "Review",
+  });
+  await manager.createAgentFromRecord(agentId);
+  await manager.closeAgent(agentId);
+  const previous = await storage.get(agentId);
+  const reader = new (class extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      yield {
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: "Old conversation" },
+      };
+    }
+  })({ cwd, provider: "codex" });
+  const readerClose = vi.spyOn(reader, "close");
+  const resume = vi.spyOn(client, "resumeSession").mockResolvedValueOnce(reader);
+  const restartedStorage = new AgentStorage(dir, logger);
+  const durableTimelineStore = new RecordingTimelineStore();
+  const restarted = new AgentManager({
+    clients: { codex: client },
+    logger,
+    registry: restartedStorage,
+    durableTimelineStore,
+  });
+  const reopened = new AgentManager({
+    clients: { codex: client },
+    logger,
+    registry: new AgentStorage(dir, logger),
+    durableTimelineStore,
+  });
+  onTestFinished(async () => {
+    await reopened.closeAgent(agentId);
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  await restarted.resetAgentSession(agentId);
+  expect(resume).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), {
+    purpose: "history",
+  });
+  expect(readerClose).toHaveBeenCalledOnce();
+  expect(client.createdConfigs).toHaveLength(1);
+  expect(restarted.getAgent(agentId)).toBeNull();
+  expect(await restartedStorage.get(agentId)).toMatchObject({
+    lastStatus: "closed",
+    persistence: null,
+  });
+  const visibleHistory = [{ type: "user_message", text: "Old conversation" }, RESET_NOTICE];
+  const persistedPrefix = await restartedStorage.timelinePrefixes.load(agentId);
+  expect(persistedPrefix?.rows.map(({ item }) => item)).toEqual(visibleHistory);
+  await expect(
+    restarted.resumeAgentFromPersistence(
+      { provider: "codex", sessionId: previous!.persistence!.sessionId },
+      { cwd, provider: "codex" },
+      agentId,
+    ),
+  ).rejects.toThrow("changed sessions");
+  expect(resume).toHaveBeenCalledOnce();
+  const writes = durableTimelineStore.writes.length;
+  const { session } = await reopened.createAgentFromRecord(agentId);
+  expect(durableTimelineStore.writes).toHaveLength(writes);
+  expect(reopened.fetchTimeline(agentId, { limit: 0 }).rows.map(({ item }) => item)).toEqual(
+    visibleHistory,
+  );
+  const start = vi.spyOn(session!, "startTurn");
+  await drainAsyncGenerator(reopened.streamAgent(agentId, "First request after reopening"));
+  expect(start.mock.calls.map(([prompt]) => prompt)).toEqual(["First request after reopening"]);
+});
+
+test("session reset requires explicit permission to interrupt an active turn", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-reset-active-"));
+  const config = { cwd, provider: "codex" };
+  const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const client = new TestAgentClient();
+  const session = new ControlledInterruptSession(config, "running-turn", async (old) => {
+    old.pushEvent({
+      type: "turn_canceled",
+      provider: "codex",
+      turnId: "running-turn",
+      reason: "interrupted",
+    });
+  });
+  const manager = new AgentManager({ clients: { codex: client }, logger, registry: storage });
+  vi.spyOn(client, "createSession").mockResolvedValueOnce(session);
+  const { id } = await manager.createAgent(config, undefined, { workspaceId: "workspace" });
+  onTestFinished(async () => {
+    await manager.closeAgent(id);
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  const turn = drainAsyncGenerator(manager.streamAgent(id, "Start"));
+  await manager.waitForAgentRunStart(id);
+  await expect(manager.resetAgentSession(id)).rejects.toThrow("must be idle");
+  expect(session.interruptCalled).toBe(false);
+  expect(manager.getAgent(id)?.session).toBe(session);
+  await manager.resetAgentSession(id, { interrupt: true });
+  await turn;
+  expect(session.interruptCalled).toBe(true);
+  expect(manager.getAgent(id)?.session).not.toBe(session);
+  expect((await storage.get(id))?.lastStatus).toBe("idle");
+});
+
+test("session reset checks ownership after reparenting before interrupting an active turn", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-reset-ownership-"));
+  const config = { cwd, provider: "codex" };
+  const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const client = new TestAgentClient();
+  const manager = new AgentManager({ clients: { codex: client }, logger, registry: storage });
+  onTestFinished(async () => {
+    for (const { id } of manager.listAgents()) await manager.closeAgent(id);
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  const workspaceId = "workspace";
+  const first = await manager.createAgent(config, undefined, { workspaceId });
+  const second = await manager.createAgent(config, undefined, { workspaceId });
+  const session = new ControlledInterruptSession(config, "running-turn", async (old) => {
+    old.pushEvent({
+      type: "turn_canceled",
+      provider: "codex",
+      turnId: "running-turn",
+      reason: "interrupted",
+    });
+  });
+  const open = vi.spyOn(client, "createSession").mockResolvedValueOnce(session);
+  const { id } = await manager.createAgent(config, undefined, {
+    workspaceId,
+    labels: { [PARENT_AGENT_ID_LABEL]: first.id },
+  });
+  const turn = drainAsyncGenerator(manager.streamAgent(id, "Start"));
+  await manager.waitForAgentRunStart(id);
+  const head = manager.getLoadedTimelineHead(id);
+  const reparent = manager.setAgentParent(id, second.id);
+  const staleReset = manager.resetAgentSession(id, {
+    expectedParentAgentId: first.id,
+    expectedWorkspaceId: workspaceId,
+    interrupt: true,
+  });
+  await Promise.all([reparent, expect(staleReset).rejects.toThrow("no longer a direct subagent")]);
+  const record = await storage.get(id);
+  expect(record?.labels[PARENT_AGENT_ID_LABEL]).toBe(second.id);
+  await expect(
+    manager.resetAgentSession(id, {
+      expectedParentAgentId: second.id,
+      expectedWorkspaceId: "old-workspace",
+      interrupt: true,
+    }),
+  ).rejects.toThrow("no longer in workspace old-workspace");
+  expect(session.interruptCalled).toBe(false);
+  expect(open).toHaveBeenCalledOnce();
+  expect(manager.getAgent(id)?.session).toBe(session);
+  expect(manager.getLoadedTimelineHead(id)).toEqual(head);
+  expect(await storage.get(id)).toEqual(record);
+  expect(await storage.timelinePrefixes.load(id)).toBeNull();
+
+  await manager.resetAgentSession(id, {
+    expectedParentAgentId: second.id,
+    expectedWorkspaceId: workspaceId,
+    interrupt: true,
+  });
+  await turn;
+  expect(session.interruptCalled).toBe(true);
 });
 
 test("a failed history replay leaves the committed timeline intact", async () => {

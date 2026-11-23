@@ -1,6 +1,8 @@
 /** @vitest-environment jsdom */
 import {
   PARENT_AGENT_ID_LABEL,
+  RESIDENT_AGENT_LABEL,
+  RESIDENT_ROLE_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
@@ -94,12 +96,18 @@ const toast = { show: () => () => {}, copied: vi.fn(), error: vi.fn() };
 it("expands the hidden directory and opens both kinds of Closed session directly", () => {
   const main = agent("main", "Coordinator", { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE });
   const closed = agent("closed", "Layout closed", { [PARENT_AGENT_ID_LABEL]: "main" });
+  const resident = agent("resident", "Review notes", {
+    [PARENT_AGENT_ID_LABEL]: "main",
+    [RESIDENT_AGENT_LABEL]: "true",
+    [RESIDENT_ROLE_LABEL]: "Reviewer",
+  });
   useSessionStore.getState().initializeSession("host", null as unknown as DaemonClient);
   useSessionStore.getState().setAgents(
     "host",
     new Map([
       [main.id, main],
       [closed.id, closed],
+      [resident.id, resident],
     ]),
   );
   useWorkspaceLayoutStore.getState().setLayoutMode("split-panes");
@@ -112,6 +120,8 @@ it("expands the hidden directory and opens both kinds of Closed session directly
       </ToastApiProvider>
     </QueryClientProvider>,
   );
+  expect(screen.getByRole("button", { name: "Reviewer, Closed" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Layout closed, Closed" })).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "Hide" }));
   expect(screen.queryByRole("button", { name: /Archived conversation/ })).toBeNull();
 

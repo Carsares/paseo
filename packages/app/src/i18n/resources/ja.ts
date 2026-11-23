@@ -2180,6 +2180,36 @@ export const ja: TranslationResources = {
     backdrop: "メニューの背景",
   },
   subagents: {
+    resident: {
+      groupTitle: "常駐の専門エージェント",
+      createAction: "常駐の専門エージェントを作成",
+      bindAction: "常駐に設定",
+      unbindAction: "常駐設定を解除",
+      resetAction: "セッションをリセット",
+      createTitle: "常駐の専門エージェントを作成",
+      bindTitle: "サブエージェントを常駐に設定",
+      unbindTitle: "常駐設定を解除しますか？",
+      resetTitle: "エージェントのセッションをリセットしますか？",
+      profile: "エージェントプロファイル",
+      role: "役割",
+      roleSlug: "役割の識別子",
+      urgentReport: "緊急報告",
+      keepAlive: "稼働を維持",
+      interrupt: "現在の作業を中断",
+      clearVisibleTimeline: "表示中のタイムラインを消去",
+      resetDescription: "エージェントの識別情報を保持したまま、新しいセッションを開始します。",
+      clearVisibleTimelineDescription:
+        "このエージェントのタイムラインに表示されるメッセージを消去します。",
+      unbindDescription: "通常のサブエージェントとして、親エージェントとの関連付けは維持されます。",
+      confirmCreate: "専門エージェントを作成",
+      confirmBind: "常駐に設定",
+      confirmUnbind: "常駐設定を解除",
+      confirmReset: "セッションをリセット",
+      emptyProfiles: "先にホスト設定でエージェントプロファイルを追加してください。",
+      updateHost:
+        "常駐の専門エージェントの利用やセッションのリセットには、ホストの更新が必要です。",
+      error: "操作に失敗しました：{{message}}",
+    },
     parent: {
       backToParent: "親に戻る",
       backTo: "{{label}} に戻る",
@@ -3112,6 +3142,20 @@ export const ja: TranslationResources = {
           "プロファイルがまだありません。特定のコマンドでターミナルを起動するために追加してください。",
       },
       agentProfiles: {
+        residentRole: {
+          slug: "役割の識別子",
+          slugHint:
+            "最大 {{max}} 文字。先頭と末尾は半角小文字または数字にし、途中には - や _ も使えます。",
+          slugError: "識別子の長さと形式を確認してください。",
+          prompt: "役割のプロンプト",
+          promptHint:
+            "create_agent ツールがこのプロファイルを使うとき、このプロファイルから常駐の専門エージェントを作成するとき、または関連するセッションをリセットするときに使われます。",
+          promptError: "{{max}} 文字以内で入力してください。",
+          defaults: "常駐時の既定値",
+          defaultResident: "既定で常駐にする",
+          urgentReport: "緊急報告",
+          keepAlive: "稼働を維持",
+        },
         sectionTitle: "エージェントプロファイル",
         unavailable: "エージェントプロファイルを管理するにはこのホストに接続してください",
         unsupported: "このホストで動作するデーモンはまだエージェントプロファイルに対応していません",

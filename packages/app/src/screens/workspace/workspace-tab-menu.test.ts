@@ -80,6 +80,15 @@ describe("main tab menu", () => {
       expect(
         buildWorkspaceTabMenuEntries(input).find((entry) => entry.key === "toggle-main-tab"),
       ).toBeUndefined();
+
+      const openResidentDialog = vi.fn();
+      const resident = buildWorkspaceTabMenuEntries({
+        ...input,
+        residentActions: [{ action: "reset", onSelect: openResidentDialog }],
+      }).find((entry) => entry.key === "resident-reset");
+      expect(resident).toMatchObject({ kind: "item", icon: "rotate-cw" });
+      if (resident?.kind === "item") resident.onSelect();
+      expect(openResidentDialog).toHaveBeenCalledOnce();
     },
   );
 

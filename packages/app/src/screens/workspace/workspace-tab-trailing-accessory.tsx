@@ -12,7 +12,9 @@ import {
   ExternalLink,
   GitMerge,
   Pencil,
+  Plus,
   RotateCw,
+  Unlink,
   X,
 } from "lucide-react-native";
 import { CrownOffIcon } from "@/components/icons/crown-off-icon";
@@ -38,6 +40,8 @@ const ThemedArrowRightToLine = withUnistyles(ArrowRightToLine);
 const ThemedCopyX = withUnistyles(CopyX);
 const ThemedExternalLink = withUnistyles(ExternalLink);
 const ThemedPencil = withUnistyles(Pencil);
+const ThemedPlus = withUnistyles(Plus);
+const ThemedUnlink = withUnistyles(Unlink);
 const ThemedX = withUnistyles(X);
 
 const mutedColorMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
@@ -76,6 +80,10 @@ function MobileTabDropdownMenuItem({
         return <ThemedExternalLink size={16} uniProps={mutedColorMapping} />;
       case "pencil":
         return <ThemedPencil size={16} uniProps={mutedColorMapping} />;
+      case "plus":
+        return <ThemedPlus size={16} uniProps={mutedColorMapping} />;
+      case "unlink":
+        return <ThemedUnlink size={16} uniProps={mutedColorMapping} />;
       case "x":
         return <ThemedX size={16} uniProps={mutedColorMapping} />;
     }

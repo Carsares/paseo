@@ -296,13 +296,13 @@ function createRealOutcomeHarness(input: {
     github: createGitHubServiceStub(),
     agentManager: {
       listAgents: () => [],
-      archiveAgent: vi.fn(async () => ({ archivedAt: new Date().toISOString() })),
-      archiveSnapshot: vi.fn(async () => {
-        throw new Error("not expected without stored agents");
+      archiveAgentForWorkspace: vi.fn(async () => {
+        throw new Error("not expected for empty agent list");
       }),
     } as unknown as AutoArchiveArchiveOptions["agentManager"],
     agentStorage: {
-      list: async (): Promise<StoredAgentRecord[]> => [],
+      listActive: async (): Promise<StoredAgentRecord[]> => [],
+      listByWorkspace: async (): Promise<StoredAgentRecord[]> => [],
     } as unknown as AutoArchiveArchiveOptions["agentStorage"],
     terminalManager: {
       listDirectories: () => [],

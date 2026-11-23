@@ -14,6 +14,7 @@ class Runtime {
   busy = false;
   closed = false;
   resumable = true;
+  keepAlive = false;
   activity = 0;
   parentAgentId: string | undefined;
   probe: (() => Promise<boolean>) | undefined;
@@ -28,6 +29,7 @@ class Runtime {
       parentAgentId: this.parentAgentId,
       provider: "test",
       sessionId: this.resumable ? this.id : null,
+      keepAlive: this.keepAlive,
       lastActivityAt: activity,
       isEligible: () => !this.closed && !this.busy && this.activity === activity,
       canStopRuntime: this.probe,
@@ -89,6 +91,16 @@ test("activity restarts the single one-hour idle period", async () => {
   s.runtime.activity = 59 * 60_000;
   expect((await s.sweep(118)).collected).toEqual([]);
   expect((await s.sweep(119)).collected).toHaveLength(1);
+});
+
+test("keep-alive protects a child without preventing collection of its parent", async () => {
+  const s = scenario();
+  const child = new Runtime("child");
+  child.parentAgentId = s.runtime.id;
+  child.keepAlive = true;
+  s.runtimes.push(child);
+  expect((await s.sweep(60)).collected.map(({ agentId }) => agentId)).toEqual([s.runtime.id]);
+  expect(child.closed).toBe(false);
 });
 
 test.each(["foreground", "finish subscription"])(

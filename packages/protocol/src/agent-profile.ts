@@ -1,13 +1,15 @@
 import { z } from "zod";
+import { RESIDENT_ROLE_SLUG_MAX_LENGTH, RESIDENT_ROLE_SLUG_PATTERN } from "./agent-labels.js";
+
+export const ResidentRoleSlugSchema = z
+  .string()
+  .max(RESIDENT_ROLE_SLUG_MAX_LENGTH)
+  .regex(RESIDENT_ROLE_SLUG_PATTERN);
 
 /**
- * A named launch bundle: a provider plus the agent-config values a client would
- * otherwise set one control at a time. Field names mirror `AgentSessionConfig`
- * so applying a profile is a copy rather than a translation table.
- *
- * There is deliberately no system prompt here. `AgentSessionConfig.systemPrompt`
- * is creation-only, so a profile carrying one would apply when starting a new
- * agent and silently do nothing when applied to a running one.
+ * A named provider configuration with optional role defaults. Provider settings
+ * mirror AgentSessionConfig. The role prompt is for starting a specialist and
+ * is separate from the provider's live configuration.
  */
 export const AgentProfileSchema = z
   .object({
@@ -27,6 +29,11 @@ export const AgentProfileSchema = z
     options: z.record(z.string(), z.unknown()).optional(),
     /** Free text, surfaced to orchestrating agents by the `list_profiles` MCP tool. */
     notes: z.string().optional(),
+    roleSlug: ResidentRoleSlugSchema.optional(),
+    rolePrompt: z.string().max(16384).optional(),
+    defaultResident: z.boolean().optional(),
+    residentUrgentReport: z.boolean().optional(),
+    residentKeepAlive: z.boolean().optional(),
   })
   .passthrough();
 

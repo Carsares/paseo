@@ -383,7 +383,7 @@ describe("agent-scoped archive_agent", () => {
   });
 
   test("applies existing cascade rules after admitting the direct target", async () => {
-    const { id: parentId } = await create();
+    const { id: parentId } = await create({}, "workspace");
     const { id } = await create({ [PARENT_AGENT_ID_LABEL]: parentId });
     const { id: openChildId } = await create({
       [PARENT_AGENT_ID_LABEL]: parentId,

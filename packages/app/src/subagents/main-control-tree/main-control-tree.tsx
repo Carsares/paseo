@@ -28,6 +28,7 @@ import {
   type MainControlWorkspaceSections,
   selectMainControlWorkspaceSections,
 } from "./select-tree";
+import { useCreateResidentAction } from "../resident-dialog";
 import { useWorkspaceArchivedAgents } from "./use-workspace-archived-agents";
 
 const iconColor = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
@@ -71,6 +72,7 @@ export function MainControlTreeLayout({
       workspaceId,
       workspaceKey,
     });
+  const createResident = useCreateResidentAction(serverId, mainAgentId);
 
   const isChinese = i18n.language?.startsWith("zh") === true;
   const showLabel = isChinese ? "显示会话目录" : "Show sessions";
@@ -146,6 +148,7 @@ export function MainControlTreeLayout({
           onToggleClosed={toggleClosed}
           onHide={hideTree}
           onOpen={openNode}
+          onCreateResident={createResident}
         />
       ) : null}
       <View style={styles.content}>
@@ -280,6 +283,7 @@ function MainControlDirectory({
   onToggleClosed,
   onHide,
   onOpen,
+  onCreateResident,
 }: {
   sections: MainControlWorkspaceSections;
   isChinese: boolean;
@@ -295,7 +299,9 @@ function MainControlDirectory({
   onToggleClosed: () => void;
   onHide: () => void;
   onOpen: (node: MainControlTreeNode) => void;
+  onCreateResident?: () => void;
 }) {
+  const { t } = useTranslation();
   const expandedState = useMemo(() => ({ expanded: closedExpanded }), [closedExpanded]);
   const expandLabel = isChinese ? "展开全部会话" : "Expand all sessions";
   const collapseLabel = isChinese ? "收起已关闭" : "Collapse closed";
@@ -329,6 +335,43 @@ function MainControlDirectory({
       </View>
       <ScrollView keyboardShouldPersistTaps="handled">
         <View style={styles.tree}>
+          {sections.residentGroups.length || onCreateResident ? (
+            <>
+              <View style={styles.sectionHeading}>
+                <Text accessibilityRole="header" style={styles.sectionTitle}>
+                  {t("subagents.resident.groupTitle")}
+                </Text>
+              </View>
+              {onCreateResident ? (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  style={styles.toggle}
+                  onPress={onCreateResident}
+                  testID="main-control-tree-create-resident"
+                >
+                  {t("subagents.resident.createAction")}
+                </Button>
+              ) : null}
+              {sections.residentGroups.map((group) => (
+                <View key={group.parent ? mainControlTreeNodeKey(group.parent) : "standalone"}>
+                  <View style={styles.sectionHeading}>
+                    <Text numberOfLines={1} accessibilityRole="header" style={styles.rowMeta}>
+                      {group.parentTitle ?? (isChinese ? "独立" : "Standalone")}
+                    </Text>
+                  </View>
+                  {group.nodes.map((node) => (
+                    <MainControlTreeRow
+                      key={mainControlTreeNodeKey(node)}
+                      node={node}
+                      isChinese={isChinese}
+                      onOpen={onOpen}
+                    />
+                  ))}
+                </View>
+              ))}
+            </>
+          ) : null}
           <View style={styles.sectionHeading}>
             <Text accessibilityRole="header" style={styles.sectionTitle}>
               {isChinese ? "活跃中" : "Active"} ({sections.active.length})
@@ -397,7 +440,8 @@ function MainControlTreeRow({
   isChinese: boolean;
   onOpen: (node: MainControlTreeNode) => void;
 }) {
-  const { agentId, depth, title, processState, roleBadge } = node;
+  const { agentId, depth, title, processState, roleBadge, residentRole } = node;
+  const label = residentRole ?? title;
   const open = useCallback(() => onOpen(node), [node, onOpen]);
   let statusLabel: string;
   if (processState === "running") statusLabel = isChinese ? "运行中" : "Running";
@@ -412,7 +456,7 @@ function MainControlTreeRow({
       testID={`main-control-tree-row-${agentId}`}
       accessibilityRole="button"
       accessibilityLabel={
-        roleLabel ? `${title}, ${roleLabel}, ${statusLabel}` : `${title}, ${statusLabel}`
+        roleLabel ? `${label}, ${roleLabel}, ${statusLabel}` : `${label}, ${statusLabel}`
       }
       style={[styles.row, depth === 1 && styles.levelTwo, depth === 2 && styles.levelThree]}
       highlightStyle={styles.rowHighlight}
@@ -420,7 +464,7 @@ function MainControlTreeRow({
     >
       <View style={styles.rowHeading}>
         <Text numberOfLines={1} ellipsizeMode="tail" style={styles.nodeTitle}>
-          {title}
+          {label}
         </Text>
         {roleLabel ? <StatusBadge size="xs" variant="muted" label={roleLabel} /> : null}
       </View>
