@@ -28,6 +28,11 @@ export const en = {
     position: "{{current}} of {{total}}",
     total: "{{total}} matches",
   },
+  assistantFileLink: {
+    searching: "Looking up…",
+    unconfirmed: "Could not locate in this workspace",
+    opensFirst: "Multiple matches. Opens this path by default.",
+  },
   common: {
     bottomSheetBackdrop: "Bottom sheet backdrop",
     back: "Back",

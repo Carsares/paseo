@@ -30,6 +30,11 @@ export const zhCN: TranslationResources = {
     position: "{{current}} / {{total}}",
     total: "{{total}} 个匹配项",
   },
+  assistantFileLink: {
+    searching: "查找中…",
+    unconfirmed: "当前工作区未定位到",
+    opensFirst: "找到多个匹配项，默认打开此路径。",
+  },
   common: {
     bottomSheetBackdrop: "底部面板背景",
     back: "返回",

@@ -14,6 +14,8 @@ export interface InlinePathTarget {
   path: string;
   lineStart?: number;
   lineEnd?: number;
+  /** The Markdown resolver already attempted the workspace suffix search. */
+  workspaceLookupComplete?: true;
 }
 
 const FILE_PROTOCOL = "file:";

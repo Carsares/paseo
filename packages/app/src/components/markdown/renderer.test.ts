@@ -682,10 +682,9 @@ it("keeps diagram identity when an earlier workspace image resolves", async () =
   expect(after?.id).toBe(before?.id);
 });
 
-it("keeps workspace-relative hover titles on explicit absolute file links", () => {
-  expect(prepareMarkdownSource("[Open](/repo/src/file.ts:42-45)", "/repo").render()).toBe(
-    '[Open](/repo/src/file.ts:42-45 "src/file.ts:42-45")',
-  );
+it("preserves absolute file hrefs without injecting Markdown titles", () => {
+  const source = "[Open](/repo/src/file.ts:42-45)";
+  expect(prepareMarkdownSource(source, "/repo").render()).toBe(source);
 });
 
 it.each(['""', "''", "()"])("preserves an authored empty link title: %s", (title) => {

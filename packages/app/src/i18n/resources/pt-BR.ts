@@ -31,6 +31,11 @@ export const ptBR: TranslationResources = {
     position: "{{current}} de {{total}}",
     total: "{{total}} correspondências",
   },
+  assistantFileLink: {
+    searching: "Buscando…",
+    unconfirmed: "Não foi possível localizar neste espaço de trabalho",
+    opensFirst: "Há várias correspondências. Este caminho é aberto por padrão.",
+  },
   common: {
     bottomSheetBackdrop: "Fundo do painel inferior",
     back: "Voltar",

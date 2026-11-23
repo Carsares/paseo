@@ -79,7 +79,7 @@ export function createInlinePathOpener(input: {
         input.openOutsideDirectory(destination.directoryPath);
       } else if (normalized.file) {
         const resolvedTarget =
-          input.resolveRelativeFiles && input.client
+          input.resolveRelativeFiles && input.client && !target.workspaceLookupComplete
             ? await resolveMissingNestedRelativeFile({
                 target,
                 workspaceRoot: input.workspaceRoot,

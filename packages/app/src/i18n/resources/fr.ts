@@ -31,6 +31,11 @@ export const fr: TranslationResources = {
     position: "{{current}} sur {{total}}",
     total: "{{total}} résultats",
   },
+  assistantFileLink: {
+    searching: "Recherche en cours…",
+    unconfirmed: "Introuvable dans cet espace de travail",
+    opensFirst: "Plusieurs résultats correspondent. Ce chemin s’ouvre par défaut.",
+  },
   common: {
     bottomSheetBackdrop: "Arrière-plan du panneau inférieur",
     back: "Retour",

@@ -7,7 +7,8 @@ import React, { useCallback, useMemo, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ToastApi } from "@/components/toast-host";
 import type { InlinePathTarget } from "./parse";
-import { AssistantFileLinkResolverProvider } from "./provider";
+import { createInlinePathOpener } from "./path-open";
+import { AssistantFileLinkResolverProvider, type AssistantFileLinkDaemonClient } from "./provider";
 import type { DirectorySuggestionResult } from "./resolver";
 import { useFileLink } from "./use-file-link";
 import type { OpenFileDisposition } from "@/workspace/file-open";
@@ -60,6 +61,7 @@ interface OpenedFile {
 }
 
 interface TestClient {
+  listDirectory?: (cwd: string, path: string) => Promise<unknown>;
   getDirectorySuggestions: (input: {
     query: string;
     cwd: string;
@@ -87,12 +89,20 @@ function createToast(): ToastApi {
   };
 }
 
-function createWrapper(input: { client: TestClient; openedFiles: OpenedFile[]; toast?: ToastApi }) {
-  const queryClient = createQueryClient();
+function createWrapper(input: {
+  client?: TestClient;
+  openedFiles: OpenedFile[];
+  toast?: ToastApi;
+  queryClient?: QueryClient;
+  relativePathBase?: string;
+  onOpen?: (target: InlinePathTarget, disposition: OpenFileDisposition) => void;
+}) {
+  const queryClient = input.queryClient ?? createQueryClient();
   return function Wrapper({ children }: { children: ReactNode }) {
     const openWorkspaceFile = useCallback(
       (target: InlinePathTarget, disposition: OpenFileDisposition) => {
         input.openedFiles.push({ target, disposition });
+        input.onOpen?.(target, disposition);
       },
       [],
     );
@@ -103,6 +113,7 @@ function createWrapper(input: { client: TestClient; openedFiles: OpenedFile[]; t
           client={input.client}
           serverId="server-1"
           workspaceRoot="/Users/test/project"
+          relativePathBase={input.relativePathBase}
           onOpenWorkspaceFile={openWorkspaceFile}
           toast={input.toast}
         >
@@ -196,6 +207,7 @@ describe("useFileLink", () => {
             path: "/Users/test/project/docs/dumm.md",
             lineStart: undefined,
             lineEnd: undefined,
+            workspaceLookupComplete: true,
           },
           disposition: "preferred",
         },
@@ -240,7 +252,7 @@ describe("useFileLink", () => {
     const { result } = renderHook(
       () => ({
         first: useFileLink(SOURCE),
-        second: useFileLink(SOURCE),
+        second: useFileLink({ href: "dumm.md:9-12", markup: "linkify" }),
       }),
       {
         wrapper: createWrapper({
@@ -257,11 +269,193 @@ describe("useFileLink", () => {
     await waitFor(() => {
       expect(getDirectorySuggestions).toHaveBeenCalledTimes(1);
     });
+    expect(result.current.first.tooltipPath).toBe("dumm.md");
+    expect(result.current.first.tooltipDetail).toBe("Looking up…");
+    expect(result.current.second.tooltipPath).toBe("dumm.md:9-12");
     deferred.resolve(resolvedSuggestions([{ path: "docs/dumm.md", kind: "file" }]));
     await waitFor(() => {
       expect(result.current.first.target?.path).toBe("/Users/test/project/docs/dumm.md");
       expect(result.current.second.target?.path).toBe("/Users/test/project/docs/dumm.md");
+      expect(result.current.second.tooltipPath).toBe("docs/dumm.md:9-12");
     });
+  });
+
+  it.each([false, true])(
+    "keeps the original reference when a lookup is unconfirmed (offline: %s)",
+    async (offline) => {
+      const client = offline
+        ? undefined
+        : { getDirectorySuggestions: async () => resolvedSuggestions([]) };
+      const { result } = renderHook(() => useFileLink(SOURCE), {
+        wrapper: createWrapper({ client, openedFiles: [] }),
+      });
+      act(() => result.current.onHoverIn());
+      await waitFor(() => {
+        expect(result.current).toMatchObject({
+          target: null,
+          tooltipPath: "dumm.md",
+          tooltipDetail: "Could not locate in this workspace",
+        });
+      });
+    },
+  );
+
+  it("shows the fallback while disconnected and looks up again on the same client after reconnecting", async () => {
+    type State = ReturnType<NonNullable<AssistantFileLinkDaemonClient["getConnectionState"]>>;
+    let state: State = { status: "connected" };
+    const listeners = new Set<(next: State) => void>();
+    const stale = createDeferred<DirectorySuggestionResult>();
+    const suggestions = vi
+      .fn()
+      .mockImplementationOnce(() => stale.promise)
+      .mockResolvedValue(resolvedSuggestions([{ path: "new/dumm.md", kind: "file" }]));
+    const client = {
+      getConnectionState: () => state,
+      subscribeConnectionStatus: (listener: (next: State) => void) => {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+      getDirectorySuggestions: suggestions,
+    };
+    const setConnection = (next: State) => {
+      state = next;
+      for (const listener of listeners) listener(state);
+    };
+    const openedFiles: OpenedFile[] = [];
+    const { result } = renderHook(() => useFileLink(SOURCE), {
+      wrapper: createWrapper({ client, openedFiles }),
+    });
+    act(() => result.current.onPress());
+    expect(suggestions).toHaveBeenCalledTimes(1);
+    act(() => setConnection({ status: "connecting", attempt: 1 }));
+    expect(result.current.tooltipDetail).toBe("Could not locate in this workspace");
+    act(() => result.current.onHoverIn());
+    expect(suggestions).toHaveBeenCalledTimes(1);
+    act(() => setConnection({ status: "connected" }));
+    act(() => result.current.onHoverIn());
+    await waitFor(() => expect(result.current.tooltipPath).toBe("new/dumm.md"));
+    await resolveLookupAndDeliver(
+      stale,
+      resolvedSuggestions([{ path: "old/dumm.md", kind: "file" }]),
+    );
+    expect(openedFiles).toEqual([]);
+    expect(result.current.tooltipPath).toBe("new/dumm.md");
+    act(() => result.current.onPress());
+    await waitFor(() =>
+      expect(openedFiles[0]?.target.path).toBe("/Users/test/project/new/dumm.md"),
+    );
+    expect(suggestions).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["README.md", undefined, "./README.md", "/Users/test/project/README.md"],
+    ["guide.md", "/Users/test/project/docs", "docs/guide.md", "/Users/test/project/docs/guide.md"],
+  ] as const)(
+    "keeps the original authored path when %s only has a suffix match",
+    async (href, base, query, path) => {
+      const getDirectorySuggestions = vi.fn(async () =>
+        resolvedSuggestions([{ path: "other/" + query.replace(/^\.\//, ""), kind: "file" }]),
+      );
+      const open = vi.fn();
+      const { result } = renderHook(() => useFileLink({ href }), {
+        wrapper: createWrapper({
+          client: { getDirectorySuggestions },
+          openedFiles: [],
+          onOpen: open,
+          relativePathBase: base,
+        }),
+      });
+      act(() => result.current.onPress());
+      await waitFor(() =>
+        expect(open).toHaveBeenCalledWith(expect.objectContaining({ path }), "preferred"),
+      );
+      expect(result.current.tooltipPath).toBe(href);
+      expect(result.current.tooltipDetail).toBe("Could not locate in this workspace");
+      expect(getDirectorySuggestions).toHaveBeenCalledWith(expect.objectContaining({ query }));
+      getDirectorySuggestions.mockResolvedValue(
+        resolvedSuggestions([{ path: query.replace(/^\.\//, ""), kind: "file" }]),
+      );
+      act(() => result.current.onHoverIn());
+      await waitFor(() => expect(result.current.target?.path).toBe(path));
+    },
+  );
+
+  it("shows and opens the exact relative file before suffix matches", async () => {
+    const getDirectorySuggestions = vi.fn(async () =>
+      resolvedSuggestions([
+        { path: "schema/x.md", kind: "file" },
+        { path: "repo-a/schema/x.md", kind: "file" },
+      ]),
+    );
+    const listDirectory = vi.fn(async () => ({}));
+    const openedFiles: OpenedFile[] = [];
+    const { result } = renderHook(() => useFileLink({ href: "schema/x.md:12-14" }), {
+      wrapper: createWrapper({ client: { getDirectorySuggestions, listDirectory }, openedFiles }),
+    });
+    act(() => {
+      result.current.onHoverIn();
+      result.current.onPress();
+    });
+    await waitFor(() => {
+      expect(result.current.tooltipPath).toBe("schema/x.md:12-14");
+      expect(result.current.tooltipDetail).toBe("Multiple matches. Opens this path by default.");
+      expect(openedFiles[0]?.target).toMatchObject({
+        path: "/Users/test/project/schema/x.md",
+        lineStart: 12,
+        lineEnd: 14,
+      });
+    });
+    expect(getDirectorySuggestions).toHaveBeenCalledTimes(1);
+    expect(listDirectory).not.toHaveBeenCalled();
+  });
+
+  it("keeps an exact dotted directory ahead of a file with the same suffix", async () => {
+    const getDirectorySuggestions = vi.fn(async () =>
+      resolvedSuggestions([{ path: "repo-a/schema/docs.md", kind: "file" }]),
+    );
+    const listDirectory = vi.fn(async () => ({}));
+    const openedFiles: OpenedFile[] = [];
+    const { result } = renderHook(() => useFileLink({ href: "schema/docs.md" }), {
+      wrapper: createWrapper({ client: { getDirectorySuggestions, listDirectory }, openedFiles }),
+    });
+    act(() => result.current.onHoverIn());
+    await waitFor(() =>
+      expect(result.current.target?.path).toBe("/Users/test/project/schema/docs.md"),
+    );
+    act(() => result.current.onPress());
+    await waitFor(() =>
+      expect(openedFiles[0]?.target.path).toBe("/Users/test/project/schema/docs.md"),
+    );
+    expect(result.current.tooltipPath).toBe("schema/docs.md");
+    expect(listDirectory).toHaveBeenCalledExactlyOnceWith("/Users/test/project", "schema/docs.md");
+    expect(getDirectorySuggestions).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes an expired hover result before opening a file", async () => {
+    const dateNow = vi.spyOn(Date, "now");
+    const queryClient = createQueryClient();
+    const getDirectorySuggestions = vi
+      .fn()
+      .mockResolvedValueOnce(resolvedSuggestions([{ path: "old/dumm.md", kind: "file" }]))
+      .mockResolvedValueOnce(resolvedSuggestions([{ path: "new/dumm.md", kind: "file" }]));
+    const openedFiles: OpenedFile[] = [];
+    const { result } = renderHook(() => useFileLink(SOURCE), {
+      wrapper: createWrapper({ client: { getDirectorySuggestions }, openedFiles, queryClient }),
+    });
+    try {
+      act(() => result.current.onHoverIn());
+      await waitFor(() => expect(result.current.tooltipPath).toBe("old/dumm.md"));
+      dateNow.mockReturnValue(Date.now() + 46_000);
+      act(() => result.current.onPress());
+      await waitFor(() =>
+        expect(openedFiles[0]?.target.path).toBe("/Users/test/project/new/dumm.md"),
+      );
+      expect(getDirectorySuggestions).toHaveBeenCalledTimes(2);
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 
   it("hover then click uses the prefetched result", async () => {
@@ -289,6 +483,40 @@ describe("useFileLink", () => {
     await waitFor(() => {
       expect(openedFiles).toHaveLength(1);
     });
+    expect(getDirectorySuggestions).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens a resolved bare reference without the chat opener starting another suffix lookup", async () => {
+    const workspaceRoot = "/Users/test/project";
+    const getDirectorySuggestions = vi.fn(async () =>
+      resolvedSuggestions([{ path: "docs/dumm.md", kind: "file" }]),
+    );
+    const listDirectory = vi.fn(async () => {
+      throw new Error("Not a directory");
+    });
+    const client = { getDirectorySuggestions, listDirectory };
+    const openFile = vi.fn();
+    const opener = createInlinePathOpener({
+      workspaceRoot,
+      resolveRelativeFiles: true,
+      client,
+      openFile,
+      openDirectory: vi.fn(),
+      openOutsideDirectory: vi.fn(),
+    });
+    const { result } = renderHook(
+      () => useFileLink({ href: "dumm.md:4-7", sourceType: "inline-code" }),
+      { wrapper: createWrapper({ client, openedFiles: [], onOpen: opener.open }) },
+    );
+    act(() => result.current.onHoverIn());
+    await waitFor(() => expect(result.current.tooltipPath).toBe("docs/dumm.md:4-7"));
+    act(() => result.current.onPress());
+    await waitFor(() =>
+      expect(openFile).toHaveBeenCalledExactlyOnceWith(
+        { path: "docs/dumm.md", lineStart: 4, lineEnd: 7 },
+        "preferred",
+      ),
+    );
     expect(getDirectorySuggestions).toHaveBeenCalledTimes(1);
   });
 

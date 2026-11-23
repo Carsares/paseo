@@ -31,6 +31,11 @@ export const ja: TranslationResources = {
     position: "{{current}} / {{total}}",
     total: "{{total}} 件の一致",
   },
+  assistantFileLink: {
+    searching: "検索中…",
+    unconfirmed: "現在のワークスペースでは見つかりませんでした",
+    opensFirst: "複数の候補があります。既定ではこのパスが開きます。",
+  },
   common: {
     bottomSheetBackdrop: "ボトムシートの背景",
     back: "戻る",

@@ -1,4 +1,5 @@
 import { Text } from "react-native";
+import { pluginOverviewPolicy, pluginOverviewUrl } from "@getpaseo/protocol/plugin-overview";
 import { forwardRef, useCallback, useMemo, useState, type ComponentProps } from "react";
 import type {
   CodeBlockRendererProps,
@@ -32,15 +33,67 @@ function WebCodeBlock({ code, language }: CodeBlockRendererProps) {
 
 // The library styles links inline, so a stylesheet :hover rule cannot underline them.
 const LINK_HOVER_STYLE = { textDecoration: "underline" } as const;
+const TOOLTIP_TEXT_WEB_STYLE = {
+  display: "block",
+  maxWidth: "calc(100vw - 40px)",
+  whiteSpace: "pre-line",
+  overflowWrap: "anywhere",
+} as const;
 
 function WebLink({ link, anchorProps, children }: LinkRendererProps) {
   const forgeShorthand = useForgeShorthand();
   // A forge reference like `#12` carries its web URL so hover, copy and new-tab opens work.
   const forgeUrl = link.sourceType === "text" ? forgeShorthand?.resolve(link.url) : null;
-  const { tooltipPath, onHoverIn } = useFileLink(
+  const { tooltipPath, tooltipDetail, onHoverIn } = useFileLink(
     forgeUrl ? markdownLinkSource(forgeUrl) : markdownLinkSource(link.url, link.sourceType),
   );
-  const tooltip = forgeUrl ?? tooltipPath;
+  const webUrl = /^https?:\/\//i.test(link.url) ? link.url : undefined;
+  return (
+    <LinkWithTooltip
+      link={link}
+      anchorProps={anchorProps}
+      href={forgeUrl ?? anchorProps.href}
+      destination={forgeUrl ?? tooltipPath ?? webUrl}
+      detail={tooltipDetail}
+      onInspect={onHoverIn}
+    >
+      {children}
+    </LinkWithTooltip>
+  );
+}
+
+function ExternalWebLink({ link, anchorProps, children }: LinkRendererProps) {
+  // Native clicks go through onLinkPress. On web the browser can also open href
+  // directly from its context menu or on auxiliary click.
+  const href = pluginOverviewUrl(link.url);
+  if (!href) return children;
+  return (
+    <LinkWithTooltip link={link} anchorProps={anchorProps} href={href} destination={href} external>
+      {children}
+    </LinkWithTooltip>
+  );
+}
+
+function LinkWithTooltip({
+  link,
+  anchorProps,
+  children,
+  href,
+  destination,
+  detail,
+  onInspect,
+  external = false,
+}: LinkRendererProps & {
+  href?: string;
+  destination?: string | null;
+  detail?: string | null;
+  onInspect?: () => void;
+  external?: boolean;
+}) {
+  const title = anchorProps.title;
+  const tooltip = [destination, detail, title !== destination ? title : null]
+    .filter(Boolean)
+    .join("\n");
   const [hovered, setHovered] = useState(false);
   const handleMouseEnter = useCallback(() => setHovered(true), []);
   const handleMouseLeave = useCallback(() => setHovered(false), []);
@@ -65,7 +118,9 @@ function WebLink({ link, anchorProps, children }: LinkRendererProps) {
   const anchor = (
     <a
       {...copyAnchorProps}
-      href={forgeUrl ?? anchorProps.href}
+      {...(external ? pluginOverviewPolicy.link : undefined)}
+      href={href}
+      title={undefined}
       style={anchorStyle}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
@@ -74,14 +129,14 @@ function WebLink({ link, anchorProps, children }: LinkRendererProps) {
     </a>
   );
   return (
-    <Tooltip delayDuration={400}>
-      <TooltipTrigger asChild onHoverIn={onHoverIn}>
+    <Tooltip delayDuration={400} enabledOnCompactWeb>
+      <TooltipTrigger asChild onHoverIn={onInspect} onFocus={onInspect}>
         <InlineLinkTrigger>{anchor}</InlineLinkTrigger>
       </TooltipTrigger>
       {tooltip ? (
         <TooltipContent side="top" align="start" maxWidth={520}>
           <Text selectable={false} style={styles.tooltipPath}>
-            {tooltip}
+            <span style={TOOLTIP_TEXT_WEB_STYLE}>{tooltip}</span>
           </Text>
         </TooltipContent>
       ) : null}
@@ -113,4 +168,9 @@ const styles = StyleSheet.create((theme) => ({
   },
 }));
 
-export const WEB_RENDERERS: MarkdownRenderers = { codeBlock: WebCodeBlock, link: WebLink };
+const WEB_RENDERERS: MarkdownRenderers = { codeBlock: WebCodeBlock, link: WebLink };
+const EXTERNAL_WEB_RENDERERS: MarkdownRenderers = { ...WEB_RENDERERS, link: ExternalWebLink };
+
+export function getWebRenderers(external: boolean): MarkdownRenderers {
+  return external ? EXTERNAL_WEB_RENDERERS : WEB_RENDERERS;
+}

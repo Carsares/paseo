@@ -30,6 +30,11 @@ export const ko: TranslationResources = {
     position: "{{current}} / {{total}}",
     total: "일치 항목 {{total}}개",
   },
+  assistantFileLink: {
+    searching: "찾는 중…",
+    unconfirmed: "현재 작업 공간에서 찾을 수 없음",
+    opensFirst: "일치하는 항목이 여러 개 있습니다. 기본적으로 이 경로를 엽니다.",
+  },
   common: {
     bottomSheetBackdrop: "하단 시트 배경",
     back: "뒤로",

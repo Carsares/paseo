@@ -30,6 +30,11 @@ export const ar: TranslationResources = {
     position: "{{current}} من {{total}}",
     total: "{{total}} تطابقات",
   },
+  assistantFileLink: {
+    searching: "جارٍ البحث…",
+    unconfirmed: "تعذر تحديد الموقع في مساحة العمل هذه",
+    opensFirst: "توجد عدة نتائج مطابقة. يُفتح هذا المسار افتراضيًا.",
+  },
   common: {
     bottomSheetBackdrop: "خلفية اللوحة السفلية",
     back: "خلف",

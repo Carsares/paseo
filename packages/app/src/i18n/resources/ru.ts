@@ -31,6 +31,11 @@ export const ru: TranslationResources = {
     position: "{{current}} из {{total}}",
     total: "Совпадений: {{total}}",
   },
+  assistantFileLink: {
+    searching: "Поиск…",
+    unconfirmed: "Не удалось найти в этом рабочем пространстве",
+    opensFirst: "Найдено несколько совпадений. По умолчанию открывается этот путь.",
+  },
   common: {
     bottomSheetBackdrop: "Фон нижней панели",
     back: "Назад",

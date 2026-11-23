@@ -7,7 +7,7 @@ import { gfmTableFromMarkdown } from "mdast-util-gfm-table";
 import type { AssistantFileLinkSource } from "@/assistant-file-links";
 import { decodeString } from "micromark-util-decode-string";
 import { fromMarkdown } from "mdast-util-from-markdown";
-import type { Link, Nodes, Paragraph, PhrasingContent, Root } from "mdast";
+import type { Nodes, Paragraph, PhrasingContent, Root } from "mdast";
 
 // Keep this regex in the syntax shared by JavaScript, ICU and java.util.regex.
 // The Unicode flag makes Metro expand it to escapes rejected by native engines.
@@ -142,14 +142,6 @@ export interface MarkdownImage {
   end: number;
 }
 
-function workspaceHoverTitle(link: Link, markup: string, workspaceRoot?: string): string | null {
-  if (link.title !== null || !workspaceRoot || !link.url.startsWith(`${workspaceRoot}/`))
-    return null;
-  // mdast represents both missing titles and authored empty titles as null.
-  if (/\s(?:""|''|\(\))\s*\)$/.test(markup)) return null;
-  return link.url.slice(workspaceRoot.length + 1);
-}
-
 /** Preserve source spelling; adapt workspace images, spoiler delimiters, and entity text. */
 export function prepareMarkdownSource(
   source: string,
@@ -191,7 +183,6 @@ export function prepareMarkdownSource(
     !/^[\t >]*[^\t >\r\n][^\r\n]*(?:\r\n|\r|\n)[^\r\n]+(?:\r\n|\r|\n)(?=[\t >:|-]*\|)[\t >|]*:?-[-\t :|]*$/m.test(
       source,
     ) &&
-    !(workspaceRoot && source.includes("](")) &&
     !(external && /\]|<[a-z]+:/i.test(source))
   ) {
     return { images, ...metadata, render: () => source };
@@ -302,11 +293,6 @@ export function prepareMarkdownSource(
         edits.push({ start: boundary, end: lineStart, text: `${newline}${blank}${newline}` });
       }
       if (external) dropUnsafeDestination(node, start, end);
-      if (node.type === "link") {
-        const title = workspaceHoverTitle(node, source.slice(start, end), workspaceRoot);
-        if (title !== null)
-          edits.push({ start: end - 1, end: end - 1, text: ` ${JSON.stringify(title)}` });
-      }
       if (node.type === "tableRow") {
         // MD4C's always-enabled spoiler extension otherwise consumes adjacent cell
         // delimiters. Spaces keep empty GFM cells empty without producing spoilers.

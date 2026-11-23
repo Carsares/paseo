@@ -26,16 +26,14 @@ it.each([
 ])("resolves authored href %s from its document directory", (href, expected) => {
   expect(
     classifyForResolution({ href }, { workspaceRoot: "/repo", relativePathBase: "/repo/docs" }),
-  ).toMatchObject({ kind: "resolved", value: { kind: "file", target: { path: expected } } });
+  ).toMatchObject({ kind: "needsLookup", target: { path: expected } });
 });
 
 it.each([
-  ["C:/repo/docs", "../README.md", "C:/repo/README.md"],
   ["C:/repo/docs", "../../", "C:/"],
   ["~/.paseo/docs", "../guide.md", "~/.paseo/guide.md"],
   ["/repo/docs", "/other/file.md", "/other/file.md"],
   ["/repo/docs", "file:///other/file.md", "/other/file.md"],
-  ["/repo/docs", "guide/details.md#L3", "/repo/docs/guide/details.md"],
 ])(
   "resolves %s with href %s without changing absolute destinations",
   (relativePathBase, href, expected) => {
@@ -51,27 +49,35 @@ it.each([
 it("keeps inferred paths and chat links rooted at the workspace", () => {
   const context = { workspaceRoot: "/repo", relativePathBase: "/repo/docs" };
   expect(classifyForResolution({ href: "src/file.ts", markup: "linkify" }, context)).toMatchObject({
-    value: { kind: "file", target: { path: "/repo/src/file.ts" } },
+    target: { path: "/repo/src/file.ts" },
   });
   expect(
     classifyForResolution({ href: "guide/details.md" }, { workspaceRoot: "/repo" }),
   ).toMatchObject({
-    value: { kind: "file", target: { path: "/repo/guide/details.md" } },
+    target: { path: "/repo/guide/details.md" },
   });
   expect(classifyForResolution({ href: "https://example.com/docs" }, context)).toMatchObject({
     value: { kind: "external", url: "https://example.com/docs" },
   });
 });
 
-it.each(["docs/guides", "docs/guides/", "docs/%E6%8C%87%E5%8D%97"])(
-  "resolves an explicit extensionless folder href: %s",
+it("keeps a destination with a trailing slash direct", () => {
+  expect(classifyForResolution({ href: "docs/guides/" }, CONTEXT)).toMatchObject({
+    kind: "resolved",
+    value: { kind: "file", target: { path: `${CONTEXT.workspaceRoot}/docs/guides` } },
+  });
+});
+
+it.each(["docs/guides", "docs/%E6%8C%87%E5%8D%97"])(
+  "keeps the decoded destination for an authored folder href %s",
   (href) => {
+    const relative = decodeURIComponent(href);
     expect(classifyForResolution({ href }, CONTEXT)).toMatchObject({
-      kind: "resolved",
-      value: {
-        kind: "file",
-        target: { path: `${CONTEXT.workspaceRoot}/${decodeURIComponent(href).replace(/\/$/, "")}` },
-      },
+      kind: "needsLookup",
+      ambiguousQuery: relative,
+      keepDirectTarget: true,
+      exactOnly: true,
+      target: { path: `${CONTEXT.workspaceRoot}/${relative}` },
     });
   },
 );
@@ -113,10 +119,12 @@ it.each([
   "example.com/guides",
   "capture.png",
   "missing.png",
-])("opens explicit file link %s without filename guessing", (href) => {
+])("uses exact-first lookup for explicit path %s regardless of its extension", (href) => {
   expect(classifyForResolution({ href }, CONTEXT)).toMatchObject({
-    kind: "resolved",
-    value: { kind: "file", target: { path: `${CONTEXT.workspaceRoot}/${href}` } },
+    kind: "needsLookup",
+    ambiguousQuery: href.includes("/") ? href : "./" + href,
+    keepDirectTarget: true,
+    target: { path: `${CONTEXT.workspaceRoot}/${href}` },
   });
 });
 
@@ -129,11 +137,21 @@ it("opens the existing non-ASCII file named by a rendered markdown link", async 
     const href = tokens[0].children?.find((token) => token.type === "link_open")?.attrGet("href");
     expect(href).toBe("docs/reports/%E5%BC%80%E6%88%B7%E8%B5%A0%E9%87%91.md");
     const resolution = classifyForResolution({ href: href! }, { workspaceRoot });
-    expect(resolution.kind).toBe("resolved");
-    if (resolution.kind !== "resolved" || resolution.value.kind !== "file") {
-      throw new Error("Expected a directly resolved file link");
-    }
-    expect(await readFile(resolution.value.target.path, "utf8")).toBe("report content");
+    expect(resolution).toMatchObject({
+      kind: "needsLookup",
+      ambiguousQuery: "docs/reports/开户赠金.md",
+      target: { path: path.join(workspaceRoot, "docs/reports/开户赠金.md") },
+    });
+    if (resolution.kind !== "needsLookup") throw new Error("Expected a file lookup.");
+    const result = await fetchDaemonResolution({
+      ...resolution,
+      workspaceRoot,
+      getDirectorySuggestions: async ({ query, cwd }) => {
+        await readFile(path.join(cwd, query));
+        return resolvedSuggestions([{ path: query, kind: "file" }]);
+      },
+    });
+    expect(await readFile(result.path, "utf8")).toBe("report content");
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
   }
@@ -198,36 +216,19 @@ describe("classifyForResolution", () => {
       value: { kind: "file", target: { path: "C:/repo/my file.md", lineStart } },
     });
   });
-  it("returns the directFile target synchronously", () => {
-    const result = classifyForResolution({ href: "src/components/message.tsx#L33" }, CONTEXT);
-
-    expect(result).toEqual({
-      kind: "resolved",
-      value: {
-        kind: "file",
-        target: {
-          raw: "src/components/message.tsx#L33",
-          path: "/Users/test/project/src/components/message.tsx",
-          lineStart: 33,
-          lineEnd: undefined,
-        },
-      },
-    });
-  });
-
-  it("preserves line ranges on direct workspace files", () => {
-    const result = classifyForResolution({ href: "src/components/message.tsx:33-40" }, CONTEXT);
-
-    expect(result).toEqual({
-      kind: "resolved",
-      value: {
-        kind: "file",
-        target: {
-          raw: "src/components/message.tsx:33-40",
-          path: "/Users/test/project/src/components/message.tsx",
-          lineStart: 33,
-          lineEnd: 40,
-        },
+  it.each([
+    ["src/components/message.tsx#L33", 33, undefined],
+    ["src/components/message.tsx:33-40", 33, 40],
+  ])("keeps line references outside the lookup query for %s", (href, lineStart, lineEnd) => {
+    const result = classifyForResolution({ href }, CONTEXT);
+    expect(result).toMatchObject({
+      kind: "needsLookup",
+      ambiguousQuery: "src/components/message.tsx",
+      target: {
+        raw: href,
+        path: "/Users/test/project/src/components/message.tsx",
+        lineStart,
+        lineEnd,
       },
     });
   });
@@ -316,15 +317,15 @@ describe("classifyForResolution", () => {
     const result = classifyForResolution({ href: "docs/my%20file.md" }, CONTEXT);
 
     expect(result).toEqual({
-      kind: "resolved",
-      value: {
-        kind: "file",
-        target: {
-          raw: "docs/my%20file.md",
-          path: "/Users/test/project/docs/my file.md",
-          lineStart: undefined,
-          lineEnd: undefined,
-        },
+      kind: "needsLookup",
+      ambiguousQuery: "docs/my file.md",
+      keepDirectTarget: true,
+      token: "docs/my%20file.md",
+      target: {
+        raw: "docs/my%20file.md",
+        path: "/Users/test/project/docs/my file.md",
+        lineStart: undefined,
+        lineEnd: undefined,
       },
     });
   });

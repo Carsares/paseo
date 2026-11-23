@@ -52,6 +52,8 @@ export type AssistantFileLinkResolution =
       ambiguousQuery: string;
       token: string;
       target: InlinePathTarget;
+      keepDirectTarget?: true;
+      exactOnly?: true;
     };
 
 export interface FetchDaemonResolutionInput {
@@ -76,56 +78,87 @@ export async function fetchDaemonResolution({
   workspaceRoot,
   getDirectorySuggestions,
 }: FetchDaemonResolutionInput): Promise<InlinePathTarget> {
+  const { paths } = await fetchFileLinkMatches({
+    ambiguousQuery,
+    workspaceRoot,
+    getDirectorySuggestions,
+    limit: 1,
+  });
+  const path = paths[0];
+  if (!path) throw new UnresolvedFileLinkError(token);
+  return { ...target, path };
+}
+
+export async function fetchFileLinkMatches({
+  ambiguousQuery,
+  workspaceRoot,
+  getDirectorySuggestions,
+  isDirectory,
+  limit = 2,
+}: Pick<
+  FetchDaemonResolutionInput,
+  "ambiguousQuery" | "workspaceRoot" | "getDirectorySuggestions"
+> & {
+  isDirectory?: (cwd: string, path: string) => Promise<boolean>;
+  limit?: 1 | 2;
+}): Promise<{ paths: string[]; exactDirectory: boolean }> {
   const trimmedRoot = workspaceRoot?.trim();
-  if (!trimmedRoot) {
-    throw new UnresolvedFileLinkError(token);
-  }
+  if (!trimmedRoot) return { paths: [], exactDirectory: false };
 
-  let suggestions: DirectorySuggestionResult;
-  try {
-    suggestions = await getDirectorySuggestions({
-      query: ambiguousQuery,
-      cwd: trimmedRoot,
-      includeFiles: true,
-      includeDirectories: false,
-      matchMode: "suffix",
-      limit: 1,
-    });
-  } catch {
-    throw new UnresolvedFileLinkError(token);
-  }
-
-  const match = suggestions.entries.find((entry) => entry.kind === "file");
-  if (!match || suggestions.error) {
-    throw new UnresolvedFileLinkError(token);
-  }
-
+  const suggestions = await getDirectorySuggestions({
+    query: ambiguousQuery,
+    cwd: trimmedRoot,
+    includeFiles: true,
+    includeDirectories: false,
+    matchMode: "suffix",
+    limit,
+  }).catch(() => ({ entries: [], error: "Unavailable" }));
+  const files = suggestions.error
+    ? []
+    : suggestions.entries.filter((entry) => entry.kind === "file");
+  const directPath = ambiguousQuery.replace(/^\.\//, "");
+  // A dotted folder can have the same name as a file elsewhere. Preserve the
+  // existing preference for the exact directory on direct links without lines.
+  const exactDirectory =
+    isDirectory && ambiguousQuery.includes("/") && files[0]?.path !== directPath
+      ? await isDirectory(trimmedRoot, directPath)
+      : false;
   return {
-    ...target,
-    path: joinWorkspacePath(trimmedRoot, match.path),
+    paths: files.map((entry) => joinWorkspacePath(trimmedRoot, entry.path)),
+    exactDirectory,
   };
 }
 
-/** Only file-looking paths nested inside the workspace need suffix search. */
+/** Qualify inferred nested files and explicit workspace-relative destinations for exact lookup. */
 function nestedRelativeLookupQuery(
-  targetPath: string,
+  target: InlinePathTarget,
   workspaceRoot: string | undefined,
+  explicitLink = false,
 ): string | null {
   const root = workspaceRoot?.trim();
-  if (!root) {
+  if (
+    !root ||
+    isAbsoluteInlineCodeToken(target.raw) ||
+    /^~(?:[\\/]|$)/.test(target.raw) ||
+    /[\\/](?:#.*)?$/.test(target.raw)
+  ) {
     return null;
   }
   const normalizedRoot = root.replace(/\\/g, "/").replace(/\/+$/, "");
-  const normalizedPath = targetPath.replace(/\\/g, "/");
+  const normalizedPath = target.path.replace(/\\/g, "/");
   const prefix = `${normalizedRoot}/`;
   if (!normalizedPath.startsWith(prefix)) {
     return null;
   }
   const relative = normalizedPath.slice(prefix.length);
-  if (!relative.includes("/") || !isFileLookingAssistantToken(encodeURI(relative))) {
+  if (
+    !explicitLink &&
+    (!relative.includes("/") || !isFileLookingAssistantToken(encodeURI(relative)))
+  ) {
     return null;
   }
-  return relative;
+  // The daemon probes exact files for path queries before ranking suffixes.
+  return relative.includes("/") ? relative : `./${relative}`;
 }
 
 /** When a markdown link points at workspaceRoot/schema/x.md and that file is
@@ -138,14 +171,7 @@ export async function resolveMissingNestedRelativeFile(input: {
   workspaceRoot?: string;
   getDirectorySuggestions: GetDirectorySuggestions;
 }): Promise<InlinePathTarget> {
-  if (
-    isAbsoluteInlineCodeToken(input.target.raw) ||
-    input.target.raw.startsWith("~/") ||
-    input.target.raw.endsWith("/")
-  ) {
-    return input.target;
-  }
-  const query = nestedRelativeLookupQuery(input.target.path, input.workspaceRoot);
+  const query = nestedRelativeLookupQuery(input.target, input.workspaceRoot);
   if (!query) {
     return input.target;
   }
@@ -172,10 +198,11 @@ export function classifyForResolution(
     return { kind: "resolved", value: { kind: "ignored" } };
   }
 
+  const explicitLink = source.sourceType !== "inline-code" && !isLinkifiedSource(source);
   const classification = classifyAssistantFileLink(token, {
     workspaceRoot: context.workspaceRoot,
     decodeHref: tokenInfo.fromHref,
-    explicitLink: source.sourceType !== "inline-code" && !isLinkifiedSource(source),
+    explicitLink,
     relativePathBase: context.relativePathBase,
   });
   if (!classification) {
@@ -193,6 +220,24 @@ export function classifyForResolution(
       target: classification.target,
     })
   ) {
+    const query = nestedRelativeLookupQuery(
+      classification.target,
+      context.workspaceRoot,
+      explicitLink,
+    );
+    if (query) {
+      const exactOnly =
+        !!context.relativePathBase ||
+        !nestedRelativeLookupQuery(classification.target, context.workspaceRoot);
+      return {
+        kind: "needsLookup",
+        ambiguousQuery: query,
+        token,
+        target: classification.target,
+        keepDirectTarget: true,
+        ...(exactOnly ? { exactOnly: true } : {}),
+      };
+    }
     return { kind: "resolved", value: { kind: "file", target: classification.target } };
   }
 
@@ -282,7 +327,7 @@ function isLinkifiedSource(source: AssistantFileLinkSource): boolean {
 function joinWorkspacePath(workspaceRoot: string, relativePath: string): string {
   const root = workspaceRoot.replace(/\\/g, "/").replace(/\/+$/, "");
   const child = relativePath.replace(/\\/g, "/").replace(/^\/+/, "");
-  return root ? `${root}/${child}` : child;
+  return `${root}/${child}`;
 }
 
 export type { AssistantFileLinkClassification };

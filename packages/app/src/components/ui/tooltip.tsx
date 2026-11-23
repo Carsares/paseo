@@ -15,10 +15,10 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import {
-  Dimensions,
   Platform,
   Pressable,
   View,
+  useWindowDimensions,
   type PressableProps,
   type StyleProp,
   type ViewStyle,
@@ -30,7 +30,12 @@ import { FloatingSurface } from "@/components/ui/floating";
 import { useRetainedPanelActive } from "@/components/retained-panel";
 import { isNative, isWeb } from "@/constants/platform";
 import { getOverlayRoot, OVERLAY_Z } from "@/lib/overlay-root";
-import { holdSurfaceEdge, surfaceFrameStyles, type SurfacePosition } from "./anchor";
+import {
+  fitSurfaceWidth,
+  holdSurfaceEdge,
+  surfaceFrameStyles,
+  type SurfacePosition,
+} from "./anchor";
 
 type Side = "top" | "bottom" | "left" | "right";
 type Align = "start" | "center" | "end";
@@ -49,6 +54,7 @@ interface TooltipContextValue {
   setOpen: (open: boolean) => void;
   triggerRef: React.RefObject<TooltipTriggerElement | null>;
   enabled: boolean;
+  enabledOnCompactWeb: boolean;
   openOnPress: boolean;
   delayDuration: number;
 }
@@ -241,6 +247,7 @@ export function Tooltip({
   delayDuration = 0,
   enabledOnDesktop = true,
   enabledOnMobile = false,
+  enabledOnCompactWeb = false,
   children,
 }: PropsWithChildren<{
   open?: boolean;
@@ -249,6 +256,8 @@ export function Tooltip({
   delayDuration?: number;
   enabledOnDesktop?: boolean;
   enabledOnMobile?: boolean;
+  /** Use desktop hover and focus behavior below the compact breakpoint on web. */
+  enabledOnCompactWeb?: boolean;
 }>): ReactElement {
   const triggerRef = useRef<TooltipTriggerElement>(null);
   const [isOpen, setIsOpen] = useControllableOpenState({
@@ -259,7 +268,7 @@ export function Tooltip({
 
   const isCompact = useIsCompactFormFactor();
   const active = useRetainedPanelActive();
-  const opensOnPress = isNative || isCompact;
+  const opensOnPress = isNative || (isCompact && !enabledOnCompactWeb);
   const enabled = active && (opensOnPress ? enabledOnMobile : enabledOnDesktop);
 
   // Remove the portal in the inactive commit, before the retained chat freezes.
@@ -274,10 +283,11 @@ export function Tooltip({
       setOpen: setIsOpen,
       triggerRef,
       enabled,
+      enabledOnCompactWeb,
       openOnPress: opensOnPress,
       delayDuration,
     }),
-    [isOpen, setIsOpen, enabled, opensOnPress, delayDuration],
+    [isOpen, setIsOpen, enabled, enabledOnCompactWeb, opensOnPress, delayDuration],
   );
 
   return <TooltipContext.Provider value={value}>{children}</TooltipContext.Provider>;
@@ -457,38 +467,43 @@ export function TooltipTrigger({
   );
 }
 
-export function TooltipContent({
-  children,
-  side = "top",
-  align = "center",
-  offset = 6,
-  style,
-  testID,
-  maxWidth = 280,
-}: PropsWithChildren<{
+type TooltipContentProps = PropsWithChildren<{
   side?: Side;
   align?: Align;
   offset?: number;
   style?: StyleProp<ViewStyle>;
   testID?: string;
   maxWidth?: number;
-}>): ReactElement | null {
+}>;
+
+export function TooltipContent(props: TooltipContentProps): ReactElement | null {
   const ctx = useTooltipContext("TooltipContent");
+  if (!ctx.open || !ctx.enabled) return null;
+  return <OpenTooltipContent {...props} ctx={ctx} />;
+}
+
+function OpenTooltipContent({
+  children,
+  ctx,
+  side = "top",
+  align = "center",
+  offset = 6,
+  style,
+  testID,
+  maxWidth = 280,
+}: TooltipContentProps & { ctx: TooltipContextValue }): ReactElement {
+  const { width: screenWidth, height: screenHeight } = useWindowDimensions();
   const [triggerRect, setTriggerRect] = useState<Rect | null>(null);
   const [contentSize, setContentSize] = useState<{ width: number; height: number } | null>(null);
   const [position, setPosition] = useState<SurfacePosition | null>(null);
 
   useEffect(() => {
-    if (!ctx.open || !ctx.enabled || !ctx.triggerRef.current) {
-      setTriggerRect(null);
-      setContentSize(null);
-      setPosition(null);
-      return () => {};
-    }
+    const trigger = ctx.triggerRef.current;
+    if (!trigger) return;
 
     let cancelled = false;
 
-    void measureElement(ctx.triggerRef.current).then((rect) => {
+    void measureElement(trigger).then((rect) => {
       if (!cancelled) setTriggerRect(rect);
       return undefined;
     });
@@ -496,11 +511,10 @@ export function TooltipContent({
     return () => {
       cancelled = true;
     };
-  }, [ctx.enabled, ctx.open, ctx.triggerRef]);
+  }, [ctx.triggerRef, screenWidth, screenHeight]);
 
   useEffect(() => {
     if (!triggerRect || !contentSize) return;
-    const { width: screenWidth, height: screenHeight } = Dimensions.get("window");
     const displayArea = { x: 0, y: 0, width: screenWidth, height: screenHeight };
     const result = computePosition({
       triggerRect,
@@ -516,7 +530,7 @@ export function TooltipContent({
         contentSize.height,
       ),
     );
-  }, [triggerRect, contentSize, side, align, offset]);
+  }, [triggerRect, contentSize, screenWidth, screenHeight, side, align, offset]);
 
   const handleLayout = useCallback(
     (event: { nativeEvent: { layout: { width: number; height: number } } }) => {
@@ -527,12 +541,16 @@ export function TooltipContent({
   );
 
   const frame = useMemo(() => surfaceFrameStyles(position), [position]);
-  const frameStyle = useMemo(() => [frame.surface, { maxWidth }], [frame.surface, maxWidth]);
+  const frameStyle = useMemo(
+    () => [
+      frame.surface,
+      isWeb && ctx.enabledOnCompactWeb ? fitSurfaceWidth({ maxWidth }, screenWidth) : { maxWidth },
+    ],
+    [frame.surface, maxWidth, screenWidth, ctx.enabledOnCompactWeb],
+  );
   const contentStyle = useMemo(() => [styles.content, style], [style]);
 
   const handleDismiss = useCallback(() => ctx.setOpen(false), [ctx]);
-
-  if (!ctx.open || !ctx.enabled) return null;
 
   // On web, avoid React Native's <Modal/> implementation (it uses <dialog> and can
   // steal focus / disrupt hover). Rendering via Portal + position:fixed keeps the

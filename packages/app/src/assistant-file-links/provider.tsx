@@ -4,6 +4,7 @@ import {
   useContext,
   useMemo,
   useRef,
+  useSyncExternalStore,
   type MutableRefObject,
   type ReactNode,
 } from "react";
@@ -12,9 +13,13 @@ import type { ToastApi } from "@/components/toast-host";
 import type { OpenFileDisposition } from "@/workspace/file-open";
 import type { InlinePathTarget } from "./parse";
 import type { AssistantFileLinkContext, GetDirectorySuggestions } from "./resolver";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 
-export interface AssistantFileLinkDaemonClient {
-  readFile?: import("@getpaseo/client/internal/daemon-client").DaemonClient["readFile"];
+export interface AssistantFileLinkDaemonClient extends Partial<
+  Pick<DaemonClient, "getConnectionState" | "subscribeConnectionStatus">
+> {
+  readFile?: DaemonClient["readFile"];
+  listDirectory?: (cwd: string, path: string) => Promise<unknown>;
   getDirectorySuggestions: GetDirectorySuggestions;
 }
 
@@ -33,7 +38,19 @@ export interface AssistantFileLinkResolverProviderProps extends AssistantFileLin
 
 export interface AssistantFileLinkResolverContextValue {
   configRef: MutableRefObject<AssistantFileLinkResolverConfig>;
-  getDirectorySuggestions: GetDirectorySuggestions;
+  scope: AssistantFileLinkLookupScope;
+}
+
+export interface AssistantFileLinkLookupScope extends AssistantFileLinkContext {
+  client?: AssistantFileLinkDaemonClient | null;
+  serverId?: string;
+  connection: object | null;
+}
+
+export function getLookupConnection(client: AssistantFileLinkDaemonClient | null | undefined) {
+  const state = client?.getConnectionState?.();
+  if (!state) return client ?? null;
+  return state.status === "connected" ? state : null;
 }
 
 const AssistantFileLinkResolverContext =
@@ -77,20 +94,17 @@ export function AssistantFileLinkResolverProvider({
     toast,
   };
 
-  const getDirectorySuggestions = useCallback<GetDirectorySuggestions>(async (input) => {
-    const activeClient = configRef.current.client;
-    if (!activeClient) {
-      return { entries: [], error: null };
-    }
-
-    const result = await activeClient.getDirectorySuggestions(input);
-    return { entries: result.entries, error: result.error };
-  }, []);
-
-  const value = useMemo<AssistantFileLinkResolverContextValue>(
-    () => ({ configRef, getDirectorySuggestions }),
-    [getDirectorySuggestions],
+  const subscribe = useCallback(
+    (notify: () => void) => client?.subscribeConnectionStatus?.(notify) ?? (() => {}),
+    [client],
   );
+  const getConnection = useCallback(() => getLookupConnection(client), [client]);
+  const connection = useSyncExternalStore(subscribe, getConnection, getConnection);
+  const scope = useMemo(
+    () => ({ client, serverId, workspaceRoot, relativePathBase, connection }),
+    [client, serverId, workspaceRoot, relativePathBase, connection],
+  );
+  const value = useMemo(() => ({ configRef, scope }), [scope]);
 
   return (
     <AssistantFileLinkResolverContext.Provider value={value}>
@@ -108,7 +122,7 @@ export type { AssistantFileLinkContext };
 
 const EMPTY_CONTEXT: AssistantFileLinkResolverContextValue = {
   configRef: { current: {} },
-  getDirectorySuggestions: async () => ({ entries: [], error: null }),
+  scope: { connection: null },
 };
 
 export function useAssistantFileLinkEnvironment() {

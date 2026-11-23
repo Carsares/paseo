@@ -188,6 +188,17 @@ describe("translation resources", () => {
     }
   });
 
+  it("localizes file link lookup states in every supported language", () => {
+    const keys = ["searching", "unconfirmed", "opensFirst"] as const;
+    for (const key of keys) {
+      expect(en.assistantFileLink[key], key).toMatch(/\S/);
+      for (const resource of [ar, es, fr, ja, ko, ptBR, ru, zhCN]) {
+        expect(resource.assistantFileLink[key], key).toMatch(/\S/);
+        expect(resource.assistantFileLink[key], key).not.toBe(en.assistantFileLink[key]);
+      }
+    }
+  });
+
   it("keeps non-English supported languages translated beyond fallback labels", () => {
     const totalStrings = Object.keys(flattenStrings(en)).length;
     const maxFallbackStrings = Math.floor(totalStrings * 0.25);

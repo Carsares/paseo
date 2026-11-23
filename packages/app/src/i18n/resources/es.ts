@@ -31,6 +31,11 @@ export const es: TranslationResources = {
     position: "{{current}} de {{total}}",
     total: "{{total}} coincidencias",
   },
+  assistantFileLink: {
+    searching: "Buscando…",
+    unconfirmed: "No se pudo localizar en este espacio de trabajo",
+    opensFirst: "Hay varias coincidencias. Esta ruta se abre de forma predeterminada.",
+  },
   common: {
     bottomSheetBackdrop: "Fondo del panel inferior",
     back: "Atrás",
