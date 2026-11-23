@@ -16,7 +16,8 @@ import { expect, test, vi } from "vitest";
 
 import { Session, type SessionOptions } from "./session.js";
 import { OWNER_PERMISSIONS } from "./authorization/index.js";
-import type { SessionOutboundMessage } from "@getpaseo/protocol/messages";
+import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
+import { PARENT_AGENT_ID_LABEL, PARENT_SERVER_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { createNoopWorkspaceGitService } from "./test-utils/workspace-git-service-stub.js";
 import { asInternals, createStub } from "./test-utils/class-mocks.js";
 import { createProviderSnapshotManagerStub } from "./test-utils/session-stubs.js";
@@ -27,10 +28,12 @@ import {
   type PersistedWorkspaceRecord,
 } from "./workspace-registry.js";
 import { resolveWorkspaceIdForPath } from "./resolve-workspace-id-for-path.js";
+import type { StoredAgentRecord } from "./agent/agent-storage.js";
 
 interface Harness {
   session: Session;
   emitted: SessionOutboundMessage[];
+  creationService: SessionOptions["creationService"];
   workspaces: Map<string, PersistedWorkspaceRecord>;
   projects: Map<string, PersistedProjectRecord>;
 }
@@ -39,6 +42,7 @@ function createHarness(input: {
   workspaces?: PersistedWorkspaceRecord[];
   projects?: PersistedProjectRecord[];
   gitRoots?: string[];
+  storedCaller?: Pick<StoredAgentRecord, "id" | "cwd" | "workspaceId" | "archivedAt">;
 }): Harness {
   const workspaces = new Map<string, PersistedWorkspaceRecord>();
   const projects = new Map<string, PersistedProjectRecord>();
@@ -83,6 +87,7 @@ function createHarness(input: {
   });
 
   const emitted: SessionOutboundMessage[] = [];
+  const creationService = createTestCreationService();
   const logger = {
     child: () => logger,
     trace: vi.fn(),
@@ -96,8 +101,9 @@ function createHarness(input: {
     workspaceRuntimeStore: createWorkspaceRuntimeStore(),
     messageReceipts: createMessageReceiptsStub(),
     agentMessages: createAgentMessageDeliveryStub(),
-    creationService: createTestCreationService(),
+    creationService,
     clientId: "test",
+    serverId: "local-host",
     permissions: OWNER_PERMISSIONS,
     appVersion: null,
     onMessage: (m) => emitted.push(m),
@@ -119,7 +125,7 @@ function createHarness(input: {
       listActive: async () => [],
       listByWorkspaces: async () => [],
       lastUserMessageAtByWorkspace: async () => new Map<string, string>(),
-      get: async () => null,
+      get: async (id: string) => (input.storedCaller?.id === id ? input.storedCaller : null),
     }),
     projectRegistry: createStub<SessionOptions["projectRegistry"]>({
       subscribeToMutations: () => () => {},
@@ -203,7 +209,7 @@ function createHarness(input: {
     terminalManager: null,
   });
 
-  return { session, emitted, workspaces, projects };
+  return { session, emitted, creationService, workspaces, projects };
 }
 
 async function openProject(session: Session, cwd: string, requestId = "req-1") {
@@ -235,6 +241,168 @@ const PROJECTS = path.resolve("/projects");
 const SOME_GIT_REPO = path.join(PROJECTS, "some-git-repo");
 const PARENT = path.resolve("/parent");
 const PARENT_CHILD = path.join(PARENT, "child");
+
+const workspaceCreate = {
+  type: "workspace.create.request",
+  requestId: "blocked",
+  idempotencyKey: "retryable",
+  subscribe: true,
+  source: { kind: "directory", path: FOO },
+} as const;
+const initialAgent = { config: { cwd: FOO, provider: "claude" }, labels: {} } as const;
+const foreignParentLabels = {
+  [PARENT_AGENT_ID_LABEL]: "parent-agent",
+  [PARENT_SERVER_ID_LABEL]: "remote-host",
+};
+const creationDenied =
+  "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.";
+
+test.each([
+  { callerAgentId: "parent-agent" },
+  { agent: { ...initialAgent, callerAgentId: "parent-agent" } },
+  { agent: { ...initialAgent, initialPromptOrigin: "agent" as const } },
+  { agent: { ...initialAgent, labels: foreignParentLabels } },
+])("rejects workspace creation with Agent context %j before recording it", async (caller) => {
+  const h = createHarness({});
+  const create = vi.spyOn(h.creationService, "create");
+  await h.session.handleMessage({ ...workspaceCreate, ...caller });
+  expect(h.emitted).toEqual([
+    expect.objectContaining({
+      type: "workspace.create.response",
+      payload: expect.objectContaining({ error: creationDenied, workspace: null }),
+    }),
+  ]);
+  expect(create).not.toHaveBeenCalled();
+  expect(h.workspaces.size).toBe(0);
+  expect(h.projects.size).toBe(0);
+
+  await h.session.handleMessage({ ...workspaceCreate, requestId: "human-retry" });
+  expect(h.emitted).toContainEqual(
+    expect.objectContaining({
+      type: "workspace.create.response",
+      payload: expect.objectContaining({ requestId: "human-retry", error: null }),
+    }),
+  );
+  expect(h.workspaces.size).toBe(1);
+});
+
+test.each([
+  ["agent.create.request", undefined],
+  ["agent.create.request", "ws-foo"],
+  ["create_agent_request", undefined],
+  ["create_agent_request", "ws-foo"],
+] as const)("rejects a foreign parent via %s with workspace %s", async (type, workspaceId) => {
+  const workspace = dirWorkspace(FOO);
+  const h = createHarness({ workspaces: [workspace] });
+  const create = vi.spyOn(h.creationService, "create");
+  await h.session.handleMessage({
+    ...initialAgent,
+    type,
+    requestId: "blocked",
+    idempotencyKey: "blocked",
+    workspaceId: workspaceId ? workspace.workspaceId : undefined,
+    labels: foreignParentLabels,
+  });
+  expect(h.emitted).toContainEqual(
+    expect.objectContaining({ payload: expect.objectContaining({ error: creationDenied }) }),
+  );
+  expect(create).not.toHaveBeenCalled();
+  expect(h.workspaces.size).toBe(1);
+  expect(h.projects.size).toBe(0);
+});
+
+const routedWorkspaceRequests = [
+  workspaceCreate,
+  { type: "agent.create.request", ...initialAgent, requestId: "blocked" },
+  { type: "create_agent_request", ...initialAgent, requestId: "blocked" },
+  { type: "open_project_request", cwd: FOO, requestId: "blocked" },
+  { type: "project.add.request", cwd: FOO, requestId: "blocked" },
+  { type: "project.create_directory.request", parentPath: FOO, name: "..", requestId: "blocked" },
+  {
+    type: "project.github.clone.request",
+    repo: "invalid-repo",
+    targetDirectory: FOO,
+    requestId: "blocked",
+  },
+  { type: "create_paseo_worktree_request", cwd: FOO, requestId: "blocked" },
+  { type: "agent.move_to_workspace.request", agentId: "agent-to-move", requestId: "blocked" },
+  {
+    type: "import_agent_request",
+    provider: "claude",
+    sessionId: "import",
+    cwd: FOO,
+    requestId: "blocked",
+  },
+  {
+    type: "hub.execution.agent.create.request",
+    provider: "claude",
+    prompt: "Run this task",
+    cwd: FOO,
+    executionId: "execution",
+    requestId: "blocked",
+  },
+] satisfies SessionInboundMessage[];
+
+test.each(routedWorkspaceRequests)("blocks $type from a direct-parent route", async (request) => {
+  const h = createHarness({});
+  h.session.setHostSource("route:peer:remote-host:mcp-direct-parent%3Aparent-agent");
+  const create = vi.spyOn(h.creationService, "create");
+  await h.session.handleMessage(request);
+  expect(h.emitted).toContainEqual(
+    expect.objectContaining({
+      payload: expect.objectContaining({
+        requestId: "blocked",
+        error:
+          request.type === "hub.execution.agent.create.request"
+            ? { code: "create_failed", message: creationDenied }
+            : creationDenied,
+      }),
+    }),
+  );
+  expect(create).not.toHaveBeenCalled();
+  expect(h.workspaces.size).toBe(0);
+  expect(h.projects.size).toBe(0);
+});
+
+test("a routed human client can open a project", async () => {
+  const h = createHarness({});
+  h.session.setRouted(true);
+  h.session.setHostSource("route:peer:remote-host:ui");
+
+  await openProject(h.session, FOO);
+
+  expect(getOpenResponse(h.emitted, "req-1")?.workspace?.workspaceDirectory).toBe(FOO);
+  expect(h.projects.size).toBe(1);
+  expect(h.workspaces.size).toBe(1);
+});
+
+test("does not admit subagent creation for a caller in an archived workspace", async () => {
+  const workspace = dirWorkspace(FOO, T0);
+  const h = createHarness({
+    workspaces: [workspace],
+    storedCaller: {
+      id: "parent-agent",
+      cwd: FOO,
+      workspaceId: workspace.workspaceId,
+      archivedAt: null,
+    },
+  });
+  const create = vi.spyOn(h.creationService, "create");
+  await h.session.handleMessage({
+    ...initialAgent,
+    type: "agent.create.request",
+    requestId: "blocked",
+    callerAgentId: "parent-agent",
+  });
+  expect(h.emitted).toContainEqual(
+    expect.objectContaining({
+      type: "agent.create.response",
+      payload: expect.objectContaining({ error: `Workspace ${workspace.workspaceId} not found` }),
+    }),
+  );
+  expect(create).not.toHaveBeenCalled();
+  expect(h.workspaces.size).toBe(1);
+});
 
 function gitWorkspace(rootPath: string, archivedAt: string | null = null) {
   return createPersistedWorkspaceRecord({

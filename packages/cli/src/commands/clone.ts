@@ -1,5 +1,6 @@
 import type { Command } from "commander";
 import { isCompleteGitRemote } from "@getpaseo/protocol/git-remote";
+import { agentWorkspaceCreationError, resolveCallerAgent } from "../utils/caller-agent.js";
 import { connectToDaemon } from "../utils/client.js";
 import type { CommandError, OutputSchema, SingleResult } from "../output/index.js";
 import type { CommandOptions } from "../output/with-output.js";
@@ -46,16 +47,17 @@ export async function runCloneCommand(
 
   const client = await connectToDaemon({ target: options.daemonTarget });
 
-  if (client.getLastServerInfoMessage()?.features?.projectGithubClone !== true) {
-    await client.close().catch(() => {});
-    throw cmdError(
-      "UNSUPPORTED_BY_HOST",
-      "This daemon does not support cloning GitHub repos.",
-      "Update the host to a newer Paseo version.",
-    );
-  }
-
   try {
+    if (await resolveCallerAgent(client)) throw agentWorkspaceCreationError();
+
+    if (client.getLastServerInfoMessage()?.features?.projectGithubClone !== true) {
+      throw cmdError(
+        "UNSUPPORTED_BY_HOST",
+        "This daemon does not support cloning GitHub repos.",
+        "Update the host to a newer Paseo version.",
+      );
+    }
+
     const response = await client.cloneGithubProject({
       repo,
       targetDirectory,

@@ -171,8 +171,8 @@ import {
   registerParentFinishSubscription,
 } from "./agent/create-agent/create.js";
 import {
+  AGENT_WORKSPACE_CREATION_ERROR,
   inheritAgentBackground,
-  inheritWorkspaceBackground,
   resolveCreateAgentIntent,
   type CreateAgentIntent,
   type CreateAgentCaller,
@@ -3588,6 +3588,20 @@ export class Session {
 
   private dispatchHubExecutionMessage(msg: SessionInboundMessage): Promise<void> | undefined {
     if (msg.type === "hub.execution.agent.create.request") {
+      if (readDirectParentRoute(this.getHostSourceId())) {
+        this.emit({
+          type: "hub.execution.agent.create.response",
+          payload: {
+            requestId: msg.requestId,
+            executionId: msg.executionId,
+            agentId: null,
+            agent: null,
+            success: false,
+            error: { code: "create_failed", message: AGENT_WORKSPACE_CREATION_ERROR },
+          },
+        });
+        return Promise.resolve();
+      }
       return this.hubExecutionController?.createAgent(msg);
     }
     if (msg.type === "hub.execution.agent.validate.request") {
@@ -4564,12 +4578,13 @@ export class Session {
       finishTargetMove?.();
       finishMove?.();
     };
-    const workspaceId = generateWorkspaceId();
-    const journal = new AgentWorkspaceMoveJournal({
-      paseoHome: this.paseoHome,
-      workspaceRegistry: this.workspaceRegistry,
-    });
     try {
+      this.assertWorkspaceCreationAllowed();
+      const workspaceId = generateWorkspaceId();
+      const journal = new AgentWorkspaceMoveJournal({
+        paseoHome: this.paseoHome,
+        workspaceRegistry: this.workspaceRegistry,
+      });
       const preMoveAgent =
         this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
       const queuedWorkspaceId = preMoveAgent?.workspaceId?.trim() || undefined;
@@ -5686,10 +5701,11 @@ export class Session {
       ? (await this.workspaceRegistry.get(id)) !== null
       : this.agentManager.getAgent(id) != null || (await this.agentStorage.get(id)) !== null;
 
-  private createRequestedAgent(
+  private async createRequestedAgent(
     request: AgentCreateRequest,
     observer?: (snapshot: CreationSnapshot) => void,
   ): Promise<CreationSnapshot> {
+    await this.preflightAgentWorkspace(request);
     const { requestId, type: _type, subscribe: _subscribe, idempotencyKey, ...intent } = request;
     return this.creationService.create(
       {
@@ -5772,6 +5788,7 @@ export class Session {
         )
       : undefined;
     try {
+      this.assertWorkspaceCreationAllowed(request);
       if (
         request.mainAgent &&
         (!this.authorization.allowsPermission("workspace.write") ||
@@ -5935,6 +5952,7 @@ export class Session {
       let agent: AgentSnapshotPayload;
       if (msg.idempotencyKey !== undefined) {
         if (msg.initialPrompt !== undefined) {
+          await this.preflightAgentWorkspace(msg);
           throw new Error("Idempotent creation requires sending the initial prompt separately");
         }
         const creation = await this.createRequestedAgent({ ...msg, type: "agent.create.request" });
@@ -6022,6 +6040,7 @@ export class Session {
     let createdWorktreeForCleanup: CreatePaseoWorktreeWorkflowResult | null = null;
     let createdAgentId: string | null = null;
     try {
+      const callerAgent = await this.preflightAgentWorkspace(msg);
       const forkedTimelineRows = await this.readForkedTimeline(msg.forkFrom);
       const requestedCwd = resolve(config.cwd);
       const needsRequestedDirectory = Boolean(worktree) || (!msg.workspaceId && !msg.callerAgentId);
@@ -6044,11 +6063,12 @@ export class Session {
         cwd: config.cwd,
         target: worktree,
         firstAgentContext,
-        ...(await this.workspaceBackgroundIntent(msg.background, msg.callerAgentId)),
+        background: msg.background,
       });
       createdWorktreeForCleanup = createdWorktree;
       const resolvedIntent = await this.resolveSessionCreateAgentIntent({
         request: msg,
+        callerAgent,
         createdWorktree,
         workspacePromptTitle,
       });
@@ -6098,9 +6118,7 @@ export class Session {
           firstAgentContext,
         },
         {
-          inheritParentWorkspace: Boolean(
-            msg.callerAgentId && !msg.workspaceId && !createdWorktree,
-          ),
+          inheritParentWorkspace: Boolean(callerAgent && msg.workspaceId === undefined),
         },
       );
       createdAgentId = snapshot.id;
@@ -6139,11 +6157,11 @@ export class Session {
 
   private async resolveSessionCreateAgentIntent(input: {
     request: CreateAgentRequestMessage;
+    callerAgent: (CreateAgentCaller & { background?: boolean }) | null;
     createdWorktree: CreatePaseoWorktreeWorkflowResult | null;
     workspacePromptTitle: string | null;
   }): Promise<ResolvedSessionCreateAgentIntent> {
-    const { request, createdWorktree } = input;
-    const callerAgent = await this.resolveCreationCaller(request.callerAgentId);
+    const { request, callerAgent, createdWorktree } = input;
 
     let config = request.config;
 
@@ -6170,8 +6188,7 @@ export class Session {
           createdWorktree: null,
           cwd: config.cwd,
           initialTitle: input.workspacePromptTitle,
-          background: inheritWorkspaceBackground(request.background, callerAgent),
-          callerWorkspaceId: callerAgent?.workspaceId,
+          background: request.background,
         }),
         cwd: config.cwd,
       }),
@@ -6313,6 +6330,10 @@ export class Session {
     );
 
     try {
+      this.assertWorkspaceCreationAllowed();
+      if (this.hasRemoteCreationParent(normalized.labels)) {
+        throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+      }
       if (!normalized.cwd) {
         throw new Error("Import requires cwd from the selected provider session");
       }
@@ -8811,14 +8832,10 @@ export class Session {
   private async resolveCreationCaller(
     callerAgentId?: string,
   ): Promise<(CreateAgentCaller & { background?: boolean }) | null> {
-    if (!callerAgentId) return null;
-    let caller: (CreateAgentCaller & { background?: boolean }) | null =
-      this.agentManager.getAgent(callerAgentId);
-    if (!caller) {
-      const stored = await this.agentStorage.get(callerAgentId);
-      if (stored && !stored.archivedAt) caller = stored;
-    }
-    if (!caller) throw new Error(`Caller agent ${callerAgentId} not found`);
+    if (callerAgentId === undefined) return null;
+    const stored = await this.agentStorage.get(callerAgentId);
+    const caller = this.agentManager.getAgent(callerAgentId) ?? stored;
+    if (!caller || stored?.archivedAt) throw new Error(`Caller agent ${callerAgentId} not found`);
     return {
       id: caller.id,
       cwd: caller.cwd,
@@ -8827,15 +8844,52 @@ export class Session {
     };
   }
 
-  private async workspaceBackgroundIntent(
-    background: boolean | undefined,
-    callerAgentId: string | undefined,
-  ): Promise<{ background?: boolean; callerWorkspaceId?: string }> {
-    const caller = await this.resolveCreationCaller(callerAgentId);
-    return {
-      background: inheritWorkspaceBackground(background, caller),
-      callerWorkspaceId: caller?.workspaceId,
-    };
+  private hasRemoteCreationParent(labels?: Record<string, string>): boolean {
+    const serverId = this.serverId ?? "";
+    const parent = getParentAddressFromLabels(labels, serverId);
+    return parent !== null && parent.serverId !== serverId;
+  }
+
+  private assertWorkspaceCreationAllowed(
+    request?: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+  ): void {
+    if (
+      readDirectParentRoute(this.getHostSourceId()) ||
+      request?.callerAgentId !== undefined ||
+      request?.agent?.callerAgentId !== undefined ||
+      request?.agent?.initialPromptOrigin === "agent" ||
+      this.hasRemoteCreationParent(request?.agent?.labels)
+    ) {
+      throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+    }
+  }
+
+  private async preflightAgentWorkspace(request: CreateAgentRequestMessage | AgentCreateRequest) {
+    this.assertWorkspaceCreationAllowed();
+    if (this.hasRemoteCreationParent(request.labels))
+      throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+    if (request.callerAgentId === undefined && request.initialPromptOrigin !== "agent") {
+      return null;
+    }
+    if (
+      request.worktree !== undefined ||
+      request.worktreeName !== undefined ||
+      request.git !== undefined
+    ) {
+      throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+    }
+
+    const caller = await this.resolveCreationCaller(request.callerAgentId);
+    const workspaceId = caller?.workspaceId;
+    if (
+      !workspaceId ||
+      (request.workspaceId !== undefined && request.workspaceId !== workspaceId)
+    ) {
+      throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+    }
+    const workspace = await this.workspaceRegistry.get(workspaceId);
+    if (!workspace || workspace.archivedAt) throw new Error(`Workspace ${workspaceId} not found`);
+    return caller;
   }
 
   private async createRequestedWorkspace(
@@ -8855,6 +8909,7 @@ export class Session {
       const { type, requestId, ...input } = request;
       const transformed = await this.pluginRuntime.before("workspace.create.before", input);
       creationRequest = { ...transformed, type, requestId };
+      this.assertWorkspaceCreationAllowed(creationRequest);
     }
     return creationRequest.source.kind === "directory"
       ? this.handleWorkspaceCreateLocal(creationRequest, workspaceId)
@@ -8872,10 +8927,6 @@ export class Session {
     const cwd = expandTilde(request.source.path);
     const explicitTitle = request.title?.trim() || null;
     const promptTitle = resolveFirstAgentPromptTitle(request.firstAgentContext);
-    const backgroundIntent = await this.workspaceBackgroundIntent(
-      request.background,
-      request.callerAgentId,
-    );
     const workspace = await this.withCheckoutForDirectory(cwd, async () => {
       const directoryExists = await this.filesystem.isDirectory(cwd).catch(() => false);
       if (!directoryExists) {
@@ -8890,7 +8941,7 @@ export class Session {
           expectsInitialAgent: Boolean(request.firstAgentContext),
           workspaceId,
           metadata: request.metadata,
-          ...backgroundIntent,
+          background: request.background,
         },
       );
     });
@@ -8955,7 +9006,7 @@ export class Session {
         firstAgentContext: request.firstAgentContext,
         title: request.title,
         metadata: request.metadata,
-        ...(await this.workspaceBackgroundIntent(request.background, request.callerAgentId)),
+        background: request.background,
       },
       source.baseBranch
         ? { resolveDefaultBranch: async () => source.baseBranch as string }
@@ -8977,6 +9028,7 @@ export class Session {
     const cwd = expandTilde(requestedCwd);
 
     try {
+      this.assertWorkspaceCreationAllowed();
       const opened = await this.withCheckoutForDirectory(cwd, async () => {
         const directoryExists = await this.filesystem.isDirectory(cwd).catch(() => false);
         if (!directoryExists) {
@@ -9071,25 +9123,26 @@ export class Session {
   ): Promise<void> {
     const requestedCwd = request.cwd;
     const cwd = expandTilde(requestedCwd);
-    const directoryExists = await this.filesystem.isDirectory(cwd).catch(() => false);
-    if (!directoryExists) {
-      this.sessionLogger.info(
-        { requestedCwd, resolvedCwd: cwd, reason: "directory_not_found" },
-        "Add project rejected",
-      );
-      this.emit({
-        type: "project.add.response",
-        payload: {
-          requestId: request.requestId,
-          project: null,
-          error: `Directory not found: ${cwd}`,
-          errorCode: "directory_not_found",
-        },
-      });
-      return;
-    }
-
     try {
+      this.assertWorkspaceCreationAllowed();
+      const directoryExists = await this.filesystem.isDirectory(cwd).catch(() => false);
+      if (!directoryExists) {
+        this.sessionLogger.info(
+          { requestedCwd, resolvedCwd: cwd, reason: "directory_not_found" },
+          "Add project rejected",
+        );
+        this.emit({
+          type: "project.add.response",
+          payload: {
+            requestId: request.requestId,
+            project: null,
+            error: `Directory not found: ${cwd}`,
+            errorCode: "directory_not_found",
+          },
+        });
+        return;
+      }
+
       const projectsBefore = new Map<string, PersistedProjectRecord>();
       for (const project of await this.projectRegistry.list()) {
         projectsBefore.set(project.projectId, project);
@@ -9133,6 +9186,7 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "project.create_directory.request" }>,
   ): Promise<void> {
     try {
+      this.assertWorkspaceCreationAllowed();
       const result = await createProjectDirectory(
         { parentPath: request.parentPath, name: request.name },
         {
@@ -9261,6 +9315,7 @@ export class Session {
     let normalizedRepo = request.repo;
     let checkoutPath: string | null = null;
     try {
+      this.assertWorkspaceCreationAllowed();
       const repo = normalizeCloneRepository({
         repo: request.repo,
         cloneProtocol: request.cloneProtocol,
@@ -9460,6 +9515,18 @@ export class Session {
   private async handleCreatePaseoWorktreeRequest(
     request: Extract<SessionInboundMessage, { type: "create_paseo_worktree_request" }>,
   ): Promise<void> {
+    if (readDirectParentRoute(this.getHostSourceId())) {
+      this.emit({
+        type: "create_paseo_worktree_response",
+        payload: {
+          requestId: request.requestId,
+          workspace: null,
+          setupTerminalId: null,
+          error: AGENT_WORKSPACE_CREATION_ERROR,
+        },
+      });
+      return;
+    }
     return handleCreateWorktreeRequest(
       {
         paseoHome: this.paseoHome,

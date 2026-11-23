@@ -1065,6 +1065,7 @@ export async function createPaseoDaemon(
     clients: initialAgentManagerState.clients,
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,
+    workspaceRegistry,
     appendSystemPrompt: config.appendSystemPrompt,
     mainControlAppendSystemPrompt: daemonConfigStore.get().mainControlAppendSystemPrompt,
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
@@ -1399,6 +1400,7 @@ export async function createPaseoDaemon(
     worktreesRoot: config.worktreesRoot,
     terminalManager,
     providerSnapshotManager,
+    workspaceRegistry,
     createPaseoWorktree: createPaseoWorktreeForTools,
     ensureWorkspaceForCreate: ensureWorkspaceForCreateAndBroadcastExternal,
   };

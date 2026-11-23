@@ -4363,6 +4363,95 @@ test("createAgent persists workspaceId on the stored record and emits it in the 
   }
 });
 
+test("createAgent rechecks a parent archive queued before creation", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-create-parent-archive-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+  const config = { provider: "codex", cwd: workdir } as const;
+
+  try {
+    const parent = await manager.createAgent(config, undefined, { workspaceId: "workspace" });
+    const archive = manager.archiveAgent(parent.id);
+    await expect(
+      manager.createAgent(config, undefined, {
+        workspaceId: "workspace",
+        labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+      }),
+    ).rejects.toThrow(`Parent agent ${parent.id} is missing or archived.`);
+    await archive;
+  } finally {
+    await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("createAgent inherits the current parent workspace and cwd inside the creation lock", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-create-parent-cwd-"));
+  const otherCwd = mkdtempSync(join(tmpdir(), "agent-manager-create-other-cwd-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+  const parent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: "parent-workspace",
+  });
+
+  try {
+    const child = await manager.createAgent({ provider: "codex", cwd: otherCwd }, undefined, {
+      workspaceId: "requested-workspace",
+      inheritParentWorkspace: true,
+      labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+    });
+
+    expect(child.workspaceId).toBe("parent-workspace");
+    expect(child.cwd).toBe(workdir);
+  } finally {
+    await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+    rmSync(workdir, { recursive: true, force: true });
+    rmSync(otherCwd, { recursive: true, force: true });
+  }
+});
+
+test("createAgent rejects an explicit workspace after the parent moves", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-create-explicit-workspace-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+  });
+  const config = { provider: "codex", cwd: workdir } as const;
+
+  try {
+    const root = await manager.createAgent(config, undefined, { workspaceId: "origin-workspace" });
+    const parent = await manager.createAgent(config, undefined, {
+      workspaceId: "origin-workspace",
+      labels: { [PARENT_AGENT_ID_LABEL]: root.id },
+    });
+    await manager.moveSubagentToWorkspace(parent.id, {
+      allocateWorkspace: async () => ({ workspaceId: "destination-workspace" }),
+    });
+
+    await expect(
+      manager.createAgent(config, undefined, {
+        workspaceId: "origin-workspace",
+        labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
+      }),
+    ).rejects.toThrow(
+      "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.",
+    );
+  } finally {
+    await Promise.all(manager.listAgents().map(({ id }) => manager.closeAgent(id)));
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("createAgent injects paseo MCP server only into provider launch config", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");
@@ -7353,7 +7442,7 @@ test("detachAgent removes relationship lifecycle labels from a stored-only agent
       title: "Parent",
     },
     undefined,
-    { workspaceId: undefined },
+    { workspaceId: "workspace" },
   );
   const child = await manager.createAgent(
     {
@@ -7401,7 +7490,7 @@ test("archiveAgent does not cascade to a detached former child", async () => {
       title: "Parent",
     },
     undefined,
-    { workspaceId: undefined },
+    { workspaceId: "workspace" },
   );
   const child = await manager.createAgent(
     {
@@ -10197,7 +10286,7 @@ test("archiveAgent on an internal parent still archives its attached children", 
   await manager.createAgent(
     { provider: "codex", cwd: workdir, title: "Internal Parent", internal: true },
     undefined,
-    { workspaceId: undefined },
+    { workspaceId: "workspace" },
   );
   await manager.createAgent({ provider: "codex", cwd: workdir, title: "Child" }, undefined, {
     workspaceId: undefined,
@@ -10231,7 +10320,7 @@ test("archiveAgent on a parent archives its live internal children", async () =>
   });
 
   await manager.createAgent({ provider: "codex", cwd: workdir, title: "Parent" }, undefined, {
-    workspaceId: undefined,
+    workspaceId: "workspace",
   });
   // An internal child is never in storage, so only the live scan can reach it.
   await manager.createAgent(
@@ -10477,7 +10566,7 @@ test("onAgentAttention is not called for delegated child agents", async () => {
   });
 
   await manager.createAgent({ provider: "codex", cwd: workdir }, parentAgentId, {
-    workspaceId: undefined,
+    workspaceId: "workspace",
   });
   const agent = await manager.createAgent(
     {
@@ -11463,7 +11552,7 @@ test("fires onAgentArchived for archived parent and cascaded children", async ()
       title: "Parent",
     },
     undefined,
-    { workspaceId: undefined },
+    { workspaceId: "workspace" },
   );
   const liveChild = await manager.createAgent(
     { provider: "codex", cwd: workdir, title: "Child" },
@@ -11589,7 +11678,7 @@ test("unarchiveSnapshot unarchives native provider storage before clearing archi
     logger,
   });
   const parent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
-    workspaceId: undefined,
+    workspaceId: "workspace",
   });
 
   const agent = await manager.createAgent(
@@ -11704,7 +11793,7 @@ test("archiveAgent cascade archives in-memory children with the full archive con
       title: "Parent",
     },
     undefined,
-    { workspaceId: undefined },
+    { workspaceId: "workspace" },
   );
   const child = await manager.createAgent(
     {
@@ -11785,17 +11874,21 @@ test("archiveAgent detaches a cross-workspace child even when its tab is closed"
     undefined,
     { workspaceId: "workspace-a" },
   );
-  const child = await manager.createAgent(
-    { provider: "codex", cwd: workdir, title: "Cross-workspace child" },
-    undefined,
-    {
+  // Existing cross-workspace children can still be opened and detached on archive.
+  const childId = "00000000-0000-4000-8000-000000000101";
+  await storage.upsert(
+    parseStoredAgentRecord({
+      id: childId,
+      provider: "codex",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      cwd: workdir,
       workspaceId: "workspace-b",
-      labels: {
-        [PARENT_AGENT_ID_LABEL]: parent.id,
-        [DESKTOP_OPEN_AGENT_TAB_LABEL]: "false",
-      },
-    },
+      title: "Cross-workspace child",
+      labels: { [PARENT_AGENT_ID_LABEL]: parent.id, [DESKTOP_OPEN_AGENT_TAB_LABEL]: "false" },
+    }),
   );
+  const child = await manager.createAgentFromRecord(childId);
 
   await manager.archiveAgent(parent.id);
 
@@ -11826,19 +11919,23 @@ test.each([
       undefined,
       { workspaceId: "workspace-a" },
     );
-    const child = await manager.createAgent(
-      { provider: "codex", cwd: workdir, title: "Closed cross-workspace child" },
-      undefined,
-      {
+    const child = { id: "00000000-0000-4000-8000-000000000102" };
+    await storage.upsert(
+      parseStoredAgentRecord({
+        id: child.id,
+        provider: "codex",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        cwd: workdir,
         workspaceId,
+        title: "Closed child",
         labels: {
           [PARENT_AGENT_ID_LABEL]: parent.id,
           [DESKTOP_OPEN_AGENT_TAB_LABEL]: open,
           team: "ios",
         },
-      },
+      }),
     );
-    await manager.closeAgent(child.id);
     // Unfiltered, as a session subscribes: a closed survivor's update must reach every client.
     const emittedLabels: Array<Record<string, string>> = [];
     const unsubscribe = manager.subscribe(
@@ -12023,7 +12120,7 @@ test("archiveAgent cascade closes a running child runtime", async () => {
       title: "Parent",
     },
     undefined,
-    { workspaceId: undefined },
+    { workspaceId: "workspace" },
   );
   const child = await manager.createAgent(
     {
@@ -12081,7 +12178,7 @@ test("archiveAgent cascade archives off-memory children with the full archive co
       title: "Parent",
     },
     undefined,
-    { workspaceId: undefined },
+    { workspaceId: "workspace" },
   );
   const child = await manager.createAgent(
     {
@@ -12120,7 +12217,7 @@ test("archiveAgent cascade notifies subscribers for in-memory and off-memory chi
       title: "Parent",
     },
     undefined,
-    { workspaceId: undefined },
+    { workspaceId: "workspace" },
   );
   const inMemoryChild = await manager.createAgent(
     {
@@ -12198,7 +12295,7 @@ test("archiveAgent cascade surfaces partial child archive failures", async () =>
       title: "Parent",
     },
     undefined,
-    { workspaceId: undefined },
+    { workspaceId: "workspace" },
   );
   const child = await manager.createAgent(
     {
@@ -13140,7 +13237,7 @@ test("archiving a closed parent still cascades to its managed children", async (
     const parent = await manager.createAgent(
       { provider: "codex", cwd: workdir, title: "Closed parent" },
       undefined,
-      { workspaceId: undefined },
+      { workspaceId: "workspace" },
     );
     const child = await manager.createAgent(
       { provider: "codex", cwd: workdir, title: "Managed child" },
@@ -15598,7 +15695,7 @@ function idleCleanupHarness() {
     },
     create: (labels?: Record<string, string>) =>
       manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
-        workspaceId: undefined,
+        workspaceId: "workspace",
         labels,
       }),
     later: (minutes: number) => new Date(Date.now() + minutes * 60_000),
@@ -16588,7 +16685,7 @@ test("workspace archive preserves a loaded history agent stamp and stamps cascad
   });
   try {
     const parent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
-      workspaceId: undefined,
+      workspaceId: "workspace",
     });
     const child = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
       labels: { [PARENT_AGENT_ID_LABEL]: parent.id },

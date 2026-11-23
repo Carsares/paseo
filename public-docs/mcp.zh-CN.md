@@ -68,10 +68,9 @@ nav: MCP 参考
 
 工作区决定工作在哪里进行；Agent 的父子关系决定工作归谁所有。
 
-- 不带 `workspaceId` 调用 `create_agent` 的 Agent，会在它自己的工作区中得到一个子 Agent。
-- 传入 `workspaceId` 会把子 Agent 放到另一个工作区，但不会让它脱离父 Agent。
-- 没有工作区的顶层 MCP 调用方会得到一个新的本地工作区。
-- 需要 worktree 隔离、特定分支或 Pull Request 检出时，请先创建工作区。
+- 子 Agent 在父 Agent 所在主机创建，继承父 Agent 的工作区和目录。可以省略 `workspaceId`，或传入父 Agent 当前的 ID。
+- 由人操作的外部 MCP 客户端可以新建工作区、选择其他工作区或使用 worktree。Agent 会话不能新建项目或工作区。
+- 从 Agent 会话启动的 [CLI](/docs/cli) 遵循相同的工作区规则。
 
 MCP 不提供解除 Agent 父子关系的工具。解除关系是用户在应用或 CLI 中手动执行的操作。
 
@@ -79,29 +78,29 @@ MCP 不提供解除 Agent 父子关系的工具。解除关系是用户在应用
 
 ### Agent {#agents}
 
-| 工具                 | 功能                                                                                                                                                                                                                             |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `create_agent`       | 创建 Agent，可用 `workspaceId` 把它放到已有的工作区。用 `initialPrompt` 开始工作；不等待完成就返回。`background: true` 会把它从标签页、默认列表、你的子 Agent 列表和通知中隐藏；你仍会收到它的完成通知。省略时继承你自己的设置。 |
-| `send_agent_prompt`  | 用 `agentId` 和 `prompt` 发送提示词；不等待完成就返回。                                                                                                                                                                          |
-| `get_agent_status`   | 返回 Agent 的最新快照。                                                                                                                                                                                                          |
-| `list_agents`        | 以精简元数据列出最近的 Agent；`includeBackground: true` 会包含后台工作。                                                                                                                                                         |
-| `cancel_agent`       | 中止 Agent 当前的运行，但保留该 Agent。                                                                                                                                                                                          |
-| `archive_agent`      | 软删除 Agent，并把它从活动列表中移除。                                                                                                                                                                                           |
-| `kill_agent`         | 永久终止 Agent 会话。                                                                                                                                                                                                            |
-| `update_agent`       | 更新 Agent 的名称、标签或运行时设置，例如模式、模型、思考选项和功能。                                                                                                                                                            |
-| `get_agent_activity` | 以整理后的摘要返回 Agent 最近的时间线条目。                                                                                                                                                                                      |
-| `set_agent_mode`     | 切换 Agent 的会话模式。                                                                                                                                                                                                          |
+| 工具                 | 功能                                                                                                                                                                                                           |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `create_agent`       | 创建 Agent。子 Agent 继承父工作区。用 `initialPrompt` 开始工作；不等待完成就返回。`background: true` 会把它从标签页、默认列表、你的子 Agent 列表和通知中隐藏；你仍会收到它的完成通知。省略时继承你自己的设置。 |
+| `send_agent_prompt`  | 用 `agentId` 和 `prompt` 发送提示词；不等待完成就返回。                                                                                                                                                        |
+| `get_agent_status`   | 返回 Agent 的最新快照。                                                                                                                                                                                        |
+| `list_agents`        | 以精简元数据列出最近的 Agent；`includeBackground: true` 会包含后台工作。                                                                                                                                       |
+| `cancel_agent`       | 中止 Agent 当前的运行，但保留该 Agent。                                                                                                                                                                        |
+| `archive_agent`      | 软删除 Agent，并把它从活动列表中移除。                                                                                                                                                                         |
+| `kill_agent`         | 永久终止 Agent 会话。                                                                                                                                                                                          |
+| `update_agent`       | 更新 Agent 的名称、标签或运行时设置，例如模式、模型、思考选项和功能。                                                                                                                                          |
+| `get_agent_activity` | 以整理后的摘要返回 Agent 最近的时间线条目。                                                                                                                                                                    |
+| `set_agent_mode`     | 切换 Agent 的会话模式。                                                                                                                                                                                        |
 
 Paseo Agent 默认会收到完成、错误和权限通知；设置 `notifyOnFinish: false` 可以关闭它们。外部 MCP 客户端使用 `get_agent_status` 和 `get_agent_activity` 查看结果。
 
 ### 工作区 {#workspaces}
 
-| 工具                | 功能                                                                                                                                                                                                                                             |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `create_workspace`  | 创建本地工作区或使用 worktree 隔离的工作区。worktree 可以从某个分支分出、检出一个分支或一个 PR。`background: true` 会把它从默认列表和侧边栏中隐藏，同时保留历史记录和按 ID 访问。省略时继承调用方 Agent 工作区的设置；没有调用方时默认为 false。 |
-| `list_workspaces`   | 列出活动的工作区及其目录和隔离方式。使用 `includeBackground: true` 可以包含后台工作区。                                                                                                                                                          |
-| `rename_workspace`  | 修改当前或指定工作区在界面上显示的名称。                                                                                                                                                                                                         |
-| `archive_workspace` | 归档工作区及其拥有的会话。                                                                                                                                                                                                                       |
+| 工具                | 功能                                                                                                                                           |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `create_workspace`  | 由人操作的外部客户端可创建本地工作区或 worktree 工作区，支持分支和 Pull Request。`background: true` 可隐藏工作区。Agent 会话调用时会收到错误。 |
+| `list_workspaces`   | 列出活动的工作区及其目录和隔离方式。使用 `includeBackground: true` 可以包含后台工作区。                                                        |
+| `rename_workspace`  | 修改当前或指定工作区在界面上显示的名称。                                                                                                       |
+| `archive_workspace` | 归档工作区及其拥有的会话。                                                                                                                     |
 
 对于 worktree 隔离，`create_workspace` 接受与应用中相同的常用选择：从某个基础分支分出、检出一个已有分支，或检出一个 Pull Request。worktree 仍然是工作区生命周期的实现细节。
 

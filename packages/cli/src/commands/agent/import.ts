@@ -1,4 +1,5 @@
 import type { Command } from "commander";
+import { agentWorkspaceCreationError } from "../../utils/caller-agent.js";
 import { connectToDaemon } from "../../utils/client.js";
 import { collectMultiple } from "../../utils/command-options.js";
 import type { CommandError, CommandOptions, SingleResult } from "../../output/index.js";
@@ -112,6 +113,9 @@ export async function runImportCommand(
   const cwd = resolveImportCwd(options.cwd, process.cwd());
 
   const labels = parseImportLabels(options.label);
+  if (process.env.PASEO_AGENT_ID !== undefined) {
+    throw agentWorkspaceCreationError();
+  }
   const client = await connectToDaemon({ target: options.daemonTarget });
 
   try {

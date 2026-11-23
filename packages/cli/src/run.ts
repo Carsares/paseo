@@ -2,10 +2,13 @@ import { renderError, toCommandError, defaultOutputOptions } from "./output/rend
 import { createCli } from "./cli.js";
 import { classifyInvocation } from "./classify.js";
 import { openDesktopWithProject } from "./commands/open.js";
+import { agentWorkspaceCreationError } from "./utils/caller-agent.js";
 
 export interface RunCliOptions {
   cwd?: string;
   nodeArgv?: [string, string];
+  openProject?: typeof openDesktopWithProject;
+  stderr?: Pick<NodeJS.WriteStream, "write">;
 }
 
 export function createCliParseArgv(input: {
@@ -57,8 +60,21 @@ export async function runCli(argv: string[], options: RunCliOptions = {}): Promi
     nodeArgv: options.nodeArgv,
   });
 
+  function reportError(error: unknown): number {
+    (options.stderr ?? process.stderr).write(
+      renderError(toCommandError(error), {
+        ...defaultOutputOptions,
+        format: argv.includes("--json") ? "json" : "table",
+      }) + "\n",
+    );
+    return 1;
+  }
+
   if (!Array.isArray(parseArgv)) {
-    await openDesktopWithProject(parseArgv.resolvedPath);
+    if (process.env.PASEO_AGENT_ID !== undefined) {
+      return reportError(agentWorkspaceCreationError());
+    }
+    await (options.openProject ?? openDesktopWithProject)(parseArgv.resolvedPath);
     return typeof process.exitCode === "number" ? process.exitCode : 0;
   }
 
@@ -66,13 +82,7 @@ export async function runCli(argv: string[], options: RunCliOptions = {}): Promi
   try {
     await program.parseAsync(parseArgv, { from: "node" });
   } catch (error) {
-    process.stderr.write(
-      renderError(toCommandError(error), {
-        ...defaultOutputOptions,
-        format: argv.includes("--json") ? "json" : "table",
-      }) + "\n",
-    );
-    return 1;
+    return reportError(error);
   }
   return typeof process.exitCode === "number" ? process.exitCode : 0;
 }

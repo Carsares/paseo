@@ -8,13 +8,7 @@ import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
 import { getFullAccessConfig } from "./daemon-e2e/agent-configs.js";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 
-// The daemon-level workspace contract that `paseo run` depends on: each
-// local-backed createWorkspace for a cwd mints a fresh, distinct workspace,
-// createAgent stamps the agent with the workspaceId it is given, and attaching
-// to an existing workspace by id creates no new record. The CLI's own flag
-// precedence (--workspace > $PASEO_WORKSPACE_ID > --worktree > bare) is covered
-// in packages/cli/src/commands/agent/run.test.ts; this test only proves the
-// daemon behaviors the CLI builds on.
+// Human CLI runs can choose a workspace. A managed run belongs to its caller.
 
 async function workspaceIds(client: DaemonClient): Promise<Set<string>> {
   const workspaces = await client.fetchWorkspaces();
@@ -79,6 +73,9 @@ test("daemon resolves human and managed CLI workspace ownership", async () => {
     // $PASEO_WORKSPACE_ID land a run) creates no new workspace record: the
     // agent lands in the named workspace and the workspace set is unchanged.
     const idsBeforeAttach = await workspaceIds(client);
+    const projectIds = async () =>
+      new Set((await client.listProjects()).projects.map((project) => project.projectId));
+    const projectsBeforeAttach = await projectIds();
     const attachedAgent = await client.createAgent({
       ...getFullAccessConfig("codex"),
       cwd: path.join(otherCwd, "stale-client-directory"),
@@ -109,16 +106,17 @@ test("daemon resolves human and managed CLI workspace ownership", async () => {
     expect(sameWorkspaceChild.labels[PARENT_AGENT_ID_LABEL]).toBe(firstAgent.id);
     expect(await workspaceIds(client)).toEqual(idsBeforeAttach);
 
-    const crossWorkspaceChild = await client.createAgent({
-      ...getFullAccessConfig("codex"),
-      cwd,
-      workspaceId: secondWorkspaceId,
-      callerAgentId: firstAgent.id,
-      title: "Cross workspace child",
-    });
-    expect(crossWorkspaceChild.workspaceId).toBe(secondWorkspaceId);
-    expect(crossWorkspaceChild.cwd).toBe(otherCwd);
-    expect(crossWorkspaceChild.labels[PARENT_AGENT_ID_LABEL]).toBe(firstAgent.id);
+    await expect(
+      client.createAgent({
+        ...getFullAccessConfig("codex"),
+        cwd,
+        workspaceId: secondWorkspaceId,
+        callerAgentId: firstAgent.id,
+        title: "Cross workspace child",
+      }),
+    ).rejects.toThrow("Subagents must reuse the current workspace");
+    expect(await workspaceIds(client)).toEqual(idsBeforeAttach);
+    expect(await projectIds()).toEqual(projectsBeforeAttach);
   } finally {
     await client.close().catch(() => undefined);
     await daemon.close();

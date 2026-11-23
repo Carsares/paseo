@@ -10,7 +10,7 @@ category: Orchestration
 
 The Paseo CLI lets you manage agents from your terminal. It's the same interface exposed by the daemon's API, so anything you can do in the app you can do from the command line.
 
-> **Agent orchestration:** You can tell coding agents to use the Paseo CLI to spawn and manage other agents. Paseo recognizes the calling agent, so CLI-created workers get the same workspace and parent defaults as MCP-created workers.
+> **Agent orchestration:** You can tell coding agents to use the Paseo CLI to spawn and manage other agents. See [Running agents](#running-agents) for how Paseo assigns the workspace and parent.
 
 ## Quick reference
 
@@ -122,7 +122,7 @@ From a human shell, a bare `paseo run` creates a new local workspace for the cur
 
 Worktree creation accepts `--worktree-mode branch-off|checkout-branch|checkout-pr` plus the matching `--new-branch`/`--base`, `--branch`, or `--pr-number`/`--forge` options. Use `--worktree-slug` to choose the managed directory slug.
 
-When an existing Paseo agent runs the same command, Paseo recognizes it through `PASEO_AGENT_ID`. Without explicit placement, the new agent becomes its subagent in the same workspace. `--workspace` can place that subagent elsewhere without changing its parent.
+When a Paseo agent runs this command, Paseo resolves `PASEO_AGENT_ID` on the selected daemon. The new agent becomes its subagent and inherits its workspace and working directory. You can omit `--workspace` or pass the caller's workspace ID. The command rejects `--new-workspace`, `--worktree`, and a different workspace ID supplied through `--workspace` or `PASEO_WORKSPACE_ID`.
 
 Use `--output-schema` to return only matching JSON output. You can pass a schema file path or an inline JSON schema object. This mode cannot be used with `--no-wait`.
 
@@ -134,6 +134,8 @@ selected separately with `workspace create --background`; this release does not 
 `run --background`.
 
 ## Projects
+
+Use a human shell for `paseo project create`, `paseo workspace create`, `paseo worktree create`, and `paseo clone`. The same restriction applies to `paseo <directory>`, which registers a project in Desktop. Importing a provider session with `paseo import` or `paseo agent import` also requires a human shell because the import can create a workspace.
 
 Register the current directory as a project, then list the projects known to the daemon:
 
@@ -498,8 +500,6 @@ agent_id=$(paseo run --no-wait --quiet --title api-agent "implement the API")
 paseo wait "$agent_id"
 paseo logs "$agent_id" --tail 5
 ```
-
-Because Agent A's ID is present in the environment, Agent B is created as its subagent in the same workspace unless `--workspace` is specified.
 
 Simple implement + verify loop:
 

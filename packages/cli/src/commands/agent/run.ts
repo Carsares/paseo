@@ -4,7 +4,11 @@ import {
   StructuredAgentResponseError,
 } from "@getpaseo/server/agent-response";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
-import { resolveCallerAgentId } from "../../utils/caller-agent.js";
+import {
+  agentWorkspaceCreationError,
+  resolveCallerAgent,
+  type CallerAgentContext,
+} from "../../utils/caller-agent.js";
 import { connectToDaemon } from "../../utils/client.js";
 import type {
   CommandOptions,
@@ -142,7 +146,8 @@ export interface AgentRunOptions extends CommandOptions {
 }
 
 function resolveNewWorkspaceKind(options: AgentRunOptions): string | undefined {
-  return options.newWorkspace ?? (options.worktree ? "worktree" : undefined);
+  if (options.newWorkspace !== undefined) return options.newWorkspace;
+  return options.worktree !== undefined ? "worktree" : undefined;
 }
 
 function buildRunWorkspaceSource(options: AgentRunOptions, cwd: string) {
@@ -318,7 +323,7 @@ function structuredRunSchema(output: Record<string, unknown>): OutputSchema<Agen
 function validateRunWorkspaceOptions(options: AgentRunOptions): void {
   const newWorkspace = resolveNewWorkspaceKind(options);
   if (
-    options.newWorkspace &&
+    options.newWorkspace !== undefined &&
     options.newWorkspace !== "local" &&
     options.newWorkspace !== "worktree"
   ) {
@@ -329,7 +334,23 @@ function validateRunWorkspaceOptions(options: AgentRunOptions): void {
     } satisfies CommandError;
   }
 
-  if (options.newWorkspace && options.worktree) {
+  if (options.worktree !== undefined && !options.worktree.trim()) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--worktree cannot be empty",
+      details: "Provide a worktree name or omit --worktree",
+    } satisfies CommandError;
+  }
+
+  if (options.workspace !== undefined && !options.workspace.trim()) {
+    throw {
+      code: "INVALID_OPTIONS",
+      message: "--workspace cannot be empty",
+      details: "Provide a workspace ID or omit --workspace",
+    } satisfies CommandError;
+  }
+
+  if (options.newWorkspace !== undefined && options.worktree !== undefined) {
     throw {
       code: "INVALID_OPTIONS",
       message: "--new-workspace and --worktree cannot be combined",
@@ -365,7 +386,7 @@ function validateRunWorkspaceOptions(options: AgentRunOptions): void {
     }
   }
 
-  if (options.newWorkspace && options.workspace) {
+  if (options.newWorkspace !== undefined && options.workspace !== undefined) {
     throw {
       code: "INVALID_OPTIONS",
       message: "--new-workspace and --workspace cannot be combined",
@@ -375,7 +396,7 @@ function validateRunWorkspaceOptions(options: AgentRunOptions): void {
 
   // COMPAT(worktreeRunFlag): --worktree implies a new worktree-isolated workspace.
   // Added in v0.2.0; remove after 2027-01-17.
-  if (options.worktree && options.workspace) {
+  if (options.worktree !== undefined && options.workspace !== undefined) {
     throw {
       code: "INVALID_OPTIONS",
       message: "--worktree and --workspace cannot be combined",
@@ -395,6 +416,14 @@ function validateRunOptions(prompt: string, options: AgentRunOptions, outputSche
 
   if (options.background) {
     console.error("Warning: --background (-d) is deprecated. Use --no-wait instead.");
+  }
+
+  if (
+    process.env.PASEO_AGENT_ID !== undefined &&
+    (resolveNewWorkspaceKind(options) !== undefined ||
+      (options.workspace !== undefined && !options.workspace.trim()))
+  ) {
+    throw agentWorkspaceCreationError();
   }
 
   validateRunWorkspaceOptions(options);
@@ -535,27 +564,34 @@ export async function resolveExistingRunWorkspace(
   } satisfies CommandError;
 }
 
-// Workspace policy for `paseo run`. Precedence:
+// Workspace policy for `paseo run`. A managed caller always reuses its own
+// workspace and cwd. Human calls retain the existing precedence:
 //   1. --workspace <id>            -> run in that existing workspace
-//   2. caller agent                -> daemon resolves the caller's workspace
-//   3. $PASEO_WORKSPACE_ID         -> exported by workspace terminals
-//   4. --new-workspace <kind>      -> mint a new workspace explicitly
-//   5. bare run                    -> mint a new local-backed workspace for cwd
-async function resolveRunWorkspace(
+//   2. $PASEO_WORKSPACE_ID         -> exported by workspace terminals
+//   3. --new-workspace <kind>      -> mint a new workspace explicitly
+//   4. bare run                    -> mint a new local-backed workspace for cwd
+export async function resolveRunWorkspace(
   client: ConnectedDaemonClient,
   options: AgentRunOptions,
   cwd: string,
-  callerAgentId: string | undefined,
+  caller: CallerAgentContext | undefined,
 ): Promise<RunWorkspace> {
+  if (caller) {
+    const explicitWorkspaceId = options.workspace?.trim();
+    if (
+      resolveNewWorkspaceKind(options) !== undefined ||
+      (options.workspace !== undefined && explicitWorkspaceId !== caller.workspaceId)
+    ) {
+      throw agentWorkspaceCreationError();
+    }
+    return { id: caller.workspaceId, cwd: caller.cwd };
+  }
+
   const newWorkspace = resolveNewWorkspaceKind(options);
   const explicit = newWorkspace ? undefined : options.workspace?.trim();
   if (explicit) {
     console.error(`Using workspace ${explicit}`);
     return resolveExistingRunWorkspace(client, explicit);
-  }
-
-  if (!newWorkspace && callerAgentId) {
-    return { cwd };
   }
 
   const ambientWorkspaceId = newWorkspace ? undefined : process.env.PASEO_WORKSPACE_ID?.trim();
@@ -569,7 +605,6 @@ async function resolveRunWorkspace(
   const source = buildRunWorkspaceSource(options, cwd);
   const result = await client.createWorkspace({
     source,
-    ...(callerAgentId ? { callerAgentId } : {}),
   });
 
   if (!result.workspace) {
@@ -624,8 +659,8 @@ export async function runRunCommand(
     const env = parseRunEnv(options.env);
     const requestEnv = Object.keys(env).length > 0 ? env : undefined;
 
-    const callerAgentId = await resolveCallerAgentId(client);
-    const workspace = await resolveRunWorkspace(client, options, cwd, callerAgentId);
+    const caller = await resolveCallerAgent(client);
+    const workspace = await resolveRunWorkspace(client, options, cwd, caller);
     const workspaceId = workspace.id;
     const runCwd = workspace.cwd;
 
@@ -638,7 +673,7 @@ export async function runRunCommand(
             provider: resolvedProviderModel.provider,
             cwd: runCwd,
             workspaceId,
-            callerAgentId,
+            callerAgentId: caller?.id,
             title: resolvedTitle,
             modeId: options.mode,
             model: resolvedProviderModel.model,
@@ -709,7 +744,7 @@ export async function runRunCommand(
       provider: resolvedProviderModel.provider,
       cwd: runCwd,
       workspaceId,
-      callerAgentId,
+      callerAgentId: caller?.id,
       title: resolvedTitle,
       modeId: options.mode,
       model: resolvedProviderModel.model,

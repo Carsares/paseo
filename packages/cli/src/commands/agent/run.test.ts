@@ -3,6 +3,7 @@ import { DaemonConnectionError } from "@getpaseo/client/internal/daemon-client";
 import { resolveCallerAgentId as resolveRunCallerAgentId } from "../../utils/caller-agent.js";
 import {
   resolveExistingRunWorkspace,
+  resolveRunWorkspace,
   runRunCommand,
   waitsForFinish,
   type AgentRunOptions,
@@ -17,7 +18,14 @@ function daemonWithAgents(...agentIds: string[]) {
       if (!agentIds.includes(agentId)) {
         throw new Error(`Agent not found: ${agentId}`);
       }
-      return { agent: { id: agentId } };
+      return {
+        agent: {
+          id: agentId,
+          cwd: "/parent/workspace",
+          workspaceId: "workspace-parent",
+          archivedAt: null,
+        },
+      };
     },
   };
 }
@@ -40,12 +48,61 @@ describe("managed agent caller context", () => {
     ).resolves.toBe("parent-agent");
   });
 
-  it("runs without a caller when PASEO_AGENT_ID belongs to another daemon", async () => {
+  it("rejects when PASEO_AGENT_ID belongs to another daemon", async () => {
     await expect(
       resolveRunCallerAgentId(daemonWithAgents("other-agent"), {
         PASEO_AGENT_ID: "parent-agent",
       }),
-    ).resolves.toBeUndefined();
+    ).rejects.toMatchObject({ code: "INVALID_CALLER_AGENT" });
+  });
+
+  it("rejects a daemon response whose agent ID does not match the environment", async () => {
+    await expect(
+      resolveRunCallerAgentId(
+        {
+          fetchAgent: async () => ({
+            agent: {
+              id: "other-agent",
+              cwd: "/parent/workspace",
+              workspaceId: "workspace-parent",
+              archivedAt: null,
+            },
+          }),
+        },
+        { PASEO_AGENT_ID: "parent-agent" },
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_CALLER_AGENT" });
+  });
+
+  it("rejects an archived caller", async () => {
+    await expect(
+      resolveRunCallerAgentId(
+        {
+          fetchAgent: async () => ({
+            agent: {
+              id: "parent-agent",
+              cwd: "/parent/workspace",
+              workspaceId: "workspace-parent",
+              archivedAt: "2026-11-23T00:00:00.000Z",
+            },
+          }),
+        },
+        { PASEO_AGENT_ID: "parent-agent" },
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_CALLER_AGENT" });
+  });
+
+  it("rejects a caller without a workspace", async () => {
+    await expect(
+      resolveRunCallerAgentId(
+        {
+          fetchAgent: async () => ({
+            agent: { id: "parent-agent", cwd: "/parent/workspace" },
+          }),
+        },
+        { PASEO_AGENT_ID: "parent-agent" },
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_CALLER_AGENT" });
   });
 
   it.each(["DAEMON_CONNECTION_LOST", "DAEMON_REQUEST_TIMEOUT"] as const)(
@@ -63,10 +120,10 @@ describe("managed agent caller context", () => {
     },
   );
 
-  it("omits blank caller ids", async () => {
+  it("rejects blank caller ids instead of treating them as human calls", async () => {
     await expect(
       resolveRunCallerAgentId(daemonWithAgents(), { PASEO_AGENT_ID: "   " }),
-    ).resolves.toBeUndefined();
+    ).rejects.toMatchObject({ code: "INVALID_CALLER_AGENT" });
   });
 });
 
@@ -100,15 +157,34 @@ describe("existing run workspace resolution", () => {
       },
     );
   });
+
+  it("uses the caller snapshot when the ambient workspace ID is stale", async () => {
+    const previousWorkspaceId = process.env.PASEO_WORKSPACE_ID;
+    process.env.PASEO_WORKSPACE_ID = "stale-workspace";
+    try {
+      await expect(
+        resolveRunWorkspace({} as never, { daemonTarget }, "/requested/by-caller", {
+          id: "parent-agent",
+          cwd: "/parent/workspace",
+          workspaceId: "workspace-parent",
+        }),
+      ).resolves.toEqual({ id: "workspace-parent", cwd: "/parent/workspace" });
+    } finally {
+      if (previousWorkspaceId === undefined) delete process.env.PASEO_WORKSPACE_ID;
+      else process.env.PASEO_WORKSPACE_ID = previousWorkspaceId;
+    }
+  });
 });
 
 // validateRunOptions runs before the CLI ever connects to a daemon, so these
 // invalid combinations reject without one running.
 describe("runRunCommand option validation", () => {
   const originalWorkspaceId = process.env.PASEO_WORKSPACE_ID;
+  const originalAgentId = process.env.PASEO_AGENT_ID;
 
   beforeEach(() => {
     delete process.env.PASEO_WORKSPACE_ID;
+    delete process.env.PASEO_AGENT_ID;
   });
 
   afterEach(() => {
@@ -117,6 +193,8 @@ describe("runRunCommand option validation", () => {
     } else {
       process.env.PASEO_WORKSPACE_ID = originalWorkspaceId;
     }
+    if (originalAgentId === undefined) delete process.env.PASEO_AGENT_ID;
+    else process.env.PASEO_AGENT_ID = originalAgentId;
   });
 
   async function expectInvalidOptions(
@@ -155,12 +233,44 @@ describe("runRunCommand option validation", () => {
     await expectInvalidOptions({ newWorkspace: "container" }, /Unsupported new workspace kind/);
   });
 
+  it("rejects an explicitly empty new workspace kind", async () => {
+    await expectInvalidOptions({ newWorkspace: "" }, /Unsupported new workspace kind/);
+  });
+
+  it("rejects an explicitly empty legacy worktree value", async () => {
+    await expectInvalidOptions({ worktree: "" }, /--worktree cannot be empty/);
+  });
+
+  it("rejects an explicitly empty workspace ID", async () => {
+    await expectInvalidOptions({ workspace: "" }, /--workspace cannot be empty/);
+  });
+
   it("rejects two workspace creation flags", async () => {
     await expectInvalidOptions(
       { newWorkspace: "local", worktree: "legacy-slug" },
       /--new-workspace and --worktree cannot be combined/,
     );
   });
+
+  it.each([{ newWorkspace: "local" }, { newWorkspace: "" }, { worktree: "" }, { workspace: "" }])(
+    "uses the canonical workspace error for managed workspace options %j",
+    async (options) => {
+      const previousAgentId = process.env.PASEO_AGENT_ID;
+      process.env.PASEO_AGENT_ID = "parent-agent";
+      try {
+        await expect(
+          runRunCommand("do something", { ...options, daemonTarget }, {} as never),
+        ).rejects.toMatchObject({
+          code: "AGENT_WORKSPACE_CREATION_FORBIDDEN",
+          message:
+            "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.",
+        });
+      } finally {
+        if (previousAgentId === undefined) delete process.env.PASEO_AGENT_ID;
+        else process.env.PASEO_AGENT_ID = previousAgentId;
+      }
+    },
+  );
 
   it("rejects an unknown worktree creation mode before connecting", async () => {
     await expectInvalidOptions(

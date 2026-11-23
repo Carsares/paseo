@@ -82,6 +82,7 @@ import {
   EXPLICIT_PARENT_REPORTING,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
+  parentAddressLabels,
 } from "@getpaseo/protocol/agent-labels";
 import { PASEO_TOOL_NAMES } from "@getpaseo/protocol/paseo-tool-presentation/index";
 import { MutableDaemonConfigSchema, type AgentProfile } from "@getpaseo/protocol/messages";
@@ -90,6 +91,8 @@ import type { BrowserToolsBroker, BrowserToolsExecuteInput } from "../browser-to
 import type { BrowserToolsResponsePayload } from "../browser-tools/errors.js";
 import { createWorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
 
+const AGENT_WORKSPACE_CREATION_ERROR =
+  "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.";
 const REPO_CWD = resolvePath("/tmp/repo");
 const TARGET_CWD = resolvePath("/tmp/target");
 const BROWSER_WORKSPACE_ID = "wks_browser_tools";
@@ -899,6 +902,26 @@ function createPaseoWorktreeForMcpTest(options: {
 }
 
 // Typed in-memory workspace port for catalogue tests without workspace setup.
+function testWorkspaceRegistry(
+  workspaceId: string,
+  cwd: string,
+): Pick<WorkspaceRegistry, "get" | "listActive" | "update"> {
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId,
+    projectId: "project-test",
+    cwd,
+    kind: "directory",
+    displayName: "Parent workspace",
+    createdAt: "2026-07-03T00:00:00.000Z",
+    updatedAt: "2026-07-03T00:00:00.000Z",
+  });
+  return {
+    get: async (id) => (id === workspaceId ? workspace : null),
+    listActive: async () => [workspace],
+    update: async () => null,
+  };
+}
+
 async function createAgentMcpServer(
   options: Parameters<typeof createAgentMcpServerWithDependencies>[0],
   subscriptionStore?: FinishSubscriptionStore,
@@ -935,11 +958,9 @@ async function createAgentMcpServer(
   const server = await createAgentMcpServerWithDependencies({
     agentMessages: () => messages,
     finishSubscriptions: () => subscriptions,
-    workspaceRegistry: {
-      get: async () => null,
-      listActive: async () => [],
-      update: async () => null,
-    },
+    workspaceRegistry: options.callerAgentId
+      ? testWorkspaceRegistry("wks_parent", process.cwd())
+      : { get: async () => null, listActive: async () => [], update: async () => null },
     ...options,
   });
   serverSubscriptionRecords.set(server, records);
@@ -1696,6 +1717,35 @@ describe("create_agent MCP tool", () => {
     );
   });
 
+  it("rejects creation with a foreign parent before provisioning or routing", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const ensureWorkspace = vi.fn(async () => "unwanted-workspace");
+    const hosts = vi.fn();
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      ensureWorkspaceForCreate: ensureWorkspace,
+      serverId: "local",
+      hosts,
+      logger,
+    });
+    for (const serverId of [undefined, "remote"]) {
+      await expect(
+        invokeToolWithParsedInput(registeredTool(server, "create_agent"), {
+          title: "Child with foreign parent",
+          provider: "codex/gpt-5.4",
+          initialPrompt: "Do work",
+          labels: parentAddressLabels({ agentId: "parent", serverId: "other" }),
+          serverId,
+        }),
+      ).rejects.toThrow(AGENT_WORKSPACE_CREATION_ERROR);
+    }
+    expect(ensureWorkspace).not.toHaveBeenCalled();
+    expect(hosts).not.toHaveBeenCalled();
+    expect(spies.agentManager.createAgent).not.toHaveBeenCalled();
+  });
+
   it("rejects public internal helpers", async () => {
     const workdir = await mkdtemp(join(tmpdir(), "mcp-public-helper-removal-"));
     const storage = new AgentStorage(join(workdir, "agents"), logger);
@@ -1797,7 +1847,7 @@ describe("create_agent MCP tool", () => {
         provider: "codex/gpt-5.4",
         initialPrompt: "Do work",
       }),
-    ).rejects.toThrow("Caller agent parent-agent has no current workspace");
+    ).rejects.toThrow(AGENT_WORKSPACE_CREATION_ERROR);
   });
 
   it("attaches create_agent to an existing workspace id", async () => {
@@ -2826,11 +2876,9 @@ describe("create_agent MCP tool", () => {
     expect(parsed.success).toBe(true);
   });
 
-  it("allows caller agents to override cwd and applies caller context labels", async () => {
+  it("inherits the parent's cwd with legacy placement and applies caller context labels", async () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
     const baseDir = await mkdtemp(join(tmpdir(), "paseo-mcp-test-"));
-    const subdir = join(baseDir, "subdir");
-    await mkdir(subdir, { recursive: true });
     spies.agentManager.getAgent.mockReturnValue({
       id: "voice-agent",
       config: { title: "Voice" },
@@ -2841,7 +2889,7 @@ describe("create_agent MCP tool", () => {
     } as ManagedAgent);
     spies.agentManager.createAgent.mockResolvedValue({
       id: "child-agent",
-      cwd: subdir,
+      cwd: baseDir,
       lifecycle: "idle",
       currentModeId: null,
       availableModes: [],
@@ -2853,6 +2901,7 @@ describe("create_agent MCP tool", () => {
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
       callerAgentId: "voice-agent",
+      workspaceRegistry: testWorkspaceRegistry("wks_voice", baseDir),
       resolveCallerContext: () => ({
         childAgentDefaultLabels: { source: "voice" },
         allowCustomCwd: true,
@@ -2870,7 +2919,7 @@ describe("create_agent MCP tool", () => {
 
     expect(spies.agentManager.createAgent).toHaveBeenCalledWith(
       expect.objectContaining({
-        cwd: subdir,
+        cwd: baseDir,
       }),
       undefined,
       {
@@ -2880,13 +2929,13 @@ describe("create_agent MCP tool", () => {
         },
         workspaceId: "wks_voice",
         background: false,
-        inheritParentWorkspace: false,
+        inheritParentWorkspace: true,
       },
     );
     await rm(baseDir, { recursive: true, force: true });
   });
 
-  it("defaults notify-on-finish on for caller agents", async () => {
+  it("keeps omitted finish notification settings implicit for caller agents", async () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
     spies.agentManager.getAgent.mockReturnValue({
       id: "parent-agent",
@@ -2919,8 +2968,9 @@ describe("create_agent MCP tool", () => {
     expect(parsed.data).toMatchObject({
       relationship: { kind: "subagent" },
       workspace: { kind: "current" },
-      notifyOnFinish: true,
     });
+    expect(parsed.data).not.toHaveProperty("notifyOnFinish");
+    expect(tool.inputSchema).not.toHaveProperty("shape.serverId");
   });
 
   it("returns notify-on-finish guidance for caller-created agents", async () => {
@@ -3013,59 +3063,146 @@ describe("create_agent MCP tool", () => {
     }
   });
 
-  it("creates detached caller agents without a parent label", async () => {
+  it("rejects detached, new, and different workspace placement before creation", async () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
-    spies.agentManager.getAgent.mockReturnValue({
-      id: "parent-agent",
-      config: {},
-      cwd: existingCwd,
-      workspaceId: "wks_parent",
-      provider: "codex",
-      currentModeId: "full-access",
-    } as ManagedAgent);
-    spies.agentManager.createAgent.mockResolvedValue({
-      id: "detached-agent",
-      cwd: existingCwd,
-      lifecycle: "idle",
-      currentModeId: null,
-      availableModes: [],
-      config: { title: "Detached" },
-    } as ManagedAgent);
-
+    spies.agentManager.getAgent.mockReturnValue(
+      createManagedAgent({ id: "parent-agent", workspaceId: "wks_parent", cwd: existingCwd }),
+    );
+    const ensureWorkspace = vi.fn(async () => "unwanted-workspace");
+    const createDirectoryWorkspace = vi.fn();
+    const createPaseoWorktree = vi.fn();
+    const hosts = vi.fn();
     const server = await createAgentMcpServer({
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
       callerAgentId: "parent-agent",
+      ensureWorkspaceForCreate: ensureWorkspace,
+      createDirectoryWorkspace,
+      createPaseoWorktree,
+      hosts,
       logger,
     });
 
     const tool = registeredTool(server, "create_agent");
-    await tool.handler({
-      ...detachedCurrentWorkspace(),
-      title: "Detached",
-      provider: "codex/gpt-5.4",
-      initialPrompt: "Take over",
-      labels: {
-        [PARENT_AGENT_ID_LABEL]: "spoofed-parent",
-        source: "handoff",
+    const args = { title: "Child", provider: "codex/gpt-5.4", initialPrompt: "Take over" };
+    for (const placement of [
+      detachedCurrentWorkspace(),
+      { workspaceId: "wks_other" },
+      { serverId: "remote", workspaceId: "wks_parent" },
+      {
+        ...subagentCurrentWorkspace(),
+        workspace: { kind: "create", source: { kind: "directory" } },
       },
-    });
+      {
+        ...subagentCurrentWorkspace(),
+        workspace: { kind: "create", source: { kind: "worktree" } },
+      },
+      { ...subagentCurrentWorkspace(), workspace: { kind: "worktree" } },
+      { worktreeName: "old-placement" },
+      { ...subagentCurrentWorkspace(), workspace: { kind: "existing", workspaceId: "wks_other" } },
+    ]) {
+      await expect(invokeToolWithParsedInput(tool, { ...args, ...placement })).rejects.toThrow(
+        AGENT_WORKSPACE_CREATION_ERROR,
+      );
+    }
+    for (const serverId of [undefined, "remote"]) {
+      await expect(
+        invokeToolWithParsedInput(registeredTool(server, "create_workspace"), {
+          serverId,
+          isolation: "local",
+          path: existingCwd,
+        }),
+      ).rejects.toThrow(AGENT_WORKSPACE_CREATION_ERROR);
+    }
+    expect(spies.agentManager.createAgent).not.toHaveBeenCalled();
+    expect(ensureWorkspace).not.toHaveBeenCalled();
+    expect(createDirectoryWorkspace).not.toHaveBeenCalled();
+    expect(createPaseoWorktree).not.toHaveBeenCalled();
+    expect(hosts).not.toHaveBeenCalled();
+  });
 
-    expect(spies.agentManager.createAgent).toHaveBeenCalledWith(
-      expect.objectContaining({
+  it("fails closed for a missing parent or workspace before creating a child or terminal", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const ensureWorkspace = vi.fn(async () => "unwanted-workspace");
+    const createTerminal = vi.fn();
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      callerAgentId: "parent-agent",
+      terminalManager: createTerminalManagerStub({ createTerminal }),
+      ensureWorkspaceForCreate: ensureWorkspace,
+      logger,
+    });
+    for (const parent of [
+      null,
+      createManagedAgent({
+        id: "parent-agent",
+        workspaceId: "missing-workspace",
         cwd: existingCwd,
       }),
-      undefined,
-      {
-        labels: {
-          source: "handoff",
-        },
-        workspaceId: "wks_parent",
-        background: false,
-        inheritParentWorkspace: false,
+    ]) {
+      spies.agentManager.getAgent.mockReturnValue(parent);
+      await expect(
+        invokeToolWithParsedInput(registeredTool(server, "create_agent"), {
+          title: "Child",
+          provider: "codex/gpt-5.4",
+          initialPrompt: "Do work",
+        }),
+      ).rejects.toThrow(AGENT_WORKSPACE_CREATION_ERROR);
+      await expect(
+        invokeToolWithParsedInput(registeredTool(server, "create_terminal"), { cwd: existingCwd }),
+      ).rejects.toThrow(AGENT_WORKSPACE_CREATION_ERROR);
+    }
+    expect(spies.agentManager.createAgent).not.toHaveBeenCalled();
+    expect(ensureWorkspace).not.toHaveBeenCalled();
+    expect(createTerminal).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { format: "workspaceId", placement: { workspaceId: "wks_parent" } },
+    {
+      format: "legacy existing placement",
+      placement: {
+        relationship: { kind: "subagent" },
+        workspace: { kind: "existing", workspaceId: "wks_parent" },
       },
+    },
+  ])("rejects $format when the parent moves after preflight", async ({ placement }) => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const parent = createManagedAgent({ id: "parent-agent", workspaceId: "wks_parent" });
+    spies.agentManager.getAgent.mockReturnValue(parent);
+    spies.agentManager.createAgent.mockResolvedValue(
+      createManagedAgent({ id: "child-agent", workspaceId: "wks_moved" }),
     );
+    const original = testWorkspaceRegistry("wks_parent", existingCwd);
+    const moved = testWorkspaceRegistry("wks_moved", existingCwd);
+    const getWorkspace = vi.fn(moved.get).mockImplementationOnce(async (id) => {
+      const workspace = await original.get(id);
+      // The pending preflight still uses the parent's original workspace.
+      spies.agentManager.getAgent.mockReturnValue({ ...parent, workspaceId: "wks_moved" });
+      return workspace;
+    });
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      callerAgentId: parent.id,
+      workspaceRegistry: { ...original, get: getWorkspace },
+      logger,
+    });
+    await expect(
+      invokeToolWithParsedInput(registeredTool(server, "create_agent"), {
+        ...placement,
+        title: "Child",
+        provider: "codex/gpt-5.4",
+        initialPrompt: "Do work",
+        notifyOnFinish: false,
+      }),
+    ).rejects.toThrow(AGENT_WORKSPACE_CREATION_ERROR);
+    expect(getWorkspace).toHaveBeenCalledExactlyOnceWith("wks_parent");
+    expect(spies.agentManager.createAgent).not.toHaveBeenCalled();
   });
 
   it("accepts provider features from caller agents and passes them through createAgent", async () => {
@@ -3126,7 +3263,7 @@ describe("create_agent MCP tool", () => {
         },
         workspaceId: "wks_parent",
         background: false,
-        inheritParentWorkspace: false,
+        inheritParentWorkspace: true,
       },
     );
   });
@@ -3214,7 +3351,7 @@ describe("create_agent MCP tool", () => {
       });
       const tool = registeredTool(server, "create_agent");
       const result = await tool.handler({
-        ...subagentCurrentWorkspace(),
+        workspaceId: "wks_parent",
         title: "Child",
         provider: "codex/gpt-5.4",
         initialPrompt: "Do work",

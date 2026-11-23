@@ -8,7 +8,7 @@ nav: CLI 参考
 
 Paseo CLI 让你在终端中管理 Agent。它与 daemon 的 API 提供的接口相同，因此能在应用中做的事，都可以在命令行中完成。
 
-> **Agent 编排**：你可以让编程 Agent 使用 Paseo CLI 启动和管理其他 Agent。Paseo 会识别发起调用的 Agent，因此通过 CLI 创建的执行者与通过 MCP 创建的执行者获得相同的工作区和父级默认值。
+> **Agent 编排**：你可以让编程 Agent 使用 Paseo CLI 启动和管理其他 Agent。参见[运行 Agent](#running-agents)，了解 Paseo 如何确定工作区和父 Agent。
 
 ## 速查 {#quick-reference}
 
@@ -117,7 +117,7 @@ paseo run --output-schema '{"type":"object","properties":{"summary":{"type":"str
 
 创建 worktree 时接受 `--worktree-mode branch-off|checkout-branch|checkout-pr`，以及相应的 `--new-branch`/`--base`、`--branch` 或 `--pr-number`/`--forge` 选项。使用 `--worktree-slug` 选择托管目录的 slug。
 
-当一个已有的 Paseo Agent 运行同样的命令时，Paseo 会通过 `PASEO_AGENT_ID` 识别它。如果没有显式指定位置，新的 Agent 会成为它在同一工作区中的子 Agent。`--workspace` 可以把这个子 Agent 放到其他地方，而不改变它的父 Agent。
+Paseo Agent 运行这条命令时，Paseo 会在选定的 daemon 上查找 `PASEO_AGENT_ID` 对应的 Agent。新 Agent 会成为它的子 Agent，并沿用它的工作区和工作目录。可以省略 `--workspace`，也可以传入调用方的工作区 ID。命令会拒绝 `--new-workspace`、`--worktree`，以及通过 `--workspace` 或 `PASEO_WORKSPACE_ID` 指定的其他工作区。
 
 使用 `--output-schema` 只返回符合 schema 的 JSON 输出。你可以传入 schema 文件路径，或内联的 JSON schema 对象。此模式不能与 `--no-wait` 一起使用。
 
@@ -126,6 +126,8 @@ paseo run --output-schema '{"type":"object","properties":{"summary":{"type":"str
 旧的 `run --background` 和 `-d` 别名仍然表示 `--no-wait`。它们已被弃用，不会出现在帮助中，并会向 stderr 输出警告。请在脚本中使用 `--no-wait`。工作区的可见性通过 `workspace create --background` 单独选择；本版本不会改变 `run --background` 的含义。
 
 ## 项目 {#projects}
+
+请在人工操作的 shell 中运行 `paseo project create`、`paseo workspace create`、`paseo worktree create` 和 `paseo clone`。通过 `paseo <directory>` 在桌面端注册项目也适用这一限制。`paseo import` 和 `paseo agent import` 也需要在人工操作的 shell 中运行，因为导入 Provider 会话可能创建工作区。
 
 把当前目录注册为项目，然后列出 daemon 知道的项目：
 
@@ -477,8 +479,6 @@ agent_id=$(paseo run --no-wait --quiet --title api-agent "implement the API")
 paseo wait "$agent_id"
 paseo logs "$agent_id" --tail 5
 ```
-
-由于 Agent A 的 ID 存在于环境变量中，除非指定了 `--workspace`，Agent B 会作为它的子 Agent 创建在同一个工作区中。
 
 简单的实现加验证循环：
 

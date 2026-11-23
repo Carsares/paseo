@@ -479,36 +479,26 @@ test("background workspaces keep durable agents addressable through restart and 
   ).toContain(hidden.id);
   const child = await ctx.client.createAgent({ config, callerAgentId: hidden.id });
   expect(child).toMatchObject({ workspaceId: hidden.workspaceId, background: true });
-  const inherited = await ctx.client.createWorkspace({
-    source: { kind: "directory", path: cwd },
-    callerAgentId: hidden.id,
-  });
-  expect(inherited.workspace?.background).toBe(true);
-  const visible = await ctx.client.createWorkspace({
-    source: { kind: "directory", path: cwd },
-    callerAgentId: hidden.id,
-    background: false,
-  });
-  expect(visible.workspace?.background).toBe(false);
-  const inheritedWorktree = await ctx.client.createAgent({
-    config,
-    callerAgentId: hidden.id,
-    worktree: { mode: "branch-off", newBranch: "background-child", base: "main" },
-  });
-  const overriddenWorktree = await ctx.client.createAgent({
-    config,
-    callerAgentId: hidden.id,
-    background: false,
-    worktree: { mode: "branch-off", newBranch: "visible-child", base: "main" },
-  });
-  const workspaces = (await ctx.client.fetchWorkspaces({ filter: { includeBackground: true } }))
-    .entries;
-  expect(workspaces.find((entry) => entry.id === inheritedWorktree.workspaceId)?.background).toBe(
-    true,
-  );
-  expect(workspaces.find((entry) => entry.id === overriddenWorktree.workspaceId)?.background).toBe(
-    false,
-  );
+  const worktrees = () => execFileSync("git", ["worktree", "list", "--porcelain"], { cwd });
+  const beforeWorktrees = worktrees();
+  for (const background of [undefined, false]) {
+    const denied = await ctx.client.createWorkspace({
+      source: { kind: "directory", path: cwd },
+      callerAgentId: hidden.id,
+      background,
+    });
+    expect(denied.workspace).toBeNull();
+    expect(denied.error).toContain("Subagents must reuse the current workspace");
+    await expect(
+      ctx.client.createAgent({
+        config,
+        callerAgentId: hidden.id,
+        background,
+        worktree: { mode: "branch-off", newBranch: "background-child", base: "main" },
+      }),
+    ).rejects.toThrow("Subagents must reuse the current workspace");
+  }
+  expect(worktrees()).toEqual(beforeWorktrees);
 
   expect(hidden.background).toBe(true);
   const visibleInHidden = await ctx.client.createAgent({

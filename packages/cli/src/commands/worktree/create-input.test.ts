@@ -1,8 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runCreateCommandWithDeps } from "./create.js";
 import { buildCreateWorktreeRequest, type WorktreeCreateOptions } from "./create-input.js";
 
 const REPO = "/tmp/repo";
+const originalAgentId = process.env.PASEO_AGENT_ID;
+
+beforeEach(() => {
+  delete process.env.PASEO_AGENT_ID;
+});
+
+afterEach(() => {
+  if (originalAgentId === undefined) delete process.env.PASEO_AGENT_ID;
+  else process.env.PASEO_AGENT_ID = originalAgentId;
+});
 
 function build(options: WorktreeCreateOptions): unknown {
   try {
@@ -90,6 +100,7 @@ it("uses the explicit worktree creation RPC and returns the created worktree det
     },
     {
       connectToDaemon: async () => ({
+        fetchAgent: async () => null,
         createPaseoWorktree: async (input) => {
           expect(input).toEqual({
             cwd: REPO,
@@ -126,4 +137,46 @@ it("uses the explicit worktree creation RPC and returns the created worktree det
     branchName: "topic",
     worktreePath: `${REPO}/topic`,
   });
+});
+
+it("rejects worktree creation from a managed agent before the mutation", async () => {
+  const previousAgentId = process.env.PASEO_AGENT_ID;
+  process.env.PASEO_AGENT_ID = "parent-agent";
+  const createPaseoWorktree = async () => {
+    throw new Error("worktree mutation should not run");
+  };
+
+  try {
+    await expect(
+      runCreateCommandWithDeps(
+        {
+          daemonTarget: { kind: "endpoint", host: "example.test:12345" },
+          mode: "branch-off",
+          newBranch: "topic",
+          cwd: REPO,
+        },
+        {
+          connectToDaemon: async () => ({
+            fetchAgent: async () => ({
+              agent: {
+                id: "parent-agent",
+                cwd: REPO,
+                workspaceId: "workspace-parent",
+                archivedAt: null,
+              },
+            }),
+            createPaseoWorktree,
+            close: async () => {},
+          }),
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_WORKSPACE_CREATION_FORBIDDEN",
+      message:
+        "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.",
+    });
+  } finally {
+    if (previousAgentId === undefined) delete process.env.PASEO_AGENT_ID;
+    else process.env.PASEO_AGENT_ID = previousAgentId;
+  }
 });

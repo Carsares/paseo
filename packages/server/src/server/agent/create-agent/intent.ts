@@ -5,6 +5,9 @@ import {
   RESERVED_HIERARCHY_LABELS,
 } from "../hierarchy-policy.js";
 
+export const AGENT_WORKSPACE_CREATION_ERROR =
+  "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.";
+
 export interface CreateAgentCaller {
   id: string;
   cwd: string;
@@ -57,7 +60,10 @@ export async function resolveCreateAgentIntent(input: {
   createWorkspace: () => Promise<CreateAgentPlacement>;
   legacyDetached?: boolean;
 }): Promise<CreateAgentIntent> {
-  const parentAgentId = input.legacyDetached ? null : (input.caller?.id ?? null);
+  if (input.caller && input.legacyDetached) {
+    throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+  }
+  const parentAgentId = input.caller?.id ?? null;
   const labels = {
     ...input.childAgentDefaultLabels,
     ...input.labels,
@@ -102,14 +108,22 @@ async function resolvePlacement(input: {
   resolveWorkspace: (workspaceId: string) => Promise<CreateAgentPlacement>;
   createWorkspace: () => Promise<CreateAgentPlacement>;
 }): Promise<CreateAgentPlacement> {
-  if (input.explicitWorkspaceId) {
-    return input.resolveWorkspace(input.explicitWorkspaceId);
-  }
   if (input.caller) {
     if (!input.caller.workspaceId) {
-      throw new Error(`Caller agent ${input.caller.id} has no workspace`);
+      throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
     }
+    if (
+      input.explicitWorkspaceId !== undefined &&
+      input.explicitWorkspaceId !== input.caller.workspaceId
+    ) {
+      throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+    }
+
+    await input.resolveWorkspace(input.caller.workspaceId);
     return { workspaceId: input.caller.workspaceId, cwd: input.caller.cwd };
+  }
+  if (input.explicitWorkspaceId) {
+    return input.resolveWorkspace(input.explicitWorkspaceId);
   }
   return input.createWorkspace();
 }

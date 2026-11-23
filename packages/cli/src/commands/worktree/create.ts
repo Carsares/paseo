@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { Command } from "commander";
 import { connectToDaemon } from "../../utils/client.js";
+import { agentWorkspaceCreationError, resolveCallerAgent } from "../../utils/caller-agent.js";
 import type { CommandError, OutputSchema, SingleResult } from "../../output/index.js";
 import { buildCreateWorktreeRequest, type WorktreeCreateOptions } from "./create-input.js";
 
@@ -35,7 +36,12 @@ export async function runCreateCommandWithDeps(
   deps: {
     connectToDaemon(
       options: Parameters<typeof connectToDaemon>[0],
-    ): Promise<Pick<Awaited<ReturnType<typeof connectToDaemon>>, "createPaseoWorktree" | "close">>;
+    ): Promise<
+      Pick<
+        Awaited<ReturnType<typeof connectToDaemon>>,
+        "createPaseoWorktree" | "fetchAgent" | "close"
+      >
+    >;
   },
 ): Promise<SingleResult<WorktreeCreateResult>> {
   const cwd = options.cwd ?? process.cwd();
@@ -44,6 +50,7 @@ export async function runCreateCommandWithDeps(
   const client = await deps.connectToDaemon({ target: options.daemonTarget });
 
   try {
+    if (await resolveCallerAgent(client)) throw agentWorkspaceCreationError();
     const response = await client.createPaseoWorktree(request);
 
     const workspace = response.workspace;

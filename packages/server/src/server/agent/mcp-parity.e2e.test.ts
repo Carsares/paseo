@@ -14,6 +14,7 @@ import type { AgentClient, AgentProvider, AgentSessionConfig } from "./agent-sdk
 import {
   EXPLICIT_PARENT_REPORTING,
   PARENT_AGENT_ID_LABEL,
+  PARENT_SERVER_ID_LABEL,
   PARENT_REPORTING_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import { DaemonClient } from "../test-utils/daemon-client.js";
@@ -148,6 +149,7 @@ let tempRoot: string;
 let daemonHandle: TestPaseoDaemon;
 let topLevelClient: McpClient;
 let agentScopedClient: McpClient;
+let parityWsClient: DaemonClient | undefined;
 let parentAgentId: string;
 let parentAgentCwd: string;
 let worktreeRepoCwd: string;
@@ -240,6 +242,18 @@ async function createChildAgent(args?: Partial<StructuredContent>): Promise<stri
   return str(payload.agentId);
 }
 
+async function readDirectoryCounts(): Promise<{ projects: number; workspaces: number }> {
+  if (!parityWsClient) throw new Error("Parity WebSocket client is not initialized");
+  const [projects, workspaces] = await Promise.all([
+    parityWsClient.listProjects(),
+    parityWsClient.fetchWorkspaces({ filter: { includeBackground: true } }),
+  ]);
+  return {
+    projects: projects.projects.length,
+    workspaces: workspaces.entries.length,
+  };
+}
+
 async function archiveAgentIfPresent(agentId: string | null | undefined): Promise<void> {
   if (!agentId) {
     return;
@@ -283,6 +297,8 @@ beforeAll(async () => {
     agentProfiles: [seededAgentProfile],
   });
   topLevelClient = await createMcpClient(`http://127.0.0.1:${daemonHandle.port}/mcp/agents`);
+  parityWsClient = new DaemonClient({ url: `ws://127.0.0.1:${daemonHandle.port}/ws` });
+  await parityWsClient.connect();
 
   const parentPayload = await callToolStructured(topLevelClient, "create_agent", {
     relationship: { kind: "detached" },
@@ -313,13 +329,13 @@ afterAll(async () => {
   await archiveAgentIfPresent(parentAgentId);
   await agentScopedClient?.close();
   await topLevelClient?.close();
+  await parityWsClient?.close();
   await daemonHandle?.close();
   await rm(tempRoot, { recursive: true, force: true });
 });
 
 describe("Suite A: Core Fixes", () => {
   test.each([
-    { relationship: "detached", reparent: false, notifications: 1 },
     { relationship: "subagent", reparent: false, notifications: 1 },
     { relationship: "subagent", reparent: true, notifications: 0 },
   ] as const)(
@@ -615,20 +631,30 @@ describe("Suite A: Core Fixes", () => {
       expect(snapshot?.labels).toMatchObject({
         [PARENT_AGENT_ID_LABEL]: parentAgentId,
       });
+      expect(snapshot).toMatchObject({
+        cwd: parentAgentCwd,
+        workspaceId: daemonHandle.daemon.agentManager.getAgent(parentAgentId)?.workspaceId,
+      });
     } finally {
       await archiveAgentIfPresent(agentId);
     }
   });
 
-  test("create_agent with detached relationship omits the parent agent label", async () => {
-    let agentId: string | null = null;
-    try {
-      agentId = await createChildAgent({ relationship: { kind: "detached" } });
-      const snapshot = daemonHandle.daemon.agentManager.getAgent(agentId);
-      expect(snapshot?.labels?.[PARENT_AGENT_ID_LABEL]).toBeUndefined();
-    } finally {
-      await archiveAgentIfPresent(agentId);
-    }
+  test("agent-scoped create_agent rejects the legacy detached relationship", async () => {
+    const before = await readDirectoryCounts();
+    await expectToolError(
+      agentScopedClient,
+      "create_agent",
+      {
+        relationship: { kind: "detached" },
+        workspace: { kind: "current" },
+        title: "Rejected detached child",
+        provider: "claude/claude-test-model",
+        initialPrompt: "say done and stop",
+      },
+      /Subagents must reuse the current workspace/,
+    );
+    expect(await readDirectoryCounts()).toEqual(before);
   });
 
   test("agentManager.createAgent injects paseo MCP using the daemon listen target", async () => {
@@ -690,7 +716,7 @@ describe("Suite A: Core Fixes", () => {
     try {
       agentId = await createTopLevelAgent({ settings: { features: { test_feature: true } } });
       const internalSnapshot = daemonHandle.daemon.agentManager.getAgent(agentId);
-      expect(internalSnapshot?.config.featureValues).toEqual({ test_feature: true });
+      expect(internalSnapshot?.config.providerOptions).toEqual({ test_feature: true });
 
       const status = await callToolStructured(topLevelClient, "get_agent_status", { agentId });
       const snapshot = z.record(z.string(), z.unknown()).parse(status.snapshot);
@@ -708,7 +734,7 @@ describe("Suite A: Core Fixes", () => {
         settings: { features: { test_feature: true } },
       });
       const internalSnapshot = daemonHandle.daemon.agentManager.getAgent(agentId);
-      expect(internalSnapshot?.config.featureValues).toEqual({ test_feature: true });
+      expect(internalSnapshot?.config.providerOptions).toEqual({ test_feature: true });
 
       const status = await callToolStructured(topLevelClient, "get_agent_status", { agentId });
       const snapshot = z.record(z.string(), z.unknown()).parse(status.snapshot);
@@ -728,7 +754,7 @@ describe("Suite A: Core Fixes", () => {
       });
       expect(updated.success).toBe(true);
       const internalSnapshot = daemonHandle.daemon.agentManager.getAgent(agentId);
-      expect(internalSnapshot?.config.featureValues).toEqual({ test_feature: true });
+      expect(internalSnapshot?.config.providerOptions).toEqual({ test_feature: true });
 
       const status = await callToolStructured(topLevelClient, "get_agent_status", { agentId });
       const snapshot = z.record(z.string(), z.unknown()).parse(status.snapshot);
@@ -1109,7 +1135,7 @@ describe("Suite D: Provider Tools", () => {
   test("list_profiles returns configured agent profiles, including notes", async () => {
     const payload = await callToolStructured(topLevelClient, "list_profiles");
     const profiles = recordArr(payload.profiles);
-    expect(profiles).toEqual([seededAgentProfile]);
+    expect(profiles).toEqual([expect.objectContaining(seededAgentProfile)]);
   });
 });
 
@@ -1178,16 +1204,30 @@ describe("Suite E: Workspace Tools", () => {
     }
   }, 30_000);
 
-  test("agent-scoped workspace creation inherits visibility and permits an explicit false override", async () => {
+  test("agent-scoped workspace creation is rejected while human background overrides remain available", async () => {
     const parentWorkspace = await callToolStructured(topLevelClient, "create_workspace", {
       isolation: "local",
       path: worktreeRepoCwd,
       background: true,
     });
     const parentWorkspaceId = str(parentWorkspace.workspaceId);
+    const humanWorkspace = await callToolStructured(topLevelClient, "create_workspace", {
+      isolation: "local",
+      path: await makeCwd("human-workspace"),
+      background: false,
+    });
+    const humanWorkspaceId = str(humanWorkspace.workspaceId);
+    const foreignWorkspace = await callToolStructured(topLevelClient, "create_workspace", {
+      isolation: "local",
+      path: await makeCwd("foreign-workspace"),
+      background: false,
+    });
+    const foreignWorkspaceId = str(foreignWorkspace.workspaceId);
     let scoped: McpClient | null = null;
-    const ownedWorkspaces: string[] = [parentWorkspaceId];
+    const ownedWorkspaces: string[] = [foreignWorkspaceId, humanWorkspaceId, parentWorkspaceId];
     try {
+      expect(parentWorkspace.background).toBe(true);
+      expect(humanWorkspace.background).toBe(false);
       const parent = await callToolStructured(topLevelClient, "create_agent", {
         workspaceId: parentWorkspaceId,
         title: "Background parent",
@@ -1197,48 +1237,81 @@ describe("Suite E: Workspace Tools", () => {
       scoped = await createMcpClient(
         `http://127.0.0.1:${daemonHandle.port}/mcp/agents?callerAgentId=${str(parent.agentId)}`,
       );
-      const inherited = await callToolStructured(scoped, "create_workspace", {
-        isolation: "local",
+      const inheritedWsChild = await parityWsClient!.createAgent({
+        provider: "claude",
+        cwd: await makeCwd("requested-child-cwd"),
+        title: "Inherited WebSocket child",
+        modeId: "bypassPermissions",
+        workspaceId: parentWorkspaceId,
+        callerAgentId: str(parent.agentId),
       });
-      ownedWorkspaces.push(str(inherited.workspaceId));
-      expect(inherited.background).toBe(true);
-      expect(inherited.parentWorkspaceId).toBe(parentWorkspaceId);
-      const visible = await callToolStructured(scoped, "create_workspace", {
-        isolation: "local",
+      expect(inheritedWsChild).toMatchObject({
+        cwd: worktreeRepoCwd,
+        workspaceId: parentWorkspaceId,
+      });
+      await archiveAgentIfPresent(inheritedWsChild.id);
+
+      const beforeMcpWorkspaceCreate = await readDirectoryCounts();
+      await expectToolError(
+        scoped,
+        "create_workspace",
+        { isolation: "local", path: worktreeRepoCwd },
+        /Subagents must reuse the current workspace/,
+      );
+      expect(await readDirectoryCounts()).toEqual(beforeMcpWorkspaceCreate);
+
+      const beforeWsWorkspaceCreate = await readDirectoryCounts();
+      const deniedWorkspace = await parityWsClient!.createWorkspace({
+        source: { kind: "directory", path: worktreeRepoCwd },
+        callerAgentId: str(parent.agentId),
         background: false,
       });
-      ownedWorkspaces.push(str(visible.workspaceId));
-      expect(visible.background).toBe(false);
-      expect(visible.parentWorkspaceId).toBe(parentWorkspaceId);
-      const worktree = await callToolStructured(scoped, "create_workspace", {
-        isolation: "worktree",
-        branchName: "parentage-child",
-        baseBranch: "main",
-        background: false,
-      });
-      ownedWorkspaces.push(str(worktree.workspaceId));
-      expect(worktree.parentWorkspaceId).toBe(parentWorkspaceId);
-      const client = new DaemonClient({ url: `ws://127.0.0.1:${daemonHandle.port}/ws` });
-      try {
-        await client.connect();
-        const created = await client.createWorkspace({
-          source: { kind: "directory", path: worktreeRepoCwd },
+      expect(deniedWorkspace.workspace).toBeNull();
+      expect(deniedWorkspace.error).toContain("Subagents must reuse the current workspace");
+      expect(await readDirectoryCounts()).toEqual(beforeWsWorkspaceCreate);
+
+      const beforeMcpCrossWorkspace = await readDirectoryCounts();
+      await expectToolError(
+        scoped,
+        "create_agent",
+        {
+          workspaceId: foreignWorkspaceId,
+          title: "Rejected cross-workspace child",
+          provider: "claude/claude-test-model",
+          initialPrompt: "say done and stop",
+        },
+        /Subagents must reuse the current workspace/,
+      );
+      expect(await readDirectoryCounts()).toEqual(beforeMcpCrossWorkspace);
+
+      const beforeWsCrossWorkspace = await readDirectoryCounts();
+      await expect(
+        parityWsClient!.createAgent({
+          provider: "claude",
+          cwd: await makeCwd("foreign-agent-cwd"),
+          title: "Rejected cross-workspace child",
+          modeId: "bypassPermissions",
+          workspaceId: foreignWorkspaceId,
           callerAgentId: str(parent.agentId),
-          background: false,
-        });
-        const workspaceId = str(created.workspace?.id);
-        ownedWorkspaces.push(workspaceId);
-        expect(created.workspace?.parentWorkspaceId).toBe(parentWorkspaceId);
-        const listed = await client.fetchWorkspaces();
-        expect(listed.entries).toContainEqual(
-          expect.objectContaining({
-            id: workspaceId,
-            parentWorkspaceId: parentWorkspaceId,
-          }),
-        );
-      } finally {
-        await client.close();
-      }
+        }),
+      ).rejects.toThrow("Subagents must reuse the current workspace");
+      expect(await readDirectoryCounts()).toEqual(beforeWsCrossWorkspace);
+
+      const beforeRemoteCreate = await readDirectoryCounts();
+      await expect(
+        parityWsClient!.createAgent({
+          provider: "claude",
+          cwd: worktreeRepoCwd,
+          title: "Rejected remote child",
+          modeId: "bypassPermissions",
+          callerAgentId: str(parent.agentId),
+          labels: {
+            [PARENT_AGENT_ID_LABEL]: str(parent.agentId),
+            [PARENT_SERVER_ID_LABEL]: "remote-host",
+          },
+        }),
+      ).rejects.toThrow("Subagents must reuse the current workspace");
+      expect(await readDirectoryCounts()).toEqual(beforeRemoteCreate);
     } finally {
       await scoped?.close();
       for (const workspaceId of ownedWorkspaces.toReversed())
@@ -1265,7 +1338,6 @@ describe("Suite E: Workspace Tools", () => {
     const scoped = await createMcpClient(
       `http://127.0.0.1:${daemonHandle.port}/mcp/agents?callerAgentId=${callerId}`,
     );
-    const ownedWorkspaces: string[] = [];
     try {
       const inheritedChild = await callToolStructured(scoped, "create_agent", {
         relationship: { kind: "subagent" },
@@ -1286,19 +1358,18 @@ describe("Suite E: Workspace Tools", () => {
         background: false,
       });
       expect(background(str(visibleChild.agentId))).toBe(false);
-      const inheritedWorkspace = await callToolStructured(scoped, "create_workspace", {
-        isolation: "local",
-      });
-      ownedWorkspaces.push(str(inheritedWorkspace.workspaceId));
-      expect(inheritedWorkspace.background).toBe(true);
+      const beforeWorkspaceCreate = await readDirectoryCounts();
+      await expectToolError(
+        scoped,
+        "create_workspace",
+        { isolation: "local" },
+        /Subagents must reuse the current workspace/,
+      );
+      expect(await readDirectoryCounts()).toEqual(beforeWorkspaceCreate);
     } finally {
       await scoped.close();
       await archiveAgentIfPresent(callerId);
       await archiveAgentIfPresent(visibleAgentId);
-      for (const id of ownedWorkspaces)
-        await topLevelClient
-          .callTool({ name: "archive_workspace", args: { workspaceId: id } })
-          .catch(() => undefined);
     }
   });
 

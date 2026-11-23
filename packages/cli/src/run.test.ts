@@ -3,11 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCli } from "./cli";
-import { createCliParseArgv } from "./run";
+import { createCliParseArgv, runCli } from "./run";
 
 const runModuleUrl = new URL("./run.ts", import.meta.url).href;
+
+afterEach(() => vi.unstubAllEnvs());
 
 // Runs the CLI in a child process whose stdout pipe has no reader, as when the
 // program that launched it has already closed its end.
@@ -134,4 +136,48 @@ describe("runCli", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("hands the resolved directory to the desktop when invoked from a human shell", async () => {
+    vi.stubEnv("PASEO_AGENT_ID", undefined);
+    const cwd = path.dirname(fileURLToPath(import.meta.url));
+    const openedPaths: string[] = [];
+
+    const code = await runCli(["."], {
+      cwd,
+      openProject: async (projectPath) => {
+        openedPaths.push(projectPath);
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(openedPaths).toEqual([cwd]);
+  });
+
+  it.each(["parent-agent", "", "  "])(
+    "rejects desktop project registration when PASEO_AGENT_ID is %j",
+    async (callerId) => {
+      vi.stubEnv("PASEO_AGENT_ID", callerId);
+      const openedPaths: string[] = [];
+      let stderr = "";
+
+      const code = await runCli([".", "--json"], {
+        cwd: path.dirname(fileURLToPath(import.meta.url)),
+        openProject: async (projectPath) => {
+          openedPaths.push(projectPath);
+        },
+        stderr: {
+          write(chunk) {
+            stderr += String(chunk);
+            return true;
+          },
+        },
+      });
+
+      expect(code).toBe(1);
+      expect(openedPaths).toEqual([]);
+      expect(JSON.parse(stderr)).toMatchObject({
+        error: { code: "AGENT_WORKSPACE_CREATION_FORBIDDEN" },
+      });
+    },
+  );
 });

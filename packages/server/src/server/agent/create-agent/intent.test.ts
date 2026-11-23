@@ -11,21 +11,38 @@ import { REMOTE_HIERARCHY_DEPTH_LABEL } from "../hierarchy-policy.js";
 import { resolveCreateAgentIntent } from "./intent.js";
 
 describe("resolveCreateAgentIntent", () => {
-  it("keeps caller parentage when an explicit workspace changes placement", async () => {
+  it("rejects a different explicit workspace for a caller", async () => {
+    const resolvedWorkspaceIds: string[] = [];
+    await expect(
+      resolveCreateAgentIntent({
+        explicitWorkspaceId: "workspace-isolated",
+        caller: { id: "parent-agent", cwd: "/parent", workspaceId: "workspace-parent" },
+        labels: { purpose: "review" },
+        resolveWorkspace: async (workspaceId) => {
+          resolvedWorkspaceIds.push(workspaceId);
+          return { workspaceId, cwd: "/isolated" };
+        },
+        createWorkspace: async () => ({ workspaceId: "workspace-created", cwd: "/created" }),
+      }),
+    ).rejects.toThrow(
+      "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.",
+    );
+    expect(resolvedWorkspaceIds).toEqual([]);
+  });
+
+  it("keeps caller workspace and cwd when the same explicit workspace is supplied", async () => {
     const intent = await resolveCreateAgentIntent({
-      explicitWorkspaceId: "workspace-isolated",
+      explicitWorkspaceId: "workspace-parent",
       caller: { id: "parent-agent", cwd: "/parent", workspaceId: "workspace-parent" },
-      labels: { purpose: "review" },
-      resolveWorkspace: async (workspaceId) => ({ workspaceId, cwd: "/isolated" }),
+      resolveWorkspace: async (workspaceId) => ({ workspaceId, cwd: "/workspace" }),
       createWorkspace: async () => ({ workspaceId: "workspace-created", cwd: "/created" }),
     });
 
     expect(intent).toEqual({
-      workspaceId: "workspace-isolated",
-      cwd: "/isolated",
+      workspaceId: "workspace-parent",
+      cwd: "/parent",
       parentAgentId: "parent-agent",
       labels: {
-        purpose: "review",
         [PARENT_AGENT_ID_LABEL]: "parent-agent",
       },
     });
@@ -48,6 +65,18 @@ describe("resolveCreateAgentIntent", () => {
     expect(createCount).toBe(0);
   });
 
+  it("rejects a caller without a workspace with the shared creation error", async () => {
+    await expect(
+      resolveCreateAgentIntent({
+        caller: { id: "parent-agent", cwd: "/parent" },
+        resolveWorkspace: async (workspaceId) => ({ workspaceId, cwd: "/unused" }),
+        createWorkspace: async () => ({ workspaceId: "workspace-created", cwd: "/created" }),
+      }),
+    ).rejects.toThrow(
+      "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.",
+    );
+  });
+
   it("creates a workspace for a human caller with no workspace context", async () => {
     const intent = await resolveCreateAgentIntent({
       caller: null,
@@ -63,21 +92,17 @@ describe("resolveCreateAgentIntent", () => {
     });
   });
 
-  it("keeps legacy detached creation independent", async () => {
-    const intent = await resolveCreateAgentIntent({
-      caller: { id: "parent-agent", cwd: "/parent", workspaceId: "workspace-parent" },
-      labels: { [PARENT_AGENT_ID_LABEL]: "spoofed-parent" },
-      legacyDetached: true,
-      resolveWorkspace: async (workspaceId) => ({ workspaceId, cwd: "/unused" }),
-      createWorkspace: async () => ({ workspaceId: "workspace-created", cwd: "/created" }),
-    });
-
-    expect(intent).toEqual({
-      workspaceId: "workspace-parent",
-      cwd: "/parent",
-      parentAgentId: null,
-      labels: {},
-    });
+  it("rejects legacy detached creation when a caller exists", async () => {
+    await expect(
+      resolveCreateAgentIntent({
+        caller: { id: "parent-agent", cwd: "/parent", workspaceId: "workspace-parent" },
+        legacyDetached: true,
+        resolveWorkspace: async (workspaceId) => ({ workspaceId, cwd: "/unused" }),
+        createWorkspace: async () => ({ workspaceId: "workspace-created", cwd: "/created" }),
+      }),
+    ).rejects.toThrow(
+      "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.",
+    );
   });
 
   it("strips reserved hierarchy labels and preserves valid remote parent labels with validated depth", async () => {

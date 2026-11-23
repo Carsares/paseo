@@ -1,5 +1,5 @@
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveProjectPath, runCreateCommand } from "./create.js";
 import { runDeleteCommand } from "./delete.js";
 import { createProjectCommand } from "./index.js";
@@ -14,6 +14,9 @@ const project = {
   projectKind: "git" as const,
 };
 const addProject = vi.fn(async () => ({ project, error: null }));
+const fetchAgent = vi.fn(
+  async () => null as { agent: { id: string; cwd: string; workspaceId: string } } | null,
+);
 const listProjects = vi.fn(async () => ({ projects: [project] }));
 const renameProject = vi.fn(async (_projectId: string, name: string | null) => ({
   customName: name,
@@ -25,6 +28,7 @@ vi.mock("../../utils/client.js", () => ({
   buildDaemonConnectionCommandError: vi.fn(({ error }: { error: unknown }) => error),
   connectToDaemon: vi.fn(async () => ({
     addProject,
+    fetchAgent,
     listProjects,
     renameProject,
     removeProject,
@@ -34,6 +38,13 @@ vi.mock("../../utils/client.js", () => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  delete process.env.PASEO_AGENT_ID;
+});
+
+const originalAgentId = process.env.PASEO_AGENT_ID;
+afterEach(() => {
+  if (originalAgentId === undefined) delete process.env.PASEO_AGENT_ID;
+  else process.env.PASEO_AGENT_ID = originalAgentId;
 });
 
 describe("project commands", () => {
@@ -61,6 +72,28 @@ describe("project commands", () => {
       path: "/tmp/paseo",
     });
     expect(close).toHaveBeenCalled();
+  });
+
+  it("rejects project creation from a managed agent before the mutation", async () => {
+    process.env.PASEO_AGENT_ID = "parent-agent";
+    fetchAgent.mockResolvedValue({
+      agent: { id: "parent-agent", cwd: "/tmp/paseo", workspaceId: "workspace-1" },
+    });
+
+    await expect(
+      runCreateCommand(
+        "relative/project",
+        {
+          daemonTarget: { kind: "instance", home: "/tmp/project-test" },
+        },
+        {} as never,
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_WORKSPACE_CREATION_FORBIDDEN",
+      message:
+        "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.",
+    });
+    expect(addProject).not.toHaveBeenCalled();
   });
 
   it("resolves paths locally and leaves daemon-owned paths unchanged", () => {

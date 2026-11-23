@@ -40,6 +40,8 @@ import { getErrorMessage } from "@getpaseo/protocol/error-utils";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
+import type { WorkspaceRegistry } from "../workspace-registry.js";
+import { AGENT_WORKSPACE_CREATION_ERROR } from "./create-agent/intent.js";
 
 import {
   AgentTurnStartCanceledError,
@@ -613,6 +615,7 @@ export interface AgentManagerOptions {
   providerDefinitions?: ProviderEnabledMap;
   idFactory?: () => string;
   registry?: AgentStorage;
+  workspaceRegistry?: Pick<WorkspaceRegistry, "get">;
   onAgentAttention?: AgentAttentionCallback;
   onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   onAgentRunAccepted?: AgentRunAcceptedCallback;
@@ -1307,6 +1310,7 @@ export class AgentManager {
   private readonly subscribers = new Set<SubscriptionRecord>();
   private readonly idFactory: () => string;
   private readonly registry?: AgentStorage;
+  private readonly workspaceRegistry?: Pick<WorkspaceRegistry, "get">;
   private readonly durableTimelineStore?: AgentTimelineStore;
   private readonly durableTimelineWriteTails = new Map<string, Promise<void>>();
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
@@ -1373,6 +1377,7 @@ export class AgentManager {
     this.timelineStore = options.timelineStore ?? new InMemoryAgentTimelineStore();
     this.idFactory = options.idFactory ?? (() => randomUUID());
     this.registry = options.registry;
+    this.workspaceRegistry = options.workspaceRegistry;
     this.timelinePrefixes = this.registry?.timelinePrefixes ?? new TimelinePrefixStore();
     this.durableTimelineStore = options.durableTimelineStore;
     this.onAgentAttention = options.onAgentAttention;
@@ -2385,9 +2390,12 @@ export class AgentManager {
     options: CreateAgentOptions,
   ): Promise<ManagedAgent> {
     const resolvedAgentId = validateAgentId(agentId ?? this.idFactory(), "createAgent");
-    const createInLifecycleLane = (resolvedOptions: CreateAgentOptions = options) =>
+    const createInLifecycleLane = (
+      resolvedOptions: CreateAgentOptions = options,
+      resolvedConfig: AgentSessionConfig = config,
+    ) =>
       this.runLifecycleMutation(resolvedAgentId, () =>
-        this.createAgentInternal(config, resolvedAgentId, {
+        this.createAgentInternal(resolvedConfig, resolvedAgentId, {
           ...resolvedOptions,
           mainControlSystemPrompt: this.snapshotMainControlPrompt(resolvedOptions.labels),
         }),
@@ -2397,28 +2405,44 @@ export class AgentManager {
       parentId
         ? this.runHierarchyMutation(async () => {
             const hierarchy = await this.readHierarchyAgents();
-            const parent =
-              hierarchy.get(parentId) ??
-              (await this.registry?.get(parentId)) ??
-              this.agents.get(parentId);
-            if (!parent || this.pendingHierarchyArchives.has(parentId)) {
-              throw new Error(`Parent agent ${parentId} is missing or archived.`);
-            }
-            if (this.pendingSubagentMoveSnapshots.has(parentId)) {
-              throw new Error("Recover the parent's workspace move before creating a subagent.");
-            }
+            const parent = await this.requireActiveCreationParent(parentId);
             validateCanSpawnChild(parent, (id) => hierarchy.get(id) ?? this.agents.get(id));
-            if (options.inheritParentWorkspace && !parent.workspaceId) {
-              throw new Error(`Parent agent ${parentId} has no current workspace.`);
+            const workspaceId = parent.workspaceId;
+            if (
+              !options.inheritParentWorkspace &&
+              options.workspaceId !== undefined &&
+              options.workspaceId !== workspaceId
+            ) {
+              throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
             }
+            await this.requireActiveParentWorkspace(workspaceId);
             return createInLifecycleLane(
-              options.inheritParentWorkspace
-                ? { ...options, workspaceId: parent.workspaceId }
-                : options,
+              { ...options, workspaceId },
+              { ...config, cwd: parent.cwd },
             );
           })
         : createInLifecycleLane(),
     );
+  }
+
+  private async requireActiveCreationParent(parentId: string) {
+    const stored = await this.registry?.get(parentId);
+    const parent = this.agents.get(parentId) ?? stored;
+    if (!parent || stored?.archivedAt || this.pendingHierarchyArchives.has(parentId)) {
+      throw new Error(`Parent agent ${parentId} is missing or archived.`);
+    }
+    if (this.pendingSubagentMoveSnapshots.has(parentId)) {
+      throw new Error("Recover the parent's workspace move before creating a subagent.");
+    }
+    return parent;
+  }
+
+  private async requireActiveParentWorkspace(workspaceId: string | undefined): Promise<void> {
+    if (!workspaceId) throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+    if (this.workspaceRegistry) {
+      const workspace = await this.workspaceRegistry.get(workspaceId);
+      if (!workspace || workspace.archivedAt) throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+    }
   }
 
   /**
@@ -2580,14 +2604,7 @@ export class AgentManager {
     const parentId = this.localHierarchyParentId(labels);
     if (!parentId) return;
     try {
-      const parent = this.agents.get(parentId) ?? (await this.registry?.get(parentId));
-      if (
-        !parent ||
-        ("archivedAt" in parent && parent.archivedAt) ||
-        this.pendingHierarchyArchives.has(parentId)
-      ) {
-        throw new Error(`Parent agent ${parentId} is missing or archived.`);
-      }
+      await this.requireActiveCreationParent(parentId);
     } catch (error) {
       await this.closeUnregisteredSession(session);
       throw error;

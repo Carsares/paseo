@@ -1,16 +1,14 @@
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
-  MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_REPORTING_LABEL,
   EXPLICIT_PARENT_REPORTING,
   parentAddressLabels,
-  WORKSPACE_MAIN_ROLE,
-  WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import { afterEach, expect, test, vi } from "vitest";
 
 import { createHostResolver, type HostOperations } from "./index.js";
 import { buildStoredAgentPayload } from "../agent-projections.js";
+import { AGENT_WORKSPACE_CREATION_ERROR } from "../create-agent/intent.js";
 
 type Handler = ((event?: unknown) => void) | null;
 
@@ -122,33 +120,24 @@ async function olderHost() {
   return { client, socket };
 }
 
-interface Caller {
-  background: boolean;
-  provider: string;
-  currentModeId: string | null;
-  labels?: Record<string, string>;
-  config: Record<string, never>;
-}
-
-function resolverFor(client: DaemonClient, caller: Caller | null) {
-  return createHostResolver({
-    serverId: "origin",
-    callerAgentId: caller ? "caller" : undefined,
-    caller: () => caller,
-    local: {} as HostOperations,
-    hosts: () => ({
-      directory: async () => ({ self: { serverId: "origin", label: "Origin" }, hosts: [] }),
-      use: (_serverId, action) => action(client),
+function resolverFor(client: DaemonClient, callerAgentId?: string) {
+  const useHost = vi.fn();
+  return {
+    ...createHostResolver({
+      serverId: "origin",
+      callerAgentId,
+      local: {} as HostOperations,
+      hosts: () => ({
+        directory: async () => ({ self: { serverId: "origin", label: "Origin" }, hosts: [] }),
+        use: (serverId, action) => {
+          useHost(serverId);
+          return action(client);
+        },
+      }),
     }),
-  });
+    useHost,
+  };
 }
-
-const visibleCodexCaller: Caller = {
-  background: false,
-  provider: "codex",
-  currentModeId: "full-access",
-  config: {},
-};
 
 const createArgs = {
   workspaceId: workspace.id,
@@ -180,7 +169,6 @@ test("remote permission responses carry the caller scope and require the matchin
   const resolver = createHostResolver({
     serverId: "origin",
     callerAgentId: "caller",
-    caller: () => visibleCodexCaller,
     local: {} as HostOperations,
     hosts: () => ({
       directory: async () => ({ self: { serverId: "origin", label: "Origin" }, hosts: [] }),
@@ -205,11 +193,9 @@ test("remote permission responses carry the caller scope and require the matchin
   expect(respondToPermissionAndWait).toHaveBeenCalledExactlyOnceWith(id, "pending", response);
 });
 
-test("a visible caller still creates agents on a host without background agents", async () => {
+test("a human can still create agents on a host without background agents", async () => {
   const { client, socket } = await olderHost();
-  const creating = resolverFor(client, visibleCodexCaller).use("srv_older", (host) =>
-    host.createAgent(createArgs, {} as never),
-  );
+  const creating = resolverFor(client).use("srv_older", (host) => host.createAgent(createArgs, {}));
   creating.catch(() => {});
 
   const request = await socket.createRequest();
@@ -217,68 +203,35 @@ test("a visible caller still creates agents on a host without background agents"
   expect(request).not.toHaveProperty("background");
 });
 
-test("a background caller's remote child asks the host to update instead of turning visible", async () => {
+test("an explicit background agent asks the host to update instead of turning visible", async () => {
   const { client, socket } = await olderHost();
 
   await expect(
-    resolverFor(client, { ...visibleCodexCaller, background: true }).use("srv_older", (host) =>
-      host.createAgent(createArgs, {} as never),
+    resolverFor(client).use("srv_older", (host) =>
+      host.createAgent({ ...createArgs, background: true }, {}),
     ),
   ).rejects.toThrow("Update the host to use background agents.");
   expect(socket.requests.map((request) => request.type)).not.toContain("create_agent_request");
 });
 
-async function forwardedMode(caller: Caller | null, args: Record<string, unknown> = createArgs) {
+test("agent creation and workspace creation are blocked before opening a remote route", async () => {
   const { client, socket } = await olderHost();
-  const creating = resolverFor(client, caller).use("srv_older", (host) =>
-    host.createAgent(args, {} as never),
-  );
-  creating.catch(() => {});
-  const request = (await socket.createRequest()) as { config: { modeId?: string } };
-  return request.config.modeId;
-}
-
-test("a remote child of the same provider starts in its caller's mode", async () => {
-  expect(await forwardedMode(visibleCodexCaller)).toBe("full-access");
+  const resolver = resolverFor(client, "caller");
+  await expect(
+    resolver.use("srv_older", (host) => host.createAgent(createArgs, {})),
+  ).rejects.toThrow(AGENT_WORKSPACE_CREATION_ERROR);
+  await expect(
+    resolver.use("srv_older", (host) =>
+      host.createWorkspace({ isolation: "local", path: "/repo/older" }, {}),
+    ),
+  ).rejects.toThrow(AGENT_WORKSPACE_CREATION_ERROR);
+  expect(resolver.useHost).not.toHaveBeenCalled();
+  expect(socket.requests).toEqual([]);
 });
-
-test("an explicit mode wins over the caller's mode on a remote host", async () => {
-  expect(
-    await forwardedMode(visibleCodexCaller, { ...createArgs, settings: { modeId: "auto" } }),
-  ).toBe("auto");
-});
-
-test("a remote child of another provider leaves its mode to the host", async () => {
-  expect(await forwardedMode({ ...visibleCodexCaller, provider: "claude" })).toBeUndefined();
-});
-
-test("a remote create without a caller agent leaves its mode to the host", async () => {
-  expect(await forwardedMode(null)).toBeUndefined();
-});
-
-test.each([
-  { currentModeId: "read-only", priorMode: "full-access", expected: "full-access" },
-  { currentModeId: "workspace-write", priorMode: "full-access", expected: "workspace-write" },
-  { currentModeId: "read-only", priorMode: null, expected: "read-only" },
-])(
-  "a remote child inherits $expected from a Main Control caller",
-  async ({ currentModeId, priorMode, expected }) => {
-    expect(
-      await forwardedMode({
-        ...visibleCodexCaller,
-        currentModeId,
-        labels: {
-          [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
-          ...(priorMode ? { [MAIN_PRIOR_MODE_ID_LABEL]: priorMode } : {}),
-        },
-      }),
-    ).toBe(expected);
-  },
-);
 
 async function forwardedWorktreeSource(args: Record<string, unknown>) {
   const { client, socket } = await olderHost();
-  const creating = resolverFor(client, null).use("srv_older", (host) =>
+  const creating = resolverFor(client).use("srv_older", (host) =>
     host.createWorkspace({ isolation: "worktree", path: "/repo/older", ...args }, {} as never),
   );
   creating.catch(() => {});
@@ -303,7 +256,7 @@ test("a remote worktree that branches off a pull request is refused, as on the l
   const { client, socket } = await olderHost();
 
   await expect(
-    resolverFor(client, null).use("srv_older", (host) =>
+    resolverFor(client).use("srv_older", (host) =>
       host.createWorkspace(
         { isolation: "worktree", path: "/repo/older", mode: "branch-off", prNumber: 42 },
         {} as never,
@@ -315,7 +268,7 @@ test("a remote worktree that branches off a pull request is refused, as on the l
 
 test("a destination without explicit reporting support receives no creation request", async () => {
   const { client, socket } = await olderHost();
-  const resolver = resolverFor(client, visibleCodexCaller);
+  const resolver = resolverFor(client);
   await expect(
     resolver.use("srv_older", (host) =>
       host.createAgent(
@@ -357,7 +310,7 @@ test.each([false, true])(
       .mockResolvedValue(modern ? { deliveryStatus: "queued" } : {});
     const prepareLegacyNotification = vi.fn(async () => {});
     await expect(
-      resolverFor(client, visibleCodexCaller).use(destination, (host) =>
+      resolverFor(client, "caller").use(destination, (host) =>
         host.sendPrompt(
           {
             agentId: agent.id,

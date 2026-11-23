@@ -9,7 +9,6 @@ import {
   isExplicitParentReportingLabels,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
-  PARENT_SERVER_ID_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
@@ -18,6 +17,7 @@ import { createTestPaseoDaemon } from "../../test-utils/paseo-daemon.js";
 import { createProviderSnapshotManagerStub } from "../../test-utils/session-stubs.js";
 import { AgentManager } from "../agent-manager.js";
 import { AgentStorage } from "../agent-storage.js";
+import type { WorkspaceRegistry } from "../../workspace-registry.js";
 import {
   createFinishSubscriptions,
   createJsonFinishSubscriptionStore,
@@ -103,16 +103,15 @@ test("SDK WebSocket creation persists explicit reporting only for a valid child"
     expect(await storedLabels(forged.id)).not.toHaveProperty(PARENT_AGENT_ID_LABEL);
 
     const remoteParent = { agentId: main.id, serverId: "other-host" };
-    const remoteChild = await workspace.agents.create({
-      config,
-      parent: remoteParent,
-      parentReporting: "explicit",
-    });
-    expect(await storedLabels(remoteChild.id)).toMatchObject({
-      [PARENT_AGENT_ID_LABEL]: remoteParent.agentId,
-      [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
-      [PARENT_SERVER_ID_LABEL]: remoteParent.serverId,
-    });
+    await expect(
+      workspace.agents.create({
+        config,
+        parent: remoteParent,
+        parentReporting: "explicit",
+      }),
+    ).rejects.toThrow(
+      "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.",
+    );
   } finally {
     finishInitial.resolve();
     finish.resolve();
@@ -126,8 +125,32 @@ function createRealAgentManager(storage: AgentStorage): AgentManager {
   return new AgentManager({
     clients: createTestAgentClients(),
     registry: storage,
+    workspaceRegistry: createTestWorkspaceRegistry(),
     logger,
   });
+}
+
+function createTestWorkspaceRegistry(): Pick<WorkspaceRegistry, "get"> {
+  return {
+    get: async (workspaceId) => ({
+      workspaceId,
+      projectId: "test-project",
+      cwd: "/tmp",
+      kind: "directory",
+      displayName: workspaceId,
+      title: null,
+      branch: null,
+      worktreeRoot: null,
+      baseBranch: null,
+      isPaseoOwnedWorktree: false,
+      mainRepoRoot: null,
+      createdAt: "",
+      updatedAt: "",
+      archivedAt: null,
+      metadata: {},
+      background: false,
+    }),
+  };
 }
 
 async function removeRealAgentManagerWorkdir({
@@ -364,25 +387,13 @@ test("session create stamps the requested workspaceId when no worktree setup run
   }
 });
 
-test("mcp create stamps the new worktree's workspaceId, not the parent's", async () => {
+test("top-level mcp create stamps the new worktree's workspaceId", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "create-agent-test-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
   const agentManager = createRealAgentManager(storage);
   const providerSnapshotManager = createProviderSnapshotManagerStub().manager;
 
   try {
-    const { snapshot: parent } = await createAgentCommand(
-      { agentManager, agentStorage: storage, logger, providerSnapshotManager },
-      {
-        kind: "session",
-        config: { provider: "codex", cwd: workdir },
-        workspaceId: "ws-parent",
-        labels: {},
-        provisionalTitle: null,
-        firstAgentContext: { attachments: [] },
-      },
-    );
-
     const { snapshot: child } = await createAgentCommand(
       {
         agentManager,
@@ -400,7 +411,6 @@ test("mcp create stamps the new worktree's workspaceId, not the parent's", async
         title: "child",
         initialPrompt: "do the thing",
         notifyOnFinish: false,
-        callerAgentId: parent.id,
         worktree: { worktreeName: "feature", baseBranch: "main" },
       },
     );
@@ -414,52 +424,140 @@ test("mcp create stamps the new worktree's workspaceId, not the parent's", async
   }
 });
 
+test("subagent mcp create rejects worktree placement before creating it", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-subagent-worktree-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const agentManager = createRealAgentManager(storage);
+  const providerSnapshotManager = createProviderSnapshotManagerStub().manager;
+  const createPaseoWorktree = vi.fn(
+    fakeWorktreeCreator({
+      repoRoot: workdir,
+      createdWorkspaceId: "ws-forbidden-worktree",
+    }),
+  );
+
+  try {
+    const { snapshot: parent } = await createAgentCommand(
+      { agentManager, agentStorage: storage, logger, providerSnapshotManager },
+      {
+        kind: "session",
+        config: { provider: "codex", cwd: workdir },
+        workspaceId: "ws-parent",
+        labels: {},
+        provisionalTitle: null,
+        firstAgentContext: { attachments: [] },
+      },
+    );
+
+    await expect(
+      createAgentCommand(
+        {
+          agentManager,
+          agentStorage: storage,
+          logger,
+          providerSnapshotManager,
+          createPaseoWorktree,
+          workspaceRegistry: createTestWorkspaceRegistry(),
+        },
+        {
+          kind: "mcp",
+          provider: "codex/gpt-5.4",
+          title: "child",
+          initialPrompt: "do the thing",
+          callerAgentId: parent.id,
+          worktree: { worktreeName: "feature", baseBranch: "main" },
+        },
+      ),
+    ).rejects.toThrow(
+      "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.",
+    );
+    expect(createPaseoWorktree).not.toHaveBeenCalled();
+  } finally {
+    await removeRealAgentManagerWorkdir({ agentManager, storage, workdir });
+  }
+});
+
+test("subagent mcp create rejects a foreign workspace and legacy detached placement", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "create-agent-subagent-placement-test-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const agentManager = createRealAgentManager(storage);
+  const providerSnapshotManager = createProviderSnapshotManagerStub().manager;
+
+  try {
+    const { snapshot: parent } = await createAgentCommand(
+      { agentManager, agentStorage: storage, logger, providerSnapshotManager },
+      {
+        kind: "session",
+        config: { provider: "codex", cwd: workdir },
+        workspaceId: "ws-parent",
+        labels: {},
+        provisionalTitle: null,
+        firstAgentContext: { attachments: [] },
+      },
+    );
+
+    for (const placement of [{ workspaceId: "ws-other" }, { detached: true }]) {
+      await expect(
+        createAgentCommand(
+          {
+            agentManager,
+            agentStorage: storage,
+            logger,
+            providerSnapshotManager,
+            workspaceRegistry: createTestWorkspaceRegistry(),
+          },
+          {
+            kind: "mcp",
+            provider: "codex/gpt-5.4",
+            title: "child",
+            initialPrompt: "do the thing",
+            callerAgentId: parent.id,
+            ...placement,
+          },
+        ),
+      ).rejects.toThrow(
+        "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.",
+      );
+    }
+  } finally {
+    await removeRealAgentManagerWorkdir({ agentManager, storage, workdir });
+  }
+});
+
 test.each([
   {
     parentReporting: "explicit",
     notifyOnFinish: undefined,
-    detached: false,
     expected: true,
     notify: false,
   },
   {
     parentReporting: "explicit",
     notifyOnFinish: true,
-    detached: false,
     expected: true,
     notify: true,
   },
   {
     parentReporting: "explicit",
     notifyOnFinish: false,
-    detached: false,
     expected: true,
     notify: false,
-  },
-  {
-    parentReporting: "explicit",
-    notifyOnFinish: true,
-    detached: true,
-    expected: false,
-    notify: true,
   },
   {
     parentReporting: "auto",
     notifyOnFinish: false,
-    detached: false,
     expected: false,
     notify: false,
   },
   {
     parentReporting: "auto",
     notifyOnFinish: undefined,
-    detached: false,
     expected: false,
     notify: true,
   },
 ] as const)(
-  "persists $parentReporting and handles initial notification $notifyOnFinish (detached: $detached)",
-  async ({ parentReporting, notifyOnFinish, detached, expected, notify }) => {
+  "persists $parentReporting and handles initial notification $notifyOnFinish",
+  async ({ parentReporting, notifyOnFinish, expected, notify }) => {
     const workdir = mkdtempSync(join(tmpdir(), "create-agent-reporting-test-"));
     const agentStorage = new AgentStorage(join(workdir, "agents"), logger);
     const agentManager = createRealAgentManager(agentStorage);
@@ -494,6 +592,7 @@ test.each([
           agentStorage,
           logger,
           providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+          workspaceRegistry: createTestWorkspaceRegistry(),
           finishSubscriptions,
         },
         {
@@ -504,13 +603,12 @@ test.each([
           initialPrompt: "Complete the task",
           notifyOnFinish,
           parentReporting,
-          detached,
           labels: { [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING },
         },
       );
       expect(initialPromptStarted).toBe(true);
       const stored = await agentStorage.get(snapshot.id);
-      expect(stored?.labels[PARENT_AGENT_ID_LABEL]).toBe(detached ? undefined : parent.id);
+      expect(stored?.labels[PARENT_AGENT_ID_LABEL]).toBe(parent.id);
       expect(isExplicitParentReportingLabels(stored?.labels)).toBe(expected);
       expect(finishSubscriptions.hasPendingForCaller(parent.id)).toBe(notify);
     } finally {

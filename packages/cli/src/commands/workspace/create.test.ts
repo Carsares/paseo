@@ -1,6 +1,29 @@
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { buildWorkspaceSource } from "./create.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { buildWorkspaceSource, runCreateCommand } from "./create.js";
+
+const fetchAgent = vi.fn(
+  async () => null as { agent: { id: string; cwd: string; workspaceId: string } } | null,
+);
+const createWorkspace = vi.fn(async () => ({ workspace: null, error: null }));
+const close = vi.fn(async () => undefined);
+
+vi.mock("../../utils/client.js", () => ({
+  connectToDaemon: vi.fn(async () => ({ fetchAgent, createWorkspace, close })),
+  getDaemonHost: vi.fn(() => "local daemon"),
+}));
+
+const originalAgentId = process.env.PASEO_AGENT_ID;
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  delete process.env.PASEO_AGENT_ID;
+});
+
+afterEach(() => {
+  if (originalAgentId === undefined) delete process.env.PASEO_AGENT_ID;
+  else process.env.PASEO_AGENT_ID = originalAgentId;
+});
 
 describe("workspace create source", () => {
   it("maps local isolation to a directory workspace", () => {
@@ -166,4 +189,31 @@ describe("workspace create source", () => {
       "Unsupported workspace isolation",
     );
   });
+});
+
+it("rejects workspace creation from a managed agent before the mutation", async () => {
+  process.env.PASEO_AGENT_ID = "parent-agent";
+  fetchAgent.mockResolvedValue({
+    agent: {
+      id: "parent-agent",
+      cwd: "/tmp/project",
+      workspaceId: "workspace-parent",
+    },
+  });
+
+  await expect(
+    runCreateCommand(
+      {
+        daemonTarget: { kind: "instance", home: "/tmp/paseo-home" },
+        isolation: "local",
+        path: "/tmp/project",
+      },
+      {} as never,
+    ),
+  ).rejects.toMatchObject({
+    code: "AGENT_WORKSPACE_CREATION_FORBIDDEN",
+    message:
+      "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.",
+  });
+  expect(createWorkspace).not.toHaveBeenCalled();
 });

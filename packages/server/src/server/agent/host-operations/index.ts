@@ -1,12 +1,7 @@
-import type {
-  AgentPermissionResponse,
-  AgentSessionConfig,
-  AgentStreamEvent,
-} from "../agent-sdk-types.js";
+import type { AgentPermissionResponse, AgentStreamEvent } from "../agent-sdk-types.js";
 import {
   getParentAddressFromLabels,
   isExplicitParentReportingLabels,
-  parentAddressLabels,
 } from "@getpaseo/protocol/agent-labels";
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import type { ActiveTurnBehavior, AgentSnapshotPayload } from "@getpaseo/protocol/messages";
@@ -25,18 +20,14 @@ import type { ConnectedHosts } from "../../connected-hosts/index.js";
 import { resolveRequiredProviderModel } from "../mcp-shared.js";
 import { selectAgentListItems } from "../agent-projections.js";
 import { summarizeAgentActivity } from "../activity-curator.js";
-import {
-  MAX_SUBAGENT_DEPTH,
-  REMOTE_HIERARCHY_DEPTH_LABEL,
-  resolveInheritedHierarchyMode,
-} from "../hierarchy-policy.js";
-import {
-  inheritAgentBackground,
-  inheritWorkspaceBackground,
-  type BackgroundCaller,
-} from "../create-agent/intent.js";
+import { REMOTE_HIERARCHY_DEPTH_LABEL } from "../hierarchy-policy.js";
+import { AGENT_WORKSPACE_CREATION_ERROR } from "../create-agent/intent.js";
 import { expandUserPath } from "../../path-utils.js";
-import type { PaseoToolExecutionContext, PaseoToolResult } from "../tools/types.js";
+import {
+  PaseoToolInputError,
+  type PaseoToolExecutionContext,
+  type PaseoToolResult,
+} from "../tools/types.js";
 
 export class HostOperationRejectedError extends Error {
   readonly code: unknown;
@@ -278,29 +269,6 @@ const result = (structuredContent: unknown): PaseoToolResult => ({
   structuredContent,
 });
 
-function assertRemoteCreationSupport(
-  client: DaemonClient,
-  callerAgentId: string | undefined,
-  labels: Record<string, string> | undefined,
-): void {
-  // COMPAT(agentExplicitParentReports): added in v0.17.0, remove gate after 2027-05-22.
-  if (isExplicitParentReportingLabels(labels) && !supportsExplicitReports(client)) {
-    throw new HostOperationRejectedError(
-      new Error("Update the destination Paseo host to use explicit parent reporting."),
-    );
-  }
-  // COMPAT(agentHierarchyControl): added in v0.16.0, remove gate after 2027-05-19.
-  if (
-    callerAgentId &&
-    labels?.[REMOTE_HIERARCHY_DEPTH_LABEL] === String(MAX_SUBAGENT_DEPTH) &&
-    client.getLastServerInfoMessage()?.features?.agentHierarchyControl !== true
-  ) {
-    throw new HostOperationRejectedError(
-      new Error("Update the destination Paseo host to create a Level-2 subagent."),
-    );
-  }
-}
-
 function supportsExplicitReports(client: DaemonClient): boolean {
   return client.getLastServerInfoMessage()?.features?.agentExplicitParentReports === true;
 }
@@ -346,15 +314,6 @@ export function createHostResolver(input: {
   hosts: () => ToolHosts;
   callerAgentId?: string;
   trackRemoteChild?(childAgentId: string, serverId: string): Promise<void>;
-  /** The destination can't see the caller, so its defaults resolve before routing. */
-  caller: () =>
-    | (BackgroundCaller & {
-        provider: string;
-        currentModeId: string | null;
-        labels?: Record<string, string>;
-        config: Pick<AgentSessionConfig, "providerOptions">;
-      })
-    | null;
   lockedCwd?: string;
 }) {
   async function trackFollowups(
@@ -384,251 +343,241 @@ export function createHostResolver(input: {
     ): Promise<T> {
       const destination = serverId ?? input.serverId;
       if (destination === input.serverId) return action(input.local);
-      if (input.lockedCwd)
-        throw new Error("This caller is restricted to its local working directory");
-      const use = (invoke: (client: DaemonClient) => Promise<T>) =>
-        input
-          .hosts()
-          .use(destination, invoke, undefined, directParentAgentId, allowLegacyDirectPrompt);
-      return use(async (client) =>
-        action({
-          async createAgent(args) {
-            const parsed = remoteCreate.parse(args);
-            assertRemoteCreationSupport(client, input.callerAgentId, parsed.labels);
-            const { provider, model } = resolveRequiredProviderModel(parsed.provider);
-            const caller = input.caller();
-            const sameProviderCaller = caller?.provider === provider ? caller : null;
-            // Same-provider children inherit the caller's mode, as they would on the same host.
-            const modeId =
-              parsed.settings?.modeId ??
-              (sameProviderCaller
-                ? (resolveInheritedHierarchyMode(
-                    sameProviderCaller.currentModeId,
-                    sameProviderCaller.labels,
-                  ) ?? undefined)
-                : undefined);
-            const inheritedOptions = sameProviderCaller?.config.providerOptions;
-            const workspace = await client.findWorkspace(parsed.workspaceId);
-            if (!workspace) throw new Error(`Workspace ${parsed.workspaceId} not found`);
-            const labels: Record<string, string> = {
-              ...parsed.labels,
-              ...(input.callerAgentId
-                ? parentAddressLabels({ agentId: input.callerAgentId, serverId: input.serverId })
-                : {}),
-            };
-            const snapshot = await client.createAgent({
-              config: {
-                provider,
-                model,
-                cwd: workspace.workspaceDirectory,
-                title: parsed.title,
-                modeId,
-                ...(inheritedOptions && Object.keys(inheritedOptions).length > 0
-                  ? { providerOptions: { ...inheritedOptions, ...parsed.settings?.features } }
-                  : { featureValues: parsed.settings?.features }),
-                thinkingOptionId: parsed.settings?.thinkingOptionId,
-              },
-              workspaceId: parsed.workspaceId,
-              // Older hosts reject any background with a workspaceId, so a visible create omits it.
-              ...(inheritAgentBackground(parsed.background, caller) ? { background: true } : {}),
-              labels,
-              initialPrompt: parsed.initialPrompt,
-              idempotencyKey: parsed.idempotencyKey,
-            });
-            if (shouldObserveRemoteFollowups(client, labels, undefined))
-              await input.trackRemoteChild?.(snapshot.id, destination);
-            return result({
-              agentId: snapshot.id,
-              type: snapshot.provider,
-              status: snapshot.status,
-              cwd: snapshot.cwd,
-              workspaceId: snapshot.workspaceId,
-              currentModeId: snapshot.currentModeId,
-              availableModes: snapshot.availableModes,
-            });
-          },
-          async sendPrompt(args) {
-            const agentId = args.agentId as string;
-            // Human sends retain the established mode RPC on older connected hosts.
-            // Agent sends apply their requested mode when the recipient dispatches the batch.
-            if (!input.callerAgentId && args.sessionMode !== undefined) {
-              await client.setAgentMode(agentId, args.sessionMode as string);
-            }
-            const agent = (
-              await client.fetchAgent(agentId).catch((error) => {
-                // Snapshot preflight precedes sendMessage, so failure is definitely unsent.
-                throw new HostOperationRejectedError(error);
-              })
-            )?.agent;
-            if (!agent)
-              throw new HostOperationRejectedError(new Error(`Agent ${agentId} not found`));
-            const directParent = args.requireParentOwnership === true;
-            const info = client.getLastServerInfoMessage();
-            if (directParentAgentId && allowLegacyDirectPrompt) {
-              try {
-                assertDirectParent(agent.labels, destination, {
-                  agentId: directParentAgentId,
-                  serverId: input.serverId,
-                });
-                if (isExplicitParentReportingLabels(agent.labels)) {
-                  throw new Error(
-                    "The child now uses explicit parent reporting. Retry the prompt.",
-                  );
-                }
-              } catch (error) {
-                throw new HostOperationRejectedError(error);
-              }
-            }
-            const queueDirectParent = canQueueDirectParentPrompt(client, directParent);
-            // COMPAT(agentMessageDispatchConfirmation): added in v0.16.0, remove after 2027-05-19.
-            const waitForDispatch =
-              directParent &&
-              (!allowLegacyDirectPrompt ||
-                info?.features?.agentMessageDispatchConfirmation === true);
-            await trackFollowups(
-              client,
-              agent,
+      const remote =
+        (
+          invoke: (client: DaemonClient, args: Record<string, unknown>) => Promise<PaseoToolResult>,
+          creates?: true,
+        ): HostOperation =>
+        async (args) => {
+          if (creates && input.callerAgentId) {
+            throw new PaseoToolInputError(AGENT_WORKSPACE_CREATION_ERROR);
+          }
+          if (input.lockedCwd) {
+            throw new Error("This caller is restricted to its local working directory");
+          }
+          return input
+            .hosts()
+            .use(
               destination,
-              args.notifyOnFinish as boolean | undefined,
+              (client) => invoke(client, args),
+              undefined,
+              directParentAgentId,
+              allowLegacyDirectPrompt,
             );
-            const prepareLegacyNotification = args.prepareLegacyNotification as
-              | (() => Promise<void>)
-              | undefined;
-            if (!queueDirectParent) await prepareLegacyNotification?.();
-            const receipt = await client
-              .sendMessage(agentId, args.prompt as string, {
-                ...remoteTurnOptions(queueDirectParent, waitForDispatch, args.notifyOnFinish),
-                sessionMode: input.callerAgentId
-                  ? (args.sessionMode as string | undefined)
-                  : undefined,
-                sourceAgentId: input.callerAgentId,
-                sourceAgentServerId: input.callerAgentId ? input.serverId : undefined,
-                activeTurnBehavior:
-                  (args.activeTurnBehavior as ActiveTurnBehavior | undefined) ??
-                  (input.callerAgentId ? "steer" : "interrupt"),
-              })
-              .catch((error) => {
-                if (isAmbiguousPromptFailure(error)) throw error;
-                throw new HostOperationRejectedError(error);
-              });
-            return result({
-              success: true,
-              ...receipt,
-              status: agent.status,
-              guidance:
-                receipt.deliveryStatus === "queued"
-                  ? "Queued for delivery after two quiet seconds and the current turn ends, unless interrupt was requested."
-                  : "Dispatch acknowledged. Observe completion using get_agent_status/get_agent_activity or SDK/RPC subscriptions and wait APIs.",
-            });
-          },
-          async respondToPermission(args) {
-            const agentId = args.agentId as string;
-            const requestId = args.requestId as string;
-            const agent = (await client.fetchAgent(agentId))?.agent;
-            if (!agent || agent.archivedAt) throw new Error(`Agent ${agentId} is unavailable`);
-            if (input.callerAgentId) {
+        };
+      return action({
+        createAgent: remote(async (client, args) => {
+          const parsed = remoteCreate.parse(args);
+          if (isExplicitParentReportingLabels(parsed.labels) && !supportsExplicitReports(client)) {
+            // COMPAT(agentExplicitParentReports): added in v0.17.0, remove gate after 2027-05-22.
+            throw new HostOperationRejectedError(
+              new Error("Update the destination Paseo host to use explicit parent reporting."),
+            );
+          }
+          const { provider, model } = resolveRequiredProviderModel(parsed.provider);
+          const workspace = await client.findWorkspace(parsed.workspaceId);
+          if (!workspace) throw new Error(`Workspace ${parsed.workspaceId} not found`);
+          const snapshot = await client.createAgent({
+            config: {
+              provider,
+              model,
+              cwd: workspace.workspaceDirectory,
+              title: parsed.title,
+              modeId: parsed.settings?.modeId,
+              featureValues: parsed.settings?.features,
+              thinkingOptionId: parsed.settings?.thinkingOptionId,
+            },
+            workspaceId: parsed.workspaceId,
+            // Older hosts reject any background with a workspaceId, so a visible create omits it.
+            ...(parsed.background === true ? { background: true } : {}),
+            labels: parsed.labels,
+            initialPrompt: parsed.initialPrompt,
+            idempotencyKey: parsed.idempotencyKey,
+          });
+          return result({
+            agentId: snapshot.id,
+            type: snapshot.provider,
+            status: snapshot.status,
+            cwd: snapshot.cwd,
+            workspaceId: snapshot.workspaceId,
+            currentModeId: snapshot.currentModeId,
+            availableModes: snapshot.availableModes,
+          });
+        }, true),
+        sendPrompt: remote(async (client, args) => {
+          const agentId = args.agentId as string;
+          // Human sends retain the established mode RPC on older connected hosts.
+          // Agent sends apply their requested mode when the recipient dispatches the batch.
+          if (!input.callerAgentId && args.sessionMode !== undefined) {
+            await client.setAgentMode(agentId, args.sessionMode as string);
+          }
+          const agent = (
+            await client.fetchAgent(agentId).catch((error) => {
+              // Snapshot preflight precedes sendMessage, so failure is definitely unsent.
+              throw new HostOperationRejectedError(error);
+            })
+          )?.agent;
+          if (!agent) throw new HostOperationRejectedError(new Error(`Agent ${agentId} not found`));
+          const directParent = args.requireParentOwnership === true;
+          const info = client.getLastServerInfoMessage();
+          if (directParentAgentId && allowLegacyDirectPrompt) {
+            try {
               assertDirectParent(agent.labels, destination, {
-                agentId: input.callerAgentId,
+                agentId: directParentAgentId,
                 serverId: input.serverId,
               });
+              if (isExplicitParentReportingLabels(agent.labels)) {
+                throw new Error("The child now uses explicit parent reporting. Retry the prompt.");
+              }
+            } catch (error) {
+              throw new HostOperationRejectedError(error);
             }
-            if (!agent.pendingPermissions.some((request) => request.id === requestId)) {
-              throw new Error(`Permission request ${requestId} is no longer pending`);
-            }
-            await client.respondToPermissionAndWait(
-              agentId,
-              requestId,
-              args.response as AgentPermissionResponse,
-            );
-            return result({ success: true });
-          },
-          async getStatus(args) {
-            const agent = (await client.fetchAgent(args.agentId as string))?.agent;
-            if (!agent) throw new Error(`Agent ${args.agentId} not found`);
-            return result({ status: agent.status, snapshot: agent });
-          },
-          async getActivity(args) {
-            const agentId = args.agentId as string;
-            const limit = args.limit as number | undefined;
-            const timeline = await client.fetchAgentTimeline(agentId, {
-              direction: "tail",
-              limit: limit ?? 0,
+          }
+          const queueDirectParent = canQueueDirectParentPrompt(client, directParent);
+          // COMPAT(agentMessageDispatchConfirmation): added in v0.16.0, remove after 2027-05-19.
+          const waitForDispatch =
+            directParent &&
+            (!allowLegacyDirectPrompt || info?.features?.agentMessageDispatchConfirmation === true);
+          await trackFollowups(
+            client,
+            agent,
+            destination,
+            args.notifyOnFinish as boolean | undefined,
+          );
+          const prepareLegacyNotification = args.prepareLegacyNotification as
+            | (() => Promise<void>)
+            | undefined;
+          if (!queueDirectParent) await prepareLegacyNotification?.();
+          const receipt = await client
+            .sendMessage(agentId, args.prompt as string, {
+              ...remoteTurnOptions(queueDirectParent, waitForDispatch, args.notifyOnFinish),
+              sessionMode: input.callerAgentId
+                ? (args.sessionMode as string | undefined)
+                : undefined,
+              sourceAgentId: input.callerAgentId,
+              sourceAgentServerId: input.callerAgentId ? input.serverId : undefined,
+              activeTurnBehavior:
+                (args.activeTurnBehavior as ActiveTurnBehavior | undefined) ??
+                (input.callerAgentId ? "steer" : "interrupt"),
+            })
+            .catch((error) => {
+              if (isAmbiguousPromptFailure(error)) throw error;
+              throw new HostOperationRejectedError(error);
             });
-            const agent = (await client.fetchAgent(agentId))?.agent;
-            if (!agent) throw new Error(`Agent ${agentId} not found`);
-            return result({
-              agentId,
-              ...summarizeAgentActivity(
-                timeline.entries.map((entry) => entry.item),
-                limit,
-              ),
-              currentModeId: agent.currentModeId,
-            });
-          },
-          async listAgents(args) {
-            const { entries } = await client.fetchAgents({
-              includeBackground: args.includeBackground === true,
-              filter: { includeArchived: args.includeArchived === true },
-            });
-            return result({
-              agents: selectAgentListItems(
-                entries.map((entry) => entry.agent),
-                {
-                  cwd: (args.cwd as string | undefined)?.trim()
-                    ? expandUserPath(args.cwd as string)
-                    : undefined,
-                  statuses: args.statuses as AgentSnapshotPayload["status"][] | undefined,
-                  sinceHours: args.sinceHours as number | undefined,
-                  limit: args.limit as number | undefined,
-                },
-              ),
-            });
-          },
-          async listWorkspaces(args) {
-            const { entries } = await client.fetchWorkspaces({
-              includeBackground: args.includeBackground === true,
-            });
-            return result({ workspaces: entries.map(workspaceSummary) });
-          },
-          async createWorkspace(args) {
-            const isolation = z.enum(["local", "worktree"]).parse(args.isolation);
-            const path = z.string().min(1).parse(args.path);
-            if (args.mode === "branch-off" && args.prNumber !== undefined) {
-              // As on the local host: branching off a pull request is the app's, not this tool's.
-              throw new Error("branch, prNumber, and forge require a checkout mode");
-            }
-            const response = await client.createWorkspace({
-              source:
-                isolation === "local"
-                  ? { kind: "directory", path, projectId: args.projectId as string | undefined }
-                  : {
-                      kind: "worktree",
-                      cwd: path,
-                      projectId: args.projectId as string | undefined,
-                      // A pull request with no mode is checked out, as it was before a pull request could be branched off.
-                      action:
-                        args.mode === "branch-off" ||
-                        (args.mode === undefined && args.prNumber === undefined)
-                          ? "branch-off"
-                          : "checkout",
-                      baseBranch: args.baseBranch as string | undefined,
-                      branchName: args.branchName as string | undefined,
-                      refName: args.branch as string | undefined,
-                      githubPrNumber: args.prNumber as number | undefined,
-                      worktreeSlug: args.worktreeSlug as string | undefined,
-                    },
-              title: args.title as string | undefined,
-              background: inheritWorkspaceBackground(
-                args.background as boolean | undefined,
-                input.caller(),
-              ),
-            });
-            if (response.error || !response.workspace)
-              throw new Error(response.error ?? "Workspace creation failed");
-            return result(workspaceSummary(response.workspace));
-          },
+          return result({
+            success: true,
+            ...receipt,
+            status: agent.status,
+            guidance:
+              receipt.deliveryStatus === "queued"
+                ? "Queued for delivery after two quiet seconds and the current turn ends, unless interrupt was requested."
+                : "Dispatch acknowledged. Observe completion using get_agent_status/get_agent_activity or SDK/RPC subscriptions and wait APIs.",
+          });
         }),
-      );
+        respondToPermission: remote(async (client, args) => {
+          const agentId = args.agentId as string;
+          const requestId = args.requestId as string;
+          const agent = (await client.fetchAgent(agentId))?.agent;
+          if (!agent || agent.archivedAt) throw new Error(`Agent ${agentId} is unavailable`);
+          if (input.callerAgentId) {
+            assertDirectParent(agent.labels, destination, {
+              agentId: input.callerAgentId,
+              serverId: input.serverId,
+            });
+          }
+          if (!agent.pendingPermissions.some((request) => request.id === requestId)) {
+            throw new Error(`Permission request ${requestId} is no longer pending`);
+          }
+          await client.respondToPermissionAndWait(
+            agentId,
+            requestId,
+            args.response as AgentPermissionResponse,
+          );
+          return result({ success: true });
+        }),
+        getStatus: remote(async (client, args) => {
+          const agent = (await client.fetchAgent(args.agentId as string))?.agent;
+          if (!agent) throw new Error(`Agent ${args.agentId} not found`);
+          return result({ status: agent.status, snapshot: agent });
+        }),
+        getActivity: remote(async (client, args) => {
+          const agentId = args.agentId as string;
+          const limit = args.limit as number | undefined;
+          const timeline = await client.fetchAgentTimeline(agentId, {
+            direction: "tail",
+            limit: limit ?? 0,
+          });
+          const agent = (await client.fetchAgent(agentId))?.agent;
+          if (!agent) throw new Error(`Agent ${agentId} not found`);
+          return result({
+            agentId,
+            ...summarizeAgentActivity(
+              timeline.entries.map((entry) => entry.item),
+              limit,
+            ),
+            currentModeId: agent.currentModeId,
+          });
+        }),
+        listAgents: remote(async (client, args) => {
+          const { entries } = await client.fetchAgents({
+            includeBackground: args.includeBackground === true,
+            filter: { includeArchived: args.includeArchived === true },
+          });
+          return result({
+            agents: selectAgentListItems(
+              entries.map((entry) => entry.agent),
+              {
+                cwd: (args.cwd as string | undefined)?.trim()
+                  ? expandUserPath(args.cwd as string)
+                  : undefined,
+                statuses: args.statuses as AgentSnapshotPayload["status"][] | undefined,
+                sinceHours: args.sinceHours as number | undefined,
+                limit: args.limit as number | undefined,
+              },
+            ),
+          });
+        }),
+        listWorkspaces: remote(async (client, args) => {
+          const { entries } = await client.fetchWorkspaces({
+            includeBackground: args.includeBackground === true,
+          });
+          return result({ workspaces: entries.map(workspaceSummary) });
+        }),
+        createWorkspace: remote(async (client, args) => {
+          const isolation = z.enum(["local", "worktree"]).parse(args.isolation);
+          const path = z.string().min(1).parse(args.path);
+          if (args.mode === "branch-off" && args.prNumber !== undefined) {
+            // As on the local host: branching off a pull request is the app's, not this tool's.
+            throw new Error("branch, prNumber, and forge require a checkout mode");
+          }
+          const response = await client.createWorkspace({
+            source:
+              isolation === "local"
+                ? { kind: "directory", path, projectId: args.projectId as string | undefined }
+                : {
+                    kind: "worktree",
+                    cwd: path,
+                    projectId: args.projectId as string | undefined,
+                    // A pull request with no mode is checked out, as it was before a pull request could be branched off.
+                    action:
+                      args.mode === "branch-off" ||
+                      (args.mode === undefined && args.prNumber === undefined)
+                        ? "branch-off"
+                        : "checkout",
+                    baseBranch: args.baseBranch as string | undefined,
+                    branchName: args.branchName as string | undefined,
+                    refName: args.branch as string | undefined,
+                    githubPrNumber: args.prNumber as number | undefined,
+                    worktreeSlug: args.worktreeSlug as string | undefined,
+                  },
+            title: args.title as string | undefined,
+            background: args.background as boolean | undefined,
+          });
+          if (response.error || !response.workspace)
+            throw new Error(response.error ?? "Workspace creation failed");
+          return result(workspaceSummary(response.workspace));
+        }, true),
+      });
     },
   };
 }

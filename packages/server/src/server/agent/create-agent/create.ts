@@ -5,7 +5,7 @@ import type { Logger } from "pino";
 
 import type { TerminalManager } from "../../../terminal/terminal-manager.js";
 import type { CreatePaseoWorktreeInput } from "../../paseo-worktree-service.js";
-import { expandUserPath, resolvePathFromBase } from "../../path-utils.js";
+import { expandUserPath, isSameOrDescendantPath } from "../../path-utils.js";
 import { toWorktreeRequestError } from "../../worktree-errors.js";
 import type {
   CreatePaseoWorktreeWorkflowFn,
@@ -17,12 +17,14 @@ import type { AgentPromptInput, AgentRunOptions, AgentSessionConfig } from "../a
 import type { AgentStorage } from "../agent-storage.js";
 import type { AgentOwner } from "../agent-owner.js";
 import type { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
+import type { WorkspaceRegistry } from "../../workspace-registry.js";
 import { startCreatedAgentInitialPrompt } from "../agent-prompt.js";
 import { resolveCreateAgentTitles } from "../create-agent-title.js";
 import { buildAgentPrompt } from "../prompt-attachments.js";
 import { normalizeClientMessageId, resolveClientMessageId } from "../../client-message-id.js";
 import { resolveRequiredProviderModel, type ResolvedProviderModel } from "../mcp-shared.js";
 import {
+  AGENT_WORKSPACE_CREATION_ERROR,
   inheritAgentBackground,
   inheritWorkspaceBackground,
   resolveCreateAgentIntent,
@@ -64,6 +66,7 @@ export interface CreateAgentCommandDependencies {
   worktreesRoot?: string;
   terminalManager?: TerminalManager | null;
   providerSnapshotManager: Pick<ProviderSnapshotManager, "resolveCreateConfig">;
+  workspaceRegistry?: Pick<WorkspaceRegistry, "get">;
   createPaseoWorktree?: CreatePaseoWorktreeWorkflowFn;
   // Mints a fresh directory workspace for a cwd and returns its id.
   ensureWorkspaceForCreate?: EnsureWorkspaceForCreate;
@@ -470,6 +473,7 @@ async function resolveMcpCreateAgent(
   const parentAgent = input.callerAgentId
     ? requireParentAgent(dependencies.agentManager, input.callerAgentId)
     : null;
+  assertMcpCallerPlacement(input, parentAgent, dependencies.workspaceRegistry);
   const cwd = resolveMcpInitialCwd(input, parentAgent);
   const workspaceIntent = {
     background: inheritWorkspaceBackground(input.background, parentAgent),
@@ -483,25 +487,13 @@ async function resolveMcpCreateAgent(
     workspaceIntent,
   });
   if (createdWorktree) input.onWorktreeCreated?.(createdWorktree);
-  const intent = await resolveCreateAgentIntent({
-    explicitWorkspaceId: createdWorkspaceId ?? input.workspaceId,
-    caller: parentAgent,
-    labels: input.labels,
-    serverId: dependencies.serverId,
-    childAgentDefaultLabels: input.callerContext?.childAgentDefaultLabels,
-    legacyDetached: input.detached ?? false,
-    resolveWorkspace: async (workspaceId) => ({ workspaceId, cwd: resolvedCwd }),
-    createWorkspace: async () => ({
-      workspaceId: requireResolvedWorkspaceId(
-        await ensureWorkspaceForMcpCreate(
-          dependencies,
-          resolvedCwd,
-          input.initialPrompt ?? "",
-          workspaceIntent,
-        ),
-      ),
-      cwd: resolvedCwd,
-    }),
+  const intent = await resolveMcpAgentIntent({
+    dependencies,
+    input,
+    parentAgent,
+    resolvedCwd,
+    createdWorkspaceId,
+    workspaceIntent,
   });
   if (intent.parentAgentId) applyMcpParentReporting(intent.labels, input, parentAgent?.labels);
   const resolvedCreateConfig = await resolveMcpProviderCreateConfig({
@@ -527,7 +519,7 @@ async function resolveMcpCreateAgent(
       ...(Object.keys(intent.labels).length > 0 ? { labels: intent.labels } : {}),
       workspaceId: intent.workspaceId,
       inheritParentWorkspace:
-        Boolean(intent.parentAgentId) && !createdWorkspaceId && !input.workspaceId,
+        Boolean(intent.parentAgentId) && !createdWorkspaceId && input.workspaceId === undefined,
       owner: input.owner,
       background: inheritAgentBackground(input.background, parentAgent),
       env: input.env,
@@ -548,11 +540,59 @@ function resolveMcpInitialCwd(
   if (!parentAgent) {
     return expandUserPath(input.cwd ?? process.cwd());
   }
-  return resolveChildAgentCwd({
-    parentCwd: parentAgent.cwd,
-    requestedCwd: input.cwd,
-    lockedCwd: input.callerContext?.lockedCwd,
-    allowCustomCwd: input.callerContext?.allowCustomCwd ?? true,
+  const lockedCwd = input.callerContext?.lockedCwd?.trim();
+  if (lockedCwd && !isSameOrDescendantPath(expandUserPath(lockedCwd), parentAgent.cwd)) {
+    throw new Error("The parent workspace is outside the allowed working directory.");
+  }
+  return parentAgent.cwd;
+}
+
+function assertMcpCallerPlacement(
+  input: CreateAgentFromMcpInput,
+  parentAgent: ManagedAgent | null,
+  workspaceRegistry: CreateAgentCommandDependencies["workspaceRegistry"],
+): void {
+  if (parentAgent && (!workspaceRegistry || hasMcpWorktreeRequest(input.worktree))) {
+    throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+  }
+}
+
+async function resolveMcpAgentIntent(params: {
+  dependencies: CreateAgentCommandDependencies;
+  input: CreateAgentFromMcpInput;
+  parentAgent: ManagedAgent | null;
+  resolvedCwd: string;
+  createdWorkspaceId?: string;
+  workspaceIntent: McpWorkspaceIntent;
+}) {
+  const { dependencies, input, parentAgent, resolvedCwd, createdWorkspaceId, workspaceIntent } =
+    params;
+  return resolveCreateAgentIntent({
+    explicitWorkspaceId: createdWorkspaceId ?? input.workspaceId,
+    caller: parentAgent,
+    labels: input.labels,
+    serverId: dependencies.serverId,
+    childAgentDefaultLabels: input.callerContext?.childAgentDefaultLabels,
+    legacyDetached: input.detached ?? false,
+    resolveWorkspace: async (workspaceId) => {
+      const workspace = await dependencies.workspaceRegistry?.get(workspaceId);
+      if (dependencies.workspaceRegistry && (!workspace || workspace.archivedAt)) {
+        if (parentAgent) throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+        throw new Error(`Workspace ${workspaceId} not found`);
+      }
+      return { workspaceId, cwd: resolvedCwd };
+    },
+    createWorkspace: async () => ({
+      workspaceId: requireResolvedWorkspaceId(
+        await ensureWorkspaceForMcpCreate(
+          dependencies,
+          resolvedCwd,
+          input.initialPrompt ?? "",
+          workspaceIntent,
+        ),
+      ),
+      cwd: resolvedCwd,
+    }),
   });
 }
 
@@ -676,29 +716,17 @@ function requireParentAgent(agentManager: AgentManager, parentAgentId: string): 
   return parentAgent;
 }
 
-function resolveChildAgentCwd(params: {
-  parentCwd: string;
-  requestedCwd?: string;
-  lockedCwd?: string;
-  allowCustomCwd: boolean;
-}): string {
-  const lockedCwd = params.lockedCwd?.trim();
-  if (lockedCwd) {
-    return expandUserPath(lockedCwd);
-  }
-
-  const requestedCwd = params.requestedCwd?.trim();
-  if (!requestedCwd || !params.allowCustomCwd) {
-    return params.parentCwd;
-  }
-
-  return resolvePathFromBase(params.parentCwd, requestedCwd);
-}
-
 interface CreateMcpWorktreeOptions {
   input: CreatePaseoWorktreeInput;
   createPaseoWorktree: CreatePaseoWorktreeWorkflowFn | undefined;
   resolveDefaultBranch?: (repoRoot: string) => Promise<string>;
+}
+
+function hasMcpWorktreeRequest(worktree: CreateAgentFromMcpInput["worktree"]): boolean {
+  return Boolean(
+    worktree &&
+    (worktree.worktreeName || worktree.refName || worktree.action || worktree.githubPrNumber),
+  );
 }
 
 async function createMcpWorktree(
@@ -732,9 +760,7 @@ async function resolveMcpCwd(params: {
   if (!worktree) {
     return { resolvedCwd: params.cwd };
   }
-  const shouldCreateWorktree = Boolean(
-    worktree.worktreeName || worktree.refName || worktree.action || worktree.githubPrNumber,
-  );
+  const shouldCreateWorktree = hasMcpWorktreeRequest(worktree);
   if (!shouldCreateWorktree) {
     return { resolvedCwd: params.cwd };
   }

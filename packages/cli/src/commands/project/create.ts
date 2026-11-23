@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { Command } from "commander";
 import type { CommandError, CommandOptions, SingleResult } from "../../output/index.js";
+import { agentWorkspaceCreationError, resolveCallerAgent } from "../../utils/caller-agent.js";
 import { buildDaemonConnectionCommandError, connectToDaemon } from "../../utils/client.js";
 import { projectSchema, toProjectRow, type ProjectRow } from "./shared.js";
 
@@ -38,6 +39,7 @@ export async function runCreateCommand(
   });
 
   try {
+    if (await resolveCallerAgent(client)) throw agentWorkspaceCreationError();
     const payload = await client.addProject(projectPath);
     if (!payload.project) {
       throw new Error(payload.error ?? "Project creation failed");

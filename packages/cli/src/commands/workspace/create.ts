@@ -3,7 +3,7 @@ import { isAbsolute as isWindowsAbsolute } from "node:path/win32";
 import { resolve } from "node:path";
 import type { Command } from "commander";
 import { connectToDaemon, getDaemonHost } from "../../utils/client.js";
-import { resolveCallerAgentId } from "../../utils/caller-agent.js";
+import { agentWorkspaceCreationError, resolveCallerAgent } from "../../utils/caller-agent.js";
 import type { DaemonTarget } from "../../utils/daemon-target.js";
 import type { CommandError, CommandOptions, SingleResult } from "../../output/index.js";
 import { toWorkspaceRow, workspaceSchema, type WorkspaceRow } from "./shared.js";
@@ -164,12 +164,12 @@ export async function runCreateCommand(
   });
 
   try {
-    const callerAgentId = await resolveCallerAgentId(client);
+    const caller = await resolveCallerAgent(client);
+    if (caller) throw agentWorkspaceCreationError();
     const payload = await client.createWorkspace({
       source: buildWorkspaceSource(options),
       ...(options.title ? { title: options.title } : {}),
       ...(options.background !== undefined ? { background: options.background } : {}),
-      ...(callerAgentId ? { callerAgentId } : {}),
     });
     if (!payload.workspace) {
       throw new Error(payload.error ?? "Workspace creation failed");
