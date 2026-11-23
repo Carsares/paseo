@@ -123,6 +123,7 @@ it("shows the main control prompt only for hosts advertising support and closes 
   fireEvent.click(edit);
   const generalInput = screen.getByLabelText<HTMLTextAreaElement>(commonCopy.accessibilityLabel);
   expect(generalInput.value).toBe("General prompt");
+  expect(generalInput.placeholder).toBe(commonCopy.placeholder);
   fireEvent.change(generalInput, { target: { value: "Different general prompt" } });
   fireEvent.click(screen.getByRole("button", { name: commonCopy.save }));
   await waitFor(() => expect(screen.queryByLabelText(commonCopy.accessibilityLabel)).toBeNull());
@@ -168,7 +169,9 @@ it("preserves a draft on config readback and saves an empty prompt without sendi
   fireEvent.click(screen.getByRole("button", { name: commonCopy.save }));
   await waitFor(() => expect(screen.queryByLabelText(promptCopy.sheetTitle)).toBeNull());
   expect(patch).toHaveBeenNthCalledWith(2, { mainControlAppendSystemPrompt: "" });
-  expect((await openMainControlPrompt()).value).toBe("");
+  const emptyInput = await openMainControlPrompt();
+  expect(emptyInput.value).toBe("");
+  expect(emptyInput.placeholder).toBe(promptCopy.placeholder);
 });
 
 it("keeps the draft in the sheet when a save fails and retries it", async () => {

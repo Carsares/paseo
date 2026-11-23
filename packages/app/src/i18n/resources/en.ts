@@ -3155,6 +3155,8 @@ export const en = {
           title: "Main control system prompt",
           hint: "Applies when a session takes on the main control role. Existing main control sessions and subagents are unaffected.",
           sheetTitle: "Edit main control system prompt",
+          placeholder:
+            "Role: Confirm the goal with the user.\nExecution: Delegate work to a lead.\nOutput: Summarize results and risks.",
         },
         systemPrompt: {
           loadFailed: "Unable to load host settings.",

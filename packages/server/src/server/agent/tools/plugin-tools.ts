@@ -1,6 +1,6 @@
 import { z } from "zod";
-import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import type { AgentManager } from "../agent-manager.js";
+import type { PaseoToolPolicy } from "../hierarchy-policy.js";
 import { isPaseoToolEnabled } from "../paseo-tool-policy.js";
 import type { PaseoToolDefinition } from "./types.js";
 import { addModelVisibleStructuredContent } from "./paseo-tool-serialization.js";
@@ -11,7 +11,7 @@ export function registerPluginTools(options: {
   scope: "agent" | "top-level";
   tools: Map<string, PaseoToolDefinition>;
   builtinNames: Set<string>;
-  policy?: ProviderPaseoToolsPolicy;
+  policy?: PaseoToolPolicy;
 }): void {
   const { agentManager, callerAgentId, scope, tools, builtinNames, policy } = options;
   if (scope !== "agent" || !callerAgentId) return;

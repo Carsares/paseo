@@ -8,6 +8,8 @@ import { expect, test } from "vitest";
 import { z } from "zod";
 import { createTestLogger } from "../../../../../test-utils/test-logger.js";
 import { OpenCodeBridge } from "../bridge.js";
+import { V2Harness } from "../test-utils/v2-harness.js";
+import { OpenCodeV2AgentClient } from "./agent.js";
 
 interface Binding {
   sessionID: string;
@@ -24,7 +26,7 @@ interface TestContext {
   system: unknown[];
 }
 
-test("a shared plugin binds Paseo sessions without involving unrelated sessions", async () => {
+test("a shared plugin binds restored Paseo sessions without involving unrelated sessions", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "paseo-shared-bridge-"));
   const bridge = new OpenCodeBridge({ paseoHome: home, logger: createTestLogger() });
   const tool = { name: "echo", description: "echo", inputSchema: { value: z.string() } };
@@ -32,18 +34,14 @@ test("a shared plugin binds Paseo sessions without involving unrelated sessions"
   // Session-only tools must survive plugin reload without a global definition.
   bridge.setManifestCatalog({ tools: new Map() });
   await bridge.start();
-  const unbind = bridge.bindSession({
-    sessionId: "paseo",
-    env: {},
-    tools: {
-      tools,
-      getTool: (name) => tools.get(name),
-      executeTool: async (_name, input) => ({
-        content: [{ type: "text", text: String((input as { value: string }).value) }],
-      }),
-    },
+  const harness = new V2Harness();
+  harness.info.id = "paseo";
+  const client = new OpenCodeV2AgentClient({
+    logger: createTestLogger(),
+    runtime: harness.runtime,
+    bridge,
   });
-  expect(() => bridge.bindSession({ sessionId: "paseo", env: {} })).toThrow("already bound");
+  let closeSession: (() => Promise<void>) | undefined;
   try {
     const plugin = {
       package: await bridge.materializeV2Plugin(),
@@ -108,13 +106,35 @@ test("a shared plugin binds Paseo sessions without involving unrelated sessions"
       },
     };
     let dispose = await module.default.setup(context);
-    await rpc.bind({ sessionID: "paseo", ...plugin.options });
+    harness.connection.bindSession = async (sessionID) => {
+      await rpc.bind({ sessionID, ...plugin.options });
+    };
+    const session = await client.resumeSession(
+      { provider: "opencode", sessionId: "paseo" },
+      { cwd: home },
+      {
+        paseoTools: {
+          tools,
+          getTool: (name) => tools.get(name),
+          executeTool: async (_name, input) => ({
+            content: [{ type: "text", text: String((input as { value: string }).value) }],
+          }),
+        },
+        paseoToolPreapprovals: ["echo"],
+      },
+    );
+    closeSession = () => session.close();
+    expect(() => bridge.bindSession({ sessionId: "paseo", env: {} })).toThrow("already bound");
     await rpc.refresh({ sessionID: "paseo", ...plugin.options });
     expect(refreshed).toEqual(["provider", "model", "agent", "command", "skill"]);
     await expect(
       rpc.bind({ sessionID: "paseo", ...plugin.options, token: "another-daemon" }),
     ).resolves.toEqual({ error: "OpenCode session is already bound to another Paseo bridge" });
-    const own = { sessionID: "paseo", tools: { paseo_echo: {}, native: {} }, system: [] };
+    const own = {
+      sessionID: "paseo",
+      tools: { paseo_echo: {}, paseo_disabled: {}, native: {} },
+      system: [],
+    };
     for (const hook of hooks) await hook(own);
     expect(Object.keys(own.tools)).toEqual(["paseo_echo", "native"]);
     expect(
@@ -130,6 +150,8 @@ test("a shared plugin binds Paseo sessions without involving unrelated sessions"
     expect(
       await installed.get("paseo_echo")!.execute({ value: "reloaded" }, { sessionID: "paseo" }),
     ).toMatchObject({ content: [{ type: "text", text: "reloaded" }] });
+    await closeSession();
+    closeSession = undefined;
     await bridge.close();
     await dispose();
     hooks.length = 0;
@@ -164,7 +186,7 @@ test("a shared plugin binds Paseo sessions without involving unrelated sessions"
     }
     await dispose();
   } finally {
-    unbind();
+    await closeSession?.();
     await bridge.close();
     await rm(home, { recursive: true, force: true });
   }

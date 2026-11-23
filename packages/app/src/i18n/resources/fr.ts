@@ -3087,6 +3087,8 @@ export const fr: TranslationResources = {
           title: "Prompt système du contrôle principal",
           hint: "S’applique quand une session prend le rôle de contrôle principal. Les sessions qui ont déjà ce rôle et les sous-agents ne sont pas affectés.",
           sheetTitle: "Modifier le prompt système du contrôle principal",
+          placeholder:
+            "Rôle : confirmer l’objectif avec l’utilisateur.\nExécution : confier la tâche à un responsable direct.\nRéponse : résumer les résultats et les risques.",
         },
         systemPrompt: {
           loadFailed: "Impossible de charger les paramètres de l’hôte.",

@@ -3065,6 +3065,8 @@ export const ptBR: TranslationResources = {
           title: "Prompt do sistema para controle principal",
           hint: "Aplica-se quando uma sessão assume a função de controle principal. Sessões que já têm essa função e subagentes não são afetados.",
           sheetTitle: "Editar prompt do sistema para controle principal",
+          placeholder:
+            "Papel: confirme o objetivo com o usuário.\nExecução: delegue a tarefa a um responsável direto.\nResposta: resuma os resultados e os riscos.",
         },
         systemPrompt: {
           loadFailed: "Não foi possível carregar as configurações do host.",

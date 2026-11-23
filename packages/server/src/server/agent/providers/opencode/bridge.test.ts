@@ -14,11 +14,17 @@ import type { PaseoToolCatalog } from "../../tools/types.js";
 import { PaseoToolInputError } from "../../tools/types.js";
 import { AgentManager } from "../../agent-manager.js";
 import { AgentStorage } from "../../agent-storage.js";
+import {
+  createFinishSubscriptions,
+  createJsonFinishSubscriptionStore,
+} from "../../finish-subscriptions/index.js";
 import { ProviderSnapshotManager } from "../../provider-snapshot-manager.js";
 import { createTestAgentClients } from "../../../test-utils/fake-agent-client.js";
 import { createTestAgentMessages } from "../../../test-utils/agent-messages.js";
 import { createPaseoAgentToolManifest, createPaseoToolCatalog } from "../../tools/paseo-tools.js";
 import { serializePaseoToolInputParameters } from "../../tools/paseo-tool-serialization.js";
+import { OpenCodeAgentClient } from "../opencode-agent.js";
+import { TestOpenCodeClient, TestOpenCodeHarness } from "./test-utils/test-opencode-harness.js";
 import {
   OpenCodeBridge,
   decorateOpenCodeV2Env,
@@ -78,6 +84,88 @@ function readPluginOptions(env: Record<string, string>): {
 }
 
 describe("OpenCodeBridge", () => {
+  test("binds V1 preapprovals to the current caller and exact bridge tool", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "paseo-opencode-approval-"));
+    temporaryDirectories.push(cwd);
+    const bridge = new OpenCodeBridge({ paseoHome: cwd, logger: createTestLogger() });
+    const openCode = new TestOpenCodeClient();
+    const runtime = new TestOpenCodeHarness();
+    runtime.enqueueClient(openCode);
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      bridge,
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const catalog = createCatalog();
+    bridge.setManifestCatalog(catalog);
+    await bridge.start();
+    const plugin = readPluginOptions(bridge.decorateServerEnv({}));
+    const hooks = await (await import(plugin.pluginUrl)).default({}, plugin);
+    const config = { provider: "opencode", cwd } as const;
+    let closeSession: (() => Promise<void>) | undefined;
+    const execute = (ask: (request: unknown) => Promise<void>) =>
+      hooks.tool.paseo_echo_context.execute({ value: "approved" }, { sessionID: "session-1", ask });
+    try {
+      const main = await client.createSession(config, {
+        paseoTools: catalog,
+        paseoToolPreapprovals: ["echo_context", "disabled_tool"],
+      });
+      closeSession = () => main.close();
+      const permission = (
+        openCode.calls.sessionCreate[0] as {
+          permission: Array<{ permission: string; pattern: string; action: string }>;
+        }
+      ).permission;
+      expect(permission).toEqual([
+        {
+          permission: "paseo_echo_context",
+          pattern: expect.stringMatching(/^paseo-bridge-/),
+          action: "allow",
+        },
+      ]);
+      await expect(
+        execute(async (request) => {
+          expect(request).toMatchObject({
+            permission: permission[0].permission,
+            patterns: [permission[0].pattern],
+          });
+        }),
+      ).resolves.toMatchObject({ output: "approved" });
+      await closeSession();
+      closeSession = undefined;
+
+      runtime.enqueueClient(openCode);
+      const restored = await client.resumeSession(
+        { provider: "opencode", sessionId: "session-1" },
+        { cwd, providerOptions: { permission: "deny" } },
+        { paseoTools: catalog, paseoToolPreapprovals: ["echo_context"] },
+      );
+      closeSession = () => restored.close();
+      const restoredRules = (
+        openCode.calls.sessionUpdate[0] as typeof config & {
+          permission: typeof permission;
+        }
+      ).permission;
+      expect(restoredRules).toEqual([
+        {
+          permission: "paseo_echo_context",
+          pattern: expect.stringMatching(/^paseo-bridge-/),
+          action: "allow",
+        },
+        { permission: "*", pattern: "*", action: "deny" },
+      ]);
+      expect(restoredRules[0].pattern).not.toBe(permission[0].pattern);
+      await expect(
+        execute(async (request) => {
+          expect(request).toMatchObject({ patterns: [restoredRules[0].pattern] });
+          throw new Error("provider denied the tool");
+        }),
+      ).rejects.toThrow("provider denied the tool");
+    } finally {
+      await closeSession?.();
+      await bridge.close();
+    }
+  });
   test("discovers only the requested session's catalog and retains global discovery", async () => {
     const paseoHome = await mkdtemp(path.join(tmpdir(), "paseo-opencode-discovery-"));
     temporaryDirectories.push(paseoHome);
@@ -238,12 +326,30 @@ describe("OpenCodeBridge", () => {
     const agentManager = new AgentManager({ clients, registry: agentStorage, logger });
     const providerSnapshotManager = new ProviderSnapshotManager({ logger, extraClients: clients });
     const agentMessages = createTestAgentMessages({ agentManager, agentStorage, logger });
+    const finishSubscriptions = createFinishSubscriptions({
+      store: createJsonFinishSubscriptionStore(paseoHome),
+      serverId: "self",
+      logger,
+      messages: () => agentMessages,
+      callerIsActive: async () => true,
+      open: async (_record, signal) => ({
+        next: async () => {
+          signal.throwIfAborted();
+          return new Promise((_resolve, reject) =>
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true }),
+          );
+        },
+        close: async () => {},
+      }),
+    });
+    await finishSubscriptions.start();
     const dependencies = {
       agentManager,
       agentStorage,
       providerSnapshotManager,
       logger,
       agentMessages: () => agentMessages,
+      finishSubscriptions: () => finishSubscriptions,
     };
     const bridge = new OpenCodeBridge({ paseoHome, logger });
     await bridge.start();
@@ -332,10 +438,13 @@ describe("OpenCodeBridge", () => {
         }
         expect(createDefinition.inputSchema).toMatchObject({
           properties: {
-            notifyOnFinish: { default: true },
+            notifyOnFinish: { type: "boolean" },
             parentReporting: { enum: ["auto", "explicit"] },
           },
         });
+        expect(createDefinition.inputSchema.properties).not.toHaveProperty(
+          "notifyOnFinish.default",
+        );
         expect(createDefinition.inputSchema.required).not.toContain("parentReporting");
         expect(createDefinition.inputSchema.properties).toHaveProperty("background");
         expect(sendDefinition.inputSchema.properties).toHaveProperty(
@@ -366,7 +475,7 @@ describe("OpenCodeBridge", () => {
           .find((agent) => agent.config.title === "Explicit child");
         expect(isExplicitParentReportingLabels(explicitChild?.labels)).toBe(true);
         expect(explicitResult).toMatchObject({
-          content: [{ type: "text", text: expect.stringContaining("Creation acknowledged") }],
+          content: [{ type: "text", text: expect.stringContaining(explicitChild!.id) }],
         });
 
         const v1Module = await import(plugin.pluginUrl);
@@ -389,6 +498,7 @@ describe("OpenCodeBridge", () => {
         await dispose();
       }
     } finally {
+      await finishSubscriptions.close();
       await agentMessages.close();
       await bridge.close();
       await Promise.all(

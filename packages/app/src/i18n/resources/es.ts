@@ -3084,6 +3084,8 @@ export const es: TranslationResources = {
           title: "Mensaje del sistema para el control principal",
           hint: "Se aplica cuando una sesión asume el rol de control principal. No afecta a las sesiones que ya tienen ese rol ni a los subagentes.",
           sheetTitle: "Editar mensaje del sistema para el control principal",
+          placeholder:
+            "Función: confirma el objetivo con el usuario.\nEjecución: delega la tarea en un responsable directo.\nRespuesta: resume los resultados y los riesgos.",
         },
         systemPrompt: {
           loadFailed: "No se pudo cargar la configuración del host.",

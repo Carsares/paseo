@@ -1148,7 +1148,7 @@ function SystemPromptCard({
               initialValue={editor.draft}
               multiline
               onChangeText={handleDraftChange}
-              placeholder={t("settings.host.orchestration.systemPrompt.placeholder")}
+              placeholder={t(`${copy}.placeholder`)}
               style={styles.systemPromptInput}
             />
           </View>

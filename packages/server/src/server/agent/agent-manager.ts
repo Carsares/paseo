@@ -149,9 +149,14 @@ import {
 } from "./runtime-mcp-config.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
 import type { PaseoToolCatalogFactory } from "./tools/types.js";
-import { isPaseoToolPolicyEnabled, resolveAgentPaseoToolPolicy } from "./paseo-tool-policy.js";
+import {
+  isPaseoToolEnabled,
+  isPaseoToolPolicyEnabled,
+  resolveAgentPaseoToolPolicy,
+} from "./paseo-tool-policy.js";
 import {
   buildHierarchyAppendSystemPrompt,
+  buildMainControlInstructions,
   computeAgentDepth,
   getLegacyMainControlPriorMode,
   hasReservedHierarchyLabels,
@@ -160,6 +165,7 @@ import {
   MAIN_CONTROL_WRITE_DENIAL,
   MAIN_CONTROL_PROMPT_HEADER,
   mainControlPromptEnd,
+  type PaseoToolPolicy,
   stripMainControlPromptHeader,
   MAX_SUBAGENT_DEPTH,
   readLocalSubtreeDepths,
@@ -306,7 +312,7 @@ async function resolveResumePurpose(
 interface PreparedSessionConfig {
   storedConfig: AgentSessionConfig;
   launchConfig: AgentSessionConfig;
-  paseoToolPolicy: ProviderPaseoToolsPolicy | undefined;
+  paseoToolPolicy: PaseoToolPolicy | undefined;
 }
 
 interface NormalizeConfigOptions {
@@ -932,6 +938,15 @@ function isAgentBusy(status: AgentLifecycleStatus): boolean {
   return BUSY_STATUSES.has(status);
 }
 
+function orchestrationPreapprovals(
+  policy: PaseoToolPolicy | undefined,
+  catalog?: AgentLaunchContext["paseoTools"],
+): string[] | undefined {
+  return policy?.allowedTools?.filter(
+    (tool) => isPaseoToolEnabled(policy, tool) && (!catalog || catalog.getTool(tool)),
+  );
+}
+
 type TurnTerminalEvent = Extract<
   AgentStreamEvent,
   { type: "turn_completed" | "turn_failed" | "turn_canceled" }
@@ -1315,6 +1330,7 @@ export class AgentManager {
     { parentId: string; destination: string; uncertain: boolean }
   >();
   private readonly pendingHierarchyArchives = new Map<string, number>();
+  private readonly guardedAgentArchives = new Set<string>();
   private readonly pendingHierarchySessionReloads = new Set<string>();
   private readonly hierarchySessionUpdates = new Set<string>();
   private readonly mainControlRoleUpdates = new Set<string>();
@@ -1333,7 +1349,7 @@ export class AgentManager {
   private readonly serverId?: string;
   private paseoToolsEnabled = true;
   private paseoToolCatalogFactory: PaseoToolCatalogFactory | null = null;
-  private readonly paseoToolPolicies = new Map<string, ProviderPaseoToolsPolicy | undefined>();
+  private readonly paseoToolPolicies = new Map<string, PaseoToolPolicy | undefined>();
   private hierarchyMutationTail = Promise.resolve();
   private readonly resolvePaseoToolPolicy: (
     provider: AgentProvider,
@@ -1524,6 +1540,7 @@ export class AgentManager {
   ): Promise<AgentToolResult> {
     const agent = this.getAgent(agentId);
     if (!agent || agent.lifecycle === "closed") throw new Error(`Agent is not live: ${agentId}`);
+    if (isMainControlAgentLabels(agent.labels)) throw new Error(MAIN_CONTROL_WRITE_DENIAL);
     if (!this.pluginAgentTools) throw new Error("Plugin tools are unavailable");
     const record = await this.registry?.get(agentId);
     return this.pluginAgentTools.callTool(
@@ -1542,7 +1559,7 @@ export class AgentManager {
     this.pluginAgentTools?.detachTools(agentId);
   }
 
-  getPaseoToolPolicy(agentId: string): ProviderPaseoToolsPolicy | undefined {
+  getPaseoToolPolicy(agentId: string): PaseoToolPolicy | undefined {
     return this.paseoToolPolicies.get(agentId);
   }
 
@@ -3027,7 +3044,7 @@ export class AgentManager {
     agentId: string,
     session: AgentSession | undefined,
     hadPreviousPolicy: boolean,
-    previousPolicy: ProviderPaseoToolsPolicy | undefined,
+    previousPolicy: PaseoToolPolicy | undefined,
     closedExisting?: ManagedAgentClosed,
     mainControlRole?: MainControlRoleUpdate,
   ): Promise<void> {
@@ -3273,6 +3290,70 @@ export class AgentManager {
     return this.runHierarchyArchive(agentId, () => this.archiveAgentUnlocked(agentId, archivedAt));
   }
 
+  async archiveAgentFromAgentTool(
+    agentId: string,
+    recheckHierarchy: () => Promise<void>,
+  ): Promise<void> {
+    return this.runHierarchyArchive(agentId, async () => {
+      // A reparent or role change may have committed while the tool was waiting.
+      await recheckHierarchy();
+      const live = this.agents.get(agentId);
+      if (!live && this.getRetiredInternalAgent(agentId)) return;
+      const stored = live?.internal ? null : await this.requireRegistry().get(agentId);
+      if (stored?.archivedAt && (!live || this.historySessions.has(live.session))) return;
+
+      if (!live) {
+        if (!stored) throw new Error(`Agent not found: ${agentId}`);
+        this.assertAgentArchiveAllowed(agentId, stored);
+        await this.archiveStoredRecordUnlocked(stored, new Date().toISOString());
+        return;
+      }
+
+      await this.drainSessionEvents(agentId);
+      // Direct foreground reservation doesn't take the lifecycle lane. Claim
+      // this runtime synchronously with the check so no new run can slip in.
+      this.assertAgentArchiveAllowed(agentId);
+      this.guardedAgentArchives.add(agentId);
+      try {
+        await this.archiveAgentUnlocked(agentId, undefined, { requireInactiveTarget: true });
+      } finally {
+        this.guardedAgentArchives.delete(agentId);
+      }
+    });
+  }
+
+  private assertAgentArchiveAllowed(agentId: string, stored?: StoredAgentRecord): void {
+    const live = this.agents.get(agentId);
+    const status = live?.lifecycle ?? stored?.lastStatus;
+    if (
+      (status && isAgentBusy(status)) ||
+      live?.activeTurnId ||
+      this.hasInFlightRun(agentId) ||
+      this.foregroundMutationTails.has(agentId)
+    ) {
+      throw new Error(
+        `Cannot archive agent ${agentId}: it is running, initializing, or has an active turn.`,
+      );
+    }
+    if (hasOpenAgentTab(live?.labels ?? stored?.labels)) {
+      throw new Error(`Cannot archive agent ${agentId}: its tab is open in a client.`);
+    }
+  }
+
+  private assertNoGuardedArchive(agentId: string): void {
+    if (this.guardedAgentArchives.has(agentId)) {
+      throw new Error(`Agent is being archived: ${agentId}`);
+    }
+  }
+
+  private assertCommandSessionCurrent(agent: ActiveManagedAgent): void {
+    this.assertAcceptingAgentRuns();
+    this.assertNoGuardedArchive(agent.id);
+    if (this.agents.get(agent.id) !== agent) {
+      throw new Error(`Agent session changed before the command was dispatched: ${agent.id}`);
+    }
+  }
+
   async archiveAgentInWorkspace(
     agentId: string,
     expectedWorkspaceId: string,
@@ -3307,7 +3388,7 @@ export class AgentManager {
   private async archiveAgentUnlocked(
     agentId: string,
     requestedArchivedAt?: string,
-    options?: { retainForkContext: boolean },
+    options?: { retainForkContext?: boolean; requireInactiveTarget?: boolean },
   ): Promise<{ archivedAt: string }> {
     const agent = this.requireAgent(agentId);
     if (agent.internal) {
@@ -3321,6 +3402,10 @@ export class AgentManager {
         toStoredAgentRecord(agent, { title: agent.config.title ?? null, internal: true }),
         { archivedAt, updatedAt: archivedAt },
       );
+      if (options?.requireInactiveTarget) {
+        await this.drainSessionEvents(agentId);
+        this.assertAgentArchiveAllowed(agentId);
+      }
       await this.closeAgentRuntime(agentId);
       await this.deleteAgentState(agentId);
       this.retireInternalAgent({ record, lastMessage });
@@ -3339,7 +3424,16 @@ export class AgentManager {
       throw new Error(`Agent ${agentId} not found in storage after snapshot`);
     }
 
-    const archivedRecord = await this.markRecordArchived(stored, requestedArchivedAt);
+    if (options?.requireInactiveTarget) {
+      // The provider may report an autonomous turn while the snapshot is being written.
+      await this.drainSessionEvents(agentId);
+      this.assertAgentArchiveAllowed(agentId);
+    }
+    const archivedRecord = await this.markRecordArchived(
+      stored,
+      requestedArchivedAt,
+      options?.requireInactiveTarget,
+    );
     const { archivedAt } = archivedRecord;
     agent.updatedAt = new Date(archivedRecord.updatedAt);
     await this.closeAgentRuntime(agentId);
@@ -3419,13 +3513,16 @@ export class AgentManager {
   private async markRecordArchived(
     record: StoredAgentRecord,
     archivedAt = new Date().toISOString(),
+    clearLiveAttention = false,
   ): Promise<ArchivedStoredAgentRecord> {
     const archivedRecord = await this.persistArchivedRecord(record, {
       archivedAt: record.archivedAt ?? archivedAt,
       updatedAt: archivedAt,
     });
 
-    if (this.agents.has(record.id)) {
+    const live = this.agents.get(record.id);
+    if (live) {
+      if (clearLiveAttention) live.attention = { requiresAttention: false };
       this.notifyAgentState(record.id);
     } else if (!archivedRecord.internal) {
       this.dispatchStoredAgentState(archivedRecord);
@@ -5457,6 +5554,13 @@ export class AgentManager {
       throw new Error(`Agent not found: ${agentId}`);
     }
 
+    return this.archiveStoredRecordUnlocked(record, archivedAt);
+  }
+
+  private async archiveStoredRecordUnlocked(
+    record: StoredAgentRecord,
+    archivedAt: string,
+  ): Promise<StoredAgentRecord> {
     // Archiving is the agent's latest change, as markRecordArchived records it for a loaded agent.
     const nextRecord = await this.persistArchivedRecord(record, {
       archivedAt,
@@ -5465,10 +5569,10 @@ export class AgentManager {
 
     await this.syncNativeArchiveState(record.provider, record.persistence, "archive");
 
-    this.discardRetainedAgentState(agentId);
+    this.discardRetainedAgentState(record.id);
     if (!nextRecord.internal) this.dispatchStoredAgentState(nextRecord);
 
-    await this.fireAgentArchived(agentId);
+    await this.fireAgentArchived(record.id);
     await this.cascadeArchiveChildren(nextRecord);
 
     return nextRecord;
@@ -5715,6 +5819,7 @@ export class AgentManager {
     }
     const agent = await this.ensureInteractiveSession(agentId);
     this.assertAcceptingAgentRuns();
+    this.assertNoGuardedArchive(agentId);
     // A switch can acquire the lifecycle lane while the history session is opening.
     // Let the foreground admission path wait for that switch.
     if (this.providerSwitches.has(agentId)) return false;
@@ -5733,7 +5838,7 @@ export class AgentManager {
       const acceptedCallback = onAccepted?.();
       if (acceptedCallback) await acceptedCallback;
     }
-    this.assertAcceptingAgentRuns();
+    this.assertCommandSessionCurrent(agent);
     this.touchUpdatedAt(agent);
     if (options?.clientMessageId) {
       this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "accepted");
@@ -5878,14 +5983,7 @@ export class AgentManager {
     const envelope = handoff && (await this.prepareContextForSend(agent, handoff));
     const providerPrompt = envelope ? injectContextHandoffIntoPrompt(prompt, envelope) : prompt;
     if (!addMainControl) return providerPrompt;
-    const hierarchy = await this.readHierarchyAgents();
-    const instructions = buildHierarchyAppendSystemPrompt({
-      agent,
-      mainControlSystemPrompt: agent.mainControlSystemPrompt,
-      serverId: this.serverId,
-      readAgent: (id) => hierarchy.get(id),
-      listActiveAgents: () => hierarchy.values(),
-    });
+    const instructions = buildMainControlInstructions(agent.mainControlSystemPrompt);
     const prefix = `${MAIN_CONTROL_PROMPT_HEADER}\n${instructions}${mainControlPromptEnd(agent.id)}\n\n`;
     if (typeof providerPrompt === "string") return prefix + providerPrompt;
     const [first, ...rest] = providerPrompt;
@@ -6215,6 +6313,7 @@ export class AgentManager {
     options?: AgentRunOptions,
     promptStart?: ForegroundPromptStart,
   ): AsyncGenerator<AgentStreamEvent> {
+    this.assertNoGuardedArchive(agentId);
     if (
       this.hierarchySessionUpdates.has(agentId) ||
       this.providerSwitches.has(agentId) ||
@@ -6619,6 +6718,7 @@ export class AgentManager {
   }
 
   private async runForegroundMutation<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+    this.assertNoGuardedArchive(agentId);
     return this.runQueuedMutation(this.foregroundMutationTails, agentId, operation);
   }
 
@@ -9722,16 +9822,17 @@ export class AgentManager {
     const readAgent = (id: string) => (id === agentId ? agent : hierarchy.get(id));
     const depth = computeAgentDepth(agentId, readAgent);
     const adapter = this.adapterOf(storedConfig.provider);
-    const hierarchyPrompt = buildHierarchyAppendSystemPrompt({
-      agent,
-      // Other adapters already get these instructions on the first turn.
-      mainControlSystemPrompt: HIERARCHY_SYSTEM_PROMPT_ADAPTERS.has(adapter)
-        ? options.mainControlSystemPrompt
-        : undefined,
-      serverId: this.serverId,
-      readAgent,
-      listActiveAgents: () => hierarchy.values(),
-    });
+    // Main Control for other adapters is injected by prepareProviderTurnPrompt.
+    const hierarchyPrompt =
+      isMainControlAgentLabels(agent.labels) && !HIERARCHY_SYSTEM_PROMPT_ADAPTERS.has(adapter)
+        ? ""
+        : buildHierarchyAppendSystemPrompt({
+            agent,
+            mainControlSystemPrompt: options.mainControlSystemPrompt,
+            serverId: this.serverId,
+            readAgent,
+            listActiveAgents: () => hierarchy.values(),
+          });
     const paseoToolPolicy = resolveAgentPaseoToolPolicy(
       this.basePaseoToolPolicy(storedConfig.provider),
       agent,
@@ -9746,6 +9847,7 @@ export class AgentManager {
             ? this.mcpBaseUrl
             : null,
         mcpAuthToken: this.mcpAuthToken,
+        preapprovedTools: orchestrationPreapprovals(paseoToolPolicy),
       }),
       hierarchyPrompt,
     );
@@ -9777,7 +9879,7 @@ export class AgentManager {
     agentId: string,
     client: AgentClient,
     cwd: string,
-    paseoToolPolicy: ProviderPaseoToolsPolicy | undefined,
+    paseoToolPolicy: PaseoToolPolicy | undefined,
     env?: Record<string, string>,
     opening?: {
       reason: PluginSessionOpenRequest["reason"];
@@ -9791,6 +9893,7 @@ export class AgentManager {
   ): Promise<AgentLaunchContext> {
     // A plugin changing during this open must still make the resulting session stale.
     const generation = this.sessionOpenGeneration;
+    const purpose = opening?.purpose ?? "interactive";
     this.detachPluginTools(agentId);
     let appendSystemPrompt: string[] | undefined;
     let mcpServers: AgentSessionConfig["mcpServers"];
@@ -9802,7 +9905,7 @@ export class AgentManager {
         cwd,
         workspaceId: opening?.workspaceId ?? null,
         reason: opening?.reason ?? "resume",
-        purpose: opening?.purpose ?? "interactive",
+        purpose,
         env: { ...env },
         title: opening?.title ?? null,
         background: opening?.background === true,
@@ -9842,7 +9945,12 @@ export class AgentManager {
           callerAgentId: agentId,
           paseoToolPolicy,
         });
-        if (useNativeTools) context.paseoTools = catalog;
+        if (useNativeTools) {
+          context.paseoTools = catalog;
+          if (purpose !== "history") {
+            context.paseoToolPreapprovals = orchestrationPreapprovals(paseoToolPolicy, catalog);
+          }
+        }
       } catch (error) {
         this.detachPluginTools(agentId);
         throw error;

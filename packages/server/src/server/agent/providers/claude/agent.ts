@@ -156,6 +156,7 @@ import {
   type ResolveAgentDefaultModeInput,
   type ToolCallDetail,
 } from "../../agent-sdk-types.js";
+import { resolveRuntimeMcpToolPolicy } from "../../runtime-mcp-config.js";
 import { importSessionFromPersistence } from "../../provider-session-import.js";
 import { runProviderRefreshActivity } from "../../provider-refresh-deadline.js";
 import {
@@ -4001,7 +4002,10 @@ class ClaudeAgentSession implements AgentSession {
       ultracode: _ultracode,
       ...sdkProviderOptions
     } = this.config.providerOptions;
-    const providerOptions = applyClaudeToolPolicy(sdkProviderOptions, this.config.toolPolicy);
+    const providerOptions = applyClaudeToolPolicy(
+      sdkProviderOptions,
+      resolveRuntimeMcpToolPolicy(this.config),
+    );
     const settingsOptions = await this.buildSettingsOptions(providerOptions);
     const sdkEnv = this.harnessEnvironment;
     assertClaudeModeCanRun(permissionMode, sdkEnv);

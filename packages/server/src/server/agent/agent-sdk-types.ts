@@ -687,6 +687,8 @@ export interface AgentLaunchContext {
    * AgentSessionConfig; providers may adapt it to their native tool surface.
    */
   paseoTools?: PaseoToolCatalog;
+  /** Exact approvals on this runtime-only native catalog. */
+  paseoToolPreapprovals?: readonly string[];
 }
 
 export interface AgentCreateSessionOptions {

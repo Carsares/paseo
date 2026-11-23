@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import path from "node:path";
@@ -12,6 +12,7 @@ import {
   serializePaseoToolInputParameters,
 } from "../../tools/paseo-tool-serialization.js";
 import { PaseoToolInputError, type PaseoToolCatalog } from "../../tools/types.js";
+import type { AgentLaunchContext } from "../../agent-sdk-types.js";
 
 const INTERNAL_PREFIX = "/_internal/opencode";
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -36,6 +37,17 @@ interface OpenCodeBridgeOptions {
 interface OpenCodeSessionBinding {
   env: Record<string, string>;
   tools?: PaseoToolCatalog;
+  toolApproval?: { resource: string; tools: readonly string[] };
+}
+
+export function createOpenCodeBridgeToolApproval(
+  launch: AgentLaunchContext | undefined,
+): OpenCodeSessionBinding["toolApproval"] {
+  const catalog = launch?.paseoTools;
+  const tools = launch?.paseoToolPreapprovals?.filter((tool) => catalog?.getTool(tool));
+  // Rules use a resource unique to this binding. A same-named external tool
+  // and a later session binding cannot use a saved rule to obtain approval.
+  return tools?.length ? { tools, resource: `paseo-bridge-${randomUUID()}` } : undefined;
 }
 
 interface BindOpenCodeSessionInput extends OpenCodeSessionBinding {
@@ -102,6 +114,7 @@ export class OpenCodeBridge {
     const binding: OpenCodeSessionBinding = {
       env: { ...input.env },
       ...(input.tools ? { tools: input.tools } : {}),
+      toolApproval: input.toolApproval,
     };
     this.sessions.set(input.sessionId, binding);
     return () => {
@@ -176,17 +189,7 @@ export class OpenCodeBridge {
         new RegExp(`^${INTERNAL_PREFIX}/sessions/([^/]+)/context$`),
       );
       if (request.method === "GET" && contextMatch) {
-        const binding = this.sessions.get(decodeURIComponent(contextMatch[1]));
-        if (!binding) {
-          sendJson(response, 404, { error: "OpenCode session is not bound to a Paseo agent" });
-          return;
-        }
-        sendJson(response, 200, {
-          env: binding.env,
-          ...(url.searchParams.has("tools")
-            ? { tools: [...(binding.tools?.tools.keys() ?? [])] }
-            : {}),
-        });
+        this.sendSessionContext(decodeURIComponent(contextMatch[1]), url.searchParams, response);
         return;
       }
 
@@ -228,6 +231,31 @@ export class OpenCodeBridge {
         response.destroy(failure);
       }
     }
+  }
+
+  private sendSessionContext(
+    sessionId: string,
+    query: URLSearchParams,
+    response: ServerResponse,
+  ): void {
+    const binding = this.sessions.get(sessionId);
+    if (!binding) {
+      sendJson(response, 404, { error: "OpenCode session is not bound to a Paseo agent" });
+      return;
+    }
+    const tool = query.get("permissionForTool");
+    if (tool !== null) {
+      const hasApproval =
+        binding.tools?.getTool(tool) && binding.toolApproval?.tools.includes(tool);
+      sendJson(response, 200, {
+        resource: hasApproval ? binding.toolApproval?.resource : undefined,
+      });
+      return;
+    }
+    sendJson(response, 200, {
+      env: binding.env,
+      ...(query.has("tools") ? { tools: [...(binding.tools?.tools.keys() ?? [])] } : {}),
+    });
   }
 
   private serializeManifest(sessionId: string | null): Array<Record<string, unknown>> {

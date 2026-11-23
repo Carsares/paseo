@@ -53,13 +53,23 @@ export interface OpenCodePermissionRule {
 export function buildOpenCodePermissionRules(
   options: OpenCodeProviderOptions | undefined,
   toolPolicy: ToolPolicy | undefined,
+  bridgeApproval?: { resource: string; tools: readonly string[] },
 ): OpenCodePermissionRule[] | undefined {
-  const grants =
+  const grants: OpenCodePermissionRule[] =
     toolPolicy?.preapproved.map((grant) => ({
       permission: `${grant.server}_${grant.tool}`,
       pattern: "*",
       action: "allow" as const,
     })) ?? [];
+  if (bridgeApproval) {
+    for (const tool of bridgeApproval.tools) {
+      grants.push({
+        permission: `paseo_${tool}`,
+        pattern: bridgeApproval.resource,
+        action: "allow",
+      });
+    }
+  }
   const permission = options?.permission;
   if (typeof permission === "string") {
     return [...grants, { permission: "*", pattern: "*", action: permission }];

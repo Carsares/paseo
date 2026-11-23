@@ -29,6 +29,8 @@ import {
   type FinishSubscription,
 } from "./finish-subscriptions/index.js";
 import { createPaseoToolCatalog } from "./tools/paseo-tools.js";
+import { isPaseoToolEnabled } from "./paseo-tool-policy.js";
+import { resolveRuntimeMcpToolPolicy } from "./runtime-mcp-config.js";
 import {
   applyHierarchyPaseoToolPolicy,
   buildHierarchyAppendSystemPrompt,
@@ -56,6 +58,16 @@ const lead = child("lead", main);
 const worker = child("worker", lead);
 const sibling = child("other-lead", main);
 const root: HierarchyAgent = { id: "ordinary-root" };
+const mainControlTools = [
+  "list_profiles",
+  "create_agent",
+  "send_agent_prompt",
+  "update_agent",
+  "get_agent_status",
+  "list_agents",
+  "summarize_workspace_agents",
+  "archive_agent",
+];
 
 it("preserves options in place and sends Main Control instructions on the first turn", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "main-control-first-turn-"));
@@ -99,7 +111,9 @@ it("preserves options in place and sends Main Control instructions on the first 
     expect(promoted.record.labels).toEqual(main.labels);
     expect(promoted.record.config).toMatchObject({ modeId: "default", providerOptions });
     expect(manager.getAgent(agent.id)?.effectiveOptions).toEqual(providerOptions);
-    expect(manager.getPaseoToolPolicy(agent.id)?.disabledTools).toContain("archive_workspace");
+    expect(isPaseoToolEnabled(manager.getPaseoToolPolicy(agent.id), "archive_workspace")).toBe(
+      false,
+    );
 
     const quoted =
       "[Workspace Main Control Instructions]\nRole: Workspace Main Control Coordinator.\nDirect Level-1 children: []\n\nQuoted text";
@@ -232,22 +246,12 @@ describe("agent orchestration", () => {
   });
 
   it("merges disabled tools with provider policy and keeps Main Control's delegation tools", () => {
-    const base = { disabledTools: ["custom_tool", "create_terminal"] };
+    const base = { disabledTools: ["custom_tool", "archive_agent"] };
     const mainPolicy = applyHierarchyPaseoToolPolicy(base, main.labels, 0);
-    expect(mainPolicy?.disabledTools).toEqual([
-      "custom_tool",
-      "create_terminal",
-      "archive_workspace",
-      "create_schedule",
-      "update_schedule",
-      "resume_schedule",
-      "run_schedule_once",
-      "create_workspace",
-      "send_terminal_keys",
-      "kill_terminal",
-      "start_workspace_script",
-      "stop_workspace_script",
-    ]);
+    expect(mainPolicy?.disabledTools).toEqual(base.disabledTools);
+    expect(mainPolicy?.allowedTools).toEqual(mainControlTools);
+    expect(isPaseoToolEnabled(mainPolicy, "create_agent")).toBe(true);
+    expect(isPaseoToolEnabled(mainPolicy, "archive_agent")).toBe(false);
     expect(applyHierarchyPaseoToolPolicy(base, lead.labels, 1)).toBe(base);
     expect(applyHierarchyPaseoToolPolicy(undefined, root.labels, 0)).toBeUndefined();
     expect(applyHierarchyPaseoToolPolicy({ enabled: false }, worker.labels, 2)).toEqual({
@@ -268,7 +272,7 @@ describe("agent orchestration", () => {
     });
   });
 
-  it("supplies role instructions and a sorted snapshot of direct active children only", () => {
+  it("keeps the Main Control prompt stable and lists direct children only for leads", () => {
     const explicitLead = {
       ...lead,
       labels: { ...lead.labels, [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING },
@@ -279,11 +283,11 @@ describe("agent orchestration", () => {
     });
     const prompt = buildHierarchyAppendSystemPrompt({ agent: main, ...graph });
     expect(prompt).toContain("Workspace Main Control Coordinator");
-    expect(prompt).toContain('parentReporting: "explicit" to create exactly one Level-1 lead');
-    expect(prompt).toContain("Wait for the lead to call report_to_parent");
-    expect(prompt).toContain(
-      'Direct Level-1 children: [{"id":"lead","title":"lead","status":"running"},{"id":"other-lead","title":"other-lead","status":"running"}]',
-    );
+    expect(prompt).toContain("Call list_profiles to select the preset");
+    expect(prompt).toContain('parentReporting: "explicit" and notifyOnFinish: false');
+    expect(prompt).toContain("End your turn to wait for the lead to call report_to_parent");
+    expect(prompt).not.toMatch(/git (status|diff)|Direct Level-1 children/);
+    expect(buildHierarchyAppendSystemPrompt({ agent: main, ...hierarchy(main) })).toBe(prompt);
     const leadPrompt = buildHierarchyAppendSystemPrompt({ agent: explicitLead, ...graph });
     expect(leadPrompt).toContain(
       "Level-1 Module Lead (Flexible Mode) under Main Control Agent main",
@@ -448,6 +452,35 @@ async function withAgents(
   }
 }
 
+it("preapproves just Main Control's enabled tools on the injected Paseo server", async () => {
+  await withAgents(async ({ manager, storage, cwd, launchedConfigs }) => {
+    manager.setMcpBaseUrl("http://localhost:1234/mcp/agents");
+    const config = { provider: "codex", cwd };
+    const mainAgent = await manager.createAgent(config, undefined, {
+      workspaceId: "workspace",
+      labels: main.labels,
+    });
+    const launches = launchedConfigs.get("codex")!;
+    const expected = {
+      preapproved: mainControlTools.map((tool) => ({ kind: "mcp", server: "paseo", tool })),
+    };
+    expect(resolveRuntimeMcpToolPolicy(launches.at(-1)!)).toEqual(expected);
+    expect((await storage.get(mainAgent.id))?.config?.toolPolicy).toBeUndefined();
+
+    await manager.reloadAgentSession(mainAgent.id);
+    expect(resolveRuntimeMcpToolPolicy(launches.at(-1)!)).toEqual(expected);
+    await manager.setAgentMainControl(mainAgent.id, false);
+    expect(resolveRuntimeMcpToolPolicy(launches.at(-1)!)).toBeUndefined();
+
+    expect(
+      resolveRuntimeMcpToolPolicy({
+        ...config,
+        mcpServers: { paseo: { type: "http", url: "https://example.invalid/tools" } },
+      }),
+    ).toBeUndefined();
+  });
+});
+
 it("switches live Main Control without overriding either agent's mode or Codex options", async () => {
   await withAgents(async ({ manager, storage, cwd, launchedConfigs }) => {
     const options = { workspaceId: "workspace" };
@@ -482,7 +515,9 @@ it("switches live Main Control without overriding either agent's mode or Codex o
         approval_policy: "never",
       }),
     ).resolves.toBeUndefined();
-    expect(manager.getPaseoToolPolicy(first.id)?.disabledTools).toContain("send_terminal_keys");
+    expect(isPaseoToolEnabled(manager.getPaseoToolPolicy(first.id), "send_terminal_keys")).toBe(
+      false,
+    );
     await manager.setAgentMainControl(second.id, true);
     expect(manager.getAgent(first.id)?.currentModeId).toBe("workspace-write");
     expect(manager.getAgent(first.id)?.config.providerOptions).toEqual({
@@ -1156,7 +1191,9 @@ it("denies workspace archive and worktree creation for Main Control before looki
       });
     const openMainCatalog = catalog(mainAgent.id);
     await manager.setAgentMainControl(mainAgent.id, true);
-    expect(manager.getPaseoToolPolicy(mainAgent.id)?.disabledTools).toContain("archive_workspace");
+    expect(isPaseoToolEnabled(manager.getPaseoToolPolicy(mainAgent.id), "archive_workspace")).toBe(
+      false,
+    );
     const request = { workspaceId: "missing" };
     await expect(openMainCatalog.executeTool("archive_workspace", request)).rejects.toThrow(
       "Paseo tool is disabled for your hierarchy role: archive_workspace",
@@ -1392,15 +1429,16 @@ it("preserves Claude options, surfaces shell requests, and auto-denies file writ
     const mainLaunch = launchedConfigs.get("claude")?.at(-1);
     expect(mainLaunch?.providerOptions?.disallowedTools).toEqual(["WebFetch", "Bash"]);
     expect(mainLaunch?.daemonAppendSystemPrompt).toContain("Workspace Main Control Coordinator");
-    expect(manager.getPaseoToolPolicy(claudeAgent.id)?.disabledTools).toEqual(
-      expect.arrayContaining([
-        "create_terminal",
-        "send_terminal_keys",
-        "kill_terminal",
-        "start_workspace_script",
-        "stop_workspace_script",
-      ]),
-    );
+    const mainPolicy = manager.getPaseoToolPolicy(claudeAgent.id);
+    for (const tool of [
+      "create_terminal",
+      "send_terminal_keys",
+      "kill_terminal",
+      "start_workspace_script",
+      "stop_workspace_script",
+    ]) {
+      expect(isPaseoToolEnabled(mainPolicy, tool)).toBe(false);
+    }
     await expect(
       manager.setAgentOptions(claudeAgent.id, { disallowedTools: ["WebFetch"] }),
     ).resolves.toBeUndefined();
@@ -1541,6 +1579,7 @@ it("enforces single-hop MCP orchestration, self mode changes, and refreshes poli
     });
     const filteredMain = makeCatalog(mainAgent.id, true);
     const filteredWorker = makeCatalog(workerA.id, true);
+    expect([...filteredMain.tools.keys()].sort()).toEqual([...mainControlTools].sort());
     const scheduleTools = [
       "create_schedule",
       "update_schedule",
@@ -1562,7 +1601,7 @@ it("enforces single-hop MCP orchestration, self mode changes, and refreshes poli
       mainCatalog.executeTool("update_agent", { agentId: workerA.id, name: "Nope" }),
     ).rejects.toThrow("Coordinate through your direct child");
     await expect(mainCatalog.executeTool("cancel_agent", { agentId: workerA.id })).rejects.toThrow(
-      "Coordinate through your direct child",
+      "Paseo tool is disabled for your hierarchy role: cancel_agent",
     );
     await expect(
       mainCatalog.executeTool("respond_to_permission", {
@@ -1570,7 +1609,7 @@ it("enforces single-hop MCP orchestration, self mode changes, and refreshes poli
         requestId: "req-1",
         response: { behavior: "deny" },
       }),
-    ).rejects.toThrow("Coordinate through your direct child");
+    ).rejects.toThrow("Paseo tool is disabled for your hierarchy role: respond_to_permission");
     await expect(
       makeCatalog(ordinaryRoot.id).executeTool("respond_to_permission", {
         agentId: workerA.id,
@@ -1580,7 +1619,7 @@ it("enforces single-hop MCP orchestration, self mode changes, and refreshes poli
     ).rejects.toThrow("You can only manage your direct subagents.");
     await expect(
       mainCatalog.executeTool("set_agent_mode", { agentId: mainAgent.id, modeId: "default" }),
-    ).resolves.toMatchObject({ structuredContent: { success: true, newMode: "default" } });
+    ).rejects.toThrow("Paseo tool is disabled for your hierarchy role: set_agent_mode");
 
     const leadCatalog = makeCatalog(leadA.id);
     await expect(
@@ -1845,7 +1884,8 @@ it("delivers explicit reports to direct parents and rejects a queued report afte
       ).rejects.toThrow("You can only manage your direct subagents.");
       expect(dispatch).toHaveBeenCalledTimes(2);
       expect(onError).toHaveBeenCalled();
-      for (const caller of [undefined, coordinator.id, workerAgent.id]) {
+      expect(makeCatalog(coordinator.id).getTool("report_to_parent")).toBeUndefined();
+      for (const caller of [undefined, workerAgent.id]) {
         await expect(
           makeCatalog(caller).executeTool("report_to_parent", { summary: "No parent" }),
         ).rejects.toThrow(/Only subagents/);

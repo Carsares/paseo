@@ -128,7 +128,6 @@ import {
   type PaseoToolExecutionContext,
   type PaseoToolResult,
 } from "./types.js";
-import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import { isPaseoToolEnabled } from "../paseo-tool-policy.js";
 import {
   applyHierarchyPaseoToolPolicy,
@@ -141,12 +140,14 @@ import {
   validateCanSpawnChild,
   validateSingleHopOrchestration,
   type HierarchyAgent,
+  type PaseoToolPolicy,
 } from "../hierarchy-policy.js";
 import {
   EXPLICIT_PARENT_REPORTING,
   getParentAddressFromLabels,
   isExplicitParentReportingLabels,
   isMainControlAgentLabels,
+  isOpenAgentTabLabel,
   PARENT_REPORTING_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 
@@ -199,7 +200,7 @@ export interface PaseoToolHostDependencies {
   ) => Promise<string>;
   browserToolsEnabled?: boolean;
   browserToolsBroker?: BrowserToolsBroker | null;
-  paseoToolPolicy?: ProviderPaseoToolsPolicy;
+  paseoToolPolicy?: PaseoToolPolicy;
   paseoHome?: string;
   worktreesRoot?: string;
   /**
@@ -862,11 +863,17 @@ function createToolCatalog(
 
   async function checkHierarchy(
     name: string,
-    args: { agentId?: string; serverId?: string },
+    args: { agentId?: string; serverId?: string; labels?: Record<string, string> },
     context: PaseoToolExecutionContext,
   ): Promise<OrchestrationCheck> {
     const unrestricted = { requireParentOwnership: false };
     if (!callerAgentId) return unrestricted;
+    if (
+      (name === "create_agent" || name === "update_agent") &&
+      Object.keys(args.labels ?? {}).some(isOpenAgentTabLabel)
+    ) {
+      throw new PaseoToolInputError("Only clients can set open-tab labels.");
+    }
     const path = await readAgentHierarchyPath(callerAgentId, readHierarchyAgent);
     const caller = path.get(callerAgentId);
     const read = (id: string) => path.get(id);
@@ -1000,6 +1007,10 @@ function createToolCatalog(
       reservation.finish(rejected ? "rejected" : "unknown");
       throw error;
     }
+  }
+
+  function describeForScope(agent: string, topLevel: string): string {
+    return scope === "agent" ? agent : topLevel;
   }
 
   const registerTool = (
@@ -2696,8 +2707,10 @@ function createToolCatalog(
     "archive_agent",
     {
       title: "Archive agent",
-      description:
+      description: describeForScope(
+        "Archive an inactive agent (soft-delete). Running or initializing agents and active turns are protected. Open-tab protection uses the subagent tab markers reported to the server. Clients do not report open root-agent tabs.",
         "Archive an agent (soft-delete). The agent is interrupted if running and removed from the active list.",
+      ),
       inputSchema: {
         agentId: z.string(),
       },
@@ -2705,15 +2718,14 @@ function createToolCatalog(
         success: z.boolean(),
       },
     },
-    async ({ agentId }) => {
-      await archiveAgentCommand(
-        {
-          agentManager,
-          agentStorage,
-          logger: childLogger,
-        },
-        agentId,
-      );
+    async ({ agentId }, context) => {
+      if (scope === "agent") {
+        await agentManager.archiveAgentFromAgentTool(agentId, async () => {
+          await checkHierarchy("archive_agent", { agentId }, context);
+        });
+      } else {
+        await archiveAgentCommand({ agentManager, agentStorage, logger: childLogger }, agentId);
+      }
       return {
         content: [],
         structuredContent: ensureValidJson({ success: true }),

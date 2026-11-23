@@ -7089,9 +7089,9 @@ test("Main Control prompt snapshots survive reloads and disk reopen without affe
   });
 
   const live = await createMain("first");
-  expect(client.createdConfigs.at(-1)?.daemonAppendSystemPrompt).toContain(
-    "summarizing workspace state.\nFirst policy\nDirect Level-1 children: []",
-  );
+  const firstPrompt = client.createdConfigs.at(-1)?.daemonAppendSystemPrompt;
+  expect(firstPrompt).toMatch(/\nFirst policy$/);
+  expect(firstPrompt).not.toContain("Direct Level-1 children");
   const silent = await createSilent("silent");
   const legacy = await createSilent("legacy");
   await storage.upsert({ ...legacy, mainControlSystemPrompt: undefined });
@@ -7127,7 +7127,7 @@ test("Main Control prompt snapshots survive reloads and disk reopen without affe
   manager.setMainControlAppendSystemPrompt("");
   const blank = await createMain("blank");
   const builtInPrompt = client.createdConfigs.at(-1)?.daemonAppendSystemPrompt;
-  expect(builtInPrompt?.split("\n")).toHaveLength(6);
+  expect(builtInPrompt).toContain("Workspace Main Control Coordinator");
   await closeAll(manager);
 
   const reloadedStorage = new AgentStorage(storagePath, logger);
@@ -7185,9 +7185,7 @@ test("a live promotion delivers its saved Main Control prompt on the next provid
   await manager.setAgentMainControl(agent.id, true);
   manager.setMainControlAppendSystemPrompt("After promotion");
   await manager.runAgent(agent.id, "First turn");
-  expect(received[0]).toEqual(
-    expect.stringContaining("\nAt promotion\nDirect Level-1 children: []"),
-  );
+  expect(received[0]).toEqual(expect.stringContaining("\nAt promotion\n[/Workspace"));
   await manager.runAgent(agent.id, "Second turn");
   expect(received[1]).toBe("Second turn");
 
@@ -7197,9 +7195,7 @@ test("a live promotion delivers its saved Main Control prompt on the next provid
   expect(received[2]).toBe("After demotion");
   await manager.setAgentMainControl(agent.id, true);
   await manager.runAgent(agent.id, "After re-promotion");
-  expect(received[3]).toEqual(
-    expect.stringContaining("\nAfter promotion\nDirect Level-1 children: []"),
-  );
+  expect(received[3]).toEqual(expect.stringContaining("\nAfter promotion\n[/Workspace"));
 });
 
 test("Main Control sends the saved prompt once for providers using the first turn", async () => {
@@ -7234,11 +7230,8 @@ test("Main Control sends the saved prompt once for providers using the first tur
   await manager.runAgent(agent.id, "First turn");
   await manager.runAgent(agent.id, "Second turn");
 
-  expect(client.createdConfigs[0]?.daemonAppendSystemPrompt).not.toContain("Saved policy");
-  expect(received).toEqual([
-    expect.stringContaining("\nSaved policy\nDirect Level-1 children: []"),
-    "Second turn",
-  ]);
+  expect(client.createdConfigs[0]?.daemonAppendSystemPrompt).toBeUndefined();
+  expect(received).toEqual([expect.stringContaining("\nSaved policy\n[/Workspace"), "Second turn"]);
 });
 
 test("restoring an archived Main Control agent as a child clears its saved prompt", async () => {

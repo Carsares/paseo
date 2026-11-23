@@ -148,8 +148,10 @@ import {
   type CodexProviderOptions,
 } from "./codex/options.js";
 import {
+  hasRuntimePaseoMcpToolApprovalList,
   isRuntimePaseoMcpServer,
   PASEO_MCP_SERVER_NAME,
+  resolveRuntimeMcpToolPolicy,
   stripInternalPaseoMcpServer,
 } from "../runtime-mcp-config.js";
 
@@ -6395,13 +6397,15 @@ export class CodexAppServerAgentSession implements AgentSession {
       for (const [name, serverConfig] of Object.entries(this.config.mcpServers)) {
         const codexServerConfig = toCodexMcpConfig(serverConfig);
         mcpServers[name] =
-          name === PASEO_MCP_SERVER_NAME && isRuntimePaseoMcpServer(serverConfig)
+          name === PASEO_MCP_SERVER_NAME &&
+          isRuntimePaseoMcpServer(serverConfig) &&
+          !hasRuntimePaseoMcpToolApprovalList(serverConfig)
             ? { ...codexServerConfig, default_tools_approval_mode: "approve" }
             : codexServerConfig;
       }
       innerConfig.mcp_servers = mcpServers;
     }
-    const configured = applyCodexToolPolicy(innerConfig, this.config.toolPolicy);
+    const configured = applyCodexToolPolicy(innerConfig, resolveRuntimeMcpToolPolicy(this.config));
     return Object.keys(configured).length > 0 ? configured : null;
   }
 

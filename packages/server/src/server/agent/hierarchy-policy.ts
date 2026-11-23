@@ -223,19 +223,20 @@ export function requiresSingleHopOrchestration(
   );
 }
 
-const MAIN_CONTROL_DISABLED_TOOLS = [
-  "archive_workspace",
-  "create_schedule",
-  "update_schedule",
-  "resume_schedule",
-  "run_schedule_once",
-  "create_workspace",
-  "create_terminal",
-  "send_terminal_keys",
-  "kill_terminal",
-  "start_workspace_script",
-  "stop_workspace_script",
+const MAIN_CONTROL_TOOLS: readonly string[] = [
+  "list_profiles",
+  "create_agent",
+  "send_agent_prompt",
+  "update_agent",
+  "get_agent_status",
+  "list_agents",
+  "summarize_workspace_agents",
+  "archive_agent",
 ];
+
+export interface PaseoToolPolicy extends ProviderPaseoToolsPolicy {
+  allowedTools?: readonly string[];
+}
 
 // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
 export function getLegacyMainControlPriorMode(
@@ -273,15 +274,20 @@ export function applyHierarchyPaseoToolPolicy(
   policy: ProviderPaseoToolsPolicy | undefined,
   labels: HierarchyAgent["labels"],
   depth: number,
-): ProviderPaseoToolsPolicy | undefined {
-  const disabledTools = [
-    ...(isMainControlAgentLabels(labels) ? MAIN_CONTROL_DISABLED_TOOLS : []),
-    ...(depth >= MAX_SUBAGENT_DEPTH ? LEVEL_TWO_DISABLED_TOOLS : []),
-  ];
-  if (disabledTools.length === 0) return policy;
+): PaseoToolPolicy | undefined {
+  const mainControl = isMainControlAgentLabels(labels);
+  const levelTwo = depth >= MAX_SUBAGENT_DEPTH;
+  if (!mainControl && !levelTwo) return policy;
   return {
     ...policy,
-    disabledTools: [...new Set([...(policy?.disabledTools ?? []), ...disabledTools])],
+    ...(mainControl ? { allowedTools: MAIN_CONTROL_TOOLS } : {}),
+    ...(levelTwo
+      ? {
+          disabledTools: [
+            ...new Set([...(policy?.disabledTools ?? []), ...LEVEL_TWO_DISABLED_TOOLS]),
+          ],
+        }
+      : {}),
   };
 }
 
@@ -316,6 +322,9 @@ export function buildHierarchyAppendSystemPrompt({
   listActiveAgents: ListActiveAgents;
   serverId?: string;
 }): string {
+  if (isMainControlAgentLabels(agent.labels)) {
+    return buildMainControlInstructions(mainControlSystemPrompt);
+  }
   const parentAddress = getParentAddressFromLabels(agent.labels, serverId);
   const parent = parentAddress?.serverId === serverId ? readAgent(parentAddress.agentId) : null;
   const canReport =
@@ -323,39 +332,23 @@ export function buildHierarchyAppendSystemPrompt({
     (parentAddress.serverId !== serverId ||
       (parent && !parent.archivedAt && parent.id !== agent.id));
   let contract: string[] = [];
-  let childRole: string | undefined;
-  if (isMainControlAgentLabels(agent.labels)) {
-    contract = [
-      "Role: Workspace Main Control Coordinator. Work strictly read-only. Do not modify files or run builds that alter the workspace.",
-      'For each task you delegate, use create_agent with parentReporting: "explicit" to create exactly one Level-1 lead. Keep workspace edits in the delegated sessions.',
-      "Coordinate through that lead with send_agent_prompt and update_agent. Wait for the lead to call report_to_parent with the final outcome or a blocking question that needs your decision.",
-      "Summarize the lead's report for the user.",
-      "Use summarize_workspace_agents to review active and closed workspace sessions, tasks, and touched files. Cross-check uncommitted changes with read-only git status and git diff when summarizing workspace state.",
-    ];
-    if (mainControlSystemPrompt) contract.push(mainControlSystemPrompt);
-    childRole = "Level-1";
-  } else if (
+  const isLead =
     parent &&
     !parent.archivedAt &&
     isMainControlAgentLabels(parent.labels) &&
-    computeAgentDepth(agent.id, readAgent, serverId) === 1
-  ) {
+    computeAgentDepth(agent.id, readAgent, serverId) === 1;
+  if (isLead) {
     contract = [
       `Role: Level-1 Module Lead (Flexible Mode) under Main Control Agent ${parent.id}.`,
       "Refine the task's requirements, edge cases, and file boundaries. Complete and verify small changes yourself. Delegate substantive implementation and independent verification to Level-2 Sub-Agents with create_agent.",
     ];
-    childRole = "Level-2";
   }
-  if (
-    !isMainControlAgentLabels(agent.labels) &&
-    canReport &&
-    isExplicitParentReportingLabels(agent.labels)
-  ) {
+  if (canReport && isExplicitParentReportingLabels(agent.labels)) {
     contract.push(
       "Call report_to_parent once all verification is complete, with a concise outcome and changed files. If you need a decision from your parent to proceed, use report_to_parent with status blocked and the question.",
     );
   }
-  if (!childRole) return contract.join("\n");
+  if (!isLead) return contract.join("\n");
   const children = [...listActiveAgents()]
     .filter((child) => {
       const address = getParentAddressFromLabels(child.labels, serverId);
@@ -367,5 +360,18 @@ export function buildHierarchyAppendSystemPrompt({
       title: title ?? null,
       status: lifecycle ?? "closed",
     }));
-  return [...contract, `Direct ${childRole} children: ${JSON.stringify(children)}`].join("\n");
+  return [...contract, `Direct Level-2 children: ${JSON.stringify(children)}`].join("\n");
+}
+
+export function buildMainControlInstructions(mainControlSystemPrompt?: string): string {
+  return [
+    "Role: Workspace Main Control Coordinator. Coordinate work and stay read-only regardless of provider mode. Delegate source, log, and data inspection, shell commands, builds, tests, and all writes.",
+    `Use only these Paseo orchestration tools: ${MAIN_CONTROL_TOOLS.join(", ")}. Call list_profiles to select the preset whose description fits the task and its authorized scope.`,
+    'For each task you delegate, use create_agent with parentReporting: "explicit" and notifyOnFinish: false to create exactly one direct Level-1 lead.',
+    "Coordinate through that lead with send_agent_prompt and update_agent. Keep notifyOnFinish: false for follow-ups. End your turn to wait for the lead to call report_to_parent with the outcome or a blocking question. Do not poll or use a blocking wait.",
+    "Summarize the lead's report for the user.",
+    mainControlSystemPrompt,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }

@@ -3036,6 +3036,8 @@ export const ko: TranslationResources = {
           title: "주 제어 시스템 프롬프트",
           hint: "세션이 주 제어 역할을 맡을 때 적용됩니다. 기존 주 제어 세션과 하위 에이전트에는 영향을 주지 않습니다.",
           sheetTitle: "주 제어 시스템 프롬프트 편집",
+          placeholder:
+            "기본 원칙: 사용자와 목표를 확인하세요.\n실행 원칙: 직속 담당자에게 작업을 맡기세요.\n출력 원칙: 결과와 위험을 간략히 정리하세요.",
         },
         systemPrompt: {
           loadFailed: "호스트 설정을 불러올 수 없습니다.",

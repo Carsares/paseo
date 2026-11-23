@@ -62,6 +62,7 @@ import {
   type ToolCallDetail,
   type ToolCallTimelineItem,
 } from "../agent-sdk-types.js";
+import { resolveRuntimeMcpToolPolicy } from "../runtime-mcp-config.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
 import {
   raceProviderRefreshAbort,
@@ -87,7 +88,7 @@ import {
   type OpenCodeServerAcquisition,
   type OpenCodeServerManagerLike,
 } from "./opencode/server-manager.js";
-import type { OpenCodeBridge } from "./opencode/bridge.js";
+import { createOpenCodeBridgeToolApproval, type OpenCodeBridge } from "./opencode/bridge.js";
 import {
   OpenCodeEventConsumer,
   type OpenCodeEventStreamDiagnostics,
@@ -1463,9 +1464,11 @@ export class OpenCodeAgentClient implements AgentClient {
 
     // OpenCode stores permission rules on the session, so they are set here and on resume
     // rather than sent with each prompt, which drops them.
+    const bridgeApproval = this.bridge && createOpenCodeBridgeToolApproval(launchContext);
     const permission = buildOpenCodePermissionRules(
       openCodeConfig.providerOptions,
-      openCodeConfig.toolPolicy,
+      resolveRuntimeMcpToolPolicy(openCodeConfig),
+      bridgeApproval,
     );
 
     try {
@@ -1493,7 +1496,7 @@ export class OpenCodeAgentClient implements AgentClient {
       }
 
       await this.populateModelContextWindowCache(client, openCodeConfig.cwd);
-      const unbindBridge = this.bindBridgeSession(session.id, launchContext);
+      const unbindBridge = this.bindBridgeSession(session.id, launchContext, bridgeApproval);
 
       return new OpenCodeAgentSession(
         openCodeConfig,
@@ -1548,9 +1551,15 @@ export class OpenCodeAgentClient implements AgentClient {
     const { client } = connection;
 
     try {
-      await this.applySessionPermissionRules(client, openCodeConfig, handle.sessionId);
+      const bridgeApproval = this.bridge && createOpenCodeBridgeToolApproval(launchContext);
+      await this.applySessionPermissionRules(
+        client,
+        openCodeConfig,
+        handle.sessionId,
+        bridgeApproval,
+      );
       await this.populateModelContextWindowCache(client, openCodeConfig.cwd);
-      const unbindBridge = this.bindBridgeSession(handle.sessionId, launchContext);
+      const unbindBridge = this.bindBridgeSession(handle.sessionId, launchContext, bridgeApproval);
 
       return new OpenCodeAgentSession(
         openCodeConfig,
@@ -1579,8 +1588,13 @@ export class OpenCodeAgentClient implements AgentClient {
     client: OpencodeClient,
     config: OpenCodeAgentConfig,
     sessionId: string,
+    bridgeApproval: ReturnType<typeof createOpenCodeBridgeToolApproval>,
   ): Promise<void> {
-    const permission = buildOpenCodePermissionRules(config.providerOptions, config.toolPolicy);
+    const permission = buildOpenCodePermissionRules(
+      config.providerOptions,
+      resolveRuntimeMcpToolPolicy(config),
+      bridgeApproval,
+    );
     if (!permission) return;
     const response = readOpenCodeRecord(
       await client.session.update({ sessionID: sessionId, directory: config.cwd, permission }),
@@ -1628,12 +1642,14 @@ export class OpenCodeAgentClient implements AgentClient {
   private bindBridgeSession(
     sessionId: string,
     launchContext?: AgentLaunchContext,
+    bridgeApproval?: ReturnType<typeof createOpenCodeBridgeToolApproval>,
   ): (() => void) | undefined {
     if (!this.bridge || !launchContext) return undefined;
     return this.bridge.bindSession({
       sessionId,
       env: launchContext.env ?? {},
       tools: launchContext.paseoTools,
+      toolApproval: bridgeApproval,
     });
   }
 

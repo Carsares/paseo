@@ -1,5 +1,5 @@
 import type { z } from "zod";
-import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
+import type { PaseoToolPolicy } from "../hierarchy-policy.js";
 
 export class PaseoToolInputError extends Error {
   readonly status = 400;
@@ -49,7 +49,7 @@ export interface PaseoToolCatalog {
 
 export interface PaseoToolRuntimeContext {
   callerAgentId?: string;
-  paseoToolPolicy?: ProviderPaseoToolsPolicy;
+  paseoToolPolicy?: PaseoToolPolicy;
   enableVoiceTools?: boolean;
   voiceOnly?: boolean;
 }

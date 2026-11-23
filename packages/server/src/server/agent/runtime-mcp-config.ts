@@ -1,11 +1,28 @@
+import type { ToolPolicy } from "@getpaseo/protocol/agent-types";
 import type { AgentSessionConfig, McpServerConfig } from "./agent-sdk-types.js";
 
 export const PASEO_MCP_SERVER_NAME = "paseo";
 const PASEO_MCP_PATHNAME = "/mcp/agents";
-const runtimePaseoMcpServers = new WeakSet<McpServerConfig>();
+const runtimePaseoMcpServers = new WeakMap<McpServerConfig, readonly string[] | undefined>();
 
 export function isRuntimePaseoMcpServer(config: McpServerConfig): boolean {
   return runtimePaseoMcpServers.has(config);
+}
+
+export function resolveRuntimeMcpToolPolicy(config: AgentSessionConfig): ToolPolicy | undefined {
+  const server = config.mcpServers?.[PASEO_MCP_SERVER_NAME];
+  const tools = server && runtimePaseoMcpServers.get(server);
+  if (!tools?.length) return config.toolPolicy;
+  return {
+    preapproved: [
+      ...(config.toolPolicy?.preapproved ?? []),
+      ...tools.map((tool) => ({ kind: "mcp" as const, server: PASEO_MCP_SERVER_NAME, tool })),
+    ],
+  };
+}
+
+export function hasRuntimePaseoMcpToolApprovalList(config: McpServerConfig): boolean {
+  return runtimePaseoMcpServers.get(config) !== undefined;
 }
 
 export function stripInternalPaseoMcpServer(config: AgentSessionConfig): AgentSessionConfig {
@@ -44,6 +61,7 @@ export function withRuntimePaseoMcpServer(params: {
    * this header the agent's MCP requests are rejected when a password is set.
    */
   mcpAuthToken: string | null;
+  preapprovedTools?: readonly string[];
 }): AgentSessionConfig {
   const storedConfig = stripInternalPaseoMcpServer(params.config);
   if (!params.mcpBaseUrl || storedConfig.mcpServers?.[PASEO_MCP_SERVER_NAME]) {
@@ -57,7 +75,7 @@ export function withRuntimePaseoMcpServer(params: {
     url: `${params.mcpBaseUrl}?callerAgentId=${params.agentId}`,
     ...(params.mcpAuthToken ? { headers: { Authorization: `Bearer ${params.mcpAuthToken}` } } : {}),
   };
-  runtimePaseoMcpServers.add(runtimeServer);
+  runtimePaseoMcpServers.set(runtimeServer, params.preapprovedTools);
   return {
     ...storedConfig,
     mcpServers: {

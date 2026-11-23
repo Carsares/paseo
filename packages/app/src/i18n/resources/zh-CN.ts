@@ -2990,6 +2990,8 @@ export const zhCN: TranslationResources = {
           title: "主控专属系统提示词",
           hint: "仅在会话成为主控时生效。已有主控会话和子会话不受影响。",
           sheetTitle: "编辑主控专属系统提示词",
+          placeholder:
+            "总约束：与用户确认目标。\n执行约束：把任务交给直属负责人。\n输出约束：简述结果和风险。",
         },
         systemPrompt: {
           loadFailed: "无法加载宿主设置。",

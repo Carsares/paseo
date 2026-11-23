@@ -1881,36 +1881,42 @@ describe("Codex app-server provider", () => {
     }
   });
 
-  test("lets an explicit Paseo tool policy override the default in the Codex resume config", async () => {
-    const appServer = createFakeCodexAppServer();
-    const config = withRuntimePaseoMcpServer({
-      config: createConfig({
-        toolPolicy: {
-          preapproved: [{ kind: "mcp", server: "paseo", tool: "finish_execution" }],
-        },
-      }),
-      agentId: "agent-1",
-      mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
-      mcpAuthToken: null,
-    });
-    const session = await createProviderWithFakeAppServer(appServer).resumeSession(
-      { sessionId: "saved-thread" },
-      config,
-    );
-
-    try {
-      const resume = appServer.requests().find((request) => request.method === "thread/resume");
-      expect(resume?.params).toHaveProperty("config.mcp_servers.paseo", {
-        url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=agent-1",
-        default_tools_approval_mode: "prompt",
-        enabled_tools: ["finish_execution"],
-        tools: { finish_execution: { approval_mode: "approve" } },
+  test.each([false, true])(
+    "uses exact Paseo grants in the Codex resume config (runtime grants: %s)",
+    async (runtime) => {
+      const appServer = createFakeCodexAppServer();
+      const config = withRuntimePaseoMcpServer({
+        config: createConfig({
+          toolPolicy: runtime
+            ? undefined
+            : {
+                preapproved: [{ kind: "mcp", server: "paseo", tool: "finish_execution" }],
+              },
+        }),
+        agentId: "agent-1",
+        mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+        mcpAuthToken: null,
+        preapprovedTools: runtime ? ["finish_execution"] : undefined,
       });
-      appServer.assertNoErrors();
-    } finally {
-      await session.close();
-    }
-  });
+      const session = await createProviderWithFakeAppServer(appServer).resumeSession(
+        { sessionId: "saved-thread" },
+        config,
+      );
+
+      try {
+        const resume = appServer.requests().find((request) => request.method === "thread/resume");
+        expect(resume?.params).toHaveProperty("config.mcp_servers.paseo", {
+          url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=agent-1",
+          default_tools_approval_mode: "prompt",
+          enabled_tools: ["finish_execution"],
+          tools: { finish_execution: { approval_mode: "approve" } },
+        });
+        appServer.assertNoErrors();
+      } finally {
+        await session.close();
+      }
+    },
+  );
 
   test("does not create a Paseo MCP config when no internal server is injected", async () => {
     const appServer = createFakeCodexAppServer();

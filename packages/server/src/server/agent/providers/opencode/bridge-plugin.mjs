@@ -36,23 +36,24 @@ export default async function paseoPlugin(input, options) {
       description: definition.description,
       args: jsonSchemaObjectToZodShape(definition.inputSchema),
       execute: async (args, context) => {
+        const sessionPath = `${INTERNAL_PREFIX}/sessions/${encodeURIComponent(context.sessionID)}`;
+        const permission = await request(
+          `${sessionPath}/context?permissionForTool=${encodeURIComponent(definition.name)}`,
+        );
         // OpenCode leaves permission checks to plugin tools, so ask it the way it asks for MCP tools.
         await context.ask({
           permission: `paseo_${definition.name}`,
-          patterns: ["*"],
+          patterns: [permission.resource ?? "*"],
           always: ["*"],
           metadata: {},
         });
         let result;
         try {
-          result = await request(
-            `${INTERNAL_PREFIX}/sessions/${encodeURIComponent(context.sessionID)}/tools/${encodeURIComponent(definition.name)}`,
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(args),
-            },
-          );
+          result = await request(`${sessionPath}/tools/${encodeURIComponent(definition.name)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(args),
+          });
         } catch (error) {
           logPluginError("tool", { sessionID: context.sessionID, tool: definition.name }, error);
           throw error;

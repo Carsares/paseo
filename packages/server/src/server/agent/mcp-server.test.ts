@@ -6803,7 +6803,7 @@ describe("agent snapshot MCP serialization", () => {
     } as ManagedAgent;
     spies.agentManager.getAgent
       .mockReturnValueOnce(null)
-      .mockReturnValue(snapshot)
+      .mockReturnValueOnce(null)
       .mockReturnValue(snapshot);
     spies.agentStorage.get.mockResolvedValue(record);
     spies.agentManager.resumeAgentFromPersistence.mockResolvedValue(snapshot);
@@ -6834,7 +6834,7 @@ describe("agent snapshot MCP serialization", () => {
     expect(spies.agentManager.resumeAgentFromPersistence).toHaveBeenCalled();
     expect(spies.agentManager.hydrateTimelineFromProvider).toHaveBeenCalledWith(
       "archived-activity-agent",
-      { broadcast: expect.any(Function) },
+      expect.objectContaining({ broadcast: expect.any(Function) }),
     );
   });
 
