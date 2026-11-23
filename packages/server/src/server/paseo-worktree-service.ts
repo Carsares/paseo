@@ -110,6 +110,7 @@ async function createPaseoWorktreeWithPriority(
         targetCwd: workspaceCwd,
       });
     }
+    const explicitTitle = input.title?.trim();
     const workspace = await deps.workspaceProvisioning.createWorkspaceForWorktree({
       sourceCwd: workspaceCwdPlan.inputCwd,
       projectId: input.projectId,
@@ -120,7 +121,8 @@ async function createPaseoWorktreeWithPriority(
       branch: createdWorktree.worktree.branchName || null,
       baseBranch: createdWorktree.worktree.comparisonBaseRef,
       worktreeManagerPluginId: createdWorktree.worktree.worktreeManagerPluginId ?? null,
-      title: input.title?.trim() || resolveFirstAgentPromptTitle(input.firstAgentContext),
+      title: explicitTitle || resolveFirstAgentPromptTitle(input.firstAgentContext),
+      titleSource: explicitTitle ? "user" : undefined,
       metadata: input.metadata,
       expectsInitialAgent: Boolean(input.firstAgentContext),
       background: input.background,

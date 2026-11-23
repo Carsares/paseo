@@ -133,7 +133,7 @@ export class WorkspaceAutoName {
       });
     }
     const generatedTitle = generated?.title ?? null;
-    if (!generatedTitle) {
+    if (!generatedTitle && !result.renamed) {
       return;
     }
 
@@ -178,11 +178,15 @@ export class WorkspaceAutoName {
 
   private async applyGeneratedWorkspaceTitle(
     workspaceId: string,
-    input: { title: string; branch?: string | null; promptTitle?: string | null },
+    input: { title: string | null; branch?: string | null; promptTitle?: string | null },
   ): Promise<void> {
     await this.workspaceRegistry.update(workspaceId, (current) => {
       let title = current.title;
-      if (!title || (input.promptTitle && title === input.promptTitle)) {
+      if (
+        current.titleSource !== "user" &&
+        input.title &&
+        (!title || title === input.promptTitle)
+      ) {
         title = input.title;
       }
       return {

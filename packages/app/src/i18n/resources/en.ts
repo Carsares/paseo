@@ -1504,6 +1504,7 @@ export const en = {
     },
   },
   newWorkspace: {
+    editTitle: "Edit workspace name",
     title: "New workspace",
     create: "Create",
     isolation: {

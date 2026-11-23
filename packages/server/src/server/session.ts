@@ -5266,6 +5266,7 @@ export class Session {
       const updated = await this.workspaceRegistry.update(workspaceId, (existing) => ({
         ...existing,
         title: nextTitle,
+        titleSource: "user",
         updatedAt,
       }));
       if (!updated) {
@@ -8885,6 +8886,7 @@ export class Session {
         explicitTitle ?? promptTitle,
         request.source.projectId,
         {
+          titleSource: explicitTitle ? "user" : undefined,
           expectsInitialAgent: Boolean(request.firstAgentContext),
           workspaceId,
           metadata: request.metadata,

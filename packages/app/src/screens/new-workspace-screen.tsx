@@ -8,7 +8,7 @@ import type { ReactNode } from "react";
 import { useIsFocused } from "expo-router/react-navigation";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
-import { Text, View } from "react-native";
+import { ActivityIndicator, Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { createNameId } from "mnemonic-id";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -21,6 +21,8 @@ import {
   splitComposerAttachmentsForSubmit,
 } from "@/composer/attachments/submit";
 import { TitlebarDragRegion } from "@/components/desktop/titlebar-drag-region";
+import { Button } from "@/components/ui/button";
+import { ICON_BUTTON_SIZES } from "@/components/ui/control-geometry";
 import { MenuHeader } from "@/components/headers/menu-header";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { useToast } from "@/contexts/toast-context";
@@ -64,6 +66,7 @@ import {
   type ForkAgentIntent,
   type ForkWorktreeSubmission,
   type PendingWorkspaceDraftSetup,
+  type WorkspaceDraftTitle,
 } from "@/stores/workspace-draft-submission-store";
 import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
 import type { KeyboardActionId } from "@/keyboard/keyboard-action-dispatcher";
@@ -141,6 +144,7 @@ import {
   type ExistingWorktree,
 } from "./new-workspace/existing-worktrees";
 import { useNewWorkspaceForm } from "./new-workspace/form";
+import { DraftTitleEditor } from "./new-workspace/draft-title-editor";
 import { ImportSessionButton } from "./new-workspace/import-session-button";
 import { useImportSession } from "@/hooks/use-import-session";
 import {
@@ -411,6 +415,7 @@ interface WorkspaceCreationResult {
 }
 
 async function createMultiplicityWorkspace(input: {
+  title: string;
   idempotencyKey: string;
   client: NonNullable<ReturnType<typeof useHostRuntimeClient>>;
   source: CreateWorkspaceRequestOptions["source"];
@@ -443,6 +448,7 @@ async function createMultiplicityWorkspace(input: {
   };
   const payload = await input.client.createWorkspace({
     idempotencyKey: input.idempotencyKey,
+    ...(input.title ? { title: input.title } : {}),
     agent: input.agent,
     ...(input.mainAgent ? { mainAgent: input.mainAgent } : {}),
     onEvent: (snapshot) => {
@@ -470,6 +476,7 @@ type EnsureWorkspace = (
 ) => Promise<WorkspaceCreationResult>;
 
 interface CreateChatAgentInput {
+  finishTitle: () => void;
   payload: MessagePayload;
   composerState: ReturnType<typeof useAgentInputDraft>["composerState"];
   forkDraftSetup?: PendingWorkspaceDraftSetup | null;
@@ -627,6 +634,7 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
       supportsForgeSearch: input.supportsForgeSearch,
       agentCreation,
     });
+    if (!input.forkDraftSetup) input.finishTitle();
   };
   const execute = async (): Promise<AgentSnapshotPayload> => {
     const { workspace, agent, mainAgent } = await ensureWorkspace({
@@ -655,6 +663,7 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
   const agentCreation = { result: Promise.resolve().then(() => execute()) };
   await agentCreation.result;
   if (outcome === "background") clearConsumedDraft();
+  if (outcome === "background" || input.forkDraftSetup) input.finishTitle();
   return outcome;
 }
 
@@ -1038,12 +1047,71 @@ function useDefaultWorkspaceMainAgent(serverId: string) {
 }
 
 export function NewWorkspaceScreen({
+  creationDraftId,
+  rememberCreationDraft,
+  ...props
+}: NewWorkspaceScreenProps & {
+  creationDraftId?: string;
+  rememberCreationDraft: (id: string) => void;
+}) {
+  const forkDraftId = props.draftId;
+  const id = forkDraftId ?? creationDraftId;
+  const focused = useIsFocused();
+  const title = useWorkspaceDraftSubmissionStore((state) =>
+    id && Object.hasOwn(state.titlesById, id) ? state.titlesById[id] : undefined,
+  );
+  const { t } = useTranslation();
+  const [error, setError] = useState<string | null>(null);
+  const retry = useCallback(() => setError(null), []);
+  useEffect(() => {
+    if (!focused || title || error) return;
+    let active = true;
+    async function open() {
+      try {
+        const openedId = await useWorkspaceDraftSubmissionStore.getState().openDraftTitle({
+          forkDraftId,
+          creationDraftId,
+          createWorktreeSlug: createNameId,
+        });
+        if (active && !forkDraftId && openedId !== creationDraftId) rememberCreationDraft(openedId);
+      } catch (cause) {
+        if (active) setError(toErrorMessage(cause));
+      }
+    }
+    void open();
+    return () => {
+      active = false;
+    };
+  }, [creationDraftId, forkDraftId, focused, error, title, rememberCreationDraft]);
+  if (!title) {
+    return (
+      <View style={styles.titleLoading}>
+        {error ? (
+          <>
+            <Text accessibilityRole="alert" style={styles.errorText}>
+              {error}
+            </Text>
+            <Button variant="ghost" onPress={retry}>
+              {t("common.actions.retry")}
+            </Button>
+          </>
+        ) : (
+          <ActivityIndicator />
+        )}
+      </View>
+    );
+  }
+  return <NewWorkspaceForm key={title.draftId} {...props} creationIdentity={title} />;
+}
+
+function NewWorkspaceForm({
   serverId,
   sourceDirectory: sourceDirectoryProp,
   projectId,
   displayName: displayNameProp,
   draftId,
-}: NewWorkspaceScreenProps) {
+  creationIdentity,
+}: NewWorkspaceScreenProps & { creationIdentity: WorkspaceDraftTitle }) {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
@@ -1092,10 +1160,23 @@ export function NewWorkspaceScreen({
   const supportsWorkspaceMultiplicity = useHostFeature(selectedServerId, "workspaceMultiplicity");
   const supportsForgeSearch = useHostFeature(selectedServerId, "forgeSearch");
   const createMainAgent = useDefaultWorkspaceMainAgent(selectedServerId);
-  const [creationIdentity] = useState(() => ({
-    draftId: draftId ?? generateDraftId(),
-    worktreeSlug: createNameId(),
-  }));
+  const draftKey = buildNewWorkspaceDraftKey(draftId);
+  const creationDraftId = creationIdentity.draftId;
+  const commitTitle = useCallback(
+    (value: string) => {
+      void useWorkspaceDraftSubmissionStore
+        .getState()
+        .editDraftTitle(creationDraftId, value)
+        .catch((error) => toast.error(toErrorMessage(error)));
+    },
+    [creationDraftId, toast],
+  );
+  const finishTitle = useCallback(() => {
+    void useWorkspaceDraftSubmissionStore
+      .getState()
+      .finishDraftTitle(creationDraftId)
+      .catch((error) => toast.error(toErrorMessage(error)));
+  }, [creationDraftId, toast]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [creationResult, setCreationResult] = useState<
     WorkspaceCreationResult | { workspace: null }
@@ -1195,7 +1276,6 @@ export function NewWorkspaceScreen({
   const projectIconDataByProjectViewKey = useProjectIcons({
     projects: projectIconTargets,
   });
-  const draftKey = buildNewWorkspaceDraftKey(draftId);
   const draftContextScopeKey = useDraftWorkspaceAttachmentScopeKey(draftId);
   const visibleDraftContextScopeKeys = useMemo(
     () => resolveVisibleDraftContextScopeKeys({ isDraftHandoffActive, draftContextScopeKey }),
@@ -1553,7 +1633,11 @@ export function NewWorkspaceScreen({
         agentConfig: input.agent?.config,
         createMainAgent: Boolean(mainAgent),
       });
+      const title = await useWorkspaceDraftSubmissionStore
+        .getState()
+        .submitDraftTitle(creationIdentity.draftId);
       const normalizedWorkspace = await createMultiplicityWorkspace({
+        title,
         idempotencyKey: creationIdentity.draftId,
         client: connectedClient,
         source,
@@ -1625,6 +1709,7 @@ export function NewWorkspaceScreen({
               });
             },
           });
+          finishTitle();
           // Nothing navigated, so this screen may still be mounted under another route. Release
           // the pending lock it would otherwise keep forever.
           if (outcome === "background") {
@@ -1652,6 +1737,7 @@ export function NewWorkspaceScreen({
             ? submittedAgentIntent?.config
             : undefined;
         const outcome = await runCreateChatAgent({
+          finishTitle,
           payload,
           composerState,
           forkDraftSetup,
@@ -1688,6 +1774,7 @@ export function NewWorkspaceScreen({
       creationIdentity,
       chatDraft.clear,
       draftKey,
+      finishTitle,
       ensureWorkspace,
       forkDraftSetup,
       isStillOnCreateScreen,
@@ -1755,6 +1842,7 @@ export function NewWorkspaceScreen({
           navigateToWorkspace({ serverId: targetServerId, workspaceId, target });
         },
       });
+      finishTitle();
       if (outcome === "background") {
         setPendingAction(null);
       }
@@ -1766,6 +1854,7 @@ export function NewWorkspaceScreen({
     }
   }, [
     ensureWorkspace,
+    finishTitle,
     isStillOnCreateScreen,
     launchTarget,
     queryClient,
@@ -1943,12 +2032,23 @@ export function NewWorkspaceScreen({
       agentControls={agentControlsWithDisabled}
     />
   );
+  const title = useMemo(
+    () => (
+      <DraftTitleEditor
+        value={creationIdentity.title}
+        onCommit={commitTitle}
+        compact={isCompact}
+        disabled={isPending || creationIdentity.submitted}
+      />
+    ),
+    [creationIdentity.title, creationIdentity.submitted, commitTitle, isCompact, isPending],
+  );
   return (
     <FileDropZone style={styles.container}>
       <NewWorkspaceLayout
         isCompact={isCompact}
         fullscreen={isComposerFullscreen}
-        title={t("newWorkspace.title")}
+        title={title}
         formStack={formStack}
         onImportSession={importSession.open}
       >
@@ -2057,15 +2157,17 @@ function NewWorkspaceLayout({
   isCompact: boolean;
   /** The composer covers the screen; the header leaves and the dock fills the content. */
   fullscreen: boolean;
-  title: string;
+  title: ReactNode;
   formStack: ReactNode;
   onImportSession: () => void;
   children: ReactNode;
 }) {
   // In the header on compact layouts, under the composer otherwise.
-  const importSessionButton = <ImportSessionButton compact={isCompact} onPress={onImportSession} />;
-  // Compact has no title: the fields name themselves. The free space above pushes them down onto
-  // the composer, where the thumb is.
+  const importSessionButton = useMemo(
+    () => <ImportSessionButton compact={isCompact} onPress={onImportSession} />,
+    [isCompact, onImportSession],
+  );
+  // On compact screens the fields sit above the composer, within reach of the thumb.
   const setupFields = isCompact ? (
     <>
       <View style={styles.compactSetupSpace} pointerEvents="none" />
@@ -2073,17 +2175,23 @@ function NewWorkspaceLayout({
     </>
   ) : (
     <>
-      <View style={styles.composerTitleContainer} pointerEvents="none">
-        <Text style={styles.composerTitle}>{title}</Text>
-      </View>
+      <View style={styles.composerTitleContainer}>{title}</View>
       {formStack}
     </>
   );
+  const headerActions = useMemo(
+    () =>
+      isCompact ? (
+        <View style={styles.compactActions}>
+          <View style={styles.compactTitle}>{title}</View>
+          {importSessionButton}
+        </View>
+      ) : undefined,
+    [isCompact, title, importSessionButton],
+  );
   return (
     <>
-      {fullscreen ? null : (
-        <MenuHeader borderless rightContent={isCompact ? importSessionButton : undefined} />
-      )}
+      {fullscreen ? null : <MenuHeader borderless rightContent={headerActions} />}
       <View style={styles.content}>
         <TitlebarDragRegion />
         <ComposerDock centered={!isCompact} fullscreen={fullscreen}>
@@ -2098,7 +2206,7 @@ function NewWorkspaceLayout({
   );
 }
 
-const styles = StyleSheet.create((theme) => ({
+const styles = StyleSheet.create((theme, runtime) => ({
   container: {
     flex: 1,
     backgroundColor: theme.colors.surface0,
@@ -2108,6 +2216,23 @@ const styles = StyleSheet.create((theme) => ({
     position: "relative",
     flex: 1,
   },
+  titleLoading: { flex: 1, justifyContent: "center", alignItems: "center" },
+  compactActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+    // Reserve the menu island, both header gaps, side padding and safe area.
+    width: Math.max(
+      0,
+      runtime.screen.width -
+        runtime.insets.left -
+        runtime.insets.right -
+        ICON_BUTTON_SIZES.large.touch -
+        theme.spacing[2] * 2 -
+        theme.spacing[3] * 2,
+    ),
+  },
+  compactTitle: { minWidth: 0, flex: 1 },
   compactSetupSpace: {
     flex: 1,
   },
@@ -2115,11 +2240,6 @@ const styles = StyleSheet.create((theme) => ({
     marginBottom: theme.spacing[8],
     paddingLeft: theme.spacing[6],
     paddingRight: theme.spacing[4],
-  },
-  composerTitle: {
-    fontSize: theme.fontSize["2xl"],
-    fontWeight: theme.fontWeight.normal,
-    color: theme.colors.foreground,
   },
   errorText: {
     fontSize: theme.fontSize.base,

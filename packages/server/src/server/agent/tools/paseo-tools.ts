@@ -180,7 +180,7 @@ export interface PaseoToolHostDependencies {
   listActiveWorkspaces?: ArchiveDependencies["listActiveWorkspaces"];
   archiveWorkspaceRecord?: ArchiveDependencies["archiveWorkspaceRecord"];
   emitWorkspaceUpdatesForWorkspaceIds?: ArchiveDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
-  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "listActive" | "upsert">;
+  workspaceRegistry?: Pick<WorkspaceRegistry, "get" | "listActive" | "update">;
   projectRegistry?: Pick<ProjectRegistry, "get" | "list">;
   createDirectoryWorkspace?: (
     cwd: string,
@@ -2831,19 +2831,15 @@ function createToolCatalog(
       }
 
       const workspaceId = resolveWorkspaceIdForRename(requestedWorkspaceId);
-      const existing = await options.workspaceRegistry.get(workspaceId);
-      if (!existing) {
+      const updated = await options.workspaceRegistry.update(workspaceId, (current) => {
+        if (current.archivedAt) {
+          throw new PaseoToolInputError(`Workspace ${workspaceId} is archived`);
+        }
+        return { ...current, title, titleSource: "user", updatedAt: new Date().toISOString() };
+      });
+      if (!updated) {
         throw new PaseoToolInputError(`Workspace ${workspaceId} not found`);
       }
-      if (existing.archivedAt) {
-        throw new PaseoToolInputError(`Workspace ${workspaceId} is archived`);
-      }
-
-      await options.workspaceRegistry.upsert({
-        ...existing,
-        title,
-        updatedAt: new Date().toISOString(),
-      });
       await options.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
 
       return {

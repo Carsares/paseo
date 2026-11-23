@@ -1530,6 +1530,7 @@ export const es: TranslationResources = {
     },
   },
   newWorkspace: {
+    editTitle: "Editar el nombre del espacio de trabajo",
     title: "Nuevo espacio de trabajo",
     create: "Crear",
     isolation: {

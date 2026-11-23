@@ -1524,6 +1524,7 @@ export const fr: TranslationResources = {
     },
   },
   newWorkspace: {
+    editTitle: "Modifier le nom de l’espace de travail",
     title: "Nouvel espace de travail",
     create: "Créer",
     isolation: {

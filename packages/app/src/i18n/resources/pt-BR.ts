@@ -1520,6 +1520,7 @@ export const ptBR: TranslationResources = {
     },
   },
   newWorkspace: {
+    editTitle: "Editar nome do workspace",
     title: "Novo workspace",
     create: "Criar",
     isolation: {

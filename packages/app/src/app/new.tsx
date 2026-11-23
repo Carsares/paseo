@@ -1,5 +1,6 @@
 import { useLocalSearchParams } from "expo-router";
-import { useEffect, useMemo, type ReactNode } from "react";
+import { useNavigation } from "expo-router/react-navigation";
+import { useCallback, useEffect, useMemo, type ReactNode } from "react";
 import { ActivityIndicator, Text, View } from "react-native";
 import { useTranslation } from "react-i18next";
 import { StyleSheet } from "react-native-unistyles";
@@ -65,7 +66,18 @@ export default function NewWorkspaceRoute() {
     name?: string;
     projectId?: string;
     draftId?: string;
+    creationDraftId?: string;
   }>();
+  const navigation = useNavigation<{ setParams: (params: { creationDraftId: string }) => void }>();
+  const rememberCreationDraft = useCallback(
+    (creationDraftId: string) => navigation.setParams({ creationDraftId }),
+    [navigation],
+  );
+  // Ordinary messages still share their composer draft. Only creation identity belongs in the URL.
+  const creationDraftId =
+    typeof params.creationDraftId === "string"
+      ? params.creationDraftId.trim() || undefined
+      : undefined;
   const serverId = typeof params.serverId === "string" ? params.serverId : "";
   const sourceDirectory = typeof params.dir === "string" ? params.dir : undefined;
   const displayName = typeof params.name === "string" ? params.name : undefined;
@@ -95,6 +107,8 @@ export default function NewWorkspaceRoute() {
           <ComposerEditingScope tabId={draftKey} targetKey={draftKey}>
             <NewWorkspaceScreen
               key={screenKey}
+              creationDraftId={creationDraftId}
+              rememberCreationDraft={rememberCreationDraft}
               serverId={serverId}
               sourceDirectory={sourceDirectory}
               displayName={displayName}

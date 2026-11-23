@@ -1744,7 +1744,7 @@ export async function createPaseoDaemon(
         cwd,
         title,
         projectId,
-        context,
+        { ...context, titleSource: title?.trim() ? "user" : undefined },
       );
       await emitWorkspaceUpdatesExternal([workspace.workspaceId]);
       return workspace;

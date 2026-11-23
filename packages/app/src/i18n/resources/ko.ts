@@ -1501,6 +1501,7 @@ export const ko: TranslationResources = {
     },
   },
   newWorkspace: {
+    editTitle: "워크스페이스 이름 편집",
     title: "새 워크스페이스",
     create: "생성",
     isolation: {

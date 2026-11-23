@@ -1482,6 +1482,7 @@ export const zhCN: TranslationResources = {
     },
   },
   newWorkspace: {
+    editTitle: "编辑 workspace 名称",
     title: "新建 workspace",
     create: "创建",
     isolation: {

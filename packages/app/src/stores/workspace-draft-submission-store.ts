@@ -5,10 +5,11 @@ import {
   type AgentSnapshotPayload,
 } from "@getpaseo/protocol/messages";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { create } from "zustand";
+import { create, type StateCreator } from "zustand";
 import { z } from "zod";
 import type { ComposerAttachment } from "@/attachments/types";
 import type { AgentProvider } from "@getpaseo/protocol/agent-types";
+import { generateDraftId } from "./draft-keys";
 import type { WorkspaceDraftTabSetup } from "@/workspace-tabs/model";
 
 export interface PendingWorkspaceDraftSubmission {
@@ -108,7 +109,123 @@ export function readForkAgentIntent(draft: Exclude<DraftSetupStatus, string> | n
   return draft?.agentIntent ?? draft?.worktreeSubmission?.agentIntent;
 }
 
-interface WorkspaceDraftSubmissionState {
+const DraftTitleSchema = z.object({
+  draftId: z.string().min(1),
+  worktreeSlug: z.string().min(1),
+  title: z.string(),
+  submitted: z.boolean(),
+});
+
+export type WorkspaceDraftTitle = z.infer<typeof DraftTitleSchema>;
+type DraftStorage = Pick<typeof AsyncStorage, "getItem" | "setItem" | "removeItem">;
+
+interface DraftTitles {
+  titlesById: Partial<Record<string, WorkspaceDraftTitle>>;
+  openDraftTitle: (input: {
+    forkDraftId?: string;
+    creationDraftId?: string;
+    createWorktreeSlug: () => string;
+  }) => Promise<string>;
+  editDraftTitle: (id: string, value: string) => Promise<void>;
+  submitDraftTitle: (id: string) => Promise<string>;
+  finishDraftTitle: (id: string) => Promise<void>;
+}
+
+function createDraftTitles(
+  storage: DraftStorage,
+): StateCreator<WorkspaceDraftSubmissionState, [], [], DraftTitles> {
+  // Blur can commit an edit while Submit is already handling the press. Order all
+  // reads, writes and cleanup for this draft before sending the first request.
+  const pending = new Map<string, Promise<unknown>>();
+  function ordered<T>(key: string, action: () => Promise<T>): Promise<T> {
+    const previous = pending.get(key) ?? Promise.resolve();
+    const next = previous.then(action, action);
+    pending.set(key, next);
+    const release = () => {
+      if (pending.get(key) === next) pending.delete(key);
+    };
+    void next.then(release, release);
+    return next;
+  }
+  const storageKey = (key: string) => `paseo:workspace-draft-title:${key}`;
+  return (set, get) => {
+    const publish = (key: string, record: WorkspaceDraftTitle) =>
+      set((state) => ({ titlesById: { ...state.titlesById, [key]: record } }));
+    const readStored = async (key: string) => {
+      const raw = await storage.getItem(storageKey(key));
+      return raw === null ? null : DraftTitleSchema.parse(JSON.parse(raw));
+    };
+    return {
+      titlesById: {},
+      openDraftTitle: ({ forkDraftId, creationDraftId, createWorktreeSlug }) => {
+        const requested = forkDraftId ?? creationDraftId;
+        const id = requested ?? generateDraftId();
+        return ordered(id, async () => {
+          if (Object.hasOwn(get().titlesById, id)) return id;
+          const stored = requested && (await readStored(id));
+          if (stored) {
+            publish(id, stored);
+            return id;
+          }
+          // Revisiting a consumed ordinary draft URL must not replay its creation.
+          const next = creationDraftId && !forkDraftId ? generateDraftId() : id;
+          const fork = forkDraftId && get().draftSetupStatusById[forkDraftId];
+          const submitted =
+            typeof fork === "object" &&
+            Boolean(fork.worktreeSlug || fork.worktreeSubmission || readForkAgentIntent(fork));
+          const record = {
+            draftId: next,
+            worktreeSlug: createWorktreeSlug(),
+            title: "",
+            submitted,
+          };
+          await storage.setItem(storageKey(next), JSON.stringify(record));
+          publish(next, record);
+          return next;
+        });
+      },
+      editDraftTitle: (id, value) =>
+        ordered(id, async () => {
+          const current = get().titlesById[id];
+          if (!current || current.submitted) return;
+          const stored = await readStored(id);
+          if (stored?.submitted) {
+            publish(id, stored);
+            return;
+          }
+          const record = { ...current, title: value.trim() };
+          publish(id, record);
+          await storage.setItem(storageKey(id), JSON.stringify(record));
+        }),
+      submitDraftTitle: (id) =>
+        ordered(id, async () => {
+          const current = get().titlesById[id];
+          if (!current) throw new Error("The workspace draft has changed.");
+          if (current.submitted) return current.title;
+          const stored = await readStored(id);
+          if (stored?.submitted) {
+            publish(id, stored);
+            return stored.title;
+          }
+          const record = { ...current, submitted: true };
+          await storage.setItem(storageKey(id), JSON.stringify(record));
+          publish(id, record);
+          return record.title;
+        }),
+      finishDraftTitle: (id) =>
+        ordered(id, async () => {
+          await storage.removeItem(storageKey(id));
+          set((state) => {
+            const titlesById = { ...state.titlesById };
+            delete titlesById[id];
+            return { titlesById };
+          });
+        }),
+    };
+  };
+}
+
+interface WorkspaceDraftSubmissionState extends DraftTitles {
   pendingByDraftId: Record<string, PendingWorkspaceDraftSubmission>;
   setupByDraftId: Record<string, PendingWorkspaceDraftSetup>;
   draftSetupStatusById: Partial<Record<string, DraftSetupStatus>>;
@@ -160,10 +277,10 @@ function forkDraftStorageKey(draftId: string): string {
   return `paseo:workspace-fork-draft:${draftId}`;
 }
 
-export function createWorkspaceDraftSubmissionStore(
-  storage: Pick<typeof AsyncStorage, "getItem" | "setItem" | "removeItem"> = AsyncStorage,
-) {
-  return create<WorkspaceDraftSubmissionState>((set, get) => ({
+export function createWorkspaceDraftSubmissionStore(storage: DraftStorage = AsyncStorage) {
+  const titles = createDraftTitles(storage);
+  return create<WorkspaceDraftSubmissionState>((set, get, api) => ({
+    ...titles(set, get, api),
     pendingByDraftId: {},
     setupByDraftId: {},
     draftSetupStatusById: {},
@@ -303,12 +420,15 @@ export function createWorkspaceDraftSubmissionStore(
           draftSetupStatusById: { ...state.draftSetupStatusById, [id]: { sourceServerId: null } },
         };
       });
-      if (typeof status === "object" && status.sourceServerId === null) {
-        return;
-      }
-      // The destination draft may finish after a reload without opening /new again.
+      // The destination may finish after a reload without ever reopening /new.
       try {
-        await storage.removeItem(forkDraftStorageKey(id));
+        const finishTitle = get().finishDraftTitle;
+        await Promise.all([
+          finishTitle(id),
+          ...(typeof status === "object" && status.sourceServerId === null
+            ? []
+            : [storage.removeItem(forkDraftStorageKey(id))]),
+        ]);
       } catch {
         // Cleanup failure must not turn a successful creation into a failed submit.
       }

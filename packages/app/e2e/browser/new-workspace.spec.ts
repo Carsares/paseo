@@ -1,9 +1,9 @@
 import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { realpath } from "node:fs/promises";
+import { mkdir, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { buildHostWorkspaceRoute } from "@/utils/host-routes";
-import { expect, test } from "../support/fixtures";
+import { buildHostWorkspaceRoute, parseHostWorkspaceRouteFromPathname } from "@/utils/host-routes";
+import { expect, test, type Page } from "../support/fixtures";
 import { gotoAppShell } from "../support/helpers/app";
 import {
   archiveWorkspaceFromDaemon,
@@ -20,6 +20,7 @@ import {
   expectPickerSelected,
   expectStartingRefPickerTriggerPr,
   fillNewWorkspaceDraft,
+  loadSessionMessageReaders,
   openGlobalNewWorkspaceComposer,
   openBranchPicker,
   openNewWorkspaceComposer,
@@ -39,6 +40,7 @@ import {
 } from "../support/helpers/new-workspace";
 import {
   commitLocalOnly,
+  createTempDirectory,
   createTempGitRepo,
   readRepoRef,
   readWorktreeBaseMetadata,
@@ -54,7 +56,7 @@ import {
 } from "../support/helpers/github-fixtures";
 import { getServerId } from "../support/helpers/server-id";
 import { selectSidebarStatusGrouping } from "../support/helpers/sidebar";
-import { getE2EDaemonPort } from "../support/helpers/daemon-port";
+import { daemonWsRoutePattern, getE2EDaemonPort } from "../support/helpers/daemon-port";
 import { chooseAddProjectMethod, expectAddProjectPage } from "../support/helpers/add-project-flow";
 import { seedSavedSettingsHosts } from "../support/helpers/settings";
 import {
@@ -64,7 +66,14 @@ import {
   waitForSidebarHydration,
   waitForWorkspaceInSidebar,
 } from "../support/helpers/workspace-ui";
-import { dropFileOnComposer, expectAttachmentPill } from "../support/helpers/composer";
+import {
+  dropFileOnComposer,
+  expectAttachmentPill,
+  resizeComposerViewport,
+} from "../support/helpers/composer";
+import { ImportSessionFlow } from "../support/helpers/import-session";
+import { selectLaunchOption, submitTerminalLaunch } from "../support/helpers/new-workspace-launch";
+import { seedWorkspace, type SeededWorkspace } from "../support/helpers/seed-client";
 
 const BACKGROUND_RESOLUTION_FILE = {
   name: "background-context.json",
@@ -211,6 +220,152 @@ async function submitNewWorkspaceWithoutPrompt(page: import("@playwright/test").
   await expect(createButton).toBeVisible({ timeout: 30_000 });
   await createButton.click();
 }
+
+const titleTest = test.extend<{ project: SeededWorkspace }>({
+  e2eDaemonEnvironment: async ({ e2eDaemonEnvironment }, provide) => {
+    const config = await createTempDirectory("workspace-title-claude-");
+    try {
+      await provide({ ...e2eDaemonEnvironment, CLAUDE_CONFIG_DIR: config.path });
+    } finally {
+      await config.cleanup();
+    }
+  },
+  project: async ({ e2eWorkerClient }, provide) => {
+    void e2eWorkerClient;
+    const project = await seedWorkspace({ repoPrefix: "workspace-title-", git: false });
+    try {
+      await provide(project);
+    } finally {
+      await project.cleanup();
+    }
+  },
+});
+
+titleTest.describe("New workspace title", () => {
+  const label = { name: "Edit workspace name", exact: true } as const;
+
+  async function editTitle(page: Page, value: string, key = "Enter") {
+    await page.getByRole("button", label).press("Enter");
+    const input = page.getByRole("textbox", label);
+    await expect(input).toBeFocused();
+    await input.fill(value);
+    await input.press(key);
+    await expect(input).toHaveCount(0);
+  }
+
+  async function openDraft(page: Page, project: SeededWorkspace) {
+    const titles: Array<string | undefined> = [];
+    const frames = await loadSessionMessageReaders();
+    page.on("websocket", (ws) => {
+      if (!daemonWsRoutePattern().test(ws.url())) return;
+      ws.on("framesent", ({ payload }) => {
+        const message = frames.client(payload);
+        if (message?.type === "workspace.create.request") titles.push(message.title);
+      });
+    });
+    await gotoAppShell(page);
+    await waitForSidebarHydration(page);
+    await openNewWorkspaceComposer(page, project);
+    return titles;
+  }
+
+  for (const launch of ["chat", "empty", "terminal", "cleared"] as const) {
+    titleTest(`persists the submitted title for ${launch}`, async ({ page, project }) => {
+      const titles = await openDraft(page, project);
+      const title = `Review ${launch} notes`;
+      const button = page.getByRole("button", label);
+      await expect(button).toHaveText("New workspace");
+      await editTitle(page, `  ${title}  `);
+      await expect(button).toHaveText(title);
+
+      if (launch === "empty") {
+        await resizeComposerViewport(page, "portrait");
+        await expect(button).toBeInViewport();
+        await expect(button).toHaveText(title);
+        await editTitle(page, "Discard this edit", "Escape");
+        await expect(button).toHaveText(title);
+      }
+      if (launch === "cleared") {
+        await editTitle(page, "   ");
+        await expect(button).toHaveText("New workspace");
+      }
+
+      if (launch === "chat") {
+        await submitNewWorkspacePrompt(page, "A prompt distinct from the workspace title");
+      } else if (launch === "terminal") {
+        await selectLaunchOption(page, "blank");
+        await submitTerminalLaunch(page);
+      } else {
+        await submitNewWorkspaceEmpty(page);
+      }
+      await expect(page).toHaveURL(/\/workspace\//u, { timeout: 60_000 });
+      expect(titles).toEqual([launch === "cleared" ? undefined : title]);
+      const route = parseHostWorkspaceRouteFromPathname(new URL(page.url()).pathname);
+      expect(route?.workspaceId).not.toEqual(project.workspaceId);
+      const { entries } = await project.client.fetchWorkspaces({
+        filter: { projectId: project.projectId },
+      });
+      const workspace = entries.find((entry) => entry.id === route?.workspaceId);
+      expect(workspace).toBeDefined();
+      if (launch !== "cleared") expect(workspace).toMatchObject({ title });
+    });
+  }
+
+  titleTest("restores each browser tab's draft title after a reload", async ({ page, project }) => {
+    titleTest.setTimeout(120_000);
+    await openDraft(page, project);
+    await editTitle(page, "First tab");
+    const second = await page.context().newPage();
+    try {
+      await openDraft(second, project);
+      await expect(second.getByRole("button", label)).toHaveText("New workspace");
+      await editTitle(second, "Second tab");
+      await page.reload();
+      await expect(page.getByRole("button", label)).toHaveText("First tab");
+      await second.reload();
+      await expect(second.getByRole("button", label)).toHaveText("Second tab");
+    } finally {
+      await second.close();
+    }
+  });
+
+  titleTest(
+    "import keeps the destination workspace title",
+    async ({ page, project, e2eDaemonEnvironment }) => {
+      const sourceTitle = "Original destination title";
+      await project.client.setWorkspaceTitle(project.workspaceId, sourceTitle);
+      const sessionId = "title-isolation";
+      const cwd = project.repoPath;
+      const directory = path.join(
+        e2eDaemonEnvironment.CLAUDE_CONFIG_DIR!,
+        "projects",
+        cwd.replace(/[^a-zA-Z0-9]/g, "-"),
+      );
+      await mkdir(directory, { recursive: true });
+      const prompt = "Published session history";
+      const session = {
+        type: "user",
+        uuid: "title-isolation-user",
+        sessionId,
+        cwd,
+        message: { role: "user", content: prompt },
+      };
+      await writeFile(path.join(directory, `${sessionId}.jsonl`), JSON.stringify(session) + "\n");
+
+      const titles = await openDraft(page, project);
+      await editTitle(page, "Unsubmitted title");
+      const flow = new ImportSessionFlow(page);
+      await flow.openFromNewWorkspace();
+      await flow.importSession(sessionId);
+      await flow.expectImportedIntoWorkspace(project.workspaceId, prompt);
+      const { entries } = await project.client.fetchWorkspaces({
+        filter: { projectId: project.projectId },
+      });
+      expect(entries).toMatchObject([{ id: project.workspaceId, title: sourceTitle }]);
+      expect(titles).not.toContain("Unsubmitted title");
+    },
+  );
+});
 
 test.describe("New workspace flow", () => {
   let client: Awaited<ReturnType<typeof connectNewWorkspaceDaemonClient>>;

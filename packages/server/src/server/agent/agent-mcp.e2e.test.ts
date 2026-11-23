@@ -92,6 +92,7 @@ async function createMcpClient(url: string, authToken?: string): Promise<McpClie
 }
 
 interface OfflineMcpDaemon {
+  paseoHome: string;
   client: McpClient;
   stop: () => Promise<void>;
 }
@@ -125,6 +126,7 @@ async function startOfflineMcpDaemon(): Promise<OfflineMcpDaemon> {
     await daemon.start();
     const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
     return {
+      paseoHome,
       client,
       stop: async () => {
         await client.close();
@@ -477,6 +479,46 @@ describe("agent MCP end-to-end (offline)", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("MCP create_workspace and rename_workspace persist explicit title choices", async () => {
+    const daemon = await startOfflineMcpDaemon();
+    try {
+      const create = async (title?: string) => {
+        const result = await daemon.client.callTool({
+          name: "create_workspace",
+          args: { isolation: "local", path: daemon.paseoHome, title },
+        });
+        expect(result.isError).not.toBe(true);
+        return getStructuredContent(result)?.workspaceId;
+      };
+      const named = await create("Named on create");
+      const renamed = await create();
+      const result = await daemon.client.callTool({
+        name: "rename_workspace",
+        args: { workspaceId: renamed, title: "Named later" },
+      });
+      expect(result.isError).not.toBe(true);
+      const records = JSON.parse(
+        await readFile(path.join(daemon.paseoHome, "projects", "workspaces.json"), "utf8"),
+      );
+      expect(records).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            workspaceId: named,
+            title: "Named on create",
+            titleSource: "user",
+          }),
+          expect.objectContaining({
+            workspaceId: renamed,
+            title: "Named later",
+            titleSource: "user",
+          }),
+        ]),
+      );
+    } finally {
+      await daemon.stop();
+    }
+  });
 
   test("password-protected daemon authorizes the agent MCP via the capability token", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));

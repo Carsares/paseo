@@ -1494,6 +1494,7 @@ export const ar: TranslationResources = {
     },
   },
   newWorkspace: {
+    editTitle: "تعديل اسم مساحة العمل",
     title: "مساحة عمل جديدة",
     create: "يخلق",
     isolation: {

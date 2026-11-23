@@ -938,7 +938,7 @@ async function createAgentMcpServer(
     workspaceRegistry: {
       get: async () => null,
       listActive: async () => [],
-      upsert: async () => {},
+      update: async () => null,
     },
     ...options,
   });
@@ -2751,7 +2751,7 @@ describe("create_agent MCP tool", () => {
       workspaceRegistry: {
         get: vi.fn(async () => workspace),
         listActive: vi.fn(async () => [workspace]),
-        upsert: vi.fn(async () => undefined),
+        update: vi.fn(async () => null),
       },
       logger,
     });
@@ -2784,7 +2784,7 @@ describe("create_agent MCP tool", () => {
       workspaceRegistry: {
         get: vi.fn(async () => backgroundWorkspace),
         listActive: vi.fn(async () => [backgroundWorkspace]),
-        upsert: vi.fn(async () => undefined),
+        update: vi.fn(async () => null),
       },
       createDirectoryWorkspace: async (cwd, _title, _projectId, context) => {
         createCalls.push({ cwd, context });
@@ -4830,6 +4830,24 @@ describe("update_agent MCP tool", () => {
 describe("rename_workspace MCP tool", () => {
   const logger = createTestLogger();
 
+  function registryForRename(
+    workspaces: Map<string, PersistedWorkspaceRecord>,
+    writes: PersistedWorkspaceRecord[],
+  ): Pick<WorkspaceRegistry, "get" | "listActive" | "update"> {
+    return {
+      get: async (id) => workspaces.get(id) ?? null,
+      listActive: async () => [...workspaces.values()].filter((record) => !record.archivedAt),
+      update: async (id, updater) => {
+        const workspace = workspaces.get(id);
+        if (!workspace) return null;
+        const next = updater(workspace);
+        workspaces.set(id, next);
+        writes.push(next);
+        return next;
+      },
+    };
+  }
+
   it("renames the caller workspace when workspaceId is omitted", async () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
     const workspace = createPersistedWorkspaceRecord({
@@ -4842,7 +4860,7 @@ describe("rename_workspace MCP tool", () => {
       updatedAt: "2026-07-03T09:00:00.000Z",
     });
     const workspaces = new Map([[workspace.workspaceId, workspace]]);
-    const upsertedWorkspaces: PersistedWorkspaceRecord[] = [];
+    const updatedWorkspaces: PersistedWorkspaceRecord[] = [];
     const emittedWorkspaceIds: string[][] = [];
     spies.agentManager.getAgent.mockReturnValue(
       createManagedAgent({
@@ -4855,13 +4873,7 @@ describe("rename_workspace MCP tool", () => {
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      workspaceRegistry: {
-        get: async (workspaceId) => workspaces.get(workspaceId) ?? null,
-        upsert: async (record) => {
-          upsertedWorkspaces.push(record);
-          workspaces.set(record.workspaceId, record);
-        },
-      },
+      workspaceRegistry: registryForRename(workspaces, updatedWorkspaces),
       emitWorkspaceUpdatesForWorkspaceIds: async (workspaceIds) => {
         emittedWorkspaceIds.push(Array.from(workspaceIds));
       },
@@ -4874,10 +4886,11 @@ describe("rename_workspace MCP tool", () => {
       title: "  Payments flow  ",
     });
 
-    expect(upsertedWorkspaces).toEqual([
+    expect(updatedWorkspaces).toEqual([
       {
         ...workspace,
         title: "Payments flow",
+        titleSource: "user",
         updatedAt: expect.any(String),
       },
     ]);
@@ -4913,7 +4926,7 @@ describe("rename_workspace MCP tool", () => {
       [parentWorkspace.workspaceId, parentWorkspace],
       [otherWorkspace.workspaceId, otherWorkspace],
     ]);
-    const upsertedWorkspaces: PersistedWorkspaceRecord[] = [];
+    const updatedWorkspaces: PersistedWorkspaceRecord[] = [];
     const emittedWorkspaceIds: string[][] = [];
     spies.agentManager.getAgent.mockReturnValue(
       createManagedAgent({
@@ -4926,13 +4939,7 @@ describe("rename_workspace MCP tool", () => {
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      workspaceRegistry: {
-        get: async (workspaceId) => workspaces.get(workspaceId) ?? null,
-        upsert: async (record) => {
-          upsertedWorkspaces.push(record);
-          workspaces.set(record.workspaceId, record);
-        },
-      },
+      workspaceRegistry: registryForRename(workspaces, updatedWorkspaces),
       emitWorkspaceUpdatesForWorkspaceIds: async (workspaceIds) => {
         emittedWorkspaceIds.push(Array.from(workspaceIds));
       },
@@ -4946,10 +4953,11 @@ describe("rename_workspace MCP tool", () => {
       title: "Payments flow",
     });
 
-    expect(upsertedWorkspaces).toEqual([
+    expect(updatedWorkspaces).toEqual([
       {
         ...otherWorkspace,
         title: "Payments flow",
+        titleSource: "user",
         updatedAt: expect.any(String),
       },
     ]);
@@ -4974,7 +4982,7 @@ describe("rename_workspace MCP tool", () => {
       updatedAt: "2026-07-03T10:00:00.000Z",
     });
     const workspaces = new Map([[workspace.workspaceId, workspace]]);
-    const upsertedWorkspaces: PersistedWorkspaceRecord[] = [];
+    const updatedWorkspaces: PersistedWorkspaceRecord[] = [];
     const emittedWorkspaceIds: string[][] = [];
     spies.agentManager.getAgent.mockReturnValue(
       createManagedAgent({
@@ -4987,13 +4995,7 @@ describe("rename_workspace MCP tool", () => {
       agentManager,
       agentStorage,
       providerSnapshotManager: createOpenCodeManager().manager,
-      workspaceRegistry: {
-        get: async (workspaceId) => workspaces.get(workspaceId) ?? null,
-        upsert: async (record) => {
-          upsertedWorkspaces.push(record);
-          workspaces.set(record.workspaceId, record);
-        },
-      },
+      workspaceRegistry: registryForRename(workspaces, updatedWorkspaces),
       emitWorkspaceUpdatesForWorkspaceIds: async (workspaceIds) => {
         emittedWorkspaceIds.push(Array.from(workspaceIds));
       },
@@ -5007,7 +5009,7 @@ describe("rename_workspace MCP tool", () => {
         title: "Payments flow",
       }),
     ).rejects.toThrow("Workspace wks_archived is archived");
-    expect(upsertedWorkspaces).toEqual([]);
+    expect(updatedWorkspaces).toEqual([]);
     expect(emittedWorkspaceIds).toEqual([]);
   });
 });

@@ -1513,6 +1513,7 @@ export const ru: TranslationResources = {
     },
   },
   newWorkspace: {
+    editTitle: "Изменить название рабочего пространства",
     title: "Новое рабочее пространство",
     create: "Создать",
     isolation: {

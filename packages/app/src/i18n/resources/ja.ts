@@ -1508,6 +1508,7 @@ export const ja: TranslationResources = {
     },
   },
   newWorkspace: {
+    editTitle: "ワークスペース名を編集",
     title: "新しいワークスペース",
     create: "作成",
     isolation: {

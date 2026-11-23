@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { transformFileSync } from "@babel/core";
 import { expect, test } from "vitest";
+import * as draftKeys from "./draft-keys";
 import type * as StoreModule from "./workspace-draft-submission-store";
 
 function createStorage() {
@@ -30,8 +31,11 @@ function loadProductionStores() {
   const require = createRequire(import.meta.url);
   const asyncStorage = createStorage();
   new Function("require", "module", "exports", result.code)(
-    (id: string) =>
-      id === "@react-native-async-storage/async-storage" ? asyncStorage : require(id),
+    (id: string) => {
+      if (id === "@react-native-async-storage/async-storage") return asyncStorage;
+      if (id === "./draft-keys") return draftKeys;
+      return require(id);
+    },
     module,
     module.exports,
   );
@@ -321,3 +325,153 @@ test("keeps the Local Fork intent when a later attempt selects a worktree", asyn
     agentIntent: original,
   });
 });
+
+const newDraft = { createWorktreeSlug: () => "first-worktree" };
+
+test.each([
+  { entered: "  Release 🚀  ", expected: "Release 🚀" },
+  { entered: "   ", expected: "" },
+])("restores the editor and first submitted title '$expected'", async ({ entered, expected }) => {
+  const storage = createStorage();
+  const { createWorkspaceDraftSubmissionStore } = loadProductionStores();
+  const writer = createWorkspaceDraftSubmissionStore(storage).getState();
+  const id = await writer.openDraftTitle(newDraft);
+  await writer.editDraftTitle(id, entered);
+
+  const restore = { creationDraftId: id, createWorktreeSlug: () => "different-worktree" };
+  const reader = createWorkspaceDraftSubmissionStore(storage);
+  expect(await reader.getState().openDraftTitle(restore)).toBe(id);
+  expect(reader.getState().titlesById[id]).toEqual({
+    draftId: id,
+    worktreeSlug: "first-worktree",
+    title: expected,
+    submitted: false,
+  });
+  await expect(reader.getState().submitDraftTitle(id)).resolves.toBe(expected);
+  await reader.getState().editDraftTitle(id, "later");
+  const retry = createWorkspaceDraftSubmissionStore(storage);
+  await retry.getState().openDraftTitle(restore);
+  expect(retry.getState().titlesById[id]).toMatchObject({ title: expected, submitted: true });
+  await expect(retry.getState().submitDraftTitle(id)).resolves.toBe(expected);
+});
+
+test("independent /new tabs sharing disk own distinct titles, request identities and lifetimes", async () => {
+  const storage = createStorage();
+  const { createWorkspaceDraftSubmissionStore } = loadProductionStores();
+  const first = createWorkspaceDraftSubmissionStore(storage).getState();
+  const second = createWorkspaceDraftSubmissionStore(storage);
+  const [a, b] = await Promise.all([
+    first.openDraftTitle(newDraft),
+    second.getState().openDraftTitle({ createWorktreeSlug: () => "second-worktree" }),
+  ]);
+  expect(a).not.toBe(b);
+  await first.editDraftTitle(a, "first");
+  await first.submitDraftTitle(a);
+  await second.getState().editDraftTitle(b, "second");
+  expect(second.getState().titlesById[b]).toEqual({
+    draftId: b,
+    worktreeSlug: "second-worktree",
+    title: "second",
+    submitted: false,
+  });
+  const reloaded = createWorkspaceDraftSubmissionStore(storage).getState();
+  expect(await reloaded.openDraftTitle({ ...newDraft, creationDraftId: b })).toBe(b);
+  await first.finishDraftTitle(a);
+  await expect(reloaded.submitDraftTitle(b)).resolves.toBe("second");
+  const next = await first.openDraftTitle({ ...newDraft, creationDraftId: a });
+  expect(next).not.toBe(a);
+  await expect(first.submitDraftTitle(next)).resolves.toBe("");
+});
+
+test("a delayed blur write finishes before concurrent submissions freeze the title", async () => {
+  const storage = createStorage();
+  let release!: () => void;
+  const write = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const { createWorkspaceDraftSubmissionStore } = loadProductionStores();
+  let delay = false;
+  const store = createWorkspaceDraftSubmissionStore({
+    ...storage,
+    setItem: async (key, value) => {
+      if (delay) await write;
+      await storage.setItem(key, value);
+    },
+  });
+  const { openDraftTitle, editDraftTitle, submitDraftTitle } = store.getState();
+  const id = await openDraftTitle(newDraft);
+  delay = true;
+  const edit = editDraftTitle(id, "blurred");
+  const first = submitDraftTitle(id);
+  const lateEdit = editDraftTitle(id, "too late");
+  const second = submitDraftTitle(id);
+  release();
+  await Promise.all([edit, lateEdit]);
+  await expect(Promise.all([first, second])).resolves.toEqual(["blurred", "blurred"]);
+  expect(store.getState().titlesById[id]).toMatchObject({ title: "blurred", submitted: true });
+});
+
+test("a failed snapshot write allows a retry and does not freeze the draft", async () => {
+  const storage = createStorage();
+  const { createWorkspaceDraftSubmissionStore } = loadProductionStores();
+  let fail = false;
+  const store = createWorkspaceDraftSubmissionStore({
+    ...storage,
+    setItem: async (key, value) => {
+      if (fail) throw new Error("write failed");
+      await storage.setItem(key, value);
+    },
+  });
+  const id = await store.getState().openDraftTitle(newDraft);
+  fail = true;
+  await expect(store.getState().submitDraftTitle(id)).rejects.toThrow("write failed");
+  expect(store.getState().titlesById[id]?.submitted).toBe(false);
+  fail = false;
+  await store.getState().editDraftTitle(id, "retry");
+  await expect(store.getState().submitDraftTitle(id)).resolves.toBe("retry");
+});
+
+test("a stale window opened on the same draft restores the accepted title", async () => {
+  const storage = createStorage();
+  const { createWorkspaceDraftSubmissionStore } = loadProductionStores();
+  const writer = createWorkspaceDraftSubmissionStore(storage).getState();
+  const stale = createWorkspaceDraftSubmissionStore(storage).getState();
+  const id = await writer.openDraftTitle(newDraft);
+  await stale.openDraftTitle({ ...newDraft, creationDraftId: id });
+  await writer.editDraftTitle(id, "accepted");
+  await writer.submitDraftTitle(id);
+  await stale.editDraftTitle(id, "too late");
+  await expect(stale.submitDraftTitle(id)).resolves.toBe("accepted");
+});
+
+test("a Fork already submitted by an older client retries without a title", async () => {
+  const { createWorkspaceDraftSubmissionStore } = loadProductionStores();
+  const store = createWorkspaceDraftSubmissionStore(createStorage());
+  const id = "old-fork";
+  store.setState({
+    draftSetupStatusById: { [id]: { sourceServerId: "fork-host", worktreeSlug: "old-slug" } },
+  });
+  expect(await store.getState().openDraftTitle({ ...newDraft, forkDraftId: id })).toBe(id);
+  await store.getState().editDraftTitle(id, "not in original request");
+  await expect(store.getState().submitDraftTitle(id)).resolves.toBe("");
+});
+
+test.each([undefined, "explicit"])(
+  "destination success cleans title %j after a reload",
+  async (forkDraftId) => {
+    const storage = createStorage();
+    const { createWorkspaceDraftSubmissionStore } = loadProductionStores();
+    const writer = createWorkspaceDraftSubmissionStore(storage).getState();
+    const id = await writer.openDraftTitle({ ...newDraft, forkDraftId });
+    await writer.editDraftTitle(id, "submitted");
+    await writer.submitDraftTitle(id);
+    const destination = createWorkspaceDraftSubmissionStore(storage).getState();
+    await destination.clearDraftSetup({ draftId: id });
+    const reader = createWorkspaceDraftSubmissionStore(storage);
+    const reopened = await reader
+      .getState()
+      .openDraftTitle({ ...newDraft, forkDraftId, creationDraftId: id });
+    expect(reader.getState().titlesById[reopened]).toMatchObject({ title: "", submitted: false });
+    if (!forkDraftId) expect(reopened).not.toBe(id);
+  },
+);

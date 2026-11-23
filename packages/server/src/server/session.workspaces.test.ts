@@ -8853,8 +8853,12 @@ test("project.rename.request returns accepted=false when project is not found", 
 test("workspace.title.set.request stores the title and emits an updated descriptor", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const session = asTestSession(
-    createSessionForWorkspaceTests({ onMessage: (message) => emitted.push(message) }),
+    createSessionForWorkspaceTests({
+      onMessage: (message) => emitted.push(message),
+      agentStorage: { lastUserMessageAtByWorkspace: async () => new Map() },
+    }),
   );
+  session.listAgentPayloads = async () => [];
 
   const project = createPersistedProjectRecord({
     projectId: "proj-1",
@@ -8911,7 +8915,10 @@ test("workspace.title.set.request stores the title and emits an updated descript
     error: null,
   });
 
-  expect(workspaces.get(workspace.workspaceId)?.title).toBe("Payments work");
+  expect(workspaces.get(workspace.workspaceId)).toMatchObject({
+    title: "Payments work",
+    titleSource: "user",
+  });
 
   const update = findByType(emitted, "workspace_update");
   expect(update?.payload).toMatchObject({
@@ -9033,7 +9040,7 @@ test("workspace.title.set.request with whitespace-only title clears the title", 
     title: null,
     error: null,
   });
-  expect(workspaces.get(workspace.workspaceId)?.title).toBeNull();
+  expect(workspaces.get(workspace.workspaceId)).toMatchObject({ title: null, titleSource: "user" });
 });
 
 test("workspace.title.set.request returns accepted=false when workspace is not found", async () => {
@@ -9883,108 +9890,115 @@ test("workspace auto-name replaces the unchanged prompt title", async () => {
   }
 });
 
-test("workspace auto-name uses the backing root for a nested worktree", async () => {
-  vi.useFakeTimers();
-  const tempDir = realpathSync(mkdtempSync(path.join(tmpdir(), "workspace-auto-name-rejected-")));
-  const repoDir = path.join(tempDir, "repo");
-  mkdirSync(repoDir);
-  execFileSync("git", ["init", repoDir], { stdio: "pipe" });
-  execFileSync("git", ["config", "user.email", "test@getpaseo.local"], {
-    cwd: repoDir,
-    stdio: "pipe",
-  });
-  execFileSync("git", ["config", "user.name", "Paseo Test"], { cwd: repoDir, stdio: "pipe" });
-  execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: repoDir, stdio: "pipe" });
-  writeFileSync(path.join(repoDir, "README.md"), "hello\n");
-  execFileSync("git", ["add", "README.md"], { cwd: repoDir, stdio: "pipe" });
-  execFileSync("git", ["commit", "-m", "initial"], { cwd: repoDir, stdio: "pipe" });
-  execFileSync("git", ["branch", "-M", "placeholder-branch"], { cwd: repoDir, stdio: "pipe" });
-  await writePaseoWorktreeMetadata(repoDir, { baseRefName: "main" });
-  await writePaseoWorktreeFirstAgentBranchAutoNameMetadata(repoDir, {
-    placeholderBranchName: "placeholder-branch",
-  });
-  const workspaceCwd = path.join(repoDir, "packages", "app");
-  mkdirSync(workspaceCwd, { recursive: true });
-
-  const workspace = createPersistedWorkspaceRecord({
-    workspaceId: "ws-rejected-branch-title",
-    projectId: "proj-rejected-branch-title",
-    cwd: workspaceCwd,
-    kind: "worktree",
-    displayName: "Fix checkout title",
-    title: "Fix checkout title",
-    branch: "placeholder-branch",
-    worktreeRoot: repoDir,
-    isPaseoOwnedWorktree: true,
-    createdAt: "2026-03-01T12:00:00.000Z",
-    updatedAt: "2026-03-01T12:00:00.000Z",
-  });
-  const stored = new Map([[workspace.workspaceId, workspace]]);
-  let generateCalls = 0;
-  const gitMutations: string[] = [];
-  const emittedCwds: string[] = [];
-  const workspaceAutoName = new WorkspaceAutoName({
-    agentManager: asAgentManager({}),
-    workspaceRegistry: {
-      update: async (workspaceId, updater) => {
-        const current = stored.get(workspaceId);
-        if (!current) return null;
-        const updated = updater(current);
-        stored.set(workspaceId, updated);
-        return updated;
-      },
-    },
-    workspaceGitService: createNoopWorkspaceGitService(),
-    providerSnapshotManager: createProviderSnapshotManagerStub().manager,
-    readDaemonConfig: () => ({ metadataGeneration: { providers: [] } }),
-    gitMutation: {
-      notifyGitMutation: async (_cwd, reason) => {
-        gitMutations.push(reason);
-      },
-    },
-    emitWorkspaceUpdateForCwd: async (cwd) => {
-      emittedCwds.push(cwd);
-    },
-    emitWorkspaceUpdateForWorkspaceId: async () => {},
-    logger: asSessionLogger(createTestLogger()),
-    generateWorkspaceName: async () => {
-      generateCalls += 1;
-      return { title: "Generated Invalid Branch Title", branch: "Invalid Branch Name" };
-    },
-  });
-
-  try {
-    workspaceAutoName.scheduleForWorktree({
-      workspace,
-      firstAgentContext: { prompt: "Fix checkout title" },
+test.each([
+  { branch: "Invalid Branch Name", expectedBranch: "placeholder-branch", manual: false },
+  { branch: "generated-branch", expectedBranch: "generated-branch", manual: true },
+])(
+  "workspace auto-name uses the backing root for a nested worktree with branch $branch",
+  async ({ branch, expectedBranch, manual }) => {
+    vi.useFakeTimers();
+    const tempDir = realpathSync(mkdtempSync(path.join(tmpdir(), "workspace-auto-name-rejected-")));
+    const repoDir = path.join(tempDir, "repo");
+    mkdirSync(repoDir);
+    execFileSync("git", ["init", repoDir], { stdio: "pipe" });
+    execFileSync("git", ["config", "user.email", "test@getpaseo.local"], {
+      cwd: repoDir,
+      stdio: "pipe",
     });
-    await vi.runAllTimersAsync();
-    await vi.waitFor(() => expect(emittedCwds).toEqual([workspaceCwd]));
+    execFileSync("git", ["config", "user.name", "Paseo Test"], { cwd: repoDir, stdio: "pipe" });
+    execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: repoDir, stdio: "pipe" });
+    writeFileSync(path.join(repoDir, "README.md"), "hello\n");
+    execFileSync("git", ["add", "README.md"], { cwd: repoDir, stdio: "pipe" });
+    execFileSync("git", ["commit", "-m", "initial"], { cwd: repoDir, stdio: "pipe" });
+    execFileSync("git", ["branch", "-M", "placeholder-branch"], { cwd: repoDir, stdio: "pipe" });
+    await writePaseoWorktreeMetadata(repoDir, { baseRefName: "main" });
+    await writePaseoWorktreeFirstAgentBranchAutoNameMetadata(repoDir, {
+      placeholderBranchName: "placeholder-branch",
+    });
+    const workspaceCwd = path.join(repoDir, "packages", "app");
+    mkdirSync(workspaceCwd, { recursive: true });
 
-    expect(generateCalls).toBe(1);
-    expect(stored.get(workspace.workspaceId)).toMatchObject({
-      title: "Generated Invalid Branch Title",
+    const workspace = createPersistedWorkspaceRecord({
+      workspaceId: "ws-rejected-branch-title",
+      projectId: "proj-rejected-branch-title",
+      cwd: workspaceCwd,
+      kind: "worktree",
+      displayName: "Fix checkout title",
+      title: "Fix checkout title",
+      titleSource: manual ? "user" : undefined,
       branch: "placeholder-branch",
+      worktreeRoot: repoDir,
+      isPaseoOwnedWorktree: true,
+      createdAt: "2026-03-01T12:00:00.000Z",
+      updatedAt: "2026-03-01T12:00:00.000Z",
     });
-    expect(
-      execFileSync("git", ["branch", "--show-current"], { cwd: repoDir, stdio: "pipe" })
-        .toString()
-        .trim(),
-    ).toBe("placeholder-branch");
-    expect(await readPaseoWorktreeMetadata(repoDir)).toMatchObject({
-      version: 2,
-      firstAgentBranchAutoName: {
-        status: "attempted",
-        placeholderBranchName: "placeholder-branch",
+    const stored = new Map([[workspace.workspaceId, workspace]]);
+    let generateCalls = 0;
+    const gitMutations: string[] = [];
+    const emittedCwds: string[] = [];
+    const workspaceAutoName = new WorkspaceAutoName({
+      agentManager: asAgentManager({}),
+      workspaceRegistry: {
+        update: async (workspaceId, updater) => {
+          const current = stored.get(workspaceId);
+          if (!current) return null;
+          const updated = updater(current);
+          stored.set(workspaceId, updated);
+          return updated;
+        },
+      },
+      workspaceGitService: createNoopWorkspaceGitService(),
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      readDaemonConfig: () => ({ metadataGeneration: { providers: [] } }),
+      gitMutation: {
+        notifyGitMutation: async (_cwd, reason) => {
+          gitMutations.push(reason);
+        },
+      },
+      emitWorkspaceUpdateForCwd: async (cwd) => {
+        emittedCwds.push(cwd);
+      },
+      emitWorkspaceUpdateForWorkspaceId: async () => {},
+      logger: asSessionLogger(createTestLogger()),
+      generateWorkspaceName: async () => {
+        generateCalls += 1;
+        return { title: "Generated title", branch };
       },
     });
-    expect(gitMutations).toEqual([]);
-    expect(emittedCwds).toEqual([workspaceCwd]);
-  } finally {
-    vi.useRealTimers();
-    rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  }
-});
+
+    try {
+      workspaceAutoName.scheduleForWorktree({
+        workspace,
+        firstAgentContext: { prompt: "Fix checkout title" },
+      });
+      await vi.runAllTimersAsync();
+      await vi.waitFor(() => expect(emittedCwds).toEqual([workspaceCwd]));
+
+      expect(generateCalls).toBe(1);
+      expect(stored.get(workspace.workspaceId)).toMatchObject({
+        title: manual ? "Fix checkout title" : "Generated title",
+        branch: expectedBranch,
+      });
+      expect(
+        execFileSync("git", ["branch", "--show-current"], { cwd: repoDir, stdio: "pipe" })
+          .toString()
+          .trim(),
+      ).toBe(expectedBranch);
+      expect(await readPaseoWorktreeMetadata(repoDir)).toMatchObject({
+        version: 2,
+        firstAgentBranchAutoName: {
+          status: "attempted",
+          placeholderBranchName: "placeholder-branch",
+        },
+      });
+      expect(gitMutations).toEqual(manual ? ["rename-branch"] : []);
+      expect(emittedCwds).toEqual([workspaceCwd]);
+    } finally {
+      vi.useRealTimers();
+      rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  },
+);
 
 // Phase 7: branch is a git fact derived per-descriptor from each workspace's own
 // live git snapshot, and reconciliation re-persists `branch` per workspace from
@@ -10049,48 +10063,53 @@ test("checkout.rename_branch.request renames the branch without a denormalized b
   expect(persisted?.title).toBe("Refactor auth flow");
 });
 
-test("workspace.create.response persists the first prompt as the initial title", async () => {
-  const emitted: SessionOutboundMessage[] = [];
-  const workspaces = new Map<string, ReturnType<typeof createPersistedWorkspaceRecord>>();
-  const session = createSessionForWorkspaceTests({
-    onMessage: (message) => emitted.push(message),
-    workspaceRegistry: {
-      initialize: async () => {},
-      existsOnDisk: async () => true,
-      listActive: async function () {
-        return (await this.listAll()).filter((record) => !record.archivedAt);
+test.each([undefined, "Add retries to the payments flow"])(
+  "workspace.create distinguishes an explicit title %s from the first prompt",
+  async (title) => {
+    const emitted: SessionOutboundMessage[] = [];
+    const workspaces = new Map<string, ReturnType<typeof createPersistedWorkspaceRecord>>();
+    const session = createSessionForWorkspaceTests({
+      onMessage: (message) => emitted.push(message),
+      workspaceRegistry: {
+        initialize: async () => {},
+        existsOnDisk: async () => true,
+        listActive: async function () {
+          return (await this.listAll()).filter((record) => !record.archivedAt);
+        },
+        listAll: async () => Array.from(workspaces.values()),
+        get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
+        upsert: async (workspace) => {
+          workspaces.set(workspace.workspaceId, workspace);
+        },
+        archive: async () => {},
+        remove: async () => {},
       },
-      listAll: async () => Array.from(workspaces.values()),
-      get: async (workspaceId: string) => workspaces.get(workspaceId) ?? null,
-      upsert: async (workspace) => {
-        workspaces.set(workspace.workspaceId, workspace);
+    });
+    session.listAgentPayloads = async () => [];
+
+    await session.handleMessage({
+      type: "workspace.create.request",
+      requestId: "req-create-first-prompt",
+      title,
+      source: { kind: "directory", path: REPO_CWD },
+      firstAgentContext: {
+        prompt: "Add retries to the payments flow\nwith exponential backoff",
       },
-      archive: async () => {},
-      remove: async () => {},
-    },
-  });
-  session.listAgentPayloads = async () => [];
+    });
 
-  await session.handleMessage({
-    type: "workspace.create.request",
-    requestId: "req-create-first-prompt",
-    source: { kind: "directory", path: REPO_CWD },
-    firstAgentContext: {
-      prompt: "Add retries to the payments flow\nwith exponential backoff",
-    },
-  });
+    const response = findByType(emitted, "workspace.create.response");
+    expect(response?.payload.error).toBeNull();
+    expect(response?.payload.workspace?.title).toBe("Add retries to the payments flow");
+    expect(response?.payload.workspace?.name).toBe("Add retries to the payments flow");
 
-  const response = findByType(emitted, "workspace.create.response");
-  expect(response?.payload.error).toBeNull();
-  expect(response?.payload.workspace?.title).toBe("Add retries to the payments flow");
-  expect(response?.payload.workspace?.name).toBe("Add retries to the payments flow");
-
-  const workspaceId = response?.payload.workspace?.id;
-  expect(workspaceId).toBeDefined();
-  const persisted = await session.workspaceRegistry.get(workspaceId as string);
-  expect(persisted?.title).toBe("Add retries to the payments flow");
-  expect(filterByType(emitted, "workspace_update")).toHaveLength(1);
-});
+    const workspaceId = response?.payload.workspace?.id;
+    expect(workspaceId).toBeDefined();
+    const persisted = await session.workspaceRegistry.get(workspaceId as string);
+    expect(persisted?.title).toBe("Add retries to the payments flow");
+    expect(persisted?.titleSource).toBe(title ? "user" : undefined);
+    expect(filterByType(emitted, "workspace_update")).toHaveLength(1);
+  },
+);
 
 test("workspace create emits through a matching workspace subscription", async () => {
   const emitted: SessionOutboundMessage[] = [];

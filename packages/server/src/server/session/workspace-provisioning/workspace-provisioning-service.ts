@@ -54,6 +54,7 @@ export interface CreateWorktreeWorkspaceInput {
   baseBranch: string | null;
   worktreeManagerPluginId?: string | null;
   title: string | null;
+  titleSource?: PersistedWorkspaceRecord["titleSource"];
   metadata?: Record<string, JsonValue>;
   expectsInitialAgent?: boolean;
   untrustedSource?: UntrustedWorkspaceSource;
@@ -73,6 +74,7 @@ export interface WorkspaceProvisioningService {
     title?: string | null,
     projectId?: string,
     context?: {
+      titleSource?: PersistedWorkspaceRecord["titleSource"];
       expectsInitialAgent?: boolean;
       workspaceId?: string;
       metadata?: Record<string, JsonValue>;
@@ -267,6 +269,7 @@ export function createWorkspaceProvisioningService(deps: {
     title?: string | null,
     projectId?: string,
     context?: {
+      titleSource?: PersistedWorkspaceRecord["titleSource"];
       expectsInitialAgent?: boolean;
       workspaceId?: string;
       metadata?: Record<string, JsonValue>;
@@ -295,6 +298,7 @@ export function createWorkspaceProvisioningService(deps: {
         baseBranch: baseMetadata?.baseRef ?? baseMetadata?.baseRefName ?? null,
         worktreeManagerPluginId: baseMetadata?.worktreeManagerPluginId ?? null,
         title: title?.trim() || null,
+        titleSource: context?.titleSource,
         metadata: context?.metadata,
         untrustedSource,
         createdAt: timestamp,
@@ -339,6 +343,7 @@ export function createWorkspaceProvisioningService(deps: {
       }),
       worktreeManagerPluginId: input.worktreeManagerPluginId ?? null,
       title: input.title,
+      titleSource: input.titleSource,
       metadata: input.metadata,
       createdAt: timestamp,
       updatedAt: timestamp,
