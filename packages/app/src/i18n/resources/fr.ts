@@ -219,6 +219,7 @@ export const fr: TranslationResources = {
       fileTooLarge: "{{fileName}} est trop volumineux (maximum {{size}})",
     },
     clientCommands: {
+      sideChat: "Ouvrir une conversation parallèle",
       archiveAgent: "Archiver l’agent actuel",
       freshDraft: "Archiver cet agent et démarrer un nouveau brouillon",
     },

@@ -17,7 +17,11 @@ import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-
 import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
 import { pluginDisplayName, usePluginList } from "@/plugins/plugin-list";
 import { resolveProviderLabel } from "@/utils/provider-definitions";
-import { CLIENT_SLASH_COMMANDS, type ClientSlashCommand } from "@/client-slash-commands";
+import {
+  availableClientSlashCommands,
+  resolveClientSlashCommand,
+  type ClientSlashCommand,
+} from "@/client-slash-commands";
 import type { PluginClientSlashCommand } from "@/plugins/client-slash-commands";
 import { mergeSlashCommandSources } from "@/plugins/client-slash-commands/model";
 import {
@@ -43,6 +47,7 @@ interface UseAgentAutocompleteInput {
   onAutocompleteApplied?: () => void;
   onClientSlashCommand?: (command: ClientSlashCommand) => void;
   canExecuteClientSlashCommand?: boolean;
+  allowSideChat?: boolean;
   pluginClientSlashCommands?: readonly PluginClientSlashCommand[];
 }
 
@@ -167,6 +172,7 @@ function mapDirectorySuggestionsToEntries(payload: {
 const CLIENT_COMMAND_ICONS = {
   "archive-agent": "archive",
   "replace-agent-with-draft": "new-draft",
+  "side-chat": "new-draft",
 } as const satisfies Record<ClientSlashCommand["kind"], AutocompleteOption["icon"]>;
 
 interface CommandOptionContext {
@@ -228,6 +234,7 @@ interface BuildAutocompleteOptionsInput {
   pluginCommands: readonly PluginClientSlashCommand[];
   pluginNames: ReadonlyMap<string, string>;
   isDraftContext: boolean;
+  allowSideChat?: boolean;
   commandFilterQuery: string;
   activeSlashCommand: SlashCommandRange | null;
   activeFileMention: FileMentionRange | null;
@@ -242,7 +249,11 @@ function buildAutocompleteOptions(input: BuildAutocompleteOptionsInput): AgentAu
       command,
     }));
     const rootCommands: AvailableCommand[] = mergeSlashCommandSources({
-      builtIn: CLIENT_SLASH_COMMANDS,
+      builtIn: availableClientSlashCommands({
+        allowSideChat: input.allowSideChat && !input.isDraftContext,
+        providerCommands: input.commands,
+        pluginCommands: input.pluginCommands,
+      }),
       plugins: input.pluginCommands,
       provider: input.commands,
       onPluginCollision(command, winner) {
@@ -500,6 +511,7 @@ export function useAgentAutocomplete(input: UseAgentAutocompleteInput): AgentAut
     onAutocompleteApplied,
     onClientSlashCommand,
     canExecuteClientSlashCommand,
+    allowSideChat,
     pluginClientSlashCommands = [],
   } = input;
 
@@ -639,6 +651,7 @@ export function useAgentAutocomplete(input: UseAgentAutocompleteInput): AgentAut
         activeSlashCommand,
         fileSuggestions: fileSuggestionsQuery.data ?? [],
         isDraftContext,
+        allowSideChat,
         mode,
         t,
       });
@@ -663,6 +676,7 @@ export function useAgentAutocomplete(input: UseAgentAutocompleteInput): AgentAut
   }, [
     activeFileMention,
     activeSlashCommand,
+    allowSideChat,
     commandFilterQuery,
     commandsEmptyText,
     commandsQuery.commands,
@@ -703,7 +717,14 @@ export function useAgentAutocomplete(input: UseAgentAutocompleteInput): AgentAut
         canExecuteClientSlashCommand &&
         onClientSlashCommand
       ) {
-        onClientSlashCommand(selected.command);
+        const command = resolveSelectedClientCommand({
+          selected,
+          current,
+          allowSideChat: allowSideChat && !isDraftContext,
+          providerCommands: commandsQuery.commands,
+          pluginCommands: pluginClientSlashCommands,
+        });
+        if (command) onClientSlashCommand(command);
         return;
       }
 
@@ -735,6 +756,10 @@ export function useAgentAutocomplete(input: UseAgentAutocompleteInput): AgentAut
     },
     [
       canExecuteClientSlashCommand,
+      allowSideChat,
+      commandsQuery.commands,
+      isDraftContext,
+      pluginClientSlashCommands,
       onAutocompleteApplied,
       onClientSlashCommand,
       setUserInput,
@@ -770,4 +795,28 @@ export function useAgentAutocomplete(input: UseAgentAutocompleteInput): AgentAut
     onSelectOption,
     onKeyPress,
   };
+}
+
+function resolveSelectedClientCommand(input: {
+  selected: Extract<AgentAutocompleteOption, { type: "client_command" }>;
+  current: AgentAutocompleteSnapshot;
+  allowSideChat?: boolean;
+  providerCommands: AgentSlashCommand[];
+  pluginCommands: readonly PluginClientSlashCommand[];
+}): ClientSlashCommand | null {
+  const { selected, current, allowSideChat, providerCommands, pluginCommands } = input;
+  if (selected.command.kind !== "side-chat") return selected.command;
+  if (!current.slashCommand) return null;
+  const command = resolveClientSlashCommand({
+    text: applySlashCommandReplacement({
+      text: current.text,
+      command: current.slashCommand,
+      commandName: selected.id,
+    }),
+    allowSideChat,
+    hasAttachments: false,
+    providerCommands,
+    pluginCommands,
+  });
+  return command?.kind === "side-chat" ? command : null;
 }

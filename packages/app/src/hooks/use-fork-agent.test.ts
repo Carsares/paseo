@@ -26,7 +26,9 @@ import { normalizeWorkspaceDraftTabSetup } from "@/workspace-tabs/identity";
 import { buildNewAgentTabTarget } from "@/workspace-tabs/new-tab";
 import { openPreferredWorkspaceTarget } from "@/workspace-tabs/open-beside";
 import {
+  appendSideChatReplyToDraft,
   buildMainSubagentTabDraftSetup,
+  buildSideChatDraftSetup,
   buildSubagentDraftSetup,
   type ForkAgentRequest,
   prepareForkDraft,
@@ -225,6 +227,51 @@ describe("seamless timeline forks", () => {
     thinkingOptionId: "high",
     providerOptions: { approval_policy: "on-request" },
   };
+
+  it("freezes the displayed timeline boundary and puts the question in draft text", () => {
+    const timeline = {
+      status: "synced",
+      items: [],
+      range: { epoch: "timeline", startSeq: 1, endSeq: 9 },
+      older: "none",
+      newer: "none",
+    } as const;
+    const liveCursor = { epoch: "timeline", seq: 10 };
+    const setup = buildSideChatDraftSetup({
+      agentId: "main",
+      agent: subagent,
+      timeline: { ...timeline, items: [] },
+      liveItems: [
+        {
+          kind: "assistant_message",
+          id: "visible",
+          timestamp: new Date(),
+          text: "Visible answer",
+          timelineCursor: liveCursor,
+        },
+      ],
+      text: "why?  \n",
+    });
+    expect(setup).toMatchObject({
+      sideChatFromAgentId: "main",
+      forkFrom: { sourceAgentId: "main", boundaryCursor: { epoch: "timeline", seq: 10 } },
+      initialDraftText: "why?  \n",
+    });
+    expect(setup).not.toHaveProperty("parentAgentId");
+    expect(
+      buildSideChatDraftSetup({ agentId: "main", agent: subagent, timeline: { status: "cold" } }),
+    ).toBeUndefined();
+    expect(
+      buildSideChatDraftSetup({
+        agentId: "main",
+        agent: subagent,
+        timeline: { ...timeline, items: [], range: null },
+      }),
+    ).toMatchObject({
+      sideChatFromAgentId: "main",
+      forkFrom: { sourceAgentId: "main", boundaryCursor: { epoch: "", seq: 0 } },
+    });
+  });
 
   async function fork(
     input: ForkAgentRequest,
@@ -458,6 +505,39 @@ describe("fork draft attachments", () => {
   const getDraftKey = (draftId: string) => `draft:${serverId}:${draftId}`;
   const getQuoteDraft = (draftId: string) =>
     useDraftStore.getState().getDraftInput(getDraftKey(draftId));
+
+  it("appends the side reply to the original draft while keeping its text and other quotes", async () => {
+    const draftKey = draftKeys.buildDraftStoreKey({ serverId, agentId: "side-chat-main" });
+    await useDraftStore.getState().hydrateDraftInput({ draftKey });
+    const existing = { kind: "quote", id: "existing", text: "Keep my quote" } as const;
+    const text = "Keep my draft  \n";
+    useDraftStore.getState().saveDraftInput({ draftKey, draft: { text, attachments: [existing] } });
+    await expect(
+      appendSideChatReplyToDraft({
+        draftKey,
+        text: "Side answer",
+        canQuote: () => true,
+      }),
+    ).resolves.toBe(true);
+    await expect(
+      appendSideChatReplyToDraft({
+        draftKey,
+        text: "Unavailable source",
+        canQuote: () => false,
+      }),
+    ).resolves.toBe(false);
+    expect(useDraftStore.getState().getDraftInput(draftKey)).toEqual({
+      text,
+      attachments: [
+        existing,
+        {
+          kind: "quote",
+          id: expect.any(String),
+          text: "Side answer",
+        },
+      ],
+    });
+  });
 
   it.each([
     {

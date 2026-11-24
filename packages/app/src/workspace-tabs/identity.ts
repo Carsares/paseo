@@ -94,6 +94,9 @@ export function normalizeWorkspaceDraftTabSetup(
       ? record.initialDraftText
       : null;
   const forkFrom = AgentForkSourceSchema.safeParse(record.forkFrom).data;
+  const sideChatFromAgentId = trimNonEmpty(
+    typeof record.sideChatFromAgentId === "string" ? record.sideChatFromAgentId : null,
+  );
   return {
     provider,
     cwd,
@@ -105,6 +108,7 @@ export function normalizeWorkspaceDraftTabSetup(
     providerOptions: isPlainRecord(record.providerOptions) ? { ...record.providerOptions } : {},
     ...(parentAgentId ? { parentAgentId } : {}),
     ...(initialDraftText ? { initialDraftText } : {}),
+    ...(sideChatFromAgentId ? { sideChatFromAgentId } : {}),
     ...(forkFrom
       ? { forkFrom, restoreChatHistory: false }
       : { restoreChatHistory: record.restoreChatHistory === true }),
@@ -188,6 +192,7 @@ function workspaceDraftTabSetupsEqual(
     left.thinkingOptionId === right.thinkingOptionId &&
     (left.parentAgentId ?? null) === (right.parentAgentId ?? null) &&
     (left.initialDraftText ?? null) === (right.initialDraftText ?? null) &&
+    left.sideChatFromAgentId === right.sideChatFromAgentId &&
     (left.restoreChatHistory ?? false) === (right.restoreChatHistory ?? false) &&
     forkSourcesEqual(left.forkFrom, right.forkFrom) &&
     recordsShallowEqual(left.providerOptions, right.providerOptions)

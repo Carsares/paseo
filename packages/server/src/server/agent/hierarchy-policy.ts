@@ -4,6 +4,7 @@ import {
   getParentAddressFromLabels,
   getParentAgentIdFromLabels,
   isMainControlAgentLabels,
+  isSideChatAgentLabels,
   isExplicitParentReportingLabels,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
@@ -14,6 +15,8 @@ import {
   RESIDENT_KEEPALIVE_LABEL,
   RESIDENT_ROLE_LABEL,
   RESIDENT_SLUG_LABEL,
+  SIDE_CHAT_LABEL,
+  SIDE_OF_AGENT_ID_LABEL,
   resolveAgentHierarchyDepth,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
@@ -62,6 +65,8 @@ export const RESERVED_HIERARCHY_LABELS = [
   WORKSPACE_ROLE_LABEL,
   MAIN_PRIOR_MODE_ID_LABEL,
   REMOTE_HIERARCHY_DEPTH_LABEL,
+  SIDE_CHAT_LABEL,
+  SIDE_OF_AGENT_ID_LABEL,
   ...RESERVED_RESIDENT_LABELS,
 ] as const;
 
@@ -170,6 +175,9 @@ export function computeMaxSubtreeDepth(
 
 export function validateCanSpawnChild(parentAgent: HierarchyAgent, readAgent: ReadAgent): void {
   if (parentAgent.archivedAt) throw new Error("Archived agents cannot spawn subagents.");
+  if (isSideChatAgentLabels(parentAgent.labels)) {
+    throw new Error("Side chats cannot spawn subagents.");
+  }
   if (computeAgentDepth(parentAgent.id, readAgent) >= MAX_SUBAGENT_DEPTH) {
     throw new Error(
       "Level-2 subagents cannot spawn nested subagents (maximum hierarchy depth is 3 tiers: Main -> Level-1 -> Level-2).",
@@ -193,6 +201,9 @@ export function validateSetAgentParent({
   if (agent.id === parentAgent.id) throw new Error("An agent cannot be its own parent.");
   if (agent.archivedAt || parentAgent.archivedAt) {
     throw new Error("Cannot reparent an archived agent or attach to an archived parent.");
+  }
+  if (isSideChatAgentLabels(agent.labels) || isSideChatAgentLabels(parentAgent.labels)) {
+    throw new Error("Side chats cannot join the agent hierarchy.");
   }
   if (isMainControlAgentLabels(agent.labels)) {
     throw new Error("Disable Main Control before attaching this agent to a parent.");

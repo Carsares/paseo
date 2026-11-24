@@ -218,6 +218,7 @@ export const ru: TranslationResources = {
       fileTooLarge: "Файл {{fileName}} слишком большой (максимальный размер: {{size}})",
     },
     clientCommands: {
+      sideChat: "Начать боковой чат",
       archiveAgent: "Архивировать текущего агента",
       freshDraft: "Архивировать этого агента и создать новый черновик",
     },

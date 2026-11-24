@@ -145,6 +145,7 @@ import {
   isExplicitParentReportingLabels,
   isMainControlAgentLabels,
   isOpenAgentTabLabel,
+  isSideChatAgent,
   AGENT_PROFILE_ID_MAX_LENGTH,
   RESIDENT_ROLE_MAX_LENGTH,
 } from "@getpaseo/protocol/agent-labels";
@@ -1911,8 +1912,14 @@ function createToolCatalog(
       const { summaryText, entries } = await summarizeWorkspaceAgents({
         workspaceId,
         includeArchived,
-        agentManager,
-        agentStorage,
+        agentManager: {
+          listAgents: (filters) => agentManager.listAgents(filters).filter(isToolVisibleAgent),
+          readTimelineForSummary: agentManager.readTimelineForSummary.bind(agentManager),
+        },
+        agentStorage: {
+          listByWorkspaces: async (...args) =>
+            (await agentStorage.listByWorkspaces(...args)).filter(isToolVisibleAgent),
+        },
         workspaceRegistry: options.workspaceRegistry,
         logger: childLogger,
       });
@@ -2679,6 +2686,10 @@ function createToolCatalog(
     );
   }
 
+  function isToolVisibleAgent(agent: { labels?: Record<string, string> }): boolean {
+    return !isSideChatAgent(agent);
+  }
+
   registerTool(
     "get_agent_status",
     {
@@ -2696,6 +2707,8 @@ function createToolCatalog(
     async ({ agentId }) => {
       const snapshot = agentManager.getAgent(agentId);
       if (snapshot) {
+        if (!isToolVisibleAgent(snapshot))
+          throw new PaseoToolInputError(`Agent ${agentId} not found`);
         const structuredSnapshot = await projectLiveAgent(snapshot);
         return {
           content: [],
@@ -2707,7 +2720,7 @@ function createToolCatalog(
       }
 
       const record = await agentStorage.get(agentId);
-      if (!record || record.internal) {
+      if (!record || record.internal || !isToolVisibleAgent(record)) {
         throw new PaseoToolInputError(`Agent ${agentId} not found`);
       }
 
@@ -2770,7 +2783,7 @@ function createToolCatalog(
           ),
       });
       const agents = selectAgentListItems(
-        await directory.list({ includeBackground, includeArchived }),
+        (await directory.list({ includeBackground, includeArchived })).filter(isToolVisibleAgent),
         { cwd: requestedCwd, statuses, sinceHours, limit },
       );
 
@@ -3889,14 +3902,17 @@ function createToolCatalog(
       },
     },
     async () => {
-      const permissions = agentManager.listAgents().flatMap((agent) => {
-        const payload = toAgentPayload(agent);
-        return payload.pendingPermissions.map((request) => ({
-          agentId: agent.id,
-          status: payload.status,
-          request: sanitizePermissionRequest(request),
-        }));
-      });
+      const permissions = agentManager
+        .listAgents()
+        .filter(isToolVisibleAgent)
+        .flatMap((agent) => {
+          const payload = toAgentPayload(agent);
+          return payload.pendingPermissions.map((request) => ({
+            agentId: agent.id,
+            status: payload.status,
+            request: sanitizePermissionRequest(request),
+          }));
+        });
 
       return {
         content: [],

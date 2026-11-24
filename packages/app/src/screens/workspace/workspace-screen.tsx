@@ -3,7 +3,7 @@ import {
   type WorkspaceCompactHeaderTabs,
 } from "./adaptive-workspace-chrome";
 import { planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
-import { useHostFeature } from "@/runtime/host-features";
+import { selectHostFeature, useHostFeature } from "@/runtime/host-features";
 import {
   AssistantFileLinkResolverProvider,
   createInlinePathOpener,
@@ -89,6 +89,7 @@ import { openWorkspacePullRequest } from "@/workspace-tabs/open-supporting-view"
 import { traceInstant } from "@/performance/native-trace";
 import {
   useSessionStore,
+  type Agent,
   type SessionState,
   type WorkspaceDescriptor,
 } from "@/stores/session-store";
@@ -154,6 +155,7 @@ import { generateDraftId } from "@/stores/draft-keys";
 import { resolveWorkspaceRouteId } from "@/utils/workspace-identity";
 import { clearSubagentOpenTabLabel } from "@/subagents/open-tab-labels";
 import { ResidentDialogProvider } from "@/subagents/resident-dialog";
+import { getSideChatOpenTabLabel } from "@/subagents/open-tab-labels";
 import { useOpenAgentTabLabels } from "@/subagents/use-open-agent-tab-labels";
 import {
   canAdoptTabUnderMainAgent,
@@ -225,7 +227,11 @@ import {
   classifyBulkClosableTabs,
   closeBulkWorkspaceTabs,
 } from "@/screens/workspace/workspace-bulk-close";
-import { resolveCloseAgentTabPolicy } from "@/subagents";
+import {
+  discardSideChatIfEmpty,
+  isSideChat,
+  resolveCloseAgentTabPolicy,
+} from "@/subagents/close-tab-policy";
 import {
   getPanelInstanceAttributes,
   useModifiedPanelTabIds,
@@ -1205,14 +1211,32 @@ function WorkspaceScreenContent({
     ),
   });
 
-  const selectWorkspaceAgentVisibility = useMemo(
-    () =>
-      createWorkspaceAgentVisibilitySelector({
-        serverId: normalizedServerId,
-        workspaceId: normalizedWorkspaceId,
-      }),
-    [normalizedServerId, normalizedWorkspaceId],
-  );
+  const selectWorkspaceAgentVisibility = useMemo(() => {
+    const select = createWorkspaceAgentVisibilitySelector({
+      serverId: normalizedServerId,
+      workspaceId: normalizedWorkspaceId,
+    });
+    let previousAgents: ReadonlyMap<string, Agent> | undefined;
+    let previousVisibility: ReturnType<typeof select> | undefined;
+    let previousResult: ReturnType<typeof select> | undefined;
+    return (state: ReturnType<typeof useSessionStore.getState>) => {
+      const visibility = select(state);
+      const agents = state.sessions[normalizedServerId]?.agents;
+      if (previousResult && previousVisibility === visibility && previousAgents === agents) {
+        return previousResult;
+      }
+      const autoOpenAgentIds = [...visibility.autoOpenAgentIds].filter(
+        (id) => !isSideChat(agents?.get(id)),
+      );
+      previousAgents = agents;
+      previousVisibility = visibility;
+      previousResult =
+        autoOpenAgentIds.length === visibility.autoOpenAgentIds.size
+          ? visibility
+          : { ...visibility, autoOpenAgentIds: new Set(autoOpenAgentIds) };
+      return previousResult;
+    };
+  }, [normalizedServerId, normalizedWorkspaceId]);
   const workspaceAgentVisibility = useStoreWithEqualityFn(
     useSessionStore,
     selectWorkspaceAgentVisibility,
@@ -2086,6 +2110,36 @@ function WorkspaceScreenContent({
     [hierarchyLabels, normalizedWorkspaceId, t],
   );
 
+  const discardEmptySideChat = useCallback(
+    async (agentId: string) => {
+      const state = useSessionStore.getState();
+      const session = state.sessions[normalizedServerId];
+      const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+      if (!agent || !isSideChat(agent) || agent.workspaceId !== normalizedWorkspaceId) return;
+      if (
+        persistenceKey &&
+        useWorkspaceLayoutStore
+          .getState()
+          .getWorkspaceTabs(persistenceKey)
+          .some((tab) => tab.target.kind === "agent" && tab.target.agentId === agentId)
+      )
+        return;
+      const sessionClient = session?.client;
+      if (sessionClient) {
+        await sessionClient.updateAgent(agentId, {
+          labels: { [getSideChatOpenTabLabel()]: "false" },
+          expectedWorkspaceId: normalizedWorkspaceId,
+        });
+      }
+      await discardSideChatIfEmpty({
+        agent,
+        client: session?.client ?? null,
+        supportsSideChat: selectHostFeature(state, normalizedServerId, "agentSideChat"),
+      });
+    },
+    [normalizedServerId, normalizedWorkspaceId, persistenceKey],
+  );
+
   const handleCloseAgentTab = useCallback(
     async (input: { tabId: string; agentId: string }) => {
       const { tabId, agentId } = input;
@@ -2095,8 +2149,10 @@ function WorkspaceScreenContent({
         }
 
         const session = useSessionStore.getState().sessions[normalizedServerId];
-        const agent = session?.agents.get(agentId) ?? null;
-        let shouldArchive = resolveCloseAgentTabPolicy(agent).kind === "archive-on-close";
+        const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+        // A restored tab can outlive its snapshot. Closing it cannot authorize an archive.
+        const closeKind = agent ? resolveCloseAgentTabPolicy(agent).kind : null;
+        let shouldArchive = closeKind === "archive-on-close";
         if (shouldArchive) {
           const confirmation = confirmArchiveAgentTab(session, agentId);
           if (confirmation !== true && !(await confirmation)) {
@@ -2104,7 +2160,7 @@ function WorkspaceScreenContent({
           }
         }
 
-        if (!shouldArchive) {
+        if (closeKind === "layout-only") {
           const sessionClient = useSessionStore.getState().sessions[normalizedServerId]?.client;
           if (!sessionClient) {
             toast.error(t("common.errors.daemonClientUnavailable"));
@@ -2132,6 +2188,13 @@ function WorkspaceScreenContent({
           });
         }
 
+        if (closeKind === "side-chat") {
+          try {
+            await discardEmptySideChat(agentId);
+          } catch (error) {
+            console.warn("[WorkspaceScreen] Failed to discard empty side chat", { error, agentId });
+          }
+        }
         if (!shouldArchive) {
           return;
         }
@@ -2149,6 +2212,7 @@ function WorkspaceScreenContent({
       closeTab,
       closeWorkspaceTabWithCleanup,
       confirmArchiveAgentTab,
+      discardEmptySideChat,
       normalizedServerId,
       normalizedWorkspaceId,
       persistenceKey,
@@ -2168,7 +2232,8 @@ function WorkspaceScreenContent({
         }
         if (
           session.serverInfo?.features?.agentHierarchyControl !== true ||
-          !isWorkspaceRootAgent(agent, normalizedWorkspaceId)
+          !isWorkspaceRootAgent(agent, normalizedWorkspaceId) ||
+          isSideChat(agent)
         ) {
           toast.error(hierarchyLabels.updateFailed);
           return;
@@ -2223,7 +2288,11 @@ function WorkspaceScreenContent({
       actionsForTab: (tab) => {
         if (!supportsHierarchyControl || tab.target.kind !== "agent") return;
         const { agentId } = tab.target;
-        if (!hierarchyTabState.rootAgentIds.has(agentId)) return;
+        if (
+          !hierarchyTabState.rootAgentIds.has(agentId) ||
+          isSideChat(useSessionStore.getState().sessions[normalizedServerId]?.agents.get(agentId))
+        )
+          return;
         return {
           isMain: agentId === mainAgentId,
           pending: closingTabIds.has(tab.tabId),
@@ -2238,7 +2307,14 @@ function WorkspaceScreenContent({
         };
       },
     }),
-    [closingTabIds, handleMainTabAction, hierarchyTabState, mainAgentId, supportsHierarchyControl],
+    [
+      closingTabIds,
+      handleMainTabAction,
+      hierarchyTabState,
+      mainAgentId,
+      normalizedServerId,
+      supportsHierarchyControl,
+    ],
   );
 
   const handleClosePassiveTab = useCallback(
@@ -2475,8 +2551,10 @@ function WorkspaceScreenContent({
 
       const session = useSessionStore.getState().sessions[normalizedServerId];
       const groups = classifyBulkClosableTabs(tabsToClose, (agentId) => {
-        const agent = session?.agents?.get(agentId);
-        return resolveCloseAgentTabPolicy(agent).kind === "layout-only" ? "layout-only" : "archive";
+        const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+        if (!agent) return "layout-only";
+        const policy = resolveCloseAgentTabPolicy(agent).kind;
+        return policy === "archive-on-close" ? "archive" : policy;
       });
       const hasMainWithDescendants =
         session !== undefined &&
@@ -2521,7 +2599,11 @@ function WorkspaceScreenContent({
         groups,
         workspaceId: normalizedWorkspaceId,
         closeTab,
+        closeSideChat: discardEmptySideChat,
         closeLayoutOnlyAgent: async (agentId) => {
+          const current = useSessionStore.getState().sessions[normalizedServerId];
+          const agent = current?.agents.get(agentId) ?? current?.agentDetails.get(agentId);
+          if (!agent || resolveCloseAgentTabPolicy(agent).kind !== "layout-only") return;
           if (!client) {
             throw new Error(t("common.errors.daemonClientUnavailable"));
           }
@@ -2558,6 +2640,7 @@ function WorkspaceScreenContent({
     [
       archiveAgent,
       bulkCloseConfirmationLabels,
+      discardEmptySideChat,
       client,
       closeTab,
       closeWorkspaceTabWithCleanup,

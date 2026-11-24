@@ -14,6 +14,7 @@ export interface WorkspaceDraftTabSetup {
   initialDraftText?: string | null;
   restoreChatHistory?: boolean;
   forkFrom?: AgentForkSource;
+  sideChatFromAgentId?: string;
 }
 
 export interface WorkspaceWorkingDiffTabTarget {

@@ -129,6 +129,9 @@ import {
   getParentAgentIdFromLabels,
   isExplicitParentReportingLabels,
   isMainControlAgentLabels,
+  isSideChatAgentLabels,
+  SIDE_CHAT_LABEL,
+  SIDE_OF_AGENT_ID_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import { applyRecordPatch } from "./record-patch.js";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
@@ -189,6 +192,7 @@ import { buildStoredAgentPayload, toAgentPayload } from "./agent/agent-projectio
 import {
   hasReservedHierarchyLabels,
   REMOTE_HIERARCHY_DEPTH_LABEL,
+  RESERVED_HIERARCHY_LABELS,
 } from "./agent/hierarchy-policy.js";
 import {
   assertPluginTimelineDataSize,
@@ -542,6 +546,18 @@ function isUserAgentCreation(request: CreateAgentRequestMessage): boolean {
     request.initialPromptOrigin === "user" ||
     (request.initialPromptOrigin === undefined && request.forkFrom !== undefined)
   );
+}
+
+function sessionAgentInitialPromptSource(request: CreateAgentRequestMessage) {
+  const { callerAgentId } = request;
+  if (callerAgentId === undefined) return {};
+  return {
+    callerAgentId,
+    source:
+      callerAgentId && !isUserAgentCreation(request)
+        ? { kind: "agent-message" as const, agentId: callerAgentId }
+        : undefined,
+  };
 }
 
 interface ResolvedSessionCreateAgentIntent {
@@ -2854,7 +2870,11 @@ export class Session {
                 requestId,
                 requestType: msg.type,
                 error: `Request failed: ${err.message}`,
-                code: "handler_error",
+                code:
+                  (msg.type === "delete_agent_request" || msg.type === "archive_agent_request") &&
+                  err instanceof SessionRequestError
+                    ? err.code
+                    : "handler_error",
               },
             });
           } catch (emitError) {
@@ -3683,9 +3703,14 @@ export class Session {
       case "fetch_agent_request":
         return this.handleFetchAgent(msg.agentId, msg.requestId);
       case "delete_agent_request":
-        return this.handleDeleteAgentRequest(msg.agentId, msg.requestId);
+        return this.handleDeleteAgentRequest(msg.agentId, msg.requestId, msg.onlyIfEmptySideChat);
       case "archive_agent_request":
-        return this.handleArchiveAgentRequest(msg.agentId, msg.requestId, msg.expectedWorkspaceId);
+        return this.handleArchiveAgentRequest(
+          msg.agentId,
+          msg.requestId,
+          msg.expectedWorkspaceId,
+          msg.explicitSideChatArchive,
+        );
       case "close_items_request":
         return this.handleCloseItemsRequest(msg);
       case "update_agent_request":
@@ -4235,14 +4260,31 @@ export class Session {
     }
   }
 
-  private async handleDeleteAgentRequest(agentId: string, requestId: string): Promise<void> {
+  private async handleDeleteAgentRequest(
+    agentId: string,
+    requestId: string,
+    onlyIfEmptySideChat?: true,
+  ): Promise<void> {
     this.sessionLogger.info({ agentId }, `Deleting agent ${agentId} from registry`);
 
     const knownAgent =
       this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
 
-    // File-backed storage still needs an early delete fence before closeAgent().
-    beginAgentDeleteIfSupported(this.agentStorage, agentId);
+    if (onlyIfEmptySideChat || isSideChatAgentLabels(knownAgent?.labels)) {
+      if (
+        !(await this.agentStorage.beginEmptySideChatDelete(
+          agentId,
+          () =>
+            !!this.agentManager.getAgent(agentId)?.lastUserMessageAt ||
+            this.agentManager.hasInFlightRun(agentId),
+        ))
+      ) {
+        throw new SessionRequestError("side_chat_not_empty", "This side chat cannot be discarded.");
+      }
+    } else {
+      // Fence late snapshot writes before closing the provider runtime.
+      beginAgentDeleteIfSupported(this.agentStorage, agentId);
+    }
 
     try {
       await closeAgentCommand({ agentManager: this.agentManager }, agentId);
@@ -4279,10 +4321,15 @@ export class Session {
     agentId: string,
     requestId: string,
     expectedWorkspaceId?: string,
+    explicitSideChatArchive?: true,
   ): Promise<void> {
     this.sessionLogger.info({ agentId }, `Archiving agent ${agentId}`);
 
-    const { archivedAt } = await this.archiveAgentForClose(agentId, expectedWorkspaceId);
+    const { archivedAt } = await this.archiveAgentForClose(
+      agentId,
+      expectedWorkspaceId,
+      explicitSideChatArchive,
+    );
 
     this.emit({
       type: "agent_archived",
@@ -4297,7 +4344,15 @@ export class Session {
   private async archiveAgentForClose(
     agentId: string,
     expectedWorkspaceId?: string,
+    explicitSideChatArchive?: true,
   ): Promise<{ agentId: string; archivedAt: string }> {
+    // COMPAT(agentSideChat): older apps used the same archive RPC to close a root tab.
+    if (!explicitSideChatArchive) {
+      const agent = this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
+      if (isSideChatAgentLabels(agent?.labels)) {
+        throw new SessionRequestError("invalid_request", "Side chats require an explicit archive.");
+      }
+    }
     const { archivedAt, record: archivedRecord } = await archiveAgentCommand(
       {
         agentManager: this.agentManager,
@@ -4417,6 +4472,13 @@ export class Session {
     let failure: string | null = null;
     let archivedSource: boolean | undefined;
     try {
+      if (enabled) {
+        const current =
+          this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
+        if (isSideChatAgentLabels(current?.labels)) {
+          throw new Error("Side chats cannot become Main Control.");
+        }
+      }
       const result = await this.agentManager.setAgentMainControl(agentId, enabled, {
         handoffFromAgentId: request.handoffFromAgentId,
         archiveSource: request.archiveSource,
@@ -5700,6 +5762,7 @@ export class Session {
     const prompt = buildAgentPrompt(promptText, images, attachments);
 
     try {
+      await this.acceptSideChatPrompt(agentId, prompt);
       await this.sendHumanPrompt({
         agentId,
         prompt,
@@ -5717,6 +5780,16 @@ export class Session {
         error: error instanceof Error ? error.message : String(error),
       };
     }
+  }
+
+  private async acceptSideChatPrompt(
+    agentId: string,
+    prompt: ReturnType<typeof buildAgentPrompt>,
+  ): Promise<void> {
+    const agent = this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
+    if (!isSideChatAgentLabels(agent?.labels)) return;
+    if (!prompt.length) throw new Error("A side chat prompt cannot be empty.");
+    await this.agentStorage.acceptSideChatPrompt(agentId);
   }
 
   private async sendHumanPrompt(
@@ -5838,7 +5911,9 @@ export class Session {
     observer?: (snapshot: CreationSnapshot) => void,
   ): Promise<CreationSnapshot> {
     const { workspaceRole } = request;
-    if (workspaceRole === "main") {
+    if (request.sideChatFromAgentId !== undefined) {
+      await this.preflightSideChat({ ...request, type: "create_agent_request" }, workspaceRole);
+    } else if (workspaceRole === "main") {
       this.assertExplicitMainCreationAllowed(request, !request.workspaceId || !!request.worktree);
     }
     await this.preflightAgentWorkspace(request);
@@ -6148,6 +6223,43 @@ export class Session {
     onAgentReady?: (agent: AgentSnapshotPayload) => Promise<void>,
     options?: { notifyParentOnInitialPrompt?: boolean; workspaceRole?: "main" },
   ): Promise<CreatedAgent> {
+    const sideChat = msg.sideChatFromAgentId !== undefined;
+    if (sideChat) await this.preflightSideChat(msg, options?.workspaceRole);
+    const callerAgent = await this.preflightAgentWorkspace(msg);
+    const forkedTimelineRows = await this.readForkedTimeline(msg.forkFrom, sideChat);
+    const prepared = { callerAgent, forkedTimelineRows };
+    if (!sideChat || !hasInitialCreationPrompt(msg)) {
+      return this.registerSessionAgent(msg, prepared, agentId, onAgentReady, options);
+    }
+    const id = agentId ?? uuidv4();
+    const release = this.agentStorage.reserveSideChatInitialPrompt(id);
+    try {
+      return await this.registerSessionAgent(
+        msg,
+        prepared,
+        id,
+        async (agent) => {
+          await this.agentStorage.acceptSideChatPrompt(agent.id);
+          await onAgentReady?.(agent);
+        },
+        options,
+      );
+    } finally {
+      release();
+    }
+  }
+
+  private async registerSessionAgent(
+    msg: CreateAgentRequestMessage,
+    prepared: {
+      callerAgent: Awaited<ReturnType<Session["preflightAgentWorkspace"]>>;
+      forkedTimelineRows: Awaited<ReturnType<Session["readForkedTimeline"]>>;
+    },
+    agentId?: string,
+    onAgentReady?: (agent: AgentSnapshotPayload) => Promise<void>,
+    options?: { notifyParentOnInitialPrompt?: boolean; workspaceRole?: "main" },
+  ): Promise<CreatedAgent> {
+    const { callerAgent, forkedTimelineRows } = prepared;
     const {
       config,
       worktreeName,
@@ -6171,8 +6283,6 @@ export class Session {
     let createdAgentId: string | null = null;
     let releaseWorkspace: (() => void) | undefined;
     try {
-      const callerAgent = await this.preflightAgentWorkspace(msg);
-      const forkedTimelineRows = await this.readForkedTimeline(msg.forkFrom);
       await this.validateRequestedAgentDirectory(msg);
       this.validatePublicAgentWorkspaceIntent(msg);
       const trimmedPrompt = initialPrompt?.trim();
@@ -6205,7 +6315,6 @@ export class Session {
         releaseWorkspace = this.reserveWorkspaceMove(workspaceId);
         await this.requireMoveSourceWorkspace(workspaceId);
       }
-      const userCreation = isUserAgentCreation(msg);
       const { snapshot, liveSnapshot, initialPromptStarted } = await createAgentCommand(
         {
           serverId: this.serverId,
@@ -6220,7 +6329,7 @@ export class Session {
         },
         {
           kind: "session",
-          callerAgentId: msg.callerAgentId,
+          ...sessionAgentInitialPromptSource(msg),
           notifyParentOnInitialPrompt: options?.notifyParentOnInitialPrompt,
           onAgentReady: async (agent) => {
             createdAgentId = agent.id;
@@ -6239,10 +6348,6 @@ export class Session {
           background: resolvedIntent.background,
           initialPrompt,
           forkedTimelineRows,
-          source:
-            msg.callerAgentId && !userCreation
-              ? { kind: "agent-message", agentId: msg.callerAgentId }
-              : undefined,
           clientMessageId,
           outputSchema,
           images,
@@ -6338,11 +6443,17 @@ export class Session {
     const { request, callerAgent, createdWorktree } = input;
 
     let config = request.config;
+    const sideChatFromAgentId = request.sideChatFromAgentId;
+    const labels = { ...request.labels };
+    if (sideChatFromAgentId !== undefined) {
+      for (const label of RESERVED_HIERARCHY_LABELS) delete labels[label];
+      delete labels[REMOTE_CHILD_RESERVATION_LABEL];
+    }
 
     const intent = await resolveCreateAgentIntent({
       explicitWorkspaceId: createdWorktree?.workspace.workspaceId ?? request.workspaceId,
       caller: callerAgent,
-      labels: request.labels,
+      labels,
       serverId: this.serverId,
       resolveWorkspace: async (workspaceId) => {
         if (createdWorktree?.workspace.workspaceId === workspaceId) {
@@ -6352,6 +6463,7 @@ export class Session {
         if (!workspace || workspace.archivedAt) {
           throw new Error(`Workspace ${workspaceId} not found`);
         }
+        if (sideChatFromAgentId !== undefined) return { workspaceId, cwd: config.cwd };
         return {
           workspaceId,
           cwd: callerAgent?.workspaceId === workspaceId ? callerAgent.cwd : workspace.cwd,
@@ -6367,7 +6479,10 @@ export class Session {
         cwd: config.cwd,
       }),
     });
-    if (getParentAgentIdFromLabels(intent.labels)) {
+    if (sideChatFromAgentId !== undefined) {
+      intent.labels[SIDE_CHAT_LABEL] = "true";
+      intent.labels[SIDE_OF_AGENT_ID_LABEL] = sideChatFromAgentId;
+    } else if (getParentAgentIdFromLabels(intent.labels)) {
       const reporting = request.labels?.[PARENT_REPORTING_LABEL];
       if (isUserAgentCreation(request)) {
         intent.labels[PARENT_REPORTING_LABEL] = reporting ?? EXPLICIT_PARENT_REPORTING;
@@ -6507,6 +6622,12 @@ export class Session {
       this.assertWorkspaceCreationAllowed();
       if (this.hasRemoteCreationParent(normalized.labels)) {
         throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
+      }
+      if (
+        Object.hasOwn(normalized.labels ?? {}, SIDE_CHAT_LABEL) ||
+        Object.hasOwn(normalized.labels ?? {}, SIDE_OF_AGENT_ID_LABEL)
+      ) {
+        throw new SessionRequestError("invalid_request", "Side chat labels are assigned by Paseo.");
       }
       if (!normalized.cwd) {
         throw new Error("Import requires cwd from the selected provider session");
@@ -9120,6 +9241,7 @@ export class Session {
 
   private async preflightAgentWorkspace(request: CreateAgentRequestMessage | AgentCreateRequest) {
     this.assertWorkspaceCreationAllowed();
+    if (request.sideChatFromAgentId !== undefined) return null;
     if (this.hasRemoteCreationParent(request.labels))
       throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
     if (request.callerAgentId === undefined && request.initialPromptOrigin !== "agent") {
@@ -9144,6 +9266,70 @@ export class Session {
     const workspace = await this.workspaceRegistry.get(workspaceId);
     if (!workspace || workspace.archivedAt) throw new Error(`Workspace ${workspaceId} not found`);
     return caller;
+  }
+
+  private async preflightSideChat(request: CreateAgentRequestMessage, workspaceRole?: "main") {
+    const { sideChatFromAgentId, workspaceId, forkFrom } = request;
+    this.assertSideChatRequestAllowed(request, workspaceRole);
+    if (
+      !sideChatFromAgentId ||
+      !workspaceId ||
+      forkFrom?.sourceAgentId !== sideChatFromAgentId ||
+      (!forkFrom.boundaryCursor && !forkFrom.boundaryMessageId)
+    ) {
+      throw new SessionRequestError(
+        "invalid_request",
+        "A side chat must fork its Main Control agent at a fixed timeline position.",
+      );
+    }
+    const workspace = await this.workspaceRegistry.get(workspaceId);
+    const record = await this.agentStorage.get(sideChatFromAgentId);
+    const source = this.agentManager.getAgent(sideChatFromAgentId) ?? record;
+    if (
+      !workspace ||
+      workspace.archivedAt ||
+      !source ||
+      record?.archivedAt ||
+      source.internal ||
+      source.background ||
+      !isMainControlAgentLabels(source.labels) ||
+      isSideChatAgentLabels(source.labels) ||
+      getParentAgentIdFromLabels(source.labels) ||
+      source.workspaceId !== workspaceId ||
+      source.cwd !== request.config.cwd
+    ) {
+      throw new SessionRequestError(
+        "invalid_request",
+        "The side chat source must be an active Main Control agent in this workspace and directory.",
+      );
+    }
+  }
+
+  private assertSideChatRequestAllowed(request: CreateAgentRequestMessage, workspaceRole?: "main") {
+    if (
+      !this.authorization.allowsPermission("workspace.read") ||
+      !this.authorization.allowsPermission("workspace.write") ||
+      readDirectParentRoute(this.getHostSourceId()) ||
+      parsePluginClientId(this.clientId)
+    ) {
+      throw new SessionRequestError(
+        "access_denied",
+        "Creating a side chat requires workspace read and write permissions from a user session.",
+      );
+    }
+    if (
+      request.callerAgentId !== undefined ||
+      request.initialPromptOrigin === "agent" ||
+      request.worktree ||
+      request.worktreeName !== undefined ||
+      request.git ||
+      request.internal ||
+      request.background ||
+      request.autoArchive ||
+      workspaceRole
+    ) {
+      throw new SessionRequestError("invalid_request", "Create a side chat as a user draft.");
+    }
   }
 
   private async createRequestedWorkspace(
@@ -10778,13 +10964,16 @@ export class Session {
     }
   }
 
-  private async readForkedTimeline(forkFrom?: AgentForkSource) {
+  private async readForkedTimeline(forkFrom?: AgentForkSource, sideChat = false) {
     if (!forkFrom) return undefined;
     // Creation authorizes the destination. Reading inherited messages also requires
     // the permission checked at ingress for an explicit fork-context read.
     if (!this.authorization.allowsPermission("workspace.read")) {
       throw new Error("Session is not authorized to read fork source history");
     }
+    // This cursor is captured before the source has any visible rows.
+    const cursor = forkFrom.boundaryCursor;
+    if (sideChat && cursor?.epoch === "" && cursor.seq === 0) return [];
     const { timeline } = await this.loadForkSourceTimeline(forkFrom.sourceAgentId);
     return sliceTimelineRowsAtBoundary(timeline.rows, {
       ...forkFrom,
@@ -10984,6 +11173,7 @@ export class Session {
       const sourceAgentEvent = this.authenticatedAgentNotificationEvent(msg);
 
       const prompt = buildAgentPrompt(msg.text, msg.images, msg.attachments);
+      await this.acceptSideChatPrompt(agentId, prompt);
       this.sessionLogger.trace(
         {
           agentId,

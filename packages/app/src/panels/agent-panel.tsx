@@ -64,6 +64,11 @@ import { useWorkspaceAttachmentScopeKey } from "@/attachments/workspace-attachme
 import { COMPACT_CONTENT_WIDTH, useIsCompactFormFactor } from "@/constants/layout";
 import { isNative, isWeb } from "@/constants/platform";
 import { useAgentAttentionClear } from "@/hooks/use-agent-attention-clear";
+import {
+  appendSideChatReplyToDraft,
+  buildSideChatDraftSetup,
+  openSideChatDraft,
+} from "@/hooks/use-fork-agent";
 import { useAgentInputDraft, type AgentInputDraft } from "@/composer/draft/input-draft";
 import {
   type AgentScreenAgent,
@@ -106,6 +111,8 @@ import { MainControlTreeLayout } from "@/subagents/main-control-tree";
 import { isWorkspaceRootAgent } from "@/subagents/main-control-tree/select-tree";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
 import { buildDraftStoreKey, generateDraftId } from "@/stores/draft-keys";
+import { selectHostFeature } from "@/runtime/host-features";
+import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import {
   selectAgentTimelineState,
   selectAgentTimelineTurnPresentation,
@@ -125,6 +132,7 @@ import { derivePendingPermissionKey, normalizeAgentSnapshot } from "@/utils/agen
 import { applyLegacyDaemonWorkspaceOwnership } from "@/workspace/legacy-daemon-workspaces";
 import type { WorkspaceFileOpenRequest } from "@/workspace/file-open";
 import { buildDraftAgentSetup, type ClientSlashCommand } from "@/client-slash-commands";
+import { getSideChatSourceAgentId } from "@/subagents/close-tab-policy";
 
 interface ChatAgentStateShape {
   serverId: string | null;
@@ -158,6 +166,16 @@ function resolveChatAgentFromSession(
   if (!agentId) return null;
   const session = state.sessions[serverId];
   return session?.agents?.get(agentId) ?? session?.agentDetails?.get(agentId) ?? null;
+}
+
+function isSideChatMainAgent(agent: Agent | null, workspaceId: string, serverId: string): boolean {
+  return Boolean(
+    agent &&
+    isWorkspaceRootAgent(agent, workspaceId) &&
+    isMainControlAgent(agent) &&
+    !agent.parentAgentId &&
+    !getParentAddressFromLabels(agent.labels, serverId),
+  );
 }
 
 function readViewedTimelineError(input: {
@@ -1247,18 +1265,64 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     onAttentionInputFocus();
     return false;
   }, [onAttentionInputFocus]);
+  const sideChatSourceId = useSessionStore((state) =>
+    getSideChatSourceAgentId(resolveChatAgentFromSession(state, serverId, agentId)),
+  );
+  const quoteSideChatReply = useStableEvent(async (quoteText: string) => {
+    if (!sideChatSourceId || !workspaceId || !quoteText.trim()) return;
+    const draftKey = buildDraftStoreKey({ serverId, agentId: sideChatSourceId });
+    const appended = await appendSideChatReplyToDraft({
+      draftKey,
+      text: quoteText,
+      canQuote: () => {
+        const state = useSessionStore.getState();
+        const source = resolveChatAgentFromSession(state, serverId, sideChatSourceId);
+        return (
+          isSideChatMainAgent(source, workspaceId, serverId) &&
+          !isHandoffInputLocked(serverId, sideChatSourceId)
+        );
+      },
+    });
+    if (!appended) {
+      toastApi.error(t("message.actions.forkUnavailable"));
+      return;
+    }
+    navigateToWorkspace({
+      serverId,
+      workspaceId,
+      target: { kind: "agent", agentId: sideChatSourceId },
+      asTab: true,
+    });
+  });
   const quoteTarget = useMemo<ComposerQuoteTarget | null>(
     () =>
       showsComposer && hasActiveComposer && !draft
         ? {
             addQuoteAttachment: (quoteText: string) => {
+              if (sideChatSourceId) {
+                void quoteSideChatReply(quoteText).catch(() =>
+                  toastApi.error(t("message.actions.forkFailed")),
+                );
+                return;
+              }
               if (isHandoffInputLocked(serverId, agentId)) return;
               const quote = createQuoteAttachment({ text: quoteText });
               if (quote.text) setAttachments((prev) => [...prev, quote]);
             },
           }
         : null,
-    [agentId, serverId, setAttachments, draft, hasActiveComposer, showsComposer],
+    [
+      agentId,
+      serverId,
+      setAttachments,
+      draft,
+      hasActiveComposer,
+      showsComposer,
+      sideChatSourceId,
+      quoteSideChatReply,
+      t,
+      toastApi,
+    ],
   );
   const streamContent = (
     <View
@@ -1735,7 +1799,21 @@ function ActiveAgentComposer({
   );
   const paneContext = usePaneContext();
   const openInSidePane = useSettings((settings) => settings.openInSidePane);
-  const { workspaceId, tabId, retargetCurrentTab } = paneContext;
+  const { workspaceId, tabId, target, retargetCurrentTab } = paneContext;
+  const { t } = useTranslation();
+  const isCurrentAgentTab =
+    paneContext.serverId === serverId && target.kind === "agent" && target.agentId === agentId;
+  const allowSideChat = useSessionStore(
+    (state) =>
+      isCurrentAgentTab &&
+      // COMPAT(agentSideChat): added in v0.17.0, remove gate after 2027-06-01.
+      selectHostFeature(state, serverId, "agentSideChat") &&
+      isSideChatMainAgent(
+        resolveChatAgentFromSession(state, serverId, agentId),
+        workspaceId,
+        serverId,
+      ),
+  );
   const { archiveAgent } = useArchiveAgent();
   const closeWorkspaceTab = useWorkspaceLayoutStore((state) => state.closeTab);
   const hideWorkspaceAgent = useWorkspaceLayoutStore((state) => state.hideAgent);
@@ -1765,9 +1843,31 @@ function ActiveAgentComposer({
 
   const handleClientSlashCommand = useCallback(
     async (command: ClientSlashCommand) => {
-      const agent = resolveChatAgentFromSession(useSessionStore.getState(), serverId, agentId);
+      const state = useSessionStore.getState();
+      const agent = resolveChatAgentFromSession(state, serverId, agentId);
       if (!agent) {
         throw new Error("Agent not found");
+      }
+      if (command.kind === "side-chat") {
+        if (
+          !isCurrentAgentTab ||
+          !selectHostFeature(state, serverId, "agentSideChat") ||
+          !isSideChatMainAgent(agent, workspaceId, serverId) ||
+          agent.cwd !== cwd
+        ) {
+          throw new Error(t("message.actions.forkUnavailable"));
+        }
+        const session = state.sessions[serverId];
+        const setup = buildSideChatDraftSetup({
+          agentId,
+          agent,
+          timeline: selectAgentTimelineState(session, agentId),
+          liveItems: session?.agentStreamHead.get(agentId),
+          text: command.argumentText,
+        });
+        if (!setup) throw new Error(t("message.actions.forkUnavailable"));
+        openSideChatDraft({ serverId, workspaceId, setup });
+        return;
       }
 
       const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
@@ -1792,10 +1892,13 @@ function ActiveAgentComposer({
       agentId,
       archiveAgent,
       closeWorkspaceTab,
+      cwd,
       hideWorkspaceAgent,
+      isCurrentAgentTab,
       retargetCurrentTab,
       serverId,
       tabId,
+      t,
       unpinWorkspaceAgent,
       workspaceId,
     ],
@@ -1832,6 +1935,7 @@ function ActiveAgentComposer({
         onComposerHeightChange={onComposerHeightChange}
         onMessageSent={onMessageSent}
         onClientSlashCommand={handleClientSlashCommand}
+        allowSideChat={allowSideChat}
         isCompactLayout={isCompactComposerLayout}
       />
     </View>

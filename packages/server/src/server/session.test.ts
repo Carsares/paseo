@@ -33,6 +33,9 @@ import {
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
+  RESIDENT_AGENT_LABEL,
+  SIDE_CHAT_LABEL,
+  SIDE_OF_AGENT_ID_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
@@ -79,6 +82,7 @@ import type {
 import { parseAgentMessage } from "./agent/agent-messages/index.js";
 import { MessageReceipts, type QueueHandoff } from "./message-receipts/index.js";
 import { REMOTE_HIERARCHY_DEPTH_LABEL } from "./agent/hierarchy-policy.js";
+import { createPaseoToolCatalog } from "./agent/tools/paseo-tools.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
 import {
@@ -1076,6 +1080,327 @@ test.each(["live", "closed", "archived"] as const)(
     }
   },
 );
+
+test("side chats fork at the requested boundary and discard only before the first prompt", async () => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "paseo-side-chat-")));
+  const logger = pino({ level: "silent" });
+  const storagePath = join(cwd, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const onStartTurn = vi.fn();
+  const manager = new AgentManager({
+    logger,
+    registry: storage,
+    clients: { codex: createTestAgentClient("codex", { onStartTurn }) },
+  });
+  const workspaceId = "side-chat-workspace";
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId,
+    projectId: "project",
+    cwd,
+    kind: "directory",
+    displayName: "Side chat workspace",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  });
+  const shared = {
+    agentManager: manager,
+    agentStorage: storage,
+    workspaceRegistry: { get: vi.fn().mockResolvedValue(workspace) },
+    paseoHome: cwd,
+  };
+  const messages: SessionOutboundMessage[] = [];
+  const otherMessages: SessionOutboundMessage[] = [];
+  const sending = Promise.withResolvers<void>();
+  const continueSending = Promise.withResolvers<void>();
+  const receipts = createMessageReceiptsStub();
+  const send = receipts.send.bind(receipts);
+  const session = createSessionForTest({
+    ...shared,
+    messages,
+    messageDelivery: {
+      messageReceipts: {
+        async send(input) {
+          sending.resolve();
+          await continueSending.promise;
+          return send(input);
+        },
+      },
+    },
+  });
+  const other = createSessionForTest({
+    ...shared,
+    clientId: "other-window",
+    messages: otherMessages,
+  });
+  const restricted = createSessionForTest({
+    ...shared,
+    permissions: ["workspace.write"],
+    messages: otherMessages,
+  });
+  let pending: Promise<void> | undefined;
+  try {
+    const config = { provider: "codex", cwd } as const;
+    const main = await manager.createAgent(config, undefined, {
+      workspaceId,
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
+    for (const item of CONTEXT_HANDOFF_ITEMS) await manager.appendTimelineItem(main.id, item);
+    await manager.appendTimelineItem(main.id, {
+      type: "user_message",
+      text: "Newer than the fork",
+    });
+    const { epoch } = manager.fetchTimeline(main.id);
+    const baseRequest = {
+      type: "agent.create.request",
+      config,
+      workspaceId,
+      sideChatFromAgentId: main.id,
+      forkFrom: { sourceAgentId: main.id, boundaryCursor: { epoch, seq: 2 } },
+      labels: {
+        topic: "keep",
+        [SIDE_CHAT_LABEL]: "false",
+        [SIDE_OF_AGENT_ID_LABEL]: "forged",
+        [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE,
+        [PARENT_AGENT_ID_LABEL]: "forged",
+        [PARENT_SERVER_ID_LABEL]: "another-host",
+        [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING,
+        [RESIDENT_AGENT_LABEL]: "true",
+      },
+    } as const;
+    await restricted.handleMessage({ ...baseRequest, requestId: "no-read" });
+    expect(otherMessages).toContainEqual({
+      type: "agent.create.response",
+      payload: expect.objectContaining({
+        requestId: "no-read",
+        agent: null,
+        errorCode: "access_denied",
+      }),
+    });
+    for (const invalid of [
+      { workspaceId: "other-workspace" },
+      { config: { ...config, cwd: join(cwd, "other") } },
+      { forkFrom: { ...baseRequest.forkFrom, sourceAgentId: "wrong-fork" } },
+      { forkFrom: { sourceAgentId: main.id } },
+      { callerAgentId: main.id },
+      { workspaceRole: "main" as const },
+    ]) {
+      messages.length = 0;
+      await session.handleMessage({ ...baseRequest, ...invalid, requestId: "invalid" });
+      expect(messages).toContainEqual({
+        type: "agent.create.response",
+        payload: expect.objectContaining({
+          requestId: "invalid",
+          agent: null,
+          error: expect.any(String),
+        }),
+      });
+    }
+    expect((await storage.listAll()).map(({ id }) => id)).toEqual([main.id]);
+
+    messages.length = 0;
+    await session.handleMessage({
+      type: "agent.create.request",
+      requestId: "forged-side-labels",
+      config,
+      workspaceId,
+      labels: { [SIDE_CHAT_LABEL]: "true", [SIDE_OF_AGENT_ID_LABEL]: main.id },
+    });
+    const ordinary = findByType(messages, "agent.create.response")?.payload.agent;
+    expect(ordinary?.labels).toEqual({});
+    if (!ordinary) throw new Error("Expected ordinary agent");
+    messages.length = 0;
+    await session.handleMessage({
+      ...baseRequest,
+      requestId: "ordinary-source",
+      sideChatFromAgentId: ordinary.id,
+      forkFrom: { sourceAgentId: ordinary.id, boundaryCursor: { epoch: "", seq: 0 } },
+    });
+    expect(findByType(messages, "agent.create.response")?.payload).toMatchObject({
+      agent: null,
+      errorCode: "invalid_request",
+    });
+
+    async function createSide(
+      requestId: string,
+      initialPrompt?: string,
+      boundaryCursor: { epoch: string; seq: number } = baseRequest.forkFrom.boundaryCursor,
+    ) {
+      messages.length = 0;
+      await session.handleMessage({
+        ...baseRequest,
+        forkFrom: { ...baseRequest.forkFrom, boundaryCursor },
+        requestId,
+        initialPrompt,
+      });
+      const result = findByType(messages, "agent.create.response")?.payload;
+      expect(result?.error).toBeNull();
+      if (!result?.agent) throw new Error("Expected side chat");
+      return result.agent;
+    }
+
+    const empty = await createSide("empty");
+    expect(empty.labels).toEqual({
+      topic: "keep",
+      [SIDE_CHAT_LABEL]: "true",
+      [SIDE_OF_AGENT_ID_LABEL]: main.id,
+    });
+    expect((await storage.timelinePrefixes.load(empty.id))?.rows.map(({ item }) => item)).toEqual(
+      CONTEXT_HANDOFF_ITEMS,
+    );
+    expect(onStartTurn).not.toHaveBeenCalled();
+    expect((await storage.get(empty.id))?.lastUserMessageAt).toBeFalsy();
+    const tools = createPaseoToolCatalog({
+      agentManager: manager,
+      agentStorage: storage,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      workspaceRegistry: createStub<FileBackedWorkspaceRegistry>(shared.workspaceRegistry),
+      callerAgentId: main.id,
+      logger,
+    });
+    const listed = await tools.executeTool("list_agents", {});
+    expect(listed.structuredContent).toMatchObject({
+      agents: expect.arrayContaining([expect.objectContaining({ id: ordinary.id })]),
+    });
+    expect(listed.structuredContent).not.toMatchObject({
+      agents: expect.arrayContaining([expect.objectContaining({ id: empty.id })]),
+    });
+    const summary = await tools.executeTool("summarize_workspace_agents", { workspaceId });
+    expect(summary.structuredContent).toMatchObject({
+      entries: [expect.objectContaining({ agentId: ordinary.id })],
+    });
+    await expect(tools.executeTool("get_agent_status", { agentId: empty.id })).rejects.toThrow(
+      "not found",
+    );
+    await other.handleMessage({
+      type: "delete_agent_request",
+      agentId: main.id,
+      onlyIfEmptySideChat: true,
+      requestId: "main",
+    });
+    expect(await storage.get(main.id)).not.toBeNull();
+    const anotherTab = getOpenAgentTabLabel("another-window");
+    await manager.setLabels(empty.id, { [anotherTab]: "true" });
+    await other.handleMessage({
+      type: "delete_agent_request",
+      agentId: empty.id,
+      onlyIfEmptySideChat: true,
+      requestId: "empty-open-in-another-window",
+    });
+    expect(await storage.get(empty.id)).not.toBeNull();
+    await manager.setLabels(empty.id, { [anotherTab]: "false" });
+    await other.handleMessage({
+      type: "delete_agent_request",
+      agentId: empty.id,
+      onlyIfEmptySideChat: true,
+      requestId: "empty",
+    });
+    expect(await storage.get(empty.id)).toBeNull();
+
+    const side = await createSide("pending-first");
+    pending = session.handleMessage({
+      type: "send_agent_message_request",
+      agentId: side.id,
+      text: "First side question",
+      messageId: "side-first",
+      requestId: "send-first",
+    });
+    await sending.promise;
+    await other.handleMessage({
+      type: "delete_agent_request",
+      agentId: side.id,
+      onlyIfEmptySideChat: true,
+      requestId: "concurrent",
+    });
+    expect(otherMessages).toContainEqual({
+      type: "rpc_error",
+      payload: expect.objectContaining({ requestId: "concurrent", code: "side_chat_not_empty" }),
+    });
+    expect(await new AgentStorage(storagePath, logger).get(side.id)).toMatchObject({
+      sideChatPromptAccepted: true,
+    });
+    continueSending.resolve();
+    await pending;
+    expect(findByType(messages, "send_agent_message_response")?.payload.accepted).toBe(true);
+    await other.handleMessage({
+      type: "archive_agent_request",
+      agentId: side.id,
+      requestId: "legacy-close",
+    });
+    await other.handleMessage({
+      type: "close_items_request",
+      agentIds: [side.id],
+      terminalIds: [],
+      expectedWorkspaceId: workspaceId,
+      requestId: "legacy-bulk-close",
+    });
+    expect(otherMessages).toContainEqual({
+      type: "rpc_error",
+      payload: expect.objectContaining({ requestId: "legacy-close", code: "invalid_request" }),
+    });
+    expect((await storage.get(side.id))?.archivedAt).toBeFalsy();
+    await other.handleMessage({
+      type: "archive_agent_request",
+      agentId: side.id,
+      explicitSideChatArchive: true,
+      requestId: "explicit-archive",
+    });
+    expect((await storage.get(side.id))?.archivedAt).toEqual(expect.any(String));
+
+    const noHistory = await createSide("fork-empty-prefix", undefined, {
+      epoch: "",
+      seq: 0,
+    });
+    expect(manager.fetchTimeline(noHistory.id).rows).toEqual([]);
+    const acceptingInitialPrompt = Promise.withResolvers<string>();
+    const acceptInitialPrompt = Promise.withResolvers<void>();
+    const acceptPrompt = storage.acceptSideChatPrompt.bind(storage);
+    const promptSpy = vi
+      .spyOn(storage, "acceptSideChatPrompt")
+      .mockImplementationOnce(async (id) => {
+        acceptingInitialPrompt.resolve(id);
+        await acceptInitialPrompt.promise;
+        await acceptPrompt(id);
+      });
+    const creating = createSide("ask-when-creating", "Ask with create", { epoch: "", seq: 0 });
+    try {
+      const agentId = await Promise.race([
+        acceptingInitialPrompt.promise,
+        creating.then(() => {
+          throw new Error("Expected creation to wait for first prompt admission");
+        }),
+      ]);
+      expect((await storage.get(agentId))?.sideChatPromptAccepted).toBeUndefined();
+      await other.handleMessage({
+        type: "delete_agent_request",
+        agentId,
+        onlyIfEmptySideChat: true,
+        requestId: "close-during-creation",
+      });
+      expect(otherMessages).toContainEqual({
+        type: "rpc_error",
+        payload: expect.objectContaining({
+          requestId: "close-during-creation",
+          code: "side_chat_not_empty",
+        }),
+      });
+    } finally {
+      acceptInitialPrompt.resolve();
+      await creating;
+      promptSpy.mockRestore();
+    }
+    const askedAtCreation = await creating;
+    expect((await storage.get(askedAtCreation.id))?.sideChatPromptAccepted).toBe(true);
+    await expect.poll(() => onStartTurn.mock.calls.at(-1)?.[0]).toBe("Ask with create");
+  } finally {
+    continueSending.resolve();
+    await pending;
+    await session.cleanup();
+    await other.cleanup();
+    await restricted.cleanup();
+    for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test.each([undefined, "Start at the checkpoint"])(
   "fork creation inherits every selected row with initial prompt %s",

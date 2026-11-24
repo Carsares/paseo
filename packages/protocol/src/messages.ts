@@ -1068,12 +1068,14 @@ const AgentDirectoryFilterSchema = z.object({
 export const DeleteAgentRequestMessageSchema = z.object({
   type: z.literal("delete_agent_request"),
   agentId: z.string(),
+  onlyIfEmptySideChat: z.literal(true).optional(),
   requestId: z.string(),
 });
 
 export const ArchiveAgentRequestMessageSchema = z.object({
   type: z.literal("archive_agent_request"),
   agentId: z.string(),
+  explicitSideChatArchive: z.literal(true).optional(),
   expectedWorkspaceId: z.string().optional(),
   requestId: z.string(),
 });
@@ -1972,6 +1974,7 @@ export const AgentTimelineCursorSchema = z.object({
 
 export const AgentForkSourceSchema = z.object({
   sourceAgentId: z.string().min(1),
+  // Side chat requests use an empty epoch and sequence 0 for an empty visible prefix.
   boundaryCursor: AgentTimelineCursorSchema.optional(),
   boundaryMessageId: z.string().min(1).optional(),
 });
@@ -1988,6 +1991,7 @@ export const CreateAgentRequestMessageSchema = z.object({
   // workspace and parentage policy as agent-scoped MCP creation.
   callerAgentId: z.string().optional(),
   forkFrom: AgentForkSourceSchema.optional(),
+  sideChatFromAgentId: z.string().min(1).optional(),
   worktreeName: z.string().optional(),
   initialPrompt: z.string().optional(),
   initialPromptOrigin: z.enum(["user", "agent"]).optional(),
@@ -2029,6 +2033,7 @@ export const WorkspaceInitialAgentSchema = AgentCreateRequestSchema.omit({
   worktree: true,
   worktreeName: true,
   git: true,
+  sideChatFromAgentId: true,
 });
 
 export const CreationSubscribeRequestSchema = z.object({
@@ -4534,6 +4539,7 @@ export const ServerInfoStatusPayloadSchema = z
         agentForkContextCursor: z.boolean().optional(),
         // COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
         agentSeamlessContextSwitch: z.boolean().optional(),
+        agentSideChat: z.boolean().optional(),
         // COMPAT(agentResidentSpecialists): added in v0.18.0, remove gate after 2027-06-01.
         agentResidentSpecialists: z.boolean().optional(),
         // COMPAT(agentSessionReset): added in v0.18.0, remove gate after 2027-06-01.

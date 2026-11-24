@@ -217,6 +217,7 @@ export const ptBR: TranslationResources = {
       fileTooLarge: "{{fileName}} é grande demais (máximo {{size}})",
     },
     clientCommands: {
+      sideChat: "Iniciar uma conversa paralela",
       archiveAgent: "Arquivar o agente atual",
       freshDraft: "Arquivar este agente e iniciar um novo rascunho",
     },

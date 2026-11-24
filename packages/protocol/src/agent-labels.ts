@@ -5,6 +5,8 @@ export const PARENT_REPORTING_LABEL = "paseo.parent-reporting";
 export const EXPLICIT_PARENT_REPORTING = "explicit";
 export const WORKSPACE_ROLE_LABEL = "paseo.workspace-role";
 export const WORKSPACE_MAIN_ROLE = "main";
+export const SIDE_CHAT_LABEL = "paseo.side-chat";
+export const SIDE_OF_AGENT_ID_LABEL = "paseo.side-of";
 export const MAIN_PRIOR_MODE_ID_LABEL = "paseo.main-prior-mode-id";
 export const RESIDENT_AGENT_LABEL = "paseo.resident";
 export const RESIDENT_ROLE_LABEL = "paseo.resident-role";
@@ -28,6 +30,14 @@ export function isOpenAgentTabLabel(label: string): boolean {
 
 export interface AgentLabelSource {
   labels?: Record<string, unknown> | null;
+}
+
+export function isSideChatAgentLabels(labels: AgentLabelSource["labels"]): boolean {
+  return labels?.[SIDE_CHAT_LABEL] === "true";
+}
+
+export function isSideChatAgent(agent: AgentLabelSource): boolean {
+  return isSideChatAgentLabels(agent.labels);
 }
 
 export function isResidentAgentLabels(labels: AgentLabelSource["labels"]): boolean {

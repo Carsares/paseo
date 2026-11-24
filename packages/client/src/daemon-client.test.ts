@@ -8852,6 +8852,120 @@ test("creation lifecycle sends the keyed agent, fork source, and initial prompt 
   expect(transport.sent).toHaveLength(1);
 });
 
+test.each([false, true])(
+  "side chat creation and cleanup require host support (%s)",
+  async (capable) => {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "side-chat",
+      transportFactory: () => mock.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    mock.triggerOpen({
+      features: {
+        agentSeamlessContextSwitch: true,
+        creationLifecycle: true,
+        agentSideChat: capable,
+      },
+    });
+    await connecting;
+
+    const forkFrom = { sourceAgentId: "main", boundaryCursor: { epoch: "", seq: 0 } };
+    const creation = client.createAgent({
+      provider: "codex",
+      cwd: "/repo",
+      workspaceId: "workspace",
+      forkFrom,
+      sideChatFromAgentId: "main",
+    });
+    void creation.catch(() => undefined);
+    if (!capable) {
+      await expect(creation).rejects.toThrow("Update the host to use side chats.");
+      await expect(client.deleteAgent("side", { onlyIfEmptySideChat: true })).rejects.toThrow(
+        "Update the host to use side chats.",
+      );
+      expect(mock.sent).toHaveLength(0);
+      return;
+    }
+    const request = parseSentFrame(mock.sent[0]);
+    expect(request).toMatchObject({
+      type: "agent.create.request",
+      forkFrom,
+      sideChatFromAgentId: "main",
+    });
+    expect(request.labels).toEqual({});
+    expect(request).not.toHaveProperty("callerAgentId");
+    const agentSnapshot = {
+      id: "side",
+      provider: "codex",
+      cwd: "/repo",
+      model: null,
+      thinkingOptionId: null,
+      effectiveThinkingOptionId: null,
+      createdAt: "2026-04-30T00:00:00.000Z",
+      updatedAt: "2026-04-30T00:00:00.000Z",
+      lastUserMessageAt: null,
+      status: "idle",
+      capabilities: {
+        supportsStreaming: false,
+        supportsSessionPersistence: false,
+        supportsDynamicModes: false,
+        supportsMcpServers: false,
+        supportsReasoningStream: false,
+        supportsToolInvocations: false,
+      },
+      currentModeId: null,
+      availableModes: [],
+      pendingPermissions: [],
+      persistence: null,
+      title: null,
+      labels: { "paseo.side-chat": "true", "paseo.side-of": "main" },
+      requiresAttention: false,
+      attentionReason: null,
+    };
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "agent.create.response",
+        payload: { requestId: request.requestId, agent: agentSnapshot, error: null },
+      }),
+    );
+    await expect(creation).resolves.toMatchObject({ id: agentSnapshot.id });
+
+    const deleting = client.deleteAgent(agentSnapshot.id, { onlyIfEmptySideChat: true });
+    const deletion = parseSentFrame(mock.sent.at(-1)!);
+    expect(deletion).toMatchObject({
+      type: "delete_agent_request",
+      agentId: agentSnapshot.id,
+      onlyIfEmptySideChat: true,
+    });
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "agent_deleted",
+        payload: { requestId: deletion.requestId, agentId: agentSnapshot.id },
+      }),
+    );
+    await deleting;
+
+    const closingDuringPrompt = client.deleteAgent(agentSnapshot.id, { onlyIfEmptySideChat: true });
+    const concurrentDeletion = parseSentFrame(mock.sent.at(-1)!);
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "rpc_error",
+        payload: {
+          requestId: concurrentDeletion.requestId,
+          requestType: "delete_agent_request",
+          code: "side_chat_not_empty",
+          error: "This side chat cannot be discarded.",
+        },
+      }),
+    );
+    await expect(closingDuringPrompt).rejects.toMatchObject({ code: "side_chat_not_empty" });
+  },
+);
+
 test("explicit main creation uses its independent capability and preserves the conflict code", async () => {
   const transport = createMockTransport();
   const client = new DaemonClient({

@@ -544,6 +544,7 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
   workspaceId?: string;
   callerAgentId?: string;
   forkFrom?: AgentForkSource;
+  sideChatFromAgentId?: string;
   initialPrompt?: string;
   initialPromptOrigin?: CreateAgentRequestMessage["initialPromptOrigin"];
   idempotencyKey?: string;
@@ -591,7 +592,14 @@ export interface CreateWorkspaceRequestOptions {
   mainAgent?: { config: CreateWorkspaceAgentConfig };
   agent?: Omit<
     CreateAgentRequestOptions,
-    "workspaceId" | "onEvent" | "worktree" | "git" | "worktreeName" | "idempotencyKey" | "requestId"
+    | "workspaceId"
+    | "onEvent"
+    | "worktree"
+    | "git"
+    | "worktreeName"
+    | "idempotencyKey"
+    | "requestId"
+    | "sideChatFromAgentId"
   >;
   onEvent?: (snapshot: CreationSnapshot) => void;
   firstAgentContext?: WorkspaceCreateRequest["firstAgentContext"];
@@ -3647,7 +3655,10 @@ export class DaemonClient {
   }
 
   private assertAgentCreationFeatures(
-    options?: Pick<CreateAgentRequestOptions, "forkFrom" | "labels" | "workspaceRole">,
+    options?: Pick<
+      CreateAgentRequestOptions,
+      "forkFrom" | "labels" | "workspaceRole" | "sideChatFromAgentId"
+    >,
   ): void {
     const workspaceRole = options?.workspaceRole;
     if (workspaceRole !== undefined && workspaceRole !== "main") {
@@ -3657,6 +3668,7 @@ export class DaemonClient {
       });
     }
     const features = this.lastServerInfoMessage?.features;
+    if (options?.sideChatFromAgentId !== undefined) this.requireAgentSideChat();
     // COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
     if (options?.forkFrom && features?.agentSeamlessContextSwitch !== true) {
       throw Object.assign(new Error("Update the host to fork an agent's conversation."), {
@@ -3754,6 +3766,7 @@ export class DaemonClient {
       ...(options.workspaceId !== undefined ? { workspaceId: options.workspaceId } : {}),
       ...(options.callerAgentId !== undefined ? { callerAgentId: options.callerAgentId } : {}),
       forkFrom: options.forkFrom,
+      sideChatFromAgentId: options.sideChatFromAgentId,
       ...(options.initialPrompt ? { initialPrompt: options.initialPrompt } : {}),
       ...(options.initialPromptOrigin !== undefined
         ? { initialPromptOrigin: options.initialPromptOrigin }
@@ -3801,11 +3814,22 @@ export class DaemonClient {
     return status.agent;
   }
 
-  async deleteAgent(agentId: string): Promise<void> {
+  // COMPAT(agentSideChat): added in v0.17.0, remove gate after 2027-06-01.
+  private requireAgentSideChat(): void {
+    if (this.lastServerInfoMessage?.features?.agentSideChat !== true) {
+      throw Object.assign(new Error("Update the host to use side chats."), {
+        outcome: "rejected" as const,
+      });
+    }
+  }
+
+  async deleteAgent(agentId: string, options?: { onlyIfEmptySideChat: true }): Promise<void> {
+    if (options?.onlyIfEmptySideChat) this.requireAgentSideChat();
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
       type: "delete_agent_request",
       agentId,
+      onlyIfEmptySideChat: options?.onlyIfEmptySideChat,
       requestId,
     });
     await this.sendRequest({
@@ -3832,6 +3856,10 @@ export class DaemonClient {
     const message = SessionInboundMessageSchema.parse({
       type: "archive_agent_request",
       agentId,
+      // COMPAT(agentSideChat): distinguish explicit archive from older tab-close requests.
+      ...(expectedWorkspaceId === undefined && this.lastServerInfoMessage?.features?.agentSideChat
+        ? { explicitSideChatArchive: true }
+        : {}),
       ...(expectedWorkspaceId === undefined ? {} : { expectedWorkspaceId }),
       requestId,
     });

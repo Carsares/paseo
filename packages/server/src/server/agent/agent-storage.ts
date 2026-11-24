@@ -3,7 +3,11 @@ import path from "node:path";
 import { z } from "zod";
 import type { Logger } from "pino";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
-import { isMainControlAgentLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  hasOpenAgentTab,
+  isMainControlAgentLabels,
+  isSideChatAgentLabels,
+} from "@getpaseo/protocol/agent-labels";
 
 import { writeJsonFileAtomic } from "../atomic-file.js";
 import { AgentFeatureSchema, AgentOptionControlSchema, AgentStatusSchema } from "../messages.js";
@@ -57,6 +61,7 @@ const RAW_STORED_AGENT_SCHEMA = z.object({
   updatedAt: z.string(),
   lastActivityAt: z.string().optional(),
   lastUserMessageAt: z.string().nullable().optional(),
+  sideChatPromptAccepted: z.literal(true).optional(),
   title: z.string().nullable().optional(),
   labels: z.record(z.string(), z.string()).default({}),
   mainControlSystemPrompt: z.string().optional(),
@@ -140,6 +145,7 @@ export class AgentStorage {
   private pathsById: Map<string, Set<string>> = new Map();
   private pendingWrites: Map<string, Promise<void>> = new Map();
   private deleting: Set<string> = new Set();
+  private readonly sideChatInitialPrompts = new Map<string, number>();
   private daemonAgentIdsByExecution: Map<string, string> = new Map();
   private daemonExecutionKeysByAgentId: Map<string, string> = new Map();
   private readonly idsByWorkspace = new Map<string, Set<string>>();
@@ -362,8 +368,14 @@ export class AgentStorage {
         return undefined;
       }
 
-      const record = mutate(this.cache.get(agentId) ?? null);
-      if (record) await this.writeRecord(record);
+      const existing = this.cache.get(agentId) ?? null;
+      const record = mutate(existing);
+      if (record) {
+        // Provider snapshots and lifecycle updates cannot clear first-prompt evidence.
+        await this.writeRecord(
+          existing?.sideChatPromptAccepted ? { ...record, sideChatPromptAccepted: true } : record,
+        );
+      }
       return undefined;
     });
 
@@ -403,6 +415,49 @@ export class AgentStorage {
 
   beginDelete(agentId: string): void {
     this.deleting.add(agentId);
+  }
+
+  reserveSideChatInitialPrompt(agentId: string): () => void {
+    this.sideChatInitialPrompts.set(agentId, (this.sideChatInitialPrompts.get(agentId) ?? 0) + 1);
+    return () => {
+      const remaining = (this.sideChatInitialPrompts.get(agentId) ?? 1) - 1;
+      if (remaining) this.sideChatInitialPrompts.set(agentId, remaining);
+      else this.sideChatInitialPrompts.delete(agentId);
+    };
+  }
+
+  async acceptSideChatPrompt(agentId: string): Promise<void> {
+    await this.load();
+    let accepted = false;
+    await this.queueRecordMutation(agentId, (record) => {
+      if (!record || !isSideChatAgentLabels(record.labels)) return null;
+      accepted = true;
+      return record.sideChatPromptAccepted ? null : { ...record, sideChatPromptAccepted: true };
+    });
+    if (!accepted) throw new Error("The side chat is no longer available.");
+  }
+
+  async beginEmptySideChatDelete(agentId: string, hasLivePrompt: () => boolean): Promise<boolean> {
+    await this.load();
+    let deleting = false;
+    await this.queueRecordMutation(agentId, (record) => {
+      if (
+        record &&
+        isSideChatAgentLabels(record.labels) &&
+        !record.archivedAt &&
+        !record.sideChatPromptAccepted &&
+        !hasOpenAgentTab(record.labels) &&
+        !this.sideChatInitialPrompts.has(agentId) &&
+        !record.lastUserMessageAt &&
+        !hasLivePrompt()
+      ) {
+        // Set the fence while holding the same write queue that accepts prompts.
+        this.beginDelete(agentId);
+        deleting = true;
+      }
+      return null;
+    });
+    return deleting;
   }
 
   async remove(agentId: string): Promise<void> {

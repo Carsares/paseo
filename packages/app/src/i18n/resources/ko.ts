@@ -216,6 +216,7 @@ export const ko: TranslationResources = {
       fileTooLarge: "{{fileName}}이(가) 너무 큽니다 (최대 {{size}})",
     },
     clientCommands: {
+      sideChat: "사이드 채팅 시작",
       archiveAgent: "현재 에이전트 보관",
       freshDraft: "이 에이전트를 보관하고 새 초안을 시작합니다",
     },

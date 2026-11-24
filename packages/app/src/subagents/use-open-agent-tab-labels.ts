@@ -5,9 +5,11 @@ import { useShallow } from "zustand/shallow";
 import { useSessionStore } from "@/stores/session-store";
 import { getOrCreateClientId } from "@/utils/client-id";
 import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
+import { isSideChat } from "./close-tab-policy";
 import type { WorkspaceTab } from "@/workspace-tabs/model";
 import {
   getAgentTabsNeedingOpenLabel,
+  getSideChatOpenTabLabel,
   needsOpenAgentTabLabel,
   selectOpenTabAgents,
 } from "./open-tab-labels";
@@ -66,17 +68,20 @@ export function useOpenAgentTabLabels(input: {
     void (async () => {
       try {
         const clientId = await getOrCreateClientId();
-        const label = getOpenAgentTabLabel(clientId);
+        const subagentLabel = getOpenAgentTabLabel(clientId);
+        const sideChatLabel = getSideChatOpenTabLabel();
         const agentIds = getAgentTabsNeedingOpenLabel({
           tabs: input.tabs,
           getAgent: (agentId) => agentsById.get(agentId),
-          label,
+          label: subagentLabel,
+          sideChatLabel,
           pendingAgentIds: pendingAgentIdsRef.current,
           workspaceId: input.workspaceId,
         });
         for (const agentId of agentIds) {
           const session = useSessionStore.getState().sessions[input.serverId];
           const latestAgent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+          const label = isSideChat(latestAgent) ? sideChatLabel : subagentLabel;
           if (
             pendingAgentIdsRef.current.has(agentId) ||
             !needsOpenAgentTabLabel(latestAgent, label, input.workspaceId)

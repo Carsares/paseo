@@ -435,6 +435,76 @@ describe("workspace draft empty text readiness", () => {
   });
 });
 
+test("a seeded side chat submits only when the user sends the draft", async () => {
+  const serverId = "side-draft-host";
+  const draftId = "side-draft";
+  const workspaceId = "workspace-1";
+  const cwd = "/tmp/project";
+  const text = "Why did this change?";
+  const forkFrom = { sourceAgentId: "main", boundaryCursor: { epoch: "", seq: 0 } };
+  const createAgent = vi.fn<DaemonClient["createAgent"]>().mockRejectedValue(new Error("Retry"));
+  const daemon = { createAgent } as unknown as DaemonClient;
+  const store = useSessionStore.getState();
+  store.initializeSession(serverId, daemon);
+  store.updateSessionServerInfo(serverId, {
+    serverId,
+    hostname: null,
+    version: null,
+    features: { agentSideChat: true },
+  });
+  vi.mocked(useHostRuntimeClient).mockReturnValue(daemon);
+  const inputDraft = mockWorkspaceDraftInput();
+  inputDraft.textSource.getSnapshot = () => "";
+  const view = render(
+    createElement(WorkspaceDraftComposer, {
+      serverId,
+      workspaceId,
+      tabId: "side-tab",
+      draftId,
+      isPaneFocused: false,
+      editingSession: new ComposerEditingSession(),
+      initialSetup: {
+        provider: "codewhale",
+        cwd,
+        modeId: null,
+        model: null,
+        thinkingOptionId: null,
+        providerOptions: {},
+        initialDraftText: text,
+        sideChatFromAgentId: "main",
+        forkFrom,
+      },
+      onCreated: vi.fn(),
+    }),
+  );
+  try {
+    expect(inputDraft.replaceText).toHaveBeenCalledExactlyOnceWith(text);
+    expect(createAgent).not.toHaveBeenCalled();
+    const props = vi.mocked(Composer).mock.lastCall?.[0];
+    if (!props?.onSubmitMessage) throw new Error("Expected the composer submit handler");
+    expect(props.allowEmptySubmit).toBe(false);
+    await act(async () => {
+      await expect(props.onSubmitMessage?.({ text, cwd, attachments: [] })).rejects.toThrow(
+        "Retry",
+      );
+    });
+    expect(createAgent).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        initialPrompt: text,
+        workspaceId,
+        sideChatFromAgentId: "main",
+        forkFrom,
+      }),
+    );
+  } finally {
+    view.unmount();
+    useCreateFlowStore.getState().clear({ draftId });
+    store.clearSession(serverId);
+    vi.mocked(useHostRuntimeClient).mockReset();
+    vi.mocked(useAgentInputDraft).mockReset();
+  }
+});
+
 describe("workspace draft main session", () => {
   test("preserves a checked draft when availability changes or the host rejects the request", async () => {
     const serverId = "main-draft-host";
@@ -759,11 +829,13 @@ describe("workspace subagent draft", () => {
       supportsOrigin = true,
       fromHandoff = true,
       forkFrom?: AgentForkSource,
+      sideChatFromAgentId?: string,
     ) =>
       submitDraftCreateRequest({
         draftId: "draft-1",
         parentAgentId,
         forkFrom,
+        sideChatFromAgentId,
         attempt: { clientMessageId: "message-1" },
         text: "Investigate this",
         cwd: "/tmp/project",
@@ -813,6 +885,20 @@ describe("workspace subagent draft", () => {
     expect(secondFork?.forkFrom).toEqual(secondSource);
     expect(firstFork?.idempotencyKey).not.toBe(secondFork?.idempotencyKey);
     expect(retry).toEqual(secondFork);
+    await submit(null, true, false, secondSource, "source-1");
+    const sideChat = createAgent.mock.calls[7]?.[0];
+    expect(sideChat).toMatchObject({
+      forkFrom: secondSource,
+      sideChatFromAgentId: "source-1",
+      initialPrompt: "Investigate this",
+    });
+    expect(sideChat).not.toHaveProperty("callerAgentId");
+    expect(sideChat).not.toHaveProperty("labels");
+    expect(sideChat?.idempotencyKey).not.toBe(secondFork?.idempotencyKey);
+    await expect(submit("source-1", true, false, secondSource, "source-1")).rejects.toThrow(
+      "cannot have a workspace role or parent",
+    );
+    expect(createAgent).toHaveBeenCalledTimes(8);
   });
 
   test("inherits the selected read-only mode and saved options when spawning from Main Control", () => {

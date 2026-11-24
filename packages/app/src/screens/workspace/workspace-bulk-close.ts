@@ -5,6 +5,7 @@ import { i18n } from "@/i18n/i18next";
 export interface BulkClosableTabGroups {
   archiveAgentTabs: Array<{ tabId: string; agentId: string }>;
   layoutOnlyAgentTabs: Array<{ tabId: string; agentId: string }>;
+  sideChatTabs?: Array<{ tabId: string; agentId: string }>;
   terminalTabs: Array<{ tabId: string; terminalId: string }>;
   otherTabs: Array<{ tabId: string; target: WorkspaceTabDescriptor["target"] }>;
 }
@@ -46,13 +47,15 @@ interface CloseBulkWorkspaceTabsInput {
   closeTab: (tabId: string, action: () => Promise<void>) => Promise<void>;
   closeWorkspaceTabWithCleanup: (input: CloseWorkspaceTabWithCleanupInput) => void;
   closeLayoutOnlyAgent: (agentId: string) => Promise<void>;
+  closeSideChat?: (agentId: string) => Promise<void>;
   logLabel: string;
   warn?: (message: string, payload: object) => void;
 }
 
 export function classifyBulkClosableTabs(
   tabs: WorkspaceTabDescriptor[],
-  resolveAgentCloseKind: (agentId: string) => "archive" | "layout-only" = () => "archive",
+  resolveAgentCloseKind: (agentId: string) => "archive" | "layout-only" | "side-chat" = () =>
+    "archive",
 ): BulkClosableTabGroups {
   const groups: BulkClosableTabGroups = {
     archiveAgentTabs: [],
@@ -64,7 +67,10 @@ export function classifyBulkClosableTabs(
   for (const tab of tabs) {
     if (tab.target.kind === "agent") {
       const agentTab = { tabId: tab.tabId, agentId: tab.target.agentId };
-      if (resolveAgentCloseKind(tab.target.agentId) === "layout-only") {
+      const closeKind = resolveAgentCloseKind(tab.target.agentId);
+      if (closeKind === "side-chat") {
+        (groups.sideChatTabs ??= []).push(agentTab);
+      } else if (closeKind === "layout-only") {
         groups.layoutOnlyAgentTabs.push(agentTab);
       } else {
         groups.archiveAgentTabs.push(agentTab);
@@ -86,7 +92,8 @@ export function buildBulkCloseConfirmationMessage(
   labels: BulkCloseConfirmationLabels = DEFAULT_BULK_CLOSE_CONFIRMATION_LABELS,
 ): string {
   const { archiveAgentTabs, layoutOnlyAgentTabs, terminalTabs, otherTabs } = input;
-  const tabCount = layoutOnlyAgentTabs.length + otherTabs.length;
+  const tabCount =
+    layoutOnlyAgentTabs.length + (input.sideChatTabs?.length ?? 0) + otherTabs.length;
   if (archiveAgentTabs.length > 0 && terminalTabs.length > 0 && tabCount > 0) {
     return labels.all({
       agents: archiveAgentTabs.length,
@@ -129,10 +136,23 @@ export async function closeBulkWorkspaceTabs(input: CloseBulkWorkspaceTabsInput)
     closeTab,
     closeWorkspaceTabWithCleanup,
     closeLayoutOnlyAgent,
+    closeSideChat,
     logLabel,
     warn,
   } = input;
   const hasDestructiveTabs = groups.archiveAgentTabs.length > 0 || groups.terminalTabs.length > 0;
+
+  for (const { tabId, agentId } of groups.sideChatTabs ?? []) {
+    await closeTab(tabId, async () => {
+      closeWorkspaceTabWithCleanup({ tabId, target: { kind: "agent", agentId } });
+      await closeSideChat?.(agentId).catch((error) => {
+        warn?.(`[WorkspaceScreen] Failed to discard empty side chat ${logLabel}`, {
+          error,
+          agentId,
+        });
+      });
+    });
+  }
 
   for (const { tabId, agentId } of groups.layoutOnlyAgentTabs) {
     await closeTab(tabId, async () => {

@@ -196,6 +196,7 @@ import { readClipboardImage } from "./clipboard-image";
 import { normalizeNativePastedImages, type NativePastedFile } from "./native-pasted-image";
 import { PluginResourceAttachmentPill, usePluginAttachmentPicker } from "@/plugins";
 import { resolveClientSlashCommand, type ClientSlashCommand } from "@/client-slash-commands";
+import { useAutocompleteCommands } from "@/agent-commands";
 import {
   appendWorkspaceFileAttachment,
   getWorkspaceFileAttachmentKey,
@@ -955,6 +956,7 @@ interface ComposerProps {
   isPaneFocused: boolean;
   onSubmitMessage?: (payload: MessagePayload) => Promise<void>;
   onClientSlashCommand?: (command: ClientSlashCommand) => Promise<void>;
+  allowSideChat?: boolean;
   /** When true, the submit button is enabled even without text or images (e.g. external attachment selected). */
   hasExternalContent?: boolean;
   /** When true, the composer can submit even with no text or attachments. */
@@ -1289,6 +1291,7 @@ function ComposerContentImpl({
   workspaceId,
   onSubmitMessage,
   onClientSlashCommand,
+  allowSideChat = false,
   hasExternalContent = false,
   allowEmptySubmit = false,
   submitButtonAccessibilityLabel,
@@ -1491,6 +1494,24 @@ function ComposerContentImpl({
     workspaceId,
     agentId,
   });
+  const sideChatCommandQuery = useAutocompleteCommands({
+    serverId,
+    agentId,
+    enabled: allowSideChat,
+  });
+  const resolveSubmittedClientCommand = useCallback(
+    (text: string, hasAttachments: boolean) => {
+      const raw = textSource.getSnapshot();
+      return resolveClientSlashCommand({
+        text: raw.trim() === text ? raw : text,
+        hasAttachments,
+        allowSideChat,
+        providerCommands: sideChatCommandQuery.commands,
+        pluginCommands: pluginClientSlashCommands,
+      });
+    },
+    [allowSideChat, pluginClientSlashCommands, sideChatCommandQuery.commands, textSource],
+  );
   const isComposerLocked =
     handoffInputLocked || resolveIsComposerLocked(submitBehavior, isSubmitLoading);
   const keyboardHandlerIdRef = useRef(
@@ -1614,31 +1635,46 @@ function ComposerContentImpl({
       if (command.execution !== "immediate" || !onClientSlashCommand) {
         return false;
       }
+      if (command.kind === "side-chat") {
+        if (!allowSideChat) return false;
+        if (sideChatCommandQuery.isLoading || sideChatCommandQuery.isError) {
+          setSendError(sideChatCommandQuery.error?.message ?? t("composer.errors.alreadyLoading"));
+          return true;
+        }
+      }
       const finish = beginComposerWork(serverId, agentId, "submit");
       if (!finish) return true;
 
       if (blurOnSubmit) {
         messageInputRef.current?.blur();
       }
-      clearDraft("sent");
-      replaceUserInput("");
-      setSelectedAttachments([]);
-      resetSuppression();
+      const clearCommandDraft = () => {
+        clearDraft("sent");
+        replaceUserInput("");
+        setSelectedAttachments([]);
+        resetSuppression();
+      };
+      const isSideChat = command.kind === "side-chat";
+      if (!isSideChat) clearCommandDraft();
       setSendError(null);
       setIsProcessing(true);
-      void Promise.resolve()
-        .then(() => onClientSlashCommand(command))
-        .catch((error) => {
+      const execute = async () => {
+        try {
+          await onClientSlashCommand(command);
+          if (isSideChat) clearCommandDraft();
+        } catch (error) {
           console.error("[Composer] Failed to run client slash command:", error);
           setSendError(error instanceof Error ? error.message : String(error));
-        })
-        .finally(() => {
+        } finally {
           finish();
           setIsProcessing(false);
-        });
+        }
+      };
+      void execute();
       return true;
     },
     [
+      allowSideChat,
       blurOnSubmit,
       clearDraft,
       agentId,
@@ -1647,6 +1683,10 @@ function ComposerContentImpl({
       resetSuppression,
       setSelectedAttachments,
       replaceUserInput,
+      sideChatCommandQuery.error,
+      sideChatCommandQuery.isError,
+      sideChatCommandQuery.isLoading,
+      t,
     ],
   );
 
@@ -1931,10 +1971,10 @@ function ComposerContentImpl({
     (payload: MessagePayload) => {
       if (isHandoffLocked()) return;
       const outgoingAttachments = buildOutgoingAttachments(attachments);
-      const clientSlashCommand = resolveClientSlashCommand({
-        text: payload.text,
-        hasAttachments: outgoingAttachments.length > 0,
-      });
+      const clientSlashCommand = resolveSubmittedClientCommand(
+        payload.text,
+        outgoingAttachments.length > 0,
+      );
       if (clientSlashCommand && runClientSlashCommand(clientSlashCommand)) {
         return;
       }
@@ -1958,6 +1998,7 @@ function ComposerContentImpl({
       rejectQuotedSlashCommand,
       buildOutgoingAttachments,
       runClientSlashCommand,
+      resolveSubmittedClientCommand,
       pluginClientSlashCommands,
       runPluginClientSlashCommand,
       sendMessageWithContent,
@@ -2214,10 +2255,10 @@ function ComposerContentImpl({
     (payload: MessagePayload) => {
       if (isHandoffLocked()) return;
       const outgoingAttachments = buildOutgoingAttachments(attachments);
-      const clientSlashCommand = resolveClientSlashCommand({
-        text: payload.text,
-        hasAttachments: outgoingAttachments.length > 0,
-      });
+      const clientSlashCommand = resolveSubmittedClientCommand(
+        payload.text,
+        outgoingAttachments.length > 0,
+      );
       if (clientSlashCommand && runClientSlashCommand(clientSlashCommand)) {
         return;
       }
@@ -2237,6 +2278,7 @@ function ComposerContentImpl({
       pluginClientSlashCommands,
       queueMessage,
       rejectQuotedSlashCommand,
+      resolveSubmittedClientCommand,
       runClientSlashCommand,
       runPluginClientSlashCommand,
     ],
@@ -2627,11 +2669,13 @@ function ComposerContentImpl({
       agentId,
       draft: commandDraft,
       canExecuteClientSlashCommand: buildOutgoingAttachments(attachments).length === 0,
+      allowSideChat,
       onClientSlashCommand: runClientSlashCommand,
       pluginClientSlashCommands,
     }),
     [
       replaceUserInput,
+      allowSideChat,
       serverId,
       agentId,
       commandDraft,

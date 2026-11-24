@@ -14,7 +14,7 @@ import {
   type AgentLabelSource,
 } from "@getpaseo/protocol/agent-labels";
 import type { AgentForkSource } from "@getpaseo/protocol/messages";
-import { appendQuoteAttachment } from "@/attachments/quote";
+import { appendQuoteAttachment, createQuoteAttachment } from "@/attachments/quote";
 import type { WorkspaceComposerAttachment } from "@/attachments/types";
 import { hasDraftContent } from "@/composer/draft/input-draft-core";
 import type { AssistantForkTarget } from "@/components/assistant-fork-menu";
@@ -33,7 +33,8 @@ import {
 } from "@/stores/draft-keys";
 import { useDraftStore } from "@/stores/draft-store";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
-import { useSessionStore } from "@/stores/session-store";
+import { useSessionStore, type AgentTimelineState } from "@/stores/session-store";
+import type { StreamItem } from "@/types/stream";
 import {
   buildDraftWorkspaceAttachmentScopeKey,
   useWorkspaceAttachmentsStore,
@@ -232,6 +233,89 @@ function buildForkDraftTabTarget(
   draftId: string,
 ): WorkspaceTabTarget {
   return setup ? { kind: "draft", draftId, setup } : { kind: "draft", draftId };
+}
+
+export function buildSideChatDraftSetup(input: {
+  agentId: string;
+  agent: ForkAgentSource & AgentLabelSource;
+  timeline: AgentTimelineState;
+  liveItems?: readonly StreamItem[];
+  text?: string;
+}): WorkspaceDraftTabSetup | undefined {
+  const { agentId, agent, timeline, liveItems, text } = input;
+  const setup = buildForkDraftSetup(agent);
+  if (!setup || timeline.status !== "synced") return undefined;
+  const boundary = getVisibleSideChatBoundary(timeline, liveItems ?? []);
+  if (!boundary) return undefined;
+  return {
+    ...setup,
+    sideChatFromAgentId: agentId,
+    forkFrom: { sourceAgentId: agentId, ...boundary },
+    ...(text ? { initialDraftText: text } : {}),
+  };
+}
+
+function getVisibleSideChatBoundary(
+  timeline: Extract<AgentTimelineState, { status: "synced" }>,
+  liveItems: readonly StreamItem[],
+): ForkAgentBoundary | undefined {
+  let boundaryCursor = timeline.range
+    ? { epoch: timeline.range.epoch, seq: timeline.range.endSeq }
+    : undefined;
+  let boundaryMessageId: string | undefined;
+  for (const item of [...timeline.items, ...liveItems]) {
+    const cursor = item.timelineCursor;
+    if (
+      cursor &&
+      (!boundaryCursor ||
+        (cursor.epoch === boundaryCursor.epoch && cursor.seq > boundaryCursor.seq))
+    ) {
+      boundaryCursor = cursor;
+    }
+    if ((item.kind === "assistant_message" || item.kind === "user_message") && item.messageId) {
+      boundaryMessageId = item.messageId;
+    }
+  }
+  if (boundaryCursor) return { boundaryCursor };
+  if (boundaryMessageId) return { boundaryMessageId };
+  if (
+    timeline.items.length ||
+    liveItems.length ||
+    timeline.older !== "none" ||
+    timeline.newer !== "none"
+  )
+    return undefined;
+  // The empty prefix stays empty even if the Main Session receives messages before submit.
+  return { boundaryCursor: { epoch: "", seq: 0 } };
+}
+
+export function openSideChatDraft(input: {
+  serverId: string;
+  workspaceId: string;
+  setup: WorkspaceDraftTabSetup;
+}): void {
+  navigateToWorkspace({
+    serverId: input.serverId,
+    workspaceId: input.workspaceId,
+    target: buildForkDraftTabTarget(input.setup, generateDraftId()),
+    asTab: true,
+  });
+}
+
+export async function appendSideChatReplyToDraft(input: {
+  draftKey: string;
+  text: string;
+  canQuote: () => boolean;
+}): Promise<boolean> {
+  const quote = createQuoteAttachment({ text: input.text });
+  if (!quote.text) return false;
+  await useDraftStore.getState().hydrateDraftInput({ draftKey: input.draftKey });
+  if (!input.canQuote()) return false;
+  useDraftStore.getState().updateDraftInput({
+    draftKey: input.draftKey,
+    update: (current) => ({ ...current, attachments: [...current.attachments, quote] }),
+  });
+  return true;
 }
 
 function openForkDraftInWorkspace(input: {

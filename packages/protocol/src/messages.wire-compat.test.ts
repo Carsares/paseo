@@ -6,6 +6,9 @@ import {
   MutableDaemonConfigPatchSchema,
   UsageReportEntrySchema,
   AgentForkSourceSchema,
+  AgentCreateRequestSchema,
+  CreateAgentRequestMessageSchema,
+  DeleteAgentRequestMessageSchema,
   CreationSnapshotSchema,
   CreationSubscribeResponseSchema,
   AgentSnapshotPayloadSchema,
@@ -108,6 +111,42 @@ test("fork sources require a source agent and validate optional boundaries", () 
   ]) {
     expect(AgentForkSourceSchema.safeParse(invalid).success).toBe(false);
   }
+});
+
+test("side chat creation and cleanup extend legacy wire messages with optional fields", () => {
+  for (const schema of [CreateAgentRequestMessageSchema, AgentCreateRequestSchema]) {
+    const type = schema.shape.type.value;
+    const original = { type, requestId: "side-1", config: { provider: "codex", cwd: "/repo" } };
+    const sideChat = {
+      ...original,
+      sideChatFromAgentId: "source",
+      forkFrom: { sourceAgentId: "source", boundaryCursor: { epoch: "", seq: 0 } },
+    };
+    expect(schema.parse(original)).not.toHaveProperty("sideChatFromAgentId");
+    expect(schema.parse(sideChat)).toMatchObject(sideChat);
+    expect(schema.omit({ sideChatFromAgentId: true }).parse(sideChat)).toEqual(
+      schema.parse({ ...original, forkFrom: sideChat.forkFrom }),
+    );
+    expect(schema.safeParse({ ...sideChat, sideChatFromAgentId: "" }).success).toBe(false);
+  }
+
+  const deletion = { type: "delete_agent_request", requestId: "delete-1", agentId: "side-1" };
+  const conditional = { ...deletion, onlyIfEmptySideChat: true };
+  expect(DeleteAgentRequestMessageSchema.parse(deletion)).toEqual(deletion);
+  expect(DeleteAgentRequestMessageSchema.parse(conditional)).toEqual(conditional);
+  expect(
+    DeleteAgentRequestMessageSchema.omit({ onlyIfEmptySideChat: true }).parse(conditional),
+  ).toEqual(deletion);
+});
+
+test("agentSideChat is optional in the server handshake and survives wire validation", () => {
+  const legacyFeatures = z.object({ agentSeamlessContextSwitch: z.boolean().optional() });
+  const info = { status: "server_info", serverId: "server-1" };
+  const features = { agentSeamlessContextSwitch: true, agentSideChat: true };
+  expect(ServerInfoStatusPayloadSchema.parse(info).features).toBeUndefined();
+  expect(legacyFeatures.parse(features)).toEqual({ agentSeamlessContextSwitch: true });
+  const envelope = { type: "session", message: { type: "status", payload: { ...info, features } } };
+  expect(validateWSOutboundMessage(envelope)).toMatchObject({ success: true, data: envelope });
 });
 
 test("agent and workspace creation accept and preserve optional fork sources", () => {

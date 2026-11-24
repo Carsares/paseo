@@ -188,7 +188,8 @@ function resolveDraftSubmitPolicy(
   const isTimelineFork = Boolean(setup?.forkFrom);
   return {
     isTimelineFork,
-    allowEmptyText: isTimelineFork || pendingAutoSubmit?.allowEmptyText === true,
+    allowEmptyText:
+      !setup?.sideChatFromAgentId && (isTimelineFork || pendingAutoSubmit?.allowEmptyText === true),
     requiresUserPromptOrigin: !isTimelineFork && setup?.restoreChatHistory === true,
   };
 }
@@ -197,6 +198,7 @@ interface DraftCreateRequestInput {
   draftId: string;
   parentAgentId?: string | null;
   forkFrom?: AgentForkSource;
+  sideChatFromAgentId?: string;
   attempt: { clientMessageId: string; workspaceRole?: "main" };
   assertWorkspaceMainAvailable?: () => void;
   imageEncodingFailedMessage?: string;
@@ -275,10 +277,20 @@ async function buildDraftRequestMessage(input: DraftCreateRequestInput) {
 export async function submitDraftCreateRequest(
   input: DraftCreateRequestInput,
 ): Promise<{ agentId: string | null; result: AgentSnapshotPayload }> {
-  const { client, workspaceDirectory, workspaceId, composerState, forkFrom } = input;
+  const { client, workspaceDirectory, workspaceId, composerState, forkFrom, sideChatFromAgentId } =
+    input;
   invariant(workspaceDirectory, "Workspace directory is required");
   invariant(workspaceId, "Workspace id is required");
   if (!client) throw new Error(input.hostDisconnectedMessage);
+  if (sideChatFromAgentId) {
+    invariant(
+      forkFrom?.sourceAgentId === sideChatFromAgentId &&
+        (forkFrom.boundaryCursor || forkFrom.boundaryMessageId) &&
+        !input.parentAgentId &&
+        !input.attempt.workspaceRole,
+      "Side chat requires a fixed fork source and cannot have a workspace role or parent",
+    );
+  }
 
   const config = buildDraftRequestConfig(input);
   const { silent, fields } = await buildDraftRequestMessage(input);
@@ -288,6 +300,7 @@ export async function submitDraftCreateRequest(
     ...fields,
     ...buildDraftCaller(input),
     ...(forkFrom ? { forkFrom } : {}),
+    ...(sideChatFromAgentId ? { sideChatFromAgentId } : {}),
     ...(Object.keys(composerState.metadata).length > 0 ? { metadata: composerState.metadata } : {}),
   };
   const result = await client.createAgent({
@@ -559,6 +572,7 @@ export function WorkspaceDraftComposer({
     onInitialized: handleInitialTextApplied,
   });
   const pendingAutoSubmit = useWorkspaceDraftSubmissionStore((state) => {
+    if (draftSetup?.sideChatFromAgentId) return null;
     const pending = state.pendingByDraftId[draftId] ?? null;
     return pending?.serverId === serverId && pending.workspaceId === workspaceId ? pending : null;
   });
@@ -666,6 +680,13 @@ export function WorkspaceDraftComposer({
           selectModelMessage: t("workspaceSetup.errors.selectModel"),
         }),
       createRequest: async ({ attempt, text, images, attachments, cwd }) => {
+        // COMPAT(agentSideChat): added in v0.17.0, remove gate after 2027-06-01.
+        if (
+          draftSetup?.sideChatFromAgentId &&
+          !selectHostFeature(useSessionStore.getState(), serverId, "agentSideChat")
+        ) {
+          throw new Error(t("message.actions.forkUnavailable"));
+        }
         const hasInitialMessage = Boolean(text.trim() || images?.length || attachments?.length);
         // An empty fork has no incoming user message for the create flow to hand off.
         const forkOnly = isTimelineFork && !hasInitialMessage;
@@ -677,6 +698,7 @@ export function WorkspaceDraftComposer({
           draftId,
           parentAgentId,
           forkFrom: draftSetup?.forkFrom,
+          sideChatFromAgentId: draftSetup?.sideChatFromAgentId,
           attempt,
           assertWorkspaceMainAvailable: () => {
             const block = getMainBlock();
@@ -785,7 +807,10 @@ export function WorkspaceDraftComposer({
   const handleDropdownCloseFocus = useCallback(() => {
     focusInputRef.current?.();
   }, []);
-  const importPillPress = resolveImportPillPress(onOpenImportSheet, isSubmitting);
+  const importPillPress = resolveImportPillPress(
+    draftSetup?.sideChatFromAgentId ? undefined : onOpenImportSheet,
+    isSubmitting,
+  );
   const { readForSubmit } = mainPreference;
   const submitDraft = useCallback(
     async (payload: MessagePayload) => {
@@ -828,7 +853,7 @@ export function WorkspaceDraftComposer({
         workspaceId={workspaceId}
         isPaneFocused={isPaneFocused}
         onSubmitMessage={submitDraft}
-        allowEmptySubmit={isTimelineFork || mainPreference.checked}
+        allowEmptySubmit={allowEmptyText || mainPreference.checked}
         submitBehavior={mainPreference.checked ? "preserve-and-lock" : "clear"}
         isSubmitLoading={isSubmitting || !areDraftAttachmentsReady}
         blurOnSubmit={true}

@@ -17,6 +17,34 @@ describe("New tab identity", () => {
   });
 });
 
+it("preserves the source and fixed fork boundary of a restored side-chat draft", () => {
+  const target = {
+    kind: "draft",
+    draftId: "draft",
+    setup: {
+      provider: "codex",
+      cwd: "/repo",
+      modeId: null,
+      model: null,
+      thinkingOptionId: null,
+      providerOptions: {},
+      sideChatFromAgentId: "main",
+      forkFrom: { sourceAgentId: "main", boundaryCursor: { epoch: "timeline", seq: 12 } },
+      initialDraftText: "  Why?  \n",
+    },
+  } as const;
+  const restored = normalizeWorkspaceTabTarget(target);
+  expect(restored).toMatchObject(target);
+  if (!restored) throw new Error("Draft did not restore");
+  expect(workspaceTabTargetsEqual(restored, target)).toBe(true);
+  expect(
+    workspaceTabTargetsEqual(restored, {
+      ...target,
+      setup: { ...target.setup, sideChatFromAgentId: undefined },
+    }),
+  ).toBe(false);
+});
+
 describe("provider subagent tab identity", () => {
   test("normalizes and compares the parent and provider child as one tab identity", () => {
     const target = normalizeWorkspaceTabTarget({

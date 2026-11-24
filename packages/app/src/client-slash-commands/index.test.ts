@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CLIENT_SLASH_COMMANDS,
+  availableClientSlashCommands,
   buildDraftAgentSetup,
   resolveClientSlashCommand,
 } from "@/client-slash-commands";
@@ -59,6 +60,7 @@ describe("resolveClientSlashCommand", () => {
     ).toEqual([
       ["exit", ["quit", "q"], "immediate"],
       ["clear", ["new"], "immediate"],
+      ["side", ["btw"], "immediate"],
     ]);
   });
 
@@ -94,6 +96,47 @@ describe("resolveClientSlashCommand", () => {
     ).toBeNull();
     expect(resolveClientSlashCommand({ text: "hello /quit", hasAttachments: false })).toBeNull();
     expect(resolveClientSlashCommand({ text: "/quit", hasAttachments: true })).toBeNull();
+  });
+
+  it("resolves a bare side chat and preserves the exact argument text", () => {
+    const options = { allowSideChat: true, hasAttachments: false };
+    expect(resolveClientSlashCommand({ ...options, text: "/side" })).toMatchObject({
+      kind: "side-chat",
+      argumentText: "",
+    });
+    expect(
+      resolveClientSlashCommand({ ...options, text: "  /btw  a /clear   \n\tb\n" }),
+    ).toMatchObject({ kind: "side-chat", argumentText: " a /clear   \n\tb\n" });
+    for (const text of ["/side: text", "/btw/path", "say /btw", "/sidebar"]) {
+      expect(resolveClientSlashCommand({ ...options, text })).toBeNull();
+    }
+    expect(
+      resolveClientSlashCommand({ ...options, text: "/side", hasAttachments: true }),
+    ).toBeNull();
+    expect(
+      resolveClientSlashCommand({ ...options, text: "/side", allowSideChat: false }),
+    ).toBeNull();
+  });
+
+  it("keeps the available alias when a provider owns the other token", () => {
+    const options = {
+      allowSideChat: true,
+      hasAttachments: false,
+      providerCommands: [{ name: "side" }],
+    };
+    expect(
+      availableClientSlashCommands(options).find(({ kind }) => kind === "side-chat"),
+    ).toMatchObject({ name: "btw", aliases: [] });
+    expect(resolveClientSlashCommand({ ...options, text: "/side provider args" })).toBeNull();
+    expect(resolveClientSlashCommand({ ...options, text: "/btw my question" })).toMatchObject({
+      kind: "side-chat",
+      argumentText: "my question",
+    });
+    expect(
+      availableClientSlashCommands({ ...options, pluginCommands: [{ name: "btw" }] }).some(
+        ({ kind }) => kind === "side-chat",
+      ),
+    ).toBe(false);
   });
 });
 

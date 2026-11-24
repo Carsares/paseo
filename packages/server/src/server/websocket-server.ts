@@ -2313,6 +2313,7 @@ export class VoiceAssistantWebSocketServer {
         agentSessionReset: true,
         workspaceMainAgentDefault: true,
         agentCreateAsMain: true,
+        agentSideChat: true,
         workspaceAgentsSummary: true,
         agentHistoryWorkspaceFilter: true,
         // COMPAT(agentInitialPromptOrigin): added in v0.16.0, remove gate after 2027-05-19.

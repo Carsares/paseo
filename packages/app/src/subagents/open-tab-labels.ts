@@ -1,10 +1,29 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { getOpenAgentTabLabel } from "@getpaseo/protocol/agent-labels";
 import { useSessionStore, type Agent } from "@/stores/session-store";
+import { isWeb } from "@/constants/platform";
+import { generateDraftId } from "@/stores/draft-keys";
 import { getOrCreateClientId } from "@/utils/client-id";
 import { normalizeWorkspaceOpaqueId } from "@/utils/workspace-identity";
 import type { WorkspaceTab } from "@/workspace-tabs/model";
-import { resolveCloseAgentTabPolicy } from "./close-tab-policy";
+import { isSideChat, resolveCloseAgentTabPolicy } from "./close-tab-policy";
+
+let sideChatWindowId: string | undefined;
+
+export function getSideChatOpenTabLabel(): string {
+  if (!sideChatWindowId) {
+    const key = "paseo:side-chat-window";
+    const generated = generateDraftId();
+    try {
+      const storage = isWeb ? window.sessionStorage : null;
+      sideChatWindowId = storage?.getItem(key) ?? generated;
+      storage?.setItem(key, sideChatWindowId);
+    } catch {
+      sideChatWindowId = generated;
+    }
+  }
+  return getOpenAgentTabLabel(sideChatWindowId);
+}
 
 export async function clearSubagentOpenTabLabel(input: {
   client: Pick<DaemonClient, "updateAgent">;
@@ -32,7 +51,8 @@ export function needsOpenAgentTabLabel(
   workspaceId?: string | null,
 ): agent is Agent {
   return Boolean(
-    agent?.parentAgentId &&
+    agent &&
+    (isSideChat(agent) || agent.parentAgentId) &&
     agent.labels[label] !== "true" &&
     (workspaceId === undefined ||
       normalizeWorkspaceOpaqueId(agent.workspaceId) === normalizeWorkspaceOpaqueId(workspaceId)),
@@ -43,6 +63,7 @@ export function getAgentTabsNeedingOpenLabel(input: {
   tabs: WorkspaceTab[];
   getAgent: (agentId: string) => Agent | null | undefined;
   label: string;
+  sideChatLabel?: string;
   pendingAgentIds: ReadonlySet<string>;
   workspaceId?: string | null;
 }): string[] {
@@ -52,8 +73,10 @@ export function getAgentTabsNeedingOpenLabel(input: {
       continue;
     }
     const agent = input.getAgent(tab.target.agentId);
+    const label = isSideChat(agent) ? input.sideChatLabel : input.label;
     if (
-      needsOpenAgentTabLabel(agent, input.label, input.workspaceId) &&
+      label &&
+      needsOpenAgentTabLabel(agent, label, input.workspaceId) &&
       !input.pendingAgentIds.has(agent.id)
     ) {
       agentIds.add(agent.id);

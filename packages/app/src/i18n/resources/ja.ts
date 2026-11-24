@@ -218,6 +218,7 @@ export const ja: TranslationResources = {
       fileTooLarge: "{{fileName}}が大きすぎます（最大{{size}}）",
     },
     clientCommands: {
+      sideChat: "サイドチャットを開始",
       archiveAgent: "現在のエージェントをアーカイブ",
       freshDraft: "このエージェントをアーカイブして新しい下書きを開始",
     },

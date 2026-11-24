@@ -34,6 +34,35 @@ function makeFileTab(path: string): WorkspaceTabDescriptor {
 }
 
 describe("workspace bulk close helpers", () => {
+  it("keeps side chats out of the archive request when closing mixed tabs", async () => {
+    const groups = classifyBulkClosableTabs(
+      [makeAgentTab("side"), makeAgentTab("ordinary")],
+      (id) => (id === "side" ? "side-chat" : "archive"),
+    );
+    const closeItems = vi.fn(async () => ({ agents: [], terminals: [], requestId: "close" }));
+    const closeSideChat = vi.fn(async () => {});
+    const cleanup = vi.fn();
+    await closeBulkWorkspaceTabs({
+      groups,
+      workspaceId: "workspace",
+      client: { closeItems },
+      closeTab: async (_, action) => action(),
+      closeLayoutOnlyAgent: async () => {},
+      closeSideChat,
+      closeWorkspaceTabWithCleanup: cleanup,
+      logLabel: "mixed tabs",
+    });
+    expect(closeSideChat).toHaveBeenCalledExactlyOnceWith("side");
+    expect(closeItems).toHaveBeenCalledExactlyOnceWith({
+      agentIds: ["ordinary"],
+      terminalIds: [],
+      expectedWorkspaceId: "workspace",
+    });
+    expect(cleanup).toHaveBeenCalledWith({
+      tabId: "agent_side",
+      target: { kind: "agent", agentId: "side" },
+    });
+  });
   it("classifies agent, terminal, and passive tabs for shared bulk close handling", () => {
     const groups = classifyBulkClosableTabs([
       makeAgentTab("a1"),
