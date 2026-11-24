@@ -1575,7 +1575,12 @@ export class AgentManager {
   private readonly rewindDaemonEpoch = randomUUID();
   private readonly rewindTurns = new Map<
     string,
-    { scope: CheckpointScope; turn: TurnCheckpoint }
+    {
+      scope: CheckpointScope;
+      turn: TurnCheckpoint;
+      checkpoints: AgentRewindCheckpoints;
+      runToken: string;
+    }
   >();
 
   constructor(options: AgentManagerOptions) {
@@ -7044,7 +7049,7 @@ export class AgentManager {
     options?: AgentRunOptions;
     promptStart?: ForegroundPromptStart;
   }): Promise<string | null> {
-    const { agent, agentId, pendingRun, prompt, options, promptStart } = params;
+    const { agent, agentId, pendingRun, prompt, promptStart } = params;
     if (promptStart?.admit?.() === false) {
       this.runs.settleForegroundRun(agentId, pendingRun.token);
       return null;
@@ -7066,8 +7071,6 @@ export class AgentManager {
               specialists,
             )
           : prompt;
-      await this.captureRewindTurn(agent, prompt, options);
-      assertNoFileRewind(this, agent.cwd);
       const result = await this.startAdmittedProviderTurn(params, providerPrompt);
       if (specialists) this.promptedResidentSpecialists.set(agent.session, specialists);
       if (addedMainControl) this.promptedMainControlRoleVersions.set(agentId, roleVersion);
@@ -7075,47 +7078,55 @@ export class AgentManager {
       this.assertPendingTurnStart(agentId, pendingRun);
       return result.turnId;
     } catch (error) {
-      if (error instanceof AgentTurnStartCanceledError) {
-        await this.settleRewindTurn(agent, "cancelled");
-        return this.finishCanceledForegroundStart(params, error);
-      }
-      await this.settleRewindTurn(agent, "failed");
-      if (pendingRun.settled) {
-        throw error;
-      }
-      if (isStaleProviderSessionError(error)) {
-        this.runs.settleForegroundStart(pendingRun, {
-          status: "failed",
-          error: error.message,
-          stale: true,
-        });
-        agent.pendingReplacement = false;
-        if (!agent.activeForegroundTurnId) agent.lifecycle = "idle";
-        this.runs.settleForegroundRun(agentId, pendingRun.token);
-        throw error;
-      }
-      agent.pendingReplacement = false;
-      const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
-      this.runs.settleForegroundStart(pendingRun, foregroundStartFailure(error, errorMsg));
-      try {
-        // A terminal rejection belongs after the submitted prompt even though no provider turn exists.
-        if (options?.clientMessageId) {
-          this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "rejected", {
-            messageId: options.clientMessageId,
-          });
-        }
-        await this.handleStreamEvent(agent, {
-          type: "turn_failed",
-          provider: agent.provider,
-          error: errorMsg,
-        });
-        this.finalizeForegroundTurn(agent);
-      } finally {
-        // A steer waiting on this start is released only once the run is cleared.
-        this.runs.settleForegroundRun(agentId, pendingRun.token);
-      }
+      return this.finishFailedForegroundStart(params, error);
+    }
+  }
+
+  private async finishFailedForegroundStart(
+    params: Parameters<AgentManager["startPendingForegroundTurn"]>[0],
+    error: unknown,
+  ): Promise<null> {
+    const { agent, agentId, pendingRun, prompt, options } = params;
+    const rewind = this.settleFailedRewindStart(params, error);
+    if (rewind) await rewind;
+    if (error instanceof AgentTurnStartCanceledError) {
+      return this.finishCanceledForegroundStart(params, error);
+    }
+    if (pendingRun.settled) {
       throw error;
     }
+    if (isStaleProviderSessionError(error)) {
+      this.runs.settleForegroundStart(pendingRun, {
+        status: "failed",
+        error: error.message,
+        stale: true,
+      });
+      agent.pendingReplacement = false;
+      if (!agent.activeForegroundTurnId) agent.lifecycle = "idle";
+      this.runs.settleForegroundRun(agentId, pendingRun.token);
+      throw error;
+    }
+    agent.pendingReplacement = false;
+    const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
+    this.runs.settleForegroundStart(pendingRun, foregroundStartFailure(error, errorMsg));
+    try {
+      // A terminal rejection belongs after the submitted prompt even though no provider turn exists.
+      if (options?.clientMessageId) {
+        this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "rejected", {
+          messageId: options.clientMessageId,
+        });
+      }
+      await this.handleStreamEvent(agent, {
+        type: "turn_failed",
+        provider: agent.provider,
+        error: errorMsg,
+      });
+      this.finalizeForegroundTurn(agent);
+    } finally {
+      // A steer waiting on this start is released only once the run is cleared.
+      this.runs.settleForegroundRun(agentId, pendingRun.token);
+    }
+    throw error;
   }
 
   private async finishCanceledForegroundStart(
@@ -7152,7 +7163,19 @@ export class AgentManager {
     params: Parameters<AgentManager["startPendingForegroundTurn"]>[0],
     providerPrompt: AgentPromptInput,
   ) {
+    this.assertPendingTurnStart(params.agentId, params.pendingRun);
+    const capture = this.prepareRewindTurnCapture(params);
+    const dispatch = () => this.dispatchAdmittedProviderTurn(params, providerPrompt);
+    // Skipping checkpoint collection must not defer provider dispatch.
+    return capture ? capture.then(dispatch) : dispatch();
+  }
+
+  private dispatchAdmittedProviderTurn(
+    params: Parameters<AgentManager["startPendingForegroundTurn"]>[0],
+    providerPrompt: AgentPromptInput,
+  ) {
     const { agent, agentId, pendingRun, options, promptStart } = params;
+    assertNoFileRewind(this, agent.cwd);
     const validate = () => {
       this.assertPendingTurnStart(agentId, pendingRun);
     };
@@ -8594,22 +8617,55 @@ export class AgentManager {
     }
   }
 
+  private prepareRewindTurnCapture({
+    agent,
+    pendingRun,
+    prompt,
+    options,
+  }: Parameters<AgentManager["startPendingForegroundTurn"]>[0]): Promise<void> | undefined {
+    const { rewindDirectories, rewindCheckpoints } = this;
+    const clientMessageId = options?.clientMessageId;
+    if (!rewindDirectories || !rewindCheckpoints || !clientMessageId) return;
+    if (!agent.workspaceId || isMainControlAgentLabels(agent.labels) || agent.internal) return;
+    return this.captureRewindTurn(
+      agent,
+      pendingRun,
+      prompt,
+      clientMessageId,
+      rewindDirectories,
+      rewindCheckpoints,
+    );
+  }
+
+  private settleFailedRewindStart(
+    { agent, pendingRun }: Parameters<AgentManager["startPendingForegroundTurn"]>[0],
+    error: unknown,
+  ): Promise<void> | undefined {
+    const capture = this.rewindTurns.get(agent.id);
+    if (capture?.runToken !== pendingRun.token) return;
+    const outcome =
+      pendingRun.settled || error instanceof AgentTurnStartCanceledError ? "cancelled" : "failed";
+    this.rewindTurns.delete(agent.id);
+    return this.settleRewindTurn(capture, outcome);
+  }
+
   private async captureRewindTurn(
     agent: ActiveManagedAgent,
+    pendingRun: PendingForegroundRun,
     prompt: AgentPromptInput,
-    options?: AgentRunOptions,
+    clientMessageId: string,
+    directories: AgentRewindDirectories,
+    checkpoints: AgentRewindCheckpoints,
   ): Promise<void> {
-    const clientMessageId = options?.clientMessageId;
-    if (!this.rewindDirectories || !this.rewindCheckpoints || !clientMessageId) return;
-    if (!agent.workspaceId || isMainControlAgentLabels(agent.labels) || agent.internal) return;
     try {
-      const scope = await getAgentRewindScope(this.rewindDirectories, agent);
+      const scope = await getAgentRewindScope(directories, agent);
       assertNoFileRewind(this, scope.cwd);
       this.assertRewindWritersIdle(scope, true);
-      if (await this.rewindDirectories.hasActiveTerminal?.(scope.cwd)) return;
-      const { service } = this.rewindCheckpoints;
+      if (await directories.hasActiveTerminal?.(scope.cwd)) return;
+      const { service } = checkpoints;
       await service.recoverInterruptedTurns(scope, this.rewindDaemonEpoch);
       const timeline = await service.getActiveTimeline(scope);
+      if (pendingRun.settled) return;
       const turn = await service.acceptTurn({
         scope,
         timelineId: timeline?.id ?? agent.id,
@@ -8617,27 +8673,38 @@ export class AgentManager {
         turnId: clientMessageId,
         message: { id: clientMessageId, clientMessageId, text: submittedPromptText(prompt) },
       });
-      if (!turn.settled) this.rewindTurns.set(agent.id, { scope, turn });
+      if (turn.settled) return;
+      const capture = { scope, turn, checkpoints, runToken: pendingRun.token };
+      if (pendingRun.settled) {
+        await this.settleRewindTurn(capture, "cancelled");
+        return;
+      }
+      this.rewindTurns.set(agent.id, capture);
     } catch (error) {
       this.logger.debug({ err: error, agentId: agent.id }, "File checkpoint unavailable");
     }
   }
 
-  private async settleRewindTurn(agent: ActiveManagedAgent, outcome: TurnOutcome): Promise<void> {
-    const capture = this.rewindTurns.get(agent.id);
-    if (!capture || !this.rewindCheckpoints) return;
-    this.rewindTurns.delete(agent.id);
-    const submitted = this.timelineStore.getSubmittedUserMessage(agent.id, capture.turn.message.id);
+  private async settleRewindTurn(
+    {
+      scope,
+      turn,
+      checkpoints,
+    }: { scope: CheckpointScope; turn: TurnCheckpoint; checkpoints: AgentRewindCheckpoints },
+    outcome: TurnOutcome,
+  ): Promise<void> {
+    const { agentId } = scope;
+    const submitted = this.timelineStore.getSubmittedUserMessage(agentId, turn.message.id);
     try {
-      await this.rewindCheckpoints.service.settleTurn({
-        scope: capture.scope,
-        timelineId: capture.turn.timelineId,
-        turnId: capture.turn.turnId,
+      await checkpoints.service.settleTurn({
+        scope,
+        timelineId: turn.timelineId,
+        turnId: turn.turnId,
         outcome,
         providerMessageId: submitted?.providerMessageId,
       });
     } catch (error) {
-      this.logger.warn({ err: error, agentId: agent.id }, "Failed to settle file checkpoint");
+      this.logger.warn({ err: error, agentId }, "Failed to settle file checkpoint");
     }
   }
 
@@ -10238,13 +10305,15 @@ export class AgentManager {
 
     if (!options?.fromHistory) {
       if (isTurnTerminalEvent(event)) {
-        await this.completeTerminalTurn({
+        const rewind = this.settleTerminalRewindTurn(
           agent,
           event,
-          eventTurnId,
           isForegroundEvent,
           terminalDisposition,
-        });
+        );
+        if (rewind) await rewind;
+        this.runs.settleTerminalRun(agent.id, eventTurnId);
+        this.publishTerminalReadiness(agent, eventTurnId, isForegroundEvent, terminalDisposition);
       }
 
       if (flags.shouldDispatchEvent) {
@@ -10271,24 +10340,22 @@ export class AgentManager {
     }
   }
 
-  private async completeTerminalTurn(input: {
-    agent: ActiveManagedAgent;
-    event: TurnTerminalEvent;
-    eventTurnId: string | undefined;
-    isForegroundEvent: boolean;
-    terminalDisposition: ActiveTurnTerminalDisposition;
-  }): Promise<void> {
-    const { agent, event, eventTurnId, isForegroundEvent, terminalDisposition } = input;
-    if (isForegroundEvent && terminalDisposition !== "stale" && this.rewindTurns.has(agent.id)) {
-      const outcome = {
-        turn_failed: "failed",
-        turn_canceled: "cancelled",
-        turn_completed: "succeeded",
-      } as const;
-      await this.settleRewindTurn(agent, outcome[event.type]);
-    }
-    this.runs.settleTerminalRun(agent.id, eventTurnId);
-    this.publishTerminalReadiness(agent, eventTurnId, isForegroundEvent, terminalDisposition);
+  private settleTerminalRewindTurn(
+    agent: ActiveManagedAgent,
+    event: TurnTerminalEvent,
+    isForegroundEvent: boolean,
+    disposition: ActiveTurnTerminalDisposition,
+  ): Promise<void> | undefined {
+    if (!isForegroundEvent || disposition === "stale") return;
+    const capture = this.rewindTurns.get(agent.id);
+    if (!capture) return;
+    this.rewindTurns.delete(agent.id);
+    const outcome = {
+      turn_failed: "failed",
+      turn_canceled: "cancelled",
+      turn_completed: "succeeded",
+    } as const;
+    return this.settleRewindTurn(capture, outcome[event.type]);
   }
 
   private traceHandleStreamEventStart(

@@ -7,7 +7,7 @@ import {
   createAgentMessageDelivery,
 } from "./agent-messages/index.js";
 import { createLifecyclePreparation } from "./restart-recovery/lifecycle-preparation.js";
-import { expect, test, vi, onTestFinished } from "vitest";
+import { describe, expect, test, vi, onTestFinished } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
 import {
   mkdirSync,
@@ -100,7 +100,12 @@ import { CursorACPAgentClient } from "./providers/cursor-acp-agent.js";
 import { fileURLToPath } from "node:url";
 import { V2Harness } from "./providers/opencode/test-utils/v2-harness.js";
 import { createWorktree } from "../../utils/worktree.js";
-import type { PersistedProjectRecord, PersistedWorkspaceRecord } from "../workspace-registry.js";
+import {
+  FileBackedWorkspaceRegistry,
+  createPersistedWorkspaceRecord,
+  type PersistedProjectRecord,
+  type PersistedWorkspaceRecord,
+} from "../workspace-registry.js";
 
 const DESKTOP_OPEN_AGENT_TAB_LABEL = getOpenAgentTabLabel("desktop-client");
 const MOBILE_OPEN_AGENT_TAB_LABEL = getOpenAgentTabLabel("mobile-client");
@@ -2943,7 +2948,7 @@ test("a steer the provider names without echoing it can be rewound to", async ()
   }
 });
 
-test("orders a concurrent replacement after a pending accepted steer", async () => {
+async function assertConcurrentReplacementAfterSteer(kind?: "directory" | "local_checkout") {
   const entered = deferred<void>();
   const release = deferred<void>();
   class HeldAcceptedSteerSession extends SteeringTestSession {
@@ -2959,6 +2964,7 @@ test("orders a concurrent replacement after a pending accepted steer", async () 
   }
   const session = new HeldAcceptedSteerSession({ provider: "codex", cwd: process.cwd() });
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-steer-replace-order-"));
+  const workspaces = new FileBackedWorkspaceRegistry(join(workdir, "workspaces.json"), logger);
   const manager = new AgentManager({
     clients: {
       codex: new (class extends TestAgentClient {
@@ -2970,9 +2976,31 @@ test("orders a concurrent replacement after a pending accepted steer", async () 
     logger,
   });
   let agentId: string | null = null;
+  let replacementRun: AsyncGenerator<AgentStreamEvent> | undefined;
   try {
+    const workspaceId = kind ? "workspace" : undefined;
+    if (workspaceId && kind) {
+      const timestamp = new Date().toISOString();
+      await workspaces.initialize();
+      await workspaces.upsert(
+        createPersistedWorkspaceRecord({
+          workspaceId,
+          projectId: "project",
+          cwd: workdir,
+          kind,
+          displayName: "Test",
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }),
+      );
+      manager.configureRewindCheckpoints({
+        paseoHome: workdir,
+        projects: { get: async () => null },
+        workspaces,
+      });
+    }
     const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
-      workspaceId: undefined,
+      workspaceId,
     });
     agentId = agent.id;
     const initial = manager.streamAgent(agent.id, "initial");
@@ -2994,14 +3022,14 @@ test("orders a concurrent replacement after a pending accepted steer", async () 
 
     release.resolve();
     await expect(steer).resolves.toEqual({ status: "accepted" });
-    const replacementRun = await replacement;
-    void (async () => {
-      for await (const _event of replacementRun) {
-      }
-    })();
+    replacementRun = await replacement;
+    await expect(replacementRun.next()).resolves.toEqual({
+      done: false,
+      value: { type: "turn_started", provider: "codex", turnId: "active-turn-2" },
+    });
     await consumeInitial;
-    await vi.waitFor(() => expect(session.startCount).toBe(2));
 
+    expect(session.startPrompts).toEqual(["initial", "replacement"]);
     expect(session.interruptCount).toBe(1);
     expect(
       manager
@@ -3015,9 +3043,18 @@ test("orders a concurrent replacement after a pending accepted steer", async () 
   } finally {
     release.resolve();
     if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    await replacementRun?.return(undefined);
     rmSync(workdir, { recursive: true, force: true });
   }
-});
+}
+
+test("orders a concurrent replacement after a pending accepted steer", () =>
+  assertConcurrentReplacementAfterSteer());
+
+test.each(["directory", "local_checkout"] as const)(
+  "orders a concurrent replacement after a pending accepted steer in a registered %s",
+  (kind) => assertConcurrentReplacementAfterSteer(kind),
+);
 
 test("does not replace a newer foreground turn after unavailable steer fallback is admitted", async () => {
   const entered = deferred<void>();
@@ -15052,7 +15089,7 @@ test("provider user_message is recorded from the live stream", async () => {
     workspaceId: undefined,
   });
 
-  await manager.runAgent(snapshot.id, { text: "do something" });
+  await manager.runAgent(snapshot.id, "do something");
 
   const timeline = manager.getTimeline(snapshot.id);
   const userMessages = timeline.filter((item) => item.type === "user_message");
@@ -15777,7 +15814,7 @@ test("system-injected prompts appear as trigger tools in the live timeline", asy
     workspaceId: undefined,
   });
 
-  await manager.runAgent(snapshot.id, { text: "do something" });
+  await manager.runAgent(snapshot.id, "do something");
 
   const timeline = manager.getTimeline(snapshot.id);
   expect(timeline).toContainEqual(
@@ -15898,7 +15935,7 @@ test("onWorkspaceStateMayHaveChanged is called when a completed shell tool call 
     workspaceId: undefined,
   });
 
-  await manager.runAgent(snapshot.id, { text: "merge it" });
+  await manager.runAgent(snapshot.id, "merge it");
 
   expect(onWorkspaceStateMayHaveChanged).toHaveBeenCalledTimes(1);
   expect(onWorkspaceStateMayHaveChanged).toHaveBeenCalledWith({ cwd: workdir });
@@ -15934,7 +15971,7 @@ test("onWorkspaceStateMayHaveChanged is not called for non-shell tool calls", as
     workspaceId: undefined,
   });
 
-  await manager.runAgent(snapshot.id, { text: "read it" });
+  await manager.runAgent(snapshot.id, "read it");
 
   expect(onWorkspaceStateMayHaveChanged).not.toHaveBeenCalled();
 });
@@ -15969,7 +16006,7 @@ test("onWorkspaceStateMayHaveChanged is not called for running shell tool calls"
     workspaceId: undefined,
   });
 
-  await manager.runAgent(snapshot.id, { text: "merge it" });
+  await manager.runAgent(snapshot.id, "merge it");
 
   expect(onWorkspaceStateMayHaveChanged).not.toHaveBeenCalled();
 });
@@ -16195,7 +16232,7 @@ test.each(["live", "history"])(
     const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
       workspaceId: undefined,
     });
-    if (path === "live") await manager.runAgent(agent.id, { text: "start" });
+    if (path === "live") await manager.runAgent(agent.id, "start");
     else await manager.hydrateTimelineFromProvider(agent.id, { force: true });
     expect(manager.getTimeline(agent.id)).toContainEqual(
       expect.objectContaining({
@@ -16491,7 +16528,7 @@ test.each(["live", "history", "accepted"] as const)(
           clientMessageId: "report",
         })) {
         }
-      } else await manager.runAgent(agent.id, { text: "start" });
+      } else await manager.runAgent(agent.id, "start");
       expect(
         manager
           .getTimeline(agent.id)
@@ -18279,8 +18316,6 @@ test.each([
 ] as const)(
   "workspace limit recovery survives restart and settles a %s dispatch once",
   async (outcome) => {
-    const { FileBackedWorkspaceRegistry, createPersistedWorkspaceRecord } =
-      await import("../workspace-registry.js");
     const { WorkspaceDeferral } = await import("../workspace-deferral/deferral.js");
     const { AgentLimitRecovery } = await import("../schedule/agent-limit-recovery.js");
     const { MessageReceipts } = await import("../message-receipts/index.js");
