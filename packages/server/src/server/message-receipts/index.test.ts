@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, test } from "vitest";
-import { MessageReceipts } from "./index.js";
+import { fingerprintMessageRequest, MessageReceipts } from "./index.js";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -33,6 +33,43 @@ test("message retries survive reconstruction without submitting twice", async ()
   expect(deliveries).toBe(1);
   await requests.send({ ...input, agentId: "another" });
   expect(deliveries).toBe(2);
+});
+
+test.each([
+  ["completed", "accepted"],
+  ["pending", "unknown"],
+] as const)("a %s receipt only confirms the requested message content", async (state, outcome) => {
+  const { requests, directory } = await fixture();
+  const agentId = "agent";
+  const messageId = "first-question";
+  const request = {
+    prompt: [{ type: "text", text: "Measure startup" }],
+    activeTurnBehavior: "interrupt",
+  };
+  const matchingFingerprint = fingerprintMessageRequest({
+    activeTurnBehavior: "interrupt",
+    prompt: [{ text: "Measure startup", type: "text" }],
+  });
+  const differentFingerprint = fingerprintMessageRequest({
+    ...request,
+    prompt: [{ type: "text", text: "Delete the trace" }],
+  });
+  expect(await requests.outcome(agentId, messageId)).toBe("absent");
+  expect(await requests.outcome(agentId, messageId, matchingFingerprint)).toBe("absent");
+
+  await requests.send({
+    agentId,
+    messageId,
+    request,
+    send: async (beforeDispatch, _declined, onProviderOutcome) => {
+      await beforeDispatch();
+      if (state === "pending") await onProviderOutcome("unknown");
+    },
+  });
+  const restarted = new MessageReceipts(directory);
+  expect(await restarted.outcome(agentId, messageId)).toBe(outcome);
+  expect(await restarted.outcome(agentId, messageId, matchingFingerprint)).toBe(outcome);
+  expect(await restarted.outcome(agentId, messageId, differentFingerprint)).toBe("absent");
 });
 
 test("ambiguous provider delivery is never blindly replayed after restart", async () => {

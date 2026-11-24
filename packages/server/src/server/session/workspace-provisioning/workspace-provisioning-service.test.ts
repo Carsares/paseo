@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync } from "node:fs";
 
 import { afterEach, beforeEach, expect, test } from "vitest";
 
@@ -22,6 +22,7 @@ import {
   type PersistedWorkspaceRecord,
   createPersistedWorkspaceRecord,
   type WorkspaceRegistry,
+  type WorkspaceMutation,
 } from "../../workspace-registry.js";
 import { checkoutLiteFromGitSnapshot } from "../../workspace-registry-model.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
@@ -323,6 +324,53 @@ test("background workspace creation preserves hooks, inheritance and durable vis
   );
   await reloaded.initialize();
   expect((await reloaded.get(child.workspaceId))?.background).toBe(true);
+});
+
+test("writes directory topic metadata before announcing workspace creation", async () => {
+  const workspaceId = "directory-topic";
+  const workspacePath = path.join(tmpDir, "projects", "workspaces.json");
+  const mutations: WorkspaceMutation[] = [];
+  const recordsAtCreation: Array<PersistedWorkspaceRecord | undefined> = [];
+  workspaceRegistry.subscribeToMutations((mutation) => {
+    mutations.push(mutation);
+  });
+  const creator = createWorkspaceProvisioningService({
+    unarchiveWorkspaceAgents: async () => {},
+    workspaceRegistry,
+    projectRegistry,
+    workspaceGitService: gitService(),
+    isDirectory,
+    logger,
+    lifecycle: {
+      emit: (name) => {
+        if (name !== "workspace.create.after") return;
+        const records: PersistedWorkspaceRecord[] = JSON.parse(readFileSync(workspacePath, "utf8"));
+        recordsAtCreation.push(records.find((record) => record.workspaceId === workspaceId));
+      },
+      wait: async () => {},
+      before: async (_name, request) => request,
+    },
+  });
+  const dir = path.join(tmpDir, "plain");
+  const topic = { summary: "First line\nSecond line", hideFromModel: true };
+  const created = await creator.createWorkspaceForDirectory(dir, "  Startup  ", undefined, {
+    workspaceId,
+    topic,
+  });
+
+  expect(created).toMatchObject({
+    workspaceId,
+    title: "Startup",
+    titleSource: "user",
+    topic: { ...topic, revision: 1 },
+  });
+  expect(mutations).toEqual([{ kind: "upsert", workspaceId, workspace: created }]);
+  expect(recordsAtCreation).toEqual([
+    expect.objectContaining({ workspaceId, topic: { ...topic, revision: 1 } }),
+  ]);
+
+  const ordinary = await provisioning.createWorkspaceForDirectory(dir, "Ordinary");
+  expect((await workspaceRegistry.get(ordinary.workspaceId))?.topic).toBeUndefined();
 });
 
 test("re-opening an active workspace by exact path returns the same record without duplicating", async () => {

@@ -112,10 +112,17 @@ export class MessageReceipts {
     return revision;
   }
 
-  async outcome(agentId: string, messageId: string): Promise<"accepted" | "unknown" | "absent"> {
+  async outcome(
+    agentId: string,
+    messageId: string,
+    expectedFingerprint?: string,
+  ): Promise<"accepted" | "unknown" | "absent"> {
     const key = digest(["send", agentId, messageId]);
     const receipt = await readReceipt(path.join(this.directory, `${key}.json`));
     if (!receipt) return "absent";
+    if (expectedFingerprint !== undefined && receipt.fingerprint !== expectedFingerprint) {
+      return "absent";
+    }
     return receipt.state === "completed" ? "accepted" : "unknown";
   }
 
@@ -130,7 +137,9 @@ export class MessageReceipts {
 
   sendQueued(input: QueueMessageInput): Promise<void> {
     const key = digest(["send", input.agentId, input.message.messageId]);
-    return this.serialize(key, () => this.deliverQueued(key, digest(input.request), input));
+    return this.serialize(key, () =>
+      this.deliverQueued(key, fingerprintMessageRequest(input.request), input),
+    );
   }
 
   resumeQueued(
@@ -281,7 +290,7 @@ export class MessageReceipts {
 
   private async sendOnce(key: string, input: SendMessageInput): Promise<void> {
     const file = path.join(this.directory, `${key}.json`);
-    const fingerprint = digest(input.request);
+    const fingerprint = fingerprintMessageRequest(input.request);
     const accepted = this.awaitingCommit.get(key);
     if (accepted) {
       if (accepted.fingerprint !== fingerprint) throw new Error("agent_request_key_conflict");
@@ -341,6 +350,10 @@ async function readReceipt(file: string): Promise<z.infer<typeof ReceiptSchema> 
     if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
     throw error;
   }
+}
+
+export function fingerprintMessageRequest(request: unknown): string {
+  return digest(request);
 }
 
 function digest(value: unknown): string {

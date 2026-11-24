@@ -26,6 +26,12 @@ import { afterEach, expect, test, vi } from "vitest";
 import { z } from "zod";
 
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
+import {
+  getOpenAgentTabLabel,
+  PARENT_AGENT_ID_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import { createTestLogger } from "../test-utils/test-logger.js";
 import { Session } from "./session.js";
 import type { SessionOptions } from "./session.js";
@@ -601,20 +607,23 @@ function createSessionForWorkspaceTests(
     warn: vi.fn(),
     error: vi.fn(),
   };
-  const agentManager = asAgentManager({
-    subscribe: () => () => {},
-    listAgents: () => [],
-    listProviderSubagentActivity: () => [],
-    getAgent: () => null,
-    getLastAssistantMessage: async () => null,
-    archiveAgent: async () => ({ archivedAt: new Date().toISOString() }),
-    archiveSnapshot: async () => ({}),
-    unarchiveSnapshot: async () => true,
-    clearAgentAttention: async () => {},
-    markAgentUnread: async () => {},
-    notifyAgentState: () => {},
-    ...options.agentManager,
-  });
+  const agentManager =
+    options.agentManager instanceof AgentManager
+      ? options.agentManager
+      : asAgentManager({
+          subscribe: () => () => {},
+          listAgents: () => [],
+          listProviderSubagentActivity: () => [],
+          getAgent: () => null,
+          getLastAssistantMessage: async () => null,
+          archiveAgent: async () => ({ archivedAt: new Date().toISOString() }),
+          archiveSnapshot: async () => ({}),
+          unarchiveSnapshot: async () => true,
+          clearAgentAttention: async () => {},
+          markAgentUnread: async () => {},
+          notifyAgentState: () => {},
+          ...options.agentManager,
+        });
   const workspaceRegistry: SessionOptions["workspaceRegistry"] = options.workspaceRegistry ?? {
     initialize: async () => {},
     existsOnDisk: async () => true,
@@ -2177,6 +2186,99 @@ test("workspace mark unread rejects workspaces without a read root agent", async
   });
 });
 
+test("legacy close_items_request clears only the requesting client's topic tabs", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "paseo-close-topic-tabs-"));
+  const logger = createTestLogger();
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaceRegistry = new FileBackedWorkspaceRegistry(
+    path.join(home, "workspaces.json"),
+    logger,
+  );
+  const storage = new AgentStorage(path.join(home, "agents"), logger);
+  const agentManager = new AgentManager({
+    clients: { codex: new CreateAgentTestClient() },
+    registry: storage,
+    logger,
+    workspaceRegistry,
+  });
+  const timestamp = "2026-05-07T00:00:00.000Z";
+  const workspaceId = "wks_close_topic";
+  const mainId = "00000000-0000-4000-8000-000000000555";
+  const childId = "00000000-0000-4000-8000-000000000556";
+  const ownTab = getOpenAgentTabLabel("test-client");
+  const otherTab = getOpenAgentTabLabel("other-client");
+  const agents = [
+    { id: mainId, labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE } },
+    { id: childId, labels: { [PARENT_AGENT_ID_LABEL]: mainId } },
+  ];
+  try {
+    await workspaceRegistry.upsert(
+      createPersistedWorkspaceRecord({
+        workspaceId,
+        projectId: "prj_close_topic",
+        cwd: REPO_CWD,
+        kind: "directory",
+        displayName: "repo",
+        title: "Keep working",
+        titleSource: "user",
+        topic: {},
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }),
+    );
+    for (const { id, labels } of agents) {
+      await storage.upsert(
+        makeStoredAgent({
+          id,
+          cwd: REPO_CWD,
+          workspaceId,
+          updatedAt: timestamp,
+          labels: { ...labels, [ownTab]: "true", [otherTab]: "true" },
+        }),
+      );
+    }
+    const session = createSessionForWorkspaceTests({
+      paseoHome: home,
+      workspaceRegistry,
+      agentManager,
+      agentStorage: {
+        get: (id: string) => storage.get(id),
+        listAll: () => storage.listAll(),
+      },
+      onMessage: (message) => emitted.push(message),
+    });
+    await session.handleMessage({
+      type: "archive_agent_request",
+      requestId: "archive-topic-main",
+      agentId: mainId,
+    });
+    expect(findByType(emitted, "rpc_error").payload).toMatchObject({
+      requestId: "archive-topic-main",
+      requestType: "archive_agent_request",
+      code: "TOPIC_MAIN_ARCHIVE_PROTECTED",
+    });
+    await session.handleMessage({
+      type: "close_items_request",
+      requestId: "close-topic-tabs",
+      agentIds: [mainId, childId],
+      terminalIds: [],
+    });
+    expect(findByType(emitted, "close_items_response").payload).toEqual({
+      requestId: "close-topic-tabs",
+      agents: [],
+      terminals: [],
+    });
+    for (const { id, labels } of agents) {
+      const stored = await storage.get(id);
+      expect(stored?.archivedAt).toBeNull();
+      expect(stored?.labels).toEqual({ ...labels, [otherTab]: "true" });
+    }
+  } finally {
+    await agentManager.flush();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("close_items_request archives agents and kills terminals in one batch", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const archivedAt = "2026-04-01T00:00:00.000Z";
@@ -2241,13 +2343,10 @@ test("close_items_request archives agents and kills terminals in one batch", asy
         getAgent: (agentId: string) => (agentId === "agent-1" ? { id: agentId } : null),
         hasInFlightRun: (agentId: string) => agentId === "agent-1",
         cancelAgentRun,
-        archiveAgent: async (
-          agentId: string,
-          _archivedAt?: string,
-          options?: { cancelActiveRun?: boolean },
-        ) => {
-          if (options?.cancelActiveRun) await cancelAgentRun(agentId);
-          return { archivedAt };
+        archiveAgentForLegacyClose: async (agentId: string, options: { clientId: string }) => {
+          expect(options.clientId).toBe("test-client");
+          await cancelAgentRun(agentId);
+          return { archivedAt, record: { ...archivedRecord, archivedAt, updatedAt: archivedAt } };
         },
         clearAgentAttention: async () => {},
         notifyAgentState: () => {},
@@ -2422,22 +2521,23 @@ test("close_items_request archives stored agents that are not currently loaded",
         listAgents: () => [],
         getAgent: (agentId: string) => (agentId === "agent-live" ? { id: agentId } : null),
         hasInFlightRun: () => false,
-        archiveAgent: async (agentId: string) => {
-          if (agentId !== "agent-live") {
-            throw new Error(`Unexpected live archive: ${agentId}`);
+        archiveAgentForLegacyClose: async (agentId: string) => {
+          if (agentId === "agent-live") {
+            liveRecord.archivedAt = liveArchivedAt;
+            liveRecord.updatedAt = liveArchivedAt;
+            return { archivedAt: liveArchivedAt, record: liveRecord };
           }
-          liveRecord.archivedAt = liveArchivedAt;
-          liveRecord.updatedAt = liveArchivedAt;
-          return { archivedAt: liveArchivedAt };
-        },
-        archiveSnapshot: async (_agentId: string, archivedAt: string) => {
+          if (agentId !== storedAgentId) {
+            throw new Error(`Unexpected archive: ${agentId}`);
+          }
+          const archivedAt = new Date().toISOString();
           storedRecord.archivedAt = archivedAt;
           storedRecord.updatedAt = archivedAt;
           storedRecord.status = "completed";
           storedRecord.requiresAttention = false;
           storedRecord.attentionReason = null;
           storedRecord.attentionTimestamp = null;
-          return storedRecord;
+          return { archivedAt, record: storedRecord };
         },
         clearAgentAttention: async () => {},
         notifyAgentState: () => {},
@@ -2589,11 +2689,11 @@ test("close_items_request continues after an archive failure", async () => {
         getAgent: (agentId: string) =>
           agentId === "agent-bad" || agentId === "agent-good" ? { id: agentId } : null,
         hasInFlightRun: () => false,
-        archiveAgent: async (agentId: string) => {
+        archiveAgentForLegacyClose: async (agentId: string) => {
           if (agentId === "agent-bad") {
             throw new Error("archive failed");
           }
-          return { archivedAt };
+          return { archivedAt, record: { ...goodRecord, archivedAt, updatedAt: archivedAt } };
         },
         clearAgentAttention: async () => {},
         notifyAgentState: () => {},
@@ -10163,6 +10263,200 @@ test.each([undefined, "Add retries to the payments flow"])(
     expect(filterByType(emitted, "workspace_update")).toHaveLength(1);
   },
 );
+
+test.each([false, true])(
+  "workspace.create persists a topic without starting a provider (preset=%s)",
+  async (withPreset) => {
+    const home = mkdtempSync(path.join(tmpdir(), "paseo-unbound-topic-"));
+    const emitted: SessionOutboundMessage[] = [];
+    const registryPath = path.join(home, "workspaces.json");
+    const logger = createTestLogger();
+    const workspaceRegistry = new FileBackedWorkspaceRegistry(registryPath, logger);
+    const generateWorkspaceName = vi.fn(async () => null);
+    const storage = new AgentStorage(path.join(home, "agents"), logger);
+    const client = new CreateAgentTestClient();
+    const createSession = vi.spyOn(client, "createSession");
+    const agentManager = new AgentManager({
+      clients: { codex: client },
+      registry: storage,
+      workspaceRegistry,
+      logger,
+    });
+    const session = createSessionForWorkspaceTests({
+      onMessage: (message) => emitted.push(message),
+      paseoHome: home,
+      workspaceRegistry,
+      generateWorkspaceName,
+      agentManager,
+      agentStorage: { get: (id: string) => storage.get(id), listAll: () => storage.listAll() },
+    });
+    try {
+      await session.handleMessage({
+        type: "workspace.create.request",
+        requestId: "create-unbound-topic",
+        source: { kind: "directory", path: home },
+        title: "Reduce startup time",
+        topic: { summary: "Measure startup before changing it", hideFromModel: true },
+        firstAgentContext: { prompt: "This legacy naming context is not a question" },
+        ...(withPreset ? { mainAgent: { config: { provider: "codex", cwd: home } } } : {}),
+      });
+
+      const { workspace, mainAgent, error } = findByType(
+        emitted,
+        "workspace.create.response",
+      ).payload;
+      expect(error).toBeNull();
+      expect(workspace).toMatchObject({
+        title: "Reduce startup time",
+        hasActiveMainAgent: withPreset,
+        topic: {
+          summary: "Measure startup before changing it",
+          hideFromModel: true,
+          revision: 1,
+          mainAgentId: withPreset ? expect.any(String) : null,
+        },
+      });
+      if (!workspace) throw new Error("Expected a created workspace");
+      const reopenedRegistry = new FileBackedWorkspaceRegistry(registryPath, logger);
+      expect(await reopenedRegistry.get(workspace.id)).toMatchObject({
+        titleSource: "user",
+        topic: { summary: "Measure startup before changing it", hideFromModel: true, revision: 1 },
+      });
+      const storedAgents = await storage.listAll();
+      expect(
+        storedAgents.map(({ id, lastStatus, workspaceId }) => ({ id, lastStatus, workspaceId })),
+      ).toEqual(
+        withPreset
+          ? [{ id: workspace.topic?.mainAgentId, lastStatus: "closed", workspaceId: workspace.id }]
+          : [],
+      );
+      expect(mainAgent?.id ?? null).toBe(workspace.topic?.mainAgentId);
+
+      await session.handleMessage({
+        type: "workspace.topic.update.request",
+        requestId: "update-topic",
+        workspaceId: workspace.id,
+        hideFromModel: false,
+      });
+      expect(findByType(emitted, "workspace.topic.update.response").payload).toMatchObject({
+        requestId: "update-topic",
+        workspaceId: workspace.id,
+        topic: {
+          summary: "Measure startup before changing it",
+          hideFromModel: false,
+          revision: 2,
+          mainAgentId: mainAgent?.id ?? null,
+        },
+        error: null,
+      });
+      expect(createSession).not.toHaveBeenCalled();
+      expect(generateWorkspaceName).not.toHaveBeenCalled();
+    } finally {
+      await agentManager.flush();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test("reading a quiet topic main timeline does not create a provider session", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "paseo-quiet-topic-timeline-"));
+  const logger = createTestLogger();
+  const emitted: SessionOutboundMessage[] = [];
+  const workspaceRegistry = new FileBackedWorkspaceRegistry(
+    path.join(home, "workspaces.json"),
+    logger,
+  );
+  const agentStorage = new AgentStorage(path.join(home, "agents"), logger);
+  const timestamp = "2026-05-07T00:00:00.000Z";
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "wks_quiet_topic",
+    projectId: "prj_quiet_topic",
+    cwd: home,
+    kind: "directory",
+    displayName: "repo",
+    title: "Reduce startup time",
+    titleSource: "user",
+    topic: {},
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  const agent = makeStoredAgent({
+    id: "00000000-0000-4000-8000-000000000554",
+    workspaceId: workspace.workspaceId,
+    cwd: workspace.cwd,
+    labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    updatedAt: timestamp,
+  });
+  const client = new CreateAgentTestClient();
+  const createSession = vi.spyOn(client, "createSession");
+  const agentManager = new AgentManager({
+    clients: { codex: client },
+    registry: agentStorage,
+    workspaceRegistry,
+    logger,
+  });
+  try {
+    await workspaceRegistry.upsert(workspace);
+    await agentStorage.upsert(agent);
+    const session = createSessionForWorkspaceTests({
+      paseoHome: home,
+      workspaceRegistry,
+      agentStorage: { get: (id: string) => agentStorage.get(id) },
+      agentManager,
+      onMessage: (message) => emitted.push(message),
+    });
+    await session.handleMessage({
+      type: "fetch_agent_timeline_request",
+      requestId: "read-quiet-topic",
+      agentId: agent.id,
+    });
+    expect(findByType(emitted, "fetch_agent_timeline_response").payload).toMatchObject({
+      requestId: "read-quiet-topic",
+      agentId: agent.id,
+      agent: { id: agent.id, status: "closed" },
+      entries: [],
+      error: null,
+    });
+    await session.handleMessage({
+      type: "agent.timeline.search.request",
+      requestId: "search-quiet-topic",
+      agentId: agent.id,
+      query: "startup",
+    });
+    expect(findByType(emitted, "agent.timeline.search.response").payload).toMatchObject({
+      requestId: "search-quiet-topic",
+      agentId: agent.id,
+      locations: [],
+      error: null,
+    });
+    await session.handleMessage({
+      type: "agent.timeline.list_prompts.request",
+      requestId: "list-quiet-prompts",
+      agentId: agent.id,
+    });
+    expect(findByType(emitted, "agent.timeline.list_prompts.response").payload).toMatchObject({
+      requestId: "list-quiet-prompts",
+      agentId: agent.id,
+      prompts: [],
+      error: null,
+    });
+    await session.handleMessage({
+      type: "list_commands_request",
+      requestId: "list-quiet-commands",
+      agentId: agent.id,
+    });
+    expect(findByType(emitted, "list_commands_response").payload).toMatchObject({
+      requestId: "list-quiet-commands",
+      agentId: agent.id,
+      commands: [],
+      error: null,
+    });
+    expect(createSession).not.toHaveBeenCalled();
+  } finally {
+    await agentManager.flush();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 test("workspace create emits through a matching workspace subscription", async () => {
   const emitted: SessionOutboundMessage[] = [];

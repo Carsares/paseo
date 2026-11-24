@@ -7,6 +7,8 @@ import {
   getOpenAgentTabLabel,
   getParentAgentIdFromLabels,
   PARENT_AGENT_ID_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
@@ -14,6 +16,7 @@ import { deferred } from "../test-fixtures/reconciliation-registries.js";
 import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
 import { AgentManager, type ManagedAgent } from "./agent-manager.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
+import type { TopicWorkspaceSnapshot } from "./hierarchy-policy.js";
 import {
   archiveAgentCommand,
   cancelAgentRunCommand,
@@ -42,6 +45,7 @@ class FakeLifecycleAgentStorage implements LifecycleAgentStorage {
 
 class FakeLifecycleAgentManager implements LifecycleAgentManager {
   readonly liveAgents = new Map<string, LifecycleAgentSnapshot>();
+  readonly workspaces = new Map<string, TopicWorkspaceSnapshot>();
   readonly cancelledAgentIds: string[] = [];
   readonly clearedAttentionAgentIds: string[] = [];
   readonly archivedAgentIds: string[] = [];
@@ -62,6 +66,10 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
 
   getAgent(agentId: string): LifecycleAgentSnapshot | null {
     return this.liveAgents.get(agentId) ?? null;
+  }
+
+  async getWorkspaceForTopicPolicy(workspaceId: string): Promise<TopicWorkspaceSnapshot | null> {
+    return this.workspaces.get(workspaceId) ?? null;
   }
 
   hasInFlightRun(agentId: string): boolean {
@@ -192,6 +200,43 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
 const logger = createTestLogger();
 
 describe("agent lifecycle commands", () => {
+  test.each([
+    [true, undefined],
+    [true, "topic"],
+    [false, undefined],
+    [false, "topic"],
+  ])("protects a topic main before side effects (live=%s, expected=%s)", async (live, expected) => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    const labels = { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE };
+    const record = { ...storedAgent("agent-1"), workspaceId: "topic", labels };
+    storage.records.set(record.id, record);
+    manager.workspaces.set("topic", {
+      workspaceId: "topic",
+      topic: { summary: "Inspect startup", hideFromModel: true, mainAgentId: record.id },
+    });
+    if (live) {
+      manager.liveAgents.set(record.id, {
+        ...managedAgent(record.id, "running"),
+        workspaceId: "topic",
+        labels,
+      });
+      manager.inFlightAgentIds.add(record.id);
+    }
+
+    await expect(
+      archiveAgentCommand(
+        { agentManager: manager, agentStorage: storage, logger },
+        record.id,
+        expected,
+      ),
+    ).rejects.toMatchObject({ code: "topic_main_archive_forbidden" });
+    expect(manager.cancelledAgentIds).toEqual([]);
+    expect(manager.clearedAttentionAgentIds).toEqual([]);
+    expect(manager.archivedAgentIds).toEqual([]);
+    expect(await storage.get(record.id)).toEqual(record);
+  });
+
   test("cancels only when the agent has an in-flight run", async () => {
     const storage = new FakeLifecycleAgentStorage();
     const manager = new FakeLifecycleAgentManager(storage);
@@ -225,7 +270,12 @@ describe("agent lifecycle commands", () => {
   test("archives a live agent after canceling and clearing attention", async () => {
     const storage = new FakeLifecycleAgentStorage();
     const manager = new FakeLifecycleAgentManager(storage);
-    manager.liveAgents.set("agent-1", managedAgent("agent-1", "running"));
+    manager.workspaces.set("legacy", { workspaceId: "legacy", title: "Existing workspace" });
+    manager.liveAgents.set("agent-1", {
+      ...managedAgent("agent-1", "running"),
+      workspaceId: "legacy",
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
     manager.inFlightAgentIds.add("agent-1");
     storage.records.set("agent-1", storedAgent("agent-1"));
 
@@ -974,6 +1024,8 @@ function managedAgent(
     id,
     cwd: "/workspace/project",
     lifecycle,
+    workspaceId: undefined,
+    labels: {},
   };
 }
 

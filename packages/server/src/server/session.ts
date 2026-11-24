@@ -32,10 +32,11 @@ import { relative } from "node:path";
 import { isAbsolute } from "node:path";
 import { CreationService, type CreatedAgent } from "./creation/index.js";
 import type { CreationSnapshot, AgentCreateRequest } from "@getpaseo/protocol/messages";
-import type {
-  MessageReceipts,
-  QueueHandoff,
-  RecoverableAgentMessage,
+import {
+  fingerprintMessageRequest,
+  type MessageReceipts,
+  type QueueHandoff,
+  type RecoverableAgentMessage,
 } from "./message-receipts/index.js";
 import {
   isDaemonBackgroundWorkItem,
@@ -95,6 +96,7 @@ import { summarizeWorkspaceAgents } from "./agent/workspace-agents-summary.js";
 import { resolveClientMessageId } from "./client-message-id.js";
 import {
   QueuedPromptLoadError,
+  readArchivedTopicMainWorkspaceId,
   sendPromptToAgent,
   waitForAgentRunStartWithTimeout,
   unarchiveAgentState,
@@ -195,6 +197,7 @@ import {
   hasReservedHierarchyLabels,
   REMOTE_HIERARCHY_DEPTH_LABEL,
   RESERVED_HIERARCHY_LABELS,
+  TopicMainArchiveError,
 } from "./agent/hierarchy-policy.js";
 import {
   assertPluginTimelineDataSize,
@@ -237,6 +240,7 @@ import {
   resolveProjectDisplayName,
   resolveWorkspaceDisplayName,
   resolveWorkspaceName,
+  resolveWorkspaceTopic,
   type PersistedProjectRecord,
   type PersistedWorkspaceRecord,
   type ProjectMutation,
@@ -842,7 +846,7 @@ export interface SessionOptions {
   worktreesRoot?: string;
   agentManager: AgentManager;
   agentStorage: AgentStorage;
-  messageReceipts: Pick<MessageReceipts, "send">;
+  messageReceipts: Pick<MessageReceipts, "send"> & Partial<Pick<MessageReceipts, "outcome">>;
   agentMessages: AgentMessageDelivery;
   finishSubscriptions?: FinishSubscriptions;
   creationService: Pick<CreationService, "create" | "subscribe">;
@@ -1058,6 +1062,31 @@ function hasInitialCreationPrompt(
   );
 }
 
+function firstQuestionReceipt(
+  request: Pick<AgentCreateRequest, "initialPrompt" | "images" | "attachments" | "clientMessageId">,
+) {
+  const { initialPrompt, images, attachments, clientMessageId } = request;
+  const prompt = buildAgentPrompt(initialPrompt?.trim() ?? "", images, attachments);
+  if (!prompt.length) return {};
+  return {
+    promptMessageId: resolveClientMessageId(clientMessageId),
+    promptReceiptFingerprint: fingerprintMessageRequest({
+      prompt,
+      activeTurnBehavior: "interrupt",
+    }),
+  };
+}
+
+function workspaceCreationNamingContext(
+  request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
+): FirstAgentContext | undefined {
+  if (request.topic) return undefined;
+  if (request.agent) {
+    return { prompt: request.agent.initialPrompt, attachments: request.agent.attachments };
+  }
+  return request.firstAgentContext;
+}
+
 function getFirstAgentContext(
   trimmedPrompt: string | undefined,
   attachments: AgentCreateRequest["attachments"],
@@ -1248,7 +1277,7 @@ export class Session {
   private readonly daemonSession: DaemonSession;
   private readonly hubExecutionController: HubExecutionController | null;
   private readonly workspaceScripts: WorkspaceScriptsService;
-  private readonly messageReceipts: Pick<MessageReceipts, "send">;
+  private readonly messageReceipts: SessionOptions["messageReceipts"];
   private readonly agentMessages: AgentMessageDelivery;
   private readonly finishSubscriptions?: FinishSubscriptions;
   private readonly connectedHosts?: ConnectedHosts;
@@ -4027,6 +4056,8 @@ export class Session {
         return this.handleProjectRemoveRequest(msg);
       case "workspace.title.set.request":
         return this.handleWorkspaceTitleSetRequest(msg.workspaceId, msg.title, msg.requestId);
+      case "workspace.topic.update.request":
+        return this.handleWorkspaceTopicUpdateRequest(msg);
       case "workspace.pin.set.request":
         return this.handleWorkspacePinSetRequest(msg.workspaceId, msg.pinned, msg.requestId);
       case "workspace.base_branch.set.request":
@@ -4459,7 +4490,12 @@ export class Session {
       agentId,
       expectedWorkspaceId,
       explicitSideChatArchive,
-    );
+    ).catch((error) => {
+      if (error instanceof TopicMainArchiveError) {
+        throw new SessionRequestError("TOPIC_MAIN_ARCHIVE_PROTECTED", error.message);
+      }
+      throw error;
+    });
 
     this.emit({
       type: "agent_archived",
@@ -4493,14 +4529,17 @@ export class Session {
       expectedWorkspaceId,
     );
 
+    await this.publishCloseArchive(archivedRecord);
+    return { agentId, archivedAt };
+  }
+
+  private async publishCloseArchive(archivedRecord: StoredAgentRecord | null): Promise<void> {
     if (archivedRecord && this.agentUpdates.hasSubscription()) {
       const payload = await this.agentUpdates.emitStoredRecord(archivedRecord);
       if (payload.workspaceId) {
         await this.emitWorkspaceUpdateForWorkspaceId(payload.workspaceId);
       }
     }
-
-    return { agentId, archivedAt };
   }
 
   private async requireResidentOperationWorkspace(agentId: string) {
@@ -5182,13 +5221,21 @@ export class Session {
 
   private async handleCloseItemsRequest(msg: CloseItemsRequest): Promise<void> {
     const archiveResults = await Promise.allSettled(
-      msg.agentIds.map((agentId) => this.archiveAgentForClose(agentId, msg.expectedWorkspaceId)),
+      msg.agentIds.map(async (agentId) => {
+        const result = await this.agentManager.archiveAgentForLegacyClose(agentId, {
+          clientId: this.clientId,
+          expectedWorkspaceId: msg.expectedWorkspaceId,
+        });
+        if (!result) return null;
+        await this.publishCloseArchive(result.record);
+        return { agentId, archivedAt: result.archivedAt };
+      }),
     );
     const agents = [];
     for (let i = 0; i < archiveResults.length; i += 1) {
       const result = archiveResults[i];
       if (result.status === "fulfilled") {
-        agents.push(result.value);
+        if (result.value) agents.push(result.value);
       } else {
         this.sessionLogger.warn(
           { err: result.reason, agentId: msg.agentIds[i], requestId: msg.requestId },
@@ -5227,6 +5274,7 @@ export class Session {
     record: StoredAgentRecord;
     didUnarchive: boolean;
     originalArchivedAt: string | null;
+    previousTopicMainWorkspaceId: string | undefined;
   } | null> {
     const records = await this.agentStorage.listByProviderSession(
       handle.provider,
@@ -5247,6 +5295,10 @@ export class Session {
     if (!matched) {
       return null;
     }
+    const previousTopicMainWorkspaceId = await readArchivedTopicMainWorkspaceId(
+      this.agentManager,
+      matched,
+    );
     const didUnarchive = await unarchiveAgentState(
       this.agentStorage,
       this.agentManager,
@@ -5256,6 +5308,7 @@ export class Session {
       record: matched,
       didUnarchive,
       originalArchivedAt: matched.archivedAt ?? null,
+      previousTopicMainWorkspaceId,
     };
   }
 
@@ -5586,6 +5639,30 @@ export class Session {
         },
       });
     }
+  }
+
+  private async handleWorkspaceTopicUpdateRequest({
+    type: _type,
+    requestId,
+    ...input
+  }: Extract<SessionInboundMessage, { type: "workspace.topic.update.request" }>): Promise<void> {
+    let topic: ReturnType<typeof resolveWorkspaceTopic> = null;
+    let error: string | null = null;
+    const release = this.reserveWorkspaceMove(input.workspaceId);
+    try {
+      await this.requireMoveSourceWorkspace(input.workspaceId);
+      const result = await this.agentManager.updateWorkspaceTopic(input, this.workspaceRegistry);
+      topic = resolveWorkspaceTopic(result.workspace, result.mainAgentId);
+    } catch (failure) {
+      error = getErrorMessageOr(failure, "Failed to update workspace topic");
+    } finally {
+      release();
+    }
+    this.emit({
+      type: "workspace.topic.update.response",
+      payload: { requestId, workspaceId: input.workspaceId, topic, error },
+    });
+    if (!error) await this.emitWorkspaceUpdatesForWorkspaceIds([input.workspaceId]);
   }
 
   private async handleWorkspaceTitleSetRequest(
@@ -6027,6 +6104,41 @@ export class Session {
     };
   }
 
+  private readonly creationRecovery = {
+    readTopicWorkspace: async (id: string) => {
+      const workspace = await this.workspaceRegistry.get(id);
+      if (!workspace?.topic || workspace.archivedAt) return null;
+      if (!(await this.filesystem.isDirectory(workspace.cwd))) {
+        throw new SessionRequestError(
+          "directory_not_found",
+          `Directory not found: ${workspace.cwd}`,
+        );
+      }
+      return {
+        workspace: await this.describeWorkspaceRecord(workspace),
+        setupSkippedReason: workspace.untrustedSource
+          ? formatWorkspaceAutomationBlockedMessage(workspace.untrustedSource)
+          : undefined,
+      };
+    },
+    readMainAgent: async (id: string, workspaceId: string) => {
+      const record = await this.agentStorage.get(id);
+      if (!record) return null;
+      if (
+        record.internal ||
+        record.archivedAt ||
+        record.workspaceId !== workspaceId ||
+        !isMainControlAgentLabels(record.labels)
+      ) {
+        throw new Error("The saved Main Session does not match this workspace creation.");
+      }
+      return this.buildStoredAgentPayload(record);
+    },
+    readPromptOutcome: (agentId: string, messageId: string, expectedFingerprint: string) =>
+      this.messageReceipts.outcome?.(agentId, messageId, expectedFingerprint) ??
+      Promise.resolve("unknown" as const),
+  };
+
   private async handleCreationSubscription(
     request: Extract<SessionInboundMessage, { type: "creation.subscribe.request" }>,
     source?: object,
@@ -6046,6 +6158,7 @@ export class Session {
         request.kind,
         request.idempotencyKey,
         (snapshot) => owner?.emit(this.creationUpdate(snapshot)),
+        this.creationRecovery,
       );
       unsubscribe = observation.unsubscribe;
       if (!owner || owner.signal.aborted) unsubscribe();
@@ -6096,6 +6209,11 @@ export class Session {
       this.assertExplicitMainCreationAllowed(request, !request.workspaceId || !!request.worktree);
     }
     await this.preflightAgentWorkspace(request);
+    const topic =
+      workspaceRole === "main" && request.workspaceId && !request.worktree
+        ? (await this.workspaceRegistry.get(request.workspaceId))?.topic
+        : undefined;
+    const promptReceipt = topic ? firstQuestionReceipt(request) : {};
     const { requestId, type: _type, subscribe: _subscribe, idempotencyKey, ...intent } = request;
     return this.creationService.create(
       {
@@ -6106,6 +6224,8 @@ export class Session {
         agentId: request.agentId,
         hasAgent: true,
         hasPrompt: hasInitialCreationPrompt(request),
+        ...promptReceipt,
+        ...this.creationRecovery,
         exists: this.creationResourceExists,
         readAgent: async (id) => {
           const record = await this.agentStorage.get(id);
@@ -6114,7 +6234,11 @@ export class Session {
         createAgent: async (id, _workspace, onReady) => {
           try {
             return await this.createSessionAgent(
-              { ...request, type: "create_agent_request" },
+              {
+                ...request,
+                type: "create_agent_request",
+                clientMessageId: promptReceipt.promptMessageId ?? request.clientMessageId,
+              },
               id,
               onReady,
               { workspaceRole },
@@ -6189,6 +6313,8 @@ export class Session {
       this.assertWorkspaceCreationWithAgentsAllowed(request);
       const agentInput = request.agent;
       const mainAgentInput = request.mainAgent;
+      const promptReceipt =
+        request.topic && request.agent ? firstQuestionReceipt(request.agent) : {};
       const resolveAgentCwd = async (
         config: AgentSessionConfig,
         workspace: WorkspaceDescriptorPayload | undefined,
@@ -6213,26 +6339,14 @@ export class Session {
           agentId: agentInput?.agentId,
           hasAgent: Boolean(agentInput),
           hasPrompt: hasInitialCreationPrompt(agentInput),
+          ...promptReceipt,
           exists: this.creationResourceExists,
-          readMainAgent: async (id, workspaceId) => {
-            const record = await this.agentStorage.get(id);
-            if (!record) return null;
-            if (
-              record.archivedAt ||
-              record.workspaceId !== workspaceId ||
-              !isMainControlAgentLabels(record.labels)
-            ) {
-              throw new Error("The saved Main Session does not match this workspace creation.");
-            }
-            return this.buildStoredAgentPayload(record);
-          },
+          ...this.creationRecovery,
           provision: async (id) => {
             const descriptor = await this.createRequestedWorkspace(
               {
                 ...request,
-                firstAgentContext: agentInput
-                  ? { prompt: agentInput.initialPrompt, attachments: agentInput.attachments }
-                  : request.firstAgentContext,
+                firstAgentContext: workspaceCreationNamingContext(request),
               },
               id,
             );
@@ -6272,6 +6386,7 @@ export class Session {
                     requestId,
                     config: await resolveAgentCwd(agentInput.config, workspace),
                     workspaceId: workspace.id,
+                    clientMessageId: promptReceipt.promptMessageId ?? agentInput.clientMessageId,
                     ...(mainAgent
                       ? {
                           callerAgentId: mainAgent.id,
@@ -6729,7 +6844,11 @@ export class Session {
         );
       } catch (error) {
         if (matched?.didUnarchive && matched.originalArchivedAt) {
-          await this.agentManager.archiveSnapshot(matched.record.id, matched.originalArchivedAt);
+          await this.agentManager.restoreArchivedSnapshot(
+            matched.record.id,
+            matched.originalArchivedAt,
+            matched.previousTopicMainWorkspaceId,
+          );
         }
         throw error;
       }
@@ -7315,6 +7434,13 @@ export class Session {
     try {
       const existing = this.agentManager.getAgent(agentId);
       const stored = existing ? null : await this.agentStorage.get(agentId);
+      if (stored && (await this.agentManager.isSilentTopicMain(stored))) {
+        this.emit({
+          type: "list_commands_response",
+          payload: { agentId, commands: [], error: null, requestId },
+        });
+        return;
+      }
       const agent =
         existing || (stored && !stored.archivedAt)
           ? await ensureAgentLoaded(agentId, {
@@ -8090,17 +8216,12 @@ export class Session {
     const resolvedProjectRecord =
       projectRecord ?? (await this.projectRegistry.get(workspace.projectId));
 
-    let diffStat: { additions: number; deletions: number } | null = null;
-    const snapshot = this.workspaceRuntimeStore.get(workspace.cwd);
-    if (snapshot?.git.diffStat) {
-      diffStat = snapshot.git.diffStat;
-    }
+    const diffStat = this.workspaceRuntimeStore.get(workspace.cwd)?.git.diffStat ?? null;
 
     const worktreeSlug =
       workspace.isPaseoOwnedWorktree && workspace.worktreeRoot
         ? basename(workspace.worktreeRoot)
         : undefined;
-
     return {
       id: workspace.workspaceId,
       projectId: workspace.projectId,
@@ -8117,9 +8238,7 @@ export class Session {
       workspaceKind: workspace.kind,
       name: resolveWorkspaceDisplayName(workspace),
       title: workspace.title,
-      hasActiveMainAgent: (
-        await this.listWorkspaceMoveVisibleRecords([workspace.workspaceId])
-      ).some((agent) => !agent.internal && isMainControlAgentLabels(agent.labels)),
+      ...(await this.describeWorkspaceMain(workspace)),
       pinnedAt: workspace.pinnedAt,
       ...projectWorkspaceDeferral(workspace),
       ...(workspace.labels && workspace.labels.length > 0 ? { labels: workspace.labels } : {}),
@@ -8139,6 +8258,14 @@ export class Session {
           }
         : {}),
     };
+  }
+
+  private async describeWorkspaceMain(workspace: PersistedWorkspaceRecord) {
+    const main = (await this.listWorkspaceMoveVisibleRecords([workspace.workspaceId])).find(
+      (agent) => !agent.internal && isMainControlAgentLabels(agent.labels),
+    );
+    const topic = resolveWorkspaceTopic(workspace, main?.id ?? null);
+    return { hasActiveMainAgent: Boolean(main), ...(topic ? { topic } : {}) };
   }
 
   private buildWorkspaceGitRuntimePayload(
@@ -8200,6 +8327,7 @@ export class Session {
     result: CreatePaseoWorktreeResult,
   ): Promise<WorkspaceDescriptorPayload> {
     const projectRecord = await this.projectRegistry.get(result.workspace.projectId);
+    const topic = resolveWorkspaceTopic(result.workspace, null);
     return {
       id: result.workspace.workspaceId,
       projectId: result.workspace.projectId,
@@ -8222,6 +8350,7 @@ export class Session {
       }),
       title: result.workspace.title,
       hasActiveMainAgent: false,
+      ...(topic ? { topic } : {}),
       pinnedAt: result.workspace.pinnedAt,
       ...(result.workspace.labels && result.workspace.labels.length > 0
         ? { labels: result.workspace.labels }
@@ -9494,6 +9623,16 @@ export class Session {
   private assertWorkspaceCreationWithAgentsAllowed(
     request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
   ): void {
+    if (
+      request.topic &&
+      request.agent &&
+      (request.agent.workspaceRole !== "main" || !hasInitialCreationPrompt(request.agent))
+    ) {
+      throw new SessionRequestError(
+        "invalid_request",
+        "A topic's initial agent requires a Main Session and a question.",
+      );
+    }
     if (request.agent?.workspaceRole === "main") {
       if (request.mainAgent) {
         throw new SessionRequestError(
@@ -9679,7 +9818,8 @@ export class Session {
         request.source.projectId,
         {
           titleSource: explicitTitle ? "user" : undefined,
-          expectsInitialAgent: Boolean(request.firstAgentContext),
+          topic: request.topic,
+          expectsInitialAgent: Boolean(!request.topic && request.firstAgentContext),
           workspaceId,
           metadata: request.metadata,
           background: request.background,
@@ -9690,7 +9830,7 @@ export class Session {
     const descriptor = await this.describeWorkspaceRecord(workspace);
     await this.emitCreatedWorkspaceUpdate(
       descriptor,
-      request.firstAgentContext ? "running" : undefined,
+      !request.topic && request.firstAgentContext ? "running" : undefined,
     );
     void this.workspaceGitService
       .getSnapshot(workspace.cwd, { force: true, includeForge: true, reason: "open_project" })
@@ -9700,7 +9840,7 @@ export class Session {
           "Background snapshot refresh failed after workspace.create",
         );
       });
-    if (request.firstAgentContext) {
+    if (!request.topic && request.firstAgentContext) {
       const firstAgentContext = request.firstAgentContext;
       this.workspaceAutoName.scheduleForDirectory(
         {
@@ -9748,8 +9888,9 @@ export class Session {
         branchName: source.branchName,
         checkoutSource: source.checkoutSource,
         githubPrNumber: source.githubPrNumber,
-        firstAgentContext: request.firstAgentContext,
+        firstAgentContext: request.topic ? undefined : request.firstAgentContext,
         title: request.title,
+        topic: request.topic,
         metadata: request.metadata,
         background: request.background,
       },
@@ -9761,7 +9902,7 @@ export class Session {
     const descriptor = await this.describeCreatedWorktreeWorkspace(result);
     await this.emitCreatedWorkspaceUpdate(
       descriptor,
-      request.firstAgentContext ? "running" : undefined,
+      !request.topic && request.firstAgentContext ? "running" : undefined,
     );
     return descriptor;
   }
@@ -10755,6 +10896,26 @@ export class Session {
     });
   }
 
+  private async readAgentTimeline(
+    agentId: string,
+    options: Parameters<AgentManager["fetchTimeline"]>[1],
+  ) {
+    const quiet = await this.agentManager.readSilentTopicTimeline(agentId, options);
+    if (quiet) {
+      return { agentPayload: this.buildStoredAgentPayload(quiet.record), timeline: quiet.timeline };
+    }
+    const snapshot = await ensureAgentLoaded(agentId, {
+      agentManager: this.agentManager,
+      agentStorage: this.agentStorage,
+      logger: this.sessionLogger,
+      purpose: "history",
+    });
+    return {
+      agentPayload: await this.buildAgentPayload(snapshot),
+      timeline: this.agentManager.fetchTimeline(agentId, options),
+    };
+  }
+
   private async handleFetchAgentTimelineRequest(
     msg: Extract<SessionInboundMessage, { type: "fetch_agent_timeline_request" }>,
     source?: object,
@@ -10769,20 +10930,16 @@ export class Session {
       : undefined;
 
     try {
-      const snapshot = await ensureAgentLoaded(msg.agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-        purpose: "history",
-      });
-      const agentPayload = await this.buildAgentPayload(snapshot);
-
-      const fetchedControlTimeline = this.agentManager.fetchTimeline(msg.agentId, {
+      const options = {
         direction,
         cursor,
         limit: msg.limit,
         wholeTurns: msg.wholeTurns,
-      });
+      };
+      const { agentPayload, timeline: fetchedControlTimeline } = await this.readAgentTimeline(
+        msg.agentId,
+        options,
+      );
       const selectedTimeline = {
         timeline: fetchedControlTimeline,
         entries: fetchedControlTimeline.rows,
@@ -10824,7 +10981,7 @@ export class Session {
             ...(msg.mergeWindow === true ? { mergeWindow: true } : {}),
             entries: entries.map((entry) => {
               const payloadEntry = {
-                provider: snapshot.provider,
+                provider: agentPayload.provider,
                 item: entry.item,
                 timestamp: entry.timestamp,
                 seqStart: entry.seqStart,
@@ -10902,15 +11059,21 @@ export class Session {
     source?: object,
   ): Promise<void> {
     try {
-      const agent = await ensureAgentLoaded(msg.agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
+      const quiet = await this.agentManager.readSilentTopicTimeline(msg.agentId, {
+        direction: "tail",
+        limit: 0,
       });
-      const head = this.agentManager.getLoadedTimelineHead(msg.agentId);
+      const agent =
+        quiet?.record ??
+        (await ensureAgentLoaded(msg.agentId, {
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+          logger: this.sessionLogger,
+        }));
+      const head = quiet?.timeline ?? this.agentManager.getLoadedTimelineHead(msg.agentId);
       if (!head) throw new Error("History changed; search again");
       const { epoch } = head;
-      const rows = await this.agentManager.getTimelineRows(msg.agentId);
+      const rows = quiet?.timeline.rows ?? (await this.agentManager.getTimelineRows(msg.agentId));
       const result = await searchTimeline({
         rows,
         query: msg.query,
@@ -10919,7 +11082,7 @@ export class Session {
         includeAgentSourceBodies: msg.includeAgentSourceBodies,
         provider: agent.provider,
       });
-      if (this.agentManager.getLoadedTimelineHead(msg.agentId)?.epoch !== epoch) {
+      if (!quiet && this.agentManager.getLoadedTimelineHead(msg.agentId)?.epoch !== epoch) {
         throw new Error("History changed; search again");
       }
       this.emitForSource(
@@ -10959,16 +11122,24 @@ export class Session {
     source?: object,
   ): Promise<void> {
     try {
-      await ensureAgentLoaded(msg.agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      const rows = await this.agentManager.getTimelineRows(msg.agentId);
-      const timeline = this.agentManager.fetchTimeline(msg.agentId, {
+      const quiet = await this.agentManager.readSilentTopicTimeline(msg.agentId, {
         direction: "tail",
-        limit: 1,
+        limit: 0,
       });
+      if (!quiet) {
+        await ensureAgentLoaded(msg.agentId, {
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+          logger: this.sessionLogger,
+        });
+      }
+      const rows = quiet?.timeline.rows ?? (await this.agentManager.getTimelineRows(msg.agentId));
+      const timeline =
+        quiet?.timeline ??
+        this.agentManager.fetchTimeline(msg.agentId, {
+          direction: "tail",
+          limit: 1,
+        });
       const index = buildTimelinePromptIndex(timeline.epoch, rows);
       this.emitForSource(
         {
@@ -11276,6 +11447,11 @@ export class Session {
   }
 
   private async loadForkSourceTimeline(agentId: string) {
+    const quiet = await this.agentManager.readSilentTopicTimeline(agentId, {
+      direction: "tail",
+      limit: 0,
+    });
+    if (quiet) return { snapshot: quiet.record, timeline: quiet.timeline };
     const source = this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
     if (!source || source.internal) throw new Error(`Agent not found: ${agentId}`);
     const snapshot = await ensureAgentLoaded(agentId, {

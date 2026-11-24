@@ -6,11 +6,14 @@ import { afterEach, expect, test, vi } from "vitest";
 
 import type { ForgeService } from "../services/forge-service.js";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
-import type {
-  PersistedProjectRecord,
-  PersistedWorkspaceRecord,
-  ProjectRegistry,
-  WorkspaceRegistry,
+import {
+  FileBackedProjectRegistry,
+  FileBackedWorkspaceRegistry,
+  type PersistedProjectRecord,
+  type PersistedWorkspaceRecord,
+  type ProjectRegistry,
+  type WorkspaceMutation,
+  type WorkspaceRegistry,
 } from "./workspace-registry.js";
 import { createWorkspaceProvisioningService } from "./session/workspace-provisioning/workspace-provisioning-service.js";
 import { createTestLogger } from "../test-utils/test-logger.js";
@@ -77,6 +80,7 @@ test("creates a worktree and registers it in the source workspace project withou
     title: "Feature One",
     titleSource: "user",
   });
+  expect(result.workspace.topic).toBeUndefined();
   expect(deps.workspaceGitService.getSnapshot).not.toHaveBeenCalled();
   expect(deps.projects.get(sourceProject.projectId)).toEqual({
     ...sourceProject,
@@ -89,6 +93,49 @@ test("creates a worktree and registers it in the source workspace project withou
     updatedAt: expect.any(String),
   });
   expect(events).toEqual([`workspace:${result.workspace.workspaceId}`]);
+});
+
+test("includes topic metadata in the first worktree workspace write", async () => {
+  const { repoDir, tempDir } = createGitRepo();
+  cleanupPaths.push(tempDir);
+  const deps = createDeps();
+  const logger = createTestLogger();
+  const workspacePath = path.join(tempDir, "workspaces.json");
+  const workspaceRegistry = new FileBackedWorkspaceRegistry(workspacePath, logger);
+  const mutations: WorkspaceMutation[] = [];
+  workspaceRegistry.subscribeToMutations((mutation) => {
+    mutations.push(mutation);
+  });
+  const workspaceProvisioning = createWorkspaceProvisioningService({
+    unarchiveWorkspaceAgents: async () => {},
+    projectRegistry: new FileBackedProjectRegistry(path.join(tempDir, "projects.json"), logger),
+    workspaceRegistry,
+    workspaceGitService: deps.workspaceGitService,
+    isDirectory: async (cwd) => existsSync(cwd),
+    logger,
+  });
+  const topic = { summary: "Check startup traces", hideFromModel: true };
+  const result = await createPaseoWorktree(
+    {
+      cwd: repoDir,
+      worktreeSlug: "topic-startup",
+      title: "  Startup  ",
+      topic,
+      paseoHome: path.join(tempDir, ".paseo"),
+    },
+    { ...deps, workspaceProvisioning },
+  );
+
+  const workspaceId = result.workspace.workspaceId;
+  expect(result.workspace).toMatchObject({
+    kind: "worktree",
+    title: "Startup",
+    titleSource: "user",
+    topic: { ...topic, revision: 1 },
+  });
+  expect(mutations).toEqual([{ kind: "upsert", workspaceId, workspace: result.workspace }]);
+  const reloaded = new FileBackedWorkspaceRegistry(workspacePath, logger);
+  expect((await reloaded.get(workspaceId))?.topic).toEqual({ ...topic, revision: 1 });
 });
 
 test("refreshes a source project that became Git while creating a worktree", async () => {

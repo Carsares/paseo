@@ -33,6 +33,7 @@ import {
   EXPLICIT_PARENT_REPORTING,
   getAgentProfileIdFromLabels,
   getMainPriorModeIdFromLabels,
+  getOpenAgentTabLabel,
   getParentAddressFromLabels,
   getParentAgentIdFromLabels,
   getResidentRoleFromLabels,
@@ -44,6 +45,7 @@ import {
   isMainControlAgentLabels,
   isOpenAgentTabLabel,
   isResidentAgentLabels,
+  isSideChatAgentLabels,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
@@ -67,7 +69,14 @@ import type { AgentRewindCheckpointDiffResponse } from "@getpaseo/protocol/messa
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
-import type { WorkspaceRegistry } from "../workspace-registry.js";
+import {
+  resolveWorkspaceDisplayName,
+  updateWorkspaceTopic as persistWorkspaceTopic,
+  type PersistedWorkspaceRecord,
+  type WorkspaceRegistry,
+  type WorkspaceTopicInput,
+} from "../workspace-registry.js";
+import { isHumanForegroundPrompt, withWorkspaceTopicPrompt } from "./agent-prompt.js";
 import { AGENT_WORKSPACE_CREATION_ERROR } from "./create-agent/intent.js";
 
 import {
@@ -222,6 +231,7 @@ import {
   resolveAgentPaseoToolPolicy,
 } from "./paseo-tool-policy.js";
 import {
+  assertTopicMainArchiveAllowed,
   buildHierarchyAppendSystemPrompt,
   buildMainControlInstructions,
   computeAgentDepth,
@@ -229,6 +239,7 @@ import {
   hasReservedHierarchyLabels,
   type HierarchyAgent,
   isMainControlWritePermissionBlocked,
+  isTopicWorkspaceMain,
   MAIN_CONTROL_WRITE_DENIAL,
   MAIN_CONTROL_PROMPT_HEADER,
   mainControlPromptEnd,
@@ -238,6 +249,8 @@ import {
   readLocalSubtreeDepths,
   REMOTE_HIERARCHY_DEPTH_LABEL,
   RESERVED_HIERARCHY_LABELS_ERROR,
+  type TopicWorkspaceAgent,
+  type TopicWorkspaceSnapshot,
   validateCanSpawnChild,
   validateSetAgentParent,
 } from "./hierarchy-policy.js";
@@ -405,6 +418,23 @@ interface MainControlRoleChange {
   enabled: boolean;
   workspaceId: string | undefined;
   previousMainIds: string[];
+}
+
+interface UpdateWorkspaceTopicInput extends WorkspaceTopicInput {
+  workspaceId: string;
+  mainAgentId?: string;
+  upgradeToTopic?: boolean;
+  updatedAt?: string;
+}
+
+interface LegacyAgentTabCloseOptions {
+  clientId?: string;
+  expectedWorkspaceId?: string;
+}
+
+interface WorkspaceAgentArchiveResult {
+  archivedAt: string;
+  record: StoredAgentRecord | null;
 }
 
 interface MainControlRoleUpdate {
@@ -2618,6 +2648,35 @@ export class AgentManager {
     return this.timelineStore.fetch(id, options);
   }
 
+  async isSilentTopicMain(record: StoredAgentRecord | null | undefined): Promise<boolean> {
+    if (!record?.workspaceId || record.internal) return false;
+    if (record.lastStatus !== "closed" || record.persistence?.sessionId) return false;
+    if (!isMainControlAgentLabels(record.labels)) return false;
+    const workspace = await this.getWorkspaceForTopicPolicy(record.workspaceId);
+    return isTopicWorkspaceMain(record, workspace);
+  }
+
+  async readSilentTopicTimeline(
+    agentId: string,
+    options?: AgentTimelineFetchOptions,
+  ): Promise<{ record: StoredAgentRecord; timeline: AgentTimelineFetchResult } | null> {
+    if (this.agents.has(agentId)) return null;
+    const record = await this.registry?.get(agentId);
+    if (!record || !(await this.isSilentTopicMain(record))) return null;
+    const [prefix, committed] = await Promise.all([
+      this.timelinePrefixes.load(agentId),
+      this.durableTimelineStore?.getCommittedRows(agentId),
+    ]);
+    const rows = this.mergeResetTimelineRows(prefix?.rows ?? [], committed ?? []);
+    const snapshot = new InMemoryAgentTimelineStore();
+    snapshot.initialize(agentId, {
+      rows,
+      epoch: "silent-topic:" + agentId,
+      sealedThrough: maxTimelineSeq(prefix?.rows ?? []),
+    });
+    return { record, timeline: snapshot.fetch(agentId, options) };
+  }
+
   listProviderSubagents(parentAgentId: string): ProviderSubagentDescriptor[] {
     this.requirePublicAgent(parentAgentId);
     return this.providerSubagents.list(parentAgentId);
@@ -2805,6 +2864,12 @@ export class AgentManager {
       const workspace = await this.workspaceRegistry.get(workspaceId);
       if (!workspace || workspace.archivedAt) throw new Error(AGENT_WORKSPACE_CREATION_ERROR);
     }
+  }
+
+  async getWorkspaceForTopicPolicy(workspaceId: string): Promise<TopicWorkspaceSnapshot | null> {
+    const workspace = await this.workspaceRegistry?.get(workspaceId);
+    if (!workspace) return null;
+    return { workspaceId, title: resolveWorkspaceDisplayName(workspace), topic: workspace.topic };
   }
 
   /**
@@ -3695,6 +3760,7 @@ export class AgentManager {
     options?: { cancelActiveRun?: boolean },
   ): Promise<{ archivedAt: string }> {
     return this.runHierarchyArchive(agentId, async () => {
+      await this.assertSingleAgentTopicArchiveAllowed(this.agents.get(agentId));
       if (options?.cancelActiveRun) await this.prepareLiveAgentArchiveUnlocked(agentId);
       return this.archiveAgentUnlocked(agentId, archivedAt);
     });
@@ -3711,6 +3777,7 @@ export class AgentManager {
       if (!live && this.getRetiredInternalAgent(agentId)) return;
       const stored = live?.internal ? null : await this.requireRegistry().get(agentId);
       if (stored?.archivedAt && (!live || this.historySessions.has(live.session))) return;
+      await this.assertSingleAgentTopicArchiveAllowed(live ?? stored);
 
       if (!live) {
         if (!stored) throw new Error(`Agent not found: ${agentId}`);
@@ -3774,32 +3841,107 @@ export class AgentManager {
   async archiveAgentInWorkspace(
     agentId: string,
     expectedWorkspaceId: string,
-  ): Promise<{ archivedAt: string; record: StoredAgentRecord | null }> {
+  ): Promise<WorkspaceAgentArchiveResult> {
     return this.runHierarchyArchive(agentId, async () => {
-      const live = this.agents.get(agentId);
-      const stored = live?.internal ? null : await this.requireRegistry().get(agentId);
-      const workspaceId = live ? live.workspaceId : stored?.workspaceId;
-      if (workspaceId !== expectedWorkspaceId) {
-        throw new Error(`Agent ${agentId} is no longer in workspace ${expectedWorkspaceId}`);
-      }
-      this.assertNotResidentForArchive(live?.labels ?? stored?.labels);
-      if (!live) {
-        if (!stored) throw new Error(`Agent not found: ${agentId}`);
-        if (stored.archivedAt) return { archivedAt: stored.archivedAt, record: stored };
-        const archivedAt = new Date().toISOString();
-        const record = await this.archiveSnapshotUnlocked(agentId, archivedAt);
-        return { archivedAt: record.archivedAt ?? archivedAt, record };
-      }
-      await this.prepareLiveAgentArchiveUnlocked(agentId);
-      const { archivedAt } = await this.archiveAgentUnlocked(agentId, undefined, {
-        retainForkContext: true,
-      });
-      const record = live.internal ? null : await this.requireRegistry().get(agentId);
-      if (!record && !live.internal) {
-        throw new Error(`Agent not found in storage after archive: ${agentId}`);
-      }
-      return { archivedAt: record?.archivedAt ?? archivedAt, record };
+      const { live, stored, target } = await this.readAgentArchiveTarget(
+        agentId,
+        expectedWorkspaceId,
+      );
+      await this.assertSingleAgentTopicArchiveAllowed(target);
+      return this.archiveAgentForTabUnlocked(agentId, live, stored, true);
     });
+  }
+
+  async archiveAgentForLegacyClose(
+    agentId: string,
+    options: LegacyAgentTabCloseOptions,
+  ): Promise<WorkspaceAgentArchiveResult | null> {
+    return this.runHierarchyArchive(agentId, async () => {
+      const { expectedWorkspaceId, clientId } = options;
+      const { live, stored, target } = await this.readAgentArchiveTarget(
+        agentId,
+        expectedWorkspaceId,
+      );
+      const workspace = target.workspaceId
+        ? await this.getWorkspaceForTopicPolicy(target.workspaceId)
+        : null;
+      if (workspace?.topic && !target.internal) {
+        await this.clearTopicClientTabUnlocked(target, stored, clientId);
+        return null;
+      }
+      if (isSideChatAgentLabels(target.labels)) {
+        throw new Error("Side chats require an explicit archive.");
+      }
+      assertTopicMainArchiveAllowed(target, workspace);
+      if (expectedWorkspaceId === undefined && !live && stored?.archivedAt) {
+        return { archivedAt: stored.archivedAt, record: stored };
+      }
+      return this.archiveAgentForTabUnlocked(
+        agentId,
+        live,
+        stored,
+        expectedWorkspaceId !== undefined,
+      );
+    });
+  }
+
+  private async readAgentArchiveTarget(agentId: string, expectedWorkspaceId?: string) {
+    const live = this.agents.get(agentId);
+    const stored = live?.internal ? null : await this.requireRegistry().get(agentId);
+    const target = live ?? stored;
+    const workspaceId = target?.workspaceId;
+    if (expectedWorkspaceId !== undefined && workspaceId !== expectedWorkspaceId) {
+      throw new Error(`Agent ${agentId} is no longer in workspace ${expectedWorkspaceId}`);
+    }
+    if (!target) throw new Error(`Agent not found: ${agentId}`);
+    return { live, stored, target };
+  }
+
+  private async archiveAgentForTabUnlocked(
+    agentId: string,
+    live: LiveManagedAgent | undefined,
+    stored: StoredAgentRecord | null,
+    retainForkContext: boolean,
+  ): Promise<WorkspaceAgentArchiveResult> {
+    this.assertNotResidentForArchive((live ?? stored)?.labels);
+    if (!live) {
+      if (!stored) throw new Error(`Agent not found: ${agentId}`);
+      if (stored.archivedAt) return { archivedAt: stored.archivedAt, record: stored };
+      const archivedAt = new Date().toISOString();
+      const record = await this.archiveSnapshotUnlocked(agentId, archivedAt);
+      return { archivedAt: record.archivedAt ?? archivedAt, record };
+    }
+    await this.prepareLiveAgentArchiveUnlocked(agentId);
+    const { archivedAt } = await this.archiveAgentUnlocked(agentId, undefined, {
+      retainForkContext,
+    });
+    const record = live.internal ? null : await this.requireRegistry().get(agentId);
+    if (!record && !live.internal)
+      throw new Error(`Agent not found in storage after archive: ${agentId}`);
+    return { archivedAt: record?.archivedAt ?? archivedAt, record };
+  }
+
+  private async clearTopicClientTabUnlocked(
+    target: TopicWorkspaceAgent,
+    stored: StoredAgentRecord | null,
+    clientId: string | undefined,
+  ): Promise<void> {
+    if (!clientId) return;
+    const label = getOpenAgentTabLabel(clientId);
+    // A failed save can leave the live labels ahead of the stored snapshot.
+    if (target.labels?.[label] === undefined && stored?.labels?.[label] === undefined) return;
+    const result = await this.writeLabels(target.id, { [label]: null });
+    if (!result.live && result.record) this.dispatchStoredAgentState(result.record);
+  }
+
+  private async assertSingleAgentTopicArchiveAllowed(
+    target: TopicWorkspaceAgent | null | undefined,
+  ): Promise<void> {
+    if (!target?.workspaceId || !isMainControlAgentLabels(target.labels)) return;
+    assertTopicMainArchiveAllowed(
+      target,
+      await this.getWorkspaceForTopicPolicy(target.workspaceId),
+    );
   }
 
   private async prepareLiveAgentArchiveUnlocked(agentId: string): Promise<void> {
@@ -5016,6 +5158,73 @@ export class AgentManager {
     };
     await registry.upsert(nextRecord);
     return nextRecord;
+  }
+
+  async updateWorkspaceTopic(
+    input: UpdateWorkspaceTopicInput,
+    registry: Pick<WorkspaceRegistry, "get" | "update">,
+  ): Promise<{ workspace: PersistedWorkspaceRecord; mainAgentId: string | null }> {
+    const { workspaceId, mainAgentId, upgradeToTopic } = input;
+    return this.runHierarchyMutationWhenMainCreationAllows(
+      () => this.workspaceMainCreations.get(workspaceId),
+      async () => {
+        const workspace = await registry.get(workspaceId);
+        if (!workspace || workspace.archivedAt)
+          throw new Error("Workspace is missing or archived.");
+        const existingMain = (await this.requireRegistry().listByWorkspaces([workspaceId])).find(
+          (record) =>
+            this.isTopicMainCandidate(record, workspaceId) &&
+            isMainControlAgentLabels(record.labels),
+        );
+        const save = async () => {
+          const updated = await persistWorkspaceTopic(registry, {
+            ...input,
+            updatedAt: input.updatedAt ?? new Date().toISOString(),
+          });
+          if (!updated) throw new Error("Workspace is missing.");
+          return updated;
+        };
+        if (!mainAgentId || mainAgentId === existingMain?.id) {
+          return { workspace: await save(), mainAgentId: existingMain?.id ?? null };
+        }
+        if (existingMain || workspace.topic || !upgradeToTopic) {
+          throw new Error("The selected agent must be the current Main Control.");
+        }
+        return this.runLifecycleMutation(mainAgentId, async () => {
+          const targetRecord = await this.requireRegistry().get(mainAgentId);
+          if (!targetRecord || !this.isTopicMainCandidate(targetRecord, workspaceId)) {
+            throw new Error("Only an active workspace root agent can be Main Control.");
+          }
+          let upgraded: PersistedWorkspaceRecord | undefined;
+          await this.changeMainControlRoles({
+            targetRecord,
+            enabled: true,
+            workspaceId,
+            previousMainIds: [],
+            handoff: {
+              canRestore: () => true,
+              commit: async () => {
+                upgraded = await save();
+              },
+            },
+          });
+          if (!upgraded) throw new Error("Topic upgrade was not persisted.");
+          return { workspace: upgraded, mainAgentId };
+        });
+      },
+    );
+  }
+
+  private isTopicMainCandidate(record: StoredAgentRecord, workspaceId: string): boolean {
+    if (record.archivedAt || record.internal || record.workspaceId !== workspaceId) return false;
+    const live = this.agents.get(record.id);
+    if (live && (live.internal || live.workspaceId !== workspaceId)) return false;
+    const labels = live?.labels ?? record.labels;
+    return (
+      !getParentAgentIdFromLabels(labels) &&
+      !isSideChatAgentLabels(labels) &&
+      !isResidentAgentLabels(labels)
+    );
   }
 
   async createSilentWorkspaceMainAgent({
@@ -6598,9 +6807,33 @@ export class AgentManager {
   }
 
   async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
-    return this.runHierarchyArchive(agentId, () =>
-      this.archiveSnapshotUnlocked(agentId, archivedAt),
-    );
+    return this.runHierarchyArchive(agentId, async () => {
+      const target = this.agents.get(agentId) ?? (await this.requireRegistry().get(agentId));
+      await this.assertSingleAgentTopicArchiveAllowed(target);
+      return this.archiveSnapshotUnlocked(agentId, archivedAt);
+    });
+  }
+
+  /** Roll back a failed reopen to its previously observed archive timestamp. */
+  async restoreArchivedSnapshot(
+    agentId: string,
+    archivedAt: string,
+    previousTopicMainWorkspaceId?: string,
+  ): Promise<StoredAgentRecord | null> {
+    return this.runHierarchyArchive(agentId, async () => {
+      const record = await this.requireRegistry().get(agentId);
+      if (!record || record.archivedAt || this.hasInFlightRun(agentId)) return record;
+      const target = this.agents.get(agentId) ?? record;
+      const workspace = target.workspaceId
+        ? await this.getWorkspaceForTopicPolicy(target.workspaceId)
+        : null;
+      if (
+        isTopicWorkspaceMain(target, workspace) &&
+        target.workspaceId !== previousTopicMainWorkspaceId
+      )
+        return null;
+      return this.archiveSnapshotUnlocked(agentId, archivedAt);
+    });
   }
 
   /** A workspace archive owns every member, including residents protected from direct archive. */
@@ -7478,16 +7711,42 @@ export class AgentManager {
     });
   }
 
-  private async prepareProviderTurnPrompt(
+  private prepareProviderTurnPrompt(
     agent: ActiveManagedAgent,
     prompt: AgentPromptInput,
     handoff: PendingContextHandoff | undefined,
     addMainControl: boolean,
     residentSpecialists: string,
-    taskLedger: string,
+    taskLedger: string | undefined,
+    promptStart?: ForegroundPromptStart,
+  ): Promise<AgentPromptInput> | undefined {
+    const mayAddTopic =
+      isMainControlAgentLabels(agent.labels) && isHumanForegroundPrompt(promptStart);
+    if (!handoff && !addMainControl && !residentSpecialists && !taskLedger && !mayAddTopic) return;
+    return this.composeProviderTurnPrompt(
+      agent,
+      prompt,
+      handoff,
+      addMainControl,
+      residentSpecialists,
+      taskLedger,
+      promptStart,
+    );
+  }
+
+  private async composeProviderTurnPrompt(
+    agent: ActiveManagedAgent,
+    prompt: AgentPromptInput,
+    handoff: PendingContextHandoff | undefined,
+    addMainControl: boolean,
+    residentSpecialists: string,
+    taskLedger: string | undefined,
+    promptStart?: ForegroundPromptStart,
   ): Promise<AgentPromptInput> {
     const envelope = handoff && (await this.prepareContextForSend(agent, handoff));
-    const providerPrompt = envelope ? injectContextHandoffIntoPrompt(prompt, envelope) : prompt;
+    const basePrompt = envelope ? injectContextHandoffIntoPrompt(prompt, envelope) : prompt;
+    const topicPrompt = this.prepareTopicProviderPrompt(agent, basePrompt, promptStart);
+    const providerPrompt = topicPrompt ? await topicPrompt : basePrompt;
     let prefix = residentSpecialists + (taskLedger ? `${taskLedger}\n\n` : "");
     if (addMainControl) {
       const instructions = buildMainControlInstructions(agent.mainControlSystemPrompt);
@@ -7499,6 +7758,20 @@ export class AgentManager {
     return first?.type === "text" && !("mimeType" in first)
       ? [{ ...first, text: prefix + first.text }, ...rest]
       : [{ type: "text", text: prefix }, ...providerPrompt];
+  }
+
+  private prepareTopicProviderPrompt(
+    agent: ActiveManagedAgent,
+    prompt: AgentPromptInput,
+    promptStart?: ForegroundPromptStart,
+  ): Promise<AgentPromptInput> | undefined {
+    if (!isHumanForegroundPrompt(promptStart) || !isMainControlAgentLabels(agent.labels)) {
+      return undefined;
+    }
+    if (!agent.workspaceId) return undefined;
+    return this.getWorkspaceForTopicPolicy(agent.workspaceId).then((workspace) =>
+      withWorkspaceTopicPrompt({ agent, workspace, prompt, promptStart }),
+    );
   }
 
   private async residentSpecialistsPrompt(agent: ActiveManagedAgent): Promise<string> {
@@ -7592,17 +7865,16 @@ export class AgentManager {
       const specialists = isMain ? await this.residentSpecialistsPrompt(agent) : "";
       const ledger = await this.workspaceTaskLedgerPrompt(agent, prompt);
       const session = agent.session;
-      const providerPrompt =
-        handoff || addedMainControl || specialists || ledger
-          ? await this.prepareProviderTurnPrompt(
-              agent,
-              prompt,
-              handoff,
-              addedMainControl,
-              specialists,
-              ledger?.text ?? "",
-            )
-          : prompt;
+      const composed = this.prepareProviderTurnPrompt(
+        agent,
+        prompt,
+        handoff,
+        addedMainControl,
+        specialists,
+        ledger?.text,
+        promptStart,
+      );
+      const providerPrompt = composed ? await composed : prompt;
       const result = await this.startAdmittedProviderTurn(params, providerPrompt, ledger?.valid);
       if (ledger) {
         const sessionId = ledger.sessionId ?? session.describePersistence()?.sessionId;
@@ -8307,13 +8579,21 @@ export class AgentManager {
               this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
               if (taskAdmission) assertTaskDispatchAdmission(taskAdmission, agentId);
             };
-            const steer = (beforeProviderDispatch?: () => Promise<void>) =>
-              agent.session.steerActiveTurn!(prompt, {
-                ...options,
-                expectedTurnId,
-                beforeProviderDispatch,
-                assertProviderDispatchAllowed: taskAdmission ? assertSteerAllowed : undefined,
+            const steer = (beforeProviderDispatch?: () => Promise<void>) => {
+              const send = (providerPrompt: AgentPromptInput) =>
+                agent.session.steerActiveTurn!(providerPrompt, {
+                  ...options,
+                  expectedTurnId,
+                  beforeProviderDispatch,
+                  assertProviderDispatchAllowed: taskAdmission ? assertSteerAllowed : undefined,
+                });
+              const topicPrompt = this.prepareTopicProviderPrompt(agent, prompt, promptStart);
+              if (!topicPrompt) return send(prompt);
+              return topicPrompt.then((providerPrompt) => {
+                assertSteerAllowed();
+                return send(providerPrompt);
               });
+            };
             let admission: SteerResult;
             try {
               if (promptStart?.beforeHandoff) {

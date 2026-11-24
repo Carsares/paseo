@@ -16,6 +16,7 @@ import {
   type PersistedWorkspaceRecord,
   type ProjectRegistry,
   type WorkspaceRegistry,
+  type WorkspaceTopicInput,
 } from "../../workspace-registry.js";
 import type { WorkspaceGitService } from "../../workspace-git-service.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
@@ -55,6 +56,7 @@ export interface CreateWorktreeWorkspaceInput {
   worktreeManagerPluginId?: string | null;
   title: string | null;
   titleSource?: PersistedWorkspaceRecord["titleSource"];
+  topic?: WorkspaceTopicInput;
   metadata?: Record<string, JsonValue>;
   expectsInitialAgent?: boolean;
   untrustedSource?: UntrustedWorkspaceSource;
@@ -78,6 +80,7 @@ export interface WorkspaceProvisioningService {
       expectsInitialAgent?: boolean;
       workspaceId?: string;
       metadata?: Record<string, JsonValue>;
+      topic?: WorkspaceTopicInput;
       background?: boolean;
       callerWorkspaceId?: string;
       untrustedSource?: UntrustedWorkspaceSource;
@@ -273,6 +276,7 @@ export function createWorkspaceProvisioningService(deps: {
       expectsInitialAgent?: boolean;
       workspaceId?: string;
       metadata?: Record<string, JsonValue>;
+      topic?: WorkspaceTopicInput;
       background?: boolean;
       callerWorkspaceId?: string;
       untrustedSource?: UntrustedWorkspaceSource;
@@ -300,6 +304,7 @@ export function createWorkspaceProvisioningService(deps: {
         title: title?.trim() || null,
         titleSource: context?.titleSource,
         metadata: context?.metadata,
+        topic: context?.topic,
         untrustedSource,
         createdAt: timestamp,
         updatedAt: timestamp,
@@ -344,6 +349,7 @@ export function createWorkspaceProvisioningService(deps: {
       worktreeManagerPluginId: input.worktreeManagerPluginId ?? null,
       title: input.title,
       titleSource: input.titleSource,
+      topic: input.topic,
       metadata: input.metadata,
       createdAt: timestamp,
       updatedAt: timestamp,

@@ -34,6 +34,7 @@ import { isPaseoToolEnabled } from "./paseo-tool-policy.js";
 import { resolveRuntimeMcpToolPolicy } from "./runtime-mcp-config.js";
 import {
   applyHierarchyPaseoToolPolicy,
+  assertTopicMainArchiveAllowed,
   buildHierarchyAppendSystemPrompt,
   computeAgentDepth,
   computeMaxSubtreeDepth,
@@ -41,10 +42,12 @@ import {
   REMOTE_HIERARCHY_DEPTH_LABEL,
   resolveInheritedHierarchyMode,
   stripMainControlPromptHeader,
+  TopicMainArchiveError,
   validateCanSpawnChild,
   validateSetAgentParent,
   validateSingleHopOrchestration,
   type HierarchyAgent,
+  type TopicWorkspaceSnapshot,
 } from "./hierarchy-policy.js";
 
 const main: HierarchyAgent = {
@@ -73,6 +76,27 @@ const mainControlTools = [
   "upsert_workspace_task",
   "list_workspace_tasks",
 ];
+
+it("protects the current topic main without changing legacy or cross-workspace archive rules", () => {
+  const workspace: TopicWorkspaceSnapshot = {
+    workspaceId: "topic",
+    topic: { summary: null, hideFromModel: true, mainAgentId: main.id },
+  };
+  const topicMain = { ...main, workspaceId: "topic" };
+  expect(() => assertTopicMainArchiveAllowed(topicMain, workspace)).toThrow(TopicMainArchiveError);
+  expect(() =>
+    assertTopicMainArchiveAllowed({ ...lead, workspaceId: "topic" }, workspace),
+  ).not.toThrow();
+  expect(() =>
+    assertTopicMainArchiveAllowed({ ...topicMain, workspaceId: "legacy" }, workspace),
+  ).not.toThrow();
+  expect(() =>
+    assertTopicMainArchiveAllowed(
+      { ...topicMain, workspaceId: "legacy" },
+      { workspaceId: "legacy" },
+    ),
+  ).not.toThrow();
+});
 
 function testWorkspaceRegistry(cwd: string) {
   const workspace = createPersistedWorkspaceRecord({

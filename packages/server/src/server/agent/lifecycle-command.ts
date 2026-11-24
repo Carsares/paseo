@@ -9,9 +9,18 @@ import {
 } from "./agent-manager.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
 import type { AgentProviderNotice } from "./agent-sdk-types.js";
-import { hasReservedHierarchyLabels, RESERVED_HIERARCHY_LABELS_ERROR } from "./hierarchy-policy.js";
+import { isMainControlAgentLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  assertTopicMainArchiveAllowed,
+  hasReservedHierarchyLabels,
+  RESERVED_HIERARCHY_LABELS_ERROR,
+  type TopicWorkspaceSnapshot,
+} from "./hierarchy-policy.js";
 
-export type LifecycleAgentSnapshot = Pick<ManagedAgent, "id" | "cwd" | "lifecycle" | "internal">;
+export type LifecycleAgentSnapshot = Pick<
+  ManagedAgent,
+  "id" | "cwd" | "lifecycle" | "internal" | "workspaceId" | "labels"
+>;
 
 export interface LifecycleAgentManager {
   getAgent(agentId: string): LifecycleAgentSnapshot | null;
@@ -130,18 +139,36 @@ export interface ArchiveAgentResult {
   record: StoredAgentRecord | null;
 }
 
+export interface ArchiveAgentCommandDependencies extends AgentLifecycleCommandDependencies {
+  agentManager: LifecycleAgentManager & {
+    getWorkspaceForTopicPolicy?(workspaceId: string): Promise<TopicWorkspaceSnapshot | null>;
+  };
+}
+
 export async function archiveAgentCommand(
-  dependencies: AgentLifecycleCommandDependencies,
+  dependencies: ArchiveAgentCommandDependencies,
   agentId: string,
   expectedWorkspaceId?: string,
 ): Promise<ArchiveAgentResult> {
+  const { agentManager, agentStorage } = dependencies;
+  const liveAgent = agentManager.getAgent(agentId);
+  const storedAgent = liveAgent ? null : await agentStorage.get(agentId);
+  const target = liveAgent ?? storedAgent;
+  if (
+    target?.workspaceId &&
+    isMainControlAgentLabels(target.labels) &&
+    (expectedWorkspaceId === undefined || target.workspaceId === expectedWorkspaceId)
+  ) {
+    const workspace = await agentManager.getWorkspaceForTopicPolicy?.(target.workspaceId);
+    assertTopicMainArchiveAllowed(target, workspace);
+  }
+
   if (expectedWorkspaceId !== undefined) {
     return {
       agentId,
       ...(await dependencies.agentManager.archiveAgentInWorkspace(agentId, expectedWorkspaceId)),
     };
   }
-  const liveAgent = dependencies.agentManager.getAgent(agentId);
   let record: StoredAgentRecord | null;
   if (liveAgent) {
     const archived = await dependencies.agentManager.archiveAgent(agentId, undefined, {
@@ -152,7 +179,10 @@ export async function archiveAgentCommand(
     }
     record = await dependencies.agentStorage.get(agentId);
   } else {
-    record = await archiveStoredAgent(dependencies, agentId);
+    if (!storedAgent) throw new Error(`Agent not found: ${agentId}`);
+    record = storedAgent.archivedAt
+      ? storedAgent
+      : await agentManager.archiveSnapshot(agentId, new Date().toISOString());
   }
 
   if (!record) {
@@ -251,21 +281,4 @@ export async function setAgentModeCommand(
 ): Promise<{ modeId: string; notice: AgentProviderNotice | null }> {
   const notice = await dependencies.agentManager.setAgentMode(input.agentId, input.modeId);
   return { modeId: input.modeId, notice };
-}
-
-async function archiveStoredAgent(
-  dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager" | "agentStorage">,
-  agentId: string,
-): Promise<StoredAgentRecord> {
-  const existing = await dependencies.agentStorage.get(agentId);
-  if (!existing) {
-    throw new Error(`Agent not found: ${agentId}`);
-  }
-
-  if (existing.archivedAt) {
-    return existing;
-  }
-
-  const archivedAt = new Date().toISOString();
-  return dependencies.agentManager.archiveSnapshot(agentId, archivedAt);
 }

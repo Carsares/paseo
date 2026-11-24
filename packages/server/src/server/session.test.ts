@@ -3594,6 +3594,7 @@ describe("agent move to workspace RPC", () => {
           subscribe: agentManager.subscribe.bind(agentManager),
           archiveSnapshot: agentManager.archiveSnapshot.bind(agentManager),
           archiveAgentInWorkspace: agentManager.archiveAgentInWorkspace.bind(agentManager),
+          archiveAgentForLegacyClose: agentManager.archiveAgentForLegacyClose.bind(agentManager),
           moveSubagentToWorkspace: agentManager.moveSubagentToWorkspace.bind(agentManager),
           getStoredWorkspaceMoveSnapshots:
             agentManager.getStoredWorkspaceMoveSnapshots.bind(agentManager),

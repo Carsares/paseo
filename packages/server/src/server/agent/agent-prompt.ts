@@ -4,13 +4,97 @@ import type { Logger } from "pino";
 import type { AgentCommandOutcome, AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import { ForegroundPromptStart } from "./agent-run-state.js";
-import type { AgentStorage } from "./agent-storage.js";
+import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
 import { AgentNotFoundError, ensureAgentLoaded } from "./agent-loading.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
 import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
+import { isMainControlAgentLabels } from "@getpaseo/protocol/agent-labels";
 import { AgentRequestOutcomeUnknownError, type QueueHandoff } from "../message-receipts/index.js";
+import {
+  isTopicWorkspaceMain,
+  WORKSPACE_TOPIC_PROMPT_DESCRIPTION,
+  WORKSPACE_TOPIC_PROMPT_HEADER,
+  workspaceTopicPromptEnd,
+  type TopicWorkspaceAgent,
+  type TopicWorkspaceSnapshot,
+} from "./hierarchy-policy.js";
+
+const humanPromptStarts = new WeakSet<ForegroundPromptStart>();
+const TOPIC_TITLE_LIMIT = 160;
+const TOPIC_SUMMARY_LIMIT = 2_000;
+
+export function isHumanForegroundPrompt(promptStart?: ForegroundPromptStart): boolean {
+  return !!promptStart && humanPromptStarts.has(promptStart);
+}
+
+function hasHumanPromptText(prompt: AgentPromptInput): boolean {
+  if (typeof prompt === "string") return !!prompt.trim();
+  return prompt.some(
+    (block) => block.type === "text" && !("mimeType" in block) && !!block.text.trim(),
+  );
+}
+
+function limitTopicField(value: string | null | undefined, limit: number): string | null {
+  return (
+    value
+      ?.trim()
+      .slice(0, limit)
+      .replace(/[\uD800-\uDBFF]$/u, "")
+      .trimEnd() || null
+  );
+}
+
+interface WorkspaceTopicPromptInput {
+  agent: TopicWorkspaceAgent;
+  workspace: TopicWorkspaceSnapshot | null | undefined;
+  prompt: AgentPromptInput;
+  promptStart?: ForegroundPromptStart;
+}
+
+/** Apply to the provider copy only. The submitted prompt still owns the timeline. */
+export function withWorkspaceTopicPrompt({
+  agent,
+  workspace,
+  prompt,
+  promptStart,
+}: WorkspaceTopicPromptInput): AgentPromptInput {
+  if (!isHumanForegroundPrompt(promptStart) || !isTopicWorkspaceMain(agent, workspace)) {
+    return prompt;
+  }
+  const { topic } = workspace;
+  if (topic.hideFromModel || (topic.mainAgentId && topic.mainAgentId !== agent.id)) return prompt;
+
+  const title = limitTopicField(workspace.title, TOPIC_TITLE_LIMIT);
+  const summary = limitTopicField(topic.summary, TOPIC_SUMMARY_LIMIT);
+  if (!title && !summary) return prompt;
+  // JSON quotes line breaks and quotes. Quote both bracket and XML delimiters
+  // as well, so fields cannot create any Paseo prompt boundaries.
+  const fields = JSON.stringify({ title, summary }).replace(
+    /[\x5b\x5d<>&\u2028\u2029]/g,
+    (character) => "\\u" + character.charCodeAt(0).toString(16).padStart(4, "0"),
+  );
+  const prefix =
+    `${WORKSPACE_TOPIC_PROMPT_HEADER}\n${WORKSPACE_TOPIC_PROMPT_DESCRIPTION}\n${fields}` +
+    workspaceTopicPromptEnd(agent.id) +
+    "\n\n";
+  if (typeof prompt === "string") return prefix + prompt;
+  const [first, ...rest] = prompt;
+  return first?.type === "text" && !("mimeType" in first)
+    ? [{ ...first, text: prefix + first.text }, ...rest]
+    : [{ type: "text", text: prefix }, ...prompt];
+}
 
 export type AgentUnarchiveController = Pick<AgentManager, "notifyAgentState" | "unarchiveSnapshot">;
+
+export async function readArchivedTopicMainWorkspaceId(
+  manager: Pick<AgentManager, "getWorkspaceForTopicPolicy">,
+  record: StoredAgentRecord,
+): Promise<string | undefined> {
+  if (!record.archivedAt || !record.workspaceId || !isMainControlAgentLabels(record.labels))
+    return undefined;
+  const workspace = await manager.getWorkspaceForTopicPolicy(record.workspaceId);
+  return isTopicWorkspaceMain(record, workspace) ? record.workspaceId : undefined;
+}
 
 export type AgentRunController = Pick<
   AgentManager,
@@ -35,6 +119,8 @@ export class QueuedPromptLoadError extends Error {
 }
 
 export interface StartAgentRunOptions {
+  /** Set by human prompt entry points before wrapping attachments and reserved text. */
+  humanPrompt?: boolean;
   idleOnly?: boolean;
   /** If busy, try an admitted steer without replacing or switching the active turn. */
   admitSteer?: () => Promise<boolean>;
@@ -128,6 +214,20 @@ function admitOutOfBand(options?: StartAgentRunOptions): (() => Promise<void>) |
   };
 }
 
+function createForegroundPromptStart(
+  agentId: string,
+  options?: StartAgentRunOptions,
+): ForegroundPromptStart {
+  const promptStart = new ForegroundPromptStart(
+    agentId,
+    options?.admit,
+    options?.beforeHandoff,
+    options?.onSteerDeclined,
+  );
+  if (options?.humanPrompt) humanPromptStarts.add(promptStart);
+  return promptStart;
+}
+
 export async function startAgentRun(
   agentManager: AgentRunController,
   agentId: string,
@@ -164,12 +264,7 @@ export async function startAgentRun(
     options?.onDispatch?.("out_of_band");
     return { disposition: "out_of_band" };
   }
-  const promptStart = new ForegroundPromptStart(
-    agentId,
-    options?.admit,
-    options?.beforeHandoff,
-    options?.onSteerDeclined,
-  );
+  const promptStart = createForegroundPromptStart(agentId, options);
   try {
     try {
       await agentManager.reloadStalePluginSession(agentId);
@@ -412,13 +507,16 @@ export async function sendPromptToAgent(
 ): Promise<PromptDispatchResult> {
   const source = await resolvePromptSource(params.source, params.agentManager, params.agentStorage);
   const delivery = prepareAgentMessage(params.prompt, source, params.messageId);
-  return sendPreparedPromptToAgent({
-    ...params,
-    prompt: delivery.prompt,
-    runOptions: delivery.messageId
-      ? { ...params.runOptions, clientMessageId: delivery.messageId }
-      : params.runOptions,
-  });
+  return dispatchPreparedPrompt(
+    {
+      ...params,
+      prompt: delivery.prompt,
+      runOptions: delivery.messageId
+        ? { ...params.runOptions, clientMessageId: delivery.messageId }
+        : params.runOptions,
+    },
+    !source && !params.runOptions?.recoveryIntent && hasHumanPromptText(params.prompt),
+  );
 }
 
 function preparePromptHandoff({
@@ -488,14 +586,26 @@ function queuedPromptRunOptions(handoff: QueueHandoff | undefined, options?: Age
 export async function sendPreparedPromptToAgent(
   params: Omit<SendPromptToAgentParams, "source" | "messageId">,
 ): Promise<PromptDispatchResult> {
+  return dispatchPreparedPrompt(params, false);
+}
+
+async function dispatchPreparedPrompt(
+  params: Omit<SendPromptToAgentParams, "source" | "messageId">,
+  humanPrompt: boolean,
+): Promise<PromptDispatchResult> {
   const unarchive = params.unarchive ?? true;
 
   const record = await params.agentStorage.get(params.agentId);
   let archivedAtToRestore: string | null = null;
+  let previousTopicMainWorkspaceId: string | undefined;
   if (record?.archivedAt) {
     if (!unarchive) {
       return { disposition: "turn_started", started: Promise.resolve() };
     }
+    previousTopicMainWorkspaceId = await readArchivedTopicMainWorkspaceId(
+      params.agentManager,
+      record,
+    );
     if (await unarchiveAgentState(params.agentStorage, params.agentManager, params.agentId)) {
       archivedAtToRestore = record.archivedAt;
     }
@@ -511,7 +621,11 @@ export async function sendPreparedPromptToAgent(
     // A send that could not load the agent leaves it where it was: still archived.
     // Concurrent sends share this load, so none of them holds a live session.
     if (archivedAtToRestore) {
-      await params.agentManager.archiveSnapshot(params.agentId, archivedAtToRestore);
+      await params.agentManager.restoreArchivedSnapshot(
+        params.agentId,
+        archivedAtToRestore,
+        previousTopicMainWorkspaceId,
+      );
     }
     throw await classifyPromptLoadFailure(params, error);
   }
@@ -534,6 +648,7 @@ export async function sendPreparedPromptToAgent(
   }
   const beforeHandoff = preparePromptHandoff(params);
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
+    humanPrompt,
     replaceRunning: !params.idleOnly,
     idleOnly: params.idleOnly,
     admitSteer: createAdmitSteer(params),
@@ -576,6 +691,8 @@ export async function startCreatedAgentInitialPrompt(
     delivery.prompt,
     params.logger,
     {
+      humanPrompt:
+        !params.source && !params.runOptions?.recoveryIntent && hasHumanPromptText(params.prompt),
       runOptions: {
         ...params.runOptions,
         clientMessageId: delivery.messageId,

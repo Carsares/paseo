@@ -680,14 +680,15 @@ class ProviderImportHarness {
       },
       hydrateTimelineFromProvider: async () => {},
       getTimeline: () => this.timeline,
-      closeAgent: async (agentId: string) => {
-        this.closedAgentIds.push(agentId);
-        this.activeAgent = null;
-      },
-      archiveSnapshot: async (agentId: string, archivedAt: string) => {
+      getWorkspaceForTopicPolicy: async () => null,
+      restoreArchivedSnapshot: async (agentId: string, archivedAt: string) => {
         const record = await this.storage.get(agentId);
         if (!record) {
           throw new Error("Agent not found: " + agentId);
+        }
+        if (this.activeAgent?.id === agentId) {
+          this.closedAgentIds.push(agentId);
+          this.activeAgent = null;
         }
         const archived = { ...record, archivedAt };
         await this.storage.upsert(archived);
@@ -851,6 +852,7 @@ test("importProviderSession rejects an archived session from a different cwd bef
 
 test("importProviderSession restores storage and closes a partial runtime when loading fails", async () => {
   const harness = await ProviderImportHarness.create({ sessionId: "thread-stale" });
+  const restoreArchive = vi.spyOn(harness.manager, "restoreArchivedSnapshot");
   const archived = makeStoredProviderSession({
     id: harness.snapshot.id,
     cwd: harness.snapshot.cwd,
@@ -863,6 +865,11 @@ test("importProviderSession restores storage and closes a partial runtime when l
     harness.import({ providerHandleId: "thread-stale", cwd: harness.snapshot.cwd }),
   ).rejects.toThrow("provider session is unavailable");
 
+  expect(restoreArchive).toHaveBeenCalledExactlyOnceWith(
+    harness.snapshot.id,
+    archived.archivedAt,
+    undefined,
+  );
   expect(await harness.storage.get(harness.snapshot.id)).toEqual(archived);
   expect(harness.activeAgent).toBeNull();
   expect(harness.closedAgentIds).toEqual([harness.snapshot.id]);

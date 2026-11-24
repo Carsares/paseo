@@ -1,4 +1,5 @@
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
+import { WorkspaceTopicSchema, type WorkspaceTopic } from "@getpaseo/protocol/messages";
 import { promises as fs } from "node:fs";
 
 import type { Logger } from "pino";
@@ -19,6 +20,12 @@ const UntrustedWorkspaceSourceSchema = z.object({
   number: z.number().int().positive(),
   headRepository: z.string(),
 });
+
+// Main Control membership belongs to the agent's workspace-role label.
+const PersistedWorkspaceTopicSchema = WorkspaceTopicSchema.omit({ mainAgentId: true });
+
+type WorkspaceTopicDetails = z.infer<typeof PersistedWorkspaceTopicSchema>;
+export type WorkspaceTopicInput = Partial<Pick<WorkspaceTopic, "summary" | "hideFromModel">>;
 
 const PersistedProjectRecordSchema = z.object({
   projectId: z.string(),
@@ -113,6 +120,7 @@ const PersistedWorkspaceRecordFieldsSchema = z.object({
   labels: z.array(z.string()).optional(),
   // Plugin-owned data. Paseo stores it and never reads a key.
   metadata: z.record(z.string(), z.custom<JsonValue>()).default({}),
+  topic: PersistedWorkspaceTopicSchema.optional(),
   untrustedSource: UntrustedWorkspaceSourceSchema.optional(),
   // Public discovery visibility. Contents retain their ordinary lifecycle.
   background: z.boolean().optional().default(false),
@@ -202,7 +210,7 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
   private readonly schema: z.ZodType<TRecord, unknown>;
   private readonly getId: (record: TRecord) => string;
   private readonly activeIds = new Set<string>();
-  private loaded = false;
+  private loadPromise: Promise<void> | undefined;
   private readonly cache = new Map<string, TRecord>();
   private mutationQueue: Promise<void> = Promise.resolve();
   private mutationsBlockedUntilRestart = false;
@@ -295,12 +303,11 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     });
   }
 
-  private async load(): Promise<void> {
-    if (this.loaded) {
-      return;
-    }
+  private load(): Promise<void> {
+    return (this.loadPromise ??= this.loadFromDisk());
+  }
 
-    this.cache.clear();
+  private async loadFromDisk(): Promise<void> {
     try {
       const raw = await fs.readFile(this.filePath, "utf8");
       const parsed = z.array(this.schema).parse(JSON.parse(raw));
@@ -314,7 +321,6 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
       }
     }
     this.rebuildActiveIndex();
-    this.loaded = true;
   }
 
   protected async mutateMany(
@@ -567,8 +573,18 @@ export class FileBackedWorkspaceRegistry
     workspaceId: string,
     updater: (record: PersistedWorkspaceRecord) => PersistedWorkspaceRecord,
   ): Promise<PersistedWorkspaceRecord | null> {
-    const workspace = await super.update(workspaceId, updater);
-    if (workspace) {
+    let changed = false;
+    const workspace = await this.mutateCache((records) => {
+      const existing = records.get(workspaceId);
+      if (!existing) return null;
+      const next = updater(existing);
+      if (next === existing && existing.topic) return existing;
+      const updated = PersistedWorkspaceRecordSchema.parse(withTopicRevision(existing, next));
+      records.set(workspaceId, updated);
+      changed = true;
+      return updated;
+    });
+    if (changed && workspace) {
       await this.notifyMutation({ kind: "upsert", workspaceId, workspace });
     }
     return workspace;
@@ -578,11 +594,25 @@ export class FileBackedWorkspaceRegistry
     record: PersistedWorkspaceRecord,
     context?: WorkspaceMutationContext,
   ): Promise<void> {
-    await super.upsert(record);
+    const workspace = await this.mutateCache((records) => {
+      const existing = records.get(record.workspaceId);
+      // Existing callers use upsert to save placement observed outside the mutation queue.
+      // Keep any title and topic changes committed since they read the record.
+      const next = existing
+        ? withTopicRevision(existing, {
+            ...record,
+            topic: existing.topic,
+            ...(existing.topic ? { title: existing.title, titleSource: existing.titleSource } : {}),
+          })
+        : record;
+      const persisted = PersistedWorkspaceRecordSchema.parse(next);
+      records.set(persisted.workspaceId, persisted);
+      return persisted;
+    });
     await this.notifyMutation({
       kind: "upsert",
       workspaceId: record.workspaceId,
-      workspace: record,
+      workspace,
       ...(context?.expectsInitialAgent ? { expectsInitialAgent: true } : {}),
     });
   }
@@ -723,14 +753,17 @@ export function createPersistedWorkspaceRecord(input: {
   pinnedAt?: string | null;
   labels?: string[];
   metadata?: Record<string, JsonValue>;
+  topic?: WorkspaceTopicInput;
   untrustedSource?: UntrustedWorkspaceSource;
   background?: boolean;
 }): PersistedWorkspaceRecord {
-  const { background, worktreeManagerPluginId, ...rest } = input;
+  const { background, worktreeManagerPluginId, topic, ...rest } = input;
+  if (topic && !input.title?.trim()) throw new Error("A topic title is required.");
   return PersistedWorkspaceRecordSchema.parse({
     ...rest,
     background: background ?? false,
     title: input.title ?? null,
+    ...(topic ? { titleSource: "user", topic: createWorkspaceTopic(topic) } : {}),
     branch: input.branch ?? null,
     worktreeRoot: input.worktreeRoot ?? null,
     baseBranch: input.baseBranch ?? null,
@@ -755,4 +788,68 @@ export function resolveWorkspaceName(input: {
 
 export function resolveWorkspaceDisplayName(record: PersistedWorkspaceRecord): string {
   return resolveWorkspaceName({ title: record.title, derivedDisplayName: record.displayName });
+}
+
+function createWorkspaceTopic(input: WorkspaceTopicInput): WorkspaceTopicDetails {
+  return {
+    summary: input.summary ?? null,
+    hideFromModel: input.hideFromModel ?? false,
+    revision: 1,
+  };
+}
+
+function withTopicRevision(
+  existing: PersistedWorkspaceRecord,
+  next: PersistedWorkspaceRecord,
+): PersistedWorkspaceRecord {
+  if (!existing.topic) return next;
+  const topic = next.topic ?? existing.topic;
+  const changed =
+    topic.summary !== existing.topic.summary ||
+    topic.hideFromModel !== existing.topic.hideFromModel ||
+    resolveWorkspaceDisplayName(next) !== resolveWorkspaceDisplayName(existing);
+  return { ...next, topic: { ...topic, revision: existing.topic.revision + Number(changed) } };
+}
+
+export function updateWorkspaceTopic(
+  registry: Pick<WorkspaceRegistry, "update">,
+  input: WorkspaceTopicInput & { workspaceId: string; upgradeToTopic?: boolean; updatedAt: string },
+): Promise<PersistedWorkspaceRecord | null> {
+  return registry.update(input.workspaceId, (workspace) => {
+    if (workspace.archivedAt) throw new Error("An archived workspace cannot be edited as a topic.");
+    if (!workspace.topic) {
+      if (!input.upgradeToTopic) throw new Error("Workspace is not a topic.");
+      return { ...workspace, topic: createWorkspaceTopic(input), updatedAt: input.updatedAt };
+    }
+    const topic = {
+      ...workspace.topic,
+      summary: input.summary === undefined ? workspace.topic.summary : input.summary,
+      hideFromModel: input.hideFromModel ?? workspace.topic.hideFromModel,
+    };
+    if (
+      topic.summary === workspace.topic.summary &&
+      topic.hideFromModel === workspace.topic.hideFromModel
+    ) {
+      return workspace;
+    }
+    return { ...workspace, topic, updatedAt: input.updatedAt };
+  });
+}
+
+export function resolveWorkspaceTopic(
+  workspace: PersistedWorkspaceRecord | null,
+  mainAgentId: string | null,
+): WorkspaceTopic | null {
+  return workspace?.topic ? { ...workspace.topic, mainAgentId } : null;
+}
+
+export function resolveWorkspaceTopicForModel(
+  workspace: PersistedWorkspaceRecord | null,
+): { title: string; summary: string | null; revision: number } | null {
+  if (!workspace?.topic || workspace.topic.hideFromModel) return null;
+  return {
+    title: resolveWorkspaceDisplayName(workspace),
+    summary: workspace.topic.summary,
+    revision: workspace.topic.revision,
+  };
 }

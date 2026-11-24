@@ -13,6 +13,9 @@ import {
   FileBackedWorkspaceRegistry,
   resolveWorkspaceDisplayName,
   resolveWorkspaceName,
+  resolveWorkspaceTopic,
+  resolveWorkspaceTopicForModel,
+  updateWorkspaceTopic,
   type WorkspaceMutation,
 } from "./workspace-registry.js";
 
@@ -80,6 +83,174 @@ describe("workspace registries", () => {
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("persists a private topic at creation and resolves the current main agent on read", async () => {
+    const timestamp = "2026-03-01T00:00:00.000Z";
+    const workspace = createPersistedWorkspaceRecord({
+      workspaceId: "ws-topic",
+      projectId: "project",
+      cwd: "/tmp/repo",
+      kind: "directory",
+      displayName: "repo",
+      title: "Startup",
+      topic: { summary: "Keep the full\nsummary", hideFromModel: true },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    await workspaceRegistry.upsert(workspace);
+
+    const reloaded = new FileBackedWorkspaceRegistry(
+      path.join(tmpDir, "projects", "workspaces.json"),
+      logger,
+    );
+    const stored = await reloaded.get(workspace.workspaceId);
+    expect(stored).toMatchObject({
+      title: "Startup",
+      titleSource: "user",
+      topic: { summary: "Keep the full\nsummary", hideFromModel: true, revision: 1 },
+    });
+    expect(stored?.topic).not.toHaveProperty("mainAgentId");
+    expect(resolveWorkspaceTopic(stored, "new-main")).toEqual({
+      summary: "Keep the full\nsummary",
+      hideFromModel: true,
+      revision: 1,
+      mainAgentId: "new-main",
+    });
+    expect(resolveWorkspaceTopicForModel(stored)).toBeNull();
+  });
+
+  test("serializes a summary, privacy toggle, and rename across a stale placement write", async () => {
+    const workspacePath = path.join(tmpDir, "projects", "workspaces.json");
+    const timestamp = "2026-03-01T00:00:00.000Z";
+    const workspace = createPersistedWorkspaceRecord({
+      workspaceId: "ws-topic",
+      projectId: "project",
+      cwd: "/tmp/repo",
+      kind: "directory",
+      displayName: "repo",
+      title: "Startup",
+      topic: {},
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    let markWriting!: () => void;
+    const writing = new Promise<void>((resolve) => (markWriting = resolve));
+    let releaseWrite!: () => void;
+    const paused = new Promise<void>((resolve) => (releaseWrite = resolve));
+    let writes = 0;
+    const registry = new FileBackedWorkspaceRegistry(workspacePath, logger, {
+      writeRecords: async (filePath, records) => {
+        if (++writes === 2) {
+          markWriting();
+          await paused;
+        }
+        await writeJsonFileAtomic(filePath, records);
+      },
+    });
+    await registry.upsert(workspace);
+    expect(resolveWorkspaceTopicForModel(await registry.get(workspace.workspaceId))).toEqual({
+      title: "Startup",
+      summary: null,
+      revision: 1,
+    });
+
+    const update = { workspaceId: workspace.workspaceId, updatedAt: "2026-03-02T00:00:00.000Z" };
+    const summary = updateWorkspaceTopic(registry, { ...update, summary: "Trace boot" });
+    await writing;
+    const privacy = updateWorkspaceTopic(registry, { ...update, hideFromModel: true });
+    const rename = registry.update(workspace.workspaceId, (existing) => ({
+      ...existing,
+      title: "Faster startup",
+    }));
+    const placement = registry.upsert({ ...workspace, cwd: "/tmp/moved-repo" });
+    const beforeCommit = await registry.get(workspace.workspaceId);
+    releaseWrite();
+    const [withSummary, withPrivacy, renamed] = await Promise.all([
+      summary,
+      privacy,
+      rename,
+      placement,
+    ]);
+
+    expect(beforeCommit?.topic).toEqual({ summary: null, hideFromModel: false, revision: 1 });
+    expect(withSummary?.topic).toEqual({
+      summary: "Trace boot",
+      hideFromModel: false,
+      revision: 2,
+    });
+    expect(withPrivacy?.topic).toEqual({ summary: "Trace boot", hideFromModel: true, revision: 3 });
+    expect(renamed?.topic).toEqual({ summary: "Trace boot", hideFromModel: true, revision: 4 });
+    await expect(
+      updateWorkspaceTopic(registry, { ...update, hideFromModel: true }),
+    ).resolves.toMatchObject({
+      title: "Faster startup",
+      topic: { revision: 4 },
+    });
+    expect(writes).toBe(5);
+
+    const reloaded = new FileBackedWorkspaceRegistry(workspacePath, logger);
+    const stored = await reloaded.get(workspace.workspaceId);
+    expect(stored).toMatchObject({
+      cwd: "/tmp/moved-repo",
+      title: "Faster startup",
+      topic: { summary: "Trace boot", hideFromModel: true, revision: 4 },
+    });
+    expect(resolveWorkspaceTopicForModel(stored)).toBeNull();
+    const unhidden = await updateWorkspaceTopic(reloaded, {
+      ...update,
+      summary: null,
+      hideFromModel: false,
+    });
+    expect(resolveWorkspaceTopicForModel(unhidden)).toEqual({
+      title: "Faster startup",
+      summary: null,
+      revision: 5,
+    });
+  });
+
+  test("only upgrades an active legacy workspace on explicit request and preserves its identity", async () => {
+    const workspaceId = "legacy-workspace";
+    const timestamp = "2026-03-01T00:00:00.000Z";
+    const workspacePath = path.join(tmpDir, "projects", "workspaces.json");
+    await writeJsonFileAtomic(workspacePath, [
+      {
+        workspaceId,
+        projectId: "legacy-project",
+        cwd: "/tmp/repo",
+        kind: "local_checkout",
+        displayName: "repo",
+        title: "Existing name",
+        titleSource: "user",
+        labels: ["keep-label"],
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        archivedAt: null,
+      },
+    ]);
+    const legacy = await workspaceRegistry.get(workspaceId);
+    expect(resolveWorkspaceTopic(legacy, null)).toBeNull();
+
+    const update = { workspaceId, updatedAt: "2026-03-02T00:00:00.000Z", summary: "Set direction" };
+    await expect(updateWorkspaceTopic(workspaceRegistry, update)).rejects.toThrow(
+      "Workspace is not a topic.",
+    );
+    expect(await workspaceRegistry.get(workspaceId)).toEqual(legacy);
+    const upgraded = await updateWorkspaceTopic(workspaceRegistry, {
+      ...update,
+      upgradeToTopic: true,
+    });
+    expect(upgraded).toEqual({
+      ...legacy,
+      updatedAt: update.updatedAt,
+      topic: { summary: "Set direction", hideFromModel: false, revision: 1 },
+    });
+    const reloaded = new FileBackedWorkspaceRegistry(workspacePath, logger);
+    expect(await reloaded.get(workspaceId)).toEqual(upgraded);
+    await workspaceRegistry.archive(workspaceId, "2026-03-03T00:00:00.000Z");
+    await expect(updateWorkspaceTopic(workspaceRegistry, update)).rejects.toThrow(
+      "archived workspace",
+    );
   });
 
   test("creates, updates, archives, deletes, and lists project records", async () => {

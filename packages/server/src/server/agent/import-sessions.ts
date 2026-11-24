@@ -9,7 +9,7 @@ import type {
 import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
 import type { AgentPersistenceHandle, AgentProvider } from "./agent-sdk-types.js";
 import { ensureAgentLoaded, type AgentLoaderManager } from "./agent-loading.js";
-import { unarchiveAgentState } from "./agent-prompt.js";
+import { readArchivedTopicMainWorkspaceId, unarchiveAgentState } from "./agent-prompt.js";
 import { toRecentProviderSessionDescriptorPayload } from "./agent-projections.js";
 import type { WorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
 import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
@@ -29,11 +29,11 @@ const IMPORT_SESSION_SEARCH_SCAN_LIMIT = 500;
 export type ImportSessionAgentManager = AgentLoaderManager &
   Pick<
     AgentManager,
-    | "archiveSnapshot"
-    | "closeAgent"
+    | "getWorkspaceForTopicPolicy"
     | "getTimeline"
     | "importProviderSession"
     | "notifyAgentState"
+    | "restoreArchivedSnapshot"
     | "unarchiveSnapshot"
   >;
 
@@ -227,10 +227,19 @@ async function importProviderSessionNow(
     ) {
       labelPatch[PARENT_AGENT_ID_LABEL] = requestedParentAgentId;
     }
-    await unarchiveAgentState(input.agentStorage, input.agentManager, archivedRecord.id, {
-      workspaceId,
-      labels: Object.keys(labelPatch).length > 0 ? labelPatch : undefined,
-    });
+    const previousTopicMainWorkspaceId = await readArchivedTopicMainWorkspaceId(
+      input.agentManager,
+      archivedRecord,
+    );
+    const didUnarchive = await unarchiveAgentState(
+      input.agentStorage,
+      input.agentManager,
+      archivedRecord.id,
+      {
+        workspaceId,
+        labels: Object.keys(labelPatch).length > 0 ? labelPatch : undefined,
+      },
+    );
     try {
       const snapshot = await ensureAgentLoaded(archivedRecord.id, {
         agentManager: input.agentManager,
@@ -242,7 +251,14 @@ async function importProviderSessionNow(
         timelineSize: input.agentManager.getTimeline(snapshot.id).length,
       };
     } catch (error) {
-      await rollbackArchivedImport(input, archivedRecord, archivedRecord.archivedAt);
+      if (didUnarchive) {
+        await rollbackArchivedImport(
+          input,
+          archivedRecord,
+          archivedRecord.archivedAt,
+          previousTopicMainWorkspaceId,
+        );
+      }
       throw error;
     }
   }
@@ -306,12 +322,14 @@ async function rollbackArchivedImport(
   input: ImportProviderSessionInput,
   archivedRecord: StoredAgentRecord,
   archivedAt: string,
+  previousTopicMainWorkspaceId: string | undefined,
 ): Promise<void> {
   try {
-    if (input.agentManager.getAgent(archivedRecord.id)) {
-      await input.agentManager.closeAgent(archivedRecord.id);
-    }
-    await input.agentManager.archiveSnapshot(archivedRecord.id, archivedAt);
+    await input.agentManager.restoreArchivedSnapshot(
+      archivedRecord.id,
+      archivedAt,
+      previousTopicMainWorkspaceId,
+    );
   } catch (error) {
     input.logger.error(
       { err: error, agentId: archivedRecord.id },

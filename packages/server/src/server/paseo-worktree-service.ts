@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import { getRealpathAwareRelativePath } from "../utils/path.js";
-import type { PersistedWorkspaceRecord } from "./workspace-registry.js";
+import type { PersistedWorkspaceRecord, WorkspaceTopicInput } from "./workspace-registry.js";
 import type { WorkspaceProvisioningService } from "./session/workspace-provisioning/workspace-provisioning-service.js";
 import {
   createWorktreeCore,
@@ -36,6 +36,7 @@ export interface CreatePaseoWorktreeInput extends CreateWorktreeCoreInput {
   workspaceId?: string;
   projectId?: string;
   title?: string;
+  topic?: WorkspaceTopicInput;
   metadata?: Record<string, JsonValue>;
   background?: boolean;
   callerWorkspaceId?: string;
@@ -123,6 +124,7 @@ async function createPaseoWorktreeWithPriority(
       worktreeManagerPluginId: createdWorktree.worktree.worktreeManagerPluginId ?? null,
       title: explicitTitle || resolveFirstAgentPromptTitle(input.firstAgentContext),
       titleSource: explicitTitle ? "user" : undefined,
+      topic: input.topic,
       metadata: input.metadata,
       expectsInitialAgent: Boolean(input.firstAgentContext),
       background: input.background,

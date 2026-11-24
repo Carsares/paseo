@@ -2377,6 +2377,8 @@ export class VoiceAssistantWebSocketServer {
         agentSessionReset: true,
         workspaceMainAgentDefault: true,
         agentCreateAsMain: true,
+        // COMPAT(topicWorkbenchV1): added in v0.18.0, remove after 2027-06-01.
+        topicWorkbenchV1: true,
         checkoutGitStagingV1: true,
         agentSideChat: true,
         workspaceAgentsSummary: true,

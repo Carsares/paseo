@@ -18,13 +18,27 @@ export interface CreatedAgent {
   agent: AgentSnapshotPayload;
   initialPromptStarted: boolean;
 }
-interface CreationRequest {
+interface CreationRecovery {
+  readTopicWorkspace?: (workspaceId: string) => Promise<{
+    workspace: WorkspaceDescriptorPayload;
+    setupSkippedReason?: string;
+  } | null>;
+  readMainAgent?: (agentId: string, workspaceId: string) => Promise<AgentSnapshotPayload | null>;
+  readPromptOutcome?: (
+    agentId: string,
+    messageId: string,
+    expectedFingerprint: string,
+  ) => Promise<"accepted" | "unknown" | "absent">;
+}
+interface CreationRequest extends CreationRecovery {
   key: string;
   request: { [key: string]: unknown };
   workspaceId?: string;
   agentId?: string;
   hasAgent: boolean;
   hasPrompt: boolean;
+  promptMessageId?: string;
+  promptReceiptFingerprint?: string;
   exists: (kind: "workspace" | "agent", id: string) => Promise<boolean>;
   provision?: (
     workspaceId: string,
@@ -33,7 +47,6 @@ interface CreationRequest {
     workspace: WorkspaceDescriptorPayload,
     agentId: string,
   ) => Promise<AgentSnapshotPayload>;
-  readMainAgent?: (agentId: string, workspaceId: string) => Promise<AgentSnapshotPayload | null>;
   createAgent?: (
     agentId: string,
     workspace: WorkspaceDescriptorPayload | undefined,
@@ -50,6 +63,8 @@ const RecordSchema = z.object({
   fingerprint: z.string(),
   snapshot: CreationSnapshotSchema,
   mainAgentId: z.string().optional(),
+  promptMessageId: z.string().optional(),
+  promptReceiptFingerprint: z.string().optional(),
   inFlight: z.enum(["workspace", "agent", "mainAgent", "prompt"]).nullable(),
 });
 type Record = z.infer<typeof RecordSchema>;
@@ -67,11 +82,15 @@ export class CreationService {
       snapshot: CreationSnapshot,
     ) => Promise<void> = async () => {},
     private readonly legacyDirectory?: string,
+    private readonly writeReceipt: (
+      path: string,
+      contents: string,
+    ) => Promise<void> = writeFileAtomic,
   ) {}
 
   async create(input: CreationInput, observer?: Observer): Promise<CreationSnapshot> {
     const identity = identityFor(input.kind, input.key);
-    const admitted = this.admission.then(async () => {
+    const admitted = this.admit(async () => {
       await mkdir(this.directory, { recursive: true });
       const fingerprint = digest(input.request);
       let record = await this.read(identity);
@@ -80,20 +99,13 @@ export class CreationService {
         throw new Error(`${input.kind}_request_key_conflict`);
       const running = this.active.get(identity);
       if (running && record) return { completion: running, snapshot: record.snapshot };
+      if (record?.snapshot.phase === "completed") await this.validateCompleted(record.snapshot);
+      if (record) await this.reconcileTopic(identity, record, input);
       if (record?.inFlight === "mainAgent") {
         await this.recoverMainAgent(identity, record, input);
       }
-      if (record?.snapshot.phase === "completed") await this.validateCompleted(record.snapshot);
-      if (record?.snapshot.phase === "completed" || record?.snapshot.outcomeUnknown) {
-        return { completion: Promise.resolve(record.snapshot), snapshot: record.snapshot };
-      }
-      if (record?.inFlight && record.inFlight !== "mainAgent") {
-        await this.publish(identity, record, {
-          phase: "failed",
-          error: `${input.kind}_request_outcome_unknown`,
-          failedStage: record.inFlight,
-          outcomeUnknown: true,
-        });
+      if (record) await this.markInterruptedUnknown(identity, record);
+      if (record && isSettled(record)) {
         return { completion: Promise.resolve(record.snapshot), snapshot: record.snapshot };
       }
       if (!record) {
@@ -118,10 +130,6 @@ export class CreationService {
       void completion.finally(() => this.active.delete(identity)).catch(() => undefined);
       return { completion, snapshot };
     });
-    this.admission = admitted.then(
-      () => undefined,
-      () => undefined,
-    );
     // Install before admission starts, so even a fast local provision cannot outrun observation.
     const unsubscribe = observer ? this.observe(identity, observer) : () => {};
     try {
@@ -137,26 +145,46 @@ export class CreationService {
     kind: CreationSnapshot["kind"],
     key: string,
     observer: Observer,
+    recovery?: CreationRecovery,
   ): Promise<{ snapshot: CreationSnapshot | null; unsubscribe: () => void }> {
     const identity = identityFor(kind, key);
     const unsubscribe = this.observe(identity, observer);
     try {
-      await this.admission;
-      const record = await this.read(identity);
-      if (record?.inFlight && record.inFlight !== "mainAgent" && !this.active.has(identity)) {
-        await this.publish(identity, record, {
-          phase: "failed",
-          failedStage: record.inFlight,
-          outcomeUnknown: true,
-          error: `${kind}_request_outcome_unknown`,
-        });
-      }
-      if (record?.snapshot.phase === "completed") await this.validateCompleted(record.snapshot);
-      return { snapshot: record?.snapshot ?? null, unsubscribe };
+      const observation = await this.admit(async () => {
+        const record = await this.read(identity);
+        if (record?.snapshot.phase === "completed") {
+          await this.validateCompleted(record.snapshot);
+        } else if (record && !this.active.has(identity)) {
+          await this.reconcileTopic(identity, record, recovery);
+          await this.markInterruptedUnknown(identity, record);
+        }
+        return record;
+      });
+      return { snapshot: observation?.snapshot ?? null, unsubscribe };
     } catch (error) {
       unsubscribe();
       throw error;
     }
+  }
+
+  private async markInterruptedUnknown(identity: string, record: Record): Promise<void> {
+    const { inFlight, snapshot } = record;
+    if (!inFlight || inFlight === "mainAgent" || snapshot.outcomeUnknown) return;
+    await this.publish(identity, record, {
+      phase: "failed",
+      failedStage: inFlight,
+      outcomeUnknown: true,
+      error: `${snapshot.kind}_request_outcome_unknown`,
+    });
+  }
+
+  private admit<T>(operation: () => Promise<T>): Promise<T> {
+    const admitted = this.admission.then(operation);
+    this.admission = admitted.then(
+      () => undefined,
+      () => undefined,
+    );
+    return admitted;
   }
 
   private async run(
@@ -171,13 +199,17 @@ export class CreationService {
         const { workspace, setupSkippedReason } = await input.provision(
           record.snapshot.workspaceId!,
         );
-        record.inFlight = null;
-        await this.publish(identity, record, {
-          phase: "workspace_ready",
-          workspace,
-          workspaceId: workspace.id,
-          setupSkippedReason,
-        });
+        await this.publish(
+          identity,
+          record,
+          {
+            phase: "workspace_ready",
+            workspace,
+            workspaceId: workspace.id,
+            setupSkippedReason,
+          },
+          null,
+        );
       }
       await this.createMainAgent(identity, record, input.createMainAgent);
       if (input.hasAgent && input.createAgent && !record.snapshot.agent) {
@@ -187,35 +219,72 @@ export class CreationService {
           record.snapshot.agentId!,
           record.snapshot.workspace,
           async (readyAgent) => {
-            record.inFlight = input.hasPrompt ? "prompt" : null;
-            await this.publish(identity, record, {
-              phase: "agent_ready",
-              agent: readyAgent,
-              workspaceId: readyAgent.workspaceId ?? record.snapshot.workspaceId,
-              ...(record.snapshot.workspace && isMainControlAgentLabels(readyAgent.labels)
-                ? { workspace: { ...record.snapshot.workspace, hasActiveMainAgent: true } }
-                : {}),
-            });
+            await this.publish(
+              identity,
+              record,
+              { phase: "agent_ready", ...withReadyAgent(record.snapshot, readyAgent) },
+              input.hasPrompt ? "prompt" : null,
+            );
           },
           record.snapshot.mainAgent,
         );
-        record.inFlight = null;
-        if (initialPromptStarted) {
-          await this.publish(identity, record, {
-            phase: "prompt_started",
-            agent,
-            initialPromptStarted: true,
-          });
+        if (isTopicPrompt(record) && input.hasPrompt) {
+          await this.recordTopicPrompt(identity, record, { agent, initialPromptStarted }, input);
+          if (!record.snapshot.initialPromptStarted) return record.snapshot;
         } else {
-          record.snapshot = { ...record.snapshot, agent };
+          record.inFlight = null;
+          if (initialPromptStarted) {
+            await this.publish(identity, record, {
+              phase: "prompt_started",
+              agent,
+              initialPromptStarted: true,
+            });
+          } else {
+            record.snapshot = { ...record.snapshot, agent };
+          }
         }
       }
-      record.inFlight = null;
-      await this.publish(identity, record, { phase: "completed" });
+      await this.publish(identity, record, { phase: "completed" }, null);
     } catch (error) {
+      // Keep the committed acceptance checkpoint if validation or the final write failed.
+      if (isTopicPrompt(record) && record.snapshot.initialPromptStarted) throw error;
       await this.recordFailure(identity, record, input.exists, error);
     }
     return record.snapshot;
+  }
+
+  private async recordTopicPrompt(
+    identity: string,
+    record: Record,
+    { agent, initialPromptStarted }: CreatedAgent,
+    recovery: CreationRecovery,
+  ): Promise<void> {
+    const outcome = initialPromptStarted
+      ? "accepted"
+      : await this.readPromptOutcome(record, recovery);
+    if (outcome === "accepted") {
+      // Keep the prompt in flight until completion is also durable.
+      await this.publish(identity, record, {
+        phase: "prompt_started",
+        agent,
+        initialPromptStarted: true,
+      });
+      return;
+    }
+    if (outcome !== "absent") throw new Error(`${record.snapshot.kind}_request_outcome_unknown`);
+    await this.publish(
+      identity,
+      record,
+      {
+        phase: "failed",
+        agent,
+        initialPromptStarted: false,
+        failedStage: "prompt",
+        outcomeUnknown: false,
+        error: "The first question was not accepted.",
+      },
+      null,
+    );
   }
 
   private async recordFailure(
@@ -258,11 +327,15 @@ export class CreationService {
     record.inFlight = "mainAgent";
     await this.write(identity, record);
     const mainAgent = await create(record.snapshot.workspace, record.mainAgentId);
-    record.inFlight = null;
-    await this.publish(identity, record, {
-      mainAgent,
-      workspace: { ...record.snapshot.workspace, hasActiveMainAgent: true },
-    });
+    await this.publish(
+      identity,
+      record,
+      {
+        mainAgent,
+        workspace: withMainAgent(record.snapshot.workspace, mainAgent.id),
+      },
+      null,
+    );
   }
 
   // COMPAT(agentRequestReceipts): added in v0.8.0, remove after 2027-03-11 once old creation receipts can expire.
@@ -316,9 +389,204 @@ export class CreationService {
       failedStage: undefined,
       outcomeUnknown: undefined,
       ...(mainAgent && snapshot.workspace
-        ? { mainAgent, workspace: { ...snapshot.workspace, hasActiveMainAgent: true } }
+        ? { mainAgent, workspace: withMainAgent(snapshot.workspace, mainAgent.id) }
         : {}),
     });
+  }
+
+  private async reconcileTopic(
+    identity: string,
+    record: Record,
+    recovery?: CreationRecovery,
+  ): Promise<void> {
+    if (record.snapshot.phase === "completed") return;
+
+    await this.recoverTopicWorkspace(identity, record, recovery);
+    if (await this.recoverTopicPromptAgent(identity, record, recovery)) return;
+    if (shouldReconcileTopicPrompt(record)) {
+      return this.reconcileTopicPrompt(identity, record, recovery);
+    }
+    await this.reconcileSilentTopic(identity, record, recovery);
+  }
+
+  private async recoverTopicWorkspace(
+    identity: string,
+    record: Record,
+    recovery?: CreationRecovery,
+  ): Promise<void> {
+    const { kind, workspaceId, workspace } = record.snapshot;
+    if (kind !== "workspace" || record.inFlight !== "workspace" || workspace || !workspaceId)
+      return;
+    const saved = await recovery?.readTopicWorkspace?.(workspaceId);
+    if (saved?.workspace.id !== workspaceId || !saved.workspace.topic) return;
+    await this.publish(
+      identity,
+      record,
+      {
+        ...saved,
+        phase: "workspace_ready",
+        error: null,
+        errorCode: undefined,
+        failedStage: undefined,
+        outcomeUnknown: undefined,
+      },
+      null,
+    );
+  }
+
+  private async reconcileSilentTopic(
+    identity: string,
+    record: Record,
+    recovery?: CreationRecovery,
+  ): Promise<void> {
+    const { snapshot, mainAgentId } = record;
+    const workspace = snapshot.workspace;
+    // Only silent topic creation can finish without a separate agent and first prompt.
+    if (snapshot.kind !== "workspace" || !workspace?.topic) return;
+    if (snapshot.agentId || (record.inFlight && record.inFlight !== "mainAgent")) return;
+    if (snapshot.phase === "failed" && !record.inFlight) return;
+    const readMainAgent = recovery?.readMainAgent;
+    const mainAgent =
+      snapshot.mainAgent ??
+      (mainAgentId && readMainAgent ? await readMainAgent(mainAgentId, workspace.id) : null);
+    if (mainAgentId && !mainAgent) {
+      if (record.inFlight !== "mainAgent" || !readMainAgent) return;
+      await this.publish(
+        identity,
+        record,
+        {
+          phase: "failed",
+          failedStage: "agent",
+          outcomeUnknown: false,
+          error: "Main Session registration did not complete.",
+        },
+        null,
+      );
+      return;
+    }
+    await this.publish(
+      identity,
+      record,
+      {
+        phase: "completed",
+        error: null,
+        errorCode: undefined,
+        failedStage: undefined,
+        outcomeUnknown: undefined,
+        ...(mainAgent ? { mainAgent, workspace: withMainAgent(workspace, mainAgent.id) } : {}),
+      },
+      null,
+    );
+  }
+
+  private async recoverTopicPromptAgent(
+    identity: string,
+    record: Record,
+    recovery?: CreationRecovery,
+  ): Promise<boolean> {
+    const { agentId, workspaceId, agent: knownAgent } = record.snapshot;
+    const { promptMessageId, promptReceiptFingerprint } = record;
+    if (
+      record.inFlight !== "agent" ||
+      knownAgent ||
+      !agentId ||
+      !workspaceId ||
+      !promptMessageId ||
+      !promptReceiptFingerprint
+    )
+      return false;
+    const agent = await recovery?.readMainAgent?.(agentId, workspaceId);
+    if (!agent) return false;
+    const outcome = await recovery?.readPromptOutcome?.(
+      agentId,
+      promptMessageId,
+      promptReceiptFingerprint,
+    );
+    if (outcome === "accepted") {
+      await this.publish(
+        identity,
+        record,
+        {
+          ...withReadyAgent(record.snapshot, agent),
+          phase: "completed",
+          initialPromptStarted: true,
+          error: null,
+          errorCode: undefined,
+          failedStage: undefined,
+          outcomeUnknown: undefined,
+        },
+        null,
+      );
+      return true;
+    }
+    // The runner waits for the agent-ready checkpoint before attempting the prompt.
+    const unknown = outcome === "unknown";
+    await this.publish(
+      identity,
+      record,
+      {
+        ...withReadyAgent(record.snapshot, agent),
+        phase: "failed",
+        failedStage: "prompt",
+        initialPromptStarted: unknown ? undefined : false,
+        outcomeUnknown: unknown,
+        error: unknown
+          ? `${record.snapshot.kind}_request_outcome_unknown`
+          : "The first question was not accepted.",
+        errorCode: undefined,
+      },
+      unknown ? "prompt" : null,
+    );
+    return true;
+  }
+
+  private async reconcileTopicPrompt(
+    identity: string,
+    record: Record,
+    recovery?: CreationRecovery,
+  ): Promise<void> {
+    const outcome = record.snapshot.initialPromptStarted
+      ? "accepted"
+      : await this.readPromptOutcome(record, recovery);
+    if (outcome !== "accepted") {
+      if (outcome === "unknown" && isRejectedTopicPrompt(record)) {
+        await this.publish(
+          identity,
+          record,
+          {
+            initialPromptStarted: undefined,
+            outcomeUnknown: true,
+            error: `${record.snapshot.kind}_request_outcome_unknown`,
+          },
+          "prompt",
+        );
+      }
+      return;
+    }
+    await this.publish(
+      identity,
+      record,
+      {
+        phase: "completed",
+        initialPromptStarted: true,
+        error: null,
+        errorCode: undefined,
+        failedStage: undefined,
+        outcomeUnknown: undefined,
+      },
+      null,
+    );
+  }
+
+  private async readPromptOutcome(record: Record, recovery?: CreationRecovery) {
+    const { snapshot, promptMessageId, promptReceiptFingerprint } = record;
+    if (isTopicPrompt(record) && snapshot.agent && promptMessageId && promptReceiptFingerprint) {
+      return recovery?.readPromptOutcome?.(
+        snapshot.agent.id,
+        promptMessageId,
+        promptReceiptFingerprint,
+      );
+    }
   }
 
   private async claimResources(
@@ -376,17 +644,21 @@ export class CreationService {
     identity: string,
     record: Record,
     update: Partial<CreationSnapshot>,
+    inFlight = record.inFlight,
   ): Promise<void> {
-    record.snapshot = { ...record.snapshot, ...update, revision: record.snapshot.revision + 1 };
-    await this.write(identity, record);
-    for (const observer of this.observers.get(identity) ?? [])
-      this.notify(observer, record.snapshot);
+    const snapshot = { ...record.snapshot, ...update, revision: record.snapshot.revision + 1 };
+    if (snapshot.phase === "completed" && isTopicPrompt(record))
+      await this.validateCompleted(snapshot);
+    await this.write(identity, { ...record, snapshot, inFlight });
+    record.snapshot = snapshot;
+    record.inFlight = inFlight;
+    for (const observer of this.observers.get(identity) ?? []) this.notify(observer, snapshot);
   }
   private write(identity: string, record: Record): Promise<void> {
     // Serialize now: the runner mutates the record after queueing this write.
     const contents = JSON.stringify(record, null, 2);
     return this.accessReceipt(identity, () =>
-      writeFileAtomic(join(this.directory, `${identity}.json`), contents),
+      this.writeReceipt(join(this.directory, `${identity}.json`), contents),
     );
   }
   private read(identity: string): Promise<Record | null> {
@@ -411,11 +683,44 @@ export class CreationService {
     return result;
   }
 }
+function isSettled(record: Record): boolean {
+  const { snapshot } = record;
+  return (
+    snapshot.phase === "completed" ||
+    snapshot.outcomeUnknown === true ||
+    isRejectedTopicPrompt(record)
+  );
+}
+function isTopicPrompt({ snapshot, promptMessageId, promptReceiptFingerprint }: Record): boolean {
+  return Boolean(snapshot.workspace?.topic || (promptMessageId && promptReceiptFingerprint));
+}
+function isRejectedTopicPrompt(record: Record): boolean {
+  const { snapshot } = record;
+  return (
+    isTopicPrompt(record) &&
+    snapshot.phase === "failed" &&
+    snapshot.failedStage === "prompt" &&
+    snapshot.outcomeUnknown === false
+  );
+}
+function shouldReconcileTopicPrompt(record: Record): boolean {
+  const { inFlight, snapshot } = record;
+  return (
+    isTopicPrompt(record) &&
+    (inFlight === "prompt" ||
+      snapshot.initialPromptStarted === true ||
+      isRejectedTopicPrompt(record))
+  );
+}
 function initialRecord(input: CreationInput, fingerprint: string): Record {
   return {
     fingerprint,
     inFlight: null,
     ...(input.createMainAgent ? { mainAgentId: randomUUID() } : {}),
+    ...(input.promptMessageId ? { promptMessageId: input.promptMessageId } : {}),
+    ...(input.promptReceiptFingerprint
+      ? { promptReceiptFingerprint: input.promptReceiptFingerprint }
+      : {}),
     snapshot: {
       kind: input.kind,
       idempotencyKey: input.key,
@@ -425,6 +730,22 @@ function initialRecord(input: CreationInput, fingerprint: string): Record {
       workspaceId: input.workspaceId ?? (input.kind === "workspace" ? generateWorkspaceId() : null),
       agentId: input.hasAgent ? (input.agentId ?? randomUUID()) : null,
     },
+  };
+}
+function withMainAgent(workspace: WorkspaceDescriptorPayload, agentId: string) {
+  return {
+    ...workspace,
+    hasActiveMainAgent: true,
+    ...(workspace.topic ? { topic: { ...workspace.topic, mainAgentId: agentId } } : {}),
+  };
+}
+function withReadyAgent(snapshot: CreationSnapshot, agent: AgentSnapshotPayload) {
+  return {
+    agent,
+    workspaceId: agent.workspaceId ?? snapshot.workspaceId,
+    ...(snapshot.workspace && isMainControlAgentLabels(agent.labels)
+      ? { workspace: withMainAgent(snapshot.workspace, agent.id) }
+      : {}),
   };
 }
 function identityFor(kind: string, key: string): string {
