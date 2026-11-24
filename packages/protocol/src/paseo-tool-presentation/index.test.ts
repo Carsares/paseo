@@ -31,6 +31,13 @@ describe("Paseo tool display", () => {
     ["create_workspace", { path: "/tmp/repo/feature-x" }, "Create workspace", "feature-x"],
     ["create_workspace", { title: "Docs", branchName: "docs" }, "Create workspace", "Docs"],
     ["start_workspace_script", { scriptName: "web" }, "Start script", "web"],
+    ["reset_agent_session", { agentId: "agt_1" }, "Reset agent session", "agt_1"],
+    [
+      "upsert_workspace_task",
+      { taskId: "task_1", title: "Review changes" },
+      "Update workspace task",
+      "Review changes",
+    ],
     ["send_terminal_keys", { terminalId: "t1", keys: "npm test" }, "Send keys", "npm test"],
     ["create_schedule", { prompt: "Check CI", cron: "0 9 * * 1" }, "Create schedule", "0 9 * * 1"],
     ["browser_navigate", { url: "https://paseo.sh" }, "Navigate", "https://paseo.sh"],
@@ -47,6 +54,9 @@ describe("Paseo tool display", () => {
 
   it("omits the summary when a call has no context", () => {
     expect(display("mcp__paseo__list_agents", {})).toEqual({ displayName: "List agents" });
+    expect(display("mcp__paseo__list_workspace_tasks", {})).toEqual({
+      displayName: "List workspace tasks",
+    });
   });
 
   it("recognizes every Paseo namespace format", () => {

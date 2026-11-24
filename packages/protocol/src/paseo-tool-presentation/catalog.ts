@@ -86,6 +86,17 @@ const BROWSER_FIELDS = [
   "height",
   "function",
 ] as const;
+const WORKSPACE_TASK_FIELDS = [
+  "taskId",
+  "title",
+  "status",
+  "tier",
+  "participants",
+  "closure",
+  "handoffSummary",
+  "blockingQuestion",
+  "workspaceId",
+] as const;
 
 const AUTOMATION_OUTPUT = ["id", "status", "nextRunAt", "expiresAt"] as const;
 
@@ -221,6 +232,15 @@ export const PASEO_TOOL_CATALOG = {
     context: targetAgent(),
     detail: { inputOrder: ["agentId"] },
   },
+  reset_agent_session: {
+    label: "Reset agent session",
+    completedLabel: "Reset agent session",
+    context: targetAgent(),
+    detail: {
+      inputOrder: ["agentId", "interrupt", "clearVisibleTimeline"],
+      outputFields: ["success"],
+    },
+  },
   list_pending_permissions: { label: "List permissions", completedLabel: "Listed permissions" },
   respond_to_permission: {
     label: "Respond to permission",
@@ -269,6 +289,23 @@ export const PASEO_TOOL_CATALOG = {
     completedLabel: "Stopped script",
     context: field("scriptName"),
     detail: { inputOrder: ["workspaceId", "scriptName"] },
+  },
+  upsert_workspace_task: {
+    label: "Update workspace task",
+    completedLabel: "Updated workspace task",
+    context: field("title", "taskId"),
+    detail: {
+      inputOrder: WORKSPACE_TASK_FIELDS,
+      outputFields: ["workspaceId", "task"],
+    },
+  },
+  list_workspace_tasks: {
+    label: "List workspace tasks",
+    completedLabel: "Listed workspace tasks",
+    detail: {
+      inputOrder: ["workspaceId"],
+      outputFields: ["workspaceId", "tasks"],
+    },
   },
 
   // Terminals
