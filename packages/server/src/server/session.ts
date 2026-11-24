@@ -3950,6 +3950,17 @@ export class Session {
       case "checkout.git.stash.apply.request":
       case "checkout.git.stash.drop.request":
         return this.checkoutSession.handleGitWorkbench(msg);
+      case "checkout.git.repos.discover.request":
+      case "checkout.git.refs.list.request":
+      case "checkout.git.log.query.request":
+      case "checkout.git.commit.get_detail.request":
+      case "checkout.git.branch.mutate.request":
+      case "checkout.git.rebase.build_plan.request":
+      case "checkout.git.rebase.execute.request":
+      case "checkout.git.rebase.act.request":
+      case "checkout.git.conflict.inspect.request":
+      case "checkout.git.conflict.resolve.request":
+        return this.checkoutSession.handleGitWorkbenchP1(msg);
       case "checkout_switch_branch_request":
         return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
           this.checkoutSession.handleCheckoutSwitchBranchRequest(msg),

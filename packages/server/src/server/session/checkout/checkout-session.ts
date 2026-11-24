@@ -63,6 +63,10 @@ import {
   type GitWorkbenchRequest,
 } from "../../git/checkout-git-workbench.js";
 import { GitCommitBaselines } from "../../git/git-commit-baselines.js";
+import {
+  handleGitWorkbenchP1Request,
+  type GitWorkbenchP1Request,
+} from "../../git/git-workbench-p1.js";
 import { findGitWorktree, repoWriteMutex } from "../../git/repo-write-mutex.js";
 import type { GitMetadataGenerator } from "./git-metadata-generator.js";
 
@@ -591,30 +595,35 @@ export class CheckoutSession {
   // Command operations (writes) and GitHub-PR operations
   // ---------------------------------------------------------------------------
 
-  async handleGitWorkbench(msg: GitWorkbenchRequest): Promise<void> {
-    const response = await handleGitWorkbenchRequest(
-      msg,
-      {
-        listActiveAgents: (root) => this.host.listActiveGitAgents(root),
-        withDirectoryWrite: (cwd, write) => this.host.withGitDirectoryWrite(cwd, write),
-        refresh: async (root, cwd, reason) => {
-          await Promise.all(
-            (root === cwd ? [root] : [root, cwd]).flatMap((path) => [
-              this.gitMutation.notifyGitMutation(path, reason, {
-                invalidateForge: reason === "commit-changes",
-              }),
-              this.scheduleDiffRefresh(path),
-            ]),
-          );
-        },
-        generateCommitMessage: (cwd, source) =>
-          this.gitMetadataGenerator.generateCommitMessage(cwd, source),
-        reportBackgroundError: (err, cwd) =>
-          this.logger.warn({ err, cwd }, "Git workbench background task failed"),
+  private gitWorkbenchHost(): GitWorkbenchHost {
+    return {
+      listActiveAgents: (root) => this.host.listActiveGitAgents(root),
+      withDirectoryWrite: (cwd, write) => this.host.withGitDirectoryWrite(cwd, write),
+      refresh: async (root, cwd, reason) => {
+        await Promise.all(
+          (root === cwd ? [root] : [root, cwd]).flatMap((path) => [
+            this.gitMutation.notifyGitMutation(path, reason, {
+              invalidateForge: reason === "commit-changes",
+            }),
+            this.scheduleDiffRefresh(path),
+          ]),
+        );
       },
-      this.gitCommitBaselines,
+      generateCommitMessage: (cwd, source) =>
+        this.gitMetadataGenerator.generateCommitMessage(cwd, source),
+      reportBackgroundError: (err, cwd) =>
+        this.logger.warn({ err, cwd }, "Git workbench background task failed"),
+    };
+  }
+
+  async handleGitWorkbench(msg: GitWorkbenchRequest): Promise<void> {
+    this.host.emit(
+      await handleGitWorkbenchRequest(msg, this.gitWorkbenchHost(), this.gitCommitBaselines),
     );
-    this.host.emit(response);
+  }
+
+  async handleGitWorkbenchP1(msg: GitWorkbenchP1Request): Promise<void> {
+    this.host.emit(await handleGitWorkbenchP1Request(msg, this.gitWorkbenchHost()));
   }
 
   private async withLegacyGitWrite<T>(

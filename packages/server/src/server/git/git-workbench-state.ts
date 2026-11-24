@@ -24,6 +24,8 @@ export interface GitMutationDetails {
   actualHeadSha?: string | null;
   activeAgents?: CheckoutGitWorkingTree["activeAgents"];
   backupRef?: string;
+  rebaseId?: string | null;
+  operationState?: CheckoutGitWorkingTree["operationState"];
 }
 
 export class GitWorkbenchError extends Error {

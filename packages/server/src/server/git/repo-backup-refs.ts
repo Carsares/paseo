@@ -1,7 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { copyFile, lstat, mkdtemp, readlink, realpath, rm } from "node:fs/promises";
+import { copyFile, lstat, mkdtemp, readdir, readlink, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import {
+  absent,
+  readOptional,
+  REBASE_JOURNAL,
+  REBASE_MARKER,
+  REBASE_STATE_DIR,
+} from "./controlled-rebase-state.js";
 import { git } from "./git-workbench-state.js";
 import type { GitWorktree } from "./repo-write-mutex.js";
 
@@ -9,27 +16,88 @@ const PREFIX = "refs/paseo/backup/";
 const RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_BACKUPS = 20;
 const CREATED_REF = /^refs\/paseo\/backup\/[a-z-]+-(\d{13})-[\da-f]{32}$/;
+const REBASE_REF = /^refs\/paseo\/backup\/rebase-\d{13}-[\da-f]{32}$/;
 
-export async function createBackupRef(repo: GitWorktree, operation: string, sha: string) {
-  const ref = `${PREFIX}${operation}-${Date.now()}-${randomUUID().replaceAll("-", "")}`;
-  await git(repo, ["update-ref", ref, sha, ""]);
+export function newBackupRef(operation: string, id = randomUUID()): string {
+  return `${PREFIX}${operation}-${Date.now()}-${id.replaceAll("-", "")}`;
+}
+
+export async function createBackupRef(
+  repo: GitWorktree,
+  operation: string,
+  sha: string,
+  id?: ReturnType<typeof randomUUID>,
+) {
+  const ref = newBackupRef(operation, id);
+  await git(repo, ["update-ref", "--no-deref", ref, sha, ""]);
   return ref;
 }
 
+async function readInUseRebaseBackup(gitDir: string): Promise<string | null> {
+  const stateDir = join(gitDir, REBASE_STATE_DIR);
+  if (!(await lstat(stateDir).catch(absent))?.isDirectory()) return null;
+  const marker = await readOptional(join(stateDir, REBASE_MARKER));
+  const contents = await readOptional(join(gitDir, REBASE_JOURNAL));
+  if (contents === null && marker === null) return null;
+  const journal: unknown = contents === null ? null : JSON.parse(contents);
+  if (
+    !journal ||
+    typeof journal !== "object" ||
+    !("id" in journal) ||
+    typeof journal.id !== "string" ||
+    !("backupRef" in journal) ||
+    typeof journal.backupRef !== "string" ||
+    !REBASE_REF.test(journal.backupRef)
+  )
+    throw new Error("Cannot verify the backup for an active controlled rebase");
+  if (marker !== null && marker !== journal.id) {
+    throw new Error("Cannot identify the active controlled rebase backup");
+  }
+  return marker !== null || ("phase" in journal && journal.phase === "running")
+    ? journal.backupRef
+    : null;
+}
+
+async function inUseRebaseBackups(repo: GitWorktree): Promise<Set<string>> {
+  const worktrees = join(repo.commonDir, "worktrees");
+  const entries = await readdir(worktrees, { withFileTypes: true }).catch(absent);
+  const gitDirs = new Set([repo.commonDir, repo.gitDir]);
+  for (const entry of entries ?? []) {
+    if (entry.isDirectory()) gitDirs.add(join(worktrees, entry.name));
+  }
+  const protectedRefs = new Set<string>();
+  for (const gitDir of gitDirs) {
+    const backup = await readInUseRebaseBackup(gitDir);
+    if (backup) protectedRefs.add(backup);
+  }
+  return protectedRefs;
+}
+
+// Call under RepoWriteMutex. Its common-directory lock also covers linked worktrees.
 export async function collectExpiredBackupRefs(repo: GitWorktree, now = Date.now()): Promise<void> {
-  const { stdout } = await git(repo, ["for-each-ref", "--format=%(refname) %(objectname)", PREFIX]);
+  const { stdout } = await git(repo, [
+    "for-each-ref",
+    "--format=%(refname)%00%(objectname)%00%(symref)",
+    PREFIX,
+  ]);
   const entries = stdout
     .trimEnd()
     .split("\n")
     .flatMap((line) => {
-      const [ref, sha] = line.split(" ");
+      const [ref, sha, target] = line.split("\0");
       const time = ref && CREATED_REF.exec(ref)?.[1];
-      return ref && sha && time ? [{ ref, sha, timestamp: Number(time) }] : [];
+      return ref && sha && time && target === "" ? [{ ref, sha, timestamp: Number(time) }] : [];
     });
   entries.sort((a, b) => b.timestamp - a.timestamp || b.ref.localeCompare(a.ref));
-  for (const [index, entry] of entries.entries()) {
-    if (index >= MAX_BACKUPS || now - entry.timestamp >= RETENTION_MS) {
-      await git(repo, ["update-ref", "-d", entry.ref, entry.sha]);
+  const protectedRefs = await inUseRebaseBackups(repo);
+  let kept = 0;
+  for (const entry of entries) {
+    if (protectedRefs.has(entry.ref)) continue;
+    if (kept >= MAX_BACKUPS || now - entry.timestamp >= RETENTION_MS) {
+      // A ref can become symbolic after enumeration. Never follow it to a branch.
+      await git(repo, ["update-ref", "--no-deref", "-d", entry.ref, entry.sha]);
+    } else {
+      kept++;
     }
   }
 }

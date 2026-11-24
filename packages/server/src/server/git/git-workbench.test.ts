@@ -799,4 +799,24 @@ describe("Git P0 operations", () => {
       [...sample.slice(0, 20), prefix + "manual"].sort(),
     );
   });
+
+  it("keeps a symbolic backup and its target branch during retention", async () => {
+    const now = Date.now();
+    const age = now - 15 * 86400000;
+    const target = "refs/heads/keep";
+    const symbolic = `refs/paseo/backup/branch-del-${age}-${"a".repeat(32)}`;
+    const expired = `refs/paseo/backup/branch-del-${age}-${"b".repeat(32)}`;
+    git("update-ref", target, head);
+    git("symbolic-ref", symbolic, target);
+    git("update-ref", expired, head);
+
+    const repo = await resolveGitTarget(root);
+    await repoWriteMutex.run(repo, "backup-retention-test", () =>
+      collectExpiredBackupRefs(repo, now),
+    );
+
+    expect(git("show-ref", "--verify", "--hash", target).trim()).toBe(head);
+    expect(git("symbolic-ref", symbolic).trim()).toBe(target);
+    expect(git("for-each-ref", "--format=%(refname)", expired)).toBe("");
+  });
 });

@@ -4,6 +4,7 @@ import type {
   SessionOutboundMessage,
 } from "../messages.js";
 import { pushCurrentBranch, type GitMutationRefreshReason } from "../../utils/checkout-git.js";
+import { readControlledRebaseId } from "./controlled-rebase.js";
 import {
   assertGitWorktree,
   git,
@@ -132,6 +133,18 @@ export async function handleGitWorkbenchRequest(
                 );
               }
             }
+            const rebaseId = await readControlledRebaseId(repo, { ...tree, branchRef }).catch(
+              (error: unknown) => {
+                host.reportBackgroundError(error, msg.cwd);
+                return null;
+              },
+            );
+            if (
+              rebaseId ||
+              tree.operationState === "rebase" ||
+              tree.operationState === "rebase_paused"
+            )
+              return { ...tree, rebaseId };
             return tree;
           });
         });

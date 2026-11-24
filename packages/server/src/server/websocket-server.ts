@@ -2380,6 +2380,12 @@ export class VoiceAssistantWebSocketServer {
         // COMPAT(topicWorkbenchV1): added in v0.18.0, remove after 2027-06-01.
         topicWorkbenchV1: true,
         checkoutGitStagingV1: true,
+        // COMPAT(checkoutGitGraphV1): added in v0.18.0, remove gate after 2027-06-01.
+        checkoutGitGraphV1: true,
+        // COMPAT(checkoutGitRebaseV1): added in v0.18.0, remove gate after 2027-06-01.
+        checkoutGitRebaseV1: true,
+        // COMPAT(checkoutGitMultiRepoV1): added in v0.18.0, remove gate after 2027-06-01.
+        checkoutGitMultiRepoV1: true,
         agentSideChat: true,
         workspaceAgentsSummary: true,
         agentHistoryWorkspaceFilter: true,

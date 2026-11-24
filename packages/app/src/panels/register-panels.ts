@@ -14,7 +14,8 @@ import { terminalPanelRegistration } from "@/panels/terminal-panel";
 import { providerSubagentPanelRegistration } from "@/panels/provider-subagent-panel";
 import { pullRequestPanelRegistration } from "@/panels/pull-request-panel";
 import { pluginPanelRegistration } from "@/plugins/workspace-panels/panel";
-import { newTabPanelRegistration } from "@/panels/new-tab-panel";
+import { gitGraphPanelRegistration } from "@/git/graph/panel";
+import { newTabWithGitGraphRegistration } from "@/git/graph/launcher";
 
 let panelsRegistered = false;
 
@@ -23,7 +24,7 @@ export function ensurePanelsRegistered(): void {
     return;
   }
   registerPanel(draftPanelRegistration);
-  registerPanel(newTabPanelRegistration);
+  registerPanel(newTabWithGitGraphRegistration);
   registerPanel(agentPanelRegistration);
   registerPanel(providerSubagentPanelRegistration);
   registerPanel(setupPanelRegistration);
@@ -34,6 +35,7 @@ export function ensurePanelsRegistered(): void {
   registerPanel(pullRequestPanelRegistration);
   registerPanel(commitDiffPanelRegistration);
   registerPanel(workingDiffPanelRegistration);
+  registerPanel(gitGraphPanelRegistration);
   registerPanel(changesTreePanelRegistration);
   registerPanel(pluginPanelRegistration);
   panelsRegistered = true;
