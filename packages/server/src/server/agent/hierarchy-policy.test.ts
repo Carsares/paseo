@@ -328,8 +328,25 @@ describe("agent orchestration", () => {
     expect(leadPrompt).toContain(
       "Level-1 Module Lead (Flexible Mode) under Main Control Agent main",
     );
+    expect(leadPrompt).toContain(
+      "For small-to-medium single-module tasks, complete the investigation, changes, and targeted verification yourself without spawning unnecessary Level-2 Sub-Agents.",
+    );
+    expect(leadPrompt).toContain(
+      "Use create_agent to spawn Level-2 Sub-Agents only for cross-module parallel implementation or when the task explicitly requires role-isolated independent review or blind verification.",
+    );
+    expect(leadPrompt).not.toContain("Delegate substantive implementation");
     expect(leadPrompt).toContain('Direct Level-2 children: [{"id":"worker"');
     expect(leadPrompt).toContain("Call report_to_parent once all verification is complete");
+    const autoLeadPrompt = buildHierarchyAppendSystemPrompt({ agent: lead, ...graph });
+    expect(autoLeadPrompt).toContain("For small-to-medium single-module tasks");
+    expect(autoLeadPrompt).not.toContain("Call report_to_parent");
+    const explicitWorker = {
+      ...worker,
+      labels: { ...worker.labels, [PARENT_REPORTING_LABEL]: EXPLICIT_PARENT_REPORTING },
+    };
+    expect(buildHierarchyAppendSystemPrompt({ agent: explicitWorker, ...graph })).toBe(
+      "Call report_to_parent once all verification is complete, with a concise outcome and changed files. If you need a decision from your parent to proceed, use report_to_parent with status blocked and the question.",
+    );
     expect(buildHierarchyAppendSystemPrompt({ agent: worker, ...graph })).toBe("");
     expect(buildHierarchyAppendSystemPrompt({ agent: root, ...graph })).toBe("");
   });
@@ -345,12 +362,11 @@ it("launches explicit reporting instructions for a level-two or remote child", a
       workspaceId,
       labels: { [PARENT_AGENT_ID_LABEL]: parent.id },
     });
-    expect(launchedConfigs.get("codex")?.at(-1)?.daemonAppendSystemPrompt).toContain(
-      "Level-1 Module Lead",
-    );
-    expect(launchedConfigs.get("codex")?.at(-1)?.daemonAppendSystemPrompt).not.toContain(
-      "Call report_to_parent",
-    );
+    const launchedLeadPrompt = launchedConfigs.get("codex")?.at(-1)?.daemonAppendSystemPrompt;
+    expect(launchedLeadPrompt).toContain("Level-1 Module Lead");
+    expect(launchedLeadPrompt).toContain("only for cross-module parallel implementation");
+    expect(launchedLeadPrompt).not.toContain("Delegate substantive implementation");
+    expect(launchedLeadPrompt).not.toContain("Call report_to_parent");
     for (const labels of [
       { [PARENT_AGENT_ID_LABEL]: leadAgent.id },
       {

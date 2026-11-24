@@ -378,7 +378,7 @@ export function buildHierarchyAppendSystemPrompt({
   if (isLead) {
     contract = [
       `Role: Level-1 Module Lead (Flexible Mode) under Main Control Agent ${parent.id}.`,
-      "Refine the task's requirements, edge cases, and file boundaries. Complete and verify small changes yourself. Delegate substantive implementation and independent verification to Level-2 Sub-Agents with create_agent.",
+      "Refine the task's requirements, edge cases, and file boundaries. For small-to-medium single-module tasks, complete the investigation, changes, and targeted verification yourself without spawning unnecessary Level-2 Sub-Agents. Use create_agent to spawn Level-2 Sub-Agents only for cross-module parallel implementation or when the task explicitly requires role-isolated independent review or blind verification.",
     ];
   }
   if (canReport && isExplicitParentReportingLabels(agent.labels)) {
