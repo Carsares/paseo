@@ -217,6 +217,50 @@ describe("OpenCode v2 session lifecycle", () => {
     10_000,
   );
 
+  test("checks handoff before sending a prompt to OpenCode", async () => {
+    const harness = new V2Harness();
+    let promptCount = 0;
+    harness.prompt = async () => {
+      promptCount += 1;
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+    try {
+      await expect(
+        session.startTurn("review", {
+          beforeProviderDispatch: async () => {
+            throw new Error("Main Control changed");
+          },
+        }),
+      ).rejects.toThrow("Main Control changed");
+      expect(promptCount).toBe(0);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("rejects confirmed prompt dispatch when OpenCode refuses admission", async () => {
+    const harness = new V2Harness();
+    harness.prompt = async () => {
+      throw new Error("Prompt refused");
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+    try {
+      await expect(session.startTurn("review", { waitForProviderPrompt: true })).rejects.toThrow(
+        "Prompt refused",
+      );
+    } finally {
+      await session.close();
+    }
+  });
+
   test("does not finish from a previous outcome before prompt admission", async () => {
     const harness = new V2Harness();
     let accept!: () => void;

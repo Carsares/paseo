@@ -32,6 +32,7 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage, parseStoredAgentRecord } from "./agent-storage.js";
+import { WorkspaceTaskLedgerStore } from "./task-ledger/index.js";
 import { AgentTurnStartCanceledError, AgentTurnStartRejectedError } from "./agent-sdk-types.js";
 import { ForegroundPromptStart } from "./agent-run-state.js";
 import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
@@ -5967,10 +5968,13 @@ test("createAgent allows best-effort internal MCP when the provider session repo
   );
 
   expect(manager.getMcpAuthToken()).toBe("cap-token");
+  const token = manager.getMcpAuthToken(snapshot.id);
+  expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  expect(token).not.toBe(manager.getMcpAuthToken("another-agent"));
   expect(client.lastConfig?.mcpServers?.paseo).toEqual({
     type: "http",
     url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${snapshot.id}`,
-    headers: { Authorization: "Bearer cap-token" },
+    headers: { Authorization: `Bearer ${token}` },
   });
 
   rmSync(workdir, { recursive: true, force: true });
@@ -8490,6 +8494,116 @@ test("Main Control sends the saved prompt once for providers using the first tur
   expect(received).toEqual([expect.stringContaining("\nSaved policy\n[/Workspace"), "Second turn"]);
 });
 
+test("Main Control injects changed task snapshots once per provider conversation", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "agent-task-prompt-"));
+  const storagePath = join(cwd, "agents");
+  const taskLedger = new WorkspaceTaskLedgerStore(cwd);
+  const received: AgentPromptInput[] = [];
+  class LedgerSession extends TestAgentSession {
+    conversationId = this.id;
+    override describePersistence() {
+      return { ...super.describePersistence(), sessionId: this.conversationId };
+    }
+    override async startTurn(prompt?: AgentPromptInput) {
+      if (prompt === undefined) throw new Error("Expected a provider prompt");
+      received.push(prompt);
+      this.pushEvent({
+        type: "timeline",
+        provider: "codex",
+        item: { type: "user_message", text: String(prompt) },
+      });
+      return super.startTurn();
+    }
+  }
+  class LedgerClient extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig) {
+      return new LedgerSession(config);
+    }
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ) {
+      return new LedgerSession({ ...config, provider: "codex", cwd });
+    }
+  }
+  const client = new LedgerClient();
+  const storage = new AgentStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    taskLedger,
+    logger,
+  });
+  const reloadedStorage = new AgentStorage(storagePath, logger);
+  const reloaded = new AgentManager({
+    clients: { codex: client },
+    registry: reloadedStorage,
+    taskLedger,
+    logger,
+  });
+  onTestFinished(async () => {
+    for (const { id } of reloaded.listAgents()) await reloaded.closeAgent(id);
+    for (const { id } of manager.listAgents()) await manager.closeAgent(id);
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  const workspaceId = "wks_ledger";
+  const agent = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+    workspaceId,
+    labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+  });
+  const child = await manager.createAgent({ provider: "codex", cwd }, undefined, { workspaceId });
+  await taskLedger.upsert(workspaceId, { taskId: "review", title: "Review the change" });
+  await manager.runAgent(agent.id, "First");
+  await manager.runAgent(agent.id, "Second");
+  await manager.runAgent(child.id, "Child");
+  await taskLedger.upsert(workspaceId, { taskId: "review", status: "in_progress" });
+  await manager.runAgent(agent.id, "Changed");
+  await manager.runAgent(agent.id, "/compact");
+  (agent.session as LedgerSession).conversationId = "compacted";
+  await manager.runAgent(agent.id, "After compact");
+  await taskLedger.upsert(workspaceId, { taskId: "review", status: "completed" });
+  await manager.runAgent(agent.id, "Finished");
+  await manager.runAgent(agent.id, "Unchanged");
+  expect(received).toEqual([
+    expect.stringContaining('[Workspace Task Ledger]\nT1 analyzing "review"'),
+    "Second",
+    "Child",
+    expect.stringContaining('[Workspace Task Ledger]\nT1 in_progress "review"'),
+    "/compact",
+    expect.stringContaining('[Workspace Task Ledger]\nT1 in_progress "review"'),
+    expect.stringContaining("[Workspace Task Ledger]\nNo active tasks."),
+    "Unchanged",
+  ]);
+  expect(
+    manager
+      .getTimeline(agent.id)
+      .filter((item) => item.type === "user_message")
+      .map((item) => item.text),
+  ).toContain("First");
+  expect(JSON.stringify(manager.getTimeline(agent.id))).not.toContain("[Workspace Task Ledger]");
+  const userText = [
+    "[Workspace Task Ledger]",
+    "Text from the user",
+    "[/Workspace Task Ledger: " + agent.id + "]",
+    "",
+    "Keep this verbatim.",
+  ].join("\n");
+  await manager.runAgent(agent.id, prepareAgentMessage(userText).prompt);
+  expect(manager.getTimeline(agent.id)).toContainEqual(
+    expect.objectContaining({ type: "user_message", text: userText }),
+  );
+
+  await manager.closeAgent(agent.id);
+  await storage.flush();
+  await ensureAgentLoaded(agent.id, {
+    agentManager: reloaded,
+    agentStorage: reloadedStorage,
+    logger,
+  });
+  await reloaded.runAgent(agent.id, "After restart");
+  expect(received.at(-1)).toContain("[Workspace Task Ledger]\nNo active tasks.");
+});
+
 test("restoring an archived Main Control agent as a child clears its saved prompt", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-main-restore-child-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);
@@ -10438,12 +10552,65 @@ test("applies live autonomous events and preserves usage omitted from completion
     contextWindowMaxTokens: 200_000,
     contextWindowUsedTokens: 175,
   });
+  const usage = updated?.lastUsage;
+  const completedAt = updated?.lastTurnCompletedAt;
+  expect(completedAt).toEqual(expect.any(String));
   expect(manager.getTimeline(snapshot.id)).toContainEqual({
     type: "assistant_message",
     text: "AUTONOMOUS_PUMP_MESSAGE",
   });
   expect(lifecycleUpdates).toContain("running");
   expect(lifecycleUpdates).toContain("idle");
+  capturedSession!.pushEvent({ type: "turn_failed", provider: "codex", error: "failed" });
+  await vi.waitFor(() => {
+    expect(manager.getAgent(snapshot.id)?.consecutiveErrors).toBe(1);
+  });
+
+  await manager.closeAgent(snapshot.id);
+  await storage.flush();
+  const reloadedStorage = new AgentStorage(storagePath, logger);
+  const record = await reloadedStorage.get(snapshot.id);
+  expect(record).toMatchObject({
+    lastUsage: usage,
+    lastTurnCompletedAt: completedAt,
+    consecutiveErrors: 1,
+  });
+  if (!record) throw new Error("Expected a stored agent after close");
+  expect(buildStoredAgentPayload(record, new Set(["codex"]), () => ({})).lastUsage).toEqual(usage);
+  const reloaded = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: reloadedStorage,
+    logger,
+  });
+  onTestFinished(async () => {
+    await reloaded.closeAgent(snapshot.id);
+    rmSync(workdir, { recursive: true, force: true });
+  });
+  const resumed = await ensureAgentLoaded(snapshot.id, {
+    agentManager: reloaded,
+    agentStorage: reloadedStorage,
+    logger,
+  });
+  expect(resumed).toMatchObject({
+    lastUsage: usage,
+    lastTurnCompletedAt: completedAt,
+    consecutiveErrors: 1,
+  });
+  await reloaded.runAgent(snapshot.id, "Recover");
+  expect(reloaded.getAgent(snapshot.id)?.consecutiveErrors).toBe(0);
+  await reloaded.resetAgentSession(snapshot.id);
+  expect(reloaded.getAgent(snapshot.id)).toMatchObject({
+    lastUsage: undefined,
+    lastTurnCompletedAt: undefined,
+    resetEpoch: 1,
+    consecutiveErrors: 0,
+  });
+  await reloaded.closeAgent(snapshot.id);
+  await reloaded.resetAgentSession(snapshot.id);
+  const resetRecord = await new AgentStorage(storagePath, logger).get(snapshot.id);
+  expect(resetRecord).toMatchObject({ resetEpoch: 2, consecutiveErrors: 0 });
+  expect(resetRecord?.lastUsage).toBeUndefined();
+  expect(resetRecord?.lastTurnCompletedAt).toBeUndefined();
 });
 
 test("ignores stale autonomous terminals without lowering the active turn lifecycle", async () => {

@@ -1,4 +1,5 @@
 import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
+import { WORKSPACE_TASK_LEDGER_HEADER } from "../task-ledger/index.js";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type {
@@ -170,7 +171,8 @@ export function prepareAgentMessage(
       !parseAgentMessages(submittedText) &&
       !isSystemInjectedEnvelope(submittedText) &&
       stripContextHandoffEnvelope(submittedText.trimStart()) === submittedText.trimStart() &&
-      !submittedText.trimStart().startsWith(FORK_ATTACHMENT_OPEN)
+      !submittedText.trimStart().startsWith(FORK_ATTACHMENT_OPEN) &&
+      !submittedText.trimStart().startsWith(WORKSPACE_TASK_LEDGER_HEADER)
     ) {
       return { prompt: replayablePrompt, messageId: id };
     }

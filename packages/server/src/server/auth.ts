@@ -142,14 +142,16 @@ export async function isAgentMcpRequestAuthorized(input: {
     return true;
   }
   const token = extractHttpBearerToken(input.authorizationHeader);
-  if (input.capabilityToken !== null && token !== null) {
-    // Constant-time compare; length-guard first because timingSafeEqual throws
-    // on differing buffer lengths.
-    const provided = Buffer.from(token);
-    const expected = Buffer.from(input.capabilityToken);
-    if (provided.length === expected.length && timingSafeEqual(provided, expected)) {
-      return true;
-    }
-  }
+  if (matchesAgentMcpCapability(input.capabilityToken, token)) return true;
   return isBearerTokenValidAsync({ password: input.password, token });
+}
+
+export function matchesAgentMcpCapability(
+  capability: string | null,
+  token: string | null,
+): boolean {
+  if (capability === null || token === null) return false;
+  const provided = Buffer.from(token);
+  const expected = Buffer.from(capability);
+  return provided.length === expected.length && timingSafeEqual(provided, expected);
 }

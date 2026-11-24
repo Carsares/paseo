@@ -141,6 +141,10 @@ export function toStoredAgentRecord(
     runtimeInfo,
     controls: normalizeControls(agent.controls),
     persistence,
+    lastUsage: sanitizeUsage(agent.lastUsage),
+    lastTurnCompletedAt: agent.lastTurnCompletedAt,
+    resetEpoch: agent.resetEpoch,
+    consecutiveErrors: agent.consecutiveErrors,
     lastError: agent.lastError ?? undefined,
     failedConversationLimit: agent.failedConversationLimit,
     requiresAttention: agent.attention.requiresAttention,
@@ -372,6 +376,7 @@ export function buildStoredAgentPayload(
     ...visibilityFlags(record),
     labels: normalizeLabels(record.labels),
     metadata: record.metadata,
+    lastUsage: record.lastUsage,
     ...(typeof record.lastError === "string" ? { lastError: record.lastError } : {}),
     ...(providerAvailable ? {} : { providerUnavailable: true }),
   };

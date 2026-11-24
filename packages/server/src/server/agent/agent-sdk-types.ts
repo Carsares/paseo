@@ -212,6 +212,8 @@ export interface AgentRunOptions {
   clientMessageId?: string;
   /** Internal marker used while dispatching a daemon-started automatic recovery. */
   recoveryIntent?: "automatic" | "delayed-limit";
+  /** Wait for the provider to acknowledge the prompt before reporting a started turn. */
+  waitForProviderPrompt?: boolean;
   /** Internal guard used by sessions that defer handoff until their provider request. */
   beforeProviderDispatch?: () => Promise<void>;
 }

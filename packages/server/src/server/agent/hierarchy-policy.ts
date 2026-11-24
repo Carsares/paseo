@@ -22,6 +22,7 @@ import {
 } from "@getpaseo/protocol/agent-labels";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import type { AgentPermissionRequest } from "./agent-sdk-types.js";
+import { WORKSPACE_TASK_LEDGER_HEADER, workspaceTaskLedgerEnd } from "./task-ledger/index.js";
 
 export const MAX_SUBAGENT_DEPTH = 2;
 export const MAIN_CONTROL_WRITE_DENIAL = "Main Control agents are read-only.";
@@ -33,11 +34,18 @@ export function mainControlPromptEnd(agentId: string): string {
 
 export function stripMainControlPromptHeader(text: string, agentId: string): string {
   const delimiter = mainControlPromptEnd(agentId);
+  const ledgerSuffix = workspaceTaskLedgerEnd(agentId) + "\n\n";
   while (true) {
     if (text.startsWith(MAIN_CONTROL_PROMPT_HEADER + "\n")) {
       const end = text.indexOf(delimiter);
       if (end === -1) return text;
       text = text.slice(end + delimiter.length).replace(/^\n\n/, "");
+      continue;
+    }
+    if (text.startsWith(WORKSPACE_TASK_LEDGER_HEADER + "\n")) {
+      const end = text.indexOf(ledgerSuffix, WORKSPACE_TASK_LEDGER_HEADER.length);
+      if (end === -1) return text;
+      text = text.slice(end + ledgerSuffix.length);
       continue;
     }
     const specialists =
@@ -269,6 +277,8 @@ const MAIN_CONTROL_TOOLS: readonly string[] = [
   "summarize_workspace_agents",
   "archive_agent",
   "reset_agent_session",
+  "upsert_workspace_task",
+  "list_workspace_tasks",
 ];
 
 export interface PaseoToolPolicy extends ProviderPaseoToolsPolicy {

@@ -2,7 +2,7 @@ import { promises as fs, type Dirent } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import type { Logger } from "pino";
-import type { JsonValue } from "@getpaseo/protocol/agent-types";
+import type { AgentUsage, JsonValue } from "@getpaseo/protocol/agent-types";
 import {
   hasOpenAgentTab,
   isMainControlAgentLabels,
@@ -57,6 +57,15 @@ const PERSISTENCE_HANDLE_SCHEMA = z
   .nullable()
   .optional();
 
+const STORED_AGENT_USAGE_SCHEMA = z.object({
+  inputTokens: z.number().optional(),
+  cachedInputTokens: z.number().optional(),
+  outputTokens: z.number().optional(),
+  totalCostUsd: z.number().optional(),
+  contextWindowMaxTokens: z.number().optional(),
+  contextWindowUsedTokens: z.number().optional(),
+} satisfies Record<keyof AgentUsage, z.ZodOptional<z.ZodNumber>>);
+
 const RAW_STORED_AGENT_SCHEMA = z.object({
   id: z.string(),
   provider: z.string(),
@@ -72,6 +81,10 @@ const RAW_STORED_AGENT_SCHEMA = z.object({
   mainControlSystemPrompt: z.string().optional(),
   metadata: z.record(z.string(), z.custom<JsonValue>()).default({}),
   lastStatus: AgentStatusSchema.default("closed"),
+  lastUsage: STORED_AGENT_USAGE_SCHEMA.optional(),
+  lastTurnCompletedAt: z.iso.datetime().optional(),
+  resetEpoch: z.number().int().nonnegative().optional(),
+  consecutiveErrors: z.number().int().nonnegative().optional(),
   resumeOnStartup: z.boolean().optional(),
   lastModeId: z.string().nullable().optional(),
   config: SERIALIZABLE_CONFIG_SCHEMA,
@@ -121,6 +134,11 @@ type RawStoredAgentConfig = NonNullable<RawStoredAgentRecord["config"]>;
 export type StoredAgentRecord = Omit<RawStoredAgentRecord, "config" | "features"> & {
   config?: Omit<RawStoredAgentConfig, "featureValues"> | null;
 };
+
+export type StoredAgentTurnState = Pick<
+  StoredAgentRecord,
+  "lastUsage" | "lastTurnCompletedAt" | "resetEpoch" | "consecutiveErrors"
+>;
 
 // COMPAT(featureValues): added in v0.15.0, remove after 2027-05-01.
 function foldLegacyRecordFields(record: RawStoredAgentRecord): StoredAgentRecord {

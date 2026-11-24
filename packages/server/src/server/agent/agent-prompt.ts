@@ -326,6 +326,7 @@ export interface StartCreatedAgentInitialPromptParams {
   runOptions?: AgentRunOptions;
   handoff?: QueueHandoff;
   waitForCommandOutcome?: boolean;
+  validateDispatch?: () => Promise<void>;
   logger: Logger;
 }
 
@@ -477,6 +478,12 @@ async function classifyPromptLoadFailure(
   return new QueuedPromptLoadError(error);
 }
 
+function queuedPromptRunOptions(handoff: QueueHandoff | undefined, options?: AgentRunOptions) {
+  return handoff?.waitForForegroundConfirmation
+    ? { ...options, waitForProviderPrompt: true }
+    : options;
+}
+
 /** Dispatch daemon-prepared context without reclassifying it as human input. */
 export async function sendPreparedPromptToAgent(
   params: Omit<SendPromptToAgentParams, "source" | "messageId">,
@@ -541,7 +548,7 @@ export async function sendPreparedPromptToAgent(
     onDispatch: params.onDispatch,
     activeTurnBehavior: params.activeTurnBehavior,
     clearPendingPermissions: params.clearPendingPermissions,
-    runOptions: params.runOptions,
+    runOptions: queuedPromptRunOptions(params.handoff, params.runOptions),
   });
 }
 
@@ -569,8 +576,11 @@ export async function startCreatedAgentInitialPrompt(
     delivery.prompt,
     params.logger,
     {
-      runOptions: { ...params.runOptions, clientMessageId: delivery.messageId },
-      beforeHandoff: params.handoff?.begin,
+      runOptions: {
+        ...params.runOptions,
+        clientMessageId: delivery.messageId,
+      },
+      beforeHandoff: params.validateDispatch ? preparePromptHandoff(params) : params.handoff?.begin,
       onSteerDeclined: params.handoff?.declined,
       commandDispatch: params.waitForCommandOutcome
         ? {

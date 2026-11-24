@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { experimental_createMCPClient } from "ai";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -12,6 +12,8 @@ import pino from "pino";
 import { withTimeout } from "../../utils/promise-timeout.js";
 import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
+import { MessageReceipts } from "../message-receipts/index.js";
+import { AgentCommandNotDispatchedError } from "./agent-manager.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import type {
@@ -548,6 +550,7 @@ describe("agent MCP end-to-end (offline)", () => {
 
     let agentId: string | null = null;
     let client: McpClient | null = null;
+    let mainClient: McpClient | null = null;
     try {
       // Remote auth is not weakened: a request without credentials is rejected
       // before any MCP processing.
@@ -577,7 +580,121 @@ describe("agent MCP end-to-end (offline)", () => {
       const payload = getStructuredContent(result);
       agentId = typeof payload?.agentId === "string" ? payload.agentId : null;
       expect(agentId).toBeTruthy();
+      if (!agentId) throw new Error("Expected an agent ID");
+      await daemon.agentManager.waitForAgentEvent(agentId);
+      await daemon.agentManager.setAgentMainControl(agentId, true);
+      const mainToken = daemon.agentManager.getMcpAuthToken(agentId);
+      if (!mainToken) throw new Error("Expected a capability scoped to Main Control");
+      const mainUrl = `${mcpUrl}?callerAgentId=${agentId}`;
+      const legacyClient = await createMcpClient(mainUrl, capabilityToken!);
+      try {
+        const status = await legacyClient.callTool({
+          name: "get_agent_status",
+          args: { agentId },
+        });
+        expect(getStructuredContent(status)).toMatchObject({ snapshot: { id: agentId } });
+        const ledger = await legacyClient.callTool({ name: "list_workspace_tasks", args: {} });
+        expect(ledger.isError).toBe(true);
+      } finally {
+        await legacyClient.close();
+      }
+      const mismatchedIdentity = await fetch(`${mcpUrl}?callerAgentId=another-agent`, {
+        method: "POST",
+        headers: { "content-type": "application/json", Authorization: `Bearer ${mainToken}` },
+        body: "{}",
+      });
+      expect(mismatchedIdentity.status).toBe(401);
+      mainClient = await createMcpClient(mainUrl, mainToken);
+      const taskBinding = { taskId: "mcp-review", title: "Review changes" };
+      const child = getStructuredContent(
+        await mainClient.callTool({
+          name: "create_agent",
+          args: {
+            title: "MCP Reviewer",
+            provider: "claude/claude-test-model",
+            initialPrompt: "reply with done and stop",
+            notifyOnFinish: false,
+            taskBinding,
+          },
+        }),
+      );
+      expect(child).toMatchObject({ agentId: expect.any(String), taskId: taskBinding.taskId });
+      const dispatch = getStructuredContent(
+        await mainClient.callTool({
+          name: "send_agent_prompt",
+          args: {
+            agentId: child?.agentId,
+            prompt: "reply with done and stop",
+            notifyOnFinish: false,
+            taskBinding: { taskId: taskBinding.taskId, status: "verifying" },
+          },
+        }),
+      );
+      expect(dispatch).toMatchObject({ deliveryStatus: "dispatched", taskId: taskBinding.taskId });
+      const command = vi.spyOn(daemon.agentManager, "tryRunOutOfBand");
+      const recoverableReceipt = vi.spyOn(MessageReceipts.prototype, "sendQueued");
+      try {
+        const unknown: typeof daemon.agentManager.tryRunOutOfBand = async (
+          _id,
+          _prompt,
+          _options,
+          onAccepted,
+          confirmation,
+        ) => {
+          expect(confirmation?.waitForProviderOutcome).toBe(true);
+          await onAccepted?.();
+          await confirmation?.onProviderOutcome?.("unknown");
+          return true;
+        };
+        command.mockImplementationOnce(unknown);
+        const unknownCreation = await mainClient.callTool({
+          name: "create_agent",
+          args: {
+            title: "Unconfirmed create",
+            provider: "claude/claude-test-model",
+            initialPrompt: "reply with done and stop",
+            notifyOnFinish: false,
+            taskBinding: { taskId: "unconfirmed-create", title: "Unconfirmed creation" },
+          },
+        });
+        expect(getStructuredContent(unknownCreation)).toMatchObject({
+          agentId: expect.any(String),
+          taskBindingError: "agent_request_outcome_unknown",
+        });
+
+        const sendBound = (taskId: string) =>
+          mainClient!.callTool({
+            name: "send_agent_prompt",
+            args: {
+              agentId: child?.agentId,
+              prompt: "reply with done and stop",
+              notifyOnFinish: false,
+              taskBinding: { taskId, title: "Failed dispatch" },
+            },
+          });
+        command.mockImplementationOnce(unknown);
+        const unknownSend = await sendBound("unconfirmed-send");
+        expect(unknownSend.isError).toBe(true);
+        expect(JSON.stringify(unknownSend)).toContain("agent_request_outcome_unknown");
+
+        command.mockRejectedValueOnce(new AgentCommandNotDispatchedError());
+        const failedSend = await sendBound("undelivered-send");
+        expect(failedSend.isError).toBe(true);
+        expect(recoverableReceipt).not.toHaveBeenCalled();
+      } finally {
+        command.mockRestore();
+        recoverableReceipt.mockRestore();
+      }
+      const ledgerResult = getStructuredContent(
+        await mainClient.callTool({ name: "list_workspace_tasks", args: {} }),
+      );
+      expect(ledgerResult).toMatchObject({
+        tasks: [
+          { ...taskBinding, status: "verifying", participants: [{ agentId: child?.agentId }] },
+        ],
+      });
     } finally {
+      await mainClient?.close();
       if (agentId) {
         await client?.callTool({ name: "kill_agent", args: { agentId } });
       }

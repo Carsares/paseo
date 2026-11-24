@@ -889,6 +889,27 @@ describe("ClaudeAgentSession features", () => {
     }
   });
 
+  test("checks handoff after the Claude query becomes ready", async () => {
+    const { queryFactory } = createQueryMock();
+    const session = await new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    }).createSession({ provider: "claude", cwd: process.cwd() });
+    try {
+      await expect(
+        session.startTurn("review", {
+          beforeProviderDispatch: async () => {
+            expect(queryFactory).toHaveBeenCalledOnce();
+            throw new Error("Main Control changed");
+          },
+        }),
+      ).rejects.toThrow("Main Control changed");
+    } finally {
+      await session.close();
+    }
+  });
+
   test("runtime close prevents a query from launching after pending options resolve", async () => {
     const { queryFactory } = createQueryMock();
     let optionsStarted!: () => void;

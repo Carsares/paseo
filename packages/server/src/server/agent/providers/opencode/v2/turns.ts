@@ -134,8 +134,35 @@ export class SessionTurns {
     const output =
       options?.outputSchema === undefined ? undefined : structuredOutput(options.outputSchema);
     const turn = this.createTurn(submitted, false, output);
-    void this.submit(turn, input, accept, options);
+    const dispatch = this.startSubmission(turn, input, accept, options);
+    if (dispatch) await dispatch;
     return { turnId: turn.id };
+  }
+  private startSubmission(
+    turn: Turn,
+    input: ReturnType<SessionTurns["promptInput"]>,
+    accept: () => void,
+    options?: AgentRunOptions,
+  ): Promise<void> | undefined {
+    if (options?.waitForProviderPrompt) return this.submit(turn, input, accept, options);
+    const beforeDispatch = options?.beforeProviderDispatch;
+    if (!beforeDispatch) {
+      void this.submit(turn, input, accept, options);
+      return undefined;
+    }
+    // Ordinary sends wait for admission checks. Only bound sends wait for OpenCode's reply.
+    let markChecked!: () => void;
+    const checked = new Promise<void>((resolve) => {
+      markChecked = resolve;
+    });
+    const dispatch = this.submit(turn, input, accept, {
+      ...options,
+      async beforeProviderDispatch() {
+        await beforeDispatch();
+        markChecked();
+      },
+    });
+    return Promise.race([checked, dispatch]);
   }
   private async submit(
     turn: Turn,
@@ -152,6 +179,7 @@ export class SessionTurns {
       this.requestReconciliation();
     } catch (error) {
       if (this.turn === turn) this.fail(new Error(toDiagnosticErrorMessage(error)));
+      if (options?.waitForProviderPrompt || options?.beforeProviderDispatch) throw error;
     } finally {
       accept();
     }
@@ -248,15 +276,19 @@ export class SessionTurns {
     output?: ReturnType<typeof structuredOutput>,
   ) {
     const command = input.text.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
-    if (command?.[1] === "compact" || command?.[1] === "summarize") {
+    const commandName = command?.[1];
+    const compact = commandName === "compact" || commandName === "summarize";
+    const selected =
+      commandName && !compact
+        ? (await commands(this.options.client(), this.options.cwd)).find(
+            (item) => item.name === commandName,
+          )
+        : undefined;
+    if (options?.beforeProviderDispatch) await options.beforeProviderDispatch();
+    if (compact) {
       await this.options.client().session.compact({ sessionID: this.options.id });
       return;
     }
-    const selected = command
-      ? (await commands(this.options.client(), this.options.cwd)).find(
-          (item) => item.name === command[1],
-        )
-      : undefined;
     if (selected && selected.kind !== "skill") {
       await this.options.client().session.command({
         sessionID: this.options.id,
@@ -336,6 +368,11 @@ export class SessionTurns {
     options: SteerActiveTurnOptions,
   ): Promise<SteerResult> {
     if (this.turn?.id !== options.expectedTurnId || this.stopping) return { status: "unavailable" };
+    if (options.beforeProviderDispatch) {
+      await options.beforeProviderDispatch();
+      if (this.turn?.id !== options.expectedTurnId || this.stopping)
+        return { status: "unavailable" };
+    }
     await this.options.client().session.prompt({
       sessionID: this.options.id,
       ...this.promptInput(prompt),

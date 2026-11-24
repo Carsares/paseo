@@ -42,6 +42,7 @@ const ReceiptSchema = z.object({
 type Receipt = z.infer<typeof ReceiptSchema>;
 export type QueuedMessageReceipt = Receipt & { queued: NonNullable<Receipt["queued"]> };
 export interface QueueHandoff {
+  waitForForegroundConfirmation?: boolean;
   begin(): Promise<void>;
   declined(): Promise<void>;
   onProviderOutcome?(outcome: AgentCommandOutcome): Promise<void>;

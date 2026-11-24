@@ -130,6 +130,7 @@ export interface CreateAgentFromMcpInput {
   mode?: string;
   unattended?: boolean;
   promptFailure?: CreateAgentPromptFailureMode;
+  validateInitialPromptDispatch?: (agentId: string) => Promise<void>;
   notifyOnFinish?: boolean;
   parentReporting?: "auto" | "explicit";
   resident?: { profileId?: string; role?: string };
@@ -350,11 +351,13 @@ async function createResolvedAgent(
         );
       });
     };
+    const validateDispatch = input.kind === "mcp" ? input.validateInitialPromptDispatch : undefined;
     const sendResult = await sendInitialPrompt(
       dependencies,
       resolved,
       snapshot,
       !!createMain,
+      validateDispatch,
     ).catch(async (error) => {
       await rejectNotification();
       throw error;
@@ -767,6 +770,7 @@ async function sendInitialPrompt(
   resolved: ResolvedCreateAgent,
   snapshot: ManagedAgent,
   waitForCommandOutcome: boolean,
+  validateDispatch?: (agentId: string) => Promise<void>,
 ): Promise<{ started: boolean; liveSnapshot: ManagedAgent; error?: unknown }> {
   try {
     const prompt = resolved.prompt;
@@ -781,9 +785,12 @@ async function sendInitialPrompt(
         snapshot,
         prompt,
         source: resolved.source,
-        runOptions: resolved.runOptions,
+        runOptions: validateDispatch
+          ? { ...resolved.runOptions, waitForProviderPrompt: true }
+          : resolved.runOptions,
         handoff,
-        waitForCommandOutcome,
+        waitForCommandOutcome: waitForCommandOutcome || !!validateDispatch,
+        validateDispatch: validateDispatch ? () => validateDispatch(snapshot.id) : undefined,
         logger: resolved.promptLogger ?? dependencies.logger,
       });
     const messageId = resolved.runOptions?.clientMessageId;

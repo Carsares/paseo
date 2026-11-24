@@ -115,6 +115,7 @@ import {
 } from "../provider-image-output.js";
 
 import {
+  AgentTurnStartCanceledError,
   getAgentStreamEventTurnId,
   type AgentPermissionAction,
   type AgentCapabilityFlags,
@@ -389,6 +390,7 @@ type ClaudeConversationRewindTarget =
   | { kind: "fork"; messageId: string };
 
 const CLAUDE_CAPABILITIES: AgentCapabilityFlags = {
+  defersPromptHandoff: true,
   supportsStreaming: true,
   supportsSessionPersistence: true,
   supportsSessionListing: true,
@@ -2705,6 +2707,7 @@ class ClaudeAgentSession implements AgentSession {
 
     const slashCommand = this.resolveSlashCommandInvocation(prompt);
     if (slashCommand?.commandName === REWIND_COMMAND_NAME) {
+      await options?.beforeProviderDispatch?.();
       const turnId = this.createTurnId("foreground");
       this.activeForegroundTurnId = turnId;
       this.transitionTurnState("foreground", "rewind command");
@@ -2759,12 +2762,31 @@ class ClaudeAgentSession implements AgentSession {
 
     this.notifySubscribers({ type: "turn_started", provider: "claude" });
 
+    await this.sendForegroundPrompt(
+      sdkMessage,
+      sdkUserMessageId,
+      turnId,
+      options,
+      () => cancelIssued,
+    );
+    return { turnId };
+  }
+
+  private async sendForegroundPrompt(
+    sdkMessage: SDKUserMessage,
+    sdkUserMessageId: string | null,
+    turnId: string,
+    options: AgentRunOptions | undefined,
+    isCanceled: () => boolean,
+  ): Promise<void> {
     try {
       await this.ensureQuery();
-      if (cancelIssued) {
+      await options?.beforeProviderDispatch?.();
+      if (isCanceled()) {
         // Stopped while Claude was still starting up: withdrawn by never sending it.
         if (sdkUserMessageId) this.unstartedMessageUuids.delete(sdkUserMessageId);
-        return { turnId };
+        if (options?.waitForProviderPrompt) throw new AgentTurnStartCanceledError();
+        return;
       }
       if (!this.input) {
         throw new Error("Claude session input stream not initialized");
@@ -2785,12 +2807,15 @@ class ClaudeAgentSession implements AgentSession {
       }, 0);
     } catch (error) {
       if (sdkUserMessageId) this.unstartedMessageUuids.delete(sdkUserMessageId);
-      this.finishForegroundTurn(
-        this.buildTurnFailedEvent(error instanceof Error ? error.message : "Claude stream failed"),
-      );
+      if (!isCanceled()) {
+        this.finishForegroundTurn(
+          this.buildTurnFailedEvent(
+            error instanceof Error ? error.message : "Claude stream failed",
+          ),
+        );
+      }
+      if (options?.waitForProviderPrompt || options?.beforeProviderDispatch) throw error;
     }
-
-    return { turnId };
   }
 
   async steerActiveTurn(
@@ -2808,8 +2833,7 @@ class ClaudeAgentSession implements AgentSession {
       return { status: "unavailable" };
     }
 
-    // Capture both ends of the live SDK stream before creating or delivering the message. There
-    // is deliberately no await below: a finished A cannot make this input point at a later B.
+    // Validate the same captured SDK stream again after the handoff check.
     const query = this.activeForegroundQuery;
     const input = this.activeForegroundInput;
     if (!query || !input || this.query !== query || this.input !== input) {
@@ -2817,6 +2841,7 @@ class ClaudeAgentSession implements AgentSession {
     }
     const message = this.toSdkUserMessage(prompt);
     message.priority = "next";
+    if (options.beforeProviderDispatch) await options.beforeProviderDispatch();
     if (
       (this.activeForegroundTurnId ?? this.autonomousTurn?.id) !== options.expectedTurnId ||
       this.activeForegroundQuery !== query ||

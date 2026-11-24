@@ -155,6 +155,33 @@ describe("AgentStorage", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  test("reloads turn usage and reset counters alongside legacy agent records", async () => {
+    const timestamp = "2026-01-01T00:00:00.000Z";
+    const base = {
+      provider: "codex",
+      cwd: tmpDir,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      labels: {},
+    };
+    const turnState = {
+      lastUsage: { contextWindowUsedTokens: 17_000, contextWindowMaxTokens: 100_000 },
+      lastTurnCompletedAt: timestamp,
+      resetEpoch: 2,
+      consecutiveErrors: 0,
+    };
+    await storage.upsert({ ...base, id: "existing" });
+    await storage.upsert({ ...base, id: "tracked", ...turnState, lastStatus: "closed" });
+
+    const reloaded = new AgentStorage(storagePath, logger);
+    expect(await reloaded.get("tracked")).toMatchObject({ lastStatus: "closed", ...turnState });
+    const legacy = await reloaded.get("existing");
+    expect(legacy?.id).toBe("existing");
+    for (const field of Object.keys(turnState)) {
+      expect(legacy).not.toHaveProperty(field);
+    }
+  });
+
   test("workspace and active queries follow updates, removal, and reload", async () => {
     const base = {
       provider: "codex",

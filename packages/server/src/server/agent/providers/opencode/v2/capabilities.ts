@@ -1,5 +1,6 @@
 import type { AgentCapabilityFlags } from "../../../agent-sdk-types.js";
 export const V2_CAPABILITIES: AgentCapabilityFlags = {
+  defersPromptHandoff: true,
   supportsStreaming: true,
   supportsSessionPersistence: true,
   supportsSessionListing: true,

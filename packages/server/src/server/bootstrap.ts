@@ -138,7 +138,7 @@ export async function fanOutReconciledWorkspaceUpdates(input: {
 }
 
 import { VoiceAssistantWebSocketServer, isDaemonOriginAllowed } from "./websocket-server.js";
-import { MessageReceipts } from "./message-receipts/index.js";
+import { AgentRequestOutcomeUnknownError, MessageReceipts } from "./message-receipts/index.js";
 import {
   enqueueRecoverableAgentMessage,
   isWorkspaceArchivePending,
@@ -162,6 +162,7 @@ import type { RequestedSpeechProviders } from "./speech/speech-types.js";
 import { createSpeechService } from "./speech/speech-runtime.js";
 import { createSpeechSettingsOwner } from "./speech/speech-settings.js";
 import { AgentManager, AgentManagerShuttingDownError } from "./agent/agent-manager.js";
+import { WorkspaceTaskLedgerStore } from "./agent/task-ledger/index.js";
 import { AgentStorage } from "./agent/agent-storage.js";
 import { recoverAgentWorkspaceMove } from "./agent/agent-workspace-move-journal.js";
 import { attachAgentStoragePersistence } from "./persistence-hooks.js";
@@ -251,7 +252,9 @@ import { withTimeout } from "../utils/promise-timeout.js";
 import { isHostnameAllowed, type HostnamesConfig } from "./hostnames.js";
 import {
   createRequireBearerMiddleware,
+  extractHttpBearerToken,
   isAgentMcpRequestAuthorized,
+  matchesAgentMcpCapability,
   type DaemonAuthConfig,
 } from "./auth.js";
 import { deleteLocalCredential, writeLocalCredential } from "./local-credential.js";
@@ -1065,6 +1068,7 @@ export async function createPaseoDaemon(
     if (git) configureGitProcessPolicy(git);
   });
   const initialAgentManagerState = providerSnapshotManager.getAgentManagerProviderState();
+  const taskLedger = new WorkspaceTaskLedgerStore(config.paseoHome);
   const agentManager = new AgentManager({
     serverId,
     pluginLifecycle: pluginRuntime,
@@ -1072,6 +1076,7 @@ export async function createPaseoDaemon(
     clients: initialAgentManagerState.clients,
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,
+    taskLedger,
     workspaceRegistry,
     getAgentProfile: (id) =>
       daemonConfigStore.get().agentProfiles?.find((profile) => profile.id === id),
@@ -1721,35 +1726,65 @@ export async function createPaseoDaemon(
     idleRuntimeCleanup,
   );
 
+  function queuedPromptContext() {
+    if (!wsServer) throw new Error("Daemon is not accepting agent messages");
+    return {
+      agentManager,
+      agentStorage,
+      agentMessages: wsServer.agentMessages,
+      finishSubscriptions,
+      serverId,
+      logger,
+    };
+  }
+  const queueAgentPrompt: NonNullable<PaseoToolHostDependencies["queueAgentPrompt"]> = async (
+    agentId,
+    request,
+  ) => {
+    const context = queuedPromptContext();
+    const message = { ...request, messageId: randomUUID() };
+    let markAdmitted!: () => void;
+    const admitted = new Promise<void>((resolve) => {
+      markAdmitted = resolve;
+    });
+    const settled = messageReceipts.sendQueued({
+      agentId,
+      message,
+      request,
+      enqueue: (handoff) => enqueueRecoverableAgentMessage(context, agentId, message, handoff),
+      retainOnError: retainQueuedAgentMessage,
+      onQueued: markAdmitted,
+    });
+    await Promise.race([admitted, settled]);
+    return message.messageId;
+  };
   const createAgentToolHostDependencies = (
     runtime: PaseoToolRuntimeContext,
   ): PaseoToolHostDependencies => ({
     changeRequestWatches,
     finishSubscriptions: () => finishSubscriptions,
-    queueAgentPrompt: async (agentId, request) => {
-      if (!wsServer) throw new Error("Daemon is not accepting agent messages");
-      const context = {
-        agentManager,
-        agentStorage,
-        agentMessages: wsServer.agentMessages,
-        finishSubscriptions,
-        serverId,
-        logger,
-      };
+    queueAgentPrompt,
+    async queueAgentPromptAndWaitForDispatch(agentId, request, validateDispatch) {
       const message = { ...request, messageId: randomUUID() };
-      let markAdmitted!: () => void;
-      const admitted = new Promise<void>((resolve) => {
-        markAdmitted = resolve;
-      });
-      const settled = messageReceipts.sendQueued({
+      // A deferred retry after restart cannot finish the originating tool call or bind its task.
+      let outcomeUnknown = false;
+      const receipt = await enqueueRecoverableAgentMessage(
+        queuedPromptContext(),
         agentId,
         message,
-        request,
-        enqueue: (handoff) => enqueueRecoverableAgentMessage(context, agentId, message, handoff),
-        retainOnError: retainQueuedAgentMessage,
-        onQueued: markAdmitted,
-      });
-      await Promise.race([admitted, settled]);
+        {
+          waitForForegroundConfirmation: true,
+          begin: async () => {},
+          declined: async () => {},
+          async onProviderOutcome(outcome) {
+            outcomeUnknown = outcome === "unknown";
+          },
+        },
+        false,
+        validateDispatch,
+      );
+      await receipt.dispatched;
+      if (outcomeUnknown) throw new AgentRequestOutcomeUnknownError();
       return message.messageId;
     },
     serverId,
@@ -1817,6 +1852,8 @@ export async function createPaseoDaemon(
     paseoHome: config.paseoHome,
     worktreesRoot: config.worktreesRoot,
     callerAgentId: runtime.callerAgentId,
+    verifiedCallerAgentId: runtime.verifiedCallerAgentId,
+    taskLedger,
     enableVoiceTools: runtime.enableVoiceTools,
     voiceOnly: runtime.voiceOnly,
     resolveSpeakHandler: (agentId) => wsServer?.resolveVoiceSpeakHandler(agentId) ?? null,
@@ -1841,11 +1878,13 @@ export async function createPaseoDaemon(
 
     const createAgentMcpSession = async (
       callerAgentId: string | undefined,
+      verifiedCallerAgentId: string | undefined,
       protocolVersion: string | undefined,
     ) => {
       const agentMcpServer = await createAgentMcpServer(
         createAgentToolHostDependencies({
           callerAgentId,
+          verifiedCallerAgentId,
           paseoToolPolicy: callerAgentId
             ? agentManager.getPaseoToolPolicy(callerAgentId)
             : undefined,
@@ -1892,15 +1931,28 @@ export async function createPaseoDaemon(
         res.status(404).json({ error: "Agent MCP endpoint disabled" });
         return;
       }
+      const rawCaller = req.query.callerAgentId;
+      const callerParam = Array.isArray(rawCaller) ? rawCaller[0] : rawCaller;
+      const callerAgentId = typeof callerParam === "string" ? callerParam : undefined;
+      const authorizationHeader = req.header("authorization");
+      const verifiedCallerAgentId =
+        callerAgentId &&
+        matchesAgentMcpCapability(
+          agentManager.getMcpAuthToken(callerAgentId),
+          extractHttpBearerToken(authorizationHeader),
+        )
+          ? callerAgentId
+          : undefined;
       // This route is exempt from the global daemon-password middleware, so it
       // authenticates here using the injected capability token (or a valid
       // daemon password). Without this, a password-protected daemon would be
       // wide open on its agent control plane.
       if (
+        !verifiedCallerAgentId &&
         !(await isAgentMcpRequestAuthorized({
           password: config.auth?.password,
           capabilityToken: agentMcpAuthToken,
-          authorizationHeader: req.header("authorization"),
+          authorizationHeader,
         }))
       ) {
         res.status(401).json({ error: "Unauthorized" });
@@ -1933,15 +1985,9 @@ export async function createPaseoDaemon(
           });
           return;
         }
-        const callerAgentIdRaw = req.query.callerAgentId;
-        let callerAgentId: string | undefined;
-        if (typeof callerAgentIdRaw === "string") {
-          callerAgentId = callerAgentIdRaw;
-        } else if (Array.isArray(callerAgentIdRaw) && typeof callerAgentIdRaw[0] === "string") {
-          callerAgentId = callerAgentIdRaw[0];
-        }
         const { server, transport } = await createAgentMcpSession(
           callerAgentId,
+          verifiedCallerAgentId,
           req.header("mcp-protocol-version"),
         );
         if (res.destroyed) {

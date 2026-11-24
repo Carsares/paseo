@@ -21,7 +21,7 @@ import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/inde
 import { applyRecordPatch } from "../record-patch.js";
 import type { FinishRegistration } from "./finish-subscriptions/index.js";
 import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { basename, resolve } from "node:path";
 import { stat } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
@@ -121,7 +121,12 @@ import {
   type LegacyFeatureValues,
   type ProviderOptionsPatch,
 } from "./option-controls.js";
-import type { StoredAgentRecord, AgentStorage } from "./agent-storage.js";
+import type { StoredAgentRecord, AgentStorage, StoredAgentTurnState } from "./agent-storage.js";
+import {
+  emptyWorkspaceTaskLedgerPrompt,
+  renderWorkspaceTaskLedger,
+  type WorkspaceTaskLedgerStore,
+} from "./task-ledger/index.js";
 import type { AgentWorkspaceMoveJournal } from "./agent-workspace-move-journal.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
@@ -696,6 +701,7 @@ export interface AgentManagerOptions {
   providerDefinitions?: ProviderEnabledMap;
   idFactory?: () => string;
   registry?: AgentStorage;
+  taskLedger?: WorkspaceTaskLedgerStore;
   workspaceRegistry?: Pick<WorkspaceRegistry, "get">;
   rewindDirectories?: AgentRewindDirectories;
   getAgentProfile?: (id: string) => AgentProfile | undefined;
@@ -801,7 +807,7 @@ interface HandleStreamEventOptions {
   fromHistory?: boolean;
 }
 
-interface ManagedAgentBase {
+interface ManagedAgentBase extends StoredAgentTurnState {
   id: string;
   mainControlSystemPrompt?: string;
   provider: AgentProvider;
@@ -841,7 +847,6 @@ interface ManagedAgentBase {
   lastTurnCompletion?: { event: TurnTerminalEvent; lastMessage: string | null };
   failedConversationLimit?: FailedConversationLimit;
   limitContinuation?: AgentLimitContinuation;
-  lastUsage?: AgentUsage;
   lastError?: string;
   attention: AttentionState;
   foregroundTurnWaiters: Set<ForegroundTurnWaiter>;
@@ -862,6 +867,23 @@ interface ManagedAgentBase {
   labels: Record<string, string>;
   /** Plugin-owned data. Paseo persists and forwards it and never reads a key. */
   metadata: AgentMetadata;
+}
+
+function pickStoredAgentTurnState(
+  source: StoredAgentTurnState | null | undefined,
+): StoredAgentTurnState {
+  if (!source) return {};
+  const { lastUsage, lastTurnCompletedAt, resetEpoch, consecutiveErrors } = source;
+  return { lastUsage, lastTurnCompletedAt, resetEpoch, consecutiveErrors };
+}
+
+function resetAgentTurnState(source: StoredAgentTurnState): StoredAgentTurnState {
+  return {
+    lastUsage: undefined,
+    lastTurnCompletedAt: undefined,
+    resetEpoch: (source.resetEpoch ?? 0) + 1,
+    consecutiveErrors: 0,
+  };
 }
 
 type ManagedAgentWithSession = ManagedAgentBase & {
@@ -1538,6 +1560,11 @@ export class AgentManager {
   private readonly mainControlRoleVersions = new Map<string, number>();
   private readonly promptedMainControlRoleVersions = new Map<string, number>();
   private readonly promptedResidentSpecialists = new WeakMap<AgentSession, string>();
+  private readonly promptedTaskLedger = new WeakMap<
+    AgentSession,
+    { sessionId: string | undefined; text: string }
+  >();
+  private readonly taskLedger?: WorkspaceTaskLedgerStore;
   private readonly resumedProviderSessions = new WeakSet<AgentSession>();
   private readonly inPlaceMainControlSessions = new WeakSet<AgentSession>();
   private readonly launchMainControlRoleVersions = new WeakMap<AgentSessionConfig, number>();
@@ -1590,6 +1617,7 @@ export class AgentManager {
     this.timelineStore = options.timelineStore ?? new InMemoryAgentTimelineStore();
     this.idFactory = options.idFactory ?? (() => randomUUID());
     this.registry = options.registry;
+    this.taskLedger = options.taskLedger;
     this.workspaceRegistry = options.workspaceRegistry;
     if (options.rewindDirectories) this.configureRewindCheckpoints(options.rewindDirectories);
     this.getAgentProfile = options.getAgentProfile;
@@ -1836,8 +1864,9 @@ export class AgentManager {
    * session to authenticate its own MCP connection. Stays in the daemon — never
    * sent to remote clients.
    */
-  getMcpAuthToken(): string | null {
-    return this.mcpAuthToken;
+  getMcpAuthToken(agentId?: string): string | null {
+    if (!agentId || !this.mcpAuthToken) return this.mcpAuthToken;
+    return createHmac("sha256", this.mcpAuthToken).update(agentId).digest("base64url");
   }
 
   setAppendSystemPrompt(prompt: string | null | undefined): void {
@@ -2741,6 +2770,7 @@ export class AgentManager {
             owner: record.owner,
             background: record.background,
             env: record.launchEnv,
+            ...pickStoredAgentTurnState(record),
           },
           prefix,
         );
@@ -2751,7 +2781,9 @@ export class AgentManager {
   private async createAgentInternal(
     config: AgentSessionConfig,
     resolvedAgentId: string,
-    options: CreateAgentOptions & Pick<StoredAgentRecord, "mainControlSystemPrompt">,
+    options: CreateAgentOptions &
+      Pick<StoredAgentRecord, "mainControlSystemPrompt"> &
+      StoredAgentTurnState,
     retainedPrefix?: PersistedTimelinePrefix | null,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
@@ -2836,6 +2868,7 @@ export class AgentManager {
       historyPrimed: true,
       timelineRows: forkPrefix?.rows,
       contextPrefix: forkPrefix,
+      ...pickStoredAgentTurnState(options),
     });
     if (!agent.internal) {
       this.pluginLifecycle?.emit("agent.create.after", {
@@ -3022,6 +3055,7 @@ export class AgentManager {
       workspaceId,
       launchEnv,
       mainControlSystemPrompt,
+      ...pickStoredAgentTurnState(record),
       persistence:
         purpose === "interactive" && session.persistenceUpdatedOnResume
           ? (session.describePersistence() ?? handle)
@@ -3173,7 +3207,6 @@ export class AgentManager {
       existing = this.requireSessionAgent(agentId);
     }
     const preservedHistoryPrimed = existing.historyPrimed;
-    const preservedLastUsage = existing.lastUsage;
     const preservedLastError = existing.lastError;
     const preservedAttention = existing.attention;
     const handle = existing.persistence;
@@ -3265,7 +3298,7 @@ export class AgentManager {
         updatedAt: existing.updatedAt,
         lastUserMessageAt: existing.lastUserMessageAt,
         historyPrimed: !rehydrateFromDisk && preservedHistoryPrimed,
-        lastUsage: preservedLastUsage,
+        ...pickStoredAgentTurnState(closedExisting),
         lastError: preservedLastError,
         attention: preservedAttention,
         restoring: true,
@@ -3923,7 +3956,7 @@ export class AgentManager {
         persistence: record.persistence ?? null,
         historyPrimed: true,
         lastUserMessageAt: record.lastUserMessageAt ? new Date(record.lastUserMessageAt) : null,
-        lastUsage: undefined,
+        ...pickStoredAgentTurnState(record),
         lastError: record.lastError ?? undefined,
         failedConversationLimit: record.failedConversationLimit,
         limitContinuation: record.limitContinuation,
@@ -4073,6 +4106,7 @@ export class AgentManager {
       lastStatus: "closed",
       resumeOnStartup: undefined,
       lastError: null,
+      ...resetAgentTurnState(record),
       failedConversationLimit: undefined,
       requiresAttention: false,
       attentionReason: null,
@@ -4270,7 +4304,7 @@ export class AgentManager {
       const next = this.buildSwitchedAgent(agent, session, storedConfig, providerConfig, client);
       const notice = await this.initializeSwitchedAgent(next, storedConfig);
       if (reset) {
-        next.lastUsage = undefined;
+        Object.assign(next, resetAgentTurnState(agent));
         next.lastTurnCompletion = undefined;
         next.attention = { requiresAttention: false };
         next.historyPrimed = true;
@@ -6720,6 +6754,10 @@ export class AgentManager {
     await this.writeStoredMetadata(agentId, updates);
   }
 
+  withTaskLedgerCaller<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
+    return this.runLifecycleMutation(agentId, operation);
+  }
+
   private async runLifecycleMutation<T>(agentId: string, mutation: () => Promise<T>): Promise<T> {
     // Parent cascade classifies a child inside the same lane used by open-tab
     // label writes, so a received ownership update cannot be overtaken.
@@ -6988,10 +7026,11 @@ export class AgentManager {
     handoff: PendingContextHandoff | undefined,
     addMainControl: boolean,
     residentSpecialists: string,
+    taskLedger: string,
   ): Promise<AgentPromptInput> {
     const envelope = handoff && (await this.prepareContextForSend(agent, handoff));
     const providerPrompt = envelope ? injectContextHandoffIntoPrompt(prompt, envelope) : prompt;
-    let prefix = residentSpecialists;
+    let prefix = residentSpecialists + (taskLedger ? `${taskLedger}\n\n` : "");
     if (addMainControl) {
       const instructions = buildMainControlInstructions(agent.mainControlSystemPrompt);
       prefix = `${MAIN_CONTROL_PROMPT_HEADER}\n${instructions}${mainControlPromptEnd(agent.id)}\n\n${prefix}`;
@@ -7026,6 +7065,37 @@ export class AgentManager {
     return next === previous ? "" : next;
   }
 
+  private async workspaceTaskLedgerPrompt(agent: ActiveManagedAgent, prompt: AgentPromptInput) {
+    const { session, workspaceId } = agent;
+    if (!this.taskLedger || !workspaceId) return undefined;
+    const valid = () =>
+      this.agents.get(agent.id) === agent &&
+      agent.session === session &&
+      agent.workspaceId === workspaceId &&
+      isMainControlAgentLabels(agent.labels) &&
+      !this.pendingSubagentMoveSnapshots.has(agent.id);
+    if (!valid()) return undefined;
+    const command = typeof prompt === "string" ? (parseAgentMessage(prompt)?.text ?? prompt) : "";
+    if (/^\/compact(?:\s|$)/.test(command.trimStart())) return undefined;
+    let rendered: string;
+    try {
+      rendered = renderWorkspaceTaskLedger(await this.taskLedger.list(workspaceId), agent.id);
+    } catch (error) {
+      this.logger.warn(
+        { err: error, workspaceId, agentId: agent.id },
+        "Unable to read task ledger",
+      );
+      return undefined;
+    }
+    if (!valid()) return undefined;
+    const previous = this.promptedTaskLedger.get(session);
+    if (!rendered && !previous && !this.resumedProviderSessions.has(session)) return undefined;
+    const text = rendered || emptyWorkspaceTaskLedgerPrompt(agent.id);
+    const sessionId = session.describePersistence()?.sessionId ?? agent.persistence?.sessionId;
+    if (previous && previous.sessionId === sessionId && previous.text === text) return undefined;
+    return { sessionId, text, valid };
+  }
+
   private needsMainControlPrompt(agent: ActiveManagedAgent, roleVersion: number): boolean {
     return (
       isMainControlAgentLabels(agent.labels) &&
@@ -7058,20 +7128,26 @@ export class AgentManager {
       const handoff = this.contextHandoffs.get(agentId);
       const roleVersion = this.mainControlRoleVersions.get(agentId) ?? 0;
       const addedMainControl = this.needsMainControlPrompt(agent, roleVersion);
-      const specialists = isMainControlAgentLabels(agent.labels)
-        ? await this.residentSpecialistsPrompt(agent)
-        : "";
+      const isMain = isMainControlAgentLabels(agent.labels);
+      const specialists = isMain ? await this.residentSpecialistsPrompt(agent) : "";
+      const ledger = await this.workspaceTaskLedgerPrompt(agent, prompt);
+      const session = agent.session;
       const providerPrompt =
-        handoff || addedMainControl || specialists
+        handoff || addedMainControl || specialists || ledger
           ? await this.prepareProviderTurnPrompt(
               agent,
               prompt,
               handoff,
               addedMainControl,
               specialists,
+              ledger?.text ?? "",
             )
           : prompt;
-      const result = await this.startAdmittedProviderTurn(params, providerPrompt);
+      const result = await this.startAdmittedProviderTurn(params, providerPrompt, ledger?.valid);
+      if (ledger) {
+        const sessionId = ledger.sessionId ?? session.describePersistence()?.sessionId;
+        this.promptedTaskLedger.set(session, { sessionId, text: ledger.text });
+      }
       if (specialists) this.promptedResidentSpecialists.set(agent.session, specialists);
       if (addedMainControl) this.promptedMainControlRoleVersions.set(agentId, roleVersion);
       if (handoff) await this.consumeContextHandoff(agentId, handoff);
@@ -7162,10 +7238,12 @@ export class AgentManager {
   private startAdmittedProviderTurn(
     params: Parameters<AgentManager["startPendingForegroundTurn"]>[0],
     providerPrompt: AgentPromptInput,
+    ledgerIsCurrent?: () => boolean,
   ) {
     this.assertPendingTurnStart(params.agentId, params.pendingRun);
     const capture = this.prepareRewindTurnCapture(params);
-    const dispatch = () => this.dispatchAdmittedProviderTurn(params, providerPrompt);
+    const dispatch = () =>
+      this.dispatchAdmittedProviderTurn(params, providerPrompt, ledgerIsCurrent);
     // Skipping checkpoint collection must not defer provider dispatch.
     return capture ? capture.then(dispatch) : dispatch();
   }
@@ -7173,15 +7251,28 @@ export class AgentManager {
   private dispatchAdmittedProviderTurn(
     params: Parameters<AgentManager["startPendingForegroundTurn"]>[0],
     providerPrompt: AgentPromptInput,
+    ledgerIsCurrent?: () => boolean,
   ) {
     const { agent, agentId, pendingRun, options, promptStart } = params;
     assertNoFileRewind(this, agent.cwd);
     const validate = () => {
       this.assertPendingTurnStart(agentId, pendingRun);
+      if (ledgerIsCurrent?.() === false) {
+        throw new AgentTurnStartCanceledError();
+      }
     };
     validate();
     const start = (runOptions = options) => agent.session.startTurn(providerPrompt, runOptions);
-    if (!promptStart?.beforeHandoff) return start();
+    if (!promptStart?.beforeHandoff) {
+      if (!ledgerIsCurrent || !agent.session.capabilities.defersPromptHandoff) return start();
+      return start({
+        ...options,
+        async beforeProviderDispatch() {
+          await options?.beforeProviderDispatch?.();
+          validate();
+        },
+      });
+    }
     this.assertAcceptingAgentRuns();
     const validateHandoff = () => {
       this.assertAcceptingAgentRuns();
@@ -9314,6 +9405,9 @@ export class AgentManager {
       persistence?: AgentPersistenceHandle;
       historyPrimed?: boolean;
       lastUsage?: AgentUsage;
+      lastTurnCompletedAt?: string;
+      resetEpoch?: number;
+      consecutiveErrors?: number;
       lastError?: string;
       failedConversationLimit?: FailedConversationLimit;
       limitContinuation?: AgentLimitContinuation;
@@ -9539,6 +9633,9 @@ export class AgentManager {
           metadata?: AgentMetadata;
           historyPrimed?: boolean;
           lastUsage?: AgentUsage;
+          lastTurnCompletedAt?: string;
+          resetEpoch?: number;
+          consecutiveErrors?: number;
           lastError?: string;
           failedConversationLimit?: FailedConversationLimit;
           limitContinuation?: AgentLimitContinuation;
@@ -9597,7 +9694,7 @@ export class AgentManager {
         options?.historyPrimed ??
         (durableTimelineHasRows && !this.unprimedRetainedTimelines.has(resolvedAgentId)),
       lastUserMessageAt: options?.lastUserMessageAt ?? null,
-      lastUsage: options?.lastUsage,
+      ...pickStoredAgentTurnState(options),
       lastError: options?.lastError,
       ...pickLimitState(options),
       attention: resolveInitialAttention(options?.attention),
@@ -10305,6 +10402,7 @@ export class AgentManager {
 
     if (!options?.fromHistory) {
       if (isTurnTerminalEvent(event)) {
+        this.updateTurnReuseState(agent, event, terminalDisposition);
         const rewind = this.settleTerminalRewindTurn(
           agent,
           event,
@@ -10337,6 +10435,20 @@ export class AgentManager {
     } else if (disposition !== "stale" && !agent.activeForegroundTurnId) {
       // Publish autonomous readiness only after the tracked run has settled.
       this.emitState(agent);
+    }
+  }
+
+  private updateTurnReuseState(
+    agent: ActiveManagedAgent,
+    event: TurnTerminalEvent,
+    disposition: ActiveTurnTerminalDisposition,
+  ): void {
+    if (disposition === "stale") return;
+    if (event.type === "turn_completed") {
+      agent.lastTurnCompletedAt = agent.updatedAt.toISOString();
+      agent.consecutiveErrors = 0;
+    } else if (event.type === "turn_failed") {
+      agent.consecutiveErrors = (agent.consecutiveErrors ?? 0) + 1;
     }
   }
 
@@ -11484,7 +11596,7 @@ export class AgentManager {
           this.paseoToolsEnabled && isPaseoToolPolicyEnabled(paseoToolPolicy)
             ? this.mcpBaseUrl
             : null,
-        mcpAuthToken: this.mcpAuthToken,
+        mcpAuthToken: this.getMcpAuthToken(agentId),
         preapprovedTools: orchestrationPreapprovals(paseoToolPolicy),
       }),
       hierarchyPrompt,
@@ -11581,6 +11693,7 @@ export class AgentManager {
       try {
         const catalog = await this.paseoToolCatalogFactory({
           callerAgentId: agentId,
+          verifiedCallerAgentId: agentId,
           paseoToolPolicy,
         });
         if (useNativeTools) {

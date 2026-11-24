@@ -82,6 +82,8 @@ import {
   EXPLICIT_PARENT_REPORTING,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
   parentAddressLabels,
 } from "@getpaseo/protocol/agent-labels";
 import { PASEO_TOOL_NAMES } from "@getpaseo/protocol/paseo-tool-presentation/index";
@@ -90,6 +92,7 @@ import type { DaemonConfigStore } from "../daemon-config-store.js";
 import type { BrowserToolsBroker, BrowserToolsExecuteInput } from "../browser-tools/broker.js";
 import type { BrowserToolsResponsePayload } from "../browser-tools/errors.js";
 import { createWorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
+import { applyHierarchyPaseoToolPolicy } from "./hierarchy-policy.js";
 
 const AGENT_WORKSPACE_CREATION_ERROR =
   "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.";
@@ -273,6 +276,9 @@ function buildAgentManagerSpies() {
     archiveAgent: vi.fn().mockResolvedValue({ archivedAt: new Date().toISOString() }),
     notifyAgentState: vi.fn(),
     getAgent: vi.fn(),
+    withTaskLedgerCaller: vi.fn(async (_id: string, operation: () => Promise<unknown>) =>
+      operation(),
+    ),
     getAgentBackgroundWorkSummary: vi.fn().mockReturnValue(undefined),
     listAgents: vi.fn().mockReturnValue([]),
     getTimeline: vi.fn().mockReturnValue([]),
@@ -3843,6 +3849,252 @@ class HeldTurnAgentClient implements AgentClient {
   }
 }
 
+describe("workspace task ledger MCP tools", () => {
+  const logger = createTestLogger();
+  let paseoHome: string | undefined;
+  afterEach(async () => {
+    if (paseoHome) await removeTempDir(paseoHome);
+    paseoHome = undefined;
+  });
+
+  async function setup() {
+    paseoHome = await mkdtemp(join(tmpdir(), "mcp-task-ledger-"));
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const main = createManagedAgent({
+      id: "main",
+      workspaceId: "wks_parent",
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
+    const ordinary = createManagedAgent({ id: "ordinary", workspaceId: "wks_parent" });
+    const labels = parentAddressLabels({ agentId: main.id, serverId: "local" });
+    const child = createManagedAgent({ id: "child", workspaceId: "wks_parent", labels });
+    const other = createManagedAgent({ id: "other", workspaceId: "wks_other", labels });
+    spies.agentManager.getAgent.mockImplementation((id) =>
+      [main, ordinary, child, other].find((agent) => agent.id === id),
+    );
+    const queueAgentPrompt = vi.fn(
+      async (_id: string, _request: unknown, validateDispatch?: () => Promise<void>) => {
+        await validateDispatch?.();
+        return "msg-task";
+      },
+    );
+    const hosts = vi.fn();
+    const makeServer = (caller?: ManagedAgent, verified = true) =>
+      createAgentMcpServer({
+        agentManager,
+        agentStorage,
+        providerSnapshotManager: createOpenCodeManager().manager,
+        paseoHome,
+        callerAgentId: caller?.id,
+        verifiedCallerAgentId: verified ? caller?.id : undefined,
+        paseoToolPolicy: applyHierarchyPaseoToolPolicy(undefined, caller?.labels, 0),
+        queueAgentPrompt,
+        queueAgentPromptAndWaitForDispatch: queueAgentPrompt,
+        serverId: "local",
+        hosts,
+        logger,
+      });
+    const server = await makeServer(main);
+    const invoke = (name: string, input: Record<string, unknown>) =>
+      invokeToolWithParsedInput(registeredTool(server, name), input, false);
+    return { main, ordinary, child, other, spies, queueAgentPrompt, hosts, makeServer, invoke };
+  }
+
+  it("exposes the ledger only to Main Control and checks its current role and workspace", async () => {
+    const { main, ordinary, spies, makeServer, invoke } = await setup();
+    const patch = { taskId: "review", title: "Review changes", status: "verifying" };
+    await expect(invoke("upsert_workspace_task", patch)).resolves.toMatchObject({
+      structuredContent: { workspaceId: "wks_parent", task: patch },
+    });
+    await expect(invoke("list_workspace_tasks", {})).resolves.toMatchObject({
+      structuredContent: { workspaceId: "wks_parent", tasks: [patch] },
+    });
+    for (const name of ["list_workspace_tasks", "upsert_workspace_task"]) {
+      expect(lookupTool(await makeServer(ordinary), name)).toBeUndefined();
+      expect(lookupTool(await makeServer(), name)).toBeUndefined();
+      expect(lookupTool(await makeServer(main, false), name)).toBeUndefined();
+    }
+    await expect(invoke("list_workspace_tasks", { workspaceId: "wks_other" })).rejects.toThrow(
+      AGENT_WORKSPACE_CREATION_ERROR,
+    );
+    await expect(
+      invoke("upsert_workspace_task", { ...patch, workspaceId: "wks_other" }),
+    ).rejects.toThrow(AGENT_WORKSPACE_CREATION_ERROR);
+    spies.agentManager.getAgent.mockImplementation((id) => (id === main.id ? ordinary : null));
+    await expect(invoke("list_workspace_tasks", {})).rejects.toThrow();
+  });
+
+  it("binds the actual child on create and preserves task fields on a confirmed follow-up", async () => {
+    const { child, spies, queueAgentPrompt, invoke } = await setup();
+    spies.agentManager.createAgent.mockResolvedValue(child);
+    const patch = { taskId: "review", title: "Review changes", status: "in_progress" };
+    await expect(
+      invoke("create_agent", {
+        title: "Reviewer",
+        provider: "codex/gpt-5.4",
+        initialPrompt: "Review the change",
+        notifyOnFinish: false,
+        taskBinding: patch,
+      }),
+    ).resolves.toMatchObject({ structuredContent: { agentId: child.id, taskId: patch.taskId } });
+    await expect(
+      invoke("send_agent_prompt", {
+        agentId: child.id,
+        prompt: "Check error handling too",
+        taskBinding: { taskId: patch.taskId, handoffSummary: "Review error handling" },
+      }),
+    ).resolves.toMatchObject({
+      structuredContent: { taskId: patch.taskId, deliveryStatus: "dispatched" },
+    });
+    expect(queueAgentPrompt).toHaveBeenCalledWith(
+      child.id,
+      expect.objectContaining({ unarchive: false }),
+      expect.any(Function),
+    );
+    await expect(invoke("list_workspace_tasks", {})).resolves.toMatchObject({
+      structuredContent: {
+        tasks: [
+          {
+            ...patch,
+            participants: [{ agentId: child.id }],
+            handoffSummary: "Review error handling",
+          },
+        ],
+      },
+    });
+  });
+
+  it("rejects foreign, remote, archived, and ordinary bindings before queueing", async () => {
+    const { child, other, ordinary, spies, hosts, queueAgentPrompt, makeServer, invoke } =
+      await setup();
+    const input = {
+      agentId: child.id,
+      prompt: "Run the task",
+      taskBinding: { taskId: "review", title: "Review changes" },
+    };
+    await expect(
+      invoke("send_agent_prompt", { ...input, agentId: other.id }),
+    ).resolves.toMatchObject({
+      structuredContent: { error: expect.stringContaining("current workspace") },
+    });
+    await expect(invoke("send_agent_prompt", { ...input, serverId: "remote" })).rejects.toThrow(
+      "only available on the caller's host",
+    );
+    const ordinarySend = registeredTool(await makeServer(ordinary), "send_agent_prompt");
+    await expect(invokeToolWithParsedInput(ordinarySend, input, false)).resolves.toMatchObject({
+      structuredContent: { error: expect.stringContaining("Only Main Control") },
+    });
+    spies.agentStorage.get.mockImplementation(async (id) =>
+      id === child.id ? { ...child, archivedAt: "2026-11-24T00:00:00Z" } : null,
+    );
+    await expect(invoke("send_agent_prompt", input)).rejects.toThrow("is archived");
+    expect(queueAgentPrompt).not.toHaveBeenCalled();
+    expect(hosts).not.toHaveBeenCalled();
+    const { taskBinding: _, ...ordinaryInput } = input;
+    await expect(
+      invokeToolWithParsedInput(ordinarySend, ordinaryInput, false),
+    ).resolves.toMatchObject({
+      structuredContent: { deliveryStatus: "queued" },
+    });
+    expect(queueAgentPrompt).toHaveBeenCalledWith(
+      child.id,
+      expect.objectContaining({ unarchive: true }),
+    );
+  });
+
+  it("requires a verified direct-parent route for remote Main Control prompts", async () => {
+    const { main, child, hosts, invoke } = await setup();
+    const sendMessage = vi.fn();
+    const fetchAgent = vi.fn().mockResolvedValue({ agent: child });
+    const use = vi.fn(
+      async (_serverId, action, _signal, parentId?: string, allowLegacy?: boolean) => {
+        if (parentId && !allowLegacy) throw new Error("Direct-parent authority unavailable");
+        return action({ fetchAgent, sendMessage });
+      },
+    );
+    hosts.mockReturnValue({ use });
+    const input = {
+      agentId: child.id,
+      serverId: "remote",
+      prompt: "Review",
+      notifyOnFinish: false,
+    };
+    fetchAgent.mockResolvedValueOnce({ agent: { ...child, archivedAt: "2026-11-24T00:00:00Z" } });
+    await expect(invoke("send_agent_prompt", input)).rejects.toThrow("is archived");
+    expect(use).toHaveBeenCalledTimes(1);
+    await expect(invoke("send_agent_prompt", input)).resolves.toMatchObject({
+      structuredContent: { error: "Direct-parent authority unavailable" },
+    });
+    expect(use).toHaveBeenLastCalledWith(
+      "remote",
+      expect.any(Function),
+      undefined,
+      main.id,
+      undefined,
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("rejects a bound send if Main Control moves while waiting for dispatch", async () => {
+    const { main, child, queueAgentPrompt, invoke } = await setup();
+    queueAgentPrompt.mockImplementationOnce(async (_id, _request, validateDispatch) => {
+      main.workspaceId = "wks_other";
+      await validateDispatch?.();
+      throw new Error("Expected workspace validation to reject");
+    });
+    await expect(
+      invoke("send_agent_prompt", {
+        agentId: child.id,
+        prompt: "Review",
+        taskBinding: { taskId: "review", title: "Review changes" },
+      }),
+    ).resolves.toMatchObject({
+      structuredContent: { error: AGENT_WORKSPACE_CREATION_ERROR },
+    });
+    main.workspaceId = "wks_parent";
+    await expect(invoke("list_workspace_tasks", {})).resolves.toMatchObject({
+      structuredContent: { tasks: [] },
+    });
+  });
+
+  it("leaves the ledger unchanged after send or create fails and validates failed completion before sending", async () => {
+    const { child, spies, queueAgentPrompt, invoke } = await setup();
+    const taskBinding = { taskId: "review", title: "Review changes" };
+    queueAgentPrompt.mockRejectedValueOnce(new Error("Queue unavailable"));
+    await expect(
+      invoke("send_agent_prompt", { agentId: child.id, prompt: "Review", taskBinding }),
+    ).resolves.toMatchObject({ structuredContent: { error: "Queue unavailable" } });
+    spies.agentManager.createAgent.mockRejectedValueOnce(new Error("Provider unavailable"));
+    await expect(
+      invoke("create_agent", {
+        title: "Reviewer",
+        provider: "codex/gpt-5.4",
+        initialPrompt: "Review",
+        taskBinding,
+      }),
+    ).resolves.toMatchObject({ structuredContent: { error: "Provider unavailable" } });
+    await expect(invoke("list_workspace_tasks", {})).resolves.toMatchObject({
+      structuredContent: { tasks: [] },
+    });
+    await invoke("upsert_workspace_task", {
+      ...taskBinding,
+      closure: { verification: { state: "failed" } },
+    });
+    const completion = { taskId: taskBinding.taskId, status: "completed" };
+    await expect(invoke("upsert_workspace_task", completion)).rejects.toThrow(
+      "failed verification cannot be completed",
+    );
+    await expect(
+      invoke("send_agent_prompt", { agentId: child.id, prompt: "Close", taskBinding: completion }),
+    ).resolves.toMatchObject({
+      structuredContent: {
+        error: expect.stringContaining("failed verification cannot be completed"),
+      },
+    });
+    expect(queueAgentPrompt).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("send_agent_prompt MCP tool", () => {
   it.each([
     { agentScoped: true, behavior: undefined, available: true },
@@ -6427,6 +6679,9 @@ describe("agent snapshot MCP serialization", () => {
     const record = createStoredRecord({
       id: "archived-agent",
       archivedAt: "2026-04-12T00:00:00.000Z",
+      lastTurnCompletedAt: "2026-04-11T00:00:00.000Z",
+      resetEpoch: 2,
+      consecutiveErrors: 1,
     });
     spies.agentManager.getAgent.mockReturnValue(null);
     spies.agentStorage.get.mockResolvedValue(record);
@@ -6442,6 +6697,9 @@ describe("agent snapshot MCP serialization", () => {
 
     expect(response.structuredContent).toEqual({
       status: "closed",
+      lastTurnCompletedAt: "2026-04-11T00:00:00.000Z",
+      resetEpoch: 2,
+      consecutiveErrors: 1,
       snapshot: expect.objectContaining({
         id: "archived-agent",
         archivedAt: "2026-04-12T00:00:00.000Z",
@@ -6458,6 +6716,9 @@ describe("agent snapshot MCP serialization", () => {
     spies.agentManager.getAgent.mockReturnValue(
       createManagedAgent({
         id: "full-detail-agent",
+        lastTurnCompletedAt: "2026-04-11T00:00:00.000Z",
+        resetEpoch: 3,
+        consecutiveErrors: 2,
         provider: "codex",
         cwd: "/tmp/full-detail",
         config: { model: "gpt-5.4", thinkingOptionId: "high" },
@@ -6512,7 +6773,12 @@ describe("agent snapshot MCP serialization", () => {
         `get_agent_status response failed AgentSnapshotPayloadSchema: ${JSON.stringify(parsed.error.issues, null, 2)}`,
       );
     }
-    expect(response.structuredContent.status).toBe("idle");
+    expect(response.structuredContent).toMatchObject({
+      status: "idle",
+      lastTurnCompletedAt: "2026-04-11T00:00:00.000Z",
+      resetEpoch: 3,
+      consecutiveErrors: 2,
+    });
     expect(snapshot).toEqual(
       expect.objectContaining({
         id: "full-detail-agent",

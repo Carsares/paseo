@@ -70,6 +70,8 @@ const mainControlTools = [
   "summarize_workspace_agents",
   "archive_agent",
   "reset_agent_session",
+  "upsert_workspace_task",
+  "list_workspace_tasks",
 ];
 
 function testWorkspaceRegistry(cwd: string) {
@@ -101,6 +103,29 @@ it("strips resident specialist instructions from replay with or without the Main
   );
   expect(stripMainControlPromptHeader(prompt + "\n" + specialistPrefix, main.id)).toBe(
     prompt + "\n" + specialistPrefix,
+  );
+});
+
+it("strips leading task ledger snapshots from replay alongside other injected headers", () => {
+  const ledger =
+    "[Workspace Task Ledger]\nT1 in_progress Fix tests\n[/Workspace Task Ledger: main]\n\n";
+  const specialists =
+    "[Workspace Resident Specialists]\nRole: Build\n[/Workspace Resident Specialists]\n\n";
+  const mainInstructions =
+    "[Workspace Main Control Instructions]\nDelegate.\n[/Workspace Main Control Instructions: main]\n\n";
+  const prompt = "Run the checks.";
+  const userText = ledger.replace(": main]", "]") + prompt;
+  expect(stripMainControlPromptHeader(userText, main.id)).toBe(userText);
+  expect(stripMainControlPromptHeader(ledger + prompt, "another-agent")).toBe(ledger + prompt);
+  expect(stripMainControlPromptHeader(ledger + prompt, main.id)).toBe(prompt);
+  expect(
+    stripMainControlPromptHeader(mainInstructions + specialists + ledger + prompt, main.id),
+  ).toBe(prompt);
+  expect(stripMainControlPromptHeader(prompt + "\n" + ledger, main.id)).toBe(
+    prompt + "\n" + ledger,
+  );
+  expect(stripMainControlPromptHeader("[Workspace Task Ledger]\nIncomplete", main.id)).toBe(
+    "[Workspace Task Ledger]\nIncomplete",
   );
 });
 
@@ -1626,6 +1651,8 @@ it("enforces single-hop MCP orchestration, self mode changes, and refreshes poli
         callerAgentId,
         workspaceRegistry: testWorkspaceRegistry(cwd),
         paseoToolPolicy: filterTools ? manager.getPaseoToolPolicy(callerAgentId) : undefined,
+        verifiedCallerAgentId: callerAgentId,
+        paseoHome: cwd,
         logger,
       });
 

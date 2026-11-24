@@ -49,6 +49,7 @@ export interface PaseoToolCatalog {
 
 export interface PaseoToolRuntimeContext {
   callerAgentId?: string;
+  verifiedCallerAgentId?: string;
   paseoToolPolicy?: PaseoToolPolicy;
   enableVoiceTools?: boolean;
   voiceOnly?: boolean;

@@ -739,10 +739,11 @@ export async function enqueueRecoverableAgentMessage(
   message: RecoverableAgentMessage,
   handoff: QueueHandoff,
   restoring = false,
+  validateExtraDispatch?: () => Promise<void>,
 ) {
   const parent = message.directParent;
   const validateDispatch =
-    parent || restoring
+    parent || restoring || validateExtraDispatch
       ? async () => {
           if (parent)
             await validateDirectParentPrompt(
@@ -755,6 +756,7 @@ export async function enqueueRecoverableAgentMessage(
             const stored = await context.agentStorage.get(agentId);
             if (!stored || stored.archivedAt) throw new Error("Queued recipient is unavailable");
           }
+          await validateExtraDispatch?.();
         }
       : undefined;
   await validateDispatch?.();

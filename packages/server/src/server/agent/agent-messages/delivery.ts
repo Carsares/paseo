@@ -232,6 +232,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     return {
       handoff: messages.some((message) => message.handoff)
         ? {
+            waitForForegroundConfirmation: messages.some(
+              (message) => message.handoff?.waitForForegroundConfirmation,
+            ),
             begin: checkMessages(messages, (message) => message.handoff?.begin()),
             async declined() {
               for (const message of messages) await message.handoff?.declined();

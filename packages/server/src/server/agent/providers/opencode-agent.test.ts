@@ -2343,58 +2343,66 @@ describe("OpenCode adapter startTurn error handling", () => {
     ]);
   });
 
-  test("emits turn_failed when client.session.promptAsync throws synchronously", async () => {
-    // Yield the server-connected event, then park forever. The adapter waits
-    // for that first event before sending the prompt.
-    const neverYieldingStream: AsyncIterable<OpenCodeEvent> = {
-      [Symbol.asyncIterator]: () => {
-        let emittedConnected = false;
-        return {
-          next: () => {
-            if (!emittedConnected) {
-              emittedConnected = true;
-              return Promise.resolve({
-                done: false,
-                value: { type: "server.connected", properties: {} } as OpenCodeEvent,
-              });
-            }
-            return new Promise(() => {});
-          },
-        };
-      },
-    };
+  test.each([false, true])(
+    "reports a synchronous prompt rejection with provider confirmation set to %s",
+    async (waitForProviderPrompt) => {
+      // Yield the server-connected event, then park forever. The adapter waits
+      // for that first event before sending the prompt.
+      const neverYieldingStream: AsyncIterable<OpenCodeEvent> = {
+        [Symbol.asyncIterator]: () => {
+          let emittedConnected = false;
+          return {
+            next: () => {
+              if (!emittedConnected) {
+                emittedConnected = true;
+                return Promise.resolve({
+                  done: false,
+                  value: { type: "server.connected", properties: {} } as OpenCodeEvent,
+                });
+              }
+              return new Promise(() => {});
+            },
+          };
+        },
+      };
 
-    const fakeClient = {
-      global: {
-        event: vi.fn().mockResolvedValue({ stream: neverYieldingStream }),
-      },
-      session: {
-        promptAsync: vi.fn(() => {
-          throw new Error("boom: synchronous throw");
-        }),
-      },
-    } as never;
+      const fakeClient = {
+        global: {
+          event: vi.fn().mockResolvedValue({ stream: neverYieldingStream }),
+        },
+        session: {
+          promptAsync: vi.fn(() => {
+            throw new Error("boom: synchronous throw");
+          }),
+        },
+      } as never;
 
-    const session = new __openCodeInternals.OpenCodeAgentSession(
-      { provider: "opencode", cwd: "/tmp/test" },
-      fakeClient,
-      "ses_unit_test",
-      createTestLogger(),
-      {},
-    );
+      const session = new __openCodeInternals.OpenCodeAgentSession(
+        { provider: "opencode", cwd: "/tmp/test" },
+        fakeClient,
+        "ses_unit_test",
+        createTestLogger(),
+        {},
+      );
 
-    const events: AgentStreamEvent[] = [];
-    session.subscribe((event) => events.push(event));
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
 
-    await session.startTurn("hello");
+      const dispatch = session.startTurn("hello", { waitForProviderPrompt });
+      if (waitForProviderPrompt) {
+        await expect(dispatch).rejects.toThrow("boom: synchronous throw");
+      } else {
+        await expect(dispatch).resolves.toHaveProperty("turnId");
+      }
 
-    const failed = events.find((event) => event.type === "turn_failed");
-    expect(failed).toBeDefined();
-    expect(failed?.type).toBe("turn_failed");
-    if (failed?.type === "turn_failed") {
-      expect(failed.error).toContain("boom: synchronous throw");
-    }
-  });
+      const failed = events.find((event) => event.type === "turn_failed");
+      expect(failed).toBeDefined();
+      expect(failed?.type).toBe("turn_failed");
+      if (failed?.type === "turn_failed") {
+        expect(failed.error).toContain("boom: synchronous throw");
+      }
+    },
+  );
 
   test("uses OpenCode native steer admission and reconciles the user echo", async () => {
     const { parent: session, openCode } = await createParentSession("ses_native_steer");
