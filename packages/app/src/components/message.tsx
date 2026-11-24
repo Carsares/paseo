@@ -19,12 +19,7 @@ import {
 } from "@/components/attachment-pill";
 import { MarkdownRenderer } from "@/components/markdown/renderer";
 import { useRetainedPanelActive } from "@/components/retained-panel";
-import {
-  isRewindableMessage,
-  RewindMenu,
-  useRewindAgentMutation,
-  type RewindMode,
-} from "@/components/rewind";
+import { isRewindableMessage, MessageRewindMenu } from "@/components/rewind";
 import { TaskListRow } from "@/components/task-list-row";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { useIsCompactFormFactor } from "@/constants/layout";
@@ -509,17 +504,10 @@ export const UserMessage = memo(function UserMessage({
     () => formatMessageTimestamp(new Date(timestamp)),
     [timestamp],
   );
-  const rewindMutation = useRewindAgentMutation({ serverId, agentId, client, messageId });
 
   const handlePointerEnter = useCallback(() => setIsHovered(true), []);
   const handlePointerLeave = useCallback(() => setIsHovered(false), []);
   const getMessageContent = useCallback(() => message, [message]);
-  const handleRewind = useCallback(
-    (input: { mode: RewindMode; rewoundText: string }) => {
-      return rewindMutation.rewindAgent(input);
-    },
-    [rewindMutation],
-  );
 
   const containerStyle = useMemo(
     () => [
@@ -620,12 +608,14 @@ export const UserMessage = memo(function UserMessage({
             <Text style={userMessageStylesheet.timestampText} testID="user-message-timestamp">
               {formattedTimestamp}
             </Text>
-            {capabilities && isRewindableMessage(messageId, message) ? (
-              <RewindMenu
+            {capabilities && messageId && isRewindableMessage(messageId, message) ? (
+              <MessageRewindMenu
                 capabilities={capabilities}
-                isPending={rewindMutation.isPending}
+                serverId={serverId}
+                agentId={agentId}
+                messageId={messageId}
+                client={client}
                 rewoundText={message}
-                onRewind={handleRewind}
               />
             ) : null}
             <TurnCopyButton

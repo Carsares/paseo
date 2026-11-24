@@ -2,10 +2,13 @@ import { useCallback } from "react";
 import { create } from "zustand";
 import {
   resolveWorkingDiffComparisonFromState,
+  selectCheckpointDiffInState,
   selectWorkingDiffComparisonInState,
+  type CheckpointDiffSelection,
   type WorkingDiffCheckoutIdentity,
   type WorkingDiffComparison,
   type WorkingDiffComparisonState,
+  workingDiffComparisonKey,
 } from "./state";
 
 interface WorkingDiffComparisonStore extends WorkingDiffComparisonState {
@@ -14,12 +17,27 @@ interface WorkingDiffComparisonStore extends WorkingDiffComparisonState {
       comparison: WorkingDiffComparison;
     },
   ) => void;
+  selectCheckpoint: (
+    input: WorkingDiffCheckoutIdentity & { selection: CheckpointDiffSelection },
+  ) => void;
 }
 
 const useWorkingDiffComparisonStore = create<WorkingDiffComparisonStore>((set) => ({
   overrides: {},
   select: (input) => set((state) => selectWorkingDiffComparisonInState(state, input)),
+  selectCheckpoint: (input) => set((state) => selectCheckpointDiffInState(state, input)),
 }));
+
+export function useCheckpointDiffSelection(input: WorkingDiffCheckoutIdentity) {
+  const key = workingDiffComparisonKey(input);
+  return useWorkingDiffComparisonStore((state) => state.overrides[key]?.checkpoint);
+}
+
+export function selectCheckpointDiff(
+  input: WorkingDiffCheckoutIdentity & { selection: CheckpointDiffSelection },
+): void {
+  useWorkingDiffComparisonStore.getState().selectCheckpoint(input);
+}
 
 export function useWorkingDiffComparison(input: WorkingDiffCheckoutIdentity): {
   comparison: WorkingDiffComparison;

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   resolveWorkingDiffComparisonFromState,
+  selectCheckpointDiffInState,
   selectWorkingDiffComparisonInState,
   type WorkingDiffComparisonState,
   workingDiffComparisonKey,
@@ -43,4 +44,37 @@ describe("working diff comparison", () => {
       ).toBe("all");
     },
   );
+
+  it("keeps the live comparison when opening, switching and closing historical ranges", () => {
+    const live = selectWorkingDiffComparisonInState(emptyState(), {
+      ...checkout,
+      comparison: "uncommitted",
+    });
+    const target = { agentId: "agent-1", messageId: "turn-1" };
+    const turn = selectCheckpointDiffInState(live, {
+      ...checkout,
+      selection: { target, range: "turn" },
+    });
+    const baseline = selectCheckpointDiffInState(turn, {
+      ...checkout,
+      selection: { target, range: "baseline" },
+    });
+    const backToLive = selectCheckpointDiffInState(baseline, {
+      ...checkout,
+      selection: { target, range: null },
+    });
+
+    expect(baseline.overrides[workingDiffComparisonKey(checkout)]?.checkpoint).toEqual({
+      target,
+      range: "baseline",
+    });
+    expect(backToLive.overrides[workingDiffComparisonKey(checkout)]?.checkpoint).toEqual({
+      target,
+      range: null,
+    });
+    expect(resolveWorkingDiffComparisonFromState(backToLive, checkout)).toBe("uncommitted");
+    expect(
+      baseline.overrides[workingDiffComparisonKey({ ...checkout, workspaceId: "other" })],
+    ).toBeUndefined();
+  });
 });

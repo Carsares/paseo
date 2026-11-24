@@ -1,8 +1,9 @@
 import { memo, useCallback, useMemo, useState, type ReactElement } from "react";
 import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
-import { FileText, Layers, MessageSquare, Undo2 } from "lucide-react-native";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { FileDiff, FileText, Layers, MessageSquare, Undo2 } from "lucide-react-native";
+import { StyleSheet, withUnistyles } from "react-native-unistyles";
+import type { Theme } from "@/styles/theme";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -11,25 +12,42 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { type RewindMode, useRewindMenuItems } from "./use-rewind-capabilities";
+import {
+  type RewindCheckpointActions,
+  type RewindMode,
+  useRewindMenuItems,
+} from "./use-rewind-capabilities";
 import type { AgentCapabilityFlags } from "@getpaseo/protocol/agent-types";
+import { useCheckpointCopy } from "@/git/diff-checkpoint-copy";
 
 interface RewindMenuProps {
   capabilities: AgentCapabilityFlags;
   rewoundText: string;
   onRewind: (input: { mode: RewindMode; rewoundText: string }) => Promise<void> | void;
   isPending?: boolean;
+  checkpoint?: RewindCheckpointActions;
+  onViewChanges?: () => void;
+  onOpenChange?: (open: boolean) => void;
   testID?: string;
 }
 
-function getIcon(mode: RewindMode, color: string): ReactElement {
+const ThemedFileText = withUnistyles(FileText);
+const ThemedLayers = withUnistyles(Layers);
+const ThemedMessageSquare = withUnistyles(MessageSquare);
+const ThemedUndo = withUnistyles(Undo2);
+const ThemedFileDiff = withUnistyles(FileDiff);
+const foreground = (theme: Theme) => ({ color: theme.colors.foreground });
+const foregroundMuted = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
+const viewChangesIcon = <ThemedFileDiff size={16} uniProps={foreground} />;
+
+function getIcon(mode: RewindMode): ReactElement {
   switch (mode) {
     case "conversation":
-      return <MessageSquare size={16} color={color} />;
+      return <ThemedMessageSquare size={16} uniProps={foreground} />;
     case "files":
-      return <FileText size={16} color={color} />;
+      return <ThemedFileText size={16} uniProps={foreground} />;
     case "both":
-      return <Layers size={16} color={color} />;
+      return <ThemedLayers size={16} uniProps={foreground} />;
   }
 }
 
@@ -38,11 +56,14 @@ export const RewindMenu = memo(function RewindMenu({
   rewoundText,
   onRewind,
   isPending: isPendingProp = false,
+  checkpoint,
+  onViewChanges,
+  onOpenChange,
   testID = "rewind-menu",
 }: RewindMenuProps) {
-  const { theme } = useUnistyles();
   const { t } = useTranslation();
-  const items = useRewindMenuItems(capabilities);
+  const copy = useCheckpointCopy();
+  const items = useRewindMenuItems(capabilities, checkpoint);
   const [isOpen, setIsOpen] = useState(false);
   const [pendingMode, setPendingMode] = useState<RewindMode | null>(null);
   const isLocked = isPendingProp || pendingMode !== null;
@@ -51,8 +72,9 @@ export const RewindMenu = memo(function RewindMenu({
     (next: boolean) => {
       if (!next && pendingMode !== null) return;
       setIsOpen(next);
+      onOpenChange?.(next);
     },
-    [pendingMode],
+    [onOpenChange, pendingMode],
   );
 
   const handleSelect = useCallback(
@@ -66,9 +88,10 @@ export const RewindMenu = memo(function RewindMenu({
       } finally {
         setPendingMode(null);
         setIsOpen(false);
+        onOpenChange?.(false);
       }
     },
-    [isLocked, onRewind, rewoundText],
+    [isLocked, onOpenChange, onRewind, rewoundText],
   );
 
   const triggerStyle = useCallback(
@@ -85,7 +108,7 @@ export const RewindMenu = memo(function RewindMenu({
     [t],
   );
 
-  if (items.length === 0) {
+  if (items.length === 0 && !onViewChanges) {
     return null;
   }
 
@@ -102,10 +125,7 @@ export const RewindMenu = memo(function RewindMenu({
               testID={`${testID}-trigger`}
             >
               {({ hovered, open }) => (
-                <Undo2
-                  size={16}
-                  color={hovered || open ? theme.colors.foreground : theme.colors.foregroundMuted}
-                />
+                <ThemedUndo size={16} uniProps={hovered || open ? foreground : foregroundMuted} />
               )}
             </DropdownMenuTrigger>
           </View>
@@ -113,16 +133,30 @@ export const RewindMenu = memo(function RewindMenu({
         {tooltipContent}
       </Tooltip>
       <DropdownMenuContent align="end" minWidth={220} side="bottom" testID={`${testID}-content`}>
-        <View style={styles.warningHeader}>
-          <Text style={styles.warningText}>{t("rewind.warning")}</Text>
-        </View>
-        <DropdownMenuSeparator />
+        {onViewChanges ? (
+          <DropdownMenuItem
+            leading={viewChangesIcon}
+            onSelect={onViewChanges}
+            testID={`${testID}-view-changes`}
+          >
+            {copy.view}
+          </DropdownMenuItem>
+        ) : null}
+        {items.length > 0 ? (
+          <>
+            {onViewChanges ? <DropdownMenuSeparator /> : null}
+            <View style={styles.warningHeader}>
+              <Text style={styles.warningText}>{t("rewind.warning")}</Text>
+            </View>
+            <DropdownMenuSeparator />
+          </>
+        ) : null}
         {items.map((item) => (
           <DropdownMenuItem
             key={item.mode}
             closeOnSelect={false}
             disabled={isLocked && pendingMode !== item.mode}
-            leading={getIcon(item.mode, theme.colors.foreground)}
+            leading={getIcon(item.mode)}
             onSelect={handleSelect(item.mode)}
             status={pendingMode === item.mode ? "pending" : undefined}
             testID={item.testID}

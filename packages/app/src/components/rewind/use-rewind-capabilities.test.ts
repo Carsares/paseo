@@ -13,11 +13,11 @@ describe("resolveRewindMenuItems", () => {
     ).toEqual([]);
   });
 
-  test("returns only the capabilities declared by the provider", () => {
+  test("provider file capabilities cannot open a file rewind", () => {
     expect(
       resolveRewindMenuItems({
         supportsRewindConversation: true,
-        supportsRewindFiles: false,
+        supportsRewindFiles: true,
         supportsRewindBoth: true,
       }),
     ).toEqual([
@@ -26,28 +26,42 @@ describe("resolveRewindMenuItems", () => {
         label: "Rewind conversation",
         testID: "rewind-menu-conversation",
       },
-      {
-        mode: "both",
-        label: "Rewind conversation and files",
-        testID: "rewind-menu-both",
-      },
     ]);
   });
 
-  test("uses caller-provided labels for available capabilities", () => {
+  test("offers file and combined actions for an eligible checkpoint and a chat-capable provider", () => {
     expect(
       resolveRewindMenuItems(
         {
           supportsRewindConversation: true,
-          supportsRewindFiles: true,
+          supportsRewindFiles: false,
           supportsRewindBoth: false,
         },
+        { canRewindFiles: true, canRewindBoth: true },
         {
           conversation: "Conversation label",
           files: "Files label",
           both: "Both label",
         },
       ).map((item) => item.label),
-    ).toEqual(["Conversation label", "Files label"]);
+    ).toEqual(["Conversation label", "Files label", "Both label"]);
+  });
+
+  test("offers file-only rewind when the provider cannot rewind chat", () => {
+    expect(
+      resolveRewindMenuItems(
+        { supportsRewindBoth: true },
+        { canRewindFiles: true, canRewindBoth: true },
+      ).map((item) => item.mode),
+    ).toEqual(["files"]);
+  });
+
+  test("file eligibility does not imply combined eligibility", () => {
+    expect(
+      resolveRewindMenuItems(
+        { supportsRewindConversation: true },
+        { canRewindFiles: true, canRewindBoth: false },
+      ).map((item) => item.mode),
+    ).toEqual(["conversation", "files"]);
   });
 });

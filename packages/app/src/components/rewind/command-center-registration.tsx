@@ -11,6 +11,8 @@ import type { AgentScreenReadySyncState } from "@/hooks/use-agent-screen-state-m
 import { selectAgentTimelineState, useSessionStore } from "@/stores/session-store";
 import { useRewindAgentMutation } from "./use-rewind-agent-mutation";
 import { isRewindableMessage, useRewindMenuItems } from "./use-rewind-capabilities";
+import { useRewindCheckpoint } from "@/hooks/use-rewind-checkpoint";
+import { useWorkspaceDirectory } from "@/stores/session-store-hooks";
 
 export function RewindCommandCenterRegistration({
   serverId,
@@ -29,6 +31,13 @@ export function RewindCommandCenterRegistration({
   const toast = useToast();
   const canSelectLatestMessage = enabled && timelineSync?.status === "idle";
   const client = useSessionStore((state) => state.sessions[serverId]?.client);
+  const workspaceId = useSessionStore((state) => {
+    const session = state.sessions[serverId];
+    return (
+      (session?.agents.get(agentId) ?? session?.agentDetails.get(agentId))?.workspaceId ?? null
+    );
+  });
+  const cwd = useWorkspaceDirectory(serverId, workspaceId);
   const message = useSessionStore((state) => {
     const session = state.sessions[serverId];
     if (
@@ -51,9 +60,17 @@ export function RewindCommandCenterRegistration({
     serverId,
     agentId,
     client,
+    cwd,
     messageId: message?.messageId,
   });
-  const items = useRewindMenuItems(capabilities);
+  const checkpoint = useRewindCheckpoint({
+    serverId,
+    agentId,
+    messageId: message?.messageId,
+    enabled: canSelectLatestMessage && !isPending && Boolean(message?.messageId),
+  });
+  const checkpointId = checkpoint.target?.checkpointId;
+  const items = useRewindMenuItems(capabilities, checkpoint);
   const actions = useMemo<CommandCenterContribution[]>(() => {
     if (!message || !isRewindableMessage(message.messageId, message.text)) return [];
     return items.map((item, rank) => ({
@@ -72,7 +89,7 @@ export function RewindCommandCenterRegistration({
       run: async () => {
         const dismiss = toast.show(`${item.label}…`, { durationMs: null });
         try {
-          await rewindAgent({ mode: item.mode, rewoundText: message.text });
+          await rewindAgent({ mode: item.mode, rewoundText: message.text, checkpointId });
         } catch {
           // The mutation reports the failure through the app toast.
         } finally {
@@ -80,7 +97,7 @@ export function RewindCommandCenterRegistration({
         }
       },
     }));
-  }, [items, message, rewindAgent, t, toast]);
+  }, [checkpointId, items, message, rewindAgent, t, toast]);
 
   useCommandCenterActions({
     sourceId: `rewind:${serverId}:${agentId}`,

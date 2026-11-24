@@ -2698,6 +2698,80 @@ export const AgentRewindResponseMessageSchema = z.object({
   }),
 });
 
+const RewindCheckpointTargetSchema = z.object({
+  checkpointId: z.string(),
+  messageId: z.string(),
+});
+
+const RewindCheckpointOperationSchema = z.object({
+  operationId: z.string(),
+  target: RewindCheckpointTargetSchema,
+  backupCheckpointId: z.string(),
+  conversationRewound: z.boolean(),
+  status: z.enum(["files_restored", "files_pending"]),
+});
+
+const RewindCheckpointResultSchema = z.object({
+  requestId: z.string(),
+  agentId: z.string(),
+  ok: z.boolean(),
+  error: z.string().nullable(),
+});
+
+export const AgentRewindCheckpointGetRequestSchema = z.object({
+  type: z.literal("agent.rewind.checkpoint.get.request"),
+  requestId: z.string(),
+  agentId: z.string(),
+  messageId: z.string(),
+});
+
+export const AgentRewindCheckpointGetResponseSchema = z.object({
+  type: z.literal("agent.rewind.checkpoint.get.response"),
+  payload: RewindCheckpointResultSchema.extend({
+    target: RewindCheckpointTargetSchema.optional(),
+    canRewindFiles: z.boolean().optional(),
+    canRewindBoth: z.boolean().optional(),
+  }),
+});
+
+export const AgentRewindCheckpointRestoreRequestSchema = z.object({
+  type: z.literal("agent.rewind.checkpoint.restore.request"),
+  requestId: z.string(),
+  agentId: z.string(),
+  messageId: z.string(),
+  checkpointId: z.string(),
+  mode: z.enum(["files", "both"]),
+});
+
+export const AgentRewindCheckpointRestoreResponseSchema = z.object({
+  type: z.literal("agent.rewind.checkpoint.restore.response"),
+  payload: RewindCheckpointResultSchema.extend({
+    operation: RewindCheckpointOperationSchema.optional(),
+  }),
+});
+
+export const AgentRewindCheckpointRetryFilesRequestSchema = z.object({
+  type: z.literal("agent.rewind.checkpoint.retry_files.request"),
+  requestId: z.string(),
+  agentId: z.string(),
+  operationId: z.string(),
+});
+
+export const AgentRewindCheckpointRetryFilesResponseSchema = z.object({
+  type: z.literal("agent.rewind.checkpoint.retry_files.response"),
+  payload: RewindCheckpointResultSchema.extend({
+    operation: RewindCheckpointOperationSchema.optional(),
+  }),
+});
+
+export const AgentRewindCheckpointDiffRequestSchema = z.object({
+  type: z.literal("agent.rewind.checkpoint.diff.get.request"),
+  requestId: z.string(),
+  agentId: z.string(),
+  messageId: z.string(),
+  range: z.enum(["turn", "baseline"]),
+});
+
 export const UpdateAgentResponseMessageSchema = z.object({
   type: z.literal("update_agent_response"),
   payload: AgentActionResponsePayloadSchema,
@@ -3568,6 +3642,24 @@ const ParsedDiffFileSchema = z.object({
   status: z.enum(["ok", "too_large", "binary"]).optional(),
 });
 
+const AgentRewindCheckpointDiffResponseSchema = z.object({
+  type: z.literal("agent.rewind.checkpoint.diff.get.response"),
+  payload: RewindCheckpointResultSchema.extend({
+    result: z
+      .discriminatedUnion("kind", [
+        z.object({ kind: z.literal("unavailable"), reason: z.enum(["missing", "unsupported"]) }),
+        z.object({
+          kind: z.literal("ready"),
+          files: z.array(ParsedDiffFileSchema),
+          stagedFiles: z.array(ParsedDiffFileSchema).optional(),
+          diffTooLarge: z.boolean(),
+          attribution: z.enum(["unknown", "known"]),
+        }),
+      ])
+      .optional(),
+  }),
+});
+
 const FileExplorerEntrySchema = z.object({
   name: z.string(),
   path: z.string(),
@@ -4197,6 +4289,10 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   AgentPullFinishReportsRequestSchema,
   AgentTrackFinishReportsRequestSchema,
   AgentRewindRequestMessageSchema,
+  AgentRewindCheckpointGetRequestSchema,
+  AgentRewindCheckpointRestoreRequestSchema,
+  AgentRewindCheckpointRetryFilesRequestSchema,
+  AgentRewindCheckpointDiffRequestSchema,
   AgentPermissionResponseMessageSchema,
   DiffSubscribeRequestSchema,
   DiffUnsubscribeRequestSchema,
@@ -4599,6 +4695,8 @@ export const ServerInfoStatusPayloadSchema = z
         "terminal-grapheme-widths": z.boolean().optional(),
         // COMPAT(rewind): added in v0.1.X, drop the gate when floor >= v0.1.X.
         rewind: z.boolean().optional(),
+        // COMPAT(rewindCheckpoints): added in v0.17.0, remove the gate after 2027-05-24.
+        rewindCheckpoints: z.boolean().optional(),
         // COMPAT(agentTimelinePromptIndex): added in v0.2.X, drop the gate when floor >= v0.2.X.
         agentTimelinePromptIndex: z.boolean().optional(),
         // COMPAT(agentHistorySearch): added in v0.3.0, remove gate after 2027-02-07.
@@ -8501,6 +8599,10 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentPullFinishReportsResponseSchema,
   AgentTrackFinishReportsResponseSchema,
   AgentRewindResponseMessageSchema,
+  AgentRewindCheckpointGetResponseSchema,
+  AgentRewindCheckpointRestoreResponseSchema,
+  AgentRewindCheckpointRetryFilesResponseSchema,
+  AgentRewindCheckpointDiffResponseSchema,
   UpdateAgentResponseMessageSchema,
   ProjectRenameResponseSchema,
   ProjectIconSetResponseSchema,
@@ -8729,6 +8831,19 @@ export type AgentMoveToWorkspaceResponseMessage = z.infer<
 export type AgentSetMainResponseMessage = z.infer<typeof AgentSetMainResponseMessageSchema>;
 export type AgentSetParentResponseMessage = z.infer<typeof AgentSetParentResponseMessageSchema>;
 export type AgentRewindResponseMessage = z.infer<typeof AgentRewindResponseMessageSchema>;
+export type AgentRewindCheckpointGetResponse = z.infer<
+  typeof AgentRewindCheckpointGetResponseSchema
+>["payload"];
+export type AgentRewindCheckpointRestoreResponse = z.infer<
+  typeof AgentRewindCheckpointRestoreResponseSchema
+>["payload"];
+export type AgentRewindCheckpointRetryFilesResponse = z.infer<
+  typeof AgentRewindCheckpointRetryFilesResponseSchema
+>["payload"];
+export type RewindCheckpointOperation = z.infer<typeof RewindCheckpointOperationSchema>;
+export type AgentRewindCheckpointDiffResponse = z.infer<
+  typeof AgentRewindCheckpointDiffResponseSchema
+>["payload"];
 export type UpdateAgentResponseMessage = z.infer<typeof UpdateAgentResponseMessageSchema>;
 export type ProjectRenameResponse = z.infer<typeof ProjectRenameResponseSchema>;
 export type ProjectIconSetResponse = z.infer<typeof ProjectIconSetResponseSchema>;

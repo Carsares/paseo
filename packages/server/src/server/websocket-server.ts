@@ -1,3 +1,4 @@
+import { rewindDirectoriesOverlap } from "./agent-rewind-scope.js";
 import {
   ChunkedTransport,
   ChunkedTransportProtocolError,
@@ -89,6 +90,7 @@ import {
   retainQueuedAgentMessage,
   Session,
   SourceDeliveryClosedError,
+  isWorkspaceArchivePending,
   type SessionLifecycleIntent,
   type SessionOptions,
   type SessionRuntimeMetrics,
@@ -991,6 +993,7 @@ export class VoiceAssistantWebSocketServer {
     this.github = github ?? createGitHubService();
     this.workspaceGitService = workspaceGitService ?? createFallbackWorkspaceGitService();
     this.worktreesRoot = daemonRuntimeConfig?.worktreesRoot;
+    this.configureRewindCheckpoints(paseoHome);
     this.workspaceBaseBranch = createWorkspaceBaseBranchService({
       paseoHome,
       worktreesRoot: this.worktreesRoot,
@@ -1064,6 +1067,34 @@ export class VoiceAssistantWebSocketServer {
     this.startApplicationSocketLeaseInterval();
 
     this.logger.info("WebSocket server initialized on /ws");
+  }
+
+  private configureRewindCheckpoints(paseoHome: string): void {
+    this.agentManager.configureRewindCheckpoints?.({
+      paseoHome,
+      worktreesRoot: this.worktreesRoot,
+      projects: this.projectRegistry,
+      workspaces: this.workspaceRegistry,
+      isWorkspaceArchiving: (workspaceId) =>
+        isWorkspaceArchivePending(this.workspaceRegistry, workspaceId),
+      hasActiveTerminal: async (cwd) => {
+        const manager = this.terminalManager;
+        if (!manager) return false;
+        if (manager.getUnavailableError?.()) return true;
+        const directories = new Set([
+          cwd,
+          ...manager
+            .listDirectories()
+            .filter((directory) => rewindDirectoriesOverlap(cwd, directory)),
+        ]);
+        const groups = await Promise.all(
+          [...directories].map((directory) => manager.getTerminals(directory)),
+        );
+        return groups.some((terminals) =>
+          terminals.some((terminal) => rewindDirectoriesOverlap(cwd, terminal.cwd)),
+        );
+      },
+    });
   }
 
   private assignOptionalServices(params: {
@@ -2432,6 +2463,8 @@ export class VoiceAssistantWebSocketServer {
         workspaceTerminals: true,
         // COMPAT(rewind): added in v0.1.X, drop the gate when floor >= v0.1.X.
         rewind: true,
+        // COMPAT(rewindCheckpoints): added in v0.17.0, remove the gate after 2027-05-24.
+        rewindCheckpoints: typeof this.agentManager.configureRewindCheckpoints === "function",
         // COMPAT(agentTimelinePromptIndex): added in v0.2.X, drop the gate when floor >= v0.2.X.
         agentTimelinePromptIndex: true,
         // COMPAT(agentHistorySearch): added in v0.3.0, remove gate after 2027-02-07.

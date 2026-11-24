@@ -1,7 +1,20 @@
 export type WorkingDiffComparison = "uncommitted" | "base" | "all";
 
+export type CheckpointDiffRange = "turn" | "baseline";
+
+export interface CheckpointDiffTarget {
+  agentId: string;
+  messageId: string;
+}
+
+export interface CheckpointDiffSelection {
+  target: CheckpointDiffTarget;
+  range: CheckpointDiffRange | null;
+}
+
 export interface WorkingDiffComparisonOverride {
-  comparison: WorkingDiffComparison;
+  comparison?: WorkingDiffComparison;
+  checkpoint?: CheckpointDiffSelection;
 }
 
 export interface WorkingDiffComparisonState {
@@ -37,8 +50,22 @@ export function selectWorkingDiffComparisonInState(
     overrides: {
       ...state.overrides,
       [workingDiffComparisonKey(input)]: {
+        ...state.overrides[workingDiffComparisonKey(input)],
         comparison: input.comparison,
       },
+    },
+  };
+}
+
+export function selectCheckpointDiffInState(
+  state: WorkingDiffComparisonState,
+  input: WorkingDiffCheckoutIdentity & { selection: CheckpointDiffSelection },
+): WorkingDiffComparisonState {
+  const key = workingDiffComparisonKey(input);
+  return {
+    overrides: {
+      ...state.overrides,
+      [key]: { ...state.overrides[key], checkpoint: input.selection },
     },
   };
 }

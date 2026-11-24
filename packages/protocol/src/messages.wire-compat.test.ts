@@ -295,6 +295,71 @@ test("server info keeps agentCreateAsMain independent and optional", () => {
   ).toEqual({ agentCreateAsMain: false });
 });
 
+test("checkpoint rewind negotiates independently of legacy rewind and preserves retry data", () => {
+  const info = { status: "server_info", serverId: "server-1" };
+  expect(
+    ServerInfoStatusPayloadSchema.parse({ ...info, features: { rewind: true } }).features,
+  ).toEqual({ rewind: true });
+  expect(
+    ServerInfoStatusPayloadSchema.parse({
+      ...info,
+      features: { rewind: true, rewindCheckpoints: true },
+    }).features,
+  ).toEqual({ rewind: true, rewindCheckpoints: true });
+  const legacy = {
+    type: "agent.rewind.request",
+    agentId: "agent-1",
+    messageId: "message-1",
+    requestId: "old",
+    mode: "conversation",
+  };
+  expect(SessionInboundMessageSchema.parse(legacy)).toEqual(legacy);
+  const response = {
+    type: "session",
+    message: {
+      type: "agent.rewind.checkpoint.restore.response",
+      payload: {
+        requestId: "restore-1",
+        agentId: "agent-1",
+        ok: false,
+        error: "Worktree changed",
+        operation: {
+          operationId: "operation-1",
+          target: { checkpointId: "checkpoint-1", messageId: "message-1" },
+          backupCheckpointId: "backup-1",
+          conversationRewound: true,
+          status: "files_pending",
+        },
+      },
+    },
+  };
+  expect(validateWSOutboundMessage(response)).toMatchObject({ success: true, data: response });
+});
+
+test("checkpoint historical diffs accept old responses and preserve staging when present", () => {
+  const ready = { kind: "ready", files: [], diffTooLarge: false, attribution: "unknown" };
+  const stagedFiles = [
+    {
+      path: "staged.txt",
+      isNew: true,
+      isDeleted: false,
+      additions: 0,
+      deletions: 0,
+      hunks: [],
+    },
+  ];
+  for (const result of [ready, { ...ready, stagedFiles }]) {
+    const response = {
+      type: "session",
+      message: {
+        type: "agent.rewind.checkpoint.diff.get.response",
+        payload: { requestId: "diff", agentId: "agent", ok: true, error: null, result },
+      },
+    };
+    expect(validateWSOutboundMessage(response)).toMatchObject({ success: true, data: response });
+  }
+});
+
 test("resident specialist and reset capabilities are optional booleans", () => {
   const info = { status: "server_info", serverId: "server-1" };
   expect(ServerInfoStatusPayloadSchema.parse(info).features).toBeUndefined();

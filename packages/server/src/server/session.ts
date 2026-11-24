@@ -1,3 +1,4 @@
+import { runRewindDirectoryWriter } from "./agent-rewind-scope.js";
 import { DiffSession } from "./diff/index.js";
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
 import type { AgentMessageDelivery, AgentPromptSource } from "./agent/agent-messages/index.js";
@@ -3602,6 +3603,11 @@ export class Session {
     switch (msg.type) {
       case "agent.rewind.request":
         return this.handleAgentRewindRequest(msg, source);
+      case "agent.rewind.checkpoint.get.request":
+      case "agent.rewind.checkpoint.diff.get.request":
+      case "agent.rewind.checkpoint.restore.request":
+      case "agent.rewind.checkpoint.retry_files.request":
+        return this.handleAgentRewindCheckpointRequest(msg, source);
       default:
         return undefined;
     }
@@ -3882,23 +3888,37 @@ export class Session {
       case "unsubscribe_checkout_diff_request":
         return this.checkoutSession.handleUnsubscribeDiffRequest(msg, this.delivery);
       case "checkout_switch_branch_request":
-        return this.checkoutSession.handleCheckoutSwitchBranchRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.checkoutSession.handleCheckoutSwitchBranchRequest(msg),
+        );
       case "checkout.rename_branch.request":
-        return this.checkoutSession.handleCheckoutRenameBranchRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.checkoutSession.handleCheckoutRenameBranchRequest(msg),
+        );
       case "checkout_commit_request":
-        return this.checkoutSession.handleCheckoutCommitRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.checkoutSession.handleCheckoutCommitRequest(msg),
+        );
       case "checkout_merge_request":
-        return this.checkoutSession.handleCheckoutMergeRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.checkoutSession.handleCheckoutMergeRequest(msg),
+        );
       case "checkout_merge_from_base_request":
-        return this.checkoutSession.handleCheckoutMergeFromBaseRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.checkoutSession.handleCheckoutMergeFromBaseRequest(msg),
+        );
       case "checkout_pull_request":
-        return this.checkoutSession.handleCheckoutPullRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.checkoutSession.handleCheckoutPullRequest(msg),
+        );
       case "checkout_push_request":
         return this.checkoutSession.handleCheckoutPushRequest(msg);
       case "checkout.refresh.request":
         return this.checkoutSession.handleRefreshRequest(msg);
       case "checkout.discard_changes.request":
-        return this.checkoutSession.handleCheckoutDiscardChangesRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.checkoutSession.handleCheckoutDiscardChangesRequest(msg),
+        );
       case "checkout_pr_create_request":
         return this.checkoutSession.handleCheckoutPrCreateRequest(msg);
       case "checkout_pr_merge_request":
@@ -3922,9 +3942,13 @@ export class Session {
       case "github_search_request":
         return this.checkoutSession.handleForgeSearchRequest(msg);
       case "stash_save_request":
-        return this.checkoutSession.handleStashSaveRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.checkoutSession.handleStashSaveRequest(msg),
+        );
       case "stash_pop_request":
-        return this.checkoutSession.handleStashPopRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.checkoutSession.handleStashPopRequest(msg),
+        );
       case "stash_list_request":
         return this.checkoutSession.handleStashListRequest(msg);
       default:
@@ -4017,15 +4041,25 @@ export class Session {
       case "fs.file.unsubscribe.request":
         return this.workspaceFilesSession.handleFileUnsubscribeRequest(msg, this.delivery);
       case "fs.file.write.request":
-        return this.workspaceFilesSession.handleFileWriteRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.workspaceFilesSession.handleFileWriteRequest(msg),
+        );
       case "fs.entry.create.request":
-        return this.workspaceFilesSession.handleFileEntryCreateRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.workspaceFilesSession.handleFileEntryCreateRequest(msg),
+        );
       case "fs.entry.rename.request":
-        return this.workspaceFilesSession.handleFileEntryRenameRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.workspaceFilesSession.handleFileEntryRenameRequest(msg),
+        );
       case "fs.entry.duplicate.request":
-        return this.workspaceFilesSession.handleFileEntryDuplicateRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.workspaceFilesSession.handleFileEntryDuplicateRequest(msg),
+        );
       case "fs.entry.delete.request":
-        return this.workspaceFilesSession.handleFileEntryDeleteRequest(msg);
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
+          this.workspaceFilesSession.handleFileEntryDeleteRequest(msg),
+        );
       case "project_icon_request":
         return this.workspaceFilesSession.handleProjectIconRequest(msg);
       case "project.icon.get.request":
@@ -4100,6 +4134,17 @@ export class Session {
         return this.handleWorkspaceScriptStartRequest(msg);
       case "workspace.script.stop.request":
         return this.handleWorkspaceScriptStopRequest(msg);
+      case "create_terminal_request":
+        return runRewindDirectoryWriter(this.agentManager, msg.cwd, async () => {
+          await this.terminalController.dispatch(msg, this.delivery);
+        });
+      case "terminal_input": {
+        const terminal = this.terminalManager?.getTerminal(msg.terminalId);
+        if (!terminal) return this.terminalController.dispatch(msg, this.delivery);
+        return runRewindDirectoryWriter(this.agentManager, terminal.cwd, async () => {
+          await this.terminalController.dispatch(msg, this.delivery);
+        });
+      }
       default:
         return this.terminalController.dispatch(msg, this.delivery);
     }
@@ -6892,6 +6937,21 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "agent.rewind.request" }>,
     source?: object,
   ): Promise<void> {
+    if (this.rewindInitiators.has(msg.agentId)) {
+      this.emitForSource(
+        {
+          type: "agent.rewind.response",
+          payload: {
+            requestId: msg.requestId,
+            agentId: msg.agentId,
+            ok: false,
+            error: "Agent rewind is already active",
+          },
+        },
+        source,
+      );
+      return;
+    }
     try {
       this.rewindInitiators.set(msg.agentId, source);
       await this.agentManager.rewind(msg.agentId, msg.messageId, msg.mode);
@@ -6922,6 +6982,100 @@ export class Session {
       );
     } finally {
       this.rewindInitiators.delete(msg.agentId);
+    }
+  }
+
+  private async handleAgentRewindCheckpointRequest(
+    msg: Extract<
+      SessionInboundMessage,
+      {
+        type:
+          | "agent.rewind.checkpoint.get.request"
+          | "agent.rewind.checkpoint.diff.get.request"
+          | "agent.rewind.checkpoint.restore.request"
+          | "agent.rewind.checkpoint.retry_files.request";
+      }
+    >,
+    source?: object,
+  ): Promise<void> {
+    const { requestId, agentId } = msg;
+    const base = { requestId, agentId };
+    const restore = msg.type === "agent.rewind.checkpoint.restore.request";
+    const publishTimeline = restore && msg.mode === "both";
+    let registered = false;
+    try {
+      if (publishTimeline) {
+        if (this.rewindInitiators.has(agentId)) throw new Error("Agent rewind is already active");
+        this.rewindInitiators.set(agentId, source);
+        registered = true;
+      }
+      switch (msg.type) {
+        case "agent.rewind.checkpoint.diff.get.request": {
+          const result = await this.agentManager.getRewindCheckpointDiff(msg);
+          this.emitForSource(
+            {
+              type: "agent.rewind.checkpoint.diff.get.response",
+              payload: { ...base, ok: true, error: null, result },
+            },
+            source,
+          );
+          break;
+        }
+        case "agent.rewind.checkpoint.get.request": {
+          const result = await this.agentManager.getRewindCheckpoint(msg);
+          this.emitForSource(
+            {
+              type: "agent.rewind.checkpoint.get.response",
+              payload: { ...base, ok: true, error: null, ...result },
+            },
+            source,
+          );
+          break;
+        }
+        case "agent.rewind.checkpoint.restore.request":
+        case "agent.rewind.checkpoint.retry_files.request": {
+          const result =
+            msg.type === "agent.rewind.checkpoint.restore.request"
+              ? await this.agentManager.restoreRewindCheckpoint(msg)
+              : await this.agentManager.retryRewindFiles(msg);
+          const type = restore
+            ? "agent.rewind.checkpoint.restore.response"
+            : "agent.rewind.checkpoint.retry_files.response";
+          this.emitForSource(
+            {
+              type,
+              payload: {
+                ...base,
+                ok: result.operation.status === "files_restored",
+                ...result,
+              },
+            },
+            source,
+          );
+          break;
+        }
+      }
+    } catch (error) {
+      const type = {
+        "agent.rewind.checkpoint.get.request": "agent.rewind.checkpoint.get.response",
+        "agent.rewind.checkpoint.diff.get.request": "agent.rewind.checkpoint.diff.get.response",
+        "agent.rewind.checkpoint.restore.request": "agent.rewind.checkpoint.restore.response",
+        "agent.rewind.checkpoint.retry_files.request":
+          "agent.rewind.checkpoint.retry_files.response",
+      } as const;
+      this.emitForSource(
+        {
+          type: type[msg.type],
+          payload: {
+            ...base,
+            ok: false,
+            error: getErrorMessageOr(error, "Checkpoint rewind failed"),
+          },
+        },
+        source,
+      );
+    } finally {
+      if (registered) this.rewindInitiators.delete(agentId);
     }
   }
 
@@ -9954,8 +10108,14 @@ export class Session {
     return this.workspaceScripts.buildSnapshot(workspace, project);
   }
 
-  private handleStartWorkspaceScriptRequest(request: StartWorkspaceScriptRequest): Promise<void> {
-    return this.workspaceScripts.start(request);
+  private async handleStartWorkspaceScriptRequest(
+    request: StartWorkspaceScriptRequest,
+  ): Promise<void> {
+    const workspace = await this.workspaceRegistry.get(request.workspaceId);
+    if (!workspace) return this.workspaceScripts.start(request);
+    return runRewindDirectoryWriter(this.agentManager, workspace.cwd, () =>
+      this.workspaceScripts.start(request),
+    );
   }
 
   private async handleWorkspaceScriptListRequest(
@@ -9989,7 +10149,11 @@ export class Session {
     request: WorkspaceScriptStartRequest,
   ): Promise<void> {
     try {
-      const script = await this.workspaceScripts.launch(request);
+      const workspace = await this.workspaceRegistry.get(request.workspaceId);
+      const launch = () => this.workspaceScripts.launch(request);
+      const script = workspace
+        ? await runRewindDirectoryWriter(this.agentManager, workspace.cwd, launch)
+        : await launch();
       this.emit({
         type: "workspace.script.start.response",
         payload: {

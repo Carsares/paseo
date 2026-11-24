@@ -103,6 +103,10 @@ import { PullRequestStateIcon } from "@/git/pull-request-state-icon";
 import { openExternalUrl } from "@/utils/open-external-url";
 import { openWorkspacePullRequest } from "@/workspace-tabs/open-supporting-view";
 import type { PullRequestOpenLocation } from "@/hooks/use-settings";
+import { useCheckpointCopy } from "@/git/diff-checkpoint-copy";
+import { useCheckpointDiffQuery } from "@/git/use-checkpoint-diff-query";
+import { selectCheckpointDiff, useCheckpointDiffSelection } from "@/git/working-diff-comparison";
+import type { CheckpointDiffRange } from "@/git/working-diff-comparison/state";
 
 export type { GitActionId, GitAction, GitActions } from "@/git/policy";
 
@@ -212,6 +216,7 @@ const ThemedListChevronsDownUp = withUnistyles(ListChevronsDownUp);
 const ThemedListChevronsUpDown = withUnistyles(ListChevronsUpDown);
 const ThemedMaximize = withUnistyles(Maximize);
 const noopStateChange = () => {};
+const EMPTY_HISTORICAL_FILES: ParsedDiffFile[] = [];
 const ThemedChevronDown = withUnistyles(ChevronDown);
 const ThemedMoreHorizontal = withUnistyles(MoreHorizontal);
 const ThemedExternalLink = withUnistyles(ExternalLink);
@@ -291,6 +296,12 @@ interface DiffModeMenuProps {
   onSelectUncommitted: () => void;
   onSelectBase: () => void;
   onSelectAll: () => void;
+  checkpoint?: CheckpointComparisonMenu;
+}
+
+interface CheckpointComparisonMenu {
+  range: CheckpointDiffRange | null;
+  selectRange: (range: CheckpointDiffRange | null) => void;
 }
 
 export function DiffModeMenu({
@@ -300,11 +311,19 @@ export function DiffModeMenu({
   onSelectUncommitted,
   onSelectBase,
   onSelectAll,
+  checkpoint,
 }: DiffModeMenuProps) {
   const { t } = useTranslation();
+  const checkpointCopy = useCheckpointCopy();
   const uncommittedLabel = t("workspace.git.diff.uncommitted");
   const committedLabel = t("workspace.git.diff.committed");
   const allLabel = t("workspace.git.diff.all");
+  const range = checkpoint?.range;
+  const label = range
+    ? checkpointCopy[range]
+    : { all: allLabel, uncommitted: uncommittedLabel, base: committedLabel }[diffMode];
+  const selectTurn = useCallback(() => checkpoint?.selectRange("turn"), [checkpoint]);
+  const selectBaseline = useCallback(() => checkpoint?.selectRange("baseline"), [checkpoint]);
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
@@ -318,7 +337,7 @@ export function DiffModeMenu({
           return (
             <>
               <Text style={toolbarLabelTriggerTextStyle(highlighted)} numberOfLines={1}>
-                {{ all: allLabel, uncommitted: uncommittedLabel, base: committedLabel }[diffMode]}
+                {label}
               </Text>
               <ToolbarLabelTriggerIcon>
                 <ThemedChevronDown size={12} uniProps={extraMutedIconColorMapping} />
@@ -330,7 +349,7 @@ export function DiffModeMenu({
       <DropdownMenuContent align="start" width={260} testID={`${testIDPrefix}-status-menu`}>
         <DropdownMenuItem
           testID={`${testIDPrefix}-mode-all`}
-          selected={diffMode === "all"}
+          selected={!range && diffMode === "all"}
           onSelect={onSelectAll}
         >
           {allLabel}
@@ -338,7 +357,7 @@ export function DiffModeMenu({
         <DropdownMenuSeparator />
         <DropdownMenuItem
           testID={`${testIDPrefix}-mode-uncommitted`}
-          selected={diffMode === "uncommitted"}
+          selected={!range && diffMode === "uncommitted"}
           onSelect={onSelectUncommitted}
         >
           {uncommittedLabel}
@@ -346,12 +365,31 @@ export function DiffModeMenu({
         <DropdownMenuSeparator />
         <DropdownMenuItem
           testID={`${testIDPrefix}-mode-committed`}
-          selected={diffMode === "base"}
+          selected={!range && diffMode === "base"}
           description={committedDescription}
           onSelect={onSelectBase}
         >
           {committedLabel}
         </DropdownMenuItem>
+        {checkpoint ? (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              testID={`${testIDPrefix}-mode-turn`}
+              selected={range === "turn"}
+              onSelect={selectTurn}
+            >
+              {checkpointCopy.turn}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              testID={`${testIDPrefix}-mode-baseline`}
+              selected={range === "baseline"}
+              onSelect={selectBaseline}
+            >
+              {checkpointCopy.baseline}
+            </DropdownMenuItem>
+          </>
+        ) : null}
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -381,7 +419,7 @@ interface ChangesToolbarDiffOptions {
   } | null;
   hideWhitespace: boolean;
   wrapLines: boolean;
-  onToggleHideWhitespace: () => void;
+  onToggleHideWhitespace?: () => void;
   onToggleWrapLines: () => void;
 }
 
@@ -423,7 +461,7 @@ function buildChangesToolbarMode(input: {
   onExpandAll: () => void;
   allFilesCollapsed: boolean;
   onToggleLayout: () => void;
-  onToggleHideWhitespace: () => void;
+  onToggleHideWhitespace?: () => void;
   onToggleWrapLines: () => void;
   onToggleTree: () => void;
 }): ChangesToolbarMode {
@@ -492,6 +530,7 @@ interface ChangesComparisonToolbarModel {
   onSelectBase: () => void;
   onSelectAll: () => void;
   onSelectUncommitted: () => void;
+  checkpoint?: CheckpointComparisonMenu;
 }
 
 interface ChangesHeaderProps {
@@ -519,6 +558,7 @@ interface BuildChangesHeaderModelInput {
   selectedDiffStat: { additions: number; deletions: number } | null;
   serverId: string;
   workspaceId?: string | null;
+  checkpoint?: CheckpointComparisonMenu;
 }
 
 function buildChangesHeaderModel(input: BuildChangesHeaderModelInput): {
@@ -546,6 +586,7 @@ function buildChangesHeaderModel(input: BuildChangesHeaderModelInput): {
       onSelectBase: input.onSelectBase,
       onSelectAll: input.onSelectAll,
       onSelectUncommitted: input.onSelectUncommitted,
+      checkpoint: input.checkpoint,
     },
   };
 }
@@ -559,16 +600,19 @@ function ChangesHeader({ compact, repository, comparison, sidebarSurface }: Chan
         compact={compact}
         mode={comparison.mode}
         sidebarSurface={sidebarSurface}
+        comparison={comparison}
       />
     );
   }
   return (
     <View>
-      <ChangesRepositoryToolbar
-        compact={compact}
-        model={repository}
-        sidebarSurface={sidebarSurface}
-      />
+      {!comparison.checkpoint?.range ? (
+        <ChangesRepositoryToolbar
+          compact={compact}
+          model={repository}
+          sidebarSurface={sidebarSurface}
+        />
+      ) : null}
       <ChangesComparisonToolbar
         compact={compact}
         model={comparison}
@@ -582,10 +626,12 @@ function ChangesDiffOnlyToolbar({
   compact,
   mode,
   sidebarSurface,
+  comparison,
 }: {
   compact: boolean;
   mode: Extract<ChangesToolbarMode, { kind: "diff" }>;
   sidebarSurface: boolean;
+  comparison: ChangesComparisonToolbarModel;
 }) {
   return (
     <ChangesToolbarRow
@@ -594,7 +640,9 @@ function ChangesDiffOnlyToolbar({
       testID="changes-header"
       trailing="glyph"
     >
-      <ChangesToolbarLeading />
+      <ChangesToolbarLeading>
+        {comparison.checkpoint ? <ChangesDiffModeMenu model={comparison} /> : null}
+      </ChangesToolbarLeading>
       <ChangesToolbarTrailing>
         <ChangesToolbarActions mode={mode} compact={compact} />
       </ChangesToolbarTrailing>
@@ -771,13 +819,7 @@ function ChangesComparisonToolbar({
       trailing="glyph"
     >
       <ChangesToolbarLeading>
-        <DiffModeMenu
-          diffMode={model.diffMode}
-          committedDescription={model.committedDescription}
-          onSelectUncommitted={model.onSelectUncommitted}
-          onSelectBase={model.onSelectBase}
-          onSelectAll={model.onSelectAll}
-        />
+        <ChangesDiffModeMenu model={model} />
         {model.selectedDiffStat ? (
           <DiffStat
             additions={model.selectedDiffStat.additions}
@@ -790,6 +832,19 @@ function ChangesComparisonToolbar({
         <ChangesToolbarActions mode={model.mode} compact={compact} />
       </ChangesToolbarTrailing>
     </ChangesToolbarRow>
+  );
+}
+
+function ChangesDiffModeMenu({ model }: { model: ChangesComparisonToolbarModel }) {
+  return (
+    <DiffModeMenu
+      diffMode={model.diffMode}
+      committedDescription={model.committedDescription}
+      onSelectUncommitted={model.onSelectUncommitted}
+      onSelectBase={model.onSelectBase}
+      onSelectAll={model.onSelectAll}
+      checkpoint={model.checkpoint}
+    />
   );
 }
 
@@ -880,15 +935,17 @@ function ChangesDiffToolbar({
           <ThemedColumns2 size={iconSize} uniProps={extraMutedIconColorMapping} />
         </ToolbarButton>
       ) : null}
-      <ToolbarButton
-        compact={compact}
-        label={whitespaceLabel}
-        selected={options.hideWhitespace}
-        testID="changes-toggle-whitespace"
-        onPress={options.onToggleHideWhitespace}
-      >
-        <ThemedPilcrow size={iconSize} uniProps={extraMutedIconColorMapping} />
-      </ToolbarButton>
+      {options.onToggleHideWhitespace ? (
+        <ToolbarButton
+          compact={compact}
+          label={whitespaceLabel}
+          selected={options.hideWhitespace}
+          testID="changes-toggle-whitespace"
+          onPress={options.onToggleHideWhitespace}
+        >
+          <ThemedPilcrow size={iconSize} uniProps={extraMutedIconColorMapping} />
+        </ToolbarButton>
+      ) : null}
       <ToolbarButton
         compact={compact}
         label={wrapLinesLabel}
@@ -1062,14 +1119,16 @@ function ChangesDiffOptions({ options }: { options: ChangesToolbarDiffOptions })
           {t("workspace.git.diff.split")}
         </DropdownMenuItem>
       ) : null}
-      <DropdownMenuItem
-        leading={DIFF_OPTIONS_WHITESPACE_ICON}
-        selected={options.hideWhitespace}
-        testID="changes-toggle-whitespace"
-        onSelect={options.onToggleHideWhitespace}
-      >
-        {whitespaceLabel}
-      </DropdownMenuItem>
+      {options.onToggleHideWhitespace ? (
+        <DropdownMenuItem
+          leading={DIFF_OPTIONS_WHITESPACE_ICON}
+          selected={options.hideWhitespace}
+          testID="changes-toggle-whitespace"
+          onSelect={options.onToggleHideWhitespace}
+        >
+          {whitespaceLabel}
+        </DropdownMenuItem>
+      ) : null}
       <DropdownMenuItem
         leading={DIFF_OPTIONS_WRAP_ICON}
         selected={options.wrapLines}
@@ -1487,6 +1546,181 @@ function useDiffTabNavigation({
   };
 }
 
+function useChangesComparison({
+  serverId,
+  workspaceId,
+  cwd,
+  enabled,
+  presentation,
+  hideWhitespace,
+}: Pick<ChangesSurfaceProps, "serverId" | "workspaceId" | "cwd" | "enabled"> & {
+  presentation: ChangesPresentation;
+  hideWhitespace: boolean;
+}) {
+  const checkpoint = useCheckpointDiffSelection({ serverId, workspaceId, cwd });
+  const historicalRange = checkpoint?.range ?? null;
+  const selectHistoricalRange = useCallback(
+    (range: CheckpointDiffRange | null) => {
+      if (!checkpoint) return;
+      selectCheckpointDiff({
+        serverId,
+        workspaceId,
+        cwd,
+        selection: { target: checkpoint.target, range },
+      });
+    },
+    [checkpoint, cwd, serverId, workspaceId],
+  );
+  const checkpointMenu = useMemo(
+    () => (checkpoint ? { range: historicalRange, selectRange: selectHistoricalRange } : undefined),
+    [checkpoint, historicalRange, selectHistoricalRange],
+  );
+  const live = useWorkingDiff({
+    presentation,
+    serverId,
+    workspaceId: workspaceId ?? undefined,
+    cwd,
+    ignoreWhitespace: hideWhitespace,
+    enabled: enabled !== false && !historicalRange,
+  });
+  const history = useCheckpointDiffQuery({
+    serverId,
+    workspaceId,
+    selection: checkpoint,
+    enabled: enabled !== false,
+  });
+  const { selectUncommitted, selectBase, selectAll } = live;
+  const handleSelectUncommitted = useCallback(() => {
+    selectUncommitted();
+    selectHistoricalRange(null);
+  }, [selectUncommitted, selectHistoricalRange]);
+  const handleSelectBase = useCallback(() => {
+    selectBase();
+    selectHistoricalRange(null);
+  }, [selectBase, selectHistoricalRange]);
+  const handleSelectAll = useCallback(() => {
+    selectAll();
+    selectHistoricalRange(null);
+  }, [selectAll, selectHistoricalRange]);
+  const [preferredHistoryLayer, setPreferredHistoryLayer] = useState<"worktree" | "staged">(
+    "worktree",
+  );
+  const hasStagedChanges = Boolean(history.stagedFiles?.length);
+  const historyLayer: "staged" | "worktree" =
+    hasStagedChanges && (!history.files?.length || preferredHistoryLayer === "staged")
+      ? "staged"
+      : "worktree";
+  const historyFiles =
+    (historyLayer === "staged" ? history.stagedFiles : history.files) ?? EMPTY_HISTORICAL_FILES;
+  const historicalLayers =
+    historicalRange && hasStagedChanges
+      ? {
+          historyLayer,
+          setPreferredHistoryLayer,
+          hasWorktreeChanges: Boolean(history.files?.length),
+        }
+      : null;
+  const display = historicalRange
+    ? {
+        files: historyFiles,
+        treeFiles: historyFiles,
+        diffErrorMessage: history.errorMessage,
+        diffTooLarge: history.diffTooLarge,
+        isDiffLoading: history.isLoading,
+        isStatusLoading: false,
+        statusErrorMessage: null,
+        notGit: false,
+      }
+    : {
+        files: live.files,
+        treeFiles: live.treeFiles,
+        diffErrorMessage: live.diffPayloadError?.message ?? null,
+        diffTooLarge: live.diffTooLarge,
+        isDiffLoading: live.isDiffLoading,
+        isStatusLoading: live.isStatusLoading,
+        statusErrorMessage: live.statusErrorMessage,
+        notGit: live.notGit,
+      };
+  return {
+    live,
+    display,
+    historicalRange,
+    checkpointMenu,
+    historicalLayers,
+    handleSelectUncommitted,
+    handleSelectBase,
+    handleSelectAll,
+    attributionNotice: historicalRange ? history.attributionNotice : null,
+  };
+}
+
+function HistoricalDiffLayers({
+  layers,
+}: {
+  layers: {
+    historyLayer: "worktree" | "staged";
+    setPreferredHistoryLayer: (value: "worktree" | "staged") => void;
+    hasWorktreeChanges: boolean;
+  } | null;
+}) {
+  const copy = useCheckpointCopy();
+  const selectLayer = layers?.setPreferredHistoryLayer;
+  const showWorktree = useCallback(() => selectLayer?.("worktree"), [selectLayer]);
+  const showStaged = useCallback(() => selectLayer?.("staged"), [selectLayer]);
+  if (!layers) return null;
+  return (
+    <View style={styles.historicalDiffLayers}>
+      <Button
+        size="sm"
+        variant={layers.historyLayer === "worktree" ? "secondary" : "ghost"}
+        disabled={!layers.hasWorktreeChanges}
+        onPress={showWorktree}
+        testID="changes-checkpoint-layer-worktree"
+      >
+        {copy.worktree}
+      </Button>
+      <Button
+        size="sm"
+        variant={layers.historyLayer === "staged" ? "secondary" : "ghost"}
+        onPress={showStaged}
+        testID="changes-checkpoint-layer-staged"
+      >
+        {copy.staged}
+      </Button>
+    </View>
+  );
+}
+
+function ChangesNotices({
+  historical,
+  forgeSetup,
+  pullRequestError,
+  attribution,
+}: {
+  historical: boolean;
+  forgeSetup: string | null;
+  pullRequestError: string | null;
+  attribution: string | null;
+}) {
+  if (historical) {
+    return attribution ? (
+      <View style={styles.forgeSetupCallout} testID="changes-checkpoint-attribution">
+        <Text style={styles.forgeSetupCalloutText}>{attribution}</Text>
+      </View>
+    ) : null;
+  }
+  return (
+    <>
+      {forgeSetup ? (
+        <View style={styles.forgeSetupCallout} testID="forge-setup-callout">
+          <Text style={styles.forgeSetupCalloutText}>{forgeSetup}</Text>
+        </View>
+      ) : null}
+      {pullRequestError ? <Text style={styles.actionErrorText}>{pullRequestError}</Text> : null}
+    </>
+  );
+}
+
 export function ChangesSurface({
   serverId,
   workspaceId,
@@ -1584,39 +1818,49 @@ export function ChangesSurface({
   }, [cwd, isRefreshing, runRefresh, serverId, t, toast]);
 
   const {
+    live,
+    display,
+    historicalRange,
+    checkpointMenu,
+    historicalLayers,
+    handleSelectUncommitted,
+    handleSelectBase,
+    handleSelectAll,
+    attributionNotice,
+  } = useChangesComparison({
+    serverId,
+    workspaceId,
+    cwd,
+    enabled,
+    presentation,
+    hideWhitespace: preferences.hideWhitespace,
+  });
+  const {
     status,
-    isStatusLoading,
     isGit,
-    notGit,
-    statusErrorMessage,
     baseRef,
     currentBranchName,
     diffMode,
-    selectUncommitted: handleSelectUncommitted,
-    selectBase: handleSelectBase,
-    selectAll: handleSelectAll,
-    files,
-    treeFiles,
-    diffPayloadError,
-    diffTooLarge,
-    isDiffLoading,
     reviewActions,
     reviewAttachment,
     reviewFeedback,
-  } = useWorkingDiff({
-    presentation,
-    serverId,
-    workspaceId: workspaceId ?? undefined,
-    cwd,
-    ignoreWhitespace: preferences.hideWhitespace,
-    enabled: enabled !== false,
-  });
+  } = live;
+  const {
+    files,
+    treeFiles,
+    diffErrorMessage,
+    diffTooLarge,
+    isDiffLoading,
+    isStatusLoading,
+    statusErrorMessage,
+    notGit,
+  } = display;
   usePublishWorkingDiffAttachment({
     serverId,
     workspaceId: workspaceId ?? undefined,
     cwd,
     attachment: reviewAttachment,
-    enabled: true,
+    enabled: !historicalRange,
   });
   const {
     status: pullRequestStatus,
@@ -1748,22 +1992,26 @@ export function ChangesSurface({
     [onSelectDiffFile, presentation],
   );
   const workingMode = useMemo(
-    () => ({
+    (): WorkingDiffMode => ({
       kind: "working" as const,
-      reviewActions,
       focusPath: documentFocusRequest?.path,
       focusRequestId: documentFocusRequest?.revision,
-      workspaceFileDragScope: workspaceId ? { serverId, workspaceId } : undefined,
-      onOpenFile,
-      onOpenToSide,
-      onAddToChat,
-      onCopyPath: handleCopyPath,
-      onCopyRelativePath: handleCopyRelativePath,
-      onReveal: fileManagerTarget ? handleRevealPath : undefined,
-      revealTargetName: fileManagerTarget?.label,
-      onDownload: handleDownloadPath,
-      onDuplicate: fsEntryDuplicateEnabled ? handleDuplicatePath : undefined,
-      onRevert: onRevertPath,
+      ...(historicalRange
+        ? {}
+        : {
+            reviewActions,
+            workspaceFileDragScope: workspaceId ? { serverId, workspaceId } : undefined,
+            onOpenFile,
+            onOpenToSide,
+            onAddToChat,
+            onCopyPath: handleCopyPath,
+            onCopyRelativePath: handleCopyRelativePath,
+            onReveal: fileManagerTarget ? handleRevealPath : undefined,
+            revealTargetName: fileManagerTarget?.label,
+            onDownload: handleDownloadPath,
+            onDuplicate: fsEntryDuplicateEnabled ? handleDuplicatePath : undefined,
+            onRevert: onRevertPath,
+          }),
     }),
     [
       reviewActions,
@@ -1782,6 +2030,7 @@ export function ChangesSurface({
       fileManagerTarget,
       fsEntryDuplicateEnabled,
       onRevertPath,
+      historicalRange,
     ],
   );
 
@@ -1808,7 +2057,6 @@ export function ChangesSurface({
     () => updateCollapsedFilePaths([]),
     [updateCollapsedFilePaths],
   );
-  const diffErrorMessage = diffPayloadError?.message ?? null;
   const prErrorMessage = computePrErrorMessage(githubFeaturesEnabled, prPayloadError);
   const baseRefLabel = useMemo(
     () => computeBaseRefLabel(baseRef, t("workspace.git.diff.base")),
@@ -1824,15 +2072,17 @@ export function ChangesSurface({
     [baseRefLabel, branchLabel],
   );
   const emptyMessage = t("diffViewer.empty");
-  const emptyAction = computeChangesEmptyAction({
-    hideWhitespace: preferences.hideWhitespace,
-    diffMode,
-    status,
-    seeUncommittedLabel: t("workspace.git.diff.seeUncommittedChanges"),
-    seeCommittedLabel: t("workspace.git.diff.seeCommittedChanges"),
-    selectUncommitted: handleSelectUncommitted,
-    selectBase: handleSelectBase,
-  });
+  const emptyAction = historicalRange
+    ? null
+    : computeChangesEmptyAction({
+        hideWhitespace: preferences.hideWhitespace,
+        diffMode,
+        status,
+        seeUncommittedLabel: t("workspace.git.diff.seeUncommittedChanges"),
+        seeCommittedLabel: t("workspace.git.diff.seeCommittedChanges"),
+        selectUncommitted: handleSelectUncommitted,
+        selectBase: handleSelectBase,
+      });
 
   const diffContent: ReactElement = (
     <View style={styles.diffContainer}>
@@ -1853,7 +2103,7 @@ export function ChangesSurface({
         <DiffDocument
           files={files}
           contentInsetBottom={floatingActionsClearance(
-            [jumpToFileInset, reviewFeedback.clearance],
+            [jumpToFileInset, historicalRange ? 0 : reviewFeedback.clearance],
             bottomInset,
           )}
           collapseState={collapseState}
@@ -1861,15 +2111,17 @@ export function ChangesSurface({
           mode={workingMode}
         />
       </DiffBodyContent>
-      <ReviewFeedbackAction
-        bottomOffset={jumpToFileInset}
-        enabled={enabled}
-        hasDiff={presentation !== "tree"}
-        model={reviewFeedback.model}
-        state={reviewFeedback.state}
-        serverId={serverId}
-        workspaceId={workspaceId}
-      />
+      {!historicalRange ? (
+        <ReviewFeedbackAction
+          bottomOffset={jumpToFileInset}
+          enabled={enabled}
+          hasDiff={presentation !== "tree"}
+          model={reviewFeedback.model}
+          state={reviewFeedback.state}
+          serverId={serverId}
+          workspaceId={workspaceId}
+        />
+      ) : null}
     </View>
   );
   const bodyContent = (
@@ -1895,7 +2147,7 @@ export function ChangesSurface({
         compact: isMobile,
         hasChanges,
         canUseSplitLayout,
-        refreshSupported,
+        refreshSupported: refreshSupported && !historicalRange,
         isRefreshing,
         layout: preferences.layout,
         hideWhitespace: preferences.hideWhitespace,
@@ -1910,7 +2162,7 @@ export function ChangesSurface({
         onExpandAll: handleExpandAllFiles,
         allFilesCollapsed,
         onToggleLayout: handleToggleLayout,
-        onToggleHideWhitespace: handleToggleHideWhitespace,
+        onToggleHideWhitespace: historicalRange ? undefined : handleToggleHideWhitespace,
         onToggleWrapLines: handleToggleWrapLines,
         onToggleTree: handleToggleDesktopTree,
       }),
@@ -1928,6 +2180,7 @@ export function ChangesSurface({
       handleToggleLayout,
       handleToggleWrapLines,
       hasChanges,
+      historicalRange,
       preferences.hideWhitespace,
       preferences.inlineDiff,
       preferences.layout,
@@ -1958,6 +2211,7 @@ export function ChangesSurface({
         selectedDiffStat,
         serverId,
         workspaceId,
+        checkpoint: checkpointMenu,
       }),
     [
       baseRef,
@@ -1978,6 +2232,7 @@ export function ChangesSurface({
       serverId,
       toolbarMode,
       workspaceId,
+      checkpointMenu,
     ],
   );
 
@@ -1988,7 +2243,7 @@ export function ChangesSurface({
       }}
       style={styles.container}
     >
-      {isGit ? (
+      {isGit || historicalRange ? (
         <ChangesHeader
           compact={isMobile}
           repository={changesHeaderModel.repository}
@@ -1997,13 +2252,14 @@ export function ChangesSurface({
         />
       ) : null}
 
-      {forgeSetupMessage ? (
-        <View style={styles.forgeSetupCallout} testID="forge-setup-callout">
-          <Text style={styles.forgeSetupCalloutText}>{forgeSetupMessage}</Text>
-        </View>
-      ) : null}
+      <ChangesNotices
+        historical={Boolean(historicalRange)}
+        forgeSetup={forgeSetupMessage}
+        pullRequestError={prErrorMessage}
+        attribution={attributionNotice}
+      />
 
-      {prErrorMessage ? <Text style={styles.actionErrorText}>{prErrorMessage}</Text> : null}
+      <HistoricalDiffLayers layers={historicalLayers} />
 
       <View style={styles.diffContainer}>
         {bodyContent}
@@ -2012,21 +2268,24 @@ export function ChangesSurface({
         ) : null}
       </View>
 
-      <ReviewCommentSheet
-        enabled={enabled}
-        editor={reviewActions.sheetEditor}
-        reviewActions={reviewActions}
-        onChangeBody={reviewActions.onChangeEditorBody}
-      />
-
-      <ChangesCommits
-        presentation={presentation}
-        serverId={serverId}
-        cwd={cwd}
-        onCommitPress={handleCommitPress}
-        collapsed={instanceState.commitsCollapsed}
-        onCollapsedChange={handleCommitsCollapsedChange}
-      />
+      {!historicalRange ? (
+        <>
+          <ReviewCommentSheet
+            enabled={enabled}
+            editor={reviewActions.sheetEditor}
+            reviewActions={reviewActions}
+            onChangeBody={reviewActions.onChangeEditorBody}
+          />
+          <ChangesCommits
+            presentation={presentation}
+            serverId={serverId}
+            cwd={cwd}
+            onCommitPress={handleCommitPress}
+            collapsed={instanceState.commitsCollapsed}
+            onCollapsedChange={handleCommitsCollapsedChange}
+          />
+        </>
+      ) : null}
     </View>
   );
 }
@@ -2080,6 +2339,11 @@ const styles = StyleSheet.create((theme) => ({
   forgeSetupCalloutText: {
     fontSize: theme.fontSize.sm,
     color: theme.colors.foregroundMuted,
+  },
+  historicalDiffLayers: {
+    flexDirection: "row",
+    gap: 6,
+    paddingHorizontal: 12,
   },
   diffContainer: {
     flex: 1,

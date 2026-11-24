@@ -430,9 +430,11 @@ test("conversation rewind discards withdrawn plugin turns before and after a rep
   });
 });
 
-test("file-only plugin rewind preserves the conversation before and after a replacement prompt", async () => {
+test("legacy file-only plugin rewind is refused and preserves the conversation", async () => {
   await withRewindAgent(async ({ manager, agentId, nativeMessages, messages }) => {
-    await manager.rewind(agentId, "user-B", "files");
+    await expect(manager.rewind(agentId, "user-B", "files")).rejects.toThrow(
+      "File rewind requires the checkpoint restore operation",
+    );
     expect(nativeMessages).toEqual(["A", "B", "C"]);
     expect(messages()).toEqual(["A", "Reply A", "B", "Reply B", "C", "Reply C"]);
     await manager.runAgent(agentId, "D", { clientMessageId: "client-D" });

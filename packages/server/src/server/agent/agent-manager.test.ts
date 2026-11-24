@@ -8,8 +8,16 @@ import {
 } from "./agent-messages/index.js";
 import { createLifecyclePreparation } from "./restart-recovery/lifecycle-preparation.js";
 import { expect, test, vi, onTestFinished } from "vitest";
-import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -51,6 +59,8 @@ import {
 } from "@getpaseo/protocol/agent-labels";
 import { REMOTE_HIERARCHY_DEPTH_LABEL } from "./hierarchy-policy.js";
 import { AgentTurnBusyError, sendPreparedPromptToAgent, startAgentRun } from "./agent-prompt.js";
+import { runRewindDirectoryWriter } from "../agent-rewind-scope.js";
+import { CheckpointService } from "./checkpoints/checkpoint-service.js";
 import { StaleProviderSessionError } from "./stale-provider-session-error.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent-loading.js";
 import type { StoredAgentRecord } from "./agent-storage.js";
@@ -89,9 +99,534 @@ import { OpenCodeV2AgentClient } from "./providers/opencode/v2/agent.js";
 import { CursorACPAgentClient } from "./providers/cursor-acp-agent.js";
 import { fileURLToPath } from "node:url";
 import { V2Harness } from "./providers/opencode/test-utils/v2-harness.js";
+import { createWorktree } from "../../utils/worktree.js";
+import type { PersistedProjectRecord, PersistedWorkspaceRecord } from "../workspace-registry.js";
 
 const DESKTOP_OPEN_AGENT_TAB_LABEL = getOpenAgentTabLabel("desktop-client");
 const MOBILE_OPEN_AGENT_TAB_LABEL = getOpenAgentTabLabel("mobile-client");
+
+async function checkpointFixture(
+  optionsForFixture: {
+    afterToolWrites?: string;
+    patchEdit?: boolean;
+    earlierTurn?: boolean;
+    stageOnly?: boolean;
+    durableTimelineStore?: AgentTimelineStore;
+  } = {},
+) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "paseo-agent-rewind-")));
+  onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+  const projectRoot = join(root, "repo");
+  const paseoHome = join(root, "state");
+  mkdirSync(projectRoot);
+  mkdirSync(paseoHome);
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  git(projectRoot, "init", "-b", "main");
+  writeFileSync(join(projectRoot, "example.txt"), "committed\n");
+  git(projectRoot, "add", "example.txt");
+  git(
+    projectRoot,
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@example.invalid",
+    "commit",
+    "-m",
+    "base",
+  );
+  const { worktreePath: cwd } = await createWorktree({
+    cwd: projectRoot,
+    paseoHome,
+    worktreeSlug: "rewind",
+    source: { kind: "branch-off", baseBranch: "main", branchName: "rewind" },
+  });
+  const file = join(cwd, "example.txt");
+  writeFileSync(file, "before staged\n");
+  git(cwd, "add", "example.txt");
+  writeFileSync(file, "before worktree\n");
+  const timestamp = new Date().toISOString();
+  const workspace: PersistedWorkspaceRecord = {
+    workspaceId: "workspace",
+    projectId: "project",
+    cwd,
+    kind: "worktree",
+    displayName: "Test",
+    title: null,
+    branch: "rewind",
+    worktreeRoot: cwd,
+    isPaseoOwnedWorktree: true,
+    mainRepoRoot: projectRoot,
+    baseBranch: "main",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    archivedAt: null,
+    autoArchivedChangeRequestUrl: null,
+    pinnedAt: null,
+    metadata: {},
+    background: false,
+  };
+  const project: PersistedProjectRecord = {
+    projectId: "project",
+    rootPath: projectRoot,
+    displayName: "Test",
+    kind: "git",
+    projectKey: null,
+    customName: null,
+    customIconRevision: null,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    archivedAt: null,
+  };
+  const workspaces = [workspace];
+  class CheckpointTestSession extends TestAgentSession {
+    override readonly capabilities = { ...TEST_CAPABILITIES, supportsRewindConversation: true };
+    readonly rewinds: string[] = [];
+    history: AgentTimelineItem[] = [];
+    historyFailed = false;
+    onRewind: () => void | Promise<void> = () => {
+      this.history = [];
+    };
+
+    override async startTurn(
+      prompt: AgentPromptInput,
+      options?: AgentRunOptions,
+    ): Promise<{ turnId: string }> {
+      const turnId = options?.clientMessageId ?? randomUUID();
+      if (prompt === "keep this turn") {
+        this.pushEvent({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: { type: "user_message", text: prompt, messageId: "provider-earlier" },
+        });
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+        return { turnId };
+      }
+      if (optionsForFixture.stageOnly) {
+        git(cwd, "add", "example.txt");
+        this.pushEvent({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: { type: "user_message", text: String(prompt), messageId: `provider-${turnId}` },
+        });
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+        return { turnId };
+      }
+      writeFileSync(file, "after staged\n");
+      git(cwd, "add", "example.txt");
+      writeFileSync(file, "after worktree\n");
+      this.history = [
+        {
+          type: "user_message",
+          text: String(prompt),
+          messageId: `provider-${turnId}`,
+          clientMessageId: options?.clientMessageId,
+        },
+        {
+          type: "tool_call",
+          callId: "write-staged",
+          name: "Write",
+          status: "completed",
+          error: null,
+          detail: { type: "write", filePath: file, content: "after staged\n" },
+        },
+        {
+          type: "tool_call",
+          callId: "write-worktree",
+          name: "Write",
+          status: "completed",
+          error: null,
+          detail: optionsForFixture.patchEdit
+            ? {
+                type: "edit",
+                filePath: file,
+                unifiedDiff: "@@ -1 +1 @@\n-after staged\n+after worktree\n",
+              }
+            : { type: "write", filePath: file, content: "after worktree\n" },
+        },
+      ];
+      for (const item of this.history) {
+        this.pushEvent({ type: "timeline", provider: this.provider, turnId, item });
+      }
+      if (optionsForFixture.afterToolWrites) writeFileSync(file, optionsForFixture.afterToolWrites);
+      this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      return { turnId };
+    }
+
+    override async *streamHistory() {
+      if (this.historyFailed) {
+        yield {
+          type: "turn_failed",
+          provider: this.provider,
+          error: "History read failed",
+        } as const;
+        return;
+      }
+      for (const item of this.history)
+        yield { type: "timeline", provider: this.provider, item } as const;
+    }
+
+    async revertConversation({ messageId }: { messageId: string }) {
+      this.rewinds.push(messageId);
+      await this.onRewind();
+    }
+  }
+  const session = new CheckpointTestSession({ provider: "codex", cwd });
+  const storage = new AgentStorage(join(paseoHome, "agents"), logger);
+  const makeManager = () =>
+    new AgentManager({
+      clients: {
+        codex: new (class extends TestAgentClient {
+          override async createSession() {
+            return session;
+          }
+        })(),
+      },
+      registry: storage,
+      durableTimelineStore: optionsForFixture.durableTimelineStore,
+      rewindDirectories: {
+        paseoHome,
+        projects: { get: async () => project },
+        workspaces: {
+          get: async (id) => workspaces.find((entry) => id === entry.workspaceId) ?? null,
+          listActive: async () => workspaces,
+        },
+      },
+      logger,
+    });
+  const create = (manager: AgentManager, id?: string) =>
+    manager.createAgent({ provider: "codex", cwd }, id, { workspaceId: workspace.workspaceId });
+  const manager = makeManager();
+  const agent = await create(manager);
+  if (optionsForFixture.earlierTurn) await manager.runAgent(agent.id, "keep this turn");
+  const messageId = "submitted";
+  await manager.runAgent(agent.id, "make edits", { clientMessageId: messageId });
+  const target = { agentId: agent.id, messageId };
+  const result = await manager.getRewindCheckpoint(target);
+  return {
+    manager,
+    session,
+    target,
+    workspaces,
+    workspace,
+    file,
+    cwd,
+    create,
+    makeManager,
+    storage,
+    service: new CheckpointService({ paseoHome }),
+    scope: {
+      workspaceId: workspace.workspaceId,
+      agentId: agent.id,
+      cwd,
+      worktreeRoot: cwd,
+      projectRoot,
+      exclusive: true,
+      isController: false,
+    },
+    checkpointId: result.target.checkpointId,
+    state: () => ({
+      worktree: readFileSync(file, "utf8"),
+      index: git(cwd, "show", ":example.txt"),
+    }),
+  };
+}
+
+const afterCheckpointEdit = { worktree: "after worktree\n", index: "after staged\n" };
+const beforeCheckpointEdit = { worktree: "before worktree\n", index: "before staged\n" };
+
+test("checkpoint rewind rejects legacy file modes and keeps legacy conversation-only rewind", async () => {
+  const { manager, session, target, state } = await checkpointFixture();
+  for (const mode of ["both", "files"] as const) {
+    await expect(manager.rewind(target.agentId, target.messageId, mode)).rejects.toThrow(
+      "File rewind requires the checkpoint restore operation",
+    );
+  }
+  expect(session.rewinds).toEqual([]);
+  await manager.rewind(target.agentId, target.messageId, "conversation");
+  expect(session.rewinds).toEqual(["provider-submitted"]);
+  expect(state()).toEqual(afterCheckpointEdit);
+});
+
+test.each(["throws", "unconfirmed", "reports a replay failure", "loses retained history"] as const)(
+  "checkpoint rewind keeps disk when chat %s",
+  async (failure) => {
+    const { manager, session, target, state, checkpointId } = await checkpointFixture({
+      earlierTurn: failure === "loses retained history",
+    });
+    session.onRewind = () => {
+      if (failure === "throws") throw new Error("provider failed");
+      if (failure === "reports a replay failure" || failure === "loses retained history") {
+        session.history = [];
+        session.historyFailed = failure === "reports a replay failure";
+      }
+    };
+    await expect(
+      manager.restoreRewindCheckpoint({ ...target, checkpointId, mode: "both" }),
+    ).rejects.toThrow(
+      failure === "throws" ? "provider failed" : "Provider history did not confirm",
+    );
+    expect(state()).toEqual(afterCheckpointEdit);
+    expect(session.rewinds).toEqual(["provider-submitted"]);
+  },
+);
+
+test("checkpoint rewind retries files after recreating the manager without a provider session", async () => {
+  const { manager, session, target, state, file, checkpointId, makeManager } =
+    await checkpointFixture();
+  session.onRewind = () => {
+    expect(state()).toEqual(afterCheckpointEdit);
+    session.history = [];
+    writeFileSync(file, "external write during conversation rewind\n");
+  };
+  const pending = await manager.restoreRewindCheckpoint({ ...target, checkpointId, mode: "both" });
+  expect(pending).toMatchObject({
+    operation: {
+      operationId: expect.any(String),
+      backupCheckpointId: expect.any(String),
+      target: { messageId: target.messageId, checkpointId },
+      status: "files_pending",
+      conversationRewound: true,
+    },
+  });
+  expect(state()).toEqual({
+    ...afterCheckpointEdit,
+    worktree: "external write during conversation rewind\n",
+  });
+  writeFileSync(file, afterCheckpointEdit.worktree);
+  await manager.closeAgent(target.agentId);
+  const restarted = makeManager();
+  expect(restarted.getAgent(target.agentId)).toBeNull();
+  const retried = await restarted.retryRewindFiles({
+    agentId: target.agentId,
+    operationId: pending.operation.operationId,
+  });
+  expect(retried).toEqual({
+    error: null,
+    operation: { ...pending.operation, status: "files_restored" },
+  });
+  expect(session.rewinds).toEqual(["provider-submitted"]);
+  expect(state()).toEqual(beforeCheckpointEdit);
+});
+
+test("checkpoint rewind excludes parent and child directory writes while confirming chat", async () => {
+  const { cwd, manager, session, target, checkpointId, state } = await checkpointFixture();
+  const entered = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  session.onRewind = async () => {
+    entered.resolve();
+    await resume.promise;
+    session.history = [];
+  };
+  const restore = manager.restoreRewindCheckpoint({ ...target, checkpointId, mode: "both" });
+  try {
+    await Promise.race([
+      entered.promise,
+      restore.then(() => {
+        throw new Error("Restore completed before chat confirmation");
+      }),
+    ]);
+    const write = vi.fn(async () => {});
+    for (const directory of [join(cwd, ".."), cwd, join(cwd, "nested")]) {
+      await expect(runRewindDirectoryWriter(manager, directory, write)).rejects.toThrow(
+        "A file rewind is active in this directory",
+      );
+    }
+    expect(write).not.toHaveBeenCalled();
+    expect(state()).toEqual(afterCheckpointEdit);
+  } finally {
+    resume.resolve();
+  }
+  expect(await restore).toMatchObject({ error: null, operation: { status: "files_restored" } });
+  expect(state()).toEqual(beforeCheckpointEdit);
+});
+
+test("checkpoint rewind rejects active sibling agents, shared worktrees and symbolic links", async () => {
+  const { manager, target, state, file, cwd, checkpointId, workspaces, workspace, create } =
+    await checkpointFixture();
+  const sibling = await create(manager);
+  const run = manager.streamAgent(sibling.id, "active reserve");
+  const restore = () => manager.restoreRewindCheckpoint({ ...target, checkpointId, mode: "files" });
+  await expect(restore()).rejects.toThrow("An agent is active in this directory");
+  await drainAsyncGenerator(run);
+  workspaces.push({ ...workspace, workspaceId: "shared" });
+  await expect(restore()).rejects.toThrow("exclusive Paseo worktree");
+  workspaces.pop();
+  expect(state()).toEqual(afterCheckpointEdit);
+  rmSync(file);
+  const outside = join(cwd, "..", "outside.txt");
+  writeFileSync(outside, "protected\n");
+  symlinkSync(outside, file);
+  await expect(restore()).rejects.toThrow(/symbolic link|symlink|unsupported|regular/iu);
+  expect(readFileSync(outside, "utf8")).toBe("protected\n");
+});
+
+test("checkpoint historical diff still returns saved content after a live edit", async () => {
+  const { manager, target, file } = await checkpointFixture();
+  writeFileSync(file, "external later edit\n");
+  const diff = await manager.getRewindCheckpointDiff({ ...target, range: "turn" });
+  expect(diff).toMatchObject({
+    kind: "ready",
+    attribution: "unknown",
+    files: [
+      {
+        path: "example.txt",
+        hunks: [
+          {
+            lines: [
+              { type: "header", content: "@@ -1 +1 @@" },
+              { type: "remove", content: "before worktree" },
+              { type: "add", content: "after worktree" },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+});
+
+test("checkpoint historical diff includes staging without a worktree change", async () => {
+  const { manager, target } = await checkpointFixture({ stageOnly: true });
+  expect(await manager.getRewindCheckpointDiff({ ...target, range: "turn" })).toMatchObject({
+    kind: "ready",
+    files: [],
+    stagedFiles: [
+      {
+        path: "example.txt",
+        hunks: [
+          {
+            lines: [
+              { type: "header" },
+              { type: "remove", content: "before staged" },
+              { type: "add", content: "before worktree" },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+});
+
+test.each(["write failure", "incomplete readback"] as const)(
+  "checkpoint rewind keeps disk when durable history reports %s",
+  async (failure) => {
+    const store = new RecordingTimelineStore();
+    const { manager, session, target, checkpointId, state } = await checkpointFixture({
+      earlierTurn: true,
+      durableTimelineStore: store,
+    });
+    await manager.flush();
+    session.onRewind = () => {
+      session.history = [
+        { type: "user_message", text: "keep this turn", messageId: "provider-earlier" },
+      ];
+      if (failure === "write failure") {
+        vi.spyOn(store, "bulkInsert").mockRejectedValueOnce(new Error("history write failed"));
+      } else {
+        vi.spyOn(store, "getCommittedRows").mockResolvedValueOnce([]);
+      }
+    };
+    await expect(
+      manager.restoreRewindCheckpoint({ ...target, checkpointId, mode: "both" }),
+    ).rejects.toThrow(
+      failure === "write failure" ? "history write failed" : "Could not confirm persisted",
+    );
+    expect(session.rewinds).toEqual(["provider-submitted"]);
+    expect(state()).toEqual(afterCheckpointEdit);
+  },
+);
+
+test("checkpoint rewind forks the next turn from the restored boundary", async () => {
+  const store = new RecordingTimelineStore();
+  const { manager, target, checkpointId, service, scope, state } = await checkpointFixture({
+    durableTimelineStore: store,
+  });
+  const restore = await manager.restoreRewindCheckpoint({ ...target, checkpointId, mode: "both" });
+  expect(restore).toMatchObject({ error: null, operation: { status: "files_restored" } });
+  expect(await store.getCommittedRows(target.agentId)).toEqual([]);
+  expect(state()).toEqual(beforeCheckpointEdit);
+  await manager.runAgent(target.agentId, "replacement prompt", { clientMessageId: "replacement" });
+  const live = await service.getActiveTimeline(scope);
+  expect(live).toMatchObject({
+    parent: { timelineId: target.agentId, turnId: target.messageId, boundary: "before" },
+    turns: [
+      { turnId: "replacement", before: expect.any(String), settled: { outcome: "succeeded" } },
+    ],
+  });
+  await expect(manager.getRewindCheckpoint(target)).rejects.toThrow(
+    "Message checkpoint is unavailable",
+  );
+  const nextTarget = { agentId: target.agentId, messageId: "replacement" };
+  const next = await manager.getRewindCheckpoint(nextTarget);
+  await expect(
+    manager.restoreRewindCheckpoint({
+      ...nextTarget,
+      checkpointId: next.target.checkpointId,
+      mode: "files",
+    }),
+  ).resolves.toMatchObject({ error: null, operation: { status: "files_restored" } });
+  expect(state()).toEqual(beforeCheckpointEdit);
+});
+
+test("checkpoint collection after manager restart settles an orphan without attributing its writes", async () => {
+  const { manager, target, makeManager, service, scope, storage, file } = await checkpointFixture();
+  await service.acceptTurn({
+    scope,
+    timelineId: target.agentId,
+    turnId: "orphan",
+    daemonEpoch: "previous-daemon",
+    message: { id: "orphan", text: "Interrupted" },
+  });
+  writeFileSync(file, "unattributed during downtime\n");
+  await manager.closeAgent(target.agentId);
+  const restarted = makeManager();
+  await ensureAgentLoaded(target.agentId, {
+    agentManager: restarted,
+    agentStorage: storage,
+    logger,
+  });
+  await restarted.runAgent(target.agentId, "after restart", { clientMessageId: "fresh" });
+  expect((await service.getActiveTimeline(scope))?.turns.slice(-2)).toMatchObject([
+    { turnId: "orphan", settled: { outcome: "interrupted", after: null } },
+    { turnId: "fresh", settled: { outcome: "succeeded", after: expect.any(String) } },
+  ]);
+  const freshTarget = { agentId: target.agentId, messageId: "fresh" };
+  expect(await restarted.getRewindCheckpoint(freshTarget)).toMatchObject({ canRewindFiles: true });
+});
+
+test("checkpoint rewind rejects an unknown writer on a path named by a completed edit", async () => {
+  const external = "unknown writer during the turn\n";
+  const { manager, session, target, state, checkpointId } = await checkpointFixture({
+    afterToolWrites: external,
+  });
+  await expect(
+    manager.restoreRewindCheckpoint({ ...target, checkpointId, mode: "both" }),
+  ).rejects.toThrow("Restore overlaps changes that cannot be attributed to an agent edit");
+  expect(session.rewinds).toEqual([]);
+  expect(state()).toEqual({ ...afterCheckpointEdit, worktree: external });
+});
+
+test("checkpoint rewind restores files and staging from a verified edit without rewinding chat", async () => {
+  const { manager, session, target, state, checkpointId } = await checkpointFixture({
+    patchEdit: true,
+  });
+  await expect(
+    manager.restoreRewindCheckpoint({ ...target, checkpointId, mode: "files" }),
+  ).resolves.toMatchObject({
+    error: null,
+    operation: {
+      status: "files_restored",
+      conversationRewound: false,
+    },
+  });
+  expect(session.rewinds).toEqual([]);
+  expect(state()).toEqual(beforeCheckpointEdit);
+});
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -2346,7 +2881,7 @@ test("a steer the provider names without echoing it can be rewound to", async ()
   class SilentSteeringSession extends SteeringTestSession {
     override readonly capabilities = {
       ...TEST_CAPABILITIES,
-      supportsRewindFiles: true,
+      supportsRewindConversation: true,
     };
     rewindMessageIds: string[] = [];
 
@@ -2360,7 +2895,7 @@ test("a steer the provider names without echoing it can be rewound to", async ()
       return { status: "accepted", providerMessageId: `provider-${options.clientMessageId}` };
     }
 
-    override async revertFiles({ messageId }: { messageId: string }): Promise<void> {
+    async revertConversation({ messageId }: { messageId: string }): Promise<void> {
       this.rewindMessageIds.push(messageId);
     }
   }
@@ -2400,7 +2935,7 @@ test("a steer the provider names without echoing it can be rewound to", async ()
       item: { text: "steered", clientMessageId: "steer-client" },
     });
 
-    await manager.rewind(agent.id, "steer-client", "files");
+    await manager.rewind(agent.id, "steer-client", "conversation");
     expect(session.rewindMessageIds).toEqual(["provider-steer-client"]);
   } finally {
     if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
@@ -14536,7 +15071,7 @@ test("canonical submitted prompt keeps wire identity while rewind resolves provi
   class SubmittedUserMessageSession extends TestAgentSession {
     override readonly capabilities = {
       ...TEST_CAPABILITIES,
-      supportsRewindFiles: true,
+      supportsRewindConversation: true,
     };
     readonly rewindMessageIds: string[] = [];
     interruptCount = 0;
@@ -14581,7 +15116,7 @@ test("canonical submitted prompt keeps wire identity while rewind resolves provi
       });
     }
 
-    override async revertFiles({ messageId }: { messageId: string }): Promise<void> {
+    async revertConversation({ messageId }: { messageId: string }): Promise<void> {
       this.rewindMessageIds.push(messageId);
     }
   }
@@ -14634,7 +15169,7 @@ test("canonical submitted prompt keeps wire identity while rewind resolves provi
     });
     await manager.waitForAgentRunStart(snapshot.id);
 
-    await expect(manager.rewind(snapshot.id, "msg-client-1", "files")).rejects.toThrow(
+    await expect(manager.rewind(snapshot.id, "msg-client-1", "conversation")).rejects.toThrow(
       "Cannot rewind before the provider acknowledges the submitted prompt",
     );
     expect(client.session?.interruptCount).toBe(0);
@@ -14677,8 +15212,8 @@ test("canonical submitted prompt keeps wire identity while rewind resolves provi
       },
     ]);
 
-    await manager.rewind(snapshot.id, "msg-client-1", "files");
-    await manager.rewind(snapshot.id, "provider-native-message", "files");
+    await manager.rewind(snapshot.id, "msg-client-1", "conversation");
+    await manager.rewind(snapshot.id, "provider-native-message", "conversation");
     expect(client.session?.rewindMessageIds).toEqual([
       "provider-message-1",
       "provider-native-message",

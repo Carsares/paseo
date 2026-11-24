@@ -24,6 +24,7 @@ import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, resolve } from "node:path";
 import { stat } from "node:fs/promises";
+import { isDeepStrictEqual } from "node:util";
 import {
   AGENT_LIFECYCLE_STATUSES,
   type AgentLifecycleStatus,
@@ -62,6 +63,7 @@ import {
 import type { Logger } from "pino";
 import type { ToolPolicy } from "@getpaseo/protocol/agent-types";
 import { getErrorMessage } from "@getpaseo/protocol/error-utils";
+import type { AgentRewindCheckpointDiffResponse } from "@getpaseo/protocol/messages";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
@@ -144,6 +146,20 @@ import {
   type PendingForegroundRun,
 } from "./agent-run-state.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
+import {
+  assertNoFileRewind,
+  getAgentRewindScope,
+  rewindDirectoryActivity,
+  rewindDirectoriesOverlap,
+  type AgentRewindDirectories,
+  type AgentRewindSubject,
+} from "../agent-rewind-scope.js";
+import { AgentRewindCheckpoints } from "../agent-rewind-checkpoints.js";
+import type {
+  CheckpointScope,
+  TurnCheckpoint,
+  TurnOutcome,
+} from "./checkpoints/checkpoint-service.js";
 import {
   parseAgentMessage,
   parseAgentMessages,
@@ -681,6 +697,7 @@ export interface AgentManagerOptions {
   idFactory?: () => string;
   registry?: AgentStorage;
   workspaceRegistry?: Pick<WorkspaceRegistry, "get">;
+  rewindDirectories?: AgentRewindDirectories;
   getAgentProfile?: (id: string) => AgentProfile | undefined;
   onAgentAttention?: AgentAttentionCallback;
   onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
@@ -1553,6 +1570,13 @@ export class AgentManager {
   private cancelAutomaticParentSubscription?: (childId: string, parentId: string) => Promise<void>;
   private acceptingAgentRegistrations = true;
   private runAdmissionPaused = false;
+  private rewindDirectories?: AgentRewindDirectories;
+  private rewindCheckpoints?: AgentRewindCheckpoints;
+  private readonly rewindDaemonEpoch = randomUUID();
+  private readonly rewindTurns = new Map<
+    string,
+    { scope: CheckpointScope; turn: TurnCheckpoint }
+  >();
 
   constructor(options: AgentManagerOptions) {
     this.pluginLifecycle = options.pluginLifecycle;
@@ -1562,6 +1586,7 @@ export class AgentManager {
     this.idFactory = options.idFactory ?? (() => randomUUID());
     this.registry = options.registry;
     this.workspaceRegistry = options.workspaceRegistry;
+    if (options.rewindDirectories) this.configureRewindCheckpoints(options.rewindDirectories);
     this.getAgentProfile = options.getAgentProfile;
     this.timelinePrefixes = this.registry?.timelinePrefixes ?? new TimelinePrefixStore();
     this.durableTimelineStore = options.durableTimelineStore;
@@ -6784,6 +6809,7 @@ export class AgentManager {
     const agent = await this.ensureInteractiveSession(agentId);
     this.assertAcceptingAgentRuns();
     this.assertNoGuardedArchive(agentId);
+    assertNoFileRewind(this, agent.cwd);
     // A switch can acquire the lifecycle lane while the history session is opening.
     // Let the foreground admission path wait for that switch.
     if (this.providerSwitches.has(agentId)) return false;
@@ -6862,6 +6888,7 @@ export class AgentManager {
         }
       : undefined;
     const command = this.runForegroundMutation(agentId, async () => {
+      assertNoFileRewind(this, agent.cwd);
       assertDispatchAllowed?.();
       try {
         await handler.run({ emit: dispatch, beforeProviderDispatch, onProviderOutcome });
@@ -7039,6 +7066,8 @@ export class AgentManager {
               specialists,
             )
           : prompt;
+      await this.captureRewindTurn(agent, prompt, options);
+      assertNoFileRewind(this, agent.cwd);
       const result = await this.startAdmittedProviderTurn(params, providerPrompt);
       if (specialists) this.promptedResidentSpecialists.set(agent.session, specialists);
       if (addedMainControl) this.promptedMainControlRoleVersions.set(agentId, roleVersion);
@@ -7047,8 +7076,10 @@ export class AgentManager {
       return result.turnId;
     } catch (error) {
       if (error instanceof AgentTurnStartCanceledError) {
+        await this.settleRewindTurn(agent, "cancelled");
         return this.finishCanceledForegroundStart(params, error);
       }
+      await this.settleRewindTurn(agent, "failed");
       if (pendingRun.settled) {
         throw error;
       }
@@ -7355,6 +7386,7 @@ export class AgentManager {
     )
       return this.streamAfterRuntimeCollection(agentId, prompt, options, promptStart);
     const existingAgent = this.requireSessionAgent(agentId);
+    assertNoFileRewind(this, existingAgent.cwd);
     if (
       this.historySessions.has(existingAgent.session) ||
       this.needsHierarchySessionReload(agentId) ||
@@ -8428,6 +8460,11 @@ export class AgentManager {
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
+    // COMPAT(rewindCheckpoints): keep accepting legacy file modes on the wire, but
+    // reject them before opening a provider session. Added in v0.17.0.
+    if (mode !== "conversation") {
+      throw new Error("File rewind requires the checkpoint restore operation");
+    }
     if (this.providerSwitches.has(agentId)) await this.waitForAgentClose(agentId);
     let agent = this.requireSessionAgent(agentId);
     if (this.historySessions.has(agent.session)) {
@@ -8452,47 +8489,451 @@ export class AgentManager {
       await this.cancelAgentRunBefore(agentId, "rewind");
     }
 
+    assertNoFileRewind(this, agent.cwd);
+    await this.rewindConversation(agent, {
+      messageId,
+      providerMessageId,
+      afterConfirmed: async () => {
+        if (!this.rewindDirectories || !this.rewindCheckpoints) return;
+        const scope = await getAgentRewindScope(this.rewindDirectories, agent).catch(() => null);
+        if (!scope) return;
+        const checkpoint = await this.getRewindTurn(scope, messageId).catch(() => null);
+        if (!checkpoint) return;
+        const { turn } = checkpoint;
+        try {
+          await this.rewindCheckpoints.service.forkTimeline({
+            scope,
+            timelineId: randomUUID(),
+            from: { timelineId: turn.timelineId, turnId: turn.turnId, boundary: "before" },
+          });
+        } catch (error) {
+          // A legacy conversation-only rewind must still succeed if checkpoints are unavailable.
+          this.logger.warn({ err: error, agentId }, "Could not fork file checkpoints");
+        }
+      },
+    });
+  }
+
+  private async rewindConversation(
+    agent: ActiveManagedAgent,
+    input: {
+      messageId: string;
+      providerMessageId: string;
+      verifyHistory?: (items: AgentTimelineItem[]) => void;
+      afterConfirmed?: () => Promise<void>;
+    },
+  ): Promise<void> {
+    const { id: agentId } = agent;
+    const { messageId, providerMessageId, verifyHistory } = input;
+    if (agent.provider === "opencode" || agent.providerAdapter === "opencode") {
+      throw new Error("OpenCode does not support conversation-only rewind");
+    }
+    if (this.hasInFlightRun(agentId)) throw new Error("Agent has an active run");
     const lock = this.runs.createPendingRun(agentId);
     try {
-      this.logger.info(
-        { agentId, provider: agent.provider, messageId, mode },
-        "agent.rewind.start",
-      );
-      await invokeRewindCapability(agent.session, { messageId: providerMessageId, mode });
-      if (mode !== "files") {
-        await this.hydrateTimelineFromProvider(agentId, {
-          force: true,
-          broadcast: true,
-          broadcastTimeline: false,
-        });
-        this.dispatch({
-          type: "timeline_replacement",
-          agentId,
-          epoch: this.timelineStore.getEpoch(agentId),
-        });
-      }
+      this.logger.info({ agentId, provider: agent.provider, messageId }, "agent.rewind.start");
+      await invokeRewindCapability(agent.session, {
+        messageId: providerMessageId,
+        mode: "conversation",
+      });
+      await this.forceHydrateTimelineFromLegacyProviderHistory(agent, true, false, verifyHistory);
+      this.dispatch({
+        type: "timeline_replacement",
+        agentId,
+        epoch: this.timelineStore.getEpoch(agentId),
+      });
       // Rewind stages provider events under the run lock; publish its final state directly.
       this.refreshSessionPersistence(agent);
       await this.refreshSessionState(agent, { emit: false });
       await this.persistSnapshot(agent);
+      await input.afterConfirmed?.();
       this.emitState(agent, { persist: false });
-      this.logger.info(
-        { agentId, provider: agent.provider, messageId, mode },
-        "agent.rewind.complete",
-      );
+      this.logger.info({ agentId, provider: agent.provider, messageId }, "agent.rewind.complete");
     } catch (error) {
       // Native rewind can commit a fork before history refresh fails. Recovery
       // must resume that latest handle rather than the abandoned conversation.
       this.refreshSessionPersistence(agent);
       await this.persistSnapshot(agent);
       this.logger.warn(
-        { err: error, agentId, provider: agent.provider, messageId, mode },
+        { err: error, agentId, provider: agent.provider, messageId },
         "agent.rewind.failed",
       );
       throw error;
     } finally {
       this.runs.settleForegroundRun(agentId, lock.token);
     }
+  }
+
+  configureRewindCheckpoints(directories: AgentRewindDirectories): void {
+    this.rewindDirectories = directories;
+    this.rewindCheckpoints = new AgentRewindCheckpoints(directories);
+  }
+
+  private assertRewindWritersIdle(scope: CheckpointScope, ignoreOwnCapture = false): void {
+    if (
+      [...rewindDirectoryActivity(this).writers.keys()].some((cwd) =>
+        rewindDirectoriesOverlap(scope.cwd, cwd),
+      )
+    ) {
+      throw new Error("A workspace write is active in this directory");
+    }
+    for (const agent of this.agents.values()) {
+      if (
+        (ignoreOwnCapture && agent.id === scope.agentId) ||
+        !rewindDirectoriesOverlap(scope.cwd, agent.cwd)
+      )
+        continue;
+      if (
+        this.hasInFlightRun(agent.id) ||
+        agent.lifecycle === "initializing" ||
+        agent.pendingPermissions.size ||
+        this.foregroundMutationTails.has(agent.id)
+      ) {
+        throw new Error("An agent is active in this directory");
+      }
+    }
+  }
+
+  private async captureRewindTurn(
+    agent: ActiveManagedAgent,
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+  ): Promise<void> {
+    const clientMessageId = options?.clientMessageId;
+    if (!this.rewindDirectories || !this.rewindCheckpoints || !clientMessageId) return;
+    if (!agent.workspaceId || isMainControlAgentLabels(agent.labels) || agent.internal) return;
+    try {
+      const scope = await getAgentRewindScope(this.rewindDirectories, agent);
+      assertNoFileRewind(this, scope.cwd);
+      this.assertRewindWritersIdle(scope, true);
+      if (await this.rewindDirectories.hasActiveTerminal?.(scope.cwd)) return;
+      const { service } = this.rewindCheckpoints;
+      await service.recoverInterruptedTurns(scope, this.rewindDaemonEpoch);
+      const timeline = await service.getActiveTimeline(scope);
+      const turn = await service.acceptTurn({
+        scope,
+        timelineId: timeline?.id ?? agent.id,
+        daemonEpoch: this.rewindDaemonEpoch,
+        turnId: clientMessageId,
+        message: { id: clientMessageId, clientMessageId, text: submittedPromptText(prompt) },
+      });
+      if (!turn.settled) this.rewindTurns.set(agent.id, { scope, turn });
+    } catch (error) {
+      this.logger.debug({ err: error, agentId: agent.id }, "File checkpoint unavailable");
+    }
+  }
+
+  private async settleRewindTurn(agent: ActiveManagedAgent, outcome: TurnOutcome): Promise<void> {
+    const capture = this.rewindTurns.get(agent.id);
+    if (!capture || !this.rewindCheckpoints) return;
+    this.rewindTurns.delete(agent.id);
+    const submitted = this.timelineStore.getSubmittedUserMessage(agent.id, capture.turn.message.id);
+    try {
+      await this.rewindCheckpoints.service.settleTurn({
+        scope: capture.scope,
+        timelineId: capture.turn.timelineId,
+        turnId: capture.turn.turnId,
+        outcome,
+        providerMessageId: submitted?.providerMessageId,
+      });
+    } catch (error) {
+      this.logger.warn({ err: error, agentId: agent.id }, "Failed to settle file checkpoint");
+    }
+  }
+
+  private requireRewindCheckpointService() {
+    if (!this.rewindCheckpoints || !this.rewindDirectories) {
+      throw new Error("File rewind is unavailable");
+    }
+    return { checkpoints: this.rewindCheckpoints, directories: this.rewindDirectories };
+  }
+
+  private rewindMessage(agentId: string, messageId: string) {
+    const rows = this.timelineStore.getRows(agentId);
+    const row = rows.find(
+      (entry) =>
+        entry.item.type === "user_message" &&
+        [entry.item.messageId, entry.item.clientMessageId, entry.providerMessageId].includes(
+          messageId,
+        ),
+    );
+    if (!row || row.item.type !== "user_message") throw new Error("User message is unavailable");
+    const providerMessageId =
+      row.providerMessageId ??
+      (row.item.clientMessageId !== row.item.messageId ? row.item.messageId : undefined);
+    return { row, providerMessageId, rows };
+  }
+
+  private async getRewindTurn(scope: CheckpointScope, messageId: string) {
+    const { checkpoints } = this.requireRewindCheckpointService();
+    const timeline = await checkpoints.service.getActiveTimeline(scope);
+    const matches = timeline?.turns.filter(({ message }) =>
+      [message.id, message.clientMessageId, message.providerMessageId].includes(messageId),
+    );
+    const turn = matches?.length === 1 ? matches[0] : undefined;
+    if (!turn?.settled?.after || !timeline) throw new Error("Message checkpoint is unavailable");
+    return { turn, timeline };
+  }
+
+  async getRewindCheckpoint(input: { agentId: string; messageId: string }) {
+    const { directories, checkpoints } = this.requireRewindCheckpointService();
+    const agent = this.requireAgent(input.agentId);
+    const scope = await getAgentRewindScope(directories, agent);
+    const eligibility = await checkpoints.service.eligibility(scope);
+    if (!eligibility.allowed) throw new Error(eligibility.reason);
+    if (await directories.hasActiveTerminal?.(scope.cwd)) {
+      throw new Error("A terminal is active in this directory");
+    }
+    this.assertRewindWritersIdle(scope);
+    assertNoFileRewind(this, scope.cwd);
+    const { turn } = await this.getRewindTurn(scope, input.messageId);
+    const { providerMessageId } = this.rewindMessage(agent.id, input.messageId);
+    return {
+      target: { checkpointId: turn.before, messageId: input.messageId },
+      canRewindFiles: true,
+      canRewindBoth:
+        Boolean(providerMessageId ?? turn.message.providerMessageId) &&
+        this.canCombineRewind(agent),
+    };
+  }
+
+  async getRewindCheckpointDiff(input: {
+    agentId: string;
+    messageId: string;
+    range: "turn" | "baseline";
+  }): Promise<NonNullable<AgentRewindCheckpointDiffResponse["result"]>> {
+    const { directories, checkpoints } = this.requireRewindCheckpointService();
+    const agent = this.requireAgent(input.agentId);
+    const scope = await getAgentRewindScope(directories, agent).catch(() => null);
+    if (!scope || !(await checkpoints.service.eligibility(scope)).allowed) {
+      return { kind: "unavailable", reason: "unsupported" };
+    }
+    const checkpoint = await this.getRewindTurn(scope, input.messageId).catch((error: unknown) => {
+      if (error instanceof Error && error.message === "Message checkpoint is unavailable")
+        return null;
+      throw error;
+    });
+    const afterId = checkpoint?.turn.settled?.after;
+    if (!checkpoint || !afterId) return { kind: "unavailable", reason: "missing" };
+    const { turn, timeline } = checkpoint;
+    return {
+      kind: "ready",
+      ...(await checkpoints.diff({
+        scope,
+        beforeId: input.range === "turn" ? turn.before : timeline.baseline,
+        afterId,
+      })),
+      attribution: "unknown",
+    };
+  }
+
+  private canCombineRewind(agent: ManagedAgent): boolean {
+    const adapter = agent.providerAdapter ?? agent.provider;
+    return (
+      (adapter === "claude" || adapter === "codex") &&
+      agent.capabilities.supportsRewindConversation === true
+    );
+  }
+
+  private async withFileRewind<T>(
+    agentId: string,
+    run: (
+      scope: CheckpointScope,
+      validate: () => Promise<void>,
+      checkpoints: AgentRewindCheckpoints,
+    ) => Promise<T>,
+  ): Promise<T> {
+    const { checkpoints, directories } = this.requireRewindCheckpointService();
+    const agent = await this.getRewindSubject(agentId);
+    return checkpoints.withDirectory(agent.cwd, async () => {
+      const validate = async () => {
+        const latest = await this.getRewindSubject(agentId);
+        if (latest.cwd !== agent.cwd || latest.workspaceId !== agent.workspaceId) {
+          throw new Error("Agent moved during file rewind");
+        }
+        const scope = await getAgentRewindScope(directories, latest);
+        if (await directories.hasActiveTerminal?.(scope.cwd)) {
+          throw new Error("A terminal is active in this directory");
+        }
+        this.assertRewindWritersIdle(scope);
+        return scope;
+      };
+      const scope = await validate();
+      assertNoFileRewind(this, scope.cwd);
+      rewindDirectoryActivity(this).rewinds.add(scope.cwd);
+      try {
+        await validate();
+        return await run(
+          scope,
+          async () => {
+            await validate();
+          },
+          checkpoints,
+        );
+      } finally {
+        rewindDirectoryActivity(this).rewinds.delete(scope.cwd);
+        this.onWorkspaceStateMayHaveChanged?.({ cwd: scope.cwd });
+      }
+    });
+  }
+
+  private async getRewindSubject(agentId: string): Promise<AgentRewindSubject> {
+    const id = validateAgentId(agentId, "getRewindSubject");
+    const live = this.agents.get(id);
+    if (live) return live;
+    const stored = await this.registry?.get(id);
+    if (!stored || stored.archivedAt) throw new Error(`Unknown agent '${id}'`);
+    const { cwd } = stored;
+    if (!cwd) throw new Error("Agent worktree is unavailable");
+    return { ...stored, cwd };
+  }
+
+  restoreRewindCheckpoint(input: {
+    agentId: string;
+    messageId: string;
+    checkpointId: string;
+    mode: "files" | "both";
+  }) {
+    return this.withFileRewind(input.agentId, async (scope, validate, checkpoints) => {
+      const { turn, timeline } = await this.getRewindTurn(scope, input.messageId);
+      if (turn.before !== input.checkpointId) throw new Error("Message checkpoint changed");
+      const { row, providerMessageId, rows } = this.rewindMessage(input.agentId, input.messageId);
+      const anchor = providerMessageId ?? turn.message.providerMessageId;
+      const agent = this.requireAgent(input.agentId);
+      if (input.mode === "both" && (!anchor || !this.canCombineRewind(agent))) {
+        throw new Error("This provider cannot rewind the conversation to this checkpoint");
+      }
+      const index = timeline.turns.findIndex((entry) => entry.turnId === turn.turnId);
+      const laterTurns = timeline.turns.slice(index);
+      const tip = laterTurns.at(-1)!;
+      const superseded = new Set<string>([input.messageId, turn.message.id]);
+      const retained = rows.flatMap((entry) =>
+        entry.seq < row.seq && entry.item.type === "user_message"
+          ? [[entry.item.messageId, entry.item.clientMessageId, entry.providerMessageId]]
+          : [],
+      );
+      if (anchor) superseded.add(anchor);
+      for (const entry of rows) {
+        if (entry.seq < row.seq) continue;
+        const item = entry.item;
+        if (item.type === "user_message") {
+          for (const id of [item.messageId, item.clientMessageId, entry.providerMessageId]) {
+            if (id) superseded.add(id);
+          }
+        }
+      }
+      return checkpoints.restore({
+        scope,
+        turn,
+        validate,
+        messageId: input.messageId,
+        mode: input.mode,
+        verifyChanges: async (paths, expectedCurrent) => {
+          const tipPreview = await checkpoints.service.preflightRestore({
+            scope,
+            target: { timelineId: tip.timelineId, turnId: tip.turnId, boundary: "after" },
+          });
+          if (
+            tipPreview.expectedCurrent !== expectedCurrent ||
+            tipPreview.changes.files.length ||
+            tipPreview.changes.index.length
+          ) {
+            throw new Error("Worktree or staging changed outside the checkpointed turns");
+          }
+          if (paths.length) {
+            await this.verifyRewindAttribution({ scope, paths, rows, laterTurns, checkpoints });
+          }
+          for (let boundary = 1; boundary < laterTurns.length; boundary++) {
+            const previous = laterTurns[boundary - 1];
+            const next = laterTurns[boundary];
+            const delta = (
+              await checkpoints.service.getCheckpointChanges({
+                scope,
+                from: {
+                  timelineId: previous.timelineId,
+                  turnId: previous.turnId,
+                  boundary: "after",
+                },
+                target: { timelineId: next.timelineId, turnId: next.turnId, boundary: "before" },
+              })
+            ).sinceReference;
+            if (
+              !delta ||
+              [...delta.files, ...delta.index].some((change) => paths.includes(change.path))
+            ) {
+              throw new Error("Restore overlaps edits made between checkpointed turns");
+            }
+          }
+        },
+        rewindConversation: async () => {
+          if (!anchor) throw new Error("Provider message is not confirmed");
+          await this.rewindConversation(await this.ensureInteractiveSession(agent.id), {
+            messageId: input.messageId,
+            providerMessageId: anchor,
+            verifyHistory: (items) => {
+              const replayedUsers = items.filter((item) => item.type === "user_message");
+              const replayedIds = new Set(
+                replayedUsers.flatMap((item) => [item.messageId, item.clientMessageId]),
+              );
+              if (
+                [...superseded].some((id) => replayedIds.has(id)) ||
+                retained.length !== replayedUsers.length ||
+                retained.some((ids, i) => {
+                  const replayed = replayedUsers[i];
+                  return !ids.some(
+                    (id) => id && (id === replayed?.messageId || id === replayed?.clientMessageId),
+                  );
+                })
+              ) {
+                throw new Error("Provider history did not confirm conversation rewind");
+              }
+            },
+          });
+        },
+      });
+    });
+  }
+
+  private async verifyRewindAttribution(input: {
+    scope: CheckpointScope;
+    paths: string[];
+    rows: AgentTimelineRow[];
+    laterTurns: TurnCheckpoint[];
+    checkpoints: AgentRewindCheckpoints;
+  }): Promise<void> {
+    const { scope, paths, rows, laterTurns, checkpoints } = input;
+    const agent = this.requireAgent(scope.agentId);
+    const adapter = agent.providerAdapter ?? agent.provider;
+    if (adapter !== "claude" && adapter !== "codex" && adapter !== "opencode") {
+      throw new Error("This provider does not supply file edit evidence");
+    }
+    const rowsByTurn = new Map<string, AgentTimelineItem[]>();
+    for (const row of rows) {
+      if (!row.turnId) continue;
+      const items = rowsByTurn.get(row.turnId) ?? [];
+      items.push(row.item);
+      rowsByTurn.set(row.turnId, items);
+    }
+    for (const turn of laterTurns) {
+      const ids = new Set([turn.message.id, turn.message.providerMessageId]);
+      const prompt = rows.find(
+        ({ item }) =>
+          item.type === "user_message" &&
+          [item.messageId, item.clientMessageId].some((id) => id && ids.has(id)),
+      );
+      await checkpoints.verifyAttribution({
+        scope,
+        turn,
+        paths,
+        items: rowsByTurn.get(prompt?.turnId ?? "") ?? [],
+      });
+    }
+  }
+
+  retryRewindFiles(input: { agentId: string; operationId: string }) {
+    return this.withFileRewind(input.agentId, (scope, validate, checkpoints) =>
+      checkpoints.retry({ scope, validate, operationId: input.operationId }),
+    );
   }
 
   async deleteAgentState(agentId: string): Promise<void> {
@@ -9457,11 +9898,15 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     broadcast: boolean,
     broadcastTimeline: boolean,
+    verifyHistory?: (items: AgentTimelineItem[]) => void,
   ): Promise<void> {
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
     let deliveredHandoff = false;
     for await (const rawEvent of agent.session.streamHistory()) {
+      if (verifyHistory && rawEvent.type === "turn_failed") {
+        throw new Error("Provider history did not confirm conversation rewind");
+      }
       deliveredHandoff ||= replayIncludesContextHandoff(rawEvent, agent.id);
       const event = limitAgentStreamEventContent(rawEvent, agent.id);
       if (event.type === "timeline") {
@@ -9473,12 +9918,13 @@ export class AgentManager {
       }
     }
 
+    verifyHistory?.(historyEvents.map((event) => event.item));
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     this.cancelContextHandoff(agent.id);
-    await this.deleteCommittedTimeline(agent.id);
+    if (!verifyHistory) await this.deleteCommittedTimeline(agent.id);
     this.timelineStore.delete(agent.id);
     this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
-    const prefix = await this.seedTimelinePrefix(agent.id);
+    const prefix = await this.seedTimelinePrefix(agent.id, !verifyHistory);
     agent.historyPrimed = true;
 
     for (const event of this.providerSubagents.deleteParent(agent.id)) {
@@ -9493,11 +9939,15 @@ export class AgentManager {
       }
     }
     for (const event of this.excludePrefixReplay(prefix, historyEvents)) {
-      const row = this.recordTimeline(
-        agent.id,
-        event.item,
-        event.timestamp ? { timestamp: event.timestamp } : undefined,
-      );
+      const row = verifyHistory
+        ? this.timelineStore.append(agent.id, limitAgentTimelineItemContent(event.item), {
+            timestamp: event.timestamp,
+          })
+        : this.recordTimeline(
+            agent.id,
+            event.item,
+            event.timestamp ? { timestamp: event.timestamp } : undefined,
+          );
       if (broadcastTimeline) {
         this.dispatchStream(
           agent.id,
@@ -9509,6 +9959,23 @@ export class AgentManager {
           },
         );
       }
+    }
+    const store = this.durableTimelineStore;
+    if (verifyHistory && store) {
+      const rows = this.timelineStore.getRows(agent.id);
+      await this.writeDurableTimeline(agent.id, async () => {
+        await store.deleteAgent(agent.id);
+        if (rows.length) await store.bulkInsert(agent.id, rows);
+        const persisted = await store.getCommittedRows(agent.id);
+        if (
+          !isDeepStrictEqual(
+            JSON.parse(JSON.stringify(persisted)),
+            JSON.parse(JSON.stringify(rows)),
+          )
+        ) {
+          throw new Error("Could not confirm persisted conversation history");
+        }
+      });
     }
     await this.restoreContextAfterReplay(agent, prefix, deliveredHandoff);
     this.touchUpdatedAt(agent);
@@ -9611,7 +10078,10 @@ export class AgentManager {
     }
   }
 
-  private async seedTimelinePrefix(agentId: string): Promise<PersistedTimelinePrefix | null> {
+  private async seedTimelinePrefix(
+    agentId: string,
+    persist = true,
+  ): Promise<PersistedTimelinePrefix | null> {
     const prefix = await this.timelinePrefixes.load(agentId);
     if (!prefix?.rows.length) return prefix;
     const current = this.timelineStore.getRows(agentId);
@@ -9624,7 +10094,7 @@ export class AgentManager {
       nextSeq: seq + 1,
       sealedThrough: maxTimelineSeq(prefix.rows),
     });
-    await this.seedDurableTimelinePrefix(agentId, prefix.rows);
+    if (persist) await this.seedDurableTimelinePrefix(agentId, prefix.rows);
     return prefix;
   }
 
@@ -9768,8 +10238,13 @@ export class AgentManager {
 
     if (!options?.fromHistory) {
       if (isTurnTerminalEvent(event)) {
-        this.runs.settleTerminalRun(agent.id, eventTurnId);
-        this.publishTerminalReadiness(agent, eventTurnId, isForegroundEvent, terminalDisposition);
+        await this.completeTerminalTurn({
+          agent,
+          event,
+          eventTurnId,
+          isForegroundEvent,
+          terminalDisposition,
+        });
       }
 
       if (flags.shouldDispatchEvent) {
@@ -9794,6 +10269,26 @@ export class AgentManager {
       // Publish autonomous readiness only after the tracked run has settled.
       this.emitState(agent);
     }
+  }
+
+  private async completeTerminalTurn(input: {
+    agent: ActiveManagedAgent;
+    event: TurnTerminalEvent;
+    eventTurnId: string | undefined;
+    isForegroundEvent: boolean;
+    terminalDisposition: ActiveTurnTerminalDisposition;
+  }): Promise<void> {
+    const { agent, event, eventTurnId, isForegroundEvent, terminalDisposition } = input;
+    if (isForegroundEvent && terminalDisposition !== "stale" && this.rewindTurns.has(agent.id)) {
+      const outcome = {
+        turn_failed: "failed",
+        turn_canceled: "cancelled",
+        turn_completed: "succeeded",
+      } as const;
+      await this.settleRewindTurn(agent, outcome[event.type]);
+    }
+    this.runs.settleTerminalRun(agent.id, eventTurnId);
+    this.publishTerminalReadiness(agent, eventTurnId, isForegroundEvent, terminalDisposition);
   }
 
   private traceHandleStreamEventStart(

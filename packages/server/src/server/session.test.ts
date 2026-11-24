@@ -2216,6 +2216,69 @@ describe("workspace label editing", () => {
 });
 
 describe("session authorization permissions", () => {
+  test("allows read-only checkpoint diffs while keeping restore and retry restricted", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const result = {
+      kind: "ready",
+      files: [],
+      stagedFiles: [],
+      diffTooLarge: false,
+      attribution: "unknown",
+    };
+    const getRewindCheckpointDiff = vi.fn().mockResolvedValue(result);
+    const restoreRewindCheckpoint = vi.fn();
+    const retryRewindFiles = vi.fn();
+    const session = createSessionForTest({
+      permissions: ["workspace.read"],
+      messages,
+      agentManager: { getRewindCheckpointDiff, restoreRewindCheckpoint, retryRewindFiles },
+    });
+    const shared = { agentId: "agent", requestId: "denied" };
+    const requests: SessionInboundMessage[] = [
+      { ...shared, type: "agent.rewind.checkpoint.get.request", messageId: "message" },
+      {
+        ...shared,
+        type: "agent.rewind.checkpoint.restore.request",
+        messageId: "message",
+        checkpointId: "checkpoint",
+        mode: "both",
+      },
+      { ...shared, type: "agent.rewind.checkpoint.retry_files.request", operationId: "operation" },
+    ];
+    for (const request of requests) await session.handleMessage(request);
+    expect(messages).toEqual(
+      requests.map((request) => ({
+        type: "rpc_error",
+        payload: {
+          requestId: "denied",
+          requestType: request.type,
+          error: `Session is not authorized for ${request.type}`,
+          code: "access_denied",
+        },
+      })),
+    );
+    expect(restoreRewindCheckpoint).not.toHaveBeenCalled();
+    expect(retryRewindFiles).not.toHaveBeenCalled();
+
+    await session.handleMessage({
+      ...shared,
+      requestId: "allowed",
+      type: "agent.rewind.checkpoint.diff.get.request",
+      messageId: "message",
+      range: "turn",
+    });
+    expect(getRewindCheckpointDiff).toHaveBeenCalledWith({
+      type: "agent.rewind.checkpoint.diff.get.request",
+      agentId: "agent",
+      messageId: "message",
+      range: "turn",
+      requestId: "allowed",
+    });
+    expect(messages.at(-1)).toMatchObject({
+      type: "agent.rewind.checkpoint.diff.get.response",
+      payload: { requestId: "allowed", ok: true, result },
+    });
+  });
   test("routes named-agent validation through the session source", async () => {
     const messages: SessionOutboundMessage[] = [];
     const providers = createProviderSnapshotManagerStub();

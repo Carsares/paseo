@@ -136,6 +136,11 @@ import type {
   DaemonConfigReloadResponse,
   DiagnosticsResponse,
   AgentRewindResponseMessage,
+  AgentRewindCheckpointGetResponse,
+  AgentRewindCheckpointDiffResponse,
+  AgentRewindCheckpointRestoreResponse,
+  AgentRewindCheckpointRetryFilesResponse,
+  RewindCheckpointOperation,
   ListTerminalsResponse,
   CreateTerminalResponse,
   SubscribeTerminalResponse,
@@ -1469,6 +1474,16 @@ export class AgentResumeOnStopUnsupportedError extends Error {
     );
     this.name = "AgentResumeOnStopUnsupportedError";
     this.version = version;
+  }
+}
+
+export class AgentRewindFilesPendingError extends Error {
+  constructor(
+    message: string,
+    public readonly operation: RewindCheckpointOperation,
+  ) {
+    super(message);
+    this.name = "AgentRewindFilesPendingError";
   }
 }
 
@@ -4837,6 +4852,30 @@ export class DaemonClient {
     messageId: string,
     mode: "conversation" | "files" | "both",
   ): Promise<AgentRewindResponseMessage["payload"]> {
+    if (mode !== "conversation") {
+      const checkpoint = await this.getAgentRewindCheckpoint({ agentId, messageId });
+      if (
+        !checkpoint.ok ||
+        !checkpoint.target ||
+        (mode === "both" ? !checkpoint.canRewindBoth : !checkpoint.canRewindFiles)
+      ) {
+        throw new Error(checkpoint.error ?? "No eligible checkpoint for this message");
+      }
+      const result = await this.restoreAgentRewindCheckpoint({
+        agentId,
+        messageId,
+        checkpointId: checkpoint.target.checkpointId,
+        mode,
+      });
+      if (!result.ok) {
+        const message = result.error ?? "Agent rewind failed";
+        if (result.operation?.status === "files_pending") {
+          throw new AgentRewindFilesPendingError(message, result.operation);
+        }
+        throw new Error(message);
+      }
+      return result;
+    }
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
       type: "agent.rewind.request",
@@ -4863,6 +4902,91 @@ export class DaemonClient {
       throw new Error(payload.error ?? "Agent rewind failed");
     }
     return payload;
+  }
+
+  // COMPAT(rewindCheckpoints): added in v0.17.0, remove the gate after 2027-05-24.
+  supportsRewindCheckpoints(): boolean {
+    return this.getLastServerInfoMessage()?.features?.rewindCheckpoints === true;
+  }
+
+  private requireRewindCheckpoints(): void {
+    if (!this.supportsRewindCheckpoints()) {
+      throw new Error("Update the host to use checkpoint rewind");
+    }
+  }
+
+  async getAgentRewindCheckpoint(input: {
+    agentId: string;
+    messageId: string;
+  }): Promise<AgentRewindCheckpointGetResponse> {
+    this.requireRewindCheckpoints();
+    const requestId = this.createRequestId();
+    return this.sendRequest({
+      requestId,
+      message: { type: "agent.rewind.checkpoint.get.request", requestId, ...input },
+      options: { skipQueue: true },
+      select: (msg) =>
+        msg.type === "agent.rewind.checkpoint.get.response" && msg.payload.requestId === requestId
+          ? msg.payload
+          : null,
+    });
+  }
+
+  async restoreAgentRewindCheckpoint(input: {
+    agentId: string;
+    messageId: string;
+    checkpointId: string;
+    mode: "files" | "both";
+  }): Promise<AgentRewindCheckpointRestoreResponse> {
+    this.requireRewindCheckpoints();
+    const requestId = this.createRequestId();
+    return this.sendRequest({
+      requestId,
+      message: { type: "agent.rewind.checkpoint.restore.request", requestId, ...input },
+      options: { skipQueue: true },
+      select: (msg) =>
+        msg.type === "agent.rewind.checkpoint.restore.response" &&
+        msg.payload.requestId === requestId
+          ? msg.payload
+          : null,
+    });
+  }
+
+  async retryAgentRewindFiles(input: {
+    agentId: string;
+    operationId: string;
+  }): Promise<AgentRewindCheckpointRetryFilesResponse> {
+    this.requireRewindCheckpoints();
+    const requestId = this.createRequestId();
+    return this.sendRequest({
+      requestId,
+      message: { type: "agent.rewind.checkpoint.retry_files.request", requestId, ...input },
+      options: { skipQueue: true },
+      select: (msg) =>
+        msg.type === "agent.rewind.checkpoint.retry_files.response" &&
+        msg.payload.requestId === requestId
+          ? msg.payload
+          : null,
+    });
+  }
+
+  async getAgentRewindCheckpointDiff(input: {
+    agentId: string;
+    messageId: string;
+    range: "turn" | "baseline";
+  }): Promise<AgentRewindCheckpointDiffResponse> {
+    this.requireRewindCheckpoints();
+    const requestId = this.createRequestId();
+    return this.sendRequest({
+      requestId,
+      message: { type: "agent.rewind.checkpoint.diff.get.request", requestId, ...input },
+      options: { skipQueue: true },
+      select: (msg) =>
+        msg.type === "agent.rewind.checkpoint.diff.get.response" &&
+        msg.payload.requestId === requestId
+          ? msg.payload
+          : null,
+    });
   }
 
   async cancelAgent(agentId: string): Promise<void> {

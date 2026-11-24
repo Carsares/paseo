@@ -16,6 +16,11 @@ export interface RewindMenuLabels {
   both: string;
 }
 
+export interface RewindCheckpointActions {
+  canRewindFiles?: boolean;
+  canRewindBoth?: boolean;
+}
+
 const DEFAULT_REWIND_MENU_LABELS: RewindMenuLabels = {
   conversation: "Rewind conversation",
   files: "Rewind files",
@@ -34,28 +39,26 @@ export function resolveRewindMenuItems(
       >
     | null
     | undefined,
+  checkpoint?: RewindCheckpointActions,
   labelsInput?: Partial<RewindMenuLabels>,
 ): RewindMenuItem[] {
-  if (!capabilities) {
-    return [];
-  }
   const labels = { ...DEFAULT_REWIND_MENU_LABELS, ...labelsInput };
   const items: RewindMenuItem[] = [];
-  if (capabilities.supportsRewindConversation) {
+  if (capabilities?.supportsRewindConversation) {
     items.push({
       mode: "conversation",
       label: labels.conversation,
       testID: "rewind-menu-conversation",
     });
   }
-  if (capabilities.supportsRewindFiles) {
+  if (checkpoint?.canRewindFiles) {
     items.push({
       mode: "files",
       label: labels.files,
       testID: "rewind-menu-files",
     });
   }
-  if (capabilities.supportsRewindBoth) {
+  if (checkpoint?.canRewindBoth && capabilities?.supportsRewindConversation) {
     items.push({
       mode: "both",
       label: labels.both,
@@ -67,15 +70,16 @@ export function resolveRewindMenuItems(
 
 export function useRewindMenuItems(
   capabilities: Parameters<typeof resolveRewindMenuItems>[0],
+  checkpoint?: RewindCheckpointActions,
 ): RewindMenuItem[] {
   const { t } = useTranslation();
   return useMemo(
     () =>
-      resolveRewindMenuItems(capabilities, {
+      resolveRewindMenuItems(capabilities, checkpoint, {
         conversation: t("rewind.actions.conversation"),
         files: t("rewind.actions.files"),
         both: t("rewind.actions.both"),
       }),
-    [capabilities, t],
+    [capabilities, checkpoint, t],
   );
 }

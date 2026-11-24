@@ -113,27 +113,56 @@ describe("AgentManager rewind", () => {
     expect(events.filter((type) => type === "agent_stream")).toEqual([]);
   });
 
-  test("rewinds files without rehydrating the conversation timeline", async () => {
-    const { manager, session, agentId } = await createRewindHarness();
+  test.each(["files", "both"] as const)(
+    "rejects legacy %s rewind before invoking the provider",
+    async (mode) => {
+      const { manager, session, agentId } = await createRewindHarness();
 
-    await manager.rewind(agentId, "message-1", "files");
+      await expect(manager.rewind(agentId, "message-1", mode)).rejects.toThrow(
+        "File rewind requires the checkpoint restore operation",
+      );
 
-    expect(session.recordedRewinds).toEqual([{ mode: "files", messageId: "message-1" }]);
-    expect(session.historyReadCount).toBe(0);
-  });
+      expect(session.recordedRewinds).toEqual([]);
+      expect(session.historyReadCount).toBe(0);
+    },
+  );
 
-  test("aborts an in-flight turn before rewinding", async () => {
+  test.each(["files", "both"] as const)(
+    "rejects checkpoint %s rewind for an agent without a managed workspace",
+    async (mode) => {
+      const { manager, session, agentId } = await createRewindHarness();
+      manager.configureRewindCheckpoints({
+        paseoHome: process.cwd(),
+        projects: { get: async () => null },
+        workspaces: { get: async () => null, listActive: async () => [] },
+      });
+
+      await expect(
+        manager.restoreRewindCheckpoint({
+          agentId,
+          messageId: "message-1",
+          checkpointId: "00000000-0000-4000-8000-000000000903",
+          mode,
+        }),
+      ).rejects.toThrow("This agent cannot restore files");
+
+      expect(session.recordedRewinds).toEqual([]);
+      expect(session.historyReadCount).toBe(0);
+    },
+  );
+
+  test("aborts an in-flight turn before rewinding the conversation", async () => {
     const { manager, session, agentId } = await createRewindHarness();
     const run = manager.streamAgent(agentId, "keep working");
     await run.next();
 
-    await manager.rewind(agentId, "message-1", "files");
+    await manager.rewind(agentId, "message-1", "conversation");
 
     expect(session.aborted).toBe(true);
-    expect(session.recordedRewinds).toEqual([{ mode: "files", messageId: "message-1" }]);
+    expect(session.recordedRewinds).toEqual([{ mode: "conversation", messageId: "message-1" }]);
   });
 
-  test("does not rewind when the in-flight turn rejects cancellation", async () => {
+  test("does not rewind the conversation when the in-flight turn rejects cancellation", async () => {
     class RejectingInterruptSession extends FakeRewindSession {
       override async interrupt(): Promise<void> {
         throw new Error("provider still owns the active turn");
@@ -152,7 +181,7 @@ describe("AgentManager rewind", () => {
     const run = manager.streamAgent(agent.id, "keep working");
     await run.next();
 
-    await expect(manager.rewind(agent.id, "message-1", "files")).rejects.toThrow(
+    await expect(manager.rewind(agent.id, "message-1", "conversation")).rejects.toThrow(
       `Cannot rewind agent ${agent.id} because its active run cancellation was not acknowledged`,
     );
     expect(session.recordedRewinds).toEqual([]);
@@ -167,7 +196,7 @@ describe("AgentManager rewind", () => {
     historyGate.hold();
     const { manager, agentId } = await createRewindHarness({ historyGate });
 
-    const rewind = manager.rewind(agentId, "message-1", "both");
+    const rewind = manager.rewind(agentId, "message-1", "conversation");
 
     expect(() => manager.streamAgent(agentId, "too early")).toThrow(
       "Agent 00000000-0000-4000-8000-000000000901 already has an active run",
