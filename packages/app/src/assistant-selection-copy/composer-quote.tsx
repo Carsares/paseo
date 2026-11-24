@@ -3,11 +3,13 @@ import { useKeyboardActionDispatcher } from "@/keyboard/keyboard-action-dispatch
 
 export interface ComposerQuote {
   quote: string;
+  /** Card title in the composer; the numbered default when omitted. */
+  label?: string;
 }
 
 /** The composer draft a quote goes into. */
 export interface ComposerQuoteTarget {
-  addQuoteAttachment: (quoteText: string) => void;
+  addQuoteAttachment: (quoteText: string, label?: string) => void;
 }
 
 interface ComposerQuoteContextValue {
@@ -48,7 +50,7 @@ export function ComposerQuoteProvider({
     () =>
       target && {
         addQuote: (input) => {
-          target.addQuoteAttachment(input.quote);
+          target.addQuoteAttachment(input.quote, input.label);
           keyboardActionDispatcher.dispatch({ id: "message-input.focus", scope: "message-input" });
         },
       },

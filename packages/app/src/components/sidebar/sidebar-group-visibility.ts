@@ -26,6 +26,7 @@ export interface SidebarGroupVisibility<T> {
 
 export type SidebarGroupVisibilityPolicy<T> =
   | { kind: "pinned" }
+  | { kind: "unreadConclusions" }
   | { kind: "workspaces"; getStatusBucket: (item: T) => SidebarStateBucket };
 
 // A placement can outrun its entry: a retained sidebar that is inactive (compact layout with the
@@ -39,6 +40,12 @@ export function createWorkspaceVisibilityPolicy<T extends { workspaceKey: string
     getStatusBucket: (item) => entriesByKey.get(item.workspaceKey)?.statusBucket ?? "done",
   };
 }
+
+const SIDEBAR_GROUP_LIMITS: Record<SidebarGroupVisibilityPolicy<never>["kind"], number> = {
+  pinned: 20,
+  unreadConclusions: 5,
+  workspaces: 7,
+};
 
 function isOpenWorkspace(
   item: SidebarGroupItem,
@@ -55,7 +62,7 @@ export function selectSidebarGroupVisibility<T extends SidebarGroupItem>(
   input: SidebarGroupVisibilityInput<T>,
 ): SidebarGroupVisibility<T> {
   const { items, expanded, policy, selection } = input;
-  const limit = policy.kind === "pinned" ? 20 : 7;
+  const limit = SIDEBAR_GROUP_LIMITS[policy.kind];
   const baseline: T[] = [];
   let leadingItem: T | null = null;
   let canToggle = false;

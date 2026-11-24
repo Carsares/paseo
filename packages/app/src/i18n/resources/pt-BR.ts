@@ -289,6 +289,12 @@ export const ptBR: TranslationResources = {
         permission: "Permissão necessária",
         closed: "Fechado",
       },
+      actions: {
+        openSubagent: "Abrir subagente",
+        quoteReply: "Citar resposta",
+        viewDetails: "Ver detalhes",
+        collapse: "Recolher",
+      },
     },
     messageCapped: "Esta mensagem foi truncada ({{bytes}} bytes).",
     quote: {
@@ -447,6 +453,8 @@ export const ptBR: TranslationResources = {
       viewDiagram: "Ver diagrama",
     },
     actions: {
+      quoteReply: "Citar resposta",
+      quoteSelection: "Citar seleção",
       copyCode: "Copiar código",
       copyTurn: "Copiar turno",
       copyMessage: "Copiar mensagem",
@@ -1404,6 +1412,11 @@ export const ptBR: TranslationResources = {
     },
     pinned: {
       title: "Fixados",
+    },
+    unreadConclusions: {
+      title: "Conclusões não lidas",
+      markAllRead: "Marcar tudo como lido",
+      markRead: "Marcar como lido",
     },
     host: {
       noHost: "Nenhum host",

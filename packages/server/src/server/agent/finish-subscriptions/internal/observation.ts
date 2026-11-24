@@ -1,5 +1,5 @@
 import type { Logger } from "pino";
-import type { AgentManager } from "../../agent-manager.js";
+import type { AgentManager, ManagedAgent } from "../../agent-manager.js";
 import type { AgentStorage } from "../../agent-storage.js";
 import type { AgentMessageDelivery } from "../../agent-messages/index.js";
 import { buildStoredAgentPayload, toAgentPayload } from "../../agent-projections.js";
@@ -7,8 +7,19 @@ import { serializeSnapshotWithMetadata } from "../../mcp-shared.js";
 import { createHostObservationResolver, type ToolHosts } from "../../host-operations/index.js";
 import { openFinishObservation } from "./observation-stream.js";
 import type { AgentStreamEvent } from "../../agent-sdk-types.js";
-import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import type { FinishObservation } from "../index.js";
+import { resolveReportTitle } from "../../report-title.js";
+import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
+
+function withReportTitle(
+  agentId: string,
+  snapshot: AgentSnapshotPayload | null,
+  liveTitle?: string | null,
+): AgentSnapshotPayload | null {
+  return snapshot
+    ? { ...snapshot, title: resolveReportTitle(agentId, snapshot.title, liveTitle) ?? null }
+    : null;
+}
 
 export function createFinishObservation(input: {
   agentManager: AgentManager;
@@ -32,13 +43,14 @@ export function createFinishObservation(input: {
         const live = agentManager.getAgent(agentId);
         if (!live) {
           const stored = await agentStorage.get(agentId);
+          const final = stored
+            ? buildStoredAgentPayload(stored, [stored.provider], (provider, own) =>
+                agentManager.effectiveOptionsFor(provider, own),
+              )
+            : null;
           return {
             status: stored?.lastStatus === "error" ? "error" : "idle",
-            final: stored
-              ? buildStoredAgentPayload(stored, [stored.provider], (provider, own) =>
-                  agentManager.effectiveOptionsFor(provider, own),
-                )
-              : null,
+            final: withReportTitle(agentId, final),
             lastMessage: await agentManager.getCompletionAssistantMessage(
               agentId,
               null,
@@ -55,11 +67,12 @@ export function createFinishObservation(input: {
         });
         const current = result.completionSnapshot;
         const status = result.permission ? "permission" : result.status;
+        const final = current
+          ? await serializeSnapshotWithMetadata(agentStorage, current, input.logger)
+          : null;
         return {
           status: status === "permission" || status === "error" ? status : "idle",
-          final: current
-            ? await serializeSnapshotWithMetadata(agentStorage, current, input.logger)
-            : null,
+          final: withReportTitle(agentId, final, current?.config.title),
           lastMessage: result.lastMessage,
           error: current?.lastError ?? null,
           turnId: current?.lastTurnCompletion?.event.turnId,
@@ -67,15 +80,26 @@ export function createFinishObservation(input: {
       },
       async observe(agentId, handler, signal, onError) {
         await input.waitForResume(agentId, signal);
-        const stored = await agentStorage.get(agentId);
         let updates = Promise.resolve();
         const publish = (
-          snapshot: AgentSnapshotPayload,
+          agent: ManagedAgent,
           event: AgentStreamEvent | undefined,
           lastMessage: string | null | Promise<string | null>,
+          fallbackConfigTitle?: string | null,
         ) => {
+          const snapshot = toAgentPayload(agent);
           updates = Promise.all([updates, lastMessage])
-            .then(([, message]) => handler(snapshot, event, message))
+            .then(async ([, message]) => {
+              const stored = await agentStorage.get(agentId);
+              const title = resolveReportTitle(
+                agentId,
+                stored?.title,
+                agentManager.getAgent(agentId)?.config.title,
+                fallbackConfigTitle,
+                snapshot.title,
+              );
+              return handler({ ...snapshot, title: title ?? null }, event, message);
+            })
             .catch(onError);
         };
         signal.throwIfAborted();
@@ -85,15 +109,16 @@ export function createFinishObservation(input: {
               const status = event.agent.lifecycle;
               if (status === "closed") {
                 publish(
-                  toAgentPayload(event.agent, { title: stored?.title }),
+                  event.agent,
                   undefined,
                   agentManager.getCompletionAssistantMessage(agentId, event.agent, status),
+                  event.agent.config.title,
                 );
               } else if (
                 status === "error" &&
                 event.agent.lastTurnCompletion?.event.type !== "turn_failed"
               ) {
-                publish(toAgentPayload(event.agent, { title: stored?.title }), undefined, null);
+                publish(event.agent, undefined, null, event.agent.config.title);
               }
               return;
             }
@@ -110,17 +135,17 @@ export function createFinishObservation(input: {
               const current = agentManager.getAgent(agentId);
               if (!current) return;
               const completion = current.lastTurnCompletion;
-              const snapshot = toAgentPayload(current, { title: stored?.title });
               if (completion?.event === streamEvent) {
-                publish(snapshot, streamEvent, completion.lastMessage);
+                publish(current, streamEvent, completion.lastMessage, current.config.title);
               } else if (streamEvent.type === "permission_requested") {
                 publish(
-                  snapshot,
+                  current,
                   streamEvent,
                   agentManager.getCompletionAssistantMessage(agentId, current, current.lifecycle),
+                  current.config.title,
                 );
               } else if (streamEvent.type === "permission_resolved") {
-                publish(snapshot, streamEvent, null);
+                publish(current, streamEvent, null, current.config.title);
               }
             }
           },

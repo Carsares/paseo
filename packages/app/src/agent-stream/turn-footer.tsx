@@ -3,9 +3,10 @@ import { View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { SPACING, type Theme } from "@/styles/theme";
 import type { TurnTiming } from "@/timeline/turn-time";
-import type { StreamItem } from "@/types/stream";
+import { getStreamItemMessageId, type StreamItem } from "@/types/stream";
 import {
   collectAssistantResponseContentForStreamRenderStrategy,
+  collectAssistantResponseMessageIdsForStreamRenderStrategy,
   type StreamStrategy,
 } from "./strategy";
 import { resolveAssistantTurnForkBoundary, type AssistantTurnForkBoundary } from "./turn-boundary";
@@ -184,6 +185,23 @@ function CompletedTurnFooter({
       }),
     [strategy, items, startIndex],
   );
+  const messageIds = useMemo(
+    () =>
+      items[startIndex]?.kind === "assistant_message"
+        ? collectAssistantResponseMessageIdsForStreamRenderStrategy({
+            strategy,
+            items,
+            startIndex,
+          })
+        : [],
+    [strategy, items, startIndex],
+  );
+  const hostItem = items[startIndex];
+  const fallbackMessageId = hostItem ? getStreamItemMessageId(hostItem) : undefined;
+  const resolvedMessageIds = useMemo(() => {
+    if (messageIds.length > 0) return messageIds;
+    return fallbackMessageId ? [fallbackMessageId] : [];
+  }, [fallbackMessageId, messageIds]);
   const boundary = resolveAssistantTurnForkBoundary({
     items,
     startIndex,
@@ -202,6 +220,7 @@ function CompletedTurnFooter({
     <View style={stylesheet.turnFooterSlot}>
       <AssistantTurnFooter
         getContent={items[startIndex]?.kind === "assistant_message" ? getContent : undefined}
+        messageIds={resolvedMessageIds}
         completedAt={timing?.completedAt}
         durationMs={timing?.durationMs}
         onFork={boundary && onForkAssistantTurn ? handleFork : undefined}

@@ -289,6 +289,12 @@ export const ja: TranslationResources = {
         permission: "権限が必要",
         closed: "終了済み",
       },
+      actions: {
+        openSubagent: "サブエージェントを開く",
+        quoteReply: "返信を引用",
+        viewDetails: "詳細を表示",
+        collapse: "折りたたむ",
+      },
     },
     messageCapped: "このメッセージは上限で切り詰められました（{{bytes}}バイト）。",
     quote: {
@@ -447,6 +453,8 @@ export const ja: TranslationResources = {
       viewDiagram: "図を表示",
     },
     actions: {
+      quoteReply: "返信を引用",
+      quoteSelection: "選択範囲を引用",
       copyCode: "コードをコピー",
       copyTurn: "ターンをコピー",
       copyMessage: "メッセージをコピー",
@@ -1391,6 +1399,11 @@ export const ja: TranslationResources = {
     },
     pinned: {
       title: "固定済み",
+    },
+    unreadConclusions: {
+      title: "未確認の結論",
+      markAllRead: "すべて既読にする",
+      markRead: "既読にする",
     },
     host: {
       noHost: "ホストなし",

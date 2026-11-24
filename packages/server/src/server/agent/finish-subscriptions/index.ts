@@ -6,6 +6,7 @@ import type { AgentExplicitFinishReport, AgentFinishReport } from "@getpaseo/pro
 import type { WaitForFinishResult } from "@getpaseo/client/internal/daemon-client";
 import type { FinishObservationResult } from "./internal/observation-buffer.js";
 import type { AgentMessageDelivery, AgentPromptSource } from "../agent-messages/index.js";
+import { resolveReportTitle } from "../report-title.js";
 import { getParentAddressFromLabels, PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { AgentRequestOutcomeUnknownError } from "../../message-receipts/index.js";
@@ -88,7 +89,7 @@ export interface FinishSubscriptions {
     address: Pick<FinishSubscription, "childAgentId" | "callerAgentId" | "callerServerId">,
     content: {
       status: NonNullable<AgentFinishReport["parentReportStatus"]>;
-      title: string;
+      title?: string;
       summary: string;
       turnId?: string;
     },
@@ -397,11 +398,12 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       record.requireParentOwnership &&
       (hasFinalSnapshot || isAutomaticLocalParentSubscription(record));
     const validation = { ...record, hasFinalSnapshot };
+    const title = resolveReportTitle(record.childAgentId, report.title);
     const source: AgentPromptSource = {
       kind: "agent-notification",
       agentId: record.childAgentId,
       serverId: record.serverId ?? deps.serverId,
-      title: report.title,
+      ...(title ? { title } : {}),
       event: report.event,
     };
     const subagentInbox =
@@ -520,11 +522,12 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       !isAutomaticParentSubscription(record)
     )
       return false;
+    const title = resolveReportTitle(record.childAgentId, report.title);
     const inbox = await deps.messages().classifyInbox?.(record.callerAgentId, {
       kind: "agent-notification",
       agentId: record.childAgentId,
       serverId: record.serverId ?? deps.serverId,
-      title: report.title,
+      ...(title ? { title } : {}),
       event: "finished",
     });
     if (!inbox) return false;
@@ -553,7 +556,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     const acknowledgments: Promise<unknown>[] = [];
     for (const request of reason === "needs permission" ? requests : [undefined]) {
       if (signal.aborted) return false;
-      const title = result.final?.title ?? record.childAgentId;
+      const title = resolveReportTitle(record.childAgentId, result.final?.title) ?? "";
       const childServerId = record.serverId ?? deps.serverId;
       const prompt = formatFinishNotificationBody({
         childAgentId: record.childAgentId,
@@ -1251,7 +1254,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         const id = randomUUID();
         const report: AgentFinishReport = {
           id,
-          title,
+          title: resolveReportTitle(address.childAgentId, title) ?? "",
           prompt: `Report to parent (${status}):\n\n${summary}`,
           event: "finished",
           parentReportStatus: status,

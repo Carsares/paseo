@@ -6,6 +6,7 @@ import {
   setProjectCollapsed,
   togglePinnedCollapsed,
   toggleProjectCollapsed,
+  toggleUnreadConclusionsCollapsed,
   toggleWorkspaceGroupCollapsed,
 } from "@/stores/sidebar-collapsed-sections-store/state";
 
@@ -14,6 +15,7 @@ function emptyState(): CollapsedProjectsState {
     collapsedProjectKeys: new Set(),
     collapsedWorkspaceGroupKeys: new Set(),
     collapsedPinned: false,
+    collapsedUnreadConclusions: false,
   };
 }
 
@@ -35,12 +37,14 @@ describe("sidebar collapsed projects transitions", () => {
       collapsedProjectKeys: new Set(["project-a", "project-b"]),
       collapsedWorkspaceGroupKeys: new Set(["running"]),
       collapsedPinned: true,
+      collapsedUnreadConclusions: true,
     };
 
     expect(serializeCollapsedProjects(state)).toEqual({
       collapsedProjectKeys: ["project-a", "project-b"],
       collapsedWorkspaceGroupKeys: ["running"],
       collapsedPinned: true,
+      collapsedUnreadConclusions: true,
     });
   });
 
@@ -50,6 +54,22 @@ describe("sidebar collapsed projects transitions", () => {
 
     const restored = mergePersistedCollapsedProjects({ collapsedPinned: true }, emptyState());
     expect(restored.collapsedPinned).toBe(true);
+  });
+
+  it("toggles and restores the unread conclusions collapse flag, defaulting to expanded", () => {
+    expect(emptyState().collapsedUnreadConclusions).toBe(false);
+    const toggled = toggleUnreadConclusionsCollapsed(emptyState());
+    expect(toggled.collapsedUnreadConclusions).toBe(true);
+
+    const restored = mergePersistedCollapsedProjects(
+      { collapsedUnreadConclusions: true },
+      emptyState(),
+    );
+    expect(restored.collapsedUnreadConclusions).toBe(true);
+
+    // Data persisted before the section existed keeps it expanded.
+    const legacy = mergePersistedCollapsedProjects({ collapsedPinned: true }, emptyState());
+    expect(legacy.collapsedUnreadConclusions).toBe(false);
   });
 
   it("rejects the complete value when a persisted project key is invalid", () => {

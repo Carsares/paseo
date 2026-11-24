@@ -289,6 +289,12 @@ export const es: TranslationResources = {
         permission: "Permiso necesario",
         closed: "Cerrado",
       },
+      actions: {
+        openSubagent: "Abrir subagente",
+        quoteReply: "Citar respuesta",
+        viewDetails: "Ver detalles",
+        collapse: "Contraer",
+      },
     },
     messageCapped: "Este mensaje fue truncado ({{bytes}} bytes).",
     quote: {
@@ -447,6 +453,8 @@ export const es: TranslationResources = {
       viewDiagram: "Ver diagrama",
     },
     actions: {
+      quoteReply: "Citar respuesta",
+      quoteSelection: "Citar selección",
       copyCode: "Copiar código",
       copyTurn: "Copiar turno",
       copyMessage: "Copiar mensaje",
@@ -1413,6 +1421,11 @@ export const es: TranslationResources = {
     },
     pinned: {
       title: "Anclados",
+    },
+    unreadConclusions: {
+      title: "Conclusiones sin leer",
+      markAllRead: "Marcar todo como leído",
+      markRead: "Marcar como leído",
     },
     host: {
       noHost: "Sin anfitrión",

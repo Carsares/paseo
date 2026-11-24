@@ -101,6 +101,7 @@ import { capAssistantMessageForRender, getUtf8ByteLength } from "./assistant-mes
 import { getTurnDurationLabel } from "./assistant-turn-footer-label";
 import { getCompactionMarkerLabel } from "./message-compaction-label";
 import { PlanCard } from "./plan-card";
+import { TurnQuoteReplyButton } from "./turn-quote-reply-button";
 import { ToolCallDetailsContent } from "./tool-call-details";
 import { useToolCallSheet } from "./tool-call-sheet";
 export type { InlinePathTarget } from "@/assistant-file-links";
@@ -642,6 +643,8 @@ export const UserMessage = memo(function UserMessage({
 
 interface AssistantTurnFooterProps {
   getContent?: () => string;
+  /** The `data-message-id` values of all rows in this reply; scopes a web selection quoted from the footer. */
+  messageIds?: readonly string[];
   completedAt?: Date;
   durationMs?: number | null;
   onFork?: (target: AssistantForkTarget) => Promise<void> | void;
@@ -699,6 +702,7 @@ const TIMESTAMP_REVEAL_MS = 3000;
  */
 export const AssistantTurnFooter = memo(function AssistantTurnFooter({
   getContent,
+  messageIds,
   completedAt,
   durationMs,
   onFork,
@@ -762,6 +766,9 @@ export const AssistantTurnFooter = memo(function AssistantTurnFooter({
               getContent={getContent}
               containerStyle={assistantTurnFooterStylesheet.copyButton}
             />
+          ) : null}
+          {getContent ? (
+            <TurnQuoteReplyButton getContent={getContent} messageIds={messageIds} />
           ) : null}
           {canFork ? (
             <AssistantForkMenu onFork={handleFork} allowSubagentFork={allowSubagentFork} />

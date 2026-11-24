@@ -361,3 +361,83 @@ describe("agent interaction projection", () => {
     expect(reads).toBe(initialReads);
   });
 });
+
+describe("findLatestAgentSourceGroupId", () => {
+  it("highlights the newest completed source in the latest turn only", async () => {
+    const { createAgentSourceGrouping, findLatestAgentSourceGroupId, setAgentSourceGroup } =
+      await import("./agent-interactions");
+
+    const sourceTool = (
+      id: string,
+      turnId: string,
+      event: "finished" | "errored" | "message",
+      reportStatus?: "completed" | "blocked",
+    ): StreamItem => ({
+      kind: "tool_call",
+      id,
+      turnId,
+      timestamp: new Date(0),
+      payload: {
+        source: "agent",
+        data: {
+          callId: id,
+          name: "AgentMessage",
+          provider: "codex",
+          status: "completed",
+          error: null,
+          detail: { type: "unknown", input: null, output: null },
+          agentMessage: {
+            event,
+            sender: { id: `child-${id}`, title: `Child ${id}` },
+            text: "Done.",
+            ...(reportStatus ? { reportStatus } : {}),
+          },
+        },
+      },
+    });
+
+    const userRow = (id: string, turnId: string): StreamItem => ({
+      kind: "user_message",
+      id,
+      turnId,
+      text: "Next question",
+      timestamp: new Date(0),
+    });
+
+    const completedRow = sourceTool("s1", "turn-1", "finished", "completed");
+    const blockedRow = sourceTool("s2", "turn-2", "finished", "blocked");
+    const grouping = createAgentSourceGrouping();
+    const grouped = grouping([completedRow, blockedRow], []);
+    setAgentSourceGroup(completedRow, grouped.history.get("s1")!);
+    setAgentSourceGroup(blockedRow, grouped.history.get("s2")!);
+
+    // Completed source in the latest turn matches.
+    expect(
+      findLatestAgentSourceGroupId(
+        [],
+        [completedRow, { ...assistant("a1", "Summary"), turnId: "turn-1" }],
+      ),
+    ).toBe("s1");
+
+    // A newer human turn stops at the turn boundary and does not highlight the older report.
+    expect(
+      findLatestAgentSourceGroupId(
+        [],
+        [
+          completedRow,
+          { ...assistant("a1", "Summary"), turnId: "turn-1" },
+          userRow("u2", "turn-2"),
+          { ...assistant("a2", "Human answer"), turnId: "turn-2" },
+        ],
+      ),
+    ).toBeNull();
+
+    // A blocked report in the latest turn does not receive the green unread completion bar.
+    expect(
+      findLatestAgentSourceGroupId(
+        [],
+        [completedRow, blockedRow, { ...assistant("a2", "Waiting"), turnId: "turn-2" }],
+      ),
+    ).toBeNull();
+  });
+});

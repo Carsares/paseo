@@ -126,3 +126,20 @@ it("updates the expand button when a short quote wraps at a different width", as
   layout?.();
   await waitFor(() => expect(view.queryByRole("button", { name: "Show more" })).toBeNull());
 });
+
+it("titles a card with its label and falls back to the numbered title without one", async () => {
+  const view = await renderQuotes({
+    quotes: [
+      { id: "labeled", text: "From a reviewer", label: "Reviewer", attachmentIndex: 0 },
+      { id: "legacy", text: "Saved by an older draft", attachmentIndex: 1 },
+      { id: "blank", text: "Blank label", label: "   ", attachmentIndex: 2 },
+    ],
+    onRemove: vi.fn(),
+  });
+
+  const cards = view.getAllByTestId("composer-quote-card");
+  expect(within(cards[0]).getByText("Reviewer")).toBeTruthy();
+  expect(within(cards[0]).queryByText("Quote 1")).toBeNull();
+  expect(within(cards[1]).getByText("Quote 2")).toBeTruthy();
+  expect(within(cards[2]).getByText("Quote 3")).toBeTruthy();
+});

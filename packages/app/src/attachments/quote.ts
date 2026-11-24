@@ -13,20 +13,24 @@ export function normalizeQuoteText(text: string): string {
 export function createQuoteAttachment(input: {
   text: string;
   id?: string;
+  label?: string;
 }): QuoteComposerAttachment {
+  const label = input.label?.trim();
   return {
     kind: "quote",
     id: input.id ?? `quote_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     text: normalizeQuoteText(input.text),
+    ...(label ? { label } : {}),
   };
 }
 
 export function appendQuoteAttachment(
   current: readonly UserComposerAttachment[],
   quoteText: string,
+  label?: string,
 ): UserComposerAttachment[] {
   if (!normalizeQuoteText(quoteText)) return [...current];
-  return [...current, createQuoteAttachment({ text: quoteText })];
+  return [...current, createQuoteAttachment({ text: quoteText, label })];
 }
 
 export function formatQuoteAsMarkdownBlockquote(quoteText: string): string {

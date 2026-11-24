@@ -1820,6 +1820,7 @@ it("delivers explicit reports to direct parents and rejects a queued report afte
       workspaceId,
       labels: { [PARENT_AGENT_ID_LABEL]: leadAgent.id },
     });
+    await manager.setTitle(leadAgent.id, "Lead specialist");
     const dispatch = vi.fn(
       async (_batch: { recipientId: string; prompt: AgentPromptInput }) => "steered" as const,
     );
@@ -1843,7 +1844,11 @@ it("delivers explicit reports to direct parents and rejects a queued report afte
             recipientId: record.callerAgentId,
             messageId: report.id,
             prompt: report.prompt,
-            source: { kind: "agent-message", agentId: record.childAgentId },
+            source: {
+              kind: "agent-message",
+              agentId: record.childAgentId,
+              ...(report.title ? { title: report.title } : {}),
+            },
             unarchive: false,
             validateDispatch: async () => {
               if ((await storage.get(record.callerAgentId))?.archivedAt) {
@@ -1913,10 +1918,26 @@ it("delivers explicit reports to direct parents and rejects a queued report afte
       ]);
       expect(reports.get(coordinator.id)).toMatchObject([
         {
-          source: { kind: "agent-message", agentId: leadAgent.id },
+          source: { kind: "agent-message", agentId: leadAgent.id, title: "Lead specialist" },
           text: "Report to parent (completed):\n\nVerified all changes.",
         },
       ]);
+      expect(reports.get(leadAgent.id)?.[0]?.source?.title).toBeUndefined();
+      expect(
+        String(
+          dispatch.mock.calls.find(([batch]) => batch.recipientId === leadAgent.id)?.[0].prompt,
+        ),
+      ).not.toContain("source-agent-title=");
+      await storage.setTitle(workerAgent.id, "ABCDEF12-3456-7890-ABCD-EF1234567890");
+      manager.getAgent(workerAgent.id)!.config.title = "Live worker title";
+      await expect(
+        workerTools.executeTool("report_to_parent", { summary: "Live title fallback" }),
+      ).resolves.toMatchObject({ structuredContent: { deliveryStatus: "queued" } });
+      while (scheduled.length) scheduled.shift()!();
+      await delivery.waitForDispatch(leadAgent.id, new AbortController().signal);
+      expect(String(dispatch.mock.calls.at(-1)![0].prompt)).toContain(
+        'source-agent-title="Live worker title"',
+      );
       await expect(
         workerTools.executeTool("report_to_parent", { summary: "Do not deliver after detach" }),
       ).resolves.toMatchObject({ structuredContent: { deliveryStatus: "queued" } });
@@ -1925,7 +1946,7 @@ it("delivers explicit reports to direct parents and rejects a queued report afte
       await expect(
         delivery.waitForDispatch(leadAgent.id, new AbortController().signal),
       ).rejects.toThrow("You can only manage your direct subagents.");
-      expect(dispatch).toHaveBeenCalledTimes(2);
+      expect(dispatch).toHaveBeenCalledTimes(3);
       expect(onError).toHaveBeenCalled();
       expect(makeCatalog(coordinator.id).getTool("report_to_parent")).toBeUndefined();
       for (const caller of [undefined, workerAgent.id]) {
@@ -1944,7 +1965,7 @@ it("delivers explicit reports to direct parents and rejects a queued report afte
       await expect(
         leadTools.executeTool("report_to_parent", { summary: "Parent already archived" }),
       ).rejects.toThrow("Only subagents with a direct parent can report.");
-      expect(dispatch).toHaveBeenCalledTimes(2);
+      expect(dispatch).toHaveBeenCalledTimes(3);
     } finally {
       await reporting.close();
       await delivery.close();

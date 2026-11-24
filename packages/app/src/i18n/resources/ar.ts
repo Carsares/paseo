@@ -287,6 +287,12 @@ export const ar: TranslationResources = {
         permission: "الإذن مطلوب",
         closed: "مغلق",
       },
+      actions: {
+        openSubagent: "فتح الوكيل الفرعي",
+        quoteReply: "اقتباس الرد",
+        viewDetails: "عرض التفاصيل",
+        collapse: "طيّ",
+      },
     },
     messageCapped: "تم اقتطاع هذه الرسالة ({{bytes}} بايت).",
     quote: {
@@ -442,6 +448,8 @@ export const ar: TranslationResources = {
       viewDiagram: "عرض المخطط",
     },
     actions: {
+      quoteReply: "اقتباس الرد",
+      quoteSelection: "اقتباس التحديد",
       copyCode: "نسخ الرمز",
       copyTurn: "نسخ بدوره",
       copyMessage: "انسخ الرسالة",
@@ -1377,6 +1385,11 @@ export const ar: TranslationResources = {
     },
     pinned: {
       title: "المثبتة",
+    },
+    unreadConclusions: {
+      title: "الاستنتاجات غير المقروءة",
+      markAllRead: "تعليم الكل كمقروء",
+      markRead: "تعليم كمقروء",
     },
     host: {
       noHost: "لا مضيف",

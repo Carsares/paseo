@@ -9,12 +9,14 @@ import {
   createAgentMessageDelivery,
   parseAgentMessages,
   type AgentMessageDelivery,
+  type AgentPromptSource,
 } from "../agent-messages/index.js";
 import { buildStoredAgentPayload } from "../agent-projections.js";
 import { registerParentFinishSubscription } from "../create-agent/create.js";
 import { MessageReceipts } from "../../message-receipts/index.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { decodeParentReportIdentity } from "./report-identity.js";
+import { formatFinishNotificationBody } from "./internal/notification.js";
 import {
   createFinishSubscriptions,
   createJsonFinishSubscriptionStore,
@@ -56,9 +58,11 @@ class Observation implements FinishObservation {
 }
 class Delivery implements AgentMessageDelivery {
   prompts: string[] = [];
+  sources: AgentPromptSource[] = [];
   acknowledgments: Array<ReturnType<typeof deferred<"steered">>> = [];
   enqueue(message: Parameters<AgentMessageDelivery["enqueue"]>[0]) {
     this.prompts.push(String(message.prompt));
+    this.sources.push(message.source);
     const acknowledgment = deferred<"steered">();
     this.acknowledgments.push(acknowledgment);
     return {
@@ -119,7 +123,10 @@ async function scenario(directory?: string, removalFailures = 0, retryDelayMs = 
   };
 }
 const intent = { callerAgentId: "parent", childAgentId: "child" };
-function outcome(status: "idle" | "running" | "closed" | "error" = "closed"): WaitForFinishResult {
+function outcome(
+  status: "idle" | "running" | "closed" | "error" = "closed",
+  title: string | null = "Child task",
+): WaitForFinishResult {
   return {
     status: status === "error" ? "error" : "idle",
     final: buildStoredAgentPayload(
@@ -127,7 +134,7 @@ function outcome(status: "idle" | "running" | "closed" | "error" = "closed"): Wa
         id: "child",
         provider: "codex",
         cwd: "/tmp",
-        title: "Child",
+        title,
         createdAt: "2026-01-01T00:00:00Z",
         updatedAt: "2026-01-01T00:00:00Z",
         labels: { "paseo.parent-agent-id": "parent" },
@@ -432,6 +439,7 @@ test("retains intent until parent dispatch acknowledgment, then restart sends no
   await until(() => first.delivery.prompts.length === 1);
   expect(first.delivery.prompts[0]).toContain("was closed");
   expect(first.delivery.prompts[0]).toContain("Partial work saved");
+  expect(first.delivery.sources[0]).toMatchObject({ title: "Child task" });
   expect(await first.store.list()).toHaveLength(1);
   first.delivery.acknowledgments[0]!.resolve("steered");
   await expect.poll(async () => (await first.store.list()).length).toBe(0);
@@ -439,6 +447,37 @@ test("retains intent until parent dispatch acknowledgment, then restart sends no
   const restarted = await scenario(first.home);
   expect(restarted.observation.waits).toHaveLength(0);
 });
+
+test.each(["child", " CHILD ", "ABCDEF12-3456-7890-ABCD-EF1234567890", "   "])(
+  "omits invalid title %j from notification metadata and body",
+  async (title) => {
+    const state = await scenario();
+    await state.service.register(intent);
+    await until(() => state.observation.waits.length === 1);
+    state.observation.waits[0]!.result.resolve(outcome("idle", title));
+    await until(() => state.delivery.prompts.length === 1);
+    expect(state.delivery.sources[0]).not.toHaveProperty("title");
+    expect(state.delivery.prompts[0]).toContain("Agent child finished.");
+    expect(state.delivery.prompts[0]).not.toContain("(child)");
+  },
+);
+
+test.each([
+  ["finished", "Agent child (A renamed task) finished."],
+  ["host unreachable", "Status of child agent child (A renamed task) is unknown."],
+] as const)(
+  "keeps the %s status line on one line when the title contains whitespace",
+  (reason, expected) => {
+    const body = formatFinishNotificationBody({
+      childAgentId: "child",
+      serverId: "remote",
+      title: "  A\n  renamed\t task  ",
+      reason,
+      lastAssistantMessage: null,
+    });
+    expect(body.split("\n")).toContain(expected);
+  },
+);
 
 test.each(["finished", "permission-required"] as const)(
   "a one-way human prompt retains a %s report before the first poll",
@@ -999,7 +1038,7 @@ test("three failed remote observations consume intent only after unavailable-not
   expect(state.delivery.prompts[0]).toContain(
     "Could not observe child agent child on host remote after three failed attempts.",
   );
-  expect(state.delivery.prompts[0]).toContain("Status of child agent child (child) is unknown.");
+  expect(state.delivery.prompts[0]).toContain("Status of child agent child is unknown.");
   expect(state.delivery.prompts[0]).not.toContain("finished.");
   expect(await state.store.list()).toHaveLength(1);
   expect(state.observation.waits).toHaveLength(3);
@@ -1038,7 +1077,7 @@ test("removed-host notice retries parent dispatch without observing again or del
   state.observation.waits[0]!.result.reject(new HostObservationError("removed"));
   await until(() => state.delivery.prompts.length === 1);
   expect(state.delivery.prompts[0]).toContain("Host remote was removed or is unavailable.");
-  expect(state.delivery.prompts[0]).toContain("Status of child agent child (child) is unknown.");
+  expect(state.delivery.prompts[0]).toContain("Status of child agent child is unknown.");
   state.delivery.acknowledgments[0]!.reject(new Error("Parent provider unavailable"));
   await until(() => state.delivery.prompts.length === 2);
   expect(state.delivery.prompts[1]).toBe(state.delivery.prompts[0]);

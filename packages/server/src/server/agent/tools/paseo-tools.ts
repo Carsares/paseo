@@ -2,6 +2,7 @@ import type { ChangeRequestWatches } from "../change-request-watches/index.js";
 import { changeRequestStatusSchema } from "../../../services/change-request-source.js";
 import { registerPluginTools } from "./plugin-tools.js";
 import type { FinishSubscriptions, FinishRegistration } from "../finish-subscriptions/index.js";
+import { resolveReportTitle } from "../report-title.js";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
 import type { RecoverableAgentMessage } from "../../message-receipts/index.js";
 import {
@@ -807,7 +808,13 @@ function createToolCatalog(
   ]);
   const readHierarchyAgent = async (id: string): Promise<HierarchyAgent | null> => {
     const stored = await agentStorage.get(id);
-    return stored?.archivedAt ? stored : (agentManager.getAgent(id) ?? stored);
+    const live = agentManager.getAgent(id);
+    const selected = stored?.archivedAt ? stored : (live ?? stored);
+    if (!selected) return null;
+    return {
+      ...selected,
+      title: resolveReportTitle(id, stored?.title, live?.config.title),
+    };
   };
 
   async function readOrchestrationTarget(
@@ -2658,7 +2665,7 @@ function createToolCatalog(
         {
           status,
           summary,
-          title: caller.title ?? callerAgentId,
+          title: resolveReportTitle(callerAgentId, caller.title),
           turnId,
         },
       );

@@ -68,6 +68,7 @@ import {
   SidebarWorkspaceMenu,
 } from "@/components/sidebar/sidebar-workspace-menu";
 import { SidebarSectionHeader } from "@/components/sidebar/sidebar-section-header";
+import { SidebarUnreadConclusionsSection } from "@/components/sidebar/sidebar-unread-conclusions-section";
 import { SidebarGroupToggleRow } from "@/components/sidebar/sidebar-group-toggle-row";
 import { useLimitedSidebarGroup } from "@/components/sidebar/use-limited-sidebar-group";
 import type { ToggleSidebarWorkspacePin } from "@/hooks/use-sidebar-workspace-pin";
@@ -221,6 +222,10 @@ export function SidebarStatusWorkspaceList({
   );
   const content = (
     <>
+      <SidebarUnreadConclusionsSection
+        hostBadgeByServerId={hostBadgeByServerId}
+        onWorkspacePress={onWorkspacePress}
+      />
       {pinnedWorkspaces.length > 0 ? (
         <View style={styles.pinnedSection} testID="sidebar-pinned-section">
           <SidebarSectionHeader

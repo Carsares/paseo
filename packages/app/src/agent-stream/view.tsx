@@ -82,8 +82,8 @@ import { createStreamPresentation } from "./presentation";
 import { OverviewToolCallGroupView } from "@/tool-calls/detail-level/overview/view";
 import { IndentRail } from "@/components/indent-rail";
 import { TurnSummaryLine } from "./turn-collapse/summary-line";
-import { getAgentSourcePresentation } from "./agent-interactions";
-import { AgentSourceHeader } from "./source-header";
+import { findLatestAgentSourceGroupId, getAgentSourcePresentation } from "./agent-interactions";
+import { AgentSourceHeader, UnreadAgentSourceContext } from "./source-header";
 import { type AgentStreamRenderModel, buildAgentStreamRenderModel } from "./model";
 import { resolveStreamRenderStrategy } from "./strategy-resolver";
 import { type StreamSegmentRenderers, type StreamViewportHandle } from "./strategy";
@@ -465,6 +465,7 @@ interface StreamExpansionProvidersProps {
   toolCallExpansion: ReturnType<typeof useAgentToolCallExpansion>;
   userMessageExpansion: ReturnType<typeof useAgentUserMessageExpansion>;
   assistantMessageExpansion: ReturnType<typeof useAgentAssistantMessageExpansion>;
+  unreadSourceGroupId: string | null;
   children: ReactNode;
 }
 
@@ -472,13 +473,16 @@ function StreamExpansionProviders({
   toolCallExpansion,
   userMessageExpansion,
   assistantMessageExpansion,
+  unreadSourceGroupId,
   children,
 }: StreamExpansionProvidersProps) {
   return (
     <ToolCallExpansionContext.Provider value={toolCallExpansion}>
       <UserMessageExpansionContext.Provider value={userMessageExpansion}>
         <AssistantMessageExpansionContext.Provider value={assistantMessageExpansion}>
-          {children}
+          <UnreadAgentSourceContext.Provider value={unreadSourceGroupId}>
+            {children}
+          </UnreadAgentSourceContext.Provider>
         </AssistantMessageExpansionContext.Provider>
       </UserMessageExpansionContext.Provider>
     </ToolCallExpansionContext.Provider>
@@ -576,6 +580,11 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     const timelineEpoch = useSessionStore(
       (state) => state.sessions[resolvedServerId]?.agentTimelineCursor.get(agentId)?.epoch ?? null,
     );
+    const hasUnreadFinished = useSessionStore((state) => {
+      const session = state.sessions[resolvedServerId];
+      const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+      return agent?.requiresAttention === true && agent.attentionReason === "finished";
+    });
     const isTimelineDetached = useSessionStore(
       (state) => state.sessions[resolvedServerId]?.agentTimelineHasNewer.get(agentId) === true,
     );
@@ -691,6 +700,13 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         effectiveTurnPresentation.turnId,
         showAgentInteractions,
       ],
+    );
+    const unreadSourceGroupId = useMemo(
+      () =>
+        hasUnreadFinished && !isTimelineDetached
+          ? findLatestAgentSourceGroupId(presentation.head, presentation.tail)
+          : null,
+      [hasUnreadFinished, isTimelineDetached, presentation.head, presentation.tail],
     );
     const {
       start: historyWindowStart,
@@ -1396,6 +1412,7 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
                   toolCallExpansion={toolCallExpansion}
                   userMessageExpansion={userMessageExpansion}
                   assistantMessageExpansion={assistantMessageExpansion}
+                  unreadSourceGroupId={unreadSourceGroupId}
                 >
                   <NativeReadingEpochContext.Provider value={timelineEpoch}>
                     {streamRenderStrategy.render({

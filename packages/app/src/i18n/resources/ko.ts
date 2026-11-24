@@ -287,6 +287,12 @@ export const ko: TranslationResources = {
         permission: "권한 필요",
         closed: "닫힘",
       },
+      actions: {
+        openSubagent: "하위 에이전트 열기",
+        quoteReply: "답장 인용",
+        viewDetails: "자세히 보기",
+        collapse: "접기",
+      },
     },
     messageCapped: "이 메시지는 길이 제한으로 잘렸습니다({{bytes}}바이트).",
     quote: {
@@ -443,6 +449,8 @@ export const ko: TranslationResources = {
       viewDiagram: "다이어그램 보기",
     },
     actions: {
+      quoteReply: "답장 인용",
+      quoteSelection: "선택 항목 인용",
       copyCode: "코드 복사",
       copyTurn: "턴 복사",
       copyMessage: "메시지 복사",
@@ -1384,6 +1392,11 @@ export const ko: TranslationResources = {
     },
     pinned: {
       title: "고정됨",
+    },
+    unreadConclusions: {
+      title: "확인하지 않은 결론",
+      markAllRead: "모두 읽음으로 표시",
+      markRead: "읽음으로 표시",
     },
     host: {
       noHost: "호스트 없음",

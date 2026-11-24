@@ -18,6 +18,8 @@ const collapsedAccessibilityState = { expanded: false };
 export interface ComposerQuoteCardEntry {
   id: string;
   text: string;
+  /** Replaces the numbered default title when it has visible text. */
+  label?: string;
   attachmentIndex: number;
 }
 
@@ -40,6 +42,7 @@ export function ComposerQuoteCard({
 }: ComposerQuoteCardProps) {
   const { t } = useTranslation();
   const { text, attachmentIndex } = quote;
+  const title = quote.label?.trim() || t("composer.quoteCard.title", { index: quoteNumber });
   const [expanded, setExpanded] = useState(false);
   const [measuredOverflow, setMeasuredOverflow] = useState<boolean | null>(null);
   const hasExtraLines = text.split("\n", PREVIEW_LINES + 1).length > PREVIEW_LINES;
@@ -61,7 +64,9 @@ export function ComposerQuoteCard({
   return (
     <View style={styles.card} testID="composer-quote-card">
       <View style={styles.header}>
-        <Text style={styles.title}>{t("composer.quoteCard.title", { index: quoteNumber })}</Text>
+        <Text style={styles.title} numberOfLines={1}>
+          {title}
+        </Text>
         <ToolbarButton
           compact
           label={t("composer.quoteCard.remove", { index: quoteNumber })}

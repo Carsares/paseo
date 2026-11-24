@@ -107,6 +107,8 @@ export interface QuoteComposerAttachment {
   kind: "quote";
   id: string;
   text: string;
+  /** Card title shown in the composer instead of the numbered default. */
+  label?: string;
 }
 
 export type UserComposerAttachment =

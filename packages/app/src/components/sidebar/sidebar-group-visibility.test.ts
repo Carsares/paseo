@@ -134,4 +134,34 @@ describe("selectSidebarGroupVisibility", () => {
     expect(result.visibleItems).toEqual(items.slice(0, 7));
     expect(result.canToggle).toBe(true);
   });
+
+  it("limits the unread conclusions group to five rows and reveals the rest on expand", () => {
+    const items = rows(Array(8).fill("attention"));
+    const policy: SidebarGroupVisibilityPolicy<Item> = { kind: "unreadConclusions" };
+
+    const collapsed = selectSidebarGroupVisibility({
+      items,
+      expanded: false,
+      policy,
+      selection: null,
+    });
+    expect(collapsed.visibleItems).toEqual(items.slice(0, 5));
+    expect(collapsed.canToggle).toBe(true);
+
+    const expanded = selectSidebarGroupVisibility({
+      items,
+      expanded: true,
+      policy,
+      selection: null,
+    });
+    expect(expanded.visibleItems).toEqual(items);
+
+    const exactlyFive = selectSidebarGroupVisibility({
+      items: items.slice(0, 5),
+      expanded: false,
+      policy,
+      selection: null,
+    });
+    expect(exactlyFive.canToggle).toBe(false);
+  });
 });

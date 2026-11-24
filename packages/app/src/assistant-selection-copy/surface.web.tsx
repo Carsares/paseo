@@ -38,7 +38,12 @@ export function AssistantSelectionCopySurface({
   }, []);
 
   return (
-    <div ref={surfaceRef} onCopy={handleCopy} style={DISPLAY_CONTENTS}>
+    <div
+      ref={surfaceRef}
+      data-agent-stream-root="true"
+      onCopy={handleCopy}
+      style={DISPLAY_CONTENTS}
+    >
       <View style={style}>{children}</View>
       {composerQuote || onSpawnSubagentFromSelection || selectionButtons.length > 0 ? (
         <AssistantSelectionQuote

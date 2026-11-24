@@ -285,6 +285,12 @@ export const en = {
         permission: "Permission needed",
         closed: "Closed",
       },
+      actions: {
+        openSubagent: "Open subagent",
+        quoteReply: "Quote reply",
+        viewDetails: "View details",
+        collapse: "Collapse",
+      },
     },
     messageCapped: "This message was capped ({{bytes}} bytes).",
     quote: {
@@ -441,6 +447,8 @@ export const en = {
       viewDiagram: "View diagram",
     },
     actions: {
+      quoteReply: "Quote reply",
+      quoteSelection: "Quote selection",
       copyCode: "Copy code",
       copyTurn: "Copy turn",
       copyMessage: "Copy message",
@@ -1387,6 +1395,11 @@ export const en = {
     },
     pinned: {
       title: "Pinned",
+    },
+    unreadConclusions: {
+      title: "Unread conclusions",
+      markAllRead: "Mark all read",
+      markRead: "Mark as read",
     },
     host: {
       noHost: "No host",

@@ -290,6 +290,12 @@ export const ru: TranslationResources = {
         permission: "Нужно разрешение",
         closed: "Закрыто",
       },
+      actions: {
+        openSubagent: "Открыть подагента",
+        quoteReply: "Цитировать ответ",
+        viewDetails: "Показать подробности",
+        collapse: "Свернуть",
+      },
     },
     messageCapped: "Это сообщение было обрезано ({{bytes}} байт).",
     quote: {
@@ -447,6 +453,8 @@ export const ru: TranslationResources = {
       viewDiagram: "Показать диаграмму",
     },
     actions: {
+      quoteReply: "Цитировать ответ",
+      quoteSelection: "Цитировать выделенное",
       copyCode: "Скопировать код",
       copyTurn: "Скопировать ответ",
       copyMessage: "Копировать сообщение",
@@ -1397,6 +1405,11 @@ export const ru: TranslationResources = {
     },
     pinned: {
       title: "Закреплённые",
+    },
+    unreadConclusions: {
+      title: "Непрочитанные выводы",
+      markAllRead: "Отметить все как прочитанные",
+      markRead: "Отметить как прочитанное",
     },
     host: {
       noHost: "Нет хоста",

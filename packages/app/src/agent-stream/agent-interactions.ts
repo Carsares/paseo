@@ -4,6 +4,7 @@ import {
 } from "@getpaseo/protocol/tool-name-normalization";
 import type { StreamItem } from "@/types/stream";
 import type { AgentMessage } from "@getpaseo/protocol/agent-message";
+import { isTurnBoundary } from "./turn-membership";
 
 // Agent lifecycle and messaging tools in the Paseo catalog. Permission tools stay visible.
 // Keep the persisted tool classification in the server's agent/chat-search/index.ts in sync.
@@ -202,6 +203,36 @@ export function createAgentSourceGrouping() {
     }
     return { history, live, boundary };
   };
+}
+
+function hasCompletedSource(group: AgentSourceGroup): boolean {
+  return group.sources.some(
+    (source) => source.status === "completed" || source.status === "finished",
+  );
+}
+
+/**
+ * The first item id of the newest completed/finished source group inside the latest turn
+ * (pass the live head before the retained tail). Stops at the turn boundary so an unread
+ * human-driven turn never highlights an older subagent report from a previous turn, and
+ * skips non-completed reports such as blocked/error/message rows.
+ */
+export function findLatestAgentSourceGroupId(
+  ...lanes: ReadonlyArray<readonly StreamItem[]>
+): string | null {
+  let laterItem: StreamItem | null = null;
+  for (const lane of lanes) {
+    for (let index = lane.length - 1; index >= 0; index--) {
+      const item = lane[index] as StreamItem;
+      if (laterItem && isTurnBoundary(item, laterItem)) {
+        return null;
+      }
+      const group = getAgentSourceGroup(item);
+      if (group && hasCompletedSource(group)) return group.firstItemId;
+      laterItem = item;
+    }
+  }
+  return null;
 }
 
 export function setAgentSourcePresentation(

@@ -22,6 +22,7 @@ import {
   type FinishSubscriptions,
 } from "./agent/finish-subscriptions/index.js";
 import { decodeParentReportIdentity } from "./agent/finish-subscriptions/report-identity.js";
+import { resolveReportTitle } from "./agent/report-title.js";
 import {
   getParentAddressFromLabels,
   hasResidentInboxBypass,
@@ -3300,19 +3301,20 @@ export class VoiceAssistantWebSocketServer {
           }
         : undefined;
     const receipts = explicit ? this.parentReportReceipts : this.messageReceipts;
+    const title = resolveReportTitle(record.childAgentId, report.title);
     const source = explicit
       ? ({
           kind: "agent-message",
           agentId: record.childAgentId,
           serverId: childServerId,
-          title: report.title,
+          ...(title ? { title } : {}),
           reportStatus: report.parentReportStatus,
         } as const)
       : ({
           kind: "agent-notification",
           agentId: record.childAgentId,
           serverId: record.serverId,
-          title: report.title,
+          ...(title ? { title } : {}),
           event: report.event,
         } as const);
     await receipts.send({

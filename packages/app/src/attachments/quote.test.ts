@@ -59,3 +59,21 @@ describe("quote attachments", () => {
     );
   });
 });
+
+describe("quote attachment label", () => {
+  it("stores a trimmed label and omits the field when there is none", () => {
+    expect(createQuoteAttachment({ id: "a", text: "x", label: " Reviewer " })).toEqual({
+      kind: "quote",
+      id: "a",
+      text: "x",
+      label: "Reviewer",
+    });
+    expect("label" in createQuoteAttachment({ id: "b", text: "x" })).toBe(false);
+    expect("label" in createQuoteAttachment({ id: "c", text: "x", label: "  " })).toBe(false);
+  });
+
+  it("appends a labeled quote", () => {
+    const [quote] = appendQuoteAttachment([], "text", "Quote reply");
+    expect(quote).toMatchObject({ kind: "quote", text: "text", label: "Quote reply" });
+  });
+});

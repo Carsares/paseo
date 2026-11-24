@@ -1298,7 +1298,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     () =>
       showsComposer && hasActiveComposer && !draft
         ? {
-            addQuoteAttachment: (quoteText: string) => {
+            addQuoteAttachment: (quoteText: string, label?: string) => {
               if (sideChatSourceId) {
                 void quoteSideChatReply(quoteText).catch(() =>
                   toastApi.error(t("message.actions.forkFailed")),
@@ -1306,7 +1306,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
                 return;
               }
               if (isHandoffInputLocked(serverId, agentId)) return;
-              const quote = createQuoteAttachment({ text: quoteText });
+              const quote = createQuoteAttachment({ text: quoteText, label });
               if (quote.text) setAttachments((prev) => [...prev, quote]);
             },
           }

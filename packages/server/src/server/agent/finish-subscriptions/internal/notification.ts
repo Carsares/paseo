@@ -26,21 +26,23 @@ const FINISH_NOTIFICATION_MESSAGE_LIMIT = 4000;
 interface FinishNotificationBodyInput {
   childAgentId: string;
   serverId?: string;
-  title: string;
+  title?: string;
   reason: FinishNotificationReason;
   lastAssistantMessage: string | null;
   permissionRequest?: AgentPermissionRequest;
 }
 
 export function formatFinishNotificationBody(params: FinishNotificationBodyInput): string {
+  const title = params.title?.replace(/\s+/g, " ").trim();
+  const label = title ? ` (${title})` : "";
   if (params.reason === "host unreachable" || params.reason === "host removed") {
     const host =
       params.reason === "host removed"
         ? `Host ${params.serverId} was removed or is unavailable.`
         : `Could not observe child agent ${params.childAgentId} on host ${params.serverId} after three failed attempts.`;
-    return `${host}\n\nStatus of child agent ${params.childAgentId} (${params.title}) is unknown.\n\nServer: ${params.serverId}\n\nThis finish subscription has ended. Reassess the delegated work; reconnecting will not resume notifications.`;
+    return `${host}\n\nStatus of child agent ${params.childAgentId}${label} is unknown.\n\nServer: ${params.serverId}\n\nThis finish subscription has ended. Reassess the delegated work; reconnecting will not resume notifications.`;
   }
-  const statusLine = `Agent ${params.childAgentId} (${params.title}) ${params.reason}.`;
+  const statusLine = `Agent ${params.childAgentId}${label} ${params.reason}.`;
   const sections = [statusLine];
   if (params.serverId) sections.push(`Server: ${params.serverId}`);
   if (params.reason === "needs permission" && params.permissionRequest) {

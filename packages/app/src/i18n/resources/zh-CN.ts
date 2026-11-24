@@ -287,6 +287,12 @@ export const zhCN: TranslationResources = {
         permission: "需要权限",
         closed: "已关闭",
       },
+      actions: {
+        openSubagent: "打开子会话",
+        quoteReply: "引用回复",
+        viewDetails: "查看详情",
+        collapse: "收起",
+      },
     },
     messageCapped: "此消息已被截断（{{bytes}} 字节）。",
     quote: {
@@ -442,6 +448,8 @@ export const zhCN: TranslationResources = {
       viewDiagram: "查看图表",
     },
     actions: {
+      quoteReply: "引用回复",
+      quoteSelection: "引用选中内容",
       copyCode: "复制代码",
       copyTurn: "复制回合",
       copyMessage: "复制消息",
@@ -1368,6 +1376,11 @@ export const zhCN: TranslationResources = {
     },
     pinned: {
       title: "已置顶",
+    },
+    unreadConclusions: {
+      title: "待查看结论",
+      markAllRead: "全部已读",
+      markRead: "标为已读",
     },
     host: {
       noHost: "没有 Host",

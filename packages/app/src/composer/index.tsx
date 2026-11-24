@@ -391,7 +391,12 @@ function renderAttachmentTray(args: RenderAttachmentTrayArgs): ReactElement | nu
   const pillAttachments: Array<{ attachment: PillComposerAttachment; index: number }> = [];
   for (const [index, attachment] of selectedAttachments.entries()) {
     if (attachment.kind === "quote") {
-      quoteEntries.push({ id: attachment.id, text: attachment.text, attachmentIndex: index });
+      quoteEntries.push({
+        id: attachment.id,
+        text: attachment.text,
+        label: attachment.label,
+        attachmentIndex: index,
+      });
     } else {
       pillAttachments.push({ attachment, index });
     }

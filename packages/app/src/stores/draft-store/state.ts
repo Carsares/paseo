@@ -96,6 +96,7 @@ export const QuoteComposerAttachmentSchema = z.strictObject({
   kind: z.literal("quote"),
   id: z.string(),
   text: z.string(),
+  label: z.string().optional(),
 });
 export const UserComposerAttachmentSchema: z.ZodType<UserComposerAttachment> = z.discriminatedUnion(
   "kind",
@@ -175,7 +176,12 @@ export function normalizeComposerAttachment(
   attachment: UserComposerAttachment,
 ): UserComposerAttachment {
   if (attachment.kind === "quote") {
-    return { kind: "quote", id: attachment.id, text: normalizeQuoteText(attachment.text) };
+    return {
+      kind: "quote",
+      id: attachment.id,
+      text: normalizeQuoteText(attachment.text),
+      ...(attachment.label ? { label: attachment.label } : {}),
+    };
   }
   if (attachment.kind === "image") {
     return {

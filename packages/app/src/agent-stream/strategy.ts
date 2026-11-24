@@ -1,6 +1,6 @@
 import type { ComponentType, ReactElement, ReactNode, RefObject } from "react";
 import type { StyleProp, ViewStyle } from "react-native";
-import type { StreamItem } from "@/types/stream";
+import { getStreamItemMessageId, type StreamItem } from "@/types/stream";
 import type { ReadingRowReplacements } from "./reading-anchor";
 import { continuesResponse } from "./turn-membership";
 import type { StreamHistoryBoundary, StreamRenderSegments } from "./model";
@@ -127,6 +127,7 @@ export interface StreamStrategy {
     relation: NeighborRelation,
   ) => StreamItem | undefined;
   collectAssistantResponseContent: (items: StreamItem[], startIndex: number) => string;
+  collectAssistantResponseMessageIds: (items: StreamItem[], startIndex: number) => string[];
   isNearBottom: (input: StreamNearBottomInput) => boolean;
   getBottomOffset: (metrics: StreamViewportMetrics) => number;
   getEdgeSlotProps: (
@@ -162,6 +163,26 @@ interface StreamStrategyConfig {
   getBottomOffset: (metrics: StreamViewportMetrics) => number;
 }
 
+function collectAssistantResponseItems(
+  items: StreamItem[],
+  startIndex: number,
+  step: AssistantTurnTraversalStep,
+): Extract<StreamItem, { kind: "assistant_message" }>[] {
+  const collected: Extract<StreamItem, { kind: "assistant_message" }>[] = [];
+  let laterItem: StreamItem | null = null;
+  for (let index = startIndex; index >= 0 && index < items.length; index += step) {
+    const currentItem = items[index];
+    if (!currentItem || (laterItem && !continuesResponse(currentItem, laterItem))) {
+      break;
+    }
+    if (currentItem.kind === "assistant_message") {
+      collected.push(currentItem);
+    }
+    laterItem = currentItem;
+  }
+  return collected.toReversed();
+}
+
 export function createStreamStrategy(config: StreamStrategyConfig): StreamStrategy {
   return {
     render: config.render,
@@ -183,24 +204,25 @@ export function createStreamStrategy(config: StreamStrategyConfig): StreamStrate
       }
       return items[neighborIndex];
     },
-    collectAssistantResponseContent: (items, startIndex) => {
-      const messages: string[] = [];
-      let laterItem: StreamItem | null = null;
-      for (
-        let index = startIndex;
-        index >= 0 && index < items.length;
-        index += config.assistantTurnTraversalStep
-      ) {
-        const currentItem = items[index];
-        if (!currentItem || (laterItem && !continuesResponse(currentItem, laterItem))) {
-          break;
+    collectAssistantResponseContent: (items, startIndex) =>
+      collectAssistantResponseItems(items, startIndex, config.assistantTurnTraversalStep)
+        .map((item) => item.text)
+        .join("\n\n"),
+    collectAssistantResponseMessageIds: (items, startIndex) => {
+      const seen = new Set<string>();
+      const messageIds: string[] = [];
+      for (const item of collectAssistantResponseItems(
+        items,
+        startIndex,
+        config.assistantTurnTraversalStep,
+      )) {
+        const messageId = getStreamItemMessageId(item);
+        if (!seen.has(messageId)) {
+          seen.add(messageId);
+          messageIds.push(messageId);
         }
-        if (currentItem.kind === "assistant_message") {
-          messages.push(currentItem.text);
-        }
-        laterItem = currentItem;
       }
-      return messages.toReversed().join("\n\n");
+      return messageIds;
     },
     isNearBottom: (input) => config.isNearBottom(input),
     getBottomOffset: (metrics) => config.getBottomOffset(metrics),
@@ -281,6 +303,14 @@ export function collectAssistantResponseContentForStreamRenderStrategy(params: {
   startIndex: number;
 }): string {
   return params.strategy.collectAssistantResponseContent(params.items, params.startIndex);
+}
+
+export function collectAssistantResponseMessageIdsForStreamRenderStrategy(params: {
+  strategy: StreamStrategy;
+  items: StreamItem[];
+  startIndex: number;
+}): string[] {
+  return params.strategy.collectAssistantResponseMessageIds(params.items, params.startIndex);
 }
 
 export function isNearBottomForStreamRenderStrategy(

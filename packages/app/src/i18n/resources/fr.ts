@@ -291,6 +291,12 @@ export const fr: TranslationResources = {
         permission: "Autorisation requise",
         closed: "Fermé",
       },
+      actions: {
+        openSubagent: "Ouvrir le sous-agent",
+        quoteReply: "Citer la réponse",
+        viewDetails: "Voir les détails",
+        collapse: "Réduire",
+      },
     },
     messageCapped: "Ce message a été tronqué ({{bytes}} octets).",
     quote: {
@@ -448,6 +454,8 @@ export const fr: TranslationResources = {
       viewDiagram: "Afficher le diagramme",
     },
     actions: {
+      quoteReply: "Citer la réponse",
+      quoteSelection: "Citer la sélection",
       copyCode: "Copier le code",
       copyTurn: "Copier l’échange",
       copyMessage: "Copier le message",
@@ -1408,6 +1416,11 @@ export const fr: TranslationResources = {
     },
     pinned: {
       title: "Épinglés",
+    },
+    unreadConclusions: {
+      title: "Conclusions non lues",
+      markAllRead: "Tout marquer comme lu",
+      markRead: "Marquer comme lu",
     },
     host: {
       noHost: "Aucun hôte",

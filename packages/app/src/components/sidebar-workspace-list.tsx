@@ -101,6 +101,7 @@ import {
 import { useLongPressDragInteraction } from "@/components/sidebar/use-long-press-drag-interaction";
 import { SidebarSectionHeader } from "@/components/sidebar/sidebar-section-header";
 import { SidebarGroupToggleRow } from "@/components/sidebar/sidebar-group-toggle-row";
+import { SidebarUnreadConclusionsSection } from "@/components/sidebar/sidebar-unread-conclusions-section";
 import { createWorkspaceVisibilityPolicy } from "@/components/sidebar/sidebar-group-visibility";
 import { useLimitedSidebarGroup } from "@/components/sidebar/use-limited-sidebar-group";
 import {
@@ -2490,6 +2491,10 @@ function ProjectModeList({
 
   const content = (
     <>
+      <SidebarUnreadConclusionsSection
+        hostBadgeByServerId={hostBadgeByServerId}
+        onWorkspacePress={onWorkspacePress}
+      />
       {pinnedChats.length > 0 ? (
         <View style={styles.pinnedSection} testID="sidebar-pinned-section">
           <SidebarSectionHeader
