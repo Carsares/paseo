@@ -9,9 +9,11 @@ import {
   AgentCreateRequestSchema,
   CreateAgentRequestMessageSchema,
   DeleteAgentRequestMessageSchema,
+  ArchiveAgentRequestMessageSchema,
   CreationSnapshotSchema,
   CreationSubscribeResponseSchema,
   AgentSnapshotPayloadSchema,
+  AgentProviderSwitchRequestMessageSchema,
   AgentTimelineItemPayloadSchema,
   ServerInfoStatusPayloadSchema,
   SessionInboundMessageSchema,
@@ -27,6 +29,70 @@ import {
   WorkspaceCreateRequestSchema,
 } from "./messages.js";
 import { validateWSOutboundMessage } from "./validation/ws-outbound.js";
+
+test("idle archive extends the current archive request and host feature shapes", () => {
+  const legacyRequest = {
+    type: "archive_agent_request",
+    agentId: "agent-1",
+    expectedWorkspaceId: "workspace-1",
+    requestId: "archive-1",
+  };
+  const request = { ...legacyRequest, onlyIfIdle: true };
+  expect(SessionInboundMessageSchema.parse(legacyRequest)).toEqual(legacyRequest);
+  expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+  expect(ArchiveAgentRequestMessageSchema.omit({ onlyIfIdle: true }).parse(request)).toEqual(
+    legacyRequest,
+  );
+  expect(
+    SessionInboundMessageSchema.safeParse({ ...legacyRequest, onlyIfIdle: false }).success,
+  ).toBe(false);
+
+  const payload = {
+    status: "server_info",
+    serverId: "server-1",
+    features: { agentIdleArchiveV1: true },
+  };
+  const envelope = { type: "session", message: { type: "status", payload } };
+  expect(validateWSOutboundMessage(envelope)).toMatchObject({ success: true, data: envelope });
+});
+
+test("blank provider switches extend the existing request and host feature shapes", () => {
+  const legacyRequest = {
+    type: "agent.provider.switch.request",
+    agentId: "agent-1",
+    provider: "claude",
+    requestId: "switch-1",
+  };
+  const blankRequest = { ...legacyRequest, context: "blank" };
+  const silentRequest = { ...blankRequest, onlyIfSilent: true };
+  expect(SessionInboundMessageSchema.parse(legacyRequest)).toEqual(legacyRequest);
+  expect(SessionInboundMessageSchema.parse(blankRequest)).toEqual(blankRequest);
+  expect(SessionInboundMessageSchema.parse(silentRequest)).toEqual(silentRequest);
+  expect(
+    AgentProviderSwitchRequestMessageSchema.omit({ context: true, onlyIfSilent: true }).parse(
+      silentRequest,
+    ),
+  ).toEqual(legacyRequest);
+  expect(
+    SessionInboundMessageSchema.safeParse({ ...silentRequest, onlyIfSilent: false }).success,
+  ).toBe(false);
+  expect(
+    SessionInboundMessageSchema.safeParse({ ...legacyRequest, context: "handoff" }).success,
+  ).toBe(false);
+
+  const legacyFeatures = { agentSeamlessContextSwitch: true };
+  const legacyInfo = { status: "server_info", serverId: "server-1", features: legacyFeatures };
+  const features = { ...legacyFeatures, agentProviderSwitchBlankContext: true };
+  expect(ServerInfoStatusPayloadSchema.parse(legacyInfo).features).toEqual(legacyFeatures);
+  expect(z.object({ agentSeamlessContextSwitch: z.boolean().optional() }).parse(features)).toEqual(
+    legacyFeatures,
+  );
+  const envelope = {
+    type: "session",
+    message: { type: "status", payload: { ...legacyInfo, features } },
+  };
+  expect(validateWSOutboundMessage(envelope)).toMatchObject({ success: true, data: envelope });
+});
 
 test("workbench features and topic creation extend legacy wire shapes", () => {
   const info = { status: "server_info", serverId: "server-1" };

@@ -41,11 +41,23 @@ export type CloseAgentTabPolicy =
   | { kind: "layout-only" }
   | { kind: "side-chat" };
 
+export interface CloseAgentTabPolicyOptions {
+  /**
+   * Topic workspaces keep every agent seat alive when closing personal layout tabs,
+   * while preserving automatic cleanup of unanswered empty side chats.
+   */
+  isTopicWorkspace?: boolean;
+}
+
 export function resolveCloseAgentTabPolicy(
   agent: (Pick<Agent, "parentAgentId"> & Partial<Pick<Agent, "labels">>) | null | undefined,
+  options?: CloseAgentTabPolicyOptions,
 ): CloseAgentTabPolicy {
   if (isSideChat(agent)) {
     return { kind: "side-chat" };
+  }
+  if (options?.isTopicWorkspace) {
+    return { kind: "layout-only" };
   }
   if (agent && (agent.parentAgentId || isResidentAgent(agent))) {
     return { kind: "layout-only" };

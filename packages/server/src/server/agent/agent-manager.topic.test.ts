@@ -4,26 +4,37 @@ import {
   RESIDENT_AGENT_LABEL,
   SIDE_CHAT_LABEL,
 } from "@getpaseo/protocol/agent-labels";
-import { mkdtemp, rm } from "node:fs/promises";
+import { type WSOutboundMessage, WSOutboundMessageSchema } from "@getpaseo/protocol/messages";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, onTestFinished, test, vi } from "vitest";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { deferred } from "../test-fixtures/reconciliation-registries.js";
+import { DaemonClient } from "../test-utils/daemon-client.js";
 import {
   createTestAgentClient,
   type TestAgentClientOptions,
 } from "../test-utils/fake-agent-client.js";
+import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import {
   createPersistedWorkspaceRecord,
   FileBackedWorkspaceRegistry,
 } from "../workspace-registry.js";
 import { AgentManager } from "./agent-manager.js";
 import { sendPreparedPromptToAgent, sendPromptToAgent } from "./agent-prompt.js";
-import type { AgentPromptInput, AgentSessionConfig } from "./agent-sdk-types.js";
+import type {
+  AgentPermissionRequest,
+  AgentPromptInput,
+  AgentSessionConfig,
+  AgentStreamEvent,
+} from "./agent-sdk-types.js";
 import { AgentStorage } from "./agent-storage.js";
 import { TopicMainArchiveError } from "./hierarchy-policy.js";
 import { archiveAgentCommand } from "./lifecycle-command.js";
+import { mergeProviderOptions } from "./provider-options.js";
+import { ProviderSnapshotManager } from "./provider-snapshot-manager.js";
+import { WorkspaceTaskLedgerStore } from "./task-ledger/index.js";
 
 const WORKSPACE_ID = "workspace";
 const provider = "antigravity";
@@ -32,7 +43,11 @@ const topicName = "User's startup topic";
 const topicSummary = "Look at the boot trace first";
 
 async function topicScenario(
-  options: TestAgentClientOptions & { legacy?: boolean; useDisplayName?: boolean } = {},
+  options: TestAgentClientOptions & {
+    legacy?: boolean;
+    useDisplayName?: boolean;
+    secondProvider?: TestAgentClientOptions;
+  } = {},
 ) {
   const cwd = await mkdtemp(join(tmpdir(), "paseo-topic-manager-"));
   const logger = createTestLogger();
@@ -52,8 +67,14 @@ async function topicScenario(
       ...(options.legacy || options.useDisplayName ? {} : { topic: { summary: topicSummary } }),
     }),
   );
+  const firstClient = createTestAgentClient(provider, options);
+  const secondClient =
+    options.secondProvider && createTestAgentClient("codex", options.secondProvider);
   const manager = new AgentManager({
-    clients: { [provider]: createTestAgentClient(provider, options) },
+    clients: {
+      [provider]: firstClient,
+      ...(secondClient && { codex: secondClient }),
+    },
     registry: storage,
     workspaceRegistry: workspaces,
     logger,
@@ -68,6 +89,8 @@ async function topicScenario(
     manager,
     storage,
     workspaces,
+    firstClient,
+    secondClient,
     config,
     createSilentMain: () =>
       manager.createSilentWorkspaceMainAgent({ config, workspaceId: WORKSPACE_ID }),
@@ -163,6 +186,112 @@ test("scoped, stored-only and agent tool archives protect the topic main and per
   await manager.restoreArchivedSnapshot(record.id, archivedAt, WORKSPACE_ID);
   expect((await storage.get(record.id))?.archivedAt).toBe(archivedAt);
 });
+
+test("idle cleanup refuses unread tasks, background work, and active stored or internal subagents", async () => {
+  const { manager, config, storage, createSilentMain } = await topicScenario();
+  const main = await createSilentMain();
+  const task = await manager.createAgent(config, undefined, {
+    workspaceId: WORKSPACE_ID,
+    labels: { [PARENT_AGENT_ID_LABEL]: main.id },
+  });
+  const archive = () => manager.archiveIdleTaskAgentInWorkspace(task.id, WORKSPACE_ID);
+  const createChild = (internal: boolean) =>
+    manager.createAgent({ ...config, internal }, undefined, {
+      workspaceId: WORKSPACE_ID,
+      labels: { [PARENT_AGENT_ID_LABEL]: task.id },
+    });
+
+  await manager.markAgentUnread(task.id);
+  await expect(archive()).rejects.toThrow("unread");
+  await manager.clearAgentAttention(task.id);
+
+  const backgroundWork = { agentId: task.id, namespace: "heartbeat", id: "periodic" } as const;
+  manager.setDaemonBackgroundWork({
+    ...backgroundWork,
+    kind: "heartbeat",
+    description: null,
+    startedAt: new Date().toISOString(),
+    stop: async () => {},
+  });
+  await expect(archive()).rejects.toThrow("active");
+  manager.removeDaemonBackgroundWork(backgroundWork);
+
+  const internal = await createChild(true);
+  const stored = await createChild(false);
+  await manager.closeAgent(stored.id);
+  try {
+    await expect(archive()).rejects.toThrow("unarchived subagents");
+    expect(manager.getAgent(internal.id)).not.toBeNull();
+    expect((await storage.get(stored.id))?.archivedAt).toBeFalsy();
+    await manager.archiveAgentInWorkspace(stored.id, WORKSPACE_ID);
+    await expect(archive()).rejects.toThrow("unarchived subagents");
+    expect(manager.getAgent(internal.id)).not.toBeNull();
+    await manager.closeAgent(internal.id);
+    await expect(archive()).resolves.toMatchObject({ archivedAt: expect.any(String) });
+  } finally {
+    await Promise.all([task, internal].map(({ id }) => manager.closeAgent(id)));
+  }
+});
+
+test("WebSocket idle cleanup refuses a turn started by another client while manual archive interrupts it", async () => {
+  const turnEnd = deferred();
+  const onInterrupt = vi.fn(() => turnEnd.resolve());
+  const daemon = await createTestPaseoDaemon({
+    mcpEnabled: false,
+    agentClients: {
+      codex: createTestAgentClient("codex", {
+        beforeTurnComplete: () => turnEnd.promise,
+        onInterrupt,
+      }),
+    },
+  });
+  const url = `ws://127.0.0.1:${daemon.port}/ws`;
+  const sender = new DaemonClient({ url });
+  const cleaner = new DaemonClient({ url });
+  const { agentManager, agentStorage } = daemon.daemon;
+  try {
+    await Promise.all([sender.connect(), cleaner.connect()]);
+    expect(cleaner.getLastServerInfoMessage()?.features?.agentIdleArchiveV1).toBe(true);
+    const { workspace, mainAgent } = await sender.createWorkspace({
+      source: { kind: "directory", path: daemon.staticDir },
+      title: "Archive cleanup",
+      topic: { hideFromModel: true },
+      mainAgent: { config: { provider: "codex", cwd: daemon.staticDir } },
+    });
+    if (!workspace || !mainAgent) throw new Error("Expected a topic with a main agent");
+    const createTask = () =>
+      agentManager.createAgent({ provider: "codex", cwd: daemon.staticDir }, undefined, {
+        workspaceId: workspace.id,
+        labels: { [PARENT_AGENT_ID_LABEL]: mainAgent.id },
+      });
+    const task = await createTask();
+    await sender.sendMessage(task.id, "Leave this task running", { waitForDispatch: true });
+    expect(agentManager.hasInFlightRun(task.id)).toBe(true);
+
+    await expect(
+      cleaner.archiveAgent(task.id, workspace.id, { onlyIfIdle: true }),
+    ).rejects.toMatchObject({ code: "agent_not_idle" });
+    expect(onInterrupt).not.toHaveBeenCalled();
+    expect((await agentStorage.get(task.id))?.archivedAt).toBeFalsy();
+    expect(agentManager.hasInFlightRun(task.id)).toBe(true);
+
+    const manual = await cleaner.archiveAgent(task.id, workspace.id);
+    expect(onInterrupt).toHaveBeenCalledOnce();
+    expect((await agentStorage.get(task.id))?.archivedAt).toBe(manual.archivedAt);
+
+    const idleTask = await createTask();
+    await expect(
+      cleaner.archiveAgent(idleTask.id, "another-workspace", { onlyIfIdle: true }),
+    ).rejects.toThrow("no longer in workspace");
+    const cleanup = await cleaner.archiveAgent(idleTask.id, workspace.id, { onlyIfIdle: true });
+    expect((await agentStorage.get(idleTask.id))?.archivedAt).toBe(cleanup.archivedAt);
+    expect(onInterrupt).toHaveBeenCalledOnce();
+  } finally {
+    turnEnd.resolve();
+    await Promise.allSettled([sender.close(), cleaner.close()]);
+    await daemon.close();
+  }
+}, 30_000);
 
 test("a failed reopen rollback cannot archive a main protected by a later topic upgrade", async () => {
   const { manager, storage, workspaces, createSilentMain } = await topicScenario({ legacy: true });
@@ -440,5 +569,722 @@ test("model receives topic context for human turns and steer, with privacy chang
   } finally {
     turnEnd.resolve();
     await manager.closeAgent(record.id);
+  }
+});
+
+test("a silent resident keeps its identity through same-provider model and cross-provider changes", async () => {
+  const beforeCreateSession = vi.fn(async () => {});
+  const { manager, storage, config, createSilentMain, firstClient, secondClient } =
+    await topicScenario({
+      beforeCreateSession,
+      secondProvider: { beforeCreateSession },
+    });
+  const main = await createSilentMain();
+  const { agentId } = await manager.createSilentResidentSubagent({
+    parentAgentId: main.id,
+    expectedWorkspaceId: WORKSPACE_ID,
+    role: "Reviewer",
+    config: { ...config, model: "initial", thinkingOptionId: "high" },
+  });
+  const before = await storage.get(agentId);
+  const fetchCatalog = vi.spyOn(firstClient, "fetchCatalog");
+  const fetchTargetCatalog = vi.spyOn(secondClient!, "fetchCatalog");
+  const readCatalog = () => ({
+    models: [
+      {
+        provider,
+        id: "compatible",
+        label: "Compatible",
+        thinkingOptions: [{ id: "high", label: "High" }],
+      },
+      {
+        provider,
+        id: "same-provider-model",
+        label: "Same provider",
+        thinkingOptions: [{ id: "low", label: "Low" }],
+      },
+    ],
+    modes: [],
+  });
+  await manager.setAgentModel(agentId, "compatible", readCatalog);
+  expect((await storage.get(agentId))?.config?.thinkingOptionId).toBe("high");
+  await manager.setAgentModel(agentId, "same-provider-model", readCatalog);
+  expect(await storage.get(agentId)).toMatchObject({
+    lastStatus: "closed",
+    config: { model: "same-provider-model" },
+  });
+  expect((await storage.get(agentId))?.config?.thinkingOptionId).toBeUndefined();
+  await manager.setAgentThinkingOption(agentId, "low", readCatalog);
+  expect((await storage.get(agentId))?.config?.thinkingOptionId).toBe("low");
+  await manager.setAgentThinkingOption(agentId, null);
+  expect((await storage.get(agentId))?.config?.thinkingOptionId).toBeUndefined();
+  await manager.setAgentThinkingOption(agentId, "low", readCatalog);
+  await manager.setAgentModel(agentId, "not-in-a-published-catalog");
+  expect((await storage.get(agentId))?.config?.thinkingOptionId).toBeUndefined();
+  await expect(
+    manager.switchAgentProvider(agentId, {
+      provider: "codex",
+      expectedWorkspaceId: "other-workspace",
+    }),
+  ).rejects.toThrow("no longer in workspace");
+  await manager.resetAgentSession(agentId, { clearVisibleTimeline: true });
+  await expect(
+    manager.switchAgentProvider(agentId, {
+      provider: "codex",
+      expectedWorkspaceId: WORKSPACE_ID,
+      model: "gpt-5.4-mini",
+      context: "blank",
+      onlyIfSilent: true,
+    }),
+  ).resolves.toMatchObject({
+    agent: {
+      id: agentId,
+      workspaceId: WORKSPACE_ID,
+      provider: "codex",
+      lifecycle: "closed",
+      session: null,
+    },
+  });
+  expect(await storage.get(agentId)).toMatchObject({
+    id: agentId,
+    labels: before?.labels,
+    createdAt: before?.createdAt,
+    provider: "codex",
+    lastStatus: "closed",
+    config: { model: "gpt-5.4-mini" },
+  });
+  expect(manager.getAgent(agentId)).toBeNull();
+  await expect(manager.readSilentTopicTimeline(agentId)).resolves.toMatchObject({
+    timeline: { rows: [] },
+  });
+  expect(beforeCreateSession).not.toHaveBeenCalled();
+  expect(fetchCatalog).not.toHaveBeenCalled();
+  expect(fetchTargetCatalog).not.toHaveBeenCalled();
+});
+
+test("WebSocket rejects a silent-only provider switch after another client completes the first turn, even after reset", async () => {
+  const claude = createTestAgentClient("claude");
+  const createTargetSession = vi.spyOn(claude, "createSession");
+  const daemon = await createTestPaseoDaemon({
+    mcpEnabled: false,
+    agentClients: { codex: createTestAgentClient("codex"), claude },
+  });
+  const url = `ws://127.0.0.1:${daemon.port}/ws`;
+  const confirmer = new DaemonClient({ url });
+  const sender = new DaemonClient({ url });
+  const { agentManager, agentStorage } = daemon.daemon;
+  try {
+    await Promise.all([confirmer.connect(), sender.connect()]);
+    const { mainAgent } = await confirmer.createWorkspace({
+      source: { kind: "directory", path: daemon.staticDir },
+      title: "Silent switch confirmation",
+      topic: { hideFromModel: true },
+      mainAgent: { config: { provider: "codex", cwd: daemon.staticDir } },
+    });
+    if (!mainAgent) throw new Error("Expected a silent topic seat");
+    expect(await confirmer.fetchAgent(mainAgent.id)).toMatchObject({
+      agent: { id: mainAgent.id, provider: "codex", status: "closed" },
+    });
+    const confirmation = { provider: "claude", context: "blank", onlyIfSilent: true } as const;
+
+    const firstPrompt = "Keep this first turn in the original conversation";
+    await sender.sendMessage(mainAgent.id, firstPrompt, { waitForDispatch: true });
+    await expect.poll(() => agentManager.hasInFlightRun(mainAgent.id)).toBe(false);
+    const originalSession = agentManager.getAgent(mainAgent.id)?.session;
+    if (!originalSession) throw new Error("Expected the original provider session");
+    const originalRecord = await agentStorage.get(mainAgent.id);
+    expect(originalRecord?.persistence).toMatchObject({
+      provider: "codex",
+      sessionId: expect.any(String),
+    });
+    const originalTimeline = structuredClone(agentManager.getTimeline(mainAgent.id));
+    expect(originalTimeline).toContainEqual(
+      expect.objectContaining({ type: "user_message", text: firstPrompt }),
+    );
+    const originalPrefix = await agentStorage.timelinePrefixes.load(mainAgent.id);
+
+    await expect(confirmer.switchAgentProvider(mainAgent.id, confirmation)).rejects.toThrow(
+      "Agent is no longer a silent seat",
+    );
+    const current = agentManager.getAgent(mainAgent.id);
+    expect(current?.provider).toBe("codex");
+    expect(current?.session).toBe(originalSession);
+    expect((await agentStorage.get(mainAgent.id))?.persistence).toEqual(
+      originalRecord?.persistence,
+    );
+    expect(await agentStorage.timelinePrefixes.load(mainAgent.id)).toEqual(originalPrefix);
+    expect(agentManager.getTimeline(mainAgent.id)).toEqual(originalTimeline);
+
+    await agentManager.closeAgent(mainAgent.id);
+    expect(agentManager.getAgent(mainAgent.id)).toBeNull();
+    await sender.resetAgentSession(mainAgent.id);
+    const resetRecord = await agentStorage.get(mainAgent.id);
+    expect(resetRecord).toMatchObject({
+      provider: "codex",
+      lastStatus: "closed",
+      persistence: null,
+      lastUserMessageAt: expect.any(String),
+    });
+    expect(resetRecord?.lastUserMessageAt).toBe(originalRecord?.lastUserMessageAt);
+    const resetHistory = await agentManager.readSilentTopicTimeline(mainAgent.id);
+    expect(resetHistory?.timeline.rows.map(({ item }) => item)).toContainEqual(
+      expect.objectContaining({ type: "user_message", text: firstPrompt }),
+    );
+
+    await expect(confirmer.switchAgentProvider(mainAgent.id, confirmation)).rejects.toThrow(
+      "Agent is no longer a silent seat",
+    );
+    expect(await agentStorage.get(mainAgent.id)).toEqual(resetRecord);
+    expect(await agentManager.readSilentTopicTimeline(mainAgent.id)).toEqual(resetHistory);
+    expect(agentManager.getAgent(mainAgent.id)).toBeNull();
+    expect(createTargetSession).not.toHaveBeenCalled();
+  } finally {
+    await Promise.allSettled([confirmer.close(), sender.close()]);
+    await daemon.close();
+  }
+}, 30_000);
+
+test.each(["blank", undefined] as const)(
+  "a WebSocket switch with context=%s sends the active task ledger and only hands off history by default",
+  async (context) => {
+    const onStartTurn = vi.fn();
+    const daemon = await createTestPaseoDaemon({
+      mcpEnabled: false,
+      agentClients: {
+        codex: createTestAgentClient("codex"),
+        claude: createTestAgentClient("claude", { onStartTurn }),
+      },
+    });
+    const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+    const { agentManager: manager, agentStorage: storage } = daemon.daemon;
+    const oldMessage = { type: "user_message", text: "Private previous conversation" } as const;
+    try {
+      await client.connect();
+      expect(client.getLastServerInfoMessage()?.features?.agentProviderSwitchBlankContext).toBe(
+        true,
+      );
+      const {
+        workspace,
+        mainAgent: agent,
+        error,
+      } = await client.createWorkspace({
+        source: { kind: "directory", path: daemon.staticDir },
+        title: "Private topic name",
+        topic: { hideFromModel: true, summary: "Private topic direction" },
+        mainAgent: { config: { provider: "codex", cwd: daemon.staticDir } },
+      });
+      expect(error).toBeNull();
+      if (!workspace || !agent) throw new Error("Expected a topic with a main agent");
+      await client.sendMessage(agent.id, oldMessage.text, { waitForDispatch: true });
+      await expect.poll(() => manager.hasInFlightRun(agent.id)).toBe(false);
+      const ledger = new WorkspaceTaskLedgerStore(daemon.paseoHome);
+      await ledger.upsert(workspace.id, {
+        taskId: "task-1",
+        title: "Review the trace",
+        tier: "T2",
+        status: "in_progress",
+        blockingQuestion: "Which startup path?",
+        handoffSummary: "Trace is ready",
+      });
+      await expect(
+        client.switchAgentProvider(agent.id, { provider: "claude", context }),
+      ).resolves.toMatchObject({ agent: { id: agent.id, provider: "claude" } });
+      expect(manager.getTimeline(agent.id)).toContainEqual(expect.objectContaining(oldMessage));
+      const prefix = await storage.timelinePrefixes.load(agent.id);
+      if (context === "blank") {
+        expect(manager.getTimeline(agent.id)).toContainEqual(
+          expect.objectContaining({
+            type: "notification",
+            message: expect.stringContaining("reset"),
+          }),
+        );
+        expect(prefix?.pendingContextHandoff).toBeNull();
+      } else {
+        expect(prefix?.pendingContextHandoff).toBeTruthy();
+      }
+      expect(onStartTurn).not.toHaveBeenCalled();
+
+      await client.sendMessage(agent.id, "Start the new conversation", { waitForDispatch: true });
+      expect(onStartTurn).toHaveBeenCalledOnce();
+      const prompt = onStartTurn.mock.calls[0]?.[0];
+      expect(prompt).toEqual(
+        expect.stringContaining(
+          'T2 in_progress "task-1" "Review the trace" question="Which startup path?" handoff="Trace is ready"',
+        ),
+      );
+      expect(prompt).toContain("Start the new conversation");
+      expect(prompt).not.toContain("Private topic name");
+      expect(prompt).not.toContain("Private topic direction");
+      if (context === "blank") {
+        expect(prompt).not.toContain("<paseo-context-handoff");
+        expect(prompt).not.toContain(oldMessage.text);
+      } else {
+        expect(prompt).toContain("<paseo-context-handoff");
+        expect(prompt).toContain(oldMessage.text);
+      }
+    } finally {
+      try {
+        await client.close();
+      } finally {
+        await daemon.close();
+      }
+    }
+  },
+  30_000,
+);
+
+test("WebSocket blank switches require both grants and reject direct-parent routes", async () => {
+  const daemon = await createTestPaseoDaemon({ mcpEnabled: false });
+  onTestFinished(() => daemon.close());
+  const url = `ws://127.0.0.1:${daemon.port}/ws`;
+  const owner = new DaemonClient({ url });
+  const writer = new DaemonClient({ url, sessionPermissions: ["workspace.write"] });
+  const executor = new DaemonClient({ url, sessionPermissions: ["hub.execute"] });
+  onTestFinished(async () => {
+    await Promise.allSettled([owner.close(), writer.close(), executor.close()]);
+  });
+  await Promise.all([owner.connect(), writer.connect(), executor.connect()]);
+  expect(writer.getLastServerInfoMessage()?.permissions).toEqual(["workspace.write"]);
+  expect(executor.getLastServerInfoMessage()?.permissions).toEqual(["hub.execute"]);
+
+  const { workspace } = await owner.createWorkspace({
+    source: { kind: "directory", path: daemon.staticDir },
+  });
+  if (!workspace) throw new Error("Expected a workspace");
+  const agent = await owner.createAgent({
+    workspaceId: workspace.id,
+    config: { provider: "codex", cwd: daemon.staticDir },
+  });
+  const oldMessage = { type: "user_message", text: "History for summary handoff" } as const;
+  const { agentManager, agentStorage } = daemon.daemon;
+  await agentManager.appendTimelineItem(agent.id, oldMessage);
+
+  for (const client of [writer, executor]) {
+    await expect(
+      client.switchAgentProvider(agent.id, { provider: "claude", context: "blank" }),
+    ).rejects.toMatchObject({ code: "access_denied" });
+  }
+  expect(agentManager.getAgent(agent.id)?.provider).toBe("codex");
+  expect(agentManager.getTimeline(agent.id)).toEqual([oldMessage]);
+
+  const scope = "blank-switch-parent";
+  const routeId = await owner.openHostLink(scope);
+  const received: WSOutboundMessage[] = [];
+  const unsubscribe = owner.subscribeRawMessages((message) => {
+    if (message.type === "hosts.route.frame" && message.payload.subscriptionId === routeId) {
+      received.push(WSOutboundMessageSchema.parse(JSON.parse(message.payload.data)));
+    }
+  });
+  try {
+    await owner.sendHostFrame(
+      routeId,
+      JSON.stringify({
+        type: "hello",
+        clientId: scope,
+        clientType: "mcp",
+        protocolVersion: 1,
+        producer: { serverId: "parent-host", sourceId: "mcp-direct-parent:parent" },
+      }),
+    );
+    await expect
+      .poll(() => received)
+      .toContainEqual({
+        type: "session",
+        message: expect.objectContaining({
+          payload: expect.objectContaining({
+            status: "server_info",
+            sourceId: "route:owner:parent-host:mcp-direct-parent%3Aparent:direct-parent",
+            permissions: expect.arrayContaining(["workspace.write", "hub.execute"]),
+          }),
+        }),
+      });
+    await owner.sendHostFrame(
+      routeId,
+      JSON.stringify({
+        type: "session",
+        message: {
+          type: "agent.provider.switch.request",
+          requestId: scope,
+          agentId: agent.id,
+          provider: "claude",
+          context: "blank",
+        },
+      }),
+    );
+    await expect
+      .poll(() => received)
+      .toContainEqual({
+        type: "session",
+        message: {
+          type: "agent.provider.switch.response",
+          payload: {
+            requestId: scope,
+            agentId: agent.id,
+            accepted: false,
+            agent: null,
+            error: expect.stringContaining("direct-parent route"),
+            notice: null,
+          },
+        },
+      });
+    expect(agentManager.getAgent(agent.id)?.provider).toBe("codex");
+  } finally {
+    unsubscribe();
+    owner.closeHostRoute(routeId);
+  }
+
+  await expect(writer.switchAgentProvider(agent.id, { provider: "claude" })).resolves.toMatchObject(
+    {
+      agent: { id: agent.id, provider: "claude" },
+    },
+  );
+  expect((await agentStorage.timelinePrefixes.load(agent.id))?.pendingContextHandoff).toBeTruthy();
+  await expect(
+    executor.switchAgentProvider(agent.id, { provider: "codex" }),
+  ).resolves.toMatchObject({
+    agent: { id: agent.id, provider: "codex" },
+  });
+
+  const child = await agentManager.createAgent(
+    { provider: "codex", cwd: daemon.staticDir },
+    undefined,
+    { workspaceId: workspace.id, labels: { [PARENT_AGENT_ID_LABEL]: agent.id } },
+  );
+  const switchProvider = agentManager.switchAgentProvider.bind(agentManager);
+  vi.spyOn(agentManager, "switchAgentProvider").mockImplementationOnce(async (agentId, input) => {
+    // The WebSocket session has finished checking the original workspace.
+    await agentManager.moveSubagentToWorkspace(agentId, {
+      allocateWorkspace: async () => ({ workspaceId: "destination-workspace" }),
+    });
+    return switchProvider(agentId, input);
+  });
+  await expect(
+    owner.switchAgentProvider(child.id, { provider: "claude", context: "blank" }),
+  ).rejects.toThrow(`no longer in workspace ${workspace.id}`);
+  expect(await agentStorage.get(child.id)).toMatchObject({
+    provider: "codex",
+    workspaceId: "destination-workspace",
+  });
+}, 30_000);
+
+test("WebSocket config, commands and history leave a silent resident unloaded", async () => {
+  const beforeCreateSession = vi.fn(async () => {});
+  const codex = createTestAgentClient("codex", { beforeCreateSession });
+  const resumeSession = vi.spyOn(codex, "resumeSession");
+  codex.effectiveOptions = (own) => mergeProviderOptions({ service_tier: "flex" }, own) ?? {};
+  const fetchCatalog = vi.spyOn(codex, "fetchCatalog").mockResolvedValue({
+    models: [
+      { provider: "codex", id: "initial", label: "Initial" },
+      {
+        provider: "codex",
+        id: "review",
+        label: "Review",
+        thinkingOptions: [{ id: "low", label: "Low" }],
+      },
+      { provider: "codex", id: "another", label: "Another" },
+    ],
+    modes: [
+      { id: "default", label: "Default" },
+      { id: "read-only", label: "Read only" },
+      { id: "full-access", label: "Full access" },
+    ],
+  });
+  const settleProviders = vi.spyOn(ProviderSnapshotManager.prototype, "settlePluginProviders");
+  onTestFinished(() => {
+    settleProviders.mockRestore();
+  });
+  const daemon = await createTestPaseoDaemon({
+    mcpEnabled: false,
+    agentClients: { codex },
+    agentProfiles: [
+      {
+        id: "review",
+        name: "Reviewer",
+        roleSlug: "review",
+        provider: "codex",
+        model: "initial",
+        modeId: "default",
+        options: { approval_policy: "never", service_tier: "default" },
+      },
+    ],
+  });
+  onTestFinished(() => daemon.close());
+  const snapshots = settleProviders.mock.contexts.at(-1);
+  settleProviders.mockRestore();
+  if (!(snapshots instanceof ProviderSnapshotManager)) throw new Error("Expected daemon snapshots");
+  // Publish before the daemon has a WebSocket Session to observe it.
+  await snapshots.refreshSnapshotForCwd({ cwd: daemon.staticDir, providers: ["codex"] });
+  expect(fetchCatalog).toHaveBeenCalledTimes(1);
+  fetchCatalog.mockClear();
+
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+  onTestFinished(() => client.close());
+  await client.connect();
+  const { workspace, mainAgent, error } = await client.createWorkspace({
+    source: { kind: "directory", path: daemon.staticDir },
+    title: "Silent review",
+    topic: { hideFromModel: true },
+    mainAgent: { config: { provider: "codex", cwd: daemon.staticDir } },
+  });
+  expect(error).toBeNull();
+  if (!workspace || !mainAgent) throw new Error("Expected a topic with a silent main");
+  const { agentId } = await client.createResidentAgent(mainAgent.id, "review");
+  const storage = daemon.daemon.agentStorage;
+  const before = await storage.get(agentId);
+  const coldCwd = join(daemon.staticDir, "cold");
+  await mkdir(coldCwd);
+  const { mainAgent: coldMain } = await client.createWorkspace({
+    source: { kind: "directory", path: coldCwd },
+    title: "Cold review",
+    topic: { hideFromModel: true },
+    mainAgent: { config: { provider: "codex", cwd: coldCwd } },
+  });
+  if (!coldMain) throw new Error("Expected a topic with a cold catalog");
+  const coldBefore = await storage.get(coldMain.id);
+  await expect(
+    client.applyAgentConfig(coldMain.id, {
+      modelId: "review",
+      modeId: "read-only",
+      options: { plan_mode: true },
+    }),
+  ).rejects.toThrow("catalog is unavailable for this workspace");
+  expect(await storage.get(coldMain.id)).toEqual(coldBefore);
+  expect(fetchCatalog).not.toHaveBeenCalled();
+
+  const secondClient = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+  onTestFinished(() => secondClient.close());
+  await secondClient.connect();
+  await expect(
+    client.applyAgentConfig(agentId, {
+      modelId: "review",
+      modeId: "unknown",
+      options: { plan_mode: true },
+    }),
+  ).rejects.toThrow("Mode 'unknown' is unavailable");
+  expect(await storage.get(agentId)).toEqual(before);
+  await expect(
+    client.applyAgentConfig(agentId, {
+      modelId: "review",
+      modeId: "read-only",
+      options: { plan_mode: "invalid" },
+    }),
+  ).rejects.toThrow("Invalid providerOptions");
+  expect(await storage.get(agentId)).toEqual(before);
+  await expect(
+    client.applyAgentConfig(agentId, {
+      modelId: "review",
+      modeId: "read-only",
+      thinkingOptionId: "high",
+    }),
+  ).rejects.toThrow("Thinking option 'high' is unavailable");
+  expect(await storage.get(agentId)).toEqual(before);
+  await expect(
+    client.applyAgentConfig(agentId, {
+      modelId: "another",
+      modeId: "read-only",
+      thinkingOptionId: "low",
+      options: { plan_mode: true },
+    }),
+  ).rejects.toThrow("Thinking option 'low' is unavailable for model 'another'");
+  expect(await storage.get(agentId)).toEqual(before);
+  await secondClient.applyAgentConfig(agentId, {
+    modelId: "review",
+    modeId: "read-only",
+    thinkingOptionId: "low",
+    featureValues: { fast_mode: true, plan_mode: false },
+    options: { plan_mode: true, service_tier: null },
+  });
+  expect(await storage.get(agentId)).toMatchObject({
+    lastStatus: "closed",
+    lastModeId: "read-only",
+    config: {
+      model: "review",
+      modeId: "read-only",
+      thinkingOptionId: "low",
+      providerOptions: { approval_policy: "never", plan_mode: true },
+    },
+  });
+  const afterBundle = await new AgentStorage(
+    daemon.config.agentStoragePath,
+    createTestLogger(),
+  ).get(agentId);
+  expect(afterBundle).toEqual(await storage.get(agentId));
+  expect(afterBundle?.config?.providerOptions?.service_tier).toBeUndefined();
+  expect(
+    daemon.daemon.agentManager.effectiveOptionsFor("codex", afterBundle?.config?.providerOptions),
+  ).toEqual({ approval_policy: "never", plan_mode: true, service_tier: "flex" });
+  await client.setAgentMode(agentId, "full-access");
+  await client.setAgentFeature(agentId, "fast_mode", true);
+  await client.setAgentOptions(agentId, { plan_mode: false });
+  await client.setAgentModel(agentId, "another");
+  expect((await storage.get(agentId))?.config?.thinkingOptionId).toBeUndefined();
+  await client.setAgentModel(agentId, "review");
+  await client.setAgentThinkingOption(agentId, "low");
+  await expect(client.setAgentThinkingOption(agentId, "high")).rejects.toThrow("unavailable");
+  await expect(client.listCommands(agentId)).resolves.toMatchObject({ commands: [], error: null });
+  await expect(client.fetchAgentTimeline(agentId)).resolves.toMatchObject({
+    entries: [],
+    error: null,
+  });
+  const stored = await storage.get(agentId);
+  expect(stored).toMatchObject({
+    workspaceId: workspace.id,
+    lastStatus: "closed",
+    lastModeId: "full-access",
+    config: {
+      model: "review",
+      modeId: "full-access",
+      thinkingOptionId: "low",
+      providerOptions: { approval_policy: "never", plan_mode: false, service_tier: "fast" },
+    },
+  });
+  expect(stored?.persistence?.sessionId).toBeUndefined();
+  expect(daemon.daemon.agentManager.getAgent(agentId)).toBeNull();
+  expect(beforeCreateSession).not.toHaveBeenCalled();
+  expect(resumeSession).not.toHaveBeenCalled();
+  expect(fetchCatalog).not.toHaveBeenCalled();
+}, 30_000);
+
+test("reset on a silent topic main keeps visible history by default and explicitly clears it on request", async () => {
+  const beforeCreateSession = vi.fn(async () => {});
+  const { manager, storage, createSilentMain } = await topicScenario({ beforeCreateSession });
+  const record = await createSilentMain();
+  const item = { type: "user_message", text: "Before reset" } as const;
+  await storage.timelinePrefixes.save(record.id, {
+    version: 1,
+    rows: [{ seq: 1, item, timestamp: record.createdAt }],
+  });
+  await manager.resetAgentSession(record.id);
+  const retained = await manager.readSilentTopicTimeline(record.id);
+  expect(retained?.timeline.rows.map((row) => row.item)).toEqual([
+    item,
+    {
+      type: "notification",
+      level: "info",
+      message: expect.stringContaining("Session context reset"),
+    },
+  ]);
+  await manager.resetAgentSession(record.id, { clearVisibleTimeline: true });
+  const cleared = await manager.readSilentTopicTimeline(record.id);
+  expect(cleared?.timeline.rows).toEqual([]);
+  expect(cleared?.timeline.epoch).not.toBe(retained?.timeline.epoch);
+  expect(await storage.get(record.id)).toMatchObject({
+    lastStatus: "closed",
+    persistence: null,
+    resetEpoch: 2,
+  });
+  expect(beforeCreateSession).not.toHaveBeenCalled();
+});
+
+test.each(["reset", "switch"] as const)(
+  "%s expires old permissions and routes only the new generation's request",
+  async (action) => {
+    const { manager, config, firstClient, secondClient } = await topicScenario({
+      secondProvider: {},
+    });
+    const original = await manager.createAgent(config, undefined, { workspaceId: WORKSPACE_ID });
+    const events: AgentStreamEvent[] = [];
+    const stop = manager.subscribe((event) => {
+      if (event.type === "agent_stream" && event.agentId === original.id) events.push(event.event);
+    });
+    try {
+      const request: AgentPermissionRequest = {
+        id: "provider-reused-id",
+        provider,
+        name: "Read",
+        kind: "tool",
+      };
+      original.pendingPermissions.set(request.id, request);
+      const oldResponse = vi.spyOn(original.session!, "respondToPermission");
+      const targetClient = action === "reset" ? firstClient : secondClient!;
+      const create = targetClient.createSession.bind(targetClient);
+      const onSubscribe = deferred<(event: AgentStreamEvent) => void>();
+      vi.spyOn(targetClient, "createSession").mockImplementationOnce(async (...args) => {
+        const session = await create(...args);
+        const subscribe = session.subscribe.bind(session);
+        vi.spyOn(session, "subscribe").mockImplementationOnce((callback) => {
+          onSubscribe.resolve(callback);
+          return subscribe(callback);
+        });
+        return session;
+      });
+      if (action === "reset") await manager.resetAgentSession(original.id);
+      else await manager.switchAgentProvider(original.id, { provider: "codex", context: "blank" });
+
+      expect(events).toContainEqual({
+        type: "permission_resolved",
+        provider,
+        requestId: request.id,
+        resolution: { behavior: "deny", message: expect.stringContaining("expired") },
+      });
+      const next = manager.getAgent(original.id)!;
+      expect(next.session).not.toBe(original.session);
+      const nextResponse = vi.spyOn(next.session!, "respondToPermission");
+      const notify = await onSubscribe.promise;
+      notify({
+        type: "permission_requested",
+        provider: next.provider,
+        request: { ...request, provider: next.provider },
+      });
+      await manager.flush();
+      const pending = manager.getPendingPermissions(original.id);
+      expect(pending).toHaveLength(1);
+      expect(pending[0]!.id).not.toBe(request.id);
+      await expect(
+        manager.respondToPermission(original.id, request.id, { behavior: "allow" }),
+      ).rejects.toThrow("no longer pending");
+      expect(oldResponse).not.toHaveBeenCalled();
+      expect(nextResponse).not.toHaveBeenCalled();
+      await manager.respondToPermission(original.id, pending[0]!.id, { behavior: "deny" });
+      expect(nextResponse).toHaveBeenCalledExactlyOnceWith(request.id, { behavior: "deny" });
+    } finally {
+      stop();
+      await manager.closeAgent(original.id);
+    }
+  },
+);
+
+test("a live model change preserves supported thinking and clears an incompatible option", async () => {
+  const { manager, config, firstClient, storage } = await topicScenario();
+  const agent = await manager.createAgent(
+    { ...config, model: "initial", thinkingOptionId: "high" },
+    undefined,
+    { workspaceId: WORKSPACE_ID },
+  );
+  try {
+    vi.spyOn(firstClient, "fetchCatalog").mockResolvedValue({
+      models: [
+        {
+          provider,
+          id: "compatible",
+          label: "Compatible",
+          thinkingOptions: [{ id: "high", label: "High" }],
+        },
+        {
+          provider,
+          id: "incompatible",
+          label: "Incompatible",
+          thinkingOptions: [{ id: "low", label: "Low" }],
+        },
+      ],
+      modes: [],
+    });
+    if (!agent.session) throw new Error("Expected a live session");
+    // The fake provider accepts model changes without doing its own thinking reconciliation.
+    agent.session.setModel = vi.fn(async (model) => ({ model }));
+    const setThinking = vi.fn(async () => {});
+    agent.session.setThinkingOption = setThinking;
+
+    await manager.setAgentModel(agent.id, "compatible");
+    await manager.flush();
+    expect(setThinking).not.toHaveBeenCalled();
+    expect((await storage.get(agent.id))?.config?.thinkingOptionId).toBe("high");
+
+    await manager.setAgentModel(agent.id, "incompatible");
+    await manager.flush();
+    expect(setThinking).toHaveBeenCalledExactlyOnceWith(null);
+    expect((await storage.get(agent.id))?.config?.thinkingOptionId).toBeUndefined();
+  } finally {
+    await manager.closeAgent(agent.id);
   }
 });

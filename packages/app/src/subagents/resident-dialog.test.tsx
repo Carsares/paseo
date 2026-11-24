@@ -1,13 +1,21 @@
 /** @vitest-environment jsdom */
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import { RESIDENT_AGENT_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  RESIDENT_AGENT_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import type { ServerInfoStatusPayload } from "@getpaseo/protocol/messages";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useCallback, type ChangeEvent, type ReactNode } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { useSessionStore, type Agent } from "@/stores/session-store";
-import { ResidentDialogProvider, useResidentActions } from "./resident-dialog";
+import {
+  ResidentDialogProvider,
+  useOpenResidentDialog,
+  useResidentActions,
+} from "./resident-dialog";
 import type { ResidentAction } from "./resident-actions";
 
 const runtime = vi.hoisted(() => ({ client: vi.fn() }));
@@ -179,4 +187,137 @@ it("allows unbinding a parentless specialist and updates eligibility if it becom
   });
   expect(screen.queryByTestId("resident-confirm")).toBeNull();
   expect(client.setAgentResident).not.toHaveBeenCalled();
+});
+
+function TopicMainResetButton() {
+  const open = useOpenResidentDialog();
+  const handleClick = useCallback(() => {
+    open?.({ serverId: host, agentId: target, action: "reset", allowTopicMainReset: true });
+  }, [open]);
+  return (
+    <button type="button" onClick={handleClick}>
+      topic-main-reset
+    </button>
+  );
+}
+
+function renderTopicMainReset(overrides: Partial<Agent> = {}) {
+  const permissions: ServerInfoStatusPayload["permissions"] = ["workspace.write", "hub.execute"];
+  const client = {
+    getLastServerInfoMessage: () => ({ permissions }),
+    resetAgentSession: vi.fn(async () => {}),
+    setAgentResident: vi.fn(async () => {}),
+  };
+  runtime.client.mockImplementation((serverId: string) => (serverId === host ? client : null));
+  const store = useSessionStore.getState();
+  store.initializeSession(host, client as unknown as DaemonClient);
+  store.setAgents(
+    host,
+    new Map([
+      [
+        target,
+        {
+          id: target,
+          serverId: host,
+          provider: "codex",
+          cwd: "/workspace",
+          model: null,
+          createdAt: new Date(0),
+          lastUserMessageAt: new Date(1),
+          lastActivityAt: new Date(1),
+          currentModeId: null,
+          availableModes: [],
+          persistence: null,
+          capabilities: {
+            supportsStreaming: true,
+            supportsSessionPersistence: true,
+            supportsDynamicModes: true,
+            supportsMcpServers: true,
+            supportsReasoningStream: true,
+            supportsToolInvocations: true,
+          },
+          title: "Topic Main",
+          workspaceId: "topic-ws",
+          parentAgentId: null,
+          status: "idle",
+          turn: { phase: "idle", cancellationRequestId: null },
+          updatedAt: new Date(1),
+          pendingPermissions: [],
+          labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+          ...overrides,
+        } satisfies Agent,
+      ],
+    ]),
+  );
+  store.updateSessionServerInfo(host, {
+    serverId: host,
+    hostname: null,
+    version: null,
+    features: { agentResidentSpecialists: true, agentSessionReset: true },
+  });
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <ResidentDialogProvider>
+        <TopicMainResetButton />
+      </ResidentDialogProvider>
+    </QueryClientProvider>,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "topic-main-reset" }));
+  return { client };
+}
+
+it("supports default safe topic main reset preserving visible history", async () => {
+  const { client } = renderTopicMainReset();
+  expect(screen.getByText("topicWorkbench.directory.resetMainDescription")).toBeTruthy();
+
+  fireEvent.click(screen.getByTestId("resident-confirm"));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(client.resetAgentSession).toHaveBeenCalledExactlyOnceWith(target, {
+    interrupt: false,
+    clearVisibleTimeline: false,
+  });
+});
+
+it("requires explicit interrupt opt-in when resetting a running topic main session", async () => {
+  const { client } = renderTopicMainReset({
+    status: "running",
+    turn: { phase: "open", turnId: "turn-1", startedAt: new Date(1), cancellationRequestId: null },
+  });
+  expect(screen.getByText("topicWorkbench.directory.resetMainRunningWarning")).toBeTruthy();
+
+  fireEvent.click(screen.getByTestId("resident-confirm"));
+  expect(client.resetAgentSession).not.toHaveBeenCalled();
+
+  const interrupt = screen.getByRole<HTMLInputElement>("checkbox", {
+    name: "subagents.resident.interrupt",
+  });
+  fireEvent.click(interrupt);
+  fireEvent.click(screen.getByTestId("resident-confirm"));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(client.resetAgentSession).toHaveBeenCalledExactlyOnceWith(target, {
+    interrupt: true,
+    clearVisibleTimeline: false,
+  });
+});
+
+it("requires secondary confirmation before clearing visible timeline on topic main reset", async () => {
+  const { client } = renderTopicMainReset();
+  const clear = screen.getByRole<HTMLInputElement>("checkbox", {
+    name: "subagents.resident.clearVisibleTimeline",
+  });
+  fireEvent.click(clear);
+
+  fireEvent.click(screen.getByTestId("resident-confirm"));
+  expect(client.resetAgentSession).not.toHaveBeenCalled();
+
+  const confirmClear = screen.getByRole<HTMLInputElement>("checkbox", {
+    name: "topicWorkbench.directory.resetMainClearConfirmLabel",
+  });
+  fireEvent.click(confirmClear);
+  fireEvent.click(screen.getByTestId("resident-confirm"));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(client.resetAgentSession).toHaveBeenCalledExactlyOnceWith(target, {
+    interrupt: false,
+    clearVisibleTimeline: true,
+  });
 });

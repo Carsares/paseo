@@ -1,13 +1,15 @@
 import {
   getParentAddressFromLabels,
+  isMainControlAgent,
   RESIDENT_ROLE_MAX_LENGTH,
   RESIDENT_ROLE_SLUG_MAX_LENGTH,
 } from "@getpaseo/protocol/agent-labels";
-import type { AgentProfile } from "@getpaseo/protocol/messages";
+import type { AgentProfile, ServerInfoStatusPayload } from "@getpaseo/protocol/messages";
 import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   useSyncExternalStore,
@@ -18,6 +20,7 @@ import { Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { useShallow } from "zustand/shallow";
 import { AdaptiveModalSheet, SheetHeaderSubtitle } from "@/components/adaptive-modal-sheet";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ControlSizeProvider } from "@/components/ui/control-size";
 import type { ControlSize } from "@/components/ui/control-geometry";
@@ -38,11 +41,67 @@ import {
 } from "./resident-actions";
 import { openResidentForm } from "./resident-form-model";
 
-type OpenResidentDialog = (request: ResidentRequest) => void;
+export type OpenResidentDialogRequest = ResidentRequest & {
+  initialProfileId?: string;
+  /** Enables safe generation reset for a Topic Main Control seat without widening resident-actions.ts. */
+  allowTopicMainReset?: boolean;
+};
+
+type Permission = NonNullable<ServerInfoStatusPayload["permissions"]>[number];
+
+function allowsPermission(
+  permissions: readonly Permission[] | undefined,
+  permission: Permission,
+): boolean {
+  return permissions?.includes(permission) ?? true;
+}
+
+function canResetTopicMainControl(
+  agentId: string,
+  session: ReturnType<typeof useSessionStore.getState>["sessions"][string] | undefined,
+): boolean {
+  const agent = session?.agents.get(agentId);
+  if (!agent || agent.archivedAt || agent.background || !agent.workspaceId) return false;
+  if (!isMainControlAgent(agent)) return false;
+  const permissions = session?.client?.getLastServerInfoMessage?.()?.permissions;
+  return (
+    allowsPermission(permissions, "workspace.write") && allowsPermission(permissions, "hub.execute")
+  );
+}
+
+function isEligibleDialogAction(
+  request: OpenResidentDialogRequest,
+  session: ReturnType<typeof useSessionStore.getState>["sessions"][string] | undefined,
+): boolean {
+  if (sessionResidentActions(request.serverId, request.agentId, session).includes(request.action)) {
+    return true;
+  }
+  return (
+    request.action === "reset" &&
+    request.allowTopicMainReset === true &&
+    canResetTopicMainControl(request.agentId, session)
+  );
+}
+
+function isAgentRunningForReset(
+  agent: ReturnType<typeof useSessionStore.getState>["sessions"][string]["agents"] extends Map<
+    string,
+    infer T
+  >
+    ? T | undefined
+    : never,
+): boolean {
+  if (!agent) return false;
+  return (
+    agent.status === "running" || agent.status === "initializing" || agent.turn.phase === "open"
+  );
+}
+
+type OpenResidentDialog = (request: OpenResidentDialogRequest) => void;
 const ResidentDialogContext = createContext<OpenResidentDialog | null>(null);
 
 export function ResidentDialogProvider({ children }: { children: ReactNode }) {
-  const [request, setRequest] = useState<ResidentRequest | null>(null);
+  const [request, setRequest] = useState<OpenResidentDialogRequest | null>(null);
   const open = useCallback<OpenResidentDialog>(
     (next) => setRequest((current) => current ?? next),
     [],
@@ -54,6 +113,10 @@ export function ResidentDialogProvider({ children }: { children: ReactNode }) {
       {request ? <ResidentDialog request={request} onClose={close} /> : null}
     </ResidentDialogContext.Provider>
   );
+}
+
+export function useOpenResidentDialog(): OpenResidentDialog | null {
+  return useContext(ResidentDialogContext);
 }
 
 export function useResidentDialogBridge() {
@@ -143,7 +206,7 @@ function useSubmitResidentForm({
 }: {
   client: ReturnType<typeof useHostRuntimeClient>;
   model: ResidentForm;
-  request: ResidentRequest;
+  request: OpenResidentDialogRequest;
   allowSubmit: boolean;
   onClose: () => void;
 }) {
@@ -154,7 +217,7 @@ function useSubmitResidentForm({
     let createdAgentId: string | undefined;
     const ok = await model.submit(async ({ profileId, overrides, reset }) => {
       const session = useSessionStore.getState().sessions[serverId];
-      if (!sessionResidentActions(serverId, agentId, session).includes(action)) {
+      if (!isEligibleDialogAction(request, session)) {
         throw new Error(t("providerSelection.unavailable"));
       }
       switch (action) {
@@ -201,34 +264,94 @@ function unavailableReason({
   return null;
 }
 
-function ResidentDialog({ request, onClose }: { request: ResidentRequest; onClose: () => void }) {
-  const { serverId, agentId, action } = request;
-  const { t } = useTranslation();
-  const size = useIsCompactFormFactor() ? "md" : "sm";
-  const [model] = useState(() => openResidentForm(action));
-  const [sheetRevision, setSheetRevision] = useState(0);
-  const state = useSyncExternalStore(model.subscribe, model.getState, model.getState);
+function isResetConfirmationSatisfied(input: {
+  isTopicMainReset: boolean;
+  isRunning: boolean;
+  interrupt: boolean;
+  clearVisibleTimeline: boolean;
+  confirmClearTimeline: boolean;
+}): boolean {
+  if (!input.isTopicMainReset) return true;
+  if (input.isRunning && !input.interrupt) return false;
+  if (input.clearVisibleTimeline && !input.confirmClearTimeline) return false;
+  return true;
+}
+
+function useResidentDialogContext(request: OpenResidentDialogRequest) {
+  const { serverId, agentId, action, allowTopicMainReset } = request;
   const client = useHostRuntimeClient(serverId);
   const connected = useHostRuntimeIsConnected(serverId);
   const serverInfo = useSessionStore((store) => store.sessions[serverId]?.serverInfo);
   const agent = useSessionStore((store) => store.sessions[serverId]?.agents.get(agentId));
-  const eligible = useResidentActions(serverId, agentId).some((item) => item.action === action);
-  const hasParent = getParentAddressFromLabels(agent?.labels, serverId) !== null;
+  const residentEligible = useResidentActions(serverId, agentId).some(
+    (item) => item.action === action,
+  );
+  const isTopicMainReset = action === "reset" && allowTopicMainReset === true;
+  const topicMainResetEligible = useSessionStore(
+    (store) => isTopicMainReset && canResetTopicMainControl(agentId, store.sessions[serverId]),
+  );
   const unavailable = unavailableReason({
     connected: connected && Boolean(client),
     hasServerInfo: Boolean(serverInfo),
     supported: supportsResidentAction(serverInfo?.features, action),
-    eligible,
+    eligible: residentEligible || topicMainResetEligible,
   });
-  const canUseAction = unavailable === null;
+  return {
+    client,
+    agent,
+    isTopicMainReset,
+    hasParent: getParentAddressFromLabels(agent?.labels, serverId) !== null,
+    isRunning: isAgentRunningForReset(agent),
+    unavailable,
+    canUseAction: unavailable === null,
+  };
+}
+
+function ResidentDialog({
+  request,
+  onClose,
+}: {
+  request: OpenResidentDialogRequest;
+  onClose: () => void;
+}) {
+  const { serverId, action, initialProfileId } = request;
+  const { t } = useTranslation();
+  const size = useIsCompactFormFactor() ? "md" : "sm";
+  const [model] = useState(() => openResidentForm(action));
+  const [sheetRevision, setSheetRevision] = useState(0);
+  const [confirmClearTimeline, setConfirmClearTimeline] = useState(false);
+  const state = useSyncExternalStore(model.subscribe, model.getState, model.getState);
+  const { client, agent, isTopicMainReset, hasParent, isRunning, unavailable, canUseAction } =
+    useResidentDialogContext(request);
   const presets = useResidentPresets(serverId, client, action === "create" && canUseAction);
+  useEffect(() => {
+    if (action !== "create" || !initialProfileId || state.preset !== null) return;
+    const match = presets.data?.agentProfiles?.find((profile) => profile.id === initialProfileId);
+    if (match) model.selectPreset(match);
+  }, [action, initialProfileId, model, presets.data?.agentProfiles, state.preset]);
+  const handleToggleClearTimeline = useCallback(
+    (next: boolean) => {
+      model.setClearVisibleTimeline(next);
+      if (!next) setConfirmClearTimeline(false);
+    },
+    [model],
+  );
   const selectedPresetId = state.preset?.id;
   const presetAvailable =
     presets.isSuccess &&
     presets.data.agentProfiles?.some((profile) => profile.id === selectedPresetId) === true;
   const waiting = state.phase === "pending";
-  const allowSubmit = canUseAction && state.canSubmit && (action !== "create" || presetAvailable);
-  const [titleKey, confirmKey] = dialogKeys[action];
+  const resetConfirmed = isResetConfirmationSatisfied({
+    isTopicMainReset,
+    isRunning,
+    interrupt: state.interrupt,
+    clearVisibleTimeline: state.clearVisibleTimeline,
+    confirmClearTimeline,
+  });
+  const allowSubmit =
+    canUseAction && state.canSubmit && resetConfirmed && (action !== "create" || presetAvailable);
+  const [defaultTitleKey, confirmKey] = dialogKeys[action];
+  const titleKey = isTopicMainReset ? "topicWorkbench.directory.resetMainTitle" : defaultTitleKey;
 
   const header = useMemo(
     () => ({
@@ -264,6 +387,11 @@ function ResidentDialog({ request, onClose }: { request: ResidentRequest; onClos
             <ResidentFields
               action={action}
               hasParent={hasParent}
+              isTopicMainReset={isTopicMainReset}
+              isRunning={isRunning}
+              confirmClearTimeline={confirmClearTimeline}
+              onToggleClearTimeline={handleToggleClearTimeline}
+              onConfirmClearTimeline={setConfirmClearTimeline}
               model={model}
               state={state}
               size={size}
@@ -300,9 +428,79 @@ interface ResidentFieldsProps {
   size: ControlSize;
 }
 
+function ResidentResetFields({
+  isTopicMainReset,
+  isRunning,
+  confirmClearTimeline,
+  onToggleClearTimeline,
+  onConfirmClearTimeline,
+  model,
+  state,
+}: {
+  isTopicMainReset: boolean;
+  isRunning: boolean;
+  confirmClearTimeline: boolean;
+  onToggleClearTimeline: (next: boolean) => void;
+  onConfirmClearTimeline: (next: boolean) => void;
+  model: ResidentForm;
+  state: ResidentFormState;
+}) {
+  const { t } = useTranslation();
+  const waiting = state.phase === "pending";
+  return (
+    <>
+      <Text style={styles.description}>
+        {t(
+          isTopicMainReset
+            ? "topicWorkbench.directory.resetMainDescription"
+            : "subagents.resident.resetDescription",
+        )}
+      </Text>
+      {isTopicMainReset && isRunning && !state.interrupt ? (
+        <Alert variant="warning" title={t("topicWorkbench.directory.resetMainRunningWarning")} />
+      ) : null}
+      <ResidentToggle
+        label={t("subagents.resident.interrupt")}
+        value={state.interrupt}
+        disabled={waiting}
+        onChange={model.setInterrupt}
+      />
+      <ResidentToggle
+        label={t("subagents.resident.clearVisibleTimeline")}
+        value={state.clearVisibleTimeline}
+        disabled={waiting}
+        onChange={onToggleClearTimeline}
+      />
+      {state.clearVisibleTimeline ? (
+        <Text style={styles.description}>
+          {t("subagents.resident.clearVisibleTimelineDescription")}
+        </Text>
+      ) : null}
+      {isTopicMainReset && state.clearVisibleTimeline ? (
+        <ResidentToggle
+          label={t("topicWorkbench.directory.resetMainClearConfirmLabel")}
+          value={confirmClearTimeline}
+          disabled={waiting}
+          onChange={onConfirmClearTimeline}
+        />
+      ) : null}
+      {isTopicMainReset && state.clearVisibleTimeline ? (
+        <Text style={styles.description}>
+          {t("topicWorkbench.directory.resetMainClearConfirmHint")}
+        </Text>
+      ) : null}
+    </>
+  );
+}
+
 function ResidentFields({
   action,
   hasParent,
+  isTopicMainReset,
+  isRunning,
+  confirmClearTimeline,
+  onToggleClearTimeline,
+  onConfirmClearTimeline,
   presets,
   model,
   state,
@@ -310,10 +508,14 @@ function ResidentFields({
 }: ResidentFieldsProps & {
   action: ResidentRequest["action"];
   hasParent: boolean;
+  isTopicMainReset: boolean;
+  isRunning: boolean;
+  confirmClearTimeline: boolean;
+  onToggleClearTimeline: (next: boolean) => void;
+  onConfirmClearTimeline: (next: boolean) => void;
   presets: ReturnType<typeof useResidentPresets>;
 }) {
   const { t } = useTranslation();
-  const waiting = state.phase === "pending";
   switch (action) {
     case "create":
       return (
@@ -330,26 +532,15 @@ function ResidentFields({
       ) : null;
     case "reset":
       return (
-        <>
-          <Text style={styles.description}>{t("subagents.resident.resetDescription")}</Text>
-          <ResidentToggle
-            label={t("subagents.resident.interrupt")}
-            value={state.interrupt}
-            disabled={waiting}
-            onChange={model.setInterrupt}
-          />
-          <ResidentToggle
-            label={t("subagents.resident.clearVisibleTimeline")}
-            value={state.clearVisibleTimeline}
-            disabled={waiting}
-            onChange={model.setClearVisibleTimeline}
-          />
-          {state.clearVisibleTimeline ? (
-            <Text style={styles.description}>
-              {t("subagents.resident.clearVisibleTimelineDescription")}
-            </Text>
-          ) : null}
-        </>
+        <ResidentResetFields
+          isTopicMainReset={isTopicMainReset}
+          isRunning={isRunning}
+          confirmClearTimeline={confirmClearTimeline}
+          onToggleClearTimeline={onToggleClearTimeline}
+          onConfirmClearTimeline={onConfirmClearTimeline}
+          model={model}
+          state={state}
+        />
       );
   }
 }

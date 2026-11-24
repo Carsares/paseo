@@ -3935,7 +3935,15 @@ export class DaemonClient {
   async archiveAgent(
     agentId: string,
     expectedWorkspaceId?: string,
+    options?: { onlyIfIdle: true },
   ): Promise<{ archivedAt: string }> {
+    if (options?.onlyIfIdle) {
+      if (!expectedWorkspaceId) throw new Error("Idle archive requires a workspace ID.");
+      // COMPAT(agentIdleArchiveV1): added in v0.18.0, remove gate after 2027-06-01.
+      if (this.lastServerInfoMessage?.features?.agentIdleArchiveV1 !== true) {
+        throw new Error("Update the host to archive finished tasks without interrupting work.");
+      }
+    }
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
       type: "archive_agent_request",
@@ -3945,6 +3953,7 @@ export class DaemonClient {
         ? { explicitSideChatArchive: true }
         : {}),
       ...(expectedWorkspaceId === undefined ? {} : { expectedWorkspaceId }),
+      ...(options?.onlyIfIdle ? { onlyIfIdle: true } : {}),
       requestId,
     });
     const result = await this.sendRequest({
@@ -5275,6 +5284,18 @@ export class DaemonClient {
     agentId: string,
     input: SwitchAgentProviderInput,
   ): Promise<SwitchAgentProviderResult> {
+    if (input.onlyIfSilent && input.context !== "blank") {
+      throw new Error("A silent-only provider switch requires blank context.");
+    }
+    // COMPAT(agentProviderSwitchBlankContext): added in v0.18.0, remove gate after 2027-06-01.
+    if (
+      input.context === "blank" &&
+      this.lastServerInfoMessage?.features?.agentProviderSwitchBlankContext !== true
+    ) {
+      throw new Error(
+        "Update the host to switch providers without handing off conversation context.",
+      );
+    }
     const message = {
       ...input,
       type: "agent.provider.switch.request",

@@ -1,4 +1,9 @@
-import { RESIDENT_AGENT_LABEL, SIDE_CHAT_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  RESIDENT_AGENT_LABEL,
+  SIDE_CHAT_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 import { describe, expect, it, vi } from "vitest";
 import { discardSideChatIfEmpty, resolveCloseAgentTabPolicy } from "./close-tab-policy";
 
@@ -27,6 +32,31 @@ describe("resolveCloseAgentTabPolicy", () => {
   it("preserves the existing archive fallback when the agent is missing", () => {
     expect(resolveCloseAgentTabPolicy(null)).toEqual({ kind: "archive-on-close" });
     expect(resolveCloseAgentTabPolicy(undefined)).toEqual({ kind: "archive-on-close" });
+  });
+
+  it("keeps all non-side-chat tabs layout-only in topic workspaces while preserving side-chat cleanup", () => {
+    const topicOptions = { isTopicWorkspace: true };
+    expect(
+      resolveCloseAgentTabPolicy(
+        { parentAgentId: null, labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE } },
+        topicOptions,
+      ),
+    ).toEqual({ kind: "layout-only" });
+    expect(resolveCloseAgentTabPolicy({ parentAgentId: null }, topicOptions)).toEqual({
+      kind: "layout-only",
+    });
+    expect(resolveCloseAgentTabPolicy({ parentAgentId: "main" }, topicOptions)).toEqual({
+      kind: "layout-only",
+    });
+    expect(resolveCloseAgentTabPolicy(null, topicOptions)).toEqual({
+      kind: "layout-only",
+    });
+    expect(
+      resolveCloseAgentTabPolicy(
+        { parentAgentId: null, labels: { [SIDE_CHAT_LABEL]: "true" } },
+        topicOptions,
+      ),
+    ).toEqual({ kind: "side-chat" });
   });
 });
 

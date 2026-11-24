@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, PanelLeft, PanelLeftClose } from "lucide-react-native";
+import { ChevronDown, ChevronRight, PanelLeft, PanelLeftClose, Plus } from "lucide-react-native";
 import { type ReactNode, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ScrollView, Text, View } from "react-native";
@@ -10,8 +10,8 @@ import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { useIsCompactFormFactor } from "@/constants/layout";
-import { useContainerWidthBelow } from "@/hooks/use-container-width";
 import { usePendingArchiveAgentKeys } from "@/hooks/use-archive-agent";
+import { useContainerWidthBelow } from "@/hooks/use-container-width";
 import { useSettings } from "@/hooks/use-settings";
 import { usePaneContext, usePaneFocus } from "@/panels/pane-context";
 import { useSessionStore } from "@/stores/session-store";
@@ -19,8 +19,11 @@ import { collectAllTabs, useWorkspaceLayoutStore } from "@/stores/workspace-layo
 import type { Theme } from "@/styles/theme";
 import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
+import { getStatusDotColor } from "@/utils/status-dot-color";
 import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
 import { openPreferredWorkspaceTarget } from "@/workspace-tabs/open-beside";
+import { useCreateResidentAction } from "../resident-dialog";
+import { useTeamDirectoryShell } from "../team-directory/shell-context";
 import {
   mainControlTreeNodeKey,
   type MainControlSession,
@@ -28,7 +31,6 @@ import {
   type MainControlWorkspaceSections,
   selectMainControlWorkspaceSections,
 } from "./select-tree";
-import { useCreateResidentAction } from "../resident-dialog";
 import { useWorkspaceArchivedAgents } from "./use-workspace-archived-agents";
 
 const iconColor = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
@@ -36,6 +38,7 @@ const DownIcon = withUnistyles(ChevronDown, iconColor);
 const RightIcon = withUnistyles(ChevronRight, iconColor);
 const ShowIcon = withUnistyles(PanelLeft, iconColor);
 const HideIcon = withUnistyles(PanelLeftClose, iconColor);
+const PlusIcon = withUnistyles(Plus, iconColor);
 
 export function MainControlTreeLayout({
   mainAgentId,
@@ -44,7 +47,8 @@ export function MainControlTreeLayout({
   mainAgentId: string | null;
   children: ReactNode;
 }) {
-  const { i18n } = useTranslation();
+  const { t } = useTranslation();
+  const teamDirectoryShell = useTeamDirectoryShell();
   const { serverId, workspaceId, tabId } = usePaneContext();
   const { focusPane } = usePaneFocus();
   const isCompact = useIsCompactFormFactor();
@@ -53,32 +57,43 @@ export function MainControlTreeLayout({
   const overlay = isCompact || isBelow;
   const [wideVisible, setWideVisible] = useState(true);
   const [overlayVisible, setOverlayVisible] = useState(false);
-  const [closedExpanded, setClosedExpanded] = useState(false);
+  const scopeKey = `${serverId}\0${workspaceId}`;
+  const [closedState, setClosedState] = useState<{ scopeKey: string; expanded: boolean }>({
+    scopeKey,
+    expanded: false,
+  });
+  const closedExpanded = closedState.scopeKey === scopeKey && closedState.expanded;
   const visible = overlay ? overlayVisible : wideVisible;
   const setVisible = overlay ? setOverlayVisible : setWideVisible;
   const hideTree = useCallback(() => setVisible(false), [setVisible]);
   const showTree = useCallback(() => setVisible(true), [setVisible]);
-  const expandAll = useCallback(() => {
-    setVisible(true);
-    setClosedExpanded(true);
-  }, [setVisible]);
-  const toggleClosed = useCallback(() => setClosedExpanded((current) => !current), []);
+  const toggleClosed = useCallback(() => {
+    setClosedState((current) => ({
+      scopeKey,
+      expanded: current.scopeKey === scopeKey ? !current.expanded : true,
+    }));
+  }, [scopeKey]);
   const preferences = useSettings((settings) => settings.openInSidePane);
   const workspaceKey = buildWorkspaceTabPersistenceKey({ serverId, workspaceId });
-  const { sections, supportsWorkspaceHistory, isLoadingArchive, archiveError, retryArchive } =
-    useMainControlDirectoryData({
-      mainAgentId,
-      serverId,
-      workspaceId,
-      workspaceKey,
-    });
-  const createResident = useCreateResidentAction(serverId, mainAgentId);
 
-  const isChinese = i18n.language?.startsWith("zh") === true;
-  const showLabel = isChinese ? "显示会话目录" : "Show sessions";
-  const hideLabel = isChinese ? "隐藏" : "Hide";
-  const expandLabel = isChinese ? "展开全部会话" : "Expand all sessions";
-  const closedLabel = `${isChinese ? "已关闭" : "Closed"} (${sections?.closed.length ?? 0})`;
+  const ownedByShell = teamDirectoryShell.isOwnedByWorkspaceShell;
+  const {
+    sections,
+    supportsWorkspaceHistory,
+    hasMoreArchive,
+    isLoadingArchive,
+    isLoadingMoreArchive,
+    archiveError,
+    loadMoreArchive,
+    retryArchive,
+  } = useMainControlDirectoryData({
+    mainAgentId: ownedByShell ? null : mainAgentId,
+    serverId,
+    workspaceId,
+    workspaceKey,
+    historyExpanded: closedExpanded,
+  });
+  const createResident = useCreateResidentAction(serverId, ownedByShell ? null : mainAgentId);
 
   const openNode = useCallback(
     ({ serverId: nodeServerId, agentId, isArchived, processState }: MainControlTreeNode) => {
@@ -103,7 +118,6 @@ export function MainControlTreeLayout({
         navigateToAgent({ serverId: nodeServerId, agentId, asTab: processState === "closed" });
         return;
       }
-      // The preferred opener uses a sheet for subagents in compact mode.
       if (
         processState === "closed" &&
         useWorkspaceLayoutStore.getState().layoutMode === "compact"
@@ -122,6 +136,18 @@ export function MainControlTreeLayout({
     [focusPane, mainAgentId, overlay, preferences, serverId, tabId, workspaceId, workspaceKey],
   );
 
+  // When WorkspaceScreen mounts the workspace-shell-level Team Directory (Zone 3),
+  // avoid rendering a duplicate per-agent directory sidebar.
+  if (ownedByShell) {
+    return children;
+  }
+
+  const showLabel = t("topicWorkbench.directory.show");
+  const hideLabel = t("topicWorkbench.directory.hide");
+  const closedLabel = closedExpanded
+    ? t("topicWorkbench.directory.historySection", { count: sections?.closed.length ?? 0 })
+    : t("topicWorkbench.directory.viewHistory");
+
   return (
     <View style={styles.layout} onLayout={mainAgentId ? onLayout : undefined}>
       {sections && overlay && visible ? (
@@ -135,15 +161,17 @@ export function MainControlTreeLayout({
       {sections && visible ? (
         <MainControlDirectory
           sections={sections}
-          isChinese={isChinese}
           overlay={overlay}
           topOverlayInset={topOverlayInset}
           closedExpanded={closedExpanded}
           closedLabel={closedLabel}
           hideLabel={hideLabel}
           supportsWorkspaceHistory={supportsWorkspaceHistory}
+          hasMoreArchive={hasMoreArchive}
           isLoadingArchive={isLoadingArchive}
+          isLoadingMoreArchive={isLoadingMoreArchive}
           archiveError={archiveError}
+          onLoadMoreArchive={loadMoreArchive}
           onRetryArchive={retryArchive}
           onToggleClosed={toggleClosed}
           onHide={hideTree}
@@ -167,16 +195,6 @@ export function MainControlTreeLayout({
             >
               <ShowIcon size={16} />
             </ToolbarButton>
-            <Button
-              size="sm"
-              variant="secondary"
-              accessibilityLabel={`${expandLabel}, ${closedLabel}`}
-              testID="main-control-tree-show-all"
-              style={styles.toggle}
-              onPress={expandAll}
-            >
-              {expandLabel}
-            </Button>
           </View>
         ) : null}
         {children}
@@ -190,11 +208,13 @@ function useMainControlDirectoryData({
   serverId,
   workspaceId,
   workspaceKey,
+  historyExpanded,
 }: {
   mainAgentId: string | null;
   serverId: string;
   workspaceId: string;
   workspaceKey: string | null;
+  historyExpanded: boolean;
 }) {
   const { t } = useTranslation();
   const layoutRoot = useWorkspaceLayoutStore((state) =>
@@ -232,13 +252,19 @@ function useMainControlDirectoryData({
   const {
     data: archivedAgents,
     supportsWorkspaceHistory,
+    hasMore: hasMoreArchive,
     isLoading: isLoadingArchive,
+    isLoadingMore: isLoadingMoreArchive,
     isError: archiveError,
-    refetch: refetchArchive,
-  } = useWorkspaceArchivedAgents({ serverId, workspaceId, mainAgentId, workspaceAgentMembership });
-  const retryArchive = useCallback(() => {
-    void refetchArchive();
-  }, [refetchArchive]);
+    loadMore: loadMoreArchive,
+    refetch: retryArchive,
+  } = useWorkspaceArchivedAgents({
+    serverId,
+    workspaceId,
+    mainAgentId,
+    enabled: Boolean(mainAgentId && historyExpanded),
+    workspaceAgentMembership,
+  });
   const pendingArchiveIds = usePendingArchiveAgentKeys();
   const fallbackTitle = t("workspace.tabs.fallback.agent");
   const sections = useMemo(() => {
@@ -265,20 +291,31 @@ function useMainControlDirectoryData({
     workspaceId,
   ]);
 
-  return { sections, supportsWorkspaceHistory, isLoadingArchive, archiveError, retryArchive };
+  return {
+    sections,
+    supportsWorkspaceHistory,
+    hasMoreArchive,
+    isLoadingArchive,
+    isLoadingMoreArchive,
+    archiveError,
+    loadMoreArchive,
+    retryArchive,
+  };
 }
 
 function MainControlDirectory({
   sections,
-  isChinese,
   overlay,
   topOverlayInset,
   closedExpanded,
   closedLabel,
   hideLabel,
   supportsWorkspaceHistory,
+  hasMoreArchive,
   isLoadingArchive,
+  isLoadingMoreArchive,
   archiveError,
+  onLoadMoreArchive,
   onRetryArchive,
   onToggleClosed,
   onHide,
@@ -286,15 +323,17 @@ function MainControlDirectory({
   onCreateResident,
 }: {
   sections: MainControlWorkspaceSections;
-  isChinese: boolean;
   overlay: boolean;
   topOverlayInset: number;
   closedExpanded: boolean;
   closedLabel: string;
   hideLabel: string;
   supportsWorkspaceHistory: boolean;
+  hasMoreArchive: boolean;
   isLoadingArchive: boolean;
+  isLoadingMoreArchive: boolean;
   archiveError: boolean;
+  onLoadMoreArchive: () => void;
   onRetryArchive: () => void;
   onToggleClosed: () => void;
   onHide: () => void;
@@ -303,8 +342,8 @@ function MainControlDirectory({
 }) {
   const { t } = useTranslation();
   const expandedState = useMemo(() => ({ expanded: closedExpanded }), [closedExpanded]);
-  const expandLabel = isChinese ? "展开全部会话" : "Expand all sessions";
-  const collapseLabel = isChinese ? "收起已关闭" : "Collapse closed";
+  const flattenResidents = sections.residentGroups.length === 1;
+
   return (
     <View
       style={[
@@ -316,55 +355,44 @@ function MainControlDirectory({
     >
       <View style={styles.header}>
         <Text numberOfLines={1} style={styles.headerTitle}>
-          {isChinese ? "会话" : "Sessions"}
+          {t("topicWorkbench.directory.title")}
         </Text>
-        <Button
-          size="sm"
-          variant="ghost"
-          testID="main-control-tree-toggle-all"
-          style={styles.toggle}
-          numberOfLines={1}
-          accessibilityState={expandedState}
-          onPress={onToggleClosed}
-        >
-          {closedExpanded ? collapseLabel : expandLabel}
-        </Button>
         <ToolbarButton compact testID="main-control-tree-hide" label={hideLabel} onPress={onHide}>
           <HideIcon size={16} />
         </ToolbarButton>
       </View>
       <ScrollView keyboardShouldPersistTaps="handled">
         <View style={styles.tree}>
-          {sections.residentGroups.length || onCreateResident ? (
+          {sections.residentGroups.length > 0 || onCreateResident ? (
             <>
               <View style={styles.sectionHeading}>
                 <Text accessibilityRole="header" style={styles.sectionTitle}>
-                  {t("subagents.resident.groupTitle")}
+                  {t("topicWorkbench.directory.residentsSection")}
                 </Text>
+                {onCreateResident ? (
+                  <ToolbarButton
+                    compact
+                    label={t("subagents.resident.createAction")}
+                    onPress={onCreateResident}
+                    testID="main-control-tree-create-resident"
+                  >
+                    <PlusIcon size={14} />
+                  </ToolbarButton>
+                ) : null}
               </View>
-              {onCreateResident ? (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  style={styles.toggle}
-                  onPress={onCreateResident}
-                  testID="main-control-tree-create-resident"
-                >
-                  {t("subagents.resident.createAction")}
-                </Button>
-              ) : null}
               {sections.residentGroups.map((group) => (
                 <View key={group.parent ? mainControlTreeNodeKey(group.parent) : "standalone"}>
-                  <View style={styles.sectionHeading}>
-                    <Text numberOfLines={1} accessibilityRole="header" style={styles.rowMeta}>
-                      {group.parentTitle ?? (isChinese ? "独立" : "Standalone")}
-                    </Text>
-                  </View>
+                  {!flattenResidents ? (
+                    <View style={styles.sectionHeading}>
+                      <Text numberOfLines={1} accessibilityRole="header" style={styles.rowMeta}>
+                        {group.parentTitle ?? t("topicWorkbench.directory.standalone")}
+                      </Text>
+                    </View>
+                  ) : null}
                   {group.nodes.map((node) => (
                     <MainControlTreeRow
                       key={mainControlTreeNodeKey(node)}
                       node={node}
-                      isChinese={isChinese}
                       onOpen={onOpen}
                     />
                   ))}
@@ -374,16 +402,11 @@ function MainControlDirectory({
           ) : null}
           <View style={styles.sectionHeading}>
             <Text accessibilityRole="header" style={styles.sectionTitle}>
-              {isChinese ? "活跃中" : "Active"} ({sections.active.length})
+              {t("topicWorkbench.directory.tasksSection")} ({sections.active.length})
             </Text>
           </View>
           {sections.active.map((node) => (
-            <MainControlTreeRow
-              key={mainControlTreeNodeKey(node)}
-              node={node}
-              isChinese={isChinese}
-              onOpen={onOpen}
-            />
+            <MainControlTreeRow key={mainControlTreeNodeKey(node)} node={node} onOpen={onOpen} />
           ))}
           <PressHighlight
             style={styles.sectionHeading}
@@ -402,25 +425,33 @@ function MainControlDirectory({
                 <MainControlTreeRow
                   key={mainControlTreeNodeKey(node)}
                   node={node}
-                  isChinese={isChinese}
                   onOpen={onOpen}
                 />
               ))}
               {!supportsWorkspaceHistory ? (
                 <Text style={styles.rowMeta}>
-                  {isChinese
-                    ? "更新主机以查看归档会话"
-                    : "Update the host to see archived sessions"}
+                  {t("topicWorkbench.directory.historyUpgradeHost")}
                 </Text>
               ) : null}
               {isLoadingArchive ? (
-                <Text style={styles.rowMeta}>
-                  {isChinese ? "正在加载归档会话…" : "Loading archived sessions…"}
-                </Text>
+                <Text style={styles.rowMeta}>{t("topicWorkbench.directory.loadingHistory")}</Text>
               ) : null}
               {archiveError ? (
                 <Button size="sm" variant="ghost" onPress={onRetryArchive}>
-                  {isChinese ? "重试加载归档会话" : "Retry loading archived sessions"}
+                  {t("topicWorkbench.directory.retryHistory")}
+                </Button>
+              ) : null}
+              {hasMoreArchive ? (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={isLoadingMoreArchive}
+                  onPress={onLoadMoreArchive}
+                  testID="main-control-tree-load-more"
+                >
+                  {isLoadingMoreArchive
+                    ? t("topicWorkbench.directory.loadingHistory")
+                    : t("topicWorkbench.directory.loadMoreHistory")}
                 </Button>
               ) : null}
             </>
@@ -431,25 +462,42 @@ function MainControlDirectory({
   );
 }
 
+function resolveProcessStateLabel(
+  processState: MainControlTreeNode["processState"],
+  t: ReturnType<typeof useTranslation>["t"],
+): string {
+  switch (processState) {
+    case "running":
+      return t("topicWorkbench.directory.statusRunning");
+    case "idle":
+      return t("topicWorkbench.directory.statusIdle");
+    default:
+      return t("topicWorkbench.directory.statusClosed");
+  }
+}
+
+function resolveRoleBadgeLabel(
+  roleBadge: MainControlTreeNode["roleBadge"],
+  t: ReturnType<typeof useTranslation>["t"],
+): string | undefined {
+  if (roleBadge === "main") return t("topicWorkbench.directory.mainBadge");
+  if (roleBadge === "standalone") return t("topicWorkbench.directory.standalone");
+  return undefined;
+}
+
 function MainControlTreeRow({
   node,
-  isChinese,
   onOpen,
 }: {
   node: MainControlTreeNode;
-  isChinese: boolean;
   onOpen: (node: MainControlTreeNode) => void;
 }) {
+  const { t } = useTranslation();
   const { agentId, depth, title, processState, roleBadge, residentRole } = node;
   const label = residentRole ?? title;
   const open = useCallback(() => onOpen(node), [node, onOpen]);
-  let statusLabel: string;
-  if (processState === "running") statusLabel = isChinese ? "运行中" : "Running";
-  else if (processState === "idle") statusLabel = isChinese ? "空闲" : "Idle";
-  else statusLabel = isChinese ? "已关闭" : "Closed";
-  let roleLabel: string | undefined;
-  if (roleBadge === "main") roleLabel = isChinese ? "主控" : "Main";
-  else if (roleBadge === "standalone") roleLabel = isChinese ? "独立" : "Standalone";
+  const statusLabel = resolveProcessStateLabel(processState, t);
+  const roleLabel = resolveRoleBadgeLabel(roleBadge, t);
 
   return (
     <PressHighlight
@@ -462,13 +510,11 @@ function MainControlTreeRow({
       highlightStyle={styles.rowHighlight}
       onPress={open}
     >
-      <View style={styles.rowHeading}>
-        <Text numberOfLines={1} ellipsizeMode="tail" style={styles.nodeTitle}>
-          {label}
-        </Text>
-        {roleLabel ? <StatusBadge size="xs" variant="muted" label={roleLabel} /> : null}
-      </View>
-      <Text style={styles.rowMeta}>{statusLabel}</Text>
+      <View style={[styles.dot, processState === "running" ? styles.dotRunning : styles.dotDone]} />
+      <Text numberOfLines={1} ellipsizeMode="tail" style={styles.nodeTitle}>
+        {label}
+      </Text>
+      {roleLabel ? <StatusBadge size="xs" variant="muted" label={roleLabel} /> : null}
     </PressHighlight>
   );
 }
@@ -492,7 +538,7 @@ const styles = StyleSheet.create((theme) => ({
     zIndex: 1,
   },
   sidebar: {
-    width: 268,
+    width: 248,
     maxWidth: "100%",
     flexShrink: 0,
     backgroundColor: theme.colors.surfaceSidebar,
@@ -503,7 +549,7 @@ const styles = StyleSheet.create((theme) => ({
   header: {
     flexDirection: "row",
     alignItems: "center",
-    minHeight: 38,
+    minHeight: 36,
     paddingHorizontal: theme.spacing[2],
     gap: theme.spacing[1],
     borderBottomWidth: 1,
@@ -513,41 +559,56 @@ const styles = StyleSheet.create((theme) => ({
     flex: 1,
     minWidth: 0,
     color: theme.colors.foreground,
-    fontSize: theme.fontSize.base,
+    fontSize: theme.fontSize.sm,
     fontWeight: theme.fontWeight.medium,
   },
-  tree: { padding: theme.spacing[2] },
-  toggle: {
-    flexShrink: 1,
-    borderRadius: theme.borderRadius.full,
-  },
+  tree: { padding: theme.spacing[2], gap: theme.spacing[0.5] },
   sectionHeading: {
     flexDirection: "row",
     alignItems: "center",
     gap: theme.spacing[1],
-    minHeight: 36,
-    paddingHorizontal: theme.spacing[1],
+    minHeight: 28,
+    paddingHorizontal: theme.spacing[1.5],
     borderRadius: theme.borderRadius.md,
   },
   sectionTitle: {
+    flex: 1,
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.sm,
     fontWeight: theme.fontWeight.medium,
   },
   row: {
-    minHeight: 36,
-    justifyContent: "center",
-    gap: theme.spacing[1],
-    paddingHorizontal: theme.spacing[1],
-    paddingVertical: theme.spacing[1],
-    borderRadius: theme.borderRadius.md,
-  },
-  levelTwo: { marginLeft: theme.spacing[3] },
-  levelThree: { marginLeft: theme.spacing[6] },
-  rowHeading: {
     flexDirection: "row",
     alignItems: "center",
-    gap: theme.spacing[1],
+    minHeight: 32,
+    gap: theme.spacing[1.5],
+    paddingHorizontal: theme.spacing[1.5],
+    borderRadius: theme.borderRadius.md,
+  },
+  levelTwo: {
+    marginLeft: theme.spacing[2],
+    borderLeftWidth: 1,
+    borderLeftColor: theme.colors.border,
+  },
+  levelThree: {
+    marginLeft: theme.spacing[4],
+    borderLeftWidth: 1,
+    borderLeftColor: theme.colors.border,
+  },
+  dot: {
+    width: 6,
+    height: 6,
+    borderRadius: theme.borderRadius.full,
+    flexShrink: 0,
+  },
+  dotRunning: {
+    backgroundColor:
+      getStatusDotColor({ theme, bucket: "running", showDoneAsInactive: true }) ??
+      theme.colors.border,
+  },
+  dotDone: {
+    backgroundColor:
+      getStatusDotColor({ theme, bucket: "done", showDoneAsInactive: true }) ?? theme.colors.border,
   },
   rowHighlight: { backgroundColor: theme.colors.interactionHighlight },
   nodeTitle: {
@@ -557,6 +618,7 @@ const styles = StyleSheet.create((theme) => ({
     fontSize: theme.fontSize.base,
   },
   rowMeta: {
+    paddingHorizontal: theme.spacing[1.5],
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.sm,
   },

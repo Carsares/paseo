@@ -24,6 +24,7 @@ import type { SheetTab } from "@/stores/workspace-layout-store";
 import type { SubagentRow } from "./select";
 import { residentActionLabel } from "./resident-actions";
 import { useResidentActions } from "./resident-dialog";
+import { useTeamDirectoryShell } from "./team-directory/shell-context";
 import type { ArchiveFinishedStatus } from "./use-archive-finished";
 import {
   buildSubagentPillPresentation,
@@ -85,6 +86,7 @@ export function SubagentsTrack({
   const { t } = useTranslation();
   const sheetPanePage = useSheetPanePage();
   const pane = useOptionalPaneContext();
+  const teamDirectoryShell = useTeamDirectoryShell();
   const actions = useResidentActions(
     serverId,
     pane?.target.kind === "agent" ? pane.target.agentId : null,
@@ -92,6 +94,15 @@ export function SubagentsTrack({
 
   const isArchivingFinished = archiveFinishedStatus.kind === "archiving";
   const isArchiveFinishedFailed = archiveFinishedStatus.kind === "failed";
+  // When the workspace shell owns and displays the unified team directory on desktop,
+  // suppress the duplicate per-pane floating track pill above the composer.
+  if (
+    teamDirectoryShell.isOwnedByWorkspaceShell &&
+    teamDirectoryShell.isDirectoryVisible &&
+    pane?.host !== "sheet"
+  ) {
+    return null;
+  }
   if (
     rows.length === 0 &&
     actions.length === 0 &&

@@ -300,6 +300,12 @@ export class ProviderSnapshotManager {
     return this.getSnapshotForTarget(target);
   }
 
+  /** Read an existing published snapshot without registering a target or starting discovery. */
+  peekSnapshot(cwd?: string): ProviderSnapshot | undefined {
+    const target = resolveProviderSnapshotTarget(cwd);
+    return this.targets.get(target.snapshotCwd)?.snapshot;
+  }
+
   async refreshSnapshotForCwd(options: ProviderSnapshotRefreshOptions): Promise<void> {
     const snapshotCwd = resolveSnapshotCwd(options.cwd);
     const target = createWorkspaceSnapshotTarget(snapshotCwd);

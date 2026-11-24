@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { WORKSPACE_MAIN_ROLE, WORKSPACE_ROLE_LABEL } from "@getpaseo/protocol/agent-labels";
+import {
+  AGENT_PROFILE_ID_LABEL,
+  RESIDENT_AGENT_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
 
 import { AGENT_LIFECYCLE_STATUSES } from "./agent-manager.js";
 import {
@@ -700,5 +705,25 @@ it("omits unknown background work and preserves known summary in list items", ()
   expect(toAgentListItemPayload(snapshot)).not.toHaveProperty("backgroundWork");
   expect(toAgentListItemPayload({ ...snapshot, backgroundWork: { count: 2 } })).toMatchObject({
     backgroundWork: { count: 2 },
+  });
+});
+
+it("projects an unopened resident as a stable closed seat with its preset ID", () => {
+  const labels = { [RESIDENT_AGENT_LABEL]: "true", [AGENT_PROFILE_ID_LABEL]: "review" };
+  const record = toStoredAgentRecord(
+    createManagedAgent({
+      id: "review-seat",
+      lifecycle: "closed",
+      workspaceId: "topic",
+      persistence: null,
+      labels,
+    }),
+  );
+  expect(buildStoredAgentPayload(record, ["claude"], ownOptionsOnly)).toMatchObject({
+    id: "review-seat",
+    workspaceId: "topic",
+    status: "closed",
+    persistence: null,
+    labels,
   });
 });

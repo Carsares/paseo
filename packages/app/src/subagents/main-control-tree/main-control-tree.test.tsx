@@ -20,6 +20,8 @@ const runtime = vi.hoisted(() => ({
   archived: [] as ReturnType<typeof agent>[],
   openPreferred: vi.fn(),
   navigateToAgent: vi.fn(),
+  loadMore: vi.fn(),
+  lastEnabled: false,
 }));
 vi.mock("lucide-react-native", async (original) => {
   const icons = await original<typeof import("lucide-react-native")>();
@@ -43,13 +45,20 @@ vi.mock("@/workspace-tabs/open-beside", () => ({
   openPreferredWorkspaceTarget: runtime.openPreferred,
 }));
 vi.mock("./use-workspace-archived-agents", () => ({
-  useWorkspaceArchivedAgents: () => ({
-    data: runtime.archived,
-    supportsWorkspaceHistory: true,
-    isLoading: false,
-    isError: false,
-    refetch: vi.fn(),
-  }),
+  useWorkspaceArchivedAgents: ({ enabled }: { enabled?: boolean }) => {
+    runtime.lastEnabled = Boolean(enabled);
+    return {
+      data: enabled ? runtime.archived : [],
+      hasLoadedOnce: Boolean(enabled),
+      hasMore: false,
+      supportsWorkspaceHistory: true,
+      isLoading: false,
+      isLoadingMore: false,
+      isError: false,
+      loadMore: runtime.loadMore,
+      refetch: vi.fn(),
+    };
+  },
 }));
 
 function agent(id: string, title: string, labels: Record<string, string>, archivedAt?: Date) {
@@ -88,12 +97,13 @@ function agent(id: string, title: string, labels: Record<string, string>, archiv
 afterEach(() => {
   cleanup();
   runtime.archived = [];
+  runtime.lastEnabled = false;
   vi.clearAllMocks();
 });
 
 const toast = { show: () => () => {}, copied: vi.fn(), error: vi.fn() };
 
-it("expands the hidden directory and opens both kinds of Closed session directly", () => {
+it("hides and restores the directory without duplicate expand-all controls and opens history on demand", () => {
   const main = agent("main", "Coordinator", { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE });
   const closed = agent("closed", "Layout closed", { [PARENT_AGENT_ID_LABEL]: "main" });
   const resident = agent("resident", "Review notes", {
@@ -120,15 +130,23 @@ it("expands the hidden directory and opens both kinds of Closed session directly
       </ToastApiProvider>
     </QueryClientProvider>,
   );
-  expect(screen.getByRole("button", { name: "Reviewer, Closed" })).toBeTruthy();
-  expect(screen.queryByRole("button", { name: "Layout closed, Closed" })).toBeNull();
-  fireEvent.click(screen.getByRole("button", { name: "Hide" }));
-  expect(screen.queryByRole("button", { name: /Archived conversation/ })).toBeNull();
 
-  fireEvent.click(screen.getByRole("button", { name: "Expand all sessions, Closed (2)" }));
-  expect(screen.getAllByRole("button", { name: "Closed (2)" })).toHaveLength(1);
-  expect(screen.getAllByRole("button", { name: "Coordinator, Main, Idle" })).toHaveLength(1);
-  fireEvent.click(screen.getByRole("button", { name: "Layout closed, Closed" }));
+  // History is not fetched until expanded, and duplicate header expand-all button is gone.
+  expect(runtime.lastEnabled).toBe(false);
+  expect(screen.queryByTestId("main-control-tree-toggle-all")).toBeNull();
+  expect(screen.getByTestId("main-control-tree-row-resident")).toBeTruthy();
+  expect(screen.queryByTestId("main-control-tree-row-closed")).toBeNull();
+
+  // Hide and show again.
+  fireEvent.click(screen.getByTestId("main-control-tree-hide"));
+  expect(screen.queryByTestId("main-control-tree")).toBeNull();
+  fireEvent.click(screen.getByTestId("main-control-tree-show"));
+  expect(screen.getByTestId("main-control-tree")).toBeTruthy();
+
+  // Click to view history members on demand.
+  fireEvent.click(screen.getByTestId("main-control-tree-toggle-closed"));
+  expect(runtime.lastEnabled).toBe(true);
+  fireEvent.click(screen.getByTestId("main-control-tree-row-closed"));
   expect(runtime.openPreferred).toHaveBeenCalledExactlyOnceWith(
     expect.objectContaining({
       workspaceKey: "host:workspace",
@@ -136,9 +154,7 @@ it("expands the hidden directory and opens both kinds of Closed session directly
       parentTabId: "main-tab",
     }),
   );
-  fireEvent.click(
-    screen.getByRole("button", { name: "Archived conversation, Standalone, Closed" }),
-  );
+  fireEvent.click(screen.getByTestId("main-control-tree-row-archive"));
   expect(runtime.navigateToAgent).toHaveBeenCalledExactlyOnceWith({
     serverId: "host",
     workspaceId: "workspace",

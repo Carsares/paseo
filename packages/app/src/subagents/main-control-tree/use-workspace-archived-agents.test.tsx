@@ -5,7 +5,10 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { PropsWithChildren } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import { invalidateAgentHistory } from "@/hooks/agent-history-query-key";
-import { useWorkspaceArchivedAgents } from "./use-workspace-archived-agents";
+import {
+  useWorkspaceArchivedAgents,
+  WORKSPACE_HISTORY_PAGE_SIZE,
+} from "./use-workspace-archived-agents";
 
 const runtime = vi.hoisted(() => ({
   fetchAgentHistory: vi.fn<DaemonClient["fetchAgentHistory"]>(),
@@ -77,18 +80,30 @@ function page(entries: FetchAgentHistoryEntry[], nextCursor: string | null = nul
   };
 }
 
-function renderHistory() {
+interface HookProps {
+  serverId?: string;
+  workspaceId?: string;
+  enabled?: boolean;
+  workspaceAgentMembership?: string;
+}
+
+function renderHistory(initialProps: HookProps = {}) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const hook = renderHook(
-    (workspaceAgentMembership) =>
+    ({
+      serverId = "host",
+      workspaceId = "workspace",
+      enabled = false,
+      workspaceAgentMembership = '[["main",false],["old",false]]',
+    }: HookProps) =>
       useWorkspaceArchivedAgents({
-        mainAgentId: "main",
-        serverId: "host",
-        workspaceId: "workspace",
+        serverId,
+        workspaceId,
+        enabled,
         workspaceAgentMembership,
       }),
     {
-      initialProps: '[["main",false],["old",false]]',
+      initialProps,
       wrapper: ({ children }: PropsWithChildren) => (
         <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
       ),
@@ -103,10 +118,10 @@ afterEach(() => {
   runtime.supportsWorkspaceHistory = true;
 });
 
-it("fetches only this workspace's archives and deduplicates results across pages", async () => {
+it("does not fetch on mount until history is explicitly opened, then fetches strictly one page per request", async () => {
   runtime.fetchAgentHistory
     .mockResolvedValueOnce(
-      page([entry("first"), entry("foreign", { workspaceId: "foreign" })], "next"),
+      page([entry("first"), entry("foreign", { workspaceId: "foreign" })], "cursor-2"),
     )
     .mockResolvedValueOnce(
       page([
@@ -116,43 +131,113 @@ it("fetches only this workspace's archives and deduplicates results across pages
         entry("internal", { internal: true }),
       ]),
     );
-  const { result } = renderHistory();
+  const { result, rerender } = renderHistory({ enabled: false });
 
-  await waitFor(() =>
-    expect(result.current.data?.map(({ id }) => id)).toEqual(["first", "second"]),
-  );
+  expect(runtime.fetchAgentHistory).not.toHaveBeenCalled();
+  expect(result.current.data).toEqual([]);
+  expect(result.current.hasLoadedOnce).toBe(false);
+
+  // User clicks "View history members" -> fetches ONLY page 1.
+  rerender({ enabled: true });
+  await waitFor(() => expect(result.current.data.map(({ id }) => id)).toEqual(["first"]));
+  expect(result.current.hasMore).toBe(true);
   const filter = { includeBackground: false, workspaceIds: ["workspace"] };
   expect(runtime.fetchAgentHistory.mock.calls).toEqual([
-    [{ archiveScope: "archived", filter, page: { limit: 200 } }],
-    [{ archiveScope: "archived", filter, page: { limit: 200, cursor: "next" } }],
+    [{ archiveScope: "archived", filter, page: { limit: WORKSPACE_HISTORY_PAGE_SIZE } }],
   ]);
+
+  // User clicks "Load more" -> fetches ONLY page 2 and deduplicates.
+  act(() => {
+    result.current.loadMore();
+  });
+  await waitFor(() => expect(result.current.data.map(({ id }) => id)).toEqual(["first", "second"]));
+  expect(result.current.hasMore).toBe(false);
+  expect(runtime.fetchAgentHistory.mock.calls).toEqual([
+    [{ archiveScope: "archived", filter, page: { limit: WORKSPACE_HISTORY_PAGE_SIZE } }],
+    [
+      {
+        archiveScope: "archived",
+        filter,
+        page: { limit: WORKSPACE_HISTORY_PAGE_SIZE, cursor: "cursor-2" },
+      },
+    ],
+  ]);
+});
+
+it("deduplicates concurrent loadMore clicks so only one page request is sent", async () => {
+  const secondPage = Promise.withResolvers<ReturnType<typeof page>>();
+  runtime.fetchAgentHistory
+    .mockResolvedValueOnce(page([entry("first")], "cursor-2"))
+    .mockReturnValueOnce(secondPage.promise);
+
+  const { result } = renderHistory({ enabled: true });
+  await waitFor(() => expect(result.current.hasMore).toBe(true));
+
+  act(() => {
+    result.current.loadMore();
+    result.current.loadMore();
+    result.current.loadMore();
+  });
+  expect(runtime.fetchAgentHistory).toHaveBeenCalledTimes(2);
+
+  secondPage.resolve(page([entry("second")]));
+  await waitFor(() => expect(result.current.data.map(({ id }) => id)).toEqual(["first", "second"]));
+  expect(runtime.fetchAgentHistory).toHaveBeenCalledTimes(2);
+});
+
+it("prevents cross-workspace data bleed when switching workspaces while a page request is in flight", async () => {
+  const wsARequest = Promise.withResolvers<ReturnType<typeof page>>();
+  runtime.fetchAgentHistory
+    .mockReturnValueOnce(wsARequest.promise)
+    .mockResolvedValueOnce(page([entry("b-1", { workspaceId: "ws-b" })]));
+
+  const { result, rerender } = renderHistory({ workspaceId: "ws-a", enabled: true });
+  expect(runtime.fetchAgentHistory).toHaveBeenCalledTimes(1);
+
+  // Switch to ws-b before ws-a settles.
+  rerender({ workspaceId: "ws-b", enabled: true, workspaceAgentMembership: '[["main-b",false]]' });
+  await waitFor(() => expect(result.current.data.map(({ id }) => id)).toEqual(["b-1"]));
+
+  // Late response from ws-a must not leak into ws-b.
+  wsARequest.resolve(page([entry("a-1", { workspaceId: "ws-a" })]));
+  await Promise.resolve();
+  expect(result.current.data.map(({ id }) => id)).toEqual(["b-1"]);
 });
 
 it("removes an unarchived session when the host history prefix is invalidated", async () => {
   runtime.fetchAgentHistory
     .mockResolvedValueOnce(page([entry("restored")]))
     .mockResolvedValueOnce(page([]));
-  const { result, queryClient } = renderHistory();
-  await waitFor(() => expect(result.current.data?.map(({ id }) => id)).toEqual(["restored"]));
+  const { result, queryClient } = renderHistory({ enabled: true });
+  await waitFor(() => expect(result.current.data.map(({ id }) => id)).toEqual(["restored"]));
 
   act(() => invalidateAgentHistory(queryClient, "host"));
   await waitFor(() => expect(result.current.data).toEqual([]));
 });
 
-it("refreshes history when one agent is archived and another opens in the same update", async () => {
+it("refreshes history when membership changes while open, and stays quiet when closed", async () => {
   runtime.fetchAgentHistory
     .mockResolvedValueOnce(page([]))
     .mockResolvedValueOnce(page([entry("old")]));
-  const { result, rerender } = renderHistory();
+  const { result, rerender } = renderHistory({ enabled: false });
+
+  // Changing membership while history is closed must not trigger any fetch.
+  rerender({ enabled: false, workspaceAgentMembership: '[["main",false],["old",true]]' });
+  expect(runtime.fetchAgentHistory).not.toHaveBeenCalled();
+
+  rerender({ enabled: true, workspaceAgentMembership: '[["main",false],["old",true]]' });
   await waitFor(() => expect(result.current.data).toEqual([]));
 
-  rerender('[["main",false],["new",false],["old",true]]');
-  await waitFor(() => expect(result.current.data?.map(({ id }) => id)).toEqual(["old"]));
+  rerender({
+    enabled: true,
+    workspaceAgentMembership: '[["main",false],["new",false],["old",true]]',
+  });
+  await waitFor(() => expect(result.current.data.map(({ id }) => id)).toEqual(["old"]));
 });
 
 it("does not fetch unscoped history on an older host", () => {
   runtime.supportsWorkspaceHistory = false;
-  const { result } = renderHistory();
+  const { result } = renderHistory({ enabled: true });
   expect(result.current.supportsWorkspaceHistory).toBe(false);
   expect(runtime.fetchAgentHistory).not.toHaveBeenCalled();
 });

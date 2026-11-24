@@ -10,7 +10,13 @@ import {
 import type { AgentLimitRecovery } from "../schedule/agent-limit-recovery.js";
 import type { WorkspaceDeferral } from "../workspace-deferral/deferral.js";
 import type { AttachedAgentTool, PluginAgentToolsRuntime } from "../plugins/agent-tools.js";
-import { ProviderOptionsValidationError } from "./provider-options.js";
+import { ProviderOptionsValidationError, validateProviderOptions } from "./provider-options.js";
+import { ACPProviderOptionsSchema } from "./providers/acp-options.js";
+import { ClaudeProviderOptionsSchema } from "./providers/claude/options.js";
+import { CodexProviderOptionsSchema } from "./providers/codex/options.js";
+import { OpenCodeProviderOptionsSchema } from "./providers/opencode/options.js";
+import { OmpProviderOptionsSchema } from "./providers/omp/provider-config.js";
+import { PiProviderOptionsSchema } from "./providers/pi/agent.js";
 import type { AgentToolResult } from "@getpaseo/plugin/server";
 import type { RuntimeCleanupCandidate } from "./idle-runtime-cleanup/index.js";
 import { AgentNotFoundError, ensureAgentLoaded } from "./agent-loading.js";
@@ -65,7 +71,10 @@ import {
 import type { Logger } from "pino";
 import type { ToolPolicy } from "@getpaseo/protocol/agent-types";
 import { getErrorMessage } from "@getpaseo/protocol/error-utils";
-import type { AgentRewindCheckpointDiffResponse } from "@getpaseo/protocol/messages";
+import type {
+  AgentConfigApply,
+  AgentRewindCheckpointDiffResponse,
+} from "@getpaseo/protocol/messages";
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import { z } from "zod";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
@@ -111,6 +120,7 @@ import {
   type AgentTimelineItem,
   type AgentUsage,
   type AgentRuntimeInfo,
+  type ProviderCatalog,
   type ImportedTimelineEntry,
   type ImportableProviderSession,
   type ListImportableSessionsOptions,
@@ -309,6 +319,13 @@ export class AgentManagerShuttingDownError extends Error {
   constructor() {
     super("Agent manager is shutting down");
     this.name = "AgentManagerShuttingDownError";
+  }
+}
+
+export class AgentIdleArchiveError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AgentIdleArchiveError";
   }
 }
 
@@ -664,6 +681,9 @@ interface SwitchAgentProviderInput {
   modeId?: string | null;
   thinkingOptionId?: string | null;
   options?: ProviderOptionsPatch;
+  expectedWorkspaceId?: string;
+  context?: "handoff" | "blank";
+  onlyIfSilent?: true;
 }
 
 interface CreateResidentAgentInput extends ResidentOptions {
@@ -741,6 +761,11 @@ export type MoveSubagentToWorkspaceResult =
       previousParentAgentId?: string | null;
       movedDescendantStoredRecords?: StoredAgentRecord[];
     };
+
+export type ReadPublishedSeatCatalog = (
+  provider: AgentProvider,
+  cwd: string,
+) => ProviderCatalog | undefined;
 
 export interface AgentManagerOptions {
   pluginLifecycle?: PluginLifecycle;
@@ -1489,6 +1514,7 @@ class SummaryTimelineReadPool {
 }
 
 export class AgentManager {
+  private readonly permissionSessionGenerations = new WeakMap<AgentSession, string>();
   private readonly timelinePrefixes: TimelinePrefixStore;
   private readonly contextHandoffs = new Map<string, PendingContextHandoff>();
   private readonly providerSwitches = new Set<string>();
@@ -2656,13 +2682,22 @@ export class AgentManager {
     return isTopicWorkspaceMain(record, workspace);
   }
 
+  async isSilentTopicSeat(record: StoredAgentRecord | null | undefined): Promise<boolean> {
+    if (!record?.workspaceId || record.internal) return false;
+    if (record.lastStatus !== "closed" || record.persistence?.sessionId) return false;
+    if (isResidentAgentLabels(record.labels)) {
+      return Boolean((await this.getWorkspaceForTopicPolicy(record.workspaceId))?.topic);
+    }
+    return this.isSilentTopicMain(record);
+  }
+
   async readSilentTopicTimeline(
     agentId: string,
     options?: AgentTimelineFetchOptions,
   ): Promise<{ record: StoredAgentRecord; timeline: AgentTimelineFetchResult } | null> {
     if (this.agents.has(agentId)) return null;
     const record = await this.registry?.get(agentId);
-    if (!record || !(await this.isSilentTopicMain(record))) return null;
+    if (!record || !(await this.isSilentTopicSeat(record))) return null;
     const [prefix, committed] = await Promise.all([
       this.timelinePrefixes.load(agentId),
       this.durableTimelineStore?.getCommittedRows(agentId),
@@ -2671,7 +2706,7 @@ export class AgentManager {
     const snapshot = new InMemoryAgentTimelineStore();
     snapshot.initialize(agentId, {
       rows,
-      epoch: "silent-topic:" + agentId,
+      epoch: `silent-topic:${agentId}:${record.timelinePrefixSwitchId ?? "initial"}`,
       sealedThrough: maxTimelineSeq(prefix?.rows ?? []),
     });
     return { record, timeline: snapshot.fetch(agentId, options) };
@@ -3852,6 +3887,103 @@ export class AgentManager {
     });
   }
 
+  async archiveIdleTaskAgentInWorkspace(
+    agentId: string,
+    expectedWorkspaceId: string,
+  ): Promise<WorkspaceAgentArchiveResult> {
+    if (!expectedWorkspaceId) throw new Error("Idle archive requires a workspace ID.");
+    return this.runHierarchyArchive(agentId, async () => {
+      const { live, stored, target } = await this.readAgentArchiveTarget(
+        agentId,
+        expectedWorkspaceId,
+      );
+      await this.requireActiveParentWorkspace(expectedWorkspaceId);
+      if (
+        target.internal ||
+        target.background ||
+        !getParentAgentIdFromLabels(target.labels) ||
+        isMainControlAgentLabels(target.labels) ||
+        isResidentAgentLabels(target.labels) ||
+        isSideChatAgentLabels(target.labels)
+      ) {
+        throw new AgentIdleArchiveError("Only ordinary task subagents can be archived by cleanup.");
+      }
+      if (stored?.archivedAt) return { archivedAt: stored.archivedAt, record: stored };
+
+      const registry = this.requireRegistry();
+      const records = await registry.listActive();
+      // Check every relationship that the regular archive cascade can follow,
+      // including stored children and internal runtimes hidden from the directory.
+      if (
+        records.some((child) => getParentAgentIdFromLabels(child.labels) === agentId) ||
+        [...this.agents.values()].some(
+          (child) => child.internal && getParentAgentIdFromLabels(child.labels) === agentId,
+        )
+      ) {
+        throw new AgentIdleArchiveError("The task still has unarchived subagents.");
+      }
+
+      const assertIdle = () => this.assertIdleTaskArchiveAllowed(agentId, live, stored);
+      if (live) await this.drainSessionEvents(agentId);
+      assertIdle();
+      // Prompt admission can bypass the lifecycle lane. Fence it without yielding
+      // between checking the current run and claiming the archive.
+      this.guardedAgentArchives.add(agentId);
+      try {
+        if (!live) {
+          if (!stored) throw new Error(`Agent not found: ${agentId}`);
+          const archivedAt = new Date().toISOString();
+          const record = await this.archiveStoredRecordUnlocked(stored, archivedAt);
+          return { archivedAt, record };
+        }
+
+        const { archivedAt } = await this.archiveAgentUnlocked(agentId, undefined, {
+          retainForkContext: true,
+          requireInactiveTarget: true,
+          assertInactiveTarget: assertIdle,
+        });
+        const record = await registry.get(agentId);
+        if (!record) throw new Error(`Agent not found in storage after archive: ${agentId}`);
+        return { archivedAt, record };
+      } finally {
+        this.guardedAgentArchives.delete(agentId);
+      }
+    });
+  }
+
+  private assertIdleTaskArchiveAllowed(
+    agentId: string,
+    live: LiveManagedAgent | undefined,
+    stored: StoredAgentRecord | null,
+  ): void {
+    const status = live?.lifecycle ?? stored?.lastStatus;
+    const requiresAttention =
+      live?.attention.requiresAttention ??
+      (stored?.requiresAttention || stored?.attentionReason === "permission");
+    if (
+      (status !== "idle" && status !== "error") ||
+      requiresAttention ||
+      this.hasArchiveBlockingRuntimeWork(agentId, live) ||
+      (this.backgroundWork.summary(agentId)?.count ?? 0) > 0 ||
+      this.providerSubagents.list(agentId).some((child) => child.status === "running")
+    ) {
+      throw new AgentIdleArchiveError("The task is active, awaiting permission, or unread.");
+    }
+  }
+
+  private hasArchiveBlockingRuntimeWork(agentId: string, live?: LiveManagedAgent): boolean {
+    return (
+      this.replacementMutationTails.has(agentId) ||
+      this.pendingCancellations.has(agentId) ||
+      Boolean(
+        live &&
+        (this.hasSessionMutationWork(live) ||
+          live.pendingReplacement ||
+          live.pendingPermissions.size),
+      )
+    );
+  }
+
   async archiveAgentForLegacyClose(
     agentId: string,
     options: LegacyAgentTabCloseOptions,
@@ -3956,11 +4088,14 @@ export class AgentManager {
     options?: {
       retainForkContext?: boolean;
       requireInactiveTarget?: boolean;
+      assertInactiveTarget?: () => void;
       workspaceArchive?: boolean;
     },
   ): Promise<{ archivedAt: string }> {
     const agent = this.requireAgent(agentId);
     if (!options?.workspaceArchive) this.assertNotResidentForArchive(agent.labels);
+    const assertInactiveTarget =
+      options?.assertInactiveTarget ?? (() => this.assertAgentArchiveAllowed(agentId));
     if (agent.internal) {
       // Nothing about an internal agent is on disk, and archiving must not put
       // it there. Its final snapshot is kept in memory for a while (see
@@ -3974,7 +4109,7 @@ export class AgentManager {
       );
       if (options?.requireInactiveTarget) {
         await this.drainSessionEvents(agentId);
-        this.assertAgentArchiveAllowed(agentId);
+        assertInactiveTarget();
       }
       await this.closeAgentRuntime(agentId);
       await this.deleteAgentState(agentId);
@@ -3997,7 +4132,7 @@ export class AgentManager {
     if (options?.requireInactiveTarget) {
       // The provider may report an autonomous turn while the snapshot is being written.
       await this.drainSessionEvents(agentId);
-      this.assertAgentArchiveAllowed(agentId);
+      assertInactiveTarget();
     }
     const archivedRecord = await this.markRecordArchived(
       stored,
@@ -4151,54 +4286,55 @@ export class AgentManager {
   }
 
   private dispatchStoredAgentState(record: StoredAgentRecord): void {
+    this.dispatch({ type: "agent_state", agent: this.buildClosedAgentSnapshot(record) });
+  }
+
+  private buildClosedAgentSnapshot(record: StoredAgentRecord): ManagedAgentClosed {
     const updatedAt = new Date(record.updatedAt);
     const attention = extractAttention(record);
-    this.dispatch({
-      type: "agent_state",
-      agent: {
-        id: record.id,
-        provider: record.provider,
-        cwd: record.cwd,
-        workspaceId: record.workspaceId,
-        owner: record.owner,
-        session: null,
-        capabilities: STORED_AGENT_CAPABILITIES,
-        config: buildStoredAgentConfig(record),
-        runtimeInfo: record.runtimeInfo,
-        lifecycle: "closed",
-        createdAt: new Date(record.createdAt),
-        updatedAt,
-        availableModes: [],
-        controls: record.controls,
-        effectiveOptions: this.effectiveOptionsFor(
-          record.provider,
-          record.config?.providerOptions ?? undefined,
-        ),
-        currentModeId: record.lastModeId ?? null,
-        pendingPermissions: new Map(),
-        bufferedPermissionResolutions: new Map(),
-        inFlightPermissionResponses: new Set(),
-        pendingReplacement: false,
-        activeForegroundTurnId: null,
-        activeTurnId: null,
-        activeTurnStartedAt: null,
-        foregroundTurnWaiters: new Set(),
-        finalizedForegroundTurnIds: new Set(),
-        unsubscribeSession: null,
-        persistence: record.persistence ?? null,
-        historyPrimed: true,
-        lastUserMessageAt: record.lastUserMessageAt ? new Date(record.lastUserMessageAt) : null,
-        ...pickStoredAgentTurnState(record),
-        lastError: record.lastError ?? undefined,
-        failedConversationLimit: record.failedConversationLimit,
-        limitContinuation: record.limitContinuation,
-        attention,
-        internal: record.internal,
-        background: record.background,
-        labels: record.labels,
-        metadata: record.metadata,
-      },
-    });
+    return {
+      id: record.id,
+      provider: record.provider,
+      cwd: record.cwd,
+      workspaceId: record.workspaceId,
+      owner: record.owner,
+      session: null,
+      capabilities: STORED_AGENT_CAPABILITIES,
+      config: buildStoredAgentConfig(record),
+      runtimeInfo: record.runtimeInfo,
+      lifecycle: "closed",
+      createdAt: new Date(record.createdAt),
+      updatedAt,
+      availableModes: [],
+      controls: record.controls,
+      effectiveOptions: this.effectiveOptionsFor(
+        record.provider,
+        record.config?.providerOptions ?? undefined,
+      ),
+      currentModeId: record.lastModeId ?? null,
+      pendingPermissions: new Map(),
+      bufferedPermissionResolutions: new Map(),
+      inFlightPermissionResponses: new Set(),
+      pendingReplacement: false,
+      activeForegroundTurnId: null,
+      activeTurnId: null,
+      activeTurnStartedAt: null,
+      foregroundTurnWaiters: new Set(),
+      finalizedForegroundTurnIds: new Set(),
+      unsubscribeSession: null,
+      persistence: record.persistence ?? null,
+      historyPrimed: true,
+      lastUserMessageAt: record.lastUserMessageAt ? new Date(record.lastUserMessageAt) : null,
+      ...pickStoredAgentTurnState(record),
+      lastError: record.lastError ?? undefined,
+      failedConversationLimit: record.failedConversationLimit,
+      limitContinuation: record.limitContinuation,
+      attention,
+      internal: record.internal,
+      background: record.background,
+      labels: record.labels,
+      metadata: record.metadata,
+    };
   }
 
   async switchAgentProvider(
@@ -4207,6 +4343,23 @@ export class AgentManager {
   ): Promise<{ agent: ManagedAgent; notice: AgentProviderNotice | null }> {
     const source = this.getAgent(agentId) ?? (await this.registry?.get(agentId));
     if (source?.internal) throw new AgentNotFoundError(agentId);
+    if (source) this.assertExpectedAgentWorkspace(source, input.expectedWorkspaceId);
+    const stored = await this.trackAgentRegistrationOperation(
+      this.runLifecycleMutation(agentId, async () => {
+        const record = await this.getSilentSeatForConfig(agentId, input.expectedWorkspaceId);
+        // A reset clears provider persistence but keeps the last user message timestamp.
+        if (input.onlyIfSilent && (!record || record.lastUserMessageAt != null)) {
+          throw new Error(
+            "Agent is no longer a silent seat. Review the provider switch and try again.",
+          );
+        }
+        if (!record) return null;
+        this.assertAcceptingAgentRegistrations();
+        const config = this.buildProviderSwitchConfig(buildStoredAgentConfig(record), input);
+        return this.updateSilentSeatConfig(record, config);
+      }),
+    );
+    if (stored) return { agent: stored, notice: null };
     if (this.registry) {
       await ensureAgentLoaded(agentId, {
         agentManager: this,
@@ -4220,17 +4373,21 @@ export class AgentManager {
         this.providerSwitches.add(agentId);
         try {
           const agent = this.requireSessionAgent(agentId);
+          this.assertExpectedAgentWorkspace(agent, input.expectedWorkspaceId);
           await this.drainSessionEvents(agentId);
-          if (
-            agent.lifecycle === "running" ||
-            this.hasInFlightRun(agentId) ||
-            agent.activeTurnId ||
-            this.foregroundMutationTails.has(agentId)
-          ) {
+          if (this.hasSessionMutationWork(agent)) {
             throw new Error(`Agent ${agentId} must be idle before switching providers`);
           }
           await this.hydrateTimelineFromLegacyProviderHistory(agent);
-          return await this.switchAgentProviderSession(agent, input);
+          const record = await this.registry?.get(agentId);
+          const config = this.buildProviderSwitchConfig(agent.config, input, record?.title);
+          const result = await this.switchAgentSession(
+            agent,
+            config,
+            input.context === "blank" ? { reset: {} } : {},
+          );
+          if (input.context === "blank") await this.recordTaskSessionReset(agentId);
+          return result;
         } finally {
           this.providerSwitches.delete(agentId);
         }
@@ -4258,16 +4415,16 @@ export class AgentManager {
             }
 
             await this.drainSessionEvents(agentId);
-            if (
-              agent.lifecycle === "running" ||
-              this.hasInFlightRun(agentId) ||
-              agent.activeTurnId ||
-              this.foregroundMutationTails.has(agentId)
-            ) {
+            if (agent.inFlightPermissionResponses.size) {
+              throw new Error(`Agent ${agentId} has a permission response in progress`);
+            }
+            if (this.hasSessionMutationWork(agent)) {
               if (!options.interrupt)
                 throw new Error(`Agent ${agentId} must be idle before resetting its session`);
               await this.cancelAgentRunBefore(agentId, "reset");
               await this.drainSessionEvents(agentId);
+              if (this.hasSessionMutationWork(agent))
+                throw new Error(`Agent ${agentId} has not settled its active turn`);
             }
             if (!options.clearVisibleTimeline)
               await this.hydrateTimelineFromLegacyProviderHistory(agent);
@@ -4278,6 +4435,167 @@ export class AgentManager {
           }
         }),
       ),
+    );
+  }
+
+  private hasSessionMutationWork(agent: ActiveManagedAgent): boolean {
+    return (
+      this.hasInFlightRun(agent.id) ||
+      Boolean(agent.activeTurnId) ||
+      this.foregroundMutationTails.has(agent.id) ||
+      agent.inFlightPermissionResponses.size > 0
+    );
+  }
+
+  private async getSilentSeatForConfig(agentId: string, expectedWorkspaceId?: string) {
+    if (this.agents.has(agentId)) return null;
+    const record = await this.registry?.get(agentId);
+    if (
+      !record ||
+      record.internal ||
+      record.archivedAt ||
+      record.lastStatus !== "closed" ||
+      record.persistence?.sessionId ||
+      !(isResidentAgentLabels(record.labels) || (await this.isSilentTopicMain(record)))
+    ) {
+      return null;
+    }
+    this.assertExpectedAgentWorkspace(record, expectedWorkspaceId);
+    if (this.pendingHierarchyArchives.has(agentId)) throw new Error("Agent is being archived.");
+    await this.requireActiveParentWorkspace(record.workspaceId);
+    return record;
+  }
+
+  private async updateSilentSeatConfig(record: StoredAgentRecord, config: AgentSessionConfig) {
+    this.requireEnabledProvider(config.provider);
+    this.requireClient(config.provider);
+    const normalized = await this.normalizeConfig(config, { resolveDefaultModel: false });
+    const next: StoredAgentRecord = {
+      ...record,
+      provider: normalized.provider,
+      config: buildSerializableConfig(normalized),
+      lastModeId: normalized.modeId ?? null,
+      controls: undefined,
+      runtimeInfo: undefined,
+      updatedAt: this.nextStoredUpdatedAt(record),
+    };
+    await this.requireRegistry().upsert(next);
+    this.dispatchStoredAgentState(next);
+    return this.buildClosedAgentSnapshot(next);
+  }
+
+  async tryApplySilentSeatConfig(
+    agentId: string,
+    patch: AgentConfigApply,
+    readCatalog: ReadPublishedSeatCatalog,
+  ): Promise<boolean> {
+    return this.runLifecycleMutation(agentId, async () => {
+      const record = await this.getSilentSeatForConfig(agentId);
+      if (!record) return false;
+      await this.applySilentSeatConfigUnlocked(record, patch, readCatalog);
+      return true;
+    });
+  }
+
+  private async applySilentSeatConfigUnlocked(
+    record: StoredAgentRecord,
+    patch: AgentConfigApply,
+    readCatalog?: ReadPublishedSeatCatalog,
+  ) {
+    const current = buildStoredAgentConfig(record);
+    const next = { ...current };
+    this.applySilentSeatOptions(next, patch);
+    if (patch.modelId !== undefined) {
+      const model = patch.modelId?.trim();
+      if (model && model !== "default") next.model = model;
+      else delete next.model;
+    }
+    const modelChanged = next.model !== current.model;
+    const changedMode = patch.modeId === current.modeId ? undefined : patch.modeId;
+    const thinking = patch.thinkingOptionId?.trim() ? patch.thinkingOptionId : undefined;
+    if (patch.thinkingOptionId !== undefined) {
+      if (thinking) next.thinkingOptionId = thinking;
+      else delete next.thinkingOptionId;
+    }
+    const explicitThinking =
+      thinking !== undefined && (thinking !== current.thinkingOptionId || modelChanged);
+    const requiresCatalog = changedMode !== undefined || explicitThinking;
+    if (requiresCatalog || (modelChanged && next.thinkingOptionId)) {
+      const catalog = readCatalog?.(current.provider, current.cwd);
+      if (!catalog && requiresCatalog) {
+        throw new Error(
+          `Provider '${current.provider}' catalog is unavailable for this workspace. Refresh the provider list and try again.`,
+        );
+      }
+      this.applySilentSeatCatalogConfig(next, changedMode, explicitThinking, modelChanged, catalog);
+    }
+    if (!isDeepStrictEqual(next, current)) await this.updateSilentSeatConfig(record, next);
+  }
+
+  private applySilentSeatOptions(config: AgentSessionConfig, patch: AgentConfigApply): void {
+    // COMPAT(featureValues): added in v0.15.0, remove after 2027-05-01.
+    const options = this.convertLegacyOptions(config.provider, {
+      ...patch.featureValues,
+      ...patch.options,
+    });
+    if (Object.keys(options).length === 0) return;
+    const own = applyProviderOptionsPatch({
+      options: this.convertLegacyOptions(config.provider, config.providerOptions),
+      patch: options,
+    });
+    if (Object.keys(own).length > 0) config.providerOptions = own;
+    else delete config.providerOptions;
+    this.validateSilentSeatOptions(config);
+  }
+
+  private applySilentSeatCatalogConfig(
+    config: AgentSessionConfig,
+    modeId: string | undefined,
+    explicitThinking: boolean,
+    modelChanged: boolean,
+    catalog: ProviderCatalog | undefined,
+  ): void {
+    if (modeId !== undefined) {
+      if (!catalog?.modes.some(({ id }) => id === modeId)) {
+        throw new Error(`Mode '${modeId}' is unavailable for provider '${config.provider}'.`);
+      }
+      config.modeId = modeId;
+    }
+    const model = this.findCatalogModel(catalog, config.model ?? null);
+    if (explicitThinking && config.thinkingOptionId) {
+      if (!model?.thinkingOptions?.some(({ id }) => id === config.thinkingOptionId)) {
+        const target = model?.id ?? config.model ?? "default";
+        throw new Error(
+          `Thinking option '${config.thinkingOptionId}' is unavailable for model '${target}'.`,
+        );
+      }
+    } else if (modelChanged && config.thinkingOptionId) {
+      if (!model?.thinkingOptions?.some(({ id }) => id === config.thinkingOptionId)) {
+        delete config.thinkingOptionId;
+      }
+    }
+  }
+
+  private validateSilentSeatOptions(config: AgentSessionConfig): void {
+    const schemas = new Map<string, z.ZodType<ProviderOptions>>([
+      ["claude", ClaudeProviderOptionsSchema],
+      ["codex", CodexProviderOptionsSchema],
+      ["opencode", OpenCodeProviderOptionsSchema],
+      ["omp", OmpProviderOptionsSchema],
+      ["pi", PiProviderOptionsSchema],
+      ["copilot", ACPProviderOptionsSchema],
+      ["cursor", ACPProviderOptionsSchema],
+    ]);
+    const schema = schemas.get(this.adapterOf(config.provider));
+    if (!schema) {
+      throw new Error(
+        `Provider '${config.provider}' does not support validating options for a silent seat.`,
+      );
+    }
+    validateProviderOptions(
+      config.provider,
+      schema,
+      this.effectiveOptionsFor(config.provider, config.providerOptions),
     );
   }
 
@@ -4468,17 +4786,15 @@ export class AgentManager {
     });
   }
 
-  private async switchAgentProviderSession(
-    agent: ActiveManagedAgent,
+  private buildProviderSwitchConfig(
+    previous: AgentSessionConfig,
     input: SwitchAgentProviderInput,
-  ) {
-    this.assertAcceptingAgentRegistrations();
-    const { id, cwd } = agent;
-    const record = await this.registry?.get(id);
-    const config: AgentSessionConfig = {
-      cwd,
-      title: record?.title ?? agent.config.title,
-      internal: agent.internal,
+    title?: string | null,
+  ): AgentSessionConfig {
+    return {
+      cwd: previous.cwd,
+      title: title ?? previous.title,
+      internal: previous.internal,
       provider: input.provider,
       model: input.model ?? undefined,
       modeId: input.modeId ?? undefined,
@@ -4487,11 +4803,10 @@ export class AgentManager {
         options: undefined,
         patch: input.options ?? {},
       }),
-      systemPrompt: agent.config.systemPrompt,
-      mcpServers: agent.config.mcpServers,
-      toolPolicy: agent.config.toolPolicy,
+      systemPrompt: previous.systemPrompt,
+      mcpServers: previous.mcpServers,
+      toolPolicy: previous.toolPolicy,
     };
-    return this.switchAgentSession(agent, config);
   }
 
   private async switchAgentSession(
@@ -4534,6 +4849,7 @@ export class AgentManager {
       const providerConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
       const session = await client.createSession(providerConfig, launchContext);
       opened = session;
+      this.permissionSessionGenerations.set(session, switchId);
       await this.requireExternalMcpSupport(session, providerConfig, launchContext);
       const next = this.buildSwitchedAgent(agent, session, storedConfig, providerConfig, client);
       const notice = await this.initializeSwitchedAgent(next, storedConfig);
@@ -4548,7 +4864,7 @@ export class AgentManager {
 
       previousPrefix = await this.timelinePrefixes.load(id);
       // Let the old provider's already submitted events reach the retained timeline.
-      await this.drainSessionEvents(id);
+      await this.drainAgentEventsBeforeSessionSwitch(agent);
       agent.unsubscribeSession?.();
       agent.unsubscribeSession = null;
       oldSessionUnsubscribed = true;
@@ -4594,6 +4910,12 @@ export class AgentManager {
       this.promptedMainControlRoleVersions.delete(id);
       this.pendingHierarchySessionReloads.delete(id);
       this.runtimeCleanupIdentities.set(session, Object.freeze({ openedAt: Date.now() }));
+      this.resolvePendingPermissionsForAgent(
+        agent,
+        agent.provider,
+        undefined,
+        "Permission request expired when the agent session changed.",
+      );
       Object.assign(agent, next);
       installed = true;
       if (reset) await this.publishResetTimeline(id, prefix, reset);
@@ -4617,6 +4939,13 @@ export class AgentManager {
         });
       }
       throw error;
+    }
+  }
+
+  private async drainAgentEventsBeforeSessionSwitch(agent: ActiveManagedAgent): Promise<void> {
+    await this.drainSessionEvents(agent.id);
+    if (this.hasSessionMutationWork(agent)) {
+      throw new Error(`Agent ${agent.id} started work while its replacement session was opening`);
     }
   }
 
@@ -4742,9 +5071,18 @@ export class AgentManager {
   // `setThinkingOption` and `applyOptions` in flight at once, and none of them overlaps an open,
   // reload or close; providers do no sequencing of their own.
 
-  async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {
-    return this.runLifecycleMutation(agentId, () =>
-      this.withLiveInteractiveSessionUnlocked(agentId, async (agent) => {
+  async setAgentMode(
+    agentId: string,
+    modeId: string,
+    readCatalog?: ReadPublishedSeatCatalog,
+  ): Promise<AgentProviderNotice | null> {
+    return this.runLifecycleMutation(agentId, async () => {
+      const record = await this.getSilentSeatForConfig(agentId);
+      if (record) {
+        await this.applySilentSeatConfigUnlocked(record, { modeId }, readCatalog);
+        return null;
+      }
+      return this.withLiveInteractiveSessionUnlocked(agentId, async (agent) => {
         // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
         if (getMainPriorModeIdFromLabels(agent.labels)) {
           return this.setAgentModeAndClearLegacyMainControlMarker(agent, modeId);
@@ -4761,8 +5099,8 @@ export class AgentManager {
         this.touchUpdatedAt(agent);
         await this.publishChangedLimitConfiguration(agent);
         return notice;
-      }),
-    );
+      });
+    });
   }
 
   // COMPAT(mainControlReadOnlyMode): added in v0.17.0, remove after 2027-06-01
@@ -4800,41 +5138,100 @@ export class AgentManager {
     return notice;
   }
 
-  async setAgentModel(agentId: string, modelId: string | null): Promise<void> {
-    return this.runLifecycleMutation(agentId, () =>
-      this.withLiveInteractiveSessionUnlocked(agentId, async (agent) => {
-        const normalizedModelId =
-          typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
+  async setAgentModel(
+    agentId: string,
+    modelId: string | null,
+    readCatalog?: ReadPublishedSeatCatalog,
+  ): Promise<void> {
+    return this.runLifecycleMutation(agentId, async () => {
+      const normalizedModelId = modelId?.trim() || null;
+      const record = await this.getSilentSeatForConfig(agentId);
+      if (record) {
+        await this.applySilentSeatConfigUnlocked(
+          record,
+          { modelId: normalizedModelId },
+          readCatalog,
+        );
+        return;
+      }
 
+      return this.withLiveInteractiveSessionUnlocked(agentId, async (agent) => {
+        const previousModelId = agent.config.model ?? null;
         const selection = await agent.session.setModel?.(normalizedModelId);
         await this.drainSessionEvents(agentId);
 
         // A reset clears the preference even when the provider retains its active model.
-        let effectiveModelId = normalizedModelId;
-        if (normalizedModelId !== null && selection) effectiveModelId = selection.model;
+        const effectiveModelId =
+          normalizedModelId !== null && selection ? selection.model : normalizedModelId;
 
         agent.config.model = effectiveModelId ?? undefined;
         if (agent.runtimeInfo) {
           agent.runtimeInfo = { ...agent.runtimeInfo, model: effectiveModelId };
         }
+        if (previousModelId !== effectiveModelId) {
+          await this.clearIncompatibleThinkingForModel(agent, selection?.model ?? effectiveModelId);
+        }
         this.refreshSessionPersistence(agent);
         this.touchUpdatedAt(agent);
         await this.publishChangedLimitConfiguration(agent);
-      }),
-    );
+      });
+    });
+  }
+
+  private async clearIncompatibleThinkingForModel(
+    agent: ActiveManagedAgent,
+    modelId: string | null,
+  ): Promise<void> {
+    const thinking = agent.config.thinkingOptionId;
+    if (!thinking || !agent.session.setThinkingOption) return;
+
+    const model = await this.findModelForThinkingOption(agent.config, modelId);
+    if (!model?.thinkingOptions || model.thinkingOptions.some(({ id }) => id === thinking)) return;
+
+    await agent.session.setThinkingOption(null);
+    await this.drainSessionEvents(agent.id);
+    agent.config.thinkingOptionId = undefined;
+    await this.refreshRuntimeInfo(agent, { emit: false });
+  }
+
+  private async findModelForThinkingOption(
+    config: Pick<AgentSessionConfig, "provider" | "cwd">,
+    modelId: string | null,
+  ) {
+    const catalog = await this.clients
+      .get(config.provider)
+      ?.fetchCatalog({ scope: "workspace", cwd: config.cwd, force: false })
+      .catch(() => undefined);
+    return this.findCatalogModel(catalog, modelId);
+  }
+
+  private findCatalogModel(catalog: ProviderCatalog | undefined, modelId: string | null) {
+    return modelId
+      ? catalog?.models.find((entry) => entry.id === modelId || entry.aliases?.includes(modelId))
+      : catalog?.models.find((entry) => entry.isDefault);
   }
 
   async setAgentThinkingOption(
     agentId: string,
     thinkingOptionId: string | null,
+    readCatalog?: ReadPublishedSeatCatalog,
   ): Promise<AgentProviderNotice | null> {
-    return this.runLifecycleMutation(agentId, () =>
-      this.withLiveInteractiveSessionUnlocked(agentId, async (agent) => {
-        const normalizedThinkingOptionId =
-          typeof thinkingOptionId === "string" && thinkingOptionId.trim().length > 0
-            ? thinkingOptionId
-            : null;
+    const normalizedThinkingOptionId =
+      typeof thinkingOptionId === "string" && thinkingOptionId.trim().length > 0
+        ? thinkingOptionId
+        : null;
+    return this.runLifecycleMutation(agentId, async () => {
+      const record = await this.getSilentSeatForConfig(agentId);
+      if (record) {
+        await this.applySilentSeatConfigUnlocked(
+          record,
+          { thinkingOptionId: normalizedThinkingOptionId },
+          readCatalog,
+        );
+        return null;
+      }
 
+      return this.withLiveInteractiveSessionUnlocked(agentId, async (agent) => {
         let notice: AgentProviderNotice | null = null;
         if (agent.session.setThinkingOption) {
           notice = (await agent.session.setThinkingOption(normalizedThinkingOptionId)) ?? null;
@@ -4857,8 +5254,8 @@ export class AgentManager {
         this.touchUpdatedAt(agent);
         await this.publishChangedLimitConfiguration(agent);
         return notice;
-      }),
-    );
+      });
+    });
   }
 
   /**
@@ -4868,8 +5265,13 @@ export class AgentManager {
    * one step once the provider accepts. Patches to one agent run one at a time, in arrival order.
    */
   async setAgentOptions(agentId: string, requested: ProviderOptionsPatch): Promise<void> {
-    return this.runLifecycleMutation(agentId, () =>
-      this.withLiveInteractiveSessionUnlocked(agentId, async (agent) => {
+    return this.runLifecycleMutation(agentId, async () => {
+      const record = await this.getSilentSeatForConfig(agentId);
+      if (record) {
+        await this.applySilentSeatConfigUnlocked(record, { options: requested });
+        return;
+      }
+      return this.withLiveInteractiveSessionUnlocked(agentId, async (agent) => {
         const patch = this.convertLegacyOptions(agent.provider, requested);
         let ended: ProviderOptionsPatch = {};
         let sent: ProviderOptionsPatch = {};
@@ -4905,8 +5307,8 @@ export class AgentManager {
         this.updateEffectiveOptions({ agent, sent, reported: ended });
         this.touchUpdatedAt(agent);
         await this.publishChangedLimitConfiguration(agent);
-      }),
-    );
+      });
+    });
   }
 
   /** The config as the opened session left it: its own difference from the options it was given. */
@@ -6766,7 +7168,11 @@ export class AgentManager {
     this.dispatchStoredAgentState(nextRecord);
   }
 
-  async markAgentUnread(agentId: string): Promise<void> {
+  markAgentUnread(agentId: string): Promise<void> {
+    return this.runLifecycleMutation(agentId, () => this.markAgentUnreadUnlocked(agentId));
+  }
+
+  private async markAgentUnreadUnlocked(agentId: string): Promise<void> {
     const liveAgent = this.agents.get(agentId);
     if (liveAgent) {
       const attentionReason = unreadAttentionReason(liveAgent.lifecycle);
@@ -9014,9 +9420,10 @@ export class AgentManager {
   ): Promise<AgentPermissionResult | void> {
     const agent = this.requireAgent(agentId);
     const request = agent.pendingPermissions.get(requestId);
+    if (!request) throw new Error("Permission request is no longer pending.");
+    if (this.providerSwitches.has(agentId)) throw new Error("Agent session is changing.");
     if (
       response.behavior === "allow" &&
-      request &&
       isMainControlAgentLabels(agent.labels) &&
       isMainControlWritePermissionBlocked(request)
     ) {
@@ -9028,7 +9435,9 @@ export class AgentManager {
     agent.inFlightPermissionResponses.add(requestId);
 
     try {
-      const result = await agent.session.respondToPermission(requestId, response);
+      const generation = this.permissionSessionGenerations.get(agent.session);
+      const providerRequestId = generation ? requestId.slice(generation.length + 1) : requestId;
+      const result = await agent.session.respondToPermission(providerRequestId, response);
       agent.pendingPermissions.delete(requestId);
 
       try {
@@ -9138,7 +9547,12 @@ export class AgentManager {
     }
 
     if (agent.pendingPermissions.size > 0) {
-      this.resolvePendingPermissionsForAgent(agent, agent.provider, undefined, "Interrupted");
+      this.resolvePendingPermissionsForAgent(
+        agent,
+        agent.provider,
+        undefined,
+        this.interruptedPermissionMessage(agent.id),
+      );
       this.touchUpdatedAt(agent);
       this.emitState(agent);
     }
@@ -10319,6 +10733,7 @@ export class AgentManager {
         config,
         options?.initialTitle ?? null,
       );
+      await this.restorePermissionSessionGeneration(resolvedAgentId, session);
 
       const now = new Date();
       const { durableTimelineHasRows } = await this.initializeAgentTimelineForRegister({
@@ -10656,8 +11071,9 @@ export class AgentManager {
       return;
     }
     const agentId = agent.id;
-    const unsubscribe = agent.session.subscribe((event: AgentStreamEvent) => {
-      this.enqueueSessionEvent(agentId, event);
+    const session = agent.session;
+    const unsubscribe = session.subscribe((event: AgentStreamEvent) => {
+      if (this.agents.get(agentId)?.session === session) this.enqueueSessionEvent(agentId, event);
     });
     agent.unsubscribeSession = unsubscribe;
   }
@@ -10758,6 +11174,11 @@ export class AgentManager {
       this.publishBackgroundWork(agent.id, items);
       return;
     }
+    if (event.type === "permission_requested") {
+      event = { ...event, request: this.scopePermissionRequest(agent.session, event.request) };
+    } else if (event.type === "permission_resolved") {
+      event = { ...event, requestId: this.scopePermissionId(agent.session, event.requestId) };
+    }
     // Resolve notice membership before selecting the foreground run's waiters.
     if (event.type === "timeline" && event.item.type === "notification") {
       event = attachManagedTurnIdentity(agent, event, false).event;
@@ -10853,6 +11274,24 @@ export class AgentManager {
     }
   }
 
+  private async restorePermissionSessionGeneration(agentId: string, session: AgentSession) {
+    if ((await this.registry?.get(agentId))?.timelinePrefixSwitchId) {
+      this.permissionSessionGenerations.set(session, randomUUID());
+    }
+  }
+
+  private scopePermissionId(session: AgentSession, requestId: string): string {
+    const generation = this.permissionSessionGenerations.get(session);
+    return generation ? `${generation}:${requestId}` : requestId;
+  }
+
+  private scopePermissionRequest(
+    session: AgentSession,
+    request: AgentPermissionRequest,
+  ): AgentPermissionRequest {
+    return { ...request, id: this.scopePermissionId(session, request.id) };
+  }
+
   private async refreshSessionState(
     agent: ActiveManagedAgent,
     options?: { emit?: boolean },
@@ -10871,7 +11310,9 @@ export class AgentManager {
     }
 
     try {
-      const pending = agent.session.getPendingPermissions();
+      const pending = agent.session
+        .getPendingPermissions()
+        .map((request) => this.scopePermissionRequest(agent.session, request));
       agent.pendingPermissions = new Map(pending.map((request) => [request.id, request]));
     } catch {
       agent.pendingPermissions.clear();
@@ -11747,7 +12188,12 @@ export class AgentManager {
       agent.lifecycle = "idle";
     }
     agent.lastError = undefined;
-    this.resolvePendingPermissionsForAgent(agent, event.provider, options, "Interrupted");
+    this.resolvePendingPermissionsForAgent(
+      agent,
+      event.provider,
+      options,
+      this.interruptedPermissionMessage(agent.id),
+    );
   }
 
   private onStreamTurnStarted(params: {
@@ -11773,7 +12219,10 @@ export class AgentManager {
       flags.shouldNotifyWaiters = false;
       return;
     }
-    if (agent.activeForegroundTurnId) {
+    if (
+      agent.activeForegroundTurnId ||
+      (eventTurnId && agent.finalizedForegroundTurnIds.has(eventTurnId))
+    ) {
       flags.shouldDispatchEvent = false;
       flags.shouldNotifyWaiters = false;
       return;
@@ -11841,6 +12290,12 @@ export class AgentManager {
       return;
     }
     this.emitState(agent);
+  }
+
+  private interruptedPermissionMessage(agentId: string): string {
+    return this.providerSwitches.has(agentId)
+      ? "Permission request expired when the active turn was interrupted for a session change."
+      : "Interrupted";
   }
 
   private resolvePendingPermissionsForAgent(

@@ -128,6 +128,10 @@ export function buildBulkCloseConfirmationMessage(
   return labels.agents({ agents: archiveAgentTabs.length });
 }
 
+export function hasDestructiveBulkCloseTabs(groups: BulkClosableTabGroups): boolean {
+  return groups.archiveAgentTabs.length > 0 || groups.terminalTabs.length > 0;
+}
+
 export async function closeBulkWorkspaceTabs(input: CloseBulkWorkspaceTabsInput): Promise<void> {
   const {
     client,
@@ -140,7 +144,7 @@ export async function closeBulkWorkspaceTabs(input: CloseBulkWorkspaceTabsInput)
     logLabel,
     warn,
   } = input;
-  const hasDestructiveTabs = groups.archiveAgentTabs.length > 0 || groups.terminalTabs.length > 0;
+  const hasDestructiveTabs = hasDestructiveBulkCloseTabs(groups);
 
   for (const { tabId, agentId } of groups.sideChatTabs ?? []) {
     await closeTab(tabId, async () => {

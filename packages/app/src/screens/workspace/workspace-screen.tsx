@@ -238,7 +238,25 @@ import {
   type BulkCloseConfirmationLabels,
   classifyBulkClosableTabs,
   closeBulkWorkspaceTabs,
+  hasDestructiveBulkCloseTabs,
 } from "@/screens/workspace/workspace-bulk-close";
+import {
+  createGitGraphNavigationIntentStore,
+  GitGraphNavigationIntentProvider,
+  TopicHeaderBar,
+  type GitGraphNavigationIntentStore,
+} from "@/screens/workspace/topic-header";
+import {
+  selectWorkspaceTeamSummary,
+  TeamDirectoryShellProvider,
+  WorkspaceTeamDirectory,
+  type TeamDirectoryMemberNode,
+} from "@/subagents/team-directory";
+import { useContainerWidthBelow } from "@/hooks/use-container-width";
+import { PressHighlight } from "@/components/ui/press-highlight";
+import { navigateToAgent } from "@/utils/navigate-to-agent";
+import type { AgentAddress } from "@getpaseo/protocol/addresses";
+import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
 import {
   discardSideChatIfEmpty,
   isSideChat,
@@ -590,6 +608,388 @@ function parsePaneDirection(actionId: string): PaneDirection | null {
   return null;
 }
 
+function resolveAgentTabCloseKind(
+  agent: Parameters<typeof resolveCloseAgentTabPolicy>[0] | undefined,
+  isTopicWorkspace: boolean,
+) {
+  if (agent) return resolveCloseAgentTabPolicy(agent, { isTopicWorkspace }).kind;
+  return isTopicWorkspace ? "layout-only" : null;
+}
+
+function useWorkspaceTeamDirectoryState(input: {
+  serverId: string;
+  workspaceId: string;
+  client: ReturnType<typeof useHostRuntimeClient>;
+  isRouteFocused: boolean;
+  isConnected: boolean;
+  isMobile: boolean;
+  mainAgentId: string | null;
+  desktopFocusModeEnabled: boolean;
+}) {
+  const { workspace: topicWorkspace } = useTopicWorkspace({
+    serverId: input.serverId,
+    workspaceId: input.workspaceId,
+    client: input.client,
+    enabled: input.isRouteFocused && input.isConnected && Boolean(input.workspaceId),
+  });
+  const isTopicWorkspace = Boolean(topicWorkspace?.topic);
+  const { isBelow: isNarrowDesktopCenter, onLayout: onCenterColumnLayout } = useContainerWidthBelow(
+    780,
+    { initialIsBelow: false },
+  );
+  const [wideTeamDirectoryOpen, setWideTeamDirectoryOpen] = useState(true);
+  const [overlayTeamDirectoryOpen, setOverlayTeamDirectoryOpen] = useState(false);
+  const hasShellTeamWorkbench = !input.isMobile && (isTopicWorkspace || Boolean(input.mainAgentId));
+  const isTeamDirectoryOverlay = isNarrowDesktopCenter;
+  const isTeamDirectoryVisible =
+    hasShellTeamWorkbench &&
+    !input.desktopFocusModeEnabled &&
+    (isTeamDirectoryOverlay ? overlayTeamDirectoryOpen : wideTeamDirectoryOpen);
+  const toggleTeamDirectory = useCallback(() => {
+    if (isTeamDirectoryOverlay) {
+      setOverlayTeamDirectoryOpen((current) => !current);
+    } else {
+      setWideTeamDirectoryOpen((current) => !current);
+    }
+  }, [isTeamDirectoryOverlay]);
+  const hideTeamDirectory = useCallback(() => {
+    if (isTeamDirectoryOverlay) {
+      setOverlayTeamDirectoryOpen(false);
+    } else {
+      setWideTeamDirectoryOpen(false);
+    }
+  }, [isTeamDirectoryOverlay]);
+  const showTeamDirectory = useCallback(() => {
+    if (isTeamDirectoryOverlay) {
+      setOverlayTeamDirectoryOpen(true);
+    } else {
+      setWideTeamDirectoryOpen(true);
+    }
+  }, [isTeamDirectoryOverlay]);
+  const teamDirectoryShellValue = useMemo(
+    () => ({
+      isOwnedByWorkspaceShell: hasShellTeamWorkbench,
+      isDirectoryVisible: isTeamDirectoryVisible,
+      toggleDirectory: toggleTeamDirectory,
+    }),
+    [hasShellTeamWorkbench, isTeamDirectoryVisible, toggleTeamDirectory],
+  );
+  const serverAgentsMap = useSessionStore((state) => state.sessions[input.serverId]?.agents);
+  const teamSummary = useMemo(
+    () =>
+      selectWorkspaceTeamSummary({
+        serverId: input.serverId,
+        workspaceId: input.workspaceId,
+        mainAgentId: input.mainAgentId,
+        agents: serverAgentsMap,
+      }),
+    [input.mainAgentId, input.serverId, input.workspaceId, serverAgentsMap],
+  );
+
+  return {
+    topicWorkspace,
+    isTopicWorkspace,
+    onCenterColumnLayout,
+    hasShellTeamWorkbench,
+    isTeamDirectoryOverlay,
+    isTeamDirectoryVisible,
+    toggleTeamDirectory,
+    hideTeamDirectory,
+    showTeamDirectory,
+    teamDirectoryShellValue,
+    teamSummary,
+  };
+}
+
+function useWorkspaceTeamDirectoryActions(input: {
+  serverId: string;
+  workspaceId: string;
+  persistenceKey: string | null;
+  lastMainPaneId: string | null;
+  isTeamDirectoryOverlay: boolean;
+  hideTeamDirectory: () => void;
+  showTeamDirectory: () => void;
+  openInSidePane: Parameters<typeof openPreferredWorkspaceTarget>[0]["preferences"];
+  gitGraphIntentStore: GitGraphNavigationIntentStore;
+  openWorkspaceTabFocused: (
+    workspaceKey: string,
+    target: WorkspaceTabTarget,
+    placement?: WorkspaceTabPlacement,
+  ) => void;
+}) {
+  const {
+    serverId,
+    workspaceId,
+    persistenceKey,
+    lastMainPaneId,
+    isTeamDirectoryOverlay,
+    hideTeamDirectory,
+    showTeamDirectory,
+    openInSidePane,
+    gitGraphIntentStore,
+    openWorkspaceTabFocused,
+  } = input;
+  const handleOpenGitGraph = useCallback(
+    (conflictRepoRoot?: string | null) => {
+      if (!persistenceKey) return;
+      const layout = useWorkspaceLayoutStore.getState();
+      const existing = layout
+        .getWorkspaceTabs(persistenceKey)
+        .find((tab) => tab.target.kind === "git_graph");
+      let targetTabId: string | null = null;
+      if (existing) {
+        revealWorkspaceTab(persistenceKey, existing.tabId);
+        targetTabId = existing.tabId;
+      } else {
+        openWorkspaceTabFocused(
+          persistenceKey,
+          { kind: "git_graph" },
+          lastMainPaneId ? { mode: "pane", paneId: lastMainPaneId } : FOCUSED_PANE_PLACEMENT,
+        );
+        targetTabId =
+          useWorkspaceLayoutStore
+            .getState()
+            .getWorkspaceTabs(persistenceKey)
+            .find((tab) => tab.target.kind === "git_graph")?.tabId ?? null;
+      }
+      if (conflictRepoRoot && targetTabId) {
+        gitGraphIntentStore.submitConflictIntent({
+          tabId: targetTabId,
+          repoRoot: conflictRepoRoot,
+        });
+      }
+    },
+    [gitGraphIntentStore, lastMainPaneId, openWorkspaceTabFocused, persistenceKey],
+  );
+
+  const handleFocusAttentionAgent = useCallback(
+    (agentId: string | null) => {
+      if (agentId && persistenceKey) {
+        openWorkspaceTabFocused(
+          persistenceKey,
+          { kind: "agent", agentId },
+          lastMainPaneId ? { mode: "pane", paneId: lastMainPaneId } : FOCUSED_PANE_PLACEMENT,
+        );
+        return;
+      }
+      showTeamDirectory();
+    },
+    [lastMainPaneId, openWorkspaceTabFocused, persistenceKey, showTeamDirectory],
+  );
+
+  const handleOpenDirectoryAgent = useCallback(
+    (node: TeamDirectoryMemberNode) => {
+      if (isTeamDirectoryOverlay) hideTeamDirectory();
+      if (node.isArchived) {
+        navigateToAgent({
+          serverId: node.serverId,
+          workspaceId: node.serverId === serverId ? workspaceId : undefined,
+          agentId: node.agentId,
+          pin: true,
+          asTab: true,
+        });
+        return;
+      }
+      const liveAgent = useSessionStore
+        .getState()
+        .sessions[node.serverId]?.agents.get(node.agentId);
+      if (
+        node.serverId !== serverId ||
+        (liveAgent?.workspaceId && liveAgent.workspaceId !== workspaceId)
+      ) {
+        navigateToAgent({ serverId: node.serverId, agentId: node.agentId, asTab: true });
+        return;
+      }
+      if (!persistenceKey) return;
+      openWorkspaceTabFocused(
+        persistenceKey,
+        { kind: "agent", agentId: node.agentId },
+        lastMainPaneId ? { mode: "pane", paneId: lastMainPaneId } : FOCUSED_PANE_PLACEMENT,
+      );
+    },
+    [
+      hideTeamDirectory,
+      isTeamDirectoryOverlay,
+      lastMainPaneId,
+      openWorkspaceTabFocused,
+      persistenceKey,
+      serverId,
+      workspaceId,
+    ],
+  );
+
+  const handleOpenDirectoryAgentBeside = useCallback(
+    (address: AgentAddress) => {
+      if (isTeamDirectoryOverlay) hideTeamDirectory();
+      if (address.serverId === serverId && persistenceKey) {
+        openWorkspaceTargetBeside({
+          workspaceKey: persistenceKey,
+          target: { kind: "agent", agentId: address.agentId },
+        });
+        return;
+      }
+      navigateToAgent({ serverId: address.serverId, agentId: address.agentId, asTab: true });
+    },
+    [hideTeamDirectory, isTeamDirectoryOverlay, persistenceKey, serverId],
+  );
+
+  const handleOpenProviderSubrun = useCallback(
+    (parentAgentId: string, subagentId: string) => {
+      if (isTeamDirectoryOverlay) hideTeamDirectory();
+      if (!persistenceKey) return;
+      openPreferredWorkspaceTarget({
+        workspaceKey: persistenceKey,
+        target: { kind: "provider_subagent", parentAgentId, subagentId },
+        source: "subagents",
+        preferences: openInSidePane,
+      });
+    },
+    [hideTeamDirectory, isTeamDirectoryOverlay, openInSidePane, persistenceKey],
+  );
+
+  return {
+    handleOpenGitGraph,
+    handleFocusAttentionAgent,
+    handleOpenDirectoryAgent,
+    handleOpenDirectoryAgentBeside,
+    handleOpenProviderSubrun,
+  };
+}
+
+function WorkspaceTopicHeaderSlot({
+  enabled,
+  topicWorkspace,
+  ...props
+}: Omit<Parameters<typeof TopicHeaderBar>[0], "topic"> & {
+  enabled: boolean;
+  topicWorkspace: WorkspaceDescriptorPayload | null | undefined;
+}) {
+  if (!enabled) return null;
+  return <TopicHeaderBar {...props} topic={topicWorkspace?.topic} />;
+}
+
+function WorkspaceShellProviders({
+  persistenceKey,
+  sheetPaneHost,
+  mainTabContext,
+  teamDirectoryShellValue,
+  gitGraphIntentStore,
+  workspaceDescriptor,
+  client,
+  serverId,
+  workspaceDirectory,
+  openMarkdownPath,
+  toast,
+  children,
+}: {
+  persistenceKey: string | null;
+  sheetPaneHost: Parameters<typeof WorkspaceContentProviders>[0]["sheetPaneHost"];
+  mainTabContext: Parameters<typeof WorkspaceContentProviders>[0]["mainTab"];
+  teamDirectoryShellValue: Parameters<typeof TeamDirectoryShellProvider>[0]["value"];
+  gitGraphIntentStore: GitGraphNavigationIntentStore;
+  workspaceDescriptor: WorkspaceDescriptor | null;
+  client: ReturnType<typeof useHostRuntimeClient>;
+  serverId: string;
+  workspaceDirectory: string | null;
+  openMarkdownPath: Parameters<typeof WorkspaceMarkdownLinks>[0]["onOpenWorkspaceFile"];
+  toast: Parameters<typeof WorkspaceMarkdownLinks>[0]["toast"];
+  children: ReactNode;
+}) {
+  return (
+    <WorkspaceContentProviders
+      key={persistenceKey}
+      workspaceKey={persistenceKey}
+      sheetPaneHost={sheetPaneHost}
+      mainTab={mainTabContext}
+    >
+      <TeamDirectoryShellProvider value={teamDirectoryShellValue}>
+        <GitGraphNavigationIntentProvider store={gitGraphIntentStore}>
+          <WorkspaceMarkdownLinks
+            workspace={workspaceDescriptor}
+            client={client}
+            serverId={serverId}
+            workspaceRoot={workspaceDirectory ?? undefined}
+            onOpenWorkspaceFile={openMarkdownPath}
+            toast={toast}
+          >
+            {children}
+          </WorkspaceMarkdownLinks>
+        </GitGraphNavigationIntentProvider>
+      </TeamDirectoryShellProvider>
+    </WorkspaceContentProviders>
+  );
+}
+
+function WorkspaceDesktopBody({
+  isTeamDirectoryVisible,
+  isTeamDirectoryOverlay,
+  hideLabel,
+  serverId,
+  workspaceId,
+  mainAgentId,
+  isTopicWorkspace,
+  focusedAgentId,
+  focusedProviderSubagentId,
+  onHideDirectory,
+  onOpenAgent,
+  onOpenAgentBeside,
+  onOpenProviderSubrun,
+  onAskFirstQuestion,
+  topicEmptyContent,
+  desktopContent,
+}: {
+  isTeamDirectoryVisible: boolean;
+  isTeamDirectoryOverlay: boolean;
+  hideLabel: string;
+  serverId: string;
+  workspaceId: string;
+  mainAgentId: string | null;
+  isTopicWorkspace: boolean;
+  focusedAgentId: string | null;
+  focusedProviderSubagentId: string | null;
+  onHideDirectory: () => void;
+  onOpenAgent: (node: TeamDirectoryMemberNode) => void;
+  onOpenAgentBeside: (address: AgentAddress) => void;
+  onOpenProviderSubrun: (parentAgentId: string, subagentId: string) => void;
+  onAskFirstQuestion?: () => void;
+  topicEmptyContent: ReactNode;
+  desktopContent: ReactNode;
+}) {
+  return (
+    <View style={styles.workspaceBodyRow}>
+      {isTeamDirectoryVisible && isTeamDirectoryOverlay ? (
+        <PressHighlight
+          style={styles.teamDirectoryOverlayBackdrop}
+          accessibilityRole="button"
+          accessibilityLabel={hideLabel}
+          onPress={onHideDirectory}
+        />
+      ) : null}
+      {isTeamDirectoryVisible ? (
+        <WorkspaceTeamDirectory
+          serverId={serverId}
+          workspaceId={workspaceId}
+          mainAgentId={mainAgentId}
+          isTopicWorkspace={isTopicWorkspace}
+          focusedAgentId={focusedAgentId}
+          focusedProviderSubagentId={focusedProviderSubagentId}
+          overlay={isTeamDirectoryOverlay}
+          onHide={onHideDirectory}
+          onOpenAgent={onOpenAgent}
+          onOpenAgentBeside={onOpenAgentBeside}
+          onOpenProviderSubrun={onOpenProviderSubrun}
+          onAskFirstQuestion={isTopicWorkspace ? onAskFirstQuestion : undefined}
+        />
+      ) : null}
+      <View style={styles.workspaceMainArea}>
+        <TopicEmptyContentContext value={topicEmptyContent}>
+          {desktopContent}
+        </TopicEmptyContentContext>
+      </View>
+    </View>
+  );
+}
+
 const TopicEmptyContentContext = createContext<ReactNode>(null);
 
 function TopicEmptyTabContent() {
@@ -597,11 +997,7 @@ function TopicEmptyTabContent() {
 }
 
 function useUnboundTopicContent(input: {
-  serverId: string;
-  workspaceId: string;
-  client: ReturnType<typeof useHostRuntimeClient>;
-  isRouteFocused: boolean;
-  isConnected: boolean;
+  topicWorkspace: WorkspaceDescriptorPayload | null | undefined;
   canOpenDraft: boolean;
   hasHydratedLayout: boolean;
   hasHydratedAgents: boolean;
@@ -629,13 +1025,7 @@ function useUnboundTopicContent(input: {
     !input.mainAgentId &&
     hasActiveMainAgent !== true &&
     mainTabs.every((tab) => tab.target.kind === "new_tab");
-  const { workspace } = useTopicWorkspace({
-    serverId: input.serverId,
-    workspaceId: input.workspaceId,
-    client: input.client,
-    enabled: canShow && input.isRouteFocused && input.isConnected,
-  });
-  const topic = canShow ? getUnboundTopicWorkspace(workspace, hasActiveMainAgent) : null;
+  const topic = canShow ? getUnboundTopicWorkspace(input.topicWorkspace, hasActiveMainAgent) : null;
   const content = useMemo(
     () => (topic ? <TopicEmptyState workspace={topic} onAsk={onAsk} /> : null),
     [onAsk, topic],
@@ -1489,6 +1879,28 @@ function WorkspaceScreenContent({
   const hierarchyTabState = useSessionStore(selectHierarchyTabState);
   const supportsHierarchyControl = useHostFeature(normalizedServerId, "agentHierarchyControl");
   const mainAgentId = hierarchyTabState.mainAgentId;
+  const {
+    topicWorkspace,
+    isTopicWorkspace,
+    onCenterColumnLayout,
+    hasShellTeamWorkbench,
+    isTeamDirectoryOverlay,
+    isTeamDirectoryVisible,
+    toggleTeamDirectory,
+    hideTeamDirectory,
+    showTeamDirectory,
+    teamDirectoryShellValue,
+    teamSummary,
+  } = useWorkspaceTeamDirectoryState({
+    serverId: normalizedServerId,
+    workspaceId: normalizedWorkspaceId,
+    client,
+    isRouteFocused,
+    isConnected,
+    isMobile,
+    mainAgentId,
+    desktopFocusModeEnabled,
+  });
   const { preferences: codingPreferences } = useFormPreferences();
   const resolveNewAgentTabSetup = useCallback(() => {
     const state = useSessionStore.getState();
@@ -1636,6 +2048,13 @@ function WorkspaceScreenContent({
       return null;
     }
     return target.terminalId;
+  }, [focusedPaneTabState.activeTab]);
+  const focusedProviderSubagentId = useMemo(() => {
+    const target = focusedPaneTabState.activeTab?.descriptor.target;
+    if (target?.kind !== "provider_subagent") {
+      return null;
+    }
+    return target.subagentId;
   }, [focusedPaneTabState.activeTab]);
 
   useEffect(() => {
@@ -2232,7 +2651,7 @@ function WorkspaceScreenContent({
         const session = useSessionStore.getState().sessions[normalizedServerId];
         const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
         // A restored tab can outlive its snapshot. Closing it cannot authorize an archive.
-        const closeKind = agent ? resolveCloseAgentTabPolicy(agent).kind : null;
+        const closeKind = resolveAgentTabCloseKind(agent, isTopicWorkspace);
         let shouldArchive = closeKind === "archive-on-close";
         if (shouldArchive) {
           const confirmation = confirmArchiveAgentTab(session, agentId);
@@ -2248,12 +2667,13 @@ function WorkspaceScreenContent({
             return;
           }
           try {
-            shouldArchive = await clearSubagentOpenTabLabel({
+            const clearResult = await clearSubagentOpenTabLabel({
               client: sessionClient,
               agentId,
               serverId: normalizedServerId,
               workspaceId: normalizedWorkspaceId,
             });
+            shouldArchive = isTopicWorkspace ? false : clearResult;
           } catch (error) {
             console.error("[WorkspaceScreen] Failed to close subagent tab", { error, agentId });
             toast.error(t("workspace.tabs.toasts.failedToCloseAgent"));
@@ -2294,6 +2714,7 @@ function WorkspaceScreenContent({
       closeWorkspaceTabWithCleanup,
       confirmArchiveAgentTab,
       discardEmptySideChat,
+      isTopicWorkspace,
       normalizedServerId,
       normalizedWorkspaceId,
       persistenceKey,
@@ -2634,7 +3055,7 @@ function WorkspaceScreenContent({
       const groups = classifyBulkClosableTabs(tabsToClose, (agentId) => {
         const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
         if (!agent) return "layout-only";
-        const policy = resolveCloseAgentTabPolicy(agent).kind;
+        const policy = resolveCloseAgentTabPolicy(agent, { isTopicWorkspace }).kind;
         return policy === "archive-on-close" ? "archive" : policy;
       });
       const hasMainWithDescendants =
@@ -2669,7 +3090,7 @@ function WorkspaceScreenContent({
         message: confirmationParts.join("\n\n"),
         confirmLabel: t("workspace.tabs.confirmations.close"),
         cancelLabel: t("workspace.tabs.confirmations.cancel"),
-        destructive: true,
+        destructive: hasDestructiveBulkCloseTabs(groups),
       });
       if (!confirmed) {
         return false;
@@ -2684,7 +3105,12 @@ function WorkspaceScreenContent({
         closeLayoutOnlyAgent: async (agentId) => {
           const current = useSessionStore.getState().sessions[normalizedServerId];
           const agent = current?.agents.get(agentId) ?? current?.agentDetails.get(agentId);
-          if (!agent || resolveCloseAgentTabPolicy(agent).kind !== "layout-only") return;
+          if (
+            !agent ||
+            resolveCloseAgentTabPolicy(agent, { isTopicWorkspace }).kind !== "layout-only"
+          ) {
+            return;
+          }
           if (!client) {
             throw new Error(t("common.errors.daemonClientUnavailable"));
           }
@@ -2694,7 +3120,7 @@ function WorkspaceScreenContent({
             serverId: normalizedServerId,
             workspaceId: normalizedWorkspaceId,
           });
-          if (shouldArchive) {
+          if (shouldArchive && !isTopicWorkspace) {
             await archiveAgent({
               serverId: normalizedServerId,
               agentId,
@@ -2726,6 +3152,7 @@ function WorkspaceScreenContent({
       closeTab,
       closeWorkspaceTabWithCleanup,
       hierarchyLabels,
+      isTopicWorkspace,
       normalizedServerId,
       normalizedWorkspaceId,
       persistenceKey,
@@ -3531,11 +3958,7 @@ function WorkspaceScreenContent({
     placeholderTabId: topicPlaceholderTabId,
     withoutTab: topicWithoutTab,
   } = useUnboundTopicContent({
-    serverId: normalizedServerId,
-    workspaceId: normalizedWorkspaceId,
-    client,
-    isRouteFocused,
-    isConnected,
+    topicWorkspace,
     canOpenDraft: Boolean(persistenceKey),
     hasHydratedLayout: hasHydratedWorkspaceLayoutStore,
     hasHydratedAgents,
@@ -3545,6 +3968,34 @@ function WorkspaceScreenContent({
     explorerPaneId: explorerSidebarPaneId,
     tabs: uiTabs,
     onAsk: askFirstTopicQuestion,
+  });
+  const [gitGraphIntentStore] = useState(createGitGraphNavigationIntentStore);
+  useEffect(() => {
+    if (persistenceKey === null) {
+      gitGraphIntentStore.clear();
+      return;
+    }
+    return () => {
+      gitGraphIntentStore.clear();
+    };
+  }, [gitGraphIntentStore, persistenceKey]);
+  const {
+    handleOpenGitGraph,
+    handleFocusAttentionAgent,
+    handleOpenDirectoryAgent,
+    handleOpenDirectoryAgentBeside,
+    handleOpenProviderSubrun,
+  } = useWorkspaceTeamDirectoryActions({
+    serverId: normalizedServerId,
+    workspaceId: normalizedWorkspaceId,
+    persistenceKey,
+    lastMainPaneId,
+    isTeamDirectoryOverlay,
+    hideTeamDirectory,
+    showTeamDirectory,
+    openInSidePane,
+    gitGraphIntentStore,
+    openWorkspaceTabFocused,
   });
   const content = renderWorkspaceContent({
     topicEmptyContent,
@@ -3757,46 +4208,83 @@ function WorkspaceScreenContent({
   const renderWorkspaceScreenHeader = useCallback(
     () =>
       showScreenHeader ? (
-        <ScreenHeader
-          left={
-            <>
-              <SidebarMenuToggle />
-              <WorkspaceHeaderTitleBar
-                isLoading={isWorkspaceHeaderLoading}
-                title={workspaceHeaderTitle}
-                subtitle={workspaceHeaderSubtitle}
-                isSubtitleDistinct={isWorkspaceHeaderSubtitleDistinct}
-                currentBranchName={currentBranchName}
-                normalizedServerId={normalizedServerId}
-                showWorkspaceSetup={showWorkspaceSetup}
-                importAgentDisabled={!canOpenImportSheet}
-                copyPathDisabled={!workspaceDirectory}
-                onOpenImportSheet={openImportSheet}
-                onCopyWorkspacePath={handleCopyWorkspacePath}
-                onCopyBranchName={handleCopyBranchName}
-                onOpenSetupTab={handleOpenSetupTab}
-              />
-            </>
-          }
-          right={headerRight}
-        />
+        <>
+          <ScreenHeader
+            left={
+              <>
+                <SidebarMenuToggle />
+                <WorkspaceHeaderTitleBar
+                  isLoading={isWorkspaceHeaderLoading}
+                  title={workspaceHeaderTitle}
+                  subtitle={workspaceHeaderSubtitle}
+                  isSubtitleDistinct={isWorkspaceHeaderSubtitleDistinct}
+                  currentBranchName={currentBranchName}
+                  normalizedServerId={normalizedServerId}
+                  showWorkspaceSetup={showWorkspaceSetup}
+                  importAgentDisabled={!canOpenImportSheet}
+                  copyPathDisabled={!workspaceDirectory}
+                  onOpenImportSheet={openImportSheet}
+                  onCopyWorkspacePath={handleCopyWorkspacePath}
+                  onCopyBranchName={handleCopyBranchName}
+                  onOpenSetupTab={handleOpenSetupTab}
+                />
+              </>
+            }
+            right={headerRight}
+          />
+          <WorkspaceTopicHeaderSlot
+            enabled={hasShellTeamWorkbench}
+            serverId={normalizedServerId}
+            workspaceId={normalizedWorkspaceId}
+            client={client}
+            isConnected={isConnected}
+            isRouteFocused={isRouteFocused}
+            topicWorkspace={topicWorkspace}
+            workspaceDirectory={workspaceDirectory}
+            isGitCheckout={isGitCheckout}
+            currentBranchName={currentBranchName}
+            setupStatus={workspaceSetupStatus}
+            showWorkspaceSetup={showWorkspaceSetup}
+            isCheckoutStatusLoading={isCheckoutStatusLoading}
+            teamSummary={teamSummary}
+            isDirectoryVisible={isTeamDirectoryVisible}
+            onToggleDirectory={toggleTeamDirectory}
+            onOpenGitGraph={handleOpenGitGraph}
+            onOpenSetupTab={handleOpenSetupTab}
+            onFocusAttentionAgent={handleFocusAttentionAgent}
+          />
+        </>
       ) : null,
     [
       canOpenImportSheet,
+      client,
       currentBranchName,
       handleCopyBranchName,
       handleCopyWorkspacePath,
+      handleFocusAttentionAgent,
+      handleOpenGitGraph,
       handleOpenSetupTab,
+      hasShellTeamWorkbench,
       headerRight,
+      isCheckoutStatusLoading,
+      isConnected,
+      isGitCheckout,
+      isRouteFocused,
+      isTeamDirectoryVisible,
       isWorkspaceHeaderLoading,
+      isWorkspaceHeaderSubtitleDistinct,
       normalizedServerId,
+      normalizedWorkspaceId,
       openImportSheet,
       showScreenHeader,
       showWorkspaceSetup,
+      teamSummary,
+      toggleTeamDirectory,
+      topicWorkspace,
       workspaceDirectory,
       workspaceHeaderSubtitle,
       workspaceHeaderTitle,
-      isWorkspaceHeaderSubtitleDistinct,
+      workspaceSetupStatus,
     ],
   );
   const compactHeaderScripts = useMemo(
@@ -4132,13 +4620,26 @@ function WorkspaceScreenContent({
           ) : null}
         </AdaptiveWorkspaceChrome>
       )}
-      <View style={styles.centerContent}>
+      <View style={styles.centerContent} onLayout={onCenterColumnLayout}>
         {topicQuestionResume}
-        <View style={styles.content}>
-          <TopicEmptyContentContext value={topicEmptyContent}>
-            {desktopContent}
-          </TopicEmptyContentContext>
-        </View>
+        <WorkspaceDesktopBody
+          isTeamDirectoryVisible={isTeamDirectoryVisible}
+          isTeamDirectoryOverlay={isTeamDirectoryOverlay}
+          hideLabel={t("topicWorkbench.directory.hide")}
+          serverId={normalizedServerId}
+          workspaceId={normalizedWorkspaceId}
+          mainAgentId={mainAgentId}
+          isTopicWorkspace={isTopicWorkspace}
+          focusedAgentId={focusedPaneAgentId}
+          focusedProviderSubagentId={focusedProviderSubagentId}
+          onHideDirectory={hideTeamDirectory}
+          onOpenAgent={handleOpenDirectoryAgent}
+          onOpenAgentBeside={handleOpenDirectoryAgentBeside}
+          onOpenProviderSubrun={handleOpenProviderSubrun}
+          onAskFirstQuestion={askFirstTopicQuestion}
+          topicEmptyContent={topicEmptyContent}
+          desktopContent={desktopContent}
+        />
       </View>
     </DesktopCenterColumnChrome>
   );
@@ -4318,23 +4819,21 @@ function WorkspaceScreenContent({
     return gatedWorkspaceScreen;
   }
   return (
-    <WorkspaceContentProviders
-      key={persistenceKey}
-      workspaceKey={persistenceKey}
+    <WorkspaceShellProviders
+      persistenceKey={persistenceKey}
       sheetPaneHost={sheetPaneHost}
-      mainTab={mainTabContext}
+      mainTabContext={mainTabContext}
+      teamDirectoryShellValue={teamDirectoryShellValue}
+      gitGraphIntentStore={gitGraphIntentStore}
+      workspaceDescriptor={workspaceDescriptor}
+      client={client}
+      serverId={normalizedServerId}
+      workspaceDirectory={workspaceDirectory}
+      openMarkdownPath={openMarkdownPath}
+      toast={toast}
     >
-      <WorkspaceMarkdownLinks
-        workspace={workspaceDescriptor}
-        client={client}
-        serverId={normalizedServerId}
-        workspaceRoot={workspaceDirectory ?? undefined}
-        onOpenWorkspaceFile={openMarkdownPath}
-        toast={toast}
-      >
-        {renderedWorkspaceScreen}
-      </WorkspaceMarkdownLinks>
-    </WorkspaceContentProviders>
+      {renderedWorkspaceScreen}
+    </WorkspaceShellProviders>
   );
 }
 
@@ -4495,6 +4994,28 @@ const styles = StyleSheet.create((theme) => ({
   centerContent: {
     flex: 1,
     minHeight: 0,
+  },
+  workspaceBodyRow: {
+    flex: 1,
+    flexDirection: "row",
+    minWidth: 0,
+    minHeight: 0,
+    position: "relative",
+  },
+  teamDirectoryOverlayBackdrop: {
+    position: "absolute",
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    zIndex: 3,
+  },
+  workspaceMainArea: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 0,
+    backgroundColor: theme.colors.surface0,
+    position: "relative",
   },
   tab: {
     paddingHorizontal: theme.spacing[3],

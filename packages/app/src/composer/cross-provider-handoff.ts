@@ -70,6 +70,8 @@ export interface CrossProviderHandoffSelection {
   thinkingOptionId?: string | null;
   providerOptions?: Record<string, unknown>;
   kind?: "model" | "profile";
+  context?: "blank";
+  onlyIfSilent?: true;
 }
 
 export interface CrossProviderAgentHandoff {
@@ -315,6 +317,8 @@ async function switchAgentProviderInPlace(
     model: config.model,
     modeId: config.modeId,
     thinkingOptionId: config.thinkingOptionId,
+    ...(input.selection.context ? { context: input.selection.context } : {}),
+    ...(input.selection.onlyIfSilent ? { onlyIfSilent: true } : {}),
     ...(Object.keys(config.options).length > 0 ? { options: config.options } : {}),
   });
   const snapshot = normalizeAgentSnapshot(result.agent, input.serverId);
@@ -899,7 +903,8 @@ export function performCrossProviderAgentHandoff(
   input: { serverId: string; agentId: string; selection: CrossProviderHandoffSelection },
   deps: CrossProviderHandoffDeps,
 ): Promise<boolean> {
-  if (deps.supportsSeamlessContextSwitch === true) {
+  // The client requires host support for blank context before sending this request.
+  if (input.selection.context === "blank" || deps.supportsSeamlessContextSwitch === true) {
     return performSeamlessContextSwitch(input, deps);
   }
   return performLegacyCrossProviderAgentHandoff(input, deps);

@@ -3,6 +3,7 @@ import {
   buildBulkCloseConfirmationMessage,
   classifyBulkClosableTabs,
   closeBulkWorkspaceTabs,
+  hasDestructiveBulkCloseTabs,
 } from "@/screens/workspace/workspace-bulk-close";
 import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-types";
 
@@ -247,5 +248,51 @@ describe("workspace bulk close helpers", () => {
     });
     expect(preparedSubagents).toEqual(["child"]);
     expect(cleanedTabs).toEqual(["agent_child", "agent_root"]);
+  });
+
+  it("keeps topic workspace agent tabs layout-only while preserving empty side-chat cleanup", async () => {
+    const groups = classifyBulkClosableTabs(
+      [
+        makeAgentTab("main"),
+        makeAgentTab("resident"),
+        makeAgentTab("side"),
+        makeFileTab("/repo/boot.ts"),
+      ],
+      (agentId) => (agentId === "side" ? "side-chat" : "layout-only"),
+    );
+    expect(hasDestructiveBulkCloseTabs(groups)).toBe(false);
+    expect(buildBulkCloseConfirmationMessage(groups)).toBe("This will close 4 tab(s).");
+
+    const closeItems = vi.fn(async () => ({ agents: [], terminals: [], requestId: "req-topic" }));
+    const closedLayoutOnly: string[] = [];
+    const closedSideChats: string[] = [];
+    const cleanedTabs: string[] = [];
+
+    await closeBulkWorkspaceTabs({
+      groups,
+      workspaceId: "topic-workspace",
+      client: { closeItems },
+      closeTab: async (_tabId, action) => action(),
+      closeLayoutOnlyAgent: async (agentId) => {
+        closedLayoutOnly.push(agentId);
+      },
+      closeSideChat: async (agentId) => {
+        closedSideChats.push(agentId);
+      },
+      closeWorkspaceTabWithCleanup: ({ tabId }) => {
+        cleanedTabs.push(tabId);
+      },
+      logLabel: "topic tabs",
+    });
+
+    expect(closeItems).not.toHaveBeenCalled();
+    expect(closedSideChats).toEqual(["side"]);
+    expect(closedLayoutOnly).toEqual(["main", "resident"]);
+    expect(cleanedTabs).toEqual([
+      "agent_side",
+      "agent_main",
+      "agent_resident",
+      "file_/repo/boot.ts",
+    ]);
   });
 });

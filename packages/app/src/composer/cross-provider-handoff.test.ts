@@ -398,6 +398,51 @@ describe("performCrossProviderAgentHandoff", () => {
     expectSourceUntouched();
   });
 
+  it.each([undefined, true] as const)(
+    "passes the blank model selection (silent-only=%s)",
+    async (onlyIfSilent) => {
+      const { client, deps, run, expectSourceUntouched } = createHandoff();
+      const guard = onlyIfSilent ? { onlyIfSilent } : {};
+      await expect(
+        run(
+          { supportsSeamlessContextSwitch: true },
+          { kind: "model", provider: "claude", modelId: "sonnet", context: "blank", ...guard },
+        ),
+      ).resolves.toBe(true);
+      expect(client.switchAgentProvider).toHaveBeenCalledExactlyOnceWith("agent-1", {
+        provider: "claude",
+        model: "sonnet",
+        modeId: null,
+        thinkingOptionId: null,
+        context: "blank",
+        ...guard,
+      });
+      expect(client.buildAgentForkContext).not.toHaveBeenCalled();
+      expect(deps.archiveAgent).not.toHaveBeenCalled();
+      expectSourceUntouched();
+    },
+  );
+
+  it.each([false, true])(
+    "leaves source history and draft untouched when the host rejects blank context (in-place=%s)",
+    async (supportsSeamlessContextSwitch) => {
+      const { client, deps, run, expectSourceUntouched } = createHandoff();
+      const error = "Update the host to switch providers without handing off conversation context.";
+      client.switchAgentProvider.mockRejectedValueOnce(new Error(error));
+      await expect(
+        run(
+          { supportsSeamlessContextSwitch },
+          { kind: "model", provider: "claude", modelId: "sonnet", context: "blank" },
+        ),
+      ).resolves.toBe(false);
+      expect(client.switchAgentProvider).toHaveBeenCalledTimes(1);
+      expect(deps.toast.error).toHaveBeenCalledExactlyOnceWith(error);
+      expect(client.buildAgentForkContext).not.toHaveBeenCalled();
+      expect(deps.archiveAgent).not.toHaveBeenCalled();
+      expectSourceUntouched();
+    },
+  );
+
   it.each([null, new Date("2026-11-20T00:00:00Z")])(
     "switches a closed profile with no workspace pane and archive date %s",
     async (archivedAt) => {

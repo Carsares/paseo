@@ -76,8 +76,24 @@ import {
   useEffortCycleShortcut,
   useModelPickerShortcut,
 } from "@/composer/agent-controls/control-items";
+import { isMainControlAgent, isResidentAgent } from "@getpaseo/protocol/agent-labels";
 import { CompactModelSheet } from "@/composer/agent-controls/model-sheet";
-import type { WorkspaceBatchModelPicker } from "./model-sheet-flow";
+import {
+  buildCrossProviderSwitchDisclosurePlan,
+  confirmCrossProviderSwitchFlow,
+  hasBlankContextSwitchPermissions,
+  isAgentTurnRunning,
+  precheckModelThinkingCompatibility,
+  readLiveTopicMetadataDisclosure,
+  type CrossProviderContextMode,
+  type CrossProviderSwitchDisclosurePlan,
+  type CrossProviderSwitchTarget,
+  type LiveAgentSwitchSnapshot,
+  type TopicMetadataDisclosureState,
+  type WorkspaceBatchModelPicker,
+} from "./model-sheet-flow";
+import { ProviderSwitchDisclosureModal } from "./provider-switch-disclosure";
+import { useHostFeature } from "@/runtime/host-features";
 import {
   resolveAgentControlsProfileProviders,
   resolveAgentControlsSelectorProviders,
@@ -352,6 +368,13 @@ function pickModel({
 type AgentControlsSlice = {
   provider: string;
   cwd: string | null;
+  workspaceId: string | null;
+  status: string;
+  turnPhase: string;
+  hasConversationHistory: boolean;
+  pendingPermissionsCount: number;
+  isMainControl: boolean;
+  isRoleSeat: boolean;
   runtimeModelId: string | null;
   model: string | null | undefined;
   options: ProviderOptions | undefined;
@@ -375,6 +398,13 @@ function selectAgentControlsSlice(
   return {
     provider: currentAgent.provider,
     cwd: currentAgent.cwd,
+    workspaceId: currentAgent.workspaceId ?? null,
+    status: currentAgent.status,
+    turnPhase: currentAgent.turn.phase,
+    hasConversationHistory: currentAgent.lastUserMessageAt !== null,
+    pendingPermissionsCount: currentAgent.pendingPermissions.length,
+    isMainControl: isMainControlAgent(currentAgent),
+    isRoleSeat: isMainControlAgent(currentAgent) || isResidentAgent(currentAgent),
     runtimeModelId: currentAgent.runtimeInfo?.model ?? null,
     model: currentAgent.model,
     options: currentAgent.options,
@@ -384,6 +414,15 @@ function selectAgentControlsSlice(
     lastUsage: currentAgent.lastUsage,
     metadata: currentAgent.metadata,
   };
+}
+
+function findProviderSnapshotModel(
+  entry: ReturnType<typeof resolveProviderSnapshotEntry>,
+  modelId: string,
+) {
+  return (
+    entry?.models?.find((model) => model.id === modelId || model.aliases?.includes(modelId)) ?? null
+  );
 }
 
 function resolveSnapshotModeIds(
@@ -1071,6 +1110,20 @@ function useAgentOptionControls(
   );
 }
 
+function useAtomicBlankContextSwitch(serverId: string, supportsInPlaceSwitch: boolean) {
+  const supportsBlankContext = useHostFeature(serverId, "agentProviderSwitchBlankContext");
+  const permissions = useSessionStore(
+    (state) => state.sessions[serverId]?.client?.getLastServerInfoMessage?.()?.permissions,
+  );
+  const supportsFeature = supportsBlankContext && supportsInPlaceSwitch;
+  const hasPermissions = hasBlankContextSwitchPermissions(permissions);
+  return {
+    supportsFeature,
+    hasPermissions,
+    allowed: supportsFeature && hasPermissions,
+  };
+}
+
 export const AgentControls = memo(function AgentControls({
   showToolbar,
   agentId,
@@ -1078,7 +1131,28 @@ export const AgentControls = memo(function AgentControls({
   onDropdownClose,
   isCompactLayout,
 }: AgentControlsProps) {
-  const { updatePreferences } = useFormPreferences();
+  const { t } = useTranslation();
+  const { preferences, updatePreferences } = useFormPreferences();
+  const supportsTopic = useHostFeature(serverId, "topicWorkbenchV1");
+  const supportsTaskLedger = useHostFeature(serverId, "workspaceTaskLedger");
+  const [pendingProviderSwitch, setPendingProviderSwitch] = useState<{
+    plan: CrossProviderSwitchDisclosurePlan;
+    target: CrossProviderSwitchTarget;
+    expectedSeat: { serverId: string; agentId: string };
+  } | null>(null);
+  const [isConfirmingProviderSwitch, setIsConfirmingProviderSwitch] = useState(false);
+  const pendingProviderSwitchResolveRef = useRef<((switched: boolean) => void) | null>(null);
+  const openDisclosureSeqRef = useRef(0);
+  useEffect(() => {
+    openDisclosureSeqRef.current += 1;
+    setPendingProviderSwitch(null);
+    pendingProviderSwitchResolveRef.current?.(false);
+    pendingProviderSwitchResolveRef.current = null;
+    return () => {
+      pendingProviderSwitchResolveRef.current?.(false);
+      pendingProviderSwitchResolveRef.current = null;
+    };
+  }, [agentId, serverId]);
   const agent = useSessionStore(
     useShallow((state) => selectAgentControlsSlice(state, serverId, agentId)),
   );
@@ -1086,6 +1160,10 @@ export const AgentControls = memo(function AgentControls({
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
   const handoff = useCrossProviderAgentHandoff({ serverId, agentId });
   const { handoffToProvider } = handoff;
+  const blankContextGate = useAtomicBlankContextSwitch(
+    serverId,
+    handoff.supportsSeamlessContextSwitch,
+  );
   const toast = useToast();
   const modeControl = useLiveAgentModeControl(serverId, agentId);
   const commandCenterModes = toCommandCenterModes(modeControl);
@@ -1142,23 +1220,84 @@ export const AgentControls = memo(function AgentControls({
 
   const activeModelId = modelSelection.activeModelId;
 
+  const applySameProviderPostModelSwitch = useStableEvent(
+    async (input: {
+      activeClient: NonNullable<typeof client>;
+      targetModelLabel: string;
+      thinkingPrecheck: ReturnType<typeof precheckModelThinkingCompatibility>;
+      isSilentSeat: boolean;
+      isRunning: boolean;
+    }) => {
+      const { activeClient, targetModelLabel, thinkingPrecheck, isSilentSeat, isRunning } = input;
+      if (thinkingPrecheck.kind === "clear") {
+        const notice = await activeClient.setAgentThinkingOption(agentId, null);
+        showProviderNoticeToast(toast, notice);
+        toast.show(t("topicWorkbench.modelSwitch.thinkingCleared", { model: targetModelLabel }));
+        return;
+      }
+      if (thinkingPrecheck.kind === "adjust") {
+        const notice = await activeClient.setAgentThinkingOption(
+          agentId,
+          thinkingPrecheck.thinkingOptionId,
+        );
+        showProviderNoticeToast(toast, notice);
+        toast.show(
+          t("topicWorkbench.modelSwitch.thinkingAdjusted", {
+            model: targetModelLabel,
+            thinking: thinkingPrecheck.thinkingLabel,
+          }),
+        );
+        return;
+      }
+      if (isSilentSeat) {
+        toast.show(
+          t("topicWorkbench.modelSwitch.silentConfigUpdated", { model: targetModelLabel }),
+        );
+      } else if (isRunning) {
+        toast.show(t("topicWorkbench.modelSwitch.runningNextTurn", { model: targetModelLabel }));
+      }
+    },
+  );
+
   const handleSelectModel = useCallback(
     async (modelId: string) => {
-      const provider = selectAgentControlsSlice(
-        useSessionStore.getState(),
-        serverId,
-        agentId,
-      )?.provider;
+      const currentSlice = selectAgentControlsSlice(useSessionStore.getState(), serverId, agentId);
+      const provider = currentSlice?.provider;
       if (!client || !provider) {
         return;
       }
+      const targetModel =
+        models?.find((model) => model.id === modelId || model.aliases?.includes(modelId)) ?? null;
+      const targetModelLabel = targetModel?.label ?? modelId;
+      const thinkingPrecheck = precheckModelThinkingCompatibility({
+        targetModel,
+        currentThinkingOptionId:
+          currentSlice.runtimeThinkingOptionId ?? currentSlice.thinkingOptionId ?? null,
+        savedThinkingOptionId:
+          preferences.providerPreferences?.[provider]?.thinkingByModel?.[modelId] ?? null,
+      });
+      const isSilentSeat = currentSlice.status === "closed" && !currentSlice.hasConversationHistory;
+      const isRunning = isAgentTurnRunning(currentSlice.status, currentSlice.turnPhase);
+
       try {
         await client.setAgentModel(agentId, modelId);
+        await applySameProviderPostModelSwitch({
+          activeClient: client,
+          targetModelLabel,
+          thinkingPrecheck,
+          isSilentSeat,
+          isRunning,
+        });
         await updatePreferences((current) =>
           mergeProviderPreferences({
             preferences: current,
             provider,
-            updates: { model: modelId },
+            updates: {
+              model: modelId,
+              ...(thinkingPrecheck.kind === "adjust"
+                ? { thinkingByModel: { [modelId]: thinkingPrecheck.thinkingOptionId } }
+                : {}),
+            },
           }),
         );
       } catch (error) {
@@ -1166,35 +1305,279 @@ export const AgentControls = memo(function AgentControls({
         toast.error(toErrorMessage(error));
       }
     },
-    [agentId, client, serverId, toast, updatePreferences],
-  );
-  const handleSelectProviderAndModel = useStableEvent((nextProvider: string, modelId: string) => {
-    const currentProvider = selectAgentControlsSlice(
-      useSessionStore.getState(),
-      serverId,
+    [
       agentId,
-    )?.provider;
-    return routeAgentModelSelection({
-      currentProvider,
-      nextProvider,
-      modelId,
-      selectSameProviderModel: handleSelectModel,
-      handoffToProvider: handoff.canSwitchProvider ? handoffToProvider : undefined,
-      persistCrossProviderModelPreference: handoff.supportsSeamlessContextSwitch
-        ? undefined
-        : async (provider, selectedModel) => {
-            await updatePreferences((current) =>
-              mergeProviderPreferences({
-                preferences: current,
-                provider,
-                updates: { model: selectedModel || undefined },
-              }),
-            );
-          },
-    }).catch((error) => {
-      console.warn("[AgentControls] persist cross-provider model preference failed", error);
-    });
-  });
+      applySameProviderPostModelSwitch,
+      client,
+      models,
+      preferences.providerPreferences,
+      serverId,
+      toast,
+      updatePreferences,
+    ],
+  );
+  const settlePendingProviderSwitch = useCallback((switched: boolean) => {
+    const resolve = pendingProviderSwitchResolveRef.current;
+    pendingProviderSwitchResolveRef.current = null;
+    resolve?.(switched);
+  }, []);
+
+  const executeModelCarrySummarySwitch = useStableEvent(
+    async (targetProvider: AgentProvider, modelId: string) => {
+      const currentProvider = selectAgentControlsSlice(
+        useSessionStore.getState(),
+        serverId,
+        agentId,
+      )?.provider;
+      await routeAgentModelSelection({
+        currentProvider,
+        nextProvider: targetProvider,
+        modelId,
+        selectSameProviderModel: handleSelectModel,
+        handoffToProvider: handoff.canSwitchProvider ? handoffToProvider : undefined,
+        persistCrossProviderModelPreference: handoff.supportsSeamlessContextSwitch
+          ? undefined
+          : async (provider, selectedModel) => {
+              await updatePreferences((current) =>
+                mergeProviderPreferences({
+                  preferences: current,
+                  provider,
+                  updates: { model: selectedModel || undefined },
+                }),
+              );
+            },
+      });
+    },
+  );
+  const readLiveSwitchSnapshot = useStableEvent(
+    (targetServerId: string, targetAgentId: string): LiveAgentSwitchSnapshot | null => {
+      const liveState = useSessionStore.getState();
+      const session = liveState.sessions[targetServerId];
+      const liveAgent =
+        session?.agents?.get(targetAgentId) ?? session?.agentDetails?.get(targetAgentId);
+      const liveSlice = selectAgentControlsSlice(liveState, targetServerId, targetAgentId);
+      if (!liveAgent || !liveSlice || liveAgent.archivedAt) {
+        return null;
+      }
+      return {
+        serverId: targetServerId,
+        agentId: liveAgent.id,
+        provider: liveSlice.provider,
+        workspaceId: liveSlice.workspaceId,
+        isMainControl: liveSlice.isMainControl,
+        isRoleSeat: liveSlice.isRoleSeat,
+        status: liveSlice.status,
+        turnPhase: liveSlice.turnPhase,
+        hasConversationHistory: liveSlice.hasConversationHistory,
+        pendingPermissionsCount: liveSlice.pendingPermissionsCount,
+        currentThinkingOptionId:
+          liveSlice.runtimeThinkingOptionId ?? liveSlice.thinkingOptionId ?? null,
+        livePermissions: session?.client?.getLastServerInfoMessage?.()?.permissions,
+      };
+    },
+  );
+  const readLiveTopicMetadata = useStableEvent(
+    (
+      snapshot: Pick<LiveAgentSwitchSnapshot, "serverId" | "isMainControl" | "workspaceId">,
+    ): Promise<TopicMetadataDisclosureState> =>
+      readLiveTopicMetadataDisclosure({
+        client: useSessionStore.getState().sessions[snapshot.serverId]?.client ?? null,
+        workspaceId: snapshot.workspaceId,
+        isMainControl: snapshot.isMainControl,
+        supportsTopic,
+      }),
+  );
+  const createProviderSwitchPlan = useStableEvent(
+    (input: {
+      snapshot: LiveAgentSwitchSnapshot;
+      target: CrossProviderSwitchTarget;
+      topicMetadataState: TopicMetadataDisclosureState;
+    }) => {
+      const { snapshot, target, topicMetadataState } = input;
+      const sourceEntry = resolveProviderSnapshotEntry(snapshotEntries, snapshot.provider);
+      const targetEntry = resolveProviderSnapshotEntry(snapshotEntries, target.targetProvider);
+      const targetModelId = target.modelId ?? "";
+      const targetModel = targetModelId
+        ? findProviderSnapshotModel(targetEntry, targetModelId)
+        : null;
+      const savedThinkingOptionId = targetModelId
+        ? (preferences.providerPreferences?.[target.targetProvider]?.thinkingByModel?.[
+            targetModelId
+          ] ?? null)
+        : null;
+      const supportsAtomicBlankContextSwitch =
+        blankContextGate.supportsFeature &&
+        hasBlankContextSwitchPermissions(snapshot.livePermissions);
+      return buildCrossProviderSwitchDisclosurePlan({
+        sourceProvider: snapshot.provider,
+        sourceProviderLabel: sourceEntry?.provider ?? snapshot.provider,
+        targetProvider: target.targetProvider,
+        targetProviderLabel: targetEntry?.provider ?? target.targetProvider,
+        targetModelId,
+        targetModelLabel: targetModel?.label ?? targetModelId,
+        targetModel,
+        currentThinkingOptionId: snapshot.currentThinkingOptionId,
+        savedThinkingOptionId,
+        skipThinkingPrecheck: target.kind === "profile",
+        agentStatus: snapshot.status,
+        turnPhase: snapshot.turnPhase,
+        hasConversationHistory: snapshot.hasConversationHistory,
+        // Real server prompt assembly (`withWorkspaceTopicPrompt` / `workspaceTaskLedgerPrompt`)
+        // attaches topic metadata and workspace task ledger only to the Main Control seat.
+        topicMetadataState,
+        hasWorkspaceTaskLedger: Boolean(
+          snapshot.isMainControl && supportsTaskLedger && snapshot.workspaceId,
+        ),
+        hasRolePrompt: snapshot.isRoleSeat,
+        pendingPermissionsCount: snapshot.pendingPermissionsCount,
+        supportsAtomicBlankContextSwitch,
+      });
+    },
+  );
+  const openCrossProviderDisclosure = useStableEvent(
+    async (target: CrossProviderSwitchTarget): Promise<boolean> => {
+      const beforeSnapshot = readLiveSwitchSnapshot(serverId, agentId);
+      if (!beforeSnapshot || !handoff.canSwitchProvider) return false;
+      const normalizedTargetProvider = target.targetProvider.trim();
+      if (!normalizedTargetProvider || normalizedTargetProvider === beforeSnapshot.provider) {
+        return false;
+      }
+      const requestSeq = openDisclosureSeqRef.current + 1;
+      openDisclosureSeqRef.current = requestSeq;
+      let topicMetadataState = await readLiveTopicMetadata(beforeSnapshot);
+      if (openDisclosureSeqRef.current !== requestSeq) return false;
+      let postSnapshot = readLiveSwitchSnapshot(serverId, agentId);
+      if (!postSnapshot || postSnapshot.provider === normalizedTargetProvider) return false;
+      if (
+        postSnapshot.workspaceId !== beforeSnapshot.workspaceId ||
+        postSnapshot.isMainControl !== beforeSnapshot.isMainControl
+      ) {
+        topicMetadataState = await readLiveTopicMetadata(postSnapshot);
+        if (openDisclosureSeqRef.current !== requestSeq) return false;
+        postSnapshot = readLiveSwitchSnapshot(serverId, agentId);
+        if (!postSnapshot || postSnapshot.provider === normalizedTargetProvider) return false;
+      }
+      const normalizedTarget: CrossProviderSwitchTarget = {
+        ...target,
+        targetProvider: normalizedTargetProvider,
+      };
+      const plan = createProviderSwitchPlan({
+        snapshot: postSnapshot,
+        target: normalizedTarget,
+        topicMetadataState,
+      });
+      if (plan.isSilentSeat && !blankContextGate.supportsFeature) {
+        toast.error(t("topicWorkbench.modelSwitch.blankContextUpdateHost"));
+        return false;
+      }
+      if (plan.isSilentSeat && !hasBlankContextSwitchPermissions(postSnapshot.livePermissions)) {
+        toast.error(t("providerSelection.unavailable"));
+        return false;
+      }
+      settlePendingProviderSwitch(false);
+      return new Promise<boolean>((resolve) => {
+        pendingProviderSwitchResolveRef.current = resolve;
+        setPendingProviderSwitch({
+          plan,
+          target: normalizedTarget,
+          expectedSeat: { serverId, agentId },
+        });
+      });
+    },
+  );
+  const handleSelectProviderAndModel = useStableEvent(
+    async (nextProvider: string, modelId: string) => {
+      const currentSlice = selectAgentControlsSlice(useSessionStore.getState(), serverId, agentId);
+      const currentProvider = currentSlice?.provider;
+      if (!currentProvider || !currentSlice) return;
+      const normalizedTargetProvider = nextProvider.trim() || currentProvider;
+      if (normalizedTargetProvider === currentProvider) {
+        await handleSelectModel(modelId);
+        return;
+      }
+      await openCrossProviderDisclosure({
+        kind: "model",
+        targetProvider: normalizedTargetProvider,
+        modelId,
+      });
+    },
+  );
+  const handleCancelProviderSwitch = useCallback(() => {
+    if (!isConfirmingProviderSwitch) {
+      setPendingProviderSwitch(null);
+      settlePendingProviderSwitch(false);
+    }
+  }, [isConfirmingProviderSwitch, settlePendingProviderSwitch]);
+  const runConfirmProviderSwitch = useStableEvent(
+    async (
+      pending: {
+        plan: CrossProviderSwitchDisclosurePlan;
+        target: CrossProviderSwitchTarget;
+        expectedSeat: { serverId: string; agentId: string };
+      },
+      contextMode: CrossProviderContextMode,
+    ) => {
+      setIsConfirmingProviderSwitch(true);
+      try {
+        const result = await confirmCrossProviderSwitchFlow({
+          plan: pending.plan,
+          target: pending.target,
+          contextMode,
+          expectedSeat: pending.expectedSeat,
+          canSwitchProvider: handoff.canSwitchProvider,
+          supportsBlankFeature: blankContextGate.supportsFeature,
+          readLiveSnapshot: () =>
+            readLiveSwitchSnapshot(pending.expectedSeat.serverId, pending.expectedSeat.agentId),
+          readLiveTopicMetadata,
+          rebuildPlan: (snapshot, topicMetadataState) =>
+            createProviderSwitchPlan({
+              snapshot,
+              target: pending.target,
+              topicMetadataState,
+            }),
+          handoffToProvider,
+          executeModelCarrySummary: executeModelCarrySummarySwitch,
+        });
+        if (result.status === "disclosure-changed") {
+          setPendingProviderSwitch((current) =>
+            current ? { ...current, plan: result.updatedPlan } : null,
+          );
+          return;
+        }
+        if (result.status === "cancelled") {
+          setPendingProviderSwitch(null);
+          settlePendingProviderSwitch(false);
+          return;
+        }
+        if (result.status === "blocked") {
+          toast.error(
+            result.reason === "update-host"
+              ? t("topicWorkbench.modelSwitch.blankContextUpdateHost")
+              : t("providerSelection.unavailable"),
+          );
+          setPendingProviderSwitch(null);
+          settlePendingProviderSwitch(false);
+          return;
+        }
+        setPendingProviderSwitch(null);
+        settlePendingProviderSwitch(result.switched);
+      } catch (error) {
+        console.warn("[AgentControls] cross-provider switch failed", error);
+        toast.error(toErrorMessage(error));
+        setPendingProviderSwitch(null);
+        settlePendingProviderSwitch(false);
+      } finally {
+        setIsConfirmingProviderSwitch(false);
+      }
+    },
+  );
+  const handleConfirmProviderSwitch = useCallback(
+    (contextMode: CrossProviderContextMode) => {
+      if (!pendingProviderSwitch || isConfirmingProviderSwitch) return;
+      void runConfirmProviderSwitch(pendingProviderSwitch, contextMode);
+    },
+    [isConfirmingProviderSwitch, pendingProviderSwitch, runConfirmProviderSwitch],
+  );
 
   const profileProviders = useMemo(
     () =>
@@ -1211,15 +1594,15 @@ export const AgentControls = memo(function AgentControls({
   );
   const handleSwitchProviderProfile = useCallback(
     (profile: MaterializedAgentProfile) =>
-      handoffToProvider({
-        provider: profile.provider,
+      openCrossProviderDisclosure({
+        kind: "profile",
+        targetProvider: profile.provider,
         modelId: profile.modelId || null,
         modeId: profile.modeId || null,
         thinkingOptionId: profile.thinkingOptionId || null,
         providerOptions: profile.options,
-        kind: "profile",
       }),
-    [handoffToProvider],
+    [openCrossProviderDisclosure],
   );
   const profileTarget = useMemo<AgentProfileApplyTarget>(
     () => ({
@@ -1390,9 +1773,18 @@ export const AgentControls = memo(function AgentControls({
     return null;
   }
 
+  const isLiveAgentRunning = isAgentTurnRunning(agent.status, agent.turnPhase);
+
   return (
     <ComposerModelProvider value={composer}>
       {commandCenterRegistration}
+      <ProviderSwitchDisclosureModal
+        plan={pendingProviderSwitch?.plan ?? null}
+        isRunning={isLiveAgentRunning}
+        pending={isConfirmingProviderSwitch}
+        onCancel={handleCancelProviderSwitch}
+        onConfirm={handleConfirmProviderSwitch}
+      />
       {showToolbar ? (
         <>
           {profileEditor.element}

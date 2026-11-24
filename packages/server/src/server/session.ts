@@ -159,6 +159,7 @@ import {
 
 import {
   AgentCommandNotDispatchedError,
+  AgentIdleArchiveError,
   AgentManager,
   AgentManagerShuttingDownError,
   AgentRunCancellationError,
@@ -172,6 +173,7 @@ import type {
   AgentTimelineFetchDirection,
   AgentTimelineFetchResult,
   ManagedAgent,
+  ReadPublishedSeatCatalog,
 } from "./agent/agent-manager.js";
 import {
   createAgentCommand,
@@ -189,7 +191,6 @@ import {
   cancelAgentRunCommand,
   closeAgentCommand,
   moveAgentToWorkspaceCommand,
-  setAgentModeCommand,
   updateAgentCommand,
 } from "./agent/lifecycle-command.js";
 import { buildStoredAgentPayload, toAgentPayload } from "./agent/agent-projections.js";
@@ -228,6 +229,8 @@ import {
 } from "./agent/import-sessions.js";
 import { WorkspaceTaskLedgerStore } from "./agent/task-ledger/index.js";
 import { listWorkspaceTaskSummaries } from "./task-ledger-rpc.js";
+import { handleDurableItemRequest } from "./durable-items/requests.js";
+import type { DurableItemStore } from "./durable-items/store.js";
 import { listProjectSuggestions, ProjectSuggestionsRequestError } from "./project-suggestions.js";
 import {
   checkoutLiteFromGitSnapshot,
@@ -852,6 +855,7 @@ export interface SessionOptions {
   creationService: Pick<CreationService, "create" | "subscribe">;
   projectRegistry: ProjectRegistry;
   workspaceRegistry: WorkspaceRegistry;
+  durableItems?: DurableItemStore;
   workspaceBaseBranch?: WorkspaceBaseBranchService;
   directorySync?: DirectorySyncService;
   workspaceLabelService?: WorkspaceLabelService;
@@ -1197,6 +1201,8 @@ export class Session {
   private readonly projectRegistry: ProjectRegistry;
   private readonly workspaceRegistry: WorkspaceRegistry;
   private readonly taskLedger: WorkspaceTaskLedgerStore;
+  private readonly durableItems: DurableItemStore | undefined;
+  private readonly durableItemPrincipalId: string;
   private readonly agentDirectory: AgentDirectory;
   private readonly directorySync: DirectorySyncService;
   private readonly filesystem: SessionFileSystem;
@@ -1273,6 +1279,7 @@ export class Session {
   private readonly speechModelsSession: SpeechModelsSession;
   private readonly workspaceFilesSession: WorkspaceFilesSession;
   private readonly agentConfigSession: AgentConfigSession;
+  private readonly readPublishedSeatCatalog: ReadPublishedSeatCatalog;
   private readonly projectConfigSession: ProjectConfigSession;
   private readonly daemonSession: DaemonSession;
   private readonly hubExecutionController: HubExecutionController | null;
@@ -1355,6 +1362,8 @@ export class Session {
     this.clientCapabilities = parseClientCapabilities(clientCapabilities);
     this.sessionId = uuidv4();
     this.hostSourceId = hostSource(options);
+    this.durableItemPrincipalId = this.hostSourceId;
+    this.durableItems = options.durableItems;
     this.connectedHostSession = createHostSession(options, this);
     this.connectedHosts = options.connectedHosts;
     this.onMessage = onMessage;
@@ -1560,24 +1569,38 @@ export class Session {
       emit: (msg) => this.emit(msg),
       runtime: speechModels,
     });
+    const readSeatCatalog: ReadPublishedSeatCatalog = (provider, cwd) => {
+      const entry = providerSnapshotManager
+        .peekSnapshot(cwd)
+        ?.records.find((record) => record.entry.provider === provider)?.entry;
+      if (!entry?.enabled || entry.status !== "ready") return undefined;
+      return { models: entry.models ?? [], modes: entry.modes ?? [] };
+    };
+    this.readPublishedSeatCatalog = readSeatCatalog;
     this.agentConfigSession = new AgentConfigSession({
       host: {
         emit: (msg) => this.emit(msg),
       },
       operations: {
         ensureLoaded: async (agentId) => {
+          if (!agentManager.getAgent(agentId)) {
+            const stored = await agentStorage.get(agentId);
+            if (stored && !stored.archivedAt && (await agentManager.isSilentTopicSeat(stored))) {
+              return;
+            }
+          }
           await ensureUnarchivedAgentLoaded(agentId, {
             agentManager,
             agentStorage,
             logger: this.sessionLogger,
           });
         },
-        setMode: async (agentId, modeId) =>
-          (await setAgentModeCommand({ agentManager }, { agentId, modeId })).notice,
-        setModel: (agentId, modelId) => agentManager.setAgentModel(agentId, modelId),
+        setMode: (agentId, modeId) => agentManager.setAgentMode(agentId, modeId, readSeatCatalog),
+        setModel: (agentId, modelId) =>
+          agentManager.setAgentModel(agentId, modelId, readSeatCatalog),
         setOptions: (agentId, patch) => agentManager.setAgentOptions(agentId, patch),
         setThinking: (agentId, thinkingOptionId) =>
-          agentManager.setAgentThinkingOption(agentId, thinkingOptionId),
+          agentManager.setAgentThinkingOption(agentId, thinkingOptionId, readSeatCatalog),
       },
       logger: this.sessionLogger,
     });
@@ -3188,7 +3211,7 @@ export class Session {
       this.dispatchAgentLifecycleMessage(msg) ??
       this.dispatchAgentConfigMessage(msg, source) ??
       this.dispatchCheckoutMessage(msg) ??
-      this.dispatchWorkspaceLifecycleMessage(msg) ??
+      this.dispatchWorkspaceLifecycleMessage(msg, source) ??
       this.dispatchWorkspaceFileMessage(msg, source) ??
       this.dispatchProviderMessage(msg) ??
       this.dispatchOrchestrationSkillsMessage(msg) ??
@@ -3219,7 +3242,22 @@ export class Session {
     );
   }
 
-  private dispatchWorkspaceLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+  private dispatchWorkspaceLifecycleMessage(
+    msg: SessionInboundMessage,
+    source?: object,
+  ): Promise<void> | undefined {
+    if (
+      msg.type === "workspace.durable_item.list.request" ||
+      msg.type === "workspace.durable_item.decide.request"
+    ) {
+      if (!this.durableItems || !this.serverId) throw new Error("Durable items are unavailable.");
+      return handleDurableItemRequest(msg, {
+        store: this.durableItems,
+        serverId: this.serverId,
+        principalId: this.durableItemPrincipalId,
+        logger: this.sessionLogger,
+      }).then((response) => this.emitForSource(response, source));
+    }
     if (msg.type === "workspace.tasks.list.request") {
       return listWorkspaceTaskSummaries(msg, {
         workspaceRegistry: this.workspaceRegistry,
@@ -3808,12 +3846,7 @@ export class Session {
       case "delete_agent_request":
         return this.handleDeleteAgentRequest(msg.agentId, msg.requestId, msg.onlyIfEmptySideChat);
       case "archive_agent_request":
-        return this.handleArchiveAgentRequest(
-          msg.agentId,
-          msg.requestId,
-          msg.expectedWorkspaceId,
-          msg.explicitSideChatArchive,
-        );
+        return this.handleArchiveAgentRequest(msg);
       case "close_items_request":
         return this.handleCloseItemsRequest(msg);
       case "update_agent_request":
@@ -3865,7 +3898,7 @@ export class Session {
       case "set_agent_thinking_request":
         return this.agentConfigSession.handleSetAgentThinkingRequest(msg);
       case "agent.config.apply.request":
-        return this.agentConfigSession.handleAgentConfigApplyRequest(msg);
+        return this.handleAgentConfigApplyRequest(msg);
       case "agent.provider.switch.request":
         return this.handleAgentProviderSwitchRequest(msg, source);
       case "get_daemon_config_request":
@@ -4489,24 +4522,42 @@ export class Session {
     });
   }
 
-  private async handleArchiveAgentRequest(
-    agentId: string,
-    requestId: string,
-    expectedWorkspaceId?: string,
-    explicitSideChatArchive?: true,
-  ): Promise<void> {
+  private async handleArchiveAgentRequest({
+    agentId,
+    requestId,
+    expectedWorkspaceId,
+    explicitSideChatArchive,
+    onlyIfIdle,
+  }: Extract<SessionInboundMessage, { type: "archive_agent_request" }>): Promise<void> {
     this.sessionLogger.info({ agentId }, `Archiving agent ${agentId}`);
 
-    const { archivedAt } = await this.archiveAgentForClose(
-      agentId,
-      expectedWorkspaceId,
-      explicitSideChatArchive,
-    ).catch((error) => {
-      if (error instanceof TopicMainArchiveError) {
-        throw new SessionRequestError("TOPIC_MAIN_ARCHIVE_PROTECTED", error.message);
+    let archivedAt: string;
+    if (onlyIfIdle) {
+      if (!expectedWorkspaceId) {
+        throw new SessionRequestError("invalid_request", "Idle archive requires a workspace ID.");
       }
-      throw error;
-    });
+      const result = await this.agentManager
+        .archiveIdleTaskAgentInWorkspace(agentId, expectedWorkspaceId)
+        .catch((error) => {
+          if (error instanceof AgentIdleArchiveError) {
+            throw new SessionRequestError("agent_not_idle", error.message);
+          }
+          throw error;
+        });
+      archivedAt = result.archivedAt;
+      await this.publishCloseArchive(result.record);
+    } else {
+      ({ archivedAt } = await this.archiveAgentForClose(
+        agentId,
+        expectedWorkspaceId,
+        explicitSideChatArchive,
+      ).catch((error) => {
+        if (error instanceof TopicMainArchiveError) {
+          throw new SessionRequestError("TOPIC_MAIN_ARCHIVE_PROTECTED", error.message);
+        }
+        throw error;
+      }));
+    }
 
     this.emit({
       type: "agent_archived",
@@ -4555,7 +4606,9 @@ export class Session {
 
   private async requireResidentOperationWorkspace(agentId: string) {
     if (readDirectParentRoute(this.getHostSourceId())) {
-      throw new Error("A direct-parent route cannot manage resident agents or reset sessions.");
+      throw new Error(
+        "A direct-parent route cannot manage resident agents, reset sessions, or switch providers with blank context.",
+      );
     }
     const stored = await this.agentStorage.get(agentId);
     const agent = this.agentManager.getAgent(agentId) ?? stored;
@@ -7445,7 +7498,7 @@ export class Session {
     try {
       const existing = this.agentManager.getAgent(agentId);
       const stored = existing ? null : await this.agentStorage.get(agentId);
-      if (stored && (await this.agentManager.isSilentTopicMain(stored))) {
+      if (stored && (await this.agentManager.isSilentTopicSeat(stored))) {
         this.emit({
           type: "list_commands_response",
           payload: { agentId, commands: [], error: null, requestId },
@@ -11392,13 +11445,76 @@ export class Session {
     }
   }
 
+  private async handleAgentConfigApplyRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.config.apply.request" }>,
+  ): Promise<void> {
+    const { agentId, config, requestId } = msg;
+    try {
+      if (
+        !(await this.agentManager.tryApplySilentSeatConfig(
+          agentId,
+          config,
+          this.readPublishedSeatCatalog,
+        ))
+      ) {
+        return this.agentConfigSession.handleAgentConfigApplyRequest(msg);
+      }
+      this.emit({
+        type: "agent.config.apply.response",
+        payload: { agentId, requestId, accepted: true, error: null, notice: null },
+      });
+    } catch (error) {
+      const message = getErrorMessageOr(error, "Failed to apply agent config");
+      this.sessionLogger.error({ err: error, agentId, requestId }, "Failed to apply agent config");
+      this.emit({
+        type: "activity_log",
+        payload: {
+          id: uuidv4(),
+          timestamp: new Date(),
+          type: "error",
+          content: `Failed to apply agent config: ${message}`,
+        },
+      });
+      this.emit({
+        type: "agent.config.apply.response",
+        payload: { agentId, requestId, accepted: false, error: message },
+      });
+    }
+  }
+
   private async handleAgentProviderSwitchRequest(
     msg: Extract<SessionInboundMessage, { type: "agent.provider.switch.request" }>,
     source?: object,
   ): Promise<void> {
     const { requestId, agentId } = msg;
+    if (
+      msg.context === "blank" &&
+      (!this.authorization.allowsPermission("workspace.write") ||
+        !this.authorization.allowsPermission("hub.execute"))
+    ) {
+      this.emitForSource(
+        {
+          type: "rpc_error",
+          payload: {
+            requestId,
+            requestType: msg.type,
+            error:
+              "Switching providers with blank context requires workspace.write and hub.execute.",
+            code: "access_denied",
+          },
+        },
+        source,
+      );
+      return;
+    }
     try {
-      const { agent, notice } = await this.agentManager.switchAgentProvider(agentId, msg);
+      if (msg.onlyIfSilent && msg.context !== "blank") {
+        throw new Error("A silent-only provider switch requires blank context.");
+      }
+      const workspace =
+        msg.context === "blank" ? await this.requireResidentOperationWorkspace(agentId) : null;
+      const input = workspace ? { ...msg, expectedWorkspaceId: workspace.workspaceId } : msg;
+      const { agent, notice } = await this.agentManager.switchAgentProvider(agentId, input);
       const payload = await this.buildAgentPayload(agent);
       await this.agentUpdates.forwardLiveAgent(agent);
       this.emitForSource(

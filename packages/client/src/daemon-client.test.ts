@@ -190,6 +190,56 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
+test.each([undefined, true])(
+  "idle archive uses the wire guard only on a supported host (%s)",
+  async (supported) => {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "idle-archive",
+      transportFactory: () => mock.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connecting = client.connect();
+    mock.triggerOpen({ features: { agentIdleArchiveV1: supported } });
+    await connecting;
+
+    const before = mock.sent.length;
+    await expect(client.archiveAgent("agent-1", undefined, { onlyIfIdle: true })).rejects.toThrow(
+      "Idle archive requires a workspace ID.",
+    );
+    expect(mock.sent).toHaveLength(before);
+
+    if (!supported) {
+      await expect(
+        client.archiveAgent("agent-1", "workspace-1", { onlyIfIdle: true }),
+      ).rejects.toThrow("Update the host");
+      expect(mock.sent).toHaveLength(before);
+    }
+
+    const result = supported
+      ? client.archiveAgent("agent-1", "workspace-1", { onlyIfIdle: true })
+      : client.archiveAgent("agent-1", "workspace-1");
+    const request = parseSentFrame(mock.sent.at(-1));
+    expect(request).toEqual({
+      type: "archive_agent_request",
+      agentId: "agent-1",
+      expectedWorkspaceId: "workspace-1",
+      requestId: expect.any(String),
+      ...(supported ? { onlyIfIdle: true } : {}),
+    });
+    const archivedAt = "2026-11-24T00:00:00Z";
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "agent_archived",
+        payload: { requestId: request.requestId, agentId: "agent-1", archivedAt },
+      }),
+    );
+    await expect(result).resolves.toEqual({ archivedAt });
+  },
+);
+
 test("durable item decisions correlate by RPC ID while preserving the item ID", async () => {
   const mock = createMockTransport();
   const client = new DaemonClient({
@@ -11342,16 +11392,29 @@ describe("provider options across daemon versions", () => {
     await expect(creating).resolves.toMatchObject({ workspace, agent });
   });
 
-  test.each([undefined, { type: "warning", message: "Model adjusted" }])(
-    "switches provider using the matching response and returns its snapshot and notice (%j)",
-    async (notice) => {
-      const { client, mock, sentMessages } = await connect({ agentSeamlessContextSwitch: true });
+  test.each([
+    { context: undefined, notice: undefined, onlyIfSilent: undefined },
+    {
+      context: "blank",
+      notice: { type: "warning", message: "Model adjusted" },
+      onlyIfSilent: undefined,
+    },
+    { context: "blank", notice: undefined, onlyIfSilent: true },
+  ] as const)(
+    "matches the provider-switch response (context=$context, silent-only=$onlyIfSilent)",
+    async ({ context, notice, onlyIfSilent }) => {
+      const { client, mock, sentMessages } = await connect({
+        agentSeamlessContextSwitch: true,
+        ...(context && { agentProviderSwitchBlankContext: true }),
+      });
       const input = {
         provider: "claude",
         model: null,
         modeId: "plan",
         thinkingOptionId: null,
         options: { speed: 1 },
+        ...(context && { context }),
+        ...(onlyIfSilent && { onlyIfSilent }),
       } as const;
       const switching = client.switchAgentProvider("agent-1", input);
       const [request] = sentMessages();
@@ -11392,6 +11455,29 @@ describe("provider options across daemon versions", () => {
         },
         notice: notice ?? null,
       });
+    },
+  );
+
+  test.each([undefined, false])(
+    "rejects a blank provider switch before sending when host support is %s",
+    async (agentProviderSwitchBlankContext) => {
+      const { client, sentMessages } = await connect({
+        agentSeamlessContextSwitch: true,
+        ...(agentProviderSwitchBlankContext === undefined
+          ? {}
+          : { agentProviderSwitchBlankContext }),
+      });
+      const before = sentMessages().length;
+      await expect(
+        client.switchAgentProvider("agent-1", {
+          provider: "claude",
+          context: "blank",
+          onlyIfSilent: true,
+        }),
+      ).rejects.toThrow(
+        "Update the host to switch providers without handing off conversation context.",
+      );
+      expect(sentMessages()).toHaveLength(before);
     },
   );
 

@@ -143,6 +143,51 @@ async function runTestCatalogActivities(
 }
 
 describe("ProviderSnapshotManager public surface", () => {
+  test("peeks at published snapshots without starting discovery or registering cold targets", async () => {
+    const cwd = "/tmp/paseo-published-catalog";
+    const coldCwd = "/tmp/paseo-cold-catalog";
+    const getCatalogCacheKey = vi.fn(async () => undefined);
+    const isAvailable = vi.fn(async () => true);
+    const model = { provider: "codex", id: "test-model", label: "Test model" };
+    const fetchCatalog = vi.fn(async () => ({ models: [model], modes: [] }));
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      extraClients: {
+        codex: createExtraClient("codex", { getCatalogCacheKey, isAvailable, fetchCatalog }),
+      },
+    });
+    try {
+      expect(manager.peekSnapshot(coldCwd)).toBeUndefined();
+      expect(manager.peekSnapshot()).toBeUndefined();
+      expect(getCatalogCacheKey).not.toHaveBeenCalled();
+      expect(isAvailable).not.toHaveBeenCalled();
+      expect(fetchCatalog).not.toHaveBeenCalled();
+
+      // A global refresh also revisits registered targets, so it would discover a cold target
+      // if peekSnapshot had registered it.
+      await manager.refreshSettingsSnapshot({ providers: ["codex"] });
+      expect(fetchCatalog).toHaveBeenCalledTimes(1);
+      expect(manager.peekSnapshot(coldCwd)).toBeUndefined();
+
+      await manager.refreshSnapshotForCwd({ cwd, providers: ["codex"] });
+      const beforePeek = getCatalogCacheKey.mock.calls.length;
+      expect(manager.peekSnapshot(`${cwd}/.`)).toMatchObject({
+        cwd: resolveSnapshotCwd(cwd),
+        records: expect.arrayContaining([
+          expect.objectContaining({
+            entry: expect.objectContaining({ status: "ready", models: [model] }),
+          }),
+        ]),
+      });
+      expect(manager.peekSnapshot()).toMatchObject({ cwd: GLOBAL_PROVIDER_SNAPSHOT_KEY });
+      expect(getCatalogCacheKey).toHaveBeenCalledTimes(beforePeek);
+      expect(isAvailable).toHaveBeenCalledTimes(2);
+      expect(fetchCatalog).toHaveBeenCalledTimes(2);
+    } finally {
+      manager.destroy();
+    }
+  });
+
   test("publishes one model per provider identity and retains the first definition", async () => {
     const first = { provider: "codex", id: "shared", label: "First", isDefault: true };
     const manager = new ProviderSnapshotManager({

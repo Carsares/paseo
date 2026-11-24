@@ -1096,6 +1096,7 @@ export const ArchiveAgentRequestMessageSchema = z.object({
   agentId: z.string(),
   explicitSideChatArchive: z.literal(true).optional(),
   expectedWorkspaceId: z.string().optional(),
+  onlyIfIdle: z.literal(true).optional(),
   requestId: z.string(),
 });
 
@@ -2453,6 +2454,9 @@ export const AgentProviderSwitchRequestMessageSchema = z.object({
   modeId: z.string().nullable().optional(),
   thinkingOptionId: z.string().nullable().optional(),
   options: ProviderOptionsSchema.optional(),
+  // Omitted switches keep the existing context handoff.
+  context: z.literal("blank").optional(),
+  onlyIfSilent: z.literal(true).optional(),
   requestId: z.string(),
 });
 export type AgentProviderSwitchRequestMessage = z.infer<
@@ -5142,6 +5146,10 @@ export const ServerInfoStatusPayloadSchema = z
         agentForkContextCursor: z.boolean().optional(),
         // COMPAT(agentSeamlessContextSwitch): added in v0.16.0, remove gate after 2027-05-21.
         agentSeamlessContextSwitch: z.boolean().optional(),
+        // COMPAT(agentProviderSwitchBlankContext): added in v0.18.0, remove gate after 2027-06-01.
+        agentProviderSwitchBlankContext: z.boolean().optional(),
+        // COMPAT(agentIdleArchiveV1): added in v0.18.0, remove gate after 2027-06-01.
+        agentIdleArchiveV1: z.boolean().optional(),
         agentSideChat: z.boolean().optional(),
         // COMPAT(agentResidentSpecialists): added in v0.18.0, remove gate after 2027-06-01.
         agentResidentSpecialists: z.boolean().optional(),

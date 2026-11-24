@@ -1,5 +1,5 @@
 import { useFetchQuery } from "@/data/query";
-import { useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ScrollView, Text, View, type LayoutChangeEvent } from "react-native";
 import { GitFork } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
@@ -21,6 +21,7 @@ import { usePaneContext } from "@/panels/pane-context";
 import { definePanel } from "@/panels/panel-registry";
 import { useHostFeature } from "@/runtime/host-features";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
+import { useGitGraphConflictIntent } from "@/screens/workspace/topic-header/git-graph-intent";
 import { useWorkspaceDirectory } from "@/stores/session-store-hooks";
 import { confirmDialog } from "@/utils/confirm-dialog";
 import { openDesktopTarget, useDesktopOpenTargets } from "@/workspace/desktop-open-targets";
@@ -96,7 +97,7 @@ function GraphWorkbench({
   connected: boolean;
   rebase: boolean;
 }) {
-  const { serverId } = usePaneContext();
+  const { serverId, tabId } = usePaneContext();
   const active = useRetainedPanelActive();
   const compact = useIsCompactFormFactor();
   const enabled = active && connected;
@@ -183,6 +184,18 @@ function GraphWorkbench({
     if (next > 0) setWidth(next);
   });
   const choose = useStableEvent(chooseRepo);
+  useConflictNavigationIntent({
+    tabId,
+    active,
+    enabled,
+    rebase,
+    revision,
+    discover,
+    repos,
+    refresh,
+    chooseRepo: choose,
+    openSurface,
+  });
   const touchStart = useStableEvent(() => setScrollingFilters(true));
   const touchEnd = useStableEvent(() => setScrollingFilters(false));
   const closeFile = useStableEvent(() => setFile(null));
@@ -308,6 +321,79 @@ function GraphWorkbench({
 
 function freshRead(query: { isSuccess: boolean; isFetching: boolean; isPlaceholderData: boolean }) {
   return query.isSuccess && !query.isFetching && !query.isPlaceholderData;
+}
+
+function useConflictNavigationIntent({
+  tabId,
+  active,
+  enabled,
+  rebase,
+  revision,
+  discover,
+  repos,
+  refresh,
+  chooseRepo,
+  openSurface,
+}: {
+  tabId: string;
+  active: boolean;
+  enabled: boolean;
+  rebase: boolean;
+  revision: number;
+  discover: {
+    isSuccess: boolean;
+    isFetching: boolean;
+    isPlaceholderData: boolean;
+    isError: boolean;
+  };
+  repos: readonly CheckoutGitRepo[];
+  refresh: () => void;
+  chooseRepo: (repoRoot: string | null) => void;
+  openSurface: (repo: CheckoutGitRepo, kind: RebaseSurfaceState["kind"]) => void;
+}) {
+  const { intent, consumeIntent } = useGitGraphConflictIntent(tabId);
+  const pendingRef = useRef<{ intentId: number; requiredRevision: number } | null>(null);
+
+  useEffect(() => {
+    if (!intent || !active || !enabled) return;
+    if (pendingRef.current?.intentId !== intent.id) {
+      if (discover.isFetching && !discover.isSuccess) {
+        pendingRef.current = { intentId: intent.id, requiredRevision: revision };
+      } else {
+        pendingRef.current = { intentId: intent.id, requiredRevision: revision + 1 };
+        refresh();
+      }
+      return;
+    }
+    if (revision < pendingRef.current.requiredRevision) return;
+    if (discover.isError && !discover.isFetching) {
+      pendingRef.current = null;
+      consumeIntent(intent.id);
+      return;
+    }
+    if (!freshRead(discover)) return;
+
+    pendingRef.current = null;
+    consumeIntent(intent.id);
+    const targetRepo = repos.find((entry) => entry.repoRoot === intent.repoRoot);
+    if (!targetRepo) return;
+    chooseRepo(targetRepo.repoRoot);
+    if (rebase && isRebasePaused(targetRepo.operationState)) {
+      openSurface(targetRepo, "conflicts");
+    }
+  }, [
+    active,
+    chooseRepo,
+    consumeIntent,
+    discover,
+    enabled,
+    intent,
+    openSurface,
+    rebase,
+    refresh,
+    repos,
+    revision,
+  ]);
 }
 
 function GraphNotices({ connected, notice }: { connected: boolean; notice?: string }) {

@@ -42,6 +42,8 @@ import {
 } from "./session/workspace-base-branch/service.js";
 import type { AgentFinishReport, CreationSnapshot } from "@getpaseo/protocol/messages";
 import { CreationService } from "./creation/index.js";
+import { openDurableItemStore } from "./durable-items/requests.js";
+import type { DurableItemStore } from "./durable-items/store.js";
 import { MessageReceipts } from "./message-receipts/index.js";
 import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage, Server as HTTPServer } from "http";
@@ -680,6 +682,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly creationService: CreationService;
   private readonly projectRegistry: ProjectRegistry;
   private readonly workspaceRegistry: WorkspaceRegistry;
+  private readonly durableItems: DurableItemStore;
   private readonly workspaceBaseBranch: WorkspaceBaseBranchService;
   private readonly workspaceLabelService: WorkspaceLabelService | null;
   private readonly scheduleService: ScheduleService;
@@ -983,6 +986,12 @@ export class VoiceAssistantWebSocketServer {
     );
     this.projectRegistry = projectRegistry ?? createNoopProjectRegistry();
     this.workspaceRegistry = workspaceRegistry ?? createNoopWorkspaceRegistry();
+    this.durableItems = openDurableItemStore({
+      paseoHome,
+      serverId,
+      workspaceRegistry: this.workspaceRegistry,
+      agentStorage: this.agentStorage,
+    });
     this.workspaceLabelService = workspaceLabelService ?? null;
     const requiredServices = requireWebSocketServices({
       scheduleService,
@@ -2001,6 +2010,7 @@ export class VoiceAssistantWebSocketServer {
       creationService: this.creationService,
       projectRegistry: this.projectRegistry,
       workspaceRegistry: this.workspaceRegistry,
+      durableItems: this.durableItems,
       workspaceBaseBranch: this.workspaceBaseBranch,
       workspaceLabelService: this.workspaceLabelService ?? undefined,
       directorySync: this.directorySync,
@@ -2375,10 +2385,16 @@ export class VoiceAssistantWebSocketServer {
         agentResidentSpecialists: true,
         // COMPAT(agentSessionReset): added in v0.18.0, remove gate after 2027-06-01.
         agentSessionReset: true,
+        // COMPAT(agentProviderSwitchBlankContext): added in v0.18.0, remove after 2027-06-01.
+        agentProviderSwitchBlankContext: true,
+        // COMPAT(agentIdleArchiveV1): added in v0.18.0, remove gate after 2027-06-01.
+        agentIdleArchiveV1: true,
         workspaceMainAgentDefault: true,
         agentCreateAsMain: true,
         // COMPAT(topicWorkbenchV1): added in v0.18.0, remove after 2027-06-01.
         topicWorkbenchV1: true,
+        // COMPAT(workspaceDurableItemsV1): added in v0.18.0, remove after 2027-06-01.
+        workspaceDurableItemsV1: true,
         checkoutGitStagingV1: true,
         // COMPAT(checkoutGitGraphV1): added in v0.18.0, remove gate after 2027-06-01.
         checkoutGitGraphV1: true,
