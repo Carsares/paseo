@@ -23,7 +23,7 @@ const EXPECTED_GITHUB_FAST_POLL_MS = 20_000;
 const EXPECTED_GITHUB_SLOW_POLL_MS = 120_000;
 const EXPECTED_GITHUB_ERROR_BACKOFF_CAP_MS = 300_000;
 const CURRENT_PR_STATUS_BASE_FIELDS =
-  "number,url,title,state,isDraft,baseRefName,headRefName,headRefOid,updatedAt,mergedAt,reviewDecision,mergeable,headRepositoryOwner";
+  "number,url,title,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,updatedAt,mergedAt,reviewDecision,mergeable,headRepositoryOwner";
 const CURRENT_PR_STATUS_FIELDS = `${CURRENT_PR_STATUS_BASE_FIELDS},statusCheckRollup`;
 const FORK_PR_QUERY = "state=all&per_page=100&head=forkOwner%3Afeature%2Ffork";
 
@@ -5330,4 +5330,377 @@ it("skips pagination after the last exact observer releases its PR", async () =>
     service.dispose?.();
     vi.useRealTimers();
   }
+});
+
+describe("GitHub review guide", () => {
+  const headSha = "a".repeat(40);
+  const baseSha = "b".repeat(40);
+  const changedSha = "c".repeat(40);
+  const version = { headSha, baseSha };
+  const target = {
+    cwd: "/checkout",
+    identity: { forge: "github", host: "ghe.example.test", projectPath: "team/repo", number: 12 },
+  };
+  const root = "repos/team/repo/pulls/12";
+  const mergeBaseSha = "d".repeat(40);
+  const compare = "repos/team/repo/compare/" + baseSha + "..." + headSha + "?per_page=1&page=1";
+  const comparison = (files: unknown[], sha = baseSha) => ({
+    base_commit: { sha },
+    merge_base_commit: { sha: mergeBaseSha },
+    files,
+  });
+  const patch = "@@ -2,2 +2,2 @@\n unchanged\n-old\n+new";
+  const file = (filename: string) => ({ filename, patch, additions: 1, deletions: 1 });
+  const pr = (count: number, actual = version) => ({
+    id: 200,
+    number: 12,
+    base: { sha: actual.baseSha, repo: { full_name: "team/repo" } },
+    head: { sha: actual.headSha },
+    changed_files: count,
+  });
+  const http = (data: unknown, extra = "") =>
+    "HTTP/2.0 200 OK\r\n" + extra + "\r\n" + JSON.stringify(data);
+  const create = (runner: GitHubCommandRunner, now?: () => number) =>
+    createGitHubService({
+      runner,
+      now,
+      resolveGhPath: async () => "/usr/bin/gh",
+      resolveReviewRemoteUrl: async () => "https://ghe.example.test/team/repo.git",
+      resolveRepoHost: async () => "ghe.example.test",
+    });
+
+  it("binds the remote host, orders the pinned comparison, reports coverage and replaces cached stops on refresh", async () => {
+    let lastPage = [file("auth/rules.ts"), { filename: "binary.png", additions: 0, deletions: 0 }];
+    const pages: string[] = [];
+    const first = Array.from({ length: 100 }, (_, i) => file("src/file-" + i + ".ts"));
+    const service = create(async (args, options) => {
+      expect(args.slice(0, 4)).toEqual(["api", "--hostname", "ghe.example.test", "-i"]);
+      expect(options.envOverlay?.GH_HOST).toBe(target.identity.host);
+      const endpoint = args[4];
+      if (endpoint === root) return { stdout: http(pr(105)), stderr: "" };
+      pages.push(endpoint);
+      expect(endpoint).toBe(compare);
+      return { stdout: http(comparison([...first, ...lastPage])), stderr: "" };
+    });
+
+    const guide = await service.getReviewGuide!(target);
+    expect(guide.diffBaseSha).toBe(mergeBaseSha);
+    expect(guide.stops[0]).toMatchObject({
+      path: "auth/rules.ts",
+      priority: "attention",
+      line: { newLine: 3 },
+    });
+    expect(guide.stops.find((stop) => stop.path === "binary.png")).toMatchObject({
+      reason: "unavailable",
+    });
+    expect(guide.coverage).toEqual({
+      filesLoaded: 102,
+      totalFiles: 105,
+      hasMore: true,
+      missingPatches: 1,
+      reason: "forge_diff_limit",
+    });
+    expect((await service.getReviewGuide!({ ...target, expectedVersion: version })).stops).toEqual(
+      guide.stops,
+    );
+    expect(pages).toHaveLength(1);
+    lastPage = [file("security/replacement.ts")];
+    const fresh = await service.getReviewGuide!({ ...target, refresh: true });
+    expect(fresh.stops[0].path).toBe("security/replacement.ts");
+    expect(fresh.stops.some((stop) => stop.path === "auth/rules.ts")).toBe(false);
+    expect(pages).toHaveLength(2);
+    await expect(
+      service.getReviewGuide!({ ...target, identity: { ...target.identity, host: "github.com" } }),
+    ).rejects.toMatchObject({ code: "invalid_target" });
+  });
+
+  it.each(["baseSha", "headSha"] as const)(
+    "discards files if %s changes during listing",
+    async (field) => {
+      let reads = 0;
+      const service = create(async (args) => ({
+        stdout:
+          args[4] === root
+            ? http(pr(1, reads++ ? { ...version, [field]: changedSha } : version))
+            : http(comparison([file("a.ts")])),
+        stderr: "",
+      }));
+      await expect(service.getReviewGuide!(target)).rejects.toMatchObject({ code: "stale" });
+    },
+  );
+
+  it("rejects a comparison returned for a different base", async () => {
+    const service = create(async (args) => ({
+      stdout: http(args[4] === root ? pr(1) : comparison([file("a.ts")], changedSha)),
+      stderr: "",
+    }));
+    await expect(service.getReviewGuide!(target)).rejects.toMatchObject({ code: "unavailable" });
+  });
+
+  it("only ranks a patchless rename as mechanical when the old blob matches", async () => {
+    const blob = "e".repeat(40);
+    const renames = ["same.bin", "different.bin"].map((filename) => ({
+      filename,
+      previous_filename: "old " + filename,
+      sha: blob,
+      status: "renamed",
+      additions: 0,
+      deletions: 0,
+    }));
+    const service = create(async (args) => {
+      const endpoint = args[4];
+      if (endpoint === root) return { stdout: http(pr(3)), stderr: "" };
+      if (endpoint === compare) {
+        return {
+          stdout: http(comparison([...renames, file("generated/handwritten.ts")])),
+          stderr: "",
+        };
+      }
+      expect(endpoint).toMatch(
+        new RegExp(
+          "^repos/team/repo/contents/old%20(?:same|different)\\.bin[?]ref=" + mergeBaseSha + "$",
+        ),
+      );
+      return {
+        stdout: http({ type: "file", sha: endpoint.includes("same") ? blob : changedSha }),
+        stderr: "",
+      };
+    });
+    const guide = await service.getReviewGuide!(target);
+    expect(guide.stops.map(({ path, priority }) => ({ path, priority }))).toEqual([
+      { path: "generated/handwritten.ts", priority: "normal" },
+      { path: "different.bin", priority: "normal" },
+      { path: "same.bin", priority: "mechanical" },
+    ]);
+  });
+
+  it("rejects an expired issued stop without rebuilding it or dispatching a write", async () => {
+    let time = 0;
+    const service = create(
+      async (args) => {
+        if (args[4] === root) return { stdout: http(pr(1)), stderr: "" };
+        expect(time).toBe(0);
+        expect(args[4]).toBe(compare);
+        return { stdout: http(comparison([file("a.ts")])), stderr: "" };
+      },
+      () => time,
+    );
+    const guide = await service.getReviewGuide!(target);
+    time += 120_001;
+    await expect(
+      service.publishReviewComment!({
+        ...target,
+        version,
+        stopId: guide.stops[0].id,
+        body: "Draft",
+        operationId: "expired-draft",
+      }),
+    ).rejects.toMatchObject({ code: "expired" });
+  });
+
+  it.each(["success", "timeout", "readback_failure", "wrong_pull", "permission"] as const)(
+    "does not repost after %s and verifies LEFT payload",
+    async (result) => {
+      const posts: string[][] = [];
+      let actual = version;
+      const deleted = {
+        filename: "new.ts",
+        previous_filename: "old.ts",
+        additions: 0,
+        deletions: 1,
+        patch: "@@ -9 +8,0 @@\n-removed",
+      };
+      const service = create(async (args) => {
+        if (args[4] === root) return { stdout: http(pr(1, actual)), stderr: "" };
+        if (args[4] === compare) return { stdout: http(comparison([deleted])), stderr: "" };
+        if (args[4] === "repos/team/repo/pulls/comments/502") {
+          if (result === "readback_failure")
+            return { stdout: "HTTP/2.0 503\r\n\r\n{}", stderr: "" };
+          return {
+            stdout: http({
+              id: 502,
+              path: "new.ts",
+              side: "LEFT",
+              original_line: 9,
+              original_commit_id: headSha,
+              pull_request_url:
+                "https://ghe.example.test/api/v3/repos/team/repo/pulls/" +
+                (result === "wrong_pull" ? 13 : 12),
+            }),
+            stderr: "",
+          };
+        }
+        expect(args.slice(4, 7)).toEqual(["-X", "POST", root + "/comments"]);
+        posts.push(args.slice(7));
+        if (result === "timeout") throw new Error("timeout");
+        if (result === "permission") return { stdout: "HTTP/2 403\r\n\r\n{}", stderr: "" };
+        return { stdout: http({ id: 502 }), stderr: "" };
+      });
+      const guide = await service.getReviewGuide!(target);
+      const input = {
+        ...target,
+        version,
+        stopId: guide.stops[0].id,
+        body: "Review this removal",
+        operationId: "operation-a",
+      };
+      expect(guide.stops[0]).toMatchObject({
+        path: "new.ts",
+        oldPath: "old.ts",
+        line: { oldLine: 9 },
+      });
+      await expect(
+        service.publishReviewComment!({
+          ...input,
+          stopId: "0".repeat(64),
+          operationId: "unverified",
+        }),
+      ).rejects.toMatchObject({ code: "expired" });
+      const outcomes = await Promise.allSettled([
+        service.publishReviewComment!(input),
+        service.publishReviewComment!(input),
+      ]);
+      if (result === "success") {
+        expect(outcomes).toEqual(
+          Array.from({ length: 2 }, () => ({ status: "fulfilled", value: { id: "502" } })),
+        );
+        await expect(service.publishReviewComment!(input)).resolves.toEqual({ id: "502" });
+      } else {
+        const code = result === "permission" ? "permission" : "unknown_outcome";
+        for (const outcome of outcomes)
+          expect(outcome).toMatchObject({
+            status: "rejected",
+            reason: { code },
+          });
+        await expect(service.publishReviewComment!(input)).rejects.toMatchObject({
+          code,
+        });
+      }
+      await expect(
+        service.publishReviewComment!({ ...input, cwd: "/other-checkout" }),
+      ).rejects.toMatchObject({ code: "invalid_target" });
+      expect(posts).toEqual([
+        [
+          "-f",
+          "body=Review this removal",
+          "-f",
+          "commit_id=" + headSha,
+          "-f",
+          "path=new.ts",
+          "-F",
+          "line=9",
+          "-f",
+          "side=LEFT",
+        ],
+      ]);
+      actual = { ...version, baseSha: changedSha };
+      await expect(
+        service.publishReviewComment!({ ...input, operationId: "new-id" }),
+      ).rejects.toMatchObject({ code: "stale" });
+      expect(posts).toHaveLength(1);
+    },
+  );
+
+  it("reads account state and confirms both directions of mutation against the same head", async () => {
+    let state = "DISMISSED";
+    let actualHead = headSha;
+    let advanceOnMutation = false;
+    let switchOnMutation = false;
+    let activeViewer = "account1";
+    const mutations: string[] = [];
+    const service = create(async (args, options) => {
+      if (args[0] === "auth") {
+        expect(args).toEqual(["auth", "token", "--hostname", target.identity.host]);
+        return { stdout: "fake-viewer-credential", stderr: "" };
+      }
+      expect(args[4]).toBe("graphql");
+      const pinned = options.envOverlay?.GH_ENTERPRISE_TOKEN === "fake-viewer-credential";
+      const query = args[6];
+      const mutation = /mutation \{ (\w+)/.exec(query)?.[1];
+      if (mutation) {
+        expect(pinned).toBe(true);
+        mutations.push(mutation);
+        expect(query).toContain('pullRequestId: "node12", path: "src/file.ts"');
+        state = mutation === "markFileAsViewed" ? "VIEWED" : "UNVIEWED";
+        if (advanceOnMutation) actualHead = changedSha;
+        if (switchOnMutation) activeViewer = "account2";
+        return { stdout: http({ data: { [mutation]: { clientMutationId: null } } }), stderr: "" };
+      }
+      const pullRequest = {
+        id: "node12",
+        baseRefOid: baseSha,
+        headRefOid: actualHead,
+        ...(query.includes("viewerViewedState")
+          ? {
+              files: {
+                totalCount: 1,
+                nodes: [{ path: "src/file.ts", viewerViewedState: state }],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            }
+          : {}),
+      };
+      return {
+        stdout: http({
+          data: { repository: { pullRequest }, viewer: { id: pinned ? "account1" : activeViewer } },
+        }),
+        stderr: "",
+      };
+    });
+
+    await expect(service.getReviewViewed!({ ...target, version })).resolves.toEqual({
+      entries: [{ path: "src/file.ts", state: "dismissed" }],
+      hasMore: false,
+      viewerId: "account1",
+    });
+    const input = { ...target, version, path: "src/file.ts", expectedViewerId: "account1" };
+    await expect(
+      service.setReviewViewed!({ ...input, expectedViewerId: "another-account", viewed: true }),
+    ).rejects.toMatchObject({ code: "stale" });
+    expect(mutations).toEqual([]);
+    await expect(service.setReviewViewed!({ ...input, viewed: true })).resolves.toMatchObject({
+      state: "viewed",
+    });
+    await expect(service.setReviewViewed!({ ...input, viewed: false })).resolves.toMatchObject({
+      state: "unviewed",
+    });
+    advanceOnMutation = true;
+    await expect(service.setReviewViewed!({ ...input, viewed: true })).rejects.toMatchObject({
+      code: "unknown_outcome",
+    });
+    await expect(service.setReviewViewed!({ ...input, viewed: false })).rejects.toMatchObject({
+      code: "stale",
+    });
+    actualHead = headSha;
+    advanceOnMutation = false;
+    switchOnMutation = true;
+    await expect(service.setReviewViewed!({ ...input, viewed: false })).rejects.toMatchObject({
+      code: "unknown_outcome",
+    });
+    expect(mutations).toEqual([
+      "markFileAsViewed",
+      "unmarkFileAsViewed",
+      "markFileAsViewed",
+      "unmarkFileAsViewed",
+    ]);
+  });
+
+  it.each([
+    [
+      "unsupported",
+      {
+        errors: [
+          {
+            message: "Field 'viewerViewedState' doesn't exist on type 'PullRequestChangedFile'",
+            extensions: { code: "undefinedField" },
+          },
+        ],
+      },
+    ],
+    ["permission", { errors: [{ message: "resource not accessible", type: "FORBIDDEN" }] }],
+    ["unavailable", { errors: [{ message: "temporary GraphQL service outage" }] }],
+  ])("reports viewed capability errors as %s", async (code, response) => {
+    const service = create(async () => ({ stdout: http(response), stderr: "" }));
+    await expect(service.getReviewViewed!({ ...target, version })).rejects.toMatchObject({ code });
+  });
 });

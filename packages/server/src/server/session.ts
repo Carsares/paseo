@@ -3906,6 +3906,11 @@ export class Session {
       case "checkout.forge.set_auto_merge.request":
       case "checkout.github.set_auto_merge.request":
         return this.checkoutSession.handleCheckoutForgeSetAutoMergeRequest(msg);
+      case "checkout.forge.get_review_guide.request":
+      case "checkout.forge.get_review_viewed.request":
+      case "checkout.forge.set_review_viewed.request":
+      case "checkout.forge.publish_review_comment.request":
+        return this.checkoutSession.handleReviewRequest(msg);
       case "checkout.forge.get_check_details.request":
       case "checkout.github.get_check_details.request":
         return this.checkoutSession.handleCheckoutForgeGetCheckDetailsRequest(msg);

@@ -5798,6 +5798,60 @@ export class DaemonClient {
     });
   }
 
+  checkoutForgeGetReviewGuide(
+    input: Omit<
+      Extract<SessionInboundMessage, { type: "checkout.forge.get_review_guide.request" }>,
+      "type" | "requestId"
+    >,
+  ) {
+    return this.sendNamespacedCorrelatedSessionRequest<"checkout.forge.get_review_guide.response">({
+      message: { ...input, type: "checkout.forge.get_review_guide.request" },
+      timeout: 90_000,
+    });
+  }
+
+  checkoutForgeGetReviewViewed(
+    input: Omit<
+      Extract<SessionInboundMessage, { type: "checkout.forge.get_review_viewed.request" }>,
+      "type" | "requestId"
+    >,
+  ) {
+    return this.sendNamespacedCorrelatedSessionRequest<"checkout.forge.get_review_viewed.response">(
+      {
+        message: { ...input, type: "checkout.forge.get_review_viewed.request" },
+        timeout: 90_000,
+      },
+    );
+  }
+
+  checkoutForgeSetReviewViewed(
+    input: Omit<
+      Extract<SessionInboundMessage, { type: "checkout.forge.set_review_viewed.request" }>,
+      "type" | "requestId"
+    >,
+  ) {
+    return this.sendNamespacedCorrelatedSessionRequest<"checkout.forge.set_review_viewed.response">(
+      {
+        message: { ...input, type: "checkout.forge.set_review_viewed.request" },
+        timeout: 90_000,
+      },
+    );
+  }
+
+  checkoutForgePublishReviewComment(
+    input: Omit<
+      Extract<SessionInboundMessage, { type: "checkout.forge.publish_review_comment.request" }>,
+      "type" | "requestId"
+    >,
+  ) {
+    return this.sendNamespacedCorrelatedSessionRequest<"checkout.forge.publish_review_comment.response">(
+      {
+        message: { ...input, type: "checkout.forge.publish_review_comment.request" },
+        timeout: 90_000,
+      },
+    );
+  }
+
   async checkoutForgeGetCheckDetails(
     input: {
       cwd: string;

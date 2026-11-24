@@ -3130,6 +3130,51 @@ export const CheckoutGithubGetCheckDetailsRequestSchema =
     type: z.literal("checkout.github.get_check_details.request"),
   });
 
+const ReviewIdentitySchema = z.object({
+  forge: z.string().min(1).max(64),
+  host: z.string().min(1).max(255),
+  projectPath: z.string().min(1).max(2048),
+  number: z.number().int().positive(),
+});
+const ReviewShaSchema = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
+const ReviewVersionSchema = z.object({
+  baseSha: ReviewShaSchema,
+  headSha: ReviewShaSchema,
+  startSha: ReviewShaSchema.optional(),
+});
+const CheckoutReviewRequestSchema = z.object({
+  cwd: z.string(),
+  requestId: z.string(),
+  identity: ReviewIdentitySchema,
+});
+
+export const CheckoutForgeGetReviewGuideRequestSchema = CheckoutReviewRequestSchema.extend({
+  type: z.literal("checkout.forge.get_review_guide.request"),
+  expectedVersion: ReviewVersionSchema.optional(),
+  refresh: z.boolean().optional(),
+});
+
+export const CheckoutForgeGetReviewViewedRequestSchema = CheckoutReviewRequestSchema.extend({
+  type: z.literal("checkout.forge.get_review_viewed.request"),
+  version: ReviewVersionSchema,
+});
+
+export const CheckoutForgeSetReviewViewedRequestSchema = CheckoutReviewRequestSchema.extend({
+  type: z.literal("checkout.forge.set_review_viewed.request"),
+  expectedViewerId: z.string().min(1).max(256).optional(),
+  version: ReviewVersionSchema,
+  path: z.string().min(1).max(4096),
+  viewed: z.boolean(),
+});
+
+export const CheckoutForgePublishReviewCommentRequestSchema = CheckoutReviewRequestSchema.extend({
+  type: z.literal("checkout.forge.publish_review_comment.request"),
+  version: ReviewVersionSchema,
+  stopId: z.string().min(1).max(256),
+  operationId: z.string().min(1).max(128),
+  body: z.string().min(1).max(65536),
+});
+
 export const CheckoutPrStatusRequestSchema = z.object({
   type: z.literal("checkout_pr_status_request"),
   cwd: z.string(),
@@ -4175,6 +4220,10 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CheckoutCommitFileDiffRequestSchema,
   CheckoutForgeGetCheckDetailsRequestSchema,
   CheckoutGithubGetCheckDetailsRequestSchema,
+  CheckoutForgeGetReviewGuideRequestSchema,
+  CheckoutForgeGetReviewViewedRequestSchema,
+  CheckoutForgeSetReviewViewedRequestSchema,
+  CheckoutForgePublishReviewCommentRequestSchema,
   CheckoutPrStatusRequestSchema,
   PullRequestTimelineRequestSchema,
   CheckoutSwitchBranchRequestSchema,
@@ -4496,6 +4545,7 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(forgeCheckDetails): added in v0.2.0-beta.1. Remove the feature
         // gate and githubCheckDetails fallback after 2027-01-17 once the
         // supported daemon floor is >= v0.2.0.
+        forgeReviewGuide: z.boolean().optional(),
         forgeCheckDetails: z.boolean().optional(),
         // COMPAT(forgeSearch): added in v0.2.0-beta.1. Remove the feature gate
         // and github_search fallback after 2027-01-17 once the supported daemon
@@ -6480,6 +6530,8 @@ export const CheckoutPrStatusSchema = z.object({
   state: z.string(),
   baseRefName: z.string(),
   headRefName: z.string(),
+  headSha: z.string().optional(),
+  reviewVersion: ReviewVersionSchema.optional(),
   isMerged: z.boolean(),
   isDraft: z.boolean().optional().default(false),
   mergeable: z
@@ -6824,6 +6876,105 @@ export const CheckoutGithubCheckDetailsSchema = z.object({
 });
 
 export const CheckoutCheckDetailsSchema = CheckoutGithubCheckDetailsSchema;
+
+const ReviewGuideSchema = z.object({
+  diffBaseSha: ReviewShaSchema.optional(),
+  identity: ReviewIdentitySchema,
+  version: ReviewVersionSchema,
+  stops: z.array(
+    z.object({
+      id: z.string(),
+      path: z.string(),
+      oldPath: z.string().optional(),
+      priority: z.enum(["attention", "normal", "mechanical"]),
+      reason: z.enum([
+        "sensitive",
+        "substantial",
+        "source",
+        "rename",
+        "lockfile",
+        "generated",
+        "unavailable",
+      ]),
+      hunk: z
+        .object({
+          oldStart: z.number().int().nonnegative(),
+          oldCount: z.number().int().nonnegative(),
+          newStart: z.number().int().nonnegative(),
+          newCount: z.number().int().nonnegative(),
+          patch: z.string(),
+        })
+        .optional(),
+      line: z
+        .object({
+          oldLine: z.number().int().positive().optional(),
+          newLine: z.number().int().positive().optional(),
+        })
+        .optional(),
+    }),
+  ),
+  coverage: z.object({
+    filesLoaded: z.number().int().nonnegative(),
+    totalFiles: z.number().int().nonnegative().optional(),
+    hasMore: z.boolean(),
+    missingPatches: z.number().int().nonnegative(),
+    reason: z.string().optional(),
+  }),
+  commentMode: z.enum(["remote", "chat"]),
+  viewedMode: z.enum(["remote", "local"]),
+});
+const ReviewViewedEntrySchema = z.object({
+  path: z.string(),
+  state: z.enum(["viewed", "unviewed", "dismissed"]),
+});
+const ReviewViewedSchema = z.object({
+  viewerId: z.string().min(1).max(256).optional(),
+  entries: z.array(ReviewViewedEntrySchema),
+  hasMore: z.boolean().optional(),
+});
+const ReviewPublishedCommentSchema = z.object({ id: z.string() });
+const CheckoutReviewResponsePayloadSchema = z.object({
+  cwd: z.string(),
+  requestId: z.string(),
+  error: z
+    .object({
+      code: z.enum([
+        "stale",
+        "permission",
+        "unsupported",
+        "unavailable",
+        "unknown_outcome",
+        "invalid_target",
+        "expired",
+      ]),
+      message: z.string(),
+    })
+    .nullable(),
+});
+
+export const CheckoutForgeGetReviewGuideResponseSchema = z.object({
+  type: z.literal("checkout.forge.get_review_guide.response"),
+  payload: CheckoutReviewResponsePayloadSchema.extend({ guide: ReviewGuideSchema.nullable() }),
+});
+
+export const CheckoutForgeGetReviewViewedResponseSchema = z.object({
+  type: z.literal("checkout.forge.get_review_viewed.response"),
+  payload: CheckoutReviewResponsePayloadSchema.extend({ viewed: ReviewViewedSchema.nullable() }),
+});
+
+export const CheckoutForgeSetReviewViewedResponseSchema = z.object({
+  type: z.literal("checkout.forge.set_review_viewed.response"),
+  payload: CheckoutReviewResponsePayloadSchema.extend({
+    entry: ReviewViewedEntrySchema.nullable(),
+  }),
+});
+
+export const CheckoutForgePublishReviewCommentResponseSchema = z.object({
+  type: z.literal("checkout.forge.publish_review_comment.response"),
+  payload: CheckoutReviewResponsePayloadSchema.extend({
+    comment: ReviewPublishedCommentSchema.nullable(),
+  }),
+});
 
 export const CheckoutForgeGetCheckDetailsResponseSchema = z.object({
   type: z.literal("checkout.forge.get_check_details.response"),
@@ -8390,6 +8541,10 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CheckoutCommitsListResponseSchema,
   CheckoutWorktreesListResponseSchema,
   CheckoutCommitFileDiffResponseSchema,
+  CheckoutForgeGetReviewGuideResponseSchema,
+  CheckoutForgeGetReviewViewedResponseSchema,
+  CheckoutForgeSetReviewViewedResponseSchema,
+  CheckoutForgePublishReviewCommentResponseSchema,
   CheckoutForgeGetCheckDetailsResponseSchema,
   CheckoutGithubGetCheckDetailsResponseSchema,
   CheckoutPrStatusResponseSchema,

@@ -24,6 +24,7 @@ import { resolveSshHostname } from "../utils/ssh-hostname.js";
 import {
   CLI_AUTH_PROBE_TIMEOUT_MS,
   createForgeCliRunner,
+  defaultResolveRemoteUrl,
   ForgeAuthenticationError,
   ForgeCliMissingError,
   parseCliJsonOutput,
@@ -69,6 +70,9 @@ import {
   isGitHubPullRequestStatusFacts,
   type GitHubPullRequestStatusFacts,
 } from "./github-facts.js";
+
+import { createGitHubReviewGuide } from "./review-guide/github.js";
+import { parseHostedReviewVersion } from "./review-guide/types.js";
 
 export type {
   CheckAnnotation,
@@ -357,6 +361,7 @@ const CurrentPullRequestStatusSchema = z.object({
   baseRefName: z.string().catch(""),
   headRefName: z.string().catch(""),
   headRefOid: z.string().optional(),
+  baseRefOid: z.string().optional(),
   updatedAt: z.string().optional(),
   mergedAt: z.string().nullable().optional(),
   statusCheckRollup: z.unknown().optional(),
@@ -540,7 +545,7 @@ query PullRequestCheckoutTarget($owner: String!, $name: String!, $number: Int!) 
 }`;
 
 const CURRENT_PR_STATUS_BASE_FIELDS =
-  "number,url,title,state,isDraft,baseRefName,headRefName,headRefOid,updatedAt,mergedAt,reviewDecision,mergeable,headRepositoryOwner";
+  "number,url,title,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,updatedAt,mergedAt,reviewDecision,mergeable,headRepositoryOwner";
 const CURRENT_PR_STATUS_FIELDS = `${CURRENT_PR_STATUS_BASE_FIELDS},statusCheckRollup`;
 
 const PULL_REQUEST_STATUS_FACTS_QUERY = `
@@ -656,6 +661,7 @@ const BatchPollPrNodeSchema = z.object({
   baseRefName: z.string().catch(""),
   headRefName: z.string().catch(""),
   headRefOid: z.string().catch(""),
+  baseRefOid: z.string().optional(),
   updatedAt: z.string().optional(),
   mergedAt: z.string().nullable().optional(),
   mergeable: PullRequestMergeableSchema.optional().default("UNKNOWN"),
@@ -761,6 +767,7 @@ fragment PaseoPollPullRequest on PullRequest {
   baseRefName
   headRefName
   headRefOid
+  baseRefOid
   updatedAt
   mergedAt
   mergeable
@@ -1079,6 +1086,7 @@ interface CreateGitHubServiceOptions {
   resolveRepoHost?: (cwd: string) => Promise<string | null>;
   resolveRepoSlug?: (cwd: string) => Promise<string | null>;
   resolveOriginRepository?: (cwd: string) => Promise<string | null>;
+  resolveReviewRemoteUrl?: (cwd: string) => Promise<string | null>;
 }
 
 type PullRequestCheckRunNode = z.infer<typeof PullRequestCheckRunNodeSchema>;
@@ -2301,7 +2309,36 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
     target.errorCallbacks.clear();
   }
 
+  const reviewGuide = createGitHubReviewGuide({
+    async origin(cwd) {
+      const url = await (options.resolveReviewRemoteUrl ?? defaultResolveRemoteUrl)(cwd);
+      const location = url && parseGitRemoteLocation(url);
+      if (!location) return null;
+      const ssh = location.transport === "scp" || location.transport === "ssh";
+      const resolvedHost =
+        ssh && !isGitHubHost(location.host)
+          ? ((await resolveSshHostname(location.host)) ?? location.host)
+          : location.host;
+      if (isGitHubHost(resolvedHost) && (ssh || !location.port)) {
+        return { host: "github.com", path: location.path };
+      }
+      // gh does not accept ports in --hostname. Do not fall back to a different host.
+      if (!ssh && location.port) return null;
+      if (options.resolveRepoHost) {
+        if ((await options.resolveRepoHost(cwd)) !== resolvedHost) return null;
+      } else if (!(await probeGitHubAuthStatusForRouting(resolvedHost))) {
+        throw new GitHubAuthenticationError({
+          stderr: "GitHub CLI is not authenticated for the review host",
+        });
+      }
+      return { host: resolvedHost, path: location.path };
+    },
+    run: (args, cwd, host, envOverlay) => run(args, { cwd, envOverlay }, host),
+    now: deps.now,
+  });
+
   api = {
+    ...reviewGuide,
     authProbeCanThrow: true,
 
     listPullRequests(input) {
@@ -3738,6 +3775,7 @@ function toBatchCurrentPullRequestItem(
     baseRefName: node.baseRefName,
     headRefName: node.headRefName,
     ...(node.headRefOid ? { headRefOid: node.headRefOid } : {}),
+    ...(node.baseRefOid ? { baseRefOid: node.baseRefOid } : {}),
     updatedAt: node.updatedAt,
     mergedAt: node.mergedAt ?? null,
     ...(statusCheckRollup ? { statusCheckRollup } : {}),
@@ -4358,6 +4396,7 @@ function toCurrentPullRequestStatus(
     state = "";
   }
   const checks = parseStatusCheckRollup(item.statusCheckRollup);
+  const reviewVersion = parseHostedReviewVersion(item.baseRefOid, item.headRefOid);
   return {
     ...(typeof item.number === "number" ? { number: item.number } : {}),
     ...(repoIdentity ? { repoOwner: repoIdentity.owner, repoName: repoIdentity.name } : {}),
@@ -4367,6 +4406,7 @@ function toCurrentPullRequestStatus(
     baseRefName: item.baseRefName,
     headRefName: item.headRefName || fallbackHeadRefName,
     ...(item.headRefOid ? { headSha: item.headRefOid } : {}),
+    ...(reviewVersion ? { reviewVersion } : {}),
     isMerged: mergedAt !== null,
     isDraft: item.isDraft ?? false,
     mergeable: item.mergeable,

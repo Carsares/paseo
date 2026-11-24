@@ -12,6 +12,7 @@ import {
 } from "@/git/pull-request-panel";
 import type { UsePrPaneDataResult } from "@/git/pull-request-panel/use-data";
 
+import { useReviewGuideConnection } from "./review-guide-connection";
 import { resolvePullRequestContentState } from "./state";
 export {
   useWorkspacePullRequestDiscovery,
@@ -26,6 +27,7 @@ export function PullRequestContent(input: {
   cwd: string;
   prPane: UsePrPaneDataResult;
 }) {
+  const reviewGuide = useReviewGuideConnection(input);
   const { t } = useTranslation();
   const toast = useToast();
   const refresh = useCheckoutGitActionsStore((state) => state.refresh);
@@ -41,6 +43,7 @@ export function PullRequestContent(input: {
         serverId={input.serverId}
         cwd={input.cwd}
         data={input.prPane.data}
+        reviewGuide={reviewGuide}
         activityLoading={input.prPane.activityLoading}
         workspaceAttachmentScopeKey={buildWorkspaceAttachmentScopeKey({
           serverId: input.serverId,

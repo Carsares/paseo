@@ -2385,6 +2385,7 @@ export class VoiceAssistantWebSocketServer {
         // COMPAT(forgeCheckDetails): added in v0.2.0-beta.1. Remove the feature
         // gate and legacy fallback after 2027-01-17 once the supported daemon
         // floor is >= v0.2.0.
+        forgeReviewGuide: true,
         forgeCheckDetails: true,
         // COMPAT(forgeSearch): added in v0.2.0-beta.1. Remove the feature gate
         // and legacy fallback after 2027-01-17 once the supported daemon floor

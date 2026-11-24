@@ -145,6 +145,8 @@ export function normalizeCheckoutPrStatusPayload(
     repoName: status.repoName,
     baseRefName: status.baseRefName,
     headRefName: status.headRefName,
+    ...(status.headSha ? { headSha: status.headSha } : {}),
+    ...(status.reviewVersion ? { reviewVersion: status.reviewVersion } : {}),
     isMerged: status.isMerged,
     isDraft: status.isDraft ?? false,
     mergeable: status.mergeable ?? "UNKNOWN",

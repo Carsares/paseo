@@ -1,5 +1,9 @@
 import type { ForgeSearchKind } from "@getpaseo/protocol/messages";
 import type { ChangeRequestSource } from "./change-request-source.js";
+import type { ReviewGuideService, ReviewVersion } from "./review-guide/types.js";
+
+export { ReviewGuideError, type ReviewGuideErrorCode } from "./review-guide/service.js";
+export type * from "./review-guide/types.js";
 
 export type ForgeSearchRequestKind = ForgeSearchKind | "github-issue" | "github-pr" | "pr";
 
@@ -130,6 +134,7 @@ export interface CurrentPullRequestStatus {
   baseRefName: string;
   headRefName: string;
   headSha?: string;
+  reviewVersion?: ReviewVersion;
   isMerged: boolean;
   isDraft?: boolean;
   mergeable: PullRequestMergeable;
@@ -453,7 +458,7 @@ export function isOnDefaultBranch(
   return (lookup.currentBranch ?? lookup.headRef) === defaultBranch;
 }
 
-export interface ForgeService {
+export interface ForgeService extends Partial<ReviewGuideService> {
   listPullRequests(options: ListPullRequestsOptions): Promise<PullRequestSummary[]>;
   listIssues(options: ListIssuesOptions): Promise<IssueSummary[]>;
   getPullRequest(options: GetPullRequestOptions): Promise<PullRequestSummary>;

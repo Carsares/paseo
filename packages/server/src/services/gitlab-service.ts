@@ -1,5 +1,8 @@
 import { z } from "zod";
 import { parseGitRemoteLocation } from "@getpaseo/protocol/git-remote";
+import { resolveSshHostname } from "../utils/ssh-hostname.js";
+import { createGitLabReviewGuide } from "./review-guide/gitlab.js";
+import { parseHostedReviewVersion } from "./review-guide/types.js";
 import { findExecutable } from "../executable-resolution/executable-resolution.js";
 import {
   createCachedCliPathResolver,
@@ -158,6 +161,13 @@ const GitLabMergeRequestSchema = z
     source_branch: z.string(),
     target_branch: z.string(),
     sha: z.string().optional(),
+    diff_refs: z
+      .object({
+        base_sha: z.string().nullish(),
+        head_sha: z.string().nullish(),
+        start_sha: z.string().nullish(),
+      })
+      .nullish(),
     source_project_id: z.number().nullable().optional(),
     target_project_id: z.number().nullable().optional(),
     draft: z.boolean().optional(),
@@ -734,6 +744,11 @@ function toCurrentPullRequestStatus(
 ): CurrentPullRequestStatus {
   const { owner, name } = splitProjectPath(mr.references?.full);
   const projectPath = extractProjectPath(mr.references?.full);
+  const refs = mr.diff_refs;
+  const reviewVersion =
+    refs?.start_sha && (!mr.sha || mr.sha === refs.head_sha)
+      ? parseHostedReviewVersion(refs.base_sha, refs.head_sha, refs.start_sha)
+      : undefined;
   return {
     number: mr.iid,
     ...(owner ? { repoOwner: owner } : {}),
@@ -745,6 +760,7 @@ function toCurrentPullRequestStatus(
     baseRefName: mr.target_branch,
     headRefName: mr.source_branch,
     ...(mr.sha ? { headSha: mr.sha } : {}),
+    ...(reviewVersion ? { reviewVersion } : {}),
     isMerged: mr.state === "merged" || mr.merged_at != null,
     isDraft: mr.draft ?? mr.work_in_progress ?? false,
     mergeable: mapMergeable(mr),
@@ -1179,7 +1195,31 @@ export function createGitLabService(options: CreateGitLabServiceOptions = {}): F
     );
   }
 
+  const reviewGuide = createGitLabReviewGuide({
+    async origin(cwd) {
+      const url = await resolveRemoteUrl(cwd);
+      const location = url && parseGitRemoteLocation(url);
+      if (!location) return null;
+      const ssh = location.transport === "scp" || location.transport === "ssh";
+      const host = ssh
+        ? ((await resolveSshHostname(location.host)) ?? location.host)
+        : location.host;
+      return {
+        host: !ssh && location.port ? host + ":" + location.port : host,
+        path: location.path,
+      };
+    },
+    async authorizeHost(host, cwd) {
+      if (host !== "gitlab.com") {
+        await run(["auth", "status", "--hostname", host], { cwd });
+      }
+    },
+    run: (args, cwd, host) => run(args, { cwd, envOverlay: { GITLAB_HOST: host } }),
+    now: options.now,
+  });
+
   return {
+    ...reviewGuide,
     async isAuthenticated(input: { cwd: string } & ForgeReadOptions): Promise<boolean> {
       const glabPath = await resolveGlab();
       if (!glabPath) {

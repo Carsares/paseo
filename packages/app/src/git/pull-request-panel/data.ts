@@ -90,6 +90,8 @@ export interface PrPaneData {
   repoName?: string;
   /** Neutral project identity (GitLab namespaces nest beyond owner/name). */
   projectPath?: string;
+  headSha?: string;
+  reviewVersion?: NonNullable<CheckoutPrStatus>["reviewVersion"];
   title: string;
   state: PrState;
   url: string;
@@ -135,6 +137,8 @@ export function mapPrPaneData(
     repoOwner: status.repoOwner,
     repoName: status.repoName,
     projectPath: status.projectPath,
+    ...(status.headSha ? { headSha: status.headSha } : {}),
+    ...(status.reviewVersion ? { reviewVersion: status.reviewVersion } : {}),
     title: status.title,
     state: derivePrState(status),
     url: status.url,

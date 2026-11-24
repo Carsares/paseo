@@ -35,6 +35,7 @@ import type {
   PullRequestCheck,
   PullRequestMergeable,
 } from "../services/forge-service.js";
+import type { ReviewVersion } from "../services/review-guide/types.js";
 import { createForgeService } from "../services/forge-registry.js";
 import {
   createForgeResolver,
@@ -204,6 +205,7 @@ export interface WorkspaceGitRuntimeSnapshot {
       baseRefName: string;
       headRefName: string;
       headSha?: string;
+      reviewVersion?: ReviewVersion;
       isMerged: boolean;
       isDraft?: boolean;
       mergeable?: PullRequestMergeable;

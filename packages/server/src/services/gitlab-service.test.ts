@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 
 import type { PullRequestCommandStatus } from "./forge-service.js";
@@ -1653,5 +1654,235 @@ describe("createGitLabService", () => {
     await expect(service.searchIssuesAndPrs({ cwd: "/repo", query: "release" })).rejects.toThrow(
       GlabCommandError,
     );
+  });
+});
+
+describe("GitLab review guide", () => {
+  const version = { headSha: "a".repeat(40), baseSha: "b".repeat(40), startSha: "c".repeat(40) };
+  const target = {
+    cwd: "/checkout",
+    identity: {
+      forge: "gitlab",
+      host: "gitlab.example.com",
+      projectPath: "example-group/example-project",
+      number: 7,
+    },
+  };
+  const root = "projects/19/merge_requests/7";
+  const project = { id: 19, path_with_namespace: target.identity.projectPath };
+  const refs = {
+    base_sha: version.baseSha,
+    head_sha: version.headSha,
+    start_sha: version.startSha,
+  };
+  const mr = { id: 72, iid: 7, target_project_id: 19, sha: version.headSha, diff_refs: refs };
+  const selected = {
+    id: 31,
+    merge_request_id: 72,
+    base_commit_sha: version.baseSha,
+    head_commit_sha: version.headSha,
+    start_commit_sha: version.startSha,
+  };
+  const renaming = {
+    old_path: "src/old.ts",
+    new_path: "src/new.ts",
+    diff: "--- a/src/old.ts\n+++ b/src/new.ts\n@@ -3 +3 @@\n-old\n+new\n@@ -10 +9,0 @@\n-obsolete",
+  };
+
+  it("uses the matching fixed version across pages, exposes coverage, and writes the verified rename position", async () => {
+    let postedPosition: unknown;
+    let posts = 0;
+    let changeAfterWrite = false;
+    let currentMr = mr;
+    const { service, calls } = makeService(
+      async (args) => {
+        if (args[0] === "auth") {
+          expect(args).toEqual(["auth", "status", "--hostname", "gitlab.example.com"]);
+          return ok("");
+        }
+        expect(args.slice(0, 4)).toEqual(["api", "--hostname", "gitlab.example.com", "-i"]);
+        const endpoint = args[4];
+        if (endpoint === "projects/example-group%2Fexample-project")
+          return ok(JSON.stringify(project));
+        if (endpoint === root) return ok(JSON.stringify(currentMr));
+        if (endpoint === root + "/versions?per_page=20&page=1") {
+          return ok(
+            "HTTP/2.0 200 OK\r\nX-Next-Page: 2\r\n\r\n" +
+              JSON.stringify([{ ...selected, id: 32, start_commit_sha: "d".repeat(40) }]),
+          );
+        }
+        if (endpoint === root + "/versions?per_page=20&page=2")
+          return ok(JSON.stringify([selected]));
+        if (endpoint === root + "/versions/31?unidiff=true") {
+          return ok(
+            JSON.stringify({
+              ...selected,
+              state: "overflow",
+              real_size: "1000+",
+              diffs: [
+                renaming,
+                { old_path: "big.txt", new_path: "big.txt", diff: renaming.diff, too_large: true },
+              ],
+            }),
+          );
+        }
+        if (endpoint === root + "/discussions/thread-1") {
+          return ok(
+            JSON.stringify({ id: "thread-1", notes: [{ id: 552, position: postedPosition }] }),
+          );
+        }
+        expect(args.slice(4, 8)).toEqual(["-X", "POST", root + "/discussions", "--input"]);
+        const payload = JSON.parse(await readFile(args[8], "utf8"));
+        expect(payload).toEqual({
+          body: "@literal comment",
+          position: {
+            ...refs,
+            position_type: "text",
+            old_path: "src/old.ts",
+            new_path: "src/new.ts",
+            new_line: 3,
+          },
+        });
+        postedPosition = payload.position;
+        posts++;
+        if (changeAfterWrite) {
+          currentMr = { ...mr, diff_refs: { ...refs, start_sha: "e".repeat(40) } };
+        }
+        return ok(JSON.stringify({ id: "thread-1", notes: [{ id: 552 }] }));
+      },
+      {
+        resolveRemoteUrl: async () =>
+          "https://gitlab.example.com/example-group/example-project.git",
+      },
+    );
+
+    const guide = await service.getReviewGuide!(target);
+    expect(guide).toMatchObject({
+      version,
+      commentMode: "remote",
+      viewedMode: "local",
+      coverage: { filesLoaded: 2, hasMore: true, missingPatches: 1, reason: "forge_diff_limit" },
+    });
+    const stops = guide.stops.filter((stop) => stop.path === "src/new.ts");
+    expect(stops.map((stop) => stop.line)).toEqual([{ newLine: 3 }, { oldLine: 10 }]);
+    expect(stops.every((stop) => stop.oldPath === "src/old.ts" && stop.reason === "rename")).toBe(
+      true,
+    );
+    expect(guide.stops.find((stop) => stop.path === "big.txt")?.line).toBeUndefined();
+
+    await expect(service.getReviewViewed!({ ...target, version })).rejects.toMatchObject({
+      code: "unsupported",
+    });
+    const input = {
+      ...target,
+      version,
+      body: "@literal comment",
+      stopId: stops[0].id,
+      operationId: "comment-1",
+    };
+    await expect(service.publishReviewComment!(input)).resolves.toEqual({ id: "552" });
+    await expect(service.publishReviewComment!(input)).resolves.toEqual({ id: "552" });
+    expect(posts).toBe(1);
+    expect(calls.some((args) => args.includes(root + "/versions/32?unidiff=true"))).toBe(false);
+    changeAfterWrite = true;
+    const second = { ...input, operationId: "comment-2" };
+    await expect(service.publishReviewComment!(second)).rejects.toMatchObject({
+      code: "unknown_outcome",
+    });
+    await expect(service.publishReviewComment!(second)).rejects.toMatchObject({
+      code: "unknown_outcome",
+    });
+    expect(posts).toBe(2);
+  });
+
+  it("compares pinned blobs in the target and source projects before deprioritizing a rename", async () => {
+    const candidates = ["same.bin", "different.bin"].map((name) => ({
+      old_path: "old/" + name,
+      new_path: "new/" + name,
+      renamed_file: true,
+      a_mode: "100644",
+      b_mode: "100644",
+      diff: "",
+    }));
+    const { service } = makeService(
+      (args) => {
+        if (args[0] === "auth") return ok("");
+        const endpoint = args[4];
+        if (endpoint.startsWith("projects/example-group%2F")) return ok(JSON.stringify(project));
+        if (endpoint === root) return ok(JSON.stringify({ ...mr, source_project_id: 25 }));
+        if (endpoint.startsWith(root + "/versions?")) return ok(JSON.stringify([selected]));
+        if (endpoint === root + "/versions/31?unidiff=true") {
+          return ok(
+            JSON.stringify({
+              ...selected,
+              state: "collected",
+              real_size: "3",
+              diffs: [
+                ...candidates,
+                {
+                  ...renaming,
+                  new_path: "generated.ts",
+                  renamed_file: false,
+                  a_mode: "100644",
+                  b_mode: "100644",
+                  generated_file: true,
+                },
+              ],
+            }),
+          );
+        }
+        expect(args.slice(4, 6)).toEqual(["-X", "HEAD"]);
+        const request = args[6];
+        if (request.startsWith("projects/19/")) {
+          expect(request).toMatch(
+            new RegExp("^projects/19/repository/files/old%2F.+[?]ref=" + version.baseSha + "$"),
+          );
+        } else {
+          expect(request).toMatch(
+            new RegExp("^projects/25/repository/files/new%2F.+[?]ref=" + version.headSha + "$"),
+          );
+        }
+        const blob = request.includes("new%2Fdifferent") ? "e".repeat(40) : "d".repeat(40);
+        return ok("HTTP/2.0 200 OK\r\nX-Gitlab-Blob-Id: " + blob + "\r\n\r\n");
+      },
+      {
+        resolveRemoteUrl: async () =>
+          "https://gitlab.example.com/example-group/example-project.git",
+      },
+    );
+    const result = await service.getReviewGuide!(target);
+    expect(result.coverage).toMatchObject({ filesLoaded: 3, totalFiles: 3, hasMore: false });
+    expect(result.stops.map(({ path, priority, reason }) => ({ path, priority, reason }))).toEqual([
+      { path: "new/different.bin", priority: "normal", reason: "rename" },
+      { path: "new/same.bin", priority: "mechanical", reason: "rename" },
+      { path: "generated.ts", priority: "mechanical", reason: "generated" },
+      { path: "generated.ts", priority: "mechanical", reason: "generated" },
+    ]);
+  });
+
+  it("checks all three version SHAs on the fixed diff response", async () => {
+    const { service } = makeService(
+      (args) => {
+        if (args[0] === "auth") return ok("");
+        const endpoint = args[4];
+        if (endpoint.startsWith("projects/example-group%2F")) return ok(JSON.stringify(project));
+        if (endpoint === root) return ok(JSON.stringify(mr));
+        if (endpoint.startsWith(root + "/versions?")) return ok(JSON.stringify([selected]));
+        expect(endpoint).toBe(root + "/versions/31?unidiff=true");
+        return ok(
+          JSON.stringify({
+            ...selected,
+            start_commit_sha: "d".repeat(40),
+            state: "collected",
+            diffs: [renaming],
+          }),
+        );
+      },
+      {
+        resolveRemoteUrl: async () =>
+          "https://gitlab.example.com/example-group/example-project.git",
+      },
+    );
+    await expect(service.getReviewGuide!(target)).rejects.toMatchObject({ code: "stale" });
   });
 });

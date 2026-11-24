@@ -41,6 +41,7 @@ import type {
   PullRequestTimelineItem,
   SearchResult,
 } from "../../../services/forge-service.js";
+import { ReviewGuideError } from "../../../services/review-guide/service.js";
 import {
   commitChanges,
   createPullRequest,
@@ -1305,6 +1306,105 @@ export class CheckoutSession {
           authState: isForgeAuthError(error) ? forgeAuthStateFromError(error) : "error",
         },
       });
+    }
+  }
+
+  private async runReviewOperation<T>(
+    cwd: string,
+    forge: string,
+    operation: (service: ForgeService) => Promise<T>,
+  ) {
+    try {
+      if (!isAbsolute(cwd)) throw new ReviewGuideError("invalid_target");
+      const resolution = await this.resolveForgeService(cwd);
+      if (!resolution || resolution.forge !== forge) throw new ReviewGuideError("invalid_target");
+      return { value: await operation(resolution.service), error: null };
+    } catch (error) {
+      const failure =
+        error instanceof ReviewGuideError
+          ? error
+          : new ReviewGuideError(isForgeAuthError(error) ? "permission" : "unavailable");
+      return { value: null, error: { code: failure.code, message: failure.message } };
+    }
+  }
+
+  async handleReviewRequest(
+    msg: Extract<
+      SessionInboundMessage,
+      {
+        type:
+          | "checkout.forge.get_review_guide.request"
+          | "checkout.forge.get_review_viewed.request"
+          | "checkout.forge.set_review_viewed.request"
+          | "checkout.forge.publish_review_comment.request";
+      }
+    >,
+  ): Promise<void> {
+    const correlation = { cwd: msg.cwd, requestId: msg.requestId };
+    switch (msg.type) {
+      case "checkout.forge.get_review_guide.request": {
+        const { value, error } = await this.runReviewOperation(
+          msg.cwd,
+          msg.identity.forge,
+          (service) => {
+            if (!service.getReviewGuide) throw new ReviewGuideError("unsupported");
+            return service.getReviewGuide(msg);
+          },
+        );
+        this.host.emit({
+          type: "checkout.forge.get_review_guide.response",
+          payload: { ...correlation, guide: value, error },
+        });
+        return;
+      }
+
+      case "checkout.forge.get_review_viewed.request": {
+        const { value, error } = await this.runReviewOperation(
+          msg.cwd,
+          msg.identity.forge,
+          (service) => {
+            if (!service.getReviewViewed) throw new ReviewGuideError("unsupported");
+            return service.getReviewViewed(msg);
+          },
+        );
+        this.host.emit({
+          type: "checkout.forge.get_review_viewed.response",
+          payload: { ...correlation, viewed: value, error },
+        });
+        return;
+      }
+
+      case "checkout.forge.set_review_viewed.request": {
+        const { value, error } = await this.runReviewOperation(
+          msg.cwd,
+          msg.identity.forge,
+          (service) => {
+            if (!service.setReviewViewed) throw new ReviewGuideError("unsupported");
+            return service.setReviewViewed(msg);
+          },
+        );
+        this.host.emit({
+          type: "checkout.forge.set_review_viewed.response",
+          payload: { ...correlation, entry: value, error },
+        });
+        return;
+      }
+
+      case "checkout.forge.publish_review_comment.request": {
+        const { value, error } = await this.runReviewOperation(
+          msg.cwd,
+          msg.identity.forge,
+          (service) => {
+            if (!service.publishReviewComment) throw new ReviewGuideError("unsupported");
+            return service.publishReviewComment(msg);
+          },
+        );
+        this.host.emit({
+          type: "checkout.forge.publish_review_comment.response",
+          payload: { ...correlation, comment: value, error },
+        });
+        return;
+      }
     }
   }
 

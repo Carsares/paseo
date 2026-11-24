@@ -82,6 +82,8 @@ import {
   successColorMapping,
 } from "./section-kit";
 import { PullRequestPaneSplit } from "./split";
+import type { ReviewGuideConnection } from "./review-guide/port";
+import { ReviewGuideSlot } from "./review-guide/section";
 
 const ThemedCircleCheck = withUnistyles(CircleCheck);
 const ThemedCircleX = withUnistyles(CircleX);
@@ -192,12 +194,14 @@ export function PullRequestPane({
   data,
   activityLoading,
   workspaceAttachmentScopeKey,
+  reviewGuide,
 }: {
   serverId: string;
   cwd: string;
   data: PrPaneData;
   activityLoading: boolean;
   workspaceAttachmentScopeKey?: string;
+  reviewGuide?: ReviewGuideConnection;
 }) {
   const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
@@ -567,6 +571,13 @@ export function PullRequestPane({
             onAddLogsToChat={handleAddCheckLogsToChat}
           />
         )}
+        <ReviewGuideSlot
+          connection={reviewGuide}
+          serverId={serverId}
+          cwd={cwd}
+          data={data}
+          attachmentScope={workspaceAttachmentScopeKey}
+        />
       </>
       <SectionHeader
         title={t("workspace.git.pr.sections.activity")}

@@ -58,6 +58,8 @@ describe("checkout status projection", () => {
         state: "open",
         baseRefName: "main",
         headRefName: "feature/pr-pane",
+        headSha: "b".repeat(40),
+        reviewVersion: { baseSha: "a".repeat(40), headSha: "b".repeat(40) },
         isMerged: false,
         isDraft: true,
         mergeable: "MERGEABLE",
@@ -80,6 +82,7 @@ describe("checkout status projection", () => {
     expect(payload).toHaveProperty("repoName", "internal-repo");
     expect(payload).toHaveProperty("forge", "github");
     expect(payload).toHaveProperty("projectPath", "internal-owner/internal-repo");
+    expect(payload?.reviewVersion).toEqual({ baseSha: "a".repeat(40), headSha: "b".repeat(40) });
     expect(payload).toHaveProperty("mergeable", "MERGEABLE");
     expect(CheckoutPrStatusSchema.parse(payload)).toEqual(payload);
   });
