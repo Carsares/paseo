@@ -2398,6 +2398,7 @@ export class VoiceAssistantWebSocketServer {
         usageSetting: true,
         usageSources: true,
         providerInstallation: true,
+        providerCustomCli: true,
         ownedSubscriptions: true,
         // COMPAT(agentHierarchyControl): added in v0.16.0, remove gate after 2027-05-19.
         agentHierarchyControl: true,
@@ -2898,10 +2899,7 @@ export class VoiceAssistantWebSocketServer {
     const { ws, parsed, parsedMessage, pendingConnection, activeConnection, log } = args;
     this.incrementRuntimeCounter("validationFailed");
     if (pendingConnection) {
-      pendingConnection.connectionLogger.warn(
-        { error: parsedMessage.error.message },
-        "Rejected pending message before hello",
-      );
+      pendingConnection.connectionLogger.warn("Rejected invalid pending message before hello");
       this.clearPendingConnection(ws);
       try {
         ws.close(WS_CLOSE_INVALID_HELLO, "Invalid hello");
@@ -2912,6 +2910,11 @@ export class VoiceAssistantWebSocketServer {
     }
 
     const requestInfo = extractRequestInfoFromUnknownWsInbound(parsed);
+    const requestType = getSessionRequestTypeFromUnknownWsInbound(parsed);
+    const validationError =
+      requestType === "set_daemon_config_request" || requestType?.startsWith("provider.custom_cli.")
+        ? "Invalid configuration request"
+        : parsedMessage.error.message;
     const isUnknownSchema =
       requestInfo?.requestId != null &&
       typeof parsed === "object" &&
@@ -2924,7 +2927,7 @@ export class VoiceAssistantWebSocketServer {
         clientId: activeConnection?.clientId,
         requestId: requestInfo?.requestId,
         requestType: requestInfo?.requestType,
-        error: parsedMessage.error.message,
+        error: validationError,
       },
       "WS inbound message validation failed",
     );
@@ -2933,7 +2936,7 @@ export class VoiceAssistantWebSocketServer {
       ...requestInfo,
       error: isUnknownSchema
         ? `Unknown request, try upgrading the daemon (currently v${this.daemonVersion})`
-        : `Invalid message: ${parsedMessage.error.message}`,
+        : `Invalid message: ${validationError}`,
       code: isUnknownSchema ? "unknown_schema" : "invalid_message",
     });
   }
@@ -3914,7 +3917,7 @@ export class VoiceAssistantWebSocketServer {
     );
     this.sessions.get(ws)?.session.delivery.protocolFailure(ws, {
       ...requestInfo,
-      error: `Invalid message: ${err.message}`,
+      error: "Invalid message",
       code: "invalid_message",
     });
   }
@@ -4541,6 +4544,14 @@ function getControlRpcLogInfo(
     };
   }
   return null;
+}
+
+function getSessionRequestTypeFromUnknownWsInbound(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return;
+  const record = payload as { type?: unknown; message?: unknown };
+  if (record.type !== "session" || !record.message || typeof record.message !== "object") return;
+  const { type } = record.message as { type?: unknown };
+  return typeof type === "string" ? type : undefined;
 }
 
 function extractRequestInfoFromUnknownWsInbound(

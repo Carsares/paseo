@@ -20,7 +20,11 @@ import { OmpProviderOptionsSchema } from "./providers/omp/provider-config.js";
 import { PiProviderOptionsSchema } from "./providers/pi/agent.js";
 import type { AgentToolResult } from "@getpaseo/plugin/server";
 import type { RuntimeCleanupCandidate } from "./idle-runtime-cleanup/index.js";
-import { AgentNotFoundError, ensureAgentLoaded } from "./agent-loading.js";
+import {
+  AgentNotFoundError,
+  AgentReadRequiresLaunchError,
+  ensureAgentLoaded,
+} from "./agent-loading.js";
 import { continuesAssistantMessage, projectTimelineRows } from "./timeline-projection.js";
 import { buildAgentForkContextAttachment } from "./activity-curator.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
@@ -414,10 +418,18 @@ interface PreparedSessionConfig {
 }
 
 interface NormalizeConfigOptions {
+  canLaunchForRead?: (provider: AgentProvider) => boolean;
   resolveDefaultModel?: boolean;
   env?: Record<string, string>;
   /** Defaults to interactive. A history load reads persisted state and runs nothing. */
   purpose?: AgentResumePurpose;
+}
+
+function assertCanLaunchForRead(
+  provider: AgentProvider,
+  canLaunchForRead?: (provider: AgentProvider) => boolean,
+): void {
+  if (canLaunchForRead?.(provider) === false) throw new AgentReadRequiresLaunchError();
 }
 
 interface PrepareSessionConfigOptions extends NormalizeConfigOptions {
@@ -641,6 +653,7 @@ interface AgentManagerRescueTimeouts {
 
 interface ProviderEnabledFlag {
   enabled: boolean;
+  isDiscoveryDeferred?: (provider: AgentProvider) => boolean;
   derivedFromProviderId?: string | null;
   applyToolPolicy?: (
     config: AgentSessionConfig,
@@ -2200,7 +2213,10 @@ export class AgentManager {
     provider: AgentProvider,
     providerFilter: Set<string> | undefined,
   ): boolean {
-    if (this.providerEnabled.get(provider) === false) {
+    if (
+      this.providerEnabled.get(provider) === false ||
+      this.isProviderDiscoveryDeferred(provider)
+    ) {
       return false;
     }
     if (providerFilter && !providerFilter.has(provider)) {
@@ -2209,9 +2225,19 @@ export class AgentManager {
     return true;
   }
 
-  async listProviderAvailability(): Promise<ProviderAvailability[]> {
+  private isProviderDiscoveryDeferred(provider: AgentProvider): boolean {
+    return this.providerDefinitions.get(provider)?.isDiscoveryDeferred?.(provider) === true;
+  }
+
+  async listProviderAvailability(
+    shouldProbe?: (provider: AgentProvider) => boolean,
+  ): Promise<ProviderAvailability[]> {
     return Promise.all(
-      Array.from(this.clients.keys()).map((provider) => this.getProviderAvailability(provider)),
+      Array.from(this.clients.keys(), (provider) =>
+        this.isProviderDiscoveryDeferred(provider) || shouldProbe?.(provider) === false
+          ? { provider, available: false, error: null }
+          : this.getProviderAvailability(provider),
+      ),
     );
   }
 
@@ -2578,12 +2604,15 @@ export class AgentManager {
       const prefix = await this.timelinePrefixes.load(agentId);
       signal.throwIfAborted();
       const handle =
-        retainedOnly || record.archivedAt
+        retainedOnly || record.archivedAt || this.isProviderDiscoveryDeferred(record.provider)
           ? null
           : toAgentPersistenceHandle(this.getRegisteredProviderIds(), record.persistence);
       return {
         items: prefix?.rows.map(({ item }) => item) ?? [],
-        replay: handle ? { record, handle, prefix } : null,
+        replay:
+          handle && !this.isProviderDiscoveryDeferred(handle.provider)
+            ? { record, handle, prefix }
+            : null,
       };
     });
   }
@@ -2617,7 +2646,7 @@ export class AgentManager {
 
     let events: Extract<AgentStreamEvent, { type: "timeline" }>[];
     try {
-      events = await this.readSummaryProviderHistory({ record, handle, signal });
+      events = await this.readSummaryProviderHistory({ record, handle, signal, readOnly: true });
     } catch (error) {
       signal.throwIfAborted();
       if (!prefix?.rows.length) throw error;
@@ -2652,10 +2681,12 @@ export class AgentManager {
     record,
     handle,
     signal,
+    readOnly,
   }: {
     record: StoredAgentRecord;
     handle: AgentPersistenceHandle;
     signal: AbortSignal;
+    readOnly?: boolean;
   }): Promise<Extract<AgentStreamEvent, { type: "timeline" }>[]> {
     const client = this.requireClient(handle.provider);
     const config = await this.normalizeConfig(
@@ -2668,6 +2699,7 @@ export class AgentManager {
       { purpose: "history", resolveDefaultModel: false },
     );
     signal.throwIfAborted();
+    if (readOnly && this.isProviderDiscoveryDeferred(handle.provider)) return [];
     const reader = await this.resumeProviderSession(
       client,
       handle,
@@ -2784,6 +2816,15 @@ export class AgentManager {
     if (this.agents.has(agentId)) return null;
     const record = await this.registry?.get(agentId);
     if (!record || !(await this.isSilentTopicSeat(record))) return null;
+    return { record, timeline: await this.readStoredTimeline(record, options) };
+  }
+
+  async readStoredTimeline(
+    record: StoredAgentRecord,
+    options?: AgentTimelineFetchOptions,
+  ): Promise<AgentTimelineFetchResult> {
+    const agentId = record.id;
+    if (this.timelineStore.has(agentId)) return this.timelineStore.fetch(agentId, options);
     const [prefix, committed] = await Promise.all([
       this.timelinePrefixes.load(agentId),
       this.durableTimelineStore?.getCommittedRows(agentId),
@@ -2795,7 +2836,7 @@ export class AgentManager {
       epoch: `silent-topic:${agentId}:${record.timelinePrefixSwitchId ?? "initial"}`,
       sealedThrough: maxTimelineSeq(prefix?.rows ?? []),
     });
-    return { record, timeline: snapshot.fetch(agentId, options) };
+    return snapshot.fetch(agentId, options);
   }
 
   listProviderSubagents(parentAgentId: string): ProviderSubagentDescriptor[] {
@@ -2998,7 +3039,10 @@ export class AgentManager {
    * from the record as it is when the lane reaches it. A write queued ahead (`setMetadata`,
    * `setLabels`) is in that record; one queued behind applies to the live agent.
    */
-  createAgentFromRecord(agentId: string): Promise<ManagedAgent> {
+  createAgentFromRecord(
+    agentId: string,
+    canLaunchForRead?: (provider: AgentProvider) => boolean,
+  ): Promise<ManagedAgent> {
     const resolvedAgentId = validateAgentId(agentId, "createAgentFromRecord");
     return this.trackAgentRegistrationOperation(
       this.runLifecycleMutation(resolvedAgentId, async () => {
@@ -3013,6 +3057,7 @@ export class AgentManager {
           );
         }
         const prefix = await this.timelinePrefixes.load(resolvedAgentId);
+        assertCanLaunchForRead(config.provider, canLaunchForRead);
         return this.createAgentInternal(
           config,
           resolvedAgentId,
@@ -3027,6 +3072,7 @@ export class AgentManager {
             ...pickStoredAgentTurnState(record),
           },
           prefix,
+          canLaunchForRead,
         );
       }),
     );
@@ -3039,6 +3085,7 @@ export class AgentManager {
       Pick<StoredAgentRecord, "mainControlSystemPrompt"> &
       StoredAgentTurnState,
     retainedPrefix?: PersistedTimelinePrefix | null,
+    canLaunchForRead?: (provider: AgentProvider) => boolean,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     config = this.withConvertedOptions(config);
@@ -3061,6 +3108,7 @@ export class AgentManager {
       };
       options = { ...options, env: request.env, metadata: request.metadata ?? options.metadata };
     }
+    assertCanLaunchForRead(config.provider, canLaunchForRead);
     if (!retainedPrefix) {
       await this.deleteAgentState(resolvedAgentId);
     }
@@ -3071,8 +3119,10 @@ export class AgentManager {
         env: options.env,
         labels: options.labels,
         mainControlSystemPrompt: options.mainControlSystemPrompt,
+        canLaunchForRead,
       },
     );
+    assertCanLaunchForRead(storedConfig.provider, canLaunchForRead);
     this.requireEnabledProvider(storedConfig.provider);
     const client = await this.requireAvailableClient({
       provider: storedConfig.provider,
@@ -3194,6 +3244,7 @@ export class AgentManager {
       attention?: AttentionState;
     },
     resumeOptions?: AgentResumeSessionOptions,
+    canLaunchForRead?: (provider: AgentProvider) => boolean,
   ): Promise<ManagedAgent> {
     const resolvedAgentId = validateAgentId(
       agentId ?? this.idFactory(),
@@ -3207,6 +3258,7 @@ export class AgentManager {
           resolvedAgentId,
           options,
           resumeOptions,
+          canLaunchForRead,
         ),
       ),
     );
@@ -3228,6 +3280,7 @@ export class AgentManager {
       attention?: AttentionState;
     },
     resumeOptions?: AgentResumeSessionOptions,
+    canLaunchForRead?: (provider: AgentProvider) => boolean,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(
@@ -3259,8 +3312,10 @@ export class AgentManager {
         env: launchEnv,
         labels: record?.labels ?? options?.labels,
         mainControlSystemPrompt,
+        canLaunchForRead,
       },
     );
+    assertCanLaunchForRead(handle.provider, canLaunchForRead);
     const client = this.requireClient(handle.provider);
     const available = await client.isAvailable();
     if (!available) {
@@ -12965,6 +13020,7 @@ export class AgentManager {
     }
 
     const shouldResolveDefaultModel = options.resolveDefaultModel ?? true;
+    assertCanLaunchForRead(normalized.provider, options.canLaunchForRead);
     if (shouldResolveDefaultModel && !normalized.model) {
       const defaultModelId = await this.resolveDefaultModelId(normalized);
       if (defaultModelId) {
@@ -13059,6 +13115,7 @@ export class AgentManager {
       env: options.env,
       purpose: options.purpose,
       resolveDefaultModel: options.resolveDefaultModel,
+      canLaunchForRead: options.canLaunchForRead,
     });
     const parentId = this.localHierarchyParentId(options.labels);
     const mainControlRoleVersion = parentId

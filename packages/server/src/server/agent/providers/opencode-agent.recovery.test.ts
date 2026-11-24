@@ -232,9 +232,13 @@ test("sends the next turn to the new OpenCode server after the old one exits", a
   session.subscribe((event) => observed.push(event));
   await exited.connected(1);
   exited.send(0, connectedRecord());
+  const commands = await session.listCommands?.({ allowLaunch: false });
+  expect(commands?.map(({ name }) => name)).toContain("test-command");
   processes[0]?.exit();
   await exited.close();
 
+  expect(await session.listCommands?.({ allowLaunch: false })).toEqual(commands);
+  expect(processes).toHaveLength(1);
   const turn = session.startTurn("after restart");
   await current.connected(1);
   current.send(0, connectedRecord());
@@ -387,6 +391,7 @@ async function createRecoveryUpstream() {
       listeningResponse = response;
       return;
     }
+    if (pathname === "/command") return json(response, [{ name: "test-command" }]);
     if (request.url?.startsWith("/global/event")) {
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.flushHeaders();

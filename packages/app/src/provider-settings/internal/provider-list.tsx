@@ -12,7 +12,12 @@ import { useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { settingsStyles } from "@/styles/settings";
 import { buildProviderDefinitions } from "@/utils/provider-definitions";
 import { AddProviderSheet } from "./add-provider-sheet";
-import { useProviderConfigActions, type ProviderEntry } from "./provider-config";
+import { CustomProviderCliFormSheet } from "./custom-provider-cli-form";
+import {
+  useProviderConfigActions,
+  useSupportsCustomProviderCli,
+  type ProviderEntry,
+} from "./provider-config";
 import { ProviderGlyph } from "./provider-glyph";
 import { ProviderNotice } from "./provider-notice";
 import { ProviderRow } from "./provider-row";
@@ -33,13 +38,21 @@ export function ProviderList({ serverId, onOpenProvider, sheetFrame }: ProviderL
   const isConnected = useHostRuntimeIsConnected(serverId) && serverId.length > 0;
   const { entries, isLoading } = useProvidersSnapshot(serverId);
   const { setEnabled, togglingProviderId } = useProviderConfigActions(serverId);
+  const supportsCustomCli = useSupportsCustomProviderCli(serverId);
   const definitions = useMemo(() => buildProviderDefinitions(entries), [entries]);
   const [adding, setAdding] = useState(false);
+  const [addingCustomCli, setAddingCustomCli] = useState(false);
   const openAdd = useCallback(() => setAdding(true), []);
   const closeAdd = useCallback(() => setAdding(false), []);
+  const openAddCustomCli = useCallback(() => {
+    setAdding(false);
+    setAddingCustomCli(true);
+  }, []);
+  const closeAddCustomCli = useCallback(() => setAddingCustomCli(false), []);
   const handleAdded = useCallback(
     (providerId: string) => {
       setAdding(false);
+      setAddingCustomCli(false);
       onOpenProvider(providerId);
     },
     [onOpenProvider],
@@ -103,13 +116,26 @@ export function ProviderList({ serverId, onOpenProvider, sheetFrame }: ProviderL
         {body}
       </SettingsSection>
       {isConnected ? (
-        <AddProviderSheet
-          serverId={serverId}
-          visible={adding}
-          onClose={closeAdd}
-          onAdded={handleAdded}
-          frame={sheetFrame}
-        />
+        <>
+          <AddProviderSheet
+            serverId={serverId}
+            visible={adding}
+            onClose={closeAdd}
+            onAdded={handleAdded}
+            onAddCustomCli={supportsCustomCli ? openAddCustomCli : undefined}
+            frame={sheetFrame}
+          />
+          {supportsCustomCli ? (
+            <CustomProviderCliFormSheet
+              mode="create"
+              serverId={serverId}
+              visible={addingCustomCli}
+              onClose={closeAddCustomCli}
+              onSaved={handleAdded}
+              frame={sheetFrame}
+            />
+          ) : null}
+        </>
       ) : null}
     </>
   );

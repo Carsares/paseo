@@ -1,4 +1,5 @@
-import { execFile } from "node:child_process";
+import { execFile, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -3613,6 +3614,63 @@ describe("ClaudeAgentSession context window usage", () => {
     await persistedSession.close();
 
     expect(persistedQueryFactory.mock.calls[0]?.[0].options.persistSession).toBe(true);
+  });
+
+  test("read-only commands keep static and cached Claude commands across a process exit", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "claude-readonly-commands-"));
+    const script = path.join(root, "claude.cjs");
+    const marker = path.join(root, "started");
+    await fs.writeFile(marker, "");
+    await fs.writeFile(
+      script,
+      `
+        if (process.argv.includes("--version")) {
+          console.log("2.0.0 (Claude Code)");
+          process.exit(0);
+        }
+        require("node:fs").appendFileSync(${JSON.stringify(marker)}, "started\\n");
+        require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
+          const message = JSON.parse(line);
+          if (message.type !== "control_request") return;
+          console.log(JSON.stringify({
+            type: "control_response",
+            response: {
+              subtype: "success",
+              request_id: message.request_id,
+              response: {
+                commands: [{ name: "cached-skill", description: "Cached skill", argumentHint: "" }],
+                agents: [], models: [], account: {}, output_style: "default", available_output_styles: [],
+              },
+            },
+          }));
+        });
+      `,
+    );
+    const client = new ClaudeAgentClient({
+      logger,
+      resolveBinary: async () => script,
+      runtimeSettings: { command: { mode: "replace", argv: [process.execPath, script] } },
+    });
+    const session = await client.createSession({ provider: "claude", cwd: root });
+    try {
+      const read = async () =>
+        (await session.listCommands!({ allowLaunch: false })).map(({ name }) => name);
+      expect(await read()).toEqual(["rewind"]);
+      expect(await fs.readFile(marker, "utf8")).toBe("");
+
+      await session.listCommands!();
+      expect(await read()).toEqual(["cached-skill", "rewind"]);
+      const { childProcess } = session as unknown as { childProcess: ChildProcess };
+      const exited = once(childProcess, "exit");
+      childProcess.kill();
+      await exited;
+
+      expect(await read()).toEqual(["cached-skill", "rewind"]);
+      expect(await fs.readFile(marker, "utf8")).toBe("started\n");
+    } finally {
+      await session.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   test("classifies Claude root-only commands separately from inline skills and hides internal ones", async () => {

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
+import { bindCustomProviderLaunch } from "../../scoped-custom-provider-launch.js";
 import { ClaudeAgentClient } from "./agent.js";
 import {
   CLAUDE_DISABLED_THINKING_OPTION_ID,
@@ -511,6 +512,50 @@ describe("ClaudeAgentClient.fetchCatalog", () => {
     });
 
     expect(models.map((model) => model.id)).toContain("glm-5.1");
+  });
+
+  it("reads the local settings catalog during managed refresh without calling Claude", async () => {
+    const configDir = await createClaudeConfigDir({
+      model: "gateway-model",
+      env: { ANTHROPIC_API_KEY: "not-a-model" },
+    });
+    const resolveVersion = vi.fn(async () => "2.1.321");
+    const discoverModels = vi.fn(async () => []);
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      resolveVersion,
+      discoverModels,
+      runtimeSettings: { env: { CLAUDE_CONFIG_DIR: configDir } },
+    });
+    const { run } = bindCustomProviderLaunch({
+      adapter: "claude",
+      providerId: "claude-custom",
+      cwd: configDir,
+      argv: [],
+      env: {},
+      file: process.execPath,
+      entrypoint: process.execPath,
+      entrypointArgs: [],
+      files: [],
+    });
+
+    const refresh = () => run(() => client.fetchCatalog({ scope: "global", force: true }));
+    const catalog = await refresh();
+
+    expect(catalog.models.map(({ id }) => id)).toContain("gateway-model");
+    expect(catalog.models.map(({ id }) => id)).not.toContain("not-a-model");
+    expect(catalog.models.filter(({ id }) => id.startsWith("claude-mythos-"))).toEqual([]);
+    expect(catalog.modes.length).toBeGreaterThan(0);
+
+    await fs.writeFile(
+      path.join(configDir, "settings.json"),
+      JSON.stringify({ model: "claude-mythos-5-2" }),
+    );
+    expect((await refresh()).models.filter(({ id }) => id.startsWith("claude-mythos-"))).toEqual([
+      expect.objectContaining({ id: "claude-mythos-5-2", label: "claude-mythos-5-2" }),
+    ]);
+    expect(resolveVersion).not.toHaveBeenCalled();
+    expect(discoverModels).not.toHaveBeenCalled();
   });
 
   it("falls back to hardcoded models when settings.json is missing", async () => {

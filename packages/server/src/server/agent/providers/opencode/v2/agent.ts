@@ -40,7 +40,7 @@ import { importSessionFromPersistence } from "../../../provider-session-import.j
 
 import type { OpenCodeBridge } from "../bridge.js";
 import { resolveOpenCodeHomeDir } from "../paths.js";
-import { V2Runtime, type V2Connection } from "./runtime.js";
+import { V2Runtime, type V2Connection, type V2RuntimeOptions } from "./runtime.js";
 import type { OpenCodeServiceSelection } from "./service-selection.js";
 import { modelRef, modesFromV2, modelsFromV2 } from "./mapping.js";
 
@@ -51,6 +51,7 @@ interface V2AgentOptions {
   bridge?: OpenCodeBridge;
   runtime?: Pick<V2Runtime, "acquire" | "shutdown">;
   selection?: OpenCodeServiceSelection;
+  catalogDiscovery?: V2RuntimeOptions["catalogDiscovery"];
 }
 
 export class OpenCodeV2AgentClient implements AgentClient {
@@ -79,7 +80,10 @@ export class OpenCodeV2AgentClient implements AgentClient {
       signal: context?.signal,
     });
     const location = {
-      directory: options.scope === "workspace" ? options.cwd : resolveOpenCodeHomeDir(),
+      directory:
+        options.scope === "workspace"
+          ? options.cwd
+          : (this.options.catalogDiscovery?.cwd ?? resolveOpenCodeHomeDir()),
     };
     const request = { signal: context?.signal };
     const activity = <T>(name: string, operation: () => Promise<T>) =>

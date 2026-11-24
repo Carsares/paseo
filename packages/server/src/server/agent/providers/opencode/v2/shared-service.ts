@@ -20,6 +20,7 @@ interface SharedServiceOptions {
   logger: Logger;
   settings?: ProviderRuntimeSettings;
   bridge?: OpenCodeBridge;
+  signal?: AbortSignal;
 }
 
 export interface SharedService {
@@ -81,7 +82,11 @@ export async function connectSharedService(
   let info: Awaited<ReturnType<typeof client.server.info>>;
   try {
     info = await client.server.info({
-      signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(30_000)]),
+      signal: AbortSignal.any([
+        lifetime.signal,
+        AbortSignal.timeout(30_000),
+        ...(options.signal ? [options.signal] : []),
+      ]),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -100,7 +105,10 @@ export async function connectSharedService(
     const configDirectory = openCodeConfigDirectory(env);
     const home = resolveOpenCodeHomeDir();
     await mkdir(home, { recursive: true });
-    const entries = await client.config.get({ location: { directory: home } });
+    const entries = await client.config.get(
+      { location: { directory: home } },
+      { signal: options.signal },
+    );
     if (
       !entries.some(
         (entry) =>

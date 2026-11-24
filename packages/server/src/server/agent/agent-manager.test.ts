@@ -5217,12 +5217,11 @@ test("the provider's terminal for a run bound to an already finalized turn settl
 }, 10_000);
 
 test("listProviderAvailability uses registered client keys, including custom providers", async () => {
+  const isAvailable = vi.fn(async () => true);
   const customClient: AgentClient = {
     provider: "zai",
     capabilities: TEST_CAPABILITIES,
-    async isAvailable() {
-      return true;
-    },
+    isAvailable,
     async createSession() {
       throw new Error("not implemented");
     },
@@ -5238,6 +5237,10 @@ test("listProviderAvailability uses registered client keys, including custom pro
     logger,
   });
 
+  await expect(manager.listProviderAvailability((provider) => provider !== "zai")).resolves.toEqual(
+    [{ provider: "zai", available: false, error: null }],
+  );
+  expect(isAvailable).not.toHaveBeenCalled();
   await expect(manager.listProviderAvailability()).resolves.toEqual([
     {
       provider: "zai",
@@ -5245,6 +5248,7 @@ test("listProviderAvailability uses registered client keys, including custom pro
       error: null,
     },
   ]);
+  expect(isAvailable).toHaveBeenCalledOnce();
 });
 
 test("createAgent passes daemon launch env through the provider launch context", async () => {
@@ -16098,6 +16102,15 @@ test.each([
     {
       claude: { enabled: true, derivedFromProviderId: null },
       codex: { enabled: false, derivedFromProviderId: null },
+    },
+  ],
+  [
+    "awaiting discovery",
+    "claude",
+    "codex",
+    {
+      claude: { enabled: true },
+      codex: { enabled: true, isDiscoveryDeferred: () => true },
     },
   ],
 ])(

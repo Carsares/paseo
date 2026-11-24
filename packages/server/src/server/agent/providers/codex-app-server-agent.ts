@@ -1,3 +1,4 @@
+import { spawnScopedProviderProcess } from "../scoped-provider-process.js";
 import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { applyProviderOptionsPatch } from "../option-controls.js";
 import { assertChangesAreLive, validateProviderOptions } from "../provider-options.js";
@@ -72,7 +73,6 @@ import {
 } from "./codex/tool-call-mapper.js";
 import { normalizeCodexFilePath } from "./codex/tool-call-detail-parser.js";
 import {
-  checkProviderLaunchAvailable,
   createProviderEnv,
   resolveProviderLaunch,
   type ProviderRuntimeSettings,
@@ -81,7 +81,12 @@ import {
 import {
   findExecutable,
   probeExecutable,
+  type ExecutableFileLookupOptions,
 } from "../../../executable-resolution/executable-resolution.js";
+import {
+  assertScopedLaunch,
+  currentCustomProviderLaunch,
+} from "../scoped-custom-provider-launch.js";
 import { createPathEquivalenceMatcher } from "../../../utils/path.js";
 import { spawnProcess, type SpawnProcessOptions } from "../../../utils/spawn.js";
 import { extractCodexTerminalSessionId, nonEmptyString } from "./tool-call-mapper-utils.js";
@@ -346,6 +351,7 @@ interface CodexAppServerProcessSpawnInput extends CodexAppServerLaunchPrefix {
 interface CodexAppServerProcessPort {
   resolvePrefix(options: {
     runtimeSettings?: ProviderRuntimeSettings;
+    environment: Record<string, string>;
   }): Promise<CodexAppServerLaunchPrefix>;
   spawn(input: CodexAppServerProcessSpawnInput): ChildProcess;
 }
@@ -607,8 +613,11 @@ function mergeCodexConfiguredDefaults(
   };
 }
 
-function codexMicrosoftStorePackageRoot(): string | null {
-  const localAppData = process.env.LOCALAPPDATA;
+function codexMicrosoftStorePackageRoot(env: NodeJS.ProcessEnv): string | null {
+  const key = Object.keys(env)
+    .sort()
+    .find((item) => item.toUpperCase() === "LOCALAPPDATA");
+  const localAppData = key === undefined ? undefined : env[key];
   if (!localAppData) {
     return null;
   }
@@ -636,12 +645,21 @@ export function codexMicrosoftStoreBinaryCandidates(
     .sort();
 }
 
-export async function findCodexMicrosoftStoreBinary(): Promise<string | null> {
+export async function findCodexMicrosoftStoreBinary(env = process.env): Promise<string | null> {
+  return findCodexStoreCandidate(env, (candidate, cwd) =>
+    findInstallationLaunchPath(candidate, { cwd, env }),
+  );
+}
+
+async function findCodexStoreCandidate(
+  env: NodeJS.ProcessEnv,
+  accept: (candidate: string, cwd: string) => Promise<string | null>,
+): Promise<string | null> {
   if (process.platform !== "win32") {
     return null;
   }
 
-  const packageRoot = codexMicrosoftStorePackageRoot();
+  const packageRoot = codexMicrosoftStorePackageRoot(env);
   if (!packageRoot) {
     return null;
   }
@@ -654,39 +672,52 @@ export async function findCodexMicrosoftStoreBinary(): Promise<string | null> {
   }
 
   for (const candidate of codexMicrosoftStoreBinaryCandidates(packageRoot, entries)) {
-    if (await probeExecutable(candidate)) {
-      return candidate;
-    }
+    const found = await accept(candidate, packageRoot);
+    if (found) return found;
   }
 
   return null;
 }
 
+/** Resolve the file a Codex launch will use, without executing candidates. */
+export async function findCodexLaunchFile(
+  name: string,
+  options: ExecutableFileLookupOptions,
+  allowStoreFallback: boolean,
+): Promise<string | null> {
+  const fromPath = await findInstallationLaunchPath(name, options);
+  if (fromPath || !allowStoreFallback) return fromPath;
+  return await findCodexMicrosoftStoreBinary(options.env);
+}
+
 export async function findDefaultCodexBinary(): Promise<string | null> {
-  const pathBinary = await findExecutable("codex");
-  if (pathBinary) return pathBinary;
-  return await findCodexMicrosoftStoreBinary();
+  return findCodexLaunchFile("codex", { cwd: process.cwd() }, true);
 }
 
 async function resolveCodexLaunchPrefix(
   runtimeSettings?: ProviderRuntimeSettings,
+  environment = buildCodexAppServerEnv(runtimeSettings),
 ): Promise<CodexAppServerLaunchPrefix> {
   const launch = await resolveCodexLaunch(runtimeSettings);
-  const availability = await checkCodexLaunchAvailable(launch);
-  if (!availability.available) {
+  const scope = currentCustomProviderLaunch();
+  const resolvedPath =
+    scope || launch.source === "override"
+      ? (await checkCodexLaunchAvailable(launch, environment, scope?.cwd)).resolvedPath
+      : ((await findExecutable(launch.command, { env: environment })) ??
+        (await findCodexStoreCandidate(environment, async (candidate) =>
+          (await probeExecutable(candidate, { env: environment })) ? candidate : null,
+        )));
+  if (!resolvedPath) {
     throw new Error(
       "Codex binary not found. Install the Codex CLI (https://github.com/openai/codex) and ensure it is available in your shell PATH.",
     );
   }
-  return {
-    command:
-      launch.source === "override" ? launch.command : (availability.resolvedPath ?? launch.command),
-    args: launch.args,
-  };
+  return { command: resolvedPath, args: launch.args };
 }
 
 const defaultCodexAppServerProcess: CodexAppServerProcessPort = {
-  resolvePrefix: ({ runtimeSettings }) => resolveCodexLaunchPrefix(runtimeSettings),
+  resolvePrefix: ({ runtimeSettings, environment }) =>
+    resolveCodexLaunchPrefix(runtimeSettings, environment),
   spawn: ({ command, args, options }) => spawnProcess(command, args, options),
 };
 
@@ -695,18 +726,21 @@ async function resolveCodexLaunch(
 ): Promise<ResolvedProviderLaunch> {
   return resolveProviderLaunch({
     commandConfig: runtimeSettings?.command,
-    defaultBinary: {
-      command: "codex",
-      resolvePath: findDefaultCodexBinary,
-    },
+    defaultBinary: "codex",
   });
 }
 
-async function checkCodexLaunchAvailable(launch: ResolvedProviderLaunch) {
-  return checkProviderLaunchAvailable(launch, {
-    command: "codex",
-    resolvePath: findDefaultCodexBinary,
-  });
+async function checkCodexLaunchAvailable(
+  launch: ResolvedProviderLaunch,
+  env: NodeJS.ProcessEnv,
+  cwd = process.cwd(),
+) {
+  const resolvedPath = await findCodexLaunchFile(
+    launch.command,
+    { cwd, env },
+    launch.source !== "override",
+  );
+  return { available: resolvedPath !== null, resolvedPath };
 }
 
 function resolveCodexHomeDir(env: NodeJS.ProcessEnv): string {
@@ -6110,10 +6144,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.client = null;
   }
 
-  async listCommands(): Promise<AgentSlashCommand[]> {
+  async listCommands(options?: { allowLaunch?: boolean }): Promise<AgentSlashCommand[]> {
     const prompts = await listCodexCustomPrompts(this.codexHome);
     if (this.connectionState === "disconnected") {
-      await this.connect();
+      if (options?.allowLaunch !== false) await this.connect();
     } else {
       await this.loadSkills();
     }
@@ -8478,14 +8512,12 @@ export class CodexAppServerAgentClient implements AgentClient {
     }),
     getActivityKeys: async (launch) => {
       const configured = await resolveCodexLaunch(this.runtimeSettings);
-      const env =
-        configured.source === "override"
-          ? buildCodexAppServerEnv(this.runtimeSettings, launch?.env)
-          : process.env;
-      const command = await findInstallationLaunchPath(configured.command, {
+      const env = buildCodexAppServerEnv(this.runtimeSettings, launch?.env);
+      const { resolvedPath: command } = await checkCodexLaunchAvailable(
+        configured,
         env,
-        cwd: launch?.cwd ?? process.cwd(),
-      });
+        launch?.cwd,
+      );
       const keys = command ? await readInstallationActivityKeys(command) : [];
       return configured.source === "override" ? [...keys, "opaque"] : keys;
     },
@@ -8522,15 +8554,17 @@ export class CodexAppServerAgentClient implements AgentClient {
     executable: string;
   } | null> {
     const launch = await resolveCodexLaunch(this.runtimeSettings);
-    const availability = await checkCodexLaunchAvailable(launch);
-    if (!availability.available) return null;
-    const command =
-      launch.source === "override" ? launch.command : (availability.resolvedPath ?? launch.command);
-    return {
-      command,
-      args: [...launch.args],
-      executable: availability.resolvedPath ?? command,
-    };
+    const resolvedPath = await findCodexLaunchFile(
+      launch.command,
+      {
+        cwd: process.cwd(),
+        env: buildCodexAppServerEnv(this.runtimeSettings),
+        skipMissingInterpreter: launch.source !== "override",
+      },
+      launch.source !== "override",
+    );
+    if (!resolvedPath) return null;
+    return { command: resolvedPath, args: [...launch.args], executable: resolvedPath };
   }
 
   private sessionDeps(launchEnv: Record<string, string> | undefined): CodexAppServerAgentDeps {
@@ -8579,6 +8613,8 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 
   private async probeAutoReviewEnabled(signal?: AbortSignal): Promise<boolean> {
+    // The discovery authorization permits app-server, not a separate version process.
+    if (currentCustomProviderLaunch()) return false;
     try {
       const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
       signal?.throwIfAborted();
@@ -8602,11 +8638,19 @@ export class CodexAppServerAgentClient implements AgentClient {
     goalsEnabled?: boolean;
     agentId?: string;
   }): Promise<() => ChildProcessWithoutNullStreams> {
+    const scope = currentCustomProviderLaunch();
     const processPort = this.deps.appServerProcess ?? defaultCodexAppServerProcess;
-    const launchPrefix = await processPort.resolvePrefix({ runtimeSettings: this.runtimeSettings });
+    if (scope && processPort !== defaultCodexAppServerProcess) {
+      throw new Error("Custom CLI discovery launch is unsupported");
+    }
+    const launch = scope ? await resolveCodexLaunch(this.runtimeSettings) : undefined;
+    const launchPrefix = await processPort.resolvePrefix({
+      runtimeSettings: this.runtimeSettings,
+      environment: options.environment,
+    });
     const resolved = await findInstallationLaunchPath(launchPrefix.command, {
       env: options.environment,
-      cwd: process.cwd(),
+      cwd: scope?.cwd ?? process.cwd(),
     });
     const keys = resolved ? await readInstallationActivityKeys(resolved) : [];
     const args = [...launchPrefix.args, "app-server"];
@@ -8614,6 +8658,17 @@ export class CodexAppServerAgentClient implements AgentClient {
       args.push("--enable", "goals");
     }
     return () => {
+      const binding =
+        launch && scope
+          ? assertScopedLaunch({
+              adapter: CODEX_PROVIDER,
+              providerId: this.deps.customProvider?.id ?? CODEX_PROVIDER,
+              cwd: scope.cwd,
+              argv: [launch.command, ...args],
+              env: options.environment,
+              file: launchPrefix.command,
+            })
+          : undefined;
       this.logger.trace(
         {
           agentId: options.agentId,
@@ -8622,22 +8677,30 @@ export class CodexAppServerAgentClient implements AgentClient {
         },
         "provider.codex.spawn",
       );
-      const child = acquireInstallationProcess(
-        {
-          family: CODEX_PROVIDER,
-          keys,
-          opaque: !keys.length || this.runtimeSettings?.command?.mode === "replace",
-        },
-        () =>
-          processPort.spawn({
-            command: launchPrefix.command,
-            args,
-            options: {
-              detached: process.platform !== "win32",
-              stdio: ["pipe", "pipe", "pipe"],
-              baseEnv: options.environment,
-            },
-          }),
+      const activity = {
+        family: CODEX_PROVIDER,
+        keys,
+        opaque: !keys.length || this.runtimeSettings?.command?.mode === "replace",
+      };
+      if (binding && scope) {
+        return spawnScopedProviderProcess({
+          command: binding.entrypoint,
+          args: [...binding.entrypointArgs, ...args],
+          cwd: scope.processCwd,
+          env: options.environment,
+          activity,
+        });
+      }
+      const child = acquireInstallationProcess(activity, () =>
+        processPort.spawn({
+          command: launchPrefix.command,
+          args,
+          options: {
+            detached: process.platform !== "win32",
+            stdio: ["pipe", "pipe", "pipe"],
+            baseEnv: options.environment,
+          },
+        }),
       );
       assertChildWithPipes(child);
       return child;
@@ -8924,14 +8987,20 @@ export class CodexAppServerAgentClient implements AgentClient {
 
   async isAvailable(): Promise<boolean> {
     const launch = await resolveCodexLaunch(this.runtimeSettings);
-    const availability = await checkCodexLaunchAvailable(launch);
+    const availability = await checkCodexLaunchAvailable(
+      launch,
+      buildCodexAppServerEnv(this.runtimeSettings),
+    );
     return availability.available;
   }
 
   async getDiagnostic(): Promise<{ diagnostic: string }> {
     try {
       const launch = await resolveCodexLaunch(this.runtimeSettings);
-      const availability = await checkCodexLaunchAvailable(launch);
+      const availability = await checkCodexLaunchAvailable(
+        launch,
+        buildCodexAppServerEnv(this.runtimeSettings),
+      );
       const entries: Array<{ label: string; value: string }> = [
         ...(await buildCommandResolutionDiagnosticRows(launch, {
           knownBinaryNames: ["codex"],

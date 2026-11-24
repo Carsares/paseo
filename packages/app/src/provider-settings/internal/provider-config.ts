@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Alert } from "react-native";
+import type { MutableDaemonConfig } from "@getpaseo/protocol/messages";
 import { useToast } from "@/contexts/toast-api-context";
 import { useDaemonConfig } from "@/hooks/use-daemon-config";
 import {
@@ -10,10 +11,114 @@ import {
 } from "@/hooks/use-acp-provider-catalog";
 import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
 import { selectHostFeature, useHostFeature } from "@/runtime/host-features";
+import { useHostRuntimeClient } from "@/runtime/host-runtime";
 import { useSessionStore } from "@/stores/session-store";
 import { confirmDialog } from "@/utils/confirm-dialog";
+import {
+  isBuiltinProviderId,
+  isValidCustomProviderExtends,
+  type CustomProviderCliClient,
+  type CustomProviderCliInitialProvider,
+  type CustomProviderCliTargetKind,
+} from "./custom-provider-cli-form-model";
 
 export type ProviderEntry = NonNullable<ReturnType<typeof useProvidersSnapshot>["entries"]>[number];
+
+export interface CustomProviderEditTarget {
+  targetKind: Exclude<CustomProviderCliTargetKind, "new">;
+  initialProvider: CustomProviderCliInitialProvider;
+}
+
+/** Single feature gate for custom provider CLI configuration on a host. */
+// COMPAT(providerCustomCli): added in v0.17.0, remove gate once daemon floor supports custom CLI RPCs.
+export function useSupportsCustomProviderCli(serverId: string | null | undefined): boolean {
+  return useHostFeature(serverId, "providerCustomCli");
+}
+
+export function useCustomProviderCliClient(serverId: string): CustomProviderCliClient | null {
+  return useHostRuntimeClient(serverId);
+}
+
+function readOptionalString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function readOptionalStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const items: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") return undefined;
+    items.push(item);
+  }
+  return items.length > 0 ? items : undefined;
+}
+
+/**
+ * Reads non-secret metadata and command from daemon config for one provider.
+ * Environment values are intentionally excluded so the form remains write-only.
+ */
+export function readCustomProviderConfig(
+  config: MutableDaemonConfig | null,
+  providerId: string,
+): Omit<CustomProviderCliInitialProvider, "providerId"> | null {
+  const raw = config?.providers?.[providerId];
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    extends: readOptionalString(raw.extends),
+    label: readOptionalString(raw.label),
+    description: readOptionalString(raw.description),
+    command: readOptionalStringArray(raw.command),
+  };
+}
+
+/**
+ * Resolves whether an existing provider detail entry can be edited via the custom CLI form.
+ * Built-in providers edit as overrides; config-owned derived/ACP providers keep their extends.
+ * External plugin providers return null so they never impersonate built-ins.
+ */
+export function resolveCustomProviderEditTarget(input: {
+  entry: ProviderEntry;
+  config: MutableDaemonConfig | null;
+}): CustomProviderEditTarget | null {
+  const { entry, config } = input;
+  const configured = readCustomProviderConfig(config, entry.provider);
+
+  if (isBuiltinProviderId(entry.provider) && entry.source !== "custom") {
+    return {
+      targetKind: "builtin",
+      initialProvider: {
+        providerId: entry.provider,
+        label: configured?.label,
+        description: configured?.description,
+        command: configured?.command,
+      },
+    };
+  }
+
+  const configuredExtends = configured?.extends;
+  const fallbackExtends =
+    entry.source === "custom" && isValidCustomProviderExtends(entry.derivedFromProviderId)
+      ? entry.derivedFromProviderId
+      : undefined;
+  const resolvedExtends = isValidCustomProviderExtends(configuredExtends)
+    ? configuredExtends
+    : fallbackExtends;
+
+  if (entry.source === "custom" && resolvedExtends) {
+    return {
+      targetKind: "custom",
+      initialProvider: {
+        providerId: entry.provider,
+        extends: resolvedExtends,
+        label: configured?.label ?? entry.label,
+        description: configured?.description ?? entry.description,
+        command: configured?.command,
+      },
+    };
+  }
+
+  return null;
+}
 
 export interface ProviderConfigActions {
   /** The provider whose Enabled switch is being saved. */

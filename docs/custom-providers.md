@@ -1,6 +1,6 @@
 # Custom Provider Configuration
 
-Paseo supports configuring custom agent providers through `config.json` (located at `$PASEO_HOME/config.json`, typically `~/.paseo/config.json`). You can extend built-in providers with different API backends, add ACP-compatible agents, set custom binaries, disable providers, and create multiple profiles for the same underlying provider.
+You can add or edit a custom CLI in a host’s provider settings. Provider definitions are stored in `config.json` on that host (typically `~/.paseo/config.json`, or `$PASEO_HOME/config.json` if set). Edit the file directly to set provider-specific options, define model lists, or configure a [local provider plugin](plugins.md) for a CLI with its own protocol.
 
 Provider definitions live under `agents.providers` in config.json:
 
@@ -16,6 +16,16 @@ Provider definitions live under `agents.providers` in config.json:
 ```
 
 Provider IDs must be lowercase alphanumeric with hyphens (`/^[a-z][a-z0-9-]*$/`).
+
+In provider settings, add a separate entry to inherit a built-in provider or select Agent Client Protocol (ACP) for a CLI that supports it over standard input and output. Edit a built-in entry to override the executable it uses. Enter the executable and each argument separately. Use the environment fields for API keys. Existing values stay hidden, and a new value replaces only the named variable.
+
+If you change which provider an entry inherits from in `config.json`, reload the host configuration and reopen the entry's editor before saving.
+
+Path lookup finds an executable on the selected host. For an ACP entry, the separate connection test starts the configured executable and checks its initial protocol response. Install the CLI on the host first if it normally runs through a launcher such as `npx` or `uvx`. An existing command configured directly in `config.json` can still run its launcher when you explicitly start a session.
+
+Saving a new launch command or changing its launch environment does not start the CLI. To discover its models and modes, select **Refresh** in the provider details. This can start the CLI and requires permission to manage the host. For a Claude entry, Refresh lists built-in models and models from Claude's local settings. After restarting the host service, refresh again if the provider is waiting for discovery.
+
+On Windows hosts, you can locate and save a CLI. Connection tests and discovery that starts a local CLI require a macOS or Linux host. Claude's local settings and an existing OpenCode service are still available for discovery on Windows.
 
 Each provider catalog refresh waits up to 2 minutes. If a provider loads many plugins or a large
 agent catalog during startup, raise the limit in milliseconds:
@@ -599,7 +609,7 @@ absolute workspace paths.
 
 Paseo diagnostics for `extends: "acp"` providers report the configured command, resolved launcher binary, version output, ACP `initialize`, ACP `session/new`, model count, modes, and final status.
 
-For package-runner commands such as `npx -y @google/gemini-cli --acp`, the version probe keeps the package spec and runs `npx -y @google/gemini-cli --version`. This diagnoses the actual agent package instead of only proving that `npx` exists.
+Diagnostics show static provider information when the host cannot establish the launcher before running it. This includes package runners such as `npx` or `uvx`, scripts that use `env` to look up an interpreter on `PATH`, and scripts that pass additional arguments to their interpreter. Starting a session runs the configured command.
 
 ACP probes use short timeouts and browser-suppression environment variables so agents that enter an auth/browser flow fail as a diagnostic error instead of hanging the provider screen.
 

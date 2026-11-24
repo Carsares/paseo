@@ -1,3 +1,9 @@
+import { ProviderLineReader } from "./jsonl-frame-decoder.js";
+import {
+  isScopedProviderProcess,
+  spawnScopedProviderProcess,
+  stopScopedProviderProcess,
+} from "../scoped-provider-process.js";
 import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { ACPProviderOptionsSchema } from "./acp-options.js";
 import { applyProviderOptionsPatch } from "../option-controls.js";
@@ -17,6 +23,10 @@ import type {
   ReadableStream as NodeReadableStream,
   WritableStream as NodeWritableStream,
 } from "node:stream/web";
+import {
+  assertScopedLaunch,
+  currentCustomProviderLaunch,
+} from "../scoped-custom-provider-launch.js";
 import {
   ClientSideConnection,
   PROTOCOL_VERSION,
@@ -176,6 +186,108 @@ function rejectOnProcessFailure(child: ChildProcess, stderrChunks: string[]): Pr
       );
     });
   });
+}
+
+const ACP_DISCOVERY_STDOUT_BYTES = 8 * 1024 * 1024;
+
+class ACPDiscoveryTransportError extends Error {}
+
+/** Scoped catalog traffic only needs responses to the daemon's outstanding requests. */
+function createScopedCatalogStream(child: ChildProcessWithoutNullStreams): {
+  stream: ACPStream;
+  failed: Promise<never>;
+} {
+  let fail!: (error: ACPDiscoveryTransportError) => void;
+  const failed = new Promise<never>((_, reject) => {
+    fail = reject;
+  });
+  const pending = new Set<number>();
+  let received = 0;
+  const failProcess = () => fail(new ACPDiscoveryTransportError("ACP discovery process failed"));
+  const readable = new ReadableStream<AnyMessage>({
+    start(controller) {
+      const reader = new ProviderLineReader(
+        ACP_DISCOVERY_STDOUT_BYTES,
+        (line) => {
+          let message: unknown;
+          try {
+            message = JSON.parse(line);
+          } catch {
+            return;
+          }
+          if (!isRecord(message) || message.jsonrpc !== "2.0") return;
+          if ("method" in message) {
+            // The directory probe delegates no operations to the CLI. Acknowledge
+            // unsupported requests without forwarding their parameters to the SDK.
+            if (typeof message.id === "number" || typeof message.id === "string") {
+              writeMessage({
+                jsonrpc: "2.0",
+                id: message.id,
+                error: { code: -32601, message: "Method not found" },
+              });
+            }
+            return;
+          }
+          if (typeof message.id !== "number" || !pending.has(message.id)) return;
+          pending.delete(message.id);
+          const { id } = message;
+          if ("error" in message || !("result" in message)) {
+            controller.enqueue({
+              jsonrpc: "2.0",
+              id,
+              error: { code: -32603, message: "ACP discovery request failed" },
+            });
+          } else {
+            controller.enqueue(
+              normalizeACPIncomingMessage({ jsonrpc: "2.0", id, result: message.result }),
+            );
+          }
+        },
+        limit,
+      );
+
+      function limit() {
+        reader.close();
+        fail(new ACPDiscoveryTransportError("ACP discovery stdout exceeded the output limit"));
+      }
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        received += chunk.byteLength;
+        if (received > ACP_DISCOVERY_STDOUT_BYTES) limit();
+        else reader.write(chunk);
+      });
+      child.stdout.once("close", () => {
+        reader.close();
+        controller.close();
+      });
+    },
+  });
+  child.once("error", failProcess);
+  child.once("exit", failProcess);
+  child.once("close", failProcess);
+  child.stdout.on("error", failProcess);
+  child.stdin.on("error", failProcess);
+  child.stderr.on("error", failProcess);
+
+  function writeMessage(message: AnyMessage) {
+    if (!child.stdin.writable) {
+      failProcess();
+      return;
+    }
+    child.stdin.write(JSON.stringify(message) + "\n", (error) => {
+      if (error) failProcess();
+    });
+  }
+  const writable = new WritableStream<AnyMessage>({
+    write(message) {
+      if ("method" in message && "id" in message && typeof message.id === "number") {
+        pending.add(message.id);
+      }
+      writeMessage(message);
+    },
+  });
+
+  return { stream: { readable, writable }, failed };
 }
 
 function describeACPDisconnect(child: ChildProcess | null): string {
@@ -496,6 +608,7 @@ interface ACPFileLaunchPolicy {
 interface ACPLaunchOptions {
   defaultCommand: [string, ...string[]];
   cwd: string;
+  configuredProviderId?: string;
   runtimeSettings?: ProviderRuntimeSettings;
   launchEnv?: Record<string, string>;
   fileLaunchPolicy?: ACPFileLaunchPolicy;
@@ -531,7 +644,29 @@ async function prepareAcpSpawn(
   const opaque = !options.fileLaunchPolicy || launch.source === "override" || !keys.length;
   const args = [...launch.args, ...options.defaultCommand.slice(1)];
   return () => {
-    const child = acquireInstallationProcess({ family, keys, opaque }, () =>
+    const binding = assertScopedLaunch({
+      adapter: family,
+      providerId: options.configuredProviderId,
+      cwd: options.cwd,
+      argv: [launch.command, ...args],
+      env,
+      file: executable,
+      envOverlays: [
+        options.launchEnv === PROBE_ENV ? PROBE_ENV : {},
+        options.fileLaunchPolicy?.readOnlyEnv ?? {},
+      ],
+    });
+    const activity = { family, keys, opaque };
+    if (binding) {
+      return spawnScopedProviderProcess({
+        command: binding.entrypoint,
+        args: [...binding.entrypointArgs, ...args],
+        cwd: options.cwd,
+        env,
+        activity,
+      });
+    }
+    const child = acquireInstallationProcess(activity, () =>
       spawnProcess(executable, args, {
         cwd: options.cwd,
         env,
@@ -545,6 +680,7 @@ async function prepareAcpSpawn(
 
 interface ACPAgentClientOptions {
   provider: string;
+  configuredProviderId?: string;
   // Provider id usage sources match a session against; ACP sessions without one report no usage.
   usageProvider?: string;
   logger: Logger;
@@ -620,6 +756,7 @@ export interface SpawnedACPProcess {
   connection: ClientSideConnection;
   initialize: InitializeResponse;
   stderrChunks?: string[];
+  processError?: Promise<never>;
 }
 
 type UninitializedACPProcess = Omit<SpawnedACPProcess, "initialize"> & {
@@ -1149,8 +1286,11 @@ export class ACPAgentClient implements AgentClient {
   private readonly now: () => number;
   protected readonly terminateProcess: ProcessTerminator;
 
+  private readonly configuredProviderId?: string;
+
   constructor(options: ACPAgentClientOptions) {
     this.provider = options.provider;
+    this.configuredProviderId = options.configuredProviderId;
     this.usageProvider = options.usageProvider;
     this.terminateProcess = options.terminateProcess ?? terminateWithTreeKill;
     this.capabilities = options.capabilities ?? DEFAULT_ACP_CAPABILITIES;
@@ -1289,7 +1429,16 @@ export class ACPAgentClient implements AgentClient {
     options: FetchCatalogOptions,
     context?: ProviderRefreshContext,
   ): Promise<ProviderCatalog> {
-    const cwd = options.scope === "global" ? homedir() : options.cwd;
+    const requestedCwd = options.scope === "global" ? homedir() : options.cwd;
+    const scope = currentCustomProviderLaunch();
+    if (
+      scope &&
+      path.resolve(requestedCwd) !== scope.cwd &&
+      path.resolve(requestedCwd) !== scope.processCwd
+    ) {
+      throw new Error("Custom CLI catalog directory did not match discovery authorization");
+    }
+    const cwd = scope?.processCwd ?? requestedCwd;
     let probe: UninitializedACPProcess | null = null;
     let probeSessionId: string | null = null;
     let probeSessionPromise: Promise<NewSessionResponse> | null = null;
@@ -1307,10 +1456,11 @@ export class ACPAgentClient implements AgentClient {
               )
             ).sessionId;
           } catch (error) {
-            this.logger.debug(
-              { err: error },
-              "ACP probe session/new did not finish during cleanup",
-            );
+            if (!scope)
+              this.logger.debug(
+                { err: error },
+                "ACP probe session/new did not finish during cleanup",
+              );
           }
         }
         await this.closeProbe(probe, probeSessionId);
@@ -1334,7 +1484,15 @@ export class ACPAgentClient implements AgentClient {
         ),
       );
       probe = initializedProbe;
-      probeSessionPromise = this.runACPRequest(() =>
+      // Initialize can finish after the approved directory has been moved or redirected.
+      scope?.assertCurrent();
+      const runRequest = <T>(request: () => Promise<T>): Promise<T> => {
+        const response = this.runACPRequest(request);
+        return initializedProbe.processError
+          ? Promise.race([response, initializedProbe.processError])
+          : response;
+      };
+      probeSessionPromise = runRequest(() =>
         initializedProbe.connection.newSession({
           cwd,
           mcpServers: [],
@@ -1359,7 +1517,7 @@ export class ACPAgentClient implements AgentClient {
                 sessionId: response.sessionId,
                 models: derivedModels,
                 configOptions: transformed.configOptions,
-                runRequest: (request) => this.runACPRequest(request),
+                runRequest,
                 transformConfigOptions: (configOptions) =>
                   this.configOptionsTransformer
                     ? this.configOptionsTransformer(configOptions)
@@ -1379,6 +1537,12 @@ export class ACPAgentClient implements AgentClient {
         models: this.modelTransformer ? this.modelTransformer(models) : models,
         modes: modeInfo.modes,
       };
+    } catch (error) {
+      if (!scope || error instanceof ACPDiscoveryTransportError) throw error;
+      scope.assertCurrent();
+      // The provider may include its configuration in the cause.
+      // oxlint-disable-next-line eslint/preserve-caught-error
+      throw new Error("ACP discovery request failed");
     } finally {
       context?.signal.removeEventListener("abort", handleAbort);
       await closeProbe();
@@ -1579,9 +1743,10 @@ export class ACPAgentClient implements AgentClient {
     executable: string | null;
     env: NodeJS.ProcessEnv;
   }> {
+    const scope = currentCustomProviderLaunch();
     return resolveAcpLaunch({
       defaultCommand: this.defaultCommand,
-      cwd: process.cwd(),
+      cwd: scope?.processCwd ?? process.cwd(),
       runtimeSettings: this.runtimeSettings,
       fileLaunchPolicy: this.fileLaunchPolicy,
     });
@@ -1602,6 +1767,7 @@ export class ACPAgentClient implements AgentClient {
       child: transport.child,
       connection: transport.connection,
       stderrChunks: transport.stderrChunks,
+      ...(isScopedProviderProcess(transport.child) ? { processError: transport.processError } : {}),
     };
     options?.onSpawned?.(probe);
     try {
@@ -1626,9 +1792,11 @@ export class ACPAgentClient implements AgentClient {
     launchEnv?: Record<string, string>,
     client: ACPClient = this.buildProbeClient(),
   ): Promise<ACPProcessTransport> {
+    const scope = currentCustomProviderLaunch();
     const spawn = await prepareAcpSpawn(this.provider, {
       defaultCommand: this.defaultCommand,
-      cwd: process.cwd(),
+      cwd: scope?.processCwd ?? process.cwd(),
+      configuredProviderId: this.configuredProviderId,
       runtimeSettings: this.runtimeSettings,
       launchEnv,
       fileLaunchPolicy: this.fileLaunchPolicy,
@@ -1636,22 +1804,23 @@ export class ACPAgentClient implements AgentClient {
     const child = spawn();
 
     const stderrChunks: string[] = [];
-    child.stderr.on("data", (chunk: Buffer | string) => {
-      stderrChunks.push(chunk.toString());
-    });
+    if (scope) child.stderr.resume();
+    else child.stderr.on("data", (chunk: Buffer | string) => stderrChunks.push(chunk.toString()));
 
-    const processErrorPromise = rejectOnProcessFailure(child, stderrChunks);
+    const scopedStream = scope ? createScopedCatalogStream(child) : undefined;
+    const processErrorPromise = scopedStream?.failed ?? rejectOnProcessFailure(child, stderrChunks);
     const spawnReadyPromise = new Promise<void>((resolve) => {
       child.once("spawn", () => {
         resolve();
       });
     });
 
-    const stream = createLoggedNdJsonStream(
-      Writable.toWeb(child.stdin),
-      Readable.toWeb(child.stdout),
-      { logger: this.logger, provider: this.provider },
-    );
+    const stream =
+      scopedStream?.stream ??
+      createLoggedNdJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout), {
+        logger: this.logger,
+        provider: this.provider,
+      });
     const connection = new ClientSideConnection(() => client, stream);
 
     return {
@@ -1730,14 +1899,20 @@ export class ACPAgentClient implements AgentClient {
   ): Promise<void> {
     try {
       if (sessionId && probe.initialize?.agentCapabilities?.sessionCapabilities?.close) {
+        const request = probe.connection.unstable_closeSession({ sessionId });
         await withTimeout(
-          probe.connection.unstable_closeSession({ sessionId }),
+          probe.processError ? Promise.race([request, probe.processError]) : request,
           ACP_PROBE_CLOSE_TIMEOUT_MS,
           `ACP probe session/close timed out after ${ACP_PROBE_CLOSE_TIMEOUT_MS}ms`,
         );
       }
     } catch (error) {
-      this.logger.debug({ err: error, sessionId }, "ACP probe closeSession failed during cleanup");
+      if (!isScopedProviderProcess(probe.child)) {
+        this.logger.debug(
+          { err: error, sessionId },
+          "ACP probe closeSession failed during cleanup",
+        );
+      }
     } finally {
       await terminateChildProcess(probe.child, 2_000, this.terminateProcess);
     }
@@ -4527,7 +4702,9 @@ async function terminateChildProcess(
   terminate: ProcessTerminator,
 ): Promise<void> {
   try {
-    await terminate(child, { gracefulTimeoutMs: timeoutMs, forceTimeoutMs: timeoutMs });
+    const scopedStop = stopScopedProviderProcess(child);
+    if (scopedStop) await scopedStop;
+    else await terminate(child, { gracefulTimeoutMs: timeoutMs, forceTimeoutMs: timeoutMs });
   } finally {
     child.stdin.destroy();
     child.stdout.destroy();

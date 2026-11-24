@@ -74,6 +74,10 @@ export interface ProviderInstallationsOptions {
   logger: Logger;
   /** The current client for a configured provider, or null when the provider is unknown. */
   resolveClient(provider: AgentProvider): AgentClient | null;
+  /** True when installation reads must not launch the provider. */
+  isDiscoveryDeferred?(provider: AgentProvider): boolean;
+  /** Version already published by authorized settings discovery for this configuration. */
+  readDiscoveredVersion?(provider: AgentProvider): string | undefined;
   resolveFamily?(provider: AgentProvider): string;
   /** Changes only when this provider's configuration is published. */
   configurationVersion?(provider: AgentProvider): number;
@@ -160,6 +164,12 @@ async function waitForInspection<T>(signal: AbortSignal, inspect: () => Promise<
 export class ProviderInstallations {
   private readonly logger: Logger;
   private readonly resolveClient: ProviderInstallationsOptions["resolveClient"];
+  private readonly isDiscoveryDeferred: NonNullable<
+    ProviderInstallationsOptions["isDiscoveryDeferred"]
+  >;
+  private readonly readDiscoveredVersion: NonNullable<
+    ProviderInstallationsOptions["readDiscoveredVersion"]
+  >;
   private readonly activity: InstallationActivity;
   private readonly configurationVersion: NonNullable<
     ProviderInstallationsOptions["configurationVersion"]
@@ -189,6 +199,8 @@ export class ProviderInstallations {
   constructor(options: ProviderInstallationsOptions) {
     this.logger = options.logger;
     this.resolveClient = options.resolveClient;
+    this.isDiscoveryDeferred = options.isDiscoveryDeferred ?? (() => false);
+    this.readDiscoveredVersion = options.readDiscoveredVersion ?? (() => undefined);
     this.configurationVersion = options.configurationVersion ?? (() => 0);
     this.activity = options.activity ?? new InstallationActivity();
     this.resolveFamily = options.resolveFamily ?? ((provider) => provider);
@@ -212,20 +224,35 @@ export class ProviderInstallations {
     const result: ProviderInstallation = {};
     if (installation.installUrl) result.installUrl = installation.installUrl;
     if (installation.updateUrl) result.updateUrl = installation.updateUrl;
+    if (this.isDiscoveryDeferred(provider)) {
+      return this.withDiscoveredInspection(provider, result);
+    }
     if (options.refresh) this.clearFailedUpdate(provider);
     const [snapshot, standaloneMaintenance] = await Promise.all([
       this.readInspection(provider, client, options),
       installation.inspectionSnapshot ? undefined : this.readMaintenance(provider, client),
     ]);
-    const maintenance = snapshot?.maintenance ?? standaloneMaintenance;
-    if (maintenance) result.maintenance = maintenance;
+    if (this.isDiscoveryDeferred(provider)) return result;
+    let maintenance = snapshot?.maintenance ?? standaloneMaintenance;
     if (installation.update && maintenance?.kind === "automatic") {
       const keys = await this.readActivityKeys(client);
-      if (keys.length === 0) result.maintenance = { kind: "manual", message: UNPROVEN_UPDATE };
+      if (this.isDiscoveryDeferred(provider)) return result;
+      if (keys.length === 0) maintenance = { kind: "manual", message: UNPROVEN_UPDATE };
       else if (!this.shutdown && this.resolveClient(provider) === client) result.canUpdate = true;
     }
+    if (maintenance) result.maintenance = maintenance;
     if (snapshot) result.inspection = snapshot.inspection;
     return result;
+  }
+
+  private withDiscoveredInspection(
+    provider: AgentProvider,
+    result: ProviderInstallation,
+  ): ProviderInstallation {
+    const version = this.readDiscoveredVersion(provider);
+    return version === undefined
+      ? result
+      : { ...result, inspection: { status: "installed", version } };
   }
 
   /**
@@ -236,6 +263,7 @@ export class ProviderInstallations {
     provider: AgentProvider,
     options: InspectProviderInstallationOptions = {},
   ): Promise<ProviderInstallationUpdateCheck | null> {
+    if (this.isDiscoveryDeferred(provider)) return null;
     const client = this.requireClient(provider);
     const installation = client.installation;
     const checkForUpdates = installation?.checkForUpdates;
@@ -243,6 +271,7 @@ export class ProviderInstallations {
     // The provider compares the version the inspection reported, so a cached answer holds only
     // while the inspection still reports that version.
     const inspection = (await this.readInspection(provider, client, options))?.inspection;
+    if (this.isDiscoveryDeferred(provider)) return null;
     if (inspection?.status === "not_installed")
       return { status: "unknown", message: "Not installed" };
     if (inspection?.status === "error") return { status: "error", message: inspection.message };
@@ -273,6 +302,9 @@ export class ProviderInstallations {
     if (this.shutdown) throw new Error(DAEMON_STOPPING);
     const running = this.updates.get(provider);
     if (running?.running) return running.snapshot();
+    if (this.isDiscoveryDeferred(provider)) {
+      throw new Error("Update this installation on the host using its original installer.");
+    }
     const client = this.requireClient(provider);
     const installation = client.installation;
     const update = installation?.update;
@@ -444,7 +476,9 @@ export class ProviderInstallations {
     client: AgentClient,
   ): boolean {
     return (
-      this.configurationVersion(provider) === version && this.resolveClient(provider) === client
+      !this.isDiscoveryDeferred(provider) &&
+      this.configurationVersion(provider) === version &&
+      this.resolveClient(provider) === client
     );
   }
 

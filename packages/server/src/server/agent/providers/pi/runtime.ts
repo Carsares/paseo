@@ -26,6 +26,7 @@ export interface PiRuntimeLaunch {
 
 export interface PiStartSessionInput {
   cwd: string;
+  catalogDiscovery?: boolean;
   mainControlReadOnly?: boolean;
   signal?: AbortSignal;
   env?: Record<string, string>;

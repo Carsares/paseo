@@ -91,7 +91,11 @@ import {
   isStoredAgentProviderAvailable,
   resolveStoredAgentUpdatedAt,
 } from "./persistence-hooks.js";
-import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
+import {
+  AgentReadRequiresLaunchError,
+  ensureAgentLoaded,
+  ensureUnarchivedAgentLoaded,
+} from "./agent/agent-loading.js";
 import { summarizeWorkspaceAgents } from "./agent/workspace-agents-summary.js";
 import { resolveClientMessageId } from "./client-message-id.js";
 import {
@@ -119,7 +123,15 @@ import {
   createWorkspaceScriptsService,
   type WorkspaceScriptsService,
 } from "./session/workspace-scripts/workspace-scripts-service.js";
-import { toWireDaemonConfig, type DaemonConfigStore } from "./daemon-config-store.js";
+import {
+  toWireDaemonConfig,
+  toWireDaemonConfigError,
+  type DaemonConfigStore,
+} from "./daemon-config-store.js";
+import {
+  prepareCustomProviderCliDiscovery,
+  runCustomProviderCliOperation,
+} from "./agent/custom-provider-cli.js";
 import { releaseWorkspaceServicePortPlan } from "./workspace-service-port-registry.js";
 import { getErrorMessage, getErrorMessageOr } from "@getpaseo/protocol/error-utils";
 import { getAgentStatusPriority } from "@getpaseo/protocol/agent-state-bucket";
@@ -1553,8 +1565,12 @@ export class Session {
         },
         supportsProviderSnapshotReferences: () =>
           this.supports(CLIENT_CAPS.providerSnapshotReferences),
-        listProviderAvailability: () => this.agentManager.listProviderAvailability(),
-        listDraftControls: (config) => this.agentManager.listDraftControls(config),
+        listProviderAvailability: () =>
+          this.agentManager.listProviderAvailability(this.canLaunchProviderForRead),
+        listDraftControls: (config) =>
+          this.canLaunchProviderForRead(config.provider)
+            ? this.agentManager.listDraftControls(config)
+            : Promise.resolve({ controls: [], options: {} }),
       },
       providerSnapshotManager,
       logger: this.sessionLogger,
@@ -1653,7 +1669,8 @@ export class Session {
         "Terminal directories": this.terminalController.getMetrics().directorySubscriptionCount,
         "Terminal output": this.terminalController.getMetrics().streamSubscriptionCount,
       }),
-      listProviderAvailability: () => this.agentManager.listProviderAvailability(),
+      listProviderAvailability: () =>
+        this.agentManager.listProviderAvailability(this.canLaunchProviderForRead),
       getTerminalsUnavailable: () => terminalManager?.getUnavailableError?.()?.message ?? null,
       listAgents: () => this.agentManager.listAgents(),
       listProjects: () => this.projectRegistry.list(),
@@ -1661,7 +1678,13 @@ export class Session {
       listWorkspaces: () => this.workspaceRegistry.listAll(),
       logger: this.sessionLogger,
       hubRelationships: options.hubRelationships,
-      reloadConfig: () => daemonConfigStore.reload(),
+      reloadConfig: async () => {
+        try {
+          return await daemonConfigStore.reload();
+        } catch (error) {
+          throw toWireDaemonConfigError(error, "Failed to reload daemon config");
+        }
+      },
     });
     this.hubExecutionController = options.hubExecutionAgents
       ? new HubExecutionController({
@@ -2965,7 +2988,14 @@ export class Session {
       try {
         await this.dispatchInboundMessage(msg, source);
       } catch (error) {
-        const err = error instanceof Error ? error : new Error(String(error));
+        const configRequest =
+          msg.type === "set_daemon_config_request" || msg.type === "get_daemon_config_request";
+        let err: Error;
+        if (configRequest) {
+          err = toWireDaemonConfigError(error, "Failed to access daemon config");
+        } else {
+          err = error instanceof Error ? error : new Error(String(error));
+        }
         this.sessionLogger.error({ err }, "Error handling message");
 
         const requestId =
@@ -4219,7 +4249,7 @@ export class Session {
       case "get_providers_snapshot_request":
         return this.providerCatalogSession.handleGetProvidersSnapshotRequest(msg);
       case "refresh_providers_snapshot_request":
-        return this.providerCatalogSession.handleRefreshProvidersSnapshotRequest(msg);
+        return this.handleProviderSnapshotRefresh(msg);
       case "provider_diagnostic_request":
         return this.providerCatalogSession.handleProviderDiagnosticRequest(msg);
       case "provider.installation.inspect.request":
@@ -4228,6 +4258,12 @@ export class Session {
         return this.providerCatalogSession.handleCheckProviderUpdatesRequest(msg);
       case "provider.installation.update.request":
         return this.providerCatalogSession.handleUpdateProviderRequest(msg);
+      case "provider.custom_cli.locate.request":
+        return this.handleCustomProviderCliRequest("locate", msg);
+      case "provider.custom_cli.test.request":
+        return this.handleCustomProviderCliRequest("test", msg);
+      case "provider.custom_cli.save.request":
+        return this.handleCustomProviderCliRequest("save", msg);
       case "provider.usage.list.request":
         return this.usageSession.handleLegacyList(msg);
       case "usage.list_reports.request":
@@ -4235,6 +4271,80 @@ export class Session {
       default:
         return undefined;
     }
+  }
+
+  private async handleProviderSnapshotRefresh(
+    msg: Extract<SessionInboundMessage, { type: "refresh_providers_snapshot_request" }>,
+  ): Promise<void> {
+    const provider = msg.providers?.length === 1 ? msg.providers[0] : undefined;
+    if (
+      provider &&
+      this.allowsPermission("daemon.manage") &&
+      this.requiresExplicitProviderDiscovery(provider)
+    ) {
+      const signal = this.delivery.requestSignal;
+      await this.providerSnapshotManager.discoverDeferredProvider(
+        provider,
+        msg.cwd ? expandTilde(msg.cwd) : undefined,
+        {
+          kind: "refresh",
+          prepare: async (cwd) => {
+            const result = await prepareCustomProviderCliDiscovery(
+              { mode: "edit", providerId: provider },
+              { ...this.customProviderCliDependencies(), signal },
+              cwd,
+            );
+            return !signal.aborted && result.status === "ok" ? result.run : undefined;
+          },
+        },
+      );
+      this.emit({
+        type: "refresh_providers_snapshot_response",
+        payload: { acknowledged: true, requestId: msg.requestId },
+      });
+      return;
+    }
+    await this.providerCatalogSession.handleRefreshProvidersSnapshotRequest(msg);
+  }
+
+  private requiresExplicitProviderDiscovery(provider: string): boolean {
+    return (
+      this.providerSnapshotManager.hasProvider(provider) &&
+      this.providerSnapshotManager.isProviderDiscoveryDeferred(provider)
+    );
+  }
+
+  private customProviderCliDependencies() {
+    return {
+      configStore: this.daemonConfigStore,
+      isRegisteredProvider: (id: string) => this.providerSnapshotManager.hasProvider(id),
+      isPluginProvider: (id: string) => this.providerSnapshotManager.isPluginProvider(id),
+    };
+  }
+
+  private async handleCustomProviderCliRequest(
+    operation: "locate" | "test" | "save",
+    msg: Extract<
+      SessionInboundMessage,
+      { type: `provider.custom_cli.${typeof operation}.request` }
+    >,
+  ): Promise<void> {
+    const signal = this.delivery.requestSignal;
+    if (signal.aborted) return;
+    let result: Awaited<ReturnType<typeof runCustomProviderCliOperation>>;
+    try {
+      result = await runCustomProviderCliOperation(operation, msg.draft, {
+        ...this.customProviderCliDependencies(),
+        signal,
+      });
+    } catch {
+      result = { status: "failed" };
+    }
+    if (signal.aborted) return;
+    this.emit({
+      type: `provider.custom_cli.${operation}.response`,
+      payload: { requestId: msg.requestId, result },
+    });
   }
 
   private dispatchTerminalMessage(msg: SessionInboundMessage): Promise<void> | undefined {
@@ -7500,6 +7610,7 @@ export class Session {
     );
 
     try {
+      const allowLaunch = this.allowsPermission("workspace.write");
       const existing = this.agentManager.getAgent(agentId);
       const stored = existing ? null : await this.agentStorage.get(agentId);
       if (stored && (await this.agentManager.isSilentTopicSeat(stored))) {
@@ -7510,16 +7621,24 @@ export class Session {
         return;
       }
       const agent =
-        existing || (stored && !stored.archivedAt)
-          ? await ensureAgentLoaded(agentId, {
-              agentManager: this.agentManager,
-              agentStorage: this.agentStorage,
-              logger: this.sessionLogger,
-            })
-          : null;
+        allowLaunch && (existing || (stored && !stored.archivedAt))
+          ? await this.loadAgentForRead(agentId)
+          : existing;
+
+      if (stored && !agent && !stored.archivedAt) {
+        this.emit({
+          type: "list_commands_response",
+          payload: { agentId, commands: [], error: null, requestId },
+        });
+        return;
+      }
 
       if (agent?.session?.listCommands) {
-        const commands = dedupeSlashCommands(await agent.session.listCommands());
+        const commands = dedupeSlashCommands(
+          await agent.session.listCommands({
+            allowLaunch: allowLaunch && this.canLaunchProviderForRead(agent.provider),
+          }),
+        );
         this.emit({
           type: "list_commands_response",
           payload: {
@@ -7533,19 +7652,7 @@ export class Session {
       }
 
       if (!agent && draftConfig) {
-        const sessionConfig: AgentSessionConfig = {
-          provider: draftConfig.provider,
-          cwd: expandTilde(draftConfig.cwd),
-          ...(draftConfig.modeId ? { modeId: draftConfig.modeId } : {}),
-          ...(draftConfig.model ? { model: draftConfig.model } : {}),
-          ...(draftConfig.thinkingOptionId
-            ? { thinkingOptionId: draftConfig.thinkingOptionId }
-            : {}),
-        };
-
-        const commands = dedupeSlashCommands(
-          await this.agentManager.listDraftCommands(sessionConfig),
-        );
+        const commands = await this.listDraftCommands(draftConfig, allowLaunch);
         this.emit({
           type: "list_commands_response",
           payload: {
@@ -7579,6 +7686,23 @@ export class Session {
         },
       });
     }
+  }
+
+  private async listDraftCommands(
+    draftConfig: NonNullable<
+      Extract<SessionInboundMessage, { type: "list_commands_request" }>["draftConfig"]
+    >,
+    allowLaunch: boolean,
+  ) {
+    if (!allowLaunch || !this.canLaunchProviderForRead(draftConfig.provider)) return [];
+    const sessionConfig: AgentSessionConfig = {
+      provider: draftConfig.provider,
+      cwd: expandTilde(draftConfig.cwd),
+      ...(draftConfig.modeId ? { modeId: draftConfig.modeId } : {}),
+      ...(draftConfig.model ? { model: draftConfig.model } : {}),
+      ...(draftConfig.thinkingOptionId ? { thinkingOptionId: draftConfig.thinkingOptionId } : {}),
+    };
+    return dedupeSlashCommands(await this.agentManager.listDraftCommands(sessionConfig));
   }
 
   /**
@@ -10964,20 +11088,48 @@ export class Session {
     });
   }
 
+  private readonly canLaunchProviderForRead = (provider: string) =>
+    this.providerSnapshotManager.canLaunchProviderForRead(provider);
+
+  private async loadAgentForRead(
+    agentId: string,
+    options: { unarchived?: boolean; purpose?: "history" | "interactive" } = {},
+  ) {
+    const load = options.unarchived ? ensureUnarchivedAgentLoaded : ensureAgentLoaded;
+    try {
+      return await load(agentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+        purpose: options.purpose,
+        canLaunchForRead: this.canLaunchProviderForRead,
+      });
+    } catch (error) {
+      if (error instanceof AgentReadRequiresLaunchError) return null;
+      throw error;
+    }
+  }
+
+  private async readLocalAgentTimeline(
+    agentId: string,
+    options: Parameters<AgentManager["fetchTimeline"]>[1],
+  ) {
+    const record = await this.agentStorage.get(agentId);
+    if (!record) throw new Error(`Agent not found: ${agentId}`);
+    const timeline = await this.agentManager.readStoredTimeline(record, options);
+    return { record, timeline };
+  }
+
   private async readAgentTimeline(
     agentId: string,
     options: Parameters<AgentManager["fetchTimeline"]>[1],
   ) {
     const quiet = await this.agentManager.readSilentTopicTimeline(agentId, options);
-    if (quiet) {
-      return { agentPayload: this.buildStoredAgentPayload(quiet.record), timeline: quiet.timeline };
+    const snapshot = quiet ? null : await this.loadAgentForRead(agentId, { purpose: "history" });
+    if (!snapshot) {
+      const { record, timeline } = quiet ?? (await this.readLocalAgentTimeline(agentId, options));
+      return { agentPayload: this.buildStoredAgentPayload(record), timeline };
     }
-    const snapshot = await ensureAgentLoaded(agentId, {
-      agentManager: this.agentManager,
-      agentStorage: this.agentStorage,
-      logger: this.sessionLogger,
-      purpose: "history",
-    });
     return {
       agentPayload: await this.buildAgentPayload(snapshot),
       timeline: this.agentManager.fetchTimeline(agentId, options),
@@ -11127,21 +11279,17 @@ export class Session {
     source?: object,
   ): Promise<void> {
     try {
-      const quiet = await this.agentManager.readSilentTopicTimeline(msg.agentId, {
-        direction: "tail",
-        limit: 0,
-      });
-      const agent =
-        quiet?.record ??
-        (await ensureAgentLoaded(msg.agentId, {
-          agentManager: this.agentManager,
-          agentStorage: this.agentStorage,
-          logger: this.sessionLogger,
-        }));
-      const head = quiet?.timeline ?? this.agentManager.getLoadedTimelineHead(msg.agentId);
-      if (!head) throw new Error("History changed; search again");
+      const options = { direction: "tail", limit: 0 } as const;
+      const quiet = await this.agentManager.readSilentTopicTimeline(msg.agentId, options);
+      const loaded = quiet ? null : await this.loadAgentForRead(msg.agentId);
+      const local = loaded
+        ? null
+        : (quiet ?? (await this.readLocalAgentTimeline(msg.agentId, options)));
+      const agent = loaded ?? local?.record;
+      const head = local?.timeline ?? this.agentManager.getLoadedTimelineHead(msg.agentId);
+      if (!agent || !head) throw new Error("History changed; search again");
       const { epoch } = head;
-      const rows = quiet?.timeline.rows ?? (await this.agentManager.getTimelineRows(msg.agentId));
+      const rows = local?.timeline.rows ?? (await this.agentManager.getTimelineRows(msg.agentId));
       const result = await searchTimeline({
         rows,
         query: msg.query,
@@ -11150,7 +11298,7 @@ export class Session {
         includeAgentSourceBodies: msg.includeAgentSourceBodies,
         provider: agent.provider,
       });
-      if (!quiet && this.agentManager.getLoadedTimelineHead(msg.agentId)?.epoch !== epoch) {
+      if (loaded && this.agentManager.getLoadedTimelineHead(msg.agentId)?.epoch !== epoch) {
         throw new Error("History changed; search again");
       }
       this.emitForSource(
@@ -11190,20 +11338,15 @@ export class Session {
     source?: object,
   ): Promise<void> {
     try {
-      const quiet = await this.agentManager.readSilentTopicTimeline(msg.agentId, {
-        direction: "tail",
-        limit: 0,
-      });
-      if (!quiet) {
-        await ensureAgentLoaded(msg.agentId, {
-          agentManager: this.agentManager,
-          agentStorage: this.agentStorage,
-          logger: this.sessionLogger,
-        });
-      }
-      const rows = quiet?.timeline.rows ?? (await this.agentManager.getTimelineRows(msg.agentId));
+      const options = { direction: "tail", limit: 0 } as const;
+      const quiet = await this.agentManager.readSilentTopicTimeline(msg.agentId, options);
+      const loaded = quiet ? null : await this.loadAgentForRead(msg.agentId);
+      const local = loaded
+        ? null
+        : (quiet ?? (await this.readLocalAgentTimeline(msg.agentId, options)));
+      const rows = local?.timeline.rows ?? (await this.agentManager.getTimelineRows(msg.agentId));
       const timeline =
-        quiet?.timeline ??
+        local?.timeline ??
         this.agentManager.fetchTimeline(msg.agentId, {
           direction: "tail",
           limit: 1,
@@ -11246,17 +11389,13 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.list.request" }>,
   ): Promise<void> {
     try {
-      await ensureUnarchivedAgentLoaded(msg.parentAgentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
+      const parent = await this.loadAgentForRead(msg.parentAgentId, { unarchived: true });
       this.emit({
         type: "agent.provider_subagents.list.response",
         payload: {
           requestId: msg.requestId,
           parentAgentId: msg.parentAgentId,
-          subagents: this.agentManager.listProviderSubagents(msg.parentAgentId),
+          subagents: parent ? this.agentManager.listProviderSubagents(msg.parentAgentId) : [],
           error: null,
         },
       });
@@ -11355,12 +11494,9 @@ export class Session {
   ): Promise<void> {
     const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
     try {
-      await ensureUnarchivedAgentLoaded(msg.parentAgentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      const descriptor = this.agentManager.getProviderSubagent(msg.parentAgentId, msg.subagentId);
+      const parent = await this.loadAgentForRead(msg.parentAgentId, { unarchived: true });
+      const descriptor =
+        parent && this.agentManager.getProviderSubagent(msg.parentAgentId, msg.subagentId);
       if (!descriptor) {
         throw new Error("Provider subagent not found");
       }
@@ -11570,14 +11706,14 @@ export class Session {
     // This cursor is captured before the source has any visible rows.
     const cursor = forkFrom.boundaryCursor;
     if (sideChat && cursor?.epoch === "" && cursor.seq === 0) return [];
-    const { timeline } = await this.loadForkSourceTimeline(forkFrom.sourceAgentId);
+    const { timeline } = await this.loadForkSourceTimeline(forkFrom.sourceAgentId, "create");
     return sliceTimelineRowsAtBoundary(timeline.rows, {
       ...forkFrom,
       timelineEpoch: timeline.epoch,
     });
   }
 
-  private async loadForkSourceTimeline(agentId: string) {
+  private async loadForkSourceTimeline(agentId: string, intent: "read" | "create") {
     const quiet = await this.agentManager.readSilentTopicTimeline(agentId, {
       direction: "tail",
       limit: 0,
@@ -11585,12 +11721,19 @@ export class Session {
     if (quiet) return { snapshot: quiet.record, timeline: quiet.timeline };
     const source = this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
     if (!source || source.internal) throw new Error(`Agent not found: ${agentId}`);
-    const snapshot = await ensureAgentLoaded(agentId, {
-      agentManager: this.agentManager,
-      agentStorage: this.agentStorage,
-      logger: this.sessionLogger,
-      purpose: "history",
-    });
+    const snapshot =
+      intent === "read"
+        ? await this.loadAgentForRead(agentId, { purpose: "history" })
+        : await ensureAgentLoaded(agentId, {
+            agentManager: this.agentManager,
+            agentStorage: this.agentStorage,
+            logger: this.sessionLogger,
+            purpose: "history",
+          });
+    if (!snapshot) {
+      const local = await this.readLocalAgentTimeline(agentId, { direction: "tail", limit: 0 });
+      return { snapshot: local.record, timeline: local.timeline };
+    }
     return {
       snapshot,
       timeline: this.agentManager.fetchTimeline(agentId, { direction: "tail", limit: 0 }),
@@ -11611,7 +11754,7 @@ export class Session {
           );
           if (archived) return archived;
         }
-        const { snapshot, timeline } = await this.loadForkSourceTimeline(msg.agentId);
+        const { snapshot, timeline } = await this.loadForkSourceTimeline(msg.agentId, "read");
         return buildAgentForkContextAttachment({
           rows: timeline.rows,
           cursorBoundary: msg.boundaryCursor

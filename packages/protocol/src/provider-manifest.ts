@@ -291,6 +291,13 @@ export function getAgentProviderDefinition(
 
 export const BUILTIN_PROVIDER_IDS = AGENT_PROVIDER_DEFINITIONS.map((d) => d.id);
 export const AGENT_PROVIDER_IDS = BUILTIN_PROVIDER_IDS;
+/** IDs routed to a dedicated adapter when a provider inherits ACP. */
+export const SPECIALIZED_ACP_PROVIDER_IDS: readonly string[] = [
+  "cursor",
+  "kimi",
+  "kiro",
+  "traecli",
+];
 
 export const AgentProviderSchema = z.string();
 

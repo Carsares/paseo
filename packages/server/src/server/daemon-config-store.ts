@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import {
   loadPersistedConfig,
   savePersistedConfigAsync,
@@ -227,11 +228,53 @@ function foldConfigProfiles<T extends { agentProfiles?: AgentProfile[] }>(input:
   };
 }
 
-/** The config API boundary: the unchanged app reads profile options from `featureValues`. */
+/** The config API boundary for reads, patch replies, and change notifications. */
 export function toWireDaemonConfig(config: MutableDaemonConfig): MutableDaemonConfig {
-  if (!config.agentProfiles) return config;
-  return { ...config, agentProfiles: config.agentProfiles.map(withLegacyProfileFeatureValues) };
+  const { providers, agentProfiles, ...wireConfig } = config;
+  return {
+    ...wireConfig,
+    providers: Object.fromEntries(
+      // Provider defaults and legacy params are opaque adapter inputs and have no config UI reader.
+      Object.entries(providers).map(
+        ([
+          id,
+          { env: _env, options: _options, params: _params, deferDiscovery: _deferred, ...provider },
+        ]) => [id, provider],
+      ),
+    ),
+    // Older clients read profile options from `featureValues`.
+    ...(agentProfiles && { agentProfiles: agentProfiles.map(withLegacyProfileFeatureValues) }),
+  };
 }
+
+/** Parser and apply errors may contain parts of the persisted or submitted config. */
+export function toWireDaemonConfigError(error: unknown, fallback: string): Error {
+  if (error instanceof Error) {
+    if (error.message.startsWith("[Config] Invalid JSON in ")) {
+      return new Error("Invalid JSON in daemon config");
+    }
+    if (error.message.startsWith("[Config] Invalid config in ")) {
+      return new Error("Invalid daemon config");
+    }
+    if (PUBLIC_CONFIG_ERRORS.has(error.message)) return new Error(error.message);
+  }
+  return new Error(fallback);
+}
+
+const RELAY_OVERRIDE_ERROR =
+  "Relay is controlled by a daemon launch override. Remove PASEO_RELAY_ENABLED or the relay CLI flag before changing it here.";
+const SPEECH_SETTINGS_UNAVAILABLE = "Speech settings are unavailable for this daemon instance";
+const CONFIG_RELOAD_UNAVAILABLE = "Daemon config reload is unavailable for this daemon instance";
+const CUSTOM_CLI_IDENTITY_CHANGED =
+  "Provider identity differs between the file and the running daemon. Reload the daemon config first.";
+const CUSTOM_CLI_CONFIG_CHANGED = "Daemon config changed on disk while validating the CLI draft";
+const PUBLIC_CONFIG_ERRORS = new Set([
+  RELAY_OVERRIDE_ERROR,
+  SPEECH_SETTINGS_UNAVAILABLE,
+  CONFIG_RELOAD_UNAVAILABLE,
+  CUSTOM_CLI_IDENTITY_CHANGED,
+  CUSTOM_CLI_CONFIG_CHANGED,
+]);
 
 function getValueAtPath(config: MutableDaemonConfig, path: string): unknown {
   return path
@@ -241,6 +284,103 @@ function getValueAtPath(config: MutableDaemonConfig, path: string): unknown {
 
 function isEqualValue(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function rebaseProviderFields(
+  runtime: Record<string, unknown>,
+  previous: Record<string, unknown>,
+  persisted: Record<string, unknown>,
+): Record<string, unknown> {
+  const fields = new Map(Object.entries(runtime));
+  for (const key of new Set([...Object.keys(previous), ...Object.keys(persisted)])) {
+    const before = Object.hasOwn(previous, key) ? previous[key] : undefined;
+    const after = Object.hasOwn(persisted, key) ? persisted[key] : undefined;
+    if (isEqualValue(before, after)) continue;
+    if (after === undefined) {
+      fields.delete(key);
+    } else if (isRecord(after) && (isRecord(before) || before === undefined)) {
+      const current = fields.get(key);
+      fields.set(key, rebaseProviderFields(isRecord(current) ? current : {}, before ?? {}, after));
+    } else {
+      fields.set(key, after);
+    }
+  }
+  return Object.fromEntries(fields);
+}
+
+function readProviderOverrides(
+  config: PersistedConfig,
+): Record<string, ProviderOverride> | undefined {
+  // The persisted loader normalizes legacy runtime settings into provider overrides.
+  return config.agents?.providers as Record<string, ProviderOverride> | undefined;
+}
+
+function providerLaunchFields(provider: MutableDaemonConfig["providers"][string] | undefined) {
+  return {
+    command: provider?.["command"],
+    env: provider?.["env"] ?? {},
+    extends: provider?.["extends"],
+  };
+}
+
+function prepareCustomProviderCliOverride(
+  patch: MutableDaemonConfig["providers"][string],
+  runtime: MutableDaemonConfig["providers"][string] | undefined,
+  known: ProviderOverride | undefined,
+  onDisk: ProviderOverride | undefined,
+) {
+  if (runtime?.["extends"] !== onDisk?.extends) throw new Error(CUSTOM_CLI_IDENTITY_CHANGED);
+  const { deferDiscovery: _deferred, ...submitted } = ProviderOverrideSchema.parse(patch);
+  if (Object.keys(submitted).length === 0) return;
+
+  const rebased = rebaseProviderFields(runtime ?? {}, known ?? {}, onDisk ?? {});
+  // A display-only edit must not apply unrelated, manually edited launch fields to the runtime.
+  const fields = ["command", "env", "extends", "deferDiscovery"] as const;
+  if (fields.every((key) => !Object.hasOwn(submitted, key))) {
+    for (const key of fields) {
+      if (runtime && Object.hasOwn(runtime, key)) rebased[key] = runtime[key];
+      else delete rebased[key];
+    }
+  }
+  const nextRuntime = deepMerge(rebased, submitted);
+  const nextPersisted = deepMerge(onDisk ?? {}, submitted);
+  if (
+    !isDeepStrictEqual(providerLaunchFields(runtime), providerLaunchFields(nextRuntime)) ||
+    !isDeepStrictEqual(providerLaunchFields(onDisk), providerLaunchFields(nextPersisted))
+  ) {
+    nextRuntime["deferDiscovery"] = true;
+    nextPersisted.deferDiscovery = true;
+  }
+  return { nextRuntime, nextPersisted };
+}
+
+function prepareCustomProviderCliPatch(
+  currentProviders: MutableDaemonConfig["providers"],
+  knownProviders: Record<string, ProviderOverride> | undefined,
+  persistedProviders: Record<string, ProviderOverride> | undefined,
+  draftPatch: MutableDaemonConfigPatch,
+) {
+  const { providers: providerPatches = {} } = MutableDaemonConfigPatchSchema.parse(draftPatch);
+  const nextRuntimeProviders = { ...currentProviders };
+  const providerUpdates: Record<string, ProviderOverride> = {};
+  const checkedProviders = new Set<string>();
+
+  for (const [id, providerPatch] of Object.entries(providerPatches)) {
+    const prepared = prepareCustomProviderCliOverride(
+      providerPatch,
+      currentProviders[id],
+      knownProviders?.[id],
+      persistedProviders?.[id],
+    );
+    if (!prepared) continue;
+    checkedProviders.add(id);
+    const base = prepared.nextPersisted.extends;
+    if (base && base !== "acp") checkedProviders.add(base);
+    nextRuntimeProviders[id] = prepared.nextRuntime;
+    providerUpdates[id] = prepared.nextPersisted;
+  }
+
+  return { nextRuntimeProviders, providerUpdates, checkedProviders };
 }
 
 const RELOADABLE_PATHS = [
@@ -358,7 +498,15 @@ function pickSupportedPatchFields(patch: MutableDaemonConfigPatch): SupportedMut
     ...(patch.browserTools?.enabled !== undefined
       ? { browserTools: { enabled: patch.browserTools.enabled } }
       : {}),
-    ...(patch.providers !== undefined ? { providers: patch.providers } : {}),
+    ...(patch.providers !== undefined
+      ? {
+          providers: Object.fromEntries(
+            Object.entries(patch.providers).map(
+              ([id, { deferDiscovery: _deferred, ...provider }]) => [id, provider],
+            ),
+          ),
+        }
+      : {}),
     ...(patch.removeProviders !== undefined ? { removeProviders: patch.removeProviders } : {}),
     ...(patch.metadataGeneration?.providers !== undefined
       ? { metadataGeneration: { providers: patch.metadataGeneration.providers } }
@@ -480,6 +628,81 @@ export class DaemonConfigStore {
     });
   }
 
+  public patchCustomProviderCli(
+    prepare: (
+      current: MutableDaemonConfig,
+      persistedProviders: Record<string, ProviderOverride> | undefined,
+    ) => Promise<MutableDaemonConfigPatch>,
+  ): Promise<MutableDaemonConfig> {
+    return this.enqueue(async () => {
+      const sanitize = (error: unknown): never => {
+        throw toWireDaemonConfigError(error, "Failed to save custom provider CLI");
+      };
+      const persisted = await loadPersistedConfigAsync(this.paseoHome, this.logger).catch(sanitize);
+      const draftPatch = await prepare(this.current, readProviderOverrides(persisted));
+      return this.commitCustomProviderCli(persisted, draftPatch).catch(sanitize);
+    });
+  }
+
+  private async commitCustomProviderCli(
+    persisted: PersistedConfig,
+    draftPatch: MutableDaemonConfigPatch,
+  ): Promise<MutableDaemonConfig> {
+    const persistedProviders = readProviderOverrides(persisted);
+    const knownProviders = readProviderOverrides(this.lastKnownPersisted);
+    const { nextRuntimeProviders, providerUpdates, checkedProviders } =
+      prepareCustomProviderCliPatch(
+        this.current.providers,
+        knownProviders,
+        persistedProviders,
+        draftPatch,
+      );
+    const written = Object.keys(providerUpdates);
+    if (written.length === 0) return this.current;
+
+    const next = MutableDaemonConfigSchema.parse({
+      ...this.current,
+      providers: nextRuntimeProviders,
+    });
+    const withProviders = (
+      base: PersistedConfig,
+      providers: Record<string, ProviderOverride>,
+    ): PersistedConfig => ({ ...base, agents: { ...base.agents, providers } }) as PersistedConfig;
+
+    // Only the submitted providers and their launch bases were validated. Keep other file edits.
+    const latest = await this.readCheckedCustomCliConfig(persistedProviders, checkedProviders);
+    await savePersistedConfigAsync(
+      this.paseoHome,
+      withProviders(latest, { ...readProviderOverrides(latest), ...providerUpdates }),
+      this.logger,
+    );
+    try {
+      this.applyReplacement(next, { removedProviders: [] });
+    } catch (error) {
+      await savePersistedConfigAsync(this.paseoHome, latest, this.logger);
+      throw error;
+    }
+    this.lastKnownPersisted = withProviders(this.lastKnownPersisted, {
+      ...knownProviders,
+      ...providerUpdates,
+    });
+    return this.current;
+  }
+
+  private async readCheckedCustomCliConfig(
+    validatedProviders: Record<string, ProviderOverride> | undefined,
+    checkedProviders: ReadonlySet<string>,
+  ): Promise<PersistedConfig> {
+    const latest = await loadPersistedConfigAsync(this.paseoHome, this.logger);
+    const latestProviders = readProviderOverrides(latest);
+    for (const id of checkedProviders) {
+      if (!isDeepStrictEqual(latestProviders?.[id], validatedProviders?.[id])) {
+        throw new Error(CUSTOM_CLI_CONFIG_CHANGED);
+      }
+    }
+    return latest;
+  }
+
   public setAgentSkillSelection(selection: AgentSkillSelection): Promise<MutableDaemonConfig> {
     return this.enqueue(() => this.applySupportedPatch({ skills: { selection } }));
   }
@@ -500,9 +723,7 @@ export class DaemonConfigStore {
     parsedPatch: SupportedMutableConfigPatch,
   ): Promise<MutableDaemonConfig> {
     if (parsedPatch.relay?.enabled !== undefined && !this.relayEnabledMutable) {
-      throw new Error(
-        "Relay is controlled by a daemon launch override. Remove PASEO_RELAY_ENABLED or the relay CLI flag before changing it here.",
-      );
+      throw new Error(RELAY_OVERRIDE_ERROR);
     }
     const { removeProviders = [], ...submittedPatch } = parsedPatch;
     const patch = this.foldPatchProfiles(submittedPatch);
@@ -581,7 +802,7 @@ export class DaemonConfigStore {
     speechPatch: SpeechSettingsPatch,
   ): Pick<MutableDaemonConfig, "features" | "envOverrides"> {
     if (!this.speechOwner) {
-      throw new Error("Speech settings are unavailable for this daemon instance");
+      throw new Error(SPEECH_SETTINGS_UNAVAILABLE);
     }
     return this.speechOwner.read(mergeSpeechSettingsPatch(this.lastKnownPersisted, speechPatch));
   }
@@ -598,7 +819,7 @@ export class DaemonConfigStore {
 
   private async reloadPersisted(): Promise<DaemonConfigReloadResult> {
     if (!this.reloadSource) {
-      throw new Error("Daemon config reload is unavailable for this daemon instance");
+      throw new Error(CONFIG_RELOAD_UNAVAILABLE);
     }
 
     const persisted = await loadPersistedConfigAsync(this.paseoHome, this.logger);
@@ -744,8 +965,8 @@ export class DaemonConfigStore {
     for (const listener of this.changeListeners) {
       try {
         listener(next, changeDetails);
-      } catch (error) {
-        this.logger?.info({ error }, "Daemon config change notification failed");
+      } catch {
+        this.logger?.info("Daemon config change notification failed");
       }
     }
   }

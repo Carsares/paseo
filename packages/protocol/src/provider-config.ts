@@ -11,9 +11,15 @@ const ProviderCommandAppendSchema = z.object({
   args: z.array(z.string()).optional(),
 });
 
+// Validate the executable separately while keeping the array type used by launch callers.
+const ProviderCommandArgvSchema: z.ZodType<string[], string[]> = z.tuple(
+  [z.string().min(1)],
+  z.string(),
+);
+
 const ProviderCommandReplaceSchema = z.object({
   mode: z.literal("replace"),
-  argv: z.array(z.string().min(1)).min(1),
+  argv: ProviderCommandArgvSchema,
 });
 
 export const ProviderCommandSchema = z.discriminatedUnion("mode", [
@@ -52,8 +58,10 @@ export const ProviderOverrideSchema = z.object({
   extends: z.string().optional(),
   label: z.string().optional(),
   description: z.string().optional(),
-  command: z.array(z.string().min(1)).min(1).optional(),
+  command: ProviderCommandArgvSchema.optional(),
   env: z.record(z.string(), z.string()).optional(),
+  // Set by the daemon after a settings form changes this provider's launch configuration.
+  deferDiscovery: z.literal(true).optional(),
   options: z.record(z.string(), z.unknown()).optional(),
   // COMPAT(providerParams): added in v0.10.0, remove after 2027-03-30 once configs use options.
   params: z.record(z.string(), z.unknown()).optional(),

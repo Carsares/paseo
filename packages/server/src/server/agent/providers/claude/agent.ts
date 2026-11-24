@@ -168,6 +168,7 @@ import {
 import { resolveRuntimeMcpToolPolicy } from "../../runtime-mcp-config.js";
 import { importSessionFromPersistence } from "../../provider-session-import.js";
 import { runProviderRefreshActivity } from "../../provider-refresh-deadline.js";
+import { currentCustomProviderLaunch } from "../../scoped-custom-provider-launch.js";
 import {
   createProviderEnv,
   resolveProviderLaunch,
@@ -1782,6 +1783,14 @@ export class ClaudeAgentClient implements AgentClient {
     context?: ProviderRefreshContext,
   ): Promise<ProviderCatalog> {
     // Claude exposes a global catalog here; cwd/force are intentionally irrelevant.
+    const managedDiscovery = currentCustomProviderLaunch()?.adapter === "claude";
+    if (managedDiscovery) {
+      const env = this.buildProviderEnv();
+      const models = await runProviderRefreshActivity(context, "settings", () =>
+        getClaudeModelsWithSettings(undefined, claudeConfigDir(env)),
+      );
+      return { models, ...claudeModeCatalog(env) };
+    }
     let claudeCodeVersion: string | undefined;
     try {
       claudeCodeVersion = await runProviderRefreshActivity(context, "version", () =>
@@ -1950,6 +1959,11 @@ export class ClaudeAgentClient implements AgentClient {
   }
 
   async isAvailable(): Promise<boolean> {
+    const scoped = currentCustomProviderLaunch();
+    if (scoped?.adapter === "claude") {
+      scoped.assertCurrent();
+      return true;
+    }
     const launch = await resolveProviderLaunch({
       commandConfig: this.runtimeSettings?.command,
       defaultBinary: "claude",
@@ -2497,6 +2511,7 @@ class ClaudeAgentSession implements AgentSession {
   private readonly resolveBinary: ClaudeBinaryResolver;
   private readonly independentUltracode: boolean;
   private query: Query | null = null;
+  private cachedCommands: AgentSlashCommand[] = [REWIND_COMMAND];
   private readonly runtimeSafety = new ClaudeRuntimeSafety();
   private readonly backgroundStops = new Map<string, (outcome: string) => void>();
   private processingSdkMessages = 0;
@@ -3549,8 +3564,9 @@ class ClaudeAgentSession implements AgentSession {
     );
   }
 
-  async listCommands(): Promise<AgentSlashCommand[]> {
-    const q = await this.ensureQuery();
+  async listCommands(options?: { allowLaunch?: boolean }): Promise<AgentSlashCommand[]> {
+    const q = options?.allowLaunch === false ? this.query : await this.ensureQuery();
+    if (!q) return this.cachedCommands;
     const commands = await q.supportedCommands();
     const commandMap = new Map<string, AgentSlashCommand>();
     for (const cmd of commands) {
@@ -3567,7 +3583,9 @@ class ClaudeAgentSession implements AgentSession {
     if (!commandMap.has(REWIND_COMMAND_NAME)) {
       commandMap.set(REWIND_COMMAND_NAME, REWIND_COMMAND);
     }
-    return Array.from(commandMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+    const available = Array.from(commandMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+    if (this.query === q) this.cachedCommands = available;
+    return available;
   }
 
   async revertConversation(input: { messageId: string }): Promise<void> {

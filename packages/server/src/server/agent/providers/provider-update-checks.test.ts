@@ -172,6 +172,31 @@ test("Claude Code is inconclusive when a wrapper command hides its version", asy
   expect(lookups).toEqual([]);
 });
 
+test.skipIf(process.platform === "win32")(
+  "Codex reports the later default installation when the first script has no interpreter",
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-codex-installation-"));
+    roots.push(root);
+    const stale = path.join(root, "stale");
+    const installed = path.join(root, "installed");
+    await Promise.all([fs.mkdir(stale), fs.mkdir(installed)]);
+    const missingInterpreter = path.join(root, "missing-interpreter");
+    const executable = path.join(installed, "codex");
+    await Promise.all([
+      fs.writeFile(path.join(stale, "codex"), "#!" + missingInterpreter + "\n", { mode: 0o700 }),
+      fs.writeFile(executable, "#!/bin/sh\nprintf 'codex-cli 0.200.0\\n'\n", { mode: 0o700 }),
+    ]);
+    const latest = releases("0.201.0");
+    const codex = new CodexAppServerAgentClient(
+      createTestLogger(),
+      { env: { PATH: [stale, installed].join(path.delimiter), CODEX_HOME: root } },
+      { lookupLatestRelease: latest.lookup },
+    );
+    await expect(check(codex)).resolves.toEqual({ status: "available", versions: ["0.201.0"] });
+    expect(latest.lookups).toEqual([await fs.realpath(executable)]);
+  },
+);
+
 /**
  * A command that answers `--version` with `banner` and any other invocation with `rest`, the way
  * a CLI answers both its version and its update check.

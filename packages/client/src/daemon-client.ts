@@ -75,6 +75,8 @@ import type {
   AgentForkContextResponseMessage,
   AgentForkSource,
   AgentProviderSwitchRequestMessage,
+  CustomProviderCliDraft,
+  CustomProviderCliResponsePayload,
   GitSetupOptions,
   CheckoutStatusResponse,
   CheckoutCommit,
@@ -7408,6 +7410,37 @@ export class DaemonClient {
       responseType: "provider_diagnostic_response",
       timeout: 180000,
     });
+  }
+
+  /** Requires `features.providerCustomCli`, checked by the caller when enabling the feature. */
+  async locateCustomProviderCli(
+    draft: CustomProviderCliDraft,
+  ): Promise<CustomProviderCliResponsePayload> {
+    return this.sendCustomProviderCliRequest("locate", draft);
+  }
+
+  async testCustomProviderCli(
+    draft: CustomProviderCliDraft,
+  ): Promise<CustomProviderCliResponsePayload> {
+    return this.sendCustomProviderCliRequest("test", draft);
+  }
+
+  async saveCustomProviderCli(
+    draft: CustomProviderCliDraft,
+  ): Promise<CustomProviderCliResponsePayload> {
+    return this.sendCustomProviderCliRequest("save", draft);
+  }
+
+  private sendCustomProviderCliRequest(
+    operation: "locate" | "test" | "save",
+    draft: CustomProviderCliDraft,
+  ): Promise<CustomProviderCliResponsePayload> {
+    return this.sendNamespacedCorrelatedSessionRequest<`provider.custom_cli.${typeof operation}.response`>(
+      {
+        message: { type: `provider.custom_cli.${operation}.request`, draft },
+        timeout: 60_000,
+      },
+    );
   }
 
   /** Install and update links plus installed state. Requires `features.providerInstallation`. */

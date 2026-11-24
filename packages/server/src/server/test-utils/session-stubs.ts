@@ -260,6 +260,11 @@ export function createProviderSnapshotManagerStub(): {
   const destroy = vi.fn<ProviderSnapshotManager["destroy"]>();
   const stub = {
     supportsConfigRequiredProvider: () => false,
+    isPluginProvider: () => false,
+    isProviderDiscoveryDeferred: () => false,
+    usesDynamicLauncher: () => false,
+    canLaunchProviderForRead: () => true,
+    discoverDeferredProvider: async () => {},
     getSnapshot,
     refreshSnapshotForCwd,
     refreshSettingsSnapshot,

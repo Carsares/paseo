@@ -1,5 +1,471 @@
 import { expect, test, vi } from "vitest";
+import { supportsScopedProviderProcess } from "../../scoped-provider-process.js";
 import { openCodeMajorVersion } from "./runtime-client.js";
+
+async function prepareManagedCatalog(
+  root: string,
+  argv: [string, ...string[]],
+  env: Record<string, string>,
+) {
+  const { prepareCustomProviderCliDiscovery } = await import("../../custom-provider-cli.js");
+  return prepareCustomProviderCliDiscovery(
+    { mode: "edit", providerId: "opencode" },
+    await openCodeConfig(root, { opencode: { command: argv, env } }),
+    root,
+  );
+}
+
+async function openCodeConfig(
+  root: string,
+  providers: Record<string, import("../../provider-launch-config.js").ProviderOverride> = {},
+) {
+  const { DaemonConfigStore } = await import("../../../daemon-config-store.js");
+  const configStore = new DaemonConfigStore(root, {
+    mcp: { injectIntoAgents: false },
+    providers,
+    browserTools: { enabled: false },
+    metadataGeneration: { providers: [] },
+    autoArchiveAfterMerge: false,
+    enableTerminalAgentHooks: false,
+    appendSystemPrompt: "",
+  });
+  return { configStore, isRegisteredProvider: () => true, isPluginProvider: () => false };
+}
+
+const v2CatalogResponses = {
+  "/api/info": { version: "2.0.10", pid: process.pid, urls: [], paths: { tmp: "/tmp" } },
+  "/api/plugin": { data: [{ id: "test", state: { status: "active" } }] },
+  "/api/agent": { data: [{ id: "test", name: "Test" }] },
+  "/api/provider": { data: [{ id: "test" }] },
+  "/api/model": {
+    data: [
+      {
+        id: "model",
+        modelID: "model",
+        providerID: "test",
+        name: "Test Model",
+        capabilities: { tools: true, input: ["text"], output: ["text"] },
+        variants: [],
+        time: { released: 1 },
+        cost: [],
+        status: "active",
+        enabled: true,
+        limit: { context: 200000, output: 10000 },
+      },
+    ],
+  },
+};
+
+test.skipIf(!supportsScopedProviderProcess())(
+  "saves and refreshes an OpenCode v1 launcher without replacing the launcher of an open session",
+  async () => {
+    const { mkdtemp, readFile, rm, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { createTestLogger } = await import("../../../../test-utils/test-logger.js");
+    const { prepareCustomProviderCliDiscovery, runCustomProviderCliOperation } =
+      await import("../../custom-provider-cli.js");
+    const { buildProviderRegistry } = await import("../../provider-registry.js");
+    const root = await mkdtemp(join(tmpdir(), "paseo-opencode-config-"));
+    const launches = join(root, "launches");
+    const config = { provider: "opencode", cwd: root } as const;
+    const logger = createTestLogger();
+    const clients: import("../../agent-sdk-types.js").AgentClient[] = [];
+    const sessions: import("../../agent-sdk-types.js").AgentSession[] = [];
+    vi.stubEnv("PASEO_HOME", root);
+    try {
+      const deps = await openCodeConfig(root);
+      const getLaunches = async () =>
+        (await readFile(launches, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+      async function saveLauncher(id: string) {
+        const script = join(root, id + ".cjs");
+        await writeFile(
+          script,
+          `
+          const id = ${JSON.stringify(id)};
+          const env = process.env.TEST_OPENCODE_CONFIG;
+          const args = process.argv.slice(2);
+          require("node:fs").appendFileSync(${JSON.stringify(launches)},
+            JSON.stringify([id, env, args.at(0)]) + "\\n");
+          if (args.includes("--version")) {
+            console.log("1.14.46");
+          } else {
+            const name = id + "-" + env;
+            const server = require("node:http").createServer((request, response) => {
+              const pathname = new URL(request.url, "http://127.0.0.1").pathname;
+              if (pathname === "/global/event") {
+                response.writeHead(200, { "content-type": "text/event-stream" });
+                response.write('data: {"payload":{"type":"server.connected","properties":{}}}\\n\\n');
+                return;
+              }
+              const body = {
+                "/session": { id: name, directory: ${JSON.stringify(root)} },
+                "/command": [{ name }],
+                "/provider": {
+                  all: [{ id: "test", name: "Test", models: { [name]: { name } } }],
+                  connected: ["test"],
+                },
+                "/agent": [{ name, mode: "primary" }],
+              };
+              response.writeHead(200, { "content-type": "application/json" });
+              response.end(JSON.stringify(body[pathname] ?? {}));
+            });
+            server.listen(Number(args[args.indexOf("--port") + 1]), "127.0.0.1", () =>
+              console.log("listening on http://127.0.0.1:" + server.address().port)
+            );
+          }
+          `,
+        );
+        const saved = await runCustomProviderCliOperation(
+          "save",
+          {
+            mode: "edit",
+            providerId: "opencode",
+            command: [process.execPath, script],
+            env: {
+              TEST_OPENCODE_CONFIG: id + "-env",
+              PASEO_OPENCODE_SERVER_URL: "",
+              XDG_STATE_HOME: root,
+            },
+          },
+          deps,
+        );
+        expect(saved).toEqual({ status: "ok" });
+        const client = buildProviderRegistry(logger, {
+          providerOverrides: deps.configStore.get().providers,
+        }).opencode.createClient(logger);
+        clients.push(client);
+        return client;
+      }
+
+      const oldClient = await saveLauncher("old");
+      await expect(readFile(launches)).rejects.toMatchObject({ code: "ENOENT" });
+      const oldSession = await oldClient.createSession(config);
+      sessions.push(oldSession);
+      const original = await getLaunches();
+      const nextClient = await saveLauncher("new");
+      expect(await getLaunches()).toEqual(original);
+      const binding = await prepareCustomProviderCliDiscovery(
+        { mode: "edit", providerId: "opencode" },
+        deps,
+        root,
+      );
+      if (binding.status !== "ok") throw new Error("Managed discovery preparation failed");
+      const catalog = await binding.run(() =>
+        nextClient.fetchCatalog!({ scope: "workspace", cwd: root, force: true }),
+      );
+      expect(catalog.models.map(({ id }) => id)).toEqual(["test/new-new-env"]);
+      const newSession = await nextClient.createSession(config);
+      sessions.push(newSession);
+      expect((await newSession.listCommands?.())?.map(({ name }) => name)).toContain("new-new-env");
+      expect((await oldSession.listCommands?.())?.map(({ name }) => name)).toContain("old-old-env");
+      expect(await getLaunches()).toEqual([
+        ["old", "old-env", "--version"],
+        ["old", "old-env", "serve"],
+        ["new", "new-env", "--version"],
+        ["new", "new-env", "serve"],
+        ["new", "new-env", "--version"],
+        ["new", "new-env", "serve"],
+      ]);
+    } finally {
+      await Promise.allSettled(sessions.map((session) => session.close()));
+      await Promise.allSettled(clients.map((client) => client.shutdown?.()));
+      vi.unstubAllEnvs();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+  15_000,
+);
+
+test.skipIf(!supportsScopedProviderProcess()).each([
+  ["1.14.46", "catalog"],
+  ["2.0.10", "catalog"],
+  ["1.14.46", "abort"],
+  ["2.0.10", "abort"],
+] as const)(
+  "reaps the verified OpenCode %s processes after %s",
+  async (version, outcome) => {
+    const { mkdtemp, readFile, realpath, rm, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { OpenCodeRuntimeClient } = await import("./runtime-client.js");
+    const { installationActivity } =
+      await import("../../provider-installation/installation-activity.js");
+    const { createTestLogger } = await import("../../../../test-utils/test-logger.js");
+    const root = await mkdtemp(join(tmpdir(), "paseo-managed-opencode-"));
+    const script = join(root, "opencode.cjs");
+    const invocations = join(root, "invocations");
+    const versionGate = join(root, "version-ready");
+    const serveGate = join(root, "serve-ready");
+    const command: [string, ...string[]] = [process.execPath, script, "configured-argument"];
+    const settings = {
+      command: { mode: "replace" as const, argv: command },
+      env: {
+        XDG_CONFIG_HOME: root,
+        XDG_STATE_HOME: root,
+        PASEO_OPENCODE_SERVER_URL: "",
+        OPENCODE_CONFIG_CONTENT: "{}",
+        TEST_OPEN_CODE_ENV: "test-value",
+      },
+    };
+    const client = new OpenCodeRuntimeClient(createTestLogger(), settings);
+    const abort = new AbortController();
+    vi.stubEnv("PASEO_HOME", root);
+    let refresh: Promise<Awaited<ReturnType<typeof client.fetchCatalog>>> | undefined;
+    const acquireUpdate = () =>
+      installationActivity.acquireUpdate({ family: "opencode", keys: [] });
+    const waitForInvocations = (count: number) =>
+      vi.waitFor(async () => {
+        const rows = (await readFile(invocations, "utf8")).trim().split("\n");
+        expect(rows).toHaveLength(count);
+        return rows.map((row) => JSON.parse(row));
+      });
+    try {
+      await writeFile(
+        script,
+        `
+        const args = process.argv.slice(2);
+        const fs = require("node:fs");
+        const worker = require("node:child_process").spawn(
+          process.execPath, ["-e", "setTimeout(() => {}, 12000)"], { stdio: "inherit" }
+        );
+        worker.unref();
+        fs.appendFileSync(
+          ${JSON.stringify(invocations)},
+          JSON.stringify([args, process.cwd(), process.env.TEST_OPEN_CODE_ENV, process.pid, worker.pid]) + "\\n"
+        );
+        const isVersion = args.includes("--version");
+        const deadline = Date.now() + 7000;
+        const wait = setInterval(() => {
+          if (Date.now() > deadline) process.exit(1);
+          if (!fs.existsSync(isVersion ? ${JSON.stringify(versionGate)} : ${JSON.stringify(serveGate)})) return;
+          clearInterval(wait);
+          if (isVersion) {
+            console.log(${JSON.stringify(version)});
+            return;
+          }
+          const responses = ${JSON.stringify({
+            ...v2CatalogResponses,
+            "/provider": {
+              all: [{ id: "test", name: "Test", models: { model: { name: "Test Model" } } }],
+              connected: ["test"],
+            },
+            "/agent": [{ name: "test", mode: "primary" }],
+          })};
+          const server = require("node:http").createServer((req, res) => {
+            const value = responses[req.url.split("?")[0]];
+            res.writeHead(value === undefined ? 404 : 200, { "content-type": "application/json" });
+            res.end(JSON.stringify(value ?? {}));
+          });
+          server.listen(Number(args[args.indexOf("--port") + 1]), "127.0.0.1", () =>
+            console.log("server listening on http://127.0.0.1:" + server.address().port)
+          );
+        }, 15);
+        `,
+      );
+      const binding = await prepareManagedCatalog(root, command, settings.env);
+      expect(binding.status).toBe("ok");
+      if (binding.status !== "ok") throw new Error("Managed discovery preparation failed");
+      const changedClient = new OpenCodeRuntimeClient(createTestLogger(), {
+        ...settings,
+        env: { ...settings.env, TEST_OPEN_CODE_ENV: "changed-after-binding" },
+      });
+      const options = { scope: "workspace", cwd: root, force: true } as const;
+      try {
+        await expect(binding.run(() => changedClient.fetchCatalog(options))).rejects.toThrow(
+          /^OpenCode catalog discovery failed$/u,
+        );
+        await expect(readFile(invocations)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await changedClient.shutdown();
+      }
+      refresh = binding.run(() =>
+        client.fetchCatalog(options, {
+          signal: abort.signal,
+          runActivity: (_, operation) => operation(),
+        }),
+      );
+      void refresh.catch(() => undefined);
+      const [probe] = await waitForInvocations(1);
+      expect(() => acquireUpdate()).toThrow("installation is in use");
+      await writeFile(versionGate, "");
+      const [, serve] = await waitForInvocations(2);
+      expect(() => process.kill(probe[4], 0)).toThrow();
+      expect(() => acquireUpdate()).toThrow("installation is in use");
+      if (outcome === "abort") {
+        abort.abort();
+        await expect(refresh).rejects.toThrow(/^OpenCode catalog discovery failed$/u);
+      } else {
+        await writeFile(serveGate, "");
+        const catalog = await refresh;
+        expect(catalog.models.map(({ id }) => id)).toEqual(["test/model"]);
+        expect(catalog.modes.map(({ id }) => id)).toContain("test");
+      }
+      expect(probe.slice(0, 3)).toEqual([
+        ["configured-argument", "--version"],
+        await realpath(join(root, "opencode-home")),
+        "test-value",
+      ]);
+      expect(serve.slice(0, 3)).toEqual([
+        version.startsWith("1.")
+          ? ["configured-argument", "serve", "--port", expect.stringMatching(/^\d+$/u)]
+          : ["configured-argument", "serve", "--hostname", "127.0.0.1", "--port", "0"],
+        await realpath(join(root, "opencode-home")),
+        "test-value",
+      ]);
+      expect(() => process.kill(serve[3], 0)).toThrow();
+      expect(() => process.kill(serve[4], 0)).toThrow();
+      acquireUpdate().release();
+    } finally {
+      await Promise.all([writeFile(versionGate, ""), writeFile(serveGate, "")]);
+      await refresh?.catch(() => undefined);
+      vi.unstubAllEnvs();
+      await client.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+  15_000,
+);
+
+test.each(["explicit", "registered"] as const)(
+  "refreshes a %s OpenCode service without a local CLI and leaves it running",
+  async (selection) => {
+    const { createServer } = await import("node:http");
+    const { mkdir, mkdtemp, rm, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { OpenCodeRuntimeClient } = await import("./runtime-client.js");
+    const { createTestLogger } = await import("../../../../test-utils/test-logger.js");
+    const root = await mkdtemp(join(tmpdir(), "paseo-managed-opencode-shared-"));
+    const requests: string[] = [];
+    const server = createServer((request, response) => {
+      requests.push(request.url ?? "");
+      if (
+        request.headers.authorization !==
+        `Basic ${Buffer.from("opencode:test-password").toString("base64")}`
+      ) {
+        response.writeHead(401).end();
+        return;
+      }
+      const endpoint = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+      const result = v2CatalogResponses[endpoint as keyof typeof v2CatalogResponses];
+      response.writeHead(result === undefined ? 404 : 200, { "content-type": "application/json" });
+      response.end(JSON.stringify(result ?? {}));
+    });
+    const command = join(root, "missing-cli");
+    try {
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("No test address");
+      const url = `http://127.0.0.1:${address.port}`;
+      const env =
+        selection === "explicit"
+          ? { PASEO_OPENCODE_SERVER_URL: url, PASEO_OPENCODE_SERVER_PASSWORD: "test-password" }
+          : { PASEO_OPENCODE_SERVER_URL: "", XDG_STATE_HOME: root };
+      if (selection === "registered") {
+        await mkdir(join(root, "opencode"));
+        await writeFile(
+          join(root, "opencode", "service.json"),
+          JSON.stringify({ url, password: "test-password", pid: process.pid, version: "2.0.10" }),
+        );
+      }
+      const client = new OpenCodeRuntimeClient(createTestLogger(), {
+        command: { mode: "replace", argv: [command] },
+        env,
+      });
+      try {
+        const binding = await prepareManagedCatalog(root, [command], env);
+        expect(binding.status).toBe("ok");
+        if (binding.status !== "ok") throw new Error("Managed discovery preparation failed");
+        const catalog = await binding.run(() =>
+          client.fetchCatalog({ scope: "workspace", cwd: root, force: true }),
+        );
+        expect(catalog.models.map(({ id }) => id)).toEqual(["test/model"]);
+        expect(requests.some((request) => request.startsWith("/api/plugin?"))).toBe(true);
+        expect(server.listening).toBe(true);
+      } finally {
+        await client.shutdown();
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) return reject(error);
+          resolve();
+        });
+        server.closeAllConnections();
+      });
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.skipIf(!supportsScopedProviderProcess())(
+  "reports managed OpenCode discovery failure when an owned CLI is missing",
+  async () => {
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { OpenCodeRuntimeClient } = await import("./runtime-client.js");
+    const { createTestLogger } = await import("../../../../test-utils/test-logger.js");
+    const root = await mkdtemp(join(tmpdir(), "paseo-managed-opencode-missing-"));
+    const argv: [string] = [join(root, "missing-cli")];
+    const env = { PASEO_OPENCODE_SERVER_URL: "", XDG_STATE_HOME: root };
+    const client = new OpenCodeRuntimeClient(createTestLogger(), {
+      command: { mode: "replace", argv },
+      env,
+    });
+    vi.stubEnv("PASEO_HOME", root);
+    try {
+      const binding = await prepareManagedCatalog(root, argv, env);
+      expect(binding.status).toBe("ok");
+      if (binding.status !== "ok") throw new Error("Managed discovery preparation failed");
+      await expect(
+        binding.run(() => client.fetchCatalog({ scope: "workspace", cwd: root, force: true })),
+      ).rejects.toThrow(/^OpenCode catalog discovery failed$/u);
+    } finally {
+      vi.unstubAllEnvs();
+      await client.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test("rejects owned discovery before preparing a launch on an unsupported host", async () => {
+  const { access, mkdtemp, rm, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { OpenCodeRuntimeClient } = await import("./runtime-client.js");
+  const { createTestLogger } = await import("../../../../test-utils/test-logger.js");
+  const root = await mkdtemp(join(tmpdir(), "paseo-managed-opencode-platform-"));
+  const argv: [string, string] = [process.execPath, join(root, "cli.cjs")];
+  const env = { PASEO_OPENCODE_SERVER_URL: "", XDG_STATE_HOME: root };
+  const client = new OpenCodeRuntimeClient(createTestLogger(), {
+    command: { mode: "replace", argv },
+    env,
+  });
+  vi.stubEnv("PASEO_HOME", root);
+  const platform = process.platform;
+  try {
+    const marker = join(root, "invoked");
+    await writeFile(argv[1], `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "");`);
+    const binding = await prepareManagedCatalog(root, argv, env);
+    if (binding.status !== "ok") throw new Error("Managed discovery preparation failed");
+    Object.defineProperty(process, "platform", { value: "win32" });
+    await expect(
+      binding.run(() => client.fetchCatalog({ scope: "workspace", cwd: root, force: true })),
+    ).rejects.toThrow("Managed discovery cannot start a local OpenCode process on this platform");
+    await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(access(join(root, "opencode-home"))).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    Object.defineProperty(process, "platform", { value: platform });
+    vi.unstubAllEnvs();
+    await client.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test.each([
   ["1.14.46", 1],

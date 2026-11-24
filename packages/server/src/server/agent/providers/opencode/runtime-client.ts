@@ -1,4 +1,4 @@
-import type { Logger } from "pino";
+import pino, { type Logger } from "pino";
 import type {
   AgentClient,
   AgentClientInstallation,
@@ -14,6 +14,7 @@ import type {
   ImportProviderSessionContext,
 } from "../../agent-sdk-types.js";
 import {
+  createProviderEnv,
   createProviderEnvSpec,
   resolveProviderLaunch,
   type ProviderRuntimeSettings,
@@ -25,6 +26,15 @@ import { resolveExternalOpenCodeServer } from "./v2/external-server.js";
 import { withOpenCodeRuntimeNotice } from "./runtime-notice.js";
 import { selectOpenCodeService, type OpenCodeServiceSelection } from "./v2/service-selection.js";
 import { createCliInstallation } from "../cli-installation.js";
+import {
+  currentOpenCodeDiscovery,
+  prepareOwnedOpenCodeLaunch,
+} from "../../scoped-custom-provider-launch.js";
+import { supportsScopedProviderProcess } from "../../scoped-provider-process.js";
+import { runProviderRefreshActivity } from "../../provider-refresh-deadline.js";
+import { OpenCodeServerManager } from "./server-manager.js";
+import { readManagedOpenCodeVersion } from "./managed-catalog-launch.js";
+import { resolveOpenCodeHomeDir } from "./paths.js";
 
 const OPENCODE_INSTALL_URL = "https://opencode.ai/docs/";
 const OPENCODE_EXTERNAL_MAINTENANCE = {
@@ -38,7 +48,13 @@ const OPENCODE_UPDATED =
 
 // Keep the minimum aligned with the SDK and binary exercised by CI.
 const MINIMUM_V2: readonly [number, number] = [0, 10];
-const VERSION_PATTERN = /^(?:opencode\s+)?v?(\d+)\.(\d+)\.(\d+)(?:[-+][\w.-]+)?$/i;
+const VERSION_PATTERN = /^(?:opencode\s+)?v?(\d+)\.(\d+)\.(\d+)([-+][\w.-]+)?$/i;
+
+class UnsupportedOwnedOpenCodeDiscovery extends Error {
+  constructor() {
+    super("Managed discovery cannot start a local OpenCode process on this platform");
+  }
+}
 
 export function openCodeMajorVersion(output: string): 1 | 2 {
   const version = output.trim().match(VERSION_PATTERN);
@@ -208,6 +224,8 @@ export class OpenCodeRuntimeClient implements AgentClient {
     return this.selected;
   }
   async isAvailable() {
+    // Managed discovery evaluates service selection and verifies any owned command in fetchCatalog.
+    if (currentOpenCodeDiscovery()) return true;
     const selection = await this.effectiveService();
     if (selection.kind !== "owned") return true;
     return this.legacy.isAvailable();
@@ -238,8 +256,116 @@ export class OpenCodeRuntimeClient implements AgentClient {
     return client === this.legacy ? session : withOpenCodeRuntimeNotice(session, 2, handle);
   }
   async fetchCatalog(options: FetchCatalogOptions, context?: ProviderRefreshContext) {
+    if (currentOpenCodeDiscovery()) {
+      try {
+        return await this.fetchManagedCatalog(options, context);
+      } catch (error) {
+        if (error instanceof UnsupportedOwnedOpenCodeDiscovery) throw error;
+        // Discovery failures can contain configuration or process output.
+        // oxlint-disable-next-line eslint/preserve-caught-error
+        throw new Error("OpenCode catalog discovery failed");
+      }
+    }
     if (options.force) await this.reprobeLegacySelection();
     return (await this.client()).fetchCatalog(options, context);
+  }
+  private async fetchManagedCatalog(
+    options: FetchCatalogOptions,
+    context?: ProviderRefreshContext,
+  ) {
+    const selection = await runProviderRefreshActivity(context, "service.select", () =>
+      this.effectiveService(),
+    );
+    const logger = pino({ level: "silent" });
+    const resolveHomeDir = this.options.resolveHomeDir ?? resolveOpenCodeHomeDir;
+    const signal = context?.signal;
+    if (selection.kind === "owned") {
+      if (!supportsScopedProviderProcess()) {
+        throw new UnsupportedOwnedOpenCodeDiscovery();
+      }
+      const cwd = resolveHomeDir();
+      const binding = await runProviderRefreshActivity(context, "launch.prepare", () =>
+        prepareOwnedOpenCodeLaunch(cwd),
+      );
+      return binding.run(async () => {
+        const { client, installedVersion } = await this.createOwnedCatalogClient(
+          logger,
+          cwd,
+          signal,
+          context,
+        );
+        try {
+          const catalog = await client.fetchCatalog(options, context);
+          return installedVersion ? { ...catalog, installedVersion } : catalog;
+        } finally {
+          await client.shutdown();
+        }
+      });
+    }
+    const { OpenCodeV2AgentClient } = await import("./v2/agent.js");
+    const client = new OpenCodeV2AgentClient({
+      logger,
+      settings: this.settings,
+      bridge: this.options.bridge,
+      selection,
+      catalogDiscovery: { signal },
+    });
+    try {
+      return await client.fetchCatalog(options, context);
+    } finally {
+      await client.shutdown();
+    }
+  }
+  private async createOwnedCatalogClient(
+    logger: Logger,
+    cwd: string,
+    signal: AbortSignal | undefined,
+    context: ProviderRefreshContext | undefined,
+  ) {
+    const command = await resolveProviderLaunch({
+      commandConfig: this.settings?.command,
+      defaultBinary: "opencode",
+    });
+    const env = createProviderEnv({ runtimeSettings: this.settings });
+    // A wrapper that cannot report its version is still usable through the v1 protocol.
+    const output = await runProviderRefreshActivity(context, "version", () =>
+      readManagedOpenCodeVersion({
+        operation: "opencode.version",
+        cwd,
+        argv: [command.command, ...command.args, "--version"],
+        env,
+        signal,
+      }),
+    );
+    const version = output.trim().match(VERSION_PATTERN);
+    const installedVersion = version && !version[4] ? version.slice(1, 4).join(".") : undefined;
+    const major = openCodeMajorVersion(output);
+    if (major === 2) {
+      const { OpenCodeV2AgentClient } = await import("./v2/agent.js");
+      const client = new OpenCodeV2AgentClient({
+        logger,
+        settings: this.settings,
+        managedProcesses: this.options.managedProcesses,
+        selection: { kind: "owned" },
+        catalogDiscovery: { signal, cwd },
+      });
+      return { client, installedVersion };
+    }
+    const resolveHomeDir = () => cwd;
+    const serverManager = new OpenCodeServerManager({
+      logger,
+      resolveHomeDir,
+      runtimeSettings: this.settings,
+      managedProcesses: this.options.managedProcesses,
+      resolveCommandPrefix: async () => command,
+      catalogDiscovery: { signal },
+    });
+    const client = new OpenCodeAgentClient(logger, this.settings, {
+      serverManager,
+      resolveHomeDir,
+      createClient: this.options.createClient,
+    });
+    return { client, installedVersion };
   }
   // Updating the binary does not change provider config, so the client survives it. A forced
   // refresh re-probes a v1 pick so a 1.x to 2.x update takes effect without a daemon restart.

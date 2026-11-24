@@ -28,9 +28,10 @@ import type { ManagedAgent } from "./agent-manager.js";
 import type { WorkspaceGitService } from "../workspace-git-service.js";
 import type { ManagedProcessRegistry } from "../managed-processes/managed-processes.js";
 import type { OpenCodeBridge } from "./providers/opencode/bridge.js";
-import type {
-  AgentProviderRuntimeSettingsMap,
-  ProviderOverride,
+import {
+  createProviderEnv,
+  type AgentProviderRuntimeSettingsMap,
+  type ProviderOverride,
 } from "./provider-launch-config.js";
 import {
   buildProviderRegistry,
@@ -54,11 +55,16 @@ import { PluginAgentClientRegistry } from "./plugin-provider.js";
 import { convertLegacyClaudeUltracode, resolveAdapter } from "./option-controls.js";
 import { installationActivity } from "./provider-installation/installation-activity.js";
 import { ProviderInstallations } from "./provider-installation/provider-installations.js";
+import {
+  hasDynamicProviderLauncherName,
+  isDynamicProviderLauncher,
+} from "./custom-provider-cli.js";
 
 const DEFAULT_REFRESH_TIMEOUT_MS = 120_000;
 const MAX_REFRESH_TIMEOUT_MS = 2_147_483_647;
 const DEFAULT_DIAGNOSTIC_TIMEOUT_MS = 120_000;
 const PROVIDER_REFRESH_DEADLINE_ENV = "PASEO_PROVIDER_REFRESH_TIMEOUT_MS";
+const CUSTOM_CLI_DISCOVERY_FAILED = "Custom CLI discovery failed";
 export const GLOBAL_PROVIDER_SNAPSHOT_KEY = "paseo:global";
 
 function validRefreshDeadline(value: unknown): number | undefined {
@@ -188,7 +194,9 @@ export interface AgentManagerProviderState {
   providerDefinitions: Partial<
     Record<
       AgentProvider,
-      Pick<ProviderDefinition, "enabled" | "derivedFromProviderId" | "applyToolPolicy">
+      Pick<ProviderDefinition, "enabled" | "derivedFromProviderId" | "applyToolPolicy"> & {
+        isDiscoveryDeferred: (provider: AgentProvider) => boolean;
+      }
     >
   >;
   clients: Partial<Record<AgentProvider, AgentClient>>;
@@ -200,7 +208,17 @@ interface ProviderLoadOptions {
   providers: AgentProvider[];
   catalogScope: ProviderCatalogScope;
   force: boolean;
+  allowDeferred?: boolean;
+  runDiscovery?: ProviderDiscoveryScope;
 }
+
+export type ProviderDiscoveryScope = <T>(operation: () => Promise<T>) => Promise<T>;
+type DeferredDiscoveryIntent =
+  | { kind: "create" }
+  | {
+      kind: "refresh";
+      prepare: (cwd: string) => Promise<ProviderDiscoveryScope | undefined>;
+    };
 interface CatalogBinding {
   key?: string;
   failure?: ProviderSnapshotRecord;
@@ -211,6 +229,7 @@ interface CatalogBinding {
 
 interface ProviderCatalog {
   result?: ProviderSnapshotRecord;
+  installedVersion?: string;
   stale?: boolean;
   load?: Promise<void>;
 }
@@ -218,10 +237,106 @@ interface ProviderCatalog {
 interface RegistryGeneration {
   definitions: Record<AgentProvider, ProviderDefinition>;
   order: readonly AgentProvider[];
-  providerStates: ReadonlyMap<
-    AgentProvider,
-    { initial: ProviderSnapshotRecord; discoveryLimit: LimitFunction }
-  >;
+  providerStates: ReadonlyMap<AgentProvider, RegistryProviderState>;
+}
+
+interface RegistryProviderState {
+  initial: ProviderSnapshotRecord;
+  discoveryLimit: LimitFunction;
+  requiresDiscovery: boolean;
+  dynamicLauncher: boolean;
+  checkLegacyLauncher?: () => Promise<boolean>;
+  discoveryLoads: Map<string, Promise<void>>;
+}
+
+function runtimeConfiguration(definition: ProviderDefinition) {
+  if (!definition.configuration) return null;
+  const {
+    definition: { label: _label, description: _description, ...descriptor },
+    ...configuration
+  } = definition.configuration;
+  return { ...configuration, definition: descriptor };
+}
+
+function sameInstallationConfiguration(
+  before: ProviderDefinition | undefined,
+  after: ProviderDefinition | undefined,
+): boolean {
+  if (before === after) return true;
+  // Plugin definitions have no declarative configuration. Replacing a registration changes
+  // the callback that owns installation and maintenance.
+  if (!before?.configuration || !after?.configuration) return false;
+  return isDeepStrictEqual(runtimeConfiguration(before), runtimeConfiguration(after));
+}
+
+function withProviderDisplay(
+  record: ProviderSnapshotRecord,
+  initial: ProviderSnapshotRecord,
+): ProviderSnapshotRecord {
+  const { label, description } = initial.entry;
+  if (record.entry.label === label && record.entry.description === description) return record;
+  return identifyEntry({ ...record.entry, label, description });
+}
+
+function safeDiscoveredVersion(version: unknown): string | undefined {
+  return typeof version === "string" && /^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$/u.test(version)
+    ? version
+    : undefined;
+}
+
+function providerRequiresDiscovery(
+  overrides: Record<string, ProviderOverride> | undefined,
+  provider: AgentProvider,
+  base: AgentProvider | null,
+): boolean {
+  return (
+    overrides?.[provider]?.deferDiscovery === true ||
+    (base !== null && overrides?.[base]?.deferDiscovery === true)
+  );
+}
+
+function providerNamesDynamicLauncher(definition: ProviderDefinition): boolean {
+  const command = definition.configuration?.runtimeSettings?.command;
+  return command?.mode === "replace" && hasDynamicProviderLauncherName(command.argv);
+}
+
+function initialProviderRecord(
+  provider: AgentProvider,
+  definition: ProviderDefinition,
+  deferred: boolean,
+  custom: boolean,
+  dynamicLauncher: boolean,
+): ProviderSnapshotRecord {
+  const staticCatalog = definition.enabled && !deferred && dynamicLauncher;
+  const config = definition.configuration;
+  return identifyEntry({
+    provider,
+    status: providerInitialStatus(definition.enabled, deferred, staticCatalog),
+    enabled: definition.enabled,
+    source: custom ? "custom" : "builtin",
+    ...(definition.derivedFromProviderId
+      ? { derivedFromProviderId: definition.derivedFromProviderId }
+      : {}),
+    label: definition.label,
+    description: definition.description,
+    iconSvg: definition.iconSvg,
+    defaultModeId: definition.defaultModeId ?? null,
+    ...(staticCatalog
+      ? {
+          models: normalizeAgentModelCatalog(
+            [...(config?.profileModels ?? []), ...(config?.additionalModels ?? [])].map((model) =>
+              Object.assign({ provider }, model),
+            ),
+          ),
+          modes: definition.modes,
+        }
+      : {}),
+  });
+}
+
+function providerInitialStatus(enabled: boolean, deferred: boolean, staticCatalog: boolean) {
+  if (!enabled || deferred) return "unavailable";
+  return staticCatalog ? "ready" : "loading";
 }
 
 interface Target {
@@ -237,6 +352,8 @@ interface ProviderSnapshotTarget {
 }
 
 export class ProviderSnapshotManager {
+  private readonly readDiscoveryDeferral = (provider: AgentProvider) =>
+    !this.canLaunchProviderForRead(provider);
   private readonly catalogs = new Map<string, Map<AgentProvider, ProviderCatalog>>();
   private readonly targets = new Map<string, Target>();
   private readonly events = new EventEmitter();
@@ -291,6 +408,8 @@ export class ProviderSnapshotManager {
       logger: options.logger.child({ module: "provider-installations" }),
       activity: installationActivity,
       configurationVersion: (provider) => this.installationConfigVersions.get(provider) ?? 0,
+      isDiscoveryDeferred: this.readDiscoveryDeferral,
+      readDiscoveredVersion: (provider) => this.readDiscoveredVersion(provider),
       resolveClient: (provider) => {
         const definition = this.generation.definitions[provider];
         return definition ? this.ensureClient(provider, definition) : null;
@@ -329,7 +448,10 @@ export class ProviderSnapshotManager {
     const target = createGlobalSnapshotTarget();
     const homeCwd = target.snapshotCwd;
     const providers = this.resolveRefreshProviders(options.providers);
-    const providersToRefresh = providers ?? this.getProviderIds();
+    // Ordinary refreshes also skip invalidation while explicit discovery is running.
+    const providersToRefresh = (providers ?? this.getProviderIds()).filter(
+      (provider) => !this.isProviderDiscoveryDeferred(provider),
+    );
 
     this.getOrCreateTarget(homeCwd);
     for (const catalogs of this.catalogs.values()) {
@@ -375,6 +497,113 @@ export class ProviderSnapshotManager {
     return Object.prototype.hasOwnProperty.call(this.generation.definitions, provider);
   }
 
+  isPluginProvider(provider: AgentProvider): boolean {
+    return this.pluginProviders.has(provider);
+  }
+
+  isProviderDiscoveryDeferred(provider: AgentProvider): boolean {
+    // Discovery results are reusable data. They do not authorize another process launch.
+    return this.generation.providerStates.get(provider)?.requiresDiscovery === true;
+  }
+
+  usesDynamicLauncher(provider: AgentProvider): boolean {
+    const state = this.generation.providerStates.get(provider);
+    // Synchronous callers cannot verify that a legacy replacement still selects
+    // the executable seen by the last asynchronous read.
+    return state?.dynamicLauncher === true || state?.checkLegacyLauncher !== undefined;
+  }
+
+  canLaunchProviderForRead(provider: AgentProvider): boolean {
+    return !this.isProviderDiscoveryDeferred(provider) && !this.usesDynamicLauncher(provider);
+  }
+
+  private async blocksCurrentLegacyLauncher(provider: AgentProvider): Promise<boolean> {
+    for (;;) {
+      const state = this.generation.providerStates.get(provider);
+      const blocked = state?.checkLegacyLauncher
+        ? await state.checkLegacyLauncher()
+        : state?.dynamicLauncher === true;
+      if (this.generation.providerStates.get(provider) === state) return blocked;
+    }
+  }
+
+  async discoverDeferredProvider(
+    provider: AgentProvider,
+    cwd: string | null | undefined,
+    intent: DeferredDiscoveryIntent,
+  ): Promise<void> {
+    const state = this.generation.providerStates.get(provider);
+    if (!state?.requiresDiscovery || !state.initial.entry.enabled || this.destroyed) return;
+    const target = resolveProviderSnapshotTarget(cwd);
+    const key = JSON.stringify([intent.kind, target.snapshotCwd]);
+    const other = JSON.stringify([
+      intent.kind === "create" ? "refresh" : "create",
+      target.snapshotCwd,
+    ]);
+    let load = state.discoveryLoads.get(key);
+    if (!load) {
+      const previous = state.discoveryLoads.get(other) ?? Promise.resolve();
+      load = previous
+        .then(() => this.loadDeferredDiscovery(provider, state, target, intent))
+        .finally(() => state.discoveryLoads.delete(key));
+      state.discoveryLoads.set(key, load);
+    }
+    await load;
+  }
+
+  private async loadDeferredDiscovery(
+    provider: AgentProvider,
+    state: RegistryProviderState,
+    target: ProviderSnapshotTarget,
+    intent: DeferredDiscoveryIntent,
+  ): Promise<void> {
+    const current = () =>
+      !this.destroyed &&
+      this.generation.providerStates.get(provider)?.discoveryLoads === state.discoveryLoads;
+    if (!current()) return;
+    // The global ACP catalog uses the host home as its workspace.
+    const cwd = target.catalogScope.scope === "global" ? homedir() : target.catalogScope.cwd;
+    try {
+      const runDiscovery = intent.kind === "refresh" ? await intent.prepare(cwd) : undefined;
+      if (!current()) return;
+      if (intent.kind === "refresh" && !runDiscovery) {
+        this.setDeferredDiscoveryFailure(target.snapshotCwd, provider, state);
+        return;
+      }
+      await this.loadProvider({
+        ...target,
+        provider,
+        providers: [provider],
+        force: true,
+        allowDeferred: true,
+        runDiscovery,
+      });
+    } catch {
+      if (current()) this.setDeferredDiscoveryFailure(target.snapshotCwd, provider, state);
+    }
+  }
+
+  private setDeferredDiscoveryFailure(
+    cwd: string,
+    provider: AgentProvider,
+    state: RegistryProviderState,
+  ): void {
+    this.getOrCreateTarget(cwd).bindings.set(provider, {
+      force: false,
+      promise: Promise.resolve(),
+      failure: identifyEntry({
+        ...state.initial.entry,
+        status: "error",
+        error: CUSTOM_CLI_DISCOVERY_FAILED,
+      }),
+    });
+    this.publishDiscoveryTargets(cwd);
+  }
+
+  private publishDiscoveryTargets(cwd: string): void {
+    this.publishTargets(cwd === GLOBAL_PROVIDER_SNAPSHOT_KEY ? this.targets.keys() : [cwd]);
+  }
+
   supportsConfigRequiredProvider(provider: AgentProvider): boolean {
     return this.pluginProviders.definitions()[provider]?.requiresConfiguration === true;
   }
@@ -396,6 +625,7 @@ export class ProviderSnapshotManager {
     for (const [provider, definition] of Object.entries(definitions)) {
       providerDefinitions[provider] = {
         enabled: definition.enabled,
+        isDiscoveryDeferred: this.readDiscoveryDeferral,
         derivedFromProviderId: definition.derivedFromProviderId,
         applyToolPolicy: definition.applyToolPolicy,
       };
@@ -489,8 +719,9 @@ export class ProviderSnapshotManager {
   }
 
   async resolveUsageLaunch(provider: string) {
+    if (await this.blocksCurrentLegacyLauncher(provider)) return undefined;
     const definition = this.generation.definitions[provider];
-    if (!definition?.enabled) return undefined;
+    if (!definition?.enabled || this.isProviderDiscoveryDeferred(provider)) return undefined;
     return this.ensureClient(provider, definition).resolveUsageLaunch?.();
   }
 
@@ -592,6 +823,7 @@ export class ProviderSnapshotManager {
   async resolveCreateConfig(
     input: ResolveProviderCreateConfigOptions,
   ): Promise<ResolvedProviderCreateConfig> {
+    await this.discoverDeferredProvider(input.provider, input.cwd, { kind: "create" });
     const entry = await this.getReadyProvider({
       cwd: input.cwd,
       provider: input.provider,
@@ -610,6 +842,10 @@ export class ProviderSnapshotManager {
   }
 
   async getProviderDiagnostic(provider: AgentProvider): Promise<ProviderDiagnosticResult> {
+    const state = this.generation.providerStates.get(provider);
+    const blocked = state?.checkLegacyLauncher
+      ? await this.blocksCurrentLegacyLauncher(provider)
+      : state?.dynamicLauncher === true;
     const definition = this.generation.definitions[provider];
     if (!definition) {
       return {
@@ -620,6 +856,32 @@ export class ProviderSnapshotManager {
       };
     }
 
+    if (blocked) {
+      return {
+        provider,
+        diagnostic: formatProviderDiagnostic(definition.label ?? provider, [
+          { label: "Status", value: "CLI is checked when opening an agent" },
+        ]),
+      };
+    }
+
+    if (this.isProviderDiscoveryDeferred(provider)) {
+      const entry = this.peekSnapshot()?.records.find(
+        (record) => record.entry.provider === provider,
+      )?.entry;
+      return {
+        provider,
+        diagnostic: formatProviderDiagnostic(definition.label ?? provider, [
+          {
+            label: "Status",
+            value:
+              entry?.status === "error" || entry?.status === "ready"
+                ? formatProviderStatus(entry)
+                : "Awaiting explicit provider discovery",
+          },
+        ]),
+      };
+    }
     const baseDiagnosticPromise = this.getBaseProviderDiagnostic(provider, definition);
     const snapshotEntryPromise = this.refreshDiagnosticSnapshotEntry(provider);
     const [baseDiagnostic, entry] = await Promise.all([
@@ -660,15 +922,25 @@ export class ProviderSnapshotManager {
     for (const provider of new Set([...this.generation.order, ...Object.keys(definitions)])) {
       const before = this.generation.definitions[provider];
       const after = definitions[provider];
-      if (!before || !after || !isDeepStrictEqual(before.configuration, after.configuration)) {
+      if (
+        !before ||
+        !after ||
+        !isDeepStrictEqual(runtimeConfiguration(before), runtimeConfiguration(after))
+      ) {
         changed.add(provider);
         delete clients[provider];
-      } else {
+      } else if (before.label === after.label && before.description === after.description) {
         definitions[provider] = before;
       }
     }
     Object.assign(clients, this.extraClients);
-    const generation = this.createGeneration(definitions, providerOverrides);
+    const generation = this.createGeneration(definitions, providerOverrides, changed);
+    for (const [provider, state] of generation.providerStates) {
+      if (
+        state.requiresDiscovery !== this.generation.providerStates.get(provider)?.requiresDiscovery
+      )
+        changed.add(provider);
+    }
     const agentManagerState = this.createAgentManagerState(definitions, clients);
     return {
       agentManagerState,
@@ -689,15 +961,7 @@ export class ProviderSnapshotManager {
     for (const provider of changed) {
       this.generation.providerStates.get(provider)?.discoveryLimit.clearQueue();
     }
-    // Compare against the last published state, not the state at prepare time.
-    const before = this.generation.definitions;
-    const after = generation.definitions;
-    for (const provider of new Set([...Object.keys(before), ...Object.keys(after)])) {
-      if (before[provider] !== after[provider]) {
-        const previousVersion = this.installationConfigVersions.get(provider) ?? 0;
-        this.installationConfigVersions.set(provider, previousVersion + 1);
-      }
-    }
+    this.updateInstallationConfigVersions(generation);
     this.generation = generation;
     this.providerClients = clients;
     this.warnUnknownProviderOverrides();
@@ -716,6 +980,21 @@ export class ProviderSnapshotManager {
         resolveProviderSnapshotTarget(cwd === GLOBAL_PROVIDER_SNAPSHOT_KEY ? undefined : cwd),
         providers,
       );
+    }
+  }
+
+  private updateInstallationConfigVersions(next: RegistryGeneration): void {
+    const previous = this.generation;
+    for (const provider of new Set([...previous.order, ...next.order])) {
+      if (
+        sameInstallationConfiguration(previous.definitions[provider], next.definitions[provider]) &&
+        previous.providerStates.get(provider)?.requiresDiscovery ===
+          next.providerStates.get(provider)?.requiresDiscovery
+      ) {
+        continue;
+      }
+      const version = this.installationConfigVersions.get(provider) ?? 0;
+      this.installationConfigVersions.set(provider, version + 1);
     }
   }
 
@@ -890,40 +1169,95 @@ export class ProviderSnapshotManager {
   private createGeneration(
     definitions: Record<AgentProvider, ProviderDefinition>,
     overrides: Record<string, ProviderOverride> | undefined,
+    changed?: ReadonlySet<AgentProvider>,
   ): RegistryGeneration {
     const order = Object.keys(definitions);
-    const providerStates = new Map<
-      AgentProvider,
-      { initial: ProviderSnapshotRecord; discoveryLimit: LimitFunction }
-    >();
+    const providerStates = new Map<AgentProvider, RegistryProviderState>();
     for (const provider of order) {
       const definition = definitions[provider]!;
+      const requiresDiscovery = providerRequiresDiscovery(
+        overrides,
+        provider,
+        definition.derivedFromProviderId,
+      );
       const previous = this.generation?.providerStates.get(provider);
-      if (this.generation?.definitions[provider] === definition) {
-        providerStates.set(provider, previous!);
+      const priorDefinition = this.generation?.definitions[provider];
+      if (previous?.requiresDiscovery === requiresDiscovery && priorDefinition === definition) {
+        providerStates.set(provider, previous);
         continue;
       }
       const custom =
         this.pluginProviders.has(provider) ||
         (!BUILTIN_PROVIDER_IDS.includes(provider) && !!overrides?.[provider]?.extends);
-      providerStates.set(provider, {
+      const reuseDiscovery =
+        previous?.requiresDiscovery === requiresDiscovery && changed && !changed.has(provider);
+      const dynamicLauncher = providerNamesDynamicLauncher(definition);
+      const state: RegistryProviderState = {
+        requiresDiscovery,
+        dynamicLauncher,
+        discoveryLoads: reuseDiscovery ? previous.discoveryLoads : new Map(),
         discoveryLimit: previous?.discoveryLimit ?? pLimit({ concurrency: 4, rejectOnClear: true }),
-        initial: identifyEntry({
+        initial: initialProviderRecord(
           provider,
-          status: definition.enabled ? "loading" : "unavailable",
-          enabled: definition.enabled,
-          source: custom ? "custom" : "builtin",
-          ...(definition.derivedFromProviderId
-            ? { derivedFromProviderId: definition.derivedFromProviderId }
-            : {}),
-          label: definition.label,
-          description: definition.description,
-          iconSvg: definition.iconSvg,
-          defaultModeId: definition.defaultModeId ?? null,
-        }),
-      });
+          definition,
+          requiresDiscovery,
+          custom,
+          dynamicLauncher,
+        ),
+      };
+      providerStates.set(provider, state);
+      this.checkLegacyLauncher(provider, definition, state, custom);
     }
     return { definitions, order, providerStates };
+  }
+
+  private checkLegacyLauncher(
+    provider: AgentProvider,
+    definition: ProviderDefinition,
+    state: RegistryProviderState,
+    custom: boolean,
+  ): void {
+    const runtimeSettings = definition.configuration?.runtimeSettings;
+    const command = runtimeSettings?.command;
+    if (
+      !definition.enabled ||
+      state.requiresDiscovery ||
+      state.dynamicLauncher ||
+      command?.mode !== "replace"
+    )
+      return;
+
+    const regularInitial = state.initial;
+    let pending: Promise<boolean> | undefined;
+    const classify = async (): Promise<boolean> => {
+      const blocked = await isDynamicProviderLauncher(
+        command.argv,
+        createProviderEnv({ runtimeSettings }),
+      );
+      if (state.dynamicLauncher === blocked) return blocked;
+      state.dynamicLauncher = blocked;
+      state.initial = blocked
+        ? initialProviderRecord(provider, definition, false, custom, true)
+        : regularInitial;
+      if (this.generation?.providerStates.get(provider) === state) {
+        if (blocked) this.clearLegacyLauncherCatalogs(provider);
+        this.publishTargets(this.targets.keys());
+      }
+      return blocked;
+    };
+    state.checkLegacyLauncher = () =>
+      (pending ??= classify().finally(() => {
+        pending = undefined;
+      }));
+    void state.checkLegacyLauncher();
+  }
+
+  private clearLegacyLauncherCatalogs(provider: AgentProvider): void {
+    for (const [key, catalogs] of this.catalogs) {
+      catalogs.delete(provider);
+      if (catalogs.size === 0) this.catalogs.delete(key);
+    }
+    for (const target of this.targets.values()) target.bindings.delete(provider);
   }
 
   private async warmUp(target: ProviderSnapshotTarget, providers?: AgentProvider[]): Promise<void> {
@@ -962,7 +1296,24 @@ export class ProviderSnapshotManager {
   }
 
   private loadProvider(options: ProviderLoadOptions & { provider: AgentProvider }): Promise<void> {
-    if (this.destroyed || !this.generation.definitions[options.provider]) return Promise.resolve();
+    const state = this.generation.providerStates.get(options.provider);
+    if (this.destroyed || !state || (state.requiresDiscovery && !options.allowDeferred))
+      return Promise.resolve();
+    if (!state.checkLegacyLauncher) {
+      return state.dynamicLauncher ? Promise.resolve() : this.loadAllowedProvider(options);
+    }
+    return this.blocksCurrentLegacyLauncher(options.provider).then((blocked) => {
+      if (blocked || this.destroyed) return undefined;
+      if (this.generation.providerStates.get(options.provider) !== state) {
+        return this.loadProvider(options);
+      }
+      return this.loadAllowedProvider(options);
+    });
+  }
+
+  private loadAllowedProvider(
+    options: ProviderLoadOptions & { provider: AgentProvider },
+  ): Promise<void> {
     const { bindings } = this.getOrCreateTarget(options.snapshotCwd);
     const binding: CatalogBinding = {
       key: bindings.get(options.provider)?.key,
@@ -971,7 +1322,10 @@ export class ProviderSnapshotManager {
       promise: Promise.resolve(),
     };
     bindings.set(options.provider, binding);
-    binding.promise = this.resolveCatalog({ ...options, force: binding.force }, binding);
+    const resolveCatalog = () => this.resolveCatalog({ ...options, force: binding.force }, binding);
+    binding.promise = options.runDiscovery
+      ? options.runDiscovery(resolveCatalog)
+      : resolveCatalog();
     return binding.promise;
   }
 
@@ -981,7 +1335,8 @@ export class ProviderSnapshotManager {
   ): Promise<void> {
     const { provider, snapshotCwd, force } = options;
     const definition = this.generation.definitions[provider]!;
-    const initial = this.generation.providerStates.get(provider)!.initial.entry;
+    const state = this.generation.providerStates.get(provider)!;
+    const { entry: initial } = state.initial;
     this.getOrCreateTarget(snapshotCwd);
     if (!definition.enabled) return;
     const currentBinding = () => this.targets.get(snapshotCwd)?.bindings.get(provider);
@@ -997,7 +1352,9 @@ export class ProviderSnapshotManager {
           )
         : await Promise.resolve(undefined);
       key = JSON.stringify(
-        sharedKey === undefined ? ["target", snapshotCwd] : ["provider", sharedKey],
+        state.requiresDiscovery || sharedKey === undefined
+          ? ["target", snapshotCwd]
+          : ["provider", sharedKey],
       );
     } catch (error) {
       if (currentBinding() !== binding) return currentBinding()?.promise;
@@ -1006,9 +1363,10 @@ export class ProviderSnapshotManager {
       binding.failure = identifyEntry({
         ...this.generation.providerStates.get(provider)!.initial.entry,
         status: "error",
-        error: toErrorMessage(error),
+        error: state.requiresDiscovery ? CUSTOM_CLI_DISCOVERY_FAILED : toErrorMessage(error),
       });
-      this.publishTargets([snapshotCwd]);
+      if (state.requiresDiscovery) this.publishDiscoveryTargets(snapshotCwd);
+      else this.publishTargets([snapshotCwd]);
       return;
     }
     // Only the latest key resolution for this target may bind it to a catalogue.
@@ -1035,20 +1393,28 @@ export class ProviderSnapshotManager {
       !this.destroyed && this.catalogs.get(key)?.get(provider) === current && current.load === load;
     const load = this.generation.providerStates
       .get(provider)!
-      .discoveryLimit(() => {
+      .discoveryLimit(async () => {
+        if (state.checkLegacyLauncher && (await state.checkLegacyLauncher())) return;
         if (!isCurrent()) return;
         return this.refreshProvider({
           catalogOptions,
           provider,
           definition,
           initial,
+          redactErrors: state.requiresDiscovery,
           client,
-          publish: (entry) => {
+          publish: (entry, installedVersion) => {
             if (!isCurrent()) return false;
             current.result = identifyEntry(structuredClone(entry));
-            const boundTargets = [...this.targets].flatMap(([cwd, target]) =>
-              target.bindings.get(provider)?.key === key ? [cwd] : [],
-            );
+            if (options.runDiscovery && snapshotCwd === GLOBAL_PROVIDER_SNAPSHOT_KEY) {
+              current.installedVersion = installedVersion;
+            }
+            const boundTargets =
+              state.requiresDiscovery && snapshotCwd === GLOBAL_PROVIDER_SNAPSHOT_KEY
+                ? this.targets.keys()
+                : [...this.targets].flatMap(([cwd, target]) =>
+                    target.bindings.get(provider)?.key === key ? [cwd] : [],
+                  );
             this.publishTargets(boundTargets);
             return true;
           },
@@ -1066,14 +1432,16 @@ export class ProviderSnapshotManager {
     provider: AgentProvider;
     definition: ProviderDefinition;
     initial: ProviderSnapshotEntry;
+    redactErrors: boolean;
     client: AgentClient;
-    publish: (entry: ProviderSnapshotEntry) => boolean;
+    publish: (entry: ProviderSnapshotEntry, installedVersion?: string) => boolean;
   }): Promise<void> {
     const {
       catalogOptions,
       provider,
       definition,
       initial: base,
+      redactErrors,
       client,
       publish: setEntry,
     } = options;
@@ -1108,26 +1476,31 @@ export class ProviderSnapshotManager {
           "Provider catalog contains repeated model IDs; retaining the first definition",
         );
       }
-      setEntry({
-        ...base,
-        defaultModeId:
-          catalog.defaultModeId === undefined ? base.defaultModeId : catalog.defaultModeId,
-        status: "ready",
-        enabled: true,
-        models,
-        modes: catalog.modes,
-        fetchedAt: new Date().toISOString(),
-      });
+      setEntry(
+        {
+          ...base,
+          defaultModeId:
+            catalog.defaultModeId === undefined ? base.defaultModeId : catalog.defaultModeId,
+          status: "ready",
+          enabled: true,
+          models,
+          modes: catalog.modes,
+          fetchedAt: new Date().toISOString(),
+        },
+        safeDiscoveredVersion(catalog.installedVersion),
+      );
     } catch (error) {
       const emitted = setEntry({
         ...base,
         status: "error",
         enabled: true,
-        error: toErrorMessage(error),
+        error: redactErrors ? CUSTOM_CLI_DISCOVERY_FAILED : toErrorMessage(error),
       });
       if (emitted) {
         this.logger.warn(
-          { err: error, provider, target: catalogOptions },
+          redactErrors
+            ? { provider, category: "custom_cli_discovery_failed" }
+            : { err: error, provider, target: catalogOptions },
           "Failed to refresh provider snapshot",
         );
       }
@@ -1140,11 +1513,7 @@ export class ProviderSnapshotManager {
     for (const cwd of cwds) {
       const target = this.targets.get(cwd)!;
       const records = this.generation.order.map((provider) => {
-        const binding = target.bindings.get(provider);
-        const result = binding?.key
-          ? this.catalogs.get(binding.key)?.get(provider)?.result
-          : undefined;
-        return binding?.failure ?? result ?? this.generation.providerStates.get(provider)!.initial;
+        return this.readSnapshotRecord(provider, cwd, target);
       });
       const previous = target.snapshot;
       if (sameSnapshotRecords(previous.records, records)) continue;
@@ -1173,14 +1542,40 @@ export class ProviderSnapshotManager {
         bindings: new Map(),
         snapshot: {
           cwd,
-          records: this.generation.order.map(
-            (provider) => this.generation.providerStates.get(provider)!.initial,
-          ),
+          records: this.generation.order.map((provider) => this.readSnapshotRecord(provider, cwd)),
         },
       };
       this.targets.set(cwd, target);
     }
     return target;
+  }
+
+  private readSnapshotRecord(provider: AgentProvider, cwd: string, target?: Target) {
+    const state = this.generation.providerStates.get(provider)!;
+    const result = this.boundCatalogRecord(target, provider);
+    // Settings discovery can populate workspace pickers without authorizing a process there.
+    const global =
+      state.requiresDiscovery && cwd !== GLOBAL_PROVIDER_SNAPSHOT_KEY
+        ? this.boundCatalogRecord(this.targets.get(GLOBAL_PROVIDER_SNAPSHOT_KEY), provider)
+        : undefined;
+    return withProviderDisplay(
+      result ?? (global?.entry.status === "ready" ? global : state.initial),
+      state.initial,
+    );
+  }
+
+  private boundCatalogRecord(target: Target | undefined, provider: AgentProvider) {
+    const binding = target?.bindings.get(provider);
+    return (
+      binding?.failure ??
+      (binding?.key ? this.catalogs.get(binding.key)?.get(provider)?.result : undefined)
+    );
+  }
+
+  private readDiscoveredVersion(provider: AgentProvider): string | undefined {
+    const binding = this.targets.get(GLOBAL_PROVIDER_SNAPSHOT_KEY)?.bindings.get(provider);
+    if (!binding?.key || binding.failure) return undefined;
+    return this.catalogs.get(binding.key)?.get(provider)?.installedVersion;
   }
 
   private getProviderIds(): AgentProvider[] {

@@ -1,3 +1,4 @@
+import { stopScopedProviderProcess } from "../../scoped-provider-process.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Logger } from "pino";
 
@@ -49,6 +50,8 @@ async function waitForSignal<T>(operation: Promise<T>, signal: AbortSignal): Pro
 }
 
 async function disposeUnownedChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  const scopedStop = stopScopedProviderProcess(child);
+  if (scopedStop) return scopedStop;
   const result = await terminateWithTreeKill(child, {
     gracefulTimeoutMs: 2_000,
     forceTimeoutMs: 1_000,

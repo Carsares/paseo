@@ -17,10 +17,13 @@ import path from "node:path";
 import pino from "pino";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { describe, expect, onTestFinished, test, vi } from "vitest";
 
 import type { AgentSession, AgentSessionConfig, AgentStreamEvent } from "../../agent-sdk-types.js";
 import { AgentTurnStartRejectedError } from "../../agent-sdk-types.js";
+import { DaemonConfigStore } from "../../../daemon-config-store.js";
+import { prepareCustomProviderCliDiscovery } from "../../custom-provider-cli.js";
 import { JsonlRpcResponseError } from "../jsonl-rpc-process.js";
 import { PiProviderOptionsSchema, PiRpcAgentClient, PiRpcAgentSession } from "./agent.js";
 import { PiCliRuntime } from "./cli-runtime.js";
@@ -32,6 +35,98 @@ import type { PiUsagePollScheduler } from "./usage-poller.js";
 
 const ONE_BY_ONE_PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+test("discovers a custom Pi catalog only in the approved directory with the approved launch", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "paseo-pi-catalog-"));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const directory = path.join(root, "workspace");
+  const requestedCwd = path.join(root, "workspace-link");
+  await mkdir(directory);
+  await symlink(directory, requestedCwd, process.platform === "win32" ? "junction" : "dir");
+  const script = path.join(root, "pi.cjs");
+  const marker = path.join(root, "started.json");
+  await writeFile(
+    script,
+    `
+    const fs = require("node:fs");
+    const shouldFail = fs.existsSync(process.argv[2] + ".fail");
+    const model = { provider: "test", id: "pi-discovered", name: "Pi Discovered" };
+    const trace = { cwd: process.cwd(), argv: process.argv.slice(3), value: process.env.PASEO_PI_CATALOG, requests: [] };
+    const record = () => fs.writeFileSync(process.argv[2], JSON.stringify(trace));
+    record();
+    require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
+      const { id, type } = JSON.parse(line);
+      trace.requests.push(type);
+      record();
+      const data = type === "get_available_models" ? { models: [model] } : { model };
+      const result = shouldFail ? { success: false, error: "private RPC failure" } : { success: true, data };
+      process.stdout.write(JSON.stringify({ type: "response", id, ...result }) + "\\n");
+    });
+  `,
+  );
+  const argv: [string, ...string[]] = [process.execPath, script, marker, "two words"];
+  const env = { PASEO_PI_CATALOG: "pi-catalog" };
+  const configStore = new DaemonConfigStore(root, {
+    mcp: { injectIntoAgents: false },
+    providers: { "custom-pi": { extends: "pi", command: argv, env } },
+    browserTools: { enabled: false },
+    metadataGeneration: { providers: [] },
+    autoArchiveAfterMerge: false,
+    enableTerminalAgentHooks: false,
+    appendSystemPrompt: "",
+  });
+  const client = new PiRpcAgentClient({
+    logger: pino({ level: "silent" }),
+    runtimeSettings: { command: { mode: "replace", argv }, env },
+  });
+  await expect(client.isAvailable()).resolves.toBe(true);
+  await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  const approve = async () => {
+    const approval = await prepareCustomProviderCliDiscovery(
+      { mode: "edit", providerId: "custom-pi" },
+      { configStore, isRegisteredProvider: () => true, isPluginProvider: () => false },
+      requestedCwd,
+    );
+    if (approval.status !== "ok")
+      throw new Error(`Pi catalog authorization failed: ${approval.status}`);
+    return approval;
+  };
+  const workspace = { scope: "workspace", cwd: requestedCwd, force: true } as const;
+  const wrongDirectoryApproval = await approve();
+  await expect(
+    wrongDirectoryApproval.run(() => client.fetchCatalog({ ...workspace, cwd: root })),
+  ).rejects.toThrow("Custom CLI discovery failed");
+  await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  const mismatchedApproval = await approve();
+  const mismatchedClient = new PiRpcAgentClient({
+    logger: pino({ level: "silent" }),
+    runtimeSettings: { command: { mode: "replace", argv }, env: { ...env, EXTRA: "mismatch" } },
+  });
+  await expect(
+    mismatchedApproval.run(() => mismatchedClient.fetchCatalog(workspace)),
+  ).rejects.toThrow("Custom CLI discovery failed");
+  await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  const approval = await approve();
+  await approval.run(async () => {
+    await expect(client.isAvailable()).resolves.toBe(true);
+    await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    const catalog = await client.fetchCatalog(workspace);
+    expect(catalog.models).toMatchObject([
+      { id: "test/pi-discovered", label: "Pi Discovered", isDefault: true },
+    ]);
+  });
+  expect(JSON.parse(await readFile(marker, "utf8"))).toEqual({
+    cwd: realpathSync(directory),
+    argv: ["two words", "--mode", "rpc", "--no-session"],
+    value: "pi-catalog",
+    requests: ["get_available_models", "get_state"],
+  });
+  await writeFile(`${marker}.fail`, "");
+  const failedApproval = await approve();
+  await expect(failedApproval.run(() => client.fetchCatalog(workspace))).rejects.toThrow(
+    /^Custom CLI discovery failed$/,
+  );
+});
 
 const RESTRICTED_THINKING_MODEL: PiModel = {
   provider: "kimi-coding",

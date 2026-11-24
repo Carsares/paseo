@@ -2,11 +2,50 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { createTestLogger } from "../../../../../test-utils/test-logger.js";
 import { OpenCodeBridge } from "../bridge.js";
+import { V2Harness } from "../test-utils/v2-harness.js";
 import { provisionLocalBridge } from "./bridge-provisioning.js";
 import { V2Runtime } from "./runtime.js";
+import { OpenCodeV2Session } from "./session.js";
+
+test("lists cached commands after an exit without acquiring a new v2 connection", async () => {
+  const old = new V2Harness();
+  const replacement = new V2Harness();
+  old.api.command.list = vi.fn(async ({ location }) => ({ location, data: [] }));
+  old.api.skill.list = async ({ location }) => ({ location, data: [] });
+  replacement.api.command.list = vi.fn(async ({ location }) => ({ location, data: [] }));
+  replacement.api.skill.list = async ({ location }) => ({ location, data: [] });
+  const exited = Promise.withResolvers<Error>();
+  const acquire = vi.fn(async () => replacement.connection);
+  const session = new OpenCodeV2Session(
+    { ...old.connection, exited: exited.promise },
+    old.info,
+    { provider: "opencode", cwd: old.info.location.directory },
+    createTestLogger(),
+    true,
+    false,
+    undefined,
+    undefined,
+    acquire,
+  );
+  try {
+    await session.initialize();
+    const commands = await session.listCommands({ allowLaunch: false });
+    expect(commands.map(({ name }) => name)).toContain("compact");
+    exited.resolve(new Error("Test helper exited"));
+    await exited.promise;
+    expect(await session.listCommands({ allowLaunch: false })).toEqual(commands);
+    expect(old.api.command.list).toHaveBeenCalledTimes(1);
+    expect(acquire).not.toHaveBeenCalled();
+    expect(await session.listCommands()).toEqual(commands);
+    expect(acquire).toHaveBeenCalledTimes(1);
+    expect(replacement.api.command.list).toHaveBeenCalledTimes(1);
+  } finally {
+    await session.close();
+  }
+});
 
 test("an owned helper uses an installed bridge once and survives catalog refresh", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "paseo-owned-opencode-"));

@@ -2202,6 +2202,37 @@ export const ProviderInstallationUpdateSubscribeRequestMessageSchema = z.object(
   requestId: z.string(),
 });
 
+export const CustomProviderCliDraftSchema = z.object({
+  mode: z.enum(["create", "edit"]),
+  providerId: z.string(),
+  extends: z.string().optional(),
+  label: z.string().optional(),
+  description: z.string().optional(),
+  command: z.array(z.string()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
+});
+export type CustomProviderCliDraft = z.infer<typeof CustomProviderCliDraftSchema>;
+
+const customProviderCliRequestFields = {
+  requestId: z.string(),
+  draft: CustomProviderCliDraftSchema,
+};
+
+export const CustomProviderCliLocateRequestMessageSchema = z.object({
+  type: z.literal("provider.custom_cli.locate.request"),
+  ...customProviderCliRequestFields,
+});
+
+export const CustomProviderCliTestRequestMessageSchema = z.object({
+  type: z.literal("provider.custom_cli.test.request"),
+  ...customProviderCliRequestFields,
+});
+
+export const CustomProviderCliSaveRequestMessageSchema = z.object({
+  type: z.literal("provider.custom_cli.save.request"),
+  ...customProviderCliRequestFields,
+});
+
 export const ProviderUsageListRequestMessageSchema = z.object({
   type: z.literal("provider.usage.list.request"),
   requestId: z.string(),
@@ -4641,6 +4672,9 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ProviderInstallationCheckUpdatesRequestMessageSchema,
   ProviderInstallationUpdateRequestMessageSchema,
   ProviderInstallationUpdateSubscribeRequestMessageSchema,
+  CustomProviderCliLocateRequestMessageSchema,
+  CustomProviderCliTestRequestMessageSchema,
+  CustomProviderCliSaveRequestMessageSchema,
   ProviderUsageListRequestMessageSchema,
   UsageListReportsRequestMessageSchema,
   ResumeAgentRequestMessageSchema,
@@ -5023,6 +5057,8 @@ export const ServerInfoStatusPayloadSchema = z
         usageSources: z.boolean().optional(),
         // COMPAT(providerInstallation): added in v0.17.0, remove gate after 2027-05-13.
         providerInstallation: z.boolean().optional(),
+        // COMPAT(providerCustomCli): added in v0.17.0, remove gate after 2027-05-25.
+        providerCustomCli: z.boolean().optional(),
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
         providersSnapshotCwd: z.boolean().optional(),
         // COMPAT(directorySync): added in v0.3.x, remove gate after 2027-02-12.
@@ -8507,6 +8543,35 @@ export const ProviderInstallationUpdateSubscribeResponseMessageSchema = z.object
   }),
 });
 
+const CustomProviderCliResultSchema = z.object({
+  status: z.enum(["ok", "invalid", "unavailable", "unsupported", "blocked", "failed"]),
+  path: z.string().optional(),
+  reason: z.literal("reload_required").optional(),
+});
+
+const CustomProviderCliResponsePayloadSchema = z.object({
+  requestId: z.string(),
+  result: CustomProviderCliResultSchema.nullable(),
+});
+export type CustomProviderCliResponsePayload = z.infer<
+  typeof CustomProviderCliResponsePayloadSchema
+>;
+
+export const CustomProviderCliLocateResponseMessageSchema = z.object({
+  type: z.literal("provider.custom_cli.locate.response"),
+  payload: CustomProviderCliResponsePayloadSchema,
+});
+
+export const CustomProviderCliTestResponseMessageSchema = z.object({
+  type: z.literal("provider.custom_cli.test.response"),
+  payload: CustomProviderCliResponsePayloadSchema,
+});
+
+export const CustomProviderCliSaveResponseMessageSchema = z.object({
+  type: z.literal("provider.custom_cli.save.response"),
+  payload: CustomProviderCliResponsePayloadSchema,
+});
+
 /**
  * Sent to `provider.installation.update.subscribe` owners when an update starts, reports output
  * or finishes. `output` holds only the entries new since the previous progress for `operation.id`.
@@ -9463,6 +9528,9 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ProviderInstallationUpdateSubscribeResponseMessageSchema,
   ProviderInstallationUpdateProgressMessageSchema,
   ProviderInstallationUpdateClearedMessageSchema,
+  CustomProviderCliLocateResponseMessageSchema,
+  CustomProviderCliTestResponseMessageSchema,
+  CustomProviderCliSaveResponseMessageSchema,
   ProviderUsageListResponseMessageSchema,
   UsageListReportsUpdateMessageSchema,
   UsageListReportsResponseMessageSchema,

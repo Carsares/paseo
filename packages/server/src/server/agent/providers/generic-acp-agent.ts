@@ -2,6 +2,7 @@ import type { Logger } from "pino";
 
 import { spawnProcess } from "../../../utils/spawn.js";
 import { acquireInstallationProcess } from "../provider-installation/installation-activity.js";
+import { currentCustomProviderLaunch } from "../scoped-custom-provider-launch.js";
 import {
   ACPAgentClient,
   type ACPCatalogModelResolver,
@@ -43,6 +44,7 @@ export class GenericACPAgentClient extends ACPAgentClient {
   constructor(options: GenericACPAgentClientOptions) {
     super({
       provider: "acp",
+      configuredProviderId: options.providerId,
       usageProvider: options.usageProvider,
       logger: options.logger,
       runtimeSettings: {
@@ -68,6 +70,8 @@ export class GenericACPAgentClient extends ACPAgentClient {
   }
 
   async getDiagnostic(): Promise<{ diagnostic: string }> {
+    if (currentCustomProviderLaunch())
+      throw new Error("Custom CLI diagnostics require a separate request");
     const providerName = formatProviderName(this.label, this.providerId);
     const entries: DiagnosticEntry[] = [
       { label: "Provider ID", value: this.providerId ?? "unknown" },

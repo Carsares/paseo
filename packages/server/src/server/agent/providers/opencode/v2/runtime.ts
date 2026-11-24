@@ -5,9 +5,10 @@ import type { V2Api } from "./api.js";
 import { randomBytes } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import type { Logger } from "pino";
-import { spawnProcess } from "../../../../../utils/spawn.js";
+import { spawnProcess, type SpawnProcessOptions } from "../../../../../utils/spawn.js";
 import { terminateWithTreeKill } from "../../../../../utils/tree-kill.js";
 import {
+  createProviderEnv,
   createProviderEnvSpec,
   resolveProviderLaunch,
   type ProviderRuntimeSettings,
@@ -27,6 +28,8 @@ import {
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { OpenCodeBridge } from "../bridge.js";
+import { spawnManagedOpenCodeProcess } from "../managed-catalog-launch.js";
+import { stopScopedProviderProcess } from "../../../scoped-provider-process.js";
 
 export interface V2Connection {
   client: V2Api;
@@ -53,6 +56,7 @@ export interface V2RuntimeOptions {
   externalServer?: ExternalOpenCodeServer;
   selection?: OpenCodeServiceSelection;
   bridge?: OpenCodeBridge;
+  catalogDiscovery?: { signal?: AbortSignal; cwd?: string };
 }
 
 export interface V2RuntimeAcquireOptions {
@@ -219,23 +223,13 @@ export class V2Runtime {
     return pending;
   }
 
-  private async start(env: Record<string, string> = {}): Promise<Generation> {
-    const selection = await this.selection;
-    if (selection.kind !== "owned") {
-      const generation: Generation = {
-        ...(await connectSharedService(selection, this.options)),
-        users: 0,
-      };
-      this.generations.add(generation);
-      return generation;
-    }
-
-    const { settings, managedProcesses, logger } = this.options;
+  private async spawnOwnedServer(env: Record<string, string>) {
+    const { settings, catalogDiscovery } = this.options;
     const launch = await resolveProviderLaunch({
       commandConfig: settings?.command,
       defaultBinary: "opencode",
     });
-    const cwd = resolveOpenCodeHomeDir();
+    const cwd = catalogDiscovery?.cwd ?? resolveOpenCodeHomeDir();
     await mkdir(cwd, { recursive: true });
     const password = randomBytes(32).toString("base64url");
     const inheritedConfig = globalThis.process.env.OPENCODE_CONFIG_CONTENT;
@@ -258,16 +252,46 @@ export class V2Runtime {
     const decorated = managed
       ? configured
       : decorateOpenCodeV2Env(configured, plugin, bridge ? {} : { mode: "structured-only" });
+    const overlay = { ...decorated, OPENCODE_PASSWORD: password };
     const args = [...launch.args, "serve", "--hostname", "127.0.0.1", "--port", "0"];
-    const process = spawnProcess(launch.command, args, {
-      cwd,
+    const options: SpawnProcessOptions = {
       detached: globalThis.process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
-      ...createProviderEnvSpec({
-        runtimeSettings: settings,
-        overlays: [{ ...decorated, OPENCODE_PASSWORD: password }],
-      }),
+    };
+    if (!catalogDiscovery) {
+      const process = spawnProcess(launch.command, args, {
+        ...options,
+        cwd,
+        ...createProviderEnvSpec({ runtimeSettings: settings, overlays: [overlay] }),
+      });
+      return { process, command: launch.command, args, password };
+    }
+    const environment = createProviderEnv({ runtimeSettings: settings, overlays: [overlay] });
+    const verified = spawnManagedOpenCodeProcess({
+      operation: "opencode.serve.v2",
+      cwd,
+      argv: [launch.command, ...args],
+      env: environment,
+      envOverlays: [overlay],
+      signal: catalogDiscovery.signal,
     });
+    return { ...verified, password };
+  }
+
+  private async start(env: Record<string, string> = {}): Promise<Generation> {
+    const selection = await this.selection;
+    const { managedProcesses, logger, catalogDiscovery } = this.options;
+    const signal = catalogDiscovery?.signal;
+    if (selection.kind !== "owned") {
+      const generation: Generation = {
+        ...(await connectSharedService(selection, { ...this.options, signal })),
+        users: 0,
+      };
+      this.generations.add(generation);
+      return generation;
+    }
+
+    const { process, command, args, password } = await this.spawnOwnedServer(env);
     const processAbort = new AbortController();
     const exited = new Promise<Error>((resolve) =>
       process.once("exit", (code) => {
@@ -283,7 +307,7 @@ export class V2Runtime {
             .record({
               owner: { provider: "opencode", kind: "helper-server" },
               pid: process.pid,
-              command: launch.command,
+              command,
               args,
             })
             .catch((error: unknown) => {
@@ -293,7 +317,8 @@ export class V2Runtime {
         : Promise.resolve(null);
     const stop = () => {
       stopped ??= (async () => {
-        await terminateWithTreeKill(process, { gracefulTimeoutMs: 5_000, forceTimeoutMs: 1_000 });
+        await (stopScopedProviderProcess(process) ??
+          terminateWithTreeKill(process, { gracefulTimeoutMs: 5_000, forceTimeoutMs: 1_000 }));
         const entry = await record;
         if (entry) await managedProcesses?.remove(entry.id);
       })();
@@ -301,44 +326,17 @@ export class V2Runtime {
     };
     const deadline = Date.now() + 30_000;
     try {
-      const url = await new Promise<string>((resolve, reject) => {
-        const timer = setTimeout(
-          () => finish(new Error("OpenCode v2 server startup timed out after 30s")),
-          30_000,
-        );
-        let buffer = "";
-        const finish = (result: string | Error) => {
-          clearTimeout(timer);
-          process.stdout?.off("data", onData);
-          process.off("error", onError);
-          process.off("exit", onExit);
-          if (result instanceof Error) reject(result);
-          else resolve(result);
-        };
-        const onData = (chunk: Buffer) => {
-          buffer = (buffer + chunk.toString()).slice(-8192);
-          const match = buffer.match(/server listening on (http:\/\/127\.0\.0\.1:\d+)(?:\r?\n)/);
-          if (match) finish(match[1]);
-        };
-        const onError = (error: Error) => finish(error);
-        const onExit = (code: number | null) =>
-          finish(new Error(`OpenCode v2 server exited during startup (${code})`));
-        process.stdout?.on("data", onData);
-        process.once("error", onError);
-        process.once("exit", onExit);
-        // Drain stderr without retaining provider output that may contain credentials.
-        process.stderr?.on("data", () => undefined);
-      });
+      const url = await waitForOwnedServerUrl(process, signal);
       const client = OpenCode.make({
         baseUrl: url,
         headers: {
           Authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`,
         },
         fetch: async (request, init) => {
-          const signal = init?.signal
+          const requestSignal = init?.signal
             ? AbortSignal.any([init.signal, processAbort.signal])
             : processAbort.signal;
-          const response = await fetch(request, { ...init, signal });
+          const response = await fetch(request, { ...init, signal: requestSignal });
           const html = response.headers.get("content-type")?.includes("text/html") ?? false;
           if (!response.ok || html) {
             const requestUrl = request instanceof Request ? request.url : String(request);
@@ -347,13 +345,17 @@ export class V2Runtime {
           return response;
         },
       });
-      await client.server.info({ signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) });
+      const startupDeadline = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
+      await client.server.info({
+        signal: signal ? AbortSignal.any([signal, startupDeadline]) : startupDeadline,
+      });
+      processAbort.signal.throwIfAborted();
       const generation: Generation = {
         client,
         users: 0,
         stop,
         exited,
-        ...bridgeBindings(client, bridge),
+        ...bridgeBindings(client, this.options.bridge),
       };
       this.generations.add(generation);
       process.once("exit", () => {
@@ -368,4 +370,39 @@ export class V2Runtime {
       throw error;
     }
   }
+}
+
+function waitForOwnedServerUrl(process: ReturnType<typeof spawnProcess>, signal?: AbortSignal) {
+  return new Promise<string>((resolve, reject) => {
+    const onAbort = () => finish(new Error("OpenCode catalog discovery stopped"));
+    const timer = setTimeout(
+      () => finish(new Error("OpenCode v2 server startup timed out after 30s")),
+      30_000,
+    );
+    let buffer = "";
+    const finish = (result: string | Error) => {
+      clearTimeout(timer);
+      process.stdout?.off("data", onData);
+      process.off("error", onError);
+      process.off("exit", onExit);
+      signal?.removeEventListener("abort", onAbort);
+      if (result instanceof Error) reject(result);
+      else resolve(result);
+    };
+    const onData = (chunk: Buffer) => {
+      buffer = (buffer + chunk.toString()).slice(-8192);
+      const match = buffer.match(/server listening on (http:\/\/127\.0\.0\.1:\d+)(?:\r?\n)/);
+      if (match) finish(match[1]);
+    };
+    const onError = (error: Error) => finish(error);
+    const onExit = (code: number | null) =>
+      finish(new Error(`OpenCode v2 server exited during startup (${code})`));
+    process.stdout?.on("data", onData);
+    process.once("error", onError);
+    process.once("exit", onExit);
+    // Drain stderr without retaining provider output that may contain credentials.
+    process.stderr?.on("data", () => undefined);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
 }

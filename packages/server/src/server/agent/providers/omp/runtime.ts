@@ -30,6 +30,7 @@ export interface OmpRuntimeLaunch {
 
 export interface OmpStartSessionInput {
   cwd: string;
+  catalogDiscovery?: boolean;
   signal?: AbortSignal;
   env?: Record<string, string>;
   protocolMode?: "rpc" | "rpc-ui";

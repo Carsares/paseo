@@ -83,7 +83,7 @@ import { parseAgentMessage } from "./agent/agent-messages/index.js";
 import { MessageReceipts, type QueueHandoff } from "./message-receipts/index.js";
 import { REMOTE_HIERARCHY_DEPTH_LABEL } from "./agent/hierarchy-policy.js";
 import { createPaseoToolCatalog } from "./agent/tools/paseo-tools.js";
-import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
+import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
 import {
   createPersistedProjectRecord,
@@ -5262,6 +5262,47 @@ describe("daemon status + pairing RPC", () => {
     ]);
   });
 
+  test("status and availability reads skip a deferred custom CLI", async () => {
+    const messages: SessionOutboundMessage[] = [];
+    const codex = createTestAgentClient("codex");
+    const claude = createTestAgentClient("claude");
+    const probeCodex = vi.spyOn(codex, "isAvailable").mockResolvedValue(true);
+    const probeClaude = vi.spyOn(claude, "isAvailable").mockResolvedValue(true);
+    const providerSnapshotManager = Object.assign(createProviderSnapshotManagerStub().manager, {
+      hasProvider: (provider: string) => provider === "codex" || provider === "claude",
+      canLaunchProviderForRead: (provider: string) => provider !== "codex",
+    });
+    const session = createSessionForTest({
+      messages,
+      paseoHome: makeHome(),
+      providerSnapshotManager,
+      agentManager: new AgentManager({
+        clients: { codex, claude },
+        logger: pino({ level: "silent" }),
+      }),
+    });
+
+    await session.handleMessage({ type: "daemon.get_status.request", requestId: "status" });
+    await session.handleMessage({ type: "list_available_providers_request", requestId: "list" });
+
+    const providers = [
+      { provider: "codex", available: false, error: null },
+      { provider: "claude", available: true, error: null },
+    ];
+    expect(messages).toEqual([
+      expect.objectContaining({
+        type: "daemon.get_status.response",
+        payload: expect.objectContaining({ requestId: "status", providers }),
+      }),
+      expect.objectContaining({
+        type: "list_available_providers_response",
+        payload: expect.objectContaining({ requestId: "list", providers }),
+      }),
+    ]);
+    expect(probeCodex).not.toHaveBeenCalled();
+    expect(probeClaude).toHaveBeenCalledTimes(2);
+  });
+
   test("daemon.get_status.request reports what a terminal cleanup could not confirm gone", async () => {
     const messages: unknown[] = [];
     const paseoHome = makeHome();
@@ -9739,76 +9780,150 @@ test("does not publish internal agents' background work to subscribed clients", 
   expect(messages.some((message) => message.type === "agent.background_work.update")).toBe(false);
 });
 
-test("deduplicates repeated command names in list_commands_response for live agents and drafts", async () => {
-  const duplicateCommands = [
-    {
-      name: "goal",
-      description: "Run until goal is finished",
-      argumentHint: "",
-      kind: "command" as const,
-    },
-    {
-      name: "plan",
-      description: "Plan carefully before executing a task.",
-      argumentHint: "",
-      kind: "command" as const,
-    },
-    {
-      name: "plan",
-      description: "Local plan skill description",
-      argumentHint: "",
-      kind: "skill" as const,
-    },
-  ];
-  const expected = [duplicateCommands[0], duplicateCommands[1]];
+test.each([false, true])(
+  "lists commands with provider launch permission %s",
+  async (allowLaunch) => {
+    const duplicateCommands = [
+      {
+        name: "goal",
+        description: "Run until goal is finished",
+        argumentHint: "",
+        kind: "command" as const,
+      },
+      {
+        name: "plan",
+        description: "Plan carefully before executing a task.",
+        argumentHint: "",
+        kind: "command" as const,
+      },
+      {
+        name: "plan",
+        description: "Local plan skill description",
+        argumentHint: "",
+        kind: "skill" as const,
+      },
+    ];
+    const expected = [duplicateCommands[0], duplicateCommands[1]];
+    const permissions: DaemonPermission[] = allowLaunch
+      ? ["daemon.read", "workspace.write"]
+      : ["daemon.read"];
+    const listCommands = vi.fn(async () => duplicateCommands);
+    const listDraftCommands = vi.fn(async () => duplicateCommands);
 
-  const liveMessages: SessionOutboundMessage[] = [];
-  const liveSession = createSessionForTest({
-    messages: liveMessages,
-    agentManager: {
-      waitForAgentClose: async () => undefined,
-      getAgent: () =>
-        ({
-          id: "agent-1",
-          session: { listCommands: async () => duplicateCommands },
-        }) as never,
-    },
-  });
-  await liveSession.handleMessage({
-    type: "list_commands_request",
-    agentId: "agent-1",
-    requestId: "req-live",
-  });
-  expect(findByType(liveMessages, "list_commands_response")).toMatchObject({
-    payload: {
+    const liveMessages: SessionOutboundMessage[] = [];
+    const liveSession = createSessionForTest({
+      permissions,
+      messages: liveMessages,
+      agentManager: {
+        waitForAgentClose: async () => undefined,
+        getAgent: () =>
+          ({
+            id: "agent-1",
+            session: { listCommands },
+          }) as never,
+      },
+    });
+    await liveSession.handleMessage({
+      type: "list_commands_request",
       agentId: "agent-1",
       requestId: "req-live",
-      error: null,
-      commands: expected,
-    },
-  });
+    });
+    expect(findByType(liveMessages, "list_commands_response")).toMatchObject({
+      payload: {
+        agentId: "agent-1",
+        requestId: "req-live",
+        error: null,
+        commands: expected,
+      },
+    });
+    expect(listCommands).toHaveBeenCalledExactlyOnceWith({ allowLaunch });
 
-  const draftMessages: SessionOutboundMessage[] = [];
-  const draftSession = createSessionForTest({
-    messages: draftMessages,
-    agentManager: {
-      getAgent: () => undefined,
-      listDraftCommands: async () => duplicateCommands,
-    },
-    agentStorage: { get: async () => null },
-  });
-  await draftSession.handleMessage({
-    type: "list_commands_request",
-    agentId: "draft-1",
-    requestId: "req-draft",
-    draftConfig: { provider: "antigravity", cwd: "/tmp/repo" },
-  });
-  expect(findByType(draftMessages, "list_commands_response")).toMatchObject({
-    payload: {
+    const draftMessages: SessionOutboundMessage[] = [];
+    const draftSession = createSessionForTest({
+      permissions,
+      messages: draftMessages,
+      agentManager: {
+        getAgent: () => undefined,
+        listDraftCommands,
+      },
+      agentStorage: { get: async () => null },
+    });
+    await draftSession.handleMessage({
+      type: "list_commands_request",
       agentId: "draft-1",
       requestId: "req-draft",
-      error: null,
-      commands: expected,
-    },
+      draftConfig: { provider: "antigravity", cwd: "/tmp/repo" },
+    });
+    expect(findByType(draftMessages, "list_commands_response")).toMatchObject({
+      payload: {
+        agentId: "draft-1",
+        requestId: "req-draft",
+        error: null,
+        commands: allowLaunch ? expected : [],
+      },
+    });
+    expect(listDraftCommands).toHaveBeenCalledTimes(allowLaunch ? 1 : 0);
+  },
+);
+
+test.each([
+  { launcher: "legacy executable override", command: [process.execPath] },
+  { launcher: "dynamic launcher", command: ["npx", "fake-codex"] },
+])("reads live commands without launching for a $launcher", async ({ command }) => {
+  const providerSnapshotManager = new ProviderSnapshotManager({
+    logger: pino({ level: "silent" }),
+    providerOverrides: { codex: { command } },
   });
+  const commands = [
+    { name: "compact", description: "Compact context", argumentHint: "", kind: "command" as const },
+  ];
+  const listCommands = vi.fn(async () => commands);
+  const createAgentFromRecord = vi.fn();
+  const listDraftCommands = vi.fn();
+  const messages: SessionOutboundMessage[] = [];
+  const coldRecord = createStoredAgentRecord({ id: "cold", cwd: "/tmp/repo", provider: "codex" });
+  const session = createSessionForTest({
+    messages,
+    permissions: ["daemon.read", "workspace.write"],
+    providerSnapshotManager,
+    agentManager: {
+      waitForAgentClose: async () => undefined,
+      isSilentTopicSeat: async () => false,
+      getAgent: (id) =>
+        id === "live" ? ({ id, provider: "codex", session: { listCommands } } as never) : undefined,
+      createAgentFromRecord,
+      listDraftCommands,
+    },
+    agentStorage: { get: async (id) => (id === coldRecord.id ? coldRecord : null) },
+  });
+
+  try {
+    await session.handleMessage({
+      type: "list_commands_request",
+      agentId: "live",
+      requestId: "live",
+    });
+    await session.handleMessage({
+      type: "list_commands_request",
+      agentId: "cold",
+      requestId: "cold",
+    });
+    await session.handleMessage({
+      type: "list_commands_request",
+      agentId: "draft",
+      requestId: "draft",
+      draftConfig: { provider: "codex", cwd: "/tmp/repo" },
+    });
+    expect(filterByType(messages, "list_commands_response").map(({ payload }) => payload)).toEqual([
+      { agentId: "live", requestId: "live", commands, error: null },
+      { agentId: "cold", requestId: "cold", commands: [], error: null },
+      { agentId: "draft", requestId: "draft", commands: [], error: null },
+    ]);
+    expect(listCommands).toHaveBeenCalledExactlyOnceWith({ allowLaunch: false });
+    expect(createAgentFromRecord).not.toHaveBeenCalled();
+    expect(listDraftCommands).not.toHaveBeenCalled();
+  } finally {
+    await session.cleanup();
+    providerSnapshotManager.destroy();
+  }
 });

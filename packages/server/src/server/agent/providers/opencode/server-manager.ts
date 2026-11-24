@@ -16,6 +16,8 @@ import {
   type ProviderRuntimeSettings,
 } from "../../provider-launch-config.js";
 import { resolveOpenCodeHomeDir } from "./paths.js";
+import { spawnManagedOpenCodeProcess } from "./managed-catalog-launch.js";
+import { stopScopedProviderProcess } from "../../scoped-provider-process.js";
 import {
   OpenCodeEventConsumer,
   type OpenCodeEventConsumerFactory,
@@ -55,10 +57,13 @@ export interface OpenCodeServerGeneration {
   events: OpenCodeEventConsumer;
   managedProcessId?: string;
   managedProcessRecord?: Promise<{ id: string } | null>;
+  catalogCleanup?: Promise<void>;
 }
 
 export type OpenCodePortAllocator = () => Promise<number>;
-export type OpenCodeCommandPrefixResolver = () => Promise<{ command: string; args: string[] }>;
+export type OpenCodeCommandPrefixResolver = (
+  env: NodeJS.ProcessEnv,
+) => Promise<{ command: string; args: string[] }>;
 export type OpenCodeServerProcessSpawner = (
   command: string,
   args: string[],
@@ -77,6 +82,7 @@ export interface OpenCodeServerManagerOptions {
   spawnServerProcess?: OpenCodeServerProcessSpawner;
   createEventSource?: OpenCodeEventConsumerFactory;
   decorateServerEnv?: (env: Record<string, string>) => Record<string, string>;
+  catalogDiscovery?: { signal?: AbortSignal };
 }
 
 export class OpenCodeServerManager implements OpenCodeServerManagerLike {
@@ -89,7 +95,6 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   private readonly logger: Logger;
   private readonly baseEnv?: SpawnProcessOptions["baseEnv"];
   private readonly runtimeSettings?: ProviderRuntimeSettings;
-  private readonly runtimeSettingsKey: string;
   private readonly managedProcesses?: ManagedProcessRegistry;
   private readonly terminateProcess: ProcessTerminator;
   private readonly portAllocator: OpenCodePortAllocator;
@@ -98,23 +103,27 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   private readonly spawnServerProcess: OpenCodeServerProcessSpawner;
   private readonly createEventSource: OpenCodeEventConsumerFactory;
   private readonly decorateServerEnv?: (env: Record<string, string>) => Record<string, string>;
+  private readonly catalogDiscovery?: OpenCodeServerManagerOptions["catalogDiscovery"];
 
   constructor(options: OpenCodeServerManagerOptions) {
     this.logger = options.logger;
     this.baseEnv = options.baseEnv;
     this.runtimeSettings = options.runtimeSettings;
-    this.runtimeSettingsKey = JSON.stringify(this.runtimeSettings ?? {});
     this.managedProcesses = options.managedProcesses;
     this.terminateProcess = options.terminateProcess ?? terminateWithTreeKill;
     this.portAllocator = options.portAllocator ?? findAvailablePort;
     this.resolveCommandPrefix =
       options.resolveCommandPrefix ??
-      (() => resolveProviderCommandPrefix(this.runtimeSettings?.command, resolveOpenCodeBinary));
+      ((env) =>
+        resolveProviderCommandPrefix(this.runtimeSettings?.command, () =>
+          resolveOpenCodeBinary(env),
+        ));
     this.resolveHomeDir = options.resolveHomeDir ?? resolveOpenCodeHomeDir;
     this.spawnServerProcess = options.spawnServerProcess ?? spawnProcess;
     this.createEventSource =
       options.createEventSource ?? ((input) => new OpenCodeEventConsumer(input));
     this.decorateServerEnv = options.decorateServerEnv;
+    this.catalogDiscovery = options.catalogDiscovery;
   }
 
   static getInstance(
@@ -122,7 +131,6 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     runtimeSettings?: ProviderRuntimeSettings,
     options: Omit<OpenCodeServerManagerOptions, "logger" | "runtimeSettings"> = {},
   ): OpenCodeServerManager {
-    const nextSettingsKey = JSON.stringify(runtimeSettings ?? {});
     if (!OpenCodeServerManager.instance) {
       OpenCodeServerManager.instance = new OpenCodeServerManager({
         logger,
@@ -130,14 +138,6 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
         ...options,
       });
       OpenCodeServerManager.registerExitHandler();
-    } else if (OpenCodeServerManager.instance.runtimeSettingsKey !== nextSettingsKey) {
-      logger.warn(
-        {
-          existingRuntimeSettings: OpenCodeServerManager.instance.runtimeSettingsKey,
-          requestedRuntimeSettings: nextSettingsKey,
-        },
-        "OpenCode server manager already initialized with different runtime settings",
-      );
     }
     return OpenCodeServerManager.instance;
   }
@@ -318,8 +318,6 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   private async startServer(launchEnv?: Record<string, string>): Promise<OpenCodeServerGeneration> {
     const port = await this.portAllocator();
     const url = `http://127.0.0.1:${port}`;
-    const launchPrefix = await this.resolveCommandPrefix();
-    const serverArgs = [...launchPrefix.args, "serve", "--port", String(port)];
     // Use a neutral OpenCode home as the server cwd. Launching from the user's
     // home directory causes OpenCode to treat it as the default workspace and
     // index the entire home tree.
@@ -340,16 +338,22 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       runtimeSettings: this.runtimeSettings,
       overlays: [launchEnv, bridgeEnv],
     });
-    const serverProcess = this.spawnServerProcess(launchPrefix.command, serverArgs, {
+    const launchPrefix = await this.resolveCommandPrefix(environment);
+    const serverArgs = [...launchPrefix.args, "serve", "--port", String(port)];
+    const {
+      command,
+      args,
+      process: serverProcess,
+    } = this.spawnServer({
+      command: launchPrefix.command,
+      args: serverArgs,
       cwd: serverCwd,
-      detached: process.platform !== "win32",
-      stdio: ["ignore", "pipe", "pipe"],
-      baseEnv: environment,
+      environment,
     });
     const managedProcessRecord = this.recordManagedServerProcess({
       process: serverProcess,
-      command: launchPrefix.command,
-      args: serverArgs,
+      command,
+      args,
       port,
     });
     let resolveProcessExit!: (error: Error) => void;
@@ -402,6 +406,7 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       return current + chunk.slice(0, remaining);
     };
     const buildStartupErrorMessage = (headline: string): string => {
+      if (this.catalogDiscovery) return headline;
       const sections = [headline];
       const stderrTrimmed = stderrBuffer.trim();
       if (stderrTrimmed.length > 0) {
@@ -416,12 +421,15 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
 
     {
       let timeout: ReturnType<typeof setTimeout>;
+      const discoverySignal = this.catalogDiscovery?.signal;
+      const onAbort = () => failStartup(new Error("OpenCode catalog discovery stopped"));
       const failStartup = (error: Error) => {
         if (settled) {
           return;
         }
         settled = true;
         clearTimeout(timeout);
+        discoverySignal?.removeEventListener("abort", onAbort);
         rejectListening(error);
       };
       timeout = setTimeout(() => {
@@ -432,23 +440,25 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
 
       serverProcess.stdout?.on("data", (data: Buffer) => {
         const output = data.toString();
-        stdoutBuffer = appendCapped(stdoutBuffer, output);
+        if (!this.catalogDiscovery) stdoutBuffer = appendCapped(stdoutBuffer, output);
         if (output.includes("listening on") && !settled) {
           started = true;
           settled = true;
           clearTimeout(timeout);
+          discoverySignal?.removeEventListener("abort", onAbort);
           resolveListening();
         }
       });
 
       serverProcess.stderr?.on("data", (data: Buffer) => {
+        if (this.catalogDiscovery) return;
         const output = data.toString();
         stderrBuffer = appendCapped(stderrBuffer, output);
         this.logger.error({ stderr: output.trim() }, "OpenCode server stderr");
       });
 
       serverProcess.on("error", (error) => {
-        const headline = error instanceof Error ? error.message : String(error);
+        const headline = this.catalogDiscovery ? "Could not start OpenCode server" : error.message;
         failStartup(new Error(buildStartupErrorMessage(headline)));
       });
 
@@ -458,21 +468,29 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
           "OpenCode server generation exited",
         );
         resolveProcessExit(new Error(`OpenCode server exited with code ${code}`));
-        this.removeManagedServerRecord(server);
+        if (this.catalogDiscovery) {
+          void this.stopCatalogServer(server).catch(() => {
+            this.logger.warn("OpenCode catalog process cleanup did not finish");
+          });
+        } else {
+          this.removeManagedServerRecord(server);
+        }
         if (!started) {
           failStartup(
             new Error(buildStartupErrorMessage(`OpenCode server exited with code ${code}`)),
           );
         }
-        if (this.currentServer?.process === serverProcess) {
+        if (!this.catalogDiscovery && this.currentServer?.process === serverProcess) {
           this.currentServer = null;
         }
         for (const retired of Array.from(this.retiredServers)) {
-          if (retired.process === serverProcess) {
+          if (!this.catalogDiscovery && retired.process === serverProcess) {
             this.retiredServers.delete(retired);
           }
         }
       });
+      discoverySignal?.addEventListener("abort", onAbort, { once: true });
+      if (discoverySignal?.aborted) onAbort();
     }
 
     server.ready = ready.catch(async (error) => {
@@ -487,7 +505,38 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     return server;
   }
 
+  private spawnServer(input: {
+    command: string;
+    args: string[];
+    cwd: string;
+    environment: NodeJS.ProcessEnv;
+  }) {
+    const { command, args, cwd, environment } = input;
+    const options: SpawnProcessOptions = {
+      detached: process.platform !== "win32",
+      stdio: ["ignore", "pipe", "pipe"],
+    };
+    if (!this.catalogDiscovery) {
+      return {
+        command,
+        args,
+        process: this.spawnServerProcess(command, args, { ...options, cwd, baseEnv: environment }),
+      };
+    }
+    return spawnManagedOpenCodeProcess({
+      operation: "opencode.serve.v1",
+      cwd,
+      argv: [command, ...args],
+      env: environment,
+      signal: this.catalogDiscovery.signal,
+    });
+  }
+
   async shutdown(): Promise<void> {
+    if (this.catalogDiscovery) {
+      // The catalog deadline can reject acquisition while startup still owns the child.
+      await Promise.allSettled([this.startPromise, this.newServerPromise]);
+    }
     const servers = [
       ...(this.currentServer ? [this.currentServer] : []),
       ...Array.from(this.retiredServers),
@@ -512,6 +561,10 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
   }
 
   private async killServer(server: OpenCodeServerGeneration): Promise<void> {
+    if (this.catalogDiscovery) {
+      await Promise.all([server.events.close(), this.stopCatalogServer(server)]);
+      return;
+    }
     await server.events.close();
     if (
       (server.process.exitCode !== null && server.process.exitCode !== undefined) ||
@@ -542,6 +595,16 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     } else {
       this.removeManagedServerRecord(server);
     }
+  }
+
+  private stopCatalogServer(server: OpenCodeServerGeneration): Promise<void> {
+    return (server.catalogCleanup ??= (async () => {
+      await stopScopedProviderProcess(server.process);
+      const record = await server.managedProcessRecord;
+      if (record) await this.removeManagedProcessId(record.id);
+      server.managedProcessId = undefined;
+      server.managedProcessRecord = undefined;
+    })());
   }
 
   private async recordManagedServerProcess(options: {
@@ -630,8 +693,8 @@ async function waitForServerAcquisition<T>(
   }
 }
 
-async function resolveOpenCodeBinary(): Promise<string> {
-  const found = await findExecutable("opencode");
+async function resolveOpenCodeBinary(env: NodeJS.ProcessEnv): Promise<string> {
+  const found = await findExecutable("opencode", { env });
   if (!found) {
     throw new Error(
       "OpenCode binary not found. Install OpenCode (https://github.com/opencode-ai/opencode) and ensure it is available in your shell PATH.",
@@ -656,12 +719,6 @@ async function resolveOpenCodeBinary(): Promise<string> {
         // Try the other npm layout before retaining the original command.
       }
     }
-
-    console.warn(
-      "[opencode-server] Found opencode.cmd but could not resolve the real opencode.exe. " +
-        "The process may not be properly terminated on exit. Path: %s",
-      found,
-    );
   }
 
   return found;

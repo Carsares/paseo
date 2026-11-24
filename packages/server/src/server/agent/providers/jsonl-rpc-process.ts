@@ -1,3 +1,4 @@
+import { isScopedProviderProcess, stopScopedProviderProcess } from "../scoped-provider-process.js";
 import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Logger } from "pino";
 
@@ -85,6 +86,7 @@ export class JsonlRpcProcess {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly messageSubscribers = new Set<(message: Record<string, unknown>) => void>();
   private readonly exitSubscribers = new Set<(exit: JsonlRpcExit) => void>();
+  private readonly scoped: boolean;
   private stderrBuffer = "";
   private nextRequestId = 1;
   private disposed = false;
@@ -113,20 +115,22 @@ export class JsonlRpcProcess {
       },
     });
     this.child = (options.spawn ?? spawnJsonlRpcProcess)(options.launch);
+    this.scoped = isScopedProviderProcess(this.child);
     this.child.stdout.on("data", (chunk) => {
       this.handleStdoutChunk(chunk);
     });
     this.child.stderr.on("data", (chunk) => {
+      if (this.scoped) return;
       this.stderrBuffer += chunk.toString();
       if (this.stderrBuffer.length > STDERR_BUFFER_LIMIT) {
         this.stderrBuffer = this.stderrBuffer.slice(-STDERR_BUFFER_LIMIT);
       }
     });
     this.child.stdin.on("error", (error) => {
-      this.handleStdinError(error);
+      void this.handleStdinError(error);
     });
     this.child.on("error", (error) => {
-      this.failAll(error instanceof Error ? error : new Error(String(error)));
+      this.failAll(this.scoped ? new Error("Provider discovery process failed") : error);
     });
     this.child.on("exit", (code, signal) => {
       this.exited = true;
@@ -241,25 +245,27 @@ export class JsonlRpcProcess {
       const line = `${JSON.stringify(message)}\n`;
       if (this.disposed) return;
       if (this.child.stdin.destroyed || !this.child.stdin.writable) {
-        this.handleStdinError(new Error(`${this.diagnosticName} stdin is not writable`));
+        void this.handleStdinError(new Error(`${this.diagnosticName} stdin is not writable`));
         return;
       }
       // Once write is attempted, even a pipe error cannot prove this request was unsent.
       if (pending) pending.writeStarted = true;
       this.child.stdin.write(line);
     } catch (error) {
-      this.handleStdinError(error);
+      void this.handleStdinError(error);
     }
   }
 
   async close(error = new Error(`${this.diagnosticName} process is closed`)): Promise<void> {
-    if (this.disposed) return;
+    if (this.disposed && !this.scoped) return;
     this.failAll(error);
-    this.closing = this.terminate();
+    this.closing ??= this.terminate();
     await this.closing;
   }
 
   private async terminate(): Promise<void> {
+    const scopedStop = stopScopedProviderProcess(this.child);
+    if (scopedStop) return scopedStop;
     try {
       this.child.stdin.end();
     } catch {
@@ -313,8 +319,9 @@ export class JsonlRpcProcess {
     }
     this.pending.delete(response.id);
     if (!response.success) {
-      const message =
-        response.error ?? `${this.diagnosticName} ${response.command ?? "request"} failed`;
+      const message = this.scoped
+        ? "Provider discovery request failed"
+        : (response.error ?? `${this.diagnosticName} ${response.command ?? "request"} failed`);
       pending.reject(
         response.success === false ? new JsonlRpcResponseError(message) : new Error(message),
       );
@@ -323,13 +330,17 @@ export class JsonlRpcProcess {
     pending.resolve(response.data);
   }
 
-  private handleStdinError(error: unknown): void {
+  private async handleStdinError(error: unknown): Promise<void> {
     if (this.disposed) {
       return;
     }
     const err = error instanceof Error ? error : new Error(String(error));
     this.options.logger.warn({ err }, `${this.diagnosticName} stdin write failed`);
-    void this.close(err);
+    try {
+      await this.close(err);
+    } catch {
+      this.options.logger.warn("Provider process cleanup did not finish");
+    }
   }
 
   private failAll(error: Error): void {

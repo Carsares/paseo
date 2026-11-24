@@ -1,9 +1,15 @@
-import { createExternalProcessEnv } from "../../../paseo-env.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawnScopedProviderProcess } from "../../scoped-provider-process.js";
+import { createExternalProcessEnv } from "../../../paseo-env.js";
 import type { Logger } from "pino";
 import { z } from "zod";
 
-import type { ProviderRuntimeSettings } from "../../provider-launch-config.js";
+import { createProviderEnv, type ProviderRuntimeSettings } from "../../provider-launch-config.js";
+import { findInstallationLaunchPath } from "../../provider-installation/installation-target.js";
+import {
+  assertScopedLaunch,
+  currentCustomProviderLaunch,
+} from "../../scoped-custom-provider-launch.js";
 import {
   JSONL_RPC_NO_TIMEOUT,
   JsonlRpcProcess,
@@ -46,8 +52,11 @@ import {
   type OmpSubagentSubscriptionLevel,
 } from "./rpc-types.js";
 
-const DEFAULT_OMP_COMMAND: [string, ...string[]] = [process.env.OMP_COMMAND ?? "omp"];
 const DEFAULT_COMMANDS_RPC_NAME = "get_available_commands";
+
+export function resolveOmpBinaryCommand(): string {
+  return process.env.OMP_COMMAND ?? "omp";
+}
 
 export interface OmpCliRuntimeOptions {
   logger: Logger;
@@ -65,38 +74,71 @@ export class OmpCliRuntime implements OmpRuntime {
   private readonly spawnProcess?: (launch: OmpRuntimeLaunch) => ChildProcessWithoutNullStreams;
 
   constructor(private readonly options: OmpCliRuntimeOptions) {
-    this.command = options.command ?? DEFAULT_OMP_COMMAND;
+    this.command = options.command ?? [resolveOmpBinaryCommand()];
     this.commandsRpcName = options.commandsRpcName ?? DEFAULT_COMMANDS_RPC_NAME;
     this.spawnProcess = options.spawnProcess;
   }
 
   async startSession(input: OmpStartSessionInput): Promise<OmpRuntimeSession> {
+    const scope = currentCustomProviderLaunch();
+    const spawnProcess = this.spawnProcess;
+    if (scope && (!input.catalogDiscovery || spawnProcess)) {
+      throw new Error("Custom CLI discovery launch is unsupported");
+    }
+    input.signal?.throwIfAborted();
     const launch = buildOmpLaunch({
       command: this.command,
       runtimeSettings: this.options.runtimeSettings,
       session: input,
     });
-    launch.env = createExternalProcessEnv(globalThis.process.env, launch.env ?? {});
+    const env = scope
+      ? createProviderEnv({ overlays: [launch.env] })
+      : createExternalProcessEnv(globalThis.process.env, launch.env ?? {});
+    launch.env = env;
     const [command, ...args] = launch.argv;
+    const processCwd = scope?.processCwd ?? launch.cwd;
+    const file = scope ? await findInstallationLaunchPath(command, { cwd: processCwd, env }) : null;
     const processLaunch: JsonlRpcLaunch = {
       command,
       args,
-      cwd: launch.cwd,
-      env: launch.env,
+      cwd: processCwd,
+      env,
     };
-    const spawn = this.spawnProcess;
+    const spawn = scope
+      ? () => {
+          input.signal?.throwIfAborted();
+          const binding = assertScopedLaunch({
+            adapter: "omp",
+            cwd: launch.cwd,
+            argv: launch.argv,
+            env,
+            file,
+          });
+          if (!binding) throw new Error("Custom CLI discovery launch is unauthorized");
+          return spawnScopedProviderProcess({
+            command: binding.entrypoint,
+            args: [...binding.entrypointArgs, ...args],
+            cwd: processCwd,
+            env,
+            activity: { family: "omp", keys: [], opaque: true },
+          });
+        }
+      : spawnProcess && (() => spawnProcess(launch));
     const processOptions = {
       launch: processLaunch,
-      logger: this.options.logger,
+      logger: scope ? this.options.logger.child({}, { level: "silent" }) : this.options.logger,
       diagnosticName: "OMP RPC",
       defaultRequestTimeoutMs: this.options.requestTimeoutMs,
-      ...(spawn ? { spawn: () => spawn(launch) } : {}),
+      ...(spawn ? { spawn } : {}),
     };
     const process = new JsonlRpcProcess(processOptions);
-    const handleAbort = () => void process.close(input.signal?.reason).catch(() => undefined);
+    let closePromise: Promise<void> | undefined;
+    const closeStartup = (error: Error) => (closePromise ??= process.close(error));
+    const handleAbort = () =>
+      void closeStartup(new Error("OMP RPC startup canceled")).catch(() => undefined);
     input.signal?.addEventListener("abort", handleAbort, { once: true });
     try {
-      await establishOmpProtocol(process, this.options.logger, {
+      await establishOmpProtocol(process, processOptions.logger, {
         readyTimeoutMs: this.options.readyTimeoutMs,
         requestTimeoutMs: this.options.requestTimeoutMs,
       });
@@ -104,7 +146,7 @@ export class OmpCliRuntime implements OmpRuntime {
       return new OmpCliRuntimeSession(process, this.commandsRpcName, launch.env);
     } catch (error) {
       const startupError = error instanceof Error ? error : new Error(String(error));
-      await process.close(startupError);
+      await closeStartup(startupError);
       throw startupError;
     } finally {
       input.signal?.removeEventListener("abort", handleAbort);

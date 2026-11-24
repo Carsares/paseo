@@ -1,3 +1,7 @@
+import {
+  isScopedProviderProcess,
+  stopScopedProviderProcess,
+} from "../../scoped-provider-process.js";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Logger } from "pino";
 import { z } from "zod";
@@ -10,6 +14,7 @@ import { ProviderLineReader, ProviderStreamLimitError } from "../jsonl-frame-dec
 // with 4x margin for longer threads. This is provider stdout, not the client protocol.
 export const CODEX_PROVIDER_LINE_BYTES = 128 * 1024 * 1024;
 
+const DISCOVERY_LINE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
 const APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 2_000;
 const APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS = 1_000;
@@ -221,6 +226,7 @@ function readProviderTurnId(params: unknown): string | undefined {
 }
 
 export class CodexAppServerClient {
+  private readonly scoped: boolean;
   private readonly stdoutLineReader: { close(): void };
   private activeProviderRequests = 0;
   private readonly pending = new Map<number, PendingRequest>();
@@ -236,12 +242,16 @@ export class CodexAppServerClient {
     private readonly logger: Logger,
     private readonly getTraceContext: () => CodexAppServerTraceContext = () => ({}),
   ) {
+    this.scoped = isScopedProviderProcess(child);
     // Split only on LF: U+2028/U+2029 are valid raw characters inside Codex JSON.
     const reader = new ProviderLineReader(
-      CODEX_PROVIDER_LINE_BYTES,
+      this.scoped ? DISCOVERY_LINE_BYTES : CODEX_PROVIDER_LINE_BYTES,
       (line) => {
         void this.handleLine(line).catch((error) => {
-          this.logger.warn({ error, line }, "Failed to handle Codex app-server stdout line");
+          this.logger.warn(
+            this.scoped ? {} : { error, line },
+            "Failed to handle Codex app-server stdout line",
+          );
         });
       },
       (error) => this.handleStreamLimit(error),
@@ -256,6 +266,7 @@ export class CodexAppServerClient {
     };
 
     child.stderr.on("data", (chunk) => {
+      if (this.scoped) return;
       this.stderrBuffer += chunk.toString();
       if (this.stderrBuffer.length > STDERR_BUFFER_LIMIT) {
         this.stderrBuffer = this.stderrBuffer.slice(-STDERR_BUFFER_LIMIT);
@@ -263,9 +274,19 @@ export class CodexAppServerClient {
     });
 
     child.on("error", (err) => {
-      this.logger.error({ err }, "Codex app-server child process error");
-      this.handleUnexpectedTermination(err);
+      this.logger.error(this.scoped ? {} : { err }, "Codex app-server child process error");
+      this.handleUnexpectedTermination(
+        this.scoped ? new Error("Codex discovery process failed") : err,
+      );
     });
+
+    if (this.scoped) {
+      const pipeFailed = () =>
+        this.handleUnexpectedTermination(new Error("Codex discovery pipe failed"));
+      child.stdin.on("error", pipeFailed);
+      child.stdout.on("error", pipeFailed);
+      child.stderr.on("error", pipeFailed);
+    }
 
     const reportExit = (code: number | null, signal: NodeJS.Signals | null) => {
       this.handleUnexpectedTermination(
@@ -282,7 +303,7 @@ export class CodexAppServerClient {
       const initializing = Array.from(this.pending.values()).some(
         (request) => request.method === "initialize",
       );
-      if (!initializing) reportExit(code, signal);
+      if (this.scoped || !initializing) reportExit(code, signal);
     });
     child.on("close", reportExit);
   }
@@ -346,6 +367,8 @@ export class CodexAppServerClient {
     } catch {
       // ignore
     }
+    const scopedStop = stopScopedProviderProcess(this.child);
+    if (scopedStop) return scopedStop;
     const result = await terminateWithTreeKill(this.child, {
       gracefulTimeoutMs: APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
       forceTimeoutMs: APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS,
@@ -377,7 +400,9 @@ export class CodexAppServerClient {
     // A lost notification or server request cannot be replayed. Fail the session,
     // including live turns with no pending RPC, rather than dropping a stream unit.
     this.stdoutLineReader.close();
-    this.handleUnexpectedTermination(failure);
+    this.handleUnexpectedTermination(
+      this.scoped ? new Error("Codex discovery stdout exceeded the line limit") : failure,
+    );
     void this.dispose().catch((err) => {
       this.logger.warn({ err }, "Failed to terminate oversized Codex stdout producer");
     });
@@ -427,12 +452,15 @@ export class CodexAppServerClient {
     try {
       raw = JSON.parse(line);
     } catch (error) {
-      this.logger.warn({ error, line }, "Ignoring non-JSON Codex app-server stdout line");
+      this.logger.warn(
+        this.scoped ? {} : { error, line },
+        "Ignoring non-JSON Codex app-server stdout line",
+      );
       return;
     }
 
     if (!isRecord(raw)) {
-      this.logger.warn({ line }, "Parsed JSON is not an object");
+      this.logger.warn(this.scoped ? {} : { line }, "Parsed JSON is not an object");
       return;
     }
 
@@ -445,11 +473,13 @@ export class CodexAppServerClient {
         this.pending.delete(id);
         if (raw.error) {
           pending.reject(
-            new CodexAppServerRpcError(
-              raw.error.message ?? "Unknown error",
-              raw.error.code,
-              raw.error.data,
-            ),
+            this.scoped
+              ? new Error("Codex discovery request failed")
+              : new CodexAppServerRpcError(
+                  raw.error.message ?? "Unknown error",
+                  raw.error.code,
+                  raw.error.data,
+                ),
           );
         } else {
           pending.resolve(raw.result);
@@ -484,6 +514,7 @@ export class CodexAppServerClient {
   }
 
   private traceRawEvent(raw: JsonRpcRequest | JsonRpcNotification): void {
+    if (this.scoped) return;
     const traceContext = this.getTraceContext();
     this.logger.trace(
       {

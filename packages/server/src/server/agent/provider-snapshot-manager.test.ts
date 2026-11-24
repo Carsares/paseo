@@ -1,6 +1,7 @@
 import pino from "pino";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type {
   ProviderEvent,
@@ -92,6 +93,63 @@ function createExtraClient(
     ...overrides,
   } satisfies AgentClient;
 }
+
+test.skipIf(process.platform === "win32").each(["refresh", "diagnostic", "cold read"] as const)(
+  "rechecks a legacy launcher after a symlink changes before %s",
+  async (operation) => {
+    const root = await mkdtemp(join(tmpdir(), "paseo-legacy-retarget-"));
+    const alias = join(root, "configured-cli");
+    const ordinary = join(root, "ordinary-cli");
+    const runner = join(root, operation === "diagnostic" ? "uvx" : "npx");
+    const isAvailable = vi.fn(async () => true);
+    const fetchCatalog = vi.fn(async () => ({
+      models: [{ provider: "codex", id: "ordinary-model", label: "Ordinary Model" }],
+      modes: [],
+    }));
+    const getDiagnostic = vi.fn(async () => ({ diagnostic: "ordinary diagnostic" }));
+    const managerOptions = {
+      logger: createTestLogger(),
+      providerOverrides: { codex: { command: [alias] } },
+      extraClients: {
+        codex: createExtraClient("codex", { isAvailable, fetchCatalog, getDiagnostic }),
+      },
+    };
+    await writeFile(ordinary, `#!${process.execPath}\n`, { mode: 0o700 });
+    await writeFile(runner, `#!${process.execPath}\n`, { mode: 0o700 });
+    await symlink(ordinary, alias);
+    const manager = new ProviderSnapshotManager(managerOptions);
+    try {
+      const before = await manager.getProvider({ provider: "codex", wait: true });
+      expect(before.models?.map(({ id }) => id)).toEqual(["ordinary-model"]);
+      expect(manager.canLaunchProviderForRead("codex")).toBe(false);
+      await symlink(runner, alias + ".next");
+      await rename(alias + ".next", alias);
+
+      const cold = join(root, "cold-workspace");
+      if (operation === "refresh") {
+        await manager.refreshSettingsSnapshot({ providers: ["codex"] });
+      } else if (operation === "diagnostic") {
+        const result = await manager.getProviderDiagnostic("codex");
+        expect(result.diagnostic).toContain("CLI is checked when opening an agent");
+      } else {
+        await manager.warmUpSnapshotForCwd({ cwd: cold, providers: ["codex"] });
+        expect(
+          manager.peekSnapshot(cold)?.records.find(({ entry }) => entry.provider === "codex")
+            ?.entry,
+        ).toMatchObject({ status: "ready", models: [] });
+      }
+      expect(
+        manager.peekSnapshot()?.records.find(({ entry }) => entry.provider === "codex")?.entry,
+      ).toMatchObject({ status: "ready", models: [] });
+      expect(isAvailable).toHaveBeenCalledTimes(1);
+      expect(fetchCatalog).toHaveBeenCalledTimes(1);
+      expect(getDiagnostic).not.toHaveBeenCalled();
+    } finally {
+      manager.destroy();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 async function withEnv(key: string, value: string, run: () => Promise<void>): Promise<void> {
   const previous = process.env[key];
@@ -1682,7 +1740,7 @@ describe("ProviderSnapshotManager applyMutableProviderConfig", () => {
     }
   });
 
-  test("changing one provider preserves other catalogs and clients across directories", async () => {
+  test("a display change preserves all catalogs and clients across directories", async () => {
     const calls = { claude: 0, codex: 0 };
     const clients = Object.fromEntries(
       (["claude", "codex"] as const).map((provider) => [
@@ -1728,7 +1786,7 @@ describe("ProviderSnapshotManager applyMutableProviderConfig", () => {
       expect(cwds.map(getCodexEntry)).toEqual(before);
       expect(manager.getAgentManagerProviderState().providerDefinitions.codex).toEqual(definition);
       for (const cwd of cwds) await manager.warmUpSnapshotForCwd({ cwd });
-      expect(calls).toEqual({ claude: 2, codex: 1 });
+      expect(calls).toEqual({ claude: 1, codex: 1 });
       const listener = vi.fn();
       manager.on("change", listener);
       manager.applyMutableProviderConfig(
@@ -1736,7 +1794,7 @@ describe("ProviderSnapshotManager applyMutableProviderConfig", () => {
         { replace: true },
       );
       for (const cwd of cwds) await manager.warmUpSnapshotForCwd({ cwd });
-      expect(calls).toEqual({ claude: 2, codex: 1 });
+      expect(calls).toEqual({ claude: 1, codex: 1 });
       expect(listener).not.toHaveBeenCalled();
     } finally {
       manager.destroy();
@@ -1945,9 +2003,9 @@ describe("ProviderSnapshotManager applyMutableProviderConfig", () => {
 
 describe("ProviderSnapshotManager lifecycle", () => {
   test("owns every materialized client generation until daemon shutdown", async () => {
-    const providerConfig = (label: string) => ({
+    const providerConfig = (value: string) => ({
       claude: { enabled: false },
-      codex: { enabled: true, label },
+      codex: { enabled: true, env: { TEST_LAUNCH_SETTING: value } },
       copilot: { enabled: false },
       omp: { enabled: false },
       opencode: { enabled: false },
@@ -2912,7 +2970,7 @@ test.each(["configuration", "shutdown", "destroy"])(
       if (action === "configuration") {
         manager.applyMutableProviderConfig({
           ...PUBLICATION_PROVIDERS,
-          pi: { enabled: true, label: "Updated" },
+          pi: { enabled: true, env: { TEST_LAUNCH_SETTING: "updated" } },
         });
         await expect.poll(() => queuedSettled).toBe(true);
         // Replacing configuration must not reset the budget for still-active probes.
@@ -3606,6 +3664,10 @@ describe("plugin provider overrides and launch", () => {
 
   test("applies plugin overrides and refreshes the resolved launch on config edits", async () => {
     const { registration, launches } = provider();
+    const root = await mkdtemp(join(tmpdir(), "paseo-plugin-launch-config-"));
+    const originalScript = join(root, "override.js");
+    const editedScript = join(root, "edited.js");
+    await Promise.all([writeFile(originalScript, ""), writeFile(editedScript, "")]);
     const manager = new ProviderSnapshotManager({
       logger: createTestLogger(),
       providerOverrides: {
@@ -3614,7 +3676,7 @@ describe("plugin provider overrides and launch", () => {
           label: "Configured plugin",
           models: [{ id: "configured", label: "Configured" }],
           additionalModels: [{ id: "extra", label: "Extra" }],
-          command: [process.execPath, "override.js"],
+          command: [process.execPath, originalScript],
           env: { PLUGIN_LOGIN: "yes", CLAUDECODE: "parent" },
         },
       },
@@ -3636,7 +3698,7 @@ describe("plugin provider overrides and launch", () => {
       ).toEqual(["configured", "extra"]);
       expect(launches[0]).toMatchObject({
         command: process.execPath,
-        args: ["override.js"],
+        args: [originalScript],
         env: { PLUGIN_LOGIN: "yes" },
       });
       expect(launches[0]!.env).not.toHaveProperty("CLAUDECODE");
@@ -3644,7 +3706,7 @@ describe("plugin provider overrides and launch", () => {
       manager.applyMutableProviderConfig({
         [registration.id]: {
           enabled: true,
-          command: [process.execPath, "edited.js"],
+          command: [process.execPath, editedScript],
           env: { PLUGIN_LOGIN: "no" },
         },
       });
@@ -3655,17 +3717,18 @@ describe("plugin provider overrides and launch", () => {
       manager.applyMutableProviderConfig({
         [registration.id]: {
           enabled: true,
-          command: [process.execPath, "edited.js"],
+          command: [process.execPath, editedScript],
           env: { PLUGIN_LOGIN: "yes" },
         },
       });
       expect(await manager.getProvider({ provider: registration.id, wait: true })).toMatchObject({
         status: "ready",
       });
-      expect(launches.at(-1)).toMatchObject({ args: ["edited.js"] });
+      expect(launches.at(-1)).toMatchObject({ args: [editedScript] });
     } finally {
       await manager.shutdown();
       manager.destroy();
+      await rm(root, { recursive: true, force: true });
     }
   });
 

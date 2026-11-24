@@ -58,7 +58,7 @@ export function getClaudeContextWindowMaxTokens(
 }
 
 export async function getClaudeModelsWithSettings(
-  logger: Logger,
+  logger: Logger | undefined,
   configDir: string,
   claudeCodeVersion?: string,
   discoveredModelIds: ReadonlySet<string> = new Set(),
@@ -90,7 +90,7 @@ export async function getClaudeModelsWithSettings(
 }
 
 async function readClaudeSettingsModels(
-  logger: Logger,
+  logger: Logger | undefined,
   configDir: string,
 ): Promise<AgentModelDefinition[]> {
   const settingsPath = path.join(configDir, "settings.json");
@@ -100,12 +100,12 @@ async function readClaudeSettingsModels(
     const rawSettings = await fs.readFile(settingsPath, "utf8");
     parsed = JSON.parse(rawSettings);
   } catch (error) {
-    logger.debug({ err: error, settingsPath }, "Failed to read Claude settings models");
+    logger?.debug({ err: error, settingsPath }, "Failed to read Claude settings models");
     return [];
   }
 
   if (!isRecord(parsed)) {
-    logger.debug({ settingsPath }, "Claude settings.json is not an object");
+    logger?.debug({ settingsPath }, "Claude settings.json is not an object");
     return [];
   }
 
@@ -117,7 +117,7 @@ async function readClaudeSettingsModels(
     return models;
   }
   if (!isRecord(env)) {
-    logger.debug({ settingsPath }, "Claude settings.json env is not an object");
+    logger?.debug({ settingsPath }, "Claude settings.json env is not an object");
     return models;
   }
 

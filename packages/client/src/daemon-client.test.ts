@@ -140,6 +140,48 @@ function wrapSessionMessage(message: unknown): string {
   });
 }
 
+test.each([
+  ["locateCustomProviderCli", "locate", { status: "ok", path: "/bin/my-cli" }],
+  ["testCustomProviderCli", "test", { status: "unsupported" }],
+  ["saveCustomProviderCli", "save", null],
+] as const)("%s correlates its custom CLI reply", async (method, operation, result) => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "custom-cli",
+    transportFactory: () => mock.transport,
+  });
+  try {
+    const connecting = client.connect();
+    mock.triggerOpen({ features: { providerCustomCli: true } });
+    await connecting;
+    expect(client.getLastServerInfoMessage()?.features?.providerCustomCli).toBe(true);
+    const draft = {
+      mode: "create",
+      providerId: "example-cli",
+      extends: "acp",
+      command: ["my-cli", "two words"],
+      env: { FLAG: "1" },
+    } as const;
+    const pending = client[method]({ ...draft, command: [...draft.command] });
+    const outbound = JSON.parse(assertStr(mock.sent[0]));
+    const requestId = outbound.message.requestId as string;
+    expect(requestId).toEqual(expect.any(String));
+    expect(outbound).toEqual({
+      type: "session",
+      message: { type: `provider.custom_cli.${operation}.request`, draft, requestId },
+    });
+    const type = `provider.custom_cli.${operation}.response`;
+    mock.triggerMessage(
+      wrapSessionMessage({ type, payload: { requestId: "other-request", result: null } }),
+    );
+    mock.triggerMessage(wrapSessionMessage({ type, payload: { requestId, result } }));
+    await expect(pending).resolves.toEqual({ requestId, result });
+  } finally {
+    await client.close();
+  }
+});
+
 function assertStr(data: string | Uint8Array | ArrayBuffer | undefined): string {
   if (typeof data !== "string") throw new Error("Expected string frame");
   return data;

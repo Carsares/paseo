@@ -1,12 +1,26 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { describe, expect, onTestFinished, test, vi } from "vitest";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdtemp,
+  mkdir,
+  readFile as readCatalogTrace,
+  realpath,
+  rm as removeCatalogFile,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import type { AgentStreamEvent } from "../../agent-sdk-types.js";
 import { AgentTurnStartRejectedError } from "../../agent-sdk-types.js";
+import { DaemonConfigStore } from "../../../daemon-config-store.js";
+import {
+  checkCustomProviderCliLaunch,
+  prepareCustomProviderCliDiscovery,
+} from "../../custom-provider-cli.js";
+import { ProviderSnapshotManager } from "../../provider-snapshot-manager.js";
 import { JsonlRpcResponseError } from "../jsonl-rpc-process.js";
 import type { PaseoToolCatalog } from "../../tools/types.js";
 import type { OmpAgentMessage } from "./rpc-types.js";
@@ -19,6 +33,103 @@ import { OmpAgentClient } from "./agent.js";
 import { OmpCliRuntime } from "./cli-runtime.js";
 import { FakeOmp } from "./test-utils/fake-omp.js";
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
+
+test("publishes a custom OMP catalog on explicit refresh without launching on reads", () =>
+  verifyOmpCatalogRefresh("configured"));
+
+test.skipIf(process.platform === "win32")(
+  "refreshes a custom OMP catalog using OMP_COMMAND when no command is configured",
+  () => verifyOmpCatalogRefresh("inherited"),
+);
+
+async function verifyOmpCatalogRefresh(commandSource: "configured" | "inherited"): Promise<void> {
+  const root = await mkdtemp(path.join(tmpdir(), "paseo-omp-catalog-"));
+  const script = path.join(root, "catalog.cjs");
+  const marker = path.join(root, "started.json");
+  const argv: [string, ...string[]] = [process.execPath, script, marker, "two words"];
+  const inherited = commandSource === "inherited";
+  if (inherited) {
+    vi.stubEnv("OMP_COMMAND", script);
+    onTestFinished(() => vi.unstubAllEnvs());
+  }
+  const provider = "custom-omp";
+  const providerOverrides = {
+    [provider]: {
+      extends: "omp",
+      label: "Custom OMP",
+      enabled: true,
+      deferDiscovery: true,
+      ...(inherited ? {} : { command: argv }),
+      env: { PASEO_OMP_CATALOG: "omp-catalog" },
+    },
+  };
+  const configStore = new DaemonConfigStore(root, {
+    mcp: { injectIntoAgents: false },
+    providers: providerOverrides,
+    browserTools: { enabled: false },
+    metadataGeneration: { providers: [] },
+    autoArchiveAfterMerge: false,
+    enableTerminalAgentHooks: false,
+    appendSystemPrompt: "",
+  });
+  const manager = new ProviderSnapshotManager({ logger: createTestLogger(), providerOverrides });
+  onTestFinished(async () => {
+    manager.destroy();
+    await removeCatalogFile(root, { recursive: true, force: true });
+  });
+  await writeFile(
+    script,
+    `${inherited ? "#!/usr/bin/env node\n" : ""}
+    const trace = { cwd: process.cwd(), argv: process.argv.slice(${inherited ? 2 : 3}), value: process.env.PASEO_OMP_CATALOG, requests: [] };
+    const record = () => require("node:fs").writeFileSync(${JSON.stringify(marker)}, JSON.stringify(trace));
+    record();
+    process.stdout.write('{"type":"ready"}\\n');
+    require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
+      const { id, type } = JSON.parse(line);
+      trace.requests.push(type);
+      record();
+      const data = { models: [{ provider: "test", id: "omp-discovered", name: "OMP Discovered" }] };
+      process.stdout.write(JSON.stringify({ type: "response", id, success: true, data }) + "\\n");
+    });
+  `,
+    { mode: 0o700 },
+  );
+  const request = { mode: "edit", providerId: provider } as const;
+  const deps = { configStore, isRegisteredProvider: () => true, isPluginProvider: () => false };
+  const client = new OmpAgentClient({
+    logger: createTestLogger(),
+    ...(inherited ? {} : { runtimeSettings: { command: { mode: "replace", argv } } }),
+  });
+  const read = () => manager.getProvider({ provider, cwd: root, wait: true });
+  expect(await read()).toMatchObject({ status: "unavailable" });
+  await expect(client.isAvailable()).resolves.toBe(true);
+  expect(await checkCustomProviderCliLaunch(request, deps)).toMatchObject({ status: "ok" });
+  await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  await manager.discoverDeferredProvider(provider, root, {
+    kind: "refresh",
+    prepare: async (cwd) => {
+      const approval = await prepareCustomProviderCliDiscovery(request, deps, cwd);
+      if (approval.status !== "ok")
+        throw new Error(`OMP catalog authorization failed: ${approval.status}`);
+      return approval.run;
+    },
+  });
+  const discovered = await read();
+  expect(discovered).toMatchObject({
+    status: "ready",
+    models: [{ provider, id: "test/omp-discovered", label: "OMP Discovered" }],
+  });
+  expect(JSON.parse(await readCatalogTrace(marker, "utf8"))).toEqual({
+    cwd: await realpath(root),
+    argv: [...(inherited ? [] : ["two words"]), "--mode", "rpc-ui", "--no-session"],
+    value: "omp-catalog",
+    requests: ["get_available_models"],
+  });
+  await removeCatalogFile(marker);
+  await manager.refreshSnapshotForCwd({ cwd: root, providers: [provider] });
+  expect(await read()).toEqual(discovered);
+  await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+}
 
 const TURN_LIFECYCLE_EVENTS = new Set<AgentStreamEvent["type"]>([
   "turn_started",

@@ -35,3 +35,22 @@ test("workspace task requests and replies require workspace read permission", ()
   expect(hub.allowsInbound(request)).toBe(false);
   expect(hub.allowsOutbound(reply)).toBe(false);
 });
+
+test.each([
+  ["locate", "daemon.read"],
+  ["test", "daemon.manage"],
+  ["save", "daemon.manage"],
+] as const)("custom CLI %s requires %s", (operation, permission) => {
+  const request = { type: `provider.custom_cli.${operation}.request` } as const;
+  const reply = {
+    type: `provider.custom_cli.${operation}.response`,
+    payload: { requestId: "request-1", result: { status: "ok" } },
+  } satisfies SessionOutboundMessage;
+  const readOnly = new SessionAuthorization(["daemon.read"]);
+  const allowed = new SessionAuthorization([permission]);
+
+  expect(readOnly.allowsInbound(request)).toBe(operation === "locate");
+  expect(readOnly.allowsOutbound(reply)).toBe(operation === "locate");
+  expect(allowed.allowsInbound(request)).toBe(true);
+  expect(allowed.allowsOutbound(reply)).toBe(true);
+});

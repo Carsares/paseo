@@ -807,7 +807,8 @@ export interface AgentSession {
   canStopRuntime?(): Promise<boolean>;
   /** Release live runtime resources without archiving or deleting the durable native session. */
   close(): Promise<void>;
-  listCommands?(): Promise<AgentSlashCommand[]>;
+  /** With launch disabled, use the current connection or cached commands. */
+  listCommands?(options?: { allowLaunch?: boolean }): Promise<AgentSlashCommand[]>;
   /** A returned model is the effective selection committed by this mutation.
    * Returning void means the requested selection was accepted. No status read is required. */
   setModel?(modelId: string | null): Promise<void | { model: string | null }>;
@@ -866,6 +867,8 @@ export interface ProviderCatalog {
   models: AgentModelDefinition[];
   modes: AgentMode[];
   defaultModeId?: string | null;
+  /** Version already observed during authorized discovery. Never probe solely for this field. */
+  installedVersion?: string;
 }
 
 export interface ResolveAgentDefaultModeInput {

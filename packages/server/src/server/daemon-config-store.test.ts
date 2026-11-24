@@ -7,6 +7,7 @@ import {
   DaemonConfigStore,
   applyMutableProviderConfigToOverrides,
   toWireDaemonConfig,
+  toWireDaemonConfigError,
 } from "./daemon-config-store.js";
 import { loadConfig, resolveReloadableConfig } from "./config.js";
 import { loadPersistedConfig } from "./persisted-config.js";
@@ -110,6 +111,77 @@ describe("DaemonConfigStore", () => {
     for (const dir of tempDirs) {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test("wire config preserves provider form data without exposing launch settings", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "paseo-wire-config-"));
+    tempDirs.push(dir);
+    const persisted: PersistedConfig = {
+      agents: {
+        providers: {
+          example: {
+            extends: "acp",
+            label: "Example",
+            description: "Custom command",
+            command: ["example", "--acp"],
+            enabled: true,
+            env: { EXAMPLE_KEY: "env-value" },
+            deferDiscovery: true,
+            options: { token: "option-value" },
+            params: { key: "old-option-value" },
+            additionalModels: [{ id: "custom", label: "Custom" }],
+          },
+        },
+      },
+    };
+    writeFileSync(path.join(dir, "config.json"), JSON.stringify(persisted));
+    const store = new DaemonConfigStore(dir, {
+      ...reloadableConfig(persisted),
+      envOverrides: { "features.dictation.enabled": "PASEO_DICTATION_ENABLED" },
+    });
+    const visibleProvider = {
+      extends: "acp",
+      label: "Example",
+      description: "Custom command",
+      command: ["example", "--acp"],
+      enabled: true,
+      additionalModels: [{ id: "custom", label: "Custom" }],
+    };
+    expect(toWireDaemonConfig(store.get()).providers.example).toEqual(visibleProvider);
+    expect(toWireDaemonConfig(store.get()).envOverrides).toEqual({
+      "features.dictation.enabled": "PASEO_DICTATION_ENABLED",
+    });
+
+    const notices: MutableDaemonConfig[] = [];
+    store.onChange((config) => notices.push(toWireDaemonConfig(config)));
+    const patched = await store.patch({
+      providers: { example: { enabled: false, deferDiscovery: false } },
+    });
+    expect(toWireDaemonConfig(patched).providers.example).toEqual({
+      ...visibleProvider,
+      enabled: false,
+    });
+    expect(notices).toEqual([toWireDaemonConfig(patched)]);
+    expect(store.get().providers.example).toMatchObject({
+      env: { EXAMPLE_KEY: "env-value" },
+      options: { token: "option-value" },
+      deferDiscovery: true,
+    });
+  });
+
+  test.each([
+    ["[Config] Invalid JSON in config.json: sample-value", "Invalid JSON in daemon config"],
+    ["[Config] Invalid config in config.json: sample-value", "Invalid daemon config"],
+    ["Runtime apply failed: sample-value", "Failed to reload daemon config"],
+  ])("keeps config errors safe to send or log", (message, expected) => {
+    const cause = new Error("sample-cause");
+    const safe = toWireDaemonConfigError(
+      new Error(message, { cause }),
+      "Failed to reload daemon config",
+    );
+    expect(safe.message).toBe(expected);
+    expect(safe.cause).toBeUndefined();
+    expect(safe.stack).not.toContain("sample-value");
   });
 
   test("patch persists relay state and emits its field change", async () => {

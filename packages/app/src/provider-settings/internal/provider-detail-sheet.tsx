@@ -46,7 +46,7 @@ export function ProviderDetailSheet({
       desktopHeight={frame.desktopHeight}
       testID="provider-settings-sheet"
     >
-      <ProviderDetail serverId={serverId} detail={detail} />
+      <ProviderDetail serverId={serverId} detail={detail} sheetFrame={frame} />
     </AdaptiveModalSheet>
   );
 }

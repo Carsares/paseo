@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { View } from "react-native";
 import { ProviderInstallationSection } from "@/components/provider-installation-section";
@@ -13,10 +13,12 @@ import {
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { readAcpProviderInstallGuide } from "@/hooks/use-acp-provider-catalog";
+import { useDaemonConfig } from "@/hooks/use-daemon-config";
 import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
 import { useTimeAgo } from "@/hooks/use-time-ago";
 import { useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { settingsStyles } from "@/styles/settings";
+import { CustomProviderCliFormSheet } from "./custom-provider-cli-form";
 import {
   readDetailPresence,
   readDetailSections,
@@ -24,9 +26,16 @@ import {
   type DetailPresence,
 } from "./detail-sections";
 import { DiagnosticSheet } from "./diagnostic-sheet";
-import { useProviderConfigActions, type ProviderEntry } from "./provider-config";
+import {
+  resolveCustomProviderEditTarget,
+  useProviderConfigActions,
+  useSupportsCustomProviderCli,
+  type CustomProviderEditTarget,
+  type ProviderEntry,
+} from "./provider-config";
 import { ProviderModels } from "./provider-models";
 import { ProviderNotice } from "./provider-notice";
+import type { ProviderSheetFrame } from "./sheet-frame";
 
 export interface ProviderDetailState {
   provider: string;
@@ -85,21 +94,46 @@ export function useProviderDetail({
 export function ProviderDetail({
   serverId,
   detail,
+  sheetFrame,
 }: {
   serverId: string;
   detail: ProviderDetailState;
+  sheetFrame?: ProviderSheetFrame;
 }) {
   const { provider, presence, label } = detail;
   const { refresh, isRefreshing } = useProvidersSnapshot(serverId);
+  const { config } = useDaemonConfig(serverId);
+  const supportsCustomCli = useSupportsCustomProviderCli(serverId);
   const installation = useProviderInstallation({ serverId, provider, visible: true });
-  const refreshInstallation = installation.refresh;
+  const refreshInstallationRef = useRef(installation.refresh);
+  const refreshGenerationRef = useRef(0);
+  useEffect(() => {
+    refreshInstallationRef.current = installation.refresh;
+  }, [installation.refresh]);
+  useEffect(() => {
+    return () => {
+      refreshGenerationRef.current += 1;
+    };
+  }, [serverId, provider]);
   const handleRefresh = useCallback(() => {
-    void refresh([provider]);
-    refreshInstallation();
-  }, [provider, refresh, refreshInstallation]);
+    const generation = ++refreshGenerationRef.current;
+    const run = async () => {
+      try {
+        await refresh([provider]);
+      } catch {
+        // Snapshot refresh failures stay owned by the snapshot query; still refresh installation.
+      }
+      if (refreshGenerationRef.current !== generation) return;
+      refreshInstallationRef.current();
+    };
+    void run();
+  }, [provider, refresh]);
   if (presence.kind !== "found") return <AbsentProvider presence={presence} />;
 
   const entry = presence.entry;
+  const customCliTarget = supportsCustomCli
+    ? resolveCustomProviderEditTarget({ entry, config })
+    : null;
   const shownInstallation = readShownInstallation({
     entry,
     installation: installation.state,
@@ -116,6 +150,14 @@ export function ProviderDetail({
         updates={installation.updates}
         action={installation.action}
       />
+      {customCliTarget ? (
+        <CustomCliSection
+          key={`${serverId}:${customCliTarget.initialProvider.providerId}`}
+          serverId={serverId}
+          target={customCliTarget}
+          sheetFrame={sheetFrame}
+        />
+      ) : null}
       {sections.models ? (
         <ProviderModels
           serverId={serverId}
@@ -229,6 +271,53 @@ function Troubleshooting({
         provider={entry.provider}
         visible={diagnosticOpen}
         onClose={closeDiagnostic}
+      />
+    </SettingsSection>
+  );
+}
+
+function CustomCliSection({
+  serverId,
+  target,
+  sheetFrame,
+}: {
+  serverId: string;
+  target: CustomProviderEditTarget;
+  sheetFrame?: ProviderSheetFrame;
+}) {
+  const { t } = useTranslation();
+  const [editing, setEditing] = useState(false);
+  const openEdit = useCallback(() => setEditing(true), []);
+  const closeEdit = useCallback(() => setEditing(false), []);
+  const configuredCommand = target.initialProvider.command?.join(" ");
+  const isBuiltin = target.targetKind === "builtin";
+
+  return (
+    <SettingsSection title={t("settings.providers.customCli.sectionTitle")}>
+      <SettingsCard>
+        <SettingsDetailRow
+          label={
+            isBuiltin
+              ? t("settings.providers.customCli.overrideAction")
+              : t("settings.providers.customCli.editAction")
+          }
+          hint={
+            configuredCommand ||
+            (isBuiltin
+              ? t("settings.providers.customCli.overrideHint")
+              : t("settings.providers.customCli.editHint"))
+          }
+          onPress={openEdit}
+          testID="provider-edit-custom-cli"
+        />
+      </SettingsCard>
+      <CustomProviderCliFormSheet
+        mode="edit"
+        target={target}
+        serverId={serverId}
+        visible={editing}
+        onClose={closeEdit}
+        frame={sheetFrame}
       />
     </SettingsSection>
   );

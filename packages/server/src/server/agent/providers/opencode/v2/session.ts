@@ -20,6 +20,7 @@ import type {
   AgentRunOptions,
   AgentSession,
   AgentSessionConfig,
+  AgentSlashCommand,
   AgentStreamEvent,
   SteerActiveTurnOptions,
   SteerResult,
@@ -64,6 +65,7 @@ export class OpenCodeV2Session implements AgentSession {
   private history: SessionMessageInfo[] = [];
   private readonly background: OpenCodeBackgroundInventory;
   private modes: AgentMode[] = [];
+  private commandCache: AgentSlashCommand[] = [];
   constructor(
     private connection: V2Connection,
     private info: SessionInfo,
@@ -423,9 +425,18 @@ export class OpenCodeV2Session implements AgentSession {
       throw error;
     }
   }
-  async listCommands() {
-    await this.reconnectIfExited();
-    return commands(this.client, this.config.cwd);
+  async listCommands(options?: { allowLaunch?: boolean }): Promise<AgentSlashCommand[]> {
+    if (options?.allowLaunch === false && (this.closed || this.exited)) {
+      return this.commandCache;
+    }
+    try {
+      if (options?.allowLaunch !== false) await this.reconnectIfExited();
+      this.commandCache = await commands(this.client, this.config.cwd);
+      return this.commandCache;
+    } catch (error) {
+      if (options?.allowLaunch === false) return this.commandCache;
+      throw error;
+    }
   }
   describePersistence(): AgentPersistenceHandle {
     return {

@@ -18,9 +18,21 @@ export class AgentNotFoundError extends Error {
   }
 }
 
+export class AgentReadRequiresLaunchError extends Error {
+  constructor() {
+    super("Open the agent to load more provider history");
+    this.name = "AgentReadRequiresLaunchError";
+  }
+}
+
 interface PendingAgentInitialization {
   promise: Promise<ManagedAgent>;
-  state: { broadcastTimeline: boolean; session: ManagedAgent["session"]; failed: boolean };
+  state: {
+    broadcastTimeline: boolean;
+    session: ManagedAgent["session"];
+    failed: boolean;
+    blockedForRead: boolean;
+  };
 }
 
 const pendingByManager = new WeakMap<AgentLoaderManager, Map<string, PendingAgentInitialization>>();
@@ -41,6 +53,7 @@ export interface EnsureAgentLoadedDeps {
   validProviders?: Iterable<AgentProvider>;
   broadcastTimeline?: boolean;
   purpose?: "history" | "interactive";
+  canLaunchForRead?: (provider: AgentProvider) => boolean;
   logger: Logger;
 }
 
@@ -84,7 +97,9 @@ export async function ensureAgentLoaded(
   await deps.agentManager.waitForAgentClose?.(agentId);
   // A failed attempt can close its temporary history reader before the lane
   // releases. Callers already waiting on that attempt share its error.
-  if (observed?.state.failed) return observed.promise;
+  if (observed?.state.failed && !(observed.state.blockedForRead && !deps.canLaunchForRead)) {
+    return observed.promise;
+  }
 
   let inflight = pendingAgentInitializations.get(agentId);
   let existing = deps.agentManager.getAgent(agentId);
@@ -98,7 +113,7 @@ export async function ensureAgentLoaded(
 
   if (inflight) {
     inflight.state.broadcastTimeline ||= deps.broadcastTimeline === true;
-    return inflight.promise;
+    return joinPendingLoad(agentId, deps, inflight);
   }
 
   // Concurrent callers share the outcome even if the initialization finished
@@ -106,46 +121,31 @@ export async function ensureAgentLoaded(
   if (existing?.session && existing.session === observed?.state.session) {
     return observed.promise;
   }
-  if (existing && existing.historyPrimed !== false) return existing;
+  if (existing && canReuseAgentForLoad(existing, deps)) {
+    return existing;
+  }
 
+  return initializeAgent(agentId, deps, existing, pendingAgentInitializations);
+}
+
+function canReuseAgentForLoad(agent: ManagedAgent, deps: EnsureAgentLoadedDeps): boolean {
+  return agent.historyPrimed !== false || deps.canLaunchForRead?.(agent.provider) === false;
+}
+
+async function initializeAgent(
+  agentId: string,
+  deps: EnsureAgentLoadedDeps,
+  existing: ManagedAgent | null,
+  pendingAgentInitializations: Map<string, PendingAgentInitialization>,
+): Promise<ManagedAgent> {
   const state: PendingAgentInitialization["state"] = {
     broadcastTimeline: deps.broadcastTimeline === true,
     session: null,
     failed: false,
-  };
-  const openStoredAgent = async () => {
-    const record = await deps.agentStorage.get(agentId);
-    if (!record) {
-      throw new AgentNotFoundError(agentId);
-    }
-
-    const validProviders = deps.validProviders ?? deps.agentManager.getRegisteredProviderIds();
-    if (!isStoredAgentProviderAvailable(record, validProviders)) {
-      throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
-    }
-
-    const handle = toAgentPersistenceHandle(validProviders, record.persistence);
-
-    if (handle) {
-      const snapshot = await deps.agentManager.resumeAgentFromPersistence(
-        handle,
-        buildConfigOverrides(record),
-        agentId,
-        { ...extractTimestamps(record), attention: extractAttention(record) },
-        deps.purpose ? { purpose: deps.purpose } : undefined,
-      );
-      deps.logger.info({ agentId, provider: record.provider }, "Agent resumed from persistence");
-      return snapshot;
-    }
-
-    // No provider handle: the manager rereads the record in its lifecycle lane to
-    // preserve any intervening metadata writes while starting the first session.
-    const snapshot = await deps.agentManager.createAgentFromRecord(agentId);
-    deps.logger.info({ agentId, provider: record.provider }, "Agent created from stored config");
-    return snapshot;
+    blockedForRead: false,
   };
   const initPromise = (async () => {
-    const snapshot = existing ?? (await openStoredAgent());
+    const snapshot = existing ?? (await openStoredAgent(agentId, deps));
     state.session = snapshot.session;
     await deps.agentManager.hydrateTimelineFromProvider(agentId, {
       broadcast: () => state.broadcastTimeline,
@@ -154,6 +154,7 @@ export async function ensureAgentLoaded(
     return deps.agentManager.getAgent(agentId) ?? snapshot;
   })().catch((error: unknown) => {
     state.failed = true;
+    state.blockedForRead = error instanceof AgentReadRequiresLaunchError;
     throw error;
   });
 
@@ -167,5 +168,58 @@ export async function ensureAgentLoaded(
     if (current === pending) {
       pendingAgentInitializations.delete(agentId);
     }
+  }
+}
+
+async function openStoredAgent(agentId: string, deps: EnsureAgentLoadedDeps) {
+  const record = await deps.agentStorage.get(agentId);
+  if (!record) {
+    throw new AgentNotFoundError(agentId);
+  }
+  if (deps.canLaunchForRead?.(record.provider) === false) {
+    throw new AgentReadRequiresLaunchError();
+  }
+
+  const validProviders = deps.validProviders ?? deps.agentManager.getRegisteredProviderIds();
+  if (!isStoredAgentProviderAvailable(record, validProviders)) {
+    throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
+  }
+
+  const handle = toAgentPersistenceHandle(validProviders, record.persistence);
+  if (handle && deps.canLaunchForRead?.(handle.provider) === false) {
+    throw new AgentReadRequiresLaunchError();
+  }
+
+  if (handle) {
+    const snapshot = await deps.agentManager.resumeAgentFromPersistence(
+      handle,
+      buildConfigOverrides(record),
+      agentId,
+      { ...extractTimestamps(record), attention: extractAttention(record) },
+      deps.purpose ? { purpose: deps.purpose } : undefined,
+      deps.canLaunchForRead,
+    );
+    deps.logger.info({ agentId, provider: record.provider }, "Agent resumed from persistence");
+    return snapshot;
+  }
+
+  // No provider handle: the manager rereads the record in its lifecycle lane to
+  // preserve any intervening metadata writes while starting the first session.
+  const snapshot = await deps.agentManager.createAgentFromRecord(agentId, deps.canLaunchForRead);
+  deps.logger.info({ agentId, provider: record.provider }, "Agent created from stored config");
+  return snapshot;
+}
+
+async function joinPendingLoad(
+  agentId: string,
+  deps: EnsureAgentLoadedDeps,
+  inflight: PendingAgentInitialization,
+): Promise<ManagedAgent> {
+  try {
+    return await inflight.promise;
+  } catch (error) {
+    // A read may have declined to open the provider. An explicit use can still proceed.
+    if (!(error instanceof AgentReadRequiresLaunchError) || deps.canLaunchForRead) throw error;
+    return ensureAgentLoaded(agentId, deps);
   }
 }

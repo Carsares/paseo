@@ -54,6 +54,9 @@ import {
 } from "../release-check.js";
 import { updatedForNewAgents } from "../update-command.js";
 import { runProviderRefreshActivity } from "../../provider-refresh-deadline.js";
+import { currentCustomProviderLaunch } from "../../scoped-custom-provider-launch.js";
+import { findInstallationLaunchPath } from "../../provider-installation/installation-target.js";
+import { createExternalProcessEnv } from "../../../paseo-env.js";
 import { runProviderTurn } from "../provider-runner.js";
 import {
   checkProviderLaunchAvailable,
@@ -2843,6 +2846,12 @@ export class PiRpcAgentClient implements AgentClient {
     options: FetchCatalogOptions,
     context?: ProviderRefreshContext,
   ): Promise<ProviderCatalog> {
+    const scope = currentCustomProviderLaunch();
+    if (scope && this.runtime) throw new Error("Custom CLI discovery launch is unsupported");
+    const signal =
+      scope?.signal && context
+        ? AbortSignal.any([scope.signal, context.signal])
+        : (scope?.signal ?? context?.signal);
     const providerOptions = PiProviderOptionsSchema.parse(options.providerOptions ?? {});
     const runtime = this.resolveRuntime(providerOptions.rpcTimeoutMs);
     let runtimeSession: PiRuntimeSession | undefined;
@@ -2853,14 +2862,15 @@ export class PiRpcAgentClient implements AgentClient {
       return closePromise;
     };
     const handleAbort = () => void closeSession().catch(() => undefined);
-    context?.signal.addEventListener("abort", handleAbort, { once: true });
+    signal?.addEventListener("abort", handleAbort, { once: true });
     try {
       await runProviderRefreshActivity(context, "runtime.start", async () => {
         runtimeSession = await runtime.startSession({
           cwd: options.scope === "global" ? homedir() : options.cwd,
-          signal: context?.signal,
+          ...(scope ? { protocolMode: "rpc", noSession: true, catalogDiscovery: true } : {}),
+          signal,
         });
-        if (context?.signal.aborted) await closeSession();
+        if (signal?.aborted) await closeSession();
       });
       if (!runtimeSession) throw new Error("Pi catalog runtime did not start");
       const catalogSession = runtimeSession;
@@ -2881,8 +2891,12 @@ export class PiRpcAgentClient implements AgentClient {
         return mapped;
       });
       return { models, modes: [] };
+    } catch (error) {
+      // oxlint-disable-next-line eslint/preserve-caught-error -- Child output can contain secrets.
+      if (scope) throw new Error("Custom CLI discovery failed");
+      throw error;
     } finally {
-      context?.signal.removeEventListener("abort", handleAbort);
+      signal?.removeEventListener("abort", handleAbort);
       await closeSession();
     }
   }
@@ -2912,11 +2926,22 @@ export class PiRpcAgentClient implements AgentClient {
     });
   }
 
-  async isAvailable(): Promise<boolean> {
+  async isAvailable(signal?: AbortSignal, options?: FetchCatalogOptions): Promise<boolean> {
     try {
+      signal?.throwIfAborted();
+      const scope = currentCustomProviderLaunch();
+      if (scope) {
+        if (!scope.active || scope.adapter !== PI_PROVIDER) return false;
+        scope.assertCurrent();
+        return true;
+      }
       const launch = await this.resolvePiLaunch();
-      const availability = await checkProviderLaunchAvailable(launch);
-      return availability.available;
+      return Boolean(
+        await findInstallationLaunchPath(launch.command, {
+          cwd: options?.scope === "workspace" ? options.cwd : homedir(),
+          env: createExternalProcessEnv(process.env, this.runtimeSettings?.env ?? {}),
+        }),
+      );
     } catch {
       return false;
     }

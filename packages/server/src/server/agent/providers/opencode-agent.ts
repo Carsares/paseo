@@ -1464,7 +1464,9 @@ export class OpenCodeAgentClient implements AgentClient {
     this.createOpenCodeClient = deps.createClient ?? createSdkOpenCodeClient;
     this.serverManager =
       deps.serverManager ??
-      OpenCodeServerManager.getInstance(this.logger, runtimeSettings, {
+      new OpenCodeServerManager({
+        logger: this.logger,
+        runtimeSettings,
         managedProcesses: deps.managedProcesses,
         resolveHomeDir: deps.resolveHomeDir,
         createEventSource: ({ serverUrl, processExit, listening, logger: eventLogger }) =>
@@ -3462,6 +3464,7 @@ class OpenCodeAgentSession implements AgentSession {
   private suppressAssistantMessagesUntilIdle = { active: false };
   private partTypes = new Map<string, string>();
   private availableModesCache: AgentMode[] | null = null;
+  private commandCache: AgentSlashCommand[] = [];
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private readonly turnNamespace = randomUUID();
   private nextTurnOrdinal = 0;
@@ -5155,9 +5158,18 @@ class OpenCodeAgentSession implements AgentSession {
     return this.currentMode;
   }
 
-  async listCommands(): Promise<AgentSlashCommand[]> {
-    await this.reconnectIfServerExited();
-    return await listOpenCodeCommandsFromSdk(this.client, this.config.cwd);
+  async listCommands(options?: { allowLaunch?: boolean }): Promise<AgentSlashCommand[]> {
+    if (options?.allowLaunch === false && (this.closed || this.serverExited)) {
+      return this.commandCache;
+    }
+    try {
+      if (options?.allowLaunch !== false) await this.reconnectIfServerExited();
+      this.commandCache = await listOpenCodeCommandsFromSdk(this.client, this.config.cwd);
+      return this.commandCache;
+    } catch (error) {
+      if (options?.allowLaunch === false) return this.commandCache;
+      throw error;
+    }
   }
 
   async setMode(modeId: string): Promise<void> {

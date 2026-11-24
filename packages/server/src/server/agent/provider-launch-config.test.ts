@@ -7,6 +7,7 @@ import {
   checkProviderLaunchAvailable,
   createProviderEnv,
   migrateProviderSettings,
+  ProviderCommandSchema,
   ProviderOverrideSchema,
   resolveProviderLaunch,
   resolveProviderCommandPrefix,
@@ -268,6 +269,25 @@ describe("createProviderEnv", () => {
 });
 
 describe("ProviderOverrideSchema", () => {
+  test("preserves empty and whitespace arguments in both command formats", async () => {
+    const argv = ["my-cli", "", " padded ", " "];
+    expect(ProviderOverrideSchema.parse({ command: argv }).command).toEqual(argv);
+
+    const command = ProviderCommandSchema.parse({ mode: "replace", argv });
+    await expect(resolveProviderCommandPrefix(command, () => "default-cli")).resolves.toEqual({
+      command: "my-cli",
+      args: ["", " padded ", " "],
+    });
+  });
+
+  test.each([{ argv: [] }, { argv: ["", "--flag"] }])(
+    "rejects commands without a nonempty executable ($argv)",
+    ({ argv }) => {
+      expect(ProviderOverrideSchema.safeParse({ command: argv }).success).toBe(false);
+      expect(ProviderCommandSchema.safeParse({ mode: "replace", argv }).success).toBe(false);
+    },
+  );
+
   test("accepts built-in override fields", () => {
     const parsed = ProviderOverrideSchema.parse({
       command: ["custom-claude", "--json"],

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AgentManager } from "../agent-manager.js";
@@ -16,7 +16,10 @@ import type {
 } from "@getpaseo/protocol/messages";
 import { describe, expect, test, vi } from "vitest";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
+import { DaemonConfigStore } from "../../daemon-config-store.js";
 import type { AgentClient, AgentClientInstallation } from "../agent-sdk-types.js";
+import { runCustomProviderCliOperation } from "../custom-provider-cli.js";
+import { attachMutableProviderConfigOwner } from "../mutable-provider-config-owner.js";
 import { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
 import {
   ProviderInstallations,
@@ -100,6 +103,76 @@ function managerWith(input: { plugin?: ProviderRegistration; codex?: AgentClient
 }
 
 describe("provider installation", () => {
+  test("returns static installation metadata for a saved CLI and its derivative without starting either", async () => {
+    const providerOverrides = { inherited: { extends: "codex", label: "Inherited Codex" } };
+    const manager = new ProviderSnapshotManager({ logger: createTestLogger(), providerOverrides });
+    const root = await mkdtemp(path.join(tmpdir(), "paseo-custom-cli-installation-"));
+    const script = path.join(root, "cli.cjs");
+    const marker = path.join(root, "cli-started");
+    const store = new DaemonConfigStore(root, {
+      mcp: { injectIntoAgents: false },
+      providers: providerOverrides,
+      browserTools: { enabled: false },
+      metadataGeneration: { providers: [] },
+      autoArchiveAfterMerge: false,
+      enableTerminalAgentHooks: false,
+      appendSystemPrompt: "",
+    });
+    const detach = attachMutableProviderConfigOwner({
+      store,
+      providerSnapshotManager: manager,
+      updateProviderRegistry: () => undefined,
+    });
+    const fetchRelease = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("Unexpected fetch"));
+    try {
+      await writeFile(
+        script,
+        'require("node:fs").writeFileSync(process.argv[2], "started"); console.log("codex-cli 1.2.3");',
+      );
+      await writeFile(
+        path.join(root, "config.json"),
+        JSON.stringify({ version: 1, agents: { providers: providerOverrides } }),
+      );
+      await expect(
+        runCustomProviderCliOperation(
+          "save",
+          { mode: "edit", providerId: "codex", command: [process.execPath, script, marker] },
+          {
+            configStore: store,
+            isRegisteredProvider: (id) => manager.hasProvider(id),
+            isPluginProvider: (id) => manager.isPluginProvider(id),
+          },
+        ),
+      ).resolves.toEqual({ status: "ok" });
+
+      const { installations } = manager;
+      for (const provider of ["codex", "inherited"]) {
+        for (const refresh of [false, true]) {
+          const options = { refresh };
+          const [installation, updateCheck] = await Promise.all([
+            installations.inspect(provider, options),
+            installations.checkForUpdates(provider, options),
+          ]);
+          expect(installation).toEqual({
+            installUrl: expect.stringMatching(/^https:/u),
+            updateUrl: expect.stringMatching(/^https:/u),
+          });
+          expect(updateCheck).toBeNull();
+        }
+      }
+      await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(fetchRelease).not.toHaveBeenCalled();
+      expect(() => installations.update("codex")).toThrow("Discover this provider");
+    } finally {
+      fetchRelease.mockRestore();
+      detach();
+      manager.destroy();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("exposes links and lets the plugin report not installed when its executable is missing", async () => {
     const contexts: ProviderInstallationContext[] = [];
     const manager = managerWith({
@@ -742,9 +815,15 @@ describe("provider updates", () => {
     expect(update).not.toHaveBeenCalled();
   });
 
-  test.each(["prepared", "published before spawn", "published after spawn"] as const)(
-    "checks the published provider config when a replacement is %s",
-    async (replacement) => {
+  test.each([
+    { change: "launch", when: "prepared", outcome: "updated" },
+    { change: "launch", when: "before spawn", outcome: "failed" },
+    { change: "launch", when: "after spawn", outcome: "unverified" },
+    { change: "display", when: "before spawn", outcome: "updated" },
+    { change: "display", when: "after spawn", outcome: "updated" },
+  ] as const)(
+    "checks the published provider config for a $change edit $when",
+    async ({ change, when, outcome }) => {
       const preflight = Promise.withResolvers<void>();
       const allowSpawn = Promise.withResolvers<void>();
       const started = Promise.withResolvers<void>();
@@ -770,18 +849,21 @@ describe("provider updates", () => {
         installations.update("codex");
         await preflight.promise;
         const next = manager.prepareMutableProviderConfig({
-          codex: { label: "New configuration" },
+          codex:
+            change === "display"
+              ? { label: "New display name", description: "New description" }
+              : { command: ["new-codex"] },
         });
 
-        if (replacement === "published before spawn") next.commit();
+        if (when === "before spawn") next.commit();
         allowSpawn.resolve();
-        if (replacement === "published after spawn") {
+        if (when === "after spawn") {
           await started.promise;
           next.commit();
         }
         allowResult.resolve();
         const result = await done;
-        if (replacement === "published before spawn") {
+        if (outcome === "failed") {
           expect(launch).not.toHaveBeenCalled();
           expect(result.operation).toMatchObject({
             status: "failed",
@@ -791,7 +873,7 @@ describe("provider updates", () => {
           expect(launch).toHaveBeenCalledTimes(1);
           expect(result.operation).toMatchObject({
             status: "succeeded",
-            outcome: replacement === "prepared" ? "updated" : "unverified",
+            outcome,
           });
         }
       } finally {

@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { spawn as spawnTestProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { EventEmitter, once } from "node:events";
 import { type Dirent, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -3902,6 +3902,64 @@ describe("Codex app-server provider", () => {
       argumentHint: "",
       kind: "skill",
     });
+  });
+
+  test("read-only commands keep local and cached Codex commands across a process exit", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "codex-readonly-commands-"));
+    const script = path.join(root, "codex.cjs");
+    const home = path.join(root, "codex-home");
+    const marker = path.join(root, "started");
+    mkdirSync(path.join(home, "prompts"), { recursive: true });
+    writeFileSync(path.join(home, "prompts", "local.md"), "A local prompt.");
+    writeFileSync(marker, "");
+    writeFileSync(
+      script,
+      `
+        require("node:fs").appendFileSync(${JSON.stringify(marker)}, "started\\n");
+        const skills = [{ name: "cached-skill", description: "Cached skill", path: "/skill/SKILL.md" }];
+        const results = {
+          initialize: { userAgent: "codex/0.150.0" },
+          "config/read": { config: {} },
+          "model/list": { data: [] },
+          "collaborationMode/list": { data: [] },
+          "skills/list": { data: [{ skills }] },
+        };
+        require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
+          const { id, method } = JSON.parse(line);
+          if (id !== undefined) console.log(JSON.stringify({ id, result: results[method] ?? {} }));
+        });
+      `,
+    );
+    const children: ChildProcessWithoutNullStreams[] = [];
+    const session = new CodexAppServerAgentSession(
+      createConfig({ cwd: root }),
+      null,
+      createTestLogger(),
+      async () => {
+        const child = spawnTestProcess(process.execPath, [script], { cwd: root, stdio: "pipe" });
+        children.push(child);
+        return child;
+      },
+      { codexHome: home },
+    );
+    try {
+      const read = async () =>
+        (await session.listCommands({ allowLaunch: false })).map(({ name }) => name);
+      expect(await read()).toEqual(["compact", "prompts:local"]);
+      expect(readFileSync(marker, "utf8")).toBe("");
+
+      await session.connect();
+      expect(await read()).toEqual(["cached-skill", "compact", "prompts:local"]);
+      const exited = once(children[0]!, "exit");
+      children[0]!.kill();
+      await exited;
+
+      expect(await read()).toEqual(["cached-skill", "compact", "prompts:local"]);
+      expect(readFileSync(marker, "utf8")).toBe("started\n");
+    } finally {
+      await session.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("lists custom prompts from the CODEX_HOME a custom provider runs Codex with", async () => {

@@ -1,5 +1,5 @@
 import { constants, existsSync } from "node:fs";
-import { access, realpath, stat } from "node:fs/promises";
+import { access, open, realpath, stat } from "node:fs/promises";
 import { delimiter, isAbsolute, resolve } from "node:path";
 import type { ProcessEnvRecord } from "../server/paseo-env.js";
 import { execCommand } from "../utils/spawn.js";
@@ -123,6 +123,8 @@ export interface ExecutableFileLookupOptions {
   winGetFallback?: boolean;
   /** Preserve the working-directory search for callers that previously used cmd.exe. */
   searchWindowsLaunchDirectory?: boolean;
+  /** Skip a POSIX script if its declared absolute interpreter cannot execute. */
+  skipMissingInterpreter?: boolean;
 }
 
 // Windows child processes receive the first spelling after sorting environment keys.
@@ -142,11 +144,37 @@ async function isPosixExecutableFile(candidate: string): Promise<boolean> {
   }
 }
 
-async function findPosixExecutableFile(name: string, cwd: string, searchPath: string) {
+async function missingPosixInterpreter(candidate: string): Promise<boolean> {
+  const file = await open(candidate, constants.O_RDONLY | constants.O_NONBLOCK).catch(() => null);
+  if (!file) return false;
+  try {
+    if (!(await file.stat()).isFile()) return false;
+    const bytes = Buffer.alloc(256);
+    const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+    const line = bytes.indexOf(0x0a);
+    if (line < 0 || line >= bytesRead) return false;
+    const interpreter = /^#![ \t]*(\/[^ \t\n]+)/u.exec(bytes.toString("utf8", 0, line))?.[1];
+    return interpreter !== undefined && !(await isPosixExecutableFile(interpreter));
+  } catch {
+    return false;
+  } finally {
+    await file.close();
+  }
+}
+
+async function findPosixExecutableFile(
+  name: string,
+  cwd: string,
+  searchPath: string,
+  skipMissingInterpreter: boolean,
+) {
+  const isCandidate = async (candidate: string) =>
+    (await isPosixExecutableFile(candidate)) &&
+    (!skipMissingInterpreter || !(await missingPosixInterpreter(candidate)));
   if (name.includes("/")) {
     // The filesystem must traverse symlinks before interpreting a later `..`.
     const command = isAbsolute(name) ? name : `${cwd}/${name}`;
-    if (!(await isPosixExecutableFile(command))) return null;
+    if (!(await isCandidate(command))) return null;
     const normalized = resolve(command);
     if (command === normalized) return command;
     const [actual, regular] = await Promise.all([
@@ -159,7 +187,7 @@ async function findPosixExecutableFile(name: string, cwd: string, searchPath: st
     let directory = entry || cwd;
     if (entry && !isAbsolute(entry)) directory = `${cwd}/${entry}`;
     const candidate = `${directory}${directory.endsWith("/") ? "" : "/"}${name}`;
-    if (await isPosixExecutableFile(candidate)) return candidate;
+    if (await isCandidate(candidate)) return candidate;
   }
   return null;
 }
@@ -190,7 +218,12 @@ export async function findExecutableWithoutProbing(
     });
   }
   const searchPath = options.path ?? env.PATH ?? process.env.PATH ?? "";
-  return findPosixExecutableFile(name, options.cwd, searchPath);
+  return findPosixExecutableFile(
+    name,
+    options.cwd,
+    searchPath,
+    options.skipMissingInterpreter === true,
+  );
 }
 
 export interface ExecutableResolutionOptions {
