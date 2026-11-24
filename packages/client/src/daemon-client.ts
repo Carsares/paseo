@@ -2347,6 +2347,15 @@ export class DaemonClient {
   private sendSessionMessageOrThrow(message: SessionInboundMessage): Promise<void> {
     return this.sendWhenConnected(() => {
       const payload = SessionInboundMessageSchema.parse(message);
+      // Creation retries can cross a reconnect. Check the host that will receive the request.
+      if (
+        payload.type === "workspace.worktree.resolve_start_point.request" ||
+        (payload.type === "workspace.create.request" &&
+          payload.source.kind === "worktree" &&
+          payload.source.startPoint !== undefined)
+      ) {
+        this.requireWorkspaceFixedStartPoint();
+      }
       return this.sendSessionPayload(payload);
     });
   }
@@ -5951,13 +5960,8 @@ export class DaemonClient {
     input: CreateWorkspaceRequestOptions,
     requestId?: string,
   ): Promise<WorkspaceCreatePayload> {
-    this.assertAgentCreationFeatures(input.agent);
+    this.assertWorkspaceCreationFeatures(input);
     const resolvedRequestId = this.createRequestId(requestId ?? input.requestId);
-    if (input.background !== undefined || input.callerAgentId) this.requireBackgroundWorkspaces();
-    if (input.agent?.background !== undefined)
-      throw new Error("Configure background on the workspace, not its initial agent.");
-    if (input.metadata !== undefined || input.agent?.metadata !== undefined)
-      this.requireEntityMetadata();
     const mainAgent = input.mainAgent
       ? await this.normalizeWorkspaceMainAgent(input.mainAgent)
       : undefined;
@@ -5978,6 +5982,47 @@ export class DaemonClient {
       setupTerminalId: result.setupTerminalId ?? null,
       requestId: result.requestId ?? resolvedRequestId,
     };
+  }
+
+  private assertWorkspaceCreationFeatures(input: CreateWorkspaceRequestOptions): void {
+    if (input.source.kind === "worktree" && input.source.startPoint !== undefined) {
+      this.requireWorkspaceFixedStartPoint();
+    }
+    this.assertAgentCreationFeatures(input.agent);
+    if (input.background !== undefined || input.callerAgentId) this.requireBackgroundWorkspaces();
+    if (input.agent?.background !== undefined)
+      throw new Error("Configure background on the workspace, not its initial agent.");
+    if (input.metadata !== undefined || input.agent?.metadata !== undefined) {
+      this.requireEntityMetadata();
+    }
+  }
+
+  supportsWorkspaceFixedStartPoint(): boolean {
+    return this.lastServerInfoMessage?.features?.workspaceFixedStartPoint === true;
+  }
+
+  private requireWorkspaceFixedStartPoint(): void {
+    // COMPAT(workspaceFixedStartPoint): added in v0.17.0, remove gate after 2027-05-24 once the daemon floor supports fixed start points.
+    if (!this.supportsWorkspaceFixedStartPoint()) {
+      throw new Error("Update the host to create worktrees from a fixed start point.");
+    }
+  }
+
+  async resolveWorkspaceWorktreeStartPoint(input: {
+    cwd?: string;
+    projectId?: string;
+    refName?: string;
+  }): Promise<{ commitSha: string; refName: string }> {
+    this.requireWorkspaceFixedStartPoint();
+    const { cwd, projectId, refName } = input;
+    const payload = await this.sendCorrelatedSessionRequest({
+      message: { type: "workspace.worktree.resolve_start_point.request", cwd, projectId, refName },
+      responseType: "workspace.worktree.resolve_start_point.response",
+    });
+    if (payload.error !== null || !payload.commitSha || !payload.refName) {
+      throw new Error(payload.error ?? "Failed to resolve worktree start point.");
+    }
+    return { commitSha: payload.commitSha, refName: payload.refName };
   }
 
   private async normalizeWorkspaceMainAgent(

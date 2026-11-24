@@ -120,6 +120,26 @@ test("workspace readiness is observable before provider startup and duplicate re
   expect(f.calls).toEqual(["workspace", "agent", "prompt"]);
 });
 
+test.each([
+  { started: true, confirmation: true },
+  { started: false, confirmation: undefined },
+])(
+  "a new connection reads the first prompt confirmation when started=$started",
+  async ({ started, confirmation }) => {
+    const f = await fixture();
+    f.input.createAgent = async (_id, _workspace, onReady) => {
+      await onReady(agent);
+      return { agent, initialPromptStarted: started };
+    };
+    await f.service.create(f.input);
+    const restored = new CreationService(f.directory, silentLogger);
+    const { snapshot, unsubscribe } = await restored.subscribe("workspace", f.input.key, () => {});
+    unsubscribe();
+    expect(snapshot).toMatchObject({ phase: "completed", agent: expect.any(Object) });
+    expect(snapshot?.initialPromptStarted).toBe(confirmation);
+  },
+);
+
 test("a failed agent startup retries only that stage with the reserved IDs", async () => {
   const f = await fixture();
   let attempts = 0;

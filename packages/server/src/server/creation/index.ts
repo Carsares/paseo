@@ -200,9 +200,15 @@ export class CreationService {
           record.snapshot.mainAgent,
         );
         record.inFlight = null;
-        if (initialPromptStarted)
-          await this.publish(identity, record, { phase: "prompt_started", agent });
-        else record.snapshot = { ...record.snapshot, agent };
+        if (initialPromptStarted) {
+          await this.publish(identity, record, {
+            phase: "prompt_started",
+            agent,
+            initialPromptStarted: true,
+          });
+        } else {
+          record.snapshot = { ...record.snapshot, agent };
+        }
       }
       record.inFlight = null;
       await this.publish(identity, record, { phase: "completed" });

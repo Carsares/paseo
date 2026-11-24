@@ -3,12 +3,21 @@ import type { CreateWorkspaceRequestOptions } from "@getpaseo/client/internal/da
 import type { AgentSnapshotPayload, CreationSnapshot } from "@getpaseo/protocol/messages";
 import { encodeImages } from "@/utils/encode-images";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import type { ReactNode } from "react";
 import { useIsFocused } from "expo-router/react-navigation";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
-import { ActivityIndicator, Text, View } from "react-native";
+import { ActivityIndicator, ScrollView, Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { createNameId } from "mnemonic-id";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -27,6 +36,11 @@ import { MenuHeader } from "@/components/headers/menu-header";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { useToast } from "@/contexts/toast-context";
 import { useAgentInputDraft } from "@/composer/draft/input-draft";
+import {
+  findWorkspaceBatchModel,
+  type WorkspaceBatchModel,
+} from "@/composer/agent-controls/model-sheet-flow";
+import { useStableEvent } from "@/hooks/use-stable-event";
 import {
   canChooseWorkspaceMain,
   workspaceMainBlockMessage,
@@ -157,10 +171,22 @@ import { useNewWorkspaceForm } from "./new-workspace/form";
 import { DraftTitleEditor } from "./new-workspace/draft-title-editor";
 import { createOrRetryWorkspaceMain } from "./new-workspace/create-explicit-main";
 import {
+  prepareWorkspaceMainBatch,
+  resolveBatchModelConfig,
+  runWorkspaceMainBatch,
+  workspaceBatchBlock,
+  workspaceMainBatchAgentTarget,
+} from "./new-workspace/main-batch";
+import {
+  canCoordinateMainDraftWindows,
   readMainDraft,
   restoreMainDraftAtTarget,
+  subscribeToMainDraftBatch,
+  withMainDraftOperation,
   writeMainDraft,
   type MainDraft,
+  type MainDraftBatch,
+  type MainDraftBatchItem,
   type MainDraftTarget,
 } from "./new-workspace/main-draft";
 import { ImportSessionButton } from "./new-workspace/import-session-button";
@@ -1223,11 +1249,31 @@ function useMainDraftSelection(id: string, initial: MainDraft | null) {
   const [restoredMainTarget, setRestoredMainTarget] = useState(() => initial?.target ?? null);
   const [mainDraft, setMainDraft] = useState(initial);
   const mainDraftRef = useRef(initial);
-  const saveMainDraft = useCallback(
-    (next: MainDraft | null) => {
+  useLayoutEffect(() => {
+    let reading = true;
+    const accept = (next: MainDraft | null) => {
+      reading = false;
       mainDraftRef.current = next;
       setMainDraft(next);
-      return writeMainDraft(id, next);
+    };
+    const unsubscribe = subscribeToMainDraftBatch(id, accept);
+    // The screen's initial query can finish before another view commits its last update.
+    async function refreshBatch() {
+      const next = await readMainDraft(id);
+      if (reading && (next?.batch || mainDraftRef.current?.batch)) accept(next);
+    }
+    void refreshBatch().catch(() => {});
+    return () => {
+      reading = false;
+      unsubscribe();
+    };
+  }, [id]);
+  const saveMainDraft = useCallback(
+    async (next: MainDraft | null, durable = false) => {
+      if (durable) await writeMainDraft(id, next);
+      mainDraftRef.current = next;
+      setMainDraft(next);
+      if (!durable) await writeMainDraft(id, next);
     },
     [id],
   );
@@ -1237,8 +1283,171 @@ function useMainDraftSelection(id: string, initial: MainDraft | null) {
     mainDraft,
     mainDraftRef,
     mainAttempt: mainDraft?.attempt,
+    mainBatch: mainDraft?.batch,
     saveMainDraft,
   };
+}
+
+function resolveDraftBatchAvailability({
+  isolation,
+  selectedItem,
+  branchAction,
+  hasDraftText,
+  attachmentCount,
+  clientReady,
+  supportsCreateAsMain,
+  supportsFixedStartPoint,
+}: {
+  isolation: MainDraftTarget["isolation"];
+  selectedItem: PickerItem | null;
+  branchAction: string;
+  hasDraftText: boolean;
+  attachmentCount: number;
+  clientReady: boolean;
+  supportsCreateAsMain: boolean;
+  supportsFixedStartPoint: boolean;
+}) {
+  return workspaceBatchBlock({
+    isolation,
+    isBranchOff: selectedItem?.kind !== "github-pr" && branchAction === "branch-off",
+    hasContent: hasDraftText || attachmentCount > 0,
+    connected: clientReady,
+    supported: supportsCreateAsMain && supportsFixedStartPoint,
+    canCoordinateWindows: canCoordinateMainDraftWindows(),
+  });
+}
+
+type BatchAction = Parameters<typeof runWorkspaceMainBatch>[0]["action"];
+
+function BatchResultRow({
+  item,
+  serverId,
+  disabled,
+  onAction,
+}: {
+  item: MainDraftBatchItem;
+  serverId: string;
+  disabled: boolean;
+  onAction: (action: BatchAction) => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const target = workspaceMainBatchAgentTarget(serverId, item);
+  const open = useCallback(() => {
+    if (target) navigateToWorkspace(target);
+  }, [target]);
+  const act = useCallback(() => {
+    if (item.stage === "queued") {
+      void onAction({ kind: "resume" });
+      return;
+    }
+    void onAction({
+      kind: item.stage === "retryable" ? "retry" : "check",
+      workspaceId: item.workspaceId,
+    });
+  }, [item.stage, item.workspaceId, onAction]);
+  let actionLabel = t("newWorkspace.batch.check");
+  if (item.stage === "queued") actionLabel = t("newWorkspace.batch.resume");
+  if (item.stage === "retryable") actionLabel = t("common.actions.retry");
+  return (
+    <View style={styles.batchResult}>
+      <View style={styles.batchResultDetails}>
+        <Text style={styles.batchModelLabel}>
+          {t("newWorkspace.batch.modelLabel", {
+            model: item.model.modelLabel,
+            provider: item.model.providerLabel,
+          })}
+        </Text>
+        <Text accessibilityLiveRegion="polite" style={styles.batchResultStatus}>
+          {t(`newWorkspace.batch.${item.stage}`)}
+        </Text>
+        {item.error ? <Text style={styles.errorText}>{item.error}</Text> : null}
+      </View>
+      <View style={styles.batchResultActions}>
+        {target ? (
+          <Button
+            variant="secondary"
+            onPress={open}
+            accessibilityLabel={t("newWorkspace.batch.openModel", { model: item.model.modelLabel })}
+          >
+            {t("newWorkspace.batch.open")}
+          </Button>
+        ) : null}
+        {item.stage !== "succeeded" ? (
+          <Button variant="outline" disabled={disabled} onPress={act}>
+            {actionLabel}
+          </Button>
+        ) : null}
+      </View>
+    </View>
+  );
+}
+
+function WorkspaceMainBatchResults({
+  draft,
+  currentServerId,
+  canRun,
+  pending,
+  onAction,
+  onFinish,
+}: {
+  draft: MainDraft | null;
+  currentServerId: string;
+  canRun: boolean;
+  pending: boolean;
+  onAction: (action: BatchAction) => Promise<void>;
+  onFinish: () => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const finish = useCallback(() => void onFinish(), [onFinish]);
+  if (!draft?.batch) return null;
+  const { items } = draft.batch;
+  const { serverId } = draft.target;
+  const disabled = !canRun || serverId !== currentServerId || pending;
+  return (
+    <ScrollView
+      style={styles.batchResults}
+      contentContainerStyle={styles.batchResultList}
+      testID="workspace-batch-results"
+    >
+      {items.map((item) => (
+        <BatchResultRow
+          key={item.workspaceId}
+          item={item}
+          serverId={serverId}
+          disabled={disabled}
+          onAction={onAction}
+        />
+      ))}
+      {items.every((item) => item.stage === "succeeded") ? (
+        <Button variant="secondary" onPress={finish}>
+          {t("newWorkspace.batch.finish")}
+        </Button>
+      ) : null}
+    </ScrollView>
+  );
+}
+
+function workspaceRefPickerEmptyText(
+  t: TFunction,
+  fetchingBranches: boolean,
+  fetchingRequests: boolean,
+) {
+  return fetchingBranches || fetchingRequests
+    ? t("newWorkspace.refPicker.searching")
+    : t("newWorkspace.refPicker.noMatchingRefs");
+}
+
+function draftModelCount(draft: MainDraft | null) {
+  return draft?.models?.length ?? 0;
+}
+
+function WorkspaceCreationError({ message }: { message: string | null }) {
+  if (!message) return null;
+  return (
+    <Text accessibilityRole="alert" style={styles.errorText}>
+      {message}
+    </Text>
+  );
 }
 
 function NewWorkspaceForm({
@@ -1263,6 +1472,7 @@ function NewWorkspaceForm({
     mainDraft,
     mainDraftRef,
     mainAttempt,
+    mainBatch,
     saveMainDraft,
   } = useMainDraftSelection(creationIdentity.draftId, restoredMainDraft);
   const beforeIsolationChange = useRef<SetupEffects["beforeIsolationChange"]>(undefined);
@@ -1371,10 +1581,17 @@ function NewWorkspaceForm({
   const [manualLaunchTarget, setManualLaunchTarget] = useState<LaunchTarget | null>(null);
   const launchTarget = useMemo(
     () =>
-      isTimelineFork || (mainDraft && !manualLaunchTarget)
+      isTimelineFork || mainBatch || (mainDraft && !manualLaunchTarget)
         ? CHAT_LAUNCH_TARGET
         : resolveLaunchTarget(manualLaunchTarget ?? formPreferences.launchTarget, terminalProfiles),
-    [isTimelineFork, mainDraft, manualLaunchTarget, formPreferences.launchTarget, terminalProfiles],
+    [
+      isTimelineFork,
+      mainBatch,
+      mainDraft,
+      manualLaunchTarget,
+      formPreferences.launchTarget,
+      terminalProfiles,
+    ],
   );
   const [terminalPromptText, setTerminalPromptText] = useState("");
   const {
@@ -1447,6 +1664,15 @@ function NewWorkspaceForm({
     }),
   });
   const composerState = chatDraft.composerState;
+  const readHasDraftText = useCallback(
+    () => Boolean(chatDraft.textSource.getSnapshot().trim()),
+    [chatDraft.textSource],
+  );
+  const hasDraftText = useSyncExternalStore(
+    chatDraft.textSource.subscribe,
+    readHasDraftText,
+    readHasDraftText,
+  );
   const supportsWorktreeList = useHostFeature(selectedServerId, "checkoutWorktreeList");
   const projectWorktrees = useProjectWorktrees({
     client,
@@ -1562,6 +1788,18 @@ function NewWorkspaceForm({
     [choice, selectedProjectId, selectedServerId, selectedSourceDirectory, workingDirectory],
   );
   const supportsCreateAsMain = useHostFeature(selectedServerId, "agentCreateAsMain");
+  // COMPAT(workspaceFixedStartPoint): added after v0.17.0-beta.1, remove after 2027-05-24.
+  const supportsFixedStartPoint = useHostFeature(selectedServerId, "workspaceFixedStartPoint");
+  const batchBlock = resolveDraftBatchAvailability({
+    isolation: choice,
+    selectedItem,
+    branchAction: refActionFor.branch,
+    hasDraftText,
+    attachmentCount: chatDraft.attachments.length,
+    clientReady,
+    supportsCreateAsMain,
+    supportsFixedStartPoint,
+  });
   const assertExplicitMainSupported = useCallback(() => {
     // COMPAT(agentCreateAsMain): added in v0.17.0-beta.1, remove gate after 2027-05-22.
     if (!selectHostFeature(useSessionStore.getState(), selectedServerId, "agentCreateAsMain")) {
@@ -1572,7 +1810,11 @@ function NewWorkspaceForm({
     toast.error(workspaceMainBlockMessage(t, "unknown"));
   }, [t, toast]);
   const forgetMainTarget = useCallback(() => {
-    if (mainDraftRef.current?.attempt || pendingExplicitMainSubmissions.has(creationDraftId))
+    if (
+      mainDraftRef.current?.attempt ||
+      mainDraftRef.current?.batch ||
+      pendingExplicitMainSubmissions.has(creationDraftId)
+    )
       return false;
     setRestoredMainTarget(null);
     if (mainDraftRef.current) void saveMainDraft(null).catch(reportMainDraftStorageError);
@@ -1586,7 +1828,11 @@ function NewWorkspaceForm({
   ]);
   useLayoutEffect(() => {
     beforeIsolationChange.current = (next) => {
-      if (mainDraftRef.current?.attempt || pendingExplicitMainSubmissions.has(creationDraftId))
+      if (
+        mainDraftRef.current?.attempt ||
+        mainDraftRef.current?.batch ||
+        pendingExplicitMainSubmissions.has(creationDraftId)
+      )
         return false;
       if (typeof next === "string" ? next === choice : next.path === existingWorktreePath)
         return true;
@@ -1606,10 +1852,10 @@ function NewWorkspaceForm({
     const checked = Boolean(restoreMainDraftAtTarget(mainDraft, mainTarget));
     return {
       checked,
-      disabled: Boolean(mainAttempt) || (!checked && !supportsCreateAsMain),
+      disabled: Boolean(mainAttempt || mainBatch) || (!checked && !supportsCreateAsMain),
       hint: supportsCreateAsMain ? undefined : workspaceMainBlockMessage(t, "unsupported"),
       onChange: (next: boolean) => {
-        if (mainAttempt || pendingExplicitMainSubmissions.has(creationDraftId)) return;
+        if (mainAttempt || mainBatch || pendingExplicitMainSubmissions.has(creationDraftId)) return;
         if (next && !supportsCreateAsMain) return;
         setRestoredMainTarget(null);
         if (mainTarget.isolation === "existing") setup.chooseExistingWorktree(mainTarget.directory);
@@ -1623,6 +1869,7 @@ function NewWorkspaceForm({
     forkDraftSetup?.setup,
     isTerminalLaunch,
     mainAttempt,
+    mainBatch,
     mainDraft,
     mainTarget,
     reportMainDraftStorageError,
@@ -1640,9 +1887,17 @@ function NewWorkspaceForm({
       target: launchTarget,
       onChange: setManualLaunchTarget,
       profiles: terminalProfiles,
-      disabled: isPending || isTimelineFork || Boolean(mainAttempt),
+      disabled: isPending || isTimelineFork || Boolean(mainAttempt || mainBatch),
     }),
-    [isPending, isTimelineFork, launchTarget, mainAttempt, selectedServerId, terminalProfiles],
+    [
+      isPending,
+      isTimelineFork,
+      launchTarget,
+      mainAttempt,
+      mainBatch,
+      selectedServerId,
+      terminalProfiles,
+    ],
   );
 
   const branchSuggestionsQuery = useQuery({
@@ -1842,7 +2097,7 @@ function NewWorkspaceForm({
   }, []);
 
   const prepareWorkspacePlacement = useCallback(
-    async (createSeparateMain: boolean, agentConfig?: ForkAgentIntent["config"]) => {
+    async (createSeparateMain: boolean, agentConfig?: ForkAgentIntent["config"], batch = false) => {
       if (!selectedProject || !selectedProjectId) throw new Error("Choose a project");
       if (!selectedSourceDirectory || !workingDirectory) {
         throw new Error("Choose a host for this project");
@@ -1876,13 +2131,14 @@ function NewWorkspaceForm({
         agentConfig,
         createMainAgent: createSeparateMain,
       });
-      const title = await useWorkspaceDraftSubmissionStore
-        .getState()
-        .submitDraftTitle(creationDraftId);
+      const title = batch
+        ? creationIdentity.title
+        : await useWorkspaceDraftSubmissionStore.getState().submitDraftTitle(creationDraftId);
       return { source, title, metadata };
     },
     [
       creationDraftId,
+      creationIdentity.title,
       creationIdentity.worktreeSlug,
       effectiveIsolation,
       isTimelineFork,
@@ -1903,10 +2159,8 @@ function NewWorkspaceForm({
 
   const assertNoMainAttempt = useCallback(async () => {
     if (draftId) return;
-    if (
-      pendingExplicitMainSubmissions.has(creationDraftId) ||
-      (await readMainDraft(creationDraftId))?.attempt
-    ) {
+    const saved = await readMainDraft(creationDraftId);
+    if (pendingExplicitMainSubmissions.has(creationDraftId) || saved?.attempt || saved?.batch) {
       throw new Error(workspaceMainBlockMessage(t, "unknown"));
     }
   }, [creationDraftId, draftId, t]);
@@ -1956,6 +2210,176 @@ function NewWorkspaceForm({
     ],
   );
 
+  const acceptWorkspaceMainSnapshots = useCallback(
+    (
+      workspace: Parameters<typeof normalizeWorkspaceDescriptor>[0],
+      agent?: AgentSnapshotPayload,
+    ) => {
+      const normalized = normalizeWorkspaceDescriptor(workspace);
+      mergeWorkspaces(selectedServerId, [
+        agent ? { ...normalized, hasActiveMainAgent: true } : normalized,
+      ]);
+      if (agent) {
+        getHostRuntimeStore().acceptAgentSnapshot(
+          selectedServerId,
+          normalizeAgentSnapshot(agent, selectedServerId),
+        );
+      }
+    },
+    [mergeWorkspaces, selectedServerId],
+  );
+
+  const assertBatchSupported = useCallback(() => {
+    assertExplicitMainSupported();
+    if (!withConnectedClient().supportsWorkspaceFixedStartPoint()) {
+      throw new Error(t("newWorkspace.batch.unsupported"));
+    }
+  }, [assertExplicitMainSupported, t, withConnectedClient]);
+
+  const buildBatchAgentConfig = useStableEvent((model: WorkspaceBatchModel, cwd: string) => {
+    if (!composerState) throw new Error(t("newWorkspace.errors.composerStateRequired"));
+    const selectedModel = findWorkspaceBatchModel(
+      composerState.modelSelectorProviders,
+      model.provider,
+      model.modelId,
+    );
+    const provider = composerState.allProviderEntries?.find(
+      (entry) => entry.provider === model.provider,
+    );
+    if (!selectedModel || !provider?.enabled || provider.status !== "ready") {
+      throw new Error(t("newWorkspace.batch.modelUnavailable", { model: model.modelLabel }));
+    }
+    const current = composerState.selectedProvider
+      ? buildWorkspaceAgentConfig(cwd, composerState.selectedProvider, composerState)
+      : null;
+    const definition = composerState.providerDefinitionMap.get(model.provider);
+    return resolveBatchModelConfig({
+      cwd,
+      model,
+      current,
+      availableModels: composerState.allProviderModels.get(model.provider) ?? [],
+      modes: provider.modes ?? definition?.modes ?? [],
+      defaultModeId: definition?.defaultModeId ?? undefined,
+    });
+  });
+
+  const runSavedBatch = useStableEvent(
+    async (draft: MainDraft, action: Parameters<typeof runWorkspaceMainBatch>[0]["action"]) => {
+      if (!draft.batch || draft.target.serverId !== selectedServerId) return;
+      await runWorkspaceMainBatch({
+        batch: draft.batch,
+        action,
+        client: withConnectedClient(),
+        save: (batch) => saveMainDraft({ ...draft, batch }, true),
+        acceptSnapshots: acceptWorkspaceMainSnapshots,
+        assertSupported: assertBatchSupported,
+        failedMessage: t("composer.errors.failedToCreateAgent"),
+      });
+    },
+  );
+
+  const handleBatchAction = useStableEvent(
+    async (action: Parameters<typeof runWorkspaceMainBatch>[0]["action"]) => {
+      if (pendingExplicitMainSubmissions.has(creationDraftId)) return;
+      pendingExplicitMainSubmissions.add(creationDraftId);
+      setPendingAction("chat");
+      setErrorMessage(null);
+      try {
+        await withMainDraftOperation(creationDraftId, async () => {
+          const draft = await readMainDraft(creationDraftId);
+          if (draft) await runSavedBatch(draft, action);
+        });
+      } catch (error) {
+        setErrorMessage(workspaceCreationErrorMessage(t, error, true));
+      } finally {
+        pendingExplicitMainSubmissions.delete(creationDraftId);
+        setPendingAction(null);
+      }
+    },
+  );
+  const hasBatch = Boolean(mainBatch);
+  useEffect(() => {
+    if (hasBatch && clientReady) void handleBatchAction({ kind: "resume" });
+  }, [client, clientReady, handleBatchAction, hasBatch]);
+
+  const finishWorkspaceMainBatch = useStableEvent(async () => {
+    if (
+      pendingExplicitMainSubmissions.has(creationDraftId) ||
+      !mainDraftRef.current?.batch?.items.every((item) => item.stage === "succeeded")
+    )
+      return;
+    pendingExplicitMainSubmissions.add(creationDraftId);
+    const clearConsumedDraft = captureWorkspaceDraftCleanup({
+      draftId: creationDraftId,
+      draftKey,
+      draftContextScopeKey,
+      clearDraft: chatDraft.clear,
+    });
+    try {
+      await withMainDraftOperation(creationDraftId, async () => {
+        const saved = await readMainDraft(creationDraftId);
+        if (!saved?.batch?.items.every((item) => item.stage === "succeeded")) return;
+        await useWorkspaceDraftSubmissionStore.getState().finishDraftTitle(creationDraftId);
+        await writeMainDraft(creationDraftId, null, { finishBatch: true });
+        clearConsumedDraft();
+      });
+    } catch (error) {
+      setErrorMessage(toErrorMessage(error));
+    } finally {
+      pendingExplicitMainSubmissions.delete(creationDraftId);
+    }
+  });
+
+  const startWorkspaceMainBatch = useStableEvent(
+    async (payload: MessagePayload, draft: MainDraft) => {
+      const blocked = workspaceBatchBlock({
+        isolation: draft.target.isolation,
+        isBranchOff:
+          setup.getSnapshot().pickerSelection.selectedItem?.kind !== "github-pr" &&
+          setup.refActionFor("branch") === "branch-off",
+        hasContent: !isEmptyWorkspaceSubmission(payload),
+        connected: clientReady,
+        supported: supportsCreateAsMain && supportsFixedStartPoint,
+        canCoordinateWindows: canCoordinateMainDraftWindows(),
+      });
+      if (blocked) throw new Error(t(`newWorkspace.batch.${blocked}`));
+      assertBatchSupported();
+      const connectedClient = withConnectedClient();
+      const placement = await prepareWorkspacePlacement(false, undefined, true);
+      const source =
+        placement.source.kind === "worktree" && placement.source.action === undefined
+          ? { ...placement.source, action: "branch-off" as const }
+          : placement.source;
+      const wire = splitComposerAttachmentsForSubmit(payload.attachments, {
+        format: resolveComposerAttachmentSubmitFormat({
+          supportsForgeAttachments: supportsForgeSearch,
+        }),
+      });
+      const images = await encodeImages(wire.images, t("composer.errors.failedToSend"));
+      const metadata = composerState?.metadata;
+      const batch: MainDraftBatch = await prepareWorkspaceMainBatch({
+        placement: { ...placement, source },
+        models: draft.models ?? [],
+        message: {
+          initialPrompt: payload.text,
+          ...(images?.length ? { images } : {}),
+          ...(wire.attachments?.length ? { attachments: wire.attachments } : {}),
+          ...(metadata && Object.keys(metadata).length > 0 ? { metadata } : {}),
+        },
+        resolveConfig: (model) => buildBatchAgentConfig(model, draft.target.directory),
+        resolveStartPoint: (input) => connectedClient.resolveWorkspaceWorktreeStartPoint(input),
+        invalidSourceMessage: t("newWorkspace.batch.branchOffRequired"),
+        invalidSelectionMessage: t("newWorkspace.errors.selectModel"),
+      });
+      assertBatchSupported();
+      const planned = { target: draft.target, batch };
+      await saveMainDraft(planned, true);
+      leaveFullscreen();
+      const saved = await readMainDraft(creationDraftId);
+      if (saved) await runSavedBatch(saved, { kind: "resume" });
+    },
+  );
+
   const submitExplicitMain = useCallback(
     async (payload: MessagePayload, target: MainDraftTarget) => {
       const clearConsumedDraft = captureWorkspaceDraftCleanup({
@@ -1965,9 +2389,6 @@ function NewWorkspaceForm({
         clearDraft: chatDraft.clear,
       });
       const provider = composerState?.selectedProvider;
-      const config = provider
-        ? buildWorkspaceAgentConfig(target.directory, provider, composerState)
-        : null;
       const metadata = composerState?.metadata;
       const format = resolveComposerAttachmentSubmitFormat({
         supportsForgeAttachments: supportsForgeSearch,
@@ -1976,13 +2397,18 @@ function NewWorkspaceForm({
       const unavailableMessage = workspaceMainBlockMessage(t, "unknown");
       const previous = restoreMainDraftAtTarget(await readMainDraft(creationDraftId), target);
       if (!previous) throw new Error(unavailableMessage);
+      const model = previous.models?.[0];
       const { workspace, agent } = await createOrRetryWorkspaceMain({
         client: withConnectedClient(),
         target,
         previous,
-        save: saveMainDraft,
+        save: (draft) => saveMainDraft({ ...draft, models: previous.models }),
         prepareAgent: async () => {
           if (!composerState) throw new Error(t("newWorkspace.errors.composerStateRequired"));
+          let config = provider
+            ? buildWorkspaceAgentConfig(target.directory, provider, composerState)
+            : null;
+          if (model) config = buildBatchAgentConfig(model, target.directory);
           if (!config) throw new Error(t("newWorkspace.errors.selectModel"));
           const images = await encodeImages(wire.images, t("composer.errors.failedToSend"));
           await composerState.persistFormPreferences();
@@ -2003,12 +2429,7 @@ function NewWorkspaceForm({
         inProgressMessage: t("panels.draft.creatingAgent"),
         failedMessage: t("composer.errors.failedToCreateAgent"),
       });
-      const normalizedWorkspace = normalizeWorkspaceDescriptor(workspace);
-      mergeWorkspaces(selectedServerId, [{ ...normalizedWorkspace, hasActiveMainAgent: true }]);
-      getHostRuntimeStore().acceptAgentSnapshot(
-        selectedServerId,
-        normalizeAgentSnapshot(agent, selectedServerId),
-      );
+      acceptWorkspaceMainSnapshots(workspace, agent);
       clearConsumedDraft();
       if (isStillOnCreateScreen()) {
         leaveFullscreen();
@@ -2026,6 +2447,8 @@ function NewWorkspaceForm({
     },
     [
       assertExplicitMainSupported,
+      acceptWorkspaceMainSnapshots,
+      buildBatchAgentConfig,
       chatDraft.clear,
       composerState,
       creationDraftId,
@@ -2035,7 +2458,6 @@ function NewWorkspaceForm({
       launchTarget,
       leaveFullscreen,
       mainTarget,
-      mergeWorkspaces,
       prepareWorkspacePlacement,
       reportMainDraftStorageError,
       saveMainDraft,
@@ -2057,13 +2479,25 @@ function NewWorkspaceForm({
       pendingExplicitMainSubmissions.add(creationDraftId);
       setPendingAction("chat");
       try {
-        await submitExplicitMain(payload, draft.target);
+        await withMainDraftOperation(creationDraftId, async () => {
+          const saved = restoreMainDraftAtTarget(
+            await readMainDraft(creationDraftId),
+            draft.target,
+          );
+          if (saved?.batch) return;
+          if (!saved?.attempt && saved?.models && saved.models.length > 1) {
+            if (!canCreate) throw new Error(workspaceMainBlockMessage(t, "unknown"));
+            await startWorkspaceMainBatch(payload, saved);
+          } else {
+            await submitExplicitMain(payload, draft.target);
+          }
+        });
       } finally {
         pendingExplicitMainSubmissions.delete(creationDraftId);
         setPendingAction(null);
       }
     },
-    [creationDraftId, mainTarget, selectedServerId, submitExplicitMain, t],
+    [creationDraftId, mainTarget, selectedServerId, startWorkspaceMainBatch, submitExplicitMain, t],
   );
 
   const handleSubmitNewWorkspace = useCallback(
@@ -2264,10 +2698,35 @@ function NewWorkspaceForm({
     workingDirectory,
   ]);
 
+  const changeBatchModels = useStableEvent((models: WorkspaceBatchModel[]) => {
+    const draft = restoreMainDraftAtTarget(mainDraftRef.current, mainTarget);
+    if (
+      !draft ||
+      draft.attempt ||
+      draft.batch ||
+      pendingExplicitMainSubmissions.has(creationDraftId)
+    )
+      return;
+    if (models.length > (draft.models?.length ?? 0) && batchBlock) return;
+    void saveMainDraft({ target: draft.target, ...(models.length > 0 ? { models } : {}) }).catch(
+      reportMainDraftStorageError,
+    );
+  });
+  const batchModels = useMemo(
+    () =>
+      workspaceMain?.checked && !mainAttempt
+        ? {
+            models: mainDraft?.models ?? [],
+            disabledReason: batchBlock ? t(`newWorkspace.batch.${batchBlock}`) : undefined,
+            onChange: changeBatchModels,
+          }
+        : undefined,
+    [batchBlock, changeBatchModels, mainAttempt, mainDraft?.models, t, workspaceMain?.checked],
+  );
   const agentControlsWithDisabled = useMemo(() => {
     if (!composerState) return undefined;
     const controls = composerState.agentControls;
-    if (!isTimelineFork) return { ...controls, disabled: isPending, workspaceMain };
+    if (!isTimelineFork) return { ...controls, disabled: isPending, workspaceMain, batchModels };
     function trackEdit<Args extends unknown[], Result>(action: (...args: Args) => Result) {
       return (...args: Args) => {
         const result = action(...args);
@@ -2289,16 +2748,17 @@ function NewWorkspaceForm({
         onSetOption: trackEdit(controls.optionControls.onSetOption),
       },
     };
-  }, [composerState, isPending, isTimelineFork, workspaceMain, markAgentConfigEdited]);
+  }, [batchModels, composerState, isPending, isTimelineFork, workspaceMain, markAgentConfigEdited]);
 
-  const pickerEmptyText =
-    branchSuggestionsQuery.isFetching || githubPrSearchQuery.isFetching
-      ? t("newWorkspace.refPicker.searching")
-      : t("newWorkspace.refPicker.noMatchingRefs");
+  const pickerEmptyText = workspaceRefPickerEmptyText(
+    t,
+    branchSuggestionsQuery.isFetching,
+    githubPrSearchQuery.isFetching,
+  );
 
   const formStack = useNewWorkspaceForm({
     isCompact,
-    isPending,
+    isPending: isPending || hasBatch,
     pluginItems: (
       <PluginNewWorkspaceItems serverId={selectedServerId} screen={pluginScreen} setup={setup} />
     ),
@@ -2368,6 +2828,7 @@ function NewWorkspaceForm({
 
   const isComposerFullscreen = composerEditing.isFullscreen(isTerminalLaunch);
   const composerCwd = workingDirectory ?? "";
+  const hasMultipleModels = draftModelCount(mainDraft) >= 2;
   const composer = isTerminalLaunch ? (
     <Composer
       key="terminal"
@@ -2404,14 +2865,15 @@ function NewWorkspaceForm({
       serverId={selectedServerId}
       isPaneFocused={isScreenFocused}
       onSubmitMessage={handleSubmitNewWorkspace}
-      allowEmptySubmit={true}
+      allowEmptySubmit={!hasMultipleModels}
+      readOnly={hasBatch}
       submitButtonAccessibilityLabel={t("newWorkspace.create")}
       submitButtonTestID="workspace-create-submit"
       submitIcon="return"
       isSubmitLoading={isPending}
       waitForForgeAutoAttachOnSubmit
       submitBehavior="preserve-and-lock"
-      blurOnSubmit={true}
+      blurOnSubmit={!hasMultipleModels}
       textSource={chatDraft.textSource}
       onChangeText={chatDraft.editText}
       textReplacement={chatDraft.textReplacement}
@@ -2434,10 +2896,17 @@ function NewWorkspaceForm({
         value={creationIdentity.title}
         onCommit={commitTitle}
         compact={isCompact}
-        disabled={isPending || creationIdentity.submitted}
+        disabled={isPending || hasBatch || creationIdentity.submitted}
       />
     ),
-    [creationIdentity.title, creationIdentity.submitted, commitTitle, isCompact, isPending],
+    [
+      creationIdentity.title,
+      creationIdentity.submitted,
+      commitTitle,
+      hasBatch,
+      isCompact,
+      isPending,
+    ],
   );
   return (
     <FileDropZone style={styles.container}>
@@ -2449,11 +2918,15 @@ function NewWorkspaceForm({
         onImportSession={importSession.open}
       >
         {composer}
-        {errorMessage ? (
-          <Text accessibilityRole="alert" style={styles.errorText}>
-            {errorMessage}
-          </Text>
-        ) : null}
+        <WorkspaceMainBatchResults
+          draft={mainDraft}
+          currentServerId={selectedServerId}
+          canRun={clientReady}
+          pending={isPending}
+          onAction={handleBatchAction}
+          onFinish={finishWorkspaceMainBatch}
+        />
+        <WorkspaceCreationError message={errorMessage} />
       </NewWorkspaceLayout>
       {importSession.sheet}
     </FileDropZone>
@@ -2648,6 +3121,20 @@ const styles = StyleSheet.create((theme, runtime) => ({
     color: theme.colors.destructive,
     lineHeight: 20,
   },
+  batchResults: { flexGrow: 0, flexShrink: 1 },
+  batchResultList: { gap: theme.spacing[2], padding: theme.spacing[2] },
+  batchResult: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[3],
+    padding: theme.spacing[2],
+    backgroundColor: theme.colors.surface1,
+    borderRadius: theme.borderRadius.lg,
+  },
+  batchResultDetails: { flex: 1, minWidth: 0, gap: theme.spacing[1] },
+  batchResultActions: { alignItems: "flex-end", gap: theme.spacing[1] },
+  batchModelLabel: { color: theme.colors.foreground, fontSize: theme.fontSize.base },
+  batchResultStatus: { color: theme.colors.foregroundMuted, fontSize: theme.fontSize.sm },
 }));
 
 /**

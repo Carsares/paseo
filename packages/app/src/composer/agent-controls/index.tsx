@@ -77,6 +77,7 @@ import {
   useModelPickerShortcut,
 } from "@/composer/agent-controls/control-items";
 import { CompactModelSheet } from "@/composer/agent-controls/model-sheet";
+import type { WorkspaceBatchModelPicker } from "./model-sheet-flow";
 import {
   resolveAgentControlsProfileProviders,
   resolveAgentControlsSelectorProviders,
@@ -142,6 +143,7 @@ interface ControlledAgentControlsProps {
   modelSelectorServerId?: string | null;
   isCompactLayout?: boolean;
   workspaceMain?: WorkspaceMainControlValue;
+  batchModels?: WorkspaceBatchModelPicker;
 }
 
 export interface DraftAgentControlsProps {
@@ -176,6 +178,7 @@ export interface DraftAgentControlsProps {
   modelSelectorServerId?: string | null;
   isCompactLayout?: boolean;
   workspaceMain?: WorkspaceMainControlValue;
+  batchModels?: WorkspaceBatchModelPicker;
   /** Which composer a plugin's `useComposer()` reports. */
   context?: "draft" | "new-workspace";
   /** What plugins set on the agent this draft creates. */
@@ -422,6 +425,7 @@ function ControlledAgentControls({
   modelSelectorServerId = null,
   isCompactLayout,
   workspaceMain,
+  batchModels,
 }: ControlledAgentControlsProps) {
   const { t } = useTranslation();
   const isCompactFormFactor = useIsCompactFormFactor();
@@ -654,6 +658,7 @@ function ControlledAgentControls({
             handleCloseSheet={handleCloseSheet}
             modelSelectorServerId={modelSelectorServerId}
             workspaceMain={workspaceMain}
+            batchModels={batchModels}
           />
         ) : (
           <SheetAgentControlsContent
@@ -685,6 +690,7 @@ function ControlledAgentControls({
             modelSelectorServerId={modelSelectorServerId}
             canSwitchProvider={Boolean(onSelectProviderAndModel)}
             workspaceMain={workspaceMain}
+            batchModels={batchModels}
           />
         )}
         <TrailingAgentControls
@@ -770,6 +776,7 @@ interface AgentControlsContentProps {
   glyphs: ToolbarGlyphs;
   modelSelectorServerId: string | null;
   workspaceMain?: WorkspaceMainControlValue;
+  batchModels?: WorkspaceBatchModelPicker;
 }
 
 interface DesktopAgentControlsContentProps extends AgentControlsContentProps {
@@ -817,6 +824,7 @@ function DesktopAgentControlsContent(props: DesktopAgentControlsContentProps) {
     handleCloseSheet,
     modelSelectorServerId,
     workspaceMain,
+    batchModels,
   } = props;
   const { action: toggleAction, keys: modelKeys } = useModelPickerShortcut(disabled);
   const modelTooltipLabel = t(getAgentControlHintKey("model"));
@@ -836,7 +844,34 @@ function DesktopAgentControlsContent(props: DesktopAgentControlsContentProps) {
   const hasFeatures = featureItems.length > 0 || hasPluginItems || Boolean(workspaceMain);
   return (
     <>
-      {canSelectModel ? (
+      {canSelectModel && batchModels ? (
+        <CompactModelSheet
+          providers={modelSelectorProviders}
+          selectedProvider={provider}
+          selectedModel={selectedModelId ?? ""}
+          thinkingLabel={null}
+          effortKeys={effortKeys}
+          onSelect={handleDesktopModelSelect}
+          profiles={agentProfiles}
+          onApplyProfile={onApplyAgentProfile}
+          onEditProfiles={onEditAgentProfiles}
+          onCreateProfile={onCreateAgentProfile}
+          onEditProfile={onEditAgentProfile}
+          contextBridge={sheetBridge}
+          isLoading={isModelLoading}
+          disabled={disabled}
+          onOpen={onModelSelectorOpen}
+          onClose={onDropdownClose}
+          onRetryProvider={onRetryModelProvider}
+          isRetryingProvider={isRetryingModelProvider}
+          serverId={modelSelectorServerId}
+          glyphs={glyphs}
+          showLabels
+          canSwitchProvider
+          batchModels={batchModels}
+        />
+      ) : null}
+      {canSelectModel && !batchModels ? (
         <View style={styles.modelControl}>
           <CombinedModelSelector
             providers={modelSelectorProviders}
@@ -964,6 +999,7 @@ function SheetAgentControlsContent(props: SheetAgentControlsContentProps) {
     modelSelectorServerId,
     canSwitchProvider,
     workspaceMain,
+    batchModels,
   } = props;
 
   const sheetControls = (
@@ -1016,6 +1052,7 @@ function SheetAgentControlsContent(props: SheetAgentControlsContentProps) {
       glyphs={glyphs}
       showLabels={showLabels}
       canSwitchProvider={canSwitchProvider}
+      batchModels={batchModels}
     >
       {sheetControls}
     </CompactModelSheet>
@@ -1426,6 +1463,7 @@ export function DraftAgentControls({
   isCompactLayout,
   context = "draft",
   workspaceMain,
+  batchModels,
   metadata,
   onSetMetadata,
 }: DraftAgentControlsProps & { draftId: string; serverId: string; showToolbar: boolean }) {
@@ -1589,7 +1627,7 @@ export function DraftAgentControls({
               provider={selectedProvider ?? ""}
               modelSelectorProviders={modelSelectorProviders}
               modelOptions={modelOptions}
-              selectedModelId={selectedModel}
+              selectedModelId={batchModels ? effectiveModelId : selectedModel}
               onSelectModel={onSelectModel}
               onSelectProviderAndModel={onSelectProviderAndModel}
               isModelLoading={isAllModelsLoading}
@@ -1611,6 +1649,7 @@ export function DraftAgentControls({
               modelSelectorServerId={modelSelectorServerId}
               isCompactLayout={isCompactLayout}
               workspaceMain={workspaceMain}
+              batchModels={batchModels}
             />
           </>
         ) : null}

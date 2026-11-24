@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ProviderSelectorProvider } from "@/provider-selection/provider-selection";
-import { resolveModelSheetOpening } from "./model-sheet-flow";
+import { resolveModelSheetOpening, toggleWorkspaceBatchModel } from "./model-sheet-flow";
 
 function provider(id: string, label: string): ProviderSelectorProvider {
   return { id, label, modelSelection: { kind: "models", rows: [] } };
@@ -39,4 +39,26 @@ describe("model sheet opening", () => {
       }),
     ).toEqual({ kind: "provider", providerId: "codex", providerLabel: "Codex" });
   });
+});
+
+it("caps the list at four, distinguishes providers, and lets users remove a selected model at the cap", () => {
+  const models = [codex, claude, provider("pi", "Pi"), provider("muse", "Muse")].map(
+    ({ id, label }) => ({
+      provider: id,
+      providerLabel: label,
+      modelId: "default",
+      modelLabel: "Default",
+    }),
+  );
+  const fifth = { ...models[0]!, modelId: "another" };
+  expect(toggleWorkspaceBatchModel({ models: models.slice(0, 3), model: models[3]! })).toEqual(
+    models,
+  );
+  expect(toggleWorkspaceBatchModel({ models, model: fifth })).toBeNull();
+  expect(toggleWorkspaceBatchModel({ models, model: models[1]! })).toEqual([
+    models[0],
+    models[2],
+    models[3],
+  ]);
+  expect(toggleWorkspaceBatchModel({ models: [], model: fifth, disabled: true })).toBeNull();
 });

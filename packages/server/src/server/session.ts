@@ -409,7 +409,11 @@ import {
 } from "./project-directory-service.js";
 import { runGitCommand } from "../utils/run-git-command.js";
 import { CreateAgentLifecycleDispatch } from "./agent/create-agent-lifecycle-dispatch.js";
-import { resolveWorktreeSourceCwd } from "./workspace-source.js";
+import { assertFixedStartPointSource } from "./resolve-worktree-creation-intent.js";
+import {
+  resolveWorkspaceWorktreeStartPoint,
+  resolveWorktreeSourceCwd,
+} from "./workspace-source.js";
 
 type ProviderSubagentManagerEvent = Extract<
   AgentManagerEvent,
@@ -3659,6 +3663,8 @@ export class Session {
         return this.handleCreationSubscription(msg, source);
       case "workspace.create.request":
         return this.handleWorkspaceCreation(msg, source);
+      case "workspace.worktree.resolve_start_point.request":
+        return this.handleWorkspaceWorktreeResolveStartPoint(msg, source);
       case "workspace.agents.summary.request":
         return this.handleWorkspaceAgentsSummary(msg, source);
       default:
@@ -8480,6 +8486,41 @@ export class Session {
     }
   }
 
+  private async handleWorkspaceWorktreeResolveStartPoint(
+    request: Extract<
+      SessionInboundMessage,
+      { type: "workspace.worktree.resolve_start_point.request" }
+    >,
+    source?: object,
+  ): Promise<void> {
+    const { requestId } = request;
+    let payload: {
+      requestId: string;
+      commitSha: string | null;
+      refName: string | null;
+      error: string | null;
+    };
+    try {
+      const result = await resolveWorkspaceWorktreeStartPoint(
+        request,
+        this.projectRegistry,
+        this.workspaceGitService,
+      );
+      payload = { requestId, ...result, error: null };
+    } catch (error) {
+      payload = {
+        requestId,
+        commitSha: null,
+        refName: null,
+        error: getErrorMessageOr(error, "Failed to resolve worktree start point"),
+      };
+    }
+    this.emitForSource(
+      { type: "workspace.worktree.resolve_start_point.response", payload },
+      source,
+    );
+  }
+
   private async handleWorkspaceAgentsSummary(
     request: Extract<SessionInboundMessage, { type: "workspace.agents.summary.request" }>,
     source?: object,
@@ -9115,6 +9156,8 @@ export class Session {
       );
     if (request.agent?.background !== undefined)
       throw new Error("Configure background on the workspace, not its initial agent.");
+    const originalSource = request.source;
+    if (originalSource.kind === "worktree") assertFixedStartPointSource(originalSource);
     let creationRequest = request;
     // Hooks belong to the operation: retries fingerprint the caller's input
     // and must not rerun hooks or compare their potentially changing output.
@@ -9122,6 +9165,21 @@ export class Session {
       const { type, requestId, ...input } = request;
       const transformed = await this.pluginRuntime.before("workspace.create.before", input);
       creationRequest = { ...transformed, type, requestId };
+      if (originalSource.kind === "worktree" && originalSource.startPoint !== undefined) {
+        const next = creationRequest.source;
+        if (
+          next.kind !== "worktree" ||
+          next.cwd !== originalSource.cwd ||
+          next.projectId !== originalSource.projectId ||
+          next.refName !== originalSource.refName ||
+          next.baseBranch !== originalSource.baseBranch ||
+          (next.startPoint !== undefined && next.startPoint !== originalSource.startPoint)
+        ) {
+          throw new Error("workspace.create.before hooks cannot change a fixed worktree source");
+        }
+        creationRequest.source = { ...next, startPoint: originalSource.startPoint };
+        assertFixedStartPointSource(creationRequest.source);
+      }
       this.assertWorkspaceCreationAllowed(creationRequest);
     }
     return creationRequest.source.kind === "directory"
@@ -9202,6 +9260,9 @@ export class Session {
         "cwd or projectId is required for a worktree-backed workspace",
       );
     }
+    if (source.startPoint !== undefined && !source.refName?.trim() && source.baseBranch) {
+      throw new Error("Select a worktree base branch with refName when using a fixed start point.");
+    }
 
     const sourceCwd = await resolveWorktreeSourceCwd(source, this.projectRegistry);
 
@@ -9213,6 +9274,7 @@ export class Session {
         worktreeSlug: source.worktreeSlug,
         action: source.action,
         refName: source.refName,
+        startPoint: source.startPoint,
         branchName: source.branchName,
         checkoutSource: source.checkoutSource,
         githubPrNumber: source.githubPrNumber,
@@ -9221,7 +9283,7 @@ export class Session {
         metadata: request.metadata,
         background: request.background,
       },
-      source.baseBranch
+      source.baseBranch && source.startPoint === undefined
         ? { resolveDefaultBranch: async () => source.baseBranch as string }
         : undefined,
     );

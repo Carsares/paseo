@@ -1531,6 +1531,35 @@ export const fr: TranslationResources = {
     },
   },
   newWorkspace: {
+    batch: {
+      browserUnsupported:
+        "Ouvrez Paseo via HTTPS dans un navigateur à jour pour sélectionner plusieurs modèles.",
+      selectModels: "Sélectionner plusieurs modèles",
+      keepModels: "Conserver la sélection",
+      count: "{{count}} sur {{max}} sélectionnés",
+      limit: "Vous pouvez sélectionner jusqu’à 4 modèles.",
+      removeModel: "Retirer {{model}} ({{provider}})",
+      worktreeRequired:
+        "Choisissez un nouvel arbre de travail pour sélectionner plusieurs modèles.",
+      branchOffRequired:
+        "Créez une branche à partir d’une autre pour sélectionner plusieurs modèles.",
+      unsupported:
+        "Mettez l’hôte à jour pour créer plusieurs arbres de travail à partir du même commit.",
+      empty: "Ajoutez un message ou une pièce jointe pour sélectionner plusieurs modèles.",
+      disconnected: "Connectez-vous à l’hôte pour sélectionner plusieurs modèles.",
+      modelUnavailable: "{{model}} n’est plus disponible.",
+      modelLabel: "{{model}} ({{provider}})",
+      queued: "En attente de création",
+      sending: "Création en cours",
+      retryable: "Échec avant l’envoi. Vous pouvez réessayer.",
+      unconfirmed: "Envoi non confirmé",
+      succeeded: "Envoyé",
+      openModel: "Ouvrir la session {{model}}",
+      open: "Ouvrir la session",
+      resume: "Continuer",
+      check: "Vérifier l’état",
+      finish: "Terminer",
+    },
     editTitle: "Modifier le nom de l’espace de travail",
     title: "Nouvel espace de travail",
     create: "Créer",

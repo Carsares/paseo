@@ -4,6 +4,7 @@ import {
   deriveWorktreeProjectHash,
   deletePaseoWorktree,
   readWorktreeHead,
+  resolveFixedWorktreeStartPoint,
   isPaseoOwnedWorktreeCwd,
   mapWorkspaceCwdToWorktree,
   runWorktreeTeardownCommands,
@@ -95,6 +96,114 @@ describe("paseo worktree manager", () => {
 
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+
+  it("resolves local and qualified cached remote tips without fetching the newer remote tip", async () => {
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" }).trim();
+    const originalTip = git(repoDir, "rev-parse", "main");
+    const remote = join(tempDir, "upstream");
+    git(tempDir, "clone", repoDir, remote);
+    git(repoDir, "remote", "add", "origin", remote);
+    git(repoDir, "fetch", "origin");
+    git(repoDir, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "local advance");
+    git(
+      remote,
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@test.com",
+      "-c",
+      "commit.gpgsign=false",
+      "commit",
+      "--allow-empty",
+      "-m",
+      "remote advance",
+    );
+    expect(await resolveFixedWorktreeStartPoint(repoDir, "main")).toEqual({
+      baseRef: "refs/heads/main",
+      commitSha: git(repoDir, "rev-parse", "main"),
+    });
+    for (const refName of ["origin/main", "refs/remotes/origin/main"]) {
+      expect(await resolveFixedWorktreeStartPoint(repoDir, refName)).toEqual({
+        baseRef: "refs/remotes/origin/main",
+        commitSha: originalTip,
+      });
+    }
+    const pinned = await createWorktreePrimitive({
+      cwd: repoDir,
+      paseoHome,
+      worktreeSlug: "pinned-remote",
+      source: {
+        kind: "branch-off",
+        baseBranch: "origin/main",
+        branchName: "pinned-remote",
+        fixedStartPoint: originalTip,
+      },
+    });
+    expect(git(pinned.worktreePath, "rev-parse", "HEAD")).toBe(originalTip);
+    expect(pinned.comparisonBaseRef).toBe("refs/remotes/origin/main");
+    expect(git(repoDir, "rev-parse", "refs/remotes/origin/main")).toBe(originalTip);
+  });
+
+  it("accepts a full commit in a SHA-256 repository and rejects its 40-character prefix", async () => {
+    const cwd = join(tempDir, "sha256");
+    const git = (dir: string, ...args: string[]) =>
+      execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: "pipe" }).trim();
+    git(tempDir, "init", "--object-format=sha256", "-b", "main", cwd);
+    git(
+      cwd,
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@test.com",
+      "-c",
+      "commit.gpgsign=false",
+      "commit",
+      "--allow-empty",
+      "-m",
+      "initial",
+    );
+    const commitSha = git(cwd, "rev-parse", "HEAD");
+    expect(commitSha).toHaveLength(64);
+    await expect(resolveFixedWorktreeStartPoint(cwd, "main", commitSha)).resolves.toMatchObject({
+      commitSha,
+    });
+    await expect(
+      resolveFixedWorktreeStartPoint(cwd, "main", commitSha.slice(0, 40)),
+    ).rejects.toThrow("full commit SHA");
+  });
+
+  it("rejects change request refs, unrelated commits, and non-commit objects as fixed starts", async () => {
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: repoDir, encoding: "utf8", stdio: "pipe" }).trim();
+    const baseSha = git("rev-parse", "main");
+    git("-c", "tag.gpgsign=false", "tag", "-a", "base-tag", "-m", "annotated", baseSha);
+    git("checkout", "--detach", baseSha);
+    git("-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "change request");
+    const unrelatedSha = git("rev-parse", "HEAD");
+    const changeRequestRef = "refs/paseo/change-requests/9";
+    git("update-ref", changeRequestRef, unrelatedSha);
+    git("checkout", "main");
+
+    for (const ref of [changeRequestRef, "paseo/change-requests/9", "base-tag", "main~0"]) {
+      await expect(resolveFixedWorktreeStartPoint(repoDir, ref)).rejects.toThrow(
+        "require a local or remote branch",
+      );
+    }
+    await expect(resolveFixedWorktreeStartPoint(repoDir, "main", unrelatedSha)).rejects.toThrow(
+      "not in the history of the base branch",
+    );
+    for (const sha of [git("rev-parse", "refs/tags/base-tag"), "0".repeat(baseSha.length)]) {
+      await expect(resolveFixedWorktreeStartPoint(repoDir, "main", sha)).rejects.toThrow(
+        "not a commit in this repository",
+      );
+    }
+    for (const revision of [`${baseSha}^{commit}`, "--help", baseSha.slice(0, 12)]) {
+      await expect(resolveFixedWorktreeStartPoint(repoDir, "main", revision)).rejects.toThrow(
+        "must be a full commit SHA",
+      );
+    }
   });
 
   it.each([

@@ -10,10 +10,17 @@ import { WebSocket } from "ws";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
+  PARENT_AGENT_ID_LABEL,
+  WORKSPACE_MAIN_ROLE,
+  WORKSPACE_ROLE_LABEL,
+} from "@getpaseo/protocol/agent-labels";
+import { BUILTIN_PROVIDER_IDS } from "@getpaseo/protocol/provider-manifest";
+import {
   DaemonClient as SocketDaemonClient,
   type WebSocketLike,
 } from "@getpaseo/client/internal/daemon-client";
 import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
+import { createTestAgentClients } from "./test-utils/fake-agent-client.js";
 
 // The reshaped workspace.create.request forwards its worktree `source`
 // (action/refName/branchName/githubPrNumber/worktreeSlug) into createWorktreeCore.
@@ -40,6 +47,192 @@ function createGitRepoWithBranch(): { repoDir: string; tempRoot: string } {
   execFileSync("git", ["branch", "feature/existing-branch"], { cwd: repoDir, stdio: "pipe" });
   return { repoDir, tempRoot };
 }
+
+test("four independent workspace mains keep the same fixed start point after the base advances", async () => {
+  const agentClients = createTestAgentClients();
+  const daemon = await createTestPaseoDaemon({
+    agentClients,
+    providerOverrides: Object.fromEntries(
+      BUILTIN_PROVIDER_IDS.map((id) => [id, { enabled: id in agentClients }]),
+    ),
+  });
+  const { repoDir, tempRoot } = createGitRepoWithBranch();
+  const client = new DaemonClient({
+    url: `ws://127.0.0.1:${daemon.port}/ws`,
+    appVersion: "0.1.82",
+  });
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" }).trim();
+  onTestFinished(async () => {
+    await client.close().catch(() => undefined);
+    await daemon.close();
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  await client.connect();
+
+  expect(client.supportsWorkspaceFixedStartPoint()).toBe(true);
+  const { commitSha, refName } = await client.resolveWorkspaceWorktreeStartPoint({ cwd: repoDir });
+  expect({ commitSha, refName }).toEqual({
+    commitSha: git(repoDir, "rev-parse", "HEAD"),
+    refName: "refs/heads/main",
+  });
+  expect(git(repoDir, "worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(1);
+
+  const create = async (
+    worktreeSlug: string,
+    branchName: string,
+    provider: "codex" | "claude",
+    model: string,
+  ) => {
+    const result = await client.createWorkspace({
+      source: {
+        kind: "worktree",
+        cwd: repoDir,
+        action: "branch-off",
+        branchName,
+        worktreeSlug,
+        refName,
+        startPoint: commitSha,
+      },
+      idempotencyKey: `receipt-${worktreeSlug}`,
+      agent: {
+        config: { provider, cwd: repoDir, model },
+        workspaceRole: "main",
+        initialPrompt: "Compare the working tree with its base",
+        clientMessageId: `prompt-${worktreeSlug}`,
+      },
+    });
+    expect(result.error).toBeNull();
+    const workspaceCwd = result.workspace?.workspaceDirectory;
+    if (!workspaceCwd || !result.agent)
+      throw new Error("Missing created workspace or Main Session");
+    expect(result.agent).toMatchObject({
+      workspaceId: result.workspace?.id,
+      provider,
+      model,
+      cwd: workspaceCwd,
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    });
+    expect(result.agent.labels[PARENT_AGENT_ID_LABEL]).toBeUndefined();
+    expect(await client.getCreationSnapshot("workspace", `receipt-${worktreeSlug}`)).toMatchObject({
+      workspaceId: result.workspace?.id,
+      agentId: result.agent.id,
+      initialPromptStarted: true,
+    });
+    expect(git(workspaceCwd, "rev-parse", "HEAD")).toBe(commitSha);
+    const gitDir = git(workspaceCwd, "rev-parse", "--absolute-git-dir");
+    expect(
+      JSON.parse(readFileSync(path.join(gitDir, "paseo", "worktree.json"), "utf8")),
+    ).toMatchObject({
+      baseRefName: "main",
+      baseRef: "refs/heads/main",
+    });
+    return {
+      workspaceId: result.workspace?.id,
+      agentId: result.agent.id,
+      cwd: workspaceCwd,
+      branch: git(workspaceCwd, "branch", "--show-current"),
+    };
+  };
+  const first = await create("first", "first-session", "codex", "gpt-5.4");
+  git(repoDir, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "advance main");
+  expect(git(repoDir, "rev-parse", "HEAD")).not.toBe(commitSha);
+  // The requested branch name already exists at a different commit.
+  const second = await create("second", "main", "claude", "sonnet");
+  const third = await create("third", "third-session", "codex", "gpt-5.4-mini");
+  const fourth = await create("fourth", "fourth-session", "claude", "haiku");
+  const created = [first, second, third, fourth];
+  for (const key of ["workspaceId", "agentId", "cwd", "branch"] as const) {
+    expect(new Set(created.map((item) => item[key])).size).toBe(4);
+  }
+  expect(git(first.cwd, "rev-parse", "HEAD")).toBe(commitSha);
+
+  // A rewritten branch no longer contains the frozen commit. Do not fall forward to
+  // its replacement or create an extra worktree.
+  git(repoDir, "checkout", "--detach");
+  git(repoDir, "checkout", "--orphan", "unrelated");
+  git(repoDir, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "new root");
+  git(repoDir, "branch", "-f", "main", "HEAD");
+  const rejected = await client.createWorkspace({
+    source: {
+      kind: "worktree",
+      cwd: repoDir,
+      action: "branch-off",
+      refName,
+      startPoint: commitSha,
+    },
+  });
+  expect(rejected).toMatchObject({
+    workspace: null,
+    error: expect.stringContaining("not in the history of the base branch"),
+    creation: { failedStage: "workspace" },
+  });
+  expect(git(repoDir, "worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(5);
+}, 180000);
+
+test("workspace fixed start points reject unsupported sources and unsafe objects before creating worktrees", async () => {
+  const daemon = await createTestPaseoDaemon();
+  const { repoDir, tempRoot } = createGitRepoWithBranch();
+  const client = new DaemonClient({
+    url: `ws://127.0.0.1:${daemon.port}/ws`,
+    appVersion: "0.1.82",
+  });
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: repoDir, encoding: "utf8", stdio: "pipe" }).trim();
+  onTestFinished(async () => {
+    await client.close().catch(() => undefined);
+    await daemon.close();
+    await rm(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+  await client.connect();
+
+  const startPoint = git("rev-parse", "HEAD");
+  git("-c", "tag.gpgsign=false", "tag", "-a", "commit-tag", "-m", "annotated tag");
+  git("checkout", "--detach");
+  git("-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "change request");
+  const changeRequestSha = git("rev-parse", "HEAD");
+  const changeRequestRef = "refs/paseo/change-requests/79";
+  git("update-ref", changeRequestRef, changeRequestSha);
+  git("checkout", "main");
+
+  for (const refName of [changeRequestRef, "paseo/change-requests/79", "commit-tag", "main~0"]) {
+    await expect(
+      client.resolveWorkspaceWorktreeStartPoint({ cwd: repoDir, refName }),
+    ).rejects.toThrow("require a local or remote branch");
+  }
+  const source = {
+    kind: "worktree",
+    cwd: repoDir,
+    action: "branch-off",
+    refName: "main",
+    startPoint,
+  } as const;
+  for (const [override, error] of [
+    [{ startPoint: startPoint.slice(0, 12) }, "full commit SHA"],
+    [{ startPoint: `${startPoint}^{commit}` }, "full commit SHA"],
+    [{ startPoint: "0".repeat(startPoint.length) }, "is not a commit in this repository"],
+    [
+      { startPoint: git("rev-parse", "refs/tags/commit-tag") },
+      "is not a commit in this repository",
+    ],
+    [{ startPoint: changeRequestSha }, "is not in the history of the base branch"],
+    [
+      { refName: changeRequestRef, startPoint: changeRequestSha },
+      "require a local or remote branch",
+    ],
+    [{ action: "checkout" }, "requires branching off an ordinary branch"],
+    [{ action: undefined }, "requires branching off an ordinary branch"],
+    [{ githubPrNumber: 79 }, "requires branching off an ordinary branch"],
+    [
+      { checkoutSource: { kind: "change_request", number: 79 } },
+      "requires branching off an ordinary branch",
+    ],
+  ] as const) {
+    const result = await client.createWorkspace({ source: { ...source, ...override } });
+    expect(result).toMatchObject({ workspace: null, error: expect.stringContaining(error) });
+  }
+  expect(git("worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(1);
+}, 180000);
 
 test("workspace.create worktree source forwards action=checkout + refName into the real worktree", async () => {
   const daemon = await createTestPaseoDaemon();

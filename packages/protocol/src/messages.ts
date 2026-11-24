@@ -3349,6 +3349,14 @@ export const WorkspaceAgentsSummaryRequestMessageSchema = z.object({
   requestId: z.string(),
 });
 
+const WorkspaceWorktreeResolveStartPointRequestSchema = z.object({
+  type: z.literal("workspace.worktree.resolve_start_point.request"),
+  cwd: z.string().optional(),
+  projectId: z.string().optional(),
+  refName: z.string().min(1).optional(),
+  requestId: z.string(),
+});
+
 // Create a new workspace record. Unlike open_project, this never deduplicates by
 // directory: it always produces a fresh workspace. The source discriminates
 // between an existing local directory and a newly created paseo worktree.
@@ -3378,6 +3386,7 @@ export const WorkspaceCreateRequestSchema = z.object({
       // Path of the existing checkout/directory to back the workspace.
       path: z.string(),
       projectId: z.string().optional(),
+      startPoint: z.never().optional(),
     }),
     z.object({
       kind: z.literal("worktree"),
@@ -3388,6 +3397,8 @@ export const WorkspaceCreateRequestSchema = z.object({
       // Target branch for checkout, or base ref for branch-off.
       refName: z.string().min(1).optional(),
       baseBranch: z.string().optional(),
+      // Requires workspaceFixedStartPoint. Older hosts would ignore this field.
+      startPoint: z.string().optional(),
       // New branch name for branch-off. The worktree path may use a different slug.
       branchName: z.string().min(1).optional(),
       checkoutSource: ChangeRequestCheckoutSourceSchema.optional(),
@@ -4122,6 +4133,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ProjectGithubCloneRequestSchema,
   ArchiveWorkspaceRequestSchema,
   WorkspaceCreateRequestSchema,
+  WorkspaceWorktreeResolveStartPointRequestSchema,
   WorkspaceAgentsSummaryRequestMessageSchema,
   AgentCreateRequestSchema,
   CreationSubscribeRequestSchema,
@@ -4499,6 +4511,7 @@ export const ServerInfoStatusPayloadSchema = z
         agentHierarchyControl: z.boolean().optional(),
         // COMPAT(workspaceMainAgentDefault): added in v0.16.0, remove gate after 2027-05-20.
         workspaceMainAgentDefault: z.boolean().optional(),
+        workspaceFixedStartPoint: z.boolean().optional(),
         // COMPAT(agentCreateAsMain): added in v0.17.0-beta.1, remove gate after 2027-05-22.
         agentCreateAsMain: z.boolean().optional(),
         // COMPAT(workspaceAgentsSummary): added in v0.16.0, remove gate after 2027-05-20.
@@ -5870,6 +5883,7 @@ export const CreationSnapshotSchema = z.object({
   workspace: WorkspaceDescriptorPayloadSchema.optional(),
   agent: AgentSnapshotPayloadSchema.optional(),
   mainAgent: AgentSnapshotPayloadSchema.nullable().optional(),
+  initialPromptStarted: z.boolean().optional(),
   error: z.string().nullable(),
   setupSkippedReason: z.string().optional(),
   errorCode: z.string().optional(),
@@ -5919,6 +5933,16 @@ export const WorkspaceCreateResponseSchema = z.object({
     error: z.string().nullable(),
     errorCode: z.string().optional(),
     requestId: z.string(),
+  }),
+});
+
+const WorkspaceWorktreeResolveStartPointResponseSchema = z.object({
+  type: z.literal("workspace.worktree.resolve_start_point.response"),
+  payload: z.object({
+    requestId: z.string(),
+    commitSha: z.string().nullable(),
+    refName: z.string().nullable(),
+    error: z.string().nullable(),
   }),
 });
 
@@ -8212,6 +8236,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CancelAgentResponseMessageSchema,
   ClearAgentAttentionResponseMessageSchema,
   WorkspaceCreateResponseSchema,
+  WorkspaceWorktreeResolveStartPointResponseSchema,
   WorkspaceAgentsSummaryResponseMessageSchema,
   AgentCreateResponseSchema,
   WorkspaceCreationUpdateSchema,

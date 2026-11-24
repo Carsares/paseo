@@ -26,6 +26,7 @@ export interface ResolveWorktreeCreationIntentInput {
   branchName?: string;
   refName?: string;
   action?: "branch-off" | "checkout";
+  startPoint?: string;
   checkoutSource?: {
     kind: "change_request";
     forge?: string;
@@ -92,6 +93,7 @@ export async function resolveWorktreeCreationIntent(
   repoRoot: string,
   deps: ResolveWorktreeCreationIntentDeps,
 ): Promise<WorktreeCreationIntent> {
+  assertFixedStartPointSource(input);
   if (input.action === "branch-off") {
     const branchName = input.branchName ?? input.worktreeSlug ?? "worktree";
     const changeRequest = resolveInputChangeRequest(input);
@@ -104,8 +106,11 @@ export async function resolveWorktreeCreationIntent(
     }
     return {
       kind: "branch-off",
-      baseBranch: input.refName?.trim() || (await resolveDefaultBranch(repoRoot, deps)),
+      baseBranch: await resolveWorktreeBaseBranch(input.refName, () =>
+        deps.resolveDefaultBranch(repoRoot),
+      ),
       branchName,
+      ...(input.startPoint !== undefined ? { fixedStartPoint: input.startPoint } : {}),
     };
   }
 
@@ -156,6 +161,17 @@ export async function resolveWorktreeCreationIntent(
     baseBranch: await resolveDefaultBranch(repoRoot, deps),
     branchName: input.branchName ?? input.worktreeSlug ?? "worktree",
   };
+}
+
+export function assertFixedStartPointSource(input: ResolveWorktreeCreationIntentInput): void {
+  if (
+    input.startPoint !== undefined &&
+    (input.action !== "branch-off" ||
+      input.checkoutSource !== undefined ||
+      input.githubPrNumber !== undefined)
+  ) {
+    throw new Error("A fixed worktree start point requires branching off an ordinary branch.");
+  }
 }
 
 /**
@@ -337,7 +353,14 @@ async function resolveDefaultBranch(
   repoRoot: string,
   deps: ResolveWorktreeCreationIntentDeps,
 ): Promise<string> {
-  const baseBranch = await deps.resolveDefaultBranch(repoRoot);
+  return resolveWorktreeBaseBranch(undefined, () => deps.resolveDefaultBranch(repoRoot));
+}
+
+export async function resolveWorktreeBaseBranch(
+  refName: string | undefined,
+  resolveDefault: () => Promise<string>,
+): Promise<string> {
+  const baseBranch = refName?.trim() || (await resolveDefault());
   if (!baseBranch) {
     throw new Error("Unable to resolve repository default branch");
   }

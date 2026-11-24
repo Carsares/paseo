@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Keyboard,
@@ -14,6 +14,7 @@ import type { AgentProfilePicker, AgentProfileSeed } from "@/agent-profiles";
 import { AdaptiveModalSheet } from "@/components/adaptive-modal-sheet";
 import type { ContextBridge } from "@/components/ui/isolated-bottom-sheet-modal";
 import { ComboboxTrigger } from "@/components/ui/combobox-trigger";
+import { Button } from "@/components/ui/button";
 import { TailEllipsisText } from "@/components/ui/tail-ellipsis-text";
 import { useProviderIcon } from "@/components/provider-icons";
 import { ModelBrowser, useModelBrowser } from "@/components/model-browser";
@@ -21,7 +22,13 @@ import { resolveModelBrowserScrolling } from "@/components/model-browser-view";
 import { AgentControlTrigger } from "@/composer/agent-controls/control";
 import { ComposerToolbarGlyph } from "@/composer/agent-controls/glyph";
 import { resolveModelTriggerLabels } from "@/composer/agent-controls/layout";
-import { resolveModelSheetOpening } from "@/composer/agent-controls/model-sheet-flow";
+import {
+  findWorkspaceBatchModel,
+  MAX_WORKSPACE_BATCH_MODELS,
+  resolveModelSheetOpening,
+  toggleWorkspaceBatchModel,
+  type WorkspaceBatchModelPicker,
+} from "@/composer/agent-controls/model-sheet-flow";
 import type { ProviderSelectorProvider } from "@/provider-selection/provider-selection";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative, isWeb } from "@/constants/platform";
@@ -68,9 +75,10 @@ interface CompactModelSheetProps {
   /** False when the toolbar is too narrow for labels: the trigger shows the provider glyph only. */
   showLabels: boolean;
   canSwitchProvider: boolean;
+  batchModels?: WorkspaceBatchModelPicker;
   /** Carries the composer's contexts into the sheets, which draw away from it. */
   contextBridge?: ContextBridge | null;
-  children: ReactNode;
+  children?: ReactNode;
 }
 
 function resolveModelSheetProfileActions(
@@ -134,6 +142,176 @@ function useModelTriggerLabels(input: {
   return { labels, measuredKey, onFrameLayout, onFullLayout };
 }
 
+function useModelSheetBatch({
+  batchModels,
+  isOpen,
+  availableProviders,
+  selectedProvider,
+  selectedModel,
+}: Pick<CompactModelSheetProps, "batchModels" | "selectedProvider" | "selectedModel"> & {
+  isOpen: boolean;
+  availableProviders: ProviderSelectorProvider[];
+}) {
+  const [isSelectingBatch, setIsSelectingBatch] = useState(false);
+  const shiftActivate = useRef(false);
+  useEffect(() => {
+    if (!isWeb || !isOpen || !batchModels) return;
+    // ModelBrowser shares its activation callback with other consumers. Keep the
+    // pointer modifier local to this open picker so ordinary selection is unchanged.
+    const capture = (event: PointerEvent | KeyboardEvent) => {
+      shiftActivate.current = event.shiftKey;
+    };
+    window.addEventListener("pointerdown", capture, true);
+    window.addEventListener("pointerup", capture, true);
+    window.addEventListener("keydown", capture, true);
+    return () => {
+      shiftActivate.current = false;
+      window.removeEventListener("pointerdown", capture, true);
+      window.removeEventListener("pointerup", capture, true);
+      window.removeEventListener("keydown", capture, true);
+    };
+  }, [batchModels, isOpen]);
+  const selectBatchModel = useCallback(
+    (provider: string, modelId: string) => {
+      if (!batchModels || (!isSelectingBatch && !shiftActivate.current)) return false;
+      if (batchModels.disabledReason) return true;
+      const model = findWorkspaceBatchModel(availableProviders, provider, modelId);
+      if (!model) return true;
+      const current = findWorkspaceBatchModel(availableProviders, selectedProvider, selectedModel);
+      const models =
+        !isSelectingBatch && batchModels.models.length === 0 && current
+          ? [current]
+          : batchModels.models;
+      const next = toggleWorkspaceBatchModel({ models, model });
+      setIsSelectingBatch(true);
+      if (next) batchModels.onChange(next);
+      return true;
+    },
+    [availableProviders, batchModels, isSelectingBatch, selectedModel, selectedProvider],
+  );
+  return { isSelectingBatch, setIsSelectingBatch, selectBatchModel };
+}
+
+function SelectedBatchModel({
+  picker,
+  model,
+}: {
+  picker: WorkspaceBatchModelPicker;
+  model: WorkspaceBatchModelPicker["models"][number];
+}) {
+  const { t } = useTranslation();
+  const remove = useCallback(() => {
+    picker.onChange(
+      picker.models.filter(
+        (entry) => entry.provider !== model.provider || entry.modelId !== model.modelId,
+      ),
+    );
+  }, [model.modelId, model.provider, picker]);
+  return (
+    <Button
+      variant="ghost"
+      onPress={remove}
+      accessibilityLabel={t("newWorkspace.batch.removeModel", {
+        model: model.modelLabel,
+        provider: model.providerLabel,
+      })}
+    >
+      {model.modelLabel}
+    </Button>
+  );
+}
+
+function ModelSheetBatchControls({
+  picker,
+  selecting,
+  onStart,
+  onCancel,
+  onClose,
+  countLabel,
+}: {
+  picker: WorkspaceBatchModelPicker;
+  selecting: boolean;
+  onStart: () => void;
+  onCancel: () => void;
+  onClose: () => void;
+  countLabel: string;
+}) {
+  const { t } = useTranslation();
+  const count = picker.models.length;
+  const reason =
+    picker.disabledReason ??
+    (count >= MAX_WORKSPACE_BATCH_MODELS ? t("newWorkspace.batch.limit") : undefined);
+  return (
+    <View style={styles.batchControls}>
+      <View style={styles.batchActions}>
+        {selecting ? (
+          <>
+            <Text accessibilityLiveRegion="polite" style={styles.triggerText}>
+              {countLabel}
+            </Text>
+            <Button variant="ghost" onPress={onCancel} testID="workspace-batch-cancel">
+              {t("common.actions.cancel")}
+            </Button>
+            <Button
+              variant="secondary"
+              onPress={onClose}
+              disabled={count === 0 || Boolean(picker.disabledReason)}
+              testID="workspace-batch-done"
+            >
+              {t("newWorkspace.batch.keepModels")}
+            </Button>
+          </>
+        ) : (
+          <Button
+            variant="secondary"
+            onPress={onStart}
+            disabled={Boolean(picker.disabledReason)}
+            accessibilityHint={picker.disabledReason}
+            testID="workspace-batch-select"
+          >
+            {t("newWorkspace.batch.selectModels")}
+          </Button>
+        )}
+      </View>
+      {reason ? <Text style={styles.triggerText}>{reason}</Text> : null}
+      {selecting && count > 0 ? (
+        <View style={styles.batchActions}>
+          {picker.models.map((model) => (
+            <SelectedBatchModel
+              key={JSON.stringify([model.provider, model.modelId])}
+              picker={picker}
+              model={model}
+            />
+          ))}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function useModelSheetTriggerLabels(
+  batchModels: WorkspaceBatchModelPicker | undefined,
+  browser: ReturnType<typeof useModelBrowser>,
+) {
+  const { t } = useTranslation();
+  const count = batchModels?.models.length ?? 0;
+  const batchCountLabel = t("newWorkspace.batch.count", { count, max: MAX_WORKSPACE_BATCH_MODELS });
+  if (count > 0) {
+    return {
+      hasBatch: true,
+      batchCountLabel,
+      modelLabel: batchCountLabel,
+      accessibilityLabel: batchCountLabel,
+    };
+  }
+  return {
+    hasBatch: false,
+    batchCountLabel,
+    modelLabel: shortModelLabel(browser.triggerLabel),
+    accessibilityLabel: t("modelSelector.selectedModel", { model: browser.selectedModelLabel }),
+  };
+}
+
 export function CompactModelSheet({
   providers,
   selectedProvider,
@@ -156,11 +334,13 @@ export function CompactModelSheet({
   glyphs,
   showLabels,
   canSwitchProvider,
+  batchModels,
   contextBridge = null,
   children,
 }: CompactModelSheetProps) {
   const { t } = useTranslation();
   const usesBottomSheet = useIsCompactFormFactor();
+  const autoFocusSearch = isWeb && !usesBottomSheet;
   const modelBrowserScrolling = resolveModelBrowserScrolling({
     isNative,
     isCompact: usesBottomSheet,
@@ -178,7 +358,7 @@ export function CompactModelSheet({
     selectedProvider,
     selectedModel,
     isLoading,
-    autoFocusSearch: isWeb && !usesBottomSheet,
+    autoFocusSearch,
     profiles,
     serverId,
   });
@@ -187,12 +367,20 @@ export function CompactModelSheet({
     selectedProvider,
     selectedModel,
     isLoading,
-    autoFocusSearch: isWeb && !usesBottomSheet,
+    autoFocusSearch,
     profiles,
     serverId,
   });
   const ModelIcon = useProviderIcon(selectedProvider, serverId);
   const hasSelectedProvider = selectedProvider.trim().length > 0;
+  const trigger = useModelSheetTriggerLabels(batchModels, rootBrowser);
+  const { isSelectingBatch, setIsSelectingBatch, selectBatchModel } = useModelSheetBatch({
+    batchModels,
+    isOpen,
+    availableProviders,
+    selectedProvider,
+    selectedModel,
+  });
   const rootHeader = useMemo(
     () => ({
       ...rootBrowser.header,
@@ -211,25 +399,32 @@ export function CompactModelSheet({
   const open = useCallback(() => {
     Keyboard.dismiss();
     rootBrowser.showAll();
+    setIsSelectingBatch(trigger.hasBatch);
     setIsOpen(true);
     onOpen?.();
-  }, [onOpen, rootBrowser]);
+  }, [onOpen, rootBrowser, setIsSelectingBatch, trigger.hasBatch]);
 
   const close = useCallback(() => {
+    const onlyModel = batchModels?.models.length === 1 ? batchModels.models[0] : undefined;
+    if (onlyModel && !batchModels?.disabledReason) {
+      onSelect(onlyModel.provider, onlyModel.modelId);
+      batchModels?.onChange([]);
+    }
     setIsModelBrowserOpen(false);
     setIsOpen(false);
     rootBrowser.reset();
     modelBrowser.reset();
     onClose?.();
-  }, [modelBrowser, onClose, rootBrowser]);
+  }, [batchModels, modelBrowser, onClose, onSelect, rootBrowser]);
 
   const handleSearchSelect = useCallback(
     (provider: string, modelId: string) => {
+      if (selectBatchModel(provider, modelId)) return;
       onSelect(provider, modelId);
       Keyboard.dismiss();
       rootBrowser.showAll();
     },
-    [onSelect, rootBrowser],
+    [onSelect, rootBrowser, selectBatchModel],
   );
 
   const openModelBrowser = useCallback(() => {
@@ -254,18 +449,20 @@ export function CompactModelSheet({
 
   const handleBrowserSelect = useCallback(
     (provider: string, modelId: string) => {
+      if (selectBatchModel(provider, modelId)) return;
       onSelect(provider, modelId);
       closeModelBrowser();
     },
-    [closeModelBrowser, onSelect],
+    [closeModelBrowser, onSelect, selectBatchModel],
   );
 
   const handleDesktopSelect = useCallback(
     (provider: string, modelId: string) => {
+      if (selectBatchModel(provider, modelId)) return;
       onSelect(provider, modelId);
       close();
     },
-    [close, onSelect],
+    [close, onSelect, selectBatchModel],
   );
 
   const handleApplyProfile = useCallback(
@@ -282,6 +479,35 @@ export function CompactModelSheet({
   }, [close, onEditProfiles]);
 
   const profileActions = resolveModelSheetProfileActions(onCreateProfile, onEditProfile, close);
+  const startBatchSelection = useCallback(() => {
+    setIsSelectingBatch(true);
+    if (usesBottomSheet && !isModelBrowserOpen) openModelBrowser();
+  }, [isModelBrowserOpen, openModelBrowser, setIsSelectingBatch, usesBottomSheet]);
+  const cancelBatchSelection = useCallback(() => {
+    batchModels?.onChange([]);
+    setIsSelectingBatch(false);
+  }, [batchModels, setIsSelectingBatch]);
+  const batchControls = useMemo(
+    () =>
+      batchModels ? (
+        <ModelSheetBatchControls
+          picker={batchModels}
+          selecting={isSelectingBatch}
+          onStart={startBatchSelection}
+          onCancel={cancelBatchSelection}
+          onClose={close}
+          countLabel={trigger.batchCountLabel}
+        />
+      ) : null,
+    [
+      trigger.batchCountLabel,
+      batchModels,
+      cancelBatchSelection,
+      close,
+      isSelectingBatch,
+      startBatchSelection,
+    ],
+  );
 
   const toggle = useCallback(() => {
     if (isOpen) {
@@ -318,7 +544,7 @@ export function CompactModelSheet({
     <>
       <ModelSheetTrigger
         ModelIcon={hasSelectedProvider ? ModelIcon : null}
-        modelLabel={shortModelLabel(rootBrowser.triggerLabel)}
+        modelLabel={trigger.modelLabel}
         thinkingLabel={thinkingLabel}
         glyphs={glyphs}
         iconOnly={!showLabels && hasSelectedProvider}
@@ -326,9 +552,7 @@ export function CompactModelSheet({
         searchFocused={rootBrowser.isSearchFocused || modelBrowser.isSearchFocused}
         disabled={disabled}
         onPress={toggle}
-        accessibilityLabel={t("modelSelector.selectedModel", {
-          model: rootBrowser.selectedModelLabel,
-        })}
+        accessibilityLabel={trigger.accessibilityLabel}
         effortKeys={effortKeys}
       />
 
@@ -352,7 +576,7 @@ export function CompactModelSheet({
           <ModelBrowser
             state={rootBrowser}
             onSelect={usesBottomSheet ? handleSearchSelect : handleDesktopSelect}
-            onApplyProfile={handleApplyProfile}
+            onApplyProfile={isSelectingBatch ? undefined : handleApplyProfile}
             onEditProfiles={onEditProfiles ? handleEditProfiles : undefined}
             onCreateProfile={profileActions.create}
             onEditProfile={profileActions.edit}
@@ -361,9 +585,11 @@ export function CompactModelSheet({
             scrolling={modelBrowserScrolling}
             searchAllOnFocus={usesBottomSheet}
             rootBrowseContent={usesBottomSheet ? mobileRootContent : undefined}
+            showProfilesSection={!isSelectingBatch}
           />
         </View>
-        {!usesBottomSheet ? (
+        {!isModelBrowserOpen ? batchControls : null}
+        {!usesBottomSheet && children ? (
           <>
             <View style={styles.modelViewportDivider} />
             <ScrollView
@@ -408,6 +634,7 @@ export function CompactModelSheet({
               showProfilesSection={false}
             />
           </View>
+          {batchControls}
         </AdaptiveModalSheet>
       ) : null}
     </>
@@ -566,6 +793,16 @@ function ModelSheetTrigger({
 }
 
 const styles = StyleSheet.create((theme) => ({
+  batchControls: {
+    gap: theme.spacing[1],
+    paddingVertical: theme.spacing[1],
+  },
+  batchActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: theme.spacing[1],
+  },
   trigger: {
     minWidth: 0,
     flexShrink: 1,

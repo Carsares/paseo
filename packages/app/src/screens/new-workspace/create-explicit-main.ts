@@ -12,6 +12,7 @@ import {
   sameMainDraftTarget,
   type MainDraft,
   type MainDraftAttempt,
+  type MainDraftBatchItem,
   type MainDraftTarget,
 } from "./main-draft";
 
@@ -115,8 +116,9 @@ async function sendMainRequest(input: {
   agent: InitialAgent;
   workspace: WorkspaceDescriptorPayload | null;
   failedMessage: string;
+  onEvent?: (snapshot: CreationSnapshot) => void;
 }): Promise<MainCreationResult> {
-  const { client, attempt, agent, workspace, failedMessage } = input;
+  const { client, attempt, agent, workspace, failedMessage, onEvent } = input;
   const { workspaceId, agentId, placement } = attempt;
   const request = { workspaceId, idempotencyKey: agentId };
   if (workspace) {
@@ -125,6 +127,7 @@ async function sendMainRequest(input: {
       ...request,
       config: { ...agent.config!, cwd: workspace.workspaceDirectory! },
       agentId,
+      ...(onEvent ? { onEvent } : {}),
     });
     return { workspace, agent: created };
   }
@@ -132,7 +135,9 @@ async function sendMainRequest(input: {
     ...placement,
     ...request,
     agent: { ...agent, agentId },
+    ...(onEvent ? { onEvent } : {}),
   });
+  if (payload.creation) onEvent?.(payload.creation);
   if (payload.error || !payload.workspace || !payload.agent) {
     throw Object.assign(new Error(payload.error ?? failedMessage), {
       code: payload.errorCode ?? payload.creation?.errorCode,
@@ -141,7 +146,7 @@ async function sendMainRequest(input: {
   return { workspace: payload.workspace, agent: payload.agent };
 }
 
-export async function createOrRetryWorkspaceMain(input: {
+interface ExplicitMainInput {
   client: MainCreationClient;
   target: MainDraftTarget;
   prepareAgent: () => Promise<InitialAgent>;
@@ -153,7 +158,220 @@ export async function createOrRetryWorkspaceMain(input: {
   unavailableMessage: string;
   inProgressMessage: string;
   failedMessage: string;
-}): Promise<MainCreationResult> {
+}
+
+export interface FixedMainInput {
+  client: MainCreationClient;
+  fixedAttempt: MainDraftBatchItem;
+  agent: InitialAgent;
+  action: "resume" | "check" | "retry";
+  saveItem: (item: MainDraftBatchItem) => Promise<void>;
+  acceptSnapshots: (workspace: WorkspaceDescriptorPayload, agent?: AgentSnapshotPayload) => void;
+  assertSupported: () => void;
+  failedMessage: string;
+}
+
+type FixedReceipt =
+  | { state: "succeeded"; result: MainCreationResult }
+  | {
+      state: "unconfirmed";
+      error?: string;
+      workspace?: WorkspaceDescriptorPayload;
+      agent?: AgentSnapshotPayload;
+    }
+  | { state: "retryable"; error?: string; workspace: WorkspaceDescriptorPayload | null };
+
+function attemptForItem(item: MainDraftBatchItem): MainDraftAttempt {
+  return {
+    workspaceId: item.workspaceId,
+    agentId: item.attemptKind === "agent" ? item.recoveryAgentId : item.agentId,
+    kind: item.attemptKind,
+    placement: item.placement,
+  };
+}
+
+function confirmsInitialPrompt(receipt: CreationSnapshot): boolean {
+  // Completed also means the agent was registered even when its first send failed.
+  // A live event or a durable marker on the receipt confirms the send.
+  return receipt.phase === "prompt_started" || receipt.initialPromptStarted === true;
+}
+
+function readFixedEntities(client: MainCreationClient, attempt: MainDraftAttempt) {
+  return Promise.all([
+    client.findWorkspace(attempt.workspaceId),
+    client.fetchAgent(attempt.agentId),
+  ]);
+}
+
+function isSafeFixedFailure(receipt: CreationSnapshot | null): receipt is CreationSnapshot {
+  return (
+    receipt?.phase === "failed" &&
+    receipt.outcomeUnknown === false &&
+    receipt.failedStage !== "prompt" &&
+    !receipt.agent
+  );
+}
+
+function readRegisteredMain(
+  workspace: WorkspaceDescriptorPayload | null,
+  agent: AgentSnapshotPayload | undefined,
+  attempt: MainDraftAttempt,
+  confirmed: boolean,
+  error?: string,
+): FixedReceipt | undefined {
+  if (!workspace || !agent || !matchesAttempt({ workspace, agent }, attempt)) return;
+  if (confirmed) return { state: "succeeded", result: { workspace, agent } };
+  return { state: "unconfirmed", workspace, agent, error };
+}
+
+function confirmsSavedPrompt(receipt: CreationSnapshot | null): boolean {
+  return Boolean(receipt && confirmsInitialPrompt(receipt));
+}
+
+function unknownFixedReceipt(
+  receipt: CreationSnapshot | null,
+  attempt: MainDraftAttempt,
+): FixedReceipt {
+  const workspace = receipt?.workspace;
+  return {
+    state: "unconfirmed",
+    workspace: workspace?.id === attempt.workspaceId ? workspace : undefined,
+    error: receipt?.error ?? undefined,
+  };
+}
+
+async function readFixedReceipt(
+  client: MainCreationClient,
+  attempt: MainDraftAttempt,
+  promptConfirmed = false,
+): Promise<FixedReceipt> {
+  const receipt = await client.getCreationSnapshot(attempt.kind, attempt.agentId);
+  if (receipt && !matchesReceipt(receipt, attempt)) return { state: "unconfirmed" };
+
+  const confirmed = promptConfirmed || confirmsSavedPrompt(receipt);
+  if (!receipt || confirmed || receipt.agent) {
+    const [workspace, found] = await readFixedEntities(client, attempt);
+    const result = readRegisteredMain(
+      workspace,
+      found?.agent,
+      attempt,
+      confirmed,
+      receipt?.error ?? undefined,
+    );
+    if (result) return result;
+  }
+
+  if (isSafeFixedFailure(receipt)) {
+    const [workspace, found] = await readFixedEntities(client, attempt);
+    if (!found?.agent && canRetryMainReceipt(receipt, workspace)) {
+      return { state: "retryable", workspace, error: receipt.error ?? undefined };
+    }
+  }
+
+  return unknownFixedReceipt(receipt, attempt);
+}
+
+async function runFixedMainAttempt(input: FixedMainInput): Promise<void> {
+  const { client, fixedAttempt, action, saveItem, acceptSnapshots, failedMessage } = input;
+  if (fixedAttempt.stage === "succeeded") return;
+  const saveSuccess = async (item: MainDraftBatchItem, result: MainCreationResult) => {
+    acceptSnapshots(result.workspace, result.agent);
+    await saveItem({ ...item, stage: "succeeded", agentReady: true, error: undefined });
+  };
+  const readReceipt = async (item: MainDraftBatchItem): Promise<FixedReceipt> => {
+    try {
+      return await readFixedReceipt(client, attemptForItem(item), item.promptConfirmed);
+    } catch {
+      return { state: "unconfirmed" };
+    }
+  };
+  const storeReceipt = async (item: MainDraftBatchItem, receipt: FixedReceipt) => {
+    if (receipt.state === "succeeded") {
+      await saveSuccess(item, receipt.result);
+      return;
+    }
+    const agent = receipt.state === "unconfirmed" ? receipt.agent : undefined;
+    if (receipt.workspace) acceptSnapshots(receipt.workspace, agent);
+    await saveItem({
+      ...item,
+      stage: receipt.state,
+      agentReady: Boolean(agent) || item.agentReady,
+      error: receipt.error ?? item.error,
+    });
+  };
+
+  let item = fixedAttempt;
+  let workspace: WorkspaceDescriptorPayload | null = null;
+  if (item.stage === "queued") {
+    if (action === "check") return;
+  } else {
+    const receipt = await readReceipt(item);
+    if (action !== "retry" || receipt.state !== "retryable") {
+      await storeReceipt(item, receipt);
+      return;
+    }
+    workspace = receipt.workspace;
+    if (workspace) {
+      acceptSnapshots(workspace);
+      // The original receipt owns its claimed agent ID. The separate agent request
+      // uses its own reserved ID in the same, already-created workspace.
+      item = { ...item, attemptKind: "agent" };
+    }
+  }
+
+  input.assertSupported();
+  if (workspace && !workspace.workspaceDirectory) throw new Error(failedMessage);
+  item = { ...item, stage: "sending", error: undefined };
+  await saveItem(item);
+  const attempt = attemptForItem(item);
+  let confirmationWrite: Promise<void> | undefined;
+  let result: MainCreationResult;
+  try {
+    result = await sendMainRequest({
+      client,
+      attempt,
+      workspace,
+      agent: asExplicitWorkspaceMain(input.agent),
+      failedMessage,
+      onEvent: (receipt) => {
+        if (
+          item.promptConfirmed ||
+          !matchesReceipt(receipt, attempt) ||
+          !confirmsInitialPrompt(receipt)
+        ) {
+          return;
+        }
+        item = { ...item, promptConfirmed: true };
+        // Preserve the positive evidence even if the final response is lost.
+        confirmationWrite = saveItem(item);
+        void confirmationWrite.catch(() => undefined);
+      },
+    });
+    if (!matchesAttempt(result, attempt)) throw new Error(failedMessage);
+  } catch (error) {
+    await confirmationWrite;
+    await storeReceipt(
+      { ...item, error: error instanceof Error ? error.message : undefined },
+      await readReceipt(item),
+    );
+    return;
+  }
+  await confirmationWrite;
+  if (item.promptConfirmed) {
+    await saveSuccess(item, result);
+  } else {
+    const receipt = await readReceipt(item);
+    await storeReceipt(item, receipt.state === "unconfirmed" ? { ...receipt, ...result } : receipt);
+  }
+}
+
+export function createOrRetryWorkspaceMain(input: FixedMainInput): Promise<void>;
+export function createOrRetryWorkspaceMain(input: ExplicitMainInput): Promise<MainCreationResult>;
+export function createOrRetryWorkspaceMain(input: ExplicitMainInput | FixedMainInput) {
+  return "fixedAttempt" in input ? runFixedMainAttempt(input) : runExplicitMainAttempt(input);
+}
+
+async function runExplicitMainAttempt(input: ExplicitMainInput): Promise<MainCreationResult> {
   const { client, target, previous, save, unavailableMessage, failedMessage } = input;
   if (previous && !sameMainDraftTarget(previous.target, target))
     throw new Error(unavailableMessage);

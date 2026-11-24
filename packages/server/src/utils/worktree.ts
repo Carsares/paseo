@@ -58,6 +58,11 @@ const execFileAsync = promisify(execFile);
 const READ_ONLY_GIT_ENV = {
   GIT_OPTIONAL_LOCKS: "0",
 } as const;
+const FIXED_START_POINT_GIT_ENV = {
+  ...READ_ONLY_GIT_ENV,
+  GIT_NO_LAZY_FETCH: "1",
+  GIT_NO_REPLACE_OBJECTS: "1",
+} as const;
 
 export interface WorktreeConfig {
   branchName: string;
@@ -203,6 +208,8 @@ export type WorktreeSource =
       branchName: string;
       /** Where the new branch starts when that is not `baseBranch`, such as a fork's head. */
       startPoint?: string;
+      /** A caller-pinned commit belonging to the ordinary base branch. */
+      fixedStartPoint?: string;
     }
   | { kind: "checkout-branch"; branchName: string }
   | { kind: "restore"; branchName: string; baseRef: string | null }
@@ -1698,6 +1705,9 @@ export async function createWorktree({
     await runGitCommand(["worktree", "add", worktreePath, ...sourcePlan.addArguments], {
       cwd,
       timeout: 120_000,
+      ...(source.kind === "branch-off" && source.fixedStartPoint !== undefined
+        ? { envOverlay: FIXED_START_POINT_GIT_ENV }
+        : {}),
     });
     worktreePath = await normalizePathForOwnership(worktreePath);
 
@@ -2119,6 +2129,17 @@ async function verifyPluginCheckoutTarget(options: {
       expectedChangeRequestHeadSha,
     });
   }
+  if (source.kind === "branch-off" && source.fixedStartPoint !== undefined) {
+    const { stdout } = await runGitCommand(["rev-parse", "--verify", "HEAD"], {
+      cwd: worktreePath,
+      envOverlay: FIXED_START_POINT_GIT_ENV,
+    });
+    if (stdout.trim() !== source.fixedStartPoint.toLowerCase()) {
+      throw new Error(
+        `Plugin ${worktreeManagerPluginId} did not check out the fixed start point ${source.fixedStartPoint}`,
+      );
+    }
+  }
   if (source.kind === "restore" || source.kind === "restore-from-base") {
     if (branchName !== source.branchName) {
       throw new Error(
@@ -2326,6 +2347,18 @@ export async function prepareWorktreeBranchOff(
   source: Extract<WorktreeSource, { kind: "branch-off" }>,
   previous?: PreparedWorktreeBranchOff,
 ): Promise<PreparedWorktreeBranchOff> {
+  if (source.fixedStartPoint !== undefined) {
+    const fixed = await resolveFixedWorktreeStartPoint(
+      cwd,
+      source.baseBranch,
+      source.fixedStartPoint,
+    );
+    return {
+      baseRef: fixed.baseRef,
+      checkoutRef: fixed.commitSha,
+      branchExists: await localBranchExists(cwd, source.branchName),
+    };
+  }
   const baseRef = previous?.baseRef ?? (await resolveBaseBranchForWorktree(cwd, source.baseBranch));
   const branchExists = await localBranchExists(cwd, source.branchName);
   const checkoutRef = branchExists ? source.branchName : (source.startPoint ?? baseRef);
@@ -2702,6 +2735,7 @@ async function resolveCheckoutBranchBaseRef(cwd: string, branchName: string): Pr
 async function resolveBaseBranchForWorktree(
   cwd: string,
   requestedBaseBranch: string,
+  ordinaryBranchOnly = false,
 ): Promise<string> {
   const requested = requestedBaseBranch.trim();
   const normalized = normalizeRequiredBaseBranch(requested);
@@ -2712,17 +2746,20 @@ async function resolveBaseBranchForWorktree(
     exactRef = `refs/remotes/${requested}`;
   }
 
-  if (exactRef) {
-    try {
-      await runGitCommand(["rev-parse", "--verify", exactRef], { cwd });
-      return exactRef;
-    } catch {
-      throw new Error(`Base branch not found: ${exactRef}`);
-    }
-  }
-
-  const candidates = [`refs/heads/${requested}`, `refs/remotes/origin/${requested}`, requested];
+  const candidates = exactRef
+    ? [exactRef]
+    : [`refs/heads/${requested}`, `refs/remotes/origin/${requested}`, requested];
   for (const candidate of candidates) {
+    if (ordinaryBranchOnly) {
+      const result = await runGitCommand(
+        ["rev-parse", "--symbolic-full-name", "--verify", "--end-of-options", candidate],
+        { cwd, envOverlay: FIXED_START_POINT_GIT_ENV, acceptExitCodes: [0, 128] },
+      );
+      if (result.exitCode !== 0) continue;
+      const ref = result.stdout.trim();
+      if (ref.startsWith("refs/heads/") || ref.startsWith("refs/remotes/")) return ref;
+      break;
+    }
     try {
       await runGitCommand(["rev-parse", "--verify", candidate], { cwd });
       return candidate;
@@ -2730,7 +2767,57 @@ async function resolveBaseBranchForWorktree(
       // Try the next unambiguous local, remote, or legacy ref candidate.
     }
   }
-  throw new Error(`Base branch not found: ${normalized}`);
+  if (ordinaryBranchOnly) {
+    throw new Error(`Fixed worktree start points require a local or remote branch: ${requested}`);
+  }
+  throw new Error(`Base branch not found: ${exactRef ?? normalized}`);
+}
+
+function isFullCommitSha(value: string): boolean {
+  return (value.length === 40 || value.length === 64) && !/[^0-9a-f]/i.test(value);
+}
+
+export async function resolveFixedWorktreeStartPoint(
+  cwd: string,
+  refName: string,
+  startPoint?: string,
+): Promise<{ baseRef: string; commitSha: string }> {
+  if (startPoint !== undefined && !isFullCommitSha(startPoint)) {
+    throw new Error("The fixed worktree start point must be a full commit SHA.");
+  }
+  const git = { cwd, envOverlay: FIXED_START_POINT_GIT_ENV };
+  const baseRef = await resolveBaseBranchForWorktree(cwd, refName, true);
+  const { stdout } = await runGitCommand(["show-ref", "--hash", "--verify", baseRef], git);
+  const baseSha = stdout.trim();
+  const commitSha = startPoint?.toLowerCase() ?? baseSha;
+  if (!isFullCommitSha(commitSha) || commitSha.length !== baseSha.length) {
+    throw new Error("The fixed worktree start point must be a full commit SHA in this repository.");
+  }
+  const isCommit = async (sha: string) => {
+    const object = await runGitCommand(["cat-file", "-t", sha], {
+      ...git,
+      acceptExitCodes: [0, 128],
+    });
+    return object.exitCode === 0 && object.stdout.trim() === "commit";
+  };
+  if (!(await isCommit(commitSha))) {
+    throw new Error("The fixed worktree start point is not a commit in this repository.");
+  }
+  // An arbitrary object might be the fetched head of an untrusted change request.
+  // Accept older tips of the selected branch, without trusting unrelated commits.
+  if (commitSha !== baseSha) {
+    if (!(await isCommit(baseSha))) {
+      throw new Error("The worktree base branch does not point to a commit.");
+    }
+    const ancestry = await runGitCommand(["merge-base", "--is-ancestor", commitSha, baseSha], {
+      ...git,
+      acceptExitCodes: [0, 1],
+    });
+    if (ancestry.exitCode !== 0) {
+      throw new Error("The fixed worktree start point is not in the history of the base branch.");
+    }
+  }
+  return { baseRef, commitSha };
 }
 
 // Clients give up on a create request after 60s. A remote that accepts the connection and never

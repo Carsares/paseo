@@ -4576,6 +4576,47 @@ test("metadata needs a host that advertises entityMetadata and sends nothing to 
   expect(mock.sent).toHaveLength(0);
 });
 
+test("workspace start point resolution and pinned creates send nothing to older hosts", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "worktree-pin-old-host",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connected = client.connect();
+  mock.triggerOpen({ features: { creationLifecycle: true } });
+  await connected;
+
+  expect(client.supportsWorkspaceFixedStartPoint()).toBe(false);
+  await expect(client.resolveWorkspaceWorktreeStartPoint({ cwd: "/repo" })).rejects.toThrow(
+    "Update the host",
+  );
+  await expect(
+    client.createWorkspace({
+      source: { kind: "worktree", cwd: "/repo", action: "branch-off", startPoint: "a".repeat(40) },
+    }),
+  ).rejects.toThrow("Update the host");
+  expect(mock.sent).toHaveLength(0);
+
+  const creation = client.createWorkspace({ source: { kind: "worktree", cwd: "/repo" } });
+  const request = parseSentFrame(mock.sent[0]);
+  expect(request).toMatchObject({ type: "workspace.create.request", source: { kind: "worktree" } });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "workspace.create.response",
+      payload: {
+        requestId: request.requestId,
+        workspace: null,
+        setupTerminalId: null,
+        error: "test response",
+      },
+    }),
+  );
+  await expect(creation).resolves.toMatchObject({ error: "test response" });
+});
+
 test("sends internal workspace creation and internal listings only to hosts that support them", async () => {
   const logger = createMockLogger();
   const mock = createMockTransport();

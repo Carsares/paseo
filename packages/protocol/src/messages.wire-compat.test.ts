@@ -6,6 +6,8 @@ import {
   MutableDaemonConfigPatchSchema,
   UsageReportEntrySchema,
   AgentForkSourceSchema,
+  CreationSnapshotSchema,
+  CreationSubscribeResponseSchema,
   AgentSnapshotPayloadSchema,
   AgentTimelineItemPayloadSchema,
   ServerInfoStatusPayloadSchema,
@@ -21,6 +23,79 @@ import {
   WorkspaceBaseBranchSetResponseSchema,
 } from "./messages.js";
 import { validateWSOutboundMessage } from "./validation/ws-outbound.js";
+
+test("workspace creation keeps accepting legacy sources and preserves a capability-gated pin", () => {
+  const request = { type: "workspace.create.request", requestId: "create-1" };
+  for (const source of [
+    { kind: "directory", path: "/repo" },
+    { kind: "worktree", cwd: "/repo" },
+    { kind: "worktree", cwd: "/repo", githubPrNumber: 5 },
+    {
+      kind: "worktree",
+      projectId: "repo",
+      action: "branch-off",
+      refName: "refs/heads/main",
+      startPoint: "a".repeat(40),
+    },
+  ]) {
+    expect(SessionInboundMessageSchema.parse({ ...request, source })).toEqual({
+      ...request,
+      source,
+    });
+  }
+  expect(
+    SessionInboundMessageSchema.safeParse({
+      ...request,
+      source: { kind: "directory", path: "/repo", startPoint: "a".repeat(40) },
+    }).success,
+  ).toBe(false);
+});
+
+test("the fixed worktree start point RPC preserves its correlated reply", () => {
+  const request = {
+    type: "workspace.worktree.resolve_start_point.request",
+    requestId: "resolve-1",
+    projectId: "repo",
+    refName: "refs/remotes/upstream/main",
+  };
+  expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+  const response = {
+    type: "session",
+    message: {
+      type: "workspace.worktree.resolve_start_point.response",
+      payload: {
+        requestId: request.requestId,
+        commitSha: "a".repeat(40),
+        refName: request.refName,
+        error: null,
+      },
+    },
+  };
+  expect(validateWSOutboundMessage(response)).toMatchObject({ success: true, data: response });
+});
+
+test("creation receipt readers accept old receipts and preserve optional prompt confirmation", () => {
+  const oldReceipt = {
+    kind: "workspace",
+    idempotencyKey: "create-1",
+    revision: 4,
+    phase: "completed",
+    workspaceId: "workspace",
+    agentId: "agent",
+    error: null,
+  };
+  const confirmedReceipt = { ...oldReceipt, initialPromptStarted: true };
+  const legacyReader = CreationSnapshotSchema.omit({ initialPromptStarted: true });
+  expect(legacyReader.parse(confirmedReceipt)).toEqual(oldReceipt);
+  expect(CreationSnapshotSchema.parse(oldReceipt)).toEqual(oldReceipt);
+  const response = {
+    type: "creation.subscribe.response",
+    payload: { requestId: "read-1", snapshot: confirmedReceipt, error: null },
+  };
+  expect(CreationSubscribeResponseSchema.parse(response)).toEqual(response);
+  const envelope = { type: "session", message: response };
+  expect(validateWSOutboundMessage(envelope)).toMatchObject({ success: true, data: envelope });
+});
 
 test("fork sources require a source agent and validate optional boundaries", () => {
   expect(AgentForkSourceSchema.parse({ sourceAgentId: "source-agent" })).toEqual({

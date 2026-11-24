@@ -19,6 +19,7 @@ import {
   type CreatedWorktree,
 } from "../utils/worktree.js";
 import {
+  assertFixedStartPointSource,
   resolveWorktreeCreationIntent,
   type ResolveWorktreeCreationIntentInput,
   UnsupportedForgeCheckoutTargetError,
@@ -37,6 +38,7 @@ export interface CreateWorktreeCoreInput {
   branchName?: string;
   refName?: string;
   action?: "branch-off" | "checkout";
+  startPoint?: string;
   checkoutSource?: ChangeRequestCheckoutSource;
   githubPrNumber?: number;
   firstAgentContext?: FirstAgentContext;
@@ -73,48 +75,38 @@ export async function createWorktreeCore(
   return runWithGitCommandPriority("high", () => createWorktreeCoreWithPriority(input, deps));
 }
 
+function resolveIntentInput(
+  input: CreateWorktreeCoreInput,
+  worktreeSlug: string | undefined,
+): ResolveWorktreeCreationIntentInput {
+  const source = {
+    refName: input.refName,
+    checkoutSource: input.checkoutSource,
+    githubPrNumber: input.githubPrNumber,
+  };
+  if (input.action === "checkout") return { ...source, action: "checkout", worktreeSlug };
+  // A change request with no action is checked out, as clients did before `action` existed.
+  if (input.action !== "branch-off" && (input.checkoutSource || input.githubPrNumber !== undefined))
+    return { ...source, worktreeSlug };
+  return {
+    ...source,
+    action: "branch-off",
+    startPoint: input.startPoint,
+    branchName: input.branchName?.trim(),
+    worktreeSlug: worktreeSlug ?? normalizeWorktreeSlug(createNameId()),
+  };
+}
+
 async function createWorktreeCoreWithPriority(
   input: CreateWorktreeCoreInput,
   deps: CreateWorktreeCoreDeps,
 ): Promise<CreateWorktreeCoreResult> {
+  assertFixedStartPointSource(input);
   const repoRoot = await resolveWorktreeRepoRoot(input, deps.workspaceGitService);
   const requestedWorktreeSlug = input.worktreeSlug
     ? normalizeWorktreeSlug(input.worktreeSlug)
     : undefined;
-  const requestedBranchName = input.branchName?.trim();
-
-  let intentInput: ResolveWorktreeCreationIntentInput;
-  if (input.action === "checkout") {
-    intentInput = {
-      action: "checkout",
-      refName: input.refName,
-      checkoutSource: input.checkoutSource,
-      githubPrNumber: input.githubPrNumber,
-      worktreeSlug: requestedWorktreeSlug,
-    };
-  } else if (
-    input.action !== "branch-off" &&
-    (input.checkoutSource !== undefined || input.githubPrNumber !== undefined)
-  ) {
-    // A change request with no action is checked out, as clients did before `action` existed.
-    intentInput = {
-      checkoutSource: input.checkoutSource,
-      githubPrNumber: input.githubPrNumber,
-      refName: input.refName,
-      worktreeSlug: requestedWorktreeSlug,
-    };
-  } else {
-    const worktreeSlug = requestedWorktreeSlug ?? normalizeWorktreeSlug(createNameId());
-    intentInput = {
-      action: "branch-off",
-      refName: input.refName,
-      checkoutSource: input.checkoutSource,
-      githubPrNumber: input.githubPrNumber,
-      branchName: requestedBranchName,
-      worktreeSlug,
-    };
-  }
-
+  const intentInput = resolveIntentInput(input, requestedWorktreeSlug);
   const forge = await resolveForge(repoRoot, deps, intentInput);
   let intent = await resolveWorktreeCreationIntent(intentInput, repoRoot, {
     forge: forge.forge,
@@ -161,6 +153,15 @@ async function createWorktreeCoreWithPriority(
   const transformed = deps.lifecycle
     ? await deps.lifecycle.before("worktree.create.before", request)
     : request;
+  if (intent.kind === "branch-off" && intent.fixedStartPoint !== undefined) {
+    if (
+      transformed.kind !== "branch-off" ||
+      transformed.baseRef !== intent.baseBranch ||
+      (transformed.startPoint !== undefined && transformed.startPoint !== intent.fixedStartPoint)
+    ) {
+      throw new Error("worktree.create.before hooks cannot change a fixed worktree source");
+    }
+  }
   const originalUntrustedSource = worktreeUntrustedSource(intent);
   normalizedSlug = validateWorktreeSlug(transformed.slug);
   intent = creationIntentFromRequest(transformed, intent);
@@ -227,7 +228,13 @@ async function tryCreateWithWorktreeManager(options: {
       };
       if (request.kind === "branch-off" && intent.kind === "branch-off") {
         preparedBranchOff = await prepareWorktreeBranchOff(repoRoot, intent);
-        request = { ...request, baseRef: preparedBranchOff.baseRef };
+        request = {
+          ...request,
+          baseRef: preparedBranchOff.baseRef,
+          ...(intent.fixedStartPoint !== undefined
+            ? { startPoint: preparedBranchOff.checkoutRef }
+            : {}),
+        };
       }
       return deps.worktreeManagers!.createWorktree(request);
     },
@@ -239,14 +246,16 @@ function describeCreationRequest(
   intent: WorktreeCreationIntent,
   placement: Pick<PluginWorktreeCreateRequest, "repoRoot" | "sourceCheckout" | "slug" | "path">,
 ): PluginWorktreeCreateRequest {
-  if (intent.kind === "branch-off")
+  if (intent.kind === "branch-off") {
+    const startPoint = intent.fixedStartPoint ?? intent.startPoint;
     return {
       ...placement,
       kind: intent.kind,
       branch: intent.branchName,
       baseRef: intent.baseBranch,
-      ...(intent.startPoint ? { startPoint: intent.startPoint } : {}),
+      ...(startPoint !== undefined ? { startPoint } : {}),
     };
+  }
   if (intent.kind === "checkout-branch")
     return { ...placement, kind: intent.kind, branch: intent.branchName };
   const { localBranchName, baseRefName, ...facts } = intent;
@@ -263,13 +272,15 @@ function creationIntentFromRequest(
   original: WorktreeCreationIntent,
 ): WorktreeCreationIntent {
   if (request.kind === "branch-off") {
-    // Plugins see the base; where a branch off a fork's change request starts stays Paseo's.
+    // The base and checkout point are separate. Preserve the original checkout point.
     const startPoint = original.kind === "branch-off" ? original.startPoint : undefined;
+    const fixedStartPoint = original.kind === "branch-off" ? original.fixedStartPoint : undefined;
     return {
       kind: request.kind,
       branchName: request.branch,
       baseBranch: request.baseRef,
       ...(startPoint ? { startPoint } : {}),
+      ...(fixedStartPoint !== undefined ? { fixedStartPoint } : {}),
     };
   }
   if (request.kind === "checkout-branch") {
