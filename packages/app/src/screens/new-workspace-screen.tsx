@@ -36,11 +36,13 @@ import { MenuHeader } from "@/components/headers/menu-header";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { useToast } from "@/contexts/toast-context";
 import { useAgentInputDraft } from "@/composer/draft/input-draft";
+import { DraftAgentControls } from "@/composer/agent-controls";
 import {
   findWorkspaceBatchModel,
   type WorkspaceBatchModel,
 } from "@/composer/agent-controls/model-sheet-flow";
 import { useStableEvent } from "@/hooks/use-stable-event";
+import { watchTopicCreation } from "@/composer/draft/topic-receipts";
 import {
   canChooseWorkspaceMain,
   workspaceMainBlockMessage,
@@ -169,6 +171,14 @@ import {
 } from "./new-workspace/existing-worktrees";
 import { useNewWorkspaceForm } from "./new-workspace/form";
 import { DraftTitleEditor } from "./new-workspace/draft-title-editor";
+import { TopicCreationStatus, TopicFields } from "./new-workspace/form/topic-fields";
+import {
+  readTopicFields,
+  runTopicCreation,
+  topicRequest,
+  type TopicOutcome,
+  type TopicPrompt,
+} from "./new-workspace/topic-creation";
 import { createOrRetryWorkspaceMain } from "./new-workspace/create-explicit-main";
 import {
   prepareWorkspaceMainBatch,
@@ -179,6 +189,7 @@ import {
 } from "./new-workspace/main-batch";
 import {
   canCoordinateMainDraftWindows,
+  hasMainDraftSubmission,
   readMainDraft,
   restoreMainDraftAtTarget,
   subscribeToMainDraftBatch,
@@ -1260,7 +1271,8 @@ function useMainDraftSelection(id: string, initial: MainDraft | null) {
     // The screen's initial query can finish before another view commits its last update.
     async function refreshBatch() {
       const next = await readMainDraft(id);
-      if (reading && (next?.batch || mainDraftRef.current?.batch)) accept(next);
+      if (reading && (hasMainDraftSubmission(next) || hasMainDraftSubmission(mainDraftRef.current)))
+        accept(next);
     }
     void refreshBatch().catch(() => {});
     return () => {
@@ -1297,6 +1309,7 @@ function resolveDraftBatchAvailability({
   clientReady,
   supportsCreateAsMain,
   supportsFixedStartPoint,
+  allowEmpty,
 }: {
   isolation: MainDraftTarget["isolation"];
   selectedItem: PickerItem | null;
@@ -1306,11 +1319,12 @@ function resolveDraftBatchAvailability({
   clientReady: boolean;
   supportsCreateAsMain: boolean;
   supportsFixedStartPoint: boolean;
+  allowEmpty: boolean;
 }) {
   return workspaceBatchBlock({
     isolation,
     isBranchOff: selectedItem?.kind !== "github-pr" && branchAction === "branch-off",
-    hasContent: hasDraftText || attachmentCount > 0,
+    hasContent: allowEmpty || hasDraftText || attachmentCount > 0,
     connected: clientReady,
     supported: supportsCreateAsMain && supportsFixedStartPoint,
     canCoordinateWindows: canCoordinateMainDraftWindows(),
@@ -1450,6 +1464,30 @@ function WorkspaceCreationError({ message }: { message: string | null }) {
   );
 }
 
+async function prepareTopicPrompt(
+  message: MessagePayload,
+  options: {
+    draftId: string;
+    supportsForgeSearch: boolean;
+    metadata?: Record<string, JsonValue>;
+    failedMessage: string;
+  },
+): Promise<TopicPrompt> {
+  const wire = splitComposerAttachmentsForSubmit(message.attachments, {
+    format: resolveComposerAttachmentSubmitFormat({
+      supportsForgeAttachments: options.supportsForgeSearch,
+    }),
+  });
+  return {
+    initialPrompt: message.text,
+    agentId: crypto.randomUUID(),
+    clientMessageId: `${options.draftId}:initial-message`,
+    attachments: wire.attachments,
+    images: await encodeImages(wire.images, options.failedMessage),
+    metadata: options.metadata,
+  };
+}
+
 function NewWorkspaceForm({
   serverId,
   sourceDirectory: sourceDirectoryProp,
@@ -1525,6 +1563,22 @@ function NewWorkspaceForm({
   const supportsWorkspaceMultiplicity = useHostFeature(selectedServerId, "workspaceMultiplicity");
   const supportsForgeSearch = useHostFeature(selectedServerId, "forgeSearch");
   const createMainAgent = useDefaultWorkspaceMainAgent(selectedServerId);
+  const supportsTopic = useHostFeature(selectedServerId, "topicWorkbenchV1");
+  const supportsTopicPreset = useHostFeature(selectedServerId, "workspaceMainAgentDefault");
+  const [legacyLaunch, setLegacyLaunch] = useState(false);
+  const [topicText, setTopicText] = useState("");
+  const [topicDirection, setTopicDirection] = useState("");
+  const [hideTopic, setHideTopic] = useState(false);
+  const [topicPreset, setTopicPreset] = useState(false);
+  const [questionOpen, setQuestionOpen] = useState(false);
+  const [topicOutcome, setTopicOutcome] = useState<TopicOutcome | null>(null);
+  const { attempt: topicAttempt, active: isTopicMode } = resolveTopicMode({
+    draft: mainDraft,
+    supportsTopic,
+    legacyLaunch,
+    handoff: Boolean(draftId),
+  });
+  const topicFields = readTopicFields(topicText, topicDirection, hideTopic);
   const draftKey = buildNewWorkspaceDraftKey(draftId);
   const creationDraftId = creationIdentity.draftId;
   const commitTitle = useCallback(
@@ -1581,11 +1635,12 @@ function NewWorkspaceForm({
   const [manualLaunchTarget, setManualLaunchTarget] = useState<LaunchTarget | null>(null);
   const launchTarget = useMemo(
     () =>
-      isTimelineFork || mainBatch || (mainDraft && !manualLaunchTarget)
+      isTopicMode || isTimelineFork || mainBatch || (mainDraft && !manualLaunchTarget)
         ? CHAT_LAUNCH_TARGET
         : resolveLaunchTarget(manualLaunchTarget ?? formPreferences.launchTarget, terminalProfiles),
     [
       isTimelineFork,
+      isTopicMode,
       mainBatch,
       mainDraft,
       manualLaunchTarget,
@@ -1796,6 +1851,7 @@ function NewWorkspaceForm({
     branchAction: refActionFor.branch,
     hasDraftText,
     attachmentCount: chatDraft.attachments.length,
+    allowEmpty: isTopicMode,
     clientReady,
     supportsCreateAsMain,
     supportsFixedStartPoint,
@@ -1811,6 +1867,7 @@ function NewWorkspaceForm({
   }, [t, toast]);
   const forgetMainTarget = useCallback(() => {
     if (
+      mainDraftRef.current?.topicAttempt ||
       mainDraftRef.current?.attempt ||
       mainDraftRef.current?.batch ||
       pendingExplicitMainSubmissions.has(creationDraftId)
@@ -1829,6 +1886,7 @@ function NewWorkspaceForm({
   useLayoutEffect(() => {
     beforeIsolationChange.current = (next) => {
       if (
+        mainDraftRef.current?.topicAttempt ||
         mainDraftRef.current?.attempt ||
         mainDraftRef.current?.batch ||
         pendingExplicitMainSubmissions.has(creationDraftId)
@@ -1841,6 +1899,7 @@ function NewWorkspaceForm({
   }, [choice, creationDraftId, existingWorktreePath, forgetMainTarget, mainDraftRef]);
   const workspaceMain = useMemo(() => {
     if (
+      isTopicMode ||
       !mainTarget ||
       !canChooseWorkspaceMain({
         setup: forkDraftSetup?.setup,
@@ -1867,6 +1926,7 @@ function NewWorkspaceForm({
     creationDraftId,
     draftId,
     forkDraftSetup?.setup,
+    isTopicMode,
     isTerminalLaunch,
     mainAttempt,
     mainBatch,
@@ -2160,7 +2220,12 @@ function NewWorkspaceForm({
   const assertNoMainAttempt = useCallback(async () => {
     if (draftId) return;
     const saved = await readMainDraft(creationDraftId);
-    if (pendingExplicitMainSubmissions.has(creationDraftId) || saved?.attempt || saved?.batch) {
+    if (
+      pendingExplicitMainSubmissions.has(creationDraftId) ||
+      saved?.attempt ||
+      saved?.topicAttempt ||
+      saved?.batch
+    ) {
       throw new Error(workspaceMainBlockMessage(t, "unknown"));
     }
   }, [creationDraftId, draftId, t]);
@@ -2272,7 +2337,12 @@ function NewWorkspaceForm({
         client: withConnectedClient(),
         save: (batch) => saveMainDraft({ ...draft, batch }, true),
         acceptSnapshots: acceptWorkspaceMainSnapshots,
-        assertSupported: assertBatchSupported,
+        assertSupported: () => {
+          if (draft.batch?.items[0]?.placement.topic && !supportsTopic) {
+            throw new Error(t("topicWorkbench.updateHost"));
+          }
+          assertBatchSupported();
+        },
         failedMessage: t("composer.errors.failedToCreateAgent"),
       });
     },
@@ -2301,6 +2371,43 @@ function NewWorkspaceForm({
   useEffect(() => {
     if (hasBatch && clientReady) void handleBatchAction({ kind: "resume" });
   }, [client, clientReady, handleBatchAction, hasBatch]);
+
+  const runTopicRecoveryRead = useStableEvent(
+    async (read: (saved: MainDraft | null) => Promise<boolean>) => {
+      if (!isStillOnCreateScreen() || pendingExplicitMainSubmissions.has(creationDraftId))
+        return false;
+      pendingExplicitMainSubmissions.add(creationDraftId);
+      try {
+        return await withMainDraftOperation(creationDraftId, async () =>
+          read(await readMainDraft(creationDraftId)),
+        );
+      } finally {
+        pendingExplicitMainSubmissions.delete(creationDraftId);
+      }
+    },
+  );
+  const batchReceiptKeys = pendingTopicBatchReceipts(mainBatch);
+  const refreshTopicBatchItem = useStableEvent(
+    (workspaceId: string, idempotencyKey: string, update?: CreationSnapshot) =>
+      runTopicRecoveryRead(async (saved) => {
+        if (!saved || !isPendingTopicBatchReceipt(saved.batch, idempotencyKey)) return true;
+        await runSavedBatch(saved, { kind: "check", workspaceId, update });
+        const updated = await readMainDraft(creationDraftId);
+        return !isPendingTopicBatchReceipt(updated?.batch, idempotencyKey);
+      }),
+  );
+  useEffect(() => {
+    if (!clientReady || !client || !batchReceiptKeys) return;
+    const receipts: [string, string][] = JSON.parse(batchReceiptKeys);
+    const stops = receipts.map(([workspaceId, idempotencyKey]) =>
+      watchTopicCreation(client, { kind: "workspace", idempotencyKey }, (update) =>
+        refreshTopicBatchItem(workspaceId, idempotencyKey, update),
+      ),
+    );
+    return () => {
+      for (const stop of stops) stop();
+    };
+  }, [batchReceiptKeys, client, clientReady, refreshTopicBatchItem]);
 
   const finishWorkspaceMainBatch = useStableEvent(async () => {
     if (
@@ -2331,13 +2438,17 @@ function NewWorkspaceForm({
   });
 
   const startWorkspaceMainBatch = useStableEvent(
-    async (payload: MessagePayload, draft: MainDraft) => {
+    async (
+      payload: MessagePayload,
+      draft: MainDraft,
+      topic?: NonNullable<ReturnType<typeof readTopicFields>>,
+    ) => {
       const blocked = workspaceBatchBlock({
         isolation: draft.target.isolation,
         isBranchOff:
           setup.getSnapshot().pickerSelection.selectedItem?.kind !== "github-pr" &&
           setup.refActionFor("branch") === "branch-off",
-        hasContent: !isEmptyWorkspaceSubmission(payload),
+        hasContent: Boolean(topic) || !isEmptyWorkspaceSubmission(payload),
         connected: clientReady,
         supported: supportsCreateAsMain && supportsFixedStartPoint,
         canCoordinateWindows: canCoordinateMainDraftWindows(),
@@ -2358,7 +2469,7 @@ function NewWorkspaceForm({
       const images = await encodeImages(wire.images, t("composer.errors.failedToSend"));
       const metadata = composerState?.metadata;
       const batch: MainDraftBatch = await prepareWorkspaceMainBatch({
-        placement: { ...placement, source },
+        placement: { ...placement, source, ...topic },
         models: draft.models ?? [],
         message: {
           initialPrompt: payload.text,
@@ -2379,6 +2490,122 @@ function NewWorkspaceForm({
       if (saved) await runSavedBatch(saved, { kind: "resume" });
     },
   );
+
+  const runSavedTopic = useStableEvent(
+    async (draft: MainDraft, action: "submit" | "check" | "retry", update?: CreationSnapshot) => {
+      if (!draft.topicAttempt || draft.target.serverId !== selectedServerId) return false;
+      if (action !== "check" && !supportsTopic) throw new Error(t("topicWorkbench.updateHost"));
+      const outcome = await runTopicCreation(
+        withConnectedClient(),
+        draft.topicAttempt,
+        action,
+        update,
+      );
+      setTopicOutcome(outcome);
+      if (outcome.workspace) acceptWorkspaceMainSnapshots(outcome.workspace, outcome.agent);
+      if (outcome.stage !== "succeeded") return false;
+
+      const clearConsumedDraft = captureWorkspaceDraftCleanup({
+        draftId: creationDraftId,
+        draftKey,
+        draftContextScopeKey,
+        clearDraft: chatDraft.clear,
+      });
+      await useWorkspaceDraftSubmissionStore.getState().finishDraftTitle(creationDraftId);
+      await writeMainDraft(creationDraftId, null, { finishBatch: true });
+      clearConsumedDraft();
+      if (isStillOnCreateScreen()) {
+        leaveFullscreen();
+        navigateToWorkspace({
+          serverId: draft.target.serverId,
+          workspaceId: outcome.workspace.id,
+          ...(outcome.agent ? { target: { kind: "agent", agentId: outcome.agent.id } } : {}),
+        });
+      }
+      return true;
+    },
+  );
+
+  const prepareTopicMain = useStableEvent(
+    async (question: MessagePayload | undefined, cwd: string) => {
+      if (!question && !topicPreset) return null;
+      if (question) assertExplicitMainSupported();
+      else if (!supportsTopicPreset) throw new Error(t("topicWorkbench.updateHost"));
+      const provider = composerState?.selectedProvider;
+      if (!provider) throw new Error(t("newWorkspace.errors.selectModel"));
+      const config = buildWorkspaceAgentConfig(cwd, provider, composerState);
+      const prompt = question
+        ? await prepareTopicPrompt(question, {
+            draftId: creationDraftId,
+            supportsForgeSearch,
+            metadata: composerState.metadata,
+            failedMessage: t("composer.errors.failedToSend"),
+          })
+        : undefined;
+      return { config, prompt };
+    },
+  );
+
+  const handleTopicAction = useStableEvent(
+    async (action: "submit" | "check" | "retry", question?: MessagePayload) => {
+      if (pendingExplicitMainSubmissions.has(creationDraftId)) return;
+      pendingExplicitMainSubmissions.add(creationDraftId);
+      setPendingAction("chat");
+      setErrorMessage(null);
+      try {
+        await withMainDraftOperation(creationDraftId, async () => {
+          const saved = await readMainDraft(creationDraftId);
+          if (saved?.topicAttempt) {
+            await runSavedTopic(saved, action === "submit" ? "check" : action);
+            return;
+          }
+          if (action !== "submit" || saved?.batch || saved?.attempt) return;
+          if (!supportsTopic) throw new Error(t("topicWorkbench.updateHost"));
+          if (!topicFields || !mainTarget) throw new Error(t("topicWorkbench.required"));
+          const prompt = questionOpen && question?.text.trim() ? question : undefined;
+          const armed = restoreMainDraftAtTarget(saved, mainTarget);
+          if (draftModelCount(armed) > 1 && armed) {
+            await startWorkspaceMainBatch(
+              prompt ?? {
+                cwd: mainTarget.directory,
+                text: "",
+                attachments: [],
+              },
+              armed,
+              topicFields,
+            );
+            return;
+          }
+          const placement = await prepareWorkspacePlacement(false, undefined, true);
+          const main = await prepareTopicMain(prompt, mainTarget.directory);
+          const workspaceId = `wks_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
+          const request = topicRequest(
+            { source: placement.source, metadata: { ...placement.metadata }, ...topicFields },
+            { workspaceId, idempotencyKey: creationDraftId },
+            main,
+          );
+          const draft = { target: mainTarget, topicAttempt: request };
+          await saveMainDraft(draft, true);
+          await runSavedTopic(draft, "submit");
+        });
+      } catch (error) {
+        setErrorMessage(workspaceCreationErrorMessage(t, error, Boolean(question?.text.trim())));
+      } finally {
+        pendingExplicitMainSubmissions.delete(creationDraftId);
+        setPendingAction(null);
+      }
+    },
+  );
+  useEffect(() => {
+    if (!topicAttempt || !clientReady || !client) return;
+    const { idempotencyKey } = topicAttempt;
+    return watchTopicCreation(client, { kind: "workspace", idempotencyKey }, (update) =>
+      runTopicRecoveryRead(async (saved) => {
+        if (saved?.topicAttempt?.idempotencyKey !== idempotencyKey) return true;
+        return runSavedTopic(saved, "check", update);
+      }),
+    );
+  }, [topicAttempt, client, clientReady, runSavedTopic, runTopicRecoveryRead]);
 
   const submitExplicitMain = useCallback(
     async (payload: MessagePayload, target: MainDraftTarget) => {
@@ -2699,29 +2926,61 @@ function NewWorkspaceForm({
   ]);
 
   const changeBatchModels = useStableEvent((models: WorkspaceBatchModel[]) => {
-    const draft = restoreMainDraftAtTarget(mainDraftRef.current, mainTarget);
+    if (!mainTarget) return;
+    const saved = restoreMainDraftAtTarget(mainDraftRef.current, mainTarget);
+    const draft = saved ?? (isTopicMode ? { target: mainTarget } : null);
     if (
       !draft ||
       draft.attempt ||
-      draft.batch ||
+      hasMainDraftSubmission(draft) ||
       pendingExplicitMainSubmissions.has(creationDraftId)
     )
       return;
-    if (models.length > (draft.models?.length ?? 0) && batchBlock) return;
-    void saveMainDraft({ target: draft.target, ...(models.length > 0 ? { models } : {}) }).catch(
+    const needsWorktree = isTopicMode && models.length > 1 && mainTarget.isolation !== "worktree";
+    if (
+      models.length > (draft.models?.length ?? 0) &&
+      batchBlock &&
+      !(needsWorktree && batchBlock === "worktreeRequired" && canCreateWorktree)
+    )
+      return;
+    const target = needsWorktree
+      ? { ...mainTarget, isolation: "worktree" as const, directory: mainTarget.sourceDirectory }
+      : draft.target;
+    if (needsWorktree) {
+      setIsolation("worktree");
+      setup.chooseRefAction("branch", "branch-off");
+    }
+    void saveMainDraft({ target, ...(models.length > 0 ? { models } : {}) }).catch(
       reportMainDraftStorageError,
     );
   });
   const batchModels = useMemo(
     () =>
-      workspaceMain?.checked && !mainAttempt
+      (workspaceMain?.checked ||
+        (isTopicMode && supportsTopicPreset && (topicPreset || questionOpen))) &&
+      !mainAttempt
         ? {
             models: mainDraft?.models ?? [],
-            disabledReason: batchBlock ? t(`newWorkspace.batch.${batchBlock}`) : undefined,
+            disabledReason:
+              batchBlock && !(isTopicMode && canCreateWorktree && batchBlock === "worktreeRequired")
+                ? t(`newWorkspace.batch.${batchBlock}`)
+                : undefined,
             onChange: changeBatchModels,
           }
         : undefined,
-    [batchBlock, changeBatchModels, mainAttempt, mainDraft?.models, t, workspaceMain?.checked],
+    [
+      batchBlock,
+      canCreateWorktree,
+      changeBatchModels,
+      isTopicMode,
+      mainAttempt,
+      mainDraft?.models,
+      questionOpen,
+      supportsTopicPreset,
+      t,
+      topicPreset,
+      workspaceMain?.checked,
+    ],
   );
   const agentControlsWithDisabled = useMemo(() => {
     if (!composerState) return undefined;
@@ -2758,7 +3017,7 @@ function NewWorkspaceForm({
 
   const formStack = useNewWorkspaceForm({
     isCompact,
-    isPending: isPending || hasBatch,
+    isPending: isWorkspaceFormLocked(isPending, mainDraft),
     pluginItems: (
       <PluginNewWorkspaceItems serverId={selectedServerId} screen={pluginScreen} setup={setup} />
     ),
@@ -2821,14 +3080,109 @@ function NewWorkspaceForm({
       canChooseAction: supportsRefActions,
       changeRequestContext,
     },
-    launch: launchControl,
+    launch: { ...launchControl, hidden: isTopicMode },
   });
 
   const importSession = useImportSession({ serverId: selectedServerId });
 
   const isComposerFullscreen = composerEditing.isFullscreen(isTerminalLaunch);
   const composerCwd = workingDirectory ?? "";
+  const commandDraft = composerState?.commandDraft;
   const hasMultipleModels = draftModelCount(mainDraft) >= 2;
+  const topicCreateLabel = topicSubmitLabel(t, questionOpen, hasDraftText);
+  const submitTopicWithoutQuestion = useCallback(
+    () => void handleTopicAction("submit"),
+    [handleTopicAction],
+  );
+  const submitTopicWithQuestion = useCallback(
+    (payload: MessagePayload) => handleTopicAction("submit", payload),
+    [handleTopicAction],
+  );
+  const toggleTopicQuestion = useCallback(() => setQuestionOpen((open) => !open), []);
+  const useDirectLaunch = useStableEvent(() => {
+    if (forgetMainTarget()) setLegacyLaunch(true);
+  });
+  const presetControls = useMemo(() => {
+    if (!isTopicMode || !topicPreset || questionOpen || !agentControlsWithDisabled) return null;
+    return (
+      <DraftAgentControls
+        {...agentControlsWithDisabled}
+        draftId={draftKey}
+        serverId={selectedServerId}
+        context="new-workspace"
+        showToolbar
+      />
+    );
+  }, [
+    agentControlsWithDisabled,
+    draftKey,
+    isTopicMode,
+    questionOpen,
+    selectedServerId,
+    topicPreset,
+  ]);
+  const topicInput = useMemo(
+    () => ({
+      compact: isCompact,
+      locked: isPending,
+      topicText,
+      direction: topicDirection,
+      onTopicChange: setTopicText,
+      onDirectionChange: setTopicDirection,
+      hidden: hideTopic,
+      onHiddenChange: setHideTopic,
+      preset: topicPreset,
+      onPresetChange: setTopicPreset,
+      supportsPreset: supportsTopicPreset,
+      presetControls,
+      questionOpen,
+      onQuestionToggle: toggleTopicQuestion,
+      onDirect: useDirectLaunch,
+    }),
+    [
+      isCompact,
+      isPending,
+      topicText,
+      topicDirection,
+      hideTopic,
+      topicPreset,
+      supportsTopicPreset,
+      presetControls,
+      questionOpen,
+      toggleTopicQuestion,
+      useDirectLaunch,
+    ],
+  );
+  const topicComposer = (
+    <Composer
+      key="topic-question"
+      editingSession={composerEditing.chat}
+      agentId={draftKey}
+      serverId={selectedServerId}
+      isPaneFocused={isScreenFocused}
+      onSubmitMessage={submitTopicWithQuestion}
+      allowEmptySubmit
+      submitLabel={topicCreateLabel}
+      submitButtonAccessibilityLabel={topicCreateLabel}
+      submitButtonTestID="topic-create-submit"
+      isSubmitLoading={isPending}
+      submitBehavior="preserve-and-lock"
+      blurOnSubmit
+      waitForForgeAutoAttachOnSubmit
+      textSource={chatDraft.textSource}
+      onChangeText={chatDraft.editText}
+      textReplacement={chatDraft.textReplacement}
+      attachments={chatDraft.attachments}
+      attachmentScopeKeys={visibleDraftContextScopeKeys}
+      onChangeAttachments={chatDraft.setAttachments}
+      onForgeChangeRequestDetected={handleForgeChangeRequestDetected}
+      onForgeChangeRequestAutoAttach={handleForgeChangeRequestAutoAttach}
+      cwd={composerCwd}
+      clearDraft={handleClearDraft}
+      agentControls={agentControlsWithDisabled}
+      commandDraft={commandDraft}
+    />
+  );
   const composer = isTerminalLaunch ? (
     <Composer
       key="terminal"
@@ -2886,28 +3240,50 @@ function NewWorkspaceForm({
       clearDraft={handleClearDraft}
       autoFocus
       autoFocusKey={launchFocusKey}
-      commandDraft={composerState?.commandDraft}
+      commandDraft={commandDraft}
       agentControls={agentControlsWithDisabled}
     />
   );
-  const title = useMemo(
-    () => (
+  const title = useMemo(() => {
+    if (isTopicMode) return null;
+    return (
       <DraftTitleEditor
         value={creationIdentity.title}
         onCommit={commitTitle}
         compact={isCompact}
         disabled={isPending || hasBatch || creationIdentity.submitted}
       />
-    ),
-    [
-      creationIdentity.title,
-      creationIdentity.submitted,
-      commitTitle,
-      hasBatch,
-      isCompact,
-      isPending,
-    ],
+    );
+  }, [
+    creationIdentity.title,
+    creationIdentity.submitted,
+    commitTitle,
+    hasBatch,
+    isCompact,
+    isPending,
+    isTopicMode,
+  ]);
+  const topicContent = (
+    <TopicCreationContent
+      pending={isPending}
+      questionOpen={questionOpen}
+      hasBatch={hasBatch}
+      attempt={topicAttempt}
+      outcome={topicOutcome}
+      clientReady={clientReady}
+      canSubmit={canSubmitTopic(topicFields, mainTarget, clientReady)}
+      serverId={selectedServerId}
+      submitLabel={topicCreateLabel}
+      onSubmit={submitTopicWithoutQuestion}
+      onAction={handleTopicAction}
+    >
+      {topicComposer}
+    </TopicCreationContent>
   );
+  const topicSetup = useMemo(() => {
+    if (!isTopicMode || topicAttempt || hasBatch || isComposerFullscreen) return null;
+    return <TopicFields {...topicInput} />;
+  }, [hasBatch, isComposerFullscreen, isTopicMode, topicAttempt, topicInput]);
   return (
     <FileDropZone style={styles.container}>
       <NewWorkspaceLayout
@@ -2915,9 +3291,10 @@ function NewWorkspaceForm({
         fullscreen={isComposerFullscreen}
         title={title}
         formStack={formStack}
+        topicSetup={topicSetup}
         onImportSession={importSession.open}
       >
-        {composer}
+        {isTopicMode ? topicContent : composer}
         <WorkspaceMainBatchResults
           draft={mainDraft}
           currentServerId={selectedServerId}
@@ -2930,6 +3307,136 @@ function NewWorkspaceForm({
       </NewWorkspaceLayout>
       {importSession.sheet}
     </FileDropZone>
+  );
+}
+
+function resolveTopicMode(input: {
+  draft: MainDraft | null;
+  supportsTopic: boolean;
+  legacyLaunch: boolean;
+  handoff: boolean;
+}) {
+  const { draft, supportsTopic, legacyLaunch, handoff } = input;
+  const attempt = draft?.topicAttempt;
+  const topicBatch = Boolean(draft?.batch?.items[0]?.placement.topic);
+  return {
+    attempt,
+    active:
+      Boolean(attempt || topicBatch) ||
+      (supportsTopic && !legacyLaunch && !handoff && !draft?.attempt && !draft?.batch),
+  };
+}
+
+function isWorkspaceFormLocked(pending: boolean, draft: MainDraft | null) {
+  return pending || hasMainDraftSubmission(draft);
+}
+
+function topicSubmitLabel(t: TFunction, questionOpen: boolean, hasDraftText: boolean) {
+  return questionOpen && hasDraftText
+    ? t("topicWorkbench.createAndAsk")
+    : t("topicWorkbench.create");
+}
+
+function canSubmitTopic(
+  fields: ReturnType<typeof readTopicFields>,
+  target: MainDraftTarget | null,
+  connected: boolean,
+) {
+  return Boolean(fields && target && connected);
+}
+
+function topicOutcomeError(outcome: TopicOutcome | null) {
+  return outcome && outcome.stage !== "succeeded" ? (outcome.error ?? null) : null;
+}
+
+function isPendingTopicBatchItem(item: MainDraftBatch["items"][number]) {
+  return Boolean(
+    item.placement.topic && (item.stage === "sending" || item.stage === "unconfirmed"),
+  );
+}
+
+function isPendingTopicBatchReceipt(batch: MainDraft["batch"], key: string) {
+  return (
+    batch?.items.some((item) => item.agentId === key && isPendingTopicBatchItem(item)) ?? false
+  );
+}
+
+function pendingTopicBatchReceipts(batch: MainDraft["batch"]) {
+  const pending = batch?.items.filter(isPendingTopicBatchItem);
+  // Stage updates replace the batch object. Only restart listeners when the pending keys change.
+  return pending?.length
+    ? JSON.stringify(pending.map((item) => [item.workspaceId, item.agentId]))
+    : null;
+}
+
+function TopicCreationContent({
+  pending,
+  questionOpen,
+  hasBatch,
+  attempt,
+  outcome,
+  clientReady,
+  canSubmit,
+  serverId,
+  submitLabel,
+  onSubmit,
+  onAction,
+  children,
+}: {
+  pending: boolean;
+  questionOpen: boolean;
+  hasBatch: boolean;
+  attempt: MainDraft["topicAttempt"];
+  outcome: TopicOutcome | null;
+  clientReady: boolean;
+  canSubmit: boolean;
+  serverId: string;
+  submitLabel: string;
+  onSubmit: () => void;
+  onAction: (action: "check" | "retry") => Promise<void>;
+  children: ReactNode;
+}) {
+  const { t } = useTranslation();
+  const retry = outcome?.stage === "retryable";
+  const workspaceId = outcome?.workspace?.id;
+  const check = useCallback(() => void onAction(retry ? "retry" : "check"), [onAction, retry]);
+  const open = useCallback(() => {
+    if (workspaceId) navigateToWorkspace({ serverId, workspaceId });
+  }, [serverId, workspaceId]);
+  if (hasBatch) return null;
+  if (attempt) {
+    let status = t("topicWorkbench.unconfirmed");
+    if (pending) status = t("topicWorkbench.preparing");
+    else if (retry) status = t("topicWorkbench.failed");
+    else if (attempt.agent && workspaceId) status = t("topicWorkbench.promptUnconfirmed");
+    return (
+      <View style={styles.topicRecovery}>
+        <TopicCreationStatus message={status} />
+        {pending ? null : (
+          <Button variant="outline" disabled={!clientReady} onPress={check}>
+            {retry ? t("common.actions.retry") : t("newWorkspace.batch.check")}
+          </Button>
+        )}
+        {!pending && workspaceId ? (
+          <Button variant="outline" onPress={open}>
+            {t("topicWorkbench.open")}
+          </Button>
+        ) : null}
+        <WorkspaceCreationError message={topicOutcomeError(outcome)} />
+      </View>
+    );
+  }
+  return (
+    <>
+      {questionOpen ? (
+        children
+      ) : (
+        <Button testID="topic-create-submit" disabled={pending || !canSubmit} onPress={onSubmit}>
+          {submitLabel}
+        </Button>
+      )}
+      {pending ? <TopicCreationStatus message={t("topicWorkbench.preparing")} /> : null}
+    </>
   );
 }
 
@@ -3026,6 +3533,7 @@ function NewWorkspaceLayout({
   fullscreen,
   title,
   formStack,
+  topicSetup,
   onImportSession,
   children,
 }: {
@@ -3034,6 +3542,7 @@ function NewWorkspaceLayout({
   fullscreen: boolean;
   title: ReactNode;
   formStack: ReactNode;
+  topicSetup: ReactNode;
   onImportSession: () => void;
   children: ReactNode;
 }) {
@@ -3043,14 +3552,23 @@ function NewWorkspaceLayout({
     [isCompact, onImportSession],
   );
   // On compact screens the fields sit above the composer, within reach of the thumb.
+  const compactFormStack = topicSetup ? (
+    <ScrollView style={styles.compactTopicForm} keyboardShouldPersistTaps="handled">
+      {topicSetup}
+      {formStack}
+    </ScrollView>
+  ) : (
+    formStack
+  );
   const setupFields = isCompact ? (
     <>
       <View style={styles.compactSetupSpace} pointerEvents="none" />
-      {formStack}
+      {compactFormStack}
     </>
   ) : (
     <>
       <View style={styles.composerTitleContainer}>{title}</View>
+      {topicSetup}
       {formStack}
     </>
   );
@@ -3111,6 +3629,7 @@ const styles = StyleSheet.create((theme, runtime) => ({
   compactSetupSpace: {
     flex: 1,
   },
+  compactTopicForm: { flexGrow: 0, flexShrink: 1 },
   composerTitleContainer: {
     marginBottom: theme.spacing[8],
     paddingLeft: theme.spacing[6],
@@ -3135,6 +3654,7 @@ const styles = StyleSheet.create((theme, runtime) => ({
   batchResultActions: { alignItems: "flex-end", gap: theme.spacing[1] },
   batchModelLabel: { color: theme.colors.foreground, fontSize: theme.fontSize.base },
   batchResultStatus: { color: theme.colors.foregroundMuted, fontSize: theme.fontSize.sm },
+  topicRecovery: { gap: theme.spacing[2], paddingHorizontal: theme.spacing[4] },
 }));
 
 /**

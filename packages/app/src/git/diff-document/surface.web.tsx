@@ -1,3 +1,4 @@
+import { DiffHunkOverlays } from "./hunk-overlays";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ViewStyle } from "react-native";
@@ -183,6 +184,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
   const measurement =
     readyTypographyResource === typographyResource ? typographyResource.measureText : null;
   const reviewActions = props.mode.kind === "working" ? props.mode.reviewActions : undefined;
+  const hunkActions = props.mode.kind === "working" && Boolean(props.mode.renderHunkActions);
   const model = useMemo(() => {
     if (!loadedTypography || !measurement) {
       return emptyDiffDocumentModel({
@@ -202,6 +204,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
       measureText: measurement,
       palette: props.palette,
       reviewActions,
+      hunkActions,
       labels: {
         binary: t("workspace.git.diff.binaryFile"),
         tooLarge: t("workspace.git.diff.tooLarge"),
@@ -221,6 +224,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
     props.files,
     props.palette,
     reviewActions,
+    hunkActions,
     t,
     desiredTypography.lineHeight,
     loadedTypography,
@@ -950,6 +954,12 @@ export function DiffSurface(props: DiffSurfaceProps) {
                 onScroll={handleHorizontalScroll}
               />
             ))}
+          <DiffHunkOverlays
+            model={model}
+            mode={props.mode}
+            scrollTop={fileWindowTop}
+            viewportHeight={viewport.height}
+          />
           {props.mode.kind === "working" && reviewActions
             ? model.rows.map((row) => {
                 if (row.kind !== "line" || row.reviewHeight === 0) return null;

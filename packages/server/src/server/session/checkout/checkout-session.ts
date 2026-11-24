@@ -57,6 +57,13 @@ import {
 import { runGitCommand } from "../../../utils/run-git-command.js";
 import { expandTilde } from "../../../utils/path.js";
 import { listGitWorktrees } from "../../../utils/worktree.js";
+import {
+  handleGitWorkbenchRequest,
+  type GitWorkbenchHost,
+  type GitWorkbenchRequest,
+} from "../../git/checkout-git-workbench.js";
+import { GitCommitBaselines } from "../../git/git-commit-baselines.js";
+import { findGitWorktree, repoWriteMutex } from "../../git/repo-write-mutex.js";
 import type { GitMetadataGenerator } from "./git-metadata-generator.js";
 
 /**
@@ -72,6 +79,8 @@ export interface CheckoutSessionHost {
   emit(msg: SessionOutboundMessage): void;
   emitWorkspaceUpdateForCwd(cwd: string): Promise<void>;
   handleWorkspaceGitBranchSnapshot(cwd: string, branchName: string | null): void;
+  listActiveGitAgents: GitWorkbenchHost["listActiveAgents"];
+  withGitDirectoryWrite: GitWorkbenchHost["withDirectoryWrite"];
   renameCurrentBranch(
     cwd: string,
     branch: string,
@@ -159,6 +168,7 @@ export class CheckoutSession {
   private readonly paseoHome: string;
   private readonly worktreesRoot: string | undefined;
   private readonly logger: pino.Logger;
+  private readonly gitCommitBaselines = new GitCommitBaselines();
   private readonly statusUpdateFingerprints = new Map<string, string>();
 
   constructor(options: CheckoutSessionOptions) {
@@ -581,13 +591,54 @@ export class CheckoutSession {
   // Command operations (writes) and GitHub-PR operations
   // ---------------------------------------------------------------------------
 
+  async handleGitWorkbench(msg: GitWorkbenchRequest): Promise<void> {
+    const response = await handleGitWorkbenchRequest(
+      msg,
+      {
+        listActiveAgents: (root) => this.host.listActiveGitAgents(root),
+        withDirectoryWrite: (cwd, write) => this.host.withGitDirectoryWrite(cwd, write),
+        refresh: async (root, cwd, reason) => {
+          await Promise.all(
+            (root === cwd ? [root] : [root, cwd]).flatMap((path) => [
+              this.gitMutation.notifyGitMutation(path, reason, {
+                invalidateForge: reason === "commit-changes",
+              }),
+              this.scheduleDiffRefresh(path),
+            ]),
+          );
+        },
+        generateCommitMessage: (cwd, source) =>
+          this.gitMetadataGenerator.generateCommitMessage(cwd, source),
+        reportBackgroundError: (err, cwd) =>
+          this.logger.warn({ err, cwd }, "Git workbench background task failed"),
+      },
+      this.gitCommitBaselines,
+    );
+    this.host.emit(response);
+  }
+
+  private async withLegacyGitWrite<T>(
+    cwd: string,
+    operation: string,
+    write: () => Promise<T>,
+  ): Promise<T> {
+    const repo = await findGitWorktree(cwd).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    });
+    // Keep the legacy operation's error mapping for missing/non-Git checkouts.
+    return repo ? repoWriteMutex.run(repo, operation, write) : write();
+  }
+
   async handleCheckoutSwitchBranchRequest(
     msg: Extract<SessionInboundMessage, { type: "checkout_switch_branch_request" }>,
   ): Promise<void> {
     const { cwd, branch, requestId } = msg;
 
     try {
-      const checkoutResult = await this.gitMutation.checkoutExistingBranch(cwd, branch);
+      const checkoutResult = await this.withLegacyGitWrite(cwd, "switch-branch", () =>
+        this.gitMutation.checkoutExistingBranch(cwd, branch),
+      );
       await this.scheduleDiffRefresh(cwd);
 
       // Push a workspace_update immediately so the sidebar/header reflect
@@ -638,7 +689,9 @@ export class CheckoutSession {
     }
 
     try {
-      const result = await this.host.renameCurrentBranch(cwd, branch);
+      const result = await this.withLegacyGitWrite(cwd, "rename-branch", () =>
+        this.host.renameCurrentBranch(cwd, branch),
+      );
       await this.gitMutation.notifyGitMutation(cwd, "rename-branch", { invalidateForge: true });
       await this.scheduleDiffRefresh(cwd);
       this.host.handleWorkspaceGitBranchSnapshot(cwd, result.currentBranch);
@@ -680,7 +733,7 @@ export class CheckoutSession {
   ): Promise<void> {
     const { cwd, paths, requestId } = msg;
     try {
-      await discardChanges(cwd, paths);
+      await this.withLegacyGitWrite(cwd, "discard-changes", () => discardChanges(cwd, paths));
       await this.gitMutation.notifyGitMutation(cwd, "discard-changes");
       await this.scheduleDiffRefresh(cwd);
       this.host.emit({
@@ -704,10 +757,12 @@ export class CheckoutSession {
       const message = branchLabel
         ? `${CheckoutSession.PASEO_STASH_PREFIX} ${branchLabel}`
         : `${CheckoutSession.PASEO_STASH_PREFIX} unnamed`;
-      await runGitCommand(["stash", "push", "--include-untracked", "-m", message], {
-        cwd,
-        timeout: 120_000,
-      });
+      await this.withLegacyGitWrite(cwd, "stash-push", () =>
+        runGitCommand(["stash", "push", "--include-untracked", "-m", message], {
+          cwd,
+          timeout: 120_000,
+        }),
+      );
       await this.gitMutation.notifyGitMutation(cwd, "stash-push");
       await this.scheduleDiffRefresh(cwd);
       this.host.emit({
@@ -727,10 +782,12 @@ export class CheckoutSession {
   ): Promise<void> {
     const { cwd, stashIndex, requestId } = msg;
     try {
-      await runGitCommand(["stash", "pop", `stash@{${stashIndex}}`], {
-        cwd,
-        timeout: 120_000,
-      });
+      await this.withLegacyGitWrite(cwd, "stash-pop", () =>
+        runGitCommand(["stash", "pop", `stash@{${stashIndex}}`], {
+          cwd,
+          timeout: 120_000,
+        }),
+      );
       await this.gitMutation.notifyGitMutation(cwd, "stash-pop");
       await this.scheduleDiffRefresh(cwd);
       this.host.emit({
@@ -779,10 +836,12 @@ export class CheckoutSession {
         throw new Error("Commit message is required");
       }
 
-      await commitChanges(cwd, {
-        message,
-        addAll: msg.addAll ?? true,
-      });
+      await this.withLegacyGitWrite(cwd, "commit-changes", () =>
+        commitChanges(cwd, {
+          message,
+          addAll: msg.addAll ?? true,
+        }),
+      );
       await this.gitMutation.notifyGitMutation(cwd, "commit-changes");
       await this.scheduleDiffRefresh(cwd);
 
@@ -814,33 +873,35 @@ export class CheckoutSession {
     const { cwd, requestId } = msg;
 
     try {
-      const snapshot = await this.workspaceGitService.getSnapshot(cwd);
-      if (!snapshot.git.isGit) {
-        throw new Error(`Not a git repository: ${cwd}`);
-      }
-
-      if (msg.requireCleanTarget) {
-        if (snapshot.git.isDirty) {
-          throw new Error("Working directory has uncommitted changes.");
+      const mutatedCwd = await this.withLegacyGitWrite(cwd, "merge-to-base", async () => {
+        const snapshot = await this.workspaceGitService.getSnapshot(cwd);
+        if (!snapshot.git.isGit) {
+          throw new Error(`Not a git repository: ${cwd}`);
         }
-      }
 
-      let baseRef = msg.baseRef ?? snapshot.git.baseRef;
-      if (!baseRef) {
-        throw new Error("Base branch is required for merge");
-      }
-      if (baseRef.startsWith("origin/")) {
-        baseRef = baseRef.slice("origin/".length);
-      }
+        if (msg.requireCleanTarget) {
+          if (snapshot.git.isDirty) {
+            throw new Error("Working directory has uncommitted changes.");
+          }
+        }
 
-      const mutatedCwd = await mergeToBase(
-        cwd,
-        {
-          baseRef,
-          mode: msg.strategy === "squash" ? "squash" : "merge",
-        },
-        { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
-      );
+        let baseRef = msg.baseRef ?? snapshot.git.baseRef;
+        if (!baseRef) {
+          throw new Error("Base branch is required for merge");
+        }
+        if (baseRef.startsWith("origin/")) {
+          baseRef = baseRef.slice("origin/".length);
+        }
+
+        return mergeToBase(
+          cwd,
+          {
+            baseRef,
+            mode: msg.strategy === "squash" ? "squash" : "merge",
+          },
+          { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
+        );
+      });
       await Promise.all([
         this.gitMutation.notifyGitMutation(mutatedCwd, "merge-to-base", { invalidateForge: true }),
         ...(mutatedCwd !== cwd ? [this.gitMutation.notifyGitMutation(cwd, "merge-to-base")] : []),
@@ -875,21 +936,23 @@ export class CheckoutSession {
     const { cwd, requestId } = msg;
 
     try {
-      if (msg.requireCleanTarget ?? true) {
-        const snapshot = await this.workspaceGitService.getSnapshot(cwd);
-        if (snapshot.git.isDirty) {
-          throw new Error("Working directory has uncommitted changes.");
+      await this.withLegacyGitWrite(cwd, "merge-from-base", async () => {
+        if (msg.requireCleanTarget ?? true) {
+          const snapshot = await this.workspaceGitService.getSnapshot(cwd);
+          if (snapshot.git.isDirty) {
+            throw new Error("Working directory has uncommitted changes.");
+          }
         }
-      }
 
-      await mergeFromBase(
-        cwd,
-        {
-          baseRef: msg.baseRef,
-          requireCleanTarget: msg.requireCleanTarget ?? true,
-        },
-        { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
-      );
+        await mergeFromBase(
+          cwd,
+          {
+            baseRef: msg.baseRef,
+            requireCleanTarget: msg.requireCleanTarget ?? true,
+          },
+          { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
+        );
+      });
       await this.gitMutation.notifyGitMutation(cwd, "merge-from-base", { invalidateForge: true });
       await this.scheduleDiffRefresh(cwd);
 
@@ -921,7 +984,7 @@ export class CheckoutSession {
     const { cwd, requestId } = msg;
 
     try {
-      await pullCurrentBranch(cwd);
+      await this.withLegacyGitWrite(cwd, "pull", () => pullCurrentBranch(cwd));
       await this.gitMutation.notifyGitMutation(cwd, "pull", { invalidateForge: true });
       await this.scheduleDiffRefresh(cwd);
 
@@ -953,7 +1016,7 @@ export class CheckoutSession {
     const { cwd, requestId } = msg;
 
     try {
-      await pushCurrentBranch(cwd);
+      await this.withLegacyGitWrite(cwd, "push", () => pushCurrentBranch(cwd));
       await this.gitMutation.notifyGitMutation(cwd, "push", { invalidateForge: true });
       this.host.emit({
         type: "checkout_push_response",
@@ -993,15 +1056,17 @@ export class CheckoutSession {
       }
 
       const { service } = await this.requireForgeService(cwd);
-      const result = await createPullRequest(
-        cwd,
-        {
-          title,
-          body,
-          base: msg.baseRef,
-        },
-        service,
-        { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
+      const result = await this.withLegacyGitWrite(cwd, "create-pr", () =>
+        createPullRequest(
+          cwd,
+          {
+            title,
+            body,
+            base: msg.baseRef,
+          },
+          service,
+          { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
+        ),
       );
       await this.gitMutation.notifyGitMutation(cwd, "create-pr", { invalidateForge: true });
 
@@ -1581,6 +1646,7 @@ export class CheckoutSession {
   }
 
   cleanup(): void {
+    this.gitCommitBaselines.clear();
     this.statusUpdateFingerprints.clear();
   }
 }

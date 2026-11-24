@@ -80,6 +80,8 @@ import {
   type AgentScreenReadySyncState,
 } from "@/hooks/use-agent-screen-state-machine";
 import { useQueryClient } from "@tanstack/react-query";
+import { TopicEmptyState, useTopicWorkspace } from "@/panels/topic-empty-state";
+import { useHostFeature } from "@/runtime/host-features";
 import { isAgentArchiving, useArchiveAgent } from "@/hooks/use-archive-agent";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useContainerWidthBelow } from "@/hooks/use-container-width";
@@ -563,6 +565,27 @@ function AgentPanelBody({
 }) {
   const { t } = useTranslation();
   const agentId = resolveConversationAgentId(target);
+  const supportsTopic = useHostFeature(serverId, "topicWorkbenchV1");
+  const isMainBeforeFirstQuestion = useSessionStore((state) => {
+    if (!supportsTopic) return false;
+    const agent = resolveChatAgentFromSession(state, serverId, agentId);
+    return Boolean(
+      agent &&
+      agent.status === "closed" &&
+      !agent.lastUserMessageAt &&
+      !agent.archivedAt &&
+      isWorkspaceRootAgent(agent, workspaceId) &&
+      isMainControlAgent(agent),
+    );
+  });
+  const [openTopicConversation, setOpenTopicConversation] = useState<string>();
+  const askFirstTopicQuestion = useCallback(() => setOpenTopicConversation(agentId), [agentId]);
+  const { workspace: topicWorkspace, isLoading: isLoadingTopicWorkspace } = useTopicWorkspace({
+    serverId,
+    workspaceId,
+    client,
+    enabled: isMainBeforeFirstQuestion && isConnected,
+  });
   const { isArchivingAgent: _isArchivingAgent } = useArchiveAgent();
   const hasSession = useSessionStore((state) => Boolean(state.sessions[serverId]));
   const projectPlacement = useStoreWithEqualityFn(
@@ -678,7 +701,10 @@ function AgentPanelBody({
         }
       : null;
 
-  if (target.kind === "agent" && !agent) {
+  if (
+    (target.kind === "agent" && !agent) ||
+    (isMainBeforeFirstQuestion && isLoadingTopicWorkspace)
+  ) {
     return (
       <View style={styles.container} testID="agent-loading">
         <View style={styles.errorContainer}>
@@ -686,6 +712,15 @@ function AgentPanelBody({
         </View>
       </View>
     );
+  }
+
+  if (
+    isMainBeforeFirstQuestion &&
+    agentId &&
+    topicWorkspace?.topic?.mainAgentId === agentId &&
+    openTopicConversation !== agentId
+  ) {
+    return <TopicEmptyState workspace={topicWorkspace} onAsk={askFirstTopicQuestion} />;
   }
 
   return (

@@ -138,6 +138,8 @@ function makeCheckoutSession(options?: {
     handleWorkspaceGitBranchSnapshot: (cwd, branchName) => {
       hostCalls.handleWorkspaceGitBranchSnapshot.push({ cwd, branchName });
     },
+    listActiveGitAgents: async () => [],
+    withGitDirectoryWrite: async (_cwd, write) => write(),
     renameCurrentBranch: async (cwd, branch) => {
       hostCalls.renameCurrentBranch.push({ cwd, branch });
       return { previousBranch: null, currentBranch: branch };

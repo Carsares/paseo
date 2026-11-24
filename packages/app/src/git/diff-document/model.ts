@@ -25,6 +25,7 @@ import type {
 } from "./types";
 
 export const FILE_HEADER_HEIGHT = 30;
+export const HUNK_ACTIONS_HEIGHT = 44;
 export const DIFF_BODY_BORDER_HEIGHT = 1;
 const CODE_HORIZONTAL_PADDING = 16;
 
@@ -185,7 +186,9 @@ function appendReusableFileRows(candidate: {
             ...cells.map(
               (cell) => (cell?.fragments.length ?? 1) * candidate.input.typography.lineHeight,
             ),
-          ) + nextRow.reviewHeight,
+          ) +
+          nextRow.reviewHeight +
+          (nextRow.hunkActionsHeight ?? 0),
       };
     }
     candidate.rows.push(nextRow);
@@ -255,7 +258,10 @@ function appendNewFileRows(candidate: {
   );
   const fileBottom =
     candidate.bodyTop +
-    lines.reduce((height, line) => height + line.height, 0) +
+    lines.reduce(
+      (height, line) => height + line.height + hunkActionsHeight(line, candidate.input),
+      0,
+    ) +
     DIFF_BODY_BORDER_HEIGHT;
   const measureWidth =
     !candidate.input.wrapLines &&
@@ -263,8 +269,9 @@ function appendNewFileRows(candidate: {
   let top = candidate.bodyTop;
   let maximumHorizontalOverflow = 0;
   for (const line of lines) {
+    const actionHeight = hunkActionsHeight(line, candidate.input);
     const shouldMaterialize =
-      intersectsMaterializationWindow(candidate.input, top, top + line.height) ||
+      intersectsMaterializationWindow(candidate.input, top, top + line.height + actionHeight) ||
       containsMaterializationAnchor(candidate.input, candidate.file.path, line.cells);
     const cells = shouldMaterialize
       ? materializeCells(line.cells, candidate.file, candidate.gutterWidth, candidate.input)
@@ -287,7 +294,8 @@ function appendNewFileRows(candidate: {
       candidate.input.typography.lineHeight,
       ...cells.map((cell) => (cell?.fragments.length ?? 1) * candidate.input.typography.lineHeight),
     );
-    const height = shouldMaterialize ? textHeight + line.reviewHeight : line.height;
+    const height =
+      (shouldMaterialize ? textHeight + line.reviewHeight : line.height) + actionHeight;
     candidate.rows.push({
       kind: "line",
       index: candidate.rows.length,
@@ -297,10 +305,18 @@ function appendNewFileRows(candidate: {
       height,
       cells,
       reviewHeight: line.reviewHeight,
+      ...(actionHeight ? { hunkActionsHeight: actionHeight } : {}),
     });
     top += height;
   }
   return { bottom: top + DIFF_BODY_BORDER_HEIGHT, maximumHorizontalOverflow };
+}
+
+function hunkActionsHeight(line: GeometryLine, input: BuildDiffDocumentModelInput): number {
+  const cell = line.cells[0];
+  return input.hunkActions && cell?.type === "header" && cell.sourceIdentity.lineIndex === 0
+    ? HUNK_ACTIONS_HEIGHT
+    : 0;
 }
 
 function materializeCells(

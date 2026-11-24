@@ -1,3 +1,4 @@
+import { listActiveAgentsForRepo } from "./git/active-agent-guard.js";
 import { runRewindDirectoryWriter } from "./agent-rewind-scope.js";
 import { DiffSession } from "./diff/index.js";
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
@@ -1441,6 +1442,14 @@ export class Session {
         emitWorkspaceUpdateForCwd: (cwd) => this.emitWorkspaceUpdateForCwd(cwd),
         handleWorkspaceGitBranchSnapshot: (cwd, branchName) =>
           this.workspaceGitObserver.handleBranchSnapshot(cwd, branchName),
+        listActiveGitAgents: (root) =>
+          listActiveAgentsForRepo({
+            root,
+            manager: this.agentManager,
+            storage: this.agentStorage,
+          }),
+        withGitDirectoryWrite: (cwd, write) =>
+          runRewindDirectoryWriter(this.agentManager, cwd, write),
         renameCurrentBranch: (cwd, branch) => this.renameCurrentBranch(cwd, branch),
       },
       gitMutation: this.gitMutation,
@@ -3889,6 +3898,18 @@ export class Session {
         return this.checkoutSession.handleSubscribeDiffRequest(msg, this.delivery);
       case "unsubscribe_checkout_diff_request":
         return this.checkoutSession.handleUnsubscribeDiffRequest(msg, this.delivery);
+      case "checkout.git.working_tree.get.request":
+      case "checkout.git.stage.apply.request":
+      case "checkout.git.unstage.apply.request":
+      case "checkout.git.discard.apply.request":
+      case "checkout.git.commit.create.request":
+      case "checkout.git.commit.generate_message.request":
+      case "checkout.git.stash.list.request":
+      case "checkout.git.stash.create.request":
+      case "checkout.git.stash.show.request":
+      case "checkout.git.stash.apply.request":
+      case "checkout.git.stash.drop.request":
+        return this.checkoutSession.handleGitWorkbench(msg);
       case "checkout_switch_branch_request":
         return runRewindDirectoryWriter(this.agentManager, msg.cwd, () =>
           this.checkoutSession.handleCheckoutSwitchBranchRequest(msg),

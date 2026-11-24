@@ -1,6 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, onTestFinished } from "vitest";
 
+import { registerEditorTargetHandlers } from "./ipc.js";
 import { listAvailableEditorTargets, openEditorTarget } from "./registry.js";
+import { createEditorTargetRuntime } from "./runtime.js";
 import type {
   EditorTargetDirectoryEntry,
   EditorTargetIcon,
@@ -139,6 +145,109 @@ class FakeEditorTargets implements EditorTargetRuntime {
 }
 
 describe("editor target registry", () => {
+  it.skipIf(process.platform === "win32").each([
+    { path: "/Applications/Rebased.app", systemInstalled: true },
+    { path: "/Users/me/Applications/Rebased.app", systemInstalled: false },
+  ])(
+    "lists and launches Rebased at $path through desktop IPC",
+    async ({ path, systemInstalled }) => {
+      const temporaryDirectory = realpathSync(mkdtempSync(join(tmpdir(), "paseo-rebased-")));
+      onTestFinished(() => rmSync(temporaryDirectory, { recursive: true, force: true }));
+      const repoRoot = join(temporaryDirectory, "Project & tools");
+      const workspacePath = join(repoRoot, "src");
+      const nonRepository = join(temporaryDirectory, "ordinary-directory");
+      const activeFile = join(workspacePath, "README.md");
+      mkdirSync(workspacePath, { recursive: true });
+      mkdirSync(nonRepository);
+      writeFileSync(activeFile, "");
+      const gitEnv = {
+        PATH: process.env.PATH,
+        GIT_CEILING_DIRECTORIES: temporaryDirectory,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+      };
+      execFileSync("git", ["init", "--quiet", repoRoot], { cwd: temporaryDirectory, env: gitEnv });
+
+      const installedPaths = ["/Users/me/Applications/Rebased.app"];
+      if (systemInstalled) installedPaths.push("/Applications/Rebased.app");
+      const launches: RecordedLaunch[] = [];
+      const runtime = createEditorTargetRuntime({
+        platform: "darwin",
+        env: { ...gitEnv, GIT_DIR: join(temporaryDirectory, "unrelated.git") },
+        homeDirectory: "/Users/me",
+        pathExists: (candidate) =>
+          installedPaths.includes(candidate) ||
+          (candidate.startsWith(`${temporaryDirectory}/`) && existsSync(candidate)),
+        loadIcon: async () => ({ kind: "symbol", name: "folder" }),
+        spawn: (command, args) => {
+          launches.push({ command, args });
+          const child = {
+            once(event: "error" | "spawn", handler: (error?: Error) => void) {
+              if (event === "spawn") queueMicrotask(() => handler());
+              return child;
+            },
+            unref() {},
+          };
+          return child;
+        },
+      });
+      const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown>();
+      registerEditorTargetHandlers({
+        ipc: { handle: (channel, listener) => void handlers.set(channel, listener) },
+        runtime,
+      });
+
+      const listTargets = handlers.get("paseo:editor:listTargets");
+      const openTarget = handlers.get("paseo:editor:openTarget");
+      if (!listTargets || !openTarget) throw new Error("Expected desktop editor IPC handlers");
+      const finder = { id: "finder", kind: "file-manager" };
+      const ordinaryTargets = await listTargets(null, { workspacePath: nonRepository });
+      expect(ordinaryTargets).not.toContainEqual(expect.objectContaining({ id: "rebased" }));
+      expect(ordinaryTargets).toContainEqual(expect.objectContaining(finder));
+      expect(await listTargets(null, {})).toEqual(ordinaryTargets);
+
+      expect(await listTargets(null, { workspacePath })).toContainEqual({
+        id: "rebased",
+        label: "Rebased",
+        kind: "editor",
+        icon: { kind: "symbol", name: "terminal" },
+      });
+      await openTarget(null, {
+        editorId: "rebased",
+        workspacePath,
+        filePath: activeFile,
+        line: 7,
+      });
+      await expect(
+        openTarget(null, { editorId: "rebased", workspacePath: nonRepository }),
+      ).rejects.toThrow("Could not resolve a Git repository root for Rebased");
+
+      expect(launches).toEqual([{ command: "/usr/bin/open", args: ["-a", path, repoRoot] }]);
+    },
+  );
+
+  it.each(["darwin", "linux", "win32"] as const)(
+    "hides Rebased when unavailable on %s",
+    async (platform) => {
+      const repoRoot = platform === "win32" ? "C:/repo" : "/repo";
+      const runtime = createEditorTargetRuntime({
+        platform,
+        env: {},
+        loadIcon: async () => ({ kind: "symbol", name: "folder" }),
+        pathExists: (path) =>
+          path === repoRoot || (platform !== "darwin" && path === "/Applications/Rebased.app"),
+      });
+
+      const targets = await listAvailableEditorTargets(runtime, undefined, {
+        workspacePath: repoRoot,
+      });
+      expect(targets.map(({ id }) => id)).not.toContain("rebased");
+      await expect(
+        openEditorTarget({ editorId: "rebased", workspacePath: repoRoot }, runtime),
+      ).rejects.toThrow("Editor target unavailable: Rebased");
+    },
+  );
+
   it("lists installed target implementations in registration order", async () => {
     const runtime = new FakeEditorTargets();
     runtime.installCommand("code");

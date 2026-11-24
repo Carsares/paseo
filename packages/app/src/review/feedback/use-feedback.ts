@@ -8,6 +8,8 @@ import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
 import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
 import { deriveWorkspaceTabModel } from "@/screens/workspace/workspace-tab-model";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
+import { useHostFeature } from "@/runtime/host-features";
+import { useFetchQuery } from "@/data/query";
 import { useAppSettings } from "@/hooks/use-settings";
 import { dispatchComposerAgentMessage } from "@/composer/actions";
 import { createMessageSubmissionWriter } from "@/composer/submission/writer";
@@ -24,6 +26,7 @@ import {
 } from "./index";
 import { useToast } from "@/contexts/toast-context";
 import { FeedbackSentMessage } from "./surface";
+import { selectWorkspaceAgentRecipients, type WorkspaceRecipientScope } from "./recipients";
 
 const feedbackScope = createReviewFeedbackScope();
 
@@ -43,6 +46,31 @@ export function useReviewFeedback(input: {
   const connected = useHostRuntimeIsConnected(serverId);
   const { settings } = useAppSettings();
   const comments = useReviewDraftComments(reviewDraftKey);
+  const agents = useSessionStore((state) => state.sessions[serverId]?.agents);
+  const supportsStaging = useHostFeature(serverId, "checkoutGitStagingV1");
+  const supportsTopic = useHostFeature(serverId, "topicWorkbenchV1");
+  const topic = useFetchQuery({
+    queryKey: ["review-workspace-topic", serverId, workspaceId],
+    dataShape: "value",
+    staleTimeMs: 30_000,
+    enabled: Boolean(
+      supportsStaging && supportsTopic && connected && client && workspaceId && comments?.length,
+    ),
+    retry: false,
+    queryFn: async () => {
+      if (!client || !workspaceId) return null;
+      return (await client.findWorkspace(workspaceId))?.topic ?? null;
+    },
+  }).data;
+  const topicMainAgentId = topic?.mainAgentId;
+  const waitingForTopic = supportsTopic && topic === undefined;
+  const recipientScope = useMemo<WorkspaceRecipientScope | "tabs" | "loading">(() => {
+    if (!supportsStaging) return "tabs";
+    if (waitingForTopic) return "loading";
+    if (supportsTopic && topicMainAgentId !== undefined)
+      return { kind: "topic", mainAgentId: topicMainAgentId };
+    return { kind: "legacy" };
+  }, [supportsStaging, supportsTopic, waitingForTopic, topicMainAgentId]);
   const layout = useWorkspaceLayoutStore((store) =>
     workspaceKey ? store.layoutByWorkspace[workspaceKey] : undefined,
   );
@@ -51,6 +79,7 @@ export function useReviewFeedback(input: {
     client,
     connected,
     attachment: input.attachment,
+    recipientScope,
     sendBehavior: settings.sendBehavior,
     toast,
   });
@@ -58,6 +87,7 @@ export function useReviewFeedback(input: {
     client,
     connected,
     attachment: input.attachment,
+    recipientScope,
     sendBehavior: settings.sendBehavior,
     toast,
   };
@@ -68,7 +98,12 @@ export function useReviewFeedback(input: {
           comments: getReviewDraftComments(reviewDraftKey) ?? [],
           attachment: live.current.attachment,
           connected: live.current.connected,
-          recipients: readRecipients(workspaceKey),
+          recipients: readRecipients(
+            serverId,
+            workspaceId,
+            workspaceKey,
+            live.current.recipientScope,
+          ),
         }),
         send: async (recipient, attachment) => {
           const { client: targetClient, sendBehavior } = live.current;
@@ -107,7 +142,7 @@ export function useReviewFeedback(input: {
   );
   useEffect(() => {
     model.refresh();
-  }, [model, comments, layout, connected, input.attachment]);
+  }, [model, comments, layout, agents, connected, input.attachment, recipientScope]);
   const state = useSyncExternalStore(model.subscribe, model.getState, model.getState);
   return {
     model,
@@ -121,15 +156,42 @@ export function useReviewFeedback(input: {
   };
 }
 
-function readRecipients(workspaceKey: string | null): FeedbackRecipient[] {
-  const tabs = workspaceKey
-    ? useWorkspaceLayoutStore.getState().getWorkspaceTabs(workspaceKey)
-    : [];
-  const descriptors = deriveWorkspaceTabModel({ tabs }).tabs;
-  const recipients: FeedbackRecipient[] = [];
-  for (const { descriptor } of descriptors) {
-    if (descriptor.target.kind === "agent")
-      recipients.push({ agentId: descriptor.target.agentId, tab: descriptor });
+function readRecipients(
+  serverId: string,
+  workspaceId: string | undefined,
+  workspaceKey: string | null,
+  scope: WorkspaceRecipientScope | "tabs" | "loading",
+): FeedbackRecipient[] {
+  if (!workspaceId || !workspaceKey || scope === "loading") return [];
+  const tabs = useWorkspaceLayoutStore.getState().getWorkspaceTabs(workspaceKey);
+  const descriptors = deriveWorkspaceTabModel({ tabs }).tabs.map(({ descriptor }) => descriptor);
+  if (scope === "tabs") {
+    return descriptors.flatMap((tab) =>
+      tab.target.kind === "agent" ? [{ agentId: tab.target.agentId, tab }] : [],
+    );
   }
-  return recipients;
+  const descriptorsById = new Map(descriptors.map((tab) => [tab.tabId, tab]));
+  const agents = useSessionStore.getState().sessions[serverId]?.agents;
+  return selectWorkspaceAgentRecipients({
+    serverId,
+    workspaceId,
+    scope,
+    agents: agents?.values() ?? [],
+    tabs,
+  }).flatMap((recipient) => {
+    if (recipient.kind !== "agent") return [];
+    const agentId = recipient.agent.id;
+    const existing = recipient.tab && descriptorsById.get(recipient.tab.tabId);
+    return [
+      {
+        agentId,
+        tab: existing || {
+          key: "review-recipient:" + agentId,
+          tabId: "review-recipient:" + agentId,
+          kind: "agent",
+          target: { kind: "agent", agentId },
+        },
+      },
+    ];
+  });
 }

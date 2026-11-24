@@ -1,7 +1,7 @@
 import type { DiffFileHeader } from "@/git/diff-snapshot";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { floatingActionsClearance } from "@/components/ui/floating-action-button";
-import { useState, useCallback, useMemo, type ReactElement, type ReactNode } from "react";
+import { useState, useCallback, useMemo, useRef, type ReactElement, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { TreeRail } from "@/components/tree-rail";
@@ -35,7 +35,17 @@ import {
 import { type ParsedDiffFile } from "@/git/use-diff-query";
 import type { ChangesState } from "@/panels/changes/state";
 import { defaultChangesState } from "@/panels/changes/state";
-import { ReviewCommentSheet, ReviewFeedbackAction } from "@/review";
+import {
+  ReviewCommentSheet,
+  ReviewFeedbackAction,
+  useInlineReviewController,
+  useReviewAttachmentSnapshot,
+  useReviewFeedback,
+} from "@/review";
+import type { CheckoutGitWorkingTree } from "@getpaseo/protocol/messages";
+import { buildHunkPatch, type PatchAction, type StagingLayer } from "@/git/staging/model";
+import { useStagingLayerDiff } from "@/git/staging/use-layer-diff";
+import type { useStaging } from "@/git/staging/use-staging";
 import { DiffDocument, type WorkingDiffMode } from "@/git/diff-document";
 import { ChangedFilesTree } from "@/git/changed-files-tree";
 import { JUMP_TO_FILE_CLEARANCE, JumpToFile } from "@/git/jump-to-file";
@@ -137,10 +147,12 @@ function useDiscardChangesAction({
   serverId,
   cwd,
   diffMode,
+  stagingEnabled,
 }: {
   serverId: string;
   cwd: string;
   diffMode: "uncommitted" | "base" | "all";
+  stagingEnabled?: boolean;
 }): ((path: string, oldPath?: string) => void) | undefined {
   const { t } = useTranslation();
   const toast = useToast();
@@ -181,7 +193,9 @@ function useDiscardChangesAction({
     },
     [discardPath],
   );
-  return discardSupported && diffMode === "uncommitted" ? handleDiscardPath : undefined;
+  return !stagingEnabled && discardSupported && diffMode === "uncommitted"
+    ? handleDiscardPath
+    : undefined;
 }
 
 interface ChangesSurfaceProps {
@@ -190,6 +204,7 @@ interface ChangesSurfaceProps {
   cwd: string;
   enabled?: boolean;
   presentation?: ChangesPresentation;
+  stagingEnabled?: boolean;
   focusPath?: string;
   focusRequestId?: number;
   onOpenFile?: (path: string) => void;
@@ -1721,12 +1736,203 @@ function ChangesNotices({
   );
 }
 
+export function StagingDiffPane({
+  serverId,
+  workspaceId,
+  tree,
+  active,
+  layer,
+  path,
+  canWrite,
+  mutate,
+}: {
+  serverId: string;
+  workspaceId: string;
+  tree: CheckoutGitWorkingTree;
+  active: boolean;
+  layer: StagingLayer;
+  path: string;
+  canWrite: boolean;
+  mutate: ReturnType<typeof useStaging>["mutate"];
+}) {
+  const { t } = useTranslation();
+  const isCompact = useIsCompactFormFactor();
+  const { settings } = useAppSettings();
+  const { preferences } = useChangesPreferences();
+  const [collapsedPaths, setCollapsedPaths] = useState<string[]>([]);
+  const { repoRoot, headSha } = tree;
+  const { diff, error } = useStagingLayerDiff(serverId, repoRoot, headSha, layer, active);
+  const selectedFile =
+    diff?.phase === "ready" ? diff.files.find((file) => file.path === path) : undefined;
+  const liveDiff = useRef(diff);
+  liveDiff.current = diff;
+  const matchesDiff = useCallback(() => liveDiff.current === diff, [diff]);
+  const files = useMemo(() => (selectedFile ? [selectedFile] : []), [selectedFile]);
+  const draftKey = JSON.stringify(["staging-review", serverId, workspaceId, repoRoot, layer, path]);
+  const reviewActions = useInlineReviewController({ reviewDraftKey: draftKey });
+  const reviewAttachment = useReviewAttachmentSnapshot({
+    key: draftKey,
+    diffFiles: files,
+    cwd: repoRoot,
+    mode: "uncommitted",
+  });
+  const feedback = useReviewFeedback({
+    reviewDraftKey: draftKey,
+    serverId,
+    workspaceId,
+    attachment: reviewAttachment,
+  });
+  const hasFile = tree[layer].some((file) => file.path === path && file.status === "modified");
+  const canApply =
+    canWrite && hasFile && !tree.conflicts.some((conflict) => conflict.path === path);
+  const renderHunkActions = useCallback(
+    (file: ParsedDiffFile, hunkIndex: number) => (
+      <StagingHunkActions
+        file={file}
+        hunkIndex={hunkIndex}
+        eligible={hasFile}
+        disabled={!canApply}
+        layer={layer}
+        mutate={mutate}
+        matchesDiff={matchesDiff}
+        tree={tree}
+      />
+    ),
+    [canApply, hasFile, layer, matchesDiff, mutate, tree],
+  );
+  const collapseState = useMemo(
+    () => ({ paths: collapsedPaths, onChange: setCollapsedPaths }),
+    [collapsedPaths],
+  );
+  const displayPreferences = useMemo(
+    () => ({
+      layout: resolveDiffLayout(preferences.layout, isWeb && !isCompact),
+      wrapLines: preferences.wrapLines,
+      codeFontSize: settings.codeFontSize,
+      monoFontFamily: settings.monoFontFamily,
+    }),
+    [
+      isCompact,
+      preferences.layout,
+      preferences.wrapLines,
+      settings.codeFontSize,
+      settings.monoFontFamily,
+    ],
+  );
+  const mode = useMemo<WorkingDiffMode>(
+    () => ({ kind: "working", reviewActions, renderHunkActions }),
+    [reviewActions, renderHunkActions],
+  );
+  if (error || !selectedFile) {
+    return (
+      <View style={styles.stagingDiffNotice}>
+        <Text style={styles.hunkUnavailable}>
+          {error ?? t(diff?.phase === "ready" ? "gitWorkbench.hunkUnavailable" : "common.loading")}
+        </Text>
+      </View>
+    );
+  }
+  return (
+    <View style={styles.diffContainer}>
+      <DiffDocument
+        files={files}
+        contentInsetBottom={feedback.clearance}
+        collapseState={collapseState}
+        displayPreferences={displayPreferences}
+        mode={mode}
+      />
+      <ReviewFeedbackAction
+        bottomOffset={0}
+        enabled={active}
+        hasDiff
+        model={feedback.model}
+        state={feedback.state}
+        serverId={serverId}
+        workspaceId={workspaceId}
+      />
+      <ReviewCommentSheet
+        enabled={active}
+        editor={reviewActions.sheetEditor}
+        reviewActions={reviewActions}
+        onChangeBody={reviewActions.onChangeEditorBody}
+      />
+    </View>
+  );
+}
+
+function StagingHunkActions({
+  file,
+  hunkIndex,
+  eligible,
+  disabled,
+  layer,
+  mutate,
+  matchesDiff,
+  tree,
+}: {
+  file: ParsedDiffFile;
+  hunkIndex: number;
+  eligible: boolean;
+  disabled: boolean;
+  layer: StagingLayer;
+  mutate: ReturnType<typeof useStaging>["mutate"];
+  matchesDiff: () => boolean;
+  tree: CheckoutGitWorkingTree;
+}) {
+  const { t } = useTranslation();
+  const patch = useMemo(
+    () => (eligible ? buildHunkPatch(file, hunkIndex) : null),
+    [eligible, file, hunkIndex],
+  );
+  const apply = useCallback(
+    (kind: PatchAction) => {
+      if (!patch) return;
+      void mutate(
+        {
+          kind,
+          scope: "hunk",
+          patch,
+          paths: [file.path],
+          description: file.path + " · " + (file.hunks[hunkIndex]?.lines[0]?.content ?? ""),
+        },
+        tree,
+        matchesDiff,
+      );
+    },
+    [file, hunkIndex, matchesDiff, mutate, patch, tree],
+  );
+  const stage = useCallback(() => apply("stage"), [apply]);
+  const unstage = useCallback(() => apply("unstage"), [apply]);
+  const discard = useCallback(() => apply("discard"), [apply]);
+  if (!patch)
+    return <Text style={styles.hunkUnavailable}>{t("gitWorkbench.hunkUnavailable")}</Text>;
+  return (
+    <View style={styles.hunkActions}>
+      {layer === "staged" ? (
+        <Button size="md" variant="ghost" disabled={disabled} onPress={unstage}>
+          {t("gitWorkbench.unstageHunk")}
+        </Button>
+      ) : (
+        <>
+          <Button size="md" variant="ghost" disabled={disabled} onPress={stage}>
+            {t("gitWorkbench.stageHunk")}
+          </Button>
+          <Button size="md" variant="ghost" disabled={disabled} onPress={discard}>
+            {t("gitWorkbench.discardHunk")}
+          </Button>
+        </>
+      )}
+    </View>
+  );
+}
+
 export function ChangesSurface({
   serverId,
   workspaceId,
   cwd,
   enabled,
   presentation = "combined",
+  stagingEnabled,
   focusPath,
   focusRequestId,
   onOpenFile,
@@ -1964,7 +2170,7 @@ export function ChangesSurface({
     },
     [client, cwd, t, toast],
   );
-  const onRevertPath = useDiscardChangesAction({ serverId, cwd, diffMode });
+  const onRevertPath = useDiscardChangesAction({ serverId, cwd, diffMode, stagingEnabled });
   const [localFocusRequest, setLocalFocusRequest] = useState<{
     path: string;
     revision: number;
@@ -2062,11 +2268,20 @@ export function ChangesSurface({
     () => computeBaseRefLabel(baseRef, t("workspace.git.diff.base")),
     [baseRef, t],
   );
-  const { gitActions, branchLabel } = useGitActions({
+  const { gitActions: checkoutActions, branchLabel } = useGitActions({
     serverId,
     cwd,
     icons: GIT_ACTION_ICONS,
   });
+  const gitActions = useMemo(() => {
+    if (!stagingEnabled) return checkoutActions;
+    const withoutCommit = (action: { id: string }) => action.id !== "commit";
+    return {
+      primary: checkoutActions.primary?.id === "commit" ? null : checkoutActions.primary,
+      secondary: checkoutActions.secondary.filter(withoutCommit),
+      menu: checkoutActions.menu.filter(withoutCommit),
+    };
+  }, [checkoutActions, stagingEnabled]);
   const committedDiffDescription = useMemo(
     () => computeCommittedDiffDescription(branchLabel, baseRefLabel),
     [baseRefLabel, branchLabel],
@@ -2291,6 +2506,21 @@ export function ChangesSurface({
 }
 
 const styles = StyleSheet.create((theme) => ({
+  hunkActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: theme.spacing[2],
+  },
+  hunkUnavailable: {
+    paddingHorizontal: theme.spacing[3],
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+  },
+  stagingDiffNotice: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+  },
   container: {
     flex: 1,
     minHeight: 0,

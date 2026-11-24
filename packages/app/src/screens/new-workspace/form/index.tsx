@@ -121,7 +121,19 @@ export interface NewWorkspaceFormProps {
     onChange: (target: LaunchTarget) => void;
     profiles: readonly TerminalProfile[];
     disabled: boolean;
+    hidden?: boolean;
   };
+}
+
+function WorkspaceLaunchField({
+  launch,
+  variant,
+}: {
+  launch: NewWorkspaceFormProps["launch"];
+  variant: "badge" | "field";
+}) {
+  if (launch.hidden) return null;
+  return <LaunchControl {...launch} variant={variant} />;
 }
 
 function hostOptionTestID(serverId: string): string {
@@ -500,16 +512,7 @@ export function useNewWorkspaceForm(props: NewWorkspaceFormProps): ReactElement 
     ) : null;
   // Which one shows follows the isolation; they share a slot.
   const baseField = worktreeField ?? refField;
-  const launchField = (
-    <LaunchControl
-      variant={variant}
-      serverId={launch.serverId}
-      target={launch.target}
-      onChange={launch.onChange}
-      profiles={launch.profiles}
-      disabled={launch.disabled}
-    />
-  );
+  const launchField = <WorkspaceLaunchField launch={launch} variant={variant} />;
 
   const pickers = (
     <>

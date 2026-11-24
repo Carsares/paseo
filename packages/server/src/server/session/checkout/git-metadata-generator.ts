@@ -1,11 +1,16 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
 import {
   StructuredAgentFallbackError,
   StructuredAgentResponseError,
+  generateStructuredAgentResponse,
   generateStructuredAgentResponseWithFallback,
   type StructuredGenerationLogger,
 } from "../../agent/agent-response-loop.js";
 import type { AgentManager } from "../../agent/agent-manager.js";
+import type { AgentSessionConfig } from "../../agent/agent-sdk-types.js";
 import type { ProviderSnapshotManager } from "../../agent/provider-snapshot-manager.js";
 import {
   resolveStructuredGenerationProviders,
@@ -18,6 +23,13 @@ import {
   type MetadataConfigKey,
 } from "../../../utils/build-metadata-prompt.js";
 
+import { createRunGitCommand } from "../../../utils/run-git-command.js";
+import { parseNameStatus, readHead } from "../../git/git-workbench-state.js";
+import { repoWriteMutex, resolveGitTarget } from "../../git/repo-write-mutex.js";
+import { emptyTree, withStagedSnapshot } from "../../git/staged-snapshot.js";
+
+const runGit = createRunGitCommand("staged-commit-message");
+
 export interface PullRequestText {
   title: string;
   body: string;
@@ -29,7 +41,7 @@ export interface PullRequestText {
  * commit/PR commands and asks this for the wording when the user left it blank.
  */
 export interface GitMetadataGenerator {
-  generateCommitMessage(cwd: string): Promise<string>;
+  generateCommitMessage(cwd: string, source?: "staged" | "uncommitted"): Promise<string>;
   generatePullRequestText(cwd: string, baseRef?: string): Promise<PullRequestText>;
 }
 
@@ -50,6 +62,7 @@ export interface StructuredTextGenerationRequest<T> {
   schema: z.ZodType<T>;
   schemaName: string;
   agentTitle: string;
+  repositoryReadOnly?: true;
 }
 
 interface GitMetadataLogger {
@@ -90,6 +103,7 @@ interface PromptForDiffInput {
   styleConfigKey: MetadataConfigKey;
   styleDefault: string;
   jsonFieldsHint: string;
+  staged?: boolean;
 }
 
 export function createGitMetadataGenerator(deps: {
@@ -123,9 +137,12 @@ export function createGitMetadataGenerator(deps: {
   }
 
   async function buildPromptForDiff(input: PromptForDiffInput): Promise<string> {
-    const diff = await workspaceGitService.getCheckoutDiff(input.cwd, input.diffOptions);
-    const fileList = renderFileList(diff.structured);
-    const patch = truncatePatch(diff.diff, input.maxPatchChars);
+    const { fileList, patch } = input.staged
+      ? await readStagedPromptParts(input.cwd, input.maxPatchChars)
+      : await workspaceGitService.getCheckoutDiff(input.cwd, input.diffOptions).then((diff) => ({
+          fileList: renderFileList(diff.structured),
+          patch: truncatePatch(diff.diff, input.maxPatchChars),
+        }));
     return buildMetadataPrompt({
       cwd: input.cwd,
       workspaceGitService,
@@ -142,9 +159,10 @@ export function createGitMetadataGenerator(deps: {
   }
 
   return {
-    async generateCommitMessage(cwd) {
+    async generateCommitMessage(cwd, source) {
       const prompt = await buildPromptForDiff({
         cwd,
+        staged: source === "staged",
         diffOptions: { mode: "uncommitted", includeStructured: true },
         maxPatchChars: MAX_COMMIT_PATCH_CHARS,
         contract: "Write a concise git commit message for the changes below.",
@@ -159,6 +177,7 @@ export function createGitMetadataGenerator(deps: {
           schema: COMMIT_MESSAGE_SCHEMA,
           schemaName: "CommitMessage",
           agentTitle: "Commit generator",
+          ...(source ? { repositoryReadOnly: true } : {}),
         },
         { message: COMMIT_MESSAGE_FALLBACK },
       );
@@ -204,30 +223,108 @@ export function createAgentStructuredTextGeneration(deps: {
   logger: StructuredGenerationLogger;
 }): StructuredTextGeneration {
   return {
-    async generate({ cwd, prompt, schema, schemaName, agentTitle }) {
+    async generate({ cwd, prompt, schema, schemaName, agentTitle, repositoryReadOnly }) {
       const providers = await resolveStructuredGenerationProviders({
         cwd,
         providerSnapshotManager: deps.providerSnapshotManager,
         daemonConfig: deps.readDaemonConfig(),
         currentSelection: deps.getFocusedSelection(cwd),
       });
-      return generateStructuredAgentResponseWithFallback({
-        manager: deps.agentManager,
-        cwd,
-        prompt,
-        schema,
-        schemaName,
-        maxRetries: 2,
-        providers,
-        persistSession: false,
-        logger: deps.logger,
-        agentConfigOverrides: {
-          title: agentTitle,
-          internal: true,
-        },
-      });
+      const directory = repositoryReadOnly
+        ? await mkdtemp(join(tmpdir(), "paseo-commit-draft-"))
+        : undefined;
+      try {
+        return await generateStructuredAgentResponseWithFallback({
+          manager: deps.agentManager,
+          cwd: directory ?? cwd,
+          prompt,
+          schema,
+          schemaName,
+          maxRetries: 2,
+          providers,
+          persistSession: false,
+          logger: deps.logger,
+          agentConfigOverrides: {
+            title: agentTitle,
+            internal: true,
+          },
+          ...(repositoryReadOnly
+            ? {
+                runner: (request) => {
+                  const restrictions = readOnlyDraftRestrictions(
+                    deps.agentManager.adapterOf(request.agentConfig.provider),
+                  );
+                  if (!restrictions) {
+                    throw new Error("This provider cannot run a read-only Git draft");
+                  }
+                  return generateStructuredAgentResponse({
+                    ...request,
+                    agentConfig: { ...request.agentConfig, mcpServers: {}, ...restrictions },
+                  });
+                },
+              }
+            : {}),
+        });
+      } finally {
+        if (directory) await rm(directory, { recursive: true, force: true });
+      }
     },
   };
+}
+
+// Keep these restrictions in step with AgentManager's context summary agent.
+function readOnlyDraftRestrictions(
+  adapter: string,
+): Pick<AgentSessionConfig, "modeId" | "providerOptions"> | undefined {
+  switch (adapter) {
+    case "codex":
+      return {
+        modeId: "read-only",
+        providerOptions: { sandbox_mode: "read-only", approval_policy: "never" },
+      };
+    case "claude":
+      return { modeId: "plan", providerOptions: { disallowedTools: ["*"] } };
+    case "opencode":
+      return { providerOptions: { permission: { "*": "deny" } } };
+    case "pi":
+      return { providerOptions: { mainControlReadOnly: true } };
+    default:
+      return undefined;
+  }
+}
+
+async function readStagedPromptParts(cwd: string, maxPatchChars: number) {
+  const repo = await resolveGitTarget(cwd);
+  return repoWriteMutex.run(repo, "staged-commit-draft", async () => {
+    const head = await readHead(repo);
+    return withStagedSnapshot(repo, async (snapshot) => {
+      if (head !== (await readHead(repo)))
+        throw new Error("HEAD changed while reading staged files");
+      const base = head ?? (await emptyTree(repo));
+      const args = ["diff", "--cached", "--no-ext-diff", "--no-textconv"];
+      const readOptions = {
+        cwd: repo.root,
+        envOverlay: { GIT_OPTIONAL_LOCKS: "0", ...snapshot.envOverlay },
+      };
+      const files = await runGit([...args, "--name-status", "-z", base, "--"], readOptions);
+      if (files.truncated) throw new Error("Staged file list exceeds the commit draft limit");
+      const staged = parseNameStatus(files.stdout);
+      if (staged.length === 0) throw new Error("Stage changes before generating a commit message");
+      const patch = await runGit([...args, "--patch", base, "--"], {
+        ...readOptions,
+        maxOutputBytes: maxPatchChars * 4,
+      });
+      return {
+        fileList: [
+          "Staged files:",
+          ...staged.map(
+            (file) => `${file.status}\t${file.oldPath ? `${file.oldPath} -> ` : ""}${file.path}`,
+          ),
+        ].join("\n"),
+        patch: truncatePatch(patch.stdout, maxPatchChars),
+      };
+    });
+  });
 }
 
 function renderFileList(structured: CheckoutDiff["structured"]): string {

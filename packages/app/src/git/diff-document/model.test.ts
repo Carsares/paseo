@@ -4,6 +4,7 @@ import {
   buildDiffDocumentModel,
   captureScrollAnchor,
   FILE_HEADER_HEIGHT,
+  HUNK_ACTIONS_HEIGHT,
   graphemeBoundaries,
   measureFragments,
   resolveScrollAnchor,
@@ -71,6 +72,18 @@ function input(overrides: Partial<BuildDiffDocumentModelInput> = {}): BuildDiffD
 }
 
 describe("diff document model", () => {
+  it.each(["unified", "split"] as const)("reserves hunk controls below the %s header", (layout) => {
+    const standard = buildDiffDocumentModel(input({ layout }));
+    const withActions = buildDiffDocumentModel(input({ layout, hunkActions: true }));
+    expect(withActions.rows[0]).toMatchObject({
+      kind: "line",
+      top: standard.rows[0]?.top,
+      hunkActionsHeight: HUNK_ACTIONS_HEIGHT,
+    });
+    expect(withActions.rows[1]?.top).toBe(standard.rows[1]!.top + HUNK_ACTIONS_HEIGHT);
+    expect(withActions.height).toBe(standard.height + HUNK_ACTIONS_HEIGHT);
+  });
+
   it("preserves shaped wrap breaks when joining makes a longer prefix narrower", () => {
     const measure = (text: string) => {
       if (text === "لا") return 30;

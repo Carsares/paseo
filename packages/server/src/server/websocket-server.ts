@@ -2361,6 +2361,7 @@ export class VoiceAssistantWebSocketServer {
         agentSessionReset: true,
         workspaceMainAgentDefault: true,
         agentCreateAsMain: true,
+        checkoutGitStagingV1: true,
         agentSideChat: true,
         workspaceAgentsSummary: true,
         agentHistoryWorkspaceFilter: true,

@@ -1,6 +1,7 @@
 import type { CreateWorkspaceRequestOptions } from "@getpaseo/client/internal/daemon-client";
 import { MAX_SLUG_LENGTH, slugify } from "@getpaseo/protocol/branch-slug";
 import type { AgentMode, AgentModelDefinition } from "@getpaseo/protocol/agent-types";
+import type { CreationSnapshot } from "@getpaseo/protocol/messages";
 import {
   MAX_WORKSPACE_BATCH_MODELS,
   sameWorkspaceBatchModel,
@@ -8,6 +9,7 @@ import {
 } from "@/composer/agent-controls/model-sheet-flow";
 import { createOrRetryWorkspaceMain, type FixedMainInput } from "./create-explicit-main";
 import type { MainDraftAttempt, MainDraftBatch, MainDraftBatchItem } from "./main-draft";
+import { runTopicCreation, topicRequest, type TopicCreationClient } from "./topic-creation";
 
 type WorktreeSource = Extract<CreateWorkspaceRequestOptions["source"], { kind: "worktree" }>;
 type AgentConfig = NonNullable<NonNullable<CreateWorkspaceRequestOptions["agent"]>["config"]>;
@@ -144,8 +146,11 @@ export async function prepareWorkspaceMainBatch(input: {
 
 export async function runWorkspaceMainBatch(input: {
   batch: MainDraftBatch;
-  action: { kind: "resume" } | { kind: "check" | "retry"; workspaceId: string };
-  client: FixedMainInput["client"];
+  action:
+    | { kind: "resume" }
+    | { kind: "check"; workspaceId: string; update?: CreationSnapshot }
+    | { kind: "retry"; workspaceId: string };
+  client: FixedMainInput["client"] & TopicCreationClient;
   save: (batch: MainDraftBatch) => Promise<void>;
   acceptSnapshots: FixedMainInput["acceptSnapshots"];
   assertSupported: () => void;
@@ -159,21 +164,59 @@ export async function runWorkspaceMainBatch(input: {
     if (action.kind !== "resume" && action.workspaceId !== item.workspaceId) continue;
     // A failed item needs an explicit retry. Reconnect only reads its latest receipt.
     try {
+      const saveItem = async (next: MainDraftBatchItem) => {
+        const updated = {
+          ...batch,
+          items: batch.items.map((entry) =>
+            entry.workspaceId === next.workspaceId ? next : entry,
+          ),
+        };
+        await save(updated);
+        batch = updated;
+      };
+      const { topic, title } = item.placement;
+      if (topic && title) {
+        if (item.stage === "queued" && action.kind === "check") continue;
+        assertSupported();
+        const request = topicRequest(
+          { ...item.placement, title, topic },
+          { workspaceId: item.workspaceId, idempotencyKey: item.agentId },
+          {
+            config: item.config,
+            prompt: {
+              ...batch.message,
+              agentId: item.agentId,
+              clientMessageId: item.clientMessageId,
+            },
+          },
+        );
+        let operation: "submit" | "retry" | "check" = "check";
+        if (item.stage === "queued") operation = "submit";
+        else if (action.kind === "retry") operation = "retry";
+        if (operation !== "check") await saveItem({ ...item, stage: "sending" });
+        const outcome = await runTopicCreation(
+          client,
+          request,
+          operation,
+          action.kind === "check" ? action.update : undefined,
+        );
+        if (outcome.workspace) acceptSnapshots(outcome.workspace, outcome.agent);
+        await saveItem({
+          ...item,
+          stage: outcome.stage,
+          agentReady: Boolean(outcome.agent),
+          workspaceReady: Boolean(outcome.workspace),
+          topicMainAgentId: outcome.agent?.id,
+          error: outcome.stage === "succeeded" ? undefined : outcome.error,
+        });
+        continue;
+      }
       await createOrRetryWorkspaceMain({
         client,
         fixedAttempt: item,
         agent: { ...batch.message, config: item.config, clientMessageId: item.clientMessageId },
         action: action.kind,
-        saveItem: async (next) => {
-          const updated = {
-            ...batch,
-            items: batch.items.map((entry) =>
-              entry.workspaceId === next.workspaceId ? next : entry,
-            ),
-          };
-          await save(updated);
-          batch = updated;
-        },
+        saveItem,
         acceptSnapshots,
         assertSupported,
         failedMessage,
@@ -186,6 +229,13 @@ export async function runWorkspaceMainBatch(input: {
 }
 
 export function workspaceMainBatchAgentTarget(serverId: string, item: MainDraftBatchItem) {
+  if (item.placement.topic) {
+    if (!item.workspaceReady) return null;
+    const target = item.topicMainAgentId
+      ? { kind: "agent" as const, agentId: item.topicMainAgentId }
+      : undefined;
+    return { serverId, workspaceId: item.workspaceId, target };
+  }
   if (item.stage !== "succeeded" && !item.agentReady) return null;
   return {
     serverId,

@@ -18,8 +18,23 @@ const attemptSchema = z.object({
   workspaceId: z.string(),
   agentId: z.string(),
   kind: z.enum(["workspace", "agent"]),
-  placement: WorkspaceCreateRequestSchema.pick({ source: true, title: true, metadata: true }),
+  placement: WorkspaceCreateRequestSchema.pick({
+    source: true,
+    title: true,
+    metadata: true,
+    topic: true,
+  }),
 });
+const topicAttemptSchema = WorkspaceCreateRequestSchema.pick({
+  source: true,
+  title: true,
+  metadata: true,
+  topic: true,
+  workspaceId: true,
+  idempotencyKey: true,
+  agent: true,
+  mainAgent: true,
+}).required({ title: true, topic: true, workspaceId: true, idempotencyKey: true });
 const modelSchema = z.object({
   provider: z.string(),
   providerLabel: z.string(),
@@ -48,6 +63,8 @@ const batchItemSchema = z.object({
   attemptKind: attemptSchema.shape.kind,
   stage: z.enum(["queued", "sending", "retryable", "unconfirmed", "succeeded"]),
   agentReady: z.boolean().optional(),
+  workspaceReady: z.boolean().optional(),
+  topicMainAgentId: z.string().optional(),
   promptConfirmed: z.boolean().optional(),
   error: z.string().optional(),
 });
@@ -65,6 +82,7 @@ const batchSchema = z.object({
 const draftSchema = z.object({
   target: targetSchema,
   attempt: attemptSchema.optional(),
+  topicAttempt: topicAttemptSchema.optional(),
   models: z.array(modelSchema).min(1).max(MAX_WORKSPACE_BATCH_MODELS).optional(),
   batch: batchSchema.optional(),
 });
@@ -93,6 +111,10 @@ const storageKey = (id: string) => `paseo:new-workspace-main:${id}`;
 const writes = new Map<string, Promise<void>>();
 const batchListeners = new Map<string, Set<(draft: MainDraft | null) => void>>();
 
+export function hasMainDraftSubmission(draft: MainDraft | null) {
+  return Boolean(draft?.batch || draft?.topicAttempt);
+}
+
 function withDraftLock<T>(key: string, run: () => Promise<T>): Promise<T> {
   const locks = isWeb ? globalThis.navigator?.locks : undefined;
   return locks ? locks.request(key, run) : run();
@@ -114,10 +136,10 @@ export function subscribeToMainDraftBatch(id: string, listener: (draft: MainDraf
   const onStorage = (event: StorageEvent) => {
     if (event.key !== storageKey(id)) return;
     if (event.newValue === null) {
-      if (parseMainDraft(event.oldValue)?.batch) listener(null);
+      if (hasMainDraftSubmission(parseMainDraft(event.oldValue))) listener(null);
     } else {
       const draft = parseMainDraft(event.newValue);
-      if (draft?.batch) listener(draft);
+      if (hasMainDraftSubmission(draft)) listener(draft);
     }
   };
   browser?.addEventListener("storage", onStorage);
@@ -148,20 +170,24 @@ export function writeMainDraft(
     .then(() =>
       withDraftLock(key, async () => {
         const previous = parseMainDraft(await AsyncStorage.getItem(key));
-        if (previous?.batch && !draft?.batch && !options?.finishBatch) {
+        if (
+          hasMainDraftSubmission(previous) &&
+          !hasMainDraftSubmission(draft) &&
+          !options?.finishBatch
+        ) {
           for (const listener of batchListeners.get(id) ?? []) listener(previous);
           return;
         }
         if (!draft) {
           await AsyncStorage.removeItem(key);
-          if (previous?.batch) {
+          if (hasMainDraftSubmission(previous)) {
             for (const listener of batchListeners.get(id) ?? []) listener(null);
           }
           return;
         }
         await AsyncStorage.setItem(key, JSON.stringify(draft));
         // An active submission may outlive a screen remounted at another breakpoint.
-        if (draft.batch) {
+        if (hasMainDraftSubmission(draft)) {
           for (const listener of batchListeners.get(id) ?? []) listener(draft);
         }
       }),

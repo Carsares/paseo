@@ -117,6 +117,7 @@ function modelVariantKey(input: Omit<BuildDiffDocumentModelInput, "reuseFrom">):
     input.viewportWidth,
     typographyKey(input.typography),
     paletteKey(input.palette),
+    input.hunkActions === true,
     input.labels.binary,
     input.labels.tooLarge,
   ]);

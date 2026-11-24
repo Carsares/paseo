@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import type { ParsedDiffFile } from "@getpaseo/protocol/messages";
 import type { InlineReviewActions } from "@/review";
 import type { ReviewableDiffTarget } from "@/utils/diff-layout";
@@ -17,6 +18,7 @@ interface DiffDocumentBaseProps {
 export interface WorkingDiffMode {
   kind: "working";
   reviewActions?: InlineReviewActions;
+  renderHunkActions?: (file: ParsedDiffFile, hunkIndex: number) => ReactNode;
   onFilePress?: (path: string) => void;
   focusPath?: string;
   focusRequestId?: number;
@@ -127,6 +129,7 @@ export interface DiffLineRow {
   height: number;
   cells: [DiffCell] | [DiffCell | null, DiffCell | null];
   reviewHeight: number;
+  hunkActionsHeight?: number;
 }
 
 export interface DiffStatusRow {
@@ -185,6 +188,7 @@ export interface BuildDiffDocumentModelInput {
   measureText: TextMeasurer;
   palette: DiffPalette;
   reviewActions?: InlineReviewActions;
+  hunkActions?: boolean;
   labels: { binary: string; tooLarge: string };
   materializationWindow?: { top: number; height: number };
   /** Also measure the anchored row so relayout can restore its exact fragment. */

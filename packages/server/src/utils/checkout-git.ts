@@ -80,6 +80,9 @@ export type GitMutationRefreshReason =
   | "stash-push"
   | "stash-pop"
   | "discard-changes"
+  | "stage-changes"
+  | "unstage-changes"
+  | "stash-drop"
   | "create-worktree";
 
 const DISCARD_CHANGES_TIMEOUT_MS = 120_000;
@@ -4192,29 +4195,83 @@ export async function pullCurrentBranch(cwd: string, forgeService?: ForgeService
   }
 }
 
-export async function pushCurrentBranch(cwd: string, forgeService?: ForgeService): Promise<void> {
+interface ReviewedPushSource {
+  sha: string;
+  branchRef: string;
+}
+
+export async function pushCurrentBranch(
+  cwd: string,
+  forgeService?: ForgeService,
+  reviewed?: ReviewedPushSource,
+): Promise<void> {
   await requireGitRepo(cwd);
   const currentBranch = await getCurrentBranch(cwd);
   if (!currentBranch || currentBranch === "HEAD") {
     throw new Error("Unable to determine current branch for push");
   }
-  const configuredPushTarget = await getCurrentBranchConfiguredPushTarget(cwd, currentBranch);
-  if (configuredPushTarget) {
+  const pushReviewed = async (
+    target: { remoteName: string; headRef: string },
+    { sha, branchRef }: ReviewedPushSource,
+  ) => {
+    const { stdout } = await runGitCommand(
+      [
+        "for-each-ref",
+        "--format=%(HEAD)%09%(objectname)%09%(refname)",
+        `refs/heads/${currentBranch}`,
+      ],
+      { cwd, envOverlay: READ_ONLY_GIT_ENV },
+    );
+    if (!stdout.split("\n").includes(`*\t${sha}\t${branchRef}`)) {
+      throw new Error("The current branch or HEAD changed after committing. Review before pushing");
+    }
+    // Pin the source so a Git command that moves HEAD after the check cannot
+    // change which commit goes to the remote.
     await runGitCommand(
-      ["push", configuredPushTarget.remoteName, `HEAD:refs/heads/${configuredPushTarget.headRef}`],
+      [
+        "--no-replace-objects",
+        "push",
+        "--",
+        target.remoteName,
+        `${sha}:refs/heads/${target.headRef}`,
+      ],
       { cwd, timeout: 120_000 },
     );
-    await refreshCurrentBranchTrackedRefAfterPush(cwd, currentBranch, configuredPushTarget);
+  };
+  const configuredPushTarget = await getCurrentBranchConfiguredPushTarget(cwd, currentBranch);
+  if (configuredPushTarget) {
+    if (reviewed) {
+      await pushReviewed(configuredPushTarget, reviewed);
+    } else {
+      await runGitCommand(
+        [
+          "push",
+          configuredPushTarget.remoteName,
+          `HEAD:refs/heads/${configuredPushTarget.headRef}`,
+        ],
+        { cwd, timeout: 120_000 },
+      );
+    }
+    await refreshCurrentBranchTrackedRefAfterPush(
+      cwd,
+      currentBranch,
+      configuredPushTarget,
+      reviewed?.sha,
+    );
     forgeService?.invalidate({ cwd });
     return;
   }
 
   const upstreamTarget = await getCurrentBranchUpstreamPushTarget(cwd, currentBranch);
   if (upstreamTarget) {
-    await runGitCommand(
-      ["push", "-u", upstreamTarget.remoteName, `HEAD:refs/heads/${upstreamTarget.headRef}`],
-      { cwd, timeout: 120_000 },
-    );
+    if (reviewed) {
+      await pushReviewed(upstreamTarget, reviewed);
+    } else {
+      await runGitCommand(
+        ["push", "-u", upstreamTarget.remoteName, `HEAD:refs/heads/${upstreamTarget.headRef}`],
+        { cwd, timeout: 120_000 },
+      );
+    }
     forgeService?.invalidate({ cwd });
     return;
   }
@@ -4223,8 +4280,40 @@ export async function pushCurrentBranch(cwd: string, forgeService?: ForgeService
   if (!hasRemote) {
     throw new Error("Remote 'origin' is not configured.");
   }
-  await runGitCommand(["push", "-u", "origin", currentBranch], { cwd, timeout: 120_000 });
+  if (reviewed) {
+    const headRef = await getReviewedOriginPushBranch(cwd, currentBranch);
+    await pushReviewed({ remoteName: "origin", headRef }, reviewed);
+    // Git's -u cannot attach a raw SHA to a local branch.
+    if (!(await getGitConfigValue(cwd, `branch.${currentBranch}.merge`))) {
+      await setBranchUpstream(cwd, currentBranch, { remoteName: "origin", headRef });
+    }
+  } else {
+    await runGitCommand(["push", "-u", "origin", currentBranch], { cwd, timeout: 120_000 });
+  }
   forgeService?.invalidate({ cwd });
+}
+
+async function getReviewedOriginPushBranch(cwd: string, currentBranch: string): Promise<string> {
+  const { exitCode } = await runGitCommand(["config", "--get-all", "remote.origin.push"], {
+    cwd,
+    acceptExitCodes: [0, 1],
+  });
+  if (exitCode === 1) return currentBranch;
+  const localRef = `refs/heads/${currentBranch}`;
+  const { stdout } = await runGitCommand(
+    [
+      "-c",
+      `branch.${currentBranch}.pushRemote=origin`,
+      "for-each-ref",
+      "--format=%(refname)%09%(push:remoteref)",
+      localRef,
+    ],
+    { cwd, envOverlay: READ_ONLY_GIT_ENV },
+  );
+  const line = stdout.split("\n").find((entry) => entry.startsWith(`${localRef}\t`));
+  const headRef = parseBranchMergeHeadRef(line?.split("\t")[1] ?? null);
+  if (!headRef) throw new Error("Could not resolve the configured origin push branch");
+  return headRef;
 }
 
 async function getCurrentBranchConfiguredPushTarget(
@@ -4245,6 +4334,7 @@ async function refreshCurrentBranchTrackedRefAfterPush(
   cwd: string,
   currentBranch: string,
   pushedTarget: { remoteName: string; headRef: string },
+  source = "HEAD",
 ): Promise<void> {
   const trackingRemoteName = await getGitConfigValue(cwd, `branch.${currentBranch}.remote`);
   const trackingMergeRef = await getGitConfigValue(cwd, `branch.${currentBranch}.merge`);
@@ -4254,19 +4344,12 @@ async function refreshCurrentBranchTrackedRefAfterPush(
       cwd,
       pushedTarget.remoteName,
       pushedTarget.headRef,
+      source,
     );
     if (!updated) {
       return;
     }
-    await runGitCommand(["config", `branch.${currentBranch}.remote`, pushedTarget.remoteName], {
-      cwd,
-    });
-    await runGitCommand(
-      ["config", `branch.${currentBranch}.merge`, `refs/heads/${pushedTarget.headRef}`],
-      {
-        cwd,
-      },
-    );
+    await setBranchUpstream(cwd, currentBranch, pushedTarget);
     return;
   }
   if (!trackingRemoteName || trackingHeadRef !== pushedTarget.headRef) {
@@ -4281,13 +4364,25 @@ async function refreshCurrentBranchTrackedRefAfterPush(
     return;
   }
 
-  await updateRemoteTrackingRef(cwd, trackingRemoteName, trackingHeadRef);
+  await updateRemoteTrackingRef(cwd, trackingRemoteName, trackingHeadRef, source);
+}
+
+async function setBranchUpstream(
+  cwd: string,
+  branch: string,
+  target: { remoteName: string; headRef: string },
+): Promise<void> {
+  await runGitCommand(["config", `branch.${branch}.remote`, target.remoteName], { cwd });
+  await runGitCommand(["config", `branch.${branch}.merge`, `refs/heads/${target.headRef}`], {
+    cwd,
+  });
 }
 
 async function updateRemoteTrackingRef(
   cwd: string,
   remoteName: string,
   headRef: string,
+  source: string,
 ): Promise<boolean> {
   const trackingRef = `refs/remotes/${remoteName}/${headRef}`;
   const checkRef = await runGitCommand(["check-ref-format", trackingRef], {
@@ -4297,7 +4392,7 @@ async function updateRemoteTrackingRef(
   if (checkRef.exitCode !== 0) {
     return false;
   }
-  await runGitCommand(["update-ref", trackingRef, "HEAD"], { cwd, timeout: 120_000 });
+  await runGitCommand(["update-ref", trackingRef, source], { cwd, timeout: 120_000 });
   return true;
 }
 

@@ -1,4 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import * as stagedSnapshot from "../../git/staged-snapshot.js";
 import {
   StructuredAgentFallbackError,
   StructuredAgentResponseError,
@@ -66,6 +71,18 @@ const DIFF_WITH_ONE_FILE: CheckoutDiffResult = {
   ],
 };
 
+function stageFileAfterSnapshot(cwd: string) {
+  const takeSnapshot = stagedSnapshot.withStagedSnapshot;
+  const takeSnapshotThenStage: typeof takeSnapshot = (repo, run) =>
+    takeSnapshot(repo, (snapshot) => {
+      execFileSync("git", ["add", "--", "new.txt"], { cwd });
+      return run(snapshot);
+    });
+  return vi
+    .spyOn(stagedSnapshot, "withStagedSnapshot")
+    .mockImplementationOnce(takeSnapshotThenStage);
+}
+
 describe("createGitMetadataGenerator", () => {
   it("generateCommitMessage returns the generated message from an uncommitted-diff prompt", async () => {
     const { diffSource, diffCalls } = createDiffSource(DIFF_WITH_ONE_FILE);
@@ -92,6 +109,47 @@ describe("createGitMetadataGenerator", () => {
     expect(generateCalls[0].prompt).toContain("Write a concise git commit message");
     expect(generateCalls[0].prompt).toContain("M\tsrc/foo.ts\t(+3 -1)");
     expect(generateCalls[0].prompt).toContain("diff --git a/src/foo.ts");
+  });
+
+  it("uses only staged changes for the draft even when HEAD is unborn", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "paseo-staged-draft-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd });
+      const file = join(cwd, "message.txt");
+      await writeFile(file, "staged evidence\n");
+      execFileSync("git", ["add", "--", "message.txt"], { cwd });
+      await writeFile(file, "unstaged evidence\n");
+      await writeFile(join(cwd, "new.txt"), "untracked evidence\n");
+      const { diffSource, diffCalls } = createDiffSource(DIFF_WITH_ONE_FILE);
+      const { generation, generateCalls } = createGeneration(() => ({ message: "Add message" }));
+      const generator = createGitMetadataGenerator({
+        workspaceGitService: diffSource,
+        generation,
+        logger: createLogger().logger,
+      });
+
+      const spy = stageFileAfterSnapshot(cwd);
+      try {
+        await expect(generator.generateCommitMessage(cwd, "staged")).resolves.toBe("Add message");
+      } finally {
+        spy.mockRestore();
+      }
+      const prompt = generateCalls[0]?.prompt;
+      expect(generateCalls[0]?.repositoryReadOnly).toBe(true);
+      expect(prompt).toContain("staged evidence");
+      expect(prompt).not.toContain("unstaged evidence");
+      expect(prompt).not.toContain("untracked evidence");
+      expect(prompt).not.toContain("new.txt");
+      expect(execFileSync("git", ["show", ":new.txt"], { cwd, encoding: "utf8" })).toBe(
+        "untracked evidence\n",
+      );
+      expect(diffCalls).toEqual([]);
+      expect(execFileSync("git", ["show", ":message.txt"], { cwd, encoding: "utf8" })).toBe(
+        "staged evidence\n",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   it("generateCommitMessage falls back to a default message when generation exhausts its providers", async () => {

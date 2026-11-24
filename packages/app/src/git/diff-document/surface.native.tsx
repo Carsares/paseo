@@ -1,3 +1,4 @@
+import { DiffHunkOverlays } from "./hunk-overlays";
 import { Canvas, Group, Picture, type SkPicture } from "@shopify/react-native-skia";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -109,6 +110,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
     [family, typography.size],
   );
   const reviewActions = props.mode.kind === "working" ? props.mode.reviewActions : undefined;
+  const hunkActions = props.mode.kind === "working" && Boolean(props.mode.renderHunkActions);
   const model = useMemo(() => {
     const dependencies = [
       props.displayPreferences.layout,
@@ -117,6 +119,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
       typography,
       measurement,
       props.palette,
+      hunkActions,
       t,
     ] as const;
     const previous = reusableModelRef.current;
@@ -134,6 +137,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
       measureText: measurement,
       palette: props.palette,
       reviewActions,
+      hunkActions,
       labels: {
         binary: t("workspace.git.diff.binaryFile"),
         tooLarge: t("workspace.git.diff.tooLarge"),
@@ -159,6 +163,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
     props.files,
     props.palette,
     reviewActions,
+    hunkActions,
     t,
     typography,
     viewport.width,
@@ -313,6 +318,12 @@ export function DiffSurface(props: DiffSurfaceProps) {
             horizontalOffsets={horizontalOffsets}
           />
         ))}
+        <DiffHunkOverlays
+          model={model}
+          mode={props.mode}
+          scrollTop={fileWindowTop}
+          viewportHeight={viewport.height}
+        />
         <NativeReviewOverlays model={model} mode={props.mode} />
         <Animated.View pointerEvents="none" style={keyboardSpacerStyle} />
       </AnimatedScrollView>

@@ -9,6 +9,9 @@ import {
   workspaceBatchBlock,
   workspaceMainBatchAgentTarget,
 } from "./main-batch";
+import { readTopicFields, runTopicCreation, topicRequest } from "./topic-creation";
+import { watchTopicCreation } from "@/composer/draft/topic-receipts";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
   readMainDraft,
   subscribeToMainDraftBatch,
@@ -140,6 +143,7 @@ async function harness(initial: MainDraftBatch) {
   const findWorkspace = vi.fn<BatchClient["findWorkspace"]>().mockResolvedValue(null);
   const fetchAgent = vi.fn<BatchClient["fetchAgent"]>().mockResolvedValue(null);
   const getCreationSnapshot = vi.fn<BatchClient["getCreationSnapshot"]>().mockResolvedValue(null);
+  const fetchAgentTimeline = vi.fn<BatchClient["fetchAgentTimeline"]>();
   const acceptSnapshots = vi.fn<Parameters<typeof runWorkspaceMainBatch>[0]["acceptSnapshots"]>();
   const assertSupported = vi.fn();
   const save = (batch: MainDraftBatch) => writeMainDraft(id, { target, batch });
@@ -151,7 +155,14 @@ async function harness(initial: MainDraftBatch) {
     runWorkspaceMainBatch({
       batch: await read(),
       action,
-      client: { createWorkspace, createAgent, findWorkspace, fetchAgent, getCreationSnapshot },
+      client: {
+        createWorkspace,
+        createAgent,
+        findWorkspace,
+        fetchAgent,
+        getCreationSnapshot,
+        fetchAgentTimeline,
+      },
       save,
       acceptSnapshots,
       assertSupported,
@@ -172,6 +183,173 @@ async function harness(initial: MainDraftBatch) {
 }
 
 describe("multi-model workspace creation", () => {
+  it("creates one silent topic per selected model from the same fixed start point", async () => {
+    const batch = await plan();
+    const topic = { summary: "Inspect cold start", hideFromModel: true };
+    const h = await harness({
+      message: { initialPrompt: "  ", attachments: message.attachments },
+      items: batch.items
+        .slice(0, 2)
+        .map((item) =>
+          Object.assign({}, item, { placement: { ...item.placement, title: "Cold start", topic } }),
+        ),
+    });
+    h.createWorkspace.mockImplementation(async (request) => {
+      const workspaceId = request.workspaceId!;
+      const mainAgent = agent(`quiet-${workspaceId}`, workspaceId);
+      const snapshot = {
+        ...workspace(workspaceId),
+        topic: { ...topic, revision: 1, mainAgentId: mainAgent.id },
+      };
+      return {
+        workspace: snapshot,
+        mainAgent,
+        error: null,
+        requestId: workspaceId,
+        setupTerminalId: null,
+        creation: {
+          kind: "workspace",
+          idempotencyKey: request.idempotencyKey!,
+          workspaceId,
+          agentId: null,
+          phase: "completed",
+          revision: 3,
+          error: null,
+        },
+      };
+    });
+    await h.run();
+    const requests = h.createWorkspace.mock.calls.map(([request]) => request);
+    expect(requests).toHaveLength(2);
+    expect(
+      new Set(requests.map(({ source }) => source.kind === "worktree" && source.worktreeSlug)).size,
+    ).toBe(2);
+    for (const [index, request] of requests.entries()) {
+      expect(request).toMatchObject({
+        title: "Cold start",
+        topic,
+        mainAgent: { config: { provider: models[index]!.provider } },
+        source: { startPoint: startPoint.commitSha },
+      });
+      expect(request.agent).toBeUndefined();
+      expect(request.firstAgentContext).toBeUndefined();
+    }
+    const items = (await h.read()).items;
+    expect(items.map(({ stage }) => stage)).toEqual(["succeeded", "succeeded"]);
+    for (const item of items) {
+      expect(workspaceMainBatchAgentTarget(target.serverId, item)).toMatchObject({
+        workspaceId: item.workspaceId,
+        target: { kind: "agent", agentId: `quiet-${item.workspaceId}` },
+      });
+    }
+    expect(h.createAgent).not.toHaveBeenCalled();
+  });
+
+  it("checks delivery against the original topic and message attempt without replaying the prompt", async () => {
+    const fields = readTopicFields("\n  Cold start\n  Inspect traces.  ", "", true);
+    expect(fields).toEqual({
+      title: "Cold start",
+      topic: { summary: "\n  Cold start\n  Inspect traces.  ", hideFromModel: true },
+    });
+    const { source } = placement;
+    expect(readTopicFields("  \n ", "Direction alone", false)).toBeNull();
+    expect(readTopicFields("X".repeat(100), " Explicit direction ", false)).toEqual({
+      title: "X".repeat(80),
+      topic: { summary: " Explicit direction ", hideFromModel: false },
+    });
+    const identity = { workspaceId: "wks_1234567890abcdef", idempotencyKey: "topic-draft" };
+    const base = { ...fields!, source };
+    expect(topicRequest(base, identity, null)).toEqual({ ...base, ...identity });
+    const request = topicRequest(base, identity, {
+      config: { provider: "codex", cwd: "/repo" },
+      prompt: {
+        agentId: "expected-agent",
+        clientMessageId: "initial-message",
+        initialPrompt: "Where should we start?",
+      },
+    });
+    expect(request.mainAgent).toBeUndefined();
+    expect(request.agent).toMatchObject({
+      workspaceRole: "main",
+      clientMessageId: "initial-message",
+    });
+    const created = {
+      ...workspace(request.workspaceId),
+      topic: { ...fields!.topic, revision: 1, mainAgentId: "expected-agent" },
+    };
+    const main = agent("expected-agent", request.workspaceId);
+    const receipt = receiptFor(request, {
+      phase: "failed",
+      failedStage: "prompt",
+      outcomeUnknown: true,
+      workspace: created,
+      agent: main,
+    });
+    const client = {
+      createWorkspace: vi
+        .fn<BatchClient["createWorkspace"]>()
+        .mockRejectedValue(new Error("Connection lost")),
+      getCreationSnapshot: vi.fn<BatchClient["getCreationSnapshot"]>().mockResolvedValue(receipt),
+      findWorkspace: vi.fn<BatchClient["findWorkspace"]>().mockResolvedValue(created),
+      fetchAgent: vi.fn().mockResolvedValue(null),
+      fetchAgentTimeline: vi.fn<BatchClient["fetchAgentTimeline"]>(),
+    };
+    expect((await runTopicCreation(client, request, "submit")).stage).toBe("unconfirmed");
+    expect((await runTopicCreation(client, request, "retry")).stage).toBe("unconfirmed");
+    const expected = {
+      stage: "succeeded",
+      workspace: created,
+      agent: main,
+    };
+    const listened = Promise.withResolvers<Awaited<ReturnType<typeof runTopicCreation>>>();
+    const checkedOnce = Promise.withResolvers<void>();
+    let onMessage: Parameters<DaemonClient["subscribeRawMessages"]>[0] = () => undefined;
+    const unsubscribe = vi.fn();
+    const watchClient = {
+      subscribeRawMessages: vi.fn<DaemonClient["subscribeRawMessages"]>((handler) => {
+        onMessage = handler;
+        return unsubscribe;
+      }),
+    };
+    const stop = watchTopicCreation(watchClient, receipt, async (update) => {
+      const outcome = await runTopicCreation(client, request, "check", update);
+      checkedOnce.resolve();
+      if (outcome.stage !== "succeeded") return false;
+      listened.resolve(outcome);
+      return true;
+    });
+    try {
+      await checkedOnce.promise;
+      onMessage({
+        type: "workspace.create.update",
+        payload: { ...receipt, idempotencyKey: "different-key", revision: receipt.revision + 1 },
+      });
+      // A later update wakes the original operation without submitting it again.
+      client.fetchAgentTimeline.mockResolvedValue({
+        agentId: main.id,
+        error: null,
+        entries: [
+          {
+            item: { type: "user_message", clientMessageId: request.agent?.clientMessageId },
+          },
+        ],
+      } as Awaited<ReturnType<DaemonClient["fetchAgentTimeline"]>>);
+      onMessage({
+        type: "workspace.create.update",
+        payload: { ...receipt, revision: receipt.revision + 1 },
+      });
+      expect(await listened.promise).toEqual(expected);
+      await vi.waitFor(() => expect(unsubscribe).toHaveBeenCalledTimes(1));
+    } finally {
+      stop();
+    }
+    expect(client.getCreationSnapshot).toHaveBeenLastCalledWith(
+      "workspace",
+      identity.idempotencyKey,
+    );
+    expect(client.createWorkspace).toHaveBeenCalledExactlyOnceWith(request);
+  });
+
   it("persists four independent requests with identical serialized input and resolves one base", async () => {
     const resolveStartPoint = vi.fn().mockResolvedValue(startPoint);
     const h = await harness(await plan(resolveStartPoint));

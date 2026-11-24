@@ -1,5 +1,6 @@
 import type { TFunction } from "i18next";
 import type { WorkspaceDraftTabSetup } from "@/workspace-tabs/model";
+import { getOrCreateClientId } from "@/utils/client-id";
 
 export type WorkspaceMainBlock = "unsupported" | "occupied" | "unknown";
 
@@ -24,6 +25,34 @@ export function workspaceMainDraftKey(input: {
       ? [target.kind, target.workspaceId]
       : [target.kind, target.projectId, target.directory, target.isolation];
   return JSON.stringify([draftId, serverId, ...targetKey]);
+}
+
+function topicFirstQuestionDraftPrefix(serverId: string, workspaceId: string): string {
+  return `topic-first-question:${JSON.stringify([serverId, workspaceId])}:`;
+}
+
+export function topicFirstQuestionDraftId(
+  serverId: string,
+  workspaceId: string,
+  clientId: string,
+): string {
+  return topicFirstQuestionDraftPrefix(serverId, workspaceId) + clientId;
+}
+
+export async function resolveTopicFirstQuestionDraftId(
+  serverId: string,
+  workspaceId: string,
+): Promise<string> {
+  return topicFirstQuestionDraftId(serverId, workspaceId, await getOrCreateClientId());
+}
+
+export function isTopicFirstQuestionDraft(
+  draftId: string,
+  serverId: string,
+  workspaceId: string,
+): boolean {
+  const prefix = topicFirstQuestionDraftPrefix(serverId, workspaceId);
+  return draftId.startsWith(prefix) && draftId.length > prefix.length;
 }
 
 export function canChooseWorkspaceMain(input: {

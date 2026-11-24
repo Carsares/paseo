@@ -51,6 +51,8 @@ import {
   WorkspaceDraftComposer,
 } from "./workspace-tab";
 import { shouldAllowEmptyDraftText, validateDraftSubmission } from "./workspace-tab-core";
+import { topicFirstQuestionDraftId } from "./workspace-main-intent";
+import { clearTopicQuestion, readTopicQuestion, writeTopicQuestion } from "./topic-first-question";
 
 vi.mock("@/composer", () => ({ Composer: vi.fn(() => null) }));
 vi.mock("./create-flow", async (importOriginal) => {
@@ -506,6 +508,168 @@ test("a seeded side chat submits only when the user sends the draft", async () =
 });
 
 describe("workspace draft main session", () => {
+  test("keeps an unconfirmed topic question across remount and clears only after its message is recorded", async () => {
+    const serverId = "topic-draft-host";
+    const workspaceId = "workspace-1";
+    const draftId = topicFirstQuestionDraftId(serverId, workspaceId, "cid_device");
+    const createAgent = vi
+      .fn<DaemonClient["createAgent"]>()
+      .mockRejectedValue(
+        Object.assign(new Error("Main already bound"), { code: "workspace_main_exists" }),
+      );
+    const main = {
+      id: "competing-main",
+      workspaceId,
+      labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+    } as unknown as AgentSnapshotPayload;
+    const fetchAgentTimeline = vi.fn<DaemonClient["fetchAgentTimeline"]>().mockResolvedValue({
+      agentId: main.id,
+      error: null,
+      entries: [],
+    } as unknown as Awaited<ReturnType<DaemonClient["fetchAgentTimeline"]>>);
+    const daemon = {
+      createAgent,
+      findWorkspace: async () => ({ id: workspaceId, topic: { mainAgentId: main.id } }),
+      fetchAgent: async () => ({ agent: main }),
+      fetchAgentTimeline,
+      getCreationSnapshot: async () => ({
+        kind: "agent",
+        idempotencyKey: createAgent.mock.calls[0]?.[0].idempotencyKey,
+        agentId: createAgent.mock.calls[0]?.[0].agentId,
+        workspaceId,
+        phase: "failed",
+        failedStage: "agent",
+        errorCode: "workspace_main_exists",
+        outcomeUnknown: false,
+        revision: 3,
+      }),
+      sendAgentMessage: vi.fn(),
+    } as unknown as DaemonClient;
+    const store = useSessionStore.getState();
+    const setCapability = (supported: boolean) =>
+      store.updateSessionServerInfo(serverId, {
+        serverId,
+        hostname: null,
+        version: null,
+        features: { topicWorkbenchV1: supported, agentCreateAsMain: true },
+      });
+    store.initializeSession(serverId, daemon);
+    setCapability(true);
+    store.mergeWorkspaces(serverId, [
+      normalizeWorkspaceDescriptor({
+        id: workspaceId,
+        projectId: "project",
+        projectDisplayName: "project",
+        projectRootPath: "/tmp/project",
+        workspaceDirectory: "/tmp/project",
+        workspaceKind: "local_checkout",
+        projectKind: "git",
+        status: "done",
+        hasActiveMainAgent: false,
+        activityAt: null,
+        statusEnteredAt: null,
+        name: "project",
+        archivingAt: null,
+        diffStat: null,
+        scripts: [],
+      }),
+    ]);
+    vi.mocked(useHostRuntimeClient).mockReturnValue(daemon);
+    const inputDraft = mockWorkspaceDraftInput();
+    const storedAttachments = useWorkspaceAttachmentsStore.getState();
+    useWorkspaceAttachmentsStore.setState({ draftHistoryHydrated: true, attachmentsByScope: {} });
+    const onCreated = vi.fn();
+    const mount = () =>
+      render(
+        createElement(WorkspaceDraftComposer, {
+          serverId,
+          workspaceId,
+          draftId,
+          tabId: "topic-draft-tab",
+          onCreated,
+          isPaneFocused: false,
+          editingSession: new ComposerEditingSession(),
+        }),
+      );
+    let view = mount();
+    const props = () => vi.mocked(Composer).mock.lastCall![0];
+    const submit = (text: string) =>
+      props().onSubmitMessage!({ text, cwd: "/tmp/project", attachments: [] });
+    try {
+      expect(props().agentControls?.workspaceMain).toBeUndefined();
+      expect(props().submitBehavior).toBe("preserve-and-lock");
+      await waitFor(() => expect(props().isSubmitLoading).toBe(false));
+      await act(async () => {
+        await expect(submit("   ")).rejects.toThrow(
+          en.providerSelection.readiness.initialPromptRequired,
+        );
+      });
+      act(() => setCapability(false));
+      await act(async () => {
+        await expect(submit("Keep my question")).rejects.toThrow(
+          en.agentControls.workspaceMain.unsupported,
+        );
+      });
+      expect(createAgent).not.toHaveBeenCalled();
+
+      act(() => setCapability(true));
+      await act(async () => {
+        await expect(submit("Keep my question")).rejects.toThrow(
+          en.topicWorkbench.promptUnconfirmed,
+        );
+      });
+      expect(createAgent).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          workspaceId,
+          workspaceRole: "main",
+          initialPrompt: "Keep my question",
+          clientMessageId: `${draftId}:initial-message`,
+        }),
+      );
+      expect(onCreated).not.toHaveBeenCalled();
+      expect(inputDraft.clear).not.toHaveBeenCalled();
+      expect(screen.getByText(en.topicWorkbench.mainQueueUnavailable)).toBeTruthy();
+      const frozen = await readTopicQuestion(draftId);
+      if (!frozen) throw new Error("Expected the frozen question");
+      expect(frozen.request.initialPrompt).toBe("Keep my question");
+      view.unmount();
+      const continued = { ...frozen, continuationAgentId: main.id };
+      await writeTopicQuestion(draftId, continued);
+      view = mount();
+      await waitFor(() => expect(screen.getByText(en.newWorkspace.batch.check)).toBeTruthy());
+      expect(props().isSubmitLoading).toBe(true);
+      await act(async () => {
+        fireEvent.click(screen.getByText(en.newWorkspace.batch.check));
+      });
+      expect(await readTopicQuestion(draftId)).toEqual(continued);
+      expect(inputDraft.clear).not.toHaveBeenCalled();
+      expect(screen.queryByText(en.topicWorkbench.mainQueueUnavailable)).toBeNull();
+      fetchAgentTimeline.mockResolvedValue({
+        agentId: main.id,
+        error: null,
+        entries: [
+          {
+            item: { type: "user_message", clientMessageId: frozen.request.clientMessageId },
+          },
+        ],
+      } as Awaited<ReturnType<DaemonClient["fetchAgentTimeline"]>>);
+      fireEvent.click(screen.getByText(en.newWorkspace.batch.check));
+      await waitFor(() => expect(onCreated).toHaveBeenCalledExactlyOnceWith(main));
+      expect(inputDraft.clear).toHaveBeenCalledWith("sent");
+      expect(await readTopicQuestion(draftId)).toBeNull();
+      expect(createAgent).toHaveBeenCalledTimes(1);
+      expect(daemon.sendAgentMessage).not.toHaveBeenCalled();
+    } finally {
+      view.unmount();
+      await clearTopicQuestion(draftId);
+      store.clearSession(serverId);
+      useCreateFlowStore.getState().clear({ draftId });
+      useWorkspaceAttachmentsStore.setState(storedAttachments);
+      vi.mocked(useHostRuntimeClient).mockReset();
+      vi.mocked(useAgentInputDraft).mockReset();
+    }
+  });
+
   test("preserves a checked draft when availability changes or the host rejects the request", async () => {
     const serverId = "main-draft-host";
     const draftId = "main-draft";

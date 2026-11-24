@@ -1,4 +1,5 @@
 import { resolveChangesPresentation } from "./changes/presentation";
+import { StagingPanel } from "./changes/staging-panel";
 import { useCallback, useMemo, type ReactNode } from "react";
 import { Text, View } from "react-native";
 import { useTranslation } from "react-i18next";
@@ -14,6 +15,7 @@ import { ChangesSurface, DiffLayoutToggle, resolveDiffLayout } from "@/git/diff-
 import { useCommitDiffFiles } from "@/git/use-diff-files";
 import { useChangesPreferences } from "@/hooks/use-changes-preferences";
 import { useAppSettings } from "@/hooks/use-settings";
+import { useHostFeature } from "@/runtime/host-features";
 import { usePaneContext } from "@/panels/pane-context";
 import { definePanel, type PanelDescriptor, type PanelPresentation } from "@/panels/panel-registry";
 import { useAddFileToChat } from "@/panels/use-add-file-to-chat";
@@ -91,6 +93,11 @@ function ChangesPanel() {
     "ChangesPanel requires working_diff or changes_tree target",
   );
   const isTree = target.kind === "changes_tree";
+  const stagingEnabled = useHostFeature(serverId, "checkoutGitStagingV1");
+  const handleOpenComparison = useCallback(
+    () => openPreferredTarget({ kind: "working_diff" }, "diffs"),
+    [openPreferredTarget],
+  );
   const isCompact = useIsCompactFormFactor();
 
   const handleOpenFile = useCallback(
@@ -116,6 +123,21 @@ function ChangesPanel() {
     return <PanelState message={t("panels.diff.directoryMissing")} />;
   }
 
+  // COMPAT(checkoutGitStagingV1): added in v0.18.0, remove after 2027-06-01 once daemon floor >= v0.18.0.
+  if (isTree && stagingEnabled) {
+    return (
+      <View style={styles.container} testID="changes-tree-panel">
+        <StagingPanel
+          key={JSON.stringify([serverId, workspaceId, cwd])}
+          serverId={serverId}
+          workspaceId={workspaceId}
+          cwd={cwd}
+          active={isActive}
+          onOpenComparison={handleOpenComparison}
+        />
+      </View>
+    );
+  }
   const presentation = resolveChangesPresentation({
     isTree,
     inlineDiff: preferences.inlineDiff,
@@ -134,6 +156,7 @@ function ChangesPanel() {
           cwd={cwd}
           enabled={isActive}
           presentation={presentation}
+          stagingEnabled={stagingEnabled}
           focusPath={target.kind === "working_diff" ? target.focusPath : undefined}
           focusRequestId={target.kind === "working_diff" ? target.focusRequestId : undefined}
           onSelectDiffFile={isTree ? handleSelectDiffFile : undefined}

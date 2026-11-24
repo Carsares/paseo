@@ -22,12 +22,24 @@ import {
   useComposerTabFullscreen,
 } from "@/composer/editing-session";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
+import {
+  isTopicFirstQuestionDraft,
+  resolveTopicFirstQuestionDraftId,
+} from "@/composer/draft/workspace-main-intent";
+import {
+  getUnboundTopicWorkspace,
+  TopicEmptyState,
+  TopicQuestionResume,
+  useTopicWorkspace,
+} from "@/panels/topic-empty-state";
 import { SheetHostScope } from "@/components/ui/isolated-bottom-sheet-modal";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { getOpenAgentTabLabel, isMainControlAgent } from "@getpaseo/protocol/agent-labels";
 import {
+  createContext,
   memo,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -578,7 +590,66 @@ function parsePaneDirection(actionId: string): PaneDirection | null {
   return null;
 }
 
+const TopicEmptyContentContext = createContext<ReactNode>(null);
+
+function TopicEmptyTabContent() {
+  return useContext(TopicEmptyContentContext);
+}
+
+function useUnboundTopicContent(input: {
+  serverId: string;
+  workspaceId: string;
+  client: ReturnType<typeof useHostRuntimeClient>;
+  isRouteFocused: boolean;
+  isConnected: boolean;
+  canOpenDraft: boolean;
+  hasHydratedLayout: boolean;
+  hasHydratedAgents: boolean;
+  mainAgentId: string | null;
+  descriptor: WorkspaceDescriptor | null;
+  layout: WorkspaceLayout | null;
+  explorerPaneId: string | null;
+  tabs: WorkspaceTab[];
+  onAsk: () => void;
+}) {
+  const { layout, explorerPaneId, tabs, onAsk } = input;
+  const mainTabs = useMemo(() => {
+    const explorerTabIds =
+      layout && explorerPaneId ? findPaneById(layout.root, explorerPaneId)?.tabIds : undefined;
+    return explorerTabIds?.length
+      ? tabs.filter((tab) => !explorerTabIds.includes(tab.tabId))
+      : tabs;
+  }, [explorerPaneId, layout, tabs]);
+  const hasActiveMainAgent = input.descriptor?.hasActiveMainAgent;
+  const canShow =
+    input.canOpenDraft &&
+    Boolean(input.descriptor?.workspaceDirectory) &&
+    input.hasHydratedLayout &&
+    input.hasHydratedAgents &&
+    !input.mainAgentId &&
+    hasActiveMainAgent !== true &&
+    mainTabs.every((tab) => tab.target.kind === "new_tab");
+  const { workspace } = useTopicWorkspace({
+    serverId: input.serverId,
+    workspaceId: input.workspaceId,
+    client: input.client,
+    enabled: canShow && input.isRouteFocused && input.isConnected,
+  });
+  const topic = canShow ? getUnboundTopicWorkspace(workspace, hasActiveMainAgent) : null;
+  const content = useMemo(
+    () => (topic ? <TopicEmptyState workspace={topic} onAsk={onAsk} /> : null),
+    [onAsk, topic],
+  );
+  return {
+    content,
+    placeholderTabId: content ? mainTabs[0]?.tabId : undefined,
+    withoutTab: content !== null && mainTabs.length === 0,
+  };
+}
+
 interface RenderWorkspaceContentInput {
+  topicEmptyContent: ReactNode;
+  topicPlaceholderTabId: string | undefined;
   isMissingWorkspaceDirectory: boolean;
   activeTabDescriptor: WorkspaceTabDescriptor | null;
   hasHydratedAgents: boolean;
@@ -597,6 +668,8 @@ interface RenderWorkspaceContentInput {
 
 function renderWorkspaceContent(input: RenderWorkspaceContentInput): React.ReactNode {
   const {
+    topicEmptyContent,
+    topicPlaceholderTabId,
     isMissingWorkspaceDirectory,
     activeTabDescriptor,
     hasHydratedAgents,
@@ -618,6 +691,12 @@ function renderWorkspaceContent(input: RenderWorkspaceContentInput): React.React
         </Text>
       </View>
     );
+  }
+  if (
+    topicEmptyContent &&
+    (!activeTabDescriptor || activeTabDescriptor.tabId === topicPlaceholderTabId)
+  ) {
+    return topicEmptyContent;
   }
   if (!activeTabDescriptor && (!hasHydratedAgents || !hasLoadedTerminals)) {
     return (
@@ -1590,6 +1669,7 @@ function WorkspaceScreenContent({
       draftId?: string;
       focus?: boolean;
       paneId?: string | null;
+      standalone?: boolean;
     }) {
       if (!persistenceKey) {
         return null;
@@ -1597,6 +1677,7 @@ function WorkspaceScreenContent({
 
       const target = buildNewAgentTabTarget({
         draftId: trimNonEmpty(input?.draftId) ?? generateDraftId(),
+        selection: input?.standalone ? { kind: "agent", relationship: "standalone" } : undefined,
         resolveSubagentSetup: resolveNewAgentTabSetup,
       });
       if (input?.ambient) {
@@ -3423,7 +3504,51 @@ function WorkspaceScreenContent({
     }
     focusWorkspacePane(persistenceKey, paneId);
   });
+  const openTopicQuestion = useStableEvent((draftId: string) => {
+    if (
+      !isTopicFirstQuestionDraft(draftId, normalizedServerId, normalizedWorkspaceId) ||
+      !selectHostFeature(useSessionStore.getState(), normalizedServerId, "topicWorkbenchV1")
+    ) {
+      return;
+    }
+    openWorkspaceDraftTab({
+      draftId,
+      paneId: lastMainPaneId ?? DEFAULT_PANE_ID,
+      standalone: true,
+    });
+  });
+  const askFirstTopicQuestion = useStableEvent(async () => {
+    try {
+      openTopicQuestion(
+        await resolveTopicFirstQuestionDraftId(normalizedServerId, normalizedWorkspaceId),
+      );
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
+  });
+  const {
+    content: topicEmptyContent,
+    placeholderTabId: topicPlaceholderTabId,
+    withoutTab: topicWithoutTab,
+  } = useUnboundTopicContent({
+    serverId: normalizedServerId,
+    workspaceId: normalizedWorkspaceId,
+    client,
+    isRouteFocused,
+    isConnected,
+    canOpenDraft: Boolean(persistenceKey),
+    hasHydratedLayout: hasHydratedWorkspaceLayoutStore,
+    hasHydratedAgents,
+    mainAgentId,
+    descriptor: workspaceDescriptor,
+    layout: workspaceLayout,
+    explorerPaneId: explorerSidebarPaneId,
+    tabs: uiTabs,
+    onAsk: askFirstTopicQuestion,
+  });
   const content = renderWorkspaceContent({
+    topicEmptyContent,
+    topicPlaceholderTabId,
     isMissingWorkspaceDirectory,
     activeTabDescriptor,
     hasHydratedAgents,
@@ -3439,13 +3564,16 @@ function WorkspaceScreenContent({
 
   const buildDesktopPaneContentModel = useCallback(
     function buildDesktopPaneContentModel(input: { paneId: string; tab: WorkspaceTabDescriptor }) {
-      return buildPaneContentModel({
+      const model = buildPaneContentModel({
         tab: input.tab,
         paneId: input.paneId,
         focusPaneBeforeOpen: true,
       });
+      return input.tab.tabId === topicPlaceholderTabId
+        ? { ...model, Component: TopicEmptyTabContent }
+        : model;
     },
-    [buildPaneContentModel],
+    [buildPaneContentModel, topicPlaceholderTabId],
   );
 
   const desktopTabRowItems = useMemo<WorkspaceDesktopTabRowItem[]>(
@@ -3820,7 +3948,7 @@ function WorkspaceScreenContent({
   );
   const fullWorkspaceActions = renderCompactWorkspaceHeader(workspaceCompactHeaderTabs, true);
   const desktopSplitContent = useMemo(() => {
-    if (!canRenderDesktopPaneSplits || !workspaceLayout || !persistenceKey) {
+    if (!canRenderDesktopPaneSplits || !workspaceLayout || !persistenceKey || topicWithoutTab) {
       return null;
     }
     return (
@@ -3861,6 +3989,7 @@ function WorkspaceScreenContent({
       />
     );
   }, [
+    topicWithoutTab,
     canRenderDesktopPaneSplits,
     workspaceLayout,
     renderWorkspaceScreenHeader,
@@ -3924,12 +4053,35 @@ function WorkspaceScreenContent({
     activeTab: activeTabDescriptor,
     composerFullscreen: useComposerTabFullscreen(workspacePanelKey, activeTabId),
   });
+  const supportsTopicRecovery = useHostFeature(normalizedServerId, "topicWorkbenchV1");
+  const canResumeTopicQuestion = [
+    supportsTopicRecovery,
+    isRouteFocused,
+    hasHydratedWorkspaceLayoutStore,
+    persistenceKey,
+    workspaceDirectory,
+  ].every(Boolean);
+  const topicQuestionResume = (
+    <TopicQuestionResume
+      key={persistenceKey}
+      enabled={canResumeTopicQuestion}
+      serverId={normalizedServerId}
+      workspaceId={normalizedWorkspaceId}
+      openTargets={[...uiTabs.map((tab) => tab.target), ...sheets.map((sheet) => sheet.tab.target)]}
+      onOpen={openTopicQuestion}
+    />
+  );
 
   // Compact sheets escape to the app overlay host, above both sidebars.
   const workspaceCenterColumn = isMobile ? (
     <View style={styles.centerColumn}>
       <FloatingHeaderLayout
-        header={compactHeaderLayout.header}
+        header={
+          <>
+            {compactHeaderLayout.header}
+            {topicQuestionResume}
+          </>
+        }
         floating={compactHeaderLayout.floating}
       >
         {(topOverlayInset) => (
@@ -3981,7 +4133,12 @@ function WorkspaceScreenContent({
         </AdaptiveWorkspaceChrome>
       )}
       <View style={styles.centerContent}>
-        <View style={styles.content}>{desktopContent}</View>
+        {topicQuestionResume}
+        <View style={styles.content}>
+          <TopicEmptyContentContext value={topicEmptyContent}>
+            {desktopContent}
+          </TopicEmptyContentContext>
+        </View>
       </View>
     </DesktopCenterColumnChrome>
   );
