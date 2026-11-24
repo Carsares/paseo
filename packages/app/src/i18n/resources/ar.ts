@@ -1,7 +1,11 @@
+import { topicWorkbench } from "../domains/topic-workbench";
+import { gitWorkbench } from "../domains/git-workbench";
 import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ar: TranslationResources = {
+  topicWorkbench: topicWorkbench["ar"],
+  gitWorkbench: gitWorkbench["ar"],
   pluginCombobox: {
     searching: "جارٍ البحث…",
     empty: "لا توجد نتائج",

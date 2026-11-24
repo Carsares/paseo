@@ -114,6 +114,14 @@ const manifests = {
     compactSheet: null,
     resourceKey: () => "pull_request",
   },
+  git_graph: {
+    kind: "git_graph",
+    supportedHosts: ["main"],
+    showCloseButton: true,
+    singleton: true,
+    compactSheet: null,
+    resourceKey: () => "git_graph",
+  },
   file: {
     kind: "file",
     supportedHosts: ["main", "explorer"],

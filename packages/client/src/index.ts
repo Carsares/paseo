@@ -18,7 +18,26 @@ import type { DaemonClientConfig } from "./daemon-client.js";
 export type {
   SetAgentLimitRecoveryParameters,
   SetWorkspaceDeferralParameters,
+  WorkbenchRequestOptions,
+  WorkbenchResponsePayload,
 } from "./daemon-client.js";
+export type {
+  CheckoutGitActiveAgent,
+  CheckoutGitCommitDetail,
+  CheckoutGitConflictFile,
+  CheckoutGitFile,
+  CheckoutGitLogCommit,
+  CheckoutGitOperationState,
+  CheckoutGitRebaseStep,
+  CheckoutGitRepo,
+  CheckoutGitRepoRefs,
+  CheckoutGitStashEntry,
+  CheckoutGitWorkingTree,
+  WorkbenchErrorCode,
+  WorkspaceDurableItem,
+  WorkspaceDurableItemEvidence,
+  WorkspaceTopic,
+} from "@getpaseo/protocol/messages";
 import type { AgentPermissionResponse, JsonValue } from "@getpaseo/protocol/agent-types";
 import type {
   AgentSnapshotPayload,

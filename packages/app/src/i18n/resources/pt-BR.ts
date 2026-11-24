@@ -1,7 +1,11 @@
+import { topicWorkbench } from "../domains/topic-workbench";
+import { gitWorkbench } from "../domains/git-workbench";
 import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ptBR: TranslationResources = {
+  topicWorkbench: topicWorkbench["pt-BR"],
+  gitWorkbench: gitWorkbench["pt-BR"],
   pluginCombobox: {
     searching: "Pesquisando…",
     empty: "Nenhum resultado",

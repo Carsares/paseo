@@ -7,6 +7,16 @@ import {
 } from "@/panels/panel-manifest";
 
 describe("panel manifest", () => {
+  it("reserves a main-only singleton for the Git graph", () => {
+    const manifest = getPanelManifest("git_graph");
+    expect(manifest.supportedHosts).toEqual(["main"]);
+    expect(manifest.showCloseButton).toBe(true);
+    expect(manifest.singleton).toBe(true);
+    expect(manifest.compactSheet).toBeNull();
+    expect(manifest.resourceKey({ kind: "git_graph" })).toBe("git_graph");
+    expect(panelSupportsHost("git_graph", "sheet")).toBe(false);
+    expect(panelCanLaunchInPane("git_graph", ["git_graph"])).toBe(false);
+  });
   it("answers host support without React panel registration", () => {
     expect(panelSupportsHost("agent", "main")).toBe(true);
     expect(panelSupportsHost("agent", "explorer")).toBe(true);

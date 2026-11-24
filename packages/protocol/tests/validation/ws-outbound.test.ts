@@ -69,6 +69,136 @@ async function compileInlineSchema(sourceSchema: string): Promise<GeneratedSchem
 }
 
 describe("WS outbound zod-aot validation", () => {
+  it("validates correlated workbench replies and their nested discriminated branches", () => {
+    const decision = {
+      type: "session",
+      message: {
+        type: "workspace.durable_item.decide.response",
+        payload: {
+          requestId: "call-1",
+          durableItemRequestId: "item-1",
+          workspaceId: "workspace-1",
+          error: null,
+          item: {
+            workspaceId: "workspace-1",
+            requestId: "item-1",
+            sourceAgentId: "main-1",
+            sourceTurnId: "turn-1",
+            kind: "acceptance",
+            title: "Review startup changes",
+            status: "decided",
+            decision: "approve",
+            revision: 2,
+            createdAt: "2026-11-24T00:00:00Z",
+            decidedAt: "2026-11-24T01:00:00Z",
+            evidence: [
+              { type: "file", path: "startup-trace.md", fingerprint: "trace-1" },
+              {
+                type: "git",
+                path: "boot.ts",
+                repoRoot: "/repo",
+                headSha: "abc",
+                blobOrIndexFingerprint: "blob-1",
+              },
+            ],
+          },
+        },
+      },
+    };
+    const graph = {
+      type: "session",
+      message: {
+        type: "checkout.git.log.query.response",
+        payload: {
+          requestId: "graph-1",
+          cwd: "/repo",
+          error: null,
+          commits: [],
+          hasMore: false,
+          nextCursor: null,
+          approxBytes: 100,
+        },
+      },
+    };
+    for (const envelope of [decision, graph]) {
+      expect(WSOutboundMessageSchema.parse(envelope)).toEqual(envelope);
+      expect(validateWSOutboundMessage(envelope)).toMatchObject({ success: true, data: envelope });
+    }
+    const { item, ...payload } = decision.message.payload;
+    const { decision: _choice, ...invalidItem } = item;
+    const invalidDecision = {
+      ...decision,
+      message: { ...decision.message, payload: { ...payload, item: invalidItem } },
+    };
+    expect(validateWSOutboundMessage(invalidDecision).success).toBe(false);
+  });
+
+  it("preserves the Git identifiers in responses and accepts staging-only working trees", () => {
+    const result = { cwd: "/repo", repoRoot: "/repo", requestId: "req-1", error: null };
+    const rebaseId = "rebase:v1/b+=";
+    const workingTree = {
+      repoRoot: "/repo",
+      headSha: "a".repeat(40),
+      currentBranch: "main",
+      operationState: "idle",
+      staged: [],
+      unstaged: [],
+      untracked: [],
+      conflicts: [],
+      activeAgents: [],
+    };
+    const conflict = {
+      path: "boot.ts",
+      status: "UU",
+      base: null,
+      ours: null,
+      theirs: null,
+      hunks: [],
+    };
+    const inspect = (entry: typeof conflict & { conflictFingerprint?: string }) => ({
+      type: "checkout.git.conflict.inspect.response",
+      payload: { ...result, conflicts: [entry] },
+    });
+    for (const message of [
+      inspect({ ...conflict, conflictFingerprint: "snapshot:v1/a+=" }),
+      {
+        type: "checkout.git.rebase.execute.response",
+        payload: { ...result, success: true, rebaseId },
+      },
+      {
+        type: "checkout.git.rebase.act.response",
+        payload: { ...result, success: true, rebaseId },
+      },
+      ...[workingTree, { ...workingTree, operationState: "rebase_paused", rebaseId }].map(
+        (tree) => ({
+          type: "checkout.git.working_tree.get.response",
+          payload: { ...result, workingTree: tree },
+        }),
+      ),
+      {
+        type: "checkout_commit_response",
+        payload: { cwd: "/repo", requestId: "legacy-1", success: true, error: null },
+      },
+    ]) {
+      const envelope = { type: "session", message };
+      expect(validateWSOutboundMessage(envelope)).toMatchObject({ success: true, data: envelope });
+    }
+    for (const message of [
+      inspect(conflict),
+      inspect({ ...conflict, conflictFingerprint: "" }),
+      {
+        type: "checkout.git.rebase.execute.response",
+        payload: { ...result, success: true },
+      },
+      {
+        type: "checkout.git.rebase.act.response",
+        payload: { ...result, success: true, rebaseId: "" },
+      },
+    ]) {
+      expect(validateWSOutboundMessage({ type: "session", message }).success).toBe(false);
+    }
+  });
+
   it("applies defaults inside discriminated-union branches", async () => {
     const schema = await compileInlineSchema(`
 const SourceSchema = z.discriminatedUnion("type", [

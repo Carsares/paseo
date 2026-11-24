@@ -190,6 +190,257 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
+test("durable item decisions correlate by RPC ID while preserving the item ID", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "durable-item",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: { workspaceDurableItemsV1: true } });
+  await connecting;
+
+  const options = {
+    workspaceId: "workspace-1",
+    durableItemRequestId: "item-1",
+    expectedRevision: 4,
+    decision: "approve",
+  } as const;
+  const first = client.decideWorkspaceDurableItem({ ...options, requestId: "call-1" });
+  expect(parseSentFrame(mock.sent.at(-1))).toEqual({
+    type: "workspace.durable_item.decide.request",
+    ...options,
+    requestId: "call-1",
+  });
+  const second = client.decideWorkspaceDurableItem({ ...options, requestId: "call-2" });
+  const conflict = {
+    workspaceId: options.workspaceId,
+    durableItemRequestId: options.durableItemRequestId,
+    requestId: "call-2",
+    item: null,
+    error: "Evidence changed",
+    errorCode: "DURABLE_ITEM_STALE_EVIDENCE",
+  };
+  mock.triggerMessage(
+    wrapSessionMessage({ type: "workspace.durable_item.decide.response", payload: conflict }),
+  );
+  const accepted = {
+    ...conflict,
+    requestId: "call-1",
+    error: null,
+    errorCode: undefined,
+    item: {
+      workspaceId: options.workspaceId,
+      requestId: options.durableItemRequestId,
+      sourceAgentId: "main-1",
+      sourceTurnId: "turn-1",
+      kind: "decision",
+      title: "Proceed?",
+      status: "decided",
+      decision: "approve",
+      revision: 5,
+      createdAt: "2026-11-24T00:00:00Z",
+      decidedAt: "2026-11-24T01:00:00Z",
+      evidence: [],
+    },
+  };
+  mock.triggerMessage(
+    wrapSessionMessage({ type: "workspace.durable_item.decide.response", payload: accepted }),
+  );
+  await expect(first).resolves.toMatchObject({ requestId: "call-1", item: accepted.item });
+  await expect(second).resolves.toEqual(conflict);
+});
+
+test("Git workbench methods require the advertised feature and count patch bytes", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "git-workbench",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: { checkoutGitStagingV1: true } });
+  await connecting;
+
+  const sentBefore = mock.sent.length;
+  await expect(client.checkoutGitLogQuery({ cwd: "/repo", repoRoots: ["/repo"] })).rejects.toThrow(
+    "Update the host",
+  );
+  await expect(
+    client.checkoutGitStageApply({
+      cwd: "/repo",
+      targetRepoRoot: "/repo",
+      scope: "hunk",
+      patch: "变".repeat(200_000),
+    }),
+  ).rejects.toThrow("512 KiB");
+  await expect(
+    client.createWorkspace({
+      source: { kind: "directory", path: "/repo" },
+      title: "Topic",
+      topic: {},
+    }),
+  ).rejects.toThrow("Update the host");
+  expect(mock.sent).toHaveLength(sentBefore);
+
+  const result = client.checkoutGitStageApply({
+    cwd: "/repo",
+    targetRepoRoot: "/repo",
+    requestId: "stage-1",
+    scope: "paths",
+    paths: ["boot.ts"],
+  });
+  expect(parseSentFrame(mock.sent.at(-1))).toEqual({
+    type: "checkout.git.stage.apply.request",
+    requestId: "stage-1",
+    cwd: "/repo",
+    targetRepoRoot: "/repo",
+    scope: "paths",
+    paths: ["boot.ts"],
+  });
+  const payload = {
+    cwd: "/repo",
+    repoRoot: "/repo",
+    requestId: "stage-1",
+    success: true,
+    error: null,
+  };
+  mock.triggerMessage(wrapSessionMessage({ type: "checkout.git.stage.apply.response", payload }));
+  await expect(result).resolves.toEqual(payload);
+});
+
+test("Git workbench sends the inspected conflict and rebase identifiers unchanged", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "git-workbench-snapshots",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: { checkoutGitRebaseV1: true } });
+  await connecting;
+
+  const target = { cwd: "/repo", targetRepoRoot: "/repo" };
+  const result = { cwd: "/repo", repoRoot: "/repo" };
+  const resolveOptions = { ...target, path: "boot.ts", strategy: "ours", hunkIndex: 0 } as const;
+  const actOptions = { ...target, action: "continue" } as const;
+  const sentBefore = mock.sent.length;
+  await expect(
+    // @ts-expect-error Simulate a caller without the required conflict fingerprint.
+    client.checkoutGitConflictResolve(resolveOptions),
+  ).rejects.toThrow("expectedConflictFingerprint");
+  await expect(
+    // @ts-expect-error Simulate a caller without the required rebase ID.
+    client.checkoutGitRebaseAct(actOptions),
+  ).rejects.toThrow("expectedRebaseId");
+  expect(mock.sent).toHaveLength(sentBefore);
+
+  const inspect = client.checkoutGitConflictInspect({ ...target, requestId: "inspect-1" });
+  const fingerprint = "snapshot:v1/a+=";
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "checkout.git.conflict.inspect.response",
+      payload: {
+        ...result,
+        requestId: "inspect-1",
+        error: null,
+        conflicts: [
+          {
+            path: "boot.ts",
+            status: "UU",
+            conflictFingerprint: fingerprint,
+            base: null,
+            ours: null,
+            theirs: null,
+            hunks: [],
+          },
+        ],
+      },
+    }),
+  );
+  const {
+    conflicts: [file],
+  } = await inspect;
+  const resolve = client.checkoutGitConflictResolve({
+    ...resolveOptions,
+    expectedConflictFingerprint: file!.conflictFingerprint,
+    requestId: "resolve-1",
+  });
+  expect(parseSentFrame(mock.sent.at(-1))).toMatchObject({
+    type: "checkout.git.conflict.resolve.request",
+    hunkIndex: 0,
+    expectedConflictFingerprint: fingerprint,
+  });
+  const staleConflict = {
+    ...result,
+    requestId: "resolve-1",
+    success: false,
+    error: "Conflict changed",
+    errorCode: "STALE_CONFLICT_SNAPSHOT",
+  };
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "checkout.git.conflict.resolve.response",
+      payload: staleConflict,
+    }),
+  );
+  await expect(resolve).resolves.toEqual(staleConflict);
+
+  const execute = client.checkoutGitRebaseExecute({
+    ...target,
+    ontoRef: "main",
+    expectedHeadSha: "a".repeat(40),
+    requestId: "execute-1",
+    steps: [{ type: "pick", sha: "b".repeat(40) }],
+  });
+  const originalRebaseId = "rebase:v1/b+=";
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "checkout.git.rebase.execute.response",
+      payload: {
+        ...result,
+        requestId: "execute-1",
+        success: true,
+        error: null,
+        rebaseId: originalRebaseId,
+      },
+    }),
+  );
+  const { rebaseId } = await execute;
+  if (!rebaseId) throw new Error("Expected the new rebase ID");
+  const act = client.checkoutGitRebaseAct({
+    ...actOptions,
+    expectedRebaseId: rebaseId,
+    requestId: "act-1",
+  });
+  expect(parseSentFrame(mock.sent.at(-1))).toMatchObject({
+    type: "checkout.git.rebase.act.request",
+    expectedRebaseId: originalRebaseId,
+  });
+  const staleRebase = {
+    ...result,
+    requestId: "act-1",
+    success: false,
+    rebaseId: "rebase-2",
+    error: "Rebase changed",
+    errorCode: "STALE_REBASE_INSTANCE",
+  };
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "checkout.git.rebase.act.response",
+      payload: staleRebase,
+    }),
+  );
+  await expect(act).resolves.toEqual(staleRebase);
+});
+
 test("workspace deferral sends correlated writes and preserves recovery conflicts", async () => {
   const mock = createMockTransport();
   const client = new DaemonClient({

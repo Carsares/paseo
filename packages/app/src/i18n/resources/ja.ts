@@ -1,7 +1,11 @@
+import { topicWorkbench } from "../domains/topic-workbench";
+import { gitWorkbench } from "../domains/git-workbench";
 import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ja: TranslationResources = {
+  topicWorkbench: topicWorkbench["ja"],
+  gitWorkbench: gitWorkbench["ja"],
   pluginCombobox: {
     searching: "検索中…",
     empty: "結果がありません",

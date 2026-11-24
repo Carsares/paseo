@@ -1,6 +1,10 @@
+import { topicWorkbench } from "../domains/topic-workbench";
+import { gitWorkbench } from "../domains/git-workbench";
 import { pluginGallery } from "./plugin-gallery";
 
 export const en = {
+  topicWorkbench: topicWorkbench["en"],
+  gitWorkbench: gitWorkbench["en"],
   pluginCombobox: {
     searching: "Searching…",
     empty: "No results",

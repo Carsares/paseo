@@ -24,8 +24,127 @@ import {
   BranchSuggestionsRequestSchema,
   WorkspaceBaseBranchSetRequestSchema,
   WorkspaceBaseBranchSetResponseSchema,
+  WorkspaceCreateRequestSchema,
 } from "./messages.js";
 import { validateWSOutboundMessage } from "./validation/ws-outbound.js";
+
+test("workbench features and topic creation extend legacy wire shapes", () => {
+  const info = { status: "server_info", serverId: "server-1" };
+  const oldFeatures = { agentCreateAsMain: true };
+  const features = {
+    ...oldFeatures,
+    topicWorkbenchV1: true,
+    workspaceDurableItemsV1: true,
+    checkoutGitStagingV1: false,
+    checkoutGitGraphV1: true,
+    checkoutGitRebaseV1: true,
+    checkoutGitMultiRepoV1: true,
+  };
+  expect(ServerInfoStatusPayloadSchema.parse({ ...info, features: oldFeatures }).features).toEqual(
+    oldFeatures,
+  );
+  expect(z.object({ agentCreateAsMain: z.boolean().optional() }).parse(features)).toEqual(
+    oldFeatures,
+  );
+  const envelope = { type: "session", message: { type: "status", payload: { ...info, features } } };
+  expect(validateWSOutboundMessage(envelope)).toMatchObject({ success: true, data: envelope });
+
+  const legacyRequest = {
+    type: "workspace.create.request",
+    requestId: "create-1",
+    source: { kind: "directory", path: "/repo" },
+    title: "Topic",
+    mainAgent: { config: { provider: "codex", cwd: "/repo" } },
+  };
+  const request = { ...legacyRequest, topic: { summary: "Inspect startup", hideFromModel: true } };
+  expect(SessionInboundMessageSchema.parse(legacyRequest)).toMatchObject(legacyRequest);
+  expect(SessionInboundMessageSchema.parse(request)).toMatchObject(request);
+  const oldSchema = WorkspaceCreateRequestSchema.omit({ topic: true });
+  expect(oldSchema.parse(request)).toEqual(oldSchema.parse(legacyRequest));
+});
+
+test("deciding an item requires a target ID distinct from the RPC correlation field", () => {
+  const request = {
+    type: "workspace.durable_item.decide.request",
+    requestId: "call-1",
+    workspaceId: "workspace-1",
+    expectedRevision: 3,
+    decision: "approve",
+  };
+  expect(SessionInboundMessageSchema.safeParse(request).success).toBe(false);
+  const decision = { ...request, durableItemRequestId: "item-1" };
+  expect(SessionInboundMessageSchema.parse(decision)).toEqual(decision);
+});
+
+test("new Git RPCs reject unsupported operations and preserve the legacy commit request", () => {
+  const legacy = { type: "checkout_commit_request", cwd: "/repo", requestId: "legacy-commit" };
+  expect(SessionInboundMessageSchema.parse(legacy)).toMatchObject(legacy);
+  const rebase = {
+    type: "checkout.git.rebase.execute.request",
+    cwd: "/repo",
+    targetRepoRoot: "/repo",
+    requestId: "rebase-1",
+    expectedHeadSha: "a".repeat(40),
+    ontoRef: "main",
+  };
+  const sha = "b".repeat(40);
+  expect(
+    SessionInboundMessageSchema.safeParse({ ...rebase, steps: [{ type: "exec", sha }] }).success,
+  ).toBe(false);
+  expect(
+    SessionInboundMessageSchema.safeParse({ ...rebase, steps: [{ type: "reword", sha }] }).success,
+  ).toBe(false);
+  expect(SessionInboundMessageSchema.parse({ ...rebase, steps: [{ type: "pick", sha }] })).toEqual({
+    ...rebase,
+    steps: [{ type: "pick", sha }],
+  });
+});
+
+test.each([
+  {
+    request: {
+      type: "checkout.git.conflict.resolve.request",
+      path: "boot.ts",
+      strategy: "ours",
+      hunkIndex: 0,
+    },
+    key: "expectedConflictFingerprint",
+    value: "snapshot:v1/a+=",
+  },
+  {
+    request: {
+      type: "checkout.git.rebase.act.request",
+      action: "continue",
+    },
+    key: "expectedRebaseId",
+    value: "rebase:v1/b+=",
+  },
+])(
+  "$request.type requires a nonempty snapshot or instance identifier",
+  ({ request, key, value }) => {
+    const base = { ...request, cwd: "/repo", targetRepoRoot: "/repo", requestId: "write-1" };
+    expect(SessionInboundMessageSchema.safeParse(base).success).toBe(false);
+    expect(SessionInboundMessageSchema.safeParse({ ...base, [key]: "" }).success).toBe(false);
+    const guarded = { ...base, [key]: value };
+    expect(SessionInboundMessageSchema.parse(guarded)).toEqual(guarded);
+  },
+);
+
+test("rebase undo retains the reserved backup reference constraint", () => {
+  const undo = {
+    type: "checkout.git.rebase.act.request",
+    action: "undo",
+    cwd: "/repo",
+    targetRepoRoot: "/repo",
+    requestId: "undo-1",
+    expectedRebaseId: "rebase-1",
+  };
+  expect(
+    SessionInboundMessageSchema.safeParse({ ...undo, backupRef: "refs/heads/main" }).success,
+  ).toBe(false);
+  const valid = { ...undo, backupRef: "refs/paseo/backup/rebase-1" };
+  expect(SessionInboundMessageSchema.parse(valid)).toEqual(valid);
+});
 
 test("workspace creation keeps accepting legacy sources and preserves a capability-gated pin", () => {
   const request = { type: "workspace.create.request", requestId: "create-1" };

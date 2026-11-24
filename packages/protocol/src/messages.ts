@@ -1168,6 +1168,50 @@ export const WorkspaceMetadataUpdateRequestSchema = z.object({
   requestId: z.string(),
 });
 
+const WorkspaceTopicInputSchema = z.object({
+  summary: z.string().nullable().optional(),
+  hideFromModel: z.boolean().optional(),
+});
+
+export const WorkspaceTopicSchema = z.object({
+  summary: z.string().nullable(),
+  hideFromModel: z.boolean(),
+  revision: z.number().int().nonnegative(),
+  mainAgentId: z.string().nullable(),
+});
+
+export const WorkspaceTopicUpdateRequestSchema = WorkspaceTopicInputSchema.extend({
+  type: z.literal("workspace.topic.update.request"),
+  workspaceId: z.string().min(1),
+  upgradeToTopic: z.boolean().optional(),
+  mainAgentId: z.string().min(1).optional(),
+  requestId: z.string(),
+});
+
+export const WorkspaceDurableItemStatusSchema = z.enum(["pending", "decided", "expired"]);
+export const WorkspaceDurableItemDecisionSchema = z.enum(["approve", "reject", "request_changes"]);
+
+export const WorkspaceDurableItemListRequestSchema = z.object({
+  type: z.literal("workspace.durable_item.list.request"),
+  workspaceId: z.string().min(1).optional(),
+  statusFilter: WorkspaceDurableItemStatusSchema.optional(),
+  cursor: z.string().optional(),
+  limit: z.number().int().positive().optional(),
+  requestId: z.string(),
+});
+
+export const WorkspaceDurableItemDecideRequestSchema = z.object({
+  type: z.literal("workspace.durable_item.decide.request"),
+  workspaceId: z.string().min(1),
+  // A durable item retains the ID of the request that created it.
+  durableItemRequestId: z.string().min(1),
+  expectedRevision: z.number().int().nonnegative(),
+  decision: WorkspaceDurableItemDecisionSchema,
+  note: z.string().optional(),
+  // A fresh ID correlates this decision RPC, including retries and conflicts.
+  requestId: z.string(),
+});
+
 export const WorkspaceDeferralSetRequestSchema = z.object({
   type: z.literal("workspace.deferral.set.request"),
   workspaceId: z.string().min(1),
@@ -2848,6 +2892,92 @@ export const WorkspaceMetadataUpdateResponseSchema = z.object({
   }),
 });
 
+export const WorkbenchErrorCodeSchema = z.enum([
+  "REPO_WRITE_LOCK_TIMEOUT",
+  "ACTIVE_AGENT_GUARD",
+  "STALE_HEAD_CONFLICT",
+  "STALE_CONFLICT_SNAPSHOT",
+  "STALE_REBASE_INSTANCE",
+  "REBASE_CONFLICT_PAUSED",
+  "PATCH_APPLY_REJECTED",
+  "TOPIC_MAIN_ARCHIVE_PROTECTED",
+  "DURABLE_ITEM_STALE_EVIDENCE",
+  "PERMISSION_DENIED",
+]);
+
+const WorkbenchResponsePayloadSchema = z.object({
+  requestId: z.string(),
+  error: z.string().nullable(),
+  errorCode: WorkbenchErrorCodeSchema.optional(),
+});
+
+export const WorkspaceTopicUpdateResponseSchema = z.object({
+  type: z.literal("workspace.topic.update.response"),
+  payload: WorkbenchResponsePayloadSchema.extend({
+    workspaceId: z.string(),
+    topic: WorkspaceTopicSchema.nullable(),
+  }),
+});
+
+export const WorkspaceDurableItemEvidenceSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("file"),
+    path: z.string(),
+    fingerprint: z.string(),
+  }),
+  z.object({
+    type: z.literal("git"),
+    path: z.string(),
+    repoRoot: z.string(),
+    headSha: z.string().nullable(),
+    blobOrIndexFingerprint: z.string(),
+  }),
+]);
+
+const WorkspaceDurableItemBaseSchema = z.object({
+  workspaceId: z.string(),
+  requestId: z.string(),
+  sourceAgentId: z.string(),
+  sourceTurnId: z.string(),
+  kind: z.enum(["authorization", "decision", "acceptance"]),
+  title: z.string(),
+  summary: z.string().optional(),
+  evidence: z.array(WorkspaceDurableItemEvidenceSchema),
+  revision: z.number().int().nonnegative(),
+  createdAt: z.string(),
+});
+
+export const WorkspaceDurableItemSchema = z.discriminatedUnion("status", [
+  WorkspaceDurableItemBaseSchema.extend({ status: z.literal("pending") }),
+  WorkspaceDurableItemBaseSchema.extend({
+    status: z.literal("decided"),
+    decision: WorkspaceDurableItemDecisionSchema,
+    note: z.string().optional(),
+    decidedAt: z.string(),
+  }),
+  WorkspaceDurableItemBaseSchema.extend({
+    status: z.literal("expired"),
+    expiredAt: z.string(),
+  }),
+]);
+
+export const WorkspaceDurableItemListResponseSchema = z.object({
+  type: z.literal("workspace.durable_item.list.response"),
+  payload: WorkbenchResponsePayloadSchema.extend({
+    items: z.array(WorkspaceDurableItemSchema),
+    nextCursor: z.string().nullable(),
+  }),
+});
+
+export const WorkspaceDurableItemDecideResponseSchema = z.object({
+  type: z.literal("workspace.durable_item.decide.response"),
+  payload: WorkbenchResponsePayloadSchema.extend({
+    workspaceId: z.string(),
+    durableItemRequestId: z.string(),
+    item: WorkspaceDurableItemSchema.nullable(),
+  }),
+});
+
 const WorkspaceDeferralResultSchema = z.object({
   requestId: z.string(),
   success: z.boolean(),
@@ -3153,6 +3283,174 @@ export const CheckoutCommitsListRequestSchema = z.object({
   type: z.literal("checkout.commits.list.request"),
   cwd: z.string(),
   requestId: z.string(),
+});
+
+const CheckoutGitRequestSchema = z.object({
+  cwd: z.string().min(1),
+  requestId: z.string(),
+});
+const CheckoutGitTargetRequestSchema = CheckoutGitRequestSchema.extend({
+  targetRepoRoot: z.string().min(1),
+});
+const CheckoutGitMutationRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  // Explicit null identifies an unborn HEAD. Omission is allowed only where specified.
+  expectedHeadSha: z.string().min(1).nullable(),
+  forceWithRunningAgents: z.boolean().optional(),
+});
+
+export const CheckoutGitWorkingTreeGetRequestSchema = CheckoutGitTargetRequestSchema.partial({
+  targetRepoRoot: true,
+}).extend({
+  type: z.literal("checkout.git.working_tree.get.request"),
+});
+
+export const CHECKOUT_GIT_MAX_PATCH_BYTES = 512 * 1024;
+const CheckoutGitPatchFields = {
+  paths: z.array(z.string().min(1)).optional(),
+  // Structural length ceiling. The SDK and future handler must enforce the UTF-8 byte limit.
+  patch: z.string().max(CHECKOUT_GIT_MAX_PATCH_BYTES).optional(),
+};
+const CheckoutGitStageMutationRequestSchema = CheckoutGitMutationRequestSchema.partial({
+  expectedHeadSha: true,
+}).extend({
+  scope: z.enum(["paths", "hunk", "lines", "all"]),
+  ...CheckoutGitPatchFields,
+});
+
+export const CheckoutGitStageApplyRequestSchema = CheckoutGitStageMutationRequestSchema.extend({
+  type: z.literal("checkout.git.stage.apply.request"),
+});
+export const CheckoutGitUnstageApplyRequestSchema = CheckoutGitStageMutationRequestSchema.extend({
+  type: z.literal("checkout.git.unstage.apply.request"),
+});
+export const CheckoutGitDiscardApplyRequestSchema = CheckoutGitMutationRequestSchema.extend({
+  type: z.literal("checkout.git.discard.apply.request"),
+  scope: z.enum(["paths", "hunk"]),
+  ...CheckoutGitPatchFields,
+});
+export const CheckoutGitCommitCreateRequestSchema = CheckoutGitMutationRequestSchema.extend({
+  type: z.literal("checkout.git.commit.create.request"),
+  message: z.string().min(1),
+  amend: z.boolean().optional(),
+  pushAfter: z.boolean().optional(),
+  noVerify: z.boolean().optional(),
+});
+export const CheckoutGitCommitGenerateMessageRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  type: z.literal("checkout.git.commit.generate_message.request"),
+  source: z.enum(["staged", "uncommitted"]),
+});
+
+export const CheckoutGitStashListRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  type: z.literal("checkout.git.stash.list.request"),
+});
+export const CheckoutGitStashCreateRequestSchema = CheckoutGitMutationRequestSchema.partial({
+  expectedHeadSha: true,
+}).extend({
+  type: z.literal("checkout.git.stash.create.request"),
+  message: z.string().optional(),
+  includeUntracked: z.boolean().optional(),
+  keepIndex: z.boolean().optional(),
+  paths: z.array(z.string().min(1)).optional(),
+});
+export const CheckoutGitStashShowRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  type: z.literal("checkout.git.stash.show.request"),
+  stashRef: z.string().min(1),
+});
+export const CheckoutGitStashApplyRequestSchema = CheckoutGitMutationRequestSchema.partial({
+  expectedHeadSha: true,
+}).extend({
+  type: z.literal("checkout.git.stash.apply.request"),
+  stashRef: z.string().min(1),
+  pop: z.boolean().optional(),
+});
+export const CheckoutGitStashDropRequestSchema = CheckoutGitMutationRequestSchema.partial({
+  expectedHeadSha: true,
+}).extend({
+  type: z.literal("checkout.git.stash.drop.request"),
+  stashRef: z.string().min(1),
+});
+
+export const CheckoutGitReposDiscoverRequestSchema = CheckoutGitRequestSchema.extend({
+  type: z.literal("checkout.git.repos.discover.request"),
+  maxDepth: z.number().int().min(0).max(3).optional(),
+  includeWorktrees: z.boolean().optional(),
+});
+const CheckoutGitMultiRepoRequestSchema = CheckoutGitRequestSchema.extend({
+  repoRoots: z.array(z.string().min(1)).min(1),
+});
+export const CheckoutGitRefsListRequestSchema = CheckoutGitMultiRepoRequestSchema.extend({
+  type: z.literal("checkout.git.refs.list.request"),
+  includeBackups: z.boolean().optional(),
+});
+export const CheckoutGitLogQueryRequestSchema = CheckoutGitMultiRepoRequestSchema.extend({
+  type: z.literal("checkout.git.log.query.request"),
+  branchFilter: z.string().optional(),
+  authorFilter: z.string().optional(),
+  textQuery: z.string().optional(),
+  regex: z.boolean().optional(),
+  matchCase: z.boolean().optional(),
+  since: z.string().optional(),
+  until: z.string().optional(),
+  cursor: z.string().optional(),
+  pageSize: z.number().int().min(1).max(300).optional(),
+});
+export const CheckoutGitCommitGetDetailRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  type: z.literal("checkout.git.commit.get_detail.request"),
+  sha: z.string().min(1),
+});
+export const CheckoutGitBranchMutateRequestSchema = CheckoutGitMutationRequestSchema.extend({
+  type: z.literal("checkout.git.branch.mutate.request"),
+  action: z.enum(["create", "checkout", "rename", "delete"]),
+  name: z.string().min(1),
+  newName: z.string().min(1).optional(),
+  startPoint: z.string().min(1).optional(),
+  force: z.boolean().optional(),
+});
+export const CheckoutGitRebaseBuildPlanRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  type: z.literal("checkout.git.rebase.build_plan.request"),
+  ontoRef: z.string().min(1),
+  dryRun: z.boolean().optional(),
+});
+const CheckoutGitRebaseStepShaSchema = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
+export const CheckoutGitRebaseStepSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.enum(["pick", "squash", "fixup", "drop"]),
+    sha: CheckoutGitRebaseStepShaSchema,
+  }),
+  z.object({
+    type: z.literal("reword"),
+    sha: CheckoutGitRebaseStepShaSchema,
+    message: z.string().min(1),
+  }),
+]);
+export const CheckoutGitRebaseExecuteRequestSchema = CheckoutGitMutationRequestSchema.extend({
+  type: z.literal("checkout.git.rebase.execute.request"),
+  ontoRef: z.string().min(1),
+  steps: z.array(CheckoutGitRebaseStepSchema).min(1),
+  expectedHeadSha: z.string().min(1),
+});
+const CheckoutGitRebaseIdSchema = z.string().min(1);
+export const CheckoutGitRebaseActRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  type: z.literal("checkout.git.rebase.act.request"),
+  action: z.enum(["continue", "skip", "abort", "undo"]),
+  // Compare against the intended instance under the repo write lock, even if HEAD matches.
+  expectedRebaseId: CheckoutGitRebaseIdSchema,
+  // Undo requires a backup reference belonging to that instance.
+  backupRef: z.string().startsWith("refs/paseo/backup/").optional(),
+  forceWithRunningAgents: z.boolean().optional(),
+});
+export const CheckoutGitConflictInspectRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  type: z.literal("checkout.git.conflict.inspect.request"),
+  path: z.string().min(1).optional(),
+});
+const CheckoutGitConflictFingerprintSchema = z.string().min(1);
+export const CheckoutGitConflictResolveRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  type: z.literal("checkout.git.conflict.resolve.request"),
+  path: z.string().min(1),
+  strategy: z.enum(["ours", "theirs", "both", "mark_resolved"]),
+  // Verify the inspected snapshot under the repo write lock before using any hunk index.
+  expectedConflictFingerprint: CheckoutGitConflictFingerprintSchema,
+  hunkIndex: z.number().int().nonnegative().optional(),
 });
 
 export const CheckoutWorktreesListRequestSchema = z.object({
@@ -3559,6 +3857,7 @@ export const WorkspaceCreateRequestSchema = z.object({
   idempotencyKey: z.string().min(1).max(512).optional(),
   // Optional user-set title applied to the created workspace.
   title: z.string().optional(),
+  topic: WorkspaceTopicInputSchema.optional(),
   metadata: EntityMetadataSchema.optional(),
   // Optional prompt context for workspace-level name/branch generation.
   firstAgentContext: FirstAgentContextSchema.optional(),
@@ -4184,6 +4483,9 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceTitleSetRequestSchema,
   AgentMetadataUpdateRequestSchema,
   WorkspaceMetadataUpdateRequestSchema,
+  WorkspaceTopicUpdateRequestSchema,
+  WorkspaceDurableItemListRequestSchema,
+  WorkspaceDurableItemDecideRequestSchema,
   WorkspaceDeferralSetRequestSchema,
   AgentLimitRecoveryRequestSchema,
   WorkspacePinSetRequestSchema,
@@ -4312,6 +4614,27 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CheckoutForgeSetAutoMergeRequestSchema,
   CheckoutGithubSetAutoMergeRequestSchema,
   CheckoutCommitsListRequestSchema,
+  CheckoutGitWorkingTreeGetRequestSchema,
+  CheckoutGitStageApplyRequestSchema,
+  CheckoutGitUnstageApplyRequestSchema,
+  CheckoutGitDiscardApplyRequestSchema,
+  CheckoutGitCommitCreateRequestSchema,
+  CheckoutGitCommitGenerateMessageRequestSchema,
+  CheckoutGitStashListRequestSchema,
+  CheckoutGitStashCreateRequestSchema,
+  CheckoutGitStashShowRequestSchema,
+  CheckoutGitStashApplyRequestSchema,
+  CheckoutGitStashDropRequestSchema,
+  CheckoutGitReposDiscoverRequestSchema,
+  CheckoutGitRefsListRequestSchema,
+  CheckoutGitLogQueryRequestSchema,
+  CheckoutGitCommitGetDetailRequestSchema,
+  CheckoutGitBranchMutateRequestSchema,
+  CheckoutGitRebaseBuildPlanRequestSchema,
+  CheckoutGitRebaseExecuteRequestSchema,
+  CheckoutGitRebaseActRequestSchema,
+  CheckoutGitConflictInspectRequestSchema,
+  CheckoutGitConflictResolveRequestSchema,
   CheckoutWorktreesListRequestSchema,
   CheckoutCommitFileDiffRequestSchema,
   CheckoutForgeGetCheckDetailsRequestSchema,
@@ -4732,6 +5055,18 @@ export const ServerInfoStatusPayloadSchema = z
         workspaceFixedStartPoint: z.boolean().optional(),
         // COMPAT(agentCreateAsMain): added in v0.17.0-beta.1, remove gate after 2027-05-22.
         agentCreateAsMain: z.boolean().optional(),
+        // COMPAT(topicWorkbenchV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
+        topicWorkbenchV1: z.boolean().optional(),
+        // COMPAT(workspaceDurableItemsV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
+        workspaceDurableItemsV1: z.boolean().optional(),
+        // COMPAT(checkoutGitStagingV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
+        checkoutGitStagingV1: z.boolean().optional(),
+        // COMPAT(checkoutGitGraphV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
+        checkoutGitGraphV1: z.boolean().optional(),
+        // COMPAT(checkoutGitRebaseV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
+        checkoutGitRebaseV1: z.boolean().optional(),
+        // COMPAT(checkoutGitMultiRepoV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
+        checkoutGitMultiRepoV1: z.boolean().optional(),
         // COMPAT(workspaceAgentsSummary): added in v0.16.0, remove gate after 2027-05-20.
         workspaceAgentsSummary: z.boolean().optional(),
         // COMPAT(agentHistoryWorkspaceFilter): added in v0.16.0, remove gate after 2027-05-20.
@@ -5188,6 +5523,7 @@ export const WorkspaceDescriptorPayloadSchema = z
     metadata: EntityMetadataSchema.optional(),
     // Older daemons omit whether this workspace has an active main agent.
     hasActiveMainAgent: z.boolean().optional(),
+    topic: WorkspaceTopicSchema.optional(),
     // Retained for wire parsing of older daemon descriptors.
     internal: z.boolean().optional(),
     background: z.boolean().optional(),
@@ -6861,6 +7197,253 @@ export const CheckoutCommitsListResponseSchema = z.object({
     error: CheckoutErrorSchema.nullable(),
     requestId: z.string(),
   }),
+});
+
+export const CheckoutGitOperationStateSchema = z.enum([
+  "idle",
+  "merge",
+  "cherry_pick",
+  "revert",
+  "rebase",
+  "rebase_paused",
+]);
+const CheckoutGitHeadStateSchema = z.object({
+  repoRoot: z.string(),
+  headSha: z.string().nullable(),
+  currentBranch: z.string().nullable(),
+  operationState: CheckoutGitOperationStateSchema,
+});
+export const CheckoutGitActiveAgentSchema = z.object({
+  agentId: z.string(),
+  workspaceId: z.string().nullable(),
+  title: z.string().nullable(),
+  status: z.enum(AGENT_LIFECYCLE_STATUSES),
+  backgroundRunningCount: z.number().int().nonnegative(),
+});
+export const CheckoutGitFileSchema = z.object({
+  path: z.string(),
+  oldPath: z.string().optional(),
+  status: z.enum(["added", "modified", "deleted", "renamed", "copied", "type_changed"]),
+});
+const CheckoutGitConflictPathSchema = z.object({
+  path: z.string(),
+  status: z.enum(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]),
+});
+export const CheckoutGitWorkingTreeSchema = CheckoutGitHeadStateSchema.extend({
+  // Absent on staging-only hosts. Null means the host knows of no active instance.
+  rebaseId: CheckoutGitRebaseIdSchema.nullable().optional(),
+  staged: z.array(CheckoutGitFileSchema),
+  unstaged: z.array(CheckoutGitFileSchema),
+  untracked: z.array(z.string()),
+  conflicts: z.array(CheckoutGitConflictPathSchema),
+  activeAgents: z.array(CheckoutGitActiveAgentSchema),
+});
+
+const CheckoutGitResponsePayloadSchema = WorkbenchResponsePayloadSchema.extend({ cwd: z.string() });
+const CheckoutGitTargetResponsePayloadSchema = CheckoutGitResponsePayloadSchema.extend({
+  repoRoot: z.string(),
+});
+const CheckoutGitMutationResultSchema = CheckoutGitTargetResponsePayloadSchema.extend({
+  success: z.boolean(),
+  newHeadSha: z.string().nullable().optional(),
+  actualHeadSha: z.string().nullable().optional(),
+  backupRef: z.string().optional(),
+  operationState: CheckoutGitOperationStateSchema.optional(),
+  activeAgents: z.array(CheckoutGitActiveAgentSchema).optional(),
+  lockOperation: z.string().optional(),
+});
+
+export const CheckoutGitWorkingTreeGetResponseSchema = z.object({
+  type: z.literal("checkout.git.working_tree.get.response"),
+  payload: CheckoutGitResponsePayloadSchema.extend({
+    workingTree: CheckoutGitWorkingTreeSchema.nullable(),
+  }),
+});
+export const CheckoutGitStageApplyResponseSchema = z.object({
+  type: z.literal("checkout.git.stage.apply.response"),
+  payload: CheckoutGitMutationResultSchema,
+});
+export const CheckoutGitUnstageApplyResponseSchema = z.object({
+  type: z.literal("checkout.git.unstage.apply.response"),
+  payload: CheckoutGitMutationResultSchema,
+});
+export const CheckoutGitDiscardApplyResponseSchema = z.object({
+  type: z.literal("checkout.git.discard.apply.response"),
+  payload: CheckoutGitMutationResultSchema,
+});
+export const CheckoutGitCommitCreateResponseSchema = z.object({
+  type: z.literal("checkout.git.commit.create.response"),
+  payload: CheckoutGitMutationResultSchema.extend({
+    // A commit can succeed while the requested push fails.
+    pushError: z.string().nullable().optional(),
+  }),
+});
+export const CheckoutGitCommitGenerateMessageResponseSchema = z.object({
+  type: z.literal("checkout.git.commit.generate_message.response"),
+  payload: CheckoutGitTargetResponsePayloadSchema.extend({ message: z.string().nullable() }),
+});
+
+export const CheckoutGitStashEntrySchema = z.object({
+  stashRef: z.string(),
+  sha: z.string(),
+  message: z.string(),
+  branch: z.string().nullable(),
+  createdAt: z.string(),
+});
+export const CheckoutGitStashListResponseSchema = z.object({
+  type: z.literal("checkout.git.stash.list.response"),
+  payload: CheckoutGitTargetResponsePayloadSchema.extend({
+    entries: z.array(CheckoutGitStashEntrySchema),
+  }),
+});
+export const CheckoutGitStashCreateResponseSchema = z.object({
+  type: z.literal("checkout.git.stash.create.response"),
+  payload: CheckoutGitMutationResultSchema.extend({
+    entry: CheckoutGitStashEntrySchema.nullable(),
+  }),
+});
+export const CheckoutGitStashShowResponseSchema = z.object({
+  type: z.literal("checkout.git.stash.show.response"),
+  payload: CheckoutGitTargetResponsePayloadSchema.extend({
+    entry: CheckoutGitStashEntrySchema.nullable(),
+    files: z.array(CheckoutGitFileSchema),
+  }),
+});
+export const CheckoutGitStashApplyResponseSchema = z.object({
+  type: z.literal("checkout.git.stash.apply.response"),
+  payload: CheckoutGitMutationResultSchema,
+});
+export const CheckoutGitStashDropResponseSchema = z.object({
+  type: z.literal("checkout.git.stash.drop.response"),
+  payload: CheckoutGitMutationResultSchema,
+});
+
+export const CheckoutGitRepoSchema = CheckoutGitHeadStateSchema.extend({
+  repoId: z.string(),
+  displayName: z.string(),
+});
+export const CheckoutGitReposDiscoverResponseSchema = z.object({
+  type: z.literal("checkout.git.repos.discover.response"),
+  payload: CheckoutGitResponsePayloadSchema.extend({
+    mode: z.enum(["single", "multi"]).nullable(),
+    repos: z.array(CheckoutGitRepoSchema),
+  }),
+});
+const CheckoutGitRefSchema = z.object({ name: z.string(), sha: z.string() });
+export const CheckoutGitRepoRefsSchema = z.object({
+  repoRoot: z.string(),
+  localBranches: z.array(CheckoutGitRefSchema),
+  remotes: z.array(z.object({ name: z.string(), branches: z.array(CheckoutGitRefSchema) })),
+  tags: z.array(CheckoutGitRefSchema),
+  backups: z.array(CheckoutGitRefSchema),
+});
+export const CheckoutGitRefsListResponseSchema = z.object({
+  type: z.literal("checkout.git.refs.list.response"),
+  payload: CheckoutGitResponsePayloadSchema.extend({ refs: z.array(CheckoutGitRepoRefsSchema) }),
+});
+
+export const CHECKOUT_GIT_LOG_MAX_BYTES = 2 * 1024 * 1024;
+export const CheckoutGitLogCommitSchema = z.object({
+  repoRoot: z.string(),
+  sha: z.string(),
+  parents: z.array(z.string()),
+  subject: z.string(),
+  authorName: z.string(),
+  authorDate: z.string(),
+  committerDate: z.string(),
+});
+export const CheckoutGitLogQueryResponseSchema = z.object({
+  type: z.literal("checkout.git.log.query.response"),
+  payload: CheckoutGitResponsePayloadSchema.extend({
+    commits: z.array(CheckoutGitLogCommitSchema).max(300),
+    nextCursor: z.string().nullable(),
+    hasMore: z.boolean(),
+    approxBytes: z.number().int().nonnegative().max(CHECKOUT_GIT_LOG_MAX_BYTES),
+  }),
+});
+const CheckoutGitCommitIdentitySchema = z.object({
+  name: z.string(),
+  email: z.string(),
+  date: z.string(),
+});
+export const CheckoutGitCommitDetailSchema = z.object({
+  sha: z.string(),
+  subject: z.string(),
+  body: z.string(),
+  parents: z.array(z.string()),
+  author: CheckoutGitCommitIdentitySchema,
+  committer: CheckoutGitCommitIdentitySchema,
+  files: z
+    .array(
+      CheckoutGitFileSchema.extend({
+        // Git reports no line counts for binary changes.
+        additions: z.number().int().nonnegative().nullable(),
+        deletions: z.number().int().nonnegative().nullable(),
+      }),
+    )
+    .max(500),
+  filesTruncated: z.boolean(),
+});
+export const CheckoutGitCommitGetDetailResponseSchema = z.object({
+  type: z.literal("checkout.git.commit.get_detail.response"),
+  payload: CheckoutGitTargetResponsePayloadSchema.extend({
+    detail: CheckoutGitCommitDetailSchema.nullable(),
+  }),
+});
+export const CheckoutGitBranchMutateResponseSchema = z.object({
+  type: z.literal("checkout.git.branch.mutate.response"),
+  payload: CheckoutGitMutationResultSchema,
+});
+export const CheckoutGitRebaseBuildPlanResponseSchema = z.object({
+  type: z.literal("checkout.git.rebase.build_plan.response"),
+  payload: CheckoutGitTargetResponsePayloadSchema.extend({
+    headSha: z.string().nullable(),
+    ontoSha: z.string().nullable(),
+    entries: z.array(z.object({ sha: z.string(), subject: z.string() })),
+    isPushedRange: z.boolean(),
+    // Missing when no preflight ran. An empty list means preflight found no conflicts.
+    conflictPaths: z.array(z.string()).optional(),
+  }),
+});
+export const CheckoutGitRebaseExecuteResponseSchema = z.object({
+  type: z.literal("checkout.git.rebase.execute.response"),
+  payload: CheckoutGitMutationResultSchema.extend({
+    // Keep the new instance ID on completion so the caller can identify a later undo.
+    rebaseId: CheckoutGitRebaseIdSchema.nullable(),
+  }),
+});
+export const CheckoutGitRebaseActResponseSchema = z.object({
+  type: z.literal("checkout.git.rebase.act.response"),
+  payload: CheckoutGitMutationResultSchema.extend({
+    // The affected instance, or the current instance (if any) on STALE_REBASE_INSTANCE.
+    rebaseId: CheckoutGitRebaseIdSchema.nullable(),
+  }),
+});
+const CheckoutGitConflictStageSchema = z.object({ sha: z.string(), mode: z.string() }).nullable();
+export const CheckoutGitConflictFileSchema = CheckoutGitConflictPathSchema.extend({
+  // Opaque snapshot of the repo, path, three conflict stages, and current worktree content.
+  conflictFingerprint: CheckoutGitConflictFingerprintSchema,
+  base: CheckoutGitConflictStageSchema,
+  ours: CheckoutGitConflictStageSchema,
+  theirs: CheckoutGitConflictStageSchema,
+  hunks: z.array(
+    z.object({
+      index: z.number().int().nonnegative(),
+      base: z.string().nullable(),
+      ours: z.string().nullable(),
+      theirs: z.string().nullable(),
+    }),
+  ),
+});
+export const CheckoutGitConflictInspectResponseSchema = z.object({
+  type: z.literal("checkout.git.conflict.inspect.response"),
+  payload: CheckoutGitTargetResponsePayloadSchema.extend({
+    conflicts: z.array(CheckoutGitConflictFileSchema),
+  }),
+});
+export const CheckoutGitConflictResolveResponseSchema = z.object({
+  type: z.literal("checkout.git.conflict.resolve.response"),
+  payload: CheckoutGitMutationResultSchema,
 });
 
 export const CheckoutWorktreeSchema = z.object({
@@ -8610,6 +9193,9 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceTitleSetResponseSchema,
   AgentMetadataUpdateResponseSchema,
   WorkspaceMetadataUpdateResponseSchema,
+  WorkspaceTopicUpdateResponseSchema,
+  WorkspaceDurableItemListResponseSchema,
+  WorkspaceDurableItemDecideResponseSchema,
   WorkspaceDeferralSetResponseSchema,
   AgentLimitRecoveryResponseSchema,
   WorkspacePinSetResponseSchema,
@@ -8641,6 +9227,27 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CheckoutForgeSetAutoMergeResponseSchema,
   CheckoutGithubSetAutoMergeResponseSchema,
   CheckoutCommitsListResponseSchema,
+  CheckoutGitWorkingTreeGetResponseSchema,
+  CheckoutGitStageApplyResponseSchema,
+  CheckoutGitUnstageApplyResponseSchema,
+  CheckoutGitDiscardApplyResponseSchema,
+  CheckoutGitCommitCreateResponseSchema,
+  CheckoutGitCommitGenerateMessageResponseSchema,
+  CheckoutGitStashListResponseSchema,
+  CheckoutGitStashCreateResponseSchema,
+  CheckoutGitStashShowResponseSchema,
+  CheckoutGitStashApplyResponseSchema,
+  CheckoutGitStashDropResponseSchema,
+  CheckoutGitReposDiscoverResponseSchema,
+  CheckoutGitRefsListResponseSchema,
+  CheckoutGitLogQueryResponseSchema,
+  CheckoutGitCommitGetDetailResponseSchema,
+  CheckoutGitBranchMutateResponseSchema,
+  CheckoutGitRebaseBuildPlanResponseSchema,
+  CheckoutGitRebaseExecuteResponseSchema,
+  CheckoutGitRebaseActResponseSchema,
+  CheckoutGitConflictInspectResponseSchema,
+  CheckoutGitConflictResolveResponseSchema,
   CheckoutWorktreesListResponseSchema,
   CheckoutCommitFileDiffResponseSchema,
   CheckoutForgeGetReviewGuideResponseSchema,
@@ -9092,6 +9699,21 @@ export type CheckoutCommitFile = z.infer<typeof CheckoutCommitFileSchema>;
 export type CheckoutCommit = z.infer<typeof CheckoutCommitSchema>;
 export type CheckoutCommitsListRequest = z.infer<typeof CheckoutCommitsListRequestSchema>;
 export type CheckoutCommitsListResponse = z.infer<typeof CheckoutCommitsListResponseSchema>;
+export type CheckoutGitActiveAgent = z.infer<typeof CheckoutGitActiveAgentSchema>;
+export type CheckoutGitCommitDetail = z.infer<typeof CheckoutGitCommitDetailSchema>;
+export type CheckoutGitConflictFile = z.infer<typeof CheckoutGitConflictFileSchema>;
+export type CheckoutGitFile = z.infer<typeof CheckoutGitFileSchema>;
+export type CheckoutGitLogCommit = z.infer<typeof CheckoutGitLogCommitSchema>;
+export type CheckoutGitOperationState = z.infer<typeof CheckoutGitOperationStateSchema>;
+export type CheckoutGitRebaseStep = z.infer<typeof CheckoutGitRebaseStepSchema>;
+export type CheckoutGitRepo = z.infer<typeof CheckoutGitRepoSchema>;
+export type CheckoutGitRepoRefs = z.infer<typeof CheckoutGitRepoRefsSchema>;
+export type CheckoutGitStashEntry = z.infer<typeof CheckoutGitStashEntrySchema>;
+export type CheckoutGitWorkingTree = z.infer<typeof CheckoutGitWorkingTreeSchema>;
+export type WorkbenchErrorCode = z.infer<typeof WorkbenchErrorCodeSchema>;
+export type WorkspaceDurableItem = z.infer<typeof WorkspaceDurableItemSchema>;
+export type WorkspaceDurableItemEvidence = z.infer<typeof WorkspaceDurableItemEvidenceSchema>;
+export type WorkspaceTopic = z.infer<typeof WorkspaceTopicSchema>;
 export type CheckoutWorktree = z.infer<typeof CheckoutWorktreeSchema>;
 export type CheckoutWorktreesListRequest = z.infer<typeof CheckoutWorktreesListRequestSchema>;
 export type CheckoutWorktreesListResponse = z.infer<typeof CheckoutWorktreesListResponseSchema>;

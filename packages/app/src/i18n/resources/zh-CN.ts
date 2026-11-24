@@ -1,7 +1,11 @@
+import { topicWorkbench } from "../domains/topic-workbench";
+import { gitWorkbench } from "../domains/git-workbench";
 import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const zhCN: TranslationResources = {
+  topicWorkbench: topicWorkbench["zh-CN"],
+  gitWorkbench: gitWorkbench["zh-CN"],
   pluginCombobox: {
     searching: "搜索中…",
     empty: "无结果",

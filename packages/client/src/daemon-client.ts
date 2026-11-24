@@ -42,6 +42,7 @@ import {
   AgentRefreshedStatusPayloadSchema,
   AgentResumedStatusPayloadSchema,
   CheckoutRenameBranchResponseSchema,
+  CHECKOUT_GIT_MAX_PATCH_BYTES,
   parseServerInfoStatusPayload,
   RenameTerminalResponseSchema,
   RestartRequestedStatusPayloadSchema,
@@ -587,6 +588,7 @@ export interface SwitchAgentProviderResult {
 export interface CreateWorkspaceRequestOptions {
   source: WorkspaceCreateRequest["source"];
   title?: string;
+  topic?: WorkspaceCreateRequest["topic"];
   /** Plugin-owned data stored on the workspace. Needs a host with `entityMetadata`. */
   metadata?: WorkspaceCreateRequest["metadata"];
   /** Workspace discovery visibility; contents retain normal durability. */
@@ -1152,6 +1154,35 @@ type CorrelatedResponsePayloads = {
 };
 type CorrelatedResponsePayload<TType extends CorrelatedResponseType> =
   CorrelatedResponsePayloads[TType];
+
+type WorkbenchRequest = Extract<
+  SessionInboundMessage,
+  {
+    type:
+      | `checkout.git.${string}.request`
+      | `workspace.topic.${string}.request`
+      | `workspace.durable_item.${string}.request`;
+  }
+>;
+type WorkbenchOperation<T = WorkbenchRequest["type"]> = T extends `${infer Operation}.request`
+  ? Operation
+  : never;
+type WorkbenchFeature =
+  | "topicWorkbenchV1"
+  | "workspaceDurableItemsV1"
+  | "checkoutGitStagingV1"
+  | "checkoutGitGraphV1"
+  | "checkoutGitRebaseV1"
+  | "checkoutGitMultiRepoV1";
+
+export type WorkbenchRequestOptions<T extends WorkbenchOperation> = Omit<
+  Extract<WorkbenchRequest, { type: `${T}.request` }>,
+  "type" | "requestId"
+> & { requestId?: string };
+
+export type WorkbenchResponsePayload<T extends WorkbenchOperation> =
+  CorrelatedResponsePayload<`${T}.response`>;
+
 export type AgentBackgroundWorkListPayload =
   CorrelatedResponsePayload<"agent.background_work.list.response">;
 export type AgentBackgroundWorkItem = AgentBackgroundWorkListPayload["items"][number];
@@ -2387,6 +2418,9 @@ export class DaemonClient {
       ) {
         this.requireWorkspaceFixedStartPoint();
       }
+      if (payload.type === "workspace.create.request" && payload.topic !== undefined) {
+        this.requireWorkbenchFeature("topicWorkbenchV1");
+      }
       return this.sendSessionPayload(payload);
     });
   }
@@ -2592,6 +2626,32 @@ export class DaemonClient {
     return this.sendCorrelatedSessionRequest({
       ...params,
       responseType,
+    });
+  }
+
+  private requireWorkbenchFeature(feature: WorkbenchFeature): void {
+    if (!this.isConnected || !this.lastServerInfoMessage) throw this.unavailableError();
+    if (this.lastServerInfoMessage.features?.[feature] !== true) {
+      throw new Error(`Update the host to use ${feature}.`);
+    }
+  }
+
+  private async sendWorkbenchRequest<T extends WorkbenchOperation>(
+    operation: T,
+    feature: WorkbenchFeature,
+    { requestId, ...options }: WorkbenchRequestOptions<T>,
+    patch?: string,
+  ): Promise<WorkbenchResponsePayload<T>> {
+    this.requireWorkbenchFeature(feature);
+    if (
+      patch !== undefined &&
+      new TextEncoder().encode(patch).byteLength > CHECKOUT_GIT_MAX_PATCH_BYTES
+    ) {
+      throw new Error("Git patches must be 512 KiB or smaller.");
+    }
+    return this.sendNamespacedCorrelatedSessionRequest<`${T}.response`>({
+      requestId,
+      message: { ...options, type: `${operation}.request` },
     });
   }
 
@@ -5889,6 +5949,201 @@ export class DaemonClient {
     });
   }
 
+  updateWorkspaceTopic(
+    options: WorkbenchRequestOptions<"workspace.topic.update">,
+  ): Promise<WorkbenchResponsePayload<"workspace.topic.update">> {
+    return this.sendWorkbenchRequest("workspace.topic.update", "topicWorkbenchV1", options);
+  }
+
+  listWorkspaceDurableItems(
+    options: WorkbenchRequestOptions<"workspace.durable_item.list">,
+  ): Promise<WorkbenchResponsePayload<"workspace.durable_item.list">> {
+    return this.sendWorkbenchRequest(
+      "workspace.durable_item.list",
+      "workspaceDurableItemsV1",
+      options,
+    );
+  }
+
+  decideWorkspaceDurableItem(
+    options: WorkbenchRequestOptions<"workspace.durable_item.decide">,
+  ): Promise<WorkbenchResponsePayload<"workspace.durable_item.decide">> {
+    return this.sendWorkbenchRequest(
+      "workspace.durable_item.decide",
+      "workspaceDurableItemsV1",
+      options,
+    );
+  }
+
+  checkoutGitWorkingTreeGet(
+    options: WorkbenchRequestOptions<"checkout.git.working_tree.get">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.working_tree.get">> {
+    return this.sendWorkbenchRequest(
+      "checkout.git.working_tree.get",
+      "checkoutGitStagingV1",
+      options,
+    );
+  }
+
+  checkoutGitStageApply(
+    options: WorkbenchRequestOptions<"checkout.git.stage.apply">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.stage.apply">> {
+    return this.sendWorkbenchRequest(
+      "checkout.git.stage.apply",
+      "checkoutGitStagingV1",
+      options,
+      options.patch,
+    );
+  }
+
+  checkoutGitUnstageApply(
+    options: WorkbenchRequestOptions<"checkout.git.unstage.apply">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.unstage.apply">> {
+    return this.sendWorkbenchRequest(
+      "checkout.git.unstage.apply",
+      "checkoutGitStagingV1",
+      options,
+      options.patch,
+    );
+  }
+
+  checkoutGitDiscardApply(
+    options: WorkbenchRequestOptions<"checkout.git.discard.apply">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.discard.apply">> {
+    return this.sendWorkbenchRequest(
+      "checkout.git.discard.apply",
+      "checkoutGitStagingV1",
+      options,
+      options.patch,
+    );
+  }
+
+  checkoutGitCommitCreate(
+    options: WorkbenchRequestOptions<"checkout.git.commit.create">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.commit.create">> {
+    return this.sendWorkbenchRequest("checkout.git.commit.create", "checkoutGitStagingV1", options);
+  }
+
+  checkoutGitCommitGenerateMessage(
+    options: WorkbenchRequestOptions<"checkout.git.commit.generate_message">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.commit.generate_message">> {
+    return this.sendWorkbenchRequest(
+      "checkout.git.commit.generate_message",
+      "checkoutGitStagingV1",
+      options,
+    );
+  }
+
+  checkoutGitStashList(
+    options: WorkbenchRequestOptions<"checkout.git.stash.list">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.stash.list">> {
+    return this.sendWorkbenchRequest("checkout.git.stash.list", "checkoutGitStagingV1", options);
+  }
+
+  checkoutGitStashCreate(
+    options: WorkbenchRequestOptions<"checkout.git.stash.create">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.stash.create">> {
+    return this.sendWorkbenchRequest("checkout.git.stash.create", "checkoutGitStagingV1", options);
+  }
+
+  checkoutGitStashShow(
+    options: WorkbenchRequestOptions<"checkout.git.stash.show">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.stash.show">> {
+    return this.sendWorkbenchRequest("checkout.git.stash.show", "checkoutGitStagingV1", options);
+  }
+
+  checkoutGitStashApply(
+    options: WorkbenchRequestOptions<"checkout.git.stash.apply">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.stash.apply">> {
+    return this.sendWorkbenchRequest("checkout.git.stash.apply", "checkoutGitStagingV1", options);
+  }
+
+  checkoutGitStashDrop(
+    options: WorkbenchRequestOptions<"checkout.git.stash.drop">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.stash.drop">> {
+    return this.sendWorkbenchRequest("checkout.git.stash.drop", "checkoutGitStagingV1", options);
+  }
+
+  checkoutGitReposDiscover(
+    options: WorkbenchRequestOptions<"checkout.git.repos.discover">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.repos.discover">> {
+    return this.sendWorkbenchRequest(
+      "checkout.git.repos.discover",
+      "checkoutGitMultiRepoV1",
+      options,
+    );
+  }
+
+  checkoutGitRefsList(
+    options: WorkbenchRequestOptions<"checkout.git.refs.list">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.refs.list">> {
+    return this.sendWorkbenchRequest("checkout.git.refs.list", "checkoutGitGraphV1", options);
+  }
+
+  checkoutGitLogQuery(
+    options: WorkbenchRequestOptions<"checkout.git.log.query">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.log.query">> {
+    return this.sendWorkbenchRequest("checkout.git.log.query", "checkoutGitGraphV1", options);
+  }
+
+  checkoutGitCommitGetDetail(
+    options: WorkbenchRequestOptions<"checkout.git.commit.get_detail">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.commit.get_detail">> {
+    return this.sendWorkbenchRequest(
+      "checkout.git.commit.get_detail",
+      "checkoutGitGraphV1",
+      options,
+    );
+  }
+
+  checkoutGitBranchMutate(
+    options: WorkbenchRequestOptions<"checkout.git.branch.mutate">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.branch.mutate">> {
+    return this.sendWorkbenchRequest("checkout.git.branch.mutate", "checkoutGitGraphV1", options);
+  }
+
+  checkoutGitRebaseBuildPlan(
+    options: WorkbenchRequestOptions<"checkout.git.rebase.build_plan">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.rebase.build_plan">> {
+    return this.sendWorkbenchRequest(
+      "checkout.git.rebase.build_plan",
+      "checkoutGitRebaseV1",
+      options,
+    );
+  }
+
+  checkoutGitRebaseExecute(
+    options: WorkbenchRequestOptions<"checkout.git.rebase.execute">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.rebase.execute">> {
+    return this.sendWorkbenchRequest("checkout.git.rebase.execute", "checkoutGitRebaseV1", options);
+  }
+
+  checkoutGitRebaseAct(
+    options: WorkbenchRequestOptions<"checkout.git.rebase.act">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.rebase.act">> {
+    return this.sendWorkbenchRequest("checkout.git.rebase.act", "checkoutGitRebaseV1", options);
+  }
+
+  checkoutGitConflictInspect(
+    options: WorkbenchRequestOptions<"checkout.git.conflict.inspect">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.conflict.inspect">> {
+    return this.sendWorkbenchRequest(
+      "checkout.git.conflict.inspect",
+      "checkoutGitRebaseV1",
+      options,
+    );
+  }
+
+  checkoutGitConflictResolve(
+    options: WorkbenchRequestOptions<"checkout.git.conflict.resolve">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.conflict.resolve">> {
+    return this.sendWorkbenchRequest(
+      "checkout.git.conflict.resolve",
+      "checkoutGitRebaseV1",
+      options,
+    );
+  }
+
   async checkoutForgeSetAutoMerge(
     cwd: string,
     input: { enabled: true; method: CheckoutPrMergeMethod } | { enabled: false },
@@ -6227,6 +6482,13 @@ export class DaemonClient {
   }
 
   private assertWorkspaceCreationFeatures(input: CreateWorkspaceRequestOptions): void {
+    if (input.topic !== undefined) {
+      this.requireWorkbenchFeature("topicWorkbenchV1");
+      if (!input.title?.trim()) throw new Error("A topic requires a workspace title.");
+      if (input.mainAgent && (input.agent || input.firstAgentContext)) {
+        throw new Error("A silent Main Session cannot include an initial agent or prompt context.");
+      }
+    }
     if (input.source.kind === "worktree" && input.source.startPoint !== undefined) {
       this.requireWorkspaceFixedStartPoint();
     }
@@ -6311,6 +6573,9 @@ export class DaemonClient {
     input: CreateWorkspaceRequestOptions,
     requestId?: string,
   ): Promise<WorkspaceCreatePayload> {
+    if (input.topic !== undefined) {
+      throw new Error("Update the host to use topic workspace creation.");
+    }
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {

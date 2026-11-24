@@ -65,6 +65,58 @@ describe("SessionAuthorization", () => {
     expect(writer.allowsOutbound(response)).toBe(true);
   });
 
+  test("workbench RPCs require the same explicit workspace permission in both directions", () => {
+    const operations = {
+      "workspace.read": [
+        "workspace.durable_item.list",
+        "checkout.git.working_tree.get",
+        "checkout.git.commit.generate_message",
+        "checkout.git.stash.list",
+        "checkout.git.stash.show",
+        "checkout.git.repos.discover",
+        "checkout.git.refs.list",
+        "checkout.git.log.query",
+        "checkout.git.commit.get_detail",
+        "checkout.git.rebase.build_plan",
+        "checkout.git.conflict.inspect",
+      ],
+      "workspace.write": [
+        "workspace.durable_item.decide",
+        "checkout.git.stage.apply",
+        "checkout.git.unstage.apply",
+        "checkout.git.discard.apply",
+        "checkout.git.commit.create",
+        "checkout.git.stash.create",
+        "checkout.git.stash.apply",
+        "checkout.git.stash.drop",
+        "checkout.git.branch.mutate",
+        "checkout.git.rebase.execute",
+        "checkout.git.rebase.act",
+        "checkout.git.conflict.resolve",
+      ],
+      "workspace.manage": ["workspace.topic.update"],
+    } as const;
+    const workspaceGrants = ["workspace.read", "workspace.write", "workspace.manage"] as const;
+    for (const required of workspaceGrants) {
+      for (const operation of operations[required]) {
+        for (const grant of [...workspaceGrants, "hub.execute"] as const) {
+          const authorization = new SessionAuthorization([grant]);
+          expect(authorization.allowsInbound(inboundMessage(`${operation}.request`))).toBe(
+            grant === required,
+          );
+          expect(authorization.allowsOutbound(outboundMessage(`${operation}.response`))).toBe(
+            grant === required,
+          );
+        }
+      }
+    }
+
+    const reader = new SessionAuthorization(["workspace.read"]);
+    expect(reader.allowsInbound(inboundMessage("checkout_commit_request"))).toBe(false);
+    expect(reader.allowsInbound(inboundMessage("checkout.commits.list.request"))).toBe(true);
+    expect(reader.allowsInbound(inboundMessage("workspace.create.request"))).toBe(false);
+  });
+
   test("owner authority covers every session operation", () => {
     const authorization = new SessionAuthorization(OWNER_PERMISSIONS);
 
