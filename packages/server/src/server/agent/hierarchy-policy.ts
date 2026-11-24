@@ -1,5 +1,7 @@
 import {
   AGENT_PROFILE_ID_LABEL,
+  getLeadCommitPolicyFromLabels,
+  getLeadPlaybookFromLabels,
   getMainPriorModeIdFromLabels,
   getParentAddressFromLabels,
   getParentAgentIdFromLabels,
@@ -10,6 +12,7 @@ import {
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
   PARENT_SERVER_ID_LABEL,
+  RESERVED_LEAD_PLAYBOOK_LABELS,
   RESIDENT_AGENT_LABEL,
   RESIDENT_INBOX_BYPASS_LABEL,
   RESIDENT_KEEPALIVE_LABEL,
@@ -23,6 +26,10 @@ import {
 import type { ProviderPaseoToolsPolicy } from "@getpaseo/protocol/provider-config";
 import type { WorkspaceTopic } from "@getpaseo/protocol/messages";
 import type { AgentPermissionRequest } from "./agent-sdk-types.js";
+import {
+  buildLeadPlaybookContract,
+  buildMainControlPlaybookGuidance,
+} from "./orchestration-playbooks.js";
 import { WORKSPACE_TASK_LEDGER_HEADER, workspaceTaskLedgerEnd } from "./task-ledger/index.js";
 
 export const MAX_SUBAGENT_DEPTH = 2;
@@ -138,6 +145,7 @@ export const RESERVED_HIERARCHY_LABELS = [
   SIDE_CHAT_LABEL,
   SIDE_OF_AGENT_ID_LABEL,
   ...RESERVED_RESIDENT_LABELS,
+  ...RESERVED_LEAD_PLAYBOOK_LABELS,
 ] as const;
 
 export function hasReservedHierarchyLabels(labels?: Record<string, string>): boolean {
@@ -448,10 +456,17 @@ export function buildHierarchyAppendSystemPrompt({
     isMainControlAgentLabels(parent.labels) &&
     computeAgentDepth(agent.id, readAgent, serverId) === 1;
   if (isLead) {
-    contract = [
-      `Role: Level-1 Module Lead (Flexible Mode) under Main Control Agent ${parent.id}.`,
-      "Refine the task's requirements, edge cases, and file boundaries. For small-to-medium single-module tasks, complete the investigation, changes, and targeted verification yourself without spawning unnecessary Level-2 Sub-Agents. Use create_agent to spawn Level-2 Sub-Agents only for cross-module parallel implementation or when the task explicitly requires role-isolated independent review or blind verification.",
-    ];
+    const playbook = getLeadPlaybookFromLabels(agent.labels);
+    contract = playbook
+      ? buildLeadPlaybookContract({
+          parentAgentId: parent.id,
+          playbook,
+          commitPolicy: getLeadCommitPolicyFromLabels(agent.labels),
+        })
+      : [
+          `Role: Level-1 Module Lead (Flexible Mode) under Main Control Agent ${parent.id}.`,
+          "Refine the task's requirements, edge cases, and file boundaries. For small-to-medium single-module tasks, complete the investigation, changes, and targeted verification yourself without spawning unnecessary Level-2 Sub-Agents. Use create_agent to spawn Level-2 Sub-Agents only for cross-module parallel implementation or when the task explicitly requires role-isolated independent review or blind verification.",
+        ];
   }
   if (canReport && isExplicitParentReportingLabels(agent.labels)) {
     contract.push(
@@ -479,6 +494,7 @@ export function buildMainControlInstructions(mainControlSystemPrompt?: string): 
     `Use only these Paseo orchestration tools: ${MAIN_CONTROL_TOOLS.join(", ")}. Call list_profiles to select the preset whose description fits the task and its authorized scope.`,
     "Reuse a matching Workspace Resident Specialist with send_agent_prompt. Use reset_agent_session for a fresh conversation with the same specialist when needed.",
     'For other tasks, use create_agent with parentReporting: "explicit" and notifyOnFinish: false to create exactly one direct Level-1 lead.',
+    ...buildMainControlPlaybookGuidance(),
     "Coordinate through that lead with send_agent_prompt and update_agent. Keep notifyOnFinish: false for follow-ups. End your turn to wait for the lead to call report_to_parent with the outcome or a blocking question. Do not poll or use a blocking wait.",
     "Summarize the lead's report for the user.",
     mainControlSystemPrompt,

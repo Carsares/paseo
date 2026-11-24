@@ -162,6 +162,13 @@ import {
   AGENT_PROFILE_ID_MAX_LENGTH,
   RESIDENT_ROLE_MAX_LENGTH,
 } from "@getpaseo/protocol/agent-labels";
+import {
+  LeadCommitPolicySchema,
+  LeadPlaybookSchema,
+  LeadPlaybookValidationError,
+  resolveLeadPlaybookInput,
+  type ResolvedLeadPlaybookOptions,
+} from "../orchestration-playbooks.js";
 
 export interface PaseoToolHostDependencies {
   agentMessages?: () => AgentMessageDelivery;
@@ -1782,6 +1789,12 @@ function createToolCatalog(
       .describe(
         "Get notified when the first turn finishes, errors, or needs permission. Set false to skip that notification. Main Control also defaults the child to explicit reporting in that case unless parentReporting is set.",
       ),
+    playbook: LeadPlaybookSchema.optional().describe(
+      'Main Control only: attach a built-in Level-1 orchestration contract ("batch_implement", "cr_fix_loop", or "readonly_cr"). Forces explicit parent reporting and notifyOnFinish: false.',
+    ),
+    commitPolicy: LeadCommitPolicySchema.optional().describe(
+      'Commit policy for "batch_implement" or "cr_fix_loop": "none" (default, leave verified edits uncommitted) or "scoped_only" (commit owned files via git commit --only when explicitly authorized).',
+    ),
   };
   const canonicalTopLevelInputSchema = {
     ...canonicalCreateAgentFields,
@@ -1798,6 +1811,8 @@ function createToolCatalog(
     ...legacyCreateAgentPlacementFields,
     parentReporting: agentToAgentInputSchema.parentReporting,
     notifyOnFinish: agentToAgentInputSchema.notifyOnFinish,
+    playbook: agentToAgentInputSchema.playbook,
+    commitPolicy: agentToAgentInputSchema.commitPolicy,
   };
   const legacyTopLevelCreateAgentInputSchema = {
     ...commonCreateAgentFields,
@@ -2287,12 +2302,37 @@ function createToolCatalog(
       },
     },
     async (args: { taskBinding?: z.infer<typeof WorkspaceTaskToolInputSchema> }) => {
-      const taskBinding = args.taskBinding ? await prepareTaskBinding(args.taskBinding) : undefined;
       const resolvedArgs = await resolveCreateAgentToolArgs(args);
       const { parsedArgs } = resolvedArgs;
-      const notifyOnFinish = parsedArgs.notifyOnFinish;
-      const parentReporting =
-        resolvedArgs.kind === "agent-scoped" ? resolvedArgs.parsedArgs.parentReporting : undefined;
+      const callerSnapshot = callerAgentId ? await readHierarchyAgent(callerAgentId) : null;
+      let resolvedPlaybook: ResolvedLeadPlaybookOptions | undefined;
+      if (resolvedArgs.kind === "agent-scoped") {
+        try {
+          resolvedPlaybook = resolveLeadPlaybookInput({
+            playbook: resolvedArgs.parsedArgs.playbook,
+            commitPolicy: resolvedArgs.parsedArgs.commitPolicy,
+            callerLabels: callerSnapshot?.labels,
+            resident: Boolean(
+              resolvedArgs.parsedArgs.resident || resolvedArgs.parsedArgs.residentRole,
+            ),
+            parentReporting: resolvedArgs.parsedArgs.parentReporting,
+            notifyOnFinish: resolvedArgs.parsedArgs.notifyOnFinish,
+          });
+        } catch (error) {
+          if (error instanceof LeadPlaybookValidationError) {
+            throw new PaseoToolInputError(error.message);
+          }
+          throw error;
+        }
+      }
+      const taskBinding = args.taskBinding ? await prepareTaskBinding(args.taskBinding) : undefined;
+      const notifyOnFinish = resolvedPlaybook ? false : parsedArgs.notifyOnFinish;
+      let parentReporting: "auto" | "explicit" | undefined;
+      if (resolvedPlaybook) {
+        parentReporting = "explicit";
+      } else if (resolvedArgs.kind === "agent-scoped") {
+        parentReporting = resolvedArgs.parsedArgs.parentReporting;
+      }
       const bindingMessageId = taskBinding ? randomUUID() : undefined;
       const { snapshot, initialPromptStarted, bindingResult } = await (async () => {
         const create = () =>
@@ -2327,6 +2367,8 @@ function createToolCatalog(
               initialPromptMessageId: bindingMessageId,
               notifyOnFinish,
               parentReporting,
+              playbook: resolvedPlaybook?.playbook,
+              commitPolicy: resolvedPlaybook?.commitPolicy,
               background: parsedArgs.background,
               detached: resolvedArgs.kind === "top-level" && resolvedArgs.detached,
               callerAgentId,
@@ -2421,7 +2463,11 @@ function createToolCatalog(
     input: ResolvedCreateAgentToolArgs["parsedArgs"],
     profile: ReturnType<typeof getCreateToolProfile>,
   ) {
-    if (input.resident ?? profile?.defaultResident) {
+    const hasPlaybook = "playbook" in input && input.playbook !== undefined;
+    if (hasPlaybook && (input.resident || input.residentRole)) {
+      throw new PaseoToolInputError("Orchestration playbook leads cannot be resident specialists.");
+    }
+    if (!hasPlaybook && (input.resident ?? profile?.defaultResident)) {
       if (!callerAgentId) {
         throw new PaseoToolInputError(
           "Resident specialists require a parent agent in an active workspace.",

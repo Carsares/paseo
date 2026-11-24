@@ -1,6 +1,8 @@
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
   EXPLICIT_PARENT_REPORTING,
+  LEAD_COMMIT_POLICY_LABEL,
+  LEAD_PLAYBOOK_LABEL,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
@@ -38,6 +40,7 @@ import {
   buildHierarchyAppendSystemPrompt,
   computeAgentDepth,
   computeMaxSubtreeDepth,
+  hasReservedHierarchyLabels,
   isMainControlWritePermissionBlocked,
   REMOTE_HIERARCHY_DEPTH_LABEL,
   resolveInheritedHierarchyMode,
@@ -370,6 +373,9 @@ describe("agent orchestration", () => {
     expect(prompt).toContain("Workspace Main Control Coordinator");
     expect(prompt).toContain("Call list_profiles to select the preset");
     expect(prompt).toContain('parentReporting: "explicit" and notifyOnFinish: false');
+    expect(prompt).toContain("combine list_workspace_tasks and summarize_workspace_agents");
+    expect(prompt).toContain('"batch_implement"');
+    expect(prompt).toContain('commitPolicy: "none"');
     expect(prompt).toContain("End your turn to wait for the lead to call report_to_parent");
     expect(prompt).not.toMatch(/git (status|diff)|Direct Level-1 children/);
     expect(buildHierarchyAppendSystemPrompt({ agent: main, ...hierarchy(main) })).toBe(prompt);
@@ -386,6 +392,27 @@ describe("agent orchestration", () => {
     expect(leadPrompt).not.toContain("Delegate substantive implementation");
     expect(leadPrompt).toContain('Direct Level-2 children: [{"id":"worker"');
     expect(leadPrompt).toContain("Call report_to_parent once all verification is complete");
+    const playbookLead = {
+      ...explicitLead,
+      labels: {
+        ...explicitLead.labels,
+        [LEAD_PLAYBOOK_LABEL]: "batch_implement",
+        [LEAD_COMMIT_POLICY_LABEL]: "scoped_only",
+      },
+    };
+    const playbookLeadPrompt = buildHierarchyAppendSystemPrompt({
+      agent: playbookLead,
+      ...hierarchy(worker, playbookLead, main),
+    });
+    expect(playbookLeadPrompt).toContain(
+      "Level-1 Batch Implementation Lead under Main Control Agent main",
+    );
+    expect(playbookLeadPrompt).toContain("git commit --only -- <owned files>");
+    expect(playbookLeadPrompt).not.toContain("Flexible Mode");
+    expect(playbookLeadPrompt).toContain('Direct Level-2 children: [{"id":"worker"');
+    expect(playbookLeadPrompt).toContain("Call report_to_parent once all verification is complete");
+    expect(hasReservedHierarchyLabels({ [LEAD_PLAYBOOK_LABEL]: "batch_implement" })).toBe(true);
+    expect(hasReservedHierarchyLabels({ [LEAD_COMMIT_POLICY_LABEL]: "none" })).toBe(true);
     const autoLeadPrompt = buildHierarchyAppendSystemPrompt({ agent: lead, ...graph });
     expect(autoLeadPrompt).toContain("For small-to-medium single-module tasks");
     expect(autoLeadPrompt).not.toContain("Call report_to_parent");

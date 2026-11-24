@@ -14,6 +14,16 @@ export const RESIDENT_SLUG_LABEL = "paseo.resident-slug";
 export const AGENT_PROFILE_ID_LABEL = "paseo.profile-id";
 export const RESIDENT_INBOX_BYPASS_LABEL = "paseo.resident-urgent-report";
 export const RESIDENT_KEEPALIVE_LABEL = "paseo.resident-keepalive";
+export const LEAD_PLAYBOOK_LABEL = "paseo.lead-playbook";
+export const LEAD_COMMIT_POLICY_LABEL = "paseo.lead-commit-policy";
+export const LEAD_PLAYBOOKS = ["batch_implement", "cr_fix_loop", "readonly_cr"] as const;
+export type LeadPlaybook = (typeof LEAD_PLAYBOOKS)[number];
+export const LEAD_COMMIT_POLICIES = ["none", "scoped_only"] as const;
+export type LeadCommitPolicy = (typeof LEAD_COMMIT_POLICIES)[number];
+export const RESERVED_LEAD_PLAYBOOK_LABELS = [
+  LEAD_PLAYBOOK_LABEL,
+  LEAD_COMMIT_POLICY_LABEL,
+] as const;
 export const RESIDENT_ROLE_MAX_LENGTH = 500;
 export const RESIDENT_ROLE_SLUG_MAX_LENGTH = 64;
 export const RESIDENT_ROLE_SLUG_PATTERN = /^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/;
@@ -79,6 +89,22 @@ export function isExplicitParentReportingLabels(
   labels: Record<string, unknown> | null | undefined,
 ): boolean {
   return labels?.[PARENT_REPORTING_LABEL] === EXPLICIT_PARENT_REPORTING;
+}
+
+export function getLeadPlaybookFromLabels(
+  labels: Record<string, unknown> | null | undefined,
+): LeadPlaybook | null {
+  const raw = labels?.[LEAD_PLAYBOOK_LABEL];
+  return typeof raw === "string" && (LEAD_PLAYBOOKS as readonly string[]).includes(raw)
+    ? (raw as LeadPlaybook)
+    : null;
+}
+
+export function getLeadCommitPolicyFromLabels(
+  labels: Record<string, unknown> | null | undefined,
+): LeadCommitPolicy {
+  if (getLeadPlaybookFromLabels(labels) === "readonly_cr") return "none";
+  return labels?.[LEAD_COMMIT_POLICY_LABEL] === "scoped_only" ? "scoped_only" : "none";
 }
 
 export function isMainControlAgentLabels(

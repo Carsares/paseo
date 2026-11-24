@@ -2,6 +2,8 @@ import { describe, expect, test } from "vitest";
 import {
   AGENT_PROFILE_ID_LABEL,
   getAgentProfileIdFromLabels,
+  getLeadCommitPolicyFromLabels,
+  getLeadPlaybookFromLabels,
   getParentAgentIdFromLabels,
   getOpenAgentTabLabel,
   getResidentRoleFromLabels,
@@ -13,6 +15,8 @@ import {
   isExplicitParentReportingLabels,
   isOpenAgentTabLabel,
   isResidentAgent,
+  LEAD_COMMIT_POLICY_LABEL,
+  LEAD_PLAYBOOK_LABEL,
   PARENT_AGENT_ID_LABEL,
   RESIDENT_AGENT_LABEL,
   RESIDENT_INBOX_BYPASS_LABEL,
@@ -95,4 +99,27 @@ test("only the reserved explicit label opts an agent out of automatic parent rep
   ]) {
     expect(isExplicitParentReportingLabels(labels)).toBe(false);
   }
+});
+
+test("reads lead playbook and commit policy labels with readonly_cr forced to none", () => {
+  for (const playbook of ["batch_implement", "cr_fix_loop", "readonly_cr"] as const) {
+    expect(getLeadPlaybookFromLabels({ [LEAD_PLAYBOOK_LABEL]: playbook })).toBe(playbook);
+  }
+  for (const invalid of [" batch_implement ", "unknown", 1, null, undefined]) {
+    expect(getLeadPlaybookFromLabels({ [LEAD_PLAYBOOK_LABEL]: invalid })).toBeNull();
+  }
+
+  expect(getLeadCommitPolicyFromLabels({})).toBe("none");
+  expect(
+    getLeadCommitPolicyFromLabels({
+      [LEAD_PLAYBOOK_LABEL]: "batch_implement",
+      [LEAD_COMMIT_POLICY_LABEL]: "scoped_only",
+    }),
+  ).toBe("scoped_only");
+  expect(
+    getLeadCommitPolicyFromLabels({
+      [LEAD_PLAYBOOK_LABEL]: "readonly_cr",
+      [LEAD_COMMIT_POLICY_LABEL]: "scoped_only",
+    }),
+  ).toBe("none");
 });

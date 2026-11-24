@@ -1,0 +1,116 @@
+import {
+  isMainControlAgentLabels,
+  LEAD_COMMIT_POLICIES,
+  LEAD_PLAYBOOKS,
+  type LeadCommitPolicy,
+  type LeadPlaybook,
+} from "@getpaseo/protocol/agent-labels";
+import { z } from "zod";
+
+export const LeadPlaybookSchema = z.enum(LEAD_PLAYBOOKS);
+export const LeadCommitPolicySchema = z.enum(LEAD_COMMIT_POLICIES);
+
+export interface LeadPlaybookValidationInput {
+  playbook?: LeadPlaybook;
+  commitPolicy?: LeadCommitPolicy;
+  callerLabels?: Record<string, unknown> | null;
+  resident?: boolean;
+  parentReporting?: "auto" | "explicit";
+  notifyOnFinish?: boolean;
+}
+
+export interface ResolvedLeadPlaybookOptions {
+  playbook: LeadPlaybook;
+  commitPolicy: LeadCommitPolicy;
+}
+
+export class LeadPlaybookValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LeadPlaybookValidationError";
+  }
+}
+
+export function resolveLeadPlaybookInput(
+  input: LeadPlaybookValidationInput,
+): ResolvedLeadPlaybookOptions | undefined {
+  if (input.playbook === undefined && input.commitPolicy === undefined) {
+    return undefined;
+  }
+  if (input.playbook === undefined) {
+    throw new LeadPlaybookValidationError("commitPolicy requires playbook.");
+  }
+  if (!isMainControlAgentLabels(input.callerLabels)) {
+    throw new LeadPlaybookValidationError(
+      "Orchestration playbooks can only be dispatched by a Workspace Main Control agent.",
+    );
+  }
+  if (input.resident) {
+    throw new LeadPlaybookValidationError(
+      "Orchestration playbook leads cannot be resident specialists.",
+    );
+  }
+  if (input.parentReporting === "auto") {
+    throw new LeadPlaybookValidationError(
+      'Orchestration playbook leads require parentReporting: "explicit".',
+    );
+  }
+  if (input.notifyOnFinish === true) {
+    throw new LeadPlaybookValidationError(
+      "Orchestration playbook leads require notifyOnFinish: false.",
+    );
+  }
+  if (input.playbook === "readonly_cr" && input.commitPolicy === "scoped_only") {
+    throw new LeadPlaybookValidationError(
+      'commitPolicy "scoped_only" cannot be used with playbook "readonly_cr".',
+    );
+  }
+  return {
+    playbook: input.playbook,
+    commitPolicy: input.commitPolicy ?? "none",
+  };
+}
+
+export function buildMainControlPlaybookGuidance(): string[] {
+  return [
+    "When asked for overall workspace or multi-task progress, combine list_workspace_tasks and summarize_workspace_agents directly to report active Level-1 tasks, completed outcomes, and pending blocking decisions without spawning a subagent or reading raw Level-2 transcripts.",
+    'For multi-track implementation or layered code review, spawn a fresh Level-1 lead via create_agent with playbook: "batch_implement" (approved multi-module implementation), "cr_fix_loop" (iterative review-and-fix loop), or "readonly_cr" (single-round layered read-only review with independent arbitration). Keep commitPolicy: "none" unless the user explicitly authorized local commits in the current request ("scoped_only").',
+  ];
+}
+
+export function buildLeadPlaybookContract(params: {
+  parentAgentId: string;
+  playbook: LeadPlaybook;
+  commitPolicy: LeadCommitPolicy;
+}): string[] {
+  const { parentAgentId, playbook, commitPolicy } = params;
+  switch (playbook) {
+    case "batch_implement":
+      return [
+        `Role: Level-1 Batch Implementation Lead under Main Control Agent ${parentAgentId}.`,
+        "Decompose the approved scope into mutually exclusive file tracks: dispatch at most 2-3 Level-2 implementation tracks plus 1 cross-track independent blind-review track, folding small adjacent edits into an existing matching track.",
+        'Reuse a warm idle same-workspace specialist or child with matching scope and clean context when appropriate; otherwise call create_agent with notifyOnFinish: true (omit parentReporting: "explicit" on Level-2). Follow any model and thinking-tier guidance from your parent prompt.',
+        "Enforce strict role isolation: an implementer must never review its own changes. After dispatching each Level-2 wave, end your turn immediately and wait passively for completion notifications without polling.",
+        commitPolicy === "scoped_only"
+          ? "After cross-track blind review and targeted verification pass, commit only this batch's owned files with git commit --only -- <owned files> without touching unrelated workspace edits, and archive temporary Level-2 subagents that have no open client tabs."
+          : "After cross-track blind review and targeted verification pass, leave verified edits uncommitted in the working tree (do not run git commit or git push), and archive temporary Level-2 subagents that have no open client tabs.",
+      ];
+    case "cr_fix_loop":
+      return [
+        `Role: Level-1 Convergent Code-Review & Fix Lead under Main Control Agent ${parentAgentId}.`,
+        "Coordinate iterative, role-isolated code review and repair across the requested scope (or full branch diff against the base branch when unspecified) within this single Level-1 lead session.",
+        "Partition review slices proportionally to diff size (1-3 slices by default, at most 5 for very large diffs) and pin shared baseline invariants at the top of Level-2 prompts. Reuse a read-only slice reviewer across at most 3 consecutive rounds for incremental checks (skip unchanged, uncoupled slices from round 2 onward) and reuse same-scope fix or verification agents up to 3 rounds; spawn a fresh independent arbiter each round to falsify findings against source code, and never let a fixer act as reviewer or arbiter.",
+        'Dispatch Level-2 subagents with notifyOnFinish: true (omit parentReporting: "explicit"), cap concurrent repair at 2-3 fix tracks plus 1 cross-track verification track, and end your turn immediately after each dispatch to wait passively for notifications without polling.',
+        commitPolicy === "scoped_only"
+          ? "Fix deterministic blocking defects autonomously while setting aside genuine contract dilemmas until deterministic blockers reach zero; commit each verified repair round with git commit --only -- <repaired files> and archive finished temporary Level-2 subagents without open client tabs."
+          : "Fix deterministic blocking defects autonomously while setting aside genuine contract dilemmas until deterministic blockers reach zero; keep verified repairs uncommitted in the working tree (do not run git commit or git push) and archive finished temporary Level-2 subagents without open client tabs.",
+      ];
+    case "readonly_cr":
+      return [
+        `Role: Level-1 Read-Only Code-Review Lead under Main Control Agent ${parentAgentId}.`,
+        "Execute a single-round layered, strictly read-only code review over the requested scope (or full branch diff against the base branch when unspecified). Never modify files, stage changes, commit, or push.",
+        'Define must-preserve behavior and blocking-defect criteria first, partition the diff proportionally (1-3 slices by default, at most 5 for very large diffs), dispatch parallel read-only Level-2 slice reviewers via create_agent with notifyOnFinish: true (omit parentReporting: "explicit"), and end your turn immediately to wait passively for notifications without polling.',
+        "Spawn a fresh independent read-only arbiter to verify candidate findings directly against source code and filter out false positives, archive temporary Level-2 subagents without open client tabs, then report confirmed blocking defects, impact, file/symbol evidence, and minimal repair recommendations.",
+      ];
+  }
+}

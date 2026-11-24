@@ -46,10 +46,15 @@ import {
   isExplicitParentReportingLabels,
   isMainControlAgentLabels,
   getParentAgentIdFromLabels,
+  LEAD_COMMIT_POLICY_LABEL,
+  LEAD_PLAYBOOK_LABEL,
   MAIN_PRIOR_MODE_ID_LABEL,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
+  RESERVED_LEAD_PLAYBOOK_LABELS,
   WORKSPACE_ROLE_LABEL,
+  type LeadCommitPolicy,
+  type LeadPlaybook,
 } from "@getpaseo/protocol/agent-labels";
 import {
   readAgentHierarchyPath,
@@ -60,6 +65,7 @@ import {
   resolveInheritedHierarchyMode,
   validateCanSpawnChild,
 } from "../hierarchy-policy.js";
+import { resolveLeadPlaybookInput } from "../orchestration-playbooks.js";
 
 /** How a workspace this creation makes inherits its creator's visibility. */
 interface McpWorkspaceIntent {
@@ -134,6 +140,8 @@ export interface CreateAgentFromMcpInput {
   initialPromptMessageId?: string;
   notifyOnFinish?: boolean;
   parentReporting?: "auto" | "explicit";
+  playbook?: LeadPlaybook;
+  commitPolicy?: LeadCommitPolicy;
   resident?: { profileId?: string; role?: string };
   internal?: boolean;
   /** Omitted with a caller, the caller agent's own background applies. */
@@ -167,10 +175,11 @@ export type CreateAgentCommandInput = CreateAgentFromSessionInput | CreateAgentF
 export type CreateAgentPromptFailureMode = "throw" | "log" | "return-error";
 
 export function shouldUseExplicitParentReporting(
-  input: Partial<Pick<CreateAgentFromMcpInput, "parentReporting" | "notifyOnFinish">>,
+  input: Partial<Pick<CreateAgentFromMcpInput, "parentReporting" | "notifyOnFinish" | "playbook">>,
   parentLabels: ManagedAgent["labels"] | undefined,
 ): boolean {
   return (
+    input.playbook !== undefined ||
     input.parentReporting === "explicit" ||
     (input.parentReporting === undefined &&
       input.notifyOnFinish === false &&
@@ -403,8 +412,14 @@ function applyCreateLabelPolicy(
   delete labels[WORKSPACE_ROLE_LABEL];
   delete labels[MAIN_PRIOR_MODE_ID_LABEL];
   for (const label of RESERVED_RESIDENT_LABELS) delete labels[label];
+  for (const label of RESERVED_LEAD_PLAYBOOK_LABELS) delete labels[label];
   if (input.kind === "session" && input.workspaceRole === "main" && input.profileId) {
     labels[AGENT_PROFILE_ID_LABEL] = input.profileId;
+  }
+  if (input.kind === "mcp" && input.playbook) {
+    labels[LEAD_PLAYBOOK_LABEL] = input.playbook;
+    labels[LEAD_COMMIT_POLICY_LABEL] =
+      input.playbook === "readonly_cr" ? "none" : (input.commitPolicy ?? "none");
   }
 }
 
@@ -438,6 +453,7 @@ async function createMcpResident(
   }
   const labels = { ...resolved.createOptions.labels };
   for (const key of RESERVED_HIERARCHY_LABELS) delete labels[key];
+  for (const key of RESERVED_LEAD_PLAYBOOK_LABELS) delete labels[key];
   if (Object.keys(labels).length) {
     await agentManager.updateAgentMetadata(agentId, { labels, expectedWorkspaceId: workspaceId });
   }
@@ -463,7 +479,12 @@ function registerInitialPromptFinish(
   child: ManagedAgent,
 ): Promise<FinishRegistration> | undefined {
   if (!input.callerAgentId) return;
-  const notify = input.kind === "mcp" ? input.notifyOnFinish : input.notifyParentOnInitialPrompt;
+  let notify: boolean | undefined;
+  if (input.kind === "mcp") {
+    notify = input.playbook ? false : input.notifyOnFinish;
+  } else {
+    notify = input.notifyParentOnInitialPrompt;
+  }
   if (!(notify ?? !isExplicitParentReportingLabels(child.labels))) return;
   const subscriptions =
     input.kind === "mcp"
@@ -569,6 +590,14 @@ async function resolveMcpCreateAgent(
     ? requireParentAgent(dependencies.agentManager, input.callerAgentId)
     : null;
   assertMcpCallerPlacement(input, parentAgent, dependencies.workspaceRegistry);
+  resolveLeadPlaybookInput({
+    playbook: input.playbook,
+    commitPolicy: input.commitPolicy,
+    callerLabels: parentAgent?.labels,
+    resident: Boolean(input.resident),
+    parentReporting: input.parentReporting,
+    notifyOnFinish: input.notifyOnFinish,
+  });
   const cwd = resolveMcpInitialCwd(input, parentAgent);
   const workspaceIntent = {
     background: inheritWorkspaceBackground(input.background, parentAgent),
