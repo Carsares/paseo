@@ -223,6 +223,8 @@ import {
   listImportableProviderSessions,
   normalizeImportAgentRequest,
 } from "./agent/import-sessions.js";
+import { WorkspaceTaskLedgerStore } from "./agent/task-ledger/index.js";
+import { listWorkspaceTaskSummaries } from "./task-ledger-rpc.js";
 import { listProjectSuggestions, ProjectSuggestionsRequestError } from "./project-suggestions.js";
 import {
   checkoutLiteFromGitSnapshot,
@@ -1165,6 +1167,7 @@ export class Session {
   private readonly agentStorage: AgentStorage;
   private readonly projectRegistry: ProjectRegistry;
   private readonly workspaceRegistry: WorkspaceRegistry;
+  private readonly taskLedger: WorkspaceTaskLedgerStore;
   private readonly agentDirectory: AgentDirectory;
   private readonly directorySync: DirectorySyncService;
   private readonly filesystem: SessionFileSystem;
@@ -1339,6 +1342,7 @@ export class Session {
     this.onWorkspaceRecovered = onWorkspaceRecovered ?? null;
     this.pushNotifications = pushNotifications;
     this.paseoHome = paseoHome;
+    this.taskLedger = new WorkspaceTaskLedgerStore(paseoHome);
     this.messageReceipts = options.messageReceipts;
     this.agentMessages = options.agentMessages;
     this.finishSubscriptions = options.finishSubscriptions;
@@ -3187,6 +3191,13 @@ export class Session {
   }
 
   private dispatchWorkspaceLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    if (msg.type === "workspace.tasks.list.request") {
+      return listWorkspaceTaskSummaries(msg, {
+        workspaceRegistry: this.workspaceRegistry,
+        taskLedger: this.taskLedger,
+        logger: this.sessionLogger,
+      }).then((response) => this.emit(response));
+    }
     if (
       msg.type === "workspace.deferral.set.request" ||
       msg.type === "agent.limit.recovery.request"

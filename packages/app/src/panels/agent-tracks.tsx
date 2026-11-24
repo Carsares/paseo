@@ -4,6 +4,7 @@ import { BackgroundWorkTrack, createHostBackgroundWorkModel } from "@/background
 import { WorkspaceDiffStatPill } from "@/composer/diff-stat-pill";
 import { AgentTaskList } from "@/composer/task-list";
 import { ComposerTrackBar } from "@/composer/tracks";
+import { WorkspaceTaskLedger } from "@/composer/workspace-task-ledger";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { usePaneContext } from "@/panels/pane-context";
 import { useSettings } from "@/hooks/use-settings";
@@ -17,6 +18,7 @@ import {
   useSubagentsForParent,
 } from "@/subagents";
 import { ParentAgentPill } from "@/subagents/parent";
+import { isWorkspaceRootAgent } from "@/subagents/main-control-tree/select-tree";
 import { SubagentsTrack } from "@/subagents/track";
 import type { TodoEntry } from "@/types/stream";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
@@ -51,7 +53,13 @@ export const AgentTracks = memo(function AgentTracks({
     parentAgentId: agentId,
     rows: subagentRows,
   });
-  const { tabId } = usePaneContext();
+  const { host, tabId } = usePaneContext();
+  const isWorkspaceRoot = useSessionStore((state) => {
+    if (host !== "main" || parentAgentId) return false;
+    const session = state.sessions[serverId];
+    const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+    return isWorkspaceRootAgent(agent, workspaceId);
+  });
   const backgroundWorkCount = useSessionStore((state) => {
     const session = state.sessions[serverId];
     const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
@@ -123,6 +131,9 @@ export const AgentTracks = memo(function AgentTracks({
     <ComposerTrackBar>
       <BackgroundWorkTrack model={backgroundModel} count={backgroundWorkCount} />
       {parentAgentId ? <ParentAgentPill serverId={serverId} parentAgentId={parentAgentId} /> : null}
+      {isWorkspaceRoot ? (
+        <WorkspaceTaskLedger serverId={serverId} workspaceId={workspaceId} />
+      ) : null}
       <AgentTaskList tasks={tasks} />
       <SubagentsTrack
         serverId={serverId}

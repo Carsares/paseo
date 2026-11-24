@@ -4919,6 +4919,82 @@ test("metadata needs a host that advertises entityMetadata and sends nothing to 
   expect(mock.sent).toHaveLength(0);
 });
 
+describe("workspace task ledger", () => {
+  async function connect(features: Record<string, boolean>) {
+    const mock = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "workspace-task-ledger-test",
+      transportFactory: () => mock.transport,
+      reconnect: { enabled: false },
+    });
+    clients.push(client);
+    const connected = client.connect();
+    mock.triggerOpen({ features });
+    await connected;
+    return { client, mock };
+  }
+
+  test.each([{}, { workspaceTaskLedger: false }])(
+    "sends nothing unless the host advertises support (%j)",
+    async (features) => {
+      const { client, mock } = await connect(features);
+      expect(client.supportsWorkspaceTaskLedger()).toBe(false);
+      await expect(client.listWorkspaceTasks("workspace-1")).rejects.toThrow("Update the host");
+      expect(mock.sent).toHaveLength(0);
+    },
+  );
+
+  test("returns tasks from the correlated workspace reply", async () => {
+    const { client, mock } = await connect({ workspaceTaskLedger: true });
+    expect(client.supportsWorkspaceTaskLedger()).toBe(true);
+    const result = client.listWorkspaceTasks("workspace-1");
+    expect(mock.sent).toHaveLength(1);
+    const request = parseSentFrame(mock.sent[0]);
+    expect(request).toEqual({
+      type: "workspace.tasks.list.request",
+      workspaceId: "workspace-1",
+      requestId: expect.any(String),
+    });
+    const tasks = [
+      {
+        taskId: "task-1",
+        title: "Review startup changes",
+        status: "in_progress",
+        tier: "T2",
+        participants: [{ agentId: "main-1" }],
+        createdAt: "2026-11-24T00:00:00.000Z",
+        updatedAt: "2026-11-24T00:00:00.000Z",
+      },
+    ];
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "workspace.tasks.list.response",
+        payload: { workspaceId: "workspace-1", requestId: request.requestId, tasks, error: null },
+      }),
+    );
+    await expect(result).resolves.toEqual(tasks);
+  });
+
+  test("throws the error from the correlated workspace reply", async () => {
+    const { client, mock } = await connect({ workspaceTaskLedger: true });
+    const result = client.listWorkspaceTasks("workspace-1");
+    const request = parseSentFrame(mock.sent[0]);
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "workspace.tasks.list.response",
+        payload: {
+          workspaceId: "workspace-1",
+          requestId: request.requestId,
+          tasks: [],
+          error: "Workspace not found",
+        },
+      }),
+    );
+    await expect(result).rejects.toThrow("Workspace not found");
+  });
+});
+
 test("workspace start point resolution and pinned creates send nothing to older hosts", async () => {
   const mock = createMockTransport();
   const client = new DaemonClient({

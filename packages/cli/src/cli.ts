@@ -11,6 +11,7 @@ import { createProjectCommand } from "./commands/project/index.js";
 import { createScheduleCommand } from "./commands/schedule/index.js";
 import { createSpeechCommand } from "./commands/speech/index.js";
 import { createScriptCommand } from "./commands/script/index.js";
+import { createTaskCommand } from "./commands/task/index.js";
 import { createTerminalCommand } from "./commands/terminal/index.js";
 import { createWorktreeCommand } from "./commands/worktree/index.js";
 import { createWorkspaceCommand } from "./commands/workspace/index.js";
@@ -161,6 +162,7 @@ export function createCli(): Command {
   // Workspace commands
   program.addCommand(createProjectCommand());
   program.addCommand(createWorkspaceCommand());
+  program.addCommand(createTaskCommand());
   // COMPAT(worktreeCli): legacy command alias added before workspace was the product unit.
   // Added in v0.2.0; remove after 2027-01-17.
   program.addCommand(createWorktreeCommand(), { hidden: true });

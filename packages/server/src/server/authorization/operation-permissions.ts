@@ -297,6 +297,7 @@ const INBOUND_PERMISSION = {
   workspace_setup_status_request: "workspace.read",
   "workspace.setup.subscribe.request": "workspace.read",
   "workspace.setup.run.request": "workspace.write",
+  "workspace.tasks.list.request": "workspace.read",
   write_project_config_request: "workspace.write",
 } as const satisfies Record<InboundOperation, PermissionRequirement>;
 
@@ -606,6 +607,7 @@ const OUTBOUND_PERMISSION = {
   workspace_setup_status_response: "workspace.read",
   "workspace.setup.subscribe.response": "workspace.read",
   "workspace.setup.run.response": "workspace.write",
+  "workspace.tasks.list.response": "workspace.read",
   workspace_update: ["workspace.read", "hub.execute"],
   write_project_config_response: "workspace.write",
 } as const satisfies Record<OutboundOperation, PermissionRequirement>;

@@ -1212,6 +1212,12 @@ export const WorkspaceDurableItemDecideRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const WorkspaceTasksListRequestSchema = z.object({
+  type: z.literal("workspace.tasks.list.request"),
+  workspaceId: z.string().min(1),
+  requestId: z.string(),
+});
+
 export const WorkspaceDeferralSetRequestSchema = z.object({
   type: z.literal("workspace.deferral.set.request"),
   workspaceId: z.string().min(1),
@@ -2978,6 +2984,53 @@ export const WorkspaceDurableItemDecideResponseSchema = z.object({
   }),
 });
 
+const WorkspaceTaskAgentStateSchema = z.object({
+  agentId: z.string().min(1),
+  kind: z.string(),
+  at: z.iso.datetime(),
+  lifecycle: z.string().optional(),
+});
+
+export const WorkspaceTaskSummarySchema = z.object({
+  taskId: z.string().min(1),
+  title: z.string().min(1),
+  status: z.enum([
+    "analyzing",
+    "awaiting_decision",
+    "in_progress",
+    "verifying",
+    "unclosed",
+    "completed",
+    "deferred",
+    "canceled",
+  ]),
+  tier: z.enum(["T1", "T2", "T3"]),
+  participants: z.array(
+    z.object({
+      agentId: z.string().min(1),
+      serverId: z.string().min(1).optional(),
+      boundBy: z.string().min(1).optional(),
+    }),
+  ),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+  handoffSummary: z.string().optional(),
+  blockingQuestion: z.string().optional(),
+  verificationState: z.enum(["passed", "failed", "not_run", "blocked", "skipped"]).optional(),
+  recentAgentStates: z.array(WorkspaceTaskAgentStateSchema).optional(),
+  latestProgress: WorkspaceTaskAgentStateSchema.optional(),
+});
+
+export const WorkspaceTasksListResponseSchema = z.object({
+  type: z.literal("workspace.tasks.list.response"),
+  payload: z.object({
+    workspaceId: z.string().min(1),
+    requestId: z.string(),
+    tasks: z.array(WorkspaceTaskSummarySchema),
+    error: z.string().nullable(),
+  }),
+});
+
 const WorkspaceDeferralResultSchema = z.object({
   requestId: z.string(),
   success: z.boolean(),
@@ -4486,6 +4539,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceTopicUpdateRequestSchema,
   WorkspaceDurableItemListRequestSchema,
   WorkspaceDurableItemDecideRequestSchema,
+  WorkspaceTasksListRequestSchema,
   WorkspaceDeferralSetRequestSchema,
   AgentLimitRecoveryRequestSchema,
   WorkspacePinSetRequestSchema,
@@ -4916,6 +4970,7 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(internalWorkspaces): added in v0.9.0; remove gate after 2027-03-17.
         internalWorkspaces: z.boolean().optional(),
         workspaceDeferral: z.boolean().optional(),
+        workspaceTaskLedger: z.boolean().optional(),
         backgroundWorkspaces: z.boolean().optional(),
         // COMPAT(backgroundAgents): added in v0.15.0; remove gate after 2027-05-03.
         backgroundAgents: z.boolean().optional(),
@@ -9196,6 +9251,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceTopicUpdateResponseSchema,
   WorkspaceDurableItemListResponseSchema,
   WorkspaceDurableItemDecideResponseSchema,
+  WorkspaceTasksListResponseSchema,
   WorkspaceDeferralSetResponseSchema,
   AgentLimitRecoveryResponseSchema,
   WorkspacePinSetResponseSchema,
@@ -9713,6 +9769,7 @@ export type CheckoutGitWorkingTree = z.infer<typeof CheckoutGitWorkingTreeSchema
 export type WorkbenchErrorCode = z.infer<typeof WorkbenchErrorCodeSchema>;
 export type WorkspaceDurableItem = z.infer<typeof WorkspaceDurableItemSchema>;
 export type WorkspaceDurableItemEvidence = z.infer<typeof WorkspaceDurableItemEvidenceSchema>;
+export type WorkspaceTaskSummary = z.infer<typeof WorkspaceTaskSummarySchema>;
 export type WorkspaceTopic = z.infer<typeof WorkspaceTopicSchema>;
 export type CheckoutWorktree = z.infer<typeof CheckoutWorktreeSchema>;
 export type CheckoutWorktreesListRequest = z.infer<typeof CheckoutWorktreesListRequestSchema>;

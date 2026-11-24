@@ -119,6 +119,7 @@ import type {
   ProjectGithubCloneResponse,
   ArchiveWorkspaceResponseMessage,
   WorkspaceSetupStatusResponseMessage,
+  WorkspaceTaskSummary,
   ListCommandsResponse,
   ListProviderFeaturesResponseMessage,
   ProviderControlsListResponseMessage,
@@ -5973,6 +5974,22 @@ export class DaemonClient {
       "workspaceDurableItemsV1",
       options,
     );
+  }
+
+  supportsWorkspaceTaskLedger(): boolean {
+    return this.lastServerInfoMessage?.features?.workspaceTaskLedger === true;
+  }
+
+  async listWorkspaceTasks(workspaceId: string): Promise<WorkspaceTaskSummary[]> {
+    if (!this.supportsWorkspaceTaskLedger()) {
+      throw new Error("Update the host to view workspace tasks.");
+    }
+    const payload =
+      await this.sendNamespacedCorrelatedSessionRequest<"workspace.tasks.list.response">({
+        message: { type: "workspace.tasks.list.request", workspaceId },
+      });
+    if (payload.error !== null) throw new Error(payload.error);
+    return payload.tasks;
   }
 
   checkoutGitWorkingTreeGet(

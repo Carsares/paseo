@@ -1,11 +1,13 @@
 import { topicWorkbench } from "../domains/topic-workbench";
 import { gitWorkbench } from "../domains/git-workbench";
+import { workspaceTaskLedger } from "../domains/workspace-task-ledger";
 import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ru: TranslationResources = {
   topicWorkbench: topicWorkbench["ru"],
   gitWorkbench: gitWorkbench["ru"],
+  workspaceTaskLedger: workspaceTaskLedger["ru"],
   pluginCombobox: {
     searching: "Поиск…",
     empty: "Нет результатов",

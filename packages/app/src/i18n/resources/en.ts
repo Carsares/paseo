@@ -1,10 +1,12 @@
 import { topicWorkbench } from "../domains/topic-workbench";
 import { gitWorkbench } from "../domains/git-workbench";
+import { workspaceTaskLedger } from "../domains/workspace-task-ledger";
 import { pluginGallery } from "./plugin-gallery";
 
 export const en = {
   topicWorkbench: topicWorkbench["en"],
   gitWorkbench: gitWorkbench["en"],
+  workspaceTaskLedger: workspaceTaskLedger["en"],
   pluginCombobox: {
     searching: "Searching…",
     empty: "No results",
