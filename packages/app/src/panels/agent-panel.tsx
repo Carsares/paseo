@@ -1794,6 +1794,7 @@ function ActiveAgentComposer({
   onComposerHeightChange: (height: number) => void;
   onMessageSent: () => void;
 }) {
+  const isComposerFullscreen = useComposerFullscreen(editingSession);
   const isCompactFormFactor = useIsCompactFormFactor();
   const { onLayout: onInputAreaLayout, isBelow: isCompactComposerLayout } = useContainerWidthBelow(
     COMPACT_CONTENT_WIDTH,
@@ -1912,6 +1913,7 @@ function ActiveAgentComposer({
         key={JSON.stringify([serverId, agentId])}
         serverId={serverId}
         agentId={agentId}
+        hidden={isComposerFullscreen}
       />
       <Composer
         agentId={agentId}
