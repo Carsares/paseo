@@ -1,4 +1,8 @@
 import { useOverlayRegistration, type KeyboardInputEvent } from "@/keyboard";
+import {
+  useSearchWorkspaceDeferral,
+  WorkspaceDeferralSearchControl,
+} from "@/workspace-deferral/search-control";
 import { Modal } from "@/components/ui/modal";
 import equal from "fast-deep-equal";
 import { recordRenderProfileReasons } from "@/utils/render-profiler";
@@ -561,6 +565,11 @@ const ResultRow = memo(function ResultRow({
   onSelect,
 }: ResultRowProps) {
   recordRenderProfileReasons(`CommandCenterResultRow:${result.id}`, ["render"]);
+  const workspace = result.kind === "workspace" && !result.archived ? result : null;
+  const deferralKind = useSearchWorkspaceDeferral(
+    workspace?.serverId ?? null,
+    workspace?.workspaceId ?? null,
+  );
   const press = useCallback(() => onSelect(result), [onSelect, result]);
   const choice =
     result.kind === "contribution" && result.contribution.presentation.kind === "choice"
@@ -578,11 +587,12 @@ const ResultRow = memo(function ResultRow({
     ({ hovered, pressed }: PressableStateCallbackType & { hovered?: boolean }) => [
       styles.row,
       { height },
+      deferralKind && styles.deferredRowMain,
       (Boolean(hovered) || pressed || active) && styles.activeRow,
     ],
-    [active, height],
+    [active, deferralKind, height],
   );
-  return (
+  const row = (
     <Pressable
       style={style}
       onPress={press}
@@ -608,6 +618,17 @@ const ResultRow = memo(function ResultRow({
         />
       )}
     </Pressable>
+  );
+  if (!workspace || !deferralKind) return row;
+  return (
+    <View style={styles.deferredRow}>
+      {row}
+      <WorkspaceDeferralSearchControl
+        serverId={workspace.serverId}
+        workspaceId={workspace.workspaceId}
+        kind={deferralKind}
+      />
+    </View>
   );
 });
 
@@ -1202,6 +1223,8 @@ const styles = StyleSheet.create((theme) => ({
     backgroundColor: theme.colors.border,
   },
   row: { paddingHorizontal: theme.spacing[4], justifyContent: "center" },
+  deferredRow: { flexDirection: "row", alignItems: "center" },
+  deferredRowMain: { flex: 1, minWidth: 0 },
   activeRow: { backgroundColor: theme.colors.surface1 },
   rowContent: {
     flexDirection: "row",

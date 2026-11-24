@@ -38,6 +38,7 @@ import { Shortcut } from "@/components/ui/shortcut";
 import { OpenInFileManagerMenuItem } from "@/workspace/open-in-file-manager/menu-item";
 import { resolveSidebarWorkspaceAccessibilityLabel } from "@/components/sidebar/sidebar-workspace-title";
 import { bySizing } from "@/components/ui/control-geometry";
+import { useSidebarWorkspaceDeferralMenu } from "./sidebar-workspace-deferral-menu";
 import {
   workspaceServiceLabelKey,
   type WorkspaceServiceSummary,
@@ -164,6 +165,7 @@ function WorkspaceMenuItem({
 
 function SidebarWorkspaceMenuItems({
   surface,
+  deferralTrigger,
   workspaceKey,
   serverId,
   workspaceId,
@@ -180,7 +182,10 @@ function SidebarWorkspaceMenuItems({
   isPinned,
   onTogglePin,
   openInFileManagerPath,
-}: SidebarWorkspaceMenuItemsProps & { surface: MenuSurface }): ReactNode {
+}: SidebarWorkspaceMenuItemsProps & {
+  surface: MenuSurface;
+  deferralTrigger: ReactNode;
+}): ReactNode {
   const { t } = useTranslation();
   const archiveTrailing = useMemo(
     () => (archiveShortcutKeys ? <Shortcut chord={archiveShortcutKeys} /> : null),
@@ -267,6 +272,7 @@ function SidebarWorkspaceMenuItems({
         path={openInFileManagerPath}
         testID={`sidebar-workspace-menu-open-folder-${workspaceKey}`}
       />
+      {deferralTrigger}
       {onArchive ? (
         <WorkspaceMenuItem
           surface={surface}
@@ -311,7 +317,9 @@ export function SidebarWorkspaceMenu({
       serverId && workspaceId ? { serverId, workspaceId, labels: workspaceLabels ?? [] } : null,
     [serverId, workspaceId, workspaceLabels],
   );
-  const pages = useWorkspaceLabelMenuPages(workspaceTarget);
+  const labelPages = useWorkspaceLabelMenuPages(workspaceTarget);
+  const deferral = useSidebarWorkspaceDeferralMenu(serverId, workspaceId);
+  const pages = [...labelPages, ...deferral.pages];
   return (
     <DropdownMenu compactMode="sheet" open={open} onOpenChange={onOpenChange}>
       <DropdownMenuTrigger
@@ -331,6 +339,7 @@ export function SidebarWorkspaceMenu({
       >
         <SidebarWorkspaceMenuItems
           surface="dropdown"
+          deferralTrigger={deferral.trigger}
           workspaceKey={workspaceKey}
           serverId={serverId}
           workspaceId={workspaceId}
@@ -425,7 +434,12 @@ export function SidebarWorkspaceContextMenu({
     }),
     [workspace],
   );
-  const pages = useWorkspaceLabelMenuPages(workspaceTarget);
+  const labelPages = useWorkspaceLabelMenuPages(workspaceTarget);
+  const deferral = useSidebarWorkspaceDeferralMenu(
+    workspaceTarget.serverId,
+    workspaceTarget.workspaceId,
+  );
+  const pages = [...labelPages, ...deferral.pages];
 
   return (
     <ContextMenu open={contextMenuOpen} onOpenChange={onContextMenuOpenChange}>
@@ -445,6 +459,7 @@ export function SidebarWorkspaceContextMenu({
       >
         <SidebarWorkspaceMenuItems
           surface="context"
+          deferralTrigger={deferral.trigger}
           workspaceKey={workspaceKey}
           serverId={workspaceTarget.serverId}
           workspaceId={workspaceTarget.workspaceId}

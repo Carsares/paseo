@@ -5,6 +5,7 @@ import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { getParentAddressFromLabels, isMainControlAgent } from "@getpaseo/protocol/agent-labels";
 import type { TFunction } from "i18next";
 import { SquarePen } from "lucide-react-native";
+import { AgentLimitRecovery } from "./agent-limit-recovery";
 import { PendingSubagentInboxBar } from "./agent-panel-inbox";
 import React, {
   memo,
@@ -1232,6 +1233,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   ) : null;
   const agentComposerSection = showsComposer ? (
     <RenderProfile id={`AgentComposerSection:${agentId}`}>
+      <AgentLimitRecovery serverId={serverId} workspaceId={workspaceId} agentId={agentId} />
       <AgentComposerSection
         agentId={agentId}
         serverId={serverId}

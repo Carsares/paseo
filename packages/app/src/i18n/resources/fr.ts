@@ -323,6 +323,20 @@ export const fr: TranslationResources = {
     },
   },
   agentPanel: {
+    limitRecovery: {
+      limited: "Le quota de la conversation se renouvelle à {{time}}.",
+      scheduled: "La reprise de cette session est prévue à {{time}}.",
+      unknown:
+        "Le fournisseur a peut-être reçu le message de reprise. Vérifiez la conversation avant de réessayer.",
+      accepted: "Le fournisseur a accepté le message de reprise.",
+      cancelled: "La reprise programmée a été annulée.",
+      failed:
+        "La session n’a pas pu reprendre automatiquement. Vous pouvez réessayer manuellement.",
+      sleep: "Reporter jusqu’au renouvellement",
+      continue: "Reprendre au renouvellement",
+      cancel: "Annuler la reprise",
+      changed: "Le quota de la conversation ou l’état de la reprise a changé.",
+    },
     states: {
       notFound: "Agent introuvable",
       failedToLoad: "Impossible de charger l’agent",
@@ -1489,6 +1503,23 @@ export const fr: TranslationResources = {
       },
     },
     workspace: {
+      deferral: {
+        menu: "Reporter ou mettre de côté",
+        snoozed: "Reporté",
+        parked: "Mis de côté",
+        snoozedUntil: "Reporté jusqu’à {{time}}",
+        snoozedList: "Espaces de travail reportés",
+        parkedList: "Espaces de travail mis de côté",
+        restore: "Réafficher l’espace de travail",
+        restoreNamed: "Réafficher {{name}} sur {{host}}",
+        oneHour: "Reporter d’une heure",
+        fourHours: "Reporter de 4 heures",
+        oneDay: "Reporter d’un jour",
+        park: "Mettre l’espace de travail de côté",
+        pending: "Mise à jour…",
+        offline: "Connectez-vous à l’hôte pour apporter des modifications.",
+        error: "Impossible de mettre à jour l’espace de travail.",
+      },
       status: {
         serviceRunning: "Service {{name}} en cours d’exécution",
         serviceUnhealthy: "Service {{name}} en échec",

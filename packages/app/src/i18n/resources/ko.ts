@@ -319,6 +319,18 @@ export const ko: TranslationResources = {
     },
   },
   agentPanel: {
+    limitRecovery: {
+      limited: "대화 한도는 {{time}}에 초기화됩니다.",
+      scheduled: "이 세션은 {{time}}에 계속하도록 예약되었습니다.",
+      unknown: "제공업체가 계속 메시지를 받았을 수 있습니다. 다시 시도하기 전에 대화를 확인하세요.",
+      accepted: "제공업체가 계속 메시지를 받았습니다.",
+      cancelled: "예약된 계속이 취소되었습니다.",
+      failed: "세션을 자동으로 계속할 수 없습니다. 직접 다시 시도할 수 있습니다.",
+      sleep: "초기화까지 숨기기",
+      continue: "초기화되면 계속",
+      cancel: "계속 예약 취소",
+      changed: "대화 한도 또는 계속 상태가 변경되었습니다.",
+    },
     states: {
       notFound: "에이전트를 찾을 수 없습니다",
       failedToLoad: "에이전트를 불러오지 못했습니다",
@@ -1465,6 +1477,23 @@ export const ko: TranslationResources = {
       },
     },
     workspace: {
+      deferral: {
+        menu: "잠시 숨기기 또는 보류",
+        snoozed: "잠시 숨김",
+        parked: "보류 중",
+        snoozedUntil: "{{time}}까지 숨김",
+        snoozedList: "잠시 숨긴 작업 공간",
+        parkedList: "보류 중인 작업 공간",
+        restore: "작업 공간 복원",
+        restoreNamed: "{{host}}의 {{name}} 복원",
+        oneHour: "1시간 숨기기",
+        fourHours: "4시간 숨기기",
+        oneDay: "1일 숨기기",
+        park: "작업 공간 보류",
+        pending: "업데이트 중…",
+        offline: "변경하려면 호스트에 연결하세요.",
+        error: "작업 공간을 업데이트할 수 없습니다.",
+      },
       status: {
         serviceRunning: "서비스 {{name}} 실행 중",
         serviceUnhealthy: "서비스 {{name}} 비정상",

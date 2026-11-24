@@ -340,6 +340,56 @@ test("createPaseoApi borrows daemon capabilities without exposing connection own
   expect("skills" in paseo.agents).toBe(false);
 });
 
+test("workspace deferral SDK handles scope writes to their own IDs and keep observed snapshots authoritative", async () => {
+  const { client, ws } = await connectClient({ workspaceDeferral: true });
+  try {
+    expect(client.workspaces.supportsDeferral()).toBe(true);
+    const workspaceRow = createWorkspace({ parkedAt: "2026-11-24T00:00:00.000Z" });
+    const workspace = client.workspaces.ref(workspaceRow);
+    const snapshot = createAgent({ workspaceId: workspace.id, lastError: "Rate limit" });
+    const agent = client.agents.ref(snapshot);
+    const restore = workspace.setDeferral({ action: "restore" });
+    const restoreRequest = parseSentSessionMessage(ws.sent.at(-1));
+    expect(restoreRequest).toMatchObject({
+      type: "workspace.deferral.set.request",
+      workspaceId: workspace.id,
+      action: "restore",
+    });
+    ws.message(
+      sessionMessage({
+        type: "workspace.deferral.set.response",
+        payload: { requestId: restoreRequest.requestId, success: true, error: null },
+      }),
+    );
+    await restore;
+    expect(workspace.current()).toEqual(workspaceRow);
+
+    const cancel = agent.setLimitRecovery({
+      workspaceId: workspace.id,
+      turnId: "failed-turn",
+      action: "cancel",
+    });
+    const cancelRequest = parseSentSessionMessage(ws.sent.at(-1));
+    expect(cancelRequest).toMatchObject({
+      type: "agent.limit.recovery.request",
+      workspaceId: workspace.id,
+      agentId: agent.id,
+      turnId: "failed-turn",
+      action: "cancel",
+    });
+    ws.message(
+      sessionMessage({
+        type: "agent.limit.recovery.response",
+        payload: { requestId: cancelRequest.requestId, success: true, error: null },
+      }),
+    );
+    await cancel;
+    expect(agent.current()).toEqual(snapshot);
+  } finally {
+    await client.close();
+  }
+});
+
 test("agent handles send permission responses for their agent", async () => {
   const { client, ws } = await connectClient();
 

@@ -37,6 +37,7 @@ import type {
 } from "@getpaseo/protocol/agent-types";
 import type {
   AgentBackgroundWorkSummary,
+  AgentSnapshotPayload,
   PendingSubagentInbox,
   ServerInfoStatusPayload,
   ProjectPlacementPayload,
@@ -96,6 +97,8 @@ export interface Agent {
   usageScopeKey?: string;
   lastUsage?: AgentUsage;
   lastError?: string | null;
+  conversationLimit?: AgentSnapshotPayload["conversationLimit"];
+  rateLimitContinuation?: AgentSnapshotPayload["rateLimitContinuation"];
   title: string | null;
   cwd: string;
   workspaceId?: string;
@@ -136,6 +139,8 @@ export interface WorkspaceDescriptor {
   name: string;
   title?: string | null;
   pinnedAt?: string | null;
+  snoozedUntil?: WorkspaceDescriptorPayload["snoozedUntil"];
+  parkedAt?: WorkspaceDescriptorPayload["parkedAt"];
   labels?: string[];
   status: WorkspaceDescriptorPayload["status"];
   statusEnteredAt: Date | null;
@@ -184,6 +189,8 @@ export function normalizeWorkspaceDescriptor(
     name: payload.name,
     title: payload.title ?? null,
     pinnedAt: payload.pinnedAt ?? null,
+    ...(payload.snoozedUntil ? { snoozedUntil: payload.snoozedUntil } : {}),
+    ...(payload.parkedAt ? { parkedAt: payload.parkedAt } : {}),
     // COMPAT(workspaceLabels): old daemons omit assignments.
     labels: payload.labels ?? [],
     status: payload.status,

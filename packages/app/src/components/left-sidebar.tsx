@@ -59,6 +59,7 @@ import { SidebarNavRows, useVisibleSidebarNavItems } from "@/components/sidebar/
 import { SidebarFooterIconHighlight } from "@/components/sidebar/sidebar-footer-icon-highlight";
 import { SidebarHelpMenu } from "@/components/sidebar/sidebar-help-menu";
 import { SidebarFooterOverflowMenu } from "@/components/sidebar/sidebar-footer-overflow-menu";
+import { useDeferredWorkspaceRows } from "@/workspace-deferral/directory";
 import {
   resolveSidebarFooterLayout,
   SIDEBAR_FOOTER_ACTIONS,
@@ -451,16 +452,23 @@ function SidebarFooter({
   const handleRowLayout = useCallback((event: LayoutChangeEvent) => {
     setRowWidth(event.nativeEvent.layout.width);
   }, []);
-  const { inline, overflow } = useMemo(
-    () =>
-      resolveSidebarFooterLayout({
-        rowWidth,
-        controlSize: TOOLBAR_CONTROL_SIZES[controlSizingForLayout(isCompactLayout)],
-        rowPadding: FOOTER_ROW_PADDING,
-        actions: SIDEBAR_FOOTER_ACTIONS,
-      }),
-    [rowWidth, isCompactLayout],
-  );
+  const deferredWorkspaces = useDeferredWorkspaceRows();
+  const showDeferralMenu = deferredWorkspaces.length > 0;
+  const { inline, overflow } = useMemo(() => {
+    const controlSize = TOOLBAR_CONTROL_SIZES[controlSizingForLayout(isCompactLayout)];
+    const fullWidth = FOOTER_ROW_PADDING * 2 + controlSize * SIDEBAR_FOOTER_ACTIONS.length;
+    // The exploration menu needs the same slot as the overflow caret.
+    const layoutWidth =
+      showDeferralMenu && rowWidth < fullWidth + controlSize
+        ? Math.min(rowWidth, fullWidth - 1)
+        : rowWidth;
+    return resolveSidebarFooterLayout({
+      rowWidth: layoutWidth,
+      controlSize,
+      rowPadding: FOOTER_ROW_PADDING,
+      actions: SIDEBAR_FOOTER_ACTIONS,
+    });
+  }, [rowWidth, isCompactLayout, showDeferralMenu]);
   const isInline = (action: SidebarFooterAction) => inline.includes(action);
 
   // One line of icons: Add project, Usage, Hosts, then Help and Settings at the end. Actions that
@@ -493,9 +501,10 @@ function SidebarFooter({
           ) : null}
           <View style={styles.footerSpacer} />
           {isInline("help") ? <SidebarHelpMenu /> : null}
-          {overflow.length > 0 ? (
+          {overflow.length > 0 || (rowWidth > 0 && showDeferralMenu) ? (
             <SidebarFooterOverflowMenu
               actions={overflow}
+              deferredWorkspaces={deferredWorkspaces}
               labels={labels}
               onAddProject={handleOpenProject}
               onSettings={handleSettings}

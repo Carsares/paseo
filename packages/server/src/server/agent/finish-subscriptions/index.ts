@@ -98,6 +98,10 @@ export interface FinishSubscriptions {
     address: Pick<FinishSubscription, "childAgentId" | "callerAgentId" | "callerServerId">,
     reportId: string,
   ): Promise<boolean>;
+  readConfirmedParentReport(
+    address: Pick<FinishSubscription, "childAgentId" | "callerAgentId" | "callerServerId">,
+    reportId: string,
+  ): Promise<AgentExplicitFinishReport | undefined>;
   suppressRemoteFinished?(
     address: Pick<FinishSubscription, "childAgentId" | "callerAgentId" | "serverId">,
     turnId: string,
@@ -1048,6 +1052,31 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     for (const records of groups.values()) attach(records, false);
   }
 
+  const readConfirmedParentReport: FinishSubscriptions["readConfirmedParentReport"] = (
+    address,
+    reportId,
+  ) =>
+    serializeReports(async () => {
+      const reports = deps.followups?.reports;
+      if (!reports) return undefined;
+      const expected = key(address);
+      const identity = decodeParentReportIdentity(reportId);
+      const record = (await reports.list()).find(
+        (entry) =>
+          entry.id === identity.id &&
+          key(entry) === expected &&
+          entry.report?.id === identity.id &&
+          entry.report.parentReportStatus !== undefined,
+      );
+      if (!record?.report?.parentReportStatus) return undefined;
+      if (reportId !== identity.id && reportId !== remoteReportId(record)) return undefined;
+      return {
+        ...record.report,
+        id: reportId,
+        parentReportStatus: record.report.parentReportStatus,
+      };
+    });
+
   return {
     isFinishedSuppressed: (id) => suppressedFinished.has(id),
     async suppressRemoteFinished(address, turnId) {
@@ -1289,6 +1318,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
                 record.supersedesFinished.push(saved.id);
             }
           }
+          report.reportedAt = new Date().toISOString();
           await deps.followups!.reports.put(record);
           for (const finishedId of record.supersedesFinished) suppressedFinished.add(finishedId);
         });
@@ -1315,23 +1345,9 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         else startRemoteReport({ ...record, callerServerId: record.callerServerId }, report);
         return id;
       }),
-    confirmParentReport: (address, reportId) =>
-      serializeReports(async () => {
-        const reports = deps.followups?.reports;
-        if (!reports) return false;
-        const expected = key(address);
-        const identity = decodeParentReportIdentity(reportId);
-        const record = (await reports.list()).find(
-          (entry) =>
-            entry.id === identity.id &&
-            key(entry) === expected &&
-            entry.report?.id === identity.id &&
-            entry.report.parentReportStatus !== undefined,
-        );
-        return (
-          record !== undefined && (reportId === identity.id || reportId === remoteReportId(record))
-        );
-      }),
+    readConfirmedParentReport,
+    confirmParentReport: async (address, reportId) =>
+      (await readConfirmedParentReport(address, reportId)) !== undefined,
     pullReports: (address, acknowledged, observe, childState, includeParentReports = false) =>
       serializeReports(async () => {
         const followups = deps.followups;

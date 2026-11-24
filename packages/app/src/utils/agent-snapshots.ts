@@ -57,6 +57,13 @@ export function derivePendingPermissionKey(
   return `${agentId}:${fallbackId}`;
 }
 
+function projectRecoveryFields(value: Pick<Agent, "conversationLimit" | "rateLimitContinuation">) {
+  return {
+    ...(value.conversationLimit ? { conversationLimit: value.conversationLimit } : {}),
+    ...(value.rateLimitContinuation ? { rateLimitContinuation: value.rateLimitContinuation } : {}),
+  };
+}
+
 export function projectAgentSnapshot(agent: Agent): AgentSnapshotPayload {
   return {
     id: agent.id,
@@ -84,6 +91,7 @@ export function projectAgentSnapshot(agent: Agent): AgentSnapshotPayload {
     ...(agent.usageScopeKey ? { usageScopeKey: agent.usageScopeKey } : {}),
     ...(agent.lastUsage ? { lastUsage: agent.lastUsage } : {}),
     ...(agent.lastError ? { lastError: agent.lastError } : {}),
+    ...projectRecoveryFields(agent),
     title: agent.title,
     labels: agent.labels,
     ...(agent.metadata ? { metadata: agent.metadata } : {}),
@@ -133,6 +141,7 @@ export function normalizeAgentSnapshot(snapshot: AgentSnapshotPayload, serverId:
     usageScopeKey: snapshot.usageScopeKey,
     lastUsage: snapshot.lastUsage,
     lastError: snapshot.lastError ?? null,
+    ...projectRecoveryFields(snapshot),
     title: snapshot.title ?? null,
     cwd: snapshot.cwd,
     workspaceId: snapshot.workspaceId,

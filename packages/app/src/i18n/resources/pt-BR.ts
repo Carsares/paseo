@@ -321,6 +321,19 @@ export const ptBR: TranslationResources = {
     },
   },
   agentPanel: {
+    limitRecovery: {
+      limited: "O limite da conversa será renovado em {{time}}.",
+      scheduled: "Esta sessão está programada para continuar em {{time}}.",
+      unknown:
+        "O provedor pode ter recebido a mensagem para continuar. Confira a conversa antes de tentar novamente.",
+      accepted: "O provedor aceitou a mensagem para continuar.",
+      cancelled: "A continuação programada foi cancelada.",
+      failed: "A sessão não pôde continuar automaticamente. Você pode tentar de novo manualmente.",
+      sleep: "Adiar até a renovação",
+      continue: "Continuar quando o limite for renovado",
+      cancel: "Cancelar continuação",
+      changed: "O limite da conversa ou o estado da continuação mudou.",
+    },
     states: {
       notFound: "Agente não encontrado",
       failedToLoad: "Falha ao carregar agente",
@@ -1485,6 +1498,23 @@ export const ptBR: TranslationResources = {
       },
     },
     workspace: {
+      deferral: {
+        menu: "Adiar ou deixar em espera",
+        snoozed: "Adiado",
+        parked: "Em espera",
+        snoozedUntil: "Adiado até {{time}}",
+        snoozedList: "Espaços de trabalho adiados",
+        parkedList: "Espaços de trabalho em espera",
+        restore: "Restaurar espaço de trabalho",
+        restoreNamed: "Restaurar {{name}} em {{host}}",
+        oneHour: "Adiar por 1 hora",
+        fourHours: "Adiar por 4 horas",
+        oneDay: "Adiar por 1 dia",
+        park: "Deixar espaço de trabalho em espera",
+        pending: "Atualizando…",
+        offline: "Conecte-se ao host para fazer alterações.",
+        error: "Não foi possível atualizar o espaço de trabalho.",
+      },
       status: {
         serviceRunning: "Serviço {{name}} em execução",
         serviceUnhealthy: "Serviço {{name}} com falha",

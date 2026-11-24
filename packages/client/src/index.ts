@@ -15,6 +15,10 @@ export type { HostAdd, HostUpdate, HostSummary, HostDirectory } from "@getpaseo/
 import type { OwnedSubscription } from "./connection/index.js";
 export type { OwnedSubscription, SubscriptionObserver } from "./connection/index.js";
 import type { DaemonClientConfig } from "./daemon-client.js";
+export type {
+  SetAgentLimitRecoveryParameters,
+  SetWorkspaceDeferralParameters,
+} from "./daemon-client.js";
 import type { AgentPermissionResponse, JsonValue } from "@getpaseo/protocol/agent-types";
 import type {
   AgentSnapshotPayload,
@@ -45,7 +49,12 @@ import type {
   WorkspaceDescriptorPayload,
   WorkspaceCreateRequest,
 } from "@getpaseo/protocol/messages";
-import { DaemonClient, type CreateAgentRequestOptions } from "./daemon-client.js";
+import {
+  DaemonClient,
+  type CreateAgentRequestOptions,
+  type SetAgentLimitRecoveryParameters,
+  type SetWorkspaceDeferralParameters,
+} from "./daemon-client.js";
 import {
   createTerminalActions,
   type PaseoTerminalActions,
@@ -214,6 +223,7 @@ export interface PaseoWorkspaceHandle {
   /** Top-level keys replace; `null` removes the key. Needs a host with `entityMetadata`. */
   setMetadata(patch: Record<string, JsonValue>): Promise<void>;
   setPinned(pinned: boolean): Promise<{ pinnedAt: string | null }>;
+  setDeferral(options: Omit<SetWorkspaceDeferralParameters, "workspaceId">): Promise<void>;
   setLabel(name: string, options: { assigned: boolean }): Promise<{ labels: string[] }>;
   setBaseBranch(options: {
     baseRef: string;
@@ -235,6 +245,7 @@ export interface PaseoProjectActions {
 }
 
 export interface PaseoWorkspaceActions {
+  supportsDeferral(): boolean;
   /** Checks the connected host's support for inclusive workspace discovery. Older SDKs omit this method. */
   supportsBackgroundWorkspaces?(): boolean;
   list(options: PaseoWorkspaceListOptions & { subscribe: {} }): Promise<
@@ -464,6 +475,7 @@ export interface PaseoAgentHandle {
    */
   reload(options?: { requestId?: string }): Promise<PaseoAgentRefetchResult | null>;
   send(text: string, options?: PaseoAgentSendOptions): Promise<void>;
+  setLimitRecovery(options: Omit<SetAgentLimitRecoveryParameters, "agentId">): Promise<void>;
   /** Sends pending subagent reports. Requires a host with `subagentInbox`. */
   flushInbox(): Promise<void>;
   /** Bind or remove a resident role for a child agent. */
@@ -938,6 +950,7 @@ export function createPaseoApi(
       },
       archive: (workspace, requestId) =>
         daemonClient.archiveWorkspace(resolveWorkspaceId(workspace), requestId),
+      supportsDeferral: () => daemonClient.supportsWorkspaceDeferral(),
       subscribe: listenWorkspaces,
     },
     agents: {
@@ -1047,6 +1060,7 @@ function createWorkspaceHandleFactory(
         if (current) current = { ...current, metadata };
       },
       setPinned: (pinned) => daemonClient.setWorkspacePinned(id, pinned),
+      setDeferral: (options) => daemonClient.setWorkspaceDeferral({ ...options, workspaceId: id }),
       setLabel: (name, options) =>
         assignWorkspaceLabel({
           client: daemonClient,
@@ -1090,6 +1104,8 @@ function createAgentHandleFactory(
     let serverId = daemonClient.getLastServerInfoMessage()?.serverId;
     const handle: PaseoAgentHandle = {
       id,
+      setLimitRecovery: (options) =>
+        daemonClient.setAgentLimitRecovery({ ...options, agentId: id }),
       get address() {
         serverId ??= daemonClient.getLastServerInfoMessage()?.serverId;
         if (!serverId) throw new Error("Connect to a host before obtaining an agent address");

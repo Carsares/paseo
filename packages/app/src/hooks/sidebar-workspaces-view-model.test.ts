@@ -13,6 +13,7 @@ import {
   createSidebarWorkspaceEntry,
   deriveProjectStatusBucket,
   deriveSidebarLoadingState,
+  filterDeferredSidebarProjects,
   shouldShowSidebarHostLabels,
   type ProjectStatusSession,
   type SidebarProjectEntry,
@@ -298,6 +299,34 @@ describe("buildSidebarProjectsFromStructure", () => {
 });
 
 describe("shared sidebar workspace model", () => {
+  it("filters project placements by host and ID and shows an authoritatively restored workspace", () => {
+    const stamp = "2030-01-01T01:00:00.000Z";
+    const main = projectWorkspace("same", "attention");
+    const first = createSidebarWorkspaceEntry({
+      serverId: "host-a",
+      workspace: { ...main, snoozedUntil: stamp },
+    });
+    const second = createSidebarWorkspaceEntry({ serverId: "host-b", workspace: main });
+    const projects: SidebarProjectEntry[] = [
+      {
+        viewKey: "project-a",
+        projectName: "Project",
+        projectKind: "git",
+        iconWorkingDir: "/repo",
+        hosts: [],
+        workspaces: [first, second],
+      },
+    ];
+    const entries = new Map([
+      [first.workspaceKey, first],
+      [second.workspaceKey, second],
+    ]);
+    expect(filterDeferredSidebarProjects(projects, entries)[0].workspaces).toEqual([second]);
+    const restored = createSidebarWorkspaceEntry({ serverId: "host-a", workspace: main });
+    entries.set(restored.workspaceKey, restored);
+    expect(filterDeferredSidebarProjects(projects, entries)).toBe(projects);
+  });
+
   it("feeds project placement and status grouping from the same cross-host workspace identities", () => {
     const model = buildSidebarWorkspacePlacementModel({
       projects: [

@@ -46,7 +46,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage, Server as HTTPServer } from "http";
 import { join } from "path";
 import { getHostName } from "./host-name.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import {
   AgentRunCancellationError,
@@ -546,8 +546,24 @@ type AgentFinishReportConfirmResponse = Extract<
 >;
 type AgentFinishReportConfirmResult = Pick<
   AgentFinishReportConfirmResponse["payload"],
-  "accepted" | "error"
+  "accepted" | "error" | "confirmedReport"
 >;
+
+type ConfirmedAgentFinishReport = NonNullable<AgentFinishReportConfirmResult["confirmedReport"]>;
+
+function parentReportFingerprint(report: AgentFinishReport): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        report.id,
+        report.parentReportStatus,
+        report.title,
+        report.prompt,
+        report.event,
+      ]),
+    )
+    .digest("hex");
+}
 
 interface PendingAgentFinishReportConfirmation {
   childAgentId: string;
@@ -2343,6 +2359,7 @@ export class VoiceAssistantWebSocketServer {
         directorySync: true,
         // COMPAT(workspaceLabels): added in v0.5.0, remove after 2027-08-14.
         ...(this.workspaceLabelService ? { workspaceLabels: true } : {}),
+        ...(session.supportsWorkspaceDeferral() ? { workspaceDeferral: true } : {}),
         terminalCollection: true,
         // COMPAT(workspaceSetupRun): added in v0.7.3, remove gate after 2027-09-02.
         workspaceSetupRun: true,
@@ -3044,7 +3061,7 @@ export class VoiceAssistantWebSocketServer {
   private async confirmParentReport(
     request: AgentFinishReportConfirmRequest,
   ): Promise<AgentFinishReportConfirmResult> {
-    const accepted = await this.finishSubscriptions?.confirmParentReport(
+    const confirmedReport = await this.finishSubscriptions?.readConfirmedParentReport(
       {
         childAgentId: request.childAgentId,
         callerAgentId: request.parentAgentId,
@@ -3052,7 +3069,8 @@ export class VoiceAssistantWebSocketServer {
       },
       request.reportId,
     );
-    if (!accepted) return { accepted: false, error: "The parent report is no longer registered." };
+    if (!confirmedReport)
+      return { accepted: false, error: "The parent report is no longer registered." };
     // Report lookup can wait for storage. Read the relationship after that wait.
     const child =
       this.agentManager.getAgent(request.childAgentId) ??
@@ -3061,13 +3079,20 @@ export class VoiceAssistantWebSocketServer {
     if (parent?.agentId !== request.parentAgentId || parent.serverId !== request.parentServerId) {
       return { accepted: false, error: "The child is no longer assigned to this parent." };
     }
-    return { accepted: true, error: null };
+    return {
+      accepted: true,
+      error: null,
+      confirmedReport: {
+        fingerprint: parentReportFingerprint(confirmedReport),
+        reportedAt: confirmedReport.reportedAt,
+      },
+    };
   }
 
   private async requestParentReportConfirmation(
     ws: VirtualHostSocket,
     request: AgentFinishReportConfirmRequest,
-  ): Promise<void> {
+  ): Promise<ConfirmedAgentFinishReport | undefined> {
     const pending = this.pendingAgentFinishReportConfirmations.get(ws) ?? new Map();
     this.pendingAgentFinishReportConfirmations.set(ws, pending);
     const response = await new Promise<AgentFinishReportConfirmResponse>((resolve, reject) => {
@@ -3110,6 +3135,7 @@ export class VoiceAssistantWebSocketServer {
         response.payload.error ?? "The parent report was rejected.",
       );
     }
+    return response.payload.confirmedReport;
   }
 
   private allowsDirectParentReportPush(
@@ -3270,7 +3296,7 @@ export class VoiceAssistantWebSocketServer {
     report: AgentFinishReport,
     options: {
       childServerId?: string;
-      confirmBeforeDispatch?: () => Promise<void>;
+      confirmBeforeDispatch?: () => Promise<ConfirmedAgentFinishReport | undefined>;
     } = {},
   ): Promise<void> {
     const explicit = report.parentReportStatus !== undefined;
@@ -3335,7 +3361,15 @@ export class VoiceAssistantWebSocketServer {
       },
       send: async (beforeProviderDispatch, declined, onProviderOutcome) => {
         await validateDispatch?.();
-        if (options.confirmBeforeDispatch) await options.confirmBeforeDispatch();
+        const confirmed = await options.confirmBeforeDispatch?.();
+        if (confirmed && confirmed.fingerprint !== parentReportFingerprint(report)) {
+          throw new ParentReportRecipientUnavailableError(
+            "The push does not match the stored parent report.",
+          );
+        }
+        const reportedAt = options.confirmBeforeDispatch
+          ? confirmed?.reportedAt
+          : report.reportedAt;
         if (explicit && record.serverId)
           await this.applyRemoteReportSupersession(record, report.id);
         const subagentInbox =
@@ -3345,6 +3379,18 @@ export class VoiceAssistantWebSocketServer {
             ? await this.classifySubagentInbox(record.callerAgentId, source)
             : undefined;
         assertNotSuperseded();
+        // The explicit report is persisted by the child and its ownership was confirmed above.
+        if (report.parentReportStatus === "blocked" && reportedAt) {
+          await this.agentManager.notifyPersistedBlockedSubagentReport(
+            record.callerAgentId,
+            JSON.stringify([
+              childServerId,
+              record.childAgentId,
+              decodeParentReportIdentity(report.id).id,
+            ]),
+            reportedAt,
+          );
+        }
         const receipt = this.agentMessages.enqueue({
           recipientId: record.callerAgentId,
           messageId,
@@ -3421,7 +3467,7 @@ export class VoiceAssistantWebSocketServer {
         confirmBeforeDispatch: async () => {
           const socket = this.parentReportSockets.get(routeKey);
           if (!socket) throw new ParentReportConfirmationUnavailableError();
-          await this.requestParentReportConfirmation(socket, {
+          return this.requestParentReportConfirmation(socket, {
             type: "agent.finish_reports.confirm.request",
             requestId: randomUUID(),
             childAgentId: request.childAgentId,

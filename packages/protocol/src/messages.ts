@@ -944,7 +944,25 @@ export const PendingSubagentInboxSchema = z.object({
 
 export type PendingSubagentInbox = z.infer<typeof PendingSubagentInboxSchema>;
 
+const conversationLimitFields = {
+  conversationLimit: z
+    .object({
+      turnId: z.string(),
+      limitId: z.string(),
+      resetsAt: z.iso.datetime(),
+    })
+    .optional(),
+  rateLimitContinuation: z
+    .object({
+      turnId: z.string(),
+      runAt: z.iso.datetime(),
+      status: z.enum(["scheduled", "unknown", "accepted", "cancelled", "failed"]),
+    })
+    .optional(),
+};
+
 export const AgentSnapshotPayloadSchema = z.object({
+  ...conversationLimitFields,
   id: z.string(),
   provider: AgentProviderSchema,
   cwd: z.string(),
@@ -993,6 +1011,7 @@ export const AgentSnapshotPayloadSchema = z.object({
 export type AgentSnapshotPayload = z.infer<typeof AgentSnapshotPayloadSchema>;
 
 export const AgentListItemPayloadSchema = z.object({
+  ...conversationLimitFields,
   id: z.string(),
   shortId: z.string(),
   title: z.string().nullable(),
@@ -1148,6 +1167,26 @@ export const WorkspaceMetadataUpdateRequestSchema = z.object({
   patch: EntityMetadataSchema,
   requestId: z.string(),
 });
+
+export const WorkspaceDeferralSetRequestSchema = z.object({
+  type: z.literal("workspace.deferral.set.request"),
+  workspaceId: z.string().min(1),
+  action: z.enum(["snooze", "park", "restore"]),
+  snoozedUntil: z.iso.datetime().optional(),
+  requestId: z.string(),
+});
+
+export const AgentLimitRecoveryRequestSchema = z.object({
+  type: z.literal("agent.limit.recovery.request"),
+  workspaceId: z.string().min(1),
+  agentId: z.string().min(1),
+  turnId: z.string().min(1),
+  action: z.enum(["sleep", "continue", "cancel"]),
+  requestId: z.string(),
+});
+
+export type WorkspaceDeferralSetRequest = z.infer<typeof WorkspaceDeferralSetRequestSchema>;
+export type AgentLimitRecoveryRequest = z.infer<typeof AgentLimitRecoveryRequestSchema>;
 
 export const WorkspacePinSetRequestSchema = z.object({
   type: z.literal("workspace.pin.set.request"),
@@ -2518,6 +2557,7 @@ export const AgentFinishReportSchema = z.object({
   title: z.string(),
   event: z.enum(["finished", "errored", "permission-required", "closed"]),
   parentReportStatus: AgentReportStatusSchema.optional(),
+  reportedAt: z.iso.datetime().optional(),
 });
 export type AgentFinishReport = z.infer<typeof AgentFinishReportSchema>;
 export const AgentExplicitFinishReportSchema = AgentFinishReportSchema.extend({
@@ -2577,6 +2617,9 @@ export const AgentConfirmFinishReportResponseSchema = z.object({
     parentAgentId: z.string().min(1),
     reportId: z.string().min(1),
     accepted: z.boolean(),
+    confirmedReport: z
+      .object({ fingerprint: z.string(), reportedAt: z.iso.datetime().optional() })
+      .optional(),
     error: z.string().nullable(),
   }),
 });
@@ -2730,6 +2773,25 @@ export const WorkspaceMetadataUpdateResponseSchema = z.object({
     error: z.string().nullable(),
   }),
 });
+
+const WorkspaceDeferralResultSchema = z.object({
+  requestId: z.string(),
+  success: z.boolean(),
+  error: z.string().nullable(),
+});
+
+export const WorkspaceDeferralSetResponseSchema = z.object({
+  type: z.literal("workspace.deferral.set.response"),
+  payload: WorkspaceDeferralResultSchema,
+});
+
+export const AgentLimitRecoveryResponseSchema = z.object({
+  type: z.literal("agent.limit.recovery.response"),
+  payload: WorkspaceDeferralResultSchema,
+});
+
+export type WorkspaceDeferralSetResponse = z.infer<typeof WorkspaceDeferralSetResponseSchema>;
+export type AgentLimitRecoveryResponse = z.infer<typeof AgentLimitRecoveryResponseSchema>;
 
 export const WorkspacePinSetResponsePayloadSchema = z.object({
   requestId: z.string(),
@@ -3985,6 +4047,8 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceTitleSetRequestSchema,
   AgentMetadataUpdateRequestSchema,
   WorkspaceMetadataUpdateRequestSchema,
+  WorkspaceDeferralSetRequestSchema,
+  AgentLimitRecoveryRequestSchema,
   WorkspacePinSetRequestSchema,
   WorkspaceBaseBranchSetRequestSchema,
   WorkspaceLabelListRequestSchema,
@@ -4383,6 +4447,7 @@ export const ServerInfoStatusPayloadSchema = z
         internalAgents: z.boolean().optional(),
         // COMPAT(internalWorkspaces): added in v0.9.0; remove gate after 2027-03-17.
         internalWorkspaces: z.boolean().optional(),
+        workspaceDeferral: z.boolean().optional(),
         backgroundWorkspaces: z.boolean().optional(),
         // COMPAT(backgroundAgents): added in v0.15.0; remove gate after 2027-05-03.
         backgroundAgents: z.boolean().optional(),
@@ -4966,6 +5031,8 @@ export const WorkspaceDescriptorPayloadSchema = z
     // its input and offer a "reset to branch name" action. Null means the name
     // is derived from the branch/directory.
     title: z.string().nullable().optional(),
+    snoozedUntil: z.iso.datetime().optional(),
+    parkedAt: z.iso.datetime().optional(),
     // COMPAT(workspacePinning): added in v0.1.107, remove optional after 2027-01-12.
     pinnedAt: z.string().nullable().optional(),
     // COMPAT(workspaceLabels): added in v0.5.0, remove optional after 2027-08-14.
@@ -8290,6 +8357,8 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   WorkspaceTitleSetResponseSchema,
   AgentMetadataUpdateResponseSchema,
   WorkspaceMetadataUpdateResponseSchema,
+  WorkspaceDeferralSetResponseSchema,
+  AgentLimitRecoveryResponseSchema,
   WorkspacePinSetResponseSchema,
   WorkspaceBaseBranchSetResponseSchema,
   WorkspaceRecoveryInspectResponseSchema,

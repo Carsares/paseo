@@ -321,6 +321,19 @@ export const ja: TranslationResources = {
     },
   },
   agentPanel: {
+    limitRecovery: {
+      limited: "会話の利用枠は {{time}} にリセットされます。",
+      scheduled: "このセッションは {{time}} に再開する予定です。",
+      unknown:
+        "プロバイダーが再開メッセージを受け取った可能性があります。再試行する前に会話を確認してください。",
+      accepted: "プロバイダーが再開メッセージを受け付けました。",
+      cancelled: "予約した再開を取り消しました。",
+      failed: "セッションを自動で再開できませんでした。手動で再試行できます。",
+      sleep: "リセットまで非表示",
+      continue: "リセット後に再開",
+      cancel: "再開を取り消す",
+      changed: "会話の利用枠または再開の状態が変わりました。",
+    },
     states: {
       notFound: "エージェントが見つかりません",
       failedToLoad: "エージェントの読み込みに失敗しました",
@@ -1472,6 +1485,23 @@ export const ja: TranslationResources = {
       },
     },
     workspace: {
+      deferral: {
+        menu: "一時非表示・保留",
+        snoozed: "一時非表示中",
+        parked: "保留中",
+        snoozedUntil: "{{time}} まで非表示",
+        snoozedList: "一時非表示のワークスペース",
+        parkedList: "保留中のワークスペース",
+        restore: "ワークスペースを戻す",
+        restoreNamed: "{{host}} の {{name}} を戻す",
+        oneHour: "1 時間非表示",
+        fourHours: "4 時間非表示",
+        oneDay: "1 日非表示",
+        park: "ワークスペースを保留",
+        pending: "更新中…",
+        offline: "変更するにはホストに接続してください。",
+        error: "ワークスペースを更新できませんでした。",
+      },
       status: {
         serviceRunning: "サービス {{name}} 実行中",
         serviceUnhealthy: "サービス {{name}} 異常",

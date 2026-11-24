@@ -190,6 +190,98 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
+test("workspace deferral sends correlated writes and preserves recovery conflicts", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "deferral-unit",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: { workspaceDeferral: true } });
+  await connecting;
+
+  const snoozedUntil = "2030-01-01T01:00:00.000Z";
+  const workspace = client.setWorkspaceDeferral({
+    workspaceId: "workspace",
+    action: "snooze",
+    snoozedUntil,
+  });
+  const workspaceRequest = parseSentFrame(mock.sent.at(-1));
+  expect(workspaceRequest).toEqual({
+    type: "workspace.deferral.set.request",
+    requestId: expect.any(String),
+    workspaceId: "workspace",
+    action: "snooze",
+    snoozedUntil,
+  });
+  const recovery = client.setAgentLimitRecovery({
+    workspaceId: "workspace",
+    agentId: "agent",
+    turnId: "failed-turn",
+    action: "continue",
+  });
+  const recoveryRequest = parseSentFrame(mock.sent.at(-1));
+  expect(recoveryRequest).toEqual({
+    type: "agent.limit.recovery.request",
+    requestId: expect.any(String),
+    workspaceId: "workspace",
+    agentId: "agent",
+    turnId: "failed-turn",
+    action: "continue",
+  });
+  expect(recoveryRequest.requestId).not.toEqual(workspaceRequest.requestId);
+  const rejection = expect(recovery).rejects.toThrow("The failed turn changed.");
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.limit.recovery.response",
+      payload: {
+        requestId: recoveryRequest.requestId,
+        success: false,
+        error: "The failed turn changed.",
+      },
+    }),
+  );
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "workspace.deferral.set.response",
+      payload: { requestId: workspaceRequest.requestId, success: true, error: null },
+    }),
+  );
+  await rejection;
+  await expect(workspace).resolves.toBeUndefined();
+});
+
+test("workspace deferral and recovery do not send requests to an old host", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "deferral-old-host",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen();
+  await connecting;
+  const sentBefore = mock.sent.length;
+
+  await expect(
+    client.setWorkspaceDeferral({ workspaceId: "workspace", action: "restore" }),
+  ).rejects.toThrow("Update the host");
+  await expect(
+    client.setAgentLimitRecovery({
+      workspaceId: "workspace",
+      agentId: "agent",
+      turnId: "turn",
+      action: "cancel",
+    }),
+  ).rejects.toThrow("Update the host");
+  expect(mock.sent).toHaveLength(sentBefore);
+});
+
 test("traces WebSocket frames, message types, and JSON parse duration", async () => {
   const mock = createMockTransport();
   const recorder = createTraceRecorder();

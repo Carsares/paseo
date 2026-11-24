@@ -35,6 +35,54 @@ function workspace(id: string, projectId = "project"): WorkspaceDescriptorPayloa
   };
 }
 
+it("replaces cached deferral on a new snapshot and leaves another host's same workspace id alone", () => {
+  const host = "workspace-deferral-replica";
+  const other = "workspace-deferral-replica-other";
+  const store = useSessionStore.getState();
+  store.initializeSession(host, null);
+  store.initializeSession(other, null);
+  try {
+    const reader = new WorkspaceDirectoryReplica(host);
+    const writer = new WorkspaceDirectoryReplica(other);
+    const record = workspace("same");
+    const snoozedUntil = "2030-01-01T01:00:00.000Z";
+    const parkedAt = "2026-11-24T01:00:00.000Z";
+    reader.commitCached({
+      workspaces: new Map([["same", normalizeWorkspaceDescriptor({ ...record, snoozedUntil })]]),
+      projects: new Map(),
+    });
+    writer.applyDelta({ kind: "upsert", workspace: { ...record, parkedAt } });
+    expect(useSessionStore.getState().sessions[host]?.workspaces.get("same")?.snoozedUntil).toBe(
+      snoozedUntil,
+    );
+
+    reader.commitSnapshot(
+      {
+        workspaces: new Map([["same", normalizeWorkspaceDescriptor(record)]]),
+        projects: new Map(),
+      },
+      [],
+    );
+    expect(useSessionStore.getState().sessions[host]?.workspaces.get("same")).not.toHaveProperty(
+      "snoozedUntil",
+    );
+    expect(useSessionStore.getState().sessions[other]?.workspaces.get("same")?.parkedAt).toBe(
+      parkedAt,
+    );
+    reader.applyDelta({ kind: "upsert", workspace: { ...record, parkedAt } });
+    expect(useSessionStore.getState().sessions[host]?.workspaces.get("same")?.parkedAt).toBe(
+      parkedAt,
+    );
+    reader.applyDelta({ kind: "upsert", workspace: record });
+    expect(useSessionStore.getState().sessions[host]?.workspaces.get("same")).not.toHaveProperty(
+      "parkedAt",
+    );
+  } finally {
+    store.clearSession(host);
+    store.clearSession(other);
+  }
+});
+
 it("commits workspace and project-parent state with filtered removals", () => {
   const serverId = "workspace-replica";
   const store = useSessionStore.getState();

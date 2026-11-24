@@ -49,7 +49,7 @@ const PersistedProjectRecordSchema = z.object({
   archivedAt: z.string().nullable(),
 });
 
-const PersistedWorkspaceRecordSchema = z.object({
+const PersistedWorkspaceRecordFieldsSchema = z.object({
   parentWorkspaceId: z.string().optional(),
   workspaceId: z.string(),
   projectId: z.string(),
@@ -106,6 +106,10 @@ const PersistedWorkspaceRecordSchema = z.object({
     .nullable()
     .optional()
     .transform((value) => value ?? null),
+  snoozedUntil: z.iso.datetime().optional(),
+  parkedAt: z.iso.datetime().optional(),
+  deferralRevision: z.string().optional(),
+  deferralStartedAt: z.iso.datetime().optional(),
   labels: z.array(z.string()).optional(),
   // Plugin-owned data. Paseo stores it and never reads a key.
   metadata: z.record(z.string(), z.custom<JsonValue>()).default({}),
@@ -113,6 +117,11 @@ const PersistedWorkspaceRecordSchema = z.object({
   // Public discovery visibility. Contents retain their ordinary lifecycle.
   background: z.boolean().optional().default(false),
 });
+
+const PersistedWorkspaceRecordSchema = PersistedWorkspaceRecordFieldsSchema.refine(
+  (record) => !(record.snoozedUntil && record.parkedAt),
+  { message: "A workspace cannot be both snoozed and parked" },
+);
 
 export type PersistedProjectRecord = z.infer<typeof PersistedProjectRecordSchema>;
 export type PersistedWorkspaceRecord = z.infer<typeof PersistedWorkspaceRecordSchema>;
@@ -591,6 +600,10 @@ export class FileBackedWorkspaceRegistry
           ...existing,
           updatedAt: archivedAt,
           archivedAt,
+          snoozedUntil: undefined,
+          parkedAt: undefined,
+          deferralRevision: undefined,
+          deferralStartedAt: undefined,
           head: context?.head,
           ...(context?.autoArchivedChangeRequestUrl
             ? { autoArchivedChangeRequestUrl: context.autoArchivedChangeRequestUrl }

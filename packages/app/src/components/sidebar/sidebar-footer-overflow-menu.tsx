@@ -29,6 +29,12 @@ import { orderHostsLocalFirst } from "@/types/host-connection";
 import { useOpenSidebarUsage } from "@/usage";
 import { SidebarFooterMenuTrigger } from "./sidebar-footer-menu-trigger";
 import { SidebarHelpMenuItems } from "./sidebar-help-menu";
+import {
+  DEFERRED_WORKSPACE_PAGES,
+  DeferredWorkspaceMenuPage,
+  deferredWorkspacePageId,
+} from "./sidebar-workspace-deferral-menu";
+import type { DeferredWorkspaceRow } from "@/workspace-deferral/directory";
 
 const mutedIconMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 const ThemedFolderPlus = withUnistyles(FolderPlus);
@@ -50,6 +56,7 @@ const HELP_PAGE_ID = "help";
 export interface SidebarFooterOverflowMenuProps {
   /** The footer actions that did not fit in the row, in row order. */
   actions: readonly SidebarFooterAction[];
+  deferredWorkspaces: DeferredWorkspaceRow[];
   labels: { addProject: string; hosts: string; settings: string; usage: string };
   onAddProject: () => void;
   onSettings: () => void;
@@ -64,6 +71,7 @@ export interface SidebarFooterOverflowMenuProps {
  */
 export function SidebarFooterOverflowMenu({
   actions,
+  deferredWorkspaces,
   labels,
   onAddProject,
   onSettings,
@@ -76,6 +84,22 @@ export function SidebarFooterOverflowMenu({
   const newAgentKeys = useShortcutKeys("new-agent");
   const settingsKeys = useShortcutKeys("toggle-settings");
   const helpLabel = t("sidebar.help.trigger");
+  const deferredPages = useMemo(
+    () =>
+      DEFERRED_WORKSPACE_PAGES.flatMap((kind) => {
+        const rows = deferredWorkspaces.filter((row) => row.kind === kind);
+        return rows.length
+          ? [
+              {
+                id: deferredWorkspacePageId(kind),
+                title: t(`sidebar.workspace.deferral.${kind}List`),
+                content: <DeferredWorkspaceMenuPage rows={rows} />,
+              },
+            ]
+          : [];
+      }),
+    [deferredWorkspaces, t],
+  );
   const addProjectTrailing = useMemo(
     () => (newAgentKeys ? <Shortcut chord={newAgentKeys} /> : null),
     [newAgentKeys],
@@ -97,8 +121,8 @@ export function SidebarFooterOverflowMenu({
     if (actions.includes("help")) {
       result.push({ id: HELP_PAGE_ID, title: helpLabel, content: <SidebarHelpMenuItems /> });
     }
-    return result;
-  }, [actions, helpLabel, labels.hosts, onAddHost, onOpenHostSettings]);
+    return [...result, ...deferredPages];
+  }, [actions, deferredPages, helpLabel, labels.hosts, onAddHost, onOpenHostSettings]);
 
   function renderAction(action: SidebarFooterAction): ReactElement {
     switch (action) {
@@ -180,6 +204,12 @@ export function SidebarFooterOverflowMenu({
         testID="sidebar-footer-overflow-menu"
       >
         {actions.map(renderAction)}
+        {actions.length && deferredPages.length ? <DropdownMenuSeparator /> : null}
+        {deferredPages.map(({ id, title }) => (
+          <DropdownMenuSubTrigger key={id} id={id} testID={id}>
+            {title}
+          </DropdownMenuSubTrigger>
+        ))}
       </DropdownMenuContent>
     </DropdownMenu>
   );

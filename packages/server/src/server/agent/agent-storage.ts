@@ -9,6 +9,11 @@ import {
   isSideChatAgentLabels,
 } from "@getpaseo/protocol/agent-labels";
 
+import { FailedConversationLimitSchema } from "../workspace-deferral/agent-limit-evidence.js";
+import {
+  AgentLimitContinuationSchema,
+  type AgentLimitContinuation,
+} from "../workspace-deferral/continuation-state.js";
 import { writeJsonFileAtomic } from "../atomic-file.js";
 import { AgentFeatureSchema, AgentOptionControlSchema, AgentStatusSchema } from "../messages.js";
 import { toStoredAgentRecord } from "./agent-projections.js";
@@ -87,6 +92,8 @@ const RAW_STORED_AGENT_SCHEMA = z.object({
   persistence: PERSISTENCE_HANDLE_SCHEMA,
   timelinePrefixSwitchId: z.string().nullable().optional(),
   lastError: z.string().nullable().optional(),
+  failedConversationLimit: FailedConversationLimitSchema.optional(),
+  limitContinuation: AgentLimitContinuationSchema.optional(),
   requiresAttention: z.boolean().optional(),
   attentionReason: z.enum(["finished", "error", "permission"]).nullable().optional(),
   attentionTimestamp: z.string().nullable().optional(),
@@ -329,6 +336,22 @@ export class AgentStorage {
     await this.queueRecordWrite(record);
   }
 
+  async updateLimitContinuation(
+    agentId: string,
+    mutate: (record: StoredAgentRecord) => AgentLimitContinuation | null,
+  ): Promise<StoredAgentRecord | null> {
+    await this.load();
+    let updated: StoredAgentRecord | null = null;
+    await this.queueRecordMutation(agentId, (record) => {
+      if (!record) return null;
+      const next = mutate(record);
+      if (!next) return null;
+      updated = { ...record, limitContinuation: next };
+      return updated;
+    });
+    return updated;
+  }
+
   async setRunningAgentRecovery(agentId: string, resumeOnStartup: boolean): Promise<boolean> {
     await this.load();
     let captured = false;
@@ -355,7 +378,10 @@ export class AgentStorage {
   }
 
   private queueRecordWrite(record: StoredAgentRecord): Promise<void> {
-    return this.queueRecordMutation(record.id, () => record);
+    return this.queueRecordMutation(record.id, (existing) => ({
+      ...record,
+      limitContinuation: existing?.limitContinuation,
+    }));
   }
 
   private queueRecordMutation(
@@ -372,6 +398,13 @@ export class AgentStorage {
       const record = mutate(existing);
       if (record) {
         // Provider snapshots and lifecycle updates cannot clear first-prompt evidence.
+        record.limitContinuation ??= existing?.limitContinuation;
+        if (record.archivedAt) {
+          record.failedConversationLimit = undefined;
+          if (record.limitContinuation?.status === "scheduled") {
+            record.limitContinuation = { ...record.limitContinuation, status: "cancelled" };
+          }
+        }
         await this.writeRecord(
           existing?.sideChatPromptAccepted ? { ...record, sideChatPromptAccepted: true } : record,
         );

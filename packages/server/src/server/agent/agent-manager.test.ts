@@ -24,7 +24,7 @@ import {
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage, parseStoredAgentRecord } from "./agent-storage.js";
-import { AgentTurnStartCanceledError } from "./agent-sdk-types.js";
+import { AgentTurnStartCanceledError, AgentTurnStartRejectedError } from "./agent-sdk-types.js";
 import { ForegroundPromptStart } from "./agent-run-state.js";
 import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
 import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
@@ -17727,3 +17727,319 @@ function dispatchStarted(dispatch: Awaited<ReturnType<typeof startAgentRun>>): P
   void dispatch.started.catch(() => undefined);
   return dispatch.started;
 }
+
+test.each([
+  "accepted",
+  "unknown",
+  "manual",
+  "manual-race",
+  "archive-race",
+  "override",
+  "new-host",
+  "reconfigured",
+  "rejected",
+  "model-round-trip",
+  "reset-closed",
+  "reset-live",
+] as const)(
+  "workspace limit recovery survives restart and settles a %s dispatch once",
+  async (outcome) => {
+    const { FileBackedWorkspaceRegistry, createPersistedWorkspaceRecord } =
+      await import("../workspace-registry.js");
+    const { WorkspaceDeferral } = await import("../workspace-deferral/deferral.js");
+    const { AgentLimitRecovery } = await import("../schedule/agent-limit-recovery.js");
+    const { MessageReceipts } = await import("../message-receipts/index.js");
+    const { isWorkspaceArchivePending, trackExternalWorkspaceArchive } =
+      await import("../session.js");
+    const cwd = mkdtempSync(join(tmpdir(), "paseo-limit-recovery-"));
+    onTestFinished(() => rmSync(cwd, { recursive: true, force: true }));
+    const workspaceId = "work-original";
+    const sessionId = "persisted-original-session";
+    const originalTurnId = "limited-turn";
+    let now = Date.now();
+    let generation = 0;
+    const resetsAt = new Date(now + 60_000).toISOString();
+    const received: AgentPromptInput[] = [];
+    const resumeHandles: string[] = [];
+    const continuationAtHandoff = deferred<void>();
+    const releaseHandoff = deferred<void>();
+
+    class LimitedSession extends TestAgentSession {
+      private count = 0;
+      override readonly capabilities = { ...TEST_CAPABILITIES, defersPromptHandoff: true };
+      override describePersistence() {
+        return { provider: "codex", sessionId };
+      }
+      override async getRuntimeInfo() {
+        const model = generation && outcome === "reconfigured" ? "gpt-5.4-mini" : "gpt-5.4";
+        return { provider: this.provider, sessionId, model, modeId: null };
+      }
+      override async startTurn(prompt?: AgentPromptInput, options?: AgentRunOptions) {
+        if (
+          ["manual-race", "archive-race"].includes(outcome) &&
+          prompt === "Continue from where you left off."
+        ) {
+          continuationAtHandoff.resolve();
+          await releaseHandoff.promise;
+        }
+        await options?.beforeProviderDispatch?.();
+        if (prompt !== undefined) received.push(prompt);
+        if (prompt === "Continue from where you left off." && outcome === "unknown") {
+          throw new Error("Provider connection broke after the request could have been received");
+        }
+        if (prompt === "Continue from where you left off." && outcome === "rejected") {
+          throw new AgentTurnStartRejectedError("The provider conclusively refused the request");
+        }
+        const turnId = prompt === "Initial task" ? originalTurnId : `later-${++this.count}`;
+        setTimeout(() => {
+          this.pushEvent(
+            turnId === originalTurnId
+              ? {
+                  type: "turn_failed",
+                  turnId,
+                  provider: "codex",
+                  error: "The provider stopped this conversation until quota resets.",
+                  conversationLimit: {
+                    limitId: "conversation",
+                    resetsAt,
+                    providerTurnId: originalTurnId,
+                    model: "gpt-5.4",
+                  },
+                }
+              : { type: "turn_completed", turnId, provider: "codex" },
+          );
+        }, 0);
+        return { turnId };
+      }
+    }
+    const openClient = () => {
+      const client = new TestAgentClient();
+      const session = new LimitedSession({ cwd, provider: "codex" });
+      vi.spyOn(client, "createSession").mockResolvedValue(session);
+      vi.spyOn(client, "resumeSession").mockImplementation(async (handle) => {
+        resumeHandles.push(handle.sessionId);
+        return session;
+      });
+      return client;
+    };
+
+    const workspacePath = join(cwd, "workspaces.json");
+    const workspaces = new FileBackedWorkspaceRegistry(workspacePath, logger);
+    for (const id of [workspaceId, "same-path-sibling"]) {
+      await workspaces.upsert(
+        createPersistedWorkspaceRecord({
+          workspaceId: id,
+          projectId: "project",
+          cwd,
+          kind: "directory",
+          displayName: id,
+          createdAt: new Date(now).toISOString(),
+          updatedAt: new Date(now).toISOString(),
+        }),
+      );
+    }
+    const openHost = async () => {
+      const registry = new FileBackedWorkspaceRegistry(workspacePath, logger);
+      const receipts = new MessageReceipts(join(cwd, "receipts"));
+      const storage = new AgentStorage(join(cwd, "agents"), logger);
+      const client = openClient();
+      const serverId = generation && outcome === "new-host" ? "host-copied" : "host-original";
+      const manager = new AgentManager({
+        clients: { codex: client },
+        registry: storage,
+        workspaceRegistry: registry,
+        logger,
+        serverId,
+      });
+      const deferral = new WorkspaceDeferral(registry, logger, () => now, receipts);
+      const recovery = new AgentLimitRecovery({
+        manager,
+        storage,
+        deferral,
+        receipts,
+        workspaces: registry,
+        isWorkspaceArchiving: (id) => isWorkspaceArchivePending(registry, id),
+        serverId,
+        logger,
+        now: () => now,
+      });
+      manager.workspaceDeferral = deferral;
+      manager.limitRecovery = recovery;
+      await deferral.start();
+      await recovery.start();
+      onTestFinished(() => {
+        deferral.stop();
+        recovery.stop();
+      });
+      return { manager, registry, receipts, storage, client, deferral, recovery };
+    };
+
+    const first = await openHost();
+    const agent = await first.manager.createAgent(
+      { cwd, provider: "codex", model: "gpt-5.4" },
+      undefined,
+      { workspaceId },
+    );
+    await first.deferral.set({ workspaceId: "same-path-sibling", action: "park" });
+    await first.deferral.set({ workspaceId, action: "park" });
+    await expect(first.manager.runAgent(agent.id, "Initial task")).rejects.toThrow("quota resets");
+    await first.manager.flush();
+    await vi.waitFor(async () => {
+      expect((await first.registry.get(workspaceId))?.parkedAt).toBeUndefined();
+      expect((await first.registry.get("same-path-sibling"))?.parkedAt).toBeTruthy();
+      expect((await first.storage.get(agent.id))?.failedConversationLimit?.turnId).toBe(
+        originalTurnId,
+      );
+    });
+    expect(toAgentPayload(first.manager.getAgent(agent.id)!).conversationLimit).toEqual({
+      turnId: originalTurnId,
+      limitId: "conversation",
+      resetsAt,
+    });
+
+    const request = {
+      workspaceId,
+      agentId: agent.id,
+      turnId: originalTurnId,
+      action: "continue",
+    } as const;
+    await expect(
+      first.recovery.set({ ...request, workspaceId: "same-path-sibling" }),
+    ).rejects.toThrow("unavailable");
+    await expect(first.recovery.set({ ...request, turnId: "old-failure" })).rejects.toThrow(
+      "current",
+    );
+    await first.recovery.set({ ...request, action: "sleep" });
+    expect((await first.storage.get(agent.id))?.limitContinuation).toBeUndefined();
+    expect(received).toEqual(["Initial task"]);
+    await first.recovery.set(request);
+    const scheduled = (await first.storage.get(agent.id))?.limitContinuation;
+    expect(scheduled?.status).toBe("scheduled");
+    await first.recovery.set(request);
+    expect((await first.storage.get(agent.id))?.limitContinuation).toEqual(scheduled);
+
+    const beforeRestart = {
+      "model-round-trip": async () => {
+        await first.manager.setAgentModel(agent.id, "gpt-5.4-mini");
+        await first.manager.flush();
+        expect(toAgentPayload(first.manager.getAgent(agent.id)!).conversationLimit).toBeUndefined();
+        expect((await first.storage.get(agent.id))?.limitContinuation?.status).toBe("cancelled");
+        await first.manager.setAgentModel(agent.id, "gpt-5.4");
+      },
+      "reset-closed": async () => {
+        await first.manager.closeAgent(agent.id);
+        await reset();
+      },
+      "reset-live": reset,
+    } satisfies Partial<Record<typeof outcome, () => Promise<void>>>;
+    async function reset() {
+      await first.manager.resetAgentSession(agent.id, { clearVisibleTimeline: true });
+      const resetRecord = await first.storage.get(agent.id);
+      expect(resetRecord?.failedConversationLimit).toBeUndefined();
+      expect(resetRecord?.limitContinuation?.status).toBe("cancelled");
+    }
+    const setup: Partial<Record<typeof outcome, () => Promise<void>>> = beforeRestart;
+    await setup[outcome]?.();
+    if (outcome === "manual") {
+      await first.manager.runAgent(agent.id, "Manual continuation");
+      await vi.waitFor(async () => {
+        expect((await first.storage.get(agent.id))?.limitContinuation?.status).toBe("cancelled");
+      });
+    }
+    if (outcome === "override") {
+      await first.deferral.set({ workspaceId, action: "park" });
+      await vi.waitFor(async () => {
+        expect((await first.storage.get(agent.id))?.limitContinuation?.status).toBe("cancelled");
+      });
+    }
+    first.recovery.stop();
+    first.deferral.stop();
+    if (outcome !== "reset-closed") await first.manager.closeAgent(agent.id);
+    now += 60_001;
+    generation++;
+
+    const restarted = await openHost();
+    const handoffOverrides: Partial<Record<typeof outcome, () => void>> = {
+      "manual-race": () => {
+        restarted.manager.notifyHumanWorkspaceMessage(agent.id);
+      },
+      "archive-race": () => {
+        trackExternalWorkspaceArchive(restarted.registry, [workspaceId], true);
+        restarted.recovery.onWorkspaceArchiveStarted(workspaceId);
+      },
+    };
+    const atHandoff = handoffOverrides[outcome];
+    if (atHandoff) {
+      await continuationAtHandoff.promise;
+      try {
+        atHandoff();
+        await vi.waitFor(async () => {
+          expect((await restarted.storage.get(agent.id))?.limitContinuation?.status).toBe(
+            "cancelled",
+          );
+        });
+      } finally {
+        releaseHandoff.resolve();
+      }
+      await vi.waitFor(() => expect(restarted.manager.hasInFlightRun(agent.id)).toBe(false));
+      if (outcome === "manual-race") {
+        await restarted.manager.runAgent(agent.id, "Manual continuation");
+      }
+    }
+    const expectedStatus = {
+      accepted: "accepted",
+      unknown: "unknown",
+      manual: "cancelled",
+      "manual-race": "cancelled",
+      "archive-race": "cancelled",
+      override: "cancelled",
+      "new-host": "cancelled",
+      reconfigured: "failed",
+      rejected: "failed",
+      "model-round-trip": "cancelled",
+      "reset-closed": "cancelled",
+      "reset-live": "cancelled",
+    }[outcome];
+    await vi.waitFor(async () => {
+      expect((await restarted.storage.get(agent.id))?.limitContinuation?.status).toBe(
+        expectedStatus,
+      );
+      if (outcome === "unknown") {
+        expect(await restarted.receipts.outcome(agent.id, scheduled!.messageId)).toBe("unknown");
+        expect(received).toContain("Continue from where you left off.");
+      }
+    });
+    if (
+      ["accepted", "unknown", "rejected", "reconfigured", "manual-race", "archive-race"].includes(
+        outcome,
+      )
+    ) {
+      expect(resumeHandles).toEqual([sessionId]);
+      expect(restarted.client.createSession).not.toHaveBeenCalled();
+      expect(restarted.manager.getAgent(agent.id)?.persistence?.sessionId).toBe(sessionId);
+    } else {
+      expect(resumeHandles).toEqual([]);
+    }
+    const continuationPrompts = {
+      accepted: ["Continue from where you left off."],
+      unknown: ["Continue from where you left off."],
+      rejected: ["Continue from where you left off."],
+      manual: ["Manual continuation"],
+      "manual-race": ["Manual continuation"],
+      "archive-race": [],
+      override: [],
+      "new-host": [],
+      reconfigured: [],
+      "model-round-trip": [],
+      "reset-closed": [],
+      "reset-live": [],
+    };
+    expect(received).toEqual(["Initial task", ...continuationPrompts[outcome]]);
+    restarted.recovery.stop();
+    restarted.deferral.stop();
+    if (restarted.manager.getAgent(agent.id)) await restarted.manager.closeAgent(agent.id);
+    const reopened = await openHost();
+    expect((await reopened.storage.get(agent.id))?.limitContinuation?.status).toBe(expectedStatus);
+    expect(reopened.manager.getAgent(agent.id)).toBeNull();
+  },
+);

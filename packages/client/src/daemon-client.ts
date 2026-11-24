@@ -938,6 +938,14 @@ type FetchWorkspacesPayload = Extract<
   { type: "fetch_workspaces_response" }
 >["payload"];
 type FetchWorkspacesRequest = Extract<SessionInboundMessage, { type: "fetch_workspaces_request" }>;
+export type SetWorkspaceDeferralParameters = Omit<
+  Extract<SessionInboundMessage, { type: "workspace.deferral.set.request" }>,
+  "type" | "requestId"
+>;
+export type SetAgentLimitRecoveryParameters = Omit<
+  Extract<SessionInboundMessage, { type: "agent.limit.recovery.request" }>,
+  "type" | "requestId"
+>;
 export type FetchWorkspacesOptions = Omit<FetchWorkspacesRequest, "type" | "requestId"> & {
   signal?: AbortSignal;
   requestId?: string;
@@ -1500,7 +1508,7 @@ type AgentFinishReportConfirmRequest = Extract<
 >;
 type AgentFinishReportConfirmResult = Pick<
   Extract<SessionInboundMessage, { type: "agent.finish_reports.confirm.response" }>["payload"],
-  "accepted" | "error"
+  "accepted" | "error" | "confirmedReport"
 >;
 
 export class DaemonClient {
@@ -4163,6 +4171,34 @@ export class DaemonClient {
       throw new Error(payload.error ?? "setWorkspacePinned rejected");
     }
     return { pinnedAt: payload.pinnedAt };
+  }
+
+  supportsWorkspaceDeferral(): boolean {
+    return this.lastServerInfoMessage?.features?.workspaceDeferral === true;
+  }
+
+  private requireWorkspaceDeferral(): void {
+    if (!this.supportsWorkspaceDeferral()) {
+      throw new Error("Update the host to use workspace deferral.");
+    }
+  }
+
+  async setWorkspaceDeferral(parameters: SetWorkspaceDeferralParameters): Promise<void> {
+    this.requireWorkspaceDeferral();
+    const payload =
+      await this.sendNamespacedCorrelatedSessionRequest<"workspace.deferral.set.response">({
+        message: { ...parameters, type: "workspace.deferral.set.request" },
+      });
+    if (!payload.success) throw new Error(payload.error ?? "Workspace deferral was rejected.");
+  }
+
+  async setAgentLimitRecovery(parameters: SetAgentLimitRecoveryParameters): Promise<void> {
+    this.requireWorkspaceDeferral();
+    const payload =
+      await this.sendNamespacedCorrelatedSessionRequest<"agent.limit.recovery.response">({
+        message: { ...parameters, type: "agent.limit.recovery.request" },
+      });
+    if (!payload.success) throw new Error(payload.error ?? "Agent limit recovery was rejected.");
   }
 
   async setWorkspaceBaseBranch(options: {
@@ -8647,6 +8683,7 @@ export class DaemonClient {
           reportId: request.reportId,
           accepted: result.accepted,
           error: result.error,
+          confirmedReport: result.confirmedReport,
         },
       });
     } catch (error) {

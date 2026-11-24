@@ -14,6 +14,7 @@ import { aggregateSidebarStateBuckets } from "@/utils/sidebar-agent-state";
 import { shortenPath } from "@/utils/shorten-path";
 import type { WorkspaceAgentActivity } from "@/utils/workspace-agent-activity";
 import { resolveWorkspaceMapKeyByIdentity } from "@/utils/workspace-identity";
+import { isWorkspaceDeferred, type WorkspaceDeferralFields } from "@/workspace-deferral/model";
 
 const EMPTY_PROJECTS: SidebarProjectEntry[] = [];
 
@@ -38,7 +39,8 @@ export interface SidebarStatusWorkspacePlacement extends SidebarWorkspacePlaceme
   statusEnteredAt: Date | null;
 }
 
-export interface SidebarWorkspaceEntry extends SidebarStatusWorkspacePlacement {
+export interface SidebarWorkspaceEntry
+  extends SidebarStatusWorkspacePlacement, WorkspaceDeferralFields {
   workspaceDirectory: string;
   workspaceDirectoryLabel: string;
   // Raw user-set title (null when the name is derived from branch/directory).
@@ -166,6 +168,8 @@ export function createSidebarWorkspaceEntry(input: {
     name: input.workspace.name,
     title: input.workspace.title ?? null,
     pinnedAt: input.workspace.pinnedAt,
+    ...(input.workspace.snoozedUntil ? { snoozedUntil: input.workspace.snoozedUntil } : {}),
+    ...(input.workspace.parkedAt ? { parkedAt: input.workspace.parkedAt } : {}),
     labels: input.workspace.labels ?? EMPTY_WORKSPACE_LABELS,
     currentBranch: normalizeCurrentBranch(input.workspace.gitRuntime?.currentBranch),
     statusBucket: effectiveStatus.status,
@@ -224,7 +228,7 @@ export function deriveProjectStatusBucket(input: {
         workspaceId,
       });
       const workspace = workspaceKey ? session.workspaces.get(workspaceKey) : undefined;
-      if (!workspace) continue;
+      if (!workspace || isWorkspaceDeferred(workspace)) continue;
       buckets.push(
         deriveEffectiveWorkspaceStatus({
           serverId,
@@ -417,6 +421,24 @@ function areSidebarWorkspaceEntriesEqual(
         leftHint.reviewDecision === rightHint.reviewDecision)
     );
   });
+}
+
+/** Prune placement lists before grouping, including pinned rows and keyboard shortcuts. */
+export function filterDeferredSidebarProjects(
+  projects: SidebarProjectEntry[],
+  entries: ReadonlyMap<string, SidebarWorkspaceEntry>,
+): SidebarProjectEntry[] {
+  let changed = false;
+  const filtered = projects.map((project) => {
+    const workspaces = project.workspaces.filter((placement) => {
+      const entry = entries.get(placement.workspaceKey);
+      return !entry || !isWorkspaceDeferred(entry);
+    });
+    if (workspaces.length === project.workspaces.length) return project;
+    changed = true;
+    return { ...project, workspaces };
+  });
+  return changed ? filtered : projects;
 }
 
 export function buildSidebarProjectsFromStructure(input: {

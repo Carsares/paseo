@@ -1,3 +1,14 @@
+import {
+  extractConversationLimit,
+  limitFingerprint,
+  type FailedConversationLimit,
+} from "../workspace-deferral/agent-limit-evidence.js";
+import {
+  AgentLimitContinuationWithdrawnError,
+  type AgentLimitContinuation,
+} from "../workspace-deferral/continuation-state.js";
+import type { AgentLimitRecovery } from "../schedule/agent-limit-recovery.js";
+import type { WorkspaceDeferral } from "../workspace-deferral/deferral.js";
 import type { AttachedAgentTool, PluginAgentToolsRuntime } from "../plugins/agent-tools.js";
 import { ProviderOptionsValidationError } from "./provider-options.js";
 import type { AgentToolResult } from "@getpaseo/plugin/server";
@@ -757,6 +768,16 @@ interface StreamEventFlags {
   shouldNotifyWaiters: boolean;
 }
 
+function pickLimitState(source?: {
+  failedConversationLimit?: FailedConversationLimit;
+  limitContinuation?: AgentLimitContinuation;
+}) {
+  return {
+    failedConversationLimit: source?.failedConversationLimit,
+    limitContinuation: source?.limitContinuation,
+  };
+}
+
 type ActiveTurnTerminalDisposition = "closed_current" | "stale" | "untracked";
 
 interface HandleStreamEventOptions {
@@ -801,6 +822,8 @@ interface ManagedAgentBase {
   activeTurnId: string | null;
   activeTurnStartedAt: Date | null;
   lastTurnCompletion?: { event: TurnTerminalEvent; lastMessage: string | null };
+  failedConversationLimit?: FailedConversationLimit;
+  limitContinuation?: AgentLimitContinuation;
   lastUsage?: AgentUsage;
   lastError?: string;
   attention: AttentionState;
@@ -921,6 +944,10 @@ function attachManagedTurnIdentity(
 }
 
 function limitAgentStreamEventContent(event: AgentStreamEvent, agentId: string): AgentStreamEvent {
+  if (event.type === "turn_failed" && !event.turnId && "conversationLimit" in event) {
+    // A guessed turn ID cannot establish which turn the provider limit applies to.
+    return { ...event, conversationLimit: undefined };
+  }
   if (event.type !== "timeline") return event;
   const item = event.item;
   const rendered = item.type === "user_message" ? cleanProviderPromptItem(item, agentId) : item;
@@ -1370,6 +1397,96 @@ export class AgentManager {
   private readonly replacementMutationTails = new Map<string, Promise<void>>();
   private readonly runs = new AgentRunState();
   private readonly subscribers = new Set<SubscriptionRecord>();
+  workspaceDeferral?: WorkspaceDeferral;
+  limitRecovery?: AgentLimitRecovery;
+
+  conversationLimitFingerprint(agent: ManagedAgent): string {
+    const config = agent.config;
+    return limitFingerprint({
+      provider: agent.provider,
+      adapter: agent.providerAdapter,
+      session: agent.persistence?.sessionId,
+      cwd: agent.cwd,
+      model: agent.runtimeInfo?.model ?? config.model ?? null,
+      selectedModel: config.model ?? null,
+      thinking: config.thinkingOptionId ?? null,
+      mode: config.modeId ?? null,
+      options: this.effectiveOptionsFor(agent.provider, config.providerOptions),
+      sessionOptions: agent.effectiveOptions,
+      env: agent.launchEnv,
+      toolPolicy: config.toolPolicy,
+      systemPrompt: config.systemPrompt,
+      profileId: getAgentProfileIdFromLabels(agent.labels),
+      mcpServers: stripInternalPaseoMcpServer(config).mcpServers,
+    });
+  }
+
+  private async publishChangedLimitConfiguration(agent: ActiveManagedAgent): Promise<void> {
+    const limit = agent.failedConversationLimit;
+    if (!limit || this.conversationLimitFingerprint(agent) === limit.fingerprint) {
+      this.emitState(agent);
+      return;
+    }
+    agent.failedConversationLimit = undefined;
+    // Retire the original evidence before another change can restore the old configuration.
+    await this.persistSnapshot(agent);
+    await this.cancelWaitingForLimitRecovery(agent.id);
+    this.emitState(agent, { persist: false });
+  }
+
+  private async cancelWaitingForLimitRecovery(agentId: string): Promise<void> {
+    await this.limitRecovery
+      ?.cancelWaitingForAgent(agentId)
+      .catch((err) =>
+        this.logger.warn({ err, agentId }, "Could not cancel an agent's delayed continuation"),
+      );
+  }
+
+  async publishLimitContinuation(agentId: string): Promise<void> {
+    const stored = await this.registry?.get(agentId);
+    if (!stored) return;
+    const live = this.agents.get(agentId);
+    if (live && !stored.archivedAt) {
+      live.limitContinuation = stored.limitContinuation;
+      this.emitState(live, { persist: false });
+    } else if (!stored.internal) {
+      this.dispatchStoredAgentState(stored);
+    }
+  }
+
+  async notifyPersistedBlockedSubagentReport(
+    recipientId: string,
+    reportId: string,
+    reportedAt: string,
+  ): Promise<void> {
+    const live = this.agents.get(recipientId);
+    const stored = await this.registry?.get(recipientId);
+    if (
+      !stored ||
+      stored.archivedAt ||
+      stored.background ||
+      stored.internal ||
+      !stored.workspaceId ||
+      (live && live.workspaceId !== stored.workspaceId)
+    )
+      return;
+    await this.workspaceDeferral?.wakeForBlockedReport(stored.workspaceId, reportId, reportedAt);
+  }
+
+  private wakeDeferredWorkspace(agent: {
+    id: string;
+    workspaceId?: string;
+    internal?: boolean;
+    background?: boolean;
+  }): void {
+    if (!agent.workspaceId || agent.internal || agent.background) return;
+    void this.workspaceDeferral
+      ?.wake(agent.workspaceId)
+      .catch((err) =>
+        this.logger.warn({ err, agentId: agent.id }, "Could not wake deferred workspace"),
+      );
+  }
+
   private readonly idFactory: () => string;
   private readonly registry?: AgentStorage;
   private readonly workspaceRegistry?: Pick<WorkspaceRegistry, "get">;
@@ -2864,7 +2981,13 @@ export class AgentManager {
       // The caller read its metadata and attention before this turn in the lane; a setMetadata
       // or attention clear queued ahead of it has saved a newer record, the one the open hooks saw.
       ...(record
-        ? { labels: record.labels, metadata: record.metadata, attention: extractAttention(record) }
+        ? {
+            labels: record.labels,
+            metadata: record.metadata,
+            attention: extractAttention(record),
+            failedConversationLimit: record.failedConversationLimit,
+            limitContinuation: record.limitContinuation,
+          }
         : {}),
       workspaceId,
       launchEnv,
@@ -3772,6 +3895,8 @@ export class AgentManager {
         lastUserMessageAt: record.lastUserMessageAt ? new Date(record.lastUserMessageAt) : null,
         lastUsage: undefined,
         lastError: record.lastError ?? undefined,
+        failedConversationLimit: record.failedConversationLimit,
+        limitContinuation: record.limitContinuation,
         attention,
         internal: record.internal,
         background: record.background,
@@ -3918,6 +4043,7 @@ export class AgentManager {
       lastStatus: "closed",
       resumeOnStartup: undefined,
       lastError: null,
+      failedConversationLimit: undefined,
       requiresAttention: false,
       attentionReason: null,
       attentionTimestamp: null,
@@ -3943,8 +4069,9 @@ export class AgentManager {
       if (oldHandoff?.compactionRow) this.replaceContextCompactionRow(id, oldHandoff.compactionRow);
       throw error;
     }
+    await this.cancelWaitingForLimitRecovery(id);
     await this.publishResetTimeline(id, prefix, options);
-    this.dispatchStoredAgentState(next);
+    this.dispatchStoredAgentState((await registry.get(id)) ?? next);
   }
 
   private async readClosedResetTimeline(
@@ -4176,6 +4303,7 @@ export class AgentManager {
       this.subscribeToSession(agent);
       if (!reset) this.installContextHandoff(agent, prefix);
       this.emitState(agent, { persist: false });
+      await this.cancelWaitingForLimitRecovery(id);
       return { agent: { ...agent }, notice };
     } catch (error) {
       if (!installed) {
@@ -4228,6 +4356,7 @@ export class AgentManager {
       currentModeId: null,
       availableModes: [],
       lastError: undefined,
+      failedConversationLimit: undefined,
     };
   }
 
@@ -4332,7 +4461,7 @@ export class AgentManager {
           agent.runtimeInfo = { ...agent.runtimeInfo, modeId: currentMode };
         }
         this.touchUpdatedAt(agent);
-        this.emitState(agent);
+        await this.publishChangedLimitConfiguration(agent);
         return notice;
       }),
     );
@@ -4392,7 +4521,7 @@ export class AgentManager {
         }
         this.refreshSessionPersistence(agent);
         this.touchUpdatedAt(agent);
-        this.emitState(agent);
+        await this.publishChangedLimitConfiguration(agent);
       }),
     );
   }
@@ -4428,7 +4557,7 @@ export class AgentManager {
           };
         }
         this.touchUpdatedAt(agent);
-        this.emitState(agent);
+        await this.publishChangedLimitConfiguration(agent);
         return notice;
       }),
     );
@@ -4477,7 +4606,7 @@ export class AgentManager {
         this.storeOptionsPatch({ agent, patch: { ...patch, ...ended } });
         this.updateEffectiveOptions({ agent, sent, reported: ended });
         this.touchUpdatedAt(agent);
-        this.emitState(agent);
+        await this.publishChangedLimitConfiguration(agent);
       }),
     );
   }
@@ -6757,17 +6886,29 @@ export class AgentManager {
     return true;
   }
 
+  notifyHumanWorkspaceMessage(agentId: string): void {
+    const agent = this.agents.get(agentId);
+    if (!agent) return;
+    this.wakeDeferredWorkspace(agent);
+    void this.limitRecovery
+      ?.cancelWaitingForAgent(agentId)
+      .catch((err) =>
+        this.logger.warn({ err, agentId }, "Could not cancel an agent's delayed continuation"),
+      );
+  }
+
   private notifyAgentRunAccepted(
     agentId: string,
     options: AgentRunOptions | undefined,
     prompt: AgentPromptInput,
   ): Promise<void> | undefined {
     if (
-      options?.recoveryIntent === "automatic" ||
-      !this.onAgentRunAccepted ||
+      options?.recoveryIntent ||
       parseAgentMessages(submittedPromptText(prompt))?.some((message) => message.source)
     )
       return undefined;
+    this.notifyHumanWorkspaceMessage(agentId);
+    if (!this.onAgentRunAccepted) return undefined;
     return Promise.resolve(this.onAgentRunAccepted(agentId)).catch((error) => {
       this.logger.warn({ err: error, agentId }, "Failed to consume automatic recovery intent");
     });
@@ -6906,7 +7047,7 @@ export class AgentManager {
       return result.turnId;
     } catch (error) {
       if (error instanceof AgentTurnStartCanceledError) {
-        return this.finishCanceledForegroundStart(params);
+        return this.finishCanceledForegroundStart(params, error);
       }
       if (pendingRun.settled) {
         throw error;
@@ -6946,14 +7087,21 @@ export class AgentManager {
     }
   }
 
-  private async finishCanceledForegroundStart({
-    agent,
-    agentId,
-    pendingRun,
-    prompt,
-    options,
-  }: Parameters<AgentManager["startPendingForegroundTurn"]>[0]): Promise<null> {
+  private async finishCanceledForegroundStart(
+    {
+      agent,
+      agentId,
+      pendingRun,
+      prompt,
+      options,
+    }: Parameters<AgentManager["startPendingForegroundTurn"]>[0],
+    error: AgentTurnStartCanceledError,
+  ): Promise<null> {
     if (pendingRun.settled) return null;
+    if (error instanceof AgentLimitContinuationWithdrawnError) {
+      this.runs.settleForegroundRun(agentId, pendingRun.token);
+      return null;
+    }
     if (options?.clientMessageId) {
       this.recordSubmittedPrompt(agent, prompt, options.clientMessageId, "rejected", {
         messageId: options.clientMessageId,
@@ -7187,6 +7335,11 @@ export class AgentManager {
     return this.reserveAgentRun(agentId, prompt, options, promptStart);
   }
 
+  private prepareForegroundStart(agent: ActiveManagedAgent, options?: AgentRunOptions): boolean {
+    if (options?.recoveryIntent !== "delayed-limit") agent.lastError = undefined;
+    return agent.pendingReplacement;
+  }
+
   private reserveAgentRun(
     agentId: string,
     prompt: AgentPromptInput,
@@ -7238,8 +7391,7 @@ export class AgentManager {
     }
 
     const agent = existingAgent;
-    const isReplacement = agent.pendingReplacement;
-    agent.lastError = undefined;
+    const isReplacement = this.prepareForegroundStart(agent, options);
 
     const pendingRun = this.runs.createPendingRun(agentId);
     promptStart?.bind(pendingRun);
@@ -7266,6 +7418,7 @@ export class AgentManager {
       }
 
       const turnStartedAt = new Date();
+      agent.lastError = undefined;
       this.runs.settleForegroundStart(pendingRun, { status: "started", turnId });
       const accepted = this.notifyAgentRunAccepted(agentId, options, prompt);
 
@@ -7400,6 +7553,7 @@ export class AgentManager {
   }
 
   private openActiveTurn(agent: ActiveManagedAgent, turnId: string, startedAt: Date): void {
+    agent.failedConversationLimit = undefined;
     agent.activeTurnId = turnId;
     agent.activeTurnStartedAt = startedAt;
   }
@@ -8653,6 +8807,8 @@ export class AgentManager {
       historyPrimed?: boolean;
       lastUsage?: AgentUsage;
       lastError?: string;
+      failedConversationLimit?: FailedConversationLimit;
+      limitContinuation?: AgentLimitContinuation;
       attention?: AttentionState;
       /**
        * Bringing a known agent back, rather than starting a new one. Its timestamps and
@@ -8876,6 +9032,8 @@ export class AgentManager {
           historyPrimed?: boolean;
           lastUsage?: AgentUsage;
           lastError?: string;
+          failedConversationLimit?: FailedConversationLimit;
+          limitContinuation?: AgentLimitContinuation;
           attention?: AttentionState;
           persistence?: AgentPersistenceHandle;
           workspaceId?: string;
@@ -8933,6 +9091,7 @@ export class AgentManager {
       lastUserMessageAt: options?.lastUserMessageAt ?? null,
       lastUsage: options?.lastUsage,
       lastError: options?.lastError,
+      ...pickLimitState(options),
       attention: resolveInitialAttention(options?.attention),
       internal: config.internal ?? false,
       background: params.background,
@@ -9946,6 +10105,20 @@ export class AgentManager {
       agent.lifecycle = "error";
     }
     agent.lastError = event.error;
+    if (!options?.fromHistory) {
+      this.wakeDeferredWorkspace(agent);
+      const limit = extractConversationLimit(event);
+      this.refreshSessionPersistence(agent);
+      agent.failedConversationLimit =
+        limit &&
+        eventTurnId &&
+        terminalDisposition === "closed_current" &&
+        (!limit.providerTurnId || limit.providerTurnId === eventTurnId) &&
+        agent.persistence?.sessionId &&
+        (!limit.model || limit.model === (agent.runtimeInfo?.model ?? agent.config.model))
+          ? { ...limit, turnId: eventTurnId, fingerprint: this.conversationLimitFingerprint(agent) }
+          : undefined;
+    }
     await this.appendSystemErrorTimelineMessage(
       agent,
       event.provider,
@@ -10053,6 +10226,9 @@ export class AgentManager {
       return;
     }
     const hadPendingPermissions = agent.pendingPermissions.size > 0;
+    if (!options?.fromHistory && !agent.pendingPermissions.has(event.request.id)) {
+      this.wakeDeferredWorkspace(agent);
+    }
     agent.pendingPermissions.set(event.request.id, event.request);
     this.refreshSessionPersistence(agent);
     if (!hadPendingPermissions && raisesAttention(agent)) {

@@ -1,3 +1,8 @@
+import {
+  projectLimitContinuation,
+  type AgentLimitContinuation,
+} from "../workspace-deferral/continuation-state.js";
+import type { FailedConversationLimit } from "../workspace-deferral/agent-limit-evidence.js";
 import { isSameOrDescendantPath } from "../path-utils.js";
 import type {
   AgentListItemPayload,
@@ -91,6 +96,23 @@ export function resolveEffectiveThinkingOptionId(options: {
   return normalizeThinkingOptionId(options.configuredThinkingOptionId);
 }
 
+function projectAgentLimitState(
+  source: {
+    failedConversationLimit?: FailedConversationLimit;
+    limitContinuation?: AgentLimitContinuation;
+  },
+  archivedAt?: string | null,
+): Pick<AgentSnapshotPayload, "conversationLimit" | "rateLimitContinuation"> {
+  const result: Pick<AgentSnapshotPayload, "conversationLimit" | "rateLimitContinuation"> = {};
+  if (source.failedConversationLimit && !archivedAt) {
+    const { turnId, limitId, resetsAt } = source.failedConversationLimit;
+    result.conversationLimit = { turnId, limitId, resetsAt };
+  }
+  if (source.limitContinuation)
+    result.rateLimitContinuation = projectLimitContinuation(source.limitContinuation);
+  return result;
+}
+
 export function toStoredAgentRecord(
   agent: ManagedAgent,
   options?: ProjectionOptions,
@@ -120,6 +142,7 @@ export function toStoredAgentRecord(
     controls: normalizeControls(agent.controls),
     persistence,
     lastError: agent.lastError ?? undefined,
+    failedConversationLimit: agent.failedConversationLimit,
     requiresAttention: agent.attention.requiresAttention,
     attentionReason: agent.attention.requiresAttention ? agent.attention.attentionReason : null,
     attentionTimestamp: agent.attention.requiresAttention
@@ -161,6 +184,7 @@ export function toAgentPayload(
     updatedAt: agent.updatedAt.toISOString(),
     lastUserMessageAt: agent.lastUserMessageAt ? agent.lastUserMessageAt.toISOString() : null,
     status: agent.lifecycle,
+    ...projectAgentLimitState(agent, options?.archivedAt),
     activeTurn: agent.activeTurnId
       ? {
           turnId: agent.activeTurnId,
@@ -331,6 +355,7 @@ export function buildStoredAgentPayload(
     updatedAt: updatedAt.toISOString(),
     lastUserMessageAt: lastUserMessageAt ? lastUserMessageAt.toISOString() : null,
     status: record.lastStatus,
+    ...projectAgentLimitState(record, record.archivedAt),
     backgroundWork: visibleStoredBackgroundWork(record, backgroundWork),
     capabilities: defaultCapabilities,
     currentModeId: record.lastModeId ?? null,
@@ -362,6 +387,8 @@ export function toAgentListItemPayload(agent: AgentSnapshotPayload): AgentListIt
     thinkingOptionId: agent.thinkingOptionId,
     effectiveThinkingOptionId: agent.effectiveThinkingOptionId,
     status: agent.status,
+    ...(agent.conversationLimit ? { conversationLimit: agent.conversationLimit } : {}),
+    ...(agent.rateLimitContinuation ? { rateLimitContinuation: agent.rateLimitContinuation } : {}),
     ...(agent.backgroundWork ? { backgroundWork: agent.backgroundWork } : {}),
     cwd: agent.cwd,
     createdAt: agent.createdAt,

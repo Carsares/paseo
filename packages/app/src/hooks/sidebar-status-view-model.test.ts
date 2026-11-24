@@ -27,6 +27,8 @@ function ws(
     currentBranch: input.currentBranch ?? null,
     statusBucket: input.statusBucket ?? "done",
     statusEnteredAt: input.statusEnteredAt ?? null,
+    snoozedUntil: input.snoozedUntil,
+    parkedAt: input.parkedAt,
     archivingAt: null,
     diffStat: null,
     prHint: null,
@@ -43,8 +45,22 @@ function d(iso: string): Date {
 }
 
 const emptyProjectNames = new Map<string, string>();
+const workspaceKeys = (rows: SidebarWorkspaceEntry[]) => rows.map((row) => row.workspaceKey);
 
 describe("buildStatusGroups", () => {
+  it("omits snoozed and parked workspaces from every status group", () => {
+    const timestamp = "2030-01-01T01:00:00.000Z";
+    const workspaces = STATUS_BUCKET_ORDER.flatMap((statusBucket) => [
+      ws({ workspaceKey: `host-a:${statusBucket}`, statusBucket }),
+      ws({ workspaceKey: `host-b:${statusBucket}`, statusBucket, snoozedUntil: timestamp }),
+      ws({ workspaceKey: `host-c:${statusBucket}`, statusBucket, parkedAt: timestamp }),
+    ]);
+    const groups = buildStatusGroups(workspaces, emptyProjectNames, i18n.t);
+    expect(groups.map(({ bucket, rows }) => [bucket, workspaceKeys(rows)])).toEqual(
+      STATUS_BUCKET_ORDER.map((bucket) => [bucket, [`host-a:${bucket}`]]),
+    );
+  });
+
   it("groups workspaces by status bucket in fixed order", () => {
     const workspaces = [
       ws({ workspaceKey: "srv:done-ws", statusBucket: "done", name: "done-ws" }),

@@ -211,7 +211,7 @@ export interface AgentRunOptions {
   maxThinkingTokens?: number;
   clientMessageId?: string;
   /** Internal marker used while dispatching a daemon-started automatic recovery. */
-  recoveryIntent?: "automatic";
+  recoveryIntent?: "automatic" | "delayed-limit";
   /** Internal guard used by sessions that defer handoff until their provider request. */
   beforeProviderDispatch?: () => Promise<void>;
 }
@@ -431,6 +431,15 @@ export type AgentTimelineItem =
   | CompactionTimelineItem
   | PluginTimelineItem;
 
+/** Provider evidence for the failed conversation turn. Keep accountScope internal. */
+export interface AgentConversationLimit {
+  limitId: string;
+  resetsAt: string;
+  providerTurnId?: string;
+  model?: string;
+  accountScope?: string;
+}
+
 export type AgentStreamEvent =
   | { type: "thread_started"; sessionId: string; provider: AgentProvider }
   | { type: "turn_started"; provider: AgentProvider; turnId?: string }
@@ -463,6 +472,7 @@ export type AgentStreamEvent =
       code?: string;
       diagnostic?: string;
       turnId?: string;
+      conversationLimit?: AgentConversationLimit;
     }
   | { type: "turn_canceled"; provider: AgentProvider; reason: string; turnId?: string }
   // Internal provider correction; the manager publishes the existing timeline invalidation.

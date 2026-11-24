@@ -321,6 +321,20 @@ export const es: TranslationResources = {
     },
   },
   agentPanel: {
+    limitRecovery: {
+      limited: "El límite de la conversación se restablece a las {{time}}.",
+      scheduled: "Esta sesión está programada para continuar a las {{time}}.",
+      unknown:
+        "Es posible que el proveedor haya recibido el mensaje para continuar. Revisa la conversación antes de volver a intentarlo.",
+      accepted: "El proveedor aceptó el mensaje para continuar.",
+      cancelled: "Se canceló la continuación programada.",
+      failed:
+        "La sesión no pudo continuar automáticamente. Puedes volver a intentarlo de forma manual.",
+      sleep: "Posponer hasta el restablecimiento",
+      continue: "Continuar al restablecerse el límite",
+      cancel: "Cancelar la continuación",
+      changed: "El límite de la conversación o el estado de la continuación ha cambiado.",
+    },
     states: {
       notFound: "Agentno encontrado",
       failedToLoad: "No se pudo cargar el agente",
@@ -1494,6 +1508,23 @@ export const es: TranslationResources = {
       },
     },
     workspace: {
+      deferral: {
+        menu: "Posponer o dejar en pausa",
+        snoozed: "Pospuesto",
+        parked: "En pausa",
+        snoozedUntil: "Pospuesto hasta {{time}}",
+        snoozedList: "Espacios de trabajo pospuestos",
+        parkedList: "Espacios de trabajo en pausa",
+        restore: "Restaurar espacio de trabajo",
+        restoreNamed: "Restaurar {{name}} en {{host}}",
+        oneHour: "Posponer 1 hora",
+        fourHours: "Posponer 4 horas",
+        oneDay: "Posponer 1 día",
+        park: "Dejar en pausa el espacio de trabajo",
+        pending: "Actualizando…",
+        offline: "Conéctate al host para hacer cambios.",
+        error: "No se pudo actualizar el espacio de trabajo.",
+      },
       status: {
         serviceRunning: "Servicio {{name}} en ejecución",
         serviceUnhealthy: "Servicio {{name}} con fallos",

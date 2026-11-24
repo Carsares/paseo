@@ -2378,6 +2378,92 @@ test.each(["completed", "blocked"] as const)(
   },
 );
 
+test.each(["forward pull", "reverse push"] as const)(
+  "only a newly stored blocked report wakes a parked workspace over %s",
+  { timeout: 30_000 },
+  async (route) => {
+    const prompts: string[] = [];
+    const parentHost = await daemon({
+      agentClients: createTestAgentClients({
+        onStartTurn: (prompt) => prompts.push(String(prompt)),
+      }),
+    });
+    const childHost = await daemon();
+    const parentApi = await api(parentHost);
+    const childApi = await api(childHost);
+    const parentWorkspace = await parentApi.paseo.workspaces.create({
+      source: { kind: "directory", path: parentHost.staticDir },
+    });
+    const parent = await parentWorkspace.agents.create({
+      config: { provider: "claude/claude-test", modeId: "full-access" },
+    });
+    const childWorkspace = await childApi.paseo.workspaces.create({
+      source: { kind: "directory", path: childHost.staticDir },
+    });
+    const { id: childId } = await seedRemoteChild(
+      childHost,
+      { id: childWorkspace.id, cwd: childHost.staticDir },
+      parent.address,
+      "Remote blocked reporter",
+      { reporting: "explicit" },
+    );
+    const forward = route === "forward pull";
+    const connector = forward ? parentApi.paseo : childApi.paseo;
+    const otherHost = forward ? childHost : parentHost;
+    const registration = await connector.hosts.add({ connection: `127.0.0.1:${otherHost.port}` });
+    const remoteId = (await online(connector)).hosts[0]!.serverId!;
+    const setLink = (enabled: boolean) =>
+      connector.hosts.update(registration.registrationId, { enabled });
+    await setLink(false);
+    const tools = new Client({ name: "blocked-report-deferral", version: "1" });
+    cleanup.push(() => tools.close());
+    await tools.connect(
+      new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${childHost.port}/mcp/agents?callerAgentId=${childId}`),
+      ),
+    );
+    const readReports = () =>
+      readFile(join(childHost.paseoHome, "finish-followup-reports.json"), "utf8").then(JSON.parse);
+    const blocked = async (summary: string) => {
+      const result = await tools.callTool({
+        name: "report_to_parent",
+        arguments: { status: "blocked", summary },
+      });
+      expect(result.structuredContent).toMatchObject({ deliveryStatus: "queued" });
+      const [entry] = await readReports();
+      expect(entry.report).toMatchObject({
+        parentReportStatus: "blocked",
+        reportedAt: expect.any(String),
+      });
+    };
+    const workspaceId = parentWorkspace.id;
+    const workspace = async () =>
+      (await parentApi.client.fetchWorkspaces()).entries.find((entry) => entry.id === workspaceId);
+    await blocked("Blocked before parking");
+    await parentApi.client.setWorkspaceDeferral({ workspaceId, action: "park" });
+    const parkedAt = (await workspace())?.parkedAt;
+    expect(parkedAt).toEqual(expect.any(String));
+    await setLink(true);
+    await online(connector);
+    if (forward) await parentApi.client.trackAgentFinishReports(remoteId, childId, parent.id);
+    await expect.poll(readReports, { timeout: 10_000 }).toEqual([]);
+    expect(prompts.filter((prompt) => prompt.includes("Blocked before parking"))).toHaveLength(1);
+    expect((await workspace())?.parkedAt).toBe(parkedAt);
+
+    await setLink(false);
+    await blocked("New blocked report while parked");
+    await setLink(true);
+    await online(connector);
+    await expect.poll(readReports, { timeout: 10_000 }).toEqual([]);
+    const newReport = prompts.filter((prompt) =>
+      prompt.includes("New blocked report while parked"),
+    );
+    expect(newReport).toHaveLength(1);
+    expect(newReport[0]).toContain(`source-agent-id="${childId}"`);
+    expect(await workspace()).not.toHaveProperty("parkedAt");
+  },
+);
+
 test.each(["cold reopen", "definite rejection", "stale retry", "unknown"] as const)(
   "an authorized local report handles provider %s",
   { timeout: 25000 },

@@ -387,6 +387,40 @@ function getWorkspaceArchiveActivity(registry: WorkspaceRegistry): WorkspaceArch
   return activity;
 }
 
+export function isWorkspaceArchivePending(
+  registry: WorkspaceRegistry,
+  workspaceId: string,
+): boolean {
+  return getWorkspaceArchiveActivity(registry).archives.has(workspaceId);
+}
+
+export function trackExternalWorkspaceArchive(
+  registry: WorkspaceRegistry,
+  workspaceIds: Iterable<string>,
+  active: boolean,
+): void {
+  const { archives } = getWorkspaceArchiveActivity(registry);
+  for (const workspaceId of workspaceIds) {
+    trackWorkspaceArchive(archives, workspaceId, externalWorkspaceArchive, active);
+  }
+}
+
+function trackWorkspaceArchive(
+  archives: WorkspaceArchiveActivity["archives"],
+  workspaceId: string,
+  source: object | symbol,
+  active: boolean,
+): void {
+  const sources = archives.get(workspaceId);
+  if (active) {
+    if (sources) sources.add(source);
+    else archives.set(workspaceId, new Set([source]));
+  } else if (sources) {
+    sources.delete(source);
+    if (sources.size === 0) archives.delete(workspaceId);
+  }
+}
+
 function resolveWorkspaceSetupRuntime(
   runtime: WorkspaceSetupRuntime | undefined,
 ): WorkspaceSetupRuntime {
@@ -431,6 +465,12 @@ const LEGACY_PROVIDER_IDS = new Set(["claude", "codex", "opencode"]);
 const FULL_AGENT_ID_PATTERN = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const MIN_VERSION_ALL_PROVIDERS = "0.1.45";
 const MIN_VERSION_EXPLICIT_WORKSPACE_RECOVERY = "0.1.105";
+function projectWorkspaceDeferral(workspace: PersistedWorkspaceRecord) {
+  if (workspace.snoozedUntil) return { snoozedUntil: workspace.snoozedUntil };
+  if (workspace.parkedAt) return { parkedAt: workspace.parkedAt };
+  return {};
+}
+
 function errorToFriendlyMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -3135,6 +3175,12 @@ export class Session {
   }
 
   private dispatchWorkspaceLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    if (
+      msg.type === "workspace.deferral.set.request" ||
+      msg.type === "agent.limit.recovery.request"
+    ) {
+      return this.handleWorkspaceDeferralRequest(msg);
+    }
     return (
       this.dispatchWorkspaceStateMessage(msg) ??
       this.dispatchWorkspaceLabelMessage(msg) ??
@@ -5639,6 +5685,54 @@ export class Session {
     }
   }
 
+  supportsWorkspaceDeferral(): boolean {
+    return Boolean(this.agentManager.workspaceDeferral && this.agentManager.limitRecovery);
+  }
+
+  private async handleWorkspaceDeferralRequest(
+    request: Extract<
+      SessionInboundMessage,
+      {
+        type: "workspace.deferral.set.request" | "agent.limit.recovery.request";
+      }
+    >,
+  ): Promise<void> {
+    const responseType =
+      request.type === "workspace.deferral.set.request"
+        ? "workspace.deferral.set.response"
+        : "agent.limit.recovery.response";
+    let error: string | null = null;
+    try {
+      if (readDirectParentRoute(this.getHostSourceId())) {
+        throw new Error("Workspace deferral requires a workspace client.");
+      }
+      if (this.workspaceArchiveActivity.archives.has(request.workspaceId)) {
+        throw new Error("Workspace is being archived.");
+      }
+      if (request.type === "workspace.deferral.set.request") {
+        const service = this.agentManager.workspaceDeferral;
+        if (!service) throw new Error("Workspace deferral is unavailable.");
+        await service.set(request);
+      } else {
+        const service = this.agentManager.limitRecovery;
+        if (!service) throw new Error("Agent limit recovery is unavailable.");
+        if (
+          request.action !== "cancel" &&
+          !this.authorization.allowsPermission("workspace.manage")
+        ) {
+          throw new Error("Deferring the workspace requires workspace.manage.");
+        }
+        await service.set(request);
+      }
+    } catch (cause) {
+      error = errorToFriendlyMessage(cause);
+    }
+    this.emit({
+      type: responseType,
+      payload: { requestId: request.requestId, success: error === null, error },
+    });
+  }
+
   private async handleWorkspacePinSetRequest(
     workspaceId: string,
     pinned: boolean,
@@ -5807,6 +5901,7 @@ export class Session {
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
         beforeDispatch: async () => {
+          this.agentManager.notifyHumanWorkspaceMessage(params.agentId);
           registration = await registerParentFinishSubscription({
             agentId: params.agentId,
             serverId: this.serverId,
@@ -7833,6 +7928,7 @@ export class Session {
         await this.listWorkspaceMoveVisibleRecords([workspace.workspaceId])
       ).some((agent) => !agent.internal && isMainControlAgentLabels(agent.labels)),
       pinnedAt: workspace.pinnedAt,
+      ...projectWorkspaceDeferral(workspace),
       ...(workspace.labels && workspace.labels.length > 0 ? { labels: workspace.labels } : {}),
       metadata: workspace.metadata,
       background: workspace.background,
@@ -7991,15 +8087,10 @@ export class Session {
     source: object | symbol,
     active: boolean,
   ): void {
-    const archives = this.workspaceArchiveActivity.archives;
-    const sources = archives.get(workspaceId);
-    if (active) {
-      if (sources) sources.add(source);
-      else archives.set(workspaceId, new Set([source]));
-    } else if (sources) {
-      sources.delete(source);
-      if (sources.size === 0) archives.delete(workspaceId);
-    }
+    const { archives } = this.workspaceArchiveActivity;
+    const newlyArchiving = active && !archives.has(workspaceId);
+    trackWorkspaceArchive(archives, workspaceId, source, active);
+    if (newlyArchiving) this.agentManager.limitRecovery?.onWorkspaceArchiveStarted(workspaceId);
   }
 
   private async emitWorkspaceArchiveUpdates(workspaceIds: Iterable<string>): Promise<void> {

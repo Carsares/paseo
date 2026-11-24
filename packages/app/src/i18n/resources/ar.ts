@@ -319,6 +319,18 @@ export const ar: TranslationResources = {
     },
   },
   agentPanel: {
+    limitRecovery: {
+      limited: "تُعاد تهيئة حد المحادثة في {{time}}.",
+      scheduled: "من المقرر أن تستأنف هذه الجلسة في {{time}}.",
+      unknown: "ربما تلقّى المزوّد رسالة الاستئناف. تحقّق من المحادثة قبل إعادة المحاولة.",
+      accepted: "قبِل المزوّد رسالة الاستئناف.",
+      cancelled: "أُلغي الاستئناف المجدول.",
+      failed: "تعذّر استئناف الجلسة تلقائيًا. يمكنك إعادة المحاولة يدويًا.",
+      sleep: "غفوة حتى تجديد الحد",
+      continue: "الاستئناف عند تجديد الحد",
+      cancel: "إلغاء الاستئناف",
+      changed: "تغيّر حد المحادثة أو حالة الاستئناف.",
+    },
     states: {
       notFound: "لم يتم العثور على Agent",
       failedToLoad: "فشل تحميل الوكيل",
@@ -1458,6 +1470,23 @@ export const ar: TranslationResources = {
       },
     },
     workspace: {
+      deferral: {
+        menu: "غفوة أو إيقاف مؤقت",
+        snoozed: "في غفوة",
+        parked: "متوقفة مؤقتًا",
+        snoozedUntil: "في غفوة حتى {{time}}",
+        snoozedList: "مساحات العمل في غفوة",
+        parkedList: "مساحات العمل المتوقفة مؤقتًا",
+        restore: "استعادة مساحة العمل",
+        restoreNamed: "استعادة {{name}} على {{host}}",
+        oneHour: "غفوة لمدة ساعة",
+        fourHours: "غفوة لمدة 4 ساعات",
+        oneDay: "غفوة لمدة يوم",
+        park: "إيقاف مساحة العمل مؤقتًا",
+        pending: "جارٍ التحديث…",
+        offline: "اتصل بالمضيف لإجراء التغييرات.",
+        error: "تعذّر تحديث مساحة العمل.",
+      },
       status: {
         serviceRunning: "الخدمة {{name}} قيد التشغيل",
         serviceUnhealthy: "الخدمة {{name}} غير سليمة",

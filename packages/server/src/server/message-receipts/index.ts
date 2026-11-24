@@ -88,6 +88,36 @@ export class MessageReceipts {
   private sequence = 0;
   constructor(private readonly directory: string) {}
 
+  async blockedReportDeferralRevision(
+    workspaceId: string,
+    reportId: string,
+    currentRevision: string | undefined,
+  ): Promise<string | undefined> {
+    const key = digest(["blocked-report-wake", workspaceId, reportId]);
+    const file = path.join(this.directory, `wake-${key}.json`);
+    let revision: string | undefined;
+    await this.serialize(key, async () => {
+      try {
+        const saved = z
+          .object({ revision: z.string().nullable() })
+          .parse(JSON.parse(await readFile(file, "utf8")));
+        revision = saved.revision ?? undefined;
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+        await writeJsonFileAtomic(file, { revision: currentRevision ?? null });
+        revision = currentRevision;
+      }
+    });
+    return revision;
+  }
+
+  async outcome(agentId: string, messageId: string): Promise<"accepted" | "unknown" | "absent"> {
+    const key = digest(["send", agentId, messageId]);
+    const receipt = await readReceipt(path.join(this.directory, `${key}.json`));
+    if (!receipt) return "absent";
+    return receipt.state === "completed" ? "accepted" : "unknown";
+  }
+
   send(input: SendMessageInput): Promise<void> {
     if (input.queue) {
       return this.sendQueued({ ...input.queue, agentId: input.agentId, request: input.request });

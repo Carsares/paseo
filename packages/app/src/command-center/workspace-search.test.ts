@@ -50,6 +50,16 @@ describe("workspace ranking", () => {
     expect(ids([subject], "  ")).toEqual(["payments"]);
   });
 
+  it("keeps parked and snoozed workspaces discoverable by name", () => {
+    const stamp = "2030-01-01T01:00:00.000Z";
+    const snoozed = {
+      ...workspace({ id: "snoozed", title: "Payments cleanup" }),
+      snoozedUntil: stamp,
+    };
+    const parked = { ...workspace({ id: "parked", title: "Payments migration" }), parkedAt: stamp };
+    expect(createWorkspaceRanker()([snoozed, parked], "payments")).toEqual([snoozed, parked]);
+  });
+
   it("matches its own change-request number in every spelling", () => {
     const spellings = ["42", " 42 ", "#42", "!42", "pr 42", "mr 42", "PR #42", "mr!42", "pr42"];
     for (const query of spellings) {

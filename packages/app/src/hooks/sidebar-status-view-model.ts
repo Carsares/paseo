@@ -1,6 +1,7 @@
 import type { TFunction } from "i18next";
 import { STATUS_BUCKET_ORDER } from "@/utils/sidebar-agent-state";
 import type { SidebarWorkspaceEntry } from "@/hooks/sidebar-workspaces-view-model";
+import { isWorkspaceDeferred } from "@/workspace-deferral/model";
 
 export type StatusBucket = SidebarWorkspaceEntry["statusBucket"];
 
@@ -32,6 +33,7 @@ export function buildStatusGroups(
   const bucketRows = new Map<StatusBucket, SidebarWorkspaceEntry[]>();
 
   for (const ws of workspaces) {
+    if (isWorkspaceDeferred(ws)) continue;
     const bucket: StatusBucket = ws.statusBucket;
     let rows = bucketRows.get(bucket);
     if (!rows) {

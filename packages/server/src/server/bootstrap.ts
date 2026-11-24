@@ -1,3 +1,5 @@
+import { WorkspaceDeferral } from "./workspace-deferral/deferral.js";
+import { AgentLimitRecovery } from "./schedule/agent-limit-recovery.js";
 import { unarchiveWorkspaceAgents } from "./workspace-archive-service.js";
 import { createRestartRecovery } from "./agent/restart-recovery/index.js";
 import { createLifecyclePreparation } from "./agent/restart-recovery/lifecycle-preparation.js";
@@ -137,7 +139,12 @@ export async function fanOutReconciledWorkspaceUpdates(input: {
 
 import { VoiceAssistantWebSocketServer, isDaemonOriginAllowed } from "./websocket-server.js";
 import { MessageReceipts } from "./message-receipts/index.js";
-import { enqueueRecoverableAgentMessage, retainQueuedAgentMessage } from "./session.js";
+import {
+  enqueueRecoverableAgentMessage,
+  isWorkspaceArchivePending,
+  retainQueuedAgentMessage,
+  trackExternalWorkspaceArchive,
+} from "./session.js";
 import { WorkspaceSetupRuntime } from "./workspace-setup-runtime.js";
 import { createWorkspaceLabelService } from "./workspace-labels/index.js";
 import { createChangeRequestRouter } from "../services/change-request-router.js";
@@ -1078,6 +1085,26 @@ export async function createPaseoDaemon(
       resolvePaseoToolPolicy(provider, daemonConfigStore.get().providers),
     logger,
   });
+  const workspaceDeferral = new WorkspaceDeferral(
+    workspaceRegistry,
+    logger,
+    Date.now,
+    messageReceipts,
+  );
+  const agentLimitRecovery = new AgentLimitRecovery({
+    serverId,
+    manager: agentManager,
+    storage: agentStorage,
+    workspaces: workspaceRegistry,
+    receipts: messageReceipts,
+    deferral: workspaceDeferral,
+    isWorkspaceArchiving: (workspaceId) =>
+      isWorkspaceArchivePending(workspaceRegistry, workspaceId),
+    logger,
+  });
+  agentManager.workspaceDeferral = workspaceDeferral;
+  agentManager.limitRecovery = agentLimitRecovery;
+
   daemonConfigStore.onFieldChange("mainControlAppendSystemPrompt", (value) => {
     agentManager.setMainControlAppendSystemPrompt(typeof value === "string" ? value : "");
   });
@@ -1265,12 +1292,16 @@ export async function createPaseoDaemon(
   };
   const markWorkspaceArchivingExternal = (workspaceIds: Iterable<string>, archivingAt: string) => {
     const workspaceIdList = Array.from(workspaceIds);
+    trackExternalWorkspaceArchive(workspaceRegistry, workspaceIdList, true);
+    for (const workspaceId of workspaceIdList)
+      agentLimitRecovery.onWorkspaceArchiveStarted(workspaceId);
     for (const session of wsServer?.listSessions() ?? []) {
       session.markWorkspaceArchivingForExternalMutation(workspaceIdList, archivingAt);
     }
   };
   const clearWorkspaceArchivingExternal = (workspaceIds: Iterable<string>) => {
     const workspaceIdList = Array.from(workspaceIds);
+    trackExternalWorkspaceArchive(workspaceRegistry, workspaceIdList, false);
     for (const session of wsServer?.listSessions() ?? []) {
       session.clearWorkspaceArchivingForExternalMutation(workspaceIdList);
     }
@@ -2130,6 +2161,8 @@ export async function createPaseoDaemon(
               releaseFinishRecovery();
             }
             await changeRequestWatches.start();
+            await workspaceDeferral.start();
+            await agentLimitRecovery.start();
             wsServer.beginAcceptingConnections();
             const relaySecurityLogger = logger.child({ module: "relay-security" });
             relayRuntime = createRelayRuntime({
@@ -2217,6 +2250,8 @@ export async function createPaseoDaemon(
         "Failed to prepare agent recovery during shutdown; continuing cleanup",
       );
     }
+    agentLimitRecovery.stop();
+    workspaceDeferral.stop();
     localCredential = null;
     await deleteLocalCredential(config.paseoHome);
     // Stop tracking plugin provider registrations before anything tears plugins

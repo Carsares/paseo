@@ -9625,6 +9625,52 @@ describe("Codex failed reply retraction", () => {
     await session.close();
   });
 
+  test.each(["usageLimitExceeded", "rateLimitExceeded"])(
+    "preserves a %s turn failure without borrowing an account reset time",
+    async (codexErrorInfo) => {
+      const session = createSession();
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      const notify = (method: string, params: Record<string, unknown>) =>
+        asInternals(session).handleNotification(method, params);
+      // The Codex v0.171 app-server account update carries a rolling window but no turn ID.
+      // The terminal turn error carries a category but no reference to that account window.
+      const error = {
+        message: "The provider limit was reached",
+        codexErrorInfo,
+        additionalDetails: null,
+      };
+      try {
+        await notify("account/rateLimits/updated", {
+          rateLimits: {
+            limitId: "codex",
+            primary: {
+              usedPercent: 100,
+              windowDurationMins: 300,
+              resetsAt: Math.floor(Date.now() / 1000) + 1800,
+            },
+          },
+        });
+        await notify("error", {
+          threadId: "test-thread",
+          turnId: "test-turn",
+          willRetry: false,
+          error,
+        });
+        await notify("turn/completed", {
+          threadId: "test-thread",
+          turn: { id: "test-turn", status: "failed", error },
+        });
+        const failures = events.filter((event) => event.type === "turn_failed");
+        expect(failures).toHaveLength(1);
+        expect(failures[0]).toMatchObject({ turnId: "test-turn", error: error.message });
+        expect(failures[0]).not.toHaveProperty("conversationLimit");
+      } finally {
+        await session.close();
+      }
+    },
+  );
+
   test("replaces a divergent final reply instead of appending it to streamed text", async () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];

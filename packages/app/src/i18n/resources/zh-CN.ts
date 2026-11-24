@@ -319,6 +319,18 @@ export const zhCN: TranslationResources = {
     },
   },
   agentPanel: {
+    limitRecovery: {
+      limited: "对话额度将在 {{time}} 重置。",
+      scheduled: "此会话将在 {{time}} 继续。",
+      unknown: "供应商可能已收到继续消息。重试前请查看会话。",
+      accepted: "供应商已接受继续消息。",
+      cancelled: "已取消定时继续。",
+      failed: "会话未能自动继续。你可以手动重试。",
+      sleep: "睡到恢复",
+      continue: "到点继续",
+      cancel: "取消续跑",
+      changed: "对话额度或续跑状态已变更。",
+    },
     states: {
       notFound: "未找到 Agent",
       failedToLoad: "加载 Agent 失败",
@@ -1447,6 +1459,23 @@ export const zhCN: TranslationResources = {
       },
     },
     workspace: {
+      deferral: {
+        menu: "搁置或安置",
+        snoozed: "已搁置",
+        parked: "已安置",
+        snoozedUntil: "搁置至 {{time}}",
+        snoozedList: "已搁置的工作区",
+        parkedList: "已安置的工作区",
+        restore: "恢复工作区",
+        restoreNamed: "恢复 {{host}} 上的 {{name}}",
+        oneHour: "搁置 1 小时",
+        fourHours: "搁置 4 小时",
+        oneDay: "搁置 1 天",
+        park: "安置工作区",
+        pending: "正在更新…",
+        offline: "连接到主机后即可修改。",
+        error: "无法更新工作区。",
+      },
       status: {
         serviceRunning: "服务 {{name}} 运行中",
         serviceUnhealthy: "服务 {{name}} 异常",

@@ -7,6 +7,7 @@ import {
   type SidebarWorkspacesListResult,
 } from "@/hooks/use-sidebar-workspaces-list";
 import { useSidebarWorkspaceEntries } from "@/hooks/use-sidebar-workspace-entries";
+import { filterDeferredSidebarProjects } from "@/hooks/sidebar-workspaces-view-model";
 import { usePinnedSidebarKeys, type PinnedSidebarGroups } from "@/hooks/use-sidebar-pins";
 import { useSidebarCollapsedSectionsStore } from "@/stores/sidebar-collapsed-sections-store";
 import {
@@ -17,6 +18,7 @@ import {
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import type { SidebarShortcutModel } from "@/utils/sidebar-shortcuts";
 import { buildSidebarProjection } from "./sidebar-projection";
+import { isWorkspaceDeferred } from "@/workspace-deferral/model";
 import type { SidebarProjectIconTarget } from "@/utils/sidebar-project-row-model";
 import { filterWorkspacesByLabels, type SidebarWorkspaceGroup } from "./sidebar-labels";
 import { filterWorkspacesByProjects, resolveActiveProjectFilters } from "./sidebar-project-filter";
@@ -109,7 +111,9 @@ export function SidebarModelProvider({
   );
   const filteredWorkspaceEntriesByKey = useMemo(() => {
     const byProject = filterWorkspacesByProjects({
-      workspaces: [...workspaceEntriesByKey.values()],
+      workspaces: [...workspaceEntriesByKey.values()].filter(
+        (workspace) => !isWorkspaceDeferred(workspace),
+      ),
       projectFilters: resolvedProjectFilters,
     });
     const filtered = filterWorkspacesByLabels({
@@ -127,7 +131,7 @@ export function SidebarModelProvider({
   // a header row you can create your first workspace under. The label filter can only ask about
   // workspaces, so a project it empties has nothing left to show.
   const filteredProjects = useMemo(() => {
-    let projects = list.projects;
+    let projects = filterDeferredSidebarProjects(list.projects, workspaceEntriesByKey);
     if (hasActiveProjectFilter) {
       const included = new Set(resolvedProjectFilters);
       projects = projects.filter((project) => included.has(project.viewKey));
@@ -150,6 +154,7 @@ export function SidebarModelProvider({
     resolvedProjectFilters,
     list.projects,
     visibleWorkspaceKeys,
+    workspaceEntriesByKey,
   ]);
   const pinnedKeys = usePinnedSidebarKeys(filteredProjects);
   const projectionInput = useMemo(

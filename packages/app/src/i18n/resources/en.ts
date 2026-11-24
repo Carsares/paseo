@@ -317,6 +317,19 @@ export const en = {
     },
   },
   agentPanel: {
+    limitRecovery: {
+      limited: "Conversation limit resets at {{time}}.",
+      scheduled: "This session is scheduled to continue at {{time}}.",
+      unknown:
+        "The provider may have received the continuation. Check the conversation before retrying.",
+      accepted: "The provider accepted the continuation.",
+      cancelled: "The scheduled continuation was cancelled.",
+      failed: "The session could not continue automatically. You can retry manually.",
+      sleep: "Sleep until reset",
+      continue: "Continue at reset",
+      cancel: "Cancel continuation",
+      changed: "The conversation limit or continuation has changed.",
+    },
     states: {
       notFound: "Agent not found",
       failedToLoad: "Failed to load agent",
@@ -1468,6 +1481,23 @@ export const en = {
       },
     },
     workspace: {
+      deferral: {
+        menu: "Snooze or park",
+        snoozed: "Snoozed",
+        parked: "Parked",
+        snoozedUntil: "Snoozed until {{time}}",
+        snoozedList: "Snoozed workspaces",
+        parkedList: "Parked workspaces",
+        restore: "Restore workspace",
+        restoreNamed: "Restore {{name}} on {{host}}",
+        oneHour: "Snooze for 1 hour",
+        fourHours: "Snooze for 4 hours",
+        oneDay: "Snooze for 1 day",
+        park: "Park workspace",
+        pending: "Updating…",
+        offline: "Connect to the host to make changes.",
+        error: "Could not update the workspace.",
+      },
       status: {
         serviceRunning: "Service {{name}} running",
         serviceUnhealthy: "Service {{name}} unhealthy",

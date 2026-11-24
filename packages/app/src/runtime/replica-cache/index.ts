@@ -260,6 +260,20 @@ const StoredAgentSnapshotSchema = z.strictObject({
   pendingPermissions: z.array(z.never()).max(0),
   persistence: z.null(),
   lastError: z.string().optional(),
+  conversationLimit: z
+    .strictObject({
+      turnId: z.string(),
+      limitId: z.string(),
+      resetsAt: IsoDateSchema,
+    })
+    .optional(),
+  rateLimitContinuation: z
+    .strictObject({
+      turnId: z.string(),
+      runAt: IsoDateSchema,
+      status: z.enum(["scheduled", "unknown", "accepted", "cancelled", "failed"]),
+    })
+    .optional(),
   title: z.string().nullable(),
   labels: z.record(z.string(), z.string()),
   // Optional: clients without background_agents never received a background agent to cache.
@@ -333,6 +347,8 @@ const StoredWorkspaceSchema = z.strictObject({
   name: z.string(),
   title: z.string().nullable(),
   pinnedAt: z.string().nullable(),
+  snoozedUntil: IsoDateSchema.optional(),
+  parkedAt: IsoDateSchema.optional(),
   // Optional because entries written before labels existed have none. A cached workspace that
   // dropped them painted its row without its chips and stayed that way: the directory cursor is
   // current on reconnect, so the daemon has nothing newer to send back.
@@ -723,6 +739,8 @@ function serializeAgent(agent: Agent): StoredAgent {
     pendingPermissions: [],
     persistence: null,
     ...(agent.lastError ? { lastError: agent.lastError } : {}),
+    ...(agent.conversationLimit ? { conversationLimit: agent.conversationLimit } : {}),
+    ...(agent.rateLimitContinuation ? { rateLimitContinuation: agent.rateLimitContinuation } : {}),
     title: agent.title,
     labels: agent.labels,
     ...(agent.background ? { background: true } : {}),
@@ -783,6 +801,8 @@ function serializeWorkspace(workspace: WorkspaceDescriptor): StoredWorkspace {
     name: workspace.name,
     title: workspace.title ?? null,
     pinnedAt: workspace.pinnedAt ?? null,
+    ...(workspace.snoozedUntil ? { snoozedUntil: workspace.snoozedUntil } : {}),
+    ...(workspace.parkedAt ? { parkedAt: workspace.parkedAt } : {}),
     labels: workspace.labels,
     status: workspace.status,
     statusEnteredAt: workspace.statusEnteredAt?.toISOString() ?? null,

@@ -212,6 +212,36 @@ function directory(
   };
 }
 
+it("retains workspace deferrals and recovery state across windows without carrying cleared values forward", async () => {
+  const storage = new MemoryStorage();
+  const writer = createCache(storage);
+  const baseline = directory();
+  const resetsAt = "2030-01-01T01:00:00.000Z";
+  const parkedAt = "2026-11-24T01:00:00.000Z";
+  baseline.workspaces.set(
+    "workspace-1",
+    normalizeWorkspaceDescriptor({ ...workspacePayload(), parkedAt }),
+  );
+  const conversationLimit = { turnId: "turn", limitId: "limit", resetsAt };
+  const rateLimitContinuation = { turnId: "turn", runAt: resetsAt, status: "unknown" } as const;
+  baseline.agents.set("agent-1", { ...agent(), conversationLimit, rateLimitContinuation });
+  commitDirectory(writer, SERVER_ID, baseline);
+  await writer.flush();
+  const reopened = await createCache(storage).readDirectory(SERVER_ID);
+  expect(reopened.workspaces.get("workspace-1")?.parkedAt).toBe(parkedAt);
+  expect(reopened.agents.get("agent-1")).toMatchObject({
+    conversationLimit,
+    rateLimitContinuation,
+  });
+
+  commitDirectory(writer, SERVER_ID, directory({ agents: { generation: "new", afterSeq: 1 } }));
+  await writer.flush();
+  const refreshed = await createCache(storage).readDirectory(SERVER_ID);
+  expect(refreshed.workspaces.get("workspace-1")).not.toHaveProperty("parkedAt");
+  expect(refreshed.agents.get("agent-1")).not.toHaveProperty("conversationLimit");
+  expect(refreshed.agents.get("agent-1")).not.toHaveProperty("rateLimitContinuation");
+});
+
 function timeline(text = "Cached") {
   return {
     agentId: "agent-1",
