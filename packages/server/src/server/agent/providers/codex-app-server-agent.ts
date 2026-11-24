@@ -9,7 +9,6 @@ import {
   type AgentPermissionAction,
   type AgentCapabilityFlags,
   type AgentClient,
-  type AgentCommandOutcome,
   type AgentCreateSessionOptions,
   type AgentOptionControl,
   type AgentLaunchContext,
@@ -25,6 +24,7 @@ import {
   type AgentPromptContentBlock,
   type AgentPromptInput,
   type AgentRunOptions,
+  type OutOfBandCommandContext,
   type AgentRunResult,
   type AgentRuntimeInfo,
   type AgentClientInstallation,
@@ -5159,9 +5159,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       // outlives it into the new turn.
       await this.waitForInterruptedTurnCleanup();
       if (options?.beforeProviderDispatch) await options.beforeProviderDispatch();
-      if (pendingStart.cancelRequested) {
-        throw new AgentTurnStartCanceledError();
-      }
+      this.assertTurnStartAllowed(pendingStart, options);
       try {
         await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS);
       } catch (error) {
@@ -5183,6 +5181,14 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       pendingStart.resolve();
     }
+  }
+
+  private assertTurnStartAllowed(
+    pendingStart: { cancelRequested: boolean },
+    options?: AgentRunOptions,
+  ): void {
+    if (pendingStart.cancelRequested) throw new AgentTurnStartCanceledError();
+    options?.assertProviderDispatchAllowed?.();
   }
 
   async steerActiveTurn(
@@ -5214,6 +5220,19 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!(await this.prepareSteerHandoff(admission, options.beforeProviderDispatch))) {
       return { status: "unavailable" };
     }
+    return this.sendSteer(admission, input, options);
+  }
+
+  private async sendSteer(
+    {
+      client,
+      threadId,
+      nativeTurnId,
+    }: Parameters<CodexAppServerAgentSession["matchesSteerAdmission"]>[0],
+    input: Awaited<ReturnType<CodexAppServerAgentSession["buildUserInput"]>>,
+    options: SteerActiveTurnOptions,
+  ): Promise<SteerResult> {
+    options.assertProviderDispatchAllowed?.();
     try {
       const response = await client.request(
         "turn/steer",
@@ -5797,9 +5816,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     });
   }
 
-  async interrupt(): Promise<void> {
+  async interrupt(options?: { assertCurrent?: () => void }): Promise<void> {
     const pendingStart = this.pendingForegroundStart;
     if (pendingStart) {
+      options?.assertCurrent?.();
       pendingStart.cancelRequested = true;
       await pendingStart.promise;
     }
@@ -5831,8 +5851,21 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (!turnId || (foregroundTurnId && this.activeForegroundTurnId !== foregroundTurnId)) {
       throw new Error("Cannot interrupt Codex before turn/started identifies the active turn");
     }
-    const client = this.client;
-    const threadId = this.currentThreadId;
+    return this.sendTurnInterrupt(
+      this.client,
+      this.currentThreadId,
+      turnId,
+      options?.assertCurrent,
+    );
+  }
+
+  private async sendTurnInterrupt(
+    client: CodexAppServerClient,
+    threadId: string,
+    turnId: string,
+    assertCurrent?: () => void,
+  ): Promise<void> {
+    assertCurrent?.();
     const interruptRequest = client.request(
       "turn/interrupt",
       {
@@ -6121,10 +6154,10 @@ export class CodexAppServerAgentSession implements AgentSession {
 
     if (parsed.commandName === "compact") {
       return {
-        run: async ({ emit, beforeProviderDispatch, onProviderOutcome }) => {
-          const error = await this.executeCompactCommand(beforeProviderDispatch, onProviderOutcome);
+        run: async (context) => {
+          const error = await this.executeCompactCommand(context);
           if (error) {
-            emit({
+            context.emit({
               type: "timeline",
               provider: CODEX_PROVIDER,
               item: { type: "assistant_message", text: formatOutOfBandStatusMessage(error) },
@@ -6138,11 +6171,11 @@ export class CodexAppServerAgentSession implements AgentSession {
 
     const subcommand = parseGoalSubcommand(parsed.args);
     return {
-      run: async ({ emit, beforeProviderDispatch, onProviderOutcome }) => {
+      run: async (context) => {
         const text = formatOutOfBandStatusMessage(
-          await this.executeGoalSubcommand(subcommand, beforeProviderDispatch, onProviderOutcome),
+          await this.executeGoalSubcommand(subcommand, context),
         );
-        emit({
+        context.emit({
           type: "timeline",
           provider: CODEX_PROVIDER,
           item: { type: "assistant_message", text },
@@ -6153,10 +6186,14 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private async dispatchCommandRequest(
     request: () => Promise<unknown>,
-    beforeProviderDispatch?: () => Promise<void>,
-    onProviderOutcome?: (outcome?: AgentCommandOutcome) => void | Promise<void>,
+    {
+      beforeProviderDispatch,
+      assertProviderDispatchAllowed,
+      onProviderOutcome,
+    }: OutOfBandCommandContext,
   ): Promise<void> {
     if (beforeProviderDispatch) await beforeProviderDispatch();
+    assertProviderDispatchAllowed?.();
     try {
       await request();
     } catch (error) {
@@ -6170,10 +6207,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     await onProviderOutcome?.("accepted");
   }
 
-  private async executeCompactCommand(
-    beforeProviderDispatch?: () => Promise<void>,
-    onProviderOutcome?: (outcome?: AgentCommandOutcome) => void | Promise<void>,
-  ): Promise<string | null> {
+  private async executeCompactCommand(context: OutOfBandCommandContext): Promise<string | null> {
     try {
       await this.connect();
       if (this.currentThreadId) {
@@ -6189,8 +6223,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         const { client, currentThreadId: threadId } = this;
         await this.dispatchCommandRequest(
           () => client.request("thread/compact/start", { threadId }),
-          beforeProviderDispatch,
-          onProviderOutcome,
+          context,
         );
       } catch (error) {
         this.pendingManualCompactionStarts = Math.max(0, this.pendingManualCompactionStarts - 1);
@@ -6205,8 +6238,7 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private async executeGoalSubcommand(
     subcommand: GoalSubcommand,
-    beforeProviderDispatch?: () => Promise<void>,
-    onProviderOutcome?: (outcome?: AgentCommandOutcome) => void | Promise<void>,
+    context: OutOfBandCommandContext,
   ): Promise<string> {
     if (subcommand.kind === "usage") {
       return "Usage: /goal <objective>|pause|resume|clear";
@@ -6225,11 +6257,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       const { client, currentThreadId: threadId } = this;
       const request = (method: string, params: Record<string, unknown>) =>
-        this.dispatchCommandRequest(
-          () => client.request(method, { threadId, ...params }),
-          beforeProviderDispatch,
-          onProviderOutcome,
-        );
+        this.dispatchCommandRequest(() => client.request(method, { threadId, ...params }), context);
       switch (subcommand.kind) {
         case "set": {
           await request("thread/goal/set", {

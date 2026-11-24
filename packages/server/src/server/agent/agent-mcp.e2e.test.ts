@@ -13,7 +13,9 @@ import { withTimeout } from "../../utils/promise-timeout.js";
 import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
 import { MessageReceipts } from "../message-receipts/index.js";
-import { AgentCommandNotDispatchedError } from "./agent-manager.js";
+import { AgentCommandNotDispatchedError, type AgentManager } from "./agent-manager.js";
+import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
+import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import type {
@@ -234,6 +236,82 @@ async function waitForAgentFinish(options: { client: McpClient; agentId: string 
       { timeout: 10000 },
     )
     .toBe("idle");
+}
+
+async function dispatchBoundCompact(
+  mainClient: McpClient,
+  fakeCodex: ReturnType<typeof createFakeCodexAppServer>,
+  manager: AgentManager,
+  compactRequest: Promise<void>,
+  confirmCompact: () => void,
+) {
+  const compactChild = getStructuredContent(
+    await mainClient.callTool({
+      name: "create_agent",
+      args: {
+        title: "Compact on creation",
+        provider: "codex/codex-test-model",
+        settings: { modeId: "full-access" },
+        initialPrompt: "/compact",
+        notifyOnFinish: false,
+        taskBinding: { taskId: "compact-create", title: "Compact on creation" },
+      },
+    }),
+  );
+  expect(compactChild).toMatchObject({ agentId: expect.any(String), taskId: "compact-create" });
+  const childId = String(compactChild?.agentId);
+  const threadId = "thread-1";
+  fakeCodex.startsTurn({ threadId, turnId: "unrelated" });
+  await expect.poll(() => manager.hasInFlightRun(childId)).toBe(true);
+  const sending = mainClient.callTool({
+    name: "send_agent_prompt",
+    args: {
+      agentId: childId,
+      prompt: "/compact",
+      activeTurnBehavior: "interrupt",
+      notifyOnFinish: false,
+      taskBinding: { taskId: "compact-send", title: "Compact through queue" },
+    },
+  });
+  try {
+    await withTimeout({
+      promise: compactRequest,
+      timeoutMs: 5_000,
+      label: "Codex compact request",
+    });
+    fakeCodex.child.stdout.write(
+      JSON.stringify({
+        method: "turn/completed",
+        params: { threadId, turn: { id: "unrelated", status: "completed", error: null } },
+      }) + "\n",
+    );
+    await expect.poll(() => manager.getAgent(childId)?.lifecycle).toBe("idle");
+  } finally {
+    confirmCompact();
+  }
+  const compactSend = getStructuredContent(await sending);
+  expect(compactSend).toMatchObject({ deliveryStatus: "dispatched", taskId: "compact-send" });
+  expect(
+    fakeCodex.requests().filter(({ method }) => method === "thread/compact/start"),
+  ).toHaveLength(2);
+  expect(fakeCodex.requests().some(({ method }) => method === "turn/start")).toBe(false);
+  expect(fakeCodex.requests().some(({ method }) => method === "turn/interrupt")).toBe(false);
+}
+
+function expectBoundCompactEvents(
+  tasks: { taskId: string; events: { kind: string; id: string }[] }[],
+) {
+  const createEvents = tasks.find(({ taskId }) => taskId === "compact-create")?.events;
+  const sendEvents = tasks.find(({ taskId }) => taskId === "compact-send")?.events;
+  expect(createEvents?.map(({ kind }) => kind)).toEqual([
+    "created",
+    "dispatched",
+    "turn_completed",
+    "dispatched",
+  ]);
+  expect(sendEvents?.map(({ kind }) => kind)).toEqual(["dispatched"]);
+  expect(sendEvents?.[0]?.id).toBe(createEvents?.[3]?.id);
+  expect(sendEvents?.[0]?.id).not.toBe(createEvents?.[1]?.id);
 }
 
 describe("agent MCP end-to-end (offline)", () => {
@@ -527,6 +605,29 @@ describe("agent MCP end-to-end (offline)", () => {
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
     const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
     const port = await getAvailablePort();
+    const compactRequest = Promise.withResolvers<void>();
+    const compactAck = Promise.withResolvers<object>();
+    let compactCount = 0;
+    const fakeCodex = createFakeCodexAppServer({
+      "thread/compact/start": () => {
+        if (++compactCount === 1) return {};
+        compactRequest.resolve();
+        return compactAck.promise;
+      },
+    });
+    const clients = createTestAgentClients();
+    const codex: AgentClient = {
+      ...clients.codex,
+      fetchCatalog: () => clients.codex.fetchCatalog!(),
+      isAvailable: async () => true,
+      createSession: async (config) =>
+        new CodexAppServerAgentSession(
+          config,
+          null,
+          pino({ level: "silent" }),
+          async () => fakeCodex.child,
+        ),
+    };
 
     const daemonConfig: PaseoDaemonConfig = {
       listen: `127.0.0.1:${port}`,
@@ -536,7 +637,7 @@ describe("agent MCP end-to-end (offline)", () => {
       mcpEnabled: true,
       staticDir,
       mcpDebug: false,
-      agentClients: createTestAgentClients(),
+      agentClients: { ...clients, codex },
       agentStoragePath: path.join(paseoHome, "agents"),
       auth: { password: hashDaemonPassword("daemon-secret") },
     };
@@ -631,6 +732,13 @@ describe("agent MCP end-to-end (offline)", () => {
         }),
       );
       expect(dispatch).toMatchObject({ deliveryStatus: "dispatched", taskId: taskBinding.taskId });
+      await dispatchBoundCompact(
+        mainClient,
+        fakeCodex,
+        daemon.agentManager,
+        compactRequest.promise,
+        () => compactAck.resolve({}),
+      );
       const command = vi.spyOn(daemon.agentManager, "tryRunOutOfBand");
       const recoverableReceipt = vi.spyOn(MessageReceipts.prototype, "sendQueued");
       try {
@@ -689,10 +797,35 @@ describe("agent MCP end-to-end (offline)", () => {
         await mainClient.callTool({ name: "list_workspace_tasks", args: {} }),
       );
       expect(ledgerResult).toMatchObject({
-        tasks: [
-          { ...taskBinding, status: "verifying", participants: [{ agentId: child?.agentId }] },
-        ],
+        tasks: expect.arrayContaining([
+          expect.objectContaining({
+            ...taskBinding,
+            status: "verifying",
+            participants: [{ agentId: child?.agentId, boundBy: agentId }],
+            events: expect.arrayContaining([
+              expect.objectContaining({ kind: "created" }),
+              expect.objectContaining({ kind: "dispatched" }),
+              expect.objectContaining({ kind: "turn_completed" }),
+            ]),
+            recentAgentStates: [expect.objectContaining({ lifecycle: "idle" })],
+            participantReuse: [
+              expect.objectContaining({ action: "reuse", reason: "idle", resetEpoch: 0 }),
+            ],
+          }),
+          expect.objectContaining({ taskId: "compact-create" }),
+          expect.objectContaining({ taskId: "compact-send" }),
+        ]),
       });
+      const tasks = ledgerResult?.tasks as {
+        taskId: string;
+        events: { kind: string; id: string }[];
+      }[];
+      expect(tasks.map(({ taskId }) => taskId).sort()).toEqual([
+        "compact-create",
+        "compact-send",
+        "mcp-review",
+      ]);
+      expectBoundCompactEvents(tasks);
     } finally {
       await mainClient?.close();
       if (agentId) {

@@ -17,9 +17,11 @@ import path from "node:path";
 import pino from "pino";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
-import { describe, expect, onTestFinished, test } from "vitest";
+import { describe, expect, onTestFinished, test, vi } from "vitest";
 
 import type { AgentSession, AgentSessionConfig, AgentStreamEvent } from "../../agent-sdk-types.js";
+import { AgentTurnStartRejectedError } from "../../agent-sdk-types.js";
+import { JsonlRpcResponseError } from "../jsonl-rpc-process.js";
 import { PiProviderOptionsSchema, PiRpcAgentClient, PiRpcAgentSession } from "./agent.js";
 import { PiCliRuntime } from "./cli-runtime.js";
 import { FakePi } from "./test-utils/fake-pi.js";
@@ -234,6 +236,46 @@ async function createSession(
   const events = new SessionEvents(session);
   return { pi, session, events };
 }
+
+test.each(["accept", "reject", "ordinary"] as const)(
+  "Pi prompt acknowledgement controls only confirmed starts (%s)",
+  async (scenario) => {
+    const { pi, session } = await createSession();
+    onTestFinished(() => session.close());
+    const runtime = pi.latestSession();
+    const original = runtime.prompt.bind(runtime);
+    const requested = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    vi.spyOn(runtime, "prompt").mockImplementationOnce(async (...args) => {
+      requested.resolve();
+      await release.promise;
+      if (scenario !== "accept") throw new JsonlRpcResponseError("provider rejected prompt");
+      return original(...args);
+    });
+    const terminal = Promise.withResolvers<AgentStreamEvent>();
+    session.subscribe((event) => {
+      if (event.type === "turn_failed") terminal.resolve(event);
+    });
+    const start = session.startTurn("work", { waitForProviderPrompt: scenario !== "ordinary" });
+    const settled = vi.fn();
+    void start.then(settled, settled);
+    await requested.promise;
+    if (scenario === "ordinary") {
+      await expect(start).resolves.toMatchObject({ turnId: expect.any(String) });
+      release.resolve();
+      await expect(terminal.promise).resolves.toMatchObject({ error: "provider rejected prompt" });
+      return;
+    }
+    await waitForImmediate();
+    expect(settled).not.toHaveBeenCalled();
+    release.resolve();
+    if (scenario === "accept") {
+      await expect(start).resolves.toMatchObject({ turnId: expect.any(String) });
+    } else {
+      await expect(start).rejects.toBeInstanceOf(AgentTurnStartRejectedError);
+    }
+  },
+);
 
 test("forwards launch-context env to the Pi process launch", async () => {
   const pi = new FakePi();
@@ -3308,6 +3350,25 @@ describe("PiRpcAgentClient", () => {
     await interruption;
     expect(events.turnLifecycleEvents()).toEqual([{ type: "turn_canceled", turnId }]);
     expect(fakeSession.prompts).toEqual([]);
+  });
+
+  test("rechecks a task interrupt before sending abort after clearing the queue", async () => {
+    const { pi, session } = await createSession();
+    onTestFinished(() => session.close());
+    const runtime = pi.latestSession();
+    const queueCleared = Promise.withResolvers<void>();
+    runtime.clearQueueCompletion = queueCleared.promise;
+    await session.startTurn("original turn");
+    const interrupt = session.interrupt({
+      assertCurrent: () => {
+        throw new Error("Target run changed");
+      },
+    });
+    const rejected = expect(interrupt).rejects.toThrow("Target run changed");
+    expect(runtime.controlRequests).toEqual(["clear_queue"]);
+    queueCleared.resolve();
+    await rejected;
+    expect(runtime.controlRequests).toEqual(["clear_queue"]);
   });
 
   test("closes Pi compact loading marker when RPC rejects after compaction starts", async () => {

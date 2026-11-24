@@ -131,6 +131,7 @@ export interface CreateAgentFromMcpInput {
   unattended?: boolean;
   promptFailure?: CreateAgentPromptFailureMode;
   validateInitialPromptDispatch?: (agentId: string) => Promise<void>;
+  initialPromptMessageId?: string;
   notifyOnFinish?: boolean;
   parentReporting?: "auto" | "explicit";
   resident?: { profileId?: string; role?: string };
@@ -619,6 +620,9 @@ async function resolveMcpCreateAgent(
       env: input.env,
     },
     prompt: trimmedPrompt ? trimmedPrompt : undefined,
+    runOptions: input.initialPromptMessageId
+      ? { clientMessageId: input.initialPromptMessageId }
+      : undefined,
     source: input.callerAgentId
       ? { kind: "agent-message", agentId: input.callerAgentId }
       : undefined,
@@ -777,6 +781,7 @@ async function sendInitialPrompt(
     if (prompt === undefined) {
       return { started: false, liveSnapshot: snapshot };
     }
+    if (validateDispatch) await validateDispatch(snapshot.id);
     const start = (handoff?: QueueHandoff) =>
       startCreatedAgentInitialPrompt({
         agentStorage: dependencies.agentStorage,

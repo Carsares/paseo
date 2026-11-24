@@ -457,8 +457,8 @@ export class OpenCodeV2Session implements AgentSession {
   stopBackgroundWork(id: string) {
     return this.background.stopItem(id);
   }
-  interrupt() {
-    return this.turns.interrupt();
+  interrupt(options?: { assertCurrent?: () => void }) {
+    return this.turns.interrupt(options);
   }
   async revertBoth(input: { messageId: string }) {
     await this.interrupt();

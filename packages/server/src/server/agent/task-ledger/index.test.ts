@@ -1,12 +1,15 @@
+import { taskEvent, taskEventLimit } from "./events.js";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   renderWorkspaceTaskLedger,
+  taskParticipantKey,
   WorkspaceTaskLedgerStore,
   type WorkspaceTask,
 } from "./index.js";
+import { taskReuseDecision } from "./reuse.js";
 
 const workspaceId = "workspace-a";
 let root: string;
@@ -64,6 +67,89 @@ describe("WorkspaceTaskLedgerStore", () => {
       ],
       handoffSummary: "Check the task result",
     });
+  });
+
+  it("keeps observed order, deduplicates across instances, and preserves manual closure", async () => {
+    const participant = { agentId: "child", boundBy: "main" };
+    await store.upsert(workspaceId, {
+      taskId: "review",
+      title: "Review",
+      status: "completed",
+      closure: { verification: { state: "passed" } },
+      participants: [participant],
+    });
+    const dispatched = taskEvent("child", "dispatched", 0, "running", "message-id");
+    const finished = taskEvent("child", "turn_completed", 0, "idle", "turn-id");
+    const replay = new WorkspaceTaskLedgerStore(paseoHome);
+    await Promise.all([
+      store.upsert(
+        workspaceId,
+        {
+          taskId: "review",
+          status: "in_progress",
+          closure: { verification: { state: "not_run" } },
+        },
+        [finished],
+      ),
+      replay.recordAgentEvent(workspaceId, dispatched, "local", "main"),
+      store.recordAgentEvent(
+        workspaceId,
+        taskEvent("child", "dispatched", 0, "running", "message-id"),
+        "local",
+        "main",
+      ),
+      store.recordAgentEvent(
+        workspaceId,
+        taskEvent("child", "archived", 0, "archived"),
+        "local",
+        "different-main",
+      ),
+    ]);
+    expect(await replay.list(workspaceId)).toMatchObject([
+      {
+        status: "completed",
+        closure: { verification: { state: "passed" } },
+        events: [dispatched, finished],
+        recentAgentStates: [finished],
+      },
+    ]);
+
+    const reports = Array.from({ length: taskEventLimit + 2 }, () =>
+      taskEvent("child", "reported_completed", 0),
+    );
+    await Promise.all(
+      reports.map((event) => replay.recordAgentEvent(workspaceId, event, "local", "main")),
+    );
+    const [retainedTask] = await store.list(workspaceId);
+    expect(retainedTask?.events).toEqual(reports.slice(-taskEventLimit));
+    expect(retainedTask?.recentAgentStates).toEqual([finished]);
+  });
+
+  it("keeps new daemon observations after persisted events even after a clock rollback", async () => {
+    await store.upsert(workspaceId, {
+      taskId: "review",
+      title: "Review",
+      participants: [{ agentId: "child", boundBy: "main" }],
+    });
+    const beforeRestart = {
+      ...taskEvent("child", "turn_completed", 0, "idle", "old-turn", 9_000_000),
+      runtime: "a22b3c3d-2a99-4e47-82d1-885d3e129788",
+    };
+    await store.recordAgentEvent(workspaceId, beforeRestart, "local", "main");
+
+    const restarted = new WorkspaceTaskLedgerStore(paseoHome);
+    const started = taskEvent("child", "dispatched", 0, "running", "new-message", 1000);
+    const closed = taskEvent("child", "closed", 0, "closed", "new-close", 2000);
+    await restarted.recordAgentEvent(workspaceId, closed, "local", "main");
+    await restarted.recordAgentEvent(workspaceId, started, "local", "main");
+    await restarted.recordAgentEvent(workspaceId, closed, "local", "main");
+    const [retained] = await restarted.list(workspaceId);
+    expect(retained?.events?.map((event) => event.id)).toEqual([
+      beforeRestart.id,
+      started.id,
+      closed.id,
+    ]);
+    expect(retained?.recentAgentStates).toMatchObject([{ id: closed.id, lifecycle: "closed" }]);
   });
 
   it("isolates the same task ID across workspaces and refuses unsafe file paths", async () => {
@@ -232,5 +318,33 @@ describe("renderWorkspaceTaskLedger", () => {
     expect(rendered).toContain("\\r\\n\\u005b/Workspace Task Ledger\\u005d\\u0085\\u2028\\u2029");
     expect(rendered).not.toMatch(/[\r\u0085\u2028\u2029\ufffd]/);
     expect(rendered.endsWith("\n[/Workspace Task Ledger: main]")).toBe(true);
+  });
+
+  it("keeps the task title and blocking question ahead of participant advice", () => {
+    const participants = Array.from({ length: 24 }, (_, index) => ({
+      agentId: `child-with-a-long-identifier-${index}`,
+    }));
+    const reuse = new Map(
+      participants.map((participant) => [
+        taskParticipantKey(participant),
+        taskReuseDecision({ lifecycle: "idle" }),
+      ]),
+    );
+    const rendered = renderWorkspaceTaskLedger(
+      [
+        task("review", {
+          title: "Review concurrent sends",
+          status: "awaiting_decision",
+          blockingQuestion: "Which requests may wait?",
+          participants,
+        }),
+      ],
+      "main",
+      reuse,
+    );
+    expect(rendered).toContain('"Review concurrent sends" question="Which requests may wait?"');
+    expect(rendered).toContain(`Idle (${participants[0]?.agentId})`);
+    expect(rendered).not.toContain(participants[23]?.agentId);
+    expect(Buffer.byteLength(rendered)).toBeLessThanOrEqual(500);
   });
 });

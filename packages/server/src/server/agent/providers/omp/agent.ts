@@ -1,3 +1,4 @@
+import { AgentTurnStartCanceledError, AgentTurnStartRejectedError } from "../../agent-sdk-types.js";
 import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { mapCustomMessageToToolCall } from "../custom-message.js";
 import { randomUUID } from "node:crypto";
@@ -122,6 +123,7 @@ import { DEFAULT_OMP_THINKING_LEVEL, mapOmpModel } from "./map-omp-model.js";
 
 const OMP_PROVIDER = "omp";
 const OMP_CORE_CAPABILITIES: AgentCapabilityFlags = {
+  defersConfirmedPromptHandoff: true,
   supportsStreaming: true,
   supportsSessionPersistence: true,
   supportsSessionListing: true,
@@ -157,6 +159,7 @@ export interface OmpNoTurnScheduler {
 // v0.2.0-beta.1; remove after January 20, 2027 once the minimum OMP version
 // guarantees prompt_result waits for queued extension work.
 const OMP_NO_TURN_SETTLE_MS = 5_000;
+const OMP_PROMPT_CONFIRMATION_TIMEOUT_MS = 60_000;
 const OMP_PROVIDER_IDLE_DEADLINE_MS = 600_000;
 const OMP_FAST_INACTIVE_MESSAGE = "Fast is enabled but does not apply to this model.";
 
@@ -184,6 +187,33 @@ interface OmpPromptResult {
   agentInvoked: boolean;
   /** Why OMP rejected the prompt before its agent ran, such as a missing API key. */
   error: string | null;
+}
+
+interface OmpPromptSubmission {
+  clientMessageId: string | null;
+  text: string;
+}
+
+interface OmpPromptConfirmation {
+  turnId: string;
+  submission: OmpPromptSubmission;
+  sent: boolean;
+  outcome: Promise<void>;
+  resolve(): void;
+  reject(error: Error): void;
+}
+
+function createPromptConfirmation(
+  turnId: string,
+  submission: OmpPromptSubmission,
+): OmpPromptConfirmation {
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  const outcome = new Promise<void>((accept, rejectPrompt) => {
+    resolve = accept;
+    reject = rejectPrompt;
+  });
+  return { turnId, submission, sent: false, outcome, resolve, reject };
 }
 
 function promptResultError(result: {
@@ -676,8 +706,7 @@ export class OmpAgentSession implements AgentSession {
   private readonly pendingExtensionUiRequests = new Map<string, AgentPermissionRequest>();
   private readonly questionUi = new OmpQuestionUi();
   private activeTurnId: string | null = null;
-  private readonly pendingClientMessages: Array<{ clientMessageId: string | null; text: string }> =
-    [];
+  private readonly pendingClientMessages: OmpPromptSubmission[] = [];
   private activeAssistantMessageId: string | null = null;
   private activeTurnTerminalAssistantMessage: OmpAgentMessage | null = null;
   private activeTurnStarted = false;
@@ -688,6 +717,7 @@ export class OmpAgentSession implements AgentSession {
   private activePromptRequestId: string | null = null;
   private activePromptAgentInvoked: boolean | null = null;
   private activePromptError: string | null = null;
+  private promptConfirmation: OmpPromptConfirmation | null = null;
   private readonly pendingPromptResults = new Map<string, OmpPromptResult>();
   private pendingNoTurnCompletionAbort: AbortController | null = null;
   private lastKnownThinkingOptionId: string | null;
@@ -890,8 +920,11 @@ export class OmpAgentSession implements AgentSession {
     this.clearNoTurnBuffers();
     const payload = await convertPromptInput(prompt, { model: this.state.model });
     if (this.closed) throw new Error("OMP session is closed");
-    if (this.activeTurnId !== turnId) return { turnId };
-    this.rememberClientMessage(options?.clientMessageId ?? null, payload.text);
+    if (this.activeTurnId !== turnId) {
+      if (options?.waitForProviderPrompt) throw new AgentTurnStartCanceledError();
+      return { turnId };
+    }
+    const remembered = this.rememberClientMessage(options?.clientMessageId ?? null, payload.text);
     this.activeNoTurnPromptText = payload.text;
     this.usagePoller.startTurn();
     if (announceTurn) {
@@ -899,62 +932,114 @@ export class OmpAgentSession implements AgentSession {
       this.emit({ type: "turn_started", provider: this.provider, turnId });
     }
 
+    const confirmation = options?.waitForProviderPrompt
+      ? createPromptConfirmation(turnId, remembered)
+      : undefined;
+    if (confirmation) {
+      // Events may arrive before the prompt RPC returns.
+      this.promptConfirmation = confirmation;
+      void confirmation.outcome.catch(() => undefined);
+    }
     const submit = async () => {
       try {
-        const ack = await this.submitPrompt(payload, streamingBehavior, commandContext);
-        this.activePromptRequestId = ack.requestId ?? null;
-        const correlatedResult = ack.requestId
-          ? this.pendingPromptResults.get(ack.requestId)
-          : undefined;
-        if (ack.requestId) {
-          this.pendingPromptResults.delete(ack.requestId);
-        }
-        this.activePromptAgentInvoked = correlatedResult?.agentInvoked ?? ack.agentInvoked ?? null;
-        this.activePromptError = correlatedResult?.error ?? null;
-        if (correlatedResult?.agentInvoked === false) {
-          this.scheduleNoTurnPromptCompletion(turnId);
-          return;
-        }
-        if (correlatedResult?.agentInvoked !== true && ack.agentInvoked === false) {
-          await this.completeNoTurnPrompt(turnId);
-          return;
-        }
-      } catch (error) {
-        if (this.activeTurnId !== turnId) {
-          return;
-        }
-        this.usagePoller.stopTurn();
-        this.resetActiveTurn({ terminalizeWork: true });
-        if (isOmpRequestAbortError(error)) {
-          this.emit({
-            type: "turn_canceled",
-            provider: this.provider,
-            turnId,
-            reason: toDiagnosticErrorMessage(error),
-          });
-          return;
-        }
-        this.emit({
-          type: "turn_failed",
-          provider: this.provider,
+        const ack = await this.submitPrompt(
+          payload,
+          streamingBehavior,
+          commandContext,
+          options,
           turnId,
-          error: toDiagnosticErrorMessage(error),
-        });
+        );
+        if (!confirmation || this.activeTurnId === turnId) await this.applyPromptAck(turnId, ack);
+        if (confirmation) await this.waitForPromptConfirmation(confirmation.outcome);
+      } catch (error) {
+        this.handlePromptSubmissionFailure(turnId, error, !!confirmation);
       }
     };
 
     // Recovery callers wait for the prompt RPC; ordinary starts publish its eventual result.
     const submission = submit();
-    if (commandContext?.onProviderOutcome) await submission;
+    if (commandContext?.onProviderOutcome || options?.waitForProviderPrompt) await submission;
     else void submission;
 
     return { turnId };
+  }
+
+  private async applyPromptAck(
+    turnId: string,
+    ack: Awaited<ReturnType<OmpRuntimeSession["prompt"]>>,
+  ): Promise<void> {
+    this.activePromptRequestId = ack.requestId ?? null;
+    const result = ack.requestId ? this.pendingPromptResults.get(ack.requestId) : undefined;
+    if (ack.requestId) this.pendingPromptResults.delete(ack.requestId);
+    this.activePromptAgentInvoked = result?.agentInvoked ?? ack.agentInvoked ?? null;
+    this.activePromptError = result?.error ?? null;
+    if (result?.error) {
+      this.rejectPromptConfirmation(turnId, new AgentTurnStartRejectedError(result.error));
+    } else if (this.activePromptAgentInvoked === true) {
+      this.acceptPromptConfirmation(turnId);
+    }
+    if (result?.agentInvoked === false) this.scheduleNoTurnPromptCompletion(turnId);
+    else if (this.activePromptAgentInvoked === false && !this.promptConfirmation) {
+      await this.completeNoTurnPrompt(turnId);
+    }
+  }
+
+  private async waitForPromptConfirmation(outcome: Promise<void>): Promise<void> {
+    const abort = new AbortController();
+    const timeout = delay(OMP_PROMPT_CONFIRMATION_TIMEOUT_MS, undefined, {
+      signal: abort.signal,
+      ref: false,
+    }).then(() => {
+      throw new Error("OMP did not confirm whether the prompt started");
+    });
+    try {
+      await Promise.race([outcome, timeout]);
+    } finally {
+      abort.abort();
+    }
+  }
+
+  private acceptPromptConfirmation(turnId: string | null | undefined): void {
+    if (this.promptConfirmation?.turnId !== turnId || !this.promptConfirmation) return;
+    this.promptConfirmation.resolve();
+    this.promptConfirmation = null;
+  }
+
+  private rejectPromptConfirmation(turnId: string | null | undefined, error: Error): void {
+    if (this.promptConfirmation?.turnId !== turnId || !this.promptConfirmation) return;
+    this.promptConfirmation.reject(error);
+    this.promptConfirmation = null;
+  }
+
+  private handlePromptSubmissionFailure(turnId: string, error: unknown, confirmed: boolean): void {
+    const current = this.activeTurnId === turnId;
+    if (current) {
+      this.usagePoller.stopTurn();
+      this.resetActiveTurn({ terminalizeWork: true });
+    }
+    const canceled = isOmpRequestAbortError(error);
+    if (confirmed) {
+      if (canceled) throw new AgentTurnStartCanceledError();
+      if (error instanceof JsonlRpcResponseError) {
+        throw new AgentTurnStartRejectedError(toDiagnosticErrorMessage(error), { cause: error });
+      }
+      throw error;
+    }
+    if (!current) return;
+    const message = toDiagnosticErrorMessage(error);
+    this.emit(
+      canceled
+        ? { type: "turn_canceled", provider: this.provider, turnId, reason: message }
+        : { type: "turn_failed", provider: this.provider, turnId, error: message },
+    );
   }
 
   private async submitPrompt(
     payload: Awaited<ReturnType<typeof convertPromptInput>>,
     streamingBehavior?: "steer" | "followUp",
     commandContext?: OutOfBandCommandContext,
+    options?: AgentRunOptions,
+    turnId?: string,
   ) {
     if (this.runtimeDead) await this.replaceRuntime(this.currentModeId ?? "full");
     if (this.closed) throw new Error("OMP session is closed");
@@ -964,7 +1049,16 @@ export class OmpAgentSession implements AgentSession {
         images: payload.images,
         streamingBehavior,
       });
-    if (!commandContext) return send();
+    if (!commandContext) {
+      if (options?.beforeProviderDispatch) await options.beforeProviderDispatch();
+      options?.assertProviderDispatchAllowed?.();
+      if (options?.waitForProviderPrompt && (this.closed || this.activeTurnId !== turnId)) {
+        throw new AgentTurnStartCanceledError();
+      }
+      const confirmation = this.promptConfirmation;
+      if (confirmation && confirmation.turnId === turnId) confirmation.sent = true;
+      return send();
+    }
     if (commandContext.beforeProviderDispatch) await commandContext.beforeProviderDispatch();
     return this.runCommandRequest(send, commandContext);
   }
@@ -979,6 +1073,7 @@ export class OmpAgentSession implements AgentSession {
     if (this.closed || this.activeTurnId !== options.expectedTurnId)
       return { status: "unavailable" };
     if (this.parseSlashCommandInput(payload.text)) return { status: "unavailable" };
+    options.assertProviderDispatchAllowed?.();
     const submission = this.rememberClientMessage(options.clientMessageId ?? null, payload.text);
     try {
       await this.runtimeSession.steer(payload.text, payload.images);
@@ -1000,25 +1095,19 @@ export class OmpAgentSession implements AgentSession {
     return { status: "accepted" };
   }
 
-  private rememberClientMessage(
-    clientMessageId: string | null,
-    text: string,
-  ): {
-    clientMessageId: string | null;
-    text: string;
-  } {
+  private rememberClientMessage(clientMessageId: string | null, text: string): OmpPromptSubmission {
     const submission = { clientMessageId, text };
     this.pendingClientMessages.push(submission);
     if (this.pendingClientMessages.length > 16) this.pendingClientMessages.shift();
     return submission;
   }
 
-  private forgetClientMessage(submission: { clientMessageId: string | null; text: string }): void {
+  private forgetClientMessage(submission: OmpPromptSubmission): void {
     const index = this.pendingClientMessages.indexOf(submission);
     if (index >= 0) this.pendingClientMessages.splice(index, 1);
   }
 
-  private takeClientMessage(): { clientMessageId: string | null; text: string } | undefined {
+  private takeClientMessage(): OmpPromptSubmission | undefined {
     return this.pendingClientMessages.shift();
   }
 
@@ -1229,6 +1318,7 @@ export class OmpAgentSession implements AgentSession {
       return;
     }
     this.closed = true;
+    this.rejectPromptConfirmation(this.activeTurnId, new AgentTurnStartCanceledError());
     this.unsubscribeRuntime?.();
     this.usagePoller.close();
     this.cancelNoTurnPromptCompletion();
@@ -1262,6 +1352,7 @@ export class OmpAgentSession implements AgentSession {
   }
 
   private resetActiveTurn({ terminalizeWork }: { terminalizeWork: boolean }): void {
+    this.rejectPromptConfirmation(this.activeTurnId, new AgentTurnStartCanceledError());
     if (terminalizeWork) this.terminalizeActiveWork();
     this.activeTurnId = null;
     this.activeAssistantMessageId = null;
@@ -1310,6 +1401,7 @@ export class OmpAgentSession implements AgentSession {
       }
       const streamingBehavior = commandName === "steer" ? "steer" : "followUp";
       return {
+        cannotConfirmTaskDispatch: true,
         run: async (context) => {
           if (!this.activeTurnId && !this.activeTurnStarted) {
             await this.startPrompt({
@@ -1412,18 +1504,22 @@ export class OmpAgentSession implements AgentSession {
     const error = this.activePromptError;
     this.emitBufferedNoTurnOutputs(turnId);
     if (error) {
+      this.rejectPromptConfirmation(turnId, new AgentTurnStartRejectedError(error));
       this.usagePoller.stopTurn();
       this.resetActiveTurn({ terminalizeWork: true });
       this.emit({ type: "turn_failed", provider: this.provider, turnId, error });
       return;
     }
+    this.acceptPromptConfirmation(turnId);
     this.completeTurn(turnId, []);
   }
 
   private clearNoTurnBuffers(): void {
     this.cancelNoTurnPromptCompletion();
     this.activeNoTurnPromptText = null;
-    this.activePromptRequestId = null;
+    // A start notification can belong to an extension cycle. Keep the request
+    // ID while confirmation is pending so its later result is still correlated.
+    if (!this.promptConfirmation) this.activePromptRequestId = null;
     this.activePromptAgentInvoked = null;
     this.activePromptError = null;
     this.pendingNoTurnOutputs.splice(0, this.pendingNoTurnOutputs.length);
@@ -1485,11 +1581,12 @@ export class OmpAgentSession implements AgentSession {
 
   private async runCommandRequest<T>(
     send: () => Promise<T>,
-    { onProviderOutcome }: OutOfBandCommandContext,
+    { onProviderOutcome, assertProviderDispatchAllowed }: OutOfBandCommandContext,
   ): Promise<T> {
     if (this.closed || this.runtimeDead) {
       throw new Error("OMP session is closed");
     }
+    assertProviderDispatchAllowed?.();
     let result: T;
     try {
       result = await send();
@@ -1873,6 +1970,14 @@ export class OmpAgentSession implements AgentSession {
         if (requestId === this.activePromptRequestId && this.activeTurnId) {
           this.activePromptAgentInvoked = agentInvoked;
           this.activePromptError = result.error;
+          if (result.error) {
+            this.rejectPromptConfirmation(
+              this.activeTurnId,
+              new AgentTurnStartRejectedError(result.error),
+            );
+          } else if (agentInvoked) {
+            this.acceptPromptConfirmation(this.activeTurnId);
+          }
           if (agentInvoked === false) {
             this.scheduleNoTurnPromptCompletion(this.activeTurnId);
           } else {
@@ -2142,6 +2247,13 @@ export class OmpAgentSession implements AgentSession {
     }
     const nativeMessage = event.message as OmpAgentMessage & { id?: unknown; entryId?: unknown };
     const messageId = readNativeMessageId(nativeMessage);
+    const currentConfirmation = this.promptConfirmation;
+    const matchingConfirmation =
+      currentConfirmation?.sent &&
+      currentConfirmation.turnId === turnId &&
+      currentConfirmation.submission.text === text
+        ? currentConfirmation
+        : undefined;
     const emitUserMessage = (resolvedMessageId?: string): void => {
       if (resolvedMessageId) {
         // OMP re-emits user message_end frames for entries it has already
@@ -2152,7 +2264,15 @@ export class OmpAgentSession implements AgentSession {
         }
         this.emittedUserMessageIds.add(resolvedMessageId);
       }
-      const clientMessageId = this.takeClientMessage()?.clientMessageId;
+      const confirmation = this.promptConfirmation;
+      const confirmDispatch = confirmation !== null && confirmation === matchingConfirmation;
+      const waitingSubmission = this.pendingClientMessages[0];
+      const preservePending = confirmation && waitingSubmission === confirmation.submission;
+      const submission = preservePending && !confirmDispatch ? undefined : this.takeClientMessage();
+      if (confirmDispatch && submission === confirmation.submission) {
+        this.acceptPromptConfirmation(turnId);
+      }
+      const clientMessageId = submission?.clientMessageId;
       this.emit({
         type: "timeline",
         provider: this.provider,

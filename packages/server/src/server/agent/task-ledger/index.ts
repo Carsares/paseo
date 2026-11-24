@@ -3,6 +3,15 @@ import { dirname, resolve } from "node:path";
 import { z } from "zod";
 import { normalizePathForIdentity } from "../../../utils/path.js";
 import { writeJsonFileAtomic } from "../../atomic-file.js";
+import {
+  compareTaskEvents,
+  mergeTaskEvents,
+  orderTaskEvents,
+  taskEventLimit,
+  type TaskEvent,
+  TaskEventSchema,
+} from "./events.js";
+import { isTaskParticipantAddress, type TaskReuseDecision } from "./reuse.js";
 
 const TaskStatusSchema = z.enum([
   "analyzing",
@@ -20,6 +29,7 @@ const TaskTitleSchema = z.string().trim().min(1);
 export const WorkspaceTaskParticipantSchema = z.object({
   agentId: z.string().min(1),
   serverId: z.string().min(1).optional(),
+  boundBy: z.string().min(1).optional(),
 });
 
 const TaskVerificationSchema = z
@@ -40,11 +50,31 @@ export const WorkspaceTaskUpsertSchema = z.object({
   blockingQuestion: z.string().optional(),
 });
 
+const boundedText = (bytes: number) =>
+  z
+    .string()
+    .refine((text) => Buffer.byteLength(text) <= bytes, `Must be at most ${bytes} UTF-8 bytes`);
+
+export const WorkspaceTaskToolInputSchema = WorkspaceTaskUpsertSchema.omit({ participants: true })
+  .extend({
+    taskId: boundedText(128).pipe(z.string().min(1)),
+    title: boundedText(512).pipe(TaskTitleSchema).optional(),
+    handoffSummary: boundedText(1024).optional(),
+    blockingQuestion: boundedText(1024).optional(),
+    closure: TaskClosureSchema.refine(
+      (closure) => Buffer.byteLength(JSON.stringify(closure)) <= 4096,
+      "Closure must be at most 4096 UTF-8 bytes",
+    ).optional(),
+  })
+  .strict();
+
 const WorkspaceTaskSchema = WorkspaceTaskUpsertSchema.extend({
   title: TaskTitleSchema,
   status: TaskStatusSchema,
   tier: TaskTierSchema,
   participants: z.array(WorkspaceTaskParticipantSchema),
+  events: z.array(TaskEventSchema).optional(),
+  recentAgentStates: z.array(TaskEventSchema).optional(),
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
 }).refine((task) => task.status !== "completed" || task.closure?.verification?.state !== "failed", {
@@ -139,9 +169,38 @@ function mergeTask(current: WorkspaceTask | undefined, update: WorkspaceTaskUpse
     closure: mergeClosure(closure, update.closure),
     handoffSummary: update.handoffSummary ?? handoffSummary,
     blockingQuestion: update.blockingQuestion ?? blockingQuestion,
+    events: current?.events,
+    recentAgentStates: current?.recentAgentStates,
     createdAt,
     updatedAt: now,
   });
+}
+
+function* retainedTaskEvents(tasks: WorkspaceTask[]) {
+  for (const task of tasks) {
+    yield* task.events ?? [];
+    yield* task.recentAgentStates ?? [];
+  }
+}
+
+function applyTaskEvents(task: WorkspaceTask, updates: readonly TaskEvent[]): WorkspaceTask {
+  if (!updates.length) return task;
+  const events = mergeTaskEvents(task.events ?? [], updates);
+  if (events.every((event, index) => event === task.events?.[index])) return task;
+  const states = new Map(task.recentAgentStates?.map((event) => [event.agentId, event]));
+  for (const event of events) {
+    const previous = states.get(event.agentId);
+    if (event.lifecycle && (!previous || compareTaskEvents(previous, event) < 0)) {
+      states.set(event.agentId, event);
+    }
+  }
+  return {
+    ...task,
+    events,
+    recentAgentStates: [...states.values()]
+      .sort((a, b) => compareTaskEvents(b, a))
+      .slice(0, taskEventLimit),
+  };
 }
 
 export class WorkspaceTaskLedgerStore {
@@ -156,13 +215,26 @@ export class WorkspaceTaskLedgerStore {
     return serializeFile(file, () => readTasks(file));
   }
 
-  async upsert(workspaceId: string, input: WorkspaceTaskUpsert): Promise<WorkspaceTask> {
+  async upsert(
+    workspaceId: string,
+    input: WorkspaceTaskUpsert,
+    bindingEvents: readonly TaskEvent[] = [],
+  ): Promise<WorkspaceTask> {
     const file = this.filePath(workspaceId);
     const update = WorkspaceTaskUpsertSchema.parse(input);
     return serializeFile(file, async () => {
       const tasks = await readTasks(file);
       const current = tasks.find((task) => task.taskId === update.taskId);
-      const next = mergeTask(current, update);
+      // A queued binding can settle after a human closes the task. Reopening
+      // or changing its closure is an explicit upsert, outside dispatch.
+      const patch =
+        bindingEvents.length && current && terminalStatuses.has(current.status)
+          ? { ...update, status: undefined, closure: undefined }
+          : update;
+      const next = applyTaskEvents(
+        mergeTask(current, patch),
+        orderTaskEvents(bindingEvents, retainedTaskEvents(tasks)),
+      );
 
       // Keep records in write order so equal timestamps cannot evict a newer terminal task.
       const updated = tasks.filter((task) => task.taskId !== next.taskId);
@@ -174,6 +246,33 @@ export class WorkspaceTaskLedgerStore {
         .toReversed();
       await writeJsonFileAtomic(file, retained);
       return next;
+    });
+  }
+
+  async recordAgentEvent(
+    workspaceId: string,
+    event: TaskEvent,
+    serverId: string,
+    parentId: string,
+    include?: (task: WorkspaceTask) => boolean,
+  ): Promise<void> {
+    const file = this.filePath(workspaceId);
+    await serializeFile(file, async () => {
+      const tasks = await readTasks(file);
+      const ordered = orderTaskEvents([event], retainedTaskEvents(tasks));
+      const updated = tasks.map((task) =>
+        (!include || include(task)) &&
+        task.participants.some(
+          (participant) =>
+            participant.agentId === event.agentId &&
+            isTaskParticipantAddress(participant, parentId, serverId),
+        )
+          ? applyTaskEvents(task, ordered)
+          : task,
+      );
+      if (updated.some((task, index) => task !== tasks[index])) {
+        await writeJsonFileAtomic(file, updated);
+      }
     });
   }
 
@@ -232,9 +331,27 @@ function truncateUtf8(line: string, budget: number): string {
   return `${line.slice(0, end)}${suffix}`;
 }
 
+export function taskParticipantKey(participant: WorkspaceTaskParticipant): string {
+  return JSON.stringify([participant.serverId, participant.agentId, participant.boundBy]);
+}
+
+export function projectTaskParticipantReuse(
+  tasks: WorkspaceTask[],
+  reuse: ReadonlyMap<string, TaskReuseDecision>,
+) {
+  return tasks.map((task) => {
+    const participantReuse = task.participants.map((participant) => ({
+      ...participant,
+      ...reuse.get(taskParticipantKey(participant)),
+    }));
+    return Object.assign({}, task, { participantReuse });
+  });
+}
+
 export function renderWorkspaceTaskLedger(
   tasks: readonly WorkspaceTask[],
   agentId: string,
+  participantReuse?: ReadonlyMap<string, TaskReuseDecision>,
 ): string {
   const active = tasks
     .filter((task) => !terminalStatuses.has(task.status))
@@ -259,8 +376,17 @@ export function renderWorkspaceTaskLedger(
 
     const fields = [quoteForPrompt(task.taskId), quoteForPrompt(task.title)];
     if (task.blockingQuestion) fields.push(`question=${quoteForPrompt(task.blockingQuestion)}`);
-    if (task.handoffSummary) fields.push(`handoff=${quoteForPrompt(task.handoffSummary)}`);
-    const line = truncateUtf8(prefix + fields.join(" "), budget);
+    let line = truncateUtf8(prefix + fields.join(" "), budget);
+    for (const participant of task.participants) {
+      const reuse = participantReuse?.get(taskParticipantKey(participant));
+      if (!reuse) continue;
+      const epoch = reuse.resetEpoch ? ` reset ${reuse.resetEpoch}` : "";
+      const field = ` ${quoteForPrompt(`${reuse.description} (${participant.agentId}${epoch})`)}`;
+      if (Buffer.byteLength(line + field) <= budget) line += field;
+    }
+    if (task.handoffSummary) {
+      line = truncateUtf8(`${line} handoff=${quoteForPrompt(task.handoffSummary)}`, budget);
+    }
     remaining -= Buffer.byteLength(line) + 1;
     lines.push(line);
   }

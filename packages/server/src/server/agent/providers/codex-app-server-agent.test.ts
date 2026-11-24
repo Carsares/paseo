@@ -293,6 +293,45 @@ describe("Codex file-change approvals", () => {
 });
 
 describe("Codex active-turn steering admission", () => {
+  test("rechecks task admission before sending a Codex start or steer", async () => {
+    const appServer = createFakeCodexAppServer();
+    const session = new CodexAppServerAgentSession(
+      createConfig({ cwd: "/workspace/project" }),
+      null,
+      createTestLogger(),
+      async () => appServer.child,
+    );
+    let allowed = true;
+    const withdraw = () => {
+      allowed = false;
+    };
+    const admission = {
+      async beforeProviderDispatch() {
+        queueMicrotask(withdraw);
+      },
+      assertProviderDispatchAllowed() {
+        if (!allowed) throw new Error("Main Control changed");
+      },
+    };
+    try {
+      await expect(session.startTurn("deny start", admission)).rejects.toThrow(
+        "Main Control changed",
+      );
+      expect(appServer.requests().filter(({ method }) => method === "turn/start")).toHaveLength(0);
+
+      const { turnId } = await session.startTurn("ordinary prompt");
+      appServer.startsTurn({ threadId: "thread-1", turnId: "native-A" });
+      allowed = true;
+      await expect(
+        session.steerActiveTurn("deny steer", { ...admission, expectedTurnId: turnId }),
+      ).rejects.toThrow("Main Control changed");
+      expect(appServer.requests().filter(({ method }) => method === "turn/steer")).toHaveLength(0);
+      appServer.assertNoErrors();
+    } finally {
+      await session.close();
+    }
+  });
+
   test("steers an accepted turn whose native id arrives after startTurn returns", async () => {
     const appServer = createFakeCodexAppServer({
       "turn/steer": () => ({ turn: { id: "native-A" } }),
@@ -5504,39 +5543,57 @@ describe("Codex app-server provider", () => {
     }
   });
 
-  test("waits for Codex to identify an accepted turn before interrupting it", async () => {
-    const interruptedTurns: unknown[] = [];
-    const appServer = createFakeCodexAppServer({
-      "turn/interrupt": async (params) => {
-        interruptedTurns.push(params);
-        return {};
-      },
-    });
-    const session = new CodexAppServerAgentSession(
-      createConfig({ cwd: "/workspace/project" }),
-      null,
-      createTestLogger(),
-      async () => appServer.child,
-    );
+  test.each([false, true])(
+    "waits for Codex to identify an accepted turn before interrupting (withdrawn: %s)",
+    async (withdrawn) => {
+      const interruptedTurns: unknown[] = [];
+      const appServer = createFakeCodexAppServer({
+        "turn/interrupt": async (params) => {
+          interruptedTurns.push(params);
+          return {};
+        },
+      });
+      const session = new CodexAppServerAgentSession(
+        createConfig({ cwd: "/workspace/project" }),
+        null,
+        createTestLogger(),
+        async () => appServer.child,
+      );
 
-    try {
-      const resultPromise = session.run("Start working.");
-      await appServer.waitForTurnStart();
+      try {
+        const resultPromise = session.run("Start working.");
+        await appServer.waitForTurnStart();
 
-      const interruptPromise = session.interrupt();
-      appServer.startsTurn({ threadId: "thread-1", turnId: "turn-identified-late" });
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      await interruptPromise;
+        let allowed = true;
+        const interruptPromise = session.interrupt(
+          withdrawn
+            ? {
+                assertCurrent() {
+                  if (!allowed) throw new Error("Main Control changed");
+                },
+              }
+            : undefined,
+        );
+        const result = withdrawn
+          ? expect(interruptPromise).rejects.toThrow("Main Control changed")
+          : interruptPromise;
+        allowed = false;
+        appServer.startsTurn({ threadId: "thread-1", turnId: "turn-identified-late" });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await result;
 
-      expect(interruptedTurns).toEqual([{ threadId: "thread-1", turnId: "turn-identified-late" }]);
-      appServer.completeTurn();
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      await resultPromise;
-      appServer.assertNoErrors();
-    } finally {
-      await session.close();
-    }
-  });
+        expect(interruptedTurns).toEqual(
+          withdrawn ? [] : [{ threadId: "thread-1", turnId: "turn-identified-late" }],
+        );
+        appServer.completeTurn();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await resultPromise;
+        appServer.assertNoErrors();
+      } finally {
+        await session.close();
+      }
+    },
+  );
 
   test("acknowledges interruption when the accepted turn terminates before identification", async () => {
     const interruptedTurns: unknown[] = [];
@@ -7398,6 +7455,23 @@ describe("Codex app-server provider", () => {
       opened.resolve();
     }
     await withdrawn;
+    expect(request.mock.calls.map(([name]) => name)).not.toContain(method);
+    expect(onProviderOutcome).not.toHaveBeenCalled();
+
+    enabled = true;
+    const withdraw = () => {
+      enabled = false;
+    };
+    await handler.run({
+      emit,
+      async beforeProviderDispatch() {
+        queueMicrotask(withdraw);
+      },
+      assertProviderDispatchAllowed() {
+        if (!enabled) throw new Error("Main Control changed");
+      },
+      onProviderOutcome,
+    });
     expect(request.mock.calls.map(([name]) => name)).not.toContain(method);
     expect(onProviderOutcome).not.toHaveBeenCalled();
 

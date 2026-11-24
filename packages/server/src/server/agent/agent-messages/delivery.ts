@@ -1,3 +1,8 @@
+import {
+  attachTaskDispatchMessage,
+  runWithTaskDispatchAdmission,
+  type TaskDispatchAdmission,
+} from "../task-ledger/admission.js";
 import { AgentTurnBusyError, type PromptDispatchDisposition } from "../agent-prompt.js";
 import { randomUUID } from "node:crypto";
 import type {
@@ -38,6 +43,7 @@ interface Receipt {
   dispatched: Promise<PromptDispatchDisposition>;
 }
 interface Admitted extends Message {
+  taskAdmission?: TaskDispatchAdmission;
   sequence: number;
   state: "queued" | "claimed" | "withdrawn";
   outOfBandDeclined: boolean;
@@ -331,7 +337,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       try {
         await request.validateDispatch?.();
         for (const message of messages) message.beforeDispatch?.();
-        const disposition = await dispatchRequest(request, messages);
+        const disposition = await runWithTaskDispatchAdmission(messages[0]?.taskAdmission, () =>
+          dispatchRequest(request, messages),
+        );
         for (const message of messages) {
           message.state = "claimed";
           try {
@@ -464,18 +472,20 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         const request = requestFor(recipientId, [message]);
         try {
           await request.validateDispatch?.();
-          const accepted = await dependencies.tryRunOutOfBand!(
-            request,
-            async () => {
-              if (!request.admit()) throw new Error("Queued agent message was withdrawn");
-              message.beforeDispatch?.();
-              await request.handoff?.begin();
-              await request.validateDispatch?.();
-            },
-            {
-              waitForProviderOutcome: request.waitForProviderOutcome,
-              onProviderOutcome: request.handoff?.onProviderOutcome,
-            },
+          const accepted = await runWithTaskDispatchAdmission(message.taskAdmission, () =>
+            dependencies.tryRunOutOfBand!(
+              request,
+              async () => {
+                if (!request.admit()) throw new Error("Queued agent message was withdrawn");
+                message.beforeDispatch?.();
+                await request.handoff?.begin();
+                await request.validateDispatch?.();
+              },
+              {
+                waitForProviderOutcome: request.waitForProviderOutcome,
+                onProviderOutcome: request.handoff?.onProviderOutcome,
+              },
+            ),
           );
           if (!accepted) {
             message.outOfBandDeclined = true;
@@ -533,6 +543,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       return false;
     if (mode && next.sessionMode && mode !== next.sessionMode) return false;
     if (first.beforeProviderDispatch || next.beforeProviderDispatch) return false;
+    if (first.taskAdmission || next.taskAdmission) return false;
     if (first.subagentInbox && next.subagentInbox) return true;
     return !(
       first.subagentInbox ||
@@ -620,8 +631,12 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         messageId: message.messageId ?? randomUUID(),
         dispatched,
       };
+      const taskAdmission = message.handoff?.waitForForegroundConfirmation
+        ? attachTaskDispatchMessage(message.recipientId, receipt.messageId)
+        : undefined;
       const item: Admitted = {
         ...message,
+        taskAdmission,
         receipt,
         resolve,
         reject,

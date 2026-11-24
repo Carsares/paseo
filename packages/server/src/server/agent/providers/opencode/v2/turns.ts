@@ -272,7 +272,7 @@ export class SessionTurns {
   }
   private async dispatch(
     input: ReturnType<SessionTurns["promptInput"]>,
-    options?: AgentRunOptions,
+    options: AgentRunOptions = {},
     output?: ReturnType<typeof structuredOutput>,
   ) {
     const command = input.text.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
@@ -284,7 +284,8 @@ export class SessionTurns {
             (item) => item.name === commandName,
           )
         : undefined;
-    if (options?.beforeProviderDispatch) await options.beforeProviderDispatch();
+    if (options.beforeProviderDispatch) await options.beforeProviderDispatch();
+    options.assertProviderDispatchAllowed?.();
     if (compact) {
       await this.options.client().session.compact({ sessionID: this.options.id });
       return;
@@ -308,7 +309,7 @@ export class SessionTurns {
           }
         : {}),
       metadata: {
-        ...(options?.clientMessageId ? { paseoClientMessageId: options.clientMessageId } : {}),
+        ...(options.clientMessageId ? { paseoClientMessageId: options.clientMessageId } : {}),
         ...(output ? { paseoOutputSchema: output.schema } : {}),
       },
     });
@@ -373,6 +374,7 @@ export class SessionTurns {
       if (this.turn?.id !== options.expectedTurnId || this.stopping)
         return { status: "unavailable" };
     }
+    options.assertProviderDispatchAllowed?.();
     await this.options.client().session.prompt({
       sessionID: this.options.id,
       ...this.promptInput(prompt),
@@ -384,13 +386,19 @@ export class SessionTurns {
     if (options.clearPendingPermissions) await this.options.clearPermissions();
     return { status: "accepted" };
   }
-  async interrupt() {
+  async interrupt(options?: { assertCurrent?: () => void }) {
     if (!this.stopping || this.stopFailed) {
+      const previousStop = this.stopping;
+      const previousStopFailed = this.stopFailed;
       this.stopFailed = false;
       const turn = this.turn;
+      let interruptSent = false;
       const stop = (async () => {
         // A stop sent before the queued prompt is accepted would interrupt an idle session.
         await turn?.submitted;
+        options?.assertCurrent?.();
+        if (options?.assertCurrent && this.turn !== turn) return;
+        interruptSent = true;
         await this.options.client().session.interrupt({ sessionID: this.options.id });
         await this.reconcile();
         await turn?.completion;
@@ -400,7 +408,12 @@ export class SessionTurns {
         await stop;
         this.stopping = null;
       } catch (error) {
-        this.stopFailed = true;
+        if (interruptSent) {
+          this.stopFailed = true;
+        } else {
+          this.stopping = previousStop;
+          this.stopFailed = previousStopFailed;
+        }
         throw error;
       }
     } else await this.stopping;

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ChangeRequestWatches } from "../change-request-watches/index.js";
 import { changeRequestStatusSchema } from "../../../services/change-request-source.js";
 import { registerPluginTools } from "./plugin-tools.js";
@@ -131,9 +132,15 @@ import {
 import { isPaseoToolEnabled } from "../paseo-tool-policy.js";
 import {
   WorkspaceTaskLedgerStore,
-  WorkspaceTaskParticipantSchema,
-  WorkspaceTaskUpsertSchema,
+  projectTaskParticipantReuse,
+  WorkspaceTaskToolInputSchema,
 } from "../task-ledger/index.js";
+import {
+  runWithTaskDispatchAdmission,
+  type TaskDispatchAdmission,
+} from "../task-ledger/admission.js";
+import { taskEvent } from "../task-ledger/events.js";
+import { isLocalTaskChild, TaskDispatchRejectedError } from "../task-ledger/reuse.js";
 import {
   applyHierarchyPaseoToolPolicy,
   computeAgentDepth,
@@ -1264,11 +1271,8 @@ function createToolCatalog(
     );
   }
 
-  async function withTaskLedger<T>(
-    requestedWorkspaceId: string | undefined,
-    operation: (ledger: WorkspaceTaskLedgerStore, workspaceId: string) => Promise<T>,
-  ): Promise<T> {
-    if (!callerAgentId) {
+  async function requireTaskLedgerWorkspace(requestedWorkspaceId?: string) {
+    if (!callerAgentId || !isMainControlAgentLabels(agentManager.getAgent(callerAgentId)?.labels)) {
       throw new PaseoToolInputError(
         "Only Main Control agents can access the workspace task ledger.",
       );
@@ -1278,25 +1282,40 @@ function createToolCatalog(
         "The workspace task ledger requires a verified agent identity.",
       );
     }
-    if (!taskLedger) throw new PaseoToolInputError("The workspace task ledger is not configured.");
-    return agentManager.withTaskLedgerCaller(callerAgentId, async () => {
-      const caller = agentManager.getAgent(callerAgentId);
-      if (!isMainControlAgentLabels(caller?.labels)) {
-        throw new PaseoToolInputError(
-          "Only Main Control agents can access the workspace task ledger.",
-        );
-      }
-      return operation(taskLedger, await requireCallerWorkspace(requestedWorkspaceId));
-    });
+    const workspaceId = await requireCallerWorkspace(requestedWorkspaceId);
+    const current = agentManager.getAgent(callerAgentId);
+    if (
+      current?.workspaceId !== workspaceId ||
+      !isMainControlAgentLabels(current.labels) ||
+      agentManager.isTaskAgentArchivePending(callerAgentId)
+    )
+      throw new PaseoToolInputError(AGENT_WORKSPACE_CREATION_ERROR);
+    return workspaceId;
   }
 
-  async function prepareTaskBinding(input: z.infer<typeof WorkspaceTaskUpsertSchema>) {
+  async function withTaskLedger<T>(
+    requestedWorkspaceId: string | undefined,
+    operation: (ledger: WorkspaceTaskLedgerStore, workspaceId: string) => Promise<T>,
+  ): Promise<T> {
+    if (!callerAgentId) {
+      throw new PaseoToolInputError(
+        "Only Main Control agents can access the workspace task ledger.",
+      );
+    }
+    if (!taskLedger) throw new PaseoToolInputError("The workspace task ledger is not configured.");
+    return agentManager.withTaskLedgerCaller(callerAgentId, async () =>
+      operation(taskLedger, await requireTaskLedgerWorkspace(requestedWorkspaceId)),
+    );
+  }
+
+  async function prepareTaskBinding(input: z.infer<typeof WorkspaceTaskToolInputSchema>) {
+    // Local host operations can call this handler without going through the outer tool parser.
+    input = WorkspaceTaskToolInputSchema.parse(input);
     const workspaceId = await withTaskLedger(undefined, async (ledger, id) => {
       const current = (await ledger.list(id)).find((task) => task.taskId === input.taskId);
       if (!current && input.title === undefined) {
         throw new PaseoToolInputError("A title is required to create a workspace task.");
       }
-      // The store rechecks the completion rule in its write queue.
       if (
         (input.status ?? current?.status) === "completed" &&
         (input.closure?.verification?.state ?? current?.closure?.verification?.state) === "failed"
@@ -1307,25 +1326,109 @@ function createToolCatalog(
       }
       return id;
     });
-    async function validateTarget(agentId: string) {
-      const target = await requireLocalPromptTarget(agentId, true);
+    const localServer = options.serverId ?? "self";
+    const admission: TaskDispatchAdmission = {};
+    const checkCaller = agentManager.taskDispatchCaller(callerAgentId!, workspaceId);
+    let resetEpoch: number | undefined;
+    let capture: ReturnType<AgentManager["captureTaskBinding"]> | undefined;
+
+    async function readTarget(agentId: string) {
+      const stored = await agentStorage.get(agentId);
+      const live = agentManager.getAgent(agentId);
+      const target = live ?? stored;
+      if (!target) throw new PaseoToolInputError(`Agent ${agentId} not found`);
       if (target.workspaceId !== workspaceId) {
         throw new PaseoToolInputError("Task binding requires an agent in your current workspace.");
       }
+      if (
+        !callerAgentId ||
+        target.internal ||
+        !isLocalTaskChild(target.labels, callerAgentId, localServer)
+      ) {
+        throw new PaseoToolInputError("Task binding requires a local direct subagent.");
+      }
+      return { live, stored, callerId: callerAgentId };
     }
+
     return {
       workspaceId,
-      validateDispatch: (agentId: string) =>
-        withTaskLedger(workspaceId, () => validateTarget(agentId)),
-      async record(agentId: string) {
+      run<T>(operation: () => T, messageId?: string) {
+        admission.messageId = messageId;
+        return runWithTaskDispatchAdmission(admission, operation);
+      },
+      async validateDispatch(agentId: string) {
+        try {
+          await requireTaskLedgerWorkspace(workspaceId);
+          const { live, stored, callerId } = await readTarget(agentId);
+          const decision = agentManager.readTaskAgentReuse(
+            callerId,
+            workspaceId,
+            { agentId },
+            live,
+            stored,
+          );
+          if (decision.action === "reset" || decision.action === "unavailable") {
+            throw new PaseoToolInputError(`Agent ${agentId}: ${decision.description}.`);
+          }
+          if (resetEpoch !== undefined && resetEpoch !== decision.resetEpoch) {
+            throw new PaseoToolInputError(`Agent ${agentId} was reset while the task was waiting.`);
+          }
+          resetEpoch = decision.resetEpoch;
+          // Read storage first. Capture both live identities only after all awaited
+          // reads, then repeat the synchronous check at each irreversible boundary.
+          checkCaller();
+          const checkTarget = agentManager.taskDispatchTarget(
+            callerId,
+            agentId,
+            workspaceId,
+            resetEpoch ?? 0,
+            stored,
+          );
+          admission.agentId = agentId;
+          admission.assertCurrent = () => {
+            checkCaller();
+            checkTarget();
+          };
+          admission.assertCurrent();
+          // The existing queue waits for busy recipients unless interrupt was requested.
+          capture ??= agentManager.captureTaskBinding(agentId, workspaceId);
+        } catch (error) {
+          if (!(error instanceof PaseoToolInputError)) throw error;
+          throw new TaskDispatchRejectedError(error.message);
+        }
+      },
+      close() {
+        capture?.close();
+      },
+      async record(agentId: string, messageId: string, created = false) {
         try {
           return await withTaskLedger(workspaceId, async (ledger, id) => {
-            await validateTarget(agentId);
-            const participant = WorkspaceTaskParticipantSchema.parse({ agentId });
-            const task = await ledger.upsert(id, {
-              ...input,
-              participants: [...(input.participants ?? []), participant],
-            });
+            // Once accepted, an archive is a historical observation, not a new dispatch.
+            const { callerId } = await readTarget(agentId);
+            const events = capture?.events(messageId) ?? [];
+            const accepted = events.find((event) => event.kind === "dispatched");
+            if (!accepted) {
+              throw new PaseoToolInputError(
+                "No provider acceptance was observed for the task binding.",
+              );
+            }
+            if (created) {
+              events.push(
+                taskEvent(
+                  agentId,
+                  "created",
+                  accepted.resetEpoch,
+                  undefined,
+                  messageId,
+                  accepted.order - 1,
+                ),
+              );
+            }
+            const task = await ledger.upsert(
+              id,
+              { ...input, participants: [{ agentId, boundBy: callerId }] },
+              events,
+            );
             return { taskId: task.taskId };
           });
         } catch (error) {
@@ -1337,20 +1440,6 @@ function createToolCatalog(
           return { taskBindingError: error instanceof Error ? error.message : String(error) };
         }
       },
-    };
-  }
-
-  async function recordInitialTaskBinding(
-    binding: Awaited<ReturnType<typeof prepareTaskBinding>> | undefined,
-    agentId: string,
-    started: boolean,
-    error: unknown,
-  ) {
-    if (!binding) return undefined;
-    if (started) return binding.record(agentId);
-    return {
-      taskBindingError:
-        error instanceof Error ? error.message : "The initial prompt did not start.",
     };
   }
 
@@ -1612,11 +1701,9 @@ function createToolCatalog(
       .describe("Create a new workspace for the agent."),
   ]);
   const commonCreateAgentFields = {
-    taskBinding: WorkspaceTaskUpsertSchema.strict()
-      .optional()
-      .describe(
-        "Main Control only. Upsert a task in your workspace and add the created agent as a participant.",
-      ),
+    taskBinding: WorkspaceTaskToolInputSchema.optional().describe(
+      "Main Control only. Upsert a task in your workspace and add the created agent as a participant.",
+    ),
     title: z
       .string()
       .trim()
@@ -1741,11 +1828,9 @@ function createToolCatalog(
     .object(legacyTopLevelCreateAgentInputSchema)
     .strict();
   const commonSendAgentPromptInputSchema = {
-    taskBinding: WorkspaceTaskUpsertSchema.strict()
-      .optional()
-      .describe(
-        "Main Control only. Wait for the prompt to dispatch, then add the local recipient to a task in your workspace.",
-      ),
+    taskBinding: WorkspaceTaskToolInputSchema.optional().describe(
+      "Main Control only. Wait for the prompt to dispatch, then add the local recipient to a task in your workspace.",
+    ),
     activeTurnBehavior: ActiveTurnBehaviorSchema.optional().describe(
       'Agent callers: "steer" (default) waits until the current turn ends; "interrupt" replaces it. Human callers: "steer" joins the turn, falling back to interrupt; default is interrupt.',
     ),
@@ -2140,7 +2225,9 @@ function createToolCatalog(
       {
         title: "Update workspace task",
         description: "Create or update a task in your current workspace. Omitted fields are kept.",
-        inputSchema: WorkspaceTaskUpsertSchema.extend({ workspaceId: workspaceIdSchema }).strict(),
+        inputSchema: WorkspaceTaskToolInputSchema.extend({
+          workspaceId: workspaceIdSchema,
+        }).strict(),
       },
       async ({ workspaceId: requestedWorkspaceId, ...input }) =>
         withTaskLedger(requestedWorkspaceId, async (ledger, workspaceId) => {
@@ -2158,7 +2245,18 @@ function createToolCatalog(
       async ({ workspaceId: requestedWorkspaceId }) =>
         withTaskLedger(requestedWorkspaceId, async (ledger, workspaceId) => {
           const tasks = await ledger.list(workspaceId);
-          return { content: [], structuredContent: ensureValidJson({ workspaceId, tasks }) };
+          const reuse = await agentManager.readTaskParticipantReuse(
+            callerAgentId!,
+            workspaceId,
+            tasks,
+          );
+          return {
+            content: [],
+            structuredContent: ensureValidJson({
+              workspaceId,
+              tasks: projectTaskParticipantReuse(tasks, reuse),
+            }),
+          };
         }),
     );
   }
@@ -2188,58 +2286,69 @@ function createToolCatalog(
         taskBindingError: z.string().optional(),
       },
     },
-    async (args: { taskBinding?: z.infer<typeof WorkspaceTaskUpsertSchema> }) => {
+    async (args: { taskBinding?: z.infer<typeof WorkspaceTaskToolInputSchema> }) => {
       const taskBinding = args.taskBinding ? await prepareTaskBinding(args.taskBinding) : undefined;
       const resolvedArgs = await resolveCreateAgentToolArgs(args);
       const { parsedArgs } = resolvedArgs;
       const notifyOnFinish = parsedArgs.notifyOnFinish;
       const parentReporting =
         resolvedArgs.kind === "agent-scoped" ? resolvedArgs.parsedArgs.parentReporting : undefined;
-      const { snapshot, initialPromptStarted, initialPromptError } = await createAgentCommand(
-        {
-          serverId: options.serverId,
-          agentManager,
-          agentStorage,
-          finishSubscriptions: options.finishSubscriptions?.(),
-          logger: childLogger,
-          paseoHome: options.paseoHome,
-          worktreesRoot: options.worktreesRoot,
-          terminalManager,
-          providerSnapshotManager,
-          ...(callerAgentId ? { workspaceRegistry: options.workspaceRegistry } : {}),
-          createPaseoWorktree: options.createPaseoWorktree,
-          ...(options.ensureWorkspaceForCreate
-            ? { ensureWorkspaceForCreate: options.ensureWorkspaceForCreate }
-            : {}),
-        },
-        {
-          kind: "mcp",
-          ...resolveCreateToolProviderSettings(parsedArgs),
-          title: parsedArgs.title,
-          initialPrompt: parsedArgs.initialPrompt,
-          cwd: resolvedArgs.kind === "top-level" ? resolvedArgs.cwd : undefined,
-          // Keep explicit placement for the final comparison after a concurrent parent move.
-          workspaceId: taskBinding?.workspaceId ?? resolvedArgs.workspaceId,
-          labels: parsedArgs.labels,
-          promptFailure: taskBinding ? "return-error" : "throw",
-          validateInitialPromptDispatch: taskBinding?.validateDispatch,
-          notifyOnFinish,
-          parentReporting,
-          background: parsedArgs.background,
-          detached: resolvedArgs.kind === "top-level" && resolvedArgs.detached,
-          callerAgentId,
-          callerContext,
-        },
-      );
+      const bindingMessageId = taskBinding ? randomUUID() : undefined;
+      const { snapshot, initialPromptStarted, bindingResult } = await (async () => {
+        const create = () =>
+          createAgentCommand(
+            {
+              serverId: options.serverId,
+              agentManager,
+              agentStorage,
+              finishSubscriptions: options.finishSubscriptions?.(),
+              logger: childLogger,
+              paseoHome: options.paseoHome,
+              worktreesRoot: options.worktreesRoot,
+              terminalManager,
+              providerSnapshotManager,
+              ...(callerAgentId ? { workspaceRegistry: options.workspaceRegistry } : {}),
+              createPaseoWorktree: options.createPaseoWorktree,
+              ...(options.ensureWorkspaceForCreate
+                ? { ensureWorkspaceForCreate: options.ensureWorkspaceForCreate }
+                : {}),
+            },
+            {
+              kind: "mcp",
+              ...resolveCreateToolProviderSettings(parsedArgs),
+              title: parsedArgs.title,
+              initialPrompt: parsedArgs.initialPrompt,
+              cwd: resolvedArgs.kind === "top-level" ? resolvedArgs.cwd : undefined,
+              // Keep explicit placement for the final comparison after a concurrent parent move.
+              workspaceId: taskBinding?.workspaceId ?? resolvedArgs.workspaceId,
+              labels: parsedArgs.labels,
+              promptFailure: taskBinding ? "return-error" : "throw",
+              validateInitialPromptDispatch: taskBinding?.validateDispatch,
+              initialPromptMessageId: bindingMessageId,
+              notifyOnFinish,
+              parentReporting,
+              background: parsedArgs.background,
+              detached: resolvedArgs.kind === "top-level" && resolvedArgs.detached,
+              callerAgentId,
+              callerContext,
+            },
+          );
 
-      // Return immediately for async creation.
+        const creation = await (taskBinding ? taskBinding.run(create, bindingMessageId) : create());
+        let recordedBinding;
+        if (taskBinding && bindingMessageId) {
+          recordedBinding = creation.initialPromptStarted
+            ? await taskBinding.record(creation.snapshot.id, bindingMessageId, true)
+            : {
+                taskBindingError:
+                  creation.initialPromptError instanceof Error
+                    ? creation.initialPromptError.message
+                    : "The initial prompt did not start.",
+              };
+        }
+        return { ...creation, bindingResult: recordedBinding };
+      })().finally(() => taskBinding?.close());
       const currentSnapshot = agentManager.getAgent(snapshot.id) ?? snapshot;
-      const bindingResult = await recordInitialTaskBinding(
-        taskBinding,
-        snapshot.id,
-        initialPromptStarted,
-        initialPromptError,
-      );
       const guidance =
         callerAgentId &&
         (notifyOnFinish ?? !isExplicitParentReportingLabels(snapshot.labels)) &&
@@ -2693,30 +2802,33 @@ function createToolCatalog(
     const sender = resolveCallerAgent();
     const mainControl = isMainControlAgentLabels(sender?.labels);
     const target = await requireLocalPromptTarget(agentId, mainControl);
-    if (taskBinding && target.workspaceId !== taskBinding.workspaceId) {
-      throw new PaseoToolInputError("Task binding requires an agent in your current workspace.");
+    if (taskBinding && !requireParentOwnership) {
+      throw new PaseoToolInputError("Task binding requires a local direct subagent.");
     }
+    await taskBinding?.validateDispatch(agentId);
     const notifying = notifyOnFinish ?? !isExplicitParentReportingLabels(target.labels);
-    const messageId = await enqueueLocalAgentPrompt(
-      agentId,
-      {
-        prompt,
-        source: {
-          agentId: senderId,
-          serverId: requireParentOwnership ? options.serverId : undefined,
-          title: sender?.config.title ?? undefined,
+    const enqueue = () =>
+      enqueueLocalAgentPrompt(
+        agentId,
+        {
+          prompt,
+          source: {
+            agentId: senderId,
+            serverId: requireParentOwnership ? options.serverId : undefined,
+            title: sender?.config.title ?? undefined,
+          },
+          directParent: requireParentOwnership
+            ? { agentId: senderId, serverId: options.serverId ?? "self" }
+            : undefined,
+          sessionMode,
+          activeTurnBehavior: activeTurnBehavior ?? "steer",
+          unarchive: !mainControl,
+          notifyLocalCaller: notifying,
+          notifyOnFinish,
         },
-        directParent: requireParentOwnership
-          ? { agentId: senderId, serverId: options.serverId ?? "self" }
-          : undefined,
-        sessionMode,
-        activeTurnBehavior: activeTurnBehavior ?? "steer",
-        unarchive: !mainControl,
-        notifyLocalCaller: notifying,
-        notifyOnFinish,
-      },
-      taskBinding ? () => taskBinding.validateDispatch(agentId) : undefined,
-    );
+        taskBinding ? () => taskBinding.validateDispatch(agentId) : undefined,
+      );
+    const messageId = await (taskBinding ? taskBinding.run(enqueue) : enqueue());
     if (!taskBinding) return queuedPromptResponse(agentId, messageId, notifying);
     return {
       content: [],
@@ -2726,7 +2838,7 @@ function createToolCatalog(
         messageId,
         status: agentManager.getAgent(agentId)?.lifecycle ?? "idle",
         guidance: notifying ? PROMPTED_AGENT_NOTIFICATION_GUIDANCE : "Dispatch acknowledged.",
-        ...(await taskBinding.record(agentId)),
+        ...(await taskBinding.record(agentId, messageId)),
       },
     };
   }
@@ -2771,7 +2883,7 @@ function createToolCatalog(
             activeTurnBehavior,
           },
           taskBinding,
-        );
+        ).finally(() => taskBinding?.close());
       }
       const dispatch = await sendPromptToAgent({
         agentManager,
@@ -2875,6 +2987,23 @@ function createToolCatalog(
     },
   );
 
+  async function requireParentReportTarget(
+    parent: { serverId: string; agentId: string },
+    localServer: string,
+  ) {
+    if (parent.serverId === localServer) {
+      const target = await readHierarchyAgent(parent.agentId);
+      if (!target || target.archivedAt) {
+        throw new PaseoToolInputError(`Parent agent ${parent.agentId} is unavailable`);
+      }
+    } else {
+      const target = await readRemoteParentForReport(parent).catch(() => undefined);
+      if (target === null || target?.archivedAt) {
+        throw new PaseoToolInputError(`Parent agent ${parent.agentId} is unavailable`);
+      }
+    }
+  }
+
   registerTool(
     "report_to_parent",
     {
@@ -2896,7 +3025,8 @@ function createToolCatalog(
     },
     async ({ status, summary }) => {
       if (!callerAgentId) throw new PaseoToolInputError("Only subagents can report to a parent.");
-      const turnId = reportTurnId(callerAgentId);
+      const taskReport = agentManager.captureTaskReport(callerAgentId);
+      const turnId = taskReport?.deliveryTurnId ?? reportTurnId(callerAgentId);
       const localServer = options.serverId ?? "self";
       const caller = await readHierarchyAgent(callerAgentId);
       const parent = getParentAddressFromLabels(caller?.labels, localServer);
@@ -2909,17 +3039,7 @@ function createToolCatalog(
       ) {
         throw new PaseoToolInputError("Only subagents with a direct parent can report.");
       }
-      if (parent.serverId === localServer) {
-        const target = await readHierarchyAgent(parent.agentId);
-        if (!target || target.archivedAt) {
-          throw new PaseoToolInputError(`Parent agent ${parent.agentId} is unavailable`);
-        }
-      } else {
-        const target = await readRemoteParentForReport(parent).catch(() => undefined);
-        if (target === null || target?.archivedAt) {
-          throw new PaseoToolInputError(`Parent agent ${parent.agentId} is unavailable`);
-        }
-      }
+      await requireParentReportTarget(parent, localServer);
       const messageId = await finishSubscriptions().queueParentReport(
         {
           childAgentId: callerAgentId,
@@ -2933,6 +3053,9 @@ function createToolCatalog(
           turnId,
         },
       );
+      if (options.verifiedCallerAgentId === callerAgentId && parent.serverId === localServer) {
+        await agentManager.recordTaskParentReport(callerAgentId, messageId, status, taskReport);
+      }
       return {
         content: [],
         structuredContent: { success: true, deliveryStatus: "queued", messageId },

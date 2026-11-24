@@ -1,3 +1,6 @@
+import { taskEvent } from "./task-ledger/events.js";
+import { taskReuseDecision } from "./task-ledger/reuse.js";
+import { taskParticipantKey, WorkspaceTaskLedgerStore } from "./task-ledger/index.js";
 import { AgentRunState, ForegroundPromptStart } from "./agent-run-state.js";
 import {
   createFinishSubscriptions,
@@ -279,6 +282,34 @@ function buildAgentManagerSpies() {
     withTaskLedgerCaller: vi.fn(async (_id: string, operation: () => Promise<unknown>) =>
       operation(),
     ),
+    isTaskAgentArchivePending: vi.fn().mockReturnValue(false),
+    taskDispatchCaller: vi.fn(() => () => {}),
+    taskDispatchTarget: vi.fn(() => () => {}),
+    captureTaskReport: vi.fn(),
+    captureTaskBinding: vi.fn((agentId: string, _workspaceId: string) => ({
+      events: (messageId: string) => [taskEvent(agentId, "dispatched", 0, "running", messageId)],
+      close: () => {},
+    })),
+    readTaskAgentReuse: vi.fn<AgentManager["readTaskAgentReuse"]>(
+      (_caller, _workspace, _participant, live, stored) =>
+        taskReuseDecision({
+          lifecycle: live?.lifecycle ?? "closed",
+          archived: !!stored?.archivedAt,
+          lastUsage: (live ?? stored)?.lastUsage,
+          resetEpoch: (live ?? stored)?.resetEpoch,
+          consecutiveErrors: (live ?? stored)?.consecutiveErrors,
+        }),
+    ),
+    readTaskParticipantReuse: vi.fn<AgentManager["readTaskParticipantReuse"]>(
+      async () =>
+        new Map([
+          [
+            taskParticipantKey({ agentId: "child", boundBy: "main" }),
+            taskReuseDecision({ lifecycle: "idle" }),
+          ],
+        ]),
+    ),
+    recordTaskParentReport: vi.fn().mockResolvedValue(undefined),
     getAgentBackgroundWorkSummary: vi.fn().mockReturnValue(undefined),
     listAgents: vi.fn().mockReturnValue([]),
     getTimeline: vi.fn().mockReturnValue([]),
@@ -299,9 +330,21 @@ function buildAgentManagerSpies() {
       (agentId: string, _prompt: unknown, _options: unknown, start?: ForegroundPromptStart) => {
         const runs = new AgentRunState();
         const run = runs.createPendingRun(agentId);
-        runs.settleForegroundStart(run, { status: "started", turnId: `${agentId}-turn` });
         start?.bind(run);
-        return (async function* noop() {})();
+        return (async function* () {
+          try {
+            await start?.beforeHandoff?.();
+            const turnId = `${agentId}-turn`;
+            runs.settleForegroundStart(run, { status: "started", turnId });
+            yield { type: "turn_started", turnId };
+          } catch (error) {
+            runs.settleForegroundStart(run, {
+              status: "failed",
+              error: String(error),
+              admissionError: error instanceof Error ? error : undefined,
+            });
+          }
+        })();
       },
     ),
     respondToPermission: vi.fn(),
@@ -3897,7 +3940,18 @@ describe("workspace task ledger MCP tools", () => {
     const server = await makeServer(main);
     const invoke = (name: string, input: Record<string, unknown>) =>
       invokeToolWithParsedInput(registeredTool(server, name), input, false);
-    return { main, ordinary, child, other, spies, queueAgentPrompt, hosts, makeServer, invoke };
+    return {
+      main,
+      ordinary,
+      child,
+      other,
+      spies,
+      queueAgentPrompt,
+      hosts,
+      makeServer,
+      invoke,
+      ledger: new WorkspaceTaskLedgerStore(paseoHome),
+    };
   }
 
   it("exposes the ledger only to Main Control and checks its current role and workspace", async () => {
@@ -3999,6 +4053,77 @@ describe("workspace task ledger MCP tools", () => {
     expect(queueAgentPrompt).toHaveBeenCalledWith(
       child.id,
       expect.objectContaining({ unarchive: true }),
+    );
+  });
+
+  it("rejects participant injection and same-ID remote parent labels", async () => {
+    const { child, main, ledger, queueAgentPrompt, invoke } = await setup();
+    const patch = { taskId: "review", title: "Review changes" };
+    const participants = [{ agentId: child.id }];
+    await expect(invoke("upsert_workspace_task", { ...patch, participants })).rejects.toThrow();
+    await expect(
+      invoke("send_agent_prompt", {
+        agentId: child.id,
+        prompt: "Review",
+        taskBinding: { ...patch, participants },
+      }),
+    ).rejects.toThrow();
+    await expect(
+      invoke("create_agent", {
+        provider: "codex/gpt-5.4",
+        title: "Reviewer",
+        initialPrompt: "Review",
+        taskBinding: { ...patch, participants },
+      }),
+    ).rejects.toThrow();
+    child.labels = parentAddressLabels({ agentId: main.id, serverId: "other-host" });
+    await expect(
+      invoke("send_agent_prompt", {
+        agentId: child.id,
+        prompt: "Review",
+        requireParentOwnership: false,
+        taskBinding: patch,
+      }),
+    ).rejects.toThrow("direct subagents");
+    expect(queueAgentPrompt).not.toHaveBeenCalled();
+    expect(await ledger.list("wks_parent")).toEqual([]);
+  });
+
+  it("rechecks context and reset epoch before delivery, while allowing busy interrupts", async () => {
+    const { child, queueAgentPrompt, invoke, ledger } = await setup();
+    const input = {
+      agentId: child.id,
+      prompt: "Review",
+      taskBinding: { taskId: "review", title: "Review changes" },
+    };
+    queueAgentPrompt.mockImplementationOnce(async (_id, _request, validate) => {
+      child.lastUsage = { contextWindowUsedTokens: 800, contextWindowMaxTokens: 1000 };
+      await validate?.();
+      throw new Error("Expected context rejection");
+    });
+    await expect(invoke("send_agent_prompt", input)).resolves.toMatchObject({
+      structuredContent: { error: expect.stringContaining("80%") },
+    });
+    child.lastUsage = undefined;
+    queueAgentPrompt.mockImplementationOnce(async (_id, _request, validate) => {
+      child.resetEpoch = 1;
+      await validate?.();
+      throw new Error("Expected epoch rejection");
+    });
+    await expect(invoke("send_agent_prompt", input)).resolves.toMatchObject({
+      structuredContent: { error: expect.stringContaining("was reset") },
+    });
+    expect(await ledger.list("wks_parent")).toEqual([]);
+    Object.assign(child, { lifecycle: "running" });
+    await expect(
+      invoke("send_agent_prompt", { ...input, activeTurnBehavior: "interrupt" }),
+    ).resolves.toMatchObject({
+      structuredContent: { deliveryStatus: "dispatched", taskId: "review" },
+    });
+    expect(queueAgentPrompt).toHaveBeenLastCalledWith(
+      child.id,
+      expect.objectContaining({ activeTurnBehavior: "interrupt" }),
+      expect.any(Function),
     );
   });
 

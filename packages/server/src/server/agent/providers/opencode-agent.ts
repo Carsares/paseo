@@ -3,17 +3,19 @@ import { applyProviderOptionsPatch } from "../option-controls.js";
 import { assertChangesAreLive, validateProviderOptions } from "../provider-options.js";
 import {
   createOpencodeClient,
+  OpencodeClient,
   type AssistantMessage as OpenCodeAssistantMessage,
   type Event as OpenCodeEvent,
   type FilePartInput as OpenCodeFilePartInput,
   type GlobalSession as OpenCodeGlobalSession,
   type Message as OpenCodeMessage,
-  type OpencodeClient,
   type OpencodeClientConfig,
   type Part as OpenCodePart,
   type Session as OpenCodeSession,
   type TextPartInput as OpenCodeTextPartInput,
 } from "@opencode-ai/sdk/v2/client";
+import type { Client as OpenCodeHttpClient } from "@opencode-ai/sdk/v2/gen/client";
+import { TaskDispatchRejectedError } from "../task-ledger/reuse.js";
 import fs from "node:fs/promises";
 import { randomBytes, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -1404,6 +1406,33 @@ type OpenCodeClientFactory = (options: { baseUrl: string; directory: string }) =
 
 function createSdkOpenCodeClient(options: { baseUrl: string; directory: string }): OpencodeClient {
   return createOpencodeClient(options satisfies OpencodeClientConfig & { directory: string });
+}
+
+function checkedOpenCodeFetch(client: OpencodeClient, assertAllowed?: () => void) {
+  if (!assertAllowed) return undefined;
+  // SDK 1.14.46 exposes per-request fetch, but keeps its configured transport on the protected client.
+  const transport = Reflect.get(client, "client") as OpenCodeHttpClient | undefined;
+  if (!transport?.getConfig) {
+    if (client instanceof OpencodeClient) {
+      throw new TaskDispatchRejectedError("OpenCode SDK cannot check dispatch before fetch.");
+    }
+    // Injected adapters that do not use the SDK send directly.
+    assertAllowed();
+    return undefined;
+  }
+  const originalFetch = transport.getConfig().fetch ?? globalThis.fetch;
+  return {
+    fetch: ((...args) => {
+      assertAllowed();
+      return originalFetch(...args);
+    }) satisfies typeof fetch,
+  };
+}
+
+function openCodeDispatchError(error: unknown): Error {
+  return error instanceof TaskDispatchRejectedError
+    ? error
+    : new Error(toDiagnosticErrorMessage(error));
 }
 
 export class OpenCodeAgentClient implements AgentClient {
@@ -3655,10 +3684,11 @@ class OpenCodeAgentSession implements AgentSession {
     });
   }
 
-  async interrupt(): Promise<void> {
+  async interrupt(options?: { assertCurrent?: () => void }): Promise<void> {
+    const assertCurrent = options?.assertCurrent;
     const turnId = this.activeForegroundTurnId;
-    this.abortController?.abort();
-    const abort = this.issueStop(turnId);
+    if (!assertCurrent) this.abortController?.abort();
+    const abort = this.issueStop(turnId, assertCurrent);
     // COMPAT(opencodeSlowAbort): OpenCode 1.14.42+ blocks session.abort until
     // the running tool actually stops, which can be tens of seconds for
     // long-running tools. Cap the wait so the user-visible cancel lands
@@ -3689,14 +3719,15 @@ class OpenCodeAgentSession implements AgentSession {
     prompt: AgentPromptInput,
     options: SteerActiveTurnOptions,
   ): Promise<SteerResult> {
-    if (this.closed || this.activeForegroundTurnId !== options.expectedTurnId) {
+    const isCurrent = () => !this.closed && this.activeForegroundTurnId === options.expectedTurnId;
+    if (!isCurrent()) {
       return { status: "unavailable" };
     }
     if (await this.resolveSlashCommandInvocation(prompt)) {
       return { status: "unavailable" };
     }
     if (options.beforeProviderDispatch) await options.beforeProviderDispatch();
-    if (this.closed || this.activeForegroundTurnId !== options.expectedTurnId) {
+    if (!isCurrent()) {
       return { status: "unavailable" };
     }
 
@@ -3706,8 +3737,6 @@ class OpenCodeAgentSession implements AgentSession {
       text: buildOpenCodeUserTimelineText(prompt),
       clientMessageId: options.clientMessageId ?? null,
     };
-    this.pendingSteerSubmissions.push(pending);
-
     const parts = buildOpenCodePromptParts(prompt);
     const systemPrompt = composeSystemPromptParts(
       this.config.systemPrompt,
@@ -3718,18 +3747,27 @@ class OpenCodeAgentSession implements AgentSession {
     const effectiveMode = resolveOpenCodeRuntimeAgentId(this.currentMode);
     const effectiveVariant = this.config.thinkingOptionId ?? undefined;
 
+    const dispatchOptions = checkedOpenCodeFetch(
+      this.client,
+      options.assertProviderDispatchAllowed,
+    );
+    this.pendingSteerSubmissions.push(pending);
     try {
-      const response = await this.client.session.promptAsync({
-        sessionID: this.sessionId,
-        directory: this.config.cwd,
-        messageID: promptId,
-        parts,
-        ...(systemPrompt ? { system: systemPrompt } : {}),
-        ...(model ? { model } : {}),
-        ...(effectiveMode ? { agent: effectiveMode } : {}),
-        ...(effectiveVariant ? { variant: effectiveVariant } : {}),
-      });
+      const response = await this.client.session.promptAsync(
+        {
+          sessionID: this.sessionId,
+          directory: this.config.cwd,
+          messageID: promptId,
+          parts,
+          ...(systemPrompt ? { system: systemPrompt } : {}),
+          ...(model ? { model } : {}),
+          ...(effectiveMode ? { agent: effectiveMode } : {}),
+          ...(effectiveVariant ? { variant: effectiveVariant } : {}),
+        },
+        dispatchOptions,
+      );
       if (response.error) {
+        if (response.error instanceof TaskDispatchRejectedError) throw response.error;
         if (
           isOpenCodeDefinitiveSteerRejection(
             response.error,
@@ -3748,6 +3786,10 @@ class OpenCodeAgentSession implements AgentSession {
       }
       return { status: "accepted" };
     } catch (error) {
+      if (error instanceof TaskDispatchRejectedError) {
+        this.removePendingSteerSubmission(promptId);
+        throw error;
+      }
       if (isOpenCodeDefinitiveSteerRejection(error)) {
         this.removePendingSteerSubmission(promptId);
         return { status: "unavailable" };
@@ -3786,15 +3828,24 @@ class OpenCodeAgentSession implements AgentSession {
     });
   }
 
-  private abortSession(turnId: string | null, reason: string): Promise<void> {
-    return this.client.session
-      .abort({
-        sessionID: this.sessionId,
-        directory: this.config.cwd,
-      })
+  private abortSession(
+    turnId: string | null,
+    reason: string,
+    assertAllowed?: () => void,
+  ): Promise<void> {
+    const client = this.client;
+    const dispatchOptions = checkedOpenCodeFetch(client, assertAllowed);
+    return client.session
+      .abort(
+        {
+          sessionID: this.sessionId,
+          directory: this.config.cwd,
+        },
+        dispatchOptions,
+      )
       .then((response) => {
         if (response.error) {
-          throw new Error(toDiagnosticErrorMessage(response.error));
+          throw openCodeDispatchError(response.error);
         }
         return undefined;
       })
@@ -3958,8 +4009,17 @@ class OpenCodeAgentSession implements AgentSession {
       effectiveMode,
       effectiveVariant,
     });
-    if (options?.waitForProviderPrompt) await dispatch;
-    else
+    if (options?.waitForProviderPrompt) {
+      try {
+        await dispatch;
+      } catch (error) {
+        this.finishForegroundTurn(
+          { type: "turn_failed", provider: "opencode", error: toDiagnosticErrorMessage(error) },
+          turnId,
+        );
+        throw error;
+      }
+    } else
       void dispatch.catch((error) => {
         this.finishForegroundTurn(
           { type: "turn_failed", provider: "opencode", error: toDiagnosticErrorMessage(error) },
@@ -3986,20 +4046,24 @@ class OpenCodeAgentSession implements AgentSession {
     effectiveMode: ReturnType<typeof resolveOpenCodeRuntimeAgentId>;
     effectiveVariant?: string;
   }): Promise<void> {
+    const client = this.client;
+    const dispatchOptions = checkedOpenCodeFetch(client, options?.assertProviderDispatchAllowed);
     if (slashCommand) {
       if (slashCommand.commandName === "compact" || slashCommand.commandName === "summarize") {
         this.activeDispatchMessageId = null;
         this.suppressAssistantMessagesUntilIdle.active = true;
-        const dispatch = this.client.session
-          .summarize({
-            sessionID: this.sessionId,
-            directory: this.config.cwd,
-            ...(model ? { providerID: model.providerID, modelID: model.modelID } : {}),
-          })
+        const dispatch = client.session
+          .summarize(
+            {
+              sessionID: this.sessionId,
+              directory: this.config.cwd,
+              ...(model ? { providerID: model.providerID, modelID: model.modelID } : {}),
+            },
+            dispatchOptions,
+          )
           .then((response) => {
             if (response.error) {
-              if (options?.waitForProviderPrompt)
-                throw new Error(toDiagnosticErrorMessage(response.error));
+              if (options?.waitForProviderPrompt) throw openCodeDispatchError(response.error);
               this.suppressAssistantMessagesUntilIdle.active = false;
               this.finishForegroundTurn(
                 {
@@ -4030,21 +4094,23 @@ class OpenCodeAgentSession implements AgentSession {
       // command() is only dispatch acknowledgement. OpenCode session events are
       // the source of truth for when the command turn becomes idle or fails.
       this.activeDispatchMessageId = createOpenCodeMessageId();
-      const dispatch = this.client.session
-        .command({
-          sessionID: this.sessionId,
-          directory: this.config.cwd,
-          command: slashCommand.commandName,
-          arguments: slashCommand.args ?? "",
-          messageID: this.activeDispatchMessageId,
-          ...(this.config.model ? { model: this.config.model } : {}),
-          ...(effectiveMode ? { agent: effectiveMode } : {}),
-          ...(effectiveVariant ? { variant: effectiveVariant } : {}),
-        })
+      const dispatch = client.session
+        .command(
+          {
+            sessionID: this.sessionId,
+            directory: this.config.cwd,
+            command: slashCommand.commandName,
+            arguments: slashCommand.args ?? "",
+            messageID: this.activeDispatchMessageId,
+            ...(this.config.model ? { model: this.config.model } : {}),
+            ...(effectiveMode ? { agent: effectiveMode } : {}),
+            ...(effectiveVariant ? { variant: effectiveVariant } : {}),
+          },
+          dispatchOptions,
+        )
         .then((response) => {
           if (response.error) {
-            if (options?.waitForProviderPrompt)
-              throw new Error(toDiagnosticErrorMessage(response.error));
+            if (options?.waitForProviderPrompt) throw openCodeDispatchError(response.error);
             if (isOpenCodeHeadersTimeoutFailure(response.error)) {
               this.logger.warn(
                 {
@@ -4104,24 +4170,27 @@ class OpenCodeAgentSession implements AgentSession {
             this.config.daemonAppendSystemPrompt,
             ...(this.config.pluginAppendSystemPrompt ?? []),
           );
-          const promptResponse = await this.client.session.promptAsync({
-            sessionID: this.sessionId,
-            directory: this.config.cwd,
-            messageID: dispatchMessageId,
-            parts,
-            ...(options?.outputSchema
-              ? {
-                  format: {
-                    type: "json_schema" as const,
-                    schema: options.outputSchema as Record<string, unknown>,
-                  },
-                }
-              : {}),
-            ...(systemPrompt ? { system: systemPrompt } : {}),
-            ...(model ? { model } : {}),
-            ...(effectiveMode ? { agent: effectiveMode } : {}),
-            ...(effectiveVariant ? { variant: effectiveVariant } : {}),
-          });
+          const promptResponse = await client.session.promptAsync(
+            {
+              sessionID: this.sessionId,
+              directory: this.config.cwd,
+              messageID: dispatchMessageId,
+              parts,
+              ...(options?.outputSchema
+                ? {
+                    format: {
+                      type: "json_schema" as const,
+                      schema: options.outputSchema as Record<string, unknown>,
+                    },
+                  }
+                : {}),
+              ...(systemPrompt ? { system: systemPrompt } : {}),
+              ...(model ? { model } : {}),
+              ...(effectiveMode ? { agent: effectiveMode } : {}),
+              ...(effectiveVariant ? { variant: effectiveVariant } : {}),
+            },
+            dispatchOptions,
+          );
           this.traceOpenCode("provider.opencode.prompt_async.response", {
             turnId,
             hasError: promptResponse.error !== undefined,
@@ -4129,8 +4198,7 @@ class OpenCodeAgentSession implements AgentSession {
             data: promptResponse.data,
           });
           if (promptResponse.error) {
-            if (options?.waitForProviderPrompt)
-              throw new Error(toDiagnosticErrorMessage(promptResponse.error));
+            if (options?.waitForProviderPrompt) throw openCodeDispatchError(promptResponse.error);
             this.finishForegroundTurn(
               {
                 type: "turn_failed",
@@ -4829,7 +4897,8 @@ class OpenCodeAgentSession implements AgentSession {
     return this.turnState.status === "stopping" && this.turnState.stop === stop;
   }
 
-  private issueStop(turnId: string | null): Promise<void> {
+  private issueStop(turnId: string | null, assertCurrent?: () => void): Promise<void> {
+    if (assertCurrent) return this.issueCheckedStop(turnId, assertCurrent);
     if (this.turnState.status === "stopping") {
       // Stop pressed again during a stop retries that same stop. There is one
       // runner per session, so a second boundary would race the first — and
@@ -4842,6 +4911,12 @@ class OpenCodeAgentSession implements AgentSession {
       terminal: createDeferred<void>(),
     };
     const abort = this.issueOwnedAbort(stop);
+    this.beginStop(stop);
+    return abort;
+  }
+
+  private beginStop(stop: OpenCodeStop): void {
+    const turnId = stop.pendingCancellationTurnId;
     if (turnId) {
       this.synthesizeInterruptedToolCalls(turnId);
       // An idle session has no run to observe, so only abort settlement gates
@@ -4852,17 +4927,62 @@ class OpenCodeAgentSession implements AgentSession {
     this.pendingClientMessageId = null;
     this.pendingSteerSubmissions = [];
     this.abortController = null;
+  }
+
+  private issueCheckedStop(turnId: string | null, assertCurrent: () => void): Promise<void> {
+    const originalState = this.turnState;
+    const stop =
+      originalState.status === "stopping"
+        ? originalState.stop
+        : { pendingCancellationTurnId: turnId, terminal: createDeferred<void>() };
+    const stoppingTurnId = stop.pendingCancellationTurnId;
+    let sent = false;
+    const assertAndBegin = () => {
+      assertCurrent();
+      const stillCurrent =
+        sent && stoppingTurnId ? this.isStopping(stop) : this.turnState === originalState;
+      if (this.closed || !stillCurrent) {
+        throw new TaskDispatchRejectedError("The OpenCode turn changed before interrupt.");
+      }
+      if (!sent && originalState.status !== "stopping") {
+        const controller = this.abortController;
+        this.beginStop(stop);
+        controller?.abort();
+      }
+      sent = true;
+    };
+    const send = async () => this.abortSession(stoppingTurnId, "interrupt", assertAndBegin);
+    const abort = send().catch((error: unknown) => {
+      if (!sent || this.closed) throw error;
+      if (stoppingTurnId && stop.pendingCancellationTurnId === null) return;
+      return this.abortSession(stoppingTurnId, "stop_retry", assertAndBegin);
+    });
+    // A denied fetch cannot settle a previous unconfirmed stop.
+    const previousSettlement = this.abortSettlement;
+    this.trackOwnedAbort(
+      stop,
+      abort,
+      abort.catch((error: unknown) => {
+        if (sent) throw error;
+        return previousSettlement;
+      }),
+    );
     return abort;
   }
 
   private issueOwnedAbort(stop: OpenCodeStop): Promise<void> {
     const abort = this.runOwnedAbort(stop.pendingCancellationTurnId);
+    this.trackOwnedAbort(stop, abort);
+    return abort;
+  }
+
+  private trackOwnedAbort(stop: OpenCodeStop, abort: Promise<void>, settlement = abort): void {
     // Abort is session-scoped, so its settlement is too: an older request lands
     // on the runner whenever the server gets to it, however many stops have come
     // and gone since. Only the newest abort may hold the gate closed, since
     // recovering from a failed one is what pressing Stop again is for.
     const stillInFlight = this.abortSettlement.catch(() => undefined);
-    this.abortSettlement = Promise.all([stillInFlight, abort]).then(() => undefined);
+    this.abortSettlement = Promise.all([stillInFlight, settlement]).then(() => undefined);
     void this.abortSettlement.catch(() => undefined);
     // Cancellation is acknowledged as soon as an owned abort succeeds, or when
     // the provider publishes the canceled run's terminal.
@@ -4870,7 +4990,6 @@ class OpenCodeAgentSession implements AgentSession {
       () => this.acknowledgeCancellation(stop),
       () => undefined,
     );
-    return abort;
   }
 
   private acknowledgeCancellation(stop: OpenCodeStop): void {

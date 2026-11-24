@@ -33,6 +33,7 @@ import {
 } from "./agent-manager.js";
 import { AgentStorage, parseStoredAgentRecord } from "./agent-storage.js";
 import { WorkspaceTaskLedgerStore } from "./task-ledger/index.js";
+import { runWithTaskDispatchAdmission } from "./task-ledger/admission.js";
 import { AgentTurnStartCanceledError, AgentTurnStartRejectedError } from "./agent-sdk-types.js";
 import { ForegroundPromptStart } from "./agent-run-state.js";
 import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
@@ -8494,6 +8495,322 @@ test("Main Control sends the saved prompt once for providers using the first tur
   expect(received).toEqual([expect.stringContaining("\nSaved policy\n[/Workspace"), "Second turn"]);
 });
 
+test("task ledger captures an already finished turn and records stored, cascade and workspace archives", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "agent-task-events-"));
+  const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const ledger = new WorkspaceTaskLedgerStore(cwd);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    taskLedger: ledger,
+    serverId: "local",
+    logger,
+  });
+  onTestFinished(async () => {
+    await manager.flush();
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  const workspaceId = "wks_ledger";
+  const main = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+    workspaceId,
+    labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+  });
+  const makeChild = (parentServerId = "local") =>
+    manager.createAgent({ provider: "codex", cwd }, undefined, {
+      workspaceId,
+      labels: { [PARENT_AGENT_ID_LABEL]: main.id, [PARENT_SERVER_ID_LABEL]: parentServerId },
+    });
+  const child = await makeChild();
+  const storedOnly = await makeChild();
+  const cascade = await makeChild();
+  const remote = await makeChild("another-host");
+  const capture = manager.captureTaskBinding(child.id, workspaceId);
+  const messageId = randomUUID();
+  await manager.runAgent(child.id, "private prompt", { clientMessageId: messageId });
+  const events = capture.events(messageId);
+  expect(events.map((event) => event.kind)).toEqual(["dispatched", "turn_completed"]);
+  await ledger.upsert(
+    workspaceId,
+    {
+      taskId: "review",
+      title: "Review",
+      status: "verifying",
+      participants: [child, storedOnly, cascade, remote].map(({ id }) => ({ agentId: id })),
+    },
+    events,
+  );
+  capture.close();
+  await manager.recordTaskParentReport(child.id, "report", "blocked");
+  await manager.recordTaskParentReport(child.id, "report", "blocked");
+  await manager.runAgent(remote.id, "another private prompt");
+  await manager.closeAgent(storedOnly.id);
+  await ensureUnarchivedAgentLoaded(storedOnly.id, {
+    agentManager: manager,
+    agentStorage: storage,
+    logger,
+  });
+  await manager.runAgent(storedOnly.id, "Turn after reopening");
+  await manager.closeAgent(storedOnly.id);
+  await manager.flush();
+  const [beforeArchive] = await ledger.list(workspaceId);
+  expect(
+    beforeArchive?.events?.filter(
+      (event) => event.kind === "closed" && event.agentId === storedOnly.id,
+    ),
+  ).toHaveLength(2);
+  expect(beforeArchive?.recentAgentStates).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ agentId: storedOnly.id, lifecycle: "closed" }),
+    ]),
+  );
+  await manager.archiveSnapshot(storedOnly.id, new Date().toISOString());
+  await manager.archiveAgentForWorkspace(child.id, workspaceId, new Date().toISOString());
+  await manager.archiveAgent(main.id);
+  const [task] = await new WorkspaceTaskLedgerStore(cwd).list(workspaceId);
+  expect(task?.status).toBe("verifying");
+  expect(task?.events?.filter((event) => event.kind === "reported_blocked")).toHaveLength(1);
+  expect(task?.events?.some((event) => event.agentId === remote.id)).toBe(false);
+  expect(task?.recentAgentStates).toEqual(
+    expect.arrayContaining(
+      [child, storedOnly, cascade].map((agent) =>
+        expect.objectContaining({
+          agentId: agent.id,
+          kind: "archived",
+          lifecycle: "archived",
+        }),
+      ),
+    ),
+  );
+  expect(JSON.stringify(task)).not.toContain("private prompt");
+  await ensureAgentLoaded(child.id, {
+    agentManager: manager,
+    agentStorage: storage,
+    logger,
+    purpose: "history",
+  });
+  await manager.closeAgent(child.id);
+  await manager.flush();
+  expect(await ledger.list(workspaceId)).toEqual([task]);
+});
+
+async function taskDispatchTestSetup(createSession: (config: AgentSessionConfig) => AgentSession) {
+  const cwd = mkdtempSync(join(tmpdir(), "paseo-task-confirmation-"));
+  const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const ledger = new WorkspaceTaskLedgerStore(cwd);
+  const client = new TestAgentClient();
+  vi.spyOn(client, "createSession").mockImplementation(async (config) => createSession(config));
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    taskLedger: ledger,
+    serverId: "local",
+    logger,
+  });
+  onTestFinished(async () => {
+    await manager.flush();
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  const workspaceId = "wks_confirmation";
+  const main = await manager.createAgent({ cwd, provider: "codex" }, undefined, {
+    workspaceId,
+    labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+  });
+  const child = await manager.createAgent({ cwd, provider: "codex" }, undefined, {
+    workspaceId,
+    labels: { [PARENT_AGENT_ID_LABEL]: main.id, [PARENT_SERVER_ID_LABEL]: "local" },
+  });
+  return { storage, ledger, manager, workspaceId, main, child };
+}
+
+test.each(["accepted", "rejected"] as const)(
+  "task ledger attributes reports around prompt acknowledgement and carries forward reset (%s)",
+  async (scenario) => {
+    const requests = Promise.withResolvers<void>();
+    const acknowledge = Promise.withResolvers<void>();
+    class Session extends TestAgentSession {
+      override async startTurn() {
+        requests.resolve();
+        await acknowledge.promise;
+        if (scenario === "rejected") throw new AgentTurnStartRejectedError("Provider refused");
+        this.pushEvent({ type: "turn_started", provider: "codex", turnId: "fast" });
+        this.pushEvent({ type: "turn_completed", provider: "codex", turnId: "fast" });
+        return { turnId: "fast" };
+      }
+    }
+    const { storage, manager, ledger, workspaceId, main, child } = await taskDispatchTestSetup(
+      (config) => new Session(config),
+    );
+    const participant = { agentId: child.id, boundBy: main.id };
+    await ledger.upsert(workspaceId, {
+      taskId: "prior",
+      title: "Prior",
+      participants: [participant],
+    });
+    await ledger.upsert(workspaceId, { taskId: "new", title: "New" });
+    const old = manager.captureTaskReport(child.id);
+    const capture = manager.captureTaskBinding(child.id, workspaceId);
+    onTestFinished(() => capture.close());
+    const messageId = randomUUID();
+    const caller = manager.taskDispatchCaller(main.id, workspaceId);
+    const target = manager.taskDispatchTarget(
+      main.id,
+      child.id,
+      workspaceId,
+      0,
+      await storage.get(child.id),
+    );
+    const dispatch = await runWithTaskDispatchAdmission(
+      {
+        messageId,
+        agentId: child.id,
+        assertCurrent: () => {
+          caller();
+          target();
+        },
+      },
+      () =>
+        startAgentRun(manager, child.id, "fast request", logger, {
+          runOptions: { clientMessageId: messageId, waitForProviderPrompt: true },
+          beforeHandoff: async () => {},
+        }),
+    );
+    const started = dispatchStarted(dispatch);
+    await requests.promise;
+    const early = manager.captureTaskReport(child.id);
+    const late = manager.captureTaskReport(child.id);
+    expect(early?.deliveryTurnId).toEqual(expect.any(String));
+    await manager.recordTaskParentReport(child.id, "early-report", "completed", early);
+    acknowledge.resolve();
+    if (scenario === "rejected") {
+      await expect(started).rejects.toThrow("Provider refused");
+      expect(capture.events(messageId)).toEqual([]);
+      await manager.flush();
+      expect(
+        (await ledger.list(workspaceId))[0]?.events?.map(({ kind }) => kind) ?? [],
+      ).not.toContain("reported_completed");
+      return;
+    }
+    await started;
+    await vi.waitFor(() => expect(manager.hasInFlightRun(child.id)).toBe(false));
+    await manager.resetAgentSession(child.id, { clearVisibleTimeline: true });
+    const events = capture.events(messageId);
+    await ledger.upsert(workspaceId, { taskId: "new", participants: [participant] }, events);
+    capture.close();
+    expect(
+      (await ledger.list(workspaceId))
+        .find(({ taskId }) => taskId === "new")
+        ?.events?.map(({ kind }) => kind),
+    ).toEqual(["dispatched", "reported_completed", "turn_completed", "reset"]);
+    await manager.recordTaskParentReport(child.id, "old-report", "blocked", old);
+    await manager.recordTaskParentReport(child.id, "late-report", "completed", late);
+    await manager.recordTaskParentReport(child.id, "late-report", "completed", late);
+    const tasks = await new WorkspaceTaskLedgerStore(manager.getAgent(child.id)!.cwd).list(
+      workspaceId,
+    );
+    const current = tasks.find(({ taskId }) => taskId === "new");
+    expect(current?.events?.filter(({ kind }) => kind === "reported_completed")).toHaveLength(2);
+    expect(current?.events?.some(({ kind }) => kind === "reported_blocked")).toBe(false);
+    expect(current?.recentAgentStates).toEqual([
+      expect.objectContaining({ kind: "reset", resetEpoch: 1 }),
+    ]);
+    expect(
+      tasks
+        .find(({ taskId }) => taskId === "prior")
+        ?.events?.some(({ kind }) => kind === "reported_blocked"),
+    ).toBe(true);
+  },
+);
+
+test.each(["demote", "archive", "new turn", "authorized interrupt"] as const)(
+  "task handoff rechecks caller and interrupt target after its final async read (%s)",
+  async (scenario) => {
+    const { storage, manager, workspaceId, main, child } = await taskDispatchTestSetup(
+      (config) => new SteeringTestSession(config),
+    );
+    const session = child.session as SteeringTestSession;
+    const interrupt = scenario === "new turn" || scenario === "authorized interrupt";
+    if (scenario === "new turn") {
+      session.pushEvent({ type: "turn_started", provider: "codex", turnId: "first" });
+      await vi.waitFor(() => expect(manager.getAgent(child.id)?.activeTurnId).toBe("first"));
+    } else if (interrupt) {
+      await dispatchStarted(await startAgentRun(manager, child.id, "original", logger));
+    }
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    onTestFinished(() => release.resolve());
+    const messageId = randomUUID();
+    const admission = { messageId, agentId: child.id, assertCurrent: () => {} };
+    const checkCaller = manager.taskDispatchCaller(main.id, workspaceId);
+    const get = storage.get.bind(storage);
+    let finalRead = false;
+    vi.spyOn(storage, "get").mockImplementation(async (id) => {
+      const record = await get(id);
+      if (finalRead && id === child.id) {
+        finalRead = false;
+        entered.resolve();
+        await release.promise;
+      }
+      return record;
+    });
+    const run = runWithTaskDispatchAdmission(admission, async () => {
+      const dispatched = await startAgentRun(manager, child.id, "bound task", logger, {
+        replaceRunning: interrupt,
+        activeTurnBehavior: "interrupt",
+        runOptions: { clientMessageId: messageId, waitForProviderPrompt: true },
+        beforeHandoff: async () => {
+          finalRead = true;
+          const stored = await storage.get(child.id);
+          const checkTarget = manager.taskDispatchTarget(main.id, child.id, workspaceId, 0, stored);
+          admission.assertCurrent = () => {
+            checkCaller();
+            checkTarget();
+          };
+        },
+      });
+      await dispatchStarted(dispatched);
+    });
+    void run.catch(() => undefined);
+    await entered.promise;
+    if (scenario === "demote") await manager.setAgentMainControl(main.id, false);
+    const finishArchive = Promise.withResolvers<void>();
+    let archiving: Promise<unknown> | undefined;
+    if (scenario === "archive") {
+      const archiveBlocked = Promise.withResolvers<void>();
+      const lane = manager.withTaskLedgerCaller(main.id, async () => {
+        archiveBlocked.resolve();
+        await finishArchive.promise;
+      });
+      await archiveBlocked.promise;
+      archiving = manager.archiveSnapshot(main.id, new Date().toISOString());
+      onTestFinished(async () => {
+        finishArchive.resolve();
+        await lane;
+        await archiving;
+      });
+    }
+    if (scenario === "new turn") {
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "first" });
+      await vi.waitFor(() => expect(manager.hasInFlightRun(child.id)).toBe(false));
+      session.pushEvent({ type: "turn_started", provider: "codex", turnId: "second" });
+      await vi.waitFor(() => expect(manager.getAgent(child.id)?.activeTurnId).toBe("second"));
+    }
+    release.resolve();
+    if (scenario === "authorized interrupt") {
+      await run;
+      expect(session.interruptCount).toBe(1);
+      expect(session.startPrompts).toEqual(["original", "bound task"]);
+    } else {
+      await expect(run).rejects.toThrow(
+        scenario === "new turn" ? "target run changed" : "Main Control changed",
+      );
+      expect(session.interruptCount).toBe(0);
+      expect(session.startPrompts).toEqual([]);
+    }
+    finishArchive.resolve();
+    await archiving;
+  },
+);
+
 test("Main Control injects changed task snapshots once per provider conversation", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "agent-task-prompt-"));
   const storagePath = join(cwd, "agents");
@@ -8551,13 +8868,39 @@ test("Main Control injects changed task snapshots once per provider conversation
     workspaceId,
     labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
   });
-  const child = await manager.createAgent({ provider: "codex", cwd }, undefined, { workspaceId });
+  const child = await manager.createAgent({ provider: "codex", cwd }, undefined, {
+    workspaceId,
+    labels: { [PARENT_AGENT_ID_LABEL]: agent.id },
+  });
   await taskLedger.upsert(workspaceId, { taskId: "review", title: "Review the change" });
   await manager.runAgent(agent.id, "First");
   await manager.runAgent(agent.id, "Second");
   await manager.runAgent(child.id, "Child");
-  await taskLedger.upsert(workspaceId, { taskId: "review", status: "in_progress" });
+  await taskLedger.upsert(workspaceId, {
+    taskId: "review",
+    status: "in_progress",
+    participants: [{ agentId: child.id }],
+  });
   await manager.runAgent(agent.id, "Changed");
+  const childSession = child.session as LedgerSession;
+  childSession.pushEvent({
+    type: "usage_updated",
+    provider: "codex",
+    usage: { contextWindowUsedTokens: 799, contextWindowMaxTokens: 1000 },
+  });
+  await vi.waitFor(() =>
+    expect(manager.getAgent(child.id)?.lastUsage?.contextWindowUsedTokens).toBe(799),
+  );
+  await manager.runAgent(agent.id, "Below threshold");
+  childSession.pushEvent({
+    type: "usage_updated",
+    provider: "codex",
+    usage: { contextWindowUsedTokens: 800, contextWindowMaxTokens: 1000 },
+  });
+  await vi.waitFor(() =>
+    expect(manager.getAgent(child.id)?.lastUsage?.contextWindowUsedTokens).toBe(800),
+  );
+  await manager.runAgent(agent.id, "At threshold");
   await manager.runAgent(agent.id, "/compact");
   (agent.session as LedgerSession).conversationId = "compacted";
   await manager.runAgent(agent.id, "After compact");
@@ -8568,7 +8911,9 @@ test("Main Control injects changed task snapshots once per provider conversation
     expect.stringContaining('[Workspace Task Ledger]\nT1 analyzing "review"'),
     "Second",
     "Child",
-    expect.stringContaining('[Workspace Task Ledger]\nT1 in_progress "review"'),
+    expect.stringContaining(`T1 in_progress "review" "Review the change" "Idle (${child.id})"`),
+    "Below threshold",
+    expect.stringContaining("Context at or above 80%, reset required"),
     "/compact",
     expect.stringContaining('[Workspace Task Ledger]\nT1 in_progress "review"'),
     expect.stringContaining("[Workspace Task Ledger]\nNo active tasks."),

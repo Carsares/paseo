@@ -86,6 +86,7 @@ test("keeps a later updatedAt when the archive time is earlier", () => {
 });
 
 describe("agent-scoped archive_agent", () => {
+  const archiveWorkspaceId = "ws-open-tab-archive";
   const openOnA = getOpenAgentTabLabel("client-a");
   const openOnB = getOpenAgentTabLabel("client-b");
   const logger = createTestLogger();
@@ -110,6 +111,9 @@ describe("agent-scoped archive_agent", () => {
       agentManager: manager,
       agentStorage: storage,
       providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      listActiveWorkspaces: async () => [
+        { workspaceId: archiveWorkspaceId, cwd, kind: "directory" },
+      ],
       logger,
     });
   }
@@ -189,6 +193,7 @@ describe("agent-scoped archive_agent", () => {
   });
 
   test("reserves client tab labels at scoped creation and update", async () => {
+    callerId = (await create({}, archiveWorkspaceId)).id;
     const { id } = await create({ [openOnA]: "true" });
     const tools = toolCatalog();
     await expect(

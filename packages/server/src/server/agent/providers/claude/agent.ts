@@ -107,6 +107,7 @@ import {
 } from "../release-check.js";
 import { runUpdateCommand, updatedForNewAgents } from "../update-command.js";
 import { THINKING_APPLIES_NEXT_TURN_NOTICE } from "../../provider-notices.js";
+import { TaskDispatchRejectedError } from "../../task-ledger/reuse.js";
 import {
   isProviderImageMarkdown,
   materializeProviderImage,
@@ -359,9 +360,19 @@ interface AutonomousTurnState {
 
 interface AsyncMessageInput<T> {
   push: (item: T) => void;
+  dispatch: (item: T, options: ClaudeInputDispatch) => Promise<void>;
+  withdrawDispatches: (turnId?: string) => void;
   end: () => void;
   iterable: AsyncIterable<T>;
 }
+
+interface ClaudeInputDispatch {
+  turnId: string;
+  assertAllowed: () => void;
+  onWithdrawn: () => void;
+}
+
+class ClaudeInputWithdrawnError extends AgentTurnStartCanceledError {}
 
 interface ClaudeReplayOwnership {
   restoredIds: ReadonlySet<string>;
@@ -2538,7 +2549,7 @@ class ClaudeAgentSession implements AgentSession {
   private turnState: TurnState = "idle";
   private readonly turnNamespace = randomUUID();
   private nextTurnOrdinal = 1;
-  private cancelCurrentTurn: (() => void) | null = null;
+  private cancelCurrentTurn: ((assertCurrent?: () => void) => void | Promise<void>) | null = null;
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   private lastOptionsModel: string | null = null;
   private lastRuntimeModel: string | null = null;
@@ -2707,6 +2718,9 @@ class ClaudeAgentSession implements AgentSession {
 
     const slashCommand = this.resolveSlashCommandInvocation(prompt);
     if (slashCommand?.commandName === REWIND_COMMAND_NAME) {
+      if (options?.assertProviderDispatchAllowed) {
+        throw new TaskDispatchRejectedError("Claude /rewind cannot confirm a task-bound dispatch.");
+      }
       await options?.beforeProviderDispatch?.();
       const turnId = this.createTurnId("foreground");
       this.activeForegroundTurnId = turnId;
@@ -2735,25 +2749,31 @@ class ClaudeAgentSession implements AgentSession {
     if (sdkUserMessageId) this.unstartedMessageUuids.add(sdkUserMessageId);
 
     let cancelIssued = false;
-    const requestCancel = () => {
+    const requestCancel = (assertCurrent?: () => void) => {
       if (cancelIssued) {
         return;
-      }
-      cancelIssued = true;
-      if (this.cancelCurrentTurn === requestCancel) {
-        this.cancelCurrentTurn = null;
       }
       // Whether Claude has this message in hand. A late idle from the previous turn can clear
       // mainTurnInFlight after Claude started it, so the message's own lifecycle counts too.
       const claudeStartedTurn =
         this.mainTurnInFlight ||
         (sdkUserMessageId !== null && !this.unstartedMessageUuids.has(sdkUserMessageId));
-      this.rejectAllPendingPermissions(new Error("Permission request canceled"));
-      this.finishForegroundTurn({
-        type: "turn_canceled",
-        provider: "claude",
-        reason: "Interrupted",
-      });
+      const finish = () => {
+        if (this.cancelCurrentTurn !== requestCancel) return;
+        cancelIssued = true;
+        this.cancelCurrentTurn = null;
+        this.rejectAllPendingPermissions(new Error("Permission request canceled"));
+        this.finishForegroundTurn({
+          type: "turn_canceled",
+          provider: "claude",
+          reason: "Interrupted",
+        });
+      };
+      if (assertCurrent) {
+        // Publishing cancellation first would remove the run used to authorize the SDK interrupt.
+        return this.interruptActiveTurn(claudeStartedTurn, assertCurrent).then(finish);
+      }
+      finish();
       void this.interruptActiveTurn(claudeStartedTurn).catch((error) => {
         this.logger.warn({ err: error }, "Failed to interrupt during cancel");
       });
@@ -2779,26 +2799,56 @@ class ClaudeAgentSession implements AgentSession {
     options: AgentRunOptions | undefined,
     isCanceled: () => boolean,
   ): Promise<void> {
+    const {
+      assertProviderDispatchAllowed: assertAllowed,
+      beforeProviderDispatch,
+      waitForProviderPrompt,
+      clientMessageId,
+    } = options ?? {};
     try {
-      await this.ensureQuery();
-      await options?.beforeProviderDispatch?.();
+      const query = await this.ensureQuery();
+      await beforeProviderDispatch?.();
       if (isCanceled()) {
         // Stopped while Claude was still starting up: withdrawn by never sending it.
         if (sdkUserMessageId) this.unstartedMessageUuids.delete(sdkUserMessageId);
-        if (options?.waitForProviderPrompt) throw new AgentTurnStartCanceledError();
+        if (assertAllowed || waitForProviderPrompt) throw new AgentTurnStartCanceledError();
         return;
       }
-      if (!this.input) {
+      const input = this.input;
+      if (!input) {
         throw new Error("Claude session input stream not initialized");
       }
       this.activeForegroundQuery = this.query;
-      this.activeForegroundInput = this.input;
+      this.activeForegroundInput = input;
       this.startQueryPump();
-      this.runtimeSafety.notePromptSent();
-      this.input.push(sdkMessage);
+      if (assertAllowed) {
+        const assertCurrent = () => {
+          if (this.closed || this.activeForegroundTurnId !== turnId) {
+            throw new ClaudeInputWithdrawnError();
+          }
+          if (this.input !== input || this.query !== query) {
+            throw new TaskDispatchRejectedError("Claude query changed before task dispatch.");
+          }
+          assertAllowed();
+        };
+        assertCurrent();
+        await input.dispatch(sdkMessage, {
+          turnId,
+          assertAllowed: () => {
+            assertCurrent();
+            this.runtimeSafety.notePromptSent();
+          },
+          onWithdrawn: () => {
+            if (sdkUserMessageId) this.unstartedMessageUuids.delete(sdkUserMessageId);
+          },
+        });
+      } else {
+        this.runtimeSafety.notePromptSent();
+        input.push(sdkMessage);
+      }
       setTimeout(() => {
         if (this.activeForegroundTurnId === turnId) {
-          void this.emitSubmittedUserMessage(sdkMessage, turnId, options?.clientMessageId).catch(
+          void this.emitSubmittedUserMessage(sdkMessage, turnId, clientMessageId).catch(
             (error: unknown) => {
               this.logger.warn({ err: error }, "Failed to emit submitted Claude message");
             },
@@ -2807,14 +2857,21 @@ class ClaudeAgentSession implements AgentSession {
       }, 0);
     } catch (error) {
       if (sdkUserMessageId) this.unstartedMessageUuids.delete(sdkUserMessageId);
-      if (!isCanceled()) {
+      if (
+        !this.closed &&
+        !isCanceled() &&
+        this.activeForegroundTurnId === turnId &&
+        !(error instanceof ClaudeInputWithdrawnError)
+      ) {
         this.finishForegroundTurn(
           this.buildTurnFailedEvent(
             error instanceof Error ? error.message : "Claude stream failed",
           ),
         );
       }
-      if (options?.waitForProviderPrompt || options?.beforeProviderDispatch) throw error;
+      if (assertAllowed || waitForProviderPrompt || beforeProviderDispatch) {
+        throw error;
+      }
     }
   }
 
@@ -2842,16 +2899,37 @@ class ClaudeAgentSession implements AgentSession {
     const message = this.toSdkUserMessage(prompt);
     message.priority = "next";
     if (options.beforeProviderDispatch) await options.beforeProviderDispatch();
-    if (
-      (this.activeForegroundTurnId ?? this.autonomousTurn?.id) !== options.expectedTurnId ||
-      this.activeForegroundQuery !== query ||
-      this.activeForegroundInput !== input ||
-      this.query !== query ||
-      this.input !== input
-    ) {
+    const ownsInput = () =>
+      (this.activeForegroundTurnId ?? this.autonomousTurn?.id) === options.expectedTurnId &&
+      this.activeForegroundQuery === query &&
+      this.activeForegroundInput === input &&
+      this.query === query &&
+      this.input === input;
+    if (!ownsInput()) {
       return { status: "unavailable" };
     }
-    this.enqueueSteer(input, message, options.clearPendingPermissions === true);
+    const assertAllowed = options.assertProviderDispatchAllowed;
+    assertAllowed?.();
+    const clearPendingPermissions = options.clearPendingPermissions === true;
+    if (assertAllowed) {
+      if (this.closed) throw new ClaudeInputWithdrawnError();
+      const uuid = message.uuid;
+      if (uuid) this.unstartedMessageUuids.add(uuid);
+      await input.dispatch(message, {
+        turnId: options.expectedTurnId,
+        assertAllowed: () => {
+          if (this.closed || !ownsInput()) throw new ClaudeInputWithdrawnError();
+          assertAllowed();
+          if (uuid && clearPendingPermissions) this.permissionClearingSteerUuids.add(uuid);
+        },
+        onWithdrawn: () => {
+          if (uuid) this.unstartedMessageUuids.delete(uuid);
+        },
+      });
+      if (clearPendingPermissions && ownsInput()) this.denyPendingPermissionsSupersededBySteer();
+    } else {
+      this.enqueueSteer(input, message, clearPendingPermissions);
+    }
     return { status: "accepted", ...(message.uuid ? { providerMessageId: message.uuid } : {}) };
   }
 
@@ -2913,9 +2991,20 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
-  async interrupt(): Promise<void> {
+  async interrupt(options?: { assertCurrent?: () => void }): Promise<void> {
+    const assertCurrent = options?.assertCurrent;
+    assertCurrent?.();
     if (this.cancelCurrentTurn) {
-      this.cancelCurrentTurn();
+      return this.cancelCurrentTurn(assertCurrent);
+    }
+
+    if (assertCurrent) {
+      const turn = this.autonomousTurn;
+      await this.interruptActiveTurn(this.mainTurnInFlight, assertCurrent);
+      if (turn && this.autonomousTurn === turn) {
+        this.flushPendingToolCalls();
+        this.completeAutonomousTurn();
+      }
       return;
     }
 
@@ -3355,6 +3444,7 @@ class ClaudeAgentSession implements AgentSession {
       "provider.claude.session_close.start",
     );
     this.closed = true;
+    this.input?.withdrawDispatches();
     await this.ensureHistoryReady();
     this.rejectAllPendingPermissions(new Error("Claude session closed"));
     // AgentManager settles the run after runtime release. Preserve cleanup records
@@ -4385,6 +4475,9 @@ class ClaudeAgentSession implements AgentSession {
   private finishForegroundTurn(
     event: Extract<AgentStreamEvent, { type: "turn_completed" | "turn_failed" | "turn_canceled" }>,
   ): void {
+    if (this.activeForegroundTurnId) {
+      this.activeForegroundInput?.withdrawDispatches(this.activeForegroundTurnId);
+    }
     if (event.type === "turn_failed" || event.type === "turn_canceled") {
       this.flushPendingToolCalls();
     }
@@ -4407,6 +4500,8 @@ class ClaudeAgentSession implements AgentSession {
 
     if (terminalSeen) {
       this.compactionMarkerOpen = false;
+      const turnId = this.activeForegroundTurnId ?? this.autonomousTurn?.id;
+      if (turnId) this.activeForegroundInput?.withdrawDispatches(turnId);
       if (this.activeForegroundTurnId) {
         this.activeForegroundTurnId = null;
         this.activeForegroundQuery = null;
@@ -4444,6 +4539,7 @@ class ClaudeAgentSession implements AgentSession {
     if (!this.autonomousTurn) {
       return;
     }
+    this.activeForegroundInput?.withdrawDispatches(this.autonomousTurn.id);
     this.notifySubscribers({ type: "turn_completed", provider: "claude" });
     this.autonomousTurn = null;
     this.activeForegroundQuery = null;
@@ -4492,6 +4588,7 @@ class ClaudeAgentSession implements AgentSession {
     }
     // Drop the dead handles so the next write spawns a fresh process instead of
     // failing against a dead transport forever.
+    this.input?.withdrawDispatches();
     this.query = null;
     this.input = null;
     this.dispatchEvents([
@@ -4635,7 +4732,9 @@ class ClaudeAgentSession implements AgentSession {
         }
       }
     } finally {
-      if (this.query === activeQuery) {
+      // Once close starts, it owns shutdown of the query and its input iterator.
+      if (this.ownsQuery(activeQuery)) {
+        this.input?.withdrawDispatches();
         this.query = null;
         this.input = null;
       }
@@ -4909,7 +5008,10 @@ class ClaudeAgentSession implements AgentSession {
    * would reach only background helpers (and kill them on a CLI that ignores
    * perTaskStopAffordance), and no result would follow to consume pendingInterruptAbort.
    */
-  private async interruptActiveTurn(claudeStartedTurn = this.mainTurnInFlight): Promise<void> {
+  private async interruptActiveTurn(
+    claudeStartedTurn = this.mainTurnInFlight,
+    assertCurrent?: () => void,
+  ): Promise<void> {
     const queryToInterrupt = this.query;
     if (!queryToInterrupt || typeof queryToInterrupt.interrupt !== "function") {
       this.logger.trace(
@@ -4923,7 +5025,19 @@ class ClaudeAgentSession implements AgentSession {
       );
       return;
     }
-    if (claudeStartedTurn) {
+    if (assertCurrent) {
+      const turnId = this.activeForegroundTurnId ?? this.autonomousTurn?.id;
+      const withdrewAll = await this.withdrawUnstartedMessages(queryToInterrupt, assertCurrent);
+      if (!claudeStartedTurn && withdrewAll) return;
+      assertCurrent();
+      if (
+        this.query !== queryToInterrupt ||
+        (this.activeForegroundTurnId ?? this.autonomousTurn?.id) !== turnId
+      ) {
+        return;
+      }
+      this.pendingInterruptAbort = true;
+    } else if (claudeStartedTurn) {
       this.pendingInterruptAbort = true;
       await this.withdrawUnstartedMessages(queryToInterrupt);
     } else {
@@ -4948,10 +5062,17 @@ class ClaudeAgentSession implements AgentSession {
    * resuming it. One already dequeued cannot be recalled, and does not need to be, since the
    * interrupt kills it. Returns whether Claude confirmed every message withdrawn.
    */
-  private async withdrawUnstartedMessages(query: Query): Promise<boolean> {
+  private async withdrawUnstartedMessages(
+    query: Query,
+    assertCurrent?: () => void,
+  ): Promise<boolean> {
+    // These task messages are still owned by Paseo, so there is no UUID to cancel at the SDK.
+    this.input?.withdrawDispatches();
     const uuids = [...this.unstartedMessageUuids];
-    this.unstartedMessageUuids.clear();
-    this.permissionClearingSteerUuids.clear();
+    if (!assertCurrent) {
+      this.unstartedMessageUuids.clear();
+      this.permissionClearingSteerUuids.clear();
+    }
     if (uuids.length === 0) return true;
     // The SDK runtime supports this, but its public Query type has not caught up. Keep the
     // compatibility escape hatch inside the Claude adapter.
@@ -4963,6 +5084,11 @@ class ClaudeAgentSession implements AgentSession {
     if (!cancelAsyncMessage) return false;
     let withdrewAll = true;
     for (const uuid of uuids) {
+      assertCurrent?.();
+      if (assertCurrent) {
+        this.unstartedMessageUuids.delete(uuid);
+        this.permissionClearingSteerUuids.delete(uuid);
+      }
       try {
         if (!(await cancelAsyncMessage.call(query, uuid))) withdrewAll = false;
       } catch (error) {
@@ -7032,25 +7158,78 @@ export async function convertClaudeHistoryEntry(
   return timeline;
 }
 
+interface ClaudePendingInputDispatch extends ClaudeInputDispatch {
+  resolve: () => void;
+  reject: (error: unknown) => void;
+}
+
+interface ClaudeInputEntry<T> {
+  item: T;
+  dispatch?: ClaudePendingInputDispatch;
+}
+
 function createAsyncMessageInput<T>(): AsyncMessageInput<T> {
-  const queue: T[] = [];
-  const resolvers: Array<(value: IteratorResult<T, void>) => void> = [];
+  type ResolveNext = (value: IteratorResult<T, void>) => void;
+  const queue: ClaudeInputEntry<T>[] = [];
+  const resolvers: ResolveNext[] = [];
   let closed = false;
+
+  function rejectDispatch(dispatch: ClaudePendingInputDispatch, error: unknown): void {
+    dispatch.onWithdrawn();
+    dispatch.reject(error);
+  }
+
+  function deliver(entry: ClaudeInputEntry<T>, resolve: ResolveNext): boolean {
+    const { dispatch, item } = entry;
+    if (dispatch) {
+      try {
+        // Keep the final check and resolution of SDK next() in the same synchronous step.
+        dispatch.assertAllowed();
+      } catch (error) {
+        rejectDispatch(dispatch, error);
+        return false;
+      }
+    }
+    resolve({ value: item, done: false });
+    dispatch?.resolve();
+    return true;
+  }
+
+  function enqueue(entry: ClaudeInputEntry<T>): void {
+    if (closed) {
+      if (entry.dispatch) rejectDispatch(entry.dispatch, new ClaudeInputWithdrawnError());
+      return;
+    }
+    const resolve = resolvers[0];
+    if (!resolve) {
+      queue.push(entry);
+    } else if (deliver(entry, resolve)) {
+      resolvers.shift();
+    }
+  }
+
+  function withdrawDispatches(turnId?: string): void {
+    for (let i = queue.length - 1; i >= 0; i--) {
+      const dispatch = queue[i]?.dispatch;
+      if (!dispatch || (turnId !== undefined && dispatch.turnId !== turnId)) continue;
+      queue.splice(i, 1);
+      rejectDispatch(dispatch, new ClaudeInputWithdrawnError());
+    }
+  }
 
   return {
     push(item: T) {
-      if (closed) {
-        return;
-      }
-      const resolve = resolvers.shift();
-      if (resolve) {
-        resolve({ value: item, done: false });
-        return;
-      }
-      queue.push(item);
+      enqueue({ item });
     },
+    dispatch(item, options) {
+      return new Promise<void>((resolve, reject) => {
+        enqueue({ item, dispatch: { ...options, resolve, reject } });
+      });
+    },
+    withdrawDispatches,
     end() {
       closed = true;
+      withdrawDispatches();
       while (resolvers.length > 0) {
         const resolve = resolvers.shift();
         resolve?.({ value: undefined, done: true });
@@ -7059,20 +7238,17 @@ function createAsyncMessageInput<T>(): AsyncMessageInput<T> {
     iterable: {
       [Symbol.asyncIterator](): AsyncIterator<T, void> {
         return {
-          next: (): Promise<IteratorResult<T, void>> => {
-            if (queue.length > 0) {
-              const value = queue.shift();
-              if (value !== undefined) {
-                return Promise.resolve({ value, done: false });
+          next: () =>
+            new Promise<IteratorResult<T, void>>((resolve) => {
+              for (let entry = queue.shift(); entry; entry = queue.shift()) {
+                if (deliver(entry, resolve)) return;
               }
-            }
-            if (closed) {
-              return Promise.resolve({ value: undefined, done: true });
-            }
-            return new Promise<IteratorResult<T, void>>((resolve) => {
+              if (closed) {
+                resolve({ value: undefined, done: true });
+                return;
+              }
               resolvers.push(resolve);
-            });
-          },
+            }),
         };
       },
     },

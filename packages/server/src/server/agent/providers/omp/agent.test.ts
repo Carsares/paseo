@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import type { AgentStreamEvent } from "../../agent-sdk-types.js";
+import { AgentTurnStartRejectedError } from "../../agent-sdk-types.js";
+import { JsonlRpcResponseError } from "../jsonl-rpc-process.js";
 import type { PaseoToolCatalog } from "../../tools/types.js";
 import type { OmpAgentMessage } from "./rpc-types.js";
 import type { OmpNoTurnScheduler, OmpProviderIdleScheduler } from "./agent.js";
@@ -28,6 +30,98 @@ const TURN_LIFECYCLE_EVENTS = new Set<AgentStreamEvent["type"]>([
 function isTurnLifecycle(type: AgentStreamEvent["type"]): boolean {
   return TURN_LIFECYCLE_EVENTS.has(type);
 }
+
+test.each(["accept", "reject", "ordinary"] as const)(
+  "OMP prompt acknowledgement controls only confirmed starts (%s)",
+  async (scenario) => {
+    const runtime = new FakeOmp();
+    const client = new OmpAgentClient({ logger: createTestLogger(), runtime });
+    const session = await client.createSession({ provider: "omp", cwd: process.cwd() });
+    onTestFinished(() => session.close());
+    const provider = runtime.latestSession();
+    provider.promptAck = { agentInvoked: true };
+    const original = provider.prompt.bind(provider);
+    const requested = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    vi.spyOn(provider, "prompt").mockImplementationOnce(async (...args) => {
+      requested.resolve();
+      await release.promise;
+      if (scenario !== "accept") throw new JsonlRpcResponseError("provider rejected prompt");
+      return original(...args);
+    });
+    const terminal = Promise.withResolvers<AgentStreamEvent>();
+    session.subscribe((event) => {
+      if (event.type === "turn_failed") terminal.resolve(event);
+    });
+    const start = session.startTurn("work", { waitForProviderPrompt: scenario !== "ordinary" });
+    const settled = vi.fn();
+    void start.then(settled, settled);
+    await requested.promise;
+    if (scenario === "ordinary") {
+      await expect(start).resolves.toMatchObject({ turnId: expect.any(String) });
+      release.resolve();
+      await expect(terminal.promise).resolves.toMatchObject({ error: "provider rejected prompt" });
+      return;
+    }
+    await waitForImmediate();
+    expect(settled).not.toHaveBeenCalled();
+    release.resolve();
+    if (scenario === "accept") {
+      await expect(start).resolves.toMatchObject({ turnId: expect.any(String) });
+    } else {
+      await expect(start).rejects.toBeInstanceOf(AgentTurnStartRejectedError);
+    }
+  },
+);
+
+test.each(["rejected", "started"] as const)(
+  "OMP queue acknowledgement alone cannot confirm a task dispatch (%s)",
+  async (outcome) => {
+    const runtime = new FakeOmp();
+    const client = new OmpAgentClient({ logger: createTestLogger(), runtime });
+    const session = await client.createSession({ provider: "omp", cwd: process.cwd() });
+    onTestFinished(() => session.close());
+    const provider = runtime.latestSession();
+    provider.promptAck = { requestId: "test-prompt" };
+    const request = provider.nextPrompt();
+    const branch = Promise.withResolvers<Array<{ entryId: string; text: string }>>();
+    const getBranch = vi.spyOn(provider, "getBranchMessages").mockReturnValueOnce(branch.promise);
+    const start = session.startTurn("task", {
+      waitForProviderPrompt: true,
+      async beforeProviderDispatch() {
+        provider.emit({ type: "agent_start" });
+        provider.emit({ type: "message_end", message: { role: "user", content: "task" } });
+      },
+    });
+    const settled = vi.fn();
+    void start.then(settled, settled);
+    await request;
+    expect(getBranch).toHaveBeenCalledOnce();
+    branch.resolve([{ entryId: "old-task", text: "task" }]);
+    await waitForImmediate();
+    expect(settled).not.toHaveBeenCalled();
+    provider.beginTurn();
+    provider.acceptCustomMessage("extension startup notice");
+    await waitForImmediate();
+    expect(settled).not.toHaveBeenCalled();
+    if (outcome === "rejected") {
+      provider.emit({
+        type: "prompt_result",
+        id: "test-prompt",
+        agentInvoked: false,
+        status: "error",
+        error: { message: "Provider refused after queueing" },
+      });
+      await expect(start).rejects.toBeInstanceOf(AgentTurnStartRejectedError);
+    } else {
+      provider.acceptPrompt("different prompt", "other-message");
+      await waitForImmediate();
+      expect(settled).not.toHaveBeenCalled();
+      provider.acceptPrompt("task", "native-task");
+      await expect(start).resolves.toMatchObject({ turnId: expect.any(String) });
+    }
+  },
+);
 
 // What OMP reports for a turn the user stopped: an error message on a terminal
 // response whose stop reason says the request was aborted.
@@ -1242,6 +1336,7 @@ describe("OMP agent client and session", () => {
       expect(omp.turnFailures()).toEqual(["No API key found for anthropic."]);
       expect(omp.completedTurnCount()).toBe(0);
     },
+    10_000,
   );
 
   test("completes a no-turn notify with one notification and no assistant text", async () => {

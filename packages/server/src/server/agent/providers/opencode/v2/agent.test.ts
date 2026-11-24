@@ -261,6 +261,36 @@ describe("OpenCode v2 session lifecycle", () => {
     }
   });
 
+  test("rechecks task admission before sending an OpenCode prompt", async () => {
+    const harness = new V2Harness();
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+    let allowed = true;
+    try {
+      await expect(
+        session.startTurn("deny this prompt", {
+          waitForProviderPrompt: true,
+          async beforeProviderDispatch() {
+            queueMicrotask(() => {
+              allowed = false;
+            });
+          },
+          assertProviderDispatchAllowed() {
+            if (!allowed) throw new Error("Main Control changed");
+          },
+        }),
+      ).rejects.toThrow("Main Control changed");
+      expect(harness.prompts).toEqual([]);
+      await session.startTurn("ordinary prompt");
+      await expect.poll(() => harness.prompts).toEqual(["ordinary prompt"]);
+    } finally {
+      await session.close();
+    }
+  });
+
   test("does not finish from a previous outcome before prompt admission", async () => {
     const harness = new V2Harness();
     let accept!: () => void;
@@ -1069,39 +1099,59 @@ describe("OpenCode v2 session lifecycle", () => {
     }
   });
 
-  test("waits for prompt acceptance before interrupting", async () => {
-    const harness = new V2Harness();
-    let accept!: () => void;
-    const settle = () => harness.finishExecution("interrupted");
-    let interruptions = 0;
-    harness.prompt = () =>
-      new Promise<void>((resolve) => {
-        accept = resolve;
-      });
+  test.each([false, true])(
+    "waits for prompt acceptance before interrupting (withdrawn: %s)",
+    async (withdrawn) => {
+      const harness = new V2Harness();
+      let accept!: () => void;
+      const settle = () => harness.finishExecution("interrupted");
+      let interruptions = 0;
+      harness.prompt = () =>
+        new Promise<void>((resolve) => {
+          accept = resolve;
+        });
 
-    harness.interrupt = async () => {
-      interruptions += 1;
-      harness.info.outcome = "interrupted";
-      settle();
-      return { interrupted: true };
-    };
-    const client = new OpenCodeV2AgentClient({
-      logger: createTestLogger(),
-      runtime: harness.runtime,
-    });
-    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
-    try {
-      await session.startTurn("first");
-      const stopping = session.interrupt();
-      await Promise.resolve();
-      expect(interruptions).toBe(0);
-      accept();
-      await stopping;
-      expect(interruptions).toBe(1);
-    } finally {
-      await session.close();
-    }
-  });
+      harness.interrupt = async () => {
+        interruptions += 1;
+        harness.info.outcome = "interrupted";
+        settle();
+        return { interrupted: true };
+      };
+      const client = new OpenCodeV2AgentClient({
+        logger: createTestLogger(),
+        runtime: harness.runtime,
+      });
+      const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+      try {
+        await session.startTurn("first");
+        let allowed = true;
+        const stopping = session.interrupt(
+          withdrawn
+            ? {
+                assertCurrent() {
+                  if (!allowed) throw new Error("Main Control changed");
+                },
+              }
+            : undefined,
+        );
+        const result = withdrawn
+          ? expect(stopping).rejects.toThrow("Main Control changed")
+          : stopping;
+        await Promise.resolve();
+        expect(interruptions).toBe(0);
+        allowed = false;
+        accept();
+        await result;
+        if (withdrawn) {
+          expect(interruptions).toBe(0);
+          await session.interrupt();
+        }
+        expect(interruptions).toBe(1);
+      } finally {
+        await session.close();
+      }
+    },
+  );
 
   test("completes a submitted turn once and reconciles its final text", async () => {
     const harness = new V2Harness();

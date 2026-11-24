@@ -176,6 +176,8 @@ export interface AgentCreateConfigUnattendedInput {
 export interface AgentCapabilityFlags {
   /** Invoke the prompt guard immediately before the provider's start or steer request. */
   defersPromptHandoff?: boolean;
+  /** This session defers handoff only for starts requiring provider confirmation. */
+  defersConfirmedPromptHandoff?: boolean;
   [capability: string]: boolean | undefined;
   supportsStreaming: boolean;
   supportsSessionPersistence: boolean;
@@ -216,6 +218,8 @@ export interface AgentRunOptions {
   waitForProviderPrompt?: boolean;
   /** Internal guard used by sessions that defer handoff until their provider request. */
   beforeProviderDispatch?: () => Promise<void>;
+  /** Synchronous final check for adapters that await handoff before sending. */
+  assertProviderDispatchAllowed?: () => void;
 }
 
 export interface AgentSteerOptions extends AgentRunOptions {
@@ -749,6 +753,7 @@ export interface OutOfBandCommandContext {
   emit: (event: AgentStreamEvent) => void;
   /** Called immediately before a provider request makes the command irreversible. */
   beforeProviderDispatch?: () => Promise<void>;
+  assertProviderDispatchAllowed?: () => void;
   /** Called after the provider acknowledges the request, or if its outcome is unknown. */
   onProviderOutcome?: (outcome?: AgentCommandOutcome) => void | Promise<void>;
 }
@@ -793,7 +798,7 @@ export interface AgentSession {
    * Calling while already idle is a successful no-op. Reject only when foreground ownership is
    * still uncertain.
    */
-  interrupt(): Promise<void>;
+  interrupt(options?: { assertCurrent?: () => void }): Promise<void>;
   /** Stop one currently owned background item and wait for provider confirmation. */
   stopBackgroundWork?(id: string): Promise<void>;
   /** True only when releasing this runtime loses no background work or pending replies.
@@ -833,6 +838,8 @@ export interface AgentSession {
    * (e.g. /goal pause) reach the provider without canceling the running turn.
    */
   tryHandleOutOfBand?(prompt: AgentPromptInput): {
+    /** False when the provider only acknowledges queueing the command. */
+    cannotConfirmTaskDispatch?: true;
     run(ctx: OutOfBandCommandContext): Promise<void>;
   } | null;
 }

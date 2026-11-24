@@ -5,7 +5,9 @@ import path from "node:path";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import type { Event as OpenCodeEvent } from "@opencode-ai/sdk/v2/client";
-import type { OpencodeClient } from "@opencode-ai/sdk/v2/client";
+import { OpencodeClient } from "@opencode-ai/sdk/v2/client";
+import { createClient as createOpenCodeHttpClient } from "@opencode-ai/sdk/v2/gen/client";
+import { TaskDispatchRejectedError } from "../task-ledger/reuse.js";
 import type { OpenCodeEventSource } from "./opencode/event-consumer.js";
 import {
   __openCodeInternals,
@@ -3211,6 +3213,144 @@ describe("OpenCode adapter startTurn error handling", () => {
     await expect(interrupt).rejects.toThrow("late abort failure");
     expect(openCode.calls.sessionAbort).toHaveLength(2);
   });
+
+  test.each(["review", "/summarize"])(
+    "rechecks task dispatch before sending %s",
+    async (prompt) => {
+      const { parent: session, openCode } = await createParentSession("ses_task_dispatch");
+      let allowed = true;
+      try {
+        await expect(
+          session.startTurn(prompt, {
+            waitForProviderPrompt: true,
+            async beforeProviderDispatch() {
+              queueMicrotask(() => {
+                allowed = false;
+              });
+            },
+            assertProviderDispatchAllowed() {
+              if (!allowed) throw new Error("Main Control changed");
+            },
+          }),
+        ).rejects.toThrow("Main Control changed");
+        expect(openCode.calls.sessionPromptAsync).toHaveLength(0);
+        expect(openCode.calls.sessionSummarize).toHaveLength(0);
+        await session.startTurn("ordinary prompt");
+        expect(openCode.calls.sessionPromptAsync).toHaveLength(1);
+      } finally {
+        await session.close();
+      }
+    },
+  );
+
+  test("rechecks task interruption before retrying a failed OpenCode abort", async () => {
+    const { parent: session, openCode } = await createParentSession("ses_task_abort_retry");
+    const response = createTestDeferred<void>();
+    openCode.sessionPromptAsyncEvents = [];
+    openCode.sessionAbortImplementation = async () => {
+      if (openCode.calls.sessionAbort.length === 1) await response.promise;
+      return { data: true };
+    };
+    let allowed = true;
+    try {
+      await session.startTurn("in progress");
+      const stopping = session.interrupt({
+        assertCurrent() {
+          if (!allowed) throw new Error("Main Control changed");
+        },
+      });
+      const rejected = expect(stopping).rejects.toThrow("Main Control changed");
+      await vi.waitFor(() => expect(openCode.calls.sessionAbort).toHaveLength(1));
+      allowed = false;
+      response.reject(new Error("abort failed"));
+      await rejected;
+      expect(openCode.calls.sessionAbort).toHaveLength(1);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test.each(["start", "steer", "interrupt"] as const)(
+    "blocks %s after the real OpenCode SDK begins preparing the request",
+    async (operation) => {
+      const intercepted = createTestDeferred<Request>();
+      const release = createTestDeferred<Request>();
+      let blockedRequest: Request | undefined;
+      function waitForRelease(request: Request) {
+        if (blockedRequest) return request;
+        blockedRequest = request;
+        intercepted.resolve(request);
+        return release.promise;
+      }
+      const fetch = vi.fn(async (request: Request) => {
+        if (new URL(request.url).pathname.endsWith("/abort")) return Response.json(true);
+        return new Response(null, { status: 204 });
+      });
+      const http = createOpenCodeHttpClient({
+        baseUrl: "http://opencode.test",
+        headers: { "x-test-transport": "preserved" },
+        fetch,
+      });
+      const session = new __openCodeInternals.OpenCodeAgentSession(
+        { provider: "opencode", cwd: "/workspace/repo" },
+        new OpencodeClient({ client: http }),
+        "ses_task_sdk_dispatch",
+        createTestLogger(),
+        {},
+      );
+      const denied = new TaskDispatchRejectedError("Main Control changed");
+      let allowed = true;
+      const assertAllowed = () => {
+        if (!allowed) throw denied;
+      };
+      try {
+        const turn = operation === "start" ? null : await session.startTurn("already running");
+        if (turn) await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+        fetch.mockClear();
+        http.interceptors.request.use(waitForRelease);
+        let request: Promise<unknown>;
+        if (operation === "interrupt") {
+          request = session.interrupt({ assertCurrent: assertAllowed });
+        } else if (turn) {
+          request = session.steerActiveTurn("deny this steer", {
+            expectedTurnId: turn.turnId,
+            assertProviderDispatchAllowed: assertAllowed,
+          });
+        } else {
+          request = session.startTurn("deny this start", {
+            waitForProviderPrompt: true,
+            assertProviderDispatchAllowed: assertAllowed,
+          });
+        }
+        const rejected = expect(request).rejects.toBe(denied);
+        const prepared = await intercepted.promise;
+        allowed = false;
+        release.resolve(prepared);
+        await rejected;
+        expect(fetch).not.toHaveBeenCalled();
+
+        allowed = true;
+        if (turn) {
+          await expect(
+            session.steerActiveTurn("still running", {
+              expectedTurnId: turn.turnId,
+              assertProviderDispatchAllowed: assertAllowed,
+            }),
+          ).resolves.toEqual({ status: "accepted" });
+        } else {
+          await session.startTurn("allowed start", {
+            waitForProviderPrompt: true,
+            assertProviderDispatchAllowed: assertAllowed,
+          });
+        }
+        expect(fetch).toHaveBeenCalledOnce();
+        expect(fetch.mock.calls[0]?.[0].headers.get("x-test-transport")).toBe("preserved");
+      } finally {
+        if (blockedRequest) release.resolve(blockedRequest);
+        await session.close();
+      }
+    },
+  );
 
   test("fails closed when the SDK abort throws before returning a promise", async () => {
     const openCode = new TestOpenCodeClient();

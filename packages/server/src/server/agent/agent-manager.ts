@@ -125,8 +125,27 @@ import type { StoredAgentRecord, AgentStorage, StoredAgentTurnState } from "./ag
 import {
   emptyWorkspaceTaskLedgerPrompt,
   renderWorkspaceTaskLedger,
+  taskParticipantKey,
+  type WorkspaceTask,
   type WorkspaceTaskLedgerStore,
 } from "./task-ledger/index.js";
+import {
+  assertTaskDispatchAdmission,
+  currentTaskDispatchAdmission,
+  type TaskDispatchAdmission,
+} from "./task-ledger/admission.js";
+import {
+  nextTaskEventOrder,
+  taskEvent,
+  taskEventLimit,
+  type TaskEvent,
+} from "./task-ledger/events.js";
+import {
+  isLocalTaskChild,
+  isTaskParticipantAddress,
+  TaskDispatchRejectedError,
+  taskReuseDecision,
+} from "./task-ledger/reuse.js";
 import type { AgentWorkspaceMoveJournal } from "./agent-workspace-move-journal.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
@@ -805,6 +824,45 @@ type ActiveTurnTerminalDisposition = "closed_current" | "stale" | "untracked";
 
 interface HandleStreamEventOptions {
   fromHistory?: boolean;
+}
+
+interface TaskLedgerObservation {
+  event: TaskEvent;
+  messageId?: string;
+  turnId?: string;
+  turnToken?: string;
+  session?: AgentSession;
+}
+
+function isTaskBindingObservation(
+  entry: TaskLedgerObservation,
+  accepted: TaskLedgerObservation,
+): boolean {
+  if (entry === accepted) return true;
+  if (entry.event.kind === "dispatched") return false;
+  if (["archived", "closed", "reset"].includes(entry.event.kind)) {
+    return entry.event.order > accepted.event.order;
+  }
+  if (!accepted.turnId || entry.event.resetEpoch !== accepted.event.resetEpoch) return false;
+  if (entry.session !== accepted.session) return false;
+  if (entry.turnToken !== undefined && accepted.turnToken !== undefined) {
+    return entry.turnToken === accepted.turnToken;
+  }
+  return entry.event.order > accepted.event.order && entry.turnId === accepted.turnId;
+}
+
+type TaskLedgerAgent = Pick<
+  ManagedAgent,
+  "id" | "workspaceId" | "labels" | "internal" | "resetEpoch"
+>;
+
+interface TaskReportAttribution {
+  agent: TaskLedgerAgent;
+  deliveryTurnId?: string;
+  correlation: Omit<TaskLedgerObservation, "event" | "messageId">;
+  order: number;
+  previousTasks: Promise<ReadonlySet<string>>;
+  pending?: PendingForegroundRun;
 }
 
 interface ManagedAgentBase extends StoredAgentTurnState {
@@ -1564,6 +1622,16 @@ export class AgentManager {
     AgentSession,
     { sessionId: string | undefined; text: string }
   >();
+  private readonly taskBindingCaptures = new Map<
+    string,
+    Set<{ workspaceId: string; observed: TaskLedgerObservation[] }>
+  >();
+  private readonly taskHandoffRuns = new WeakMap<
+    PendingForegroundRun,
+    { session: AgentSession; order: number; dispatchId?: string }
+  >();
+  private readonly taskLedgerArchivedRuntimes = new WeakSet<TaskLedgerAgent>();
+  private readonly taskLedgerLifecycles = new WeakMap<ManagedAgent, string>();
   private readonly taskLedger?: WorkspaceTaskLedgerStore;
   private readonly resumedProviderSessions = new WeakSet<AgentSession>();
   private readonly inPlaceMainControlSessions = new WeakSet<AgentSession>();
@@ -3567,6 +3635,8 @@ export class AgentManager {
     if (canClose && !canClose()) return false;
     // Retain ownership until shutdown succeeds. A failed close may still own a
     // native writer, so publishing a resumable closed snapshot would orphan it.
+    const trackLedgerClose =
+      !this.historySessions.has(agent.session) && !this.taskLedgerArchivedRuntimes.has(agent);
     await agent.session.close();
     await this.drainSessionEvents(agentId);
     this.cancelRunningProviderSubagents(agentId);
@@ -3581,6 +3651,14 @@ export class AgentManager {
       persistError = error;
     }
     this.detachPluginTools(agentId);
+    if (trackLedgerClose) {
+      this.trackBackgroundTask(
+        this.observeTaskLedgerEvent(
+          closedAgent,
+          taskEvent(agentId, "closed", closedAgent.resetEpoch, "closed"),
+        ),
+      );
+    }
     this.emitClosedAgent(closedAgent, { persist: false });
     this.logger.trace(
       {
@@ -3898,6 +3976,18 @@ export class AgentManager {
     if (record.archivedAt !== archivedRecord.archivedAt)
       this.archivedForkContexts.delete(record.id);
     if (!record.archivedAt && !record.internal) {
+      const live = this.agents.get(record.id);
+      if (live) this.taskLedgerArchivedRuntimes.add(live);
+      await this.observeTaskLedgerEvent(
+        archivedRecord,
+        taskEvent(
+          record.id,
+          "archived",
+          record.resetEpoch,
+          "archived",
+          JSON.stringify([options.archivedAt, record.updatedAt]),
+        ),
+      );
       this.pluginLifecycle?.emit("agent.archive.after", {
         agent: describeHookAgent(archivedRecord),
         archivedAt: archivedRecord.archivedAt,
@@ -4021,6 +4111,7 @@ export class AgentManager {
             if (profile) config.systemPrompt = profile.rolePrompt;
             if (!agent) {
               await this.resetClosedAgentSession(record, config, options);
+              await this.recordTaskSessionReset(agentId);
               return;
             }
 
@@ -4039,6 +4130,7 @@ export class AgentManager {
             if (!options.clearVisibleTimeline)
               await this.hydrateTimelineFromLegacyProviderHistory(agent);
             await this.switchAgentSession(agent, config, { reset: options });
+            await this.recordTaskSessionReset(agentId);
           } finally {
             this.providerSwitches.delete(agentId);
           }
@@ -6754,6 +6846,328 @@ export class AgentManager {
     await this.writeStoredMetadata(agentId, updates);
   }
 
+  /** Keep only observations that can bridge provider confirmation and the ledger binding. */
+  captureTaskBinding(agentId: string, workspaceId: string) {
+    const observed: TaskLedgerObservation[] = [];
+    const capture = { workspaceId, observed };
+    const captures = this.taskBindingCaptures.get(agentId) ?? new Set<typeof capture>();
+    captures.add(capture);
+    this.taskBindingCaptures.set(agentId, captures);
+    return {
+      events(messageId: string) {
+        const accepted = observed.find((entry) => entry.messageId === messageId);
+        if (!accepted) return [];
+        return observed
+          .filter((entry) => isTaskBindingObservation(entry, accepted))
+          .map((entry) => entry.event);
+      },
+      close: () => {
+        captures.delete(capture);
+        if (!captures.size) this.taskBindingCaptures.delete(agentId);
+      },
+    };
+  }
+
+  taskDispatchCaller(callerId: string, workspaceId: string): () => void {
+    const caller = this.agents.get(callerId);
+    const session = caller?.session;
+    return () => {
+      if (
+        !caller ||
+        !session ||
+        this.agents.get(callerId) !== caller ||
+        caller.session !== session ||
+        caller.workspaceId !== workspaceId ||
+        !isMainControlAgentLabels(caller.labels) ||
+        this.isTaskAgentArchivePending(callerId) ||
+        this.mainControlRoleUpdates.has(callerId) ||
+        this.pendingSubagentMoveSnapshots.has(callerId)
+      )
+        throw new TaskDispatchRejectedError("Main Control changed before task dispatch.");
+    };
+  }
+
+  taskDispatchTarget(
+    callerId: string,
+    agentId: string,
+    workspaceId: string,
+    epoch: number,
+    stored: StoredAgentRecord | null,
+  ): () => void {
+    const live = this.agents.get(agentId);
+    const session = live?.session;
+    return () => {
+      if (
+        this.agents.get(agentId) !== live ||
+        live?.session !== session ||
+        this.providerSwitches.has(agentId) ||
+        this.pendingSubagentMoveSnapshots.has(agentId)
+      )
+        throw new TaskDispatchRejectedError("The target session changed before task dispatch.");
+      const decision = this.readTaskAgentReuse(
+        callerId,
+        workspaceId,
+        { agentId },
+        live ?? null,
+        stored,
+      );
+      if (
+        decision.resetEpoch !== epoch ||
+        decision.action === "reset" ||
+        decision.action === "unavailable"
+      ) {
+        throw new TaskDispatchRejectedError(`Task dispatch rejected: ${decision.description}.`);
+      }
+    };
+  }
+
+  isTaskAgentArchivePending(agentId: string): boolean {
+    return this.pendingHierarchyArchives.has(agentId);
+  }
+
+  readTaskAgentReuse(
+    callerId: string,
+    workspaceId: string,
+    participant: WorkspaceTask["participants"][number],
+    live: ManagedAgent | null,
+    stored: StoredAgentRecord | null | undefined,
+  ) {
+    const serverId = this.serverId ?? "self";
+    const interactive = live?.session && !this.historySessions.has(live.session) ? live : undefined;
+    const target = interactive ?? stored;
+    if (!isTaskParticipantAddress(participant, callerId, serverId))
+      return taskReuseDecision(undefined, "not_direct_child");
+    if (!target) return taskReuseDecision();
+    if (target.workspaceId !== workspaceId)
+      return taskReuseDecision(undefined, "different_workspace");
+    if (target.internal || !isLocalTaskChild(target.labels, callerId, serverId))
+      return taskReuseDecision(undefined, "not_direct_child");
+    return taskReuseDecision({
+      // Stored-only running/initializing snapshots were interrupted by shutdown.
+      // The loader resumes from persistence or creates a fresh provider runtime.
+      lifecycle: interactive?.lifecycle ?? (stored?.lastStatus === "error" ? "error" : "closed"),
+      busy: this.hasInFlightRun(target.id) || Boolean(interactive?.activeTurnId),
+      archived: !!stored?.archivedAt || this.isTaskAgentArchivePending(target.id),
+      providerUnavailable:
+        !interactive && !this.getRegisteredProviderIds().includes(target.provider),
+      providerCanConfirmPrompt: this.canConfirmTaskPrompt(target.provider),
+      lastUsage: target.lastUsage,
+      lastTurnCompletedAt: target.lastTurnCompletedAt,
+      resetEpoch: target.resetEpoch,
+      consecutiveErrors: target.consecutiveErrors,
+    });
+  }
+
+  async readTaskParticipantReuse(callerId: string, workspaceId: string, tasks: WorkspaceTask[]) {
+    const participants = new Map(
+      tasks.flatMap((task) =>
+        task.participants.map(
+          (participant) => [taskParticipantKey(participant), participant] as const,
+        ),
+      ),
+    );
+    if (!participants.size) return new Map<string, ReturnType<typeof taskReuseDecision>>();
+    return new Map(
+      await Promise.all(
+        [...participants].map(async ([key, participant]) => {
+          if (!isTaskParticipantAddress(participant, callerId, this.serverId ?? "self")) {
+            return [key, taskReuseDecision(undefined, "not_direct_child")] as const;
+          }
+          const stored = await this.registry?.get(participant.agentId);
+          const live = this.getAgent(participant.agentId);
+          return [
+            key,
+            this.readTaskAgentReuse(callerId, workspaceId, participant, live, stored),
+          ] as const;
+        }),
+      ),
+    );
+  }
+
+  private async recordTaskSessionReset(agentId: string) {
+    if (!this.taskLedger && !this.taskBindingCaptures.has(agentId)) return;
+    const live = this.agents.get(agentId);
+    const agent = live ?? (await this.registry?.get(agentId));
+    if (!agent) return;
+    await this.observeTaskLedgerEvent(
+      agent,
+      taskEvent(agentId, "reset", agent.resetEpoch, live?.lifecycle ?? "closed", "reset"),
+    );
+  }
+
+  captureTaskReport(agentId: string): TaskReportAttribution | undefined {
+    const agent = this.agents.get(agentId);
+    if (!agent?.session || !this.taskLedger || !agent.workspaceId) return undefined;
+    const serverId = this.serverId ?? "self";
+    const parent = getParentAddressFromLabels(agent.labels, serverId);
+    if (parent?.serverId !== serverId) return undefined;
+    const turnId = agent.activeForegroundTurnId ?? agent.activeTurnId ?? undefined;
+    const ownRun = this.taskRunForReport(agentId, agent.session, turnId);
+    // Queue this read at report invocation. A slow report can only update tasks
+    // already bound here, or a new binding that confirmed this very submission.
+    const previousTasks = this.listTasksBoundToAgent(
+      agent.workspaceId,
+      agentId,
+      parent.agentId,
+      serverId,
+    );
+    return {
+      agent: { ...agent },
+      deliveryTurnId: turnId ?? ownRun?.token,
+      correlation: {
+        turnId,
+        turnToken: ownRun?.token,
+        session: agent.session,
+      },
+      order: nextTaskEventOrder(),
+      previousTasks,
+      pending: ownRun,
+    };
+  }
+
+  private taskRunForReport(agentId: string, session: AgentSession, turnId: string | undefined) {
+    const run = this.runs.getPendingRun(agentId);
+    if (!run || this.taskHandoffRuns.get(run)?.session !== session) return undefined;
+    if (run.start.status === "started" && run.start.turnId === turnId) return run;
+    if (run.start.status === "pending" && !turnId) return run;
+    return undefined;
+  }
+
+  private listTasksBoundToAgent(
+    workspaceId: string,
+    agentId: string,
+    parentId: string,
+    serverId: string,
+  ) {
+    return this.taskLedger!.list(workspaceId).then(
+      (tasks) =>
+        new Set(
+          tasks
+            .filter(({ participants }) =>
+              participants.some(
+                (participant) =>
+                  participant.agentId === agentId &&
+                  isTaskParticipantAddress(participant, parentId, serverId),
+              ),
+            )
+            .map(({ taskId }) => taskId),
+        ),
+      () => new Set<string>(),
+    );
+  }
+
+  async recordTaskParentReport(
+    agentId: string,
+    messageId: string,
+    status: "completed" | "blocked",
+    attribution?: TaskReportAttribution,
+  ) {
+    const agent = attribution?.agent ?? this.agents.get(agentId);
+    if (!agent) return;
+    const kind = status === "blocked" ? "reported_blocked" : "reported_completed";
+    const pending = attribution?.pending;
+    const handoff = pending && this.taskHandoffRuns.get(pending);
+    const persist = this.observeTaskLedgerEvent(
+      agent,
+      taskEvent(agentId, kind, agent.resetEpoch, undefined, messageId, attribution?.order),
+      attribution?.correlation,
+      attribution &&
+        (async () => {
+          if (pending?.start.status === "pending") {
+            await Promise.race([pending.turnStartedPromise, pending.settledPromise]);
+          }
+          if (pending && !handoff?.dispatchId) return () => false;
+          const previousTasks = await attribution.previousTasks;
+          return (task: WorkspaceTask) =>
+            previousTasks.has(task.taskId) ||
+            (!!handoff?.dispatchId &&
+              task.events?.some((event) => event.id === handoff.dispatchId) === true);
+        }),
+    );
+    // A provider may wait for the report tool before acknowledging the prompt.
+    if (pending?.start.status === "pending") this.trackBackgroundTask(persist);
+    else await persist;
+  }
+
+  private recordTaskDispatch(
+    agent: ActiveManagedAgent,
+    messageId?: string,
+    turnId?: string,
+    run?: PendingForegroundRun,
+  ) {
+    if (!this.taskLedger && !this.taskBindingCaptures.has(agent.id)) return;
+    const handoff = run && this.taskHandoffRuns.get(run);
+    const event = taskEvent(
+      agent.id,
+      "dispatched",
+      agent.resetEpoch,
+      agent.lifecycle,
+      messageId ?? turnId,
+      handoff?.order,
+    );
+    if (handoff) handoff.dispatchId = event.id;
+    this.trackBackgroundTask(
+      this.observeTaskLedgerEvent(agent, event, {
+        messageId,
+        turnId,
+        turnToken: run?.token,
+        session: agent.session,
+      }),
+    );
+  }
+
+  private async observeTaskLedgerEvent(
+    agent: TaskLedgerAgent,
+    event: TaskEvent,
+    correlation: Omit<TaskLedgerObservation, "event"> = {},
+    selectTasks?: () => Promise<(task: WorkspaceTask) => boolean>,
+  ): Promise<void> {
+    const { id, workspaceId } = agent;
+    if (
+      (!this.taskLedger && !this.taskBindingCaptures.has(id)) ||
+      !workspaceId ||
+      agent.internal ||
+      Buffer.byteLength(id) > 128
+    )
+      return;
+    if (event.kind !== "archived" && this.taskLedgerArchivedRuntimes.has(agent)) return;
+    const serverId = this.serverId ?? "self";
+    const parent = getParentAddressFromLabels(agent.labels, serverId);
+    if (!parent || parent.serverId !== serverId || parent.agentId === id) return;
+
+    for (const capture of this.taskBindingCaptures.get(id) ?? []) {
+      if (capture.workspaceId !== workspaceId) continue;
+      capture.observed.push({ event, ...correlation });
+      if (capture.observed.length > taskEventLimit * 2) capture.observed.shift();
+    }
+
+    await this.persistTaskLedgerEvent(workspaceId, event, serverId, parent.agentId, selectTasks);
+  }
+
+  private async persistTaskLedgerEvent(
+    workspaceId: string,
+    event: TaskEvent,
+    serverId: string,
+    parentId: string,
+    selectTasks?: () => Promise<(task: WorkspaceTask) => boolean>,
+  ) {
+    if (!this.taskLedger) return;
+    try {
+      const parentAgent = this.agents.get(parentId) ?? (await this.registry?.get(parentId));
+      // A P0 participant is eligible only if the actual local parent is Main Control
+      // in this workspace. Cascade can legitimately archive the parent first.
+      if (parentAgent?.workspaceId !== workspaceId || !isMainControlAgentLabels(parentAgent.labels))
+        return;
+      const include = selectTasks ? await selectTasks() : undefined;
+      await this.taskLedger.recordAgentEvent(workspaceId, event, serverId, parentId, include);
+    } catch (err) {
+      this.logger.warn(
+        { err, agentId: event.agentId, workspaceId },
+        "Unable to record task ledger event",
+      );
+    }
+  }
+
   withTaskLedgerCaller<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
     return this.runLifecycleMutation(agentId, operation);
   }
@@ -6858,13 +7272,17 @@ export class AgentManager {
     if (this.providerSwitches.has(agentId)) return false;
     // Providers parse slash commands from the raw text, so a command another agent sent
     // must reach them without its sender envelope.
-    const agentMessage = typeof prompt === "string" ? parseAgentMessage(prompt) : null;
-    const handler = agent.session.tryHandleOutOfBand?.(
-      agentMessage?.source ? agentMessage.text : prompt,
-    );
+    const handler = this.resolveOutOfBandCommand(agent.session, prompt);
     if (!handler) {
       return false;
     }
+    const commandSession = agent.session;
+    const assertTaskCommandAllowed = this.taskCommandGuard(
+      agent,
+      commandSession,
+      options?.clientMessageId,
+      handler.cannotConfirmTaskDispatch,
+    );
     const requiresProviderHandoff = commandDispatch?.waitForProviderOutcome === true;
     const assertDispatchAllowed = commandDispatch?.assertAllowed;
     if (!requiresProviderHandoff) {
@@ -6906,15 +7324,23 @@ export class AgentManager {
       : undefined;
     let providerHandoffOutcome: AgentCommandOutcome | undefined;
     let failedAdmission: { error: unknown } | undefined;
+    const assertCommandCurrent = () => {
+      try {
+        this.assertCommandSessionCurrent(agent);
+        assertDispatchAllowed?.();
+        assertTaskCommandAllowed?.();
+      } catch (error) {
+        failedAdmission = { error };
+        throw error;
+      }
+    };
     const beforeProviderDispatch = requiresProviderHandoff
       ? async () => {
           try {
-            this.assertAcceptingAgentRuns();
-            assertDispatchAllowed?.();
+            assertCommandCurrent();
             const accepted = onAccepted?.();
             if (accepted) await accepted;
-            this.assertAcceptingAgentRuns();
-            assertDispatchAllowed?.();
+            assertCommandCurrent();
           } catch (error) {
             // A command handler may turn this error into a timeline message.
             failedAdmission = { error };
@@ -6926,6 +7352,7 @@ export class AgentManager {
       ? async (outcome: AgentCommandOutcome = "accepted") => {
           if (providerHandoffOutcome) return;
           providerHandoffOutcome = outcome;
+          if (outcome === "accepted") this.recordTaskDispatch(agent, options?.clientMessageId);
           await commandDispatch?.onProviderOutcome?.(outcome);
           markCommandStarted?.();
         }
@@ -6934,7 +7361,12 @@ export class AgentManager {
       assertNoFileRewind(this, agent.cwd);
       assertDispatchAllowed?.();
       try {
-        await handler.run({ emit: dispatch, beforeProviderDispatch, onProviderOutcome });
+        await handler.run({
+          emit: dispatch,
+          beforeProviderDispatch,
+          assertProviderDispatchAllowed: assertTaskCommandAllowed && assertCommandCurrent,
+          onProviderOutcome,
+        });
       } catch (error) {
         if (requiresProviderHandoff && !providerHandoffOutcome) {
           if (failedAdmission) throw failedAdmission.error;
@@ -6954,6 +7386,32 @@ export class AgentManager {
     });
     if (commandStarted) await Promise.race([commandStarted, command]);
     return true;
+  }
+
+  private taskCommandGuard(
+    agent: ActiveManagedAgent,
+    session: AgentSession,
+    messageId: string | undefined,
+    cannotConfirm: boolean | undefined,
+  ): (() => void) | undefined {
+    const admission = currentTaskDispatchAdmission(messageId);
+    if (!admission) return undefined;
+    if (cannotConfirm || !this.canConfirmTaskPrompt(agent.provider)) {
+      throw new TaskDispatchRejectedError(
+        "This provider cannot confirm execution of this task-bound command.",
+      );
+    }
+    return () => {
+      if (agent.session !== session) {
+        throw new TaskDispatchRejectedError("The target session changed before the task command.");
+      }
+      assertTaskDispatchAdmission(admission, agent.id);
+    };
+  }
+
+  private resolveOutOfBandCommand(session: AgentSession, prompt: AgentPromptInput) {
+    const message = typeof prompt === "string" ? parseAgentMessage(prompt) : null;
+    return session.tryHandleOutOfBand?.(message?.source ? message.text : prompt);
   }
 
   notifyHumanWorkspaceMessage(agentId: string): void {
@@ -7079,7 +7537,9 @@ export class AgentManager {
     if (/^\/compact(?:\s|$)/.test(command.trimStart())) return undefined;
     let rendered: string;
     try {
-      rendered = renderWorkspaceTaskLedger(await this.taskLedger.list(workspaceId), agent.id);
+      const tasks = await this.taskLedger.list(workspaceId);
+      const reuse = await this.readTaskParticipantReuse(agent.id, workspaceId, tasks);
+      rendered = renderWorkspaceTaskLedger(tasks, agent.id, reuse);
     } catch (error) {
       this.logger.warn(
         { err: error, workspaceId, agentId: agent.id },
@@ -7171,6 +7631,21 @@ export class AgentManager {
     if (pendingRun.settled) {
       throw error;
     }
+    if (error instanceof TaskDispatchRejectedError) {
+      this.runs.settleForegroundStart(pendingRun, {
+        status: "failed",
+        error: error.message,
+        admissionError: error,
+      });
+      agent.pendingReplacement = false;
+      if (!agent.activeForegroundTurnId && !agent.activeTurnId && agent.lifecycle === "running") {
+        (agent as ActiveManagedAgent).lifecycle =
+          (agent.consecutiveErrors ?? 0) > 0 ? "error" : "idle";
+        this.emitState(agent);
+      }
+      this.runs.settleForegroundRun(agentId, pendingRun.token);
+      throw error;
+    }
     if (isStaleProviderSessionError(error)) {
       this.runs.settleForegroundStart(pendingRun, {
         status: "failed",
@@ -7248,6 +7723,10 @@ export class AgentManager {
     return capture ? capture.then(dispatch) : dispatch();
   }
 
+  private canConfirmTaskPrompt(provider: AgentProvider): boolean {
+    return ["codex", "claude", "opencode", "pi", "omp"].includes(this.adapterOf(provider));
+  }
+
   private dispatchAdmittedProviderTurn(
     params: Parameters<AgentManager["startPendingForegroundTurn"]>[0],
     providerPrompt: AgentPromptInput,
@@ -7255,6 +7734,10 @@ export class AgentManager {
   ) {
     const { agent, agentId, pendingRun, options, promptStart } = params;
     assertNoFileRewind(this, agent.cwd);
+    const taskAdmission = currentTaskDispatchAdmission(options?.clientMessageId);
+    if (taskAdmission && !this.canConfirmTaskPrompt(agent.provider)) {
+      throw new TaskDispatchRejectedError("This provider cannot confirm a task-bound prompt.");
+    }
     const validate = () => {
       this.assertPendingTurnStart(agentId, pendingRun);
       if (ledgerIsCurrent?.() === false) {
@@ -7264,6 +7747,9 @@ export class AgentManager {
     validate();
     const start = (runOptions = options) => agent.session.startTurn(providerPrompt, runOptions);
     if (!promptStart?.beforeHandoff) {
+      if (taskAdmission) {
+        throw new TaskDispatchRejectedError("Task prompts require a provider handoff check.");
+      }
       if (!ledgerIsCurrent || !agent.session.capabilities.defersPromptHandoff) return start();
       return start({
         ...options,
@@ -7274,20 +7760,42 @@ export class AgentManager {
       });
     }
     this.assertAcceptingAgentRuns();
+    const session = agent.session;
     const validateHandoff = () => {
       this.assertAcceptingAgentRuns();
       validate();
+      if (taskAdmission) {
+        if (
+          this.agents.get(agentId) !== agent ||
+          agent.session !== session ||
+          this.runs.getPendingRun(agentId) !== pendingRun
+        ) {
+          throw new TaskDispatchRejectedError("The target run changed before task dispatch.");
+        }
+        assertTaskDispatchAdmission(taskAdmission, agentId);
+        if (!this.taskHandoffRuns.has(pendingRun)) {
+          this.taskHandoffRuns.set(pendingRun, {
+            session: agent.session,
+            order: nextTaskEventOrder(),
+          });
+        }
+      }
     };
+    const { defersPromptHandoff, defersConfirmedPromptHandoff } = agent.session.capabilities;
+    const defer =
+      defersPromptHandoff || (options?.waitForProviderPrompt && defersConfirmedPromptHandoff);
     return (
-      agent.session.capabilities.defersPromptHandoff
+      defer
         ? start({
             ...options,
             beforeProviderDispatch: () => promptStart.handoff(async () => {}, validateHandoff),
+            assertProviderDispatchAllowed: taskAdmission ? validateHandoff : undefined,
           })
         : promptStart.handoff(start, validateHandoff)
     ).catch(async (error) => {
       if (
         isStaleProviderSessionError(error) ||
+        error instanceof TaskDispatchRejectedError ||
         error instanceof AgentTurnStartCanceledError ||
         error instanceof AgentTurnStartRejectedError
       ) {
@@ -7576,6 +8084,7 @@ export class AgentManager {
       agent.attention = { requiresAttention: false };
       agent.lifecycle = "running";
       this.touchUpdatedAt(agent);
+      this.recordTaskDispatch(agent, options?.clientMessageId, turnId, pendingRun);
       // AgentManager owns the accepted-turn boundary. Publish liveness before the canonical
       // prompt so clients can retire optimistic activity without painting an idle frame.
       // The provider's duplicate start for this turn is suppressed at the ingestion boundary.
@@ -7792,15 +8301,18 @@ export class AgentManager {
             if (admitSteer) {
               if (!(await admitSteer())) return { status: "unavailable" };
             }
+            const taskAdmission = currentTaskDispatchAdmission(options?.clientMessageId);
             const assertSteerAllowed = () => {
               this.assertAcceptingAgentRuns();
               this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
+              if (taskAdmission) assertTaskDispatchAdmission(taskAdmission, agentId);
             };
             const steer = (beforeProviderDispatch?: () => Promise<void>) =>
               agent.session.steerActiveTurn!(prompt, {
                 ...options,
                 expectedTurnId,
                 beforeProviderDispatch,
+                assertProviderDispatchAllowed: taskAdmission ? assertSteerAllowed : undefined,
               });
             let admission: SteerResult;
             try {
@@ -7815,6 +8327,7 @@ export class AgentManager {
             } catch (error) {
               if (
                 isStaleProviderSessionError(error) ||
+                error instanceof TaskDispatchRejectedError ||
                 error instanceof AgentTurnStartCanceledError
               ) {
                 await onSteerDeclined?.();
@@ -7823,6 +8336,7 @@ export class AgentManager {
             }
             if (admission.status === "unavailable") await onSteerDeclined?.();
             if (admission.status === "accepted") {
+              this.recordTaskDispatch(agent, options?.clientMessageId, expectedTurnId);
               await this.recordAcceptedSteer(
                 agent,
                 prompt,
@@ -7961,18 +8475,24 @@ export class AgentManager {
     promptStart?: ForegroundPromptStart,
     assertAdmission?: (agent: ActiveManagedAgent) => void,
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
+    const taskAdmission = currentTaskDispatchAdmission(options?.clientMessageId);
     let stalledStart: PendingForegroundRun | null = null;
+    let awaitedStart: PendingForegroundRun | null = null;
     for (;;) {
       const admission = await this.runForegroundMutation(agentId, async () => {
         this.assertAcceptingAgentRuns();
         if (this.hierarchySessionUpdates.has(agentId) && !assertAdmission) {
           return {
             status: "reserved" as const,
-            iterator: this.streamAgent(agentId, prompt, options),
+            iterator: this.streamAgent(agentId, prompt, options, promptStart),
           };
         }
         // Resolve the agent inside the lane: a reload while this send waited replaces it.
         const agent = this.requireSessionAgent(agentId);
+        const currentRun = this.runs.getRun(agentId);
+        if (taskAdmission && awaitedStart && currentRun && currentRun !== awaitedStart) {
+          throw new TaskDispatchRejectedError("The target run changed before task interrupt.");
+        }
         // A run that is still starting has no turn to interrupt yet. Canceling it would drop
         // its prompt, so wait for it outside the lane, where Stop can still reach it. A start
         // that outlasts the rescue timeout is canceled like any other run.
@@ -7987,27 +8507,24 @@ export class AgentManager {
             iterator: this.streamAgent(agent.id, prompt, options, promptStart),
           };
         }
-        agent.pendingReplacement = true;
-        agent.lifecycle = "running";
-        this.touchUpdatedAt(agent);
-        this.emitState(agent);
-        try {
-          const result = await this.cancelAgentRunNow(agent.id);
-          if (result.status === "refused") {
-            throw new AgentRunCancellationError(agent.id, "replace");
-          }
-          return {
-            status: "reserved" as const,
-            iterator: this.reserveAgentRun(agent.id, prompt, options, promptStart),
-          };
-        } catch (error) {
-          agent.pendingReplacement = false;
-          throw error;
-        }
+        const assertInterrupt = taskAdmission
+          ? await this.prepareTaskInterrupt(agent, taskAdmission, promptStart)
+          : undefined;
+        return {
+          status: "reserved" as const,
+          iterator: await this.interruptAndReserveRun(
+            agent,
+            prompt,
+            options,
+            promptStart,
+            assertInterrupt,
+          ),
+        };
       });
       if (admission.status === "reserved") {
         return admission.iterator;
       }
+      awaitedStart = admission.run;
       const started = await this.waitWithTimeout({
         operation: Promise.race([admission.run.turnStartedPromise, admission.run.settledPromise]),
         timeoutMs: this.rescueTimeouts.interruptSessionMs,
@@ -8015,6 +8532,66 @@ export class AgentManager {
       if (started === "timed_out") {
         stalledStart = admission.run;
       }
+    }
+  }
+
+  private async prepareTaskInterrupt(
+    agent: ActiveManagedAgent,
+    admission: TaskDispatchAdmission,
+    promptStart?: ForegroundPromptStart,
+  ): Promise<(() => void) | undefined> {
+    if (!promptStart?.beforeHandoff || !this.canConfirmTaskPrompt(agent.provider)) {
+      throw new TaskDispatchRejectedError("This provider cannot confirm a task-bound prompt.");
+    }
+    const { id, session, activeTurnId } = agent;
+    const run = this.runs.getRun(id);
+    await promptStart.beforeHandoff();
+    const validate = () => {
+      assertTaskDispatchAdmission(admission, id);
+      if (
+        this.agents.get(id) !== agent ||
+        agent.session !== session ||
+        this.runs.getRun(id) !== run ||
+        agent.activeTurnId !== activeTurnId
+      ) {
+        throw new TaskDispatchRejectedError("The target run changed before task interrupt.");
+      }
+    };
+    validate();
+    return validate;
+  }
+
+  private async interruptAndReserveRun(
+    agent: ActiveManagedAgent,
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+    promptStart?: ForegroundPromptStart,
+    assertInterrupt?: () => void,
+  ) {
+    const previousLifecycle = agent.lifecycle;
+    agent.pendingReplacement = true;
+    agent.lifecycle = "running";
+    this.touchUpdatedAt(agent);
+    this.emitState(agent);
+    try {
+      const result = await this.cancelAgentRunNow(agent.id, assertInterrupt);
+      if (result.status === "refused") throw new AgentRunCancellationError(agent.id, "replace");
+      return this.reserveAgentRun(agent.id, prompt, options, promptStart);
+    } catch (error) {
+      agent.pendingReplacement = false;
+      if (error instanceof TaskDispatchRejectedError && this.agents.get(agent.id) === agent) {
+        let lifecycle = previousLifecycle;
+        if (
+          previousLifecycle === "running" &&
+          !this.hasInFlightRun(agent.id) &&
+          !agent.activeTurnId
+        ) {
+          lifecycle = agent.consecutiveErrors ? "error" : "idle";
+        }
+        agent.lifecycle = lifecycle;
+        this.emitState(agent);
+      }
+      throw error;
     }
   }
 
@@ -8212,7 +8789,11 @@ export class AgentManager {
     }
   }
 
-  private async cancelAgentRunNow(agentId: string): Promise<AgentRunCancellationResult> {
+  private async cancelAgentRunNow(
+    agentId: string,
+    assertInterruptAllowed?: () => void,
+  ): Promise<AgentRunCancellationResult> {
+    assertInterruptAllowed?.();
     const agent = this.requireSessionAgent(agentId);
     const run =
       this.runs.getRun(agentId) ??
@@ -8221,7 +8802,11 @@ export class AgentManager {
       return { status: "not_running" };
     }
 
-    const interruptAcknowledged = await this.interruptSession(agent.session, agentId);
+    const interruptAcknowledged = await this.interruptSession(
+      agent.session,
+      agentId,
+      assertInterruptAllowed,
+    );
     const settlement = await this.waitWithTimeout({
       operation: run.settledPromise,
       timeoutMs: interruptAcknowledged
@@ -8233,6 +8818,9 @@ export class AgentManager {
       return { status: settlement === "completed" ? "settled" : "refused" };
     }
 
+    if (this.agents.get(agentId) !== agent || this.runs.getRun(agentId) !== run) {
+      return { status: "settled" };
+    }
     const runTurnId = this.runs.getTurnId(agentId);
     if (settlement === "timed_out" && runTurnId) {
       this.logger.warn(
@@ -8287,10 +8875,14 @@ export class AgentManager {
     }
   }
 
-  private async interruptSession(session: AgentSession, agentId: string): Promise<boolean> {
+  private async interruptSession(
+    session: AgentSession,
+    agentId: string,
+    assertCurrent?: () => void,
+  ): Promise<boolean> {
     try {
       const result = await this.waitWithTimeout({
-        operation: session.interrupt(),
+        operation: assertCurrent ? session.interrupt({ assertCurrent }) : session.interrupt(),
         timeoutMs: this.rescueTimeouts.interruptSessionMs,
         onLateError: (error) => {
           this.logger.warn(
@@ -8309,6 +8901,7 @@ export class AgentManager {
       }
       return true;
     } catch (error) {
+      if (assertCurrent && error instanceof TaskDispatchRejectedError) throw error;
       this.logger.error({ err: error, agentId }, "Failed to interrupt session");
       return false;
     }
@@ -10402,16 +10995,14 @@ export class AgentManager {
 
     if (!options?.fromHistory) {
       if (isTurnTerminalEvent(event)) {
-        this.updateTurnReuseState(agent, event, terminalDisposition);
-        const rewind = this.settleTerminalRewindTurn(
+        const settling = this.settleLiveTerminal(
           agent,
           event,
+          eventTurnId,
           isForegroundEvent,
           terminalDisposition,
         );
-        if (rewind) await rewind;
-        this.runs.settleTerminalRun(agent.id, eventTurnId);
-        this.publishTerminalReadiness(agent, eventTurnId, isForegroundEvent, terminalDisposition);
+        if (settling) await settling;
       }
 
       if (flags.shouldDispatchEvent) {
@@ -10422,6 +11013,50 @@ export class AgentManager {
     this.traceHandleStreamEventEnd(agent, event, eventTurnId, flags);
 
     return flags.shouldNotifyWaiters;
+  }
+
+  private settleLiveTerminal(
+    agent: ActiveManagedAgent,
+    event: TurnTerminalEvent,
+    turnId: string | undefined,
+    isForegroundEvent: boolean,
+    disposition: ActiveTurnTerminalDisposition,
+  ): Promise<void> | undefined {
+    const fromHistoryReader = this.historySessions.has(agent.session);
+    if (!fromHistoryReader) this.updateTurnReuseState(agent, event, disposition);
+    const rewind = this.settleTerminalRewindTurn(agent, event, isForegroundEvent, disposition);
+    const publish = () => {
+      this.runs.settleTerminalRun(agent.id, turnId);
+      if (disposition !== "stale" && !fromHistoryReader) {
+        this.recordTaskTerminal(agent, event, turnId, isForegroundEvent);
+      }
+      this.publishTerminalReadiness(agent, turnId, isForegroundEvent, disposition);
+    };
+    if (rewind) return rewind.then(publish);
+    publish();
+  }
+
+  private recordTaskTerminal(
+    agent: ActiveManagedAgent,
+    event: TurnTerminalEvent,
+    turnId: string | undefined,
+    isForegroundEvent: boolean,
+  ) {
+    if (!this.taskLedger && !this.taskBindingCaptures.has(agent.id)) return;
+    let lifecycle = agent.lifecycle;
+    if (isForegroundEvent) {
+      if (event.type === "turn_failed") lifecycle = "error";
+      else lifecycle = agent.pendingReplacement ? "running" : "idle";
+    }
+    this.taskLedgerLifecycles.set(agent, lifecycle);
+    const key = turnId ? JSON.stringify([agent.persistence?.sessionId, turnId]) : undefined;
+    this.trackBackgroundTask(
+      this.observeTaskLedgerEvent(
+        agent,
+        taskEvent(agent.id, event.type, agent.resetEpoch, lifecycle, key),
+        { turnId, session: agent.session },
+      ),
+    );
   }
 
   private publishTerminalReadiness(
@@ -11124,6 +11759,26 @@ export class AgentManager {
   }
 
   private emitState(agent: ManagedAgent, options?: { persist?: boolean }): void {
+    if (
+      agent.session &&
+      !this.historySessions.has(agent.session) &&
+      (this.taskLedger || this.taskBindingCaptures.has(agent.id))
+    ) {
+      const previous = this.taskLedgerLifecycles.get(agent);
+      const current = agent.lifecycle;
+      this.taskLedgerLifecycles.set(agent, current);
+      if (
+        (current === "error" && previous !== current) ||
+        (current === "idle" && previous === "running")
+      ) {
+        this.trackBackgroundTask(
+          this.observeTaskLedgerEvent(
+            agent,
+            taskEvent(agent.id, current, agent.resetEpoch, current),
+          ),
+        );
+      }
+    }
     // Keep attention as an edge-triggered unread signal, not a level signal.
     this.checkAndSetAttention(agent);
     if (options?.persist !== false) {

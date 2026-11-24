@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { setImmediate } from "node:timers/promises";
 import { promisify } from "node:util";
 import pino from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -907,6 +908,209 @@ describe("ClaudeAgentSession features", () => {
       ).rejects.toThrow("Main Control changed");
     } finally {
       await session.close();
+    }
+  });
+
+  test("rechecks task admission before pushing a Claude prompt", async () => {
+    const { queryFactory } = createQueryMock();
+    const session = await new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    }).createSession({ provider: "claude", cwd: process.cwd() });
+    const checked = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    let allowed = true;
+    try {
+      const starting = session.startTurn("deny this prompt", {
+        waitForProviderPrompt: true,
+        async beforeProviderDispatch() {
+          checked.resolve();
+          await resume.promise;
+        },
+        assertProviderDispatchAllowed() {
+          if (!allowed) throw new Error("Main Control changed");
+        },
+      });
+      const rejected = expect(starting).rejects.toThrow("Main Control changed");
+      await checked.promise;
+      allowed = false;
+      resume.resolve();
+      await rejected;
+      await session.startTurn("ordinary prompt");
+      const input = queryFactory.mock.calls[0]?.[0].prompt as AsyncIterable<SDKUserMessage>;
+      expect((await input[Symbol.asyncIterator]().next()).value).toMatchObject({
+        message: { content: [{ type: "text", text: "ordinary prompt" }] },
+      });
+    } finally {
+      resume.resolve();
+      await session.close();
+    }
+  });
+
+  async function createTaskDispatchSession(kind: "foreground" | "steer") {
+    const mock = createStreamingQueryMock();
+    const session = await new ClaudeAgentClient({
+      logger,
+      queryFactory: mock.queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    }).createSession({ provider: "claude", cwd: process.cwd() });
+    function input() {
+      const prompt = mock.queryFactory.mock.calls[0]?.[0].prompt as AsyncIterable<SDKUserMessage>;
+      return prompt[Symbol.asyncIterator]();
+    }
+    const original = kind === "steer" ? await session.startTurn("original turn") : undefined;
+    if (original) await input().next();
+    function submit(text: string, assertProviderDispatchAllowed?: () => void) {
+      return original
+        ? session.steerActiveTurn(text, {
+            expectedTurnId: original.turnId,
+            assertProviderDispatchAllowed,
+          })
+        : session.startTurn(text, { assertProviderDispatchAllowed });
+    }
+    return { session, input, submit };
+  }
+
+  test.each(["foreground", "steer"] as const)(
+    "drops a task-bound %s prompt when authorization changes before SDK next()",
+    async (kind) => {
+      const { session, input, submit } = await createTaskDispatchSession(kind);
+      const queued = Promise.withResolvers<void>();
+      let allowed = true;
+      const assertProviderDispatchAllowed = () => {
+        if (!allowed) throw new Error("Main Control changed");
+        queued.resolve();
+      };
+      try {
+        const rejected = expect(
+          submit("stale task", assertProviderDispatchAllowed),
+        ).rejects.toThrow("Main Control changed");
+        await queued.promise;
+        allowed = false;
+        const sdkMessage = input().next();
+        await rejected;
+        await submit("ordinary prompt");
+        expect((await sdkMessage).value).toMatchObject({
+          message: { content: [{ type: "text", text: "ordinary prompt" }] },
+        });
+      } finally {
+        await session.close();
+      }
+    },
+  );
+
+  test.each(["foreground", "steer"] as const)(
+    "confirms a task-bound %s prompt when the SDK takes it",
+    async (kind) => {
+      const { session, input, submit } = await createTaskDispatchSession(kind);
+      const queued = Promise.withResolvers<void>();
+      const assertAllowed = vi.fn(queued.resolve);
+      const accepted = vi.fn();
+      try {
+        const submission = submit("task prompt", assertAllowed);
+        void submission.then(accepted, () => {});
+        await queued.promise;
+        await setImmediate();
+        expect(accepted).not.toHaveBeenCalled();
+        expect((await input().next()).value).toMatchObject({
+          message: { content: [{ type: "text", text: "task prompt" }] },
+        });
+        await submission;
+        expect(accepted).toHaveBeenCalledOnce();
+        expect(assertAllowed).toHaveBeenCalledTimes(2);
+      } finally {
+        await session.close();
+      }
+    },
+  );
+
+  test.each(["interrupt", "close"] as const)(
+    "%s rejects a queued task prompt even if the SDK has not called next()",
+    async (action) => {
+      const { session, input, submit } = await createTaskDispatchSession("foreground");
+      const queued = Promise.withResolvers<void>();
+      try {
+        const rejected = expect(submit("withdrawn task", queued.resolve)).rejects.toThrow(
+          "Turn was canceled before starting",
+        );
+        await queued.promise;
+        const sdkInput = input();
+        await session[action]();
+        await rejected;
+        await session.close();
+        expect(await sdkInput.next()).toEqual({ value: undefined, done: true });
+      } finally {
+        await session.close();
+      }
+    },
+  );
+
+  test.each(["foreground", "steer"] as const)(
+    "accepts an ordinary %s prompt before the SDK calls next()",
+    async (kind) => {
+      const { session, input, submit } = await createTaskDispatchSession(kind);
+      try {
+        await submit("ordinary prompt");
+        expect((await input().next()).value).toMatchObject({
+          message: { content: [{ type: "text", text: "ordinary prompt" }] },
+        });
+      } finally {
+        await session.close();
+      }
+    },
+  );
+
+  test("rejects task-bound rewind before starting the Claude query", async () => {
+    const { queryFactory } = createQueryMock();
+    const session = await new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    }).createSession({ provider: "claude", cwd: process.cwd() });
+    try {
+      await expect(
+        session.startTurn("/rewind", {
+          waitForProviderPrompt: true,
+          assertProviderDispatchAllowed() {},
+        }),
+      ).rejects.toThrow("Claude /rewind cannot confirm a task-bound dispatch.");
+      expect(queryFactory).not.toHaveBeenCalled();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("rechecks task interruption after Claude tries to withdraw its queued prompt", async () => {
+    const fixture = await startToolForClosure();
+    const withdrawing = Promise.withResolvers<void>();
+    const withdrawal = Promise.withResolvers<boolean>();
+    const interrupt = vi.fn(async () => undefined);
+    Object.assign(fixture.queryMock, {
+      interrupt,
+      cancelAsyncMessage: () => {
+        withdrawing.resolve();
+        return withdrawal.promise;
+      },
+    });
+    let allowed = true;
+    try {
+      const stopping = fixture.session.interrupt({
+        assertCurrent() {
+          if (!allowed) throw new Error("Main Control changed");
+        },
+      });
+      const rejected = expect(stopping).rejects.toThrow("Main Control changed");
+      await withdrawing.promise;
+      allowed = false;
+      withdrawal.resolve(false);
+      await rejected;
+      expect(interrupt).not.toHaveBeenCalled();
+      expect(fixture.events.filter((event) => event.type === "turn_canceled")).toHaveLength(0);
+    } finally {
+      withdrawal.resolve(false);
+      fixture.unsubscribe();
+      await fixture.session.close();
     }
   });
 
