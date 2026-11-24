@@ -3462,6 +3462,7 @@ export const CheckoutGitBranchMutateRequestSchema = CheckoutGitMutationRequestSc
   newName: z.string().min(1).optional(),
   startPoint: z.string().min(1).optional(),
   force: z.boolean().optional(),
+  expectedRefSha: z.string().min(1).optional(),
 });
 export const CheckoutGitRebaseBuildPlanRequestSchema = CheckoutGitTargetRequestSchema.extend({
   type: z.literal("checkout.git.rebase.build_plan.request"),
@@ -3496,9 +3497,36 @@ export const CheckoutGitRebaseActRequestSchema = CheckoutGitTargetRequestSchema.
   backupRef: z.string().startsWith("refs/paseo/backup/").optional(),
   forceWithRunningAgents: z.boolean().optional(),
 });
+export const CheckoutGitBlameGetRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  type: z.literal("checkout.git.blame.get.request"),
+  path: z.string().min(1),
+  startLine: z.number().int().positive().optional(),
+  endLine: z.number().int().positive().optional(),
+});
+export const CheckoutGitTagMutateRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  type: z.literal("checkout.git.tag.mutate.request"),
+  action: z.enum(["create", "delete", "push"]),
+  tagName: z.string().min(1),
+  expectedTagSha: z.string().min(1).optional(),
+  remote: z.string().min(1).optional(),
+  expectedHeadSha: z.string().min(1).nullable(),
+});
+export const CheckoutGitPushPrepareRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  type: z.literal("checkout.git.push.prepare.request"),
+  expectedHeadSha: z.string().min(1).nullable(),
+});
+export const CheckoutGitPushForceRequestSchema = CheckoutGitTargetRequestSchema.extend({
+  type: z.literal("checkout.git.push.force.request"),
+  expectedHeadSha: z.string().min(1).nullable(),
+  confirmation: z.string(),
+  expectedPushToken: z.string().min(1).optional(),
+});
+
+export const CHECKOUT_GIT_MAX_CONFLICT_TEXT_BYTES = 512 * 1024;
 export const CheckoutGitConflictInspectRequestSchema = CheckoutGitTargetRequestSchema.extend({
   type: z.literal("checkout.git.conflict.inspect.request"),
   path: z.string().min(1).optional(),
+  includeContents: z.boolean().optional(),
 });
 const CheckoutGitConflictFingerprintSchema = z.string().min(1);
 export const CheckoutGitConflictResolveRequestSchema = CheckoutGitTargetRequestSchema.extend({
@@ -3508,6 +3536,7 @@ export const CheckoutGitConflictResolveRequestSchema = CheckoutGitTargetRequestS
   // Verify the inspected snapshot under the repo write lock before using any hunk index.
   expectedConflictFingerprint: CheckoutGitConflictFingerprintSchema,
   hunkIndex: z.number().int().nonnegative().optional(),
+  resultText: z.string().max(CHECKOUT_GIT_MAX_CONFLICT_TEXT_BYTES).optional(),
 });
 
 export const CheckoutWorktreesListRequestSchema = z.object({
@@ -4691,6 +4720,10 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CheckoutGitRebaseBuildPlanRequestSchema,
   CheckoutGitRebaseExecuteRequestSchema,
   CheckoutGitRebaseActRequestSchema,
+  CheckoutGitBlameGetRequestSchema,
+  CheckoutGitTagMutateRequestSchema,
+  CheckoutGitPushPrepareRequestSchema,
+  CheckoutGitPushForceRequestSchema,
   CheckoutGitConflictInspectRequestSchema,
   CheckoutGitConflictResolveRequestSchema,
   CheckoutWorktreesListRequestSchema,
@@ -5126,6 +5159,8 @@ export const ServerInfoStatusPayloadSchema = z
         checkoutGitRebaseV1: z.boolean().optional(),
         // COMPAT(checkoutGitMultiRepoV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
         checkoutGitMultiRepoV1: z.boolean().optional(),
+        // COMPAT(checkoutGitP2V1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
+        checkoutGitP2V1: z.boolean().optional(),
         // COMPAT(workspaceAgentsSummary): added in v0.16.0, remove gate after 2027-05-20.
         workspaceAgentsSummary: z.boolean().optional(),
         // COMPAT(agentHistoryWorkspaceFilter): added in v0.16.0, remove gate after 2027-05-20.
@@ -7397,7 +7432,7 @@ export const CheckoutGitRepoRefsSchema = z.object({
   repoRoot: z.string(),
   localBranches: z.array(CheckoutGitRefSchema),
   remotes: z.array(z.object({ name: z.string(), branches: z.array(CheckoutGitRefSchema) })),
-  tags: z.array(CheckoutGitRefSchema),
+  tags: z.array(CheckoutGitRefSchema.extend({ objectSha: z.string().optional() })),
   backups: z.array(CheckoutGitRefSchema),
 });
 export const CheckoutGitRefsListResponseSchema = z.object({
@@ -7497,7 +7532,61 @@ export const CheckoutGitConflictFileSchema = CheckoutGitConflictPathSchema.exten
       theirs: z.string().nullable(),
     }),
   ),
+  contents: z
+    .object({
+      base: z.string().nullable(),
+      ours: z.string().nullable(),
+      theirs: z.string().nullable(),
+      result: z.string().nullable(),
+    })
+    .optional(),
 });
+export const CheckoutGitBlameGetResponseSchema = z.object({
+  type: z.literal("checkout.git.blame.get.response"),
+  payload: CheckoutGitTargetResponsePayloadSchema.extend({
+    lines: z.array(
+      z.object({
+        lineNumber: z.number().int().positive(),
+        sha: z.string().nullable(),
+        authorName: z.string(),
+        authorDate: z.string().nullable(),
+        summary: z.string(),
+        lineText: z.string().optional(),
+      }),
+    ),
+    truncated: z.boolean().optional(),
+  }),
+});
+export const CheckoutGitTagMutateResponseSchema = z.object({
+  type: z.literal("checkout.git.tag.mutate.response"),
+  payload: CheckoutGitMutationResultSchema,
+});
+const CheckoutGitPushErrorCodeSchema = z.enum([
+  ...WorkbenchErrorCodeSchema.options,
+  "STALE_REMOTE_BASELINE",
+]);
+export const CheckoutGitPushPrepareResponseSchema = z.object({
+  type: z.literal("checkout.git.push.prepare.response"),
+  payload: CheckoutGitTargetResponsePayloadSchema.extend({
+    errorCode: CheckoutGitPushErrorCodeSchema.optional(),
+    target: z
+      .object({
+        branch: z.string(),
+        remote: z.string(),
+        remoteRef: z.string(),
+        remoteSha: z.string(),
+        token: z.string(),
+      })
+      .nullable(),
+  }),
+});
+export const CheckoutGitPushForceResponseSchema = z.object({
+  type: z.literal("checkout.git.push.force.response"),
+  payload: CheckoutGitMutationResultSchema.extend({
+    errorCode: CheckoutGitPushErrorCodeSchema.optional(),
+  }),
+});
+
 export const CheckoutGitConflictInspectResponseSchema = z.object({
   type: z.literal("checkout.git.conflict.inspect.response"),
   payload: CheckoutGitTargetResponsePayloadSchema.extend({
@@ -9310,6 +9399,10 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   CheckoutGitRebaseBuildPlanResponseSchema,
   CheckoutGitRebaseExecuteResponseSchema,
   CheckoutGitRebaseActResponseSchema,
+  CheckoutGitBlameGetResponseSchema,
+  CheckoutGitTagMutateResponseSchema,
+  CheckoutGitPushPrepareResponseSchema,
+  CheckoutGitPushForceResponseSchema,
   CheckoutGitConflictInspectResponseSchema,
   CheckoutGitConflictResolveResponseSchema,
   CheckoutWorktreesListResponseSchema,

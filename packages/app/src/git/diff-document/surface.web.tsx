@@ -1,3 +1,4 @@
+import { DiffLineActions, DiffLineOverlays } from "./line-overlays";
 import { DiffHunkOverlays } from "./hunk-overlays";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -185,12 +186,17 @@ export function DiffSurface(props: DiffSurfaceProps) {
     readyTypographyResource === typographyResource ? typographyResource.measureText : null;
   const reviewActions = props.mode.kind === "working" ? props.mode.reviewActions : undefined;
   const hunkActions = props.mode.kind === "working" && Boolean(props.mode.renderHunkActions);
+  const blameWidth = blameRailWidth(props.mode, viewport.width);
+  const codeWidth = viewport.width - blameWidth;
+  const hasPickedLines =
+    props.mode.kind === "working" && Boolean(props.mode.lineSelection?.picked.size);
+
   const model = useMemo(() => {
     if (!loadedTypography || !measurement) {
       return emptyDiffDocumentModel({
         layout: props.displayPreferences.layout,
         wrapLines: props.displayPreferences.wrapLines,
-        viewportWidth: viewport.width,
+        viewportWidth: codeWidth,
         lineHeight: desiredTypography.lineHeight,
       });
     }
@@ -199,7 +205,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
       collapsedFilePaths: props.collapsedFilePaths,
       layout: props.displayPreferences.layout,
       wrapLines: props.displayPreferences.wrapLines,
-      viewportWidth: viewport.width,
+      viewportWidth: codeWidth,
       typography: loadedTypography,
       measureText: measurement,
       palette: props.palette,
@@ -228,7 +234,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
     t,
     desiredTypography.lineHeight,
     loadedTypography,
-    viewport.width,
+    codeWidth,
     viewport.height,
     workspaceCache,
   ]);
@@ -267,40 +273,40 @@ export function DiffSurface(props: DiffSurfaceProps) {
         const canReusePaint =
           slot.file === file &&
           slot.active === active &&
-          slot.width === viewport.width &&
+          slot.width === codeWidth &&
           slot.ratio === ratio &&
           slot.palette === props.palette &&
           slot.typography === props.headerTypography;
         if (canReusePaint) continue;
 
-        const pixelWidth = Math.ceil(viewport.width * ratio);
+        const pixelWidth = Math.ceil(codeWidth * ratio);
         const pixelHeight = Math.ceil(FILE_HEADER_HEIGHT * ratio);
         if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
         if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
-        canvas.style.width = `${viewport.width}px`;
+        canvas.style.width = `${codeWidth}px`;
         canvas.style.height = `${FILE_HEADER_HEIGHT}px`;
         const context = canvas.getContext("2d");
         if (!context) continue;
         context.setTransform(ratio, 0, 0, ratio, 0, 0);
-        context.clearRect(0, 0, viewport.width, FILE_HEADER_HEIGHT);
+        context.clearRect(0, 0, codeWidth, FILE_HEADER_HEIGHT);
         paintWebFileHeader({
           context,
           file,
           palette: props.palette,
           typography: props.headerTypography,
-          viewportWidth: viewport.width,
+          viewportWidth: codeWidth,
           y: 0,
           activePath: activeHeaderPathRef.current,
         });
         slot.file = file;
         slot.active = active;
-        slot.width = viewport.width;
+        slot.width = codeWidth;
         slot.ratio = ratio;
         slot.palette = props.palette;
         slot.typography = props.headerTypography;
       }
     },
-    [props.headerTypography, props.palette, viewport.height, viewport.width],
+    [props.headerTypography, props.palette, viewport.height, codeWidth],
   );
 
   const paint = useCallback(() => {
@@ -574,6 +580,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
     if (!currentModel || !root) return null;
     const bounds = root.getBoundingClientRect();
     const x = clientX - bounds.left;
+    if (x >= currentModel.viewportWidth) return null;
     const documentY = clientY - bounds.top + scrollTopRef.current;
     const file = currentModel.files.find(
       (entry) => entry.top <= documentY && documentY < entry.bottom,
@@ -716,7 +723,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
       const sideIndex =
         row?.kind === "line" && row.cells.length === 2 && hit.position.side === "new" ? 1 : 0;
       if (row && file) {
-        const columnWidth = viewport.width / (row.kind === "line" ? row.cells.length : 1);
+        const columnWidth = codeWidth / (row.kind === "line" ? row.cells.length : 1);
         const gutterBorder = sideIndex * columnWidth + file.gutterWidth;
         const rootBounds = rootRef.current?.getBoundingClientRect();
         const pointerX = rootBounds ? clientX - rootBounds.left : Number.NaN;
@@ -733,7 +740,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
       hasHoveredAffordanceRef.current = false;
       setHoveredAffordance(null);
     },
-    [viewport.width],
+    [codeWidth],
   );
   const pointerMove = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
@@ -748,7 +755,9 @@ export function DiffSurface(props: DiffSurfaceProps) {
           alreadyDragging: drag.moved,
         });
       }
-      const hit = pointHit(event);
+      const target = event.target;
+      const isPicking = target instanceof Element && target.closest("[data-diff-pick-line]");
+      const hit = !drag && isPicking ? null : pointHit(event);
       if (hit?.kind === "cell") {
         updateHoveredAffordance(hit, event.clientX);
       } else {
@@ -880,7 +889,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
     () => ({ ...ROOT_STYLE, background: props.palette.surface }),
     [props.palette.surface],
   );
-  const contentInsetBottom = props.contentInsetBottom ?? 0;
+  const contentInsetBottom = (props.contentInsetBottom ?? 0) + (hasPickedLines ? 48 : 0);
   const contentStyle = useMemo<React.CSSProperties>(
     () => ({
       ...CONTENT_STYLE,
@@ -954,6 +963,13 @@ export function DiffSurface(props: DiffSurfaceProps) {
                 onScroll={handleHorizontalScroll}
               />
             ))}
+          <DiffLineOverlays
+            model={model}
+            mode={props.mode}
+            scrollTop={fileWindowTop}
+            viewportHeight={viewport.height}
+            blameWidth={blameWidth}
+          />
           <DiffHunkOverlays
             model={model}
             mode={props.mode}
@@ -989,6 +1005,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
             : null}
         </div>
       </div>
+      <DiffLineActions mode={props.mode} />
       <DomOverlayScrollbar scrollContainerRef={scrollRef} onUserScrollUp={noop} />
       {hoveredAffordance?.hit.target && reviewActions ? (
         <InlineReviewAddButton onPress={addHoveredComment} style={affordanceStyle} />
@@ -1138,7 +1155,7 @@ function WebFileHeaderSection({
 function preventDocumentMouseSelection(event: React.MouseEvent): void {
   if (event.detail < 2) return;
   const target = event.target;
-  if (target instanceof Element && target.closest('[data-diff-review="true"]')) return;
+  if (target instanceof Element && target.closest('[data-diff-review="true"], button')) return;
   event.preventDefault();
   window.getSelection()?.removeAllRanges();
 }
@@ -1290,4 +1307,9 @@ function createWebTextMeasurer(typography: DiffTypography): TextMeasurer {
       return requiresShaping(text) ? measure(text) : (additive(graphemes).at(-1) ?? 0);
     }),
   };
+}
+
+function blameRailWidth(mode: DiffSurfaceProps["mode"], width: number) {
+  if (mode.kind !== "working" || !mode.lineBlame) return 0;
+  return Math.min(160, Math.floor(width * 0.33));
 }

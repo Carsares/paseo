@@ -12,6 +12,7 @@ import {
 import { unquoteGitPath } from "../../utils/git-quoted-path.js";
 
 const MAX_DIFF_HIGHLIGHT_LINE_CHARS = 10_000;
+const NO_NEWLINE_MARKER = "\\ No newline at end of file";
 
 export interface DiffLine {
   type: "add" | "remove" | "context" | "header";
@@ -151,6 +152,10 @@ function parseSectionBody(lines: string[]): ParsedSectionBody {
       deletions++;
     } else if (line.startsWith(" ")) {
       currentHunk.lines.push({ type: "context", content: line.slice(1) });
+    } else if (line === NO_NEWLINE_MARKER) {
+      if (/^[ +-]/.test(lines[i - 1])) {
+        currentHunk.lines.push({ type: "header", content: line });
+      }
     } else if (line.length > 0 && !line.startsWith("\\")) {
       currentHunk.lines.push({ type: "context", content: line });
     }

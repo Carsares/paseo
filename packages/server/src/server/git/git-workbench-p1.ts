@@ -29,6 +29,14 @@ import { discoverRepos, resolveP1Target } from "./repo-discovery.js";
 import { collectExpiredBackupRefs } from "./repo-backup-refs.js";
 import { RepoWriteLockTimeout, repoWriteMutex, type GitWorktree } from "./repo-write-mutex.js";
 
+import {
+  getBlame,
+  mutateTag,
+  preparePush,
+  pushForce,
+  StaleRemoteBaseline,
+} from "./git-workbench-p2.js";
+
 type Operation =
   | "repos.discover"
   | "refs.list"
@@ -38,6 +46,10 @@ type Operation =
   | "rebase.build_plan"
   | "rebase.execute"
   | "rebase.act"
+  | "blame.get"
+  | "tag.mutate"
+  | "push.prepare"
+  | "push.force"
   | "conflict.inspect"
   | "conflict.resolve";
 export type GitWorkbenchP1Request = Extract<
@@ -105,6 +117,12 @@ const BRANCH_REFRESH = {
   rename: "rename-branch",
   delete: "commit-changes",
 } satisfies Record<BranchMutationRequest["action"], GitMutationRefreshReason>;
+
+const TAG_REFRESH = {
+  create: "commit-changes",
+  delete: "commit-changes",
+  push: "push",
+} as const;
 
 async function handleBranchMutation(
   repo: GitWorktree,
@@ -195,10 +213,51 @@ export async function handleGitWorkbenchP1Request(
             )),
           },
         };
+      case "checkout.git.blame.get.request":
+        await assertGitWorktree(repo);
+        return {
+          type: "checkout.git.blame.get.response",
+          payload: { ...target, ...(await getBlame(repo, input)) },
+        };
+      case "checkout.git.tag.mutate.request":
+        return {
+          type: "checkout.git.tag.mutate.response",
+          payload: {
+            ...target,
+            success: true,
+            newHeadSha: await mutate(
+              repo,
+              input,
+              host,
+              () => mutateTag(repo, input),
+              TAG_REFRESH[input.action],
+            ),
+          },
+        };
+      case "checkout.git.push.prepare.request":
+        return {
+          type: "checkout.git.push.prepare.response",
+          payload: {
+            ...target,
+            target: await repoWriteMutex.run(repo, input.type, async () => {
+              await assertGitWorktree(repo);
+              return preparePush(repo, input);
+            }),
+          },
+        };
+      case "checkout.git.push.force.request":
+        return {
+          type: "checkout.git.push.force.response",
+          payload: {
+            ...target,
+            success: true,
+            newHeadSha: await mutate(repo, input, host, () => pushForce(repo, input), "push"),
+          },
+        };
       case "checkout.git.conflict.inspect.request": {
         const conflicts = await repoWriteMutex.run(repo, input.type, async () => {
           await assertGitWorktree(repo);
-          return inspectConflicts(repo, input.path);
+          return inspectConflicts(repo, input.path, input.includeContents);
         });
         return {
           type: "checkout.git.conflict.inspect.response",
@@ -286,6 +345,26 @@ function failureResponse(
       return {
         type: "checkout.git.rebase.act.response",
         payload: { ...mutation, rebaseId: mutation.rebaseId ?? null },
+      };
+    case "checkout.git.blame.get.request":
+      return { type: "checkout.git.blame.get.response", payload: { ...target, lines: [] } };
+    case "checkout.git.tag.mutate.request":
+      return { type: "checkout.git.tag.mutate.response", payload: mutation };
+    case "checkout.git.push.prepare.request":
+      return {
+        type: "checkout.git.push.prepare.response",
+        payload:
+          error instanceof StaleRemoteBaseline
+            ? { ...target, target: null, errorCode: "STALE_REMOTE_BASELINE" }
+            : { ...target, target: null },
+      };
+    case "checkout.git.push.force.request":
+      return {
+        type: "checkout.git.push.force.response",
+        payload:
+          error instanceof StaleRemoteBaseline
+            ? { ...mutation, errorCode: "STALE_REMOTE_BASELINE" }
+            : mutation,
       };
     case "checkout.git.conflict.inspect.request":
       return {

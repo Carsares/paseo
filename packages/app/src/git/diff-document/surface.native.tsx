@@ -1,3 +1,4 @@
+import { DiffLineActions, DiffLineOverlays } from "./line-overlays";
 import { DiffHunkOverlays } from "./hunk-overlays";
 import { Canvas, Group, Picture, type SkPicture } from "@shopify/react-native-skia";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -111,11 +112,17 @@ export function DiffSurface(props: DiffSurfaceProps) {
   );
   const reviewActions = props.mode.kind === "working" ? props.mode.reviewActions : undefined;
   const hunkActions = props.mode.kind === "working" && Boolean(props.mode.renderHunkActions);
+  const lineBlame = props.mode.kind === "working" && props.mode.lineBlame;
+  const blameWidth = lineBlame ? Math.min(160, Math.floor(viewport.width * 0.33)) : 0;
+  const codeWidth = viewport.width - blameWidth;
+  const hasPickedLines =
+    props.mode.kind === "working" && Boolean(props.mode.lineSelection?.picked.size);
+
   const model = useMemo(() => {
     const dependencies = [
       props.displayPreferences.layout,
       props.displayPreferences.wrapLines,
-      viewport.width,
+      codeWidth,
       typography,
       measurement,
       props.palette,
@@ -128,11 +135,11 @@ export function DiffSurface(props: DiffSurfaceProps) {
     );
     const reuseFrom = canReuse ? previous?.models : undefined;
     const next = buildDiffDocumentModel({
-      files: viewport.width > 0 ? props.files : [],
+      files: codeWidth > 0 ? props.files : [],
       collapsedFilePaths: props.collapsedFilePaths,
       layout: props.displayPreferences.layout,
       wrapLines: props.displayPreferences.wrapLines,
-      viewportWidth: viewport.width,
+      viewportWidth: codeWidth,
       typography,
       measureText: measurement,
       palette: props.palette,
@@ -166,7 +173,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
     hunkActions,
     t,
     typography,
-    viewport.width,
+    codeWidth,
     viewport.height,
   ]);
   const paints = useMemo(() => createNativePaints(props.palette), [props.palette]);
@@ -266,7 +273,7 @@ export function DiffSurface(props: DiffSurfaceProps) {
       consumedFocusRef.current = requestKey;
     }
   }, [collapsedFilePaths, mode, model.files, onToggleFile, scrollTop]);
-  const contentInsetBottom = props.contentInsetBottom ?? 0;
+  const contentInsetBottom = (props.contentInsetBottom ?? 0) + (hasPickedLines ? 48 : 0);
   const contentStyle = useMemo(
     () => ({
       minHeight: Math.max(model.height, viewport.height) + contentInsetBottom,
@@ -324,9 +331,17 @@ export function DiffSurface(props: DiffSurfaceProps) {
           scrollTop={fileWindowTop}
           viewportHeight={viewport.height}
         />
+        <DiffLineOverlays
+          model={model}
+          mode={props.mode}
+          scrollTop={fileWindowTop}
+          viewportHeight={viewport.height}
+          blameWidth={blameWidth}
+        />
         <NativeReviewOverlays model={model} mode={props.mode} />
         <Animated.View pointerEvents="none" style={keyboardSpacerStyle} />
       </AnimatedScrollView>
+      <DiffLineActions mode={props.mode} />
     </View>
   );
 }
@@ -502,6 +517,7 @@ function NativeFileBody({
         left: 0,
         right: 0,
         height: file.bodyHeight,
+        width: model.viewportWidth,
         zIndex: 2,
       })}
       onTouchStart={touchStart}

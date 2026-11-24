@@ -28,6 +28,13 @@ type Patch =
 
 export type StagingAction =
   | ({ kind: PatchAction; description: string } & Patch)
+  | {
+      kind: "stage" | "unstage";
+      description: string;
+      scope: "lines";
+      patch: string;
+      paths: [string];
+    }
   | { kind: "commit"; message: string; amend: boolean; pushAfter: boolean }
   | { kind: "stash-create"; message: string; includeUntracked: boolean; keepIndex: boolean }
   | { kind: "stash-apply"; entry: CheckoutGitStashEntry };
@@ -383,9 +390,11 @@ function executeAction(
   }
 }
 
-function patchInput(action: Patch): Patch {
-  if (action.scope === "paths") return { scope: "paths", paths: action.paths };
-  return { scope: "hunk", patch: action.patch, paths: action.paths };
+function patchInput<T extends "hunk" | "lines">(
+  action: { scope: "paths"; paths: string[] } | { scope: T; patch: string; paths: [string] },
+): { scope: "paths"; paths: string[] } | { scope: T; patch: string; paths: [string] } {
+  if ("patch" in action) return { scope: action.scope, patch: action.patch, paths: action.paths };
+  return { scope: "paths", paths: action.paths };
 }
 
 function mutationNotice(response: MutationResult, t: Translate): Notice {

@@ -82,6 +82,23 @@ async function validateBranch(repo: GitWorktree, input: string): Promise<LocalBr
   return { name, ref: HEADS + name };
 }
 
+async function validateReviewedBranch(
+  repo: GitWorktree,
+  input: BranchMutationRequest,
+): Promise<LocalBranch> {
+  if (
+    input.action !== "delete" ||
+    !input.force ||
+    !input.name.startsWith(HEADS) ||
+    !OID.test(input.expectedRefSha ?? "")
+  ) {
+    throw new Error("Force deletion requires the reviewed full local branch reference and SHA");
+  }
+  validateRefInput(input.name, "local branch reference");
+  await git(repo, ["check-ref-format", input.name], { envOverlay: BRANCH_ENV });
+  return { name: input.name.slice(HEADS.length), ref: input.name };
+}
+
 async function readExactRef(repo: GitWorktree, ref: string): Promise<string | null> {
   const result = await git(repo, ["show-ref", "--verify", "--hash", "--", ref], {
     acceptExitCodes: [0, 128],
@@ -362,7 +379,10 @@ export async function mutateBranch(
   operationState: GitOperationState;
   backupRef?: string;
 }> {
-  const branch = await validateBranch(repo, input.name);
+  const branch =
+    input.expectedRefSha === undefined
+      ? await validateBranch(repo, input.name)
+      : await validateReviewedBranch(repo, input);
   const baseline = await readBaseline(repo);
   if (baseline.head !== input.expectedHeadSha) {
     throw new GitWorkbenchError("HEAD changed. Refresh and try again.", "STALE_HEAD_CONFLICT", {
@@ -386,6 +406,13 @@ export async function mutateBranch(
   } else {
     await assertDirectLocalRef(repo, branch);
     const tip = await readExactRef(repo, branch.ref);
+    if (input.expectedRefSha !== undefined && tip !== input.expectedRefSha) {
+      throw new GitWorkbenchError(
+        "The reviewed branch tip changed. Refresh and review it before retrying.",
+        "STALE_HEAD_CONFLICT",
+        { actualHeadSha: baseline.head },
+      );
+    }
     if (!tip) throw new Error("Local branch does not exist");
     switch (input.action) {
       case "checkout":

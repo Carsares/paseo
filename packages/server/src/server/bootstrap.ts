@@ -137,7 +137,11 @@ export async function fanOutReconciledWorkspaceUpdates(input: {
   );
 }
 
-import { VoiceAssistantWebSocketServer, isDaemonOriginAllowed } from "./websocket-server.js";
+import {
+  VoiceAssistantWebSocketServer,
+  isDaemonOriginAllowed,
+  type ServerFeatureOverrides,
+} from "./websocket-server.js";
 import { AgentRequestOutcomeUnknownError, MessageReceipts } from "./message-receipts/index.js";
 import {
   enqueueRecoverableAgentMessage,
@@ -548,10 +552,7 @@ export interface PaseoDaemonDependencies {
   hubRelationshipClock?: HubRelationshipClock;
   hubRelationshipRetryPolicy?: HubRelationshipRetryPolicy;
   createHubDaemonId?: () => string;
-  serverFeatureOverrides?: {
-    daemonStatusRpc?: boolean;
-    relayConfig?: boolean;
-  };
+  serverFeatureOverrides?: ServerFeatureOverrides;
 }
 
 function resolveBuiltinPluginLoader(dependencies: PaseoDaemonDependencies): BuiltinPluginLoader {
@@ -2125,8 +2126,7 @@ export async function createPaseoDaemon(
               {
                 getAllowedOrigins: () => allowedOrigins,
                 getHostnames: () => configuredHostnames,
-                daemonStatusRpc: dependencies.serverFeatureOverrides?.daemonStatusRpc,
-                relayConfig: dependencies.serverFeatureOverrides?.relayConfig,
+                serverFeatureOverrides: dependencies.serverFeatureOverrides,
                 startPaused: true,
                 messageReceipts,
               },

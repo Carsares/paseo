@@ -302,3 +302,101 @@ it("exposes Git P1 and recovers a paused rebase after an isolated daemon restart
     await rm(temp, { recursive: true, force: true });
   }
 }, 30_000);
+
+it("exposes blame and tag operations through the P2 SDK", async () => {
+  const temp = await mkdtemp(join(tmpdir(), "paseo-p2-wire-"));
+  try {
+    const root = await realpath(temp);
+    const remote = join(root, "remote.git");
+    const repo = join(root, "worktree");
+    await mkdir(repo);
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync("git", ["-c", "core.hooksPath=.git/test-disabled-hooks", ...args], {
+        cwd,
+        encoding: "utf8",
+      });
+    git(repo, "init", "--quiet", "--initial-branch=main");
+    git(repo, "config", "user.name", "Wire Author");
+    git(repo, "config", "user.email", "wire-author@example.invalid");
+    git(root, "init", "--bare", "--quiet", remote);
+    git(repo, "remote", "add", "chosen", remote);
+    const path = "story.txt";
+    await writeFile(join(repo, path), "original\nsecond\n");
+    git(repo, "add", "--", path);
+    git(repo, "commit", "--quiet", "-m", "Write the story");
+    const sha = git(repo, "rev-parse", "HEAD").trim();
+    await writeFile(join(repo, path), "original\nrecent edit\n");
+    const daemon = await createTestPaseoDaemon({ mcpEnabled: false });
+    const client = new DaemonClient({ url: "ws://127.0.0.1:" + daemon.port + "/ws" });
+    try {
+      await client.connect();
+      expect(client.getLastServerInfoMessage()?.features?.checkoutGitP2V1).toBe(true);
+      const target = { cwd: repo, targetRepoRoot: repo };
+      expect(await client.checkoutGitBlameGet({ ...target, path })).toMatchObject({
+        error: null,
+        lines: [
+          {
+            lineNumber: 1,
+            sha,
+            authorName: "Wire Author",
+            authorDate: expect.any(String),
+            summary: "Write the story",
+            lineText: "original",
+          },
+          { lineNumber: 2, sha: null, authorDate: null, lineText: "recent edit" },
+        ],
+      });
+      const tag = { ...target, tagName: "reviewed", expectedHeadSha: sha };
+      expect(await client.checkoutGitTagMutate({ ...tag, action: "create" })).toMatchObject({
+        success: true,
+      });
+      expect(await client.checkoutGitRefsList({ cwd: repo, repoRoots: [repo] })).toMatchObject({
+        error: null,
+        refs: [
+          {
+            tags: [{ name: "reviewed", sha, objectSha: sha }],
+            remotes: [{ name: "chosen", branches: [] }],
+          },
+        ],
+      });
+      git(repo, "tag", "-a", "-f", "-m", "Reviewed object", "reviewed", sha);
+      const tagObject = git(repo, "rev-parse", "refs/tags/reviewed").trim();
+      expect(tagObject).not.toBe(sha);
+      expect(await client.checkoutGitRefsList({ cwd: repo, repoRoots: [repo] })).toMatchObject({
+        refs: [{ tags: [{ name: "reviewed", sha, objectSha: tagObject }] }],
+      });
+      expect(
+        await client.checkoutGitTagMutate({ ...tag, action: "delete", expectedTagSha: sha }),
+      ).toMatchObject({ success: false });
+      expect(
+        await client.checkoutGitTagMutate({
+          ...tag,
+          action: "push",
+          remote: "chosen",
+          expectedTagSha: sha,
+        }),
+      ).toMatchObject({ success: false });
+      expect(git(remote, "for-each-ref", "--format=%(refname)")).toBe("");
+      expect(
+        await client.checkoutGitTagMutate({
+          ...tag,
+          action: "push",
+          remote: "chosen",
+          expectedTagSha: tagObject,
+        }),
+      ).toMatchObject({ success: true });
+      expect(
+        await client.checkoutGitTagMutate({ ...tag, action: "delete", expectedTagSha: tagObject }),
+      ).toMatchObject({ success: true });
+      expect(git(repo, "tag", "--list")).toBe("");
+      expect(git(remote, "for-each-ref", "--format=%(refname) %(objectname)").trim()).toBe(
+        "refs/tags/reviewed " + tagObject,
+      );
+    } finally {
+      await client.close();
+      await daemon.close();
+    }
+  } finally {
+    await rm(temp, { force: true, recursive: true });
+  }
+}, 30_000);

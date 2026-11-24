@@ -3991,6 +3991,10 @@ export class Session {
       case "checkout.git.rebase.build_plan.request":
       case "checkout.git.rebase.execute.request":
       case "checkout.git.rebase.act.request":
+      case "checkout.git.blame.get.request":
+      case "checkout.git.tag.mutate.request":
+      case "checkout.git.push.prepare.request":
+      case "checkout.git.push.force.request":
       case "checkout.git.conflict.inspect.request":
       case "checkout.git.conflict.resolve.request":
         return this.checkoutSession.handleGitWorkbenchP1(msg);

@@ -76,12 +76,24 @@ export async function listGraphRefs(input: {
           backups: [],
         };
         const remotes = new Map<string, CheckoutGitRepoRefs["remotes"][number]>();
-        for (const { name, sha, commit } of await readRefs(repo, input.includeBackups)) {
+        const [refs, configuredRemotes] = await Promise.all([
+          readRefs(repo, input.includeBackups),
+          git(repo, ["remote"]),
+        ]);
+        const names = configuredRemotes.stdout
+          .split("\n")
+          .filter(Boolean)
+          .sort((a, b) => b.length - a.length);
+        for (const name of names) {
+          remotes.set(name, { name, branches: [] });
+        }
+        for (const { name, sha, commit } of refs) {
           if (name.startsWith(PREFIXES[0])) {
             result.localBranches.push({ name: name.slice(PREFIXES[0].length), sha });
           } else if (name.startsWith(PREFIXES[1])) {
             const path = name.slice(PREFIXES[1].length);
-            const slash = path.indexOf("/");
+            const configured = names.find((remoteName) => path.startsWith(remoteName + "/"));
+            const slash = configured?.length ?? path.indexOf("/");
             if (slash < 1) continue;
             const remote = path.slice(0, slash);
             let group = remotes.get(remote);
@@ -91,7 +103,11 @@ export async function listGraphRefs(input: {
             }
             group.branches.push({ name: path.slice(slash + 1), sha });
           } else if (name.startsWith(PREFIXES[2])) {
-            result.tags.push({ name: name.slice(PREFIXES[2].length), sha: commit ?? sha });
+            result.tags.push({
+              name: name.slice(PREFIXES[2].length),
+              sha: commit ?? sha,
+              objectSha: sha,
+            });
           } else if (name.startsWith(BACKUP_PREFIX)) {
             result.backups.push({ name, sha });
           }

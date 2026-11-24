@@ -19,7 +19,7 @@ export function fileSelection(
   return layer === "staged";
 }
 
-function quotePatchPath(path: string): string {
+export function quotePatchPath(path: string): string {
   // Git reads C-style quoted UTF-8 bytes, with octal escapes outside printable ASCII.
   const escaped = Array.from(new TextEncoder().encode(path), (byte) => {
     if (byte === 34 || byte === 92) return "\\" + String.fromCharCode(byte);

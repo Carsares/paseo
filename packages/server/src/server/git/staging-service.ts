@@ -10,6 +10,7 @@ import {
   readHeadBranchRef,
   validateGitPaths,
 } from "./git-workbench-state.js";
+import { applyLinePatch } from "./line-patch.js";
 import type { GitWorktree } from "./repo-write-mutex.js";
 import { readStagedTree, withStagedCommitLock } from "./staged-snapshot.js";
 
@@ -26,7 +27,7 @@ async function readPatchPath(repo: GitWorktree, input: ChangeSelection): Promise
   if (!patch || Buffer.byteLength(patch, "utf8") > CHECKOUT_GIT_MAX_PATCH_BYTES) {
     throw new Error("Select a patch no larger than 512 KiB");
   }
-  // P0 accepts one textual hunk of an existing file. File operations cover
+  // Accept one textual hunk of an existing file. File operations cover
   // additions, deletions, renames, binaries and changes to the file type.
   if (
     !patch.startsWith("diff --git ") ||
@@ -39,13 +40,9 @@ async function readPatchPath(repo: GitWorktree, input: ChangeSelection): Promise
   ) {
     throw new Error("Expected one text hunk from an existing file");
   }
-  const { stdout } = await git(repo, ["apply", "--numstat", "-z", "-"], { input: patch });
-  const [stat, end, extra] = stdout.split("\0");
-  const fields = /^\d+\t\d+\t([\s\S]+)$/.exec(stat ?? "");
-  if (!fields || end !== "" || extra !== undefined) {
-    throw new Error("Patch does not identify one repository file");
-  }
-  const [path] = validateGitPaths([fields[1]!]);
+  const path = await patchFile(repo, patch);
+  if (input.scope === "lines" && (await patchFile(repo, patch, true)) !== path)
+    throw new Error("Line patch must refer to the same file on both sides");
   if (
     !path ||
     (input.paths !== undefined && (input.paths.length !== 1 || input.paths[0] !== path))
@@ -55,9 +52,39 @@ async function readPatchPath(repo: GitWorktree, input: ChangeSelection): Promise
   return path;
 }
 
+async function patchFile(repo: GitWorktree, patch: string, reverse = false) {
+  const { stdout } = await git(
+    repo,
+    ["apply", ...(reverse ? ["--reverse"] : []), "--numstat", "-z", "-"],
+    { input: patch },
+  );
+  const [stat, end, extra] = stdout.split("\0");
+  const fields = /^\d+\t\d+\t([\s\S]+)$/.exec(stat ?? "");
+  if (!fields || end !== "" || extra !== undefined)
+    throw new Error("Patch does not identify one repository file");
+  return validateGitPaths([fields[1]!])[0]!;
+}
+
+async function changeSelectedLines(
+  repo: GitWorktree,
+  head: string | null,
+  action: ChangeAction,
+  input: ChangeSelection,
+) {
+  try {
+    if (action === "discard") throw new Error("Discard does not support selected lines");
+    const path = await readPatchPath(repo, input);
+    await applyLinePatch(repo, head, action, path, input.patch!);
+  } catch (error) {
+    throw new GitWorkbenchError(
+      error instanceof Error ? error.message : "Invalid line patch",
+      "PATCH_APPLY_REJECTED",
+    );
+  }
+}
+
 async function preparePatch(repo: GitWorktree, action: ChangeAction, input: ChangeSelection) {
   try {
-    if (input.scope === "lines") throw new Error("Line staging is unavailable on this host");
     const path = await readPatchPath(repo, input);
     const args = [
       "apply",
@@ -89,7 +116,8 @@ export async function changeSelection(
   input: ChangeSelection,
   preserveBackup: (backupRef: string) => void,
 ): Promise<void> {
-  if (input.scope === "hunk" || input.scope === "lines") {
+  if (input.scope === "lines") return changeSelectedLines(repo, head, action, input);
+  if (input.scope === "hunk") {
     const { path, args } = await preparePatch(repo, action, input);
     if (action === "discard") preserveBackup(await backupDiscardPaths(repo, head, [path]));
     try {

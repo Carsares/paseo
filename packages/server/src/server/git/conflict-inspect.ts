@@ -1,11 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, readlink, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, open, readlink, rename, rm } from "node:fs/promises";
 import { dirname, join, sep } from "node:path";
 import { runGitCommandBytes } from "../../utils/run-git-command.js";
-import type { CheckoutGitConflictFile, SessionInboundMessage } from "../messages.js";
+import {
+  CHECKOUT_GIT_MAX_CONFLICT_TEXT_BYTES,
+  type CheckoutGitConflictFile,
+  type SessionInboundMessage,
+} from "../messages.js";
 import { git, GitWorkbenchError, readChanges, validateGitPaths } from "./git-workbench-state.js";
 import type { GitWorktree } from "./repo-write-mutex.js";
+import { withStagedCommitLock } from "./staged-snapshot.js";
 
 type ResolveRequest = Extract<
   SessionInboundMessage,
@@ -16,7 +21,7 @@ type ConflictHunk = CheckoutGitConflictFile["hunks"][number];
 type FileState =
   | { type: "missing" }
   | { type: "link"; bytes: Buffer }
-  | { type: "file"; bytes: Buffer; mode: number };
+  | { type: "file"; bytes: Buffer; mode: number; dev: number; ino: number };
 interface TextHunk extends ConflictHunk {
   ours: string;
   theirs: string;
@@ -31,7 +36,7 @@ interface Snapshot {
   markerSize: number;
 }
 
-const MAX_FILE_BYTES = 512 * 1024;
+const MAX_FILE_BYTES = CHECKOUT_GIT_MAX_CONFLICT_TEXT_BYTES;
 const MAX_INSPECT_PATHS = 128;
 const MAX_INSPECT_BYTES = 2 * 1024 * 1024;
 
@@ -48,14 +53,15 @@ function validatePath(path: string): void {
   if (path.includes("\uFFFD")) throw new Error("Unsupported Git path encoding");
 }
 
-async function safePath(repo: GitWorktree, path: string): Promise<string> {
+export async function safeRepoPath(repo: GitWorktree, path: string): Promise<string> {
+  validatePath(path);
   const components = process.platform === "win32" ? path.split(/[/\\]/) : path.split("/");
   let parent = repo.root;
   for (const component of components.slice(0, -1)) {
     parent = join(parent, component);
     const info = await lstat(parent).catch(missing);
     if (info && !info.isDirectory())
-      throw new Error("The conflict path crosses a non-directory or symbolic link");
+      throw new Error("The path crosses a non-directory or symbolic link");
   }
   return join(repo.root, components.join(sep));
 }
@@ -80,7 +86,23 @@ async function readFileState(path: string): Promise<FileState> {
       size += bytesRead;
     }
     if (size > MAX_FILE_BYTES) throw new Error("Conflict file exceeds 512 KiB");
-    return { type: "file", bytes: buffer.subarray(0, size), mode: opened.mode };
+    const latest = await lstat(path).catch(missing);
+    if (
+      !latest ||
+      latest.dev !== opened.dev ||
+      latest.ino !== opened.ino ||
+      latest.size !== size ||
+      latest.mtimeMs !== opened.mtimeMs ||
+      latest.ctimeMs !== opened.ctimeMs
+    )
+      throw staleSnapshot();
+    return {
+      type: "file",
+      bytes: buffer.subarray(0, size),
+      mode: opened.mode,
+      dev: opened.dev,
+      ino: opened.ino,
+    };
   } finally {
     await handle.close();
   }
@@ -181,8 +203,7 @@ async function snapshot(
   path: string,
   status: CheckoutGitConflictFile["status"],
 ): Promise<Snapshot> {
-  validatePath(path);
-  const absolute = await safePath(repo, path);
+  const absolute = await safeRepoPath(repo, path);
   const [stages, state, size] = await Promise.all([
     readStages(repo, path),
     readFileState(absolute),
@@ -223,7 +244,10 @@ async function snapshot(
 export async function inspectConflicts(
   repo: GitWorktree,
   path?: string,
+  includeContents?: boolean,
 ): Promise<CheckoutGitConflictFile[]> {
+  if (includeContents && path === undefined)
+    throw new Error("Select a single conflict to read its contents");
   if (path !== undefined) validatePath(path);
   const { conflicts } = await readChanges(repo);
   const filtered =
@@ -232,12 +256,47 @@ export async function inspectConflicts(
   const result: CheckoutGitConflictFile[] = [];
   let bytes = 0;
   for (const entry of filtered) {
-    const { conflict } = await snapshot(repo, entry.path, entry.status);
+    const state = await snapshot(repo, entry.path, entry.status);
+    const { conflict } = state;
     bytes += Buffer.byteLength(JSON.stringify(conflict));
     if (bytes > MAX_INSPECT_BYTES) throw new Error("Select a single conflict to inspect");
+    if (includeContents) {
+      const contents = await readConflictContents(repo, state);
+      if (
+        contents &&
+        bytes + Buffer.byteLength(JSON.stringify(contents)) < MAX_INSPECT_BYTES - 1024
+      )
+        conflict.contents = contents;
+    }
     result.push(conflict);
   }
   return result;
+}
+
+async function readConflictContents(
+  repo: GitWorktree,
+  state: Snapshot,
+): Promise<CheckoutGitConflictFile["contents"]> {
+  if (state.state.type !== "missing" && state.text === null) return;
+  const read = async (stage: Stage | null) => {
+    if (!stage) return null;
+    if (stage.mode !== "100644" && stage.mode !== "100755") return undefined;
+    const result = await runGitCommandBytes(["cat-file", "blob", stage.sha], {
+      cwd: repo.root,
+      maxOutputBytes: MAX_FILE_BYTES,
+      envOverlay: { GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" },
+    }).catch(() => undefined);
+    if (!result || result.truncated) return undefined;
+    return decodeText(result.stdout) ?? undefined;
+  };
+  const { base, ours, theirs } = state.conflict;
+  const [baseText, oursText, theirsText] = await Promise.all([
+    read(base),
+    read(ours),
+    read(theirs),
+  ]);
+  if (baseText === undefined || oursText === undefined || theirsText === undefined) return;
+  return { base: baseText, ours: oursText, theirs: theirsText, result: state.text };
 }
 
 async function readStageBlob(repo: GitWorktree, stage: Stage, path: string): Promise<Buffer> {
@@ -252,11 +311,23 @@ async function readStageBlob(repo: GitWorktree, stage: Stage, path: string): Pro
   return result.stdout;
 }
 
-async function replaceFile(path: string, bytes: Buffer, mode: number): Promise<void> {
+async function replaceFile(
+  path: string,
+  bytes: Buffer,
+  mode: number,
+  verify?: () => Promise<void>,
+) {
   const temp = join(dirname(path), ".paseo-conflict-" + randomUUID());
+  const handle = await open(temp, "wx", mode & 0o777);
   try {
-    await writeFile(temp, bytes, { mode: mode & 0o777, flag: "wx" });
+    const identity = await (async () => {
+      await handle.writeFile(bytes);
+      const { dev, ino, mode: writtenMode } = await handle.stat();
+      return { dev, ino, mode: writtenMode };
+    })().finally(() => handle.close());
+    await verify?.();
     await rename(temp, path);
+    return identity;
   } finally {
     await rm(temp, { force: true });
   }
@@ -264,13 +335,24 @@ async function replaceFile(path: string, bytes: Buffer, mode: number): Promise<v
 
 // Call under the shared worktree and repository write lock.
 export async function resolveConflict(repo: GitWorktree, input: ResolveRequest): Promise<void> {
-  validatePath(input.path);
-  const absolute = await safePath(repo, input.path);
+  const absolute = await safeRepoPath(repo, input.path);
   const entry = (await readChanges(repo)).conflicts.find(({ path }) => path === input.path);
   if (!entry) throw staleSnapshot();
   const original = await snapshot(repo, input.path, entry.status);
   if (original.conflict.conflictFingerprint !== input.expectedConflictFingerprint)
     throw staleSnapshot();
+  if (input.resultText !== undefined) {
+    return saveEditedConflict(repo, input, original, absolute);
+  }
+  return resolveExistingConflict(repo, input, original, absolute);
+}
+
+async function resolveExistingConflict(
+  repo: GitWorktree,
+  input: ResolveRequest,
+  original: Snapshot,
+  absolute: string,
+) {
   let replacement: { bytes: Buffer; mode: number } | null | undefined;
   let stage = true;
 
@@ -297,10 +379,113 @@ export async function resolveConflict(repo: GitWorktree, input: ResolveRequest):
   }
 
   // Reading the blob can take time. Compare again before writing user files.
-  const latest = await snapshot(repo, input.path, entry.status);
-  if (latest.conflict.conflictFingerprint !== input.expectedConflictFingerprint)
-    throw staleSnapshot();
+  await verifyConflictSnapshot(repo, input, original.conflict.status);
   if (replacement) await replaceFile(absolute, replacement.bytes, replacement.mode);
   else if (replacement === null && original.state.type === "file") await rm(absolute);
   if (stage) await git(repo, ["--literal-pathspecs", "add", "-A", "--", input.path]);
+}
+
+async function verifyConflictSnapshot(
+  repo: GitWorktree,
+  input: ResolveRequest,
+  status: CheckoutGitConflictFile["status"],
+) {
+  const latest = await snapshot(repo, input.path, status);
+  if (latest.conflict.conflictFingerprint !== input.expectedConflictFingerprint)
+    throw staleSnapshot();
+}
+
+async function saveEditedConflict(
+  repo: GitWorktree,
+  input: ResolveRequest,
+  original: Snapshot,
+  absolute: string,
+) {
+  const replacement = await editedResult(repo, original, input);
+  let written: Awaited<ReturnType<typeof replaceFile>> | undefined;
+  let staged: { sha: string; mode: string } | undefined;
+  const verifyWrittenFile = async () => {
+    const path = await safeRepoPath(repo, input.path);
+    const actual = await readFileState(path);
+    if (
+      !written ||
+      actual.type !== "file" ||
+      actual.dev !== written.dev ||
+      actual.ino !== written.ino ||
+      actual.mode !== written.mode ||
+      !actual.bytes.equals(replacement.bytes)
+    )
+      throw staleSnapshot();
+  };
+  const { indexError } = await withStagedCommitLock(
+    repo,
+    async ({ envOverlay }) => {
+      await verifyConflictSnapshot(repo, input, original.conflict.status);
+      const { stdout } = await git(repo, ["hash-object", "-w", "--path=" + input.path, "--stdin"], {
+        input: replacement.bytes,
+        envOverlay,
+      });
+      const sha = stdout.trim();
+      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha))
+        throw new Error("Git did not return a conflict result object");
+      const mode = replacement.mode & 0o100 ? "100755" : "100644";
+      staged = { sha, mode };
+      await git(repo, ["update-index", "--cacheinfo", mode, sha, input.path], { envOverlay });
+      written = await replaceFile(absolute, replacement.bytes, replacement.mode, () =>
+        verifyConflictSnapshot(repo, input, original.conflict.status),
+      );
+      if ((written.mode & 0o100 ? "100755" : "100644") !== mode) throw staleSnapshot();
+    },
+    {
+      beforeInstall: async () => {
+        const { base, ours, theirs } = original.conflict;
+        const current = await readStages(repo, input.path);
+        if (JSON.stringify(current) !== JSON.stringify([base, ours, theirs])) throw staleSnapshot();
+        await verifyWrittenFile();
+      },
+      afterInstall: async () => {
+        const { stdout } = await git(repo, [
+          "--literal-pathspecs",
+          "ls-files",
+          "--stage",
+          "-z",
+          "--",
+          input.path,
+        ]);
+        if (!staged || stdout !== staged.mode + " " + staged.sha + " 0\t" + input.path + "\0")
+          throw staleSnapshot();
+        await verifyWrittenFile();
+      },
+    },
+  );
+  if (indexError)
+    throw new Error("The result was written, but Git's staged file changes could not be installed");
+}
+
+async function editedResult(repo: GitWorktree, original: Snapshot, input: ResolveRequest) {
+  if (
+    input.strategy !== "mark_resolved" ||
+    input.hunkIndex !== undefined ||
+    input.resultText === undefined
+  )
+    throw new Error("An edited result resolves the entire file");
+  const text = input.resultText;
+  const bytes = Buffer.from(text);
+  if (bytes.length > MAX_FILE_BYTES || decodeText(bytes) !== text)
+    throw new Error("Use a UTF-8 conflict result no larger than 512 KiB");
+  if (hasMarker(text, original.markerSize))
+    throw new Error("Remove all conflict markers before staging the file");
+  if (!(await readConflictContents(repo, original)))
+    throw new Error("The conflict does not have editable text contents");
+  const mode =
+    original.state.type === "file"
+      ? original.state.mode
+      : parseInt(
+          original.conflict.ours?.mode ??
+            original.conflict.theirs?.mode ??
+            original.conflict.base?.mode ??
+            "100644",
+          8,
+        );
+  return { bytes, mode };
 }

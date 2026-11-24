@@ -1174,7 +1174,8 @@ type WorkbenchFeature =
   | "checkoutGitStagingV1"
   | "checkoutGitGraphV1"
   | "checkoutGitRebaseV1"
-  | "checkoutGitMultiRepoV1";
+  | "checkoutGitMultiRepoV1"
+  | "checkoutGitP2V1";
 
 export type WorkbenchRequestOptions<T extends WorkbenchOperation> = Omit<
   Extract<WorkbenchRequest, { type: `${T}.request` }>,
@@ -1267,6 +1268,7 @@ function toTimeoutError(error: unknown, label: string, timeoutMs: number): Error
 const DEFAULT_RECONNECT_BASE_DELAY_MS = 1500;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 30000;
 const DEFAULT_SESSION_RPC_TIMEOUT_MS = 60_000;
+const GIT_REMOTE_PUSH_TIMEOUT_MS = 180_000;
 const PUSH_TOKEN_REVOCATION_TIMEOUT_MS = 2_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_LIVENESS_TIMEOUT_MS = 5000;
@@ -2642,6 +2644,7 @@ export class DaemonClient {
     feature: WorkbenchFeature,
     { requestId, ...options }: WorkbenchRequestOptions<T>,
     patch?: string,
+    timeout?: number,
   ): Promise<WorkbenchResponsePayload<T>> {
     this.requireWorkbenchFeature(feature);
     if (
@@ -2653,6 +2656,7 @@ export class DaemonClient {
     return this.sendNamespacedCorrelatedSessionRequest<`${T}.response`>({
       requestId,
       message: { ...options, type: `${operation}.request` },
+      timeout,
     });
   }
 
@@ -6028,7 +6032,7 @@ export class DaemonClient {
   ): Promise<WorkbenchResponsePayload<"checkout.git.stage.apply">> {
     return this.sendWorkbenchRequest(
       "checkout.git.stage.apply",
-      "checkoutGitStagingV1",
+      options.scope === "lines" ? "checkoutGitP2V1" : "checkoutGitStagingV1",
       options,
       options.patch,
     );
@@ -6039,7 +6043,7 @@ export class DaemonClient {
   ): Promise<WorkbenchResponsePayload<"checkout.git.unstage.apply">> {
     return this.sendWorkbenchRequest(
       "checkout.git.unstage.apply",
-      "checkoutGitStagingV1",
+      options.scope === "lines" ? "checkoutGitP2V1" : "checkoutGitStagingV1",
       options,
       options.patch,
     );
@@ -6162,12 +6166,48 @@ export class DaemonClient {
     return this.sendWorkbenchRequest("checkout.git.rebase.act", "checkoutGitRebaseV1", options);
   }
 
+  checkoutGitBlameGet(
+    options: WorkbenchRequestOptions<"checkout.git.blame.get">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.blame.get">> {
+    return this.sendWorkbenchRequest("checkout.git.blame.get", "checkoutGitP2V1", options);
+  }
+
+  checkoutGitTagMutate(
+    options: WorkbenchRequestOptions<"checkout.git.tag.mutate">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.tag.mutate">> {
+    return this.sendWorkbenchRequest(
+      "checkout.git.tag.mutate",
+      "checkoutGitP2V1",
+      options,
+      undefined,
+      options.action === "push" ? GIT_REMOTE_PUSH_TIMEOUT_MS : undefined,
+    );
+  }
+
+  checkoutGitPushPrepare(
+    options: WorkbenchRequestOptions<"checkout.git.push.prepare">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.push.prepare">> {
+    return this.sendWorkbenchRequest("checkout.git.push.prepare", "checkoutGitP2V1", options);
+  }
+
+  checkoutGitPushForce(
+    options: WorkbenchRequestOptions<"checkout.git.push.force">,
+  ): Promise<WorkbenchResponsePayload<"checkout.git.push.force">> {
+    return this.sendWorkbenchRequest(
+      "checkout.git.push.force",
+      "checkoutGitP2V1",
+      options,
+      undefined,
+      GIT_REMOTE_PUSH_TIMEOUT_MS,
+    );
+  }
+
   checkoutGitConflictInspect(
     options: WorkbenchRequestOptions<"checkout.git.conflict.inspect">,
   ): Promise<WorkbenchResponsePayload<"checkout.git.conflict.inspect">> {
     return this.sendWorkbenchRequest(
       "checkout.git.conflict.inspect",
-      "checkoutGitRebaseV1",
+      options.includeContents ? "checkoutGitP2V1" : "checkoutGitRebaseV1",
       options,
     );
   }
@@ -6177,7 +6217,7 @@ export class DaemonClient {
   ): Promise<WorkbenchResponsePayload<"checkout.git.conflict.resolve">> {
     return this.sendWorkbenchRequest(
       "checkout.git.conflict.resolve",
-      "checkoutGitRebaseV1",
+      options.resultText !== undefined ? "checkoutGitP2V1" : "checkoutGitRebaseV1",
       options,
     );
   }

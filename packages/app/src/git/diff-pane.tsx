@@ -44,6 +44,10 @@ import {
 } from "@/review";
 import type { CheckoutGitWorkingTree } from "@getpaseo/protocol/messages";
 import { buildHunkPatch, type PatchAction, type StagingLayer } from "@/git/staging/model";
+import { useFileBlame } from "@/git/blame/use-file-blame";
+import { useGitP2Copy } from "@/git/p2-copy";
+import { canSelectPatchLines } from "@/git/staging/line-patch";
+import { useLineSelection } from "@/git/staging/use-line-selection";
 import { useStagingLayerDiff } from "@/git/staging/use-layer-diff";
 import type { useStaging } from "@/git/staging/use-staging";
 import { DiffDocument, type WorkingDiffMode } from "@/git/diff-document";
@@ -1744,6 +1748,7 @@ export function StagingDiffPane({
   layer,
   path,
   canWrite,
+  p2Enabled,
   mutate,
 }: {
   serverId: string;
@@ -1753,9 +1758,12 @@ export function StagingDiffPane({
   layer: StagingLayer;
   path: string;
   canWrite: boolean;
+  p2Enabled: boolean;
   mutate: ReturnType<typeof useStaging>["mutate"];
 }) {
   const { t } = useTranslation();
+  const [showBlame, setShowBlame] = useState(false);
+  const toggleBlame = useCallback(() => setShowBlame((show) => !show), []);
   const isCompact = useIsCompactFormFactor();
   const { settings } = useAppSettings();
   const { preferences } = useChangesPreferences();
@@ -1785,6 +1793,59 @@ export function StagingDiffPane({
   const hasFile = tree[layer].some((file) => file.path === path && file.status === "modified");
   const canApply =
     canWrite && hasFile && !tree.conflicts.some((conflict) => conflict.path === path);
+  const blameActive = active && p2Enabled && showBlame;
+  const { diff: indexToWorktree } = useStagingLayerDiff(
+    serverId,
+    repoRoot,
+    headSha,
+    "unstaged",
+    blameActive && layer === "staged",
+  );
+  const { blame, status: blameStatus } = useFileBlame({
+    serverId,
+    cwd: repoRoot,
+    path,
+    active: blameActive,
+    diff,
+    indexToWorktree,
+    file: selectedFile,
+    layer,
+  });
+  const displayPreferences = useMemo(
+    () => ({
+      layout: resolveDiffLayout(preferences.layout, isWeb && !isCompact),
+      wrapLines: preferences.wrapLines,
+      codeFontSize: settings.codeFontSize,
+      monoFontFamily: settings.monoFontFamily,
+    }),
+    [
+      isCompact,
+      preferences.layout,
+      preferences.wrapLines,
+      settings.codeFontSize,
+      settings.monoFontFamily,
+    ],
+  );
+  const lineSelection = useLineSelection({
+    diff,
+    file: selectedFile,
+    layer,
+    layout: displayPreferences.layout,
+    eligible: Boolean(p2Enabled && hasFile && selectedFile && canSelectPatchLines(selectedFile)),
+    canWrite: canApply,
+    apply: (patch) =>
+      mutate(
+        {
+          kind: layer === "staged" ? "unstage" : "stage",
+          scope: "lines",
+          paths: [path],
+          description: path,
+          patch,
+        },
+        tree,
+        matchesDiff,
+      ),
+  });
   const renderHunkActions = useCallback(
     (file: ParsedDiffFile, hunkIndex: number) => (
       <StagingHunkActions
@@ -1804,24 +1865,9 @@ export function StagingDiffPane({
     () => ({ paths: collapsedPaths, onChange: setCollapsedPaths }),
     [collapsedPaths],
   );
-  const displayPreferences = useMemo(
-    () => ({
-      layout: resolveDiffLayout(preferences.layout, isWeb && !isCompact),
-      wrapLines: preferences.wrapLines,
-      codeFontSize: settings.codeFontSize,
-      monoFontFamily: settings.monoFontFamily,
-    }),
-    [
-      isCompact,
-      preferences.layout,
-      preferences.wrapLines,
-      settings.codeFontSize,
-      settings.monoFontFamily,
-    ],
-  );
   const mode = useMemo<WorkingDiffMode>(
-    () => ({ kind: "working", reviewActions, renderHunkActions }),
-    [reviewActions, renderHunkActions],
+    () => ({ kind: "working", reviewActions, renderHunkActions, lineSelection, lineBlame: blame }),
+    [reviewActions, renderHunkActions, lineSelection, blame],
   );
   if (error || !selectedFile) {
     return (
@@ -1834,6 +1880,14 @@ export function StagingDiffPane({
   }
   return (
     <View style={styles.diffContainer}>
+      {p2Enabled ? (
+        <StagingP2Toolbar
+          showBlame={showBlame}
+          toggleBlame={toggleBlame}
+          canSelectLines={Boolean(lineSelection)}
+          status={blameStatus}
+        />
+      ) : null}
       <DiffDocument
         files={files}
         contentInsetBottom={feedback.clearance}
@@ -1856,6 +1910,36 @@ export function StagingDiffPane({
         reviewActions={reviewActions}
         onChangeBody={reviewActions.onChangeEditorBody}
       />
+    </View>
+  );
+}
+
+function StagingP2Toolbar({
+  showBlame,
+  toggleBlame,
+  canSelectLines,
+  status,
+}: {
+  showBlame: boolean;
+  toggleBlame: () => void;
+  canSelectLines: boolean;
+  status: string | null;
+}) {
+  const copy = useGitP2Copy();
+  return (
+    <View style={styles.changesToolbar}>
+      <Button
+        size="sm"
+        variant={showBlame ? "outline" : "ghost"}
+        onPress={toggleBlame}
+        testID="git-diff-toggle-blame"
+      >
+        {copy.blame}
+      </Button>
+      {canSelectLines && isWeb ? (
+        <Text style={styles.hunkUnavailable}>{copy.selectRange}</Text>
+      ) : null}
+      {showBlame && status ? <Text style={styles.hunkUnavailable}>{status}</Text> : null}
     </View>
   );
 }

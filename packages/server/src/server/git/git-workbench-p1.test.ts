@@ -1,8 +1,17 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   CHECKOUT_GIT_LOG_MAX_BYTES,
@@ -16,9 +25,15 @@ import {
   type GitWorkbenchP1Host,
   type GitWorkbenchP1Request,
 } from "./git-workbench-p1.js";
+import * as workbenchGit from "./git-workbench-state.js";
 import { resolveP1Target } from "./repo-discovery.js";
 import { collectExpiredBackupRefs } from "./repo-backup-refs.js";
 import { repoWriteMutex } from "./repo-write-mutex.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...fs, access: vi.fn(fs.access) };
+});
 
 let workspace: string;
 let root: string;
@@ -779,3 +794,433 @@ it("keeps active rebase backups across linked worktrees past the normal capacity
   );
   expect(backups()).toEqual([]);
 }, 15000);
+
+it("force pushes only to the push URL using the upstream's custom fetch mapping", async () => {
+  const fetchRepo = join(workspace, "fetch.git");
+  const pushRepo = join(workspace, "push.git");
+  const branch = "refs/heads/published";
+  const tracking = "refs/paseo-test/fetched/published";
+  git(root, ["init", "--bare", "-q", fetchRepo]);
+  git(root, ["init", "--bare", "-q", pushRepo]);
+  const original = await commit(root, "original\n", "Original");
+  git(root, ["push", "-q", fetchRepo, original + ":" + branch]);
+  const remoteTip = await commit(root, "remote\n", "Remote");
+  git(root, ["push", "-q", pushRepo, remoteTip + ":" + branch]);
+  git(root, ["remote", "add", "origin", fetchRepo]);
+  git(root, ["remote", "set-url", "--push", "origin", pushRepo]);
+  git(root, ["config", "remote.origin.fetch", "+" + branch + ":" + tracking]);
+  git(root, ["config", "branch.main.remote", "origin"]);
+  git(root, ["config", "branch.main.merge", branch]);
+  git(root, ["fetch", "-q", "origin"]);
+  const local = await commit(root, "local\n", "Local");
+  const readRef = (repository: string, ref: string) =>
+    git(repository, ["rev-parse", "--verify", ref]).trim();
+  const prepare = async () =>
+    payload(
+      await request({
+        type: "checkout.git.push.prepare.request",
+        targetRepoRoot: root,
+        expectedHeadSha: local,
+      }),
+      "checkout.git.push.prepare.response",
+    );
+  const run = async (expectedPushToken?: string) =>
+    payload(
+      await request({
+        type: "checkout.git.push.force.request",
+        targetRepoRoot: root,
+        expectedHeadSha: local,
+        expectedPushToken,
+        confirmation: "force-push main",
+      }),
+      "checkout.git.push.force.response",
+    );
+  expect(readRef(root, tracking)).toBe(original);
+  const previous = await prepare();
+  expect(previous.target).toMatchObject({
+    branch: "main",
+    remote: "origin",
+    remoteRef: branch,
+    remoteSha: original,
+    token: expect.any(String),
+  });
+  expect(JSON.stringify(previous)).not.toContain(pushRepo);
+  expect(await run()).toMatchObject({ success: false, errorCode: "STALE_REMOTE_BASELINE" });
+  expect(await run(previous.target!.token)).toMatchObject({
+    success: false,
+    errorCode: "STALE_REMOTE_BASELINE",
+  });
+  expect(readRef(pushRepo, branch)).toBe(remoteTip);
+
+  git(root, ["fetch", "-q", pushRepo, branch + ":" + tracking]);
+  expect(await run(previous.target!.token)).toMatchObject({
+    success: false,
+    errorCode: "STALE_REMOTE_BASELINE",
+  });
+  const reviewed = (await prepare()).target!;
+  expect(reviewed.remoteSha).toBe(remoteTip);
+  git(root, ["config", "remote.origin.pushurl", fetchRepo]);
+  // The tracking SHA and remote name remain identical, but the endpoint changed.
+  expect(await run(reviewed.token)).toMatchObject({
+    success: false,
+    errorCode: "STALE_REMOTE_BASELINE",
+  });
+  git(root, ["config", "--replace-all", "remote.origin.pushurl", pushRepo]);
+  git(root, ["config", "push.followTags", "true"]);
+  git(root, ["tag", "-am", "Do not publish", "other"]);
+  git(root, ["remote", "set-url", "--add", "--push", "origin", fetchRepo]);
+  expect(await prepare()).toMatchObject({
+    target: null,
+    error: expect.stringContaining("exactly one"),
+  });
+  expect(await run(reviewed.token)).toMatchObject({
+    success: false,
+    errorCode: "STALE_REMOTE_BASELINE",
+  });
+  expect(readRef(pushRepo, branch)).toBe(remoteTip);
+  git(root, ["config", "--replace-all", "remote.origin.pushurl", pushRepo]);
+
+  const actualGit = workbenchGit.git;
+  let movedAfterQuery = false;
+  const observer = vi.spyOn(workbenchGit, "git").mockImplementation(async (...args) => {
+    const result = await actualGit(...args);
+    if (!movedAfterQuery && args[1][0] === "ls-remote") {
+      git(pushRepo, ["update-ref", branch, original, remoteTip]);
+      movedAfterQuery = true;
+    }
+    return result;
+  });
+  try {
+    expect(await run(reviewed.token)).toMatchObject({
+      success: false,
+      errorCode: "STALE_REMOTE_BASELINE",
+    });
+    expect(movedAfterQuery).toBe(true);
+    expect(readRef(pushRepo, branch)).toBe(original);
+  } finally {
+    observer.mockRestore();
+  }
+  git(pushRepo, ["update-ref", branch, remoteTip, original]);
+  expect(await run(reviewed.token)).toMatchObject({ success: true, error: null });
+  expect(readRef(pushRepo, branch)).toBe(local);
+  expect(readRef(fetchRepo, branch)).toBe(original);
+  expect(git(pushRepo, ["for-each-ref", "--format=%(refname)"]).trim()).toBe(branch);
+});
+
+it.for(["hook path", "hook config"])(
+  "honors a pre-push hook from %s for force and tag pushes",
+  async (hookKind, { skip }) => {
+    if (hookKind === "hook config") {
+      const [, major, minor] = /git version (\d+)\.(\d+)/.exec(git(root, ["--version"])) ?? [];
+      if (!major || (Number(major) === 2 && Number(minor) < 54)) skip();
+    }
+
+    const remote = "reviewed";
+    const pushRepo = join(workspace, "push destination.git");
+    const fetchRepo = join(workspace, "fetch.git");
+    const branchRef = "refs/heads/published";
+    const tagRef = "refs/tags/release";
+    git(root, ["init", "--bare", "-q", pushRepo]);
+    git(root, ["init", "--bare", "-q", fetchRepo]);
+    const local = await commit(root, "local\n", "Local");
+    const remoteTip = await commit(root, "remote\n", "Remote");
+    git(root, ["push", "-q", pushRepo, remoteTip + ":" + branchRef]);
+    git(root, ["remote", "add", remote, fetchRepo]);
+    git(root, ["remote", "set-url", "--push", remote, "fixture:push destination.git"]);
+    git(root, ["config", "url." + workspace + "/.insteadOf", "fixture:"]);
+    git(root, ["config", "remote." + remote + ".lfspushurl", "fixture:large-files"]);
+    git(root, ["fetch", "-q", pushRepo, branchRef + ":refs/remotes/" + remote + "/published"]);
+    git(root, ["config", "branch.main.remote", remote]);
+    git(root, ["config", "branch.main.merge", branchRef]);
+    git(root, ["update-ref", "refs/heads/main", local, remoteTip]);
+    git(root, ["tag", "-am", "Release", "release"]);
+    const tag = git(root, ["rev-parse", tagRef]).trim();
+
+    const hookDirectory = "team hooks";
+    const hooksPath = hookKind === "hook path" ? hookDirectory : ".git/no-hooks";
+    git(root, ["config", "core.hooksPath", hooksPath]);
+    await mkdir(join(root, hookDirectory));
+    const hookSource = join(hookDirectory, "pre-push");
+    if (hookKind === "hook config") {
+      git(root, ["config", "hook.team.event", "pre-push"]);
+      git(root, ["config", "hook.team.command", 'exec "./team hooks/pre-push"']);
+    }
+    await writeFile(
+      join(root, hookSource),
+      `#!/bin/sh
+if [ "$1" != reviewed ]; then exit 0; fi
+{
+  printf '%s\\n' "$1" "$2"
+  git config --get "remote.$1.lfspushurl" || exit 2
+  git config --get core.hooksPath || exit 2
+  cat
+} > .git/pre-push-observed
+if [ -f .git/reject-push ]; then exit 1; fi
+`,
+      { mode: 0o700 },
+    );
+
+    const { target } = payload(
+      await request({
+        type: "checkout.git.push.prepare.request",
+        targetRepoRoot: root,
+        expectedHeadSha: local,
+      }),
+      "checkout.git.push.prepare.response",
+    );
+    expect(target).toMatchObject({ remote, remoteRef: branchRef, remoteSha: remoteTip });
+    const force = async () =>
+      payload(
+        await request({
+          type: "checkout.git.push.force.request",
+          targetRepoRoot: root,
+          expectedHeadSha: local,
+          expectedPushToken: target!.token,
+          confirmation: "force-push main",
+        }),
+        "checkout.git.push.force.response",
+      );
+    const pushTag = async () =>
+      payload(
+        await request({
+          type: "checkout.git.tag.mutate.request",
+          targetRepoRoot: root,
+          action: "push",
+          remote,
+          tagName: "release",
+          expectedHeadSha: local,
+          expectedTagSha: tag,
+        }),
+        "checkout.git.tag.mutate.response",
+      );
+    const inventory = (path: string) =>
+      git(path, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+    const observation = () => readFile(join(root, ".git", "pre-push-observed"), "utf8");
+    const header = [remote, pushRepo, "fixture:large-files", hooksPath].join("\n") + "\n";
+    const before = inventory(pushRepo);
+    expect(before).toBe(`${branchRef} ${remoteTip}\n`);
+
+    await writeFile(join(root, ".git", "reject-push"), "");
+    expect(await force()).toMatchObject({ success: false });
+    expect(await observation()).toBe(header + `${local} ${local} ${branchRef} ${remoteTip}\n`);
+    expect(inventory(pushRepo)).toBe(before);
+    expect(await pushTag()).toMatchObject({ success: false });
+    expect(await observation()).toBe(
+      header + `${tag} ${tag} ${tagRef} ${"0".repeat(tag.length)}\n`,
+    );
+    expect(inventory(pushRepo)).toBe(before);
+
+    await rm(join(root, ".git", "reject-push"));
+    const checkAccess = vi.mocked(access);
+    const originalAccess = checkAccess.getMockImplementation()!;
+    const blockedScripts: string[] = [];
+    checkAccess.mockImplementation(async (path, mode) => {
+      const script = String(path);
+      if (basename(dirname(script)).startsWith("paseo-pre-push-")) {
+        blockedScripts.push(script);
+        throw Object.assign(new Error("Execution denied on the temporary filesystem"), {
+          code: "EACCES",
+        });
+      }
+      return originalAccess(path, mode);
+    });
+    try {
+      const failure = {
+        success: false,
+        error: "Could not prepare the repository's pre-push hook.",
+      };
+      expect(await force()).toMatchObject(failure);
+      expect(await pushTag()).toMatchObject(failure);
+      expect(inventory(pushRepo)).toBe(before);
+    } finally {
+      checkAccess.mockImplementation(originalAccess);
+    }
+    expect(blockedScripts).toHaveLength(2);
+    for (const script of blockedScripts) {
+      await expect(access(dirname(script))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+
+    // Introduce a second configured destination after the last check and before
+    // Git starts. Neither request may push to that destination.
+    const pushKey = "remote." + remote + ".pushurl";
+    const actualGit = workbenchGit.git;
+    let changedBeforePush = 0;
+    const observer = vi.spyOn(workbenchGit, "git").mockImplementation(async (...args) => {
+      if (!args[1].includes("push")) return actualGit(...args);
+      git(root, ["config", "--add", pushKey, fetchRepo]);
+      changedBeforePush++;
+      try {
+        return await actualGit(...args);
+      } finally {
+        git(root, ["config", "--replace-all", pushKey, "fixture:push destination.git"]);
+      }
+    });
+    try {
+      expect(await force()).toMatchObject({ success: true });
+      expect(await pushTag()).toMatchObject({ success: true });
+      expect(changedBeforePush).toBe(2);
+    } finally {
+      observer.mockRestore();
+    }
+    expect(inventory(pushRepo)).toBe(`${branchRef} ${local}\n${tagRef} ${tag}\n`);
+    expect(inventory(fetchRepo)).toBe("");
+  },
+);
+
+it("reads whole conflict sides on demand and refuses a stale edited result", async () => {
+  await pauseConflict();
+  const path = "[literal].txt";
+  const conflict = await readFile(join(root, path), "utf8");
+  const inspect = async (includeContents?: boolean) =>
+    payload(
+      await request({
+        type: "checkout.git.conflict.inspect.request",
+        targetRepoRoot: root,
+        path,
+        includeContents,
+      }),
+      "checkout.git.conflict.inspect.response",
+    ).conflicts[0]!;
+  expect(await inspect()).not.toHaveProperty("contents");
+  const original = await inspect(true);
+  expect(original.contents).toEqual({
+    base: "base\n",
+    ours: "upstream\n",
+    theirs: "topic\n",
+    result: conflict,
+  });
+  const writeResult = async (fingerprint: string, resultText: string) =>
+    payload(
+      await request({
+        type: "checkout.git.conflict.resolve.request",
+        targetRepoRoot: root,
+        path,
+        strategy: "mark_resolved",
+        expectedConflictFingerprint: fingerprint,
+        resultText,
+      }),
+      "checkout.git.conflict.resolve.response",
+    );
+  await writeFile(join(root, path), conflict + "concurrent edit\n");
+  expect(await writeResult(original.conflictFingerprint, "resolved\n")).toMatchObject({
+    success: false,
+    errorCode: "STALE_CONFLICT_SNAPSHOT",
+  });
+  const refreshed = await inspect(true);
+  expect(await writeResult(refreshed.conflictFingerprint, conflict)).toMatchObject({
+    success: false,
+  });
+  expect(await readFile(join(root, path), "utf8")).toBe(conflict + "concurrent edit\n");
+  expect(await writeResult(refreshed.conflictFingerprint, "resolved\n")).toMatchObject({
+    success: true,
+  });
+  expect(await readFile(join(root, path), "utf8")).toBe("resolved\n");
+  expect(git(root, ["show", ":" + path])).toBe("resolved\n");
+});
+
+it("stages the Git conversion of the approved conflict text and preserves an external edit", async () => {
+  await pauseConflict();
+  const path = "[literal].txt";
+  const absolute = join(root, path);
+  await writeFile(join(root, ".git", "info", "attributes"), "*.txt text eol=crlf\n");
+  const inspect = async () =>
+    payload(
+      await request({
+        type: "checkout.git.conflict.inspect.request",
+        targetRepoRoot: root,
+        path,
+      }),
+      "checkout.git.conflict.inspect.response",
+    ).conflicts[0]!;
+  const save = async (expectedConflictFingerprint: string) =>
+    payload(
+      await request({
+        type: "checkout.git.conflict.resolve.request",
+        targetRepoRoot: root,
+        path,
+        strategy: "mark_resolved",
+        expectedConflictFingerprint,
+        resultText: "reviewed\r\n",
+      }),
+      "checkout.git.conflict.resolve.response",
+    );
+  const original = await inspect();
+  const unmerged = () => git(root, ["--literal-pathspecs", "ls-files", "--unmerged", "--", path]);
+  const initialStages = unmerged();
+  const actualGit = workbenchGit.git;
+  let raced = false;
+  const observer = vi.spyOn(workbenchGit, "git").mockImplementation(async (...args) => {
+    const response = await actualGit(...args);
+    if (
+      !raced &&
+      args[1].includes("--unmerged") &&
+      (await readFile(absolute, "utf8")) === "reviewed\r\n"
+    ) {
+      raced = true;
+      await writeFile(absolute, "external edit\r\n");
+    }
+    return response;
+  });
+  try {
+    expect(await save(original.conflictFingerprint)).toMatchObject({
+      success: false,
+      errorCode: "STALE_CONFLICT_SNAPSHOT",
+    });
+    expect(raced).toBe(true);
+    expect(unmerged()).toBe(initialStages);
+    expect(await readFile(absolute, "utf8")).toBe("external edit\r\n");
+  } finally {
+    observer.mockRestore();
+  }
+
+  expect(await save((await inspect()).conflictFingerprint)).toMatchObject({ success: true });
+  expect(git(root, ["show", ":" + path])).toBe("reviewed\n");
+  expect(await readFile(absolute, "utf8")).toBe("reviewed\r\n");
+});
+
+it("reports worktree edits after installing the approved conflict blob", async () => {
+  await pauseConflict();
+  const path = "[literal].txt";
+  const absolute = join(root, path);
+  const before = payload(
+    await request({
+      type: "checkout.git.conflict.inspect.request",
+      targetRepoRoot: root,
+      path,
+    }),
+    "checkout.git.conflict.inspect.response",
+  ).conflicts[0]!;
+  const actualGit = workbenchGit.git;
+  let raced = false;
+  const observer = vi.spyOn(workbenchGit, "git").mockImplementation(async (...args) => {
+    const response = await actualGit(...args);
+    if (!raced && args[1].includes("--stage") && args[1].includes(path)) {
+      await writeFile(absolute, "external edit after install\n");
+      raced = true;
+    }
+    return response;
+  });
+  try {
+    expect(
+      payload(
+        await request({
+          type: "checkout.git.conflict.resolve.request",
+          targetRepoRoot: root,
+          path,
+          strategy: "mark_resolved",
+          expectedConflictFingerprint: before.conflictFingerprint,
+          resultText: "approved\n",
+        }),
+        "checkout.git.conflict.resolve.response",
+      ),
+    ).toMatchObject({
+      success: false,
+      errorCode: "STALE_CONFLICT_SNAPSHOT",
+    });
+    expect(raced).toBe(true);
+    expect(await readFile(absolute, "utf8")).toBe("external edit after install\n");
+    expect(git(root, ["show", ":" + path])).toBe("approved\n");
+  } finally {
+    observer.mockRestore();
+  }
+});

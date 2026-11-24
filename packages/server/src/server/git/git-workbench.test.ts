@@ -820,3 +820,29 @@ describe("Git P0 operations", () => {
     expect(git("for-each-ref", "--format=%(refname)", expired)).toBe("");
   });
 });
+
+it("stages and unstages an EOF change with no final newline", async () => {
+  const path = "example.txt";
+  const newText = original.trimEnd() + " edited";
+  await writeWorkingFile(path, newText);
+  const patch = git("diff", "--", path);
+  expect(patch).toContain("\\ No newline at end of file\n");
+  const stage = await request({
+    type: "checkout.git.stage.apply.request",
+    scope: "lines",
+    patch,
+    expectedHeadSha: head,
+  });
+  expect(stage).toMatchObject({ success: true });
+  expect(git("show", ":" + path)).toBe(newText);
+  expect(
+    await request({
+      type: "checkout.git.unstage.apply.request",
+      scope: "lines",
+      patch,
+      expectedHeadSha: head,
+    }),
+  ).toMatchObject({ success: true });
+  expect(git("show", ":" + path)).toBe(original);
+  expect(await readFile(join(root, path), "utf8")).toBe(newText);
+});

@@ -393,6 +393,110 @@ ${SIMPLE_DIFF.replaceAll("example.ts", "other.ts")
     expect(files[0].hunks[1].newStart).toBe(10);
   });
 
+  const eof = "\\ No newline at end of file";
+  const eofDiffHeader = [
+    "diff --git a/eof.txt b/eof.txt",
+    "--- a/eof.txt",
+    "+++ b/eof.txt",
+    "@@ -1,2 +1,2 @@",
+    " common",
+  ];
+
+  it.each([
+    {
+      name: "the old side lacks a newline",
+      before: "old",
+      after: "new",
+      oldMissing: true,
+      newMissing: false,
+    },
+    {
+      name: "the new side lacks a newline",
+      before: "old",
+      after: "new",
+      oldMissing: false,
+      newMissing: true,
+    },
+    {
+      name: "both sides lack a newline",
+      before: "old",
+      after: "new",
+      oldMissing: true,
+      newMissing: true,
+    },
+    {
+      name: "only the final newline changes",
+      before: "same",
+      after: "same",
+      oldMissing: false,
+      newMissing: true,
+    },
+  ])("preserves the EOF marker when $name", ({ before, after, oldMissing, newMissing }) => {
+    const [file] = parseDiff(
+      [
+        ...eofDiffHeader,
+        "-" + before,
+        ...(oldMissing ? [eof] : []),
+        "+" + after,
+        ...(newMissing ? [eof] : []),
+        "",
+      ].join("\n"),
+    );
+    expect(file).toMatchObject({ additions: 1, deletions: 1 });
+    expect(file.hunks[0]).toEqual({
+      oldStart: 1,
+      oldCount: 2,
+      newStart: 1,
+      newCount: 2,
+      lines: [
+        { type: "header", content: "@@ -1,2 +1,2 @@" },
+        { type: "context", content: "common" },
+        { type: "remove", content: before },
+        ...(oldMissing ? [{ type: "header", content: eof }] : []),
+        { type: "add", content: after },
+        ...(newMissing ? [{ type: "header", content: eof }] : []),
+      ],
+    });
+    expect(reconstructOldFile(file.hunks)).toEqual(
+      new Map([
+        [1, "common"],
+        [2, before],
+      ]),
+    );
+    expect(reconstructNewFile(file.hunks)).toEqual(
+      new Map([
+        [1, "common"],
+        [2, after],
+      ]),
+    );
+  });
+
+  it("keeps marker-like file content and ignores markers outside a hunk or without a preceding line", () => {
+    const [file, binary] = parseDiff(
+      [
+        ...eofDiffHeader.slice(0, 3),
+        eof,
+        "@@ -1,2 +1,2 @@",
+        eof,
+        " " + eof,
+        "-" + eof,
+        "+" + eof,
+        "diff --git a/image.png b/image.png",
+        "GIT binary patch",
+        "literal 0",
+        eof,
+        "",
+      ].join("\n"),
+    );
+    expect(file.hunks[0].lines).toEqual([
+      { type: "header", content: "@@ -1,2 +1,2 @@" },
+      { type: "context", content: eof },
+      { type: "remove", content: eof },
+      { type: "add", content: eof },
+    ]);
+    expect(binary).toMatchObject({ additions: 0, deletions: 0, hunks: [] });
+  });
+
   it("parses a new file diff", () => {
     const files = parseDiff(NEW_FILE_DIFF);
 

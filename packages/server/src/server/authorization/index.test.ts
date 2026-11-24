@@ -79,6 +79,8 @@ describe("SessionAuthorization", () => {
         "checkout.git.commit.get_detail",
         "checkout.git.rebase.build_plan",
         "checkout.git.conflict.inspect",
+        "checkout.git.blame.get",
+        "checkout.git.push.prepare",
       ],
       "workspace.write": [
         "workspace.durable_item.decide",
@@ -93,6 +95,8 @@ describe("SessionAuthorization", () => {
         "checkout.git.rebase.execute",
         "checkout.git.rebase.act",
         "checkout.git.conflict.resolve",
+        "checkout.git.tag.mutate",
+        "checkout.git.push.force",
       ],
       "workspace.manage": ["workspace.topic.update"],
     } as const;

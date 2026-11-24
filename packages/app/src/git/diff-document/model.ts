@@ -392,25 +392,56 @@ function lineSources(
   if (layout === "split") {
     return buildSplitDiffRows(file).map((row) => {
       if (row.kind === "header") {
-        return [headerSource(row.content, row.hunkIndex, row.lineIndex)];
+        return [
+          headerSource(
+            row.content.startsWith("@@") ? row.content : "@@",
+            row.hunkIndex,
+            row.lineIndex,
+          ),
+        ];
       }
       return [cellSource(row.left, includeTokens), cellSource(row.right, includeTokens)];
     });
   }
-  return buildUnifiedDiffLines(file).map((entry) => [
-    {
-      type: entry.line.type,
-      content: entry.line.content,
-      lineNumber: entry.lineNumber,
-      reviewTarget: entry.reviewTarget,
-      tokenText: includeTokens ? compactHighlightTokens(entry.line.tokens ?? []) : [],
-      sourceIdentity: {
-        hunkIndex: entry.hunkIndex,
-        lineIndex: entry.lineIndex,
-        side: entry.reviewTarget?.side ?? "new",
+  return buildUnifiedDiffLines(file)
+    .filter(
+      (entry) =>
+        entry.line.content !== "\\ No newline at end of file" || entry.line.type !== "header",
+    )
+    .map((entry) => [
+      {
+        type: entry.line.type,
+        content: entry.line.content,
+        lineNumber: entry.lineNumber,
+        reviewTarget: entry.reviewTarget,
+        tokenText: includeTokens ? compactHighlightTokens(entry.line.tokens ?? []) : [],
+        sourceIdentity: {
+          hunkIndex: entry.hunkIndex,
+          lineIndex: entry.lineIndex,
+          side: entry.reviewTarget?.side ?? "new",
+        },
       },
-    },
-  ]);
+    ]);
+}
+
+export function selectableLineOrder(
+  file: BuildDiffDocumentModelInput["files"][number],
+  layout: "unified" | "split",
+): ReadonlyMap<number, readonly number[]> {
+  const order = new Map<number, number[]>();
+  for (const cells of lineSources(file, layout, false)) {
+    for (const cell of cells) {
+      if (cell?.type !== "add" && cell?.type !== "remove") continue;
+      const { hunkIndex, lineIndex } = cell.sourceIdentity;
+      let lines = order.get(hunkIndex);
+      if (!lines) {
+        lines = [];
+        order.set(hunkIndex, lines);
+      }
+      lines.push(lineIndex);
+    }
+  }
+  return order;
 }
 
 function headerSource(content: string, hunkIndex: number, lineIndex: number): CellSource {

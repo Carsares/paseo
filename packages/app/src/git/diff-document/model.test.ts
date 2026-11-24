@@ -72,6 +72,22 @@ function input(overrides: Partial<BuildDiffDocumentModelInput> = {}): BuildDiffD
 }
 
 describe("diff document model", () => {
+  it.each(["unified", "split"] as const)("keeps EOF markers out of %s rows", (layout) => {
+    const contents = file();
+    const hunk = contents.hunks[0]!;
+    const marker = { type: "header", content: "\\ No newline at end of file" } as const;
+    hunk.lines.splice(2, 0, marker);
+    hunk.lines.push(marker);
+    const { rows } = buildDiffDocumentModel(
+      input({ layout, files: [contents], hunkActions: true }),
+    );
+    const cells = rows.flatMap((row) => (row.kind === "line" ? row.cells : []));
+    const headers = cells.filter((cell) => cell?.type === "header");
+    expect(headers.map((cell) => cell?.content)).toEqual(["@@ -1 +1 @@"]);
+    const changedLines = cells.filter((cell) => cell?.type === "add" || cell?.type === "remove");
+    expect(changedLines.map((cell) => cell?.sourceIdentity.lineIndex)).toEqual([1, 3]);
+  });
+
   it.each(["unified", "split"] as const)("reserves hunk controls below the %s header", (layout) => {
     const standard = buildDiffDocumentModel(input({ layout }));
     const withActions = buildDiffDocumentModel(input({ layout, hunkActions: true }));

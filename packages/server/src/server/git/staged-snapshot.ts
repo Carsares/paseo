@@ -63,6 +63,7 @@ export async function emptyTree(repo: GitWorktree): Promise<string> {
 export async function withStagedCommitLock<T>(
   repo: GitWorktree,
   commit: (snapshot: StagedSnapshot) => Promise<T>,
+  checks?: { beforeInstall?(): Promise<void>; afterInstall?(): Promise<void> },
 ): Promise<{ result: T; indexError?: string }> {
   const indexPath = join(repo.gitDir, "index");
   const lockPath = `${indexPath}.lock`;
@@ -92,18 +93,26 @@ export async function withStagedCommitLock<T>(
       try {
         if (!(await stillOwnsLock())) throw new Error("Git index lock was replaced");
         await copyFile(snapshot.indexPath, lockPath);
+      } catch (error) {
+        return { result, indexError: indexInstallError(error) };
+      }
+      await checks?.beforeInstall?.();
+      try {
+        if (!(await stillOwnsLock())) throw new Error("Git index lock was replaced");
         await rename(lockPath, indexPath);
         installed = true;
-        return { result };
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          result,
-          indexError: `Commit created, but Git's updated index could not be installed: ${message}`,
-        };
+        return { result, indexError: indexInstallError(error) };
       }
+      await checks?.afterInstall?.();
+      return { result };
     });
   } finally {
     if (!installed && (await stillOwnsLock())) await rm(lockPath, { force: true });
   }
+}
+
+function indexInstallError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return `Commit created, but Git's updated index could not be installed: ${message}`;
 }

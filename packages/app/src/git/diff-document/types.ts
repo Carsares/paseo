@@ -15,9 +15,34 @@ interface DiffDocumentBaseProps {
   };
 }
 
+export interface DiffLineSelection {
+  path: string;
+  hunkIndex?: number;
+  picked: ReadonlySet<number>;
+  pick: (hunkIndex: number, lineIndex: number, extend: boolean) => void;
+  clear: () => void;
+  submit: () => Promise<void>;
+  canSubmit: boolean;
+  label: string;
+  rangeHint: string;
+  actionLabel: string;
+}
+
+export interface DiffBlameMark {
+  label: string;
+  detail: string;
+}
+
+export interface DiffLineBlame {
+  path: string;
+  mark: (cell: DiffCell) => DiffBlameMark | undefined;
+}
+
 export interface WorkingDiffMode {
   kind: "working";
   reviewActions?: InlineReviewActions;
+  lineSelection?: DiffLineSelection;
+  lineBlame?: DiffLineBlame;
   renderHunkActions?: (file: ParsedDiffFile, hunkIndex: number) => ReactNode;
   onFilePress?: (path: string) => void;
   focusPath?: string;

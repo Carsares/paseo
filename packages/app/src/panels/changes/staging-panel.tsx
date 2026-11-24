@@ -18,11 +18,18 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { isWeb } from "@/constants/platform";
+import { useIsCompactFormFactor } from "@/constants/layout";
+import { useHostFeature } from "@/runtime/host-features";
+import { ConflictEditor } from "@/git/merge/conflict-editor";
+import { useGitP2Copy } from "@/git/p2-copy";
+import { ForcePush } from "@/git/tags/force-push";
+import { RepoRefActions } from "@/git/tags/repo-ref-actions";
 import { StagingDiffPane } from "@/git/diff-pane";
 import { fileSelection, type StagingLayer } from "@/git/staging/model";
 import { useStaging } from "@/git/staging/use-staging";
 
-type Tab = "commit" | "stash";
+type Tab = "commit" | "stash" | "refs";
 interface Selection {
   layer: StagingLayer;
   path: string;
@@ -47,7 +54,11 @@ export function StagingPanel({
   onOpenComparison: () => void;
 }) {
   const { t } = useTranslation();
-  const [tab, setTab] = useState<Tab>("commit");
+  const p2Enabled = useHostFeature(serverId, "checkoutGitP2V1");
+  const graphEnabled = useHostFeature(serverId, "checkoutGitGraphV1");
+  const refsEnabled = p2Enabled && graphEnabled;
+  const [selectedTab, setTab] = useState<Tab>("commit");
+  const tab = selectedTab === "refs" && !refsEnabled ? "commit" : selectedTab;
   const [selection, setSelection] = useState<Selection | null>(null);
   const staging = useStaging(serverId, cwd, active, tab === "stash");
   const { tree, treeQuery, connected, busy, refresh, mutate, canWrite } = staging;
@@ -59,32 +70,34 @@ export function StagingPanel({
     },
     [busy],
   );
-  const refreshPanel = useCallback(() => void refresh(), [refresh]);
   const leaveDiff = useCallback(() => setSelection(null), []);
   const showLoading = !tree && connected && !treeQuery.isError;
   return (
     <View style={styles.container}>
-      <View style={styles.toolbar}>
-        <SegmentedControl<Tab>
-          size="sm"
-          value={tab}
-          onValueChange={onTabChange}
-          options={[
-            { value: "commit", label: t("gitWorkbench.commitTab") },
-            { value: "stash", label: t("gitWorkbench.stashTab") },
-          ]}
-        />
-        <Button
-          size="sm"
-          variant="ghost"
-          disabled={!connected || busy || treeQuery.isFetching}
-          onPress={refreshPanel}
-        >
-          {t("gitWorkbench.refresh")}
-        </Button>
-      </View>
+      <StagingToolbar
+        serverId={serverId}
+        cwd={cwd}
+        active={active}
+        staging={staging}
+        tab={tab}
+        refsEnabled={refsEnabled}
+        p2Enabled={p2Enabled}
+        onTabChange={onTabChange}
+      />
       <StagingStatus staging={staging} />
       {showLoading ? <Text style={styles.summary}>{t("common.loading")}</Text> : null}
+      {tree && tab === "refs" ? (
+        <RepoRefActions
+          key={JSON.stringify([serverId, cwd, tree.repoRoot, tree.headSha, tree.currentBranch])}
+          serverId={serverId}
+          cwd={cwd}
+          tree={tree}
+          active={active}
+          connected={connected}
+          canWrite={canWrite}
+          onChanged={refresh}
+        />
+      ) : null}
       {tree && tab === "stash" ? (
         <StashPanel key={"stash:" + tree.repoRoot} staging={staging} />
       ) : null}
@@ -107,24 +120,22 @@ export function StagingPanel({
             layer={selection.layer}
             path={selection.path}
             canWrite={canWrite}
+            p2Enabled={p2Enabled}
             mutate={mutate}
           />
         </View>
       ) : null}
       {tree && tab === "commit" && !selection ? (
         <ScrollView style={styles.container} contentContainerStyle={styles.list}>
-          {tree.conflicts.length > 0 ? (
-            <View style={styles.section}>
-              <Text accessibilityRole="header" style={styles.error}>
-                {t("gitWorkbench.conflicts")}
-              </Text>
-              {tree.conflicts.map(({ path, status }) => (
-                <Text key={path} style={styles.text}>
-                  {path} · {status}
-                </Text>
-              ))}
-            </View>
-          ) : null}
+          <ConflictedFiles
+            tree={tree}
+            p2Enabled={p2Enabled}
+            serverId={serverId}
+            cwd={cwd}
+            active={active}
+            canWrite={canWrite}
+            refresh={refresh}
+          />
           <ChangeSection
             tree={tree}
             layer="staged"
@@ -148,6 +159,149 @@ export function StagingPanel({
       ) : null}
       {tree ? (
         <CommitForm key={"commit:" + tree.repoRoot} staging={staging} hidden={tab !== "commit"} />
+      ) : null}
+    </View>
+  );
+}
+
+function StagingToolbar({
+  serverId,
+  cwd,
+  active,
+  staging,
+  tab,
+  refsEnabled,
+  p2Enabled,
+  onTabChange,
+}: {
+  serverId: string;
+  cwd: string;
+  active: boolean;
+  staging: Staging;
+  tab: Tab;
+  refsEnabled: boolean;
+  p2Enabled: boolean;
+  onTabChange: (tab: Tab) => void;
+}) {
+  const { t } = useTranslation();
+  const copy = useGitP2Copy();
+  const { tree, treeQuery, connected, busy, refresh, canWrite } = staging;
+  const refreshPanel = useCallback(() => void refresh(), [refresh]);
+  return (
+    <View style={styles.toolbar}>
+      <SegmentedControl<Tab>
+        size="sm"
+        value={tab}
+        onValueChange={onTabChange}
+        options={[
+          { value: "commit", label: t("gitWorkbench.commitTab") },
+          { value: "stash", label: t("gitWorkbench.stashTab") },
+          ...(refsEnabled ? [{ value: "refs" as const, label: copy.localTags }] : []),
+        ]}
+      />
+      <Button
+        size="sm"
+        variant="ghost"
+        disabled={!connected || busy || treeQuery.isFetching}
+        onPress={refreshPanel}
+      >
+        {t("gitWorkbench.refresh")}
+      </Button>
+      {p2Enabled && tree?.headSha && tree.currentBranch ? (
+        <ForcePush
+          key={JSON.stringify([serverId, cwd, tree.repoRoot, tree.headSha, tree.currentBranch])}
+          serverId={serverId}
+          cwd={cwd}
+          repoRoot={tree.repoRoot}
+          headSha={tree.headSha}
+          branch={tree.currentBranch}
+          active={active}
+          canWrite={canWrite}
+          onChanged={refresh}
+        />
+      ) : null}
+    </View>
+  );
+}
+
+function ConflictedFiles({
+  tree,
+  p2Enabled,
+  serverId,
+  cwd,
+  active,
+  canWrite,
+  refresh,
+}: {
+  tree: CheckoutGitWorkingTree;
+  p2Enabled: boolean;
+  serverId: string;
+  cwd: string;
+  active: boolean;
+  canWrite: boolean;
+  refresh: () => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const isCompact = useIsCompactFormFactor();
+  const canOpenEditor = p2Enabled && isWeb && !isCompact;
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const close = useCallback(() => setSelectedPath(null), []);
+  if (tree.conflicts.length === 0 && !selectedPath) return null;
+  return (
+    <View style={styles.section}>
+      {tree.conflicts.length ? (
+        <Text accessibilityRole="header" style={styles.error}>
+          {t("gitWorkbench.conflicts")}
+        </Text>
+      ) : null}
+      {tree.conflicts.map(({ path, status }) => (
+        <ConflictRow
+          key={path}
+          path={path}
+          status={status}
+          canOpenEditor={canOpenEditor}
+          onOpen={setSelectedPath}
+        />
+      ))}
+      {selectedPath && canOpenEditor ? (
+        <ConflictEditor
+          key={JSON.stringify([tree.repoRoot, selectedPath])}
+          serverId={serverId}
+          cwd={cwd}
+          repoRoot={tree.repoRoot}
+          path={selectedPath}
+          enabled={active}
+          canWrite={canWrite}
+          onClose={close}
+          onSaved={refresh}
+        />
+      ) : null}
+    </View>
+  );
+}
+
+function ConflictRow({
+  path,
+  status,
+  canOpenEditor,
+  onOpen,
+}: {
+  path: string;
+  status: string;
+  canOpenEditor: boolean;
+  onOpen: (path: string) => void;
+}) {
+  const copy = useGitP2Copy();
+  const open = useCallback(() => onOpen(path), [onOpen, path]);
+  return (
+    <View style={styles.actions}>
+      <Text style={styles.text}>
+        {path} · {status}
+      </Text>
+      {canOpenEditor ? (
+        <Button size="sm" variant="outline" testID={`git-open-merge:${path}`} onPress={open}>
+          {copy.openMerge}
+        </Button>
       ) : null}
     </View>
   );

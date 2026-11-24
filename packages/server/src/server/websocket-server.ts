@@ -220,15 +220,38 @@ interface WebSocketConnectionIdentity {
   appVersion?: string;
 }
 
-interface WebSocketServerConfig {
+export interface ServerFeatureOverrides {
+  daemonStatusRpc?: boolean;
+  relayConfig?: boolean;
+  topicWorkbenchV1?: boolean;
+  workspaceDurableItemsV1?: boolean;
+  checkoutGitStagingV1?: boolean;
+  checkoutGitGraphV1?: boolean;
+  checkoutGitRebaseV1?: boolean;
+  checkoutGitMultiRepoV1?: boolean;
+  checkoutGitP2V1?: boolean;
+}
+
+interface WebSocketServerConfig extends Pick<
+  ServerFeatureOverrides,
+  "daemonStatusRpc" | "relayConfig"
+> {
   allowedOrigins?: Set<string>;
   hostnames?: HostnamesConfig;
   getAllowedOrigins?: () => Set<string>;
   getHostnames?: () => HostnamesConfig | undefined;
-  daemonStatusRpc?: boolean;
-  relayConfig?: boolean;
+  serverFeatureOverrides?: ServerFeatureOverrides;
   startPaused?: boolean;
   messageReceipts?: MessageReceipts;
+}
+
+function resolveServerFeatureOverrides(wsConfig: WebSocketServerConfig): ServerFeatureOverrides {
+  const overrides = wsConfig.serverFeatureOverrides;
+  return {
+    ...overrides,
+    daemonStatusRpc: overrides?.daemonStatusRpc ?? wsConfig.daemonStatusRpc,
+    relayConfig: overrides?.relayConfig ?? wsConfig.relayConfig,
+  };
 }
 
 function resolveAgentMessageReceiptStores(paseoHome: string, messages?: MessageReceipts) {
@@ -743,8 +766,7 @@ export class VoiceAssistantWebSocketServer {
   private readonly browserToolsBroker: BrowserToolsBroker | null;
   private readonly hubRelationships: HubRelationshipManagement | null;
   private connectionLifecycle: "starting" | "accepting" | "stopping" = "accepting";
-  private readonly advertiseDaemonStatusRpc: boolean;
-  private readonly advertiseRelayConfig: boolean;
+  private readonly featureOverrides: ServerFeatureOverrides;
   private readonly directorySync = new DirectorySyncService();
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
   private readonly orchestrationSkills: SessionOptions["orchestrationSkills"];
@@ -820,8 +842,7 @@ export class VoiceAssistantWebSocketServer {
     this.logger = logger.child({ module: "websocket-server" });
     this.workspaceSetupRuntime = workspaceSetupRuntime;
     this.workspaceArchiveOperations = resolveWorkspaceArchiveOperations(workspaceArchiveOperations);
-    this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
-    this.advertiseRelayConfig = wsConfig.relayConfig !== false;
+    this.featureOverrides = resolveServerFeatureOverrides(wsConfig);
     this.connectionLifecycle = wsConfig.startPaused === true ? "starting" : "accepting";
     this.serverId = serverId;
     if (typeof daemonVersion !== "string" || daemonVersion.trim().length === 0) {
@@ -2392,16 +2413,26 @@ export class VoiceAssistantWebSocketServer {
         workspaceMainAgentDefault: true,
         agentCreateAsMain: true,
         // COMPAT(topicWorkbenchV1): added in v0.18.0, remove after 2027-06-01.
-        topicWorkbenchV1: true,
+        ...(this.featureOverrides.topicWorkbenchV1 !== false ? { topicWorkbenchV1: true } : {}),
         // COMPAT(workspaceDurableItemsV1): added in v0.18.0, remove after 2027-06-01.
-        workspaceDurableItemsV1: true,
-        checkoutGitStagingV1: true,
+        ...(this.featureOverrides.workspaceDurableItemsV1 !== false
+          ? { workspaceDurableItemsV1: true }
+          : {}),
+        ...(this.featureOverrides.checkoutGitStagingV1 !== false
+          ? { checkoutGitStagingV1: true }
+          : {}),
         // COMPAT(checkoutGitGraphV1): added in v0.18.0, remove gate after 2027-06-01.
-        checkoutGitGraphV1: true,
+        ...(this.featureOverrides.checkoutGitGraphV1 !== false ? { checkoutGitGraphV1: true } : {}),
         // COMPAT(checkoutGitRebaseV1): added in v0.18.0, remove gate after 2027-06-01.
-        checkoutGitRebaseV1: true,
+        ...(this.featureOverrides.checkoutGitRebaseV1 !== false
+          ? { checkoutGitRebaseV1: true }
+          : {}),
         // COMPAT(checkoutGitMultiRepoV1): added in v0.18.0, remove gate after 2027-06-01.
-        checkoutGitMultiRepoV1: true,
+        ...(this.featureOverrides.checkoutGitMultiRepoV1 !== false
+          ? { checkoutGitMultiRepoV1: true }
+          : {}),
+        // COMPAT(checkoutGitP2V1): added in v0.18.0, remove gate after 2027-06-01.
+        ...(this.featureOverrides.checkoutGitP2V1 !== false ? { checkoutGitP2V1: true } : {}),
         agentSideChat: true,
         workspaceAgentsSummary: true,
         agentHistoryWorkspaceFilter: true,
@@ -2465,13 +2496,13 @@ export class VoiceAssistantWebSocketServer {
         // is >= v0.2.0.
         forgeSearch: true,
         // COMPAT(daemonStatusRpc): added in v0.1.76, remove gate after 2026-11-18.
-        ...(this.advertiseDaemonStatusRpc ? { daemonStatusRpc: true } : {}),
+        ...(this.featureOverrides.daemonStatusRpc !== false ? { daemonStatusRpc: true } : {}),
         // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
         daemonConfigReload: true,
         // COMPAT(speechSettings): added in v0.12.0, remove gate after 2027-04-18.
         speechSettings: true,
         // COMPAT(relayConfig): added in v0.2.6, remove gate after 2027-01-31.
-        ...(this.advertiseRelayConfig ? { relayConfig: true } : {}),
+        ...(this.featureOverrides.relayConfig !== false ? { relayConfig: true } : {}),
         // COMPAT(pushTokenRevocation): added in v0.3.2, remove gate after 2027-02-10.
         pushTokenRevocation: true,
         // COMPAT(plugins): added in v0.3.0, remove gate after 2027-08-07.

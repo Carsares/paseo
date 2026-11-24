@@ -513,3 +513,28 @@ it("waits on a sibling's repository lock before checking the expected HEAD", asy
   });
   expect(listRefs()).toEqual(["refs/heads/linked:" + initial, "refs/heads/main:" + next]);
 });
+
+it("requires the reviewed branch SHA before force deleting its full reference", async () => {
+  const tip = await createUnmerged();
+  const ref = "refs/heads/topic";
+  git(root, "update-ref", ref, initial, tip);
+
+  expect(
+    await request({ action: "delete", name: ref, force: true, expectedRefSha: tip }),
+  ).toMatchObject({
+    success: false,
+    errorCode: "STALE_HEAD_CONFLICT",
+  });
+  expect(
+    await request({ action: "delete", name: "topic", force: true, expectedRefSha: initial }),
+  ).toMatchObject({
+    success: false,
+  });
+  expect(listRefs()).toContain(ref + ":" + initial);
+  expect(
+    await request({ action: "delete", name: ref, force: true, expectedRefSha: initial }),
+  ).toMatchObject({
+    success: true,
+  });
+  expect(listRefs()).not.toContain(ref + ":" + initial);
+});
