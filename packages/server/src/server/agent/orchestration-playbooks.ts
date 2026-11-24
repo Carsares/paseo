@@ -74,7 +74,7 @@ export function resolveLeadPlaybookInput(
 export function buildMainControlPlaybookGuidance(): string[] {
   return [
     "When asked for overall workspace or multi-task progress, combine list_workspace_tasks and summarize_workspace_agents directly to report active Level-1 tasks, completed outcomes, and pending blocking decisions without spawning a subagent or reading raw Level-2 transcripts.",
-    'For multi-track implementation or layered code review, spawn a fresh Level-1 lead via create_agent with playbook: "batch_implement" (approved multi-module implementation), "cr_fix_loop" (iterative review-and-fix loop), or "readonly_cr" (single-round layered read-only review with independent arbitration). Keep commitPolicy: "none" unless the user explicitly authorized local commits in the current request ("scoped_only").',
+    'For approved multi-module implementation when a non-resident direct Level-1 planning lead already owns the task, continue that lead via send_agent_prompt to decompose Level-2 implementation and independent blind-review tracks; when no suitable Level-1 lead exists yet (or for layered code review), call create_agent with playbook: "batch_implement", "cr_fix_loop", or "readonly_cr". Keep commitPolicy: "none" unless the user explicitly authorized local commits in the current request ("scoped_only").',
   ];
 }
 

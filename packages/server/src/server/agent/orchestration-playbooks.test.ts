@@ -97,6 +97,7 @@ describe("orchestration playbook contracts", () => {
     const guidance = buildMainControlPlaybookGuidance().join("\n");
     expect(guidance).toContain("list_workspace_tasks");
     expect(guidance).toContain("summarize_workspace_agents");
+    expect(guidance).toContain("continue that lead via send_agent_prompt");
     expect(guidance).toContain('"batch_implement"');
     expect(guidance).toContain('"cr_fix_loop"');
     expect(guidance).toContain('"readonly_cr"');
