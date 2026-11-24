@@ -14,6 +14,7 @@ import type { AgentClient, AgentProvider } from "../agent/agent-sdk-types.js";
 import { createTestAgentClients } from "./fake-agent-client.js";
 import type { PushNotificationSender } from "../push/index.js";
 import type { AgentProfile } from "@getpaseo/protocol/messages";
+import type { ServerFeatureOverrides } from "../websocket-server.js";
 
 interface TestPaseoDaemonOptions {
   daemonVersion?: string;
@@ -33,6 +34,7 @@ interface TestPaseoDaemonOptions {
   relayRequireProtectedSecurity?: boolean;
   daemonStatusRpcCapability?: boolean;
   relayConfigCapability?: boolean;
+  serverFeatureOverrides?: ServerFeatureOverrides;
   agentClients?: Partial<Record<AgentProvider, AgentClient>>;
   providerOverrides?: PaseoDaemonConfig["providerOverrides"];
   paseoHomeRoot?: string;
@@ -111,8 +113,10 @@ export async function createTestPaseoDaemon(
     const daemon = await createPaseoDaemon(config, logger, {
       builtinPlugins: options.builtinPlugins ?? new BuiltinPluginLoader(undefined, []),
       serverFeatureOverrides: {
-        daemonStatusRpc: options.daemonStatusRpcCapability,
-        relayConfig: options.relayConfigCapability,
+        ...options.serverFeatureOverrides,
+        daemonStatusRpc:
+          options.daemonStatusRpcCapability ?? options.serverFeatureOverrides?.daemonStatusRpc,
+        relayConfig: options.relayConfigCapability ?? options.serverFeatureOverrides?.relayConfig,
       },
     });
     try {

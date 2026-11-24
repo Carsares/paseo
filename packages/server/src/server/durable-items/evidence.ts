@@ -91,13 +91,15 @@ export async function captureDurableItemEvidence(
     const repoRoot =
       target.type === "git" ? await realpath(resolve(workspaceCwd, target.repoRoot)) : undefined;
     const path = await realpath(resolve(repoRoot ?? workspaceCwd, target.path));
-    if (!isWithin(workspaceRoot, path)) throw new DurableItemEvidenceError();
+    if (!isWithin(workspaceRoot, path) || (repoRoot && !isWithin(repoRoot, path))) {
+      throw new DurableItemEvidenceError();
+    }
     const workspacePath = relative(workspaceRoot, path).split(sep).join("/");
     if (!repoRoot)
       return { type: "file", path: workspacePath, fingerprint: await fileFingerprint(path) };
 
     const reportedRoot = (await gitRead(repoRoot, ["rev-parse", "--show-toplevel"])).trimEnd();
-    if (!isWithin(repoRoot, path) || !reportedRoot || (await realpath(reportedRoot)) !== repoRoot) {
+    if (!reportedRoot || (await realpath(reportedRoot)) !== repoRoot) {
       throw new DurableItemEvidenceError();
     }
     const gitPath = relative(repoRoot, path).split(sep).join("/");

@@ -142,6 +142,7 @@ import {
   isDaemonOriginAllowed,
   type ServerFeatureOverrides,
 } from "./websocket-server.js";
+import { openDurableItemStore } from "./durable-items/requests.js";
 import { AgentRequestOutcomeUnknownError, MessageReceipts } from "./message-receipts/index.js";
 import {
   enqueueRecoverableAgentMessage,
@@ -1759,10 +1760,23 @@ export async function createPaseoDaemon(
     await Promise.race([admitted, settled]);
     return message.messageId;
   };
+  function openAgentDurableItems(registry: FileBackedWorkspaceRegistry) {
+    const features = dependencies.serverFeatureOverrides;
+    if (features?.topicWorkbenchV1 === false || features?.workspaceDurableItemsV1 === false)
+      return undefined;
+    return openDurableItemStore({
+      paseoHome: config.paseoHome,
+      serverId,
+      workspaceRegistry: registry,
+      agentStorage,
+    });
+  }
+  const durableItems = openAgentDurableItems(workspaceRegistry);
   const createAgentToolHostDependencies = (
     runtime: PaseoToolRuntimeContext,
   ): PaseoToolHostDependencies => ({
     changeRequestWatches,
+    durableItems,
     finishSubscriptions: () => finishSubscriptions,
     queueAgentPrompt,
     async queueAgentPromptAndWaitForDispatch(agentId, request, validateDispatch) {

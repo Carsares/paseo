@@ -29,6 +29,7 @@ import { scheduleOnRN, scheduleOnUI } from "react-native-worklets";
 import { resolveDesktopSidebarWidth } from "@/components/desktop-sidebar-layout";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative } from "@/constants/platform";
+import { ActiveWorkspaceSheetProvider } from "@/screens/workspace/sheet-pane/active-workspace";
 import {
   usePanelStore,
   type MobilePanelSelection,
@@ -287,8 +288,24 @@ export function MobilePanelsProvider({ children }: { children: ReactNode }) {
 
   return (
     <MobilePanelsContext.Provider value={value}>
-      <SettledPanelContext.Provider value={settledPanel}>{children}</SettledPanelContext.Provider>
+      <SettledPanelContext.Provider value={settledPanel}>
+        <ActiveWorkspaceSheetProvider>{children}</ActiveWorkspaceSheetProvider>
+      </SettledPanelContext.Provider>
     </MobilePanelsContext.Provider>
+  );
+}
+
+/** Carries the existing gesture owners to compact surfaces rendered at the app portal. */
+export function useMobilePanelsBridge() {
+  const runtime = useContext(MobilePanelsContext);
+  const settled = useContext(SettledPanelContext);
+  return useCallback(
+    (children: ReactNode) => (
+      <MobilePanelsContext.Provider value={runtime}>
+        <SettledPanelContext.Provider value={settled}>{children}</SettledPanelContext.Provider>
+      </MobilePanelsContext.Provider>
+    ),
+    [runtime, settled],
   );
 }
 

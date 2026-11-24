@@ -32,6 +32,8 @@ import {
   TopicQuestionResume,
   useTopicWorkspace,
 } from "@/panels/topic-empty-state";
+import { WorkspaceTopicUpgradeDialog } from "@/workspace/upgrade-to-topic/dialog";
+import { canOfferTopicUpgrade } from "@/workspace/upgrade-to-topic/model";
 import { SheetHostScope } from "@/components/ui/isolated-bottom-sheet-modal";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { getOpenAgentTabLabel, isMainControlAgent } from "@getpaseo/protocol/agent-labels";
@@ -241,6 +243,7 @@ import {
   hasDestructiveBulkCloseTabs,
 } from "@/screens/workspace/workspace-bulk-close";
 import {
+  CompactWorkspaceRebaseConflictAction,
   createGitGraphNavigationIntentStore,
   GitGraphNavigationIntentProvider,
   TopicHeaderBar,
@@ -546,6 +549,7 @@ interface WorkspaceHeaderTitleBarProps {
   onCopyWorkspacePath: () => void;
   onCopyBranchName: () => void;
   onOpenSetupTab: () => void;
+  onUpgradeToTopic?: () => void;
 }
 
 function WorkspaceHeaderTitleBar({
@@ -562,6 +566,7 @@ function WorkspaceHeaderTitleBar({
   onCopyWorkspacePath,
   onCopyBranchName,
   onOpenSetupTab,
+  onUpgradeToTopic,
 }: WorkspaceHeaderTitleBarProps) {
   const actionsInBar = resolveWorkspaceActionPlacement(useWindowLayout()) === "vertical-bar";
   return (
@@ -591,6 +596,7 @@ function WorkspaceHeaderTitleBar({
             onCopyWorkspacePath={onCopyWorkspacePath}
             onCopyBranchName={onCopyBranchName}
             onOpenSetupTab={onOpenSetupTab}
+            onUpgradeToTopic={onUpgradeToTopic}
           />
         </View>
       )}
@@ -856,6 +862,59 @@ function useWorkspaceTeamDirectoryActions(input: {
   };
 }
 
+function useWorkspaceTopicUpgrade({
+  client,
+  isConnected,
+  isRouteFocused,
+  serverId,
+  workspaceId,
+  cachedWorkspace,
+  hostWorkspace,
+  supportsTopic,
+}: Parameters<typeof canOfferTopicUpgrade>[0] & {
+  client: ReturnType<typeof useHostRuntimeClient>;
+  isRouteFocused: boolean;
+  serverId: string;
+  workspaceId: string;
+}) {
+  const queryClient = useQueryClient();
+  const scopeKey = JSON.stringify([serverId, workspaceId]);
+  const [openScope, setOpenScope] = useState<string | null>(null);
+  const open = useCallback(() => setOpenScope(scopeKey), [scopeKey]);
+  const close = useCallback(() => {
+    setOpenScope((current) => (current === scopeKey ? null : current));
+  }, [scopeKey]);
+  const onUpgraded = useCallback(() => {
+    close();
+    void queryClient.invalidateQueries({
+      queryKey: ["topic-empty-workspace", serverId, workspaceId],
+      exact: true,
+    });
+  }, [close, queryClient, serverId, workspaceId]);
+  useEffect(() => {
+    setOpenScope((current) => (isRouteFocused && current === scopeKey ? current : null));
+  }, [isRouteFocused, scopeKey]);
+  const canOpen = canOfferTopicUpgrade({
+    cachedWorkspace,
+    hostWorkspace,
+    isConnected,
+    supportsTopic,
+  });
+  return {
+    onUpgradeToTopic: canOpen && client && isRouteFocused ? open : undefined,
+    dialog:
+      isRouteFocused && openScope === scopeKey ? (
+        <WorkspaceTopicUpgradeDialog
+          key={scopeKey}
+          client={isConnected ? client : null}
+          workspaceId={workspaceId}
+          onClose={close}
+          onUpgraded={onUpgraded}
+        />
+      ) : null,
+  };
+}
+
 function WorkspaceTopicHeaderSlot({
   enabled,
   topicWorkspace,
@@ -987,6 +1046,54 @@ function WorkspaceDesktopBody({
         </TopicEmptyContentContext>
       </View>
     </View>
+  );
+}
+
+function CompactWorkspaceTeamDirectory({
+  close,
+  onOpenAgent,
+  onOpenAgentBeside,
+  onOpenProviderSubrun,
+  onAskFirstQuestion,
+  ...directory
+}: Omit<Parameters<typeof WorkspaceTeamDirectory>[0], "inSheet" | "onHide" | "overlay"> & {
+  close: () => void;
+}) {
+  const openAgent = useCallback(
+    (node: TeamDirectoryMemberNode) => {
+      close();
+      onOpenAgent(node);
+    },
+    [close, onOpenAgent],
+  );
+  const openAgentBeside = useCallback(
+    (address: AgentAddress) => {
+      close();
+      onOpenAgentBeside(address);
+    },
+    [close, onOpenAgentBeside],
+  );
+  const openProviderSubrun = useCallback(
+    (parentAgentId: string, subagentId: string) => {
+      close();
+      onOpenProviderSubrun(parentAgentId, subagentId);
+    },
+    [close, onOpenProviderSubrun],
+  );
+  const askFirstQuestion = useCallback(() => {
+    close();
+    onAskFirstQuestion?.();
+  }, [close, onAskFirstQuestion]);
+  return (
+    <WorkspaceTeamDirectory
+      {...directory}
+      inSheet
+      onHide={close}
+      onOpenAgent={openAgent}
+      onOpenAgentBeside={openAgentBeside}
+      onOpenProviderSubrun={openProviderSubrun}
+      onAskFirstQuestion={onAskFirstQuestion ? askFirstQuestion : undefined}
+    />
   );
 }
 
@@ -1900,6 +2007,17 @@ function WorkspaceScreenContent({
     isMobile,
     mainAgentId,
     desktopFocusModeEnabled,
+  });
+  const supportsTopicWorkbench = useHostFeature(normalizedServerId, "topicWorkbenchV1");
+  const { onUpgradeToTopic, dialog: topicUpgradeDialog } = useWorkspaceTopicUpgrade({
+    client,
+    isRouteFocused,
+    serverId: normalizedServerId,
+    workspaceId: normalizedWorkspaceId,
+    cachedWorkspace: workspaceDescriptor,
+    hostWorkspace: topicWorkspace,
+    isConnected,
+    supportsTopic: supportsTopicWorkbench,
   });
   const { preferences: codingPreferences } = useFormPreferences();
   const resolveNewAgentTabSetup = useCallback(() => {
@@ -4227,6 +4345,7 @@ function WorkspaceScreenContent({
                   onCopyWorkspacePath={handleCopyWorkspacePath}
                   onCopyBranchName={handleCopyBranchName}
                   onOpenSetupTab={handleOpenSetupTab}
+                  onUpgradeToTopic={onUpgradeToTopic}
                 />
               </>
             }
@@ -4275,6 +4394,7 @@ function WorkspaceScreenContent({
       isWorkspaceHeaderSubtitleDistinct,
       normalizedServerId,
       normalizedWorkspaceId,
+      onUpgradeToTopic,
       openImportSheet,
       showScreenHeader,
       showWorkspaceSetup,
@@ -4349,6 +4469,55 @@ function WorkspaceScreenContent({
       handleCloseTabById,
     ],
   );
+  const compactTeamDirectory = useMemo(() => {
+    if (!isTopicWorkspace && !mainAgentId) return undefined;
+    return (close: () => void) => (
+      <CompactWorkspaceTeamDirectory
+        close={close}
+        serverId={normalizedServerId}
+        workspaceId={normalizedWorkspaceId}
+        mainAgentId={mainAgentId}
+        isTopicWorkspace={isTopicWorkspace}
+        focusedAgentId={focusedPaneAgentId}
+        focusedProviderSubagentId={focusedProviderSubagentId}
+        onOpenAgent={handleOpenDirectoryAgent}
+        onOpenAgentBeside={handleOpenDirectoryAgentBeside}
+        onOpenProviderSubrun={handleOpenProviderSubrun}
+        onAskFirstQuestion={isTopicWorkspace ? askFirstTopicQuestion : undefined}
+      />
+    );
+  }, [
+    askFirstTopicQuestion,
+    focusedPaneAgentId,
+    focusedProviderSubagentId,
+    handleOpenDirectoryAgent,
+    handleOpenDirectoryAgentBeside,
+    handleOpenProviderSubrun,
+    isTopicWorkspace,
+    mainAgentId,
+    normalizedServerId,
+    normalizedWorkspaceId,
+  ]);
+  const compactConflictAction = useMemo(
+    () => (
+      <CompactWorkspaceRebaseConflictAction
+        serverId={normalizedServerId}
+        client={client}
+        isConnected={isConnected}
+        isRouteFocused={isRouteFocused}
+        workspaceDirectory={workspaceDirectory}
+        onOpenGitGraph={handleOpenGitGraph}
+      />
+    ),
+    [
+      client,
+      handleOpenGitGraph,
+      isConnected,
+      isRouteFocused,
+      normalizedServerId,
+      workspaceDirectory,
+    ],
+  );
   // Without a pane's tabs (above a split) the header carries workspace controls only: split panes
   // keep their tab rails.
   const renderCompactWorkspaceHeader = useCallback(
@@ -4367,6 +4536,8 @@ function WorkspaceScreenContent({
           subtitle={workspaceHeaderSubtitle}
           isSubtitleDistinct={isWorkspaceHeaderSubtitleDistinct}
           serverId={normalizedServerId}
+          compactTeamDirectory={compactTeamDirectory}
+          compactConflictAction={compactConflictAction}
         >
           <WorkspaceHeaderMenuMobile
             pane={paneTabs?.actions.pane}
@@ -4386,6 +4557,7 @@ function WorkspaceScreenContent({
             onCopyWorkspacePath={handleCopyWorkspacePath}
             onCopyBranchName={handleCopyBranchName}
             onOpenSetupTab={handleOpenSetupTab}
+            onUpgradeToTopic={onUpgradeToTopic}
           />
         </CompactWorkspaceHeader>
       );
@@ -4398,6 +4570,8 @@ function WorkspaceScreenContent({
       toggleFocusMode,
       canOpenImportSheet,
       compactHeaderScripts,
+      compactTeamDirectory,
+      compactConflictAction,
       createTerminalDisabled,
       currentBranchName,
       handleCopyBranchName,
@@ -4411,6 +4585,7 @@ function WorkspaceScreenContent({
       isWorkspaceHeaderSubtitleDistinct,
       normalizedServerId,
       normalizedWorkspaceId,
+      onUpgradeToTopic,
       openImportSheet,
       showCreateBrowserTab,
       showWorkspaceSetup,
@@ -4541,9 +4716,8 @@ function WorkspaceScreenContent({
     activeTab: activeTabDescriptor,
     composerFullscreen: useComposerTabFullscreen(workspacePanelKey, activeTabId),
   });
-  const supportsTopicRecovery = useHostFeature(normalizedServerId, "topicWorkbenchV1");
   const canResumeTopicQuestion = [
-    supportsTopicRecovery,
+    supportsTopicWorkbench,
     isRouteFocused,
     hasHydratedWorkspaceLayoutStore,
     persistenceKey,
@@ -4815,25 +4989,27 @@ function WorkspaceScreenContent({
     </RenderProfile>
   );
 
-  if (gatedWorkspaceScreen) {
-    return gatedWorkspaceScreen;
-  }
   return (
-    <WorkspaceShellProviders
-      persistenceKey={persistenceKey}
-      sheetPaneHost={sheetPaneHost}
-      mainTabContext={mainTabContext}
-      teamDirectoryShellValue={teamDirectoryShellValue}
-      gitGraphIntentStore={gitGraphIntentStore}
-      workspaceDescriptor={workspaceDescriptor}
-      client={client}
-      serverId={normalizedServerId}
-      workspaceDirectory={workspaceDirectory}
-      openMarkdownPath={openMarkdownPath}
-      toast={toast}
-    >
-      {renderedWorkspaceScreen}
-    </WorkspaceShellProviders>
+    <>
+      {gatedWorkspaceScreen ?? (
+        <WorkspaceShellProviders
+          persistenceKey={persistenceKey}
+          sheetPaneHost={sheetPaneHost}
+          mainTabContext={mainTabContext}
+          teamDirectoryShellValue={teamDirectoryShellValue}
+          gitGraphIntentStore={gitGraphIntentStore}
+          workspaceDescriptor={workspaceDescriptor}
+          client={client}
+          serverId={normalizedServerId}
+          workspaceDirectory={workspaceDirectory}
+          openMarkdownPath={openMarkdownPath}
+          toast={toast}
+        >
+          {renderedWorkspaceScreen}
+        </WorkspaceShellProviders>
+      )}
+      {topicUpgradeDialog}
+    </>
   );
 }
 

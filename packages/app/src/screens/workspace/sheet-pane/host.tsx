@@ -5,12 +5,18 @@ import { useAssistantFileLinkEnvironmentBridge } from "@/assistant-file-links";
 import { useForgeShorthandBridge } from "@/git/forge-shorthand";
 import { useComposerEditingEnvironmentBridge } from "@/composer/editing-session";
 import { RetainedPanelActivity, useRetainedPanelActive } from "@/components/retained-panel";
+import { useMobilePanelsBridge } from "@/mobile-panels/provider";
 import type { ContextBridge } from "@/components/ui/isolated-bottom-sheet-modal";
 import { useDiffDocumentWorkspaceCacheBridge } from "@/git/diff-document/workspace-cache";
 import { HostRouteProvider, useHostRouteServerId } from "@/navigation/host-route-context";
 import type { WorkspacePaneContentModel } from "@/screens/workspace/workspace-pane-content";
 import type { WorkspaceTabDescriptor } from "@/screens/workspace/workspace-tabs-types";
 import { useResidentDialogBridge } from "@/subagents/resident-dialog";
+import {
+  WorkspaceSheetStackBridge,
+  WorkspaceSheetStackProvider,
+  useWorkspaceSheetPages,
+} from "./stack-provider";
 
 /** What a sheet pane needs from the workspace it shows a tab of. */
 export interface SheetPaneHost {
@@ -35,7 +41,13 @@ export function SheetPaneHostProvider({
   value: SheetPaneHost | null;
   children: ReactNode;
 }) {
-  return <SheetPaneHostContext.Provider value={value}>{children}</SheetPaneHostContext.Provider>;
+  return (
+    <SheetPaneHostContext.Provider value={value}>
+      <WorkspaceSheetStackProvider workspaceKey={value?.workspaceKey ?? null}>
+        {children}
+      </WorkspaceSheetStackProvider>
+    </SheetPaneHostContext.Provider>
+  );
 }
 
 /** The host of the workspace the caller is in, or null while there is none. */
@@ -55,6 +67,8 @@ export function useSheetPaneHost(): SheetPaneHost {
  */
 export function useSheetPaneBridge(): ContextBridge {
   const host = useSheetPaneHost();
+  const stack = useWorkspaceSheetPages();
+  const mobilePanels = useMobilePanelsBridge();
   const editing = useComposerEditingEnvironmentBridge();
   const cache = useDiffDocumentWorkspaceCacheBridge();
   const files = useAssistantFileLinkEnvironmentBridge();
@@ -66,25 +80,29 @@ export function useSheetPaneBridge(): ContextBridge {
   const route = useContext(NavigationRouteContext);
   return useCallback(
     (children) => {
-      const content = editing(cache(files(forgeShorthand(residentDialog(children)))));
+      const content = mobilePanels(editing(cache(files(forgeShorthand(residentDialog(children))))));
       return (
         <SheetPaneHostContext.Provider value={host}>
-          <NavigationContext.Provider value={navigation}>
-            <NavigationRouteContext.Provider value={route}>
-              <RetainedPanelActivity active={active}>
-                {serverId ? (
-                  <HostRouteProvider serverId={serverId}>{content}</HostRouteProvider>
-                ) : (
-                  content
-                )}
-              </RetainedPanelActivity>
-            </NavigationRouteContext.Provider>
-          </NavigationContext.Provider>
+          <WorkspaceSheetStackBridge value={stack}>
+            <NavigationContext.Provider value={navigation}>
+              <NavigationRouteContext.Provider value={route}>
+                <RetainedPanelActivity active={active}>
+                  {serverId ? (
+                    <HostRouteProvider serverId={serverId}>{content}</HostRouteProvider>
+                  ) : (
+                    content
+                  )}
+                </RetainedPanelActivity>
+              </NavigationRouteContext.Provider>
+            </NavigationContext.Provider>
+          </WorkspaceSheetStackBridge>
         </SheetPaneHostContext.Provider>
       );
     },
     [
       host,
+      stack,
+      mobilePanels,
       editing,
       cache,
       files,

@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { CheckoutGitConflictFile, CheckoutGitRepo } from "@getpaseo/protocol/messages";
 import { GraphSheet } from "../graph/sheet";
+import { useIsCompactFormFactor } from "@/constants/layout";
 import { Button } from "@/components/ui/button";
 import { SelectField } from "@/components/ui/select-field";
 import { createQuoteAttachment } from "@/attachments/quote";
@@ -13,6 +14,10 @@ import { createMessageSubmissionWriter } from "@/composer/submission/writer";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { confirmDialog } from "@/utils/confirm-dialog";
 import { usePaneContext } from "@/panels/pane-context";
+import {
+  useIsWorkspaceSheetPageOnTop,
+  useWorkspaceSheetPages,
+} from "@/screens/workspace/sheet-pane/stack-context";
 import { useGraphRecipients } from "../graph/recipients";
 import { errorMessage, GraphMessage, styles } from "../graph/ui";
 import { buildConflictQuote } from "./delegation";
@@ -26,11 +31,15 @@ type Act = Parameters<DaemonClient["checkoutGitRebaseAct"]>[0]["action"];
 const conflictChoices = ["ours", "theirs", "both"] as const;
 const sides = ["base", "ours", "theirs"] as const;
 
+export function conflictWorkspacePageKey(tabId: string, repoRoot: string) {
+  return JSON.stringify(["git-conflicts", tabId, repoRoot]);
+}
+
 export function ConflictSheet({
   cwd,
   client,
   repo,
-  enabled,
+  enabled: ownerEnabled,
   snapshot,
   workingTree,
   onClose,
@@ -48,7 +57,13 @@ export function ConflictSheet({
   onChangedWhileHidden: () => void;
 }) {
   const { t } = useTranslation();
-  const { serverId } = usePaneContext();
+  const { serverId, tabId } = usePaneContext();
+  const compact = useIsCompactFormFactor();
+  const sheetStack = useWorkspaceSheetPages();
+  const compactSheet = compact && !!sheetStack;
+  const workspacePageKey = conflictWorkspacePageKey(tabId, repo.repoRoot);
+  const onTop = useIsWorkspaceSheetPageOnTop(compactSheet ? workspacePageKey : undefined);
+  const enabled = ownerEnabled && (!compactSheet || onTop);
   const target = { cwd, targetRepoRoot: repo.repoRoot };
   const [path, setPath] = useState<string | null>(null);
   const [recipientId, setRecipientId] = useState<string | null>(null);
@@ -198,8 +213,9 @@ export function ConflictSheet({
     });
   }
 
+  const canClose = useStableEvent(() => !pending.current);
   const close = useStableEvent(() => {
-    if (!pending.current) onClose();
+    if (canClose()) onClose();
   });
   const refreshFiles = useStableEvent(() => void run(refresh));
   const abort = useStableEvent(() => void act("abort"));
@@ -236,6 +252,8 @@ export function ConflictSheet({
   return (
     <GraphSheet
       visible
+      workspacePageKey={workspacePageKey}
+      canClose={canClose}
       header={header}
       testID="git-rebase-conflicts"
       onClose={close}

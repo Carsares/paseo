@@ -66,21 +66,21 @@ export interface TopicHeaderModel {
 export async function fetchAllPendingDurableItemCount(
   client: Pick<DaemonClient, "listWorkspaceDurableItems">,
   workspaceId: string,
-  signal?: AbortSignal,
+  signal?: Pick<AbortSignal, "aborted">,
 ): Promise<number> {
   const seenItemIds = new Set<string>();
   const seenCursors = new Set<string>();
   let cursor: string | undefined;
 
   while (true) {
-    signal?.throwIfAborted();
+    checkPendingCountAborted(signal);
     const result = await client.listWorkspaceDurableItems({
       workspaceId,
       statusFilter: "pending",
       limit: DURABLE_ITEMS_PAGE_SIZE,
       ...(cursor ? { cursor } : {}),
     });
-    signal?.throwIfAborted();
+    checkPendingCountAborted(signal);
     if (result.error) {
       throw new Error(result.error);
     }
@@ -98,6 +98,14 @@ export async function fetchAllPendingDurableItemCount(
   return seenItemIds.size;
 }
 
+function checkPendingCountAborted(signal?: Pick<AbortSignal, "aborted">) {
+  if (signal?.aborted) {
+    const error = new Error("Pending durable item count was cancelled");
+    error.name = "AbortError";
+    throw error;
+  }
+}
+
 function directoryBasename(path: string | null | undefined): string {
   if (!path) return "";
   const normalized = path.replace(/[\\/]+$/, "");
@@ -105,7 +113,7 @@ function directoryBasename(path: string | null | undefined): string {
   return segments[segments.length - 1] ?? normalized;
 }
 
-function deriveTopicHeaderGitStatus(input: {
+export function deriveTopicHeaderGitStatus(input: {
   workspaceDirectory: string | null;
   isGitCheckout: boolean;
   currentBranchName: string | null;

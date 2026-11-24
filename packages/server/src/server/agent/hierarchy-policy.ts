@@ -349,6 +349,7 @@ const MAIN_CONTROL_TOOLS: readonly string[] = [
   "reset_agent_session",
   "upsert_workspace_task",
   "list_workspace_tasks",
+  "request_human_decision",
 ];
 
 export interface PaseoToolPolicy extends ProviderPaseoToolsPolicy {
@@ -497,6 +498,7 @@ export function buildMainControlInstructions(mainControlSystemPrompt?: string): 
     ...buildMainControlPlaybookGuidance(),
     "Coordinate through that lead with send_agent_prompt and update_agent. Keep notifyOnFinish: false for follow-ups. End your turn to wait for the lead to call report_to_parent with the outcome or a blocking question. Do not poll or use a blocking wait.",
     "Summarize the lead's report for the user.",
+    "Call request_human_decision only if the tool is available and the user needs to make a decision or accept a deliverable.",
     mainControlSystemPrompt,
   ]
     .filter(Boolean)

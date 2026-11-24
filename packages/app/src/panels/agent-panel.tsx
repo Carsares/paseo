@@ -25,6 +25,7 @@ import { shallow, useShallow } from "zustand/shallow";
 import { useStoreWithEqualityFn } from "zustand/traditional";
 import { useAgentStreamTail } from "@/agent-stream/use-agent-stream-tail";
 import { AgentStreamView, type AgentStreamViewHandle } from "@/agent-stream/view";
+import { AgentDurableItems } from "@/durable-items/card";
 import { CHAT_COLUMN_RAIL_DATASET, ChatColumnRailSurface } from "@/chat-rail";
 import { ArchivedAgentCallout } from "@/components/archived-agent-callout";
 import { ComposerDock } from "@/composer/dock";
@@ -1390,6 +1391,12 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
           onOpenWorkspaceFile={onOpenWorkspaceFile}
         />
       </RenderProfile>
+      <AgentDurableItems
+        serverId={serverId}
+        workspaceId={workspaceId}
+        agentId={agentState.id}
+        isPaneFocused={isPaneFocused}
+      />
       {hasActiveComposer && !draft ? (
         <AgentTracks
           serverId={serverId}

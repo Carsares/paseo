@@ -1,9 +1,5 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import type {
-  CheckoutGitRepo,
-  WorkspaceDescriptorPayload,
-  WorkspaceTopic,
-} from "@getpaseo/protocol/messages";
+import type { WorkspaceDescriptorPayload, WorkspaceTopic } from "@getpaseo/protocol/messages";
 import {
   AlertTriangle,
   ChevronDown,
@@ -26,6 +22,11 @@ import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/status-bad
 import { useHostFeature } from "@/runtime/host-features";
 import type { TeamDirectorySummary } from "@/subagents/team-directory";
 import type { Theme } from "@/styles/theme";
+import {
+  EMPTY_REPOS,
+  getRebaseConflictLabel,
+  useTopicHeaderGitRepos,
+} from "./compact-rebase-conflict-action";
 import {
   deriveTopicHeaderModel,
   fetchAllPendingDurableItemCount,
@@ -52,18 +53,13 @@ const ALERT_TRIANGLE_ICON = <ThemedAlertTriangle size={12} />;
 const FOLDER_ICON = <ThemedFolder size={12} />;
 const USERS_ICON = <ThemedUsers size={12} />;
 
-const EMPTY_REPOS: CheckoutGitRepo[] = [];
-
 function resolveGitBadge(
   git: TopicHeaderGitStatus,
   t: TFunction,
 ): { label: string; variant: StatusBadgeVariant; leading: ReactNode } {
   if (git.kind === "rebase_conflict") {
     return {
-      label:
-        git.conflictCount > 1
-          ? t("topicWorkbench.header.gitRebaseConflictCount", { count: git.conflictCount })
-          : t("topicWorkbench.header.gitRebaseConflict"),
+      label: getRebaseConflictLabel(git.conflictCount, t),
       variant: "warning",
       leading: ALERT_TRIANGLE_ICON,
     };
@@ -263,26 +259,15 @@ export const TopicHeaderBar = memo(function TopicHeaderBar({
 
   // COMPAT(checkoutGitGraphV1): added in v0.18.0, remove after 2027-06-01 once daemon floor >= v0.18.0.
   const supportsGitGraph = useHostFeature(serverId, "checkoutGitGraphV1");
-  // COMPAT(checkoutGitMultiRepoV1): added in v0.18.0, remove after 2027-06-01 once daemon floor >= v0.18.0.
-  const supportsMultiRepo = useHostFeature(serverId, "checkoutGitMultiRepoV1");
   // COMPAT(workspaceDurableItemsV1): added in v0.18.0, remove after 2027-06-01 once daemon floor >= v0.18.0.
   const supportsDurableItems = useHostFeature(serverId, "workspaceDurableItemsV1");
 
-  // Read-only discovery for multi-repo branch & rebase conflict badge; zero AI or deferral wakeup.
-  const reposQuery = useFetchQuery({
-    queryKey: ["topic-header-git-repos", serverId, workspaceDirectory],
-    enabled: Boolean(
-      isRouteFocused && isConnected && client && workspaceDirectory && supportsMultiRepo,
-    ),
-    dataShape: "list",
-    staleTimeMs: 30_000,
-    retry: false,
-    queryFn: async () => {
-      if (!client || !workspaceDirectory) return EMPTY_REPOS;
-      const result = await client.checkoutGitReposDiscover({ cwd: workspaceDirectory });
-      if (result.error) throw new Error(result.error);
-      return result.repos ?? EMPTY_REPOS;
-    },
+  const { query: reposQuery } = useTopicHeaderGitRepos({
+    serverId,
+    client,
+    isConnected,
+    isRouteFocused,
+    workspaceDirectory,
   });
 
   // Paginate all pending durable items so counts >50 never truncate and errors stay visible.

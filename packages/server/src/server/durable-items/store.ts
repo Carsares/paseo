@@ -91,7 +91,7 @@ export class DurableItemStore {
     this.filePath = resolve(options.filePath);
   }
 
-  async create(input: CreateInput): Promise<WorkspaceDurableItem> {
+  async create(input: CreateInput, validateSource?: () => void): Promise<WorkspaceDurableItem> {
     this.assertLocalHost(input.serverId);
     const itemInput = CreateInputSchema.parse(input);
     const targets = structuredClone(input.evidence);
@@ -112,6 +112,7 @@ export class DurableItemStore {
       for (const target of targets) {
         evidence.push(await captureDurableItemEvidence(workspace.cwd, target));
       }
+      validateSource?.();
       const item = WorkspaceDurableItemSchema.parse({
         ...itemInput,
         evidence,

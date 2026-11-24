@@ -21,6 +21,8 @@ import {
 import { isWeb } from "@/constants/platform";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { useHostFeature } from "@/runtime/host-features";
+import { useOptionalPaneContext } from "@/panels/pane-context";
+import { CompactGitExplorerTabs, type CompactGitExplorerView } from "@/git/compact/explorer-tabs";
 import { ConflictEditor } from "@/git/merge/conflict-editor";
 import { useGitP2Copy } from "@/git/p2-copy";
 import { ForcePush } from "@/git/tags/force-push";
@@ -30,6 +32,11 @@ import { fileSelection, type StagingLayer } from "@/git/staging/model";
 import { useStaging } from "@/git/staging/use-staging";
 
 type Tab = "commit" | "stash" | "refs";
+const COMPACT_VIEW_BY_TAB: Record<Tab, CompactGitExplorerView | null> = {
+  commit: "changes",
+  stash: "stash",
+  refs: null,
+};
 interface Selection {
   layer: StagingLayer;
   path: string;
@@ -55,6 +62,7 @@ export function StagingPanel({
 }) {
   const { t } = useTranslation();
   const p2Enabled = useHostFeature(serverId, "checkoutGitP2V1");
+  // COMPAT(checkoutGitGraphV1): added in v0.18.0, remove after 2027-06-01 once daemon floor >= v0.18.0.
   const graphEnabled = useHostFeature(serverId, "checkoutGitGraphV1");
   const refsEnabled = p2Enabled && graphEnabled;
   const [selectedTab, setTab] = useState<Tab>("commit");
@@ -81,6 +89,7 @@ export function StagingPanel({
         staging={staging}
         tab={tab}
         refsEnabled={refsEnabled}
+        graphEnabled={graphEnabled}
         p2Enabled={p2Enabled}
         onTabChange={onTabChange}
       />
@@ -171,6 +180,7 @@ function StagingToolbar({
   staging,
   tab,
   refsEnabled,
+  graphEnabled,
   p2Enabled,
   onTabChange,
 }: {
@@ -180,46 +190,106 @@ function StagingToolbar({
   staging: Staging;
   tab: Tab;
   refsEnabled: boolean;
+  graphEnabled: boolean;
   p2Enabled: boolean;
   onTabChange: (tab: Tab) => void;
 }) {
   const { t } = useTranslation();
   const copy = useGitP2Copy();
+  const compact = useIsCompactFormFactor();
   const { tree, treeQuery, connected, busy, refresh, canWrite } = staging;
   const refreshPanel = useCallback(() => void refresh(), [refresh]);
+  const showLocalTags = useCallback(() => onTabChange("refs"), [onTabChange]);
   return (
-    <View style={styles.toolbar}>
-      <SegmentedControl<Tab>
-        size="sm"
-        value={tab}
-        onValueChange={onTabChange}
-        options={[
-          { value: "commit", label: t("gitWorkbench.commitTab") },
-          { value: "stash", label: t("gitWorkbench.stashTab") },
-          ...(refsEnabled ? [{ value: "refs" as const, label: copy.localTags }] : []),
-        ]}
-      />
-      <Button
-        size="sm"
-        variant="ghost"
-        disabled={!connected || busy || treeQuery.isFetching}
-        onPress={refreshPanel}
-      >
-        {t("gitWorkbench.refresh")}
-      </Button>
-      {p2Enabled && tree?.headSha && tree.currentBranch ? (
-        <ForcePush
-          key={JSON.stringify([serverId, cwd, tree.repoRoot, tree.headSha, tree.currentBranch])}
-          serverId={serverId}
-          cwd={cwd}
-          repoRoot={tree.repoRoot}
-          headSha={tree.headSha}
-          branch={tree.currentBranch}
-          active={active}
-          canWrite={canWrite}
-          onChanged={refresh}
+    <>
+      {compact ? (
+        <CompactStagingTabs
+          tab={tab}
+          graphEnabled={graphEnabled}
+          busy={busy}
+          onTabChange={onTabChange}
         />
       ) : null}
+      <View style={[styles.toolbar, compact && styles.compactToolbar]}>
+        {compact ? (
+          refsEnabled && (
+            <Button
+              size="sm"
+              variant={tab === "refs" ? "secondary" : "ghost"}
+              disabled={busy}
+              onPress={showLocalTags}
+            >
+              {copy.localTags}
+            </Button>
+          )
+        ) : (
+          <SegmentedControl<Tab>
+            size="sm"
+            value={tab}
+            onValueChange={onTabChange}
+            options={[
+              { value: "commit", label: t("gitWorkbench.commitTab") },
+              { value: "stash", label: t("gitWorkbench.stashTab") },
+              ...(refsEnabled ? [{ value: "refs" as const, label: copy.localTags }] : []),
+            ]}
+          />
+        )}
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={!connected || busy || treeQuery.isFetching}
+          onPress={refreshPanel}
+        >
+          {t("gitWorkbench.refresh")}
+        </Button>
+        {p2Enabled && tree?.headSha && tree.currentBranch ? (
+          <ForcePush
+            key={JSON.stringify([serverId, cwd, tree.repoRoot, tree.headSha, tree.currentBranch])}
+            serverId={serverId}
+            cwd={cwd}
+            repoRoot={tree.repoRoot}
+            headSha={tree.headSha}
+            branch={tree.currentBranch}
+            active={active}
+            canWrite={canWrite}
+            onChanged={refresh}
+          />
+        ) : null}
+      </View>
+    </>
+  );
+}
+
+function CompactStagingTabs({
+  tab,
+  graphEnabled,
+  busy,
+  onTabChange,
+}: {
+  tab: Tab;
+  graphEnabled: boolean;
+  busy: boolean;
+  onTabChange: (tab: Tab) => void;
+}) {
+  const openTab = useOptionalPaneContext()?.openTab;
+  const select = useCallback(
+    (view: CompactGitExplorerView) => {
+      if (view === "history") {
+        openTab?.({ kind: "git_graph" });
+        return;
+      }
+      onTabChange(view === "changes" ? "commit" : "stash");
+    },
+    [onTabChange, openTab],
+  );
+  return (
+    <View style={styles.compactTabs}>
+      <CompactGitExplorerTabs
+        value={COMPACT_VIEW_BY_TAB[tab]}
+        historyEnabled={graphEnabled && Boolean(openTab)}
+        disabled={busy}
+        onChange={select}
+      />
     </View>
   );
 }
@@ -770,6 +840,8 @@ const styles = StyleSheet.create((theme) => ({
     borderBottomWidth: 1,
     borderColor: theme.colors.border,
   },
+  compactTabs: { paddingHorizontal: theme.spacing[2], paddingTop: theme.spacing[2] },
+  compactToolbar: { justifyContent: "flex-start", flexWrap: "wrap" },
   summary: {
     paddingHorizontal: theme.spacing[3],
     paddingVertical: theme.spacing[1],

@@ -22,10 +22,14 @@ import { definePanel } from "@/panels/panel-registry";
 import { useHostFeature } from "@/runtime/host-features";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { useGitGraphConflictIntent } from "@/screens/workspace/topic-header/git-graph-intent";
+import {
+  useIsWorkspaceSheetPageOnTop,
+  useWorkspaceSheetPages,
+} from "@/screens/workspace/sheet-pane/stack-context";
 import { useWorkspaceDirectory } from "@/stores/session-store-hooks";
 import { confirmDialog } from "@/utils/confirm-dialog";
 import { openDesktopTarget, useDesktopOpenTargets } from "@/workspace/desktop-open-targets";
-import { ConflictSheet } from "../rebase/conflict-sheet";
+import { ConflictSheet, conflictWorkspacePageKey } from "../rebase/conflict-sheet";
 import { PlanSheet, type RebaseResult } from "../rebase/plan-sheet";
 import {
   isRebasePaused,
@@ -51,6 +55,30 @@ const EMPTY_REFS: CheckoutGitRepoRefs[] = [];
 const DETAILS_SNAP = ["85%"];
 const SELECTED = { selected: true };
 const UNSELECTED = { selected: false };
+
+function useGraphPresentation(width: number) {
+  const compact = useIsCompactFormFactor();
+  const stack = useWorkspaceSheetPages();
+  return {
+    compact,
+    compactSheet: compact && !!stack,
+    layout: compact ? "narrow" : graphLayout(width),
+  } as const;
+}
+
+function useCanReadRebaseWorkingTree(
+  compactSheet: boolean,
+  tabId: string,
+  surface: RebaseSurfaceState | null,
+) {
+  const pageKey =
+    compactSheet && surface?.kind === "conflicts"
+      ? conflictWorkspacePageKey(tabId, surface.repo.repoRoot)
+      : undefined;
+  const onTop = useIsWorkspaceSheetPageOnTop(pageKey);
+  return !pageKey || onTop;
+}
+
 function GitGraphPanel() {
   const { t } = useTranslation();
   const { serverId, workspaceId } = usePaneContext();
@@ -99,10 +127,9 @@ function GraphWorkbench({
 }) {
   const { serverId, tabId } = usePaneContext();
   const active = useRetainedPanelActive();
-  const compact = useIsCompactFormFactor();
   const enabled = active && connected;
   const [width, setWidth] = useState(0);
-  const layout = graphLayout(width);
+  const { compact, compactSheet, layout } = useGraphPresentation(width);
   const narrow = layout === "narrow";
   const [focus, setFocus] = useState<string | null>(null);
   const [filterDraft, setFilterDraft] = useState(emptyFilters);
@@ -151,6 +178,7 @@ function GraphWorkbench({
   const refresh = useStableEvent(() => setRevision((value) => value + 1));
   const { surface, openSurface, closeSurface, reportSurfaceResult, reportHiddenConflictChange } =
     useRebaseSurfaces(enabled && rebase, repo, refresh);
+  const readWorkingTree = useCanReadRebaseWorkingTree(compactSheet, tabId, surface);
 
   const { snapshot, undoing, recordResult, undo, workingTree } = useRebaseOperations({
     client,
@@ -160,6 +188,7 @@ function GraphWorkbench({
     action: surface?.kind,
     revision,
     enabled: enabled && rebase,
+    readWorkingTree,
     references: freshRead(refs) ? references : EMPTY_REFS,
     repoFresh: freshRead(discover),
     refresh,
@@ -295,6 +324,7 @@ function GraphWorkbench({
           enabled={enabled}
           active={active}
           narrow={narrow}
+          keepDetailUnderFile={compactSheet}
           onDiff={setFile}
           clearSelection={clearSelection}
           closeFile={closeFile}
@@ -483,6 +513,7 @@ function useRebaseOperations({
   action,
   revision,
   enabled,
+  readWorkingTree,
   references,
   repoFresh,
   refresh,
@@ -496,6 +527,7 @@ function useRebaseOperations({
   action: RebaseSurfaceState["kind"] | undefined;
   revision: number;
   enabled: boolean;
+  readWorkingTree: boolean;
   references: CheckoutGitRepoRefs[];
   repoFresh: boolean;
   refresh: () => void;
@@ -515,7 +547,8 @@ function useRebaseOperations({
     cwd,
     repoRoot: repo?.repoRoot,
     serverId,
-    enabled: enabled && (readPausedSnapshot || !!sessionSnapshot?.completedHeadSha),
+    enabled:
+      enabled && readWorkingTree && (readPausedSnapshot || !!sessionSnapshot?.completedHeadSha),
     revision,
   });
   const tree = workingTree.isSuccess && !workingTree.isFetching ? workingTree.data : undefined;
@@ -738,6 +771,7 @@ function DetailSurfaces({
   enabled,
   active,
   narrow,
+  keepDetailUnderFile,
   onDiff,
   clearSelection,
   closeFile,
@@ -749,11 +783,13 @@ function DetailSurfaces({
   enabled: boolean;
   active: boolean;
   narrow: boolean;
+  keepDetailUnderFile: boolean;
   onDiff: (path: string) => void;
   clearSelection: () => void;
   closeFile: () => void;
 }) {
   const { t } = useTranslation();
+  const { tabId } = usePaneContext();
   const detail = selectedDetail ? (
     <CommitDetail
       key={commitKey(selectedDetail)}
@@ -773,9 +809,10 @@ function DetailSurfaces({
   return (
     <>
       {narrow ? null : <View style={[styles.paneBorder, styles.detailColumn]}>{detail}</View>}
-      {active && narrow && selectedDetail && !file ? (
+      {active && narrow && selectedDetail && (!file || keepDetailUnderFile) ? (
         <GraphSheet
           visible
+          workspacePageKey={JSON.stringify(["git-detail", tabId, commitKey(selectedDetail)])}
           header={drawerHeader}
           onClose={clearSelection}
           scrollable={false}

@@ -101,6 +101,7 @@ import {
 import { useLongPressDragInteraction } from "@/components/sidebar/use-long-press-drag-interaction";
 import { SidebarSectionHeader } from "@/components/sidebar/sidebar-section-header";
 import { SidebarGroupToggleRow } from "@/components/sidebar/sidebar-group-toggle-row";
+import { SidebarDurableItemsSection } from "@/components/sidebar/sidebar-durable-items-section";
 import { SidebarUnreadConclusionsSection } from "@/components/sidebar/sidebar-unread-conclusions-section";
 import { createWorkspaceVisibilityPolicy } from "@/components/sidebar/sidebar-group-visibility";
 import { useLimitedSidebarGroup } from "@/components/sidebar/use-limited-sidebar-group";
@@ -1990,56 +1991,105 @@ export function SidebarWorkspaceList({
   // whenever a local filter empties an otherwise populated directory, so users can
   // reach the display menu to reveal their work again.
   const sidebarFilterEmpty = hasProjectsBeforeFilter && projects.length === 0;
+  const projectMode = groupMode === "project";
+  const nativeScrollGestureProps = useMemo(
+    () =>
+      projectMode && parentGestureRef
+        ? ({
+            // NestableScrollContainer forwards this to RNGH ScrollView so the sidebar's
+            // horizontal close gesture can coexist with vertical scrolling in project mode.
+            simultaneousHandlers: parentGestureRef,
+          } as object)
+        : undefined,
+    [parentGestureRef, projectMode],
+  );
 
   // Project mode is the one that keeps its project headers; every other grouping mode is a flat
   // list of grouped rows, so a new mode lands in the grouped branch rather than silently in this
   // one's `else`.
-  const content =
-    groupMode !== "project" ? (
-      <SidebarGroupedModeList
-        workspaceGroups={workspaceGroups}
-        pinnedGroups={pinnedGroups}
-        workspaceEntriesByKey={workspaceEntriesByKey}
-        projectIconByProjectViewKey={projectIconByProjectViewKey}
-        shortcutIndexByWorkspaceKey={shortcutIndexByWorkspaceKey}
-        onWorkspacePress={onWorkspacePress}
-        hostBadgeByServerId={hostBadgeByServerId}
-        supportsPinningByServerId={supportsPinningByServerId}
-        onToggleWorkspacePin={onToggleWorkspacePin}
-        onPinnedWorkspaceReorder={handlePinnedWorkspaceReorder}
-        listHeaderComponent={listHeaderComponent}
-        sidebarFilterEmpty={sidebarFilterEmpty}
-        parentGestureRef={parentGestureRef}
-        dragGestureHostActive={dragGestureHostActive}
-      />
-    ) : (
-      <ProjectModeList
-        projects={projects}
-        pinnedGroups={pinnedGroups}
-        workspaceEntriesByKey={workspaceEntriesByKey}
-        projectIconByProjectViewKey={projectIconByProjectViewKey}
-        collapsedProjectKeys={collapsedProjectKeys}
-        onToggleProjectCollapsed={onToggleProjectCollapsed}
-        shortcutIndexByWorkspaceKey={shortcutIndexByWorkspaceKey}
-        onWorkspacePress={onWorkspacePress}
-        onAddProject={onAddProject}
-        onImportSession={onImportSession}
-        listFooterComponent={listFooterComponent}
-        listHeaderComponent={listHeaderComponent}
-        sidebarFilterEmpty={sidebarFilterEmpty}
-        hasActiveProjectFilter={hasActiveProjectFilter}
-        parentGestureRef={parentGestureRef}
-        dragGestureHostActive={dragGestureHostActive}
-        pathname={pathname}
-        hostBadgeByServerId={hostBadgeByServerId}
-        supportsMultiplicityByServerId={supportsMultiplicityByServerId}
-        supportsPinningByServerId={supportsPinningByServerId}
-        onToggleWorkspacePin={onToggleWorkspacePin}
-        onPinnedWorkspaceReorder={handlePinnedWorkspaceReorder}
-      />
-    );
+  const groups = !projectMode ? (
+    <SidebarGroupedModeList
+      workspaceGroups={workspaceGroups}
+      pinnedGroups={pinnedGroups}
+      workspaceEntriesByKey={workspaceEntriesByKey}
+      projectIconByProjectViewKey={projectIconByProjectViewKey}
+      shortcutIndexByWorkspaceKey={shortcutIndexByWorkspaceKey}
+      onWorkspacePress={onWorkspacePress}
+      hostBadgeByServerId={hostBadgeByServerId}
+      supportsPinningByServerId={supportsPinningByServerId}
+      onToggleWorkspacePin={onToggleWorkspacePin}
+      onPinnedWorkspaceReorder={handlePinnedWorkspaceReorder}
+      listHeaderComponent={listHeaderComponent}
+      sidebarFilterEmpty={sidebarFilterEmpty}
+      parentGestureRef={parentGestureRef}
+      dragGestureHostActive={dragGestureHostActive}
+    />
+  ) : (
+    <ProjectModeList
+      projects={projects}
+      pinnedGroups={pinnedGroups}
+      workspaceEntriesByKey={workspaceEntriesByKey}
+      projectIconByProjectViewKey={projectIconByProjectViewKey}
+      collapsedProjectKeys={collapsedProjectKeys}
+      onToggleProjectCollapsed={onToggleProjectCollapsed}
+      shortcutIndexByWorkspaceKey={shortcutIndexByWorkspaceKey}
+      onWorkspacePress={onWorkspacePress}
+      onAddProject={onAddProject}
+      onImportSession={onImportSession}
+      listFooterComponent={listFooterComponent}
+      listHeaderComponent={listHeaderComponent}
+      sidebarFilterEmpty={sidebarFilterEmpty}
+      hasActiveProjectFilter={hasActiveProjectFilter}
+      parentGestureRef={parentGestureRef}
+      dragGestureHostActive={dragGestureHostActive}
+      pathname={pathname}
+      hostBadgeByServerId={hostBadgeByServerId}
+      supportsMultiplicityByServerId={supportsMultiplicityByServerId}
+      supportsPinningByServerId={supportsPinningByServerId}
+      onToggleWorkspacePin={onToggleWorkspacePin}
+      onPinnedWorkspaceReorder={handlePinnedWorkspaceReorder}
+    />
+  );
 
-  return content;
+  const content = (
+    <>
+      <SidebarDurableItemsSection />
+      <SidebarUnreadConclusionsSection
+        hostBadgeByServerId={hostBadgeByServerId}
+        onWorkspacePress={onWorkspacePress}
+      />
+      {groups}
+      <SidebarToastClearance />
+    </>
+  );
+  const scrollTestID = projectMode
+    ? "sidebar-project-workspace-list-scroll"
+    : "sidebar-status-list-scroll";
+
+  return (
+    <View style={styles.container}>
+      {platformIsNative ? (
+        <NestableScrollContainer
+          {...nativeScrollGestureProps}
+          style={styles.list}
+          contentContainerStyle={styles.listContent}
+          showsVerticalScrollIndicator={false}
+          testID={scrollTestID}
+        >
+          {content}
+        </NestableScrollContainer>
+      ) : (
+        <ScrollView
+          style={styles.list}
+          contentContainerStyle={styles.listContent}
+          showsVerticalScrollIndicator={false}
+          testID={scrollTestID}
+        >
+          {content}
+        </ScrollView>
+      )}
+    </View>
+  );
 }
 
 /**
@@ -2200,20 +2250,6 @@ function ProjectModeList({
     selection: selectionEnabled ? activeWorkspaceSelection : null,
     expanded: pinnedChatsExpanded,
   });
-  const nativeScrollGestureProps = useMemo(
-    () =>
-      parentGestureRef
-        ? ({
-            // NestableScrollContainer forwards props to RNGH ScrollView. Keep
-            // vertical scroll and sidebar close pan simultaneous: vertical
-            // intent scrolls immediately, clear horizontal intent can still
-            // activate close from inside the list.
-            simultaneousHandlers: parentGestureRef,
-          } as object)
-        : undefined,
-    [parentGestureRef],
-  );
-
   useEffect(() => {
     const timeouts = creatingWorkspaceTimeoutsRef.current;
     return () => {
@@ -2489,12 +2525,8 @@ function ProjectModeList({
       />
     );
 
-  const content = (
+  return (
     <>
-      <SidebarUnreadConclusionsSection
-        hostBadgeByServerId={hostBadgeByServerId}
-        onWorkspacePress={onWorkspacePress}
-      />
       {pinnedChats.length > 0 ? (
         <View style={styles.pinnedSection} testID="sidebar-pinned-section">
           <SidebarSectionHeader
@@ -2545,33 +2577,7 @@ function ProjectModeList({
         : null}
       {sidebarFilterEmpty ? <SidebarFilterEmptyState /> : projectBody}
       {listFooterComponent}
-      <SidebarToastClearance />
     </>
-  );
-
-  return (
-    <View style={styles.container}>
-      {platformIsNative ? (
-        <NestableScrollContainer
-          {...nativeScrollGestureProps}
-          style={styles.list}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-          testID="sidebar-project-workspace-list-scroll"
-        >
-          {content}
-        </NestableScrollContainer>
-      ) : (
-        <ScrollView
-          style={styles.list}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-          testID="sidebar-project-workspace-list-scroll"
-        >
-          {content}
-        </ScrollView>
-      )}
-    </View>
   );
 }
 

@@ -10,8 +10,7 @@ import {
   type Ref,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { View, Text, ScrollView } from "react-native";
-import { NestableScrollContainer } from "react-native-draggable-flatlist";
+import { View, Text } from "react-native";
 import type { GestureType } from "react-native-gesture-handler";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
@@ -35,7 +34,6 @@ import {
   CircleX,
 } from "lucide-react-native";
 import { useToast } from "@/contexts/toast-context";
-import { SidebarToastClearance } from "@/components/sidebar/sidebar-toast-region";
 import { useSidebarWorkspaceRename } from "@/workspace-rename";
 import { useWorkspaceClipboardActions } from "@/hooks/use-workspace-clipboard-actions";
 import { redirectIfArchivingActiveWorkspace } from "@/utils/sidebar-workspace-archive-redirect";
@@ -68,7 +66,6 @@ import {
   SidebarWorkspaceMenu,
 } from "@/components/sidebar/sidebar-workspace-menu";
 import { SidebarSectionHeader } from "@/components/sidebar/sidebar-section-header";
-import { SidebarUnreadConclusionsSection } from "@/components/sidebar/sidebar-unread-conclusions-section";
 import { SidebarGroupToggleRow } from "@/components/sidebar/sidebar-group-toggle-row";
 import { useLimitedSidebarGroup } from "@/components/sidebar/use-limited-sidebar-group";
 import type { ToggleSidebarWorkspacePin } from "@/hooks/use-sidebar-workspace-pin";
@@ -220,12 +217,8 @@ export function SidebarStatusWorkspaceList({
       }),
     [renderPinnedWorkspaceRow],
   );
-  const content = (
+  return (
     <>
-      <SidebarUnreadConclusionsSection
-        hostBadgeByServerId={hostBadgeByServerId}
-        onWorkspacePress={onWorkspacePress}
-      />
       {pinnedWorkspaces.length > 0 ? (
         <View style={styles.pinnedSection} testID="sidebar-pinned-section">
           <SidebarSectionHeader
@@ -276,32 +269,7 @@ export function SidebarStatusWorkspaceList({
           onToggleWorkspacePin={onToggleWorkspacePin}
         />
       )}
-      <SidebarToastClearance />
     </>
-  );
-
-  return (
-    <View style={styles.container}>
-      {platformIsNative ? (
-        <NestableScrollContainer
-          style={styles.list}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-          testID="sidebar-status-list-scroll"
-        >
-          {content}
-        </NestableScrollContainer>
-      ) : (
-        <ScrollView
-          style={styles.list}
-          contentContainerStyle={styles.listContent}
-          showsVerticalScrollIndicator={false}
-          testID="sidebar-status-list-scroll"
-        >
-          {content}
-        </ScrollView>
-      )}
-    </View>
   );
 }
 
@@ -1074,19 +1042,6 @@ function getStatusWorkspaceRowStyle({
 }
 
 const styles = StyleSheet.create((theme) => ({
-  container: {
-    flex: 1,
-  },
-  list: {
-    flex: 1,
-  },
-  listContent: {
-    paddingHorizontal: theme.spacing[2],
-    // Keep status mode's Pinned/Workspaces boundary identical to project mode.
-    paddingTop: 2,
-    // Room for the sidebar toast comes from SidebarToastClearance at the end of the content.
-    paddingBottom: theme.spacing[4],
-  },
   pinnedSection: {
     marginBottom: theme.spacing[1],
   },

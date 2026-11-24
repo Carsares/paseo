@@ -3,7 +3,14 @@ import React, { useCallback, useMemo } from "react";
 import { View } from "react-native";
 import { useRouter, type Href } from "expo-router";
 import { useTranslation } from "react-i18next";
-import { Copy, Ellipsis, Globe, Import as ImportIcon, Settings } from "lucide-react-native";
+import {
+  ArrowUp,
+  Copy,
+  Ellipsis,
+  Globe,
+  Import as ImportIcon,
+  Settings,
+} from "lucide-react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import type { TerminalProfile } from "@getpaseo/protocol/messages";
 import {
@@ -39,6 +46,7 @@ const ThemedCopy = withUnistyles(Copy);
 const ThemedGlobe = withUnistyles(Globe);
 const ThemedImport = withUnistyles(ImportIcon);
 const ThemedSettings = withUnistyles(Settings);
+const ThemedArrowUp = withUnistyles(ArrowUp);
 
 const mutedColorMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 
@@ -46,6 +54,7 @@ const MENU_NEW_BROWSER_ICON = <ThemedGlobe size={16} uniProps={mutedColorMapping
 const MENU_IMPORT_ICON = <ThemedImport size={16} uniProps={mutedColorMapping} />;
 const MENU_COPY_ICON = <ThemedCopy size={16} uniProps={mutedColorMapping} />;
 const MENU_SETTINGS_ICON = <ThemedSettings size={16} uniProps={mutedColorMapping} />;
+const MENU_UPGRADE_ICON = <ThemedArrowUp size={16} uniProps={mutedColorMapping} />;
 function WorkspaceHeaderMenuTriggerIcon() {
   return (
     <ThemedEllipsis
@@ -85,6 +94,7 @@ export interface WorkspaceHeaderWorkspaceActions {
   onCopyWorkspacePath: () => void;
   onCopyBranchName: () => void;
   onOpenSetupTab: () => void;
+  onUpgradeToTopic?: () => void;
 }
 
 function WorkspaceHeaderWorkspaceActionItems({
@@ -96,6 +106,7 @@ function WorkspaceHeaderWorkspaceActionItems({
   onCopyWorkspacePath,
   onCopyBranchName,
   onOpenSetupTab,
+  onUpgradeToTopic,
 }: WorkspaceHeaderWorkspaceActions) {
   const { t } = useTranslation();
   return (
@@ -125,6 +136,15 @@ function WorkspaceHeaderWorkspaceActionItems({
       >
         {t("workspace.header.actions.importSession")}
       </DropdownMenuItem>
+      {onUpgradeToTopic ? (
+        <DropdownMenuItem
+          testID="workspace-header-upgrade-to-topic"
+          leading={MENU_UPGRADE_ICON}
+          onSelect={onUpgradeToTopic}
+        >
+          {t("topicWorkbench.upgrade.title")}
+        </DropdownMenuItem>
+      ) : null}
       {showWorkspaceSetup ? (
         <>
           <DropdownMenuSeparator />

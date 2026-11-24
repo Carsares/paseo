@@ -307,6 +307,12 @@ export const PASEO_TOOL_CATALOG = {
       outputFields: ["workspaceId", "tasks"],
     },
   },
+  request_human_decision: {
+    label: "Request human decision",
+    completedLabel: "Requested human decision",
+    context: field("title"),
+    detail: { inputOrder: ["kind", "title", "summary", "evidence"], outputFields: ["item"] },
+  },
 
   // Terminals
   create_terminal: {

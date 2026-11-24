@@ -1,4 +1,10 @@
 import { Fragment, useMemo, type ReactNode } from "react";
+import { Text } from "react-native";
+import { useTranslation } from "react-i18next";
+import { StyleSheet } from "react-native-unistyles";
+import { HeaderToggleButton } from "@/components/headers/header-toggle-button";
+import { useStableEvent } from "@/hooks/use-stable-event";
+import { useWorkspaceSheetPages } from "@/screens/workspace/sheet-pane";
 import { usePanelStore } from "@/stores/panel-store";
 import { CompactHeader } from "@/components/headers/compact-header";
 import { WorkspaceHeaderProjectRow } from "@/screens/workspace/workspace-header-project-row";
@@ -26,6 +32,8 @@ interface CompactWorkspaceHeaderProps {
   headerVariant: "compact" | "full";
   isRouteFocused: boolean;
   isCompact: boolean;
+  compactTeamDirectory?: (close: () => void) => ReactNode;
+  compactConflictAction?: ReactNode;
 }
 
 /** The compact header with the workspace's project row and controls. */
@@ -42,7 +50,17 @@ export function CompactWorkspaceHeader({
   headerVariant,
   isRouteFocused,
   isCompact,
+  compactTeamDirectory,
+  compactConflictAction,
 }: CompactWorkspaceHeaderProps) {
+  const { t } = useTranslation();
+  const stack = useWorkspaceSheetPages();
+  const teamTitle = t("topicWorkbench.directory.title");
+  const renderTeam = useStableEvent((close: () => void) => compactTeamDirectory?.(close));
+  const openTeam = useStableEvent(() => {
+    if (!compactTeamDirectory) return;
+    stack?.push({ key: "team", title: teamTitle, render: renderTeam });
+  });
   const actionsInBar = resolveWorkspaceActionPlacement(useWindowLayout()) === "vertical-bar";
   const projectRow = useMemo(
     () => (
@@ -59,9 +77,30 @@ export function CompactWorkspaceHeader({
     overflow: children,
     explorer: explorerAction,
   };
-  const actions = resolveWorkspaceBarActions(headerVariant).map((symbol) => (
-    <Fragment key={symbol}>{symbols[symbol]}</Fragment>
-  ));
+  const actions = (
+    <>
+      {isCompact && stack && compactTeamDirectory ? (
+        <HeaderToggleButton
+          accessibilityRole="button"
+          accessibilityLabel={teamTitle}
+          onPress={openTeam}
+          testID="workspace-header-team"
+          tooltipLabel={t("topicWorkbench.directory.show")}
+          tooltipKeys={NO_SHORTCUTS}
+          tooltipSide="bottom"
+          style={styles.teamButton}
+        >
+          <Text style={styles.teamLabel} numberOfLines={1}>
+            {teamTitle}
+          </Text>
+        </HeaderToggleButton>
+      ) : null}
+      {isCompact ? compactConflictAction : null}
+      {resolveWorkspaceBarActions(headerVariant).map((symbol) => (
+        <Fragment key={symbol}>{symbols[symbol]}</Fragment>
+      ))}
+    </>
+  );
 
   return (
     <IconButtonChromeProvider value="header-island">
@@ -99,3 +138,10 @@ function WorkspaceWindowActions({
   );
   return <WindowLayoutActions active={active}>{children}</WindowLayoutActions>;
 }
+
+const NO_SHORTCUTS: [] = [];
+
+const styles = StyleSheet.create((theme) => ({
+  teamButton: { width: "auto", minWidth: 44, paddingHorizontal: theme.spacing[2] },
+  teamLabel: { color: theme.colors.foreground, fontSize: theme.fontSize.sm },
+}));

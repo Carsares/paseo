@@ -193,6 +193,30 @@ describe("deriveTopicHeaderModel", () => {
 });
 
 describe("fetchAllPendingDurableItemCount", () => {
+  it("honors a native-style aborted signal before the first request and after a page resolves", async () => {
+    const signal = { aborted: true };
+    const list = vi.fn<DaemonClient["listWorkspaceDurableItems"]>(async () => {
+      signal.aborted = true;
+      return {
+        requestId: "r1",
+        error: null,
+        items: [makeDurableItem(1)],
+        nextCursor: "next",
+      };
+    });
+    const client = { listWorkspaceDurableItems: list };
+    await expect(fetchAllPendingDurableItemCount(client, "ws-1", signal)).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    expect(list).not.toHaveBeenCalled();
+
+    signal.aborted = false;
+    await expect(fetchAllPendingDurableItemCount(client, "ws-1", signal)).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    expect(list).toHaveBeenCalledOnce();
+  });
+
   it("paginates across multiple pages to count all 51 pending items without truncating at 50", async () => {
     const firstPage = Array.from({ length: 50 }, (_, index) => makeDurableItem(index + 1));
     const secondPage = [makeDurableItem(51)];

@@ -1,123 +1,121 @@
 import { useIsFocused } from "expo-router/react-navigation";
-import { useCallback, useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useSyncExternalStore } from "react";
+import { Keyboard, StyleSheet } from "react-native";
 import {
   FULL_SHEET_SNAP_POINTS,
   SheetBackground,
   SheetHandle,
 } from "@/components/adaptive-modal-sheet";
+import { RetainedPanel, useRetainedPanelActive } from "@/components/retained-panel";
 import {
   IsolatedBottomSheetModal,
   type IsolatedBottomSheetModalRef,
   systemBackPress,
 } from "@/components/ui/isolated-bottom-sheet-modal";
+import { SheetVisibleFrame } from "@/components/ui/isolated-bottom-sheet-modal/visible-frame";
+import { useStableEvent } from "@/hooks/use-stable-event";
+import { isNative } from "@/constants/platform";
 import {
   SheetPane,
   useSheetPaneBridge,
   useSheetPaneHost,
-  useSheetPaneHostIfAny,
+  useWorkspaceSheetPages,
 } from "@/screens/workspace/sheet-pane";
-import { useWorkspaceLayoutStore, type SheetTab } from "@/stores/workspace-layout-store";
-
-const NO_SHEETS: readonly SheetTab[] = [];
+import { WorkspacePagePane } from "@/screens/workspace/sheet-pane/page";
+import { useRegisterActiveWorkspaceSheet } from "@/screens/workspace/sheet-pane/active-workspace";
+import type {
+  WorkspaceSheetEntry,
+  WorkspaceSheetStack,
+} from "@/screens/workspace/sheet-pane/stack";
 
 export interface SheetTabsProps {
   /** The workspace's ordinary tab close, including its unsaved-changes guard. */
   onCloseTab: (tabId: string) => Promise<void>;
 }
 
-interface SheetTabSheetProps {
-  sheet: SheetTab;
-  /** Only the top sheet answers Android Back; the ones below wait their turn. */
-  isTop: boolean;
-  /** Runs the guarded close and resolves to whether the tab is still open. */
-  onClose: (tabId: string) => Promise<boolean>;
-}
-
-/**
- * The workspace's sheet tabs, one sheet each, on the app-wide sheet stack. Their environment
- * crosses into the app overlay host so compact sheets cover both sidebars, and a sheet opened
- * from another one lands on top of it and uncovers it on close.
- */
-export function SheetTabs({ onCloseTab }: SheetTabsProps) {
-  const host = useSheetPaneHostIfAny();
-  return host ? (
-    <WorkspaceSheetTabs workspaceKey={host.workspaceKey} onCloseTab={onCloseTab} />
-  ) : null;
+/** The single modal hosts ordinary sheet tabs and workspace pages in opening order. */
+export function SheetTabs(props: SheetTabsProps) {
+  const stack = useWorkspaceSheetPages();
+  return stack ? <WorkspaceSheetTabs {...props} stack={stack} /> : null;
 }
 
 function WorkspaceSheetTabs({
-  workspaceKey,
   onCloseTab,
-}: SheetTabsProps & { workspaceKey: string }) {
-  const sheets = useWorkspaceLayoutStore(
-    (state) => state.sheetsByWorkspace[workspaceKey] ?? NO_SHEETS,
-  );
-  const handleClose = useCallback(
-    async (tabId: string) => {
-      await onCloseTab(tabId);
-      // A declined unsaved-changes prompt leaves the tab in its sheet.
-      const open = useWorkspaceLayoutStore.getState().sheetsByWorkspace[workspaceKey];
-      return open?.some((sheet) => sheet.tab.tabId === tabId) ?? false;
-    },
-    [onCloseTab, workspaceKey],
-  );
-  return (
-    <>
-      {sheets.map((sheet, index) => (
-        <SheetTabSheet
-          // Keyed by tab id and kind, so the registration and its descriptor hook stay fixed.
-          key={`${sheet.tab.tabId}:${sheet.tab.target.kind}`}
-          sheet={sheet}
-          isTop={index === sheets.length - 1}
-          onClose={handleClose}
-        />
-      ))}
-    </>
-  );
+  stack,
+}: SheetTabsProps & { stack: WorkspaceSheetStack }) {
+  const { workspaceKey, isWorkspaceFocused } = useSheetPaneHost();
+  const isScreenFocused = useIsFocused();
+  const active = useRetainedPanelActive();
+  const ownsSheet = active && isScreenFocused && isWorkspaceFocused;
+  useRegisterActiveWorkspaceSheet(stack, ownsSheet);
+  const entries = useSyncExternalStore(stack.subscribe, stack.getSnapshot, stack.getSnapshot);
+  const top = entries.at(-1);
+  return top ? (
+    <SheetTabModal
+      key={workspaceKey}
+      stack={stack}
+      entries={entries}
+      ownsSheet={ownsSheet}
+      onCloseTab={onCloseTab}
+    />
+  ) : null;
 }
 
-function SheetTabSheet({ sheet, isTop, onClose }: SheetTabSheetProps) {
-  const { tab } = sheet;
+function SheetTabModal({
+  entries,
+  stack,
+  ownsSheet,
+  onCloseTab,
+}: SheetTabsProps & {
+  stack: WorkspaceSheetStack;
+  entries: readonly WorkspaceSheetEntry[];
+  ownsSheet: boolean;
+}) {
   const sheetRef = useRef<IsolatedBottomSheetModalRef>(null);
-  const isScreenFocused = useIsFocused();
-  const { isWorkspaceFocused } = useSheetPaneHost();
+  const alive = useRef(false);
+  const closing = useRef(false);
   const contextBridge = useSheetPaneBridge();
 
-  // The sheet lives as long as its store entry: it presents on mount, and unmounting takes it off
-  // the stack, which uncovers the sheet below. Gorhom slides an unmounting sheet down and still
-  // reports that as `onChange(-1)`, which must not read as the user closing it: the store already
-  // moved on, and the same tab id may now be a pane tab (Open as tab).
-  const unmounted = useRef(false);
-  useEffect(() => {
+  const closeTop = useStableEvent(async (slidDown = false) => {
+    if (closing.current || !alive.current || !ownsSheet) return;
+    const top = stack.getSnapshot().at(-1);
+    if (!top) return;
+    closing.current = true;
+    try {
+      if (top.kind === "page") stack.closeTopPage(top);
+      else await onCloseTab(top.sheet.tab.tabId);
+    } finally {
+      closing.current = false;
+      if (slidDown && alive.current && stack.getSnapshot().length > 0) {
+        sheetRef.current?.snapToIndex(0);
+      }
+    }
+  });
+  const back = useStableEvent(() => void closeTop());
+  const handleChange = useStableEvent((index: number) => {
+    if (index === -1) void closeTop(true);
+  });
+
+  useLayoutEffect(() => {
+    alive.current = true;
     sheetRef.current?.present();
     return () => {
-      unmounted.current = true;
+      alive.current = false;
     };
   }, []);
 
-  // Every close path (drag, backdrop, Close, Back) slides the sheet down first; `onChange(-1)` then
-  // runs the one guarded close. The sheet keeps its content through the close, so a declined
-  // unsaved-changes prompt only has to bring it back up.
-  const close = useCallback(() => sheetRef.current?.close(), []);
-  const handleChange = useCallback(
-    (index: number) => {
-      if (index !== -1 || unmounted.current) return;
-      void onClose(tab.tabId).then((stillOpen) => {
-        if (stillOpen) sheetRef.current?.snapToIndex(0);
-        return stillOpen;
-      });
-    },
-    [onClose, tab.tabId],
-  );
-  // Hidden workspaces stay mounted in the deck and under Settings; only the visible one owns Back.
-  const ownsBackPress = isTop && isWorkspaceFocused && isScreenFocused;
+  const topKey = entries.at(-1)?.key;
   useEffect(() => {
-    if (!ownsBackPress) return;
+    if (isNative && ownsSheet && topKey) Keyboard.dismiss();
+  }, [ownsSheet, topKey]);
+
+  useEffect(() => {
+    if (!ownsSheet) return;
     return systemBackPress.subscribe(() => {
-      close();
+      back();
       return true;
     });
-  }, [close, ownsBackPress]);
+  }, [back, ownsSheet]);
 
   return (
     <IsolatedBottomSheetModal
@@ -125,17 +123,43 @@ function SheetTabSheet({ sheet, isTop, onClose }: SheetTabSheetProps) {
       contextBridge={contextBridge}
       snapPoints={FULL_SHEET_SNAP_POINTS}
       enableDynamicSizing={false}
-      enablePanDownToClose
-      // The pane scrolls on its own; the sheet drags from its handle and header.
+      enablePanDownToClose={entries.length === 1}
       enableContentPanningGesture={false}
       enableDismissOnClose={false}
       backgroundComponent={SheetBackground}
       handleComponent={SheetHandle}
-      backdropOpacity={0.45}
+      backdropOpacity={ownsSheet ? 0.45 : undefined}
+      containerStyle={ownsSheet ? undefined : styles.inactiveContainer}
       onChange={handleChange}
       accessible={false}
     >
-      <SheetPane sheet={sheet} onClose={close} isTop={isTop} />
+      <SheetVisibleFrame>
+        {entries.map((entry, index) => {
+          const top = index === entries.length - 1;
+          const onBack = index > 0 ? back : undefined;
+          return (
+            <RetainedPanel
+              key={entry.kind === "tab" ? `${entry.key}:${entry.sheet.tab.target.kind}` : entry.key}
+              active={top && ownsSheet}
+            >
+              {entry.kind === "tab" ? (
+                <SheetPane
+                  sheet={entry.sheet}
+                  onClose={back}
+                  onBack={onBack}
+                  isTop={top && ownsSheet}
+                />
+              ) : (
+                <WorkspacePagePane page={entry.page} onClose={back} onBack={onBack} />
+              )}
+            </RetainedPanel>
+          );
+        })}
+      </SheetVisibleFrame>
     </IsolatedBottomSheetModal>
   );
 }
+
+const styles = StyleSheet.create({
+  inactiveContainer: { display: "none" },
+});

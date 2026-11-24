@@ -18,6 +18,11 @@ import { AgentDirectory } from "../directory.js";
 import { stat } from "node:fs/promises";
 import { z } from "zod";
 import { ensureValidJson } from "../../json-utils.js";
+import {
+  agentDurableItemRequestSchema,
+  requestDurableItemFromAgent,
+} from "../../durable-items/agent-request.js";
+import type { DurableItemStore } from "../../durable-items/store.js";
 import type { Logger } from "pino";
 
 import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-types.js";
@@ -235,6 +240,7 @@ export interface PaseoToolHostDependencies {
   /** Caller ID verified by the entry point and bound to this invocation's authority. */
   verifiedCallerAgentId?: string;
   taskLedger?: WorkspaceTaskLedgerStore;
+  durableItems?: DurableItemStore;
   /**
    * Optional resolver for session-bound speak handlers.
    * Used by hidden voice agents to narrate through daemon-managed TTS.
@@ -2276,6 +2282,36 @@ function createToolCatalog(
     );
   }
   registerTaskLedgerTools();
+
+  function registerDurableItemRequestTool() {
+    const { durableItems, serverId, verifiedCallerAgentId } = options;
+    if (scope !== "agent" || !durableItems || !serverId) return;
+    if (callerAgentId && verifiedCallerAgentId !== callerAgentId) return;
+
+    registerTool(
+      "request_human_decision",
+      {
+        title: "Request human decision",
+        description:
+          "Ask the user to make a decision or accept a deliverable in your current workspace. " +
+          "This creates a persistent item for the user. Acceptance requires evidence paths. " +
+          "For routine completion or a decision from your parent agent, use report_to_parent instead.",
+        inputSchema: agentDurableItemRequestSchema,
+      },
+      async (input: z.infer<typeof agentDurableItemRequestSchema>) => {
+        const item = await requestDurableItemFromAgent({
+          store: durableItems,
+          serverId,
+          agentManager,
+          callerAgentId,
+          verifiedCallerAgentId,
+          input,
+        });
+        return { content: [], structuredContent: ensureValidJson({ item }) };
+      },
+    );
+  }
+  registerDurableItemRequestTool();
 
   registerTool(
     "create_agent",

@@ -318,15 +318,22 @@ const graphZh: Record<keyof typeof graphEn, string> = {
 };
 
 export const gitWorkbench = {
-  en: { graphTitle: "Git Graph", ...stagingEn, graph: graphEn },
+  en: {
+    graphTitle: "Git Graph",
+    compact: { changes: "Changes", history: "History" },
+    ...stagingEn,
+    graph: graphEn,
+  },
   ar: {
     graphTitle: "مخطط Git",
+    compact: { changes: "التغييرات", history: "السجل" },
     ...stagingEn,
     graph: graphEn,
     stashRetained: "يبقى الإدخال بعد تطبيقه لتجنب حذف إدخال آخر بالخطأ إذا تغيّرت القائمة.",
   },
   es: {
     graphTitle: "Gráfico de Git",
+    compact: { changes: "Cambios", history: "Historial" },
     ...stagingEn,
     graph: graphEn,
     stashRetained:
@@ -334,6 +341,7 @@ export const gitWorkbench = {
   },
   fr: {
     graphTitle: "Graphe Git",
+    compact: { changes: "Modifications", history: "Historique" },
     ...stagingEn,
     graph: graphEn,
     stashRetained:
@@ -341,6 +349,7 @@ export const gitWorkbench = {
   },
   ja: {
     graphTitle: "Git グラフ",
+    compact: { changes: "変更", history: "履歴" },
     ...stagingEn,
     graph: graphEn,
     stashRetained:
@@ -348,6 +357,7 @@ export const gitWorkbench = {
   },
   ko: {
     graphTitle: "Git 그래프",
+    compact: { changes: "변경 사항", history: "기록" },
     ...stagingEn,
     graph: graphEn,
     stashRetained:
@@ -355,6 +365,7 @@ export const gitWorkbench = {
   },
   "pt-BR": {
     graphTitle: "Gráfico do Git",
+    compact: { changes: "Alterações", history: "Histórico" },
     ...stagingEn,
     graph: graphEn,
     stashRetained:
@@ -362,10 +373,16 @@ export const gitWorkbench = {
   },
   ru: {
     graphTitle: "Граф Git",
+    compact: { changes: "Изменения", history: "История" },
     ...stagingEn,
     graph: graphEn,
     stashRetained:
       "После применения запись сохраняется, чтобы при изменении списка случайно не удалить другую.",
   },
-  "zh-CN": { graphTitle: "Git 图谱", ...stagingZh, graph: graphZh },
+  "zh-CN": {
+    graphTitle: "Git 图谱",
+    compact: { changes: "变更", history: "历史" },
+    ...stagingZh,
+    graph: graphZh,
+  },
 } as const;

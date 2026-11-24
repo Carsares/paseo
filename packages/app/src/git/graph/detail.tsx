@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { CheckoutGitCommitDetail, CheckoutGitLogCommit } from "@getpaseo/protocol/messages";
 import { GraphSheet } from "./sheet";
+import { useRetainedPanelActive } from "@/components/retained-panel";
 import { Button } from "@/components/ui/button";
 import { SelectField } from "@/components/ui/select-field";
 import { useFetchQuery } from "@/data/query";
@@ -28,7 +29,7 @@ export function CommitDetail({
   client,
   cwd,
   commit,
-  enabled,
+  enabled: ownerEnabled,
   onDiff,
 }: {
   client: DaemonClient;
@@ -38,6 +39,8 @@ export function CommitDetail({
   onDiff: (path: string) => void;
 }) {
   const { t } = useTranslation();
+  const active = useRetainedPanelActive();
+  const enabled = ownerEnabled && active;
   const { serverId } = usePaneContext();
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set());
   const [recipientId, setRecipientId] = useState<string | null>(null);
@@ -264,23 +267,46 @@ function ChangeRow({
   );
 }
 
-export function CommitFileSheet({
-  client,
-  commit,
-  path,
-  enabled,
-  onClose,
-}: {
+interface CommitFileSheetProps {
   client: DaemonClient;
   commit: CheckoutGitLogCommit;
   path: string;
   enabled: boolean;
   onClose: () => void;
-}) {
+}
+
+export function CommitFileSheet({ onClose, ...props }: CommitFileSheetProps) {
+  const { tabId } = usePaneContext();
+  const { commit, path } = props;
+  const header = useMemo(() => ({ title: path }), [path]);
+  return (
+    <GraphSheet
+      visible
+      workspacePageKey={JSON.stringify(["git-file", tabId, commit.repoRoot, commit.sha, path])}
+      header={header}
+      onClose={onClose}
+      scrollable={false}
+      desktopMaxWidth={980}
+      desktopHeight="80%"
+      snapPoints={DIFF_SNAP_POINTS}
+    >
+      <CommitFileBody {...props} />
+    </GraphSheet>
+  );
+}
+
+function CommitFileBody({
+  client,
+  commit,
+  path,
+  enabled: ownerEnabled,
+}: Omit<CommitFileSheetProps, "onClose">) {
   const { t } = useTranslation();
   const { serverId } = usePaneContext();
   const { settings } = useAppSettings();
   const compact = useIsCompactFormFactor();
+  const active = useRetainedPanelActive();
+  const enabled = ownerEnabled && active;
   useBlockMobilePanelOpenGestures(enabled && compact);
   const query = useFetchQuery(
     commitFileDiffQueryOptions({
@@ -293,7 +319,6 @@ export function CommitFileSheet({
     }),
   );
   const files = useMemo(() => (query.data?.file ? [query.data.file] : []), [query.data?.file]);
-  const header = useMemo(() => ({ title: path }), [path]);
   const displayPreferences = useMemo(
     () => ({
       layout: "unified" as const,
@@ -305,23 +330,11 @@ export function CommitFileSheet({
   );
   let message = t(query.isPending ? "gitWorkbench.graph.loading" : "gitWorkbench.graph.emptyDiff");
   if (query.error) message = errorMessage(query.error);
-  return (
-    <GraphSheet
-      visible
-      header={header}
-      onClose={onClose}
-      scrollable={false}
-      desktopMaxWidth={980}
-      desktopHeight="80%"
-      snapPoints={DIFF_SNAP_POINTS}
-    >
-      {files.length ? (
-        <DiffDocument files={files} mode={commitMode} displayPreferences={displayPreferences} />
-      ) : (
-        <View style={styles.stack}>
-          <GraphMessage error={!!query.error}>{message}</GraphMessage>
-        </View>
-      )}
-    </GraphSheet>
+  return files.length ? (
+    <DiffDocument files={files} mode={commitMode} displayPreferences={displayPreferences} />
+  ) : (
+    <View style={styles.stack}>
+      <GraphMessage error={!!query.error}>{message}</GraphMessage>
+    </View>
   );
 }

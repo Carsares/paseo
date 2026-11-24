@@ -17,7 +17,8 @@ import {
   UserMinus,
   UserPlus,
 } from "lucide-react-native";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useRetainedPanelActive } from "@/components/retained-panel";
 import { useTranslation } from "react-i18next";
 import { ScrollView, Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
@@ -103,6 +104,7 @@ export interface WorkspaceTeamDirectoryProps {
   focusedAgentId: string | null;
   focusedProviderSubagentId: string | null;
   overlay?: boolean;
+  inSheet?: boolean;
   onHide: () => void;
   onOpenAgent: (node: TeamDirectoryMemberNode) => void;
   onOpenAgentBeside: (address: AgentAddress) => void;
@@ -291,6 +293,7 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   focusedAgentId,
   focusedProviderSubagentId,
   overlay = false,
+  inSheet = false,
   onHide,
   onOpenAgent,
   onOpenAgentBeside,
@@ -298,6 +301,7 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   onAskFirstQuestion,
 }: WorkspaceTeamDirectoryProps) {
   const { t } = useTranslation();
+  const active = useRetainedPanelActive();
   const client = useHostRuntimeClient(serverId);
   const isConnected = useHostRuntimeIsConnected(serverId);
   const supportsResidents = useHostFeature(serverId, "agentResidentSpecialists");
@@ -348,17 +352,28 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
     return JSON.stringify(entries.sort());
   }, [localAgents, workspaceId]);
 
-  const history = useWorkspaceArchivedAgents({
+  const liveHistory = useWorkspaceArchivedAgents({
     serverId,
     workspaceId,
-    enabled: historyExpanded,
+    enabled: active && historyExpanded,
     workspaceAgentMembership,
   });
+  // The disabled query has no page observers. Keep the last rows in the hidden scroll view.
+  const retainedHistory = useRef({ scopeKey, history: liveHistory });
+  useLayoutEffect(() => {
+    if (active) retainedHistory.current = { scopeKey, history: liveHistory };
+  }, [active, liveHistory, scopeKey]);
+  const history =
+    !active && retainedHistory.current.scopeKey === scopeKey
+      ? retainedHistory.current.history
+      : liveHistory;
 
   // Load resident presets only when resident specialists + profiles are supported.
   const daemonConfigQuery = useReplicaQuery({
     queryKey: daemonConfigQueryKey(serverId),
-    enabled: Boolean(client && isConnected && supportsResidents && supportsProfiles && mainAgentId),
+    enabled: Boolean(
+      active && client && isConnected && supportsResidents && supportsProfiles && mainAgentId,
+    ),
     pushEvent: "status:daemon_config_changed",
     queryFn: async () => {
       if (!client) throw new Error(t("common.errors.daemonClientUnavailable"));
@@ -368,9 +383,9 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   const residentProfiles = daemonConfigQuery.data?.agentProfiles ?? EMPTY_PROFILES;
 
   useEffect(() => {
-    if (!client || !isConnected || !supportsProviderSubagents || !mainAgentId) return;
+    if (!active || !client || !isConnected || !supportsProviderSubagents || !mainAgentId) return;
     void refreshProviderSubagents(client, serverId, mainAgentId).catch(() => undefined);
-  }, [client, isConnected, mainAgentId, serverId, supportsProviderSubagents]);
+  }, [active, client, isConnected, mainAgentId, serverId, supportsProviderSubagents]);
 
   const providerSubagents = useProviderSubagentStore(
     useShallow((state) => {
@@ -462,20 +477,25 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   );
 
   return (
-    <View style={[styles.sidebar, overlay && styles.overlay]} testID="workspace-team-directory">
-      <View style={styles.header}>
-        <Text numberOfLines={1} style={styles.headerTitle}>
-          {t("topicWorkbench.directory.title")}
-        </Text>
-        <ToolbarButton
-          compact
-          testID="team-directory-hide"
-          label={t("topicWorkbench.directory.hide")}
-          onPress={onHide}
-        >
-          <ThemedPanelLeftClose size={16} />
-        </ToolbarButton>
-      </View>
+    <View
+      style={inSheet ? styles.sheet : [styles.sidebar, overlay && styles.overlay]}
+      testID="workspace-team-directory"
+    >
+      {inSheet ? null : (
+        <View style={styles.header}>
+          <Text numberOfLines={1} style={styles.headerTitle}>
+            {t("topicWorkbench.directory.title")}
+          </Text>
+          <ToolbarButton
+            compact
+            testID="team-directory-hide"
+            label={t("topicWorkbench.directory.hide")}
+            onPress={onHide}
+          >
+            <ThemedPanelLeftClose size={16} />
+          </ToolbarButton>
+        </View>
+      )}
 
       <ScrollView keyboardShouldPersistTaps="handled" style={styles.scroll}>
         <View style={styles.list}>
@@ -1121,6 +1141,10 @@ const NativeSubrunRow = memo(function NativeSubrunRow({
 });
 
 const styles = StyleSheet.create((theme) => ({
+  sheet: {
+    flex: 1,
+    minHeight: 0,
+  },
   sidebar: {
     width: 248,
     maxWidth: "100%",

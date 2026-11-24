@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createTestLogger } from "../../test-utils/test-logger.js";
+import { openDurableItemStore } from "../durable-items/requests.js";
 import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
 import { createProviderSnapshotManagerStub } from "../test-utils/session-stubs.js";
 import { createPersistedWorkspaceRecord } from "../workspace-registry.js";
@@ -78,6 +79,7 @@ const mainControlTools = [
   "reset_agent_session",
   "upsert_workspace_task",
   "list_workspace_tasks",
+  "request_human_decision",
 ];
 
 it("protects the current topic main without changing legacy or cross-workspace archive rules", () => {
@@ -338,6 +340,17 @@ describe("agent orchestration", () => {
     expect(mainPolicy?.disabledTools).toEqual(base.disabledTools);
     expect(mainPolicy?.allowedTools).toEqual(mainControlTools);
     expect(isPaseoToolEnabled(mainPolicy, "create_agent")).toBe(true);
+    expect(isPaseoToolEnabled(mainPolicy, "request_human_decision")).toBe(true);
+    expect(
+      isPaseoToolEnabled(
+        applyHierarchyPaseoToolPolicy(
+          { disabledTools: ["request_human_decision"] },
+          main.labels,
+          0,
+        ),
+        "request_human_decision",
+      ),
+    ).toBe(false);
     expect(isPaseoToolEnabled(mainPolicy, "archive_agent")).toBe(false);
     expect(applyHierarchyPaseoToolPolicy(base, lead.labels, 1)).toBe(base);
     expect(applyHierarchyPaseoToolPolicy(undefined, root.labels, 0)).toBeUndefined();
@@ -377,6 +390,10 @@ describe("agent orchestration", () => {
     expect(prompt).toContain('"batch_implement"');
     expect(prompt).toContain('commitPolicy: "none"');
     expect(prompt).toContain("End your turn to wait for the lead to call report_to_parent");
+    expect(prompt).toContain("stay read-only regardless of provider mode");
+    expect(prompt).toContain(
+      "Call request_human_decision only if the tool is available and the user needs to make a decision or accept a deliverable.",
+    );
     expect(prompt).not.toMatch(/git (status|diff)|Direct Level-1 children/);
     expect(buildHierarchyAppendSystemPrompt({ agent: main, ...hierarchy(main) })).toBe(prompt);
     const leadPrompt = buildHierarchyAppendSystemPrompt({ agent: explicitLead, ...graph });
@@ -1694,13 +1711,23 @@ it("enforces single-hop MCP orchestration, self mode changes, and refreshes poli
       `Level-1 Module Lead (Flexible Mode) under Main Control Agent ${mainAgent.id}`,
     );
 
+    const workspaceRegistry = testWorkspaceRegistry(cwd);
+    const serverId = "test-server";
+    const durableItems = openDurableItemStore({
+      paseoHome: cwd,
+      serverId,
+      workspaceRegistry,
+      agentStorage: storage,
+    });
     const makeCatalog = (callerAgentId: string, filterTools = false) =>
       createPaseoToolCatalog({
         agentManager: manager,
         agentStorage: storage,
         providerSnapshotManager: createProviderSnapshotManagerStub().manager,
         callerAgentId,
-        workspaceRegistry: testWorkspaceRegistry(cwd),
+        workspaceRegistry,
+        serverId,
+        durableItems,
         paseoToolPolicy: filterTools ? manager.getPaseoToolPolicy(callerAgentId) : undefined,
         verifiedCallerAgentId: callerAgentId,
         paseoHome: cwd,

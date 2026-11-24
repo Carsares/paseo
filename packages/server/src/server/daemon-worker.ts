@@ -364,12 +364,27 @@ async function main() {
   installSupervisorLivenessGuard();
 
   try {
+    // Start with PASEO_WORKBENCH_COMPAT=1 to hide the topic and Git workbenches.
+    // Keep durable item read/decide available for previously created requests.
+    const workbenchCompatibility = process.env.PASEO_WORKBENCH_COMPAT === "1";
     daemon = await createPaseoDaemon(
       {
         ...config,
         onLifecycleIntent: handleLifecycleIntent,
       },
       logger,
+      workbenchCompatibility
+        ? {
+            serverFeatureOverrides: {
+              topicWorkbenchV1: false,
+              checkoutGitStagingV1: false,
+              checkoutGitGraphV1: false,
+              checkoutGitRebaseV1: false,
+              checkoutGitMultiRepoV1: false,
+              checkoutGitP2V1: false,
+            },
+          }
+        : undefined,
     );
   } catch (err) {
     logger.fatal({ err }, "Daemon bootstrap failed");

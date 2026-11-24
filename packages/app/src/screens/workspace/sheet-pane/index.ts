@@ -14,3 +14,7 @@ export {
 } from "./host";
 export { SheetPane, useLeaveSheet, type SheetPaneProps } from "./sheet-pane";
 export { useSheetPanePage } from "./page";
+export { useIsWorkspaceSheetPageOnTop, useWorkspaceSheetPages } from "./stack-context";
+export { WorkspaceSheetSurface } from "./stack-provider";
+export { useActiveWorkspaceSheetOpener } from "./active-workspace";
+export type { WorkspaceSheetPage } from "./stack";

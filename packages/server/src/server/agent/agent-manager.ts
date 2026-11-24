@@ -5573,11 +5573,21 @@ export class AgentManager {
         const workspace = await registry.get(workspaceId);
         if (!workspace || workspace.archivedAt)
           throw new Error("Workspace is missing or archived.");
-        const existingMain = (await this.requireRegistry().listByWorkspaces([workspaceId])).find(
-          (record) =>
-            this.isTopicMainCandidate(record, workspaceId) &&
-            isMainControlAgentLabels(record.labels),
+        const roots = (await this.requireRegistry().listByWorkspaces([workspaceId])).filter(
+          (record) => this.isTopicMainCandidate(record, workspaceId),
         );
+        const existingMain = roots.find((record) => isMainControlAgentLabels(record.labels));
+        if (
+          upgradeToTopic === true &&
+          !workspace.topic &&
+          !existingMain &&
+          roots.length > 1 &&
+          !mainAgentId
+        ) {
+          throw new Error(
+            "Select a Main Control agent before upgrading a workspace with multiple root agents.",
+          );
+        }
         const save = async () => {
           const updated = await persistWorkspaceTopic(registry, {
             ...input,
