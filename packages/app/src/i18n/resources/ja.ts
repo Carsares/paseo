@@ -3488,6 +3488,13 @@ export const ja: TranslationResources = {
         updateFailed: "アップデートに失敗しました",
         outputTruncated: "以前の出力は破棄されました。",
         updatesFailed: "アップデートを確認できませんでした",
+        maintenanceAutomatic: "自動メンテナンス",
+        maintenanceExternal: "外部で管理",
+        maintenanceExternalHint: "この CLI をインストールしたツールで更新してください。",
+        maintenanceManual: "手動での更新が必要",
+        maintenanceManualHint: "プロバイダーの手順に従って、このホストで更新してください。",
+        alreadyCurrent: "すでに最新です",
+        updateUnverified: "更新処理が終了しましたが、バージョンは未確認です",
         installInstructions: "インストール手順",
       },
       diagnostic: {

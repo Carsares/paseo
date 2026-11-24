@@ -17,6 +17,8 @@ const systemPromptCapability = z.object({
 });
 
 const fileWrite = z.object({ Path: z.string(), Content: z.string().optional() });
+const command = ["agy", "acp", "--disable-telemetry"] as const;
+const disableAutoUpdate = { AGY_CLI_DISABLE_AUTO_UPDATE: "true" };
 
 function isOrchestrator(model: string | undefined): boolean {
   return model !== undefined && /^gemini-pro-orchestrator(?:-|$)/.test(model);
@@ -113,7 +115,7 @@ async function readAgyVersion(
   const acp = launch.args.indexOf("acp");
   const prefix = acp === -1 ? launch.args : launch.args.slice(0, acp);
   const { stdout } = await execCommand(launch.command, [...prefix, "--version"], {
-    env: launch.env,
+    env: { ...launch.env, ...disableAutoUpdate },
     timeout: 5000,
     maxBuffer: 8192,
     signal,
@@ -128,7 +130,7 @@ export function createAntigravityProvider(): ProviderRegistration {
     label: "Antigravity",
     description: "Antigravity CLI on your host",
     icon: "icon.svg",
-    command: ["agy", "acp", "--disable-telemetry"],
+    command,
     acpOptions: {
       waitForInitialCommands: true,
       loadReplayQuietPeriodMs: 200,
@@ -157,11 +159,46 @@ export function createAntigravityProvider(): ProviderRegistration {
     },
     transformers: [antigravity],
   });
+  const connect: ProviderRegistration["connect"] = async (request) => {
+    const [executable, ...args] = command;
+    const launch = request.launch ?? {
+      command: executable,
+      args,
+      env: Object.fromEntries(
+        Object.entries(process.env).filter(
+          (entry): entry is [string, string] => entry[1] !== undefined,
+        ),
+      ),
+    };
+    // Connecting probes capabilities, and catalog requests launch another CLI from this same config.
+    const connection = await provider.connect({
+      ...request,
+      launch: { ...launch, env: { ...launch.env, ...disableAutoUpdate } },
+    });
+    return {
+      ...connection,
+      send(input) {
+        if (input.type !== "session.open") return connection.send(input);
+        // The ACP launcher applies session environment after the connection environment.
+        return connection.send({
+          ...input,
+          config: { ...input.config, env: { ...input.config.env, ...disableAutoUpdate } },
+        });
+      },
+    };
+  };
   return {
     ...provider,
-    // agy documents no update command and no release source, so there is nothing to check or run.
+    connect,
     installation: {
       installUrl: "https://antigravity.google/docs/getting-started?tab=cli",
+      updateUrl:
+        "https://antigravity.google/docs/cli/troubleshooting#resolve-self-updater-locks-and-failures",
+      maintenance: {
+        kind: "automatic",
+        message:
+          "Run Antigravity CLI directly on the host to let it update itself, or follow the updater guide. Paseo disables automatic updates in its CLI connections.",
+      },
       async inspect({ launch, signal }) {
         if (!launch?.resolved) return { status: "not_installed" };
         const version = await readAgyVersion(launch, signal);
@@ -171,7 +208,7 @@ export function createAntigravityProvider(): ProviderRegistration {
     async status({ launch }) {
       if (!launch) return { available: false, diagnostic: "Install Antigravity 1.5.0 or later." };
       try {
-        const connection = await provider.connect({
+        const connection = await connect({
           launch,
           versions: [PROVIDER_PROTOCOL_VERSION],
           capabilities: [],

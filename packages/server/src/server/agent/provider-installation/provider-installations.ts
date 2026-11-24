@@ -13,15 +13,18 @@ import {
   ProviderUpdateCheckSchema,
   ProviderUpdateReportSchema,
   ProviderUpdateResultSchema,
-  type ProviderUpdateResult,
 } from "@getpaseo/plugin/server/provider";
 import type {
   AgentClient,
   AgentClientInstallationContext,
   AgentClientUpdateContext,
   AgentProvider,
+  InstallationMaintenance,
+  InstallationUpdateResult,
 } from "../agent-sdk-types.js";
+import { InstallationActivity } from "./installation-activity.js";
 import { ProviderUpdateOperation } from "./provider-update-operation.js";
+import { sanitizeUpdateProgress, sanitizeUpdateResultMessage } from "./update-output.js";
 
 const DEFAULT_INSPECT_TIMEOUT_MS = 20_000;
 const DEFAULT_INSPECT_CACHE_MS = 30_000;
@@ -31,10 +34,50 @@ const DEFAULT_UPDATE_CHECK_CACHE_MS = 60 * 60_000;
 /** Characters of updater output kept per update; older output is dropped first. */
 export const DEFAULT_UPDATE_OUTPUT_LIMIT = 64 * 1024;
 
+const CONFIG_CHANGED = "Provider configuration changed. Inspect the installation and retry.";
+const UPDATE_UNVERIFIED =
+  "The updater completed for the previous configuration. Inspect the current installation to verify its version.";
+const UNPROVEN_UPDATE = "Paseo could not verify a local update plan for this installation.";
+const DAEMON_STOPPING = "The daemon is stopping.";
+
+class UpdateRefusal extends Error {}
+
+export class ProviderUpdateCleanupError extends Error {
+  constructor() {
+    super("Could not confirm that every provider updater process stopped.");
+  }
+}
+
+const PROVIDER_UPDATE_REFUSAL_MESSAGES = {
+  manual: "This installation must be updated outside Paseo.",
+  external: "Update this installation on the host that manages it.",
+};
+
+function parseUpdateResult(answer: unknown): InstallationUpdateResult {
+  const result = ProviderUpdateResultSchema.parse(answer);
+  if (
+    result.status !== "succeeded" ||
+    !answer ||
+    typeof answer !== "object" ||
+    !("outcome" in answer)
+  ) {
+    return result;
+  }
+  const { outcome } = answer;
+  if (outcome === "updated" || outcome === "already_current" || outcome === "unverified") {
+    return { ...result, outcome };
+  }
+  return result;
+}
+
 export interface ProviderInstallationsOptions {
   logger: Logger;
   /** The current client for a configured provider, or null when the provider is unknown. */
   resolveClient(provider: AgentProvider): AgentClient | null;
+  resolveFamily?(provider: AgentProvider): string;
+  /** Changes only when this provider's configuration is published. */
+  configurationVersion?(provider: AgentProvider): number;
+  activity?: InstallationActivity;
   inspectTimeoutMs?: number;
   inspectCacheMs?: number;
   updateCheckTimeoutMs?: number;
@@ -58,21 +101,14 @@ export interface InspectProviderInstallationOptions {
   refresh?: boolean;
 }
 
-/** A wire result: the provider's answer, or the `failed` value when the call threw or timed out. */
-interface ProviderCallResult {
-  status: string;
-}
-
-interface ProviderCall<T extends ProviderCallResult> {
+interface ProviderCall<T> {
   name: string;
   /** A cached result is reused only for the same key. */
   key?: string;
-  /** Validates the provider's answer; throws when it breaks the contract. */
-  parse(value: unknown): T;
   timeoutMs: number;
   /** How long a settled result is reused. */
   cacheMs(result: T): number;
-  run(context: AgentClientInstallationContext): Promise<unknown>;
+  run(context: AgentClientInstallationContext): Promise<T>;
   failed(message: string): T;
 }
 
@@ -83,16 +119,52 @@ interface CachedRead<T> {
   cacheMs: number;
 }
 
+interface InstallationInspectionSnapshot {
+  inspection: ProviderInstallationInspection;
+  maintenance?: InstallationMaintenance;
+}
+
+interface ProviderUpdateTask {
+  provider: AgentProvider;
+  client: AgentClient;
+  version: number;
+  operation: ProviderUpdateOperation;
+  controller: AbortController;
+  run(context: AgentClientUpdateContext): Promise<unknown>;
+}
+
+async function waitForInspection<T>(signal: AbortSignal, inspect: () => Promise<T>): Promise<T> {
+  let onAbort: (() => void) | undefined;
+  try {
+    signal.throwIfAborted();
+    return await Promise.race([
+      inspect(),
+      new Promise<never>((_, reject) => {
+        onAbort = () => reject(signal.reason);
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
 /**
  * Calls provider installation callbacks for every provider, built-in or plugin, through
  * `AgentClient.installation`. Owns deadlines, in-flight sharing and result caching. Results are
- * keyed by client, so a provider configuration change, which replaces the client, starts fresh.
+ * keyed by client and, when provided, by the runtime choice within that client.
  * An update check first reads the inspection and passes its version to the provider, so the
  * installed version never waits on an update check.
  */
 export class ProviderInstallations {
   private readonly logger: Logger;
   private readonly resolveClient: ProviderInstallationsOptions["resolveClient"];
+  private readonly activity: InstallationActivity;
+  private readonly configurationVersion: NonNullable<
+    ProviderInstallationsOptions["configurationVersion"]
+  >;
+  private readonly resolveFamily: NonNullable<ProviderInstallationsOptions["resolveFamily"]>;
   private readonly inspectTimeoutMs: number;
   private readonly inspectCacheMs: number;
   private readonly updateCheckTimeoutMs: number;
@@ -102,10 +174,12 @@ export class ProviderInstallations {
   private readonly now: () => number;
   private readonly updates = new Map<AgentProvider, ProviderUpdateOperation>();
   private readonly updateListeners = new Map<AgentProvider, Set<ProviderUpdateListener>>();
-  private readonly runningUpdates = new Set<AbortController>();
+  private readonly runningUpdates = new Map<AbortController, Promise<void>>();
+  private shutdown: Promise<void> | undefined;
+  private hasUnconfirmedCleanup = false;
   private readonly inspections = new WeakMap<
     AgentClient,
-    CachedRead<ProviderInstallationInspection>
+    CachedRead<InstallationInspectionSnapshot>
   >();
   private readonly updateChecks = new WeakMap<
     AgentClient,
@@ -115,6 +189,9 @@ export class ProviderInstallations {
   constructor(options: ProviderInstallationsOptions) {
     this.logger = options.logger;
     this.resolveClient = options.resolveClient;
+    this.configurationVersion = options.configurationVersion ?? (() => 0);
+    this.activity = options.activity ?? new InstallationActivity();
+    this.resolveFamily = options.resolveFamily ?? ((provider) => provider);
     this.inspectTimeoutMs = options.inspectTimeoutMs ?? DEFAULT_INSPECT_TIMEOUT_MS;
     this.inspectCacheMs = options.inspectCacheMs ?? DEFAULT_INSPECT_CACHE_MS;
     this.updateCheckTimeoutMs = options.updateCheckTimeoutMs ?? DEFAULT_UPDATE_CHECK_TIMEOUT_MS;
@@ -135,9 +212,19 @@ export class ProviderInstallations {
     const result: ProviderInstallation = {};
     if (installation.installUrl) result.installUrl = installation.installUrl;
     if (installation.updateUrl) result.updateUrl = installation.updateUrl;
-    if (installation.update) result.canUpdate = true;
-    const inspection = await this.readInspection(provider, client, options);
-    if (inspection) result.inspection = inspection;
+    if (options.refresh) this.clearFailedUpdate(provider);
+    const [snapshot, standaloneMaintenance] = await Promise.all([
+      this.readInspection(provider, client, options),
+      installation.inspectionSnapshot ? undefined : this.readMaintenance(provider, client),
+    ]);
+    const maintenance = snapshot?.maintenance ?? standaloneMaintenance;
+    if (maintenance) result.maintenance = maintenance;
+    if (installation.update && maintenance?.kind === "automatic") {
+      const keys = await this.readActivityKeys(client);
+      if (keys.length === 0) result.maintenance = { kind: "manual", message: UNPROVEN_UPDATE };
+      else if (!this.shutdown && this.resolveClient(provider) === client) result.canUpdate = true;
+    }
+    if (snapshot) result.inspection = snapshot.inspection;
     return result;
   }
 
@@ -155,7 +242,7 @@ export class ProviderInstallations {
     if (!installation || !checkForUpdates) return null;
     // The provider compares the version the inspection reported, so a cached answer holds only
     // while the inspection still reports that version.
-    const inspection = await this.readInspection(provider, client, options);
+    const inspection = (await this.readInspection(provider, client, options))?.inspection;
     if (inspection?.status === "not_installed")
       return { status: "unknown", message: "Not installed" };
     if (inspection?.status === "error") return { status: "error", message: inspection.message };
@@ -163,14 +250,16 @@ export class ProviderInstallations {
     return this.read(provider, client, this.updateChecks, options, {
       name: "update check",
       key: installedVersion,
-      parse: (value) => ProviderUpdateCheckSchema.parse(value),
       timeoutMs: this.updateCheckTimeoutMs,
       // Inconclusive answers are retried soon; a conclusive one holds for the long cache.
       cacheMs: (result) =>
         result.status === "current" || result.status === "available"
           ? this.updateCheckCacheMs
           : this.inspectCacheMs,
-      run: (context) => checkForUpdates.call(installation, { ...context, installedVersion }),
+      run: async (context) =>
+        ProviderUpdateCheckSchema.parse(
+          await checkForUpdates.call(installation, { ...context, installedVersion }),
+        ),
       failed: (message) => ({ status: "error" as const, message }),
     });
   }
@@ -181,6 +270,7 @@ export class ProviderInstallations {
    * provider declares no `update`.
    */
   update(provider: AgentProvider): ProviderInstallationUpdate {
+    if (this.shutdown) throw new Error(DAEMON_STOPPING);
     const running = this.updates.get(provider);
     if (running?.running) return running.snapshot();
     const client = this.requireClient(provider);
@@ -199,15 +289,34 @@ export class ProviderInstallations {
         }),
     });
     this.updates.set(provider, operation);
-    void this.runUpdate(provider, client, operation, (context) =>
-      update.call(installation, context),
-    );
+    const controller = new AbortController();
+    const version = this.configurationVersion(provider);
+    const task = Promise.resolve()
+      .then(() =>
+        this.runUpdate({
+          provider,
+          client,
+          operation,
+          controller,
+          version,
+          run: (context) => update.call(installation, context),
+        }),
+      )
+      .finally(() => {
+        this.runningUpdates.delete(controller);
+      });
+    this.runningUpdates.set(controller, task);
+    void task.catch(() => {
+      this.hasUnconfirmedCleanup = true;
+      this.logger.error({ provider }, "Provider update did not settle normally");
+    });
+    operation.publishStarted();
     return operation.snapshot();
   }
 
   /**
-   * The latest update of the provider since the daemon started, or null. A failed update stays
-   * until the next refresh of the provider's installation or update check.
+   * The latest update of the provider since the daemon started, or null. An explicit installation
+   * refresh clears a failed update.
    */
   getUpdate(provider: AgentProvider): ProviderInstallationUpdate | null {
     return this.updates.get(provider)?.snapshot() ?? null;
@@ -231,84 +340,222 @@ export class ProviderInstallations {
   }
 
   private publishUpdate(provider: AgentProvider, event: ProviderUpdateEvent): void {
-    for (const listener of this.updateListeners.get(provider) ?? []) listener(event);
+    for (const listener of this.updateListeners.get(provider) ?? []) {
+      try {
+        listener(event);
+      } catch {
+        this.logger.warn({ provider }, "Could not notify a provider update listener");
+      }
+    }
   }
 
-  /** Aborts running updates. Each settles as failed with the provider's answer to the abort. */
-  close(): void {
-    for (const controller of this.runningUpdates)
-      controller.abort(new Error("The daemon is stopping"));
+  /** Close admission before aborting and keep each task registered through its process cleanup. */
+  close(): Promise<void> {
+    if (this.shutdown) return this.shutdown;
+    const updates = [...this.runningUpdates];
+    this.shutdown = Promise.allSettled(updates.map(([, task]) => task)).then((results) => {
+      if (this.hasUnconfirmedCleanup || results.some((result) => result.status === "rejected")) {
+        throw new ProviderUpdateCleanupError();
+      }
+      return undefined;
+    });
+    for (const [controller] of updates) controller.abort(new UpdateRefusal(DAEMON_STOPPING));
+    return this.shutdown;
   }
 
-  /**
-   * The provider's inspection, or undefined when it declares no `inspect`. A refresh also drops
-   * a failed update, so the provider's own state replaces it; a running update is kept.
-   */
+  private clearFailedUpdate(provider: AgentProvider): void {
+    const failed = this.updates.get(provider);
+    if (!failed?.failed) return;
+    this.updates.delete(provider);
+    this.publishUpdate(provider, {
+      type: "provider.installation.update.cleared",
+      payload: { provider, operationId: failed.id },
+    });
+  }
+
   private readInspection(
     provider: AgentProvider,
     client: AgentClient,
     options: InspectProviderInstallationOptions,
-  ): Promise<ProviderInstallationInspection> | undefined {
-    const failed = this.updates.get(provider)?.snapshot().operation;
-    if (options.refresh && failed?.status === "failed") {
-      this.updates.delete(provider);
-      this.publishUpdate(provider, {
-        type: "provider.installation.update.cleared",
-        payload: { provider, operationId: failed.id },
-      });
-    }
+  ): Promise<InstallationInspectionSnapshot> | undefined {
     const installation = client.installation;
-    const inspect = installation?.inspect;
-    if (!installation || !inspect) return undefined;
+    if (!installation) return undefined;
+    const snapshot = installation.inspectionSnapshot;
+    const inspect = installation.inspect;
+    if (!snapshot && !inspect) return undefined;
     return this.read(provider, client, this.inspections, options, {
       name: "inspect",
-      parse: (value) => ProviderInspectionSchema.parse(value),
+      key: snapshot?.cacheKey(),
       timeoutMs: this.inspectTimeoutMs,
       cacheMs: () => this.inspectCacheMs,
-      run: (context) => inspect.call(installation, context),
-      failed: (message) => ({ status: "error" as const, message }),
+      run: async (context) => {
+        const { inspection, maintenance } = snapshot
+          ? await snapshot.read(context)
+          : { inspection: await inspect?.call(installation, context), maintenance: undefined };
+        return { inspection: ProviderInspectionSchema.parse(inspection), maintenance };
+      },
+      failed: (message) => ({
+        inspection: { status: "error", message },
+        ...(snapshot ? { maintenance: { kind: "manual", message: UNPROVEN_UPDATE } } : {}),
+      }),
     });
   }
 
-  private async runUpdate(
+  private async readMaintenance(
     provider: AgentProvider,
     client: AgentClient,
-    operation: ProviderUpdateOperation,
-    run: (context: AgentClientUpdateContext) => Promise<unknown>,
-  ): Promise<void> {
-    const controller = new AbortController();
-    this.runningUpdates.add(controller);
-    let result: ProviderUpdateResult;
+    parentSignal?: AbortSignal,
+  ): Promise<InstallationMaintenance | undefined> {
+    const installation = client.installation;
+    const getMaintenance = installation?.getMaintenance;
+    if (!getMaintenance) return undefined;
+    const timeout = AbortSignal.timeout(this.inspectTimeoutMs);
+    const signal = parentSignal ? AbortSignal.any([parentSignal, timeout]) : timeout;
     try {
-      const answer = await run({
-        signal: controller.signal,
-        report: (event) => {
-          const parsed = ProviderUpdateReportSchema.safeParse(event);
-          if (parsed.success) operation.append(parsed.data);
-          else this.logger.warn({ provider }, "Ignored invalid provider update output");
-        },
-      });
-      result = ProviderUpdateResultSchema.parse(answer);
-    } catch (error) {
-      this.logger.warn({ err: error, provider }, "Provider update failed");
-      result = {
-        status: "failed",
-        message: error instanceof Error ? error.message : String(error),
-      };
-    } finally {
-      this.runningUpdates.delete(controller);
+      return await waitForInspection(signal, () => getMaintenance.call(installation, { signal }));
+    } catch {
+      if (!parentSignal?.aborted)
+        this.logger.warn({ provider }, "Provider maintenance could not be verified");
+      return { kind: "manual", message: UNPROVEN_UPDATE };
     }
-    if (result.status === "succeeded") {
-      // The installed version and update state are now stale; read them again on next request.
+  }
+
+  private async readActivityKeys(
+    client: AgentClient,
+    parentSignal?: AbortSignal,
+  ): Promise<string[]> {
+    const installation = client.installation;
+    const getActivityKeys = installation?.getActivityKeys;
+    if (!getActivityKeys) return [];
+    const deadline = AbortSignal.timeout(this.inspectTimeoutMs);
+    const signal = parentSignal ? AbortSignal.any([parentSignal, deadline]) : deadline;
+    try {
+      const keys = await waitForInspection(signal, () => getActivityKeys.call(installation));
+      if (keys.includes("opaque")) return [];
+      return keys.filter((key) => key.trim().length > 0);
+    } catch {
+      return [];
+    }
+  }
+
+  private sameConfiguration(
+    provider: AgentProvider,
+    version: number,
+    client: AgentClient,
+  ): boolean {
+    return (
+      this.configurationVersion(provider) === version && this.resolveClient(provider) === client
+    );
+  }
+
+  private reportProgress(
+    provider: AgentProvider,
+    operation: ProviderUpdateOperation,
+    report: unknown,
+  ): void {
+    const parsed = ProviderUpdateReportSchema.safeParse(report);
+    if (!parsed.success) {
+      this.logger.warn({ provider }, "Ignored invalid provider update output");
+      return;
+    }
+    const text = sanitizeUpdateProgress(parsed.data.text);
+    if (text) operation.append({ type: "message", text });
+    else if (parsed.data.text) operation.markOutputTruncated();
+  }
+
+  private async executeUpdate(task: ProviderUpdateTask): Promise<InstallationUpdateResult> {
+    const { provider, client, version, run, controller, operation } = task;
+    const { signal } = controller;
+    let spawnAuthorized = false;
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      if (!this.sameConfiguration(provider, version, client))
+        throw new UpdateRefusal(CONFIG_CHANGED);
+    };
+    assertCurrent();
+    const maintenance = await this.readMaintenance(provider, client, signal);
+    assertCurrent();
+    if (maintenance && maintenance.kind !== "automatic") {
+      const message =
+        sanitizeUpdateResultMessage(maintenance.message) ??
+        PROVIDER_UPDATE_REFUSAL_MESSAGES[maintenance.kind];
+      throw new UpdateRefusal(message);
+    }
+    if (maintenance?.kind !== "automatic") throw new UpdateRefusal(UNPROVEN_UPDATE);
+    const keys = await this.readActivityKeys(client, signal);
+    assertCurrent();
+    if (keys.length === 0) throw new UpdateRefusal(UNPROVEN_UPDATE);
+
+    const lease = this.activity.acquireUpdate({ family: this.resolveFamily(provider), keys });
+    try {
+      const result = parseUpdateResult(
+        await run({
+          signal,
+          activityKeys: keys,
+          assertCurrent: () => {
+            assertCurrent();
+            spawnAuthorized = true;
+          },
+          quarantineActivity: () => {
+            this.hasUnconfirmedCleanup = true;
+            lease.quarantine();
+          },
+          report: (event) => this.reportProgress(provider, operation, event),
+        }),
+      );
+      if (!this.sameConfiguration(provider, version, client)) {
+        if (result.status === "succeeded" && spawnAuthorized) {
+          return { status: "succeeded", outcome: "unverified", message: UPDATE_UNVERIFIED };
+        }
+        throw new UpdateRefusal(CONFIG_CHANGED);
+      }
+      if (result.status === "succeeded" && !spawnAuthorized)
+        throw new UpdateRefusal(UNPROVEN_UPDATE);
+      const message = sanitizeUpdateResultMessage(result.message);
+      if (result.status === "failed") {
+        return { status: "failed", message: message ?? "The updater failed." };
+      }
+      signal.throwIfAborted();
+      return { ...result, message };
+    } finally {
+      lease.release();
+    }
+  }
+
+  private async runUpdate(task: ProviderUpdateTask): Promise<void> {
+    const { provider, version, client, operation } = task;
+    let result: InstallationUpdateResult;
+    try {
+      result = await this.executeUpdate(task);
+    } catch (error) {
+      this.logger.warn({ provider }, "Provider update failed");
+      let message: string | undefined;
+      if (error instanceof UpdateRefusal) message = error.message;
+      else if (error instanceof Error) message = sanitizeUpdateResultMessage(error.message);
+      result = { status: "failed", message: message ?? "The updater failed." };
+    }
+    // A config commit may run between the update promise settling and publication.
+    const current = this.sameConfiguration(provider, version, client);
+    if (result.status === "succeeded" && !current) {
+      result = { status: "succeeded", outcome: "unverified", message: UPDATE_UNVERIFIED };
+    }
+    if (result.status === "succeeded" && current) {
       this.inspections.delete(client);
       this.updateChecks.delete(client);
     }
     operation.settle(result, this.timestamp());
-    if (result.status === "succeeded" && this.refreshProvider) {
-      await this.refreshProvider(provider).catch((error: unknown) => {
-        this.logger.warn({ err: error, provider }, "Provider refresh after update failed");
+    if (!current || result.status !== "succeeded") return;
+    const refresh = this.refreshProvider;
+    if (!refresh) return;
+    void Promise.resolve()
+      .then(() => {
+        if (!this.shutdown && this.sameConfiguration(provider, version, client))
+          return refresh(provider);
+        return undefined;
+      })
+      .catch(() => {
+        this.logger.warn({ provider }, "Provider refresh after update failed");
       });
-    }
   }
 
   private timestamp(): string {
@@ -321,7 +568,7 @@ export class ProviderInstallations {
     return client;
   }
 
-  private read<T extends ProviderCallResult>(
+  private read<T>(
     provider: AgentProvider,
     client: AgentClient,
     cache: WeakMap<AgentClient, CachedRead<T>>,
@@ -351,10 +598,7 @@ export class ProviderInstallations {
     return read.settledAt !== null && this.now() - read.settledAt < read.cacheMs;
   }
 
-  private async invoke<T extends ProviderCallResult>(
-    provider: AgentProvider,
-    call: ProviderCall<T>,
-  ): Promise<T> {
+  private async invoke<T>(provider: AgentProvider, call: ProviderCall<T>): Promise<T> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_resolve, reject) => {
@@ -365,8 +609,7 @@ export class ProviderInstallations {
       }, call.timeoutMs);
     });
     try {
-      const result = await Promise.race([call.run({ signal: controller.signal }), deadline]);
-      return call.parse(result);
+      return await Promise.race([call.run({ signal: controller.signal }), deadline]);
     } catch (error) {
       this.logger.warn({ err: error, provider }, `Provider installation ${call.name} failed`);
       return call.failed(error instanceof Error ? error.message : String(error));

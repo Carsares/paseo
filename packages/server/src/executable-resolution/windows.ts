@@ -1,5 +1,6 @@
 import { readdirSync } from "node:fs";
-import { extname, join } from "node:path";
+import { stat } from "node:fs/promises";
+import { extname, join, resolve, win32 } from "node:path";
 
 interface WindowsFindExecutableOptions {
   enumeratePathCandidates: (name: string) => Promise<string[]>;
@@ -55,9 +56,56 @@ async function find(input: string, options: WindowsFindExecutableOptions): Promi
   const wingetCandidates = enumerateWingetPackageCandidates(
     input,
     options.localAppData ?? process.env.LOCALAPPDATA,
-  ).filter(options.exists);
+  );
 
   return findFirstProbeable([...pathCandidates, ...wingetCandidates], options);
+}
+
+interface WindowsFileLookupOptions {
+  cwd: string;
+  path?: string;
+  pathExt?: string;
+  wingetLocalAppData?: string;
+  searchLaunchDirectory: boolean;
+}
+
+async function firstFile(candidates: Iterable<string>): Promise<string | null> {
+  for (const candidate of candidates) {
+    const info = await stat(candidate).catch(() => null);
+    if (info?.isFile()) return candidate;
+  }
+  return null;
+}
+
+function* pathFileCandidates(input: string, options: WindowsFileLookupOptions) {
+  const extensions = (options.pathExt || ".EXE;.CMD;.BAT;.COM")
+    .split(";")
+    .map((extension) => extension.trim())
+    .filter(Boolean);
+  const suffix = win32.extname(input);
+  const literalPath = hasPathSeparator(input);
+  if (literalPath && suffix) {
+    yield resolve(options.cwd, input);
+    return;
+  }
+  const matchingSuffixes = suffix ? ["", ...extensions] : extensions;
+  const bases = literalPath
+    ? [resolve(options.cwd, input)]
+    : [
+        ...(options.searchLaunchDirectory ? [join(options.cwd, input)] : []),
+        ...(options.path
+          ?.split(";")
+          .map((entry) => resolve(options.cwd, entry.replace(/^"(.*)"$/u, "$1"), input)) ?? []),
+      ];
+  for (const base of bases) {
+    for (const extension of matchingSuffixes) yield base + extension;
+  }
+}
+
+async function findWithoutProbing(input: string, options: WindowsFileLookupOptions) {
+  const found = await firstFile(pathFileCandidates(input, options));
+  if (found || hasPathSeparator(input) || !options.wingetLocalAppData) return found;
+  return firstFile(enumerateWingetPackageCandidates(input, options.wingetLocalAppData));
 }
 
 async function findFirstProbeable(
@@ -92,4 +140,5 @@ function exists(executablePath: string, options: WindowsExecutableExistsOptions)
 export const windowsExecutableResolution = {
   exists,
   find,
+  findWithoutProbing,
 };

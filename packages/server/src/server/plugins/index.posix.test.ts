@@ -18,6 +18,9 @@ import pino from "pino";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DaemonConfigStore } from "../daemon-config-store.js";
 import { PluginService } from "./index.js";
+import { PluginRuntime } from "./runtime.js";
+import { PluginAgentClientRegistry } from "../agent/plugin-provider.js";
+import { ProviderInstallations } from "../agent/provider-installation/provider-installations.js";
 import { BuiltinPluginLoader } from "./builtin/index.js";
 import { ManagedPluginSources } from "./managed-source.js";
 import type { PluginProviderMetadata } from "./plugin-process-protocol.js";
@@ -309,29 +312,27 @@ describe("PluginService", () => {
   );
 
   it.each(["subprocess", "builtin"] as const)(
-    "carries a provider update's output and result through the %s plugin runtime",
+    "rejects an old provider update in the %s plugin runtime",
     async (runtime) => {
       const home = await mkdtemp(path.join(tmpdir(), "paseo-plugin-home-"));
       roots.push(home);
+      const marker = path.join(home, "update-ran");
       const directory = await createPlugin(
         "provider-update",
-        `export default function contribute(server) {
-      server.registerProvider({ id: "plugin-agent", label: "Plugin agent", command: ["agent"],
-        installation: {
-          async update({ launch, report }) {
-            report({ type: "message", text: "Running " + launch.command + " update\\n" });
-            report({ type: "stdout", text: " added 1 package\\r\\n" });
-            report({ type: "bogus", text: "dropped" });
-            report({ type: "stderr", text: "warn \\u001b[33mold\\u001b[0m\\n" });
-            if (launch.env.MODE === "throw") throw new Error(" updater crashed \\n");
-            if (launch.env.MODE === "fail") return { status: "failed", message: " exit 3 \\n" };
-            return { status: "succeeded", message: " Restart agents \\n" };
-          },
-        },
-        async connect() { throw new Error("not connected by this test"); },
-      });
-      return () => {};
-    }`,
+        `import { writeFile } from "node:fs/promises";
+        export default function contribute(server) {
+          server.registerProvider({ id: "plugin-agent", label: "Plugin agent",
+            installation: {
+              maintenance: { kind: "automatic" },
+              async update() {
+                await writeFile(${JSON.stringify(marker)}, "ran");
+                return { status: "succeeded" };
+              },
+            },
+            async connect() { throw new Error("not connected by this test"); },
+          });
+          return () => {};
+        }`,
       );
       const store = createStore(home);
       const builtinRoot = path.join(home, "builtins");
@@ -339,52 +340,51 @@ describe("PluginService", () => {
         await mkdir(builtinRoot);
         await cp(directory, path.join(builtinRoot, "provider-update"), { recursive: true });
       }
+      const logger = pino({ level: "silent" });
       const builtinPlugins = new BuiltinPluginLoader(
         builtinRoot,
         runtime === "builtin" ? ["provider-update"] : [],
       );
+      const pluginRuntime = new PluginRuntime(logger, "0.4.0");
       const service = bindTestSessionHost(
-        new PluginService(pino({ level: "silent" }), store, "0.4.0", { builtinPlugins }),
+        new PluginService(logger, store, "0.4.0", { builtinPlugins, runtime: pluginRuntime }),
       );
+      const registry = new PluginAgentClientRegistry(logger);
       await service.start();
       try {
         if (runtime === "subprocess") await service.installDirectory({ path: directory });
         const [registration] = service.getProviderRegistrations();
-        const update = registration!.installation!.update!;
-        const run = async (env: Record<string, string>) => {
-          const output: unknown[] = [];
-          const result = await update({
-            launch: { command: "/bin/agent", args: [], env, resolved: true },
-            signal: new AbortController().signal,
-            report: (event) => output.push(event),
-          }).catch((error: Error) => ({ thrown: error.message }));
-          return { result, output };
+        const maintenance = {
+          kind: "manual",
+          message: "Update this CLI with its original installer or package manager.",
         };
-        const output = [
-          { type: "message", text: "Running /bin/agent update\n" },
-          { type: "stdout", text: " added 1 package\r\n" },
-          { type: "stderr", text: "warn \u001b[33mold\u001b[0m\n" },
-        ];
-        await expect(run({})).resolves.toEqual({
-          result: { status: "succeeded", message: " Restart agents \n" },
-          output,
+        expect(registration?.installation?.maintenance).toEqual(maintenance);
+        expect(registration?.installation?.update).toBeUndefined();
+        registry.replace([registration!]);
+        const installations = new ProviderInstallations({
+          logger,
+          resolveClient: (id) => registry.clients()[id] ?? null,
         });
-        await expect(run({ MODE: "fail" })).resolves.toEqual({
-          result: { status: "failed", message: " exit 3 \n" },
-          output,
-        });
-        await expect(run({ MODE: "throw" })).resolves.toEqual({
-          result: { thrown: " updater crashed \n" },
-          output,
-        });
+        await expect(installations.inspect("plugin-agent")).resolves.toEqual({ maintenance });
+        expect(() => installations.update("plugin-agent")).toThrow("cannot update itself");
+        await expect(
+          pluginRuntime.updateProvider("provider-update", "plugin-agent", {
+            signal: new AbortController().signal,
+            report() {
+              throw new Error("The callback must not produce output");
+            },
+          }),
+        ).resolves.toEqual({ status: "failed", message: maintenance.message });
+        await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
       } finally {
+        await registry.shutdown();
         await service.stopAllPlugins();
       }
     },
   );
 
   it.each(["subprocess", "builtin"] as const)(
-    "carries provider installation links, inspect and update checks through the %s plugin runtime",
+    "carries provider installation guides, maintenance and checks through the %s plugin runtime",
     async (runtime) => {
       const home = await mkdtemp(path.join(tmpdir(), "paseo-plugin-home-"));
       roots.push(home);
@@ -395,6 +395,7 @@ describe("PluginService", () => {
         installation: {
           installUrl: "https://example.com/install",
           updateUrl: "https://example.com/update",
+          maintenance: { kind: "manual", message: "Update through the original installer" },
           async inspect({ launch, signal }) {
             if (launch.env.HANG === "yes")
               return await new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("aborted"))));
@@ -434,6 +435,7 @@ describe("PluginService", () => {
         expect(installation).toMatchObject({
           installUrl: "https://example.com/install",
           updateUrl: "https://example.com/update",
+          maintenance: { kind: "manual", message: "Update through the original installer" },
         });
         const signal = new AbortController().signal;
         const launch = { command: "/bin/agent", args: [], env: { VERSION: " 1.0 (beta)\n" } };

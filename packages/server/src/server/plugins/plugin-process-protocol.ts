@@ -6,6 +6,7 @@ import type {
   ProviderCatalogOptions,
   ProviderEvent,
   ProviderInput,
+  ProviderInstallation,
   ProviderInstallationLaunch,
   ProviderStatusRequest,
   ProviderUpdateReport,
@@ -33,10 +34,17 @@ export interface PluginProviderMetadata {
 export interface PluginProviderInstallationMetadata {
   installUrl?: string;
   updateUrl?: string;
+  maintenance?: ProviderInstallation["maintenance"];
   hasInspect: boolean;
   hasCheckForUpdates: boolean;
+  /** Accepted from an older plugin process so the host can show manual update instructions. */
   hasUpdate?: boolean;
 }
+
+export const PLUGIN_MANUAL_UPDATE_MAINTENANCE = {
+  kind: "manual",
+  message: "Update this CLI with its original installer or package manager.",
+} as const;
 
 export interface PluginUsageSourceMetadata {
   id: string;
@@ -183,6 +191,13 @@ const providerMetadataSchema = z
       .object({
         installUrl: z.string().optional(),
         updateUrl: z.string().optional(),
+        maintenance: z
+          .object({
+            kind: z.enum(["automatic", "external", "manual"]),
+            message: z.string().optional(),
+          })
+          .strict()
+          .optional(),
         hasInspect: z.boolean(),
         hasCheckForUpdates: z.boolean(),
         hasUpdate: z.boolean().optional(),

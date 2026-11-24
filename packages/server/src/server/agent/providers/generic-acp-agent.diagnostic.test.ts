@@ -6,10 +6,30 @@ import path from "node:path";
 import { describe, expect, test } from "vitest";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
+import { installationActivity } from "../provider-installation/installation-activity.js";
 import { runProviderRefreshWithDeadline } from "../provider-refresh-deadline.js";
 import { buildVersionProbeCommand, GenericACPAgentClient } from "./generic-acp-agent.js";
 
 const TEST_ACP_TIMEOUT_MS = 1_000;
+const otherInstallation = { family: "other-provider", keys: ["file:other-installation"] };
+
+function assertUpdateBlocked() {
+  expect(() => installationActivity.acquireUpdate(otherInstallation).release()).toThrow("in use");
+}
+
+async function expectVersionProbeReady(file: string) {
+  await expect.poll(() => readFile(file, "utf8").catch(() => "")).toBe("ready");
+}
+
+function canAcquireUpdate(): boolean {
+  try {
+    installationActivity.acquireUpdate(otherInstallation).release();
+    return true;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("in use")) return false;
+    throw error;
+  }
+}
 
 function parseInitializeTrace(content: string): Array<{ clientCapabilities: unknown }> {
   return content
@@ -24,6 +44,95 @@ function historyBudgetClock(): () => number {
 }
 
 describe("GenericACPAgentClient diagnostics", () => {
+  test("does not start diagnostic, catalog, or session children while an update is active", async () => {
+    await withFakeACPAgent("success", async (scriptPath, mode, testDir) => {
+      const client = new GenericACPAgentClient({
+        logger: createTestLogger(),
+        command: [process.execPath, scriptPath, mode],
+        diagnosticPhaseTimeoutMs: TEST_ACP_TIMEOUT_MS,
+      });
+      const update = installationActivity.acquireUpdate(otherInstallation);
+      try {
+        await expect(client.isAvailable()).resolves.toBe(true);
+        const { diagnostic } = await client.getDiagnostic();
+        expect(diagnostic).toContain("Version: error: This installation is being updated");
+        expect(diagnostic).toContain("ACP spawn: error: This installation is being updated");
+        await expect(
+          client.fetchCatalog({ scope: "workspace", cwd: testDir, force: true }),
+        ).rejects.toThrow("being updated");
+        await expect(client.createSession({ provider: "acp", cwd: testDir })).rejects.toThrow(
+          "being updated",
+        );
+      } finally {
+        update.release();
+      }
+    });
+  });
+
+  test("keeps an opaque session's installation occupied until the child closes", async () => {
+    await withFakeACPAgent("success", async (scriptPath, mode, testDir) => {
+      const client = new GenericACPAgentClient({
+        logger: createTestLogger(),
+        command: [process.execPath, scriptPath, mode],
+      });
+      const session = await client.createSession({ provider: "acp", cwd: testDir });
+      try {
+        assertUpdateBlocked();
+      } finally {
+        await session.close();
+      }
+      await expect.poll(canAcquireUpdate).toBe(true);
+    });
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "keeps the installation occupied while the diagnostic version command runs",
+    async () => {
+      await withTempDir("paseo-acp-version-lock-", async (testDir) => {
+        const launcher = path.join(testDir, "launcher");
+        const script = path.join(testDir, "version.cjs");
+        const ready = path.join(testDir, "ready");
+        const finish = path.join(testDir, "finish");
+        await writeFile(launcher, '#!/bin/sh\nexec "$ACP_TEST_NODE" "$ACP_TEST_SCRIPT" "$@"\n', {
+          mode: 0o755,
+        });
+        await writeFile(
+          script,
+          `
+          if (process.argv[2] !== "--version") process.exit(1);
+          const fs = require("node:fs");
+          fs.writeFileSync(process.env.ACP_TEST_READY, "ready");
+          const timer = setInterval(() => {
+            if (!fs.existsSync(process.env.ACP_TEST_FINISH)) return;
+            console.log("1.2.3");
+            clearInterval(timer);
+          }, 10);
+          `,
+        );
+        const client = new GenericACPAgentClient({
+          logger: createTestLogger(),
+          command: [launcher, "--acp"],
+          env: {
+            ACP_TEST_NODE: process.execPath,
+            ACP_TEST_SCRIPT: script,
+            ACP_TEST_READY: ready,
+            ACP_TEST_FINISH: finish,
+          },
+        });
+        const probe = client.getDiagnostic();
+        try {
+          await expectVersionProbeReady(ready);
+          assertUpdateBlocked();
+        } finally {
+          await writeFile(finish, "finish");
+          await probe;
+        }
+        expect((await probe).diagnostic).toContain("Version: 1.2.3");
+        await expect.poll(canAcquireUpdate).toBe(true);
+      });
+    },
+  );
+
   test("filters empty ACP sessions by replaying history and returns prompt previews", async () => {
     await withFakeACPAgent("history-list", async (scriptPath, mode, testDir) => {
       const closeTracePath = path.join(testDir, "session-close.jsonl");

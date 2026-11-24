@@ -1,4 +1,4 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { openCodeMajorVersion } from "./runtime-client.js";
 
 test.each([
@@ -323,15 +323,166 @@ test("selects v2 without probing the binary when an external server is configure
   const { createTestLogger } = await import("../../../../test-utils/test-logger.js");
   const client = new OpenCodeRuntimeClient(createTestLogger(), {
     command: { mode: "replace", argv: [process.execPath, "-e", "process.exit(1)"] },
-    env: { PASEO_OPENCODE_SERVER_URL: "http://127.0.0.1:4096" },
+    env: {
+      PASEO_OPENCODE_SERVER_URL: "http://127.0.0.1:4096",
+      PASEO_OPENCODE_SERVER_PASSWORD: "test-password",
+    },
   });
   try {
     const { controls } = await client.listControls({ provider: "opencode", cwd: "/tmp/project" });
     expect(controls.map((control) => control.label)).toEqual(["Auto-accept"]);
+    await expectExternalInstallation(client.installation);
   } finally {
     await client.shutdown();
   }
 });
+
+async function expectExternalInstallation(
+  installation: import("../../agent-sdk-types.js").AgentClientInstallation,
+) {
+  const signal = new AbortController().signal;
+  const message = "Update OpenCode on the host that manages the connected server.";
+  await expect(installation.getMaintenance!({ signal })).resolves.toEqual({
+    kind: "external",
+    message,
+  });
+  await expect(installation.inspect!({ signal })).resolves.toEqual({ status: "installed" });
+  await expect(
+    installation.update!({
+      signal,
+      report: () => {
+        throw new Error("The local updater must not start for an external server");
+      },
+    }),
+  ).resolves.toEqual({ status: "failed", message });
+}
+
+test.each(["external", "owned", "external during inspection"] as const)(
+  "reports a consistent installation for OpenCode service selection: %s",
+  async (selected) => {
+    const { createServer } = await import("node:http");
+    const { mkdir, mkdtemp, rm, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { OpenCodeRuntimeClient } = await import("./runtime-client.js");
+    const { createTestLogger } = await import("../../../../test-utils/test-logger.js");
+    const { ProviderInstallations } =
+      await import("../../provider-installation/provider-installations.js");
+    const root = await mkdtemp(join(tmpdir(), "opencode-external-maintenance-"));
+    const server = createServer((request, response) => {
+      if (
+        request.headers.authorization !==
+        `Basic ${Buffer.from("opencode:test-password").toString("base64")}`
+      ) {
+        response.writeHead(401).end();
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ version: "2.0.10", pid: process.pid }));
+    });
+    try {
+      const state = join(root, "opencode");
+      await mkdir(state);
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("No test address");
+      const registration = join(state, "service.json");
+      const publish = () =>
+        writeFile(
+          registration,
+          JSON.stringify({
+            url: `http://127.0.0.1:${address.port}`,
+            password: "test-password",
+            pid: process.pid,
+            version: "2.0.10",
+          }),
+        );
+      const script = join(root, "version.cjs");
+      await writeFile(script, 'console.log("opencode 1.19.5")');
+      const logger = createTestLogger();
+      const client = new OpenCodeRuntimeClient(logger, {
+        command: { mode: "replace", argv: [process.execPath, script] },
+        env: { XDG_STATE_HOME: root, PASEO_OPENCODE_SERVER_URL: "" },
+      });
+      const installations = new ProviderInstallations({
+        logger,
+        resolveClient: () => client,
+        now: () => 0,
+      });
+      const inspect = () => installations.inspect("opencode");
+      const localInstallation = {
+        inspection: { status: "installed", version: "1.19.5" },
+        maintenance: { kind: "manual" },
+      };
+      const externalInstallation = {
+        maintenance: { kind: "external" },
+      };
+      try {
+        const controls = () => client.listControls({ provider: "opencode", cwd: root });
+        if (selected === "external during inspection") {
+          const diagnostics = await import("../diagnostic-utils.js");
+          const started = Promise.withResolvers<void>();
+          const finish = Promise.withResolvers<string>();
+          const version = vi
+            .spyOn(diagnostics, "readCommandVersionOutput")
+            .mockImplementationOnce(async () => {
+              started.resolve();
+              return finish.promise;
+            });
+          const localRead = inspect();
+          try {
+            await Promise.race([
+              started.promise,
+              localRead.then(() => {
+                throw new Error("Inspection finished without reading the local version");
+              }),
+            ]);
+            await publish();
+            expect((await controls()).controls[0]?.label).toBe("Auto-accept");
+            const externalRead = inspect();
+            finish.resolve("opencode 1.19.5");
+            await expect(localRead).resolves.toMatchObject(localInstallation);
+            const current = await externalRead;
+            expect(current).toMatchObject(externalInstallation);
+            expect(current?.inspection).toEqual({ status: "installed" });
+          } finally {
+            finish.resolve("opencode 1.19.5");
+            await localRead;
+            version.mockRestore();
+          }
+        } else if (selected === "external") {
+          await expect(inspect()).resolves.toMatchObject(localInstallation);
+          await publish();
+          await expectExternalInstallation(client.installation);
+          expect((await controls()).controls[0]?.label).toBe("Auto-accept");
+        } else {
+          expect((await controls()).controls[0]?.label).toBe("Auto Accept");
+          await expect(inspect()).resolves.toMatchObject(localInstallation);
+          await publish();
+          await expect(installations.inspect("opencode", { refresh: true })).resolves.toMatchObject(
+            localInstallation,
+          );
+          expect((await controls()).controls[0]?.label).toBe("Auto Accept");
+          return;
+        }
+        const current = await inspect();
+        expect(current).toMatchObject(externalInstallation);
+        expect(current?.inspection).toEqual({ status: "installed" });
+        await rm(registration);
+        const refreshed = await installations.inspect("opencode", { refresh: true });
+        expect(refreshed).toMatchObject(externalInstallation);
+        expect(refreshed?.inspection).toEqual({ status: "installed" });
+        await expectExternalInstallation(client.installation);
+        expect((await controls()).controls[0]?.label).toBe("Auto-accept");
+      } finally {
+        await client.shutdown();
+      }
+    } finally {
+      if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("keeps native Paseo tools available when an external server is configured", async () => {
   const { OpenCodeRuntimeClient } = await import("./runtime-client.js");

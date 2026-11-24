@@ -50,6 +50,12 @@ export function createMuseProvider(
     command: ["muse"],
     installation: {
       installUrl: "https://paseo.sh/docs/muse-code",
+      updateUrl: "https://dev.meta.ai/docs/muse-code#install",
+      maintenance: {
+        kind: "external",
+        message:
+          "The Meta launcher manages the update channel. For other installs, see Meta’s installation guide and use the original installation method.",
+      },
       async inspect({ launch, signal }) {
         if (!launch?.resolved) return { status: "not_installed" };
         const version = await readVersion(launch, signal);

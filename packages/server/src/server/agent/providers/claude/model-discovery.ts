@@ -1,6 +1,7 @@
 import type { ChildProcess } from "node:child_process";
 import os from "node:os";
 import type { ModelInfo, Query, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { readInstallationActivityKeys } from "../../provider-installation/installation-target.js";
 import { raceProviderRefreshAbort } from "../../provider-refresh-deadline.js";
 import type { ProviderRuntimeSettings } from "../../provider-launch-config.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
@@ -60,6 +61,11 @@ export async function discoverClaudeModels(
   try {
     signal.throwIfAborted();
     const binary = await raceProviderRefreshAbort(signal, options.resolveBinary());
+    const installationKeys =
+      options.runtimeSettings?.command?.mode === "replace"
+        ? []
+        : await raceProviderRefreshAbort(signal, readInstallationActivityKeys(binary));
+    signal.throwIfAborted();
     query = openQuery(
       {
         prompt: input,
@@ -79,6 +85,8 @@ export async function discoverClaudeModels(
       },
       {
         runtimeSettings: options.runtimeSettings,
+        installationKeys,
+        assertCanSpawn: () => signal.throwIfAborted(),
         onChildProcess: (process) => {
           child = process;
         },

@@ -3522,6 +3522,14 @@ export const es: TranslationResources = {
         updateFailed: "No se pudo actualizar",
         outputTruncated: "Se descartó la salida anterior.",
         updatesFailed: "No se pudo comprobar si hay actualizaciones",
+        maintenanceAutomatic: "Mantenimiento automático",
+        maintenanceExternal: "Gestionado externamente",
+        maintenanceExternalHint: "Usa la herramienta que instaló esta CLI para actualizarla.",
+        maintenanceManual: "Requiere actualización manual",
+        maintenanceManualHint:
+          "Sigue las instrucciones del proveedor para actualizar en este host.",
+        alreadyCurrent: "Ya está actualizado",
+        updateUnverified: "Actualización finalizada, versión sin confirmar",
         installInstructions: "Instrucciones de instalación",
       },
       diagnostic: {

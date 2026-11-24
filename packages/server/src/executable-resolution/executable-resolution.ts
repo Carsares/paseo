@@ -1,5 +1,6 @@
-import { existsSync } from "node:fs";
-import { delimiter, resolve } from "node:path";
+import { constants, existsSync } from "node:fs";
+import { access, realpath, stat } from "node:fs/promises";
+import { delimiter, isAbsolute, resolve } from "node:path";
 import type { ProcessEnvRecord } from "../server/paseo-env.js";
 import { execCommand } from "../utils/spawn.js";
 import which from "which";
@@ -114,6 +115,55 @@ export function executableExists(
   return exists(executablePath) ? executablePath : null;
 }
 
+export interface ExecutableFileLookupOptions {
+  cwd: string;
+  path?: string;
+  env?: ProcessEnvRecord;
+  platform?: NodeJS.Platform;
+  winGetFallback?: boolean;
+  /** Preserve the working-directory search for callers that previously used cmd.exe. */
+  searchWindowsLaunchDirectory?: boolean;
+}
+
+// Windows child processes receive the first spelling after sorting environment keys.
+function readWindowsEnv(env: ProcessEnvRecord, name: string): string | undefined {
+  const key = Object.keys(env)
+    .sort()
+    .find((entry) => entry.toUpperCase() === name);
+  return key === undefined ? undefined : env[key];
+}
+
+async function isPosixExecutableFile(candidate: string): Promise<boolean> {
+  try {
+    await access(candidate, constants.X_OK);
+    return (await stat(candidate)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function findPosixExecutableFile(name: string, cwd: string, searchPath: string) {
+  if (name.includes("/")) {
+    // The filesystem must traverse symlinks before interpreting a later `..`.
+    const command = isAbsolute(name) ? name : `${cwd}/${name}`;
+    if (!(await isPosixExecutableFile(command))) return null;
+    const normalized = resolve(command);
+    if (command === normalized) return command;
+    const [actual, regular] = await Promise.all([
+      realpath(command).catch(() => null),
+      realpath(normalized).catch(() => null),
+    ]);
+    return actual !== null && actual === regular ? normalized : command;
+  }
+  for (const entry of searchPath.split(delimiter)) {
+    let directory = entry || cwd;
+    if (entry && !isAbsolute(entry)) directory = `${cwd}/${entry}`;
+    const candidate = `${directory}${directory.endsWith("/") ? "" : "/"}${name}`;
+    if (await isPosixExecutableFile(candidate)) return candidate;
+  }
+  return null;
+}
+
 // PATH lookup that never runs the candidate, unlike findExecutable which probes
 // each one with `--version`. A terminal spawn path cannot afford that probe: it
 // would execute the profile command once before the terminal even opens.
@@ -121,20 +171,26 @@ export function executableExists(
 // environment its child process will actually get rather than the daemon's own.
 export async function findExecutableWithoutProbing(
   name: string,
-  options: { path?: string; cwd: string },
+  options: ExecutableFileLookupOptions,
 ): Promise<string | null> {
   if (!name) {
     return null;
   }
-  const path =
-    options.path === undefined
-      ? undefined
-      : options.path
-          .split(delimiter)
-          .map((entry) => resolve(options.cwd, entry))
-          .join(delimiter);
-  const candidates = await enumerateCandidatesViaLibrary(name, { PATH: path });
-  return candidates[0] ?? null;
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  if (platform === "win32") {
+    return windowsExecutableResolution.findWithoutProbing(name, {
+      cwd: options.cwd,
+      path: options.path ?? readWindowsEnv(env, "PATH") ?? process.env.PATH,
+      pathExt: readWindowsEnv(env, "PATHEXT"),
+      wingetLocalAppData: options.winGetFallback ? readWindowsEnv(env, "LOCALAPPDATA") : undefined,
+      searchLaunchDirectory:
+        options.searchWindowsLaunchDirectory === true &&
+        readWindowsEnv(env, "NODEFAULTCURRENTDIRECTORYINEXEPATH") === undefined,
+    });
+  }
+  const searchPath = options.path ?? env.PATH ?? process.env.PATH ?? "";
+  return findPosixExecutableFile(name, options.cwd, searchPath);
 }
 
 export interface ExecutableResolutionOptions {

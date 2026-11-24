@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { PluginSessionHistory } from "./plugin-session-history.js";
-import { resolve as resolvePath } from "node:path";
+import { findInstallationLaunchPath } from "./provider-installation/installation-target.js";
+import { PLUGIN_MANUAL_UPDATE_MAINTENANCE } from "../plugins/plugin-process-protocol.js";
 import type { Logger } from "pino";
 import type { JsonValue, ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { z } from "zod";
@@ -14,7 +15,6 @@ import {
   type ProviderStatus,
   type ProviderInspection,
   type ProviderUpdateCheck,
-  type ProviderUpdateResult,
   type ProviderInstallationLaunch,
   type ProviderLaunch,
   requireProviderCapabilities,
@@ -37,7 +37,6 @@ import type {
   AgentClient,
   AgentClientInstallation,
   AgentClientUpdateCheckContext,
-  AgentClientUpdateContext,
   AgentCreateSessionOptions,
   AgentLaunchContext,
   AgentMode,
@@ -67,7 +66,6 @@ import type {
 } from "./agent-sdk-types.js";
 import {
   resolveProviderLaunch,
-  checkProviderLaunchAvailable,
   createProviderEnv,
   type ProviderRuntimeSettings,
 } from "./provider-launch-config.js";
@@ -174,12 +172,14 @@ class ProviderRuntime {
     });
     if (launch.source !== "override") launch.args.unshift(...command.slice(1));
     const env = createProviderEnv({ runtimeSettings: this.runtimeSettings });
-    launch.env = env;
-    const availability = await checkProviderLaunchAvailable(launch);
-    if (!availability.resolvedPath)
-      return { command: launch.command, args: launch.args, env, resolved: false };
+    const resolvedPath = await findInstallationLaunchPath(launch.command, {
+      cwd: process.cwd(),
+      env,
+      winGetFallback: true,
+    });
+    if (!resolvedPath) return { command: launch.command, args: launch.args, env, resolved: false };
     return {
-      command: resolvePath(availability.resolvedPath),
+      command: resolvedPath,
       args: launch.args,
       env,
       resolved: true,
@@ -213,14 +213,6 @@ class ProviderRuntime {
     const launch = await this.resolveEffectiveLaunch();
     context.signal.throwIfAborted();
     return await checkForUpdates.call(this.registration.installation, { ...context, launch });
-  }
-
-  async update(context: AgentClientUpdateContext): Promise<ProviderUpdateResult> {
-    const update = this.registration.installation?.update;
-    if (!update) throw new Error("Provider does not update itself");
-    const launch = await this.resolveEffectiveLaunch();
-    context.signal.throwIfAborted();
-    return await update.call(this.registration.installation, { ...context, launch });
   }
 
   async status(): Promise<ProviderStatus> {
@@ -1027,17 +1019,20 @@ class PluginAgentClient implements AgentClient {
     if (registration.getCatalogCacheKey)
       this.getCatalogCacheKey = (options) => this.runtime.catalogCacheKey(options);
     const installation = registration.installation;
+    const maintenance = installation?.update
+      ? PLUGIN_MANUAL_UPDATE_MAINTENANCE
+      : installation?.maintenance;
     if (installation)
       this.installation = {
         installUrl: installation.installUrl,
         updateUrl: installation.updateUrl,
+        getMaintenance: maintenance ? async () => maintenance : undefined,
         inspect: installation.inspect
           ? ({ signal }) => this.runtime.inspectInstallation(signal)
           : undefined,
         checkForUpdates: installation.checkForUpdates
           ? (context) => this.runtime.checkForUpdates(context)
           : undefined,
-        update: installation.update ? (context) => this.runtime.update(context) : undefined,
       };
     this.runtime.onSessionOpened((session, opened) => this.acceptChild(session, opened));
   }

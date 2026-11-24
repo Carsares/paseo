@@ -2,6 +2,7 @@ import { PluginAgentTools } from "./agent-tools.js";
 import { PluginHookHandlers } from "./lifecycle/index.js";
 import { evaluateBundle } from "./bundle-evaluator.js";
 import {
+  PLUGIN_MANUAL_UPDATE_MAINTENANCE,
   PluginProcessRequestSchema,
   type PluginProcessMessage,
   type PluginProcessRequest,
@@ -35,8 +36,6 @@ import {
   ProviderStatusSchema,
   ProviderInspectionSchema,
   ProviderUpdateCheckSchema,
-  ProviderUpdateReportSchema,
-  ProviderUpdateResultSchema,
 } from "@getpaseo/plugin/server/provider";
 import { createPaseoApi, type PaseoApi } from "@getpaseo/client";
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
@@ -277,9 +276,11 @@ export function createPluginWorker(options: {
         ? {
             installUrl: provider.installation.installUrl,
             updateUrl: provider.installation.updateUrl,
+            maintenance: provider.installation.update
+              ? PLUGIN_MANUAL_UPDATE_MAINTENANCE
+              : provider.installation.maintenance,
             hasInspect: provider.installation.inspect !== undefined,
             hasCheckForUpdates: provider.installation.checkForUpdates !== undefined,
-            hasUpdate: provider.installation.update !== undefined,
           }
         : undefined,
       command: provider.command,
@@ -294,10 +295,17 @@ export function createPluginWorker(options: {
         ?.abort(new Error("Installation request canceled"));
       return true;
     }
+    if (message.type === "provider.installation.update") {
+      send({
+        type: "result",
+        requestId: message.requestId,
+        output: { status: "failed", message: PLUGIN_MANUAL_UPDATE_MAINTENANCE.message },
+      });
+      return true;
+    }
     if (
       message.type !== "provider.installation.inspect" &&
-      message.type !== "provider.installation.check_updates" &&
-      message.type !== "provider.installation.update"
+      message.type !== "provider.installation.check_updates"
     )
       return false;
     const controller = new AbortController();
@@ -309,27 +317,6 @@ export function createPluginWorker(options: {
         : undefined;
     void (async () => {
       const installation = providers.get(message.providerId)?.installation;
-      if (message.type === "provider.installation.update") {
-        if (!installation?.update)
-          throw new Error(`Provider has no update capability: ${message.providerId}`);
-        let settled = false;
-        const report = (event: unknown) => {
-          const parsed = ProviderUpdateReportSchema.safeParse(event);
-          if (settled || !parsed.success) return;
-          send({
-            type: "provider.installation.report",
-            requestId: message.requestId,
-            report: parsed.data,
-          });
-        };
-        try {
-          return ProviderUpdateResultSchema.parse(
-            await installation.update({ ...context, report }),
-          );
-        } finally {
-          settled = true;
-        }
-      }
       if (message.type === "provider.installation.inspect") {
         if (!installation?.inspect)
           throw new Error(`Provider has no inspect capability: ${message.providerId}`);

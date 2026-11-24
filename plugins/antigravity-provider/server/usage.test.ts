@@ -9,7 +9,7 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true })));
 });
 
-it("discovers the resolved account and maps the CLI's quota buckets", async () => {
+it("maps the resolved account's quota buckets with automatic updates disabled", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "paseo-antigravity-usage-"));
   directories.push(directory);
   const cli = path.join(directory, "cli.cjs");
@@ -17,6 +17,7 @@ it("discovers the resolved account and maps the CLI's quota buckets", async () =
     cli,
     `
     if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(['-p', '/usage', '--output-format', 'json'])) process.exit(2);
+    if (process.env.AGY_CLI_DISABLE_AUTO_UPDATE !== 'true') process.exit(3);
     console.log(JSON.stringify({ status: 'SUCCESS', command: { name: 'usage', data: { groups: [
       { name: 'Gemini Models', buckets: [
         { id: 'gemini-5h', name: 'Five Hour Limit Remaining', window: '5h', remaining_fraction: 0.25, reset_time: '2026-11-19T14:25:08Z' },
@@ -30,7 +31,7 @@ it("discovers the resolved account and maps the CLI's quota buckets", async () =
   const launch = {
     command: process.execPath,
     args: [cli, "acp", "--disable-telemetry"],
-    env: { HOME: directory },
+    env: { HOME: directory, AGY_CLI_DISABLE_AUTO_UPDATE: "false" },
   };
   const source = usage.registration();
   const accounts = await source.discover({ kind: "global", launch });

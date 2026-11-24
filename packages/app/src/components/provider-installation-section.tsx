@@ -18,6 +18,13 @@ import { openExternalUrl } from "@/utils/open-external-url";
 const ThemedLoadingSpinner = withUnistyles(LoadingSpinner);
 const foregroundMutedColorMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
 
+type Maintenance = NonNullable<ProviderInstallation["maintenance"]>;
+const maintenanceLabel = {
+  automatic: "settings.providers.installation.maintenanceAutomatic",
+  external: "settings.providers.installation.maintenanceExternal",
+  manual: "settings.providers.installation.maintenanceManual",
+} as const satisfies Record<Maintenance["kind"], string>;
+
 export type ProviderInstallationState =
   | { status: "unsupported" }
   | { status: "loading" }
@@ -33,6 +40,8 @@ export type ProviderUpdatesState =
   | { status: "loading" }
   | { status: "ready"; updateCheck: ProviderInstallationUpdateCheck | null }
   | { status: "error"; message: string };
+
+const hiddenUpdates: ProviderUpdatesState = { status: "hidden" };
 
 /** Running the provider's own update. Absent when the host cannot report updates. */
 export interface ProviderUpdateAction {
@@ -56,17 +65,16 @@ export function ProviderInstallationSection({
 }) {
   const { t } = useTranslation();
   if (state.status === "unsupported") return null;
-  if (
-    state.status === "ready" &&
-    !state.installation?.inspection &&
-    !state.installation?.installUrl
-  )
-    return null;
   const installation = state.status === "ready" ? state.installation : null;
-  const run = action ? readUpdateRun(action) : null;
-  // A running update keeps its row, so Update shows its progress whatever the inspection reads
-  // meanwhile; the binary may be mid-replacement.
-  const updating = action ? isUpdating(action) : false;
+  const updateUrl = installation?.updateUrl;
+  const updating = Boolean(action && isUpdating(action));
+  const updateAction = offersUpdater(installation, updating) ? action : undefined;
+  const showRunningStatus = !updateAction;
+  const run = action ? readUpdateRun(action, showRunningStatus) : null;
+  const showUpdates = updating || hasUpdateDetails(installation);
+  if (state.status === "ready" && !showUpdates && !run && !hasInstallationDetails(installation)) {
+    return null;
+  }
 
   return (
     <View style={settingsStyles.section} testID="provider-installation">
@@ -77,17 +85,56 @@ export function ProviderInstallationSection({
       </View>
       <View style={settingsStyles.card}>
         <InstallationRow state={state} />
-        {installation?.inspection?.status === "installed" || updating ? (
+        {showUpdates ? (
           <UpdatesRow
-            updates={updates}
-            updateUrl={installation?.updateUrl}
-            action={updating || installation?.canUpdate ? action : undefined}
+            updates={readShownUpdateCheck(updates, run)}
+            maintenance={installation?.maintenance}
+            updateUrl={updateUrl}
+            action={updateAction}
           />
         ) : null}
-        {run ? <UpdateRunRow run={run} updateUrl={installation?.updateUrl} /> : null}
+        {run ? (
+          <UpdateRunRow
+            run={run}
+            showRunningStatus={showRunningStatus}
+            updateUrl={showUpdates && !updateAction ? undefined : updateUrl}
+          />
+        ) : null}
       </View>
     </View>
   );
+}
+
+function hasInstallationDetails(installation: ProviderInstallation | null): boolean {
+  return Boolean(installation?.inspection || installation?.installUrl);
+}
+
+function hasUpdateDetails(installation: ProviderInstallation | null): boolean {
+  const status = installation?.inspection?.status;
+  return (
+    status === "installed" || (status !== "not_installed" && Boolean(installation?.maintenance))
+  );
+}
+
+function offersUpdater(installation: ProviderInstallation | null, updating: boolean): boolean {
+  const kind = installation?.maintenance?.kind;
+  if (kind === "external" || kind === "manual") return false;
+  // The binary may be between versions during an update. Keep the progress visible.
+  return (
+    updating || Boolean(installation?.inspection?.status === "installed" && installation.canUpdate)
+  );
+}
+
+function readShownUpdateCheck(
+  updates: ProviderUpdatesState,
+  run: UpdateRun | null,
+): ProviderUpdatesState {
+  if (updates.status !== "ready" || updates.updateCheck?.status !== "current") return updates;
+  const operation = run?.status === "succeeded" ? run.update.operation : undefined;
+  // The completed operation already says the CLI was current.
+  return operation?.status === "succeeded" && operation.outcome === "already_current"
+    ? hiddenUpdates
+    : updates;
 }
 
 function InstallInstructionsLink({ installUrl }: { installUrl: string }) {
@@ -188,10 +235,12 @@ function InstallationRow({ state }: { state: ProviderInstallationState }) {
  */
 function UpdatesRow({
   updates,
+  maintenance,
   updateUrl,
   action,
 }: {
   updates: ProviderUpdatesState;
+  maintenance: Maintenance | undefined;
   updateUrl: string | undefined;
   /** Present when the provider runs its own update. */
   action: ProviderUpdateAction | undefined;
@@ -200,7 +249,11 @@ function UpdatesRow({
   const updateCheck = updates.status === "ready" ? updates.updateCheck : null;
   const offersUpdate = Boolean(action || updateUrl);
   // With nothing to offer, the row waits until the check has something to say.
-  if (!offersUpdate && !updateCheck && updates.status !== "error") return null;
+  if (!maintenance && !offersUpdate && !updateCheck && updates.status !== "error") return null;
+
+  let checkMessage: string | undefined;
+  if (updates.status === "error") checkMessage = updates.message;
+  else if (updateCheck && "message" in updateCheck) checkMessage = updateCheck.message;
 
   return (
     <View style={[settingsStyles.row, settingsStyles.rowBorder]} testID="provider-updates">
@@ -211,9 +264,47 @@ function UpdatesRow({
             : t("settings.providers.installation.updates")}
         </Text>
         <UpdateCheckSummary updates={updates} />
+        {maintenance ? (
+          <MaintenanceSummary
+            maintenance={maintenance}
+            hasGuide={Boolean(updateUrl)}
+            checkMessage={checkMessage}
+          />
+        ) : null}
       </View>
       <UpdateButton action={action} updateUrl={updateUrl} />
     </View>
+  );
+}
+
+function MaintenanceSummary({
+  maintenance,
+  hasGuide,
+  checkMessage,
+}: {
+  maintenance: Maintenance;
+  hasGuide: boolean;
+  checkMessage: string | undefined;
+}) {
+  const { t } = useTranslation();
+  const label = t(maintenanceLabel[maintenance.kind]);
+  let guidance = maintenance.message;
+  if (!guidance && !hasGuide) {
+    if (maintenance.kind === "external") {
+      guidance = t("settings.providers.installation.maintenanceExternalHint");
+    } else if (maintenance.kind === "manual") {
+      guidance = t("settings.providers.installation.maintenanceManualHint");
+    }
+  }
+  return (
+    <>
+      <Text style={settingsStyles.rowHint}>{label}</Text>
+      {guidance && guidance !== label && guidance !== checkMessage ? (
+        <Text style={settingsStyles.rowHint} selectable>
+          {guidance}
+        </Text>
+      ) : null}
+    </>
   );
 }
 
@@ -320,10 +411,10 @@ type UpdateRun =
  * What the update's row shows, or null for nothing. While the update starts or runs, Update shows
  * its progress and the row holds only the output so far. A new start clears the previous result.
  */
-function readUpdateRun(action: ProviderUpdateAction): UpdateRun | null {
+function readUpdateRun(action: ProviderUpdateAction, showRunningStatus: boolean): UpdateRun | null {
   const update = action.current;
   if (isUpdating(action)) {
-    return update?.operation.status === "running" && update.output.length > 0
+    return update?.operation.status === "running" && (showRunningStatus || update.output.length > 0)
       ? { status: "running", update }
       : null;
   }
@@ -332,27 +423,67 @@ function readUpdateRun(action: ProviderUpdateAction): UpdateRun | null {
   return { status: update.operation.status, update };
 }
 
-function UpdateRunRow({ run, updateUrl }: { run: UpdateRun; updateUrl: string | undefined }) {
+function readUpdateResult(run: UpdateRun, showRunningStatus: boolean) {
+  if (run.status === "running") {
+    return {
+      label: showRunningStatus ? ("settings.providers.installation.updating" as const) : null,
+      showGuide: false,
+    };
+  }
+  if (run.status === "refused") {
+    return {
+      label: "settings.providers.installation.updateFailed",
+      message: run.message,
+      showGuide: true,
+    } as const;
+  }
+  const operation = run.update.operation;
+  if (operation.status === "failed") {
+    return {
+      label: "settings.providers.installation.updateFailed",
+      message: operation.message,
+      showGuide: true,
+    } as const;
+  }
+  if (operation.status !== "succeeded") return { label: null, showGuide: false };
+  const label = {
+    updated: "settings.providers.installation.updated",
+    already_current: "settings.providers.installation.alreadyCurrent",
+    unverified: "settings.providers.installation.updateUnverified",
+  } as const;
+  return {
+    label: label[operation.outcome ?? "updated"],
+    message: operation.message,
+    showGuide: operation.outcome === "unverified",
+  };
+}
+
+function UpdateRunRow({
+  run,
+  showRunningStatus,
+  updateUrl,
+}: {
+  run: UpdateRun;
+  showRunningStatus: boolean;
+  updateUrl: string | undefined;
+}) {
   const { t } = useTranslation();
   const scroll = useRef<ScrollView>(null);
   const followOutput = useCallback(() => scroll.current?.scrollToEnd({ animated: false }), []);
   const update = run.status === "refused" ? null : run.update;
   const output = update?.output.map((entry) => entry.text).join("") ?? "";
-  let message: string | undefined;
-  if (run.status === "refused") message = run.message;
-  else if (run.update.operation.status !== "running") message = run.update.operation.message;
+  const { label, message, showGuide } = readUpdateResult(run, showRunningStatus);
+  const status = label ? t(label) : null;
 
   return (
     <View style={[settingsStyles.row, settingsStyles.rowBorder]} testID="provider-update-run">
       <View style={settingsStyles.rowContent}>
-        {run.status === "running" ? null : (
+        {status ? (
           <Text style={settingsStyles.rowTitle} testID="provider-update-status">
-            {run.status === "succeeded"
-              ? t("settings.providers.installation.updated")
-              : t("settings.providers.installation.updateFailed")}
+            {status}
           </Text>
-        )}
-        {message ? (
+        ) : null}
+        {message && message.trim() !== status ? (
           <Text style={settingsStyles.rowHint} selectable testID="provider-update-message">
             {message}
           </Text>
@@ -383,7 +514,7 @@ function UpdateRunRow({ run, updateUrl }: { run: UpdateRun; updateUrl: string | 
             </Text>
           </ScrollView>
         ) : null}
-        {(run.status === "failed" || run.status === "refused") && updateUrl ? (
+        {showGuide && updateUrl ? (
           <View style={styles.link}>
             <ExternalLink
               href={updateUrl}

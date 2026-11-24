@@ -8405,6 +8405,12 @@ export const ProviderInstallationSchema = z.object({
   inspection: ProviderInstallationInspectionSchema.optional(),
   /** True when the provider can run its own update through `provider.installation.update`. */
   canUpdate: z.boolean().optional(),
+  maintenance: z
+    .object({
+      kind: z.enum(["automatic", "external", "manual"]),
+      message: z.string().optional(),
+    })
+    .optional(),
 });
 
 export const ProviderInstallationInspectResponseMessageSchema = z.object({
@@ -8459,6 +8465,7 @@ export const ProviderInstallationUpdateOperationSchema = z.discriminatedUnion("s
     startedAt: z.string(),
     finishedAt: z.string(),
     message: z.string().optional(),
+    outcome: z.enum(["updated", "already_current", "unverified"]).optional(),
   }),
   z.object({
     status: z.literal("failed"),

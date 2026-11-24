@@ -3505,6 +3505,13 @@ export const ptBR: TranslationResources = {
         updateFailed: "Falha na atualização",
         outputTruncated: "A saída anterior foi descartada.",
         updatesFailed: "Não foi possível verificar atualizações",
+        maintenanceAutomatic: "Manutenção automática",
+        maintenanceExternal: "Gerenciado externamente",
+        maintenanceExternalHint: "Atualize com a ferramenta usada para instalar esta CLI.",
+        maintenanceManual: "Atualização manual necessária",
+        maintenanceManualHint: "Siga as instruções do provedor para atualizar neste host.",
+        alreadyCurrent: "Já está atualizado",
+        updateUnverified: "Atualização concluída, versão não confirmada",
         installInstructions: "Instruções de instalação",
       },
       diagnostic: {

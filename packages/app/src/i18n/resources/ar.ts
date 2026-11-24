@@ -3484,6 +3484,13 @@ export const ar: TranslationResources = {
         updateFailed: "فشل التحديث",
         outputTruncated: "تم حذف المخرجات السابقة.",
         updatesFailed: "تعذّر التحقق من التحديثات",
+        maintenanceAutomatic: "صيانة تلقائية",
+        maintenanceExternal: "إدارة خارجية",
+        maintenanceExternalHint: "حدّث باستخدام الأداة التي ثبّتت واجهة سطر الأوامر هذه.",
+        maintenanceManual: "يلزم التحديث يدويًا",
+        maintenanceManualHint: "اتّبع تعليمات المزوّد للتحديث على هذا المضيف.",
+        alreadyCurrent: "محدّث بالفعل",
+        updateUnverified: "انتهى التحديث دون تأكيد الإصدار",
         installInstructions: "تعليمات التثبيت",
       },
       diagnostic: {

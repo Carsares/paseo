@@ -3514,6 +3514,14 @@ export const ru: TranslationResources = {
         updateFailed: "Не удалось обновить",
         outputTruncated: "Более ранний вывод был отброшен.",
         updatesFailed: "Не удалось проверить обновления",
+        maintenanceAutomatic: "Автоматическое обслуживание",
+        maintenanceExternal: "Управляется извне",
+        maintenanceExternalHint:
+          "Для обновления используйте инструмент, которым установили этот CLI.",
+        maintenanceManual: "Требуется ручное обновление",
+        maintenanceManualHint: "Следуйте инструкциям провайдера по обновлению на этом хосте.",
+        alreadyCurrent: "Версия уже актуальна",
+        updateUnverified: "Обновление завершено, версия не подтверждена",
         installInstructions: "Инструкции по установке",
       },
       diagnostic: {

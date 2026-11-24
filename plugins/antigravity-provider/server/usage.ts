@@ -112,7 +112,7 @@ export class Usage {
             launch.command,
             [...launch.args.slice(0, acpIndex), "-p", "/usage", "--output-format", "json"],
             {
-              env: launch.env,
+              env: { ...launch.env, AGY_CLI_DISABLE_AUTO_UPDATE: "true" },
               timeout: 18_000,
               maxBuffer: 1024 * 1024,
             },

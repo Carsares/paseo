@@ -3409,6 +3409,13 @@ export const zhCN: TranslationResources = {
         updateFailed: "更新失败",
         outputTruncated: "较早的输出已被丢弃。",
         updatesFailed: "无法检查更新",
+        maintenanceAutomatic: "自动维护",
+        maintenanceExternal: "由外部管理",
+        maintenanceExternalHint: "请用安装此 CLI 的工具更新。",
+        maintenanceManual: "需要手动升级",
+        maintenanceManualHint: "请按提供方的说明在此主机上升级。",
+        alreadyCurrent: "已是最新版本",
+        updateUnverified: "更新已结束，版本未确认",
         installInstructions: "安装说明",
       },
       diagnostic: {

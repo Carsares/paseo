@@ -10,7 +10,7 @@ import type {
   UserMessageForkContext,
 } from "@getpaseo/protocol/agent-types";
 import type { AgentMessage } from "@getpaseo/protocol/agent-message";
-import type { AgentAttachment } from "@getpaseo/protocol/messages";
+import type { AgentAttachment, ProviderInstallation } from "@getpaseo/protocol/messages";
 import type {
   ProviderInspection,
   ProviderUpdateCheck,
@@ -884,14 +884,38 @@ export interface AgentClientInstallationContext {
   signal: AbortSignal;
 }
 
+export type InstallationMaintenance = NonNullable<ProviderInstallation["maintenance"]>;
+export interface AgentClientInstallationSnapshot {
+  inspection: ProviderInspection;
+  maintenance?: InstallationMaintenance;
+}
+
+export type InstallationUpdateOutcome = "updated" | "already_current" | "unverified";
+export type InstallationUpdateResult =
+  | Extract<ProviderUpdateResult, { status: "failed" }>
+  | (Extract<ProviderUpdateResult, { status: "succeeded" }> & {
+      outcome?: InstallationUpdateOutcome;
+    });
+
 export interface AgentClientInstallation {
   installUrl?: string;
   updateUrl?: string;
   inspect?(context: AgentClientInstallationContext): Promise<ProviderInspection>;
+  /** Read inspection and maintenance together when both depend on a runtime choice. */
+  inspectionSnapshot?: {
+    /** Synchronous and free of discovery or I/O. Change the key when the choice changes. */
+    cacheKey(): string;
+    read(context: AgentClientInstallationContext): Promise<AgentClientInstallationSnapshot>;
+  };
+  getMaintenance?(
+    context: AgentClientInstallationContext,
+  ): Promise<InstallationMaintenance | undefined>;
+  /** Read-only launch identity for admission; unknown launches return an empty list. */
+  getActivityKeys?(launch?: { env?: Record<string, string>; cwd?: string }): Promise<string[]>;
   /** See `ProviderInstallation.checkForUpdates` in the plugin contract. */
   checkForUpdates?(context: AgentClientUpdateCheckContext): Promise<ProviderUpdateCheck>;
   /** Runs the provider's updater. See `ProviderInstallation.update` in the plugin contract. */
-  update?(context: AgentClientUpdateContext): Promise<ProviderUpdateResult>;
+  update?(context: AgentClientUpdateContext): Promise<InstallationUpdateResult>;
 }
 
 export interface AgentClientUpdateCheckContext extends AgentClientInstallationContext {
@@ -901,6 +925,11 @@ export interface AgentClientUpdateCheckContext extends AgentClientInstallationCo
 
 export interface AgentClientUpdateContext extends AgentClientInstallationContext {
   report(event: ProviderUpdateReport): void;
+  /** Call immediately before synchronously spawning the updater. Throws if this launch is stale. */
+  assertCurrent?(): void;
+  /** The installation identities held until this update settles. Built-in updaters recheck them. */
+  activityKeys?: readonly string[];
+  quarantineActivity?(): void;
 }
 
 export interface AgentClient {
@@ -909,6 +938,8 @@ export interface AgentClient {
   >;
   readonly provider: AgentProvider;
   readonly capabilities: AgentCapabilityFlags;
+  /** This adapter holds installation activity for the lifetime of each launched child. */
+  readonly tracksInstallationProcesses?: true;
   /**
    * Create the agent with `config.providerOptions` (defaults already merged in). Emit nothing
    * about options while creating. If the agent ended up different from the options, say so in the

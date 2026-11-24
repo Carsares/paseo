@@ -73,6 +73,7 @@ it.each([
   "loads saved model $savedModel with ACP system prompt support $supportsSystemPrompt",
   async ({ supportsSystemPrompt, savedModel, model, thinkingOption, explicitThinking }) => {
     const { directory, launch } = await launchAgent(`
+      if (process.env.AGY_CLI_DISABLE_AUTO_UPDATE !== "true") process.exit(2);
       const { appendFileSync } = require("node:fs");
       const { createInterface } = require("node:readline");
       const configOptions = [
@@ -145,7 +146,7 @@ it.each([
           thinkingOption: explicitThinking,
           mode: "full-access",
           systemPrompt: "A test system instruction",
-          env: {},
+          env: { AGY_CLI_DISABLE_AUTO_UPDATE: "false" },
           mcpServers: {},
           settings: {},
           persist: true,
@@ -410,15 +411,74 @@ it("limits empty catalog tiers to orchestrators and drops the stale tier on a li
 describe("installation", () => {
   const signal = new AbortController().signal;
 
-  it("reports the version agy prints and links its install docs", async () => {
+  it("disables automatic updates for the ACP status connection", async () => {
+    const { launch } = await launchAgent(`
+      if (process.env.AGY_CLI_DISABLE_AUTO_UPDATE !== "true") process.exit(2);
+      const { createInterface } = require("node:readline");
+      createInterface({ input: process.stdin }).on("line", (line) => {
+        const { id, method } = JSON.parse(line);
+        if (method === "initialize")
+          console.log(JSON.stringify({
+            jsonrpc: "2.0", id, result: { protocolVersion: 1, agentCapabilities: {} },
+          }));
+      });
+    `);
+    await expect(
+      createAntigravityProvider().status!({
+        launch: { ...launch, env: { ...launch.env, AGY_CLI_DISABLE_AUTO_UPDATE: "false" } },
+      }),
+    ).resolves.toEqual({ available: true });
+  });
+
+  it("disables automatic updates in capability and catalog processes from a normal connection", async () => {
+    const { directory, launch } = await launchAgent(`
+      const { appendFileSync } = require("node:fs");
+      const { createInterface } = require("node:readline");
+      if (process.env.AGY_CLI_DISABLE_AUTO_UPDATE !== "true") process.exit(2);
+      appendFileSync(process.env.CAPTURE, process.env.AGY_CLI_DISABLE_AUTO_UPDATE + "\\n");
+      createInterface({ input: process.stdin }).on("line", (line) => {
+        const { id, method } = JSON.parse(line);
+        const result = method === "initialize"
+          ? { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } } }
+          : { sessionId: "catalog", configOptions: [{ id: "model", name: "Model", category: "model",
+              type: "select", currentValue: "test-model", options: [{ value: "test-model", name: "Test model" }] }] };
+        console.log(JSON.stringify({ jsonrpc: "2.0", id, result }));
+      });
+    `);
+    const connection = await createAntigravityProvider().connect({
+      launch: { ...launch, env: { ...launch.env, AGY_CLI_DISABLE_AUTO_UPDATE: "false" } },
+      versions: [1],
+      capabilities: ["prompt.image"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+    try {
+      expect(connection.capabilities).toContain("prompt.image");
+      await connection.send({ type: "catalog", cwd: directory, requestId: "catalog" });
+      await expect
+        .poll(() => events[0])
+        .toMatchObject({
+          type: "catalog",
+          catalog: { models: [{ id: "test-model", label: "Test model" }] },
+        });
+      await expect(readFile(launch.env.CAPTURE, "utf8")).resolves.toBe("true\ntrue\n");
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("reports the version without starting auto-update and links the updater guide", async () => {
     // A real `agy acp --version` starts the ACP server, so the fake refuses it.
     const { launch } = await launchAgent(`
       const args = process.argv.slice(2);
       if (args.includes("acp")) process.exit(1);
+      if (process.env.AGY_CLI_DISABLE_AUTO_UPDATE !== "true") process.exit(2);
       if (args[0] === "--version") console.log("Antigravity CLI 1.6.2");
     `);
     const installation = createAntigravityProvider().installation!;
     expect(installation.installUrl).toBe("https://antigravity.google/docs/getting-started?tab=cli");
+    expect(installation.updateUrl).toContain("antigravity.google/docs/cli/troubleshooting");
+    expect(installation.maintenance).toMatchObject({ kind: "automatic" });
     expect(installation.update).toBeUndefined();
     await expect(
       installation.inspect!({ launch: { ...launch, resolved: true }, signal }),

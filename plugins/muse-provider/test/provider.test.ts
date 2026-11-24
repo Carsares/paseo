@@ -204,6 +204,12 @@ test("update check compares the installed build with the launcher's channel", as
     },
   });
   const signal = new AbortController().signal;
+  expect(provider.installation?.maintenance).toMatchObject({
+    kind: "external",
+    message: expect.stringContaining("installation guide"),
+  });
+  expect(provider.installation?.updateUrl).toBe("https://dev.meta.ai/docs/muse-code#install");
+  expect(provider.installation?.update).toBeUndefined();
   const check = (installedVersion: string, env: Record<string, string> = {}) =>
     provider.installation?.checkForUpdates?.({
       launch: { command: "muse", args: [], env, resolved: true },

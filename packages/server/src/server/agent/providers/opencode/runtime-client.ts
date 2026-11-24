@@ -23,10 +23,14 @@ import { OpenCodeAgentClient } from "../opencode-agent.js";
 import type { OpenCodeV2AgentClient } from "./v2/agent.js";
 import { resolveExternalOpenCodeServer } from "./v2/external-server.js";
 import { withOpenCodeRuntimeNotice } from "./runtime-notice.js";
-import { selectOpenCodeService } from "./v2/service-selection.js";
+import { selectOpenCodeService, type OpenCodeServiceSelection } from "./v2/service-selection.js";
 import { createCliInstallation } from "../cli-installation.js";
 
 const OPENCODE_INSTALL_URL = "https://opencode.ai/docs/";
+const OPENCODE_EXTERNAL_MAINTENANCE = {
+  kind: "external",
+  message: "Update OpenCode on the host that manages the connected server.",
+} as const;
 // Agents share a long-lived OpenCode server, and this client keeps the protocol it chose for the
 // version it found. Neither changes until the daemon restarts.
 const OPENCODE_UPDATED =
@@ -66,6 +70,7 @@ export class OpenCodeRuntimeClient implements AgentClient {
   readonly resolveCreateConfig;
   readonly isCreateConfigUnattended;
   private selected: Promise<OpenCodeAgentClient | OpenCodeV2AgentClient> | null = null;
+  private runtimeService?: OpenCodeServiceSelection;
   private legacySelected = false;
   private readonly legacy: OpenCodeAgentClient;
   readonly installation: AgentClientInstallation;
@@ -80,7 +85,7 @@ export class OpenCodeRuntimeClient implements AgentClient {
     this.isCreateConfigUnattended = this.legacy.isCreateConfigUnattended;
     // OpenCode's update source depends on its channel and install method, which only the binary
     // knows, so it has no update check here.
-    this.installation = createCliInstallation({
+    const local = createCliInstallation({
       name: "OpenCode",
       defaultBinary: "opencode",
       runtimeSettings: settings,
@@ -92,6 +97,48 @@ export class OpenCodeRuntimeClient implements AgentClient {
           .replace(/^opencode\s+/i, "") || undefined,
       update: { args: ["upgrade"], successMessage: OPENCODE_UPDATED },
     });
+    const inspectionSnapshot: NonNullable<AgentClientInstallation["inspectionSnapshot"]> = {
+      cacheKey: () => this.runtimeService?.kind ?? "unselected",
+      read: async (context) => {
+        if (await this.hasExternalInstallation(context.signal)) {
+          return {
+            inspection: { status: "installed" },
+            maintenance: OPENCODE_EXTERNAL_MAINTENANCE,
+          };
+        }
+        // Keep this choice even if the runtime is selected while the local version is read.
+        const [inspection, maintenance] = await Promise.all([
+          local.inspect!(context),
+          local.getMaintenance?.(context),
+        ]);
+        return { inspection, maintenance };
+      },
+    };
+    this.installation = {
+      ...local,
+      updateUrl: OPENCODE_INSTALL_URL,
+      getMaintenance: async (context) =>
+        (await this.hasExternalInstallation(context.signal))
+          ? OPENCODE_EXTERNAL_MAINTENANCE
+          : local.getMaintenance?.(context),
+      inspect: async (context) => (await inspectionSnapshot.read(context)).inspection,
+      inspectionSnapshot,
+      update: async (context) => {
+        if (await this.hasExternalInstallation(context.signal)) {
+          return { status: "failed", message: OPENCODE_EXTERNAL_MAINTENANCE.message };
+        }
+        return local.update!(context);
+      },
+    };
+  }
+  private async hasExternalInstallation(signal: AbortSignal): Promise<boolean> {
+    signal.throwIfAborted();
+    // Installation responses never include server URLs or authentication details.
+    const selection = await this.effectiveService().catch(() => {
+      throw new Error("Could not determine which OpenCode server manages this installation.");
+    });
+    signal.throwIfAborted();
+    return selection.kind !== "owned";
   }
   private selectService() {
     return selectOpenCodeService({
@@ -99,18 +146,25 @@ export class OpenCodeRuntimeClient implements AgentClient {
       env: this.settings?.env,
     });
   }
+  private async effectiveService(): Promise<OpenCodeServiceSelection> {
+    if (this.runtimeService) return this.runtimeService;
+    const discovered = await this.selectService();
+    return this.runtimeService ?? discovered;
+  }
   private client(): Promise<OpenCodeAgentClient | OpenCodeV2AgentClient> {
     this.selected ??= (async () => {
-      const selection = await this.selectService();
+      const selection = await this.effectiveService();
       if (selection.kind !== "owned") {
         const { OpenCodeV2AgentClient } = await import("./v2/agent.js");
-        return new OpenCodeV2AgentClient({
+        const client = new OpenCodeV2AgentClient({
           logger: this.logger,
           settings: this.settings,
           managedProcesses: this.options.managedProcesses,
           bridge: this.options.bridge,
           selection,
         });
+        this.runtimeService = selection;
+        return client;
       }
       let output: string;
       try {
@@ -126,22 +180,26 @@ export class OpenCodeRuntimeClient implements AgentClient {
       } catch {
         // Version discovery is additive: legacy wrappers need not support --version.
         this.selected = null;
+        this.runtimeService = selection;
         this.legacySelected = true;
         return this.legacy;
       }
       if (!VERSION_PATTERN.test(output.trim())) this.selected = null;
       if (openCodeMajorVersion(output) === 1) {
+        this.runtimeService = selection;
         this.legacySelected = true;
         return this.legacy;
       }
       const { OpenCodeV2AgentClient } = await import("./v2/agent.js");
-      return new OpenCodeV2AgentClient({
+      const client = new OpenCodeV2AgentClient({
         logger: this.logger,
         settings: this.settings,
         managedProcesses: this.options.managedProcesses,
         bridge: this.options.bridge,
         selection,
       });
+      this.runtimeService = selection;
+      return client;
     })().catch((error: unknown) => {
       // A failed probe must not poison refresh after the user updates the binary.
       this.selected = null;
@@ -150,12 +208,12 @@ export class OpenCodeRuntimeClient implements AgentClient {
     return this.selected;
   }
   async isAvailable() {
-    const selection = await this.selectService();
+    const selection = await this.effectiveService();
     if (selection.kind !== "owned") return true;
     return this.legacy.isAvailable();
   }
   async getDiagnostic() {
-    const selection = await this.selectService();
+    const selection = await this.effectiveService();
     if (selection.kind !== "owned")
       return { diagnostic: `OpenCode server: ${selection.server.url}` };
     return this.legacy.getDiagnostic();

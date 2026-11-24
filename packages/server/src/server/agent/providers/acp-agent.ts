@@ -119,12 +119,17 @@ import {
 } from "../create-agent-mode.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
 import {
-  checkProviderLaunchAvailable,
   createProviderEnv,
   createProviderEnvSpec,
   resolveProviderLaunch,
   type ProviderRuntimeSettings,
+  type ResolvedProviderLaunch,
 } from "../provider-launch-config.js";
+import { acquireInstallationProcess } from "../provider-installation/installation-activity.js";
+import {
+  findInstallationLaunchPath,
+  readInstallationActivityKeys,
+} from "../provider-installation/installation-target.js";
 import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
 import { appendOrReplaceGrowingAssistantMessage, runProviderTurn } from "./provider-runner.js";
 import { resolveResumeProcessCwd } from "./resume-process-cwd.js";
@@ -483,12 +488,68 @@ export type ACPCatalogModelResolver = (
   context: ACPCatalogModelResolverContext,
 ) => Promise<AgentModelDefinition[]>;
 
+/** A built-in CLI whose command is known and whose updater can be disabled. */
+interface ACPFileLaunchPolicy {
+  readOnlyEnv: Record<string, string>;
+}
+
+interface ACPLaunchOptions {
+  defaultCommand: [string, ...string[]];
+  cwd: string;
+  runtimeSettings?: ProviderRuntimeSettings;
+  launchEnv?: Record<string, string>;
+  fileLaunchPolicy?: ACPFileLaunchPolicy;
+}
+
+async function resolveAcpLaunch(options: ACPLaunchOptions) {
+  const env = createProviderEnv({
+    runtimeSettings: options.runtimeSettings,
+    // Listing commands can open a session later reused for interactive work.
+    overlays: [options.launchEnv, options.fileLaunchPolicy?.readOnlyEnv],
+  });
+  const launch = await resolveProviderLaunch({
+    commandConfig: options.runtimeSettings?.command,
+    defaultBinary: options.defaultCommand[0],
+  });
+  const executable = await findInstallationLaunchPath(launch.command, {
+    cwd: options.cwd,
+    env,
+    searchWindowsLaunchDirectory: true,
+  });
+  return { launch, executable, env };
+}
+
+async function prepareAcpSpawn(
+  family: string,
+  options: ACPLaunchOptions,
+): Promise<() => ChildProcessWithoutNullStreams> {
+  const { launch, executable, env } = await resolveAcpLaunch(options);
+  if (!executable) {
+    throw new Error(`${family} command '${launch.command}' not found`);
+  }
+  const keys = await readInstallationActivityKeys(executable);
+  const opaque = !options.fileLaunchPolicy || launch.source === "override" || !keys.length;
+  const args = [...launch.args, ...options.defaultCommand.slice(1)];
+  return () => {
+    const child = acquireInstallationProcess({ family, keys, opaque }, () =>
+      spawnProcess(executable, args, {
+        cwd: options.cwd,
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+      }),
+    );
+    assertChildWithPipes(child);
+    return child;
+  };
+}
+
 interface ACPAgentClientOptions {
   provider: string;
   // Provider id usage sources match a session against; ACP sessions without one report no usage.
   usageProvider?: string;
   logger: Logger;
   runtimeSettings?: ProviderRuntimeSettings;
+  fileLaunchPolicy?: ACPFileLaunchPolicy;
   defaultCommand: [string, ...string[]];
   defaultModes?: AgentMode[];
   catalogModelResolver?: ACPCatalogModelResolver;
@@ -522,6 +583,7 @@ interface ACPAgentSessionOptions {
   usageProvider?: string;
   logger: Logger;
   runtimeSettings?: ProviderRuntimeSettings;
+  fileLaunchPolicy?: ACPFileLaunchPolicy;
   defaultCommand: [string, ...string[]];
   defaultModes: AgentMode[];
   modelTransformer?: (models: AgentModelDefinition[]) => AgentModelDefinition[];
@@ -1047,11 +1109,13 @@ export class ACPAgentClient implements AgentClient {
   readonly provider: string;
   private readonly usageProvider?: string;
   readonly capabilities: AgentCapabilityFlags;
+  readonly tracksInstallationProcesses = true;
   readonly resolveCreateConfig = resolveACPCreateConfig;
   readonly isCreateConfigUnattended = isACPCreateConfigUnattended;
 
   protected readonly logger: Logger;
   protected readonly runtimeSettings?: ProviderRuntimeSettings;
+  private readonly fileLaunchPolicy?: ACPFileLaunchPolicy;
   protected readonly defaultCommand: [string, ...string[]];
   protected readonly defaultModes: AgentMode[];
   private readonly catalogModelResolver?: ACPCatalogModelResolver;
@@ -1095,6 +1159,7 @@ export class ACPAgentClient implements AgentClient {
       provider: options.provider,
     });
     this.runtimeSettings = options.runtimeSettings;
+    this.fileLaunchPolicy = options.fileLaunchPolicy;
     this.defaultCommand = options.defaultCommand;
     this.defaultModes = options.defaultModes ?? [];
     this.catalogModelResolver = options.catalogModelResolver;
@@ -1129,6 +1194,7 @@ export class ACPAgentClient implements AgentClient {
         usageProvider: this.usageProvider,
         logger: this.logger,
         runtimeSettings: this.runtimeSettings,
+        fileLaunchPolicy: this.fileLaunchPolicy,
         defaultCommand: this.defaultCommand,
         defaultModes: this.defaultModes,
         modelTransformer: this.modelTransformer,
@@ -1187,6 +1253,7 @@ export class ACPAgentClient implements AgentClient {
       usageProvider: this.usageProvider,
       logger: this.logger,
       runtimeSettings: this.runtimeSettings,
+      fileLaunchPolicy: this.fileLaunchPolicy,
       defaultCommand: this.defaultCommand,
       defaultModes: this.defaultModes,
       modelTransformer: this.modelTransformer,
@@ -1501,11 +1568,23 @@ export class ACPAgentClient implements AgentClient {
 
   async isAvailable(): Promise<boolean> {
     try {
-      await this.resolveLaunchCommand();
-      return true;
+      return (await this.resolveLauncher()).executable !== null;
     } catch {
       return false;
     }
+  }
+
+  protected async resolveLauncher(): Promise<{
+    launch: ResolvedProviderLaunch;
+    executable: string | null;
+    env: NodeJS.ProcessEnv;
+  }> {
+    return resolveAcpLaunch({
+      defaultCommand: this.defaultCommand,
+      cwd: process.cwd(),
+      runtimeSettings: this.runtimeSettings,
+      fileLaunchPolicy: this.fileLaunchPolicy,
+    });
   }
 
   protected async spawnProcess(
@@ -1547,16 +1626,14 @@ export class ACPAgentClient implements AgentClient {
     launchEnv?: Record<string, string>,
     client: ACPClient = this.buildProbeClient(),
   ): Promise<ACPProcessTransport> {
-    const { command, args } = await this.resolveLaunchCommand();
-    const child = spawnProcess(command, args, {
+    const spawn = await prepareAcpSpawn(this.provider, {
+      defaultCommand: this.defaultCommand,
       cwd: process.cwd(),
-      ...createProviderEnvSpec({
-        runtimeSettings: this.runtimeSettings,
-        overlays: [launchEnv],
-      }),
-      stdio: ["pipe", "pipe", "pipe"],
+      runtimeSettings: this.runtimeSettings,
+      launchEnv,
+      fileLaunchPolicy: this.fileLaunchPolicy,
     });
-    assertChildWithPipes(child);
+    const child = spawn();
 
     const stderrChunks: string[] = [];
     child.stderr.on("data", (chunk: Buffer | string) => {
@@ -1793,21 +1870,6 @@ export class ACPAgentClient implements AgentClient {
     }
   }
 
-  protected async resolveLaunchCommand(): Promise<{ command: string; args: string[] }> {
-    const prefix = await resolveProviderLaunch({
-      commandConfig: this.runtimeSettings?.command,
-      defaultBinary: this.defaultCommand[0],
-    });
-    const availability = await checkProviderLaunchAvailable(prefix);
-    if (!availability.available) {
-      throw new Error(`${this.provider} command '${this.defaultCommand[0]}' not found`);
-    }
-    return {
-      command: prefix.command,
-      args: [...prefix.args, ...this.defaultCommand.slice(1)],
-    };
-  }
-
   private assertProvider(config: AgentSessionConfig): void {
     if (config.provider !== this.provider) {
       throw new Error(`Expected ${this.provider} config, received ${config.provider}`);
@@ -1834,6 +1896,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
 
   private readonly logger: Logger;
   private readonly runtimeSettings?: ProviderRuntimeSettings;
+  private readonly fileLaunchPolicy?: ACPFileLaunchPolicy;
   private readonly defaultCommand: [string, ...string[]];
   private readonly defaultModes: AgentMode[];
   protected readonly modelTransformer?: (models: AgentModelDefinition[]) => AgentModelDefinition[];
@@ -1917,6 +1980,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.capabilities = options.capabilities;
     this.logger = options.logger.child({ module: "agent", provider: options.provider });
     this.runtimeSettings = options.runtimeSettings;
+    this.fileLaunchPolicy = options.fileLaunchPolicy;
     this.defaultCommand = options.defaultCommand;
     this.defaultModes = options.defaultModes;
     this.modelTransformer = options.modelTransformer;
@@ -3121,26 +3185,14 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   }
 
   private async spawnProcess(): Promise<SpawnedACPProcess> {
-    const prefix = await resolveProviderLaunch({
-      commandConfig: this.runtimeSettings?.command,
-      defaultBinary: this.defaultCommand[0],
-    });
-    const availability = await checkProviderLaunchAvailable(prefix);
-    if (!availability.available) {
-      throw new Error(`${this.provider} command '${this.defaultCommand[0]}' not found`);
-    }
-
-    const command = prefix.command;
-    const args = [...prefix.args, ...this.defaultCommand.slice(1)];
-    const child = spawnProcess(command, args, {
+    const spawn = await prepareAcpSpawn(this.provider, {
+      defaultCommand: this.defaultCommand,
       cwd: await this.resolveProcessCwd(),
-      ...createProviderEnvSpec({
-        runtimeSettings: this.runtimeSettings,
-        overlays: [this.launchEnv],
-      }),
-      stdio: ["pipe", "pipe", "pipe"],
+      runtimeSettings: this.runtimeSettings,
+      launchEnv: this.launchEnv,
+      fileLaunchPolicy: this.fileLaunchPolicy,
     });
-    assertChildWithPipes(child);
+    const child = spawn();
 
     const stderrChunks: string[] = [];
     child.stderr.on("data", (chunk: Buffer | string) => {

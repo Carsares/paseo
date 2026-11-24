@@ -4,7 +4,7 @@ import type {
   ProviderInstallationUpdateOutput,
   ProviderInstallationUpdateProgress,
 } from "@getpaseo/protocol/messages";
-import type { ProviderUpdateResult } from "@getpaseo/plugin/server/provider";
+import type { InstallationUpdateResult } from "../agent-sdk-types.js";
 
 interface ProviderUpdateOperationOptions {
   id: string;
@@ -22,11 +22,15 @@ interface ProviderUpdateOperationOptions {
 export class ProviderUpdateOperation {
   private state: ProviderInstallationUpdateOperation;
   private readonly output: ProviderInstallationUpdateOutput[] = [];
+  private readonly reportedPhases = new Set<string>();
   private outputLength = 0;
   private truncated = false;
 
   constructor(private readonly options: ProviderUpdateOperationOptions) {
     this.state = { status: "running", id: options.id, startedAt: options.startedAt };
+  }
+
+  publishStarted(): void {
     this.publish([]);
   }
 
@@ -34,8 +38,25 @@ export class ProviderUpdateOperation {
     return this.state.status === "running";
   }
 
+  get failed(): boolean {
+    return this.state.status === "failed";
+  }
+
+  get id(): string {
+    return this.state.id;
+  }
+
+  markOutputTruncated(): void {
+    this.truncated = true;
+  }
+
   append(entry: ProviderInstallationUpdateOutput): void {
-    if (!this.running) return;
+    if (!this.running || !entry.text || this.reportedPhases.has(entry.text)) return;
+    this.reportedPhases.add(entry.text);
+    if (this.options.outputLimit <= 0) {
+      this.markOutputTruncated();
+      return;
+    }
     const limit = this.options.outputLimit;
     const kept =
       entry.text.length > limit ? { type: entry.type, text: entry.text.slice(-limit) } : entry;
@@ -50,7 +71,7 @@ export class ProviderUpdateOperation {
     this.publish([kept]);
   }
 
-  settle(result: ProviderUpdateResult, finishedAt: string): void {
+  settle(result: InstallationUpdateResult, finishedAt: string): void {
     if (!this.running) return;
     const { id, startedAt } = this.state;
     this.state =
@@ -61,6 +82,7 @@ export class ProviderUpdateOperation {
             startedAt,
             finishedAt,
             ...(result.message === undefined ? {} : { message: result.message }),
+            ...(result.outcome === undefined ? {} : { outcome: result.outcome }),
           }
         : { status: "failed", id, startedAt, finishedAt, message: result.message };
     this.publish([]);

@@ -3534,6 +3534,14 @@ export const fr: TranslationResources = {
         updateFailed: "Échec de la mise à jour",
         outputTruncated: "La sortie précédente a été supprimée.",
         updatesFailed: "Impossible de vérifier les mises à jour",
+        maintenanceAutomatic: "Maintenance automatique",
+        maintenanceExternal: "Géré en externe",
+        maintenanceExternalHint: "Utilisez l’outil qui a installé cette CLI pour la mettre à jour.",
+        maintenanceManual: "Mise à jour manuelle requise",
+        maintenanceManualHint:
+          "Suivez les instructions du fournisseur pour la mise à jour sur cet hôte.",
+        alreadyCurrent: "Déjà à jour",
+        updateUnverified: "Mise à jour terminée, version non confirmée",
         installInstructions: "Instructions d'installation",
       },
       diagnostic: {

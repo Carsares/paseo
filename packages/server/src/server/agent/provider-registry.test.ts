@@ -293,6 +293,7 @@ vi.mock("./providers/pi/agent.js", () => ({
 
 vi.mock("./providers/generic-acp-agent.js", () => ({
   GenericACPAgentClient: class GenericACPAgentClient {
+    readonly tracksInstallationProcesses = true;
     capabilities = {
       supportsStreaming: true,
       supportsSessionPersistence: true,
@@ -687,7 +688,9 @@ test("new provider extending acp uses GenericACPAgentClient", () => {
     },
   });
 
-  expect(registry["my-agent"].createClient(logger).provider).toBe("my-agent");
+  const client = registry["my-agent"].createClient(logger);
+  expect(client.provider).toBe("my-agent");
+  expect(client.tracksInstallationProcesses).toBe(true);
   expect(mockState.constructorArgs.genericAcp).toEqual([
     {
       command: ["my-agent", "--acp"],

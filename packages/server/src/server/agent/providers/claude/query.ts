@@ -8,6 +8,9 @@ import {
 import { buildSelfNodeCommand, createExternalProcessEnv } from "../../../paseo-env.js";
 import { spawnProcess } from "../../../../utils/spawn.js";
 
+import { acquireInstallationProcess } from "../../provider-installation/installation-activity.js";
+import { readInstallationActivityKeys } from "../../provider-installation/installation-target.js";
+
 // Keep the raw SDK query import in this module only. Claude process launch behavior
 // must stay shared between production and tests so Windows .cmd/.bat handling cannot
 // diverge from the daemon path.
@@ -20,6 +23,8 @@ export interface ClaudeQueryContext {
   runtimeSettings?: ProviderRuntimeSettings;
   launchEnv?: Record<string, string>;
   queryFactory?: ClaudeQueryFactory;
+  installationKeys?: readonly string[];
+  assertCanSpawn?: () => void;
   /** Called with the spawned child process so the caller can tree-kill it on close. */
   onChildProcess?: (child: ChildProcess) => void;
 }
@@ -57,7 +62,10 @@ function applyRuntimeSettingsToClaudeOptions(
   options: ClaudeOptions,
   context: ClaudeQueryContext,
 ): ClaudeOptions {
-  const { runtimeSettings, launchEnv, onChildProcess } = context;
+  const { runtimeSettings, launchEnv, onChildProcess, assertCanSpawn } = context;
+  const installationKeys = context.installationKeys ?? [];
+  const opaque = runtimeSettings?.command?.mode === "replace";
+  const stderr = options.stderr;
   return {
     ...options,
     spawnClaudeCodeProcess: (spawnOptions) => {
@@ -82,22 +90,26 @@ function applyRuntimeSettingsToClaudeOptions(
         : null;
       const command = selfNodeCommand?.command ?? resolved.command;
       const args = selfNodeCommand?.args ?? resolved.args;
-      const child = spawnProcess(command, args, {
-        cwd: spawnOptions.cwd,
-        ...(selfNodeCommand
-          ? { env: selfNodeCommand.env, envMode: "internal" as const }
-          : providerEnvSpec),
+      const cwd = spawnOptions.cwd ?? process.cwd();
+      const env = selfNodeCommand?.env ?? providerEnv;
+      const executable = isDefaultRuntime ? args[0] : command;
+      // The SDK can choose a different executable. Use a specific scope only
+      // when the argument it hands us matches the prepared literal path.
+      const keys = executable === options.pathToClaudeCodeExecutable ? installationKeys : [];
+      assertCanSpawn?.();
+      const child = spawnClaudeProcess(command, args, {
+        cwd,
+        env,
+        keys,
+        opaque,
         signal: spawnOptions.signal,
-        stdio: ["pipe", "pipe", "pipe"],
-        // Bypass cmd.exe on Windows: the SDK passes --mcp-config with inline JSON
-        // containing double quotes, which cmd.exe mangles (strips quotes, breaks parsing).
-        // The command is always a resolved binary path, so shell routing is unnecessary.
+        // Passing SDK JSON through a Windows shell would strip its quotes.
         shell: false,
       });
       onChildProcess?.(child);
-      if (typeof options.stderr === "function") {
+      if (typeof stderr === "function") {
         child.stderr?.on("data", (chunk: Buffer | string) => {
-          options.stderr?.(chunk.toString());
+          stderr(chunk.toString());
         });
       }
       if (!isChildProcessWithStreams(child)) {
@@ -106,6 +118,89 @@ function applyRuntimeSettingsToClaudeOptions(
       return child;
     },
   };
+}
+
+function spawnClaudeProcess(
+  command: string,
+  args: string[],
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    keys: readonly string[];
+    opaque: boolean;
+    signal?: AbortSignal;
+    shell?: boolean;
+  },
+): ChildProcess {
+  const { keys, opaque, ...launch } = options;
+  return acquireInstallationProcess(
+    { family: "claude", keys, opaque: opaque || !keys.length },
+    () =>
+      spawnProcess(command, args, {
+        ...launch,
+        envMode: "internal",
+        stdio: ["pipe", "pipe", "pipe"],
+      }),
+  );
+}
+
+/** Version and auth probes also execute the configured provider's CLI. */
+export async function execClaudeProbe(
+  command: string,
+  args: string[],
+  options: { runtimeSettings?: ProviderRuntimeSettings; signal?: AbortSignal },
+): Promise<{ stdout: string; stderr: string }> {
+  const deadline = AbortSignal.timeout(5_000);
+  const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+  signal.throwIfAborted();
+  const opaque = options.runtimeSettings?.command?.mode === "replace";
+  const keys = opaque ? [] : await readInstallationActivityKeys(command);
+  signal.throwIfAborted();
+  const envSpec = createProviderEnvSpec({ runtimeSettings: options.runtimeSettings });
+  const child = spawnClaudeProcess(command, args, {
+    cwd: process.cwd(),
+    env: createExternalProcessEnv(process.env, envSpec.envOverlay),
+    keys,
+    opaque,
+    signal,
+  });
+  return new Promise((resolve, reject) => {
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    const maxBuffer = 1024 * 1024;
+    const collect = (stream: NodeJS.ReadableStream | null, buffer: Buffer[]) => {
+      let size = 0;
+      stream?.on("data", (chunk: Buffer) => {
+        size += chunk.length;
+        if (size <= maxBuffer) buffer.push(chunk);
+        else if (size - chunk.length <= maxBuffer) {
+          child.kill();
+          reject(new Error("Claude probe output exceeded its limit"));
+        }
+      });
+    };
+    collect(child.stdout, stdout);
+    collect(child.stderr, stderr);
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    child.once("error", reject);
+    child.once("close", (code, exitSignal) => {
+      signal.removeEventListener("abort", abort);
+      const output = {
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      };
+      if (code === 0) resolve(output);
+      else
+        reject(
+          Object.assign(new Error("Claude probe did not complete"), output, {
+            code,
+            signal: exitSignal,
+          }),
+        );
+    });
+  });
 }
 
 export function claudeQuery(input: ClaudeQueryInput, context: ClaudeQueryContext = {}): Query {

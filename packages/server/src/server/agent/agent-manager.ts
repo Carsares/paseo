@@ -1,3 +1,4 @@
+import { installationActivity } from "./provider-installation/installation-activity.js";
 import {
   extractConversationLimit,
   limitFingerprint,
@@ -1650,6 +1651,7 @@ export class AgentManager {
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
   private readonly inFlightAgentCloses = new Map<string, Promise<void>>();
   private readonly historySessions = new WeakSet<AgentSession>();
+  private readonly installationLeases = new WeakMap<AgentSession, () => void>();
   private readonly reloadedSessionCloses = new WeakMap<AgentSession, Promise<void>>();
   private readonly runtimeCleanupIdentities = new WeakMap<
     AgentSession,
@@ -2241,6 +2243,88 @@ export class AgentManager {
     }
   }
 
+  private async openWithInstallationActivity<T>(
+    client: AgentClient,
+    launch: { cwd: string; env?: Record<string, string> },
+    open: () => Promise<T>,
+    getSession: (opened: T) => AgentSession,
+  ): Promise<T> {
+    const family = this.adapterOf(client.provider);
+    // These adapters admit at the actual spawn; an unopened query or a history reader
+    // can outlive an update without holding the executable.
+    if (
+      client.tracksInstallationProcesses ||
+      family === "claude" ||
+      family === "codex" ||
+      family === "mock"
+    ) {
+      return open();
+    }
+    const installation = client.installation;
+    const keys = installation?.getActivityKeys ? await installation.getActivityKeys(launch) : [];
+    const release = installationActivity.acquireAgent({
+      family,
+      keys,
+      opaque: !installation || keys.includes("opaque"),
+    });
+    try {
+      const opened = await open();
+      const session = getSession(opened);
+      const priorRelease = this.installationLeases.get(session);
+      this.installationLeases.set(
+        session,
+        priorRelease
+          ? () => {
+              priorRelease();
+              release();
+            }
+          : release,
+      );
+      return opened;
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
+  private async closeProviderSession(session: AgentSession): Promise<void> {
+    await session.close();
+    this.installationLeases.get(session)?.();
+    this.installationLeases.delete(session);
+  }
+
+  private openProviderSession(
+    client: AgentClient,
+    config: AgentSessionConfig,
+    context?: AgentLaunchContext,
+    options?: AgentCreateSessionOptions,
+  ): Promise<AgentSession> {
+    return this.openWithInstallationActivity(
+      client,
+      { cwd: config.cwd, env: context?.env },
+      () => client.createSession(config, context, options),
+      (session) => session,
+    );
+  }
+
+  private resumeProviderSession(
+    client: AgentClient,
+    handle: AgentPersistenceHandle,
+    config: AgentSessionConfig,
+    context?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
+  ): Promise<AgentSession> {
+    if (options?.purpose === "history" && this.adapterOf(client.provider) === "omp") {
+      return client.resumeSession(handle, config, context, options);
+    }
+    return this.openWithInstallationActivity(
+      client,
+      { cwd: config.cwd, env: context?.env },
+      () => client.resumeSession(handle, config, context, options),
+      (session) => session,
+    );
+  }
+
   async listDraftCommands(config: AgentSessionConfig): Promise<AgentSlashCommand[]> {
     const normalizedConfig = await this.normalizeConfig(config, { resolveDefaultModel: false });
     const client = this.requireClient(normalizedConfig.provider);
@@ -2258,7 +2342,7 @@ export class AgentManager {
       return await client.listCommands(normalizedConfig);
     }
 
-    const session = await client.createSession(normalizedConfig);
+    const session = await this.openProviderSession(client, normalizedConfig);
     try {
       if (!session.listCommands) {
         throw new Error(
@@ -2268,7 +2352,7 @@ export class AgentManager {
       return await session.listCommands();
     } finally {
       try {
-        await session.close();
+        await this.closeProviderSession(session);
       } catch (error) {
         this.logger.warn(
           { err: error, provider: normalizedConfig.provider },
@@ -2299,7 +2383,7 @@ export class AgentManager {
       return await client.listControls(normalizedConfig);
     }
 
-    const session = await client.createSession(normalizedConfig);
+    const session = await this.openProviderSession(client, normalizedConfig);
     try {
       // The options a session opens with, as create would report them, so the controls'
       // selection matches what the first turn runs with.
@@ -2309,7 +2393,7 @@ export class AgentManager {
       };
     } finally {
       try {
-        await session.close();
+        await this.closeProviderSession(session);
       } catch (error) {
         this.logger.warn(
           { err: error, provider: normalizedConfig.provider },
@@ -2584,14 +2668,16 @@ export class AgentManager {
       { purpose: "history", resolveDefaultModel: false },
     );
     signal.throwIfAborted();
-    const reader = await client.resumeSession(
+    const reader = await this.resumeProviderSession(
+      client,
       handle,
       config,
       { agentId: record.id, env: record.launchEnv },
       { purpose: "history" },
     );
     let closing: Promise<void> | undefined;
-    const closeReader = () => (closing ??= Promise.resolve().then(() => reader.close()));
+    const closeReader = () =>
+      (closing ??= Promise.resolve().then(() => this.closeProviderSession(reader)));
     const onAbort = () => {
       void closeReader().catch((err: unknown) => {
         this.logger.warn({ err, agentId: record.id }, "Failed to close workspace summary reader");
@@ -3014,7 +3100,12 @@ export class AgentManager {
       client,
       own: providerLaunchConfig.providerOptions,
     });
-    const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
+    const session = await this.openProviderSession(
+      client,
+      providerLaunchConfig,
+      launchContext,
+      createOptions,
+    );
     await this.requireExternalMcpSupport(session, providerLaunchConfig, launchContext);
     await this.assertOpeningChildHasActiveParent(options.labels, session);
     const forkPrefix = await this.prepareForkPrefix({
@@ -3198,7 +3289,8 @@ export class AgentManager {
       client,
       own: providerLaunchConfig.providerOptions,
     });
-    const session = await client.resumeSession(
+    const session = await this.resumeProviderSession(
+      client,
       handle,
       providerLaunchConfig,
       launchContext,
@@ -3287,12 +3379,16 @@ export class AgentManager {
       client,
       own: providerLaunchConfig.providerOptions,
     });
-    const imported = await client.importSession(
-      {
-        providerHandleId: input.providerHandleId,
-        cwd: input.cwd,
-      },
-      { config: providerLaunchConfig, storedConfig, launchContext },
+    const importSession = client.importSession.bind(client);
+    const imported = await this.openWithInstallationActivity(
+      client,
+      { cwd: input.cwd, env: launchContext.env },
+      () =>
+        importSession(
+          { providerHandleId: input.providerHandleId, cwd: input.cwd },
+          { config: providerLaunchConfig, storedConfig, launchContext },
+        ),
+      (result) => result.session,
     );
     await this.requireExternalMcpSupport(imported.session, providerLaunchConfig, launchContext);
     let handedToRegistration = false;
@@ -3437,8 +3533,8 @@ export class AgentManager {
         own: providerLaunchConfig.providerOptions,
       });
       session = handle
-        ? await client.resumeSession(handle, providerLaunchConfig, launchContext)
-        : await client.createSession(providerLaunchConfig, launchContext);
+        ? await this.resumeProviderSession(client, handle, providerLaunchConfig, launchContext)
+        : await this.openProviderSession(client, providerLaunchConfig, launchContext);
       await this.requireExternalMcpSupport(session, providerLaunchConfig, launchContext);
       this.assertAcceptingAgentRegistrations();
 
@@ -3551,7 +3647,7 @@ export class AgentManager {
   private async closeReloadedSession(session: AgentSession, agentId: string): Promise<void> {
     let operation = this.reloadedSessionCloses.get(session);
     if (!operation) {
-      operation = session.close();
+      operation = this.closeProviderSession(session);
       this.reloadedSessionCloses.set(session, operation);
       // Keep pending closes across request timeouts; a retry must await the same release.
       void operation.catch(() => this.reloadedSessionCloses.delete(session));
@@ -3737,7 +3833,7 @@ export class AgentManager {
     // native writer, so publishing a resumable closed snapshot would orphan it.
     const trackLedgerClose =
       !this.historySessions.has(agent.session) && !this.taskLedgerArchivedRuntimes.has(agent);
-    await agent.session.close();
+    await this.closeProviderSession(agent.session);
     await this.drainSessionEvents(agentId);
     this.cancelRunningProviderSubagents(agentId);
     // close() drops the session's subscribers before the provider could report an empty list.
@@ -4847,7 +4943,7 @@ export class AgentManager {
         },
       );
       const providerConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
-      const session = await client.createSession(providerConfig, launchContext);
+      const session = await this.openProviderSession(client, providerConfig, launchContext);
       opened = session;
       this.permissionSessionGenerations.set(session, switchId);
       await this.requireExternalMcpSupport(session, providerConfig, launchContext);
@@ -5020,7 +5116,7 @@ export class AgentManager {
         await this.deleteCommittedTimeline(agent.id);
         cleared = true;
       }
-      await agent.session.close();
+      await this.closeProviderSession(agent.session);
     } catch (error) {
       if (persisted && previousRecord) await this.requireRegistry().upsert(previousRecord);
       const store = this.durableTimelineStore;
@@ -9732,7 +9828,8 @@ export class AgentManager {
     const client = this.requireClient(agent.provider);
     const restrictions = this.contextSummaryRestrictions(adapter);
     if (!restrictions && client.capabilities.supportsToolInvocations) return "";
-    const opening = client.createSession(
+    const opening = this.openProviderSession(
+      client,
       {
         provider: agent.provider,
         model: agent.runtimeInfo?.model ?? agent.config.model,
@@ -10842,7 +10939,7 @@ export class AgentManager {
 
   private async closeUnregisteredSession(session: AgentSession): Promise<void> {
     try {
-      await session.close();
+      await this.closeProviderSession(session);
     } catch (error) {
       this.logger.warn({ err: error }, "Failed to close unregistered agent session");
     }

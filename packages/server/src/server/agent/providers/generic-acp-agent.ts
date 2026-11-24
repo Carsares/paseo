@@ -1,6 +1,7 @@
 import type { Logger } from "pino";
 
-import { checkProviderLaunchAvailable, resolveProviderLaunch } from "../provider-launch-config.js";
+import { spawnProcess } from "../../../utils/spawn.js";
+import { acquireInstallationProcess } from "../provider-installation/installation-activity.js";
 import {
   ACPAgentClient,
   type ACPCatalogModelResolver,
@@ -10,10 +11,10 @@ import {
   type ACPExtensionCommandsParser,
 } from "./acp-agent.js";
 import {
-  buildBinaryDiagnosticRows,
   formatProviderDiagnostic,
   type DiagnosticEntry,
   toDiagnosticErrorMessage,
+  truncateForDiagnostic,
 } from "./diagnostic-utils.js";
 
 interface GenericACPAgentClientOptions {
@@ -66,19 +67,6 @@ export class GenericACPAgentClient extends ACPAgentClient {
     this.diagnosticPhaseTimeoutMs = options.diagnosticPhaseTimeoutMs;
   }
 
-  protected override async resolveLaunchCommand(): Promise<{ command: string; args: string[] }> {
-    return {
-      command: this.command[0],
-      args: this.command.slice(1),
-    };
-  }
-
-  override async isAvailable(): Promise<boolean> {
-    const launch = await this.resolveConfiguredLaunch();
-    const availability = await checkProviderLaunchAvailable(launch);
-    return availability.available;
-  }
-
   async getDiagnostic(): Promise<{ diagnostic: string }> {
     const providerName = formatProviderName(this.label, this.providerId);
     const entries: DiagnosticEntry[] = [
@@ -88,17 +76,19 @@ export class GenericACPAgentClient extends ACPAgentClient {
     const versionProbe = buildVersionProbeCommand(this.command);
 
     try {
-      const launch = await this.resolveConfiguredLaunch();
-      const availability = await checkProviderLaunchAvailable(launch);
+      const { executable, env } = await this.resolveLauncher();
+      let version = "unknown";
+      if (executable) {
+        try {
+          version = (await readLauncherVersion(executable, versionProbe.args, env)) || "unknown";
+        } catch (error) {
+          version = `error: ${toDiagnosticErrorMessage(error)}`;
+        }
+      }
       entries.push(
-        ...(await buildBinaryDiagnosticRows(launch, availability, {
-          binaryLabel: "Launcher binary",
-          versionCommand: {
-            command: versionProbe.command,
-            args: versionProbe.args,
-            env: this.runtimeSettings?.env,
-          },
-        })),
+        { label: "Launcher binary", value: versionProbe.command },
+        { label: "Resolved path", value: executable ?? "not found" },
+        { label: "Version", value: version },
       );
     } catch (error) {
       entries.push({
@@ -120,13 +110,6 @@ export class GenericACPAgentClient extends ACPAgentClient {
     };
   }
 
-  private async resolveConfiguredLaunch() {
-    return resolveProviderLaunch({
-      commandConfig: { mode: "replace", argv: this.command },
-      defaultBinary: this.command[0],
-    });
-  }
-
   private async getACPProbeRowsForDiagnostic() {
     try {
       return await this.buildACPProbeDiagnosticRows({
@@ -141,6 +124,55 @@ export class GenericACPAgentClient extends ACPAgentClient {
       ];
     }
   }
+}
+
+function readLauncherVersion(
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<string> {
+  const cwd = process.cwd();
+  const signal = AbortSignal.timeout(5_000);
+  const child = acquireInstallationProcess({ family: "acp", keys: [], opaque: true }, () =>
+    spawnProcess(command, args, {
+      cwd,
+      env,
+      signal,
+      killSignal: "SIGKILL",
+      stdio: ["ignore", "pipe", "pipe"],
+    }),
+  );
+  return new Promise((resolve, reject) => {
+    const collect = (stream: NodeJS.ReadableStream | null) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      stream?.on("data", (chunk: Buffer) => {
+        size += chunk.length;
+        if (size <= 1024 * 1024) chunks.push(chunk);
+        else if (size - chunk.length <= 1024 * 1024) {
+          child.kill("SIGKILL");
+          reject(new Error("ACP version output exceeded its limit"));
+        }
+      });
+      return () => Buffer.concat(chunks).toString("utf8").trim();
+    };
+    const stdout = collect(child.stdout);
+    const stderr = collect(child.stderr);
+    child.once("error", reject);
+    child.once("close", (code, exitSignal) => {
+      if (code === 0) resolve(stdout() || stderr());
+      else {
+        reject(
+          Object.assign(new Error("ACP version command failed"), {
+            code,
+            signal: exitSignal,
+            stdout: truncateForDiagnostic(stdout()),
+            stderr: truncateForDiagnostic(stderr()),
+          }),
+        );
+      }
+    });
+  });
 }
 
 export interface CommandInvocation {

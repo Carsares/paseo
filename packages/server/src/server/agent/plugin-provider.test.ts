@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile as writeTestFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentStorage } from "./agent-storage.js";
@@ -2506,6 +2506,73 @@ describe("pending provider responses", () => {
 });
 
 describe("plugin provider launch and status", () => {
+  test("does not expose the update callback of a directly registered plugin", async () => {
+    const { registration } = createProviderHarness();
+    const registry = new PluginAgentClientRegistry(createTestLogger());
+    registry.replace([
+      {
+        ...registration,
+        installation: {
+          maintenance: { kind: "automatic" },
+          async update() {
+            throw new Error("The old callback must not run");
+          },
+        },
+      },
+    ]);
+    try {
+      const installation = registry.clients()[registration.id]!.installation;
+      expect(installation?.update).toBeUndefined();
+      await expect(
+        installation?.getMaintenance?.({ signal: new AbortController().signal }),
+      ).resolves.toMatchObject({ kind: "manual" });
+    } finally {
+      await registry.shutdown();
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "resolves a plugin executable without running it",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "paseo-plugin-lookup-"));
+      const executable = join(root, "agy");
+      const marker = join(root, "started");
+      const harness = createProviderHarness();
+      const registry = new PluginAgentClientRegistry(createTestLogger());
+      try {
+        await writeTestFile(executable, '#!/bin/sh\nprintf started > "$PROBE_MARKER"\n', {
+          mode: 0o755,
+        });
+        registry.replace([
+          {
+            ...harness.registration,
+            command: ["agy", "acp"],
+            async status({ launch }) {
+              return { available: launch?.command === executable };
+            },
+            installation: {
+              async inspect({ launch }) {
+                return { status: launch?.resolved ? "installed" : "not_installed" };
+              },
+            },
+          },
+        ]);
+        const logger = createTestLogger();
+        const client = registry.definitions()[harness.registration.id]!.createClient(logger, {
+          env: { PATH: root, PROBE_MARKER: marker },
+        });
+        expect(await client.isAvailable()).toBe(true);
+        await expect(
+          client.installation?.inspect?.({ signal: new AbortController().signal }),
+        ).resolves.toEqual({ status: "installed" });
+        await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await registry.shutdown();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("resolves the executable against the provider's PATH override", async () => {
     const harness = createProviderHarness();
     const registration: ProviderRegistration = { ...harness.registration, command: ["node"] };

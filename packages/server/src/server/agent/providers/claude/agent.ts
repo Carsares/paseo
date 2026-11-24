@@ -8,6 +8,10 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { promises } from "node:fs";
 import path from "node:path";
+import {
+  findInstallationLaunchPath,
+  readInstallationActivityKeys,
+} from "../../provider-installation/installation-target.js";
 import { LRUCache } from "lru-cache";
 import stripAnsi from "strip-ansi";
 import { createImportDescriptorScheduler } from "./import-descriptor-scheduler.js";
@@ -74,7 +78,6 @@ import { limitAgentTimelineItemContent } from "../../agent-timeline-content.js";
 import { readClaudeWorkflowResultFile } from "./subagents/workflow-output.js";
 import { buildClaudeControls, claudeModelSupportsFastMode } from "./feature-definitions.js";
 import {
-  buildBinaryDiagnosticRows,
   buildCommandResolutionDiagnosticRows,
   formatProviderDiagnostic,
   formatProviderDiagnosticError,
@@ -87,7 +90,12 @@ import {
 } from "./options.js";
 import { renderPromptAttachmentAsText } from "../../prompt-attachments.js";
 import { discoverClaudeModels, killExitingClaudeModelDiscoveries } from "./model-discovery.js";
-import { claudeQuery, type ClaudeOptions, type ClaudeQueryFactory } from "./query.js";
+import {
+  claudeQuery,
+  execClaudeProbe,
+  type ClaudeOptions,
+  type ClaudeQueryFactory,
+} from "./query.js";
 import {
   findSteeredMessageParent,
   realClaudeRewindSdk,
@@ -105,7 +113,6 @@ import {
   resolveExecutablePath,
   type LatestReleaseLookup,
 } from "../release-check.js";
-import { runUpdateCommand, updatedForNewAgents } from "../update-command.js";
 import { THINKING_APPLIES_NEXT_TURN_NOTICE } from "../../provider-notices.js";
 import { TaskDispatchRejectedError } from "../../task-ledger/reuse.js";
 import {
@@ -162,16 +169,13 @@ import { resolveRuntimeMcpToolPolicy } from "../../runtime-mcp-config.js";
 import { importSessionFromPersistence } from "../../provider-session-import.js";
 import { runProviderRefreshActivity } from "../../provider-refresh-deadline.js";
 import {
-  checkProviderLaunchAvailable,
   createProviderEnv,
-  createProviderEnvSpec,
   resolveProviderLaunch,
   type ProviderRuntimeSettings,
   type ResolvedProviderLaunch,
 } from "../../provider-launch-config.js";
 import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
-import { execCommand } from "../../../../utils/spawn.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
 
 const fsPromises = promises;
@@ -497,6 +501,13 @@ export interface ClaudeContentChunk {
   [key: string]: unknown;
 }
 
+interface ClaudeLaunchLocation {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+}
+
+type ClaudeBinaryResolver = (location?: ClaudeLaunchLocation) => Promise<string>;
+
 interface ClaudeAgentClientOptions {
   discoverModels?: typeof discoverClaudeModels;
   defaults?: { agents?: Record<string, AgentDefinition> };
@@ -523,7 +534,7 @@ interface ClaudeAgentSessionOptions {
   persistSession?: boolean;
   logger: Logger;
   queryFactory?: ClaudeQueryFactory;
-  resolveBinary: () => Promise<string>;
+  resolveBinary: ClaudeBinaryResolver;
   independentUltracode: boolean;
   rewindSdk?: ClaudeRewindSdk;
 }
@@ -1661,28 +1672,15 @@ export class ClaudeAgentClient implements AgentClient {
       });
       return compareWithLatestRelease({ installed: installedVersion, latest });
     },
-    // `claude update` updates native installs itself and package-manager installs through the
-    // package manager.
-    update: async (context) => {
-      const installed = await resolveInstalledClaude(this.runtimeSettings);
-      if (!installed) return { status: "failed", message: "Claude Code is not installed" };
-      return runUpdateCommand(
-        {
-          command: installed.executable,
-          args: [...installed.args, "update"],
-          env: createProviderEnvSpec({ runtimeSettings: this.runtimeSettings }),
-          successMessage: updatedForNewAgents("Claude Code"),
-        },
-        context,
-      );
-    },
+    getMaintenance: async () => ({ kind: "manual", message: CLAUDE_MANUAL_UPDATE }),
+    update: async () => ({ status: "failed", message: CLAUDE_MANUAL_UPDATE }),
   };
 
   private readonly defaults?: { agents?: Record<string, AgentDefinition> };
   private readonly logger: Logger;
   private readonly runtimeSettings?: ProviderRuntimeSettings;
   private readonly queryFactory?: ClaudeQueryFactory;
-  private readonly resolveBinary: () => Promise<string>;
+  private readonly resolveBinary: ClaudeBinaryResolver;
   private readonly resolveVersion: (signal?: AbortSignal) => Promise<string>;
   private version: Promise<string | undefined> | undefined;
   private readonly lookupLatestRelease: LatestReleaseLookup;
@@ -1703,7 +1701,8 @@ export class ClaudeAgentClient implements AgentClient {
     this.logger = options.logger.child({ module: "agent", provider: "claude" });
     this.runtimeSettings = options.runtimeSettings;
     this.queryFactory = options.queryFactory;
-    this.resolveBinary = options.resolveBinary ?? (() => resolveClaudeBinary(this.runtimeSettings));
+    this.resolveBinary =
+      options.resolveBinary ?? ((location) => resolveClaudeBinary(this.runtimeSettings, location));
     this.resolveVersion =
       options.resolveVersion ??
       ((signal) => resolveClaudeCodeVersion(this.runtimeSettings, signal));
@@ -1955,7 +1954,7 @@ export class ClaudeAgentClient implements AgentClient {
       commandConfig: this.runtimeSettings?.command,
       defaultBinary: "claude",
     });
-    const availability = await checkProviderLaunchAvailable(launch);
+    const availability = await checkClaudeLaunchAvailable(launch, this.buildProviderEnv());
     return availability.available;
   }
 
@@ -1965,8 +1964,16 @@ export class ClaudeAgentClient implements AgentClient {
         commandConfig: this.runtimeSettings?.command,
         defaultBinary: "claude",
       });
-      const availability = await checkProviderLaunchAvailable(launch);
-      const auth = availability.available
+      const availability = await checkClaudeLaunchAvailable(launch, this.buildProviderEnv());
+      const executable = availability.resolvedPath;
+      const version = executable
+        ? await execClaudeProbe(executable, [...launch.args, "--version"], {
+            runtimeSettings: this.runtimeSettings,
+          })
+            .then(({ stdout, stderr }) => stdout.trim() || stderr.trim() || "unknown")
+            .catch(() => "unknown")
+        : "unknown";
+      const auth = executable
         ? await resolveClaudeAuth(launch, availability, this.runtimeSettings)
         : null;
 
@@ -1974,8 +1981,14 @@ export class ClaudeAgentClient implements AgentClient {
         diagnostic: formatProviderDiagnostic("Claude Code", [
           ...(await buildCommandResolutionDiagnosticRows(launch, {
             knownBinaryNames: ["claude"],
+            includeCommandProbes: false,
           })),
-          ...(await buildBinaryDiagnosticRows(launch, availability)),
+          {
+            label: launch.source === "override" ? "Binary (override)" : "Binary",
+            value: launch.command,
+          },
+          { label: "Resolved path", value: executable ?? "not found" },
+          { label: "Version", value: version },
           ...(auth ? [{ label: "Auth", value: auth }] : []),
         ]),
       };
@@ -2002,12 +2015,32 @@ export class ClaudeAgentClient implements AgentClient {
   }
 }
 
-async function resolveClaudeBinary(runtimeSettings?: ProviderRuntimeSettings): Promise<string> {
+async function checkClaudeLaunchAvailable(
+  launch: ResolvedProviderLaunch,
+  env: NodeJS.ProcessEnv,
+  cwd = process.cwd(),
+) {
+  const resolvedPath = await findInstallationLaunchPath(launch.command, {
+    cwd: launch.source === "override" ? cwd : process.cwd(),
+    env,
+    winGetFallback: launch.source !== "override",
+  });
+  return { available: resolvedPath !== null, resolvedPath };
+}
+
+async function resolveClaudeBinary(
+  runtimeSettings?: ProviderRuntimeSettings,
+  location?: ClaudeLaunchLocation,
+): Promise<string> {
   const launch = await resolveProviderLaunch({
     commandConfig: runtimeSettings?.command,
     defaultBinary: "claude",
   });
-  const availability = await checkProviderLaunchAvailable(launch);
+  const availability = await checkClaudeLaunchAvailable(
+    launch,
+    location?.env ?? createProviderEnv({ runtimeSettings }),
+    location?.cwd,
+  );
   if (availability.available) {
     return availability.resolvedPath ?? launch.command;
   }
@@ -2018,6 +2051,9 @@ async function resolveClaudeBinary(runtimeSettings?: ProviderRuntimeSettings): P
 
 const CLAUDE_INSTALL_URL = "https://code.claude.com/docs/en/setup#install-claude-code";
 const CLAUDE_UPDATE_URL = "https://code.claude.com/docs/en/setup#update-claude-code";
+
+const CLAUDE_MANUAL_UPDATE =
+  "Update Claude Code with the installer or package manager that installed it. Paseo cannot verify this installation for an in-app update.";
 
 type ClaudeCodeVersionRead =
   | { status: "not_installed" }
@@ -2082,7 +2118,10 @@ async function resolveInstalledClaude(
     commandConfig: runtimeSettings?.command,
     defaultBinary: "claude",
   });
-  const availability = await checkProviderLaunchAvailable(launch);
+  const availability = await checkClaudeLaunchAvailable(
+    launch,
+    createProviderEnv({ runtimeSettings }),
+  );
   if (!availability.available) return null;
   return { executable: availability.resolvedPath ?? launch.command, args: [...launch.args] };
 }
@@ -2094,9 +2133,8 @@ async function readClaudeCodeVersion(
   const installed = await resolveInstalledClaude(runtimeSettings);
   if (!installed) return { status: "not_installed" };
   const { executable } = installed;
-  const { stdout, stderr } = await execCommand(executable, [...installed.args, "--version"], {
-    ...createProviderEnvSpec({ runtimeSettings }),
-    timeout: 5_000,
+  const { stdout, stderr } = await execClaudeProbe(executable, [...installed.args, "--version"], {
+    runtimeSettings,
     signal,
   });
   // A wrapper command (the `command` provider setting) prints its own version here
@@ -2122,9 +2160,8 @@ async function resolveClaudeAuth(
     args: string[],
   ): Promise<{ stdout: string; stderr: string }> => {
     try {
-      return await execCommand(executable, args, {
-        ...createProviderEnvSpec({ runtimeSettings }),
-        timeout: 5_000,
+      return await execClaudeProbe(executable, args, {
+        runtimeSettings,
       });
     } catch (error) {
       const err = toObjectRecord(error);
@@ -2457,7 +2494,7 @@ class ClaudeAgentSession implements AgentSession {
   private readonly persistSession?: boolean;
   private readonly logger: Logger;
   private readonly queryFactory?: ClaudeQueryFactory;
-  private readonly resolveBinary: () => Promise<string>;
+  private readonly resolveBinary: ClaudeBinaryResolver;
   private readonly independentUltracode: boolean;
   private query: Query | null = null;
   private readonly runtimeSafety = new ClaudeRuntimeSafety();
@@ -3961,8 +3998,12 @@ class ClaudeAgentSession implements AgentSession {
     // buildOptions copies the launch options before it waits, so from here they are fixed.
     this.queryStarting = true;
     let options: ClaudeOptions;
+    let installationKeys: string[] = [];
     try {
       options = await this.buildOptions(launchMode);
+      if (options.pathToClaudeCodeExecutable && this.runtimeSettings?.command?.mode !== "replace") {
+        installationKeys = await readInstallationActivityKeys(options.pathToClaudeCodeExecutable);
+      }
       // Closure can finish while launch options are being prepared.
       if (this.closed) throw new Error("Claude session is closed");
     } catch (error) {
@@ -3975,19 +4016,30 @@ class ClaudeAgentSession implements AgentSession {
     this.dispatchEvents([{ type: "background_work", provider: "claude", items: null }]);
     // A fresh Claude process has no turn of its own in flight.
     this.mainTurnInFlight = false;
-    this.query = claudeQuery(
-      { prompt: input.iterable, options },
-      {
-        runtimeSettings: this.runtimeSettings,
-        launchEnv: this.launchEnv,
-        queryFactory: this.queryFactory,
-        onChildProcess: (child) => {
-          this.childProcess = child;
-          child.once("exit", (code, signal) => this.handleRuntimeExit(child, code, signal));
+    try {
+      this.query = claudeQuery(
+        { prompt: input.iterable, options },
+        {
+          runtimeSettings: this.runtimeSettings,
+          launchEnv: this.launchEnv,
+          queryFactory: this.queryFactory,
+          installationKeys,
+          assertCanSpawn: () => {
+            if (this.closed || this.input !== input) throw new Error("Claude query is closed");
+          },
+          onChildProcess: (child) => {
+            this.childProcess = child;
+            child.once("exit", (code, signal) => this.handleRuntimeExit(child, code, signal));
+          },
         },
-      },
-    );
-    this.queryStarting = false;
+      );
+    } catch (error) {
+      this.input = null;
+      input.end();
+      throw error;
+    } finally {
+      this.queryStarting = false;
+    }
     const fastMode = this.resolveFastModeSetting();
     const ultracode = this.independentUltracode ? this.resolveUltracodeSetting() : undefined;
     if (fastMode !== null || ultracode !== undefined) {
@@ -4125,7 +4177,7 @@ class ClaudeAgentSession implements AgentSession {
     const sdkEnv = this.harnessEnvironment;
     assertClaudeModeCanRun(permissionMode, sdkEnv);
 
-    const claudeBinary = await this.resolveBinary();
+    const claudeBinary = await this.resolveBinary({ cwd: this.config.cwd, env: sdkEnv });
     this.logger.debug(
       {
         claudeBinary,

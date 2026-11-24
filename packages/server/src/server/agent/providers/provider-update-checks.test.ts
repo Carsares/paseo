@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
-import type { AgentClient } from "../agent-sdk-types.js";
+import type { AgentClient, AgentSession } from "../agent-sdk-types.js";
 import { ClaudeAgentClient } from "./claude/agent.js";
 import { CodexAppServerAgentClient } from "./codex-app-server-agent.js";
 import { CopilotACPAgentClient } from "./copilot-acp-agent.js";
@@ -27,28 +27,17 @@ async function versionCommand(banner: string): Promise<[string, string]> {
   return [process.execPath, script];
 }
 
-/**
- * A command that, for `update`, writes `stdout` and `stderr` and exits with `exitCode`. Its
- * arguments are recorded so the test can see which updater ran.
- */
-async function updaterCommand(input: {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-}): Promise<{ argv: [string, string]; recordedArgs: () => Promise<string[]> }> {
+async function recordCommand(): Promise<{
+  argv: [string, string];
+  recordedArgs: () => Promise<string[]>;
+}> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-updater-"));
   roots.push(root);
   const script = path.join(root, "cli.mjs");
   const record = path.join(root, "args.json");
   await fs.writeFile(
     script,
-    [
-      `import { writeFileSync } from "node:fs";`,
-      `writeFileSync(${JSON.stringify(record)}, JSON.stringify(process.argv.slice(2)));`,
-      `process.stdout.write(${JSON.stringify(input.stdout)});`,
-      `process.stderr.write(${JSON.stringify(input.stderr)});`,
-      `process.exitCode = ${input.exitCode};`,
-    ].join("\n"),
+    `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(record)}, JSON.stringify(process.argv.slice(2)));\n`,
   );
   return {
     argv: [process.execPath, script],
@@ -106,48 +95,14 @@ const providers = [
 ];
 
 describe.each(providers)("$name update", ({ client }) => {
-  test("runs the CLI's own update command and passes its output through", async () => {
-    const updater = await updaterCommand({
-      stdout: "Updating via `npm install -g`...\nadded 1 package\n",
-      stderr: "npm warn deprecated\n",
-      exitCode: 0,
-    });
-    const { result, output } = await runUpdate(client(updater.argv, releases("9.9.9").lookup));
-    expect(await updater.recordedArgs()).toEqual(["update"]);
-    expect(result).toEqual({ status: "succeeded", message: expect.stringContaining("updated") });
-    expect(output[0]).toEqual({
-      type: "message",
-      text: `Running ${updater.argv.join(" ")} update\n`,
-    });
-    expect(
-      output
-        .filter((event) => event.type === "stdout")
-        .map((event) => event.text)
-        .join(""),
-    ).toBe("Updating via `npm install -g`...\nadded 1 package\n");
-    expect(
-      output
-        .filter((event) => event.type === "stderr")
-        .map((event) => event.text)
-        .join(""),
-    ).toBe("npm warn deprecated\n");
-  });
-
-  test("fails with the exit code and keeps the updater's output", async () => {
-    const updater = await updaterCommand({
-      stdout: "",
-      stderr: "Could not detect the installation method\n",
-      exitCode: 3,
-    });
-    const { result, output } = await runUpdate(client(updater.argv, releases("9.9.9").lookup));
-    expect(result).toEqual({
-      status: "failed",
-      message: `${updater.argv.join(" ")} update exited with code 3`,
-    });
-    expect(output).toContainEqual({
-      type: "stderr",
-      text: "Could not detect the installation method\n",
-    });
+  test("does not run the updater through a configured wrapper", async () => {
+    const updater = await recordCommand();
+    const agent = client(updater.argv, releases("9.9.9").lookup);
+    await expect(
+      agent.installation?.getMaintenance?.({ signal: new AbortController().signal }),
+    ).resolves.toMatchObject({ kind: "manual" });
+    await expect(runUpdate(agent)).resolves.toMatchObject({ result: { status: "failed" } });
+    await expect(updater.recordedArgs()).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 
@@ -244,8 +199,6 @@ const selfUpdatingClis = [
     name: "Copilot",
     banner: "GitHub Copilot CLI 1.0.110.\nRun 'copilot update' to check for updates.",
     version: "1.0.110",
-    updateArgs: ["update"],
-    successMessage: expect.stringContaining("New agents use the new version"),
     client: (argv: [string, string]) =>
       new CopilotACPAgentClient({
         logger: createTestLogger(),
@@ -256,18 +209,16 @@ const selfUpdatingClis = [
     name: "OpenCode",
     banner: "1.19.5",
     version: "1.19.5",
-    updateArgs: ["upgrade"],
-    // OpenCode runs one server for every agent, which keeps the old version until restarted.
-    successMessage: expect.stringContaining("Restart the Paseo daemon"),
     client: (argv: [string, string]) =>
-      new OpenCodeRuntimeClient(createTestLogger(), { command: { mode: "replace", argv } }),
+      new OpenCodeRuntimeClient(createTestLogger(), {
+        command: { mode: "replace", argv },
+        env: { XDG_STATE_HOME: path.dirname(argv[1]), PASEO_OPENCODE_SERVER_URL: "" },
+      }),
   },
   {
     name: "Pi",
     banner: "1.3.0",
     version: "1.3.0",
-    updateArgs: ["update", "--self"],
-    successMessage: expect.stringContaining("New agents use the new version"),
     client: (argv: [string, string]) =>
       new PiRpcAgentClient({
         logger: createTestLogger(),
@@ -278,8 +229,6 @@ const selfUpdatingClis = [
     name: "Oh My Pi",
     banner: "omp/18.6.1",
     version: "18.6.1",
-    updateArgs: ["update"],
-    successMessage: expect.stringContaining("New agents use the new version"),
     client: (argv: [string, string]) =>
       new OmpAgentClient({
         logger: createTestLogger(),
@@ -297,19 +246,22 @@ describe.each(selfUpdatingClis)("$name installation", (cli) => {
     });
   });
 
-  test("updates with the CLI's own update command", async () => {
-    const updater = await updaterCommand({ stdout: "done\n", stderr: "", exitCode: 0 });
-    const { result } = await runUpdate(cli.client(updater.argv));
-    expect(await updater.recordedArgs()).toEqual(cli.updateArgs);
-    expect(result).toEqual({ status: "succeeded", message: cli.successMessage });
+  test("uses manual maintenance and does not launch the configured updater", async () => {
+    const updater = await recordCommand();
+    const client = cli.client(updater.argv);
+    await expect(
+      client.installation.getMaintenance?.({ signal: new AbortController().signal }),
+    ).resolves.toMatchObject({ kind: "manual" });
+    await expect(runUpdate(client)).resolves.toMatchObject({
+      result: { status: "failed" },
+      output: [],
+    });
+    await expect(updater.recordedArgs()).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   test("is not installed when the command is missing", async () => {
     const client = cli.client(["/nonexistent/paseo-cli", "--flag"]);
     await expect(inspect(client)).resolves.toEqual({ status: "not_installed" });
-    await expect(runUpdate(client)).resolves.toMatchObject({
-      result: { status: "failed", message: `${cli.name} is not installed` },
-    });
   });
 });
 
@@ -333,6 +285,114 @@ test("Copilot reports the copy on the provider's PATH", async () => {
   });
   await expect(inspect(client)).resolves.toEqual({ status: "installed", version: "9.9.9" });
 });
+
+test.skipIf(process.platform === "win32")(
+  "Copilot resolves availability without a process and only runs guarded diagnostic queries",
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-copilot-diagnostic-"));
+    roots.push(root);
+    const invocations = path.join(root, "invocations");
+    await fs.writeFile(
+      path.join(root, "copilot"),
+      [
+        "#!/bin/sh",
+        'printf "%s %s\\n" "$COPILOT_AUTO_UPDATE" "$*" >> "$COPILOT_TEST_LOG"',
+        'printf "GitHub Copilot CLI 0.0.418.\\n"',
+        'if [ "$*" = "--no-auto-update version" ]; then printf "Update available: 1.0.115\\n"; fi',
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const client = new CopilotACPAgentClient({
+      logger: createTestLogger(),
+      runtimeSettings: {
+        env: { PATH: root, COPILOT_TEST_LOG: invocations, COPILOT_AUTO_UPDATE: "true" },
+      },
+    });
+
+    expect(await client.isAvailable()).toBe(true);
+    await expect(fs.stat(invocations)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await client.getDiagnostic()).diagnostic).toContain("GitHub Copilot CLI 0.0.418.");
+    await expect(inspect(client)).resolves.toEqual({ status: "installed", version: "0.0.418" });
+    await expect(
+      client.installation.checkForUpdates!({
+        signal: new AbortController().signal,
+        installedVersion: "0.0.418",
+      }),
+    ).resolves.toEqual({ status: "available", versions: ["1.0.115"] });
+    expect((await fs.readFile(invocations, "utf8")).trim().split("\n")).toEqual([
+      "false --no-auto-update --version",
+      "false --no-auto-update --version",
+      "false --no-auto-update version",
+    ]);
+  },
+);
+
+test
+  .skipIf(process.platform === "win32")
+  .each(["metadata", "history", "interactive", "new"] as const)(
+  "Copilot starts %s with automatic updates disabled and no preceding version process",
+  async (purpose) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-copilot-acp-resume-"));
+    roots.push(root);
+    const executable = path.join(root, "copilot");
+    const script = path.join(root, "acp.mjs");
+    await fs.writeFile(
+      executable,
+      [
+        "#!/bin/sh",
+        'printf "%s %s\\n" "$COPILOT_AUTO_UPDATE" "$*" >> "$0.calls"',
+        'if [ "$1" = "--version" ]; then exit 0; fi',
+        'exec "$COPILOT_TEST_NODE" "$COPILOT_TEST_SCRIPT" "$@"',
+      ].join("\n") + "\n",
+      { mode: 0o755 },
+    );
+    await fs.writeFile(
+      script,
+      `
+    import { createInterface } from "node:readline";
+    createInterface({ input: process.stdin }).on("line", (line) => {
+      const { id, method } = JSON.parse(line);
+      if (id === undefined) return;
+      const result = method === "initialize"
+        ? { protocolVersion: 1, agentCapabilities: { loadSession: true, sessionCapabilities: { close: {} } } }
+        : method === "session/new" ? { sessionId: "new" } : {};
+      console.log(JSON.stringify({ jsonrpc: "2.0", id, result }));
+    });
+  `,
+    );
+    const client = new CopilotACPAgentClient({
+      logger: createTestLogger(),
+      runtimeSettings: {
+        command: { mode: "replace", argv: [executable] },
+        env: {
+          COPILOT_TEST_NODE: process.execPath,
+          COPILOT_TEST_SCRIPT: script,
+          COPILOT_AUTO_UPDATE: "true",
+        },
+      },
+    });
+    const launchContext = { env: { COPILOT_AUTO_UPDATE: "true" } };
+    let session: AgentSession | undefined;
+    try {
+      if (purpose === "metadata") {
+        await client.listImportableSessions();
+      } else if (purpose === "new") {
+        session = await client.createSession({ provider: "copilot", cwd: root }, launchContext);
+      } else {
+        session = await client.resumeSession(
+          { provider: "copilot", sessionId: "saved", metadata: { cwd: root } },
+          undefined,
+          launchContext,
+          { purpose },
+        );
+      }
+      expect(await fs.readFile(executable + ".calls", "utf8")).toBe("false --acp\n");
+    } finally {
+      await session?.close();
+    }
+  },
+);
 
 test("Pi checks the release its own update check reads", async () => {
   const argv = await versionCommand("1.3.0");
@@ -373,8 +433,75 @@ describe("Oh My Pi update check", () => {
   });
 });
 
-test("Copilot and OpenCode declare no update check", () => {
+describe("Copilot update check", () => {
+  const banner = "GitHub Copilot CLI 0.0.418\n";
+  const unknown = {
+    status: "unknown",
+    message: "Copilot did not report whether an update is available.",
+  };
+  const cases = [
+    {
+      name: "reads the available version from Copilot's own release channel",
+      stdout: banner + "Update available: 1.0.115\nRun 'copilot update' to update",
+      exitCode: 0,
+      expected: { status: "available", versions: ["1.0.115"] },
+    },
+    {
+      name: "reads an explicit current response",
+      stdout: banner + "You are already on the latest version.",
+      exitCode: 0,
+      expected: { status: "current" },
+    },
+    {
+      name: "does not mistake the installed version or update instructions for a result",
+      stdout: banner + "Run 'copilot update' to check for updates.",
+      exitCode: 0,
+      expected: unknown,
+    },
+    {
+      name: "ignores output from failed or unsupported commands",
+      stdout: banner + "Update available: 1.0.115",
+      exitCode: 1,
+      expected: unknown,
+    },
+  ];
+
+  test.each(cases)("$name", async ({ stdout, exitCode, expected }) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-copilot-check-"));
+    roots.push(root);
+    const script = path.join(root, "cli.mjs");
+    const invocations = path.join(root, "invocations");
+    await fs.writeFile(
+      script,
+      [
+        'import { appendFileSync } from "node:fs";',
+        "const args = process.argv.slice(2);",
+        `appendFileSync(${JSON.stringify(invocations)}, JSON.stringify([args, process.env.COPILOT_AUTO_UPDATE]) + "\\n");`,
+        `if (args.at(-1) === "--version") console.log(${JSON.stringify(banner)});`,
+        `else { console.log(${JSON.stringify(stdout)}); process.exitCode = ${exitCode}; }`,
+      ].join("\n"),
+    );
+    const client = new CopilotACPAgentClient({
+      logger: createTestLogger(),
+      runtimeSettings: {
+        command: { mode: "replace", argv: [process.execPath, script, "--wrapper-flag"] },
+        env: { COPILOT_AUTO_UPDATE: "true" },
+      },
+    });
+    await expect(check(client)).resolves.toEqual(expected);
+    expect(
+      (await fs.readFile(invocations, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line)),
+    ).toEqual([
+      [["--wrapper-flag", "--no-auto-update", "--version"], "false"],
+      [["--wrapper-flag", "--no-auto-update", "version"], "false"],
+    ]);
+  });
+});
+
+test("OpenCode declares no update check", () => {
   const argv: [string, string] = [process.execPath, "cli.mjs"];
-  expect(selfUpdatingClis[0]!.client(argv).installation.checkForUpdates).toBeUndefined();
   expect(selfUpdatingClis[1]!.client(argv).installation.checkForUpdates).toBeUndefined();
 });

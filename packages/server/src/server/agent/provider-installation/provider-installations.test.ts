@@ -1,19 +1,28 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { AgentManager } from "../agent-manager.js";
+import { createTestAgentClient } from "../../test-utils/fake-agent-client.js";
+import { installationActivity, InstallationActivity } from "./installation-activity.js";
 import type {
   ProviderEvent,
   ProviderInstallation,
   ProviderInstallationContext,
   ProviderRegistration,
-  ProviderUpdateResult,
 } from "@getpaseo/plugin/server/provider";
 import type {
   ProviderInstallationUpdate,
   ProviderInstallationUpdateProgress,
 } from "@getpaseo/protocol/messages";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import type { AgentClient, AgentClientInstallation } from "../agent-sdk-types.js";
 import { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
-import { ProviderInstallations, type ProviderUpdateEvent } from "./provider-installations.js";
+import {
+  ProviderInstallations,
+  ProviderUpdateCleanupError,
+  type ProviderUpdateEvent,
+} from "./provider-installations.js";
 
 const OPAQUE_VERSION = "  v1.2.3-beta+weird (build 7)\n";
 const MISSING_COMMAND = "paseo-provider-installation-missing-binary";
@@ -609,6 +618,12 @@ describe("ProviderInstallations", () => {
   });
 });
 
+const fakeCheckPhase = "Verifying the Claude Code installation.\n";
+const fakeUpdatePhase = "Running the verified native updater.\n";
+const fakeVerifyPhase = "Verifying the version selected by the original Claude Code command.\n";
+const automatic = async () => ({ kind: "automatic" as const });
+const getFakeActivityKeys = async () => ["file:mock-installation"];
+
 describe("provider updates", () => {
   function updating(
     update: NonNullable<AgentClientInstallation["update"]>,
@@ -619,11 +634,16 @@ describe("provider updates", () => {
     } = {},
   ) {
     let calls = 0;
+    const invoked = Promise.withResolvers<void>();
     const client = builtinClient({
       updateUrl: "https://example.com/update",
       inspect: options.inspect,
+      getMaintenance: automatic,
+      getActivityKeys: getFakeActivityKeys,
       update(context) {
+        context.assertCurrent?.();
         calls += 1;
+        invoked.resolve();
         return update(context);
       },
     });
@@ -639,7 +659,7 @@ describe("provider updates", () => {
       events.push(event);
       if (event.type === "provider.installation.update.progress") progress.push(event.payload);
     });
-    return { installations, events, progress, calls: () => calls };
+    return { installations, events, progress, invoked: invoked.promise, calls: () => calls };
   }
 
   function settled(installations: ProviderInstallations): Promise<ProviderInstallationUpdate> {
@@ -653,38 +673,252 @@ describe("provider updates", () => {
     });
   }
 
-  test("passes output and the success message through unchanged, in order", async () => {
+  test("enforces fresh external maintenance at update time and retains the refusal", async () => {
+    let external = false;
+    const update = vi.fn(async () => ({ status: "succeeded" as const }));
+    const client = builtinClient({
+      update,
+      getActivityKeys: getFakeActivityKeys,
+      async getMaintenance() {
+        return external
+          ? { kind: "external", message: "Update the connected server on its host." }
+          : { kind: "automatic" };
+      },
+    });
+    const installations = new ProviderInstallations({
+      logger: createTestLogger(),
+      resolveClient: () => client,
+    });
+    await expect(installations.inspect("codex")).resolves.toMatchObject({
+      canUpdate: true,
+      maintenance: { kind: "automatic" },
+    });
+    external = true;
+    const done = settled(installations);
+    installations.update("codex");
+    await expect(done).resolves.toMatchObject({
+      operation: {
+        status: "failed",
+        message: "Update this installation on the host that manages it.",
+      },
+    });
+    expect(update).not.toHaveBeenCalled();
+    const view = await installations.inspect("codex");
+    expect(view).toEqual({
+      maintenance: { kind: "external", message: "Update the connected server on its host." },
+    });
+    expect(installations.getUpdate("codex")?.operation.status).toBe("failed");
+    await installations.checkForUpdates("codex", { refresh: true });
+    expect(installations.getUpdate("codex")?.operation.status).toBe("failed");
+    await installations.inspect("codex", { refresh: true });
+    expect(installations.getUpdate("codex")).toBeNull();
+  });
+
+  test.each([
+    { name: "no maintenance", getActivityKeys: getFakeActivityKeys },
+    { name: "no keys", getMaintenance: automatic },
+    { name: "empty keys", getMaintenance: automatic, getActivityKeys: async () => [] },
+    {
+      name: "opaque launch",
+      getMaintenance: automatic,
+      getActivityKeys: async () => ["opaque", "file:mock"],
+    },
+  ])("rejects an unproven updater with $name", async (proof) => {
+    const update = vi.fn(async () => ({ status: "succeeded" as const }));
+    const client = builtinClient({ ...proof, update });
+    const installations = new ProviderInstallations({
+      logger: createTestLogger(),
+      resolveClient: () => client,
+    });
+    await expect(installations.inspect("codex")).resolves.not.toHaveProperty("canUpdate");
+    const done = settled(installations);
+    installations.update("codex");
+    await expect(done).resolves.toMatchObject({
+      operation: {
+        status: "failed",
+        message: "Paseo could not verify a local update plan for this installation.",
+      },
+    });
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  test.each(["prepared", "published before spawn", "published after spawn"] as const)(
+    "checks the published provider config when a replacement is %s",
+    async (replacement) => {
+      const preflight = Promise.withResolvers<void>();
+      const allowSpawn = Promise.withResolvers<void>();
+      const started = Promise.withResolvers<void>();
+      const allowResult = Promise.withResolvers<void>();
+      const launch = vi.fn(() => started.resolve());
+      const client = builtinClient({
+        getMaintenance: automatic,
+        getActivityKeys: getFakeActivityKeys,
+        update: async ({ assertCurrent }) => {
+          preflight.resolve();
+          await allowSpawn.promise;
+          assertCurrent?.();
+          launch();
+          await allowResult.promise;
+          return { status: "succeeded", outcome: "updated" };
+        },
+      });
+      // The snapshot keeps this injected client even when it publishes a different definition.
+      const manager = managerWith({ codex: client });
+      const { installations } = manager;
+      try {
+        const done = settled(installations);
+        installations.update("codex");
+        await preflight.promise;
+        const next = manager.prepareMutableProviderConfig({
+          codex: { label: "New configuration" },
+        });
+
+        if (replacement === "published before spawn") next.commit();
+        allowSpawn.resolve();
+        if (replacement === "published after spawn") {
+          await started.promise;
+          next.commit();
+        }
+        allowResult.resolve();
+        const result = await done;
+        if (replacement === "published before spawn") {
+          expect(launch).not.toHaveBeenCalled();
+          expect(result.operation).toMatchObject({
+            status: "failed",
+            message: "Provider configuration changed. Inspect the installation and retry.",
+          });
+        } else {
+          expect(launch).toHaveBeenCalledTimes(1);
+          expect(result.operation).toMatchObject({
+            status: "succeeded",
+            outcome: replacement === "prepared" ? "updated" : "unverified",
+          });
+        }
+      } finally {
+        allowSpawn.resolve();
+        allowResult.resolve();
+        await installations.close();
+        manager.destroy();
+      }
+    },
+  );
+
+  test("refuses an update against an active alias and publishes the verified outcome after release", async () => {
+    const activity = new InstallationActivity();
+    const release = activity.acquireAgent({ family: "alias", keys: ["file:shared"] });
+    const update = vi.fn<NonNullable<AgentClientInstallation["update"]>>(async (context) => {
+      context.assertCurrent?.();
+      return { status: "succeeded", outcome: "updated" };
+    });
+    const client = builtinClient({
+      update,
+      getMaintenance: automatic,
+      getActivityKeys: async () => ["file:shared"],
+    });
+    const installations = new ProviderInstallations({
+      logger: createTestLogger(),
+      resolveClient: () => client,
+      activity,
+    });
+
+    const refused = settled(installations);
+    installations.update("codex");
+    await expect(refused).resolves.toMatchObject({
+      operation: { status: "failed", message: expect.stringContaining("in use") },
+    });
+    expect(update).not.toHaveBeenCalled();
+
+    release();
+    const accepted = settled(installations);
+    installations.update("codex");
+    await expect(accepted).resolves.toMatchObject({
+      operation: { status: "succeeded", outcome: "updated" },
+    });
+  });
+
+  test("keeps an admitted agent opening exclusive with a provider update", async () => {
+    const entered = Promise.withResolvers<void>();
+    const admitted = Promise.withResolvers<void>();
+    const fake = createTestAgentClient("pi", {
+      beforeCreateSession: async () => {
+        entered.resolve();
+        await admitted.promise;
+      },
+    });
+    const update = vi.fn<NonNullable<AgentClientInstallation["update"]>>(async (context) => {
+      context.assertCurrent?.();
+      return { status: "succeeded" };
+    });
+    const runtimeClient = Object.assign(fake, {
+      installation: {
+        update,
+        getMaintenance: automatic,
+        getActivityKeys: async () => ["file:fake-runtime"],
+      },
+    });
+    const cwd = await mkdtemp(path.join(tmpdir(), "paseo-update-admission-"));
+    const logger = createTestLogger();
+    const manager = new AgentManager({ clients: { pi: runtimeClient }, logger });
+    const updaterClient = builtinClient(runtimeClient.installation);
+    const installations = new ProviderInstallations({
+      logger,
+      resolveClient: () => updaterClient,
+      activity: installationActivity,
+    });
+    const config = { cwd, provider: "pi", model: "test-model" };
+    const creating = manager.createAgent(config, undefined, {});
+    try {
+      await entered.promise;
+      const blocked = settled(installations);
+      installations.update("codex");
+      await expect(blocked).resolves.toMatchObject({
+        operation: { status: "failed", message: expect.stringContaining("in use") },
+      });
+      expect(update).not.toHaveBeenCalled();
+    } finally {
+      admitted.resolve();
+      try {
+        const agent = await creating;
+        await manager.closeAgent(agent.id);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+
+    const completed = settled(installations);
+    installations.update("codex");
+    await expect(completed).resolves.toMatchObject({ operation: { status: "succeeded" } });
+  });
+
+  test("streams fixed phases in order and never exposes raw output or callback results", async () => {
     const { installations, progress } = updating(async ({ report }) => {
-      report({ type: "message", text: OPAQUE_MESSAGE });
-      report({ type: "stdout", text: "  added 1 package\r\n" });
-      report({ type: "stderr", text: "npm warn \u001b[33mdeprecated\u001b[0m\n" });
+      report({ type: "message", text: fakeCheckPhase });
+      report({ type: "message", text: fakeCheckPhase });
+      report({ type: "stdout", text: "credential-".repeat(900) });
+      report({ type: "stderr", text: "passphrase" });
       report({ type: "stdout", text: "" });
-      return { status: "succeeded", message: OPAQUE_MESSAGE };
+      report({ type: "message", text: fakeVerifyPhase });
+      return { status: "succeeded", message: "secret-result" };
     });
     const done = settled(installations);
     const started = installations.update("codex");
     expect(started.operation.status).toBe("running");
 
-    const update = await done;
     const output = [
-      { type: "message", text: OPAQUE_MESSAGE },
-      { type: "stdout", text: "  added 1 package\r\n" },
-      { type: "stderr", text: "npm warn \u001b[33mdeprecated\u001b[0m\n" },
-      { type: "stdout", text: "" },
+      { type: "message", text: fakeCheckPhase },
+      { type: "message", text: fakeVerifyPhase },
     ];
-    expect(update).toEqual({
+    await expect(done).resolves.toEqual({
       operation: {
         status: "succeeded",
         id: started.operation.id,
         startedAt: expect.any(String),
         finishedAt: expect.any(String),
-        message: OPAQUE_MESSAGE,
       },
       output,
+      truncated: true,
     });
     expect(progress.map((event) => event.operation.status)).toEqual([
-      "running",
-      "running",
       "running",
       "running",
       "running",
@@ -693,33 +927,30 @@ describe("provider updates", () => {
     expect(progress.flatMap((event) => event.output)).toEqual(output);
   });
 
-  test("reports a failure with the provider's message and keeps its output", async () => {
+  test("reports a controlled failure with the earlier safe output", async () => {
     const { installations } = updating(async ({ report }) => {
-      report({ type: "stdout", text: "Updating Codex via `npm install -g @openai/codex`...\n" });
-      report({ type: "stderr", text: "npm error code EACCES\n" });
-      return { status: "failed", message: OPAQUE_MESSAGE };
+      report({ type: "message", text: fakeUpdatePhase });
+      report({ type: "stderr", text: "permission issue with secret environment" });
+      return { status: "failed", message: "The native updater exited with code 5." };
     });
     const done = settled(installations);
     installations.update("codex");
-    await expect(done).resolves.toEqual({
-      operation: expect.objectContaining({ status: "failed", message: OPAQUE_MESSAGE }),
-      output: [
-        { type: "stdout", text: "Updating Codex via `npm install -g @openai/codex`...\n" },
-        { type: "stderr", text: "npm error code EACCES\n" },
-      ],
+    await expect(done).resolves.toMatchObject({
+      operation: { status: "failed", message: "The native updater exited with code 5." },
+      output: [{ type: "message", text: fakeUpdatePhase }],
     });
   });
 
-  test("turns a throw into a failure with its message and keeps earlier output", async () => {
+  test("redacts exception details and retains earlier safe output", async () => {
     const { installations } = updating(async ({ report }) => {
-      report({ type: "stdout", text: "step 1\n" });
-      throw new Error(OPAQUE_MESSAGE);
+      report({ type: "message", text: fakeUpdatePhase });
+      throw new Error("token=secret");
     });
     const done = settled(installations);
     installations.update("codex");
-    await expect(done).resolves.toEqual({
-      operation: expect.objectContaining({ status: "failed", message: OPAQUE_MESSAGE }),
-      output: [{ type: "stdout", text: "step 1\n" }],
+    await expect(done).resolves.toMatchObject({
+      operation: { status: "failed", message: "The updater failed." },
+      output: [{ type: "message", text: fakeUpdatePhase }],
     });
   });
 
@@ -777,25 +1008,28 @@ describe("provider updates", () => {
   });
 
   test("a second request while an update runs joins it instead of starting another", async () => {
-    let finish!: () => void;
-    const { installations, calls } = updating(async ({ report }) => {
-      report({ type: "stdout", text: "working\n" });
-      await new Promise<void>((resolve) => {
-        finish = resolve;
-      });
+    const finish = Promise.withResolvers<void>();
+    const { installations, invoked, calls } = updating(async ({ report }) => {
+      report({ type: "message", text: fakeUpdatePhase });
+      await finish.promise;
       return { status: "succeeded" };
     });
     const first = installations.update("codex");
     const second = installations.update("codex");
     expect(second.operation.id).toBe(first.operation.id);
-    expect(second.output).toEqual([{ type: "stdout", text: "working\n" }]);
+    await invoked;
+    expect(installations.getUpdate("codex")?.output).toEqual([
+      { type: "message", text: fakeUpdatePhase },
+    ]);
     expect(calls()).toBe(1);
 
     const done = settled(installations);
-    finish();
+    finish.resolve();
     await expect(done).resolves.toMatchObject({ operation: { status: "succeeded" } });
+    const thirdDone = settled(installations);
     const third = installations.update("codex");
     expect(third.operation.id).not.toBe(first.operation.id);
+    await thirdDone;
     expect(calls()).toBe(2);
   });
 
@@ -855,44 +1089,24 @@ describe("provider updates", () => {
     await expect(done).resolves.toMatchObject({ operation: { status: "succeeded" } });
   });
 
-  test("retains the most recent output within the limit and marks the drop", async () => {
+  test("retains the most recent safe output within the limit and marks the drop", async () => {
     const { installations, progress } = updating(
       async ({ report }) => {
-        report({ type: "stdout", text: "aaaa" });
-        report({ type: "stdout", text: "bbbb" });
-        report({ type: "stderr", text: "cccc" });
-        report({ type: "stdout", text: "0123456789XYZ" });
+        report({ type: "message", text: fakeCheckPhase });
+        report({ type: "message", text: fakeUpdatePhase });
+        report({ type: "message", text: fakeVerifyPhase });
         return { status: "succeeded" };
       },
-      { updateOutputLimit: 10 },
+      { updateOutputLimit: fakeVerifyPhase.length },
     );
     const done = settled(installations);
     installations.update("codex");
     const update = await done;
-    expect(update.output).toEqual([{ type: "stdout", text: "3456789XYZ" }]);
+    expect(update.output).toEqual([{ type: "message", text: fakeVerifyPhase }]);
     expect(update.truncated).toBe(true);
     expect(progress.flatMap((event) => event.output).at(-1)).toEqual({
-      type: "stdout",
-      text: "3456789XYZ",
-    });
-
-    const partial = updating(
-      async ({ report }) => {
-        report({ type: "stdout", text: "aaaa" });
-        report({ type: "stdout", text: "bbbb" });
-        report({ type: "stderr", text: "cccc" });
-        return { status: "succeeded" };
-      },
-      { updateOutputLimit: 10 },
-    );
-    const partialDone = settled(partial.installations);
-    partial.installations.update("codex");
-    await expect(partialDone).resolves.toMatchObject({
-      output: [
-        { type: "stdout", text: "bbbb" },
-        { type: "stderr", text: "cccc" },
-      ],
-      truncated: true,
+      type: "message",
+      text: fakeVerifyPhase,
     });
   });
 
@@ -900,6 +1114,7 @@ describe("provider updates", () => {
     const { installations } = updating(async () => ({ status: "succeeded" }));
     await expect(installations.inspect("codex")).resolves.toEqual({
       updateUrl: "https://example.com/update",
+      maintenance: { kind: "automatic" },
       canUpdate: true,
     });
     // The update never depends on a check: this provider has none, and it still updates.
@@ -919,20 +1134,47 @@ describe("provider updates", () => {
     expect(plain.getUpdate("codex")).toBeNull();
   });
 
-  test("close aborts a running update, which settles with the provider's answer", async () => {
-    function failOnAbort(signal: AbortSignal): Promise<ProviderUpdateResult> {
-      return new Promise((resolve) => {
-        const stopped = () =>
-          resolve({ status: "failed", message: `stopped: ${String(signal.reason)}` });
-        signal.addEventListener("abort", stopped);
-      });
-    }
-    const { installations } = updating(({ signal }) => failOnAbort(signal));
+  test("closes admission and waits for the aborted updater to finish cleanup", async () => {
+    const aborted = Promise.withResolvers<void>();
+    const cleaned = Promise.withResolvers<void>();
+    const { installations, invoked } = updating(async ({ signal }) => {
+      signal.addEventListener("abort", aborted.resolve, { once: true });
+      await aborted.promise;
+      await cleaned.promise;
+      return { status: "failed", message: "Update canceled." };
+    });
     const done = settled(installations);
     installations.update("codex");
-    installations.close();
-    await expect(done).resolves.toMatchObject({
-      operation: { status: "failed", message: "stopped: Error: The daemon is stopping" },
+    await invoked;
+
+    let closed = false;
+    const closing = installations.close();
+    void closing.then(() => {
+      closed = true;
+      return undefined;
     });
+    await aborted.promise;
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    expect(installations.close()).toBe(closing);
+    expect(() => installations.update("codex")).toThrow("The daemon is stopping.");
+
+    cleaned.resolve();
+    await closing;
+    expect(closed).toBe(true);
+    await expect(done).resolves.toMatchObject({
+      operation: { status: "failed", message: "Update canceled." },
+    });
+  });
+
+  test("reports unconfirmed updater cleanup even if it was recorded before shutdown", async () => {
+    const { installations } = updating(async ({ quarantineActivity }) => {
+      quarantineActivity?.();
+      return { status: "failed", message: "Could not confirm the updater process tree stopped." };
+    });
+    const done = settled(installations);
+    installations.update("codex");
+    await done;
+    await expect(installations.close()).rejects.toBeInstanceOf(ProviderUpdateCleanupError);
   });
 });

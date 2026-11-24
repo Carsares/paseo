@@ -3469,6 +3469,13 @@ export const ko: TranslationResources = {
         updateFailed: "업데이트 실패",
         outputTruncated: "이전 출력이 삭제되었습니다.",
         updatesFailed: "업데이트를 확인할 수 없습니다",
+        maintenanceAutomatic: "자동 유지 관리",
+        maintenanceExternal: "외부에서 관리",
+        maintenanceExternalHint: "이 CLI를 설치한 도구로 업데이트하세요.",
+        maintenanceManual: "수동 업데이트 필요",
+        maintenanceManualHint: "제공업체의 안내에 따라 이 호스트에서 업데이트하세요.",
+        alreadyCurrent: "이미 최신 상태",
+        updateUnverified: "업데이트가 끝났지만 버전이 확인되지 않음",
         installInstructions: "설치 안내",
       },
       diagnostic: {

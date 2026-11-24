@@ -178,6 +178,7 @@ import {
   type PaseoToolHostDependencies,
 } from "./agent/tools/paseo-tools.js";
 import type { PaseoToolRuntimeContext } from "./agent/tools/types.js";
+import { ProviderUpdateCleanupError } from "./agent/provider-installation/provider-installations.js";
 import { createAgentProviderRuntime } from "./agent/provider-runtime.js";
 import { bootstrapWorkspaceRegistries } from "./workspace-registry-bootstrap.js";
 import { WorkspaceReconciliationService } from "./workspace-reconciliation-service.js";
@@ -2284,6 +2285,9 @@ export async function createPaseoDaemon(
       await deleteLocalCredential(config.paseoHome);
       unsubscribePluginProviders();
       unsubscribePluginSessionChanges();
+      await providerSnapshotManager.installations.close().catch((cleanupError: unknown) => {
+        logger.error({ err: cleanupError }, "Provider updater cleanup failed");
+      });
       await pluginRuntime.stopAllPlugins().catch(() => undefined);
       await serviceProxy.stopStandalone().catch(() => undefined);
       await agentProviderRuntime.shutdown().catch(() => undefined);
@@ -2295,7 +2299,7 @@ export async function createPaseoDaemon(
     }
   };
 
-  const stop = async (options?: { keepTerminals?: boolean; resumeAgents?: boolean }) => {
+  const stopServices = async (options?: { keepTerminals?: boolean; resumeAgents?: boolean }) => {
     const keepTerminals = options?.keepTerminals === true;
     const resumeAgents = options?.resumeAgents === true;
     let deliveryDrained = false;
@@ -2342,7 +2346,14 @@ export async function createPaseoDaemon(
     await agentManager.flushForShutdown().catch(() => undefined);
     detachAgentStoragePersistence();
     await agentStorage.flush().catch(() => undefined);
-    await agentProviderRuntime.shutdown();
+    let providerUpdateCleanupError: ProviderUpdateCleanupError | undefined;
+    try {
+      await agentProviderRuntime.shutdown();
+    } catch (error) {
+      if (!(error instanceof ProviderUpdateCleanupError)) throw error;
+      providerUpdateCleanupError = error;
+      logger.error({ err: error }, "Provider updater cleanup failed");
+    }
     await pluginRuntime.stopAllPlugins();
     try {
       if (keepTerminals) {
@@ -2380,8 +2391,19 @@ export async function createPaseoDaemon(
     if (listenTarget.type === "socket" && existsSync(listenTarget.path)) {
       unlinkSync(listenTarget.path);
     }
-    if (terminalShutdownError) {
-      throw terminalShutdownError;
+    if (providerUpdateCleanupError) throw providerUpdateCleanupError;
+    if (terminalShutdownError) throw terminalShutdownError;
+  };
+
+  const stop: PaseoDaemon["stop"] = async (options) => {
+    // Close update admission before recovery or session teardown can yield.
+    const updatesStopped = providerSnapshotManager.installations.close();
+    void updatesStopped.catch(() => undefined);
+    try {
+      await stopServices(options);
+    } finally {
+      // A failure in another service must not let the worker exit during updater cleanup.
+      await updatesStopped;
     }
   };
 

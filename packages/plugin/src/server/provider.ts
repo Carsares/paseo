@@ -49,6 +49,8 @@ export interface ProviderInstallation {
   installUrl?: string;
   /** http(s) page that explains how to update the provider. */
   updateUrl?: string;
+  /** How the CLI is kept up to date when Paseo does not run the update. */
+  maintenance?: { kind: "automatic" | "external" | "manual"; message?: string };
   /** Report whether the provider is installed and which version. Runs only when a user asks. */
   inspect?(context: ProviderInstallationContext): Promise<ProviderInspection>;
   /**
@@ -59,11 +61,7 @@ export interface ProviderInstallation {
    * version.
    */
   checkForUpdates?(context: ProviderUpdateCheckContext): Promise<ProviderUpdateCheck>;
-  /**
-   * Update the provider, usually by running its CLI's own updater. Paseo shows everything passed
-   * to `report` while it runs, then the returned message. A throw is a failure with its message.
-   * Runs only when a user asks. Paseo sets no deadline; `signal` aborts when the daemon stops.
-   */
+  /** @deprecated Retained for existing plugins. Paseo no longer invokes this callback. */
   update?(context: ProviderUpdateContext): Promise<ProviderUpdateResult>;
 }
 

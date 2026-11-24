@@ -1195,12 +1195,14 @@ describe("Claude model discovery process", () => {
     ) {
       const child = new StartingClaudeProcess();
       const state: StalledDiscoveryState = { closed: false, inputEnded: false };
+      const { promise: opened, resolve: markOpened } = Promise.withResolvers<void>();
       const result = discoverClaudeModels(
         { resolveBinary: async () => "/claude", env: {} },
         (input, context) => {
           if (typeof input.prompt === "string") throw new Error("unexpected inference prompt");
           void recordInputEnd(input.prompt, state);
           context.onChildProcess?.(child);
+          markOpened();
           return {
             supportedModels,
             close: () => {
@@ -1209,7 +1211,7 @@ describe("Claude model discovery process", () => {
           };
         },
       );
-      return { child, state, result };
+      return { child, state, opened, result };
     }
 
     afterEach(() => {
@@ -1218,8 +1220,9 @@ describe("Claude model discovery process", () => {
 
     it("stops waiting at the limit but lets the CLI finish instead of killing it", async () => {
       vi.useFakeTimers();
-      const { child, state, result } = startStalledDiscovery();
+      const { child, state, opened, result } = startStalledDiscovery();
       const settled = expect(result).rejects.toThrow("Claude model discovery timed out");
+      await opened;
 
       await vi.advanceTimersByTimeAsync(5_000);
       await settled;
@@ -1258,8 +1261,9 @@ describe("Claude model discovery process", () => {
 
     it("never signals a CLI that exits on its own during the grace period", async () => {
       vi.useFakeTimers();
-      const { child, state, result } = startStalledDiscovery();
+      const { child, state, opened, result } = startStalledDiscovery();
       const settled = expect(result).rejects.toThrow("Claude model discovery timed out");
+      await opened;
       await vi.advanceTimersByTimeAsync(5_000);
       await settled;
 
@@ -1273,8 +1277,9 @@ describe("Claude model discovery process", () => {
 
     it("tree-kills a still-running CLI when the daemon shuts down", async () => {
       vi.useFakeTimers();
-      const { child, state, result } = startStalledDiscovery();
+      const { child, state, opened, result } = startStalledDiscovery();
       const settled = expect(result).rejects.toThrow("Claude model discovery timed out");
+      await opened;
       await vi.advanceTimersByTimeAsync(5_000);
       await settled;
       expect(child.signals).toEqual([]);

@@ -28,9 +28,10 @@ import { runPluginBuild } from "./preparation.js";
 import { PluginRuntime, type PluginWorktreeManagerRuntime } from "./runtime.js";
 import type { PluginRuntimeSubscription } from "./runtime-subscription.js";
 import { BuiltinPluginLoader, type BuiltinPlugin } from "./builtin/index.js";
-import type {
-  PluginProviderInstallationMetadata,
-  PluginProviderMetadata,
+import {
+  PLUGIN_MANUAL_UPDATE_MAINTENANCE,
+  type PluginProviderInstallationMetadata,
+  type PluginProviderMetadata,
 } from "./plugin-process-protocol.js";
 import { readPluginProviderIcon } from "./provider-icon.js";
 import {
@@ -69,7 +70,6 @@ interface PluginRuntimePort {
   getProviderStatus?: PluginRuntime["getProviderStatus"];
   inspectProviderInstallation?: PluginRuntime["inspectProviderInstallation"];
   checkProviderUpdates?: PluginRuntime["checkProviderUpdates"];
-  updateProvider?: PluginRuntime["updateProvider"];
   validatePlugin?(path: string): Promise<void>;
   startPlugin(pluginId: string, path: string, canPublish: () => boolean): Promise<void>;
   startBuiltinPlugin?(plugin: BuiltinPlugin): Promise<void>;
@@ -851,6 +851,7 @@ export class PluginService {
     return {
       installUrl: metadata.installUrl,
       updateUrl: metadata.updateUrl,
+      maintenance: metadata.hasUpdate ? PLUGIN_MANUAL_UPDATE_MAINTENANCE : metadata.maintenance,
       inspect: metadata.hasInspect
         ? (context) => {
             if (!this.runtime.inspectProviderInstallation)
@@ -863,13 +864,6 @@ export class PluginService {
             if (!this.runtime.checkProviderUpdates)
               throw new Error("Plugin runtime cannot check provider updates");
             return this.runtime.checkProviderUpdates(pluginId, providerId, context);
-          }
-        : undefined,
-      update: metadata.hasUpdate
-        ? (context) => {
-            if (!this.runtime.updateProvider)
-              throw new Error("Plugin runtime cannot update providers");
-            return this.runtime.updateProvider(pluginId, providerId, context);
           }
         : undefined,
     };

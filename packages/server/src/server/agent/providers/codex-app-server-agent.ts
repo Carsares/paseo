@@ -74,7 +74,6 @@ import { normalizeCodexFilePath } from "./codex/tool-call-detail-parser.js";
 import {
   checkProviderLaunchAvailable,
   createProviderEnv,
-  createProviderEnvSpec,
   resolveProviderLaunch,
   type ProviderRuntimeSettings,
   type ResolvedProviderLaunch,
@@ -135,7 +134,11 @@ import {
   resolveExecutablePath,
   type LatestReleaseLookup,
 } from "./release-check.js";
-import { runUpdateCommand, updatedForNewAgents } from "./update-command.js";
+import { acquireInstallationProcess } from "../provider-installation/installation-activity.js";
+import {
+  findInstallationLaunchPath,
+  readInstallationActivityKeys,
+} from "../provider-installation/installation-target.js";
 import { appendOrReplaceGrowingAssistantMessage, runProviderTurn } from "./provider-runner.js";
 import {
   MODE_APPLIES_NEXT_TURN_NOTICE,
@@ -8418,6 +8421,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   }
 }
 
+const CODEX_MANUAL_UPDATE = "Update Codex with the installer or package manager that installed it.";
 const CODEX_INSTALL_URL = "https://developers.openai.com/codex/cli";
 
 /** `codex --version` prints `codex-cli <version>`; report the version part. */
@@ -8467,21 +8471,25 @@ export class CodexAppServerAgentClient implements AgentClient {
       });
       return compareWithLatestRelease({ installed: installedVersion, latest });
     },
-    // `codex update` picks the updater for the install method: npm, bun, pnpm, Homebrew or the
-    // standalone installer, and exits non-zero with a reason when it cannot tell.
-    update: async (context) => {
-      const command = await this.resolveInstalledCommand();
-      if (!command) return { status: "failed", message: "Codex is not installed" };
-      return runUpdateCommand(
-        {
-          command: command.command,
-          args: [...command.args, "update"],
-          env: createProviderEnvSpec({ runtimeSettings: this.runtimeSettings }),
-          successMessage: updatedForNewAgents("Codex"),
-        },
-        context,
-      );
+    // Both the standalone installer and the package-manager routes can start a shell.
+    getMaintenance: async () => ({
+      kind: "manual",
+      message: CODEX_MANUAL_UPDATE,
+    }),
+    getActivityKeys: async (launch) => {
+      const configured = await resolveCodexLaunch(this.runtimeSettings);
+      const env =
+        configured.source === "override"
+          ? buildCodexAppServerEnv(this.runtimeSettings, launch?.env)
+          : process.env;
+      const command = await findInstallationLaunchPath(configured.command, {
+        env,
+        cwd: launch?.cwd ?? process.cwd(),
+      });
+      const keys = command ? await readInstallationActivityKeys(command) : [];
+      return configured.source === "override" ? [...keys, "opaque"] : keys;
     },
+    update: async () => ({ status: "failed", message: CODEX_MANUAL_UPDATE }),
   };
   private goalsEnabledPromise: Promise<boolean> | null = null;
   private autoReviewEnabledPromise: Promise<boolean> | null = null;
@@ -8596,6 +8604,11 @@ export class CodexAppServerAgentClient implements AgentClient {
   }): Promise<() => ChildProcessWithoutNullStreams> {
     const processPort = this.deps.appServerProcess ?? defaultCodexAppServerProcess;
     const launchPrefix = await processPort.resolvePrefix({ runtimeSettings: this.runtimeSettings });
+    const resolved = await findInstallationLaunchPath(launchPrefix.command, {
+      env: options.environment,
+      cwd: process.cwd(),
+    });
+    const keys = resolved ? await readInstallationActivityKeys(resolved) : [];
     const args = [...launchPrefix.args, "app-server"];
     if (options.goalsEnabled) {
       args.push("--enable", "goals");
@@ -8605,20 +8618,27 @@ export class CodexAppServerAgentClient implements AgentClient {
         {
           agentId: options.agentId,
           provider: CODEX_PROVIDER,
-          launchPrefix,
           goalsEnabled: options.goalsEnabled === true,
         },
         "provider.codex.spawn",
       );
-      const child = processPort.spawn({
-        command: launchPrefix.command,
-        args,
-        options: {
-          detached: process.platform !== "win32",
-          stdio: ["pipe", "pipe", "pipe"],
-          baseEnv: options.environment,
+      const child = acquireInstallationProcess(
+        {
+          family: CODEX_PROVIDER,
+          keys,
+          opaque: !keys.length || this.runtimeSettings?.command?.mode === "replace",
         },
-      });
+        () =>
+          processPort.spawn({
+            command: launchPrefix.command,
+            args,
+            options: {
+              detached: process.platform !== "win32",
+              stdio: ["pipe", "pipe", "pipe"],
+              baseEnv: options.environment,
+            },
+          }),
+      );
       assertChildWithPipes(child);
       return child;
     };

@@ -3585,6 +3585,13 @@ export const en = {
         updateFailed: "Update failed",
         outputTruncated: "Earlier output was dropped.",
         updatesFailed: "Couldn't check for updates",
+        maintenanceAutomatic: "Automatic maintenance",
+        maintenanceExternal: "Managed externally",
+        maintenanceExternalHint: "Update using the tool that installed this CLI.",
+        maintenanceManual: "Manual update required",
+        maintenanceManualHint: "Follow the provider’s instructions to update on this host.",
+        alreadyCurrent: "Already up to date",
+        updateUnverified: "Update finished, version unconfirmed",
         installInstructions: "Install instructions",
       },
       diagnostic: {

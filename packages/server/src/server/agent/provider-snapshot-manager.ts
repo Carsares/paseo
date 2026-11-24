@@ -52,6 +52,7 @@ import {
 import type { ProviderRegistration } from "@getpaseo/plugin/server/provider";
 import { PluginAgentClientRegistry } from "./plugin-provider.js";
 import { convertLegacyClaudeUltracode, resolveAdapter } from "./option-controls.js";
+import { installationActivity } from "./provider-installation/installation-activity.js";
 import { ProviderInstallations } from "./provider-installation/provider-installations.js";
 
 const DEFAULT_REFRESH_TIMEOUT_MS = 120_000;
@@ -257,6 +258,7 @@ export class ProviderSnapshotManager {
   private readonly pluginProviders: PluginAgentClientRegistry;
   /** Installation links and versions; separate from availability and discovery. */
   readonly installations: ProviderInstallations;
+  private readonly installationConfigVersions = new Map<AgentProvider, number>();
   private pluginProvidersSettled = false;
 
   constructor(options: ProviderSnapshotManagerOptions) {
@@ -287,10 +289,17 @@ export class ProviderSnapshotManager {
     for (const client of Object.values(this.providerClients)) this.ownedClients.add(client);
     this.installations = new ProviderInstallations({
       logger: options.logger.child({ module: "provider-installations" }),
+      activity: installationActivity,
+      configurationVersion: (provider) => this.installationConfigVersions.get(provider) ?? 0,
       resolveClient: (provider) => {
         const definition = this.generation.definitions[provider];
         return definition ? this.ensureClient(provider, definition) : null;
       },
+      resolveFamily: (provider) =>
+        resolveAdapter({
+          provider,
+          extendsOf: (id) => this.generation.definitions[id]?.derivedFromProviderId,
+        }),
       refreshProvider: (provider) => this.refreshSettingsSnapshot({ providers: [provider] }),
     });
   }
@@ -680,6 +689,15 @@ export class ProviderSnapshotManager {
     for (const provider of changed) {
       this.generation.providerStates.get(provider)?.discoveryLimit.clearQueue();
     }
+    // Compare against the last published state, not the state at prepare time.
+    const before = this.generation.definitions;
+    const after = generation.definitions;
+    for (const provider of new Set([...Object.keys(before), ...Object.keys(after)])) {
+      if (before[provider] !== after[provider]) {
+        const previousVersion = this.installationConfigVersions.get(provider) ?? 0;
+        this.installationConfigVersions.set(provider, previousVersion + 1);
+      }
+    }
     this.generation = generation;
     this.providerClients = clients;
     this.warnUnknownProviderOverrides();
@@ -718,18 +736,23 @@ export class ProviderSnapshotManager {
 
   async shutdown(): Promise<void> {
     this.destroyed = true;
-    this.installations.close();
+    const closingUpdates = this.installations.close();
     for (const state of this.generation.providerStates.values()) state.discoveryLimit.clearQueue();
-    // Materialize a client per enabled provider so provider-owned resources
-    // (background processes, sockets, etc.) get a chance to release even when
-    // a given provider hasn't been touched yet during this daemon's lifetime.
-    this.getAgentManagerProviderState();
-    await shutdownAgentClients(this.ownedClients, this.logger);
+    try {
+      await closingUpdates;
+    } finally {
+      // Materialize a client per enabled provider so provider-owned resources
+      // have a chance to release even when the provider has not been used.
+      this.getAgentManagerProviderState();
+      await shutdownAgentClients(this.ownedClients, this.logger);
+    }
   }
 
   destroy(): void {
     this.destroyed = true;
-    this.installations.close();
+    void this.installations.close().catch((error: unknown) => {
+      this.logger.warn({ err: error }, "Provider updater cleanup failed");
+    });
     for (const state of this.generation.providerStates.values()) state.discoveryLimit.clearQueue();
     this.catalogs.clear();
     this.targets.clear();

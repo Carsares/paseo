@@ -1,5 +1,6 @@
 import type { Logger } from "pino";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import { stripVTControlCharacters } from "node:util";
 
 import type {
   AgentCapabilityFlags,
@@ -7,7 +8,7 @@ import type {
   AgentMode,
 } from "../agent-sdk-types.js";
 import {
-  checkProviderLaunchAvailable,
+  createProviderEnv,
   resolveProviderLaunch,
   type ProviderRuntimeSettings,
 } from "../provider-launch-config.js";
@@ -24,15 +25,19 @@ import {
   formatProviderDiagnosticError,
   buildBinaryDiagnosticRows,
   buildCommandResolutionDiagnosticRows,
+  readCommandVersionOutput,
 } from "./diagnostic-utils.js";
-import { createCliInstallation } from "./cli-installation.js";
+import { createCliInstallation, type CliInstallationOptions } from "./cli-installation.js";
 import { updatedForNewAgents } from "./update-command.js";
+import { findInstallationLaunchPath } from "../provider-installation/installation-target.js";
 
 const COPILOT_INSTALL_URL =
   "https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli";
 // The command reference documents `copilot update`.
 const COPILOT_UPDATE_URL =
   "https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference";
+const COPILOT_READ_ONLY_ENV = { COPILOT_AUTO_UPDATE: "false" };
+const COPILOT_VERSION_ARGS = ["--no-auto-update", "--version"] as const;
 
 const COPILOT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: true,
@@ -96,6 +101,43 @@ function readCopilotVersionLabel(output: string): string | undefined {
   return line.replace(/^GitHub Copilot CLI\s+/i, "").replace(/\.$/, "") || undefined;
 }
 
+const checkCopilotForUpdates: NonNullable<CliInstallationOptions["checkForUpdates"]> = async ({
+  cli,
+  signal,
+}) => {
+  const unknown = {
+    status: "unknown",
+    message: "Copilot did not report whether an update is available.",
+  } as const;
+  let output: string;
+  try {
+    output = await readCommandVersionOutput({
+      command: cli.command,
+      args: [...cli.args, "--no-auto-update", "version"],
+      env: { ...cli.env, ...COPILOT_READ_ONLY_ENV },
+      signal,
+    });
+  } catch {
+    signal.throwIfAborted();
+    return unknown;
+  }
+  const lines = stripVTControlCharacters(output)
+    .split("\n")
+    .map((line) => line.trim());
+  for (const line of lines) {
+    const available = /^Update available:\s+(v?\d+\.\d+\.\d+(?:[-+][\w.-]+)?)$/i.exec(line)?.[1];
+    if (available) return { status: "available", versions: [available] };
+  }
+  if (
+    lines.some((line) =>
+      /^(?:Already up to date|You are (?:already )?on the latest version)\.?$/i.test(line),
+    )
+  ) {
+    return { status: "current" };
+  }
+  return unknown;
+};
+
 export class CopilotACPAgentClient extends ACPAgentClient {
   readonly installation: AgentClientInstallation;
 
@@ -104,6 +146,7 @@ export class CopilotACPAgentClient extends ACPAgentClient {
       provider: "copilot",
       logger: options.logger,
       runtimeSettings: options.runtimeSettings,
+      fileLaunchPolicy: { readOnlyEnv: COPILOT_READ_ONLY_ENV },
       defaultCommand: ["copilot", "--acp"],
       defaultModes: COPILOT_MODES,
       sessionResponseTransformer: transformCopilotSessionResponse,
@@ -114,36 +157,53 @@ export class CopilotACPAgentClient extends ACPAgentClient {
       beforeModeWriter: beforeCopilotModeWriter,
       capabilities: COPILOT_CAPABILITIES,
     });
-    // Copilot's updater lives in its native binary, so there is no known release source to check.
     this.installation = createCliInstallation({
       name: "Copilot",
       defaultBinary: "copilot",
       runtimeSettings: options.runtimeSettings,
       installUrl: COPILOT_INSTALL_URL,
       updateUrl: COPILOT_UPDATE_URL,
+      versionProbe: { args: COPILOT_VERSION_ARGS, env: COPILOT_READ_ONLY_ENV },
       versionLabel: readCopilotVersionLabel,
+      checkForUpdates: checkCopilotForUpdates,
       update: { args: ["update"], successMessage: updatedForNewAgents("Copilot") },
     });
   }
 
-  override async isAvailable(): Promise<boolean> {
-    return super.isAvailable();
+  private async resolveCopilotLaunch() {
+    const launch = await resolveProviderLaunch({
+      commandConfig: this.runtimeSettings?.command,
+      defaultBinary: "copilot",
+    });
+    const env = createProviderEnv({ runtimeSettings: this.runtimeSettings });
+    const resolvedPath = await findInstallationLaunchPath(launch.command, {
+      cwd: process.cwd(),
+      env,
+    });
+    return {
+      launch,
+      resolvedPath,
+      env: { ...this.runtimeSettings?.env, ...COPILOT_READ_ONLY_ENV },
+    };
   }
 
   async getDiagnostic(): Promise<{ diagnostic: string }> {
     try {
-      const launch = await resolveProviderLaunch({
-        commandConfig: this.runtimeSettings?.command,
-        defaultBinary: "copilot",
-      });
-      const availability = await checkProviderLaunchAvailable(launch);
+      const { launch, resolvedPath, env } = await this.resolveCopilotLaunch();
+      const availability = { resolvedPath, available: resolvedPath !== null };
 
       return {
         diagnostic: formatProviderDiagnostic("Copilot", [
           ...(await buildCommandResolutionDiagnosticRows(launch, {
             knownBinaryNames: ["copilot"],
           })),
-          ...(await buildBinaryDiagnosticRows(launch, availability)),
+          ...(await buildBinaryDiagnosticRows(launch, availability, {
+            versionCommand: {
+              command: resolvedPath ?? launch.command,
+              args: [...launch.args, ...COPILOT_VERSION_ARGS],
+              env,
+            },
+          })),
         ]),
       };
     } catch (error) {

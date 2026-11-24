@@ -42,10 +42,18 @@ function mount(
   const view = within(container);
   return {
     view,
-    rerender: (nextUpdates: ProviderUpdatesState, nextAction?: ProviderUpdateAction) =>
+    rerender: (
+      nextUpdates: ProviderUpdatesState,
+      nextAction?: ProviderUpdateAction,
+      nextState = state,
+    ) =>
       act(() =>
         root.render(
-          <ProviderInstallationSection state={state} updates={nextUpdates} action={nextAction} />,
+          <ProviderInstallationSection
+            state={nextState}
+            updates={nextUpdates}
+            action={nextAction}
+          />,
         ),
       ),
     installButton: () => view.queryByRole("button", { name: "Install" }),
@@ -337,6 +345,123 @@ describe("update action", () => {
       " Restart agents \n",
     );
     expect(section.view.queryByTestId("provider-update-output")).toBeNull();
+  });
+
+  it.each([
+    { outcome: "updated", label: "Updated" },
+    { outcome: "already_current", label: "Already up to date" },
+    { outcome: "unverified", label: "Update finished, version unconfirmed" },
+  ] as const)("shows the $outcome result while keeping restart guidance", ({ outcome, label }) => {
+    const message = "Restart running agents to use the installed version.";
+    const section = mount(
+      installed(true),
+      { status: "ready", updateCheck: { status: "current" } },
+      action({
+        current: {
+          operation: { ...operation, status: "succeeded", finishedAt, outcome, message },
+          output: [],
+        },
+      }).value,
+    );
+    expect(section.view.getByTestId("provider-update-status").textContent).toBe(label);
+    expect(section.view.getByTestId("provider-update-message").textContent).toBe(message);
+  });
+
+  it("shows the already-current result once when the version check agrees", () => {
+    const section = mount(
+      installed(true),
+      { status: "ready", updateCheck: { status: "current" } },
+      action({
+        current: {
+          operation: {
+            ...operation,
+            status: "succeeded",
+            finishedAt,
+            outcome: "already_current",
+            message: "Already up to date",
+          },
+          output: [],
+        },
+      }).value,
+    );
+    expect(section.view.getAllByText("Already up to date")).toHaveLength(1);
+    expect(section.view.queryByTestId("provider-updates-current")).toBeNull();
+  });
+
+  it("hides Update for an externally managed CLI and keeps its running update visible", () => {
+    const current = {
+      operation: { ...operation, status: "running" as const },
+      output: [],
+    };
+    const control = action({ current });
+    const state = installed(true);
+    const external = ready({
+      ...state,
+      installation: {
+        ...state.installation,
+        maintenance: { kind: "external", message: "Upgrade with your package manager." },
+      },
+    });
+    const section = mount(state, available, control.value);
+    expect(section.view.getByTestId("provider-update-start").textContent).toBe("Updating...");
+
+    section.rerender(available, control.value, external);
+    expect(section.view.queryByTestId("provider-update-start")).toBeNull();
+    expect(section.view.getByTestId("provider-update-status").textContent).toBe("Updating...");
+    expect(section.view.getByTestId("provider-installation-version").textContent).toBe("1.0.0");
+    expect(section.view.getByTestId("provider-updates-version").textContent).toBe("2.0.0");
+    expect(section.view.getByText("Managed externally").textContent).toBe("Managed externally");
+    expect(section.view.getByText("Upgrade with your package manager.").textContent).toBe(
+      "Upgrade with your package manager.",
+    );
+    expect(section.view.getByRole("button", { name: "Update instructions" }).textContent).toBe(
+      "Update instructions",
+    );
+
+    section.rerender(
+      available,
+      action({
+        current: { ...current, output: [{ type: "stdout", text: "downloading\n" }] },
+      }).value,
+      external,
+    );
+    expect(section.view.queryByTestId("provider-update-start")).toBeNull();
+    expect(section.view.getByTestId("provider-update-output").textContent).toBe("downloading\n");
+  });
+
+  it("keeps Update for automatic maintenance and shows instructions for a manual install", () => {
+    const state = installed(true);
+    const control = action();
+    const section = mount(
+      ready({
+        ...state,
+        installation: { ...state.installation, maintenance: { kind: "automatic" } },
+      }),
+      { status: "loading" },
+      control.value,
+    );
+    expect(section.view.getByText("Automatic maintenance").textContent).toBe(
+      "Automatic maintenance",
+    );
+    act(() => section.view.getByRole("button", { name: "Update" }).click());
+    expect(control.starts()).toBe(1);
+
+    section.rerender(
+      { status: "ready", updateCheck: null },
+      control.value,
+      ready({
+        ...state,
+        installation: {
+          ...state.installation,
+          updateUrl: undefined,
+          maintenance: { kind: "manual" },
+        },
+      }),
+    );
+    expect(section.view.queryByRole("button", { name: "Update" })).toBeNull();
+    expect(section.view.getByTestId("provider-updates").textContent).toBe(
+      "UpdatesManual update requiredFollow the provider’s instructions to update on this host.",
+    );
   });
 
   it("shows a failure with its message, its output and the update instructions", async () => {
