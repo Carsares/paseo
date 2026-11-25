@@ -15,11 +15,39 @@ import {
   isUnboundTopicWorkspace,
   isTopicPromptAccepted,
 } from "@/composer/draft/topic-receipts";
+import type { MessagePayload } from "@/composer/types";
+import type { NavigateToWorkspaceInput } from "@/stores/navigation-active-workspace-store";
 
 export type TopicPlacement = Pick<CreateWorkspaceRequestOptions, "source" | "metadata"> & {
   title: string;
   topic: NonNullable<CreateWorkspaceRequestOptions["topic"]>;
 };
+
+export function resolveTopicMainOptions(
+  fields: { preset?: boolean; questionOpen?: boolean } | undefined,
+  supportsPreset: boolean,
+) {
+  const canAskQuestion = fields?.preset !== false;
+  return {
+    preset: supportsPreset && canAskQuestion,
+    canAskQuestion,
+    questionOpen: canAskQuestion && fields?.questionOpen === true,
+  };
+}
+
+export function planTopicSubmission(
+  fields: Parameters<typeof resolveTopicMainOptions>[0],
+  supportsPreset: boolean,
+  question: MessagePayload | undefined,
+  draft: MainDraft | null,
+) {
+  const options = resolveTopicMainOptions(fields, supportsPreset);
+  const prompt = options.questionOpen ? question : undefined;
+  if (options.preset && draft && (draft.models?.length ?? 0) > 1) {
+    return { kind: "batch" as const, prompt, draft };
+  }
+  return { kind: "single" as const, preset: options.preset, prompt };
+}
 
 export function readTopicFields(text = "", direction = "", hideFromModel = false) {
   const firstLine = text
@@ -87,6 +115,20 @@ export type TopicOutcome =
   | ({ stage: "succeeded"; workspace: WorkspaceDescriptorPayload } & TopicEntities)
   | ({ stage: "retryable"; retryPromptRevision?: number; error?: string } & TopicEntities)
   | ({ stage: "unconfirmed"; updateHost?: boolean; error?: string } & TopicEntities);
+
+export function openConfirmedTopic(
+  outcome: TopicOutcome,
+  serverId: string,
+  isCreateScreenActive: () => boolean,
+  open: (input: NavigateToWorkspaceInput) => void,
+): void {
+  if (outcome.stage !== "succeeded" || !isCreateScreenActive()) return;
+  open({
+    serverId,
+    workspaceId: outcome.workspace.id,
+    ...(outcome.agent ? { target: { kind: "agent", agentId: outcome.agent.id } } : {}),
+  });
+}
 
 function matchingEntities(
   request: TopicRequest,

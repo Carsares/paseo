@@ -9,6 +9,7 @@ import type { DraftCommandTarget } from "@/agent-commands";
 import { i18n } from "@/i18n/i18next";
 import { compareMatchScores, scoreTextFields } from "@getpaseo/protocol/search/text-match";
 import { filterSelectableModels, findModelByReference } from "./model-catalog";
+import { orderProviders } from "./provider-order";
 
 export interface ProviderSelectionModelRow {
   /**
@@ -37,7 +38,16 @@ export type ProviderModelSelection =
 export interface ProviderSelectorProvider {
   id: string;
   label: string;
+  /** Missing when a current choice has no matching host snapshot entry. */
+  enabled?: boolean;
   modelSelection: ProviderModelSelection;
+}
+
+export function orderProviderSelectorRows(providers: readonly ProviderSelectorProvider[]) {
+  return orderProviders(providers, (provider) => ({
+    enabled: provider.enabled === true,
+    hasError: provider.modelSelection.kind === "error",
+  }));
 }
 
 export interface ProviderSelectionState {
@@ -152,6 +162,7 @@ export function buildSelectorProvider(
   return {
     id: entry.provider,
     label,
+    enabled: entry.enabled,
     modelSelection: buildEntryModelSelection(entry, label, isConnected),
   };
 }

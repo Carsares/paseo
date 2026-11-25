@@ -175,7 +175,10 @@ import { useNewWorkspaceForm } from "./new-workspace/form";
 import { DraftTitleEditor } from "./new-workspace/draft-title-editor";
 import { TopicCreationStatus, TopicFields } from "./new-workspace/form/topic-fields";
 import {
+  openConfirmedTopic,
+  planTopicSubmission,
   readTopicFields,
+  resolveTopicMainOptions,
   runTopicCreation,
   topicRequest,
   type TopicOutcome,
@@ -1520,9 +1523,15 @@ function readEditableTopicFields(fields: WorkspaceDraftTitle["topicFields"]) {
     topicText: fields?.text ?? "",
     topicDirection: fields?.direction ?? "",
     hideTopic: fields?.hidden ?? false,
-    topicPreset: fields?.preset ?? false,
-    questionOpen: fields?.questionOpen ?? false,
   };
+}
+
+function resolveBatchModelChangeTarget(
+  target: MainDraftTarget | null,
+  isTopicMode: boolean,
+  topicPreset: boolean,
+) {
+  return isTopicMode && !topicPreset ? null : target;
 }
 
 function NewWorkspaceForm({
@@ -1603,8 +1612,14 @@ function NewWorkspaceForm({
   const supportsTopic = useHostFeature(selectedServerId, "topicWorkbenchV1");
   const supportsTopicPreset = useHostFeature(selectedServerId, "workspaceMainAgentDefault");
   const [legacyLaunch, setLegacyLaunch] = useState(false);
-  const { topicText, topicDirection, hideTopic, topicPreset, questionOpen } =
-    readEditableTopicFields(creationIdentity.topicFields);
+  const { topicText, topicDirection, hideTopic } = readEditableTopicFields(
+    creationIdentity.topicFields,
+  );
+  const {
+    preset: topicPreset,
+    canAskQuestion: canAskTopicQuestion,
+    questionOpen,
+  } = resolveTopicMainOptions(creationIdentity.topicFields, supportsTopicPreset);
   const [topicOutcome, setTopicOutcome] = useState<TopicOutcome | null>(null);
   const { attempt: topicAttempt, active: isTopicMode } = resolveTopicMode({
     draft: mainDraft,
@@ -2563,17 +2578,14 @@ function NewWorkspaceForm({
       );
       setTopicOutcome(outcome);
       if (outcome.workspace) acceptWorkspaceMainSnapshots(outcome.workspace, outcome.agent);
+      const cleanup = workspaceDraftCleanup();
+      openConfirmedTopic(outcome, draft.target.serverId, isStillOnCreateScreen, (input) => {
+        leaveFullscreen();
+        navigateToWorkspace(input);
+      });
       if (outcome.stage !== "succeeded") return false;
 
-      await clearOwnedWorkspaceDraft(creationDraftId, workspaceDraftCleanup()).catch(() => {});
-      if (isStillOnCreateScreen()) {
-        leaveFullscreen();
-        navigateToWorkspace({
-          serverId: draft.target.serverId,
-          workspaceId: outcome.workspace.id,
-          ...(outcome.agent ? { target: { kind: "agent", agentId: outcome.agent.id } } : {}),
-        });
-      }
+      await clearOwnedWorkspaceDraft(creationDraftId, cleanup).catch(() => {});
       await useWorkspaceDraftSubmissionStore.getState().finishDraftTitle(creationDraftId);
       await writeMainDraft(creationDraftId, null, { finishBatch: true });
       return true;
@@ -2581,7 +2593,7 @@ function NewWorkspaceForm({
   );
 
   const prepareTopicMain = useStableEvent(
-    async (question: MessagePayload | undefined, cwd: string, preset?: boolean) => {
+    async (question: MessagePayload | undefined, cwd: string, preset: boolean) => {
       if (!question && !preset) return null;
       if (question) assertExplicitMainSupported();
       else if (!supportsTopicPreset) throw new Error(t("topicWorkbench.updateHost"));
@@ -2608,22 +2620,28 @@ function NewWorkspaceForm({
         .readDraftTopic(creationDraftId);
       const frozenFields = readTopicFields(fields?.text, fields?.direction, fields?.hidden);
       if (!frozenFields || !mainTarget) throw new Error(t("topicWorkbench.required"));
-      const prompt =
-        fields?.questionOpen && question && !isEmptyWorkspaceSubmission(question)
-          ? question
-          : undefined;
       const armed = restoreMainDraftAtTarget(saved, mainTarget);
-      if (armed && draftModelCount(armed) > 1) {
+      const submission = planTopicSubmission(
+        fields,
+        supportsTopicPreset,
+        question && !isEmptyWorkspaceSubmission(question) ? question : undefined,
+        armed,
+      );
+      if (submission.kind === "batch") {
         await startWorkspaceMainBatch(
-          prompt ?? { cwd: mainTarget.directory, text: "", attachments: [] },
-          armed,
+          submission.prompt ?? { cwd: mainTarget.directory, text: "", attachments: [] },
+          submission.draft,
           frozenFields,
-          prompt ? cleanupOwner : undefined,
+          submission.prompt ? cleanupOwner : undefined,
         );
         return;
       }
       const placement = await prepareWorkspacePlacement(false, undefined, true);
-      const main = await prepareTopicMain(prompt, mainTarget.directory, fields?.preset);
+      const main = await prepareTopicMain(
+        submission.prompt,
+        mainTarget.directory,
+        submission.preset,
+      );
       const workspaceId = `wks_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
       const request = topicRequest(
         { source: placement.source, metadata: { ...placement.metadata }, ...frozenFields },
@@ -3025,10 +3043,15 @@ function NewWorkspaceForm({
     workingDirectory,
   ]);
 
+  const batchModelChangeTarget = resolveBatchModelChangeTarget(
+    mainTarget,
+    isTopicMode,
+    topicPreset,
+  );
   const changeBatchModels = useStableEvent((models: WorkspaceBatchModel[]) => {
-    if (!mainTarget) return;
-    const saved = restoreMainDraftAtTarget(mainDraftRef.current, mainTarget);
-    const draft = saved ?? (isTopicMode ? { target: mainTarget } : null);
+    if (!batchModelChangeTarget) return;
+    const saved = restoreMainDraftAtTarget(mainDraftRef.current, batchModelChangeTarget);
+    const draft = saved ?? (isTopicMode ? { target: batchModelChangeTarget } : null);
     if (
       !draft ||
       draft.attempt ||
@@ -3036,7 +3059,8 @@ function NewWorkspaceForm({
       pendingExplicitMainSubmissions.has(creationDraftId)
     )
       return;
-    const needsWorktree = isTopicMode && models.length > 1 && mainTarget.isolation !== "worktree";
+    const needsWorktree =
+      isTopicMode && models.length > 1 && batchModelChangeTarget.isolation !== "worktree";
     if (
       models.length > (draft.models?.length ?? 0) &&
       batchBlock &&
@@ -3044,7 +3068,11 @@ function NewWorkspaceForm({
     )
       return;
     const target = needsWorktree
-      ? { ...mainTarget, isolation: "worktree" as const, directory: mainTarget.sourceDirectory }
+      ? {
+          ...batchModelChangeTarget,
+          isolation: "worktree" as const,
+          directory: batchModelChangeTarget.sourceDirectory,
+        }
       : draft.target;
     if (needsWorktree) {
       setIsolation("worktree");
@@ -3056,9 +3084,7 @@ function NewWorkspaceForm({
   });
   const batchModels = useMemo(
     () =>
-      (workspaceMain?.checked ||
-        (isTopicMode && supportsTopicPreset && (topicPreset || questionOpen))) &&
-      !mainAttempt
+      (workspaceMain?.checked || (isTopicMode && topicPreset)) && !mainAttempt
         ? {
             models: mainDraft?.models ?? [],
             disabledReason:
@@ -3075,8 +3101,6 @@ function NewWorkspaceForm({
       isTopicMode,
       mainAttempt,
       mainDraft?.models,
-      questionOpen,
-      supportsTopicPreset,
       t,
       topicPreset,
       workspaceMain?.checked,
@@ -3240,7 +3264,10 @@ function NewWorkspaceForm({
       supportsPreset: supportsTopicPreset,
       presetControls,
       questionOpen,
-      onQuestionToggle: () => editTopic({ questionOpen: !questionOpen }),
+      canAskQuestion: canAskTopicQuestion,
+      onQuestionToggle: () => {
+        if (canAskTopicQuestion) editTopic({ questionOpen: !questionOpen });
+      },
       onDirect: useDirectLaunch,
     }),
     [
@@ -3253,6 +3280,7 @@ function NewWorkspaceForm({
       supportsTopicPreset,
       presetControls,
       questionOpen,
+      canAskTopicQuestion,
       editTopic,
       useDirectLaunch,
     ],

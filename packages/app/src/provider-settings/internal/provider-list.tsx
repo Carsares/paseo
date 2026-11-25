@@ -1,5 +1,5 @@
 import { Plus } from "lucide-react-native";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
@@ -8,9 +8,9 @@ import { SettingsAddRow, SettingsCard, SettingsSection } from "@/components/sett
 import { Button } from "@/components/ui/button";
 import { SkeletonPulse, useSkeletonPulse } from "@/components/ui/skeleton";
 import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
+import { orderProviders } from "@/provider-selection/provider-order";
 import { useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { settingsStyles } from "@/styles/settings";
-import { buildProviderDefinitions } from "@/utils/provider-definitions";
 import { AddProviderSheet } from "./add-provider-sheet";
 import { CustomProviderCliFormSheet } from "./custom-provider-cli-form";
 import {
@@ -39,7 +39,6 @@ export function ProviderList({ serverId, onOpenProvider, sheetFrame }: ProviderL
   const { entries, isLoading } = useProvidersSnapshot(serverId);
   const { setEnabled, togglingProviderId } = useProviderConfigActions(serverId);
   const supportsCustomCli = useSupportsCustomProviderCli(serverId);
-  const definitions = useMemo(() => buildProviderDefinitions(entries), [entries]);
   const [adding, setAdding] = useState(false);
   const [addingCustomCli, setAddingCustomCli] = useState(false);
   const openAdd = useCallback(() => setAdding(true), []);
@@ -81,28 +80,15 @@ export function ProviderList({ serverId, onOpenProvider, sheetFrame }: ProviderL
     body = <ProviderRowsSkeleton />;
   } else {
     body = (
-      <SettingsCard testID="provider-list">
-        {definitions.map((definition) => {
-          const entry = entries?.find((candidate) => candidate.provider === definition.id);
-          if (!entry) return null;
-          return (
-            <ListedProvider
-              key={definition.id}
-              serverId={serverId}
-              entry={entry}
-              label={definition.label}
-              toggling={togglingProviderId === definition.id}
-              onOpen={onOpenProvider}
-              onToggle={setEnabled}
-            />
-          );
-        })}
-        <SettingsAddRow
-          label={t("settings.providers.addProvider")}
-          onPress={openAdd}
-          testID="provider-list-add-row"
-        />
-      </SettingsCard>
+      <ProviderRows
+        key={serverId}
+        serverId={serverId}
+        entries={entries}
+        togglingProviderId={togglingProviderId}
+        onOpen={onOpenProvider}
+        onToggle={setEnabled}
+        onAdd={openAdd}
+      />
     );
   }
 
@@ -141,21 +127,80 @@ export function ProviderList({ serverId, onOpenProvider, sheetFrame }: ProviderL
   );
 }
 
+type ReportRowError = (provider: string, hasError: boolean | undefined) => void;
+
+function ProviderRows({
+  serverId,
+  entries,
+  togglingProviderId,
+  onOpen,
+  onToggle,
+  onAdd,
+}: {
+  serverId: string;
+  entries: readonly ProviderEntry[] | undefined;
+  togglingProviderId: string | null;
+  onOpen: (provider: string) => void;
+  onToggle: (provider: string, enabled: boolean) => void;
+  onAdd: () => void;
+}) {
+  const { t } = useTranslation();
+  const [rowErrors, setRowErrors] = useState<ReadonlyMap<string, boolean>>(() => new Map());
+  const reportError = useCallback<ReportRowError>((provider, hasError) => {
+    setRowErrors((current) => {
+      if (current.get(provider) === hasError) return current;
+      const next = new Map(current);
+      if (hasError === undefined) next.delete(provider);
+      else next.set(provider, hasError);
+      return next;
+    });
+  }, []);
+  const orderedEntries = useMemo(
+    () =>
+      orderProviders(entries ?? [], (entry) => ({
+        enabled: entry.enabled,
+        hasError: rowErrors.get(entry.provider) ?? (entry.enabled && entry.status === "error"),
+      })),
+    [entries, rowErrors],
+  );
+
+  return (
+    <SettingsCard testID="provider-list">
+      {orderedEntries.map((entry) => (
+        <ListedProvider
+          key={entry.provider}
+          serverId={serverId}
+          entry={entry}
+          toggling={togglingProviderId === entry.provider}
+          onOpen={onOpen}
+          onToggle={onToggle}
+          reportError={reportError}
+        />
+      ))}
+      <SettingsAddRow
+        label={t("settings.providers.addProvider")}
+        onPress={onAdd}
+        testID="provider-list-add-row"
+      />
+    </SettingsCard>
+  );
+}
+
 /** A row reads its provider's installation itself; the detail shares the same requests. */
 function ListedProvider({
   serverId,
   entry,
-  label,
   toggling,
   onOpen,
   onToggle,
+  reportError,
 }: {
   serverId: string;
   entry: ProviderEntry;
-  label: string;
   toggling: boolean;
   onOpen: (provider: string) => void;
   onToggle: (provider: string, enabled: boolean) => void;
+  reportError: ReportRowError;
 }) {
   const installation = useProviderInstallation({
     serverId,
@@ -166,12 +211,19 @@ function ListedProvider({
     () => <ProviderGlyph serverId={serverId} provider={entry.provider} />,
     [entry.provider, serverId],
   );
+  const summary = readRowSummary(entry, installation);
+  const hasError = summary.kind === "failing";
+  const provider = entry.provider;
+  useLayoutEffect(() => {
+    reportError(provider, hasError);
+    return () => reportError(provider, undefined);
+  }, [provider, hasError, reportError]);
   return (
     <ProviderRow
-      provider={entry.provider}
-      label={label}
+      provider={provider}
+      label={entry.label ?? provider}
       icon={icon}
-      summary={readRowSummary(entry, installation)}
+      summary={summary}
       enabled={entry.enabled}
       toggling={toggling}
       onOpen={onOpen}

@@ -11,6 +11,7 @@ import {
   buildSelectorProvider,
   filterAndRankModelRows,
   matchesModelSearch,
+  orderProviderSelectorRows,
   resolveEffectiveComposerModeId,
   resolveEffectiveComposerThinkingOptionId,
   resolveSelectedModelLabel,
@@ -55,6 +56,23 @@ describe("combined model selector data", () => {
     };
   }
 
+  it("orders browse rows by the state they display, including cached models and the disabled selection", () => {
+    const entries = [
+      snapshotEntry({ provider: "failed", status: "error", models: [] }),
+      snapshotEntry({ provider: "saved", enabled: false }),
+      snapshotEntry({ provider: "cached", status: "error" }),
+      snapshotEntry({ provider: "loading", status: "loading", models: [] }),
+      snapshotEntry({ provider: "missing", status: "unavailable", models: [] }),
+    ];
+    const browse = (isConnected: boolean) =>
+      orderProviderSelectorRows(
+        entries.map((entry) => buildSelectorProvider(entry, isConnected)),
+      ).map(({ id }) => id);
+
+    expect(browse(true)).toEqual(["cached", "loading", "saved", "failed", "missing"]);
+    expect(browse(false)).toEqual(["cached", "saved", "failed", "loading", "missing"]);
+  });
+
   it("builds selector providers from ready enabled snapshot entries", () => {
     expect(
       buildSelectableProviderSelectorProviders(
@@ -71,6 +89,7 @@ describe("combined model selector data", () => {
       {
         id: "codex",
         label: "Codex",
+        enabled: true,
         modelSelection: {
           kind: "models",
           rows: [
@@ -124,6 +143,7 @@ describe("combined model selector data", () => {
       {
         id: "codewhale",
         label: "CodeWhale",
+        enabled: true,
         modelSelection: {
           kind: "models",
           rows: [
@@ -176,11 +196,13 @@ describe("combined model selector data", () => {
       {
         id: "loading-provider",
         label: "loading-provider",
+        enabled: true,
         modelSelection: { kind: "loading" },
       },
       {
         id: "error-provider",
         label: "error-provider",
+        enabled: true,
         modelSelection: { kind: "error", message: "boom" },
       },
     ]);
@@ -218,6 +240,7 @@ describe("combined model selector data", () => {
     ).toEqual({
       id: "gemini",
       label: "gemini",
+      enabled: true,
       modelSelection: { kind: "error", message: "Unavailable" },
     });
   });

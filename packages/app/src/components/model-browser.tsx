@@ -48,6 +48,7 @@ import {
   filterAndRankModelRows,
   getAllProviderModelRows,
   getProviderModelRows,
+  orderProviderSelectorRows,
   resolveSelectedModelLabel,
   type ProviderSelectionModelRow,
   type ProviderSelectorProvider,
@@ -1063,9 +1064,10 @@ function GroupedProviderRows({
   serverId: string | null;
   onDrillDown: (providerId: string, providerLabel: string) => void;
 }) {
+  const orderedProviders = useMemo(() => orderProviderSelectorRows(providers), [providers]);
   return (
     <View>
-      {providers.map((provider, index) => (
+      {orderedProviders.map((provider, index) => (
         <View key={provider.id}>
           {index > 0 ? <View style={styles.separator} /> : null}
           <GroupProviderButton provider={provider} serverId={serverId} onDrillDown={onDrillDown} />

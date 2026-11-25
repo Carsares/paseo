@@ -10,7 +10,10 @@ import {
   workspaceMainBatchAgentTarget,
 } from "./main-batch";
 import {
+  openConfirmedTopic,
+  planTopicSubmission,
   readTopicFields,
+  resolveTopicMainOptions,
   runTopicCreation,
   topicRequest,
   type TopicCreationClient,
@@ -159,6 +162,94 @@ function receiptFor(
 function findBatchItem(batch: MainDraftBatch, workspaceId?: string) {
   return batch.items.find((item) => item.workspaceId === workspaceId);
 }
+
+describe("new topic main options", () => {
+  it("defaults to a silent main when the host supports presets, without opening the first question", () => {
+    expect(resolveTopicMainOptions(undefined, true)).toEqual({
+      preset: true,
+      canAskQuestion: true,
+      questionOpen: false,
+    });
+  });
+
+  it("honors an explicit opt-out even when the draft still has an open first question", () => {
+    expect(resolveTopicMainOptions({ preset: false, questionOpen: true }, true)).toEqual({
+      preset: false,
+      canAskQuestion: false,
+      questionOpen: false,
+    });
+  });
+
+  it("keeps the first question independent of silent preset support on older hosts", () => {
+    expect(resolveTopicMainOptions({ preset: true, questionOpen: true }, false)).toEqual({
+      preset: false,
+      canAskQuestion: true,
+      questionOpen: true,
+    });
+  });
+
+  it("plans one unbound topic after opting out with a first question and multiple models saved", () => {
+    const fields = { questionOpen: true };
+    const question = { cwd: "/repo", text: message.initialPrompt, attachments: [] };
+    const draft = { target, models };
+    expect(planTopicSubmission(fields, true, question, draft)).toEqual({
+      kind: "batch",
+      prompt: question,
+      draft,
+    });
+    expect(planTopicSubmission({ ...fields, preset: false }, true, question, draft)).toEqual({
+      kind: "single",
+      preset: false,
+      prompt: undefined,
+    });
+  });
+});
+
+it.each([true, false])("opens a confirmed silent topic (with main: %s)", async (withMain) => {
+  const topic = { summary: null, hideFromModel: false };
+  const request = topicRequest(
+    { ...placement, title: "Silent topic", topic },
+    { workspaceId: "wks_1234567890abcdef", idempotencyKey: "silent-draft" },
+    withMain ? { config: { provider: "codex", cwd: "/repo" } } : null,
+  );
+  const main = withMain ? agent("quiet-main", request.workspaceId) : undefined;
+  const created = {
+    ...workspace(request.workspaceId),
+    topic: { ...topic, revision: 1, mainAgentId: main?.id ?? null },
+  };
+  const client: TopicCreationClient = {
+    createWorkspace: vi.fn(async () => ({
+      requestId: "reply",
+      setupTerminalId: null,
+      workspace: created,
+      mainAgent: main,
+      error: null,
+      creation: {
+        kind: "workspace" as const,
+        phase: "completed" as const,
+        revision: 1,
+        workspaceId: request.workspaceId,
+        agentId: null,
+        idempotencyKey: request.idempotencyKey,
+        error: null,
+      },
+    })),
+    getCreationSnapshot: vi.fn(),
+    findWorkspace: vi.fn(),
+    fetchAgent: vi.fn(),
+    fetchAgentTimeline: vi.fn(),
+  };
+  const open = vi.fn();
+  const outcome = await runTopicCreation(client, request, "submit");
+  openConfirmedTopic(outcome, "host", () => false, open);
+  expect(open).not.toHaveBeenCalled();
+  openConfirmedTopic(outcome, "host", () => true, open);
+  expect(open).toHaveBeenCalledExactlyOnceWith({
+    serverId: "host",
+    workspaceId: request.workspaceId,
+    ...(withMain ? { target: { kind: "agent", agentId: "quiet-main" } } : {}),
+  });
+});
 
 async function harness(initial: MainDraftBatch) {
   const id = crypto.randomUUID();
@@ -424,7 +515,11 @@ describe("multi-model workspace creation", () => {
       fetchAgent: vi.fn().mockResolvedValue(null),
       fetchAgentTimeline: vi.fn<BatchClient["fetchAgentTimeline"]>(),
     };
-    expect((await runTopicCreation(client, request, "submit")).stage).toBe("unconfirmed");
+    const unconfirmed = await runTopicCreation(client, request, "submit");
+    expect(unconfirmed.stage).toBe("unconfirmed");
+    const open = vi.fn();
+    openConfirmedTopic(unconfirmed, "host", () => true, open);
+    expect(open).not.toHaveBeenCalled();
     expect((await runTopicCreation(client, request, "retry")).stage).toBe("unconfirmed");
     const expected = {
       stage: "succeeded",
@@ -476,7 +571,14 @@ describe("multi-model workspace creation", () => {
           error: null,
         },
       });
-      expect(await listened.promise).toEqual(expected);
+      const recovered = await listened.promise;
+      expect(recovered).toEqual(expected);
+      openConfirmedTopic(recovered, "host", () => true, open);
+      expect(open).toHaveBeenCalledExactlyOnceWith({
+        serverId: "host",
+        workspaceId: created.id,
+        target: { kind: "agent", agentId: main.id },
+      });
       await vi.waitFor(() => expect(unsubscribe).toHaveBeenCalledTimes(1));
     } finally {
       stop();

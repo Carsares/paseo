@@ -20,6 +20,7 @@ export function TopicFields({
   supportsPreset,
   presetControls,
   questionOpen,
+  canAskQuestion,
   onQuestionToggle,
   onDirect,
 }: {
@@ -36,6 +37,7 @@ export function TopicFields({
   supportsPreset: boolean;
   presetControls: ReactNode;
   questionOpen: boolean;
+  canAskQuestion: boolean;
   onQuestionToggle: () => void;
   onDirect: () => void;
 }) {
@@ -66,8 +68,8 @@ export function TopicFields({
     [presetLabel, preset, locked, onPresetChange],
   );
   const questionState = useMemo(
-    () => ({ expanded: questionOpen, disabled: locked }),
-    [questionOpen, locked],
+    () => ({ expanded: questionOpen, disabled: locked || !canAskQuestion }),
+    [questionOpen, locked, canAskQuestion],
   );
   return (
     <View style={styles.fields}>
@@ -108,7 +110,7 @@ export function TopicFields({
         <Button
           variant="outline"
           size={size}
-          disabled={locked}
+          disabled={questionState.disabled}
           accessibilityState={questionState}
           onPress={onQuestionToggle}
         >
