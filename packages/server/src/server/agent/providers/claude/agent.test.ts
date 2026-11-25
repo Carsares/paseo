@@ -3784,6 +3784,63 @@ describe("ClaudeAgentSession context window usage", () => {
     ]);
   });
 
+  test("replays Claude assistant transcript and streamed model IDs together", async () => {
+    const configDir = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-claude-history-id-"));
+    const cwd = path.join(configDir, "workspace");
+    const sessionId = "491b09da-5479-4a1c-88dd-e60c78b0c260";
+    try {
+      await fs.mkdir(cwd);
+      const projectDir = claudeProjectDirSync(cwd, { configDir });
+      await fs.mkdir(projectDir, { recursive: true });
+      const transcript = path.join(projectDir, `${sessionId}.jsonl`);
+      await fs.writeFile(
+        transcript,
+        JSON.stringify({
+          type: "assistant",
+          uuid: "assistant-transcript-uuid",
+          message: {
+            id: "assistant-model-id",
+            role: "assistant",
+            content: [{ type: "text", text: "Retained reply" }],
+          },
+        }) + "\n",
+      );
+      const client = new ClaudeAgentClient({
+        logger,
+        queryFactory: createQueryFactoryForTurns([]),
+        resolveBinary: async () => "/test/claude/bin",
+      });
+      const session = await client.resumeSession(
+        {
+          provider: "claude",
+          sessionId,
+          metadata: { cwd },
+        },
+        undefined,
+        { env: { CLAUDE_CONFIG_DIR: configDir } },
+      );
+      try {
+        const events = [];
+        for await (const event of session.streamHistory()) events.push(event);
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: "timeline",
+            item: {
+              type: "assistant_message",
+              text: "Retained reply",
+              messageId: "assistant-transcript-uuid",
+            },
+            historyAssistantMessageId: "assistant-model-id",
+          }),
+        );
+      } finally {
+        await session.close();
+      }
+    } finally {
+      await fs.rm(configDir, { recursive: true, force: true });
+    }
+  });
+
   test("deletes the persisted session jsonl on close when persistSession=false", async () => {
     const tmpConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-claude-persist-"));
     const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;

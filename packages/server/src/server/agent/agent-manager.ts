@@ -10087,7 +10087,7 @@ export class AgentManager {
     input: {
       messageId: string;
       providerMessageId: string;
-      verifyHistory?: (items: AgentTimelineItem[]) => void;
+      verifyHistory?: (events: Extract<AgentStreamEvent, { type: "timeline" }>[]) => void;
       afterConfirmed?: () => Promise<void>;
       confirmedRewind?: ConfirmedRewind;
     },
@@ -10507,14 +10507,18 @@ export class AgentManager {
             messageId: input.messageId,
             providerMessageId: anchor,
             confirmedRewind,
-            verifyHistory: (items) => {
-              const replayedUsers = items.filter((item) => item.type === "user_message");
+            verifyHistory: (events) => {
+              const replayedUsers = events
+                .map((event) => event.item)
+                .filter((item) => item.type === "user_message");
               const replayedIds = new Set(
                 replayedUsers.flatMap((item) => [item.messageId, item.clientMessageId]),
               );
               const replayedAssistantIds = new Set(
-                items.flatMap((item) =>
-                  item.type === "assistant_message" && item.messageId ? [item.messageId] : [],
+                events.flatMap(({ item, historyAssistantMessageId }) =>
+                  item.type === "assistant_message"
+                    ? [item.messageId, historyAssistantMessageId]
+                    : [],
                 ),
               );
               if (
@@ -11579,7 +11583,7 @@ export class AgentManager {
     agent: ActiveManagedAgent,
     broadcast: boolean,
     broadcastTimeline: boolean,
-    verifyHistory?: (items: AgentTimelineItem[]) => void,
+    verifyHistory?: (events: Extract<AgentStreamEvent, { type: "timeline" }>[]) => void,
   ): Promise<void> {
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
@@ -11599,7 +11603,7 @@ export class AgentManager {
       }
     }
 
-    verifyHistory?.(historyEvents.map((event) => event.item));
+    verifyHistory?.(historyEvents);
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
     this.cancelContextHandoff(agent.id);
     if (!verifyHistory) await this.deleteCommittedTimeline(agent.id);

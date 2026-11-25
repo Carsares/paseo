@@ -123,6 +123,7 @@ async function checkpointFixture(
     externalSecondEdit?: boolean;
     emptyAddition?: "valid" | "existing" | "mismatched path" | "external edit";
     earlierTurn?: boolean;
+    provider?: "claude" | "codex";
     stageOnly?: boolean;
     durableTimelineStore?: AgentTimelineStore;
   } = {},
@@ -205,6 +206,7 @@ async function checkpointFixture(
     rewoundSessionId?: string;
     history: AgentTimelineItem[] = [];
     historyFailed = false;
+    historyAssistantMessageId?: string;
     onRewind: () => void | Promise<void> = () => {
       this.history = [];
     };
@@ -337,8 +339,16 @@ async function checkpointFixture(
         } as const;
         return;
       }
-      for (const item of this.history)
-        yield { type: "timeline", provider: this.provider, item } as const;
+      for (const item of this.history) {
+        yield {
+          type: "timeline",
+          provider: this.provider,
+          item,
+          ...(item.type === "assistant_message" && this.historyAssistantMessageId
+            ? { historyAssistantMessageId: this.historyAssistantMessageId }
+            : {}),
+        } as const;
+      }
     }
 
     async revertConversation({ messageId }: { messageId: string }) {
@@ -350,12 +360,13 @@ async function checkpointFixture(
       return { ...super.describePersistence(), sessionId: this.rewoundSessionId ?? this.id };
     }
   }
-  const session = new CheckpointTestSession({ provider: "codex", cwd });
+  const provider = optionsForFixture.provider ?? "codex";
+  const session = new CheckpointTestSession({ provider, cwd });
   const storage = new AgentStorage(join(paseoHome, "agents"), logger);
   const makeManager = (registry = new AgentStorage(join(paseoHome, "agents"), logger)) =>
     new AgentManager({
       clients: {
-        codex: new (class extends TestAgentClient {
+        [provider]: new (class extends TestAgentClient {
           override async createSession() {
             return session;
           }
@@ -374,7 +385,7 @@ async function checkpointFixture(
       logger,
     });
   const create = (manager: AgentManager, id?: string) =>
-    manager.createAgent({ provider: "codex", cwd }, id, { workspaceId: workspace.workspaceId });
+    manager.createAgent({ provider, cwd }, id, { workspaceId: workspace.workspaceId });
   const manager = makeManager(storage);
   const agent = await create(manager);
   if (optionsForFixture.earlierTurn) await manager.runAgent(agent.id, "keep this turn");
@@ -522,6 +533,29 @@ test.each([
   expect(state()).toEqual(afterCheckpointEdit);
   expect(session.rewinds).toEqual(["provider-submitted"]);
   await expect(manager.getPendingRewindFiles(target.agentId)).resolves.toEqual([]);
+});
+
+test("checkpoint rewind accepts Claude history with a distinct assistant transcript UUID", async () => {
+  const { manager, session, target, state, checkpointId } = await checkpointFixture({
+    earlierTurn: true,
+    provider: "claude",
+  });
+  session.onRewind = () => {
+    session.history = [
+      { type: "user_message", text: "keep this turn", messageId: "provider-earlier" },
+      {
+        type: "assistant_message",
+        text: "retained answer",
+        messageId: "assistant-transcript-uuid",
+      },
+    ];
+    session.historyAssistantMessageId = "earlier-answer";
+  };
+  await expect(
+    manager.restoreRewindCheckpoint({ ...target, checkpointId, mode: "both" }),
+  ).resolves.toMatchObject({ error: null, operation: { status: "files_restored" } });
+  expect(state()).toEqual(beforeCheckpointEdit);
+  expect(session.rewinds).toEqual(["provider-submitted"]);
 });
 
 test("checkpoint rewind discovers and retries files after recreating the manager without a provider session", async () => {

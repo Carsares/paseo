@@ -12,8 +12,6 @@ const LocalViewedRecord = z.object({
   headSha: z.string(),
   paths: z.array(z.string()),
   revision: z.number().int().nonnegative().default(0),
-  latestRequest: z.number().int().nonnegative().default(0),
-  confirmedRequest: z.number().int().nonnegative().default(0),
 });
 
 type LocalViewedRecord = z.infer<typeof LocalViewedRecord>;
@@ -24,7 +22,7 @@ type ReviewTransaction = <T>(
 
 export interface LocalReviewRequest {
   identity: ReviewIdentity;
-  sequence: number;
+  revision: number;
 }
 
 export interface LocalReviewHead {
@@ -90,10 +88,13 @@ function createBrowserReviewTransaction(): ReviewTransaction {
       request.addEventListener("success", () => {
         try {
           // Older web clients kept progress in AsyncStorage (localStorage).
-          const saved = request.result ?? window.localStorage.getItem(key);
-          const result = operation(parseRecord(saved), (record) => {
-            store.put(JSON.stringify(record), key);
+          const legacy = request.result === undefined ? window.localStorage.getItem(key) : null;
+          let updated: LocalViewedRecord | undefined;
+          const result = operation(parseRecord(request.result ?? legacy), (record) => {
+            updated = record;
           });
+          if (updated) store.put(JSON.stringify(updated), key);
+          else if (legacy !== null) store.put(legacy, key);
           transaction.addEventListener("complete", () => resolve(result));
         } catch (error) {
           reject(error);
@@ -113,21 +114,42 @@ function reviewKey(identity: ReviewIdentity): string {
 }
 
 function createReviewViewed(transaction: ReviewTransaction) {
+  function begin(identity: ReviewIdentity): Promise<LocalReviewRequest> {
+    return transaction(reviewKey(identity), (record) => ({
+      identity,
+      revision: record?.revision ?? 0,
+    }));
+  }
+
+  function confirm(
+    request: LocalReviewRequest,
+    headSha: string,
+    signal: AbortSignal,
+    verified = false,
+  ) {
+    type Result = { head: LocalReviewHead; viewed: ReviewViewed } | { retryRevision: number };
+    return transaction<Result>(reviewKey(request.identity), (stored, save) => {
+      signal.throwIfAborted();
+      const revision = stored?.revision ?? 0;
+      if (revision !== request.revision) {
+        if (verified) throw { code: "stale" };
+        return { retryRevision: revision };
+      }
+      if (!verified && stored?.headSha && stored.headSha !== headSha) {
+        return { retryRevision: revision };
+      }
+      const record =
+        stored?.headSha === headSha ? stored : { headSha, paths: [], revision: revision + 1 };
+      if (record !== stored) save(record);
+      return {
+        head: { request, headSha, revision: record.revision },
+        viewed: viewedEntries(record),
+      };
+    });
+  }
+
   return {
-    begin(identity: ReviewIdentity): Promise<LocalReviewRequest> {
-      return transaction(reviewKey(identity), (stored, save) => {
-        const record = stored ?? {
-          headSha: "",
-          paths: [],
-          revision: 0,
-          latestRequest: 0,
-          confirmedRequest: 0,
-        };
-        const sequence = Math.max(record.latestRequest, record.revision) + 1;
-        save({ ...record, latestRequest: sequence });
-        return { identity, sequence };
-      });
-    },
+    begin,
     load(head: LocalReviewHead, signal: AbortSignal): Promise<ReviewViewed> {
       return transaction(reviewKey(head.request.identity), (record) => {
         signal.throwIfAborted();
@@ -137,35 +159,29 @@ function createReviewViewed(transaction: ReviewTransaction) {
         return viewedEntries(record);
       });
     },
-    confirmHead(
+    async confirmHead(
       request: LocalReviewRequest,
       headSha: string,
       signal: AbortSignal,
+      verifyCurrent: () => Promise<void>,
     ): Promise<{ head: LocalReviewHead; viewed: ReviewViewed }> {
-      return transaction(reviewKey(request.identity), (stored, save) => {
-        signal.throwIfAborted();
-        // An older reply may share the current head, but cannot change it or cross a head rotation.
-        if (
-          !stored ||
-          request.sequence < stored.revision ||
-          (stored.headSha !== headSha && request.sequence < stored.confirmedRequest)
-        ) {
-          throw { code: "stale" };
-        }
-        const confirmedRequest = Math.max(stored.confirmedRequest, request.sequence);
-        const record =
-          stored.headSha === headSha
-            ? { ...stored, confirmedRequest }
-            : { ...stored, headSha, paths: [], revision: request.sequence, confirmedRequest };
-        if (record.revision !== stored.revision || confirmedRequest !== stored.confirmedRequest) {
-          save(record);
-        }
-        return {
-          head: { request, headSha, revision: record.revision },
-          viewed: viewedEntries(record),
-        };
-      });
+      const first = await confirm(request, headSha, signal);
+      if ("head" in first) return first;
+
+      // The guide may have read an older host version even when the local head
+      // did not change while it loaded. Confirm it again before any replacement.
+      signal.throwIfAborted();
+      await verifyCurrent();
+      const checked = await confirm(
+        { identity: request.identity, revision: first.retryRevision },
+        headSha,
+        signal,
+        true,
+      );
+      if (!("head" in checked)) throw { code: "stale" };
+      return checked;
     },
+
     set(head: LocalReviewHead, path: string, viewed: boolean): Promise<ReviewViewedEntry> {
       return transaction(reviewKey(head.request.identity), (record, save) => {
         if (record?.headSha !== head.headSha || record.revision !== head.revision) {

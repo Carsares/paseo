@@ -4,6 +4,8 @@ import { useFetchQuery } from "@/data/query";
 import { localReviewViewed, type LocalReviewHead, type LocalReviewRequest } from "./local-viewed";
 import {
   reviewFailure,
+  reviewIdentityKey,
+  reviewVersionKey,
   type ReviewFailure,
   type ReviewGuide,
   type ReviewGuidePort,
@@ -39,6 +41,18 @@ export function useReviewViewed(
           localRequest,
           input.version.headSha,
           signal,
+          async () => {
+            const current = await port.getReviewGuide({
+              ...target,
+              expectedVersion: input.version,
+            });
+            if (reviewIdentityKey(current.identity) !== reviewIdentityKey(target.identity)) {
+              throw { code: "invalid_target" };
+            }
+            if (reviewVersionKey(current.version) !== reviewVersionKey(input.version)) {
+              throw { code: "stale" };
+            }
+          },
         );
         localHead.current = confirmed.head;
         return confirmed.viewed;

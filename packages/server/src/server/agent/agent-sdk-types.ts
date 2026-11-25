@@ -509,6 +509,8 @@ export type AgentStreamEvent =
       provider: AgentProvider;
       turnId?: string;
       timestamp?: string;
+      /** Model message ID when a history row displays a separate transcript ID. */
+      historyAssistantMessageId?: string;
     }
   | {
       type: "permission_requested";

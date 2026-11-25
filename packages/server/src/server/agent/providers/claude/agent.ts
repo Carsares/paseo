@@ -403,6 +403,7 @@ interface ClaudeSubagentCardFacts {
 interface PersistedTimelineEntry {
   item: AgentTimelineItem;
   timestamp?: string;
+  historyAssistantMessageId?: string;
 }
 
 interface ClaudeRewindTurnAnchor {
@@ -1323,7 +1324,7 @@ class TimelineAssembler {
     messageIdHint: string | null,
   ): AgentTimelineItem[] {
     const messageId =
-      this.readMessageIdFromAssistantMessage(message) ??
+      readAssistantModelMessageId(toObjectRecord(message)) ??
       messageIdHint ??
       this.resolveMessageId({ runId, createIfMissing: true, messageId: null });
     if (!messageId) {
@@ -1559,20 +1560,16 @@ class TimelineAssembler {
     return fragments;
   }
 
-  private readMessageIdFromAssistantMessage(
-    message: SDKMessage & { type: "assistant" },
-  ): string | null {
-    const candidate = toObjectRecord(message);
-    const messageContainer = toObjectRecord(candidate?.message);
-    return (
-      readTrimmedString(candidate?.message_id) ?? readTrimmedString(messageContainer?.id) ?? null
-    );
-  }
-
   private readMessageIdFromStreamEvent(event: Record<string, unknown>): string | null {
     const messageContainer = toObjectRecord(event.message);
     return readTrimmedString(event.message_id) ?? readTrimmedString(messageContainer?.id) ?? null;
   }
+}
+
+function readAssistantModelMessageId(entry: Record<string, unknown> | null | undefined) {
+  return (
+    readTrimmedString(entry?.message_id) ?? readTrimmedString(toObjectRecord(entry?.message)?.id)
+  );
 }
 
 function isSyntheticUserEntry(entry: unknown): boolean {
@@ -3189,6 +3186,9 @@ class ClaudeAgentSession implements AgentSession {
         item: entry.item,
         provider: "claude",
         timestamp: entry.timestamp,
+        ...(entry.historyAssistantMessageId
+          ? { historyAssistantMessageId: entry.historyAssistantMessageId }
+          : {}),
       };
     }
     yield* providerSubagentEvents;
@@ -6310,13 +6310,8 @@ class ClaudeAgentSession implements AgentSession {
       this.rememberRewindAssistantAnchor(entry.uuid);
     }
 
-    if (items.length > 0) {
-      for (const item of items) {
-        timeline.push({
-          item,
-          timestamp: historyTimestamp ?? undefined,
-        });
-      }
+    for (const item of items) {
+      timeline.push(claudeHistoryTimelineEntry(entry, item, historyTimestamp ?? undefined));
     }
   }
 
@@ -7173,6 +7168,18 @@ interface ClaudeHistoryEntry {
   uuid?: unknown;
   message?: { content?: unknown; [key: string]: unknown };
   [key: string]: unknown;
+}
+
+function claudeHistoryTimelineEntry(
+  entry: ClaudeHistoryEntry,
+  item: AgentTimelineItem,
+  timestamp?: string,
+): PersistedTimelineEntry {
+  const assistantModelId =
+    entry.type === "assistant" && item.type === "assistant_message"
+      ? readAssistantModelMessageId(entry)
+      : undefined;
+  return { item, timestamp, historyAssistantMessageId: assistantModelId ?? undefined };
 }
 
 async function mapAssistantHistoryBlocksWithMessageId(
