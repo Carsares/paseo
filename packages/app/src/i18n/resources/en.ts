@@ -468,6 +468,7 @@ export const en = {
     actions: {
       quoteReply: "Quote reply",
       quoteSelection: "Quote selection",
+      copyQuote: "Copy quote",
       copyCode: "Copy code",
       copyTurn: "Copy turn",
       copyMessage: "Copy message",

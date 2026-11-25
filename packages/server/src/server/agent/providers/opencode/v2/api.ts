@@ -7,6 +7,7 @@ export interface V2Api {
     OpenCodeClient["session"],
     | "create"
     | "get"
+    | "update"
     | "list"
     | "active"
     | "remove"

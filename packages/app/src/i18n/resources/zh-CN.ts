@@ -468,6 +468,7 @@ export const zhCN: TranslationResources = {
     actions: {
       quoteReply: "引用回复",
       quoteSelection: "引用选中内容",
+      copyQuote: "复制引用",
       copyCode: "复制代码",
       copyTurn: "复制回合",
       copyMessage: "复制消息",

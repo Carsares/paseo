@@ -11,7 +11,12 @@ import {
   addModelVisibleStructuredContent,
   serializePaseoToolInputParameters,
 } from "../../tools/paseo-tool-serialization.js";
-import { PaseoToolInputError, type PaseoToolCatalog } from "../../tools/types.js";
+import {
+  PaseoToolInputError,
+  type PaseoToolCatalog,
+  type PaseoToolResult,
+} from "../../tools/types.js";
+import type { McpClientTool } from "../../mcp-client-connection.js";
 import type { AgentLaunchContext } from "../../agent-sdk-types.js";
 
 const INTERNAL_PREFIX = "/_internal/opencode";
@@ -34,9 +39,28 @@ interface OpenCodeBridgeOptions {
   port?: number;
 }
 
+export interface OpenCodeBridgeMcpTool {
+  /** OpenCode's effective tool name, `<server>_<tool>`. */
+  name: string;
+  description: string;
+  inputSchema: McpClientTool["inputSchema"];
+  permissionResource?: string;
+}
+
+/** MCP servers Paseo hosts for one session; the v2 plugin exposes them to that session only. */
+export interface OpenCodeBridgeMcp {
+  readonly tools: readonly OpenCodeBridgeMcpTool[];
+  /** Server instructions for the model, which the plugin adds to each request of the session. */
+  readonly instructions: string | undefined;
+  execute(name: string, input: unknown, signal?: AbortSignal): Promise<PaseoToolResult>;
+}
+
 interface OpenCodeSessionBinding {
   env: Record<string, string>;
   tools?: PaseoToolCatalog;
+  mcp?: OpenCodeBridgeMcp;
+  /** Prepares a descendant session before its first model request. */
+  adoptDescendant?: (sessionId: string) => Promise<void>;
   toolApproval?: { resource: string; tools: readonly string[] };
 }
 
@@ -52,6 +76,7 @@ export function createOpenCodeBridgeToolApproval(
 
 interface BindOpenCodeSessionInput extends OpenCodeSessionBinding {
   sessionId: string;
+  scoped?: boolean;
 }
 
 interface OpenCodePluginOptions {
@@ -69,6 +94,7 @@ export class OpenCodeBridge {
   private readonly logger: Logger;
   private readonly port: number;
   private readonly token = randomBytes(32).toString("hex");
+  private readonly sessionTokens = new Map<string, string>();
   private readonly sessions = new Map<string, OpenCodeSessionBinding>();
   private server: Server | null = null;
   private baseUrl: string | null = null;
@@ -115,13 +141,22 @@ export class OpenCodeBridge {
       env: { ...input.env },
       ...(input.tools ? { tools: input.tools } : {}),
       toolApproval: input.toolApproval,
+      ...(input.mcp ? { mcp: input.mcp } : {}),
+      ...(input.adoptDescendant ? { adoptDescendant: input.adoptDescendant } : {}),
     };
     this.sessions.set(input.sessionId, binding);
+    if (input.scoped) this.sessionTokens.set(input.sessionId, randomBytes(32).toString("hex"));
     return () => {
       if (this.sessions.get(input.sessionId) === binding) {
         this.sessions.delete(input.sessionId);
+        this.sessionTokens.delete(input.sessionId);
       }
     };
+  }
+
+  /** Whether the session's bound MCP servers expose tools the v2 plugin must run. */
+  hasMcpTools(sessionId: string): boolean {
+    return (this.sessions.get(sessionId)?.mcp?.tools.length ?? 0) > 0;
   }
 
   decorateServerEnv(env: Record<string, string>): Record<string, string> {
@@ -154,11 +189,18 @@ export class OpenCodeBridge {
     return { baseUrl, token: this.token };
   }
 
+  v2SessionConnection(sessionId: string, baseUrl = this.requireBaseUrl()): OpenCodePluginOptions {
+    const token = this.sessionTokens.get(sessionId);
+    if (!token) throw new Error("OpenCode session has no scoped bridge binding");
+    return { baseUrl, token };
+  }
+
   async close(): Promise<void> {
     const server = this.server;
     this.server = null;
     this.baseUrl = null;
     this.sessions.clear();
+    this.sessionTokens.clear();
     if (server) await closeServer(server);
   }
 
@@ -173,89 +215,98 @@ export class OpenCodeBridge {
 
   private async route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
-      if (request.headers.authorization !== `Bearer ${this.token}`) {
+      const url = new URL(request.url ?? "/", this.requireBaseUrl());
+      const pathSession = url.pathname.match(new RegExp(`^${INTERNAL_PREFIX}/sessions/([^/]+)/`));
+      const sessionId = pathSession
+        ? decodeURIComponent(pathSession[1])
+        : url.searchParams.get("sessionID");
+      const token =
+        (sessionId === null ? undefined : this.sessionTokens.get(sessionId)) ?? this.token;
+      if (request.headers.authorization !== `Bearer ${token}`) {
         sendJson(response, 401, { error: "Unauthorized" });
         return;
       }
-      const url = new URL(request.url ?? "/", this.requireBaseUrl());
-      if (request.method === "GET" && url.pathname === `${INTERNAL_PREFIX}/tools`) {
-        sendJson(response, 200, {
-          tools: this.serializeManifest(url.searchParams.get("sessionID")),
-        });
-        return;
-      }
-
-      const contextMatch = url.pathname.match(
-        new RegExp(`^${INTERNAL_PREFIX}/sessions/([^/]+)/context$`),
-      );
-      if (request.method === "GET" && contextMatch) {
-        this.sendSessionContext(decodeURIComponent(contextMatch[1]), url.searchParams, response);
-        return;
-      }
-
-      const toolMatch = url.pathname.match(
-        new RegExp(`^${INTERNAL_PREFIX}/sessions/([^/]+)/tools/([^/]+)$`),
-      );
-      if (request.method === "POST" && toolMatch) {
-        await this.executeTool({
-          sessionId: decodeURIComponent(toolMatch[1]),
-          toolName: decodeURIComponent(toolMatch[2]),
-          request,
-          response,
-        });
-        return;
-      }
-
-      sendJson(response, 404, { error: "Not found" });
+      await this.dispatch(request, response, url);
     } catch (error) {
       this.logger.warn({ err: error }, "OpenCode bridge request failed");
-      const failure = error instanceof Error ? error : new Error(String(error));
-      if (!response.headersSent) {
-        if (error instanceof OpenCodeBridgeClientError) {
-          sendJson(response, error.status, {
-            error: error.message,
-            ...(error.details === undefined ? {} : { details: error.details }),
-          });
-        } else if (error instanceof PaseoToolInputError) {
-          sendJson(
-            response,
-            error.status,
-            error.issues
-              ? { error: "Invalid tool input", issues: error.issues }
-              : { error: error.message },
-          );
-        } else {
-          sendJson(response, 500, { error: failure.message });
-        }
-      } else {
-        response.destroy(failure);
-      }
+      sendFailure(response, error);
     }
   }
 
-  private sendSessionContext(
-    sessionId: string,
-    query: URLSearchParams,
+  private async dispatch(
+    request: IncomingMessage,
     response: ServerResponse,
-  ): void {
-    const binding = this.sessions.get(sessionId);
-    if (!binding) {
-      sendJson(response, 404, { error: "OpenCode session is not bound to a Paseo agent" });
+    url: URL,
+  ): Promise<void> {
+    if (request.method === "GET" && url.pathname === `${INTERNAL_PREFIX}/tools`) {
+      sendJson(response, 200, this.manifest(url.searchParams.get("sessionID")));
       return;
     }
-    const tool = query.get("permissionForTool");
-    if (tool !== null) {
-      const hasApproval =
-        binding.tools?.getTool(tool) && binding.toolApproval?.tools.includes(tool);
-      sendJson(response, 200, {
-        resource: hasApproval ? binding.toolApproval?.resource : undefined,
+
+    const contextMatch = url.pathname.match(
+      new RegExp(`^${INTERNAL_PREFIX}/sessions/([^/]+)/context$`),
+    );
+    if (request.method === "GET" && contextMatch) {
+      const binding = this.requireBinding(decodeURIComponent(contextMatch[1]));
+      const tool = url.searchParams.get("permissionForTool");
+      if (tool !== null) {
+        const hasApproval =
+          binding.tools?.getTool(tool) && binding.toolApproval?.tools.includes(tool);
+        sendJson(response, 200, {
+          resource: hasApproval ? binding.toolApproval?.resource : undefined,
+        });
+        return;
+      }
+      sendJson(response, 200, sessionContext(binding, url.searchParams.has("tools")));
+      return;
+    }
+
+    const mcpMatch = url.pathname.match(
+      new RegExp(`^${INTERNAL_PREFIX}/sessions/([^/]+)/mcp-tools/([^/]+)$`),
+    );
+    if (request.method === "POST" && mcpMatch) {
+      await this.executeMcpTool({
+        sessionId: decodeURIComponent(mcpMatch[1]),
+        toolName: decodeURIComponent(mcpMatch[2]),
+        request,
+        response,
       });
       return;
     }
-    sendJson(response, 200, {
-      env: binding.env,
-      ...(query.has("tools") ? { tools: [...(binding.tools?.tools.keys() ?? [])] } : {}),
-    });
+
+    const descendantMatch = url.pathname.match(
+      new RegExp(`^${INTERNAL_PREFIX}/sessions/([^/]+)/descendants/([^/]+)$`),
+    );
+    if (request.method === "POST" && descendantMatch) {
+      const binding = this.requireBinding(decodeURIComponent(descendantMatch[1]));
+      if (!binding.adoptDescendant)
+        throw new OpenCodeBridgeClientError(404, "OpenCode session cannot adopt descendants");
+      await binding.adoptDescendant(decodeURIComponent(descendantMatch[2]));
+      sendJson(response, 200, {});
+      return;
+    }
+
+    const toolMatch = url.pathname.match(
+      new RegExp(`^${INTERNAL_PREFIX}/sessions/([^/]+)/tools/([^/]+)$`),
+    );
+    if (request.method === "POST" && toolMatch) {
+      await this.executeTool({
+        sessionId: decodeURIComponent(toolMatch[1]),
+        toolName: decodeURIComponent(toolMatch[2]),
+        request,
+        response,
+      });
+      return;
+    }
+
+    sendJson(response, 404, { error: "Not found" });
+  }
+
+  private manifest(sessionId: string | null) {
+    return {
+      tools: this.serializeManifest(sessionId),
+      mcpTools: sessionId === null ? [] : (this.sessions.get(sessionId)?.mcp?.tools ?? []),
+    };
   }
 
   private serializeManifest(sessionId: string | null): Array<Record<string, unknown>> {
@@ -298,14 +349,31 @@ export class OpenCodeBridge {
       throw new OpenCodeBridgeClientError(404, `Paseo tool not found: ${input.toolName}`);
     }
     const body = await readJsonBody(input.request);
-    const controller = new AbortController();
-    input.request.once("aborted", () =>
-      controller.abort(new Error("OpenCode tool request was aborted")),
-    );
     const result = await binding.tools.executeTool(input.toolName, body, {
-      signal: controller.signal,
+      signal: abortOnDisconnect(input.response),
     });
     sendJson(input.response, 200, addModelVisibleStructuredContent(result));
+  }
+
+  private async executeMcpTool(input: {
+    sessionId: string;
+    toolName: string;
+    request: IncomingMessage;
+    response: ServerResponse;
+  }): Promise<void> {
+    const mcp = this.requireBinding(input.sessionId).mcp;
+    if (!mcp?.tools.some((tool) => tool.name === input.toolName))
+      throw new OpenCodeBridgeClientError(404, `MCP tool not found: ${input.toolName}`);
+    const body = await readJsonBody(input.request);
+    const result = await mcp.execute(input.toolName, body, abortOnDisconnect(input.response));
+    sendJson(input.response, 200, addModelVisibleStructuredContent(result));
+  }
+
+  private requireBinding(sessionId: string): OpenCodeSessionBinding {
+    const binding = this.sessions.get(sessionId);
+    if (!binding)
+      throw new OpenCodeBridgeClientError(404, "OpenCode session is not bound to a Paseo agent");
+    return binding;
   }
 
   private requireBaseUrl(): string {
@@ -434,6 +502,53 @@ async function readJsonBody(request: IncomingMessage): Promise<unknown> {
     return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
   } catch {
     throw new OpenCodeBridgeClientError(400, "Malformed JSON request body");
+  }
+}
+
+function sessionContext(binding: OpenCodeSessionBinding, withTools: boolean) {
+  if (!withTools) return { env: binding.env };
+  return {
+    env: binding.env,
+    tools: [...(binding.tools?.tools.keys() ?? [])],
+    mcpTools: binding.mcp?.tools ?? [],
+    mcpInstructions: binding.mcp?.instructions,
+  };
+}
+
+/**
+ * Aborts when OpenCode stops waiting for the response, for example when the user stops the turn.
+ * The request has ended by then, so only the response reports the disconnect.
+ */
+function abortOnDisconnect(response: ServerResponse): AbortSignal {
+  const controller = new AbortController();
+  response.once("close", () => {
+    if (!response.writableFinished)
+      controller.abort(new Error("OpenCode tool request was aborted"));
+  });
+  return controller.signal;
+}
+
+function sendFailure(response: ServerResponse, error: unknown): void {
+  const failure = error instanceof Error ? error : new Error(String(error));
+  if (response.headersSent) {
+    response.destroy(failure);
+    return;
+  }
+  if (error instanceof OpenCodeBridgeClientError) {
+    sendJson(response, error.status, {
+      error: error.message,
+      ...(error.details === undefined ? {} : { details: error.details }),
+    });
+  } else if (error instanceof PaseoToolInputError) {
+    sendJson(
+      response,
+      error.status,
+      error.issues
+        ? { error: "Invalid tool input", issues: error.issues }
+        : { error: error.message },
+    );
+  } else {
+    sendJson(response, 500, { error: failure.message });
   }
 }
 

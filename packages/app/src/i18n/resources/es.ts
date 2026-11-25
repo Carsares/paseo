@@ -475,6 +475,7 @@ export const es: TranslationResources = {
     actions: {
       quoteReply: "Citar respuesta",
       quoteSelection: "Citar selección",
+      copyQuote: "Copiar cita",
       copyCode: "Copiar código",
       copyTurn: "Copiar turno",
       copyMessage: "Copiar mensaje",

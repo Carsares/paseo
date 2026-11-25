@@ -469,6 +469,7 @@ export const ko: TranslationResources = {
     actions: {
       quoteReply: "답장 인용",
       quoteSelection: "선택 항목 인용",
+      copyQuote: "인용문 복사",
       copyCode: "코드 복사",
       copyTurn: "턴 복사",
       copyMessage: "메시지 복사",

@@ -474,6 +474,7 @@ export const ptBR: TranslationResources = {
     actions: {
       quoteReply: "Citar resposta",
       quoteSelection: "Citar seleção",
+      copyQuote: "Copiar citação",
       copyCode: "Copiar código",
       copyTurn: "Copiar turno",
       copyMessage: "Copiar mensagem",

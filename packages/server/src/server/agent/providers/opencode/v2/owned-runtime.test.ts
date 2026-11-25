@@ -20,17 +20,15 @@ test("lists cached commands after an exit without acquiring a new v2 connection"
   replacement.api.skill.list = async ({ location }) => ({ location, data: [] });
   const exited = Promise.withResolvers<Error>();
   const acquire = vi.fn(async () => replacement.connection);
-  const session = new OpenCodeV2Session(
-    { ...old.connection, exited: exited.promise },
-    old.info,
-    { provider: "opencode", cwd: old.info.location.directory },
-    createTestLogger(),
-    true,
-    false,
-    undefined,
-    undefined,
+  const session = new OpenCodeV2Session({
+    connection: { ...old.connection, exited: exited.promise },
+    info: old.info,
+    config: { provider: "opencode", cwd: old.info.location.directory },
+    logger: createTestLogger(),
+    persist: true,
+    requiresPaseoPlugin: false,
     acquire,
-  );
+  });
   try {
     await session.initialize();
     const commands = await session.listCommands({ allowLaunch: false });

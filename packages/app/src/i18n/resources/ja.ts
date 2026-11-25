@@ -474,6 +474,7 @@ export const ja: TranslationResources = {
     actions: {
       quoteReply: "返信を引用",
       quoteSelection: "選択範囲を引用",
+      copyQuote: "引用をコピー",
       copyCode: "コードをコピー",
       copyTurn: "ターンをコピー",
       copyMessage: "メッセージをコピー",

@@ -474,6 +474,7 @@ export const ru: TranslationResources = {
     actions: {
       quoteReply: "Цитировать ответ",
       quoteSelection: "Цитировать выделенное",
+      copyQuote: "Копировать цитату",
       copyCode: "Скопировать код",
       copyTurn: "Скопировать ответ",
       copyMessage: "Копировать сообщение",

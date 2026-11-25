@@ -468,6 +468,7 @@ export const ar: TranslationResources = {
     actions: {
       quoteReply: "اقتباس الرد",
       quoteSelection: "اقتباس التحديد",
+      copyQuote: "نسخ الاقتباس",
       copyCode: "نسخ الرمز",
       copyTurn: "نسخ بدوره",
       copyMessage: "انسخ الرسالة",

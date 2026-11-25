@@ -1,35 +1,25 @@
 import type { SessionInfo, PermissionRuleset } from "@opencode/client";
 import type { V2Api } from "./api.js";
 
-import type {
-  AgentLaunchContext,
-  AgentOptionControl,
-  AgentSessionConfig,
-} from "../../../agent-sdk-types.js";
+import type { AgentOptionControl, AgentSessionConfig } from "../../../agent-sdk-types.js";
 import { resolveRuntimeMcpToolPolicy } from "../../../runtime-mcp-config.js";
 
 import { OpenCodeProviderOptionsSchema, buildOpenCodePermissionRules } from "../options.js";
 
 import { modelRef } from "./mapping.js";
+import { SessionMcp, openCodeMcpToolName } from "./session-mcp.js";
 
 export const controls: AgentOptionControl[] = [
   { type: "toggle", key: "auto_accept", label: "Auto-accept" },
 ];
-export function permissionRules(config: AgentSessionConfig): PermissionRuleset {
+export function permissionRules(config: AgentSessionConfig, mcp?: SessionMcp): PermissionRuleset {
   const rules =
     buildOpenCodePermissionRules(
       OpenCodeProviderOptionsSchema.parse(config.providerOptions ?? {}),
       undefined,
     ) ?? [];
-  const grants: PermissionRuleset = (resolveRuntimeMcpToolPolicy(config)?.preapproved ?? []).map(
-    (grant) => ({
-      action: `${grant.server.replace(/[^a-zA-Z0-9_-]/g, "_")}_${grant.tool.replace(/[^a-zA-Z0-9_-]/g, "_")}`,
-      resource: "*",
-      effect: "allow",
-    }),
-  );
   return [
-    ...grants,
+    ...(mcp?.preapprovalRules() ?? []),
     ...rules.map((rule) => ({
       action: nativePermissionAction(rule.permission),
       resource: rule.pattern,
@@ -37,6 +27,53 @@ export function permissionRules(config: AgentSessionConfig): PermissionRuleset {
     })),
   ];
 }
+export async function refreshMcpPermissionRules(
+  client: V2Api,
+  info: SessionInfo,
+  config: AgentSessionConfig,
+  mcp: SessionMcp | undefined,
+  previousPolicy: unknown,
+): Promise<void> {
+  const legacyActions = new Set(
+    [
+      ...legacyGrants(previousPolicy),
+      ...(resolveRuntimeMcpToolPolicy(config)?.preapproved ?? []),
+    ].map(({ server, tool }) => openCodeMcpToolName(server, tool)),
+  );
+  const authoredAllows = new Set(
+    permissionRules(config)
+      .filter(({ resource, effect }) => resource === "*" && effect === "allow")
+      .map(({ action }) => action),
+  );
+  const current = info.permissions ?? [];
+  const retained = current.filter(
+    ({ action, resource, effect }) =>
+      !SessionMcp.isPermissionResource(resource) &&
+      !(
+        legacyActions.has(action) &&
+        resource === "*" &&
+        effect === "allow" &&
+        !authoredAllows.has(action)
+      ),
+  );
+  const next = [...(mcp?.preapprovalRules() ?? []), ...retained];
+  if (JSON.stringify(current) === JSON.stringify(next)) return;
+  await client.session.update({ sessionID: info.id, permissions: next });
+  info.permissions = next;
+}
+
+function legacyGrants(policy: unknown): Array<{ server: string; tool: string }> {
+  if (typeof policy !== "object" || policy === null) return [];
+  const grants: unknown = Reflect.get(policy, "preapproved");
+  if (!Array.isArray(grants)) return [];
+  return grants.flatMap((grant: unknown) => {
+    if (typeof grant !== "object" || grant === null) return [];
+    const server: unknown = Reflect.get(grant, "server");
+    const tool: unknown = Reflect.get(grant, "tool");
+    return typeof server === "string" && typeof tool === "string" ? [{ server, tool }] : [];
+  });
+}
+
 function nativePermissionAction(action: string): string {
   if (action === "bash") return "shell";
   if (action === "task") return "subagent";
@@ -62,18 +99,4 @@ export async function applyResumeOverrides(
     await client.session.switchModel({ sessionID: info.id, model });
     info.model = model;
   }
-}
-
-// Agent identity env is applied per session through `session.environment`, so
-// it must not force a dedicated server. Custom MCP is location-scoped, and any
-// other env key belongs to the process, so both need isolation. Mirrors the v1
-// adapter's `requiresDedicatedOpenCodeServer`.
-const V2_SESSION_ENV_KEYS = new Set(["PASEO_AGENT_ID", "PASEO_AGENT_CWD", "PASEO_WORKSPACE_ID"]);
-
-export function requiresDedicatedV2Server(
-  config: AgentSessionConfig,
-  launch?: AgentLaunchContext,
-): boolean {
-  if (Object.keys(config.mcpServers ?? {}).length > 0) return true;
-  return Object.keys(launch?.env ?? {}).some((key) => !V2_SESSION_ENV_KEYS.has(key));
 }

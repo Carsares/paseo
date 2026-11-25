@@ -44,6 +44,26 @@ import { SessionPermissions } from "./permissions.js";
 import { SessionUsage } from "./usage.js";
 import { createSessionMetricsReporter } from "../../metrics.js";
 import { replayedTurnMetrics, sessionMetrics } from "./metrics.js";
+import type { SessionMcp } from "./session-mcp.js";
+
+export interface OpenCodeV2SessionOptions {
+  connection: V2Connection;
+  info: SessionInfo;
+  config: AgentSessionConfig;
+  logger: Logger;
+  persist: boolean;
+  requiresPaseoPlugin: boolean;
+  /** The complete shell environment for this session and its descendants. */
+  environment?: Record<string, string>;
+  /** MCP servers Paseo hosts for this session; the session closes them. */
+  mcp?: SessionMcp;
+  unbind?: () => void;
+  bindChild?: (id: string) => void;
+  acquire?: () => Promise<V2Connection>;
+  moved?: (connection: V2Connection) => void;
+  historyOnly?: boolean;
+  blockPassiveLaunch?: boolean;
+}
 
 export class OpenCodeV2Session implements AgentSession {
   readonly provider = "opencode";
@@ -59,7 +79,6 @@ export class OpenCodeV2Session implements AgentSession {
   private streamAbort = new AbortController();
   private exited = false;
   private reconnecting: Promise<void> | null = null;
-  private launchEnv: Record<string, string> | undefined;
   private sync: Promise<void> = Promise.resolve();
   private dirty = false;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -72,20 +91,35 @@ export class OpenCodeV2Session implements AgentSession {
   private readonly reportSessionMetrics = createSessionMetricsReporter((metrics) =>
     this.emit({ type: "session_metrics_updated", provider: "opencode", metrics }),
   );
-  constructor(
-    private connection: V2Connection,
-    private info: SessionInfo,
-    private readonly config: AgentSessionConfig,
-    private readonly logger: Logger,
-    private readonly persist: boolean,
-    private readonly requiresPaseoPlugin: boolean,
-    private readonly unbind?: () => void,
-    bindChild?: (id: string) => void,
-    private readonly acquire?: () => Promise<V2Connection>,
-    private readonly moved?: (connection: V2Connection) => void,
-    private readonly historyOnly = false,
-    private readonly blockPassiveLaunch = false,
-  ) {
+  private connection: V2Connection;
+  private info: SessionInfo;
+  private readonly config: AgentSessionConfig;
+  private readonly logger: Logger;
+  private readonly persist: boolean;
+  private readonly requiresPaseoPlugin: boolean;
+  // OpenCode replaces the whole local shell environment, rather than overlaying it.
+  private readonly environment: Record<string, string> | undefined;
+  private readonly mcp: SessionMcp | undefined;
+  private readonly unbind: (() => void) | undefined;
+  private readonly acquire: (() => Promise<V2Connection>) | undefined;
+  private readonly moved: ((connection: V2Connection) => void) | undefined;
+  private readonly historyOnly: boolean;
+  private readonly blockPassiveLaunch: boolean;
+  constructor(options: OpenCodeV2SessionOptions) {
+    const { info, config, bindChild } = options;
+    this.connection = options.connection;
+    this.info = info;
+    this.config = config;
+    this.logger = options.logger;
+    this.persist = options.persist;
+    this.requiresPaseoPlugin = options.requiresPaseoPlugin;
+    this.environment = options.environment;
+    this.mcp = options.mcp;
+    this.unbind = options.unbind;
+    this.acquire = options.acquire;
+    this.moved = options.moved;
+    this.historyOnly = options.historyOnly ?? false;
+    this.blockPassiveLaunch = options.blockPassiveLaunch ?? false;
     this.background = new OpenCodeBackgroundInventory({
       id: info.id,
       cwd: config.cwd,
@@ -107,7 +141,10 @@ export class OpenCodeV2Session implements AgentSession {
       id: info.id,
       emit: (event) => this.emit(event),
       reconcilePermissions: (id) => this.permissions.reconcile(id),
-      bindChild,
+      adoptChild: async (id) => {
+        bindChild?.(id);
+        await this.adoptDescendant(id);
+      },
     });
     this.turns = new SessionTurns({
       client: () => this.client,
@@ -154,14 +191,13 @@ export class OpenCodeV2Session implements AgentSession {
   private get client() {
     return this.connection.client;
   }
-  async initialize(environment?: Record<string, string>) {
-    // OpenCode replaces the whole local shell environment, rather than overlaying it.
-    this.launchEnv = environment;
+  async initialize(configureBoundSession?: () => Promise<void>) {
     this.watchExit(this.connection);
-    await this.configureConnection();
+    await this.configureConnection(configureBoundSession);
     const location = { directory: this.config.cwd };
     this.modes = modesFromV2((await this.client.agent.list({ location })).data);
     await this.timeline.messages(await messages(this.client, this.id), () => {});
+    if (this.historyOnly) return;
     await this.startStream();
     await this.children.reconcile(this.id);
   }
@@ -175,35 +211,14 @@ export class OpenCodeV2Session implements AgentSession {
       return undefined;
     });
   }
-  private async configureConnection() {
+  private async configureConnection(configureBoundSession?: () => Promise<void>) {
+    if (this.historyOnly) return;
     const location = { directory: this.config.cwd };
     await this.connection.bindSession(this.id, this.config.cwd);
     await waitForLocationReady({ client: this.client, location, signal: this.abort.signal });
     if (this.requiresPaseoPlugin)
       await awaitPaseoPlugin({ client: this.client, location, signal: this.abort.signal });
-    for (const [server, config] of Object.entries(this.config.mcpServers ?? {})) {
-      await this.client.mcp.add({
-        server,
-        location,
-        config:
-          config.type === "stdio"
-            ? {
-                type: "local",
-                command: [config.command, ...(config.args ?? [])],
-                environment: config.env,
-                codemode: false,
-              }
-            : {
-                type: "remote",
-                url: config.url,
-                headers: config.headers,
-                oauth: false,
-                codemode: false,
-              },
-      });
-      await this.awaitMcp(server);
-    }
-    if (this.historyOnly) return;
+    await configureBoundSession?.();
     const system = composeSystemPromptParts(
       this.config.systemPrompt,
       this.config.daemonAppendSystemPrompt,
@@ -221,6 +236,28 @@ export class OpenCodeV2Session implements AgentSession {
         await this.client.session.instructions.entry.remove({ sessionID: this.id, key: "paseo" });
       }
     }
+  }
+  /** Verify bridge requests against OpenCode's session tree before applying agent environment. */
+  async adoptBridgeDescendant(sessionID: string) {
+    if (this.closed || this.historyOnly) return;
+    const seen = new Set<string>([this.id]);
+    let current: string | undefined = sessionID;
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const { parentID } = await this.client.session.get({ sessionID: current });
+      if (parentID === this.id) {
+        await this.adoptDescendant(sessionID);
+        return;
+      }
+      current = parentID;
+    }
+    throw new Error("OpenCode session is outside the bound agent's session tree");
+  }
+
+  /** Gives a descendant session the shell environment, which OpenCode does not inherit. */
+  async adoptDescendant(sessionID: string) {
+    if (this.closed || this.historyOnly || !this.environment) return;
+    await this.client.session.environment({ sessionID, variables: this.environment });
   }
   private async startStream() {
     let ready!: () => void;
@@ -247,11 +284,13 @@ export class OpenCodeV2Session implements AgentSession {
     if (!this.acquire) throw new Error("OpenCode helper server exited");
     await this.stream;
     await this.sync.catch(() => undefined);
-    await this.connection
-      .unbindSession(this.id, this.config.cwd)
-      .catch((error: unknown) =>
-        this.logger.warn({ error }, "Could not unbind the OpenCode Paseo bridge"),
-      );
+    if (!this.historyOnly) {
+      await this.connection
+        .unbindSession(this.id, this.config.cwd)
+        .catch((error: unknown) =>
+          this.logger.warn({ error }, "Could not unbind the OpenCode Paseo bridge"),
+        );
+    }
     const next = await this.acquire();
     if (this.closed) {
       await next.release();
@@ -262,17 +301,19 @@ export class OpenCodeV2Session implements AgentSession {
     this.streamAbort = new AbortController();
     this.exited = false;
     this.watchExit(next);
-    try {
-      await this.configureConnection();
-      await this.startStream();
-    } catch (error) {
-      this.connection = old;
-      this.exited = true;
-      this.streamAbort.abort();
-      await next.release();
-      throw error;
+    if (!this.historyOnly) {
+      try {
+        await this.configureConnection();
+        await this.startStream();
+      } catch (error) {
+        this.connection = old;
+        this.exited = true;
+        this.streamAbort.abort();
+        await next.release();
+        throw error;
+      }
+      this.moved?.(next);
     }
-    this.moved?.(next);
     await old.release();
   }
   subscribe(callback: (event: AgentStreamEvent) => void) {
@@ -286,22 +327,6 @@ export class OpenCodeV2Session implements AgentSession {
     return () => {
       this.listeners.delete(callback);
     };
-  }
-  private async awaitMcp(server: string) {
-    const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(30_000)]);
-    while (true) {
-      const catalog = await this.client.mcp.list(
-        { location: { directory: this.config.cwd } },
-        { signal },
-      );
-      const entry = catalog.data.find((item) => item.name === server);
-      if (entry?.status.status === "connected") return;
-      if (entry && entry.status.status !== "pending") {
-        const reason = entry.status.status === "failed" ? entry.status.error : entry.status.status;
-        throw new Error(`OpenCode MCP server ${server} failed to connect: ${reason}`);
-      }
-      await delay(50, undefined, { signal });
-    }
   }
   private emit(event: AgentStreamEvent) {
     for (const listener of this.listeners) listener(event);
@@ -545,8 +570,9 @@ export class OpenCodeV2Session implements AgentSession {
     await this.connection.bindSession(this.id, this.config.cwd);
     // Session environments are process-local. Reapply this agent's snapshot before
     // reconciling a new connection, including event-stream reconnections.
-    if (this.launchEnv)
-      await this.client.session.environment({ sessionID: this.id, variables: this.launchEnv });
+    if (this.environment)
+      await this.client.session.environment({ sessionID: this.id, variables: this.environment });
+    for (const id of this.children.ids()) await this.adoptDescendant(id);
     await this.reconcile();
     await this.children.reconcile(this.id);
     await this.turns.reconcile();
@@ -672,15 +698,18 @@ export class OpenCodeV2Session implements AgentSession {
     await this.stream;
     await this.reconnecting?.catch(() => undefined);
     await this.sync.catch(() => undefined);
-    await this.connection
-      .unbindSession(this.id, this.config.cwd)
-      .catch((error: unknown) =>
-        this.logger.warn({ error }, "Could not unbind the OpenCode Paseo bridge"),
-      );
-    this.unbind?.();
+    if (!this.historyOnly) {
+      await this.connection
+        .unbindSession(this.id, this.config.cwd)
+        .catch((error: unknown) =>
+          this.logger.warn({ error }, "Could not unbind the OpenCode Paseo bridge"),
+        );
+      this.unbind?.();
+    }
     try {
       if (!this.persist) await this.client.session.remove({ sessionID: this.id });
     } finally {
+      await this.mcp?.close();
       await this.connection.release();
     }
     this.listeners.clear();

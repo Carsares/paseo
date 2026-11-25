@@ -11,6 +11,7 @@ import { ProviderSnapshotManager } from "../../../provider-snapshot-manager.js";
 import type { AgentRunOptions, AgentStreamEvent } from "../../../agent-sdk-types.js";
 import { AgentRequestOutcomeUnknownError } from "../../../../message-receipts/index.js";
 import { OpenCodeV2AgentClient } from "./agent.js";
+import { OpenCodeBridge } from "../bridge.js";
 import { V2Harness } from "../test-utils/v2-harness.js";
 import type { V2Api } from "./api.js";
 
@@ -69,6 +70,81 @@ describe("OpenCode v2 session lifecycle", () => {
       expect(harness.instructions.get("paseo")).toBe("Existing plugin instruction");
     } finally {
       await session.close();
+    }
+  });
+
+  test("a rejected duplicate restore and a history read preserve the live session's permissions", async () => {
+    const { vi } = await import("vitest");
+    const harness = new V2Harness();
+    const bridge = new OpenCodeBridge({ paseoHome: "/tmp/project", logger: createTestLogger() });
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+      bridge,
+    });
+    const active = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+    try {
+      const handle = active.describePersistence()!;
+      const preapproval = {
+        action: "hub_marker",
+        resource: "paseo-mcp-binding-current",
+        effect: "allow",
+      } as const;
+      harness.info.permissions = [preapproval];
+      const update = vi.spyOn(harness.api.session, "update");
+
+      await expect(client.resumeSession(handle)).rejects.toThrow(/already bound/);
+      expect(update).not.toHaveBeenCalled();
+
+      const history = await client.resumeSession(handle, undefined, undefined, {
+        purpose: "history",
+      });
+      await history.close();
+      expect(update).not.toHaveBeenCalled();
+      expect(harness.info.permissions).toEqual([preapproval]);
+    } finally {
+      await active.close();
+      await bridge.close();
+    }
+  });
+
+  test("releases the session binding when refreshing permissions fails before listening", async () => {
+    const { vi } = await import("vitest");
+    const harness = new V2Harness();
+    const bridge = new OpenCodeBridge({ paseoHome: "/tmp/project", logger: createTestLogger() });
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+      bridge,
+    });
+    const bind = vi.spyOn(harness.connection, "bindSession");
+    const unbind = vi.spyOn(harness.connection, "unbindSession");
+    const subscribe = vi.spyOn(harness.api.event, "subscribe");
+    const update = vi.spyOn(harness.api.session, "update");
+    update.mockRejectedValueOnce(new Error("permission update failed"));
+    harness.info.permissions = [
+      { action: "hub_marker", resource: "paseo-mcp-binding-previous", effect: "allow" },
+    ];
+    const handle = {
+      provider: "opencode",
+      sessionId: harness.info.id,
+      metadata: { cwd: "/tmp/project" },
+    } as const;
+    try {
+      await expect(client.resumeSession(handle)).rejects.toThrow("permission update failed");
+      expect(bind).toHaveBeenCalledBefore(update);
+      expect(unbind).toHaveBeenCalledWith(harness.info.id, handle.metadata.cwd);
+      expect(subscribe).not.toHaveBeenCalled();
+
+      const restored = await client.resumeSession(handle);
+      try {
+        expect(update).toHaveBeenCalledBefore(subscribe);
+        expect(harness.info.permissions).toEqual([]);
+      } finally {
+        await restored.close();
+      }
+    } finally {
+      await bridge.close();
     }
   });
 
@@ -984,11 +1060,7 @@ describe("OpenCode v2 session lifecycle", () => {
       second.prompts.push(input.text);
     };
     const session = await client.createSession(
-      {
-        provider: "opencode",
-        cwd: "/tmp/project",
-        mcpServers: { tools: { type: "stdio", command: "tools" } },
-      },
+      { provider: "opencode", cwd: "/tmp/project" },
       { env: { TOKEN: "test" } },
     );
     const commands = await session.listCommands!({ allowLaunch: false });
@@ -1006,7 +1078,6 @@ describe("OpenCode v2 session lifecycle", () => {
     try {
       expect((await session.run("after exit")).finalText).toBe("recovered");
       expect(second.prompts).toEqual(["after exit"]);
-      expect(second.mcpAdds).toEqual(["tools"]);
       expect(second.environments).toMatchObject([
         { sessionID: "session", variables: { TOKEN: "test", PATH: process.env.PATH } },
       ]);
@@ -1151,6 +1222,93 @@ describe("OpenCode v2 session lifecycle", () => {
     };
     await expect(client.resumeSession(handle)).rejects.toThrow("Session not found");
     expect(harness.creates).toEqual([]);
+  });
+
+  test("only allows a native child session to be opened for history", async () => {
+    const harness = new V2Harness();
+    harness.api.session.get = async () => ({ ...harness.info, parentID: "native-parent" });
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const config = { provider: "opencode", cwd: "/tmp/project" } as const;
+    const handle = { provider: "opencode", sessionId: harness.info.id, metadata: config } as const;
+    await expect(
+      client.importSession(
+        { providerHandleId: harness.info.id, cwd: config.cwd },
+        {
+          config,
+          storedConfig: config,
+        },
+      ),
+    ).rejects.toThrow(/child sessions cannot be attached/);
+    await expect(client.resumeSession(handle)).rejects.toThrow(/child sessions cannot be attached/);
+    const history = await client.resumeSession(handle, undefined, undefined, {
+      purpose: "history",
+    });
+    try {
+      expect(history.describePersistence()).toMatchObject({ sessionId: harness.info.id });
+      expect(harness.environments).toEqual([]);
+    } finally {
+      await history.close();
+    }
+  });
+
+  test("reconnects child session history without changing its bridge binding", async () => {
+    const { vi } = await import("vitest");
+    const first = new V2Harness();
+    const next = new V2Harness();
+    const exit = Promise.withResolvers<Error>();
+    const bindSession = vi.fn(async () => {});
+    const unbindSession = vi.fn(async () => {});
+    const subscribe = vi.spyOn(next.api.event, "subscribe");
+    for (const harness of [first, next]) {
+      harness.api.session.get = async () => ({ ...harness.info, parentID: "native-parent" });
+      harness.connection.bindSession = bindSession;
+      harness.connection.unbindSession = unbindSession;
+    }
+    next.history.push({
+      id: "answer",
+      type: "assistant",
+      agent: "build",
+      model: { providerID: "test", id: "model" },
+      time: { created: 2 },
+      content: [{ type: "text", text: "child history after reconnect" }],
+    });
+    const acquire = vi
+      .fn(async () => next.connection)
+      .mockResolvedValueOnce({ ...first.connection, exited: exit.promise });
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: { acquire, shutdown: async () => undefined },
+    });
+    const session = await client.resumeSession(
+      { provider: "opencode", sessionId: first.info.id, metadata: { cwd: "/tmp/project" } },
+      undefined,
+      undefined,
+      { purpose: "history" },
+    );
+    try {
+      exit.resolve(new Error("helper exited"));
+      await exit.promise;
+      const events = await Array.fromAsync(session.streamHistory!());
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline",
+          item: expect.objectContaining({
+            type: "assistant_message",
+            text: "child history after reconnect",
+          }),
+        }),
+      );
+    } finally {
+      await session.close();
+    }
+    expect(bindSession).not.toHaveBeenCalled();
+    expect(unbindSession).not.toHaveBeenCalled();
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(first.releases).toBe(1);
+    expect(next.releases).toBe(1);
   });
 
   test("reconciles reconnect snapshots without replaying text or losing repeated chunks", async () => {
@@ -1356,12 +1514,12 @@ describe("OpenCode v2 session lifecycle", () => {
     }
   });
 
-  test("reuses the shared helper for sessions whose env is only agent identity", async () => {
+  test("shares the server for a launch environment, which reaches the session only", async () => {
     const harness = new V2Harness();
-    const acquires: Array<{ env?: Record<string, string>; dedicated?: boolean }> = [];
+    let acquisitions = 0;
     const runtime = {
-      acquire: async (input: { env?: Record<string, string>; dedicated?: boolean } = {}) => {
-        acquires.push(input);
+      acquire: async () => {
+        acquisitions += 1;
         return harness.connection;
       },
       shutdown: async () => undefined,
@@ -1369,46 +1527,32 @@ describe("OpenCode v2 session lifecycle", () => {
     const client = new OpenCodeV2AgentClient({ logger: createTestLogger(), runtime });
     const session = await client.createSession(
       { provider: "opencode", cwd: "/tmp/project" },
-      { agentId: "agent", env: { PASEO_AGENT_ID: "agent", PASEO_AGENT_CWD: "/tmp/project" } },
+      { agentId: "agent", env: { HUB_SECRET: "secret", PASEO_AGENT_ID: "agent" } },
     );
     try {
-      expect(acquires).toEqual([{}]);
+      expect(acquisitions).toBe(1);
       expect(harness.environments).toMatchObject([
-        {
-          sessionID: "session",
-          variables: { PASEO_AGENT_ID: "agent", PASEO_AGENT_CWD: "/tmp/project" },
-        },
+        { sessionID: "session", variables: { HUB_SECRET: "secret", PASEO_AGENT_ID: "agent" } },
       ]);
     } finally {
       await session.close();
     }
   });
 
-  test("starts a dedicated helper when the session carries custom MCP", async () => {
+  test("rejects MCP servers without the Paseo bridge before creating an OpenCode session", async () => {
     const harness = new V2Harness();
-    const acquires: Array<{ env?: Record<string, string>; dedicated?: boolean }> = [];
-    const runtime = {
-      acquire: async (input: { env?: Record<string, string>; dedicated?: boolean } = {}) => {
-        acquires.push(input);
-        return harness.connection;
-      },
-      shutdown: async () => undefined,
-    };
-    const client = new OpenCodeV2AgentClient({ logger: createTestLogger(), runtime });
-    const session = await client.createSession(
-      {
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    await expect(
+      client.createSession({
         provider: "opencode",
         cwd: "/tmp/project",
         mcpServers: { custom: { type: "stdio", command: "custom", args: [] } },
-      },
-      { agentId: "agent", env: { PASEO_AGENT_ID: "agent", PASEO_AGENT_CWD: "/tmp/project" } },
-    );
-    try {
-      expect(acquires).toHaveLength(1);
-      expect(acquires[0]?.dedicated).toBe(true);
-    } finally {
-      await session.close();
-    }
+      }),
+    ).rejects.toThrow("OpenCode MCP servers require the Paseo tool bridge");
+    expect(harness.creates).toEqual([]);
   });
 
   test("refuses replacement work after a failed stop until Stop succeeds", async () => {
