@@ -1,4 +1,4 @@
-import React, { act, createRef, type ReactNode } from "react";
+import React, { act, createRef, useCallback, useRef, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { within } from "@testing-library/dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -9,6 +9,7 @@ import { AssistantMessage, ExpandableBadge } from "@/components/message";
 import { createAssistantMessageExpansion } from "@/components/assistant-message-expansion/expansion";
 import { AssistantMessageExpansionContext } from "@/components/assistant-message-expansion/expansion-context";
 import { ASSISTANT_MESSAGE_RENDER_CHARACTER_LIMIT } from "@/components/assistant-message-render-limit";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { page, userEvent } from "vitest/browser";
 import { PlanCard } from "@/components/plan-card";
 import { MessagePreview } from "@/components/user-message";
@@ -16,6 +17,7 @@ import { createUserMessageExpansion } from "@/components/user-message/expansion"
 import { UserMessageExpansionContext } from "@/components/user-message/expansion-context";
 import { DisclosureRow } from "./disclosure";
 import type { DisclosureTriggerEdge, StreamViewportHandle } from "./strategy";
+import { useScrollToMessage } from "./use-scroll-to-message.web";
 
 // Load translations so the toggles expose their real accessible names.
 void testI18n;
@@ -382,4 +384,82 @@ describe("tool detail interaction", () => {
     await userEvent.keyboard("{Tab}");
     expect(document.activeElement).toBe(view().getByRole("button", { name: "Copy output" }));
   });
+});
+
+const reportJumpStyles = {
+  viewport: { height: 180, overflowY: "auto" },
+  lead: { height: 300 },
+  summary: { height: 40 },
+  first: { height: 160 },
+  second: { height: 100 },
+  trailing: { height: 500 },
+} as const;
+
+it("settles at the second report row after it mounts, independently of its summary", async () => {
+  const settled = vi.fn();
+  const signal = new AbortController().signal;
+  function Timeline() {
+    const scrollContainerRef = useRef<HTMLDivElement>(null);
+    const rowVirtualizer = useVirtualizer<HTMLElement, Element>({
+      count: 0,
+      getScrollElement: () => scrollContainerRef.current,
+      estimateSize: () => 100,
+    });
+    const [expanded, setExpanded] = React.useState(false);
+    const { scrollToMessage } = useScrollToMessage({
+      active: true,
+      scrollContainerRef,
+      rowVirtualizer,
+      historyVirtualized: [],
+      cancelPendingStickToBottom: () => {},
+      setFollowOutput: () => false,
+      onNearBottomChange: () => {},
+    });
+    const expand = useCallback(() => setExpanded(true), []);
+    const jumpToSecond = useCallback(
+      () => scrollToMessage("report-two", undefined, { signal, onSettled: settled }),
+      [scrollToMessage],
+    );
+    return (
+      <>
+        <button type="button" onClick={expand}>
+          Expand reports
+        </button>
+        <button type="button" onClick={jumpToSecond}>
+          Jump to second report
+        </button>
+        <div ref={scrollContainerRef} style={reportJumpStyles.viewport}>
+          <div style={reportJumpStyles.lead} />
+          <div data-message-id="report-summary" style={reportJumpStyles.summary}>
+            Report summary
+          </div>
+          {expanded && (
+            <>
+              <div data-message-id="report-one" style={reportJumpStyles.first}>
+                First report
+              </div>
+              <div data-message-id="report-two" style={reportJumpStyles.second}>
+                Second report
+              </div>
+            </>
+          )}
+          <div style={reportJumpStyles.trailing} />
+        </div>
+      </>
+    );
+  }
+
+  await act(async () => root.render(<Timeline />));
+  const jump = page.getByRole("button", { name: "Jump to second report" });
+  await jump.click();
+  expect(settled).not.toHaveBeenCalled();
+  await page.getByRole("button", { name: "Expand reports" }).click();
+  await jump.click();
+  await expect.poll(() => settled.mock.calls).toEqual([[true]]);
+
+  const row = container.querySelector('[data-message-id="report-two"]');
+  const scroll = row?.parentElement;
+  expect(row).toBeTruthy();
+  expect(scroll).toBeTruthy();
+  expect(row!.getBoundingClientRect().top - scroll!.getBoundingClientRect().top).toBeCloseTo(8);
 });

@@ -201,6 +201,8 @@ export interface AgentCapabilityFlags {
   defersPromptHandoff?: boolean;
   /** This session defers handoff only for starts requiring provider confirmation. */
   defersConfirmedPromptHandoff?: boolean;
+  /** Enforces peer authorization on a fresh turn before calling the handoff callback. */
+  supportsPeerReadOnlyTurn?: true;
   [capability: string]: boolean | undefined;
   supportsStreaming: boolean;
   supportsSessionPersistence: boolean;
@@ -231,6 +233,8 @@ export type AgentPromptContentBlock =
 export type AgentPromptInput = string | AgentPromptContentBlock[];
 
 export interface AgentRunOptions {
+  /** Internal authorization derived from the verified peer queue entry. */
+  turnAuthorization?: "peer-read-only";
   outputSchema?: unknown;
   resumeFrom?: AgentPersistenceHandle;
   maxThinkingTokens?: number;
@@ -243,6 +247,10 @@ export interface AgentRunOptions {
   beforeProviderDispatch?: () => Promise<void>;
   /** Synchronous final check for adapters that await handoff before sending. */
   assertProviderDispatchAllowed?: () => void;
+  /** Peer receipt boundary. Called synchronously immediately before submitting to the provider. */
+  onPeerPromptSubmitting?: () => void;
+  /** Explicit acknowledgement of that same submission, even if the sender stopped waiting. */
+  onPeerPromptAccepted?: () => void | Promise<void>;
 }
 
 export interface AgentSteerOptions extends AgentRunOptions {
@@ -614,6 +622,9 @@ export class AgentTurnStartCanceledError extends Error {
 
 /** The provider explicitly rejected the request before creating a turn. */
 export class AgentTurnStartRejectedError extends Error {}
+
+/** A peer turn cannot be attempted until the recipient is opened independently. */
+export class PeerRecipientNotReadyError extends AgentTurnStartRejectedError {}
 
 export interface AgentRunResult {
   sessionId: string;

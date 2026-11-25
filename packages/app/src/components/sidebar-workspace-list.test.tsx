@@ -41,6 +41,7 @@ import {
 import type { HostProfile } from "@/types/host-connection";
 import { useSessionStore, type WorkspaceDescriptor } from "@/stores/session-store";
 import { seedRuntimeWorkspaces } from "@/test/seed-session";
+import { useSidebarViewStore } from "@/stores/sidebar-view-store";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
 import { useWorkspaceFields } from "@/stores/session-store-hooks";
 import { useActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
@@ -257,7 +258,7 @@ function WorkspaceSelectionProbe({
 
 function SidebarFrameProbe({ counts }: { counts: RenderCounts }): ReactElement {
   counts.frame += 1;
-  const { projects } = useSidebarWorkspacesList({ hostFilters: [SERVER_ID] });
+  const { projects } = useSidebarWorkspacesList({ hostFilters: [SERVER_ID], groupMode: "project" });
 
   return (
     <>
@@ -668,4 +669,45 @@ describe("sidebar group visibility", () => {
     rerender({ expanded: false });
     expect(result.current.visibleItems).toHaveLength(20);
   });
+});
+
+it("uses project sorting when a stored topic preference is temporarily unavailable", async () => {
+  const prev = useSidebarViewStore.getState();
+  initializeSidebarState(createWorkspaces());
+  try {
+    act(() => {
+      useSidebarViewStore.setState({ groupMode: "topic", workspaceSort: "created" });
+      useSessionStore.getState().updateSessionServerInfo(SERVER_ID, {
+        serverId: SERVER_ID,
+        hostname: null,
+        version: null,
+        features: { workspaceSortTimes: true },
+      });
+      useSessionStore.getState().mergeWorkspaces(SERVER_ID, [
+        { ...createWorkspaces()[1]!, createdAt: new Date("2026-11-23T09:00:00Z") },
+        { ...createWorkspaces()[2]!, createdAt: new Date("2026-11-25T09:00:00Z") },
+      ]);
+    });
+    const { result, unmount } = renderHook(() =>
+      useSidebarWorkspacesList({
+        hostFilters: [SERVER_ID],
+        groupMode: "project",
+        enabled: false,
+      }),
+    );
+    const ids = result.current.projects[0]!.workspaces.map((item) => item.workspaceId);
+    expect(ids.indexOf("a-two")).toBeLessThan(ids.indexOf("a-one"));
+    expect(useSidebarViewStore.getState().groupMode).toBe("topic");
+    unmount();
+  } finally {
+    await act(async () => {
+      setHostProfiles([]);
+      useSessionStore.getState().clearSession(SERVER_ID);
+      useSidebarOrderStore.setState({ projectOrder: [] });
+      useSidebarViewStore.setState({
+        groupMode: prev.groupMode,
+        workspaceSort: prev.workspaceSort,
+      });
+    });
+  }
 });

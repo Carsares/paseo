@@ -49,7 +49,14 @@ export interface QueueHandoff {
   begin(): Promise<void>;
   holdAfterStop?(): Promise<void>;
   releaseAfterStop?(): Promise<void>;
+  rejectHeld?(
+    agentId: string,
+    messageId: string,
+    rejectReservation: (message: RecoverableAgentMessage) => Promise<boolean>,
+  ): Promise<boolean>;
   declined(): Promise<void>;
+  /** Continue dispatching from the same durable queue receipt after a declined attempt. */
+  retryQueued?(): Promise<void>;
   onProviderOutcome?(outcome: AgentCommandOutcome): Promise<void>;
 }
 export class AgentRequestOutcomeUnknownError extends Error {
@@ -130,11 +137,29 @@ export class MessageReceipts {
   ): Promise<"accepted" | "unknown" | "absent"> {
     const key = digest(["send", agentId, messageId]);
     const receipt = await readReceipt(path.join(this.directory, `${key}.json`));
-    if (!receipt) return "absent";
+    if (!receipt || receipt.agentId !== agentId) return "absent";
     if (expectedFingerprint !== undefined && receipt.fingerprint !== expectedFingerprint) {
       return "absent";
     }
     return receipt.state === "completed" ? "accepted" : "unknown";
+  }
+
+  /** Legacy peer history may identify the request by fingerprint, without its queue ID. */
+  async findCompletedFingerprints(candidates: ReadonlyMap<string, string>): Promise<Set<string>> {
+    const accepted = new Set<string>();
+    if (!candidates.size) return accepted;
+    const names = await readdir(this.directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const name of names) {
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+      const receipt = await readReceipt(path.join(this.directory, name)).catch(() => null);
+      if (receipt?.state === "completed" && candidates.get(receipt.fingerprint) === receipt.agentId)
+        accepted.add(receipt.fingerprint);
+      if (accepted.size === candidates.size) break;
+    }
+    return accepted;
   }
 
   send(input: SendMessageInput): Promise<void> {
@@ -230,23 +255,31 @@ export class MessageReceipts {
       const queued = existing?.queued ?? { message: input.message, sequence: ++this.sequence };
       let handedOff = false;
       let declinedAndRestored = false;
+      let heldRejectionCommitted = false;
       let providerOutcome: AgentCommandOutcome | undefined;
       const saveQueued = () => this.writeQueued(file, { ...receipt, state: "pending", queued });
       if (!existing) await saveQueued();
       let receiptWrites = Promise.resolve();
-      const write = (operation: () => Promise<void>) => {
+      const write = <T>(operation: () => Promise<T>): Promise<T> => {
         const pending = receiptWrites.then(operation);
-        receiptWrites = pending.catch(() => undefined);
+        receiptWrites = pending.then(
+          () => undefined,
+          () => undefined,
+        );
         return pending;
       };
+      const writeTerminalReceipt = () =>
+        writeJsonFileAtomic(file, { ...receipt, state: "pending" });
       const handoff: QueueHandoff = {
         holdAfterStop: () =>
           write(async () => {
+            if (heldRejectionCommitted) return;
             queued.message = { ...queued.message, heldAfterStop: true };
             if (!handedOff) await saveQueued();
           }),
         releaseAfterStop: () =>
           write(async () => {
+            if (heldRejectionCommitted) return;
             queued.message = {
               ...queued.message,
               heldAfterStop: undefined,
@@ -255,26 +288,61 @@ export class MessageReceipts {
             };
             if (!handedOff) await saveQueued();
           }),
+        rejectHeld: (agentId, messageId, rejectReservation) =>
+          write(async () => {
+            if (
+              heldRejectionCommitted ||
+              handedOff ||
+              providerOutcome ||
+              agentId !== receipt.agentId
+            )
+              return false;
+            const stored = await readReceipt(file);
+            if (
+              stored?.state !== "pending" ||
+              stored.agentId !== agentId ||
+              stored.fingerprint !== fingerprint ||
+              !stored.queued?.message.heldAfterStop ||
+              stored.queued.message.messageId !== messageId ||
+              digest(stored.queued) !== digest(queued)
+            )
+              return false;
+            if (!(await rejectReservation(stored.queued.message))) return false;
+            // Keep the queue recoverable until the reservation cleanup is durable.
+            await writeTerminalReceipt();
+            heldRejectionCommitted = true;
+            return true;
+          }),
         begin: () =>
           write(async () => {
+            if (heldRejectionCommitted) throw new Error("Queued recipient is no longer available");
             if (handedOff) return;
             declinedAndRestored = false;
-            await writeJsonFileAtomic(file, { ...receipt, state: "pending" });
+            await writeTerminalReceipt();
             handedOff = true;
           }),
         declined: () =>
           write(async () => {
-            if (!handedOff || providerOutcome === "unknown") return;
+            if (!handedOff || providerOutcome) return;
             await saveQueued();
             handedOff = false;
             declinedAndRestored = true;
           }),
+        retryQueued: () =>
+          write(async () => {
+            if (!handedOff) declinedAndRestored = false;
+          }),
         onProviderOutcome: (outcome: AgentCommandOutcome) =>
           write(async () => {
+            if (!handedOff || providerOutcome === "accepted") return;
+            if (outcome === "accepted") {
+              this.awaitingCommit.set(key, receipt);
+              await this.commit(file, key, receipt);
+            }
             providerOutcome = outcome;
             if (outcome === "unknown") {
               handedOff = true;
-              await writeJsonFileAtomic(file, { ...receipt, state: "pending" });
+              await writeTerminalReceipt();
             }
           }),
       };
@@ -283,16 +351,20 @@ export class MessageReceipts {
         input.onQueued?.(queuedDelivery);
         return {
           completed: queuedDelivery.dispatched.then(
-            async () => {
-              if (providerOutcome === "unknown") return;
-              this.awaitingCommit.set(key, receipt);
-              return this.commit(file, key, receipt);
-            },
+            () =>
+              write(async () => {
+                if (providerOutcome || heldRejectionCommitted) return;
+                this.awaitingCommit.set(key, receipt);
+                await this.commit(file, key, receipt);
+              }),
             async (error) => {
               if (input.retainOnError?.(error)) {
                 await handoff.declined();
-              } else if (!handedOff && !declinedAndRestored) {
-                await writeJsonFileAtomic(file, { ...receipt, state: "pending" });
+              } else {
+                await write(async () => {
+                  if (!handedOff && !declinedAndRestored && !heldRejectionCommitted)
+                    await writeTerminalReceipt();
+                });
               }
               throw error;
             },

@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import {
   AgentMessageAdmissionError,
   createAgentMessageDelivery,
@@ -258,6 +258,68 @@ test("persistent queue records an unknown provider outcome without replayable co
     }),
   ).rejects.toThrow("agent_request_outcome_unknown");
 });
+
+test.for(["unsent", "submitting", "unknown"] as const)(
+  "a held rejection checks durable queue ownership and serializes against handoff (%s)",
+  async (state) => {
+    const { requests } = await fixture();
+    const message = {
+      messageId: "original-message",
+      prompt: "queued prompt",
+      source: { agentId: "sender" },
+      activeTurnBehavior: "queue" as const,
+      unarchive: false,
+      heldAfterStop: true,
+    };
+    const checked = Promise.withResolvers<void>();
+    const persistReservation = Promise.withResolvers<void>();
+    const rejectReservation = vi.fn(async () => {
+      checked.resolve();
+      await persistReservation.promise;
+      return true;
+    });
+    const rejection = new Error("recipient archived");
+
+    await expect(
+      requests.sendQueued({
+        agentId: "recipient",
+        request: { prompt: message.prompt },
+        message,
+        async enqueue(handoff) {
+          const rejectHeld = handoff.rejectHeld!;
+          expect(await rejectHeld("another-recipient", message.messageId, rejectReservation)).toBe(
+            false,
+          );
+          expect(await rejectHeld("recipient", "different-message", rejectReservation)).toBe(false);
+          if (state !== "unsent") {
+            const begin = handoff.begin();
+            if (state === "unknown") await handoff.onProviderOutcome?.("unknown");
+            expect(await rejectHeld("recipient", message.messageId, rejectReservation)).toBe(false);
+            await begin;
+            await handoff.holdAfterStop?.();
+            expect(rejectReservation).not.toHaveBeenCalled();
+            expect(await requests.queuedMessages()).toEqual([]);
+          } else {
+            const first = rejectHeld("recipient", message.messageId, rejectReservation);
+            await checked.promise;
+            const repeated = rejectHeld("recipient", message.messageId, rejectReservation);
+            const stop = handoff.holdAfterStop?.();
+            expect(await requests.queuedMessages()).toMatchObject([{ queued: { message } }]);
+            persistReservation.resolve();
+            expect(await first).toBe(true);
+            expect(await repeated).toBe(false);
+            await stop;
+            await expect(handoff.begin()).rejects.toThrow("no longer available");
+            expect(rejectReservation).toHaveBeenCalledExactlyOnceWith(message);
+          }
+          return { dispatched: Promise.reject(rejection) };
+        },
+      }),
+    ).rejects.toBe(rejection);
+    expect(await requests.queuedMessages()).toEqual([]);
+    expect(await requests.outcome("recipient", message.messageId)).toBe("unknown");
+  },
+);
 
 test("direct persistent receipt leaves an unknown provider outcome pending", async () => {
   const { requests, directory } = await fixture();

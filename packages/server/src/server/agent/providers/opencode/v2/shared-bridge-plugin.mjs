@@ -255,7 +255,9 @@ export async function registerSharedBridge(context) {
             }
             await install(input);
             bindings.set(input.sessionID, { baseUrl: input.baseUrl, token: input.token });
-            return { features: { mcpTools: runsMcpTools } };
+            return {
+              features: { mcpTools: runsMcpTools, mcpToolPermissionResources: runsMcpTools },
+            };
           });
         updating = next;
         return await next;

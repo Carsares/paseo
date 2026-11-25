@@ -5,12 +5,15 @@ import pino from "pino";
 import { describe, expect, test, vi } from "vitest";
 
 import { AgentManager } from "../agent-manager.js";
+import { AgentRequestOutcomeUnknownError } from "../../message-receipts/index.js";
+import { AgentTurnStartRejectedError } from "../agent-sdk-types.js";
 import { toAgentPayload } from "../agent-projections.js";
 import { AgentStorage } from "../agent-storage.js";
 import { featuresFromControls } from "@getpaseo/protocol/option-controls";
 import { convertLegacyOptions } from "../option-controls.js";
 import type {
   AgentClient,
+  AgentPersistenceHandle,
   AgentSession,
   AgentSessionConfig,
   AgentStreamEvent,
@@ -140,7 +143,13 @@ function createConfig(overrides: Partial<AgentSessionConfig> = {}): AgentSession
 
 function createSessionHarness(
   configOverrides: Partial<AgentSessionConfig> = {},
-  options: { logger?: pino.Logger; models?: unknown[]; userAgent?: string } = {},
+  options: {
+    logger?: pino.Logger;
+    models?: unknown[];
+    userAgent?: string;
+    handlers?: Parameters<typeof createFakeCodexAppServer>[0];
+    resumeHandle?: AgentPersistenceHandle;
+  } = {},
 ): {
   session: CodexFeaturesTestSession;
   appServer: FakeCodexAppServer;
@@ -150,15 +159,273 @@ function createSessionHarness(
     initialize: () => ({ userAgent: options.userAgent ?? "codex/0.156.0" }),
     "collaborationMode/list": () => ({ data: TEST_COLLABORATION_MODES }),
     "model/list": () => ({ data: options.models ?? TEST_SPEED_MODELS }),
+    ...options.handlers,
   });
   const session = new CodexAppServerAgentSession(
     { ...config, provider: CODEX_PROVIDER },
-    null,
+    options.resumeHandle ?? null,
     options.logger ?? createTestLogger(),
     async () => appServer.child,
   ) as CodexFeaturesTestSession;
   return { session, appServer };
 }
+
+describe("read-only peer turns", () => {
+  const disabledFeatures = Object.fromEntries(
+    [
+      "shell_tool",
+      "unified_exec",
+      "worktrees",
+      "multi_agent",
+      "multi_agent_v2",
+      "apps",
+      "hooks",
+      "plugins",
+      "browser_use",
+      "browser_use_external",
+      "computer_use",
+      "image_generation",
+      "code_mode",
+      "network_proxy",
+      "request_permissions_tool",
+      "workspace_dependencies",
+      "goals",
+      "memories",
+    ].map((name) => [name, false]),
+  );
+
+  function turnStarts(appServer: FakeCodexAppServer) {
+    return appServer.requests().filter(({ method }) => method === "turn/start");
+  }
+
+  function createPeerSession(
+    handlers: NonNullable<Parameters<typeof createFakeCodexAppServer>[0]> = {},
+    userAgent?: string,
+    resumeHandle?: AgentPersistenceHandle,
+  ) {
+    return createSessionHarness(
+      {
+        modeId: "full-access",
+        providerOptions: { sandbox_mode: "danger-full-access", approval_policy: "on-request" },
+      },
+      {
+        userAgent,
+        resumeHandle,
+        handlers: {
+          "config/read": () => ({ config: { features: disabledFeatures } }),
+          "thread/start": () => ({
+            thread: { id: "thread-1" },
+            sandbox: { type: "dangerFullAccess" },
+            approvalPolicy: "on-request",
+            approvalsReviewer: "user",
+          }),
+          "thread/loaded/list": () => ({ data: ["thread-1"] }),
+          "thread/read": () => ({
+            thread: { id: "thread-1", status: { type: "idle" }, turns: [] },
+          }),
+          "experimentalFeature/list": (params) => {
+            expect(params).toEqual({ threadId: "thread-1" });
+            return {
+              data: Object.entries(disabledFeatures).map(([name, enabled]) => ({ name, enabled })),
+              nextCursor: null,
+            };
+          },
+          "mcpServerStatus/list": () => ({ data: [], nextCursor: null }),
+          "thread/goal/get": () => ({ goal: null }),
+          ...handlers,
+        },
+      },
+    );
+  }
+
+  async function completeTurn(session: AgentSession, appServer: FakeCodexAppServer) {
+    const finished = Promise.withResolvers<void>();
+    const unsubscribe = session.subscribe((event) => {
+      if (event.type === "turn_completed") finished.resolve();
+    });
+    try {
+      appServer.startsTurn({ threadId: "thread-1" });
+      appServer.completeTurn();
+      await finished.promise;
+    } finally {
+      unsubscribe();
+    }
+  }
+
+  async function openThread(session: AgentSession, appServer: FakeCodexAppServer) {
+    await session.startTurn("Open the workspace");
+    await completeTurn(session, appServer);
+  }
+
+  test("uses native read-only policy for a new peer turn and restores the human policy", async () => {
+    const { session, appServer } = createPeerSession();
+    const callbacks: Array<[string, number]> = [];
+    const handoff = vi.fn(async () => {
+      callbacks.push(["prepare receipt", turnStarts(appServer).length]);
+    });
+    const submitting = vi.fn(() => {
+      callbacks.push(["submit", turnStarts(appServer).length]);
+    });
+    const accepted = vi.fn(() => {
+      callbacks.push(["accepted", turnStarts(appServer).length]);
+    });
+    try {
+      await openThread(session, appServer);
+      await session.startTurn("Inspect the current design", {
+        turnAuthorization: "peer-read-only",
+        beforeProviderDispatch: handoff,
+        onPeerPromptSubmitting: submitting,
+        onPeerPromptAccepted: accepted,
+      });
+      expect(turnStarts(appServer)[1]?.params).toMatchObject({
+        sandboxPolicy: { type: "readOnly", networkAccess: false },
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+      });
+      expect(callbacks).toEqual([
+        ["prepare receipt", 1],
+        ["submit", 1],
+        ["accepted", 2],
+      ]);
+      const opened = appServer.requests().find(({ method }) => method === "thread/start");
+      expect(opened?.params).toMatchObject({ config: { features: disabledFeatures } });
+      expect(await session.getCurrentMode()).toBe("full-access");
+      await completeTurn(session, appServer);
+      await session.startTurn("Continue my task");
+      const starts = turnStarts(appServer);
+      expect(starts).toHaveLength(3);
+      expect(starts[2]?.params).toMatchObject({
+        sandboxPolicy: { type: "dangerFullAccess" },
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+      });
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("a peer turn never opens a disconnected persisted Codex thread", async () => {
+    const { session, appServer } = createPeerSession({}, undefined, {
+      provider: CODEX_PROVIDER,
+      sessionId: "thread-1",
+    });
+    const handoff = vi.fn();
+    try {
+      await expect(
+        session.startTurn("Inspect the current design", {
+          turnAuthorization: "peer-read-only",
+          beforeProviderDispatch: handoff,
+        }),
+      ).rejects.toThrow("Open the native Codex thread");
+      expect(appServer.requests()).toEqual([]);
+      expect(handoff).not.toHaveBeenCalled();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("a peer turn never resumes a thread that the native server no longer has loaded", async () => {
+    let loaded = true;
+    const { session, appServer } = createPeerSession({
+      "thread/loaded/list": () => ({ data: loaded ? ["thread-1"] : [] }),
+    });
+    const handoff = vi.fn();
+    try {
+      await openThread(session, appServer);
+      loaded = false;
+      const requestsBeforePeer = appServer.requests().length;
+      await expect(
+        session.startTurn("Inspect the current design", {
+          turnAuthorization: "peer-read-only",
+          beforeProviderDispatch: handoff,
+        }),
+      ).rejects.toThrow("Open the native Codex thread");
+      const peerMethods = appServer
+        .requests()
+        .slice(requestsBeforePeer)
+        .map(({ method }) => method);
+      expect(peerMethods).toContain("thread/loaded/list");
+      expect(peerMethods).not.toContain("thread/resume");
+      expect(peerMethods).not.toContain("thread/unarchive");
+      expect(peerMethods).not.toContain("thread/start");
+      expect(peerMethods).not.toContain("turn/start");
+      expect(handoff).not.toHaveBeenCalled();
+    } finally {
+      await session.close();
+    }
+  });
+
+  test.each([
+    ["legacy server", {}, "codex/0.155.0"],
+    ["unconstrained thread config", { "config/read": () => ({ config: {} }) }],
+    ["external MCP", { "mcpServerStatus/list": () => ({ data: [{ name: "other" }] }) }],
+    [
+      "native shell",
+      {
+        "experimentalFeature/list": () => ({
+          data: [
+            { name: "shell_tool", enabled: true },
+            { name: "unified_exec", enabled: false },
+          ],
+        }),
+      },
+    ],
+    [
+      "active native turn",
+      {
+        "thread/read": () => ({ thread: { id: "thread-1", status: { type: "active" } } }),
+      },
+    ],
+    [
+      "active background terminal",
+      {
+        "thread/backgroundTerminals/list": () => ({ data: [{}], nextCursor: null }),
+      },
+    ],
+  ] as const)("rejects %s before peer handoff", async (_case, handlers, userAgent?) => {
+    const { session, appServer } = createPeerSession(handlers, userAgent);
+    const handoff = vi.fn();
+    try {
+      await openThread(session, appServer);
+      await expect(
+        session.startTurn("Inspect the current design", {
+          turnAuthorization: "peer-read-only",
+          beforeProviderDispatch: handoff,
+        }),
+      ).rejects.toThrow("Codex cannot start a read-only peer turn");
+      expect(handoff).not.toHaveBeenCalled();
+      expect(turnStarts(appServer)).toHaveLength(1);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test.each([
+    [-32602, AgentTurnStartRejectedError],
+    [-32603, AgentRequestOutcomeUnknownError],
+  ] as const)("classifies native start error %s after peer handoff", async (code, expected) => {
+    const { session, appServer } = createPeerSession({
+      "turn/start": (params) =>
+        (params.sandboxPolicy as { type?: string } | undefined)?.type === "readOnly"
+          ? { __jsonRpcError: { code, message: "Start failed" } }
+          : { turn: { id: "turn-1" } },
+    });
+    const handoff = vi.fn();
+    try {
+      await openThread(session, appServer);
+      await expect(
+        session.startTurn("Inspect the current design", {
+          turnAuthorization: "peer-read-only",
+          beforeProviderDispatch: handoff,
+        }),
+      ).rejects.toThrow(expected);
+      expect(handoff).toHaveBeenCalledOnce();
+      expect(turnStarts(appServer)).toHaveLength(2);
+    } finally {
+      await session.close();
+    }
+  });
+});
 
 async function createConnectedSession(
   configOverrides: Partial<AgentSessionConfig> = {},

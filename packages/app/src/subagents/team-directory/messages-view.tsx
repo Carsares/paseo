@@ -10,10 +10,7 @@ import { PressHighlight } from "@/components/ui/press-highlight";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative } from "@/constants/platform";
 import { DurableItemCard } from "@/durable-items/card";
-import {
-  useTopicInboxReadStore,
-  type MarkAllInboxReadSnapshot,
-} from "@/stores/topic-inbox-read-store";
+import { useTopicInboxReadStore } from "@/stores/topic-inbox-read-store";
 import type { Theme } from "@/styles/theme";
 import type { SidebarStateBucket } from "@/utils/sidebar-agent-state";
 import { getStatusDotColor } from "@/utils/status-dot-color";
@@ -75,21 +72,47 @@ export const DirectoryMessagesView = memo(function DirectoryMessagesView({
       .finally(() => setFlushingInbox(false));
   }, [client, flushingInbox, mainAgentId]);
 
-  const handleMarkAllRead = useCallback(
-    (snapshot: MarkAllInboxReadSnapshot, hasUnreadMainConclusion: boolean) => {
-      markAllRead(readScopeKey, snapshot);
-      if (hasUnreadMainConclusion && client) {
-        void client.clearWorkspaceAttention?.(workspaceId)?.catch(() => undefined);
-      }
+  const clearConclusionAttention = useCallback(
+    (item: TeamInboxMessageItem) => {
+      if (
+        item.isRead ||
+        !item.conclusionAttentionTimestamp ||
+        !mainAgentId ||
+        item.targetAgentId !== mainAgentId ||
+        !client
+      )
+        return;
+      void client
+        .clearTeamConclusionAttention(mainAgentId, {
+          workspaceId,
+          attentionTimestamp: item.conclusionAttentionTimestamp,
+        })
+        .catch(() => undefined);
     },
-    [client, markAllRead, readScopeKey, workspaceId],
+    [client, mainAgentId, workspaceId],
   );
 
   const hasMarkableUnread = (projection.markAllSnapshot.itemIds?.length ?? 0) > 0;
-  const hasUnreadMainConclusion = projection.unread.some((item) => item.kind === "main_conclusion");
   const onMarkAllPress = useCallback(() => {
-    handleMarkAllRead(projection.markAllSnapshot, hasUnreadMainConclusion);
-  }, [handleMarkAllRead, hasUnreadMainConclusion, projection.markAllSnapshot]);
+    markAllRead(readScopeKey, projection.markAllSnapshot);
+    const conclusion = projection.unread.find((item) => item.kind === "main_conclusion");
+    if (conclusion) clearConclusionAttention(conclusion);
+  }, [
+    clearConclusionAttention,
+    markAllRead,
+    projection.markAllSnapshot,
+    projection.unread,
+    readScopeKey,
+  ]);
+
+  const handleMarkSingleRead = useCallback(
+    (item: TeamInboxMessageItem) => {
+      if (item.isRead || !item.readCandidate) return;
+      markItemRead(readScopeKey, item.readCandidate.id, item.mainConclusionSnapshot);
+      clearConclusionAttention(item);
+    },
+    [clearConclusionAttention, markItemRead, readScopeKey],
+  );
 
   const handleSelectItem = useCallback(
     (item: TeamInboxMessageItem) => {
@@ -97,35 +120,18 @@ export const DirectoryMessagesView = memo(function DirectoryMessagesView({
         setExpandedDurableId((current) => (current === item.id ? null : item.id));
         return;
       }
-      if (item.readCandidate) {
-        markItemRead(readScopeKey, item.readCandidate.id, item.mainConclusionSnapshot);
-      }
-      if (item.kind === "main_conclusion" && client) {
-        void client.clearWorkspaceAttention?.(workspaceId)?.catch(() => undefined);
-      }
-      if (item.targetAgentId) {
-        onFocusAgentById(item.targetAgentId);
-      }
+      handleMarkSingleRead(item);
       if (item.jumpTarget) {
         jumpStore?.requestJump({
           serverId,
           ...item.jumpTarget,
         });
       }
-    },
-    [client, jumpStore, markItemRead, onFocusAgentById, readScopeKey, serverId, workspaceId],
-  );
-
-  const handleMarkSingleRead = useCallback(
-    (item: TeamInboxMessageItem) => {
-      if (item.readCandidate) {
-        markItemRead(readScopeKey, item.readCandidate.id, item.mainConclusionSnapshot);
-      }
-      if (item.kind === "main_conclusion" && client) {
-        void client.clearWorkspaceAttention?.(workspaceId)?.catch(() => undefined);
+      if (item.targetAgentId) {
+        onFocusAgentById(item.targetAgentId);
       }
     },
-    [client, markItemRead, readScopeKey, workspaceId],
+    [handleMarkSingleRead, jumpStore, onFocusAgentById, serverId],
   );
 
   if (projection.unread.length === 0 && projection.read.length === 0) {

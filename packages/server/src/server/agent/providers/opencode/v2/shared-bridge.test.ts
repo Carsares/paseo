@@ -4,12 +4,14 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { OpenCode } from "@opencode/client";
 import { expect, test } from "vitest";
 import { z } from "zod";
 import { createTestLogger } from "../../../../../test-utils/test-logger.js";
 import { OpenCodeBridge } from "../bridge.js";
 import { V2Harness } from "../test-utils/v2-harness.js";
 import { OpenCodeV2AgentClient } from "./agent.js";
+import { bridgeBindings, requireMcpPermissionResources } from "./shared-service.js";
 
 interface Binding {
   sessionID: string;
@@ -38,7 +40,50 @@ interface TestContext {
 }
 
 // The fake OpenCode context has no permission service, as on OpenCode before 2.0.29.
-const BOUND_WITHOUT_MCP = { features: { mcpTools: false } };
+const BOUND_WITHOUT_MCP = { features: { mcpTools: false, mcpToolPermissionResources: false } };
+
+test("external bridge requires per-tool permission resources only for preapproved sessions", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "paseo-shared-bridge-capabilities-"));
+  const bridge = new OpenCodeBridge({ paseoHome: home, logger: createTestLogger() });
+  let features: { mcpTools: boolean; mcpToolPermissionResources?: boolean } = {
+    mcpTools: true,
+  };
+  const client = OpenCode.make({
+    baseUrl: "http://localhost:1",
+    fetch: async (request) => {
+      if (new URL(request instanceof Request ? request.url : request).pathname.includes("/rpc"))
+        return Response.json({ output: { features } });
+      return Response.json(
+        await new V2Harness().api.plugin.list({ location: { directory: home } }),
+      );
+    },
+  });
+  try {
+    await bridge.start();
+    bridge.bindSession({
+      sessionId: "with-mcp",
+      scoped: true,
+      env: {},
+      mcp: {
+        tools: [{ name: "local_read", description: "Read", inputSchema: { type: "object" } }],
+        instructions: undefined,
+        execute: async () => ({ content: [] }),
+      },
+    });
+    const { bindSession } = bridgeBindings(client, bridge);
+    await expect(bindSession("with-mcp", home)).resolves.toBeUndefined();
+    const release = requireMcpPermissionResources(bridge, "with-mcp");
+    await expect(bindSession("with-mcp", home)).rejects.toThrow("Update the Paseo OpenCode plugin");
+    features = { mcpTools: true, mcpToolPermissionResources: true };
+    await expect(bindSession("with-mcp", home)).resolves.toBeUndefined();
+    release();
+    features = { mcpTools: true };
+    await expect(bindSession("with-mcp", home)).resolves.toBeUndefined();
+  } finally {
+    await bridge.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
 
 test("a shared plugin binds restored Paseo sessions without involving unrelated sessions", async () => {
   const home = await mkdtemp(path.join(tmpdir(), "paseo-shared-bridge-"));
@@ -544,7 +589,7 @@ test("a shared plugin gives each session its own MCP tools behind OpenCode's per
     });
     for (const sessionID of ["a", "b"])
       await expect(rpc.bind({ sessionID, ...bridge.sharedV2Connection() })).resolves.toEqual({
-        features: { mcpTools: true },
+        features: { mcpTools: true, mcpToolPermissionResources: true },
       });
     const requestFor = async (sessionID: string) => {
       const input = {

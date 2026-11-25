@@ -1,4 +1,5 @@
 import { promises as fs, type Dirent } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
 import type { Logger } from "pino";
@@ -14,7 +15,7 @@ import {
   AgentLimitContinuationSchema,
   type AgentLimitContinuation,
 } from "../workspace-deferral/continuation-state.js";
-import { writeJsonFileAtomic } from "../atomic-file.js";
+import { writeFileAtomic, writeJsonFileAtomic } from "../atomic-file.js";
 import {
   AgentFeatureSchema,
   AgentMetricSchema,
@@ -203,13 +204,40 @@ function activeMainWorkspaceId(record: StoredAgentRecord | undefined): string | 
   return undefined;
 }
 
+const DELETE_INTENT = "paseo-agent-delete-v1\n";
+const DELETE_INTENT_FILENAME = /^\.delete-[a-f0-9]{64}\.intent$/;
+
+function isMissingFile(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+async function syncPath(filePath: string, flags: "r" | "r+" = "r"): Promise<void> {
+  const handle = await fs.open(filePath, flags);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+export class SideChatDeleteRefusedError extends Error {}
+
+interface AgentDeleteOptions {
+  onlyIfEmptySideChat?: () => boolean;
+  prepare?: () => Promise<void>;
+}
+
 export class AgentStorage {
   readonly timelinePrefixes: TimelinePrefixStore;
   private cache: Map<string, StoredAgentRecord> = new Map();
   private pathById: Map<string, string> = new Map();
   private pathsById: Map<string, Set<string>> = new Map();
   private pendingWrites: Map<string, Promise<void>> = new Map();
+  private readonly pendingDeletes = new Map<string, Promise<void>>();
   private deleting: Set<string> = new Set();
+  private readonly deleteIntents = new Set<string>();
+  private registryScanComplete = true;
+  private readonly unreadableRecordIds = new Set<string>();
   private readonly sideChatInitialPrompts = new Map<string, number>();
   private daemonAgentIdsByExecution: Map<string, string> = new Map();
   private daemonExecutionKeysByAgentId: Map<string, string> = new Map();
@@ -366,6 +394,30 @@ export class AgentStorage {
     return this.cache.get(agentId) ?? null;
   }
 
+  async hasDeletedAgent(agentId: string): Promise<boolean> {
+    await this.load();
+    if (
+      !this.registryScanComplete ||
+      this.cache.has(agentId) ||
+      this.unreadableRecordIds.has(agentId)
+    )
+      return false;
+    const name = this.deleteIntentName(agentId);
+    if (!this.deleteIntents.has(name)) return false;
+    try {
+      const marker = await fs.readFile(path.join(this.baseDir, name), "utf8");
+      return (
+        marker === DELETE_INTENT &&
+        this.deleteIntents.has(name) &&
+        !this.cache.has(agentId) &&
+        !this.pendingWrites.has(agentId)
+      );
+    } catch (error) {
+      if (!isMissingFile(error)) throw error;
+      return false;
+    }
+  }
+
   async listByProviderSession(
     provider: string,
     providerHandleId: string,
@@ -389,9 +441,10 @@ export class AgentStorage {
     return agentId ? (this.cache.get(agentId) ?? null) : null;
   }
 
-  async upsert(record: StoredAgentRecord): Promise<void> {
+  async upsert(record: StoredAgentRecord, options?: { requireWritable?: boolean }): Promise<void> {
     await this.load();
-    await this.queueRecordWrite(record);
+    if (options?.requireWritable) await this.recheckDeleteBeforeWrite(record.id);
+    await this.queueRecordWrite(record, options?.requireWritable);
   }
 
   async updateLimitContinuation(
@@ -435,21 +488,30 @@ export class AgentStorage {
     );
   }
 
-  private queueRecordWrite(record: StoredAgentRecord): Promise<void> {
-    return this.queueRecordMutation(record.id, (existing) => ({
-      ...record,
-      limitContinuation: existing?.limitContinuation,
-      ...(existing?.confirmedRewinds && { confirmedRewinds: existing.confirmedRewinds }),
-    }));
+  private queueRecordWrite(record: StoredAgentRecord, requireWritable?: boolean): Promise<void> {
+    return this.queueRecordMutation(
+      record.id,
+      (existing) => ({
+        ...record,
+        limitContinuation: existing?.limitContinuation,
+        ...(existing?.confirmedRewinds && { confirmedRewinds: existing.confirmedRewinds }),
+      }),
+      requireWritable,
+    );
   }
 
   private queueRecordMutation(
     agentId: string,
     mutate: (existing: StoredAgentRecord | null) => StoredAgentRecord | null,
+    requireWritable = false,
   ): Promise<void> {
+    if (this.deleting.has(agentId)) {
+      return requireWritable ? Promise.reject(this.deleteBlockedWrite(agentId)) : Promise.resolve();
+    }
     const prev = this.pendingWrites.get(agentId) ?? Promise.resolve();
     const next = prev.then(async () => {
       if (this.deleting.has(agentId)) {
+        if (requireWritable) throw this.deleteBlockedWrite(agentId);
         return undefined;
       }
 
@@ -484,11 +546,18 @@ export class AgentStorage {
     return tracked;
   }
 
+  private deleteBlockedWrite(agentId: string): Error {
+    return new Error(
+      `Could not update agent ${agentId} during or after deletion. Refresh and retry.`,
+    );
+  }
+
   private async writeRecord(record: StoredAgentRecord): Promise<void> {
     const agentId = record.id;
     const nextPath = this.buildRecordPath(record);
     const previousPath = this.pathById.get(agentId);
 
+    await this.clearDeleteIntent(agentId);
     await writeJsonFileAtomic(nextPath, record);
     this.addIndexedPath(agentId, nextPath);
 
@@ -503,10 +572,11 @@ export class AgentStorage {
         if (previous.dev !== next.dev || previous.ino !== next.ino) {
           await fs.unlink(previousPath);
         }
-      } catch {
-        // ignore cleanup errors
+        this.removeIndexedPath(agentId, previousPath);
+      } catch (error) {
+        // Keep an unsuccessfully removed copy in the set that an explicit delete must remove.
+        if (isMissingFile(error)) this.removeIndexedPath(agentId, previousPath);
       }
-      this.removeIndexedPath(agentId, previousPath);
     }
 
     const previousMainWorkspaceId = activeMainWorkspaceId(this.cache.get(agentId));
@@ -516,8 +586,26 @@ export class AgentStorage {
     this.publishMainWorkspaceChange(previousMainWorkspaceId, activeMainWorkspaceId(record));
   }
 
-  beginDelete(agentId: string): void {
-    this.deleting.add(agentId);
+  private deleteIntentName(agentId: string): string {
+    return `.delete-${createHash("sha256").update(agentId).digest("hex")}.intent`;
+  }
+
+  private async persistDeleteIntent(agentId: string): Promise<void> {
+    const name = this.deleteIntentName(agentId);
+    const filePath = path.join(this.baseDir, name);
+    await writeFileAtomic(filePath, DELETE_INTENT);
+    this.deleteIntents.add(name);
+    await syncPath(filePath, "r+");
+    if (process.platform !== "win32") await syncPath(this.baseDir);
+  }
+
+  private async clearDeleteIntent(agentId: string): Promise<void> {
+    if (!this.deleteIntents.size) return;
+    const name = this.deleteIntentName(agentId);
+    if (!this.deleteIntents.has(name)) return;
+    await fs.rm(path.join(this.baseDir, name), { force: true });
+    if (process.platform !== "win32") await syncPath(this.baseDir);
+    this.deleteIntents.delete(name);
   }
 
   reserveSideChatInitialPrompt(agentId: string): () => void {
@@ -540,8 +628,10 @@ export class AgentStorage {
     if (!accepted) throw new Error("The side chat is no longer available.");
   }
 
-  async beginEmptySideChatDelete(agentId: string, hasLivePrompt: () => boolean): Promise<boolean> {
-    await this.load();
+  private async beginEmptySideChatDelete(
+    agentId: string,
+    hasLivePrompt: () => boolean,
+  ): Promise<boolean> {
     let deleting = false;
     await this.queueRecordMutation(agentId, (record) => {
       if (
@@ -555,7 +645,7 @@ export class AgentStorage {
         !hasLivePrompt()
       ) {
         // Set the fence while holding the same write queue that accepts prompts.
-        this.beginDelete(agentId);
+        this.deleting.add(agentId);
         deleting = true;
       }
       return null;
@@ -563,28 +653,138 @@ export class AgentStorage {
     return deleting;
   }
 
-  async remove(agentId: string): Promise<void> {
+  async remove(agentId: string, options?: AgentDeleteOptions): Promise<void> {
     await this.load();
-    this.beginDelete(agentId);
-    await (this.pendingWrites.get(agentId) ?? Promise.resolve());
-    await this.timelinePrefixes.delete(agentId);
-    const paths = Array.from(this.pathsById.get(agentId) ?? []);
-    await Promise.all(
-      paths.map(async (filePath) => {
-        try {
-          await fs.unlink(filePath);
-        } catch (error) {
-          const code = (error as NodeJS.ErrnoException).code;
-          if (code && code !== "ENOENT") {
-            this.logger.warn(
-              { err: error, agentId, filePath },
-              "Failed to remove agent record file",
-            );
-          }
-        }
-      }),
-    );
+    await this.serializeDelete(agentId, () => this.removeOnce(agentId, options));
+  }
 
+  private async serializeDelete(agentId: string, run: () => Promise<void>): Promise<void> {
+    const previous = this.pendingDeletes.get(agentId) ?? Promise.resolve();
+    const removal = previous.catch(() => undefined).then(run);
+    this.pendingDeletes.set(agentId, removal);
+    try {
+      await removal;
+    } finally {
+      if (this.pendingDeletes.get(agentId) === removal) this.pendingDeletes.delete(agentId);
+    }
+  }
+
+  private async recheckDeleteBeforeWrite(agentId: string): Promise<void> {
+    // A delete may be waiting for the same lifecycle operation that is writing.
+    // Only recheck a previous failure. The write queue checks the fence again.
+    if (
+      this.deleting.has(agentId) &&
+      !this.pendingDeletes.has(agentId) &&
+      this.pathsById.has(agentId)
+    ) {
+      await this.serializeDelete(agentId, () => this.restoreAfterFailedDelete(agentId));
+    }
+  }
+
+  private async removeOnce(agentId: string, options?: AgentDeleteOptions): Promise<void> {
+    if (options?.onlyIfEmptySideChat) {
+      // A previous delete can leave writes blocked while its snapshots are unreadable.
+      if (this.deleting.has(agentId) && this.pathsById.has(agentId)) {
+        await this.restoreAfterFailedDelete(agentId);
+        if (this.deleting.has(agentId) && this.pathsById.has(agentId)) {
+          throw new Error("Could not verify the stored side chat after an incomplete delete");
+        }
+      }
+      if (!(await this.beginEmptySideChatDelete(agentId, options.onlyIfEmptySideChat)))
+        throw new SideChatDeleteRefusedError("This side chat cannot be discarded.");
+    } else {
+      this.deleting.add(agentId);
+    }
+
+    try {
+      await options?.prepare?.();
+      await this.pendingWrites.get(agentId);
+      await this.removeRecordFiles(agentId);
+    } catch (error) {
+      try {
+        await this.restoreAfterFailedDelete(agentId);
+      } catch (recoveryError) {
+        this.logger.warn(
+          { err: recoveryError, agentId },
+          "Failed to recover agent after incomplete delete",
+        );
+      }
+      throw error;
+    }
+
+    this.forgetDeletedAgent(agentId);
+    try {
+      await this.timelinePrefixes.delete(agentId);
+    } catch (error) {
+      this.logger.warn({ err: error, agentId }, "Failed to remove deleted agent timeline prefix");
+    }
+  }
+
+  private async removeRecordFiles(agentId: string): Promise<void> {
+    const paths = Array.from(this.pathsById.get(agentId) ?? []);
+    // Keep the record of the user's delete as long as its ID is retired. A later
+    // snapshot for that ID clears it. A plan alone cannot prove all copies are gone.
+    if (paths.length) await this.persistDeleteIntent(agentId);
+    // Keep the current snapshot until every other indexed copy is gone.
+    const current = this.pathById.get(agentId);
+    const unlinks = await Promise.allSettled(
+      paths
+        .filter((filePath) => filePath !== current)
+        .map((filePath) => this.unlinkRecord(agentId, filePath)),
+    );
+    const failed = unlinks.find((result) => result.status === "rejected");
+    if (failed) throw failed.reason;
+    if (current) await this.unlinkRecord(agentId, current);
+  }
+
+  private async unlinkRecord(agentId: string, filePath: string): Promise<void> {
+    try {
+      await fs.unlink(filePath);
+    } catch (error) {
+      if (!isMissingFile(error)) {
+        this.logger.warn({ err: error, agentId, filePath }, "Failed to remove agent record file");
+        throw error;
+      }
+    }
+    this.removeIndexedPath(agentId, filePath);
+  }
+
+  private async restoreAfterFailedDelete(agentId: string): Promise<void> {
+    // Preparation can fail before the flush finishes. Keep the fence until the
+    // existing write settles and the remaining records can be checked on disk.
+    await this.waitForPendingWrite(agentId);
+    const current = this.pathById.get(agentId);
+    const paths = Array.from(this.pathsById.get(agentId) ?? []);
+    let survivor: string | undefined;
+    for (const filePath of paths) {
+      try {
+        const record = parseStoredAgentRecord(JSON.parse(await fs.readFile(filePath, "utf8")));
+        if (record.id === agentId && (!survivor || filePath === current)) survivor = filePath;
+      } catch (error) {
+        if (isMissingFile(error)) this.removeIndexedPath(agentId, filePath);
+        else
+          this.logger.warn(
+            { err: error, agentId, filePath },
+            "Could not verify remaining agent snapshot",
+          );
+      }
+    }
+    if (!survivor) {
+      if (!this.pathsById.has(agentId)) this.forgetDeletedAgent(agentId);
+      return;
+    }
+
+    this.pathById.set(agentId, survivor);
+    try {
+      await this.clearDeleteIntent(agentId);
+    } finally {
+      // A verified snapshot wins over an intent. If its cleanup failed, the next
+      // write will retry clearing it before replacing the snapshot.
+      this.deleting.delete(agentId);
+    }
+  }
+
+  private forgetDeletedAgent(agentId: string): void {
     const workspaceId = this.workspaceById.get(agentId);
     this.workspaceById.delete(agentId);
     this.promptTimeByAgent.delete(agentId);
@@ -606,11 +806,13 @@ export class AgentStorage {
     options?: {
       title?: string | null;
       internal?: boolean;
+      requireWritable?: boolean;
       timelinePrefixSwitchId?: string | null;
       confirmedRewind?: ConfirmedRewind;
     },
   ): Promise<void> {
     await this.load();
+    if (options?.requireWritable) await this.recheckDeleteBeforeWrite(agent.id);
     const hasTitleOverride =
       options !== undefined && Object.prototype.hasOwnProperty.call(options, "title");
     const hasInternalOverride =
@@ -619,30 +821,34 @@ export class AgentStorage {
     const titleOverride = options?.title ?? null;
     const internalOverride = options?.internal;
     const confirmed = options?.confirmedRewind;
-    await this.queueRecordMutation(agent.id, (existing) => {
-      if (switchId !== undefined && !existing) {
-        throw new Error(`Agent ${agent.id} disappeared during provider switch`);
-      }
-      const record = toStoredAgentRecord(agent, {
-        title: hasTitleOverride ? titleOverride : (existing?.title ?? null),
-        createdAt: existing?.createdAt,
-        internal: hasInternalOverride ? internalOverride : (agent.internal ?? existing?.internal),
-      });
-      record.mainControlSystemPrompt = agent.mainControlSystemPrompt;
-      if (confirmed) record.confirmedRewinds = appendConfirmedRewind(agent, existing, confirmed);
+    await this.queueRecordMutation(
+      agent.id,
+      (existing) => {
+        if (switchId !== undefined && !existing) {
+          throw new Error(`Agent ${agent.id} disappeared during provider switch`);
+        }
+        const record = toStoredAgentRecord(agent, {
+          title: hasTitleOverride ? titleOverride : (existing?.title ?? null),
+          createdAt: existing?.createdAt,
+          internal: hasInternalOverride ? internalOverride : (agent.internal ?? existing?.internal),
+        });
+        record.mainControlSystemPrompt = agent.mainControlSystemPrompt;
+        if (confirmed) record.confirmedRewinds = appendConfirmedRewind(agent, existing, confirmed);
 
-      // Preserve soft-delete/archive status across snapshot flushes. The
-      // projection runs inside the per-agent write queue so it cannot commit a
-      // stale pre-archive record after the archive mutation.
-      record.archivedAt = existing?.archivedAt;
-      record.timelinePrefixSwitchId =
-        switchId === undefined ? existing?.timelinePrefixSwitchId : switchId;
-      // Background is fixed at creation; a runtime opened without it cannot clear it.
-      if (existing?.background) record.background = true;
-      record.resumeOnStartup =
-        existing?.resumeOnStartup && agent.lifecycle !== "idle" && agent.lifecycle !== "error";
-      return record;
-    });
+        // Preserve soft-delete/archive status across snapshot flushes. The
+        // projection runs inside the per-agent write queue so it cannot commit a
+        // stale pre-archive record after the archive mutation.
+        record.archivedAt = existing?.archivedAt;
+        record.timelinePrefixSwitchId =
+          switchId === undefined ? existing?.timelinePrefixSwitchId : switchId;
+        // Background is fixed at creation; a runtime opened without it cannot clear it.
+        if (existing?.background) record.background = true;
+        record.resumeOnStartup =
+          existing?.resumeOnStartup && agent.lifecycle !== "idle" && agent.lifecycle !== "error";
+        return record;
+      },
+      options?.requireWritable,
+    );
     if (confirmed && !this.cache.get(agent.id)?.confirmedRewinds?.includes(confirmed)) {
       throw new Error("Could not persist conversation rewind confirmation");
     }
@@ -655,7 +861,7 @@ export class AgentStorage {
     if (!record) {
       throw new Error(`Agent ${agentId} not found`);
     }
-    await this.upsert({ ...record, title });
+    await this.upsert({ ...record, title }, { requireWritable: true });
   }
 
   async flush(): Promise<void> {
@@ -687,10 +893,11 @@ export class AgentStorage {
       await this.scanDisk();
       this.loaded = true;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (isMissingFile(error)) {
         this.loaded = true;
         return;
       }
+      this.registryScanComplete = false;
       this.logger.error({ err: error }, "Failed to load agents");
       this.loaded = true;
     }
@@ -705,6 +912,11 @@ export class AgentStorage {
         return;
       }
       throw error;
+    }
+
+    for (const entry of entries) {
+      if (entry.isFile() && DELETE_INTENT_FILENAME.test(entry.name))
+        this.deleteIntents.add(entry.name);
     }
 
     const rootRecordPaths = entries
@@ -725,7 +937,8 @@ export class AgentStorage {
           return files
             .filter((file) => file.isFile() && file.name.endsWith(".json"))
             .map((file) => path.join(projectDir, file.name));
-        } catch {
+        } catch (error) {
+          if (!isMissingFile(error)) this.registryScanComplete = false;
           return [];
         }
       }),
@@ -750,11 +963,17 @@ export class AgentStorage {
   }
 
   private async readRecordFile(filePath: string): Promise<StoredAgentRecord | null> {
+    let parsed: unknown;
     try {
       const content = await fs.readFile(filePath, "utf8");
-      const parsed = JSON.parse(content);
+      parsed = JSON.parse(content);
       return parseStoredAgentRecord(parsed);
     } catch (error) {
+      if (parsed === undefined && !isMissingFile(error)) this.registryScanComplete = false;
+      // Schema failures with a readable identity also count as remaining copies.
+      if (parsed && typeof parsed === "object" && "id" in parsed && typeof parsed.id === "string")
+        this.unreadableRecordIds.add(parsed.id);
+      this.unreadableRecordIds.add(path.basename(filePath, ".json"));
       this.logger.error({ err: error, filePath }, "Skipping invalid agent record");
       return null;
     }

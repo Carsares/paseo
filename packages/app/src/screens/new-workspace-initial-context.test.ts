@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { HostProjectListItem } from "@/projects/host-projects";
 import type { HostRuntimeConnectionStatus } from "@/runtime/host-runtime";
 import {
+  filterNewWorkspaceHostsForIntent,
+  resolveTopicHostAfterCapabilityChange,
   resolveNewWorkspaceAutomaticServerId,
   resolveNewWorkspaceInitialServerId,
 } from "./new-workspace-initial-context";
@@ -288,4 +290,19 @@ describe("resolveNewWorkspaceAutomaticServerId", () => {
       }),
     ).toBe("online-empty");
   });
+});
+
+it("keeps topic host choices inside the negotiated capability and restores regular choices", () => {
+  const hosts = [{ serverId: "old" }, { serverId: "topic" }, { serverId: "connecting" }];
+  const topicSupport = multiplicity({ old: false, topic: true });
+  expect(filterNewWorkspaceHostsForIntent(hosts, topicSupport, true)).toEqual([hosts[1]]);
+  expect(filterNewWorkspaceHostsForIntent(hosts, multiplicity(), true)).toEqual([]);
+  expect(filterNewWorkspaceHostsForIntent(hosts, topicSupport, false)).toBe(hosts);
+});
+
+it("keeps the chosen topic host visible after support disappears instead of silently switching", () => {
+  const changed = multiplicity({ selected: false, next: true });
+  expect(resolveTopicHostAfterCapabilityChange(true, "selected", changed, "next")).toBe("selected");
+  expect(resolveTopicHostAfterCapabilityChange(false, "selected", changed, "next")).toBe("next");
+  expect(resolveTopicHostAfterCapabilityChange(true, null, changed, "next")).toBe("next");
 });

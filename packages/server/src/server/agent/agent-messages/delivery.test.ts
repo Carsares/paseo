@@ -1,6 +1,7 @@
 import {
   AgentTurnBusyError,
   AgentTurnChangedError,
+  QueuedPromptLoadError,
   sendPromptToAgent,
   type SendDirectPromptParams,
 } from "../agent-prompt.js";
@@ -27,7 +28,11 @@ import {
 } from "./envelope.js";
 import { MAX_SUBAGENT_INBOX_WAIT_MS } from "./delivery.js";
 import { buildAgentPrompt } from "../prompt-attachments.js";
-import type { AgentPromptInput, AgentRunOptions } from "../agent-sdk-types.js";
+import {
+  PeerRecipientNotReadyError,
+  type AgentPromptInput,
+  type AgentRunOptions,
+} from "../agent-sdk-types.js";
 
 function createClock() {
   let now = 0;
@@ -3107,6 +3112,223 @@ test("peer-marked prompts fail closed at dispatch when authorization verifier co
   expect(recipient.sent).toEqual([]);
   await recipient.delivery.close();
 });
+
+test("peer rechecks use the same attempt until the queue retries delivery", async () => {
+  const clock = createClock();
+  const checks: string[] = [];
+  const outcomes: Array<[PeerDispatchTerminalOutcome, string | undefined]> = [];
+  const dispatchId = "peer_retry_after_busy";
+  const delivery = createAgentMessageDelivery({
+    schedule: clock.schedule,
+    dispatch: async (request) => {
+      expect(request.turnAuthorization).toBe("peer-read-only");
+      expect(request.idleOnly).toBe(true);
+      expect(request.canSteerDuringDrain).toBeUndefined();
+      await request.validateDispatch?.();
+      await request.beforeProviderDispatch();
+      await request.validateDispatch?.();
+      if (outcomes.length === 0) throw new AgentTurnBusyError("recipient became busy");
+      return "turn_started";
+    },
+    onError: () => {},
+  });
+  registerPromptDispatchVerifier(
+    dispatchId,
+    { kind: "peer-workspace", recipientId: "recipient", senderAgentId: "sender" },
+    async (_recipient, attemptId) => {
+      checks.push(attemptId);
+    },
+    (outcome, context) => {
+      outcomes.push([outcome, context.attemptId]);
+    },
+  );
+  try {
+    const receipt = delivery.enqueue({
+      recipientId: "recipient",
+      source: { kind: "agent-message", agentId: "sender" },
+      prompt: encodePeerWorkspacePrompt(
+        {
+          dispatchId,
+          senderAgentId: "sender",
+          recipientAgentId: "recipient",
+          sourceWorkspaceId: "wks_a",
+          targetWorkspaceId: "wks_b",
+          correlationId: "corr_retry_after_busy",
+          intent: "query",
+          hop: 1,
+          maxHops: 2,
+          expectReply: true,
+        },
+        "Inspect schema",
+      ),
+    });
+    clock.advance(2000);
+    await vi.waitFor(() => expect(outcomes).toHaveLength(1));
+    expect(checks).toEqual([checks[0], checks[0], checks[0]]);
+    expect(outcomes[0]).toEqual(["returned_to_queue", checks[0]]);
+
+    clock.advance(2000);
+    await expect(receipt.dispatched).resolves.toBe("turn_started");
+    await delivery.close();
+    expect(checks.slice(3)).toEqual([checks[3], checks[3], checks[3]]);
+    expect(checks[3]).not.toBe(checks[0]);
+    expect(outcomes[1]).toEqual(["accepted", checks[3]]);
+  } finally {
+    await delivery.close();
+    resetInMemoryPeerDispatchStateForTest();
+  }
+});
+
+test("a cold durable peer message waits for its recipient's state without blocking later messages", async () => {
+  const clock = createClock();
+  const dispatchId = "peer_waits_for_manual_open";
+  const recipientId = "recipient";
+  const source = { kind: "agent-message", agentId: "sender" } as const;
+  const begin = vi.fn(async () => {});
+  const retryQueued = vi.fn(async () => {});
+  const onError = vi.fn();
+  const verify = vi.fn(async () => {});
+  const dispatches: string[] = [];
+  let ready = false;
+  const listeners = new Set<(agentId: string) => void>();
+  const notify = (agentId: string) => {
+    for (const listener of listeners) listener(agentId);
+  };
+  const delivery = createAgentMessageDelivery({
+    schedule: clock.schedule,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    async dispatch(request) {
+      dispatches.push(request.messageIds[0]!);
+      if (request.turnAuthorization && !ready) throw new PeerRecipientNotReadyError();
+      await request.handoff?.begin();
+      return "turn_started";
+    },
+    onError,
+  });
+  registerPromptDispatchVerifier(
+    dispatchId,
+    { kind: "peer-workspace", recipientId, senderAgentId: source.agentId },
+    verify,
+  );
+  try {
+    const peer = delivery.enqueue({
+      recipientId,
+      source,
+      messageId: "peer",
+      handoff: { begin, declined: async () => {}, retryQueued },
+      prompt: encodePeerWorkspacePrompt(
+        {
+          dispatchId,
+          senderAgentId: source.agentId,
+          recipientAgentId: recipientId,
+          sourceWorkspaceId: "wks_a",
+          targetWorkspaceId: "wks_b",
+          correlationId: "corr_waits_for_manual_open",
+          intent: "query",
+          hop: 1,
+          maxHops: 2,
+          expectReply: false,
+        },
+        "Inspect the current design",
+      ),
+    });
+    clock.advance(2000);
+    const drained = vi.fn();
+    const waited = delivery
+      .waitForDispatch(recipientId, new AbortController().signal)
+      .then(drained);
+    await vi.waitFor(() => {
+      expect(retryQueued).toHaveBeenCalledOnce();
+      expect(delivery.hasPending(recipientId)).toBe(false);
+      expect(drained).toHaveBeenCalledOnce();
+    });
+    await waited;
+    expect(begin).not.toHaveBeenCalled();
+    const later = delivery.enqueue({ recipientId, source, messageId: "later", prompt: "Later" });
+    notify("unrelated-recipient");
+    clock.advance(60_000);
+    await vi.waitFor(() => expect(dispatches).toEqual(["peer", "later"]));
+    await expect(later.dispatched).resolves.toBe("turn_started");
+    expect(dispatches).toEqual(["peer", "later"]);
+    expect(begin).not.toHaveBeenCalled();
+    ready = true;
+    notify(recipientId);
+    expect(delivery.hasPending(recipientId)).toBe(true);
+    await vi.waitFor(() => {
+      expect(dispatches).toEqual(["peer", "later", "peer"]);
+    });
+    await expect(peer.dispatched).resolves.toBe("turn_started");
+    expect(onError).not.toHaveBeenCalled();
+    expect(verify).toHaveBeenCalledTimes(2);
+    expect(begin).toHaveBeenCalledOnce();
+  } finally {
+    await delivery.close();
+    resetInMemoryPeerDispatchStateForTest();
+  }
+});
+
+test.each([
+  [new QueuedPromptLoadError(new Error("temporarily unavailable")), "retained_for_restart"],
+  [new Error("recipient rejected the prompt"), "definitively_unsent"],
+  [new AgentRequestOutcomeUnknownError(), "outcome_unknown"],
+] as const)(
+  "reports a failed peer dispatch as %s with its actual attempt",
+  async (error, outcome) => {
+    const clock = createClock();
+    const dispatchId = `peer_dispatch_disposition_${outcome}`;
+    const attempted = vi.fn();
+    const terminal = vi.fn();
+    const delivery = createAgentMessageDelivery({
+      schedule: clock.schedule,
+      dispatch: async () => {
+        throw error;
+      },
+      onError: () => {},
+    });
+    registerPromptDispatchVerifier(
+      dispatchId,
+      { kind: "peer-workspace", recipientId: "recipient", senderAgentId: "sender" },
+      async (_recipient, attemptId) => {
+        attempted(attemptId);
+      },
+      (result, context) => {
+        terminal(result, context.attemptId);
+      },
+    );
+    try {
+      const receipt = delivery.enqueue({
+        recipientId: "recipient",
+        source: { kind: "agent-message", agentId: "sender" },
+        prompt: encodePeerWorkspacePrompt(
+          {
+            dispatchId,
+            senderAgentId: "sender",
+            recipientAgentId: "recipient",
+            sourceWorkspaceId: "wks_a",
+            targetWorkspaceId: "wks_b",
+            correlationId: "peer_disposition",
+            intent: "query",
+            hop: 1,
+            maxHops: 2,
+            expectReply: true,
+          },
+          "Inspect schema",
+        ),
+      });
+      clock.advance(2000);
+      await expect(receipt.dispatched).rejects.toBe(error);
+      await delivery.close();
+      expect(attempted).toHaveBeenCalledExactlyOnceWith(expect.any(String));
+      expect(terminal).toHaveBeenCalledExactlyOnceWith(outcome, attempted.mock.calls[0]![0]);
+    } finally {
+      await delivery.close();
+      resetInMemoryPeerDispatchStateForTest();
+    }
+  },
+);
 
 test("peer-marked prompt without handoff hitting outcome-unknown concurrently with Stop is never re-dispatched on close", async () => {
   resetInMemoryPeerDispatchStateForTest();

@@ -3,9 +3,11 @@ import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { applyProviderOptionsPatch } from "../option-controls.js";
 import { assertChangesAreLive, validateProviderOptions } from "../provider-options.js";
 import { CodexBackgroundInventory } from "./codex/background-inventory.js";
+import { AgentRequestOutcomeUnknownError } from "../../message-receipts/index.js";
 import {
   AgentTurnStartCanceledError,
   AgentTurnStartRejectedError,
+  PeerRecipientNotReadyError,
   getAgentStreamEventTurnId,
   type AgentPermissionAction,
   type AgentCapabilityFlags,
@@ -309,6 +311,7 @@ function formatOutOfBandStatusMessage(text: string): string {
 
 const CODEX_APP_SERVER_CAPABILITIES: AgentCapabilityFlags = {
   defersPromptHandoff: true,
+  supportsPeerReadOnlyTurn: true,
   supportsStreaming: true,
   supportsSessionPersistence: true,
   supportsSessionListing: true,
@@ -320,6 +323,40 @@ const CODEX_APP_SERVER_CAPABILITIES: AgentCapabilityFlags = {
   supportsRewindFiles: false,
   supportsRewindBoth: false,
 };
+
+// Native exec allow rules can bypass a read-only sandbox. Pin off the tools
+// that bypass the sandbox, or can invoke other agents or tools outside it.
+const CODEX_PEER_UNSAFE_FEATURES = [
+  "shell_tool",
+  "unified_exec",
+  "worktrees",
+  "multi_agent",
+  "multi_agent_v2",
+  "apps",
+  "hooks",
+  "plugins",
+  "browser_use",
+  "browser_use_external",
+  "computer_use",
+  "image_generation",
+  "code_mode",
+  "network_proxy",
+  "request_permissions_tool",
+  "workspace_dependencies",
+  "goals",
+  "memories",
+];
+const codexPeerTurnPolicySchema = z.object({
+  sandboxPolicy: z
+    .object({ type: z.enum(["readOnly", "workspaceWrite", "dangerFullAccess"]) })
+    .passthrough(),
+  approvalPolicy: z.union([
+    z.enum(["never", "on-request", "untrusted", "on-failure"]),
+    z.object({ granular: z.record(z.string(), z.boolean()) }),
+  ]),
+  approvalsReviewer: z.enum(["user", "auto_review", "guardian_subagent"]),
+});
+type CodexPeerTurnPolicy = z.infer<typeof codexPeerTurnPolicySchema>;
 
 const CODEX_MODES: AgentMode[] = [
   {
@@ -4103,7 +4140,9 @@ export class CodexAppServerAgentSession implements AgentSession {
     promise: Promise<void>;
     resolve: () => void;
     cancelRequested: boolean;
+    peerReadOnly: boolean;
   } | null = null;
+  private nativeCommandsInFlight = 0;
   private client: CodexAppServerClient | null = null;
   private readonly background = new CodexBackgroundInventory((event) => this.emitEvent(event));
   private threadRollbackAvailable = true;
@@ -4114,6 +4153,12 @@ export class CodexAppServerAgentSession implements AgentSession {
   private readonly turnNamespace = randomUUID();
   private nextTurnOrdinal = 0;
   private activeForegroundTurnId: string | null = null;
+  private peerReadOnlyTurnId: string | null = null;
+  private lastNormalTurnPolicy: CodexPeerTurnPolicy | undefined;
+  private restoreNormalTurnPolicy = false;
+  private supportsPeerRuntimeChecks = false;
+  private peerDisabledFeatures: Record<string, false> | undefined;
+  private peerPinnedThreadId: string | undefined;
   private activeClientMessageId: string | null = null;
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   /** The tier the options ask for; `serviceTier` is what the current model can honor. */
@@ -4342,6 +4387,10 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.supportsUnadvertisedFlex =
         typeof userAgent === "string" &&
         codexVersionAtLeast(userAgent, CODEX_UNADVERTISED_FLEX_MIN_VERSION);
+      const version = typeof userAgent === "string" ? parseCodexVersion(userAgent) : null;
+      this.supportsPeerRuntimeChecks = version?.[0] === 0 && version[1] === 156;
+      this.peerDisabledFeatures = undefined;
+      this.peerPinnedThreadId = undefined;
       this.supportsInstructionSnapshots =
         typeof userAgent === "string" && codexVersionAtLeast(userAgent, [0, 121, 0]);
       if (
@@ -4394,13 +4443,33 @@ export class CodexAppServerAgentSession implements AgentSession {
       );
       const config = toObjectRecord(response?.config);
       this.resolvedWorkspaceWrite = readSandboxWorkspaceWrite(config?.sandbox_workspace_write);
+      const features = toObjectRecord(config?.features);
+      const innerFeatures = toObjectRecord(this.buildCodexInnerConfig()?.features);
+      if (
+        this.supportsPeerRuntimeChecks &&
+        CODEX_PEER_UNSAFE_FEATURES.every(
+          (name) => features?.[name] === false && innerFeatures?.[name] !== true,
+        )
+      ) {
+        this.peerDisabledFeatures = Object.fromEntries(
+          CODEX_PEER_UNSAFE_FEATURES.map((name) => [name, false as const]),
+        );
+      }
     } catch (error) {
       this.logger.debug({ error }, "Failed to read resolved Codex workspace-write config");
     }
   }
 
   private rememberResolvedSandboxPolicy(response: unknown): void {
-    const sandbox = toObjectRecord(toObjectRecord(response)?.sandbox);
+    const settings = toObjectRecord(response);
+    const sandbox = toObjectRecord(settings?.sandbox);
+    const policy = codexPeerTurnPolicySchema.safeParse({
+      sandboxPolicy: sandbox,
+      approvalPolicy: settings?.approvalPolicy,
+      approvalsReviewer: settings?.approvalsReviewer,
+    });
+    this.lastNormalTurnPolicy = policy.data;
+    this.restoreNormalTurnPolicy = false;
     this.resolvedSandboxPolicy = sandbox ?? null;
     if (sandbox?.type !== "workspaceWrite") return;
     this.resolvedWorkspaceWrite = readSandboxWorkspaceWrite(sandbox);
@@ -4868,7 +4937,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (developerInstructions) {
       params.developerInstructions = developerInstructions;
     }
-    const codexConfig = this.buildCodexInnerConfig();
+    const codexConfig = this.buildCodexThreadConfig();
     if (codexConfig) {
       params.config = codexConfig;
     }
@@ -4877,6 +4946,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       const ids = Array.isArray(loaded?.data) ? loaded.data : [];
       if (!ids.includes(this.currentThreadId)) {
         const response = await this.client.request("thread/resume", params);
+        this.peerPinnedThreadId = this.peerDisabledFeatures ? this.currentThreadId : undefined;
         this.rememberResolvedSandboxPolicy(response);
         this.rememberRestoredCollaborationMode(response);
       }
@@ -4892,6 +4962,7 @@ export class CodexAppServerAgentSession implements AgentSession {
           }
         }
         const response = await this.client.request("thread/resume", params);
+        this.peerPinnedThreadId = this.peerDisabledFeatures ? threadId : undefined;
         this.rememberResolvedSandboxPolicy(response);
         this.rememberRestoredCollaborationMode(response);
         this.logger.info({ threadId }, "Unarchived Codex thread to restore active Paseo agent");
@@ -5081,6 +5152,197 @@ export class CodexAppServerAgentSession implements AgentSession {
     return { approvalPolicy, sandboxPolicyType };
   }
 
+  private normalTurnPolicy(params: Record<string, unknown>): CodexPeerTurnPolicy | undefined {
+    const policy = codexPeerTurnPolicySchema.safeParse({
+      ...this.lastNormalTurnPolicy,
+      ...(params.sandboxPolicy === undefined ? {} : { sandboxPolicy: params.sandboxPolicy }),
+      ...(params.approvalPolicy === undefined ? {} : { approvalPolicy: params.approvalPolicy }),
+      ...(params.approvalsReviewer === undefined
+        ? {}
+        : { approvalsReviewer: params.approvalsReviewer }),
+    });
+    return policy.data;
+  }
+
+  private rejectPeerTurn(reason: string): never {
+    throw new AgentTurnStartRejectedError(`Codex cannot start a read-only peer turn. ${reason}`);
+  }
+
+  private checkPeerThreadConfiguration(): void {
+    if (!this.supportsPeerRuntimeChecks) {
+      this.rejectPeerTurn("Use a supported Codex 0.156 session.");
+    }
+    // 0.156's turn/start can also steer. Its sandbox and permission-profile
+    // overrides do not restrict the existing thread's native and external tools.
+    if (!this.peerDisabledFeatures) {
+      this.rejectPeerTurn(
+        "This session has no verifiable read-only tool configuration. Use a dedicated Codex session with native shell, delegation, background automation, and external tools disabled.",
+      );
+    }
+  }
+
+  private async verifyReadOnlyPeerTools(client: CodexAppServerClient, threadId: string) {
+    const [features, mcp, goal] = await Promise.all([
+      client.request("experimentalFeature/list", { threadId }, 10_000),
+      client.request("mcpServerStatus/list", { threadId, detail: "toolsAndAuthOnly" }, 10_000),
+      client.request("thread/goal/get", { threadId }, 10_000).catch((error: unknown) => {
+        if (isCodexRequestRejected(error) && error.message === "goals feature is disabled") {
+          return { goal: null };
+        }
+        throw error;
+      }),
+    ]);
+    const featurePage = z
+      .object({
+        data: z.array(z.object({ name: z.string(), enabled: z.boolean() })),
+        nextCursor: z.string().nullish(),
+      })
+      .parse(features);
+    const byName = new Map(featurePage.data.map(({ name, enabled }) => [name, enabled]));
+    if (
+      featurePage.nextCursor ||
+      CODEX_PEER_UNSAFE_FEATURES.some((name) => byName.get(name) !== false)
+    ) {
+      this.rejectPeerTurn(
+        "Disable native shell, delegation, and external tool access in this session.",
+      );
+    }
+    const inventory = z
+      .object({ data: z.array(z.object({ name: z.string() })), nextCursor: z.string().nullish() })
+      .parse(mcp);
+    const paseo = this.config.mcpServers?.[PASEO_MCP_SERVER_NAME];
+    if (
+      inventory.nextCursor ||
+      inventory.data.some(
+        ({ name }) => name !== PASEO_MCP_SERVER_NAME || !paseo || !isRuntimePaseoMcpServer(paseo),
+      )
+    ) {
+      this.rejectPeerTurn("Use a session without external MCP servers.");
+    }
+    if (z.object({ goal: z.null() }).safeParse(goal).success === false) {
+      this.rejectPeerTurn("Clear the native goal before receiving peer messages.");
+    }
+  }
+
+  private async verifyFreshReadOnlyPeerTurn(
+    client: CodexAppServerClient,
+    threadId: string,
+    verifyTools = true,
+  ) {
+    try {
+      if (verifyTools) await this.verifyReadOnlyPeerTools(client, threadId);
+      const [threads, terminals, thread] = await Promise.all([
+        client.request("thread/loaded/list", {}, 10_000),
+        client.request("thread/backgroundTerminals/list", { threadId }, 10_000),
+        client.request("thread/read", { threadId, includeTurns: false }, 10_000),
+      ]);
+      const loaded = z
+        .object({ data: z.array(z.string()), nextCursor: z.string().nullish() })
+        .parse(threads);
+      const background = z
+        .object({ data: z.array(z.unknown()), nextCursor: z.null() })
+        .safeParse(terminals);
+      const nativeThread = z
+        .object({
+          thread: z.object({ id: z.string(), status: z.object({ type: z.literal("idle") }) }),
+        })
+        .safeParse(thread);
+      if (!loaded.data.includes(threadId)) {
+        throw this.peerThreadNotReady();
+      }
+      if (
+        loaded.nextCursor ||
+        loaded.data.some((id) => id !== threadId) ||
+        !background.success ||
+        background.data.data.length ||
+        !nativeThread.success ||
+        nativeThread.data.thread.id !== threadId ||
+        this.hasPeerTurnConflict(client, threadId)
+      ) {
+        this.rejectPeerTurn("Wait for native turns, background work, and approvals to finish.");
+      }
+    } catch (error) {
+      if (error instanceof AgentTurnStartRejectedError) throw error;
+      this.rejectPeerTurn("The native server did not confirm its turn and tool state.");
+    }
+  }
+
+  private hasPeerTurnConflict(client: CodexAppServerClient, threadId: string): boolean {
+    return (
+      this.client !== client ||
+      this.currentThreadId !== threadId ||
+      this.currentTurnId !== null ||
+      this.nativeCommandsInFlight !== 0 ||
+      this.pendingManualCompactionStarts !== 0 ||
+      this.pendingPermissionHandlers.size !== 0 ||
+      this.getPendingPermissions().length !== 0 ||
+      this.pendingSubAgentNotificationsByThreadId.size !== 0
+    );
+  }
+
+  private async applyPeerTurnPolicy(
+    turnStart: Awaited<ReturnType<CodexAppServerAgentSession["buildTurnStartParams"]>>,
+    options: AgentRunOptions | undefined,
+    client: CodexAppServerClient,
+    normalPolicy: CodexPeerTurnPolicy | undefined,
+  ): Promise<string> {
+    const threadId = this.currentThreadId;
+    if (!threadId || threadId !== this.peerPinnedThreadId) {
+      this.rejectPeerTurn(
+        "Open a session with native shell, delegation, and external tools disabled.",
+      );
+    }
+    if (!options?.beforeProviderDispatch || !normalPolicy) {
+      this.rejectPeerTurn("The session could not verify and preserve its original permissions.");
+    }
+    await this.waitForInterruptedTurnCleanup();
+    await this.verifyFreshReadOnlyPeerTurn(client, threadId);
+    Object.assign(turnStart.params, {
+      sandboxPolicy: { type: "readOnly", networkAccess: false },
+      approvalPolicy: "never",
+      approvalsReviewer: "user",
+    });
+    turnStart.approvalPolicy = "never";
+    turnStart.sandboxPolicyType = "read-only";
+    return threadId;
+  }
+
+  private async submitProviderTurn(
+    client: CodexAppServerClient,
+    params: Record<string, unknown>,
+    options: AgentRunOptions | undefined,
+    pendingStart: { cancelRequested: boolean },
+    normalPolicy: CodexPeerTurnPolicy | undefined,
+    peerThreadId: string | undefined,
+  ): Promise<void> {
+    await this.waitForInterruptedTurnCleanup();
+    await options?.beforeProviderDispatch?.();
+    if (peerThreadId) await this.verifyFreshReadOnlyPeerTurn(client, peerThreadId, false);
+    this.assertTurnStartAllowed(pendingStart, options);
+    if (peerThreadId) options?.onPeerPromptSubmitting?.();
+    try {
+      if (peerThreadId) this.restoreNormalTurnPolicy = true;
+      await client.request("turn/start", params, TURN_START_TIMEOUT_MS);
+      if (!peerThreadId) {
+        this.lastNormalTurnPolicy = normalPolicy;
+        this.restoreNormalTurnPolicy = false;
+      }
+    } catch (error) {
+      if (options?.beforeProviderDispatch && isCodexRequestRejected(error)) {
+        throw new AgentTurnStartRejectedError(error.message, { cause: error });
+      }
+      if (peerThreadId) throw new AgentRequestOutcomeUnknownError({ cause: error });
+      throw error;
+    }
+    if (peerThreadId && options?.onPeerPromptAccepted) {
+      void Promise.resolve()
+        .then(options.onPeerPromptAccepted)
+        .catch((error) => {
+          this.logger.error({ error }, "Failed to record Codex peer prompt acknowledgement");
+        });
+    }
+  }
+
   private logTurnStartSummary({
     turnId,
     thinkingOptionId,
@@ -5171,10 +5433,40 @@ export class CodexAppServerAgentSession implements AgentSession {
     });
   }
 
+  private async prepareTurnThread(peerReadOnly: boolean): Promise<CodexAppServerClient> {
+    if (peerReadOnly) {
+      // Connecting or ensuring the thread can resume, unarchive, or create it.
+      if (this.connectionState !== "connected" || !this.client || !this.currentThreadId) {
+        throw this.peerThreadNotReady();
+      }
+      this.checkPeerThreadConfiguration();
+      return this.client;
+    }
+    await this.connect();
+    if (!this.client) throw new Error("Codex client not initialized");
+    return this.client;
+  }
+
+  private peerThreadNotReady(): PeerRecipientNotReadyError {
+    return new PeerRecipientNotReadyError(
+      "Open the native Codex thread before retrying this peer message.",
+    );
+  }
+
+  private async ensureInteractiveTurnThread(): Promise<void> {
+    if (this.currentThreadId) {
+      await this.ensureThreadLoaded();
+      await this.ensureHistoryIndexed();
+    } else {
+      await this.ensureThread();
+    }
+  }
+
   async startTurn(
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<{ turnId: string }> {
+    const peerReadOnly = options?.turnAuthorization === "peer-read-only";
     if (this.activeForegroundTurnId || this.pendingForegroundStart) {
       throw new Error("A foreground turn is already active");
     }
@@ -5186,33 +5478,34 @@ export class CodexAppServerAgentSession implements AgentSession {
       }),
       resolve: () => resolveStart(),
       cancelRequested: false,
+      peerReadOnly,
     };
     this.pendingForegroundStart = pendingStart;
 
-    this.dismissPendingPlanApprovals("Dismissed by a new prompt");
+    if (!peerReadOnly) this.dismissPendingPlanApprovals("Dismissed by a new prompt");
 
     try {
       await this.pendingNotifications;
-      await this.connect();
-      if (!this.client) {
-        throw new Error("Codex client not initialized");
-      }
+      const client = await this.prepareTurnThread(peerReadOnly);
 
-      const slashCommand = await this.resolveSlashCommandInvocation(prompt);
+      const slashCommand = peerReadOnly ? null : await this.resolveSlashCommandInvocation(prompt);
       const effectivePrompt = slashCommand
         ? await this.buildCommandPromptInput(slashCommand.commandName, slashCommand.args)
         : prompt;
 
-      if (this.currentThreadId) {
-        await this.ensureThreadLoaded();
-        await this.ensureHistoryIndexed();
-      } else {
-        await this.ensureThread();
-      }
+      if (!peerReadOnly) await this.ensureInteractiveTurnThread();
 
       const turnStart = await this.buildTurnStartParams(effectivePrompt, options);
+      const normalPolicy = this.normalTurnPolicy(turnStart.params);
+      const peerThreadId = peerReadOnly
+        ? await this.applyPeerTurnPolicy(turnStart, options, client, normalPolicy)
+        : undefined;
+      if (!peerReadOnly && this.restoreNormalTurnPolicy) {
+        Object.assign(turnStart.params, normalPolicy);
+      }
       const turnId = this.createTurnId();
       this.activeForegroundTurnId = turnId;
+      this.peerReadOnlyTurnId = peerReadOnly ? turnId : null;
       this.activeClientMessageId = options?.clientMessageId ?? null;
       this.currentTurnId = null;
       this.pendingForegroundTurnIdentification?.resolve(null);
@@ -5235,19 +5528,14 @@ export class CodexAppServerAgentSession implements AgentSession {
         hasDeveloperInstructions: turnStart.hasDeveloperInstructions,
         hasCodexConfig: turnStart.hasCodexConfig,
       });
-      // The interrupted turn's commands end before this turn begins, so none of them
-      // outlives it into the new turn.
-      await this.waitForInterruptedTurnCleanup();
-      if (options?.beforeProviderDispatch) await options.beforeProviderDispatch();
-      this.assertTurnStartAllowed(pendingStart, options);
-      try {
-        await this.client.request("turn/start", turnStart.params, TURN_START_TIMEOUT_MS);
-      } catch (error) {
-        if (options?.beforeProviderDispatch && isCodexRequestRejected(error)) {
-          throw new AgentTurnStartRejectedError(error.message, { cause: error });
-        }
-        throw error;
-      }
+      await this.submitProviderTurn(
+        client,
+        turnStart.params,
+        options,
+        pendingStart,
+        normalPolicy,
+        peerThreadId,
+      );
       return { turnId };
     } catch (error) {
       this.pendingForegroundTurnIdentification?.resolve(null);
@@ -5275,6 +5563,11 @@ export class CodexAppServerAgentSession implements AgentSession {
     prompt: AgentPromptInput,
     options: SteerActiveTurnOptions,
   ): Promise<SteerResult> {
+    if (
+      options.turnAuthorization === "peer-read-only" ||
+      (this.peerReadOnlyTurnId && this.peerReadOnlyTurnId === this.activeForegroundTurnId)
+    )
+      return { status: "unavailable" };
     const client = this.client;
     const threadId = this.currentThreadId;
     let nativeTurnId = this.currentTurnId;
@@ -6272,19 +6565,29 @@ export class CodexAppServerAgentSession implements AgentSession {
       onProviderOutcome,
     }: OutOfBandCommandContext,
   ): Promise<void> {
-    if (beforeProviderDispatch) await beforeProviderDispatch();
-    assertProviderDispatchAllowed?.();
-    try {
-      await request();
-    } catch (error) {
-      // Protocol-level request rejection proves the command did not execute.
-      // Transport failures and other server errors leave the outcome unknown.
-      if (!isCodexRequestRejected(error)) {
-        await onProviderOutcome?.("unknown");
-      }
-      throw error;
+    if (this.pendingForegroundStart?.peerReadOnly) {
+      throw new AgentTurnStartRejectedError(
+        "Wait for the read-only peer turn to start before running a native command.",
+      );
     }
-    await onProviderOutcome?.("accepted");
+    this.nativeCommandsInFlight += 1;
+    try {
+      if (beforeProviderDispatch) await beforeProviderDispatch();
+      assertProviderDispatchAllowed?.();
+      try {
+        await request();
+      } catch (error) {
+        // Protocol-level request rejection proves the command did not execute.
+        // Transport failures and other server errors leave the outcome unknown.
+        if (!isCodexRequestRejected(error)) {
+          await onProviderOutcome?.("unknown");
+        }
+        throw error;
+      }
+      await onProviderOutcome?.("accepted");
+    } finally {
+      this.nativeCommandsInFlight -= 1;
+    }
   }
 
   private async executeCompactCommand(context: OutOfBandCommandContext): Promise<string | null> {
@@ -6463,6 +6766,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.cachedRuntimeInfo = null;
     }
     this.currentThreadId = threadId;
+    this.peerPinnedThreadId = this.peerDisabledFeatures ? threadId : undefined;
     this.instructionSnapshot.recordNewThread(threadId);
   }
 
@@ -6474,7 +6778,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     const preset = MODE_PRESETS[this.currentMode] ?? MODE_PRESETS[DEFAULT_CODEX_MODE_ID];
     const approvalPolicy = this.hasWorkflowModeOverride ? preset.approvalPolicy : undefined;
     const sandbox = this.hasWorkflowModeOverride ? preset.sandbox : undefined;
-    const innerConfig = this.buildCodexInnerConfig();
+    const innerConfig = this.buildCodexThreadConfig();
     const developerInstructions = composeAgentSystemPrompt(this.config);
     const params: Record<string, unknown> = {
       model,
@@ -6491,6 +6795,17 @@ export class CodexAppServerAgentSession implements AgentSession {
       params.approvalsReviewer = preset.approvalsReviewer;
     }
     return { params, approvalPolicy, sandbox };
+  }
+
+  private buildCodexThreadConfig(): Record<string, unknown> | null {
+    const config = this.buildCodexInnerConfig();
+    if (!this.peerDisabledFeatures) return config;
+    // The peer checks apply only to a thread that Paseo opened with these
+    // constraints. Reading the latest config alone cannot prove a loaded thread safe.
+    return {
+      ...config,
+      features: { ...toObjectRecord(config?.features), ...this.peerDisabledFeatures },
+    };
   }
 
   private buildCodexInnerConfig(): Record<string, unknown> | null {

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   prepareAgentMessage,
   type AgentMessageDelivery,
@@ -5,7 +6,13 @@ import {
 } from "./agent-messages/index.js";
 import type { Logger } from "pino";
 
-import type { AgentCommandOutcome, AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
+import {
+  AgentTurnStartRejectedError,
+  PeerRecipientNotReadyError,
+  type AgentCommandOutcome,
+  type AgentPromptInput,
+  type AgentRunOptions,
+} from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import { ForegroundPromptStart } from "./agent-run-state.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
@@ -24,11 +31,24 @@ import {
 } from "./hierarchy-policy.js";
 
 const humanPromptStarts = new WeakSet<ForegroundPromptStart>();
+const peerInitialPrompt = new AsyncLocalStorage<{ verifiedAgentId?: string }>();
 const TOPIC_TITLE_LIMIT = 160;
 const TOPIC_SUMMARY_LIMIT = 2_000;
 
 export function isHumanForegroundPrompt(promptStart?: ForegroundPromptStart): boolean {
   return !!promptStart && humanPromptStarts.has(promptStart);
+}
+
+/** Carry the peer validator's result through the MCP creation command to its first turn. */
+export function withPeerInitialPrompt<T>(
+  create: (verifyRecipient: (agentId: string) => void) => Promise<T>,
+): Promise<T> {
+  const context: { verifiedAgentId?: string } = {};
+  return peerInitialPrompt.run(context, () =>
+    create((agentId) => {
+      context.verifiedAgentId = agentId;
+    }),
+  );
 }
 
 function hasHumanPromptText(prompt: AgentPromptInput): boolean {
@@ -115,6 +135,12 @@ export type AgentRunController = Pick<
 
 export class AgentTurnBusyError extends Error {}
 
+export function peerRecipientRequiresOpenSession(): PeerRecipientNotReadyError {
+  return new PeerRecipientNotReadyError(
+    "Open the recipient's interactive session before retrying this peer message.",
+  );
+}
+
 export class QueuedPromptLoadError extends Error {
   constructor(cause: unknown) {
     super(cause instanceof Error ? cause.message : String(cause), { cause });
@@ -197,7 +223,11 @@ async function startOrReplaceRun(
   iterator: AsyncGenerator<import("./agent-sdk-types.js").AgentStreamEvent>;
   replaced: boolean;
 }> {
-  const replaced = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
+  const replaced = Boolean(
+    !options?.runOptions?.turnAuthorization &&
+    options?.replaceRunning &&
+    agentManager.hasInFlightRun(agentId),
+  );
   const iterator = replaced
     ? await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions, promptStart)
     : agentManager.streamAgent(agentId, prompt, options?.runOptions, promptStart);
@@ -234,6 +264,29 @@ function createForegroundPromptStart(
   return promptStart;
 }
 
+function requireFreshPeerTurn(
+  options: StartAgentRunOptions | undefined,
+): StartAgentRunOptions | undefined {
+  if (options?.runOptions?.turnAuthorization !== "peer-read-only") return options;
+  return { ...options, idleOnly: true, admitSteer: undefined, replaceRunning: false };
+}
+
+function tryPromptCommand(
+  agentManager: AgentRunController,
+  agentId: string,
+  prompt: AgentPromptInput,
+  options: StartAgentRunOptions | undefined,
+): Promise<boolean> {
+  if (options?.runOptions?.turnAuthorization) return Promise.resolve(false);
+  return agentManager.tryRunOutOfBand(
+    agentId,
+    prompt,
+    options?.runOptions,
+    admitOutOfBand(options),
+    options?.commandDispatch,
+  );
+}
+
 export async function startAgentRun(
   agentManager: AgentRunController,
   agentId: string,
@@ -241,6 +294,8 @@ export async function startAgentRun(
   logger: Logger,
   options?: StartAgentRunOptions,
 ): Promise<PromptDispatchResult> {
+  options = requireFreshPeerTurn(options);
+  const peerReadOnly = options?.runOptions?.turnAuthorization === "peer-read-only";
   const snapshot = agentManager.getAgent(agentId);
   logger.trace(
     {
@@ -257,26 +312,17 @@ export async function startAgentRun(
   // Out-of-band commands (e.g. /goal pause) must run WITHOUT canceling an
   // in-flight turn — replaceAgentRun would interrupt the running turn. The
   // intercept lives at this layer so it covers every prompt entrypoint.
-  const admitCommand = admitOutOfBand(options);
-  if (
-    await agentManager.tryRunOutOfBand(
-      agentId,
-      prompt,
-      options?.runOptions,
-      admitCommand,
-      options?.commandDispatch,
-    )
-  ) {
+  if (await tryPromptCommand(agentManager, agentId, prompt, options)) {
     options?.onDispatch?.("out_of_band");
     return { disposition: "out_of_band" };
   }
   const promptStart = createForegroundPromptStart(agentId, options);
   try {
     try {
-      await agentManager.reloadStalePluginSession(agentId);
+      if (!peerReadOnly) await agentManager.reloadStalePluginSession(agentId);
       return await startAgentRunInner(agentManager, agentId, prompt, logger, options, promptStart);
     } catch (error) {
-      if (!isStaleProviderSessionError(error)) throw error;
+      if (peerReadOnly || !isStaleProviderSessionError(error)) throw error;
       logger.info(
         { agentId, err: error },
         "Provider session went stale; reopening from persistence",
@@ -330,7 +376,12 @@ async function startAgentRunInner(
       try {
         await drainAgentRunIterator(iterator);
       } catch (error) {
-        if (!isStaleProviderSessionError(error)) throw error;
+        if (
+          options?.runOptions?.turnAuthorization === "peer-read-only" ||
+          !isStaleProviderSessionError(error)
+        ) {
+          throw error;
+        }
         logger.info(
           { agentId, err: error },
           "Provider session went stale; reopening from persistence",
@@ -436,19 +487,50 @@ export interface StartCreatedAgentInitialPromptParams {
   logger: Logger;
 }
 
-/**
- * Outer bound on a run reaching "started" after dispatch.
- *
- * This wraps provider startup, so it MUST stay larger than the slowest provider's own
- * startup budget — otherwise it aborts a start the provider was still allowed to be
- * working on, and the provider's budget can never apply. OpenCode is the slowest today:
- * up to 30s for the server to boot (OPENCODE_SERVER_STARTUP_TIMEOUT_MS) and then a
- * session.create on the same budget, so this is deliberately set well above 30s.
- *
- * Not derived from the provider constant on purpose: this module is provider-agnostic
- * and must not depend on a specific provider's internals.
- */
+/** Sender wait budget. A provider may still acknowledge an already submitted prompt later. */
 const AGENT_RUN_START_TIMEOUT_MS = 60_000;
+
+export function createPeerPromptHandoff(handoff?: QueueHandoff) {
+  let submitted = false;
+  let accepted = false;
+  let expired: QueuedPromptLoadError | AgentRequestOutcomeUnknownError | undefined;
+  const assertAllowed = () => {
+    if (expired) throw expired;
+  };
+  return {
+    handoff: handoff && {
+      ...handoff,
+      declined: async () => {
+        if (!accepted && !(submitted && expired)) await handoff.declined();
+      },
+    },
+    assertAllowed,
+    onSubmitting() {
+      assertAllowed();
+      submitted = true;
+    },
+    onAccepted() {
+      if (!submitted || accepted) return;
+      accepted = true;
+      if (expired) return handoff?.onProviderOutcome?.("accepted");
+    },
+    async wait(started: Promise<void>, manager: Pick<AgentManager, "getAgent">, agentId: string) {
+      try {
+        await waitForAgentRunStartWithTimeout(manager, agentId, started);
+      } catch (error) {
+        if (accepted) return;
+        if (!(error instanceof AgentRunStartTimeoutError)) throw error;
+        expired = submitted
+          ? new AgentRequestOutcomeUnknownError({ cause: error })
+          : new QueuedPromptLoadError(error);
+        if (!submitted) await handoff?.declined();
+        throw expired;
+      }
+    },
+  };
+}
+
+class AgentRunStartTimeoutError extends Error {}
 
 export async function waitForAgentRunStartWithTimeout(
   agentManager: Pick<AgentManager, "getAgent">,
@@ -461,7 +543,7 @@ export async function waitForAgentRunStartWithTimeout(
   const startTimeout = setTimeout(
     () =>
       startAbort.abort(
-        new Error(
+        new AgentRunStartTimeoutError(
           `${provider} run did not start within ${AGENT_RUN_START_TIMEOUT_MS / 1000} seconds (phase: run start)`,
         ),
       ),
@@ -484,6 +566,10 @@ export async function waitForAgentRunStartWithTimeout(
 }
 
 function createStartAbortError(reason: unknown): Error {
+  if (reason instanceof AgentRunStartTimeoutError) {
+    reason.name = "AbortError";
+    return reason;
+  }
   let message = "wait_for_agent_start aborted";
   if (typeof reason === "string") message = reason;
   else if (reason instanceof Error) message = reason.message;
@@ -592,10 +678,12 @@ function preparePromptHandoff({
   | undefined {
   if (!handoff && !validateDispatch && !assertDispatchAllowed) return undefined;
   return async () => {
+    assertDispatchAllowed?.();
     await validateDispatch?.();
     assertDispatchAllowed?.();
     try {
       await handoff?.begin();
+      assertDispatchAllowed?.();
       await validateDispatch?.();
       assertDispatchAllowed?.();
     } catch (error) {
@@ -657,15 +745,63 @@ async function dispatchPreparedPrompt(
   params: Omit<SendPromptToAgentParams, "source" | "messageId">,
   humanPrompt: boolean,
 ): Promise<PromptDispatchResult> {
-  const unarchive = params.unarchive ?? true;
-
   const record = await params.agentStorage.get(params.agentId);
+  if (params.runOptions?.turnAuthorization === "peer-read-only") {
+    return dispatchPreparedPeerPrompt(params, record);
+  }
+  if (record?.archivedAt && params.unarchive === false) {
+    return { disposition: "turn_started", started: Promise.resolve() };
+  }
+  await loadPreparedPromptRecipient(params, record);
+  params.assertDispatchAllowed?.();
+  if (
+    params.idleOnly &&
+    !params.canSteerDuringDrain?.() &&
+    params.agentManager.hasInFlightRun(params.agentId)
+  ) {
+    throw new AgentTurnBusyError(`Agent ${params.agentId} is running`);
+  }
+  if (params.sessionMode) {
+    await params.agentManager.setAgentMode(params.agentId, params.sessionMode);
+  }
+  await params.beforeDispatch?.();
+  return startPreparedPromptRun(params, humanPrompt);
+}
+
+async function dispatchPreparedPeerPrompt(
+  params: Omit<SendPromptToAgentParams, "source" | "messageId">,
+  record: StoredAgentRecord | null,
+): Promise<PromptDispatchResult> {
+  const live = params.agentManager.getAgent(params.agentId);
+  const provider = live?.provider ?? record?.provider;
+  if (record?.archivedAt || !provider) {
+    throw new AgentTurnStartRejectedError("The peer message recipient is archived or unavailable.");
+  }
+  if (
+    params.agentManager.adapterOf(provider) !== "codex" ||
+    !params.agentManager.getRegisteredProviderIds().includes(provider)
+  ) {
+    throw new AgentTurnStartRejectedError(
+      "This provider cannot enforce a fresh read-only turn for peer messages. Use a supported Codex session.",
+    );
+  }
+  const peerSession = live?.session;
+  if (!peerSession) throw peerRecipientRequiresOpenSession();
+  params.assertDispatchAllowed?.();
+  await params.beforeDispatch?.();
+  if (params.agentManager.getAgent(params.agentId)?.session !== peerSession) {
+    throw peerRecipientRequiresOpenSession();
+  }
+  return startPreparedPromptRun(params, false);
+}
+
+async function loadPreparedPromptRecipient(
+  params: Omit<SendPromptToAgentParams, "source" | "messageId">,
+  record: StoredAgentRecord | null,
+): Promise<void> {
   let archivedAtToRestore: string | null = null;
   let previousTopicMainWorkspaceId: string | undefined;
   if (record?.archivedAt) {
-    if (!unarchive) {
-      return { disposition: "turn_started", started: Promise.resolve() };
-    }
     previousTopicMainWorkspaceId = await readArchivedTopicMainWorkspaceId(
       params.agentManager,
       record,
@@ -693,22 +829,14 @@ async function dispatchPreparedPrompt(
     }
     throw await classifyPromptLoadFailure(params, error);
   }
+}
 
-  params.assertDispatchAllowed?.();
-  if (
-    params.idleOnly &&
-    !params.canSteerDuringDrain?.() &&
-    params.agentManager.hasInFlightRun(params.agentId)
-  ) {
-    throw new AgentTurnBusyError(`Agent ${params.agentId} is running`);
-  }
-  if (params.sessionMode) {
-    await params.agentManager.setAgentMode(params.agentId, params.sessionMode);
-  }
-
-  await params.beforeDispatch?.();
+function startPreparedPromptRun(
+  params: Omit<SendPromptToAgentParams, "source" | "messageId">,
+  humanPrompt: boolean,
+): Promise<PromptDispatchResult> {
   const beforeHandoff = preparePromptHandoff(params);
-  return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
+  return startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
     humanPrompt,
     replaceRunning: !params.idleOnly,
     idleOnly: params.idleOnly,
@@ -740,6 +868,7 @@ export async function startCreatedAgentInitialPrompt(
     return currentSnapshot;
   }
 
+  const peerReadOnly = peerInitialPrompt.getStore()?.verifiedAgentId === params.agentId;
   const delivery = prepareAgentMessage(
     params.prompt,
     await resolvePromptSource(params.source, params.agentManager, params.agentStorage),
@@ -757,6 +886,9 @@ export async function startCreatedAgentInitialPrompt(
       runOptions: {
         ...params.runOptions,
         clientMessageId: delivery.messageId,
+        ...(peerReadOnly
+          ? { turnAuthorization: "peer-read-only", waitForProviderPrompt: true }
+          : {}),
       },
       beforeHandoff: params.validateDispatch ? preparePromptHandoff(params) : params.handoff?.begin,
       onSteerDeclined: params.handoff?.declined,

@@ -2704,12 +2704,25 @@ export class DaemonClient {
     }
   }
 
-  async clearAgentAttention(agentId: string | string[]): Promise<void> {
+  async clearTeamConclusionAttention(
+    agentId: string,
+    teamConclusion: { workspaceId: string; attentionTimestamp: string },
+  ): Promise<void> {
+    // COMPAT(teamConclusionAttention): older hosts only keep the App's local read mark.
+    if (this.lastServerInfoMessage?.features?.teamConclusionAttention !== true) return;
+    await this.clearAgentAttention(agentId, teamConclusion);
+  }
+
+  async clearAgentAttention(
+    agentId: string | string[],
+    teamConclusion?: { workspaceId: string; attentionTimestamp: string },
+  ): Promise<void> {
     const requestId = this.createRequestId();
     const message = SessionInboundMessageSchema.parse({
       type: "clear_agent_attention",
       agentId,
       requestId,
+      ...(teamConclusion ? { teamConclusion } : {}),
     });
     await this.sendRequest({
       requestId,

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createPromptJumpSettleController,
   type PromptJumpSettleViewport,
@@ -131,11 +131,14 @@ describe("prompt jump settle", () => {
     const controller = createController(viewport, frames);
     viewport.setTargetTop("target", 8);
 
-    controller.start("target");
+    const settled = vi.fn();
+    controller.start("target", settled);
     frames.runNextFrame();
+    expect(settled).not.toHaveBeenCalled();
     frames.runNextFrame();
 
     expect(controller.isActive()).toBe(false);
+    expect(settled).toHaveBeenCalledExactlyOnceWith(true);
   });
 
   it("succeeds when the target remains below the top at maximum scroll", () => {
@@ -172,10 +175,12 @@ describe("prompt jump settle", () => {
     const viewport = createFakeViewport();
     const controller = createController(viewport, frames);
 
-    controller.start("missing");
+    const settled = vi.fn();
+    controller.start("missing", settled);
     for (let frame = 0; frame < 24; frame += 1) frames.runNextFrame();
 
     expect(controller.isActive()).toBe(false);
+    expect(settled).toHaveBeenCalledExactlyOnceWith(false);
   });
 
   it("cancels the previous target when a newer jump starts", () => {

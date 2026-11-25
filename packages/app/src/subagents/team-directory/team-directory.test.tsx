@@ -10,11 +10,20 @@ import {
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useSessionStore, type Agent } from "@/stores/session-store";
 import { useTeamDirectoryViewStore } from "@/stores/team-directory-view-store";
 import { useTopicInboxReadStore } from "@/stores/topic-inbox-read-store";
+import { useAgentAttentionClear } from "@/hooks/use-agent-attention-clear";
 import type { StreamItem } from "@/types/stream";
 import { createTeamMessageJumpStore, TeamMessageJumpProvider } from "./message-jump-store";
 import { WorkspaceTeamDirectory } from "./team-directory";
@@ -24,10 +33,13 @@ const runtime = vi.hoisted(() => ({
     archiveAgent: ReturnType<typeof vi.fn>;
     flushAgentInbox: ReturnType<typeof vi.fn>;
     clearWorkspaceAttention: ReturnType<typeof vi.fn>;
+    clearTeamConclusionAttention: ReturnType<typeof vi.fn>;
     getLastServerInfoMessage: () => { permissions: string[] };
   },
   archiveAgentSnapshot: vi.fn(),
 }));
+
+vi.mock("@/utils/app-visibility", () => ({ getIsAppActivelyVisible: () => true }));
 
 vi.mock("lucide-react-native", async (original) => {
   const icons = await original<typeof import("lucide-react-native")>();
@@ -147,6 +159,7 @@ function setupDirectory({
   const archiveAgent = vi.fn(async () => ({ archivedAt: "2026-11-24T12:00:00.000Z" }));
   const flushAgentInbox = vi.fn(async () => ({}));
   const clearWorkspaceAttention = vi.fn(async () => ({}));
+  const clearTeamConclusionAttention = vi.fn(async () => ({}));
   const onOpenAgent = vi.fn();
   const jumpStore = createTeamMessageJumpStore();
 
@@ -166,6 +179,7 @@ function setupDirectory({
     archiveAgent,
     flushAgentInbox,
     clearWorkspaceAttention,
+    clearTeamConclusionAttention,
     getLastServerInfoMessage: () => serverInfoMessage,
   };
   const store = useSessionStore.getState();
@@ -347,3 +361,91 @@ it("switches between attribute view (showing parent Level-1 on Level-2 rows) and
   });
   expect(screen.getByTestId("team-directory-read-section")).toBeTruthy();
 });
+
+it.each(["open", "single", "all"] as const)(
+  "reads only the captured main conclusion via %s and leaves unrelated attention alone",
+  (method) => {
+    const timestamp = new Date("2026-11-25T09:30:00.000Z");
+    const conclusionId = `main-conclusion:main-1:att:${timestamp.getTime()}`;
+    const { jumpStore } = setupDirectory({
+      supportsIdleArchive: true,
+      extraAgents: [
+        makeAgent("main-1", {
+          labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+          attentionTimestamp: timestamp,
+          requiresAttention: true,
+          attentionReason: "finished",
+        }),
+      ],
+    });
+    fireEvent.click(screen.getByTestId("team-directory-tab-messages"));
+    const controls = {
+      all: "team-directory-mark-all-read",
+      single: `team-directory-mark-read-${conclusionId}`,
+      open: `team-directory-message-${conclusionId}`,
+    };
+    fireEvent.click(screen.getByTestId(controls[method]));
+
+    expect(runtime.client.clearTeamConclusionAttention).toHaveBeenCalledExactlyOnceWith("main-1", {
+      workspaceId: WORKSPACE_ID,
+      attentionTimestamp: timestamp.toISOString(),
+    });
+    expect(runtime.client.clearWorkspaceAttention).not.toHaveBeenCalled();
+    expect(screen.getByTestId("team-directory-read-section")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId(`team-directory-message-${conclusionId}`));
+    expect(runtime.client.clearTeamConclusionAttention).toHaveBeenCalledTimes(1);
+    expect(jumpStore.consumeNavigationFocus("main-1")).toBe(true);
+    expect(jumpStore.consumeNavigationFocus("main-1")).toBe(false);
+  },
+);
+
+it.each(["clearOnUserInteraction", "clearOnPromptSend"] as const)(
+  "opening a report protects the new conclusion until %s",
+  async (acknowledge) => {
+    const jumpStore = createTeamMessageJumpStore();
+    const clearAgentAttention = vi.fn(async () => {});
+    const client = { clearAgentAttention } as unknown as DaemonClient;
+    const onError = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ focused, dataReady }: { focused: boolean; dataReady: boolean }) =>
+        useAgentAttentionClear({
+          agentId: "main-1",
+          client,
+          isConnected: true,
+          isAgentDataReady: dataReady,
+          requiresAttention: true,
+          attentionReason: "finished",
+          isScreenFocused: focused,
+          focusRequest: null,
+          onError,
+        }),
+      {
+        initialProps: { focused: false, dataReady: false },
+        wrapper: ({ children }) => (
+          <TeamMessageJumpProvider store={jumpStore}>{children}</TeamMessageJumpProvider>
+        ),
+      },
+    );
+
+    const requestId = jumpStore.requestJump({
+      serverId: SERVER_ID,
+      agentId: "main-1",
+      itemId: "old-report",
+      messageId: "old-report",
+      epoch: null,
+      seq: null,
+    });
+    rerender({ focused: true, dataReady: false });
+    jumpStore.acknowledgeJump(requestId);
+    rerender({ focused: true, dataReady: true });
+    act(() => result.current.clearOnInputFocus());
+    expect(clearAgentAttention).not.toHaveBeenCalled();
+
+    act(() => result.current[acknowledge]());
+    await waitFor(() => expect(clearAgentAttention).toHaveBeenCalledExactlyOnceWith("main-1"));
+    act(() => result.current.clearOnInputFocus());
+    expect(clearAgentAttention).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+  },
+);

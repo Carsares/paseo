@@ -13,7 +13,7 @@ export interface PromptJumpSettleViewport {
 }
 
 export interface PromptJumpSettleController {
-  start(messageId: string): void;
+  start(messageId: string, onSettled?: (landed: boolean) => void): void;
   cancel(): void;
   isActive(): boolean;
 }
@@ -38,7 +38,11 @@ export function createPromptJumpSettleController(input: {
   let stableFrames = 0;
   let unsubscribeFromUserIntent: (() => void) | null = null;
 
-  function finish(): void {
+  let onSettled: ((landed: boolean) => void) | undefined;
+
+  function finish(landed: boolean): void {
+    const notify = onSettled;
+    onSettled = undefined;
     if (frameId !== null) input.cancelFrame(frameId);
     unsubscribeFromUserIntent?.();
     activeMessageId = null;
@@ -46,6 +50,7 @@ export function createPromptJumpSettleController(input: {
     sampledFrames = 0;
     stableFrames = 0;
     unsubscribeFromUserIntent = null;
+    notify?.(landed);
   }
 
   function scheduleNextFrame(): void {
@@ -64,7 +69,7 @@ export function createPromptJumpSettleController(input: {
       if (Math.abs(delta) <= POSITION_TOLERANCE_PX) {
         stableFrames += 1;
         if (stableFrames >= REQUIRED_STABLE_FRAMES) {
-          finish();
+          finish(true);
           return;
         }
       } else {
@@ -82,28 +87,38 @@ export function createPromptJumpSettleController(input: {
         }
         const maxScrollTop = Math.max(0, after.scrollHeight - after.clientHeight);
         const isClampedAtBottom = after.scrollTop >= maxScrollTop - POSITION_TOLERANCE_PX;
-        if (remainingDelta > POSITION_TOLERANCE_PX && isClampedAtBottom) {
-          finish();
-          return;
+        if (adjustedTargetTop !== null) {
+          const y = adjustedTargetTop - input.viewport.getContainerTop();
+          const isVisible = y >= 0 && y < after.clientHeight;
+          const isClampedAtTop = after.scrollTop <= POSITION_TOLERANCE_PX;
+          if (
+            isVisible &&
+            ((remainingDelta > POSITION_TOLERANCE_PX && isClampedAtBottom) ||
+              (remainingDelta < -POSITION_TOLERANCE_PX && isClampedAtTop))
+          ) {
+            finish(true);
+            return;
+          }
         }
       }
     }
 
     if (sampledFrames >= FRAME_BUDGET) {
-      finish();
+      finish(false);
       return;
     }
     scheduleNextFrame();
   }
 
   return {
-    start(messageId) {
-      finish();
+    start(messageId, callback) {
+      finish(false);
       activeMessageId = messageId;
-      unsubscribeFromUserIntent = input.viewport.subscribeToUserIntent(finish);
+      onSettled = callback;
+      unsubscribeFromUserIntent = input.viewport.subscribeToUserIntent(() => finish(false));
       scheduleNextFrame();
     },
-    cancel: finish,
+    cancel: () => finish(false),
     isActive() {
       return activeMessageId !== null;
     },

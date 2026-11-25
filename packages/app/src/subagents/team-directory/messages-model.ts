@@ -44,6 +44,7 @@ export interface TeamInboxMessageItem {
   canFlushPendingInbox?: boolean;
   readCandidate?: TopicInboxReadCandidate;
   mainConclusionSnapshot?: RetainedMainConclusionSnapshot;
+  conclusionAttentionTimestamp?: string;
 }
 
 export interface TeamDirectoryMessagesProjection {
@@ -698,6 +699,7 @@ function collectMainConclusionMessage(input: {
     jumpTarget,
     readCandidate,
     mainConclusionSnapshot,
+    conclusionAttentionTimestamp: isRead ? undefined : mainAgent.attentionTimestamp?.toISOString(),
   };
 
   if (isRead) acc.read.push(entry);

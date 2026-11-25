@@ -216,23 +216,60 @@ test("diagnostics still exercise the configured proxy when normal routing bypass
   expect(recorder.requests).toEqual([{ target: "relay.paseo.sh:443", authorization: undefined }]);
 });
 
-test("split proxy diagnostics label HTTPS and WSS on port 443 for both configured slots", () => {
+test("split diagnostics send HTTP and WS to port 80, then test the secure slot on 443", async () => {
+  const origin = createServer((_request, response) => {
+    response.writeHead(308, { location: "https://relay.paseo.sh/health" }).end();
+  });
+  origin.on("upgrade", (request, socket) => {
+    socket.end(
+      `HTTP/1.1 308 Permanent Redirect\r\nLocation: https://relay.paseo.sh${request.url}\r\nContent-Length: 0\r\n\r\n`,
+    );
+  });
+  const plain = await proxy(await listen(origin));
+  const secure = await proxy();
   const transport = new ProxyTransport(
     {
       mode: "manual",
-      proxy: { kind: "split", httpUrl: "http://proxy.example", httpsUrl: "http://proxy.example" },
+      proxy: { kind: "split", httpUrl: plain.url, httpsUrl: secure.url },
+      bypass: ["*"],
     },
-    {},
+    {
+      http: { username: "plain", password: "fixture" },
+      https: { username: "secure", password: "fixture" },
+    },
     [],
   );
   transports.push(transport);
-  const checks = [
-    { protocol: "https", port: 443 },
-    { protocol: "wss", port: 443 },
-  ];
   expect(transport.diagnosticRoutes().map((route) => route.coverage)).toEqual([
-    { proxySlot: "http", checks },
-    { proxySlot: "https", checks },
+    {
+      proxySlot: "http",
+      checks: [
+        { protocol: "http", port: 80 },
+        { protocol: "ws", port: 80 },
+      ],
+    },
+    {
+      proxySlot: "https",
+      checks: [
+        { protocol: "https", port: 443 },
+        { protocol: "wss", port: 443 },
+      ],
+    },
+  ]);
+  await expect(diagnoseProxy(transport, AbortSignal.timeout(2_000))).rejects.toThrow(
+    /^Proxy diagnostic failed \(HTTPS port 443 via https proxy\)$/,
+  );
+  expect(plain.requests).toEqual(
+    Array.from({ length: 2 }, () => ({
+      target: "relay.paseo.sh:80",
+      authorization: `Basic ${Buffer.from("plain:fixture").toString("base64")}`,
+    })),
+  );
+  expect(secure.requests).toEqual([
+    {
+      target: "relay.paseo.sh:443",
+      authorization: `Basic ${Buffer.from("secure:fixture").toString("base64")}`,
+    },
   ]);
 });
 

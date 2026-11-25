@@ -1,10 +1,12 @@
-import { describe, expect, test, beforeEach, afterEach } from "vitest";
+import { describe, expect, test, beforeEach, afterEach, vi } from "vitest";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { Session as InspectorSession } from "node:inspector/promises";
 import type { HeapProfiler } from "node:inspector";
+import { SIDE_CHAT_LABEL } from "@getpaseo/protocol/agent-labels";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentStorage } from "./agent-storage.js";
@@ -775,5 +777,211 @@ describe("AgentStorage", () => {
     const afterReload = new AgentStorage(storagePath, createTestLogger());
     const after = await afterReload.listAll();
     expect(after.some((r) => r.id === agentId)).toBe(false);
+    expect(await afterReload.hasDeletedAgent(agentId)).toBe(true);
+    expect(await afterReload.hasDeletedAgent("unrecorded-id")).toBe(false);
+
+    await afterReload.upsert(recordA);
+    expect(await afterReload.hasDeletedAgent(agentId)).toBe(false);
+    expect((await fs.readdir(storagePath)).some((name) => name.endsWith(".intent"))).toBe(false);
+  });
+
+  test("does not prove deletion while a remaining snapshot is readable or failed to load", async () => {
+    const agentId = "partly-removed";
+    await storage.applySnapshot(createManagedAgent({ id: agentId }));
+    const record = await storage.get(agentId);
+    const firstPath = findRecordFile(storagePath, agentId);
+    const historicalPath = path.join(storagePath, "legacy-record.json");
+    await fs.writeFile(historicalPath, JSON.stringify(record));
+    const reloaded = new AgentStorage(storagePath, logger);
+    const originalUnlink = fs.unlink;
+    const failure = Object.assign(new Error("Simulated unlink failure"), { code: "EACCES" });
+    const prefix = {
+      version: 1 as const,
+      rows: [],
+      pendingContextHandoff: { olderSummary: "Saved context" },
+    };
+    await reloaded.timelinePrefixes.save(agentId, prefix);
+    const unlink = vi.spyOn(fs, "unlink").mockImplementation((filePath) => {
+      if (filePath === firstPath) return Promise.reject(failure);
+      return originalUnlink(filePath);
+    });
+    try {
+      await expect(reloaded.remove(agentId)).rejects.toBe(failure);
+    } finally {
+      unlink.mockRestore();
+    }
+    expect(existsSync(historicalPath)).toBe(false);
+    expect(existsSync(firstPath)).toBe(true);
+    expect(await reloaded.timelinePrefixes.load(agentId)).toEqual(prefix);
+    expect(await reloaded.get(agentId)).toMatchObject({ id: agentId });
+    expect(await reloaded.hasDeletedAgent(agentId)).toBe(false);
+    expect((await fs.readdir(storagePath)).some((name) => name.endsWith(".intent"))).toBe(false);
+    const partial = new AgentStorage(storagePath, logger);
+    expect(await partial.get(agentId)).toMatchObject({ id: agentId });
+    expect(await partial.hasDeletedAgent(agentId)).toBe(false);
+
+    const originalRead = fs.readFile;
+    const read = vi.spyOn(fs, "readFile").mockImplementation((...args) => {
+      if (args[0] === firstPath) return Promise.reject(failure);
+      return originalRead(...args);
+    });
+    try {
+      const incomplete = new AgentStorage(storagePath, logger);
+      expect(await incomplete.get(agentId)).toBeNull();
+      expect(await incomplete.hasDeletedAgent(agentId)).toBe(false);
+    } finally {
+      read.mockRestore();
+    }
+    await reloaded.setTitle(agentId, "Updated after incomplete delete");
+    expect(await partial.get(agentId)).toMatchObject({ id: agentId });
+    expect(await new AgentStorage(storagePath, logger).get(agentId)).toMatchObject({
+      title: "Updated after incomplete delete",
+    });
+    await reloaded.remove(agentId);
+    await reloaded.applySnapshot(createManagedAgent({ id: agentId }));
+    expect(await reloaded.get(agentId)).toBeNull();
+    expect(await reloaded.timelinePrefixes.load(agentId)).toBeNull();
+    expect(await new AgentStorage(storagePath, logger).hasDeletedAgent(agentId)).toBe(true);
+  });
+
+  test.for(["write", "sync"] as const)(
+    "keeps the snapshot when the delete intent fails to %s",
+    async (phase) => {
+      const agentId = "delete-intent-write-fails";
+      await storage.applySnapshot(createManagedAgent({ id: agentId }));
+      const digest = createHash("sha256").update(agentId).digest("hex");
+      const intentPath = path.join(storagePath, `.delete-${digest}.intent`);
+      if (phase === "write") await fs.mkdir(intentPath);
+      const open = fs.open;
+      const syncFailure = new Error("Simulated marker sync failure");
+      const spy = vi.spyOn(fs, "open").mockImplementation((...args) => {
+        if (phase === "sync" && args[0] === intentPath) return Promise.reject(syncFailure);
+        return open(...args);
+      });
+      try {
+        await expect(storage.remove(agentId)).rejects.toThrow();
+      } finally {
+        spy.mockRestore();
+      }
+      if (phase === "write") await fs.rmdir(intentPath);
+      expect(existsSync(intentPath)).toBe(false);
+      const reloaded = new AgentStorage(storagePath, logger);
+      expect(await reloaded.get(agentId)).toMatchObject({ id: agentId });
+      expect(await reloaded.hasDeletedAgent(agentId)).toBe(false);
+      await storage.setTitle(agentId, "Saved after marker failure");
+      expect((await storage.get(agentId))?.title).toBe("Saved after marker failure");
+      await storage.remove(agentId);
+      expect(await new AgentStorage(storagePath, logger).hasDeletedAgent(agentId)).toBe(true);
+    },
+  );
+
+  test("serializes a delete after a failed preparation and keeps the fence after commit", async () => {
+    const agentId = "concurrent-delete";
+    await storage.applySnapshot(createManagedAgent({ id: agentId }));
+    const entered = Promise.withResolvers<void>();
+    const allowFailure = Promise.withResolvers<void>();
+    const preparationFailure = new Error("Simulated persistence flush failure");
+    const first = storage.remove(agentId, {
+      prepare: async () => {
+        entered.resolve();
+        await allowFailure.promise;
+        throw preparationFailure;
+      },
+    });
+    const firstResult = expect(first).rejects.toBe(preparationFailure);
+    await entered.promise;
+    const prepareRetry = vi.fn(async () => {
+      expect(await storage.get(agentId)).toMatchObject({ id: agentId });
+    });
+    const cleanup = vi
+      .spyOn(storage.timelinePrefixes, "delete")
+      .mockRejectedValueOnce(new Error("Simulated prefix cleanup failure"));
+    const second = storage.remove(agentId, { prepare: prepareRetry });
+    await Promise.resolve();
+    expect(prepareRetry).not.toHaveBeenCalled();
+    allowFailure.resolve();
+    try {
+      await firstResult;
+      await second;
+      expect(prepareRetry).toHaveBeenCalledOnce();
+      expect(cleanup).toHaveBeenCalledExactlyOnceWith(agentId);
+    } finally {
+      cleanup.mockRestore();
+    }
+    await storage.applySnapshot(createManagedAgent({ id: agentId }));
+    expect(await storage.get(agentId)).toBeNull();
+    expect(await new AgentStorage(storagePath, logger).hasDeletedAgent(agentId)).toBe(true);
+  });
+
+  test("rechecks an empty side chat on retry after its snapshot becomes readable", async () => {
+    const agentId = "unreadable-side-chat";
+    const agent = {
+      ...createManagedAgent({ id: agentId }),
+      labels: { [SIDE_CHAT_LABEL]: "true" },
+      lastUserMessageAt: null,
+    };
+    await storage.applySnapshot(agent);
+    const file = findRecordFile(storagePath, agentId);
+    const inaccessible = Object.assign(new Error("Snapshot temporarily inaccessible"), {
+      code: "EACCES",
+    });
+    const originalUnlink = fs.unlink;
+    const originalRead = fs.readFile;
+    const unlink = vi
+      .spyOn(fs, "unlink")
+      .mockImplementation((...args) =>
+        args[0] === file ? Promise.reject(inaccessible) : originalUnlink(...args),
+      );
+    const read = vi
+      .spyOn(fs, "readFile")
+      .mockImplementation((...args) =>
+        args[0] === file ? Promise.reject(inaccessible) : originalRead(...args),
+      );
+    const options = { onlyIfEmptySideChat: vi.fn(() => false) };
+    try {
+      await expect(storage.remove(agentId, options)).rejects.toBe(inaccessible);
+      await expect(storage.remove(agentId, options)).rejects.toThrow(
+        "Could not verify the stored side chat after an incomplete delete",
+      );
+      expect(options.onlyIfEmptySideChat).toHaveBeenCalledOnce();
+      await expect(storage.hasDeletedAgent(agentId)).resolves.toBe(false);
+    } finally {
+      read.mockRestore();
+      unlink.mockRestore();
+    }
+
+    options.onlyIfEmptySideChat.mockReturnValueOnce(true);
+    await expect(storage.remove(agentId, options)).rejects.toThrow("cannot be discarded");
+    await storage.remove(agentId, options);
+    expect(options.onlyIfEmptySideChat).toHaveBeenCalledTimes(3);
+    await storage.applySnapshot(agent);
+    await expect(storage.get(agentId)).resolves.toBeNull();
+    await expect(new AgentStorage(storagePath, logger).hasDeletedAgent(agentId)).resolves.toBe(
+      true,
+    );
+  });
+
+  test("keeps deletion evidence and blocks late snapshots when no copy survives a failure", async () => {
+    const agentId = "failed-after-last-unlink";
+    const agent = createManagedAgent({ id: agentId });
+    await storage.applySnapshot(agent);
+    const recordFile = findRecordFile(storagePath, agentId);
+    const originalUnlink = fs.unlink;
+    const failure = new Error("Simulated failure after removing the last copy");
+    const unlink = vi.spyOn(fs, "unlink").mockImplementation(async (filePath) => {
+      await originalUnlink(filePath);
+      if (filePath === recordFile) throw failure;
+    });
+    try {
+      await expect(storage.remove(agentId)).rejects.toBe(failure);
+    } finally {
+      unlink.mockRestore();
+    }
+    await storage.applySnapshot(agent);
+    expect(existsSync(recordFile)).toBe(false);
+    expect(await storage.get(agentId)).toBeNull();
+    expect(await storage.hasDeletedAgent(agentId)).toBe(true);
+    await storage.remove(agentId);
+    expect(await new AgentStorage(storagePath, logger).hasDeletedAgent(agentId)).toBe(true);
   });
 });

@@ -19,16 +19,20 @@ function isChildSource(source: AgentPromptSource): source is ChildSource {
 import {
   AgentTurnBusyError,
   AgentTurnChangedError,
+  QueuedPromptLoadError,
   type PromptDispatchDisposition,
   type PromptDispatchResult,
 } from "../agent-prompt.js";
+import { PeerRecipientNotReadyError } from "../agent-sdk-types.js";
 import { randomUUID } from "node:crypto";
 import type {
   AgentCommandOutcome,
   AgentPromptInput,
   AgentPromptContentBlock,
+  AgentRunOptions,
 } from "../agent-sdk-types.js";
 import {
+  claimPromptDispatchReservation,
   ensurePeerDispatchEnvironmentReady,
   envelopeMessage,
   flushAllHostPendingPeerOutcomes,
@@ -81,8 +85,14 @@ interface Admitted extends Message {
   drainSteerDeclined?: boolean;
   dispatchFailure?: { error: unknown };
   retainedForRestart?: boolean;
+  waitingForPeerRecipient?: boolean;
   outcomeUnknown?: boolean;
+  beginDispatchAttempt?: () => void;
+  peerTurnAuthorization?: () => AgentRunOptions["turnAuthorization"];
   onReturnedToQueue?: () => Promise<void>;
+  capturePeerAcceptance?: () => () => Promise<void>;
+  rejectHeldPeerReservation?: (prompt: AgentPromptInput) => Promise<boolean>;
+  peerReservationRejected?: boolean;
   /** claimed: a dispatch has it. It leaves the queue when the provider admits the prompt. */
   state: "queued" | "claimed" | "withdrawn" | "rejected";
   /** A steer or interrupt that was not released yet. After a Stop it waits like any other message. */
@@ -117,6 +127,7 @@ interface Inbox {
   holdGeneration: number;
   /** Explicit Stops invalidate acceptance of a human prompt already in flight. */
   stops: number;
+  recipientStateVersion: number;
 }
 interface DispatchRequest {
   recipientId: string;
@@ -130,6 +141,7 @@ interface DispatchRequest {
   prompt: AgentPromptInput;
   activeTurnBehavior: "steer" | "interrupt";
   idleOnly: boolean;
+  readonly turnAuthorization?: AgentRunOptions["turnAuthorization"];
   /**
    * Claim this exact prompt at provider admission. A withdrawn message or a Stop that reached
    * the recipient first invalidates it.
@@ -178,6 +190,7 @@ interface Dependencies {
   subscribe?: (
     listener: (recipientId: string, releaseInboxForRecipient?: boolean) => void,
   ) => () => void;
+  unavailableHeldRecipient?: (recipientId: string) => Promise<string | undefined>;
   /** Notify before a recipient's turn is stopped with no prompt replacing it. */
   onStop?: (listener: (recipientId: string) => void) => () => void;
   tryRunOutOfBand?(
@@ -238,6 +251,8 @@ export interface AgentMessageDelivery {
 }
 
 const isQueued = (message: Admitted): boolean => message.state === "queued";
+const isRunnable = (message: Admitted): boolean =>
+  isQueued(message) && !message.waitingForPeerRecipient;
 const isWithdrawn = (message: Admitted): boolean => message.state === "withdrawn";
 const isUrgent = (message: Admitted): boolean => isQueued(message) && message.urgency !== null;
 const isOfferable = (message: Admitted): boolean =>
@@ -285,6 +300,7 @@ function modeGroups(messages: Admitted[]): Admitted[][] {
     if (
       group.length &&
       ((mode && message.sessionMode && mode !== message.sessionMode) ||
+        Boolean(group[0]!.peerTurnAuthorization) !== Boolean(message.peerTurnAuthorization) ||
         group[0]!.taskAdmission ||
         message.taskAdmission ||
         group[0]!.beforeProviderDispatch ||
@@ -386,15 +402,20 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     idleOnly: boolean,
     stopped: () => boolean,
   ): DispatchRequest {
+    const peerOnly = messages.some((message) => message.peerTurnAuthorization);
     return {
       recipientId,
-      idleOnly,
+      idleOnly: idleOnly || peerOnly,
+      get turnAuthorization() {
+        return messages.find((message) => message.peerTurnAuthorization)?.peerTurnAuthorization?.();
+      },
       shouldReportUpward: messages.some(
         ({ childReported, source }) =>
           childReported ||
           (source.kind === "agent-notification" && source.event !== "permission-required"),
       ),
-      canSteerDuringDrain: idleOnly && messages.every(maySteerDuringDrain) ? preparing : undefined,
+      canSteerDuringDrain:
+        idleOnly && !peerOnly && messages.every(maySteerDuringDrain) ? preparing : undefined,
       validateDispatch: messages.some((message) => message.validateDispatch)
         ? checkMessages(messages, (message) => message.validateDispatch?.())
         : undefined,
@@ -429,7 +450,11 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     const handoffs = [...messages.map((message) => message.handoff), direct].filter(
       (handoff): handoff is QueueHandoff => handoff !== undefined,
     );
-    if (!handoffs.length) return undefined;
+    const confirmPeer = messages.flatMap((message) => {
+      const confirm = message.capturePeerAcceptance?.();
+      return confirm ? [confirm] : [];
+    });
+    if (!handoffs.length && !confirmPeer.length) return undefined;
     return {
       waitForForegroundConfirmation: handoffs.some((entry) => entry.waitForForegroundConfirmation),
       async begin() {
@@ -440,6 +465,10 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         for (const entry of handoffs) await entry.declined();
       },
       async onProviderOutcome(outcome) {
+        // Leave the handed-off receipt in place until peer acceptance is recoverable.
+        if (outcome === "accepted") {
+          for (const confirm of confirmPeer) await confirm();
+        }
         for (const entry of handoffs) await entry.onProviderOutcome?.(outcome);
       },
     };
@@ -502,7 +531,14 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   /** After an operation, a waiting queue keeps polling for the turn to end. */
   function rest(recipientId: string): void {
     const inbox = inboxes.get(recipientId);
-    if (closed || !inbox || inbox.advancing || inbox.phase !== "waiting") return;
+    if (
+      closed ||
+      !inbox ||
+      inbox.advancing ||
+      inbox.phase !== "waiting" ||
+      !inbox.messages.some(isRunnable)
+    )
+      return;
     inbox.cancelTimer();
     if (preparing() && !isRunning(recipientId)) {
       nudge(recipientId, inbox);
@@ -520,17 +556,44 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     }
   }
 
-  async function returnBusyBatch(
+  async function returnBlockedBatch(
     error: unknown,
     messages: Admitted[],
     request: DispatchRequest,
+    inbox: Inbox,
+    stateVersion: number,
   ): Promise<boolean> {
-    if (!(error instanceof AgentTurnBusyError) || !request.idleOnly) return false;
+    if (!(error instanceof AgentTurnBusyError) || !request.idleOnly) {
+      return deferUntilPeerRecipientChanges(error, messages, request, inbox, stateVersion);
+    }
     handBack(messages);
     for (const message of messages) {
       await message.onReturnedToQueue?.();
       if (request.canSteerDuringDrain && preparing()) message.drainSteerDeclined = true;
     }
+    return true;
+  }
+
+  async function deferUntilPeerRecipientChanges(
+    error: unknown,
+    messages: Admitted[],
+    request: DispatchRequest,
+    inbox: Inbox,
+    stateVersion: number,
+  ): Promise<boolean> {
+    if (
+      !(error instanceof PeerRecipientNotReadyError) ||
+      !request.turnAuthorization ||
+      !messages.every((message) => message.handoff?.retryQueued)
+    )
+      return false;
+    await returnUnsubmittedBatch(messages, request);
+    for (const message of messages) {
+      await message.handoff?.retryQueued?.();
+      // A session can open while validation or the receipt write is in progress.
+      message.waitingForPeerRecipient = inbox.recipientStateVersion === stateVersion;
+    }
+    for (const check of stopWaiters) check(request.recipientId);
     return true;
   }
 
@@ -564,7 +627,8 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     for (const message of messages) fail(message, error);
   }
 
-  async function awaitPeerEnvironmentForBatch(messages: Admitted[]): Promise<void> {
+  async function prepareDispatchAttempt(messages: Admitted[]): Promise<void> {
+    for (const message of messages) message.beginDispatchAttempt?.();
     const peerMsg = messages.find((message) => hasMandatoryPeerDispatchMarker(message.prompt));
     if (!peerMsg) return;
     const senderServerId = "serverId" in peerMsg.source ? peerMsg.source.serverId : undefined;
@@ -585,9 +649,13 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     prompt: AgentPromptInput,
     validateDispatch: (() => Promise<void> | void) | undefined,
   ): {
+    beginDispatchAttempt?: () => void;
+    peerTurnAuthorization?: Admitted["peerTurnAuthorization"];
     validateDispatch?: () => Promise<void>;
     onReturnedToQueue?: () => Promise<void>;
     onOutcome?: (outcome: PeerDispatchTerminalOutcome) => void;
+    capturePeerAcceptance?: Admitted["capturePeerAcceptance"];
+    rejectHeldPeerReservation?: Admitted["rejectHeldPeerReservation"];
   } {
     const hasPeerMarker = hasMandatoryPeerDispatchMarker(prompt);
     if (!validateDispatch && !hasPeerMarker) return {};
@@ -596,41 +664,77 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       senderAgentId: "agentId" in source ? source.agentId : undefined,
       senderServerId: "serverId" in source ? source.serverId : undefined,
     };
-    let latestAttemptId: string | undefined;
+    const owner = {};
+    const reservation = hasPeerMarker
+      ? claimPromptDispatchReservation(prompt, baseContext, owner)
+      : undefined;
+    let attemptId: string | undefined;
+    let turnAuthorization: AgentRunOptions["turnAuthorization"];
+    const notify = async (outcome: PeerDispatchTerminalOutcome, id = attemptId) => {
+      await reservation;
+      await notifyPromptDispatchOutcome(prompt, outcome, { ...baseContext, attemptId: id }, owner);
+    };
     return {
+      beginDispatchAttempt: hasPeerMarker
+        ? () => {
+            attemptId = randomUUID();
+            turnAuthorization = undefined;
+          }
+        : undefined,
+      peerTurnAuthorization: hasPeerMarker ? () => turnAuthorization : undefined,
       validateDispatch: async () => {
         await validateDispatch?.();
         if (hasPeerMarker) {
-          const verified = await verifyMandatoryPeerPromptAtDispatch(prompt, baseContext);
-          latestAttemptId = verified?.attemptId;
+          if (!attemptId) throw new Error("Peer dispatch requires an active delivery attempt.");
+          await reservation;
+          turnAuthorization = await verifyMandatoryPeerPromptAtDispatch(
+            prompt,
+            baseContext,
+            attemptId,
+            owner,
+          );
+          if (!turnAuthorization) throw new Error("Missing verified peer dispatch authorization.");
         }
       },
       onReturnedToQueue: hasPeerMarker
         ? async () => {
-            const attemptId = latestAttemptId;
-            if (!attemptId) return;
-            await notifyPromptDispatchOutcome(prompt, "returned_to_queue", {
-              ...baseContext,
-              attemptId,
-            }).catch(() => undefined);
+            if (attemptId) await notify("returned_to_queue").catch(() => undefined);
           }
         : undefined,
-      onOutcome: hasPeerMarker
-        ? (outcome) => {
-            trackOutcomeWrite(
-              notifyPromptDispatchOutcome(prompt, outcome, {
-                ...baseContext,
-                attemptId: latestAttemptId,
-              }),
+      onOutcome: hasPeerMarker ? (outcome) => trackOutcomeWrite(notify(outcome)) : undefined,
+      rejectHeldPeerReservation: hasPeerMarker
+        ? async (heldPrompt) => {
+            await reservation;
+            // A previous check may have removed the reservation before the receipt write failed.
+            await claimPromptDispatchReservation(prompt, baseContext, owner);
+            return (
+              (await notifyPromptDispatchOutcome(
+                heldPrompt,
+                "definitively_unsent",
+                { ...baseContext, rejectDurableHold: true },
+                owner,
+              )) === true
             );
+          }
+        : undefined,
+      capturePeerAcceptance: hasPeerMarker
+        ? () => {
+            const id = attemptId;
+            return async () => {
+              if (!id) throw new Error("Peer acceptance requires a delivery attempt.");
+              const write = notify("accepted", id);
+              trackOutcomeWrite(write);
+              await write;
+            };
           }
         : undefined,
     };
   }
 
-  function resolveRejectedOutcome(message: Admitted): PeerDispatchTerminalOutcome {
+  function resolveRejectedOutcome(message: Admitted, error: unknown): PeerDispatchTerminalOutcome {
     if (message.outcomeUnknown) return "outcome_unknown";
-    if (message.retainedForRestart) return "retained_for_restart";
+    if (message.retainedForRestart || error instanceof QueuedPromptLoadError)
+      return "retained_for_restart";
     return "definitively_unsent";
   }
 
@@ -644,8 +748,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         validation.onOutcome?.("accepted");
         return undefined;
       },
-      () => {
-        validation.onOutcome?.(resolveRejectedOutcome(message));
+      (error: unknown) => {
+        if (!message.peerReservationRejected)
+          validation.onOutcome?.(resolveRejectedOutcome(message, error));
       },
     );
   }
@@ -669,15 +774,17 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   /** Dispatch one batch. A batch that finds the recipient stopped, or busy when idle-only, stays queued. */
   async function deliver(
     recipientId: string,
+    inbox: Inbox,
     batch: Admitted[],
     idleOnly: boolean,
     stopped: () => boolean,
   ): Promise<void> {
     let retriedChangedTurn = false;
     for (;;) {
-      const messages = batch.filter(isQueued);
+      const messages = batch.filter(isRunnable);
       if (!messages.length) return;
-      await awaitPeerEnvironmentForBatch(messages);
+      const stateVersion = inbox.recipientStateVersion;
+      await prepareDispatchAttempt(messages);
       const hasSubagentInbox = hasSubagentInboxBatch(messages);
       const request = requestFor(
         recipientId,
@@ -716,8 +823,8 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
           retriedChangedTurn = true;
           continue;
         }
-        if (await returnBusyBatch(error, messages, request)) {
-          if (closed && !hasSubagentInbox) continue;
+        if (await returnBlockedBatch(error, messages, request, inbox, stateVersion)) {
+          if (closed && !hasSubagentInbox && !request.turnAuthorization) continue;
           return;
         }
         failBatch(messages, error);
@@ -739,7 +846,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     for (const message of candidates) {
       if (closed || stopped() || !stillDue()) return;
       if (!isOfferable(message)) continue;
-      await awaitPeerEnvironmentForBatch([message]);
+      await prepareDispatchAttempt([message]);
       const request = requestFor(recipientId, [message], true, stopped);
       try {
         await request.validateDispatch?.();
@@ -762,6 +869,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         if (accepted) claim(message, "out_of_band", request);
         else {
           handBack([message]);
+          await message.onReturnedToQueue?.();
           message.outOfBandDeclined = true;
         }
       } catch (error) {
@@ -769,6 +877,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         await request.handoff?.declined();
         if (stopped()) {
           handBack([message]);
+          await message.onReturnedToQueue?.();
           return;
         }
         fail(message, error);
@@ -795,9 +904,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       const last = ahead.findLastIndex(isUrgent);
       if (last >= 0) {
         // A steer or an interrupt does not jump the queue: everything admitted before it goes first.
-        const first = modeGroups(ahead.slice(0, last + 1).filter(isQueued))[0] ?? [];
+        const first = modeGroups(ahead.slice(0, last + 1).filter(isRunnable))[0] ?? [];
         if (first.some(isUrgent) || !isRunning(recipientId)) {
-          await deliver(recipientId, first, !first.some(isUrgent), stopped);
+          await deliver(recipientId, inbox, first, !first.some(isUrgent), stopped);
         }
         return;
       }
@@ -807,9 +916,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     if (running()) await offerOutOfBand(recipientId, ahead, stopped, running);
     // Later mode groups stay queued for the turn ends that follow.
     if (inbox.phase === "waiting") {
-      const first = modeGroups(ahead.filter(isQueued))[0] ?? [];
+      const first = modeGroups(ahead.filter(isRunnable))[0] ?? [];
       if (!isRunning(recipientId) || (first.length && first.every(maySteerDuringDrain))) {
-        await deliver(recipientId, first, true, stopped);
+        await deliver(recipientId, inbox, first, true, stopped);
       }
     }
   }
@@ -839,7 +948,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   /** The quiet window closed, a retry came due, or the recipient settled. */
   function attempt(recipientId: string): void {
     const inbox = inboxes.get(recipientId);
-    if (!inbox || inbox.phase === "held") return;
+    if (!inbox || inbox.phase === "held" || !inbox.messages.some(isRunnable)) return;
     inbox.cancelTimer();
     inbox.cancelCap();
     inbox.phase = "waiting";
@@ -867,9 +976,11 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       advancing: false,
       holdGeneration: 0,
       stops: 0,
+      recipientStateVersion: 0,
     };
     inboxes.set(item.recipientId, inbox);
     inbox.messages.push(item);
+    if (item.held) rejectUnavailableHeldMessages(item.recipientId);
     if (item.heldAfterStop && inbox.messages.every((message) => message.held)) {
       inbox.phase = "held";
       return;
@@ -1016,16 +1127,57 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     }
   }
 
+  function rejectUnavailableHeldMessages(recipientId: string): void {
+    const check = dependencies.unavailableHeldRecipient;
+    const candidates = inboxes
+      .get(recipientId)
+      ?.messages.filter(
+        (message) =>
+          message.held &&
+          !message.outcomeUnknown &&
+          message.rejectHeldPeerReservation &&
+          message.handoff?.rejectHeld,
+      );
+    if (!check || !candidates?.length) return;
+    run(recipientId, async () => {
+      for (const message of candidates) {
+        if (!isQueued(message) || !message.held || message.outcomeUnknown) continue;
+        const rejectReservation = message.rejectHeldPeerReservation;
+        if (!message.handoff?.rejectHeld || !rejectReservation) continue;
+        const request = requestFor(recipientId, [message], true, () => true);
+        try {
+          const reason = await check(recipientId);
+          if (!reason || !isQueued(message)) continue;
+          const rejected = await message.handoff.rejectHeld(
+            recipientId,
+            message.receipt.messageId,
+            (held) => rejectReservation(held.prompt),
+          );
+          if (!rejected) continue;
+          message.peerReservationRejected = true;
+          if (isQueued(message)) fail(message, new Error(reason));
+        } catch (error) {
+          dependencies.onError(error, request);
+        }
+      }
+    });
+  }
+
   const unsubscribe = dependencies.subscribe?.((recipientId, releaseInboxForRecipient) => {
     refreshInbox(releaseInboxForRecipient ? recipientId : undefined);
-    if (inboxes.get(recipientId)?.phase === "waiting" && !isRunning(recipientId))
-      attempt(recipientId);
+    const inbox = inboxes.get(recipientId);
+    if (!inbox) return;
+    rejectUnavailableHeldMessages(recipientId);
+    inbox.recipientStateVersion++;
+    for (const message of inbox.messages) message.waitingForPeerRecipient = false;
+    if (inbox.phase === "waiting" && !isRunning(recipientId)) attempt(recipientId);
   });
   const unsubscribeStop = dependencies.onStop?.((recipientId) => {
     const inbox = inboxes.get(recipientId);
     if (inbox) {
       inbox.stops++;
       hold(inbox);
+      rejectUnavailableHeldMessages(recipientId);
     }
     for (const check of stopWaiters) check(recipientId);
   });
@@ -1063,10 +1215,27 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     const receipts: Promise<unknown>[] = [];
     for (const [recipientId, inbox] of inboxes) {
       if (inbox.phase === "held") continue;
-      receipts.push(...inbox.messages.map((message) => message.receipt.dispatched));
+      receipts.push(...inbox.messages.map(waitForRunnableMessage));
       attempt(recipientId);
     }
     await Promise.allSettled(receipts);
+  }
+
+  function waitForRunnableMessage(message: Admitted): Promise<unknown> {
+    if (!message.peerTurnAuthorization || !message.handoff?.retryQueued)
+      return message.receipt.dispatched;
+    if (message.waitingForPeerRecipient) return Promise.resolve();
+    let resolveParked!: () => void;
+    const parked = new Promise<void>((resolve) => {
+      resolveParked = resolve;
+    });
+    const check = (recipientId: string) => {
+      if (recipientId === message.recipientId && message.waitingForPeerRecipient) resolveParked();
+    };
+    stopWaiters.add(check);
+    return Promise.race([message.receipt.dispatched, parked]).finally(() =>
+      stopWaiters.delete(check),
+    );
   }
 
   return {
@@ -1114,7 +1283,12 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       withdrawPending(recipientId, (message) => matches(message.source)),
     hasPending(recipientId) {
       const inbox = inboxes.get(recipientId);
-      return parentInboxes.has(recipientId) || (inbox !== undefined && inbox.phase !== "held");
+      return (
+        parentInboxes.has(recipientId) ||
+        (inbox !== undefined &&
+          inbox.phase !== "held" &&
+          inbox.messages.some((message) => !message.waitingForPeerRecipient))
+      );
     },
     enqueue(message) {
       if (closed) throw new AgentMessageAdmissionError("Agent message delivery is closed");
@@ -1127,7 +1301,9 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         reject = failed;
       });
       void dispatched.catch(() => undefined);
-      const activeTurnBehavior = message.activeTurnBehavior ?? "queue";
+      const activeTurnBehavior = hasMandatoryPeerDispatchMarker(message.prompt)
+        ? "queue"
+        : (message.activeTurnBehavior ?? "queue");
       const receipt: Receipt = {
         status: "queued",
         messageId: message.messageId ?? randomUUID(),
@@ -1151,7 +1327,11 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       const item: Admitted = {
         ...message,
         validateDispatch: combinedValidation.validateDispatch,
+        beginDispatchAttempt: combinedValidation.beginDispatchAttempt,
+        peerTurnAuthorization: combinedValidation.peerTurnAuthorization,
         onReturnedToQueue: combinedValidation.onReturnedToQueue,
+        capturePeerAcceptance: combinedValidation.capturePeerAcceptance,
+        rejectHeldPeerReservation: combinedValidation.rejectHeldPeerReservation,
         taskAdmission,
         receipt,
         resolve,
@@ -1242,7 +1422,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       const waiting = Array.from(
         [...(inboxes.get(recipientId)?.messages ?? []), ...(parentInboxes.get(recipientId) ?? [])],
         (message) =>
-          message.receipt.dispatched.catch((error) => {
+          waitForRunnableMessage(message).catch((error) => {
             if (message.state !== "withdrawn") throw error;
             return undefined;
           }),
@@ -1319,6 +1499,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         inbox.cancelTimer();
         inbox.cancelCap();
         const retainHeld = (message: Admitted) =>
+          Boolean(message.waitingForPeerRecipient) ||
           (inbox.phase === "held" && Boolean(message.handoff?.holdAfterStop)) ||
           (Boolean(message.subagentInbox) && isRunning(recipientId));
         const deferQueued = (matches: (message: Admitted) => boolean) => {
@@ -1344,7 +1525,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
           deferQueued(retainHeld);
           try {
             for (const group of modeGroups(inbox.messages.filter(isQueued)))
-              await deliver(recipientId, group, false, () => false).catch(() => undefined);
+              await deliver(recipientId, inbox, group, false, () => false).catch(() => undefined);
           } finally {
             deferQueued(() => true);
           }

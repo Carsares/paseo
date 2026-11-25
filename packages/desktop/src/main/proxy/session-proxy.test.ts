@@ -7,7 +7,7 @@ import {
   desktopProxyPolicy,
   proxyForTarget,
 } from "./policy.js";
-import { createSessionProxyPort } from "./session-proxy.js";
+import { createSessionProxyPort, type LiveProxyConfig } from "./session-proxy.js";
 import type { StoredProxySettings } from "./storage.js";
 
 const http = "http://proxy.example";
@@ -35,8 +35,10 @@ function fakeSession(forceDirect = false, manual = policy) {
   let config: ProxyConfig = { mode: "direct" };
   let failClose = false;
   let badRoute = false;
+  const liveRoutes = new Map<string, string>();
   return {
     effects,
+    liveRoutes,
     failClose() {
       failClose = true;
     },
@@ -53,6 +55,8 @@ function fakeSession(forceDirect = false, manual = policy) {
     async resolveProxy(address: string) {
       effects.push("resolve");
       if (badRoute) return "PROXY unexpected.example:80";
+      const liveRoute = config.mode === "pac_script" && liveRoutes.get(address);
+      if (liveRoute) return liveRoute;
       if (config.mode === "direct") return "DIRECT";
       if (config.proxyBypassRules === "<-loopback>") {
         if (forceDirect) return "DIRECT";
@@ -71,7 +75,12 @@ function fakeSession(forceDirect = false, manual = policy) {
   };
 }
 
-function setup(timeoutMs = 1_000, forceDirect = false, manual = policy) {
+function setup(
+  timeoutMs = 1_000,
+  forceDirect = false,
+  manual = policy,
+  liveConfig?: () => LiveProxyConfig,
+) {
   const target = fakeSession(false, manual);
   const candidates: ReturnType<typeof fakeSession>[] = [];
   const requests: Array<{ url: string; keys: string[] }> = [];
@@ -83,6 +92,7 @@ function setup(timeoutMs = 1_000, forceDirect = false, manual = policy) {
     probes,
     routing,
     baseline: { mode: "direct" },
+    liveConfig,
     timeoutMs,
     createCandidate() {
       const value = fakeSession(forceDirect, manual);
@@ -130,6 +140,20 @@ function setup(timeoutMs = 1_000, forceDirect = false, manual = policy) {
 }
 
 describe("Chromium session proxy adapter", () => {
+  it("verifies an ordered control fallback list despite separator spacing", async () => {
+    const origin = "wss://host.example";
+    const fixture = setup(1_000, false, policy, () => ({
+      config: { mode: "pac_script" },
+      control: new Map([[origin, "HTTPS proxy.example:443;DIRECT"]]),
+      paired: new Set(),
+    }));
+    fixture.target.liveRoutes.set(origin + "/ws", "HTTPS proxy.example:443; DIRECT");
+    await fixture.port.apply(plan);
+    fixture.port.resume();
+    fixture.target.liveRoutes.set(origin + "/ws", "DIRECT;HTTPS proxy.example:443");
+    await expect(fixture.port.apply(plan)).rejects.toThrow(/expected desktop proxy route/);
+  });
+
   it("forces both configured endpoints despite wildcard bypass and scopes the probe credentials", async () => {
     const fixture = setup();
     await fixture.port.test(plan);

@@ -3,7 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react"
 import type { Virtualizer } from "@tanstack/react-virtual";
 import { getStreamItemMessageId, type StreamItem } from "@/types/stream";
 import { createPromptJumpSettleController, PROMPT_JUMP_TOP_INSET_PX } from "./prompt-jump-settle";
-import type { ScrollToMessageOccurrence } from "./strategy";
+import type { ScrollToMessageOccurrence, StreamMessageScrollCompletion } from "./strategy";
 
 interface UseScrollToMessageInput {
   active: boolean;
@@ -102,15 +102,23 @@ export function useScrollToMessage({
   }, [active, settleController]);
 
   const scrollToMessage = useCallback(
-    (messageId: string, occurrence?: ScrollToMessageOccurrence) => {
+    (
+      messageId: string,
+      occurrence?: ScrollToMessageOccurrence,
+      completion?: StreamMessageScrollCompletion,
+    ) => {
+      const container = scrollContainerRef.current;
+      if (!active || !container || occurrence?.signal.aborted || completion?.signal.aborted)
+        return false;
       occurrenceRef.current = occurrence;
       removeAbortListener.current?.();
       const cancel = () => settleController.cancel();
       occurrence?.signal.addEventListener("abort", cancel, { once: true });
-      removeAbortListener.current = () => occurrence?.signal.removeEventListener("abort", cancel);
-      if (!active) return;
-      const container = scrollContainerRef.current;
-      if (!container) return;
+      completion?.signal.addEventListener("abort", cancel, { once: true });
+      removeAbortListener.current = () => {
+        occurrence?.signal.removeEventListener("abort", cancel);
+        completion?.signal.removeEventListener("abort", cancel);
+      };
       cancelPendingStickToBottom();
       setFollowOutput(false);
 
@@ -123,9 +131,9 @@ export function useScrollToMessage({
           container.getBoundingClientRect().top -
           PROMPT_JUMP_TOP_INSET_PX;
         container.scrollTop += delta;
-        settleController.start(messageId);
+        settleController.start(messageId, completion?.onSettled);
         onNearBottomChange(false);
-        return;
+        return true;
       }
 
       const index = historyVirtualized.findIndex(
@@ -133,9 +141,11 @@ export function useScrollToMessage({
       );
       if (index >= 0) {
         rowVirtualizer.scrollToIndex(index, { align: "start" });
-        settleController.start(messageId);
+        settleController.start(messageId, completion?.onSettled);
         onNearBottomChange(false);
+        return true;
       }
+      return false;
     },
     [
       active,

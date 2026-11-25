@@ -39,6 +39,7 @@ contextBridge.exposeInMainWorld("paseoDesktop", {
   browserHostLabel: readArgValue("--paseo-browser-host-label="),
   browserHostInstanceId: readArgValue("--paseo-browser-host-instance-id="),
   nativeControlWebSocket: true,
+  directFileDownload: true,
   invoke: (command: string, args?: Record<string, unknown>) =>
     ipcRenderer.invoke("paseo:invoke", command, args),
   getPendingOpenProject: () =>

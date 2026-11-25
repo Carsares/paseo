@@ -14,6 +14,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import type { ReactNode } from "react";
+import { useLocalSearchParams } from "expo-router";
 import { useIsFocused } from "expo-router/react-navigation";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
@@ -161,6 +162,8 @@ import {
 import type { IsolationChoice } from "./new-workspace/form";
 import { shortenPath } from "@/utils/shorten-path";
 import {
+  filterNewWorkspaceHostsForIntent,
+  resolveTopicHostAfterCapabilityChange,
   resolveNewWorkspaceAutomaticServerId,
   resolveNewWorkspaceInitialServerId,
 } from "./new-workspace-initial-context";
@@ -1095,8 +1098,15 @@ function useNewWorkspaceInitialContext(
     displayName: displayNameProp,
   }: NewWorkspaceScreenProps,
   isTimelineFork: boolean,
+  topicRequested: boolean,
 ): NewWorkspaceInitialContextState {
-  const allHosts = useHosts();
+  const hosts = useHosts();
+  const knownServerIds = useMemo(() => hosts.map((host) => host.serverId), [hosts]);
+  const topicSupport = useHostFeatureMap(knownServerIds, "topicWorkbenchV1");
+  const allHosts = useMemo(
+    () => filterNewWorkspaceHostsForIntent(hosts, topicSupport, topicRequested),
+    [hosts, topicSupport, topicRequested],
+  );
   const allServerIds = useMemo(() => allHosts.map((h) => h.serverId), [allHosts]);
   const projects = useHostProjects(allServerIds);
   const routeDisplayName = displayNameProp?.trim() ?? "";
@@ -1154,12 +1164,32 @@ function useNewWorkspaceInitialContext(
     workspaceMultiplicityByServerId,
   });
 
+  const [lastTopicHostId, setLastTopicHostId] = useState<string | null>(null);
+  const topicServerId = resolveTopicHostAfterCapabilityChange(
+    topicRequested,
+    lastTopicHostId,
+    topicSupport,
+    selectedServerId,
+  );
+  useEffect(() => {
+    if (!topicRequested) setLastTopicHostId(null);
+    else if (topicSupport.get(topicServerId)) setLastTopicHostId(topicServerId);
+  }, [topicRequested, topicServerId, topicSupport]);
+
+  const selectHost = useCallback(
+    (nextServerId: string) => {
+      if (topicRequested) setLastTopicHostId(nextServerId);
+      handleSelectHost(nextServerId);
+    },
+    [handleSelectHost, topicRequested],
+  );
+
   return {
     allHosts,
     // The selected history belongs to its source host, including while that host is offline.
-    selectedServerId: isTimelineFork ? serverId.trim() : selectedServerId,
+    selectedServerId: isTimelineFork ? serverId.trim() : topicServerId,
     hostPickerOpen,
-    handleSelectHost,
+    handleSelectHost: selectHost,
     handleHostPickerOpenChange,
     openHostPicker,
     projects,
@@ -1547,6 +1577,7 @@ function NewWorkspaceForm({
   restoredMainDraft: MainDraft | null;
 }) {
   const queryClient = useQueryClient();
+  const { topic: topicParam } = useLocalSearchParams<{ topic?: string }>();
   const { t } = useTranslation();
   const isCompact = useIsCompactFormFactor();
   const toast = useToast();
@@ -1576,6 +1607,9 @@ function NewWorkspaceForm({
   }, []);
   const composerEditing = useNewWorkspaceComposerEditing();
   const { leaveFullscreen } = composerEditing;
+  const [legacyLaunch, setLegacyLaunch] = useState(false);
+  const topicRequested = isTopicRequested(topicParam, draftId, legacyLaunch);
+  const restrictToTopicHosts = restrictTopicHostOptions(topicRequested, mainDraft);
   const mergeWorkspaces = useCallback(
     (targetServerId: string, workspaces: Iterable<WorkspaceDescriptor>) => {
       getHostRuntimeStore().acceptWorkspaceSnapshots(targetServerId, Array.from(workspaces));
@@ -1604,6 +1638,7 @@ function NewWorkspaceForm({
       restoredWorktree,
     ),
     isTimelineFork,
+    restrictToTopicHosts,
   );
   // COMPAT(workspaceMultiplicity): added in v0.1.97, drop the gate when floor >= v0.1.97
   const supportsWorkspaceMultiplicity = useHostFeature(selectedServerId, "workspaceMultiplicity");
@@ -1611,7 +1646,6 @@ function NewWorkspaceForm({
   const createMainAgent = useDefaultWorkspaceMainAgent(selectedServerId);
   const supportsTopic = useHostFeature(selectedServerId, "topicWorkbenchV1");
   const supportsTopicPreset = useHostFeature(selectedServerId, "workspaceMainAgentDefault");
-  const [legacyLaunch, setLegacyLaunch] = useState(false);
   const { topicText, topicDirection, hideTopic } = readEditableTopicFields(
     creationIdentity.topicFields,
   );
@@ -1624,6 +1658,7 @@ function NewWorkspaceForm({
   const { attempt: topicAttempt, active: isTopicMode } = resolveTopicMode({
     draft: mainDraft,
     supportsTopic,
+    topicRequested,
     legacyLaunch,
     handoff: Boolean(draftId),
   });
@@ -2145,6 +2180,13 @@ function NewWorkspaceForm({
         toast.error(t("message.actions.forkUnavailable"));
         return;
       }
+      if (
+        restrictToTopicHosts &&
+        !selectHostFeature(useSessionStore.getState(), id, "topicWorkbenchV1")
+      ) {
+        toast.error(t("topicWorkbench.updateHost"));
+        return;
+      }
       if (id !== selectedServerId && !forgetMainTarget()) return;
       handleSelectHost(id);
       clearPickerSelectionForTargetChange(selectedServerId, id);
@@ -2154,6 +2196,7 @@ function NewWorkspaceForm({
       forgetMainTarget,
       handleSelectHost,
       isTimelineFork,
+      restrictToTopicHosts,
       selectedServerId,
       serverId,
       t,
@@ -3407,7 +3450,7 @@ function NewWorkspaceForm({
       outcome={topicOutcome}
       error={errorMessage}
       clientReady={clientReady}
-      canSubmit={canSubmitTopic(topicFields, mainTarget, clientReady)}
+      canSubmit={canSubmitTopic(topicFields, mainTarget, clientReady, supportsTopic)}
       serverId={selectedServerId}
       submitLabel={topicCreateLabel}
       onSubmit={submitTopicWithoutQuestion}
@@ -3430,6 +3473,12 @@ function NewWorkspaceForm({
         topicSetup={topicSetup}
         onImportSession={importSession.open}
       >
+        <TopicHostNotice
+          active={isTopicMode}
+          supported={supportsTopic}
+          locked={isWorkspaceFormLocked(isPending, mainDraft)}
+          onCreateRegular={useDirectLaunch}
+        />
         {isTopicMode ? topicContent : composer}
         <WorkspaceMainBatchResults
           batchPromptRevisions={creationIdentity.batchPromptRevisions}
@@ -3446,20 +3495,62 @@ function NewWorkspaceForm({
   );
 }
 
+function isTopicRequested(
+  routeIntent: string | undefined,
+  forkDraftId: string | undefined,
+  legacyLaunch: boolean,
+) {
+  return routeIntent === "1" && !forkDraftId && !legacyLaunch;
+}
+
+function restrictTopicHostOptions(topicRequested: boolean, draft: MainDraft | null) {
+  return topicRequested && !draft?.attempt && !hasMainDraftSubmission(draft);
+}
+
+function TopicHostNotice({
+  active,
+  supported,
+  locked,
+  onCreateRegular,
+}: {
+  active: boolean;
+  supported: boolean;
+  locked: boolean;
+  onCreateRegular: () => void;
+}) {
+  const { t } = useTranslation();
+  if (!active || supported) return null;
+  return (
+    <View accessibilityLiveRegion="polite">
+      <WorkspaceCreationError message={t("topicWorkbench.updateHost")} />
+      {!locked ? (
+        <Button variant="secondary" onPress={onCreateRegular}>
+          {t("topicWorkbench.createRegularWorkspace")}
+        </Button>
+      ) : null}
+    </View>
+  );
+}
+
 function resolveTopicMode(input: {
   draft: MainDraft | null;
   supportsTopic: boolean;
+  topicRequested: boolean;
   legacyLaunch: boolean;
   handoff: boolean;
 }) {
-  const { draft, supportsTopic, legacyLaunch, handoff } = input;
+  const { draft, supportsTopic, topicRequested, legacyLaunch, handoff } = input;
   const attempt = draft?.topicAttempt;
   const topicBatch = Boolean(draft?.batch?.items[0]?.placement.topic);
   return {
     attempt,
     active:
       Boolean(attempt || topicBatch) ||
-      (supportsTopic && !legacyLaunch && !handoff && !draft?.attempt && !draft?.batch),
+      ((supportsTopic || topicRequested) &&
+        !legacyLaunch &&
+        !handoff &&
+        !draft?.attempt &&
+        !draft?.batch),
   };
 }
 
@@ -3482,8 +3573,9 @@ function canSubmitTopic(
   fields: ReturnType<typeof readTopicFields>,
   target: MainDraftTarget | null,
   connected: boolean,
+  supported: boolean,
 ) {
-  return Boolean(fields && target && connected);
+  return Boolean(fields && target && connected && supported);
 }
 
 function topicOutcomeError(outcome: TopicOutcome | null, error: string | null) {

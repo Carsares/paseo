@@ -1,10 +1,14 @@
 import type { WebFrameMain } from "electron";
 import { describe, expect, it } from "vitest";
 import type { ProxyPlan } from "./desktop-proxy.js";
-import { createNativeControlRoutes, parseControlSocketTarget } from "./native-control.js";
+import {
+  chromiumRoute,
+  createNativeControlRoutes,
+  parseControlSocketTarget,
+} from "./native-control.js";
 
 const url = new URL("wss://host.example/ws?serverId=fixture&role=client&v=2");
-const system = "HTTPS proxy.example:443; DIRECT";
+const system = "HTTPS proxy.example:443;DIRECT";
 const direct: ProxyPlan = {
   policy: { mode: "direct" },
   config: { mode: "direct" },
@@ -15,6 +19,14 @@ const direct: ProxyPlan = {
 const makeFrame = () => ({ detached: false, url: "paseo://app/" }) as WebFrameMain;
 
 describe("native desktop control routes", () => {
+  it("normalizes Chromium fallback separators without changing the route order", () => {
+    expect(chromiumRoute("HTTPS proxy.example:443; SOCKS5 [::1]:1080; DIRECT")).toBe(
+      "HTTPS proxy.example:443;SOCKS5 [::1]:1080;DIRECT",
+    );
+    expect(chromiumRoute("DIRECT; HTTPS proxy.example:443")).not.toBe(system);
+    expect(() => chromiumRoute("PROXY proxy.example:65536;DIRECT")).toThrow(/Unsupported/);
+  });
+
   it("reserves one exact socket request for its owning frame", async () => {
     const routes = createNativeControlRoutes({ resolveProxy: async () => system });
     const frame = makeFrame();

@@ -8,6 +8,7 @@ import type {
   AgentPromptSource,
 } from "./agent/agent-messages/index.js";
 import { AgentMessageAdmissionError } from "./agent/agent-messages/delivery.js";
+import { hasMandatoryPeerDispatchMarker } from "./agent/agent-messages/envelope.js";
 import { AgentDirectory, type BackgroundVisibility } from "./agent/directory.js";
 import { ConnectedHostSession } from "./connected-hosts/index.js";
 import type { ConnectedHosts } from "./connected-hosts/index.js";
@@ -239,8 +240,11 @@ import {
   type AgentRunOptions,
   type AgentSessionConfig,
 } from "./agent/agent-sdk-types.js";
-import type { StoredAgentRecord } from "./agent/agent-storage.js";
-import type { AgentStorage } from "./agent/agent-storage.js";
+import {
+  SideChatDeleteRefusedError,
+  type AgentStorage,
+  type StoredAgentRecord,
+} from "./agent/agent-storage.js";
 import { AgentWorkspaceMoveJournal } from "./agent/agent-workspace-move-journal.js";
 import {
   ImportSessionsRequestError,
@@ -534,16 +538,6 @@ function clientUsesLegacyWorkspaceRestore(appVersion: string | null): boolean {
   );
 }
 
-type DeleteFencedAgentStorage = AgentStorage & {
-  beginDelete(agentId: string): void;
-};
-
-function beginAgentDeleteIfSupported(agentStorage: AgentStorage, agentId: string): void {
-  if ("beginDelete" in agentStorage && typeof agentStorage.beginDelete === "function") {
-    (agentStorage as DeleteFencedAgentStorage).beginDelete(agentId);
-  }
-}
-
 const FETCH_AGENTS_SORT_KEYS = ["status_priority", "created_at", "updated_at", "title"] as const;
 const FETCH_AGENT_HISTORY_SORT_KEYS = [...FETCH_AGENTS_SORT_KEYS, "archived_at"] as const;
 
@@ -791,7 +785,9 @@ export async function enqueueRecoverableAgentMessage(
           await validateExtraDispatch?.();
         }
       : undefined;
-  await validateDispatch?.();
+  // Let delivery settle the authenticated reservation when a restored peer
+  // recipient is gone or archived. Pre-admission rejection only sees the receipt.
+  if (!restoring || !hasMandatoryPeerDispatchMarker(message.prompt)) await validateDispatch?.();
   const notification = await registerQueuedPromptNotification(
     context.finishSubscriptions,
     agentId,
@@ -3931,7 +3927,7 @@ export class Session {
       case "agent_permission_response":
         return this.handleAgentPermissionResponse(msg.agentId, msg.requestId, msg.response);
       case "clear_agent_attention":
-        return this.handleClearAgentAttention(msg.agentId, msg.requestId);
+        return this.handleClearAgentAttention(msg.agentId, msg.requestId, msg.teamConclusion);
       default:
         return undefined;
     }
@@ -4635,43 +4631,38 @@ export class Session {
     const knownAgent =
       this.agentManager.getAgent(agentId) ?? (await this.agentStorage.get(agentId));
 
-    if (onlyIfEmptySideChat || isSideChatAgentLabels(knownAgent?.labels)) {
-      if (
-        !(await this.agentStorage.beginEmptySideChatDelete(
-          agentId,
-          () =>
-            !!this.agentManager.getAgent(agentId)?.lastUserMessageAt ||
-            this.agentManager.hasInFlightRun(agentId),
-        ))
-      ) {
-        throw new SessionRequestError("side_chat_not_empty", "This side chat cannot be discarded.");
-      }
-    } else {
-      // Fence late snapshot writes before closing the provider runtime.
-      beginAgentDeleteIfSupported(this.agentStorage, agentId);
-    }
-
     try {
-      await closeAgentCommand({ agentManager: this.agentManager }, agentId);
+      await this.agentStorage.remove(agentId, {
+        onlyIfEmptySideChat:
+          onlyIfEmptySideChat || isSideChatAgentLabels(knownAgent?.labels)
+            ? () =>
+                !!this.agentManager.getAgent(agentId)?.lastUserMessageAt ||
+                this.agentManager.hasInFlightRun(agentId)
+            : undefined,
+        prepare: async () => {
+          try {
+            await closeAgentCommand({ agentManager: this.agentManager }, agentId);
+          } catch (error) {
+            this.sessionLogger.warn({ err: error, agentId }, "Failed to close agent during delete");
+          }
+          // Drain queued persistence before the registry removes the durable snapshot.
+          await this.agentManager.flush();
+        },
+      });
     } catch (error) {
-      this.sessionLogger.warn(
-        { err: error, agentId },
-        `Failed to close agent ${agentId} during delete`,
-      );
+      if (error instanceof SideChatDeleteRefusedError)
+        throw new SessionRequestError("side_chat_not_empty", error.message);
+      this.sessionLogger.error({ err: error, agentId }, "Failed to remove stored agent");
+      throw new SessionRequestError("agent_delete_failed", "Could not delete the stored agent.");
     }
 
-    // Drain queued persistence from the just-closed agent before removing its
-    // durable snapshot, otherwise an in-flight background write can recreate it.
-    await this.agentManager.flush();
-
     try {
-      await this.agentStorage.remove(agentId);
       await this.agentManager.deleteAgentState(agentId);
-      // Directory removal is daemon-wide; agent_deleted below stays a source-scoped RPC reply.
-      if (knownAgent) this.agentManager.notifyAgentRemoved(knownAgent);
     } catch (error) {
-      this.sessionLogger.error({ err: error, agentId }, `Failed to fully delete agent ${agentId}`);
+      this.sessionLogger.error({ err: error, agentId }, "Failed to remove deleted agent history");
     }
+    // Directory removal is daemon-wide; agent_deleted below stays a source-scoped RPC reply.
+    if (knownAgent) this.agentManager.notifyAgentRemoved(knownAgent);
 
     this.emit({
       type: "agent_deleted",
@@ -7699,6 +7690,7 @@ export class Session {
   private async handleClearAgentAttention(
     agentId: string | string[],
     requestId?: string,
+    teamConclusion?: { workspaceId: string; attentionTimestamp: string },
   ): Promise<void> {
     const agentIds = Array.isArray(agentId) ? agentId : [agentId];
 
@@ -7708,7 +7700,12 @@ export class Session {
           throw new Error(`Agent not found: ${id}`);
         }
       }
-      await Promise.all(agentIds.map((id) => this.agentManager.clearAgentAttention(id)));
+      if (teamConclusion) {
+        if (typeof agentId !== "string") return;
+        await this.agentManager.clearTeamConclusionAttention(agentId, teamConclusion);
+      } else {
+        await Promise.all(agentIds.map((id) => this.agentManager.clearAgentAttention(id)));
+      }
       if (requestId) {
         const agents = (
           await Promise.all(

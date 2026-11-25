@@ -33,7 +33,7 @@ const routeEntry =
   /^(?:PROXY|HTTPS|SOCKS|SOCKS4|SOCKS5|QUIC) ([a-z\d._-]+|\[[a-f\d:.]+\]):([1-9]\d{0,4})$/i;
 
 // Serialize only Chromium's proxy result grammar, never free-form PAC source.
-function proxyChain(value: string): string {
+export function chromiumRoute(value: string): string {
   const entries = value.split(";").map((entry) => entry.trim());
   if (
     entries.length > 32 ||
@@ -43,9 +43,10 @@ function proxyChain(value: string): string {
       return !port || Number(port) > 65535;
     })
   ) {
-    throw new Error("Unsupported system route for desktop control connection.");
+    throw new Error("Unsupported Chromium proxy route.");
   }
-  return entries.join("; ");
+  // Match Chromium's ProxyList::ToPacString without changing fallback order.
+  return entries.join(";");
 }
 
 function originKey(url: URL) {
@@ -158,7 +159,7 @@ export function createNativeControlRoutes(baseline: Pick<Session, "resolveProxy"
       const origin = frameOrigin(frame);
       const frameChange = frameChanges.get(frame);
       return async () => {
-        const route = proxyChain(await resolveRoute(baseline, url.href));
+        const route = await resolveRoute(baseline, url.href);
         prune();
         const key = originKey(url);
         if (
@@ -185,7 +186,7 @@ export function createNativeControlRoutes(baseline: Pick<Session, "resolveProxy"
       if (plan.credentials.size) {
         for (const route of [...knownRoutes, ...registrations.map((entry) => entry.route)]) {
           if (
-            route.split("; ").some((entry) => {
+            route.split(";").some((entry) => {
               const endpoint = routeEntry.exec(entry);
               return (
                 endpoint &&
@@ -235,7 +236,7 @@ export function createNativeControlRoutes(baseline: Pick<Session, "resolveProxy"
 export async function resolveRoute(session: Pick<Session, "resolveProxy">, url: string) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([
+    const route = await Promise.race([
       session.resolveProxy(url),
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(
@@ -244,6 +245,7 @@ export async function resolveRoute(session: Pick<Session, "resolveProxy">, url: 
         );
       }),
     ]);
+    return chromiumRoute(route);
   } finally {
     clearTimeout(timer);
   }

@@ -25,7 +25,7 @@ import {
   AgentReadRequiresLaunchError,
   ensureAgentLoaded,
 } from "./agent-loading.js";
-import { AgentTurnChangedError } from "./agent-prompt.js";
+import { AgentTurnChangedError, peerRecipientRequiresOpenSession } from "./agent-prompt.js";
 import {
   continuesAssistantMessage,
   projectTimelineRows,
@@ -102,6 +102,7 @@ import { AGENT_WORKSPACE_CREATION_ERROR } from "./create-agent/intent.js";
 import {
   AgentTurnStartCanceledError,
   AgentTurnStartRejectedError,
+  PeerRecipientNotReadyError,
   type AgentCommandOutcome,
   getAgentStreamEventTurnId,
   type AgentCapabilityFlags,
@@ -996,6 +997,7 @@ interface ManagedAgentBase extends StoredAgentTurnState {
   sessionMetrics?: AgentMetric[];
   lastError?: string;
   attention: AttentionState;
+  lastMainAttentionTimestampMs?: number;
   foregroundTurnWaiters: Set<ForegroundTurnWaiter>;
   finalizedForegroundTurnIds: Set<string>;
   unsubscribeSession: (() => void) | null;
@@ -4356,6 +4358,7 @@ export class AgentManager {
 
     await this.registry.applySnapshot(agent, {
       internal: agent.internal,
+      requireWritable: true,
     });
     const stored = await this.registry.get(agentId);
     if (!stored) {
@@ -4481,7 +4484,7 @@ export class AgentManager {
     options: { archivedAt: string; updatedAt: string },
   ): Promise<ArchivedStoredAgentRecord> {
     const archivedRecord = buildArchivedAgentRecord(record, options);
-    await this.requireRegistry().upsert(archivedRecord);
+    await this.requireRegistry().upsert(archivedRecord, { requireWritable: true });
     // A restore and a new archive can reuse the previous timestamp.
     if (record.archivedAt !== archivedRecord.archivedAt)
       this.archivedForkContexts.delete(record.id);
@@ -5643,7 +5646,7 @@ export class AgentManager {
       return;
     }
     this.touchUpdatedAt(agent);
-    await this.persistSnapshot(agent, { title: normalizedTitle });
+    await this.persistSnapshot(agent, { title: normalizedTitle, requireWritable: true });
     this.emitState(agent, { persist: false });
   }
 
@@ -5763,9 +5766,15 @@ export class AgentManager {
   private async writeLabels(agentId: string, patch: AgentLabelPatch): Promise<WriteLabelsResult> {
     const liveAgent = this.agents.get(agentId);
     if (liveAgent) {
-      liveAgent.labels = applyRecordPatch(liveAgent.labels, patch);
+      const previousLabels = liveAgent.labels;
+      liveAgent.labels = applyRecordPatch(previousLabels, patch);
       this.touchUpdatedAt(liveAgent);
-      await this.persistSnapshot(liveAgent);
+      try {
+        await this.persistSnapshot(liveAgent, { requireWritable: true });
+      } catch (error) {
+        liveAgent.labels = previousLabels;
+        throw error;
+      }
       this.emitState(liveAgent, { persist: false });
       const record = this.registry ? await this.registry.get(agentId) : null;
       return { record, live: true };
@@ -5792,7 +5801,7 @@ export class AgentManager {
       ...(patch.metadata ? { metadata: applyRecordPatch(record.metadata, patch.metadata) } : {}),
       updatedAt: this.nextStoredUpdatedAt(record),
     };
-    await registry.upsert(nextRecord);
+    await registry.upsert(nextRecord, { requireWritable: true });
     return nextRecord;
   }
 
@@ -7385,9 +7394,58 @@ export class AgentManager {
     return this.runLifecycleMutation(agentId, () => this.clearAgentAttentionUnlocked(agentId));
   }
 
-  private async clearAgentAttentionUnlocked(agentId: string): Promise<void> {
+  async clearTeamConclusionAttention(
+    agentId: string,
+    expected: { workspaceId: string; attentionTimestamp: string },
+  ): Promise<void> {
+    return this.runLifecycleMutation(agentId, () =>
+      this.clearAgentAttentionUnlocked(agentId, expected),
+    );
+  }
+
+  private matchesLiveTeamConclusion(
+    agent: ManagedAgent,
+    expected: { workspaceId: string; attentionTimestamp: string },
+  ): boolean {
+    return (
+      agent.workspaceId === expected.workspaceId &&
+      isMainControlAgentLabels(agent.labels) &&
+      raisesAttention(agent) &&
+      (agent.lifecycle === "idle" || agent.lifecycle === "error") &&
+      !agent.activeTurnId &&
+      agent.pendingPermissions.size === 0 &&
+      agent.attention.requiresAttention &&
+      agent.attention.attentionReason !== "permission" &&
+      agent.attention.attentionTimestamp.toISOString() === expected.attentionTimestamp
+    );
+  }
+
+  private matchesStoredTeamConclusion(
+    record: StoredAgentRecord,
+    expected: { workspaceId: string; attentionTimestamp: string },
+  ): boolean {
+    return (
+      record.workspaceId === expected.workspaceId &&
+      isMainControlAgentLabels(record.labels) &&
+      !record.background &&
+      (record.lastStatus === "idle" || record.lastStatus === "error") &&
+      (record.attentionReason === "finished" || record.attentionReason === "error") &&
+      record.attentionTimestamp === expected.attentionTimestamp
+    );
+  }
+
+  private async clearAgentAttentionUnlocked(
+    agentId: string,
+    expected?: { workspaceId: string; attentionTimestamp: string },
+  ): Promise<void> {
+    if (expected) {
+      const workspace = await this.workspaceRegistry?.get(expected.workspaceId);
+      if (!workspace || workspace.archivedAt) return;
+    }
+
     const agent = this.agents.get(agentId);
     if (agent) {
+      if (expected && !this.matchesLiveTeamConclusion(agent, expected)) return;
       if (agent.attention.requiresAttention) {
         agent.attention = { requiresAttention: false };
         await this.persistSnapshot(agent);
@@ -7401,6 +7459,7 @@ export class AgentManager {
     if (!record || record.internal || record.archivedAt || record.requiresAttention !== true) {
       return;
     }
+    if (expected && !this.matchesStoredTeamConclusion(record, expected)) return;
     const nextRecord: StoredAgentRecord = {
       ...record,
       updatedAt: this.nextStoredUpdatedAt(record),
@@ -7429,7 +7488,7 @@ export class AgentManager {
       liveAgent.attention = {
         requiresAttention: true,
         attentionReason,
-        attentionTimestamp: new Date(),
+        attentionTimestamp: this.nextAttentionTimestamp(liveAgent),
       };
       await this.persistSnapshot(liveAgent);
       this.emitState(liveAgent, { persist: false });
@@ -8573,6 +8632,15 @@ export class AgentManager {
     if (pendingRun.settled) {
       throw error;
     }
+    if (error instanceof PeerRecipientNotReadyError) {
+      this.runs.settleForegroundStart(pendingRun, {
+        status: "failed",
+        error: error.message,
+        admissionError: error,
+      });
+      this.runs.settleForegroundRun(agentId, pendingRun.token);
+      throw error;
+    }
     if (error instanceof TaskDispatchRejectedError) {
       this.runs.settleForegroundStart(pendingRun, {
         status: "failed",
@@ -8658,7 +8726,10 @@ export class AgentManager {
     ledgerIsCurrent?: () => boolean,
   ) {
     this.assertPendingTurnStart(params.agentId, params.pendingRun);
-    const capture = this.prepareRewindTurnCapture(params);
+    const capture =
+      params.options?.turnAuthorization === "peer-read-only"
+        ? undefined
+        : this.prepareRewindTurnCapture(params);
     const dispatch = () =>
       this.dispatchAdmittedProviderTurn(params, providerPrompt, ledgerIsCurrent);
     // Skipping checkpoint collection must not defer provider dispatch.
@@ -8687,7 +8758,23 @@ export class AgentManager {
       }
     };
     validate();
-    const start = (runOptions = options) => agent.session.startTurn(providerPrompt, runOptions);
+    const peerReadOnly = options?.turnAuthorization === "peer-read-only";
+    const session = agent.session;
+    const verifyPeerSession = () => {
+      if (
+        this.adapterOf(agent.provider) === "codex" &&
+        session.capabilities.supportsPeerReadOnlyTurn &&
+        session.capabilities.defersPromptHandoff &&
+        promptStart?.beforeHandoff
+      )
+        return;
+      throw new AgentTurnStartRejectedError(
+        "This provider cannot enforce a fresh read-only turn for peer messages. Use a supported Codex session.",
+      );
+    };
+    if (peerReadOnly) verifyPeerSession();
+    const start = (runOptions = options) =>
+      (peerReadOnly ? session : agent.session).startTurn(providerPrompt, runOptions);
     if (!promptStart?.beforeHandoff) {
       if (taskAdmission) {
         throw new TaskDispatchRejectedError("Task prompts require a provider handoff check.");
@@ -8702,10 +8789,18 @@ export class AgentManager {
       });
     }
     this.assertAcceptingAgentRuns();
-    const session = agent.session;
     const validateHandoff = () => {
       this.assertAcceptingAgentRuns();
       validate();
+      if (
+        peerReadOnly &&
+        (this.agents.get(agentId) !== agent ||
+          agent.session !== session ||
+          this.inFlightAgentCloses.has(agentId) ||
+          this.runs.getPendingRun(agentId) !== pendingRun)
+      ) {
+        throw new AgentTurnStartRejectedError("The target session changed before peer dispatch.");
+      }
       if (taskAdmission) {
         if (
           this.agents.get(agentId) !== agent ||
@@ -8731,7 +8826,8 @@ export class AgentManager {
         ? start({
             ...options,
             beforeProviderDispatch: () => promptStart.handoff(async () => {}, validateHandoff),
-            assertProviderDispatchAllowed: taskAdmission ? validateHandoff : undefined,
+            assertProviderDispatchAllowed:
+              taskAdmission || peerReadOnly ? validateHandoff : undefined,
           })
         : promptStart.handoff(start, validateHandoff)
     ).catch(async (error) => {
@@ -8944,6 +9040,21 @@ export class AgentManager {
     return agent.pendingReplacement;
   }
 
+  private needsForegroundRuntimeLoad(agentId: string): boolean {
+    return (
+      this.hierarchySessionUpdates.has(agentId) ||
+      this.providerSwitches.has(agentId) ||
+      this.collectingRuntimes.has(agentId) ||
+      (!this.agents.has(agentId) && Boolean(this.registry))
+    );
+  }
+
+  private assertPeerRecipientOpen(agentId: string): void {
+    if (!this.agents.get(agentId)?.session || this.inFlightAgentCloses.has(agentId)) {
+      throw peerRecipientRequiresOpenSession();
+    }
+  }
+
   private reserveAgentRun(
     agentId: string,
     prompt: AgentPromptInput,
@@ -8951,21 +9062,22 @@ export class AgentManager {
     promptStart?: ForegroundPromptStart,
   ): AsyncGenerator<AgentStreamEvent> {
     this.assertNoGuardedArchive(agentId);
-    if (
-      this.hierarchySessionUpdates.has(agentId) ||
-      this.providerSwitches.has(agentId) ||
-      this.collectingRuntimes.has(agentId) ||
-      (!this.agents.has(agentId) && this.registry)
-    )
+    const peerReadOnly = options?.turnAuthorization === "peer-read-only";
+    if (peerReadOnly) this.assertPeerRecipientOpen(agentId);
+    if (this.needsForegroundRuntimeLoad(agentId)) {
+      if (peerReadOnly) throw peerRecipientRequiresOpenSession();
       return this.streamAfterRuntimeCollection(agentId, prompt, options, promptStart);
+    }
     const existingAgent = this.requireSessionAgent(agentId);
     assertNoFileRewind(this, existingAgent.cwd);
     if (
       this.historySessions.has(existingAgent.session) ||
       this.needsHierarchySessionReload(agentId) ||
       this.changingMainControlParent(existingAgent)
-    )
+    ) {
+      if (peerReadOnly) throw peerRecipientRequiresOpenSession();
       return this.streamAfterHistoryLoad(agentId, prompt, options, promptStart);
+    }
     this.logger.trace(
       {
         agentId,
@@ -12982,6 +13094,16 @@ export class AgentManager {
     }
   }
 
+  private nextAttentionTimestamp(agent: ManagedAgent): Date {
+    if (!isMainControlAgentLabels(agent.labels)) return new Date();
+    const previous = agent.attention.requiresAttention
+      ? agent.attention.attentionTimestamp.getTime()
+      : 0;
+    const next = Math.max(Date.now(), previous + 1, (agent.lastMainAttentionTimestampMs ?? 0) + 1);
+    agent.lastMainAttentionTimestampMs = next;
+    return new Date(next);
+  }
+
   private checkAndSetAttention(agent: ManagedAgent): void {
     const previousStatus = this.previousStatuses.get(agent.id);
     const currentStatus = agent.lifecycle;
@@ -13000,8 +13122,21 @@ export class AgentManager {
 
     const finished = previousStatus === "running" && currentStatus === "idle";
     if (agent.attention.requiresAttention) {
-      // The unread finish stays the same; the notifier knows whether the user was told about it.
-      if (finished && agent.attention.attentionReason === "finished") {
+      if (
+        finished &&
+        isMainControlAgentLabels(agent.labels) &&
+        agent.attention.attentionReason !== "permission"
+      ) {
+        // A later main conclusion has its own receipt, even if the previous one is unread.
+        agent.attention = {
+          requiresAttention: true,
+          attentionReason: agent.attention.attentionReason,
+          attentionTimestamp: this.nextAttentionTimestamp(agent),
+        };
+        if (agent.attention.attentionReason === "finished") {
+          this.broadcastAgentAttention(agent, "finished");
+        }
+      } else if (finished && agent.attention.attentionReason === "finished") {
         this.broadcastAgentAttention(agent, "finished");
       }
       return;
@@ -13011,7 +13146,7 @@ export class AgentManager {
       agent.attention = {
         requiresAttention: true,
         attentionReason: "finished",
-        attentionTimestamp: new Date(),
+        attentionTimestamp: this.nextAttentionTimestamp(agent),
       };
       this.broadcastAgentAttention(agent, "finished");
     }
@@ -13024,13 +13159,17 @@ export class AgentManager {
     if (!raisesAttention(agent)) {
       return;
     }
-    if (agent.attention.requiresAttention && agent.attention.attentionReason !== "finished") {
+    const previous = agent.attention;
+    if (
+      previous.requiresAttention &&
+      (previous.attentionReason === "permission" ||
+        (previous.attentionReason === "error" && !isMainControlAgentLabels(agent.labels)))
+    )
       return;
-    }
     agent.attention = {
       requiresAttention: true,
       attentionReason: "error",
-      attentionTimestamp: new Date(),
+      attentionTimestamp: this.nextAttentionTimestamp(agent),
     };
     this.broadcastAgentAttention(agent, "error");
   }

@@ -9,6 +9,7 @@ import {
 } from "./configuration.js";
 import { resolveRuntimeMcpToolPolicy } from "../../../runtime-mcp-config.js";
 import { SessionMcp } from "./session-mcp.js";
+import { requireMcpPermissionResources } from "./shared-service.js";
 import { commands } from "./commands.js";
 
 import { waitForLocationReady } from "./readiness.js";
@@ -254,8 +255,13 @@ export class OpenCodeV2AgentClient implements AgentClient {
         await session.adoptBridgeDescendant(childId);
       },
     });
+    const releaseMcpRequirement =
+      bridge && mcp?.preapprovalRules().length
+        ? requireMcpPermissionResources(bridge, info.id)
+        : undefined;
     if (!historyOnly) this.connections.set(info.id, connection);
     const releaseBindings = () => {
+      releaseMcpRequirement?.();
       unbind?.();
       if (historyOnly) return;
       for (const [id, owner] of this.connections)

@@ -250,3 +250,25 @@ export function resolveNewWorkspaceAutomaticServerId(
 
   return currentServerId;
 }
+
+export function filterNewWorkspaceHostsForIntent<T extends { serverId: string }>(
+  hosts: T[],
+  topicSupport: ReadonlyMap<string, boolean>,
+  topicRequested: boolean,
+): T[] {
+  return topicRequested
+    ? hosts.filter(({ serverId }) => topicSupport.get(serverId) === true)
+    : hosts;
+}
+
+export function resolveTopicHostAfterCapabilityChange(
+  topicRequested: boolean,
+  lastSelectedServerId: string | null,
+  topicSupport: ReadonlyMap<string, boolean>,
+  defaultServerId: string,
+): string {
+  if (topicRequested && lastSelectedServerId && topicSupport.get(lastSelectedServerId) !== true) {
+    return lastSelectedServerId;
+  }
+  return defaultServerId;
+}

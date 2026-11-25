@@ -53,6 +53,11 @@ export interface ScrollToMessageOccurrence {
  */
 export type DisclosureTriggerEdge = "top" | "bottom";
 
+export interface StreamMessageScrollCompletion {
+  signal: AbortSignal;
+  onSettled: (landed: boolean) => void;
+}
+
 export interface StreamViewportHandle {
   /** Give keyboard navigation back to the scrolling surface on web. */
   focus?: () => void;
@@ -63,7 +68,11 @@ export interface StreamViewportHandle {
    * sits on in place. Following output stops; it resumes if the change leaves the list at its end.
    */
   holdRow: (rowId: string, apply: () => void, triggerEdge: DisclosureTriggerEdge) => void;
-  scrollToMessage?: (messageId: string, occurrence?: ScrollToMessageOccurrence) => void;
+  scrollToMessage?: (
+    messageId: string,
+    occurrence?: ScrollToMessageOccurrence,
+    completion?: StreamMessageScrollCompletion,
+  ) => boolean | void;
 }
 
 export interface StreamSegmentRenderers {

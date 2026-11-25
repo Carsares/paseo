@@ -58,6 +58,7 @@ interface SidebarModel extends SidebarWorkspacesListResult {
   resolvedProjectFilters: readonly string[];
   hasProjectsBeforeFilter: boolean;
   supportsTopicWorkbench: boolean;
+  topicWorkbenchByServer: Readonly<Record<string, boolean>>;
   hasAnyTopicsBeforeFilter: boolean;
   hiddenNonTopicCount: number;
   hasMultipleTopicProjects: boolean;
@@ -218,7 +219,6 @@ export function SidebarModelProvider({
 }) {
   const { t } = useTranslation();
   const modelActive = active !== false || keyboardNavigationActive;
-  const list = useSidebarWorkspacesList({ enabled: modelActive });
   const showBackground = useSidebarViewStore((state) => state.showBackground);
   const storedGroupMode = useSidebarViewStore((state) => state.groupMode);
   const hasExplicitGroupMode = useSidebarViewStore((state) => state.hasExplicitGroupMode);
@@ -262,6 +262,17 @@ export function SidebarModelProvider({
     () => activeServerIds.some((serverId) => topicWorkbenchByServer[serverId] === true),
     [activeServerIds, topicWorkbenchByServer],
   );
+  const hasAnyTopicWorkspace = useMemo(
+    () => hasTopicOnServers(activeServerIds, workspacesByServer),
+    [activeServerIds, workspacesByServer],
+  );
+  const groupMode = resolveEffectiveSidebarGroupMode({
+    groupMode: storedGroupMode,
+    hasExplicitGroupMode,
+    supportsTopicWorkbench,
+    hasAnyTopicWorkspace,
+  });
+  const list = useSidebarWorkspacesList({ enabled: modelActive, groupMode });
   const agentsByServer = useSessionStore(
     useShallow((state) =>
       Object.fromEntries(
@@ -320,8 +331,7 @@ export function SidebarModelProvider({
     recordTopicWorkSignals(globalWorkSignalsByWorkspaceKey);
   }, [globalWorkSignalsByWorkspaceKey, recordTopicWorkSignals]);
 
-  const { topicFactsByWorkspaceKey, hasAnyTopicWorkspace } = useMemo(() => {
-    let foundTopic = hasTopicOnServers(activeServerIds, workspacesByServer);
+  const topicFactsByWorkspaceKey = useMemo(() => {
     const factsMap = new Map<string, TopicWorkspaceFacts>();
     for (const placement of list.workspacePlacements) {
       const descriptor = workspacesByServer[placement.serverId]?.get(placement.workspaceId);
@@ -337,12 +347,10 @@ export function SidebarModelProvider({
         latestPendingDurableCreatedAtMs: durableStats?.latestCreatedAtMs ?? null,
         isDispatchInProgress: activity?.status === "running",
       });
-      if (facts.isTopic) foundTopic = true;
       factsMap.set(placement.workspaceKey, facts);
     }
-    return { topicFactsByWorkspaceKey: factsMap, hasAnyTopicWorkspace: foundTopic };
+    return factsMap;
   }, [
-    activeServerIds,
     activityByServer,
     agentsByWorkspaceIdentity,
     completedAtByWorkspaceKey,
@@ -352,12 +360,6 @@ export function SidebarModelProvider({
     workspacesByServer,
   ]);
 
-  const groupMode = resolveEffectiveSidebarGroupMode({
-    groupMode: storedGroupMode,
-    hasExplicitGroupMode,
-    supportsTopicWorkbench,
-    hasAnyTopicWorkspace,
-  });
   const { hosts: labelHosts } = useWorkspaceLabelProjection();
   const collapsedProjectKeys = useSidebarCollapsedSectionsStore(
     (state) => state.collapsedProjectKeys,
@@ -528,6 +530,7 @@ export function SidebarModelProvider({
       resolvedProjectFilters,
       hasProjectsBeforeFilter: list.projects.length > 0,
       supportsTopicWorkbench,
+      topicWorkbenchByServer,
       hasAnyTopicsBeforeFilter,
       hiddenNonTopicCount,
       hasMultipleTopicProjects,
@@ -546,6 +549,7 @@ export function SidebarModelProvider({
       collapsedProjectKeys,
       groupMode,
       supportsTopicWorkbench,
+      topicWorkbenchByServer,
       hasAnyTopicsBeforeFilter,
       hiddenNonTopicCount,
       hasMultipleTopicProjects,

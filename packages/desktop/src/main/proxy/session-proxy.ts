@@ -1,5 +1,6 @@
 import type { ProxyConfig, Session } from "electron";
 import type { DesktopProxyScopePort, ProxyPlan } from "./desktop-proxy.js";
+import { chromiumRoute } from "./native-control.js";
 import {
   chromiumProxyResult,
   configuredProxyForTarget,
@@ -105,15 +106,13 @@ async function readRoutes(session: ProxySession, targets: readonly URL[], signal
   const routes: string[] = [];
   for (const url of targets) {
     signal.throwIfAborted();
-    const route = await session.resolveProxy(url.href);
-    if (!route) throw new Error("Chromium did not resolve the desktop proxy route.");
-    routes.push(route);
+    routes.push(chromiumRoute(await session.resolveProxy(url.href)));
   }
   return routes;
 }
 
 function checkRoutes(actual: string[], expected: string[]) {
-  if (actual.some((route, index) => route !== expected[index])) {
+  if (actual.some((route, index) => route !== chromiumRoute(expected[index]))) {
     throw new Error("Chromium did not select the expected desktop proxy route.");
   }
 }

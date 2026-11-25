@@ -10,6 +10,7 @@ import {
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
 import { createAgentMessageDelivery } from "./agent/agent-messages/index.js";
 import {
+  createPeerPromptHandoff,
   sendPreparedPromptToAgent,
   waitForAgentRunStartWithTimeout,
 } from "./agent/agent-prompt.js";
@@ -944,6 +945,16 @@ export class VoiceAssistantWebSocketServer {
       canSteer: (agentId) => agentManager.canSteer(agentId),
       hasPendingPermission: (agentId) => agentManager.hasPendingPermissions(agentId),
       validateParentOwnership: (address) => this.validateFinishSubscriptionParent(address),
+      unavailableHeldRecipient: async (agentId) => {
+        const stored = await agentStorage.get(agentId);
+        if (stored?.archivedAt) return "Queued peer recipient is archived.";
+        if (
+          !stored &&
+          (await agentStorage.hasDeletedAgent(agentId)) &&
+          !agentManager.getAgent(agentId)
+        )
+          return "Queued peer recipient was deleted.";
+      },
       subscribe: (notify) =>
         agentManager.subscribe(
           (event) => {
@@ -958,6 +969,9 @@ export class VoiceAssistantWebSocketServer {
         let registration: FinishRegistration | undefined;
         let dispatched = false;
         let prepared = false;
+        const peerHandoff = batch.turnAuthorization
+          ? createPeerPromptHandoff(batch.handoff)
+          : undefined;
         const { disposition } = await sendPreparedPromptToAgent({
           agentManager,
           agentStorage,
@@ -966,14 +980,25 @@ export class VoiceAssistantWebSocketServer {
           activeTurnBehavior: batch.activeTurnBehavior,
           idleOnly: batch.idleOnly,
           canSteerDuringDrain: batch.canSteerDuringDrain,
-          handoff: batch.handoff,
+          handoff: peerHandoff?.handoff ?? batch.handoff,
+          assertDispatchAllowed: peerHandoff?.assertAllowed,
           validateDispatch: batch.validateDispatch,
           admit: batch.admit,
           sessionMode: batch.validateDispatch ? undefined : batch.sessionMode,
           clearPendingPermissions: batch.clearPendingPermissions,
           unarchive: batch.unarchive,
           waitForCommandOutcome: batch.waitForProviderOutcome,
-          runOptions: { clientMessageId: batch.messageIds[0] },
+          runOptions: {
+            clientMessageId: batch.messageIds[0],
+            turnAuthorization: batch.turnAuthorization,
+            ...(peerHandoff
+              ? {
+                  waitForProviderPrompt: true,
+                  onPeerPromptSubmitting: peerHandoff.onSubmitting,
+                  onPeerPromptAccepted: peerHandoff.onAccepted,
+                }
+              : {}),
+          },
           beforeDispatch: async () => {
             if (batch.shouldReportUpward) {
               try {
@@ -994,7 +1019,7 @@ export class VoiceAssistantWebSocketServer {
             }
             if (batch.validateDispatch) {
               await batch.validateDispatch();
-              if (batch.sessionMode)
+              if (batch.sessionMode && !batch.turnAuthorization)
                 await agentManager.setAgentMode(batch.recipientId, batch.sessionMode);
             }
             // Run queue preparation before reserving a turn so it can be deferred at shutdown.
@@ -1006,7 +1031,9 @@ export class VoiceAssistantWebSocketServer {
         })
           .then(async (result) => {
             if (!prepared) throw new Error("Recipient was archived before message dispatch");
-            if (result.disposition === "turn_started") {
+            if (result.disposition === "turn_started" && peerHandoff) {
+              await peerHandoff.wait(result.started, agentManager, batch.recipientId);
+            } else if (result.disposition === "turn_started") {
               await waitForAgentRunStartWithTimeout(
                 agentManager,
                 batch.recipientId,
@@ -2498,6 +2525,7 @@ export class VoiceAssistantWebSocketServer {
         agentCreateAsMain: true,
         // COMPAT(topicWorkbenchV1): added in v0.18.0, remove after 2027-06-01.
         ...(this.featureOverrides.topicWorkbenchV1 !== false ? { topicWorkbenchV1: true } : {}),
+        teamConclusionAttention: true,
         ...(this.featureOverrides.topicWorkbenchV1 !== false &&
         this.featureOverrides.topicPromptRetryV1 !== false
           ? { topicPromptRetryV1: true }

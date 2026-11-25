@@ -1,3 +1,4 @@
+import type { ScrollToMessageOccurrence, StreamMessageScrollCompletion } from "./strategy";
 import {
   type ReactElement,
   type ReactNode,
@@ -102,6 +103,8 @@ const BOTTOM_ANCHOR_TRANSPORT_BEHAVIOR = Object.freeze({
 type RowLayoutSyncRegistry = Map<string, () => void>;
 interface MessageScrollRequest {
   messageId: string;
+  completion?: StreamMessageScrollCompletion;
+  removeAbortListener?: () => void;
 }
 
 // A disclosure toggle changes a row from the row's own state, so LegendList's container does not
@@ -199,9 +202,12 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
   const pendingMessageScrollRef = useRef<MessageScrollRequest | null>(null);
   const [queuedMessageScroll, setQueuedMessageScroll] = useState<MessageScrollRequest | null>(null);
   const cancelMessageScroll = useCallback(() => {
-    if (!pendingMessageScrollRef.current) return;
+    const request = pendingMessageScrollRef.current;
+    if (!request) return;
     pendingMessageScrollRef.current = null;
+    request.removeAbortListener?.();
     listRef.current?.cancelScroll();
+    request.completion?.onSettled(false);
   }, []);
   // LegendList places the rows once, behind a hidden reveal, when the list mounts.
   const [isListPlaced, setIsListPlaced] = useState(false);
@@ -546,28 +552,54 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
   const finishMessageScroll = useStableEvent((request: MessageScrollRequest) => {
     if (pendingMessageScrollRef.current !== request) return;
     pendingMessageScrollRef.current = null;
-    const list = listRef.current;
-    if (canReadPosition && list && list.getState().distanceFromEnd <= AT_END_OFFSET_PX) {
+    request.removeAbortListener?.();
+    const state = listRef.current?.getState();
+    if (canReadPosition && state && state.distanceFromEnd <= AT_END_OFFSET_PX) {
       bottomAnchorController.endUserScroll({ isAtEnd: true });
     }
+    const index = findNativeMessageRowIndex(rows, request.messageId);
+    request.completion?.onSettled(
+      Boolean(canReadPosition && state && index >= 0 && index >= state.start && index <= state.end),
+    );
   });
-  const scrollToMessage = useStableEvent((messageId: string) => {
-    const list = listRef.current;
-    if (!canReadPosition || !list || findNativeMessageRowIndex(rows, messageId) < 0) return;
+  const scrollToMessage = useStableEvent(
+    (
+      messageId: string,
+      _occurrence?: ScrollToMessageOccurrence,
+      completion?: StreamMessageScrollCompletion,
+    ) => {
+      const list = listRef.current;
+      if (
+        !canReadPosition ||
+        !list ||
+        completion?.signal.aborted ||
+        findNativeMessageRowIndex(rows, messageId) < 0
+      )
+        return false;
 
-    // Give the jump ownership of the offset before asking LegendList to move it.
-    clearPendingUserScrollEnd();
-    isUserScrollActiveRef.current = false;
-    cancelDisclosureHold();
-    bottomAnchorController.beginUserScroll();
-    bottomAnchorController.endUserScroll({ isAtEnd: false });
-    onNearBottomChange(false);
+      // Give the jump ownership of the offset before asking LegendList to move it.
+      clearPendingUserScrollEnd();
+      isUserScrollActiveRef.current = false;
+      cancelDisclosureHold();
+      bottomAnchorController.beginUserScroll();
+      bottomAnchorController.endUserScroll({ isAtEnd: false });
+      onNearBottomChange(false);
 
-    list.cancelScroll();
-    const request = { messageId };
-    pendingMessageScrollRef.current = request;
-    setQueuedMessageScroll(request);
-  });
+      if (pendingMessageScrollRef.current) cancelMessageScroll();
+      else list.cancelScroll();
+      const request: MessageScrollRequest = { messageId, completion };
+      if (completion) {
+        const cancel = () => {
+          if (pendingMessageScrollRef.current === request) cancelMessageScroll();
+        };
+        completion.signal.addEventListener("abort", cancel, { once: true });
+        request.removeAbortListener = () => completion.signal.removeEventListener("abort", cancel);
+      }
+      pendingMessageScrollRef.current = request;
+      setQueuedMessageScroll(request);
+      return true;
+    },
+  );
   const startMessageScroll = useStableEvent((request: MessageScrollRequest) => {
     if (pendingMessageScrollRef.current !== request || pinsEnd) return;
     setQueuedMessageScroll(null);
@@ -575,7 +607,7 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
     // Older rows may have been prepended while the pin was being removed.
     const index = findNativeMessageRowIndex(rows, request.messageId);
     if (!canReadPosition || !list || index < 0) {
-      pendingMessageScrollRef.current = null;
+      cancelMessageScroll();
       return;
     }
     const scroll = list.scrollToIndex({
@@ -584,7 +616,12 @@ function NativeStreamViewport(props: StreamRenderInput & { strategy: StreamStrat
       viewPosition: 0,
       viewOffset: readingLineInset,
     });
-    void scroll.then(() => finishMessageScroll(request));
+    void scroll.then(
+      () => finishMessageScroll(request),
+      () => {
+        if (pendingMessageScrollRef.current === request) cancelMessageScroll();
+      },
+    );
   });
   useLayoutEffect(() => cancelMessageScroll, [agentId, canReadPosition, cancelMessageScroll]);
   useLayoutEffect(() => {

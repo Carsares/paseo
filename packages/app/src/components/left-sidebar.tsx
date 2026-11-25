@@ -195,6 +195,7 @@ export const LeftSidebar = memo(function LeftSidebar({
     hasMultipleTopicProjects,
     topicFactsByWorkspaceKey,
     resolvedProjectFilters,
+    topicWorkbenchByServer,
     workspaceEntriesByKey,
     isInitialLoad,
     isRevalidating,
@@ -234,8 +235,14 @@ export const LeftSidebar = memo(function LeftSidebar({
     if (isCompactLayout) {
       showMobileAgent();
     }
-    router.navigate(buildNewTopicHref(allProjects, resolvedProjectFilters));
-  }, [allProjects, isCompactLayout, resolvedProjectFilters, showMobileAgent]);
+    router.navigate(buildNewTopicHref(allProjects, resolvedProjectFilters, topicWorkbenchByServer));
+  }, [
+    allProjects,
+    isCompactLayout,
+    resolvedProjectFilters,
+    showMobileAgent,
+    topicWorkbenchByServer,
+  ]);
 
   const handleSettings = useCallback(() => {
     openSettingsFromSidebar({ workspace: activeWorkspace, isCompact: isCompactLayout });
@@ -1012,6 +1019,7 @@ const ThemedHeaderPlus = withUnistyles(Plus, (theme) => ({
 function buildNewTopicHref(
   allProjects: ReturnType<typeof useSidebarModel>["allProjects"],
   resolvedProjectFilters: readonly string[],
+  topicWorkbenchByServer: Readonly<Record<string, boolean>>,
 ): Href {
   let candidateProject = null;
   if (resolvedProjectFilters.length === 1) {
@@ -1020,8 +1028,10 @@ function buildNewTopicHref(
   } else if (allProjects.length === 1) {
     candidateProject = allProjects[0] ?? null;
   }
-  const hostTarget = candidateProject?.hosts[0];
-  return buildNewWorkspaceRoute(
+  const hostTarget =
+    candidateProject?.hosts.find((host) => topicWorkbenchByServer[host.serverId]) ??
+    candidateProject?.hosts[0];
+  const href = buildNewWorkspaceRoute(
     hostTarget && candidateProject
       ? {
           serverId: hostTarget.serverId,
@@ -1030,22 +1040,30 @@ function buildNewTopicHref(
           projectId: hostTarget.projectId,
         }
       : {},
-  ) as Href;
+  );
+  return `${href}${href.includes("?") ? "&" : "?"}topic=1` as Href;
 }
 
 function WorkspacesSectionHeader() {
   const { t } = useTranslation();
   const isCompactLayout = useIsCompactFormFactor();
   const showMobileAgent = usePanelStore((state) => state.showMobileAgent);
-  const { groupMode, allProjects, resolvedProjectFilters } = useSidebarModel();
+  const { groupMode, allProjects, resolvedProjectFilters, topicWorkbenchByServer } =
+    useSidebarModel();
   const isTopicMode = groupMode === "topic";
 
   const handleCreateTopic = useCallback(() => {
     if (isCompactLayout) {
       showMobileAgent();
     }
-    router.navigate(buildNewTopicHref(allProjects, resolvedProjectFilters));
-  }, [allProjects, isCompactLayout, resolvedProjectFilters, showMobileAgent]);
+    router.navigate(buildNewTopicHref(allProjects, resolvedProjectFilters, topicWorkbenchByServer));
+  }, [
+    allProjects,
+    isCompactLayout,
+    resolvedProjectFilters,
+    showMobileAgent,
+    topicWorkbenchByServer,
+  ]);
 
   return (
     <SidebarSectionHeader title={isTopicMode ? t("topicWorkbench.sidebar.title") : "Workspaces"}>

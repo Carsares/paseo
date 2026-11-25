@@ -1,8 +1,27 @@
+import { mkdtemp, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { IpcMainInvokeEvent, WebContents } from "electron";
 import { describe, expect, it, vi } from "vitest";
 import { createDesktopProxy } from "./desktop-proxy.js";
 import { createDeviceProxyCommands } from "./ipc.js";
 import type { StoredProxySettings } from "./storage.js";
+
+const download = vi.hoisted(() => ({
+  fetch: vi.fn<typeof fetch>(),
+  resolveProxy: vi.fn(async (_url: string) => "DIRECT"),
+  setProxy: vi.fn(async () => undefined),
+  showSaveDialog: vi.fn<() => Promise<{ canceled: boolean; filePath: string }>>(),
+}));
+
+vi.mock("electron", () => ({
+  app: { getPath: () => tmpdir() },
+  BrowserWindow: { fromWebContents: () => ({}) },
+  dialog: { showSaveDialog: download.showSaveDialog },
+  session: {
+    fromPartition: () => ({ ...download, forceReloadProxyConfig: async () => undefined }),
+  },
+}));
 
 async function setup() {
   let stored: StoredProxySettings = { version: 1, scopes: {} };
@@ -33,7 +52,11 @@ async function setup() {
     },
   });
   const frame = { url: "paseo://app/settings" };
-  const sender = { mainFrame: frame, isDestroyed: () => false } as unknown as WebContents;
+  const sender = {
+    mainFrame: frame,
+    isDestroyed: () => false,
+    session: { cookies: { get: async () => [] } },
+  } as unknown as WebContents;
   const event = { sender, senderFrame: frame } as unknown as IpcMainInvokeEvent;
   const appWindows = new WeakSet([sender]);
   const trustedUrl = "paseo://app/";
@@ -47,6 +70,70 @@ async function setup() {
 }
 
 describe("device proxy commands", () => {
+  it("streams a 65 MiB DNS-host download via the verified direct session", async () => {
+    const { invoke, event } = await setup();
+    const tested = await invoke(event, "test_device_proxy", {
+      expectedRevision: 0,
+      change: {
+        settings: {
+          mode: "manual",
+          endpoints: { kind: "unified", url: "http://proxy.example" },
+          bypass: [],
+        },
+        credentials: {},
+      },
+    });
+    if (tested.status !== "passed") throw new Error("Expected a validation receipt");
+    await expect(
+      invoke(event, "set_device_proxy", {
+        validationId: tested.receipt.validationId,
+        revision: tested.receipt.revision,
+      }),
+    ).resolves.toMatchObject({ status: "saved" });
+
+    const directory = await mkdtemp(path.join(tmpdir(), "paseo-download-test-"));
+    try {
+      const destination = path.join(directory, "file.bin");
+      download.showSaveDialog.mockResolvedValueOnce({ canceled: false, filePath: destination });
+      const prepared = await invoke(event, "prepare_direct_file_download", {
+        origin: "https://paired.example:8443",
+        fileName: "file.bin",
+      });
+      if (prepared.status !== "ready" || !("id" in prepared))
+        throw new Error("Expected a download ID");
+      const chunk = new Uint8Array(1024 * 1024);
+      let remaining = 65;
+      download.fetch.mockResolvedValueOnce(
+        new Response(
+          new ReadableStream({
+            pull(controller) {
+              if (remaining-- > 0) controller.enqueue(chunk);
+              else controller.close();
+            },
+          }),
+        ),
+      );
+      const args = { id: prepared.id, token: "fixture-token" };
+      await expect(invoke(event, "start_direct_file_download", args)).resolves.toEqual({
+        status: "complete",
+      });
+      expect(download.setProxy).toHaveBeenCalledWith({ mode: "direct" });
+      expect(download.resolveProxy).toHaveBeenCalledWith(
+        "https://paired.example:8443/api/files/download",
+      );
+      expect(download.fetch).toHaveBeenCalledExactlyOnceWith(
+        "https://paired.example:8443/api/files/download?token=fixture-token",
+        expect.objectContaining({ redirect: "error", credentials: "omit" }),
+      );
+      expect((await stat(destination)).size).toBe(65 * chunk.length);
+      await expect(invoke(event, "start_direct_file_download", args)).resolves.toEqual({
+        status: "failed",
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("replaces the paired LAN snapshot with canonical local origins only", async () => {
     const { event, sender, frame, appWindows, trustedUrl } = await setup();
     const syncPaired = vi.fn(async () => undefined);

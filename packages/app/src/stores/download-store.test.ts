@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { defaultHostAppearance } from "@/hosts/appearance";
 import { i18n } from "@/i18n/i18next";
 import {
@@ -17,6 +17,13 @@ const FILE_BYTES = new TextEncoder().encode("relay download payload");
 const FILE_PATH = "reports/données été.bin";
 const FILE_NAME = "données été.bin";
 const MIME_TYPE = "application/octet-stream";
+
+const desktop = vi.hoisted(() => ({
+  host: vi.fn(),
+  getHostRuntimeStore: vi.fn(),
+}));
+vi.mock("@/desktop/host", () => ({ getDesktopHost: desktop.host }));
+vi.mock("@/runtime/host-runtime", () => ({ getHostRuntimeStore: desktop.getHostRuntimeStore }));
 
 const relayConnection: RelayHostConnection = {
   id: "relay:relay.paseo.sh:443",
@@ -118,6 +125,56 @@ async function startDownload(input: StartInput): Promise<Download | undefined> {
 describe("download store transport selection", () => {
   beforeEach(() => {
     useDownloadStore.setState({ downloads: new Map(), activeDownloadId: null });
+    desktop.host.mockReset();
+    desktop.getHostRuntimeStore.mockReset();
+  });
+
+  it("hands an authenticated DNS download larger than the session limit to Desktop", async () => {
+    const connection: DirectTcpHostConnection = {
+      id: "direct:paired.example:8443",
+      type: "directTcp",
+      endpoint: "paired.example:8443",
+      useTls: true,
+    };
+    const profile = profileWith([connection]);
+    const active = {
+      activeConnectionId: connection.id,
+      activeConnection: { type: "directTcp" },
+      connectionStatus: "online",
+      connectionEpoch: 1,
+      client: { getLastServerInfoMessage: () => ({ serverId: profile.serverId }) },
+    };
+    const getSnapshot = vi.fn(() => active);
+    desktop.getHostRuntimeStore.mockReturnValue({ getSnapshot, getHosts: () => [profile] });
+    const invoke = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "ready", id: "download-id" })
+      .mockResolvedValueOnce({ status: "complete" });
+    desktop.host.mockReturnValue({ directFileDownload: true, invoke });
+    const token = createTokenRequest(MAX_SESSION_DOWNLOAD_BYTES + 1);
+    const fetchFile = vi.fn<typeof fetch>();
+    await expect(
+      startDownload({ profile, activeConnectionId: connection.id, token, fetchFile }),
+    ).resolves.toMatchObject({ status: "complete" });
+    expect(invoke.mock.calls).toEqual([
+      [
+        "prepare_direct_file_download",
+        { origin: "https://paired.example:8443", fileName: FILE_NAME },
+      ],
+      ["start_direct_file_download", { id: "download-id", token: "tok" }],
+    ]);
+    expect(fetchFile).not.toHaveBeenCalled();
+
+    invoke.mockReset().mockResolvedValueOnce({ status: "ready", id: "next-download" });
+    getSnapshot
+      .mockReturnValueOnce(active)
+      .mockReturnValueOnce(active)
+      .mockReturnValue({ ...active, connectionEpoch: 2 });
+    await expect(
+      startDownload({ profile, activeConnectionId: connection.id, token, fetchFile }),
+    ).resolves.toMatchObject({ status: "error", message: i18n.t("downloads.hostUnavailable") });
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(fetchFile).not.toHaveBeenCalled();
   });
 
   it("downloads over the session when the active connection is the relay", async () => {

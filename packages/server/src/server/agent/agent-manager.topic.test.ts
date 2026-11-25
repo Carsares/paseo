@@ -1288,3 +1288,48 @@ test("a live model change preserves supported thinking and clears an incompatibl
     await manager.closeAgent(agent.id);
   }
 });
+
+test("a team conclusion receipt only clears the matching main attention", async () => {
+  const { manager, storage, config, createSilentMain, send } = await topicScenario();
+  const main = await createSilentMain();
+  const child = await manager.createAgent(config, undefined, {
+    workspaceId: WORKSPACE_ID,
+    labels: { [PARENT_AGENT_ID_LABEL]: main.id },
+  });
+
+  await sendPromptToAgent({ ...send, agentId: main.id, prompt: "First conclusion" });
+  await expect.poll(() => manager.hasInFlightRun(main.id)).toBe(false);
+  const first = (await storage.get(main.id))?.attentionTimestamp;
+  if (!first) throw new Error("Expected first conclusion attention");
+  await manager.markAgentUnread(child.id);
+
+  await sendPromptToAgent({ ...send, agentId: main.id, prompt: "Second conclusion" });
+  await expect.poll(() => manager.hasInFlightRun(main.id)).toBe(false);
+  const second = (await storage.get(main.id))?.attentionTimestamp;
+  if (!second) throw new Error("Expected second conclusion attention");
+  expect(second).not.toBe(first);
+
+  await manager.clearTeamConclusionAttention(main.id, {
+    workspaceId: WORKSPACE_ID,
+    attentionTimestamp: first,
+  });
+  expect(await storage.get(main.id)).toMatchObject({
+    requiresAttention: true,
+    attentionTimestamp: second,
+  });
+
+  const childAttention = (await storage.get(child.id))?.attentionTimestamp;
+  if (!childAttention) throw new Error("Expected separate child attention");
+  await manager.clearTeamConclusionAttention(child.id, {
+    workspaceId: WORKSPACE_ID,
+    attentionTimestamp: childAttention,
+  });
+  expect((await storage.get(child.id))?.requiresAttention).toBe(true);
+
+  await manager.clearTeamConclusionAttention(main.id, {
+    workspaceId: WORKSPACE_ID,
+    attentionTimestamp: second,
+  });
+  expect((await storage.get(main.id))?.requiresAttention).toBe(false);
+  expect((await storage.get(child.id))?.requiresAttention).toBe(true);
+});

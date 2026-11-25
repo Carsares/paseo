@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AppState } from "react-native";
 import { DaemonConnectionError, type DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { createAgentAttentionController } from "@/utils/agent-attention";
 import { getIsAppActivelyVisible } from "@/utils/app-visibility";
 import { isWeb } from "@/constants/platform";
 import { useStableEvent } from "@/hooks/use-stable-event";
+import { useOptionalTeamMessageJumpStore } from "@/subagents/team-directory/message-jump-store";
 
 type AttentionReason = "finished" | "error" | "permission" | null | undefined;
 
@@ -22,6 +23,7 @@ interface UseAgentAttentionClearParams {
 
 interface AgentAttentionClearController {
   clearOnInputFocus: () => void;
+  clearOnUserInteraction: () => void;
   clearOnPromptSend: () => void;
 }
 
@@ -36,6 +38,8 @@ export function useAgentAttentionClear({
   focusRequest,
   onError,
 }: UseAgentAttentionClearParams): AgentAttentionClearController {
+  const jumpStore = useOptionalTeamMessageJumpStore();
+  const navigationFocusAgent = useRef<string | null>(null);
   const [isAppVisible, setIsAppVisible] = useState<boolean>(() => getIsAppActivelyVisible());
   const clearAttention = useStableEvent(async (id: string) => {
     if (client) await client.clearAgentAttention(id);
@@ -82,10 +86,18 @@ export function useAgentAttentionClear({
   }, []);
 
   useEffect(() => {
+    const focused = isScreenFocused && isAppVisible;
+    // Message navigation can focus the chat even for an older report. Consume that focus
+    // without queuing an unconditional clear while the agent state is still loading.
+    if (!isScreenFocused) navigationFocusAgent.current = null;
+    if (focused && agentId && jumpStore?.consumeNavigationFocus(agentId)) {
+      navigationFocusAgent.current = agentId;
+    }
+    const suppressFocus = Boolean(agentId && navigationFocusAgent.current === agentId);
     controller.update({
-      focused: isScreenFocused && isAppVisible,
-      ready: Boolean(client && agentId && isConnected && isAgentDataReady),
-      requiresAttention,
+      focused,
+      ready: suppressFocus || Boolean(client && agentId && isConnected && isAgentDataReady),
+      requiresAttention: requiresAttention && !suppressFocus,
       attentionReason,
       focusRequest,
     });
@@ -100,10 +112,32 @@ export function useAgentAttentionClear({
     requiresAttention,
     attentionReason,
     focusRequest,
+    jumpStore,
   ]);
 
+  const clearOnInteraction = useStableEvent(() => {
+    controller.update({
+      focused: isScreenFocused && isAppVisible,
+      ready: Boolean(client && agentId && isConnected && isAgentDataReady),
+      requiresAttention,
+      attentionReason,
+      focusRequest,
+    });
+    controller.focus();
+  });
+  const clearOnInputFocus = useStableEvent(() => {
+    if (
+      agentId &&
+      (navigationFocusAgent.current === agentId || jumpStore?.consumeNavigationFocus(agentId))
+    ) {
+      navigationFocusAgent.current = agentId;
+      return;
+    }
+    clearOnInteraction();
+  });
   return {
-    clearOnInputFocus: controller.focus,
-    clearOnPromptSend: controller.focus,
+    clearOnInputFocus,
+    clearOnUserInteraction: clearOnInteraction,
+    clearOnPromptSend: clearOnInteraction,
   };
 }

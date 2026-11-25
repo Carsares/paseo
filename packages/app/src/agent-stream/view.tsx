@@ -86,7 +86,11 @@ import { findLatestAgentSourceGroupId, getAgentSourcePresentation } from "./agen
 import { AgentSourceHeader, UnreadAgentSourceContext } from "./source-header";
 import { type AgentStreamRenderModel, buildAgentStreamRenderModel } from "./model";
 import { resolveStreamRenderStrategy } from "./strategy-resolver";
-import { type StreamSegmentRenderers, type StreamViewportHandle } from "./strategy";
+import type {
+  StreamMessageScrollCompletion,
+  StreamSegmentRenderers,
+  StreamViewportHandle,
+} from "./strategy";
 import { renderStreamRow, type RenderStreamItem } from "./stream-row";
 import { type NearBottom, useIsNearBottom, useNearBottom } from "./near-bottom";
 import { ActivePromptBar } from "@/agent-stream/chat-outline/active-prompt-bar";
@@ -267,30 +271,26 @@ export interface AgentStreamViewHandle {
 
 type StreamPresentationResult = ReturnType<ReturnType<typeof createStreamPresentation>>;
 
-function matchesTeamJumpCandidate(
-  candidate: StreamItem,
-  jump: NonNullable<ReturnType<typeof usePendingTeamMessageJump>>,
-): boolean {
-  if (jump.itemId !== null && candidate.id === jump.itemId) return true;
-  if (jump.messageId !== null && getStreamItemMessageId(candidate) === jump.messageId) return true;
-  return (
-    jump.epoch !== null &&
-    jump.seq !== null &&
-    candidate.timelineCursor?.epoch === jump.epoch &&
-    candidate.timelineCursor.seq === jump.seq
-  );
-}
-
 function findLoadedTeamJumpItem(
   presentation: StreamPresentationResult,
   jump: NonNullable<ReturnType<typeof usePendingTeamMessageJump>>,
 ): StreamItem | undefined {
-  const predicate = (candidate: StreamItem) => matchesTeamJumpCandidate(candidate, jump);
+  const find = (matches: (item: StreamItem) => boolean) =>
+    presentation.sourceTail.find(matches) ??
+    presentation.sourceHead.find(matches) ??
+    presentation.tail.find(matches) ??
+    presentation.head.find(matches);
   return (
-    presentation.sourceTail.find(predicate) ??
-    presentation.sourceHead.find(predicate) ??
-    presentation.tail.find(predicate) ??
-    presentation.head.find(predicate)
+    (jump.itemId !== null ? find((item) => item.id === jump.itemId) : undefined) ??
+    (jump.epoch !== null && jump.seq !== null
+      ? find(
+          (item) =>
+            item.timelineCursor?.epoch === jump.epoch && item.timelineCursor?.seq === jump.seq,
+        )
+      : undefined) ??
+    (jump.messageId !== null
+      ? find((item) => getStreamItemMessageId(item) === jump.messageId)
+      : undefined)
   );
 }
 
@@ -300,6 +300,10 @@ function resolveLoadedTeamJumpRowId(
   setToolCallGroupExpanded: (groupId: string, expanded: boolean) => void,
 ): string {
   const displayedRows = [...presentation.tail, ...presentation.head];
+  const exactRow = displayedRows.find((row) => row.id === loadedItem.id);
+  if (exactRow && !presentation.groupsByHostId.get(exactRow.id)) {
+    return getStreamItemMessageId(exactRow);
+  }
   for (const row of displayedRows) {
     const group = presentation.groupsByHostId.get(row.id);
     if (!group?.run.calls.some((call) => call.id === loadedItem.id)) continue;
@@ -371,7 +375,7 @@ function useTeamMessageJumpEffect(input: {
   revealLoadedMessage: (messageId: string) => boolean;
   setToolCallGroupExpanded: (groupId: string, expanded: boolean) => void;
   scrollToBottom: () => void;
-  scrollToMessage: (messageId: string) => void;
+  scrollToMessage: (messageId: string, completion: StreamMessageScrollCompletion) => boolean;
   handleTimelineHistoryLoadError: () => void;
 }): void {
   const {
@@ -391,6 +395,16 @@ function useTeamMessageJumpEffect(input: {
   const inFlightJumpRequestIdRef = useRef<number | null>(null);
   const settledJumpRequestIdRef = useRef<number | null>(null);
   const [jumpFetchTick, setJumpFetchTick] = useState(0);
+  const scrollAbort = useRef<AbortController | null>(null);
+  const activeJumpId = pendingTeamMessageJump?.requestId;
+  useEffect(
+    () => () => {
+      const request = scrollAbort.current;
+      scrollAbort.current = null;
+      request?.abort();
+    },
+    [isActive, activeJumpId],
+  );
 
   useEffect(() => {
     if (!pendingTeamMessageJump || !isActive) return;
@@ -404,23 +418,55 @@ function useTeamMessageJumpEffect(input: {
 
     const loadedItem = findLoadedTeamJumpItem(presentation, pendingTeamMessageJump);
     if (loadedItem) {
+      if (scrollAbort.current) return;
+      const loadedMessageId = getStreamItemMessageId(loadedItem);
+      if (
+        presentation.turns.hostIdByFoldedMessageId.has(loadedMessageId) &&
+        revealLoadedMessage(loadedMessageId)
+      )
+        return;
+
       const scrollRowMessageId = resolveLoadedTeamJumpRowId(
         loadedItem,
         presentation,
         setToolCallGroupExpanded,
       );
-      if (!mountedMessageIds.has(scrollRowMessageId)) {
-        if (revealLoadedMessage(scrollRowMessageId) || revealLoadedMessage(loadedItem.id)) {
+      if (!mountedMessageIds.has(scrollRowMessageId) && revealLoadedMessage(scrollRowMessageId)) {
+        return;
+      }
+      const request = new AbortController();
+      scrollAbort.current = request;
+      let retryFrame: number | undefined;
+      let attempts = 0;
+      const onSettled = (landed: boolean) => {
+        if (request.signal.aborted || teamMessageJumpStore?.getIntent()?.requestId !== requestId)
           return;
+        if (landed) teamMessageJumpStore.acknowledgeJump(requestId);
+        else teamMessageJumpStore.discardJump(requestId);
+      };
+      function startScroll() {
+        if (request.signal.aborted) return;
+        if (scrollToMessage(scrollRowMessageId, { signal: request.signal, onSettled })) return;
+        if (++attempts < 24) retryFrame = requestAnimationFrame(startScroll);
+        else {
+          handleTimelineHistoryLoadError();
+          onSettled(false);
         }
       }
-      scrollToMessage(scrollRowMessageId);
-      teamMessageJumpStore?.acknowledgeJump(requestId);
+      request.signal.addEventListener(
+        "abort",
+        () => {
+          if (retryFrame !== undefined) cancelAnimationFrame(retryFrame);
+        },
+        { once: true },
+      );
+      startScroll();
       return;
     }
 
     if (!epoch || seq === null || settledJumpRequestIdRef.current === requestId) {
-      teamMessageJumpStore?.acknowledgeJump(requestId);
+      handleTimelineHistoryLoadError();
+      teamMessageJumpStore?.discardJump(requestId);
       return;
     }
 
@@ -438,7 +484,7 @@ function useTeamMessageJumpEffect(input: {
         onSettledSuccess: () => setJumpFetchTick((v) => v + 1),
         onError: () => {
           handleTimelineHistoryLoadError();
-          teamMessageJumpStore?.acknowledgeJump(requestId);
+          teamMessageJumpStore?.discardJump(requestId);
         },
       });
     }
@@ -1079,9 +1125,10 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     });
 
     const setToolCallGroupExpanded = toolCallExpansion.setGroupExpanded;
-    const scrollViewportToMessage = useStableEvent((messageId: string) => {
-      viewportRef.current?.scrollToMessage?.(messageId);
-    });
+    const scrollViewportToMessage = useStableEvent(
+      (messageId: string, completion: StreamMessageScrollCompletion) =>
+        viewportRef.current?.scrollToMessage?.(messageId, undefined, completion) === true,
+    );
     useTeamMessageJumpEffect({
       isActive,
       resolvedServerId,

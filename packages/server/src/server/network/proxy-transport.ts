@@ -22,12 +22,36 @@ interface Endpoint {
 
 const DIAGNOSTIC_HTTPS_TARGET = "https://relay.paseo.sh/health";
 // Use a source-owned diagnostic identity as a client. It sends no application frames.
-const DIAGNOSTIC_WEBSOCKET_TARGET =
+const DIAGNOSTIC_WSS_TARGET =
   "wss://relay.paseo.sh/ws?role=client&serverId=paseo-network-diagnostics&v=2";
+
+const diagnosticTargets = {
+  http: {
+    http: DIAGNOSTIC_HTTPS_TARGET.replace(/^https:/, "http:"),
+    webSocket: DIAGNOSTIC_WSS_TARGET.replace(/^wss:/, "ws:"),
+    checks: [
+      { protocol: "http", port: 80 },
+      { protocol: "ws", port: 80 },
+    ],
+    upgrade: {
+      http: DIAGNOSTIC_HTTPS_TARGET,
+      webSocket: DIAGNOSTIC_WSS_TARGET.replace(/^wss:/, "https:"),
+    },
+  },
+  https: {
+    http: DIAGNOSTIC_HTTPS_TARGET,
+    webSocket: DIAGNOSTIC_WSS_TARGET,
+    checks: [
+      { protocol: "https", port: 443 },
+      { protocol: "wss", port: 443 },
+    ],
+    upgrade: undefined,
+  },
+} as const;
 
 export interface ProxyDiagnosticCoverage {
   proxySlot: ProxySlot | null;
-  checks: readonly [{ protocol: "https"; port: 443 }, { protocol: "wss"; port: 443 }];
+  checks: (typeof diagnosticTargets)[TargetScheme]["checks"];
 }
 
 function endpoint(url: string, credential?: ProxyCredential): Endpoint {
@@ -182,24 +206,22 @@ export class ProxyTransport {
     );
     return (this.#unified ? (["https"] as const) : routes).map((route) => {
       const proxySlot = this.#unified ? "unified" : route;
+      const targets = diagnosticTargets[route];
       const coverage: ProxyDiagnosticCoverage = {
         proxySlot: this.#proxies[route] ? proxySlot : null,
-        checks: [
-          { protocol: "https", port: 443 },
-          { protocol: "wss", port: 443 },
-        ],
+        checks: targets.checks,
       };
       return {
         coverage,
-        https: (signal: AbortSignal) =>
-          fetch(DIAGNOSTIC_HTTPS_TARGET, {
+        upgrade: targets.upgrade,
+        http: (signal: AbortSignal) =>
+          fetch(targets.http, {
             dispatcher: this.#dispatchers[route] ?? this.#direct,
             method: "GET",
             signal,
-            redirect: "error",
+            redirect: "manual",
           }),
-        webSocket: (signal: AbortSignal) =>
-          this.#webSocket(DIAGNOSTIC_WEBSOCKET_TARGET, signal, route),
+        webSocket: (signal: AbortSignal) => this.#webSocket(targets.webSocket, signal, route),
       };
     });
   }

@@ -14,14 +14,19 @@ import { join } from "node:path";
 import { WORKSPACE_MAIN_ROLE, WORKSPACE_ROLE_LABEL } from "@getpaseo/protocol/agent-labels";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
+import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
 import { AgentManager } from "./agent-manager.js";
 import {
+  createPeerPromptHandoff,
+  QueuedPromptLoadError,
   sendPreparedPromptToAgent,
   sendPromptToAgent,
+  startAgentRun,
   startCreatedAgentInitialPrompt,
   waitForAgentRunStartWithTimeout,
   withWorkspaceTopicPrompt,
 } from "./agent-prompt.js";
+import { AgentRequestOutcomeUnknownError } from "../message-receipts/index.js";
 import { AgentRunState, ForegroundPromptStart } from "./agent-run-state.js";
 import type {
   AgentClient,
@@ -30,7 +35,7 @@ import type {
   AgentSession,
   AgentStreamEvent,
 } from "./agent-sdk-types.js";
-import type { AgentStorage } from "./agent-storage.js";
+import { AgentStorage } from "./agent-storage.js";
 import { stripMainControlPromptHeader, type TopicWorkspaceSnapshot } from "./hierarchy-policy.js";
 
 test("isSystemInjectedEnvelope matches the envelope formatSystemNotificationPrompt produces", () => {
@@ -440,6 +445,104 @@ test("waiting for a run start outlasts the slowest provider startup budget", asy
   }
 });
 
+test("a peer turn never calls an unqualified provider or hands off its receipt", async () => {
+  const { agentManager, agentId, cleanup } = await createRunStartScenario(null);
+  const session = agentManager.getAgent(agentId)!.session!;
+  const providerStart = vi.spyOn(session, "startTurn");
+  const outOfBand = vi.spyOn(agentManager, "tryRunOutOfBand");
+  const beforeHandoff = vi.fn(async () => {});
+  try {
+    const run = await startAgentRun(agentManager, agentId, "Inspect schema", createTestLogger(), {
+      beforeHandoff,
+      runOptions: { turnAuthorization: "peer-read-only", waitForProviderPrompt: true },
+    });
+    expect(run.disposition).toBe("turn_started");
+    if (run.disposition !== "turn_started") return;
+    await expect(run.started).rejects.toThrow("cannot enforce a fresh read-only turn");
+    expect(providerStart).not.toHaveBeenCalled();
+    expect(outOfBand).not.toHaveBeenCalled();
+    expect(beforeHandoff).not.toHaveBeenCalled();
+  } finally {
+    await cleanup();
+  }
+});
+
+test.each([false, true])(
+  "peer dispatch leaves a persisted cold recipient untouched (archived: %s)",
+  async (archived) => {
+    const workdir = mkdtempSync(join(tmpdir(), "peer-cold-recipient-"));
+    const logger = createTestLogger();
+    const storageDir = join(workdir, "agents");
+    const registry = new AgentStorage(storageDir, logger);
+    const author = new AgentManager({ clients: createTestAgentClients(), logger, registry });
+    const beforeResumeSession = vi.fn(async () => {});
+    const onStartTurn = vi.fn();
+    const agentStorage = new AgentStorage(storageDir, logger);
+    const agentManager = new AgentManager({
+      clients: createTestAgentClients({ beforeResumeSession, onStartTurn }),
+      logger,
+      registry: agentStorage,
+    });
+    const { id: agentId } = await author.createAgent(
+      { provider: "codex", cwd: workdir },
+      undefined,
+      { workspaceId: undefined },
+    );
+    try {
+      await author.closeAgent(agentId);
+      if (archived) await author.archiveSnapshot(agentId, "2026-11-25T00:00:00.000Z");
+      const record = await agentStorage.get(agentId);
+      expect(record?.persistence?.sessionId).toEqual(expect.any(String));
+      expect(Boolean(record?.archivedAt)).toBe(archived);
+
+      const unarchive = vi.spyOn(agentManager, "unarchiveSnapshot");
+      const write = vi.spyOn(agentStorage, "upsert");
+      const begin = vi.fn();
+      const beforeDispatch = vi.fn();
+      const runOptions = { turnAuthorization: "peer-read-only" } as const;
+      const params = {
+        agentManager,
+        agentStorage,
+        agentId,
+        prompt: "Inspect the current design",
+        beforeDispatch,
+        handoff: { begin, declined: vi.fn() },
+        logger,
+      };
+      await expect(sendPreparedPromptToAgent({ ...params, runOptions })).rejects.toThrow(
+        archived ? "recipient is archived" : "Open the recipient's interactive session",
+      );
+      expect(() => agentManager.streamAgent(agentId, params.prompt, runOptions)).toThrow(
+        "Open the recipient's interactive session",
+      );
+      expect(agentManager.getAgent(agentId)).toBeNull();
+      expect(beforeResumeSession).not.toHaveBeenCalled();
+      expect(unarchive).not.toHaveBeenCalled();
+      expect(write).not.toHaveBeenCalled();
+      expect(beforeDispatch).not.toHaveBeenCalled();
+      expect(begin).not.toHaveBeenCalled();
+      expect(onStartTurn).not.toHaveBeenCalled();
+      expect(await new AgentStorage(storageDir, logger).get(agentId)).toEqual(record);
+
+      const manual = await sendPromptToAgent({
+        agentManager,
+        agentStorage,
+        agentId,
+        prompt: "Open and continue",
+        logger,
+      });
+      expect(manual.disposition).toBe("turn_started");
+      if (manual.disposition === "turn_started") await manual.started;
+      expect(beforeResumeSession).toHaveBeenCalledOnce();
+      expect(onStartTurn).toHaveBeenCalledOnce();
+    } finally {
+      await agentManager.closeAgent(agentId).catch(() => undefined);
+      await author.closeAgent(agentId).catch(() => undefined);
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
 test("waiting for a run start still gives up at the run start budget", async () => {
   const scenario = await createRunStartScenario(null);
   vi.useFakeTimers();
@@ -467,6 +570,41 @@ test("waiting for a run start still gives up at the run start budget", async () 
     await scenario.cleanup();
   }
 });
+
+test.each(["before submission", "after submission"] as const)(
+  "classifies the peer cutoff %s even when the receipt was prepared",
+  async (phase) => {
+    const started = Promise.withResolvers<void>();
+    const begin = vi.fn(async () => {});
+    const declined = vi.fn(async () => {});
+    const onProviderOutcome = vi.fn(async () => {});
+    const peer = createPeerPromptHandoff({ begin, declined, onProviderOutcome });
+    const rejected =
+      phase === "before submission" ? QueuedPromptLoadError : AgentRequestOutcomeUnknownError;
+    vi.useFakeTimers();
+    try {
+      const wait = expect(
+        peer.wait(started.promise, { getAgent: () => null }, "agent"),
+      ).rejects.toThrow(rejected);
+      await peer.handoff?.begin();
+      if (phase === "after submission") peer.onSubmitting();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await wait;
+      if (phase === "before submission") {
+        expect(declined).toHaveBeenCalledOnce();
+        expect(peer.onSubmitting).toThrow(QueuedPromptLoadError);
+      } else {
+        await peer.handoff?.declined();
+        expect(declined).not.toHaveBeenCalled();
+        await peer.onAccepted();
+        await peer.onAccepted();
+        expect(onProviderOutcome).toHaveBeenCalledExactlyOnceWith("accepted");
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  },
+);
 
 test("agent envelopes round-trip opaque sender IDs and XML-sensitive messages", () => {
   const message = {

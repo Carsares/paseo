@@ -1,24 +1,45 @@
-import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { WORKSPACE_MAIN_ROLE, WORKSPACE_ROLE_LABEL } from "@getpaseo/protocol/agent-labels";
 import type { PendingSubagentInbox } from "@getpaseo/protocol/messages";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { within } from "@testing-library/dom";
-import { act } from "react";
+import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { View } from "react-native";
+import { KeyboardProvider } from "react-native-keyboard-controller";
+import { SafeAreaInsetsContext } from "react-native-safe-area-context";
 import { StyleSheet } from "react-native-unistyles";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { page, userEvent } from "vitest/browser";
 import {
   CHAT_OUTLINE_GUTTER_INSET,
   CHAT_OUTLINE_MIN_PANEL_WIDTH,
 } from "@/agent-stream/chat-outline/geometry";
 import { CHAT_COLUMN_RAIL_DATASET, ChatColumnRailSurface } from "@/chat-rail";
+import { CommandCenterProvider } from "@/command-center/provider";
 import { ToastProvider } from "@/contexts/toast-context";
+import { DiffDocumentWorkspaceCacheProvider } from "@/git/diff-document/workspace-cache";
 import { APP_SETTINGS_QUERY_KEY, DEFAULT_APP_SETTINGS } from "@/hooks/use-settings/storage";
 import { i18n } from "@/i18n/i18next";
+import { KeyboardActionDispatcherProvider } from "@/keyboard/keyboard-action-dispatcher-context";
+import { KeyboardShiftProvider } from "@/keyboard/shift";
+import { MobilePanelsProvider } from "@/mobile-panels/provider";
+import {
+  createPaneFocusContextValue,
+  PaneFocusProvider,
+  PaneProvider,
+  type PaneContextValue,
+} from "@/panels/pane-context";
+import { getHostRuntimeStore, type HostRuntimeSnapshot } from "@/runtime/host-runtime";
+import { SheetPaneHostProvider, type SheetPaneHost } from "@/screens/workspace/sheet-pane/host";
 import { useSessionStore } from "@/stores/session-store";
 import { DEFAULT_CONTENT_MAX_WIDTH } from "@/styles/theme";
+import {
+  createTeamMessageJumpStore,
+  TeamMessageJumpProvider,
+} from "@/subagents/team-directory/message-jump-store";
 import { normalizeAgentSnapshot } from "@/utils/agent-snapshots";
+import { AgentConversationPanel } from "./agent-panel";
 import { PendingSubagentInboxBar } from "./agent-panel-inbox";
 
 const serverId = "inbox-host";
@@ -29,6 +50,32 @@ const inbox: PendingSubagentInbox = {
     { agentId: "reviewer", title: "Reviewer", event: "finished" },
     { agentId: "subagent-123456", event: "finished" },
   ],
+};
+const noop = () => {};
+const pane: PaneContextValue = {
+  serverId,
+  workspaceId: "workspace",
+  tabId: "agent-tab",
+  host: "main",
+  target: { kind: "agent", agentId },
+  openTab: noop,
+  openPreferredTarget: noop,
+  closeCurrentTab: noop,
+  retargetCurrentTab: noop,
+  setCurrentTabState: noop,
+  openFileInWorkspace: noop,
+  openImportSheet: noop,
+};
+const insets = { top: 0, right: 0, bottom: 0, left: 0 };
+const paneFocus = createPaneFocusContextValue({ isWorkspaceFocused: true, isPaneFocused: true });
+const sheetHost: SheetPaneHost = {
+  serverId,
+  workspaceId: pane.workspaceId,
+  workspaceKey: `${serverId}:${pane.workspaceId}`,
+  isWorkspaceFocused: true,
+  buildContent: () => {
+    throw new Error("The chat click does not open a sheet");
+  },
 };
 const store = useSessionStore.getState();
 let container: HTMLDivElement;
@@ -45,6 +92,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   act(() => root.unmount());
+  vi.restoreAllMocks();
   store.clearSession(serverId);
   container.remove();
 });
@@ -68,7 +116,11 @@ function renderInbox(hidden = false) {
   );
 }
 
-function publishAgent(isMain: boolean, pendingSubagentInbox?: PendingSubagentInbox) {
+function publishAgent(
+  isMain: boolean,
+  pendingSubagentInbox?: PendingSubagentInbox,
+  requiresAttention = false,
+) {
   const agent = normalizeAgentSnapshot(
     {
       id: agentId,
@@ -79,6 +131,8 @@ function publishAgent(isMain: boolean, pendingSubagentInbox?: PendingSubagentInb
       updatedAt: "2026-04-20T00:01:00.000Z",
       lastUserMessageAt: null,
       status: "idle",
+      requiresAttention,
+      attentionReason: requiresAttention ? "finished" : null,
       capabilities: {
         supportsStreaming: true,
         supportsSessionPersistence: true,
@@ -99,6 +153,127 @@ function publishAgent(isMain: boolean, pendingSubagentInbox?: PendingSubagentInb
   );
   store.setAgents(serverId, new Map([[agentId, agent]]));
 }
+
+function ConversationShell({ children }: { children: ReactNode }) {
+  return (
+    <SafeAreaInsetsContext.Provider value={insets}>
+      <ToastProvider>
+        <CommandCenterProvider>
+          <KeyboardActionDispatcherProvider>
+            <MobilePanelsProvider>{children}</MobilePanelsProvider>
+          </KeyboardActionDispatcherProvider>
+        </CommandCenterProvider>
+      </ToastProvider>
+    </SafeAreaInsetsContext.Provider>
+  );
+}
+
+function ConversationPane({ children }: { children: ReactNode }) {
+  return (
+    <PaneProvider value={pane}>
+      <PaneFocusProvider value={paneFocus}>
+        <DiffDocumentWorkspaceCacheProvider>
+          <SheetPaneHostProvider value={sheetHost}>
+            <KeyboardProvider>
+              <KeyboardShiftProvider>{children}</KeyboardShiftProvider>
+            </KeyboardProvider>
+          </SheetPaneHostProvider>
+        </DiffDocumentWorkspaceCacheProvider>
+      </PaneFocusProvider>
+    </PaneProvider>
+  );
+}
+
+it.each(["the historical report", "the composer"])(
+  "keeps a new conclusion after a historical jump until the user clicks %s",
+  async (clickTarget) => {
+    const client = new DaemonClient({ url: "ws://unused.test", clientId: serverId });
+    const clearAgentAttention = vi
+      .spyOn(client, "clearAgentAttention")
+      .mockResolvedValue(undefined);
+    const snapshot: HostRuntimeSnapshot = {
+      serverId,
+      client,
+      connectionStatus: "online",
+      activeConnectionId: null,
+      activeConnection: null,
+      lastError: null,
+      lastOnlineAt: null,
+      agentDirectoryStatus: "ready",
+      agentDirectoryError: null,
+      hasEverLoadedAgentDirectory: true,
+      probeByConnectionId: new Map(),
+      clientGeneration: 0,
+      connectionEpoch: 0,
+    };
+    const runtime = getHostRuntimeStore();
+    const getSnapshot = runtime.getSnapshot.bind(runtime);
+    vi.spyOn(runtime, "getSnapshot").mockImplementation((id) =>
+      id === serverId ? snapshot : getSnapshot(id),
+    );
+    store.initializeSession(serverId, client);
+    const settings = new QueryClient();
+    settings.setQueryData(APP_SETTINGS_QUERY_KEY, DEFAULT_APP_SETTINGS);
+    const jumpStore = createTeamMessageJumpStore();
+    const acknowledgeJump = vi.spyOn(jumpStore, "acknowledgeJump");
+    const requestId = jumpStore.requestJump({
+      serverId,
+      agentId,
+      itemId: "old-report",
+      messageId: "old-report",
+      epoch: null,
+      seq: null,
+    });
+    const reportText = "A historical report from the reviewer";
+    container.style.height = "620px";
+    publishAgent(true);
+    store.applyAgentTimelineResponseState(serverId, agentId, {
+      items: [
+        {
+          kind: "user_message",
+          id: "old-report",
+          messageId: "old-report",
+          text: reportText,
+          timestamp: new Date("2026-04-20T00:00:00.000Z"),
+        },
+      ],
+      head: [],
+      range: null,
+      older: "none",
+      newer: false,
+      synchronized: true,
+      acknowledgedClientMessageIds: [],
+    });
+    await act(async () =>
+      root.render(
+        <QueryClientProvider client={settings}>
+          <ConversationShell>
+            <TeamMessageJumpProvider store={jumpStore}>
+              <ConversationPane>
+                <AgentConversationPanel />
+              </ConversationPane>
+            </TeamMessageJumpProvider>
+          </ConversationShell>
+        </QueryClientProvider>,
+      ),
+    );
+
+    await vi.waitFor(() => expect(acknowledgeJump).toHaveBeenCalledExactlyOnceWith(requestId));
+    await act(async () => publishAgent(true, undefined, true));
+    const input = view.getByRole("textbox");
+    await act(async () => {
+      input.blur();
+      input.focus();
+    });
+    expect(document.activeElement).toBe(input);
+    expect(clearAgentAttention).not.toHaveBeenCalled();
+
+    await userEvent.click(
+      clickTarget === "the composer" ? page.getByRole("textbox") : page.getByText(reportText),
+    );
+    expect(clearAgentAttention).toHaveBeenCalledExactlyOnceWith(agentId);
+  },
+);
 
 it("gates the inbox and summarizes distinct sources from the current snapshot", () => {
   initializeSession();

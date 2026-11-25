@@ -8,7 +8,7 @@ import { workspaceEqualityFns } from "@/stores/session-store-hooks/selectors";
 import { useWorkspaceStructure } from "@/stores/session-store-hooks";
 import { getHostRuntimeStore, useHostRegistryLoaded, useHosts } from "@/runtime/host-runtime";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
-import { useSidebarViewStore } from "@/stores/sidebar-view-store";
+import { type SidebarGroupMode, useSidebarViewStore } from "@/stores/sidebar-view-store";
 import {
   createSidebarWorkspacePlacementSelector,
   computeSidebarOrderUpdates,
@@ -96,9 +96,10 @@ export interface SidebarWorkspacesListResult {
   refreshAll: () => void;
 }
 
-export function useSidebarWorkspacesList(options?: {
+export function useSidebarWorkspacesList(options: {
   hostFilters?: readonly string[];
   enabled?: boolean;
+  groupMode: SidebarGroupMode;
 }): SidebarWorkspacesListResult {
   const runtime = getHostRuntimeStore();
   const allHosts = useHosts();
@@ -106,9 +107,9 @@ export function useSidebarWorkspacesList(options?: {
   const allServerIds = useMemo(() => allHosts.map((h) => h.serverId), [allHosts]);
 
   const storeHostFilters = useSidebarViewStore((state) => state.hostFilters);
-  const hostFilters = options?.hostFilters ?? storeHostFilters;
+  const hostFilters = options.hostFilters ?? storeHostFilters;
   const reconcileHostFilters = useSidebarViewStore((state) => state.reconcileHostFilters);
-  const isActive = options?.enabled !== false;
+  const isActive = options.enabled !== false;
 
   const serverIds = useMemo(() => {
     if (hostFilters.length === 0) {
@@ -141,7 +142,7 @@ export function useSidebarWorkspacesList(options?: {
   const directoryServerIds = useWorkspaceDirectoryServerIds(serverIds);
 
   const workspaceSort = useSidebarViewStore((state) => state.workspaceSort);
-  const groupMode = useSidebarViewStore((state) => state.groupMode);
+  const { groupMode } = options;
   const sortSupport = useHostFeatureMap(directoryServerIds, "workspaceSortTimes");
   const workspaceSortSupported = [...sortSupport.values()].every(Boolean);
   const sort =

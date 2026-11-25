@@ -172,7 +172,20 @@ function validateBridgeAddress(
 
 interface BindOutput {
   error?: unknown;
-  features?: { mcpTools?: boolean };
+  features?: { mcpTools?: boolean; mcpToolPermissionResources?: boolean };
+}
+
+const sessionsRequiringMcpPermissionResources = new WeakMap<OpenCodeBridge, Set<string>>();
+
+export function requireMcpPermissionResources(bridge: OpenCodeBridge, sessionId: string) {
+  let sessions = sessionsRequiringMcpPermissionResources.get(bridge);
+  if (!sessions) {
+    sessions = new Set();
+    sessionsRequiringMcpPermissionResources.set(bridge, sessions);
+  }
+  const boundSessions = sessions;
+  boundSessions.add(sessionId);
+  return () => boundSessions.delete(sessionId);
 }
 
 export function bridgeBindings(
@@ -207,6 +220,15 @@ export function bridgeBindings(
         throw new Error(
           `This OpenCode server cannot run the agent's MCP servers. Update OpenCode to 2.0.29 or newer${pluginDirectory ? `, install the Paseo plugin from ${pluginDirectory}, and restart the server` : ""}.`,
         );
+      // COMPAT(openCodeMcpPreapproval): added in v0.17.4, remove once external plugins support per-tool resources.
+      if (
+        sessionsRequiringMcpPermissionResources.get(bridge)?.has(sessionId) &&
+        output?.features?.mcpToolPermissionResources !== true
+      ) {
+        throw new Error(
+          `This session requires per-tool MCP preapproval. Update the Paseo OpenCode plugin${pluginDirectory ? ` from ${pluginDirectory}` : ""} and restart the OpenCode server.`,
+        );
+      }
     },
     unbindSession: async (sessionId, cwd) => {
       if (bridge)

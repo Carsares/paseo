@@ -926,6 +926,12 @@ it("keeps all source links across the live boundary, then folds exactly the sett
     human.id,
   ]);
   expect(opened.turns.summaryRowsByHostId.get(first.id)?.expanded).toBe(true);
+  expect(opened.tail.find((row) => row.id === second.id)).toMatchObject({
+    id: second.id,
+    kind: "user_message",
+    text: "Deep match in the second report",
+  });
+  expect(opened.turns.nestedItemIds.has(second.id)).toBe(true);
   expect(present(settled).readingRowReplacements.get(second.id)).toBe(summary.id);
 
   const interactions = present({ ...settled, showAgentInteractions: true });

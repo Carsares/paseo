@@ -4323,9 +4323,15 @@ export const FileUploadRequestSchema = z.object({
   requestId: z.string(),
 });
 
+export const TeamConclusionAttentionSchema = z.object({
+  workspaceId: z.string(),
+  attentionTimestamp: z.string(),
+});
+
 export const ClearAgentAttentionMessageSchema = z.object({
   type: z.literal("clear_agent_attention"),
   agentId: z.union([z.string(), z.array(z.string())]),
+  teamConclusion: TeamConclusionAttentionSchema.optional(),
   requestId: z.string().optional(),
 });
 
@@ -5302,6 +5308,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentCreateAsMain: z.boolean().optional(),
         // COMPAT(topicWorkbenchV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
         topicWorkbenchV1: z.boolean().optional(),
+        // COMPAT(teamConclusionAttention): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
+        teamConclusionAttention: z.boolean().optional(),
         // COMPAT(topicPromptRetryV1): added in v0.18.0, remove after 2027-06-01.
         topicPromptRetryV1: z.boolean().optional(),
         // COMPAT(workspaceDurableItemsV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.

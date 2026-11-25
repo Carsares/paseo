@@ -22,18 +22,27 @@ export interface TeamMessageJumpStore {
   subscribe: (listener: () => void) => () => void;
   requestJump: (input: Omit<TeamMessageJumpIntent, "requestId">) => number;
   acknowledgeJump: (requestId: number) => void;
+  discardJump: (requestId: number) => void;
+  consumeNavigationFocus: (agentId: string) => boolean;
   clear: () => void;
 }
 
 export function createTeamMessageJumpStore(): TeamMessageJumpStore {
   let currentIntent: TeamMessageJumpIntent | null = null;
   let nextRequestId = 0;
+  let navigationAgentId: string | null = null;
   const listeners = new Set<() => void>();
 
   function emit() {
     for (const listener of listeners) {
       listener();
     }
+  }
+
+  function finishJump(requestId: number) {
+    if (currentIntent?.requestId !== requestId) return;
+    currentIntent = null;
+    emit();
   }
 
   return {
@@ -46,6 +55,7 @@ export function createTeamMessageJumpStore(): TeamMessageJumpStore {
     },
     requestJump: (input) => {
       nextRequestId += 1;
+      navigationAgentId = input.agentId;
       currentIntent = {
         ...input,
         requestId: nextRequestId,
@@ -53,12 +63,15 @@ export function createTeamMessageJumpStore(): TeamMessageJumpStore {
       emit();
       return nextRequestId;
     },
-    acknowledgeJump: (requestId) => {
-      if (currentIntent?.requestId !== requestId) return;
-      currentIntent = null;
-      emit();
+    acknowledgeJump: finishJump,
+    discardJump: finishJump,
+    consumeNavigationFocus: (agentId) => {
+      if (navigationAgentId !== agentId) return false;
+      navigationAgentId = null;
+      return true;
     },
     clear: () => {
+      navigationAgentId = null;
       if (currentIntent === null) return;
       currentIntent = null;
       emit();

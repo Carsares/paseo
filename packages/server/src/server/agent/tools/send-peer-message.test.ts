@@ -1,5 +1,13 @@
 import { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import { chmodSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,7 +18,8 @@ import {
 import { expect, test, vi } from "vitest";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { openDurableItemStore } from "../../durable-items/requests.js";
-import { AgentRequestOutcomeUnknownError } from "../../message-receipts/index.js";
+import { AgentRequestOutcomeUnknownError, MessageReceipts } from "../../message-receipts/index.js";
+import { retainQueuedAgentMessage } from "../../session.js";
 import { createTestAgentClients } from "../../test-utils/fake-agent-client.js";
 import { createProviderSnapshotManagerStub } from "../../test-utils/session-stubs.js";
 import {
@@ -20,11 +29,13 @@ import {
 } from "../../workspace-registry.js";
 import { AgentManager } from "../agent-manager.js";
 import { toAgentPayload } from "../agent-projections.js";
-import { AgentTurnBusyError } from "../agent-prompt.js";
+import { AgentTurnBusyError, QueuedPromptLoadError } from "../agent-prompt.js";
+import type { AgentSession } from "../agent-sdk-types.js";
 import {
   createAgentMessageDelivery,
   formatSystemNotificationPrompt,
   parseAgentMessages,
+  projectAgentMessages,
 } from "../agent-messages/index.js";
 import {
   formatPeerInspectionPromptPrefix,
@@ -117,6 +128,26 @@ async function withPeerHarness(
     makeWorkspace("wks_third", thirdDir, { title: "third_repo" }),
   ]);
   const clients = createTestAgentClients();
+  const codex = clients.codex!;
+  function simulatePeerReadOnlyProvider(session: AgentSession): AgentSession {
+    const start = session.startTurn.bind(session);
+    return Object.assign(session, {
+      capabilities: {
+        ...session.capabilities,
+        supportsPeerReadOnlyTurn: true as const,
+        defersPromptHandoff: true,
+      },
+      async startTurn(...[prompt, runOptions]: Parameters<AgentSession["startTurn"]>) {
+        await runOptions?.beforeProviderDispatch?.();
+        runOptions?.assertProviderDispatchAllowed?.();
+        return start(prompt, runOptions);
+      },
+    });
+  }
+  const create = codex.createSession.bind(codex);
+  const resume = codex.resumeSession.bind(codex);
+  codex.createSession = async (...args) => simulatePeerReadOnlyProvider(await create(...args));
+  codex.resumeSession = async (...args) => simulatePeerReadOnlyProvider(await resume(...args));
   const agentManager = new AgentManager({
     serverId: "srv_local",
     clients,
@@ -1251,10 +1282,9 @@ test("re-verifies sender session at dispatch boundary, isolates duplicate prompt
               targetWorkspaceId: "wks_oncall",
               intent: "query",
               correlationId,
-              expectReply: true,
               message: "Queued hop 4 that will also fail",
             });
-            expect(failedHop4.structuredContent).toMatchObject({ hop: 4 });
+            expect(failedHop4.structuredContent).toMatchObject({ hop: 4, expectReply: false });
 
             // Also queue hops 1 and 2 on a brand-new unconfirmed thread and fail both: hop 1 must NOT be resurrected as confirmed!
             const unconfirmedHop1 = await twoHopFailCatalogA.executeTool("send_peer_message", {
@@ -1334,13 +1364,24 @@ test("re-verifies sender session at dispatch boundary, isolates duplicate prompt
         }
         await deliverPromptToTimeline(busyChildId, "Local human unlocked busyChild once.");
         let childDispatchCalls = 0;
-        const scheduledRetryCallbacks: Array<() => void> = [];
+        const scheduledRetryCallbacks = new Set<() => void>();
+        const releaseScheduledRetry = () => {
+          const due = [...scheduledRetryCallbacks];
+          for (const callback of due) {
+            if (scheduledRetryCallbacks.delete(callback)) callback();
+          }
+        };
         const busyRetryDelivery = createAgentMessageDelivery({
           schedule: (_ms, cb) => {
-            scheduledRetryCallbacks.push(cb);
-            return () => {};
+            scheduledRetryCallbacks.add(cb);
+            return () => {
+              scheduledRetryCallbacks.delete(cb);
+            };
           },
-          dispatch: async () => {
+          dispatch: async (request) => {
+            await request.validateDispatch?.();
+            await request.beforeProviderDispatch();
+            await request.validateDispatch?.();
             childDispatchCalls += 1;
             if (childDispatchCalls === 1) {
               chmodSync(agentsDir, 0o555);
@@ -1369,15 +1410,34 @@ test("re-verifies sender session at dispatch boundary, isolates duplicate prompt
           });
           expect(reuseRes.isError).toBeFalsy();
           // Trigger attempt 1 (throws AgentTurnBusyError while agentsDir is 0o555 so returned_to_queue stays in pendingOutcomes).
-          scheduledRetryCallbacks.shift()?.();
-          await new Promise((resolve) => setTimeout(resolve, 20));
+          releaseScheduledRetry();
+          await vi.waitFor(() => {
+            expect(childDispatchCalls).toBe(1);
+            expect(scheduledRetryCallbacks.size).toBeGreaterThan(0);
+          });
           chmodSync(agentsDir, 0o755);
-          // Trigger attempt 2: flushes old returned_to_queue and writes isolated attempt 2 grant!
-          while (scheduledRetryCallbacks.length > 0) {
-            scheduledRetryCallbacks.shift()?.();
-          }
+          const childCatalog = makeCatalog(busyChildId);
+          const readAttemptGrants = () => {
+            const state = JSON.parse(
+              readFileSync(join(agentsDir, "peer-workspace-state.json"), "utf8"),
+            ) as { lockedChildren: Array<[string, Array<{ dispatchId?: string }>]> };
+            const childGrants = state.lockedChildren.find(([id]) => id === busyChildId)?.[1];
+            return childGrants?.filter((grant) => grant.dispatchId !== undefined) ?? [];
+          };
+          await expect(
+            childCatalog.executeTool("rename_workspace", {
+              title: "Check the queue released its lock",
+            }),
+          ).rejects.toThrow(/read-only \(A0 READ\)/);
+          // The parent can still impose read-only authority. The returned attempt owns no grant.
+          expect(readAttemptGrants()).toHaveLength(0);
+          releaseScheduledRetry();
           await busyRetryDelivery.waitForDispatch(busyChildId, new AbortController().signal);
           expect(childDispatchCalls).toBe(2);
+          await expect(
+            childCatalog.executeTool("rename_workspace", { title: "Retry is still protected" }),
+          ).rejects.toThrow(/read-only \(A0 READ\)/);
+          expect(readAttemptGrants()).toHaveLength(1);
         } finally {
           chmodSync(agentsDir, 0o755);
           await busyRetryDelivery.close();
@@ -1703,7 +1763,9 @@ test("re-verifies sender session at dispatch boundary, isolates duplicate prompt
             source: { kind: "agent-message", ...capturedLegitSource! },
           });
           flushManualTimers();
-          await expect(replaySettledReceipt.dispatched).rejects.toThrow(/withdrawn or settled/);
+          await expect(replaySettledReceipt.dispatched).rejects.toThrow(
+            /withdrawn or settled|already has a queued delivery/,
+          );
           await new Promise((resolve) => setTimeout(resolve, 20));
           await expect(
             makeCatalog(mainB.id).executeTool("send_peer_message", {
@@ -1737,6 +1799,507 @@ test("re-verifies sender session at dispatch boundary, isolates duplicate prompt
       }
     },
   );
+});
+
+test("reserves distinct hops for an initiation and a reply to an earlier confirmed hop", async () => {
+  await withPeerHarness(async ({ workdir, agentManager, makeCatalog, waitForDispatch }) => {
+    const mainA = await agentManager.createAgent(
+      { provider: "codex", cwd: join(workdir, "paseo") },
+      undefined,
+      { workspaceId: "wks_paseo" },
+    );
+    const mainB = await agentManager.createAgent(
+      { provider: "codex", cwd: join(workdir, "oncall") },
+      undefined,
+      { workspaceId: "wks_oncall" },
+    );
+    await agentManager.setAgentMainControl(mainA.id, true);
+    await agentManager.setAgentMainControl(mainB.id, true);
+    const queued = createAgentMessageDelivery({
+      schedule: () => () => {},
+      dispatch: async () => "turn_started",
+      onError: () => {},
+    });
+    try {
+      const catalogA = makeCatalog(mainA.id);
+      const catalogB = makeCatalog(mainB.id);
+      const query = await catalogA.executeTool("send_peer_message", {
+        targetWorkspaceId: "wks_oncall",
+        intent: "query",
+        maxHops: 3,
+        message: "First question",
+      });
+      const { correlationId } = query.structuredContent as { correlationId: string };
+      await waitForDispatch(mainB.id);
+      const second = await makeCatalog(mainA.id, {
+        agentMessages: () => queued,
+      }).executeTool("send_peer_message", {
+        targetWorkspaceId: "wks_oncall",
+        correlationId,
+        intent: "query",
+        message: "Still queued",
+      });
+      expect(second.structuredContent).toMatchObject({ hop: 2 });
+      const reply = await catalogB.executeTool("send_peer_message", {
+        targetWorkspaceId: "wks_paseo",
+        correlationId,
+        intent: "reply",
+        message: "Reply to the first question",
+      });
+      expect(reply.structuredContent).toMatchObject({ hop: 3 });
+      await waitForDispatch(mainA.id);
+      expect(queued.withdrawPending(mainB.id, () => true)).toBe(1);
+      await queued.close();
+      await expect(
+        catalogB.executeTool("send_peer_message", {
+          targetWorkspaceId: "wks_paseo",
+          correlationId,
+          intent: "reply",
+          message: "Duplicate reply",
+        }),
+      ).rejects.toThrow(/already sent a reply|does not expect a reply/);
+    } finally {
+      await queued.close();
+    }
+  });
+});
+
+test.each([
+  "no acknowledgement",
+  "acknowledged",
+  "receipt interrupted",
+  "journal fallback",
+  "peer writes failed",
+])("unknown first and later hops survive restart (%s)", async (scenario) => {
+  await withPeerHarness(
+    async ({ workdir, agentManager, agentStorage, makeCatalog, waitForDispatch }) => {
+      const mainA = await agentManager.createAgent(
+        { provider: "codex", cwd: join(workdir, "paseo") },
+        undefined,
+        { workspaceId: "wks_paseo" },
+      );
+      const mainB = await agentManager.createAgent(
+        { provider: "codex", cwd: join(workdir, "oncall") },
+        undefined,
+        { workspaceId: "wks_oncall" },
+      );
+      await agentManager.setAgentMainControl(mainA.id, true);
+      await agentManager.setAgentMainControl(mainB.id, true);
+      const dispatch = vi.fn<Parameters<typeof createAgentMessageDelivery>[0]["dispatch"]>(
+        async (request) => {
+          await request.handoff?.begin();
+          await request.handoff?.onProviderOutcome?.("unknown");
+          throw new AgentRequestOutcomeUnknownError();
+        },
+      );
+      const unknownDelivery = createAgentMessageDelivery({
+        schedule: (_ms, callback) => {
+          callback();
+          return () => {};
+        },
+        dispatch,
+        onError: () => {},
+      });
+      const receiptsPath = join(workdir, "agent-requests");
+      const receipts = new MessageReceipts(receiptsPath);
+      const receiptInterrupted = new Error("Interrupted before settling the receipt");
+      const receiptAcceptance = vi.fn();
+      const initialRequests: Parameters<MessageReceipts["sendQueued"]>[0][] = [];
+      const pendingReceipts: Promise<void>[] = [];
+      const restart = new AgentManager({
+        serverId: "srv_local",
+        clients: createTestAgentClients(),
+        registry: agentStorage,
+        logger,
+      });
+      try {
+        const query = (correlationId?: string) => ({
+          targetWorkspaceId: "wks_oncall",
+          intent: "query",
+          correlationId,
+          maxHops: 2,
+          message: "Question",
+        });
+        const catalogA = makeCatalog(mainA.id);
+        await expect(
+          catalogA.executeTool("send_peer_message", {
+            ...query(),
+            maxHops: 1,
+            expectReply: true,
+          }),
+        ).rejects.toThrow(/no room for a reply.*expectReply: false/);
+        const confirmed = await catalogA.executeTool("send_peer_message", {
+          ...query(),
+          expectReply: false,
+        });
+        await waitForDispatch(mainB.id);
+        const confirmedId = (confirmed.structuredContent as { correlationId: string })
+          .correlationId;
+        const unknownA = makeCatalog(mainA.id, {
+          queueAgentPrompt: async (agentId, input) => {
+            const messageId = `unknown-hop-${pendingReceipts.length + 1}`;
+            const admitted = Promise.withResolvers<void>();
+            const queued: Parameters<MessageReceipts["sendQueued"]>[0] = {
+              agentId,
+              request: input,
+              message: { ...input, messageId },
+              onQueued: () => admitted.resolve(),
+              enqueue: async (handoff) =>
+                unknownDelivery.enqueue({
+                  recipientId: agentId,
+                  messageId,
+                  source: { kind: "agent-message", ...input.source },
+                  prompt: input.prompt,
+                  handoff: {
+                    ...handoff,
+                    async onProviderOutcome(outcome) {
+                      if (outcome === "accepted") {
+                        receiptAcceptance();
+                        if (scenario === "receipt interrupted") throw receiptInterrupted;
+                      }
+                      await handoff.onProviderOutcome?.(outcome);
+                    },
+                  },
+                }),
+            };
+            initialRequests.push(queued);
+            const settled = receipts.sendQueued(queued);
+            pendingReceipts.push(settled);
+            await Promise.race([admitted.promise, settled]);
+            return messageId;
+          },
+        });
+        const first = await unknownA.executeTool("send_peer_message", query());
+        const firstId = (first.structuredContent as { correlationId: string }).correlationId;
+        await expect(
+          unknownDelivery.waitForDispatch(mainB.id, new AbortController().signal),
+        ).rejects.toThrow(AgentRequestOutcomeUnknownError);
+        await expect(
+          unknownA.executeTool("send_peer_message", {
+            ...query(confirmedId),
+            expectReply: true,
+          }),
+        ).rejects.toThrow(/no room for a reply.*expectReply: false/);
+        const later = await unknownA.executeTool("send_peer_message", query(confirmedId));
+        expect(later.structuredContent).toMatchObject({
+          hop: 2,
+          expectReply: false,
+          guidance: expect.stringContaining("No reply is expected"),
+        });
+        await expect(
+          unknownDelivery.waitForDispatch(mainB.id, new AbortController().signal),
+        ).rejects.toThrow(AgentRequestOutcomeUnknownError);
+        expect(dispatch).toHaveBeenCalledTimes(2);
+        for (const settled of pendingReceipts)
+          await expect(settled).rejects.toThrow(AgentRequestOutcomeUnknownError);
+        await expect(new MessageReceipts(receiptsPath).queuedMessages()).resolves.toEqual([]);
+        const verify = async (manager: AgentManager, firstAccepted = false) => {
+          const receiver = makeCatalog(mainB.id, { agentManager: manager });
+          const reply = (correlationId: string) =>
+            receiver.executeTool("send_peer_message", {
+              targetWorkspaceId: "wks_paseo",
+              intent: "reply",
+              correlationId,
+              message: "Reply",
+            });
+          await expect(reply(confirmedId)).rejects.toThrow(/does not expect a reply/);
+          await expect(
+            receiver.executeTool("send_peer_message", {
+              targetWorkspaceId: "wks_third",
+              intent: "query",
+              message: "Still protected",
+            }),
+          ).rejects.toThrow(/read-only \(A0 READ\)/);
+          const sender = makeCatalog(mainA.id, { agentManager: manager });
+          await expect(sender.executeTool("send_peer_message", query(confirmedId))).rejects.toThrow(
+            /exceeded maxHops/,
+          );
+          if (firstAccepted) {
+            await expect(reply(firstId)).resolves.toMatchObject({
+              structuredContent: { hop: 2 },
+            });
+          } else {
+            await expect(reply(firstId)).rejects.toThrow(/Unknown or unauthorized/);
+          }
+        };
+        await verify(agentManager);
+        const outcome = dispatch.mock.calls[0]![0].handoff!.onProviderOutcome!;
+        const statePath = join(workdir, "agents", "peer-workspace-state.json");
+        const journalPath = join(workdir, "agents", "peer-workspace-pending-outcomes.json");
+        if (scenario === "receipt interrupted") {
+          await expect(outcome("accepted")).rejects.toBe(receiptInterrupted);
+          expect(receiptAcceptance).toHaveBeenCalledOnce();
+        } else if (scenario === "journal fallback" || scenario === "peer writes failed") {
+          // Make the atomic rename fail at the destination, without mocking either store.
+          renameSync(statePath, statePath + ".backup");
+          mkdirSync(statePath);
+          const failJournal = scenario === "peer writes failed";
+          if (failJournal) mkdirSync(journalPath);
+          try {
+            await expect(outcome("accepted")).rejects.toThrow();
+            expect(receiptAcceptance).not.toHaveBeenCalled();
+            if (!failJournal) {
+              expect(JSON.parse(readFileSync(journalPath, "utf8"))).toContainEqual(
+                expect.objectContaining({
+                  outcome: "accepted",
+                  context: expect.objectContaining({
+                    recipientId: mainB.id,
+                    attemptId: expect.any(String),
+                  }),
+                  dispatchId: expect.any(String),
+                }),
+              );
+            }
+          } finally {
+            if (failJournal) rmSync(journalPath, { recursive: true });
+            rmSync(statePath, { recursive: true });
+            renameSync(statePath + ".backup", statePath);
+          }
+        } else if (scenario === "acknowledged") {
+          await outcome("accepted");
+        }
+
+        // Reopen both stores without a graceful flush of the old peer runtime.
+        resetInMemoryPeerDispatchStateForTest();
+        const restartedReceipts = new MessageReceipts(receiptsPath);
+        await expect(restartedReceipts.queuedMessages()).resolves.toEqual([]);
+        await expect(restartedReceipts.outcome(mainB.id, "unknown-hop-1")).resolves.toBe(
+          scenario === "acknowledged" ? "accepted" : "unknown",
+        );
+        const enqueue = vi.fn();
+        const retry = restartedReceipts.sendQueued({ ...initialRequests[0]!, enqueue });
+        if (scenario === "acknowledged") await expect(retry).resolves.toBeUndefined();
+        else await expect(retry).rejects.toThrow(AgentRequestOutcomeUnknownError);
+        expect(enqueue).not.toHaveBeenCalled();
+        await verify(
+          restart,
+          scenario !== "no acknowledgement" && scenario !== "peer writes failed",
+        );
+      } finally {
+        await unknownDelivery.close();
+      }
+    },
+  );
+});
+
+test("legacy replay restores only the exact completed receipt for the recipient", async () => {
+  await withPeerHarness(async ({ workdir, agentManager, agentStorage, makeCatalog }) => {
+    const from = await agentManager.createAgent(
+      { provider: "codex", cwd: join(workdir, "paseo") },
+      undefined,
+      { workspaceId: "wks_paseo" },
+    );
+    const to = await agentManager.createAgent(
+      { provider: "codex", cwd: join(workdir, "oncall") },
+      undefined,
+      { workspaceId: "wks_oncall" },
+    );
+    await agentManager.setAgentMainControl(from.id, true);
+    await agentManager.setAgentMainControl(to.id, true);
+    const receipts = new MessageReceipts(join(workdir, "agent-requests"));
+    const rows: Awaited<ReturnType<AgentManager["getTimelineRows"]>> = [];
+    let index = 0;
+    const pending: Promise<void>[] = [];
+    const delivery = createAgentMessageDelivery({
+      schedule: (_ms, callback) => {
+        callback();
+        return () => {};
+      },
+      dispatch: async (request) => {
+        await request.handoff?.begin();
+        expect(typeof request.prompt).toBe("string");
+        const [item] = projectAgentMessages({
+          type: "user_message",
+          text: request.prompt as string,
+        });
+        expect(item?.type).toBe("tool_call");
+        rows.push({ seq: rows.length + 1, timestamp: new Date().toISOString(), item: item! });
+        if (request.messageIds[0] !== "legacy-receipt-1")
+          throw new AgentRequestOutcomeUnknownError();
+        return "turn_started";
+      },
+      onError: () => {},
+    });
+    try {
+      const sender = makeCatalog(from.id, {
+        queueAgentPrompt: async (agentId, input) => {
+          const messageId = `legacy-receipt-${++index}`;
+          const admitted = Promise.withResolvers<void>();
+          const settled = receipts.sendQueued({
+            agentId,
+            request: input,
+            message: { ...input, messageId },
+            enqueue: async (handoff) =>
+              delivery.enqueue({
+                recipientId: agentId,
+                source: { kind: "agent-message", ...input.source },
+                prompt: input.prompt,
+                messageId,
+                activeTurnBehavior: "queue",
+                handoff,
+              }),
+            onQueued: admitted.resolve,
+          });
+          pending.push(settled);
+          if (index === 2) {
+            // An identical fingerprint in a different recipient's receipt is not proof.
+            await receipts.send({
+              agentId: from.id,
+              messageId,
+              request: input,
+              send: (begin) => begin(),
+            });
+          }
+          await Promise.race([admitted.promise, settled]);
+          return messageId;
+        },
+      });
+      const correlations: string[] = [];
+      for (const message of ["Accepted", "Unconfirmed"]) {
+        const result = await sender.executeTool("send_peer_message", {
+          targetWorkspaceId: "wks_oncall",
+          intent: "query",
+          message,
+        });
+        correlations.push((result.structuredContent as { correlationId: string }).correlationId);
+        const receipt = pending.at(-1)!;
+        if (message === "Accepted") await receipt;
+        else await expect(receipt).rejects.toThrow(AgentRequestOutcomeUnknownError);
+      }
+      await delivery.close();
+      const statePath = join(workdir, "agents", "peer-workspace-state.json");
+      const state = JSON.parse(readFileSync(statePath, "utf8")) as {
+        separatesUnknownOutcomes?: true;
+        threads: Array<Record<string, unknown>>;
+        messages: Array<[string, Record<string, unknown>]>;
+      };
+      delete state.separatesUnknownOutcomes;
+      for (const thread of state.threads) {
+        thread.confirmedSnapshot ??= thread.highestUnknownSnapshot;
+        thread.hasConfirmedHop = true;
+        thread.admitted = true;
+        delete thread.highestUnknownSnapshot;
+        delete thread.unknownReplyHops;
+      }
+      for (const [, message] of state.messages) delete message.deliveryOutcome;
+      writeFileSync(statePath, JSON.stringify(state));
+      await agentStorage.timelinePrefixes.save(to.id, { version: 1, rows });
+      resetInMemoryPeerDispatchStateForTest();
+      const restarted = new AgentManager({
+        serverId: "srv_local",
+        clients: createTestAgentClients(),
+        registry: agentStorage,
+        logger,
+      });
+      const receiver = makeCatalog(to.id, { agentManager: restarted });
+      const reply = (correlationId: string) =>
+        receiver.executeTool("send_peer_message", {
+          targetWorkspaceId: "wks_paseo",
+          intent: "reply",
+          correlationId,
+          message: "Reply",
+        });
+      await expect(reply(correlations[1]!)).rejects.toThrow(/Unknown or unauthorized/);
+      await expect(reply(correlations[0]!)).resolves.toMatchObject({
+        structuredContent: { hop: 2 },
+      });
+    } finally {
+      await delivery.close();
+    }
+  });
+});
+
+test("a retained peer receipt retries the same reserved hop after a temporary load failure", async () => {
+  await withPeerHarness(async ({ workdir, agentManager, makeCatalog }) => {
+    const sender = await agentManager.createAgent(
+      { provider: "codex", cwd: join(workdir, "paseo") },
+      undefined,
+      { workspaceId: "wks_paseo" },
+    );
+    const recipient = await agentManager.createAgent(
+      { provider: "codex", cwd: join(workdir, "oncall") },
+      undefined,
+      { workspaceId: "wks_oncall" },
+    );
+    await agentManager.setAgentMainControl(sender.id, true);
+    await agentManager.setAgentMainControl(recipient.id, true);
+    const receiptsPath = join(workdir, "load-failure-receipts");
+    const receipts = new MessageReceipts(receiptsPath);
+    const admitted = Promise.withResolvers<void>();
+    const failure = new QueuedPromptLoadError(new Error("provider temporarily unavailable"));
+    const dispatch = vi.fn<Parameters<typeof createAgentMessageDelivery>[0]["dispatch"]>();
+    dispatch.mockRejectedValueOnce(failure).mockImplementationOnce(async (request) => {
+      expect(request.turnAuthorization).toBe("peer-read-only");
+      await request.handoff?.begin();
+      return "turn_started";
+    });
+    const delivery = createAgentMessageDelivery({
+      schedule: (_ms, callback) => {
+        callback();
+        return () => {};
+      },
+      dispatch,
+      onError: () => {},
+    });
+    const messageId = "peer-retained-before-handoff";
+    let queued: Promise<void> | undefined;
+    const enqueue =
+      (agentId: string, message: Parameters<MessageReceipts["sendQueued"]>[0]["message"]) =>
+      (handoff: Parameters<Parameters<MessageReceipts["sendQueued"]>[0]["enqueue"]>[0]) =>
+        delivery.enqueue({
+          recipientId: agentId,
+          messageId: message.messageId,
+          source: { kind: "agent-message", ...message.source },
+          prompt: message.prompt,
+          handoff,
+        });
+    try {
+      const catalog = makeCatalog(sender.id, {
+        queueAgentPrompt: async (agentId, request) => {
+          const message = { ...request, messageId };
+          queued = receipts.sendQueued({
+            agentId,
+            request,
+            message,
+            enqueue: enqueue(agentId, message),
+            onQueued: () => admitted.resolve(),
+            retainOnError: retainQueuedAgentMessage,
+          });
+          await Promise.race([admitted.promise, queued]);
+          return messageId;
+        },
+      });
+      const result = await catalog.executeTool("send_peer_message", {
+        targetWorkspaceId: "wks_oncall",
+        intent: "query",
+        maxHops: 1,
+        message: "One-way inspection",
+      });
+      expect(result.structuredContent).toMatchObject({
+        hop: 1,
+        expectReply: false,
+        guidance: expect.stringContaining("No reply is expected"),
+      });
+      await expect(queued).rejects.toBe(failure);
+      const restarted = new MessageReceipts(receiptsPath);
+      const recoverable = await restarted.queuedMessages();
+      expect(recoverable).toHaveLength(1);
+      const receipt = recoverable[0]!;
+      await restarted.resumeQueued(receipt, {
+        enqueue: enqueue(receipt.agentId, receipt.queued.message),
+        retainOnError: retainQueuedAgentMessage,
+      });
+      await delivery.close();
+      expect(dispatch).toHaveBeenCalledTimes(2);
+      expect(dispatch.mock.calls[1]?.[0].prompt).toContain(
+        "No reply is expected (expectReply=false)",
+      );
+      await expect(restarted.outcome(recipient.id, messageId)).resolves.toBe("accepted");
+      await expect(restarted.queuedMessages()).resolves.toEqual([]);
+    } finally {
+      await delivery.close();
+    }
+  });
 });
 
 test("enforces single-round reply convergence, maxHops ceiling, and pairwise circuit breaker", async () => {

@@ -2097,6 +2097,47 @@ test("bounds the wait for push token revocation", async () => {
   expect(client.getConnectionState().status).toBe("connected");
 });
 
+test.each([false, true])(
+  "only sends a team conclusion receipt to a capable host (%s)",
+  async (capable) => {
+    const transport = createMockTransport();
+    const client = new DaemonClient({
+      url: "ws://test",
+      clientId: "clsk_team_conclusion",
+      reconnect: { enabled: false },
+      transportFactory: () => transport.transport,
+    });
+    clients.push(client);
+    const connected = client.connect();
+    transport.triggerOpen({ features: capable ? { teamConclusionAttention: true } : {} });
+    await connected;
+
+    const teamConclusion = {
+      workspaceId: "workspace-1",
+      attentionTimestamp: "2026-11-25T10:00:00.000Z",
+    };
+    const frameCount = transport.sent.length;
+    const clearing = client.clearTeamConclusionAttention("main-1", teamConclusion);
+    if (capable) {
+      const request = parseSentFrame(transport.sent.at(-1));
+      expect(request).toMatchObject({
+        type: "clear_agent_attention",
+        agentId: "main-1",
+        teamConclusion,
+      });
+      transport.triggerMessage(
+        wrapSessionMessage({
+          type: "clear_agent_attention_response",
+          payload: { requestId: request.requestId, agentId: "main-1", agents: [] },
+        }),
+      );
+    } else {
+      expect(transport.sent).toHaveLength(frameCount);
+    }
+    await clearing;
+  },
+);
+
 test("identifies the request when marking an agent as read times out", async () => {
   useHeartbeatClock();
   const transport = createMockTransport();

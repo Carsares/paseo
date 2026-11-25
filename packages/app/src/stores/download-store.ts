@@ -5,6 +5,7 @@ import * as Sharing from "expo-sharing";
 import type { HostProfile } from "@/types/host-connection";
 import { buildDaemonWebSocketUrl } from "@/utils/daemon-endpoints";
 import { isWeb } from "@/constants/platform";
+import { getDesktopHost } from "@/desktop/host";
 import { i18n } from "@/i18n/i18next";
 
 interface DownloadProgress {
@@ -104,13 +105,24 @@ export const useDownloadStore = create<DownloadState>()((set, get) => ({
     }));
 
     try {
+      const downloadTarget = resolveDaemonDownloadTarget(daemonProfile, activeConnectionId);
+      const desktopDownload = await prepareDesktopDownload(
+        serverId,
+        activeConnectionId,
+        downloadTarget?.baseUrl,
+        fileName,
+      );
       const tokenResponse = await requestFileDownloadToken(path);
       if (tokenResponse.error || !tokenResponse.token) {
         throw new Error(tokenResponse.error ?? i18n.t("downloads.requestTokenFailed"));
       }
 
       const resolvedFileName = tokenResponse.fileName ?? fileName;
-      const downloadTarget = resolveDaemonDownloadTarget(daemonProfile, activeConnectionId);
+      if (desktopDownload) {
+        await desktopDownload(tokenResponse.token);
+        get().completeDownload(id);
+        return;
+      }
       if (!downloadTarget) {
         // Relay, SSH, socket and pipe hosts have no HTTP endpoint: read the file over the
         // session socket that is already connected (#543).
@@ -325,6 +337,68 @@ function resolveDaemonDownloadTarget(
     : null;
 
   return { baseUrl, authHeader };
+}
+
+async function prepareDesktopDownload(
+  serverId: string,
+  connectionId: string | null,
+  origin: string | null | undefined,
+  fileName: string,
+): Promise<((token: string) => Promise<void>) | null> {
+  if (!origin || !isWeb) return null;
+  const desktop = getDesktopHost();
+  // COMPAT(desktopDirectFileDownload): added in v0.18.0; remove after 2027-06-01.
+  if (
+    !desktop ||
+    !("directFileDownload" in desktop) ||
+    desktop.directFileDownload !== true ||
+    !desktop.invoke
+  )
+    return null;
+  const invoke = desktop.invoke;
+  const { getHostRuntimeStore } = await import("@/runtime/host-runtime");
+  const runtime = getHostRuntimeStore();
+  const active = runtime.getSnapshot(serverId);
+  const prepared = await invoke("prepare_direct_file_download", { origin, fileName });
+  if (!prepared || typeof prepared !== "object" || !("status" in prepared)) {
+    throw new Error(i18n.t("downloads.failed"));
+  }
+  if (prepared.status === "use-browser") return null;
+  if (prepared.status === "cancelled") throw new Error(i18n.t("downloads.cancelled"));
+  if (prepared.status !== "ready" || !("id" in prepared) || typeof prepared.id !== "string") {
+    throw new Error(i18n.t("downloads.failed"));
+  }
+
+  function verifyHost() {
+    const current = runtime.getSnapshot(serverId);
+    const host = runtime.getHosts().find((entry) => entry.serverId === serverId);
+    if (
+      !active?.client ||
+      !current ||
+      current.client !== active.client ||
+      current.connectionEpoch !== active.connectionEpoch ||
+      current.connectionStatus !== "online" ||
+      current.activeConnectionId !== connectionId ||
+      current.activeConnection?.type !== "directTcp" ||
+      current.client.getLastServerInfoMessage()?.serverId !== serverId ||
+      resolveDaemonDownloadTarget(host, connectionId)?.baseUrl !== origin
+    ) {
+      throw new Error(i18n.t("downloads.hostUnavailable"));
+    }
+  }
+  verifyHost();
+
+  return async (token) => {
+    verifyHost();
+    const result = await invoke("start_direct_file_download", { id: prepared.id, token });
+    if (result && typeof result === "object" && "status" in result) {
+      if (result.status === "complete") return;
+      if (result.status === "http-error" && "code" in result && typeof result.code === "number") {
+        throw new Error(i18n.t("downloads.httpFailed", { status: result.code }));
+      }
+    }
+    throw new Error(i18n.t("downloads.failed"));
+  };
 }
 
 function buildDownloadUrl(baseUrl: string, token: string): string {

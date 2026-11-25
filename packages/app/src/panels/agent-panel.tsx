@@ -1106,6 +1106,7 @@ function ChatAgentContent({
       cwd={agentState.cwd ?? ""}
       retryTimelineSync={retryTimelineSync}
       onAttentionInputFocus={attentionController.clearOnInputFocus}
+      onAttentionUserInteraction={attentionController.clearOnUserInteraction}
       onAttentionPromptSend={attentionController.clearOnPromptSend}
       onOpenWorkspaceFile={onOpenWorkspaceFile}
     />
@@ -1137,6 +1138,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   retryTimelineSync,
   cwd,
   onAttentionInputFocus,
+  onAttentionUserInteraction,
   onAttentionPromptSend,
   onOpenWorkspaceFile,
 }: {
@@ -1165,6 +1167,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   retryTimelineSync: () => void;
   cwd: string;
   onAttentionInputFocus: () => void;
+  onAttentionUserInteraction: () => void;
   onAttentionPromptSend: () => void;
   onOpenWorkspaceFile?: (request: WorkspaceFileOpenRequest) => void;
 }) {
@@ -1302,9 +1305,9 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     agentComposerSection
   );
   const handleAttentionInteraction = useCallback(() => {
-    onAttentionInputFocus();
+    onAttentionUserInteraction();
     return false;
-  }, [onAttentionInputFocus]);
+  }, [onAttentionUserInteraction]);
   const sideChatSourceId = useSessionStore((state) =>
     getSideChatSourceAgentId(resolveChatAgentFromSession(state, serverId, agentId)),
   );
@@ -1365,10 +1368,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     ],
   );
   const streamContent = (
-    <View
-      style={animatedStaticStyles.content}
-      onStartShouldSetResponderCapture={handleAttentionInteraction}
-    >
+    <View style={animatedStaticStyles.content}>
       {showsComposer ? null : <SheetAgentFacts serverId={serverId} agentId={agentId} />}
       <RenderProfile id={`AgentStreamSection:${agentId}`}>
         <AgentStreamSection
@@ -1453,7 +1453,7 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   );
 
   const chat = (
-    <View style={styles.root}>
+    <View style={styles.root} onStartShouldSetResponderCapture={handleAttentionInteraction}>
       {dock}
 
       {isArchivingCurrentAgent ? (

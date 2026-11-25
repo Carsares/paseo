@@ -18,6 +18,7 @@ import {
   parseAgentMessages,
   parseProjectedPeerCallId,
   PeerMessageIntentSchema,
+  projectedPeerMessagePrefix,
   registerHostPeerDispatchVerifier,
   registerPromptDispatchVerifier,
   releasePromptDispatchVerifier,
@@ -27,7 +28,11 @@ import {
   type PeerDispatchTerminalOutcome,
   type PeerDispatchVerificationRequest,
 } from "../agent-messages/envelope.js";
-import type { RecoverableAgentMessage } from "../../message-receipts/index.js";
+import {
+  fingerprintMessageRequest,
+  MessageReceipts,
+  type RecoverableAgentMessage,
+} from "../../message-receipts/index.js";
 import {
   assertDirectParent,
   createHostResolver,
@@ -52,6 +57,7 @@ import type {
   AgentPromptInput,
   AgentProvider,
   AgentSessionConfig,
+  AgentTimelineItem,
 } from "../agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "../agent-manager.js";
 import {
@@ -129,7 +135,11 @@ import {
   serializeSnapshotWithMetadata,
   toScheduleSummary,
 } from "../mcp-shared.js";
-import { sendPromptToAgent, waitForAgentRunStartWithTimeout } from "../agent-prompt.js";
+import {
+  sendPromptToAgent,
+  waitForAgentRunStartWithTimeout,
+  withPeerInitialPrompt,
+} from "../agent-prompt.js";
 import { respondToAgentPermission } from "../permission-response.js";
 import {
   archiveAgentCommand,
@@ -835,6 +845,8 @@ interface PeerThreadState {
   repliedHops: Set<number>;
   admitted: boolean;
   confirmedSnapshot?: BasePeerThreadSnapshot;
+  highestUnknownSnapshot?: BasePeerThreadSnapshot;
+  unknownReplyHops?: number[];
 }
 
 interface PeerLockGrant {
@@ -855,7 +867,11 @@ type PersistedPeerEnvelope = Extract<AgentPromptSource, { kind: "peer-workspace-
   dispatchId: string;
   recipientAgentId: string;
   activeAttemptId?: string;
+  lastAttemptId?: string;
   settled?: boolean;
+  deliveryOutcome?: "accepted" | "outcome_unknown";
+  legacyUnconfirmed?: true;
+  replyToHop?: number;
   inboundThread?: SerializedPeerThread;
 };
 
@@ -867,7 +883,9 @@ interface PersistedPeerChildDispatch {
   recipientAgentId: string;
   correlationId: string;
   activeAttemptId?: string;
+  lastAttemptId?: string;
   settled?: boolean;
+  deliveryOutcome?: "accepted" | "outcome_unknown";
 }
 
 interface PeerRuntimeMaps {
@@ -888,6 +906,9 @@ interface PendingPeerOutcomeRecord {
 
 interface PeerWorkspaceRuntime extends PeerRuntimeMaps {
   paseoHome?: string;
+  readRecipientTimeline(
+    agentId: string,
+  ): Promise<Awaited<ReturnType<AgentManager["readStoredTimeline"]>> | null>;
   loadPromise: Promise<void> | null;
   loadedFromDisk: boolean;
   stateMutex: Promise<void>;
@@ -924,11 +945,12 @@ function deserializeBasePeerThread(snapshot: BasePeerThreadSnapshot): PeerThread
 }
 
 function clonePeerThreadState(thread: PeerThreadState): PeerThreadState {
-  const confirmedSnapshot = cloneBaseThreadSnapshot(thread.confirmedSnapshot);
   return {
     ...thread,
     repliedHops: new Set(thread.repliedHops),
-    ...(confirmedSnapshot ? { confirmedSnapshot } : {}),
+    confirmedSnapshot: cloneBaseThreadSnapshot(thread.confirmedSnapshot),
+    highestUnknownSnapshot: cloneBaseThreadSnapshot(thread.highestUnknownSnapshot),
+    unknownReplyHops: thread.unknownReplyHops?.slice(),
   };
 }
 
@@ -1258,6 +1280,8 @@ const basePeerThreadSnapshotSchema = z.object({
 const persistedPeerThreadSchema = basePeerThreadSnapshotSchema.extend({
   hasConfirmedHop: z.boolean().optional(),
   confirmedSnapshot: basePeerThreadSnapshotSchema.optional(),
+  highestUnknownSnapshot: basePeerThreadSnapshotSchema.optional(),
+  unknownReplyHops: z.array(z.number().int().min(1)).optional(),
 });
 
 const persistedPeerChildDispatchSchema = z.object({
@@ -1268,7 +1292,9 @@ const persistedPeerChildDispatchSchema = z.object({
   recipientAgentId: z.string().min(1),
   correlationId: z.string().min(1),
   activeAttemptId: z.string().min(1).optional(),
+  lastAttemptId: z.string().min(1).optional(),
   settled: z.boolean().optional(),
+  deliveryOutcome: z.enum(["accepted", "outcome_unknown"]).optional(),
 });
 
 const pendingPeerOutcomeRecordSchema = z.object({
@@ -1287,6 +1313,7 @@ const pendingPeerOutcomeRecordSchema = z.object({
     senderAgentId: z.string().min(1).optional(),
     senderServerId: z.string().min(1).optional(),
     attemptId: z.string().min(1).optional(),
+    ownsReservation: z.boolean().optional(),
   }),
 });
 
@@ -1296,6 +1323,7 @@ const persistedAgentGrantsTupleSchema = z.tuple([
 ]);
 
 const persistedPeerStateFileSchema = z.object({
+  separatesUnknownOutcomes: z.literal(true).optional(),
   threads: z.array(persistedPeerThreadSchema).optional(),
   messages: z.array(z.tuple([z.string().min(1), z.record(z.string(), z.unknown())])).optional(),
   inboundAgentLocks: z.array(persistedAgentGrantsTupleSchema).optional(),
@@ -1309,6 +1337,8 @@ function serializePeerThread(thread: PeerThreadState): SerializedPeerThread {
     ...toBasePeerThreadSnapshot(thread),
     hasConfirmedHop: Boolean(confirmedSnapshot),
     ...(confirmedSnapshot ? { confirmedSnapshot } : {}),
+    highestUnknownSnapshot: thread.highestUnknownSnapshot,
+    unknownReplyHops: thread.unknownReplyHops,
   };
 }
 
@@ -1357,35 +1387,49 @@ function matchesRecordedOutcomeContext(
   return Boolean(child && matchesPersistedPeerChildEndpoints(child, context));
 }
 
-function advanceThreadConfirmedSnapshot(draft: PeerRuntimeMaps, msg: PersistedPeerEnvelope): void {
-  const currentThread = draft.threads.get(msg.correlationId);
-  const prevConfirmed = currentThread?.confirmedSnapshot;
-  if (prevConfirmed && msg.hop < prevConfirmed.hop) return;
-  const mergedReplied = new Set<number>(prevConfirmed?.repliedHops ?? []);
-  if (msg.intent === "reply" && msg.hop > 1) {
-    mergedReplied.add(msg.hop - 1);
-  }
-  const nextConfirmed: BasePeerThreadSnapshot = {
+function peerSnapshotFromMessage(msg: PersistedPeerEnvelope): BasePeerThreadSnapshot {
+  return {
     correlationId: msg.correlationId,
-    maxHops: currentThread?.maxHops ?? msg.maxHops,
+    maxHops: msg.maxHops,
     hop: msg.hop,
     expectReply: msg.expectReply,
     lastSourceWorkspaceId: msg.sourceWorkspaceId,
     lastSourceAgentId: msg.agentId,
     lastTargetWorkspaceId: msg.targetWorkspaceId,
     lastTargetAgentId: msg.recipientAgentId,
-    repliedHops: [...mergedReplied],
+    repliedHops: [],
     admitted: true,
   };
-  if (currentThread) {
-    currentThread.confirmedSnapshot = nextConfirmed;
-    for (const h of mergedReplied) currentThread.repliedHops.add(h);
+}
+
+function persistedReplyTargetHop(msg: PersistedPeerEnvelope): number | undefined {
+  // Older queued replies already stored their confirmed inbound snapshot.
+  return msg.intent === "reply" ? (msg.replyToHop ?? msg.inboundThread?.hop) : undefined;
+}
+
+function recordPeerThreadOutcome(
+  draft: PeerRuntimeMaps,
+  msg: PersistedPeerEnvelope,
+  outcome: "accepted" | "outcome_unknown",
+): void {
+  const snapshot = peerSnapshotFromMessage(msg);
+  const thread = draft.threads.get(msg.correlationId) ?? deserializeBasePeerThread(snapshot);
+  const replyToHop = persistedReplyTargetHop(msg);
+  if (replyToHop !== undefined) thread.repliedHops.add(replyToHop);
+  if (outcome === "accepted") {
+    const previous = thread.confirmedSnapshot;
+    const repliedHops = new Set(previous?.repliedHops);
+    if (replyToHop !== undefined) repliedHops.add(replyToHop);
+    const latest = previous && previous.hop > msg.hop ? previous : snapshot;
+    thread.confirmedSnapshot = { ...latest, repliedHops: [...repliedHops] };
+    thread.admitted = true;
   } else {
-    draft.threads.set(msg.correlationId, {
-      ...deserializeBasePeerThread(nextConfirmed),
-      confirmedSnapshot: nextConfirmed,
-    });
+    if (!thread.highestUnknownSnapshot || msg.hop > thread.highestUnknownSnapshot.hop)
+      thread.highestUnknownSnapshot = snapshot;
+    if (replyToHop !== undefined)
+      thread.unknownReplyHops = [...new Set([...(thread.unknownReplyHops ?? []), replyToHop])];
   }
+  draft.threads.set(msg.correlationId, thread);
 }
 
 function pruneUnlockedInboundGrants(
@@ -1401,18 +1445,19 @@ function pruneUnlockedInboundGrants(
   }
 }
 
-function settleAcceptedPeerDispatchInDraft(
+function settlePeerDispatchInDraft(
   draft: PeerRuntimeMaps,
   dispatchId: string,
   kind: PeerDispatchEndpointContext["kind"],
+  outcome: "accepted" | "outcome_unknown",
   countHuman: (agentId: string) => number,
 ): void {
   if (kind === "peer-workspace") {
     const msg = draft.byMessageId.get(dispatchId);
     if (msg) {
       const { activeAttemptId: _cleared, ...rest } = msg;
-      draft.byMessageId.set(dispatchId, { ...rest, settled: true });
-      advanceThreadConfirmedSnapshot(draft, msg);
+      draft.byMessageId.set(dispatchId, { ...rest, settled: true, deliveryOutcome: outcome });
+      recordPeerThreadOutcome(draft, msg, outcome);
     }
     pruneUnlockedInboundGrants(draft.inboundAgentLocks, countHuman);
     return;
@@ -1420,17 +1465,12 @@ function settleAcceptedPeerDispatchInDraft(
   const child = draft.pendingChildDispatches.get(dispatchId);
   if (child) {
     const { activeAttemptId: _cleared, ...rest } = child;
-    draft.pendingChildDispatches.set(dispatchId, { ...rest, settled: true });
+    draft.pendingChildDispatches.set(dispatchId, {
+      ...rest,
+      settled: true,
+      deliveryOutcome: outcome,
+    });
   }
-}
-
-function resolveBaselineConfirmedSnapshot(
-  currentThread: PeerThreadState | undefined,
-  removedMsg: PersistedPeerEnvelope,
-): BasePeerThreadSnapshot | undefined {
-  return cloneBaseThreadSnapshot(
-    currentThread?.confirmedSnapshot ?? removedMsg.inboundThread?.confirmedSnapshot,
-  );
 }
 
 function reconcileThreadAfterUnsentRemoval(
@@ -1439,38 +1479,29 @@ function reconcileThreadAfterUnsentRemoval(
 ): void {
   const { correlationId } = removedMsg;
   const currentThread = draft.threads.get(correlationId);
-  const confirmedSnapshot = resolveBaselineConfirmedSnapshot(currentThread, removedMsg);
-  let topUnsettled: PersistedPeerEnvelope | undefined;
-  const unsettledReplied = new Set<number>(confirmedSnapshot?.repliedHops ?? []);
+  const confirmedSnapshot = currentThread?.confirmedSnapshot;
+  const highestUnknownSnapshot = currentThread?.highestUnknownSnapshot;
+  let latest = confirmedSnapshot;
+  if (highestUnknownSnapshot && (!latest || highestUnknownSnapshot.hop > latest.hop))
+    latest = highestUnknownSnapshot;
+  const repliedHops = new Set([
+    ...(confirmedSnapshot?.repliedHops ?? []),
+    ...(currentThread?.unknownReplyHops ?? []),
+  ]);
   for (const candidate of draft.byMessageId.values()) {
     if (candidate.settled || candidate.correlationId !== correlationId) continue;
-    if (candidate.intent === "reply" && candidate.hop > 1) {
-      unsettledReplied.add(candidate.hop - 1);
-    }
-    if (!topUnsettled || candidate.hop > topUnsettled.hop) {
-      topUnsettled = candidate;
-    }
+    const replyToHop = persistedReplyTargetHop(candidate);
+    if (replyToHop !== undefined) repliedHops.add(replyToHop);
+    if (!latest || candidate.hop > latest.hop) latest = peerSnapshotFromMessage(candidate);
   }
-  if (topUnsettled) {
+  if (latest) {
     draft.threads.set(correlationId, {
-      correlationId,
-      maxHops: topUnsettled.maxHops,
-      hop: topUnsettled.hop,
-      expectReply: topUnsettled.expectReply,
-      lastSourceWorkspaceId: topUnsettled.sourceWorkspaceId,
-      lastSourceAgentId: topUnsettled.agentId,
-      lastTargetWorkspaceId: topUnsettled.targetWorkspaceId,
-      lastTargetAgentId: topUnsettled.recipientAgentId,
-      repliedHops: unsettledReplied,
+      ...deserializeBasePeerThread(latest),
+      repliedHops,
       admitted: Boolean(confirmedSnapshot?.admitted),
-      ...(confirmedSnapshot ? { confirmedSnapshot } : {}),
-    });
-    return;
-  }
-  if (confirmedSnapshot) {
-    draft.threads.set(correlationId, {
-      ...deserializeBasePeerThread(confirmedSnapshot),
       confirmedSnapshot,
+      highestUnknownSnapshot,
+      unknownReplyHops: currentThread?.unknownReplyHops,
     });
     return;
   }
@@ -1527,34 +1558,32 @@ function clearActiveAttemptOnReturn(
   }
 }
 
-function isSupersededNonAcceptedAttempt(
-  record: { settled?: boolean; activeAttemptId?: string },
+function matchesPeerAttempt(
+  record: { settled?: boolean; activeAttemptId?: string; lastAttemptId?: string },
   context: PeerDispatchEndpointContext,
 ): boolean {
-  if (record.settled) return true;
-  return Boolean(
-    record.activeAttemptId &&
-    context.attemptId !== undefined &&
-    context.attemptId !== record.activeAttemptId,
-  );
+  if (record.settled) return false;
+  if (record.activeAttemptId) return context.attemptId === record.activeAttemptId;
+  return context.ownsReservation === true && Boolean(context.attemptId || !record.lastAttemptId);
 }
 
-function revokeNonAcceptedGrantInDraft(
+function peerOutcomeRecord(
   draft: PeerRuntimeMaps,
   dispatchId: string,
-  outcome: "returned_to_queue" | "retained_for_restart",
   context: PeerDispatchEndpointContext,
-): void {
-  if (outcome === "returned_to_queue") {
-    clearActiveAttemptOnReturn(draft, dispatchId, context);
-    revokeAttemptGrantForKind(draft, context.kind, context.attemptId);
-    return;
-  }
-  if (context.kind === "peer-child") {
-    revokeGrantsByDispatchId(draft.lockedChildren, dispatchId, "initial");
-  } else {
-    revokeGrantsByDispatchId(draft.inboundAgentLocks, dispatchId);
-  }
+) {
+  return context.kind === "peer-child"
+    ? draft.pendingChildDispatches.get(dispatchId)
+    : draft.byMessageId.get(dispatchId);
+}
+
+function matchesPeerAcceptanceAttempt(
+  record: NonNullable<ReturnType<typeof peerOutcomeRecord>>,
+  attemptId: string | undefined,
+): boolean {
+  if (!attemptId) return false;
+  if (!record.settled) return attemptId === record.activeAttemptId;
+  return record.deliveryOutcome !== undefined && attemptId === record.lastAttemptId;
 }
 
 function applySinglePeerOutcomeInDraft(
@@ -1563,26 +1592,30 @@ function applySinglePeerOutcomeInDraft(
   outcome: PeerDispatchTerminalOutcome,
   context: PeerDispatchEndpointContext,
   countHuman: (agentId: string) => number,
-): void {
-  if (!matchesRecordedOutcomeContext(draft, dispatchId, context)) return;
-  if (outcome === "accepted" || outcome === "outcome_unknown") {
-    settleAcceptedPeerDispatchInDraft(draft, dispatchId, context.kind, countHuman);
-    return;
+): boolean {
+  if (!matchesRecordedOutcomeContext(draft, dispatchId, context)) return false;
+  const targetRecord = peerOutcomeRecord(draft, dispatchId, context);
+  if (!targetRecord) return false;
+  if (outcome === "accepted") {
+    if (!matchesPeerAcceptanceAttempt(targetRecord, context.attemptId)) return false;
+    if (targetRecord.deliveryOutcome !== "accepted") {
+      settlePeerDispatchInDraft(draft, dispatchId, context.kind, outcome, countHuman);
+    }
+    return true;
   }
-  const targetRecord =
-    context.kind === "peer-child"
-      ? draft.pendingChildDispatches.get(dispatchId)
-      : draft.byMessageId.get(dispatchId);
-  if (!targetRecord) return;
-  if (isSupersededNonAcceptedAttempt(targetRecord, context)) {
-    revokeAttemptGrantForKind(draft, context.kind, context.attemptId);
-    return;
+  if (!matchesPeerAttempt(targetRecord, context)) return false;
+  if (outcome === "outcome_unknown") {
+    if (!context.attemptId || context.attemptId !== targetRecord.activeAttemptId) return false;
+    settlePeerDispatchInDraft(draft, dispatchId, context.kind, outcome, countHuman);
+    return true;
   }
   if (outcome === "returned_to_queue" || outcome === "retained_for_restart") {
-    revokeNonAcceptedGrantInDraft(draft, dispatchId, outcome, context);
-    return;
+    clearActiveAttemptOnReturn(draft, dispatchId, context);
+    revokeAttemptGrantForKind(draft, context.kind, context.attemptId);
+    return true;
   }
   cleanupUnsentPeerDispatchInDraft(draft, dispatchId, context.kind);
+  return true;
 }
 
 function serializeGrantMap(
@@ -1618,10 +1651,199 @@ function invalidatePeerRuntimeCache(runtime: PeerWorkspaceRuntime): void {
   runtime.pendingChildDispatches.clear();
 }
 
-function hydratePersistedPeerState(
+async function restoreLegacyPeerConfirmation(
+  runtime: PeerWorkspaceRuntime,
+  journal: PendingPeerOutcomeRecord[],
+): Promise<void> {
+  const accepted = new Set<string>();
+  for (const { dispatchId, outcome, context } of journal) {
+    if (
+      outcome !== "accepted" ||
+      context.kind !== "peer-workspace" ||
+      !matchesRecordedOutcomeContext(runtime, dispatchId, context)
+    )
+      continue;
+    accepted.add(dispatchId);
+  }
+  for (const message of runtime.byMessageId.values()) {
+    if (message.legacyUnconfirmed && accepted.has(message.dispatchId))
+      settleLegacyPeerAcceptance(runtime, message);
+  }
+  for (const message of await findLegacyPeerAcceptances(runtime))
+    settleLegacyPeerAcceptance(runtime, message);
+}
+
+function settleLegacyPeerAcceptance(draft: PeerRuntimeMaps, message: PersistedPeerEnvelope): void {
+  draft.byMessageId.set(message.dispatchId, {
+    ...message,
+    legacyUnconfirmed: undefined,
+    deliveryOutcome: "accepted",
+  });
+  recordPeerThreadOutcome(draft, message, "accepted");
+}
+
+function matchLegacyPeerTimelineItem(
+  item: AgentTimelineItem,
+  candidates: ReadonlyMap<string, PersistedPeerEnvelope>,
+) {
+  if (
+    item.type !== "tool_call" ||
+    item.name !== "agent_message" ||
+    item.status !== "completed" ||
+    item.agentMessage?.event !== "message"
+  )
+    return;
+  const id = parseProjectedPeerCallId(item.callId);
+  if (!id) return;
+  const message = candidates.get(id.messageId);
+  if (
+    !message ||
+    id.correlationId !== message.correlationId ||
+    id.intent !== message.intent ||
+    item.agentMessage.sender.id !== message.agentId ||
+    item.agentMessage.sender.serverId !== message.serverId
+  )
+    return;
+  return { message, text: item.agentMessage.text };
+}
+
+async function findLegacyPeerAcceptances(
+  runtime: PeerWorkspaceRuntime,
+  correlationId?: string,
+): Promise<PersistedPeerEnvelope[]> {
+  const byRecipient = new Map<string, Map<string, PersistedPeerEnvelope>>();
+  for (const message of runtime.byMessageId.values()) {
+    if (!message.legacyUnconfirmed || (correlationId && message.correlationId !== correlationId))
+      continue;
+    const group = byRecipient.get(message.recipientAgentId) ?? new Map();
+    group.set(message.dispatchId, message);
+    byRecipient.set(message.recipientAgentId, group);
+  }
+  const accepted = new Set<PersistedPeerEnvelope>();
+  const replayed = new Map<string, PersistedPeerEnvelope>();
+  const secret =
+    byRecipient.size && runtime.paseoHome
+      ? await resolvePeerTransportSecret(runtime.paseoHome)
+      : undefined;
+  for (const [recipientId, candidates] of byRecipient) {
+    const timeline = await runtime.readRecipientTimeline(recipientId).catch(() => null);
+    for (const { item, turnId } of timeline?.rows ?? []) {
+      const match = matchLegacyPeerTimelineItem(item, candidates);
+      if (!match) continue;
+      // The local accepted-turn projection has a turn ID. Replay alone lacks it
+      // and needs the matching completed queue receipt, including the exact body.
+      if (turnId) accepted.add(match.message);
+      else if (secret) {
+        const fingerprint = legacyPeerRequestFingerprint(match, secret);
+        if (fingerprint) replayed.set(fingerprint, match.message);
+      }
+    }
+  }
+  if (runtime.paseoHome && replayed.size) {
+    const receipts = new MessageReceipts(join(runtime.paseoHome, "agent-requests"));
+    const matches = await receipts
+      .findCompletedFingerprints(
+        new Map(
+          [...replayed].map(([fingerprint, message]) => [fingerprint, message.recipientAgentId]),
+        ),
+      )
+      .catch(() => new Set<string>());
+    for (const [fingerprint, message] of replayed)
+      if (matches.has(fingerprint)) accepted.add(message);
+  }
+  return [...accepted];
+}
+
+function legacyPeerRequestFingerprint(
+  { message, text }: { message: PersistedPeerEnvelope; text: string },
+  secret: Buffer,
+) {
+  const prefix = projectedPeerMessagePrefix(message);
+  if (!text.startsWith(prefix)) return;
+  const {
+    dispatchId,
+    agentId,
+    serverId,
+    title,
+    recipientAgentId,
+    sourceWorkspaceId,
+    sourceWorkspaceTitle,
+    targetWorkspaceId,
+    correlationId,
+    intent,
+    hop,
+    maxHops,
+    expectReply,
+    subject,
+  } = message;
+  try {
+    const prompt = encodePeerWorkspacePrompt(
+      {
+        dispatchId,
+        senderAgentId: agentId,
+        senderServerId: serverId,
+        recipientAgentId,
+        sourceWorkspaceId,
+        sourceWorkspaceTitle,
+        targetWorkspaceId,
+        correlationId,
+        intent,
+        hop,
+        maxHops,
+        expectReply,
+        subject,
+      },
+      text.slice(prefix.length),
+      secret,
+    );
+    return fingerprintMessageRequest({
+      prompt,
+      source: { agentId, serverId, title },
+      activeTurnBehavior: "queue",
+      unarchive: false,
+      notifyLocalCaller: false,
+      notifyOnFinish: false,
+    });
+  } catch {
+    // Unverifiable stale metadata cannot establish a completed request.
+    return;
+  }
+}
+
+function hydratePeerThread(
+  runtime: PeerWorkspaceRuntime,
+  rawThread: SerializedPeerThread,
+  separatesUnknownOutcomes: boolean,
+): PeerThreadState {
+  const thread = deserializePeerThread(rawThread);
+  if (!separatesUnknownOutcomes) {
+    // This format used the same snapshot for acceptance and unknown provider results.
+    // Keep its occupancy and consumption unless a durable outcome proves acceptance.
+    const previous =
+      thread.confirmedSnapshot ??
+      (rawThread.hasConfirmedHop === undefined &&
+      !hasUnsettledDispatchForThread(rawThread.correlationId, runtime)
+        ? toBasePeerThreadSnapshot(thread)
+        : undefined);
+    thread.highestUnknownSnapshot = previous;
+    thread.unknownReplyHops = previous?.repliedHops;
+    thread.confirmedSnapshot = undefined;
+    thread.admitted = false;
+  } else if (
+    rawThread.hasConfirmedHop === undefined &&
+    !thread.confirmedSnapshot &&
+    !hasUnsettledDispatchForThread(rawThread.correlationId, runtime)
+  ) {
+    thread.confirmedSnapshot = toBasePeerThreadSnapshot(thread);
+  }
+  return thread;
+}
+
+async function hydratePersistedPeerState(
   runtime: PeerWorkspaceRuntime,
   parsed: z.infer<typeof persistedPeerStateFileSchema>,
-): void {
+  journal: PendingPeerOutcomeRecord[],
+): Promise<void> {
   hydrateGrantEntries(runtime.inboundAgentLocks, parsed.inboundAgentLocks, "legacy");
   hydrateGrantEntries(runtime.lockedChildren, parsed.lockedChildren, "initial");
   for (const [msgId, rawSource] of parsed.messages ?? []) {
@@ -1633,6 +1855,11 @@ function hydratePersistedPeerState(
       setPeerDeliveryRecordWithUndo(runtime.byMessageId, runtime.inboundAgentLocks, msgId, {
         ...(rawSource as PersistedPeerEnvelope),
         dispatchId: typeof rawSource.dispatchId === "string" ? rawSource.dispatchId : msgId,
+        ...(!parsed.separatesUnknownOutcomes &&
+        rawSource.settled === true &&
+        rawSource.deliveryOutcome === undefined
+          ? { legacyUnconfirmed: true as const }
+          : {}),
       });
     }
   }
@@ -1649,16 +1876,12 @@ function hydratePersistedPeerState(
   }
   for (const rawThread of parsed.threads ?? []) {
     if (runtime.threads.has(rawThread.correlationId)) continue;
-    const hydrated = deserializePeerThread(rawThread);
-    if (
-      rawThread.hasConfirmedHop === undefined &&
-      !hydrated.confirmedSnapshot &&
-      !hasUnsettledDispatchForThread(rawThread.correlationId, runtime)
-    ) {
-      hydrated.confirmedSnapshot = toBasePeerThreadSnapshot(hydrated);
-    }
-    runtime.threads.set(rawThread.correlationId, hydrated);
+    runtime.threads.set(
+      rawThread.correlationId,
+      hydratePeerThread(runtime, rawThread, parsed.separatesUnknownOutcomes === true),
+    );
   }
+  if (!parsed.separatesUnknownOutcomes) await restoreLegacyPeerConfirmation(runtime, journal);
 }
 
 async function readPendingOutcomesJournal(paseoHome: string): Promise<PendingPeerOutcomeRecord[]> {
@@ -1712,11 +1935,11 @@ function ensurePeerRuntimeLoaded(runtime: PeerWorkspaceRuntime): Promise<void> {
     } catch (error) {
       if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
     }
+    const journalEntries = await readPendingOutcomesJournal(home);
     if (rawText !== undefined) {
       const parsed = persistedPeerStateFileSchema.parse(JSON.parse(rawText));
-      hydratePersistedPeerState(runtime, parsed);
+      await hydratePersistedPeerState(runtime, parsed, journalEntries);
     }
-    const journalEntries = await readPendingOutcomesJournal(home);
     for (const entry of journalEntries) {
       if (!runtime.pendingOutcomes.has(entry.outcomeKey)) {
         runtime.pendingOutcomes.set(entry.outcomeKey, entry);
@@ -1754,6 +1977,7 @@ async function writePeerStateMapsToDisk(
   const agentsDir = join(paseoHome, "agents");
   const statePath = join(agentsDir, "peer-workspace-state.json");
   const payload = {
+    separatesUnknownOutcomes: true,
     threads: Array.from(state.threads.values(), serializePeerThread),
     messages: [...state.byMessageId.entries()],
     inboundAgentLocks: serializeGrantMap(state.inboundAgentLocks),
@@ -1766,21 +1990,22 @@ async function writePeerStateMapsToDisk(
   await rename(tmpPath, statePath);
 }
 
-function finalizeFlushedPendingOutcomes(
+async function finalizeFlushedPendingOutcomes(
   runtime: PeerWorkspaceRuntime,
   flushed: ReadonlyArray<PendingPeerOutcomeRecord>,
-): void {
+  releasedDispatches: ReadonlySet<string>,
+): Promise<void> {
   if (flushed.length === 0) return;
   for (const entry of flushed) {
     if (runtime.pendingOutcomes.get(entry.outcomeKey) === entry) {
       runtime.pendingOutcomes.delete(entry.outcomeKey);
     }
-    if (entry.outcome !== "returned_to_queue") {
+    if (releasedDispatches.has(entry.dispatchId)) {
       releasePromptDispatchVerifier(entry.dispatchId);
     }
   }
   if (runtime.pendingOutcomes.size === 0) {
-    void clearPendingOutcomesJournal(runtime.paseoHome).catch(() => undefined);
+    await clearPendingOutcomesJournal(runtime.paseoHome).catch(() => undefined);
   }
 }
 
@@ -1791,20 +2016,27 @@ async function commitPeerStateTransaction<T>(
 ): Promise<T> {
   const pendingSnapshot = [...runtime.pendingOutcomes.values()];
   const draft = clonePeerRuntimeMaps(runtime);
+  const releasedDispatches = new Set<string>();
   for (const entry of pendingSnapshot) {
-    applySinglePeerOutcomeInDraft(
+    const applied = applySinglePeerOutcomeInDraft(
       draft,
       entry.dispatchId,
       entry.outcome,
       entry.context,
       countHuman,
     );
+    if (applied && peerDispatchEndsReservation(entry.outcome))
+      releasedDispatches.add(entry.dispatchId);
   }
   const result = await mutator(draft);
   await writePeerStateMapsToDisk(runtime.paseoHome, draft);
   applyPeerRuntimeMaps(runtime, draft);
-  finalizeFlushedPendingOutcomes(runtime, pendingSnapshot);
+  await finalizeFlushedPendingOutcomes(runtime, pendingSnapshot, releasedDispatches);
   return result;
+}
+
+function peerDispatchEndsReservation(outcome: PeerDispatchTerminalOutcome): boolean {
+  return outcome !== "returned_to_queue" && outcome !== "retained_for_restart";
 }
 
 async function withPeerStateMutex<T>(
@@ -1828,11 +2060,16 @@ async function withPeerStateMutex<T>(
 
 const peerRuntimeByManager = new WeakMap<object, PeerWorkspaceRuntime>();
 
-function getPeerWorkspaceRuntime(key: object, paseoHome?: string): PeerWorkspaceRuntime {
+function getPeerWorkspaceRuntime(
+  key: object,
+  readRecipientTimeline: PeerWorkspaceRuntime["readRecipientTimeline"],
+  paseoHome?: string,
+): PeerWorkspaceRuntime {
   let runtime = peerRuntimeByManager.get(key);
   if (!runtime) {
     runtime = {
       paseoHome,
+      readRecipientTimeline,
       loadPromise: null,
       loadedFromDisk: false,
       stateMutex: Promise.resolve(),
@@ -1886,7 +2123,14 @@ function createToolCatalog(
   const childLogger = logger.child({ module: "agent", component: "paseo-tool-catalog" });
   const callerContext = callerAgentId ? (resolveCallerContext?.(callerAgentId) ?? null) : null;
   const taskLedger = openTaskLedger(options);
-  const peerRuntime = getPeerWorkspaceRuntime(agentManager, options.paseoHome);
+  const peerRuntime = getPeerWorkspaceRuntime(
+    agentManager,
+    async (agentId) => {
+      const record = await agentStorage.get(agentId);
+      return record ? agentManager.readStoredTimeline(record, { limit: 0 }) : null;
+    },
+    options.paseoHome,
+  );
   void ensurePeerRuntimeLoaded(peerRuntime);
 
   const parseToolInput = async (tool: PaseoToolDefinition, input: unknown): Promise<unknown> => {
@@ -2124,15 +2368,20 @@ function createToolCatalog(
             if (
               !activeChild ||
               activeChild.settled ||
+              (!activeChild.activeAttemptId && activeChild.lastAttemptId === grantId) ||
               activeChild.recipientAgentId !== childAgentId
             ) {
               throw new PaseoToolInputError(
                 `Peer child prompt ${dispatchId} was withdrawn or settled before dispatch lock commit.`,
               );
             }
+            if (activeChild.activeAttemptId !== grantId) {
+              revokeGrantsByDispatchId(draft.lockedChildren, dispatchId, "initial");
+            }
             draft.pendingChildDispatches.set(dispatchId, {
               ...activeChild,
               activeAttemptId: grantId,
+              lastAttemptId: grantId,
             });
           }
           await pruneArchivedGrantMap(draft.lockedChildren);
@@ -2169,15 +2418,20 @@ function createToolCatalog(
           if (
             !activeMessage ||
             activeMessage.settled ||
+            (!activeMessage.activeAttemptId && activeMessage.lastAttemptId === attemptId) ||
             activeMessage.recipientAgentId !== recipientAgentId
           ) {
             throw new PaseoToolInputError(
               `Peer message ${dispatchId} was withdrawn or settled before dispatch lock commit.`,
             );
           }
+          if (activeMessage.activeAttemptId !== attemptId) {
+            revokeGrantsByDispatchId(draft.inboundAgentLocks, dispatchId);
+          }
           draft.byMessageId.set(dispatchId, {
             ...activeMessage,
             activeAttemptId: attemptId,
+            lastAttemptId: attemptId,
           });
           await pruneArchivedGrantMap(draft.inboundAgentLocks);
           grantAgentPeerLockWithUndo(
@@ -2240,7 +2494,7 @@ function createToolCatalog(
           });
         }
         for (const entry of peerRuntime.pendingOutcomes.values()) {
-          if (entry.outcome !== "returned_to_queue") {
+          if (peerDispatchEndsReservation(entry.outcome)) {
             releasePromptDispatchVerifier(entry.dispatchId);
           }
         }
@@ -2256,8 +2510,25 @@ function createToolCatalog(
     dispatchId: string,
     outcome: PeerDispatchTerminalOutcome,
     context: PeerDispatchEndpointContext,
-  ): Promise<void> {
+  ): Promise<boolean | void> {
     return withPeerStateMutex(peerRuntime, async () => {
+      if (context.rejectDurableHold) {
+        if (outcome !== "definitively_unsent") return false;
+        const rejection = resolveDurableHoldRejection(dispatchId, context);
+        if (typeof rejection === "boolean") return rejection;
+        context = rejection;
+      }
+      if (outcome === "accepted") {
+        const record = peerOutcomeRecord(peerRuntime, dispatchId, context);
+        if (
+          !record ||
+          !matchesRecordedOutcomeContext(peerRuntime, dispatchId, context) ||
+          !matchesPeerAcceptanceAttempt(record, context.attemptId)
+        ) {
+          throw new Error("Peer acceptance does not match the recorded delivery attempt.");
+        }
+        if (record.deliveryOutcome === "accepted") return;
+      }
       queuePendingOutcomeRecord(dispatchId, outcome, context);
       try {
         await flushPendingPeerOutcomesUnlocked();
@@ -2276,7 +2547,36 @@ function createToolCatalog(
         }
         throw stateErr;
       }
+      if (
+        outcome === "accepted" &&
+        peerOutcomeRecord(peerRuntime, dispatchId, context)?.deliveryOutcome !== "accepted"
+      ) {
+        throw new Error("Peer acceptance could not be applied to the recorded delivery attempt.");
+      }
+      if (outcome === "definitively_unsent")
+        return !peerOutcomeRecord(peerRuntime, dispatchId, context);
     });
+  }
+
+  function resolveDurableHoldRejection(
+    dispatchId: string,
+    context: PeerDispatchEndpointContext,
+  ): PeerDispatchEndpointContext | boolean {
+    if (context.kind !== "peer-workspace" || !context.ownsReservation) return false;
+    const record = peerRuntime.byMessageId.get(dispatchId);
+    if (!record) return true; // Cleanup can have committed before the receipt was written.
+    if (
+      record.settled ||
+      !matchesRecordedOutcomeContext(peerRuntime, dispatchId, context) ||
+      hasPendingAcceptedOutcome(dispatchId, context.kind, context.recipientId)
+    )
+      return false;
+    // Use the recorded pre-handoff attempt in the journal without broadening anonymous outcomes.
+    return {
+      ...context,
+      rejectDurableHold: undefined,
+      attemptId: record.activeAttemptId ?? record.lastAttemptId,
+    };
   }
 
   function hasEnforcedAdapterReadOnlyOptions(
@@ -2352,11 +2652,17 @@ function createToolCatalog(
     kind: PeerDispatchEndpointContext["kind"],
     agentId: string,
   ): boolean {
+    const record =
+      kind === "peer-child"
+        ? peerRuntime.pendingChildDispatches.get(dispatchId)
+        : peerRuntime.byMessageId.get(dispatchId);
     for (const entry of peerRuntime.pendingOutcomes.values()) {
       if (
         entry.dispatchId === dispatchId &&
         entry.context.kind === kind &&
         entry.context.recipientId === agentId &&
+        record?.activeAttemptId !== undefined &&
+        record.activeAttemptId === entry.context.attemptId &&
         (entry.outcome === "accepted" || entry.outcome === "outcome_unknown")
       ) {
         return true;
@@ -2379,13 +2685,7 @@ function createToolCatalog(
       ) {
         continue;
       }
-      if (
-        recorded?.activeAttemptId &&
-        pending.context.attemptId !== undefined &&
-        pending.context.attemptId !== recorded.activeAttemptId
-      ) {
-        continue;
-      }
+      if (!recorded || !matchesPeerAttempt(recorded, pending.context)) continue;
       return true;
     }
     return false;
@@ -2479,14 +2779,6 @@ function createToolCatalog(
       if (entry.context.kind !== kind || entry.context.recipientId !== agentId) continue;
       if (!isRevokingOutcome(entry.outcome)) continue;
       if (entry.context.attemptId === grant.grantId) return true;
-      if (
-        dispatchKey &&
-        entry.dispatchId === dispatchKey &&
-        entry.context.attemptId === undefined &&
-        entry.outcome !== "returned_to_queue"
-      ) {
-        return true;
-      }
     }
     return false;
   }
@@ -4178,7 +4470,7 @@ function createToolCatalog(
       const bindingMessageId = taskBinding ? randomUUID() : undefined;
       const { snapshot, initialPromptStarted, bindingResult } = await (async () => {
         let peerChildLockedBeforeStart = false;
-        const create = () =>
+        const create = (verifyPeerRecipient?: (agentId: string) => void) =>
           createAgentCommand(
             {
               serverId: options.serverId,
@@ -4221,6 +4513,7 @@ function createToolCatalog(
                             "initial",
                           );
                           peerChildLockedBeforeStart = true;
+                          verifyPeerRecipient?.(createdAgentId);
                         }
                       }
                     }
@@ -4237,7 +4530,10 @@ function createToolCatalog(
             },
           );
 
-        const creation = await (taskBinding ? taskBinding.run(create, bindingMessageId) : create());
+        const startCreate = () => (activePeerTurn ? withPeerInitialPrompt(create) : create());
+        const creation = await (taskBinding
+          ? taskBinding.run(startCreate, bindingMessageId)
+          : startCreate());
         if (activePeerTurn && !peerChildLockedBeforeStart) {
           const [firstCorrelationId] = activePeerTurn.correlationIds;
           if (firstCorrelationId) {
@@ -5032,6 +5328,7 @@ function createToolCatalog(
       });
       guardedPrompt = stagedPeerChild.guardedPrompt;
     }
+    const behavior = stagedPeerChild ? "queue" : (activeTurnBehavior ?? "queue");
     const enqueue = () =>
       enqueueLocalAgentPrompt(
         agentId,
@@ -5047,8 +5344,8 @@ function createToolCatalog(
             : undefined,
           expectedWorkspaceId: senderWorkspaceId,
           sessionMode,
-          activeTurnBehavior: activeTurnBehavior ?? "queue",
-          ...(activeTurnBehavior === "steer" ? { immediateSteer: true } : {}),
+          activeTurnBehavior: behavior,
+          ...(behavior === "steer" ? { immediateSteer: true } : {}),
           unarchive: !mainControl,
           notifyLocalCaller: notifying,
           notifyOnFinish,
@@ -5064,8 +5361,7 @@ function createToolCatalog(
       }
       throw error;
     }
-    if (!taskBinding)
-      return queuedPromptResponse(agentId, messageId, notifying, activeTurnBehavior ?? "queue");
+    if (!taskBinding) return queuedPromptResponse(agentId, messageId, notifying, behavior);
     return {
       content: [],
       structuredContent: {
@@ -5199,7 +5495,7 @@ function createToolCatalog(
         .boolean()
         .optional()
         .describe(
-          'Whether the recipient should send one reply. Defaults to true for "query"/"align"; must be false (or omitted) for "reply".',
+          'Whether the recipient should send one reply. Defaults to true for "query"/"align" while a reply hop remains. Omit or set false on the last hop or for "reply".',
         ),
       maxHops: z
         .number()
@@ -5384,15 +5680,20 @@ function createToolCatalog(
     return { sourceWorkspaceId, sourceWorkspace, targetWorkspace };
   }
 
-  function hasQueuedReplyForConfirmedHop(correlationId: string, targetHop: number): boolean {
-    for (const entry of peerRuntime.byMessageId.values()) {
-      if (entry.settled || entry.correlationId !== correlationId) continue;
-      if (isPeerWorkspaceDispatchUnsentInPending(entry.dispatchId, entry.recipientAgentId)) {
-        continue;
-      }
-      if (entry.intent === "reply" && entry.hop === targetHop + 1) return true;
+  function reserveNextPeerHop(state: PeerRuntimeMaps, thread: PeerThreadState): number {
+    const { correlationId, maxHops } = thread;
+    let highest = Math.max(
+      thread.hop,
+      thread.confirmedSnapshot?.hop ?? 0,
+      thread.highestUnknownSnapshot?.hop ?? 0,
+    );
+    for (const entry of state.byMessageId.values()) {
+      if (entry.correlationId === correlationId) highest = Math.max(highest, entry.hop);
     }
-    return false;
+    if (highest >= maxHops) {
+      throw new PaseoToolInputError(`Peer thread ${correlationId} exceeded maxHops (${maxHops}).`);
+    }
+    return highest + 1;
   }
 
   function resolvePeerReplyStep(params: {
@@ -5401,7 +5702,7 @@ function createToolCatalog(
     callerIsMainControl: boolean;
     sourceWorkspaceId: string;
     targetWorkspaceId: string;
-    lookupThread: (id: string) => PeerThreadState | undefined;
+    state: PeerRuntimeMaps;
   }) {
     const { rawInput, callerId, callerIsMainControl, sourceWorkspaceId, targetWorkspaceId } =
       params;
@@ -5412,7 +5713,7 @@ function createToolCatalog(
       throw new PaseoToolInputError("Replies must converge with expectReply: false.");
     }
     const correlationId = rawInput.correlationId;
-    const trackedThread = params.lookupThread(correlationId);
+    const trackedThread = params.state.threads.get(correlationId);
     const confirmedSnap = trackedThread?.confirmedSnapshot;
     if (!trackedThread || !confirmedSnap || !confirmedSnap.admitted) {
       throw new PaseoToolInputError(`Unknown or unauthorized peer correlationId: ${correlationId}`);
@@ -5426,7 +5727,7 @@ function createToolCatalog(
     }
     if (inboundThread.lastSourceWorkspaceId === sourceWorkspaceId) {
       throw new PaseoToolInputError(
-        `Peer thread ${correlationId} already sent a reply for hop ${Math.max(1, inboundThread.hop - 1)}.`,
+        `Peer thread ${correlationId} already sent a reply or the latest confirmed hop was outbound.`,
       );
     }
     if (inboundThread.lastTargetAgentId !== callerId && !callerIsMainControl) {
@@ -5439,8 +5740,7 @@ function createToolCatalog(
     }
     const replyAlreadyRecorded =
       inboundThread.repliedHops.has(inboundThread.hop) ||
-      trackedThread.repliedHops.has(inboundThread.hop) ||
-      hasQueuedReplyForConfirmedHop(correlationId, inboundThread.hop);
+      trackedThread.repliedHops.has(inboundThread.hop);
     if (replyAlreadyRecorded) {
       throw new PaseoToolInputError(
         `Peer thread ${correlationId} already sent a reply for hop ${inboundThread.hop}.`,
@@ -5450,15 +5750,9 @@ function createToolCatalog(
     if (rawInput.maxHops !== undefined && rawInput.maxHops !== effectiveMaxHops) {
       throw new PaseoToolInputError("maxHops cannot be changed on an existing peer thread.");
     }
-    const nextHop = inboundThread.hop + 1;
-    if (nextHop > effectiveMaxHops) {
-      throw new PaseoToolInputError(
-        `Peer thread ${correlationId} exceeded maxHops (${effectiveMaxHops}).`,
-      );
-    }
     return {
       correlationId,
-      nextHop,
+      nextHop: reserveNextPeerHop(params.state, trackedThread),
       effectiveMaxHops,
       effectiveExpectReply: false,
       inboundThread,
@@ -5484,7 +5778,7 @@ function createToolCatalog(
     callerIsMainControl: boolean;
     sourceWorkspaceId: string;
     targetWorkspaceId: string;
-    lookupThread: (id: string) => PeerThreadState | undefined;
+    state: PeerRuntimeMaps;
   }) {
     const { rawInput, callerIsMainControl, sourceWorkspaceId, targetWorkspaceId } = params;
     if (!callerIsMainControl) {
@@ -5492,39 +5786,37 @@ function createToolCatalog(
         'Only Workspace Main Control agents can initiate cross-workspace "query" or "align" messages.',
       );
     }
-    const effectiveExpectReply = rawInput.expectReply ?? true;
     const correlationId = rawInput.correlationId ?? `peer_${randomUUID()}`;
-    const existing = rawInput.correlationId ? params.lookupThread(correlationId) : undefined;
-    if (!existing) {
-      return {
-        correlationId,
-        nextHop: 1,
-        effectiveMaxHops: rawInput.maxHops ?? DEFAULT_MAX_PEER_HOPS,
-        effectiveExpectReply,
-        inboundThread: undefined,
-      };
-    }
-    if (!isSameWorkspacePair(existing, sourceWorkspaceId, targetWorkspaceId)) {
+    const existing = params.state.threads.get(correlationId);
+    if (existing && !isSameWorkspacePair(existing, sourceWorkspaceId, targetWorkspaceId)) {
       throw new PaseoToolInputError(
         `Peer correlationId ${correlationId} belongs to another workspace pair.`,
       );
     }
-    if (rawInput.maxHops !== undefined && rawInput.maxHops !== existing.maxHops) {
+    if (existing && rawInput.maxHops !== undefined && rawInput.maxHops !== existing.maxHops) {
       throw new PaseoToolInputError("maxHops cannot be changed on an existing peer thread.");
     }
-    const nextHop = existing.hop + 1;
-    if (nextHop > existing.maxHops) {
+    const nextHop = existing ? reserveNextPeerHop(params.state, existing) : 1;
+    const effectiveMaxHops = existing?.maxHops ?? rawInput.maxHops ?? DEFAULT_MAX_PEER_HOPS;
+    const hasReplyHop = nextHop < effectiveMaxHops;
+    if (!hasReplyHop && rawInput.expectReply === true) {
       throw new PaseoToolInputError(
-        `Peer thread ${correlationId} exceeded maxHops (${existing.maxHops}).`,
+        `Peer hop ${nextHop} of ${effectiveMaxHops} leaves no room for a reply. Omit expectReply or set expectReply: false.`,
       );
     }
     return {
       correlationId,
       nextHop,
-      effectiveMaxHops: existing.maxHops,
-      effectiveExpectReply,
+      effectiveMaxHops,
+      effectiveExpectReply: rawInput.expectReply ?? hasReplyHop,
       inboundThread: existing,
     };
+  }
+
+  function resolvePeerStep(params: Parameters<typeof resolvePeerReplyStep>[0]) {
+    return params.rawInput.intent === "reply"
+      ? resolvePeerReplyStep(params)
+      : resolvePeerInitiationStep(params);
   }
 
   function selectPeerReplyTarget(
@@ -6091,15 +6383,21 @@ function createToolCatalog(
     targetId: string,
     correlationId: string,
     expectReply: boolean,
+    intent: SendPeerMessageInput["intent"],
   ): string {
-    const base = describeAgentMessage({
-      activeTurnBehavior: "queue",
-      running: agentManager.hasInFlightRun(targetId),
-      canSteer: agentManager.canSteer(targetId),
-    });
-    return expectReply
-      ? `${base} End your turn and wait for the peer workspace to reply via send_peer_message on correlationId "${correlationId}". Do not poll.`
-      : `${base} Peer reply queued with expectReply=false; thread "${correlationId}" has converged.`;
+    const base = agentManager.getAgent(targetId)?.session
+      ? describeAgentMessage({
+          activeTurnBehavior: "queue",
+          running: agentManager.hasInFlightRun(targetId),
+          canSteer: agentManager.canSteer(targetId),
+        })
+      : "The message is queued. Open the recipient's supported Codex session to receive it.";
+    if (expectReply) {
+      return `${base} End your turn and wait for the peer workspace to reply via send_peer_message on correlationId "${correlationId}". Do not poll.`;
+    }
+    return intent === "reply"
+      ? `${base} Peer reply queued with expectReply=false; thread "${correlationId}" has converged.`
+      : `${base} Peer message queued with expectReply=false. No reply is expected on thread "${correlationId}".`;
   }
 
   function formatPeerSenderTitle(
@@ -6120,50 +6418,71 @@ function createToolCatalog(
 
   async function enqueueReservedPeerPrompt(params: {
     callerId: string;
+    callerIsMainControl: boolean;
     sourceWorkspaceId: string;
     sourceWorkspaceTitle: string;
-    targetWorkspaceId: string;
     resolvedTargetId: string;
     senderTitle: string;
-    intent: SendPeerMessageInput["intent"];
-    subject?: string;
-    message: string;
-    step: {
-      correlationId: string;
-      nextHop: number;
-      effectiveMaxHops: number;
-      effectiveExpectReply: boolean;
-      inboundThread?: PeerThreadState;
-    };
-  }): Promise<string> {
+    correlationId: string;
+    replyToHop?: number;
+    rawInput: SendPeerMessageInput;
+  }) {
     const {
       callerId,
+      callerIsMainControl,
       sourceWorkspaceId,
       sourceWorkspaceTitle,
-      targetWorkspaceId,
       resolvedTargetId,
       senderTitle,
-      intent,
-      subject,
-      message,
-      step,
+      correlationId,
+      replyToHop,
+      rawInput,
     } = params;
+    const { intent, subject, message, targetWorkspaceId, targetAgentId } = rawInput;
     const dispatchId = randomUUID();
-    const peerDisplayMetadata = {
-      sourceWorkspaceId,
-      sourceWorkspaceTitle,
-      targetWorkspaceId,
-      correlationId: step.correlationId,
-      intent,
-      hop: step.nextHop,
-      maxHops: step.effectiveMaxHops,
-      expectReply: step.effectiveExpectReply,
-      ...(subject ? { subject } : {}),
-    };
     // Atomic copy-on-write pre-enqueue commit: disk failure leaves in-memory runtime completely untouched.
-    const undoDraft = await commitPeerStateTransaction(
+    const {
+      step: reserved,
+      peerDisplayMetadata: metadata,
+      undoDraft,
+    } = await commitPeerStateTransaction(
       peerRuntime,
-      (draft) => {
+      async (draft) => {
+        const step = resolvePeerStep({
+          rawInput: { ...rawInput, correlationId },
+          callerId,
+          callerIsMainControl,
+          sourceWorkspaceId,
+          targetWorkspaceId,
+          state: draft,
+        });
+        if (intent === "reply" && step.inboundThread) {
+          const eligibleTargets = await listEligiblePeerTargets(
+            targetWorkspaceId,
+            targetAgentId ?? step.inboundThread.lastSourceAgentId,
+          );
+          const replyTarget = selectPeerTargetAgent({
+            intent,
+            eligibleTargets,
+            targetWorkspaceId,
+            targetAgentId,
+            inboundThread: step.inboundThread,
+          });
+          if (step.inboundThread.hop !== replyToHop || replyTarget.id !== resolvedTargetId) {
+            throw new PaseoToolInputError("Peer reply target changed before reservation.");
+          }
+        }
+        const peerDisplayMetadata = {
+          sourceWorkspaceId,
+          sourceWorkspaceTitle,
+          targetWorkspaceId,
+          correlationId,
+          intent,
+          hop: step.nextHop,
+          maxHops: step.effectiveMaxHops,
+          expectReply: step.effectiveExpectReply,
+          ...(subject ? { subject } : {}),
+        };
         const undoSlot = checkAndStagePeerPairSlot(
           peerRuntime,
           draft.pairWindows,
@@ -6172,8 +6491,8 @@ function createToolCatalog(
         );
         const existingThread = draft.threads.get(step.correlationId);
         const confirmedSnapshot = cloneBaseThreadSnapshot(existingThread?.confirmedSnapshot);
-        const repliedHops = new Set(step.inboundThread?.repliedHops ?? []);
-        if (intent === "reply" && step.inboundThread) repliedHops.add(step.inboundThread.hop);
+        const repliedHops = new Set(existingThread?.repliedHops ?? []);
+        if (replyToHop !== undefined) repliedHops.add(replyToHop);
         const undoDelivery = setPeerDeliveryRecordWithUndo(
           draft.byMessageId,
           draft.inboundAgentLocks,
@@ -6186,6 +6505,7 @@ function createToolCatalog(
             title: senderTitle,
             recipientAgentId: resolvedTargetId,
             settled: false,
+            ...(replyToHop !== undefined ? { replyToHop } : {}),
             ...(step.inboundThread
               ? { inboundThread: serializePeerThread(step.inboundThread) }
               : {}),
@@ -6207,13 +6527,19 @@ function createToolCatalog(
             repliedHops,
             admitted: Boolean(confirmedSnapshot?.admitted),
             ...(confirmedSnapshot ? { confirmedSnapshot } : {}),
+            highestUnknownSnapshot: existingThread?.highestUnknownSnapshot,
+            unknownReplyHops: existingThread?.unknownReplyHops,
           },
           countLocalHumanMessages,
         );
-        return (rollbackTarget: PeerRuntimeMaps) => {
-          undoDelivery(rollbackTarget.byMessageId);
-          undoThread(rollbackTarget.threads);
-          undoSlot(rollbackTarget.pairWindows);
+        return {
+          step,
+          peerDisplayMetadata,
+          undoDraft: (rollbackTarget: PeerRuntimeMaps) => {
+            undoDelivery(rollbackTarget.byMessageId);
+            undoThread(rollbackTarget.threads);
+            undoSlot(rollbackTarget.pairWindows);
+          },
         };
       },
       countLocalHumanMessages,
@@ -6226,7 +6552,7 @@ function createToolCatalog(
         senderAgentId: callerId,
         ...(options.serverId ? { senderServerId: options.serverId } : {}),
         recipientAgentId: resolvedTargetId,
-        ...peerDisplayMetadata,
+        ...metadata,
       },
       message,
       transportSecret,
@@ -6243,21 +6569,21 @@ function createToolCatalog(
         verifyQueuedPeerDispatchBoundary({
           dispatchId,
           attemptId,
-          correlationId: step.correlationId,
+          correlationId: reserved.correlationId,
           callerId,
           recipientId,
           expectedTargetId: resolvedTargetId,
           sourceWorkspaceId,
           targetWorkspaceId,
           intent,
-          inboundThread: step.inboundThread,
+          inboundThread: reserved.inboundThread,
           expectedServerId: options.serverId,
         }),
       (outcome, context) => handlePeerDispatchOutcome(dispatchId, outcome, context),
     );
 
     try {
-      return await enqueueLocalAgentPrompt(resolvedTargetId, {
+      const messageId = await enqueueLocalAgentPrompt(resolvedTargetId, {
         prompt: encodedPrompt,
         source: {
           agentId: callerId,
@@ -6269,6 +6595,7 @@ function createToolCatalog(
         notifyLocalCaller: false,
         notifyOnFinish: false,
       });
+      return { messageId, step: reserved };
     } catch (enqueueError) {
       releasePromptDispatchVerifier(dispatchId);
       return await rollbackPeerDeltaAfterFailedEnqueue(undoDraft, enqueueError);
@@ -6285,26 +6612,15 @@ function createToolCatalog(
       liveCaller?.workspaceId ?? storedCaller?.workspaceId,
       rawInput.targetWorkspaceId,
     );
-    const { targetWorkspaceId, targetAgentId, intent, subject, message, taskId } = rawInput;
-    const lookupThread = (id: string): PeerThreadState | undefined => peerRuntime.threads.get(id);
-
-    const step =
-      intent === "reply"
-        ? resolvePeerReplyStep({
-            rawInput,
-            callerId,
-            callerIsMainControl,
-            sourceWorkspaceId,
-            targetWorkspaceId,
-            lookupThread,
-          })
-        : resolvePeerInitiationStep({
-            rawInput,
-            callerIsMainControl,
-            sourceWorkspaceId,
-            targetWorkspaceId,
-            lookupThread,
-          });
+    const { targetWorkspaceId, targetAgentId, intent, taskId } = rawInput;
+    const step = resolvePeerStep({
+      rawInput,
+      callerId,
+      callerIsMainControl,
+      sourceWorkspaceId,
+      targetWorkspaceId,
+      state: peerRuntime,
+    });
 
     const eligibleTargets = await listEligiblePeerTargets(
       targetWorkspaceId,
@@ -6356,17 +6672,16 @@ function createToolCatalog(
       storedCaller,
       liveCaller,
     );
-    const messageId = await enqueueReservedPeerPrompt({
+    const { messageId, step: reserved } = await enqueueReservedPeerPrompt({
       callerId,
+      callerIsMainControl,
       sourceWorkspaceId,
       sourceWorkspaceTitle,
-      targetWorkspaceId,
       resolvedTargetId: resolvedTarget.id,
       senderTitle,
-      intent,
-      subject,
-      message,
-      step,
+      rawInput,
+      correlationId: step.correlationId,
+      replyToHop: intent === "reply" ? step.inboundThread?.hop : undefined,
     });
 
     return {
@@ -6375,18 +6690,19 @@ function createToolCatalog(
         success: true,
         deliveryStatus: "queued",
         messageId,
-        correlationId: step.correlationId,
-        hop: step.nextHop,
-        maxHops: step.effectiveMaxHops,
-        expectReply: step.effectiveExpectReply,
+        correlationId: reserved.correlationId,
+        hop: reserved.nextHop,
+        maxHops: reserved.effectiveMaxHops,
+        expectReply: reserved.effectiveExpectReply,
         targetWorkspaceId,
         targetAgentId: resolvedTarget.id,
         status: agentManager.getAgent(resolvedTarget.id)?.lifecycle ?? "idle",
         ...(taskId ? { taskId } : {}),
         guidance: buildPeerDispatchGuidance(
           resolvedTarget.id,
-          step.correlationId,
-          step.effectiveExpectReply,
+          reserved.correlationId,
+          reserved.effectiveExpectReply,
+          intent,
         ),
       }),
     };
@@ -6398,6 +6714,18 @@ function createToolCatalog(
     }
     return withPeerStateMutex(peerRuntime, async () => {
       await flushPendingPeerOutcomesUnlocked();
+      if (rawInput.correlationId) {
+        const recovered = await findLegacyPeerAcceptances(peerRuntime, rawInput.correlationId);
+        if (recovered.length) {
+          await commitPeerStateTransaction(
+            peerRuntime,
+            (draft) => {
+              for (const message of recovered) settleLegacyPeerAcceptance(draft, message);
+            },
+            countLocalHumanMessages,
+          );
+        }
+      }
       return executeSendPeerMessageUnlocked(callerAgentId, rawInput);
     });
   }
