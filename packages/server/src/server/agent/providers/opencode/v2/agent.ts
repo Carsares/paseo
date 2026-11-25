@@ -1,3 +1,4 @@
+import { hasProviderExecutableEnvOverride } from "../../../agent-sdk-types.js";
 import { OpenCodeV2Session } from "./session.js";
 import { V2_CAPABILITIES } from "./capabilities.js";
 import {
@@ -224,6 +225,8 @@ export class OpenCodeV2AgentClient implements AgentClient {
       acquire,
       moved,
       historyOnly,
+      this.options.settings?.command?.mode === "replace" ||
+        hasProviderExecutableEnvOverride(this.options.settings?.env, launch?.env),
     );
     try {
       await session.initialize(

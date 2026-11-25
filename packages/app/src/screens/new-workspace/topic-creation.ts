@@ -13,7 +13,7 @@ import type { MainDraft } from "./main-draft";
 import {
   isRejectedBoundTopicPrompt,
   isUnboundTopicWorkspace,
-  readTopicPromptReceipt,
+  isTopicPromptAccepted,
 } from "@/composer/draft/topic-receipts";
 
 export type TopicPlacement = Pick<CreateWorkspaceRequestOptions, "source" | "metadata"> & {
@@ -77,6 +77,7 @@ export type TopicCreationClient = Pick<
   "createWorkspace" | "getCreationSnapshot" | "findWorkspace" | "fetchAgentTimeline"
 > & {
   fetchAgent: (agentId: string) => Promise<FetchAgentResult | null>;
+  supportsTopicPromptRetry?: DaemonClient["supportsTopicPromptRetry"];
 };
 interface TopicEntities {
   workspace?: WorkspaceDescriptorPayload;
@@ -84,7 +85,8 @@ interface TopicEntities {
 }
 export type TopicOutcome =
   | ({ stage: "succeeded"; workspace: WorkspaceDescriptorPayload } & TopicEntities)
-  | ({ stage: "retryable" | "unconfirmed"; error?: string } & TopicEntities);
+  | ({ stage: "retryable"; retryPromptRevision?: number; error?: string } & TopicEntities)
+  | ({ stage: "unconfirmed"; updateHost?: boolean; error?: string } & TopicEntities);
 
 function matchingEntities(
   request: TopicRequest,
@@ -106,36 +108,20 @@ function matchingEntities(
   return { workspace, agent };
 }
 
-async function confirmed(
-  client: TopicCreationClient,
+function confirmed(
   request: TopicRequest,
   receipt: CreationSnapshot | null | undefined,
   entities: TopicEntities,
-  prompt?: Awaited<ReturnType<typeof readTopicPromptReceipt>>,
-): Promise<TopicOutcome | undefined> {
+): TopicOutcome | undefined {
   if (!entities.workspace) return;
   if (request.agent) {
-    if (!entities.agent || !request.agent.clientMessageId) return;
-    const started =
-      !receipt?.outcomeUnknown &&
-      (receipt?.initialPromptStarted === true || receipt?.phase === "prompt_started");
-    if (
-      !started &&
-      (prompt ??
-        (await readTopicPromptReceipt(
-          client,
-          entities.agent.id,
-          request.agent.clientMessageId,
-        ))) !== "recorded"
-    )
-      return;
-  } else {
-    if (
-      receipt?.phase !== "completed" ||
-      receipt.outcomeUnknown ||
-      (request.mainAgent && !entities.agent)
-    )
-      return;
+    if (!entities.agent || !isTopicPromptAccepted(receipt)) return;
+  } else if (
+    receipt?.phase !== "completed" ||
+    receipt.outcomeUnknown ||
+    (request.mainAgent && !entities.agent)
+  ) {
+    return;
   }
   return { ...entities, stage: "succeeded", workspace: entities.workspace };
 }
@@ -156,21 +142,11 @@ function canRetryTopic(
   snapshot: PromiseSettledResult<CreationSnapshot | null>,
   latest: CreationSnapshot | null,
   directory: PromiseSettledResult<WorkspaceDescriptorPayload | null>,
-  prompt: Awaited<ReturnType<typeof readTopicPromptReceipt>> | undefined,
 ) {
   if (snapshot.status !== "fulfilled" || directory.status !== "fulfilled") return false;
   const workspace = directory.value;
   if (!latest) return snapshot.value === null && workspace === null;
   if (!matchingReceipt(request, snapshot.value)) return false;
-  if (latest.failedStage === "prompt") {
-    const agentId = request.agent?.agentId;
-    return (
-      latest === snapshot.value &&
-      prompt === "not-found" &&
-      !!agentId &&
-      isRejectedBoundTopicPrompt(latest, workspace, request.workspaceId, agentId)
-    );
-  }
   return canRetryUnboundTopic(latest, workspace, request.workspaceId);
 }
 
@@ -181,6 +157,7 @@ function canRetryUnboundTopic(
 ) {
   if (receipt.outcomeUnknown) return false;
   const unbound = isUnboundTopicWorkspace(workspace, workspaceId);
+  if (receipt.phase === "accepted" && receipt.canResume) return !workspace;
   if (receipt.phase === "workspace_ready") return unbound && !receipt.agent && !receipt.mainAgent;
   if (receipt.outcomeUnknown !== false || receipt.phase !== "failed") return false;
   if (receipt.failedStage === "workspace") return !workspace && !receipt.workspace;
@@ -202,18 +179,25 @@ async function reconcileTopic(
   const workspace = directory.status === "fulfilled" ? directory.value : latest?.workspace;
   const agent = await readTopicAgent(client, request, workspace, latest);
   const entities = matchingEntities(request, workspace, agent);
-  const prompt =
-    latest?.failedStage === "prompt" && entities.agent && request.agent?.clientMessageId
-      ? await readTopicPromptReceipt(client, entities.agent.id, request.agent.clientMessageId)
-      : undefined;
-  const success = await confirmed(client, request, latest, entities, prompt);
+  const success = confirmed(request, latest, entities);
   if (success) return success;
+  const error = latest?.error ?? undefined;
+  const agentId = request.agent?.agentId;
+  if (
+    receipt &&
+    latest === receipt &&
+    agentId &&
+    directory.status === "fulfilled" &&
+    isRejectedBoundTopicPrompt(receipt, directory.value, request.workspaceId, agentId)
+  ) {
+    return client.supportsTopicPromptRetry?.()
+      ? { ...entities, stage: "retryable", retryPromptRevision: receipt.revision, error }
+      : { ...entities, stage: "unconfirmed", updateHost: true };
+  }
   return {
     ...entities,
-    stage: canRetryTopic(request, snapshot, latest, directory, prompt)
-      ? "retryable"
-      : "unconfirmed",
-    error: latest?.error ?? undefined,
+    stage: canRetryTopic(request, snapshot, latest, directory) ? "retryable" : "unconfirmed",
+    error,
   };
 }
 
@@ -234,25 +218,31 @@ export async function runTopicCreation(
   request: TopicRequest,
   action: "submit" | "check" | "retry",
   update?: CreationSnapshot,
+  expectedPromptRevision?: number | null,
 ): Promise<TopicOutcome> {
+  let retryPromptRevision: number | undefined;
   if (action !== "submit") {
     const outcome = await reconcileTopic(client, request, update);
     if (action === "check" || outcome.stage !== "retryable") return outcome;
+    retryPromptRevision = outcome.retryPromptRevision;
+    if (
+      expectedPromptRevision !== undefined &&
+      expectedPromptRevision !== (retryPromptRevision ?? null)
+    ) {
+      return outcome;
+    }
   }
   let error: string | undefined;
   try {
-    const response = await client.createWorkspace(request);
+    const response = await client.createWorkspace(
+      retryPromptRevision === undefined ? request : { ...request, retryPromptRevision },
+    );
     const entities = matchingEntities(
       request,
       response.workspace,
       response.agent ?? response.mainAgent,
     );
-    const success = await confirmed(
-      client,
-      request,
-      matchingReceipt(request, response.creation),
-      entities,
-    );
+    const success = confirmed(request, matchingReceipt(request, response.creation), entities);
     if (success) return success;
     error = response.error ?? undefined;
   } catch (cause) {

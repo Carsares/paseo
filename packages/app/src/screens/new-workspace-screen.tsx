@@ -209,6 +209,9 @@ import {
 } from "./workspace/terminals/state";
 import {
   captureWorkspaceDraftCleanup,
+  captureWorkspaceDraftCleanupOwner,
+  clearOwnedWorkspaceDraft,
+  saveWorkspaceDraftCleanupOwner,
   handOffDraftMetadata,
 } from "./new-workspace/background-handoff";
 import { useNewWorkspaceScreenPresence } from "./new-workspace/screen-presence";
@@ -1337,9 +1340,11 @@ function BatchResultRow({
   item,
   serverId,
   disabled,
+  retryPromptRevision,
   onAction,
 }: {
   item: MainDraftBatchItem;
+  retryPromptRevision?: number;
   serverId: string;
   disabled: boolean;
   onAction: (action: BatchAction) => Promise<void>;
@@ -1354,11 +1359,16 @@ function BatchResultRow({
       void onAction({ kind: "resume" });
       return;
     }
-    void onAction({
-      kind: item.stage === "retryable" ? "retry" : "check",
-      workspaceId: item.workspaceId,
-    });
-  }, [item.stage, item.workspaceId, onAction]);
+    void onAction(
+      item.stage === "retryable"
+        ? {
+            kind: "retry",
+            workspaceId: item.workspaceId,
+            retryPromptRevision: retryPromptRevision ?? null,
+          }
+        : { kind: "check", workspaceId: item.workspaceId },
+    );
+  }, [item.stage, item.workspaceId, onAction, retryPromptRevision]);
   let actionLabel = t("newWorkspace.batch.check");
   if (item.stage === "queued") actionLabel = t("newWorkspace.batch.resume");
   if (item.stage === "retryable") actionLabel = t("common.actions.retry");
@@ -1401,10 +1411,12 @@ function WorkspaceMainBatchResults({
   currentServerId,
   canRun,
   pending,
+  batchPromptRevisions,
   onAction,
   onFinish,
 }: {
   draft: MainDraft | null;
+  batchPromptRevisions: WorkspaceDraftTitle["batchPromptRevisions"];
   currentServerId: string;
   canRun: boolean;
   pending: boolean;
@@ -1429,6 +1441,7 @@ function WorkspaceMainBatchResults({
           item={item}
           serverId={serverId}
           disabled={disabled}
+          retryPromptRevision={batchPromptRevisions?.[item.workspaceId]}
           onAction={onAction}
         />
       ))}
@@ -2352,6 +2365,11 @@ function NewWorkspaceForm({
         action,
         client: withConnectedClient(),
         save: (batch) => saveMainDraft({ ...draft, batch }, true),
+        savePromptRevision: (workspaceId, revision) =>
+          useWorkspaceDraftSubmissionStore
+            .getState()
+            .saveBatchPromptRevision(creationDraftId, workspaceId, revision),
+        updateHostMessage: t("topicWorkbench.updateHost"),
         acceptSnapshots: acceptWorkspaceMainSnapshots,
         assertSupported: () => {
           if (draft.batch?.items[0]?.placement.topic && !supportsTopic) {
@@ -2425,6 +2443,13 @@ function NewWorkspaceForm({
     };
   }, [batchReceiptKeys, client, clientReady, refreshTopicBatchItem]);
 
+  const workspaceDraftCleanup = () => ({
+    draftId: creationDraftId,
+    draftKey,
+    draftContextScopeKey,
+    clearDraft: chatDraft.clear,
+  });
+
   const finishWorkspaceMainBatch = useStableEvent(async () => {
     if (
       pendingExplicitMainSubmissions.has(creationDraftId) ||
@@ -2432,19 +2457,13 @@ function NewWorkspaceForm({
     )
       return;
     pendingExplicitMainSubmissions.add(creationDraftId);
-    const clearConsumedDraft = captureWorkspaceDraftCleanup({
-      draftId: creationDraftId,
-      draftKey,
-      draftContextScopeKey,
-      clearDraft: chatDraft.clear,
-    });
     try {
       await withMainDraftOperation(creationDraftId, async () => {
         const saved = await readMainDraft(creationDraftId);
         if (!saved?.batch?.items.every((item) => item.stage === "succeeded")) return;
+        await clearOwnedWorkspaceDraft(creationDraftId, workspaceDraftCleanup()).catch(() => {});
         await useWorkspaceDraftSubmissionStore.getState().finishDraftTitle(creationDraftId);
         await writeMainDraft(creationDraftId, null, { finishBatch: true });
-        clearConsumedDraft();
       });
     } catch (error) {
       setErrorMessage(toErrorMessage(error));
@@ -2458,6 +2477,7 @@ function NewWorkspaceForm({
       payload: MessagePayload,
       draft: MainDraft,
       topic?: NonNullable<ReturnType<typeof readTopicFields>>,
+      cleanupOwner?: string,
     ) => {
       const blocked = workspaceBatchBlock({
         isolation: draft.target.isolation,
@@ -2500,6 +2520,7 @@ function NewWorkspaceForm({
       });
       assertBatchSupported();
       const planned = { target: draft.target, batch };
+      await saveWorkspaceDraftCleanupOwner(creationDraftId, cleanupOwner);
       await saveMainDraft(planned, true);
       leaveFullscreen();
       const saved = await readMainDraft(creationDraftId);
@@ -2508,26 +2529,26 @@ function NewWorkspaceForm({
   );
 
   const runSavedTopic = useStableEvent(
-    async (draft: MainDraft, action: "submit" | "check" | "retry", update?: CreationSnapshot) => {
+    async (
+      draft: MainDraft,
+      action: "submit" | "check" | "retry",
+      update?: CreationSnapshot,
+      retryPromptRevision?: number | null,
+    ) => {
       if (!draft.topicAttempt || draft.target.serverId !== selectedServerId) return false;
       if (action !== "check" && !supportsTopic) throw new Error(t("topicWorkbench.updateHost"));
-      const clearConsumedDraft = captureWorkspaceDraftCleanup({
-        draftId: creationDraftId,
-        draftKey,
-        draftContextScopeKey,
-        clearDraft: chatDraft.clear,
-      });
       const outcome = await runTopicCreation(
         withConnectedClient(),
         draft.topicAttempt,
         action,
         update,
+        retryPromptRevision,
       );
       setTopicOutcome(outcome);
       if (outcome.workspace) acceptWorkspaceMainSnapshots(outcome.workspace, outcome.agent);
       if (outcome.stage !== "succeeded") return false;
 
-      clearConsumedDraft();
+      await clearOwnedWorkspaceDraft(creationDraftId, workspaceDraftCleanup()).catch(() => {});
       if (isStillOnCreateScreen()) {
         leaveFullscreen();
         navigateToWorkspace({
@@ -2563,7 +2584,7 @@ function NewWorkspaceForm({
   );
 
   const submitNewTopic = useStableEvent(
-    async (saved: MainDraft | null, question?: MessagePayload) => {
+    async (saved: MainDraft | null, question?: MessagePayload, cleanupOwner?: string) => {
       if (!supportsTopic) throw new Error(t("topicWorkbench.updateHost"));
       const fields = await useWorkspaceDraftSubmissionStore
         .getState()
@@ -2580,6 +2601,7 @@ function NewWorkspaceForm({
           prompt ?? { cwd: mainTarget.directory, text: "", attachments: [] },
           armed,
           frozenFields,
+          prompt ? cleanupOwner : undefined,
         );
         return;
       }
@@ -2592,6 +2614,10 @@ function NewWorkspaceForm({
         main,
       );
       const draft = { target: mainTarget, topicAttempt: request };
+      await saveWorkspaceDraftCleanupOwner(
+        creationDraftId,
+        request.agent ? cleanupOwner : undefined,
+      );
       await saveMainDraft(draft, true);
       await runSavedTopic(draft, "submit");
     },
@@ -2603,15 +2629,23 @@ function NewWorkspaceForm({
       pendingExplicitMainSubmissions.add(creationDraftId);
       setPendingAction("chat");
       setErrorMessage(null);
+      const cleanupOwner =
+        question && !isEmptyWorkspaceSubmission(question)
+          ? captureWorkspaceDraftCleanupOwner(workspaceDraftCleanup())
+          : undefined;
       try {
         await withMainDraftOperation(creationDraftId, async () => {
           const saved = await readMainDraft(creationDraftId);
           if (saved?.topicAttempt) {
-            await runSavedTopic(saved, action === "submit" ? "check" : action);
+            const revision =
+              topicOutcome?.stage === "retryable"
+                ? (topicOutcome.retryPromptRevision ?? null)
+                : null;
+            await runSavedTopic(saved, action === "submit" ? "check" : action, undefined, revision);
             return;
           }
           if (action !== "submit" || saved?.batch || saved?.attempt) return;
-          await submitNewTopic(saved, question);
+          await submitNewTopic(saved, question, cleanupOwner);
         });
       } catch (error) {
         setErrorMessage(
@@ -2736,6 +2770,11 @@ function NewWorkspaceForm({
       }
       pendingExplicitMainSubmissions.add(creationDraftId);
       setPendingAction("chat");
+      const cleanupOwner = captureWorkspaceDraftCleanupOwner({
+        draftId: creationDraftId,
+        draftKey,
+        draftContextScopeKey,
+      });
       try {
         await withMainDraftOperation(creationDraftId, async () => {
           const saved = restoreMainDraftAtTarget(
@@ -2745,7 +2784,7 @@ function NewWorkspaceForm({
           if (saved?.batch) return;
           if (!saved?.attempt && saved?.models && saved.models.length > 1) {
             if (!canCreate) throw new Error(workspaceMainBlockMessage(t, "unknown"));
-            await startWorkspaceMainBatch(payload, saved);
+            await startWorkspaceMainBatch(payload, saved, undefined, cleanupOwner);
           } else {
             await submitExplicitMain(payload, draft.target);
           }
@@ -2755,7 +2794,16 @@ function NewWorkspaceForm({
         setPendingAction(null);
       }
     },
-    [creationDraftId, mainTarget, selectedServerId, startWorkspaceMainBatch, submitExplicitMain, t],
+    [
+      creationDraftId,
+      draftContextScopeKey,
+      draftKey,
+      mainTarget,
+      selectedServerId,
+      startWorkspaceMainBatch,
+      submitExplicitMain,
+      t,
+    ],
   );
 
   const handleSubmitNewWorkspace = useCallback(
@@ -3331,6 +3379,7 @@ function NewWorkspaceForm({
       >
         {isTopicMode ? topicContent : composer}
         <WorkspaceMainBatchResults
+          batchPromptRevisions={creationIdentity.batchPromptRevisions}
           draft={mainDraft}
           currentServerId={selectedServerId}
           canRun={clientReady}
@@ -3448,6 +3497,8 @@ function TopicCreationContent({
     let status = t("topicWorkbench.unconfirmed");
     if (pending) status = t("topicWorkbench.preparing");
     else if (retry) status = t("topicWorkbench.failed");
+    else if (outcome?.stage === "unconfirmed" && outcome.updateHost)
+      status = t("topicWorkbench.updateHost");
     else if (attempt.agent && workspaceId) status = t("topicWorkbench.promptUnconfirmed");
     return (
       <View style={styles.topicRecovery}>

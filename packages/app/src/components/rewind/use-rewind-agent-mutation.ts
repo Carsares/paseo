@@ -1,9 +1,9 @@
 import { planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
-import { createElement, useCallback, useMemo } from "react";
+import { createElement, useCallback, useMemo, type ReactElement } from "react";
 import { useTranslation } from "react-i18next";
 import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useToast } from "@/contexts/toast-context";
-import { useFetchQuery } from "@/data/query";
+import { useFetchQuery, useReplicaQuery } from "@/data/query";
 import { useHostFeature } from "@/runtime/host-features";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { RewindMode } from "./use-rewind-capabilities";
@@ -13,7 +13,11 @@ import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import { useCheckpointCopy } from "@/git/diff-checkpoint-copy";
 import { invalidateCheckoutGitQueriesForClient } from "@/git/query-keys";
 import { rewindCheckpointQueryKey } from "@/hooks/use-rewind-checkpoint";
-import { RewindFileRetry } from "./rewind-file-retry";
+import {
+  RewindFileLookupRetry,
+  RewindFileRetry,
+  UnconfirmedRewindFileNotice,
+} from "./rewind-file-retry";
 
 interface UseRewindAgentMutationInput {
   serverId?: string;
@@ -31,6 +35,11 @@ interface RewindAgentInput {
 
 const pendingFilesKey = (serverId?: string, agentId?: string) =>
   ["agent-rewind-pending-files", serverId, agentId] as const;
+const knownPendingKey = (serverId?: string, agentId?: string) =>
+  ["agent-rewind-known-pending-files", serverId, agentId] as const;
+type PendingFiles = Awaited<ReturnType<DaemonClient["getPendingAgentRewindFiles"]>>;
+type FileRecovery = Awaited<ReturnType<DaemonClient["getAgentRewindFileRecovery"]>>;
+type KnownPending = PendingFiles[number] & { detail: string | null };
 
 export function useRewindAgentMutation(input: UseRewindAgentMutationInput): {
   rewindAgent: (input: RewindAgentInput) => Promise<void>;
@@ -66,16 +75,33 @@ export function useRewindAgentMutation(input: UseRewindAgentMutationInput): {
       }
       const retryMutation = queryClient.getMutationCache().build(queryClient, {
         mutationKey,
-        mutationFn: () => client.retryAgentRewindFiles({ agentId, operationId }),
+        mutationFn: async () => {
+          const result = await client.retryAgentRewindFiles({ agentId, operationId });
+          if (!result.ok || result.operation?.status !== "files_restored") {
+            throw new Error(result.error ?? copy.fileRewindFailed);
+          }
+          const key = pendingFilesKey(serverId, agentId);
+          await queryClient.cancelQueries({ queryKey: key, exact: true });
+          queryClient.setQueryData<FileRecovery>(
+            key,
+            (recovery) =>
+              recovery && {
+                ...recovery,
+                pendingFiles: recovery.pendingFiles.filter(
+                  (file) => file.operationId !== operationId,
+                ),
+              },
+          );
+          queryClient.setQueryData<KnownPending[]>(knownPendingKey(serverId, agentId), (files) =>
+            files?.filter((file) => file.operationId !== operationId),
+          );
+        },
         onSettled: () => {
           refreshCheckout();
           refreshPendingFiles();
         },
       });
-      const result = await retryMutation.execute(undefined);
-      if (!result.ok || result.operation?.status !== "files_restored") {
-        throw new Error(result.error ?? copy.fileRewindFailed);
-      }
+      await retryMutation.execute(undefined);
       toast.show(copy.filesRestored, { variant: "success" });
     },
     [
@@ -126,9 +152,17 @@ export function useRewindAgentMutation(input: UseRewindAgentMutationInput): {
       });
       const { operation } = response;
       refreshCheckout();
-      if (operation?.conversationRewound) await refreshConversation();
       if (operation?.status === "files_pending") {
-        if (client.supportsPendingRewindFiles()) return;
+        if (client.supportsPendingRewindFiles()) {
+          const { operationId, conversationRewound } = operation;
+          queryClient.setQueryData<KnownPending[]>(knownPendingKey(serverId, agentId), (files) => [
+            ...(files ?? []).filter((file) => file.operationId !== operationId),
+            { operationId, conversationRewound, detail: response.error },
+          ]);
+          if (conversationRewound) await refreshConversation();
+          return;
+        }
+        if (operation.conversationRewound) await refreshConversation();
         // COMPAT(rewindPendingFiles): added in v0.18.0, remove the toast after 2027-06-01.
         toast.show(
           createElement(RewindFileRetry, {
@@ -140,6 +174,7 @@ export function useRewindAgentMutation(input: UseRewindAgentMutationInput): {
         );
         return;
       }
+      if (operation?.conversationRewound) await refreshConversation();
       if (!response.ok || operation?.status !== "files_restored") {
         throw new Error(response.error ?? t("rewind.errors.failed"));
       }
@@ -175,6 +210,10 @@ export function usePendingRewindFileRecovery(
   const { serverId, agentId, client } = input;
   const supported = useHostFeature(serverId, "rewindPendingFiles");
   const enabled = input.enabled && supported && Boolean(agentId && client);
+  const known = useReplicaQuery<KnownPending[]>({
+    queryKey: knownPendingKey(serverId, agentId),
+    pushEvent: "agent.rewind.checkpoint.restore.response",
+  });
   const pending = useFetchQuery({
     queryKey: pendingFilesKey(serverId, agentId),
     dataShape: "value",
@@ -183,20 +222,41 @@ export function usePendingRewindFileRecovery(
     queryFn: async ({ signal }) => {
       if (!client || !agentId) throw new Error("Pending file restores are unavailable");
       signal.throwIfAborted();
-      const files = await client.getPendingAgentRewindFiles(agentId);
+      const recovery = await client.getAgentRewindFileRecovery(agentId);
       signal.throwIfAborted();
-      return files;
+      return recovery;
     },
     retry: false,
   });
   const { retryFiles } = useRewindAgentMutation(input);
-  if (!enabled || !pending.isSuccess) return null;
-  return pending.data.map(({ operationId, conversationRewound }) =>
-    createElement(RewindFileRetry, {
-      key: operationId,
-      conversationRewound,
-      detail: null,
-      retry: () => retryFiles(operationId),
-    }),
+  if (!enabled) return null;
+  const files = new Map<string, KnownPending>();
+  for (const file of pending.data?.pendingFiles ?? []) {
+    files.set(file.operationId, { ...file, detail: null });
+  }
+  for (const file of known.data ?? []) files.set(file.operationId, file);
+  const unconfirmed = pending.data?.unconfirmedFileRewinds ?? [];
+  for (const { operationId } of unconfirmed) files.delete(operationId);
+  const notices: ReactElement[] = [...files.values()].map(
+    ({ operationId, conversationRewound, detail }) =>
+      createElement(RewindFileRetry, {
+        key: operationId,
+        conversationRewound,
+        detail,
+        retry: () => retryFiles(operationId),
+      }),
   );
+  for (const { operationId } of unconfirmed) {
+    notices.push(createElement(UnconfirmedRewindFileNotice, { key: operationId }));
+  }
+  if (pending.isError) {
+    notices.push(
+      createElement(RewindFileLookupRetry, {
+        key: "pending-files-lookup",
+        pending: pending.isFetching,
+        retry: () => void pending.refetch(),
+      }),
+    );
+  }
+  return notices;
 }

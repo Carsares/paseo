@@ -55,7 +55,15 @@ import {
 import { updatedForNewAgents } from "../update-command.js";
 import { runProviderRefreshActivity } from "../../provider-refresh-deadline.js";
 import { currentCustomProviderLaunch } from "../../scoped-custom-provider-launch.js";
-import { findInstallationLaunchPath } from "../../provider-installation/installation-target.js";
+import {
+  findInstallationLaunchPath,
+  inspectDiscoveredFiles,
+  readInstalledNodePackageVersion,
+} from "../../provider-installation/installation-target.js";
+import {
+  discoveredReleaseCheck,
+  type StaticCatalogMetadata,
+} from "../../provider-installation/provider-installations.js";
 import { createExternalProcessEnv } from "../../../paseo-env.js";
 import { runProviderTurn } from "../provider-runner.js";
 import {
@@ -2652,6 +2660,7 @@ export class PiRpcAgentClient implements AgentClient {
   private readonly runtimeSettings?: ProviderRuntimeSettings;
   private readonly runtime?: PiRuntime;
   private readonly usagePollScheduler?: PiUsagePollScheduler;
+  private readonly lookupLatestRelease: LatestReleaseLookup;
 
   constructor(options: PiRpcAgentClientOptions) {
     this.provider = PI_PROVIDER;
@@ -2660,7 +2669,7 @@ export class PiRpcAgentClient implements AgentClient {
     this.runtimeSettings = options.runtimeSettings;
     this.runtime = options.runtime;
     this.usagePollScheduler = options.usagePollScheduler;
-    const lookup = options.lookupLatestRelease ?? lookupLatestPiRelease;
+    this.lookupLatestRelease = options.lookupLatestRelease ?? lookupLatestPiRelease;
     this.installation = createCliInstallation({
       name: "Pi",
       defaultBinary: PI_BINARY_COMMAND,
@@ -2671,7 +2680,7 @@ export class PiRpcAgentClient implements AgentClient {
       checkForUpdates: async ({ cli, installedVersion, signal }) =>
         compareWithLatestRelease({
           installed: installedVersion,
-          latest: await lookup({ executablePath: cli.command, signal }),
+          latest: await this.lookupLatestRelease({ executablePath: cli.command, signal }),
         }),
       // `--self` updates Pi itself and leaves installed Pi packages alone.
       update: { args: ["update", "--self"], successMessage: updatedForNewAgents("Pi") },
@@ -2846,7 +2855,7 @@ export class PiRpcAgentClient implements AgentClient {
   async fetchCatalog(
     options: FetchCatalogOptions,
     context?: ProviderRefreshContext,
-  ): Promise<ProviderCatalog> {
+  ): Promise<ProviderCatalog & StaticCatalogMetadata> {
     const scope = currentCustomProviderLaunch();
     if (scope && this.runtime) throw new Error("Custom CLI discovery launch is unsupported");
     const signal =
@@ -2891,7 +2900,13 @@ export class PiRpcAgentClient implements AgentClient {
         if (isConfigured) mapped.isDefault = true;
         return mapped;
       });
-      return { models, modes: [] };
+      const installation =
+        scope?.adapter === "pi" && options.scope === "global"
+          ? await runProviderRefreshActivity(context, "installation", () =>
+              this.readDiscoveredInstallation(scope),
+            )
+          : {};
+      return { models, modes: [], ...installation };
     } catch (error) {
       // oxlint-disable-next-line eslint/preserve-caught-error -- Child output can contain secrets.
       if (scope) throw new Error("Custom CLI discovery failed");
@@ -3024,6 +3039,41 @@ export class PiRpcAgentClient implements AgentClient {
     } finally {
       await runtimeSession.close().catch(() => undefined);
     }
+  }
+
+  private async readDiscoveredInstallation(
+    scope: NonNullable<ReturnType<typeof currentCustomProviderLaunch>>,
+  ): Promise<StaticCatalogMetadata> {
+    // The authorized RPC suffix is --mode rpc --no-session. Extra launcher arguments
+    // may select a different program than the executable identified by the package.
+    if (!scope.active || scope.argv.length !== 4) return {};
+    const executablePath = scope.files.find(({ file }) => file === scope.file)?.real;
+    if (!executablePath) return {};
+    const currentPackage = "@earendil-works/pi-coding-agent";
+    const legacyPackage = "@mariozechner/pi-coding-agent";
+    const currentVersion = await readInstalledNodePackageVersion(executablePath, currentPackage);
+    const packageName = currentVersion ? currentPackage : legacyPackage;
+    const readVersion = () => readInstalledNodePackageVersion(executablePath, packageName);
+    const installedVersion = currentVersion ?? (await readVersion());
+    if (!installedVersion) return {};
+    return {
+      installedVersion,
+      [discoveredReleaseCheck]: {
+        inspectFiles: async () => {
+          const status = await inspectDiscoveredFiles(scope.files);
+          if (status !== "current") return status;
+          return (await readVersion()) === installedVersion ? "current" : "changed";
+        },
+        ...(currentVersion &&
+          /^\d+\.\d+\.\d+$/u.test(currentVersion) && {
+            run: async (signal: AbortSignal) =>
+              compareWithLatestRelease({
+                installed: installedVersion,
+                latest: await this.lookupLatestRelease({ executablePath, signal }),
+              }),
+          }),
+      },
+    };
   }
 
   private async resolvePiLaunch(): Promise<ResolvedProviderLaunch> {

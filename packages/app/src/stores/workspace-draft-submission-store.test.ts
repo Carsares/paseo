@@ -508,3 +508,19 @@ test.each([undefined, "explicit"])(
     if (!forkDraftId) expect(reopened).not.toBe(id);
   },
 );
+
+test("a reopened creation keeps the original cleanup ownership and retry revision", async () => {
+  const storage = createStorage();
+  const { createWorkspaceDraftSubmissionStore } = loadProductionStores();
+  const writer = createWorkspaceDraftSubmissionStore(storage);
+  const createWorktreeSlug = () => "workspace";
+  const id = await writer.getState().openDraftTitle({ createWorktreeSlug });
+  await writer.getState().saveDraftCleanupOwner(id, "owner-at-submission");
+  await writer.getState().saveBatchPromptRevision(id, "wks_1", 5);
+  const reader = createWorkspaceDraftSubmissionStore(storage);
+  await reader.getState().openDraftTitle({ creationDraftId: id, createWorktreeSlug });
+  expect(await reader.getState().readDraftCleanupOwner(id)).toBe("owner-at-submission");
+  expect(reader.getState().titlesById[id]?.batchPromptRevisions).toEqual({ wks_1: 5 });
+  const another = await reader.getState().openDraftTitle({ createWorktreeSlug });
+  expect(await reader.getState().readDraftCleanupOwner(another)).toBeUndefined();
+});

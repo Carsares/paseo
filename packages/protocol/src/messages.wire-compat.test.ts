@@ -559,6 +559,11 @@ test("checkpoint pending file recovery is optional and does not require an origi
   for (const payload of [
     { ...base, target: { messageId: "original-message", checkpointId: "checkpoint" } },
     { ...base, pendingFiles: [{ operationId: "operation", conversationRewound: true }] },
+    {
+      ...base,
+      pendingFiles: [{ operationId: "operation", conversationRewound: true }],
+      unconfirmedFileRewinds: [{ operationId: "unconfirmed" }],
+    },
   ]) {
     const message = { type: "agent.rewind.checkpoint.get.response", payload };
     const response = { type: "session", message };
@@ -1310,4 +1315,72 @@ test("speech config reads remain compatible with clients before features and fut
       features: { voiceMode: { stt: { provider: "future", region: "eu" } } },
     }).features?.voiceMode?.stt,
   ).toEqual({ provider: "future", region: "eu" });
+});
+
+test("topic first question retries and idle creation receipts extend both wire directions", () => {
+  const agent = {
+    type: "agent.create.request",
+    requestId: "agent-action",
+    labels: {},
+    config: { provider: "codex", cwd: "/tmp/topic" },
+    workspaceRole: "main",
+    idempotencyKey: "initial",
+  };
+  const workspace = {
+    type: "workspace.create.request",
+    requestId: "workspace-action",
+    source: { kind: "directory", path: "/tmp/topic" },
+    title: "Topic",
+    topic: { summary: null, hideFromModel: false },
+    idempotencyKey: "initial",
+  };
+  for (const request of [agent, workspace]) {
+    expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+    expect(SessionInboundMessageSchema.parse({ ...request, retryPromptRevision: 4 })).toEqual({
+      ...request,
+      retryPromptRevision: 4,
+    });
+    expect(
+      SessionInboundMessageSchema.safeParse({ ...request, retryPromptRevision: -1 }).success,
+    ).toBe(false);
+  }
+  expect(
+    AgentCreateRequestSchema.omit({ retryPromptRevision: true }).parse({
+      ...agent,
+      retryPromptRevision: 4,
+    }),
+  ).toEqual(agent);
+  expect(
+    WorkspaceCreateRequestSchema.omit({ retryPromptRevision: true }).parse({
+      ...workspace,
+      retryPromptRevision: 4,
+    }),
+  ).toEqual(workspace);
+  const receipt = {
+    kind: "workspace",
+    phase: "accepted",
+    idempotencyKey: "initial",
+    revision: 0,
+    error: null,
+    workspaceId: "wks_1234567890abcdef",
+    agentId: null,
+  };
+  const idle = { ...receipt, canResume: true };
+  expect(CreationSnapshotSchema.parse(receipt)).toEqual(receipt);
+  expect(CreationSnapshotSchema.parse(idle)).toEqual(idle);
+  expect(CreationSnapshotSchema.omit({ canResume: true }).parse(idle)).toEqual(receipt);
+  const priorHost = {
+    status: "server_info",
+    serverId: "old",
+    features: { topicWorkbenchV1: true },
+  };
+  expect(
+    ServerInfoStatusPayloadSchema.parse(priorHost).features?.topicPromptRetryV1,
+  ).toBeUndefined();
+  expect(
+    ServerInfoStatusPayloadSchema.parse({
+      ...priorHost,
+      features: { ...priorHost.features, topicPromptRetryV1: true },
+    }).features?.topicPromptRetryV1,
+  ).toBe(true);
 });

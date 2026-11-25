@@ -144,18 +144,22 @@ export async function prepareWorkspaceMainBatch(input: {
   return { items, message };
 }
 
-export async function runWorkspaceMainBatch(input: {
+interface RunWorkspaceMainBatchInput {
   batch: MainDraftBatch;
   action:
     | { kind: "resume" }
     | { kind: "check"; workspaceId: string; update?: CreationSnapshot }
-    | { kind: "retry"; workspaceId: string };
+    | { kind: "retry"; workspaceId: string; retryPromptRevision?: number | null };
   client: FixedMainInput["client"] & TopicCreationClient;
   save: (batch: MainDraftBatch) => Promise<void>;
+  savePromptRevision?: (workspaceId: string, revision: number | undefined) => Promise<void>;
+  updateHostMessage?: string;
   acceptSnapshots: FixedMainInput["acceptSnapshots"];
   assertSupported: () => void;
   failedMessage: string;
-}): Promise<void> {
+}
+
+export async function runWorkspaceMainBatch(input: RunWorkspaceMainBatchInput): Promise<void> {
   const { action, client, save, acceptSnapshots, assertSupported, failedMessage } = input;
   let batch = input.batch;
   const failures: unknown[] = [];
@@ -176,39 +180,7 @@ export async function runWorkspaceMainBatch(input: {
       };
       const { topic, title } = item.placement;
       if (topic && title) {
-        if (item.stage === "queued" && action.kind === "check") continue;
-        assertSupported();
-        const request = topicRequest(
-          { ...item.placement, title, topic },
-          { workspaceId: item.workspaceId, idempotencyKey: item.agentId },
-          {
-            config: item.config,
-            prompt: {
-              ...batch.message,
-              agentId: item.agentId,
-              clientMessageId: item.clientMessageId,
-            },
-          },
-        );
-        let operation: "submit" | "retry" | "check" = "check";
-        if (item.stage === "queued") operation = "submit";
-        else if (action.kind === "retry") operation = "retry";
-        if (operation !== "check") await saveItem({ ...item, stage: "sending" });
-        const outcome = await runTopicCreation(
-          client,
-          request,
-          operation,
-          action.kind === "check" ? action.update : undefined,
-        );
-        if (outcome.workspace) acceptSnapshots(outcome.workspace, outcome.agent);
-        await saveItem({
-          ...item,
-          stage: outcome.stage,
-          agentReady: Boolean(outcome.agent),
-          workspaceReady: Boolean(outcome.workspace),
-          topicMainAgentId: outcome.agent?.id,
-          error: outcome.stage === "succeeded" ? undefined : outcome.error,
-        });
+        await runTopicBatchItem(input, item, { ...item.placement, topic, title }, saveItem);
         continue;
       }
       await createOrRetryWorkspaceMain({
@@ -226,6 +198,55 @@ export async function runWorkspaceMainBatch(input: {
     }
   }
   if (failures.length > 0) throw failures[0];
+}
+
+async function runTopicBatchItem(
+  input: RunWorkspaceMainBatchInput,
+  item: MainDraftBatchItem,
+  placement: Parameters<typeof topicRequest>[0],
+  saveItem: (item: MainDraftBatchItem) => Promise<void>,
+) {
+  const { action, client, assertSupported, acceptSnapshots } = input;
+  if (item.stage === "queued" && action.kind === "check") return;
+  assertSupported();
+  const request = topicRequest(
+    placement,
+    { workspaceId: item.workspaceId, idempotencyKey: item.agentId },
+    {
+      config: item.config,
+      prompt: {
+        ...input.batch.message,
+        agentId: item.agentId,
+        clientMessageId: item.clientMessageId,
+      },
+    },
+  );
+  let operation: "submit" | "retry" | "check" = "check";
+  if (item.stage === "queued") operation = "submit";
+  else if (action.kind === "retry") operation = "retry";
+  if (operation !== "check") await saveItem({ ...item, stage: "sending" });
+  const outcome = await runTopicCreation(
+    client,
+    request,
+    operation,
+    action.kind === "check" ? action.update : undefined,
+    action.kind === "retry" ? action.retryPromptRevision : undefined,
+  );
+  await input.savePromptRevision?.(
+    item.workspaceId,
+    outcome.stage === "retryable" ? outcome.retryPromptRevision : undefined,
+  );
+  if (outcome.workspace) acceptSnapshots(outcome.workspace, outcome.agent);
+  let error = outcome.stage === "succeeded" ? undefined : outcome.error;
+  if (outcome.stage === "unconfirmed" && outcome.updateHost) error = input.updateHostMessage;
+  await saveItem({
+    ...item,
+    stage: outcome.stage,
+    agentReady: Boolean(outcome.agent),
+    workspaceReady: Boolean(outcome.workspace),
+    topicMainAgentId: outcome.agent?.id,
+    error,
+  });
 }
 
 export function workspaceMainBatchAgentTarget(serverId: string, item: MainDraftBatchItem) {

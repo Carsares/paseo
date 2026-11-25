@@ -25,6 +25,7 @@ export interface TopicPromptRetry {
   fingerprint: string;
 }
 interface CreationRecovery {
+  isTopicPromptBound?: (agentId: string, workspaceId: string) => Promise<boolean>;
   readTopicWorkspace?: (workspaceId: string) => Promise<{
     workspace: WorkspaceDescriptorPayload;
     setupSkippedReason?: string;
@@ -59,6 +60,7 @@ interface CreationRequest extends CreationRecovery {
     onReady: (agent: AgentSnapshotPayload) => Promise<void>,
     mainAgent: AgentSnapshotPayload | null | undefined,
   ) => Promise<CreatedAgent>;
+  retryPromptRevision?: number;
   retryTopicPrompt?: (target: TopicPromptRetry) => Promise<void>;
 }
 export type CreationInput = CreationRequest &
@@ -108,24 +110,25 @@ export class CreationService {
         throw new Error(`${input.kind}_request_key_conflict`);
       const running = pending ?? activeOnRead ?? this.active.get(identity);
       if (running && record) return { completion: running, snapshot: record.snapshot };
-      if (record?.snapshot.phase === "completed") await this.validateCompleted(record.snapshot);
-      if (record) await this.reconcileTopic(identity, record, input);
-      if (record?.inFlight === "mainAgent") {
-        await this.recoverMainAgent(identity, record, input);
-      }
-      if (record) await this.markInterruptedUnknown(identity, record);
-      if (record && isSettled(record)) {
-        const snapshot = record.snapshot;
-        const retry = await this.prepareTopicPromptRetry(record, input);
-        const settled = record;
-        return {
-          snapshot,
-          completion: retry
-            ? this.start(identity, () => this.retryTopicPrompt(identity, settled, input, retry))
-            : Promise.resolve(snapshot),
-        };
+      if (record) {
+        await this.reconcileAdmission(identity, record, input);
+        if (isSettled(record) || input.retryPromptRevision !== undefined) {
+          const snapshot = record.snapshot;
+          const retry = await this.prepareTopicPromptRetry(record, input);
+          const settled = record;
+          return {
+            snapshot,
+            completion: retry
+              ? this.start(identity, () => this.retryTopicPrompt(identity, settled, input, retry))
+              : Promise.resolve(snapshot),
+          };
+        }
       }
       if (!record) {
+        // A retry only authorizes the named refusal, never a new creation.
+        if (input.retryPromptRevision !== undefined) {
+          throw new Error("The first question has no saved creation receipt.");
+        }
         record = initialRecord(input, fingerprint);
         // Persist identity before claiming resources. A failed admission can only retry these IDs.
         await this.write(identity, record);
@@ -155,6 +158,15 @@ export class CreationService {
     }
   }
 
+  private async reconcileAdmission(identity: string, record: Record, input: CreationInput) {
+    if (record.snapshot.phase === "completed") await this.validateCompleted(record.snapshot);
+    await this.reconcileTopic(identity, record, input);
+    if (record.inFlight === "mainAgent" && input.retryPromptRevision === undefined) {
+      await this.recoverMainAgent(identity, record, input);
+    }
+    await this.markInterruptedUnknown(identity, record);
+  }
+
   async subscribe(
     kind: CreationSnapshot["kind"],
     key: string,
@@ -172,9 +184,22 @@ export class CreationService {
           await this.reconcileTopic(identity, record, recovery);
           await this.markInterruptedUnknown(identity, record);
         }
-        return record;
+        if (!record) return null;
+        const { snapshot } = record;
+        if (
+          !this.active.has(identity) &&
+          !record.inFlight &&
+          !snapshot.agent &&
+          !snapshot.mainAgent &&
+          (snapshot.phase === "accepted" ||
+            (snapshot.phase === "workspace_ready" &&
+              snapshot.workspace?.topic?.mainAgentId === null))
+        ) {
+          return { ...snapshot, canResume: true };
+        }
+        return snapshot;
       });
-      return { snapshot: observation?.snapshot ?? null, unsubscribe };
+      return { snapshot: observation, unsubscribe };
     } catch (error) {
       unsubscribe();
       throw error;
@@ -188,6 +213,7 @@ export class CreationService {
       phase: "failed",
       failedStage: inFlight,
       outcomeUnknown: true,
+      ...(inFlight === "prompt" ? { initialPromptStarted: undefined } : {}),
       error: `${snapshot.kind}_request_outcome_unknown`,
     });
   }
@@ -210,9 +236,13 @@ export class CreationService {
 
   private async prepareTopicPromptRetry(record: Record, input: CreationInput) {
     const retry = input.retryTopicPrompt;
-    if (!retry) return;
+    if (!retry || input.retryPromptRevision !== record.snapshot.revision) return;
     const target = rejectedTopicPromptTarget(record);
-    if (target && (await this.readPromptOutcome(record, input)) === "absent") {
+    if (
+      target &&
+      (await this.isTopicPromptBound(record.snapshot, input)) &&
+      (await this.readPromptOutcome(record, input)) === "absent"
+    ) {
       return () => retry(target);
     }
   }
@@ -296,9 +326,7 @@ export class CreationService {
           record.snapshot.mainAgent,
         );
         if (isTopicPrompt(record) && input.hasPrompt) {
-          const outcome = initialPromptStarted
-            ? "accepted"
-            : await this.readPromptOutcome(record, input);
+          const outcome = await this.readPromptOutcome(record, input, initialPromptStarted);
           await this.recordTopicPrompt(identity, record, agent, outcome);
           if (!record.snapshot.initialPromptStarted) return record.snapshot;
         } else {
@@ -562,7 +590,7 @@ export class CreationService {
       !promptReceiptFingerprint
     )
       return false;
-    const agent = await recovery?.readMainAgent?.(agentId, workspaceId);
+    const agent = await recovery?.readMainAgent?.(agentId, workspaceId).catch(() => null);
     if (!agent) return false;
     const outcome = await recovery?.readPromptOutcome?.(
       agentId,
@@ -587,7 +615,9 @@ export class CreationService {
       return true;
     }
     // The runner waits for the agent-ready checkpoint before attempting the prompt.
-    const unknown = outcome === "unknown";
+    const unknown =
+      outcome !== "absent" ||
+      !(await this.isTopicPromptBound(withReadyAgent(record.snapshot, agent), recovery));
     await this.publish(
       identity,
       record,
@@ -612,11 +642,17 @@ export class CreationService {
     record: Record,
     recovery?: CreationRecovery,
   ): Promise<void> {
-    const outcome = record.snapshot.initialPromptStarted
-      ? "accepted"
-      : await this.readPromptOutcome(record, recovery);
+    const outcome = await this.readPromptOutcome(
+      record,
+      recovery,
+      record.snapshot.initialPromptStarted,
+    );
     if (outcome !== "accepted") {
-      if (outcome === "unknown" && isRejectedTopicPrompt(record)) {
+      const bound =
+        outcome === "absent" && (await this.isTopicPromptBound(record.snapshot, recovery));
+      if (bound && !isRejectedTopicPrompt(record)) {
+        await this.recordTopicPrompt(identity, record, record.snapshot.agent!, "absent");
+      } else if (!bound && isRejectedTopicPrompt(record)) {
         await this.publish(
           identity,
           record,
@@ -645,15 +681,42 @@ export class CreationService {
     );
   }
 
-  private async readPromptOutcome(record: Record, recovery?: CreationRecovery) {
+  private async isTopicPromptBound(
+    snapshot: Pick<CreationSnapshot, "agent" | "workspaceId">,
+    recovery?: CreationRecovery,
+  ) {
+    const { agent, workspaceId } = snapshot;
+    if (
+      !agent ||
+      !workspaceId ||
+      agent.workspaceId !== workspaceId ||
+      agent.archivedAt ||
+      !isMainControlAgentLabels(agent.labels)
+    )
+      return false;
+    return recovery?.isTopicPromptBound
+      ? recovery.isTopicPromptBound(agent.id, workspaceId).catch(() => false)
+      : true;
+  }
+
+  private async readPromptOutcome(
+    record: Record,
+    recovery?: CreationRecovery,
+    legacyAccepted?: boolean,
+  ) {
     const { snapshot, promptMessageId, promptReceiptFingerprint } = record;
-    if (isTopicPrompt(record) && snapshot.agent && promptMessageId && promptReceiptFingerprint) {
-      return recovery?.readPromptOutcome?.(
-        snapshot.agent.id,
-        promptMessageId,
-        promptReceiptFingerprint,
-      );
+    if (
+      isTopicPrompt(record) &&
+      snapshot.agent &&
+      promptMessageId &&
+      promptReceiptFingerprint &&
+      recovery?.readPromptOutcome
+    ) {
+      return recovery
+        .readPromptOutcome(snapshot.agent.id, promptMessageId, promptReceiptFingerprint)
+        .catch(() => "unknown" as const);
     }
+    return legacyAccepted ? "accepted" : undefined;
   }
 
   private async claimResources(

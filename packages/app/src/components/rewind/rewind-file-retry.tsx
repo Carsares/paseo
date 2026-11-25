@@ -12,7 +12,7 @@ interface RewindFileRetryProps {
 
 export function RewindFileRetry({ conversationRewound, detail, retry }: RewindFileRetryProps) {
   const copy = useCheckpointCopy();
-  const [error, setError] = useState(detail);
+  const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const handleRetry = useCallback(async () => {
     setPending(true);
@@ -29,12 +29,30 @@ export function RewindFileRetry({ conversationRewound, detail, retry }: RewindFi
       <Text style={styles.text}>
         {conversationRewound ? copy.partialRewind : copy.fileRewindFailed}
       </Text>
-      {error ? <Text style={styles.text}>{error}</Text> : null}
+      {detail ? <Text style={styles.text}>{detail}</Text> : null}
+      {error && error !== detail ? <Text style={styles.text}>{error}</Text> : null}
       <Button variant="secondary" size="sm" disabled={pending} onPress={handleRetry}>
         {copy.retryFiles}
       </Button>
     </View>
   );
+}
+
+export function RewindFileLookupRetry({ pending, retry }: { pending: boolean; retry: () => void }) {
+  const copy = useCheckpointCopy();
+  return (
+    <View style={styles.container}>
+      <Text style={styles.text}>{copy.pendingFilesLoadFailed}</Text>
+      <Button variant="secondary" size="sm" disabled={pending} onPress={retry}>
+        {copy.retryPendingFilesLookup}
+      </Button>
+    </View>
+  );
+}
+
+export function UnconfirmedRewindFileNotice() {
+  const copy = useCheckpointCopy();
+  return <Text style={styles.text}>{copy.conversationRewindUnconfirmed}</Text>;
 }
 
 const styles = StyleSheet.create((theme) => ({

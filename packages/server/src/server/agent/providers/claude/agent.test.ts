@@ -21,6 +21,7 @@ import {
   toClaudeSdkMcpConfig,
 } from "./agent.js";
 import { AgentManager } from "../../agent-manager.js";
+import { ProviderSnapshotManager } from "../../provider-snapshot-manager.js";
 import { ensureAgentLoaded } from "../../agent-loading.js";
 import { AgentStorage } from "../../agent-storage.js";
 import { createImportDescriptorScheduler } from "./import-descriptor-scheduler.js";
@@ -3616,10 +3617,12 @@ describe("ClaudeAgentSession context window usage", () => {
     expect(persistedQueryFactory.mock.calls[0]?.[0].options.persistSession).toBe(true);
   });
 
-  test("read-only commands keep static and cached Claude commands across a process exit", async () => {
+  test("Claude with an old command keeps cached commands without relaunching after reload", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "claude-readonly-commands-"));
     const script = path.join(root, "claude.cjs");
     const marker = path.join(root, "started");
+    const promptMarker = path.join(root, "prompt.json");
+    await fs.writeFile(promptMarker, "");
     await fs.writeFile(marker, "");
     await fs.writeFile(
       script,
@@ -3631,6 +3634,9 @@ describe("ClaudeAgentSession context window usage", () => {
         require("node:fs").appendFileSync(${JSON.stringify(marker)}, "started\\n");
         require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
           const message = JSON.parse(line);
+          if (message.type === "user") {
+            require("node:fs").writeFileSync(${JSON.stringify(promptMarker)}, JSON.stringify(message));
+          }
           if (message.type !== "control_request") return;
           console.log(JSON.stringify({
             type: "control_response",
@@ -3651,6 +3657,10 @@ describe("ClaudeAgentSession context window usage", () => {
       resolveBinary: async () => script,
       runtimeSettings: { command: { mode: "replace", argv: [process.execPath, script] } },
     });
+    const manager = new ProviderSnapshotManager({
+      logger,
+      providerOverrides: { claude: { command: [process.execPath, script], deferDiscovery: true } },
+    });
     const session = await client.createSession({ provider: "claude", cwd: root });
     try {
       const read = async () =>
@@ -3658,17 +3668,30 @@ describe("ClaudeAgentSession context window usage", () => {
       expect(await read()).toEqual(["rewind"]);
       expect(await fs.readFile(marker, "utf8")).toBe("");
 
-      await session.listCommands!();
+      await session.setMode("default");
       expect(await read()).toEqual(["cached-skill", "rewind"]);
+      expect(manager.canLaunchProviderForRead("claude")).toBe(false);
+      manager.applyMutableProviderConfig(undefined, { replace: true });
+      expect(manager.canLaunchProviderForRead("claude")).toBe(true);
       const { childProcess } = session as unknown as { childProcess: ChildProcess };
       const exited = once(childProcess, "exit");
       childProcess.kill();
       await exited;
 
       expect(await read()).toEqual(["cached-skill", "rewind"]);
+      expect((await session.listCommands!({ allowLaunch: true })).map(({ name }) => name)).toEqual([
+        "cached-skill",
+        "rewind",
+      ]);
       expect(await fs.readFile(marker, "utf8")).toBe("started\n");
+      await session.startTurn("continue on the original CLI");
+      await expect
+        .poll(() => fs.readFile(promptMarker, "utf8"))
+        .toContain("continue on the original CLI");
+      expect(await fs.readFile(marker, "utf8")).toBe("started\nstarted\n");
     } finally {
       await session.close();
+      manager.destroy();
       await fs.rm(root, { recursive: true, force: true });
     }
   });

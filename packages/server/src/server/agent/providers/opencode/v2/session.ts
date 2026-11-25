@@ -78,6 +78,7 @@ export class OpenCodeV2Session implements AgentSession {
     private readonly acquire?: () => Promise<V2Connection>,
     private readonly moved?: (connection: V2Connection) => void,
     private readonly historyOnly = false,
+    private readonly blockPassiveLaunch = false,
   ) {
     this.background = new OpenCodeBackgroundInventory({
       id: info.id,
@@ -426,15 +427,16 @@ export class OpenCodeV2Session implements AgentSession {
     }
   }
   async listCommands(options?: { allowLaunch?: boolean }): Promise<AgentSlashCommand[]> {
-    if (options?.allowLaunch === false && (this.closed || this.exited)) {
+    const allowLaunch = options?.allowLaunch !== false && !this.blockPassiveLaunch;
+    if (!allowLaunch && (this.closed || this.exited)) {
       return this.commandCache;
     }
     try {
-      if (options?.allowLaunch !== false) await this.reconnectIfExited();
+      if (allowLaunch) await this.reconnectIfExited();
       this.commandCache = await commands(this.client, this.config.cwd);
       return this.commandCache;
     } catch (error) {
-      if (options?.allowLaunch === false) return this.commandCache;
+      if (!allowLaunch) return this.commandCache;
       throw error;
     }
   }

@@ -8,9 +8,12 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { promises } from "node:fs";
 import path from "node:path";
+import { homedir } from "node:os";
 import {
   findInstallationLaunchPath,
+  inspectDiscoveredFiles,
   readInstallationActivityKeys,
+  readInstalledNodePackageVersion,
 } from "../../provider-installation/installation-target.js";
 import { LRUCache } from "lru-cache";
 import stripAnsi from "strip-ansi";
@@ -108,6 +111,7 @@ import { claudeConfigDir, claudeProjectDirSync, claudeTranscriptPath } from "./p
 import {
   compareWithLatestRelease,
   fetchHomebrewCaskVersion,
+  fetchReleaseField,
   fetchReleaseText,
   homebrewCaskOf,
   resolveExecutablePath,
@@ -168,6 +172,11 @@ import {
 import { resolveRuntimeMcpToolPolicy } from "../../runtime-mcp-config.js";
 import { importSessionFromPersistence } from "../../provider-session-import.js";
 import { runProviderRefreshActivity } from "../../provider-refresh-deadline.js";
+import { hasProviderExecutableEnvOverride } from "../../agent-sdk-types.js";
+import {
+  discoveredReleaseCheck,
+  type StaticCatalogMetadata,
+} from "../../provider-installation/provider-installations.js";
 import { currentCustomProviderLaunch } from "../../scoped-custom-provider-launch.js";
 import {
   createProviderEnv,
@@ -1793,17 +1802,23 @@ export class ClaudeAgentClient implements AgentClient {
   }
 
   async fetchCatalog(
-    _options: FetchCatalogOptions,
+    options: FetchCatalogOptions,
     context?: ProviderRefreshContext,
-  ): Promise<ProviderCatalog> {
-    // Claude exposes a global catalog here; cwd/force are intentionally irrelevant.
-    const managedDiscovery = currentCustomProviderLaunch()?.adapter === "claude";
-    if (managedDiscovery) {
+  ): Promise<ProviderCatalog & StaticCatalogMetadata> {
+    // Claude exposes a global model catalog here. Installation evidence only goes to Settings.
+    const scope = currentCustomProviderLaunch();
+    if (scope?.adapter === "claude") {
       const env = this.buildProviderEnv();
       const models = await runProviderRefreshActivity(context, "settings", () =>
         getClaudeModelsWithSettings(undefined, claudeConfigDir(env)),
       );
-      return { models, ...claudeModeCatalog(env) };
+      const installation =
+        options.scope === "global"
+          ? await runProviderRefreshActivity(context, "installation", () =>
+              this.readDiscoveredInstallation(scope),
+            )
+          : {};
+      return { models, ...claudeModeCatalog(env), ...installation };
     }
     let claudeCodeVersion: string | undefined;
     try {
@@ -2027,6 +2042,47 @@ export class ClaudeAgentClient implements AgentClient {
     }
   }
 
+  private async readDiscoveredInstallation(
+    scope: NonNullable<ReturnType<typeof currentCustomProviderLaunch>>,
+  ): Promise<StaticCatalogMetadata> {
+    // A wrapper can launch a different program. Do not infer its release from nearby files.
+    if (!scope.active || scope.argv.length !== 1) return {};
+    const executablePath = scope.files.find(({ file }) => file === scope.file)?.real;
+    if (!executablePath) return {};
+    const readRelease = () => readDiscoveredClaudeRelease(executablePath, scope.env);
+    const release = await readRelease();
+    if (!release) return {};
+    const { version: installedVersion, source } = release;
+    return {
+      installedVersion,
+      [discoveredReleaseCheck]: {
+        inspectFiles: async () => {
+          const status = await inspectDiscoveredFiles(scope.files);
+          if (status !== "current") return status;
+          return (await readRelease())?.version === installedVersion ? "current" : "changed";
+        },
+        isReleaseSourceCurrent: async () => {
+          const next = await readRelease();
+          return next?.version === installedVersion && next.source === source;
+        },
+        ...(source && {
+          run: async (signal: AbortSignal) =>
+            compareWithLatestRelease({
+              installed: installedVersion,
+              latest:
+                source === "npm"
+                  ? await fetchReleaseField({
+                      url: "https://registry.npmjs.org/@anthropic-ai%2fclaude-code/latest",
+                      field: "version",
+                      signal,
+                    })
+                  : await this.lookupLatestRelease({ executablePath, signal }),
+            }),
+        }),
+      },
+    };
+  }
+
   private assertConfig(config: AgentSessionConfig): ClaudeAgentConfig {
     if (config.provider !== "claude") {
       throw new Error(`ClaudeAgentClient received config for provider '${config.provider}'`);
@@ -2089,6 +2145,31 @@ type ClaudeCodeVersionRead =
   | { status: "installed"; version: string | null };
 
 const CLAUDE_UPDATE_CHANNELS = new Set(["latest", "stable", "rc"]);
+
+async function readDiscoveredClaudeRelease(executablePath: string, env: NodeJS.ProcessEnv) {
+  const npmVersion = await readInstalledNodePackageVersion(
+    executablePath,
+    "@anthropic-ai/claude-code",
+  );
+  if (npmVersion) {
+    return { version: npmVersion, source: /^\d+\.\d+\.\d+$/u.test(npmVersion) ? "npm" : undefined };
+  }
+  if (homebrewCaskOf(executablePath) === "claude-code") {
+    const version = executablePath.match(/\/Caskroom\/claude-code\/(\d+\.\d+\.\d+)\//u)?.[1];
+    if (version) return { version, source: "homebrew" };
+  }
+  const home = (process.platform === "win32" ? env.USERPROFILE : env.HOME) || homedir();
+  const nativeRoot = path.join(
+    env.XDG_DATA_HOME || path.join(home, ".local", "share"),
+    "claude",
+    "versions",
+  );
+  const filename = path.basename(executablePath);
+  if (path.dirname(executablePath) === nativeRoot && /^\d+\.\d+\.\d+$/u.test(filename)) {
+    return { version: filename, source: "native" };
+  }
+  return undefined;
+}
 
 /** The `autoUpdatesChannel` Claude Code updates from, `latest` unless settings pick another. */
 async function readClaudeUpdateChannel(configDir: string): Promise<string> {
@@ -2524,6 +2605,7 @@ class ClaudeAgentSession implements AgentSession {
   private readonly queryFactory?: ClaudeQueryFactory;
   private readonly resolveBinary: ClaudeBinaryResolver;
   private readonly independentUltracode: boolean;
+  private readonly blockPassiveLaunch: boolean;
   private query: Query | null = null;
   private cachedCommands: AgentSlashCommand[] = [REWIND_COMMAND];
   private readonly runtimeSafety = new ClaudeRuntimeSafety();
@@ -2654,6 +2736,10 @@ class ClaudeAgentSession implements AgentSession {
     this.config = config;
     assertClaudeThinkingOptionSupported(config.model, config.thinkingOptionId);
     this.launchEnv = options.launchEnv;
+    this.blockPassiveLaunch =
+      options.runtimeSettings?.command?.mode === "replace" ||
+      currentCustomProviderLaunch() !== undefined ||
+      hasProviderExecutableEnvOverride(options.runtimeSettings?.env, options.launchEnv);
     this.agentId = options.agentId;
     this.defaults = options.defaults;
     this.runtimeSettings = options.runtimeSettings;
@@ -3579,9 +3665,14 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   async listCommands(options?: { allowLaunch?: boolean }): Promise<AgentSlashCommand[]> {
-    const q = options?.allowLaunch === false ? this.query : await this.ensureQuery();
+    const allowLaunch = options?.allowLaunch !== false && !this.blockPassiveLaunch;
+    const q = allowLaunch ? await this.ensureQuery() : this.query;
     if (!q) return this.cachedCommands;
-    const commands = await q.supportedCommands();
+    const commands = await q.supportedCommands().catch((error: unknown) => {
+      if (!allowLaunch && this.query !== q) return null;
+      throw error;
+    });
+    if (!commands) return this.cachedCommands;
     const commandMap = new Map<string, AgentSlashCommand>();
     for (const cmd of commands) {
       if (isClaudeInternalSlashCommand(cmd.name)) continue;

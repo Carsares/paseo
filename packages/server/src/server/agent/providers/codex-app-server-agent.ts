@@ -57,6 +57,7 @@ import { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { hasProviderExecutableEnvOverride } from "../agent-sdk-types.js";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { renderPromptAttachmentAsText } from "../prompt-attachments.js";
@@ -142,6 +143,8 @@ import {
 import { acquireInstallationProcess } from "../provider-installation/installation-activity.js";
 import {
   findInstallationLaunchPath,
+  inspectDiscoveredFiles,
+  readInstallationFileIdentity,
   readInstallationActivityKeys,
   readInstalledNodePackageVersion,
 } from "../provider-installation/installation-target.js";
@@ -8492,21 +8495,9 @@ const lookupLatestCodexRelease: LatestReleaseLookup = async ({ executablePath, s
   return tag.replace(/^rust-v/, "");
 };
 
-async function readCodexExecutableIdentity(file: string) {
-  try {
-    const real = await fs.realpath(file);
-    const info = await fs.stat(real, { bigint: true });
-    if (!info.isFile()) return undefined;
-    const { dev, ino, size, mtimeNs, ctimeNs } = info;
-    return { real, dev, ino, size, mtimeNs, ctimeNs };
-  } catch {
-    return undefined;
-  }
-}
-
 interface CodexInstallationIdentity {
-  file: string;
-  identity: Awaited<ReturnType<typeof readCodexExecutableIdentity>>;
+  files: NonNullable<Awaited<ReturnType<typeof readInstallationFileIdentity>>>[];
+  directExecutable?: string;
 }
 
 async function readCodexReleaseSource(realPath: string, version: string) {
@@ -8629,7 +8620,8 @@ export class CodexAppServerAgentClient implements AgentClient {
       customCodexConfig: this.customProviderConfig(),
       blockPassiveLaunch:
         this.runtimeSettings?.command?.mode === "replace" ||
-        currentCustomProviderLaunch() !== undefined,
+        currentCustomProviderLaunch() !== undefined ||
+        hasProviderExecutableEnvOverride(this.runtimeSettings?.env, launchEnv),
     };
   }
 
@@ -8716,10 +8708,16 @@ export class CodexAppServerAgentClient implements AgentClient {
     if (options.goalsEnabled) {
       args.push("--enable", "goals");
     }
-    const installation =
-      options.observeInstallation && resolved && launchPrefix.args.length === 0
-        ? { file: resolved, identity: await readCodexExecutableIdentity(resolved) }
+    const discoveredFile =
+      options.observeInstallation && resolved && (scope || launchPrefix.args.length === 0)
+        ? await readInstallationFileIdentity(resolved)
         : undefined;
+    const installation = discoveredFile
+      ? {
+          files: scope?.files ?? [discoveredFile],
+          directExecutable: launchPrefix.args.length === 0 ? discoveredFile.real : undefined,
+        }
+      : undefined;
     const spawn = () => {
       const binding =
         launch && scope
@@ -9001,13 +8999,11 @@ export class CodexAppServerAgentClient implements AgentClient {
       try {
         const installed = await this.resolveInstalledCommand();
         if (!installed) return defaults;
-        const installation =
+        const file =
           installed.args.length === 0
-            ? {
-                file: installed.executable,
-                identity: await readCodexExecutableIdentity(installed.executable),
-              }
+            ? await readInstallationFileIdentity(installed.executable)
             : undefined;
+        const installation = file ? { files: [file], directExecutable: file.real } : undefined;
         context?.signal.throwIfAborted();
         const output = await readCommandVersionOutput({
           command: installed.command,
@@ -9096,7 +9092,7 @@ export class CodexAppServerAgentClient implements AgentClient {
     installedVersion: string | undefined,
     installation?: CodexInstallationIdentity,
   ): Promise<Omit<StaticCatalogMetadata, "defaultModeId">> {
-    if (!installedVersion) return {};
+    if (!installedVersion || !installation) return {};
     return {
       installedVersion,
       [discoveredReleaseCheck]: await this.createDiscoveredReleaseCheck(
@@ -9108,23 +9104,21 @@ export class CodexAppServerAgentClient implements AgentClient {
 
   private async createDiscoveredReleaseCheck(
     installed: string,
-    installation?: CodexInstallationIdentity,
+    installation: CodexInstallationIdentity,
   ): Promise<DiscoveredReleaseCheck> {
-    const unknown = { status: "unknown", message: "The CLI's release source is unknown." } as const;
-    const identity = installation?.identity;
-    if (!installation || !identity) {
-      return { isCurrent: async () => true, run: async () => unknown };
-    }
-    const source = await readCodexReleaseSource(identity.real, installed);
+    const inspectFiles = () => inspectDiscoveredFiles(installation.files);
+    const executablePath = installation.directExecutable;
+    if (!executablePath) return { inspectFiles };
+    const source = await readCodexReleaseSource(executablePath, installed);
+    if (!source) return { inspectFiles };
     return {
-      isCurrent: async () =>
-        isDeepStrictEqual(await readCodexExecutableIdentity(installation.file), identity) &&
-        (await readCodexReleaseSource(identity.real, installed)) === source,
+      inspectFiles,
+      isReleaseSourceCurrent: async () =>
+        (await readCodexReleaseSource(executablePath, installed)) === source,
       run: async (signal) => {
-        if (!source) return unknown;
         let latest: string;
         if (this.deps.lookupLatestRelease) {
-          latest = await this.deps.lookupLatestRelease({ executablePath: identity.real, signal });
+          latest = await this.deps.lookupLatestRelease({ executablePath, signal });
         } else if (source === "homebrew") {
           latest = await fetchHomebrewCaskVersion("codex", signal);
         } else {

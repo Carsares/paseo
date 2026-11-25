@@ -23,6 +23,39 @@ import { AgentOwnerSchema, daemonExecutionKey, type DaemonAgentOwner } from "./a
 import { controlsFromFeatures } from "@getpaseo/protocol/option-controls";
 import { foldFeatureValues } from "./option-controls.js";
 import { isTimelinePrefixFilename, TimelinePrefixStore } from "./timeline-prefix-store.js";
+import { worktreeIdentitySchema } from "./checkpoints/worktree.js";
+
+const confirmedRewindSchema = z.object({
+  operationId: z.uuid(),
+  agentId: z.string(),
+  workspaceId: z.string(),
+  messageId: z.string(),
+  checkpointId: z.uuid(),
+  worktree: worktreeIdentitySchema,
+});
+
+export type ConfirmedRewind = z.infer<typeof confirmedRewindSchema>;
+
+function appendConfirmedRewind(
+  agent: ManagedAgent,
+  existing: StoredAgentRecord | null,
+  confirmed: ConfirmedRewind,
+): ConfirmedRewind[] {
+  if (
+    existing?.archivedAt ||
+    agent.id !== confirmed.agentId ||
+    agent.workspaceId !== confirmed.workspaceId ||
+    agent.cwd !== confirmed.worktree.root
+  ) {
+    throw new Error("Agent changed during conversation rewind");
+  }
+  return [
+    ...(existing?.confirmedRewinds ?? []).filter(
+      (item) => item.operationId !== confirmed.operationId,
+    ),
+    confirmed,
+  ];
+}
 
 const SERIALIZABLE_CONFIG_SCHEMA = z
   .object({
@@ -103,6 +136,7 @@ const RAW_STORED_AGENT_SCHEMA = z.object({
   // COMPAT(featureValues): added in v0.15.0, remove after 2027-05-01. Read-only; becomes controls.
   features: z.array(AgentFeatureSchema).optional(),
   persistence: PERSISTENCE_HANDLE_SCHEMA,
+  confirmedRewinds: z.array(confirmedRewindSchema).optional(),
   timelinePrefixSwitchId: z.string().nullable().optional(),
   lastError: z.string().nullable().optional(),
   failedConversationLimit: FailedConversationLimitSchema.optional(),
@@ -399,6 +433,7 @@ export class AgentStorage {
     return this.queueRecordMutation(record.id, (existing) => ({
       ...record,
       limitContinuation: existing?.limitContinuation,
+      ...(existing?.confirmedRewinds && { confirmedRewinds: existing.confirmedRewinds }),
     }));
   }
 
@@ -415,6 +450,9 @@ export class AgentStorage {
       const existing = this.cache.get(agentId) ?? null;
       const record = mutate(existing);
       if (record) {
+        if (!record.confirmedRewinds && existing?.confirmedRewinds) {
+          record.confirmedRewinds = existing.confirmedRewinds;
+        }
         // Provider snapshots and lifecycle updates cannot clear first-prompt evidence.
         record.limitContinuation ??= existing?.limitContinuation;
         if (record.archivedAt) {
@@ -551,7 +589,12 @@ export class AgentStorage {
 
   async applySnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean; timelinePrefixSwitchId?: string | null },
+    options?: {
+      title?: string | null;
+      internal?: boolean;
+      timelinePrefixSwitchId?: string | null;
+      confirmedRewind?: ConfirmedRewind;
+    },
   ): Promise<void> {
     await this.load();
     const hasTitleOverride =
@@ -561,6 +604,7 @@ export class AgentStorage {
     const switchId = options?.timelinePrefixSwitchId;
     const titleOverride = options?.title ?? null;
     const internalOverride = options?.internal;
+    const confirmed = options?.confirmedRewind;
     await this.queueRecordMutation(agent.id, (existing) => {
       if (switchId !== undefined && !existing) {
         throw new Error(`Agent ${agent.id} disappeared during provider switch`);
@@ -571,6 +615,7 @@ export class AgentStorage {
         internal: hasInternalOverride ? internalOverride : (agent.internal ?? existing?.internal),
       });
       record.mainControlSystemPrompt = agent.mainControlSystemPrompt;
+      if (confirmed) record.confirmedRewinds = appendConfirmedRewind(agent, existing, confirmed);
 
       // Preserve soft-delete/archive status across snapshot flushes. The
       // projection runs inside the per-agent write queue so it cannot commit a
@@ -584,6 +629,9 @@ export class AgentStorage {
         existing?.resumeOnStartup && agent.lifecycle !== "idle" && agent.lifecycle !== "error";
       return record;
     });
+    if (confirmed && !this.cache.get(agent.id)?.confirmedRewinds?.includes(confirmed)) {
+      throw new Error("Could not persist conversation rewind confirmation");
+    }
   }
 
   async setTitle(agentId: string, title: string): Promise<void> {

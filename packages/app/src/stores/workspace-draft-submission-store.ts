@@ -125,6 +125,8 @@ const DraftTitleSchema = z.object({
   title: z.string(),
   submitted: z.boolean(),
   topicFields: DraftTopicFieldsSchema.optional(),
+  cleanupOwner: z.string().optional(),
+  batchPromptRevisions: z.record(z.string(), z.number().int().nonnegative()).optional(),
 });
 
 export type WorkspaceDraftTitle = z.infer<typeof DraftTitleSchema>;
@@ -142,6 +144,13 @@ interface DraftTitles {
   readDraftTopic: (id: string) => Promise<DraftTopicFields | undefined>;
   submitDraftTitle: (id: string) => Promise<string>;
   finishDraftTitle: (id: string) => Promise<void>;
+  saveDraftCleanupOwner: (id: string, owner: string | undefined) => Promise<void>;
+  saveBatchPromptRevision: (
+    id: string,
+    workspaceId: string,
+    revision: number | undefined,
+  ) => Promise<void>;
+  readDraftCleanupOwner: (id: string) => Promise<string | undefined>;
 }
 
 function createDraftTitles(
@@ -234,6 +243,26 @@ function createDraftTitles(
           publish(id, record);
           return record.title;
         }),
+      saveDraftCleanupOwner: (id, owner) =>
+        ordered(id, async () => {
+          const stored = await readStored(id);
+          if (!stored || stored.cleanupOwner === owner) return;
+          const record = { ...stored, cleanupOwner: owner };
+          await storage.setItem(storageKey(id), JSON.stringify(record));
+          publish(id, record);
+        }),
+      saveBatchPromptRevision: (id, workspaceId, revision) =>
+        ordered(id, async () => {
+          const stored = await readStored(id);
+          if (!stored || stored.batchPromptRevisions?.[workspaceId] === revision) return;
+          const revisions = { ...stored.batchPromptRevisions };
+          if (revision === undefined) delete revisions[workspaceId];
+          else revisions[workspaceId] = revision;
+          const record = { ...stored, batchPromptRevisions: revisions };
+          await storage.setItem(storageKey(id), JSON.stringify(record));
+          publish(id, record);
+        }),
+      readDraftCleanupOwner: (id) => ordered(id, async () => (await readStored(id))?.cleanupOwner),
       finishDraftTitle: (id) =>
         ordered(id, async () => {
           await storage.removeItem(storageKey(id));

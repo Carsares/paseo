@@ -136,74 +136,79 @@ test("duplicate client submissions join one complete intent and cumulative updat
   f.client.close();
 });
 
-test("reconnect resumes an unbound topic from its workspace checkpoint with the same request", async () => {
-  const request = {
-    idempotencyKey: "resume-topic",
-    workspaceId: workspace.id,
-    source: { kind: "directory" as const, path: "/project" },
-    title: "Topic",
-    topic: { summary: null, hideFromModel: true },
-    mainAgent: { config: { provider: "codex", cwd: "/project" } },
-  };
-  const created = {
-    ...workspace,
-    topic: { ...request.topic, mainAgentId: null, revision: 1 },
-  };
-  const halfway: CreationSnapshot = {
-    kind: "workspace",
-    idempotencyKey: request.idempotencyKey,
-    workspaceId: workspace.id,
-    workspace: created,
-    agentId: null,
-    phase: "workspace_ready",
-    revision: 2,
-    error: null,
-  };
-  const requests: Record<string, unknown>[] = [];
-  const resumed = Promise.withResolvers<CreationResult>();
-  const client = new CreationClient({
-    supports: () => true,
-    requestId: () => "request",
-    request: async (_kind, input) => {
-      requests.push(input);
-      if (requests.length === 1)
-        throw Object.assign(new Error("Connection lost"), { code: "DAEMON_CONNECTION_LOST" });
-      return resumed.promise;
-    },
-    observe: (_kind, _key, next) => {
-      next({ ...halfway, idempotencyKey: "another-topic" });
-      next(halfway);
-      next(halfway);
-      return () => {};
-    },
-    legacyAgent: async () => {
-      throw new Error("Unexpected legacy agent");
-    },
-    legacyWorkspace: async () => {
-      throw new Error("Unexpected legacy workspace");
-    },
-  });
-  const original = client.createWorkspace(request);
-  client.reconnect();
-  expect(requests).toEqual([
-    { ...request, subscribe: true },
-    { ...request, subscribe: true },
-  ]);
-  const completion: CreationSnapshot = {
-    ...halfway,
-    phase: "completed",
-    revision: 4,
-    mainAgent: agent,
-    workspace: { ...created, topic: { ...created.topic, mainAgentId: agent.id } },
-  };
-  resumed.resolve({
-    creation: completion,
-    workspace: completion.workspace,
-    mainAgent: agent,
-    error: null,
-  });
-  await expect(original).resolves.toMatchObject({ creation: completion, mainAgent: agent });
-});
+test.each(["accepted", "workspace_ready"] as const)(
+  "reconnect resumes only an idle %s checkpoint with the same request",
+  async (phase) => {
+    const request = {
+      idempotencyKey: "resume-topic",
+      workspaceId: workspace.id,
+      source: { kind: "directory" as const, path: "/project" },
+      title: "Topic",
+      topic: { summary: null, hideFromModel: true },
+      mainAgent: { config: { provider: "codex", cwd: "/project" } },
+    };
+    const created = {
+      ...workspace,
+      topic: { ...request.topic, mainAgentId: null, revision: 1 },
+    };
+    const halfway: CreationSnapshot = {
+      kind: "workspace",
+      idempotencyKey: request.idempotencyKey,
+      workspaceId: workspace.id,
+      ...(phase === "workspace_ready" ? { workspace: created } : {}),
+      agentId: null,
+      phase,
+      revision: 2,
+      error: null,
+    };
+    const requests: Record<string, unknown>[] = [];
+    const resumed = Promise.withResolvers<CreationResult>();
+    const client = new CreationClient({
+      supports: () => true,
+      requestId: () => "request",
+      request: async (_kind, input) => {
+        requests.push(input);
+        if (requests.length === 1)
+          throw Object.assign(new Error("Connection lost"), { code: "DAEMON_CONNECTION_LOST" });
+        return resumed.promise;
+      },
+      observe: (_kind, _key, next) => {
+        next({ ...halfway, idempotencyKey: "another-topic" });
+        next(halfway);
+        expect(requests).toHaveLength(1);
+        next({ ...halfway, canResume: true });
+        next({ ...halfway, canResume: true });
+        return () => {};
+      },
+      legacyAgent: async () => {
+        throw new Error("Unexpected legacy agent");
+      },
+      legacyWorkspace: async () => {
+        throw new Error("Unexpected legacy workspace");
+      },
+    });
+    const original = client.createWorkspace(request);
+    client.reconnect();
+    expect(requests).toEqual([
+      { ...request, subscribe: true },
+      { ...request, subscribe: true },
+    ]);
+    const completion: CreationSnapshot = {
+      ...halfway,
+      phase: "completed",
+      revision: 4,
+      mainAgent: agent,
+      workspace: { ...created, topic: { ...created.topic, mainAgentId: agent.id } },
+    };
+    resumed.resolve({
+      creation: completion,
+      workspace: completion.workspace,
+      mainAgent: agent,
+      error: null,
+    });
+    await expect(original).resolves.toMatchObject({ creation: completion, mainAgent: agent });
+  },
+);
 
 test("legacy adaptation keeps workspace, agent and initial prompt sequencing inside the client", async () => {
   const f = fixture(false);
@@ -290,4 +295,86 @@ test.each([
     input: { workspaceId: workspace.id, config: { cwd: "/project/worktree/src" } },
   });
   f.client.close();
+});
+
+test.each(["refusal", "missing"] as const)(
+  "reconnect observes an explicit prompt retry without resending it (%s)",
+  async (state) => {
+    const f = fixture(true);
+    const request = { ...f.input, retryPromptRevision: 5 };
+    const refusal: CreationSnapshot = {
+      kind: "workspace",
+      idempotencyKey: request.idempotencyKey,
+      phase: "failed",
+      failedStage: "prompt",
+      outcomeUnknown: false,
+      workspaceId: workspace.id,
+      agentId: agent.id,
+      revision: 5,
+      error: "refused",
+    };
+    const calls: Record<string, unknown>[] = [];
+    const client = new CreationClient({
+      supports: () => true,
+      requestId: () => "request",
+      request: async (_kind, input) => {
+        calls.push(input);
+        throw Object.assign(new Error("Connection lost"), { code: "DAEMON_CONNECTION_LOST" });
+      },
+      observe: (_kind, _key, next) => {
+        next(state === "missing" ? null : refusal);
+        return () => {};
+      },
+      legacyAgent: async () => {
+        throw new Error("Unexpected legacy agent");
+      },
+      legacyWorkspace: async () => {
+        throw new Error("Unexpected legacy workspace");
+      },
+    });
+    const original = client.createWorkspace(request);
+    client.reconnect();
+    if (state === "missing") await expect(original).rejects.toThrow("receipt is unavailable");
+    else await expect(original).resolves.toMatchObject({ creation: refusal });
+    expect(calls).toEqual([{ ...request, subscribe: true }]);
+  },
+);
+
+test("reconnect on an older topic host reports an unresolved checkpoint without a replay", async () => {
+  const f = fixture(true);
+  const calls: Record<string, unknown>[] = [];
+  const request = { ...f.input, topic: { summary: null, hideFromModel: false } };
+  const client = new CreationClient({
+    supports: (feature) => feature !== "topicPromptRetryV1",
+    requestId: () => "request",
+    request: async (_kind, input) => {
+      calls.push(input);
+      throw Object.assign(new Error("Connection lost"), { code: "DAEMON_CONNECTION_LOST" });
+    },
+    observe: (_kind, _key, next) => {
+      next({
+        kind: "workspace",
+        idempotencyKey: request.idempotencyKey,
+        phase: "workspace_ready",
+        workspaceId: workspace.id,
+        agentId: agent.id,
+        revision: 2,
+        error: null,
+      });
+      return () => {};
+    },
+    legacyAgent: async () => {
+      throw new Error("Unexpected legacy agent");
+    },
+    legacyWorkspace: async () => {
+      throw new Error("Unexpected legacy workspace");
+    },
+  });
+  const original = client.createWorkspace(request);
+  client.reconnect();
+  await expect(original).rejects.toThrow("host has not confirmed creation");
+  await expect(client.createWorkspace({ ...request, retryPromptRevision: 2 })).rejects.toThrow(
+    "Update the host",
+  );
+  expect(calls).toEqual([{ ...request, subscribe: true }]);
 });

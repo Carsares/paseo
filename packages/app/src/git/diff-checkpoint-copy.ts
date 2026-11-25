@@ -13,6 +13,10 @@ const english = {
   partialRewind: "Conversation rewound. Files could not be restored.",
   fileRewindFailed: "Files could not be restored.",
   retryFiles: "Retry file restore",
+  pendingFilesLoadFailed: "Could not check for pending file restores.",
+  conversationRewindUnconfirmed:
+    "Could not confirm the conversation rewind. Files were not restored.",
+  retryPendingFilesLookup: "Check again for pending file restores",
   filesRestored: "Files restored.",
   rewindInProgress: "Another rewind is in progress.",
 };
@@ -30,6 +34,9 @@ const chinese: typeof english = {
   partialRewind: "聊天已回滚，文件恢复失败。",
   fileRewindFailed: "文件恢复失败。",
   retryFiles: "重试文件恢复",
+  pendingFilesLoadFailed: "无法查询待恢复的文件。",
+  conversationRewindUnconfirmed: "无法确认聊天是否已回滚，文件未恢复。",
+  retryPendingFilesLookup: "重新查询待恢复的文件",
   filesRestored: "文件已恢复。",
   rewindInProgress: "另一次回滚正在进行。",
 };

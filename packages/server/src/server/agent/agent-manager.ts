@@ -145,7 +145,12 @@ import {
   type LegacyFeatureValues,
   type ProviderOptionsPatch,
 } from "./option-controls.js";
-import type { StoredAgentRecord, AgentStorage, StoredAgentTurnState } from "./agent-storage.js";
+import type {
+  StoredAgentRecord,
+  AgentStorage,
+  StoredAgentTurnState,
+  ConfirmedRewind,
+} from "./agent-storage.js";
 import {
   emptyWorkspaceTaskLedgerPrompt,
   renderWorkspaceTaskLedger,
@@ -10084,6 +10089,7 @@ export class AgentManager {
       providerMessageId: string;
       verifyHistory?: (items: AgentTimelineItem[]) => void;
       afterConfirmed?: () => Promise<void>;
+      confirmedRewind?: ConfirmedRewind;
     },
   ): Promise<void> {
     const { id: agentId } = agent;
@@ -10100,15 +10106,15 @@ export class AgentManager {
         mode: "conversation",
       });
       await this.forceHydrateTimelineFromLegacyProviderHistory(agent, true, false, verifyHistory);
+      // Rewind stages provider events under the run lock; publish its final state directly.
+      this.refreshSessionPersistence(agent);
+      await this.refreshSessionState(agent, { emit: false });
+      await this.persistSnapshot(agent, { confirmedRewind: input.confirmedRewind });
       this.dispatch({
         type: "timeline_replacement",
         agentId,
         epoch: this.timelineStore.getEpoch(agentId),
       });
-      // Rewind stages provider events under the run lock; publish its final state directly.
-      this.refreshSessionPersistence(agent);
-      await this.refreshSessionState(agent, { emit: false });
-      await this.persistSnapshot(agent);
       await input.afterConfirmed?.();
       this.emitState(agent, { persist: false });
       this.logger.info({ agentId, provider: agent.provider, messageId }, "agent.rewind.complete");
@@ -10305,10 +10311,18 @@ export class AgentManager {
   }
 
   async getPendingRewindFiles(agentId: string) {
+    return (await this.getAgentRewindFileRecovery(agentId)).pendingFiles;
+  }
+
+  async getAgentRewindFileRecovery(agentId: string) {
     const { directories, checkpoints } = this.requireRewindCheckpointService();
     const agent = await this.getRewindSubject(agentId);
     const scope = await getAgentRewindScope(directories, agent);
-    return checkpoints.getPendingFiles(scope);
+    return checkpoints.getFileRecovery(scope, await this.getConfirmedRewinds(agentId));
+  }
+
+  private async getConfirmedRewinds(agentId: string): Promise<ConfirmedRewind[]> {
+    return (await this.registry?.get(agentId))?.confirmedRewinds ?? [];
   }
 
   async getRewindCheckpointDiff(input: {
@@ -10417,6 +10431,7 @@ export class AgentManager {
       if (input.mode === "both" && (!anchor || !this.canCombineRewind(agent))) {
         throw new Error("This provider cannot rewind the conversation to this checkpoint");
       }
+      if (input.mode === "both") this.requireRegistry();
       const index = timeline.turns.findIndex((entry) => entry.turnId === turn.turnId);
       const laterTurns = timeline.turns.slice(index);
       const tip = laterTurns.at(-1)!;
@@ -10425,6 +10440,13 @@ export class AgentManager {
         entry.seq < row.seq && entry.item.type === "user_message"
           ? [[entry.item.messageId, entry.item.clientMessageId, entry.providerMessageId]]
           : [],
+      );
+      const retainedAssistantIds = new Set(
+        rows.flatMap(({ seq, item }) =>
+          seq < row.seq && item.type === "assistant_message" && item.messageId
+            ? [item.messageId]
+            : [],
+        ),
       );
       if (anchor) superseded.add(anchor);
       for (const entry of rows) {
@@ -10479,18 +10501,25 @@ export class AgentManager {
             }
           }
         },
-        rewindConversation: async () => {
+        rewindConversation: async (confirmedRewind) => {
           if (!anchor) throw new Error("Provider message is not confirmed");
           await this.rewindConversation(await this.ensureInteractiveSession(agent.id), {
             messageId: input.messageId,
             providerMessageId: anchor,
+            confirmedRewind,
             verifyHistory: (items) => {
               const replayedUsers = items.filter((item) => item.type === "user_message");
               const replayedIds = new Set(
                 replayedUsers.flatMap((item) => [item.messageId, item.clientMessageId]),
               );
+              const replayedAssistantIds = new Set(
+                items.flatMap((item) =>
+                  item.type === "assistant_message" && item.messageId ? [item.messageId] : [],
+                ),
+              );
               if (
                 [...superseded].some((id) => replayedIds.has(id)) ||
+                [...retainedAssistantIds].some((id) => !replayedAssistantIds.has(id)) ||
                 retained.length !== replayedUsers.length ||
                 retained.some((ids, i) => {
                   const replayed = replayedUsers[i];
@@ -10545,8 +10574,13 @@ export class AgentManager {
   }
 
   retryRewindFiles(input: { agentId: string; operationId: string }) {
-    return this.withFileRewind(input.agentId, (scope, validate, checkpoints) =>
-      checkpoints.retry({ scope, validate, operationId: input.operationId }),
+    return this.withFileRewind(input.agentId, async (scope, validate, checkpoints) =>
+      checkpoints.retry({
+        scope,
+        validate,
+        operationId: input.operationId,
+        confirmations: await this.getConfirmedRewinds(input.agentId),
+      }),
     );
   }
 
@@ -11407,7 +11441,7 @@ export class AgentManager {
 
   private async persistSnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean; timelinePrefixSwitchId?: string | null },
+    options?: Parameters<AgentStorage["applySnapshot"]>[1],
   ): Promise<void> {
     if (!this.registry) {
       return;
@@ -11607,13 +11641,22 @@ export class AgentManager {
         );
       }
     }
+    if (verifyHistory) {
+      await this.persistVerifiedRewindTimeline(agent.id);
+    }
+    await this.restoreContextAfterReplay(agent, prefix, deliveredHandoff);
+    this.touchUpdatedAt(agent);
+    if (!verifyHistory) this.emitState(agent);
+  }
+
+  private async persistVerifiedRewindTimeline(agentId: string): Promise<void> {
     const store = this.durableTimelineStore;
-    if (verifyHistory && store) {
-      const rows = this.timelineStore.getRows(agent.id);
-      await this.writeDurableTimeline(agent.id, async () => {
-        await store.deleteAgent(agent.id);
-        if (rows.length) await store.bulkInsert(agent.id, rows);
-        const persisted = await store.getCommittedRows(agent.id);
+    if (store) {
+      const rows = this.timelineStore.getRows(agentId);
+      await this.writeDurableTimeline(agentId, async () => {
+        await store.deleteAgent(agentId);
+        if (rows.length) await store.bulkInsert(agentId, rows);
+        const persisted = await store.getCommittedRows(agentId);
         if (
           !isDeepStrictEqual(
             JSON.parse(JSON.stringify(persisted)),
@@ -11624,9 +11667,6 @@ export class AgentManager {
         }
       });
     }
-    await this.restoreContextAfterReplay(agent, prefix, deliveredHandoff);
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
   }
 
   private async primeTimelineFromLegacyProviderHistory(

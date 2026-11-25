@@ -16,7 +16,7 @@ import {
   creationSnapshotMatches,
   isRejectedBoundTopicPrompt,
   isUnboundTopicWorkspace,
-  readTopicPromptReceipt,
+  isTopicPromptAccepted,
 } from "./topic-receipts";
 
 const requestSchema = AgentCreateRequestSchema.pick({
@@ -48,12 +48,14 @@ export type TopicQuestionClient = Pick<
   "getCreationSnapshot" | "findWorkspace" | "fetchAgentTimeline" | "createAgent"
 > & {
   fetchAgent: (input: FetchAgentOptions) => Promise<FetchAgentResult | null>;
+  supportsTopicPromptRetry?: DaemonClient["supportsTopicPromptRetry"];
 };
 export type TopicQuestionOutcome =
   | { stage: "confirmed"; agent: AgentSnapshotPayload }
   | { stage: "queue-unavailable" }
-  | { stage: "retry" }
-  | { stage: "unconfirmed" };
+  | { stage: "retry"; retryPromptRevision?: number }
+  | { stage: "unconfirmed" }
+  | { stage: "update-host" };
 
 const storageKey = (draftId: string) => `paseo:topic-first-question:${draftId}`;
 const operations = new Map<string, Promise<unknown>>();
@@ -122,13 +124,6 @@ function agentCreationFailedBeforeBinding(receipt: CreationSnapshot | null) {
   );
 }
 
-function promptStarted(receipt: CreationSnapshot | null) {
-  return (
-    !receipt?.outcomeUnknown &&
-    (receipt?.initialPromptStarted === true || receipt?.phase === "prompt_started")
-  );
-}
-
 async function readMainAgent(client: TopicQuestionClient, id: string, workspaceId: string) {
   const result = await client.fetchAgent({ agentId: id }).catch(() => undefined);
   if (result === undefined) return { available: false, agent: null };
@@ -153,25 +148,9 @@ function canRetryUnboundQuestion(
   return (
     creation.status === "fulfilled" &&
     ((creation.value === null && !receipt) ||
+      (receipt?.phase === "accepted" && receipt.canResume === true) ||
       (agentCreationFailedBeforeBinding(receipt) && receipt?.errorCode !== "workspace_main_exists"))
   );
-}
-
-async function reconcileContinuedQuestion(
-  client: TopicQuestionClient,
-  request: SavedTopicQuestion["request"],
-  continuationAgentId: string,
-): Promise<TopicQuestionOutcome> {
-  // The send may have reached the host. Only a positive receipt for the recorded target settles it.
-  if (!continuationAgentId) return { stage: "unconfirmed" };
-  const { agent } = await readMainAgent(client, continuationAgentId, request.workspaceId);
-  if (
-    agent &&
-    (await readTopicPromptReceipt(client, agent.id, request.clientMessageId)) === "recorded"
-  ) {
-    return { stage: "confirmed", agent };
-  }
-  return { stage: "unconfirmed" };
 }
 
 export async function reconcileTopicQuestion(
@@ -180,9 +159,8 @@ export async function reconcileTopicQuestion(
   update?: CreationSnapshot,
 ): Promise<TopicQuestionOutcome> {
   const { request, continuationAgentId } = saved;
-  if (continuationAgentId !== undefined) {
-    return reconcileContinuedQuestion(client, request, continuationAgentId);
-  }
+  // Legacy continuations have no identity-matched creation receipt. Preserve the draft.
+  if (continuationAgentId !== undefined) return { stage: "unconfirmed" };
   const [creation, directory] = await Promise.allSettled([
     client.getCreationSnapshot("agent", request.idempotencyKey),
     client.findWorkspace(request.workspaceId),
@@ -199,22 +177,15 @@ export async function reconcileTopicQuestion(
     ? { available: true, agent: receipt.agent }
     : await readMainAgent(client, agentId, request.workspaceId);
   if (candidate.agent) {
-    const stored = matchingReceipt(
-      request,
-      creation.status === "fulfilled" ? creation.value : null,
-    );
-    const retry =
-      receipt === stored &&
-      isRejectedBoundTopicPrompt(stored, workspace, request.workspaceId, request.agentId);
-    return reconcileBoundPrompt(
+    return boundQuestionOutcome({
       client,
-      request,
-      candidate.agent,
+      agent: candidate.agent,
       receipt,
-      boundMainId,
+      workspace,
+      request,
       mainConflict,
-      retry,
-    );
+      stored: creation.status === "fulfilled" ? matchingReceipt(request, creation.value) : null,
+    });
   }
   if (
     isUnboundTopicWorkspace(workspace, request.workspaceId) &&
@@ -226,27 +197,33 @@ export async function reconcileTopicQuestion(
   return { stage: "unconfirmed" };
 }
 
-async function reconcileBoundPrompt(
-  client: TopicQuestionClient,
-  request: SavedTopicQuestion["request"],
-  agent: AgentSnapshotPayload,
-  receipt: CreationSnapshot | null,
-  boundMainId: string | null | undefined,
-  mainConflict: boolean,
-  retry: boolean,
-): Promise<TopicQuestionOutcome> {
-  if (agent.id === request.agentId && promptStarted(receipt)) return { stage: "confirmed", agent };
-  const prompt = await readTopicPromptReceipt(client, agent.id, request.clientMessageId);
-  if (prompt === "recorded") return { stage: "confirmed", agent };
-  if (prompt === "not-found" && retry) return { stage: "retry" };
+function boundQuestionOutcome(input: {
+  client: TopicQuestionClient;
+  agent: AgentSnapshotPayload;
+  receipt: CreationSnapshot | null;
+  stored: CreationSnapshot | null;
+  workspace: Awaited<ReturnType<TopicQuestionClient["findWorkspace"]>>;
+  request: SavedTopicQuestion["request"];
+  mainConflict: boolean;
+}): TopicQuestionOutcome {
+  const { agent, receipt, stored, workspace, request, client } = input;
+  if (agent.id === request.agentId && isTopicPromptAccepted(receipt)) {
+    return { stage: "confirmed", agent };
+  }
   if (
-    prompt === "not-found" &&
-    mainConflict &&
-    agent.id === boundMainId &&
+    stored &&
+    receipt === stored &&
+    isRejectedBoundTopicPrompt(stored, workspace, request.workspaceId, request.agentId)
+  ) {
+    return client.supportsTopicPromptRetry?.()
+      ? { stage: "retry", retryPromptRevision: stored.revision }
+      : { stage: "update-host" };
+  }
+  if (
+    input.mainConflict &&
+    agent.id === workspace?.topic?.mainAgentId &&
     agent.id !== request.agentId
   ) {
-    // Wave 0 queues agent-originated messages. Human sends only support interrupt and steer.
-    // Resume this path when the host exposes ordered admission for a human topic first question.
     return { stage: "queue-unavailable" };
   }
   return { stage: "unconfirmed" };
@@ -266,12 +243,18 @@ export async function runTopicQuestionAction(
   options: {
     update?: CreationSnapshot;
     assertAvailable: () => void;
+    expectedPromptRevision?: number | null;
   },
 ): Promise<TopicQuestionOutcome> {
   const outcome = await reconcileTopicQuestion(client, saved, options.update);
   if (action === "retry" && outcome.stage === "retry") {
+    if (
+      options.expectedPromptRevision !== undefined &&
+      options.expectedPromptRevision !== (outcome.retryPromptRevision ?? null)
+    )
+      return outcome;
     options.assertAvailable();
-    return submitFrozenTopicQuestion(client, saved);
+    return submitFrozenTopicQuestion(client, saved, outcome.retryPromptRevision);
   }
   return outcome;
 }
@@ -279,11 +262,13 @@ export async function runTopicQuestionAction(
 export async function submitFrozenTopicQuestion(
   client: TopicQuestionClient,
   saved: SavedTopicQuestion,
+  retryPromptRevision?: number,
 ): Promise<TopicQuestionOutcome> {
   let latest: CreationSnapshot | undefined;
   try {
     await client.createAgent({
       ...saved.request,
+      ...(retryPromptRevision !== undefined ? { retryPromptRevision } : {}),
       onEvent: (snapshot) => {
         latest = snapshot;
       },

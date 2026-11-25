@@ -29,6 +29,21 @@ export type {
 
 export type AgentProvider = string;
 
+/** These overrides can select a different executable even with the default command name. */
+export function hasProviderExecutableEnvOverride(
+  ...environments: (NodeJS.ProcessEnv | undefined)[]
+): boolean {
+  return environments.some((env) =>
+    Object.keys(env ?? {}).some((name) => {
+      const key = process.platform === "win32" ? name.toUpperCase() : name;
+      return (
+        key === "PATH" ||
+        (process.platform === "win32" && (key === "PATHEXT" || key === "LOCALAPPDATA"))
+      );
+    }),
+  );
+}
+
 export interface AgentMetadata {
   [key: string]: unknown;
 }

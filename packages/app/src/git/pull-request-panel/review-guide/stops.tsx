@@ -25,12 +25,14 @@ import {
 } from "./port";
 import { styles } from "./styles";
 import { useReviewViewed } from "./viewed";
+import type { LocalReviewRequest } from "./local-viewed";
 
 interface ReviewStopsProps {
   guide: ReviewGuide;
   target: ReviewTarget;
   connection: ReviewGuideConnection;
   queryToken: string;
+  localRequest: LocalReviewRequest | undefined;
   scope: string;
   url: string;
   attach?: AttachReviewStop;
@@ -68,7 +70,15 @@ export function ReviewStops(props: ReviewStopsProps) {
   const invalidate = useCallback((failure: ReviewFailure) => {
     if (mustRefresh(failure)) setStale(failure);
   }, []);
-  const viewed = useReviewViewed(connection.port, guide, target, scope, queryToken, invalidate);
+  const viewed = useReviewViewed(
+    connection.port,
+    guide,
+    target,
+    scope,
+    queryToken,
+    props.localRequest,
+    invalidate,
+  );
 
   const files = useMemo(() => groupByPath(guide.stops), [guide.stops]);
   const active = guide.stops[selection];

@@ -225,6 +225,7 @@ export interface ServerFeatureOverrides {
   daemonStatusRpc?: boolean;
   relayConfig?: boolean;
   topicWorkbenchV1?: boolean;
+  topicPromptRetryV1?: boolean;
   workspaceDurableItemsV1?: boolean;
   checkoutGitStagingV1?: boolean;
   checkoutGitGraphV1?: boolean;
@@ -2418,6 +2419,10 @@ export class VoiceAssistantWebSocketServer {
         agentCreateAsMain: true,
         // COMPAT(topicWorkbenchV1): added in v0.18.0, remove after 2027-06-01.
         ...(this.featureOverrides.topicWorkbenchV1 !== false ? { topicWorkbenchV1: true } : {}),
+        ...(this.featureOverrides.topicWorkbenchV1 !== false &&
+        this.featureOverrides.topicPromptRetryV1 !== false
+          ? { topicPromptRetryV1: true }
+          : {}),
         // COMPAT(workspaceDurableItemsV1): added in v0.18.0, remove after 2027-06-01.
         ...(this.featureOverrides.workspaceDurableItemsV1 !== false
           ? { workspaceDurableItemsV1: true }

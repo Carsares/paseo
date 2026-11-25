@@ -19,7 +19,8 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
+import type { LaunchFileIdentity } from "../scoped-custom-provider-launch.js";
 import { z } from "zod";
 export { findExecutableWithoutProbing as findInstallationLaunchPath } from "../../../executable-resolution/executable-resolution.js";
 
@@ -416,6 +417,35 @@ async function readOwningPackage(owner: string, packageName: string, command: st
   } catch {
     return undefined;
   }
+}
+
+/** Capture the executable and follow symlinks without probing or starting a process. */
+export async function readInstallationFileIdentity(
+  file: string,
+): Promise<LaunchFileIdentity | undefined> {
+  try {
+    const real = await realpath(file);
+    const info = await stat(real, { bigint: true });
+    if (!info.isFile()) throw new Error("The CLI launch file is not a regular file.");
+    const { dev, ino, size, mtimeNs, ctimeNs } = info;
+    return { file, real, dev, ino, size, mtimeNs, ctimeNs };
+  } catch (error) {
+    if (
+      (error as NodeJS.ErrnoException).code === "ENOENT" ||
+      (error as NodeJS.ErrnoException).code === "ENOTDIR"
+    )
+      return undefined;
+    throw error;
+  }
+}
+
+export async function inspectDiscoveredFiles(
+  files: readonly LaunchFileIdentity[],
+): Promise<"current" | "missing" | "changed"> {
+  if (!files.length) return "changed";
+  const observed = await Promise.all(files.map(({ file }) => readInstallationFileIdentity(file)));
+  if (observed.some((file) => file === undefined)) return "missing";
+  return isDeepStrictEqual(observed, files) ? "current" : "changed";
 }
 
 /** Reads the release only when the resolved command is the package's declared binary. */

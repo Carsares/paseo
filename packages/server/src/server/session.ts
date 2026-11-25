@@ -6307,6 +6307,11 @@ export class Session {
   }
 
   private readonly creationRecovery = {
+    isTopicPromptBound: async (agentId: string, workspaceId: string) => {
+      const workspace = await this.workspaceRegistry.get(workspaceId);
+      if (!workspace?.topic || workspace.archivedAt || workspace.untrustedSource) return false;
+      return (await this.describeWorkspaceMain(workspace)).topic?.mainAgentId === agentId;
+    },
     readTopicWorkspace: async (id: string) => {
       const workspace = await this.workspaceRegistry.get(id);
       if (!workspace?.topic || workspace.archivedAt) return null;
@@ -6339,10 +6344,14 @@ export class Session {
     readPromptOutcome: async (agentId: string, messageId: string, expectedFingerprint: string) => {
       const outcome = this.messageReceipts.outcome?.bind(this.messageReceipts);
       if (!outcome) return "unknown" as const;
-      const matching = await outcome(agentId, messageId, expectedFingerprint);
-      if (matching !== "absent") return matching;
-      // An occupied message ID with a different fingerprint is not absent.
-      return (await outcome(agentId, messageId)) === "absent" ? "absent" : "unknown";
+      try {
+        const matching = await outcome(agentId, messageId, expectedFingerprint);
+        if (matching !== "absent") return matching;
+        // An occupied message ID with a different fingerprint is not absent.
+        return (await outcome(agentId, messageId)) === "absent" ? "absent" : "unknown";
+      } catch {
+        return "unknown";
+      }
     },
   };
 
@@ -6522,7 +6531,14 @@ export class Session {
         ? (await this.workspaceRegistry.get(request.workspaceId))?.topic
         : undefined;
     const promptReceipt = topic ? firstQuestionReceipt(request) : {};
-    const { requestId, type: _type, subscribe: _subscribe, idempotencyKey, ...intent } = request;
+    const {
+      requestId,
+      type: _type,
+      subscribe: _subscribe,
+      idempotencyKey,
+      retryPromptRevision,
+      ...intent
+    } = request;
     return this.creationService.create(
       {
         kind: "agent",
@@ -6534,6 +6550,7 @@ export class Session {
         hasPrompt: hasInitialCreationPrompt(request),
         ...promptReceipt,
         ...this.creationRecovery,
+        retryPromptRevision,
         retryTopicPrompt: this.topicPromptRetry(idempotencyKey, topic ? request : undefined),
         exists: this.creationResourceExists,
         readAgent: async (id) => {
@@ -6610,7 +6627,14 @@ export class Session {
     request: Extract<SessionInboundMessage, { type: "workspace.create.request" }>,
     source?: object,
   ): Promise<void> {
-    const { requestId, subscribe, type: _type, idempotencyKey, ...intent } = request;
+    const {
+      requestId,
+      subscribe,
+      type: _type,
+      idempotencyKey,
+      retryPromptRevision,
+      ...intent
+    } = request;
     const progress = subscribe
       ? this.delivery.operation(
           (message) =>
@@ -6651,6 +6675,7 @@ export class Session {
           ...promptReceipt,
           exists: this.creationResourceExists,
           ...this.creationRecovery,
+          retryPromptRevision,
           retryTopicPrompt: this.topicPromptRetry(idempotencyKey, topicAgent),
           provision: async (id) => {
             const descriptor = await this.createRequestedWorkspace(
@@ -7486,7 +7511,7 @@ export class Session {
         }
         case "agent.rewind.checkpoint.get.request": {
           const result = msg.pendingFiles
-            ? { pendingFiles: await this.agentManager.getPendingRewindFiles(agentId) }
+            ? await this.agentManager.getAgentRewindFileRecovery(agentId)
             : await this.agentManager.getRewindCheckpoint(msg);
           this.emitForSource(
             {

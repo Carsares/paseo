@@ -40,6 +40,15 @@ function applyPatch(content: string | null, patch: string): string | null | unde
   return output.length ? `${output.join("\n")}\n` : "";
 }
 
+function emptyAdditionPath(section: string): string | undefined {
+  const lines = section.split("\n");
+  if (lines.length !== 3 || lines[1] !== "--- /dev/null" || !lines[2]?.startsWith("+++ b/")) {
+    return undefined;
+  }
+  const path = lines[2].slice("+++ b/".length);
+  return path && lines[0] === `diff --git a/${path} b/${path}` ? path : undefined;
+}
+
 function applyEdit(content: string | null, edit: Edit): string | null | undefined {
   if (edit.type === "write") return edit.content;
   if (edit.unifiedDiff) return applyPatch(content, edit.unifiedDiff);
@@ -57,7 +66,7 @@ function checkpointPath(cwd: string, path: string): string {
 function patchSectionPath(section: string): string | undefined {
   const [header, ...lines] = section.split("\n");
   const firstHunk = lines.findIndex((line) => line.startsWith("@@ "));
-  if (firstHunk < 0) return undefined;
+  if (firstHunk < 0) return emptyAdditionPath(section);
   const metadata = lines.slice(0, firstHunk);
   const oldPaths = metadata.filter((line) => line.startsWith("--- "));
   const newPaths = metadata.filter((line) => line.startsWith("+++ "));
@@ -96,7 +105,7 @@ function expandEdit(cwd: string, edit: Edit): [string, Edit][] {
   )
     return [];
   const sections = patch.split(/\n(?=diff --git )/);
-  if (sections.length === 1) return [[path, edit]];
+  if (sections.length === 1 && !emptyAdditionPath(patch)) return [[path, edit]];
   if (edit.type !== "edit") return [];
 
   const expanded = new Map<string, Edit>();
@@ -177,6 +186,19 @@ interface EditComparison {
   stageChanged: boolean;
 }
 
+function isEmptyAddition(edit: Edit): boolean {
+  return edit.type === "edit" && !!edit.unifiedDiff && !!emptyAdditionPath(edit.unifiedDiff);
+}
+
+function applyCheckpointEdit(
+  content: string | null,
+  edit: Edit,
+  emptyAdditionConfirmed: boolean,
+): string | null | undefined {
+  if (isEmptyAddition(edit)) return emptyAdditionConfirmed && content === null ? "" : undefined;
+  return applyEdit(content, edit);
+}
+
 function hasUnsupportedModeChange(input: EditComparison): boolean {
   const { oldFile, newFile, oldStage, newStage, stageChanged } = input;
   if (oldFile && newFile && oldFile.mode !== newFile.mode) return true;
@@ -200,8 +222,9 @@ async function verifiesEdits(
   const known = new Set<string | null>();
   const objectId = (value: string | null) =>
     value === null ? null : gitBlobId(Buffer.from(value), format);
+  const emptyAdditionConfirmed = !oldFile && newFile?.oid === objectId("");
   for (const edit of edits) {
-    const updated = applyEdit(content, edit);
+    const updated = applyCheckpointEdit(content, edit, emptyAdditionConfirmed);
     if (updated === undefined) return false;
     content = updated;
     known.add(objectId(content));

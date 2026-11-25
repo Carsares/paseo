@@ -625,7 +625,8 @@ test.each([
         expect((await client.createWorkspace(placement)).error).toBeNull();
       }
       await creator.request({ ...request, requestId: "first" });
-      expect(await read("first-receipt")).toMatchObject({
+      const initial = await read("first-receipt");
+      expect(initial).toMatchObject({
         payload: {
           snapshot: {
             phase: scenario.first === "accepted" ? "completed" : "failed",
@@ -666,8 +667,17 @@ test.each([
       }
       const beforeHistory = await history();
       const workspaces = (await client.fetchWorkspaces()).entries.map(({ id }) => id);
-      const retry = creator.request({ ...request, requestId: "retry" });
-      const duplicate = peer.request({ ...request, requestId: "duplicate" });
+      const passive = await creator.request({ ...request, requestId: "passive-replay" });
+      expect(passive).toMatchObject({
+        payload: { creation: { phase: scenario.first === "accepted" ? "completed" : "failed" } },
+      });
+      expect(calls).toBe(1);
+      if (initial.type !== "creation.subscribe.response" || !initial.payload.snapshot) {
+        throw new Error("Expected a creation receipt");
+      }
+      const explicit = { ...request, retryPromptRevision: initial.payload.snapshot.revision };
+      const retry = creator.request({ ...explicit, requestId: "retry" });
+      const duplicate = peer.request({ ...explicit, requestId: "duplicate" });
       if (scenario.calls === 2) {
         // The original receipt must be visible as in flight before the provider replies.
         const duringRetry = await Promise.race([

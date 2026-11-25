@@ -20,7 +20,11 @@ export interface CreationResult {
 }
 interface Dependencies {
   supports: (
-    feature: "creationLifecycle" | "agentRequestReceipts" | "agentCreateAsMain",
+    feature:
+      | "creationLifecycle"
+      | "agentRequestReceipts"
+      | "agentCreateAsMain"
+      | "topicPromptRetryV1",
   ) => boolean;
   requestId: () => string;
   request: (kind: Kind, input: Record<string, unknown>) => Promise<CreationResult>;
@@ -39,6 +43,7 @@ interface Operation {
   kind: Kind;
   key: string;
   fingerprint: string;
+  retryPromptRevision?: number;
   input: Record<string, unknown>;
   observers: Set<Observer>;
   snapshot?: CreationSnapshot;
@@ -119,7 +124,10 @@ export class CreationClient {
     const key =
       typeof input.idempotencyKey === "string" ? input.idempotencyKey : this.deps.requestId();
     const identity = JSON.stringify([kind, key]);
-    const { requestId: _requestId, ...intent } = input;
+    const { requestId: _requestId, retryPromptRevision, ...intent } = input;
+    if (retryPromptRevision !== undefined && !this.deps.supports("topicPromptRetryV1")) {
+      return Promise.reject(new Error("Update the host to retry the first question."));
+    }
     const fingerprint = JSON.stringify(intent, (_key, value: unknown) =>
       value && typeof value === "object" && !Array.isArray(value)
         ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)))
@@ -129,6 +137,9 @@ export class CreationClient {
     if (previous) {
       if (previous.fingerprint !== fingerprint)
         return Promise.reject(new Error(`${kind}_request_key_conflict`));
+      if (previous.retryPromptRevision !== retryPromptRevision) {
+        return Promise.reject(new Error("A different creation action is still running."));
+      }
       if (observer) {
         previous.observers.add(observer);
         if (previous.snapshot) this.notify(observer, previous.snapshot);
@@ -146,6 +157,8 @@ export class CreationClient {
       key,
       input: { ...input, idempotencyKey: key },
       fingerprint,
+      retryPromptRevision:
+        typeof retryPromptRevision === "number" ? retryPromptRevision : undefined,
       observers: new Set(observer ? [observer] : []),
       result,
       resolve,
@@ -226,11 +239,30 @@ export class CreationClient {
             this.receive(snapshot);
           }
           if (operation.settled || replaying) return;
-          if (!snapshot || isResumableTopic(operation, snapshot)) {
+          if (operation.retryPromptRevision !== undefined) {
+            if (!snapshot)
+              this.fail(operation, new Error("The first question receipt is unavailable."));
+            return;
+          }
+          if (!snapshot && operation.snapshot) {
+            this.fail(operation, new Error("The creation receipt is unavailable."));
+            return;
+          }
+          if (!snapshot || snapshot.canResume) {
             replaying = true;
             void this.submit(operation).finally(() => {
               replaying = false;
             });
+            return;
+          }
+          if (
+            (snapshot.phase === "accepted" || snapshot.phase === "workspace_ready") &&
+            (operation.input.topic || this.hasExplicitMainRole(operation.kind, operation.input)) &&
+            !this.deps.supports("topicPromptRetryV1")
+          ) {
+            // Older hosts cannot say whether an owner will finish this checkpoint.
+            // Unblock the caller so it can check or explicitly resume the saved request.
+            this.fail(operation, new Error("The host has not confirmed creation."));
           }
         },
         (error) => this.fail(operation, error),
@@ -267,20 +299,6 @@ export class CreationClient {
       /* Observation does not control execution. */
     }
   }
-}
-
-function isResumableTopic(operation: Operation, snapshot: CreationSnapshot) {
-  return (
-    operation.kind === "workspace" &&
-    operation.input.topic &&
-    snapshot.phase === "workspace_ready" &&
-    !snapshot.outcomeUnknown &&
-    !snapshot.agent &&
-    !snapshot.mainAgent &&
-    snapshot.workspaceId === operation.input.workspaceId &&
-    snapshot.workspace?.id === snapshot.workspaceId &&
-    snapshot.workspace?.topic?.mainAgentId === null
-  );
 }
 
 function relativeDirectory(cwd: string, source: string): string {

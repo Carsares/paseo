@@ -116,6 +116,7 @@ import {
   type OpenCodeSubagentPresentationFacts,
   type OpenCodeSubagentPresentationState,
 } from "./opencode/subagent-presentation.js";
+import { hasProviderExecutableEnvOverride } from "../agent-sdk-types.js";
 import type { ManagedProcessRegistry } from "../../managed-processes/managed-processes.js";
 import {
   buildOpenCodePermissionRules,
@@ -1546,6 +1547,7 @@ export class OpenCodeAgentClient implements AgentClient {
         unbindBridge,
         connectServer,
         openCodeOpenOptionsPatch({ given: config, opened: openCodeConfig }),
+        this.blocksPassiveLaunch(launchContext),
       );
     } catch (error) {
       await connection.release();
@@ -1609,6 +1611,7 @@ export class OpenCodeAgentClient implements AgentClient {
         unbindBridge,
         connectServer,
         openCodeOpenOptionsPatch({ given: config, opened: openCodeConfig }),
+        this.blocksPassiveLaunch(launchContext),
       );
     } catch (error) {
       await connection.release();
@@ -1636,6 +1639,13 @@ export class OpenCodeAgentClient implements AgentClient {
         `Failed to apply OpenCode session permission rules: ${toDiagnosticErrorMessage(response.error)}`,
       );
     }
+  }
+
+  private blocksPassiveLaunch(launchContext: AgentLaunchContext | undefined): boolean {
+    return (
+      this.runtimeSettings?.command?.mode === "replace" ||
+      hasProviderExecutableEnvOverride(this.runtimeSettings?.env, launchContext?.env)
+    );
   }
 
   private async connectServer(
@@ -3521,6 +3531,7 @@ class OpenCodeAgentSession implements AgentSession {
     releaseBridge?: () => void,
     connectServer?: () => Promise<OpenCodeServerConnection>,
     openOptionsPatch: Record<string, unknown> = {},
+    private readonly blockPassiveLaunch = false,
   ) {
     this.config = config;
     this.openOptionsPatch = openOptionsPatch;
@@ -5159,15 +5170,19 @@ class OpenCodeAgentSession implements AgentSession {
   }
 
   async listCommands(options?: { allowLaunch?: boolean }): Promise<AgentSlashCommand[]> {
-    if (options?.allowLaunch === false && (this.closed || this.serverExited)) {
+    return this.readCommands(options?.allowLaunch !== false && !this.blockPassiveLaunch);
+  }
+
+  private async readCommands(allowLaunch: boolean): Promise<AgentSlashCommand[]> {
+    if (!allowLaunch && (this.closed || this.serverExited)) {
       return this.commandCache;
     }
     try {
-      if (options?.allowLaunch !== false) await this.reconnectIfServerExited();
+      if (allowLaunch) await this.reconnectIfServerExited();
       this.commandCache = await listOpenCodeCommandsFromSdk(this.client, this.config.cwd);
       return this.commandCache;
     } catch (error) {
-      if (options?.allowLaunch === false) return this.commandCache;
+      if (!allowLaunch) return this.commandCache;
       throw error;
     }
   }
@@ -5395,7 +5410,7 @@ class OpenCodeAgentSession implements AgentSession {
       return null;
     }
     try {
-      const commands = await this.listCommands();
+      const commands = await this.readCommands(true);
       return commands.some((command) => command.name === parsed.commandName) ? parsed : null;
     } catch (error) {
       this.logger.warn(

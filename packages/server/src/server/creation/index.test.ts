@@ -405,7 +405,7 @@ test.each(["accepted", "unknown", "absent"] as const)(
       },
       ...(outcome === "accepted"
         ? { phase: "completed", initialPromptStarted: true }
-        : { phase: "failed", failedStage: "prompt", outcomeUnknown: true }),
+        : { phase: "failed", failedStage: "prompt", outcomeUnknown: outcome === "unknown" }),
     });
     expect(await restarted.create(input)).toEqual(snapshot);
     expect(creates).toBe(1);
@@ -884,3 +884,118 @@ test("observer failures are logged without failing creation", async () => {
     }),
   );
 });
+
+test("only an idle accepted receipt advertises continuation and keeps its claimed IDs", async () => {
+  const f = await fixture();
+  const claim = deferred();
+  const entered = deferred();
+  const restartedDirectory = await mkdtemp(join(tmpdir(), "creation-idle-accepted-"));
+  directories.push(restartedDirectory);
+  const first = f.service.create({
+    ...f.input,
+    exists: async () => {
+      entered.resolve();
+      await claim.promise;
+      return false;
+    },
+  });
+  await entered.promise;
+  await cp(f.directory, restartedDirectory, { recursive: true });
+  claim.resolve();
+  const active = await f.service.subscribe("workspace", f.input.key, () => {});
+  active.unsubscribe();
+  expect(active.snapshot?.canResume).toBeUndefined();
+  f.provider.resolve();
+  await first;
+
+  const restarted = new CreationService(restartedDirectory, silentLogger);
+  const idle = await restarted.subscribe("workspace", f.input.key, () => {});
+  idle.unsubscribe();
+  expect(idle.snapshot).toMatchObject({
+    phase: "accepted",
+    canResume: true,
+    workspaceId: workspace.id,
+    agentId: agent.id,
+  });
+  await expect(restarted.create({ ...f.input, exists: async () => true })).rejects.toThrow(
+    "workspace_id_conflict",
+  );
+  await expect(restarted.create(f.input)).resolves.toMatchObject({
+    phase: "completed",
+    workspaceId: workspace.id,
+    agentId: agent.id,
+  });
+});
+
+test("a stale refusal version cannot send a first question after one explicit attempt", async () => {
+  const f = await fixture();
+  let sends = 0;
+  const input: CreationInput = {
+    ...f.input,
+    request: { topic, initialPrompt: "Preserve the original" },
+    provision: async () => ({ workspace: topicWorkspace }),
+    promptMessageId: "prompt-1",
+    promptReceiptFingerprint: "original",
+    createAgent: async (_id, _workspace, onReady) => {
+      await onReady(topicMain);
+      return { agent: topicMain, initialPromptStarted: true };
+    },
+    readPromptOutcome: async () => "absent",
+    retryTopicPrompt: async (target) => {
+      expect(target).toEqual({
+        agentId: topicMain.id,
+        workspaceId: workspace.id,
+        messageId: "prompt-1",
+        fingerprint: "original",
+      });
+      sends++;
+    },
+  };
+  const refused = await f.service.create(input);
+  expect(refused).toMatchObject({ phase: "failed", outcomeUnknown: false });
+  await expect(f.service.create(input)).resolves.toEqual(refused);
+  const retry = { ...input, retryPromptRevision: refused.revision };
+  const [second, duplicate] = await Promise.all([f.service.create(retry), f.service.create(retry)]);
+  expect(second).toMatchObject({ phase: "failed", outcomeUnknown: false });
+  expect(second.revision).toBeGreaterThan(refused.revision);
+  expect(duplicate).toEqual(second);
+  await expect(new CreationService(f.directory, silentLogger).create(retry)).resolves.toEqual(
+    second,
+  );
+  expect(sends).toBe(1);
+});
+
+test.each(["unknown", "throw", "rebound"] as const)(
+  "an interrupted agent-ready checkpoint stays unknown when recovery reports %s",
+  async (state) => {
+    const f = await fixture();
+    const restartedDirectory = await mkdtemp(join(tmpdir(), "creation-agent-ready-"));
+    directories.push(restartedDirectory);
+    const input: CreationInput = {
+      ...f.input,
+      request: { topic },
+      promptMessageId: "message-1",
+      promptReceiptFingerprint: "fingerprint-1",
+      provision: async () => ({ workspace: topicWorkspace }),
+      createAgent: async (_id, _workspace, onReady) => {
+        await onReady(topicMain);
+        await cp(f.directory, restartedDirectory, { recursive: true });
+        return { agent: topicMain, initialPromptStarted: false };
+      },
+      readPromptOutcome: async () => {
+        if (state === "throw") throw new Error("receipt unreadable");
+        return state === "unknown" ? "unknown" : "absent";
+      },
+      isTopicPromptBound: async () => state !== "rebound",
+    };
+    await f.service.create(input);
+    const restarted = new CreationService(restartedDirectory, silentLogger);
+    const receipt = await restarted.subscribe("workspace", input.key, () => {}, input);
+    receipt.unsubscribe();
+    expect(receipt.snapshot).toMatchObject({
+      phase: "failed",
+      failedStage: "prompt",
+      outcomeUnknown: true,
+    });
+  },
+);

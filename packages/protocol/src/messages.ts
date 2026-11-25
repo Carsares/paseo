@@ -2112,6 +2112,7 @@ export const AgentCreateRequestSchema = CreateAgentRequestMessageSchema.extend({
   attachments: z.array(LegacyAgentAttachmentSchema).optional(),
   subscribe: z.boolean().optional(),
   workspaceRole: z.literal("main").optional(),
+  retryPromptRevision: z.number().int().nonnegative().optional(),
 });
 
 export const WorkspaceInitialAgentSchema = AgentCreateRequestSchema.omit({
@@ -2124,6 +2125,7 @@ export const WorkspaceInitialAgentSchema = AgentCreateRequestSchema.omit({
   worktreeName: true,
   git: true,
   sideChatFromAgentId: true,
+  retryPromptRevision: true,
 });
 
 export const CreationSubscribeRequestSchema = z.object({
@@ -2839,6 +2841,9 @@ export const AgentRewindCheckpointGetResponseSchema = z.object({
     canRewindBoth: z.boolean().optional(),
     pendingFiles: z
       .array(RewindCheckpointOperationSchema.pick({ operationId: true, conversationRewound: true }))
+      .optional(),
+    unconfirmedFileRewinds: z
+      .array(RewindCheckpointOperationSchema.pick({ operationId: true }))
       .optional(),
   }),
 });
@@ -3993,6 +3998,7 @@ export const WorkspaceCreateRequestSchema = z.object({
     .optional(),
   agent: WorkspaceInitialAgentSchema.optional(),
   mainAgent: WorkspaceMainAgentInitSchema.optional(),
+  retryPromptRevision: z.number().int().nonnegative().optional(),
   subscribe: z.boolean().optional(),
   requestId: z.string(),
   idempotencyKey: z.string().min(1).max(512).optional(),
@@ -5216,6 +5222,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentCreateAsMain: z.boolean().optional(),
         // COMPAT(topicWorkbenchV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
         topicWorkbenchV1: z.boolean().optional(),
+        // COMPAT(topicPromptRetryV1): added in v0.18.0, remove after 2027-06-01.
+        topicPromptRetryV1: z.boolean().optional(),
         // COMPAT(workspaceDurableItemsV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
         workspaceDurableItemsV1: z.boolean().optional(),
         // COMPAT(checkoutGitStagingV1): added in v0.18.0, remove gate after 2027-06-01 once daemon floor >= v0.18.0.
@@ -6611,6 +6619,8 @@ export const CreationSnapshotSchema = z.object({
   errorCode: z.string().optional(),
   failedStage: z.enum(["workspace", "agent", "prompt"]).optional(),
   outcomeUnknown: z.boolean().optional(),
+  // Only a fresh subscription can report a checkpoint that has no executing owner.
+  canResume: z.boolean().optional(),
 });
 export type CreationSnapshot = z.infer<typeof CreationSnapshotSchema>;
 export type AgentCreateRequest = z.infer<typeof AgentCreateRequestSchema>;

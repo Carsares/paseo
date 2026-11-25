@@ -12,7 +12,14 @@ import {
 } from "./agent/checkpoints/checkpoint-service.js";
 import { captureWorktreeSnapshot } from "./agent/checkpoints/snapshot.js";
 import { CheckpointStore, stableKey } from "./agent/checkpoints/store.js";
-import { isMissing, withCheckpointLock } from "./agent/checkpoints/worktree.js";
+import {
+  isMissing,
+  sameWorktree,
+  withCheckpointLock,
+  worktreeIdentitySchema,
+  type WorktreeIdentity,
+} from "./agent/checkpoints/worktree.js";
+import type { ConfirmedRewind } from "./agent/agent-storage.js";
 import type { AgentRewindDirectories } from "./agent-rewind-scope.js";
 import { readCheckpointDiff } from "./agent-checkpoint-diff.js";
 import { verifyCheckpointAttribution } from "./agent-rewind-attribution.js";
@@ -27,6 +34,7 @@ const journalSchema = z.object({
   timelineId: z.string(),
   turnId: z.string(),
   expectedCurrent: z.string(),
+  worktree: worktreeIdentitySchema.optional(),
   state: z.enum(["awaiting_conversation", "files_only", "conversation_confirmed"]),
 });
 
@@ -78,7 +86,7 @@ export class AgentRewindCheckpoints {
     mode: "files" | "both";
     validate: () => Promise<void>;
     verifyChanges: (files: string[], expectedCurrent: string) => Promise<void>;
-    rewindConversation: () => Promise<void>;
+    rewindConversation: (confirmation: ConfirmedRewind) => Promise<void>;
   }) {
     const { scope, turn } = input;
     const target = {
@@ -117,14 +125,23 @@ export class AgentRewindCheckpoints {
       timelineId: turn.timelineId,
       turnId: turn.turnId,
       expectedCurrent: preview.expectedCurrent,
+      worktree: worktree.worktree,
       state: input.mode === "both" ? "awaiting_conversation" : "files_only",
     };
     await input.validate();
     await this.save(scope, journal);
     if (input.mode === "both") {
-      await input.rewindConversation();
+      await input.rewindConversation({
+        operationId: journal.operationId,
+        agentId: scope.agentId,
+        workspaceId: scope.workspaceId,
+        messageId: journal.messageId,
+        checkpointId: journal.checkpointId,
+        worktree: worktree.worktree,
+      });
+      // Recovery reads the confirmation from the saved session, even if file
+      // restore has not started. The journal alone cannot confirm the rewind.
       journal.state = "conversation_confirmed";
-      await this.save(scope, journal);
     }
     return this.restoreFiles(scope, journal, input.validate);
   }
@@ -133,38 +150,86 @@ export class AgentRewindCheckpoints {
     scope: CheckpointScope;
     operationId: string;
     validate: () => Promise<void>;
+    confirmations: readonly ConfirmedRewind[];
   }) {
     const { scope } = input;
     const operationId = z.uuid().parse(input.operationId);
     if (!(await this.store(scope).open(false))) throw new Error("Restore operation is unavailable");
     const journal = await this.readJournal(scope, operationId);
-    if (!journal || journal.state === "awaiting_conversation") {
-      throw new Error("Restore operation is unavailable");
+    if (!journal) throw new Error("Restore operation is unavailable");
+    const worktree = await this.requireWorktree(scope);
+    this.assertJournalWorktree(journal, worktree);
+    const confirmed = this.withConfirmation(scope, journal, worktree, input.confirmations);
+    if (confirmed.state === "awaiting_conversation") {
+      throw new Error("Conversation rewind is unconfirmed. Files were not restored.");
     }
-    return this.restoreFiles(scope, journal, input.validate);
+    return this.restoreFiles(scope, confirmed, input.validate);
   }
 
-  async getPendingFiles(scope: CheckpointScope) {
-    if (!(await this.store(scope).open(false))) return [];
+  async getFileRecovery(scope: CheckpointScope, confirmations: readonly ConfirmedRewind[]) {
+    const pendingFiles: Array<{ operationId: string; conversationRewound: boolean }> = [];
+    const unconfirmedFileRewinds: Array<{ operationId: string }> = [];
+    if (!(await this.store(scope).open(false))) return { pendingFiles, unconfirmedFileRewinds };
+    const worktree = await this.requireWorktree(scope);
     const operations = await this.service.listRestoreOperations(scope);
     const applied = new Set(
       operations.filter(({ status }) => status === "applied").map(({ operationId }) => operationId),
     );
-    const pending = [];
     // The journal precedes file writes, so it also covers interruption before
     // CheckpointService could record an operation.
     for (const name of await readdir(this.journalDirectory(scope))) {
       const id = z.uuid().safeParse(/^rewind-(.+)\.json$/.exec(name)?.[1]);
       if (!id.success || applied.has(id.data)) continue;
-      const journal = await this.readJournal(scope, id.data);
-      if (journal && journal.state !== "awaiting_conversation") {
-        pending.push({
+      const saved = await this.readJournal(scope, id.data);
+      if (!saved) continue;
+      this.assertJournalWorktree(saved, worktree);
+      const journal = this.withConfirmation(scope, saved, worktree, confirmations);
+      if (journal.state === "awaiting_conversation") {
+        unconfirmedFileRewinds.push({ operationId: journal.operationId });
+      } else {
+        pendingFiles.push({
           operationId: journal.operationId,
           conversationRewound: journal.state === "conversation_confirmed",
         });
       }
     }
-    return pending;
+    return { pendingFiles, unconfirmedFileRewinds };
+  }
+
+  private withConfirmation(
+    scope: CheckpointScope,
+    journal: Journal,
+    worktree: WorktreeIdentity,
+    confirmations: readonly ConfirmedRewind[],
+  ): Journal {
+    if (
+      journal.state === "awaiting_conversation" &&
+      journal.worktree &&
+      confirmations.some(
+        (confirmed) =>
+          confirmed.operationId === journal.operationId &&
+          confirmed.agentId === scope.agentId &&
+          confirmed.workspaceId === scope.workspaceId &&
+          confirmed.messageId === journal.messageId &&
+          confirmed.checkpointId === journal.checkpointId &&
+          sameWorktree(confirmed.worktree, worktree),
+      )
+    ) {
+      return { ...journal, state: "conversation_confirmed" };
+    }
+    return journal;
+  }
+
+  private async requireWorktree(scope: CheckpointScope): Promise<WorktreeIdentity> {
+    const eligibility = await this.service.eligibility(scope);
+    if (!eligibility.allowed) throw new Error(eligibility.reason);
+    return eligibility.worktree;
+  }
+
+  private assertJournalWorktree(journal: Journal, worktree: WorktreeIdentity): void {
+    if (journal.worktree && !sameWorktree(journal.worktree, worktree)) {
+      throw new Error("Checkpoint worktree was replaced");
+    }
   }
 
   private async readJournal(scope: CheckpointScope, operationId: string) {

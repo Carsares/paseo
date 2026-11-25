@@ -43,25 +43,13 @@ export function isRejectedBoundTopicPrompt(
   );
 }
 
-/** A timeline match is positive evidence only. An absent or truncated page cannot prove rejection. */
-export async function readTopicPromptReceipt(
-  client: Pick<DaemonClient, "fetchAgentTimeline">,
-  agentId: string,
-  clientMessageId: string,
-): Promise<"recorded" | "not-found" | "unavailable"> {
-  try {
-    const page = await client.fetchAgentTimeline(agentId, { direction: "tail", limit: 100 });
-    if (page.error || page.agentId !== agentId) return "unavailable";
-    return page.entries.some(
-      ({ item }) =>
-        item.type === "user_message" &&
-        (item.clientMessageId === clientMessageId || item.messageId === clientMessageId),
-    )
-      ? "recorded"
-      : "not-found";
-  } catch {
-    return "unavailable";
-  }
+/** A rejected attempt may be on the timeline. Only the creation receipt proves acceptance. */
+export function isTopicPromptAccepted(receipt: CreationSnapshot | null | undefined) {
+  return Boolean(
+    receipt &&
+    !receipt.outcomeUnknown &&
+    (receipt.initialPromptStarted === true || receipt.phase === "prompt_started"),
+  );
 }
 
 /**

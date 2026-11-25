@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { createTestLogger } from "../../../test-utils/test-logger.js";
+import { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
 import type { Event as OpenCodeEvent } from "@opencode-ai/sdk/v2/client";
 import { OpencodeClient } from "@opencode-ai/sdk/v2/client";
 import { createClient as createOpenCodeHttpClient } from "@opencode-ai/sdk/v2/gen/client";
@@ -343,6 +344,52 @@ describe("OpenCodeAgentClient adapter smoke tests", () => {
     provider: "opencode",
     cwd,
     model: TEST_MODEL,
+  });
+
+  test("retains OpenCode 1.x commands without relaunching an old CLI after reload", async () => {
+    const cwd = tmpCwd();
+    const argv: [string] = ["/old/opencode"];
+    const manager = new ProviderSnapshotManager({
+      logger,
+      providerOverrides: { opencode: { command: argv, deferDiscovery: true } },
+    });
+    const runtime = new TestOpenCodeHarness();
+    const first = new TestOpenCodeClient();
+    const second = new TestOpenCodeClient();
+    first.commandListResponse = { data: [{ name: "cached-test", description: "Cached command" }] };
+    runtime.enqueueClient(first);
+    runtime.enqueueClient(second);
+    const provider = new OpenCodeAgentClient(
+      logger,
+      { command: { mode: "replace", argv } },
+      {
+        serverManager: runtime,
+        createClient: runtime.createClient,
+      },
+    );
+    const env = { PATH: "/old/bin" };
+    const session = await provider.createSession(buildConfig(cwd), { env });
+    try {
+      expect(manager.canLaunchProviderForRead("opencode")).toBe(false);
+      const commands = await session.listCommands!({ allowLaunch: false });
+      expect(commands.map(({ name }) => name)).toContain("cached-test");
+
+      manager.applyMutableProviderConfig(undefined, { replace: true });
+      expect(manager.canLaunchProviderForRead("opencode")).toBe(true);
+      const options = { allowLaunch: true };
+      expect(await session.listCommands!(options)).toEqual(commands);
+      first.emitEvent({ type: "server-exited", error: new Error("Test OpenCode exited") });
+      expect(await session.listCommands!(options)).toEqual(commands);
+      expect(runtime.acquisitions).toHaveLength(1);
+
+      await session.startTurn("continue on the original CLI");
+      expect(runtime.acquisitions.map((acquisition) => acquisition.env)).toEqual([env, env]);
+      expect(second.calls.sessionPromptAsync).toHaveLength(1);
+    } finally {
+      await session.close();
+      manager.destroy();
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   test.each([

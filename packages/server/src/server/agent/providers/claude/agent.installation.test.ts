@@ -9,6 +9,8 @@ import { installationActivity } from "../../provider-installation/installation-a
 import { readInstallationActivityKeys } from "../../provider-installation/installation-target.js";
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import * as spawnUtils from "../../../../utils/spawn.js";
+import { DaemonConfigStore } from "../../../daemon-config-store.js";
+import { prepareCustomProviderCliDiscovery } from "../../custom-provider-cli.js";
 import { ClaudeAgentClient } from "./agent.js";
 import { discoverClaudeModels } from "./model-discovery.js";
 import { claudeQuery, type ClaudeQueryFactory } from "./query.js";
@@ -53,6 +55,46 @@ test.skipIf(process.platform === "win32")(
     expect(spawn).not.toHaveBeenCalled();
   },
 );
+
+test("managed Claude refresh reads the local settings without needing a process", async () => {
+  await writeFile(
+    path.join(root, "settings.json"),
+    JSON.stringify({ model: "local-custom-model" }),
+  );
+  const argv: [string] = [process.execPath];
+  const env = { CLAUDE_CONFIG_DIR: root };
+  const configStore = new DaemonConfigStore(root, {
+    providers: { "managed-claude": { extends: "claude", command: argv, env } },
+    mcp: { injectIntoAgents: false },
+    browserTools: { enabled: false },
+    metadataGeneration: { providers: [] },
+    autoArchiveAfterMerge: false,
+    enableTerminalAgentHooks: false,
+    appendSystemPrompt: "",
+  });
+  const client = new ClaudeAgentClient({
+    logger: createTestLogger(),
+    runtimeSettings: { command: { mode: "replace", argv }, env },
+    resolveVersion: vi.fn(async () => {
+      throw new Error("version probe must not run");
+    }),
+    discoverModels: vi.fn(async () => {
+      throw new Error("model discovery must not spawn");
+    }),
+  });
+  const approval = await prepareCustomProviderCliDiscovery(
+    { mode: "edit", providerId: "managed-claude" },
+    { configStore, isRegisteredProvider: () => true, isPluginProvider: () => false },
+    root,
+  );
+  if (approval.status !== "ok")
+    throw new Error(`Claude discovery could not start: ${approval.status}`);
+  const spawn = vi.spyOn(spawnUtils, "spawnProcess");
+  const catalog = await approval.run(() => client.fetchCatalog({ scope: "global", force: true }));
+  expect(catalog.models).toContainEqual(expect.objectContaining({ id: "local-custom-model" }));
+  expect(catalog.installedVersion).toBeUndefined();
+  expect(spawn).not.toHaveBeenCalled();
+});
 
 test("takes the installation lock at model discovery spawn and releases it on child close", async () => {
   const binary = path.join(root, "fake-claude.cjs");

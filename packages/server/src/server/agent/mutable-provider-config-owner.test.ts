@@ -599,6 +599,135 @@ describe("mutable provider config owner", () => {
   }, 20_000);
 
   test.skipIf(nativePlatform === "win32").each([
+    {
+      adapter: "claude",
+      packageName: "@anthropic-ai/claude-code",
+      version: "2.1.95",
+      releaseUrl: "https://registry.npmjs.org/@anthropic-ai%2fclaude-code/latest",
+    },
+    {
+      adapter: "pi",
+      packageName: "@earendil-works/pi-coding-agent",
+      version: "1.2.3",
+      releaseUrl: "https://pi.dev/api/latest-version",
+    },
+    {
+      adapter: "pi",
+      packageName: "@mariozechner/pi-coding-agent",
+      version: "0.73.0",
+      releaseUrl: undefined,
+    },
+  ] as const)(
+    "authorized $adapter refresh publishes $packageName only from its launch files",
+    async (testCase) => {
+      const { adapter, packageName, version, releaseUrl } = testCase;
+      const root = mkdtempSync(path.join(tmpdir(), "paseo-managed-release-"));
+      tempDirs.push(root);
+      const directory = path.join(root, "node_modules", packageName);
+      const executable = path.join(directory, "cli.cjs");
+      const marker = path.join(root, "invocations");
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(
+        path.join(directory, "package.json"),
+        JSON.stringify({
+          name: packageName,
+          version,
+          bin: { [adapter]: "cli.cjs" },
+        }),
+      );
+      writeFileSync(
+        executable,
+        `
+      #!${process.execPath}
+      require("node:fs").appendFileSync(${JSON.stringify(marker)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+      require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
+        const { id, type } = JSON.parse(line);
+        const model = { provider: "test", id: "pi-model", name: "Pi Model" };
+        const data = type === "get_available_models" ? { models: [model] } : { model };
+        console.log(JSON.stringify({ type: "response", id, success: true, data }));
+      });
+    `.trim(),
+        { mode: 0o700 },
+      );
+      writeFileSync(
+        path.join(root, "settings.json"),
+        JSON.stringify({ model: "local-claude-model" }),
+      );
+      const fetchRelease = vi.fn(async () => Response.json({ version: "3.0.0" }));
+      vi.stubGlobal("fetch", fetchRelease);
+      onTestFinished(() => vi.unstubAllGlobals());
+      const daemon = await createTestPaseoDaemon({
+        mcpEnabled: false,
+        agentClients: {},
+        providerOverrides: { ...CONTROLLED_PROVIDERS, codex: { enabled: false } },
+      });
+      const url = `ws://127.0.0.1:${daemon.port}/ws`;
+      const reader = new DaemonClient({ url, sessionPermissions: ["daemon.read"] });
+      const owner = new DaemonClient({ url });
+      const providerId = `managed-${adapter}-release`;
+      const inspect = (refresh = false) =>
+        reader.inspectProviderInstallation(providerId, { refresh });
+      try {
+        await Promise.all([reader.connect(), owner.connect()]);
+        expect(
+          (
+            await owner.saveCustomProviderCli({
+              mode: "create",
+              providerId,
+              extends: adapter,
+              label: `Managed ${adapter}`,
+              command: [executable],
+              env: { CLAUDE_CONFIG_DIR: root, PI_CODING_AGENT_DIR: root },
+            })
+          ).result,
+        ).toMatchObject({ status: "ok" });
+        await reader.refreshProvidersSnapshot({ providers: [providerId] });
+        expect((await inspect()).installation?.inspection).toBeUndefined();
+        expect(existsSync(marker)).toBe(false);
+        await owner.refreshProvidersSnapshot({ providers: [providerId] });
+        expect(
+          (await reader.getProvidersSnapshot()).entries.find(
+            ({ provider }) => provider === providerId,
+          ),
+        ).toMatchObject({
+          status: "ready",
+          models: expect.arrayContaining([
+            expect.objectContaining({
+              id: adapter === "pi" ? "test/pi-model" : "local-claude-model",
+            }),
+          ]),
+        });
+        for (const refreshInspection of [false, true]) {
+          expect((await inspect(refreshInspection)).installation?.inspection).toEqual({
+            status: "installed",
+            version,
+          });
+        }
+        const { updateCheck } = await reader.checkProviderUpdates(providerId);
+        if (releaseUrl) {
+          expect(updateCheck).toEqual({ status: "available", versions: ["3.0.0"] });
+          expect(fetchRelease).toHaveBeenCalledExactlyOnceWith(releaseUrl, expect.any(Object));
+        } else {
+          expect(updateCheck).toEqual({
+            status: "unknown",
+            message: expect.stringContaining("release source"),
+          });
+          expect(fetchRelease).not.toHaveBeenCalled();
+        }
+        if (adapter === "pi") {
+          expect(readFileSync(marker, "utf8")).toBe('["--mode","rpc","--no-session"]\n');
+        } else {
+          expect(existsSync(marker)).toBe(false);
+        }
+      } finally {
+        await Promise.all([reader.close(), owner.close()]);
+        await daemon.close();
+      }
+    },
+    20_000,
+  );
+
+  test.skipIf(nativePlatform === "win32").each([
     { catalog: "dynamic", replacementModels: undefined },
     { catalog: "static", replacementModels: [{ id: "configured-model", label: "Configured" }] },
   ])(
@@ -657,7 +786,7 @@ describe("mutable provider config owner", () => {
       const reader = new DaemonClient({ url, sessionPermissions: ["daemon.read"] });
       const owner = new DaemonClient({ url });
       const provider = "managed-codex-release";
-      const inspect = () => reader.inspectProviderInstallation(provider, { refresh: true });
+      const inspect = (refresh = true) => reader.inspectProviderInstallation(provider, { refresh });
       const check = () => reader.checkProviderUpdates(provider, { refresh: true });
       const refresh = () => owner.refreshProvidersSnapshot({ providers: [provider] });
       try {
@@ -712,9 +841,22 @@ describe("mutable provider config owner", () => {
         });
         expect(fetchRelease).toHaveBeenCalledTimes(1);
         rmSync(command);
+        for (const refreshInspection of [false, true]) {
+          expect((await inspect(refreshInspection)).installation?.inspection).toEqual({
+            status: "not_installed",
+          });
+        }
         expect((await reader.checkProviderUpdates(provider)).updateCheck).toMatchObject({
           status: "unknown",
         });
+        makeCli(command, "0.151.0");
+        for (const refreshInspection of [false, true]) {
+          expect((await inspect(refreshInspection)).installation?.inspection).toEqual({
+            status: "error",
+            message: expect.stringContaining("installation changed"),
+          });
+        }
+        expect((await check()).updateCheck).toMatchObject({ status: "unknown" });
         expect(readFileSync(marker, "utf8")).toBe("app-server\n");
 
         expect(

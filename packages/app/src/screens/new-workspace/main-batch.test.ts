@@ -188,6 +188,7 @@ async function harness(initial: MainDraftBatch) {
         fetchAgent,
         getCreationSnapshot,
         fetchAgentTimeline,
+        supportsTopicPromptRetry: () => true,
       },
       save,
       acceptSnapshots,
@@ -453,7 +454,7 @@ describe("multi-model workspace creation", () => {
         type: "workspace.create.update",
         payload: { ...receipt, idempotencyKey: "different-key", revision: receipt.revision + 1 },
       });
-      // A later update wakes the original operation without submitting it again.
+      // The timeline can show a refused attempt. Only a later acceptance receipt settles it.
       client.fetchAgentTimeline.mockResolvedValue({
         agentId: main.id,
         error: null,
@@ -465,7 +466,15 @@ describe("multi-model workspace creation", () => {
       } as Awaited<ReturnType<DaemonClient["fetchAgentTimeline"]>>);
       onMessage({
         type: "workspace.create.update",
-        payload: { ...receipt, revision: receipt.revision + 1 },
+        payload: {
+          ...receipt,
+          revision: receipt.revision + 1,
+          phase: "completed",
+          initialPromptStarted: true,
+          outcomeUnknown: undefined,
+          failedStage: undefined,
+          error: null,
+        },
       });
       expect(await listened.promise).toEqual(expected);
       await vi.waitFor(() => expect(unsubscribe).toHaveBeenCalledTimes(1));
@@ -688,7 +697,7 @@ describe("multi-model workspace creation", () => {
     expect(h.createWorkspace).toHaveBeenCalledTimes(4);
   });
 
-  it.each(["rejected", "receipt-unavailable", "rebound"] as const)(
+  it.each(["rejected", "receipt-unavailable", "rebound", "old-host"] as const)(
     "offers single topic retry only for a known rejection with the same Main Session (%s)",
     async (state) => {
       const topic = { summary: null, hideFromModel: false };
@@ -724,22 +733,28 @@ describe("multi-model workspace creation", () => {
         getCreationSnapshot: vi.fn<BatchClient["getCreationSnapshot"]>().mockResolvedValue(receipt),
         findWorkspace: vi.fn<BatchClient["findWorkspace"]>().mockResolvedValue(current),
         fetchAgent: vi.fn<BatchClient["fetchAgent"]>(),
-        fetchAgentTimeline: vi
-          .fn<BatchClient["fetchAgentTimeline"]>()
-          .mockResolvedValue(emptyTimeline("main")),
+        supportsTopicPromptRetry: () => state !== "old-host",
+        fetchAgentTimeline: vi.fn<BatchClient["fetchAgentTimeline"]>().mockResolvedValue({
+          ...emptyTimeline("main"),
+          entries: [{ item: { type: "user_message", clientMessageId: "original-first-question" } }],
+        } as Awaited<ReturnType<BatchClient["fetchAgentTimeline"]>>),
       };
       if (state === "receipt-unavailable") {
         client.getCreationSnapshot.mockRejectedValue(new Error("Receipt unavailable"));
       }
       const retryable = state === "rejected";
-      expect((await runTopicCreation(client, request, "check", receipt)).stage).toBe(
-        retryable ? "retryable" : "unconfirmed",
-      );
+      const checked = await runTopicCreation(client, request, "check", receipt);
+      if (state === "old-host") expect(checked).toMatchObject({ updateHost: true });
+      expect(checked.stage).toBe(retryable ? "retryable" : "unconfirmed");
       expect(client.createWorkspace).not.toHaveBeenCalled();
       expect((await runTopicCreation(client, request, "retry", receipt)).stage).toBe(
         retryable ? "succeeded" : "unconfirmed",
       );
-      if (retryable) expect(client.createWorkspace).toHaveBeenCalledExactlyOnceWith(request);
+      if (retryable)
+        expect(client.createWorkspace).toHaveBeenCalledExactlyOnceWith({
+          ...request,
+          retryPromptRevision: receipt.revision,
+        });
       else expect(client.createWorkspace).not.toHaveBeenCalled();
     },
   );
@@ -790,7 +805,7 @@ describe("multi-model workspace creation", () => {
     });
     await h.run({ kind: "retry", workspaceId: itemId });
     expect(h.createWorkspace).toHaveBeenCalledTimes(5);
-    expect(h.createWorkspace.mock.calls[4]![0]).toEqual(original);
+    expect(h.createWorkspace.mock.calls[4]![0]).toEqual({ ...original, retryPromptRevision: 2 });
     expect(findBatchItem(await h.read(), itemId)?.stage).toBe("succeeded");
     expect(h.createAgent).not.toHaveBeenCalled();
   });

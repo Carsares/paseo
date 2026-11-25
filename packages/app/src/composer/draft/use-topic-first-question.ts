@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import type { AgentSnapshotPayload, CreationSnapshot } from "@getpaseo/protocol/messages";
 import { useStableEvent } from "@/hooks/use-stable-event";
@@ -28,6 +29,7 @@ export function useTopicFirstQuestion(input: {
   onConfirmed: (agent: AgentSnapshotPayload) => Promise<void>;
 }) {
   const { client } = input;
+  const { t } = useTranslation();
   const draftId = input.enabled ? input.draftId : null;
   const [loaded, setLoaded] = useState<{ id: string; item: SavedTopicQuestion | null }>();
   const [outcome, setOutcome] = useState<TopicQuestionOutcome>();
@@ -70,6 +72,10 @@ export function useTopicFirstQuestion(input: {
     async (action: "check" | "retry", update?: CreationSnapshot, background = false) => {
       if (!draftId || !client || !input.isConnected || !input.isDraftHydrated || submitting.current)
         return false;
+      const expectedPromptRevision =
+        action === "retry" && outcome?.stage === "retry"
+          ? (outcome.retryPromptRevision ?? null)
+          : null;
       if (!background) setChecking(true);
       try {
         return await withTopicQuestionOperation(draftId, async () => {
@@ -78,6 +84,7 @@ export function useTopicFirstQuestion(input: {
           const result = await runTopicQuestionAction(client, item, action, {
             update,
             assertAvailable: input.assertAvailable,
+            expectedPromptRevision,
           });
           setError(undefined);
           setOutcome(result);
@@ -137,7 +144,7 @@ export function useTopicFirstQuestion(input: {
     check,
     submit,
     outcome,
-    error,
+    error: error ?? (outcome?.stage === "update-host" ? t("topicWorkbench.updateHost") : undefined),
     isChecking,
     isLocked: Boolean(draftId) && saved !== null,
     hasSavedQuestion: Boolean(saved),

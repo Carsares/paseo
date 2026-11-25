@@ -2,6 +2,7 @@ import type { FormInfo, ModelInfo, SessionMessageInfo } from "@opencode/client";
 import { describe, expect, test } from "vitest";
 
 import { createTestLogger } from "../../../../../test-utils/test-logger.js";
+import { ProviderSnapshotManager } from "../../../provider-snapshot-manager.js";
 import type { AgentStreamEvent } from "../../../agent-sdk-types.js";
 import { OpenCodeV2AgentClient } from "./agent.js";
 import { V2Harness } from "../test-utils/v2-harness.js";
@@ -830,9 +831,16 @@ describe("OpenCode v2 session lifecycle", () => {
     }
   });
 
-  test("reconnects after a helper exits and restores session configuration on the next turn", async () => {
+  test("keeps OpenCode 2.x commands after reload and reconnects on the next turn", async () => {
+    const argv: [string] = ["/old/opencode"];
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      providerOverrides: { opencode: { command: argv, deferDiscovery: true } },
+    });
     const first = new V2Harness();
     const second = new V2Harness(1);
+    first.api.command.list = async ({ location }) => ({ location, data: [] });
+    first.api.skill.list = async ({ location }) => ({ location, data: [] });
     let exit!: (error: Error) => void;
     const exited = new Promise<Error>((resolve) => {
       exit = resolve;
@@ -840,6 +848,7 @@ describe("OpenCode v2 session lifecycle", () => {
     let acquisitions = 0;
     const client = new OpenCodeV2AgentClient({
       logger: createTestLogger(),
+      settings: { command: { mode: "replace", argv } },
       runtime: {
         acquire: async () => {
           acquisitions += 1;
@@ -868,10 +877,17 @@ describe("OpenCode v2 session lifecycle", () => {
       },
       { env: { TOKEN: "test" } },
     );
+    const commands = await session.listCommands!({ allowLaunch: false });
+    expect(commands.map(({ name }) => name)).toContain("compact");
+    expect(manager.canLaunchProviderForRead("opencode")).toBe(false);
+    manager.applyMutableProviderConfig(undefined, { replace: true });
+    expect(manager.canLaunchProviderForRead("opencode")).toBe(true);
+    expect(await session.listCommands!({ allowLaunch: true })).toEqual(commands);
     const running = session.run("before exit");
     await expect.poll(() => first.prompts).toEqual(["before exit"]);
     exit(new Error("helper exited"));
     await expect(running).rejects.toThrow("helper exited");
+    expect(await session.listCommands!({ allowLaunch: true })).toEqual(commands);
     expect(acquisitions).toBe(1);
     try {
       expect((await session.run("after exit")).finalText).toBe("recovered");
@@ -884,6 +900,7 @@ describe("OpenCode v2 session lifecycle", () => {
       expect(first.releases).toBe(1);
     } finally {
       await session.close();
+      manager.destroy();
     }
     await expect(session.startTurn("after close")).rejects.toThrow("OpenCode session is closed");
   });

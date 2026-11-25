@@ -84,156 +84,223 @@ test("partial success stays clear when a file-only retry fails", async () => {
   expect(retry).toHaveBeenCalledOnce();
 });
 
-test("retry uses the operation ID without rewinding conversation again", async () => {
-  const serverId = "checkpoint-test";
-  const agentId = "agent";
-  const messageId = "message";
-  const checkpointId = "checkpoint";
-  const operation = {
-    operationId: "operation",
-    target: { checkpointId, messageId },
-    backupCheckpointId: "backup",
-    conversationRewound: true,
-  };
-  const restoreAgentRewindCheckpoint = vi
-    .fn<DaemonClient["restoreAgentRewindCheckpoint"]>()
-    .mockResolvedValue({
-      agentId,
-      requestId: "restore",
-      ok: false,
-      error: "Files are busy",
-      operation: { ...operation, status: "files_pending" },
-    });
-  const retryAgentRewindFiles = vi.fn<DaemonClient["retryAgentRewindFiles"]>().mockResolvedValue({
-    agentId,
-    requestId: "retry",
-    ok: true,
-    error: null,
-    operation: { ...operation, status: "files_restored" },
-  });
-  const rewindAgent = vi.fn<DaemonClient["rewindAgent"]>();
-  const client = Object.assign(new DaemonClient({ url: "ws://unused.test", clientId: serverId }), {
-    restoreAgentRewindCheckpoint,
-    retryAgentRewindFiles,
-    rewindAgent,
-  });
-  useSessionStore.getState().initializeSession(serverId, client);
-  const query = new QueryClient();
-  function Rewind() {
-    const { rewindAgent: runRewind } = useRewindAgentMutation({
-      serverId,
-      agentId,
-      messageId,
-      client,
-    });
-    const rewindBoth = React.useCallback(() => {
-      void runRewind({ mode: "both", rewoundText: "A saved message", checkpointId });
-    }, [runRewind]);
-    return (
-      <button type="button" onClick={rewindBoth}>
-        Rewind both
-      </button>
-    );
-  }
-  function Harness() {
-    const [content, setContent] = React.useState<React.ReactNode>();
-    const toast = React.useMemo(
-      () => ({
-        show: (next: React.ReactNode) => {
-          setContent(next);
-          return () => {};
-        },
-        error: setContent,
-        copied: () => {},
-      }),
-      [],
-    );
-    return (
-      <QueryClientProvider client={query}>
-        <ToastApiProvider api={toast}>
-          <Rewind />
-          {content}
-        </ToastApiProvider>
-      </QueryClientProvider>
-    );
-  }
-  mounted = mount(<Harness />);
-  await userEvent.click(page.getByRole("button", { name: "Rewind both" }));
-  await expect
-    .element(page.getByText("Conversation rewound. Files could not be restored."))
-    .toBeVisible();
-  await userEvent.click(page.getByRole("button", { name: "Retry file restore" }));
-  await expect.element(page.getByText("Files restored.")).toBeVisible();
-  expect(restoreAgentRewindCheckpoint).toHaveBeenCalledExactlyOnceWith({
-    agentId,
-    messageId,
-    checkpointId,
-    mode: "both",
-  });
-  expect(retryAgentRewindFiles).toHaveBeenCalledExactlyOnceWith({
-    agentId,
-    operationId: operation.operationId,
-  });
-  expect(rewindAgent).not.toHaveBeenCalled();
-  query.clear();
-});
-
-test("a reopened conversation finds pending files without a message or the original response", async () => {
-  const serverId = "checkpoint-test";
-  const agentId = "agent";
-  const operationId = "recovered-operation";
-  const getPendingAgentRewindFiles = vi
-    .fn<DaemonClient["getPendingAgentRewindFiles"]>()
-    .mockResolvedValueOnce([{ operationId, conversationRewound: true }])
-    .mockResolvedValue([]);
-  const retryAgentRewindFiles = vi.fn<DaemonClient["retryAgentRewindFiles"]>().mockResolvedValue({
-    agentId,
-    requestId: "retry",
-    ok: true,
-    error: null,
-    operation: {
-      operationId,
-      target: { messageId: "removed-message", checkpointId: "checkpoint" },
+test.each([false, true])(
+  "retry uses the operation ID on hosts with pending lookup = %s",
+  async (supportsLookup) => {
+    const serverId = "checkpoint-test";
+    const agentId = "agent";
+    const messageId = "message";
+    const checkpointId = "checkpoint";
+    const operation = {
+      operationId: "operation",
+      target: { checkpointId, messageId },
       backupCheckpointId: "backup",
       conversationRewound: true,
-      status: "files_restored",
-    },
-  });
-  const restoreAgentRewindCheckpoint = vi.fn<DaemonClient["restoreAgentRewindCheckpoint"]>();
-  const rewindAgent = vi.fn<DaemonClient["rewindAgent"]>();
-  const client = Object.assign(new DaemonClient({ url: "ws://unused.test", clientId: serverId }), {
-    getPendingAgentRewindFiles,
-    retryAgentRewindFiles,
-    restoreAgentRewindCheckpoint,
-    rewindAgent,
-  });
-  useSessionStore.getState().initializeSession(serverId, client);
-  useSessionStore.getState().updateSessionServerInfo(serverId, {
-    serverId,
-    hostname: null,
-    version: null,
-    features: { rewindCheckpoints: true, rewindPendingFiles: true },
-  });
-  const query = new QueryClient();
-  function ReopenedConversation() {
-    return usePendingRewindFileRecovery({ serverId, agentId, client, enabled: true });
-  }
-  mounted = mount(
-    <QueryClientProvider client={query}>
-      <ToastApiProvider api={silentToast}>
-        <ReopenedConversation />
-      </ToastApiProvider>
-    </QueryClientProvider>,
-  );
-  await expect
-    .element(page.getByText("Conversation rewound. Files could not be restored."))
-    .toBeVisible();
-  const retry = page.getByRole("button", { name: "Retry file restore" });
-  await userEvent.click(retry);
-  await expect.element(retry).not.toBeInTheDocument();
-  expect(getPendingAgentRewindFiles).toHaveBeenCalledWith(agentId);
-  expect(retryAgentRewindFiles).toHaveBeenCalledExactlyOnceWith({ agentId, operationId });
-  expect(restoreAgentRewindCheckpoint).not.toHaveBeenCalled();
-  expect(rewindAgent).not.toHaveBeenCalled();
-  query.clear();
-});
+    };
+    const restoreAgentRewindCheckpoint = vi
+      .fn<DaemonClient["restoreAgentRewindCheckpoint"]>()
+      .mockResolvedValue({
+        agentId,
+        requestId: "restore",
+        ok: false,
+        error: "Files are busy",
+        operation: { ...operation, status: "files_pending" },
+      });
+    const retryAgentRewindFiles = vi.fn<DaemonClient["retryAgentRewindFiles"]>();
+    if (supportsLookup) {
+      retryAgentRewindFiles.mockRejectedValueOnce(new Error("Another writer started"));
+    }
+    retryAgentRewindFiles.mockResolvedValue({
+      agentId,
+      requestId: "retry",
+      ok: true,
+      error: null,
+      operation: { ...operation, status: "files_restored" },
+    });
+    const getAgentRewindFileRecovery = vi
+      .fn<DaemonClient["getAgentRewindFileRecovery"]>()
+      .mockRejectedValue(new Error("Lookup failed"));
+    const rewindAgent = vi.fn<DaemonClient["rewindAgent"]>();
+    const client = Object.assign(
+      new DaemonClient({ url: "ws://unused.test", clientId: serverId }),
+      {
+        restoreAgentRewindCheckpoint,
+        retryAgentRewindFiles,
+        rewindAgent,
+        getAgentRewindFileRecovery,
+        supportsPendingRewindFiles: () => supportsLookup,
+      },
+    );
+    useSessionStore.getState().initializeSession(serverId, client);
+    useSessionStore.getState().updateSessionServerInfo(serverId, {
+      serverId,
+      hostname: null,
+      version: null,
+      features: { rewindCheckpoints: true, rewindPendingFiles: supportsLookup },
+    });
+    const query = new QueryClient();
+    function Rewind() {
+      const { rewindAgent: runRewind } = useRewindAgentMutation({
+        serverId,
+        agentId,
+        messageId,
+        client,
+      });
+      const rewindBoth = React.useCallback(() => {
+        void runRewind({ mode: "both", rewoundText: "A saved message", checkpointId });
+      }, [runRewind]);
+      return (
+        <button type="button" onClick={rewindBoth}>
+          Rewind both
+        </button>
+      );
+    }
+    function Harness() {
+      const [content, setContent] = React.useState<React.ReactNode>();
+      const toast = React.useMemo(
+        () => ({
+          show: (next: React.ReactNode) => {
+            setContent(next);
+            return () => {};
+          },
+          error: setContent,
+          copied: () => {},
+        }),
+        [],
+      );
+      return (
+        <QueryClientProvider client={query}>
+          <ToastApiProvider api={toast}>
+            <Rewind />
+            <Recovery />
+            {content}
+          </ToastApiProvider>
+        </QueryClientProvider>
+      );
+    }
+    function Recovery() {
+      return usePendingRewindFileRecovery({ serverId, agentId, client, enabled: true });
+    }
+    mounted = mount(<Harness />);
+    await userEvent.click(page.getByRole("button", { name: "Rewind both" }));
+    await expect
+      .element(page.getByText("Conversation rewound. Files could not be restored."))
+      .toBeVisible();
+    await expect.element(page.getByText("Files are busy")).toBeVisible();
+    if (supportsLookup) {
+      await expect
+        .element(page.getByText("Could not check for pending file restores."))
+        .toBeVisible();
+      await userEvent.click(page.getByRole("button", { name: "Retry file restore" }));
+      await expect.element(page.getByText("Another writer started")).toBeVisible();
+      await expect.element(page.getByText("Files are busy")).toBeVisible();
+    }
+    await userEvent.click(page.getByRole("button", { name: "Retry file restore" }));
+    await expect.element(page.getByText("Files restored.")).toBeVisible();
+    await expect
+      .element(page.getByRole("button", { name: "Retry file restore" }))
+      .not.toBeInTheDocument();
+    expect(restoreAgentRewindCheckpoint).toHaveBeenCalledExactlyOnceWith({
+      agentId,
+      messageId,
+      checkpointId,
+      mode: "both",
+    });
+    expect(retryAgentRewindFiles.mock.calls).toEqual(
+      Array.from({ length: supportsLookup ? 2 : 1 }, () => [
+        { agentId, operationId: operation.operationId },
+      ]),
+    );
+    expect(rewindAgent).not.toHaveBeenCalled();
+    query.clear();
+  },
+);
+
+test.each([false, true])(
+  "a reopened conversation finds pending files with unconfirmed items = %s",
+  async (hasUnconfirmed) => {
+    const serverId = "checkpoint-test";
+    const agentId = "agent";
+    const operationId = "recovered-operation";
+    const unconfirmedFileRewinds = hasUnconfirmed ? [{ operationId: "older-operation" }] : [];
+    const getAgentRewindFileRecovery = vi
+      .fn<DaemonClient["getAgentRewindFileRecovery"]>()
+      .mockRejectedValueOnce(new Error("Lookup failed"))
+      .mockResolvedValueOnce({
+        pendingFiles: [{ operationId, conversationRewound: true }],
+        unconfirmedFileRewinds,
+      })
+      .mockRejectedValue(new Error("Lookup failed again"));
+    const retryAgentRewindFiles = vi.fn<DaemonClient["retryAgentRewindFiles"]>().mockResolvedValue({
+      agentId,
+      requestId: "retry",
+      ok: true,
+      error: null,
+      operation: {
+        operationId,
+        target: { messageId: "removed-message", checkpointId: "checkpoint" },
+        backupCheckpointId: "backup",
+        conversationRewound: true,
+        status: "files_restored",
+      },
+    });
+    const restoreAgentRewindCheckpoint = vi.fn<DaemonClient["restoreAgentRewindCheckpoint"]>();
+    const rewindAgent = vi.fn<DaemonClient["rewindAgent"]>();
+    const client = Object.assign(
+      new DaemonClient({ url: "ws://unused.test", clientId: serverId }),
+      {
+        getAgentRewindFileRecovery,
+        retryAgentRewindFiles,
+        restoreAgentRewindCheckpoint,
+        rewindAgent,
+      },
+    );
+    useSessionStore.getState().initializeSession(serverId, client);
+    useSessionStore.getState().updateSessionServerInfo(serverId, {
+      serverId,
+      hostname: null,
+      version: null,
+      features: { rewindCheckpoints: true, rewindPendingFiles: true },
+    });
+    const query = new QueryClient();
+    function ReopenedConversation() {
+      return usePendingRewindFileRecovery({ serverId, agentId, client, enabled: true });
+    }
+    mounted = mount(
+      <QueryClientProvider client={query}>
+        <ToastApiProvider api={silentToast}>
+          <ReopenedConversation />
+        </ToastApiProvider>
+      </QueryClientProvider>,
+    );
+    await expect
+      .element(page.getByText("Could not check for pending file restores."))
+      .toBeVisible();
+    await userEvent.click(
+      page.getByRole("button", { name: "Check again for pending file restores" }),
+    );
+    await expect
+      .element(page.getByText("Conversation rewound. Files could not be restored."))
+      .toBeVisible();
+    const unconfirmed = page.getByText(
+      "Could not confirm the conversation rewind. Files were not restored.",
+    );
+    if (hasUnconfirmed) {
+      await expect.element(unconfirmed).toBeVisible();
+    } else {
+      await expect.element(unconfirmed).not.toBeInTheDocument();
+    }
+    const retry = page.getByRole("button", { name: "Retry file restore" });
+    await userEvent.click(retry);
+    await expect.element(retry).not.toBeInTheDocument();
+    await expect
+      .element(page.getByText("Could not check for pending file restores."))
+      .toBeVisible();
+    if (hasUnconfirmed) await expect.element(unconfirmed).toBeVisible();
+    expect(getAgentRewindFileRecovery).toHaveBeenCalledWith(agentId);
+    expect(retryAgentRewindFiles).toHaveBeenCalledExactlyOnceWith({ agentId, operationId });
+    expect(restoreAgentRewindCheckpoint).not.toHaveBeenCalled();
+    expect(rewindAgent).not.toHaveBeenCalled();
+    query.clear();
+  },
+);

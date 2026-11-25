@@ -1,11 +1,14 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
-import { useDraftStore } from "@/stores/draft-store";
+import { flushDraftPersistStorage, useDraftStore } from "@/stores/draft-store";
 import { useWorkspaceAttachmentsStore } from "@/attachments/workspace-attachments-store";
 import { useWorkspaceDraftSubmissionStore } from "@/stores/workspace-draft-submission-store";
 import {
   captureWorkspaceDraftCleanup,
+  captureWorkspaceDraftCleanupOwner,
+  clearOwnedWorkspaceDraft,
   createWorkspaceAgentInBackground,
+  saveWorkspaceDraftCleanupOwner,
 } from "./background-handoff";
 
 const DRAFT_ID = "draft_1";
@@ -173,4 +176,83 @@ describe("createWorkspaceAgentInBackground", () => {
     expect(draftText()).toBe("a newer workspace idea");
     expect(useWorkspaceAttachmentsStore.getState().attachmentsByScope[SCOPE_KEY]).toHaveLength(1);
   });
+});
+
+describe("persisted workspace draft ownership", () => {
+  it.each(["unchanged", "typed", "attachment", "legacy", "other-window"] as const)(
+    "only clears the draft owned by the original submission (%s)",
+    async (edit) => {
+      const store = useWorkspaceDraftSubmissionStore.getState();
+      const id = await store.openDraftTitle({ createWorktreeSlug: () => "workspace" });
+      const cleanup = {
+        draftId: id,
+        draftKey: DRAFT_KEY,
+        draftContextScopeKey: SCOPE_KEY,
+        clearDraft: (lifecycle: "sent" | "abandoned") =>
+          useDraftStore.getState().clearDraftInput({ draftKey: DRAFT_KEY, lifecycle }),
+      };
+      try {
+        await useWorkspaceAttachmentsStore.hydration;
+        if (!useDraftStore.persist.hasHydrated()) await useDraftStore.persist.rehydrate();
+        saveDraft("Original prompt");
+        const owner = captureWorkspaceDraftCleanupOwner(cleanup);
+        if (edit !== "legacy") await saveWorkspaceDraftCleanupOwner(id, owner);
+        if (edit === "typed") saveDraft("Next prompt from another page");
+        if (edit === "attachment") {
+          useWorkspaceAttachmentsStore.getState().addWorkspaceAttachment({
+            scopeKey: SCOPE_KEY,
+            attachment: {
+              kind: "chat_history",
+              id: "new-history",
+              attachment: {
+                type: "text",
+                mimeType: "text/plain",
+                contextKind: "chat_history",
+                text: "New attachment",
+                title: "New history",
+              },
+              source: { serverId: "local", agentId: "agent-1" },
+            },
+          });
+        }
+        await flushDraftPersistStorage();
+        if (edit === "other-window") {
+          const { name, storage } = useDraftStore.persist.getOptions();
+          const stored = await storage!.getItem(name!);
+          const record = useDraftStore.getState().drafts[DRAFT_KEY]!;
+          await storage!.setItem(name!, {
+            ...stored,
+            state: {
+              ...stored?.state,
+              drafts: {
+                ...stored?.state.drafts,
+                [DRAFT_KEY]: {
+                  ...record,
+                  input: { ...record.input, text: "From another window" },
+                  version: record.version + 1,
+                },
+              },
+            },
+          });
+          await flushDraftPersistStorage();
+        }
+        await clearOwnedWorkspaceDraft(id, cleanup);
+        const expected = {
+          unchanged: "",
+          typed: "Next prompt from another page",
+          attachment: "Original prompt",
+          legacy: "Original prompt",
+          "other-window": "Original prompt",
+        };
+        expect(draftText()).toBe(expected[edit]);
+        if (edit === "attachment") {
+          expect(
+            useWorkspaceAttachmentsStore.getState().attachmentsByScope[SCOPE_KEY],
+          ).toHaveLength(1);
+        }
+      } finally {
+        await store.finishDraftTitle(id);
+      }
+    },
+  );
 });

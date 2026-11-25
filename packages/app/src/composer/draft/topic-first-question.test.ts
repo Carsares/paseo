@@ -54,6 +54,7 @@ function fixture() {
     fetchAgentTimeline: vi
       .fn<TopicQuestionClient["fetchAgentTimeline"]>()
       .mockResolvedValue(timeline(main.id)),
+    supportsTopicPromptRetry: vi.fn().mockReturnValue(true),
     sendAgentMessage: vi.fn(),
     createAgent: vi.fn<TopicQuestionClient["createAgent"]>(),
   };
@@ -76,7 +77,7 @@ describe("topic first question recovery", () => {
     expect(question).toEqual(frozen);
   });
 
-  test("reconciles a lost continuation response against the saved agent and message only", async () => {
+  test("keeps a legacy continuation when its message appears in history without acceptance evidence", async () => {
     const { question, client, main, options, timeline } = fixture();
     const continued = { ...question, continuationAgentId: main.id };
     const frozen = structuredClone(continued);
@@ -93,10 +94,9 @@ describe("topic first question recovery", () => {
       timeline(main.id, question.request.clientMessageId),
     );
     expect(await runTopicQuestionAction(client, continued, "check", options)).toEqual({
-      stage: "confirmed",
-      agent: main,
+      stage: "unconfirmed",
     });
-    expect(client.fetchAgent).toHaveBeenLastCalledWith({ agentId: main.id });
+    expect(client.fetchAgent).not.toHaveBeenCalled();
     expect(client.getCreationSnapshot).not.toHaveBeenCalled();
     expect(client.findWorkspace).not.toHaveBeenCalled();
     expect(client.sendAgentMessage).not.toHaveBeenCalled();
@@ -116,7 +116,7 @@ describe("topic first question recovery", () => {
     expect(client.createAgent).not.toHaveBeenCalled();
   });
 
-  test("keeps an unknown prompt and refuses create or continuation until its own message is recorded", async () => {
+  test("keeps a recorded attempt until the matching creation receipt confirms acceptance", async () => {
     const { question, client, main, receipt, options, timeline } = fixture();
     const ownAgent = { ...main, id: question.request.agentId };
     client.getCreationSnapshot.mockResolvedValue({
@@ -137,6 +137,18 @@ describe("topic first question recovery", () => {
       timeline(ownAgent.id, question.request.clientMessageId),
     );
     expect(await runTopicQuestionAction(client, question, "check", options)).toEqual({
+      stage: "unconfirmed",
+    });
+    client.getCreationSnapshot.mockResolvedValue({
+      ...receipt,
+      revision: receipt.revision + 1,
+      agent: ownAgent,
+      phase: "completed",
+      failedStage: undefined,
+      error: null,
+      initialPromptStarted: true,
+    });
+    expect(await runTopicQuestionAction(client, question, "check", options)).toEqual({
       stage: "confirmed",
       agent: ownAgent,
     });
@@ -145,7 +157,14 @@ describe("topic first question recovery", () => {
     expect(options.assertAvailable).not.toHaveBeenCalled();
   });
 
-  test.each(["rejected", "receipt-unavailable", "timeline-unavailable", "rebound"] as const)(
+  test.each([
+    "rejected",
+    "receipt-unavailable",
+    "timeline-unavailable",
+    "rebound",
+    "old-host",
+    "stale-refusal",
+  ] as const)(
     "retries a bound first question only after confirming rejection (%s)",
     async (state) => {
       const { question, client, main, receipt, options, timeline } = fixture();
@@ -168,6 +187,7 @@ describe("topic first question recovery", () => {
       if (state === "timeline-unavailable") {
         client.fetchAgentTimeline.mockRejectedValue(new Error("Timeline unavailable"));
       }
+      if (state === "old-host") client.supportsTopicPromptRetry.mockReturnValue(false);
       client.createAgent.mockImplementation(async () => {
         client.getCreationSnapshot.mockResolvedValue({
           ...failed,
@@ -179,22 +199,30 @@ describe("topic first question recovery", () => {
         });
         return ownAgent;
       });
+      const retryOutcome = { stage: "retry", retryPromptRevision: failed.revision };
+      const safe = state === "rejected" || state === "timeline-unavailable";
+      const checked =
+        safe || state === "stale-refusal"
+          ? retryOutcome
+          : { stage: state === "old-host" ? "update-host" : "unconfirmed" };
       expect(
         await runTopicQuestionAction(client, question, "check", { ...options, update: failed }),
-      ).toEqual({ stage: state === "rejected" ? "retry" : "unconfirmed" });
+      ).toEqual(checked);
       expect(client.createAgent).not.toHaveBeenCalled();
       const result = await runTopicQuestionAction(client, question, "retry", {
         ...options,
         update: failed,
+        expectedPromptRevision: state === "stale-refusal" ? failed.revision - 1 : failed.revision,
       });
-      if (state === "rejected") {
+      if (safe) {
         expect(result).toEqual({ stage: "confirmed", agent: ownAgent });
         expect(client.createAgent).toHaveBeenCalledExactlyOnceWith({
           ...question.request,
+          retryPromptRevision: failed.revision,
           onEvent: expect.any(Function),
         });
       } else {
-        expect(result).toEqual({ stage: "unconfirmed" });
+        expect(result).toEqual(checked);
         expect(client.createAgent).not.toHaveBeenCalled();
       }
       expect(client.sendAgentMessage).not.toHaveBeenCalled();
@@ -219,10 +247,10 @@ describe("topic first question recovery", () => {
     expect(client.sendAgentMessage).not.toHaveBeenCalled();
   });
 
-  test.each(["missing", "read-failed"] as const)(
+  test.each(["missing", "read-failed", "idle-accepted", "active-accepted"] as const)(
     "only retries an unbound saved first question after checking the creation receipt (%s)",
     async (state) => {
-      const { question, client, options } = fixture();
+      const { question, client, options, receipt } = fixture();
       client.findWorkspace.mockResolvedValue({
         id: question.request.workspaceId,
         hasActiveMainAgent: false,
@@ -230,13 +258,22 @@ describe("topic first question recovery", () => {
       } as unknown as Awaited<ReturnType<TopicQuestionClient["findWorkspace"]>>);
       client.fetchAgent.mockResolvedValue(null);
       if (state === "missing") client.getCreationSnapshot.mockResolvedValue(null);
-      else client.getCreationSnapshot.mockRejectedValue(new Error("Receipt unavailable"));
+      else if (state === "read-failed")
+        client.getCreationSnapshot.mockRejectedValue(new Error("Receipt unavailable"));
+      else
+        client.getCreationSnapshot.mockResolvedValue({
+          ...receipt,
+          phase: "accepted",
+          canResume: state === "idle-accepted",
+          failedStage: undefined,
+        });
+      const retryable = state === "missing" || state === "idle-accepted";
       expect(await runTopicQuestionAction(client, question, "check", options)).toEqual({
-        stage: state === "missing" ? "retry" : "unconfirmed",
+        stage: retryable ? "retry" : "unconfirmed",
       });
       expect(client.createAgent).not.toHaveBeenCalled();
       await runTopicQuestionAction(client, question, "retry", options);
-      if (state === "missing") {
+      if (retryable) {
         expect(client.createAgent).toHaveBeenCalledExactlyOnceWith({
           ...question.request,
           onEvent: expect.any(Function),

@@ -1,6 +1,7 @@
 import { useWorkspaceAttachmentsStore } from "@/attachments/workspace-attachments-store";
 import { buildDraftStoreKey } from "@/stores/draft-keys";
-import { useDraftStore } from "@/stores/draft-store";
+import { flushDraftPersistStorage, useDraftStore } from "@/stores/draft-store";
+import { isWeb } from "@/constants/platform";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { useWorkspaceDraftSubmissionStore } from "@/stores/workspace-draft-submission-store";
 
@@ -29,6 +30,78 @@ interface WorkspaceDraftCleanupInput {
   draftKey: string;
   clearDraft: (lifecycle: "sent" | "abandoned") => void;
   draftContextScopeKey: string | null;
+}
+
+type WorkspaceDraftCleanupScope = Omit<WorkspaceDraftCleanupInput, "clearDraft">;
+
+export function captureWorkspaceDraftCleanupOwner(input: WorkspaceDraftCleanupScope) {
+  const draft = useDraftStore.getState();
+  const record = draft.drafts[input.draftKey];
+  return JSON.stringify({
+    draftKey: input.draftKey,
+    draftId: input.draftId,
+    scopeKey: input.draftContextScopeKey,
+    record,
+    metadata: draft.metadataByDraftKey[input.draftKey],
+    setup: useWorkspaceDraftSubmissionStore.getState().setupByDraftId[input.draftId ?? ""],
+    attachments:
+      useWorkspaceAttachmentsStore.getState().attachmentsByScope[input.draftContextScopeKey ?? ""],
+  });
+}
+
+/** Store ownership with the original submission before any request can leave the app. */
+export async function saveWorkspaceDraftCleanupOwner(
+  id: string,
+  captured: string | undefined,
+): Promise<void> {
+  const owner = captured === undefined ? undefined : await digestCleanupOwner(captured);
+  if (owner) await flushDraftPersistStorage();
+  await useWorkspaceDraftSubmissionStore.getState().saveDraftCleanupOwner(id, owner);
+}
+
+async function digestCleanupOwner(contents: string) {
+  try {
+    if (isWeb) {
+      const buffer = await globalThis.crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(contents),
+      );
+      return Array.from(new Uint8Array(buffer), (byte) => byte.toString(16).padStart(2, "0")).join(
+        "",
+      );
+    }
+    const { CryptoDigestAlgorithm, digestStringAsync } = await import("expo-crypto");
+    return await digestStringAsync(CryptoDigestAlgorithm.SHA256, contents);
+  } catch {
+    return undefined;
+  }
+}
+
+export async function clearOwnedWorkspaceDraft(
+  id: string,
+  input: WorkspaceDraftCleanupInput,
+): Promise<void> {
+  const owner = await useWorkspaceDraftSubmissionStore.getState().readDraftCleanupOwner(id);
+  if (!owner) return;
+  const current = captureWorkspaceDraftCleanupOwner(input);
+  if ((await digestCleanupOwner(current)) !== owner) return;
+  // Another browser window can persist a newer body while this window still holds the old one.
+  const { name, storage } = useDraftStore.persist.getOptions();
+  const stored =
+    name && storage ? await Promise.resolve(storage.getItem(name)).catch(() => null) : null;
+  const record = stored?.state.drafts?.[input.draftKey];
+  const live = useDraftStore.getState().drafts[input.draftKey];
+  if (
+    JSON.stringify(record) !== JSON.stringify(live) ||
+    captureWorkspaceDraftCleanupOwner(input) !== current
+  )
+    return;
+  if (input.draftContextScopeKey) {
+    useWorkspaceAttachmentsStore.getState().clearWorkspaceAttachments({
+      scopeKey: input.draftContextScopeKey,
+    });
+  }
+  input.clearDraft("sent");
 }
 
 /** Capture ownership before workspace creation starts, not when its response arrives. */

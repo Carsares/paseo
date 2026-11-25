@@ -575,6 +575,7 @@ export interface CreateAgentRequestOptions extends AgentConfigOverrides {
   /** Plugin-owned data stored on the agent. Needs a host with `entityMetadata`. */
   metadata?: CreateAgentRequestMessage["metadata"];
   workspaceRole?: AgentCreateRequest["workspaceRole"];
+  retryPromptRevision?: AgentCreateRequest["retryPromptRevision"];
 }
 
 export type CreateWorkspaceAgentConfig = AgentSessionConfig;
@@ -601,6 +602,7 @@ export interface CreateWorkspaceRequestOptions {
   idempotencyKey?: string;
   workspaceId?: string;
   mainAgent?: { config: CreateWorkspaceAgentConfig };
+  retryPromptRevision?: WorkspaceCreateRequest["retryPromptRevision"];
   agent?: Omit<
     CreateAgentRequestOptions,
     | "workspaceId"
@@ -611,6 +613,7 @@ export interface CreateWorkspaceRequestOptions {
     | "idempotencyKey"
     | "requestId"
     | "sideChatFromAgentId"
+    | "retryPromptRevision"
   >;
   onEvent?: (snapshot: CreationSnapshot) => void;
   firstAgentContext?: WorkspaceCreateRequest["firstAgentContext"];
@@ -3784,6 +3787,10 @@ export class DaemonClient {
     }
   }
 
+  supportsTopicPromptRetry(): boolean {
+    return this.lastServerInfoMessage?.features?.topicPromptRetryV1 === true;
+  }
+
   async createAgent(options: CreateAgentRequestOptions): Promise<AgentSnapshotPayload> {
     if (options.git !== undefined || options.worktreeName !== undefined) {
       throw new Error(
@@ -5006,6 +5013,10 @@ export class DaemonClient {
   }
 
   async getPendingAgentRewindFiles(agentId: string) {
+    return (await this.getAgentRewindFileRecovery(agentId)).pendingFiles;
+  }
+
+  async getAgentRewindFileRecovery(agentId: string) {
     if (!this.supportsPendingRewindFiles()) {
       throw new Error("Update the host to find pending file restores");
     }
@@ -5019,7 +5030,11 @@ export class DaemonClient {
     if (!result.ok || !result.pendingFiles) {
       throw new Error(result.error ?? "Pending file restores are unavailable");
     }
-    return result.pendingFiles;
+    return {
+      pendingFiles: result.pendingFiles,
+      // COMPAT(rewindFileRecoveryStatus): added in v0.18.0, remove the default after 2027-06-01.
+      unconfirmedFileRewinds: result.unconfirmedFileRewinds ?? [],
+    };
   }
 
   private requestAgentRewindCheckpoint(input: {

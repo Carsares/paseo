@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useFetchQuery } from "@/data/query";
-import { localReviewViewed } from "./local-viewed";
+import { localReviewViewed, type LocalReviewHead, type LocalReviewRequest } from "./local-viewed";
 import {
   reviewFailure,
   type ReviewFailure,
@@ -17,29 +17,31 @@ export function useReviewViewed(
   target: ReviewTarget,
   scope: string,
   queryToken: string,
+  localRequest: LocalReviewRequest | undefined,
   invalidateGuide: (failure: ReviewFailure) => void,
 ) {
   const client = useQueryClient();
   const queryKey = ["pr-review-viewed", scope, queryToken];
   const input = { ...target, version: guide.version };
   const local = guide.viewedMode === "local";
-  const confirmLocalHead = useRef(true);
+  const localHead = useRef<LocalReviewHead>(undefined);
   const query = useFetchQuery({
     dataShape: "value",
     staleTimeMs: 0,
     queryKey,
     queryFn: async ({ signal }) => {
       if (local) {
-        if (!confirmLocalHead.current) {
-          return localReviewViewed.load(input.identity, input.version.headSha, signal);
+        if (localHead.current) {
+          return localReviewViewed.load(localHead.current, signal);
         }
-        const viewed = await localReviewViewed.confirmHead(
-          input.identity,
+        if (!localRequest) throw { code: "unavailable" };
+        const confirmed = await localReviewViewed.confirmHead(
+          localRequest,
           input.version.headSha,
           signal,
         );
-        confirmLocalHead.current = false;
-        return viewed;
+        localHead.current = confirmed.head;
+        return confirmed.viewed;
       }
       const result = await port.getReviewViewed(input);
       signal.throwIfAborted();
@@ -48,7 +50,7 @@ export function useReviewViewed(
     retry: false,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
-    enabled: guide.stops.length > 0,
+    enabled: local || guide.stops.length > 0,
   });
   const writeInFlight = useRef(false);
   const [pendingPath, setPendingPath] = useState<string>();
@@ -57,7 +59,6 @@ export function useReviewViewed(
 
   async function reload() {
     if (writeInFlight.current) return;
-    confirmLocalHead.current = false;
     const result = await query.refetch();
     if (result.isSuccess) setWriteFailure(undefined);
   }
@@ -74,14 +75,16 @@ export function useReviewViewed(
     setPendingPath(path);
     setWriteFailure(undefined);
     try {
-      const entry = local
-        ? await localReviewViewed.set(input.identity, input.version.headSha, path, viewed)
-        : await port.setReviewViewed({
-            ...input,
-            path,
-            viewed,
-            ...(query.data.viewerId ? { expectedViewerId: query.data.viewerId } : {}),
-          });
+      if (local && !localHead.current) throw { code: "stale" };
+      const entry =
+        local && localHead.current
+          ? await localReviewViewed.set(localHead.current, path, viewed)
+          : await port.setReviewViewed({
+              ...input,
+              path,
+              viewed,
+              ...(query.data.viewerId ? { expectedViewerId: query.data.viewerId } : {}),
+            });
       if (entry.path !== path) throw { code: "unknown_outcome" };
       client.setQueryData<ReviewViewed>(
         queryKey,

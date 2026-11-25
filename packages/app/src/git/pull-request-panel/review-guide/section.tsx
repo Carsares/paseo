@@ -16,6 +16,7 @@ import {
 import { reviewStopAttachment } from "./diff";
 import { emptyDrafts, reviewDraftKey, useReviewDrafts } from "./drafts";
 import { ReviewStops } from "./stops";
+import { localReviewViewed } from "./local-viewed";
 import {
   reviewFailure,
   reviewIdentityKey,
@@ -146,6 +147,8 @@ function ReviewGuideContent({
     ...REVIEW_READ_OPTIONS,
     queryKey: ["pr-review-guide", scope, queryToken],
     queryFn: async ({ signal }) => {
+      const localRequest = await localReviewViewed.begin(target.identity).catch(() => undefined);
+      signal.throwIfAborted();
       const expected = generation === 0 ? connection.expectedVersion : undefined;
       const guide = await connection.port.getReviewGuide(
         generation > 0 ? { ...target, refresh: true } : { ...target, expectedVersion: expected },
@@ -159,7 +162,7 @@ function ReviewGuideContent({
       ) {
         throw { code: "stale" };
       }
-      return validateGuide(guide, target, expected);
+      return { guide: validateGuide(guide, target, expected), localRequest };
     },
   });
 
@@ -197,7 +200,8 @@ function ReviewGuideContent({
       {query.data ? (
         <ReviewStops
           key={queryToken}
-          guide={query.data}
+          guide={query.data.guide}
+          localRequest={query.data.localRequest}
           target={target}
           connection={connection}
           queryToken={queryToken}
@@ -206,7 +210,7 @@ function ReviewGuideContent({
           attach={attach}
         />
       ) : null}
-      <EarlierDrafts scope={scope} guide={query.data} attach={attach} url={url} />
+      <EarlierDrafts scope={scope} guide={query.data?.guide} attach={attach} url={url} />
     </View>
   );
 }

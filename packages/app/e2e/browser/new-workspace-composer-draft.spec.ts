@@ -126,6 +126,50 @@ topicTest(
   },
 );
 
+topicTest(
+  "a late topic receipt preserves the draft edited in another browser page",
+  async ({ page }) => {
+    const project = await seedWorkspace({ repoPrefix: "topic-draft-ownership-", git: false });
+    const nextProject = await seedWorkspace({ repoPrefix: "topic-next-draft-", git: false });
+    const delayed = await delayBrowserWorkspaceCreatedResponse(page);
+    const nextPage = await page.context().newPage();
+    await nextPage.route(/:(6767)\b/, (route) => route.abort());
+    await nextPage.routeWebSocket(/:(6767)\b/, (ws) =>
+      ws.close({ code: 1008, reason: "Blocked connection to localhost:6767 during e2e." }),
+    );
+    const nextPrompt = "Keep this new draft when the previous topic finishes.";
+    try {
+      await gotoAppShell(page);
+      await waitForSidebarHydration(page);
+      await openNewWorkspaceComposer(page, project);
+      await page.getByTestId("new-topic-title").fill("First topic");
+      await page.getByRole("button", { name: "Attach a first question" }).click();
+      await fillNewWorkspaceDraft(page, DRAFT);
+      await page.getByTestId("topic-create-submit").click();
+      await delayed.waitForCreateRequest();
+
+      await gotoAppShell(nextPage);
+      await waitForSidebarHydration(nextPage);
+      await openNewWorkspaceComposer(nextPage, nextProject);
+      await nextPage.getByTestId("new-topic-title").fill("New topic");
+      await nextPage.getByRole("button", { name: "Attach a first question" }).click();
+      await fillNewWorkspaceDraft(nextPage, nextPrompt);
+      await expect
+        .poll(() => nextPage.evaluate(() => localStorage.getItem("paseo-drafts")))
+        .toContain(nextPrompt);
+      delayed.release();
+      await page.waitForURL((url) => url.pathname.includes("/workspace/"));
+      await nextPage.reload();
+      await expectNewWorkspaceDraft(nextPage, nextPrompt);
+    } finally {
+      delayed.release();
+      await nextPage.close();
+      await nextProject.cleanup();
+      await project.cleanup();
+    }
+  },
+);
+
 test.describe("New workspace composer draft", () => {
   test.describe.configure({ timeout: 240_000 });
 

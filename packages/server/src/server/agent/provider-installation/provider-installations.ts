@@ -167,8 +167,9 @@ interface CachedRead<T> {
 
 /** Catalog-only data. Resolving and running the check must never launch the configured CLI. */
 export interface DiscoveredReleaseCheck {
-  isCurrent(): Promise<boolean>;
-  run(signal: AbortSignal): Promise<ProviderInstallationUpdateCheck>;
+  inspectFiles(): Promise<"current" | "missing" | "changed">;
+  isReleaseSourceCurrent?(): Promise<boolean>;
+  run?(signal: AbortSignal): Promise<ProviderInstallationUpdateCheck>;
 }
 
 export const discoveredReleaseCheck = Symbol("discoveredReleaseCheck");
@@ -318,8 +319,10 @@ export class ProviderInstallations {
     if (this.isDiscoveryDeferred(provider)) {
       const planId = await this.readApprovedUpdatePlanId(provider);
       if (!this.sameConfiguration(provider, version, client)) return result;
-      const discovered = this.withDiscoveredInspection(provider, result);
-      return this.withApprovedPlanId(provider, version, client, discovered, planId);
+      const inspection = await this.inspectDiscoveredInstallation(provider);
+      if (!this.sameConfiguration(provider, version, client)) return result;
+      if (inspection) result.inspection = inspection;
+      return this.withApprovedPlanId(provider, version, client, result, planId);
     }
     const [snapshot, standaloneMaintenance, planId] = await Promise.all([
       this.readInspection(provider, client, options),
@@ -377,14 +380,31 @@ export class ProviderInstallations {
     return result;
   }
 
-  private withDiscoveredInspection(
+  private async inspectDiscoveredInstallation(
     provider: AgentProvider,
-    result: ProviderInstallation,
-  ): ProviderInstallation {
+  ): Promise<ProviderInstallationInspection | undefined> {
     const version = this.readDiscoveredVersion(provider);
-    return version === undefined
-      ? result
-      : { ...result, inspection: { status: "installed", version } };
+    if (version === undefined) return undefined;
+    const evidence = this.readDiscoveredReleaseCheck(provider);
+    // Providers that publish runtime metadata without file evidence retain their existing contract.
+    if (!evidence) return { status: "installed", version };
+    const status = await this.readDiscoveredFileStatus(evidence);
+    if (this.readDiscoveredReleaseCheck(provider) !== evidence) return undefined;
+    if (status === "missing") return { status: "not_installed" };
+    if (status === "changed") {
+      return {
+        status: "error",
+        message: "The CLI installation changed. Refresh provider discovery to verify its version.",
+      };
+    }
+    return { status: "installed", version };
+  }
+
+  private readDiscoveredFileStatus(evidence: DiscoveredReleaseCheck) {
+    return waitForInspection(
+      AbortSignal.timeout(this.inspectTimeoutMs),
+      evidence.inspectFiles,
+    ).catch(() => "changed" as const);
   }
 
   /**
@@ -433,18 +453,24 @@ export class ProviderInstallations {
   ): Promise<ProviderInstallationUpdateCheck | null> {
     if (!this.readDiscoveredVersion(provider)) return null;
     const check = this.readDiscoveredReleaseCheck(provider);
-    const unknown = { status: "unknown", message: "The CLI's release source is unknown." } as const;
     if (!check) return null;
+    const unknown = { status: "unknown", message: "The CLI's release source is unknown." } as const;
+    const run = check.run;
     const client = this.requireClient(provider);
     const version = this.configurationVersion(provider);
     const isCurrent = () =>
       this.sameConfiguration(provider, version, client) &&
       this.readDiscoveredReleaseCheck(provider) === check;
-    const matchesInstallation = () =>
-      waitForInspection(AbortSignal.timeout(this.inspectTimeoutMs), check.isCurrent).catch(
-        () => false,
-      );
-    if (!(await matchesInstallation()) || !isCurrent()) return unknown;
+    const matchesInstallation = async () => {
+      if ((await this.readDiscoveredFileStatus(check)) !== "current") return false;
+      return check.isReleaseSourceCurrent
+        ? waitForInspection(
+            AbortSignal.timeout(this.inspectTimeoutMs),
+            check.isReleaseSourceCurrent,
+          ).catch(() => false)
+        : true;
+    };
+    if (!run || !(await matchesInstallation()) || !isCurrent()) return unknown;
     const answer = await this.read(provider, client, this.updateChecks, options, {
       name: "discovered release check",
       key: check,
@@ -453,7 +479,7 @@ export class ProviderInstallations {
         result.status === "current" || result.status === "available"
           ? this.updateCheckCacheMs
           : this.inspectCacheMs,
-      run: async ({ signal }) => ProviderUpdateCheckSchema.parse(await check.run(signal)),
+      run: async ({ signal }) => ProviderUpdateCheckSchema.parse(await run(signal)),
       failed: () => ({
         status: "error" as const,
         message: "Could not check the CLI's release source.",
