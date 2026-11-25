@@ -145,6 +145,62 @@ describe("topic first question recovery", () => {
     expect(options.assertAvailable).not.toHaveBeenCalled();
   });
 
+  test.each(["rejected", "receipt-unavailable", "timeline-unavailable", "rebound"] as const)(
+    "retries a bound first question only after confirming rejection (%s)",
+    async (state) => {
+      const { question, client, main, receipt, options, timeline } = fixture();
+      const ownAgent = { ...main, id: question.request.agentId };
+      const failed = {
+        ...receipt,
+        agent: ownAgent,
+        failedStage: "prompt" as const,
+        errorCode: undefined,
+      };
+      client.findWorkspace.mockResolvedValue({
+        id: question.request.workspaceId,
+        topic: { mainAgentId: state === "rebound" ? main.id : ownAgent.id },
+      } as Awaited<ReturnType<TopicQuestionClient["findWorkspace"]>>);
+      client.getCreationSnapshot.mockResolvedValue(failed);
+      if (state === "receipt-unavailable") {
+        client.getCreationSnapshot.mockRejectedValue(new Error("Receipt unavailable"));
+      }
+      client.fetchAgentTimeline.mockResolvedValue(timeline(ownAgent.id));
+      if (state === "timeline-unavailable") {
+        client.fetchAgentTimeline.mockRejectedValue(new Error("Timeline unavailable"));
+      }
+      client.createAgent.mockImplementation(async () => {
+        client.getCreationSnapshot.mockResolvedValue({
+          ...failed,
+          phase: "completed",
+          failedStage: undefined,
+          initialPromptStarted: true,
+          outcomeUnknown: undefined,
+          error: null,
+        });
+        return ownAgent;
+      });
+      expect(
+        await runTopicQuestionAction(client, question, "check", { ...options, update: failed }),
+      ).toEqual({ stage: state === "rejected" ? "retry" : "unconfirmed" });
+      expect(client.createAgent).not.toHaveBeenCalled();
+      const result = await runTopicQuestionAction(client, question, "retry", {
+        ...options,
+        update: failed,
+      });
+      if (state === "rejected") {
+        expect(result).toEqual({ stage: "confirmed", agent: ownAgent });
+        expect(client.createAgent).toHaveBeenCalledExactlyOnceWith({
+          ...question.request,
+          onEvent: expect.any(Function),
+        });
+      } else {
+        expect(result).toEqual({ stage: "unconfirmed" });
+        expect(client.createAgent).not.toHaveBeenCalled();
+      }
+      expect(client.sendAgentMessage).not.toHaveBeenCalled();
+    },
+  );
+
   test("retries a known unbound failure using the identical saved create request", async () => {
     const { question, client, receipt, options } = fixture();
     client.findWorkspace.mockResolvedValue({
@@ -162,4 +218,30 @@ describe("topic first question recovery", () => {
     });
     expect(client.sendAgentMessage).not.toHaveBeenCalled();
   });
+
+  test.each(["missing", "read-failed"] as const)(
+    "only retries an unbound saved first question after checking the creation receipt (%s)",
+    async (state) => {
+      const { question, client, options } = fixture();
+      client.findWorkspace.mockResolvedValue({
+        id: question.request.workspaceId,
+        hasActiveMainAgent: false,
+        topic: { mainAgentId: null },
+      } as unknown as Awaited<ReturnType<TopicQuestionClient["findWorkspace"]>>);
+      client.fetchAgent.mockResolvedValue(null);
+      if (state === "missing") client.getCreationSnapshot.mockResolvedValue(null);
+      else client.getCreationSnapshot.mockRejectedValue(new Error("Receipt unavailable"));
+      expect(await runTopicQuestionAction(client, question, "check", options)).toEqual({
+        stage: state === "missing" ? "retry" : "unconfirmed",
+      });
+      expect(client.createAgent).not.toHaveBeenCalled();
+      await runTopicQuestionAction(client, question, "retry", options);
+      if (state === "missing") {
+        expect(client.createAgent).toHaveBeenCalledExactlyOnceWith({
+          ...question.request,
+          onEvent: expect.any(Function),
+        });
+      } else expect(client.createAgent).not.toHaveBeenCalled();
+    },
+  );
 });

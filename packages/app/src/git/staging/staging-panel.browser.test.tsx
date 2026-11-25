@@ -756,9 +756,7 @@ describe("Git staging Explorer", () => {
         cwd: repoRoot,
         targetRepoRoot: repoRoot,
         expectedHeadSha: tree.headSha,
-        requestId: expect.stringMatching(
-          new RegExp("^paseo-git-commit:" + initial.requestId + ":[a-f0-9-]{36}$"),
-        ),
+        snapshotRequestId: initial.requestId,
         message: "Keep this draft",
         amend: false,
         pushAfter: true,

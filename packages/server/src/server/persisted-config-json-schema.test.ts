@@ -47,6 +47,19 @@ test("the published schema stays current with the daemon's configuration schema"
   ).toEqual(generated);
 });
 
+test.each([
+  [{ command: ["tool", ""] }, true],
+  [{ command: [] }, false],
+  [{ command: ["", "arg"] }, false],
+  [{ command: ["tool"], deferDiscovery: true }, true],
+  [{ command: ["tool"], deferDiscovery: false }, false],
+] as const)("provider launch configuration %j has validity %s in both schemas", (codex, valid) => {
+  const config = { version: 1, agents: { providers: { codex } } };
+  expect(PersistedConfigSchema.safeParse(config).success).toBe(valid);
+  const validate = new Ajv({ strict: false }).compile(publishedSchema);
+  expect(validate(config)).toBe(valid);
+});
+
 test("editors retain the existing proxy configuration help", () => {
   const daemon = publishedSchema.properties.daemon.properties;
   expect(daemon.trustedProxies.description).toBe(

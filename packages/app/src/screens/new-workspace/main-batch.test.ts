@@ -9,7 +9,12 @@ import {
   workspaceBatchBlock,
   workspaceMainBatchAgentTarget,
 } from "./main-batch";
-import { readTopicFields, runTopicCreation, topicRequest } from "./topic-creation";
+import {
+  readTopicFields,
+  runTopicCreation,
+  topicRequest,
+  type TopicCreationClient,
+} from "./topic-creation";
 import { watchTopicCreation } from "@/composer/draft/topic-receipts";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import {
@@ -64,6 +69,27 @@ async function plan(resolveStartPoint = vi.fn().mockResolvedValue(startPoint)) {
 type BatchClient = Parameters<typeof runWorkspaceMainBatch>[0]["client"];
 type WorkspaceRequest = Parameters<BatchClient["createWorkspace"]>[0];
 type WorkspaceResponse = Awaited<ReturnType<BatchClient["createWorkspace"]>>;
+
+function emptyTimeline(agentId: string): Awaited<ReturnType<BatchClient["fetchAgentTimeline"]>> {
+  return {
+    requestId: "timeline",
+    agentId,
+    agent: null,
+    direction: "tail",
+    projection: "canonical",
+    epoch: "epoch",
+    reset: false,
+    staleCursor: false,
+    gap: false,
+    window: { minSeq: 0, maxSeq: 0, nextSeq: 1 },
+    startCursor: null,
+    endCursor: null,
+    hasOlder: false,
+    hasNewer: false,
+    entries: [],
+    error: null,
+  };
+}
 
 function workspace(id: string): NonNullable<WorkspaceResponse["workspace"]> {
   return {
@@ -176,6 +202,7 @@ async function harness(initial: MainDraftBatch) {
     createAgent,
     findWorkspace,
     fetchAgent,
+    fetchAgentTimeline,
     getCreationSnapshot,
     acceptSnapshots,
     assertSupported,
@@ -187,7 +214,7 @@ describe("multi-model workspace creation", () => {
     const batch = await plan();
     const topic = { summary: "Inspect cold start", hideFromModel: true };
     const h = await harness({
-      message: { initialPrompt: "  ", attachments: message.attachments },
+      message: { initialPrompt: "  ", attachments: [] },
       items: batch.items
         .slice(0, 2)
         .map((item) =>
@@ -244,6 +271,108 @@ describe("multi-model workspace creation", () => {
     }
     expect(h.createAgent).not.toHaveBeenCalled();
   });
+
+  it("sends a blank-text question with attachments in each model's original create request", async () => {
+    const batch = await plan();
+    const topic = { summary: null, hideFromModel: false };
+    const images = [{ data: "YWJj", mimeType: "image/png" }];
+    const h = await harness({
+      message: { initialPrompt: "", images, attachments: message.attachments },
+      items: batch.items.slice(0, 2).map((item) =>
+        Object.assign({}, item, {
+          placement: { ...item.placement, title: "Attachments", topic },
+        }),
+      ),
+    });
+    h.createWorkspace.mockImplementation(async (request) => {
+      const response = successful(request);
+      return {
+        ...response,
+        workspace: {
+          ...workspace(request.workspaceId!),
+          topic: { ...topic, revision: 1, mainAgentId: request.agent!.agentId! },
+        },
+      };
+    });
+    await h.run();
+    expect(h.createWorkspace).toHaveBeenCalledTimes(2);
+    for (const [index, [request]] of h.createWorkspace.mock.calls.entries()) {
+      const item = batch.items[index]!;
+      expect(request.mainAgent).toBeUndefined();
+      expect(request.agent).toMatchObject({
+        workspaceRole: "main",
+        agentId: item.agentId,
+        clientMessageId: item.clientMessageId,
+        initialPrompt: "",
+        images,
+        attachments: message.attachments,
+      });
+    }
+    expect((await h.read()).items.map(({ stage }) => stage)).toEqual(["succeeded", "succeeded"]);
+  });
+
+  it.each(["missing", "workspace_ready", "read-failed", "occupied", "unknown"] as const)(
+    "keeps observation read-only and only retries the original request when recovery is safe (%s)",
+    async (state) => {
+      const topic = { summary: null, hideFromModel: false };
+      const request = topicRequest(
+        { ...placement, title: "Recovery", topic },
+        { workspaceId: "wks_1234567890abcdef", idempotencyKey: "frozen-topic" },
+        { config: { provider: "codex", cwd: "/repo" } },
+      );
+      const unbound = {
+        ...workspace(request.workspaceId),
+        hasActiveMainAgent: false,
+        topic: { ...topic, revision: 1, mainAgentId: null },
+      };
+      const receipt = {
+        kind: "workspace",
+        idempotencyKey: request.idempotencyKey,
+        revision: 2,
+        workspaceId: request.workspaceId,
+        agentId: null,
+        workspace: unbound,
+        phase: "workspace_ready",
+        error: null,
+      } as const;
+      const main = agent("existing-main", request.workspaceId);
+      const completed = { ...unbound, topic: { ...unbound.topic, mainAgentId: main.id } };
+      const client: TopicCreationClient = {
+        getCreationSnapshot: vi.fn<TopicCreationClient["getCreationSnapshot"]>(async () => {
+          if (state === "read-failed") throw new Error("Receipt read failed");
+          if (state === "missing") return null;
+          if (state === "unknown")
+            return { ...receipt, phase: "failed", failedStage: "agent", outcomeUnknown: true };
+          return receipt;
+        }),
+        findWorkspace: vi.fn(async () => {
+          if (state === "missing" || state === "read-failed") return null;
+          if (state === "occupied") return { ...completed, hasActiveMainAgent: true };
+          return unbound;
+        }),
+        fetchAgent: vi.fn(async () => null),
+        fetchAgentTimeline: vi.fn(),
+        createWorkspace: vi.fn<TopicCreationClient["createWorkspace"]>(async () => ({
+          requestId: "reply",
+          setupTerminalId: null,
+          workspace: completed,
+          mainAgent: main,
+          error: null,
+          creation: { ...receipt, phase: "completed" },
+        })),
+      };
+      const retryable = state === "missing" || state === "workspace_ready";
+      expect((await runTopicCreation(client, request, "check")).stage).toBe(
+        retryable ? "retryable" : "unconfirmed",
+      );
+      expect(client.createWorkspace).not.toHaveBeenCalled();
+      expect((await runTopicCreation(client, request, "retry")).stage).toBe(
+        retryable ? "succeeded" : "unconfirmed",
+      );
+      if (retryable) expect(client.createWorkspace).toHaveBeenCalledExactlyOnceWith(request);
+      else expect(client.createWorkspace).not.toHaveBeenCalled();
+    },
+  );
 
   it("checks delivery against the original topic and message attempt without replaying the prompt", async () => {
     const fields = readTopicFields("\n  Cold start\n  Inspect traces.  ", "", true);
@@ -557,6 +686,113 @@ describe("multi-model workspace creation", () => {
       firstRequest.idempotencyKey,
     );
     expect(h.createWorkspace).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(["rejected", "receipt-unavailable", "rebound"] as const)(
+    "offers single topic retry only for a known rejection with the same Main Session (%s)",
+    async (state) => {
+      const topic = { summary: null, hideFromModel: false };
+      const request = topicRequest(
+        { ...placement, title: "Topic", topic },
+        { workspaceId: "wks_1234567890abcdef", idempotencyKey: "original-topic" },
+        {
+          config: { provider: "codex", cwd: "/repo" },
+          prompt: {
+            ...message,
+            agentId: "main",
+            clientMessageId: "original-first-question",
+          },
+        },
+      );
+      const result = successful(request);
+      const current = {
+        ...result.workspace!,
+        topic: { ...topic, revision: 1, mainAgentId: state === "rebound" ? "replacement" : "main" },
+        hasActiveMainAgent: true,
+      };
+      const receipt = receiptFor(request, {
+        phase: "failed",
+        failedStage: "prompt",
+        outcomeUnknown: false,
+        workspace: current,
+        agent: result.agent,
+      });
+      const client = {
+        createWorkspace: vi
+          .fn<BatchClient["createWorkspace"]>()
+          .mockResolvedValue({ ...result, workspace: current }),
+        getCreationSnapshot: vi.fn<BatchClient["getCreationSnapshot"]>().mockResolvedValue(receipt),
+        findWorkspace: vi.fn<BatchClient["findWorkspace"]>().mockResolvedValue(current),
+        fetchAgent: vi.fn<BatchClient["fetchAgent"]>(),
+        fetchAgentTimeline: vi
+          .fn<BatchClient["fetchAgentTimeline"]>()
+          .mockResolvedValue(emptyTimeline("main")),
+      };
+      if (state === "receipt-unavailable") {
+        client.getCreationSnapshot.mockRejectedValue(new Error("Receipt unavailable"));
+      }
+      const retryable = state === "rejected";
+      expect((await runTopicCreation(client, request, "check", receipt)).stage).toBe(
+        retryable ? "retryable" : "unconfirmed",
+      );
+      expect(client.createWorkspace).not.toHaveBeenCalled();
+      expect((await runTopicCreation(client, request, "retry", receipt)).stage).toBe(
+        retryable ? "succeeded" : "unconfirmed",
+      );
+      if (retryable) expect(client.createWorkspace).toHaveBeenCalledExactlyOnceWith(request);
+      else expect(client.createWorkspace).not.toHaveBeenCalled();
+    },
+  );
+
+  it("retries a rejected topic batch question with its frozen request and existing Main Session", async () => {
+    const batch = await plan();
+    const topic = { summary: null, hideFromModel: false };
+    batch.items = batch.items.map((item) => ({
+      ...item,
+      placement: { ...item.placement, title: "Batch topic", topic },
+    }));
+    const h = await harness(batch);
+    h.createWorkspace.mockImplementationOnce(async (request) => {
+      const result = successful(request);
+      const created = {
+        ...result.workspace!,
+        topic: { ...topic, ...request.topic, revision: 1, mainAgentId: result.agent!.id },
+        hasActiveMainAgent: true,
+      };
+      const receipt = receiptFor(request, {
+        workspace: created,
+        agent: result.agent,
+        phase: "failed",
+        failedStage: "prompt",
+        outcomeUnknown: false,
+        error: "First question was rejected",
+      });
+      h.getCreationSnapshot.mockResolvedValue(receipt);
+      h.findWorkspace.mockResolvedValue(created);
+      h.fetchAgentTimeline.mockResolvedValue(emptyTimeline(result.agent!.id));
+      return { ...result, workspace: created, creation: receipt, error: receipt.error };
+    });
+    await h.run();
+    const original = h.createWorkspace.mock.calls[0]![0];
+    const itemId = original.workspaceId!;
+    expect(findBatchItem(await h.read(), itemId)?.stage).toBe("retryable");
+    await h.run({ kind: "check", workspaceId: itemId });
+    expect(h.createWorkspace).toHaveBeenCalledTimes(4);
+    h.createWorkspace.mockImplementationOnce(async (request) => {
+      const result = successful(request);
+      return {
+        ...result,
+        workspace: {
+          ...result.workspace!,
+          topic: { ...topic, ...request.topic, revision: 1, mainAgentId: result.agent!.id },
+        },
+      };
+    });
+    await h.run({ kind: "retry", workspaceId: itemId });
+    expect(h.createWorkspace).toHaveBeenCalledTimes(5);
+    expect(h.createWorkspace.mock.calls[4]![0]).toEqual(original);
+    expect(findBatchItem(await h.read(), itemId)?.stage).toBe("succeeded");
+    expect(h.createAgent).not.toHaveBeenCalled();
   });
 
   it("ignores a confirmation for another workspace without retrying the first prompt", async () => {

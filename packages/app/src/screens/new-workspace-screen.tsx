@@ -1488,6 +1488,16 @@ async function prepareTopicPrompt(
   };
 }
 
+function readEditableTopicFields(fields: WorkspaceDraftTitle["topicFields"]) {
+  return {
+    topicText: fields?.text ?? "",
+    topicDirection: fields?.direction ?? "",
+    hideTopic: fields?.hidden ?? false,
+    topicPreset: fields?.preset ?? false,
+    questionOpen: fields?.questionOpen ?? false,
+  };
+}
+
 function NewWorkspaceForm({
   serverId,
   sourceDirectory: sourceDirectoryProp,
@@ -1566,11 +1576,8 @@ function NewWorkspaceForm({
   const supportsTopic = useHostFeature(selectedServerId, "topicWorkbenchV1");
   const supportsTopicPreset = useHostFeature(selectedServerId, "workspaceMainAgentDefault");
   const [legacyLaunch, setLegacyLaunch] = useState(false);
-  const [topicText, setTopicText] = useState("");
-  const [topicDirection, setTopicDirection] = useState("");
-  const [hideTopic, setHideTopic] = useState(false);
-  const [topicPreset, setTopicPreset] = useState(false);
-  const [questionOpen, setQuestionOpen] = useState(false);
+  const { topicText, topicDirection, hideTopic, topicPreset, questionOpen } =
+    readEditableTopicFields(creationIdentity.topicFields);
   const [topicOutcome, setTopicOutcome] = useState<TopicOutcome | null>(null);
   const { attempt: topicAttempt, active: isTopicMode } = resolveTopicMode({
     draft: mainDraft,
@@ -1581,6 +1588,15 @@ function NewWorkspaceForm({
   const topicFields = readTopicFields(topicText, topicDirection, hideTopic);
   const draftKey = buildNewWorkspaceDraftKey(draftId);
   const creationDraftId = creationIdentity.draftId;
+  const editTopic = useCallback(
+    (fields: NonNullable<WorkspaceDraftTitle["topicFields"]>) => {
+      void useWorkspaceDraftSubmissionStore
+        .getState()
+        .editDraftTopic(creationDraftId, fields)
+        .catch((error) => toast.error(toErrorMessage(error)));
+    },
+    [creationDraftId, toast],
+  );
   const commitTitle = useCallback(
     (value: string) => {
       void useWorkspaceDraftSubmissionStore
@@ -2495,6 +2511,12 @@ function NewWorkspaceForm({
     async (draft: MainDraft, action: "submit" | "check" | "retry", update?: CreationSnapshot) => {
       if (!draft.topicAttempt || draft.target.serverId !== selectedServerId) return false;
       if (action !== "check" && !supportsTopic) throw new Error(t("topicWorkbench.updateHost"));
+      const clearConsumedDraft = captureWorkspaceDraftCleanup({
+        draftId: creationDraftId,
+        draftKey,
+        draftContextScopeKey,
+        clearDraft: chatDraft.clear,
+      });
       const outcome = await runTopicCreation(
         withConnectedClient(),
         draft.topicAttempt,
@@ -2505,14 +2527,6 @@ function NewWorkspaceForm({
       if (outcome.workspace) acceptWorkspaceMainSnapshots(outcome.workspace, outcome.agent);
       if (outcome.stage !== "succeeded") return false;
 
-      const clearConsumedDraft = captureWorkspaceDraftCleanup({
-        draftId: creationDraftId,
-        draftKey,
-        draftContextScopeKey,
-        clearDraft: chatDraft.clear,
-      });
-      await useWorkspaceDraftSubmissionStore.getState().finishDraftTitle(creationDraftId);
-      await writeMainDraft(creationDraftId, null, { finishBatch: true });
       clearConsumedDraft();
       if (isStillOnCreateScreen()) {
         leaveFullscreen();
@@ -2522,13 +2536,15 @@ function NewWorkspaceForm({
           ...(outcome.agent ? { target: { kind: "agent", agentId: outcome.agent.id } } : {}),
         });
       }
+      await useWorkspaceDraftSubmissionStore.getState().finishDraftTitle(creationDraftId);
+      await writeMainDraft(creationDraftId, null, { finishBatch: true });
       return true;
     },
   );
 
   const prepareTopicMain = useStableEvent(
-    async (question: MessagePayload | undefined, cwd: string) => {
-      if (!question && !topicPreset) return null;
+    async (question: MessagePayload | undefined, cwd: string, preset?: boolean) => {
+      if (!question && !preset) return null;
       if (question) assertExplicitMainSupported();
       else if (!supportsTopicPreset) throw new Error(t("topicWorkbench.updateHost"));
       const provider = composerState?.selectedProvider;
@@ -2546,6 +2562,41 @@ function NewWorkspaceForm({
     },
   );
 
+  const submitNewTopic = useStableEvent(
+    async (saved: MainDraft | null, question?: MessagePayload) => {
+      if (!supportsTopic) throw new Error(t("topicWorkbench.updateHost"));
+      const fields = await useWorkspaceDraftSubmissionStore
+        .getState()
+        .readDraftTopic(creationDraftId);
+      const frozenFields = readTopicFields(fields?.text, fields?.direction, fields?.hidden);
+      if (!frozenFields || !mainTarget) throw new Error(t("topicWorkbench.required"));
+      const prompt =
+        fields?.questionOpen && question && !isEmptyWorkspaceSubmission(question)
+          ? question
+          : undefined;
+      const armed = restoreMainDraftAtTarget(saved, mainTarget);
+      if (armed && draftModelCount(armed) > 1) {
+        await startWorkspaceMainBatch(
+          prompt ?? { cwd: mainTarget.directory, text: "", attachments: [] },
+          armed,
+          frozenFields,
+        );
+        return;
+      }
+      const placement = await prepareWorkspacePlacement(false, undefined, true);
+      const main = await prepareTopicMain(prompt, mainTarget.directory, fields?.preset);
+      const workspaceId = `wks_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
+      const request = topicRequest(
+        { source: placement.source, metadata: { ...placement.metadata }, ...frozenFields },
+        { workspaceId, idempotencyKey: creationDraftId },
+        main,
+      );
+      const draft = { target: mainTarget, topicAttempt: request };
+      await saveMainDraft(draft, true);
+      await runSavedTopic(draft, "submit");
+    },
+  );
+
   const handleTopicAction = useStableEvent(
     async (action: "submit" | "check" | "retry", question?: MessagePayload) => {
       if (pendingExplicitMainSubmissions.has(creationDraftId)) return;
@@ -2560,36 +2611,16 @@ function NewWorkspaceForm({
             return;
           }
           if (action !== "submit" || saved?.batch || saved?.attempt) return;
-          if (!supportsTopic) throw new Error(t("topicWorkbench.updateHost"));
-          if (!topicFields || !mainTarget) throw new Error(t("topicWorkbench.required"));
-          const prompt = questionOpen && question?.text.trim() ? question : undefined;
-          const armed = restoreMainDraftAtTarget(saved, mainTarget);
-          if (draftModelCount(armed) > 1 && armed) {
-            await startWorkspaceMainBatch(
-              prompt ?? {
-                cwd: mainTarget.directory,
-                text: "",
-                attachments: [],
-              },
-              armed,
-              topicFields,
-            );
-            return;
-          }
-          const placement = await prepareWorkspacePlacement(false, undefined, true);
-          const main = await prepareTopicMain(prompt, mainTarget.directory);
-          const workspaceId = `wks_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
-          const request = topicRequest(
-            { source: placement.source, metadata: { ...placement.metadata }, ...topicFields },
-            { workspaceId, idempotencyKey: creationDraftId },
-            main,
-          );
-          const draft = { target: mainTarget, topicAttempt: request };
-          await saveMainDraft(draft, true);
-          await runSavedTopic(draft, "submit");
+          await submitNewTopic(saved, question);
         });
       } catch (error) {
-        setErrorMessage(workspaceCreationErrorMessage(t, error, Boolean(question?.text.trim())));
+        setErrorMessage(
+          workspaceCreationErrorMessage(
+            t,
+            error,
+            Boolean(question && !isEmptyWorkspaceSubmission(question)),
+          ),
+        );
       } finally {
         pendingExplicitMainSubmissions.delete(creationDraftId);
         setPendingAction(null);
@@ -3089,7 +3120,12 @@ function NewWorkspaceForm({
   const composerCwd = workingDirectory ?? "";
   const commandDraft = composerState?.commandDraft;
   const hasMultipleModels = draftModelCount(mainDraft) >= 2;
-  const topicCreateLabel = topicSubmitLabel(t, questionOpen, hasDraftText);
+  const topicCreateLabel = topicSubmitLabel(
+    t,
+    questionOpen,
+    hasDraftText,
+    chatDraft.attachments.length,
+  );
   const submitTopicWithoutQuestion = useCallback(
     () => void handleTopicAction("submit"),
     [handleTopicAction],
@@ -3098,7 +3134,6 @@ function NewWorkspaceForm({
     (payload: MessagePayload) => handleTopicAction("submit", payload),
     [handleTopicAction],
   );
-  const toggleTopicQuestion = useCallback(() => setQuestionOpen((open) => !open), []);
   const useDirectLaunch = useStableEvent(() => {
     if (forgetMainTarget()) setLegacyLaunch(true);
   });
@@ -3127,16 +3162,16 @@ function NewWorkspaceForm({
       locked: isPending,
       topicText,
       direction: topicDirection,
-      onTopicChange: setTopicText,
-      onDirectionChange: setTopicDirection,
+      onTopicChange: (text: string) => editTopic({ text }),
+      onDirectionChange: (direction: string) => editTopic({ direction }),
       hidden: hideTopic,
-      onHiddenChange: setHideTopic,
+      onHiddenChange: (hidden: boolean) => editTopic({ hidden }),
       preset: topicPreset,
-      onPresetChange: setTopicPreset,
+      onPresetChange: (preset: boolean) => editTopic({ preset }),
       supportsPreset: supportsTopicPreset,
       presetControls,
       questionOpen,
-      onQuestionToggle: toggleTopicQuestion,
+      onQuestionToggle: () => editTopic({ questionOpen: !questionOpen }),
       onDirect: useDirectLaunch,
     }),
     [
@@ -3149,7 +3184,7 @@ function NewWorkspaceForm({
       supportsTopicPreset,
       presetControls,
       questionOpen,
-      toggleTopicQuestion,
+      editTopic,
       useDirectLaunch,
     ],
   );
@@ -3331,8 +3366,13 @@ function isWorkspaceFormLocked(pending: boolean, draft: MainDraft | null) {
   return pending || hasMainDraftSubmission(draft);
 }
 
-function topicSubmitLabel(t: TFunction, questionOpen: boolean, hasDraftText: boolean) {
-  return questionOpen && hasDraftText
+function topicSubmitLabel(
+  t: TFunction,
+  questionOpen: boolean,
+  hasText: boolean,
+  attachmentCount: number,
+) {
+  return questionOpen && (hasText || attachmentCount > 0)
     ? t("topicWorkbench.createAndAsk")
     : t("topicWorkbench.create");
 }

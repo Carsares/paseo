@@ -7,7 +7,11 @@ import {
   type ReviewViewedEntry,
 } from "./port";
 
-const LocalViewedRecord = z.object({ headSha: z.string(), paths: z.array(z.string()) });
+const LocalViewedRecord = z.object({
+  headSha: z.string(),
+  paths: z.array(z.string()),
+  previousHeads: z.array(z.string()).default([]),
+});
 
 export function createLocalReviewViewed(storage: Pick<typeof AsyncStorage, "getItem" | "setItem">) {
   const pending = new Map<string, Promise<unknown>>();
@@ -35,17 +39,42 @@ export function createLocalReviewViewed(storage: Pick<typeof AsyncStorage, "getI
     return stored ? LocalViewedRecord.parse(JSON.parse(stored)) : null;
   }
 
+  function viewedEntries(record: z.infer<typeof LocalViewedRecord>): ReviewViewed {
+    return { entries: record.paths.map((path) => ({ path, state: "viewed" })) };
+  }
+
   return {
     load(identity: ReviewIdentity, headSha: string, signal: AbortSignal): Promise<ReviewViewed> {
       return forReview(identity, async (key) => {
         signal.throwIfAborted();
         const record = await read(key);
         signal.throwIfAborted();
+        if (record?.headSha !== headSha) throw { code: "stale" };
+        return viewedEntries(record);
+      });
+    },
+    confirmHead(
+      identity: ReviewIdentity,
+      headSha: string,
+      signal: AbortSignal,
+    ): Promise<ReviewViewed> {
+      return forReview(identity, async (key) => {
+        signal.throwIfAborted();
+        const record = await read(key);
+        signal.throwIfAborted();
         if (record?.headSha !== headSha) {
-          await storage.setItem(key, JSON.stringify({ headSha, paths: [] }));
+          if (record?.previousHeads.includes(headSha)) throw { code: "stale" };
+          await storage.setItem(
+            key,
+            JSON.stringify({
+              headSha,
+              paths: [],
+              previousHeads: record ? [...record.previousHeads, record.headSha] : [],
+            }),
+          );
           return { entries: [] };
         }
-        return { entries: record.paths.map((path) => ({ path, state: "viewed" })) };
+        return viewedEntries(record);
       });
     },
     set(
@@ -60,7 +89,10 @@ export function createLocalReviewViewed(storage: Pick<typeof AsyncStorage, "getI
         const paths = new Set(record.paths);
         if (viewed) paths.add(path);
         else paths.delete(path);
-        await storage.setItem(key, JSON.stringify({ headSha, paths: [...paths] }));
+        await storage.setItem(
+          key,
+          JSON.stringify({ headSha, paths: [...paths], previousHeads: record.previousHeads }),
+        );
         return { path, state: viewed ? "viewed" : "unviewed" };
       });
     },

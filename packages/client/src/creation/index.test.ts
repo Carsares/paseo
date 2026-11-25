@@ -136,6 +136,75 @@ test("duplicate client submissions join one complete intent and cumulative updat
   f.client.close();
 });
 
+test("reconnect resumes an unbound topic from its workspace checkpoint with the same request", async () => {
+  const request = {
+    idempotencyKey: "resume-topic",
+    workspaceId: workspace.id,
+    source: { kind: "directory" as const, path: "/project" },
+    title: "Topic",
+    topic: { summary: null, hideFromModel: true },
+    mainAgent: { config: { provider: "codex", cwd: "/project" } },
+  };
+  const created = {
+    ...workspace,
+    topic: { ...request.topic, mainAgentId: null, revision: 1 },
+  };
+  const halfway: CreationSnapshot = {
+    kind: "workspace",
+    idempotencyKey: request.idempotencyKey,
+    workspaceId: workspace.id,
+    workspace: created,
+    agentId: null,
+    phase: "workspace_ready",
+    revision: 2,
+    error: null,
+  };
+  const requests: Record<string, unknown>[] = [];
+  const resumed = Promise.withResolvers<CreationResult>();
+  const client = new CreationClient({
+    supports: () => true,
+    requestId: () => "request",
+    request: async (_kind, input) => {
+      requests.push(input);
+      if (requests.length === 1)
+        throw Object.assign(new Error("Connection lost"), { code: "DAEMON_CONNECTION_LOST" });
+      return resumed.promise;
+    },
+    observe: (_kind, _key, next) => {
+      next({ ...halfway, idempotencyKey: "another-topic" });
+      next(halfway);
+      next(halfway);
+      return () => {};
+    },
+    legacyAgent: async () => {
+      throw new Error("Unexpected legacy agent");
+    },
+    legacyWorkspace: async () => {
+      throw new Error("Unexpected legacy workspace");
+    },
+  });
+  const original = client.createWorkspace(request);
+  client.reconnect();
+  expect(requests).toEqual([
+    { ...request, subscribe: true },
+    { ...request, subscribe: true },
+  ]);
+  const completion: CreationSnapshot = {
+    ...halfway,
+    phase: "completed",
+    revision: 4,
+    mainAgent: agent,
+    workspace: { ...created, topic: { ...created.topic, mainAgentId: agent.id } },
+  };
+  resumed.resolve({
+    creation: completion,
+    workspace: completion.workspace,
+    mainAgent: agent,
+    error: null,
+  });
+  await expect(original).resolves.toMatchObject({ creation: completion, mainAgent: agent });
+});
+
 test("legacy adaptation keeps workspace, agent and initial prompt sequencing inside the client", async () => {
   const f = fixture(false);
   const phases: string[] = [];

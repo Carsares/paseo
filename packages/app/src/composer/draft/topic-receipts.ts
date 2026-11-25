@@ -1,11 +1,46 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
-import type { CreationSnapshot } from "@getpaseo/protocol/messages";
+import { isMainControlAgent } from "@getpaseo/protocol/agent-labels";
+import type { CreationSnapshot, WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
 
 export function creationSnapshotMatches(
   snapshot: CreationSnapshot | null | undefined,
   identity: Pick<CreationSnapshot, "kind" | "idempotencyKey">,
 ): snapshot is CreationSnapshot {
   return snapshot?.kind === identity.kind && snapshot.idempotencyKey === identity.idempotencyKey;
+}
+
+export function isUnboundTopicWorkspace(
+  workspace: WorkspaceDescriptorPayload | null,
+  workspaceId: string,
+) {
+  return (
+    workspace?.id === workspaceId &&
+    workspace.topic?.mainAgentId === null &&
+    workspace.hasActiveMainAgent === false
+  );
+}
+
+export function isRejectedBoundTopicPrompt(
+  receipt: CreationSnapshot | null,
+  workspace: WorkspaceDescriptorPayload | null,
+  workspaceId: string,
+  agentId: string,
+) {
+  const agent = receipt?.agent;
+  return (
+    receipt?.phase === "failed" &&
+    receipt.failedStage === "prompt" &&
+    receipt.outcomeUnknown === false &&
+    !receipt.initialPromptStarted &&
+    receipt.workspaceId === workspaceId &&
+    workspace?.id === workspaceId &&
+    !workspace.archivingAt &&
+    workspace.topic?.mainAgentId === agentId &&
+    agent?.id === agentId &&
+    agent.workspaceId === workspaceId &&
+    !agent.archivedAt &&
+    isMainControlAgent(agent)
+  );
 }
 
 /** A timeline match is positive evidence only. An absent or truncated page cannot prove rejection. */

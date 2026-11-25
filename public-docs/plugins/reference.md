@@ -459,19 +459,21 @@ has a complete example. Import the types from `@getpaseo/plugin/server/provider`
 interface ProviderInstallation {
   installUrl?: string;
   updateUrl?: string;
+  maintenance?: { kind: "automatic" | "external" | "manual"; message?: string };
   inspect?(context: ProviderInstallationContext): Promise<ProviderInspection>;
   checkForUpdates?(context: ProviderUpdateCheckContext): Promise<ProviderUpdateCheck>;
+  /** Compatibility only. The host does not call this. */
   update?(context: ProviderUpdateContext): Promise<ProviderUpdateResult>;
 }
 ```
 
-| Member            | Called                                                       | Deadline | Answer kept                                      |
-| ----------------- | ------------------------------------------------------------ | -------- | ------------------------------------------------ |
-| `inspect`         | When the provider list or a provider's page shows            | 20 s     | 30 s                                             |
-| `checkForUpdates` | After `inspect` answers `installed`, or without `inspect`    | 25 s     | 1 hour for `current` or `available`, else 30 s   |
-| `update`          | When the user selects **Update**, one at a time per provider | None     | Paseo reads both answers again after `succeeded` |
+| Member            | Called                                                    | Deadline | Answer kept                                    |
+| ----------------- | --------------------------------------------------------- | -------- | ---------------------------------------------- |
+| `inspect`         | When the provider list or a provider's page shows         | 20 s     | 30 s                                           |
+| `checkForUpdates` | After `inspect` answers `installed`, or without `inspect` | 25 s     | 1 hour for `current` or `available`, else 30 s |
+| `update`          | Compatibility only. Paseo does not call it.               | —        | —                                              |
 
-**Refresh** in the provider's settings skips the kept answers and clears a failed update. Paseo
+**Refresh** in the provider's settings skips the kept answers. Paseo
 never calls these members before a session or on a schedule. A deadline or a throw becomes an error that shows the message.
 
 `installUrl` and `updateUrl` are `http` or `https` pages that Paseo opens in the browser. The
@@ -484,7 +486,6 @@ The context:
 | `launch`           | `ProviderInstallationLaunch \| undefined` | The launch a session would use, with `resolved`. Absent when the registration declares no `command`.                            |
 | `signal`           | `AbortSignal`                             | Aborts when Paseo stops waiting or the daemon stops.                                                                            |
 | `installedVersion` | `string \| undefined`                     | `checkForUpdates` only. The `version` `inspect` reported, as written. Absent when it reported none or you declare no `inspect`. |
-| `report`           | `(event: ProviderUpdateReport) => void`   | `update` only. Shows `{ type: "stdout" \| "stderr" \| "message", text }` to the user in order.                                  |
 
 `ProviderInstallationLaunch` is `{ command, args, env, resolved }`. With `resolved: true`, `command`
 is the executable's path. With `resolved: false`, Paseo did not find the executable and `command`
@@ -492,18 +493,18 @@ is the configured name.
 
 Answers:
 
-| Type                   | Values                                                                                                                                  |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `ProviderInspection`   | `{ status: "installed", version?: string }` or `{ status: "not_installed" }`                                                            |
-| `ProviderUpdateCheck`  | `{ status: "current" }`, `{ status: "available", versions?: string[], message?: string }`, or `{ status: "unknown", message?: string }` |
-| `ProviderUpdateResult` | `{ status: "succeeded", message?: string }` or `{ status: "failed", message: string }`                                                  |
+| Type                  | Values                                                                                                                                  |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `ProviderInspection`  | `{ status: "installed", version?: string }` or `{ status: "not_installed" }`                                                            |
+| `ProviderUpdateCheck` | `{ status: "current" }`, `{ status: "available", versions?: string[], message?: string }`, or `{ status: "unknown", message?: string }` |
 
-Paseo shows `version`, `versions` and `message` as written and does not parse or sort them. It
-reuses a `current` or `available` answer for up to an hour while `inspect` reports the same
-`version`. It keeps the last 65,536 characters of `report` output. An answer that does not match these
-shapes is an error. **Update** appears once `inspect` reports the CLI installed and you declare
-`update`, whatever `checkForUpdates` answers and whether you declare it; without `update`, Paseo
-offers `updateUrl` on the same terms.
+Paseo shows `version`, `versions` and `message` as written. It reuses a `current` or `available`
+answer for up to an hour while `inspect` reports the same `version`.
+
+Use `maintenance` to describe how updates happen and `updateUrl` to link to the instructions.
+`automatic` describes vendor-managed updates. `external` describes maintenance by a service operator.
+`manual` describes updates the user performs. A legacy `update` callback makes the host report
+manual maintenance. It does not enable an **Update** action.
 
 ### Usage sources
 

@@ -38,6 +38,7 @@ import { AgentTurnStartCanceledError, AgentTurnStartRejectedError } from "./agen
 import { ForegroundPromptStart } from "./agent-run-state.js";
 import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
 import { createFakeCodexAppServer } from "./providers/codex/test-utils/fake-app-server.js";
+import { mapCodexToolCallFromThreadItem } from "./providers/codex/tool-call-mapper.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
 import { buildStoredAgentPayload, toAgentPayload } from "./agent-projections.js";
@@ -116,6 +117,8 @@ async function checkpointFixture(
   optionsForFixture: {
     afterToolWrites?: string;
     patchEdit?: boolean;
+    multiFilePatch?: boolean;
+    externalSecondEdit?: boolean;
     earlierTurn?: boolean;
     stageOnly?: boolean;
     durableTimelineStore?: AgentTimelineStore;
@@ -152,6 +155,8 @@ async function checkpointFixture(
     source: { kind: "branch-off", baseBranch: "main", branchName: "rewind" },
   });
   const file = join(cwd, "example.txt");
+  const secondFile = join(cwd, "second file.txt");
+  if (optionsForFixture.multiFilePatch) writeFileSync(secondFile, "second before\n");
   writeFileSync(file, "before staged\n");
   git(cwd, "add", "example.txt");
   writeFileSync(file, "before worktree\n");
@@ -257,9 +262,37 @@ async function checkpointFixture(
             : { type: "write", filePath: file, content: "after worktree\n" },
         },
       ];
+      if (optionsForFixture.multiFilePatch) {
+        const secondAfter = "second after\n";
+        writeFileSync(secondFile, secondAfter);
+        git(cwd, "add", "second file.txt");
+        const tool = mapCodexToolCallFromThreadItem(
+          {
+            type: "fileChange",
+            id: "codex-two-files",
+            status: "completed",
+            changes: [
+              {
+                path: file,
+                kind: { type: "update", move_path: null },
+                diff: "@@ -1 +1 @@\n-after staged\n+after worktree\n",
+              },
+              {
+                path: secondFile,
+                kind: { type: "update", move_path: null },
+                diff: "@@ -1 +1 @@\n-second before\n+second after\n",
+              },
+            ],
+          },
+          { cwd },
+        );
+        if (!tool) throw new Error("Expected mapped Codex apply_patch event");
+        this.history.splice(2, 1, tool);
+      }
       for (const item of this.history) {
         this.pushEvent({ type: "timeline", provider: this.provider, turnId, item });
       }
+      if (optionsForFixture.externalSecondEdit) writeFileSync(secondFile, "an external change\n");
       if (optionsForFixture.afterToolWrites) writeFileSync(file, optionsForFixture.afterToolWrites);
       this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
       return { turnId };
@@ -322,6 +355,7 @@ async function checkpointFixture(
     workspaces,
     workspace,
     file,
+    secondFile,
     cwd,
     create,
     makeManager,
@@ -346,6 +380,38 @@ async function checkpointFixture(
 
 const afterCheckpointEdit = { worktree: "after worktree\n", index: "after staged\n" };
 const beforeCheckpointEdit = { worktree: "before worktree\n", index: "before staged\n" };
+
+test.each([false, true])(
+  "checkpoint rewind attributes a Codex patch across files (external edit: %s)",
+  async (externalEdit) => {
+    const { manager, target, checkpointId, state, secondFile, cwd } = await checkpointFixture({
+      multiFilePatch: true,
+      externalSecondEdit: externalEdit,
+    });
+    const stagedSecond = () =>
+      execFileSync("git", ["show", ":second file.txt"], {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    expect(stagedSecond()).toBe("second after\n");
+    const restore = manager.restoreRewindCheckpoint({ ...target, checkpointId, mode: "files" });
+    if (externalEdit) {
+      await expect(restore).rejects.toThrow("cannot be attributed to an agent edit");
+      expect(state()).toEqual(afterCheckpointEdit);
+      expect(readFileSync(secondFile, "utf8")).toBe("an external change\n");
+      expect(stagedSecond()).toBe("second after\n");
+    } else {
+      await expect(restore).resolves.toMatchObject({
+        error: null,
+        operation: { status: "files_restored" },
+      });
+      expect(state()).toEqual(beforeCheckpointEdit);
+      expect(readFileSync(secondFile, "utf8")).toBe("second before\n");
+      expect(() => stagedSecond()).toThrow();
+    }
+  },
+);
 
 test("checkpoint rewind rejects legacy file modes and keeps legacy conversation-only rewind", async () => {
   const { manager, session, target, state } = await checkpointFixture();
@@ -380,11 +446,12 @@ test.each(["throws", "unconfirmed", "reports a replay failure", "loses retained 
     );
     expect(state()).toEqual(afterCheckpointEdit);
     expect(session.rewinds).toEqual(["provider-submitted"]);
+    await expect(manager.getPendingRewindFiles(target.agentId)).resolves.toEqual([]);
   },
 );
 
-test("checkpoint rewind retries files after recreating the manager without a provider session", async () => {
-  const { manager, session, target, state, file, checkpointId, makeManager } =
+test("checkpoint rewind discovers and retries files after recreating the manager without a provider session", async () => {
+  const { manager, session, target, state, file, checkpointId, makeManager, create, workspace } =
     await checkpointFixture();
   session.onRewind = () => {
     expect(state()).toEqual(afterCheckpointEdit);
@@ -405,13 +472,40 @@ test("checkpoint rewind retries files after recreating the manager without a pro
     ...afterCheckpointEdit,
     worktree: "external write during conversation rewind\n",
   });
+  expect(manager.getTimeline(target.agentId)).toEqual([]);
+  const sibling = await create(manager);
+  await expect(manager.getPendingRewindFiles(sibling.id)).resolves.toEqual([]);
+  await expect(
+    manager.retryRewindFiles({
+      agentId: sibling.id,
+      operationId: pending.operation.operationId,
+    }),
+  ).rejects.toThrow("Restore operation is unavailable");
+  await manager.closeAgent(sibling.id);
   writeFileSync(file, afterCheckpointEdit.worktree);
   await manager.closeAgent(target.agentId);
   const restarted = makeManager();
   expect(restarted.getAgent(target.agentId)).toBeNull();
+  const [recovered] = await restarted.getPendingRewindFiles(target.agentId);
+  expect(recovered).toEqual({
+    operationId: pending.operation.operationId,
+    conversationRewound: true,
+  });
+  const originalCwd = workspace.cwd;
+  workspace.cwd = join(originalCwd, "not-the-original-directory");
+  await expect(restarted.getPendingRewindFiles(target.agentId)).rejects.toThrow(
+    "exclusive Paseo worktree",
+  );
+  await expect(
+    restarted.retryRewindFiles({
+      agentId: target.agentId,
+      operationId: recovered!.operationId,
+    }),
+  ).rejects.toThrow("exclusive Paseo worktree");
+  workspace.cwd = originalCwd;
   const retried = await restarted.retryRewindFiles({
     agentId: target.agentId,
-    operationId: pending.operation.operationId,
+    operationId: recovered!.operationId,
   });
   expect(retried).toEqual({
     error: null,
@@ -419,6 +513,7 @@ test("checkpoint rewind retries files after recreating the manager without a pro
   });
   expect(session.rewinds).toEqual(["provider-submitted"]);
   expect(state()).toEqual(beforeCheckpointEdit);
+  await expect(restarted.getPendingRewindFiles(target.agentId)).resolves.toEqual([]);
 });
 
 test("checkpoint rewind excludes parent and child directory writes while confirming chat", async () => {

@@ -23,12 +23,24 @@ export function useReviewViewed(
   const queryKey = ["pr-review-viewed", scope, queryToken];
   const input = { ...target, version: guide.version };
   const local = guide.viewedMode === "local";
+  const confirmLocalHead = useRef(true);
   const query = useFetchQuery({
     dataShape: "value",
     staleTimeMs: 0,
     queryKey,
     queryFn: async ({ signal }) => {
-      if (local) return localReviewViewed.load(input.identity, input.version.headSha, signal);
+      if (local) {
+        if (!confirmLocalHead.current) {
+          return localReviewViewed.load(input.identity, input.version.headSha, signal);
+        }
+        const viewed = await localReviewViewed.confirmHead(
+          input.identity,
+          input.version.headSha,
+          signal,
+        );
+        confirmLocalHead.current = false;
+        return viewed;
+      }
       const result = await port.getReviewViewed(input);
       signal.throwIfAborted();
       return result;
@@ -45,6 +57,7 @@ export function useReviewViewed(
 
   async function reload() {
     if (writeInFlight.current) return;
+    confirmLocalHead.current = false;
     const result = await query.refetch();
     if (result.isSuccess) setWriteFailure(undefined);
   }

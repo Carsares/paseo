@@ -49,6 +49,8 @@ import {
   RewindCommandCenterRegistration,
   RewindComposerRestoreProvider,
 } from "@/components/rewind";
+import { usePendingRewindFileRecovery } from "@/components/rewind/use-rewind-agent-mutation";
+import { ToastApiProvider } from "@/contexts/toast-context";
 import { useAgentDescriptor } from "@/agent-presentation";
 import {
   ComposerQuoteProvider,
@@ -1411,6 +1413,14 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
   const dockContent = (
     <View style={styles.contentContainer}>
       {streamContent}
+      <AgentPendingRewindFiles
+        serverId={serverId}
+        agent={effectiveAgent}
+        draft={draft}
+        isArchiving={isArchivingCurrentAgent}
+        cwd={cwd}
+        toastApi={toastApi}
+      />
 
       {showHistorySyncError ? (
         <TimelineSyncErrorCallout isRetrying={isRetryingHistorySync} onRetry={retryTimelineSync} />
@@ -1482,6 +1492,55 @@ const ChatAgentReadyContent = memo(function ChatAgentReadyContent({
     children: content,
   });
 });
+
+function AgentPendingRewindFiles({
+  agent,
+  draft,
+  isArchiving,
+  toastApi,
+  ...scope
+}: {
+  serverId: string;
+  agent: AgentScreenAgent | null;
+  draft: DraftConversation | null;
+  isArchiving: boolean;
+  cwd: string;
+  toastApi: ToastApi;
+}) {
+  if (!agent || draft || isArchiving) return null;
+  return (
+    <ToastApiProvider api={toastApi}>
+      <AgentPendingRewindFileNotice {...scope} agentId={agent.id} />
+    </ToastApiProvider>
+  );
+}
+
+function AgentPendingRewindFileNotice({
+  serverId,
+  agentId,
+  cwd,
+}: {
+  serverId: string;
+  agentId: string;
+  cwd: string;
+}) {
+  const active = useRetainedPanelActive();
+  const client = useHostRuntimeClient(serverId);
+  const connected = useHostRuntimeIsConnected(serverId);
+  const recovery = usePendingRewindFileRecovery({
+    serverId,
+    agentId,
+    cwd,
+    client,
+    enabled: active && connected,
+  });
+  if (!recovery?.length) return null;
+  return (
+    <View style={styles.timelineSyncCalloutRail} testID="agent-pending-rewind-files">
+      <View style={styles.timelineSyncCalloutContent}>{recovery}</View>
+    </View>
+  );
+}
 
 function ChatAgentReadyFrame({
   mainAgentId,

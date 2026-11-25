@@ -42,6 +42,39 @@ function loadProductionStores() {
   return module.exports;
 }
 
+test("topic fields survive a store restart and stay scoped to their original draft", async () => {
+  const storage = createStorage();
+  const { createWorkspaceDraftSubmissionStore } = loadProductionStores();
+  const writer = createWorkspaceDraftSubmissionStore(storage);
+  const createWorktreeSlug = () => "unused-slug";
+  const first = await writer.getState().openDraftTitle({ createWorktreeSlug });
+  const second = await writer.getState().openDraftTitle({ createWorktreeSlug });
+  await Promise.all([
+    writer.getState().editDraftTopic(first, { text: "  First topic\nDetails" }),
+    writer.getState().editDraftTopic(first, { direction: "  Follow the trace" }),
+    writer.getState().editDraftTopic(second, { text: "Second topic" }),
+    writer.getState().editDraftTopic(first, { hidden: true, preset: true, questionOpen: true }),
+  ]);
+  const reader = createWorkspaceDraftSubmissionStore(storage);
+  for (const id of [first, second]) {
+    expect(
+      await reader.getState().openDraftTitle({ creationDraftId: id, createWorktreeSlug }),
+    ).toBe(id);
+  }
+  expect(reader.getState().titlesById[first]?.topicFields).toEqual({
+    text: "  First topic\nDetails",
+    direction: "  Follow the trace",
+    hidden: true,
+    preset: true,
+    questionOpen: true,
+  });
+  expect(reader.getState().titlesById[second]?.topicFields).toEqual({ text: "Second topic" });
+  await reader.getState().finishDraftTitle(first);
+  await writer.getState().editDraftTopic(first, { text: "Stale editor" });
+  expect(await reader.getState().readDraftTopic(first)).toBeUndefined();
+  expect(await reader.getState().readDraftTopic(second)).toEqual({ text: "Second topic" });
+});
+
 test("the production app consumes a draft once and leaves other drafts pending", () => {
   const { useWorkspaceDraftSubmissionStore: store } = loadProductionStores();
   const submission = {

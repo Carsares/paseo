@@ -10,14 +10,18 @@ import type {
   WorkspaceDescriptorPayload,
 } from "@getpaseo/protocol/messages";
 import type { MainDraft } from "./main-draft";
-import { readTopicPromptReceipt } from "@/composer/draft/topic-receipts";
+import {
+  isRejectedBoundTopicPrompt,
+  isUnboundTopicWorkspace,
+  readTopicPromptReceipt,
+} from "@/composer/draft/topic-receipts";
 
 export type TopicPlacement = Pick<CreateWorkspaceRequestOptions, "source" | "metadata"> & {
   title: string;
   topic: NonNullable<CreateWorkspaceRequestOptions["topic"]>;
 };
 
-export function readTopicFields(text: string, direction: string, hideFromModel: boolean) {
+export function readTopicFields(text = "", direction = "", hideFromModel = false) {
   const firstLine = text
     .split(/\r\n?|\n/)
     .find((line) => line.trim())
@@ -54,7 +58,12 @@ export function topicRequest(
     ...(metadata && Object.keys(metadata).length ? { metadata } : {}),
   };
   if (!main) return base;
-  if (main.prompt?.initialPrompt?.trim()) {
+  if (
+    main.prompt &&
+    (main.prompt.initialPrompt?.trim() ||
+      main.prompt.images?.length ||
+      main.prompt.attachments?.length)
+  ) {
     return {
       ...base,
       agent: { ...main.prompt, labels: {}, config: main.config, workspaceRole: "main" },
@@ -102,6 +111,7 @@ async function confirmed(
   request: TopicRequest,
   receipt: CreationSnapshot | null | undefined,
   entities: TopicEntities,
+  prompt?: Awaited<ReturnType<typeof readTopicPromptReceipt>>,
 ): Promise<TopicOutcome | undefined> {
   if (!entities.workspace) return;
   if (request.agent) {
@@ -111,8 +121,12 @@ async function confirmed(
       (receipt?.initialPromptStarted === true || receipt?.phase === "prompt_started");
     if (
       !started &&
-      (await readTopicPromptReceipt(client, entities.agent.id, request.agent.clientMessageId)) !==
-        "recorded"
+      (prompt ??
+        (await readTopicPromptReceipt(
+          client,
+          entities.agent.id,
+          request.agent.clientMessageId,
+        ))) !== "recorded"
     )
       return;
   } else {
@@ -138,20 +152,39 @@ function matchingReceipt(request: TopicRequest, receipt: CreationSnapshot | null
 }
 
 function canRetryTopic(
-  receipt: CreationSnapshot | null,
+  request: TopicRequest,
+  snapshot: PromiseSettledResult<CreationSnapshot | null>,
+  latest: CreationSnapshot | null,
   directory: PromiseSettledResult<WorkspaceDescriptorPayload | null>,
+  prompt: Awaited<ReturnType<typeof readTopicPromptReceipt>> | undefined,
 ) {
-  // Both reads precede a retry. A lost acknowledgement cannot become a new prompt.
-  if (directory.status !== "fulfilled" || !receipt || receipt.outcomeUnknown !== false)
-    return false;
-  if (receipt.phase !== "failed") return false;
-  if (receipt.failedStage === "workspace") return !directory.value && !receipt.workspace;
-  return (
-    receipt.failedStage === "agent" &&
-    !!directory.value?.topic &&
-    !receipt.agent &&
-    !receipt.mainAgent
-  );
+  if (snapshot.status !== "fulfilled" || directory.status !== "fulfilled") return false;
+  const workspace = directory.value;
+  if (!latest) return snapshot.value === null && workspace === null;
+  if (!matchingReceipt(request, snapshot.value)) return false;
+  if (latest.failedStage === "prompt") {
+    const agentId = request.agent?.agentId;
+    return (
+      latest === snapshot.value &&
+      prompt === "not-found" &&
+      !!agentId &&
+      isRejectedBoundTopicPrompt(latest, workspace, request.workspaceId, agentId)
+    );
+  }
+  return canRetryUnboundTopic(latest, workspace, request.workspaceId);
+}
+
+function canRetryUnboundTopic(
+  receipt: CreationSnapshot,
+  workspace: WorkspaceDescriptorPayload | null,
+  workspaceId: string,
+) {
+  if (receipt.outcomeUnknown) return false;
+  const unbound = isUnboundTopicWorkspace(workspace, workspaceId);
+  if (receipt.phase === "workspace_ready") return unbound && !receipt.agent && !receipt.mainAgent;
+  if (receipt.outcomeUnknown !== false || receipt.phase !== "failed") return false;
+  if (receipt.failedStage === "workspace") return !workspace && !receipt.workspace;
+  return receipt.failedStage === "agent" && unbound && !receipt.agent && !receipt.mainAgent;
 }
 
 async function reconcileTopic(
@@ -169,11 +202,17 @@ async function reconcileTopic(
   const workspace = directory.status === "fulfilled" ? directory.value : latest?.workspace;
   const agent = await readTopicAgent(client, request, workspace, latest);
   const entities = matchingEntities(request, workspace, agent);
-  const success = await confirmed(client, request, latest, entities);
+  const prompt =
+    latest?.failedStage === "prompt" && entities.agent && request.agent?.clientMessageId
+      ? await readTopicPromptReceipt(client, entities.agent.id, request.agent.clientMessageId)
+      : undefined;
+  const success = await confirmed(client, request, latest, entities, prompt);
   if (success) return success;
   return {
     ...entities,
-    stage: canRetryTopic(latest, directory) ? "retryable" : "unconfirmed",
+    stage: canRetryTopic(request, snapshot, latest, directory, prompt)
+      ? "retryable"
+      : "unconfirmed",
     error: latest?.error ?? undefined,
   };
 }

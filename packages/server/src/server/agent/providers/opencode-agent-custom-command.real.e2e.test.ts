@@ -7,7 +7,6 @@ import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import pino from "pino";
 
 import { createDaemonTestContext, type DaemonTestContext } from "../../test-utils/index.js";
-import { OpenCodeServerManager } from "./opencode/server-manager.js";
 import {
   canRunRealProvider,
   createRealProviderClients,
@@ -97,7 +96,6 @@ describe("opencode custom command Big Pickle E2E (real)", () => {
       expect(state.lastMessage).toContain(EXPECTED_RESPONSE);
     } finally {
       await ctx?.cleanup();
-      await OpenCodeServerManager.getInstance(logger).shutdown();
       await rm(commandFile, { force: true });
       if (!commandDirExisted) {
         await rmdir(commandDir).catch(() => undefined);

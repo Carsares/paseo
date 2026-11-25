@@ -1,10 +1,9 @@
-import { afterAll, beforeAll, beforeEach, describe, test, expect } from "vitest";
+import { beforeAll, beforeEach, describe, onTestFinished, test, expect } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import pino from "pino";
 
-import { OpenCodeServerManager } from "./opencode/server-manager.js";
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
 import {
   canRunRealProvider,
@@ -28,16 +27,14 @@ describe("OpenCode reasoning dedup", () => {
     }
   });
 
-  afterAll(async () => {
-    await OpenCodeServerManager.getInstance(logger).shutdown();
-  });
-
   test("reasoning content is not duplicated as assistant_message", async () => {
     const cwd = mkdtempSync(path.join(tmpdir(), "opencode-reasoning-dedup-"));
     const client = createRealProviderClient("opencode", logger);
+    onTestFinished(async () => await client.shutdown?.());
 
+    let session: Awaited<ReturnType<typeof client.createSession>> | undefined;
     try {
-      const session = await client.createSession({
+      session = await client.createSession({
         provider: "opencode",
         cwd,
         model: OPENCODE_REAL_TEST_MODEL,
@@ -80,7 +77,11 @@ describe("OpenCode reasoning dedup", () => {
         expect(fullAssistantText).not.toContain(reasoningPrefix);
       }
     } finally {
-      rmSync(cwd, { recursive: true, force: true });
+      try {
+        await session?.close();
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
     }
   }, 120_000);
 });

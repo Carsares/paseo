@@ -109,11 +109,22 @@ export function readForkAgentIntent(draft: Exclude<DraftSetupStatus, string> | n
   return draft?.agentIntent ?? draft?.worktreeSubmission?.agentIntent;
 }
 
+const DraftTopicFieldsSchema = z.object({
+  text: z.string().optional(),
+  direction: z.string().optional(),
+  hidden: z.boolean().optional(),
+  preset: z.boolean().optional(),
+  questionOpen: z.boolean().optional(),
+});
+
+type DraftTopicFields = z.infer<typeof DraftTopicFieldsSchema>;
+
 const DraftTitleSchema = z.object({
   draftId: z.string().min(1),
   worktreeSlug: z.string().min(1),
   title: z.string(),
   submitted: z.boolean(),
+  topicFields: DraftTopicFieldsSchema.optional(),
 });
 
 export type WorkspaceDraftTitle = z.infer<typeof DraftTitleSchema>;
@@ -127,6 +138,8 @@ interface DraftTitles {
     createWorktreeSlug: () => string;
   }) => Promise<string>;
   editDraftTitle: (id: string, value: string) => Promise<void>;
+  editDraftTopic: (id: string, fields: DraftTopicFields) => Promise<void>;
+  readDraftTopic: (id: string) => Promise<DraftTopicFields | undefined>;
   submitDraftTitle: (id: string) => Promise<string>;
   finishDraftTitle: (id: string) => Promise<void>;
 }
@@ -197,6 +210,15 @@ function createDraftTitles(
           publish(id, record);
           await storage.setItem(storageKey(id), JSON.stringify(record));
         }),
+      editDraftTopic: (id, fields) =>
+        ordered(id, async () => {
+          const stored = await readStored(id);
+          if (!stored || stored.submitted) return;
+          const record = { ...stored, topicFields: { ...stored.topicFields, ...fields } };
+          publish(id, record);
+          await storage.setItem(storageKey(id), JSON.stringify(record));
+        }),
+      readDraftTopic: (id) => ordered(id, async () => (await readStored(id))?.topicFields),
       submitDraftTitle: (id) =>
         ordered(id, async () => {
           const current = get().titlesById[id];

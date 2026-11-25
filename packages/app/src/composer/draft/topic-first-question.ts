@@ -12,7 +12,12 @@ import {
 } from "@getpaseo/protocol/messages";
 import { z } from "zod";
 import { isWeb } from "@/constants/platform";
-import { creationSnapshotMatches, readTopicPromptReceipt } from "./topic-receipts";
+import {
+  creationSnapshotMatches,
+  isRejectedBoundTopicPrompt,
+  isUnboundTopicWorkspace,
+  readTopicPromptReceipt,
+} from "./topic-receipts";
 
 const requestSchema = AgentCreateRequestSchema.pick({
   agentId: true,
@@ -141,6 +146,17 @@ function latestQuestionReceipt(
   return event && (!stored || event.revision > stored.revision) ? event : stored;
 }
 
+function canRetryUnboundQuestion(
+  creation: PromiseSettledResult<CreationSnapshot | null>,
+  receipt: CreationSnapshot | null,
+) {
+  return (
+    creation.status === "fulfilled" &&
+    ((creation.value === null && !receipt) ||
+      (agentCreationFailedBeforeBinding(receipt) && receipt?.errorCode !== "workspace_main_exists"))
+  );
+}
+
 async function reconcileContinuedQuestion(
   client: TopicQuestionClient,
   request: SavedTopicQuestion["request"],
@@ -183,6 +199,13 @@ export async function reconcileTopicQuestion(
     ? { available: true, agent: receipt.agent }
     : await readMainAgent(client, agentId, request.workspaceId);
   if (candidate.agent) {
+    const stored = matchingReceipt(
+      request,
+      creation.status === "fulfilled" ? creation.value : null,
+    );
+    const retry =
+      receipt === stored &&
+      isRejectedBoundTopicPrompt(stored, workspace, request.workspaceId, request.agentId);
     return reconcileBoundPrompt(
       client,
       request,
@@ -190,13 +213,12 @@ export async function reconcileTopicQuestion(
       receipt,
       boundMainId,
       mainConflict,
+      retry,
     );
   }
   if (
-    boundMainId === null &&
-    workspace?.hasActiveMainAgent === false &&
-    rejected &&
-    !mainConflict &&
+    isUnboundTopicWorkspace(workspace, request.workspaceId) &&
+    canRetryUnboundQuestion(creation, receipt) &&
     candidate.available
   ) {
     return { stage: "retry" };
@@ -211,10 +233,12 @@ async function reconcileBoundPrompt(
   receipt: CreationSnapshot | null,
   boundMainId: string | null | undefined,
   mainConflict: boolean,
+  retry: boolean,
 ): Promise<TopicQuestionOutcome> {
   if (agent.id === request.agentId && promptStarted(receipt)) return { stage: "confirmed", agent };
   const prompt = await readTopicPromptReceipt(client, agent.id, request.clientMessageId);
   if (prompt === "recorded") return { stage: "confirmed", agent };
+  if (prompt === "not-found" && retry) return { stage: "retry" };
   if (
     prompt === "not-found" &&
     mainConflict &&

@@ -429,24 +429,21 @@ daemon timeline append. A renderer does not require a provider implementation.
 
 ## Report installation and updates
 
-Add `installation` to your registration and the provider's settings show an **Installation**
-section. Users see whether your CLI is installed and which version, whether an update is
-available, and an **Update** button that runs your updater and shows its output. Every member is
-optional, so declare only what your CLI supports:
+Add `installation` to show the CLI version, release status, and maintenance instructions in provider settings. Each field is optional.
 
-| Member            | Users see                                                               | Declare it when                                        |
-| ----------------- | ----------------------------------------------------------------------- | ------------------------------------------------------ |
-| `installUrl`      | **Install instructions**, and **Install** while not installed           | Users install a CLI                                    |
-| `updateUrl`       | **Update instructions** while installed, when you declare no `update`   | Your docs say how to update                            |
-| `inspect`         | **Version**, or **Not installed**                                       | The CLI reports its version                            |
-| `checkForUpdates` | **Up to date**, **Update available**, or **Couldn't check for updates** | You can ask the release source your CLI's updater uses |
-| `update`          | **Update** while installed, then the updater's output                   | The CLI updates itself with a command                  |
+| Member            | Users see                                                                |
+| ----------------- | ------------------------------------------------------------------------ |
+| `installUrl`      | Vendor installation instructions                                         |
+| `updateUrl`       | **Update instructions** linking to your guide                            |
+| `maintenance`     | How the CLI is maintained (`manual`, `external`, or `automatic`)         |
+| `inspect`         | **Version** or **Not installed**                                         |
+| `checkForUpdates` | **Up to date**, **Update available**, or **Couldn't check for updates**  |
+| `update`          | Compatibility only. Paseo shows manual maintenance and does not call it. |
 
-This `example-agent` prints its version, asks `self-update --check --json` for the release its
-updater installs, and updates with `self-update`:
+This `example-agent` prints its version and uses `self-update --check --json` to check the same release source as its updater.
 
 ```ts
-import { execCommand, spawnProcess, terminateProcess } from "@getpaseo/plugin/server";
+import { execCommand } from "@getpaseo/plugin/server";
 import type {
   ProviderInstallation,
   ProviderInstallationLaunch,
@@ -464,6 +461,7 @@ async function run(launch: ProviderInstallationLaunch, args: string[], signal: A
 export const installation: ProviderInstallation = {
   installUrl: "https://example.com/docs/install",
   updateUrl: "https://example.com/docs/update",
+  maintenance: { kind: "manual" },
 
   async inspect({ launch, signal }) {
     if (!launch?.resolved) return { status: "not_installed" };
@@ -480,25 +478,6 @@ export const installation: ProviderInstallation = {
     return latest === installedVersion
       ? { status: "current" }
       : { status: "available", versions: [latest] };
-  },
-
-  async update({ launch, signal, report }) {
-    if (!launch?.resolved) return { status: "failed", message: "example-agent is not installed" };
-    const child = spawnProcess(launch.command, [...launch.args, "self-update"], {
-      env: launch.env,
-      stdio: "pipe",
-    });
-    child.stdin.end();
-    child.stdout.on("data", (chunk: Buffer) => report({ type: "stdout", text: chunk.toString() }));
-    child.stderr.on("data", (chunk: Buffer) => report({ type: "stderr", text: chunk.toString() }));
-    const stop = () => void terminateProcess(child);
-    signal.addEventListener("abort", stop, { once: true });
-    const code = await new Promise<number | null>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", resolve);
-    }).finally(() => signal.removeEventListener("abort", stop));
-    if (code !== 0) return { status: "failed", message: `self-update exited with code ${code}` };
-    return { status: "succeeded", message: "New sessions use the new version." };
   },
 };
 ```
@@ -521,9 +500,10 @@ export function createProvider(): ProviderRegistration {
 
 Each callback receives the launch a session would use. When `launch.resolved` is `false`, Paseo did
 not find the executable and `command` is the configured name, so report `not_installed` without
-running it. `launch` is absent when the registration declares no `command`. `checkForUpdates` runs
-only after `inspect` reports the CLI installed, and receives the `version` it reported as
-`installedVersion`, so compare that instead of reading the version again. For an ACP provider,
+running it. `launch` is absent when the registration declares no `command`. If you declare
+`inspect`, Paseo runs `checkForUpdates` after `inspect` reports the CLI installed and passes its
+`version`, if any, as `installedVersion`. Use that version when available. Without `inspect`,
+Paseo can still run the check and `installedVersion` is `undefined`. For an ACP provider,
 spread `runAcpProvider()` into the registration and add `installation` beside it. Run version and
 update probes with the launch's arguments before your session subcommand, such as `hoplite
 --version` for a provider that runs `hoplite acp`.
@@ -533,19 +513,12 @@ them, so your check decides what counts as newer. Ask the source your CLI's own 
 leave `checkForUpdates` out when you cannot. A check that returns `unknown`, throws, or misses its
 deadline shows **Couldn't check for updates** with your message and never shows **Up to date**.
 
-`update` runs only when a user selects **Update**, and Paseo runs one update per provider at a
-time. Pass the updater's output to `report` unchanged; Paseo keeps the last 65,536 characters. Paseo adds no
-verification of its own, so the update does what your command does in a terminal. Return
-`succeeded` with a message that says when the new version takes effect, or `failed` with the reason.
-A failed update shows until the user refreshes the provider. Without `update`, **Update instructions** opens `updateUrl` instead.
-
-**Update** and **Update instructions** appear whenever `inspect` reports the CLI installed. The
-check only says what it knows beside them, so declare `update` even when you cannot check.
+Use `manual` when the user follows your update guide, `external` when a service operator maintains the CLI, or `automatic` when the vendor manages updates. Paseo uses these values as maintenance descriptions. Provide `updateUrl` even if you cannot check for releases.
 
 Paseo calls `inspect` when the settings open and keeps the answer for 30 seconds. It keeps a
 `current` or `available` answer from `checkForUpdates` for an hour while `inspect` reports the same
 version, so a CLI updated outside Paseo is checked again once the inspection expires. `inspect` must answer within 20 seconds and `checkForUpdates` within 25.
-`update` has no deadline. `signal` aborts when Paseo stops waiting or the daemon stops.
+`signal` aborts when Paseo stops waiting or the daemon stops.
 See the [`installation` reference](/docs/plugins/reference#provider-installation) for every field.
 
 ## Adapt an ACP agent

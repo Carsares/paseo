@@ -213,18 +213,30 @@ export class CreationClient {
     for (const operation of this.operations.values()) {
       if (operation.settled || !operation.modern || operation.recovering) continue;
       operation.recovering = true;
-      operation.stopObserving = this.deps.observe(
+      let replaying = false;
+      const stopObserving = this.deps.observe(
         operation.kind,
         operation.key,
         (snapshot) => {
-          if (!snapshot) void this.submit(operation);
-          else {
+          if (snapshot) {
+            if (snapshot.kind !== operation.kind || snapshot.idempotencyKey !== operation.key)
+              return;
             // Re-subscription is authoritative even if its revision matches the last live event.
+            if (snapshot.revision < (operation.snapshot?.revision ?? 0)) return;
             this.receive(snapshot);
+          }
+          if (operation.settled || replaying) return;
+          if (!snapshot || isResumableTopic(operation, snapshot)) {
+            replaying = true;
+            void this.submit(operation).finally(() => {
+              replaying = false;
+            });
           }
         },
         (error) => this.fail(operation, error),
       );
+      if (operation.settled) stopObserving();
+      else operation.stopObserving = stopObserving;
     }
   }
   close(): void {
@@ -255,6 +267,20 @@ export class CreationClient {
       /* Observation does not control execution. */
     }
   }
+}
+
+function isResumableTopic(operation: Operation, snapshot: CreationSnapshot) {
+  return (
+    operation.kind === "workspace" &&
+    operation.input.topic &&
+    snapshot.phase === "workspace_ready" &&
+    !snapshot.outcomeUnknown &&
+    !snapshot.agent &&
+    !snapshot.mainAgent &&
+    snapshot.workspaceId === operation.input.workspaceId &&
+    snapshot.workspace?.id === snapshot.workspaceId &&
+    snapshot.workspace?.topic?.mainAgentId === null
+  );
 }
 
 function relativeDirectory(cwd: string, source: string): string {

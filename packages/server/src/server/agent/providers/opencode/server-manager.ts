@@ -91,8 +91,6 @@ export interface OpenCodeServerManagerOptions {
 }
 
 export class OpenCodeServerManager implements OpenCodeServerManagerLike {
-  private static instance: OpenCodeServerManager | null = null;
-  private static exitHandlerRegistered = false;
   private currentServer: OpenCodeServerGeneration | null = null;
   private retiredServers = new Set<OpenCodeServerGeneration>();
   private startPromise: Promise<OpenCodeServerGeneration> | null = null;
@@ -129,38 +127,6 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       options.createEventSource ?? ((input) => new OpenCodeEventConsumer(input));
     this.decorateServerEnv = options.decorateServerEnv;
     this.catalogDiscovery = options.catalogDiscovery;
-  }
-
-  static getInstance(
-    logger: Logger,
-    runtimeSettings?: ProviderRuntimeSettings,
-    options: Omit<OpenCodeServerManagerOptions, "logger" | "runtimeSettings"> = {},
-  ): OpenCodeServerManager {
-    if (!OpenCodeServerManager.instance) {
-      OpenCodeServerManager.instance = new OpenCodeServerManager({
-        logger,
-        runtimeSettings,
-        ...options,
-      });
-      OpenCodeServerManager.registerExitHandler();
-    }
-    return OpenCodeServerManager.instance;
-  }
-
-  private static registerExitHandler(): void {
-    if (OpenCodeServerManager.exitHandlerRegistered) {
-      return;
-    }
-    OpenCodeServerManager.exitHandlerRegistered = true;
-
-    const cleanup = () => {
-      const instance = OpenCodeServerManager.instance;
-      void instance?.shutdown();
-    };
-
-    process.on("exit", cleanup);
-    process.on("SIGTERM", cleanup);
-    process.on("SIGINT", cleanup);
   }
 
   async acquireCurrent(signal?: AbortSignal): Promise<OpenCodeServerAcquisition> {

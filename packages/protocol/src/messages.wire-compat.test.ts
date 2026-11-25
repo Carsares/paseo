@@ -545,6 +545,35 @@ test("checkpoint historical diffs accept old responses and preserve staging when
   }
 });
 
+test("checkpoint pending file recovery is optional and does not require an original message", () => {
+  const request = {
+    type: "agent.rewind.checkpoint.get.request",
+    requestId: "lookup",
+    agentId: "agent",
+    messageId: "original-message",
+  };
+  const pendingRequest = { ...request, messageId: "", pendingFiles: true };
+  expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+  expect(SessionInboundMessageSchema.parse(pendingRequest)).toEqual(pendingRequest);
+  const base = { requestId: "lookup", agentId: "agent", ok: true, error: null };
+  for (const payload of [
+    { ...base, target: { messageId: "original-message", checkpointId: "checkpoint" } },
+    { ...base, pendingFiles: [{ operationId: "operation", conversationRewound: true }] },
+  ]) {
+    const message = { type: "agent.rewind.checkpoint.get.response", payload };
+    const response = { type: "session", message };
+    expect(SessionOutboundMessageSchema.parse(message)).toEqual(message);
+    expect(validateWSOutboundMessage(response)).toMatchObject({ success: true, data: response });
+  }
+  expect(
+    ServerInfoStatusPayloadSchema.parse({
+      status: "server_info",
+      serverId: "server",
+      features: { rewindCheckpoints: true, rewindPendingFiles: true },
+    }).features,
+  ).toEqual({ rewindCheckpoints: true, rewindPendingFiles: true });
+});
+
 test("resident specialist and reset capabilities are optional booleans", () => {
   const info = { status: "server_info", serverId: "server-1" };
   expect(ServerInfoStatusPayloadSchema.parse(info).features).toBeUndefined();

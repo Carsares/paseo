@@ -399,12 +399,17 @@
                 "type": "string"
               },
               "command": {
-                "minItems": 1,
                 "type": "array",
-                "items": {
-                  "type": "string",
-                  "minLength": 1
-                }
+                "items": [
+                  {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                ],
+                "additionalItems": {
+                  "type": "string"
+                },
+                "minItems": 1
               },
               "env": {
                 "type": "object",
@@ -414,6 +419,10 @@
                 "additionalProperties": {
                   "type": "string"
                 }
+              },
+              "deferDiscovery": {
+                "type": "boolean",
+                "const": true
               },
               "options": {
                 "type": "object",

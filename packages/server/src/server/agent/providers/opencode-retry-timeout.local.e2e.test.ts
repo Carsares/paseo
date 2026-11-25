@@ -1,5 +1,5 @@
 import http from "node:http";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -7,7 +7,6 @@ import { expect, test } from "vitest";
 
 import type { AgentStreamEvent } from "../agent-sdk-types.js";
 import { OpenCodeAgentClient } from "./opencode-agent.js";
-import { OpenCodeServerManager } from "./opencode/server-manager.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 
 function listen(server: http.Server): Promise<number> {
@@ -23,6 +22,73 @@ function listen(server: http.Server): Promise<number> {
     });
   });
 }
+
+test("closing one OpenCode client and session stops only its own helper", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "paseo-opencode-owned-stop-"));
+  const script = path.join(root, "server.cjs");
+  const logger = createTestLogger();
+  const createClient = (name: string) =>
+    new OpenCodeAgentClient(
+      logger,
+      { command: { mode: "replace", argv: [process.execPath, script, path.join(root, name)] } },
+      { resolveHomeDir: () => root },
+    );
+  const first = createClient("first.pid");
+  const second = createClient("second.pid");
+  let firstSession: Awaited<ReturnType<OpenCodeAgentClient["createSession"]>> | undefined;
+  let secondSession: Awaited<ReturnType<OpenCodeAgentClient["createSession"]>> | undefined;
+  try {
+    await writeFile(
+      script,
+      [
+        'const { writeFileSync } = require("node:fs");',
+        'const server = require("node:http").createServer((req, res) => {',
+        ' const pathname = req.url.split("?")[0];',
+        ' if (pathname === "/global/event") {',
+        '   res.writeHead(200, { "content-type": "text/event-stream" });',
+        '   res.write("data: " + JSON.stringify({ payload: { type: "server.connected", properties: {} } }) + "\\n\\n");',
+        "   return;",
+        " }",
+        ' res.writeHead(200, { "content-type": "application/json" });',
+        ' const body = req.method === "POST" && pathname === "/session"',
+        '   ? { id: "owned-test-session" } : pathname === "/provider" ? { all: [] } : [];',
+        " res.end(JSON.stringify(body));",
+        "});",
+        'server.listen(Number(process.argv.at(-1)), "127.0.0.1", () => {',
+        " writeFileSync(process.argv[2], String(process.pid));",
+        ' console.log("server listening on http://127.0.0.1:" + server.address().port);',
+        "});",
+      ].join("\n"),
+    );
+    firstSession = await first.createSession({ provider: "opencode", cwd: root });
+    secondSession = await second.createSession({ provider: "opencode", cwd: root });
+    const firstPid = Number(await readFile(path.join(root, "first.pid"), "utf8"));
+    const secondPid = Number(await readFile(path.join(root, "second.pid"), "utf8"));
+    expect(firstPid).not.toBe(secondPid);
+
+    await firstSession.close();
+    firstSession = undefined;
+    await first.shutdown();
+    expect(() => process.kill(firstPid, 0)).toThrow(/ESRCH/u);
+    expect(await second.listImportableSessions()).toEqual([]);
+    expect(await readFile(path.join(root, "second.pid"), "utf8")).toBe(String(secondPid));
+
+    await secondSession.close();
+    secondSession = undefined;
+    await second.shutdown();
+    expect(() => process.kill(secondPid, 0)).toThrow(/ESRCH/u);
+  } finally {
+    try {
+      try {
+        await Promise.all([firstSession?.close(), secondSession?.close()]);
+      } finally {
+        await Promise.all([first.shutdown(), second.shutdown()]);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
 
 test("does not fail an active OpenCode provider retry before the advertised retry delay elapses", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "paseo-opencode-retry-"));
@@ -148,9 +214,15 @@ test("does not fail an active OpenCode provider retry before the advertised retr
       ),
     ).toEqual([]);
   } finally {
-    await session?.close();
-    await OpenCodeServerManager.getInstance(logger, runtimeSettings).shutdown();
-    providerServer.close();
-    await rm(root, { recursive: true, force: true });
+    try {
+      await session?.close();
+    } finally {
+      try {
+        await client.shutdown();
+      } finally {
+        providerServer.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    }
   }
 }, 45_000);

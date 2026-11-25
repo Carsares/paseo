@@ -143,7 +143,14 @@ import { acquireInstallationProcess } from "../provider-installation/installatio
 import {
   findInstallationLaunchPath,
   readInstallationActivityKeys,
+  readInstalledNodePackageVersion,
 } from "../provider-installation/installation-target.js";
+import {
+  discoveredReleaseCheck,
+  readStaticCatalogMetadata,
+  type DiscoveredReleaseCheck,
+  type StaticCatalogMetadata,
+} from "../provider-installation/provider-installations.js";
 import { appendOrReplaceGrowingAssistantMessage, runProviderTurn } from "./provider-runner.js";
 import {
   MODE_APPLIES_NEXT_TURN_NOTICE,
@@ -370,6 +377,8 @@ interface CodexAppServerAgentDeps {
   customCodexConfig?: CodexCustomProviderConfig | null;
   // The CODEX_HOME the session's app-server runs with; prompts and skills are read from it.
   codexHome?: string;
+  /** A menu read cannot restart a session that captured a custom launch. */
+  blockPassiveLaunch?: boolean;
   _createCodexClient?: (
     child: ChildProcessWithoutNullStreams,
     logger: Logger,
@@ -6147,7 +6156,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   async listCommands(options?: { allowLaunch?: boolean }): Promise<AgentSlashCommand[]> {
     const prompts = await listCodexCustomPrompts(this.codexHome);
     if (this.connectionState === "disconnected") {
-      if (options?.allowLaunch !== false) await this.connect();
+      if (options?.allowLaunch !== false && !this.deps.blockPassiveLaunch) await this.connect();
     } else {
       await this.loadSkills();
     }
@@ -8483,6 +8492,39 @@ const lookupLatestCodexRelease: LatestReleaseLookup = async ({ executablePath, s
   return tag.replace(/^rust-v/, "");
 };
 
+async function readCodexExecutableIdentity(file: string) {
+  try {
+    const real = await fs.realpath(file);
+    const info = await fs.stat(real, { bigint: true });
+    if (!info.isFile()) return undefined;
+    const { dev, ino, size, mtimeNs, ctimeNs } = info;
+    return { real, dev, ino, size, mtimeNs, ctimeNs };
+  } catch {
+    return undefined;
+  }
+}
+
+interface CodexInstallationIdentity {
+  file: string;
+  identity: Awaited<ReturnType<typeof readCodexExecutableIdentity>>;
+}
+
+async function readCodexReleaseSource(realPath: string, version: string) {
+  // A prerelease number alone does not identify which tag originally selected it.
+  if (!/^\d+\.\d+\.\d+$/u.test(version)) return undefined;
+  const caskDirectory = path.join("Caskroom", "codex", version);
+  if (
+    homebrewCaskOf(realPath) === "codex" &&
+    realPath.includes(path.sep + caskDirectory + path.sep)
+  ) {
+    return "homebrew";
+  }
+  if ((await readInstalledNodePackageVersion(realPath, "@openai/codex")) === version) {
+    return "npm";
+  }
+  return undefined;
+}
+
 export class CodexAppServerAgentClient implements AgentClient {
   readonly provider = CODEX_PROVIDER;
   readonly capabilities = CODEX_APP_SERVER_CAPABILITIES;
@@ -8585,6 +8627,9 @@ export class CodexAppServerAgentClient implements AgentClient {
       ...this.deps,
       codexHome: resolveCodexHomeDir(buildCodexAppServerEnv(this.runtimeSettings, launchEnv)),
       customCodexConfig: this.customProviderConfig(),
+      blockPassiveLaunch:
+        this.runtimeSettings?.command?.mode === "replace" ||
+        currentCustomProviderLaunch() !== undefined,
     };
   }
 
@@ -8650,7 +8695,8 @@ export class CodexAppServerAgentClient implements AgentClient {
     environment: Record<string, string>;
     goalsEnabled?: boolean;
     agentId?: string;
-  }): Promise<() => ChildProcessWithoutNullStreams> {
+    observeInstallation?: boolean;
+  }) {
     const scope = currentCustomProviderLaunch();
     const processPort = this.deps.appServerProcess ?? defaultCodexAppServerProcess;
     if (scope && processPort !== defaultCodexAppServerProcess) {
@@ -8670,7 +8716,11 @@ export class CodexAppServerAgentClient implements AgentClient {
     if (options.goalsEnabled) {
       args.push("--enable", "goals");
     }
-    return () => {
+    const installation =
+      options.observeInstallation && resolved && launchPrefix.args.length === 0
+        ? { file: resolved, identity: await readCodexExecutableIdentity(resolved) }
+        : undefined;
+    const spawn = () => {
       const binding =
         launch && scope
           ? assertScopedLaunch({
@@ -8718,14 +8768,18 @@ export class CodexAppServerAgentClient implements AgentClient {
       assertChildWithPipes(child);
       return child;
     };
+    return { spawn, installation };
   }
 
   private async startAppServer(
-    options: { signal?: AbortSignal } = {},
-  ): Promise<CodexAppServerClient> {
+    options: { signal?: AbortSignal; observeInstallation?: boolean } = {},
+  ) {
     const environment = buildCodexAppServerEnv(this.runtimeSettings);
-    const spawn = await this.prepareAppServerSpawn({ environment });
-    const { client } = await codexAppServerStartup.start({
+    const { spawn, installation } = await this.prepareAppServerSpawn({
+      environment,
+      observeInstallation: options.observeInstallation,
+    });
+    const result = await codexAppServerStartup.start({
       stateDirKey: codexStartupStateDirKey(environment),
       spawn,
       createClient: (child) => new CodexAppServerClient(child, this.logger),
@@ -8733,7 +8787,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       logger: this.logger,
       signal: options.signal,
     });
-    return client;
+    return { ...result, installation };
   }
 
   async createSession(
@@ -8752,7 +8806,7 @@ export class CodexAppServerAgentClient implements AgentClient {
     const goalsEnabled = await this.resolveGoalsEnabled();
     const autoReviewEnabled = await this.resolveAutoReviewEnabled();
     const environment = buildCodexAppServerEnv(this.runtimeSettings, launchContext?.env);
-    const spawn = await this.prepareAppServerSpawn({
+    const { spawn } = await this.prepareAppServerSpawn({
       environment,
       goalsEnabled,
       agentId: launchContext?.agentId,
@@ -8790,7 +8844,7 @@ export class CodexAppServerAgentClient implements AgentClient {
     const goalsEnabled = await this.resolveGoalsEnabled();
     const autoReviewEnabled = await this.resolveAutoReviewEnabled();
     const environment = buildCodexAppServerEnv(this.runtimeSettings, launchContext?.env);
-    const spawn = await this.prepareAppServerSpawn({
+    const { spawn } = await this.prepareAppServerSpawn({
       environment,
       goalsEnabled,
       agentId: launchContext?.agentId,
@@ -8815,7 +8869,7 @@ export class CodexAppServerAgentClient implements AgentClient {
     options?: ListImportableSessionsOptions,
   ): Promise<ImportableProviderSession[]> {
     const environment = buildCodexAppServerEnv(this.runtimeSettings);
-    const spawn = await this.prepareAppServerSpawn({ environment });
+    const { spawn } = await this.prepareAppServerSpawn({ environment });
     const { client } = await codexAppServerStartup.start({
       stateDirKey: codexStartupStateDirKey(environment),
       spawn,
@@ -8889,17 +8943,21 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 
   async fetchCatalog(
-    _options: FetchCatalogOptions,
+    options: FetchCatalogOptions,
     context?: ProviderRefreshContext,
-  ): Promise<ProviderCatalog> {
-    const [models, autoReviewEnabled] = await Promise.all([
-      this.fetchModelsFromAppServer(context),
+  ): Promise<ProviderCatalog & { [discoveredReleaseCheck]?: DiscoveredReleaseCheck }> {
+    const observeInstallation =
+      options.scope === "global" &&
+      (currentCustomProviderLaunch() !== undefined ||
+        this.runtimeSettings?.command?.mode === "replace");
+    const [catalog, autoReviewEnabled] = await Promise.all([
+      this.fetchModelsFromAppServer(context, observeInstallation),
       runProviderRefreshActivity(context, "version", () =>
         this.resolveAutoReviewEnabled(context?.signal),
       ),
     ]);
     return {
-      models,
+      ...catalog,
       defaultModeId: autoReviewEnabled ? "auto-review" : DEFAULT_CODEX_MODE_ID,
       modes: autoReviewEnabled
         ? CODEX_MODES
@@ -8913,9 +8971,67 @@ export class CodexAppServerAgentClient implements AgentClient {
       : DEFAULT_CODEX_MODE_ID;
   }
 
+  async [readStaticCatalogMetadata](
+    options: FetchCatalogOptions,
+    context?: ProviderRefreshContext,
+  ): Promise<StaticCatalogMetadata | undefined> {
+    const scope = currentCustomProviderLaunch();
+    const customCommand = this.runtimeSettings?.command?.mode === "replace";
+    if (!scope && !customCommand) return undefined;
+    const defaults = { defaultModeId: DEFAULT_CODEX_MODE_ID };
+    if (options.scope !== "global" || !options.force) return defaults;
+
+    if (scope) {
+      if (!scope.active || scope.adapter !== CODEX_PROVIDER) return defaults;
+      return runProviderRefreshActivity(context, "app-server.initialize", async () => {
+        const startup = await this.startAppServer({
+          signal: context?.signal,
+          observeInstallation: true,
+        });
+        try {
+          return { ...defaults, ...(await this.readAppServerInstallation(startup)) };
+        } finally {
+          await startup.client.dispose();
+        }
+      });
+    }
+
+    // Legacy replacements reach this branch after the manager classifies the launcher.
+    return runProviderRefreshActivity(context, "version", async () => {
+      try {
+        const installed = await this.resolveInstalledCommand();
+        if (!installed) return defaults;
+        const installation =
+          installed.args.length === 0
+            ? {
+                file: installed.executable,
+                identity: await readCodexExecutableIdentity(installed.executable),
+              }
+            : undefined;
+        context?.signal.throwIfAborted();
+        const output = await readCommandVersionOutput({
+          command: installed.command,
+          args: [...installed.args, "--version"],
+          env: this.runtimeSettings?.env,
+          signal: context?.signal,
+        });
+        return {
+          ...(await this.readInstallationMetadata(readCodexVersionLabel(output), installation)),
+          defaultModeId: codexVersionAtLeast(output, CODEX_AUTO_REVIEW_MIN_VERSION)
+            ? "auto-review"
+            : DEFAULT_CODEX_MODE_ID,
+        };
+      } catch {
+        context?.signal.throwIfAborted();
+        return defaults;
+      }
+    });
+  }
+
   private async fetchModelsFromAppServer(
     context?: ProviderRefreshContext,
-  ): Promise<AgentModelDefinition[]> {
+    observeInstallation = false,
+  ) {
     // Codex model/list is global to the app server in this flow; cwd/force are intentionally ignored.
     let client: CodexAppServerClient | undefined;
     let disposePromise: Promise<void> | undefined;
@@ -8928,19 +9044,20 @@ export class CodexAppServerAgentClient implements AgentClient {
     context?.signal.addEventListener("abort", handleAbort, { once: true });
 
     try {
-      await runProviderRefreshActivity(context, "app-server.start", async () => {
-        client = await this.startAppServer({ signal: context?.signal });
+      const startup = await runProviderRefreshActivity(context, "app-server.start", async () => {
+        const started = await this.startAppServer({ signal: context?.signal, observeInstallation });
+        client = started.client;
         if (context?.signal.aborted) await dispose();
+        return started;
       });
-      if (!client) throw new Error("Codex app-server did not start");
 
       const rawResponse = await runProviderRefreshActivity(context, "model/list", () =>
-        client!.request("model/list", {}),
+        startup.client.request("model/list", {}),
       );
       const parsedResponse = CodexModelListResponseSchema.safeParse(rawResponse);
       const models = parsedResponse.success ? (parsedResponse.data.data ?? []) : [];
       const configuredDefaults = await runProviderRefreshActivity(context, "config/read", () =>
-        readCodexConfiguredDefaults(client!, this.logger),
+        readCodexConfiguredDefaults(startup.client, this.logger),
       );
       const configuredDefaultModelId = configuredDefaults.model;
       const configuredDefaultThinkingOptionId = configuredDefaults.thinkingOptionId;
@@ -8948,17 +9065,78 @@ export class CodexAppServerAgentClient implements AgentClient {
         typeof configuredDefaultModelId === "string"
           ? models.some((model) => model?.id === configuredDefaultModelId)
           : false;
-      return models.map((model) =>
+      const definitions = models.map((model) =>
         buildCodexModelDefinition(model, {
           configuredDefaultModelId,
           configuredDefaultThinkingOptionId,
           hasConfiguredDefaultModel,
         }),
       );
+      const installation = observeInstallation ? await this.readAppServerInstallation(startup) : {};
+      return { models: definitions, ...installation };
     } finally {
       context?.signal.removeEventListener("abort", handleAbort);
       await dispose();
     }
+  }
+
+  private readAppServerInstallation(startup: {
+    initialized: unknown;
+    installation?: CodexInstallationIdentity;
+  }) {
+    const userAgent = toObjectRecord(startup.initialized)?.userAgent;
+    const version =
+      typeof userAgent === "string"
+        ? userAgent.match(/^[^/\s]+\/(\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[\w.-]{1,40})?)(?=\s|$)/u)?.[1]
+        : undefined;
+    return this.readInstallationMetadata(version, startup.installation);
+  }
+
+  private async readInstallationMetadata(
+    installedVersion: string | undefined,
+    installation?: CodexInstallationIdentity,
+  ): Promise<Omit<StaticCatalogMetadata, "defaultModeId">> {
+    if (!installedVersion) return {};
+    return {
+      installedVersion,
+      [discoveredReleaseCheck]: await this.createDiscoveredReleaseCheck(
+        installedVersion,
+        installation,
+      ),
+    };
+  }
+
+  private async createDiscoveredReleaseCheck(
+    installed: string,
+    installation?: CodexInstallationIdentity,
+  ): Promise<DiscoveredReleaseCheck> {
+    const unknown = { status: "unknown", message: "The CLI's release source is unknown." } as const;
+    const identity = installation?.identity;
+    if (!installation || !identity) {
+      return { isCurrent: async () => true, run: async () => unknown };
+    }
+    const source = await readCodexReleaseSource(identity.real, installed);
+    return {
+      isCurrent: async () =>
+        isDeepStrictEqual(await readCodexExecutableIdentity(installation.file), identity) &&
+        (await readCodexReleaseSource(identity.real, installed)) === source,
+      run: async (signal) => {
+        if (!source) return unknown;
+        let latest: string;
+        if (this.deps.lookupLatestRelease) {
+          latest = await this.deps.lookupLatestRelease({ executablePath: identity.real, signal });
+        } else if (source === "homebrew") {
+          latest = await fetchHomebrewCaskVersion("codex", signal);
+        } else {
+          latest = await fetchReleaseField({
+            url: "https://registry.npmjs.org/@openai%2fcodex/latest",
+            field: "version",
+            signal,
+          });
+        }
+        return compareWithLatestRelease({ installed, latest });
+      },
+    };
   }
 
   async archiveNativeSession(handle: AgentPersistenceHandle): Promise<void> {
@@ -8976,7 +9154,7 @@ export class CodexAppServerAgentClient implements AgentClient {
     const threadId = handle.nativeHandle ?? handle.sessionId;
     if (!threadId) return;
 
-    const client = await this.startAppServer();
+    const { client } = await this.startAppServer();
 
     try {
       if (state === "archive") {

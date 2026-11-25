@@ -1,7 +1,6 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "vitest";
+import { beforeAll, beforeEach, describe, onTestFinished, expect, test } from "vitest";
 import pino from "pino";
 
-import { OpenCodeServerManager } from "./opencode/server-manager.js";
 import {
   canRunRealProvider,
   createRealProviderClient,
@@ -24,12 +23,9 @@ describe("opencode agent commands contract (real)", () => {
     }
   });
 
-  afterAll(async () => {
-    await OpenCodeServerManager.getInstance(logger).shutdown();
-  });
-
   test("lists slash commands with the expected contract", async () => {
     const client = createRealProviderClient("opencode", logger);
+    onTestFinished(async () => await client.shutdown?.());
     const session = await client.createSession({
       provider: "opencode",
       cwd: process.cwd(),
@@ -59,6 +55,7 @@ describe("opencode agent commands contract (real)", () => {
 
   test("executes a slash command without arguments", async () => {
     const client = createRealProviderClient("opencode", logger);
+    onTestFinished(async () => await client.shutdown?.());
     const session = await client.createSession({
       provider: "opencode",
       cwd: process.cwd(),

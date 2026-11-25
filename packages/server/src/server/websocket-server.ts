@@ -2542,6 +2542,7 @@ export class VoiceAssistantWebSocketServer {
         rewind: true,
         // COMPAT(rewindCheckpoints): added in v0.17.0, remove the gate after 2027-05-24.
         rewindCheckpoints: typeof this.agentManager.configureRewindCheckpoints === "function",
+        rewindPendingFiles: typeof this.agentManager.getPendingRewindFiles === "function",
         // COMPAT(agentTimelinePromptIndex): added in v0.2.X, drop the gate when floor >= v0.2.X.
         agentTimelinePromptIndex: true,
         // COMPAT(agentHistorySearch): added in v0.3.0, remove gate after 2027-02-07.

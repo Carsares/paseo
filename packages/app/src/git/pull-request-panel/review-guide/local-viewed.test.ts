@@ -24,23 +24,32 @@ describe("device-local review progress", () => {
     const signal = new AbortController().signal;
     const first = createLocalReviewViewed(storage);
 
-    await first.load(review, "head1", signal);
+    await first.confirmHead(review, "head1", signal);
     await first.set(review, "head1", path, true);
-    await first.load(anotherRepo, "head1", signal);
+    await first.confirmHead(anotherRepo, "head1", signal);
     await first.set(anotherRepo, "head1", path, true);
-    expect(await first.load(anotherHost, "head1", signal)).toEqual({ entries: [] });
+    expect(await first.confirmHead(anotherHost, "head1", signal)).toEqual({ entries: [] });
 
     const reopened = createLocalReviewViewed(storage);
     expect(await reopened.load(review, "head1", signal)).toEqual({
       entries: [{ path, state: "viewed" }],
     });
-    expect(await reopened.load(review, "head2", signal)).toEqual({ entries: [] });
+    expect(await reopened.confirmHead(review, "head2", signal)).toEqual({ entries: [] });
+    const newPath = "src/new-head.ts";
+    await reopened.set(review, "head2", newPath, true);
+    await expect(first.confirmHead(review, "head1", signal)).rejects.toMatchObject({
+      code: "stale",
+    });
     await expect(reopened.set(review, "head1", path, true)).rejects.toMatchObject({
       code: "stale",
     });
     expect(await reopened.load(anotherRepo, "head1", signal)).toEqual({
       entries: [{ path, state: "viewed" }],
     });
-    expect(await reopened.load(review, "head1", signal)).toEqual({ entries: [] });
+    await expect(first.load(review, "head1", signal)).rejects.toMatchObject({ code: "stale" });
+    await expect(first.set(review, "head1", path, true)).rejects.toMatchObject({ code: "stale" });
+    expect(await reopened.load(review, "head2", signal)).toEqual({
+      entries: [{ path: newPath, state: "viewed" }],
+    });
   });
 });

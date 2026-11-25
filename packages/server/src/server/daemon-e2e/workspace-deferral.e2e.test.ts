@@ -1,5 +1,7 @@
+import { dirname, join } from "node:path";
 import { expect, test, vi } from "vitest";
 import { WebSocket } from "ws";
+import { MessageReceipts } from "../message-receipts/index.js";
 import type { SessionInboundMessage, WSOutboundMessage } from "../messages.js";
 import { createDaemonTestContext } from "../test-utils/index.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
@@ -225,3 +227,121 @@ test("a real manual send withdraws a delayed continuation before provider handof
     await ctx.cleanup();
   }
 }, 20_000);
+
+test.each([
+  ["absent", "accepted"],
+  ["pending", "unknown"],
+  ["accepted", "accepted"],
+  ["revoked", "cancelled"],
+] as const)(
+  "restores a delayed continuation after startup with a %s receipt or workspace",
+  async (checkpoint, finalStatus) => {
+    const resetsAt = new Date(Date.now() + 60_000).toISOString();
+    const originalPrompt = "Emit a turn failure";
+    const continuation = "Continue from where you left off.";
+    const model = "test-quota-model";
+    const received: string[] = [];
+    const clients = createTestAgentClients({
+      onStartTurn: (prompt) => received.push(String(prompt)),
+    });
+    const provider = clients.codex!;
+    const createSession = provider.createSession.bind(provider);
+    vi.spyOn(provider, "createSession").mockImplementation(async (...args) => {
+      const session = await createSession(...args);
+      const subscribe = session.subscribe.bind(session);
+      session.subscribe = (callback) =>
+        subscribe((event) => {
+          if (event.type !== "turn_failed") return callback(event);
+          callback({
+            ...event,
+            conversationLimit: {
+              limitId: "conversation",
+              providerTurnId: event.turnId,
+              model,
+              resetsAt,
+            },
+          });
+        });
+      return session;
+    });
+    const ctx = await createDaemonTestContext({ mcpEnabled: false, agentClients: clients });
+    let restarted: Awaited<ReturnType<typeof createDaemonTestContext>> | undefined;
+    try {
+      const result = await ctx.client.createWorkspace({
+        source: { kind: "directory", path: ctx.daemon.staticDir },
+      });
+      if (!result.workspace) throw new Error(result.error ?? "Missing workspace");
+      const workspaceId = result.workspace.id;
+      const agent = await ctx.client.createAgent({
+        provider: "codex",
+        cwd: ctx.daemon.staticDir,
+        model,
+        workspaceId,
+      });
+      const { agentStorage, agentManager } = ctx.daemon.daemon;
+      const recovery = agentManager.limitRecovery!;
+      const receipts = new MessageReceipts(join(ctx.daemon.paseoHome, "agent-requests"));
+      await ctx.client.sendMessage(agent.id, originalPrompt, { messageId: "original-message" });
+      const readRecord = () => agentStorage.get(agent.id);
+      await expect
+        .poll(async () => (await readRecord())?.failedConversationLimit?.turnId)
+        .toEqual(expect.any(String));
+      const turnId = (await readRecord())!.failedConversationLimit!.turnId;
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(Date.parse(resetsAt) - 100);
+      await ctx.client.setAgentLimitRecovery({
+        agentId: agent.id,
+        workspaceId,
+        turnId,
+        action: "continue",
+      });
+      recovery.stop();
+      // Recreate the checkpoint between the durable task update and provider handoff.
+      const task = (await readRecord())!.limitContinuation!;
+      await agentStorage.updateLimitContinuation(agent.id, () => ({ ...task, status: "unknown" }));
+      if (checkpoint === "pending" || checkpoint === "accepted") {
+        await receipts.send({
+          agentId: agent.id,
+          messageId: task.messageId,
+          request: { prompt: continuation, workspaceId, turnId },
+          send: async (begin, _discard, providerOutcome) => {
+            await begin();
+            await providerOutcome(checkpoint === "pending" ? "unknown" : "accepted");
+          },
+        });
+      } else if (checkpoint === "revoked") {
+        await ctx.client.setWorkspaceDeferral({ workspaceId, action: "restore" });
+      }
+      const originalSessionId = (await readRecord())?.persistence?.sessionId;
+      expect(originalSessionId).toEqual(expect.any(String));
+      await ctx.client.close();
+      await ctx.daemon.daemon.stop();
+      vi.setSystemTime(Date.parse(resetsAt) + 100);
+      restarted = await createDaemonTestContext({
+        mcpEnabled: false,
+        agentClients: clients,
+        paseoHomeRoot: dirname(ctx.daemon.paseoHome),
+        staticDir: ctx.daemon.staticDir,
+        cleanup: false,
+      });
+      const restoredStorage = restarted.daemon.daemon.agentStorage;
+      const restoredRecord = () => restoredStorage.get(agent.id);
+      await expect
+        .poll(async () => (await restoredRecord())?.limitContinuation?.status)
+        .toBe(finalStatus);
+      expect((await restoredRecord())?.limitContinuation?.messageId).toBe(task.messageId);
+      expect((await restoredRecord())?.persistence?.sessionId).toBe(originalSessionId);
+      expect(received).toEqual(
+        checkpoint === "absent" ? [originalPrompt, continuation] : [originalPrompt],
+      );
+      expect(await receipts.outcome(agent.id, task.messageId)).toBe(
+        checkpoint === "revoked" ? "absent" : finalStatus,
+      );
+    } finally {
+      vi.useRealTimers();
+      await restarted?.cleanup();
+      await ctx.cleanup();
+    }
+  },
+  20_000,
+);

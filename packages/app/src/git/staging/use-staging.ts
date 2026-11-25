@@ -18,8 +18,7 @@ type Translate = ReturnType<typeof useTranslation>["t"];
 type Client = NonNullable<ReturnType<typeof useHostRuntimeClient>>;
 type MutationOptions = Parameters<Client["checkoutGitCommitCreate"]>[0];
 type Target = Pick<MutationOptions, "cwd" | "targetRepoRoot">;
-type WriteOptions = Target &
-  Pick<MutationOptions, "expectedHeadSha" | "forceWithRunningAgents" | "requestId">;
+type WriteOptions = Target & Pick<MutationOptions, "expectedHeadSha" | "forceWithRunningAgents">;
 type MutationResult = Awaited<ReturnType<Client["checkoutGitCommitCreate"]>>;
 
 type Patch =
@@ -134,11 +133,7 @@ export function useStaging(serverId: string, cwd: string, active: boolean, showS
           return false;
         // Polling can replace the status ID while the displayed file list stays identical.
         // Bind the commit to the read that backed the button when it was pressed.
-        let requestId: string | undefined;
-        if (action.kind === "commit") {
-          if (!statusRequestId) return false;
-          requestId = `paseo-git-commit:${statusRequestId}:${crypto.randomUUID()}`;
-        }
+        if (action.kind === "commit" && !statusRequestId) return false;
         const approved = await confirmAction(action, snapshot, t);
         if (!approved) return false;
         if (!sameSnapshot(live.current, client, snapshot) || matchesDiff?.() === false) {
@@ -149,12 +144,11 @@ export function useStaging(serverId: string, cwd: string, active: boolean, showS
           cwd,
           targetRepoRoot: snapshot.repoRoot,
           expectedHeadSha: snapshot.headSha,
-          ...(requestId ? { requestId } : {}),
           ...(approved.force ? { forceWithRunningAgents: true } : {}),
         };
         let response: MutationResult;
         try {
-          response = await executeAction(client, action, options);
+          response = await executeAction(client, action, options, statusRequestId);
         } finally {
           // The host may have written even if its response was lost.
           await refresh();
@@ -359,6 +353,7 @@ function executeAction(
   client: Client,
   action: StagingAction,
   options: WriteOptions,
+  snapshotRequestId?: string,
 ): Promise<MutationResult> {
   switch (action.kind) {
     case "stage":
@@ -370,6 +365,7 @@ function executeAction(
     case "commit":
       return client.checkoutGitCommitCreate({
         ...options,
+        snapshotRequestId,
         message: action.message.trim(),
         amend: action.amend,
         pushAfter: action.pushAfter,

@@ -54,7 +54,11 @@ import type { ProviderRegistration } from "@getpaseo/plugin/server/provider";
 import { PluginAgentClientRegistry } from "./plugin-provider.js";
 import { convertLegacyClaudeUltracode, resolveAdapter } from "./option-controls.js";
 import { installationActivity } from "./provider-installation/installation-activity.js";
-import { ProviderInstallations } from "./provider-installation/provider-installations.js";
+import {
+  ProviderInstallations,
+  discoveredReleaseCheck,
+  type DiscoveredReleaseCheck,
+} from "./provider-installation/provider-installations.js";
 import {
   hasDynamicProviderLauncherName,
   isDynamicProviderLauncher,
@@ -231,6 +235,7 @@ interface CatalogBinding {
 interface ProviderCatalog {
   result?: ProviderSnapshotRecord;
   installedVersion?: string;
+  releaseCheck?: DiscoveredReleaseCheck;
   stale?: boolean;
   load?: Promise<void>;
 }
@@ -280,7 +285,8 @@ function withProviderDisplay(
 }
 
 function safeDiscoveredVersion(version: unknown): string | undefined {
-  return typeof version === "string" && /^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$/u.test(version)
+  return typeof version === "string" &&
+    /^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-(?:alpha|beta|rc)\.\d{1,6})?$/u.test(version)
     ? version
     : undefined;
 }
@@ -412,6 +418,8 @@ export class ProviderSnapshotManager {
       configurationVersion: (provider) => this.installationConfigVersions.get(provider) ?? 0,
       isDiscoveryDeferred: this.readDiscoveryDeferral,
       readDiscoveredVersion: (provider) => this.readDiscoveredVersion(provider),
+      readDiscoveredReleaseCheck: (provider) =>
+        this.readDiscoveredInstallation(provider)?.releaseCheck,
       resolveClient: (provider) => {
         const definition = this.generation.definitions[provider];
         return definition ? this.ensureClient(provider, definition) : null;
@@ -1413,11 +1421,15 @@ export class ProviderSnapshotManager {
           initial,
           redactErrors: state.requiresDiscovery,
           client,
-          publish: (entry, installedVersion) => {
+          publish: (entry, installedVersion, releaseCheck) => {
             if (!isCurrent()) return false;
             current.result = identifyEntry(structuredClone(entry));
-            if (options.runDiscovery && snapshotCwd === GLOBAL_PROVIDER_SNAPSHOT_KEY) {
+            if (
+              snapshotCwd === GLOBAL_PROVIDER_SNAPSHOT_KEY &&
+              (options.runDiscovery || (state.checkLegacyLauncher && releaseCheck))
+            ) {
               current.installedVersion = installedVersion;
+              current.releaseCheck = releaseCheck;
             }
             const boundTargets =
               state.requiresDiscovery && snapshotCwd === GLOBAL_PROVIDER_SNAPSHOT_KEY
@@ -1444,7 +1456,11 @@ export class ProviderSnapshotManager {
     initial: ProviderSnapshotEntry;
     redactErrors: boolean;
     client: AgentClient;
-    publish: (entry: ProviderSnapshotEntry, installedVersion?: string) => boolean;
+    publish: (
+      entry: ProviderSnapshotEntry,
+      installedVersion?: string,
+      releaseCheck?: DiscoveredReleaseCheck,
+    ) => boolean;
   }): Promise<void> {
     const {
       catalogOptions,
@@ -1498,6 +1514,9 @@ export class ProviderSnapshotManager {
           fetchedAt: new Date().toISOString(),
         },
         safeDiscoveredVersion(catalog.installedVersion),
+        (catalog as typeof catalog & { [discoveredReleaseCheck]?: DiscoveredReleaseCheck })[
+          discoveredReleaseCheck
+        ],
       );
     } catch (error) {
       const emitted = setEntry({
@@ -1583,9 +1602,13 @@ export class ProviderSnapshotManager {
   }
 
   private readDiscoveredVersion(provider: AgentProvider): string | undefined {
+    return this.readDiscoveredInstallation(provider)?.installedVersion;
+  }
+
+  private readDiscoveredInstallation(provider: AgentProvider): ProviderCatalog | undefined {
     const binding = this.targets.get(GLOBAL_PROVIDER_SNAPSHOT_KEY)?.bindings.get(provider);
     if (!binding?.key || binding.failure) return undefined;
-    return this.catalogs.get(binding.key)?.get(provider)?.installedVersion;
+    return this.catalogs.get(binding.key)?.get(provider);
   }
 
   private getProviderIds(): AgentProvider[] {

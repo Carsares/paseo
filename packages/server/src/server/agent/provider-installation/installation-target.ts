@@ -131,6 +131,7 @@ interface UpdateAccount {
 }
 const PackageMetadata = z.object({
   name: z.string(),
+  version: z.unknown().optional(),
   bin: z.union([z.string(), z.record(z.string(), z.string())]),
 });
 
@@ -392,11 +393,7 @@ export async function acquireApprovedUpdateFileLock(
   }
 }
 
-async function packageOwnsCommand(
-  owner: string,
-  packageName: string,
-  command: string,
-): Promise<boolean> {
+async function readOwningPackage(owner: string, packageName: string, command: string) {
   try {
     const manifest = await open(
       path.join(owner, "package.json"),
@@ -404,21 +401,36 @@ async function packageOwnsCommand(
     );
     try {
       const info = await manifest.stat();
-      if (!info.isFile() || info.size > 64 * 1024) return false;
+      if (!info.isFile() || info.size > 64 * 1024) return undefined;
       const data = Buffer.alloc(info.size + 1);
       const { bytesRead } = await manifest.read(data, 0, data.length, 0);
-      if (bytesRead !== info.size) return false;
+      if (bytesRead !== info.size) return undefined;
       const parsed = PackageMetadata.safeParse(JSON.parse(data.toString("utf8", 0, bytesRead)));
-      if (!parsed.success || parsed.data.name !== packageName) return false;
+      if (!parsed.success || parsed.data.name !== packageName) return undefined;
       const { bin } = parsed.data;
       const entries = typeof bin === "string" ? [bin] : Object.values(bin);
-      return entries.some((entry) => path.resolve(owner, entry) === command);
+      if (entries.some((entry) => path.resolve(owner, entry) === command)) return parsed.data;
     } finally {
       await manifest.close();
     }
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+/** Reads the release only when the resolved command is the package's declared binary. */
+export async function readInstalledNodePackageVersion(
+  realPath: string,
+  packageName: string,
+): Promise<string | undefined> {
+  const dirs = realPath.split(path.sep);
+  const modules = dirs.lastIndexOf("node_modules");
+  const packageParts = packageName.split("/");
+  const end = modules + 1 + packageParts.length;
+  if (modules < 1 || dirs.slice(modules + 1, end).join("/") !== packageName) return undefined;
+  const owner = dirs.slice(0, end).join(path.sep);
+  const version = (await readOwningPackage(owner, packageName, realPath))?.version;
+  return typeof version === "string" ? version : undefined;
 }
 
 /** Activity keys describe possible overlap, not executable provenance. */
@@ -447,7 +459,7 @@ export async function readInstallationActivityKeys(launchPath: string): Promise<
       const root = dirs.slice(0, modules + 1).join(path.sep);
       const owner = dirs.slice(0, packageEnd).join(path.sep);
       const packageName = dirs.slice(modules + 1, packageEnd).join("/");
-      if (packageEnd < dirs.length && (await packageOwnsCommand(owner, packageName, realPath))) {
+      if (packageEnd < dirs.length && (await readOwningPackage(owner, packageName, realPath))) {
         keys.push(`root:${root}`);
         if (dirs[modules - 1] === "lib" && modules > 2) {
           keys.push(`root:${dirs.slice(0, modules - 1).join(path.sep)}`);

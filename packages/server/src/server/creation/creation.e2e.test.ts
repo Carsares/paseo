@@ -546,6 +546,166 @@ test.each(["accepted", "rejected", "unknown"] as const)(
   60_000,
 );
 
+test.each([
+  { kind: "agent", first: "rejected", change: null, expected: "completed", calls: 2 },
+  { kind: "workspace", first: "rejected", change: null, expected: "completed", calls: 2 },
+  { kind: "agent", first: "accepted", change: null, expected: "completed", calls: 1 },
+  { kind: "workspace", first: "unknown", change: null, expected: "failed", calls: 1 },
+  { kind: "agent", first: "rejected", change: "rebound", expected: "failed", calls: 1 },
+] as const)(
+  "replays a topic creation key ($kind, $first, $change)",
+  async (scenario) => {
+    const root = await mkdtemp(join(tmpdir(), "creation-topic-retry-"));
+    const retryEntered = deferred<void>();
+    const releaseRetry = deferred<void>();
+    let calls = 0;
+    const codex = new CodexAppServerAgentClient(
+      pino({ level: "silent" }),
+      { command: { mode: "replace", argv: [process.execPath] }, env: { CODEX_HOME: root } },
+      {
+        appServerProcess: {
+          resolvePrefix: async () => ({ command: process.execPath, args: [] }),
+          spawn: () =>
+            createFakeCodexAppServer({
+              "thread/loaded/list": () => ({ data: ["thread-1"] }),
+              "thread/compact/start": async () => {
+                calls++;
+                if (calls > 1) {
+                  retryEntered.resolve();
+                  await releaseRetry.promise;
+                  return {};
+                }
+                if (scenario.first === "accepted") return {};
+                return {
+                  __jsonRpcError: {
+                    code: scenario.first === "rejected" ? -32602 : -32603,
+                    message: "First compaction failed",
+                  },
+                };
+              },
+            }).child,
+        },
+      },
+    );
+    const daemon = await createCreationDaemon({ agentClients: { codex }, mcpEnabled: false });
+    const creator = await connectCreationPeer(daemon.port);
+    const peer = await connectCreationPeer(daemon.port);
+    const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+    const workspaceId = "wks_0123456789abcdef";
+    const idempotencyKey = "original-topic-creation";
+    const agent = {
+      agentId: randomUUID(),
+      workspaceRole: "main" as const,
+      config: { provider: "codex", cwd: root },
+      initialPrompt: "/compact",
+      // Workspace creation also supports callers who let the daemon choose the message ID.
+      ...(scenario.kind === "agent" ? { clientMessageId: "original-topic-question" } : {}),
+    };
+    const placement = {
+      workspaceId,
+      title: "Topic retry",
+      source: { kind: "directory" as const, path: root },
+      topic: { summary: null, hideFromModel: true },
+    };
+    const request =
+      scenario.kind === "agent"
+        ? { type: "agent.create.request" as const, ...agent, workspaceId, idempotencyKey }
+        : { type: "workspace.create.request" as const, ...placement, agent, idempotencyKey };
+    const read = (requestId: string) =>
+      peer.request({
+        type: "creation.subscribe.request",
+        requestId,
+        kind: scenario.kind,
+        idempotencyKey,
+        subscribe: false,
+      });
+    try {
+      await client.connect();
+      if (scenario.kind === "agent") {
+        expect((await client.createWorkspace(placement)).error).toBeNull();
+      }
+      await creator.request({ ...request, requestId: "first" });
+      expect(await read("first-receipt")).toMatchObject({
+        payload: {
+          snapshot: {
+            phase: scenario.first === "accepted" ? "completed" : "failed",
+            agentId: agent.agentId,
+            workspaceId,
+            ...(scenario.first === "accepted"
+              ? { initialPromptStarted: true }
+              : { failedStage: "prompt", outcomeUnknown: scenario.first === "unknown" }),
+          },
+        },
+      });
+      expect(calls).toBe(1);
+      const conflict = await creator.request({
+        ...(request.type === "agent.create.request"
+          ? { ...request, initialPrompt: "A different question" }
+          : { ...request, agent: { ...request.agent, initialPrompt: "A different question" } }),
+        requestId: "changed-request",
+      });
+      expect(conflict).toMatchObject({
+        payload: { error: `${scenario.kind}_request_key_conflict` },
+      });
+      expect(calls).toBe(1);
+      const history = async () =>
+        (
+          await client.fetchAgentHistory({
+            filter: { workspaceIds: [workspaceId] },
+          })
+        ).entries
+          .map(({ agent: entry }) => entry.id)
+          .sort();
+      expect(await history()).toEqual([agent.agentId]);
+      if (scenario.change === "rebound") {
+        const replacement = await client.createAgent({ workspaceId, config: agent.config });
+        await client.setAgentMainControl(replacement.id, true, {
+          handoffFromAgentId: agent.agentId,
+        });
+        expect((await client.findWorkspace(workspaceId))?.topic?.mainAgentId).toBe(replacement.id);
+      }
+      const beforeHistory = await history();
+      const workspaces = (await client.fetchWorkspaces()).entries.map(({ id }) => id);
+      const retry = creator.request({ ...request, requestId: "retry" });
+      const duplicate = peer.request({ ...request, requestId: "duplicate" });
+      if (scenario.calls === 2) {
+        // The original receipt must be visible as in flight before the provider replies.
+        const duringRetry = await Promise.race([
+          retryEntered.promise.then(() => read("during-retry")),
+          retry.then(() => null),
+        ]);
+        expect(duringRetry).toMatchObject({ payload: { snapshot: { phase: "agent_ready" } } });
+        releaseRetry.resolve();
+      }
+      const [result, duplicateResult] = await Promise.all([retry, duplicate]);
+      for (const response of [result, duplicateResult]) {
+        expect(response).toMatchObject({
+          payload: { creation: { phase: scenario.expected, workspaceId, agentId: agent.agentId } },
+        });
+      }
+      expect(calls).toBe(scenario.calls);
+      expect(await history()).toEqual(beforeHistory);
+      expect((await client.fetchWorkspaces()).entries.map(({ id }) => id)).toEqual(workspaces);
+      expect(await read("final-receipt")).toMatchObject({
+        payload: {
+          snapshot: {
+            phase: scenario.expected,
+            ...(scenario.expected === "completed" ? { initialPromptStarted: true } : {}),
+          },
+        },
+      });
+    } finally {
+      releaseRetry.resolve();
+      creator.close();
+      peer.close();
+      await client.close();
+      await daemon.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
 test("explicit Main occupancy survives closing and follows archive, promotion and restore", async () => {
   const daemon = await createCreationDaemon();
   const url = `ws://127.0.0.1:${daemon.port}/ws`;

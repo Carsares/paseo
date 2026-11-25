@@ -58,11 +58,34 @@ export class AgentLimitRecovery {
           this.arm(record.id, task);
         }
       } else if (task?.status === "unknown") {
-        const receipt = await this.deps.receipts
-          .outcome(record.id, task.messageId)
-          .catch(() => "unknown");
-        if (receipt === "accepted") await this.finish(record.id, task, "accepted");
+        await this.run(record.id, () => this.recoverHandoff(record, task));
       }
+    }
+  }
+
+  private async recoverHandoff(record: StoredAgentRecord, task: AgentLimitContinuation) {
+    const receipt = await this.deps.receipts
+      .outcome(record.id, task.messageId)
+      .catch(() => "unknown");
+    if (receipt === "accepted") {
+      await this.finish(record.id, task, "accepted", "unknown");
+      return;
+    }
+    if (receipt !== "absent") return;
+    // The provider handoff waits for its durable receipt. Recover the original task
+    // if the daemon exited after recording "unknown" but before writing that receipt.
+    const limit = record.failedConversationLimit;
+    if (
+      record.archivedAt ||
+      !record.persistence?.sessionId ||
+      record.workspaceId !== task.workspaceId ||
+      limit?.turnId !== task.turnId ||
+      limit.fingerprint !== task.fingerprint ||
+      !(await this.workspaceStillMatches(task))
+    ) {
+      await this.finish(record.id, task, "cancelled", "unknown");
+    } else if (await this.finish(record.id, task, "scheduled", "unknown")) {
+      this.arm(record.id, task);
     }
   }
 
@@ -391,11 +414,14 @@ export class AgentLimitRecovery {
     agentId: string,
     task: AgentLimitContinuation,
     status: AgentLimitContinuation["status"],
+    expectedStatus?: "unknown",
   ): Promise<boolean> {
     const changed = await this.deps.storage.updateLimitContinuation(agentId, (record) => {
       const current = record.limitContinuation;
       if (current?.messageId !== task.messageId || current.status === status) return null;
-      if (status === "unknown" || status === "cancelled") {
+      if (expectedStatus) {
+        if (current.status !== expectedStatus) return null;
+      } else if (status === "unknown" || status === "cancelled") {
         if (current.status !== "scheduled") return null;
       } else if (current.status !== "scheduled" && current.status !== "unknown") return null;
       return { ...current, status };

@@ -104,6 +104,7 @@ import { asInternals as castInternals, createStub } from "../../test-utils/class
 import { AgentManager } from "../agent-manager.js";
 import { AgentStorage } from "../agent-storage.js";
 import { buildProviderRegistry } from "../provider-registry.js";
+import { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
 import { withRuntimePaseoMcpServer } from "../runtime-mcp-config.js";
 
 interface CollaborationModeRecord {
@@ -3959,6 +3960,50 @@ describe("Codex app-server provider", () => {
     } finally {
       await session.close();
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a disconnected custom Codex session keeps its original launch restriction", async () => {
+    const manager = new ProviderSnapshotManager({
+      logger,
+      providerOverrides: { codex: { command: ["custom-codex"], deferDiscovery: true } },
+    });
+    const first = createFakeCodexAppServer();
+    const second = createFakeCodexAppServer();
+    const spawn = vi.fn().mockReturnValueOnce(first.child).mockReturnValueOnce(second.child);
+    const provider = new CodexAppServerAgentClient(
+      logger,
+      { command: { mode: "replace", argv: ["custom-codex"] } },
+      { appServerProcess: createFakeCodexAppServerProcess(spawn) },
+    );
+    const internals = castInternals<{
+      goalsEnabledPromise: Promise<boolean>;
+      autoReviewEnabledPromise: Promise<boolean>;
+    }>(provider);
+    internals.goalsEnabledPromise = Promise.resolve(false);
+    internals.autoReviewEnabledPromise = Promise.resolve(false);
+    const session = (await provider.createSession(createConfig())) as CodexTestSession;
+    try {
+      expect(manager.canLaunchProviderForRead("codex")).toBe(false);
+      manager.applyMutableProviderConfig(undefined, { replace: true });
+      expect(manager.canLaunchProviderForRead("codex")).toBe(true);
+      first.disconnect();
+      await expect.poll(() => session.connectionState).toBe("disconnected");
+
+      const allowLaunch = manager.canLaunchProviderForRead("codex");
+      expect(await session.listCommands?.({ allowLaunch })).toContainEqual(
+        expect.objectContaining({ name: "compact" }),
+      );
+      expect(spawn).toHaveBeenCalledTimes(1);
+
+      await session.startTurn("continue on the original CLI");
+      await second.waitForTurnStart();
+      expect(spawn).toHaveBeenCalledTimes(2);
+      first.assertNoErrors();
+      second.assertNoErrors();
+    } finally {
+      await session.close();
+      manager.destroy();
     }
   });
 

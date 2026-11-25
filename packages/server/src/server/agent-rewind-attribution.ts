@@ -1,4 +1,5 @@
 import { relative, resolve, sep } from "node:path";
+import { unquoteGitPath } from "../utils/git-quoted-path.js";
 import type { AgentTimelineItem } from "./agent/agent-sdk-types.js";
 import { gitBlobId, type FileSnapshot } from "./agent/checkpoints/snapshot.js";
 import type { CheckpointStore } from "./agent/checkpoints/store.js";
@@ -49,6 +50,67 @@ function applyEdit(content: string | null, edit: Edit): string | null | undefine
   return content.slice(0, start) + edit.newString + content.slice(start + edit.oldString.length);
 }
 
+function checkpointPath(cwd: string, path: string): string {
+  return relative(cwd, resolve(cwd, path)).split(sep).join("/");
+}
+
+function patchSectionPath(section: string): string | undefined {
+  const [header, ...lines] = section.split("\n");
+  const firstHunk = lines.findIndex((line) => line.startsWith("@@ "));
+  if (firstHunk < 0) return undefined;
+  const metadata = lines.slice(0, firstHunk);
+  const oldPaths = metadata.filter((line) => line.startsWith("--- "));
+  const newPaths = metadata.filter((line) => line.startsWith("+++ "));
+  if (oldPaths.length !== 1 || newPaths.length !== 1) return undefined;
+  const oldPath = unquoteGitPath(oldPaths[0]!.slice(4).replace(/\t$/, ""));
+  const newPath = unquoteGitPath(newPaths[0]!.slice(4).replace(/\t$/, ""));
+  const path = oldPath.startsWith("a/") ? oldPath.slice(2) : newPath.slice(2);
+  if (
+    !path ||
+    (oldPath !== `a/${path}` && oldPath !== "/dev/null") ||
+    (newPath !== `b/${path}` && newPath !== "/dev/null") ||
+    (oldPath === "/dev/null" && newPath === "/dev/null")
+  )
+    return undefined;
+
+  const labels = header!.slice("diff --git ".length);
+  if (labels === `a/${path} b/${path}`) return path;
+  // Quoted Git paths can contain escaped bytes or spaces. Both labels must
+  // identify this exact file; a rename or an ambiguous section is insufficient.
+  const quoted =
+    labels.match(/^("(?:\\.|[^"\\])*") (.+)$/) ?? labels.match(/^(.+) ("(?:\\.|[^"\\])*")$/);
+  return quoted &&
+    unquoteGitPath(quoted[1]!) === `a/${path}` &&
+    unquoteGitPath(quoted[2]!) === `b/${path}`
+    ? path
+    : undefined;
+}
+
+function expandEdit(cwd: string, edit: Edit): [string, Edit][] {
+  const path = checkpointPath(cwd, edit.filePath);
+  const patch = edit.type === "edit" ? edit.unifiedDiff : undefined;
+  if (!patch) return [[path, edit]];
+  if (
+    /^\.\.\.\[(?:truncated(?: \d+ chars)?|\d+ more files omitted)\]/m.test(patch) ||
+    /…\[truncated [\d.]+ (?:B|KB|MB)\]$/.test(patch)
+  )
+    return [];
+  const sections = patch.split(/\n(?=diff --git )/);
+  if (sections.length === 1) return [[path, edit]];
+  if (edit.type !== "edit") return [];
+
+  const expanded = new Map<string, Edit>();
+  for (const section of sections) {
+    if (!section.startsWith("diff --git ")) return [];
+    const file = patchSectionPath(section);
+    if (!file || checkpointPath(cwd, file) !== file || file === ".." || file.startsWith("../"))
+      return [];
+    if (expanded.has(file) || (expanded.size === 0 && file !== path)) return [];
+    expanded.set(file, { ...edit, filePath: file, unifiedDiff: section });
+  }
+  return [...expanded];
+}
+
 function editsByPath(cwd: string, items: AgentTimelineItem[]): Map<string, Edit[]> {
   const files = new Map<string, Edit[]>();
   const recorded = new Set<string>();
@@ -57,10 +119,11 @@ function editsByPath(cwd: string, items: AgentTimelineItem[]): Map<string, Edit[
       continue;
     if (item.detail.type !== "write" && item.detail.type !== "edit") continue;
     recorded.add(item.callId);
-    const file = relative(cwd, resolve(cwd, item.detail.filePath)).split(sep).join("/");
-    const edits = files.get(file) ?? [];
-    edits.push(item.detail);
-    files.set(file, edits);
+    for (const [file, edit] of expandEdit(cwd, item.detail)) {
+      const edits = files.get(file) ?? [];
+      edits.push(edit);
+      files.set(file, edits);
+    }
   }
   return files;
 }

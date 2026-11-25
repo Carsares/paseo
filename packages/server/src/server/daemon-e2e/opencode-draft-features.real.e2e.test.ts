@@ -5,7 +5,6 @@ import pino from "pino";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 
 import type { AgentClient, ImportableProviderSession } from "../agent/agent-sdk-types.js";
-import { OpenCodeServerManager } from "../agent/providers/opencode/server-manager.js";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { canRunRealProvider, createRealProviderClient } from "./real-provider-test-config.js";
@@ -90,9 +89,15 @@ describe("daemon E2E (real opencode) - draft feature discovery", () => {
 
       after = (await provider.listImportableSessions?.({ cwd })) ?? [];
     } finally {
-      await deletePersistedSessions(provider, after);
-      rmSync(cwd, { recursive: true, force: true });
-      await OpenCodeServerManager.getInstance(logger).shutdown();
+      try {
+        await deletePersistedSessions(provider, after);
+      } finally {
+        try {
+          await provider.shutdown?.();
+        } finally {
+          rmSync(cwd, { recursive: true, force: true });
+        }
+      }
     }
 
     expect(after).toEqual([]);
@@ -122,9 +127,15 @@ describe("daemon E2E (real opencode) - draft feature discovery", () => {
 
       after = (await provider.listImportableSessions?.({ cwd })) ?? [];
     } finally {
-      await deletePersistedSessions(provider, after);
-      rmSync(cwd, { recursive: true, force: true });
-      await OpenCodeServerManager.getInstance(logger).shutdown();
+      try {
+        await deletePersistedSessions(provider, after);
+      } finally {
+        try {
+          await provider.shutdown?.();
+        } finally {
+          rmSync(cwd, { recursive: true, force: true });
+        }
+      }
     }
 
     expect(after).toEqual([]);

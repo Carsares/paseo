@@ -17,6 +17,8 @@ it("serializes Git writes and rejects a commit after another client changes the 
     git("init", "--quiet");
     git("config", "user.name", "Paseo Test");
     git("config", "user.email", "paseo-test@example.invalid");
+    git("config", "core.hooksPath", ".git/test-disabled-hooks");
+    git("config", "commit.gpgSign", "false");
     const paths = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
     await Promise.all(paths.map((path) => writeFile(join(repoRoot, path), `${path}\n`)));
 
@@ -80,7 +82,7 @@ it("serializes Git writes and rejects a commit after another client changes the 
           ...target,
           expectedHeadSha: null,
           message: "Commit the four reviewed files",
-          requestId: `paseo-git-commit:${after.requestId}:${randomUUID()}`,
+          snapshotRequestId: after.requestId,
         });
         expect(stale).toMatchObject({ success: false, errorCode: "STALE_HEAD_CONFLICT" });
         const latest = await client.checkoutGitWorkingTreeGet(target);
@@ -89,6 +91,50 @@ it("serializes Git writes and rejects a commit after another client changes the 
           staged: paths.map((path) => ({ path, status: "added" })),
           untracked: [],
         });
+        await expect(
+          client.checkoutGitCommitCreate({
+            ...target,
+            expectedHeadSha: null,
+            message: "Missing snapshot",
+          }),
+        ).rejects.toThrow("requires the request ID of the reviewed working tree snapshot");
+        const commit = await client.checkoutGitCommitCreate({
+          ...target,
+          expectedHeadSha: null,
+          message: "Commit the reviewed files",
+          snapshotRequestId: latest.requestId,
+          requestId: "commit-five",
+        });
+        expect(commit).toMatchObject({
+          success: true,
+          error: null,
+          requestId: `paseo-git-commit:${latest.requestId}:commit-five`,
+        });
+        expect(
+          git("show", "--format=%s", "--name-only", "HEAD").split("\n").filter(Boolean),
+        ).toEqual(["Commit the reviewed files", ...paths]);
+        const headSha = git("rev-parse", "HEAD").trim();
+        await writeFile(join(repoRoot, "a.txt"), "another version\n");
+        expect(
+          (
+            await client.checkoutGitStageApply({
+              ...target,
+              scope: "paths",
+              paths: ["a.txt"],
+              expectedHeadSha: headSha,
+            })
+          ).success,
+        ).toBe(true);
+        const next = await client.checkoutGitWorkingTreeGet(target);
+        const legacyId = `paseo-git-commit:${next.requestId}:${randomUUID()}`;
+        await expect(
+          client.checkoutGitCommitCreate({
+            ...target,
+            expectedHeadSha: headSha,
+            message: "Legacy request ID",
+            requestId: legacyId,
+          }),
+        ).resolves.toMatchObject({ success: true, error: null, requestId: legacyId });
       } finally {
         await Promise.allSettled(clients.map((peer) => peer.close()));
       }

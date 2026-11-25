@@ -2828,6 +2828,7 @@ export const AgentRewindCheckpointGetRequestSchema = z.object({
   requestId: z.string(),
   agentId: z.string(),
   messageId: z.string(),
+  pendingFiles: z.literal(true).optional(),
 });
 
 export const AgentRewindCheckpointGetResponseSchema = z.object({
@@ -2836,6 +2837,9 @@ export const AgentRewindCheckpointGetResponseSchema = z.object({
     target: RewindCheckpointTargetSchema.optional(),
     canRewindFiles: z.boolean().optional(),
     canRewindBoth: z.boolean().optional(),
+    pendingFiles: z
+      .array(RewindCheckpointOperationSchema.pick({ operationId: true, conversationRewound: true }))
+      .optional(),
   }),
 });
 
@@ -5174,6 +5178,7 @@ export const ServerInfoStatusPayloadSchema = z
         rewind: z.boolean().optional(),
         // COMPAT(rewindCheckpoints): added in v0.17.0, remove the gate after 2027-05-24.
         rewindCheckpoints: z.boolean().optional(),
+        rewindPendingFiles: z.boolean().optional(),
         // COMPAT(agentTimelinePromptIndex): added in v0.2.X, drop the gate when floor >= v0.2.X.
         agentTimelinePromptIndex: z.boolean().optional(),
         // COMPAT(agentHistorySearch): added in v0.3.0, remove gate after 2027-02-07.

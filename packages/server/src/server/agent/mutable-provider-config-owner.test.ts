@@ -598,6 +598,195 @@ describe("mutable provider config owner", () => {
     }
   }, 20_000);
 
+  test.skipIf(nativePlatform === "win32").each([
+    { catalog: "dynamic", replacementModels: undefined },
+    { catalog: "static", replacementModels: [{ id: "configured-model", label: "Configured" }] },
+  ])(
+    "authorized Codex refresh records the version with a $catalog catalog without relaunching on read",
+    async ({ replacementModels }) => {
+      const root = mkdtempSync(path.join(tmpdir(), "paseo-managed-codex-release-"));
+      tempDirs.push(root);
+      const packageDir = path.join(root, "node_modules", "@openai", "codex");
+      const command = path.join(packageDir, "codex");
+      const replacement = path.join(root, "custom-codex");
+      const marker = path.join(root, "invocations");
+      const requests = path.join(root, "requests");
+      mkdirSync(packageDir, { recursive: true });
+      writeFileSync(
+        path.join(packageDir, "package.json"),
+        JSON.stringify({ name: "@openai/codex", version: "0.150.0", bin: { codex: "codex" } }),
+      );
+      const makeCli = (file: string, version: string) =>
+        writeFileSync(
+          file,
+          [
+            "#!" + process.execPath,
+            'require("node:fs").appendFileSync(' +
+              JSON.stringify(marker) +
+              ', process.argv[2] + "\\n");',
+            'if (process.argv[2] === "--version") {',
+            " console.log(" + JSON.stringify("codex-cli " + version) + ");",
+            " process.exit(0);",
+            "}",
+            "const results = " +
+              JSON.stringify({
+                initialize: { userAgent: "codex/" + version + " (test)" },
+                "model/list": { data: [] },
+                "config/read": { config: {} },
+              }),
+            'require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {',
+            " const { id, method } = JSON.parse(line);",
+            ' require("node:fs").appendFileSync(' + JSON.stringify(requests) + ', method + "\\n");',
+            " if (id !== undefined) console.log(JSON.stringify({ id, result: results[method] ?? {} }));",
+            "});",
+          ].join("\n"),
+          { mode: 0o700 },
+        );
+      makeCli(command, "0.150.0");
+      makeCli(replacement, "0.151.0");
+
+      const fetchRelease = vi.fn(async () => Response.json({ version: "0.152.0" }));
+      vi.stubGlobal("fetch", fetchRelease);
+      onTestFinished(() => vi.unstubAllGlobals());
+      const daemon = await createTestPaseoDaemon({
+        mcpEnabled: false,
+        agentClients: {},
+        providerOverrides: { ...CONTROLLED_PROVIDERS, codex: { enabled: false } },
+      });
+      const url = "ws://127.0.0.1:" + daemon.port + "/ws";
+      const reader = new DaemonClient({ url, sessionPermissions: ["daemon.read"] });
+      const owner = new DaemonClient({ url });
+      const provider = "managed-codex-release";
+      const inspect = () => reader.inspectProviderInstallation(provider, { refresh: true });
+      const check = () => reader.checkProviderUpdates(provider, { refresh: true });
+      const refresh = () => owner.refreshProvidersSnapshot({ providers: [provider] });
+      try {
+        await Promise.all([reader.connect(), owner.connect()]);
+        expect(
+          (
+            await owner.saveCustomProviderCli({
+              mode: "create",
+              providerId: provider,
+              extends: "codex",
+              label: "Managed Codex",
+              command: [command],
+              env: { CODEX_HOME: path.join(root, "codex-home") },
+            })
+          ).result,
+        ).toMatchObject({ status: "ok" });
+        if (replacementModels) {
+          await owner.patchDaemonConfig({
+            providers: { [provider]: { models: replacementModels } },
+          });
+        }
+        await reader.getProvidersSnapshot();
+        await reader.refreshProvidersSnapshot({ providers: [provider] });
+        expect((await inspect()).installation?.inspection).toBeUndefined();
+        expect((await check()).updateCheck).toBeNull();
+        expect(existsSync(marker)).toBe(false);
+
+        await refresh();
+        if (replacementModels) {
+          expect(
+            (await reader.getProvidersSnapshot()).entries.find(
+              (entry) => entry.provider === provider,
+            ),
+          ).toMatchObject({ status: "ready", models: [{ id: "configured-model" }] });
+          expect(readFileSync(requests, "utf8").trim().split("\n")).toEqual([
+            "initialize",
+            "initialized",
+          ]);
+        }
+        expect((await inspect()).installation?.inspection).toEqual({
+          status: "installed",
+          version: "0.150.0",
+        });
+        expect((await check()).updateCheck).toEqual({ status: "available", versions: ["0.152.0"] });
+        expect(fetchRelease).toHaveBeenCalledWith(
+          "https://registry.npmjs.org/@openai%2fcodex/latest",
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
+        expect((await reader.checkProviderUpdates(provider)).updateCheck).toEqual({
+          status: "available",
+          versions: ["0.152.0"],
+        });
+        expect(fetchRelease).toHaveBeenCalledTimes(1);
+        rmSync(command);
+        expect((await reader.checkProviderUpdates(provider)).updateCheck).toMatchObject({
+          status: "unknown",
+        });
+        expect(readFileSync(marker, "utf8")).toBe("app-server\n");
+
+        expect(
+          (
+            await owner.saveCustomProviderCli({
+              mode: "edit",
+              providerId: provider,
+              command: [replacement],
+            })
+          ).result,
+        ).toMatchObject({ status: "ok" });
+        expect((await inspect()).installation?.inspection).toBeUndefined();
+        expect((await check()).updateCheck).toBeNull();
+        expect(readFileSync(marker, "utf8")).toBe("app-server\n");
+
+        await refresh();
+        expect((await inspect()).installation?.inspection).toEqual({
+          status: "installed",
+          version: "0.151.0",
+        });
+        expect((await check()).updateCheck).toMatchObject({ status: "unknown" });
+        expect(fetchRelease).toHaveBeenCalledTimes(1);
+        expect(readFileSync(marker, "utf8")).toBe("app-server\napp-server\n");
+      } finally {
+        await Promise.all([reader.close(), owner.close()]);
+        await daemon.close();
+      }
+
+      const legacy = new ProviderSnapshotManager({
+        logger: createTestLogger(),
+        providerOverrides: {
+          ...CONTROLLED_PROVIDERS,
+          codex: {
+            command: [replacement],
+            env: { CODEX_HOME: path.join(root, "codex-home") },
+            models: replacementModels,
+          },
+        },
+      });
+      try {
+        expect((await legacy.installations.inspect("codex"))?.inspection).toBeUndefined();
+        expect(await legacy.installations.checkForUpdates("codex")).toBeNull();
+        if (replacementModels) {
+          await legacy.warmUpSnapshotForCwd({ providers: ["codex"] });
+          expect(readFileSync(marker, "utf8")).toBe("app-server\napp-server\n");
+        }
+        await legacy.refreshSettingsSnapshot({ providers: ["codex"] });
+        expect(
+          legacy.peekSnapshot()?.records.find(({ entry }) => entry.provider === "codex")?.entry
+            .status,
+        ).toBe("ready");
+        const invocations = readFileSync(marker, "utf8");
+        expect(invocations.match(/app-server\n/g)).toHaveLength(replacementModels ? 2 : 3);
+        if (replacementModels) expect(invocations).toBe("app-server\napp-server\n--version\n");
+        expect(
+          (await legacy.installations.inspect("codex", { refresh: true }))?.inspection,
+        ).toEqual({
+          status: "installed",
+          version: "0.151.0",
+        });
+        expect(await legacy.installations.checkForUpdates("codex")).toMatchObject({
+          status: "unknown",
+        });
+        expect(readFileSync(marker, "utf8")).toBe(invocations);
+        expect(fetchRelease).toHaveBeenCalledTimes(1);
+      } finally {
+        legacy.destroy();
+      }
+    },
+    20_000,
+  );
+
   test("stored Session reads retain local history without reopening a form-managed CLI", async () => {
     const resumeSession = vi.fn(async () => undefined);
     const createSession = vi.fn(async () => undefined);

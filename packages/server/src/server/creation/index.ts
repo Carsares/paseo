@@ -18,6 +18,12 @@ export interface CreatedAgent {
   agent: AgentSnapshotPayload;
   initialPromptStarted: boolean;
 }
+export interface TopicPromptRetry {
+  agentId: string;
+  workspaceId: string;
+  messageId: string;
+  fingerprint: string;
+}
 interface CreationRecovery {
   readTopicWorkspace?: (workspaceId: string) => Promise<{
     workspace: WorkspaceDescriptorPayload;
@@ -53,6 +59,7 @@ interface CreationRequest extends CreationRecovery {
     onReady: (agent: AgentSnapshotPayload) => Promise<void>,
     mainAgent: AgentSnapshotPayload | null | undefined,
   ) => Promise<CreatedAgent>;
+  retryTopicPrompt?: (target: TopicPromptRetry) => Promise<void>;
 }
 export type CreationInput = CreationRequest &
   (
@@ -90,14 +97,16 @@ export class CreationService {
 
   async create(input: CreationInput, observer?: Observer): Promise<CreationSnapshot> {
     const identity = identityFor(input.kind, input.key);
+    const pending = this.active.get(identity);
     const admitted = this.admit(async () => {
       await mkdir(this.directory, { recursive: true });
       const fingerprint = digest(input.request);
+      const activeOnRead = this.active.get(identity);
       let record = await this.read(identity);
       if (!record) record = await this.readLegacyAgent(input, fingerprint);
       if (record && record.fingerprint !== fingerprint)
         throw new Error(`${input.kind}_request_key_conflict`);
-      const running = this.active.get(identity);
+      const running = pending ?? activeOnRead ?? this.active.get(identity);
       if (running && record) return { completion: running, snapshot: record.snapshot };
       if (record?.snapshot.phase === "completed") await this.validateCompleted(record.snapshot);
       if (record) await this.reconcileTopic(identity, record, input);
@@ -106,7 +115,15 @@ export class CreationService {
       }
       if (record) await this.markInterruptedUnknown(identity, record);
       if (record && isSettled(record)) {
-        return { completion: Promise.resolve(record.snapshot), snapshot: record.snapshot };
+        const snapshot = record.snapshot;
+        const retry = await this.prepareTopicPromptRetry(record, input);
+        const settled = record;
+        return {
+          snapshot,
+          completion: retry
+            ? this.start(identity, () => this.retryTopicPrompt(identity, settled, input, retry))
+            : Promise.resolve(snapshot),
+        };
       }
       if (!record) {
         record = initialRecord(input, fingerprint);
@@ -124,10 +141,7 @@ export class CreationService {
         });
       }
       const snapshot = record.snapshot;
-      // Defer the runner until admission has installed the initiating observer.
-      const completion = Promise.resolve().then(() => this.run(identity, record, input));
-      this.active.set(identity, completion);
-      void completion.finally(() => this.active.delete(identity)).catch(() => undefined);
+      const completion = this.start(identity, () => this.run(identity, record, input));
       return { completion, snapshot };
     });
     // Install before admission starts, so even a fast local provision cannot outrun observation.
@@ -187,6 +201,59 @@ export class CreationService {
     return admitted;
   }
 
+  private start(identity: string, run: () => Promise<CreationSnapshot>) {
+    const completion = Promise.resolve().then(run);
+    this.active.set(identity, completion);
+    void completion.finally(() => this.active.delete(identity)).catch(() => undefined);
+    return completion;
+  }
+
+  private async prepareTopicPromptRetry(record: Record, input: CreationInput) {
+    const retry = input.retryTopicPrompt;
+    if (!retry) return;
+    const target = rejectedTopicPromptTarget(record);
+    if (target && (await this.readPromptOutcome(record, input)) === "absent") {
+      return () => retry(target);
+    }
+  }
+
+  private async retryTopicPrompt(
+    identity: string,
+    record: Record,
+    input: CreationInput,
+    send: () => Promise<void>,
+  ): Promise<CreationSnapshot> {
+    const agent = record.snapshot.agent!;
+    await this.publish(
+      identity,
+      record,
+      {
+        phase: "agent_ready",
+        error: null,
+        errorCode: undefined,
+        failedStage: undefined,
+        outcomeUnknown: undefined,
+      },
+      "prompt",
+    );
+    const result = await send().then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    try {
+      const outcome = await this.readPromptOutcome(record, input);
+      if (outcome !== "accepted" && outcome !== "absent" && !result.ok) throw result.error;
+      await this.recordTopicPrompt(identity, record, agent, outcome);
+      if (record.snapshot.initialPromptStarted) {
+        await this.publish(identity, record, { phase: "completed" }, null);
+      }
+    } catch (error) {
+      if (record.snapshot.initialPromptStarted) throw error;
+      await this.recordFailure(identity, record, input.exists, error);
+    }
+    return record.snapshot;
+  }
+
   private async run(
     identity: string,
     record: Record,
@@ -229,7 +296,10 @@ export class CreationService {
           record.snapshot.mainAgent,
         );
         if (isTopicPrompt(record) && input.hasPrompt) {
-          await this.recordTopicPrompt(identity, record, { agent, initialPromptStarted }, input);
+          const outcome = initialPromptStarted
+            ? "accepted"
+            : await this.readPromptOutcome(record, input);
+          await this.recordTopicPrompt(identity, record, agent, outcome);
           if (!record.snapshot.initialPromptStarted) return record.snapshot;
         } else {
           record.inFlight = null;
@@ -256,12 +326,9 @@ export class CreationService {
   private async recordTopicPrompt(
     identity: string,
     record: Record,
-    { agent, initialPromptStarted }: CreatedAgent,
-    recovery: CreationRecovery,
+    agent: AgentSnapshotPayload,
+    outcome: Awaited<ReturnType<CreationService["readPromptOutcome"]>>,
   ): Promise<void> {
-    const outcome = initialPromptStarted
-      ? "accepted"
-      : await this.readPromptOutcome(record, recovery);
     if (outcome === "accepted") {
       // Keep the prompt in flight until completion is also durable.
       await this.publish(identity, record, {
@@ -702,6 +769,28 @@ function isRejectedTopicPrompt(record: Record): boolean {
     snapshot.failedStage === "prompt" &&
     snapshot.outcomeUnknown === false
   );
+}
+function rejectedTopicPromptTarget(record: Record): TopicPromptRetry | undefined {
+  const { snapshot, promptMessageId, promptReceiptFingerprint } = record;
+  if (
+    isRejectedTopicPrompt(record) &&
+    !record.inFlight &&
+    !snapshot.initialPromptStarted &&
+    snapshot.agentId &&
+    snapshot.agent?.id === snapshot.agentId &&
+    snapshot.workspaceId &&
+    snapshot.agent.workspaceId === snapshot.workspaceId &&
+    isMainControlAgentLabels(snapshot.agent.labels) &&
+    promptMessageId &&
+    promptReceiptFingerprint
+  ) {
+    return {
+      agentId: snapshot.agentId,
+      workspaceId: snapshot.workspaceId,
+      messageId: promptMessageId,
+      fingerprint: promptReceiptFingerprint,
+    };
+  }
 }
 function shouldReconcileTopicPrompt(record: Record): boolean {
   const { inFlight, snapshot } = record;

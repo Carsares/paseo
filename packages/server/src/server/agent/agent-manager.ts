@@ -10304,6 +10304,13 @@ export class AgentManager {
     };
   }
 
+  async getPendingRewindFiles(agentId: string) {
+    const { directories, checkpoints } = this.requireRewindCheckpointService();
+    const agent = await this.getRewindSubject(agentId);
+    const scope = await getAgentRewindScope(directories, agent);
+    return checkpoints.getPendingFiles(scope);
+  }
+
   async getRewindCheckpointDiff(input: {
     agentId: string;
     messageId: string;

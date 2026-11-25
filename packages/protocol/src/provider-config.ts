@@ -12,10 +12,9 @@ const ProviderCommandAppendSchema = z.object({
 });
 
 // Validate the executable separately while keeping the array type used by launch callers.
-const ProviderCommandArgvSchema: z.ZodType<string[], string[]> = z.tuple(
-  [z.string().min(1)],
-  z.string(),
-);
+const ProviderCommandArgvSchema: z.ZodType<string[], string[]> = z
+  .tuple([z.string().min(1)], z.string())
+  .meta({ minItems: 1 });
 
 const ProviderCommandReplaceSchema = z.object({
   mode: z.literal("replace"),

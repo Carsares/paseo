@@ -500,7 +500,10 @@ export class CheckpointService {
   }
 
   async listRestoreOperations(scope: CheckpointScope) {
+    const worktree = await requireCheckpointWorktree({ scope, options: this.options });
     const state = await this.store(scope).load();
+    if (state && !sameWorktree(state.worktree, worktree))
+      refuse("Checkpoint worktree was replaced");
     return state?.operations.filter((item) => item.agentId === scope.agentId) ?? [];
   }
 

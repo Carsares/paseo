@@ -523,13 +523,16 @@ A command-backed provider without status is available when its executable resolv
 neither command nor status retain connection-based availability.
 
 Implement optional `installation` to fill the **Installation** section of provider settings. The
-bridge sends each callback as a `provider.installation.*` request carrying the launch `status`
-receives plus `resolved`. `resolved: false` means the executable was not found and `command` is
-the configured name, so answer `not_installed` instead of spawning it. Inspect and update-check
-requests use the 30 s plugin request timeout; the daemon's 25 s update-check deadline sits below
-it, so a slow check reports that deadline. `update` has no request timeout and streams output
-through `provider.installation.report`. When the daemon stops waiting on any of the three, it
-sends `provider.installation.cancel`, which aborts the callback's `signal`.
+bridge sends `inspect` and `checkForUpdates` as `provider.installation.*` requests. Both carry the
+launch that `status` receives, plus `resolved`. With `resolved: false`, executable lookup failed
+and `command` holds the configured name. Return `not_installed` from `inspect` without spawning it.
+Both requests use the 30 s plugin request timeout. The daemon reports a slow update check at
+its 25 s deadline. When the daemon stops waiting, it sends `provider.installation.cancel` and
+the bridge aborts the callback's `signal`.
+
+The host retains the `update` field for compatibility and displays manual maintenance when a
+plugin declares it. The host does not call the callback. Use `maintenance` to describe the update
+process and `updateUrl` to link to instructions.
 The rules shared with built-ins are in [providers.md](providers.md#installation-and-updates); the
 author contract is in the
 [public provider guide](../public-docs/plugins/providers.md#report-installation-and-updates).

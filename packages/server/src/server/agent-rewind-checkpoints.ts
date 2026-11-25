@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { open, rename, rm, writeFile } from "node:fs/promises";
+import { open, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { RewindCheckpointOperation } from "@getpaseo/protocol/messages";
 import { z } from "zod";
@@ -137,13 +137,45 @@ export class AgentRewindCheckpoints {
     const { scope } = input;
     const operationId = z.uuid().parse(input.operationId);
     if (!(await this.store(scope).open(false))) throw new Error("Restore operation is unavailable");
+    const journal = await this.readJournal(scope, operationId);
+    if (!journal || journal.state === "awaiting_conversation") {
+      throw new Error("Restore operation is unavailable");
+    }
+    return this.restoreFiles(scope, journal, input.validate);
+  }
+
+  async getPendingFiles(scope: CheckpointScope) {
+    if (!(await this.store(scope).open(false))) return [];
+    const operations = await this.service.listRestoreOperations(scope);
+    const applied = new Set(
+      operations.filter(({ status }) => status === "applied").map(({ operationId }) => operationId),
+    );
+    const pending = [];
+    // The journal precedes file writes, so it also covers interruption before
+    // CheckpointService could record an operation.
+    for (const name of await readdir(this.journalDirectory(scope))) {
+      const id = z.uuid().safeParse(/^rewind-(.+)\.json$/.exec(name)?.[1]);
+      if (!id.success || applied.has(id.data)) continue;
+      const journal = await this.readJournal(scope, id.data);
+      if (journal && journal.state !== "awaiting_conversation") {
+        pending.push({
+          operationId: journal.operationId,
+          conversationRewound: journal.state === "conversation_confirmed",
+        });
+      }
+    }
+    return pending;
+  }
+
+  private async readJournal(scope: CheckpointScope, operationId: string) {
     const file = await open(
       this.journalPath(scope, operationId),
       constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
     ).catch((error) => {
-      if (isMissing(error)) throw new Error("Restore operation is unavailable");
+      if (isMissing(error)) return null;
       throw error;
     });
+    if (!file) return null;
     const raw = await (async () => {
       try {
         const stat = await file.stat();
@@ -161,14 +193,9 @@ export class AgentRewindCheckpoints {
       }
     })();
     const journal = journalSchema.parse(JSON.parse(raw));
-    if (
-      journal.agentId !== scope.agentId ||
-      journal.operationId !== operationId ||
-      journal.state === "awaiting_conversation"
-    ) {
-      throw new Error("Restore operation is unavailable");
-    }
-    return this.restoreFiles(scope, journal, input.validate);
+    return journal.agentId === scope.agentId && journal.operationId === operationId
+      ? journal
+      : null;
   }
 
   private async restoreFiles(
@@ -216,13 +243,12 @@ export class AgentRewindCheckpoints {
     return new CheckpointStore(this.directories.paseoHome, scope.workspaceId);
   }
 
+  private journalDirectory(scope: CheckpointScope): string {
+    return join(this.directories.paseoHome, "file-checkpoints", stableKey(scope.workspaceId));
+  }
+
   private journalPath(scope: CheckpointScope, operationId: string): string {
-    return join(
-      this.directories.paseoHome,
-      "file-checkpoints",
-      stableKey(scope.workspaceId),
-      `rewind-${operationId}.json`,
-    );
+    return join(this.journalDirectory(scope), `rewind-${operationId}.json`);
   }
 
   private async save(scope: CheckpointScope, journal: Journal): Promise<void> {

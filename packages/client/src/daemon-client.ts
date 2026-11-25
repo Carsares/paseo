@@ -4997,6 +4997,36 @@ export class DaemonClient {
     messageId: string;
   }): Promise<AgentRewindCheckpointGetResponse> {
     this.requireRewindCheckpoints();
+    return this.requestAgentRewindCheckpoint(input);
+  }
+
+  // COMPAT(rewindPendingFiles): added in v0.18.0, remove the gate after 2027-06-01.
+  supportsPendingRewindFiles(): boolean {
+    return this.getLastServerInfoMessage()?.features?.rewindPendingFiles === true;
+  }
+
+  async getPendingAgentRewindFiles(agentId: string) {
+    if (!this.supportsPendingRewindFiles()) {
+      throw new Error("Update the host to find pending file restores");
+    }
+    // Older validators require a messageId. The pending-files query is scoped
+    // only to the agent and works after the original message has been removed.
+    const result = await this.requestAgentRewindCheckpoint({
+      agentId,
+      messageId: "",
+      pendingFiles: true,
+    });
+    if (!result.ok || !result.pendingFiles) {
+      throw new Error(result.error ?? "Pending file restores are unavailable");
+    }
+    return result.pendingFiles;
+  }
+
+  private requestAgentRewindCheckpoint(input: {
+    agentId: string;
+    messageId: string;
+    pendingFiles?: true;
+  }): Promise<AgentRewindCheckpointGetResponse> {
     const requestId = this.createRequestId();
     return this.sendRequest({
       requestId,
@@ -6063,10 +6093,34 @@ export class DaemonClient {
     );
   }
 
-  checkoutGitCommitCreate(
-    options: WorkbenchRequestOptions<"checkout.git.commit.create">,
-  ): Promise<WorkbenchResponsePayload<"checkout.git.commit.create">> {
-    return this.sendWorkbenchRequest("checkout.git.commit.create", "checkoutGitStagingV1", options);
+  async checkoutGitCommitCreate({
+    snapshotRequestId,
+    requestId,
+    ...options
+  }: WorkbenchRequestOptions<"checkout.git.commit.create"> & {
+    /** requestId from the working tree response whose staged changes were reviewed. */
+    snapshotRequestId?: string;
+  }): Promise<WorkbenchResponsePayload<"checkout.git.commit.create">> {
+    // COMPAT(gitCommitSnapshotId): staged commits in v0.18.0 accept pre-encoded request IDs.
+    // Remove legacy input after 2027-06-01 once callers supply snapshotRequestId.
+    const encodedSnapshotId = requestId?.match(/^paseo-git-commit:([^:]{1,160}):[^:]{1,160}$/)?.[1];
+    let wireRequestId = requestId;
+    if (encodedSnapshotId) {
+      if (snapshotRequestId !== undefined && snapshotRequestId !== encodedSnapshotId) {
+        throw new Error("Commit request ID refers to a different working tree snapshot.");
+      }
+    } else {
+      if (snapshotRequestId === undefined || !/^[^:]{1,160}$/.test(snapshotRequestId)) {
+        throw new Error("Commit requires the request ID of the reviewed working tree snapshot.");
+      }
+      const operationId = this.createRequestId(requestId);
+      if (!/^[^:]{1,160}$/.test(operationId)) throw new Error("Invalid commit request ID.");
+      wireRequestId = `paseo-git-commit:${snapshotRequestId}:${operationId}`;
+    }
+    return this.sendWorkbenchRequest("checkout.git.commit.create", "checkoutGitStagingV1", {
+      ...options,
+      requestId: wireRequestId,
+    });
   }
 
   checkoutGitCommitGenerateMessage(

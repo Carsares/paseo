@@ -36,6 +36,32 @@ test("workspace task requests and replies require workspace read permission", ()
   expect(hub.allowsOutbound(reply)).toBe(false);
 });
 
+test("pending rewind file operations require workspace write for requests and replies", () => {
+  const request = {
+    type: "agent.rewind.checkpoint.get.request",
+    requestId: "lookup",
+    agentId: "agent",
+    messageId: "",
+    pendingFiles: true,
+  } as const;
+  const reply = {
+    type: "agent.rewind.checkpoint.get.response",
+    payload: {
+      requestId: "lookup",
+      agentId: "agent",
+      ok: true,
+      error: null,
+      pendingFiles: [{ operationId: "operation", conversationRewound: true }],
+    },
+  } satisfies SessionOutboundMessage;
+  const reader = new SessionAuthorization(["workspace.read"]);
+  const writer = new SessionAuthorization(["workspace.write"]);
+  expect(reader.allowsInbound(request)).toBe(false);
+  expect(reader.allowsOutbound(reply)).toBe(false);
+  expect(writer.allowsInbound(request)).toBe(true);
+  expect(writer.allowsOutbound(reply)).toBe(true);
+});
+
 test.each([
   ["locate", "daemon.read"],
   ["test", "daemon.manage"],

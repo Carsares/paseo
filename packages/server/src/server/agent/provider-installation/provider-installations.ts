@@ -21,8 +21,10 @@ import type {
   AgentClientInstallationContext,
   AgentClientUpdateContext,
   AgentProvider,
+  FetchCatalogOptions,
   InstallationMaintenance,
   InstallationUpdateResult,
+  ProviderRefreshContext,
 } from "../agent-sdk-types.js";
 import { runApprovedUpdateCommand } from "../providers/update-command.js";
 import { InstallationActivity } from "./installation-activity.js";
@@ -110,6 +112,7 @@ export interface ProviderInstallationsOptions {
   isDiscoveryDeferred?(provider: AgentProvider): boolean;
   /** Version already published by authorized settings discovery for this configuration. */
   readDiscoveredVersion?(provider: AgentProvider): string | undefined;
+  readDiscoveredReleaseCheck?(provider: AgentProvider): DiscoveredReleaseCheck | undefined;
   resolveFamily?(provider: AgentProvider): string;
   /** Changes only when this provider's configuration is published. */
   configurationVersion?(provider: AgentProvider): number;
@@ -147,7 +150,7 @@ export interface InspectProviderInstallationOptions {
 interface ProviderCall<T> {
   name: string;
   /** A cached result is reused only for the same key. */
-  key?: string;
+  key?: string | object;
   timeoutMs: number;
   /** How long a settled result is reused. */
   cacheMs(result: T): number;
@@ -156,10 +159,33 @@ interface ProviderCall<T> {
 }
 
 interface CachedRead<T> {
-  key: string | undefined;
+  key: string | object | undefined;
   promise: Promise<T>;
   settledAt: number | null;
   cacheMs: number;
+}
+
+/** Catalog-only data. Resolving and running the check must never launch the configured CLI. */
+export interface DiscoveredReleaseCheck {
+  isCurrent(): Promise<boolean>;
+  run(signal: AbortSignal): Promise<ProviderInstallationUpdateCheck>;
+}
+
+export const discoveredReleaseCheck = Symbol("discoveredReleaseCheck");
+
+export const readStaticCatalogMetadata = Symbol("readStaticCatalogMetadata");
+
+export interface StaticCatalogMetadata {
+  defaultModeId?: string;
+  installedVersion?: string;
+  [discoveredReleaseCheck]?: DiscoveredReleaseCheck;
+}
+
+export interface StaticCatalogMetadataReader {
+  [readStaticCatalogMetadata]?(
+    options: FetchCatalogOptions,
+    context?: ProviderRefreshContext,
+  ): Promise<StaticCatalogMetadata | undefined>;
 }
 
 interface InstallationInspectionSnapshot {
@@ -247,12 +273,16 @@ export class ProviderInstallations {
     AgentClient,
     CachedRead<ProviderInstallationUpdateCheck>
   >();
+  private readonly readDiscoveredReleaseCheck: NonNullable<
+    ProviderInstallationsOptions["readDiscoveredReleaseCheck"]
+  >;
 
   constructor(options: ProviderInstallationsOptions) {
     this.logger = options.logger;
     this.resolveClient = options.resolveClient;
     this.isDiscoveryDeferred = options.isDiscoveryDeferred ?? (() => false);
     this.readDiscoveredVersion = options.readDiscoveredVersion ?? (() => undefined);
+    this.readDiscoveredReleaseCheck = options.readDiscoveredReleaseCheck ?? (() => undefined);
     this.configurationVersion = options.configurationVersion ?? (() => 0);
     this.activity = options.activity ?? new InstallationActivity();
     this.resolveFamily = options.resolveFamily ?? ((provider) => provider);
@@ -287,6 +317,7 @@ export class ProviderInstallations {
     }
     if (this.isDiscoveryDeferred(provider)) {
       const planId = await this.readApprovedUpdatePlanId(provider);
+      if (!this.sameConfiguration(provider, version, client)) return result;
       const discovered = this.withDiscoveredInspection(provider, result);
       return this.withApprovedPlanId(provider, version, client, discovered, planId);
     }
@@ -364,7 +395,9 @@ export class ProviderInstallations {
     provider: AgentProvider,
     options: InspectProviderInstallationOptions = {},
   ): Promise<ProviderInstallationUpdateCheck | null> {
-    if (this.isDiscoveryDeferred(provider)) return null;
+    if (this.isDiscoveryDeferred(provider)) {
+      return this.checkDiscoveredUpdates(provider, options);
+    }
     const client = this.requireClient(provider);
     const installation = client.installation;
     const checkForUpdates = installation?.checkForUpdates;
@@ -392,6 +425,41 @@ export class ProviderInstallations {
         ),
       failed: (message) => ({ status: "error" as const, message }),
     });
+  }
+
+  private async checkDiscoveredUpdates(
+    provider: AgentProvider,
+    options: InspectProviderInstallationOptions,
+  ): Promise<ProviderInstallationUpdateCheck | null> {
+    if (!this.readDiscoveredVersion(provider)) return null;
+    const check = this.readDiscoveredReleaseCheck(provider);
+    const unknown = { status: "unknown", message: "The CLI's release source is unknown." } as const;
+    if (!check) return null;
+    const client = this.requireClient(provider);
+    const version = this.configurationVersion(provider);
+    const isCurrent = () =>
+      this.sameConfiguration(provider, version, client) &&
+      this.readDiscoveredReleaseCheck(provider) === check;
+    const matchesInstallation = () =>
+      waitForInspection(AbortSignal.timeout(this.inspectTimeoutMs), check.isCurrent).catch(
+        () => false,
+      );
+    if (!(await matchesInstallation()) || !isCurrent()) return unknown;
+    const answer = await this.read(provider, client, this.updateChecks, options, {
+      name: "discovered release check",
+      key: check,
+      timeoutMs: this.updateCheckTimeoutMs,
+      cacheMs: (result) =>
+        result.status === "current" || result.status === "available"
+          ? this.updateCheckCacheMs
+          : this.inspectCacheMs,
+      run: async ({ signal }) => ProviderUpdateCheckSchema.parse(await check.run(signal)),
+      failed: () => ({
+        status: "error" as const,
+        message: "Could not check the CLI's release source.",
+      }),
+    });
+    return isCurrent() && (await matchesInstallation()) && isCurrent() ? answer : unknown;
   }
 
   /**

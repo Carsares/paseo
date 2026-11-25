@@ -30,7 +30,7 @@ import type {
 } from "@getpaseo/protocol/messages";
 import { relative } from "node:path";
 import { isAbsolute } from "node:path";
-import { CreationService, type CreatedAgent } from "./creation/index.js";
+import { CreationService, type CreatedAgent, type TopicPromptRetry } from "./creation/index.js";
 import type { CreationSnapshot, AgentCreateRequest } from "@getpaseo/protocol/messages";
 import {
   fingerprintMessageRequest,
@@ -6336,10 +6336,116 @@ export class Session {
       }
       return this.buildStoredAgentPayload(record);
     },
-    readPromptOutcome: (agentId: string, messageId: string, expectedFingerprint: string) =>
-      this.messageReceipts.outcome?.(agentId, messageId, expectedFingerprint) ??
-      Promise.resolve("unknown" as const),
+    readPromptOutcome: async (agentId: string, messageId: string, expectedFingerprint: string) => {
+      const outcome = this.messageReceipts.outcome?.bind(this.messageReceipts);
+      if (!outcome) return "unknown" as const;
+      const matching = await outcome(agentId, messageId, expectedFingerprint);
+      if (matching !== "absent") return matching;
+      // An occupied message ID with a different fingerprint is not absent.
+      return (await outcome(agentId, messageId)) === "absent" ? "absent" : "unknown";
+    },
   };
+
+  private topicPromptRetry(
+    key: string | undefined,
+    request:
+      | Pick<
+          AgentCreateRequest,
+          "workspaceRole" | "initialPrompt" | "images" | "attachments" | "outputSchema"
+        >
+      | undefined,
+  ) {
+    if (!key || request?.workspaceRole !== "main") return;
+    return (target: TopicPromptRetry) => this.retryTopicFirstQuestion(target, request);
+  }
+
+  private async retryTopicFirstQuestion(
+    { agentId, workspaceId, messageId, fingerprint }: TopicPromptRetry,
+    request: Pick<AgentCreateRequest, "initialPrompt" | "images" | "attachments" | "outputSchema">,
+  ): Promise<void> {
+    const prompt = buildAgentPrompt(
+      request.initialPrompt?.trim() ?? "",
+      request.images,
+      request.attachments,
+    );
+    const message = { prompt, activeTurnBehavior: "interrupt" };
+    if (!prompt.length || fingerprintMessageRequest(message) !== fingerprint) {
+      throw new Error("The first question does not match its saved receipt.");
+    }
+    const validateBinding = async () => {
+      const workspace = await this.requireMoveSourceWorkspace(workspaceId);
+      const record = await this.agentStorage.get(agentId);
+      if (
+        !workspace.topic ||
+        workspace.untrustedSource ||
+        !record ||
+        record.archivedAt ||
+        record.internal ||
+        record.workspaceId !== workspaceId ||
+        !isMainControlAgentLabels(record.labels) ||
+        (await this.describeWorkspaceMain(workspace)).topic?.mainAgentId !== agentId
+      ) {
+        throw new Error("The saved Main Session is no longer bound to a trusted topic workspace.");
+      }
+    };
+    const assertLiveBinding = () => {
+      const current = this.agentManager.getAgent(agentId);
+      this.assertWorkspaceNotArchiving(workspaceId);
+      if (
+        !current ||
+        current.internal ||
+        current.workspaceId !== workspaceId ||
+        !isMainControlAgentLabels(current.labels) ||
+        this.agentManager.getStoredWorkspaceMoveSnapshots().has(agentId) ||
+        this.agentManager.hasPendingPermissions(agentId)
+      ) {
+        throw new Error("The saved Main Session cannot accept the first question.");
+      }
+    };
+    const release = this.reserveWorkspaceMove(workspaceId);
+    try {
+      await validateBinding();
+      if (
+        (await this.creationRecovery.readPromptOutcome(agentId, messageId, fingerprint)) !==
+        "absent"
+      )
+        return;
+      await this.messageReceipts.send({
+        agentId,
+        messageId,
+        request: message,
+        retryIfUnsent: (error) => error instanceof AgentCommandNotDispatchedError,
+        send: async (begin, declined, onProviderOutcome) => {
+          await validateBinding();
+          if (this.agentManager.hasInFlightRun(agentId))
+            throw new Error("The Main Session is busy.");
+          let dispatched = false;
+          const result = await this.sendHumanPrompt({
+            agentId,
+            messageId,
+            prompt,
+            idleOnly: true,
+            unarchive: false,
+            waitForCommandOutcome: true,
+            runOptions: request.outputSchema ? { outputSchema: request.outputSchema } : undefined,
+            handoff: { begin, declined, onProviderOutcome },
+            validateDispatch: validateBinding,
+            assertDispatchAllowed: assertLiveBinding,
+            onDispatch: () => {
+              dispatched = true;
+            },
+          });
+          // A concurrent archive can cause the send helper to return without dispatch.
+          if (!dispatched) throw new Error("The Main Session was not available for dispatch.");
+          if (result.disposition === "turn_started") {
+            await waitForAgentRunStartWithTimeout(this.agentManager, agentId, result.started);
+          }
+        },
+      });
+    } finally {
+      release();
+    }
+  }
 
   private async handleCreationSubscription(
     request: Extract<SessionInboundMessage, { type: "creation.subscribe.request" }>,
@@ -6428,6 +6534,7 @@ export class Session {
         hasPrompt: hasInitialCreationPrompt(request),
         ...promptReceipt,
         ...this.creationRecovery,
+        retryTopicPrompt: this.topicPromptRetry(idempotencyKey, topic ? request : undefined),
         exists: this.creationResourceExists,
         readAgent: async (id) => {
           const record = await this.agentStorage.get(id);
@@ -6515,8 +6622,8 @@ export class Session {
       this.assertWorkspaceCreationWithAgentsAllowed(request);
       const agentInput = request.agent;
       const mainAgentInput = request.mainAgent;
-      const promptReceipt =
-        request.topic && request.agent ? firstQuestionReceipt(request.agent) : {};
+      const topicAgent = request.topic ? agentInput : undefined;
+      const promptReceipt = topicAgent ? firstQuestionReceipt(topicAgent) : {};
       const resolveAgentCwd = async (
         config: AgentSessionConfig,
         workspace: WorkspaceDescriptorPayload | undefined,
@@ -6544,6 +6651,7 @@ export class Session {
           ...promptReceipt,
           exists: this.creationResourceExists,
           ...this.creationRecovery,
+          retryTopicPrompt: this.topicPromptRetry(idempotencyKey, topicAgent),
           provision: async (id) => {
             const descriptor = await this.createRequestedWorkspace(
               {
@@ -7377,7 +7485,9 @@ export class Session {
           break;
         }
         case "agent.rewind.checkpoint.get.request": {
-          const result = await this.agentManager.getRewindCheckpoint(msg);
+          const result = msg.pendingFiles
+            ? { pendingFiles: await this.agentManager.getPendingRewindFiles(agentId) }
+            : await this.agentManager.getRewindCheckpoint(msg);
           this.emitForSource(
             {
               type: "agent.rewind.checkpoint.get.response",

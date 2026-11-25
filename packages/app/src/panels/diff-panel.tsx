@@ -13,6 +13,7 @@ import { isWeb, isNative } from "@/constants/platform";
 import { DiffDocument } from "@/git/diff-document";
 import { ChangesSurface, DiffLayoutToggle, resolveDiffLayout } from "@/git/diff-pane";
 import { useCommitDiffFiles } from "@/git/use-diff-files";
+import { useCheckpointDiffSelection } from "@/git/working-diff-comparison";
 import { useChangesPreferences } from "@/hooks/use-changes-preferences";
 import { useAppSettings } from "@/hooks/use-settings";
 import { useHostFeature } from "@/runtime/host-features";
@@ -94,6 +95,7 @@ function ChangesPanel() {
   );
   const isTree = target.kind === "changes_tree";
   const stagingEnabled = useHostFeature(serverId, "checkoutGitStagingV1");
+  const checkpoint = useCheckpointDiffSelection({ serverId, workspaceId, cwd: cwd ?? "" });
   const handleOpenComparison = useCallback(
     () => openPreferredTarget({ kind: "working_diff" }, "diffs"),
     [openPreferredTarget],
@@ -124,20 +126,8 @@ function ChangesPanel() {
   }
 
   // COMPAT(checkoutGitStagingV1): added in v0.18.0, remove after 2027-06-01 once daemon floor >= v0.18.0.
-  if (isTree && stagingEnabled) {
-    return (
-      <View style={styles.container} testID="changes-tree-panel">
-        <StagingPanel
-          key={JSON.stringify([serverId, workspaceId, cwd])}
-          serverId={serverId}
-          workspaceId={workspaceId}
-          cwd={cwd}
-          active={isActive}
-          onOpenComparison={handleOpenComparison}
-        />
-      </View>
-    );
-  }
+  const showStaging = isTree && stagingEnabled;
+  const showComparison = !showStaging || Boolean(checkpoint?.range);
   const presentation = resolveChangesPresentation({
     isTree,
     inlineDiff: preferences.inlineDiff,
@@ -149,24 +139,38 @@ function ChangesPanel() {
 
   return (
     <View style={styles.container} testID={testID}>
-      <RenderProfile id={profileId}>
-        <ChangesSurface
-          serverId={serverId}
-          workspaceId={workspaceId}
-          cwd={cwd}
-          enabled={isActive}
-          presentation={presentation}
-          stagingEnabled={stagingEnabled}
-          focusPath={target.kind === "working_diff" ? target.focusPath : undefined}
-          focusRequestId={target.kind === "working_diff" ? target.focusRequestId : undefined}
-          onSelectDiffFile={isTree ? handleSelectDiffFile : undefined}
-          onOpenFile={handleOpenFile}
-          onOpenToSide={isTree && openTargetToSide ? handleOpenDiffToSide : undefined}
-          onAddToChat={canAddToChat ? addFile : undefined}
-          state={changesState}
-          onStateChange={setChangesState}
-        />
-      </RenderProfile>
+      {showStaging ? (
+        <View style={showComparison ? styles.hidden : styles.container}>
+          <StagingPanel
+            key={JSON.stringify([serverId, workspaceId, cwd])}
+            serverId={serverId}
+            workspaceId={workspaceId}
+            cwd={cwd}
+            active={isActive && !showComparison}
+            onOpenComparison={handleOpenComparison}
+          />
+        </View>
+      ) : null}
+      {showComparison ? (
+        <RenderProfile id={profileId}>
+          <ChangesSurface
+            serverId={serverId}
+            workspaceId={workspaceId}
+            cwd={cwd}
+            enabled={isActive}
+            presentation={presentation}
+            stagingEnabled={stagingEnabled}
+            focusPath={target.kind === "working_diff" ? target.focusPath : undefined}
+            focusRequestId={target.kind === "working_diff" ? target.focusRequestId : undefined}
+            onSelectDiffFile={isTree ? handleSelectDiffFile : undefined}
+            onOpenFile={handleOpenFile}
+            onOpenToSide={isTree && openTargetToSide ? handleOpenDiffToSide : undefined}
+            onAddToChat={canAddToChat ? addFile : undefined}
+            state={changesState}
+            onStateChange={setChangesState}
+          />
+        </RenderProfile>
+      ) : null}
     </View>
   );
 }
@@ -276,6 +280,7 @@ export const commitDiffPanelRegistration = definePanel("commit_diff", {
 });
 
 const styles = StyleSheet.create((theme) => ({
+  hidden: { display: "none" },
   container: {
     flex: 1,
     minHeight: 0,

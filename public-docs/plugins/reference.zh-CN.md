@@ -382,8 +382,10 @@ Paseo 在会话就绪、收到配置通知或提交配置更改时调用此同�
 interface ProviderInstallation {
   installUrl?: string;
   updateUrl?: string;
+  maintenance?: { kind: "automatic" | "external" | "manual"; message?: string };
   inspect?(context: ProviderInstallationContext): Promise<ProviderInspection>;
   checkForUpdates?(context: ProviderUpdateCheckContext): Promise<ProviderUpdateCheck>;
+  /** 仅为兼容保留，宿主不调用。 */
   update?(context: ProviderUpdateContext): Promise<ProviderUpdateResult>;
 }
 ```
@@ -392,9 +394,9 @@ interface ProviderInstallation {
 | ----------------- | ------------------------------------------------- | ----- | ----------------------------------------------- |
 | `inspect`         | 打开 Provider 设置时                              | 20 秒 | 30 秒                                           |
 | `checkForUpdates` | `inspect` 回答 `installed` 之后，或没有 `inspect` | 25 秒 | `current` 或 `available` 为一小时，其他为 30 秒 |
-| `update`          | 用户选择 **更新** 时，每个 Provider 同一时间一个  | 无    | `succeeded` 之后 Paseo 重新读取两个结果         |
+| `update`          | 仅为兼容保留，Paseo 不调用                        | —     | —                                               |
 
-Provider 设置中的 **刷新** 会跳过保留的结果，并清除失败的更新。Paseo 从不在会话开始前或按计划调用这些成员。超过期限或抛出异常会变成显示该消息的错误。
+Provider 设置中的 **刷新** 会跳过保留的结果。Paseo 从不在会话开始前或按计划调用这些成员。超过期限或抛出异常会变成显示该消息的错误。
 
 `installUrl` 和 `updateUrl` 是 Paseo 在浏览器中打开的 `http` 或 `https` 页面。其中任何一个是其他类型的 URL 时，插件无法启动。
 
@@ -405,19 +407,19 @@ Provider 设置中的 **刷新** 会跳过保留的结果，并清除失败的�
 | `launch`           | `ProviderInstallationLaunch \| undefined` | 会话将使用的启动配置，带有 `resolved`。注册没有声明 `command` 时不存在。                                                  |
 | `signal`           | `AbortSignal`                             | 当 Paseo 停止等待或 daemon 停止时中止。                                                                                   |
 | `installedVersion` | `string \| undefined`                     | 仅用于 `checkForUpdates`。`inspect` 报告的 `version`，按原样传入。`inspect` 没有报告版本或你没有声明 `inspect` 时不存在。 |
-| `report`           | `(event: ProviderUpdateReport) => void`   | 仅用于 `update`。按顺序向用户显示 `{ type: "stdout" \| "stderr" \| "message", text }`。                                   |
 
 `ProviderInstallationLaunch` 是 `{ command, args, env, resolved }`。`resolved: true` 时，`command` 是可执行文件的路径。`resolved: false` 时，Paseo 没有找到可执行文件，`command` 是配置中写的名称。
 
 结果：
 
-| 类型                   | 取值                                                                                                                                   |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `ProviderInspection`   | `{ status: "installed", version?: string }` 或 `{ status: "not_installed" }`                                                           |
-| `ProviderUpdateCheck`  | `{ status: "current" }`、`{ status: "available", versions?: string[], message?: string }` 或 `{ status: "unknown", message?: string }` |
-| `ProviderUpdateResult` | `{ status: "succeeded", message?: string }` 或 `{ status: "failed", message: string }`                                                 |
+| 类型                  | 取值                                                                                                                                   |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `ProviderInspection`  | `{ status: "installed", version?: string }` 或 `{ status: "not_installed" }`                                                           |
+| `ProviderUpdateCheck` | `{ status: "current" }`、`{ status: "available", versions?: string[], message?: string }` 或 `{ status: "unknown", message?: string }` |
 
-Paseo 按原样显示 `version`、`versions` 和 `message`，不解析或排序它们。只要 `inspect` 报告的 `version` 不变，Paseo 会在最长一小时内复用 `current` 或 `available` 的结果。它保留 `report` 输出的最后 65,536 个字符。不符合这些结构的结果是错误。只要 `inspect` 报告 CLI 已安装且你声明了 `update`，就会出现 **更新**，与 `checkForUpdates` 的回答以及是否声明它无关；没有 `update` 时，Paseo 在同样条件下提供 `updateUrl`。
+Paseo 按原样显示 `version`、`versions` 和 `message`。只要 `inspect` 报告的 `version` 不变，Paseo 会在最长一小时内复用 `current` 或 `available` 的结果。
+
+用 `maintenance` 描述维护方式，用 `updateUrl` 链接到更新说明。`automatic` 表示厂商自动维护，`external` 表示由服务运营方维护，`manual` 表示用户手动维护。声明旧版 `update` 回调时，宿主会显示手动维护说明。此回调不会启用 **更新** 操作。
 
 ### 用量来源 {#usage-sources}
 

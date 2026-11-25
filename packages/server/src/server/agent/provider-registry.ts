@@ -25,6 +25,10 @@ import {
 } from "./create-agent-mode.js";
 import { normalizeAgentModelDefinition } from "./agent-sdk-types.js";
 import { runProviderRefreshActivity } from "./provider-refresh-deadline.js";
+import {
+  readStaticCatalogMetadata,
+  type StaticCatalogMetadataReader,
+} from "./provider-installation/provider-installations.js";
 import type { WorkspaceGitService } from "../workspace-git-service.js";
 import type { ManagedProcessRegistry } from "../managed-processes/managed-processes.js";
 import type {
@@ -496,7 +500,7 @@ function wrapClientProvider(
   additionalModels: ProviderProfileModel[],
   profileModelsAreAdditive: boolean,
   configuredOptions: ProviderOptions | undefined,
-): AgentClient {
+): AgentClient & StaticCatalogMetadataReader {
   const listImportableSessions = inner.listImportableSessions?.bind(inner);
   const importSession = inner.importSession?.bind(inner);
   const listControls = inner.listControls?.bind(inner);
@@ -626,6 +630,9 @@ function wrapClientProvider(
       : undefined,
     resolveUsageLaunch: inner.resolveUsageLaunch?.bind(inner),
     getCatalogCacheKey: inner.getCatalogCacheKey?.bind(inner),
+    [readStaticCatalogMetadata]: (inner as AgentClient & StaticCatalogMetadataReader)[
+      readStaticCatalogMetadata
+    ]?.bind(inner),
     isAvailable: (signal, options) => inner.isAvailable(signal, options),
     getDiagnostic: inner.getDiagnostic?.bind(inner),
     installation: inner.installation,
@@ -697,6 +704,13 @@ function createRegistryEntry(
         // the single catalog API; otherwise use static/empty modes with no runtime.
         const models = mergeModelAdditions(provider, replacementModels, additionalModels);
         if (hasStaticModes) {
+          const readMetadata = (catalogClient as AgentClient & StaticCatalogMetadataReader)[
+            readStaticCatalogMetadata
+          ];
+          const metadata = await readMetadata?.call(catalogClient, options, context);
+          if (metadata) {
+            return { ...metadata, models, modes: decorateModes(resolved.definition.modes) };
+          }
           const defaultModeId = await runProviderRefreshActivity(
             context,
             "default-mode",

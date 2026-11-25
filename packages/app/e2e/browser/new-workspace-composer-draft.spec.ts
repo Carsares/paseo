@@ -1,18 +1,22 @@
+import { BUILTIN_PROVIDER_IDS } from "@getpaseo/protocol/provider-manifest";
 import { chooseModel, startWithoutRememberedModel } from "../support/helpers/model-memory";
 import {
   composerLocator,
+  dropFileOnComposer,
   enterComposerFullscreen,
+  expectAttachmentPill,
   exitComposerFullscreen,
   resizeComposerViewport,
 } from "../support/helpers/composer";
 import { expect, test } from "../support/fixtures";
 import { gotoAppShell } from "../support/helpers/app";
-import { getE2EDaemonPort } from "../support/helpers/daemon-port";
+import { daemonWsRoutePattern, getE2EDaemonPort } from "../support/helpers/daemon-port";
 import {
   delayBrowserWorkspaceCreatedResponse,
   expectNewWorkspaceDraft,
   expectNewWorkspaceProjectSelected,
   fillNewWorkspaceDraft,
+  loadSessionMessageReaders,
   openGlobalNewWorkspaceComposer,
   openNewWorkspaceComposer,
   selectNewWorkspaceHost,
@@ -26,6 +30,101 @@ import { waitForSidebarHydration } from "../support/helpers/workspace-ui";
 const DRAFT = `Please investigate the workspace startup failure.
 
 Trace the request from the app through the daemon, preserve the existing behavior, and explain the root cause before making changes.`;
+
+const topicTest = test.extend({
+  e2eDaemonEnvironment: { PASEO_WORKBENCH_COMPAT: "0" },
+  e2eDaemonConfig: {
+    version: 1,
+    agents: {
+      providers: Object.fromEntries(BUILTIN_PROVIDER_IDS.map((id) => [id, { enabled: false }])),
+    },
+  },
+});
+
+topicTest(
+  "restores topic fields on resize and refresh before sending an attachment-only question",
+  async ({ page }) => {
+    const project = await seedWorkspace({ repoPrefix: "topic-draft-restore-", git: false });
+    const frames = await loadSessionMessageReaders();
+    const requests: NonNullable<ReturnType<typeof frames.client>>[] = [];
+    page.on("websocket", (ws) => {
+      if (!daemonWsRoutePattern().test(ws.url())) return;
+      ws.on("framesent", ({ payload }) => {
+        const message = frames.client(payload);
+        if (message?.type === "workspace.create.request") requests.push(message);
+      });
+    });
+    try {
+      await gotoAppShell(page);
+      await waitForSidebarHydration(page);
+      await openNewWorkspaceComposer(page, project);
+      const title = page.getByTestId("new-topic-title");
+      const direction = page.getByTestId("new-topic-direction");
+      const hidden = page.getByRole("switch", { name: "Hide topic information from the model" });
+      const firstQuestion = page.getByRole("button", { name: "Attach a first question" });
+      const topicTitle = "Recovered topic";
+      const topicDirection = "Read the attached evidence.";
+      await title.fill(topicTitle);
+      await direction.fill(topicDirection);
+      await hidden.click();
+      await firstQuestion.click();
+      await expect(composerLocator(page)).toBeVisible();
+      const draftId = new URL(page.url()).searchParams.get("creationDraftId");
+      expect(draftId).toBeTruthy();
+
+      await resizeComposerViewport(page, "portrait");
+      await expect(title).toHaveValue(topicTitle);
+      await expect(direction).toHaveValue(topicDirection);
+      await resizeComposerViewport(page, "landscape");
+      await page.reload();
+      await expect(title).toHaveValue(topicTitle);
+      await expect(direction).toHaveValue(topicDirection);
+      await expect(hidden).toBeChecked();
+      await expect(composerLocator(page)).toBeVisible();
+      expect(new URL(page.url()).searchParams.get("creationDraftId")).toBe(draftId);
+
+      await expect(
+        page.getByRole("button", { name: "Select model (Ten second stream)" }),
+      ).toBeVisible();
+      await dropFileOnComposer(page, {
+        name: "evidence.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from("Attachment only"),
+      });
+      await expectAttachmentPill(page, "composer-file-attachment-pill");
+      const submit = page.getByTestId("topic-create-submit");
+      await expect(submit).toHaveAccessibleName("Create and ask");
+      await submit.click();
+      await page.waitForURL((url) => url.pathname.includes("/workspace/"));
+      expect(requests).toEqual([
+        expect.objectContaining({
+          type: "workspace.create.request",
+          title: topicTitle,
+          topic: { summary: topicDirection, hideFromModel: true },
+          agent: expect.objectContaining({
+            initialPrompt: "",
+            clientMessageId: `${draftId}:initial-message`,
+            workspaceRole: "main",
+            attachments: [
+              expect.objectContaining({
+                type: "uploaded_file",
+                fileName: "evidence.txt",
+                mimeType: "text/plain",
+                size: Buffer.byteLength("Attachment only"),
+              }),
+            ],
+          }),
+        }),
+      ]);
+      await openGlobalNewWorkspaceComposer(page);
+      await expect(title).toHaveValue("");
+      await firstQuestion.click();
+      await expect(page.getByTestId("composer-file-attachment-pill")).toHaveCount(0);
+    } finally {
+      await project.cleanup();
+    }
+  },
+);
 
 test.describe("New workspace composer draft", () => {
   test.describe.configure({ timeout: 240_000 });
