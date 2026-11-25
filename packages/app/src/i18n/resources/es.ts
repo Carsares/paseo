@@ -3532,6 +3532,24 @@ export const es: TranslationResources = {
         updateUnverified: "Actualización finalizada, versión sin confirmar",
         installInstructions: "Instrucciones de instalación",
       },
+      catalogPin: {
+        sectionTitle: "Versión fijada del lanzador",
+        rowTitle: "Versión fijada",
+        rowHint:
+          "Actual {{current}} -> {{target}}. Actualiza el comando guardado sin descargar ahora.",
+        updateAction: "Actualizar versión",
+        updatingAction: "Actualizando...",
+        confirmTitle: "¿Actualizar la versión fijada de {{name}}?",
+        confirmMessage:
+          "¿Actualizar la versión fijada guardada de {{current}} a {{target}}? Los demás argumentos del comando no cambian y la nueva versión no se descargará hasta ejecutar el proveedor.",
+        confirmAction: "Actualizar versión",
+        updatedToast: "Versión fijada actualizada a {{version}}",
+        conflictError:
+          "La versión guardada cambió en este host. Actualiza y revísala antes de volver a intentarlo.",
+        unsupportedError:
+          "Este host no puede actualizar la versión fijada del catálogo para este comando.",
+        failedError: "No se pudo actualizar la versión fijada del lanzador.",
+      },
       diagnostic: {
         title: "Diagnóstico",
         button: "Diagnóstico",

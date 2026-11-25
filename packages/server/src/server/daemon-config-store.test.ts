@@ -1443,6 +1443,31 @@ describe("DaemonConfigStore reload", () => {
     writeFileSync(path.join(paseoHome, "config.json"), `${JSON.stringify(config, null, 2)}\n`);
   }
 
+  test("updates a catalog pin in both configs and rejects a newer external edit", async () => {
+    const provider = {
+      extends: "acp",
+      label: "Catalog tool",
+      command: ["npx", "-y", "catalog-tool@1.0.0", "--acp"],
+      env: { KEEP: "test fixture" },
+    };
+    const { paseoHome, store, persisted } = createReloadableStore({
+      initialPersisted: { agents: { providers: { "catalog-tool": provider } } },
+    });
+    const next = ["npx", "-y", "catalog-tool@1.1.0", "--acp"];
+    const update = () =>
+      store.patchProviderCatalogPin("catalog-tool", () => ({ status: "updated", command: next }));
+    await expect(update()).resolves.toBe("updated");
+    const checked = { ...provider, command: next, deferDiscovery: true };
+    expect(store.get().providers["catalog-tool"]).toEqual(checked);
+    expect(loadPersistedConfig(paseoHome).agents?.providers?.["catalog-tool"]).toEqual(checked);
+
+    const external = { ...checked, command: ["npx", "-y", "catalog-tool@1.2.0", "--acp"] };
+    writeConfig(paseoHome, { ...persisted, agents: { providers: { "catalog-tool": external } } });
+    await expect(update()).resolves.toBe("conflict");
+    expect(store.get().providers["catalog-tool"]).toEqual(checked);
+    expect(loadPersistedConfig(paseoHome).agents?.providers?.["catalog-tool"]).toEqual(external);
+  });
+
   test("applies overlapping plugin mutations to the latest committed sources", async () => {
     const { store } = createReloadableStore({
       initialPersisted: {

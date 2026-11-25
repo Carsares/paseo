@@ -3514,6 +3514,23 @@ export const ptBR: TranslationResources = {
         updateUnverified: "Atualização concluída, versão não confirmada",
         installInstructions: "Instruções de instalação",
       },
+      catalogPin: {
+        sectionTitle: "Versão fixada do inicializador",
+        rowTitle: "Versão fixada",
+        rowHint: "Atual {{current}} -> {{target}}. Atualiza o comando salvo sem baixar agora.",
+        updateAction: "Atualizar versão",
+        updatingAction: "Atualizando...",
+        confirmTitle: "Atualizar a versão fixada de {{name}}?",
+        confirmMessage:
+          "Atualizar a versão fixada salva de {{current}} para {{target}}? Os demais argumentos do comando permanecem inalterados e a nova versão só será baixada quando o provedor for executado.",
+        confirmAction: "Atualizar versão",
+        updatedToast: "Versão fixada atualizada para {{version}}",
+        conflictError:
+          "A versão salva mudou neste host. Atualize e revise antes de tentar novamente.",
+        unsupportedError:
+          "Este host não pode atualizar a versão fixada do catálogo para este comando.",
+        failedError: "Não foi possível atualizar a versão fixada do inicializador.",
+      },
       diagnostic: {
         title: "Diagnóstico",
         button: "Diagnóstico",

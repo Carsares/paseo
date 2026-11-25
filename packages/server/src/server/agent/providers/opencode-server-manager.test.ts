@@ -17,6 +17,8 @@ import type {
   ManagedProcessReapResult,
 } from "../../managed-processes/managed-processes.js";
 import type { ProcessTerminator, TreeKillTarget } from "../../../utils/tree-kill.js";
+import { installationActivity } from "../provider-installation/installation-activity.js";
+import { readInstallationActivityKeys } from "../provider-installation/installation-target.js";
 import {
   OpenCodeServerManager,
   type OpenCodeCommandPrefixResolver,
@@ -26,6 +28,46 @@ import {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+test("a V1 helper keeps its installation occupied when termination times out", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "paseo-opencode-v1-activity-"));
+  const keys = await readInstallationActivityKeys(process.execPath);
+  const acquireUpdate = () => installationActivity.acquireUpdate({ family: "other-cli", keys });
+  let child: TreeKillTarget | undefined;
+  const manager = new OpenCodeServerManager({
+    logger: createTestLogger(),
+    resolveHomeDir: () => root,
+    resolveCommandPrefix: async () => ({
+      command: process.execPath,
+      args: ["-e", "console.log('listening on'); setInterval(() => {}, 1000)", "--"],
+    }),
+    terminateProcess: async (target) => {
+      child = target;
+      return "kill-timeout";
+    },
+  });
+  try {
+    expect(keys.length).toBeGreaterThan(0);
+    const update = acquireUpdate();
+    try {
+      await expect(manager.acquireCurrent()).rejects.toThrow("installation is being updated");
+    } finally {
+      update.release();
+    }
+    const first = await manager.acquireCurrent();
+    const second = await manager.acquireCurrent();
+    await first.release();
+    expect(acquireUpdate).toThrow("installation is in use");
+    await second.release();
+    expect(acquireUpdate).toThrow("installation is in use");
+    expect(child?.kill()).toBe(true);
+    await vi.waitFor(() => acquireUpdate().release());
+  } finally {
+    await manager.shutdown();
+    if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 describe("OpenCodeServerManager generations", () => {
@@ -164,7 +206,8 @@ describe("OpenCodeServerManager generations", () => {
 
     await manager.shutdown();
 
-    expect(runtime.terminatedPorts).toEqual([4402, 4401]);
+    expect(runtime.terminatedPorts).toEqual(expect.arrayContaining([4401, 4402]));
+    expect(runtime.terminatedPorts).toHaveLength(2);
   });
 
   test("shutdown still signals a process after an earlier kill signal if it has not exited", async () => {
@@ -184,7 +227,7 @@ describe("OpenCodeServerManager generations", () => {
 
     const acquisition = manager.acquireCurrent();
     const failure = expect(acquisition).rejects.toThrow("OpenCode server startup timeout");
-    await runtime.settle();
+    await runtime.waitForSpawn(4471);
 
     await vi.advanceTimersByTimeAsync(30_000);
 
@@ -198,7 +241,7 @@ describe("OpenCodeServerManager generations", () => {
     const controller = new AbortController();
 
     const abortedAcquisition = manager.acquireCurrent(controller.signal);
-    await runtime.settle();
+    await runtime.waitForSpawn(4477);
     controller.abort(new Error("catalog refresh expired"));
 
     await expect(abortedAcquisition).rejects.toThrow("catalog refresh expired");
@@ -216,11 +259,12 @@ describe("OpenCodeServerManager generations", () => {
     const { manager, runtime } = createTestManager([4472], { autoAnnounce: false });
 
     const acquisition = manager.acquireCurrent();
-    await runtime.settle();
+    const failure = expect(acquisition).rejects.toThrow("OpenCode server exited with code null");
+    await runtime.waitForSpawn(4472);
 
     await manager.shutdown();
 
-    await expect(acquisition).rejects.toThrow("OpenCode server exited with code null");
+    await failure;
     expect(runtime.terminatedPorts).toEqual([4472]);
     expect(await runtime.managedProcesses.list()).toEqual([]);
   });
@@ -229,12 +273,12 @@ describe("OpenCodeServerManager generations", () => {
     const { manager, runtime } = createTestManager([4473, 4474], { autoAnnounce: false });
 
     const currentStart = manager.acquireCurrent();
-    await runtime.settle();
+    await runtime.waitForSpawn(4473);
     runtime.processForPort(4473).announceListening();
     const currentAcquisition = await currentStart;
 
     const dedicatedStart = manager.acquireDedicated({ TEST_ENV: "custom" });
-    await runtime.settle();
+    await runtime.waitForSpawn(4474);
 
     await currentAcquisition.release();
     expect(runtime.terminatedPorts).toEqual([4473]);
@@ -462,6 +506,7 @@ class FakeOpenCodeServerRuntime {
   private readonly autoAnnounce: boolean;
   private readonly processesByChild = new Map<ChildProcess, FakeOpenCodeProcess>();
   private readonly processesByPort = new Map<number, FakeOpenCodeProcess>();
+  private readonly spawnWaiters = new Map<number, () => void>();
 
   constructor(ports: number[], options: { autoAnnounce: boolean }) {
     this.ports = [...ports];
@@ -491,6 +536,11 @@ class FakeOpenCodeServerRuntime {
     const process = new FakeOpenCodeProcess({ port, pid: 10_000 + port });
     this.processesByChild.set(process.child, process);
     this.processesByPort.set(port, process);
+    const notify = this.spawnWaiters.get(port);
+    if (notify) {
+      this.spawnWaiters.delete(port);
+      queueMicrotask(notify);
+    }
     if (this.autoAnnounce) {
       queueMicrotask(() => process.announceListening());
     }
@@ -510,6 +560,11 @@ class FakeOpenCodeServerRuntime {
       throw new Error(`No fake OpenCode process for port ${port}`);
     }
     return process;
+  }
+
+  waitForSpawn(port: number): Promise<void> {
+    if (this.processesByPort.has(port)) return Promise.resolve();
+    return new Promise((resolve) => this.spawnWaiters.set(port, resolve));
   }
 
   async settle(): Promise<void> {
@@ -550,12 +605,14 @@ class FakeOpenCodeProcess extends EventEmitter {
   exitNormally(): void {
     this.exitCode = 0;
     this.emit("exit", 0, null);
+    this.emit("close", 0, null);
   }
 
   exitBySignal(signal: NodeJS.Signals): void {
     this.killed = true;
     this.signalCode = signal;
     this.emit("exit", null, signal);
+    this.emit("close", null, signal);
   }
 
   markKillSignalSent(): void {

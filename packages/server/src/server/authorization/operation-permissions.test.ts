@@ -54,3 +54,30 @@ test.each([
   expect(allowed.allowsInbound(request)).toBe(true);
   expect(allowed.allowsOutbound(reply)).toBe(true);
 });
+
+test.each([
+  [
+    "provider.installation.approved_update.request",
+    {
+      type: "provider.installation.approved_update.response",
+      payload: { provider: "codex", requestId: "test", update: null, error: "unavailable" },
+    },
+  ],
+  [
+    "provider.catalog_pin.update.request",
+    {
+      type: "provider.catalog_pin.update.response",
+      payload: { provider: "codex", requestId: "test", status: "updated" },
+    },
+  ],
+] as const satisfies readonly (readonly [string, SessionOutboundMessage])[])(
+  "%s requires daemon.manage",
+  (type, reply) => {
+    const reader = new SessionAuthorization(["daemon.read"]);
+    const manager = new SessionAuthorization(["daemon.manage"]);
+    expect(reader.allowsInbound({ type })).toBe(false);
+    expect(reader.allowsOutbound(reply)).toBe(false);
+    expect(manager.allowsInbound({ type })).toBe(true);
+    expect(manager.allowsOutbound(reply)).toBe(true);
+  },
+);

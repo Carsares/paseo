@@ -543,22 +543,40 @@ export class ProviderCatalogSession {
   }
 
   async handleUpdateProviderRequest(
-    msg: Extract<SessionInboundMessage, { type: "provider.installation.update.request" }>,
+    msg: Extract<
+      SessionInboundMessage,
+      {
+        type:
+          | "provider.installation.update.request"
+          | "provider.installation.approved_update.request";
+      }
+    >,
   ): Promise<void> {
     const response = { provider: msg.provider, requestId: msg.requestId };
+    const type =
+      msg.type === "provider.installation.approved_update.request"
+        ? "provider.installation.approved_update.response"
+        : "provider.installation.update.response";
     try {
-      const update = this.providerSnapshotManager.installations.update(msg.provider);
+      const installations = this.providerSnapshotManager.installations;
+      const update =
+        msg.type === "provider.installation.approved_update.request"
+          ? installations.update(msg.provider, { planId: msg.planId })
+          : installations.update(msg.provider);
       this.host.emit({
-        type: "provider.installation.update.response",
+        type,
         payload: { ...response, update, error: null },
       });
     } catch (error) {
       this.host.emit({
-        type: "provider.installation.update.response",
+        type,
         payload: {
           ...response,
           update: null,
-          error: error instanceof Error ? error.message : String(error),
+          error:
+            msg.type === "provider.installation.approved_update.request"
+              ? "The host-approved update plan is unavailable."
+              : getErrorMessage(error),
         },
       });
     }

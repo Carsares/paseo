@@ -3478,6 +3478,24 @@ export const ko: TranslationResources = {
         updateUnverified: "업데이트가 끝났지만 버전이 확인되지 않음",
         installInstructions: "설치 안내",
       },
+      catalogPin: {
+        sectionTitle: "카탈로그 런처 고정 버전",
+        rowTitle: "고정 버전",
+        rowHint:
+          "현재 {{current}} -> {{target}}. 저장된 실행 명령만 업데이트하며 지금 다운로드하지 않습니다.",
+        updateAction: "버전 업데이트",
+        updatingAction: "업데이트 중...",
+        confirmTitle: "{{name}} 고정 버전을 업데이트할까요?",
+        confirmMessage:
+          "저장된 런처 고정 버전을 {{current}}에서 {{target}}(으)로 업데이트할까요? 다른 명령 인수는 유지되며 새 버전은 공급자를 실행할 때까지 다운로드되지 않습니다.",
+        confirmAction: "버전 업데이트",
+        updatedToast: "런처 고정 버전을 {{version}}(으)로 업데이트했습니다",
+        conflictError:
+          "이 호스트에서 저장된 런처 버전이 변경되었습니다. 새로고침 후 다시 확인하세요.",
+        unsupportedError:
+          "이 호스트에서는 이 공급자 명령의 카탈로그 고정 버전을 업데이트할 수 없습니다.",
+        failedError: "카탈로그 런처 고정 버전을 업데이트하지 못했습니다.",
+      },
       diagnostic: {
         title: "진단",
         button: "진단",

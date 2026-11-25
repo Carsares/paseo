@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { ProviderInstallationUpdate } from "@getpaseo/protocol/messages";
+import type { ProviderInstallation, ProviderInstallationUpdate } from "@getpaseo/protocol/messages";
 import { useFetchQuery } from "@/data/query";
 import { useHostFeature } from "@/runtime/host-features";
 import { useHostRuntimeClient } from "@/runtime/host-runtime";
@@ -23,6 +23,14 @@ export interface ProviderInstallationRead {
   refreshing: boolean;
 }
 
+function readApprovedPlanId(
+  supported: boolean,
+  installation: ProviderInstallation | null | undefined,
+): string | undefined {
+  if (!supported || installation?.canUpdate) return undefined;
+  return installation?.approvedUpdatePlanId;
+}
+
 /**
  * Reads a provider's installation from hosts that advertise `providerInstallation`. The update
  * check is a separate request that starts once the provider reports itself installed, so the
@@ -35,6 +43,7 @@ export function useProviderInstallation(input: {
 }): ProviderInstallationRead {
   const { serverId, provider, visible } = input;
   const supported = useHostFeature(serverId, "providerInstallation");
+  const supportsApprovedUpdates = useHostFeature(serverId, "providerApprovedUpdates");
   const client = useHostRuntimeClient(serverId);
   const queryClient = useQueryClient();
   const { t } = useTranslation();
@@ -70,6 +79,7 @@ export function useProviderInstallation(input: {
     staleTimeMs: 0,
   });
   const installed = installationQuery.data?.inspection?.status === "installed";
+  const approvedPlanId = readApprovedPlanId(supportsApprovedUpdates, installationQuery.data);
   const updatesQuery = useFetchQuery({
     queryKey: updatesKey,
     queryFn: () => checkForUpdates(false),
@@ -146,7 +156,9 @@ export function useProviderInstallation(input: {
   const startUpdate = useMutation({
     mutationFn: async () => {
       if (!client) throw new Error(t("workspace.terminal.hostDisconnected"));
-      const result = await client.updateProvider(provider);
+      const result = approvedPlanId
+        ? await client.updateProviderWithApprovedPlan(provider, approvedPlanId)
+        : await client.updateProvider(provider);
       if (result.error) throw new Error(result.error);
       return result.update;
     },
@@ -165,6 +177,7 @@ export function useProviderInstallation(input: {
         current: currentUpdate,
         starting: startUpdate.isPending,
         startError: startUpdate.error?.message ?? null,
+        approved: Boolean(approvedPlanId),
         start,
       }
     : undefined;

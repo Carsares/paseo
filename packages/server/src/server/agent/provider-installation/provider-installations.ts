@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
 import type { Logger } from "pino";
 import type {
   ProviderInstallation,
@@ -16,13 +17,23 @@ import {
 } from "@getpaseo/plugin/server/provider";
 import type {
   AgentClient,
+  AgentClientInstallation,
   AgentClientInstallationContext,
   AgentClientUpdateContext,
   AgentProvider,
   InstallationMaintenance,
   InstallationUpdateResult,
 } from "../agent-sdk-types.js";
+import { runApprovedUpdateCommand } from "../providers/update-command.js";
 import { InstallationActivity } from "./installation-activity.js";
+import {
+  acquireApprovedUpdateFileLock,
+  acquireProviderUpdateFileLock,
+  ApprovedUpdateAdmissionError,
+  readInstallationActivityKeys,
+  supportsHostApprovedProviderUpdates,
+} from "./installation-target.js";
+import { readApprovedProviderUpdater } from "./local-updater-plan-store.js";
 import { ProviderUpdateOperation } from "./provider-update-operation.js";
 import { sanitizeUpdateProgress, sanitizeUpdateResultMessage } from "./update-output.js";
 
@@ -38,6 +49,7 @@ const CONFIG_CHANGED = "Provider configuration changed. Inspect the installation
 const UPDATE_UNVERIFIED =
   "The updater completed for the previous configuration. Inspect the current installation to verify its version.";
 const UNPROVEN_UPDATE = "Paseo could not verify a local update plan for this installation.";
+const HOST_APPROVAL_UNAVAILABLE = "Host-approved provider updates are unavailable on this host.";
 const DAEMON_STOPPING = "The daemon is stopping.";
 
 class UpdateRefusal extends Error {}
@@ -52,6 +64,26 @@ const PROVIDER_UPDATE_REFUSAL_MESSAGES = {
   manual: "This installation must be updated outside Paseo.",
   external: "Update this installation on the host that manages it.",
 };
+
+function maintenanceRefusal(
+  kind: keyof typeof PROVIDER_UPDATE_REFUSAL_MESSAGES,
+  message: string | undefined,
+): string {
+  return sanitizeUpdateResultMessage(message) ?? PROVIDER_UPDATE_REFUSAL_MESSAGES[kind];
+}
+
+function isApprovalOnlyInstallation(installation: AgentClientInstallation): boolean {
+  return Boolean(
+    installation.resolveApprovedUpdateLaunch &&
+    !installation.installUrl &&
+    !installation.updateUrl &&
+    !installation.inspect &&
+    !installation.inspectionSnapshot &&
+    !installation.getMaintenance &&
+    !installation.checkForUpdates &&
+    !installation.update,
+  );
+}
 
 function parseUpdateResult(answer: unknown): InstallationUpdateResult {
   const result = ProviderUpdateResultSchema.parse(answer);
@@ -89,6 +121,13 @@ export interface ProviderInstallationsOptions {
   updateCheckCacheMs?: number;
   /** Rediscovers the provider after a successful update. A failure is logged, not reported. */
   refreshProvider?(provider: AgentProvider): Promise<void>;
+  /** Host-owned configuration directory containing the local updater plan file. */
+  paseoHome?: string;
+  /** Returns the current absolute launch entry before symlinks, using lookup without child processes. */
+  resolveApprovedUpdateLaunch?(
+    provider: AgentProvider,
+    signal: AbortSignal,
+  ): Promise<string | null>;
   updateOutputLimit?: number;
   now?: () => number;
 }
@@ -134,6 +173,13 @@ interface ProviderUpdateTask {
   version: number;
   operation: ProviderUpdateOperation;
   controller: AbortController;
+  run?(context: AgentClientUpdateContext): Promise<unknown>;
+  planId?: string;
+  discoveryDeferredAtStart: boolean;
+}
+
+interface PreparedUpdate {
+  keys: string[];
   run(context: AgentClientUpdateContext): Promise<unknown>;
 }
 
@@ -180,11 +226,17 @@ export class ProviderInstallations {
   private readonly updateCheckTimeoutMs: number;
   private readonly updateCheckCacheMs: number;
   private readonly refreshProvider: ProviderInstallationsOptions["refreshProvider"];
+  private readonly paseoHome: ProviderInstallationsOptions["paseoHome"];
+  private readonly resolveApprovedUpdateLaunch: ProviderInstallationsOptions["resolveApprovedUpdateLaunch"];
   private readonly updateOutputLimit: number;
   private readonly now: () => number;
   private readonly updates = new Map<AgentProvider, ProviderUpdateOperation>();
   private readonly updateListeners = new Map<AgentProvider, Set<ProviderUpdateListener>>();
   private readonly runningUpdates = new Map<AbortController, Promise<void>>();
+  private readonly approvedOperations = new WeakMap<
+    ProviderUpdateOperation,
+    { key: string; client: AgentClient; version: number }
+  >();
   private shutdown: Promise<void> | undefined;
   private hasUnconfirmedCleanup = false;
   private readonly inspections = new WeakMap<
@@ -209,6 +261,8 @@ export class ProviderInstallations {
     this.updateCheckTimeoutMs = options.updateCheckTimeoutMs ?? DEFAULT_UPDATE_CHECK_TIMEOUT_MS;
     this.updateCheckCacheMs = options.updateCheckCacheMs ?? DEFAULT_UPDATE_CHECK_CACHE_MS;
     this.refreshProvider = options.refreshProvider;
+    this.paseoHome = options.paseoHome;
+    this.resolveApprovedUpdateLaunch = options.resolveApprovedUpdateLaunch;
     this.updateOutputLimit = options.updateOutputLimit ?? DEFAULT_UPDATE_OUTPUT_LIMIT;
     this.now = options.now ?? Date.now;
   }
@@ -221,27 +275,74 @@ export class ProviderInstallations {
     const client = this.requireClient(provider);
     const installation = client.installation;
     if (!installation) return null;
+    if (options.refresh) this.clearFailedUpdate(provider);
     const result: ProviderInstallation = {};
     if (installation.installUrl) result.installUrl = installation.installUrl;
     if (installation.updateUrl) result.updateUrl = installation.updateUrl;
-    if (this.isDiscoveryDeferred(provider)) {
-      return this.withDiscoveredInspection(provider, result);
+    const version = this.configurationVersion(provider);
+    if (isApprovalOnlyInstallation(installation)) {
+      const planId = await this.readApprovedUpdatePlanId(provider);
+      this.withApprovedPlanId(provider, version, client, result, planId);
+      return result.approvedUpdatePlanId ? result : null;
     }
-    if (options.refresh) this.clearFailedUpdate(provider);
-    const [snapshot, standaloneMaintenance] = await Promise.all([
+    if (this.isDiscoveryDeferred(provider)) {
+      const planId = await this.readApprovedUpdatePlanId(provider);
+      const discovered = this.withDiscoveredInspection(provider, result);
+      return this.withApprovedPlanId(provider, version, client, discovered, planId);
+    }
+    const [snapshot, standaloneMaintenance, planId] = await Promise.all([
       this.readInspection(provider, client, options),
       installation.inspectionSnapshot ? undefined : this.readMaintenance(provider, client),
+      this.readApprovedUpdatePlanId(provider),
     ]);
     if (this.isDiscoveryDeferred(provider)) return result;
-    let maintenance = snapshot?.maintenance ?? standaloneMaintenance;
-    if (installation.update && maintenance?.kind === "automatic") {
-      const keys = await this.readActivityKeys(client);
-      if (this.isDiscoveryDeferred(provider)) return result;
-      if (keys.length === 0) maintenance = { kind: "manual", message: UNPROVEN_UPDATE };
-      else if (!this.shutdown && this.resolveClient(provider) === client) result.canUpdate = true;
-    }
-    if (maintenance) result.maintenance = maintenance;
+    const ordinary = await this.inspectOrdinaryUpdate(
+      provider,
+      client,
+      version,
+      snapshot?.maintenance ?? standaloneMaintenance,
+    );
+    if (this.isDiscoveryDeferred(provider)) return result;
+    Object.assign(result, ordinary);
     if (snapshot) result.inspection = snapshot.inspection;
+    return this.withApprovedPlanId(provider, version, client, result, planId);
+  }
+
+  private async inspectOrdinaryUpdate(
+    provider: AgentProvider,
+    client: AgentClient,
+    version: number,
+    maintenance: InstallationMaintenance | undefined,
+  ): Promise<Pick<ProviderInstallation, "maintenance" | "canUpdate">> {
+    let details = maintenance ? { maintenance } : {};
+    if (maintenance?.kind === "external") return details;
+    const isCurrent = () =>
+      !this.shutdown &&
+      !this.isDiscoveryDeferred(provider) &&
+      this.sameConfiguration(provider, version, client);
+    if (client.installation?.update && maintenance?.kind === "automatic") {
+      const keys = await this.readActivityKeys(client);
+      if (keys.length > 0) return isCurrent() ? { ...details, canUpdate: true } : details;
+      details = { maintenance: { kind: "manual", message: UNPROVEN_UPDATE } };
+    }
+    return details;
+  }
+
+  private withApprovedPlanId(
+    provider: AgentProvider,
+    version: number,
+    client: AgentClient,
+    result: ProviderInstallation,
+    planId: string | undefined,
+  ): ProviderInstallation {
+    if (
+      planId &&
+      !this.shutdown &&
+      result.maintenance?.kind !== "external" &&
+      this.sameConfiguration(provider, version, client)
+    ) {
+      result.approvedUpdatePlanId = planId;
+    }
     return result;
   }
 
@@ -298,17 +399,37 @@ export class ProviderInstallations {
    * provider settles it, independent of any client; only `close` aborts it. Throws when the
    * provider declares no `update`.
    */
-  update(provider: AgentProvider): ProviderInstallationUpdate {
+  update(provider: AgentProvider, options?: { planId: string }): ProviderInstallationUpdate {
+    if (options) {
+      if (!supportsHostApprovedProviderUpdates()) throw new Error(HOST_APPROVAL_UNAVAILABLE);
+      if (!this.paseoHome || !this.resolveApprovedUpdateLaunch) throw new Error(UNPROVEN_UPDATE);
+      return this.startUpdate(provider, options.planId);
+    }
+    return this.startUpdate(provider);
+  }
+
+  private startUpdate(provider: AgentProvider, planId?: string): ProviderInstallationUpdate {
     if (this.shutdown) throw new Error(DAEMON_STOPPING);
     const running = this.updates.get(provider);
-    if (running?.running) return running.snapshot();
-    if (this.isDiscoveryDeferred(provider)) {
+    if (running?.running) {
+      const activeApproval = this.approvedOperations.get(running);
+      if (
+        activeApproval?.key !== planId ||
+        (activeApproval &&
+          !this.sameConfiguration(provider, activeApproval.version, activeApproval.client))
+      )
+        throw new Error("An update is already in progress for this installation.");
+      return running.snapshot();
+    }
+    const discoveryDeferredAtStart = this.isDiscoveryDeferred(provider);
+    if (planId === undefined && discoveryDeferredAtStart) {
       throw new Error("Update this installation on the host using its original installer.");
     }
     const client = this.requireClient(provider);
     const installation = client.installation;
     const update = installation?.update;
-    if (!installation || !update) throw new Error(`Provider ${provider} cannot update itself`);
+    if (!installation || (planId === undefined && !update))
+      throw new Error(`Provider ${provider} cannot update itself`);
     const operation = new ProviderUpdateOperation({
       id: randomUUID(),
       provider,
@@ -320,9 +441,11 @@ export class ProviderInstallations {
           payload: progress,
         }),
     });
+    const version = this.configurationVersion(provider);
+    if (planId !== undefined)
+      this.approvedOperations.set(operation, { key: planId, client, version });
     this.updates.set(provider, operation);
     const controller = new AbortController();
-    const version = this.configurationVersion(provider);
     const task = Promise.resolve()
       .then(() =>
         this.runUpdate({
@@ -331,7 +454,9 @@ export class ProviderInstallations {
           operation,
           controller,
           version,
-          run: (context) => update.call(installation, context),
+          planId,
+          discoveryDeferredAtStart,
+          run: update && ((context) => update.call(installation, context)),
         }),
       )
       .finally(() => {
@@ -476,9 +601,14 @@ export class ProviderInstallations {
     client: AgentClient,
   ): boolean {
     return (
-      !this.isDiscoveryDeferred(provider) &&
-      this.configurationVersion(provider) === version &&
-      this.resolveClient(provider) === client
+      this.configurationVersion(provider) === version && this.resolveClient(provider) === client
+    );
+  }
+
+  private isCurrentUpdate(task: ProviderUpdateTask): boolean {
+    return (
+      (task.planId !== undefined || !this.isDiscoveryDeferred(task.provider)) &&
+      this.sameConfiguration(task.provider, task.version, task.client)
     );
   }
 
@@ -498,46 +628,66 @@ export class ProviderInstallations {
   }
 
   private async executeUpdate(task: ProviderUpdateTask): Promise<InstallationUpdateResult> {
-    const { provider, client, version, run, controller, operation } = task;
+    const { provider, controller, operation, planId } = task;
     const { signal } = controller;
     let spawnAuthorized = false;
     const assertCurrent = () => {
       signal.throwIfAborted();
-      if (!this.sameConfiguration(provider, version, client))
-        throw new UpdateRefusal(CONFIG_CHANGED);
+      if (!this.isCurrentUpdate(task)) throw new UpdateRefusal(CONFIG_CHANGED);
     };
     assertCurrent();
-    const maintenance = await this.readMaintenance(provider, client, signal);
-    assertCurrent();
-    if (maintenance && maintenance.kind !== "automatic") {
-      const message =
-        sanitizeUpdateResultMessage(maintenance.message) ??
-        PROVIDER_UPDATE_REFUSAL_MESSAGES[maintenance.kind];
-      throw new UpdateRefusal(message);
-    }
-    if (maintenance?.kind !== "automatic") throw new UpdateRefusal(UNPROVEN_UPDATE);
-    const keys = await this.readActivityKeys(client, signal);
-    assertCurrent();
-    if (keys.length === 0) throw new UpdateRefusal(UNPROVEN_UPDATE);
+    const { keys, run } =
+      planId === undefined
+        ? await this.prepareOrdinaryUpdate(task, assertCurrent)
+        : await this.prepareHostApprovedUpdate(provider, planId, signal, assertCurrent);
 
-    const lease = this.activity.acquireUpdate({ family: this.resolveFamily(provider), keys });
+    const lease = this.activity.acquireUpdate({
+      family: this.resolveFamily(provider),
+      keys,
+      // A host approval binds the launch and updater identities, but not the updater's write scope.
+      opaque: planId !== undefined,
+    });
+    let releaseFileLock: (() => Promise<void>) | undefined;
+    let releaseApprovalLock: (() => Promise<void>) | undefined;
+    let cleanupUnconfirmed = false;
     try {
+      if (supportsHostApprovedProviderUpdates()) {
+        const release = await acquireProviderUpdateFileLock().catch(() => {
+          throw new UpdateRefusal("Could not lock provider updates for this host.");
+        });
+        if (!release)
+          throw new UpdateRefusal(
+            "Provider updates are locked for this account. Check for an active updater.",
+          );
+        releaseFileLock = release;
+      }
+      assertCurrent();
+      if (planId !== undefined) {
+        releaseApprovalLock = await acquireApprovedUpdateFileLock().catch((error) => {
+          throw new UpdateRefusal(
+            error instanceof ApprovedUpdateAdmissionError
+              ? error.message
+              : "Could not verify provider agent activity for this account.",
+          );
+        });
+        assertCurrent();
+      }
       const result = parseUpdateResult(
         await run({
           signal,
-          activityKeys: keys,
           assertCurrent: () => {
             assertCurrent();
             spawnAuthorized = true;
           },
           quarantineActivity: () => {
+            cleanupUnconfirmed = true;
             this.hasUnconfirmedCleanup = true;
             lease.quarantine();
           },
           report: (event) => this.reportProgress(provider, operation, event),
         }),
       );
-      if (!this.sameConfiguration(provider, version, client)) {
+      if (!this.isCurrentUpdate(task)) {
         if (result.status === "succeeded" && spawnAuthorized) {
           return { status: "succeeded", outcome: "unverified", message: UPDATE_UNVERIFIED };
         }
@@ -552,7 +702,131 @@ export class ProviderInstallations {
       signal.throwIfAborted();
       return { ...result, message };
     } finally {
+      if (!cleanupUnconfirmed && releaseApprovalLock) {
+        await releaseApprovalLock().catch(() => {
+          this.logger.warn({ provider }, "Could not release the approved provider update lock");
+        });
+      }
+      if (!cleanupUnconfirmed && releaseFileLock) {
+        await releaseFileLock().catch(() => {
+          this.logger.warn({ provider }, "Could not release the provider update lock");
+        });
+      }
       lease.release();
+    }
+  }
+
+  private async prepareOrdinaryUpdate(
+    task: ProviderUpdateTask,
+    assertCurrent: () => void,
+  ): Promise<PreparedUpdate> {
+    const {
+      provider,
+      client,
+      controller: { signal },
+      run,
+    } = task;
+    const maintenance = await this.readMaintenance(provider, client, signal);
+    assertCurrent();
+    if (maintenance?.kind === "external")
+      throw new UpdateRefusal(maintenanceRefusal(maintenance.kind, maintenance.message));
+    if (run && maintenance?.kind === "automatic") {
+      const keys = await this.readActivityKeys(client, signal);
+      assertCurrent();
+      if (keys.length > 0) return { keys, run };
+    }
+    if (maintenance?.kind === "manual")
+      throw new UpdateRefusal(maintenanceRefusal(maintenance.kind, maintenance.message));
+    throw new UpdateRefusal(UNPROVEN_UPDATE);
+  }
+
+  private async prepareHostApprovedUpdate(
+    provider: AgentProvider,
+    planId: string,
+    signal: AbortSignal,
+    assertCurrent: () => void,
+  ): Promise<PreparedUpdate> {
+    const { paseoHome, resolveApprovedUpdateLaunch } = this;
+    if (!paseoHome || !resolveApprovedUpdateLaunch) throw new UpdateRefusal(UNPROVEN_UPDATE);
+    const reread = async () => {
+      assertCurrent();
+      const deadline = AbortSignal.any([signal, AbortSignal.timeout(this.inspectTimeoutMs)]);
+      const plan = await waitForInspection(deadline, async () => {
+        const launchPath = await resolveApprovedUpdateLaunch(provider, deadline);
+        if (!launchPath || !isAbsolute(launchPath)) return null;
+        return readApprovedProviderUpdater({
+          paseoHome,
+          provider,
+          launchPath,
+          planId,
+          signal: deadline,
+        });
+      });
+      assertCurrent();
+      return plan?.provider === provider && plan.planId === planId ? plan : null;
+    };
+    const plan = await reread();
+    if (!plan) throw new UpdateRefusal(UNPROVEN_UPDATE);
+    const launchKeys = await readInstallationActivityKeys(plan.launchPath);
+    if (launchKeys.length === 0) throw new UpdateRefusal(UNPROVEN_UPDATE);
+    const keys = [
+      ...launchKeys,
+      ...(await readInstallationActivityKeys(plan.updater.resolvedCommand)),
+    ];
+    const expected = JSON.stringify(plan);
+    const readEnv = () =>
+      Object.fromEntries(
+        ["HOME", "LANG", "LC_ALL", "TMPDIR", "PATH"].map((key) => [key, process.env[key]]),
+      );
+    const env = readEnv();
+    const verify = async () => {
+      if (
+        JSON.stringify(await reread()) !== expected ||
+        JSON.stringify(readEnv()) !== JSON.stringify(env)
+      )
+        throw new UpdateRefusal(UNPROVEN_UPDATE);
+    };
+    return {
+      keys,
+      async run(context) {
+        await verify();
+        return runApprovedUpdateCommand(
+          {
+            command: plan.updater.resolvedCommand,
+            args: [...plan.updater.args],
+            env,
+            verifyBeforeSpawn: verify,
+          },
+          context,
+        );
+      },
+    };
+  }
+
+  private async readApprovedUpdatePlanId(provider: AgentProvider): Promise<string | undefined> {
+    const { paseoHome, resolveApprovedUpdateLaunch } = this;
+    if (
+      !supportsHostApprovedProviderUpdates() ||
+      !paseoHome ||
+      !resolveApprovedUpdateLaunch ||
+      this.shutdown
+    )
+      return;
+    const signal = AbortSignal.timeout(this.inspectTimeoutMs);
+    try {
+      return await waitForInspection(signal, async () => {
+        const launchPath = await resolveApprovedUpdateLaunch(provider, signal);
+        if (!launchPath || !isAbsolute(launchPath)) return;
+        const plans = await readApprovedProviderUpdater({
+          paseoHome,
+          provider,
+          launchPath,
+          signal,
+        });
+        if (plans.length === 1) return plans[0]?.planId;
+      });
+    } catch {
+      return;
     }
   }
 
@@ -569,7 +843,7 @@ export class ProviderInstallations {
       result = { status: "failed", message: message ?? "The updater failed." };
     }
     // A config commit may run between the update promise settling and publication.
-    const current = this.sameConfiguration(provider, version, client);
+    const current = this.isCurrentUpdate(task);
     if (result.status === "succeeded" && !current) {
       result = { status: "succeeded", outcome: "unverified", message: UPDATE_UNVERIFIED };
     }
@@ -578,12 +852,22 @@ export class ProviderInstallations {
       this.updateChecks.delete(client);
     }
     operation.settle(result, this.timestamp());
-    if (!current || result.status !== "succeeded") return;
+    if (!current || result.status !== "succeeded" || task.discoveryDeferredAtStart) return;
+    if (
+      task.planId !== undefined &&
+      client.installation &&
+      isApprovalOnlyInstallation(client.installation)
+    )
+      return;
     const refresh = this.refreshProvider;
     if (!refresh) return;
     void Promise.resolve()
       .then(() => {
-        if (!this.shutdown && this.sameConfiguration(provider, version, client))
+        if (
+          !this.shutdown &&
+          !this.isDiscoveryDeferred(provider) &&
+          this.sameConfiguration(provider, version, client)
+        )
           return refresh(provider);
         return undefined;
       })

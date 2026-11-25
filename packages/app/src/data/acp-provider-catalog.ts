@@ -1,5 +1,22 @@
+import {
+  buildProviderCatalogCommand,
+  PROVIDER_CATALOG_PINS,
+  type ProviderCatalogPin,
+} from "@getpaseo/protocol/provider-catalog-pins";
 import { ACP_PROVIDER_ICON_SVGS } from "@/assets/acp-provider-icons";
 import type { HostFeatureName } from "@/runtime/host-features";
+
+function requireCatalogPin(provider: string): ProviderCatalogPin {
+  const pin = PROVIDER_CATALOG_PINS[provider];
+  if (!pin) {
+    throw new Error(`Missing catalog pin metadata for ${provider}`);
+  }
+  return pin;
+}
+
+function pinnedCommand(provider: string): readonly [string, ...string[]] {
+  return buildProviderCatalogCommand(requireCatalogPin(provider));
+}
 
 export interface AcpProviderCatalogEntry {
   id: string;
@@ -20,10 +37,10 @@ const CATALOG_DATA = [
     title: "Agoragentic",
     description:
       "Agent marketplace with 174+ AI capabilities. Browse, invoke, and pay for agent services settled in USDC on Base L2.",
-    version: "1.3.6",
+    version: requireCatalogPin("agoragentic-acp").version,
     iconId: "agoragentic-acp",
     installLink: "https://agoragentic.com",
-    command: ["npx", "-y", "agoragentic-mcp@1.3.6", "--acp"],
+    command: pinnedCommand("agoragentic-acp"),
   },
   {
     id: "amp-acp",
@@ -39,10 +56,10 @@ const CATALOG_DATA = [
     title: "Auggie CLI",
     description:
       "Augment Code's powerful software agent, backed by industry-leading context engine",
-    version: "0.36.0",
+    version: requireCatalogPin("auggie").version,
     iconId: "auggie",
     installLink: "https://www.augmentcode.com/",
-    command: ["npx", "-y", "@augmentcode/auggie@0.36.0", "--acp"],
+    command: pinnedCommand("auggie"),
     env: {
       AUGMENT_DISABLE_AUTO_UPDATE: "1",
     },
@@ -51,20 +68,20 @@ const CATALOG_DATA = [
     id: "autohand",
     title: "Autohand Code",
     description: "Autohand Code - AI coding agent powered by Autohand AI",
-    version: "0.2.1",
+    version: requireCatalogPin("autohand").version,
     iconId: "autohand",
     installLink: "https://www.autohand.ai/cli/",
-    command: ["npx", "-y", "@autohandai/autohand-acp@0.2.1"],
+    command: pinnedCommand("autohand"),
   },
   {
     id: "cline",
     title: "Cline",
     description:
       "Autonomous coding agent CLI - capable of creating/editing files, running commands, using the browser, and more",
-    version: "3.0.73",
+    version: requireCatalogPin("cline").version,
     iconId: "cline",
     installLink: "https://cline.bot/cli",
-    command: ["npx", "-y", "cline@3.0.73", "--acp"],
+    command: pinnedCommand("cline"),
   },
   {
     id: "codebuddy-code",
@@ -124,10 +141,10 @@ const CATALOG_DATA = [
     id: "deepagents",
     title: "DeepAgents",
     description: "Batteries-included AI coding and general purpose agent powered by LangChain.",
-    version: "0.1.36",
+    version: requireCatalogPin("deepagents").version,
     iconId: "deepagents",
     installLink: "https://docs.langchain.com/oss/javascript/deepagents/overview",
-    command: ["npx", "-y", "deepagents-acp@0.1.36"],
+    command: pinnedCommand("deepagents"),
   },
   {
     id: "devin",
@@ -142,29 +159,29 @@ const CATALOG_DATA = [
     id: "dimcode",
     title: "DimCode",
     description: "A coding agent that puts leading models at your command.",
-    version: "0.5.21",
+    version: requireCatalogPin("dimcode").version,
     iconId: "dimcode",
     installLink: "https://dimcode.dev/docs/acp.html",
-    command: ["npx", "-y", "dimcode@0.5.21", "acp"],
+    command: pinnedCommand("dimcode"),
   },
   {
     id: "dirac",
     title: "Dirac",
     description:
       "Reduces API costs by more than 50%, produces better and faster work. Uses Hash anchored parallel edits, AST manipulation and a whole lot of neat optimizations. Fully Open Source.",
-    version: "0.5.23",
+    version: requireCatalogPin("dirac").version,
     iconId: "dirac",
     installLink: "https://dirac.run",
-    command: ["npx", "-y", "dirac-cli@0.5.23", "--acp"],
+    command: pinnedCommand("dirac"),
   },
   {
     id: "factory-droid",
     title: "Factory Droid",
     description: "Factory Droid - AI coding agent powered by Factory AI",
-    version: "0.249.0",
+    version: requireCatalogPin("factory-droid").version,
     iconId: "factory-droid",
     installLink: "https://factory.ai/product/cli",
-    command: ["npx", "-y", "droid@0.249.0", "exec", "--output-format", "acp-daemon"],
+    command: pinnedCommand("factory-droid"),
     env: {
       DROID_DISABLE_AUTO_UPDATE: "true",
       FACTORY_DROID_AUTO_UPDATE_ENABLED: "false",
@@ -175,10 +192,10 @@ const CATALOG_DATA = [
     id: "fast-agent",
     title: "fast-agent",
     description: "Code and build agents with comprehensive multi-provider support",
-    version: "0.10.47",
+    version: requireCatalogPin("fast-agent").version,
     iconId: "fast-agent",
     installLink: "https://fast-agent.ai/acp/",
-    command: ["uvx", "--from", "fast-agent-acp==0.10.47", "fast-agent-acp", "-x"],
+    command: pinnedCommand("fast-agent"),
   },
   {
     id: "fx",
@@ -194,10 +211,10 @@ const CATALOG_DATA = [
     id: "gemini",
     title: "Gemini CLI",
     description: "Google's official CLI for Gemini",
-    version: "0.70.0",
+    version: requireCatalogPin("gemini").version,
     iconId: "gemini",
     installLink: "https://geminicli.com",
-    command: ["npx", "-y", "@google/gemini-cli@0.70.0", "--acp"],
+    command: pinnedCommand("gemini"),
   },
   {
     id: "gjc",
@@ -217,10 +234,10 @@ const CATALOG_DATA = [
     title: "GLM Agent",
     description:
       "ACP agent powered by Zhipu AI's GLM Coding Plan models (glm-5.3, glm-5.3-flash, glm-5-turbo, glm-4.7). Supports streaming, tool calls, mid-session model switching, image input via Z.AI Coding Plan Vision MCP, and session load/fork/resume with on-disk persistence.",
-    version: "1.15.0",
+    version: requireCatalogPin("glm-acp-agent").version,
     iconId: "glm-acp-agent",
     installLink: "https://github.com/stefandevo/glm-acp-agent",
-    command: ["npx", "-y", "glm-acp-agent@1.15.0"],
+    command: pinnedCommand("glm-acp-agent"),
   },
   {
     id: "goose",
@@ -301,23 +318,23 @@ const CATALOG_DATA = [
     id: "minimax-code",
     title: "MiniMax Code",
     description: "MiniMax's coding agent for the terminal",
-    version: "0.6.13",
+    version: requireCatalogPin("minimax-code").version,
     iconId: "minimax-code",
     installLink: "https://agent.minimax.io",
     // `-p <pkg>` names the package and `mcode` names its binary. Without the
     // explicit binary, npx resolves the executable from the unscoped package
     // name (`code`), which this package does not publish.
-    command: ["npx", "-y", "-p", "@minimax-ai/code@0.6.13", "mcode", "acp"],
+    command: pinnedCommand("minimax-code"),
   },
   {
     id: "minion-code",
     title: "Minion Code",
     description:
       "An enhanced AI code assistant built on the Minion framework with rich development tools",
-    version: "0.1.45",
+    version: requireCatalogPin("minion-code").version,
     iconId: "minion-code",
     installLink: "https://github.com/femto/minion-code",
-    command: ["uvx", "--from", "minion-code==0.1.45", "minion-code", "acp"],
+    command: pinnedCommand("minion-code"),
   },
   {
     id: "mistral-vibe",
@@ -332,10 +349,10 @@ const CATALOG_DATA = [
     id: "nova",
     title: "Nova",
     description: "Nova by Compass AI - a fully-fledged software engineer at your command",
-    version: "1.1.59",
+    version: requireCatalogPin("nova").version,
     iconId: "nova",
     installLink: "https://www.compassap.ai/portfolio/nova.html",
-    command: ["npx", "-y", "@compass-ai/nova@1.1.59", "acp"],
+    command: pinnedCommand("nova"),
   },
   {
     id: "poolside",
@@ -350,19 +367,19 @@ const CATALOG_DATA = [
     id: "qoder",
     title: "Qoder CLI",
     description: "AI coding assistant with agentic capabilities",
-    version: "1.1.78",
+    version: requireCatalogPin("qoder").version,
     iconId: "qoder",
     installLink: "https://qoder.com",
-    command: ["npx", "-y", "@qoder-ai/qodercli@1.1.78", "--acp"],
+    command: pinnedCommand("qoder"),
   },
   {
     id: "qwen-code",
     title: "Qwen Code",
     description: "Alibaba's Qwen coding assistant",
-    version: "0.26.0",
+    version: requireCatalogPin("qwen-code").version,
     iconId: "qwen-code",
     installLink: "https://qwenlm.github.io/qwen-code-docs/en/users/overview",
-    command: ["npx", "-y", "@qwen-code/qwen-code@0.26.0", "--acp", "--experimental-skills"],
+    command: pinnedCommand("qwen-code"),
   },
   {
     id: "sigit",

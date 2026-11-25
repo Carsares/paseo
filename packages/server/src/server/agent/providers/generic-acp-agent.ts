@@ -1,6 +1,8 @@
 import type { Logger } from "pino";
+import { isAbsolute } from "node:path";
 
 import { spawnProcess } from "../../../utils/spawn.js";
+import type { AgentClientInstallation } from "../agent-sdk-types.js";
 import { acquireInstallationProcess } from "../provider-installation/installation-activity.js";
 import { currentCustomProviderLaunch } from "../scoped-custom-provider-launch.js";
 import {
@@ -40,6 +42,16 @@ export class GenericACPAgentClient extends ACPAgentClient {
   private readonly providerId?: string;
   private readonly label?: string;
   private readonly diagnosticPhaseTimeoutMs?: number;
+
+  readonly installation: AgentClientInstallation = {
+    resolveApprovedUpdateLaunch: async ({ signal }) => {
+      signal.throwIfAborted();
+      if (this.command.length !== 1 || !isAbsolute(this.command[0])) return null;
+      const { executable } = await this.resolveLauncher();
+      signal.throwIfAborted();
+      return executable;
+    },
+  };
 
   constructor(options: GenericACPAgentClientOptions) {
     super({

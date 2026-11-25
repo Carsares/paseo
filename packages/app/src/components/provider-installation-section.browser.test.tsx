@@ -464,6 +464,21 @@ describe("update action", () => {
     );
   });
 
+  it("makes a host-approved update available when ordinary maintenance is manual", () => {
+    const state = installed(false);
+    const control = action({ approved: true });
+    const section = mount(
+      ready({
+        ...state,
+        installation: { ...state.installation, maintenance: { kind: "manual" } },
+      }),
+      { status: "hidden" },
+      control.value,
+    );
+    act(() => section.view.getByRole("button", { name: "Update" }).click());
+    expect(control.starts()).toBe(1);
+  });
+
   it("shows a failure with its message, its output and the update instructions", async () => {
     const section = mount(
       installed(true),

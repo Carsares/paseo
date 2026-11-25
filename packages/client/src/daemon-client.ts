@@ -77,6 +77,7 @@ import type {
   AgentProviderSwitchRequestMessage,
   CustomProviderCliDraft,
   CustomProviderCliResponsePayload,
+  ProviderCatalogPinUpdateInput,
   GitSetupOptions,
   CheckoutStatusResponse,
   CheckoutCommit,
@@ -7431,6 +7432,14 @@ export class DaemonClient {
     return this.sendCustomProviderCliRequest("save", draft);
   }
 
+  /** Requires `features.providerCatalogPinUpdates`. Saves only the fixed package version. */
+  async updateProviderCatalogPin(input: ProviderCatalogPinUpdateInput) {
+    return this.sendNamespacedCorrelatedSessionRequest<"provider.catalog_pin.update.response">({
+      message: { type: "provider.catalog_pin.update.request", ...input },
+      timeout: 60_000,
+    });
+  }
+
   private sendCustomProviderCliRequest(
     operation: "locate" | "test" | "save",
     draft: CustomProviderCliDraft,
@@ -7487,6 +7496,21 @@ export class DaemonClient {
       message: { type: "provider.installation.update.request", provider },
       timeout: 60_000,
     });
+  }
+
+  /** Requires `features.providerApprovedUpdates`. Runs a plan approved on the host. */
+  async updateProviderWithApprovedPlan(
+    provider: AgentProvider,
+    planId: string,
+    options?: { requestId?: string },
+  ): Promise<ProviderInstallationUpdatePayload> {
+    return this.sendNamespacedCorrelatedSessionRequest<"provider.installation.approved_update.response">(
+      {
+        requestId: options?.requestId,
+        message: { type: "provider.installation.approved_update.request", provider, planId },
+        timeout: 60_000,
+      },
+    );
   }
 
   /**

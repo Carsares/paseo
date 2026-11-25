@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { vi } from "vitest";
 import { expect, test } from "vitest";
 import type { AgentClientUpdateContext } from "../agent-sdk-types.js";
-import { runUpdateCommand } from "./update-command.js";
+import { runApprovedUpdateCommand, runUpdateCommand } from "./update-command.js";
 
 vi.mock("node:child_process", { spy: true });
 
@@ -44,6 +44,23 @@ test.skipIf(!supported)(
     );
 
     expect(result).toEqual({ status: "failed", message: "The native command timed out." });
+  },
+);
+
+test.skipIf(!supported)(
+  "keeps the approval locked if the updater leaves background work",
+  async () => {
+    const script = [
+      'const { spawn } = require("node:child_process");',
+      'spawn(process.execPath, ["-e", "setTimeout(() => {}, 10000)"], { stdio: "ignore" }).unref();',
+    ].join("\n");
+    const quarantineActivity = vi.fn();
+    const result = await runApprovedUpdateCommand(
+      { command: process.execPath, args: ["-e", script], env: {} },
+      { signal: new AbortController().signal, report() {}, quarantineActivity },
+    );
+    expect(result).toMatchObject({ status: "failed" });
+    expect(quarantineActivity).toHaveBeenCalledOnce();
   },
 );
 

@@ -63,3 +63,35 @@ test("old clients and hosts can omit the custom CLI feature", () => {
   expect(WSOutboundMessageSchema.safeParse(hostInfo).success).toBe(true);
   expect(validateWSOutboundMessage(hostInfo).success).toBe(true);
 });
+
+test.each([
+  {
+    operation: "installation.approved_update",
+    request: { provider: "codex", planId: "local-plan-1" },
+    response: { provider: "codex", update: null, error: "The update plan is unavailable." },
+  },
+  {
+    operation: "catalog_pin.update",
+    request: { provider: "gemini", expectedVersion: "0.60.0", version: "0.70.0" },
+    response: { provider: "gemini", status: "updated" },
+  },
+])("accepts $operation and its correlated response", ({ operation, request, response }) => {
+  const requestId = "request-2";
+  const inbound = {
+    type: "session",
+    message: { type: `provider.${operation}.request`, requestId, ...request },
+  };
+  expect(WSInboundMessageSchema.parse(inbound)).toEqual(inbound);
+  expect(
+    WSInboundMessageSchema.parse({
+      ...inbound,
+      message: { ...inbound.message, command: ["/bin/false"] },
+    }),
+  ).toEqual(inbound);
+  const outbound = {
+    type: "session",
+    message: { type: `provider.${operation}.response`, payload: { requestId, ...response } },
+  };
+  expect(WSOutboundMessageSchema.parse(outbound)).toEqual(outbound);
+  expect(validateWSOutboundMessage(outbound)).toMatchObject({ success: true, data: outbound });
+});

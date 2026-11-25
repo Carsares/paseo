@@ -3,6 +3,7 @@ import {
   readInstallationActivityKeys,
 } from "../provider-installation/installation-target.js";
 import type { ProviderUpdateCheck } from "@getpaseo/plugin/server/provider";
+import { isAbsolute } from "node:path";
 import type { AgentClientInstallation } from "../agent-sdk-types.js";
 import {
   checkProviderLaunchAvailable,
@@ -28,6 +29,8 @@ export interface CliInstallationOptions {
   runtimeSettings: ProviderRuntimeSettings | undefined;
   installUrl: string;
   updateUrl?: string;
+  /** Allows host approval for an absolute configured command with no arguments. */
+  allowApprovedUpdate?: boolean;
   /** For CLIs that need a filesystem lookup and a guarded version invocation. */
   versionProbe?: { args: readonly string[]; env: Record<string, string> };
   /** The version shown for the CLI's `--version` output. Defaults to its first line. */
@@ -108,6 +111,20 @@ export function createCliInstallation(options: CliInstallationOptions): AgentCli
     },
   };
   if (options.updateUrl) installation.updateUrl = options.updateUrl;
+  if (options.allowApprovedUpdate) {
+    installation.resolveApprovedUpdateLaunch = async ({ signal }) => {
+      signal.throwIfAborted();
+      const launch = await resolveProviderLaunch({
+        commandConfig: runtimeSettings?.command,
+        defaultBinary: options.defaultBinary,
+      });
+      if (!isAbsolute(launch.command) || launch.args.length > 0) return null;
+      const env = createProviderEnv({ runtimeSettings });
+      const command = await findInstallationLaunchPath(launch.command, { cwd: process.cwd(), env });
+      signal.throwIfAborted();
+      return command;
+    };
+  }
 
   const checkForUpdates = options.checkForUpdates;
   if (checkForUpdates) {

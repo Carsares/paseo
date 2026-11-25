@@ -915,6 +915,8 @@ export interface AgentClientInstallation {
   ): Promise<InstallationMaintenance | undefined>;
   /** Read-only launch identity for admission; unknown launches return an empty list. */
   getActivityKeys?(launch?: { env?: Record<string, string>; cwd?: string }): Promise<string[]>;
+  /** Resolves the absolute launch entry before symlinks for host approval, without running it. */
+  resolveApprovedUpdateLaunch?(context: AgentClientInstallationContext): Promise<string | null>;
   /** See `ProviderInstallation.checkForUpdates` in the plugin contract. */
   checkForUpdates?(context: AgentClientUpdateCheckContext): Promise<ProviderUpdateCheck>;
   /** Runs the provider's updater. See `ProviderInstallation.update` in the plugin contract. */
@@ -930,8 +932,6 @@ export interface AgentClientUpdateContext extends AgentClientInstallationContext
   report(event: ProviderUpdateReport): void;
   /** Call immediately before synchronously spawning the updater. Throws if this launch is stale. */
   assertCurrent?(): void;
-  /** The installation identities held until this update settles. Built-in updaters recheck them. */
-  activityKeys?: readonly string[];
   quarantineActivity?(): void;
 }
 

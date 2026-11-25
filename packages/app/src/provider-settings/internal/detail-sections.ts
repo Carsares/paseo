@@ -1,5 +1,10 @@
 import type { ProviderSnapshotEntry } from "@getpaseo/protocol/agent-types";
+import type { MutableDaemonConfig } from "@getpaseo/protocol/messages";
 import type { ProviderInstallationState } from "@/components/provider-installation-section";
+import {
+  readConfiguredCatalogPinStatus,
+  type ConfiguredCatalogPinStatus,
+} from "@/hooks/use-acp-provider-catalog";
 
 export interface DetailSections {
   /** The failure the page leads with, or null. Empty when the provider gave no message. */
@@ -94,4 +99,30 @@ export function readDetailPresence(input: {
   if (input.entries) return { kind: "missing" };
   if (input.error) return { kind: "failed", message: input.error };
   return { kind: "loading" };
+}
+
+function readCommandArgv(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.every((item): item is string => typeof item === "string") ? value : undefined;
+}
+
+/**
+ * Resolves whether a configured ACP catalog provider has an outdated fixed `npx`/`uvx` pin
+ * that the host can update. Gated on `features.providerCatalogPinUpdates` so older hosts never
+ * show the action or receive the request.
+ */
+export function readCatalogPinUpdateTarget(input: {
+  entry: ProviderSnapshotEntry;
+  config: Pick<MutableDaemonConfig, "providers"> | null;
+  supportsCatalogPinUpdates: boolean;
+}): ConfiguredCatalogPinStatus | null {
+  if (!input.supportsCatalogPinUpdates || input.entry.source !== "custom") return null;
+  const configured = input.config?.providers?.[input.entry.provider];
+  if (!configured || configured.extends !== "acp") return null;
+  const status = readConfiguredCatalogPinStatus(
+    input.entry.provider,
+    readCommandArgv(configured.command),
+  );
+  if (!status || !status.updateAvailable) return null;
+  return status;
 }

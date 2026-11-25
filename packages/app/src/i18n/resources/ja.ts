@@ -3497,6 +3497,23 @@ export const ja: TranslationResources = {
         updateUnverified: "更新処理が終了しましたが、バージョンは未確認です",
         installInstructions: "インストール手順",
       },
+      catalogPin: {
+        sectionTitle: "カタログ起動ピン",
+        rowTitle: "固定バージョン",
+        rowHint:
+          "現在 {{current}} -> {{target}}。保存済みの起動コマンドのみ更新し、今すぐダウンロードは行いません。",
+        updateAction: "ピンを更新",
+        updatingAction: "更新中...",
+        confirmTitle: "{{name}} の固定バージョンを更新しますか？",
+        confirmMessage:
+          "保存済みの起動ピンを {{current}} から {{target}} に更新しますか？他のコマンド引数は保持され、新しいバージョンはプロバイダー実行時までダウンロードされません。",
+        confirmAction: "ピンを更新",
+        updatedToast: "起動ピンを {{version}} に更新しました",
+        conflictError:
+          "このホストで保存済みの起動バージョンが変更されました。再読み込みして確認してください。",
+        unsupportedError: "このホストではこのプロバイダーコマンドのカタログピンを更新できません。",
+        failedError: "カタログ起動ピンを更新できませんでした。",
+      },
       diagnostic: {
         title: "診断",
         button: "診断",

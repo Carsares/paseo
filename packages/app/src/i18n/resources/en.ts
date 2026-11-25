@@ -3594,6 +3594,23 @@ export const en = {
         updateUnverified: "Update finished, version unconfirmed",
         installInstructions: "Install instructions",
       },
+      catalogPin: {
+        sectionTitle: "Catalog launcher pin",
+        rowTitle: "Pinned version",
+        rowHint:
+          "Current {{current}} -> {{target}}. Updates the saved launcher command without downloading now.",
+        updateAction: "Update pin",
+        updatingAction: "Updating...",
+        confirmTitle: "Update {{name}} pinned version?",
+        confirmMessage:
+          "Update the saved launcher pin from {{current}} to {{target}}? Other command arguments stay unchanged, and the new version is not downloaded until the provider runs.",
+        confirmAction: "Update pin",
+        updatedToast: "Updated launcher pin to {{version}}",
+        conflictError:
+          "The saved launcher version changed on this host. Refresh and review before trying again.",
+        unsupportedError: "This host cannot update the catalog pin for this provider command.",
+        failedError: "Couldn't update the catalog launcher pin.",
+      },
       diagnostic: {
         title: "Diagnostic",
         button: "Diagnostic",

@@ -7,6 +7,7 @@ import type { AgentClient, AgentSession } from "../agent-sdk-types.js";
 import { ClaudeAgentClient } from "./claude/agent.js";
 import { CodexAppServerAgentClient } from "./codex-app-server-agent.js";
 import { CopilotACPAgentClient } from "./copilot-acp-agent.js";
+import { GenericACPAgentClient } from "./generic-acp-agent.js";
 import { OmpAgentClient } from "./omp/agent.js";
 import { OpenCodeRuntimeClient } from "./opencode/runtime-client.js";
 import { PiRpcAgentClient } from "./pi/agent.js";
@@ -93,6 +94,84 @@ const providers = [
       }),
   },
 ];
+
+const approvalClients: Array<{
+  name: string;
+  client(argv: [string, ...string[]]): AgentClient;
+}> = [
+  {
+    name: "Codex",
+    client: (argv) =>
+      new CodexAppServerAgentClient(createTestLogger(), { command: { mode: "replace", argv } }),
+  },
+  {
+    name: "Claude Code",
+    client: (argv) =>
+      new ClaudeAgentClient({
+        logger: createTestLogger(),
+        runtimeSettings: { command: { mode: "replace", argv } },
+      }),
+  },
+  {
+    name: "Copilot",
+    client: (argv) =>
+      new CopilotACPAgentClient({
+        logger: createTestLogger(),
+        runtimeSettings: { command: { mode: "replace", argv } },
+      }),
+  },
+  {
+    name: "Pi",
+    client: (argv) =>
+      new PiRpcAgentClient({
+        logger: createTestLogger(),
+        runtimeSettings: { command: { mode: "replace", argv } },
+      }),
+  },
+  {
+    name: "Oh My Pi",
+    client: (argv) =>
+      new OmpAgentClient({
+        logger: createTestLogger(),
+        runtimeSettings: { command: { mode: "replace", argv } },
+      }),
+  },
+  {
+    name: "custom ACP",
+    client: (command) => new GenericACPAgentClient({ logger: createTestLogger(), command }),
+  },
+];
+
+test.skipIf(process.platform === "win32").each(approvalClients)(
+  "$name resolves only a direct absolute launch for host approval without executing it",
+  async ({ client }) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-approved-launch-"));
+    roots.push(root);
+    const launch = path.join(root, "cli");
+    const target = path.join(root, "target");
+    const marker = path.join(root, "started");
+    await fs.writeFile(target, '#!/bin/sh\nprintf ran > "$(dirname "$0")/started"\n', {
+      mode: 0o755,
+    });
+    await fs.symlink(target, launch);
+
+    const signal = new AbortController().signal;
+    const resolve = (argv: [string, ...string[]]) =>
+      client(argv).installation?.resolveApprovedUpdateLaunch?.({ signal });
+
+    await expect(resolve([launch])).resolves.toBe(launch);
+    await expect(resolve([launch, "--flag"])).resolves.toBeNull();
+    await expect(resolve(["relative/cli"])).resolves.toBeNull();
+    await expect(resolve(["cli"])).resolves.toBeNull();
+    await expect(resolve([path.join(root, "missing")])).resolves.toBeNull();
+    await expect(fs.access(marker)).rejects.toHaveProperty("code", "ENOENT");
+  },
+);
+
+test("OpenCode does not offer a launch for host approval", () => {
+  const client = new OpenCodeRuntimeClient(createTestLogger());
+  expect(client.installation.resolveApprovedUpdateLaunch).toBeUndefined();
+});
 
 describe.each(providers)("$name update", ({ client }) => {
   test("does not run the updater through a configured wrapper", async () => {

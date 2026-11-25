@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { View } from "react-native";
@@ -12,14 +13,22 @@ import {
 } from "@/components/settings";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { readAcpProviderInstallGuide } from "@/hooks/use-acp-provider-catalog";
+import { useToast } from "@/contexts/toast-api-context";
+import { daemonConfigQueryKey } from "@/data/daemon-config";
+import {
+  readAcpProviderInstallGuide,
+  type ConfiguredCatalogPinStatus,
+} from "@/hooks/use-acp-provider-catalog";
 import { useDaemonConfig } from "@/hooks/use-daemon-config";
 import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
 import { useTimeAgo } from "@/hooks/use-time-ago";
-import { useHostRuntimeIsConnected } from "@/runtime/host-runtime";
+import { useHostFeature } from "@/runtime/host-features";
+import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { settingsStyles } from "@/styles/settings";
+import { confirmDialog } from "@/utils/confirm-dialog";
 import { CustomProviderCliFormSheet } from "./custom-provider-cli-form";
 import {
+  readCatalogPinUpdateTarget,
   readDetailPresence,
   readDetailSections,
   readShownInstallation,
@@ -104,6 +113,8 @@ export function ProviderDetail({
   const { refresh, isRefreshing } = useProvidersSnapshot(serverId);
   const { config } = useDaemonConfig(serverId);
   const supportsCustomCli = useSupportsCustomProviderCli(serverId);
+  // COMPAT(providerCatalogPinUpdates): added in v0.17.0, remove gate after 2027-05-25.
+  const supportsCatalogPinUpdates = useHostFeature(serverId, "providerCatalogPinUpdates");
   const installation = useProviderInstallation({ serverId, provider, visible: true });
   const refreshInstallationRef = useRef(installation.refresh);
   const refreshGenerationRef = useRef(0);
@@ -134,6 +145,11 @@ export function ProviderDetail({
   const customCliTarget = supportsCustomCli
     ? resolveCustomProviderEditTarget({ entry, config })
     : null;
+  const catalogPinTarget = readCatalogPinUpdateTarget({
+    entry,
+    config,
+    supportsCatalogPinUpdates,
+  });
   const shownInstallation = readShownInstallation({
     entry,
     installation: installation.state,
@@ -150,6 +166,19 @@ export function ProviderDetail({
         updates={installation.updates}
         action={installation.action}
       />
+      {catalogPinTarget ? (
+        <CatalogPinUpdateSection
+          key={JSON.stringify([
+            serverId,
+            catalogPinTarget.provider,
+            catalogPinTarget.currentVersion,
+            catalogPinTarget.targetVersion,
+          ])}
+          serverId={serverId}
+          label={label}
+          target={catalogPinTarget}
+        />
+      ) : null}
       {customCliTarget ? (
         <CustomCliSection
           key={`${serverId}:${customCliTarget.initialProvider.providerId}`}
@@ -272,6 +301,107 @@ function Troubleshooting({
         visible={diagnosticOpen}
         onClose={closeDiagnostic}
       />
+    </SettingsSection>
+  );
+}
+
+function CatalogPinUpdateSection({
+  serverId,
+  label,
+  target,
+}: {
+  serverId: string;
+  label: string;
+  target: ConfiguredCatalogPinStatus;
+}) {
+  const { t } = useTranslation();
+  const toast = useToast();
+  const client = useHostRuntimeClient(serverId);
+  const queryClient = useQueryClient();
+  const [updating, setUpdating] = useState(false);
+  const updatingRef = useRef(false);
+  const generationRef = useRef(0);
+
+  useEffect(() => {
+    return () => {
+      generationRef.current += 1;
+      updatingRef.current = false;
+    };
+  }, []);
+
+  const handleUpdate = useCallback(async () => {
+    if (updatingRef.current || !client) return;
+    const generation = generationRef.current;
+    updatingRef.current = true;
+    try {
+      const confirmed = await confirmDialog({
+        title: t("settings.providers.catalogPin.confirmTitle", { name: label }),
+        message: t("settings.providers.catalogPin.confirmMessage", {
+          current: target.currentVersion,
+          target: target.targetVersion,
+        }),
+        confirmLabel: t("settings.providers.catalogPin.confirmAction"),
+      });
+      if (!confirmed || generationRef.current !== generation) return;
+
+      setUpdating(true);
+      const response = await client.updateProviderCatalogPin({
+        provider: target.provider,
+        expectedVersion: target.currentVersion,
+        version: target.targetVersion,
+      });
+      if (generationRef.current !== generation) return;
+
+      if (response.status === "updated") {
+        // Refresh saved config only; never launch or implicitly download the CLI.
+        void queryClient.invalidateQueries({ queryKey: daemonConfigQueryKey(serverId) });
+        toast.show(
+          t("settings.providers.catalogPin.updatedToast", { version: target.targetVersion }),
+          { variant: "success" },
+        );
+      } else if (response.status === "conflict") {
+        void queryClient.invalidateQueries({ queryKey: daemonConfigQueryKey(serverId) });
+        toast.error(t("settings.providers.catalogPin.conflictError"));
+      } else if (response.status === "unsupported") {
+        toast.error(t("settings.providers.catalogPin.unsupportedError"));
+      } else {
+        toast.error(t("settings.providers.catalogPin.failedError"));
+      }
+    } catch (error) {
+      if (generationRef.current !== generation) return;
+      toast.error(
+        error instanceof Error ? error.message : t("settings.providers.catalogPin.failedError"),
+      );
+    } finally {
+      if (generationRef.current === generation) {
+        updatingRef.current = false;
+        setUpdating(false);
+      }
+    }
+  }, [client, label, queryClient, serverId, t, target, toast]);
+
+  return (
+    <SettingsSection title={t("settings.providers.catalogPin.sectionTitle")}>
+      <SettingsCard>
+        <SettingsRow
+          label={t("settings.providers.catalogPin.rowTitle")}
+          hint={t("settings.providers.catalogPin.rowHint", {
+            current: target.currentVersion,
+            target: target.targetVersion,
+          })}
+        >
+          <Button
+            variant="outline"
+            onPress={handleUpdate}
+            loading={updating}
+            testID="provider-catalog-pin-update"
+          >
+            {updating
+              ? t("settings.providers.catalogPin.updatingAction")
+              : t("settings.providers.catalogPin.updateAction")}
+          </Button>
+        </SettingsRow>
+      </SettingsCard>
     </SettingsSection>
   );
 }

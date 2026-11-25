@@ -3493,6 +3493,22 @@ export const ar: TranslationResources = {
         updateUnverified: "انتهى التحديث دون تأكيد الإصدار",
         installInstructions: "تعليمات التثبيت",
       },
+      catalogPin: {
+        sectionTitle: "إصدار مشغل الدليل المثبت",
+        rowTitle: "الإصدار المثبت",
+        rowHint: "الحالي {{current}} -> {{target}}. يحدث أمر التشغيل المحفوظ دون تنزيل الآن.",
+        updateAction: "تحديث الإصدار",
+        updatingAction: "جارٍ التحديث...",
+        confirmTitle: "تحديث الإصدار المثبت لـ {{name}}؟",
+        confirmMessage:
+          "تحديث الإصدار المثبت المحفوظ من {{current}} إلى {{target}}؟ تبقى بقية وسائط الأمر دون تغيير، ولن يتم تنزيل الإصدار الجديد حتى تشغيل المزود.",
+        confirmAction: "تحديث الإصدار",
+        updatedToast: "تم تحديث الإصدار المثبت إلى {{version}}",
+        conflictError:
+          "تغير إصدار المشغل المحفوظ على هذا المضيف. أعد التحميل وراجع قبل المحاولة مجددًا.",
+        unsupportedError: "لا يدعم هذا المضيف تحديث الإصدار المثبت لأمر هذا المزود.",
+        failedError: "تعذر تحديث الإصدار المثبت لمشغل الدليل.",
+      },
       diagnostic: {
         title: "التشخيص",
         button: "التشخيص",

@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { ProviderSnapshotEntry } from "@getpaseo/protocol/agent-types";
 import type { ProviderInstallationState } from "@/components/provider-installation-section";
-import { readDetailPresence, readDetailSections, readShownInstallation } from "./detail-sections";
+import {
+  readCatalogPinUpdateTarget,
+  readDetailPresence,
+  readDetailSections,
+  readShownInstallation,
+} from "./detail-sections";
 
 function entry(overrides: Partial<ProviderSnapshotEntry> = {}): ProviderSnapshotEntry {
   return {
@@ -245,5 +250,103 @@ describe("provider detail presence", () => {
         removing: null,
       }),
     ).toEqual({ kind: "failed", message: "Request timed out" });
+  });
+});
+
+describe("catalog pin update target", () => {
+  const customGemini = entry({ provider: "gemini", label: "Gemini CLI", source: "custom" });
+  const outdatedConfig = {
+    providers: {
+      gemini: {
+        extends: "acp",
+        label: "Gemini CLI",
+        command: ["npx", "-y", "@google/gemini-cli@0.68.0", "--acp", "--extra"],
+      },
+    },
+  };
+
+  it("hides the update target on older hosts without providerCatalogPinUpdates", () => {
+    expect(
+      readCatalogPinUpdateTarget({
+        entry: customGemini,
+        config: outdatedConfig,
+        supportsCatalogPinUpdates: false,
+      }),
+    ).toBeNull();
+  });
+
+  it("returns the outdated pin target on capable hosts for standard ACP commands", () => {
+    const result = readCatalogPinUpdateTarget({
+      entry: customGemini,
+      config: outdatedConfig,
+      supportsCatalogPinUpdates: true,
+    });
+    expect(result).toMatchObject({
+      provider: "gemini",
+      packageName: "@google/gemini-cli",
+      launcher: "npx",
+      currentVersion: "0.68.0",
+      updateAvailable: true,
+    });
+  });
+
+  it("returns null when already on the catalog target pin or command is non-standard", () => {
+    const target = readCatalogPinUpdateTarget({
+      entry: customGemini,
+      config: outdatedConfig,
+      supportsCatalogPinUpdates: true,
+    })!.targetVersion;
+    expect(
+      readCatalogPinUpdateTarget({
+        entry: customGemini,
+        config: {
+          providers: {
+            gemini: {
+              extends: "acp",
+              command: ["npx", "-y", `@google/gemini-cli@${target}`, "--acp"],
+            },
+          },
+        },
+        supportsCatalogPinUpdates: true,
+      }),
+    ).toBeNull();
+
+    expect(
+      readCatalogPinUpdateTarget({
+        entry: customGemini,
+        config: {
+          providers: {
+            gemini: {
+              extends: "acp",
+              command: ["npx", "-y", "@other/gemini-cli@0.68.0", "--acp"],
+            },
+          },
+        },
+        supportsCatalogPinUpdates: true,
+      }),
+    ).toBeNull();
+
+    expect(
+      readCatalogPinUpdateTarget({
+        entry: customGemini,
+        config: {
+          providers: {
+            gemini: {
+              extends: "acp",
+              command: ["npx", "-y", "@google/gemini-cli@9.0.0", "--acp"],
+            },
+          },
+        },
+        supportsCatalogPinUpdates: true,
+      }),
+    ).toBeNull();
+
+    expect(
+      readCatalogPinUpdateTarget({
+        entry: entry({ provider: "gemini", source: "builtin" }),
+        config: outdatedConfig,
+        supportsCatalogPinUpdates: true,
+      }),
+    ).toBeNull();
   });
 });

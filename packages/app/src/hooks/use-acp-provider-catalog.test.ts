@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { ACP_PROVIDER_CATALOG } from "@/data/acp-provider-catalog";
-import { buildAcpProviderConfigPatch, getAcpProviderCatalog } from "./use-acp-provider-catalog";
+import {
+  buildAcpProviderConfigPatch,
+  getAcpProviderCatalog,
+  readConfiguredCatalogPinStatus,
+} from "./use-acp-provider-catalog";
 
 function findProvider(id: string) {
   const entry = getAcpProviderCatalog().find((provider) => provider.id === id);
@@ -157,6 +161,51 @@ describe("ACP provider catalog", () => {
     expect(droidPatch.providers?.["factory-droid"]?.params).toEqual({
       supportsMcpServers: false,
     });
+  });
+
+  it("reads pinned npx/uvx launcher status strictly without launching", () => {
+    const gemini = findProvider("gemini");
+    expect(
+      readConfiguredCatalogPinStatus("gemini", [
+        "npx",
+        "-y",
+        "@google/gemini-cli@0.68.0",
+        "--acp",
+        "--extra",
+      ]),
+    ).toEqual({
+      provider: "gemini",
+      packageName: "@google/gemini-cli",
+      launcher: "npx",
+      currentVersion: "0.68.0",
+      targetVersion: gemini.version,
+      updateAvailable: true,
+    });
+
+    expect(readConfiguredCatalogPinStatus("gemini", [...gemini.command])).toEqual({
+      provider: "gemini",
+      packageName: "@google/gemini-cli",
+      launcher: "npx",
+      currentVersion: gemini.version,
+      targetVersion: gemini.version,
+      updateAvailable: false,
+    });
+
+    expect(
+      readConfiguredCatalogPinStatus("gemini", ["npx", "-y", "@google/gemini-cli@9.0.0", "--acp"]),
+    ).toEqual({
+      provider: "gemini",
+      packageName: "@google/gemini-cli",
+      launcher: "npx",
+      currentVersion: "9.0.0",
+      targetVersion: gemini.version,
+      updateAvailable: false,
+    });
+
+    expect(
+      readConfiguredCatalogPinStatus("gemini", ["npx", "-y", "@google/gemini-cli@latest", "--acp"]),
+    ).toBeNull();
+    expect(readConfiguredCatalogPinStatus("amp-acp", ["amp-acp"])).toBeNull();
   });
 });
 

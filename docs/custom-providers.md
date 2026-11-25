@@ -27,6 +27,13 @@ Saving a new launch command or changing its launch environment does not start th
 
 On Windows hosts, you can locate and save a CLI. Connection tests and discovery that starts a local CLI require a macOS or Linux host. Claude's local settings and an existing OpenCode service are still available for discovery on Windows.
 
+For a provider added from the catalog with a fixed `npx` or `uvx` package version, provider
+settings can offer a newer version shipped in the host's catalog. Confirm the version to update
+the saved command. The package downloads the next time you start a session, if it is missing
+from the launcher's cache.
+
+For a custom CLI installed on macOS, see [host-approved updaters](providers.md#host-approved-updaters).
+
 Each provider catalog refresh waits up to 2 minutes. If a provider loads many plugins or a large
 agent catalog during startup, raise the limit in milliseconds:
 

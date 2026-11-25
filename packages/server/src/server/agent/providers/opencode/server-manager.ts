@@ -10,6 +10,11 @@ import { findExecutable } from "../../../../executable-resolution/executable-res
 import { spawnProcess, type SpawnProcessOptions } from "../../../../utils/spawn.js";
 import { terminateWithTreeKill, type ProcessTerminator } from "../../../../utils/tree-kill.js";
 import type { ManagedProcessRegistry } from "../../../managed-processes/managed-processes.js";
+import { acquireInstallationProcess } from "../../provider-installation/installation-activity.js";
+import {
+  findInstallationLaunchPath,
+  readInstallationActivityKeys,
+} from "../../provider-installation/installation-target.js";
 import {
   createProviderEnv,
   resolveProviderCommandPrefix,
@@ -340,16 +345,36 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     });
     const launchPrefix = await this.resolveCommandPrefix(environment);
     const serverArgs = [...launchPrefix.args, "serve", "--port", String(port)];
-    const {
-      command,
-      args,
-      process: serverProcess,
-    } = this.spawnServer({
-      command: launchPrefix.command,
-      args: serverArgs,
-      cwd: serverCwd,
-      environment,
-    });
+    const launch = this.catalogDiscovery
+      ? spawnManagedOpenCodeProcess({
+          operation: "opencode.serve.v1",
+          cwd: serverCwd,
+          argv: [launchPrefix.command, ...serverArgs],
+          env: environment,
+          signal: this.catalogDiscovery.signal,
+        })
+      : {
+          command: launchPrefix.command,
+          args: serverArgs,
+          process: acquireInstallationProcess(
+            await resolveOpenCodeInstallationActivity({
+              command: launchPrefix.command,
+              cwd: serverCwd,
+              env: environment,
+              commandOverride: this.runtimeSettings?.command?.mode === "replace",
+              // V1 may run the native executable behind the Windows npm command shim.
+              includeWindowsLauncher: process.platform === "win32",
+            }),
+            () =>
+              this.spawnServerProcess(launchPrefix.command, serverArgs, {
+                detached: process.platform !== "win32",
+                stdio: ["ignore", "pipe", "pipe"],
+                cwd: serverCwd,
+                baseEnv: environment,
+              }),
+          ),
+        };
+    const { command, args, process: serverProcess } = launch;
     const managedProcessRecord = this.recordManagedServerProcess({
       process: serverProcess,
       command,
@@ -505,33 +530,6 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
     return server;
   }
 
-  private spawnServer(input: {
-    command: string;
-    args: string[];
-    cwd: string;
-    environment: NodeJS.ProcessEnv;
-  }) {
-    const { command, args, cwd, environment } = input;
-    const options: SpawnProcessOptions = {
-      detached: process.platform !== "win32",
-      stdio: ["ignore", "pipe", "pipe"],
-    };
-    if (!this.catalogDiscovery) {
-      return {
-        command,
-        args,
-        process: this.spawnServerProcess(command, args, { ...options, cwd, baseEnv: environment }),
-      };
-    }
-    return spawnManagedOpenCodeProcess({
-      operation: "opencode.serve.v1",
-      cwd,
-      argv: [command, ...args],
-      env: environment,
-      signal: this.catalogDiscovery.signal,
-    });
-  }
-
   async shutdown(): Promise<void> {
     if (this.catalogDiscovery) {
       // The catalog deadline can reject acquisition while startup still owns the child.
@@ -664,6 +662,33 @@ export class OpenCodeServerManager implements OpenCodeServerManagerLike {
       this.logger.warn({ err: error, id }, "Failed to remove OpenCode helper process record");
     }
   }
+}
+
+export async function resolveOpenCodeInstallationActivity(input: {
+  command: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  commandOverride: boolean;
+  includeWindowsLauncher?: boolean;
+}): Promise<Parameters<typeof acquireInstallationProcess>[0]> {
+  const family = "opencode";
+  // A replacement command can be a wrapper around a different installation.
+  if (input.commandOverride) return { family, keys: [], opaque: true };
+  const options = {
+    cwd: input.cwd,
+    env: input.env,
+    searchWindowsLaunchDirectory: true,
+    skipMissingInterpreter: true,
+  };
+  const launchPath = await findInstallationLaunchPath(input.command, options);
+  const keys = launchPath ? await readInstallationActivityKeys(launchPath) : [];
+  if (input.includeWindowsLauncher && keys.length) {
+    const launcher = await findInstallationLaunchPath("opencode", options);
+    if (launcher && launcher !== launchPath) {
+      keys.push(...(await readInstallationActivityKeys(launcher)));
+    }
+  }
+  return { family, keys, opaque: !keys.length };
 }
 
 function generationLogContext(server: OpenCodeServerGeneration): Record<string, unknown> {

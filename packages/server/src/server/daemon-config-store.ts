@@ -644,6 +644,39 @@ export class DaemonConfigStore {
     });
   }
 
+  /** Update a catalog command only if it still matches the live and persisted provider. */
+  public async patchProviderCatalogPin(
+    provider: string,
+    resolveCommand: (
+      command: readonly string[],
+    ) => { status: "updated"; command: string[] } | { status: "unsupported" | "conflict" },
+  ): Promise<"updated" | "unsupported" | "conflict"> {
+    let status: "updated" | "unsupported" | "conflict" = "unsupported";
+    await this.patchCustomProviderCli(async (current, persisted) => {
+      const running = Object.hasOwn(current.providers, provider)
+        ? current.providers[provider]
+        : null;
+      const saved = persisted && Object.hasOwn(persisted, provider) ? persisted[provider] : null;
+      if (running?.["extends"] !== "acp" || saved?.extends !== "acp" || !saved.command) return {};
+      if (!isDeepStrictEqual(running, saved)) {
+        status = "conflict";
+        return {};
+      }
+      const resolution = resolveCommand(saved.command);
+      if (resolution.status !== "updated") {
+        status = resolution.status;
+        return {};
+      }
+      if (isDeepStrictEqual(resolution.command, saved.command)) {
+        status = "conflict";
+        return {};
+      }
+      status = "updated";
+      return { providers: { [provider]: { command: resolution.command } } };
+    });
+    return status;
+  }
+
   private async commitCustomProviderCli(
     persisted: PersistedConfig,
     draftPatch: MutableDaemonConfigPatch,

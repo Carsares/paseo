@@ -51,6 +51,8 @@ export interface ProviderUpdateAction {
   starting: boolean;
   /** Why the host did not start the update. */
   startError: string | null;
+  /** The host has approved an update plan for this installation. */
+  approved?: boolean;
   start(): void;
 }
 
@@ -68,10 +70,10 @@ export function ProviderInstallationSection({
   const installation = state.status === "ready" ? state.installation : null;
   const updateUrl = installation?.updateUrl;
   const updating = Boolean(action && isUpdating(action));
-  const updateAction = offersUpdater(installation, updating) ? action : undefined;
+  const updateAction = selectUpdateAction(installation, updating, action);
   const showRunningStatus = !updateAction;
   const run = action ? readUpdateRun(action, showRunningStatus) : null;
-  const showUpdates = updating || hasUpdateDetails(installation);
+  const showUpdates = updating || Boolean(updateAction) || hasUpdateDetails(installation);
   if (state.status === "ready" && !showUpdates && !run && !hasInstallationDetails(installation)) {
     return null;
   }
@@ -123,6 +125,14 @@ function offersUpdater(installation: ProviderInstallation | null, updating: bool
   return (
     updating || Boolean(installation?.inspection?.status === "installed" && installation.canUpdate)
   );
+}
+
+function selectUpdateAction(
+  installation: ProviderInstallation | null,
+  updating: boolean,
+  action: ProviderUpdateAction | undefined,
+): ProviderUpdateAction | undefined {
+  return action?.approved || offersUpdater(installation, updating) ? action : undefined;
 }
 
 function readShownUpdateCheck(

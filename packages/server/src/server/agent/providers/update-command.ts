@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { isAbsolute } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentClientUpdateContext, InstallationUpdateResult } from "../agent-sdk-types.js";
@@ -8,7 +8,10 @@ interface UpdateCommand {
   command: string;
   args: string[];
   env: NodeJS.ProcessEnv;
+  cwd?: string;
   deadlineMs?: number;
+  verifyBeforeSpawn?(): Promise<void>;
+  requireForegroundExit?: boolean;
 }
 
 type CommandResult =
@@ -16,6 +19,7 @@ type CommandResult =
   | { status: "failed"; message: string; stopped: boolean };
 
 const UPDATE_DEADLINE_MS = 5 * 60_000;
+const UPDATE_STARTED = "Running the verified native updater.\n";
 
 /** Kept for the built-in installation declarations that have no controlled updater yet. */
 export function updatedForNewAgents(name: string): string {
@@ -45,10 +49,18 @@ async function stopGroup(pid: number | undefined): Promise<boolean> {
 }
 
 async function runNativeCommand(
-  { command, args, env, deadlineMs = UPDATE_DEADLINE_MS }: UpdateCommand,
+  {
+    command,
+    args,
+    env,
+    cwd = "/",
+    deadlineMs = UPDATE_DEADLINE_MS,
+    verifyBeforeSpawn,
+    requireForegroundExit = false,
+  }: UpdateCommand,
   parent: AbortSignal,
   assertCurrent: AgentClientUpdateContext["assertCurrent"],
-  onOutput: (stream: "stdout" | "stderr", text: string) => void,
+  onOutput?: (stream: "stdout" | "stderr", text: string) => void,
 ): Promise<CommandResult> {
   if (!isAbsolute(command) || !["darwin", "linux"].includes(process.platform)) {
     return {
@@ -58,20 +70,29 @@ async function runNativeCommand(
     };
   }
   if (parent.aborted) return { status: "failed", message: "Update canceled.", stopped: true };
+  if (verifyBeforeSpawn) {
+    await verifyBeforeSpawn();
+    if (parent.aborted) return { status: "failed", message: "Update canceled.", stopped: true };
+  }
   const deadline = AbortSignal.timeout(deadlineMs);
   const signal = AbortSignal.any([parent, deadline]);
   assertCurrent?.();
-  const child = spawn(command, args, {
-    shell: false,
-    cwd: "/",
-    env,
-    detached: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (text: string) => onOutput("stdout", text));
-  child.stderr.on("data", (text: string) => onOutput("stderr", text));
+  let child: ChildProcess;
+  try {
+    child = spawn(command, args, {
+      shell: false,
+      cwd,
+      env,
+      detached: true,
+      stdio: onOutput ? ["ignore", "pipe", "pipe"] : "ignore",
+    });
+  } catch {
+    return { status: "failed", message: "Could not start the verified executable.", stopped: true };
+  }
+  if (onOutput) {
+    child.stdout?.setEncoding("utf8").on("data", (text: string) => onOutput("stdout", text));
+    child.stderr?.setEncoding("utf8").on("data", (text: string) => onOutput("stderr", text));
+  }
   let onAbort: (() => void) | undefined;
   const result = await new Promise<CommandResult>((resolve) => {
     onAbort = () =>
@@ -94,12 +115,21 @@ async function runNativeCommand(
     );
   });
   if (onAbort) signal.removeEventListener("abort", onAbort);
+  return finishNativeCommand(child, result, requireForegroundExit);
+}
 
+async function finishNativeCommand(
+  child: ChildProcess,
+  result: CommandResult,
+  requireForegroundExit: boolean,
+): Promise<CommandResult> {
   // The child can exit before descendants close inherited pipes, or a descendant can close them
   // and carry on. Check the group even after a successful exit.
+  const foregroundExitConfirmed =
+    !requireForegroundExit || confirmedForegroundExit(result, child.pid);
   const stopped = await stopGroup(child.pid);
-  child.stdout.destroy();
-  child.stderr.destroy();
+  child.stdout?.destroy();
+  child.stderr?.destroy();
   if (!stopped) {
     return {
       status: "failed",
@@ -107,8 +137,20 @@ async function runNativeCommand(
       stopped: false,
     };
   }
+  if (!foregroundExitConfirmed) {
+    return {
+      status: "failed",
+      message: "Could not confirm the approved updater finished. Check it on the host.",
+      stopped: false,
+    };
+  }
   if (result.status === "failed") return { ...result, stopped: true };
   return result;
+}
+
+function confirmedForegroundExit(result: CommandResult, pid: number | undefined): boolean {
+  if (result.status === "failed") return result.stopped;
+  return result.signal === null && pid !== undefined && !signalGroup(pid, 0);
 }
 
 type UpdaterResult =
@@ -119,7 +161,7 @@ export async function runUpdateCommand(
   update: UpdateCommand,
   context: AgentClientUpdateContext,
 ): Promise<UpdaterResult> {
-  context.report({ type: "message", text: "Running the verified native updater.\n" });
+  context.report({ type: "message", text: UPDATE_STARTED });
   const stdout = createUpdateOutput(context.report);
   const stderr = createUpdateOutput(context.report);
   const result = await runNativeCommand(
@@ -149,4 +191,24 @@ export async function runUpdateCommand(
   return reportedCurrentVersion === undefined
     ? { status: "succeeded", outcome: "unverified" }
     : { status: "succeeded", outcome: "unverified", reportedCurrentVersion };
+}
+
+export async function runApprovedUpdateCommand(
+  update: UpdateCommand,
+  context: AgentClientUpdateContext,
+): Promise<InstallationUpdateResult> {
+  context.report({ type: "message", text: UPDATE_STARTED });
+  // Approved commands can print arbitrary local values. Discard both streams at spawn.
+  const result = await runNativeCommand(
+    { ...update, requireForegroundExit: true },
+    context.signal,
+    context.assertCurrent,
+  );
+  if (result.status === "failed") {
+    if (!result.stopped) context.quarantineActivity?.();
+    return { status: "failed", message: result.message };
+  }
+  return result.code === 0
+    ? { status: "succeeded", outcome: "unverified" }
+    : { status: "failed", message: "The updater failed." };
 }

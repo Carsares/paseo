@@ -8,6 +8,7 @@ import {
 } from "../../provider-launch-config.js";
 import { createCliInstallation, type InstalledCli } from "../cli-installation.js";
 import { updatedForNewAgents } from "../update-command.js";
+import { resolveOmpBinaryCommand } from "./cli-runtime.js";
 
 const OMP_INSTALL_URL = "https://github.com/can1357/oh-my-pi#install";
 
@@ -46,7 +47,8 @@ export function createOmpInstallation(
 ): AgentClientInstallation {
   return createCliInstallation({
     name: "Oh My Pi",
-    defaultBinary: "omp",
+    defaultBinary: resolveOmpBinaryCommand(),
+    allowApprovedUpdate: true,
     runtimeSettings,
     installUrl: OMP_INSTALL_URL,
     updateUrl: OMP_INSTALL_URL,

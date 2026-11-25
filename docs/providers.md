@@ -293,12 +293,15 @@ checked again once the 30 s inspection expires. The host streams bounded update 
 operation across client disconnects. An explicit refresh of the installation clears a failed
 update for every client observing it. Polling and opening the page leave the result visible.
 
-The update check only informs. The app offers **Update** for an installed CLI the host can update,
-or **Update instructions** when the provider supplies a guide and the app cannot update the CLI.
-Use the original installer for Claude Code. The native install layout alone cannot establish
-which executable the updater will run or whether its configured channel would downgrade it.
-For local OpenCode, update through its original installation channel. If Paseo uses an existing
-OpenCode service, update it through the service operator.
+The update check only informs. The app offers **Update** when Paseo can verify how to update the
+installed CLI. For other installations, use **Update instructions** when the provider supplies
+a guide. Update an existing OpenCode service through its operator.
+
+Use the original installer to update Claude Code and the original package manager for npm,
+pnpm, Bun, Homebrew, `uv tool`, pipx, and pip installations. The installed files can identify
+the current package, while an automatic update also needs to establish what the updater will
+install and coordinate writes to the same installation. See [custom provider configuration](custom-providers.md)
+for catalog entries pinned to an `npx` or `uvx` version.
 
 `createCliInstallation()` covers version inspection for CLI providers. A profile that extends a
 built-in reports the CLI it launches. If a wrapper or custom path prevents the host from verifying
@@ -307,6 +310,74 @@ channel.
 
 Test with fake executables, as `providers/provider-update-checks.test.ts` does. Running a real
 updater during development replaces the CLI on your machine.
+
+### Host-approved updaters
+
+On macOS, the host owner can allow a specific local updater in
+`$PASEO_HOME/provider-update-plans.json` when the original installer has no verified automatic
+route. The host checks the approval and installation again before running it. Settings clients
+receive the plan ID and can request it with `daemon.manage` permission. Keep updater arguments and
+any sensitive values on the host.
+
+On Linux, keep using provider updates whose installer Paseo can verify, or run the original
+installer. You can also save a new fixed catalog version in provider settings on either platform.
+
+Approve a foreground command that finishes all writes before returning, including on failure.
+Keep its child processes in the same process group until they finish. Paseo can stop that group.
+The host owner is responsible for this contract because approved code can start work outside it.
+
+On macOS, Paseo instances that support approved updates share an update lock under the same OS
+account, even across state directories. Close all Paseo agent runtimes under that account before
+starting an approved update, because its updater can write beyond the selected installation.
+Paseo blocks new runtimes until the update finishes. Find the private
+`paseo-provider-coordination` directory under the system user directory printed by
+`/usr/bin/getconf DARWIN_USER_DIR`. This keeps the locks and activity records visible even when
+the account's home is on a different volume.
+
+If an update is interrupted, locks may remain in `.paseo-provider-update.lock` and
+`.paseo-provider-approved-update.lock` in that directory. Check each `owner.json` for the
+process ID and acquisition time. If the record is missing or unreadable, check every Paseo
+instance under the account. Before clearing these locks, confirm that the updater and its
+children have stopped and check the installation for partial changes.
+
+An instance that exits unexpectedly can also leave a directory named with its process ID under
+`.paseo-provider-agents`. Remove a leftover entry only after confirming both the instance and
+its runtimes have stopped.
+
+Use one active plan per provider and installation. Save the file under the same host account as
+Paseo with mode `0600`. Keep the plan, approved executable, and installation records on paths
+that only the host account or root can modify. Paseo also rejects paths with macOS access list
+entries that grant permissions. To revoke a plan, remove its entry from the file. If an approved
+file changes during an update, check the new installation before issuing a new approval.
+
+Create a JSON object with `version: 1` and a `plans` array. Each plan has a unique `planId`, the
+provider ID in `provider`, the absolute `launchPath`, and its `launchIdentity`. Set
+`completion` to `"foreground"` to attest to the command's execution behavior. Set `updater.command`
+to the absolute executable and `updater.args` to the argument array. Record its file identity in
+`updater.identity`. In `evidence`, list any installation records the plan relies on as
+`{ path, identity }` objects with absolute paths. For a custom provider using Agent Client
+Protocol, configure a single absolute executable in the provider command.
+
+Use the following on the host to read each file's identity for the plan. It prints JSON without
+running the file. Replace the sample path with the launch, updater, or evidence path.
+
+```sh
+node --input-type=module - /absolute/path/to/file <<'JS'
+import { statSync } from "node:fs";
+
+const info = statSync(process.argv[2], { bigint: true });
+console.log(JSON.stringify({
+  dev: String(info.dev),
+  ino: String(info.ino),
+  mode: Number(info.mode & 0o7777n),
+  uid: Number(info.uid),
+  gid: Number(info.gid),
+  size: String(info.size),
+  mtimeNs: String(info.mtimeNs),
+  ctimeNs: String(info.ctimeNs),
+}));
+JS
+```
 
 ## Usage sources
 

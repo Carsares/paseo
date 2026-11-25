@@ -2664,6 +2664,7 @@ export class PiRpcAgentClient implements AgentClient {
     this.installation = createCliInstallation({
       name: "Pi",
       defaultBinary: PI_BINARY_COMMAND,
+      allowApprovedUpdate: true,
       runtimeSettings: options.runtimeSettings,
       installUrl: PI_INSTALL_URL,
       updateUrl: PI_INSTALL_URL,

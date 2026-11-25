@@ -16,7 +16,7 @@ export interface AgentProviderRuntime {
 interface CreateAgentProviderRuntimeOptions {
   paseoHome: string;
   logger: Logger;
-  snapshotManager: Omit<ProviderSnapshotManagerOptions, "logger" | "openCodeBridge">;
+  snapshotManager: Omit<ProviderSnapshotManagerOptions, "logger" | "openCodeBridge" | "paseoHome">;
 }
 
 export async function createAgentProviderRuntime(
@@ -34,6 +34,7 @@ export async function createAgentProviderRuntime(
       ...options.snapshotManager,
       logger: options.logger.child({ module: "provider-snapshot-manager" }),
       openCodeBridge: bridge,
+      paseoHome: options.paseoHome,
     });
     let shutdownPromise: Promise<void> | null = null;
     return {

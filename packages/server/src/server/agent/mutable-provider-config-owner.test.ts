@@ -1,19 +1,26 @@
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import pino from "pino";
-import { afterEach, describe, expect, onTestFinished, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, onTestFinished, test, vi } from "vitest";
 
-import type { CustomProviderCliDraft, MutableDaemonConfig } from "@getpaseo/protocol/messages";
+import type {
+  CustomProviderCliDraft,
+  MutableDaemonConfig,
+  ProviderInstallationUpdate,
+} from "@getpaseo/protocol/messages";
+import { getProviderCatalogPin } from "@getpaseo/protocol/provider-catalog-pins";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { loadConfig } from "../config.js";
 import { DaemonConfigStore } from "../daemon-config-store.js";
@@ -28,12 +35,26 @@ import type {
   FetchCatalogOptions,
 } from "./agent-sdk-types.js";
 import { attachMutableProviderConfigOwner } from "./mutable-provider-config-owner.js";
+import { LOCAL_UPDATER_PLANS_FILENAME } from "./provider-installation/local-updater-plan-store.js";
 import {
   type ProviderSnapshotTransition,
   ProviderSnapshotManager,
 } from "./provider-snapshot-manager.js";
 
 const tempDirs: string[] = [];
+const updateAccount = vi.hoisted(() => ({ directory: "" }));
+vi.mock("./provider-installation/installation-target.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./provider-installation/installation-target.js")>();
+  const account = () => ({ directory: updateAccount.directory, uid: process.geteuid!() });
+  return {
+    ...actual,
+    acquireProviderUpdateFileLock: () => actual.acquireProviderUpdateFileLock(account()),
+    acquireApprovedUpdateFileLock: () => actual.acquireApprovedUpdateFileLock(account()),
+    acquireProviderAgentFileTicket: () => actual.acquireProviderAgentFileTicket(account()),
+  };
+});
+
 const CONTROLLED_PROVIDERS = {
   claude: { enabled: false },
   codex: { enabled: true },
@@ -42,6 +63,89 @@ const CONTROLLED_PROVIDERS = {
   opencode: { enabled: false },
   pi: { enabled: false },
 } as const;
+const nativePlatform = process.platform;
+const catalogPinPlatforms = nativePlatform === "darwin" ? ["darwin", "linux"] : [nativePlatform];
+
+function useLinuxHost(): void {
+  if (nativePlatform === "linux") return;
+  // Override after daemon startup so native dependencies load for the real OS.
+  // This suite runs in an isolated Vitest fork.
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+  onTestFinished(() => {
+    Object.defineProperty(process, "platform", platform);
+  });
+}
+
+async function createApprovedUpdateHost() {
+  const root = mkdtempSync(path.join(tmpdir(), "paseo-approved-update-"));
+  tempDirs.push(root);
+  const home = path.join(root, ".paseo");
+  mkdirSync(home, { mode: 0o700 });
+  const launch = path.join(root, "agent");
+  const updater = path.join(root, "update-agent");
+  const started = path.join(root, "agent-started");
+  const updated = path.join(root, "agent-updated");
+  writeFileSync(
+    launch,
+    `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(started)}, '');\n`,
+    { mode: 0o700 },
+  );
+  writeFileSync(
+    updater,
+    `#!${process.execPath}\nrequire('node:fs').writeFileSync(process.argv[2], 'updated');\n`,
+    { mode: 0o700 },
+  );
+  const identity = (file: string) => {
+    const stat = statSync(file, { bigint: true });
+    return {
+      dev: String(stat.dev),
+      ino: String(stat.ino),
+      mode: Number(stat.mode & 0o7777n),
+      uid: Number(stat.uid),
+      gid: Number(stat.gid),
+      size: String(stat.size),
+      mtimeNs: String(stat.mtimeNs),
+      ctimeNs: String(stat.ctimeNs),
+    };
+  };
+  const provider = "approved-agent";
+  const planId = "test-approved-update";
+  const planFile = path.join(home, LOCAL_UPDATER_PLANS_FILENAME);
+  writeFileSync(
+    planFile,
+    JSON.stringify({
+      version: 1,
+      plans: [
+        {
+          planId,
+          provider,
+          completion: "foreground",
+          launchPath: launch,
+          launchIdentity: identity(launch),
+          updater: { command: updater, identity: identity(updater), args: [updated] },
+          evidence: [],
+        },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+  const daemon = await createTestPaseoDaemon({
+    paseoHomeRoot: root,
+    mcpEnabled: false,
+    providerOverrides: {
+      ...CONTROLLED_PROVIDERS,
+      codex: { enabled: false },
+      [provider]: {
+        extends: "acp",
+        label: "Approved agent",
+        command: [launch],
+        deferDiscovery: true,
+      },
+    },
+  });
+  return { daemon, provider, planId, planFile, updater, started, updated };
+}
 
 interface Catalog {
   models: AgentModelDefinition[];
@@ -108,7 +212,13 @@ function mutableConfig(persisted: PersistedConfig): MutableDaemonConfig {
   };
 }
 
+beforeEach(() => {
+  updateAccount.directory = mkdtempSync(path.join(tmpdir(), "paseo-update-account-"));
+  tempDirs.push(updateAccount.directory);
+});
+
 afterEach(() => {
+  updateAccount.directory = "";
   for (const tempDir of tempDirs.splice(0)) rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -550,6 +660,158 @@ describe("mutable provider config owner", () => {
       await daemon.close();
     }
   }, 20_000);
+
+  test.skipIf(nativePlatform === "win32").each(catalogPinPlatforms)(
+    "updates a fixed catalog pin on %s over WebSocket without starting the package runner",
+    async (platform) => {
+      const root = mkdtempSync(path.join(tmpdir(), "paseo-catalog-pin-"));
+      tempDirs.push(root);
+      const home = path.join(root, ".paseo");
+      const marker = path.join(root, "started");
+      mkdirSync(home);
+      writeFileSync(
+        path.join(root, "npx"),
+        `#!${process.execPath}\nrequire("node:fs").writeFileSync(${JSON.stringify(marker)}, "started");\n`,
+        { mode: 0o700 },
+      );
+      const provider = "gemini";
+      const oldVersion = "0.60.0";
+      const targetVersion = getProviderCatalogPin(provider)!.version;
+      const providers = {
+        ...CONTROLLED_PROVIDERS,
+        codex: { enabled: false },
+        [provider]: {
+          extends: "acp",
+          label: "Gemini",
+          command: ["npx", "-y", `@google/gemini-cli@${oldVersion}`, "--acp", "x y"],
+          env: { PATH: root, KEEP: "fixture" },
+        },
+      };
+      writeFileSync(path.join(home, "config.json"), JSON.stringify({ agents: { providers } }));
+      const daemon = await createTestPaseoDaemon({
+        paseoHomeRoot: root,
+        mcpEnabled: false,
+        providerOverrides: providers,
+      });
+      const url = `ws://127.0.0.1:${daemon.port}/ws`;
+      const reader = new DaemonClient({ url, sessionPermissions: ["daemon.read"] });
+      const owner = new DaemonClient({ url, sessionPermissions: ["daemon.read", "daemon.manage"] });
+      try {
+        if (platform === "linux") useLinuxHost();
+        await Promise.all([reader.connect(), owner.connect()]);
+        expect(owner.getLastServerInfoMessage()?.features?.providerCatalogPinUpdates).toBe(true);
+        const request = { provider, expectedVersion: oldVersion, version: targetVersion };
+        await expect(reader.updateProviderCatalogPin(request)).rejects.toThrow(/access_denied/);
+        expect((await owner.updateProviderCatalogPin(request)).status).toBe("updated");
+        expect((await owner.updateProviderCatalogPin(request)).status).toBe("conflict");
+        await reader.getProviderDiagnostic(provider);
+        expect((await loadPersistedConfigAsync(home)).agents?.providers?.[provider]).toMatchObject({
+          extends: "acp",
+          command: ["npx", "-y", `@google/gemini-cli@${targetVersion}`, "--acp", "x y"],
+          env: { PATH: root, KEEP: "fixture" },
+        });
+        expect(existsSync(marker)).toBe(false);
+      } finally {
+        await Promise.all([reader.close(), owner.close()]);
+        await daemon.close();
+      }
+    },
+  );
+
+  test.skipIf(nativePlatform !== "darwin" && nativePlatform !== "linux")(
+    "refuses a host-approved updater on Linux even with daemon.manage and a plan on disk",
+    async () => {
+      const { daemon, provider, planId, planFile, started, updated } =
+        await createApprovedUpdateHost();
+      const owner = new DaemonClient({
+        url: `ws://127.0.0.1:${daemon.port}/ws`,
+        sessionPermissions: ["daemon.read", "daemon.manage"],
+      });
+      try {
+        useLinuxHost();
+        await owner.connect();
+        expect(readFileSync(planFile, "utf8")).toContain(planId);
+        expect(owner.getLastServerInfoMessage()?.permissions).toContain("daemon.manage");
+        expect(owner.getLastServerInfoMessage()?.features).toMatchObject({
+          providerApprovedUpdates: false,
+          providerCatalogPinUpdates: true,
+        });
+        const { installation, error } = await owner.inspectProviderInstallation(provider);
+        expect(error).toBeNull();
+        expect(installation?.approvedUpdatePlanId).toBeUndefined();
+        expect(await owner.updateProviderWithApprovedPlan(provider, planId)).toMatchObject({
+          update: null,
+          error: "The host-approved update plan is unavailable.",
+        });
+        expect(existsSync(updated)).toBe(false);
+        expect(existsSync(started)).toBe(false);
+      } finally {
+        await owner.close();
+        await daemon.close();
+      }
+    },
+  );
+
+  test.skipIf(nativePlatform !== "darwin")(
+    "runs a host-approved updater on macOS without discovering the CLI",
+    async () => {
+      const { daemon, provider, planId, updater, started, updated } =
+        await createApprovedUpdateHost();
+      const url = `ws://127.0.0.1:${daemon.port}/ws`;
+      const reader = new DaemonClient({ url, sessionPermissions: ["daemon.read"] });
+      const owner = new DaemonClient({ url, sessionPermissions: ["daemon.read", "daemon.manage"] });
+      try {
+        await Promise.all([reader.connect(), owner.connect()]);
+        expect(reader.getLastServerInfoMessage()?.features?.providerApprovedUpdates).toBe(true);
+        const { installation } = await reader.inspectProviderInstallation(provider);
+        expect(installation?.approvedUpdatePlanId).toBe(planId);
+        expect(JSON.stringify(installation)).not.toContain(updater);
+        await expect(reader.updateProviderWithApprovedPlan(provider, planId)).rejects.toThrow(
+          /access_denied/,
+        );
+        expect(existsSync(updated)).toBe(false);
+        const observation = reader.observeProviderUpdates(provider);
+        const observed: {
+          operation?: ProviderInstallationUpdate["operation"];
+          clearedId?: string;
+        } = {};
+        observation.subscribe({
+          snapshot: () => {},
+          update: (event) => {
+            if (event.type === "provider.installation.update.progress") {
+              observed.operation = event.payload.operation;
+            }
+            if (event.type === "provider.installation.update.cleared") {
+              observed.clearedId = event.payload.operationId;
+            }
+          },
+        });
+        await observation.ready;
+        await owner.updateProviderWithApprovedPlan(provider, "unknown-plan");
+        await expect.poll(() => observed.operation).toMatchObject({ status: "failed" });
+        const failedId = observed.operation!.id;
+        expect(existsSync(updated)).toBe(false);
+        await reader.inspectProviderInstallation(provider, { refresh: true });
+        await expect.poll(() => observed.clearedId).toBe(failedId);
+        const refreshed = reader.observeProviderUpdates(provider);
+        try {
+          expect((await refreshed.ready).update).toBeNull();
+        } finally {
+          await refreshed.release();
+        }
+        const request = await owner.updateProviderWithApprovedPlan(provider, planId);
+        expect(request.error).toBeNull();
+        await expect
+          .poll(() => observed.operation, { timeout: 10_000 })
+          .toMatchObject({ status: "succeeded", outcome: "unverified" });
+        expect(readFileSync(updated, "utf8")).toBe("updated");
+        expect(existsSync(started)).toBe(false);
+      } finally {
+        await Promise.all([reader.close(), owner.close()]);
+        await daemon.close();
+      }
+    },
+  );
 
   test("a custom CLI save rebases disk edits and defers the new catalog and its dependents", async () => {
     const paseoHome = mkdtempSync(path.join(tmpdir(), "paseo-custom-cli-owner-"));

@@ -1,9 +1,25 @@
 import { useCallback, useState } from "react";
 import type { MutableDaemonConfigPatch } from "@getpaseo/protocol/messages";
+import {
+  getProviderCatalogPin,
+  isCatalogPinUpgrade,
+  parseFixedCatalogLauncher,
+  type FixedLauncherKind,
+  type ProviderCatalogPin,
+} from "@getpaseo/protocol/provider-catalog-pins";
 import { ACP_PROVIDER_CATALOG, type AcpProviderCatalogEntry } from "@/data/acp-provider-catalog";
 import type { HostFeatureName } from "@/runtime/host-features";
 
 export type AcpProviderCatalogItem = AcpProviderCatalogEntry;
+
+export interface ConfiguredCatalogPinStatus {
+  readonly provider: string;
+  readonly packageName: string;
+  readonly launcher: FixedLauncherKind;
+  readonly currentVersion: string;
+  readonly targetVersion: string;
+  readonly updateAvailable: boolean;
+}
 
 export function getAcpProviderCatalog(): AcpProviderCatalogItem[] {
   return ACP_PROVIDER_CATALOG;
@@ -12,6 +28,33 @@ export function getAcpProviderCatalog(): AcpProviderCatalogItem[] {
 /** The catalog's install guide for a provider added from it, or null for any other provider. */
 export function readAcpProviderInstallGuide(provider: string): string | null {
   return ACP_PROVIDER_CATALOG.find((entry) => entry.id === provider)?.installLink ?? null;
+}
+
+/** The catalog's fixed launcher pin spec for a provider, or null if not a pinned npx/uvx entry. */
+export function readAcpProviderCatalogPin(provider: string): ProviderCatalogPin | null {
+  return getProviderCatalogPin(provider);
+}
+
+/**
+ * Pure read-only inspection of a configured command against the catalog's fixed `npx`/`uvx` pin.
+ * Returns null when the provider has no catalog pin or the command does not strictly match.
+ */
+export function readConfiguredCatalogPinStatus(
+  provider: string,
+  command: readonly string[] | undefined,
+): ConfiguredCatalogPinStatus | null {
+  const pin = getProviderCatalogPin(provider);
+  if (!pin) return null;
+  const parsed = parseFixedCatalogLauncher(provider, command);
+  if (!parsed) return null;
+  return {
+    provider: pin.provider,
+    packageName: parsed.packageName,
+    launcher: parsed.launcher,
+    currentVersion: parsed.version,
+    targetVersion: pin.version,
+    updateAvailable: isCatalogPinUpgrade(parsed.launcher, parsed.version, pin.version),
+  };
 }
 
 export function buildAcpProviderConfigPatch(

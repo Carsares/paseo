@@ -3,7 +3,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { fireEvent, within } from "@testing-library/dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MutableDaemonConfig } from "@getpaseo/protocol/messages";
+import type {
+  MutableDaemonConfig,
+  ProviderCatalogPinUpdateInput,
+} from "@getpaseo/protocol/messages";
+import { getProviderCatalogPin } from "@getpaseo/protocol/provider-catalog-pins";
 import type { ProviderInstallationState } from "@/components/provider-installation-section";
 import { i18n as testI18n } from "@/i18n/i18next";
 import type {
@@ -16,6 +20,7 @@ void testI18n;
 
 const mocks = vi.hoisted(() => ({
   supportsCustomCli: true,
+  supportsCatalogPinUpdates: true,
   config: null as MutableDaemonConfig | null,
   entries: [] as Array<{
     provider: string;
@@ -33,8 +38,13 @@ const mocks = vi.hoisted(() => ({
   installationRefreshing: false,
   hosts: [{ serverId: "host-1", label: "Mac Studio" }],
   hostname: "mac-studio.local" as string | null,
-  client: null as CustomProviderCliClient | null,
+  client: null as MockCustomProviderCliClient | null,
   getProviderDiagnostic: vi.fn(async () => ({ diagnostic: "diag" })),
+  confirmDialog: vi.fn<
+    (input: import("@/utils/confirm-dialog").ConfirmDialogInput) => Promise<boolean>
+  >(async () => true),
+  toastShow: vi.fn(),
+  toastError: vi.fn(),
 }));
 
 vi.mock("@/hooks/use-daemon-config", () => ({
@@ -58,23 +68,34 @@ vi.mock("@/hooks/use-providers-snapshot", () => ({
   }),
 }));
 
-vi.mock("@/hooks/use-acp-provider-catalog", () => ({
-  useAcpProviderCatalog: () => ({
-    entries: [
-      {
-        id: "gemini",
-        title: "Google Gemini",
-        description: "Gemini CLI",
-        command: ["gemini", "--acp"],
-      },
-    ],
-    loading: false,
-    error: null,
-    refetch: vi.fn(async () => []),
-  }),
-  getAcpProviderCatalog: () => [],
-  readAcpProviderInstallGuide: () => null,
-  buildAcpProviderConfigPatch: vi.fn(() => ({})),
+vi.mock("@/hooks/use-acp-provider-catalog", async () => {
+  const actual = await vi.importActual<typeof import("@/hooks/use-acp-provider-catalog")>(
+    "@/hooks/use-acp-provider-catalog",
+  );
+  return {
+    ...actual,
+    useAcpProviderCatalog: () => ({
+      entries: [
+        {
+          id: "gemini",
+          title: "Google Gemini",
+          description: "Gemini CLI",
+          command: ["gemini", "--acp"],
+        },
+      ],
+      loading: false,
+      error: null,
+      refetch: vi.fn(async () => []),
+    }),
+    getAcpProviderCatalog: () => [],
+    readAcpProviderInstallGuide: () => null,
+    buildAcpProviderConfigPatch: vi.fn(() => ({})),
+  };
+});
+
+vi.mock("@/utils/confirm-dialog", () => ({
+  confirmDialog: (...args: Parameters<typeof import("@/utils/confirm-dialog").confirmDialog>) =>
+    mocks.confirmDialog(...args),
 }));
 
 vi.mock("@/runtime/host-runtime", () => ({
@@ -91,7 +112,11 @@ vi.mock("@/stores/session-store", () => ({
         {
           serverInfo: {
             hostname: string | null;
-            features: { providerCustomCli?: boolean; providerRemoval?: boolean };
+            features: {
+              providerCustomCli?: boolean;
+              providerCatalogPinUpdates?: boolean;
+              providerRemoval?: boolean;
+            };
           };
         }
       >;
@@ -104,6 +129,7 @@ vi.mock("@/stores/session-store", () => ({
             hostname: mocks.hostname,
             features: {
               providerCustomCli: mocks.supportsCustomCli,
+              providerCatalogPinUpdates: mocks.supportsCatalogPinUpdates,
               providerRemoval: true,
             },
           },
@@ -113,6 +139,7 @@ vi.mock("@/stores/session-store", () => ({
             hostname: "linux-box.local",
             features: {
               providerCustomCli: mocks.supportsCustomCli,
+              providerCatalogPinUpdates: mocks.supportsCatalogPinUpdates,
               providerRemoval: true,
             },
           },
@@ -133,19 +160,17 @@ vi.mock("@/components/provider-installation", () => ({
 
 vi.mock("@/contexts/toast-api-context", () => ({
   useToast: () => ({
-    error: vi.fn(),
+    show: mocks.toastShow,
+    error: mocks.toastError,
     copied: vi.fn(),
-    success: vi.fn(),
-    info: vi.fn(),
   }),
 }));
 
 vi.mock("@/contexts/toast-context", () => ({
   useToast: () => ({
-    error: vi.fn(),
+    show: mocks.toastShow,
+    error: mocks.toastError,
     copied: vi.fn(),
-    success: vi.fn(),
-    info: vi.fn(),
   }),
 }));
 
@@ -180,6 +205,15 @@ interface MockCustomProviderCliClient extends CustomProviderCliClient {
   >;
   testCustomProviderCli: ReturnType<typeof vi.fn<CustomProviderCliClient["testCustomProviderCli"]>>;
   saveCustomProviderCli: ReturnType<typeof vi.fn<CustomProviderCliClient["saveCustomProviderCli"]>>;
+  updateProviderCatalogPin: ReturnType<
+    typeof vi.fn<
+      (input: ProviderCatalogPinUpdateInput) => Promise<{
+        provider: string;
+        requestId: string;
+        status: "updated" | "conflict" | "unsupported" | "failed";
+      }>
+    >
+  >;
 }
 
 function createMockClient(
@@ -199,6 +233,11 @@ function createMockClient(
     saveCustomProviderCli: vi.fn<CustomProviderCliClient["saveCustomProviderCli"]>(async () => ({
       requestId: "save-1",
       result: { status: "ok", path: "/opt/bin/my-agent" },
+    })),
+    updateProviderCatalogPin: vi.fn(async (input: ProviderCatalogPinUpdateInput) => ({
+      provider: input.provider,
+      requestId: "pin-1",
+      status: "updated" as const,
     })),
     ...overrides,
   };
@@ -257,6 +296,11 @@ beforeEach(() => {
   vi.stubGlobal("React", React);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   mocks.supportsCustomCli = true;
+  mocks.supportsCatalogPinUpdates = true;
+  mocks.confirmDialog.mockReset();
+  mocks.confirmDialog.mockResolvedValue(true);
+  mocks.toastShow.mockReset();
+  mocks.toastError.mockReset();
   mocks.config = {
     mcp: { injectIntoAgents: true },
     browserTools: { enabled: false },
@@ -773,5 +817,207 @@ describe("custom CLI form UI", () => {
       await Promise.resolve();
     });
     expect(mocks.refreshInstallation).not.toHaveBeenCalled();
+  });
+
+  it("shows current and target catalog pin versions, skips RPC on cancel, and sends only updateProviderCatalogPin without refresh or discovery on confirm", async () => {
+    const targetVersion = getProviderCatalogPin("gemini")!.version;
+    const client = createMockClient();
+    mocks.client = client;
+    mocks.config = {
+      ...mocks.config!,
+      providers: {
+        ...mocks.config!.providers,
+        gemini: {
+          extends: "acp",
+          label: "Gemini CLI",
+          command: ["npx", "-y", "@google/gemini-cli@0.68.0", "--acp", "--extra"],
+        },
+      },
+    } as MutableDaemonConfig;
+    const geminiEntry = {
+      provider: "gemini",
+      status: "ready" as const,
+      enabled: true,
+      source: "custom" as const,
+      label: "Gemini CLI",
+    };
+    mocks.entries = [...mocks.entries, geminiEntry];
+
+    const makeDetail = (): ProviderDetailState => ({
+      provider: "gemini",
+      label: "Gemini CLI",
+      presence: { kind: "found", entry: geminiEntry },
+      canRemove: () => false,
+      removing: false,
+      remove: vi.fn(),
+    });
+
+    const { view } = mountNode(<ProviderDetail serverId="host-1" detail={makeDetail()} />);
+
+    expect(view.getByTestId("provider-catalog-pin-update")).toBeTruthy();
+    expect(document.body.textContent).toContain("0.68.0");
+    expect(document.body.textContent).toContain(targetVersion);
+
+    // Cancelling confirmation must not send any RPC or trigger refresh/discovery.
+    mocks.confirmDialog.mockResolvedValueOnce(false);
+    act(() => view.getByTestId("provider-catalog-pin-update").click());
+    await flushMicrotasks();
+
+    expect(mocks.confirmDialog).toHaveBeenCalledTimes(1);
+    expect(client.updateProviderCatalogPin).not.toHaveBeenCalled();
+    expect(mocks.refreshSnapshot).not.toHaveBeenCalled();
+    expect(mocks.refreshInstallation).not.toHaveBeenCalled();
+
+    // Confirming sends only updateProviderCatalogPin without launching refresh/discovery.
+    mocks.confirmDialog.mockResolvedValueOnce(true);
+    act(() => view.getByTestId("provider-catalog-pin-update").click());
+    await flushMicrotasks();
+
+    expect(mocks.confirmDialog).toHaveBeenCalledTimes(2);
+    expect(client.updateProviderCatalogPin).toHaveBeenCalledTimes(1);
+    expect(client.updateProviderCatalogPin).toHaveBeenCalledWith({
+      provider: "gemini",
+      expectedVersion: "0.68.0",
+      version: targetVersion,
+    });
+    expect(mocks.refreshSnapshot).not.toHaveBeenCalled();
+    expect(mocks.refreshInstallation).not.toHaveBeenCalled();
+    expect(mocks.toastShow).toHaveBeenCalledWith(
+      expect.stringContaining(targetVersion),
+      expect.objectContaining({ variant: "success" }),
+    );
+  });
+
+  it("does not write to a stale catalog pin target if the host or provider changes while confirmation is open", async () => {
+    const client = createMockClient();
+    mocks.client = client;
+    mocks.config = {
+      ...mocks.config!,
+      providers: {
+        ...mocks.config!.providers,
+        gemini: {
+          extends: "acp",
+          label: "Gemini CLI",
+          command: ["npx", "-y", "@google/gemini-cli@0.68.0", "--acp"],
+        },
+        cline: {
+          extends: "acp",
+          label: "Cline",
+          command: ["npx", "-y", "cline@3.0.70", "--acp"],
+        },
+      },
+    } as MutableDaemonConfig;
+    const geminiEntry = {
+      provider: "gemini",
+      status: "ready" as const,
+      enabled: true,
+      source: "custom" as const,
+      label: "Gemini CLI",
+    };
+    const clineEntry = {
+      provider: "cline",
+      status: "ready" as const,
+      enabled: true,
+      source: "custom" as const,
+      label: "Cline",
+    };
+    mocks.entries = [...mocks.entries, geminiEntry, clineEntry];
+
+    const makeDetail = (entry: typeof geminiEntry): ProviderDetailState => ({
+      provider: entry.provider,
+      label: entry.label,
+      presence: { kind: "found", entry },
+      canRemove: () => false,
+      removing: false,
+      remove: vi.fn(),
+    });
+
+    const hostSwitchConfirm = createDeferred<boolean>();
+    mocks.confirmDialog.mockReturnValueOnce(hostSwitchConfirm.promise);
+
+    const { view, rerender } = mountNode(
+      <ProviderDetail serverId="host-1" detail={makeDetail(geminiEntry)} />,
+    );
+
+    act(() => view.getByTestId("provider-catalog-pin-update").click());
+    // User switches host before answering the confirmation dialog.
+    rerender(<ProviderDetail serverId="host-2" detail={makeDetail(geminiEntry)} />);
+
+    hostSwitchConfirm.resolve(true);
+    await flushMicrotasks();
+
+    expect(client.updateProviderCatalogPin).not.toHaveBeenCalled();
+    expect(mocks.toastShow).not.toHaveBeenCalled();
+
+    const providerSwitchConfirm = createDeferred<boolean>();
+    mocks.confirmDialog.mockReturnValueOnce(providerSwitchConfirm.promise);
+
+    act(() => view.getByTestId("provider-catalog-pin-update").click());
+    // User switches provider before answering the confirmation dialog.
+    rerender(<ProviderDetail serverId="host-2" detail={makeDetail(clineEntry)} />);
+
+    providerSwitchConfirm.resolve(true);
+    await flushMicrotasks();
+
+    expect(client.updateProviderCatalogPin).not.toHaveBeenCalled();
+    expect(mocks.toastShow).not.toHaveBeenCalled();
+  });
+
+  it("allows another catalog pin update after the saved version changes during a request", async () => {
+    const client = createMockClient();
+    const request = createDeferred<Awaited<ReturnType<typeof client.updateProviderCatalogPin>>>();
+    client.updateProviderCatalogPin.mockReturnValueOnce(request.promise);
+    mocks.client = client;
+    const setSavedVersion = (version: string) => {
+      mocks.config = {
+        ...mocks.config!,
+        providers: {
+          ...mocks.config!.providers,
+          gemini: {
+            extends: "acp",
+            label: "Gemini CLI",
+            command: ["npx", "-y", `@google/gemini-cli@${version}`, "--acp"],
+          },
+        },
+      } as MutableDaemonConfig;
+    };
+    setSavedVersion("0.68.0");
+    const entry = {
+      provider: "gemini",
+      status: "ready" as const,
+      enabled: true,
+      source: "custom" as const,
+      label: "Gemini CLI",
+    };
+    const makeDetail = (): ProviderDetailState => ({
+      provider: entry.provider,
+      label: entry.label,
+      presence: { kind: "found", entry },
+      canRemove: () => false,
+      removing: false,
+      remove: vi.fn(),
+    });
+    const page = () => <ProviderDetail serverId="host-1" detail={makeDetail()} />;
+    const { view, rerender } = mountNode(page());
+    mocks.confirmDialog.mockResolvedValueOnce(true);
+    act(() => view.getByTestId("provider-catalog-pin-update").click());
+    await flushMicrotasks();
+    expect(client.updateProviderCatalogPin).toHaveBeenCalledOnce();
+
+    setSavedVersion("0.69.0");
+    rerender(page());
+    mocks.confirmDialog.mockResolvedValueOnce(true);
+    act(() => view.getByTestId("provider-catalog-pin-update").click());
+    await flushMicrotasks();
+    expect(client.updateProviderCatalogPin).toHaveBeenCalledTimes(2);
+    expect(client.updateProviderCatalogPin).toHaveBeenLastCalledWith({
+      provider: entry.provider,
+      expectedVersion: "0.69.0",
+      version: getProviderCatalogPin(entry.provider)!.version,
+    });
+    request.resolve({ provider: entry.provider, requestId: "old-pin", status: "conflict" });
+    await flushMicrotasks();
+    expect(mocks.toastError).not.toHaveBeenCalled();
+    expect(mocks.toastShow).toHaveBeenCalledOnce();
   });
 });

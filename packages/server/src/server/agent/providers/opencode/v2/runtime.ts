@@ -9,7 +9,6 @@ import { spawnProcess, type SpawnProcessOptions } from "../../../../../utils/spa
 import { terminateWithTreeKill } from "../../../../../utils/tree-kill.js";
 import {
   createProviderEnv,
-  createProviderEnvSpec,
   resolveProviderLaunch,
   type ProviderRuntimeSettings,
 } from "../../../provider-launch-config.js";
@@ -29,7 +28,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { OpenCodeBridge } from "../bridge.js";
 import { spawnManagedOpenCodeProcess } from "../managed-catalog-launch.js";
+import { resolveOpenCodeInstallationActivity } from "../server-manager.js";
 import { stopScopedProviderProcess } from "../../../scoped-provider-process.js";
+import { acquireInstallationProcess } from "../../../provider-installation/installation-activity.js";
 
 export interface V2Connection {
   client: V2Api;
@@ -258,15 +259,19 @@ export class V2Runtime {
       detached: globalThis.process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     };
+    const environment = createProviderEnv({ runtimeSettings: settings, overlays: [overlay] });
     if (!catalogDiscovery) {
-      const process = spawnProcess(launch.command, args, {
-        ...options,
+      const activity = await resolveOpenCodeInstallationActivity({
+        command: launch.command,
         cwd,
-        ...createProviderEnvSpec({ runtimeSettings: settings, overlays: [overlay] }),
+        env: environment,
+        commandOverride: launch.source === "override",
       });
+      const process = acquireInstallationProcess(activity, () =>
+        spawnProcess(launch.command, args, { ...options, cwd, baseEnv: environment }),
+      );
       return { process, command: launch.command, args, password };
     }
-    const environment = createProviderEnv({ runtimeSettings: settings, overlays: [overlay] });
     const verified = spawnManagedOpenCodeProcess({
       operation: "opencode.serve.v2",
       cwd,

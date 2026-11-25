@@ -3544,6 +3544,24 @@ export const fr: TranslationResources = {
         updateUnverified: "Mise à jour terminée, version non confirmée",
         installInstructions: "Instructions d'installation",
       },
+      catalogPin: {
+        sectionTitle: "Version épinglée du lanceur",
+        rowTitle: "Version épinglée",
+        rowHint:
+          "Actuelle {{current}} -> {{target}}. Met à jour la commande enregistrée sans téléchargement immédiat.",
+        updateAction: "Mettre à jour",
+        updatingAction: "Mise à jour...",
+        confirmTitle: "Mettre à jour la version épinglée de {{name}} ?",
+        confirmMessage:
+          "Mettre à jour la version épinglée de {{current}} vers {{target}} ? Les autres arguments restent inchangés et la nouvelle version ne sera pas téléchargée avant le lancement du fournisseur.",
+        confirmAction: "Mettre à jour",
+        updatedToast: "Version épinglée mise à jour vers {{version}}",
+        conflictError:
+          "La version enregistrée a changé sur cet hôte. Actualisez et vérifiez avant de réessayer.",
+        unsupportedError:
+          "Cet hôte ne peut pas mettre à jour la version épinglée du catalogue pour cette commande.",
+        failedError: "Impossible de mettre à jour la version épinglée du lanceur.",
+      },
       diagnostic: {
         title: "Diagnostic",
         button: "Diagnostic",

@@ -1,9 +1,35 @@
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import {
+  access,
+  chmod,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import pino from "pino";
 import { AgentManager } from "../agent-manager.js";
 import { createTestAgentClient } from "../../test-utils/fake-agent-client.js";
-import { installationActivity, InstallationActivity } from "./installation-activity.js";
+import {
+  acquireInstallationProcess,
+  installationActivity,
+  InstallationActivity,
+} from "./installation-activity.js";
+import {
+  acquireApprovedUpdateFileLock,
+  acquireProviderAgentFileTicket,
+  acquireProviderUpdateFileLock,
+  findInstallationLaunchPath,
+  supportsHostApprovedProviderUpdates,
+} from "./installation-target.js";
 import type {
   ProviderEvent,
   ProviderInstallation,
@@ -14,23 +40,66 @@ import type {
   ProviderInstallationUpdate,
   ProviderInstallationUpdateProgress,
 } from "@getpaseo/protocol/messages";
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { DaemonConfigStore } from "../../daemon-config-store.js";
 import type { AgentClient, AgentClientInstallation } from "../agent-sdk-types.js";
+import {
+  formatApprovedProviderUpdaterPlansJson,
+  LOCAL_UPDATER_PLANS_FILENAME,
+  type LocalFileIdentity,
+} from "./local-updater-plan-store.js";
 import { runCustomProviderCliOperation } from "../custom-provider-cli.js";
 import { attachMutableProviderConfigOwner } from "../mutable-provider-config-owner.js";
 import { ProviderSnapshotManager } from "../provider-snapshot-manager.js";
+import { runUpdateCommand } from "../providers/update-command.js";
 import {
   ProviderInstallations,
   ProviderUpdateCleanupError,
   type ProviderUpdateEvent,
 } from "./provider-installations.js";
 
+const fileLockFixture = vi.hoisted(() => ({ directory: "" }));
+vi.mock("./installation-target.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./installation-target.js")>();
+  const account = () => ({ directory: fileLockFixture.directory, uid: process.geteuid!() });
+  return {
+    ...actual,
+    acquireProviderUpdateFileLock: vi.fn(() => actual.acquireProviderUpdateFileLock(account())),
+    acquireApprovedUpdateFileLock: vi.fn(() => actual.acquireApprovedUpdateFileLock(account())),
+    acquireProviderAgentFileTicket: vi.fn(() => actual.acquireProviderAgentFileTicket(account())),
+  };
+});
+
+beforeEach(async () => {
+  fileLockFixture.directory = await mkdtemp(path.join(tmpdir(), "paseo-update-account-"));
+  vi.mocked(acquireProviderUpdateFileLock).mockClear();
+  vi.mocked(acquireApprovedUpdateFileLock).mockClear();
+  vi.mocked(acquireProviderAgentFileTicket).mockClear();
+});
+
+afterEach(async () => {
+  await rm(fileLockFixture.directory, { recursive: true, force: true });
+});
+
 const OPAQUE_VERSION = "  v1.2.3-beta+weird (build 7)\n";
 const MISSING_COMMAND = "paseo-provider-installation-missing-binary";
 const OPAQUE_VERSIONS = ["v9-nightly+abc", "  2.0 (LTS)\n"];
 const OPAQUE_MESSAGE = "  Restart to finish updating\n";
+
+async function localFileIdentity(file: string): Promise<LocalFileIdentity> {
+  const value = await stat(file, { bigint: true });
+  return {
+    dev: value.dev.toString(),
+    ino: value.ino.toString(),
+    mode: Number(value.mode & 0o7777n),
+    uid: Number(value.uid),
+    gid: Number(value.gid),
+    size: value.size.toString(),
+    mtimeNs: value.mtimeNs.toString(),
+    ctimeNs: value.ctimeNs.toString(),
+  };
+}
 
 function pluginProvider(
   installation: ProviderInstallation | undefined,
@@ -164,7 +233,7 @@ describe("provider installation", () => {
       }
       await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
       expect(fetchRelease).not.toHaveBeenCalled();
-      expect(() => installations.update("codex")).toThrow("Discover this provider");
+      expect(() => installations.update("codex")).toThrow("using its original installer");
     } finally {
       fetchRelease.mockRestore();
       detach();
@@ -735,16 +804,894 @@ describe("provider updates", () => {
     return { installations, events, progress, invoked: invoked.promise, calls: () => calls };
   }
 
-  function settled(installations: ProviderInstallations): Promise<ProviderInstallationUpdate> {
+  function settled(
+    installations: ProviderInstallations,
+    provider = "codex",
+  ): Promise<ProviderInstallationUpdate> {
     return new Promise((resolve) => {
-      const stop = installations.observeUpdates("codex", (event) => {
+      const stop = installations.observeUpdates(provider, (event) => {
         if (event.type !== "provider.installation.update.progress") return;
         if (event.payload.operation.status === "running") return;
         stop();
-        resolve(installations.getUpdate("codex")!);
+        resolve(installations.getUpdate(provider)!);
       });
     });
   }
+
+  async function expectRefreshClearsFailedApproval(
+    installations: ProviderInstallations,
+    provider: string,
+    planId: string,
+  ): Promise<void> {
+    const completed = settled(installations, provider);
+    const rejected = installations.update(provider, { planId: "unknown-approval" });
+    await expect(completed).resolves.toMatchObject({ operation: { status: "failed" } });
+
+    const events: ProviderUpdateEvent[] = [];
+    const stop = installations.observeUpdates(provider, (event) => events.push(event));
+    try {
+      await expect(installations.inspect(provider)).resolves.toMatchObject({
+        approvedUpdatePlanId: planId,
+      });
+      expect(installations.getUpdate(provider)?.operation.status).toBe("failed");
+
+      await expect(installations.inspect(provider, { refresh: true })).resolves.toMatchObject({
+        approvedUpdatePlanId: planId,
+      });
+      expect(installations.getUpdate(provider)).toBeNull();
+      expect(events).toEqual([
+        {
+          type: "provider.installation.update.cleared",
+          payload: { provider, operationId: rejected.operation.id },
+        },
+      ]);
+    } finally {
+      stop();
+    }
+  }
+
+  // This runs on real Linux as well as in a macOS test worker simulating Linux.
+  test.skipIf(typeof process.geteuid !== "function")(
+    "disables host approvals on Linux while an ordinary update still waits for agent activity",
+    async () => {
+      const cwd = await realpath(fileLockFixture.directory);
+      const launchPath = path.join(cwd, "cli");
+      const updater = path.join(cwd, "updater");
+      const marker = path.join(cwd, "updater-started");
+      const planId = "linux-approval";
+      await writeFile(launchPath, '#!/bin/sh\nprintf probed > "$0.probed"\n', { mode: 0o700 });
+      await writeFile(updater, '#!/bin/sh\nprintf started > "$1"\n', { mode: 0o700 });
+      await writeFile(
+        path.join(cwd, LOCAL_UPDATER_PLANS_FILENAME),
+        formatApprovedProviderUpdaterPlansJson([
+          {
+            planId,
+            provider: "pi",
+            completion: "foreground",
+            launchPath,
+            launchIdentity: await localFileIdentity(launchPath),
+            updater: {
+              command: updater,
+              args: [marker],
+              identity: await localFileIdentity(updater),
+            },
+            evidence: [],
+          },
+        ]),
+        { mode: 0o600 },
+      );
+
+      const update = vi.fn<NonNullable<AgentClientInstallation["update"]>>(async (context) => {
+        context.assertCurrent?.();
+        return { status: "succeeded", outcome: "updated" };
+      });
+      const resolveApprovedUpdateLaunch = vi.fn(async () => launchPath);
+      const runtimeClient = Object.assign(createTestAgentClient("pi"), {
+        installation: {
+          getMaintenance: automatic,
+          getActivityKeys: getFakeActivityKeys,
+          resolveApprovedUpdateLaunch,
+          update,
+        },
+      });
+      const approvalOnly = builtinClient({ resolveApprovedUpdateLaunch });
+      const logger = createTestLogger();
+      const installations = new ProviderInstallations({
+        logger,
+        paseoHome: cwd,
+        activity: installationActivity,
+        resolveClient: (provider) => (provider === "pi" ? runtimeClient : approvalOnly),
+        resolveApprovedUpdateLaunch,
+      });
+      const manager = new AgentManager({ clients: { pi: runtimeClient }, logger });
+      const observe = vi.fn();
+      const stop = installations.observeUpdates("pi", observe);
+      const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      Object.defineProperty(process, "platform", { value: "linux" });
+      try {
+        await expect(installations.inspect("pi")).resolves.toEqual({
+          maintenance: { kind: "automatic" },
+          canUpdate: true,
+        });
+        await expect(installations.inspect("approval-only")).resolves.toBeNull();
+        expect(() => installations.update("pi", { planId })).toThrow(
+          "Host-approved provider updates are unavailable on this host.",
+        );
+        expect(installations.getUpdate("pi")).toBeNull();
+        expect(observe).not.toHaveBeenCalled();
+        expect(resolveApprovedUpdateLaunch).not.toHaveBeenCalled();
+        expect(update).not.toHaveBeenCalled();
+
+        const agent = await manager.createAgent(
+          { cwd, provider: "pi", model: "test-model" },
+          undefined,
+          {},
+        );
+        try {
+          const blocked = settled(installations, "pi");
+          installations.update("pi");
+          await expect(blocked).resolves.toMatchObject({
+            operation: { status: "failed", message: expect.stringContaining("in use") },
+          });
+          expect(update).not.toHaveBeenCalled();
+        } finally {
+          await manager.closeAgent(agent.id);
+        }
+
+        const child = acquireInstallationProcess({ family: "pi", keys: [] }, () =>
+          spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd, stdio: "ignore" }),
+        );
+        const closed = once(child, "close");
+        try {
+          const blocked = settled(installations, "pi");
+          installations.update("pi");
+          await expect(blocked).resolves.toMatchObject({
+            operation: { status: "failed", message: expect.stringContaining("in use") },
+          });
+          expect(update).not.toHaveBeenCalled();
+        } finally {
+          child.kill();
+          await closed;
+        }
+
+        const completed = settled(installations, "pi");
+        installations.update("pi");
+        await expect(completed).resolves.toMatchObject({
+          operation: { status: "succeeded", outcome: "updated" },
+        });
+        expect(update).toHaveBeenCalledOnce();
+        expect(acquireProviderAgentFileTicket).not.toHaveBeenCalled();
+        expect(acquireProviderUpdateFileLock).not.toHaveBeenCalled();
+        expect(acquireApprovedUpdateFileLock).not.toHaveBeenCalled();
+        await expect(access(launchPath + ".probed")).rejects.toHaveProperty("code", "ENOENT");
+        await expect(access(marker)).rejects.toHaveProperty("code", "ENOENT");
+      } finally {
+        Object.defineProperty(process, "platform", platform);
+        stop();
+        await installations.close();
+      }
+    },
+  );
+
+  // The macOS cases use real file locks under the injected temporary account.
+  test.skipIf(!supportsHostApprovedProviderUpdates()).each([
+    ["approved", "approved", "shared"],
+    ["approved", "approved", "different"],
+    ["approved", "ordinary", "shared"],
+    ["ordinary", "approved", "shared"],
+    ["approved", "ordinary", "different"],
+    ["ordinary", "approved", "different"],
+  ] as const)(
+    "locks %s then %s on %s roots across different Paseo homes",
+    async (first, second, roots) => {
+      const root = await realpath(await mkdtemp(path.join(tmpdir(), "paseo-cross-instance-")));
+      const release = path.join(root, "release");
+      const instances: ProviderInstallations[] = [];
+      const openOtherAgent = () =>
+        installationActivity.acquireAgent({ family: "other", keys: ["path:unrelated"] });
+      const prepare = async (name: string, kind: "approved" | "ordinary") => {
+        const paseoHome = path.join(root, `home-${name}`);
+        const installRoot = path.join(root, roots === "shared" ? "install" : `install-${name}`);
+        const launch = path.join(installRoot, `cli-${name}`);
+        const updater = path.join(installRoot, `updater-${name}`);
+        const marker = path.join(root, `started-${name}`);
+        const args = [marker, release];
+        await mkdir(paseoHome, { mode: 0o700 });
+        await mkdir(installRoot, { recursive: true });
+        await Promise.all([
+          writeFile(launch, "#!/bin/sh\n", { mode: 0o700 }),
+          writeFile(
+            updater,
+            '#!/bin/sh\nprintf started > "$1"\nwhile [ ! -f "$2" ]; do /bin/sleep 0.05; done\n',
+            { mode: 0o700 },
+          ),
+        ]);
+        const planId = `approved-${name}`;
+        if (kind === "approved") {
+          await writeFile(
+            path.join(paseoHome, LOCAL_UPDATER_PLANS_FILENAME),
+            formatApprovedProviderUpdaterPlansJson([
+              {
+                planId,
+                provider: "codex",
+                completion: "foreground",
+                launchPath: launch,
+                launchIdentity: await localFileIdentity(launch),
+                updater: { command: updater, args, identity: await localFileIdentity(updater) },
+                evidence: [],
+              },
+            ]),
+            { mode: 0o600 },
+          );
+        }
+        const client = builtinClient({
+          getMaintenance: automatic,
+          getActivityKeys: async () => [`root:${installRoot}`],
+          update: (context) => runUpdateCommand({ command: updater, args, env: {} }, context),
+        });
+        const installations = new ProviderInstallations({
+          logger: createTestLogger(),
+          activity: new InstallationActivity(),
+          paseoHome,
+          resolveClient: () => client,
+          resolveApprovedUpdateLaunch: async () => launch,
+        });
+        instances.push(installations);
+        return {
+          marker,
+          start: () => {
+            const completed = settled(installations);
+            installations.update("codex", kind === "approved" ? { planId } : undefined);
+            return completed;
+          },
+        };
+      };
+      try {
+        const leader = await prepare("first", first);
+        const follower = await prepare("second", second);
+        if (first === "approved") {
+          const closeAgent = openOtherAgent();
+          try {
+            await expect(leader.start()).resolves.toMatchObject({
+              operation: {
+                status: "failed",
+                message: expect.stringContaining(
+                  "Paseo agent activity is recorded for this account",
+                ),
+              },
+            });
+            await expect(access(leader.marker)).rejects.toHaveProperty("code", "ENOENT");
+          } finally {
+            closeAgent();
+          }
+        }
+        const completed = leader.start();
+        await vi.waitFor(
+          async () => expect(await readFile(leader.marker, "utf8")).toBe("started"),
+          { timeout: 10_000 },
+        );
+        if (first === "approved") {
+          expect(openOtherAgent).toThrow("An approved provider update is in progress");
+        } else {
+          openOtherAgent()();
+        }
+        await expect(follower.start()).resolves.toMatchObject({
+          operation: {
+            status: "failed",
+            message: "Provider updates are locked for this account. Check for an active updater.",
+          },
+        });
+        await expect(access(follower.marker)).rejects.toHaveProperty("code", "ENOENT");
+        await writeFile(release, "");
+        await expect(completed).resolves.toMatchObject({ operation: { status: "succeeded" } });
+        openOtherAgent()();
+        await expect(follower.start()).resolves.toMatchObject({
+          operation: { status: "succeeded" },
+        });
+        await expect(readFile(follower.marker, "utf8")).resolves.toBe("started");
+      } finally {
+        await writeFile(release, "");
+        await Promise.all(instances.map((instance) => instance.close()));
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!supportsHostApprovedProviderUpdates())(
+    "offers Generic ACP only when its direct executable has a valid host approval",
+    async () => {
+      const root = await realpath(
+        await mkdtemp(path.join(tmpdir(), "paseo-generic-acp-approval-")),
+      );
+      const provider = "local-generic-acp";
+      const launchPath = path.join(root, "cli");
+      const updater = path.join(root, "updater");
+      const updated = path.join(root, "updated");
+      const manager = new ProviderSnapshotManager({
+        logger: createTestLogger(),
+        paseoHome: root,
+        providerOverrides: {
+          [provider]: {
+            extends: "acp",
+            label: "Generic ACP test",
+            command: [launchPath],
+          },
+        },
+      });
+      try {
+        await writeFile(launchPath, '#!/bin/sh\nprintf probed > "$0.probed"\n', { mode: 0o700 });
+        await writeFile(updater, '#!/bin/sh\nprintf updated > "$1"\n', { mode: 0o700 });
+        const { installations } = manager;
+        const refresh = vi.spyOn(manager, "refreshSettingsSnapshot");
+        await expect(installations.inspect(provider)).resolves.toBeNull();
+        expect(() => installations.update(provider)).toThrow("using its original installer");
+
+        const planId = "acp-approved";
+        await writeFile(
+          path.join(root, LOCAL_UPDATER_PLANS_FILENAME),
+          formatApprovedProviderUpdaterPlansJson([
+            {
+              planId,
+              provider,
+              completion: "foreground",
+              launchPath,
+              launchIdentity: await localFileIdentity(launchPath),
+              updater: {
+                command: updater,
+                args: [updated],
+                identity: await localFileIdentity(updater),
+              },
+              evidence: [],
+            },
+          ]),
+          { mode: 0o600 },
+        );
+        await expect(installations.inspect(provider, { refresh: true })).resolves.toEqual({
+          approvedUpdatePlanId: planId,
+        });
+        expect(() => installations.update(provider)).toThrow("using its original installer");
+        await expectRefreshClearsFailedApproval(installations, provider, planId);
+        const completed = settled(installations, provider);
+        installations.update(provider, { planId });
+        await expect(completed).resolves.toMatchObject({
+          operation: { status: "succeeded", outcome: "unverified" },
+        });
+        await expect(readFile(updated, "utf8")).resolves.toBe("updated");
+        await expect(access(launchPath + ".probed")).rejects.toHaveProperty("code", "ENOENT");
+        expect(refresh).not.toHaveBeenCalled();
+      } finally {
+        await manager.shutdown();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!supportsHostApprovedProviderUpdates())(
+    "executes the exact local approval and refuses changes to the launch or approved arguments",
+    async () => {
+      const root = await realpath(await mkdtemp(path.join(tmpdir(), "paseo-host-updater-")));
+      try {
+        const command = path.join(root, "updater");
+        const updaterTarget = path.join(root, "updater-target");
+        const launchPath = path.join(root, "cli");
+        const launchTarget = path.join(root, "cli-target");
+        const log = path.join(root, "called");
+        await writeFile(
+          updaterTarget,
+          '#!/bin/sh\nprintf "%s" "$1" > "$2"\nprintf "%s" "$0" > "$2.path"\n' +
+            'printf "downloading %s\\n" "$1"\n' +
+            'printf "permission denied %s\\n" "arbitrary-stderr-value" >&2\n' +
+            'exit "$3"\n',
+          { mode: 0o755 },
+        );
+        await symlink(updaterTarget, command);
+        await writeFile(launchTarget, '#!/bin/sh\nprintf checked > "$0.probed"\n', { mode: 0o755 });
+        await symlink(launchTarget, launchPath);
+        const planId = "test-host-plan";
+        const writePlan = async (arg: string, exitCode = "0") =>
+          writeFile(
+            path.join(root, LOCAL_UPDATER_PLANS_FILENAME),
+            formatApprovedProviderUpdaterPlansJson([
+              {
+                planId,
+                provider: "codex",
+                completion: "foreground",
+                launchPath,
+                launchIdentity: await localFileIdentity(launchPath),
+                updater: {
+                  command,
+                  args: [arg, log, exitCode],
+                  identity: await localFileIdentity(command),
+                },
+                evidence: [],
+              },
+            ]),
+            { mode: 0o600 },
+          );
+        await writePlan("approved argument");
+        const activity = new InstallationActivity();
+        const nativeUpdate = vi.fn(async () => ({ status: "succeeded" as const }));
+        const refreshProvider = vi.fn(async () => {});
+        const getMaintenance = vi.fn(async () => ({
+          kind: nativeAvailable ? ("automatic" as const) : ("manual" as const),
+        }));
+        const resolveApprovedUpdateLaunch = vi.fn(async () => null);
+        let nativeAvailable = false;
+        let discoveryDeferred = false;
+        let configurationVersion = 0;
+        const client = builtinClient({
+          getMaintenance,
+          getActivityKeys: async () => ["file:verified-native"],
+          update: nativeUpdate,
+          resolveApprovedUpdateLaunch,
+        });
+        let selectedLaunch = launchPath;
+        let rewrite: Promise<void> | undefined;
+        const logs: string[] = [];
+        const installations = new ProviderInstallations({
+          logger: pino({ level: "trace" }, { write: (line) => logs.push(line) }),
+          resolveClient: () => client,
+          paseoHome: root,
+          activity,
+          refreshProvider,
+          isDiscoveryDeferred: () => discoveryDeferred,
+          configurationVersion: () => configurationVersion,
+          resolveApprovedUpdateLaunch: async (_provider, signal) => {
+            await rewrite;
+            signal.throwIfAborted();
+            return findInstallationLaunchPath(selectedLaunch, { cwd: root });
+          },
+        });
+        await expect(installations.inspect("codex")).resolves.toEqual({
+          maintenance: { kind: "manual" },
+          approvedUpdatePlanId: planId,
+        });
+        const ordinary = settled(installations);
+        installations.update("codex");
+        await expect(ordinary).resolves.toMatchObject({ operation: { status: "failed" } });
+
+        nativeAvailable = true;
+        const unknown = settled(installations);
+        installations.update("codex", { planId: "unknown-plan" });
+        await expect(unknown).resolves.toMatchObject({
+          operation: {
+            status: "failed",
+            message: "Paseo could not verify a local update plan for this installation.",
+          },
+        });
+        nativeAvailable = false;
+        await expect(access(log)).rejects.toHaveProperty("code", "ENOENT");
+
+        const release = activity.acquireAgent({
+          family: "other-provider",
+          keys: [`path:${launchPath}`],
+        });
+        const busy = settled(installations);
+        installations.update("codex", { planId });
+        await expect(busy).resolves.toMatchObject({
+          operation: {
+            status: "failed",
+            message:
+              "This installation is in use by a Paseo agent. Close its runtime before updating.",
+          },
+        });
+        release();
+        await expect(access(log)).rejects.toHaveProperty("code", "ENOENT");
+
+        const onFirstOutput = (change: () => void) =>
+          installations.observeUpdates("codex", (event) => {
+            if (
+              event.type === "provider.installation.update.progress" &&
+              event.payload.operation.status === "running" &&
+              event.payload.output.length > 0
+            ) {
+              change();
+            }
+          });
+        const stop = onFirstOutput(() => {
+          selectedLaunch = path.join(root, "other-cli");
+        });
+        const rejected = settled(installations);
+        const update = installations.update("codex", { planId });
+        expect(installations.update("codex", { planId }).operation.id).toBe(update.operation.id);
+        expect(() => installations.update("codex", { planId: "different-plan" })).toThrow(
+          "An update is already in progress",
+        );
+        expect(() => installations.update("codex")).toThrow("An update is already in progress");
+        await expect(rejected).resolves.toMatchObject({
+          operation: {
+            status: "failed",
+            message: "Paseo could not verify a local update plan for this installation.",
+          },
+        });
+        stop();
+        await expect(access(log)).rejects.toHaveProperty("code", "ENOENT");
+
+        selectedLaunch = launchPath;
+        const stopRewrite = onFirstOutput(() => {
+          rewrite = writePlan("replaced argument");
+        });
+        const changedPlan = settled(installations);
+        installations.update("codex", { planId });
+        await expect(changedPlan).resolves.toMatchObject({
+          operation: {
+            status: "failed",
+            message: "Paseo could not verify a local update plan for this installation.",
+          },
+        });
+        stopRewrite();
+        await expect(access(log)).rejects.toHaveProperty("code", "ENOENT");
+
+        await writePlan("approved argument");
+        discoveryDeferred = true;
+        getMaintenance.mockClear();
+        resolveApprovedUpdateLaunch.mockClear();
+        await expect(installations.inspect("codex")).resolves.toEqual({
+          approvedUpdatePlanId: planId,
+        });
+        await expect(installations.checkForUpdates("codex")).resolves.toBeNull();
+        expect(() => installations.update("codex")).toThrow("using its original installer");
+        expect(getMaintenance).not.toHaveBeenCalled();
+        expect(resolveApprovedUpdateLaunch).not.toHaveBeenCalled();
+
+        const stopConfigurationChange = onFirstOutput(() => {
+          configurationVersion += 1;
+        });
+        const stale = settled(installations);
+        installations.update("codex", { planId });
+        await expect(stale).resolves.toMatchObject({
+          operation: {
+            status: "failed",
+            message: "Provider configuration changed. Inspect the installation and retry.",
+          },
+        });
+        stopConfigurationChange();
+        await expect(access(log)).rejects.toHaveProperty("code", "ENOENT");
+
+        const emitted: ProviderUpdateEvent[] = [];
+        const stopObserving = installations.observeUpdates("codex", (event) => emitted.push(event));
+        const completed = settled(installations);
+        installations.update("codex", { planId });
+        await expect(completed).resolves.toMatchObject({
+          operation: { status: "succeeded", outcome: "unverified" },
+          output: [{ type: "message", text: fakeUpdatePhase }],
+        });
+        await expect(readFile(log, "utf8")).resolves.toBe("approved argument");
+        await expect(readFile(log + ".path", "utf8")).resolves.toBe(updaterTarget);
+
+        await writePlan("approved argument", "41");
+        const failed = settled(installations);
+        installations.update("codex", { planId });
+        await expect(failed).resolves.toMatchObject({
+          operation: { status: "failed", message: "The updater failed." },
+          output: [{ type: "message", text: fakeUpdatePhase }],
+        });
+        stopObserving();
+        expect(
+          emitted.flatMap((event) =>
+            event.type === "provider.installation.update.progress" ? event.payload.output : [],
+          ),
+        ).toEqual([
+          { type: "message", text: fakeUpdatePhase },
+          { type: "message", text: fakeUpdatePhase },
+        ]);
+        const observable = JSON.stringify([emitted, installations.getUpdate("codex"), logs]);
+        expect(observable).not.toContain("approved argument");
+        expect(observable).not.toContain("arbitrary-stderr-value");
+        await expect(access(launchPath + ".probed")).rejects.toHaveProperty("code", "ENOENT");
+        expect(refreshProvider).not.toHaveBeenCalled();
+        expect(resolveApprovedUpdateLaunch).not.toHaveBeenCalled();
+        expect(nativeUpdate).not.toHaveBeenCalled();
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!supportsHostApprovedProviderUpdates())(
+    "uses a host approval after the custom CLI form saves a deferred launcher",
+    async () => {
+      const root = await realpath(await mkdtemp(path.join(tmpdir(), "paseo-form-approval-")));
+      const logger = createTestLogger();
+      const manager = new ProviderSnapshotManager({ logger, paseoHome: root });
+      const store = new DaemonConfigStore(root, {
+        mcp: { injectIntoAgents: false },
+        browserTools: { enabled: false },
+        metadataGeneration: { providers: [] },
+        autoArchiveAfterMerge: false,
+        enableTerminalAgentHooks: false,
+        appendSystemPrompt: "",
+      });
+      const detach = attachMutableProviderConfigOwner({
+        store,
+        providerSnapshotManager: manager,
+        updateProviderRegistry: () => undefined,
+      });
+      try {
+        const launchPath = path.join(root, "custom-codex");
+        const updater = path.join(root, "updater");
+        const updated = path.join(root, "updated");
+        await copyFile(process.execPath, launchPath);
+        await chmod(launchPath, 0o700);
+        await writeFile(updater, '#!/bin/sh\nprintf updated > "$1"\n', { mode: 0o700 });
+        await writeFile(path.join(root, "config.json"), JSON.stringify({ version: 1 }));
+        const planId = "form-approved";
+        await writeFile(
+          path.join(root, LOCAL_UPDATER_PLANS_FILENAME),
+          formatApprovedProviderUpdaterPlansJson([
+            {
+              planId,
+              provider: "codex",
+              completion: "foreground",
+              launchPath,
+              launchIdentity: await localFileIdentity(launchPath),
+              updater: {
+                command: updater,
+                args: [updated],
+                identity: await localFileIdentity(updater),
+              },
+              evidence: [],
+            },
+          ]),
+          { mode: 0o600 },
+        );
+        await expect(
+          runCustomProviderCliOperation(
+            "save",
+            {
+              mode: "edit",
+              providerId: "codex",
+              command: [launchPath],
+              env: { PATH: "/usr/bin:/bin" },
+            },
+            {
+              configStore: store,
+              isRegisteredProvider: (id) => manager.hasProvider(id),
+              isPluginProvider: (id) => manager.isPluginProvider(id),
+            },
+          ),
+        ).resolves.toEqual({ status: "ok" });
+
+        const { installations } = manager;
+        expect(manager.isProviderDiscoveryDeferred("codex")).toBe(true);
+        await expect(installations.inspect("codex", { refresh: true })).resolves.toMatchObject({
+          approvedUpdatePlanId: planId,
+        });
+        await expect(installations.checkForUpdates("codex", { refresh: true })).resolves.toBeNull();
+        await expectRefreshClearsFailedApproval(installations, "codex", planId);
+        const completed = settled(installations);
+        installations.update("codex", { planId });
+        await expect(completed).resolves.toMatchObject({
+          operation: { status: "succeeded", outcome: "unverified" },
+        });
+        await expect(readFile(updated, "utf8")).resolves.toBe("updated");
+        expect(manager.isProviderDiscoveryDeferred("codex")).toBe(true);
+        await expect(installations.checkForUpdates("codex")).resolves.toBeNull();
+      } finally {
+        detach();
+        await manager.shutdown();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(!supportsHostApprovedProviderUpdates()).each([
+    ["codex", "claude"],
+    ["claude", "codex"],
+  ] as const)(
+    "serializes %s then %s across different launchers sharing one installation root",
+    async (first, second) => {
+      const root = await realpath(await mkdtemp(path.join(tmpdir(), "paseo-shared-update-root-")));
+      const release = path.join(root, "release");
+      const plans = path.join(root, LOCAL_UPDATER_PLANS_FILENAME);
+      const approvedLaunch = path.join(root, "approved-cli");
+      const managedLaunch = path.join(root, "managed-cli");
+      const approvedUpdater = path.join(root, "approved-updater");
+      const managedUpdater = path.join(root, "managed-updater");
+      const approvedMarker = path.join(root, "approved-started");
+      const managedMarker = path.join(root, "managed-started");
+      const planId = "approved-shared-root";
+      const updater =
+        '#!/bin/sh\nprintf started > "$1"\nwhile [ ! -f "$2" ]; do /bin/sleep 0.05; done\n';
+      const managed = {
+        ...builtinClient({
+          getMaintenance: automatic,
+          getActivityKeys: async () => [`root:${root}`, `path:${managedLaunch}`],
+          update: (context) =>
+            runUpdateCommand(
+              { command: managedUpdater, args: [managedMarker, release], env: {} },
+              context,
+            ),
+        }),
+        provider: "claude",
+      } satisfies AgentClient;
+      const approved = builtinClient({ resolveApprovedUpdateLaunch: async () => approvedLaunch });
+      const installations = new ProviderInstallations({
+        logger: createTestLogger(),
+        paseoHome: root,
+        resolveClient: (provider) => (provider === "codex" ? approved : managed),
+        resolveApprovedUpdateLaunch: async (provider) =>
+          provider === "codex" ? approvedLaunch : null,
+      });
+      const start = (provider: "codex" | "claude") =>
+        provider === "codex"
+          ? installations.update(provider, { planId })
+          : installations.update(provider);
+      const startedOrSettled = (provider: string) =>
+        new Promise<ProviderInstallationUpdateProgress>((resolve) => {
+          const stop = installations.observeUpdates(provider, (event) => {
+            if (event.type !== "provider.installation.update.progress") return;
+            if (event.payload.operation.status === "running" && event.payload.output.length === 0)
+              return;
+            stop();
+            resolve(event.payload);
+          });
+        });
+      try {
+        await Promise.all([
+          writeFile(approvedLaunch, "#!/bin/sh\n", { mode: 0o700 }),
+          writeFile(managedLaunch, "#!/bin/sh\n", { mode: 0o700 }),
+          writeFile(approvedUpdater, updater, { mode: 0o700 }),
+          writeFile(managedUpdater, updater, { mode: 0o700 }),
+        ]);
+        await writeFile(
+          plans,
+          formatApprovedProviderUpdaterPlansJson([
+            {
+              planId,
+              provider: "codex",
+              completion: "foreground",
+              launchPath: approvedLaunch,
+              launchIdentity: await localFileIdentity(approvedLaunch),
+              updater: {
+                command: approvedUpdater,
+                args: [approvedMarker, release],
+                identity: await localFileIdentity(approvedUpdater),
+              },
+              evidence: [],
+            },
+          ]),
+          { mode: 0o600 },
+        );
+        const firstReady = startedOrSettled(first);
+        const firstDone = settled(installations, first);
+        start(first);
+        await expect(firstReady).resolves.toMatchObject({ operation: { status: "running" } });
+
+        const secondReady = startedOrSettled(second);
+        start(second);
+        await expect(secondReady).resolves.toMatchObject({
+          operation: {
+            status: "failed",
+            message: "An update is already in progress for this installation.",
+          },
+        });
+        const secondMarker = second === "codex" ? approvedMarker : managedMarker;
+        await expect(access(secondMarker)).rejects.toHaveProperty("code", "ENOENT");
+        await writeFile(release, "");
+        await expect(firstDone).resolves.toMatchObject({ operation: { status: "succeeded" } });
+
+        const retry = settled(installations, second);
+        start(second);
+        await expect(retry).resolves.toMatchObject({ operation: { status: "succeeded" } });
+        await expect(readFile(secondMarker, "utf8")).resolves.toBe("started");
+      } finally {
+        await writeFile(release, "");
+        await installations.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "keeps an unpinned npm update manual and honors the verified native updater's lock",
+    async () => {
+      const root = await realpath(
+        await mkdtemp(path.join(tmpdir(), "paseo-approved-installation-")),
+      );
+      try {
+        const bin = path.join(root, "bin");
+        const modules = path.join(root, "lib/node_modules");
+        const npm = path.join(modules, "npm");
+        const cli = path.join(modules, "test-provider");
+        const manifest = path.join(cli, "package.json");
+        const launchPath = path.join(bin, "test-provider");
+        const log = path.join(root, "called");
+        const metadata = (version: string) =>
+          JSON.stringify({
+            name: "test-provider",
+            bin: { "test-provider": "cli" },
+            version,
+            _from: "test-provider",
+            _resolved: `https://registry.npmjs.org/test-provider/-/test-provider-${version}.tgz`,
+            _integrity: "sha512-YQ==",
+          });
+        await Promise.all(
+          [bin, path.join(npm, "bin"), cli].map((dir) => mkdir(dir, { recursive: true })),
+        );
+        await Promise.all([
+          writeFile(manifest, metadata("1.1.0")),
+          writeFile(path.join(cli, "cli"), "#!/bin/sh\n", { mode: 0o755 }),
+          writeFile(
+            path.join(npm, "package.json"),
+            JSON.stringify({ name: "npm", version: "6.0.0", bin: { npm: "bin/npm-cli.js" } }),
+          ),
+          writeFile(
+            path.join(npm, "bin/npm-cli.js"),
+            `#!/bin/sh\nprintf '%s' called > '${log}'\nprintf '%s' '${metadata("1.2.0")}' > '${manifest}'\n`,
+            { mode: 0o755 },
+          ),
+        ]);
+        await Promise.all([
+          symlink(path.join(cli, "cli"), launchPath),
+          symlink(path.join(npm, "bin/npm-cli.js"), path.join(bin, "npm")),
+        ]);
+        vi.stubEnv("PATH", `${bin}:/usr/bin:/bin`);
+        const activity = new InstallationActivity();
+        let nativeAvailable = false;
+        const nativeUpdate = vi.fn<NonNullable<AgentClientInstallation["update"]>>(
+          async (context) => {
+            context.assertCurrent?.();
+            return { status: "succeeded", outcome: "unverified" };
+          },
+        );
+        const client = builtinClient({
+          getMaintenance: async () => ({ kind: nativeAvailable ? "automatic" : "manual" }),
+          getActivityKeys: async () => [`root:${root}`],
+          update: nativeUpdate,
+          inspect: async () => ({ status: "installed", version: "1.1.0" }),
+          resolveApprovedUpdateLaunch: async () => launchPath,
+        });
+        const installations = new ProviderInstallations({
+          logger: createTestLogger(),
+          resolveClient: () => client,
+          activity,
+        });
+        await expect(installations.inspect("codex")).resolves.toEqual({
+          inspection: { status: "installed", version: "1.1.0" },
+          maintenance: { kind: "manual" },
+        });
+        expect(() => installations.update("codex", { planId: "unknown" })).toThrow(
+          "Paseo could not verify a local update plan",
+        );
+        const denied = settled(installations);
+        installations.update("codex");
+        await expect(denied).resolves.toMatchObject({ operation: { status: "failed" } });
+        await expect(access(log)).rejects.toHaveProperty("code", "ENOENT");
+        expect(nativeUpdate).not.toHaveBeenCalled();
+
+        nativeAvailable = true;
+        const release = activity.acquireAgent({
+          family: "second-provider",
+          keys: [`root:${root}`],
+        });
+        const blocked = settled(installations);
+        installations.update("codex");
+        await expect(blocked).resolves.toMatchObject({
+          operation: {
+            status: "failed",
+            message:
+              "This installation is in use by a Paseo agent. Close its runtime before updating.",
+          },
+        });
+        release();
+        await expect(access(log)).rejects.toHaveProperty("code", "ENOENT");
+
+        expect(nativeUpdate).not.toHaveBeenCalled();
+
+        const nativeCompleted = settled(installations);
+        installations.update("codex");
+        await expect(nativeCompleted).resolves.toMatchObject({
+          operation: { status: "succeeded", outcome: "unverified" },
+        });
+        expect(nativeUpdate).toHaveBeenCalledTimes(1);
+        await expect(access(log)).rejects.toHaveProperty("code", "ENOENT");
+      } finally {
+        vi.unstubAllEnvs();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("enforces fresh external maintenance at update time and retains the refusal", async () => {
     let external = false;
@@ -972,6 +1919,54 @@ describe("provider updates", () => {
     await expect(completed).resolves.toMatchObject({ operation: { status: "succeeded" } });
   });
 
+  test.skipIf(!supportsHostApprovedProviderUpdates())(
+    "agent sessions and self-managed children honor the same account approval lock",
+    async () => {
+      const cwd = fileLockFixture.directory;
+      const client = createTestAgentClient("pi");
+      const manager = new AgentManager({ clients: { pi: client }, logger: createTestLogger() });
+      const config = { cwd, provider: "pi", model: "test-model" };
+      const openAgent = () => manager.createAgent(config, undefined, {});
+      const spawnChild = vi.fn(() =>
+        spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd, stdio: "ignore" }),
+      );
+      const openChild = () =>
+        acquireInstallationProcess({ family: "self-managed", keys: [] }, spawnChild);
+
+      const releaseApproval = await acquireApprovedUpdateFileLock();
+      try {
+        await expect(openAgent()).rejects.toThrow("An approved provider update is in progress");
+        expect(openChild).toThrow("An approved provider update is in progress");
+        expect(spawnChild).not.toHaveBeenCalled();
+      } finally {
+        await releaseApproval();
+      }
+
+      const agent = await openAgent();
+      try {
+        await expect(acquireApprovedUpdateFileLock()).rejects.toThrow(
+          "Paseo agent activity is recorded for this account",
+        );
+      } finally {
+        await manager.closeAgent(agent.id);
+      }
+
+      const child = openChild();
+      const closed = once(child, "close");
+      try {
+        await expect(acquireApprovedUpdateFileLock()).rejects.toThrow(
+          "Paseo agent activity is recorded for this account",
+        );
+      } finally {
+        child.kill();
+        await closed;
+      }
+
+      const retry = await acquireApprovedUpdateFileLock();
+      await retry();
+    },
+  );
+
   test("streams fixed phases in order and never exposes raw output or callback results", async () => {
     const { installations, progress } = updating(async ({ report }) => {
       report({ type: "message", text: fakeCheckPhase });
@@ -1037,15 +2032,13 @@ describe("provider updates", () => {
   });
 
   test("a refresh drops a failed update and keeps a running one", async () => {
-    let finish!: () => void;
+    const finish = Promise.withResolvers<void>();
     let attempt = 0;
     const { installations } = updating(
       async () => {
         attempt += 1;
         if (attempt === 1) return { status: "failed", message: "EACCES" };
-        await new Promise<void>((resolve) => {
-          finish = resolve;
-        });
+        await finish.promise;
         return { status: "succeeded" };
       },
       { inspect: async () => ({ status: "installed", version: "1.0.0" }) },
@@ -1063,7 +2056,7 @@ describe("provider updates", () => {
     await installations.checkForUpdates("codex", { refresh: true });
     expect(installations.getUpdate("codex")?.operation.id).toBe(running.operation.id);
     const done = settled(installations);
-    finish();
+    finish.resolve();
     await done;
   });
 

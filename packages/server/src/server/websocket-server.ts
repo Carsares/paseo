@@ -56,6 +56,7 @@ import {
   type AgentManager,
   type AgentMetricsSnapshot,
 } from "./agent/agent-manager.js";
+import { supportsHostApprovedProviderUpdates } from "./agent/provider-installation/installation-target.js";
 import type { AgentStorage } from "./agent/agent-storage.js";
 import type { DownloadTokenStore } from "./file-download/token-store.js";
 import type { TerminalManager } from "../terminal/terminal-manager.js";
@@ -2399,6 +2400,8 @@ export class VoiceAssistantWebSocketServer {
         usageSources: true,
         providerInstallation: true,
         providerCustomCli: true,
+        providerCatalogPinUpdates: true,
+        providerApprovedUpdates: supportsHostApprovedProviderUpdates(),
         ownedSubscriptions: true,
         // COMPAT(agentHierarchyControl): added in v0.16.0, remove gate after 2027-05-19.
         agentHierarchyControl: true,

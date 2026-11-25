@@ -2196,6 +2196,26 @@ export const ProviderInstallationUpdateRequestMessageSchema = z.object({
   requestId: z.string(),
 });
 
+export const ProviderInstallationApprovedUpdateRequestMessageSchema = z.object({
+  type: z.literal("provider.installation.approved_update.request"),
+  provider: AgentProviderSchema,
+  planId: z.string().min(1).max(128),
+  requestId: z.string(),
+});
+
+const ProviderCatalogPinUpdateInputSchema = z.object({
+  provider: AgentProviderSchema,
+  expectedVersion: z.string().min(1).max(128),
+  version: z.string().min(1).max(128),
+});
+export type ProviderCatalogPinUpdateInput = z.infer<typeof ProviderCatalogPinUpdateInputSchema>;
+
+export const ProviderCatalogPinUpdateRequestMessageSchema = z.object({
+  type: z.literal("provider.catalog_pin.update.request"),
+  ...ProviderCatalogPinUpdateInputSchema.shape,
+  requestId: z.string(),
+});
+
 export const ProviderInstallationUpdateSubscribeRequestMessageSchema = z.object({
   type: z.literal("provider.installation.update.subscribe.request"),
   provider: AgentProviderSchema,
@@ -4671,6 +4691,8 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ProviderInstallationInspectRequestMessageSchema,
   ProviderInstallationCheckUpdatesRequestMessageSchema,
   ProviderInstallationUpdateRequestMessageSchema,
+  ProviderInstallationApprovedUpdateRequestMessageSchema,
+  ProviderCatalogPinUpdateRequestMessageSchema,
   ProviderInstallationUpdateSubscribeRequestMessageSchema,
   CustomProviderCliLocateRequestMessageSchema,
   CustomProviderCliTestRequestMessageSchema,
@@ -5059,6 +5081,10 @@ export const ServerInfoStatusPayloadSchema = z
         providerInstallation: z.boolean().optional(),
         // COMPAT(providerCustomCli): added in v0.17.0, remove gate after 2027-05-25.
         providerCustomCli: z.boolean().optional(),
+        // COMPAT(providerCatalogPinUpdates): added in v0.17.0, remove gate after 2027-05-25.
+        providerCatalogPinUpdates: z.boolean().optional(),
+        // COMPAT(providerApprovedUpdates): added in v0.17.0, remove gate after 2027-05-25.
+        providerApprovedUpdates: z.boolean().optional(),
         // COMPAT(providersSnapshotCwd): added in v0.3.2, remove gate after 2027-02-10.
         providersSnapshotCwd: z.boolean().optional(),
         // COMPAT(directorySync): added in v0.3.x, remove gate after 2027-02-12.
@@ -8441,6 +8467,8 @@ export const ProviderInstallationSchema = z.object({
   inspection: ProviderInstallationInspectionSchema.optional(),
   /** True when the provider can run its own update through `provider.installation.update`. */
   canUpdate: z.boolean().optional(),
+  /** An update plan registered by the host owner for this provider's current installation. */
+  approvedUpdatePlanId: z.string().optional(),
   maintenance: z
     .object({
       kind: z.enum(["automatic", "external", "manual"]),
@@ -8528,6 +8556,20 @@ export const ProviderInstallationUpdateResponseMessageSchema = z.object({
     update: ProviderInstallationUpdateSchema.nullable(),
     error: z.string().nullable(),
     requestId: z.string(),
+  }),
+});
+
+export const ProviderInstallationApprovedUpdateResponseMessageSchema = z.object({
+  type: z.literal("provider.installation.approved_update.response"),
+  payload: ProviderInstallationUpdateResponseMessageSchema.shape.payload,
+});
+
+export const ProviderCatalogPinUpdateResponseMessageSchema = z.object({
+  type: z.literal("provider.catalog_pin.update.response"),
+  payload: z.object({
+    provider: AgentProviderSchema,
+    requestId: z.string(),
+    status: z.enum(["updated", "conflict", "unsupported", "failed"]),
   }),
 });
 
@@ -9525,6 +9567,8 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ProviderInstallationInspectResponseMessageSchema,
   ProviderInstallationCheckUpdatesResponseMessageSchema,
   ProviderInstallationUpdateResponseMessageSchema,
+  ProviderInstallationApprovedUpdateResponseMessageSchema,
+  ProviderCatalogPinUpdateResponseMessageSchema,
   ProviderInstallationUpdateSubscribeResponseMessageSchema,
   ProviderInstallationUpdateProgressMessageSchema,
   ProviderInstallationUpdateClearedMessageSchema,

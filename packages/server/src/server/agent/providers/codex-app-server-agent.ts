@@ -8505,11 +8505,24 @@ export class CodexAppServerAgentClient implements AgentClient {
       });
       return compareWithLatestRelease({ installed: installedVersion, latest });
     },
-    // Both the standalone installer and the package-manager routes can start a shell.
     getMaintenance: async () => ({
       kind: "manual",
       message: CODEX_MANUAL_UPDATE,
     }),
+    resolveApprovedUpdateLaunch: async ({ signal }) => {
+      signal.throwIfAborted();
+      const launch = await resolveCodexLaunch(this.runtimeSettings);
+      if (
+        launch.source !== "override" ||
+        !path.isAbsolute(launch.command) ||
+        launch.args.length > 0
+      )
+        return null;
+      const env = buildCodexAppServerEnv(this.runtimeSettings);
+      const { resolvedPath } = await checkCodexLaunchAvailable(launch, env);
+      signal.throwIfAborted();
+      return resolvedPath;
+    },
     getActivityKeys: async (launch) => {
       const configured = await resolveCodexLaunch(this.runtimeSettings);
       const env = buildCodexAppServerEnv(this.runtimeSettings, launch?.env);

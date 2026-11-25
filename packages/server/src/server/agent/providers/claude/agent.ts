@@ -1674,6 +1674,20 @@ export class ClaudeAgentClient implements AgentClient {
       return compareWithLatestRelease({ installed: installedVersion, latest });
     },
     getMaintenance: async () => ({ kind: "manual", message: CLAUDE_MANUAL_UPDATE }),
+    resolveApprovedUpdateLaunch: async ({ signal }) => {
+      signal.throwIfAborted();
+      const configured = await resolveProviderLaunch({
+        commandConfig: this.runtimeSettings?.command,
+        defaultBinary: "claude",
+      });
+      if (!path.isAbsolute(configured.command) || configured.args.length > 0) return null;
+      const { resolvedPath } = await checkClaudeLaunchAvailable(
+        configured,
+        createProviderEnv({ runtimeSettings: this.runtimeSettings }),
+      );
+      signal.throwIfAborted();
+      return resolvedPath;
+    },
     update: async () => ({ status: "failed", message: CLAUDE_MANUAL_UPDATE }),
   };
 

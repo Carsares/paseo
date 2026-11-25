@@ -122,6 +122,7 @@ type ProviderSnapshotChangeListener = (transition: ProviderSnapshotTransition) =
 
 export interface ProviderSnapshotManagerOptions {
   logger: Logger;
+  paseoHome?: string;
   runtimeSettings?: AgentProviderRuntimeSettingsMap;
   providerOverrides?: Record<string, ProviderOverride>;
   workspaceGitService?: Pick<WorkspaceGitService, "resolveRepoRoot">;
@@ -406,6 +407,7 @@ export class ProviderSnapshotManager {
     for (const client of Object.values(this.providerClients)) this.ownedClients.add(client);
     this.installations = new ProviderInstallations({
       logger: options.logger.child({ module: "provider-installations" }),
+      paseoHome: options.paseoHome,
       activity: installationActivity,
       configurationVersion: (provider) => this.installationConfigVersions.get(provider) ?? 0,
       isDiscoveryDeferred: this.readDiscoveryDeferral,
@@ -413,6 +415,14 @@ export class ProviderSnapshotManager {
       resolveClient: (provider) => {
         const definition = this.generation.definitions[provider];
         return definition ? this.ensureClient(provider, definition) : null;
+      },
+      resolveApprovedUpdateLaunch: async (provider, signal) => {
+        const definition = this.generation.definitions[provider];
+        if (!definition?.enabled || this.isPluginProvider(provider)) return null;
+        const installation = this.ensureClient(provider, definition).installation;
+        const launch = await installation?.resolveApprovedUpdateLaunch?.({ signal });
+        if (this.generation.definitions[provider] !== definition) return null;
+        return launch ?? null;
       },
       resolveFamily: (provider) =>
         resolveAdapter({

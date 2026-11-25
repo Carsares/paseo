@@ -132,6 +132,7 @@ import {
   prepareCustomProviderCliDiscovery,
   runCustomProviderCliOperation,
 } from "./agent/custom-provider-cli.js";
+import { resolveFixedLauncherUpdate } from "./agent/provider-installation/fixed-launcher.js";
 import { releaseWorkspaceServicePortPlan } from "./workspace-service-port-registry.js";
 import { getErrorMessage, getErrorMessageOr } from "@getpaseo/protocol/error-utils";
 import { getAgentStatusPriority } from "@getpaseo/protocol/agent-state-bucket";
@@ -4257,7 +4258,10 @@ export class Session {
       case "provider.installation.check_updates.request":
         return this.providerCatalogSession.handleCheckProviderUpdatesRequest(msg);
       case "provider.installation.update.request":
+      case "provider.installation.approved_update.request":
         return this.providerCatalogSession.handleUpdateProviderRequest(msg);
+      case "provider.catalog_pin.update.request":
+        return this.handleProviderCatalogPinUpdate(msg);
       case "provider.custom_cli.locate.request":
         return this.handleCustomProviderCliRequest("locate", msg);
       case "provider.custom_cli.test.request":
@@ -4344,6 +4348,26 @@ export class Session {
     this.emit({
       type: `provider.custom_cli.${operation}.response`,
       payload: { requestId: msg.requestId, result },
+    });
+  }
+
+  private async handleProviderCatalogPinUpdate(
+    msg: Extract<SessionInboundMessage, { type: "provider.catalog_pin.update.request" }>,
+  ): Promise<void> {
+    const { provider, requestId, expectedVersion, version } = msg;
+    let status: "updated" | "conflict" | "unsupported" | "failed";
+    try {
+      status = await this.daemonConfigStore.patchProviderCatalogPin(provider, (command) =>
+        this.providerSnapshotManager.isPluginProvider(provider)
+          ? { status: "unsupported" }
+          : resolveFixedLauncherUpdate({ provider, command, expectedVersion, version }),
+      );
+    } catch {
+      status = "failed";
+    }
+    this.emit({
+      type: "provider.catalog_pin.update.response",
+      payload: { provider, requestId, status },
     });
   }
 

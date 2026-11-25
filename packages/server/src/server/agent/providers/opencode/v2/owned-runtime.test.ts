@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test, vi } from "vitest";
 import { createTestLogger } from "../../../../../test-utils/test-logger.js";
+import { installationActivity } from "../../../provider-installation/installation-activity.js";
 import { OpenCodeBridge } from "../bridge.js";
 import { V2Harness } from "../test-utils/v2-harness.js";
 import { provisionLocalBridge } from "./bridge-provisioning.js";
@@ -47,7 +48,7 @@ test("lists cached commands after an exit without acquiring a new v2 connection"
   }
 });
 
-test("an owned helper uses an installed bridge once and survives catalog refresh", async () => {
+test("an owned helper reuses its installed bridge and keeps the installation occupied while idle", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "paseo-owned-opencode-"));
   const config = path.join(root, "config", "opencode");
   const script = path.join(root, "server.cjs");
@@ -80,17 +81,29 @@ test("an owned helper uses an installed bridge once and survives catalog refresh
       env: { XDG_CONFIG_HOME: path.join(root, "config"), OPENCODE_CONFIG_CONTENT: "{}" },
     },
   });
+  const acquireUpdate = () => installationActivity.acquireUpdate({ family: "opencode", keys: [] });
+  const update = acquireUpdate();
+  vi.stubEnv("PASEO_HOME", root);
   try {
+    try {
+      await expect(runtime.acquire()).rejects.toThrow("installation is being updated");
+    } finally {
+      update.release();
+    }
     const first = await runtime.acquire();
     const pid = (await first.client.server.info()).pid;
     expect(JSON.parse(await readFile(record, "utf8"))).toEqual({});
     await first.release();
+    expect(acquireUpdate).toThrow("installation is in use");
     const refreshed = await runtime.acquire({ fresh: true });
     expect((await refreshed.client.server.info()).pid).toBe(pid);
     await refreshed.release();
+    await runtime.shutdown();
+    await vi.waitFor(() => acquireUpdate().release());
   } finally {
     await runtime.shutdown();
     await bridge.close();
+    vi.unstubAllEnvs();
     await rm(root, { recursive: true, force: true });
   }
 }, 15_000);

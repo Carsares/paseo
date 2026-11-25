@@ -1,4 +1,8 @@
 import type { ChildProcess } from "node:child_process";
+import {
+  acquireProviderAgentFileTicket,
+  supportsHostApprovedProviderUpdates,
+} from "./installation-target.js";
 
 interface ActivityScope {
   family: string;
@@ -22,6 +26,8 @@ function conflicts(left: ActivityScope, right: ActivityScope): boolean {
 export class InstallationActivity {
   private readonly agents = new Set<{ scope: ActivityScope }>();
   private readonly updates = new Set<{ scope: ActivityScope }>();
+
+  constructor(private readonly acquireAgentFileTicket?: () => (() => void) | undefined) {}
 
   acquireUpdate(scope: ActivityScope): ActivityLease {
     if ([...this.agents].some((agent) => conflicts(agent.scope, scope))) {
@@ -51,14 +57,19 @@ export class InstallationActivity {
         "This installation is being updated. Try opening the agent again after the update.",
       );
     }
+    const releaseFileTicket = this.acquireAgentFileTicket?.();
     const agent = { scope };
     this.agents.add(agent);
-    return () => this.agents.delete(agent);
+    return () => {
+      if (this.agents.delete(agent)) releaseFileTicket?.();
+    };
   }
 }
 
 /** One coordinator for all provider clients and their runtime processes in this daemon. */
-export const installationActivity = new InstallationActivity();
+export const installationActivity = new InstallationActivity(() =>
+  supportsHostApprovedProviderUpdates() ? acquireProviderAgentFileTicket() : undefined,
+);
 
 /** Transfer a synchronous admission check to the lifetime of the actual child. */
 export function acquireInstallationProcess<T extends ChildProcess>(

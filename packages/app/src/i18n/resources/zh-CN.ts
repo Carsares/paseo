@@ -3418,6 +3418,21 @@ export const zhCN: TranslationResources = {
         updateUnverified: "更新已结束，版本未确认",
         installInstructions: "安装说明",
       },
+      catalogPin: {
+        sectionTitle: "目录启动器版本",
+        rowTitle: "固定版本",
+        rowHint: "当前 {{current}} -> {{target}}。仅更新已保存的启动命令，不会立即下载。",
+        updateAction: "更新版本",
+        updatingAction: "正在更新...",
+        confirmTitle: "更新 {{name}} 的固定版本？",
+        confirmMessage:
+          "将已保存的启动器固定版本从 {{current}} 更新为 {{target}}？其余命令参数保持不变，新版本只会在下次启动提供方时获取。",
+        confirmAction: "更新版本",
+        updatedToast: "已将启动器固定版本更新为 {{version}}",
+        conflictError: "此主机上的已保存启动器版本已变更，请刷新并确认后重试。",
+        unsupportedError: "此主机不支持更新该提供方命令的目录固定版本。",
+        failedError: "无法更新目录启动器固定版本。",
+      },
       diagnostic: {
         title: "诊断",
         button: "诊断",

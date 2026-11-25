@@ -160,6 +160,7 @@ export class CopilotACPAgentClient extends ACPAgentClient {
     this.installation = createCliInstallation({
       name: "Copilot",
       defaultBinary: "copilot",
+      allowApprovedUpdate: true,
       runtimeSettings: options.runtimeSettings,
       installUrl: COPILOT_INSTALL_URL,
       updateUrl: COPILOT_UPDATE_URL,
