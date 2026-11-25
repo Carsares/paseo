@@ -97,6 +97,8 @@ export const SidebarWorkspaceRowContent = memo(function SidebarWorkspaceRowConte
   hostBadge,
   leadingProjectName = null,
   leadingProjectIconDataUri = null,
+  forceShowProject = false,
+  pendingApprovalLabel = null,
   serviceSummary = null,
   backdrop,
   isHovered,
@@ -113,6 +115,8 @@ export const SidebarWorkspaceRowContent = memo(function SidebarWorkspaceRowConte
   /** Hoisted rows use their project icon as the leading visual because no project row contains them. */
   leadingProjectName?: string | null;
   leadingProjectIconDataUri?: string | null;
+  forceShowProject?: boolean;
+  pendingApprovalLabel?: string | null;
   serviceSummary?: WorkspaceServiceSummary | null;
   /** The row's current background, so the project status badge can knock out of it. */
   backdrop: SidebarSurfaceBackdrop;
@@ -183,6 +187,8 @@ export const SidebarWorkspaceRowContent = memo(function SidebarWorkspaceRowConte
             backdrop={backdrop}
             currentBranch={workspace.currentBranch}
             projectName={leadingProjectName}
+            forceShowProject={forceShowProject}
+            pendingApprovalLabel={pendingApprovalLabel}
             hostBadge={hostBadge ?? null}
             prHint={workspace.prHint}
             serviceSummary={serviceSummary}

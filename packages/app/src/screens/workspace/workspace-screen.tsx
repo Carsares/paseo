@@ -250,11 +250,15 @@ import {
   type GitGraphNavigationIntentStore,
 } from "@/screens/workspace/topic-header";
 import {
+  createTeamMessageJumpStore,
   selectWorkspaceTeamSummary,
   TeamDirectoryShellProvider,
+  TeamMessageJumpProvider,
   WorkspaceTeamDirectory,
   type TeamDirectoryMemberNode,
+  type TeamMessageJumpStore,
 } from "@/subagents/team-directory";
+import { useTeamDirectoryViewStore } from "@/stores/team-directory-view-store";
 import { useContainerWidthBelow } from "@/hooks/use-container-width";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import { navigateToAgent } from "@/utils/navigate-to-agent";
@@ -778,6 +782,7 @@ function useWorkspaceTeamDirectoryActions(input: {
         );
         return;
       }
+      useTeamDirectoryViewStore.getState().setActiveTab("messages");
       showTeamDirectory();
     },
     [lastMainPaneId, openWorkspaceTabFocused, persistenceKey, showTeamDirectory],
@@ -932,6 +937,7 @@ function WorkspaceShellProviders({
   sheetPaneHost,
   mainTabContext,
   teamDirectoryShellValue,
+  teamMessageJumpStore,
   gitGraphIntentStore,
   workspaceDescriptor,
   client,
@@ -945,6 +951,7 @@ function WorkspaceShellProviders({
   sheetPaneHost: Parameters<typeof WorkspaceContentProviders>[0]["sheetPaneHost"];
   mainTabContext: Parameters<typeof WorkspaceContentProviders>[0]["mainTab"];
   teamDirectoryShellValue: Parameters<typeof TeamDirectoryShellProvider>[0]["value"];
+  teamMessageJumpStore: TeamMessageJumpStore;
   gitGraphIntentStore: GitGraphNavigationIntentStore;
   workspaceDescriptor: WorkspaceDescriptor | null;
   client: ReturnType<typeof useHostRuntimeClient>;
@@ -962,18 +969,20 @@ function WorkspaceShellProviders({
       mainTab={mainTabContext}
     >
       <TeamDirectoryShellProvider value={teamDirectoryShellValue}>
-        <GitGraphNavigationIntentProvider store={gitGraphIntentStore}>
-          <WorkspaceMarkdownLinks
-            workspace={workspaceDescriptor}
-            client={client}
-            serverId={serverId}
-            workspaceRoot={workspaceDirectory ?? undefined}
-            onOpenWorkspaceFile={openMarkdownPath}
-            toast={toast}
-          >
-            {children}
-          </WorkspaceMarkdownLinks>
-        </GitGraphNavigationIntentProvider>
+        <TeamMessageJumpProvider store={teamMessageJumpStore}>
+          <GitGraphNavigationIntentProvider store={gitGraphIntentStore}>
+            <WorkspaceMarkdownLinks
+              workspace={workspaceDescriptor}
+              client={client}
+              serverId={serverId}
+              workspaceRoot={workspaceDirectory ?? undefined}
+              onOpenWorkspaceFile={openMarkdownPath}
+              toast={toast}
+            >
+              {children}
+            </WorkspaceMarkdownLinks>
+          </GitGraphNavigationIntentProvider>
+        </TeamMessageJumpProvider>
       </TeamDirectoryShellProvider>
     </WorkspaceContentProviders>
   );
@@ -4088,15 +4097,18 @@ function WorkspaceScreenContent({
     onAsk: askFirstTopicQuestion,
   });
   const [gitGraphIntentStore] = useState(createGitGraphNavigationIntentStore);
+  const [teamMessageJumpStore] = useState(createTeamMessageJumpStore);
   useEffect(() => {
     if (persistenceKey === null) {
       gitGraphIntentStore.clear();
+      teamMessageJumpStore.clear();
       return;
     }
     return () => {
       gitGraphIntentStore.clear();
+      teamMessageJumpStore.clear();
     };
-  }, [gitGraphIntentStore, persistenceKey]);
+  }, [gitGraphIntentStore, persistenceKey, teamMessageJumpStore]);
   const {
     handleOpenGitGraph,
     handleFocusAttentionAgent,
@@ -4997,6 +5009,7 @@ function WorkspaceScreenContent({
           sheetPaneHost={sheetPaneHost}
           mainTabContext={mainTabContext}
           teamDirectoryShellValue={teamDirectoryShellValue}
+          teamMessageJumpStore={teamMessageJumpStore}
           gitGraphIntentStore={gitGraphIntentStore}
           workspaceDescriptor={workspaceDescriptor}
           client={client}

@@ -6,7 +6,26 @@ import { z } from "zod";
 import { workspaceLabelKey } from "@getpaseo/protocol/workspace-labels";
 import { createValidatedPersistStorage } from "@/storage/validated-persist-storage";
 
-export type SidebarGroupMode = "project" | "status";
+export type SidebarGroupMode = "topic" | "project" | "status";
+
+export function resolveEffectiveSidebarGroupMode(input: {
+  groupMode: SidebarGroupMode;
+  hasExplicitGroupMode?: boolean;
+  supportsTopicWorkbench: boolean;
+  hasAnyTopicWorkspace: boolean;
+}): SidebarGroupMode {
+  const topicAvailable = input.supportsTopicWorkbench || input.hasAnyTopicWorkspace;
+  if (input.groupMode === "status") {
+    return "status";
+  }
+  if (!input.hasExplicitGroupMode) {
+    return topicAvailable ? "topic" : "project";
+  }
+  if (input.groupMode === "topic" && !topicAvailable) {
+    return "project";
+  }
+  return input.groupMode;
+}
 
 const SIDEBAR_VIEW_STORAGE_KEY = "sidebar-view";
 const LEGACY_SIDEBAR_GROUP_MODE_STORAGE_KEY = "sidebar-group-mode";
@@ -48,6 +67,7 @@ function toggleFilterEntry(list: readonly string[], key: string): string[] {
 
 interface SidebarViewStoreState {
   groupMode: SidebarGroupMode;
+  hasExplicitGroupMode?: boolean;
   workspaceSort: WorkspaceSort;
   showBackground: boolean;
   // Empty means "all hosts". A non-empty list pins the sidebar to those hosts.
@@ -80,6 +100,7 @@ interface SidebarViewStoreState {
 
 interface SidebarViewPersistedState {
   groupMode: SidebarGroupMode;
+  hasExplicitGroupMode?: boolean;
   workspaceSort: WorkspaceSort;
   showBackground: boolean;
   hostFilters: string[];
@@ -87,7 +108,7 @@ interface SidebarViewPersistedState {
   labelFilter: SidebarLabelFilter;
 }
 
-const PersistedSidebarGroupModeSchema = z.enum(["project", "status", "label"]);
+const PersistedSidebarGroupModeSchema = z.enum(["topic", "project", "status", "label"]);
 const SidebarLabelFilterSchema = z.object({
   labels: z.array(z.string()),
 });
@@ -95,6 +116,7 @@ const SidebarViewPersistedStateSchema = z.strictObject({
   workspaceSort: z.enum(["manual", "created", "lastPrompt"]).optional(),
   showBackground: z.boolean().optional(),
   groupMode: PersistedSidebarGroupModeSchema.optional(),
+  hasExplicitGroupMode: z.boolean().optional(),
   hostFilters: z.array(z.string()).optional(),
   hostFilter: z.string().nullable().optional(),
   projectFilters: z.array(z.string()).optional(),
@@ -154,9 +176,17 @@ export function migrateSidebarViewState(persistedState: unknown): SidebarViewPer
     };
   }
 
+  let migratedGroupMode: SidebarGroupMode = "project";
+  if (state.groupMode === "topic") {
+    migratedGroupMode = "topic";
+  } else if (state.groupMode === "status") {
+    migratedGroupMode = "status";
+  }
+
   return {
     showBackground: state.showBackground ?? false,
-    groupMode: state.groupMode === "status" ? "status" : "project",
+    groupMode: migratedGroupMode,
+    ...(state.hasExplicitGroupMode ? { hasExplicitGroupMode: true } : {}),
     workspaceSort: state.workspaceSort ?? "created",
     hostFilters: readHostFilters(state),
     projectFilters: state.projectFilters ?? [],
@@ -196,12 +226,13 @@ export const useSidebarViewStore = create<SidebarViewStoreState>()(
     (set) => ({
       showBackground: false,
       groupMode: "project",
+      hasExplicitGroupMode: false,
       workspaceSort: "created",
       hostFilters: [],
       projectFilters: [],
       labelFilter: emptyLabelFilter(),
       toggleBackground: () => set((state) => ({ showBackground: !state.showBackground })),
-      setGroupMode: (mode) => set({ groupMode: mode }),
+      setGroupMode: (mode) => set({ groupMode: mode, hasExplicitGroupMode: true }),
       setWorkspaceSort: (workspaceSort) => set({ workspaceSort }),
       toggleHostFilter: (serverId) =>
         set((state) => ({ hostFilters: toggleFilterEntry(state.hostFilters, serverId) })),
@@ -253,6 +284,7 @@ export const useSidebarViewStore = create<SidebarViewStoreState>()(
       partialize: (state) => ({
         showBackground: state.showBackground ?? false,
         groupMode: state.groupMode,
+        ...(state.hasExplicitGroupMode ? { hasExplicitGroupMode: true } : {}),
         workspaceSort: state.workspaceSort,
         hostFilters: state.hostFilters,
         projectFilters: state.projectFilters,

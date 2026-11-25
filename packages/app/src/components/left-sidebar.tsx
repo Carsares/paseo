@@ -4,10 +4,12 @@ import {
   CircleGauge,
   FolderPlus,
   GitBranch,
+  Plus,
   Server,
   Settings,
   type LucideIcon,
 } from "lucide-react-native";
+import { router, type Href } from "expo-router";
 import { useTranslation } from "react-i18next";
 import {
   memo,
@@ -36,7 +38,7 @@ import {
 import Animated, { runOnJS, useAnimatedStyle, useSharedValue } from "react-native-reanimated";
 import { scheduleOnRN } from "react-native-worklets";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { StyleSheet, useUnistyles } from "react-native-unistyles";
+import { StyleSheet, useUnistyles, withUnistyles } from "react-native-unistyles";
 import {
   TitlebarDragRegion,
   WINDOW_CONTENT_DATASET,
@@ -89,7 +91,9 @@ import { SPACING } from "@/styles/theme";
 import { useSidebarModel } from "@/components/sidebar/sidebar-model";
 import type { PinnedSidebarGroups } from "@/hooks/use-sidebar-pins";
 import { RetainedPanelActivity } from "@/components/retained-panel";
+import { PressHighlight } from "@/components/ui/press-highlight";
 import type { SidebarWorkspaceGroup } from "@/components/sidebar/sidebar-labels";
+import type { TopicWorkspaceFacts } from "@/components/sidebar/sidebar-topic-view-model";
 import type { SidebarProjectIconTarget } from "@/utils/sidebar-project-row-model";
 import { type SidebarGroupMode, useSidebarViewStore } from "@/stores/sidebar-view-store";
 import { useHosts } from "@/runtime/host-runtime";
@@ -101,7 +105,7 @@ import { useOwnsWindowChromeCorner, WindowChromeSafeArea } from "@/utils/desktop
 import { useCloseAgentListGesture } from "@/mobile-panels/gestures";
 import { useLeftPanelWidth } from "@/mobile-panels/provider";
 import { MobilePanelOverlay } from "@/mobile-panels/presentation";
-import { buildSettingsHostSectionRoute } from "@/utils/host-routes";
+import { buildNewWorkspaceRoute, buildSettingsHostSectionRoute } from "@/utils/host-routes";
 import { useActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
 import { openSettingsFromSidebar } from "@/navigation/settings-navigation";
 import { UsageSidebarItem, UsageSidebarRoot, useUsageSummary, useOpenSidebarUsage } from "@/usage";
@@ -124,6 +128,10 @@ interface SidebarSharedProps {
   projects: SidebarProjectEntry[];
   hasProjectsBeforeFilter: boolean;
   hasActiveProjectFilter: boolean;
+  hasAnyTopicsBeforeFilter: boolean;
+  hiddenNonTopicCount: number;
+  hasMultipleTopicProjects: boolean;
+  topicFactsByWorkspaceKey: ReadonlyMap<string, TopicWorkspaceFacts>;
   workspaceEntriesByKey: ReadonlyMap<string, SidebarWorkspaceEntry>;
   isInitialLoad: boolean;
   isRevalidating: boolean;
@@ -134,6 +142,7 @@ interface SidebarSharedProps {
   toggleProjectCollapsed: (projectViewKey: string) => void;
   handleRefresh: () => void;
   handleOpenProject: () => void;
+  handleCreateTopic: () => void;
   handleImportSession: () => void;
   handleSettings: () => void;
   labels: SidebarLabels;
@@ -179,7 +188,12 @@ export const LeftSidebar = memo(function LeftSidebar({
 
   const {
     projects,
+    allProjects,
     hasProjectsBeforeFilter,
+    hasAnyTopicsBeforeFilter,
+    hiddenNonTopicCount,
+    hasMultipleTopicProjects,
+    topicFactsByWorkspaceKey,
     resolvedProjectFilters,
     workspaceEntriesByKey,
     isInitialLoad,
@@ -215,6 +229,13 @@ export const LeftSidebar = memo(function LeftSidebar({
   const handleOpenProject = useCallback(() => {
     void openProjectPicker();
   }, [openProjectPicker]);
+
+  const handleCreateTopic = useCallback(() => {
+    if (isCompactLayout) {
+      showMobileAgent();
+    }
+    router.navigate(buildNewTopicHref(allProjects, resolvedProjectFilters));
+  }, [allProjects, isCompactLayout, resolvedProjectFilters, showMobileAgent]);
 
   const handleSettings = useCallback(() => {
     openSettingsFromSidebar({ workspace: activeWorkspace, isCompact: isCompactLayout });
@@ -253,6 +274,10 @@ export const LeftSidebar = memo(function LeftSidebar({
     projects,
     hasProjectsBeforeFilter,
     hasActiveProjectFilter: resolvedProjectFilters.length > 0,
+    hasAnyTopicsBeforeFilter,
+    hiddenNonTopicCount,
+    hasMultipleTopicProjects,
+    topicFactsByWorkspaceKey,
     workspaceEntriesByKey,
     isInitialLoad,
     isRevalidating,
@@ -267,6 +292,7 @@ export const LeftSidebar = memo(function LeftSidebar({
 
   const handlers = {
     handleOpenProject,
+    handleCreateTopic,
     handleImportSession: openImportSession,
     handleSettings,
     handleAddHost,
@@ -582,6 +608,10 @@ function MobileSidebar({
   projects,
   hasProjectsBeforeFilter,
   hasActiveProjectFilter,
+  hasAnyTopicsBeforeFilter,
+  hiddenNonTopicCount,
+  hasMultipleTopicProjects,
+  topicFactsByWorkspaceKey,
   workspaceEntriesByKey,
   isInitialLoad,
   isRevalidating,
@@ -592,6 +622,7 @@ function MobileSidebar({
   toggleProjectCollapsed,
   handleRefresh,
   handleOpenProject,
+  handleCreateTopic,
   handleImportSession,
   handleSettings,
   labels,
@@ -665,11 +696,16 @@ function MobileSidebar({
                 projects={projects}
                 hasProjectsBeforeFilter={hasProjectsBeforeFilter}
                 hasActiveProjectFilter={hasActiveProjectFilter}
+                hasAnyTopicsBeforeFilter={hasAnyTopicsBeforeFilter}
+                hiddenNonTopicCount={hiddenNonTopicCount}
+                hasMultipleTopicProjects={hasMultipleTopicProjects}
+                topicFactsByWorkspaceKey={topicFactsByWorkspaceKey}
                 workspaceEntriesByKey={workspaceEntriesByKey}
                 isRefreshing={isManualRefresh && isRevalidating}
                 onRefresh={handleRefresh}
                 onWorkspacePress={handleWorkspacePress}
                 onAddProject={handleOpenProject}
+                onCreateTopic={handleCreateTopic}
                 onImportSession={handleImportSession}
                 parentGestureRef={closeGestureRef}
                 dragGestureHostActive={active}
@@ -741,6 +777,10 @@ function DesktopSidebar({
   projects,
   hasProjectsBeforeFilter,
   hasActiveProjectFilter,
+  hasAnyTopicsBeforeFilter,
+  hiddenNonTopicCount,
+  hasMultipleTopicProjects,
+  topicFactsByWorkspaceKey,
   workspaceEntriesByKey,
   isInitialLoad,
   isRevalidating,
@@ -751,6 +791,7 @@ function DesktopSidebar({
   toggleProjectCollapsed,
   handleRefresh,
   handleOpenProject,
+  handleCreateTopic,
   handleImportSession,
   handleSettings,
   labels,
@@ -920,10 +961,15 @@ function DesktopSidebar({
                   projects={projects}
                   hasProjectsBeforeFilter={hasProjectsBeforeFilter}
                   hasActiveProjectFilter={hasActiveProjectFilter}
+                  hasAnyTopicsBeforeFilter={hasAnyTopicsBeforeFilter}
+                  hiddenNonTopicCount={hiddenNonTopicCount}
+                  hasMultipleTopicProjects={hasMultipleTopicProjects}
+                  topicFactsByWorkspaceKey={topicFactsByWorkspaceKey}
                   workspaceEntriesByKey={workspaceEntriesByKey}
                   isRefreshing={isManualRefresh && isRevalidating}
                   onRefresh={handleRefresh}
                   onAddProject={handleOpenProject}
+                  onCreateTopic={handleCreateTopic}
                   onImportSession={handleImportSession}
                   onWorkspacePress={closeSidebar}
                   parentGestureRef={closeGestureRef}
@@ -959,19 +1005,81 @@ function DesktopSidebar({
   );
 }
 
+const ThemedHeaderPlus = withUnistyles(Plus, (theme) => ({
+  color: theme.colors.foregroundMuted,
+}));
+
+function buildNewTopicHref(
+  allProjects: ReturnType<typeof useSidebarModel>["allProjects"],
+  resolvedProjectFilters: readonly string[],
+): Href {
+  let candidateProject = null;
+  if (resolvedProjectFilters.length === 1) {
+    candidateProject =
+      allProjects.find((project) => project.viewKey === resolvedProjectFilters[0]) ?? null;
+  } else if (allProjects.length === 1) {
+    candidateProject = allProjects[0] ?? null;
+  }
+  const hostTarget = candidateProject?.hosts[0];
+  return buildNewWorkspaceRoute(
+    hostTarget && candidateProject
+      ? {
+          serverId: hostTarget.serverId,
+          sourceDirectory: hostTarget.iconWorkingDir,
+          displayName: candidateProject.projectName,
+          projectId: hostTarget.projectId,
+        }
+      : {},
+  ) as Href;
+}
+
 function WorkspacesSectionHeader() {
+  const { t } = useTranslation();
+  const isCompactLayout = useIsCompactFormFactor();
+  const showMobileAgent = usePanelStore((state) => state.showMobileAgent);
+  const { groupMode, allProjects, resolvedProjectFilters } = useSidebarModel();
+  const isTopicMode = groupMode === "topic";
+
+  const handleCreateTopic = useCallback(() => {
+    if (isCompactLayout) {
+      showMobileAgent();
+    }
+    router.navigate(buildNewTopicHref(allProjects, resolvedProjectFilters));
+  }, [allProjects, isCompactLayout, resolvedProjectFilters, showMobileAgent]);
+
   return (
-    <SidebarSectionHeader title="Workspaces">
-      <Tooltip delayDuration={300}>
-        <TooltipTrigger asChild>
-          <View>
-            <SidebarDisplayPreferencesMenu />
-          </View>
-        </TooltipTrigger>
-        <TooltipContent side="bottom" align="center" offset={8}>
-          <IconTooltipContent label="Display preferences" />
-        </TooltipContent>
-      </Tooltip>
+    <SidebarSectionHeader title={isTopicMode ? t("topicWorkbench.sidebar.title") : "Workspaces"}>
+      <View style={styles.sectionHeaderActions}>
+        {isTopicMode ? (
+          <Tooltip delayDuration={300}>
+            <TooltipTrigger asChild>
+              <PressHighlight
+                accessibilityRole="button"
+                accessibilityLabel={t("topicWorkbench.sidebar.newTopic")}
+                onPress={handleCreateTopic}
+                style={styles.sectionHeaderIconButton}
+                highlightStyle={styles.sectionHeaderIconButtonHovered}
+                testID="sidebar-new-topic-button"
+              >
+                <ThemedHeaderPlus size={14} />
+              </PressHighlight>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" align="center" offset={8}>
+              <IconTooltipContent label={t("topicWorkbench.sidebar.newTopic")} />
+            </TooltipContent>
+          </Tooltip>
+        ) : null}
+        <Tooltip delayDuration={300}>
+          <TooltipTrigger asChild>
+            <View>
+              <SidebarDisplayPreferencesMenu />
+            </View>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" align="center" offset={8}>
+            <IconTooltipContent label="Display preferences" />
+          </TooltipContent>
+        </Tooltip>
+      </View>
     </SidebarSectionHeader>
   );
 }
@@ -1093,5 +1201,20 @@ const styles = StyleSheet.create((theme) => ({
   tooltipText: {
     fontSize: theme.fontSize.base,
     color: theme.colors.popoverForeground,
+  },
+  sectionHeaderActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[0.5],
+  },
+  sectionHeaderIconButton: {
+    width: 24,
+    height: 24,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: theme.borderRadius.md,
+  },
+  sectionHeaderIconButtonHovered: {
+    backgroundColor: theme.colors.surfaceSidebarHover,
   },
 }));

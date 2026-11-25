@@ -144,13 +144,13 @@ class WorkspaceStatus {
     );
   }
 
-  hasDelegatedAgent(input: AgentState): void {
+  hasDelegatedAgent(input: AgentState & { parentAgentId?: string; updatedAt?: string }): void {
     this.agents.push(
       createAgent({
         ...input,
         cwd: this.workspace.cwd,
         workspaceId: this.workspace.workspaceId,
-        labels: { [PARENT_AGENT_ID_LABEL]: "parent-agent" },
+        labels: { [PARENT_AGENT_ID_LABEL]: input.parentAgentId ?? "parent-agent" },
       }),
     );
   }
@@ -269,6 +269,7 @@ class WorkspaceStatus {
 interface AgentState {
   id: string;
   status: AgentSnapshotPayload["status"];
+  updatedAt?: string;
   lastUserMessageAt?: string | null;
   archivedAt?: string | null;
   pendingPermissionCount?: number;
@@ -292,7 +293,7 @@ function createAgent(
     thinkingOptionId: null,
     effectiveThinkingOptionId: null,
     createdAt: NOW,
-    updatedAt: NOW,
+    updatedAt: input.updatedAt ?? NOW,
     lastUserMessageAt: input.lastUserMessageAt ?? null,
     status: input.status,
     backgroundWork: input.backgroundWork,
@@ -467,6 +468,67 @@ describe("WorkspaceDirectory", () => {
     workspace.hasDelegatedAgent({ id: "child-agent", status: "running" });
 
     await expect(workspace.workspaceStatus()).resolves.toBe("running");
+  });
+
+  test("same-workspace subagent pending permission bubbles needs_input to its parent workspace", async () => {
+    const workspace = new WorkspaceStatus();
+
+    workspace.hasRootAgent({ id: "parent-agent", status: "idle" });
+    workspace.hasDelegatedAgent({
+      id: "child-agent",
+      status: "idle",
+      pendingPermissionCount: 1,
+      updatedAt: "2026-03-01T12:04:00.000Z",
+    });
+
+    await expect(workspace.workspaceDescriptor()).resolves.toMatchObject({
+      status: "needs_input",
+      statusEnteredAt: "2026-03-01T12:04:00.000Z",
+    });
+  });
+
+  test("nested L2 same-workspace subagent pending permission bubbles needs_input over running parent", async () => {
+    const workspace = new WorkspaceStatus();
+
+    workspace.hasRootAgent({ id: "parent-agent", status: "running" });
+    workspace.hasDelegatedAgent({
+      id: "l1-agent",
+      parentAgentId: "parent-agent",
+      status: "running",
+    });
+    workspace.hasDelegatedAgent({
+      id: "l2-agent",
+      parentAgentId: "l1-agent",
+      status: "idle",
+      pendingPermissionCount: 1,
+      updatedAt: "2026-03-01T12:06:00.000Z",
+    });
+    workspace.hasDelegatedAgent({
+      id: "l1-errored",
+      parentAgentId: "parent-agent",
+      status: "error",
+      requiresAttention: true,
+      attentionReason: "error",
+    });
+
+    await expect(workspace.workspaceDescriptor()).resolves.toMatchObject({
+      status: "needs_input",
+      statusEnteredAt: "2026-03-01T12:06:00.000Z",
+    });
+  });
+
+  test("background same-workspace subagent pending permission does not move workspace status", async () => {
+    const workspace = new WorkspaceStatus();
+
+    workspace.hasRootAgent({ id: "parent-agent", status: "idle" });
+    workspace.hasDelegatedAgent({
+      id: "bg-child",
+      status: "idle",
+      pendingPermissionCount: 1,
+      background: true,
+    });
+
+    await expect(workspace.workspaceStatus()).resolves.toBe("done");
   });
 
   test("provider subagent follows its cross-workspace parent", async () => {

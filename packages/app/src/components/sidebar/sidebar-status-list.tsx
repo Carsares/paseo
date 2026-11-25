@@ -15,8 +15,14 @@ import type { GestureType } from "react-native-gesture-handler";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
 import { type SidebarWorkspaceEntry } from "@/hooks/use-sidebar-workspaces-list";
-import type { StatusBucket } from "@/hooks/sidebar-status-view-model";
-import type { SidebarWorkspaceGroup } from "@/components/sidebar/sidebar-labels";
+import type {
+  SidebarGroupLeading,
+  SidebarWorkspaceGroup,
+} from "@/components/sidebar/sidebar-labels";
+import {
+  deriveTopicStatusClassification,
+  type TopicWorkspaceFacts,
+} from "@/components/sidebar/sidebar-topic-view-model";
 import { SidebarFilterEmptyState } from "@/components/sidebar/empty-states";
 import type { HostBadgeModel } from "@/hosts/appearance";
 import { isWeb as platformIsWeb, isNative as platformIsNative } from "@/constants/platform";
@@ -61,6 +67,7 @@ import {
   type SidebarWorkspaceTrailing,
 } from "@/components/sidebar/workspace-trailing";
 import { useSidebarCollapsedSectionsStore } from "@/stores/sidebar-collapsed-sections-store";
+import { useSidebarTopicCompletionStore } from "@/stores/sidebar-topic-completion-store";
 import {
   SidebarWorkspaceContextMenu,
   SidebarWorkspaceMenu,
@@ -115,6 +122,10 @@ interface StatusWorkspaceListProps {
   supportsPinningByServerId: ReadonlyMap<string, boolean>;
   onToggleWorkspacePin: ToggleSidebarWorkspacePin;
   onPinnedWorkspaceReorder: (workspaces: SidebarWorkspaceEntry[]) => void;
+  forceShowProject?: boolean;
+  topicFactsByWorkspaceKey?: ReadonlyMap<string, TopicWorkspaceFacts>;
+  emptyStateComponent?: ReactNode;
+  listFooterComponent?: ReactNode;
   listHeaderComponent?: ReactNode;
   /** Swaps the group list for the label filter's empty state. Never the header above it. */
   sidebarFilterEmpty?: boolean;
@@ -133,6 +144,10 @@ export function SidebarStatusWorkspaceList({
   supportsPinningByServerId,
   onToggleWorkspacePin,
   onPinnedWorkspaceReorder,
+  forceShowProject = false,
+  topicFactsByWorkspaceKey,
+  emptyStateComponent = null,
+  listFooterComponent = null,
   listHeaderComponent,
   sidebarFilterEmpty = false,
   parentGestureRef,
@@ -182,6 +197,8 @@ export function SidebarStatusWorkspaceList({
           projectIconByProjectViewKey,
           hostBadgeByServerId,
         })}
+        forceShowProject={forceShowProject}
+        topicFacts={topicFactsByWorkspaceKey?.get(workspace.workspaceKey)}
         inStatusGroup={false}
         shortcutNumber={statusShortcutIndex.get(workspace.workspaceKey) ?? null}
         showShortcutBadge={showShortcutBadges}
@@ -194,6 +211,7 @@ export function SidebarStatusWorkspaceList({
       />
     ),
     [
+      forceShowProject,
       hostBadgeByServerId,
       onToggleWorkspacePin,
       onWorkspacePress,
@@ -201,6 +219,7 @@ export function SidebarStatusWorkspaceList({
       showShortcutBadges,
       statusShortcutIndex,
       supportsPinningByServerId,
+      topicFactsByWorkspaceKey,
     ],
   );
   const renderPinnedWorkspace = useCallback(
@@ -254,22 +273,67 @@ export function SidebarStatusWorkspaceList({
         </View>
       ) : null}
       {listHeaderComponent}
-      {sidebarFilterEmpty ? (
-        <SidebarFilterEmptyState />
-      ) : (
-        <StatusGroupList
-          groups={groups}
-          collapsedWorkspaceGroupKeys={collapsedWorkspaceGroupKeys}
-          projectIconByProjectViewKey={projectIconByProjectViewKey}
-          shortcutIndex={statusShortcutIndex}
-          showShortcutBadges={showShortcutBadges}
-          onWorkspacePress={onWorkspacePress}
-          hostBadgeByServerId={hostBadgeByServerId}
-          supportsPinningByServerId={supportsPinningByServerId}
-          onToggleWorkspacePin={onToggleWorkspacePin}
-        />
-      )}
+      {renderStatusWorkspaceBody({
+        sidebarFilterEmpty,
+        groups,
+        pinnedWorkspaces,
+        emptyStateComponent,
+        collapsedWorkspaceGroupKeys,
+        projectIconByProjectViewKey,
+        shortcutIndex: statusShortcutIndex,
+        showShortcutBadges,
+        onWorkspacePress,
+        hostBadgeByServerId,
+        supportsPinningByServerId,
+        onToggleWorkspacePin,
+        forceShowProject,
+        topicFactsByWorkspaceKey,
+      })}
+      {listFooterComponent}
     </>
+  );
+}
+
+function renderStatusWorkspaceBody(input: {
+  sidebarFilterEmpty: boolean;
+  groups: SidebarWorkspaceGroup[];
+  pinnedWorkspaces: SidebarWorkspaceEntry[];
+  emptyStateComponent: ReactNode;
+  collapsedWorkspaceGroupKeys: ReadonlySet<string>;
+  projectIconByProjectViewKey: ReadonlyMap<string, string | null>;
+  shortcutIndex: Map<string, number>;
+  showShortcutBadges: boolean;
+  onWorkspacePress?: () => void;
+  hostBadgeByServerId: ReadonlyMap<string, HostBadgeModel>;
+  supportsPinningByServerId: ReadonlyMap<string, boolean>;
+  onToggleWorkspacePin: ToggleSidebarWorkspacePin;
+  forceShowProject: boolean;
+  topicFactsByWorkspaceKey?: ReadonlyMap<string, TopicWorkspaceFacts>;
+}): ReactNode {
+  if (input.sidebarFilterEmpty) {
+    return <SidebarFilterEmptyState />;
+  }
+  if (
+    input.groups.length === 0 &&
+    input.pinnedWorkspaces.length === 0 &&
+    input.emptyStateComponent
+  ) {
+    return input.emptyStateComponent;
+  }
+  return (
+    <StatusGroupList
+      groups={input.groups}
+      collapsedWorkspaceGroupKeys={input.collapsedWorkspaceGroupKeys}
+      projectIconByProjectViewKey={input.projectIconByProjectViewKey}
+      shortcutIndex={input.shortcutIndex}
+      showShortcutBadges={input.showShortcutBadges}
+      onWorkspacePress={input.onWorkspacePress}
+      hostBadgeByServerId={input.hostBadgeByServerId}
+      supportsPinningByServerId={input.supportsPinningByServerId}
+      onToggleWorkspacePin={input.onToggleWorkspacePin}
+      forceShowProject={input.forceShowProject}
+      topicFactsByWorkspaceKey={input.topicFactsByWorkspaceKey}
+    />
   );
 }
 
@@ -283,6 +347,8 @@ function StatusGroupList({
   hostBadgeByServerId,
   supportsPinningByServerId,
   onToggleWorkspacePin,
+  forceShowProject,
+  topicFactsByWorkspaceKey,
 }: {
   groups: SidebarWorkspaceGroup[];
   collapsedWorkspaceGroupKeys: ReadonlySet<string>;
@@ -293,6 +359,8 @@ function StatusGroupList({
   hostBadgeByServerId: ReadonlyMap<string, HostBadgeModel>;
   supportsPinningByServerId: ReadonlyMap<string, boolean>;
   onToggleWorkspacePin: ToggleSidebarWorkspacePin;
+  forceShowProject: boolean;
+  topicFactsByWorkspaceKey?: ReadonlyMap<string, TopicWorkspaceFacts>;
 }) {
   return (
     <>
@@ -308,6 +376,8 @@ function StatusGroupList({
           hostBadgeByServerId={hostBadgeByServerId}
           supportsPinningByServerId={supportsPinningByServerId}
           onToggleWorkspacePin={onToggleWorkspacePin}
+          forceShowProject={forceShowProject}
+          topicFactsByWorkspaceKey={topicFactsByWorkspaceKey}
         />
       ))}
     </>
@@ -329,6 +399,8 @@ function StatusGroupRows({
   hostBadgeByServerId,
   supportsPinningByServerId,
   onToggleWorkspacePin,
+  forceShowProject,
+  topicFactsByWorkspaceKey,
 }: {
   group: SidebarWorkspaceGroup;
   collapsed: boolean;
@@ -339,6 +411,8 @@ function StatusGroupRows({
   hostBadgeByServerId: ReadonlyMap<string, HostBadgeModel>;
   supportsPinningByServerId: ReadonlyMap<string, boolean>;
   onToggleWorkspacePin: ToggleSidebarWorkspacePin;
+  forceShowProject: boolean;
+  topicFactsByWorkspaceKey?: ReadonlyMap<string, TopicWorkspaceFacts>;
 }) {
   const activeWorkspaceSelection = useActiveWorkspaceSelection();
   const [workspacesExpanded, setWorkspacesExpanded] = useState(false);
@@ -367,6 +441,8 @@ function StatusGroupRows({
           projectIconByProjectViewKey,
           hostBadgeByServerId,
         })}
+        forceShowProject={forceShowProject}
+        topicFacts={topicFactsByWorkspaceKey?.get(workspace.workspaceKey)}
         shortcutNumber={shortcutIndex.get(workspace.workspaceKey) ?? null}
         showShortcutBadge={showShortcutBadges}
         canPin={supportsPinningByServerId.get(workspace.serverId) === true}
@@ -468,6 +544,9 @@ function StatusGroupHeader({
             <Text style={styles.statusGroupTitle} numberOfLines={1}>
               {group.label}
             </Text>
+            {typeof group.count === "number" ? (
+              <Text style={styles.statusGroupCount}>{group.count}</Text>
+            ) : null}
           </View>
         </View>
       </Pressable>
@@ -480,12 +559,12 @@ function StatusGroupLeadingVisual({
   collapsed,
   showChevron,
 }: {
-  leading: SidebarWorkspaceGroup["leading"];
+  leading: SidebarGroupLeading;
   collapsed: boolean;
   showChevron: boolean;
 }) {
   if (!showChevron) {
-    return <StatusGroupIcon bucket={leading.bucket} />;
+    return <StatusGroupIcon leading={leading} />;
   }
   if (collapsed) {
     return <ThemedChevronRight uniProps={mutedGroupIconProps} />;
@@ -493,8 +572,18 @@ function StatusGroupLeadingVisual({
   return <ThemedChevronDown uniProps={mutedGroupIconProps} />;
 }
 
-function StatusGroupIcon({ bucket }: { bucket: StatusBucket }) {
-  switch (bucket) {
+function StatusGroupIcon({ leading }: { leading: SidebarGroupLeading }) {
+  if (leading.kind === "topic") {
+    switch (leading.bucket) {
+      case "pending_action":
+        return <ThemedCircleAlert uniProps={needsInputGroupIconProps} />;
+      case "in_progress":
+        return <ThemedCircleDot uniProps={runningGroupIconProps} />;
+      case "completed":
+        return <ThemedCircleCheck uniProps={mutedGroupIconProps} />;
+    }
+  }
+  switch (leading.bucket) {
     case "needs_input":
       return <ThemedCircleAlert uniProps={needsInputGroupIconProps} />;
     case "failed":
@@ -513,12 +602,15 @@ const StatusWorkspaceRow = memo(function StatusWorkspaceRow({
   hostBadge,
   projectName,
   projectIconDataUri,
+  forceShowProject = false,
+  topicFacts,
   shortcutNumber,
   showShortcutBadge,
   canPin,
   onToggleWorkspacePin,
   reserveIdleStatusIndicatorSpace = true,
   inStatusGroup = true,
+  onWorkspacePress,
   drag,
   isDragging = false,
   dragHandleProps,
@@ -527,6 +619,8 @@ const StatusWorkspaceRow = memo(function StatusWorkspaceRow({
   hostBadge: HostBadgeModel | null;
   projectName: string;
   projectIconDataUri: string | null;
+  forceShowProject?: boolean;
+  topicFacts?: TopicWorkspaceFacts;
   shortcutNumber: number | null;
   showShortcutBadge: boolean;
   canPin: boolean;
@@ -549,8 +643,9 @@ const StatusWorkspaceRow = memo(function StatusWorkspaceRow({
 
   const handlePress = useCallback(() => {
     if (!workspace.serverId) return;
+    onWorkspacePress?.();
     navigateToWorkspace({ serverId: workspace.serverId, workspaceId: workspace.workspaceId });
-  }, [workspace.serverId, workspace.workspaceId]);
+  }, [onWorkspacePress, workspace.serverId, workspace.workspaceId]);
 
   return (
     <StatusWorkspaceRowWithMenu
@@ -558,6 +653,8 @@ const StatusWorkspaceRow = memo(function StatusWorkspaceRow({
       hostBadge={hostBadge}
       projectName={projectName}
       projectIconDataUri={projectIconDataUri}
+      forceShowProject={forceShowProject}
+      topicFacts={topicFacts}
       selected={selected}
       shortcutNumber={shortcutNumber}
       showShortcutBadge={showShortcutBadge}
@@ -573,11 +670,62 @@ const StatusWorkspaceRow = memo(function StatusWorkspaceRow({
   );
 });
 
+function canOfferMarkTopicCompleted(
+  workspace: Pick<SidebarWorkspaceEntry, "statusBucket">,
+  topicFacts: TopicWorkspaceFacts | undefined,
+): boolean {
+  if (!topicFacts?.isTopic || topicFacts.completedAt !== null) return false;
+  const classification = deriveTopicStatusClassification(workspace, topicFacts);
+  if (classification.isActivelyWorking) return false;
+  return (
+    classification.pendingReason !== "approval" &&
+    classification.pendingReason !== "failed" &&
+    classification.pendingReason !== "awaiting_first_prompt"
+  );
+}
+
+function useTopicRowActions(
+  workspace: SidebarWorkspaceEntry,
+  topicFacts: TopicWorkspaceFacts | undefined,
+  t: ReturnType<typeof useTranslation>["t"],
+): {
+  onMarkCompleted: (() => void) | undefined;
+  onReopenTopic: (() => void) | undefined;
+  pendingApprovalLabel: string | null;
+} {
+  const { workspaceKey } = workspace;
+  const markTopicCompleted = useSidebarTopicCompletionStore((state) => state.markTopicCompleted);
+  const reopenTopic = useSidebarTopicCompletionStore((state) => state.reopenTopic);
+  const handleMarkCompleted = useCallback(() => {
+    markTopicCompleted(workspaceKey);
+  }, [markTopicCompleted, workspaceKey]);
+  const handleReopenTopic = useCallback(() => {
+    reopenTopic(workspaceKey);
+  }, [reopenTopic, workspaceKey]);
+
+  const isTopic = Boolean(topicFacts?.isTopic);
+  const isTopicCompleted = Boolean(topicFacts?.completedAt);
+  const pendingCount = topicFacts?.pendingDurableCount ?? 0;
+
+  return {
+    onMarkCompleted: canOfferMarkTopicCompleted(workspace, topicFacts)
+      ? handleMarkCompleted
+      : undefined,
+    onReopenTopic: isTopic && isTopicCompleted ? handleReopenTopic : undefined,
+    pendingApprovalLabel:
+      pendingCount > 0
+        ? t("topicWorkbench.sidebar.pendingApprovalCount", { count: pendingCount })
+        : null,
+  };
+}
+
 function StatusWorkspaceRowWithMenu({
   workspace,
   hostBadge,
   projectName,
   projectIconDataUri,
+  forceShowProject = false,
+  topicFacts,
   selected,
   shortcutNumber,
   showShortcutBadge,
@@ -594,6 +742,8 @@ function StatusWorkspaceRowWithMenu({
   hostBadge: HostBadgeModel | null;
   projectName: string;
   projectIconDataUri: string | null;
+  forceShowProject?: boolean;
+  topicFacts?: TopicWorkspaceFacts;
   selected: boolean;
   shortcutNumber: number | null;
   showShortcutBadge: boolean;
@@ -674,6 +824,12 @@ function StatusWorkspaceRowWithMenu({
     });
   }, [markUnread, toast]);
 
+  const { onMarkCompleted, onReopenTopic, pendingApprovalLabel } = useTopicRowActions(
+    workspace,
+    topicFacts,
+    t,
+  );
+
   return (
     <>
       <StatusWorkspaceRowInner
@@ -681,6 +837,8 @@ function StatusWorkspaceRowWithMenu({
         hostBadge={hostBadge}
         projectName={projectName}
         projectIconDataUri={projectIconDataUri}
+        forceShowProject={forceShowProject}
+        pendingApprovalLabel={pendingApprovalLabel}
         selected={selected}
         shortcutNumber={shortcutNumber}
         showShortcutBadge={showShortcutBadge}
@@ -693,6 +851,8 @@ function StatusWorkspaceRowWithMenu({
         onCopyBranchName={workspace.projectKind === "git" ? handleCopyBranchName : undefined}
         onCopyPath={handleCopyPath}
         onRename={rename.begin}
+        onMarkCompleted={onMarkCompleted}
+        onReopenTopic={onReopenTopic}
         titleEditor={rename.titleEditor}
         onMarkAsRead={hasClearableAttention ? handleMarkAsRead : undefined}
         onMarkAsUnread={canMarkUnread ? handleMarkAsUnread : undefined}
@@ -715,6 +875,8 @@ interface StatusWorkspaceRowInnerProps {
   hostBadge: HostBadgeModel | null;
   projectName: string;
   projectIconDataUri: string | null;
+  forceShowProject?: boolean;
+  pendingApprovalLabel?: string | null;
   selected: boolean;
   shortcutNumber: number | null;
   showShortcutBadge: boolean;
@@ -727,6 +889,8 @@ interface StatusWorkspaceRowInnerProps {
   onCopyBranchName?: () => void;
   onCopyPath?: () => void;
   onRename?: () => void;
+  onMarkCompleted?: () => void;
+  onReopenTopic?: () => void;
   /** Present while the row is renamed in place: the row stops pressing, dragging and hovering. */
   titleEditor?: ReactNode;
   onMarkAsRead?: () => void;
@@ -764,6 +928,8 @@ function StatusWorkspaceRowInnerContent({
   hostBadge,
   projectName,
   projectIconDataUri,
+  forceShowProject = false,
+  pendingApprovalLabel = null,
   selected,
   shortcutNumber,
   showShortcutBadge,
@@ -776,6 +942,8 @@ function StatusWorkspaceRowInnerContent({
   onCopyBranchName,
   onCopyPath,
   onRename,
+  onMarkCompleted,
+  onReopenTopic,
   titleEditor = null,
   onMarkAsRead,
   onMarkAsUnread,
@@ -865,6 +1033,8 @@ function StatusWorkspaceRowInnerContent({
               onCopyPath={onCopyPath}
               onCopyBranchName={onCopyBranchName}
               onRename={onRename}
+              onMarkCompleted={onMarkCompleted}
+              onReopenTopic={onReopenTopic}
               onMarkAsRead={onMarkAsRead}
               onMarkAsUnread={onMarkAsUnread}
               onArchive={onArchive}
@@ -893,6 +1063,8 @@ function StatusWorkspaceRowInnerContent({
                 hostBadge={hostBadge}
                 leadingProjectName={projectName}
                 leadingProjectIconDataUri={projectIconDataUri}
+                forceShowProject={forceShowProject}
+                pendingApprovalLabel={pendingApprovalLabel}
                 serviceSummary={serviceSummary}
                 backdrop={backdrop}
                 isHovered={isHovered}
@@ -917,6 +1089,8 @@ function StatusWorkspaceRowInnerContent({
                     onCopyPath={onCopyPath}
                     onCopyBranchName={onCopyBranchName}
                     onRename={onRename}
+                    onMarkCompleted={onMarkCompleted}
+                    onReopenTopic={onReopenTopic}
                     onMarkAsRead={onMarkAsRead}
                     onMarkAsUnread={onMarkAsUnread}
                     onArchive={onArchive}
@@ -950,6 +1124,8 @@ function StatusWorkspaceActionSlot({
   onCopyPath,
   onCopyBranchName,
   onRename,
+  onMarkCompleted,
+  onReopenTopic,
   onMarkAsRead,
   onMarkAsUnread,
   onArchive,
@@ -971,6 +1147,8 @@ function StatusWorkspaceActionSlot({
   onCopyPath?: () => void;
   onCopyBranchName?: () => void;
   onRename?: () => void;
+  onMarkCompleted?: () => void;
+  onReopenTopic?: () => void;
   onMarkAsRead?: () => void;
   onMarkAsUnread?: () => void;
   onArchive?: () => void;
@@ -1005,6 +1183,8 @@ function StatusWorkspaceActionSlot({
             onCopyPath={onCopyPath}
             onCopyBranchName={onCopyBranchName}
             onRename={onRename}
+            onMarkCompleted={onMarkCompleted}
+            onReopenTopic={onReopenTopic}
             onMarkAsRead={onMarkAsRead}
             onMarkAsUnread={onMarkAsUnread}
             onArchive={onArchive}
@@ -1096,6 +1276,11 @@ const styles = StyleSheet.create((theme) => ({
     fontWeight: "400",
     minWidth: 0,
     flexShrink: 1,
+  },
+  statusGroupCount: {
+    color: theme.colors.foregroundExtraMuted,
+    fontSize: theme.fontSize.sm,
+    flexShrink: 0,
   },
   workspaceRowContainer: {
     position: "relative",

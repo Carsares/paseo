@@ -9,6 +9,7 @@ import type {
   SidebarProjectEntry,
   SidebarWorkspaceEntry,
 } from "@/hooks/use-sidebar-workspaces-list";
+import type { WorkspaceSort } from "@/projects/workspace-structure";
 import type { SidebarGroupMode } from "@/stores/sidebar-view-store";
 import {
   resolveSidebarProjectIconTargets,
@@ -19,7 +20,14 @@ import {
   type SidebarShortcutModel,
   type SidebarShortcutSection,
 } from "@/utils/sidebar-shortcuts";
-import { statusWorkspaceGroups, type SidebarWorkspaceGroup } from "./sidebar-labels";
+import {
+  statusWorkspaceGroups,
+  topicWorkspaceGroups,
+  type SidebarWorkspaceGroup,
+} from "./sidebar-labels";
+import { buildTopicGroups, type TopicWorkspaceFacts } from "./sidebar-topic-view-model";
+
+const EMPTY_TOPIC_FACTS: ReadonlyMap<string, TopicWorkspaceFacts> = new Map();
 
 export interface SidebarProjection {
   pinnedGroups: PinnedSidebarGroups;
@@ -43,6 +51,8 @@ export interface SidebarProjectionInput {
   workspaceEntriesByKey: ReadonlyMap<string, SidebarWorkspaceEntry>;
   projectNamesByViewKey: Map<string, string>;
   groupMode: SidebarGroupMode;
+  workspaceSort?: WorkspaceSort;
+  topicFactsByWorkspaceKey?: ReadonlyMap<string, TopicWorkspaceFacts>;
   pinnedCollapsed: boolean;
   collapsedProjectKeys: ReadonlySet<string>;
   collapsedWorkspaceGroupKeys: ReadonlySet<string>;
@@ -103,6 +113,16 @@ function buildWorkspaceGroups(
     case "status":
       return statusWorkspaceGroups(
         buildStatusGroups(unpinnedWorkspaces, input.projectNamesByViewKey, input.t),
+      );
+    case "topic":
+      return topicWorkspaceGroups(
+        buildTopicGroups({
+          workspaces: unpinnedWorkspaces,
+          factsByWorkspaceKey: input.topicFactsByWorkspaceKey ?? EMPTY_TOPIC_FACTS,
+          projectNamesByViewKey: input.projectNamesByViewKey,
+          workspaceSort: input.workspaceSort ?? "lastPrompt",
+          t: input.t,
+        }),
       );
   }
 }

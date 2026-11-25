@@ -18,6 +18,7 @@ import type { WorkspaceServiceSummary } from "./service-summary";
 export type MetaRowItem =
   | { kind: "branch"; name: string }
   | { kind: "project"; name: string }
+  | { kind: "pendingApproval"; label: string }
   | { kind: "host" }
   | { kind: "changeRequest"; hint: PrHint }
   | { kind: "checks"; summary: CheckSummary; label: boolean }
@@ -37,6 +38,8 @@ export type MetaRowItem =
 export function selectMetaRowItems(input: {
   currentBranch: string | null;
   projectName: string | null;
+  forceShowProject?: boolean;
+  pendingApprovalLabel?: string | null;
   hasHostBadge: boolean;
   prHint: PrHint | null;
   serviceSummary: WorkspaceServiceSummary | null;
@@ -47,6 +50,8 @@ export function selectMetaRowItems(input: {
   const {
     currentBranch,
     projectName,
+    forceShowProject = false,
+    pendingApprovalLabel = null,
     hasHostBadge,
     prHint,
     serviceSummary,
@@ -59,8 +64,11 @@ export function selectMetaRowItems(input: {
   if (currentBranch && visible.branch) {
     items.push({ kind: "branch", name: currentBranch });
   }
-  if (projectName && visible.project) {
+  if (projectName && (visible.project || forceShowProject)) {
     items.push({ kind: "project", name: projectName });
+  }
+  if (pendingApprovalLabel) {
+    items.push({ kind: "pendingApproval", label: pendingApprovalLabel });
   }
   if (hasHostBadge) {
     items.push({ kind: "host" });

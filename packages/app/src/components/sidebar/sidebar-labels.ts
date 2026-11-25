@@ -2,12 +2,18 @@ import { workspaceLabelKey } from "@getpaseo/protocol/workspace-labels";
 import type { SidebarWorkspaceEntry } from "@/hooks/use-sidebar-workspaces-list";
 import { SIDEBAR_UNLABELLED_LABEL_KEY, type SidebarLabelFilter } from "@/stores/sidebar-view-store";
 import type { StatusBucket, StatusGroup } from "@/hooks/sidebar-status-view-model";
+import type { TopicGroup, TopicStatusBucket } from "./sidebar-topic-view-model";
+
+export type SidebarGroupLeading =
+  | { kind: "status"; bucket: StatusBucket }
+  | { kind: "topic"; bucket: TopicStatusBucket };
 
 export interface SidebarWorkspaceGroup {
   key: string;
   label: string;
+  count?: number;
   rows: SidebarWorkspaceEntry[];
-  leading: { kind: "status"; bucket: StatusBucket };
+  leading: SidebarGroupLeading;
 }
 
 export function statusWorkspaceGroups(groups: readonly StatusGroup[]): SidebarWorkspaceGroup[] {
@@ -16,6 +22,16 @@ export function statusWorkspaceGroups(groups: readonly StatusGroup[]): SidebarWo
     label: group.label,
     rows: group.rows,
     leading: { kind: "status", bucket: group.bucket },
+  }));
+}
+
+export function topicWorkspaceGroups(groups: readonly TopicGroup[]): SidebarWorkspaceGroup[] {
+  return groups.map((group) => ({
+    key: `topic:${group.bucket}`,
+    label: group.label,
+    count: group.rows.length,
+    rows: group.rows,
+    leading: { kind: "topic", bucket: group.bucket },
   }));
 }
 

@@ -23,6 +23,7 @@ import {
   Globe,
   Server,
   Settings2,
+  Sparkles,
   Tag,
   Type,
 } from "lucide-react-native";
@@ -90,6 +91,7 @@ type OptionIcon = ComponentType<{
 // Options carry icons; the root rows deliberately do not. The root is four labels with their
 // current values, and a column of icons there would be decoration competing with the values.
 const GROUPING_ICONS: Record<SidebarGroupMode, OptionIcon> = {
+  topic: withUnistyles(Sparkles),
   project: withUnistyles(Folder),
   status: withUnistyles(CircleDashed),
 };
@@ -123,11 +125,13 @@ const TRAILING_ICONS: Record<SidebarTrailingChoice, OptionIcon> = {
   timestamp: withUnistyles(Clock),
 };
 
-const GROUPING_MODES: readonly SidebarGroupMode[] = ["project", "status"];
+const LEGACY_GROUPING_MODES: readonly SidebarGroupMode[] = ["project", "status"];
+const TOPIC_GROUPING_MODES: readonly SidebarGroupMode[] = ["topic", "project", "status"];
 const TITLE_SOURCES: readonly WorkspaceTitleSource[] = ["title", "branch"];
 const TRAILING_CHOICES: readonly SidebarTrailingChoice[] = ["diff", "timestamp"];
 
 const GROUPING_LABEL_KEYS: Record<SidebarGroupMode, string> = {
+  topic: "topicWorkbench.sidebar.groupingOption",
   project: "sidebar.display.grouping.project",
   status: "sidebar.display.grouping.status",
 };
@@ -170,7 +174,19 @@ export function SidebarDisplayPreferencesMenu(): ReactElement {
   const hosts = useHosts();
   // `allProjects`, never `projects`: the model's `projects` is already filtered, so a picker fed
   // from it would lose the row that undoes the filter as soon as the filter narrowed to one.
-  const { allProjects, resolvedProjectFilters, workspaceSortSupported } = useSidebarModel();
+  const {
+    allProjects,
+    resolvedProjectFilters,
+    workspaceSortSupported,
+    groupMode,
+    supportsTopicWorkbench,
+  } = useSidebarModel();
+  const groupingModes =
+    supportsTopicWorkbench || groupMode === "topic" ? TOPIC_GROUPING_MODES : LEGACY_GROUPING_MODES;
+  const effectiveWorkspaceSort =
+    groupMode === "topic" && preferences.workspaceSort === "manual"
+      ? "lastPrompt"
+      : preferences.workspaceSort;
   const { labels } = useWorkspaceLabelProjection();
   const [managerOpen, setManagerOpen] = useState(false);
   const openManager = useCallback(() => setManagerOpen(true), []);
@@ -199,10 +215,10 @@ export function SidebarDisplayPreferencesMenu(): ReactElement {
         title: t("sidebar.display.grouping.label"),
         content: (
           <OptionList
-            values={GROUPING_MODES}
+            values={groupingModes}
             icons={GROUPING_ICONS}
             labelKeys={GROUPING_LABEL_KEYS}
-            selectedValue={preferences.grouping}
+            selectedValue={groupMode}
             onSelect={preferences.setGrouping}
             testIDPrefix="sidebar-grouping"
           />
@@ -243,12 +259,17 @@ export function SidebarDisplayPreferencesMenu(): ReactElement {
       },
     ];
 
-    if (preferences.grouping === "project") {
+    if (groupMode === "project" || groupMode === "topic") {
       definitions.push({
         id: "sort",
         title: t("sidebar.display.sort.label"),
         content: (
-          <SortPage preferences={preferences} automaticSortSupported={workspaceSortSupported} />
+          <SortPage
+            preferences={preferences}
+            selectedSort={effectiveWorkspaceSort}
+            allowManual={groupMode === "project"}
+            automaticSortSupported={workspaceSortSupported}
+          />
         ),
       });
     }
@@ -286,6 +307,9 @@ export function SidebarDisplayPreferencesMenu(): ReactElement {
   }, [
     t,
     preferences,
+    groupMode,
+    groupingModes,
+    effectiveWorkspaceSort,
     workspaceSortSupported,
     hosts,
     showHostFilter,
@@ -317,17 +341,18 @@ export function SidebarDisplayPreferencesMenu(): ReactElement {
         >
           <MenuSubTrigger
             id="grouping"
-            value={t(GROUPING_LABEL_KEYS[preferences.grouping])}
+            value={t(GROUPING_LABEL_KEYS[groupMode])}
             testID="sidebar-display-grouping"
           >
             {t("sidebar.display.grouping.label")}
           </MenuSubTrigger>
-          {preferences.grouping === "project" ? (
+          {groupMode === "project" || groupMode === "topic" ? (
             <MenuSubTrigger
               id="sort"
               value={
-                workspaceSortSupported || preferences.workspaceSort === "manual"
-                  ? t(`sidebar.display.sort.${preferences.workspaceSort}`)
+                workspaceSortSupported ||
+                (groupMode === "project" && effectiveWorkspaceSort === "manual")
+                  ? t(`sidebar.display.sort.${effectiveWorkspaceSort}`)
                   : undefined
               }
             >
@@ -402,9 +427,13 @@ export function SidebarDisplayPreferencesMenu(): ReactElement {
 
 function SortPage({
   preferences,
+  selectedSort,
+  allowManual,
   automaticSortSupported,
 }: {
   preferences: Preferences;
+  selectedSort: Preferences["workspaceSort"];
+  allowManual: boolean;
   automaticSortSupported: boolean;
 }): ReactElement {
   const { t } = useTranslation();
@@ -414,18 +443,17 @@ function SortPage({
   const selectLastPrompt = useCallback(() => setWorkspaceSort("lastPrompt"), [setWorkspaceSort]);
   return (
     <>
-      <MenuItem selected={preferences.workspaceSort === "manual"} onSelect={selectManual}>
-        {t("sidebar.display.sort.manual")}
-      </MenuItem>
+      {allowManual ? (
+        <MenuItem selected={selectedSort === "manual"} onSelect={selectManual}>
+          {t("sidebar.display.sort.manual")}
+        </MenuItem>
+      ) : null}
       {automaticSortSupported ? (
         <>
-          <MenuItem selected={preferences.workspaceSort === "created"} onSelect={selectCreated}>
+          <MenuItem selected={selectedSort === "created"} onSelect={selectCreated}>
             {t("sidebar.display.sort.created")}
           </MenuItem>
-          <MenuItem
-            selected={preferences.workspaceSort === "lastPrompt"}
-            onSelect={selectLastPrompt}
-          >
+          <MenuItem selected={selectedSort === "lastPrompt"} onSelect={selectLastPrompt}>
             {t("sidebar.display.sort.lastPrompt")}
           </MenuItem>
         </>

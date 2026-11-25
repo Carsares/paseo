@@ -272,8 +272,10 @@ export class WorkspaceDirectory {
         !agent.background &&
         this.deps.isProviderVisibleToClient(agent.provider),
     );
+    const activeAgentsById = new Map(activeAgents.map((agent) => [agent.id, agent] as const));
     this.applyAgentBucketContributions({
       activeAgents,
+      activeAgentsById,
       descriptorsByWorkspaceId,
     });
 
@@ -284,6 +286,7 @@ export class WorkspaceDirectory {
     );
     this.applyProviderSubagentContributions({
       activeAgents,
+      activeAgentsById,
       providerSubagentActivity,
       descriptorsByWorkspaceId,
       activityEntriesByWorkspaceId,
@@ -304,6 +307,7 @@ export class WorkspaceDirectory {
         workspaceId,
         winningBucket: descriptor.status,
         contributingAgents,
+        activeAgentsById,
         activityEntries,
         previous: this.bucketHistoryByWorkspaceId.get(workspaceId) ?? null,
         workspaceCreatedAt: activeRecordsByWorkspaceId.get(workspaceId)?.createdAt ?? null,
@@ -322,17 +326,17 @@ export class WorkspaceDirectory {
 
   private applyProviderSubagentContributions(params: {
     activeAgents: AgentSnapshotPayload[];
+    activeAgentsById: ReadonlyMap<string, AgentSnapshotPayload>;
     providerSubagentActivity: ProviderSubagentWorkspaceActivity[];
     descriptorsByWorkspaceId: Map<string, WorkspaceDescriptorPayload>;
     activityEntriesByWorkspaceId: Map<string, WorkspaceBucketTimestampEntry[]>;
   }): void {
     const {
-      activeAgents,
+      activeAgentsById,
       providerSubagentActivity,
       descriptorsByWorkspaceId,
       activityEntriesByWorkspaceId,
     } = params;
-    const activeAgentsById = new Map(activeAgents.map((agent) => [agent.id, agent] as const));
 
     for (const subagent of providerSubagentActivity) {
       if (subagent.status !== "running") {
@@ -366,46 +370,30 @@ export class WorkspaceDirectory {
   // Aggregate each agent's state bucket into its owning workspace descriptor,
   // keeping the highest-priority bucket. A record's owner IS its `workspaceId`;
   // status never fans out to same-cwd siblings. A subagent in another workspace
-  // is a root for that workspace. Same-workspace descendants contribute only
-  // running activity to the nearest ancestor in that workspace.
+  // is a root for that workspace. Same-workspace descendants bubble pending
+  // permission requests (`needs_input`) and running activity to the nearest
+  // ancestor in that workspace while keeping settled/error states local.
   private applyAgentBucketContributions(params: {
     activeAgents: AgentSnapshotPayload[];
+    activeAgentsById: ReadonlyMap<string, AgentSnapshotPayload>;
     descriptorsByWorkspaceId: Map<string, WorkspaceDescriptorPayload>;
   }): void {
-    const { activeAgents, descriptorsByWorkspaceId } = params;
-    const activeAgentsById = new Map(activeAgents.map((agent) => [agent.id, agent] as const));
+    const { activeAgents, activeAgentsById, descriptorsByWorkspaceId } = params;
 
     for (const agent of activeAgents) {
-      const workspaceAgent = resolveWorkspaceRootAgent(agent, activeAgentsById);
-      if (!workspaceAgent) {
+      const contribution = deriveWorkspaceAgentContribution(agent, activeAgentsById);
+      if (!contribution) {
         continue;
       }
-      const isWorkspaceRoot = workspaceAgent.id === agent.id;
-      if (!isWorkspaceRoot && !isAgentRunning(agent)) {
-        continue;
-      }
-      const bucket = isWorkspaceRoot
-        ? deriveAgentStateBucket({
-            status: agent.status,
-            pendingPermissionCount: agent.pendingPermissions?.length ?? 0,
-            requiresAttention: agent.requiresAttention,
-            attentionReason: agent.attentionReason ?? null,
-            backgroundWork: agent.backgroundWork,
-          })
-        : "running";
-
-      const workspaceId = workspaceAgent.workspaceId;
-      if (!workspaceId) {
-        continue;
-      }
-      const existing = descriptorsByWorkspaceId.get(workspaceId);
+      const existing = descriptorsByWorkspaceId.get(contribution.workspaceId);
       if (!existing) {
         continue;
       }
       if (
-        getWorkspaceStateBucketPriority(bucket) < getWorkspaceStateBucketPriority(existing.status)
+        getWorkspaceStateBucketPriority(contribution.bucket) <
+        getWorkspaceStateBucketPriority(existing.status)
       ) {
-        existing.status = bucket;
+        existing.status = contribution.bucket;
       }
     }
   }
@@ -460,6 +448,7 @@ export class WorkspaceDirectory {
     workspaceId: string;
     winningBucket: WorkspaceStateBucket;
     contributingAgents: AgentSnapshotPayload[];
+    activeAgentsById: ReadonlyMap<string, AgentSnapshotPayload>;
     activityEntries: WorkspaceBucketTimestampEntry[];
     previous: WorkspaceBucketHistoryEntry | null;
     workspaceCreatedAt: string | null;
@@ -470,8 +459,10 @@ export class WorkspaceDirectory {
     recordDelete?: true;
   } {
     const {
+      workspaceId,
       winningBucket,
       contributingAgents,
+      activeAgentsById,
       activityEntries,
       previous,
       workspaceCreatedAt,
@@ -498,11 +489,13 @@ export class WorkspaceDirectory {
     }
 
     if (!previous) {
-      const newestInWinningBucket = this.findNewestTimestampInBucket(
+      const newestInWinningBucket = this.findNewestTimestampInBucket({
+        workspaceId,
         contributingAgents,
+        activeAgentsById,
         activityEntries,
         winningBucket,
-      );
+      });
       const enteredAt = newestInWinningBucket ?? nowIso;
       return {
         statusEnteredAt: enteredAt,
@@ -528,21 +521,19 @@ export class WorkspaceDirectory {
   //   - `attentionTimestamp` when attention is set (covers attention/failed)
   //   - `updatedAt` as a general fallback for any bucket
   // Returns `null` if no matching contributor has a parseable timestamp.
-  private findNewestTimestampInBucket(
-    contributingAgents: AgentSnapshotPayload[],
-    activityEntries: WorkspaceBucketTimestampEntry[],
-    winningBucket: WorkspaceStateBucket,
-  ): string | null {
+  private findNewestTimestampInBucket(params: {
+    workspaceId: string;
+    contributingAgents: AgentSnapshotPayload[];
+    activeAgentsById: ReadonlyMap<string, AgentSnapshotPayload>;
+    activityEntries: WorkspaceBucketTimestampEntry[];
+    winningBucket: WorkspaceStateBucket;
+  }): string | null {
+    const { workspaceId, contributingAgents, activeAgentsById, activityEntries, winningBucket } =
+      params;
     const agentTimestamps = contributingAgents
       .filter((agent) => {
-        const derived = deriveAgentStateBucket({
-          status: agent.status,
-          pendingPermissionCount: agent.pendingPermissions?.length ?? 0,
-          requiresAttention: agent.requiresAttention,
-          attentionReason: agent.attentionReason ?? null,
-          backgroundWork: agent.backgroundWork,
-        });
-        return derived === winningBucket;
+        const contribution = deriveWorkspaceAgentContribution(agent, activeAgentsById);
+        return contribution?.workspaceId === workspaceId && contribution.bucket === winningBucket;
       })
       .map((agent) => {
         // Prefer attentionTimestamp when the agent has attention set — this is
@@ -719,6 +710,42 @@ export class WorkspaceDirectory {
       },
     };
   }
+}
+
+function deriveWorkspaceAgentContribution(
+  agent: AgentSnapshotPayload,
+  activeAgentsById: ReadonlyMap<string, AgentSnapshotPayload>,
+): { workspaceId: string; bucket: WorkspaceStateBucket } | null {
+  const workspaceAgent = resolveWorkspaceRootAgent(agent, activeAgentsById);
+  if (!workspaceAgent?.workspaceId) {
+    return null;
+  }
+  const isWorkspaceRoot = workspaceAgent.id === agent.id;
+  if (isWorkspaceRoot) {
+    return {
+      workspaceId: workspaceAgent.workspaceId,
+      bucket: deriveAgentStateBucket({
+        status: agent.status,
+        pendingPermissionCount: agent.pendingPermissions?.length ?? 0,
+        requiresAttention: agent.requiresAttention,
+        attentionReason: agent.attentionReason ?? null,
+        backgroundWork: agent.backgroundWork,
+      }),
+    };
+  }
+  if ((agent.pendingPermissions?.length ?? 0) > 0 || agent.attentionReason === "permission") {
+    return {
+      workspaceId: workspaceAgent.workspaceId,
+      bucket: "needs_input",
+    };
+  }
+  if (isAgentRunning(agent)) {
+    return {
+      workspaceId: workspaceAgent.workspaceId,
+      bucket: "running",
+    };
+  }
+  return null;
 }
 
 function groupAgentsByWorkspaceId(

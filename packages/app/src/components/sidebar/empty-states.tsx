@@ -1,9 +1,10 @@
 import { type ReactNode, useCallback } from "react";
-import { Import, Plus } from "lucide-react-native";
+import { Folder, Import, Plus } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import { Text, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import { Button } from "@/components/ui/button";
+import { PressHighlight } from "@/components/ui/press-highlight";
 import { useSidebarViewStore } from "@/stores/sidebar-view-store";
 
 function SidebarEmptyStateCard({
@@ -106,6 +107,88 @@ export function SidebarProjectEmptyState({
   );
 }
 
+export function SidebarTopicEmptyState({
+  hiddenWorkspaceCount,
+  onCreateTopic,
+}: {
+  hiddenWorkspaceCount: number;
+  onCreateTopic?: () => void;
+}) {
+  const { t } = useTranslation();
+  const setGroupMode = useSidebarViewStore((state) => state.setGroupMode);
+  const handleShowAllWorkspaces = useCallback(() => {
+    setGroupMode("project");
+  }, [setGroupMode]);
+
+  return (
+    <SidebarEmptyStateCard
+      testID="sidebar-topic-empty-state"
+      title={t("topicWorkbench.sidebar.emptyTitle")}
+      description={t("topicWorkbench.sidebar.emptyDescription")}
+    >
+      {onCreateTopic ? (
+        <Button
+          variant="secondary"
+          size="sm"
+          leftIcon={Plus}
+          style={styles.action}
+          textStyle={styles.actionText}
+          onPress={onCreateTopic}
+          testID="sidebar-topic-empty-create"
+        >
+          {t("topicWorkbench.sidebar.newTopic")}
+        </Button>
+      ) : null}
+      {hiddenWorkspaceCount > 0 ? (
+        <Button
+          variant="outline"
+          size="sm"
+          leftIcon={Folder}
+          style={styles.action}
+          textStyle={styles.actionText}
+          onPress={handleShowAllWorkspaces}
+          testID="sidebar-topic-empty-show-all"
+        >
+          {t("topicWorkbench.sidebar.viewAllWorkspaces", { count: hiddenWorkspaceCount })}
+        </Button>
+      ) : null}
+    </SidebarEmptyStateCard>
+  );
+}
+
+export function SidebarHiddenWorkspacesFooter({
+  hiddenWorkspaceCount,
+  activeWorkspaceHidden,
+}: {
+  hiddenWorkspaceCount: number;
+  activeWorkspaceHidden: boolean;
+}) {
+  const { t } = useTranslation();
+  const setGroupMode = useSidebarViewStore((state) => state.setGroupMode);
+  const handleSwitchToProject = useCallback(() => {
+    setGroupMode("project");
+  }, [setGroupMode]);
+
+  if (hiddenWorkspaceCount <= 0 && !activeWorkspaceHidden) return null;
+  const label = activeWorkspaceHidden
+    ? t("topicWorkbench.sidebar.activeNonTopicHint")
+    : t("topicWorkbench.sidebar.hiddenWorkspacesHint", { count: hiddenWorkspaceCount });
+
+  return (
+    <PressHighlight
+      accessibilityRole="button"
+      onPress={handleSwitchToProject}
+      style={styles.hiddenFooterButton}
+      highlightStyle={styles.hiddenFooterPressed}
+      testID="sidebar-topic-hidden-workspaces-footer"
+    >
+      <Text style={styles.hiddenFooterText} numberOfLines={1}>
+        {label}
+      </Text>
+    </PressHighlight>
+  );
+}
+
 const styles = StyleSheet.create((theme) => ({
   card: {
     marginTop: theme.spacing[3],
@@ -135,6 +218,19 @@ const styles = StyleSheet.create((theme) => ({
     fontWeight: theme.fontWeight.normal,
   },
   description: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
+  },
+  hiddenFooterButton: {
+    marginTop: theme.spacing[2],
+    paddingVertical: theme.spacing[1.5],
+    paddingHorizontal: theme.spacing[2],
+    borderRadius: theme.borderRadius.md,
+  },
+  hiddenFooterPressed: {
+    backgroundColor: theme.colors.surfaceSidebarHover,
+  },
+  hiddenFooterText: {
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.sm,
   },

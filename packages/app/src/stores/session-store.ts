@@ -139,6 +139,7 @@ export interface WorkspaceDescriptor {
   workspaceKind: WorkspaceDescriptorPayload["workspaceKind"];
   background?: boolean;
   hasActiveMainAgent?: boolean;
+  topic?: WorkspaceDescriptorPayload["topic"];
   name: string;
   title?: string | null;
   pinnedAt?: string | null;
@@ -157,18 +158,30 @@ export interface WorkspaceDescriptor {
   project?: ProjectPlacementPayload;
 }
 
+function parseOptionalDate(raw: string | null | undefined): Date | null {
+  return typeof raw === "string" && raw.length > 0 ? new Date(raw) : null;
+}
+
+function normalizeOptionalWorkspaceFlags(
+  payload: WorkspaceDescriptorPayload,
+): Pick<WorkspaceDescriptor, "hasActiveMainAgent" | "topic" | "snoozedUntil" | "parkedAt"> {
+  return {
+    ...(payload.hasActiveMainAgent !== undefined
+      ? { hasActiveMainAgent: payload.hasActiveMainAgent }
+      : {}),
+    ...(payload.topic ? { topic: payload.topic } : {}),
+    ...(payload.snoozedUntil ? { snoozedUntil: payload.snoozedUntil } : {}),
+    ...(payload.parkedAt ? { parkedAt: payload.parkedAt } : {}),
+  };
+}
+
 export function normalizeWorkspaceDescriptor(
   payload: WorkspaceDescriptorPayload,
 ): WorkspaceDescriptor {
-  const statusEnteredAtRaw = payload.statusEnteredAt;
-  const statusEnteredAt: Date | null =
-    typeof statusEnteredAtRaw === "string" && statusEnteredAtRaw.length > 0
-      ? new Date(statusEnteredAtRaw)
-      : null;
   return {
     // COMPAT(workspaceSortTimes): added in v0.13.0, remove after 2027-04-22.
-    createdAt: payload.createdAt ? new Date(payload.createdAt) : null,
-    lastUserMessageAt: payload.lastUserMessageAt ? new Date(payload.lastUserMessageAt) : null,
+    createdAt: parseOptionalDate(payload.createdAt),
+    lastUserMessageAt: parseOptionalDate(payload.lastUserMessageAt),
     id: normalizeWorkspaceOpaqueId(payload.id) ?? payload.id,
     projectId: payload.projectId,
     projectDisplayName: payload.projectDisplayName,
@@ -185,19 +198,15 @@ export function normalizeWorkspaceDescriptor(
     projectKind: payload.projectKind,
     workspaceKind: payload.workspaceKind,
     background: payload.background ?? false,
-    ...(payload.hasActiveMainAgent !== undefined
-      ? { hasActiveMainAgent: payload.hasActiveMainAgent }
-      : {}),
+    ...normalizeOptionalWorkspaceFlags(payload),
     parentWorkspaceId: payload.parentWorkspaceId,
     name: payload.name,
     title: payload.title ?? null,
     pinnedAt: payload.pinnedAt ?? null,
-    ...(payload.snoozedUntil ? { snoozedUntil: payload.snoozedUntil } : {}),
-    ...(payload.parkedAt ? { parkedAt: payload.parkedAt } : {}),
     // COMPAT(workspaceLabels): old daemons omit assignments.
     labels: payload.labels ?? [],
     status: payload.status,
-    statusEnteredAt,
+    statusEnteredAt: parseOptionalDate(payload.statusEnteredAt),
     archivingAt: payload.archivingAt ?? null,
     diffStat: payload.diffStat ?? null,
     scripts: (payload.scripts ?? []).map((s) => Object.assign({}, s)),

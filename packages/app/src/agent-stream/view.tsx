@@ -97,7 +97,11 @@ import {
 } from "@/agent-stream/chat-outline/use-chat-outline";
 import { CHAT_COLUMN_RAIL_DATASET, useChatOutlineRail } from "@/chat-rail";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
-import { planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
+import { planTimelinePromptJump, planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
+import {
+  useOptionalTeamMessageJumpStore,
+  usePendingTeamMessageJump,
+} from "@/subagents/team-directory";
 import {
   CompletedTurnFooterRow,
   TurnFooter,
@@ -259,6 +263,200 @@ function renderListEmptyComponent(input: {
 export interface AgentStreamViewHandle {
   scrollToBottom(reason?: BottomAnchorLocalRequest["reason"]): void;
   prepareForViewportChange(): void;
+}
+
+type StreamPresentationResult = ReturnType<ReturnType<typeof createStreamPresentation>>;
+
+function matchesTeamJumpCandidate(
+  candidate: StreamItem,
+  jump: NonNullable<ReturnType<typeof usePendingTeamMessageJump>>,
+): boolean {
+  if (jump.itemId !== null && candidate.id === jump.itemId) return true;
+  if (jump.messageId !== null && getStreamItemMessageId(candidate) === jump.messageId) return true;
+  return (
+    jump.epoch !== null &&
+    jump.seq !== null &&
+    candidate.timelineCursor?.epoch === jump.epoch &&
+    candidate.timelineCursor.seq === jump.seq
+  );
+}
+
+function findLoadedTeamJumpItem(
+  presentation: StreamPresentationResult,
+  jump: NonNullable<ReturnType<typeof usePendingTeamMessageJump>>,
+): StreamItem | undefined {
+  const predicate = (candidate: StreamItem) => matchesTeamJumpCandidate(candidate, jump);
+  return (
+    presentation.sourceTail.find(predicate) ??
+    presentation.sourceHead.find(predicate) ??
+    presentation.tail.find(predicate) ??
+    presentation.head.find(predicate)
+  );
+}
+
+function resolveLoadedTeamJumpRowId(
+  loadedItem: StreamItem,
+  presentation: StreamPresentationResult,
+  setToolCallGroupExpanded: (groupId: string, expanded: boolean) => void,
+): string {
+  const displayedRows = [...presentation.tail, ...presentation.head];
+  for (const row of displayedRows) {
+    const group = presentation.groupsByHostId.get(row.id);
+    if (!group?.run.calls.some((call) => call.id === loadedItem.id)) continue;
+    setToolCallGroupExpanded(group.run.id, true);
+    return getStreamItemMessageId(row);
+  }
+  const replacementRowId = presentation.readingRowReplacements.get(loadedItem.id);
+  if (replacementRowId) {
+    const replacementRow = displayedRows.find((row) => row.id === replacementRowId);
+    if (replacementRow) {
+      const group = presentation.groupsByHostId.get(replacementRow.id);
+      if (group) setToolCallGroupExpanded(group.run.id, true);
+      return getStreamItemMessageId(replacementRow);
+    }
+  }
+  return getStreamItemMessageId(loadedItem);
+}
+
+async function runTeamJumpTimelineFetch(input: {
+  resolvedServerId: string;
+  agentId: string;
+  epoch: string;
+  seq: number;
+  requestId: number;
+  isCurrentRequest: () => boolean;
+  inFlightRef: React.MutableRefObject<number | null>;
+  settledRef: React.MutableRefObject<number | null>;
+  onSettledSuccess: () => void;
+  onError: () => void;
+}): Promise<void> {
+  const {
+    resolvedServerId,
+    agentId,
+    epoch,
+    seq,
+    requestId,
+    isCurrentRequest,
+    inFlightRef,
+    settledRef,
+    onSettledSuccess,
+    onError,
+  } = input;
+  inFlightRef.current = requestId;
+  try {
+    await getHostRuntimeStore().fetchAgentTimeline(
+      resolvedServerId,
+      agentId,
+      planTimelinePromptJump({ epoch, seq }),
+      { canApply: isCurrentRequest },
+    );
+    if (inFlightRef.current === requestId) inFlightRef.current = null;
+    if (!isCurrentRequest()) return;
+    settledRef.current = requestId;
+    onSettledSuccess();
+  } catch {
+    if (inFlightRef.current === requestId) inFlightRef.current = null;
+    if (!isCurrentRequest()) return;
+    settledRef.current = requestId;
+    onError();
+  }
+}
+
+function useTeamMessageJumpEffect(input: {
+  isActive: boolean;
+  resolvedServerId: string;
+  agentId: string;
+  presentation: StreamPresentationResult;
+  mountedMessageIds: { has: (messageId: string) => boolean };
+  revealLoadedMessage: (messageId: string) => boolean;
+  setToolCallGroupExpanded: (groupId: string, expanded: boolean) => void;
+  scrollToBottom: () => void;
+  scrollToMessage: (messageId: string) => void;
+  handleTimelineHistoryLoadError: () => void;
+}): void {
+  const {
+    isActive,
+    resolvedServerId,
+    agentId,
+    presentation,
+    mountedMessageIds,
+    revealLoadedMessage,
+    setToolCallGroupExpanded,
+    scrollToBottom,
+    scrollToMessage,
+    handleTimelineHistoryLoadError,
+  } = input;
+  const teamMessageJumpStore = useOptionalTeamMessageJumpStore();
+  const pendingTeamMessageJump = usePendingTeamMessageJump(resolvedServerId, agentId);
+  const inFlightJumpRequestIdRef = useRef<number | null>(null);
+  const settledJumpRequestIdRef = useRef<number | null>(null);
+  const [jumpFetchTick, setJumpFetchTick] = useState(0);
+
+  useEffect(() => {
+    if (!pendingTeamMessageJump || !isActive) return;
+    const { requestId, itemId, messageId, epoch, seq } = pendingTeamMessageJump;
+
+    if (!itemId && !messageId && seq === null) {
+      scrollToBottom();
+      teamMessageJumpStore?.acknowledgeJump(requestId);
+      return;
+    }
+
+    const loadedItem = findLoadedTeamJumpItem(presentation, pendingTeamMessageJump);
+    if (loadedItem) {
+      const scrollRowMessageId = resolveLoadedTeamJumpRowId(
+        loadedItem,
+        presentation,
+        setToolCallGroupExpanded,
+      );
+      if (!mountedMessageIds.has(scrollRowMessageId)) {
+        if (revealLoadedMessage(scrollRowMessageId) || revealLoadedMessage(loadedItem.id)) {
+          return;
+        }
+      }
+      scrollToMessage(scrollRowMessageId);
+      teamMessageJumpStore?.acknowledgeJump(requestId);
+      return;
+    }
+
+    if (!epoch || seq === null || settledJumpRequestIdRef.current === requestId) {
+      teamMessageJumpStore?.acknowledgeJump(requestId);
+      return;
+    }
+
+    if (inFlightJumpRequestIdRef.current !== requestId) {
+      const isCurrentRequest = () => teamMessageJumpStore?.getIntent()?.requestId === requestId;
+      void runTeamJumpTimelineFetch({
+        resolvedServerId,
+        agentId,
+        epoch,
+        seq,
+        requestId,
+        isCurrentRequest,
+        inFlightRef: inFlightJumpRequestIdRef,
+        settledRef: settledJumpRequestIdRef,
+        onSettledSuccess: () => setJumpFetchTick((v) => v + 1),
+        onError: () => {
+          handleTimelineHistoryLoadError();
+          teamMessageJumpStore?.acknowledgeJump(requestId);
+        },
+      });
+    }
+  }, [
+    agentId,
+    handleTimelineHistoryLoadError,
+    isActive,
+    jumpFetchTick,
+    mountedMessageIds,
+    pendingTeamMessageJump,
+    presentation,
+    resolvedServerId,
+    revealLoadedMessage,
+    scrollToBottom,
+    scrollToMessage,
+    setToolCallGroupExpanded,
+    teamMessageJumpStore,
+  ]);
 }
 
 export interface AgentStreamViewProps {
@@ -881,6 +1079,21 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     });
 
     const setToolCallGroupExpanded = toolCallExpansion.setGroupExpanded;
+    const scrollViewportToMessage = useStableEvent((messageId: string) => {
+      viewportRef.current?.scrollToMessage?.(messageId);
+    });
+    useTeamMessageJumpEffect({
+      isActive,
+      resolvedServerId,
+      agentId,
+      presentation,
+      mountedMessageIds,
+      revealLoadedMessage,
+      setToolCallGroupExpanded,
+      scrollToBottom,
+      scrollToMessage: scrollViewportToMessage,
+      handleTimelineHistoryLoadError,
+    });
 
     const renderUserMessageItem = useCallback(
       (layoutItem: StreamLayoutItem, item: Extract<StreamItem, { kind: "user_message" }>) => {

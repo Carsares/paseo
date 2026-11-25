@@ -4,6 +4,7 @@ import type { PressableStateCallbackType } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import {
   Archive,
+  CheckCircle2,
   Circle,
   CircleCheck,
   Copy,
@@ -11,6 +12,7 @@ import {
   Pencil,
   Pin,
   PinOff,
+  RotateCcw,
   Tag,
 } from "lucide-react-native";
 import { PressHighlight } from "@/components/ui/press-highlight";
@@ -57,15 +59,21 @@ const foregroundMutedColorMapping = (theme: Theme) => ({
 const ThemedMoreVertical = withUnistyles(MoreVertical);
 const ThemedCopy = withUnistyles(Copy);
 const ThemedArchive = withUnistyles(Archive);
+const ThemedCheckCircle2 = withUnistyles(CheckCircle2);
 const ThemedCircle = withUnistyles(Circle);
 const ThemedPencil = withUnistyles(Pencil);
 const ThemedCircleCheck = withUnistyles(CircleCheck);
 const ThemedPin = withUnistyles(Pin);
 const ThemedPinOff = withUnistyles(PinOff);
+const ThemedRotateCcw = withUnistyles(RotateCcw);
 const ThemedTag = withUnistyles(Tag);
 
 const copyLeadingIcon = <ThemedCopy size={14} uniProps={foregroundMutedColorMapping} />;
 const renameLeadingIcon = <ThemedPencil size={14} uniProps={foregroundMutedColorMapping} />;
+const markCompletedLeadingIcon = (
+  <ThemedCheckCircle2 size={14} uniProps={foregroundMutedColorMapping} />
+);
+const reopenTopicLeadingIcon = <ThemedRotateCcw size={14} uniProps={foregroundMutedColorMapping} />;
 const markAsReadLeadingIcon = (
   <ThemedCircleCheck size={14} uniProps={foregroundMutedColorMapping} />
 );
@@ -123,6 +131,8 @@ export interface SidebarWorkspaceMenuProps {
   onCopyPath?: () => void;
   onCopyBranchName?: () => void;
   onRename?: () => void;
+  onMarkCompleted?: () => void;
+  onReopenTopic?: () => void;
   onMarkAsRead?: () => void;
   onMarkAsUnread?: () => void;
   onArchive: () => void;
@@ -172,6 +182,8 @@ function SidebarWorkspaceMenuItems({
   onCopyPath,
   onCopyBranchName,
   onRename,
+  onMarkCompleted,
+  onReopenTopic,
   onMarkAsRead,
   onMarkAsUnread,
   onArchive,
@@ -226,6 +238,26 @@ function SidebarWorkspaceMenuItems({
           onSelect={onRename}
         >
           {t("sidebar.workspace.actions.rename")}
+        </WorkspaceMenuItem>
+      ) : null}
+      {onMarkCompleted ? (
+        <WorkspaceMenuItem
+          surface={surface}
+          testID={`sidebar-workspace-menu-mark-completed-${workspaceKey}`}
+          leading={markCompletedLeadingIcon}
+          onSelect={onMarkCompleted}
+        >
+          {t("topicWorkbench.sidebar.markCompleted")}
+        </WorkspaceMenuItem>
+      ) : null}
+      {onReopenTopic ? (
+        <WorkspaceMenuItem
+          surface={surface}
+          testID={`sidebar-workspace-menu-reopen-topic-${workspaceKey}`}
+          leading={reopenTopicLeadingIcon}
+          onSelect={onReopenTopic}
+        >
+          {t("topicWorkbench.sidebar.reopenTopic")}
         </WorkspaceMenuItem>
       ) : null}
       {onMarkAsRead ? (
@@ -298,6 +330,8 @@ export function SidebarWorkspaceMenu({
   onCopyPath,
   onCopyBranchName,
   onRename,
+  onMarkCompleted,
+  onReopenTopic,
   onMarkAsRead,
   onMarkAsUnread,
   onArchive,
@@ -347,6 +381,8 @@ export function SidebarWorkspaceMenu({
           onCopyPath={onCopyPath}
           onCopyBranchName={onCopyBranchName}
           onRename={onRename}
+          onMarkCompleted={onMarkCompleted}
+          onReopenTopic={onReopenTopic}
           onMarkAsRead={onMarkAsRead}
           onMarkAsUnread={onMarkAsUnread}
           onArchive={onArchive}
@@ -380,6 +416,8 @@ export function SidebarWorkspaceContextMenu({
   onCopyPath,
   onCopyBranchName,
   onRename,
+  onMarkCompleted,
+  onReopenTopic,
   onMarkAsRead,
   onMarkAsUnread,
   onArchive,
@@ -467,6 +505,8 @@ export function SidebarWorkspaceContextMenu({
           onCopyPath={onCopyPath}
           onCopyBranchName={onCopyBranchName}
           onRename={onRename}
+          onMarkCompleted={onMarkCompleted}
+          onReopenTopic={onReopenTopic}
           onMarkAsRead={onMarkAsRead}
           onMarkAsUnread={onMarkAsUnread}
           onArchive={onArchive}

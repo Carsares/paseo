@@ -13,6 +13,9 @@ import type { AgentProfile, ProviderSubagentDescriptorPayload } from "@getpaseo/
 import { describe, expect, it } from "vitest";
 import {
   isDirectlyCleanableTaskMember,
+  isMemberActivelyWorking,
+  selectTeamActivityGroups,
+  selectTeamAttributeGroups,
   selectTeamDirectoryData,
   type TeamDirectoryAgent,
 } from "./model";
@@ -308,5 +311,129 @@ describe("selectTeamDirectoryData", () => {
     });
 
     expect(data.cleanableTaskMembers).toEqual([{ serverId: "host", agentId: "cleanable-idle" }]);
+  });
+
+  it("projects unified activity and attribute groupings while keeping working, needs-action, and focused members expanded", () => {
+    const residentIdle = makeAgent("resident-idle", {
+      title: "Architecture Advisor",
+      labels: {
+        ...parentLabel("main"),
+        [RESIDENT_AGENT_LABEL]: "true",
+        [RESIDENT_ROLE_LABEL]: "Advisor",
+      },
+    });
+    const sideChat = makeAgent("side-chat", {
+      title: "Quick scratch",
+      labels: { [SIDE_CHAT_LABEL]: "true", [SIDE_OF_AGENT_ID_LABEL]: "main" },
+    });
+    const l1Active = makeAgent("l1-active", {
+      title: "Backend Lead",
+      labels: parentLabel("main"),
+      status: "running",
+    });
+    const l1Idle = makeAgent("l1-idle", {
+      title: "Frontend Lead",
+      labels: parentLabel("main"),
+      status: "idle",
+    });
+    const l2Idle = makeAgent("l2-idle", {
+      title: "CSS Fixer",
+      labels: parentLabel("l1-idle"),
+      status: "idle",
+    });
+    const l2NeedsPerm = makeAgent("l2-perm", {
+      title: "DB Runner",
+      labels: parentLabel("l1-active"),
+      pendingPermissions: [
+        {
+          id: "perm-db",
+          provider: "codex",
+          name: "bash",
+          kind: "tool",
+          title: "Run migration",
+          description: "",
+        },
+      ],
+    });
+
+    const data = selectTeamDirectoryData({
+      serverId: "host",
+      workspaceId: "ws-1",
+      mainAgentId: "main",
+      agentMaps: {
+        host: new Map(
+          [main, residentIdle, sideChat, l1Active, l1Idle, l2Idle, l2NeedsPerm].map((agent) => [
+            agent.id,
+            agent,
+          ]),
+        ),
+      },
+      fallbackTitle: "Agent",
+    });
+
+    const focused = { serverId: "host", agentId: "l2-idle" };
+    const activity = selectTeamActivityGroups(data, focused);
+    expect(activity.activeMembers.map((node) => node.agentId)).toEqual(["l2-perm", "l1-active"]);
+    expect(activity.activeMembers.every((node) => isMemberActivelyWorking(node))).toBe(true);
+    // Focused idle L2 stays pinned visible even while collapsible inactive rows are folded
+    expect(activity.pinnedInactiveMembers.map((node) => node.agentId)).toEqual(["l2-idle"]);
+    expect(activity.collapsibleInactiveMembers.map((node) => node.agentId)).toEqual([
+      "main",
+      "resident-idle",
+      "l1-idle",
+      "side-chat",
+    ]);
+
+    const attribute = selectTeamAttributeGroups(data, focused);
+    expect(attribute.mainSeat?.agentId).toBe("main");
+    expect(attribute.sideChats.map((node) => node.agentId)).toEqual(["side-chat"]);
+    expect(attribute.levelOne.expandedMembers.map((node) => node.agentId)).toEqual(["l1-active"]);
+    expect(attribute.levelOne.foldedInactiveMembers.map((node) => node.agentId)).toEqual([
+      "resident-idle",
+      "l1-idle",
+    ]);
+    expect(attribute.levelTwo.expandedMembers.map((node) => node.agentId)).toEqual([
+      "l2-perm",
+      "l2-idle",
+    ]);
+    expect(attribute.levelTwo.expandedMembers[0]?.parentTitle).toBe("Backend Lead");
+    expect(attribute.levelTwo.expandedMembers[1]?.parentTitle).toBe("Frontend Lead");
+  });
+
+  it("traverses subagents spawned by a Level-1 resident specialist into Level-2 with the resident role as parentTitle", () => {
+    const resident = makeAgent("res-lead", {
+      title: "Resident Session",
+      labels: {
+        ...parentLabel("main"),
+        [RESIDENT_AGENT_LABEL]: "true",
+        [RESIDENT_ROLE_LABEL]: "Security Auditor",
+      },
+    });
+    const residentChild = makeAgent("res-l2", {
+      title: "Dependency Scanner",
+      labels: parentLabel("res-lead"),
+      status: "running",
+    });
+
+    const data = selectTeamDirectoryData({
+      serverId: "host",
+      workspaceId: "ws-1",
+      mainAgentId: "main",
+      agentMaps: {
+        host: new Map([main, resident, residentChild].map((agent) => [agent.id, agent])),
+      },
+      fallbackTitle: "Agent",
+    });
+
+    expect(data.residentSubtasks).toHaveLength(1);
+    expect(data.residentSubtasks[0]).toMatchObject({
+      agentId: "res-l2",
+      depth: 2,
+      parentAgentId: "res-lead",
+      parentTitle: "Security Auditor",
+    });
+
+    const attribute = selectTeamAttributeGroups(data, null);
+    expect(attribute.levelTwo.expandedMembers.map((node) => node.agentId)).toEqual(["res-l2"]);
   });
 });

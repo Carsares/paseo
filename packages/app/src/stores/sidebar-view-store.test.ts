@@ -4,6 +4,7 @@ import {
   createSidebarViewStorage,
   hasActiveSidebarLabelFilter,
   migrateSidebarViewState,
+  resolveEffectiveSidebarGroupMode,
   SIDEBAR_UNLABELLED_LABEL_KEY,
   useSidebarViewStore,
 } from "./sidebar-view-store";
@@ -35,10 +36,51 @@ describe("sidebar view store", () => {
       workspaceSort: "created",
       showBackground: false,
       groupMode: "project",
+      hasExplicitGroupMode: false,
       hostFilters: [],
       projectFilters: [],
       labelFilter: { labels: [] },
     });
+  });
+
+  it("resolves effective group mode to topic when host supports topicWorkbenchV1 and user has not overridden", () => {
+    expect(
+      resolveEffectiveSidebarGroupMode({
+        groupMode: "project",
+        hasExplicitGroupMode: false,
+        supportsTopicWorkbench: true,
+        hasAnyTopicWorkspace: false,
+      }),
+    ).toBe("topic");
+
+    expect(
+      resolveEffectiveSidebarGroupMode({
+        groupMode: "project",
+        hasExplicitGroupMode: false,
+        supportsTopicWorkbench: false,
+        hasAnyTopicWorkspace: false,
+      }),
+    ).toBe("project");
+
+    useSidebarViewStore.getState().setGroupMode("project");
+    expect(useSidebarViewStore.getState().hasExplicitGroupMode).toBe(true);
+    expect(
+      resolveEffectiveSidebarGroupMode({
+        groupMode: useSidebarViewStore.getState().groupMode,
+        hasExplicitGroupMode: useSidebarViewStore.getState().hasExplicitGroupMode,
+        supportsTopicWorkbench: true,
+        hasAnyTopicWorkspace: true,
+      }),
+    ).toBe("project");
+
+    expect(
+      resolveEffectiveSidebarGroupMode({
+        groupMode: "topic",
+        hasExplicitGroupMode: true,
+        supportsTopicWorkbench: false,
+        hasAnyTopicWorkspace: false,
+      }),
+    ).toBe("project");
   });
 
   it("toggles multiple hosts into and out of the filter", () => {

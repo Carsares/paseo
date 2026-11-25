@@ -2,7 +2,6 @@ import type { AgentAddress } from "@getpaseo/protocol/addresses";
 import {
   getAgentProfileIdFromLabels,
   getParentAddressFromLabels,
-  getParentAgentIdFromLabels,
   getResidentRoleFromLabels,
   getResidentRoleSlugFromLabels,
   isMainControlAgent,
@@ -35,6 +34,8 @@ export type TeamDirectoryAgent = Pick<
 export interface TeamDirectoryMemberNode extends AgentAddress {
   depth: 0 | 1 | 2;
   title: string;
+  parentAgentId: string | null;
+  parentTitle: string | null;
   bucket: SidebarStateBucket;
   sortPriority: 0 | 1 | 2 | 3;
   isArchived: boolean;
@@ -93,6 +94,7 @@ export interface TeamDirectoryData {
   mainSeat: TeamDirectoryMemberNode | null;
   standaloneRoots: TeamDirectoryMemberNode[];
   residentGroups: TeamDirectoryResidentGroup[];
+  residentSubtasks: TeamDirectoryMemberNode[];
   flattenResidentGroups: boolean;
   presetResidents: TeamDirectoryPresetResident[];
   taskTree: TeamDirectoryTaskBranch[];
@@ -101,6 +103,55 @@ export interface TeamDirectoryData {
   cleanableTaskMembers: AgentAddress[];
   historyMembers: TeamDirectoryMemberNode[];
   summary: TeamDirectorySummary;
+}
+
+export interface TeamDirectoryActivityGroups {
+  activeMembers: TeamDirectoryMemberNode[];
+  activeSubruns: TeamDirectoryNativeSubrunNode[];
+  pinnedInactiveMembers: TeamDirectoryMemberNode[];
+  collapsibleInactiveMembers: TeamDirectoryMemberNode[];
+  inactiveSubruns: TeamDirectoryNativeSubrunNode[];
+  totalInactiveCount: number;
+}
+
+export interface TeamDirectoryAttributeSectionSplit {
+  expandedMembers: TeamDirectoryMemberNode[];
+  foldedInactiveMembers: TeamDirectoryMemberNode[];
+}
+
+export interface TeamDirectoryAttributeGroups {
+  mainSeat: TeamDirectoryMemberNode | null;
+  standaloneRoots: TeamDirectoryMemberNode[];
+  sideChats: TeamDirectoryMemberNode[];
+  levelOne: TeamDirectoryAttributeSectionSplit;
+  levelTwo: TeamDirectoryAttributeSectionSplit;
+  levelTwoSubruns: TeamDirectoryNativeSubrunNode[];
+}
+
+export function isMemberActivelyWorking(
+  node: Pick<TeamDirectoryMemberNode, "isRunning" | "bucket" | "isArchived">,
+): boolean {
+  if (node.isArchived) return false;
+  return node.isRunning || node.bucket === "needs_input";
+}
+
+export function shouldKeepMemberExpanded(
+  node: Pick<
+    TeamDirectoryMemberNode,
+    "serverId" | "agentId" | "isRunning" | "bucket" | "isArchived"
+  >,
+  focusedAddress: AgentAddress | null,
+): boolean {
+  if (isMemberActivelyWorking(node)) return true;
+  if (!node.isArchived && (node.bucket === "failed" || node.bucket === "attention")) return true;
+  if (
+    focusedAddress &&
+    node.serverId === focusedAddress.serverId &&
+    node.agentId === focusedAddress.agentId
+  ) {
+    return true;
+  }
+  return false;
 }
 
 export function teamDirectoryNodeKey({ serverId, agentId }: AgentAddress): string {
@@ -194,20 +245,36 @@ export function isDirectlyCleanableTaskMember(
   return agent.status === "idle" || agent.status === "error";
 }
 
+function resolveParentTitle(
+  parentAddress: AgentAddress | null,
+  entriesByKey: ReadonlyMap<string, LocatedDirectoryAgent> | undefined,
+  fallbackTitle: string,
+): string | null {
+  if (!parentAddress) return null;
+  const parentEntry = entriesByKey?.get(teamDirectoryNodeKey(parentAddress));
+  if (parentEntry && isResidentAgent(parentEntry.agent)) {
+    const role = getResidentRoleFromLabels(parentEntry.agent.labels)?.trim();
+    if (role) return role;
+  }
+  return parentEntry?.agent.title?.trim() || fallbackTitle;
+}
+
 function toMemberNode(
   entry: LocatedDirectoryAgent,
   input: {
     depth: 0 | 1 | 2;
     isMain: boolean;
     fallbackTitle: string;
+    entriesByKey?: ReadonlyMap<string, LocatedDirectoryAgent>;
   },
 ): TeamDirectoryMemberNode {
   const { agent, agentId, serverId } = entry;
   const { bucket, sortPriority, isRunning } = resolveMemberBucketAndPriority(agent);
   const resident = isResidentAgent(agent);
   const sideChat = isSideChatAgent(agent);
-  const isStandalone =
-    !getParentAgentIdFromLabels(agent.labels) && !input.isMain && !resident && !sideChat;
+  const parentAddress = getParentAddressFromLabels(agent.labels, serverId);
+  const parentTitle = resolveParentTitle(parentAddress, input.entriesByKey, input.fallbackTitle);
+  const isStandalone = !parentAddress && !input.isMain && !resident && !sideChat;
   const isSilentSeat =
     !agent.archivedAt && agent.status === "closed" && agent.lastUserMessageAt === null;
 
@@ -216,6 +283,8 @@ function toMemberNode(
     agentId,
     depth: input.depth,
     title: agent.title?.trim() || input.fallbackTitle,
+    parentAgentId: parentAddress?.agentId ?? null,
+    parentTitle,
     bucket,
     sortPriority,
     isArchived: Boolean(agent.archivedAt),
@@ -271,6 +340,7 @@ interface DirectoryBuildContext {
   visitedLiveKeys: Set<string>;
   allLiveWorkspaceAgentIds: Set<string>;
   residentGroupsMap: Map<string | null, TeamDirectoryResidentGroup>;
+  residentSubtasks: TeamDirectoryMemberNode[];
   standaloneRoots: TeamDirectoryMemberNode[];
   sideChats: TeamDirectoryMemberNode[];
 }
@@ -348,7 +418,53 @@ function registerResidentNode(
     };
     ctx.residentGroupsMap.set(parentKey, group);
   }
-  group.nodes.push(toMemberNode(entry, { depth, isMain: false, fallbackTitle: ctx.fallbackTitle }));
+  group.nodes.push(
+    toMemberNode(entry, {
+      depth,
+      isMain: false,
+      fallbackTitle: ctx.fallbackTitle,
+      entriesByKey: ctx.entriesByKey,
+    }),
+  );
+}
+
+function collectResidentDescendants(
+  ctx: DirectoryBuildContext,
+  residentEntry: LocatedDirectoryAgent,
+): void {
+  const queue = [...(ctx.childrenByParentKey.get(teamDirectoryNodeKey(residentEntry)) ?? [])];
+  while (queue.length > 0) {
+    const childEntry = queue.shift()!;
+    const childKey = teamDirectoryNodeKey(childEntry);
+    if (ctx.visitedLiveKeys.has(childKey)) continue;
+    ctx.visitedLiveKeys.add(childKey);
+    if (childEntry.serverId === ctx.serverId) {
+      ctx.allLiveWorkspaceAgentIds.add(childEntry.agentId);
+    }
+    if (isSideChatAgent(childEntry.agent)) {
+      ctx.sideChats.push(
+        toMemberNode(childEntry, {
+          depth: 2,
+          isMain: false,
+          fallbackTitle: ctx.fallbackTitle,
+          entriesByKey: ctx.entriesByKey,
+        }),
+      );
+    } else if (isResidentAgent(childEntry.agent)) {
+      registerResidentNode(ctx, childEntry, 2);
+    } else {
+      ctx.residentSubtasks.push(
+        toMemberNode(childEntry, {
+          depth: 2,
+          isMain: false,
+          fallbackTitle: ctx.fallbackTitle,
+          entriesByKey: ctx.entriesByKey,
+        }),
+      );
+    }
+    const deeper = ctx.childrenByParentKey.get(childKey);
+    if (deeper) queue.push(...deeper);
+  }
 }
 
 function collectWorkspaceRoots(
@@ -365,7 +481,12 @@ function collectWorkspaceRoots(
       ctx.visitedLiveKeys.add(key);
       ctx.allLiveWorkspaceAgentIds.add(entry.agentId);
       ctx.sideChats.push(
-        toMemberNode(entry, { depth: 0, isMain: false, fallbackTitle: ctx.fallbackTitle }),
+        toMemberNode(entry, {
+          depth: 0,
+          isMain: false,
+          fallbackTitle: ctx.fallbackTitle,
+          entriesByKey: ctx.entriesByKey,
+        }),
       );
       continue;
     }
@@ -374,12 +495,18 @@ function collectWorkspaceRoots(
       ctx.allLiveWorkspaceAgentIds.add(entry.agentId);
       if (isResidentAgent(entry.agent)) {
         registerResidentNode(ctx, entry, 0);
+        collectResidentDescendants(ctx, entry);
       } else {
         ctx.standaloneRoots.push(
-          toMemberNode(entry, { depth: 0, isMain: false, fallbackTitle: ctx.fallbackTitle }),
+          toMemberNode(entry, {
+            depth: 0,
+            isMain: false,
+            fallbackTitle: ctx.fallbackTitle,
+            entriesByKey: ctx.entriesByKey,
+          }),
         );
+        rootEntries.push(entry);
       }
-      rootEntries.push(entry);
     }
   }
   return rootEntries;
@@ -398,10 +525,16 @@ function collectLevelOneTasks(
       if (child.serverId === ctx.serverId) ctx.allLiveWorkspaceAgentIds.add(child.agentId);
       if (isSideChatAgent(child.agent)) {
         ctx.sideChats.push(
-          toMemberNode(child, { depth: 1, isMain: false, fallbackTitle: ctx.fallbackTitle }),
+          toMemberNode(child, {
+            depth: 1,
+            isMain: false,
+            fallbackTitle: ctx.fallbackTitle,
+            entriesByKey: ctx.entriesByKey,
+          }),
         );
       } else if (isResidentAgent(child.agent)) {
         registerResidentNode(ctx, child, 1);
+        collectResidentDescendants(ctx, child);
       } else {
         levelOneTaskEntries.push(child);
       }
@@ -418,6 +551,7 @@ function buildTaskBranch(
     depth: 1,
     isMain: false,
     fallbackTitle: ctx.fallbackTitle,
+    entriesByKey: ctx.entriesByKey,
   });
   const l2Nodes: TeamDirectoryMemberNode[] = [];
   const queue = [...(ctx.childrenByParentKey.get(teamDirectoryNodeKey(l1Entry)) ?? [])];
@@ -429,13 +563,23 @@ function buildTaskBranch(
     if (l2Entry.serverId === ctx.serverId) ctx.allLiveWorkspaceAgentIds.add(l2Entry.agentId);
     if (isSideChatAgent(l2Entry.agent)) {
       ctx.sideChats.push(
-        toMemberNode(l2Entry, { depth: 2, isMain: false, fallbackTitle: ctx.fallbackTitle }),
+        toMemberNode(l2Entry, {
+          depth: 2,
+          isMain: false,
+          fallbackTitle: ctx.fallbackTitle,
+          entriesByKey: ctx.entriesByKey,
+        }),
       );
     } else if (isResidentAgent(l2Entry.agent)) {
       registerResidentNode(ctx, l2Entry, 2);
     } else {
       l2Nodes.push(
-        toMemberNode(l2Entry, { depth: 2, isMain: false, fallbackTitle: ctx.fallbackTitle }),
+        toMemberNode(l2Entry, {
+          depth: 2,
+          isMain: false,
+          fallbackTitle: ctx.fallbackTitle,
+          entriesByKey: ctx.entriesByKey,
+        }),
       );
     }
     const deeper = ctx.childrenByParentKey.get(l2Key);
@@ -464,7 +608,12 @@ function appendOrphanedWorkspaceEntries(
     ctx.allLiveWorkspaceAgentIds.add(entry.agentId);
     if (isSideChatAgent(entry.agent)) {
       ctx.sideChats.push(
-        toMemberNode(entry, { depth: 1, isMain: false, fallbackTitle: ctx.fallbackTitle }),
+        toMemberNode(entry, {
+          depth: 1,
+          isMain: false,
+          fallbackTitle: ctx.fallbackTitle,
+          entriesByKey: ctx.entriesByKey,
+        }),
       );
     } else if (isResidentAgent(entry.agent)) {
       registerResidentNode(ctx, entry, 1);
@@ -473,6 +622,7 @@ function appendOrphanedWorkspaceEntries(
         depth: 1,
         isMain: false,
         fallbackTitle: ctx.fallbackTitle,
+        entriesByKey: ctx.entriesByKey,
       });
       taskTree.push({ node, children: [], effectivePriority: node.sortPriority });
     }
@@ -533,8 +683,21 @@ function selectPresetResidents(
   return presetResidents;
 }
 
+function isCleanableLeafOrSubtask(
+  node: TeamDirectoryMemberNode,
+  entriesByKey: ReadonlyMap<string, LocatedDirectoryAgent>,
+  childrenByParentKey: ReadonlyMap<string, LocatedDirectoryAgent[]>,
+): boolean {
+  const key = teamDirectoryNodeKey(node);
+  const entry = entriesByKey.get(key);
+  if (!entry || !isDirectlyCleanableTaskMember(entry.agent, entry.serverId)) return false;
+  const rawChildren = childrenByParentKey.get(key) ?? [];
+  return rawChildren.every((child) => isDirectlyCleanableTaskMember(child.agent, child.serverId));
+}
+
 function collectCleanableTaskMembers(
   taskTree: readonly TeamDirectoryTaskBranch[],
+  residentSubtasks: readonly TeamDirectoryMemberNode[],
   entriesByKey: ReadonlyMap<string, LocatedDirectoryAgent>,
   childrenByParentKey: ReadonlyMap<string, LocatedDirectoryAgent[]>,
 ): AgentAddress[] {
@@ -542,8 +705,7 @@ function collectCleanableTaskMembers(
   for (const branch of taskTree) {
     let allChildrenCleanable = true;
     for (const childNode of branch.children) {
-      const childEntry = entriesByKey.get(teamDirectoryNodeKey(childNode));
-      if (childEntry && isDirectlyCleanableTaskMember(childEntry.agent, childEntry.serverId)) {
+      if (isCleanableLeafOrSubtask(childNode, entriesByKey, childrenByParentKey)) {
         cleanable.push({ serverId: childNode.serverId, agentId: childNode.agentId });
       } else {
         allChildrenCleanable = false;
@@ -561,6 +723,11 @@ function collectCleanableTaskMembers(
       isDirectlyCleanableTaskMember(branchEntry.agent, branchEntry.serverId)
     ) {
       cleanable.push({ serverId: branch.node.serverId, agentId: branch.node.agentId });
+    }
+  }
+  for (const subtask of residentSubtasks) {
+    if (isCleanableLeafOrSubtask(subtask, entriesByKey, childrenByParentKey)) {
+      cleanable.push({ serverId: subtask.serverId, agentId: subtask.agentId });
     }
   }
   return cleanable;
@@ -665,6 +832,7 @@ export function selectTeamDirectoryData(input: {
     visitedLiveKeys: new Set<string>(),
     allLiveWorkspaceAgentIds: new Set<string>(),
     residentGroupsMap: new Map<string | null, TeamDirectoryResidentGroup>(),
+    residentSubtasks: [],
     standaloneRoots: [],
     sideChats: [],
   };
@@ -683,6 +851,7 @@ export function selectTeamDirectoryData(input: {
       ? left.effectivePriority - right.effectivePriority
       : compareMembers(left.node, right.node),
   );
+  ctx.residentSubtasks.sort(compareMembers);
   ctx.standaloneRoots.sort(compareMembers);
   ctx.sideChats.sort(compareMembers);
 
@@ -695,6 +864,7 @@ export function selectTeamDirectoryData(input: {
   const presetResidents = selectPresetResidents(residentProfiles, residentGroups);
   const cleanableTaskMembers = collectCleanableTaskMembers(
     taskTree,
+    ctx.residentSubtasks,
     entriesByKey,
     childrenByParentKey,
   );
@@ -717,6 +887,7 @@ export function selectTeamDirectoryData(input: {
     ...(mainSeat ? [mainSeat] : []),
     ...ctx.standaloneRoots,
     ...residentGroups.flatMap((group) => group.nodes),
+    ...ctx.residentSubtasks,
     ...taskTree.flatMap((branch) => [branch.node, ...branch.children]),
     ...ctx.sideChats,
   ];
@@ -725,6 +896,7 @@ export function selectTeamDirectoryData(input: {
     mainSeat,
     standaloneRoots: ctx.standaloneRoots,
     residentGroups,
+    residentSubtasks: ctx.residentSubtasks,
     flattenResidentGroups,
     presetResidents,
     taskTree,
@@ -781,5 +953,107 @@ export function selectWorkspaceTeamSummary(input: {
     activeCount,
     needsInputCount,
     firstNeedsInputAgentId,
+  };
+}
+
+export function selectTeamActivityGroups(
+  data: TeamDirectoryData,
+  focusedAddress: AgentAddress | null,
+  focusedProviderSubagentId: string | null = null,
+): TeamDirectoryActivityGroups {
+  const allLiveNodes: TeamDirectoryMemberNode[] = [
+    ...(data.mainSeat ? [data.mainSeat] : []),
+    ...data.standaloneRoots,
+    ...data.residentGroups.flatMap((group) => group.nodes),
+    ...data.residentSubtasks,
+    ...data.taskTree.flatMap((branch) => [branch.node, ...branch.children]),
+    ...data.sideChats,
+  ];
+
+  const activeMembers: TeamDirectoryMemberNode[] = [];
+  const pinnedInactiveMembers: TeamDirectoryMemberNode[] = [];
+  const collapsibleInactiveMembers: TeamDirectoryMemberNode[] = [];
+
+  for (const node of allLiveNodes) {
+    if (isMemberActivelyWorking(node)) {
+      activeMembers.push(node);
+    } else if (shouldKeepMemberExpanded(node, focusedAddress)) {
+      pinnedInactiveMembers.push(node);
+    } else {
+      collapsibleInactiveMembers.push(node);
+    }
+  }
+
+  activeMembers.sort((left, right) => {
+    if (left.isMain !== right.isMain) return left.isMain ? -1 : 1;
+    return compareMembers(left, right);
+  });
+  pinnedInactiveMembers.sort((left, right) => {
+    if (left.isMain !== right.isMain) return left.isMain ? -1 : 1;
+    return compareMembers(left, right);
+  });
+  collapsibleInactiveMembers.sort((left, right) => {
+    if (left.isMain !== right.isMain) return left.isMain ? -1 : 1;
+    if (left.isResident !== right.isResident) return left.isResident ? -1 : 1;
+    return compareMembers(left, right);
+  });
+
+  const activeSubruns: TeamDirectoryNativeSubrunNode[] = [];
+  const inactiveSubruns: TeamDirectoryNativeSubrunNode[] = [];
+  for (const subrun of data.nativeSubruns) {
+    if (subrun.bucket === "running" || subrun.id === focusedProviderSubagentId) {
+      activeSubruns.push(subrun);
+    } else {
+      inactiveSubruns.push(subrun);
+    }
+  }
+
+  return {
+    activeMembers,
+    activeSubruns,
+    pinnedInactiveMembers,
+    collapsibleInactiveMembers,
+    inactiveSubruns,
+    totalInactiveCount:
+      pinnedInactiveMembers.length + collapsibleInactiveMembers.length + inactiveSubruns.length,
+  };
+}
+
+function splitAttributeSection(
+  nodes: readonly TeamDirectoryMemberNode[],
+  focusedAddress: AgentAddress | null,
+): TeamDirectoryAttributeSectionSplit {
+  const expandedMembers: TeamDirectoryMemberNode[] = [];
+  const foldedInactiveMembers: TeamDirectoryMemberNode[] = [];
+  for (const node of nodes) {
+    if (shouldKeepMemberExpanded(node, focusedAddress)) {
+      expandedMembers.push(node);
+    } else {
+      foldedInactiveMembers.push(node);
+    }
+  }
+  return { expandedMembers, foldedInactiveMembers };
+}
+
+export function selectTeamAttributeGroups(
+  data: TeamDirectoryData,
+  focusedAddress: AgentAddress | null,
+): TeamDirectoryAttributeGroups {
+  const residentNodes = data.residentGroups.flatMap((group) => group.nodes);
+  const levelOneTaskNodes = data.taskTree.map((branch) => branch.node);
+  const levelOneOrdered = [...residentNodes, ...levelOneTaskNodes];
+  const levelTwoOrdered = [
+    ...data.taskTree.flatMap((branch) => branch.children),
+    ...data.residentSubtasks,
+  ];
+  levelTwoOrdered.sort(compareMembers);
+
+  return {
+    mainSeat: data.mainSeat,
+    standaloneRoots: data.standaloneRoots,
+    sideChats: data.sideChats,
+    levelOne: splitAttributeSection(levelOneOrdered, focusedAddress),
+    levelTwo: splitAttributeSection(levelTwoOrdered, focusedAddress),
+    levelTwoSubruns: data.nativeSubruns,
   };
 }

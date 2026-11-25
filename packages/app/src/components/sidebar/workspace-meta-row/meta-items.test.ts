@@ -120,6 +120,22 @@ describe("selectMetaRowItems", () => {
     expect(kinds(items)).toEqual(["host", "services", "labels"]);
   });
 
+  it("shows project identity and pending approval badge when forced in multi-project topic mode", () => {
+    const items = select({
+      forceShowProject: true,
+      pendingApprovalLabel: "2 pending",
+    });
+    expect(kinds(items)).toEqual([
+      "project",
+      "pendingApproval",
+      "host",
+      "changeRequest",
+      "checks",
+      "services",
+      "labels",
+    ]);
+  });
+
   it("carries the resolved check summary rather than the raw hint", () => {
     const checks = select().find((item) => item.kind === "checks");
     expect(checks).toEqual({

@@ -1,5 +1,15 @@
 import { useTranslation } from "react-i18next";
-import React, { createContext, useContext, useEffect, useMemo, type ReactNode } from "react";
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  type ReactNode,
+} from "react";
+import { useShallow } from "zustand/shallow";
+import { useGlobalDurableItems } from "@/durable-items/queries";
+import { getHostRuntimeStore, useHosts } from "@/runtime/host-runtime";
 import {
   useSidebarWorkspacesList,
   type SidebarProjectEntry,
@@ -9,9 +19,12 @@ import {
 import { useSidebarWorkspaceEntries } from "@/hooks/use-sidebar-workspace-entries";
 import { filterDeferredSidebarProjects } from "@/hooks/sidebar-workspaces-view-model";
 import { usePinnedSidebarKeys, type PinnedSidebarGroups } from "@/hooks/use-sidebar-pins";
+import { useSessionStore, type Agent } from "@/stores/session-store";
 import { useSidebarCollapsedSectionsStore } from "@/stores/sidebar-collapsed-sections-store";
+import { useSidebarTopicCompletionStore } from "@/stores/sidebar-topic-completion-store";
 import {
   hasActiveSidebarLabelFilter,
+  resolveEffectiveSidebarGroupMode,
   useSidebarViewStore,
   type SidebarGroupMode,
 } from "@/stores/sidebar-view-store";
@@ -22,6 +35,11 @@ import { isWorkspaceDeferred } from "@/workspace-deferral/model";
 import type { SidebarProjectIconTarget } from "@/utils/sidebar-project-row-model";
 import { filterWorkspacesByLabels, type SidebarWorkspaceGroup } from "./sidebar-labels";
 import { filterWorkspacesByProjects, resolveActiveProjectFilters } from "./sidebar-project-filter";
+import {
+  buildWorkspaceTopicFacts,
+  resolveWorkspaceLatestWorkSignalMs,
+  type TopicWorkspaceFacts,
+} from "./sidebar-topic-view-model";
 import {
   hasAuthoritativeWorkspaceLabelCatalog,
   useWorkspaceLabelProjection,
@@ -39,6 +57,11 @@ interface SidebarModel extends SidebarWorkspacesListResult {
   /** The project filter as it is actually being applied — see `resolveActiveProjectFilters`. */
   resolvedProjectFilters: readonly string[];
   hasProjectsBeforeFilter: boolean;
+  supportsTopicWorkbench: boolean;
+  hasAnyTopicsBeforeFilter: boolean;
+  hiddenNonTopicCount: number;
+  hasMultipleTopicProjects: boolean;
+  topicFactsByWorkspaceKey: ReadonlyMap<string, TopicWorkspaceFacts>;
   groupMode: SidebarGroupMode;
   workspaceGroups: SidebarWorkspaceGroup[];
   projectIconTargets: SidebarProjectIconTarget[];
@@ -46,6 +69,140 @@ interface SidebarModel extends SidebarWorkspacesListResult {
   collapsedProjectKeys: ReadonlySet<string>;
   toggleProjectCollapsed: (projectViewKey: string) => void;
   shortcutModel: SidebarShortcutModel;
+}
+
+function resolveActiveSidebarServerIds(
+  allServerIds: readonly string[],
+  hostFilters: readonly string[],
+): readonly string[] {
+  if (hostFilters.length === 0) return allServerIds;
+  const selected = new Set(hostFilters);
+  const matched = allServerIds.filter((id) => selected.has(id));
+  return matched.length > 0 ? matched : allServerIds;
+}
+
+function groupLiveAgentsByWorkspaceIdentity(
+  agentsByServer: Readonly<Record<string, ReadonlyMap<string, Agent>>>,
+): Map<string, Agent[]> {
+  const result = new Map<string, Agent[]>();
+  for (const [serverId, agents] of Object.entries(agentsByServer)) {
+    for (const agent of agents.values()) {
+      if (!agent.workspaceId || agent.archivedAt || agent.background) continue;
+      const identity = `${serverId}\0${agent.workspaceId}`;
+      const bucket = result.get(identity);
+      if (bucket) bucket.push(agent);
+      else result.set(identity, [agent]);
+    }
+  }
+  return result;
+}
+
+function computeGlobalTopicWorkSignals(input: {
+  workspacesByServer: Readonly<
+    Record<string, ReadonlyMap<string, import("@/stores/session-store").WorkspaceDescriptor>>
+  >;
+  agentsByWorkspaceIdentity: ReadonlyMap<string, Agent[]>;
+  pendingDurableStatsByIdentity: ReadonlyMap<
+    string,
+    { count: number; latestCreatedAtMs: number | null }
+  >;
+}): Record<string, number> {
+  const signals: Record<string, number> = {};
+  for (const [serverId, workspaces] of Object.entries(input.workspacesByServer)) {
+    for (const descriptor of workspaces.values()) {
+      if (!descriptor.topic) continue;
+      const identity = `${serverId}\0${descriptor.id}`;
+      const signalMs = resolveWorkspaceLatestWorkSignalMs({
+        workspace: descriptor,
+        workspaceAgents: input.agentsByWorkspaceIdentity.get(identity) ?? [],
+        latestPendingDurableCreatedAtMs:
+          input.pendingDurableStatsByIdentity.get(identity)?.latestCreatedAtMs ?? null,
+      });
+      if (signalMs !== null) {
+        signals[`${serverId}:${descriptor.id}`] = signalMs;
+      }
+    }
+  }
+  return signals;
+}
+
+function hasTopicOnServers(
+  serverIds: readonly string[],
+  workspacesByServer: Readonly<
+    Record<string, ReadonlyMap<string, { topic?: unknown }> | undefined>
+  >,
+): boolean {
+  for (const serverId of serverIds) {
+    const workspaces = workspacesByServer[serverId];
+    if (!workspaces) continue;
+    for (const descriptor of workspaces.values()) {
+      if (descriptor.topic) return true;
+    }
+  }
+  return false;
+}
+
+function resolveCompletedTopicServerIds(
+  completedAtByWorkspaceKey: Readonly<Record<string, string>>,
+  hostServerIds: readonly string[],
+): string[] {
+  const keys = Object.keys(completedAtByWorkspaceKey);
+  if (keys.length === 0 || hostServerIds.length === 0) return [];
+  const sortedServers = [...hostServerIds].sort((left, right) => right.length - left.length);
+  const needed = new Set<string>();
+  for (const workspaceKey of keys) {
+    for (const serverId of sortedServers) {
+      if (workspaceKey.startsWith(`${serverId}:`)) {
+        needed.add(serverId);
+        break;
+      }
+    }
+  }
+  return [...needed];
+}
+
+function useCompletedTopicDirectoryDemand(
+  completedAtByWorkspaceKey: Readonly<Record<string, string>>,
+): void {
+  const allHosts = useHosts();
+  const completedTopicServerIds = useMemo(
+    () =>
+      resolveCompletedTopicServerIds(
+        completedAtByWorkspaceKey,
+        allHosts.map((host) => host.serverId),
+      ),
+    [allHosts, completedAtByWorkspaceKey],
+  );
+  const releasesByServerRef = useRef<Map<string, () => void>>(new Map());
+
+  useEffect(() => {
+    const runtime = getHostRuntimeStore();
+    if (typeof runtime.acquireDirectoryDemand !== "function") return;
+    const desired = new Set(completedTopicServerIds);
+    const held = releasesByServerRef.current;
+
+    for (const [serverId, release] of held) {
+      if (!desired.has(serverId)) {
+        held.delete(serverId);
+        release();
+      }
+    }
+    for (const serverId of desired) {
+      if (!held.has(serverId)) {
+        held.set(serverId, runtime.acquireDirectoryDemand(serverId));
+      }
+    }
+  }, [completedTopicServerIds]);
+
+  useEffect(() => {
+    const held = releasesByServerRef.current;
+    return () => {
+      for (const release of held.values()) {
+        release();
+      }
+      held.clear();
+    };
+  }, []);
 }
 
 const SidebarModelContext = createContext<SidebarModel | null>(null);
@@ -63,10 +220,144 @@ export function SidebarModelProvider({
   const modelActive = active !== false || keyboardNavigationActive;
   const list = useSidebarWorkspacesList({ enabled: modelActive });
   const showBackground = useSidebarViewStore((state) => state.showBackground);
-  const groupMode = useSidebarViewStore((state) => state.groupMode);
+  const storedGroupMode = useSidebarViewStore((state) => state.groupMode);
+  const hasExplicitGroupMode = useSidebarViewStore((state) => state.hasExplicitGroupMode);
+  const workspaceSort = useSidebarViewStore((state) => state.workspaceSort);
+  const hostFilters = useSidebarViewStore((state) => state.hostFilters);
   const labelFilter = useSidebarViewStore((state) => state.labelFilter);
   const projectFilters = useSidebarViewStore((state) => state.projectFilters);
   const reconcileLabelFilter = useSidebarViewStore((state) => state.reconcileLabelFilter);
+  const completedAtByWorkspaceKey = useSidebarTopicCompletionStore(
+    (state) => state.completedAtByWorkspaceKey,
+  );
+  const lastWorkAtByWorkspaceKey = useSidebarTopicCompletionStore(
+    (state) => state.lastWorkAtByWorkspaceKey,
+  );
+  const recordTopicWorkSignals = useSidebarTopicCompletionStore(
+    (state) => state.recordTopicWorkSignals,
+  );
+  useCompletedTopicDirectoryDemand(completedAtByWorkspaceKey);
+  const topicWorkbenchByServer = useSessionStore(
+    useShallow((state) =>
+      Object.fromEntries(
+        Object.entries(state.sessions).map(([serverId, session]) => [
+          serverId,
+          session.serverInfo?.features?.topicWorkbenchV1 === true,
+        ]),
+      ),
+    ),
+  );
+  const workspacesByServer = useSessionStore(
+    useShallow((state) =>
+      Object.fromEntries(
+        Object.entries(state.sessions).map(([serverId, session]) => [serverId, session.workspaces]),
+      ),
+    ),
+  );
+  const activeServerIds = useMemo(
+    () => resolveActiveSidebarServerIds(Object.keys(workspacesByServer), hostFilters),
+    [hostFilters, workspacesByServer],
+  );
+  const supportsTopicWorkbench = useMemo(
+    () => activeServerIds.some((serverId) => topicWorkbenchByServer[serverId] === true),
+    [activeServerIds, topicWorkbenchByServer],
+  );
+  const agentsByServer = useSessionStore(
+    useShallow((state) =>
+      Object.fromEntries(
+        Object.entries(state.sessions).map(([serverId, session]) => [serverId, session.agents]),
+      ),
+    ),
+  );
+  const activityByServer = useSessionStore(
+    useShallow((state) =>
+      Object.fromEntries(
+        Object.entries(state.sessions).map(([serverId, session]) => [
+          serverId,
+          session.workspaceAgentActivity,
+        ]),
+      ),
+    ),
+  );
+  const { items: pendingDurableItems } = useGlobalDurableItems();
+  const pendingDurableStatsByIdentity = useMemo(() => {
+    const stats = new Map<string, { count: number; latestCreatedAtMs: number | null }>();
+    for (const { serverId, item } of pendingDurableItems) {
+      const identity = `${serverId}\0${item.workspaceId}`;
+      const createdMs = Date.parse(item.createdAt);
+      const validMs = Number.isFinite(createdMs) ? createdMs : null;
+      const existing = stats.get(identity);
+      if (existing) {
+        existing.count += 1;
+        if (validMs !== null) {
+          existing.latestCreatedAtMs =
+            existing.latestCreatedAtMs === null
+              ? validMs
+              : Math.max(existing.latestCreatedAtMs, validMs);
+        }
+      } else {
+        stats.set(identity, { count: 1, latestCreatedAtMs: validMs });
+      }
+    }
+    return stats;
+  }, [pendingDurableItems]);
+
+  const agentsByWorkspaceIdentity = useMemo(
+    () => groupLiveAgentsByWorkspaceIdentity(agentsByServer),
+    [agentsByServer],
+  );
+  const globalWorkSignalsByWorkspaceKey = useMemo(
+    () =>
+      computeGlobalTopicWorkSignals({
+        workspacesByServer,
+        agentsByWorkspaceIdentity,
+        pendingDurableStatsByIdentity,
+      }),
+    [agentsByWorkspaceIdentity, pendingDurableStatsByIdentity, workspacesByServer],
+  );
+
+  useEffect(() => {
+    recordTopicWorkSignals(globalWorkSignalsByWorkspaceKey);
+  }, [globalWorkSignalsByWorkspaceKey, recordTopicWorkSignals]);
+
+  const { topicFactsByWorkspaceKey, hasAnyTopicWorkspace } = useMemo(() => {
+    let foundTopic = hasTopicOnServers(activeServerIds, workspacesByServer);
+    const factsMap = new Map<string, TopicWorkspaceFacts>();
+    for (const placement of list.workspacePlacements) {
+      const descriptor = workspacesByServer[placement.serverId]?.get(placement.workspaceId);
+      const activity = activityByServer[placement.serverId]?.get(placement.workspaceId);
+      const identity = `${placement.serverId}\0${placement.workspaceId}`;
+      const durableStats = pendingDurableStatsByIdentity.get(identity);
+      const facts = buildWorkspaceTopicFacts({
+        workspace: descriptor,
+        workspaceAgents: agentsByWorkspaceIdentity.get(identity) ?? [],
+        completedAtIso: completedAtByWorkspaceKey[placement.workspaceKey],
+        lastWorkAtIso: lastWorkAtByWorkspaceKey[placement.workspaceKey],
+        pendingDurableCount: durableStats?.count ?? 0,
+        latestPendingDurableCreatedAtMs: durableStats?.latestCreatedAtMs ?? null,
+        isDispatchInProgress: activity?.status === "running",
+      });
+      if (facts.isTopic) foundTopic = true;
+      factsMap.set(placement.workspaceKey, facts);
+    }
+    return { topicFactsByWorkspaceKey: factsMap, hasAnyTopicWorkspace: foundTopic };
+  }, [
+    activeServerIds,
+    activityByServer,
+    agentsByWorkspaceIdentity,
+    completedAtByWorkspaceKey,
+    lastWorkAtByWorkspaceKey,
+    list.workspacePlacements,
+    pendingDurableStatsByIdentity,
+    workspacesByServer,
+  ]);
+
+  const groupMode = resolveEffectiveSidebarGroupMode({
+    groupMode: storedGroupMode,
+    hasExplicitGroupMode,
+    supportsTopicWorkbench,
+    hasAnyTopicWorkspace,
+  });
   const { hosts: labelHosts } = useWorkspaceLabelProjection();
   const collapsedProjectKeys = useSidebarCollapsedSectionsStore(
     (state) => state.collapsedProjectKeys,
@@ -109,23 +400,62 @@ export function SidebarModelProvider({
     list.workspacePlacements,
     modelActive || needsWorkspaceEntries,
   );
-  const filteredWorkspaceEntriesByKey = useMemo(() => {
-    const byProject = filterWorkspacesByProjects({
-      workspaces: [...workspaceEntriesByKey.values()].filter(
-        (workspace) => !isWorkspaceDeferred(workspace),
-      ),
-      projectFilters: resolvedProjectFilters,
-    });
-    const filtered = filterWorkspacesByLabels({
-      workspaces: byProject.filter((workspace) => showBackground || !workspace.background),
-      ...labelFilter,
-    });
-    return new Map(filtered.map((workspace) => [workspace.workspaceKey, workspace]));
-  }, [showBackground, labelFilter, resolvedProjectFilters, workspaceEntriesByKey]);
+  const { filteredWorkspaceEntriesByKey, hiddenNonTopicCount, hasAnyTopicsBeforeFilter } =
+    useMemo(() => {
+      const nonDeferred = [...workspaceEntriesByKey.values()].filter(
+        (workspace) => !isWorkspaceDeferred(workspace) && (showBackground || !workspace.background),
+      );
+      const anyTopicsBeforeFilter = nonDeferred.some(
+        (workspace) => topicFactsByWorkspaceKey.get(workspace.workspaceKey)?.isTopic === true,
+      );
+      const byProject = filterWorkspacesByProjects({
+        workspaces: nonDeferred,
+        projectFilters: resolvedProjectFilters,
+      });
+      const filtered = filterWorkspacesByLabels({
+        workspaces: byProject,
+        ...labelFilter,
+      });
+      if (groupMode !== "topic") {
+        return {
+          filteredWorkspaceEntriesByKey: new Map(
+            filtered.map((workspace) => [workspace.workspaceKey, workspace]),
+          ),
+          hiddenNonTopicCount: 0,
+          hasAnyTopicsBeforeFilter: anyTopicsBeforeFilter,
+        };
+      }
+      const topicOnly = filtered.filter(
+        (workspace) => topicFactsByWorkspaceKey.get(workspace.workspaceKey)?.isTopic === true,
+      );
+      return {
+        filteredWorkspaceEntriesByKey: new Map(
+          topicOnly.map((workspace) => [workspace.workspaceKey, workspace]),
+        ),
+        hiddenNonTopicCount: filtered.length - topicOnly.length,
+        hasAnyTopicsBeforeFilter: anyTopicsBeforeFilter,
+      };
+    }, [
+      groupMode,
+      labelFilter,
+      resolvedProjectFilters,
+      showBackground,
+      topicFactsByWorkspaceKey,
+      workspaceEntriesByKey,
+    ]);
   const visibleWorkspaceKeys = useMemo(
     () => new Set(filteredWorkspaceEntriesByKey.keys()),
     [filteredWorkspaceEntriesByKey],
   );
+  const hasMultipleTopicProjects = useMemo(() => {
+    if (groupMode !== "topic" || resolvedProjectFilters.length === 1) return false;
+    const projectKeys = new Set<string>();
+    for (const entry of filteredWorkspaceEntriesByKey.values()) {
+      projectKeys.add(entry.projectViewKey);
+      if (projectKeys.size > 1) return true;
+    }
+    return false;
+  }, [filteredWorkspaceEntriesByKey, groupMode, resolvedProjectFilters.length]);
   // The two filters prune differently on purpose. The project filter is a membership test on the
   // project itself, so a project you filtered TO survives even with no workspaces — it still owns
   // a header row you can create your first workspace under. The label filter can only ask about
@@ -136,18 +466,20 @@ export function SidebarModelProvider({
       const included = new Set(resolvedProjectFilters);
       projects = projects.filter((project) => included.has(project.viewKey));
     }
-    if (hasActiveLabelFilter || !showBackground) {
+    if (groupMode === "topic" || hasActiveLabelFilter || !showBackground) {
       projects = projects.flatMap((project) => {
         const workspaces = project.workspaces.filter((workspace) =>
           visibleWorkspaceKeys.has(workspace.workspaceKey),
         );
-        return workspaces.length > 0 || (!hasActiveLabelFilter && project.workspaces.length === 0)
+        return workspaces.length > 0 ||
+          (groupMode !== "topic" && !hasActiveLabelFilter && project.workspaces.length === 0)
           ? [workspaces.length === project.workspaces.length ? project : { ...project, workspaces }]
           : [];
       });
     }
     return projects;
   }, [
+    groupMode,
     showBackground,
     hasActiveLabelFilter,
     hasActiveProjectFilter,
@@ -165,6 +497,8 @@ export function SidebarModelProvider({
       workspaceEntriesByKey: filteredWorkspaceEntriesByKey,
       projectNamesByViewKey: list.projectNamesByViewKey,
       groupMode,
+      workspaceSort,
+      topicFactsByWorkspaceKey,
       pinnedCollapsed,
       collapsedProjectKeys,
       collapsedWorkspaceGroupKeys,
@@ -174,6 +508,8 @@ export function SidebarModelProvider({
       collapsedProjectKeys,
       collapsedWorkspaceGroupKeys,
       groupMode,
+      workspaceSort,
+      topicFactsByWorkspaceKey,
       list.projectNamesByViewKey,
       filteredProjects,
       pinnedCollapsed,
@@ -191,6 +527,11 @@ export function SidebarModelProvider({
       allProjects: list.projects,
       resolvedProjectFilters,
       hasProjectsBeforeFilter: list.projects.length > 0,
+      supportsTopicWorkbench,
+      hasAnyTopicsBeforeFilter,
+      hiddenNonTopicCount,
+      hasMultipleTopicProjects,
+      topicFactsByWorkspaceKey,
       workspaceEntriesByKey: filteredWorkspaceEntriesByKey,
       groupMode,
       workspaceGroups: projection.workspaceGroups,
@@ -204,6 +545,11 @@ export function SidebarModelProvider({
       resolvedProjectFilters,
       collapsedProjectKeys,
       groupMode,
+      supportsTopicWorkbench,
+      hasAnyTopicsBeforeFilter,
+      hiddenNonTopicCount,
+      hasMultipleTopicProjects,
+      topicFactsByWorkspaceKey,
       list,
       filteredProjects,
       projection,

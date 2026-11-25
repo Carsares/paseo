@@ -1,5 +1,9 @@
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
-import type { AgentProfile, ServerInfoStatusPayload } from "@getpaseo/protocol/messages";
+import type {
+  AgentProfile,
+  ServerInfoStatusPayload,
+  WorkspaceDurableItem,
+} from "@getpaseo/protocol/messages";
 import { useQueryClient } from "@tanstack/react-query";
 import type { TFunction } from "i18next";
 import {
@@ -18,20 +22,27 @@ import {
   UserPlus,
 } from "lucide-react-native";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useRetainedPanelActive } from "@/components/retained-panel";
 import { useTranslation } from "react-i18next";
 import { ScrollView, Text, View } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { useShallow } from "zustand/shallow";
+import { useRetainedPanelActive } from "@/components/retained-panel";
 import { useOpenKebabMenuVisibility } from "@/components/sidebar/use-open-kebab-menu-visibility";
 import { Button } from "@/components/ui/button";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import { PressHighlight } from "@/components/ui/press-highlight";
+import { SegmentedControl, type SegmentedControlOption } from "@/components/ui/segmented-control";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { isNative } from "@/constants/platform";
 import { daemonConfigQueryKey } from "@/data/daemon-config";
 import { useReplicaQuery } from "@/data/query";
+import { useWorkspaceDurableItems } from "@/durable-items/queries";
 import {
   applyArchivedAgentCloseResults,
   clearArchiveAgentPending,
@@ -39,11 +50,26 @@ import {
   usePendingArchiveAgentKeys,
 } from "@/hooks/use-archive-agent";
 import { useHostFeature } from "@/runtime/host-features";
-import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
-import { useSessionStore } from "@/stores/session-store";
+import {
+  getHostRuntimeStore,
+  useHostRuntimeClient,
+  useHostRuntimeIsConnected,
+} from "@/runtime/host-runtime";
+import { selectAgentTimelineState, useSessionStore } from "@/stores/session-store";
+import { planTimelineResumeFetch } from "@/timeline/timeline-sync-plan";
+import {
+  useTeamDirectoryViewStore,
+  type TeamDirectoryAgentGroupMode,
+  type TeamDirectoryTab,
+} from "@/stores/team-directory-view-store";
+import {
+  buildTopicInboxReadScopeKey,
+  useTopicInboxReadStore,
+} from "@/stores/topic-inbox-read-store";
 import type { Theme } from "@/styles/theme";
-import { getStatusDotColor } from "@/utils/status-dot-color";
+import type { StreamItem } from "@/types/stream";
 import type { SidebarStateBucket } from "@/utils/sidebar-agent-state";
+import { getStatusDotColor } from "@/utils/status-dot-color";
 import { useWorkspaceArchivedAgents } from "../main-control-tree/use-workspace-archived-agents";
 import { refreshProviderSubagents, useProviderSubagentStore } from "../provider-store";
 import {
@@ -54,16 +80,21 @@ import {
 import { useCreateResidentAction, useOpenResidentDialog } from "../resident-dialog";
 import { useArchiveSubagent } from "../use-archive-subagent";
 import { useDetachSubagent } from "../use-detach-subagent";
+import { selectTeamDirectoryMessages } from "./messages-model";
+import { DirectoryMessagesView } from "./messages-view";
 import {
   isDirectlyCleanableTaskMember,
+  selectTeamActivityGroups,
+  selectTeamAttributeGroups,
   selectTeamDirectoryData,
   teamDirectoryNodeKey,
+  type TeamDirectoryActivityGroups,
   type TeamDirectoryAgent,
+  type TeamDirectoryAttributeGroups,
+  type TeamDirectoryData,
   type TeamDirectoryMemberNode,
   type TeamDirectoryNativeSubrunNode,
   type TeamDirectoryPresetResident,
-  type TeamDirectoryResidentGroup,
-  type TeamDirectoryTaskBranch,
 } from "./model";
 
 const mutedIconMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
@@ -90,6 +121,8 @@ const UNLINK_ICON = <ThemedUnlink size={14} />;
 const ARCHIVE_ICON = <ThemedArchive size={14} />;
 
 const EMPTY_PROFILES: AgentProfile[] = [];
+const EMPTY_STREAM_ITEMS: readonly StreamItem[] = [];
+const EMPTY_DURABLE_ITEMS: readonly WorkspaceDurableItem[] = [];
 
 type CleanupStatus =
   | { kind: "idle" }
@@ -185,9 +218,23 @@ function resolveMemberStatusText(node: TeamDirectoryMemberNode, t: TFunction): s
   return t("topicWorkbench.directory.statusIdle");
 }
 
-function resolveMemberTrailingTag(node: TeamDirectoryMemberNode, t: TFunction): string | null {
+function resolveMemberRoleTag(
+  node: TeamDirectoryMemberNode,
+  mode: TeamDirectoryAgentGroupMode,
+  t: TFunction,
+): string | null {
   if (node.isMain) return t("topicWorkbench.directory.mainBadge");
+  if (node.isSideChat) return t("topicWorkbench.directory.sideChatBadge");
+  if (node.isResident) {
+    return node.isSilentSeat
+      ? `${t("topicWorkbench.directory.residentBadge")} · ${t("topicWorkbench.directory.silentRegistered")}`
+      : t("topicWorkbench.directory.residentBadge");
+  }
   if (node.isSilentSeat) return t("topicWorkbench.directory.silentRegistered");
+  if (mode === "activity" && !node.isArchived) {
+    if (node.depth === 2) return t("topicWorkbench.directory.levelTwoBadge");
+    if (node.depth === 1) return t("topicWorkbench.directory.levelOneBadge");
+  }
   return null;
 }
 
@@ -285,6 +332,310 @@ function useCompactFinishedCleanup(
   return { cleanupStatus, handleCleanupPress };
 }
 
+function useScopedExpansion(scopeKey: string, initialExpanded = false) {
+  const [state, setState] = useState<{ scopeKey: string; expanded: boolean }>({
+    scopeKey,
+    expanded: initialExpanded,
+  });
+  const expanded = state.scopeKey === scopeKey ? state.expanded : initialExpanded;
+  const toggle = useCallback(() => {
+    setState((current) => ({
+      scopeKey,
+      expanded: current.scopeKey === scopeKey ? !current.expanded : !initialExpanded,
+    }));
+  }, [initialExpanded, scopeKey]);
+  return [expanded, toggle] as const;
+}
+
+function useMainAgentTimelineStreams(serverId: string, mainAgentId: string | null) {
+  const mainStreamTail = useSessionStore((state) =>
+    mainAgentId
+      ? (state.sessions[serverId]?.agentStreamTail.get(mainAgentId) ?? EMPTY_STREAM_ITEMS)
+      : EMPTY_STREAM_ITEMS,
+  );
+  const mainStreamHead = useSessionStore((state) =>
+    mainAgentId
+      ? (state.sessions[serverId]?.agentStreamHead.get(mainAgentId) ?? EMPTY_STREAM_ITEMS)
+      : EMPTY_STREAM_ITEMS,
+  );
+  const mainTimelineHasNewer = useSessionStore((state) =>
+    mainAgentId ? state.sessions[serverId]?.agentTimelineHasNewer.get(mainAgentId) === true : false,
+  );
+  const currentMainEpoch = useSessionStore((state) =>
+    mainAgentId
+      ? (state.sessions[serverId]?.agentTimelineCursor.get(mainAgentId)?.epoch ?? null)
+      : null,
+  );
+  return { mainStreamTail, mainStreamHead, mainTimelineHasNewer, currentMainEpoch };
+}
+
+interface InboxSyncLoopState {
+  running: boolean;
+  dirty: boolean;
+  latestStamp: string;
+  sessionGeneration: number;
+  retryTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const MAX_INBOX_FORWARD_CATCH_UP_PAGES = 50;
+const INBOX_CATCH_UP_RETRY_DELAY_MS = 2_000;
+
+function clearInboxSyncRetryTimer(state: InboxSyncLoopState): void {
+  if (state.retryTimer !== null) {
+    clearTimeout(state.retryTimer);
+    state.retryTimer = null;
+  }
+}
+
+type InboxPageDecision = "apply" | "superseded_epoch" | "superseded_seq" | "reject";
+
+interface InboxTimelineCandidatePage {
+  direction: "tail" | "before" | "after";
+  reset?: boolean;
+  error: string | null;
+  epoch: string;
+  window?: { maxSeq: number };
+  endCursor: { epoch: string; seq: number } | null;
+}
+
+function isSameEpochPageSuperseded(
+  page: InboxTimelineCandidatePage,
+  currentEndSeq: number,
+  requestedAfterSeq: number | null,
+): boolean {
+  const pageMaxSeq = page.endCursor?.seq ?? page.window?.maxSeq ?? -1;
+  if (page.direction === "tail" && !page.reset && pageMaxSeq < currentEndSeq) {
+    return true;
+  }
+  return (
+    page.direction === "after" &&
+    requestedAfterSeq !== null &&
+    currentEndSeq > requestedAfterSeq &&
+    pageMaxSeq <= currentEndSeq
+  );
+}
+
+function evaluateInboxTimelinePage(input: {
+  serverId: string;
+  mainAgentId: string;
+  page: InboxTimelineCandidatePage;
+  baselineEpoch: string | null;
+  requestedAfterSeq: number | null;
+}): InboxPageDecision {
+  const { serverId, mainAgentId, page, baselineEpoch, requestedAfterSeq } = input;
+  if (page.error) return "reject";
+
+  const session = useSessionStore.getState().sessions[serverId];
+  const latest = selectAgentTimelineState(session, mainAgentId);
+  const currentRange = latest.status === "synced" ? latest.range : undefined;
+  const isReplacementPage = page.reset === true || page.direction === "tail";
+  if (!currentRange) {
+    return baselineEpoch === null || isReplacementPage ? "apply" : "reject";
+  }
+  if (baselineEpoch !== currentRange.epoch) {
+    return "superseded_epoch";
+  }
+  if (page.epoch !== currentRange.epoch) {
+    return isReplacementPage ? "apply" : "reject";
+  }
+  return isSameEpochPageSuperseded(page, currentRange.endSeq, requestedAfterSeq)
+    ? "superseded_seq"
+    : "apply";
+}
+
+function didTimelineAdvancePastRequest(
+  serverId: string,
+  mainAgentId: string,
+  baselineEpoch: string | null,
+  requestedAfterSeq: number | null,
+): boolean {
+  const afterApply = selectAgentTimelineState(
+    useSessionStore.getState().sessions[serverId],
+    mainAgentId,
+  );
+  if (afterApply.status !== "synced" || !afterApply.range) return false;
+  if (afterApply.range.epoch !== baselineEpoch) return true;
+  return requestedAfterSeq !== null && afterApply.range.endSeq > requestedAfterSeq;
+}
+
+async function catchUpMainTimelineOnce(
+  serverId: string,
+  mainAgentId: string,
+  isCurrentSession: () => boolean,
+): Promise<boolean> {
+  const runtime = getHostRuntimeStore();
+  if (typeof runtime.fetchAgentTimeline !== "function") return true;
+  await runtime.prepareAgentTimeline?.(serverId, mainAgentId);
+  if (!isCurrentSession()) return false;
+
+  for (let pageCount = 0; pageCount < MAX_INBOX_FORWARD_CATCH_UP_PAGES; pageCount += 1) {
+    if (!isCurrentSession()) return false;
+    const session = useSessionStore.getState().sessions[serverId];
+    if (!session?.viewedTimelineSync) return false;
+    const timeline = selectAgentTimelineState(session, mainAgentId);
+    const range = timeline.status === "synced" ? timeline.range : null;
+    const baselineEpoch = range?.epoch ?? null;
+    const request = planTimelineResumeFetch(range);
+    const requestedAfterSeq = request.direction === "after" ? request.cursor.seq : null;
+    let decision: InboxPageDecision = "reject";
+
+    const page = await runtime.fetchAgentTimeline(serverId, mainAgentId, request, {
+      canApply: (candidate) => {
+        if (!isCurrentSession()) {
+          decision = "reject";
+          return false;
+        }
+        decision = evaluateInboxTimelinePage({
+          serverId,
+          mainAgentId,
+          page: candidate,
+          baselineEpoch,
+          requestedAfterSeq,
+        });
+        return decision === "apply";
+      },
+    });
+    if (!isCurrentSession() || page.error || decision === "reject") return false;
+
+    if (decision === "superseded_epoch") {
+      continue;
+    }
+
+    const syncedAfter =
+      selectAgentTimelineState(useSessionStore.getState().sessions[serverId], mainAgentId)
+        .status === "synced";
+    if (!syncedAfter) return false;
+    if (!page.hasNewer) return true;
+    if (!didTimelineAdvancePastRequest(serverId, mainAgentId, baselineEpoch, requestedAfterSeq)) {
+      return false;
+    }
+  }
+  return false;
+}
+
+async function drainInboxTimelineSyncLoop(input: {
+  state: InboxSyncLoopState;
+  generation: number;
+  serverId: string;
+  mainAgentId: string;
+  onSyncedStamp: (stamp: string) => void;
+}): Promise<void> {
+  const { state, generation, serverId, mainAgentId, onSyncedStamp } = input;
+  const isCurrentSession = () => state.sessionGeneration === generation;
+  try {
+    while (state.dirty && isCurrentSession()) {
+      state.dirty = false;
+      const stampBefore = state.latestStamp;
+      let caughtUp = false;
+      try {
+        caughtUp = await catchUpMainTimelineOnce(serverId, mainAgentId, isCurrentSession);
+      } catch {
+        caughtUp = false;
+      }
+      if (!isCurrentSession()) return;
+      if (caughtUp && !state.dirty) {
+        clearInboxSyncRetryTimer(state);
+        onSyncedStamp(stampBefore);
+      } else if (!caughtUp && !state.dirty && state.retryTimer === null) {
+        state.retryTimer = setTimeout(() => {
+          state.retryTimer = null;
+          if (!isCurrentSession()) return;
+          state.dirty = true;
+          if (!state.running) {
+            state.running = true;
+            void drainInboxTimelineSyncLoop(input);
+          }
+        }, INBOX_CATCH_UP_RETRY_DELAY_MS);
+      }
+    }
+  } finally {
+    if (isCurrentSession()) {
+      state.running = false;
+    }
+  }
+}
+
+function useMainTimelineInboxSync(input: {
+  serverId: string;
+  mainAgentId: string | null;
+  active: boolean;
+  activeTab: string;
+  isConnected: boolean;
+  hasMain: boolean;
+  isMainSilent: boolean;
+}): boolean {
+  const { serverId, mainAgentId, active, activeTab, isConnected, hasMain, isMainSilent } = input;
+  const client = useHostRuntimeClient(serverId);
+  const shouldSync = Boolean(
+    active &&
+    activeTab === "messages" &&
+    isConnected &&
+    client &&
+    mainAgentId &&
+    hasMain &&
+    !isMainSilent,
+  );
+  const mainUpdateStamp = useSessionStore((state) => {
+    if (!mainAgentId) return "";
+    const agent = state.sessions[serverId]?.agents.get(mainAgentId);
+    if (!agent) return "";
+    return `${agent.updatedAt.getTime()}:${agent.attentionTimestamp?.getTime() ?? 0}:${agent.turn.phase}:${agent.pendingSubagentInbox?.count ?? 0}`;
+  });
+  const [syncedStamp, setSyncedStamp] = useState<string>("");
+  const loopStateRef = useRef<InboxSyncLoopState>({
+    running: false,
+    dirty: false,
+    latestStamp: "",
+    sessionGeneration: 0,
+    retryTimer: null,
+  });
+
+  useEffect(() => {
+    const state = loopStateRef.current;
+    state.sessionGeneration += 1;
+    const generation = state.sessionGeneration;
+    state.running = false;
+    clearInboxSyncRetryTimer(state);
+    if (!shouldSync || !mainAgentId || !client) {
+      state.dirty = false;
+      return;
+    }
+    return () => {
+      if (state.sessionGeneration === generation) {
+        state.sessionGeneration += 1;
+        state.dirty = false;
+        state.running = false;
+        clearInboxSyncRetryTimer(state);
+      }
+    };
+  }, [client, mainAgentId, serverId, shouldSync]);
+
+  useEffect(() => {
+    if (!shouldSync || !mainAgentId || !client) return;
+    if (typeof getHostRuntimeStore().fetchAgentTimeline !== "function") {
+      setSyncedStamp(mainUpdateStamp);
+      return;
+    }
+    const state = loopStateRef.current;
+    clearInboxSyncRetryTimer(state);
+    state.latestStamp = mainUpdateStamp;
+    state.dirty = true;
+    if (!state.running) {
+      state.running = true;
+      void drainInboxTimelineSyncLoop({
+        state,
+        generation: state.sessionGeneration,
+        serverId,
+        mainAgentId,
+        onSyncedStamp: setSyncedStamp,
+      });
+    }
+  }, [client, mainAgentId, mainUpdateStamp, serverId, shouldSync]);
+
+  if (!shouldSync || typeof getHostRuntimeStore().fetchAgentTimeline !== "function") return false;
+  return syncedStamp !== mainUpdateStamp;
+}
+
 export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   serverId,
   workspaceId,
@@ -318,19 +669,16 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   const archiveSubagent = useArchiveSubagent();
   const detachSubagent = useDetachSubagent();
 
-  // History expands strictly on user click and resets when switching workspaces.
+  const activeTab = useTeamDirectoryViewStore((state) => state.activeTab);
+  const setActiveTab = useTeamDirectoryViewStore((state) => state.setActiveTab);
+  const agentGroupMode = useTeamDirectoryViewStore((state) => state.agentGroupMode);
+  const setAgentGroupMode = useTeamDirectoryViewStore((state) => state.setAgentGroupMode);
+
   const scopeKey = `${serverId}\0${workspaceId}`;
-  const [historyScope, setHistoryScope] = useState<{ scopeKey: string; expanded: boolean }>({
-    scopeKey,
-    expanded: false,
-  });
-  const historyExpanded = historyScope.scopeKey === scopeKey && historyScope.expanded;
-  const toggleHistory = useCallback(() => {
-    setHistoryScope((current) => ({
-      scopeKey,
-      expanded: current.scopeKey === scopeKey ? !current.expanded : true,
-    }));
-  }, [scopeKey]);
+  const [historyExpanded, toggleHistory] = useScopedExpansion(scopeKey, false);
+  const [activityInactiveExpanded, toggleActivityInactive] = useScopedExpansion(scopeKey, false);
+  const [l1InactiveExpanded, toggleL1Inactive] = useScopedExpansion(`${scopeKey}\0l1`, false);
+  const [l2InactiveExpanded, toggleL2Inactive] = useScopedExpansion(`${scopeKey}\0l2`, false);
 
   const agentMaps = useSessionStore(
     useShallow(
@@ -340,7 +688,9 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
         ),
     ),
   );
-  const localAgents = agentMaps[serverId];
+  const localAgents = useSessionStore((state) => state.sessions[serverId]?.agents);
+  const { mainStreamTail, mainStreamHead, mainTimelineHasNewer, currentMainEpoch } =
+    useMainAgentTimelineStreams(serverId, mainAgentId);
 
   const workspaceAgentMembership = useMemo(() => {
     const entries: Array<[string, boolean]> = [];
@@ -355,10 +705,9 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
   const liveHistory = useWorkspaceArchivedAgents({
     serverId,
     workspaceId,
-    enabled: active && historyExpanded,
+    enabled: active && activeTab === "agents" && historyExpanded,
     workspaceAgentMembership,
   });
-  // The disabled query has no page observers. Keep the last rows in the hidden scroll view.
   const retainedHistory = useRef({ scopeKey, history: liveHistory });
   useLayoutEffect(() => {
     if (active) retainedHistory.current = { scopeKey, history: liveHistory };
@@ -368,7 +717,6 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
       ? retainedHistory.current.history
       : liveHistory;
 
-  // Load resident presets only when resident specialists + profiles are supported.
   const daemonConfigQuery = useReplicaQuery({
     queryKey: daemonConfigQueryKey(serverId),
     enabled: Boolean(
@@ -429,6 +777,68 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
     ],
   );
 
+  const isMainTimelineStale = useMainTimelineInboxSync({
+    serverId,
+    mainAgentId,
+    active,
+    activeTab,
+    isConnected,
+    hasMain: directory.summary.hasMain,
+    isMainSilent: directory.summary.isMainSilent,
+  });
+
+  const focusedAddress = useMemo<AgentAddress | null>(
+    () => (focusedAgentId ? { serverId, agentId: focusedAgentId } : null),
+    [focusedAgentId, serverId],
+  );
+
+  const activityGroups = useMemo(
+    () => selectTeamActivityGroups(directory, focusedAddress, focusedProviderSubagentId),
+    [directory, focusedAddress, focusedProviderSubagentId],
+  );
+  const attributeGroups = useMemo(
+    () => selectTeamAttributeGroups(directory, focusedAddress),
+    [directory, focusedAddress],
+  );
+
+  const durableQuery = useWorkspaceDurableItems(serverId, workspaceId, active);
+  const durableItems = durableQuery.result.data ?? EMPTY_DURABLE_ITEMS;
+  const readScopeKey = useMemo(
+    () => buildTopicInboxReadScopeKey({ serverId, workspaceId, mainAgentId }),
+    [mainAgentId, serverId, workspaceId],
+  );
+  const readScope = useTopicInboxReadStore((state) => state.scopes[readScopeKey]);
+
+  const messagesProjection = useMemo(
+    () =>
+      selectTeamDirectoryMessages({
+        workspaceId,
+        mainAgentId,
+        agents: localAgents,
+        mainStreamTail,
+        mainStreamHead,
+        mainTimelineHasNewer,
+        isMainTimelineStale,
+        currentMainEpoch,
+        durableItems,
+        readScope,
+        fallbackAgentTitle: fallbackTitle,
+      }),
+    [
+      currentMainEpoch,
+      durableItems,
+      fallbackTitle,
+      isMainTimelineStale,
+      localAgents,
+      mainAgentId,
+      mainStreamHead,
+      mainStreamTail,
+      mainTimelineHasNewer,
+      readScope,
+      workspaceId,
+    ],
+  );
+
   const { cleanupStatus, handleCleanupPress } = useCompactFinishedCleanup(
     scopeKey,
     workspaceId,
@@ -447,6 +857,59 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
       });
     },
     [mainAgentId, openResidentDialog, serverId],
+  );
+
+  const liveNodeByAgentId = useMemo(() => {
+    const map = new Map<string, TeamDirectoryMemberNode>();
+    const allNodes = [
+      ...(directory.mainSeat ? [directory.mainSeat] : []),
+      ...directory.standaloneRoots,
+      ...directory.residentGroups.flatMap((group) => group.nodes),
+      ...directory.residentSubtasks,
+      ...directory.taskTree.flatMap((branch) => [branch.node, ...branch.children]),
+      ...directory.sideChats,
+    ];
+    for (const node of allNodes) {
+      if (node.serverId === serverId) {
+        map.set(node.agentId, node);
+      }
+    }
+    return map;
+  }, [directory, serverId]);
+
+  const handleFocusAgentById = useCallback(
+    (targetAgentId: string) => {
+      const existing = liveNodeByAgentId.get(targetAgentId);
+      if (existing) {
+        onOpenAgent(existing);
+        return;
+      }
+      const fallbackAgent = localAgents?.get(targetAgentId);
+      if (!fallbackAgent) return;
+      onOpenAgent({
+        serverId,
+        agentId: targetAgentId,
+        depth: 0,
+        title: fallbackAgent.title?.trim() || fallbackTitle,
+        parentAgentId: fallbackAgent.parentAgentId,
+        parentTitle: null,
+        bucket: "done",
+        sortPriority: 3,
+        isArchived: Boolean(fallbackAgent.archivedAt),
+        isRunning: false,
+        isSilentSeat: false,
+        isMain: targetAgentId === mainAgentId,
+        isStandalone: false,
+        isResident: false,
+        isSideChat: false,
+        residentRole: null,
+        residentSlug: null,
+        profileId: null,
+        lastActivityAt: fallbackAgent.lastActivityAt,
+        createdAt: fallbackAgent.createdAt,
+      });
+    },
+    [fallbackTitle, liveNodeByAgentId, localAgents, mainAgentId, onOpenAgent, serverId],
   );
 
   const rowActions = useMemo<MemberRowActionHandlers>(
@@ -476,16 +939,61 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
     ],
   );
 
+  const unreadCount = messagesProjection.unread.length;
+  const runningCount = directory.summary.runningCount;
+  const tabOptions = useMemo<SegmentedControlOption<TeamDirectoryTab>[]>(
+    () => [
+      {
+        value: "messages",
+        label:
+          unreadCount > 0
+            ? t("topicWorkbench.directory.tabMessagesCount", { count: unreadCount })
+            : t("topicWorkbench.directory.tabMessages"),
+        testID: "team-directory-tab-messages",
+      },
+      {
+        value: "agents",
+        label:
+          runningCount > 0
+            ? t("topicWorkbench.directory.tabAgentsCount", { count: runningCount })
+            : t("topicWorkbench.directory.tabAgents"),
+        testID: "team-directory-tab-agents",
+      },
+    ],
+    [runningCount, t, unreadCount],
+  );
+
+  const groupModeOptions = useMemo<SegmentedControlOption<TeamDirectoryAgentGroupMode>[]>(
+    () => [
+      {
+        value: "activity",
+        label: t("topicWorkbench.directory.groupByActivity"),
+        testID: "team-directory-group-activity",
+      },
+      {
+        value: "attribute",
+        label: t("topicWorkbench.directory.groupByAttribute"),
+        testID: "team-directory-group-attribute",
+      },
+    ],
+    [t],
+  );
+
   return (
     <View
       style={inSheet ? styles.sheet : [styles.sidebar, overlay && styles.overlay]}
       testID="workspace-team-directory"
     >
-      {inSheet ? null : (
-        <View style={styles.header}>
-          <Text numberOfLines={1} style={styles.headerTitle}>
-            {t("topicWorkbench.directory.title")}
-          </Text>
+      <View style={styles.header}>
+        <SegmentedControl
+          size="sm"
+          options={tabOptions}
+          value={activeTab}
+          onValueChange={setActiveTab}
+          style={styles.tabsControl}
+          testID="team-directory-tabs"
+        />
+        {inSheet ? null : (
           <ToolbarButton
             compact
             testID="team-directory-hide"
@@ -494,62 +1002,337 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
           >
             <ThemedPanelLeftClose size={16} />
           </ToolbarButton>
-        </View>
-      )}
+        )}
+      </View>
 
       <ScrollView keyboardShouldPersistTaps="handled" style={styles.scroll}>
         <View style={styles.list}>
-          <DirectoryMainSection
-            mainSeat={directory.mainSeat}
-            standaloneRoots={directory.standaloneRoots}
-            isTopicWorkspace={isTopicWorkspace}
-            onAskFirstQuestion={onAskFirstQuestion}
-            rowActions={rowActions}
-          />
-
-          <DirectoryResidentsSection
-            residentGroups={directory.residentGroups}
-            flattenResidentGroups={directory.flattenResidentGroups}
-            presetResidents={directory.presetResidents}
-            onCreateResident={createResidentAction}
-            onActivatePreset={handleActivatePreset}
-            rowActions={rowActions}
-          />
-
-          <DirectoryTasksSection
-            taskTree={directory.taskTree}
-            cleanableCount={directory.cleanableTaskMembers.length}
-            supportsIdleArchive={supportsIdleArchive}
-            cleanupStatus={cleanupStatus}
-            onCleanupPress={handleCleanupPress}
-            rowActions={rowActions}
-          />
-
-          {directory.sideChats.length > 0 ? (
-            <View style={styles.section}>
-              <View style={styles.sectionHeader}>
-                <Text accessibilityRole="header" numberOfLines={1} style={styles.sectionTitle}>
-                  {t("topicWorkbench.directory.sideChatsSection")}
-                </Text>
+          {activeTab === "messages" ? (
+            <DirectoryMessagesView
+              serverId={serverId}
+              workspaceId={workspaceId}
+              mainAgentId={mainAgentId}
+              readScopeKey={readScopeKey}
+              client={client}
+              projection={messagesProjection}
+              onFocusAgentById={handleFocusAgentById}
+            />
+          ) : (
+            <>
+              <View style={styles.groupSwitcherRow}>
+                <SegmentedControl
+                  size="sm"
+                  options={groupModeOptions}
+                  value={agentGroupMode}
+                  onValueChange={setAgentGroupMode}
+                  testID="team-directory-agent-group-mode"
+                />
               </View>
-              {directory.sideChats.map((node) => (
+
+              {agentGroupMode === "activity" ? (
+                <DirectoryActivityModeContent
+                  directory={directory}
+                  activityGroups={activityGroups}
+                  isTopicWorkspace={isTopicWorkspace}
+                  focusedProviderSubagentId={focusedProviderSubagentId}
+                  inactiveExpanded={activityInactiveExpanded}
+                  onToggleInactive={toggleActivityInactive}
+                  supportsIdleArchive={supportsIdleArchive}
+                  cleanupStatus={cleanupStatus}
+                  onCleanupPress={handleCleanupPress}
+                  onCreateResident={createResidentAction}
+                  onActivatePreset={handleActivatePreset}
+                  onOpenProviderSubrun={onOpenProviderSubrun}
+                  onAskFirstQuestion={onAskFirstQuestion}
+                  rowActions={rowActions}
+                />
+              ) : (
+                <DirectoryAttributeModeContent
+                  directory={directory}
+                  attributeGroups={attributeGroups}
+                  isTopicWorkspace={isTopicWorkspace}
+                  focusedProviderSubagentId={focusedProviderSubagentId}
+                  l1InactiveExpanded={l1InactiveExpanded}
+                  onToggleL1Inactive={toggleL1Inactive}
+                  l2InactiveExpanded={l2InactiveExpanded}
+                  onToggleL2Inactive={toggleL2Inactive}
+                  supportsIdleArchive={supportsIdleArchive}
+                  cleanupStatus={cleanupStatus}
+                  onCleanupPress={handleCleanupPress}
+                  onCreateResident={createResidentAction}
+                  onActivatePreset={handleActivatePreset}
+                  onOpenProviderSubrun={onOpenProviderSubrun}
+                  onAskFirstQuestion={onAskFirstQuestion}
+                  rowActions={rowActions}
+                />
+              )}
+
+              <DirectoryHistorySection
+                expanded={historyExpanded}
+                onToggle={toggleHistory}
+                members={directory.historyMembers}
+                hasLoadedOnce={history.hasLoadedOnce}
+                hasMore={history.hasMore}
+                isLoading={history.isLoading}
+                isLoadingMore={history.isLoadingMore}
+                isError={history.isError}
+                supportsWorkspaceHistory={history.supportsWorkspaceHistory}
+                onLoadMore={history.loadMore}
+                onRetry={history.refetch}
+                groupMode={agentGroupMode}
+                rowActions={rowActions}
+              />
+            </>
+          )}
+        </View>
+      </ScrollView>
+    </View>
+  );
+});
+
+const AddResidentTrigger = memo(function AddResidentTrigger({
+  presetResidents,
+  onCreateResident,
+  onActivatePreset,
+}: {
+  presetResidents: readonly TeamDirectoryPresetResident[];
+  onCreateResident?: () => void;
+  onActivatePreset: (profileId: string) => void;
+}) {
+  const { t } = useTranslation();
+  if (!onCreateResident && presetResidents.length === 0) return null;
+
+  if (presetResidents.length === 0 && onCreateResident) {
+    return (
+      <ToolbarButton
+        compact
+        testID="team-directory-create-resident"
+        label={t("subagents.resident.createAction")}
+        onPress={onCreateResident}
+      >
+        <ThemedPlus size={14} />
+      </ToolbarButton>
+    );
+  }
+
+  return (
+    <DropdownMenu>
+      <ToolbarButton
+        kind="menu"
+        compact
+        testID="team-directory-create-resident"
+        label={t("topicWorkbench.directory.addResidentMenuTitle")}
+      >
+        <ThemedPlus size={14} />
+      </ToolbarButton>
+      <DropdownMenuContent align="end">
+        {presetResidents.map((preset) => (
+          <PresetResidentMenuItem
+            key={preset.profileId}
+            preset={preset}
+            onActivate={onActivatePreset}
+          />
+        ))}
+        {presetResidents.length > 0 && onCreateResident ? <DropdownMenuSeparator /> : null}
+        {onCreateResident ? (
+          <DropdownMenuItem leading={USER_PLUS_ICON} onSelect={onCreateResident}>
+            {t("topicWorkbench.directory.createCustomResident")}
+          </DropdownMenuItem>
+        ) : null}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+});
+
+function PresetResidentMenuItem({
+  preset,
+  onActivate,
+}: {
+  preset: TeamDirectoryPresetResident;
+  onActivate: (profileId: string) => void;
+}) {
+  const handleSelect = useCallback(
+    () => onActivate(preset.profileId),
+    [onActivate, preset.profileId],
+  );
+  return (
+    <DropdownMenuItem
+      leading={USER_PLUS_ICON}
+      onSelect={handleSelect}
+      testID={`team-directory-preset-${preset.profileId}`}
+    >
+      {preset.name}
+    </DropdownMenuItem>
+  );
+}
+
+const CleanupActionButton = memo(function CleanupActionButton({
+  cleanableCount,
+  supportsIdleArchive,
+  cleanupStatus,
+  onCleanupPress,
+}: {
+  cleanableCount: number;
+  supportsIdleArchive: boolean;
+  cleanupStatus: CleanupStatus;
+  onCleanupPress: () => void;
+}) {
+  const { t } = useTranslation();
+  const cleanupTooltip = useMemo(
+    () => <Text style={styles.tooltipText}>{t("topicWorkbench.directory.cleanupTooltip")}</Text>,
+    [t],
+  );
+  const showCleanupAction =
+    supportsIdleArchive && (cleanableCount > 0 || cleanupStatus.kind !== "idle");
+  if (!showCleanupAction) return null;
+  const cleanupLabel = resolveCleanupLabel(cleanupStatus, cleanableCount, t);
+
+  return (
+    <ToolbarButton
+      compact
+      disabled={cleanupStatus.kind === "running"}
+      label={cleanupLabel}
+      tooltip={cleanupTooltip}
+      onPress={onCleanupPress}
+      testID="team-directory-cleanup-finished"
+    >
+      <ThemedTrash2 size={14} />
+    </ToolbarButton>
+  );
+});
+
+const DirectoryActivityModeContent = memo(function DirectoryActivityModeContent({
+  directory,
+  activityGroups,
+  isTopicWorkspace,
+  focusedProviderSubagentId,
+  inactiveExpanded,
+  onToggleInactive,
+  supportsIdleArchive,
+  cleanupStatus,
+  onCleanupPress,
+  onCreateResident,
+  onActivatePreset,
+  onOpenProviderSubrun,
+  onAskFirstQuestion,
+  rowActions,
+}: {
+  directory: TeamDirectoryData;
+  activityGroups: TeamDirectoryActivityGroups;
+  isTopicWorkspace: boolean;
+  focusedProviderSubagentId: string | null;
+  inactiveExpanded: boolean;
+  onToggleInactive: () => void;
+  supportsIdleArchive: boolean;
+  cleanupStatus: CleanupStatus;
+  onCleanupPress: () => void;
+  onCreateResident?: () => void;
+  onActivatePreset: (profileId: string) => void;
+  onOpenProviderSubrun: (parentAgentId: string, subagentId: string) => void;
+  onAskFirstQuestion?: () => void;
+  rowActions: MemberRowActionHandlers;
+}) {
+  const { t } = useTranslation();
+  const activeCount = activityGroups.activeMembers.length + activityGroups.activeSubruns.length;
+  const hasCollapsibleInactive =
+    activityGroups.collapsibleInactiveMembers.length > 0 ||
+    activityGroups.inactiveSubruns.length > 0;
+  const showInactiveSection =
+    activityGroups.totalInactiveCount > 0 || cleanupStatus.kind !== "idle";
+  const inactiveExpandedState = useMemo(() => ({ expanded: inactiveExpanded }), [inactiveExpanded]);
+
+  return (
+    <>
+      <View style={styles.section} testID="team-directory-activity-active">
+        <View style={styles.sectionHeader}>
+          <Text accessibilityRole="header" numberOfLines={1} style={styles.sectionTitle}>
+            {t("topicWorkbench.directory.activityActiveSection", { count: activeCount })}
+          </Text>
+          <AddResidentTrigger
+            presetResidents={directory.presetResidents}
+            onCreateResident={onCreateResident}
+            onActivatePreset={onActivatePreset}
+          />
+        </View>
+
+        {!directory.mainSeat && isTopicWorkspace ? (
+          <UnboundMainBlock onAskFirstQuestion={onAskFirstQuestion} />
+        ) : null}
+
+        {activeCount === 0 && (directory.mainSeat || !isTopicWorkspace) ? (
+          <Text style={styles.historyMeta}>
+            {t("topicWorkbench.directory.activityEmptyActive")}
+          </Text>
+        ) : null}
+
+        {activityGroups.activeMembers.map((node) => (
+          <TeamMemberRow
+            key={teamDirectoryNodeKey(node)}
+            node={node}
+            groupMode="activity"
+            showParentSubtitle={node.depth === 2}
+            rowActions={rowActions}
+          />
+        ))}
+        {activityGroups.activeSubruns.map((subrun) => (
+          <NativeSubrunRow
+            key={`${subrun.parentAgentId}:${subrun.id}`}
+            subrun={subrun}
+            isFocused={focusedProviderSubagentId === subrun.id}
+            onOpen={onOpenProviderSubrun}
+          />
+        ))}
+      </View>
+
+      {showInactiveSection ? (
+        <View style={styles.section} testID="team-directory-activity-inactive">
+          <View style={styles.sectionHeader}>
+            <PressHighlight
+              style={styles.sectionToggleButton}
+              highlightStyle={styles.rowHighlight}
+              accessibilityRole="button"
+              accessibilityState={inactiveExpandedState}
+              disabled={!hasCollapsibleInactive}
+              onPress={onToggleInactive}
+              testID="team-directory-toggle-inactive"
+            >
+              {renderSectionChevron(hasCollapsibleInactive, inactiveExpanded)}
+              <Text numberOfLines={1} style={styles.sectionTitle}>
+                {t("topicWorkbench.directory.activityInactiveSection", {
+                  count: activityGroups.totalInactiveCount,
+                })}
+              </Text>
+            </PressHighlight>
+            <CleanupActionButton
+              cleanableCount={directory.cleanableTaskMembers.length}
+              supportsIdleArchive={supportsIdleArchive}
+              cleanupStatus={cleanupStatus}
+              onCleanupPress={onCleanupPress}
+            />
+          </View>
+
+          {activityGroups.pinnedInactiveMembers.map((node) => (
+            <TeamMemberRow
+              key={teamDirectoryNodeKey(node)}
+              node={node}
+              groupMode="activity"
+              showParentSubtitle={node.depth === 2}
+              rowActions={rowActions}
+            />
+          ))}
+
+          {inactiveExpanded ? (
+            <View style={styles.historyBody}>
+              {activityGroups.collapsibleInactiveMembers.map((node) => (
                 <TeamMemberRow
                   key={teamDirectoryNodeKey(node)}
                   node={node}
+                  groupMode="activity"
+                  showParentSubtitle={node.depth === 2}
                   rowActions={rowActions}
                 />
               ))}
-            </View>
-          ) : null}
-
-          {directory.nativeSubruns.length > 0 ? (
-            <View style={styles.section}>
-              <View style={styles.sectionHeader}>
-                <Text accessibilityRole="header" numberOfLines={1} style={styles.sectionTitle}>
-                  {t("topicWorkbench.directory.nativeSubrunsSection")}
-                </Text>
-              </View>
-              {directory.nativeSubruns.map((subrun) => (
+              {activityGroups.inactiveSubruns.map((subrun) => (
                 <NativeSubrunRow
                   key={`${subrun.parentAgentId}:${subrun.id}`}
                   subrun={subrun}
@@ -559,207 +1342,248 @@ export const WorkspaceTeamDirectory = memo(function WorkspaceTeamDirectory({
               ))}
             </View>
           ) : null}
-
-          <DirectoryHistorySection
-            expanded={historyExpanded}
-            onToggle={toggleHistory}
-            members={directory.historyMembers}
-            hasLoadedOnce={history.hasLoadedOnce}
-            hasMore={history.hasMore}
-            isLoading={history.isLoading}
-            isLoadingMore={history.isLoadingMore}
-            isError={history.isError}
-            supportsWorkspaceHistory={history.supportsWorkspaceHistory}
-            onLoadMore={history.loadMore}
-            onRetry={history.refetch}
-            rowActions={rowActions}
-          />
-        </View>
-      </ScrollView>
-    </View>
-  );
-});
-
-const DirectoryMainSection = memo(function DirectoryMainSection({
-  mainSeat,
-  standaloneRoots,
-  isTopicWorkspace,
-  onAskFirstQuestion,
-  rowActions,
-}: {
-  mainSeat: TeamDirectoryMemberNode | null;
-  standaloneRoots: readonly TeamDirectoryMemberNode[];
-  isTopicWorkspace: boolean;
-  onAskFirstQuestion?: () => void;
-  rowActions: MemberRowActionHandlers;
-}) {
-  const { t } = useTranslation();
-  return (
-    <>
-      {mainSeat ? <TeamMemberRow node={mainSeat} rowActions={rowActions} /> : null}
-      {!mainSeat && isTopicWorkspace ? (
-        <View style={styles.unboundBlock} testID="team-directory-unbound-main">
-          <Text style={styles.mutedText} numberOfLines={1}>
-            {t("topicWorkbench.directory.unboundMain")}
-          </Text>
-          {onAskFirstQuestion ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              onPress={onAskFirstQuestion}
-              testID="team-directory-bind-main"
-            >
-              {t("topicWorkbench.directory.bindMainAction")}
-            </Button>
-          ) : null}
         </View>
       ) : null}
-      {standaloneRoots.map((node) => (
-        <TeamMemberRow key={teamDirectoryNodeKey(node)} node={node} rowActions={rowActions} />
-      ))}
     </>
   );
 });
 
-const DirectoryResidentsSection = memo(function DirectoryResidentsSection({
-  residentGroups,
-  flattenResidentGroups,
-  presetResidents,
-  onCreateResident,
-  onActivatePreset,
-  rowActions,
-}: {
-  residentGroups: readonly TeamDirectoryResidentGroup[];
-  flattenResidentGroups: boolean;
-  presetResidents: readonly TeamDirectoryPresetResident[];
-  onCreateResident?: () => void;
-  onActivatePreset: (profileId: string) => void;
-  rowActions: MemberRowActionHandlers;
-}) {
-  const { t } = useTranslation();
-  if (residentGroups.length === 0 && presetResidents.length === 0 && !onCreateResident) {
-    return null;
-  }
-  return (
-    <View style={styles.section}>
-      <View style={styles.sectionHeader}>
-        <Text accessibilityRole="header" numberOfLines={1} style={styles.sectionTitle}>
-          {t("topicWorkbench.directory.residentsSection")}
-        </Text>
-        {onCreateResident ? (
-          <ToolbarButton
-            compact
-            testID="team-directory-create-resident"
-            label={t("subagents.resident.createAction")}
-            onPress={onCreateResident}
-          >
-            <ThemedPlus size={14} />
-          </ToolbarButton>
-        ) : null}
-      </View>
-
-      {residentGroups.map((group) => (
-        <View key={group.parent ? teamDirectoryNodeKey(group.parent) : "standalone"}>
-          {!flattenResidentGroups ? (
-            <View style={styles.subGroupHeader}>
-              <Text numberOfLines={1} style={styles.subGroupTitle}>
-                {group.parentTitle ?? t("topicWorkbench.directory.standalone")}
-              </Text>
-            </View>
-          ) : null}
-          {group.nodes.map((node) => (
-            <TeamMemberRow key={teamDirectoryNodeKey(node)} node={node} rowActions={rowActions} />
-          ))}
-        </View>
-      ))}
-
-      {presetResidents.map((preset) => (
-        <PresetResidentRow key={preset.profileId} preset={preset} onActivate={onActivatePreset} />
-      ))}
-    </View>
-  );
-});
-
-const TaskBranchItem = memo(function TaskBranchItem({
-  branch,
-  rowActions,
-}: {
-  branch: TeamDirectoryTaskBranch;
-  rowActions: MemberRowActionHandlers;
-}) {
-  return (
-    <View>
-      <TeamMemberRow node={branch.node} rowActions={rowActions} />
-      {branch.children.length > 0 ? (
-        <View style={styles.nestedTreeRail}>
-          {branch.children.map((child) => (
-            <TeamMemberRow key={teamDirectoryNodeKey(child)} node={child} rowActions={rowActions} />
-          ))}
-        </View>
-      ) : null}
-    </View>
-  );
-});
-
-const DirectoryTasksSection = memo(function DirectoryTasksSection({
-  taskTree,
-  cleanableCount,
+const DirectoryAttributeModeContent = memo(function DirectoryAttributeModeContent({
+  directory,
+  attributeGroups,
+  isTopicWorkspace,
+  focusedProviderSubagentId,
+  l1InactiveExpanded,
+  onToggleL1Inactive,
+  l2InactiveExpanded,
+  onToggleL2Inactive,
   supportsIdleArchive,
   cleanupStatus,
   onCleanupPress,
+  onCreateResident,
+  onActivatePreset,
+  onOpenProviderSubrun,
+  onAskFirstQuestion,
   rowActions,
 }: {
-  taskTree: readonly TeamDirectoryTaskBranch[];
-  cleanableCount: number;
+  directory: TeamDirectoryData;
+  attributeGroups: TeamDirectoryAttributeGroups;
+  isTopicWorkspace: boolean;
+  focusedProviderSubagentId: string | null;
+  l1InactiveExpanded: boolean;
+  onToggleL1Inactive: () => void;
+  l2InactiveExpanded: boolean;
+  onToggleL2Inactive: () => void;
   supportsIdleArchive: boolean;
   cleanupStatus: CleanupStatus;
   onCleanupPress: () => void;
+  onCreateResident?: () => void;
+  onActivatePreset: (profileId: string) => void;
+  onOpenProviderSubrun: (parentAgentId: string, subagentId: string) => void;
+  onAskFirstQuestion?: () => void;
   rowActions: MemberRowActionHandlers;
 }) {
   const { t } = useTranslation();
-  const cleanupTooltip = useMemo(
-    () => <Text style={styles.tooltipText}>{t("topicWorkbench.directory.cleanupTooltip")}</Text>,
-    [t],
-  );
-  if (taskTree.length === 0 && cleanupStatus.kind === "idle") {
-    return null;
-  }
-  const showCleanupAction =
-    supportsIdleArchive && (cleanableCount > 0 || cleanupStatus.kind !== "idle");
-  const cleanupLabel = resolveCleanupLabel(cleanupStatus, cleanableCount, t);
+  const hasLevelOne =
+    attributeGroups.levelOne.expandedMembers.length > 0 ||
+    attributeGroups.levelOne.foldedInactiveMembers.length > 0 ||
+    Boolean(onCreateResident) ||
+    directory.presetResidents.length > 0 ||
+    cleanupStatus.kind !== "idle";
+  const hasLevelTwo =
+    attributeGroups.levelTwo.expandedMembers.length > 0 ||
+    attributeGroups.levelTwo.foldedInactiveMembers.length > 0 ||
+    attributeGroups.levelTwoSubruns.length > 0;
 
   return (
-    <View style={styles.section}>
-      <View style={styles.sectionHeader}>
-        <Text accessibilityRole="header" numberOfLines={1} style={styles.sectionTitle}>
-          {t("topicWorkbench.directory.tasksSection")}
-        </Text>
-        {showCleanupAction ? (
-          <ToolbarButton
-            compact
-            disabled={cleanupStatus.kind === "running"}
-            label={cleanupLabel}
-            tooltip={cleanupTooltip}
-            onPress={onCleanupPress}
-            testID="team-directory-cleanup-finished"
-          >
-            <ThemedTrash2 size={14} />
-          </ToolbarButton>
+    <>
+      <View style={styles.section} testID="team-directory-attribute-main">
+        <View style={styles.sectionHeader}>
+          <Text accessibilityRole="header" numberOfLines={1} style={styles.sectionTitle}>
+            {t("topicWorkbench.directory.attributeMainSection")}
+          </Text>
+        </View>
+        {attributeGroups.mainSeat ? (
+          <TeamMemberRow
+            node={attributeGroups.mainSeat}
+            groupMode="attribute"
+            rowActions={rowActions}
+          />
         ) : null}
-      </View>
-
-      <View style={styles.taskTreeRail}>
-        {taskTree.map((branch) => (
-          <TaskBranchItem
-            key={teamDirectoryNodeKey(branch.node)}
-            branch={branch}
+        {!attributeGroups.mainSeat && isTopicWorkspace ? (
+          <UnboundMainBlock onAskFirstQuestion={onAskFirstQuestion} />
+        ) : null}
+        {attributeGroups.standaloneRoots.map((node) => (
+          <TeamMemberRow
+            key={teamDirectoryNodeKey(node)}
+            node={node}
+            groupMode="attribute"
+            rowActions={rowActions}
+          />
+        ))}
+        {attributeGroups.sideChats.map((node) => (
+          <TeamMemberRow
+            key={teamDirectoryNodeKey(node)}
+            node={node}
+            groupMode="attribute"
             rowActions={rowActions}
           />
         ))}
       </View>
+
+      {hasLevelOne ? (
+        <View style={styles.section} testID="team-directory-attribute-l1">
+          <View style={styles.sectionHeader}>
+            <Text accessibilityRole="header" numberOfLines={1} style={styles.sectionTitle}>
+              {t("topicWorkbench.directory.attributeLevelOneSection")}
+            </Text>
+            <View style={styles.headerActions}>
+              <CleanupActionButton
+                cleanableCount={directory.cleanableTaskMembers.length}
+                supportsIdleArchive={supportsIdleArchive}
+                cleanupStatus={cleanupStatus}
+                onCleanupPress={onCleanupPress}
+              />
+              <AddResidentTrigger
+                presetResidents={directory.presetResidents}
+                onCreateResident={onCreateResident}
+                onActivatePreset={onActivatePreset}
+              />
+            </View>
+          </View>
+
+          {attributeGroups.levelOne.expandedMembers.map((node) => (
+            <TeamMemberRow
+              key={teamDirectoryNodeKey(node)}
+              node={node}
+              groupMode="attribute"
+              rowActions={rowActions}
+            />
+          ))}
+
+          <InactiveSectionFold
+            foldedNodes={attributeGroups.levelOne.foldedInactiveMembers}
+            expanded={l1InactiveExpanded}
+            onToggle={onToggleL1Inactive}
+            showParentSubtitle={false}
+            testID="team-directory-toggle-l1-inactive"
+            rowActions={rowActions}
+          />
+        </View>
+      ) : null}
+
+      {hasLevelTwo ? (
+        <View style={styles.section} testID="team-directory-attribute-l2">
+          <View style={styles.sectionHeader}>
+            <Text accessibilityRole="header" numberOfLines={1} style={styles.sectionTitle}>
+              {t("topicWorkbench.directory.attributeLevelTwoSection")}
+            </Text>
+          </View>
+
+          {attributeGroups.levelTwo.expandedMembers.map((node) => (
+            <TeamMemberRow
+              key={teamDirectoryNodeKey(node)}
+              node={node}
+              groupMode="attribute"
+              showParentSubtitle
+              rowActions={rowActions}
+            />
+          ))}
+
+          {attributeGroups.levelTwoSubruns.map((subrun) => (
+            <NativeSubrunRow
+              key={`${subrun.parentAgentId}:${subrun.id}`}
+              subrun={subrun}
+              isFocused={focusedProviderSubagentId === subrun.id}
+              onOpen={onOpenProviderSubrun}
+            />
+          ))}
+
+          <InactiveSectionFold
+            foldedNodes={attributeGroups.levelTwo.foldedInactiveMembers}
+            expanded={l2InactiveExpanded}
+            onToggle={onToggleL2Inactive}
+            showParentSubtitle
+            testID="team-directory-toggle-l2-inactive"
+            rowActions={rowActions}
+          />
+        </View>
+      ) : null}
+    </>
+  );
+});
+
+const InactiveSectionFold = memo(function InactiveSectionFold({
+  foldedNodes,
+  expanded,
+  onToggle,
+  showParentSubtitle,
+  testID,
+  rowActions,
+}: {
+  foldedNodes: readonly TeamDirectoryMemberNode[];
+  expanded: boolean;
+  onToggle: () => void;
+  showParentSubtitle: boolean;
+  testID: string;
+  rowActions: MemberRowActionHandlers;
+}) {
+  const { t } = useTranslation();
+  const expandedState = useMemo(() => ({ expanded }), [expanded]);
+  if (foldedNodes.length === 0) return null;
+
+  return (
+    <View style={styles.historyBody}>
+      <PressHighlight
+        style={styles.historyToggleRow}
+        highlightStyle={styles.rowHighlight}
+        accessibilityRole="button"
+        accessibilityState={expandedState}
+        onPress={onToggle}
+        testID={testID}
+      >
+        {expanded ? <ThemedChevronDown size={13} /> : <ThemedChevronRight size={13} />}
+        <Text numberOfLines={1} style={styles.foldLabel}>
+          {expanded
+            ? t("topicWorkbench.directory.hideInactiveFold", { count: foldedNodes.length })
+            : t("topicWorkbench.directory.inactiveFoldToggle", { count: foldedNodes.length })}
+        </Text>
+      </PressHighlight>
+      {expanded
+        ? foldedNodes.map((node) => (
+            <TeamMemberRow
+              key={teamDirectoryNodeKey(node)}
+              node={node}
+              groupMode="attribute"
+              showParentSubtitle={showParentSubtitle}
+              rowActions={rowActions}
+            />
+          ))
+        : null}
     </View>
   );
 });
+
+function UnboundMainBlock({ onAskFirstQuestion }: { onAskFirstQuestion?: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <View style={styles.unboundBlock} testID="team-directory-unbound-main">
+      <Text style={styles.mutedText} numberOfLines={1}>
+        {t("topicWorkbench.directory.unboundMain")}
+      </Text>
+      {onAskFirstQuestion ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          onPress={onAskFirstQuestion}
+          testID="team-directory-bind-main"
+        >
+          {t("topicWorkbench.directory.bindMainAction")}
+        </Button>
+      ) : null}
+    </View>
+  );
+}
 
 const DirectoryHistorySection = memo(function DirectoryHistorySection({
   expanded,
@@ -773,6 +1597,7 @@ const DirectoryHistorySection = memo(function DirectoryHistorySection({
   supportsWorkspaceHistory,
   onLoadMore,
   onRetry,
+  groupMode,
   rowActions,
 }: {
   expanded: boolean;
@@ -786,6 +1611,7 @@ const DirectoryHistorySection = memo(function DirectoryHistorySection({
   supportsWorkspaceHistory: boolean;
   onLoadMore: () => void;
   onRetry: () => void;
+  groupMode: TeamDirectoryAgentGroupMode;
   rowActions: MemberRowActionHandlers;
 }) {
   const { t } = useTranslation();
@@ -805,15 +1631,20 @@ const DirectoryHistorySection = memo(function DirectoryHistorySection({
         {expanded ? <ThemedChevronDown size={14} /> : <ThemedChevronRight size={14} />}
         <Text numberOfLines={1} style={styles.sectionTitle}>
           {expanded && hasLoadedOnce
-            ? t("topicWorkbench.directory.historySection", { count: members.length })
-            : t("topicWorkbench.directory.viewHistory")}
+            ? t("topicWorkbench.directory.activityArchivedSectionCount", { count: members.length })
+            : t("topicWorkbench.directory.activityArchivedSection")}
         </Text>
       </PressHighlight>
 
       {expanded ? (
         <View style={styles.historyBody}>
           {members.map((node) => (
-            <TeamMemberRow key={teamDirectoryNodeKey(node)} node={node} rowActions={rowActions} />
+            <TeamMemberRow
+              key={teamDirectoryNodeKey(node)}
+              node={node}
+              groupMode={groupMode}
+              rowActions={rowActions}
+            />
           ))}
           {!supportsWorkspaceHistory ? (
             <Text style={styles.historyMeta}>
@@ -953,16 +1784,47 @@ const TeamMemberRowMenu = memo(function TeamMemberRowMenu({
   );
 });
 
+function renderSectionChevron(visible: boolean, expanded: boolean) {
+  if (!visible) return null;
+  return expanded ? <ThemedChevronDown size={14} /> : <ThemedChevronRight size={14} />;
+}
+
+function deriveTeamMemberRowCapabilities(
+  node: TeamDirectoryMemberNode,
+  rowActions: MemberRowActionHandlers,
+): {
+  canResetTopicMain: boolean;
+  canDetach: boolean;
+  canArchive: boolean;
+} {
+  const canResetTopicMain = Boolean(
+    rowActions.isTopicWorkspace &&
+    node.isMain &&
+    !node.isArchived &&
+    rowActions.onResidentAction &&
+    supportsResidentAction(rowActions.features, "reset") &&
+    allowsTopicMainResetPermissions(rowActions.permissions),
+  );
+  return {
+    canResetTopicMain,
+    canDetach: !node.isArchived && !node.isMain && !node.isStandalone && !node.isSideChat,
+    canArchive: !node.isArchived && !node.isMain && !node.isResident,
+  };
+}
+
 const TeamMemberRow = memo(function TeamMemberRow({
   node,
+  groupMode,
+  showParentSubtitle = false,
   rowActions,
 }: {
   node: TeamDirectoryMemberNode;
+  groupMode: TeamDirectoryAgentGroupMode;
+  showParentSubtitle?: boolean;
   rowActions: MemberRowActionHandlers;
 }) {
   const {
     serverId,
-    isTopicWorkspace,
     focusedAgentId,
     features,
     permissions,
@@ -1007,43 +1869,60 @@ const TeamMemberRow = memo(function TeamMemberRow({
     }).filter((action) => action !== "create" && supportsResidentAction(features, action));
   }, [features, node.agentId, node.isArchived, node.serverId, onResidentAction, permissions]);
 
-  const canResetTopicMain = Boolean(
-    isTopicWorkspace &&
-    node.isMain &&
-    !node.isArchived &&
-    onResidentAction &&
-    supportsResidentAction(features, "reset") &&
-    allowsTopicMainResetPermissions(permissions),
+  const { canResetTopicMain, canDetach, canArchive } = deriveTeamMemberRowCapabilities(
+    node,
+    rowActions,
   );
-  const canDetach = !node.isArchived && !node.isMain && !node.isStandalone && !node.isSideChat;
-  const canArchive = !node.isArchived && !node.isMain && !node.isResident;
   const statusText = resolveMemberStatusText(node, t);
-  const trailingTag = resolveMemberTrailingTag(node, t);
+  const trailingTag = resolveMemberRoleTag(node, groupMode, t);
+  const parentLine =
+    showParentSubtitle && node.parentTitle
+      ? t("topicWorkbench.directory.parentPrefix", { parent: node.parentTitle })
+      : null;
+  const accessibilityLabel = parentLine
+    ? `${label}, ${parentLine}, ${statusText}`
+    : `${label}, ${statusText}`;
 
   return (
     <View
-      style={[styles.rowContainer, isFocused && styles.rowFocused]}
+      style={[
+        styles.rowContainer,
+        isHovered && !isFocused && styles.rowHovered,
+        isFocused && styles.rowFocused,
+      ]}
       onPointerEnter={handlePointerEnter}
       onPointerLeave={handlePointerLeave}
     >
       <PressHighlight
         testID={`team-directory-row-${node.agentId}`}
         accessibilityRole="button"
-        accessibilityLabel={`${label}, ${statusText}`}
+        accessibilityLabel={accessibilityLabel}
         accessibilityState={selectedAccessibilityState}
         style={styles.row}
         highlightStyle={styles.rowHighlight}
         onPress={handlePress}
       >
         <StatusDot bucket={node.bucket} />
-        <Text
-          numberOfLines={1}
-          ellipsizeMode="tail"
-          style={[styles.rowTitle, node.isArchived && styles.rowTitleMuted]}
-        >
-          {label}
-        </Text>
-        {trailingTag && !showKebab ? (
+        <View style={styles.rowTextColumn}>
+          <Text
+            numberOfLines={1}
+            ellipsizeMode="tail"
+            style={node.isArchived ? styles.rowTitleMuted : styles.rowTitle}
+          >
+            {label}
+          </Text>
+          {parentLine ? (
+            <Text
+              numberOfLines={1}
+              ellipsizeMode="tail"
+              style={styles.rowSubtitle}
+              testID={`team-directory-parent-${node.agentId}`}
+            >
+              {parentLine}
+            </Text>
+          ) : null}
+        </View>
+        {trailingTag ? (
           <Text numberOfLines={1} style={styles.rowTrailingTag}>
             {trailingTag}
           </Text>
@@ -1063,40 +1942,6 @@ const TeamMemberRow = memo(function TeamMemberRow({
         onArchive={handleArchive}
         onResidentAction={onResidentAction}
       />
-    </View>
-  );
-});
-
-const PresetResidentRow = memo(function PresetResidentRow({
-  preset,
-  onActivate,
-}: {
-  preset: TeamDirectoryPresetResident;
-  onActivate: (profileId: string) => void;
-}) {
-  const { t } = useTranslation();
-  const handlePress = useCallback(
-    () => onActivate(preset.profileId),
-    [onActivate, preset.profileId],
-  );
-  return (
-    <View style={styles.rowContainer}>
-      <PressHighlight
-        testID={`team-directory-preset-${preset.profileId}`}
-        accessibilityRole="button"
-        accessibilityLabel={`${preset.name}, ${t("topicWorkbench.directory.presetAvailable")}`}
-        style={styles.row}
-        highlightStyle={styles.rowHighlight}
-        onPress={handlePress}
-      >
-        <StatusDot bucket="done" hollow />
-        <Text numberOfLines={1} ellipsizeMode="tail" style={styles.rowTitleMuted}>
-          {preset.name}
-        </Text>
-        <Text numberOfLines={1} style={styles.rowTrailingTag}>
-          {t("topicWorkbench.directory.presetAvailable")}
-        </Text>
-      </PressHighlight>
     </View>
   );
 });
@@ -1146,7 +1991,7 @@ const styles = StyleSheet.create((theme) => ({
     minHeight: 0,
   },
   sidebar: {
-    width: 248,
+    width: 256,
     maxWidth: "100%",
     flexShrink: 0,
     backgroundColor: theme.colors.surfaceSidebar,
@@ -1163,18 +2008,28 @@ const styles = StyleSheet.create((theme) => ({
   header: {
     flexDirection: "row",
     alignItems: "center",
-    minHeight: 36,
+    justifyContent: "space-between",
+    minHeight: 38,
     paddingHorizontal: theme.spacing[2],
+    paddingVertical: theme.spacing[1],
     gap: theme.spacing[1],
     borderBottomWidth: theme.borderWidth[1],
     borderBottomColor: theme.colors.border,
   },
-  headerTitle: {
+  tabsControl: {
     flex: 1,
     minWidth: 0,
-    color: theme.colors.foreground,
-    fontSize: theme.fontSize.sm,
-    fontWeight: theme.fontWeight.medium,
+  },
+  groupSwitcherRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: theme.spacing[1],
+    paddingBottom: theme.spacing[1],
+  },
+  headerActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[0.5],
   },
   scroll: {
     flex: 1,
@@ -1195,6 +2050,15 @@ const styles = StyleSheet.create((theme) => ({
     paddingHorizontal: theme.spacing[1.5],
     gap: theme.spacing[1],
   },
+  sectionToggleButton: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+    minHeight: 28,
+    gap: theme.spacing[1],
+    borderRadius: theme.borderRadius.md,
+  },
   sectionTitle: {
     flex: 1,
     minWidth: 0,
@@ -1202,34 +2066,20 @@ const styles = StyleSheet.create((theme) => ({
     fontSize: theme.fontSize.sm,
     fontWeight: theme.fontWeight.medium,
   },
-  subGroupHeader: {
-    paddingHorizontal: theme.spacing[1.5],
-    paddingTop: theme.spacing[1],
-    paddingBottom: theme.spacing[0.5],
-  },
-  subGroupTitle: {
+  foldLabel: {
+    flex: 1,
+    minWidth: 0,
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.sm,
-  },
-  taskTreeRail: {
-    borderLeftWidth: 1,
-    borderLeftColor: theme.colors.border,
-    marginLeft: theme.spacing[2],
-    paddingLeft: theme.spacing[1],
-    gap: theme.spacing[0.5],
-  },
-  nestedTreeRail: {
-    borderLeftWidth: 1,
-    borderLeftColor: theme.colors.border,
-    marginLeft: theme.spacing[2],
-    paddingLeft: theme.spacing[1],
-    gap: theme.spacing[0.5],
   },
   rowContainer: {
     position: "relative",
     flexDirection: "row",
     alignItems: "center",
     borderRadius: theme.borderRadius.md,
+  },
+  rowHovered: {
+    backgroundColor: theme.colors.surfaceSidebarHover,
   },
   row: {
     flex: 1,
@@ -1238,6 +2088,7 @@ const styles = StyleSheet.create((theme) => ({
     alignItems: "center",
     minHeight: 32,
     paddingHorizontal: theme.spacing[1.5],
+    paddingVertical: theme.spacing[1],
     gap: theme.spacing[1.5],
     borderRadius: theme.borderRadius.md,
   },
@@ -1247,19 +2098,23 @@ const styles = StyleSheet.create((theme) => ({
   rowHighlight: {
     backgroundColor: theme.colors.interactionHighlight,
   },
-  rowTitle: {
+  rowTextColumn: {
     flex: 1,
     minWidth: 0,
+  },
+  rowTitle: {
     color: theme.colors.foreground,
     fontSize: theme.fontSize.base,
     fontWeight: theme.fontWeight.normal,
   },
   rowTitleMuted: {
-    flex: 1,
-    minWidth: 0,
     color: theme.colors.foregroundMuted,
     fontSize: theme.fontSize.base,
     fontWeight: theme.fontWeight.normal,
+  },
+  rowSubtitle: {
+    color: theme.colors.foregroundMuted,
+    fontSize: theme.fontSize.sm,
   },
   rowTrailingTag: {
     flexShrink: 0,
@@ -1327,7 +2182,7 @@ const styles = StyleSheet.create((theme) => ({
   historyToggleRow: {
     flexDirection: "row",
     alignItems: "center",
-    minHeight: 32,
+    minHeight: 30,
     paddingHorizontal: theme.spacing[1.5],
     gap: theme.spacing[1],
     borderRadius: theme.borderRadius.md,

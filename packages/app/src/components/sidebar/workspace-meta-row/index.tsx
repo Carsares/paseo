@@ -3,7 +3,7 @@ import { Fragment, useCallback, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { Text, View, type GestureResponderEvent } from "react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
-import { ExternalLink, Folder, GitBranch, Globe } from "lucide-react-native";
+import { CircleAlert, ExternalLink, Folder, GitBranch, Globe } from "lucide-react-native";
 import {
   workspaceLabelKey,
   type WorkspaceLabelDefinition,
@@ -40,6 +40,7 @@ export {
  */
 const META_ICON_SIZE = HOST_BADGE_ICON_SIZE;
 
+const ThemedCircleAlert = withUnistyles(CircleAlert);
 const ThemedExternalLink = withUnistyles(ExternalLink);
 const ThemedFolder = withUnistyles(Folder);
 const ThemedGitBranch = withUnistyles(GitBranch);
@@ -50,6 +51,7 @@ const EMPTY_LABELS: readonly WorkspaceLabelDefinition[] = [];
 
 const foregroundMapping = (theme: Theme) => ({ color: theme.colors.foreground });
 const mutedMapping = (theme: Theme) => ({ color: theme.colors.foregroundMuted });
+const warningMapping = (theme: Theme) => ({ color: theme.colors.statusWarning });
 const dangerMapping = (theme: Theme) => ({ color: theme.colors.statusDanger });
 
 /**
@@ -72,6 +74,8 @@ const dangerMapping = (theme: Theme) => ({ color: theme.colors.statusDanger });
 export function WorkspaceMetaRow({
   currentBranch,
   projectName,
+  forceShowProject = false,
+  pendingApprovalLabel = null,
   hostBadge,
   prHint,
   serviceSummary,
@@ -81,6 +85,8 @@ export function WorkspaceMetaRow({
 }: {
   currentBranch: string | null;
   projectName: string | null;
+  forceShowProject?: boolean;
+  pendingApprovalLabel?: string | null;
   hostBadge: HostBadgeModel | null;
   prHint: PrHint | null;
   serviceSummary: WorkspaceServiceSummary | null;
@@ -93,6 +99,8 @@ export function WorkspaceMetaRow({
   const items = selectMetaRowItems({
     currentBranch,
     projectName,
+    forceShowProject,
+    pendingApprovalLabel,
     hasHostBadge: hostBadge !== null,
     prHint,
     serviceSummary,
@@ -144,6 +152,16 @@ function MetaItemNode({
   }
   if (item.kind === "project") {
     return <IdentityItem kind="project" name={item.name} />;
+  }
+  if (item.kind === "pendingApproval") {
+    return (
+      <View style={styles.item} testID="sidebar-workspace-pending-approval">
+        <ThemedCircleAlert size={META_ICON_SIZE} uniProps={warningMapping} />
+        <Text style={styles.checksTextRunning} numberOfLines={1}>
+          {item.label}
+        </Text>
+      </View>
+    );
   }
   if (item.kind === "host") {
     return hostBadge ? <HostBadge badge={hostBadge} /> : null;

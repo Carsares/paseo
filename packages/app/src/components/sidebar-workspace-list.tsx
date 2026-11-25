@@ -70,7 +70,13 @@ import {
   type SidebarWorkspacePlacement,
 } from "@/hooks/use-sidebar-workspaces-list";
 import { useSidebarOrderStore } from "@/stores/sidebar-order-store";
-import { useSidebarViewStore, type SidebarGroupMode } from "@/stores/sidebar-view-store";
+import { useSessionStore } from "@/stores/session-store";
+import {
+  hasActiveSidebarLabelFilter,
+  useSidebarViewStore,
+  type SidebarGroupMode,
+  type SidebarLabelFilter,
+} from "@/stores/sidebar-view-store";
 import { useShowShortcutBadges } from "@/hooks/use-show-shortcut-badges";
 import {
   ContextMenu,
@@ -94,6 +100,7 @@ import { confirmDialog } from "@/utils/confirm-dialog";
 import type { SidebarStateBucket } from "@/utils/sidebar-agent-state";
 import { SidebarStatusWorkspaceList } from "@/components/sidebar/sidebar-status-list";
 import type { SidebarWorkspaceGroup } from "@/components/sidebar/sidebar-labels";
+import type { TopicWorkspaceFacts } from "@/components/sidebar/sidebar-topic-view-model";
 import {
   SidebarWorkspaceContextMenu,
   SidebarWorkspaceMenu,
@@ -117,7 +124,9 @@ import {
 import { useOpenKebabMenuVisibility } from "@/components/sidebar/use-open-kebab-menu-visibility";
 import {
   SidebarFilterEmptyState,
+  SidebarHiddenWorkspacesFooter,
   SidebarProjectEmptyState,
+  SidebarTopicEmptyState,
 } from "@/components/sidebar/empty-states";
 import { selectWorkspaceServiceSummary } from "@/components/sidebar/workspace-meta-row";
 import {
@@ -226,6 +235,10 @@ interface SidebarWorkspaceListProps {
   hasProjectsBeforeFilter: boolean;
   /** Whether a project filter is actually being applied — the resolved list, not the stored one. */
   hasActiveProjectFilter: boolean;
+  hasAnyTopicsBeforeFilter?: boolean;
+  hiddenNonTopicCount?: number;
+  hasMultipleTopicProjects?: boolean;
+  topicFactsByWorkspaceKey?: ReadonlyMap<string, TopicWorkspaceFacts>;
   workspaceEntriesByKey: ReadonlyMap<string, SidebarWorkspaceEntry>;
   collapsedProjectKeys: ReadonlySet<string>;
   onToggleProjectCollapsed: (projectViewKey: string) => void;
@@ -235,6 +248,7 @@ interface SidebarWorkspaceListProps {
   onRefresh?: () => void;
   onWorkspacePress?: () => void;
   onAddProject?: () => void;
+  onCreateTopic?: () => void;
   onImportSession?: () => void;
   listFooterComponent?: ReactElement | null;
   // Rendered inside the scroll area, below the Pinned section and above the workspace
@@ -1918,6 +1932,46 @@ function areProjectBlockSelectionsEqual(
 
 const MemoProjectBlock = memo(ProjectBlock, areProjectBlockPropsEqual);
 
+function isSidebarFilterEmpty(input: {
+  topicMode: boolean;
+  hasAnyTopicsBeforeFilter: boolean;
+  hasActiveProjectFilter: boolean;
+  labelFilter: SidebarLabelFilter;
+  hiddenNonTopicCount: number;
+  workspaceGroupsCount: number;
+  pinnedChatsCount: number;
+  hasProjectsBeforeFilter: boolean;
+  projectsCount: number;
+}): boolean {
+  if (input.topicMode) {
+    const hasTopicFilter =
+      input.hasActiveProjectFilter || hasActiveSidebarLabelFilter(input.labelFilter);
+    return (
+      input.hasAnyTopicsBeforeFilter &&
+      hasTopicFilter &&
+      input.hiddenNonTopicCount === 0 &&
+      input.workspaceGroupsCount === 0 &&
+      input.pinnedChatsCount === 0
+    );
+  }
+  return input.hasProjectsBeforeFilter && input.projectsCount === 0;
+}
+
+function useActiveWorkspaceHiddenInTopicMode(topicMode: boolean, pathname: string | null): boolean {
+  const activeWorkspaceSelection = useActiveWorkspaceSelection();
+  const activeDescriptor = useSessionStore((state) =>
+    activeWorkspaceSelection
+      ? state.sessions[activeWorkspaceSelection.serverId]?.workspaces.get(
+          activeWorkspaceSelection.workspaceId,
+        )
+      : undefined,
+  );
+  if (!topicMode || !activeWorkspaceSelection) return false;
+  const isRouteWorkspace = Boolean(pathname && parseHostWorkspaceRouteFromPathname(pathname));
+  if (!isRouteWorkspace || !activeDescriptor) return false;
+  return !activeDescriptor.topic;
+}
+
 export function SidebarWorkspaceList({
   workspaceGroups,
   projectIconTargets,
@@ -1925,6 +1979,10 @@ export function SidebarWorkspaceList({
   projects,
   hasProjectsBeforeFilter,
   hasActiveProjectFilter,
+  hasAnyTopicsBeforeFilter = false,
+  hiddenNonTopicCount = 0,
+  hasMultipleTopicProjects = false,
+  topicFactsByWorkspaceKey,
   workspaceEntriesByKey,
   collapsedProjectKeys,
   onToggleProjectCollapsed,
@@ -1934,6 +1992,7 @@ export function SidebarWorkspaceList({
   onRefresh: _onRefresh,
   onWorkspacePress,
   onAddProject,
+  onCreateTopic,
   onImportSession,
   listFooterComponent,
   listHeaderComponent,
@@ -1941,6 +2000,7 @@ export function SidebarWorkspaceList({
   dragGestureHostActive,
 }: SidebarWorkspaceListProps) {
   const pathname = usePathname();
+  const labelFilter = useSidebarViewStore((state) => state.labelFilter);
   const hosts = useHosts();
   const rowItems = useSidebarRowItems();
   // Host badge visibility is a lattice, not three competing switches: this gate is the global
@@ -1990,18 +2050,30 @@ export function SidebarWorkspaceList({
   // Background visibility can also hide the last project. Keep the header mounted
   // whenever a local filter empties an otherwise populated directory, so users can
   // reach the display menu to reveal their work again.
-  const sidebarFilterEmpty = hasProjectsBeforeFilter && projects.length === 0;
+  const topicMode = groupMode === "topic";
   const projectMode = groupMode === "project";
+  const sidebarFilterEmpty = isSidebarFilterEmpty({
+    topicMode,
+    hasAnyTopicsBeforeFilter,
+    hasActiveProjectFilter,
+    labelFilter,
+    hiddenNonTopicCount,
+    workspaceGroupsCount: workspaceGroups.length,
+    pinnedChatsCount: pinnedGroups.pinnedChats.length,
+    hasProjectsBeforeFilter,
+    projectsCount: projects.length,
+  });
+  const activeWorkspaceHiddenInTopicMode = useActiveWorkspaceHiddenInTopicMode(topicMode, pathname);
   const nativeScrollGestureProps = useMemo(
     () =>
-      projectMode && parentGestureRef
+      parentGestureRef
         ? ({
             // NestableScrollContainer forwards this to RNGH ScrollView so the sidebar's
-            // horizontal close gesture can coexist with vertical scrolling in project mode.
+            // horizontal close gesture can coexist with vertical scrolling across all modes.
             simultaneousHandlers: parentGestureRef,
           } as object)
         : undefined,
-    [parentGestureRef, projectMode],
+    [parentGestureRef],
   );
 
   // Project mode is the one that keeps its project headers; every other grouping mode is a flat
@@ -2019,6 +2091,12 @@ export function SidebarWorkspaceList({
       supportsPinningByServerId={supportsPinningByServerId}
       onToggleWorkspacePin={onToggleWorkspacePin}
       onPinnedWorkspaceReorder={handlePinnedWorkspaceReorder}
+      forceShowProject={topicMode && hasMultipleTopicProjects}
+      topicFactsByWorkspaceKey={topicFactsByWorkspaceKey}
+      topicMode={topicMode}
+      hiddenNonTopicCount={hiddenNonTopicCount}
+      activeWorkspaceHiddenInTopicMode={activeWorkspaceHiddenInTopicMode}
+      onCreateTopic={onCreateTopic}
       listHeaderComponent={listHeaderComponent}
       sidebarFilterEmpty={sidebarFilterEmpty}
       parentGestureRef={parentGestureRef}
@@ -2054,10 +2132,12 @@ export function SidebarWorkspaceList({
   const content = (
     <>
       <SidebarDurableItemsSection />
-      <SidebarUnreadConclusionsSection
-        hostBadgeByServerId={hostBadgeByServerId}
-        onWorkspacePress={onWorkspacePress}
-      />
+      {topicMode ? null : (
+        <SidebarUnreadConclusionsSection
+          hostBadgeByServerId={hostBadgeByServerId}
+          onWorkspacePress={onWorkspacePress}
+        />
+      )}
       {groups}
       <SidebarToastClearance />
     </>
@@ -2109,6 +2189,12 @@ function SidebarGroupedModeList({
   supportsPinningByServerId,
   onToggleWorkspacePin,
   onPinnedWorkspaceReorder,
+  forceShowProject = false,
+  topicFactsByWorkspaceKey,
+  topicMode = false,
+  hiddenNonTopicCount = 0,
+  activeWorkspaceHiddenInTopicMode = false,
+  onCreateTopic,
   listHeaderComponent,
   sidebarFilterEmpty,
   parentGestureRef,
@@ -2124,6 +2210,12 @@ function SidebarGroupedModeList({
   supportsPinningByServerId: ReadonlyMap<string, boolean>;
   onToggleWorkspacePin: ToggleSidebarWorkspacePin;
   onPinnedWorkspaceReorder: (workspaces: SidebarWorkspacePlacement[]) => void;
+  forceShowProject?: boolean;
+  topicFactsByWorkspaceKey?: ReadonlyMap<string, TopicWorkspaceFacts>;
+  topicMode?: boolean;
+  hiddenNonTopicCount?: number;
+  activeWorkspaceHiddenInTopicMode?: boolean;
+  onCreateTopic?: () => void;
   listHeaderComponent?: ReactElement | null;
   sidebarFilterEmpty: boolean;
   parentGestureRef?: MutableRefObject<GestureType | undefined>;
@@ -2138,6 +2230,27 @@ function SidebarGroupedModeList({
       }),
     [pinnedGroups.pinnedChats, workspaceEntriesByKey],
   );
+  const emptyStateComponent = useMemo(
+    () =>
+      topicMode ? (
+        <SidebarTopicEmptyState
+          hiddenWorkspaceCount={hiddenNonTopicCount}
+          onCreateTopic={onCreateTopic}
+        />
+      ) : null,
+    [hiddenNonTopicCount, onCreateTopic, topicMode],
+  );
+  const hasVisibleTopicRows = workspaceGroups.length > 0 || pinnedGroups.pinnedChats.length > 0;
+  const listFooterComponent = useMemo(
+    () =>
+      topicMode && (hasVisibleTopicRows || activeWorkspaceHiddenInTopicMode) ? (
+        <SidebarHiddenWorkspacesFooter
+          hiddenWorkspaceCount={hasVisibleTopicRows ? hiddenNonTopicCount : 0}
+          activeWorkspaceHidden={activeWorkspaceHiddenInTopicMode}
+        />
+      ) : null,
+    [activeWorkspaceHiddenInTopicMode, hasVisibleTopicRows, hiddenNonTopicCount, topicMode],
+  );
 
   return (
     <SidebarStatusWorkspaceList
@@ -2151,6 +2264,10 @@ function SidebarGroupedModeList({
       supportsPinningByServerId={supportsPinningByServerId}
       onToggleWorkspacePin={onToggleWorkspacePin}
       onPinnedWorkspaceReorder={onPinnedWorkspaceReorder}
+      forceShowProject={forceShowProject}
+      topicFactsByWorkspaceKey={topicFactsByWorkspaceKey}
+      emptyStateComponent={emptyStateComponent}
+      listFooterComponent={listFooterComponent}
       listHeaderComponent={listHeaderComponent}
       sidebarFilterEmpty={sidebarFilterEmpty}
       parentGestureRef={parentGestureRef}
