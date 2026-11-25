@@ -1,4 +1,8 @@
-import { prepareAgentMessage, type AgentPromptSource } from "./agent-messages/index.js";
+import {
+  prepareAgentMessage,
+  type AgentMessageDelivery,
+  type AgentPromptSource,
+} from "./agent-messages/index.js";
 import type { Logger } from "pino";
 
 import type { AgentCommandOutcome, AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
@@ -117,6 +121,8 @@ export class QueuedPromptLoadError extends Error {
     this.name = "QueuedPromptLoadError";
   }
 }
+/** The turn a steer targeted ended or changed before the provider took the steer. */
+export class AgentTurnChangedError extends Error {}
 
 export interface StartAgentRunOptions {
   /** Set by human prompt entry points before wrapping attachments and reserved text. */
@@ -411,6 +417,11 @@ export interface SendPromptToAgentParams {
   logger: Logger;
 }
 
+/** A prompt that does not wait its turn. Messages queued for the agent go with it. */
+export interface SendDirectPromptParams extends SendPromptToAgentParams {
+  agentMessages?: Pick<AgentMessageDelivery, "sendDirect">;
+}
+
 export interface StartCreatedAgentInitialPromptParams {
   agentStorage: AgentStorage;
   agentManager: AgentManager;
@@ -499,23 +510,76 @@ async function resolvePromptSource(
  * chat mentions, notify-on-finish) MUST go through this so behavior can never
  * drift between them.
  *
+ * The prompt does not wait in the agent's message queue, and it does not jump it either:
+ * messages already queued for the agent are delivered ahead of it in the same provider prompt.
+ *
  * When `unarchive` is false and the agent is archived, the call is a silent
  * no-op (returns the normal turn-start disposition) — the agent is not run.
  */
 export async function sendPromptToAgent(
-  params: SendPromptToAgentParams,
+  params: SendDirectPromptParams,
 ): Promise<PromptDispatchResult> {
-  const source = await resolvePromptSource(params.source, params.agentManager, params.agentStorage);
-  const delivery = prepareAgentMessage(params.prompt, source, params.messageId);
-  return dispatchPreparedPrompt(
+  const { agentMessages, source, messageId, ...send } = params;
+  const resolvedSource = await resolvePromptSource(
+    source,
+    params.agentManager,
+    params.agentStorage,
+  );
+  const fromPerson = !resolvedSource && !send.runOptions?.recoveryIntent;
+  const human = fromPerson && hasHumanPromptText(send.prompt);
+  const dispatch = (joined: {
+    prompt: AgentPromptInput;
+    messageId?: string;
+    sessionMode?: string;
+    unarchive?: boolean;
+    waitForProviderPrompt?: boolean;
+    admit?: () => boolean;
+    handoff?: QueueHandoff;
+  }) => {
+    const { waitForProviderPrompt, ...prepared } = joined;
+    const confirm = fromPerson && waitForProviderPrompt;
+    return dispatchPreparedPrompt(
+      {
+        ...send,
+        ...prepared,
+        // Preserve a queued rider's handoff and the direct sender's own receipt.
+        handoff: joined.handoff ?? send.handoff,
+        runOptions:
+          prepared.messageId || confirm
+            ? {
+                ...send.runOptions,
+                ...(prepared.messageId ? { clientMessageId: prepared.messageId } : {}),
+                ...(confirm ? { waitForProviderPrompt: true } : {}),
+              }
+            : send.runOptions,
+      },
+      human,
+    );
+  };
+  if (
+    !agentMessages ||
+    send.idleOnly ||
+    send.runOptions?.recoveryIntent ||
+    send.unarchive === false
+  ) {
+    return dispatch({
+      ...prepareAgentMessage(send.prompt, resolvedSource, messageId),
+      sessionMode: send.sessionMode,
+      unarchive: send.unarchive,
+      admit: send.admit,
+    });
+  }
+  return agentMessages.sendDirect(
     {
-      ...params,
-      prompt: delivery.prompt,
-      runOptions: delivery.messageId
-        ? { ...params.runOptions, clientMessageId: delivery.messageId }
-        : params.runOptions,
+      recipientId: send.agentId,
+      prompt: send.prompt,
+      source: resolvedSource,
+      messageId,
+      sessionMode: send.sessionMode,
+      unarchive: send.unarchive,
+      handoff: send.handoff,
     },
-    !source && !params.runOptions?.recoveryIntent && hasHumanPromptText(params.prompt),
+    dispatch,
   );
 }
 
@@ -643,9 +707,6 @@ async function dispatchPreparedPrompt(
   }
 
   await params.beforeDispatch?.();
-  if (!params.idleOnly && params.admit?.() === false) {
-    throw new Error("Queued agent message was withdrawn");
-  }
   const beforeHandoff = preparePromptHandoff(params);
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
     humanPrompt,

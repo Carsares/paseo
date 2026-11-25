@@ -1890,7 +1890,11 @@ test("archive emits an authoritative agent_update upsert for subscribed clients"
 
   await activateAgentUpdatesSubscription(session, "sub-agents", { includeArchived: true });
 
-  await session.handleArchiveAgentRequest("agent-1", "req-archive");
+  await session.handleMessage({
+    type: "archive_agent_request",
+    agentId: "agent-1",
+    requestId: "req-archive",
+  });
 
   const update = emitted.find((message) => message.type === "agent_update");
   expect(update?.payload).toMatchObject({
@@ -4616,18 +4620,18 @@ test("project.remove.request archives active workspaces and removes the project 
     requestId: "req-remove-project",
   });
 
-  expect(projects.has(project.projectId)).toBe(false);
-  expect(workspaces.get(workspace.workspaceId)).toEqual({
-    ...workspace,
-    updatedAt: expect.any(String),
-    archivedAt: expect.any(String),
-  });
   expect(findByType(emitted, "project.remove.response")?.payload).toEqual({
     requestId: "req-remove-project",
     projectId: project.projectId,
     accepted: true,
     removedWorkspaceIds: [workspace.workspaceId],
     error: null,
+  });
+  expect(projects.has(project.projectId)).toBe(false);
+  expect(workspaces.get(workspace.workspaceId)).toEqual({
+    ...workspace,
+    updatedAt: expect.any(String),
+    archivedAt: expect.any(String),
   });
   const workspaceUpdates = filterByType(emitted, "workspace_update");
   expect(workspaceUpdates.at(-1)?.payload).toEqual({
@@ -10842,6 +10846,8 @@ test("workspace PR status survives session cleanup and reconnect", async () => {
     comparisonBaseRef: null,
     branchRemoteName: "origin",
     branchMergeRef: "refs/heads/feature",
+    upstreamStatus: { state: "none" },
+    pushTarget: null,
     pullRequestLookupTarget: { headRef: "feature" },
   };
   const githubStub = {

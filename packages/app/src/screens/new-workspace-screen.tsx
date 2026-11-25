@@ -30,11 +30,13 @@ import {
   splitComposerAttachmentsForSubmit,
 } from "@/composer/attachments/submit";
 import { TitlebarDragRegion } from "@/components/desktop/titlebar-drag-region";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { ICON_BUTTON_SIZES } from "@/components/ui/control-geometry";
 import { MenuHeader } from "@/components/headers/menu-header";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { useToast } from "@/contexts/toast-context";
+import { draftCreationKey } from "@/composer/draft/creation-key";
 import { useAgentInputDraft } from "@/composer/draft/input-draft";
 import { DraftAgentControls } from "@/composer/agent-controls";
 import {
@@ -490,6 +492,7 @@ interface WorkspaceCreationResult {
 async function createMultiplicityWorkspace(input: {
   title: string;
   idempotencyKey: string;
+  editableLaunchTarget?: LaunchTarget;
   client: NonNullable<ReturnType<typeof useHostRuntimeClient>>;
   source: CreateWorkspaceRequestOptions["source"];
   /** Stored on the created workspace. */
@@ -519,18 +522,27 @@ async function createMultiplicityWorkspace(input: {
       );
     }
   };
-  const payload = await input.client.createWorkspace({
-    idempotencyKey: input.idempotencyKey,
+  const request: Omit<CreateWorkspaceRequestOptions, "idempotencyKey" | "onEvent"> = {
     ...(input.title ? { title: input.title } : {}),
     agent: input.agent,
     ...(input.mainAgent ? { mainAgent: input.mainAgent } : {}),
+    source: input.source,
+    ...(firstAgentContext ? { firstAgentContext } : {}),
+    ...(Object.keys(input.metadata).length > 0 ? { metadata: { ...input.metadata } } : {}),
+  };
+  const payload = await input.client.createWorkspace({
+    ...request,
+    // Fork drafts persist the original request key for receipt recovery.
+    idempotencyKey: input.editableLaunchTarget
+      ? draftCreationKey(input.idempotencyKey, {
+          request,
+          launchTarget: input.editableLaunchTarget,
+        })
+      : input.idempotencyKey,
     onEvent: (snapshot) => {
       acceptMainAgent(snapshot.mainAgent);
       input.onEvent?.(snapshot);
     },
-    source: input.source,
-    ...(firstAgentContext ? { firstAgentContext } : {}),
-    ...(Object.keys(input.metadata).length > 0 ? { metadata: { ...input.metadata } } : {}),
   });
   if (payload.error || !payload.workspace) {
     const code = payload.errorCode ?? payload.creation?.errorCode;
@@ -697,7 +709,7 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
   });
   const images = await encodeImages(wirePayload.images);
   let navigated = false;
-  let outcome: SubmitOutcome = "background";
+  const delivery: { outcome: SubmitOutcome } = { outcome: "background" };
   const agentConfig = input.submittedAgentConfig
     ? { ...input.submittedAgentConfig, cwd }
     : buildWorkspaceAgentConfig(cwd, provider, composerState);
@@ -724,7 +736,7 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
       agentConfig,
       mainAgentId: mainAgent?.id,
     });
-    outcome = submitWorkspaceDraft({
+    delivery.outcome = submitWorkspaceDraft({
       clearConsumedDraft,
       draftKey: input.draftKey,
       draftContextScopeKey: input.draftContextScopeKey,
@@ -770,10 +782,16 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
   };
   // A retry after a failed agent start belongs to the ready workspace's draft, not to this creation.
   const agentCreation = { result: Promise.resolve().then(() => execute()) };
-  await agentCreation.result;
-  if (outcome === "background") clearConsumedDraft();
-  if (outcome === "background" || input.forkDraftSetup) input.finishTitle();
-  return outcome;
+  try {
+    await agentCreation.result;
+  } catch (error) {
+    // Once handed off to the workspace draft tab, that tab owns surfacing agent startup errors.
+    if (delivery.outcome === "navigated") return delivery.outcome;
+    throw error;
+  }
+  if (delivery.outcome === "background") clearConsumedDraft();
+  if (delivery.outcome === "background" || input.forkDraftSetup) input.finishTitle();
+  return delivery.outcome;
 }
 
 function buildComposerConfig(input: {
@@ -1470,11 +1488,7 @@ function draftModelCount(draft: MainDraft | null) {
 
 function WorkspaceCreationError({ message }: { message: string | null }) {
   if (!message) return null;
-  return (
-    <Text accessibilityRole="alert" style={styles.errorText}>
-      {message}
-    </Text>
-  );
+  return <Alert variant="error" size="sm" description={message} />;
 }
 
 async function prepareTopicPrompt(
@@ -2275,6 +2289,7 @@ function NewWorkspaceForm({
       const normalizedWorkspace = await createMultiplicityWorkspace({
         ...placement,
         idempotencyKey: creationDraftId,
+        editableLaunchTarget: isTimelineFork ? undefined : launchTarget,
         client: withConnectedClient(),
         withInitialAgent: input.withInitialAgent,
         prompt: input.prompt,
@@ -2296,6 +2311,8 @@ function NewWorkspaceForm({
       composerState,
       createMainAgent,
       formPreferences.provider,
+      isTimelineFork,
+      launchTarget,
       mergeWorkspaces,
       prepareWorkspacePlacement,
       selectedServerId,
@@ -2891,7 +2908,9 @@ function NewWorkspaceForm({
         const message = workspaceCreationErrorMessage(t, error, Boolean(armedMain));
         setPendingAction(null);
         setErrorMessage(message);
-        toast.error(message);
+        if (!isStillOnCreateScreen()) {
+          toast.error(message);
+        }
         if (armedMain) throw new Error(message, { cause: error });
       }
     },
@@ -2982,7 +3001,9 @@ function NewWorkspaceForm({
       const message = toErrorMessage(error);
       setPendingAction(null);
       setErrorMessage(message);
-      toast.error(message);
+      if (!isStillOnCreateScreen()) {
+        toast.error(message);
+      }
     }
   }, [
     ensureWorkspace,
@@ -3264,6 +3285,7 @@ function NewWorkspaceForm({
       clearDraft={handleClearDraft}
       agentControls={agentControlsWithDisabled}
       commandDraft={commandDraft}
+      error={errorMessage}
     />
   );
   const composer = isTerminalLaunch ? (
@@ -3293,6 +3315,7 @@ function NewWorkspaceForm({
       clearDraft={noopClearDraft}
       autoFocus={terminalTakesPrompt}
       autoFocusKey={launchFocusKey}
+      error={errorMessage}
     />
   ) : (
     <Composer
@@ -3325,6 +3348,7 @@ function NewWorkspaceForm({
       autoFocusKey={launchFocusKey}
       commandDraft={commandDraft}
       agentControls={agentControlsWithDisabled}
+      error={errorMessage}
     />
   );
   const title = useMemo(() => {
@@ -3353,6 +3377,7 @@ function NewWorkspaceForm({
       hasBatch={hasBatch}
       attempt={topicAttempt}
       outcome={topicOutcome}
+      error={errorMessage}
       clientReady={clientReady}
       canSubmit={canSubmitTopic(topicFields, mainTarget, clientReady)}
       serverId={selectedServerId}
@@ -3387,7 +3412,6 @@ function NewWorkspaceForm({
           onAction={handleBatchAction}
           onFinish={finishWorkspaceMainBatch}
         />
-        <WorkspaceCreationError message={errorMessage} />
       </NewWorkspaceLayout>
       {importSession.sheet}
     </FileDropZone>
@@ -3434,7 +3458,8 @@ function canSubmitTopic(
   return Boolean(fields && target && connected);
 }
 
-function topicOutcomeError(outcome: TopicOutcome | null) {
+function topicOutcomeError(outcome: TopicOutcome | null, error: string | null) {
+  if (error) return error;
   return outcome && outcome.stage !== "succeeded" ? (outcome.error ?? null) : null;
 }
 
@@ -3464,6 +3489,7 @@ function TopicCreationContent({
   hasBatch,
   attempt,
   outcome,
+  error,
   clientReady,
   canSubmit,
   serverId,
@@ -3477,6 +3503,7 @@ function TopicCreationContent({
   hasBatch: boolean;
   attempt: MainDraft["topicAttempt"];
   outcome: TopicOutcome | null;
+  error: string | null;
   clientReady: boolean;
   canSubmit: boolean;
   serverId: string;
@@ -3492,7 +3519,7 @@ function TopicCreationContent({
   const open = useCallback(() => {
     if (workspaceId) navigateToWorkspace({ serverId, workspaceId });
   }, [serverId, workspaceId]);
-  if (hasBatch) return null;
+  if (hasBatch) return <WorkspaceCreationError message={error} />;
   if (attempt) {
     let status = t("topicWorkbench.unconfirmed");
     if (pending) status = t("topicWorkbench.preparing");
@@ -3513,7 +3540,7 @@ function TopicCreationContent({
             {t("topicWorkbench.open")}
           </Button>
         ) : null}
-        <WorkspaceCreationError message={topicOutcomeError(outcome)} />
+        <WorkspaceCreationError message={topicOutcomeError(outcome, error)} />
       </View>
     );
   }
@@ -3522,9 +3549,12 @@ function TopicCreationContent({
       {questionOpen ? (
         children
       ) : (
-        <Button testID="topic-create-submit" disabled={pending || !canSubmit} onPress={onSubmit}>
-          {submitLabel}
-        </Button>
+        <>
+          <WorkspaceCreationError message={error} />
+          <Button testID="topic-create-submit" disabled={pending || !canSubmit} onPress={onSubmit}>
+            {submitLabel}
+          </Button>
+        </>
       )}
       {pending ? <TopicCreationStatus message={t("topicWorkbench.preparing")} /> : null}
     </>

@@ -436,7 +436,7 @@ describe("Git P0 operations", () => {
     },
   );
 
-  it.each(["first push", "mapped origin", "upstream", "configured remote"])(
+  it.each(["first push", "mapped origin", "upstream", "configured remote", "no origin"])(
     "pushes the reviewed SHA to the target for %s and keeps branch tracking",
     async (mode) => {
       const origin = createBareOrigin();
@@ -458,6 +458,11 @@ describe("Git P0 operations", () => {
         git("remote", "add", remoteName, remote);
         git("config", "branch.main.pushRemote", remoteName);
         git("config", "remote.configured.push", "HEAD:refs/heads/target");
+      } else if (mode === "no origin") {
+        remoteName = "central";
+        git("remote", "rename", "origin", remoteName);
+        git("config", "branch.main.remote", remoteName);
+        git("config", "branch.main.merge", "refs/heads/main");
       }
       await writeWorkingFile("example.txt", partial);
       git("add", "--", "example.txt");

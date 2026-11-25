@@ -761,7 +761,9 @@ describe("custom CLI form UI", () => {
     expect(order).toEqual(["discovery:start", "discovery:resolved", "installation:refresh"]);
     expect(mocks.refreshInstallation).toHaveBeenCalledOnce();
     expect(view.getByTestId("provider-installation-version").textContent).toBe("2.4.0");
-    expect(view.getByTestId("provider-refresh").textContent).toBe("Refresh");
+    expect(view.getByRole("button", { name: "Refresh" })).toBe(
+      view.getByTestId("provider-refresh"),
+    );
   });
 
   it("still refreshes installation without leaving loading stuck when discovery fails, and skips stale refreshes after unmount", async () => {

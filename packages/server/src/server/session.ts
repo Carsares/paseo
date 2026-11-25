@@ -2,7 +2,11 @@ import { listActiveAgentsForRepo } from "./git/active-agent-guard.js";
 import { runRewindDirectoryWriter } from "./agent-rewind-scope.js";
 import { DiffSession } from "./diff/index.js";
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
-import type { AgentMessageDelivery, AgentPromptSource } from "./agent/agent-messages/index.js";
+import type {
+  AgentMessageBehavior,
+  AgentMessageDelivery,
+  AgentPromptSource,
+} from "./agent/agent-messages/index.js";
 import { AgentMessageAdmissionError } from "./agent/agent-messages/delivery.js";
 import { AgentDirectory, type BackgroundVisibility } from "./agent/directory.js";
 import { ConnectedHostSession } from "./connected-hosts/index.js";
@@ -31,7 +35,11 @@ import type {
 import { relative } from "node:path";
 import { isAbsolute } from "node:path";
 import { CreationService, type CreatedAgent, type TopicPromptRetry } from "./creation/index.js";
-import type { CreationSnapshot, AgentCreateRequest } from "@getpaseo/protocol/messages";
+import type {
+  AgentActiveTurnBehavior,
+  CreationSnapshot,
+  AgentCreateRequest,
+} from "@getpaseo/protocol/messages";
 import {
   fingerprintMessageRequest,
   type MessageReceipts,
@@ -680,6 +688,7 @@ type QueuedMessageContext = Pick<
 export function retainQueuedAgentMessage(error: unknown): boolean {
   return (
     error instanceof AgentManagerShuttingDownError ||
+    error instanceof AgentMessageAdmissionError ||
     error instanceof AgentCommandNotDispatchedError ||
     error instanceof QueuedPromptLoadError
   );
@@ -802,14 +811,20 @@ export async function enqueueRecoverableAgentMessage(
       prompt: message.prompt,
       source: { kind: "agent-message", ...message.source },
       sessionMode: message.sessionMode,
-      activeTurnBehavior: message.activeTurnBehavior,
+      // Receipts written before the three-mode contract stored queue as steer.
+      activeTurnBehavior:
+        message.immediateSteer || message.activeTurnBehavior !== "steer"
+          ? message.activeTurnBehavior
+          : "queue",
       unarchive: !restoring && message.unarchive,
+      heldAfterStop: message.heldAfterStop,
       waitForProviderOutcome: true,
       validateDispatch,
       handoff,
       onDispatch: () => notification?.accept(),
     });
     return {
+      ...receipt,
       dispatched: receipt.dispatched.catch(async (error) => {
         await rejectNotification();
         throw error;
@@ -853,6 +868,7 @@ export interface SessionOptions {
   getConnectedHostBufferedAmount?: () => number | null;
   onLifecycleIntent?: (intent: SessionLifecycleIntent) => void;
   prepareLifecycleIntent?: (intent: SessionLifecycleIntent) => Promise<void>;
+  publishWorkspaceArchiveUpdates?: (workspaceIds: Iterable<string>) => Promise<void>;
   onWorkspaceRecovered?: (workspace: PersistedWorkspaceRecord) => Promise<void>;
   publishScriptStatusUpdate?: (message: ScriptStatusUpdateMessage) => void;
   logger: pino.Logger;
@@ -1200,6 +1216,7 @@ export class Session {
   private readonly prepareLifecycleIntent:
     | ((intent: SessionLifecycleIntent) => Promise<void>)
     | null;
+  private readonly onWorkspaceArchiveUpdate: SessionOptions["publishWorkspaceArchiveUpdates"];
   private readonly onWorkspaceRecovered:
     | ((workspace: PersistedWorkspaceRecord) => Promise<void>)
     | null;
@@ -1390,6 +1407,7 @@ export class Session {
     this.getTransportBufferedAmount = getTransportBufferedAmount ?? (() => 0);
     this.onLifecycleIntent = onLifecycleIntent ?? null;
     this.prepareLifecycleIntent = prepareLifecycleIntent ?? null;
+    this.onWorkspaceArchiveUpdate = options.publishWorkspaceArchiveUpdates;
     this.onWorkspaceRecovered = onWorkspaceRecovered ?? null;
     this.pushNotifications = pushNotifications;
     this.paseoHome = paseoHome;
@@ -1764,6 +1782,8 @@ export class Session {
       worktreeManagers: this.pluginRuntime,
       workspaceArchiveOperations: this.workspaceArchiveOperations,
       getWorkspace: (workspaceId) => this.workspaceRegistry.get(workspaceId),
+      assertWorkspaceAutomationAllowed: (workspaceId) =>
+        assertWorkspaceAutomationAllowedForWorkspace(this.workspaceRegistry, workspaceId),
       isCheckoutUntrusted: (checkoutPath) =>
         isCheckoutUntrusted(this.workspaceRegistry, checkoutPath),
       agentManager: this.agentManager,
@@ -1778,8 +1798,7 @@ export class Session {
       archiveWorkspaceRecord: (workspaceId) => this.archiveWorkspaceRecord(workspaceId),
       emit: (message) => this.emit(message),
       emitAgentRemove: (agentId) => this.agentUpdates.removeAgent(agentId),
-      emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-        this.emitWorkspaceArchiveUpdates(workspaceIds),
+      emitWorkspaceUpdatesForWorkspaceIds: this.publishWorkspaceArchiveUpdates,
       markWorkspaceArchiving: (workspaceIds, archivingAt) =>
         this.markWorkspaceArchiving(workspaceIds, archivingAt),
       clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
@@ -1831,6 +1850,7 @@ export class Session {
       getGlobalServicePorts: () => this.daemonConfigStore.readServicePorts(),
     });
     this.workspaceDirectory = new WorkspaceDirectory({
+      getArchivingAt: (workspaceId) => this.workspaceArchiveOperations.getArchivingAt(workspaceId),
       logger: this.sessionLogger,
       projectRegistry: this.projectRegistry,
       workspaceRegistry: this.workspaceRegistry,
@@ -2154,16 +2174,10 @@ export class Session {
     });
   }
 
-  markWorkspaceArchivingForExternalMutation(
+  private readonly publishWorkspaceArchiveUpdates = (
     workspaceIds: Iterable<string>,
-    archivingAt: string,
-  ): void {
-    this.markWorkspaceArchiving(workspaceIds, archivingAt, externalWorkspaceArchive);
-  }
-
-  clearWorkspaceArchivingForExternalMutation(workspaceIds: Iterable<string>): void {
-    this.clearWorkspaceArchiving(workspaceIds, externalWorkspaceArchive);
-  }
+  ): Promise<void> =>
+    this.onWorkspaceArchiveUpdate?.(workspaceIds) ?? this.emitWorkspaceArchiveUpdates(workspaceIds);
 
   async emitWorkspaceUpdatesForExternalWorkspaceIds(workspaceIds: Iterable<string>): Promise<void> {
     await this.emitWorkspaceArchiveUpdates(workspaceIds);
@@ -2194,6 +2208,14 @@ export class Session {
   ): Promise<void> {
     try {
       await this.syncWorkspaceGitObserverForWorkspace(workspace);
+      if (workspace.kind !== "directory" && this.wantsEvent("checkout_status_update")) {
+        // Recovery can refresh Git before this session starts observing again.
+        // Publish the current status to replace any read made while archived.
+        const snapshot = await this.workspaceGitService.getSnapshot(workspace.cwd, {
+          includeForge: false,
+        });
+        this.checkoutSession.emitStatusUpdate(workspace.cwd, snapshot, { force: true });
+      }
       await this.emitWorkspaceUpdateForWorkspaceId(workspace.workspaceId);
     } catch (error) {
       this.sessionLogger.warn(
@@ -5764,7 +5786,7 @@ export class Session {
         activeWorkspaceIds = (await listProjectWorkspaces()).map(({ workspaceId }) => workspaceId);
         if (activeWorkspaceIds.length > 0) {
           this.markWorkspaceArchiving(activeWorkspaceIds, new Date().toISOString());
-          await this.emitWorkspaceArchiveUpdates(activeWorkspaceIds);
+          await this.publishWorkspaceArchiveUpdates(activeWorkspaceIds);
         }
         for (const workspaceId of activeWorkspaceIds) {
           const archivedAt = new Date().toISOString();
@@ -5793,18 +5815,25 @@ export class Session {
             "Failed to clean up removed project icon",
           );
         });
-      } finally {
-        if (activeWorkspaceIds.length > 0) {
-          this.clearWorkspaceArchiving(activeWorkspaceIds);
-        }
-        removingProjects.delete(resolvedProjectId);
-      }
 
-      const updateIds =
-        removedWorkspaceIds.length > 0 ? removedWorkspaceIds : [activeWorkspaceIds[0] ?? projectId];
-      await this.emitWorkspaceUpdatesForWorkspaceIds(updateIds, {
-        removedProjectId: projectId,
-      });
+        const archivedWorkspace =
+          removedWorkspaceIds.length === 0
+            ? (await this.workspaceRegistry.listAll()).find(
+                (workspace) => workspace.projectId === resolvedProjectId,
+              )
+            : undefined;
+        const updateIds =
+          removedWorkspaceIds.length > 0
+            ? removedWorkspaceIds
+            : [archivedWorkspace?.workspaceId ?? projectId];
+        await this.emitWorkspaceUpdatesForWorkspaceIds(updateIds, { removedProjectId: projectId });
+      } finally {
+        this.clearWorkspaceArchiving(activeWorkspaceIds);
+        removingProjects.delete(resolvedProjectId);
+        if (activeWorkspaceIds.length > 0) {
+          await this.publishWorkspaceArchiveUpdates(activeWorkspaceIds);
+        }
+      }
 
       this.emit({
         type: "project.remove.response",
@@ -6252,7 +6281,7 @@ export class Session {
   private async sendHumanPrompt(
     params: Omit<
       Parameters<typeof sendPromptToAgent>[0],
-      "agentManager" | "agentStorage" | "logger"
+      "agentManager" | "agentStorage" | "agentMessages" | "logger"
     >,
   ): ReturnType<typeof sendPromptToAgent> {
     let registration: FinishRegistration | undefined;
@@ -6260,6 +6289,7 @@ export class Session {
     try {
       return await sendPromptToAgent({
         ...params,
+        agentMessages: this.agentMessages,
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         logger: this.sessionLogger,
@@ -7993,13 +8023,14 @@ export class Session {
         archiveWorkspaceRecord: (workspaceId, archivedAt) =>
           this.archiveWorkspaceRecord(workspaceId, archivedAt),
         emit: (message) => this.emit(message),
-        emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-          this.emitWorkspaceArchiveUpdates(workspaceIds),
+        emitWorkspaceUpdatesForWorkspaceIds: this.publishWorkspaceArchiveUpdates,
         markWorkspaceArchiving: (workspaceIds, archivingAt) =>
           this.markWorkspaceArchiving(workspaceIds, archivingAt),
         clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
         killTerminalsForWorkspace: (workspaceId) =>
           this.terminalController.killTerminalsForWorkspace(workspaceId),
+        assertWorkspaceAutomationAllowed: (workspaceId) =>
+          assertWorkspaceAutomationAllowedForWorkspace(this.workspaceRegistry, workspaceId),
         isCheckoutUntrusted: (checkoutPath) =>
           isCheckoutUntrusted(this.workspaceRegistry, checkoutPath),
         sessionLogger: this.sessionLogger,
@@ -8746,13 +8777,13 @@ export class Session {
   ): void {
     const ids = Array.from(workspaceIds);
     for (const id of ids) this.trackWorkspaceArchive(id, source, true);
-    this.workspaceDirectory.markArchiving(ids, archivingAt);
+    this.workspaceArchiveOperations.markArchiving(ids, archivingAt);
   }
 
   clearWorkspaceArchiving(workspaceIds: Iterable<string>, source: object | symbol = this): void {
     const ids = Array.from(workspaceIds);
     for (const id of ids) this.trackWorkspaceArchive(id, source, false);
-    this.workspaceDirectory.clearArchiving(ids);
+    this.workspaceArchiveOperations.clearArchiving(ids);
   }
 
   private trackWorkspaceArchive(
@@ -8908,16 +8939,19 @@ export class Session {
     };
   }
 
-  private async withWorkspaceCheckout<T>(workspaceId: string, run: () => Promise<T>): Promise<T> {
+  private async withWorkspaceCheckout<T>(
+    workspaceId: string,
+    run: (checkoutPath: string | null) => Promise<T>,
+  ): Promise<T> {
     const workspace = await this.workspaceRegistry.get(workspaceId);
     if (!workspace) {
-      return run();
+      return run(null);
     }
     const checkoutPath = await resolveWorkspaceBackingPath(workspace, {
       paseoHome: this.paseoHome,
       paseoWorktreesBaseRoot: this.worktreesRoot,
     });
-    return this.workspaceArchiveOperations.withCheckout(checkoutPath, run);
+    return this.workspaceArchiveOperations.withCheckout(checkoutPath, () => run(checkoutPath));
   }
 
   private async withCheckoutForDirectory<T>(cwd: string, run: () => Promise<T>): Promise<T> {
@@ -10850,7 +10884,15 @@ export class Session {
       {
         getWorkspace: (workspaceId) => this.workspaceRegistry.get(workspaceId),
         clearAutomationBlock: (workspaceId) =>
-          clearWorkspaceAutomationBlock(this.workspaceRegistry, workspaceId),
+          this.withWorkspaceCheckout(workspaceId, async (checkoutPath) => {
+            const current = await this.workspaceRegistry.get(workspaceId);
+            if (!current || current.archivedAt) {
+              throw new Error(`Workspace not found: ${workspaceId}`);
+            }
+            return clearWorkspaceAutomationBlock(this.workspaceRegistry, workspaceId, {
+              checkoutPath,
+            });
+          }),
         startWorkspaceSetup: (workspaceId, operation) =>
           this.workspaceSetupRuntime.start(workspaceId, operation),
         paseoHome: this.paseoHome,
@@ -10903,8 +10945,7 @@ export class Session {
               listActiveWorkspaces: () => this.listActiveWorkspaceRefs(),
               archiveWorkspaceRecord: (workspaceId, archivedAt) =>
                 this.archiveWorkspaceRecord(workspaceId, archivedAt),
-              emitWorkspaceUpdatesForWorkspaceIds: (workspaceIds) =>
-                this.emitWorkspaceArchiveUpdates(workspaceIds),
+              emitWorkspaceUpdatesForWorkspaceIds: this.publishWorkspaceArchiveUpdates,
               markWorkspaceArchiving: (workspaceIds, archivingAt) =>
                 this.markWorkspaceArchiving(workspaceIds, archivingAt),
               clearWorkspaceArchiving: (workspaceIds) => this.clearWorkspaceArchiving(workspaceIds),
@@ -11366,6 +11407,7 @@ export class Session {
                 seqStart: entry.seqStart,
                 seqEnd: entry.seqEnd,
                 sourceSeqRanges: entry.sourceSeqRanges,
+                turnMetrics: entry.turnMetrics,
                 turnId: undefined as string | undefined,
                 collapsed: (
                   source
@@ -11978,6 +12020,7 @@ export class Session {
     prompt: AgentPromptInput,
     directParent: ReturnType<typeof readDirectParentRoute>,
     sourceAgentEvent: ReturnType<Session["authenticatedAgentNotificationEvent"]>,
+    behavior: AgentMessageBehavior,
   ): RecoverableAgentMessage | undefined {
     if (!msg.sourceAgentId || sourceAgentEvent || msg.waitForDispatch) return undefined;
     return {
@@ -11992,7 +12035,8 @@ export class Session {
       },
       directParent,
       notifyOnFinish: msg.notifyDirectParentOnFinish,
-      activeTurnBehavior: msg.activeTurnBehavior ?? "steer",
+      activeTurnBehavior: behavior,
+      ...(behavior === "steer" ? { immediateSteer: true } : {}),
       sessionMode: msg.sessionMode,
       unarchive: !directParent,
     };
@@ -12054,6 +12098,34 @@ export class Session {
     };
   }
 
+  /** An agent sender's message waits for the running turn to end unless it asks otherwise. */
+  private agentSenderBehavior(
+    requested: AgentActiveTurnBehavior | undefined,
+  ): AgentMessageBehavior {
+    // COMPAT(agentActiveTurnBehaviors): added in v0.17.2, remove after 2027-05-22 once client
+    // floor >= v0.17.2. Older CLIs and connected hosts send steer for every default agent send,
+    // meaning wait for the turn to end, so only their interrupt stays an interrupt.
+    if (!this.supports(CLIENT_CAPS.agentActiveTurnBehaviors))
+      return requested === "interrupt" ? "interrupt" : "queue";
+    return requested ?? "queue";
+  }
+
+  private humanSenderBehavior(requested?: AgentActiveTurnBehavior): "steer" | "interrupt" {
+    return requested === "steer" ? "steer" : "interrupt";
+  }
+
+  private retryUnsentAgentMessage(
+    msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
+    parent: ReturnType<typeof readDirectParentRoute>,
+  ): ((error: unknown) => boolean) | undefined {
+    if (!msg.sourceAgentId || (!msg.waitForDispatch && !parent)) return undefined;
+    return (error) =>
+      error instanceof AgentRunCancellationError ||
+      error instanceof DirectParentRequiredError ||
+      error instanceof ParentReportRecipientUnavailableError ||
+      retainQueuedAgentMessage(error);
+  }
+
   private async handleSendAgentMessageRequest(
     msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
   ): Promise<void> {
@@ -12075,6 +12147,9 @@ export class Session {
       const agentId = resolved.agentId;
       const sourceAgentEvent = this.authenticatedAgentNotificationEvent(msg);
 
+      const requested = msg.activeTurnBehavior;
+      if (!msg.sourceAgentId && requested === "queue")
+        throw new Error('activeTurnBehavior "queue" needs an agent sender');
       const prompt = buildAgentPrompt(msg.text, msg.images, msg.attachments);
       await this.acceptSideChatPrompt(agentId, prompt);
       this.sessionLogger.trace(
@@ -12090,7 +12165,19 @@ export class Session {
       const admitted = new Promise<void>((acceptAdmission) => {
         queued = acceptAdmission;
       });
-      let deliveryStatus: "queued" | undefined;
+      let queueAck:
+        | { deliveryStatus: "queued"; activeTurnBehavior?: AgentMessageBehavior; guidance?: string }
+        | undefined;
+      const acknowledgeQueue = ({
+        activeTurnBehavior,
+        guidance,
+      }: {
+        activeTurnBehavior?: AgentMessageBehavior;
+        guidance?: string;
+      }) => {
+        queueAck = { deliveryStatus: "queued", activeTurnBehavior, guidance };
+        queued();
+      };
       const directParent = readDirectParentRoute(this.getHostSourceId());
       const queuedContext = {
         agentManager: this.agentManager,
@@ -12100,7 +12187,16 @@ export class Session {
         serverId: this.serverId,
         logger: this.sessionLogger,
       };
-      const recoverable = this.recoverableAgentMessage(msg, prompt, directParent, sourceAgentEvent);
+      const behavior = msg.sourceAgentId
+        ? this.agentSenderBehavior(requested)
+        : this.humanSenderBehavior(requested);
+      const recoverable = this.recoverableAgentMessage(
+        msg,
+        prompt,
+        directParent,
+        sourceAgentEvent,
+        behavior,
+      );
       const send = async (handoff?: QueueHandoff) => {
         if (msg.sourceAgentId) {
           const validateDispatch = directParent
@@ -12140,15 +12236,14 @@ export class Session {
               prompt,
               source: promptSource,
               ...admission,
-              activeTurnBehavior: msg.activeTurnBehavior ?? "steer",
+              activeTurnBehavior: behavior,
               sessionMode: msg.sessionMode,
               clearPendingPermissions: false,
               unarchive: confirmAtDispatch ? false : undefined,
               waitForProviderOutcome: confirmAtDispatch,
               onDispatch: () => notification?.accept(),
             });
-            deliveryStatus = "queued";
-            queued();
+            acknowledgeQueue(receipt);
             await receipt.dispatched;
           } catch (error) {
             await notification?.reject().catch((cleanupError) => {
@@ -12165,7 +12260,7 @@ export class Session {
           agentId,
           prompt,
           messageId: msg.messageId,
-          activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
+          activeTurnBehavior: requested === "steer" ? "steer" : "interrupt",
           sessionMode: msg.sessionMode,
           clearPendingPermissions: true,
           beforeDispatch: handoff?.begin,
@@ -12189,10 +12284,7 @@ export class Session {
                   message: recoverable,
                   enqueue: (handoff) =>
                     enqueueRecoverableAgentMessage(queuedContext, agentId, recoverable, handoff),
-                  onQueued: () => {
-                    deliveryStatus = "queued";
-                    queued();
-                  },
+                  onQueued: acknowledgeQueue,
                   retainOnError: retainQueuedAgentMessage,
                 }
               : undefined,
@@ -12204,27 +12296,20 @@ export class Session {
               ...(directParent && msg.notifyDirectParentOnFinish === true
                 ? { notifyDirectParentOnFinish: true }
                 : {}),
-              activeTurnBehavior:
-                msg.activeTurnBehavior ?? (msg.sourceAgentId ? "steer" : "interrupt"),
+              // Keep existing idempotency keys readable: legacy agent "steer" meant queue.
+              activeTurnBehavior: behavior === "queue" ? "steer" : behavior,
+              ...(msg.sourceAgentId && behavior === "steer" ? { immediateSteer: true } : {}),
             },
             send: async (begin, declined, onProviderOutcome) => {
               if (!msg.sourceAgentId) await this.prepareAgentMessage(agentId, msg.text);
               await send({ begin, declined, onProviderOutcome });
             },
-            retryIfUnsent:
-              (msg.waitForDispatch || directParent) && msg.sourceAgentId
-                ? (error) =>
-                    error instanceof AgentRunCancellationError ||
-                    error instanceof DirectParentRequiredError ||
-                    error instanceof ParentReportRecipientUnavailableError ||
-                    retainQueuedAgentMessage(error)
-                : undefined,
-            retryIfNotAdmitted: (error) =>
-              deliveryStatus !== "queued" && error instanceof AgentMessageAdmissionError,
+            retryIfUnsent: this.retryUnsentAgentMessage(msg, directParent),
+            retryIfNotAdmitted: (error) => !queueAck && error instanceof AgentMessageAdmissionError,
           })
         : send();
       void sent.catch((error) => {
-        if (!msg.waitForDispatch && deliveryStatus === "queued") {
+        if (!msg.waitForDispatch && queueAck) {
           this.handleAgentRunError(agentId, error, "Failed to dispatch queued agent message");
         }
       });
@@ -12237,7 +12322,7 @@ export class Session {
           requestId: msg.requestId,
           agentId,
           accepted: true,
-          ...(!msg.waitForDispatch && deliveryStatus ? { deliveryStatus } : {}),
+          ...(msg.waitForDispatch ? undefined : queueAck),
           error: null,
         },
       });

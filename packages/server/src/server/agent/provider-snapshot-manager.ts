@@ -63,12 +63,21 @@ import {
   hasDynamicProviderLauncherName,
   isDynamicProviderLauncher,
 } from "./custom-provider-cli.js";
+import {
+  ProviderRefreshSchedule,
+  systemProviderRefreshTimers,
+  type ProviderRefreshTimers,
+} from "./provider-refresh-schedule.js";
 
 const DEFAULT_REFRESH_TIMEOUT_MS = 120_000;
 const MAX_REFRESH_TIMEOUT_MS = 2_147_483_647;
 const DEFAULT_DIAGNOSTIC_TIMEOUT_MS = 120_000;
+const USAGE_PROVIDER_ACTIVITY_TIMEOUT_MS = 5_000;
+const USAGE_PROVIDER_ACTIVITY_TTL_MS = 300_000;
 const PROVIDER_REFRESH_DEADLINE_ENV = "PASEO_PROVIDER_REFRESH_TIMEOUT_MS";
 const CUSTOM_CLI_DISCOVERY_FAILED = "Custom CLI discovery failed";
+/** How long shutdown waits for aborted probes; a provider ignoring the abort must not hang it. */
+const PROBE_SHUTDOWN_GRACE_MS = 10_000;
 export const GLOBAL_PROVIDER_SNAPSHOT_KEY = "paseo:global";
 
 function validRefreshDeadline(value: unknown): number | undefined {
@@ -136,7 +145,20 @@ export interface ProviderSnapshotManagerOptions {
   refreshTimeoutMs?: number;
   diagnosticTimeoutMs?: number;
   openCodeBridge?: OpenCodeBridge;
+  /** Refreshes enabled providers in the background; omitted, catalogues refresh only on request. */
+  backgroundRefresh?: ProviderBackgroundRefreshOptions;
 }
+
+export interface ProviderBackgroundRefreshOptions {
+  intervalMs: number;
+  timers?: ProviderRefreshTimers;
+}
+
+/**
+ * Why a catalogue is probed although it may hold a result. A background refresh joins discovery
+ * in flight and publishes only a changed catalogue; a failure keeps a ready one.
+ */
+type RefreshReason = "manual" | "background";
 
 interface ProviderSnapshotRefreshOptions {
   cwd: string;
@@ -208,11 +230,19 @@ export interface AgentManagerProviderState {
   retiredProviders?: readonly AgentProvider[];
 }
 
+/** A manual refresh forces the provider and publishes failures; a background one never weakens it. */
+function strongerRefresh(
+  first: RefreshReason | undefined,
+  second: RefreshReason | undefined,
+): RefreshReason | undefined {
+  return first === "manual" || second === "manual" ? "manual" : (first ?? second);
+}
+
 interface ProviderLoadOptions {
   snapshotCwd: string;
   providers: AgentProvider[];
   catalogScope: ProviderCatalogScope;
-  force: boolean;
+  refresh?: RefreshReason;
   allowDeferred?: boolean;
   runDiscovery?: ProviderDiscoveryScope;
 }
@@ -228,7 +258,7 @@ interface CatalogBinding {
   key?: string;
   failure?: ProviderSnapshotRecord;
   /** Refresh intent survives reads that supersede an unfinished key lookup. */
-  force: boolean;
+  refresh?: RefreshReason;
   promise: Promise<void>;
 }
 
@@ -236,7 +266,7 @@ interface ProviderCatalog {
   result?: ProviderSnapshotRecord;
   installedVersion?: string;
   releaseCheck?: DiscoveredReleaseCheck;
-  stale?: boolean;
+  stale?: RefreshReason;
   load?: Promise<void>;
 }
 
@@ -327,6 +357,7 @@ function initialProviderRecord(
     label: definition.label,
     description: definition.description,
     iconSvg: definition.iconSvg,
+    docsUrl: definition.docsUrl,
     defaultModeId: definition.defaultModeId ?? null,
     ...(staticCatalog
       ? {
@@ -363,8 +394,12 @@ export class ProviderSnapshotManager {
     !this.canLaunchProviderForRead(provider);
   private readonly catalogs = new Map<string, Map<AgentProvider, ProviderCatalog>>();
   private readonly targets = new Map<string, Target>();
+  private readonly usageActivityCache = new Map<AgentProvider, { at: number; active: boolean }>();
   private readonly events = new EventEmitter();
   private destroyed = false;
+  /** Aborts provider work in flight when the manager stops. */
+  private readonly stopped = new AbortController();
+  private readonly runningProbes = new Set<Promise<void>>();
   private refreshTimeoutMs: number;
   private diagnosticTimeoutMs: number;
   private readonly logger: Logger;
@@ -384,6 +419,7 @@ export class ProviderSnapshotManager {
   readonly installations: ProviderInstallations;
   private readonly installationConfigVersions = new Map<AgentProvider, number>();
   private pluginProvidersSettled = false;
+  private readonly refreshSchedule: ProviderRefreshSchedule | null;
 
   constructor(options: ProviderSnapshotManagerOptions) {
     this.logger = options.logger;
@@ -439,6 +475,15 @@ export class ProviderSnapshotManager {
         }),
       refreshProvider: (provider) => this.refreshSettingsSnapshot({ providers: [provider] }),
     });
+    this.refreshSchedule = options.backgroundRefresh
+      ? new ProviderRefreshSchedule({
+          intervalMs: options.backgroundRefresh.intervalMs,
+          timers: options.backgroundRefresh.timers ?? systemProviderRefreshTimers,
+          refresh: (provider) => this.refreshAllTargets([provider], "background"),
+          logger: options.logger,
+        })
+      : null;
+    this.refreshSchedule?.setProviders(this.getEnabledProviderIds());
   }
 
   getSnapshot(cwd?: string): ProviderSnapshot {
@@ -457,34 +502,44 @@ export class ProviderSnapshotManager {
     const target = createWorkspaceSnapshotTarget(snapshotCwd);
     const providers = this.resolveRefreshProviders(options.providers);
     const providersToRefresh = providers ?? this.getProviderIds();
-    await this.refreshProviders(target, providersToRefresh);
+    await this.refreshProviders(target, providersToRefresh, "manual");
   }
 
   async refreshSettingsSnapshot(
     options: Omit<ProviderSnapshotRefreshOptions, "cwd"> = {},
   ): Promise<void> {
+    const providers = this.resolveRefreshProviders(options.providers);
+    await this.refreshAllTargets(providers ?? this.getProviderIds(), "manual");
+  }
+
+  private async refreshAllTargets(
+    providers: AgentProvider[],
+    reason: RefreshReason,
+  ): Promise<void> {
     const target = createGlobalSnapshotTarget();
     const homeCwd = target.snapshotCwd;
-    const providers = this.resolveRefreshProviders(options.providers);
-    // Ordinary refreshes also skip invalidation while explicit discovery is running.
-    const providersToRefresh = (providers ?? this.getProviderIds()).filter(
-      (provider) => !this.isProviderDiscoveryDeferred(provider),
-    );
-
+    // An ordinary refresh must not invalidate an explicitly authorized discovery.
+    const refreshable = providers.filter((provider) => !this.isProviderDiscoveryDeferred(provider));
     this.getOrCreateTarget(homeCwd);
     for (const catalogs of this.catalogs.values()) {
-      for (const provider of providersToRefresh) {
+      for (const provider of refreshable) {
         const catalog = catalogs.get(provider);
-        if (catalog) catalogs.set(provider, { result: catalog.result, stale: true });
+        if (!catalog || (reason === "background" && catalog.load)) continue;
+        catalogs.set(provider, {
+          result: catalog.result,
+          installedVersion: catalog.installedVersion,
+          releaseCheck: catalog.releaseCheck,
+          stale: strongerRefresh(catalog.stale, reason),
+        });
       }
     }
     // Refresh each known target: provider keys coalesce reads, while target-scoped
     // providers must discover again in their own execution context.
-    await this.refreshProviders(target, providersToRefresh);
+    await this.refreshProviders(target, refreshable, reason);
     await Promise.all(
       [...this.targets.keys()]
         .filter((cwd) => cwd !== homeCwd)
-        .map((cwd) => this.warmUp(createWorkspaceSnapshotTarget(cwd), providersToRefresh)),
+        .map((cwd) => this.warmUp(createWorkspaceSnapshotTarget(cwd), refreshable)),
     );
   }
 
@@ -592,7 +647,7 @@ export class ProviderSnapshotManager {
         ...target,
         provider,
         providers: [provider],
-        force: true,
+        refresh: "manual",
         allowDeferred: true,
         runDiscovery,
       });
@@ -607,7 +662,6 @@ export class ProviderSnapshotManager {
     state: RegistryProviderState,
   ): void {
     this.getOrCreateTarget(cwd).bindings.set(provider, {
-      force: false,
       promise: Promise.resolve(),
       failure: identifyEntry({
         ...state.initial.entry,
@@ -743,6 +797,99 @@ export class ProviderSnapshotManager {
     return this.ensureClient(provider, definition).resolveUsageLaunch?.();
   }
 
+  /**
+   * Whether `provider` (or a custom provider derived from it) is enabled and installed on this
+   * host. Used as a hint for whether discovered usage accounts start shown.
+   */
+  async isProviderActiveForUsage(
+    provider: string,
+    options: { forceRefresh?: boolean; timeoutMs?: number; ttlMs?: number } = {},
+  ): Promise<boolean> {
+    const matching = this.generation.order
+      .map((id) => ({ id, definition: this.generation.definitions[id] }))
+      .filter(
+        (candidate): candidate is { id: AgentProvider; definition: ProviderDefinition } =>
+          candidate.definition !== undefined &&
+          candidate.definition.enabled &&
+          (candidate.id === provider || candidate.definition.derivedFromProviderId === provider),
+      );
+    if (matching.length === 0) return false;
+
+    const forceRefresh = options.forceRefresh === true;
+    const ttlMs = options.ttlMs ?? USAGE_PROVIDER_ACTIVITY_TTL_MS;
+    const timeoutMs = options.timeoutMs ?? USAGE_PROVIDER_ACTIVITY_TIMEOUT_MS;
+    const now = Date.now();
+
+    const unresolved: Array<{ id: AgentProvider; definition: ProviderDefinition }> = [];
+    if (forceRefresh) {
+      unresolved.push(...matching);
+    } else {
+      for (const candidate of matching) {
+        const cached = this.usageActivityCache.get(candidate.id);
+        if (cached && now - cached.at < ttlMs) {
+          if (cached.active) return true;
+          continue;
+        }
+        unresolved.push(candidate);
+      }
+      if (unresolved.length === 0) return false;
+    }
+
+    const results = await Promise.all(
+      unresolved.map(({ id, definition }) => this.probeUsageActivity(id, definition, timeoutMs)),
+    );
+    return results.some(Boolean);
+  }
+
+  private async probeUsageActivity(
+    provider: AgentProvider,
+    definition: ProviderDefinition,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    if (this.destroyed) return false;
+    if (this.isProviderDiscoveryDeferred(provider)) {
+      return (
+        this.peekSnapshot()?.records.some(
+          ({ entry }) => entry.provider === provider && entry.status === "ready",
+        ) ?? false
+      );
+    }
+    const generation = this.generation;
+    if (await this.blocksCurrentLegacyLauncher(provider)) return false;
+    if (this.destroyed || this.generation !== generation) return false;
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, this.stopped.signal]);
+    const timedOut = Symbol("usage-provider-activity-timeout");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<typeof timedOut>((finish) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        finish(timedOut);
+      }, timeoutMs);
+    });
+    const probe = this.ensureClient(provider, definition)
+      .isAvailable(signal, { scope: "global", force: true })
+      .then(
+        (active) => ({ ok: true as const, active }),
+        () => ({ ok: false as const, active: false }),
+      );
+    this.trackProbe(probe.then(() => undefined));
+    try {
+      const outcome = await Promise.race([probe, deadline]);
+      if (outcome === timedOut) {
+        // Fail open without caching when a slow probe misses the deadline; a subsequent read
+        // picks up the real status once the provider snapshot finishes loading.
+        return true;
+      }
+      if (outcome.ok && !this.destroyed && this.generation === generation) {
+        this.usageActivityCache.set(provider, { at: Date.now(), active: outcome.active });
+      }
+      return outcome.active;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   async listProviders(input: ProviderSnapshotReadOptions = {}): Promise<ProviderSnapshotEntry[]> {
     const target = resolveProviderSnapshotTarget(input.cwd);
     if (input.wait) {
@@ -780,6 +927,7 @@ export class ProviderSnapshotManager {
 
     const provider = await this.getProvider({
       provider: input.provider,
+      cwd: input.cwd,
       wait: true,
     });
     if (!provider.enabled) {
@@ -978,6 +1126,7 @@ export class ProviderSnapshotManager {
   ): void {
     for (const provider of changed) {
       this.generation.providerStates.get(provider)?.discoveryLimit.clearQueue();
+      this.usageActivityCache.delete(provider);
     }
     this.updateInstallationConfigVersions(generation);
     this.generation = generation;
@@ -991,6 +1140,8 @@ export class ProviderSnapshotManager {
       for (const provider of changed) target.bindings.delete(provider);
     }
     this.publishTargets(this.targets.keys());
+    this.refreshSchedule?.setProviders(this.getEnabledProviderIds());
+    this.refreshSchedule?.recordRefresh([...changed]);
     const providers = [...changed].filter((provider) => generation.definitions[provider]);
     if (providers.length === 0) return;
     for (const cwd of this.targets.keys()) {
@@ -1032,28 +1183,44 @@ export class ProviderSnapshotManager {
   }
 
   async shutdown(): Promise<void> {
-    this.destroyed = true;
-    const closingUpdates = this.installations.close();
-    for (const state of this.generation.providerStates.values()) state.discoveryLimit.clearQueue();
+    const closingUpdates = this.stop();
+    void closingUpdates.catch(() => undefined);
+    // A running probe stops at its next activity boundary and cleans up what it started, so no
+    // provider starts work after its client shuts down.
+    await withTimeout(
+      Promise.allSettled(this.runningProbes),
+      PROBE_SHUTDOWN_GRACE_MS,
+      "Provider probes did not stop before shutdown",
+    ).catch((error) =>
+      this.logger.warn({ err: error }, "Shutting down providers with probes running"),
+    );
+    // Materialize a client per enabled provider so provider-owned resources
+    // (background processes, sockets, etc.) get a chance to release even when
+    // a given provider hasn't been touched yet during this daemon's lifetime.
     try {
       await closingUpdates;
     } finally {
-      // Materialize a client per enabled provider so provider-owned resources
-      // have a chance to release even when the provider has not been used.
       this.getAgentManagerProviderState();
       await shutdownAgentClients(this.ownedClients, this.logger);
     }
   }
 
   destroy(): void {
-    this.destroyed = true;
-    void this.installations.close().catch((error: unknown) => {
+    void this.stop().catch((error: unknown) => {
       this.logger.warn({ err: error }, "Provider updater cleanup failed");
     });
-    for (const state of this.generation.providerStates.values()) state.discoveryLimit.clearQueue();
     this.catalogs.clear();
     this.targets.clear();
     this.events.removeAllListeners();
+  }
+
+  private stop(): Promise<void> {
+    this.destroyed = true;
+    this.refreshSchedule?.dispose();
+    const closingUpdates = this.installations.close();
+    for (const state of this.generation.providerStates.values()) state.discoveryLimit.clearQueue();
+    this.stopped.abort(new Error("Provider snapshot manager stopped"));
+    return closingUpdates;
   }
 
   private buildRegistry(
@@ -1148,7 +1315,7 @@ export class ProviderSnapshotManager {
   ): Promise<ProviderSnapshotEntry> {
     try {
       const target = createGlobalSnapshotTarget();
-      await this.refreshProviders(target, [provider]);
+      await this.refreshProviders(target, [provider], "manual");
       return await this.getProvider({ provider, wait: false });
     } catch (error) {
       return {
@@ -1168,7 +1335,11 @@ export class ProviderSnapshotManager {
       if (client.getDiagnostic) {
         return (
           await withTimeout(
-            client.getDiagnostic(),
+            client.getDiagnostic({
+              // The report and the Installation row show one answer for the version.
+              inspectInstallation: async () =>
+                (await this.installations.inspect(provider, { refresh: true }))?.inspection,
+            }),
             this.diagnosticTimeoutMs,
             `Timed out collecting ${definition.label ?? provider} diagnostic after ${
               this.diagnosticTimeoutMs
@@ -1285,19 +1456,20 @@ export class ProviderSnapshotManager {
       snapshotCwd: target.snapshotCwd,
       catalogScope: target.catalogScope,
       providers: providersToRefresh,
-      force: false,
     });
   }
 
   private async refreshProviders(
     target: ProviderSnapshotTarget,
     providers: AgentProvider[],
+    reason: RefreshReason,
   ): Promise<void> {
+    this.refreshSchedule?.recordRefresh(providers);
     await this.loadProviders({
       snapshotCwd: target.snapshotCwd,
       catalogScope: target.catalogScope,
       providers,
-      force: true,
+      refresh: reason,
     });
   }
 
@@ -1336,11 +1508,12 @@ export class ProviderSnapshotManager {
     const binding: CatalogBinding = {
       key: bindings.get(options.provider)?.key,
       failure: bindings.get(options.provider)?.failure,
-      force: options.force || bindings.get(options.provider)?.force === true,
+      refresh: strongerRefresh(options.refresh, bindings.get(options.provider)?.refresh),
       promise: Promise.resolve(),
     };
     bindings.set(options.provider, binding);
-    const resolveCatalog = () => this.resolveCatalog({ ...options, force: binding.force }, binding);
+    const resolveCatalog = () =>
+      this.resolveCatalog({ ...options, refresh: binding.refresh }, binding);
     binding.promise = options.runDiscovery
       ? options.runDiscovery(resolveCatalog)
       : resolveCatalog();
@@ -1351,7 +1524,7 @@ export class ProviderSnapshotManager {
     options: ProviderLoadOptions & { provider: AgentProvider },
     binding: CatalogBinding,
   ): Promise<void> {
-    const { provider, snapshotCwd, force } = options;
+    const { provider, snapshotCwd, refresh } = options;
     const definition = this.generation.definitions[provider]!;
     const state = this.generation.providerStates.get(provider)!;
     const { entry: initial } = state.initial;
@@ -1359,7 +1532,8 @@ export class ProviderSnapshotManager {
     if (!definition.enabled) return;
     const currentBinding = () => this.targets.get(snapshotCwd)?.bindings.get(provider);
     const client = this.ensureClient(provider, definition);
-    const catalogOptions = createFetchCatalogOptions(options.catalogScope, force);
+    // Only a requested refresh asks the provider to bypass its own caches or rotate servers.
+    const catalogOptions = createFetchCatalogOptions(options.catalogScope, refresh === "manual");
     let key: string;
     try {
       const sharedKey = client.getCatalogCacheKey
@@ -1376,7 +1550,7 @@ export class ProviderSnapshotManager {
       );
     } catch (error) {
       if (currentBinding() !== binding) return currentBinding()?.promise;
-      binding.force = false;
+      binding.refresh = undefined;
       binding.key = undefined;
       binding.failure = identifyEntry({
         ...this.generation.providerStates.get(provider)!.initial.entry,
@@ -1389,7 +1563,7 @@ export class ProviderSnapshotManager {
     }
     // Only the latest key resolution for this target may bind it to a catalogue.
     if (currentBinding() !== binding) return currentBinding()?.promise;
-    binding.force = false;
+    binding.refresh = undefined;
     binding.key = key;
     binding.failure = undefined;
     let catalogs = this.catalogs.get(key);
@@ -1403,10 +1577,13 @@ export class ProviderSnapshotManager {
       catalogs.set(provider, catalog);
     }
     this.publishTargets([snapshotCwd]);
-    if (!force && (catalog.load || (catalog.result && !catalog.stale))) return catalog.load;
-    catalog.stale = false;
+    if (refresh !== "manual" && catalog.load) return catalog.load;
+    if (!refresh && catalog.result && !catalog.stale) return;
+    const background = strongerRefresh(refresh, catalog.stale) === "background";
+    catalog.stale = undefined;
 
     const current = catalog;
+    const recordDiscoveredVersion = snapshotCwd === GLOBAL_PROVIDER_SNAPSHOT_KEY;
     const isCurrent = (): boolean =>
       !this.destroyed && this.catalogs.get(key)?.get(provider) === current && current.load === load;
     const load = this.generation.providerStates
@@ -1414,39 +1591,91 @@ export class ProviderSnapshotManager {
       .discoveryLimit(async () => {
         if (state.checkLegacyLauncher && (await state.checkLegacyLauncher())) return;
         if (!isCurrent()) return;
-        return this.refreshProvider({
-          catalogOptions,
-          provider,
-          definition,
-          initial,
-          redactErrors: state.requiresDiscovery,
-          client,
-          publish: (entry, installedVersion, releaseCheck) => {
-            if (!isCurrent()) return false;
-            current.result = identifyEntry(structuredClone(entry));
-            if (
-              snapshotCwd === GLOBAL_PROVIDER_SNAPSHOT_KEY &&
-              (options.runDiscovery || (state.checkLegacyLauncher && releaseCheck))
-            ) {
-              current.installedVersion = installedVersion;
-              current.releaseCheck = releaseCheck;
-            }
-            const boundTargets =
-              state.requiresDiscovery && snapshotCwd === GLOBAL_PROVIDER_SNAPSHOT_KEY
-                ? this.targets.keys()
-                : [...this.targets].flatMap(([cwd, target]) =>
-                    target.bindings.get(provider)?.key === key ? [cwd] : [],
+        return this.trackProbe(
+          this.refreshProvider({
+            catalogOptions,
+            provider,
+            definition,
+            initial,
+            redactErrors: state.requiresDiscovery,
+            client,
+            publish: (entry, { incomplete, installedVersion, releaseCheck }) => {
+              if (!isCurrent()) return false;
+              const result = identifyEntry(structuredClone(entry));
+              const boundTargets =
+                state.requiresDiscovery && snapshotCwd === GLOBAL_PROVIDER_SNAPSHOT_KEY
+                  ? [...this.targets.keys()]
+                  : [...this.targets].flatMap(([cwd, target]) =>
+                      target.bindings.get(provider)?.key === key ? [cwd] : [],
+                    );
+              const isGlobal =
+                catalogOptions.scope === "global" ||
+                boundTargets.includes(resolveProviderSnapshotTarget().snapshotCwd);
+              if (
+                background &&
+                current.result &&
+                keepsPublishedResult({ published: current.result, next: result, incomplete })
+              ) {
+                if (entry.status !== "ready" || incomplete) {
+                  this.logger.warn(
+                    {
+                      provider,
+                      target: catalogOptions,
+                      status: entry.status,
+                      incomplete,
+                      error: entry.error,
+                    },
+                    "Background provider refresh failed; keeping the last catalogue",
                   );
-            this.publishTargets(boundTargets);
-            return true;
-          },
-        });
+                }
+                if (
+                  isGlobal &&
+                  (entry.status === "ready" ||
+                    (entry.status === "unavailable" && current.result.entry.status !== "ready"))
+                ) {
+                  this.usageActivityCache.set(provider, {
+                    at: Date.now(),
+                    active: entry.status === "ready",
+                  });
+                }
+                return false;
+              }
+              current.result = result;
+              if (
+                recordDiscoveredVersion &&
+                (options.runDiscovery || (state.checkLegacyLauncher && releaseCheck))
+              ) {
+                current.installedVersion = installedVersion;
+                current.releaseCheck = releaseCheck;
+              }
+              if (isGlobal) this.cacheUsageActivity(provider, entry.status);
+              this.publishTargets(boundTargets);
+              return true;
+            },
+          }),
+        );
       })
       .finally(() => {
         if (current.load === load) current.load = undefined;
       });
     current.load = load;
     return load;
+  }
+
+  private cacheUsageActivity(
+    provider: AgentProvider,
+    status: ProviderSnapshotEntry["status"],
+  ): void {
+    if (status === "ready" || status === "unavailable") {
+      this.usageActivityCache.set(provider, { at: Date.now(), active: status === "ready" });
+    }
+  }
+
+  private trackProbe(probe: Promise<void>): Promise<void> {
+    this.runningProbes.add(probe);
+    const forget = () => this.runningProbes.delete(probe);
+    probe.then(forget, forget);
+    return probe;
   }
 
   private async refreshProvider(options: {
@@ -1458,8 +1687,11 @@ export class ProviderSnapshotManager {
     client: AgentClient;
     publish: (
       entry: ProviderSnapshotEntry,
-      installedVersion?: string,
-      releaseCheck?: DiscoveredReleaseCheck,
+      result: {
+        incomplete: boolean;
+        installedVersion?: string;
+        releaseCheck?: DiscoveredReleaseCheck;
+      },
     ) => boolean;
   }): Promise<void> {
     const {
@@ -1476,6 +1708,7 @@ export class ProviderSnapshotManager {
       const catalog = await runProviderRefreshWithDeadline({
         label: definition.label,
         timeoutMs: this.refreshTimeoutMs,
+        signal: this.stopped.signal,
         operation: async (context) => {
           const available = await context.runActivity("availability", () =>
             raceProviderRefreshAbort(
@@ -1491,7 +1724,7 @@ export class ProviderSnapshotManager {
         },
       });
       if (!catalog) {
-        setEntry({ ...base, status: "unavailable", enabled: true });
+        setEntry({ ...base, status: "unavailable", enabled: true }, { incomplete: false });
         return;
       }
 
@@ -1513,18 +1746,26 @@ export class ProviderSnapshotManager {
           modes: catalog.modes,
           fetchedAt: new Date().toISOString(),
         },
-        safeDiscoveredVersion(catalog.installedVersion),
-        (catalog as typeof catalog & { [discoveredReleaseCheck]?: DiscoveredReleaseCheck })[
-          discoveredReleaseCheck
-        ],
+        {
+          incomplete: catalog.incomplete === true,
+          installedVersion: safeDiscoveredVersion(catalog.installedVersion),
+          releaseCheck: (
+            catalog as typeof catalog & {
+              [discoveredReleaseCheck]?: DiscoveredReleaseCheck;
+            }
+          )[discoveredReleaseCheck],
+        },
       );
     } catch (error) {
-      const emitted = setEntry({
-        ...base,
-        status: "error",
-        enabled: true,
-        error: redactErrors ? CUSTOM_CLI_DISCOVERY_FAILED : toErrorMessage(error),
-      });
+      const emitted = setEntry(
+        {
+          ...base,
+          status: "error",
+          enabled: true,
+          error: redactErrors ? CUSTOM_CLI_DISCOVERY_FAILED : toErrorMessage(error),
+        },
+        { incomplete: false },
+      );
       if (emitted) {
         this.logger.warn(
           redactErrors
@@ -1615,6 +1856,12 @@ export class ProviderSnapshotManager {
     return [...this.generation.order];
   }
 
+  private getEnabledProviderIds(): AgentProvider[] {
+    return this.generation.order.filter(
+      (provider) => this.generation.definitions[provider]!.enabled,
+    );
+  }
+
   private resolveRefreshProviders(providers?: AgentProvider[]): AgentProvider[] | undefined {
     if (!providers || providers.length === 0) {
       return undefined;
@@ -1684,6 +1931,23 @@ function identifyEntry(entry: ProviderSnapshotEntry): ProviderSnapshotRecord {
     .update(JSON.stringify(["paseo.provider-result/1", content]))
     .digest("base64url");
   return { entry, contentHash };
+}
+
+/**
+ * A background result replaces neither unchanged content nor a ready catalogue with a result that
+ * is not ready or is incomplete. Providers report a failed startup probe as unavailable, so it
+ * counts as transient too.
+ */
+function keepsPublishedResult(options: {
+  published: ProviderSnapshotRecord;
+  next: ProviderSnapshotRecord;
+  incomplete: boolean;
+}): boolean {
+  const { published, next, incomplete } = options;
+  return (
+    published.contentHash === next.contentHash ||
+    (published.entry.status === "ready" && (next.entry.status !== "ready" || incomplete))
+  );
 }
 
 function toErrorMessage(error: unknown): string {

@@ -4,7 +4,7 @@ import {
   isExplicitParentReportingLabels,
 } from "@getpaseo/protocol/agent-labels";
 import type { AgentAddress } from "@getpaseo/protocol/addresses";
-import type { ActiveTurnBehavior, AgentSnapshotPayload } from "@getpaseo/protocol/messages";
+import type { AgentActiveTurnBehavior, AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
@@ -283,6 +283,12 @@ function canQueueDirectParentPrompt(client: DaemonClient, restricted: boolean): 
   );
 }
 
+function remotePromptGuidance(receipt: { deliveryStatus?: "queued"; guidance?: string }): string {
+  if (receipt.deliveryStatus === "queued")
+    return receipt.guidance ?? "Queued for delivery after the current turn ends.";
+  return "Dispatch acknowledged. Observe completion using get_agent_status/get_agent_activity or SDK/RPC subscriptions and wait APIs.";
+}
+
 function remoteTurnOptions(
   queueDirectParent: boolean,
   waitForDispatch: boolean,
@@ -457,8 +463,8 @@ export function createHostResolver(input: {
               sourceAgentId: input.callerAgentId,
               sourceAgentServerId: input.callerAgentId ? input.serverId : undefined,
               activeTurnBehavior:
-                (args.activeTurnBehavior as ActiveTurnBehavior | undefined) ??
-                (input.callerAgentId ? "steer" : "interrupt"),
+                (args.activeTurnBehavior as AgentActiveTurnBehavior | undefined) ??
+                (input.callerAgentId ? "queue" : "interrupt"),
             })
             .catch((error) => {
               if (isAmbiguousPromptFailure(error)) throw error;
@@ -468,10 +474,7 @@ export function createHostResolver(input: {
             success: true,
             ...receipt,
             status: agent.status,
-            guidance:
-              receipt.deliveryStatus === "queued"
-                ? "Queued for delivery after two quiet seconds and the current turn ends, unless interrupt was requested."
-                : "Dispatch acknowledged. Observe completion using get_agent_status/get_agent_activity or SDK/RPC subscriptions and wait APIs.",
+            guidance: remotePromptGuidance(receipt),
           });
         }),
         respondToPermission: remote(async (client, args) => {

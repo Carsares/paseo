@@ -1708,7 +1708,11 @@ test("agent message retries distinguish admission refusal from unconfirmed dispa
     const retry = send("waited", true);
     await vi.waitFor(() => expect(delivery.hasPending(agentId)).toBe(true));
     await drain();
-    expect(await retry).toMatchObject({ payload: { accepted: true } });
+    const confirmed = await retry;
+    expect(confirmed).toMatchObject({ payload: { accepted: true } });
+    expect(confirmed?.payload).not.toHaveProperty("deliveryStatus");
+    expect(confirmed?.payload).not.toHaveProperty("activeTurnBehavior");
+    expect(confirmed?.payload).not.toHaveProperty("guidance");
     expect(dispatch).toHaveBeenCalledTimes(4);
   } finally {
     await delivery.close();
@@ -7228,7 +7232,11 @@ describe("session checkout pull and push handling", () => {
       requestId: "request-push",
     });
 
-    expect(checkoutGitMocks.pushCurrentBranch).toHaveBeenCalledWith("/tmp/request-worktree");
+    expect(checkoutGitMocks.pushCurrentBranch).toHaveBeenCalledWith(
+      "/tmp/request-worktree",
+      undefined,
+      { paseoHome: "/tmp/paseo-home", worktreesRoot: undefined },
+    );
     expect(workspaceGitService.getSnapshot).toHaveBeenCalledWith("/tmp/request-worktree", {
       force: true,
       reason: "push",

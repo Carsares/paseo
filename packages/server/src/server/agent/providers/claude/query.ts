@@ -34,7 +34,7 @@ function isChildProcessWithStreams(child: ChildProcess): child is ChildProcessWi
 }
 
 function resolveClaudeSpawnCommand(
-  spawnOptions: SpawnOptions,
+  spawnOptions: Pick<SpawnOptions, "command" | "args">,
   runtimeSettings?: ProviderRuntimeSettings,
 ): { command: string; args: string[] } {
   const commandConfig = runtimeSettings?.command;
@@ -58,11 +58,23 @@ function resolveClaudeSpawnCommand(
   };
 }
 
+type ClaudeLaunchEnvironment = Pick<ClaudeQueryContext, "runtimeSettings" | "launchEnv">;
+
+function createClaudeSpawnEnvSpec(
+  baseEnv: SpawnOptions["env"],
+  { runtimeSettings, launchEnv }: ClaudeLaunchEnvironment,
+) {
+  const spec = createProviderEnvSpec({ baseEnv, runtimeSettings, overlays: [launchEnv] });
+  // Session-open hooks may supply a client identity. Clear inherited SDK/parent identities.
+  spec.envOverlay.CLAUDE_CODE_ENTRYPOINT = launchEnv?.CLAUDE_CODE_ENTRYPOINT;
+  return spec;
+}
+
 function applyRuntimeSettingsToClaudeOptions(
   options: ClaudeOptions,
   context: ClaudeQueryContext,
 ): ClaudeOptions {
-  const { runtimeSettings, launchEnv, onChildProcess, assertCanSpawn } = context;
+  const { runtimeSettings, onChildProcess, assertCanSpawn } = context;
   const installationKeys = context.installationKeys ?? [];
   const opaque = runtimeSettings?.command?.mode === "replace";
   const stderr = options.stderr;
@@ -76,14 +88,7 @@ function applyRuntimeSettingsToClaudeOptions(
       // When the SDK passes a native binary path (from pathToClaudeCodeExecutable)
       // or the user overrides the command via runtime settings, use that directly.
       const isDefaultRuntime = resolved.command === "node" || resolved.command === "bun";
-      const providerEnvSpec = createProviderEnvSpec({
-        baseEnv: spawnOptions.env,
-        runtimeSettings,
-        overlays: [launchEnv],
-      });
-      // Session-open hooks may explicitly supply a client identity. Keep inherited
-      // SDK/parent identities cleared while honoring this launch-only contribution.
-      providerEnvSpec.envOverlay.CLAUDE_CODE_ENTRYPOINT = launchEnv?.CLAUDE_CODE_ENTRYPOINT;
+      const providerEnvSpec = createClaudeSpawnEnvSpec(spawnOptions.env, context);
       const providerEnv = createExternalProcessEnv(spawnOptions.env, providerEnvSpec.envOverlay);
       const selfNodeCommand = isDefaultRuntime
         ? buildSelfNodeCommand(resolved.args, providerEnv)

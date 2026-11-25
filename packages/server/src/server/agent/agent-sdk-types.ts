@@ -1,4 +1,5 @@
 import type {
+  AgentMetric,
   AgentOptionControl,
   AgentOptionSelectControl,
   AgentOptionToggleControl,
@@ -10,7 +11,11 @@ import type {
   UserMessageForkContext,
 } from "@getpaseo/protocol/agent-types";
 import type { AgentMessage } from "@getpaseo/protocol/agent-message";
-import type { AgentAttachment, ProviderInstallation } from "@getpaseo/protocol/messages";
+import type {
+  AgentAttachment,
+  ProviderInstallation,
+  ProviderInstallationInspection,
+} from "@getpaseo/protocol/messages";
 import type {
   ProviderInspection,
   ProviderUpdateCheck,
@@ -20,6 +25,7 @@ import type {
 import type { PaseoToolCatalog } from "./tools/types.js";
 
 export type {
+  AgentMetric,
   AgentOptionControl,
   AgentOptionSelectControl,
   AgentOptionToggleControl,
@@ -158,6 +164,8 @@ export interface ProviderSnapshotEntry {
   label?: string;
   description?: string;
   iconSvg?: string;
+  /** The page that helps users set up and troubleshoot this provider. */
+  docsUrl?: string;
   defaultModeId?: string | null;
 }
 
@@ -464,8 +472,17 @@ export interface AgentConversationLimit {
 export type AgentStreamEvent =
   | { type: "thread_started"; sessionId: string; provider: AgentProvider }
   | { type: "turn_started"; provider: AgentProvider; turnId?: string }
-  | { type: "turn_completed"; provider: AgentProvider; usage?: AgentUsage; turnId?: string }
+  | {
+      type: "turn_completed";
+      provider: AgentProvider;
+      usage?: AgentUsage;
+      turnId?: string;
+      /** Shown on the completed turn's footer. */
+      metrics?: AgentMetric[];
+    }
   | { type: "usage_updated"; provider: AgentProvider; usage: AgentUsage; turnId?: string }
+  /** Full replacement of the metrics shown for the session. An empty list clears them. */
+  | { type: "session_metrics_updated"; provider: AgentProvider; metrics: AgentMetric[] }
   | {
       type: "mode_changed";
       provider: AgentProvider;
@@ -668,6 +685,8 @@ export interface ImportProviderSessionContext {
 export interface ImportedTimelineEntry {
   item: AgentTimelineItem;
   timestamp?: string;
+  /** Set on the last entry of a turn the provider reported stats for. */
+  turnMetrics?: AgentMetric[];
 }
 
 export interface ImportedProviderSession {
@@ -675,6 +694,7 @@ export interface ImportedProviderSession {
   config: AgentSessionConfig;
   persistence: AgentPersistenceHandle;
   timeline: ImportedTimelineEntry[];
+  sessionMetrics?: AgentMetric[];
   providerSubagentEvents?: Extract<AgentStreamEvent, { type: "provider_subagent" }>[];
 }
 
@@ -886,6 +906,8 @@ export interface ProviderCatalog {
   defaultModeId?: string | null;
   /** Version already observed during authorized discovery. Never probe solely for this field. */
   installedVersion?: string;
+  /** Part of discovery failed, so the catalogue omits models the provider could not confirm. */
+  incomplete?: boolean;
 }
 
 export interface ResolveAgentDefaultModeInput {
@@ -950,6 +972,15 @@ export interface AgentClientUpdateContext extends AgentClientInstallationContext
   /** Call immediately before synchronously spawning the updater. Throws if this launch is stale. */
   assertCurrent?(): void;
   quarantineActivity?(): void;
+}
+
+/** What the daemon gives a provider's diagnostic report. */
+export interface AgentClientDiagnosticContext {
+  /**
+   * The installation as the provider's Installation row shows it, under the same deadline and
+   * cache. Undefined when the provider does not report its installation.
+   */
+  inspectInstallation(): Promise<ProviderInstallationInspection | undefined>;
 }
 
 export interface AgentClient {
@@ -1019,7 +1050,7 @@ export interface AgentClient {
    * Returns true if available, false otherwise.
    */
   isAvailable(signal?: AbortSignal, options?: FetchCatalogOptions): Promise<boolean>;
-  getDiagnostic?(): Promise<{ diagnostic: string }>;
+  getDiagnostic?(context: AgentClientDiagnosticContext): Promise<{ diagnostic: string }>;
   /**
    * Installation links and the installed version. The same contract as plugin providers'
    * `ProviderRegistration.installation`; built-ins resolve their own launch inside `inspect`.

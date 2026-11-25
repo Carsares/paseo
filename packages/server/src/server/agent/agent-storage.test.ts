@@ -127,6 +127,7 @@ function createManagedAgent(overrides: ManagedAgentOverrides = {}): ManagedAgent
     historyPrimed: overrides.historyPrimed ?? true,
     lastUserMessageAt: overrides.lastUserMessageAt ?? core.now,
     lastUsage: overrides.lastUsage,
+    sessionMetrics: overrides.sessionMetrics,
     lastError: overrides.lastError,
   };
 }
@@ -153,6 +154,47 @@ describe("AgentStorage", () => {
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("preserves records after saving and reloading a directory with different capitalization", async () => {
+    const cwd = path.join(tmpDir, "Work");
+    const alternateCwd = path.join(tmpDir, "work");
+    await fs.mkdir(cwd);
+    const needsAlias = !existsSync(alternateCwd);
+    if (needsAlias) await fs.symlink(cwd, alternateCwd, "junction");
+    const timestamp = "2026-01-01T00:00:00.000Z";
+    const first = {
+      id: "first",
+      provider: "codex",
+      cwd,
+      workspaceId: "one",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      labels: {},
+    };
+    const second = { ...first, id: "second", workspaceId: "two" };
+    await storage.upsert(first);
+    await storage.upsert(second);
+
+    // An existing record can use one cwd spelling in JSON and another in its path.
+    const recordPath = findRecordFile(storagePath, first.id);
+    if (needsAlias) {
+      // Exercise the same on-disk alias on case-sensitive CI filesystems.
+      const recordDir = path.dirname(recordPath);
+      await fs.symlink(recordDir, recordDir.replace(/Work$/, "work"), "junction");
+    }
+    await fs.writeFile(recordPath, JSON.stringify({ ...first, cwd: alternateCwd }));
+    const loaded = new AgentStorage(storagePath, logger);
+    const saved = { ...first, cwd: alternateCwd, title: "Updated conversation" };
+    await loaded.upsert(saved);
+
+    const restarted = new AgentStorage(storagePath, logger);
+    await expect(restarted.listByWorkspace("one")).resolves.toMatchObject([saved]);
+    await expect(restarted.listByWorkspace("two")).resolves.toMatchObject([second]);
+    expect((await fs.readdir(path.dirname(recordPath))).sort()).toEqual([
+      `${first.id}.json`,
+      `${second.id}.json`,
+    ]);
   });
 
   test("reloads turn usage and reset counters alongside legacy agent records", async () => {
@@ -340,6 +382,21 @@ describe("AgentStorage", () => {
       cwd: "/tmp/project",
       providerOptions: { fast_mode: true },
     });
+  });
+
+  test("session metrics survive a daemon restart and follow the latest snapshot", async () => {
+    const sessionMetrics = [
+      { label: "Cost", value: "$1.23" },
+      { label: "Cache", value: "82%", tone: "ok" as const },
+    ];
+    await storage.applySnapshot(createManagedAgent({ id: "agent-metrics", sessionMetrics }));
+
+    const reloaded = new AgentStorage(storagePath, createTestLogger());
+    expect((await reloaded.get("agent-metrics"))?.sessionMetrics).toEqual(sessionMetrics);
+
+    await reloaded.applySnapshot(createManagedAgent({ id: "agent-metrics" }));
+    const cleared = new AgentStorage(storagePath, createTestLogger());
+    expect(await cleared.get("agent-metrics")).not.toHaveProperty("sessionMetrics");
   });
 
   test("a record stored with featureValues loads them in providerOptions", async () => {

@@ -556,7 +556,11 @@ export class CheckoutSession {
     }
   }
 
-  emitStatusUpdate(cwd: string, snapshot: WorkspaceGitRuntimeSnapshot): void {
+  emitStatusUpdate(
+    cwd: string,
+    snapshot: WorkspaceGitRuntimeSnapshot,
+    options?: { force: boolean },
+  ): void {
     try {
       const requestId = `subscription:${cwd}`;
       const payload = {
@@ -572,7 +576,7 @@ export class CheckoutSession {
         }),
       };
       const fingerprint = JSON.stringify(payload);
-      if (this.statusUpdateFingerprints.get(cwd) === fingerprint) return;
+      if (!options?.force && this.statusUpdateFingerprints.get(cwd) === fingerprint) return;
       this.statusUpdateFingerprints.set(cwd, fingerprint);
       this.host.emit({
         type: "checkout_status_update",
@@ -597,6 +601,7 @@ export class CheckoutSession {
 
   private gitWorkbenchHost(): GitWorkbenchHost {
     return {
+      checkoutContext: { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
       listActiveAgents: (root) => this.host.listActiveGitAgents(root),
       withDirectoryWrite: (cwd, write) => this.host.withGitDirectoryWrite(cwd, write),
       refresh: async (root, cwd, reason) => {
@@ -1025,7 +1030,12 @@ export class CheckoutSession {
     const { cwd, requestId } = msg;
 
     try {
-      await this.withLegacyGitWrite(cwd, "push", () => pushCurrentBranch(cwd));
+      await this.withLegacyGitWrite(cwd, "push", () =>
+        pushCurrentBranch(cwd, undefined, {
+          paseoHome: this.paseoHome,
+          worktreesRoot: this.worktreesRoot,
+        }),
+      );
       await this.gitMutation.notifyGitMutation(cwd, "push", { invalidateForge: true });
       this.host.emit({
         type: "checkout_push_response",

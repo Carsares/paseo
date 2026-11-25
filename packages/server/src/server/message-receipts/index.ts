@@ -1,3 +1,4 @@
+import type { AgentActiveTurnBehavior } from "@getpaseo/protocol/messages";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -28,7 +29,9 @@ const QueuedMessageSchema = z.object({
   notifyOnFinish: z.boolean().optional(),
   notifyLocalCaller: z.boolean().optional(),
   sessionMode: z.string().optional(),
-  activeTurnBehavior: z.enum(["steer", "interrupt"]),
+  activeTurnBehavior: z.enum(["steer", "interrupt", "queue"]),
+  immediateSteer: z.boolean().optional(),
+  heldAfterStop: z.boolean().optional(),
   unarchive: z.boolean(),
 });
 export type RecoverableAgentMessage = z.infer<typeof QueuedMessageSchema>;
@@ -44,12 +47,14 @@ export type QueuedMessageReceipt = Receipt & { queued: NonNullable<Receipt["queu
 export interface QueueHandoff {
   waitForForegroundConfirmation?: boolean;
   begin(): Promise<void>;
+  holdAfterStop?(): Promise<void>;
+  releaseAfterStop?(): Promise<void>;
   declined(): Promise<void>;
   onProviderOutcome?(outcome: AgentCommandOutcome): Promise<void>;
 }
 export class AgentRequestOutcomeUnknownError extends Error {
-  constructor() {
-    super("agent_request_outcome_unknown");
+  constructor(options?: ErrorOptions) {
+    super("agent_request_outcome_unknown", options);
   }
 }
 interface SendMessageInput {
@@ -72,12 +77,18 @@ interface SendMessageInput {
   queue?: Omit<QueueMessageInput, "agentId" | "request">;
 }
 
+interface QueueAdmission {
+  dispatched: Promise<unknown>;
+  activeTurnBehavior?: AgentActiveTurnBehavior;
+  guidance?: string;
+}
+
 interface QueueMessageInput {
   agentId: string;
   request: unknown;
   message: RecoverableAgentMessage;
-  enqueue: (handoff: QueueHandoff) => Promise<{ dispatched: Promise<unknown> }>;
-  onQueued?: () => void;
+  enqueue: (handoff: QueueHandoff) => Promise<QueueAdmission>;
+  onQueued?: (receipt: QueueAdmission) => void;
   retainOnError?: (error: unknown) => boolean;
 }
 
@@ -222,29 +233,54 @@ export class MessageReceipts {
       let providerOutcome: AgentCommandOutcome | undefined;
       const saveQueued = () => this.writeQueued(file, { ...receipt, state: "pending", queued });
       if (!existing) await saveQueued();
-      const handoff = {
-        begin: async () => {
-          if (handedOff) return;
-          declinedAndRestored = false;
-          await writeJsonFileAtomic(file, { ...receipt, state: "pending" });
-          handedOff = true;
-        },
-        declined: async () => {
-          if (!handedOff) return;
-          await saveQueued();
-          handedOff = false;
-          declinedAndRestored = true;
-        },
-        onProviderOutcome: async (outcome: AgentCommandOutcome) => {
-          providerOutcome = outcome;
-          if (outcome === "unknown") {
+      let receiptWrites = Promise.resolve();
+      const write = (operation: () => Promise<void>) => {
+        const pending = receiptWrites.then(operation);
+        receiptWrites = pending.catch(() => undefined);
+        return pending;
+      };
+      const handoff: QueueHandoff = {
+        holdAfterStop: () =>
+          write(async () => {
+            queued.message = { ...queued.message, heldAfterStop: true };
+            if (!handedOff) await saveQueued();
+          }),
+        releaseAfterStop: () =>
+          write(async () => {
+            queued.message = {
+              ...queued.message,
+              heldAfterStop: undefined,
+              activeTurnBehavior: "queue",
+              immediateSteer: undefined,
+            };
+            if (!handedOff) await saveQueued();
+          }),
+        begin: () =>
+          write(async () => {
+            if (handedOff) return;
+            declinedAndRestored = false;
             await writeJsonFileAtomic(file, { ...receipt, state: "pending" });
-          }
-        },
+            handedOff = true;
+          }),
+        declined: () =>
+          write(async () => {
+            if (!handedOff || providerOutcome === "unknown") return;
+            await saveQueued();
+            handedOff = false;
+            declinedAndRestored = true;
+          }),
+        onProviderOutcome: (outcome: AgentCommandOutcome) =>
+          write(async () => {
+            providerOutcome = outcome;
+            if (outcome === "unknown") {
+              handedOff = true;
+              await writeJsonFileAtomic(file, { ...receipt, state: "pending" });
+            }
+          }),
       };
       try {
         const queuedDelivery = await input.enqueue(handoff);
-        input.onQueued?.();
+        input.onQueued?.(queuedDelivery);
         return {
           completed: queuedDelivery.dispatched.then(
             async () => {

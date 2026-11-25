@@ -99,6 +99,8 @@ MCP does not expose an agent-detach tool. Detaching is a manual user action in t
 | `get_agent_activity` | Return recent agent timeline entries as a curated summary.                                                                                                                                                                                                                                                 |
 | `set_agent_mode`     | Switch an agent's session mode.                                                                                                                                                                                                                                                                            |
 
+Agent callers can set `activeTurnBehavior` to `queue` (the default), `steer`, or `interrupt`. A queued receipt confirms the daemon accepted the message and includes guidance about when it will dispatch. Main Control can bind a local direct subagent to a task with `taskBinding`, which waits for dispatch confirmation. Human-operated clients default to `interrupt` and can also use `steer`.
+
 Paseo agents receive finish, error, and permission notifications by default; set `notifyOnFinish: false` to disable them. External MCP clients use `get_agent_status` and `get_agent_activity` to check results.
 
 ### Workspaces

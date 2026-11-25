@@ -364,13 +364,15 @@ describe("ClaudeAgentClient.fetchCatalog", () => {
       },
     });
     const options = { scope: "workspace" as const, cwd: configDir, force: true };
-    expect(
-      (await client.fetchCatalog(options)).models.some((model) => model.id === "claude-mythos-5-1"),
-    ).toBe(false);
+    const failed = await client.fetchCatalog(options);
+    expect(failed.models.some((model) => model.id === "claude-mythos-5-1")).toBe(false);
+    expect(failed.incomplete).toBe(true);
     fail = false;
-    expect(
-      (await client.fetchCatalog(options)).models.find((model) => model.id === "claude-mythos-5-1"),
-    ).toEqual(findClaudeModel("claude-mythos-5-1"));
+    const discovered = await client.fetchCatalog(options);
+    expect(discovered.models.find((model) => model.id === "claude-mythos-5-1")).toEqual(
+      findClaudeModel("claude-mythos-5-1"),
+    );
+    expect(discovered.incomplete).toBeUndefined();
   });
 
   it("keeps the curated catalog when discovery does not advertise Mythos", async () => {
@@ -525,7 +527,9 @@ describe("ClaudeAgentClient.fetchCatalog", () => {
       logger: createTestLogger(),
       resolveVersion,
       discoverModels,
-      runtimeSettings: { env: { CLAUDE_CONFIG_DIR: configDir } },
+      runtimeSettings: {
+        env: { CLAUDE_CONFIG_DIR: configDir, CLAUDE_CODE_USE_BEDROCK: "1" },
+      },
     });
     const { run } = bindCustomProviderLaunch({
       adapter: "claude",
@@ -545,7 +549,8 @@ describe("ClaudeAgentClient.fetchCatalog", () => {
     expect(catalog.models.map(({ id }) => id)).toContain("gateway-model");
     expect(catalog.models.map(({ id }) => id)).not.toContain("not-a-model");
     expect(catalog.models.filter(({ id }) => id.startsWith("claude-mythos-"))).toEqual([]);
-    expect(catalog.modes.length).toBeGreaterThan(0);
+    expect(catalog.modes.map(({ id }) => id)).toContain("auto");
+    expect(catalog.defaultModeId).toBe("default");
 
     await fs.writeFile(
       path.join(configDir, "settings.json"),

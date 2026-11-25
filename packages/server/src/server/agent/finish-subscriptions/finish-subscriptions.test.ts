@@ -373,7 +373,7 @@ test("restores a remote parent subscription and delivers to the owning host", as
       messageId: expect.any(String),
       sourceAgentId: "child",
       sourceAgentServerId: "origin",
-      activeTurnBehavior: "steer",
+      activeTurnBehavior: "queue",
       waitForDispatch: true,
     },
   );

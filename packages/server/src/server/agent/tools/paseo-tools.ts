@@ -1,3 +1,5 @@
+import { describeAgentMessage } from "../agent-messages/guidance.js";
+import type { AgentActiveTurnBehavior } from "@getpaseo/protocol/messages";
 import { randomUUID } from "node:crypto";
 import type { ChangeRequestWatches } from "../change-request-watches/index.js";
 import { changeRequestStatusSchema } from "../../../services/change-request-source.js";
@@ -29,6 +31,7 @@ import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-
 import type { AgentManager, ManagedAgent } from "../agent-manager.js";
 import {
   ActiveTurnBehaviorSchema,
+  AgentActiveTurnBehaviorSchema,
   AgentProfileSchema,
   WorkspaceAgentSummaryEntrySchema,
 } from "@getpaseo/protocol/messages";
@@ -205,6 +208,7 @@ export interface PaseoToolHostDependencies {
   findWorkspaceIdForCwd?: ArchiveDependencies["findWorkspaceIdForCwd"];
   worktreeManagers?: ArchiveDependencies["worktreeManagers"];
   workspaceArchiveOperations?: ArchiveDependencies["workspaceArchiveOperations"];
+  assertWorkspaceAutomationAllowed?: ArchiveDependencies["assertWorkspaceAutomationAllowed"];
   isCheckoutUntrusted?: ArchiveDependencies["isCheckoutUntrusted"];
   listActiveWorkspaces?: ArchiveDependencies["listActiveWorkspaces"];
   archiveWorkspaceRecord?: ArchiveDependencies["archiveWorkspaceRecord"];
@@ -809,14 +813,15 @@ function createToolCatalog(
     ["get_agent_activity", "getActivity"],
     ["list_agents", "listAgents"],
   ] as const satisfies ReadonlyArray<readonly [string, keyof HostOperations]>);
+  function createRemoteChildTracker() {
+    if (!callerAgentId || !options.finishSubscriptions) return undefined;
+    return (childAgentId: string, serverId: string) =>
+      finishSubscriptions().trackRemoteChild({ childAgentId, callerAgentId, serverId });
+  }
   const hostResolver = createHostResolver({
     serverId: options.serverId ?? "self",
     callerAgentId,
-    trackRemoteChild:
-      callerAgentId && options.finishSubscriptions
-        ? (childAgentId, serverId) =>
-            finishSubscriptions().trackRemoteChild({ childAgentId, callerAgentId, serverId })
-        : undefined,
+    trackRemoteChild: createRemoteChildTracker(),
     lockedCwd: callerContext?.lockedCwd,
     hosts: () => {
       if (!options.hosts) throw new Error("Connected hosts are not configured");
@@ -1852,15 +1857,15 @@ function createToolCatalog(
     taskBinding: WorkspaceTaskToolInputSchema.optional().describe(
       "Main Control only. Wait for the prompt to dispatch, then add the local recipient to a task in your workspace.",
     ),
-    activeTurnBehavior: ActiveTurnBehaviorSchema.optional().describe(
-      'Agent callers: "steer" (default) waits until the current turn ends; "interrupt" replaces it. Human callers: "steer" joins the turn, falling back to interrupt; default is interrupt.',
-    ),
     agentId: z.string(),
     prompt: z.string(),
     sessionMode: z.string().optional().describe("Optional mode to set before running the prompt."),
   };
   const agentToAgentSendAgentPromptInputSchema = {
     ...commonSendAgentPromptInputSchema,
+    activeTurnBehavior: AgentActiveTurnBehaviorSchema.optional().describe(
+      'Leave this out unless the message cannot wait. Default "queue": the message waits until the agent\'s running turn ends. "steer": the message joins the running turn; a provider that cannot steer interrupts the turn instead. "interrupt": the running turn stops and a new turn starts with the message. A steer or interrupt carries the messages you queued before it, in order.',
+    ),
     notifyOnFinish: z
       .boolean()
       .optional()
@@ -1870,6 +1875,9 @@ function createToolCatalog(
   };
   const topLevelSendAgentPromptInputSchema = {
     ...commonSendAgentPromptInputSchema,
+    activeTurnBehavior: ActiveTurnBehaviorSchema.optional().describe(
+      'Default "interrupt": the running turn stops and a new turn starts with the prompt. "steer": the prompt joins the running turn; a provider that cannot steer interrupts the turn instead.',
+    ),
     notifyOnFinish: z
       .boolean()
       .optional()
@@ -2782,17 +2790,25 @@ function createToolCatalog(
   const PROMPTED_AGENT_NOTIFICATION_GUIDANCE =
     "You will get notified when the prompted agent finishes, errors, or needs permission. Do not poll for status; continue with other work until the notification arrives.";
 
-  function queuedPromptResponse(agentId: string, messageId: string, notifying: boolean) {
+  function queuedPromptResponse(
+    agentId: string,
+    messageId: string,
+    notifying: boolean,
+    activeTurnBehavior: AgentActiveTurnBehavior,
+  ) {
     return {
       content: [],
       structuredContent: {
         success: true,
         deliveryStatus: "queued" as const,
         messageId,
+        activeTurnBehavior,
         status: agentManager.getAgent(agentId)?.lifecycle ?? "idle",
-        guidance: notifying
-          ? `Queued for delivery after two quiet seconds and the current turn ends. ${PROMPTED_AGENT_NOTIFICATION_GUIDANCE}`
-          : "Queued for delivery after two quiet seconds and the current turn ends; provider dispatch has not occurred.",
+        guidance: `${describeAgentMessage({
+          activeTurnBehavior,
+          running: agentManager.hasInFlightRun(agentId),
+          canSteer: agentManager.canSteer(agentId),
+        })}${notifying ? ` ${PROMPTED_AGENT_NOTIFICATION_GUIDANCE}` : ""}`,
       },
     };
   }
@@ -2878,6 +2894,7 @@ function createToolCatalog(
     }: z.infer<z.ZodObject<typeof commonSendAgentPromptInputSchema>> & {
       requireParentOwnership: boolean;
       notifyOnFinish?: boolean;
+      activeTurnBehavior?: AgentActiveTurnBehavior;
     },
     taskBinding?: Awaited<ReturnType<typeof prepareTaskBinding>>,
   ) {
@@ -2903,7 +2920,8 @@ function createToolCatalog(
             ? { agentId: senderId, serverId: options.serverId ?? "self" }
             : undefined,
           sessionMode,
-          activeTurnBehavior: activeTurnBehavior ?? "steer",
+          activeTurnBehavior: activeTurnBehavior ?? "queue",
+          ...(activeTurnBehavior === "steer" ? { immediateSteer: true } : {}),
           unarchive: !mainControl,
           notifyLocalCaller: notifying,
           notifyOnFinish,
@@ -2911,7 +2929,8 @@ function createToolCatalog(
         taskBinding ? () => taskBinding.validateDispatch(agentId) : undefined,
       );
     const messageId = await (taskBinding ? taskBinding.run(enqueue) : enqueue());
-    if (!taskBinding) return queuedPromptResponse(agentId, messageId, notifying);
+    if (!taskBinding)
+      return queuedPromptResponse(agentId, messageId, notifying, activeTurnBehavior ?? "queue");
     return {
       content: [],
       structuredContent: {
@@ -2930,13 +2949,16 @@ function createToolCatalog(
     {
       title: "Send agent prompt",
       description:
-        "Send a task. Agent callers receive an immediate queued receipt; delivery follows after two quiet seconds per recipient and waits for the current turn to end unless interrupt is requested. Completion reports include the target’s last response by default. Paseo supplies caller identity.",
+        scope === "agent"
+          ? "Send a message to another agent. The response returns at once. Its guidance says whether the message waits for the running turn to end, joins it, or interrupts it, and how to deliver a waiting message now. Leave activeTurnBehavior out unless the message cannot wait. The recipient reads your messages in the order you sent them. Stop holds messages that have not reached the provider until the next prompt. Completion reports include the target’s last response by default. Paseo supplies caller identity."
+          : "Send a prompt to an agent. A running turn is interrupted unless activeTurnBehavior is steer.",
       inputSchema: sendAgentPromptInputSchema,
       outputSchema: {
         success: z.boolean(),
         disposition: z.enum(["turn_started", "out_of_band", "steered"]).optional(),
         deliveryStatus: z.enum(["queued", "dispatched"]).optional(),
         messageId: z.string().optional(),
+        activeTurnBehavior: AgentActiveTurnBehaviorSchema.optional(),
         status: AgentStatusEnum,
         guidance: z.string().optional(),
         taskId: z.string().optional(),
@@ -2950,7 +2972,7 @@ function createToolCatalog(
       requireParentOwnership,
       notifyOnFinish,
       taskBinding: taskBindingInput,
-      activeTurnBehavior = callerAgentId ? "steer" : "interrupt",
+      activeTurnBehavior,
     }) => {
       const taskBinding = taskBindingInput ? await prepareTaskBinding(taskBindingInput) : undefined;
       if (callerAgentId) {
@@ -2967,7 +2989,11 @@ function createToolCatalog(
           taskBinding,
         ).finally(() => taskBinding?.close());
       }
+      if (activeTurnBehavior === "queue") {
+        throw new PaseoToolInputError('activeTurnBehavior "queue" needs an agent caller');
+      }
       const dispatch = await sendPromptToAgent({
+        agentMessages: agentMessages(),
         agentManager,
         agentStorage,
         agentId,
@@ -4498,11 +4524,18 @@ function archiveWorktreeDependencies(
   if (!options.clearWorkspaceArchiving) {
     throw new Error("Workspace archiving clearer is required to archive worktrees");
   }
+  if (!options.assertWorkspaceAutomationAllowed) {
+    throw new Error("Workspace automation gate is required to archive worktrees");
+  }
+  if (!options.isCheckoutUntrusted) {
+    throw new Error("Checkout trust lookup is required to archive worktrees");
+  }
   return {
     paseoHome: options.paseoHome,
     paseoWorktreesBaseRoot: options.worktreesRoot,
     worktreeManagers: options.worktreeManagers,
     workspaceArchiveOperations: options.workspaceArchiveOperations,
+    assertWorkspaceAutomationAllowed: options.assertWorkspaceAutomationAllowed,
     isCheckoutUntrusted: options.isCheckoutUntrusted,
     github: options.github,
     workspaceGitService: options.workspaceGitService,

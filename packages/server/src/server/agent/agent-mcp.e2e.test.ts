@@ -7,6 +7,11 @@ import { describe, expect, test, vi } from "vitest";
 import { experimental_createMCPClient } from "ai";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {
+  Client as StandardMcpClient,
+  StreamableHTTPClientTransport as StandardMcpHttpTransport,
+  type VersionNegotiationMode,
+} from "@modelcontextprotocol/client";
 import pino from "pino";
 
 import { withTimeout } from "../../utils/promise-timeout.js";
@@ -95,13 +100,13 @@ async function createMcpClient(url: string, authToken?: string): Promise<McpClie
   return { callTool: boundCallTool, close: () => rawClient.close() };
 }
 
-interface OfflineMcpDaemon {
+interface OfflineDaemon {
+  mcpUrl: string;
   paseoHome: string;
-  client: McpClient;
   stop: () => Promise<void>;
 }
 
-async function startOfflineMcpDaemon(): Promise<OfflineMcpDaemon> {
+async function startOfflineDaemon(logger = pino({ level: "silent" })): Promise<OfflineDaemon> {
   const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
   const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
   const removeDirectories = async () => {
@@ -121,27 +126,91 @@ async function startOfflineMcpDaemon(): Promise<OfflineMcpDaemon> {
       agentClients: createTestAgentClients(),
       agentStoragePath: path.join(paseoHome, "agents"),
     },
-    pino({ level: "silent" }),
+    logger,
   ).catch(async (error: unknown) => {
     await removeDirectories();
     throw error;
   });
+  const stop = async () => {
+    await daemon.stop();
+    await removeDirectories();
+  };
   try {
     await daemon.start();
-    const client = await createMcpClient(`http://127.0.0.1:${port}/mcp/agents`);
+  } catch (error) {
+    await stop();
+    throw error;
+  }
+  return { paseoHome, mcpUrl: `http://127.0.0.1:${port}/mcp/agents`, stop };
+}
+
+interface OfflineMcpDaemon {
+  paseoHome: string;
+  client: McpClient;
+  stop: () => Promise<void>;
+}
+
+async function startOfflineMcpDaemon(): Promise<OfflineMcpDaemon> {
+  const daemon = await startOfflineDaemon();
+  try {
+    const client = await createMcpClient(daemon.mcpUrl);
     return {
-      paseoHome,
+      paseoHome: daemon.paseoHome,
       client,
       stop: async () => {
         await client.close();
         await daemon.stop();
-        await removeDirectories();
       },
     };
   } catch (error) {
     await daemon.stop();
-    await removeDirectories();
     throw error;
+  }
+}
+
+interface CapturedLog {
+  level: number;
+  msg?: string;
+}
+
+function createCapturingLogger(): { logger: pino.Logger; logs: CapturedLog[] } {
+  const logs: CapturedLog[] = [];
+  const logger = pino(
+    { level: "warn" },
+    {
+      write: (line: string) => {
+        logs.push(JSON.parse(line) as CapturedLog);
+      },
+    },
+  );
+  return { logger, logs };
+}
+
+interface StandardMcpSession {
+  negotiatedProtocolVersion: string | undefined;
+  toolNames: string[];
+  listWorkspacesResult: unknown;
+}
+
+async function runStandardMcpSession(
+  mcpUrl: string,
+  mode: VersionNegotiationMode,
+): Promise<StandardMcpSession> {
+  const client = new StandardMcpClient(
+    { name: "agent-mcp-e2e", version: "0.0.0" },
+    { versionNegotiation: { mode } },
+  );
+  await client.connect(new StandardMcpHttpTransport(new URL(mcpUrl)));
+  try {
+    const tools = await client.listTools();
+    const workspaces = await client.callTool({ name: "list_workspaces", arguments: {} });
+    return {
+      negotiatedProtocolVersion: client.getNegotiatedProtocolVersion(),
+      toolNames: tools.tools.map((tool) => tool.name),
+      listWorkspacesResult: workspaces.structuredContent,
+    };
+  } finally {
+    await client.close();
   }
 }
 
@@ -315,7 +384,7 @@ function expectBoundCompactEvents(
 }
 
 describe("agent MCP end-to-end (offline)", () => {
-  test("negotiates a 2025 tool call after a 2026-07-28 discovery probe", async () => {
+  test("serves a 2025 tool call after a 2026-07-28 discovery probe", async () => {
     const errors: string[] = [];
     const clientInfo = { name: "agent-mcp-test", version: "1.0.0" };
     const daemon = await createTestPaseoDaemon({
@@ -346,16 +415,14 @@ describe("agent MCP end-to-end (offline)", () => {
           },
         }),
       });
-      // A legacy HTTP 400 tells a dual-era client to retry with initialize.
-      expect(probe.status).toBe(400);
+      expect(probe.status).toBe(200);
       expect(await probe.json()).toMatchObject({
         jsonrpc: "2.0",
-        id: null,
-        error: { code: -32000, message: expect.stringContaining("2025-11-25") },
+        id: 1,
+        result: expect.any(Object),
       });
 
-      // SDK 1.29 only implements the legacy handshake. Drive the modern probe
-      // above and use the SDK for the real legacy requests after the rejection.
+      // SDK 1.29 still uses its legacy handshake on the same endpoint.
       const transport = new StreamableHTTPClientTransport(url);
       await client.connect(transport);
       expect(transport.protocolVersion).toBe("2025-11-25");
@@ -423,7 +490,32 @@ describe("agent MCP end-to-end (offline)", () => {
         result: { protocolVersion: "2025-11-25" },
       });
 
-      for (const version of ["2026-07-28", "2099-01-01", "invalid-version"]) {
+      // The modern version is supported, but a request missing its envelope is invalid.
+      const incomplete = await post(
+        {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "list_workspaces",
+            arguments: {},
+            _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" },
+          },
+        },
+        {
+          "MCP-Protocol-Version": "2026-07-28",
+          "Mcp-Method": "tools/call",
+          "Mcp-Name": "list_workspaces",
+        },
+      );
+      expect(incomplete.status).toBe(400);
+      expect(await incomplete.json()).toMatchObject({
+        jsonrpc: "2.0",
+        id: 2,
+        error: { code: -32602, message: expect.stringContaining("clientCapabilities") },
+      });
+
+      for (const version of ["2099-01-01", "invalid-version"]) {
         const response = await post(
           {
             jsonrpc: "2.0",
@@ -432,7 +524,18 @@ describe("agent MCP end-to-end (offline)", () => {
             params: {
               name: "list_workspaces",
               arguments: {},
-              _meta: { "io.modelcontextprotocol/protocolVersion": version },
+              ...(version === "2099-01-01"
+                ? {
+                    _meta: {
+                      "io.modelcontextprotocol/protocolVersion": version,
+                      "io.modelcontextprotocol/clientInfo": {
+                        name: "agent-mcp-test",
+                        version: "1.0.0",
+                      },
+                      "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                  }
+                : {}),
             },
           },
           {
@@ -444,25 +547,47 @@ describe("agent MCP end-to-end (offline)", () => {
         expect(response.status).toBe(400);
         expect(await response.json()).toMatchObject({
           jsonrpc: "2.0",
-          id: null,
+          id: 2,
           error: {
-            code: -32000,
-            message: expect.stringContaining(`Unsupported protocol version: ${version}`),
+            code: version === "2099-01-01" ? -32022 : -32602,
+            message: expect.stringContaining(
+              version === "2099-01-01"
+                ? `Unsupported protocol version: ${version}`
+                : "missing the required per-request envelope",
+            ),
           },
         });
       }
-      expect(errors.join("\n")).not.toContain("Agent MCP transport error");
+      expect(errors.map((line) => JSON.parse(line))).toEqual([
+        expect.objectContaining({
+          msg: "Agent MCP transport error",
+          err: expect.objectContaining({ message: expect.stringContaining("envelope-invalid") }),
+        }),
+        expect.objectContaining({
+          msg: "Agent MCP transport error",
+          err: expect.objectContaining({
+            message: expect.stringContaining("modern-header-without-claim"),
+          }),
+        }),
+      ]);
 
       // A rejected version header must not hide a different transport error
       // raised before the SDK gets to validate the version.
       const invalidMessage = await post({}, { "MCP-Protocol-Version": "2026-07-28" });
       expect(invalidMessage.status).toBe(400);
-      expect(await invalidMessage.json()).toMatchObject({ error: { code: -32700 } });
+      expect(await invalidMessage.json()).toMatchObject({
+        error: {
+          code: -32600,
+          message: expect.stringContaining("not a valid JSON-RPC message"),
+        },
+      });
       expect(errors.map((line) => JSON.parse(line))).toContainEqual(
         expect.objectContaining({
           level: 50,
           msg: "Agent MCP transport error",
-          err: expect.objectContaining({ message: "Parse error: Invalid JSON-RPC message" }),
+          err: expect.objectContaining({
+            message: expect.stringContaining("the request body is not a valid JSON-RPC message"),
+          }),
         }),
       );
     } finally {
@@ -694,8 +819,9 @@ describe("agent MCP end-to-end (offline)", () => {
           args: { agentId },
         });
         expect(getStructuredContent(status)).toMatchObject({ snapshot: { id: agentId } });
-        const ledger = await legacyClient.callTool({ name: "list_workspace_tasks", args: {} });
-        expect(ledger.isError).toBe(true);
+        await expect(
+          legacyClient.callTool({ name: "list_workspace_tasks", args: {} }),
+        ).rejects.toThrow("Tool list_workspace_tasks not found");
       } finally {
         await legacyClient.close();
       }
@@ -705,6 +831,43 @@ describe("agent MCP end-to-end (offline)", () => {
         body: "{}",
       });
       expect(mismatchedIdentity.status).toBe(401);
+      for (const [token, isError] of [
+        [capabilityToken!, true],
+        [mainToken, false],
+      ] as const) {
+        const modernLedger = await fetch(mainUrl, {
+          method: "POST",
+          headers: {
+            Accept: "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+            "MCP-Protocol-Version": "2026-07-28",
+            "Mcp-Method": "tools/call",
+            "Mcp-Name": "list_workspace_tasks",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: {
+              name: "list_workspace_tasks",
+              arguments: {},
+              _meta: {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": { name: "agent-mcp-test", version: "1.0.0" },
+                "io.modelcontextprotocol/clientCapabilities": {},
+              },
+            },
+          }),
+        });
+        expect(modernLedger.status).toBe(200);
+        const body = await modernLedger.json();
+        expect(body).toMatchObject(
+          isError
+            ? { error: { code: -32602, message: "Tool list_workspace_tasks not found" } }
+            : { result: { structuredContent: { tasks: [] } } },
+        );
+      }
       mainClient = await createMcpClient(mainUrl, mainToken);
       const taskBinding = { taskId: "mcp-review", title: "Review changes" };
       const child = getStructuredContent(
@@ -1347,4 +1510,43 @@ describe("agent MCP end-to-end (offline)", () => {
       await rm(repoRoot, { recursive: true, force: true });
     }
   }, 60_000);
+});
+
+describe("agent MCP protocol negotiation", () => {
+  test("a client pinned to 2026-07-28 lists and calls tools", async () => {
+    const daemon = await startOfflineDaemon();
+    try {
+      const session = await runStandardMcpSession(daemon.mcpUrl, { pin: "2026-07-28" });
+      expect(session.negotiatedProtocolVersion).toBe("2026-07-28");
+      expect(session.toolNames).toEqual(expect.arrayContaining(["create_agent", "update_agent"]));
+      expect(session.listWorkspacesResult).toMatchObject({ workspaces: [] });
+    } finally {
+      await daemon.stop();
+    }
+  }, 30_000);
+
+  test("an auto-negotiating client settles on 2026-07-28 without transport errors", async () => {
+    const { logger, logs } = createCapturingLogger();
+    const daemon = await startOfflineDaemon(logger);
+    try {
+      const session = await runStandardMcpSession(daemon.mcpUrl, "auto");
+      expect(session.negotiatedProtocolVersion).toBe("2026-07-28");
+      expect(session.listWorkspacesResult).toMatchObject({ workspaces: [] });
+      expect(logs.filter((log) => log.msg === "Agent MCP transport error")).toEqual([]);
+    } finally {
+      await daemon.stop();
+    }
+  }, 30_000);
+
+  test("a legacy client still initializes over a 2025 protocol version", async () => {
+    const daemon = await startOfflineDaemon();
+    try {
+      const session = await runStandardMcpSession(daemon.mcpUrl, "legacy");
+      expect(session.negotiatedProtocolVersion).toMatch(/^2025-/);
+      expect(session.toolNames).toEqual(expect.arrayContaining(["create_agent", "update_agent"]));
+      expect(session.listWorkspacesResult).toMatchObject({ workspaces: [] });
+    } finally {
+      await daemon.stop();
+    }
+  }, 30_000);
 });

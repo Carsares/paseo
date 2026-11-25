@@ -42,6 +42,7 @@ export function asAgentManager(stub: {
     effectiveOptionsFor: (_provider: string, own?: Record<string, unknown>) => own ?? {},
     adapterOf: (provider: string) => provider,
     getAgentBackgroundWorkSummary: () => undefined,
+    limitRecovery: undefined,
     ...stub,
   });
 }

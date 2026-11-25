@@ -2,6 +2,7 @@ import { findMountedWindowStart } from "@/agent-stream/history-window";
 import { z } from "zod";
 import {
   AgentBackgroundWorkSummarySchema,
+  AgentMetricSchema,
   AgentStatusSchema,
   AgentTimelineItemPayloadSchema,
   ForgeWebSchema,
@@ -22,6 +23,7 @@ import {
   forkContextToChatHistoryAttachments,
   isUnreconciledLocalUserMessage,
   type AgentToolCallData,
+  type AgentToolCallItem,
   type StreamItem,
 } from "@/types/stream";
 import type { UnsettledTurn } from "@/timeline/turn-liveness";
@@ -138,6 +140,7 @@ const StoredTimelineItemSchema = z.discriminatedUnion("kind", [
     ...TimelineItemBaseShape,
     kind: z.literal("assistant_message"),
     messageId: z.string().optional(),
+    turnMetrics: z.array(AgentMetricSchema).optional(),
     text: z.string(),
     // Reject old caches containing display fragments; refetch the complete source text.
   }),
@@ -172,6 +175,7 @@ const StoredTimelineItemSchema = z.discriminatedUnion("kind", [
     ...TimelineItemBaseShape,
     kind: z.literal("tool_call"),
     provider: AgentProviderSchema,
+    turnMetrics: z.array(AgentMetricSchema).optional(),
     item: AgentTimelineItemPayloadSchema.refine((item) => item.type === "tool_call"),
   }),
   z.strictObject({
@@ -525,6 +529,7 @@ function serializeTimelineItem(item: StreamItem): StoredTimelineItem | null {
         ...base,
         kind: item.kind,
         ...(item.messageId ? { messageId: item.messageId } : {}),
+        ...(item.turnMetrics ? { turnMetrics: item.turnMetrics } : {}),
         text: item.text,
       };
     case "thought":
@@ -559,6 +564,7 @@ function serializeTimelineItem(item: StreamItem): StoredTimelineItem | null {
         ...base,
         kind: item.kind,
         provider: item.payload.data.provider,
+        ...(item.turnMetrics ? { turnMetrics: item.turnMetrics } : {}),
         item: serializeAgentToolCall(item.payload.data),
       };
     case "plugin":
@@ -595,6 +601,28 @@ function deserializeTimelineItem(item: StoredTimelineItem): StreamItem {
   return deserializeBuiltinTimelineItem(item);
 }
 
+function deserializeToolCallPayload(
+  item: Extract<StoredTimelineItem, { kind: "tool_call" }>,
+): AgentToolCallItem["payload"] {
+  const tool = item.item;
+  if (tool.type !== "tool_call") {
+    throw new Error("Stored tool call contains a non-tool timeline item");
+  }
+  return {
+    source: "agent",
+    data: {
+      provider: item.provider,
+      callId: tool.callId,
+      name: tool.name,
+      status: tool.status,
+      error: tool.error,
+      detail: tool.detail,
+      ...(tool.metadata ? { metadata: tool.metadata } : {}),
+      ...(tool.agentMessage ? { agentMessage: tool.agentMessage } : {}),
+    },
+  };
+}
+
 function deserializeBuiltinTimelineItem(
   item: Exclude<StoredTimelineItem, { kind: "plugin" }>,
 ): StreamItem {
@@ -621,6 +649,7 @@ function deserializeBuiltinTimelineItem(
         ...base,
         kind: item.kind,
         ...(item.messageId ? { messageId: item.messageId } : {}),
+        ...(item.turnMetrics ? { turnMetrics: item.turnMetrics } : {}),
         text: item.text,
       };
     case "thought":
@@ -649,29 +678,13 @@ function deserializeBuiltinTimelineItem(
         ...(item.trigger ? { trigger: item.trigger } : {}),
         ...(item.preTokens !== undefined ? { preTokens: item.preTokens } : {}),
       };
-    case "tool_call": {
-      const tool = item.item;
-      if (tool.type !== "tool_call") {
-        throw new Error("Stored tool call contains a non-tool timeline item");
-      }
+    case "tool_call":
       return {
         ...base,
         kind: item.kind,
-        payload: {
-          source: "agent",
-          data: {
-            provider: item.provider,
-            callId: tool.callId,
-            name: tool.name,
-            status: tool.status,
-            error: tool.error,
-            detail: tool.detail,
-            ...(tool.metadata ? { metadata: tool.metadata } : {}),
-            ...(tool.agentMessage ? { agentMessage: tool.agentMessage } : {}),
-          },
-        },
+        ...(item.turnMetrics ? { turnMetrics: item.turnMetrics } : {}),
+        payload: deserializeToolCallPayload(item),
       };
-    }
   }
 }
 

@@ -27,6 +27,7 @@ import { WebSocket } from "ws";
 
 import { createPaseoDaemon, parseListenString, type PaseoDaemonConfig } from "./bootstrap.js";
 import { SavedRecoveryTerminalCleanupError } from "./daemon-shutdown-outcome.js";
+import { BuiltinPluginLoader } from "./plugins/builtin/index.js";
 import { loadConfig } from "./config.js";
 import {
   FileBackedProjectRegistry,
@@ -250,7 +251,10 @@ describe("paseo daemon bootstrap", () => {
         voiceTts: { provider: "local", explicit: true, enabled: false },
       },
     };
-    const daemon = await createPaseoDaemon(config, pino({ level: "silent" }));
+    const daemon = await createPaseoDaemon(config, pino({ level: "silent" }), {
+      builtinPlugins: new BuiltinPluginLoader(undefined, []),
+      lazyTerminalWorker: true,
+    });
     let client: DaemonClient | null = null;
     let proxyUpstream: http.Server | null = null;
 
@@ -296,7 +300,9 @@ describe("paseo daemon bootstrap", () => {
       const beforeMcp = await fetch(`http://127.0.0.1:${target.port}/mcp/agents`, {
         method: "POST",
       });
-      expect(beforeMcp.status).toBe(406);
+      // Any answer from the agent MCP handler proves the route is live; the handler
+      // rejects a body-less POST as an unsupported media type.
+      expect(beforeMcp.status).toBe(415);
       const beforeProxyReload = await httpGetWithHost(target.port, proxyHost, "/", {
         "x-forwarded-proto": "https",
       });
@@ -524,7 +530,10 @@ describe("paseo daemon bootstrap", () => {
         standaloneListen: `127.0.0.1:${address.port}`,
       },
     };
-    const daemon = await createPaseoDaemon(config, pino({ level: "silent" }));
+    const daemon = await createPaseoDaemon(config, pino({ level: "silent" }), {
+      builtinPlugins: new BuiltinPluginLoader(undefined, []),
+      lazyTerminalWorker: true,
+    });
 
     try {
       await expect(daemon.start()).rejects.toThrow();
@@ -637,6 +646,8 @@ describe("paseo daemon bootstrap", () => {
       speech: undefined,
     };
     const daemon = await createPaseoDaemon(config, pino({ level: "silent" }), {
+      builtinPlugins: new BuiltinPluginLoader(undefined, []),
+      lazyTerminalWorker: true,
       hubRelationshipRemote: remote,
     });
     const starting = daemon.start();
@@ -677,6 +688,72 @@ describe("paseo daemon bootstrap", () => {
       ).resolves.toEqual([{ status: "rejected", statusCode: 503 }, "rejected"]);
     } finally {
       await shutdown.finish();
+    }
+  });
+
+  test("workspace archive publishes progress and removal to a second connection", async () => {
+    const handle = await createTestPaseoDaemon({ agentClients: createTestAgentClients() });
+    const url = `ws://127.0.0.1:${handle.port}/ws`;
+    const initiator = new DaemonClient({ url });
+    const observer = new DaemonClient({ url });
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const archiveAgent = handle.daemon.agentManager.archiveAgentForWorkspace.bind(
+      handle.daemon.agentManager,
+    );
+    const blockedArchive = vi
+      .spyOn(handle.daemon.agentManager, "archiveAgentForWorkspace")
+      .mockImplementation(async (...args) => {
+        started.resolve();
+        await release.promise;
+        return archiveAgent(...args);
+      });
+    let pendingArchive: ReturnType<DaemonClient["archiveWorkspace"]> | undefined;
+    try {
+      await Promise.all([initiator.connect(), observer.connect()]);
+      const { workspace, error } = await initiator.createWorkspace({
+        source: { kind: "directory", path: handle.staticDir },
+      });
+      if (!workspace) throw new Error(error ?? "Expected a workspace to archive");
+      await handle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: handle.staticDir },
+        undefined,
+        { workspaceId: workspace.id },
+      );
+      const updates: Array<{ kind: "upsert" | "remove"; archivingAt?: string | null }> = [];
+      const unsubscribe = observer.subscribe((event) => {
+        if (event.type !== "workspace_update" || event.workspaceId !== workspace.id) return;
+        if (event.payload.kind === "remove") updates.push({ kind: "remove" });
+        else updates.push({ kind: "upsert", archivingAt: event.payload.workspace.archivingAt });
+      });
+      try {
+        const { subscription } = await observer.fetchWorkspaces({ subscribe: {} });
+        try {
+          pendingArchive = initiator.archiveWorkspace(workspace.id);
+          void pendingArchive.catch(() => undefined);
+          await started.promise;
+          await vi.waitFor(() =>
+            expect(updates).toContainEqual({ kind: "upsert", archivingAt: expect.any(String) }),
+          );
+          release.resolve();
+          await expect(pendingArchive).resolves.toMatchObject({
+            workspaceId: workspace.id,
+            archivedAt: expect.any(String),
+            error: null,
+          });
+          await vi.waitFor(() => expect(updates.at(-1)).toEqual({ kind: "remove" }));
+        } finally {
+          await subscription.release();
+        }
+      } finally {
+        unsubscribe();
+      }
+    } finally {
+      release.resolve();
+      await pendingArchive?.catch(() => undefined);
+      blockedArchive.mockRestore();
+      await Promise.all([initiator.close(), observer.close()]);
+      await handle.close();
     }
   });
 
@@ -831,7 +908,11 @@ describe("paseo daemon bootstrap", () => {
             sourceAgentId: agent.id,
             messageId: text,
           }),
-        ).resolves.toEqual({ deliveryStatus: "queued" });
+        ).resolves.toEqual({
+          deliveryStatus: "queued",
+          activeTurnBehavior: "queue",
+          guidance: expect.any(String),
+        });
       }
 
       const receipts = path.join(handle.paseoHome, "agent-requests");
@@ -864,13 +945,9 @@ describe("paseo daemon bootstrap", () => {
     }
   });
 
-  test("ordinary shutdown can deliver to a healthy steerable turn beyond the drain budget", async () => {
+  test("ordinary shutdown retains queued work when a steerable turn outlives the drain budget", async () => {
     const running = Promise.withResolvers<void>();
-    const providerAccepted = Promise.withResolvers<void>();
-    const steered = vi.fn(async () => {
-      providerAccepted.resolve();
-      return { status: "accepted" as const };
-    });
+    const steered = vi.fn(async () => ({ status: "accepted" as const }));
     const handle = await createTestPaseoDaemon({
       agentClients: createTestAgentClients({
         steerActiveTurn: steered,
@@ -899,19 +976,24 @@ describe("paseo daemon bootstrap", () => {
           sourceAgentId: agent.id,
           messageId: "queued-at-timeout",
         }),
-      ).resolves.toEqual({ deliveryStatus: "queued" });
+      ).resolves.toEqual({
+        deliveryStatus: "queued",
+        activeTurnBehavior: "queue",
+        guidance: expect.any(String),
+      });
       stopped = handle.daemon.stop();
       void stopped.catch(() => undefined);
-      await providerAccepted.promise;
+      await vi.advanceTimersByTimeAsync(5_000);
       await stopped;
       await vi.advanceTimersByTimeAsync(5_100);
       const receipts = path.join(handle.paseoHome, "agent-requests");
       const [file] = await readdir(receipts);
       const disk = JSON.parse(await readFile(path.join(receipts, file!), "utf8"));
-      expect({
-        steers: steered.mock.calls.length,
-        receipt: disk.state,
-      }).toEqual({ steers: 1, receipt: "completed" });
+      expect(steered).not.toHaveBeenCalled();
+      expect(disk).toMatchObject({
+        state: "pending",
+        queued: { message: { messageId: "queued-at-timeout", activeTurnBehavior: "queue" } },
+      });
     } finally {
       vi.useRealTimers();
       await stopped?.catch(() => undefined);
@@ -1010,7 +1092,11 @@ describe("paseo daemon bootstrap", () => {
             sourceAgentId: agent.id,
             messageId: prompt,
           }),
-        ).resolves.toEqual({ deliveryStatus: "queued" });
+        ).resolves.toEqual({
+          deliveryStatus: "queued",
+          activeTurnBehavior: "queue",
+          guidance: expect.any(String),
+        });
       }
       await preparing.promise;
       const pause = manager.pauseRunAdmission.bind(manager);
@@ -1449,7 +1535,11 @@ describe("paseo daemon bootstrap", () => {
             sourceAgentId: agent.id,
             messageId: text,
           }),
-        ).resolves.toEqual({ deliveryStatus: "queued" });
+        ).resolves.toEqual({
+          deliveryStatus: "queued",
+          activeTurnBehavior: "queue",
+          guidance: expect.any(String),
+        });
       }
       const stopped = first.daemon.stop();
       await vi.advanceTimersByTimeAsync(5_000);
@@ -1483,7 +1573,11 @@ describe("paseo daemon bootstrap", () => {
           sourceAgentId: agent.id,
           messageId: "third",
         }),
-      ).resolves.toEqual({ deliveryStatus: "queued" });
+      ).resolves.toEqual({
+        deliveryStatus: "queued",
+        activeTurnBehavior: "queue",
+        guidance: expect.any(String),
+      });
       await second.daemon.stop();
       expect(received).toEqual(["first", "second", "third"]);
       for (const record of await readReceipts()) {
@@ -1549,7 +1643,11 @@ describe("paseo daemon bootstrap", () => {
               sourceAgentId: agent.id,
               messageId: text,
             }),
-          ).resolves.toEqual({ deliveryStatus: "queued" });
+          ).resolves.toEqual({
+            deliveryStatus: "queued",
+            activeTurnBehavior: "queue",
+            guidance: expect.any(String),
+          });
         }
         if (entry === "signal") {
           await first.stop();
@@ -1730,12 +1828,25 @@ describe("paseo daemon bootstrap", () => {
         }),
       );
       const manager = first.daemon.agentManager;
+      const owner = new DaemonClient({ url: `ws://127.0.0.1:${first.port}/ws` });
+      const workspaceId = await (async () => {
+        try {
+          await owner.connect();
+          const { workspace, error } = await owner.createWorkspace({
+            source: { kind: "directory", path: root },
+          });
+          if (!workspace) throw new Error(error ?? "Expected a workspace for child agents");
+          return workspace.id;
+        } finally {
+          await owner.close();
+        }
+      })();
       const parent = await manager.createAgent({ provider: "codex", cwd: root }, undefined, {
-        workspaceId: undefined,
+        workspaceId,
       });
       const createChild = (labels?: Record<string, string>) =>
         manager.createAgent({ provider: "codex", cwd: root }, undefined, {
-          workspaceId: undefined,
+          workspaceId,
           labels: { ...labels, "paseo.parent-agent-id": parent.id },
         });
       const child = await createChild();
@@ -1908,7 +2019,11 @@ describe("paseo daemon bootstrap", () => {
           sourceAgentId: agent.id,
           messageId: "after-failed-stop",
         }),
-      ).resolves.toEqual({ deliveryStatus: "queued" });
+      ).resolves.toEqual({
+        deliveryStatus: "queued",
+        activeTurnBehavior: "queue",
+        guidance: expect.any(String),
+      });
       const receipts = path.join(handle.paseoHome, "agent-requests");
       const [file] = await readdir(receipts);
       const receiptPath = path.join(receipts, file!);
@@ -2811,7 +2926,10 @@ export default function contribute(plugin: unknown) {
         ? {}
         : { "startup-rollback": { source: "directory", path: pluginDirectory } },
     };
-    const daemon = await createPaseoDaemon(config, pino({ level: "silent" }));
+    const daemon = await createPaseoDaemon(config, pino({ level: "silent" }), {
+      builtinPlugins: new BuiltinPluginLoader(undefined, []),
+      lazyTerminalWorker: true,
+    });
 
     try {
       await expect(daemon.start()).rejects.toThrow();
@@ -2903,7 +3021,10 @@ export default function contribute(plugin: unknown) {
     };
 
     try {
-      const daemon = await createPaseoDaemon(config, pino({ level: "silent" }));
+      const daemon = await createPaseoDaemon(config, pino({ level: "silent" }), {
+        builtinPlugins: new BuiltinPluginLoader(undefined, []),
+        lazyTerminalWorker: true,
+      });
       try {
         await daemon.start();
         expect(daemon.getListenTarget()).toBeDefined();
@@ -3034,7 +3155,10 @@ export default function contribute(plugin: unknown) {
         speech: undefined,
       };
 
-      const daemon = await createPaseoDaemon(config, logger);
+      const daemon = await createPaseoDaemon(config, logger, {
+        builtinPlugins: new BuiltinPluginLoader(undefined, []),
+        lazyTerminalWorker: true,
+      });
 
       try {
         await daemon.start();
@@ -3386,3 +3510,188 @@ test.each(["reject", "stall"] as const)(
   },
   30_000,
 );
+
+test("shutdown finishes promptly when a persisted ACP plugin reopen is still streaming history replay", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "paseo-shutdown-acp-replay-"));
+  const pluginDirectory = path.join(root, "plugin");
+  const agentScriptPath = path.join(root, "streaming-acp-agent.mjs");
+  const replayStartedPath = path.join(root, "replay-started.pid");
+  const workspace = path.join(root, "workspace");
+  await mkdir(pluginDirectory, { recursive: true });
+  await mkdir(workspace, { recursive: true });
+  const pluginId = "streaming-replay-plugin";
+  const providerId = "streaming-replay-acp";
+
+  await writeFile(
+    agentScriptPath,
+    `
+import { writeFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+const send = (msg) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...msg }) + "\\n");
+let stream;
+createInterface({ input: process.stdin }).on("line", (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ id: msg.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
+  } else if (msg.method === "session/new") {
+    send({ id: msg.id, result: { sessionId: "new-session", configOptions: [] } });
+  } else if (msg.method === "session/load") {
+    const sid = msg.params.sessionId;
+    send({ id: msg.id, result: { configOptions: [] } });
+    writeFileSync(${JSON.stringify(replayStartedPath)}, String(process.pid));
+    let count = 0;
+    stream = setInterval(() => {
+      count += 1;
+      send({
+        method: "session/update",
+        params: {
+          sessionId: sid,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            messageId: "chunk-" + count,
+            content: { type: "text", text: "replayed message " + count },
+          },
+        },
+      });
+    }, 20);
+  } else if (msg.method === "session/close") {
+    clearInterval(stream);
+    send({ id: msg.id, result: {} });
+  }
+});
+process.on("SIGTERM", () => {
+  clearInterval(stream);
+  process.exit(0);
+});
+`,
+  );
+  await writeFile(
+    path.join(pluginDirectory, "paseo-plugin.json"),
+    JSON.stringify({
+      id: pluginId,
+      requirements: { paseo: `>=${resolveDaemonVersion(import.meta.url)}` },
+    }),
+  );
+  await writeFile(
+    path.join(pluginDirectory, "index.server.ts"),
+    `import { runAcpProvider } from "@getpaseo/plugin/server/acp";
+import type { ProviderRegistration } from "@getpaseo/plugin/server/provider";
+
+const provider: ProviderRegistration = runAcpProvider({
+  id: ${JSON.stringify(providerId)},
+  label: "Streaming replay ACP",
+  command: [${JSON.stringify(process.execPath)}, ${JSON.stringify(agentScriptPath)}],
+  acpOptions: { loadReplayQuietPeriodMs: 100 },
+});
+
+export default function contribute(server: { registerProvider(p: ProviderRegistration): void }) {
+  server.registerProvider(provider);
+  return () => undefined;
+}
+`,
+  );
+
+  const paseoHomeRoot = path.join(root, "home");
+  const paseoHome = path.join(paseoHomeRoot, ".paseo");
+  const logger = pino({ level: "silent" });
+  const storage = new AgentStorage(path.join(paseoHome, "agents"), logger);
+  const agentId = randomUUID();
+  const persistence = { version: 1, data: { sessionId: "persisted-acp-session" } };
+  await storage.upsert({
+    id: agentId,
+    workspaceId: "workspace-1",
+    provider: providerId,
+    cwd: workspace,
+    createdAt: "2025-01-01T00:00:00.000Z",
+    updatedAt: "2025-01-02T00:00:00.000Z",
+    lastActivityAt: "2025-01-02T00:00:00.000Z",
+    lastStatus: "closed",
+    title: "Streaming replay agent",
+    labels: {},
+    metadata: {},
+    persistence: {
+      provider: providerId,
+      sessionId: `plugin:${JSON.stringify(persistence)}`,
+      metadata: { pluginProviderPersistence: persistence },
+    },
+    config: {},
+    requiresAttention: false,
+    attentionReason: null,
+    attentionTimestamp: null,
+    archivedAt: null,
+  });
+
+  const handle = await createTestPaseoDaemon({
+    paseoHomeRoot,
+    staticDir: path.join(root, "static"),
+    pluginsEnabled: true,
+    plugins: {
+      [pluginId]: { source: "directory", path: pluginDirectory, enabled: true },
+    },
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${handle.port}/ws` });
+  let stopped = false;
+  let childPid: number | null = null;
+  try {
+    await client.connect();
+    const timelineRequest = client
+      .fetchAgentTimeline(agentId, { direction: "tail", limit: 20 })
+      .catch(() => "rejected");
+
+    await expect
+      .poll(
+        async () => {
+          try {
+            const raw = (await readFile(replayStartedPath, "utf8")).trim();
+            const pid = Number(raw);
+            if (Number.isInteger(pid) && pid > 0) {
+              childPid = pid;
+              return pid;
+            }
+            return null;
+          } catch {
+            return null;
+          }
+        },
+        { timeout: 10_000 },
+      )
+      .not.toBeNull();
+
+    const outcome = await Promise.race([
+      handle.daemon.stop().then(() => {
+        stopped = true;
+        return "stopped";
+      }),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timed_out"), 12_000)),
+    ]);
+    expect(outcome).toBe("stopped");
+    await expect(timelineRequest).resolves.toBe("rejected");
+    // The ACP child process must be terminated when provider shutdown cancels replay.
+    await expect
+      .poll(
+        () => {
+          if (!childPid) return false;
+          try {
+            process.kill(childPid, 0);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        { timeout: 3_000 },
+      )
+      .toBe(false);
+  } finally {
+    await client.close().catch(() => undefined);
+    if (!stopped && childPid) {
+      try {
+        process.kill(childPid, "SIGKILL");
+      } catch {
+        // already exited
+      }
+    }
+    if (!stopped) await handle.daemon.stop().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+}, 30_000);

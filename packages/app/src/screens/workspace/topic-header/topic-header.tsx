@@ -280,7 +280,7 @@ export const TopicHeaderBar = memo(function TopicHeaderBar({
     staleTimeMs: 30_000,
     retry: false,
     queryFn: async ({ signal }) => {
-      if (!client) throw new Error("Daemon client unavailable");
+      if (!client) throw new Error(t("workspace.terminal.hostDisconnected"));
       return fetchAllPendingDurableItemCount(client, workspaceId, signal);
     },
   });

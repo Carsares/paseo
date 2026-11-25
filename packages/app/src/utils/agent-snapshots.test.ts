@@ -4,6 +4,20 @@ import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
 import { isControlActive, readSelectOption } from "@/agent-controls/option-controls";
 import { normalizeAgentSnapshot, projectAgentSnapshot } from "./agent-snapshots";
 
+function snapshotOptionalFields(
+  input: Pick<
+    Partial<AgentSnapshotPayload>,
+    "pendingSubagentInbox" | "controls" | "options" | "sessionMetrics"
+  >,
+) {
+  return {
+    ...(input.pendingSubagentInbox ? { pendingSubagentInbox: input.pendingSubagentInbox } : {}),
+    ...(input.controls ? { controls: input.controls } : {}),
+    ...(input.options ? { options: input.options } : {}),
+    ...(input.sessionMetrics ? { sessionMetrics: input.sessionMetrics } : {}),
+  };
+}
+
 function createSnapshot(
   input: Partial<Omit<AgentSnapshotPayload, "labels">> & {
     labels?: Record<string, unknown>;
@@ -33,9 +47,7 @@ function createSnapshot(
     persistence: input.persistence ?? null,
     title: input.title ?? null,
     labels: (input.labels ?? {}) as AgentSnapshotPayload["labels"],
-    ...(input.pendingSubagentInbox ? { pendingSubagentInbox: input.pendingSubagentInbox } : {}),
-    ...(input.controls ? { controls: input.controls } : {}),
-    ...(input.options ? { options: input.options } : {}),
+    ...snapshotOptionalFields(input),
   };
 }
 
@@ -77,6 +89,15 @@ describe("normalizeAgentSnapshot", () => {
       status: "running",
       activeTurn: snapshot.activeTurn,
     });
+  });
+
+  it("round-trips session metrics through the canonical snapshot boundary", () => {
+    const sessionMetrics = [{ label: "Cost", value: "$0.42", tone: "warning" as const }];
+
+    const agent = normalizeAgentSnapshot(createSnapshot({ sessionMetrics }), "server-1");
+
+    expect(agent.sessionMetrics).toEqual(sessionMetrics);
+    expect(projectAgentSnapshot(agent).sessionMetrics).toEqual(sessionMetrics);
   });
 
   it("normalizes identified and legacy active turns at the snapshot boundary", () => {

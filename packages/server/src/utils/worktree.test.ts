@@ -6,6 +6,7 @@ import {
   readWorktreeHead,
   resolveFixedWorktreeStartPoint,
   isPaseoOwnedWorktreeCwd,
+  listPaseoWorktrees,
   mapWorkspaceCwdToWorktree,
   runWorktreeTeardownCommands,
   slugify,
@@ -205,6 +206,14 @@ describe("paseo worktree manager", () => {
       );
     }
   });
+
+  function cloneBareRepository(): string {
+    const bareRepo = join(tempDir, "bare.git");
+    execFileSync("git", ["clone", "--bare", "-q", repoDir, bareRepo]);
+    // A bare clone does not copy the checkout's local config; its linked worktrees share this one.
+    execFileSync("git", ["--git-dir", bareRepo, "config", "core.autocrlf", "false"]);
+    return bareRepo;
+  }
 
   it.each([
     { existing: [], preferred: "main/patch-1", expected: "main-1/patch-1" },
@@ -410,6 +419,44 @@ describe("paseo worktree manager", () => {
     await expect(isPaseoOwnedWorktreeCwd(projectHashDir, { paseoHome })).resolves.toMatchObject({
       allowed: false,
     });
+  });
+
+  it("creates and removes a worktree from a bare repository with no linked checkouts", async () => {
+    const bareRepo = cloneBareRepository();
+
+    const created = await createLegacyWorktreeForTest({
+      branchName: "from-bare",
+      cwd: bareRepo,
+      baseBranch: "main",
+      worktreeSlug: "from-bare",
+      paseoHome,
+    });
+    expect(readFileSync(join(created.worktreePath, "file.txt"), "utf8")).toBe("hello\n");
+
+    await deletePaseoWorktree({ cwd: bareRepo, worktreePath: created.worktreePath, paseoHome });
+    expect(existsSync(created.worktreePath)).toBe(false);
+    expect(
+      execFileSync("git", ["--git-dir", bareRepo, "worktree", "list", "--porcelain"], {
+        encoding: "utf8",
+      }),
+    ).not.toContain(created.worktreePath);
+  });
+
+  it("lists the worktrees of a bare repository that only Paseo checkouts use", async () => {
+    const bareRepo = cloneBareRepository();
+    const created = await createLegacyWorktreeForTest({
+      branchName: "listed",
+      cwd: bareRepo,
+      baseBranch: "main",
+      worktreeSlug: "listed",
+      paseoHome,
+    });
+
+    const worktrees = await listPaseoWorktrees({ cwd: bareRepo, paseoHome });
+
+    expect(worktrees.map((entry) => [entry.path, entry.branchName])).toEqual([
+      [realpathSync.native(created.worktreePath), "listed"],
+    ]);
   });
 
   it("deletes a worktree whose .git admin dir has already been removed", async () => {

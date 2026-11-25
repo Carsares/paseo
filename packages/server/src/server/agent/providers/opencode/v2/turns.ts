@@ -1,5 +1,10 @@
 import { structuredOutput } from "./structured-output.js";
-import type { OpenCodeEvent, SessionInfo, SessionMessageInfo } from "@opencode/client";
+import {
+  ClientError,
+  type OpenCodeEvent,
+  type SessionInfo,
+  type SessionMessageInfo,
+} from "@opencode/client";
 
 import { randomUUID } from "node:crypto";
 
@@ -14,8 +19,10 @@ import type {
 import { toDiagnosticErrorMessage } from "../../diagnostic-utils.js";
 
 import { renderPromptAttachmentAsText } from "../../../prompt-attachments.js";
+import { AgentRequestOutcomeUnknownError } from "../../../../message-receipts/index.js";
 
 import { usageFromV2 } from "./mapping.js";
+import { latestTurnMetrics } from "./metrics.js";
 
 import { commands } from "./commands.js";
 
@@ -39,6 +46,18 @@ function isExecutionEvent(event: { type: string }): event is ExecutionEvent {
   );
 }
 
+async function awaitPromptSubmission(submission: Promise<unknown>): Promise<void> {
+  try {
+    await submission;
+  } catch (error) {
+    if (error instanceof ClientError && error.reason === "Transport") {
+      // The POST may have reached OpenCode before the connection failed.
+      throw new AgentRequestOutcomeUnknownError({ cause: error });
+    }
+    throw error;
+  }
+}
+
 interface TurnSnapshot {
   info: SessionInfo;
   history: SessionMessageInfo[];
@@ -60,6 +79,7 @@ interface Turn {
   completion: Promise<void>;
   settle(): void;
   accepted: boolean;
+  startError?: Error;
   requestDenied: boolean;
 }
 
@@ -77,12 +97,16 @@ export class SessionTurns {
   get id() {
     return this.turn?.id;
   }
+  get acceptedId() {
+    return this.turn?.accepted ? this.turn.id : undefined;
+  }
   get hasStructuredOutput() {
     return Boolean(this.turn?.output);
   }
   fail(error: Error) {
     const turn = this.turn;
     if (!turn) return;
+    turn.startError = error;
     this.release(turn);
     this.options.emit({
       type: "turn_failed",
@@ -99,7 +123,9 @@ export class SessionTurns {
     turn.settle();
   }
   close() {
-    if (this.turn) this.release(this.turn);
+    if (!this.turn) return;
+    this.turn.startError = new Error("OpenCode session is closed");
+    this.release(this.turn);
   }
   private createTurn(submitted: Promise<void>, accepted: boolean, output?: Turn["output"]): Turn {
     let settle!: () => void;
@@ -118,70 +144,43 @@ export class SessionTurns {
     this.turn = turn;
     this.execution = null;
     this.revision += 1;
-    this.options.emit({ type: "turn_started", provider: "opencode", turnId: turn.id });
+    if (accepted) this.emitStarted(turn);
     this.scheduleRecovery();
     return turn;
+  }
+  private emitStarted(turn: Turn) {
+    this.options.emit({ type: "turn_started", provider: "opencode", turnId: turn.id });
   }
   async startTurn(prompt: AgentPromptInput, options?: AgentRunOptions) {
     await this.stopping;
     if (this.options.signal.aborted) throw new Error("OpenCode session is closed");
     if (this.turn) throw new Error("OpenCode session already has an active turn");
     const input = this.promptInput(prompt);
-    let accept!: () => void;
+    let settleSubmission!: () => void;
     const submitted = new Promise<void>((resolve) => {
-      accept = resolve;
+      settleSubmission = resolve;
     });
     const output =
       options?.outputSchema === undefined ? undefined : structuredOutput(options.outputSchema);
     const turn = this.createTurn(submitted, false, output);
-    const dispatch = this.startSubmission(turn, input, accept, options);
-    if (dispatch) await dispatch;
-    return { turnId: turn.id };
-  }
-  private startSubmission(
-    turn: Turn,
-    input: ReturnType<SessionTurns["promptInput"]>,
-    accept: () => void,
-    options?: AgentRunOptions,
-  ): Promise<void> | undefined {
-    if (options?.waitForProviderPrompt) return this.submit(turn, input, accept, options);
-    const beforeDispatch = options?.beforeProviderDispatch;
-    if (!beforeDispatch) {
-      void this.submit(turn, input, accept, options);
-      return undefined;
-    }
-    // Ordinary sends wait for admission checks. Only bound sends wait for OpenCode's reply.
-    let markChecked!: () => void;
-    const checked = new Promise<void>((resolve) => {
-      markChecked = resolve;
-    });
-    const dispatch = this.submit(turn, input, accept, {
-      ...options,
-      async beforeProviderDispatch() {
-        await beforeDispatch();
-        markChecked();
-      },
-    });
-    return Promise.race([checked, dispatch]);
-  }
-  private async submit(
-    turn: Turn,
-    input: ReturnType<SessionTurns["promptInput"]>,
-    accept: () => void,
-    options?: AgentRunOptions,
-  ) {
+
     try {
-      await this.dispatch(input, options, turn.output);
-      if (this.turn !== turn) return;
+      await this.dispatch(turn, input, options);
+      if (turn.startError) {
+        // OpenCode accepted the request, but the local turn ended before we could publish its start.
+        throw new AgentRequestOutcomeUnknownError({ cause: turn.startError });
+      }
       turn.accepted = true;
       this.revision += 1;
+      this.emitStarted(turn);
       // Covers a fast execution whose terminal event preceded the admission response.
       this.requestReconciliation();
+      return { turnId: turn.id };
     } catch (error) {
       if (this.turn === turn) this.fail(new Error(toDiagnosticErrorMessage(error)));
-      if (options?.waitForProviderPrompt || options?.beforeProviderDispatch) throw error;
+      throw error;
     } finally {
-      accept();
+      settleSubmission();
     }
   }
   observe(event: OpenCodeEvent) {
@@ -271,9 +270,9 @@ export class SessionTurns {
     }
   }
   private async dispatch(
+    turn: Turn,
     input: ReturnType<SessionTurns["promptInput"]>,
     options: AgentRunOptions = {},
-    output?: ReturnType<typeof structuredOutput>,
   ) {
     const command = input.text.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
     const commandName = command?.[1];
@@ -284,35 +283,53 @@ export class SessionTurns {
             (item) => item.name === commandName,
           )
         : undefined;
+    this.assertStartCurrent(turn);
     if (options.beforeProviderDispatch) await options.beforeProviderDispatch();
+    this.assertStartCurrent(turn);
     options.assertProviderDispatchAllowed?.();
+    const request = { signal: this.options.signal };
     if (compact) {
-      await this.options.client().session.compact({ sessionID: this.options.id });
+      await awaitPromptSubmission(
+        this.options.client().session.compact({ sessionID: this.options.id }, request),
+      );
       return;
     }
     if (selected && selected.kind !== "skill") {
-      await this.options.client().session.command({
-        sessionID: this.options.id,
-        name: selected.name,
-        text: command?.[2] ?? "",
-        files: input.files,
-      });
+      await awaitPromptSubmission(
+        this.options.client().session.command(
+          {
+            sessionID: this.options.id,
+            name: selected.name,
+            text: command?.[2] ?? "",
+            files: input.files,
+          },
+          request,
+        ),
+      );
       return;
     }
-    await this.options.client().session.prompt({
-      sessionID: this.options.id,
-      ...input,
-      ...(selected?.kind === "skill"
-        ? {
-            skills: [{ id: selected.name }],
-            text: command?.[2] ?? `Use the ${selected.name} skill.`,
-          }
-        : {}),
-      metadata: {
-        ...(options.clientMessageId ? { paseoClientMessageId: options.clientMessageId } : {}),
-        ...(output ? { paseoOutputSchema: output.schema } : {}),
-      },
-    });
+    await awaitPromptSubmission(
+      this.options.client().session.prompt(
+        {
+          sessionID: this.options.id,
+          ...input,
+          ...(selected?.kind === "skill"
+            ? {
+                skills: [{ id: selected.name }],
+                text: command?.[2] ?? `Use the ${selected.name} skill.`,
+              }
+            : {}),
+          metadata: {
+            ...(options.clientMessageId ? { paseoClientMessageId: options.clientMessageId } : {}),
+            ...(turn.output ? { paseoOutputSchema: turn.output.schema } : {}),
+          },
+        },
+        request,
+      ),
+    );
+  }
+  private assertStartCurrent(turn: Turn) {
+    if (turn.startError) throw turn.startError;
   }
   private finish(turn: Turn, { info, history }: TurnSnapshot, execution: ExecutionEvent) {
     if (execution.type === "session.execution.succeeded") turn.output?.assert(history);
@@ -337,6 +354,7 @@ export class SessionTurns {
         provider: "opencode",
         turnId: turn.id,
         usage: usageFromV2(info),
+        metrics: latestTurnMetrics(history),
       });
   }
   private async readExecution(): Promise<ExecutionEvent | null> {
@@ -375,14 +393,16 @@ export class SessionTurns {
         return { status: "unavailable" };
     }
     options.assertProviderDispatchAllowed?.();
-    await this.options.client().session.prompt({
-      sessionID: this.options.id,
-      ...this.promptInput(prompt),
-      delivery: "steer",
-      metadata: options.clientMessageId
-        ? { paseoClientMessageId: options.clientMessageId }
-        : undefined,
-    });
+    await awaitPromptSubmission(
+      this.options.client().session.prompt({
+        sessionID: this.options.id,
+        ...this.promptInput(prompt),
+        delivery: "steer",
+        metadata: options.clientMessageId
+          ? { paseoClientMessageId: options.clientMessageId }
+          : undefined,
+      }),
+    );
     if (options.clearPendingPermissions) await this.options.clearPermissions();
     return { status: "accepted" };
   }

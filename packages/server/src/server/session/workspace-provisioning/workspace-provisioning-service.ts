@@ -241,15 +241,6 @@ export function createWorkspaceProvisioningService(deps: {
     return project;
   }
 
-  async function findUntrustedSource(checkoutRoot: string) {
-    const matchesCheckout = createRealpathAwarePathMatcher(checkoutRoot);
-    return (await workspaceRegistry.listAll()).find(
-      (candidate) =>
-        Boolean(candidate.untrustedSource) &&
-        matchesCheckout(candidate.worktreeRoot ?? candidate.cwd),
-    )?.untrustedSource;
-  }
-
   async function resolveCreationMetadata(input?: {
     workspaceId?: string;
     background?: boolean;
@@ -291,9 +282,14 @@ export function createWorkspaceProvisioningService(deps: {
         await findOrCreateProjectForDirectory(normalizedCwd);
     const checkoutRoot = checkout.worktreeRoot ?? normalizedCwd;
     const isOwnedWorktree = checkout.isGit && checkout.isPaseoOwnedWorktree;
+    const beforeSave = context?.beforeSave;
     const create = async () => {
       const baseMetadata = isOwnedWorktree ? await readPaseoWorktreeMetadata(checkoutRoot) : null;
-      const untrustedSource = context?.untrustedSource ?? (await findUntrustedSource(checkoutRoot));
+      const { untrustedSource: inheritedUntrustedSource } = await resolveCheckoutUntrustedSource(
+        checkoutRoot,
+        baseMetadata?.untrustedSource,
+      );
+      const untrustedSource = context?.untrustedSource ?? inheritedUntrustedSource;
       const timestamp = new Date().toISOString();
       const workspace = createPersistedWorkspaceRecord({
         workspaceId: context?.workspaceId ?? generateWorkspaceId(),
@@ -310,7 +306,7 @@ export function createWorkspaceProvisioningService(deps: {
         updatedAt: timestamp,
         ...(await resolveCreationMetadata(context)),
       });
-      if (context?.beforeSave) await context.beforeSave();
+      await beforeSave?.();
       await workspaceRegistry.upsert(workspace, {
         expectsInitialAgent: context?.expectsInitialAgent,
       });
@@ -447,6 +443,49 @@ export function createWorkspaceProvisioningService(deps: {
     ).workspaceId;
   }
 
+  async function resolveCheckoutUntrustedSource(
+    checkoutRoot: string,
+    knownMetadataUntrustedSource?: UntrustedWorkspaceSource,
+  ): Promise<{ hasEvidence: boolean; untrustedSource: UntrustedWorkspaceSource | undefined }> {
+    const metadataUntrustedSource =
+      knownMetadataUntrustedSource ??
+      (await readPaseoWorktreeMetadata(checkoutRoot).catch(() => null))?.untrustedSource;
+    if (metadataUntrustedSource) {
+      return { hasEvidence: true, untrustedSource: metadataUntrustedSource };
+    }
+    const matchesCheckout = createRealpathAwarePathMatcher(checkoutRoot);
+    const active = (await workspaceRegistry.listActive()).filter((candidate) =>
+      matchesCheckout(candidate.worktreeRoot ?? candidate.cwd),
+    );
+    if (active.length === 0) {
+      return { hasEvidence: false, untrustedSource: undefined };
+    }
+    return {
+      hasEvidence: true,
+      untrustedSource: active.find((candidate) => Boolean(candidate.untrustedSource))
+        ?.untrustedSource,
+    };
+  }
+
+  async function syncUnarchivedCheckoutUntrustedSource(
+    workspace: PersistedWorkspaceRecord,
+  ): Promise<PersistedWorkspaceRecord> {
+    const resolved = await resolveCheckoutUntrustedSource(workspace.worktreeRoot ?? workspace.cwd);
+    if (!resolved.hasEvidence) {
+      return workspace;
+    }
+    if (resolved.untrustedSource) {
+      return workspace.untrustedSource
+        ? workspace
+        : { ...workspace, untrustedSource: resolved.untrustedSource };
+    }
+    if (!workspace.untrustedSource) {
+      return workspace;
+    }
+    const { untrustedSource: _stale, ...approved } = workspace;
+    return approved;
+  }
+
   async function resolveRestoredAutoArchiveChangeRequestUrl(
     workspace: PersistedWorkspaceRecord,
   ): Promise<string | null> {
@@ -484,7 +523,7 @@ export function createWorkspaceProvisioningService(deps: {
         updatedAt: timestamp,
       });
       next = {
-        ...(placementUpdate?.workspace ?? workspace),
+        ...(await syncUnarchivedCheckoutUntrustedSource(placementUpdate?.workspace ?? workspace)),
         archivedAt: null,
         autoArchivedChangeRequestUrl,
         updatedAt: timestamp,

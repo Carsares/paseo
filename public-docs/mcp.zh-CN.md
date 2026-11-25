@@ -91,6 +91,8 @@ MCP 不提供解除 Agent 父子关系的工具。解除关系是用户在应用
 | `get_agent_activity` | 以整理后的摘要返回 Agent 最近的时间线条目。                                                                                                                                                                    |
 | `set_agent_mode`     | 切换 Agent 的会话模式。                                                                                                                                                                                        |
 
+Agent 可将 `activeTurnBehavior` 设为 `queue`（默认）、`steer` 或 `interrupt`。排队回执确认守护进程已接收消息，并说明派发时机。主控可用 `taskBinding` 将本机直属子 Agent 绑定到任务，此时工具会等待派发确认。人类操作的客户端默认用 `interrupt`，也可用 `steer`。
+
 Paseo Agent 默认会收到完成、错误和权限通知；设置 `notifyOnFinish: false` 可以关闭它们。外部 MCP 客户端使用 `get_agent_status` 和 `get_agent_activity` 查看结果。
 
 ### 工作区 {#workspaces}

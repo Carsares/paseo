@@ -1,9 +1,15 @@
-import type { FormInfo, ModelInfo, SessionMessageInfo } from "@opencode/client";
+import {
+  ClientError,
+  type FormInfo,
+  type ModelInfo,
+  type SessionMessageInfo,
+} from "@opencode/client";
 import { describe, expect, test } from "vitest";
 
 import { createTestLogger } from "../../../../../test-utils/test-logger.js";
 import { ProviderSnapshotManager } from "../../../provider-snapshot-manager.js";
-import type { AgentStreamEvent } from "../../../agent-sdk-types.js";
+import type { AgentRunOptions, AgentStreamEvent } from "../../../agent-sdk-types.js";
+import { AgentRequestOutcomeUnknownError } from "../../../../message-receipts/index.js";
 import { OpenCodeV2AgentClient } from "./agent.js";
 import { V2Harness } from "../test-utils/v2-harness.js";
 import type { V2Api } from "./api.js";
@@ -243,7 +249,11 @@ describe("OpenCode v2 session lifecycle", () => {
     }
   });
 
-  test("rejects confirmed prompt dispatch when OpenCode refuses admission", async () => {
+  test.each<[string, AgentRunOptions | undefined]>([
+    ["ordinary", undefined],
+    ["confirmed", { waitForProviderPrompt: true }],
+    ["checked", { beforeProviderDispatch: async () => {} }],
+  ])("rejects %s prompt dispatch when OpenCode refuses admission", async (_mode, options) => {
     const harness = new V2Harness();
     harness.prompt = async () => {
       throw new Error("Prompt refused");
@@ -254,9 +264,7 @@ describe("OpenCode v2 session lifecycle", () => {
     });
     const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
     try {
-      await expect(session.startTurn("review", { waitForProviderPrompt: true })).rejects.toThrow(
-        "Prompt refused",
-      );
+      await expect(session.startTurn("review", options)).rejects.toThrow("Prompt refused");
     } finally {
       await session.close();
     }
@@ -294,7 +302,7 @@ describe("OpenCode v2 session lifecycle", () => {
 
   test("does not finish from a previous outcome before prompt admission", async () => {
     const harness = new V2Harness();
-    let accept!: () => void;
+    let accept: (() => void) | undefined;
     harness.prompt = () =>
       new Promise<void>((resolve) => {
         accept = resolve;
@@ -306,17 +314,123 @@ describe("OpenCode v2 session lifecycle", () => {
     const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
+    const startEvents = () => events.filter((event) => event.type === "turn_started");
+    let started = false;
+    const starting = session.startTurn("fast execution").then((result) => {
+      started = true;
+      return result;
+    });
     try {
-      await session.startTurn("fast execution");
+      await expect.poll(() => typeof accept).toBe("function");
       const reads = harness.activeReads;
       harness.push({ id: "reconnect", created: 3, type: "server.connected", data: {} });
       await expect.poll(() => harness.activeReads).toBeGreaterThan(reads);
+      expect(started).toBe(false);
+      expect(startEvents()).toEqual([]);
+      const lateEvents: AgentStreamEvent[] = [];
+      const unsubscribe = session.subscribe((event) => lateEvents.push(event));
+      unsubscribe();
+      expect(lateEvents.filter((event) => event.type === "turn_started")).toEqual([]);
       expect(terminalEvents(events)).toEqual([]);
       harness.startExecution();
       harness.finishExecution();
-      accept();
+      accept?.();
+      const { turnId } = await starting;
+      expect(startEvents()).toEqual([{ type: "turn_started", provider: "opencode", turnId }]);
       await expect.poll(() => terminalEvents(events)).toHaveLength(1);
       expect(terminalEvents(events)[0]).toMatchObject({ type: "turn_completed" });
+    } finally {
+      accept?.();
+      await starting.catch(() => undefined);
+      await session.close();
+    }
+  });
+
+  test("rejects startup if the OpenCode connection exits before acknowledging the prompt", async () => {
+    const harness = new V2Harness();
+    let accept!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      accept = resolve;
+    });
+    const prompt = harness.prompt;
+    harness.prompt = async (...args) => {
+      const receipt = await prompt(...args);
+      await gate;
+      return receipt;
+    };
+    let exit!: (error: Error) => void;
+    const exited = new Promise<Error>((resolve) => {
+      exit = resolve;
+    });
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: { ...harness.runtime, acquire: async () => ({ ...harness.connection, exited }) },
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const starting = session.startTurn("before exit");
+    try {
+      await expect.poll(() => harness.prompts).toEqual(["before exit"]);
+      exit(new Error("OpenCode helper exited"));
+      await expect
+        .poll(() => terminalEvents(events))
+        .toMatchObject([{ type: "turn_failed", error: "OpenCode helper exited" }]);
+      accept();
+      await expect(starting).rejects.toMatchObject({
+        message: "agent_request_outcome_unknown",
+        cause: expect.objectContaining({ message: "OpenCode helper exited" }),
+      });
+      expect(events.filter((event) => event.type === "turn_started")).toEqual([]);
+    } finally {
+      accept();
+      await starting.catch(() => undefined);
+      await session.close();
+    }
+  });
+
+  test("preserves an unknown start outcome when OpenCode receives a prompt but the reply is lost", async () => {
+    const harness = new V2Harness();
+    const receive = harness.prompt;
+    const lostReply = new ClientError("Transport", { cause: new Error("socket closed") });
+    harness.prompt = async (...args) => {
+      await receive(...args);
+      throw lostReply;
+    };
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+    try {
+      const start = session.startTurn("accepted before disconnect");
+      await expect(start).rejects.toBeInstanceOf(AgentRequestOutcomeUnknownError);
+      await expect(start).rejects.toHaveProperty("cause", lostReply);
+      expect(harness.prompts).toEqual(["accepted before disconnect"]);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("preserves an unknown steering outcome when OpenCode receives it but the reply is lost", async () => {
+    const harness = new V2Harness();
+    harness.autoComplete = false;
+    const client = new OpenCodeV2AgentClient({
+      logger: createTestLogger(),
+      runtime: harness.runtime,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+    try {
+      const { turnId } = await session.startTurn("start");
+      const receive = harness.prompt;
+      harness.prompt = async (...args) => {
+        await receive(...args);
+        throw new ClientError("Transport");
+      };
+      await expect(
+        session.steerActiveTurn("already received", { expectedTurnId: turnId }),
+      ).rejects.toBeInstanceOf(AgentRequestOutcomeUnknownError);
+      expect(harness.prompts).toEqual(["start", "already received"]);
     } finally {
       await session.close();
     }
@@ -1120,7 +1234,7 @@ describe("OpenCode v2 session lifecycle", () => {
     "waits for prompt acceptance before interrupting (withdrawn: %s)",
     async (withdrawn) => {
       const harness = new V2Harness();
-      let accept!: () => void;
+      let accept: (() => void) | undefined;
       const settle = () => harness.finishExecution("interrupted");
       let interruptions = 0;
       harness.prompt = () =>
@@ -1139,8 +1253,9 @@ describe("OpenCode v2 session lifecycle", () => {
         runtime: harness.runtime,
       });
       const session = await client.createSession({ provider: "opencode", cwd: "/tmp/project" });
+      const starting = session.startTurn("first");
       try {
-        await session.startTurn("first");
+        await expect.poll(() => typeof accept).toBe("function");
         let allowed = true;
         const stopping = session.interrupt(
           withdrawn
@@ -1157,14 +1272,16 @@ describe("OpenCode v2 session lifecycle", () => {
         await Promise.resolve();
         expect(interruptions).toBe(0);
         allowed = false;
-        accept();
-        await result;
+        accept?.();
+        await Promise.all([starting, result]);
         if (withdrawn) {
           expect(interruptions).toBe(0);
           await session.interrupt();
         }
         expect(interruptions).toBe(1);
       } finally {
+        accept?.();
+        await starting.catch(() => undefined);
         await session.close();
       }
     },

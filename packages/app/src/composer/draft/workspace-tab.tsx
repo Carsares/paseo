@@ -6,7 +6,7 @@ import {
   PARENT_REPORTING_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
-import { Keyboard, StyleSheet as RNStyleSheet, Text, View } from "react-native";
+import { Keyboard, StyleSheet as RNStyleSheet, View } from "react-native";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { StyleSheet } from "react-native-unistyles";
@@ -72,6 +72,7 @@ import { openWorkspaceChanges } from "@/workspace-tabs/open-supporting-view";
 import { useSettings, type OpenInSidePanePreferences } from "@/hooks/use-settings";
 import { draftCreationKey } from "@/composer/draft/creation-key";
 import { ParentAgentPill } from "@/subagents/parent";
+import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { useTopicFirstQuestion } from "./use-topic-first-question";
 
@@ -903,16 +904,6 @@ export function WorkspaceDraftComposer({
         isConnected={isConnected}
         isSubmitting={isSubmitting}
       />
-      {formErrorMessage ? (
-        <View
-          style={styles.formErrorRow}
-          dataSet={isComposerFullscreen ? undefined : CHAT_COLUMN_RAIL_DATASET}
-        >
-          <View style={styles.formError}>
-            <Text style={styles.errorText}>{formErrorMessage}</Text>
-          </View>
-        </View>
-      ) : null}
       {!isComposerFullscreen ? (
         <DraftComposerPills
           serverId={serverId}
@@ -946,6 +937,7 @@ export function WorkspaceDraftComposer({
         commandDraft={composerState.commandDraft}
         agentControls={composerAgentControls}
         isCompactLayout={isCompactComposerLayout}
+        error={formErrorMessage || null}
       />
     </View>
   );
@@ -995,9 +987,13 @@ function TopicQuestionRecovery({
   const handleAction = useCallback(() => void check(action), [action, check]);
   if (isSubmitting || (!state.hasSavedQuestion && !state.error)) return null;
   return (
-    <View style={styles.formErrorRow}>
-      <View style={styles.formError}>
-        <Text style={styles.errorText}>{state.error ?? status}</Text>
+    <View style={styles.recoveryRow} dataSet={CHAT_COLUMN_RAIL_DATASET}>
+      <View style={styles.recoveryContent}>
+        <Alert
+          variant={state.error ? "error" : "warning"}
+          size="sm"
+          description={state.error ?? status}
+        />
         {state.hasSavedQuestion ? (
           <Button
             variant="outline"
@@ -1022,10 +1018,16 @@ const animatedStaticStyles = RNStyleSheet.create({
 });
 
 const styles = StyleSheet.create((theme) => ({
-  formErrorRow: {
+  recoveryRow: {
     width: "100%",
     paddingHorizontal: theme.spacing[4],
     alignItems: "center",
+  },
+  recoveryContent: {
+    width: "100%",
+    maxWidth: theme.contentMaxWidth,
+    gap: theme.spacing[2],
+    marginBottom: theme.spacing[2],
   },
   pillRow: {
     width: "100%",
@@ -1045,19 +1047,5 @@ const styles = StyleSheet.create((theme) => ({
     maxWidth: theme.contentMaxWidth,
     flexDirection: "row",
     gap: theme.spacing[2],
-  },
-  formError: {
-    width: "100%",
-    maxWidth: theme.contentMaxWidth,
-    marginBottom: theme.spacing[2],
-    paddingHorizontal: theme.spacing[3],
-    paddingVertical: theme.spacing[2],
-    borderRadius: theme.borderRadius.md,
-    backgroundColor: theme.colors.surface2,
-    borderWidth: 1,
-    borderColor: theme.colors.destructive,
-  },
-  errorText: {
-    color: theme.colors.destructive,
   },
 }));

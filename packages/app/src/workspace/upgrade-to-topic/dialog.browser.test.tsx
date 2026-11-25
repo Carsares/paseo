@@ -13,6 +13,9 @@ import type { TopicUpgradeClient, WorkspaceTopic } from "./model";
 
 vi.mock("@/plugins", () => ({ usePluginWorkspaceMenu: () => ({ pages: [], rows: [] }) }));
 vi.mock("@/hooks/use-daemon-config", () => ({ useDaemonConfig: () => ({ config: null }) }));
+vi.mock("@/hooks/use-active-workspace-archive", () => ({
+  useActiveWorkspaceArchive: () => ({ canArchive: false, archive: () => false }),
+}));
 vi.mock("expo-router", async (importOriginal) => ({
   ...(await importOriginal<typeof import("expo-router")>()),
   useRouter: () => ({ push: vi.fn() }),

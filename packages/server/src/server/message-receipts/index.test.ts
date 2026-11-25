@@ -2,6 +2,10 @@ import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, test } from "vitest";
+import {
+  AgentMessageAdmissionError,
+  createAgentMessageDelivery,
+} from "../agent/agent-messages/delivery.js";
 import { fingerprintMessageRequest, MessageReceipts } from "./index.js";
 
 const directories: string[] = [];
@@ -203,7 +207,7 @@ test("restart sees ordered, privately stored unsent entries and skips uncertain 
   }
   const broken = path.join(directory, `${"a".repeat(64)}.json`);
   await writeFile(broken, "{");
-  const unreadable = [];
+  const unreadable: boolean[] = [];
   expect(await restarted.queuedMessages(() => unreadable.push(true))).toEqual(queued);
   expect(unreadable).toHaveLength(1);
   expect(await readFile(broken, "utf8")).toBe("{");
@@ -237,6 +241,8 @@ test("persistent queue records an unknown provider outcome without replayable co
     async enqueue(handoff) {
       await handoff.begin();
       await handoff.onProviderOutcome?.("unknown");
+      await handoff.holdAfterStop?.();
+      await handoff.declined();
       return { dispatched: Promise.resolve() };
     },
   });
@@ -303,4 +309,170 @@ test("a queued provider refusal keeps the original message available for retry",
   expect((await restarted.queuedMessages()).map((item) => item.queued.message.messageId)).toEqual([
     "refused-command",
   ]);
+});
+
+test("Stop preserves queued and declined in-flight messages across shutdown and restart", async () => {
+  const { requests, directory } = await fixture();
+  let stop!: (recipientId: string) => void;
+  const provider = Promise.withResolvers<never>();
+  const started = Promise.withResolvers<void>();
+  const delivered: (readonly string[])[] = [];
+  const createDelivery = (dispatch: Parameters<typeof createAgentMessageDelivery>[0]["dispatch"]) =>
+    createAgentMessageDelivery({
+      dispatch,
+      onError: () => {},
+      onStop(listener) {
+        stop = listener;
+        return () => {};
+      },
+      schedule: () => () => {},
+    });
+  const delivery = createDelivery(async (request) => {
+    expect(request.admit()).toBe(true);
+    await request.handoff?.begin();
+    started.resolve();
+    return provider.promise;
+  });
+  const retainOnError = (error: unknown) => error instanceof AgentMessageAdmissionError;
+
+  function send(messageId: string, activeTurnBehavior: "interrupt" | "queue") {
+    const admitted = Promise.withResolvers<void>();
+    const message = {
+      messageId,
+      prompt: messageId,
+      activeTurnBehavior,
+      source: { agentId: "sender" },
+      unarchive: false,
+    };
+    const dispatched = requests.sendQueued({
+      agentId: "recipient",
+      request: message,
+      message,
+      onQueued: admitted.resolve,
+      retainOnError,
+      enqueue: async (handoff) =>
+        delivery.enqueue({
+          ...message,
+          recipientId: "recipient",
+          source: { kind: "agent-message", ...message.source },
+          handoff,
+        }),
+    });
+    void dispatched.catch(() => undefined);
+    return { dispatched, admitted: admitted.promise };
+  }
+
+  const inFlight = send("in-flight", "interrupt");
+  await started.promise;
+  const queued = send("queued", "queue");
+  await queued.admitted;
+  stop("recipient");
+  const closing = delivery.close();
+  provider.reject(new Error("provider rejected the stopped prompt"));
+  await closing;
+  await expect(inFlight.dispatched).rejects.toBeInstanceOf(AgentMessageAdmissionError);
+  await expect(queued.dispatched).rejects.toBeInstanceOf(AgentMessageAdmissionError);
+
+  const restarted = new MessageReceipts(directory);
+  const persisted = await restarted.queuedMessages();
+  expect(
+    persisted.map(({ queued: { message } }) => [message.messageId, message.heldAfterStop]),
+  ).toEqual([
+    ["in-flight", true],
+    ["queued", true],
+  ]);
+  const restored = createDelivery(async (request) => {
+    delivered.push(request.messageIds);
+    return "turn_started";
+  });
+  const restartedDispatches = persisted.map((item) => {
+    const admitted = Promise.withResolvers<void>();
+    const dispatched = restarted.resumeQueued(item, {
+      onQueued: admitted.resolve,
+      retainOnError,
+      enqueue: async (handoff) => {
+        const { message } = item.queued;
+        return restored.enqueue({
+          ...message,
+          recipientId: item.agentId,
+          source: { kind: "agent-message", ...message.source },
+          handoff,
+        });
+      },
+    });
+    return { dispatched, admitted: admitted.promise };
+  });
+  await Promise.all(restartedDispatches.map(({ admitted }) => admitted));
+  expect(restored.hasPending("recipient")).toBe(false);
+  expect(delivered).toEqual([]);
+  const paused = restored.pauseAdmission();
+  await paused.drained;
+  paused.release();
+  expect(delivered).toEqual([]);
+  await restored.sendDirect({ recipientId: "recipient", prompt: "continue" }, async (joined) => {
+    expect(joined.admit?.()).toBe(true);
+    await joined.handoff?.begin();
+    return { disposition: "steered" };
+  });
+  await Promise.all(restartedDispatches.map(({ dispatched }) => dispatched));
+  expect(await restarted.queuedMessages()).toEqual([]);
+  await restored.close();
+});
+
+test("an accepted human turn releases a protected held receipt for normal replay", async () => {
+  const { requests, directory } = await fixture();
+  const delivery = createAgentMessageDelivery({
+    dispatch: async () => {
+      throw new Error("The human turn is still running");
+    },
+    isRunning: () => true,
+    schedule: () => () => {},
+    onError: () => {},
+  });
+  const admitted = Promise.withResolvers<void>();
+  const message = {
+    messageId: "protected",
+    prompt: "protected",
+    source: { agentId: "sender" },
+    activeTurnBehavior: "steer" as const,
+    immediateSteer: true,
+    heldAfterStop: true,
+    unarchive: false,
+  };
+  const dispatched = requests.sendQueued({
+    agentId: "recipient",
+    request: message,
+    message,
+    onQueued: admitted.resolve,
+    retainOnError: (error) => error instanceof AgentMessageAdmissionError,
+    enqueue: async (handoff) =>
+      delivery.enqueue({
+        ...message,
+        recipientId: "recipient",
+        source: { kind: "agent-message", ...message.source },
+        validateDispatch: async () => {},
+        handoff,
+      }),
+  });
+  void dispatched.catch(() => undefined);
+  await admitted.promise;
+  expect(delivery.hasPending("recipient")).toBe(false);
+
+  await delivery.sendDirect({ recipientId: "recipient", prompt: "continue" }, async () => ({
+    disposition: "turn_started",
+    started: Promise.resolve(),
+  }));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(delivery.hasPending("recipient")).toBe(true);
+  await delivery.close({ deferWith: new AgentMessageAdmissionError("Retained at shutdown") });
+  await expect(dispatched).rejects.toBeInstanceOf(AgentMessageAdmissionError);
+
+  const [pending] = await new MessageReceipts(directory).queuedMessages();
+  expect(pending?.queued.message).toEqual({
+    messageId: "protected",
+    prompt: "protected",
+    source: { agentId: "sender" },
+    activeTurnBehavior: "queue",
+    unarchive: false,
+  });
 });

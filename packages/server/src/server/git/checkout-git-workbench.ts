@@ -3,7 +3,11 @@ import type {
   SessionInboundMessage,
   SessionOutboundMessage,
 } from "../messages.js";
-import { pushCurrentBranch, type GitMutationRefreshReason } from "../../utils/checkout-git.js";
+import {
+  pushCurrentBranch,
+  type CheckoutContext,
+  type GitMutationRefreshReason,
+} from "../../utils/checkout-git.js";
 import { readControlledRebaseId } from "./controlled-rebase.js";
 import {
   assertGitWorktree,
@@ -53,6 +57,7 @@ type GitWorkbenchResponse = Extract<
 type GitWorkbenchMutation = Extract<GitWorkbenchRequest, { expectedHeadSha?: string | null }>;
 
 export interface GitWorkbenchHost {
+  checkoutContext?: Pick<CheckoutContext, "paseoHome" | "worktreesRoot">;
   listActiveAgents(repoRoot: string): Promise<CheckoutGitActiveAgent[]>;
   withDirectoryWrite<T>(cwd: string, write: () => Promise<T>): Promise<T>;
   refresh(repoRoot: string, cwd: string, reason: GitMutationRefreshReason): Promise<void>;
@@ -333,6 +338,7 @@ async function mutateGitWorkbench(
             const pushError = msg.pushAfter
               ? await pushReviewedCommit({
                   repo,
+                  context: host.checkoutContext,
                   newHeadSha,
                   branchRef: baseline.branchRef,
                   head,
@@ -405,13 +411,14 @@ async function mutateGitWorkbench(
 
 async function pushReviewedCommit(input: {
   repo: GitWorktree;
+  context?: CheckoutContext;
   newHeadSha: string | null;
   branchRef: string | null;
   head: string | null;
   tree: string;
   amend?: boolean;
 }): Promise<string | null> {
-  const { repo, newHeadSha, branchRef, head, tree, amend } = input;
+  const { repo, newHeadSha, branchRef, head, tree, amend, context } = input;
   if (!newHeadSha) return "Could not identify the local commit. Review it before pushing";
   if (!branchRef) return "Unable to determine current branch for push";
   try {
@@ -433,7 +440,7 @@ async function pushReviewedCommit(input: {
     }
     if (parents !== expectedParents)
       return "The local commit has a different base. Review before pushing";
-    await pushCurrentBranch(repo.root, undefined, { sha: newHeadSha, branchRef });
+    await pushCurrentBranch(repo.root, undefined, context, { sha: newHeadSha, branchRef });
     return null;
   } catch (error) {
     return serializeError(error).error;

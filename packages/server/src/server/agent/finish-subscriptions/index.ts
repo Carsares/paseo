@@ -346,7 +346,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           ...(client.getLastServerInfoMessage()?.features?.agentNotificationEvents === true
             ? { sourceAgentEvent: report.event }
             : {}),
-          activeTurnBehavior: "steer",
+          activeTurnBehavior: "queue",
           waitForDispatch: true,
         });
         if (receipt.deliveryStatus === "queued")
@@ -425,7 +425,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       prompt: report.prompt,
       source,
       subagentInbox,
-      activeTurnBehavior: "steer",
+      activeTurnBehavior: "queue",
       unarchive: false,
       // The observation's snapshot cannot authorize a notification that
       // waited behind another turn or the recipient's quiet window.
@@ -547,6 +547,20 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     return true;
   }
 
+  /** An unavailable recipient ends observation permanently. */
+  async function acknowledgeLocalNotifications(
+    acknowledgments: Promise<unknown>[],
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    try {
+      await abortable(Promise.all(acknowledgments), signal);
+      return false;
+    } catch (error) {
+      if (error instanceof ParentReportRecipientUnavailableError) return true;
+      throw error;
+    }
+  }
+
   async function deliver(
     record: FinishSubscription,
     result: FinishObservationResult,
@@ -560,6 +574,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     const acknowledgments: Promise<unknown>[] = [];
     for (const request of reason === "needs permission" ? requests : [undefined]) {
       if (signal.aborted) return false;
+      if (request && permissions.has(request.id)) continue;
       const title = resolveReportTitle(record.childAgentId, result.final?.title) ?? "";
       const childServerId = record.serverId ?? deps.serverId;
       const prompt = formatFinishNotificationBody({
@@ -597,13 +612,10 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
         }),
       );
     }
-    try {
-      await abortable(Promise.all(acknowledgments), signal);
-    } catch (error) {
-      if (error instanceof ParentReportRecipientUnavailableError) return true;
-      throw error;
-    }
-    return !signal.aborted && reason !== "needs permission";
+    return (
+      (await acknowledgeLocalNotifications(acknowledgments, signal)) ||
+      (!signal.aborted && reason !== "needs permission")
+    );
   }
   async function run(watch: Watch, group: Set<Watch>): Promise<void> {
     const signal = watch.controller.signal;

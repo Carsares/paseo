@@ -1,7 +1,11 @@
 import React, { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { PortalProvider } from "@gorhom/portal";
+import type { AgentMetric } from "@getpaseo/protocol/agent-types";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { page } from "vitest/browser";
 import { ComposerQuoteProvider } from "@/assistant-selection-copy/composer-quote";
+import { FloatingPanelPortalHost } from "@/components/ui/floating-panel-portal";
 import { i18n } from "@/i18n/i18next";
 import { KeyboardActionDispatcherProvider } from "@/keyboard/keyboard-action-dispatcher-context";
 import type { TurnTiming } from "@/timeline/turn-time";
@@ -53,6 +57,7 @@ function renderCompletedFooter(
   options: {
     item?: StreamItem;
     items?: StreamItem[];
+    turnMetrics?: AgentMetric[];
     startIndex?: number;
     addQuoteAttachment?: (quoteText: string, label?: string) => void;
     wrapInStreamRoot?: boolean;
@@ -67,6 +72,7 @@ function renderCompletedFooter(
       items={items}
       timing={timing}
       startIndex={options.startIndex ?? 0}
+      turnMetrics={options.turnMetrics}
       supportsTimelineCursor={false}
     />
   );
@@ -86,7 +92,14 @@ function renderCompletedFooter(
         {content}
       </div>
     );
-  act(() => root.render(wrapped));
+  act(() =>
+    root.render(
+      <PortalProvider>
+        {wrapped}
+        <FloatingPanelPortalHost />
+      </PortalProvider>,
+    ),
+  );
 }
 
 /** How many painted lines each footer label takes. */
@@ -270,10 +283,10 @@ it("captures selections spanning multiple assistant rows inside the stream root 
     timestamp: FRIDAY_NIGHT,
   };
   const addQuoteAttachment = vi.fn();
-  // Native strategy traverses forward (`+1`), so index 0 is the latest item (`second`).
+  // Native renders oldest first. Starting at the footer, it walks back through the turn.
   renderCompletedFooter(TIMING, {
-    items: [second, first],
-    startIndex: 0,
+    items: [first, second],
+    startIndex: 1,
     addQuoteAttachment,
     streamChildren: (
       <>
@@ -342,4 +355,41 @@ it("ignores selections when rendered outside a stream root or in a different cha
     window.getSelection()?.removeAllRanges();
     otherStream.remove();
   }
+});
+
+describe("turn stats", () => {
+  const metrics: AgentMetric[] = [
+    { label: "Model", value: "opus" },
+    { label: "Cost", value: "$0.42", tone: "warning" },
+  ];
+
+  it("has no trigger when the provider reported nothing for the turn", () => {
+    renderCompletedFooter(TIMING);
+
+    expect(page.getByRole("button", { name: "Turn stats" }).elements()).toHaveLength(0);
+  });
+
+  it("shows the turn's metrics while the pointer is on the trigger", async () => {
+    renderCompletedFooter(TIMING, { turnMetrics: metrics });
+
+    await page.getByRole("button", { name: "Turn stats" }).hover();
+
+    const card = page.getByRole("dialog", { name: "Turn stats" });
+    await expect.element(card).toBeVisible();
+    await expect.element(card.getByText("Model")).toBeVisible();
+    await expect.element(card.getByText("opus")).toBeVisible();
+    await expect.element(card.getByText("$0.42")).toBeVisible();
+  });
+
+  it("keeps the footer's height when the trigger appears beside Quote reply", () => {
+    const addQuoteAttachment = vi.fn();
+    renderCompletedFooter(TIMING, { addQuoteAttachment });
+    const without = host.getBoundingClientRect().height;
+
+    renderCompletedFooter(TIMING, { addQuoteAttachment, turnMetrics: metrics });
+
+    expect(host.getBoundingClientRect().height).toBe(without);
+    act(() => quoteButton()?.click());
+    expect(addQuoteAttachment).toHaveBeenCalledExactlyOnceWith("Done.", "Quote reply");
+  });
 });
