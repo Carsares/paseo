@@ -72,6 +72,7 @@ import { BrowserToolsOptInCard } from "./browser-tools-card";
 import { PaseoToolsCard } from "./paseo-tools-card";
 import { RestartRecoveryCard } from "./restart-recovery-card";
 import { IdleRuntimeCleanupCard } from "./idle-runtime-cleanup-card";
+import { HostProxySettingsEntry } from "./proxy-settings";
 import { restartDaemonFromSettings, updateDaemonFromSettings } from "./daemon-lifecycle";
 
 const ThemedRestart = withUnistyles(RotateCw);
@@ -266,6 +267,7 @@ export function HostConnectionsPage({ serverId }: { serverId: string }) {
     <View>
       <HostConnectionError serverId={serverId} />
       <ConnectionsSection host={host} />
+      <HostProxySettingsEntry initialHostId={serverId} />
     </View>
   );
 }

@@ -7,6 +7,7 @@ import {
   type PullRequestOpenLocation,
   type ServiceUrlBehavior,
 } from "@/hooks/use-settings";
+import { DeviceProxySettingsEntry } from "../proxy-settings";
 
 const SOURCES = [
   "explorerFiles",
@@ -100,24 +101,27 @@ export function OpenLocationSection() {
     [settings.openInSidePane, updateSettings],
   );
   return (
-    <SettingsSection title={t("settings.layout.openInSidePane.title")}>
-      <SettingsCard>
-        {SOURCES.map((source) => (
+    <>
+      <SettingsSection title={t("settings.layout.openInSidePane.title")}>
+        <SettingsCard>
+          {SOURCES.map((source) => (
+            <OpenLocationRow
+              key={source}
+              source={source}
+              destination={settings.openInSidePane[source] ? "side" : "main"}
+              onDestinationChange={handleDestinationChange}
+            />
+          ))}
           <OpenLocationRow
-            key={source}
-            source={source}
-            destination={settings.openInSidePane[source] ? "side" : "main"}
+            source="pullRequests"
+            destination={settings.pullRequestOpenLocation}
+            allowExplorer
             onDestinationChange={handleDestinationChange}
           />
-        ))}
-        <OpenLocationRow
-          source="pullRequests"
-          destination={settings.pullRequestOpenLocation}
-          allowExplorer
-          onDestinationChange={handleDestinationChange}
-        />
-        <ServiceUrlRow />
-      </SettingsCard>
-    </SettingsSection>
+          <ServiceUrlRow />
+        </SettingsCard>
+      </SettingsSection>
+      <DeviceProxySettingsEntry />
+    </>
   );
 }

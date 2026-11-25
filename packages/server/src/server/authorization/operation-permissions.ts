@@ -131,6 +131,9 @@ const INBOUND_PERMISSION = {
   create_paseo_worktree_request: "workspace.manage",
   create_terminal_request: "workspace.write",
   "daemon.config.reload.request": "daemon.manage",
+  "daemon.network.get_proxy.request": "daemon.read",
+  "daemon.network.test_proxy.request": "daemon.manage",
+  "daemon.network.set_proxy.request": "daemon.manage",
   "daemon.get_pairing_offer.request": "access.manage",
   "daemon.get_status.request": "daemon.read",
   "daemon.update.request": "daemon.manage",
@@ -443,6 +446,9 @@ const OUTBOUND_PERMISSION = {
   create_paseo_worktree_response: "workspace.manage",
   create_terminal_response: "workspace.write",
   "daemon.config.reload.response": "daemon.manage",
+  "daemon.network.get_proxy.response": "daemon.read",
+  "daemon.network.test_proxy.response": "daemon.manage",
+  "daemon.network.set_proxy.response": "daemon.manage",
   "daemon.get_pairing_offer.response": "access.manage",
   "daemon.get_status.response": "daemon.read",
   "daemon.update.progress": "daemon.manage",
@@ -637,6 +643,13 @@ export function requiredPermissionForInbound(operation: InboundOperation): Permi
 export function requiredPermissionForOutbound(
   message: SessionOutboundMessage,
 ): PermissionRequirement {
+  if (
+    (message.type === "daemon.network.get_proxy.response" ||
+      message.type === "daemon.network.test_proxy.response" ||
+      message.type === "daemon.network.set_proxy.response") &&
+    message.payload.result.status === "denied"
+  )
+    return null;
   // The legacy status envelope carries both agent RPC results and daemon configuration.
   if (
     message.type === "status" &&

@@ -63,6 +63,7 @@ import {
   readLegacySkillSelection,
 } from "../integrations/legacy-skill-selection.js";
 import { tailFile } from "../diagnostics/tail-file.js";
+import { isDeviceProxyCommand, type createDeviceProxyCommands } from "../main/proxy/ipc.js";
 
 const DAEMON_LOG_FILENAME = "daemon.log";
 const RECOVERY_MARKER_FILENAME = "restart-recovery-once.json";
@@ -940,17 +941,20 @@ export function createDaemonCommandHandlers(
 export function registerDaemonManager(
   onSettingsChanged?: (settings: DesktopSettings) => void,
   isQuitting?: () => boolean,
+  deviceProxyCommands?: ReturnType<typeof createDeviceProxyCommands>,
 ): void {
   const handlers = createDaemonCommandHandlers(onSettingsChanged, isQuitting);
 
-  ipcMain.handle(
-    "paseo:invoke",
-    async (_event, command: string, args?: Record<string, unknown>) => {
-      const handler = handlers[command];
-      if (!handler) {
-        throw new Error(`Unknown desktop command: ${command}`);
-      }
-      return await handler(args);
-    },
-  );
+  ipcMain.handle("paseo:invoke", async (event, command: string, args?: Record<string, unknown>) => {
+    if (isDeviceProxyCommand(command)) {
+      return deviceProxyCommands
+        ? deviceProxyCommands(event, command, args)
+        : { status: "unavailable" };
+    }
+    const handler = handlers[command];
+    if (!handler) {
+      throw new Error(`Unknown desktop command: ${command}`);
+    }
+    return await handler(args);
+  });
 }

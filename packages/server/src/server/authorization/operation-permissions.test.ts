@@ -81,6 +81,29 @@ test.each([
   expect(allowed.allowsOutbound(reply)).toBe(true);
 });
 
+test("host proxy settings use separate read and manage permissions", () => {
+  const reader = new SessionAuthorization(["daemon.read"]);
+  const manager = new SessionAuthorization(["daemon.manage"]);
+  const unprivileged = new SessionAuthorization(["workspace.read"]);
+  const request = {
+    get: { type: "daemon.network.get_proxy.request" },
+    test: { type: "daemon.network.test_proxy.request" },
+    set: { type: "daemon.network.set_proxy.request" },
+  } as const;
+  expect(reader.allowsInbound(request.get)).toBe(true);
+  expect(reader.allowsInbound(request.test)).toBe(false);
+  expect(reader.allowsInbound(request.set)).toBe(false);
+  expect(manager.allowsInbound(request.test)).toBe(true);
+  expect(manager.allowsInbound(request.set)).toBe(true);
+  expect(unprivileged.allowsInbound(request.get)).toBe(false);
+  expect(
+    unprivileged.allowsOutbound({
+      type: "daemon.network.get_proxy.response",
+      payload: { requestId: "settings", result: { status: "denied" } },
+    }),
+  ).toBe(true);
+});
+
 test.each([
   [
     "provider.installation.approved_update.request",

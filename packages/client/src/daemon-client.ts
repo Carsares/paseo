@@ -139,6 +139,8 @@ import type {
   DaemonGetStatusResponse,
   DaemonGetPairingOfferResponse,
   DaemonConfigReloadResponse,
+  DaemonNetworkSetProxyRequest,
+  DaemonNetworkTestProxyRequest,
   DiagnosticsResponse,
   AgentRewindResponseMessage,
   AgentRewindCheckpointGetResponse,
@@ -7355,6 +7357,80 @@ export class DaemonClient {
       requestId,
       message: { type: "daemon.config.reload.request" },
     });
+  }
+
+  /** Requires a host advertising `server_info.features.outboundProxy`. */
+  async getOutboundProxy({ requestId }: { requestId?: string } = {}) {
+    const { result } =
+      await this.sendNamespacedCorrelatedSessionRequest<"daemon.network.get_proxy.response">({
+        requestId,
+        message: { type: "daemon.network.get_proxy.request" },
+      });
+    return result;
+  }
+
+  canSendOutboundProxyCredentials(): boolean {
+    if (!this.isConnected) return false;
+    if (this.config.e2ee?.enabled === true) return this.relaySecurityFloorValue === "protected";
+    const url = URL.parse(this.config.url);
+    if (!url || isRelayClientWebSocketUrl(url.href)) return false;
+    if (url.protocol === "wss:" || url.protocol === "ws+unix:") return true;
+    return (
+      Boolean(this.config.transportFactory) &&
+      url.protocol === "paseo+desktop:" &&
+      (url.hostname === "socket" || url.hostname === "pipe")
+    );
+  }
+
+  async testOutboundProxy({
+    requestId,
+    settings,
+    credentials,
+    expectedRevision,
+  }: Omit<DaemonNetworkTestProxyRequest, "type" | "requestId"> & { requestId?: string }) {
+    if (Object.values(credentials ?? {}).some((entry) => entry?.action === "replace")) {
+      const transport = this.transport;
+      if (!transport || !this.canSendOutboundProxyCredentials()) {
+        return { status: "denied" } as const;
+      }
+      // A TLS reverse proxy can forward the handshake to the daemon over plain TCP.
+      // Ask the daemon about this connection before sending any new credential.
+      const loaded = await this.getOutboundProxy();
+      if (
+        this.transport !== transport ||
+        !this.canSendOutboundProxyCredentials() ||
+        loaded.status !== "loaded" ||
+        loaded.snapshot.access !== "edit" ||
+        loaded.snapshot.supportsCredentialReplacement !== true
+      ) {
+        return { status: "denied" } as const;
+      }
+    }
+    const { result } =
+      await this.sendNamespacedCorrelatedSessionRequest<"daemon.network.test_proxy.response">({
+        requestId,
+        message: {
+          type: "daemon.network.test_proxy.request",
+          settings,
+          credentials,
+          expectedRevision,
+        },
+        timeout: 30_000,
+      });
+    return result;
+  }
+
+  async setOutboundProxy({
+    requestId,
+    verificationId,
+    revision,
+  }: Omit<DaemonNetworkSetProxyRequest, "type" | "requestId"> & { requestId?: string }) {
+    const { result } =
+      await this.sendNamespacedCorrelatedSessionRequest<"daemon.network.set_proxy.response">({
+        requestId,
+        message: { type: "daemon.network.set_proxy.request", verificationId, revision },
+      });
+    return result;
   }
 
   async connectHub(

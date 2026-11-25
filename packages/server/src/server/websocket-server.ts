@@ -1,4 +1,8 @@
 import { rewindDirectoriesOverlap } from "./agent-rewind-scope.js";
+import { handleHostProxyRequest, isHostProxyRequest } from "./network/host-proxy-rpc.js";
+import { isProtectedProxyIngress } from "./network/host-proxy-ingress.js";
+import type { HostProxyRuntime } from "./network/proxy-runtime.js";
+import { readConfirmedLanPeers, type ConfirmedLanPeers } from "./network/host-proxy-trust.js";
 import {
   ChunkedTransport,
   ChunkedTransportProtocolError,
@@ -248,6 +252,7 @@ interface WebSocketServerConfig extends Pick<
   serverFeatureOverrides?: ServerFeatureOverrides;
   startPaused?: boolean;
   messageReceipts?: MessageReceipts;
+  hostProxy?: HostProxyRuntime;
 }
 
 function resolveServerFeatureOverrides(wsConfig: WebSocketServerConfig): ServerFeatureOverrides {
@@ -687,6 +692,45 @@ function requireWebSocketServices(params: {
  * WebSocket server that only accepts sockets + parses/forwards messages to the session layer.
  */
 export class VoiceAssistantWebSocketServer {
+  private readonly hostProxy?: HostProxyRuntime;
+  private readonly protectedProxySources = new WeakSet<WebSocketLike>();
+  private trustedProxyOrigins: readonly string[] = [];
+  private unsubscribeProxyTrust?: () => void;
+
+  getTrustedProxyOrigins(): readonly string[] {
+    return this.trustedProxyOrigins;
+  }
+
+  observeProxyTrust(): void {
+    let generation = 0;
+    let confirmed: ConfirmedLanPeers = new Map();
+    const refresh = async () => {
+      const current = ++generation;
+      this.trustedProxyOrigins = [];
+      try {
+        const directory = await this.connectedHosts.list();
+        const next = await readConfirmedLanPeers(this.paseoHome, directory, confirmed);
+        if (generation !== current) return;
+        confirmed = next;
+        this.trustedProxyOrigins = [...next.values()].map((peer) => peer.origin);
+      } catch {
+        // An unreadable registration grants no bypass.
+      }
+    };
+    const unsubscribe = this.connectedHosts.observe(() => void refresh());
+    this.unsubscribeProxyTrust = () => {
+      generation++;
+      unsubscribe();
+      this.trustedProxyOrigins = [];
+    };
+    void refresh();
+  }
+
+  private hostProxyFeatures(): { outboundProxy?: true } {
+    // COMPAT(outboundProxy): added in v0.18.0, remove gate after 2027-06-01.
+    return this.hostProxy?.available ? { outboundProxy: true } : {};
+  }
+
   private readonly logger: pino.Logger;
   private readonly wss: WebSocketServer;
   private readonly hostLinks = new Map<WebSocketLike, DaemonLinkEndpoint>();
@@ -1051,6 +1095,7 @@ export class VoiceAssistantWebSocketServer {
       { serverId, label: getHostName() },
       { onFinishReportConfirm: (request) => this.confirmParentReport(request) },
     );
+    this.hostProxy = wsConfig.hostProxy;
     this.passwordHash = auth?.password;
     this.daemonConfigStore = daemonConfigStore;
     this.mcpBaseUrl = mcpBaseUrl;
@@ -1216,6 +1261,9 @@ export class VoiceAssistantWebSocketServer {
     });
     wss.on("connection", (ws, request) => {
       const socket = Object.assign(ws, { maxFrameBytes: DIRECT_WEBSOCKET_FRAME_BYTES });
+      if (isProtectedProxyIngress(server.address(), request.socket)) {
+        this.protectedProxySources.add(socket);
+      }
       void this.attachAuthenticatedSocket(socket, request, password);
     });
     return wss;
@@ -1408,6 +1456,7 @@ export class VoiceAssistantWebSocketServer {
   ): Promise<void> {
     if (metadata?.transport === "relay") {
       this.incrementRuntimeCounter("relayExternalSocketAttached");
+      if (metadata.securityMode === "protected") this.protectedProxySources.add(ws);
     }
     await this.attachSocket(ws, undefined, metadata, false, admission, initialHello);
   }
@@ -1473,6 +1522,7 @@ export class VoiceAssistantWebSocketServer {
 
   public async close(options?: { waitForAgentMessages?: boolean }): Promise<void> {
     this.prepareForShutdown();
+    this.unsubscribeProxyTrust?.();
     if (options?.waitForAgentMessages !== false) await this.agentMessages.close();
     await this.connectedHosts.close();
     this.unsubscribeSpeechReadiness?.();
@@ -2421,6 +2471,7 @@ export class VoiceAssistantWebSocketServer {
       desktopManaged: this.daemonRuntimeConfig?.desktopManaged === true,
       ...(this.serverCapabilities ? { capabilities: this.serverCapabilities } : {}),
       features: {
+        ...this.hostProxyFeatures(),
         connectedHosts: true,
         hostMultiplexing: true,
         // COMPAT(relayProtectedSecurity): added in v0.13.0, remove gate after 2027-04-21.
@@ -2953,7 +3004,9 @@ export class VoiceAssistantWebSocketServer {
     const requestInfo = extractRequestInfoFromUnknownWsInbound(parsed);
     const requestType = getSessionRequestTypeFromUnknownWsInbound(parsed);
     const validationError =
-      requestType === "set_daemon_config_request" || requestType?.startsWith("provider.custom_cli.")
+      requestType === "set_daemon_config_request" ||
+      requestType?.startsWith("provider.custom_cli.") ||
+      requestType?.startsWith("daemon.network.")
         ? "Invalid configuration request"
         : parsedMessage.error.message;
     const isUnknownSchema =
@@ -3896,6 +3949,28 @@ export class VoiceAssistantWebSocketServer {
       await activeConnection.session.delivery.request(ws, request, () =>
         this.pushFinishReport(activeConnection.session, ws, request),
       );
+      return;
+    }
+    if (isHostProxyRequest(message.message)) {
+      const request = message.message;
+      const session = activeConnection.session;
+      await session.delivery.request(ws, request, async () => {
+        const canManage = () => session.allowsPermission("daemon.manage");
+        const authorized =
+          request.type === "daemon.network.get_proxy.request"
+            ? session.allowsPermission("daemon.read")
+            : canManage();
+        const reply = await handleHostProxyRequest({
+          request,
+          runtime: this.hostProxy,
+          source: ws,
+          signal: session.delivery.requestSignal,
+          authorized,
+          allowCredentialReplacement: this.protectedProxySources.has(ws) && !session.isRouted(),
+          canManage,
+        });
+        session.delivery.reply(reply);
+      });
       return;
     }
     this.recordInboundSessionRequestType(message.message.type);

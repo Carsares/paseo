@@ -10,6 +10,11 @@ interface ProxyEnvironment {
 
 let environment = readEnvironment(process.env, process.platform).environment;
 
+/** Internal snapshot for candidate transports. It can contain environment credentials. */
+export function snapshotEnvironmentProxy(): Readonly<ProxyEnvironment> {
+  return { ...environment };
+}
+
 function readEnvironment(
   env: NodeJS.ProcessEnv,
   platform: NodeJS.Platform,

@@ -124,6 +124,8 @@ import {
   type AgentDeepLinkTarget,
 } from "@getpaseo/protocol/agent-deep-link";
 import { AgentNavigationInbox, parseAgentDeepLinkFromArgv } from "./agent-navigation.js";
+import { createDeviceProxyCommands } from "./main/proxy/ipc.js";
+import { startMainWindowProxy } from "./main/proxy/main-window.js";
 
 const DEV_SERVER_URL = process.env.EXPO_DEV_URL ?? "http://localhost:8081";
 const APP_SCHEME = "paseo";
@@ -138,6 +140,8 @@ const DESKTOP_WINDOW_CHROME_MODE = resolveDesktopWindowChromeMode({
 const UPDATE_QUIT_DEADLINE_MS = 5_000;
 const pendingBrowserWindowOpenRequests = new PendingBrowserWindowOpenRequests();
 const agentNavigationInbox = new AgentNavigationInbox();
+const appWindowContents = new WeakSet<Electron.WebContents>();
+let releaseNativeControlFrame: ((frame: Electron.WebFrameMain) => void) | undefined;
 
 // A second-instance launch can arrive before the packaged protocol handler,
 // IPC handlers, and first window exist. Wait for full bootstrap, not just
@@ -739,12 +743,24 @@ async function createWindow(
   applyDesktopWindowChromeMode({ win: mainWindow, mode: DESKTOP_WINDOW_CHROME_MODE });
 
   const webContentsId = mainWindow.webContents.id;
+  const appContents = mainWindow.webContents;
+  let lastAppFrame = appContents.mainFrame;
+  appWindowContents.add(appContents);
   options.onCreated?.(webContentsId);
   mainWindow.webContents.on("did-start-navigation", (_event, _url, isSameDocument, isMainFrame) => {
     if (isMainFrame && !isSameDocument) {
+      releaseNativeControlFrame?.(lastAppFrame);
       agentNavigationInbox.windowLoading(webContentsId);
     }
   });
+  appContents.on("did-navigate", () => {
+    lastAppFrame = appContents.mainFrame;
+  });
+  function releaseControlRoutes() {
+    releaseNativeControlFrame?.(lastAppFrame);
+  }
+  appContents.on("render-process-gone", releaseControlRoutes);
+  appContents.once("destroyed", releaseControlRoutes);
   mainWindow.on("closed", () => {
     options.onClosed?.(webContentsId);
     agentNavigationInbox.removeWindow(webContentsId);
@@ -957,6 +973,18 @@ async function bootstrap(): Promise<void> {
 
   await app.whenReady();
 
+  const trustedAppUrl = new URL(app.isPackaged ? `${APP_SCHEME}://app/` : DEV_SERVER_URL);
+  const deviceProxy = await startMainWindowProxy(() => {
+    log.warn("[device-proxy] Settings unavailable. Keeping system proxy routing.");
+  }).catch(() => {
+    log.warn("[device-proxy] Could not initialize main-window proxy settings.");
+    return null;
+  });
+  releaseNativeControlFrame = deviceProxy?.releaseFrame;
+  app.once("will-quit", () => {
+    deviceProxy?.backend?.removeWindowLogin();
+  });
+
   const appDistDir = getAppDistDir();
   protocol.handle(APP_SCHEME, (request) => {
     const { pathname, search, hash } = new URL(request.url);
@@ -1005,6 +1033,20 @@ async function bootstrap(): Promise<void> {
       }
     },
     () => quitLifecycle.isQuitting(),
+    createDeviceProxyCommands({
+      trustedUrl: trustedAppUrl.href,
+      appWindows: appWindowContents,
+      scope: "mainWindow",
+      getBackend: () => deviceProxy?.backend ?? null,
+      prepareNative: async (frame, url) => {
+        if (!deviceProxy) throw new Error("Device control routing is unavailable.");
+        await deviceProxy.prepare(frame, url);
+      },
+      syncPaired: async (frame, origins) => {
+        if (!deviceProxy) throw new Error("Device control routing is unavailable.");
+        await deviceProxy.syncPaired(frame, origins);
+      },
+    }),
   );
   registerWindowManager({ mode: DESKTOP_WINDOW_CHROME_MODE });
   registerDialogHandlers();

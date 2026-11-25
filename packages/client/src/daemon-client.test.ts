@@ -2778,6 +2778,169 @@ test("sends and parses daemon config reload", async () => {
   });
 });
 
+test("correlates outbound proxy replies and sends only the verification receipt on save", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "wss://test",
+    clientId: "proxy-settings",
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: { outboundProxy: true } });
+  await connecting;
+  expect(client.getLastServerInfoMessage()?.features?.outboundProxy).toBe(true);
+
+  const snapshot = {
+    access: "edit",
+    revision: 2,
+    settings: { mode: "inherit" },
+    credentialSlots: [],
+    supportsBypass: true,
+    supportsCredentialReplacement: true,
+  };
+  const get = client.getOutboundProxy({ requestId: "read-proxy" });
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "daemon.network.get_proxy.request",
+    requestId: "read-proxy",
+  });
+  const loaded = { status: "loaded", snapshot };
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "daemon.network.get_proxy.response",
+      payload: { requestId: "read-proxy", result: loaded },
+    }),
+  );
+  await expect(get).resolves.toEqual(loaded);
+
+  const change = {
+    expectedRevision: 2,
+    settings: { mode: "manual", proxy: { kind: "unified", url: "http://proxy.test:3128" } },
+    credentials: { unified: { action: "replace", credential: { username: "u", password: "p" } } },
+  } as const;
+  const validation = client.testOutboundProxy({ requestId: "test-proxy", ...change });
+  const preflight = parseSentFrame(mock.sent[1]);
+  expect(preflight).toEqual({
+    type: "daemon.network.get_proxy.request",
+    requestId: expect.any(String),
+  });
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "daemon.network.get_proxy.response",
+      payload: { requestId: preflight.requestId, result: loaded },
+    }),
+  );
+  await vi.waitFor(() => expect(mock.sent).toHaveLength(3));
+  expect(parseSentFrame(mock.sent[2])).toEqual({
+    type: "daemon.network.test_proxy.request",
+    requestId: "test-proxy",
+    ...change,
+  });
+  const verificationId = "df44d848-43df-4c02-acb9-a49fd09fd9e8";
+  const tested = {
+    status: "passed",
+    receipt: { verificationId, revision: 2, expiresInMs: 60_000 },
+  };
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "daemon.network.test_proxy.response",
+      payload: { requestId: "test-proxy", result: tested },
+    }),
+  );
+  await expect(validation).resolves.toEqual(tested);
+
+  const set = client.setOutboundProxy({ requestId: "save-proxy", verificationId, revision: 2 });
+  expect(parseSentFrame(mock.sent[3])).toEqual({
+    type: "daemon.network.set_proxy.request",
+    requestId: "save-proxy",
+    verificationId,
+    revision: 2,
+  });
+  const saved = {
+    status: "saved",
+    snapshot: { ...snapshot, revision: 3, settings: change.settings, credentialSlots: ["unified"] },
+  };
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "daemon.network.set_proxy.response",
+      payload: { requestId: "save-proxy", result: saved },
+    }),
+  );
+  await expect(set).resolves.toEqual(saved);
+
+  const retry = client.setOutboundProxy({ requestId: "retry-proxy", verificationId, revision: 2 });
+  const unavailable = { status: "unavailable" };
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "daemon.network.set_proxy.response",
+      payload: { requestId: "retry-proxy", result: unavailable },
+    }),
+  );
+  await expect(retry).resolves.toEqual(unavailable);
+});
+
+test("does not send replacement proxy credentials over a plain WebSocket", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://host.test/ws",
+    clientId: "proxy-settings",
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: { outboundProxy: true } });
+  await connecting;
+  await expect(
+    client.testOutboundProxy({
+      settings: { mode: "manual", proxy: { kind: "unified", url: "http://proxy.test" } },
+      credentials: { unified: { action: "replace", credential: { username: "u", password: "p" } } },
+      expectedRevision: 0,
+    }),
+  ).resolves.toEqual({ status: "denied" });
+  expect(mock.sent).toHaveLength(0);
+});
+
+test("does not send replacement proxy credentials when the daemon behind TLS cannot accept them", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "wss://host.test/ws",
+    clientId: "proxy-settings",
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+  const connecting = client.connect();
+  mock.triggerOpen({ features: { outboundProxy: true } });
+  await connecting;
+  const result = client.testOutboundProxy({
+    settings: { mode: "manual", proxy: { kind: "unified", url: "http://proxy.test" } },
+    credentials: { unified: { action: "replace", credential: { username: "u", password: "p" } } },
+    expectedRevision: 1,
+  });
+  const preflight = parseSentFrame(mock.sent[0]);
+  expect(preflight.type).toBe("daemon.network.get_proxy.request");
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "daemon.network.get_proxy.response",
+      payload: {
+        requestId: preflight.requestId,
+        result: {
+          status: "loaded",
+          snapshot: {
+            access: "edit",
+            revision: 1,
+            settings: { mode: "inherit" },
+            credentialSlots: [],
+            supportsBypass: true,
+            supportsCredentialReplacement: false,
+          },
+        },
+      },
+    }),
+  );
+  await expect(result).resolves.toEqual({ status: "denied" });
+  expect(mock.sent).toHaveLength(1);
+});
+
 test("gets a structured plugin log snapshot", async () => {
   const mock = createMockTransport();
   const client = new DaemonClient({

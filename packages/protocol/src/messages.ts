@@ -1740,6 +1740,64 @@ export const DaemonConfigReloadRequestSchema = z.object({
   requestId: z.string(),
 });
 
+const OutboundProxyRevisionSchema = z.number().int().nonnegative();
+const OutboundProxySlotSchema = z.enum(["unified", "http", "https"]);
+const OutboundProxyOriginSchema = z.string().max(2048);
+const OutboundProxyEndpointsSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("unified"), url: OutboundProxyOriginSchema }),
+  z.object({
+    kind: z.literal("split"),
+    httpUrl: OutboundProxyOriginSchema,
+    httpsUrl: OutboundProxyOriginSchema,
+  }),
+]);
+
+const OutboundProxySettingsSchema = z.discriminatedUnion("mode", [
+  z.object({ mode: z.literal("inherit"), controlPlane: z.never().optional() }),
+  z.object({ mode: z.literal("direct"), controlPlane: z.never().optional() }),
+  z.object({
+    mode: z.literal("manual"),
+    proxy: OutboundProxyEndpointsSchema,
+    bypass: z.array(z.string().max(512)).max(128).optional(),
+    controlPlane: z.never().optional(),
+  }),
+]);
+
+const OutboundProxyCredentialChangeSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("keep") }),
+  z.object({ action: z.literal("clear") }),
+  z.object({
+    action: z.literal("replace"),
+    credential: z.object({ username: z.string().max(1024), password: z.string().max(1024) }),
+  }),
+]);
+
+export const DaemonNetworkGetProxyRequestSchema = z.object({
+  type: z.literal("daemon.network.get_proxy.request"),
+  requestId: z.string(),
+});
+
+export const DaemonNetworkTestProxyRequestSchema = z.object({
+  type: z.literal("daemon.network.test_proxy.request"),
+  requestId: z.string(),
+  expectedRevision: OutboundProxyRevisionSchema,
+  settings: OutboundProxySettingsSchema,
+  credentials: z
+    .object({
+      unified: OutboundProxyCredentialChangeSchema.optional(),
+      http: OutboundProxyCredentialChangeSchema.optional(),
+      https: OutboundProxyCredentialChangeSchema.optional(),
+    })
+    .optional(),
+});
+
+export const DaemonNetworkSetProxyRequestSchema = z.object({
+  type: z.literal("daemon.network.set_proxy.request"),
+  requestId: z.string(),
+  verificationId: z.uuid(),
+  revision: OutboundProxyRevisionSchema,
+});
+
 export const HubManagementDaemonConnectRequestSchema = z.object({
   type: z.literal("hub.management.daemon.connect.request"),
   requestId: z.string(),
@@ -4667,6 +4725,9 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   DaemonGetStatusRequestSchema,
   DaemonGetPairingOfferRequestSchema,
   DaemonConfigReloadRequestSchema,
+  DaemonNetworkGetProxyRequestSchema,
+  DaemonNetworkTestProxyRequestSchema,
+  DaemonNetworkSetProxyRequestSchema,
   HubManagementDaemonConnectRequestSchema,
   HubManagementDaemonGetStatusRequestSchema,
   HubManagementDaemonDisconnectRequestSchema,
@@ -5101,6 +5162,7 @@ export const ServerInfoStatusPayloadSchema = z
         agentHistoryQueryControls: z.boolean().optional(),
         providersSnapshot: z.boolean().optional(),
         connectedHosts: z.boolean().optional(),
+        outboundProxy: z.boolean().optional(),
         hostMultiplexing: z.boolean().optional(),
         // COMPAT(usageSetting): added in v0.14, remove after 2027-05-01.
         usageSetting: z.boolean().optional(),
@@ -6908,6 +6970,65 @@ export const DaemonConfigReloadResponseSchema = z.object({
       overrideControlledPaths: z.array(z.string()),
     })
     .passthrough(),
+});
+
+const OutboundProxySnapshotSchema = z.object({
+  access: z.enum(["edit", "read-only"]),
+  revision: OutboundProxyRevisionSchema,
+  settings: OutboundProxySettingsSchema,
+  credentialSlots: z.array(OutboundProxySlotSchema).max(3),
+  supportsBypass: z.boolean(),
+  supportsCredentialReplacement: z.boolean().optional(),
+});
+
+const outboundProxyFailureSchemas = [
+  z.object({ status: z.literal("failed") }),
+  z.object({ status: z.literal("denied") }),
+  z.object({ status: z.literal("unavailable") }),
+] as const;
+const OutboundProxyRevisionConflictSchema = z.object({ status: z.literal("revision-conflict") });
+
+export const DaemonNetworkGetProxyResponseSchema = z.object({
+  type: z.literal("daemon.network.get_proxy.response"),
+  payload: z.object({
+    requestId: z.string(),
+    result: z.discriminatedUnion("status", [
+      z.object({ status: z.literal("loaded"), snapshot: OutboundProxySnapshotSchema }),
+      ...outboundProxyFailureSchemas,
+    ]),
+  }),
+});
+
+export const DaemonNetworkTestProxyResponseSchema = z.object({
+  type: z.literal("daemon.network.test_proxy.response"),
+  payload: z.object({
+    requestId: z.string(),
+    result: z.discriminatedUnion("status", [
+      z.object({
+        status: z.literal("passed"),
+        receipt: z.object({
+          verificationId: z.uuid(),
+          revision: OutboundProxyRevisionSchema,
+          expiresInMs: z.number().int().positive(),
+        }),
+      }),
+      OutboundProxyRevisionConflictSchema,
+      ...outboundProxyFailureSchemas,
+    ]),
+  }),
+});
+
+export const DaemonNetworkSetProxyResponseSchema = z.object({
+  type: z.literal("daemon.network.set_proxy.response"),
+  payload: z.object({
+    requestId: z.string(),
+    result: z.discriminatedUnion("status", [
+      z.object({ status: z.literal("saved"), snapshot: OutboundProxySnapshotSchema }),
+      z.object({ status: z.literal("retest-required") }),
+      OutboundProxyRevisionConflictSchema,
+      ...outboundProxyFailureSchemas,
+    ]),
+  }),
 });
 
 export const DiagnosticsResponseSchema = z.object({
@@ -9486,6 +9607,9 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   DaemonGetStatusResponseSchema,
   DaemonGetPairingOfferResponseSchema,
   DaemonConfigReloadResponseSchema,
+  DaemonNetworkGetProxyResponseSchema,
+  DaemonNetworkTestProxyResponseSchema,
+  DaemonNetworkSetProxyResponseSchema,
   HubManagementDaemonConnectResponseSchema,
   HubManagementDaemonGetStatusResponseSchema,
   HubManagementDaemonDisconnectResponseSchema,
@@ -9841,6 +9965,8 @@ export type ListAvailableProvidersResponse = z.infer<typeof ListAvailableProvide
 export type DaemonGetStatusResponse = z.infer<typeof DaemonGetStatusResponseSchema>;
 export type DaemonGetPairingOfferResponse = z.infer<typeof DaemonGetPairingOfferResponseSchema>;
 export type DaemonConfigReloadResponse = z.infer<typeof DaemonConfigReloadResponseSchema>;
+export type DaemonNetworkTestProxyRequest = z.infer<typeof DaemonNetworkTestProxyRequestSchema>;
+export type DaemonNetworkSetProxyRequest = z.infer<typeof DaemonNetworkSetProxyRequestSchema>;
 export type DiagnosticsResponse = z.infer<typeof DiagnosticsResponseSchema>;
 export type GetProvidersSnapshotResponseMessage = z.infer<
   typeof GetProvidersSnapshotResponseMessageSchema

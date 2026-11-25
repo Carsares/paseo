@@ -1,6 +1,8 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { initializeEnvironmentProxy } from "./network/index.js";
+import { installHostProxyDispatcher } from "./network/host-proxy-dispatch.js";
+import { openStoredHostProxy } from "./network/host-proxy-store.js";
 import { createPaseoDaemon, formatListenTarget } from "./bootstrap.js";
 import { loadConfig } from "./config.js";
 import { resolvePaseoHome } from "./paseo-home.js";
@@ -141,6 +143,16 @@ async function main() {
       variable,
     });
   }
+  let trustedProxyOrigins: () => readonly string[] = () => [];
+  const readTrustedProxyOrigins = () => trustedProxyOrigins();
+  const hostProxy = await openStoredHostProxy(paseoHome, readTrustedProxyOrigins).catch(() => {
+    logger.error("Host proxy storage unavailable");
+    return undefined;
+  });
+  const restoreDispatcher = installHostProxyDispatcher(hostProxy?.runtime, readTrustedProxyOrigins);
+  const closeHostProxy = async () => {
+    await Promise.all([restoreDispatcher(), hostProxy?.close()]);
+  };
   let daemon: Awaited<ReturnType<typeof createPaseoDaemon>> | null = null;
   let shutdownPromise: Promise<number> | null = null;
   let exitHookInstalled = false;
@@ -195,7 +207,11 @@ async function main() {
             clearTimeout(forceExit);
             return 1;
           }
-          await daemon.stop({ keepTerminals, resumeAgents });
+          try {
+            await daemon.stop({ keepTerminals, resumeAgents });
+          } finally {
+            await closeHostProxy();
+          }
           clearTimeout(forceExit);
           logger.info("Server closed");
           return options?.successExitCode ?? 0;
@@ -373,20 +389,27 @@ async function main() {
         onLifecycleIntent: handleLifecycleIntent,
       },
       logger,
-      workbenchCompatibility
-        ? {
-            serverFeatureOverrides: {
-              topicWorkbenchV1: false,
-              checkoutGitStagingV1: false,
-              checkoutGitGraphV1: false,
-              checkoutGitRebaseV1: false,
-              checkoutGitMultiRepoV1: false,
-              checkoutGitP2V1: false,
-            },
-          }
-        : undefined,
+      {
+        hostProxy: hostProxy?.runtime,
+        updateTrustedProxyOrigins: (read) => {
+          trustedProxyOrigins = read;
+        },
+        ...(workbenchCompatibility
+          ? {
+              serverFeatureOverrides: {
+                topicWorkbenchV1: false,
+                checkoutGitStagingV1: false,
+                checkoutGitGraphV1: false,
+                checkoutGitRebaseV1: false,
+                checkoutGitMultiRepoV1: false,
+                checkoutGitP2V1: false,
+              },
+            }
+          : {}),
+      },
     );
   } catch (err) {
+    await closeHostProxy();
     logger.fatal({ err }, "Daemon bootstrap failed");
     throw err;
   }
@@ -404,6 +427,7 @@ async function main() {
       serverId: daemon.getServerId(),
     });
   } catch (err) {
+    await closeHostProxy();
     logger.fatal({ err }, "Daemon failed to start listening");
     throw err;
   }

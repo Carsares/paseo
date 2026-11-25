@@ -1,4 +1,6 @@
 import { WorkspaceDeferral } from "./workspace-deferral/deferral.js";
+import { onLegacyControlRoute } from "./network/host-proxy-dispatch.js";
+import type { HostProxyRuntime } from "./network/proxy-runtime.js";
 import { AgentLimitRecovery } from "./schedule/agent-limit-recovery.js";
 import { unarchiveWorkspaceAgents } from "./workspace-archive-service.js";
 import { createRestartRecovery } from "./agent/restart-recovery/index.js";
@@ -551,6 +553,8 @@ export interface PaseoDaemon {
 }
 
 export interface PaseoDaemonDependencies {
+  hostProxy?: HostProxyRuntime;
+  updateTrustedProxyOrigins?: (read: () => readonly string[]) => void;
   builtinPlugins?: BuiltinPluginLoader;
   lazyTerminalWorker?: boolean;
   hubRelationshipRemote?: HubRelationshipRemote;
@@ -921,6 +925,7 @@ export async function createPaseoDaemon(
       hostname: getHostName(),
       version: daemonVersion,
       ...(machineKind ? { machineKind } : {}),
+      ...(dependencies.hostProxy?.available ? { features: { outboundProxy: true } } : {}),
       listen: formatListenTarget(boundListenTarget ?? listenTarget),
     });
   });
@@ -1509,13 +1514,19 @@ export async function createPaseoDaemon(
       killTerminalsForWorkspace({ terminalManager, sessionLogger: logger }, workspaceId),
     logger,
   });
+  const hubRemote = dependencies.hubRelationshipRemote ?? new DirectHubRelationshipRemote();
   const hubRelationships = new HubRelationshipController({
     paseoHome: config.paseoHome,
     hostname: getHostName(),
     serverId,
     daemonPublicKey: daemonKeyPair.publicKeyB64,
     logger,
-    remote: dependencies.hubRelationshipRemote ?? new DirectHubRelationshipRemote(),
+    remote: {
+      enroll: (input) => onLegacyControlRoute(() => hubRemote.enroll(input)),
+      updatePermissions: (input) => onLegacyControlRoute(() => hubRemote.updatePermissions(input)),
+      revoke: (input) => onLegacyControlRoute(() => hubRemote.revoke(input)),
+      openSocket: (input, events) => hubRemote.openSocket(input, events),
+    },
     clock: dependencies.hubRelationshipClock,
     retryPolicy: dependencies.hubRelationshipRetryPolicy,
     createDaemonId: dependencies.createHubDaemonId,
@@ -2145,6 +2156,7 @@ export async function createPaseoDaemon(
                 serverFeatureOverrides: dependencies.serverFeatureOverrides,
                 startPaused: true,
                 messageReceipts,
+                hostProxy: dependencies.hostProxy,
               },
               workspaceAutoName,
               workspaceRuntimeStore,
@@ -2206,6 +2218,18 @@ export async function createPaseoDaemon(
               finishSubscriptions,
               workspaceArchiveOperations,
             );
+            const localProxyOrigins = mcpBaseUrl ? [new URL(mcpBaseUrl).origin] : [];
+            if (dependencies.updateTrustedProxyOrigins) wsServer.observeProxyTrust();
+            let previousPeerOrigins: readonly string[] | undefined;
+            let trustedProxyOrigins: readonly string[] = localProxyOrigins;
+            dependencies.updateTrustedProxyOrigins?.(() => {
+              const peerOrigins = wsServer?.getTrustedProxyOrigins();
+              if (previousPeerOrigins !== peerOrigins) {
+                previousPeerOrigins = peerOrigins;
+                trustedProxyOrigins = [...localProxyOrigins, ...(peerOrigins ?? [])];
+              }
+              return trustedProxyOrigins;
+            });
             pluginRuntime.bindPaseoSessionHost(wsServer);
             await pluginRuntime.start();
             providerSnapshotManager.settlePluginProviders();
