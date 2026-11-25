@@ -24,6 +24,23 @@ describe("Paseo tool display", () => {
       "Send message",
       "Fix the failing test",
     ],
+    [
+      "send_peer_message",
+      {
+        targetWorkspaceId: "wks_oncall",
+        intent: "align",
+        subject: "loom-chat protocol alignment",
+        message: "Please verify field names",
+      },
+      "Send peer message",
+      "loom-chat protocol alignment",
+    ],
+    [
+      "send_peer_message",
+      { targetWorkspaceId: "wks_oncall", intent: "query", message: "Check API version" },
+      "Send peer message",
+      "Check API version",
+    ],
     ["create_agent", { title: "Reviewer", initialPrompt: "Review it" }, "Create agent", "Reviewer"],
     ["create_agent", { initialPrompt: "Review it" }, "Create agent", "Review it"],
     ["get_agent_status", { agentId: "agt_1" }, "Check agent", "agt_1"],

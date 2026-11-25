@@ -6,7 +6,9 @@ import type { StreamItem } from "@/types/stream";
 import type { AgentMessage } from "@getpaseo/protocol/agent-message";
 import { isTurnBoundary } from "./turn-membership";
 
-// Agent lifecycle and messaging tools in the Paseo catalog. Permission tools stay visible.
+// Agent lifecycle and intra-workspace subagent messaging tools in the Paseo catalog.
+// Permission tools and cross-workspace peer collaboration tools (`send_peer_message`,
+// `list_workspaces`) stay visible so external workspace alignment is never hidden.
 // Keep the persisted tool classification in the server's agent/chat-search/index.ts in sync.
 const PASEO_INTERACTION_TOOLS = new Set([
   "create_agent",

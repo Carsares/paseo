@@ -151,6 +151,62 @@ describe("Paseo tool-call detail presentation", () => {
   it("leaves non-Paseo tools alone", () => {
     expect(buildPaseoToolDetailSections("mcp__github__create_issue", {}, {})).toBeNull();
   });
+
+  it("presents send_peer_message body and cross-workspace routing details", () => {
+    expect(
+      buildPaseoToolDetailSections(
+        "mcp__paseo__send_peer_message",
+        {
+          targetWorkspaceId: "wks_oncall",
+          targetAgentId: "6c6af207",
+          intent: "align",
+          subject: "loom-chat protocol",
+          message: "Confirm envelope fields.",
+        },
+        {
+          structuredContent: {
+            success: true,
+            deliveryStatus: "queued",
+            targetWorkspaceId: "wks_oncall",
+            targetAgentId: "6c6af207",
+            correlationId: "peer_1",
+            hop: 1,
+            maxHops: 4,
+            status: "idle",
+          },
+        },
+      ),
+    ).toEqual([
+      {
+        kind: "prose",
+        title: "Prompt",
+        text: "Confirm envelope fields.",
+      },
+      {
+        kind: "fields",
+        title: "Details",
+        fields: [
+          { label: "Target workspace id", value: "wks_oncall" },
+          { label: "Target agent id", value: "6c6af207" },
+          { label: "Intent", value: "align" },
+          { label: "Subject", value: "loom-chat protocol" },
+        ],
+      },
+      {
+        kind: "fields",
+        title: "Result",
+        fields: [
+          { label: "Delivery status", value: "queued" },
+          { label: "Target workspace id", value: "wks_oncall" },
+          { label: "Target agent id", value: "6c6af207" },
+          { label: "Correlation id", value: "peer_1" },
+          { label: "Hop", value: "1" },
+          { label: "Max hops", value: "4" },
+          { label: "Status", value: "idle" },
+        ],
+      },
+    ]);
+  });
 });
 
 describe("published Paseo tool-call detail entry", () => {

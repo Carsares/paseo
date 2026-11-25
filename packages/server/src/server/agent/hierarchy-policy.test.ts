@@ -69,8 +69,10 @@ const sibling = child("other-lead", main);
 const root: HierarchyAgent = { id: "ordinary-root" };
 const mainControlTools = [
   "list_profiles",
+  "list_workspaces",
   "create_agent",
   "send_agent_prompt",
+  "send_peer_message",
   "update_agent",
   "get_agent_status",
   "list_agents",
@@ -332,6 +334,18 @@ describe("agent orchestration", () => {
     expect(() => check(lead.id, sibling.id)).toThrow("Coordinate through your direct child");
     expect(() => check(lead.id, "missing")).toThrow("Coordinate through your direct child");
     expect(() => check(root.id, lead.id)).not.toThrow();
+
+    const { readAgent: readCrossWs } = hierarchy(
+      { ...main, workspaceId: "wks_a" },
+      { ...lead, workspaceId: "wks_b" },
+    );
+    expect(() =>
+      validateSingleHopOrchestration({
+        callerAgentId: main.id,
+        targetAgentId: lead.id,
+        readAgent: readCrossWs,
+      }),
+    ).toThrow("Coordinate through your direct child");
   });
 
   it("merges disabled tools with provider policy and keeps Main Control's delegation tools", () => {
@@ -364,6 +378,7 @@ describe("agent orchestration", () => {
         "resume_schedule",
         "run_schedule_once",
         "send_agent_prompt",
+        "send_peer_message",
         "update_agent",
         "cancel_agent",
         "archive_agent",
@@ -389,6 +404,8 @@ describe("agent orchestration", () => {
     expect(prompt).toContain("combine list_workspace_tasks and summarize_workspace_agents");
     expect(prompt).toContain('"batch_implement"');
     expect(prompt).toContain('commitPolicy: "none"');
+    expect(prompt).toContain("discover workspaces with list_workspaces and use send_peer_message");
+    expect(prompt).toContain('kind="peer-workspace-message"');
     expect(prompt).toContain("End your turn to wait for the lead to call report_to_parent");
     expect(prompt).toContain("stay read-only regardless of provider mode");
     expect(prompt).toContain(

@@ -12,6 +12,10 @@ import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 type InboxSummary = NonNullable<AgentSnapshotPayload["pendingSubagentInbox"]>;
 type ChildSource = Extract<AgentPromptSource, { kind: "agent-message" | "agent-notification" }>;
 
+function isChildSource(source: AgentPromptSource): source is ChildSource {
+  return source.kind === "agent-message" || source.kind === "agent-notification";
+}
+
 import {
   AgentTurnBusyError,
   AgentTurnChangedError,
@@ -24,13 +28,25 @@ import type {
   AgentPromptInput,
   AgentPromptContentBlock,
 } from "../agent-sdk-types.js";
-import { envelopeMessage, prepareAgentMessage, type AgentPromptSource } from "./envelope.js";
+import {
+  ensurePeerDispatchEnvironmentReady,
+  envelopeMessage,
+  flushAllHostPendingPeerOutcomes,
+  hasMandatoryPeerDispatchMarker,
+  notifyPromptDispatchOutcome,
+  prepareAgentMessage,
+  verifyMandatoryPeerPromptAtDispatch,
+  type AgentPromptSource,
+  type PeerDispatchTerminalOutcome,
+} from "./envelope.js";
 import { describeAgentMessage, type AgentMessageBehavior } from "./guidance.js";
 
 /** A message's quiet window closes this long after the latest arrival. */
 const QUIET_MS = 2000;
 /** Steady arrivals cannot keep a quiet window open longer than this. */
 const MAX_COLLECTING_MS = 10_000;
+/** Held subagent inbox reports auto-release no later than this after the first arrival. */
+export const MAX_SUBAGENT_INBOX_WAIT_MS = 30_000;
 
 interface Message {
   recipientId: string;
@@ -64,6 +80,9 @@ interface Admitted extends Message {
   taskAdmission?: TaskDispatchAdmission;
   drainSteerDeclined?: boolean;
   dispatchFailure?: { error: unknown };
+  retainedForRestart?: boolean;
+  outcomeUnknown?: boolean;
+  onReturnedToQueue?: () => Promise<void>;
   /** claimed: a dispatch has it. It leaves the queue when the provider admits the prompt. */
   state: "queued" | "claimed" | "withdrawn" | "rejected";
   /** A steer or interrupt that was not released yet. After a Stop it waits like any other message. */
@@ -226,7 +245,8 @@ const isOfferable = (message: Admitted): boolean =>
   !message.outOfBandDeclined &&
   message.sessionMode === undefined &&
   !message.subagentInbox &&
-  !message.beforeProviderDispatch;
+  !message.beforeProviderDispatch &&
+  !hasMandatoryPeerDispatchMarker(message.prompt);
 
 /**
  * Providers read a command from the raw start of the prompt: a slash and a name with no
@@ -248,7 +268,12 @@ function combine(prompts: AgentPromptInput[]): AgentPromptInput {
 }
 
 function envelope(message: Admitted): AgentPromptInput {
-  return prepareAgentMessage(message.prompt, message.source, message.receipt.messageId).prompt;
+  return prepareAgentMessage(
+    message.prompt,
+    message.source,
+    message.receipt.messageId,
+    message.recipientId,
+  ).prompt;
 }
 
 /** Explicitly conflicting session modes require separate, ordered dispatches. */
@@ -298,11 +323,21 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   const inboxes = new Map<string, Inbox>();
   const releasing = new Map<string, Promise<void>>();
   const parentInboxes = new Map<string, Admitted[]>();
+  const parentInboxCaps = new Map<string, () => void>();
   const stopWrites = new Set<Promise<void>>();
+  const outcomeWrites = new Set<Promise<void>>();
   const stopWaiters = new Set<(recipientId: string) => void>();
   let admissionPaused = false;
   let closed = false;
+  let queuesDrainedOnClose = false;
   let closing: Promise<void> | undefined;
+
+  function clearParentInboxCap(recipientId: string): void {
+    const cancel = parentInboxCaps.get(recipientId);
+    if (!cancel) return;
+    parentInboxCaps.delete(recipientId);
+    cancel();
+  }
 
   const isRunning = (recipientId: string): boolean =>
     Boolean(dependencies.isRunning?.(recipientId));
@@ -480,19 +515,21 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     await request.handoff?.declined();
     handBack(messages);
     for (const message of messages) {
+      if (!message.outcomeUnknown) await message.onReturnedToQueue?.();
       if (message.dispatchFailure) fail(message, message.dispatchFailure.error);
     }
   }
 
-  function returnBusyBatch(
+  async function returnBusyBatch(
     error: unknown,
     messages: Admitted[],
     request: DispatchRequest,
-  ): boolean {
+  ): Promise<boolean> {
     if (!(error instanceof AgentTurnBusyError) || !request.idleOnly) return false;
     handBack(messages);
-    if (request.canSteerDuringDrain && preparing()) {
-      for (const message of messages) message.drainSteerDeclined = true;
+    for (const message of messages) {
+      await message.onReturnedToQueue?.();
+      if (request.canSteerDuringDrain && preparing()) message.drainSteerDeclined = true;
     }
     return true;
   }
@@ -505,7 +542,128 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   }
 
   function isUnconfirmedBatch(error: unknown, messages: Admitted[]): boolean {
-    return isUnconfirmedDispatch(error) && messages.some((message) => message.handoff);
+    return (
+      isUnconfirmedDispatch(error) &&
+      messages.some(
+        (message) =>
+          Boolean(message.handoff) ||
+          (Boolean(message.outcomeUnknown) && hasMandatoryPeerDispatchMarker(message.prompt)),
+      )
+    );
+  }
+
+  function hasSubagentInboxBatch(messages: Admitted[]): boolean {
+    return messages.some((message) => Boolean(message.subagentInbox));
+  }
+
+  function isBatchIdleOnly(idleOnly: boolean, hasSubagentInbox: boolean): boolean {
+    return (idleOnly && !closed) || hasSubagentInbox;
+  }
+
+  function failBatch(messages: Admitted[], error: unknown): void {
+    for (const message of messages) fail(message, error);
+  }
+
+  async function awaitPeerEnvironmentForBatch(messages: Admitted[]): Promise<void> {
+    const peerMsg = messages.find((message) => hasMandatoryPeerDispatchMarker(message.prompt));
+    if (!peerMsg) return;
+    const senderServerId = "serverId" in peerMsg.source ? peerMsg.source.serverId : undefined;
+    await ensurePeerDispatchEnvironmentReady(senderServerId);
+  }
+
+  function trackOutcomeWrite(write: Promise<void>): void {
+    const settled = write.catch(() => undefined);
+    outcomeWrites.add(settled);
+    void settled.finally(() => {
+      outcomeWrites.delete(settled);
+    });
+  }
+
+  function combineDispatchValidators(
+    recipientId: string,
+    source: AgentPromptSource,
+    prompt: AgentPromptInput,
+    validateDispatch: (() => Promise<void> | void) | undefined,
+  ): {
+    validateDispatch?: () => Promise<void>;
+    onReturnedToQueue?: () => Promise<void>;
+    onOutcome?: (outcome: PeerDispatchTerminalOutcome) => void;
+  } {
+    const hasPeerMarker = hasMandatoryPeerDispatchMarker(prompt);
+    if (!validateDispatch && !hasPeerMarker) return {};
+    const baseContext = {
+      recipientId,
+      senderAgentId: "agentId" in source ? source.agentId : undefined,
+      senderServerId: "serverId" in source ? source.serverId : undefined,
+    };
+    let latestAttemptId: string | undefined;
+    return {
+      validateDispatch: async () => {
+        await validateDispatch?.();
+        if (hasPeerMarker) {
+          const verified = await verifyMandatoryPeerPromptAtDispatch(prompt, baseContext);
+          latestAttemptId = verified?.attemptId;
+        }
+      },
+      onReturnedToQueue: hasPeerMarker
+        ? async () => {
+            const attemptId = latestAttemptId;
+            if (!attemptId) return;
+            await notifyPromptDispatchOutcome(prompt, "returned_to_queue", {
+              ...baseContext,
+              attemptId,
+            }).catch(() => undefined);
+          }
+        : undefined,
+      onOutcome: hasPeerMarker
+        ? (outcome) => {
+            trackOutcomeWrite(
+              notifyPromptDispatchOutcome(prompt, outcome, {
+                ...baseContext,
+                attemptId: latestAttemptId,
+              }),
+            );
+          }
+        : undefined,
+    };
+  }
+
+  function resolveRejectedOutcome(message: Admitted): PeerDispatchTerminalOutcome {
+    if (message.outcomeUnknown) return "outcome_unknown";
+    if (message.retainedForRestart) return "retained_for_restart";
+    return "definitively_unsent";
+  }
+
+  function bindValidationLifecycle(
+    message: Admitted,
+    validation: ReturnType<typeof combineDispatchValidators>,
+  ): void {
+    if (!validation.onOutcome) return;
+    void message.receipt.dispatched.then(
+      () => {
+        validation.onOutcome?.("accepted");
+        return undefined;
+      },
+      () => {
+        validation.onOutcome?.(resolveRejectedOutcome(message));
+      },
+    );
+  }
+
+  function resolveMessageUrgency(
+    activeTurnBehavior: AgentMessageBehavior,
+    heldAfterStop: boolean | undefined,
+  ): Admitted["urgency"] {
+    return activeTurnBehavior === "queue" || heldAfterStop ? null : activeTurnBehavior;
+  }
+
+  function markOutcomeUnknownIfSubmitted(
+    enteredProviderSubmission: boolean,
+    error: unknown,
+    messages: Admitted[],
+  ): void {
+    if (!enteredProviderSubmission || !isUnconfirmedDispatch(error)) return;
+    for (const message of messages) message.outcomeUnknown = true;
   }
 
   /** Dispatch one batch. A batch that finds the recipient stopped, or busy when idle-only, stays queued. */
@@ -519,22 +677,34 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     for (;;) {
       const messages = batch.filter(isQueued);
       if (!messages.length) return;
-      const request = requestFor(recipientId, messages, idleOnly && !closed, stopped);
+      await awaitPeerEnvironmentForBatch(messages);
+      const hasSubagentInbox = hasSubagentInboxBatch(messages);
+      const request = requestFor(
+        recipientId,
+        messages,
+        isBatchIdleOnly(idleOnly, hasSubagentInbox),
+        stopped,
+      );
+      let enteredProviderSubmission = false;
       try {
         await request.validateDispatch?.();
+        if (!messages.every(isQueued)) {
+          throw new DOMException("Agent message withdrawn", "AbortError");
+        }
         for (const message of messages) message.beforeDispatch?.();
+        enteredProviderSubmission = true;
         const disposition = await runWithTaskDispatchAdmission(messages[0]?.taskAdmission, () =>
           dependencies.dispatch(request),
         );
         for (const message of messages) claim(message, disposition, request);
         return;
       } catch (error) {
-        const isStopped = stopped();
+        markOutcomeUnknownIfSubmitted(enteredProviderSubmission, error, messages);
         if (isUnconfirmedBatch(error, messages)) {
-          // Stop does not prove the provider failed to receive the batch.
-          for (const message of messages) fail(message, error);
+          failBatch(messages, error);
           throw error;
         }
+        const isStopped = stopped();
         if (isStopped || messages.some(isWithdrawn)) {
           await returnUnsubmittedBatch(messages, request);
           if (isStopped) return;
@@ -546,11 +716,11 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
           retriedChangedTurn = true;
           continue;
         }
-        if (returnBusyBatch(error, messages, request)) {
-          if (closed) continue;
+        if (await returnBusyBatch(error, messages, request)) {
+          if (closed && !hasSubagentInbox) continue;
           return;
         }
-        for (const message of messages) fail(message, error);
+        failBatch(messages, error);
         dependencies.onError(error, request);
         throw error;
       }
@@ -569,6 +739,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     for (const message of candidates) {
       if (closed || stopped() || !stillDue()) return;
       if (!isOfferable(message)) continue;
+      await awaitPeerEnvironmentForBatch([message]);
       const request = requestFor(recipientId, [message], true, stopped);
       try {
         await request.validateDispatch?.();
@@ -720,6 +891,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
   }
 
   function releaseInbox(recipientId: string, arriving: Admitted[] = []): void {
+    clearParentInboxCap(recipientId);
     const backlog = parentInboxes.get(recipientId);
     parentInboxes.delete(recipientId);
     for (const message of [...(backlog ?? []), ...arriving]) admit(message);
@@ -733,8 +905,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         recipientId === releaseRecipientId ||
         backlog.some(
           ({ source }) =>
-            source.kind !== "change-request-update" &&
-            !dependencies.shouldHoldInbox?.(recipientId, source),
+            isChildSource(source) && !dependencies.shouldHoldInbox?.(recipientId, source),
         )
       )
         releaseInbox(recipientId);
@@ -865,7 +1036,10 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     if (parent && removedParent.length) {
       const remaining = parent.filter((message) => !removedParent.includes(message));
       if (remaining.length) parentInboxes.set(recipientId, remaining);
-      else parentInboxes.delete(recipientId);
+      else {
+        parentInboxes.delete(recipientId);
+        clearParentInboxCap(recipientId);
+      }
       for (const message of removedParent) {
         message.state = "withdrawn";
         message.reject(new DOMException("Agent message withdrawn", "AbortError"));
@@ -904,7 +1078,7 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       return {
         count: backlog.length,
         items: backlog.flatMap(({ source }) => {
-          if (source.kind === "change-request-update") return [];
+          if (!isChildSource(source)) return [];
           return [
             {
               agentId: source.agentId,
@@ -968,26 +1142,45 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
       const taskAdmission = message.handoff?.waitForForegroundConfirmation
         ? attachTaskDispatchMessage(message.recipientId, receipt.messageId)
         : undefined;
+      const combinedValidation = combineDispatchValidators(
+        message.recipientId,
+        message.source,
+        message.prompt,
+        message.validateDispatch,
+      );
       const item: Admitted = {
         ...message,
+        validateDispatch: combinedValidation.validateDispatch,
+        onReturnedToQueue: combinedValidation.onReturnedToQueue,
         taskAdmission,
         receipt,
         resolve,
         reject,
         state: "queued",
-        urgency:
-          activeTurnBehavior === "queue" || message.heldAfterStop ? null : activeTurnBehavior,
+        urgency: resolveMessageUrgency(activeTurnBehavior, message.heldAfterStop),
         held: message.heldAfterStop ?? false,
         outOfBandDeclined: false,
       };
+      bindValidationLifecycle(item, combinedValidation);
       if (
         message.subagentInbox === "ordinary" &&
-        message.source.kind !== "change-request-update" &&
+        isChildSource(message.source) &&
         dependencies.shouldHoldInbox?.(message.recipientId, message.source)
       ) {
-        const backlog = parentInboxes.get(message.recipientId) ?? [];
+        const existing = parentInboxes.get(message.recipientId);
+        const backlog = existing ?? [];
         backlog.push(item);
         parentInboxes.set(message.recipientId, backlog);
+        if (!existing) {
+          parentInboxCaps.set(
+            message.recipientId,
+            schedule(MAX_SUBAGENT_INBOX_WAIT_MS, () => {
+              parentInboxCaps.delete(message.recipientId);
+              if (closed) return;
+              releaseInbox(message.recipientId);
+            }),
+          );
+        }
         dependencies.onInboxChange?.(message.recipientId);
       } else if (message.subagentInbox) releaseInbox(message.recipientId, [item]);
       else admit(item);
@@ -1100,14 +1293,24 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     },
     close(options) {
       if (closing) return closing;
+      if (queuesDrainedOnClose) {
+        const retryFlush = flushAllHostPendingPeerOutcomes().finally(() => {
+          if (closing === retryFlush) closing = undefined;
+        });
+        closing = retryFlush;
+        return retryFlush;
+      }
       closed = true;
       unsubscribe?.();
       unsubscribeStop?.();
       const receipts: Promise<unknown>[] = [];
       const deferred =
         options?.deferWith ?? new AgentMessageAdmissionError("Inbox retained for restart");
+      for (const cancel of parentInboxCaps.values()) cancel();
+      parentInboxCaps.clear();
       for (const backlog of parentInboxes.values())
         for (const message of backlog) {
+          message.retainedForRestart = true;
           message.state = "withdrawn";
           message.reject(deferred);
         }
@@ -1116,10 +1319,12 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
         inbox.cancelTimer();
         inbox.cancelCap();
         const retainHeld = (message: Admitted) =>
-          inbox.phase === "held" && Boolean(message.handoff?.holdAfterStop);
+          (inbox.phase === "held" && Boolean(message.handoff?.holdAfterStop)) ||
+          (Boolean(message.subagentInbox) && isRunning(recipientId));
         const deferQueued = (matches: (message: Admitted) => boolean) => {
           for (const message of inbox.messages.filter(matches)) {
             if (!isQueued(message)) continue;
+            message.retainedForRestart = true;
             settle(message, "withdrawn");
             message.reject(deferred);
           }
@@ -1145,7 +1350,19 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
           }
         });
       }
-      closing = Promise.allSettled([...receipts, ...stopWrites]).then(() => undefined);
+      closing = (async () => {
+        await Promise.allSettled([...receipts, ...stopWrites]);
+        while (outcomeWrites.size > 0) {
+          await Promise.allSettled(outcomeWrites);
+        }
+        queuesDrainedOnClose = true;
+        try {
+          await flushAllHostPendingPeerOutcomes();
+        } catch (error) {
+          closing = undefined;
+          throw error;
+        }
+      })();
       return closing;
     },
   };

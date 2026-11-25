@@ -1,12 +1,32 @@
 import { describeAgentMessage } from "../agent-messages/guidance.js";
 import type { AgentActiveTurnBehavior } from "@getpaseo/protocol/messages";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { ChangeRequestWatches } from "../change-request-watches/index.js";
 import { changeRequestStatusSchema } from "../../../services/change-request-source.js";
 import { registerPluginTools } from "./plugin-tools.js";
 import type { FinishSubscriptions, FinishRegistration } from "../finish-subscriptions/index.js";
 import { resolveReportTitle } from "../report-title.js";
 import type { AgentMessageDelivery } from "../agent-messages/index.js";
+import {
+  encodePeerWorkspacePrompt,
+  formatPeerInspectionPromptPrefix,
+  isPeerInspectionBoundaryPromptText,
+  isSystemInjectedEnvelope,
+  neutralizePeerWorkspacePromptMarker,
+  parseAgentMessages,
+  parseProjectedPeerCallId,
+  PeerMessageIntentSchema,
+  registerHostPeerDispatchVerifier,
+  registerPromptDispatchVerifier,
+  releasePromptDispatchVerifier,
+  resolvePeerTransportSecret,
+  type AgentPromptSource,
+  type PeerDispatchEndpointContext,
+  type PeerDispatchTerminalOutcome,
+  type PeerDispatchVerificationRequest,
+} from "../agent-messages/envelope.js";
 import type { RecoverableAgentMessage } from "../../message-receipts/index.js";
 import {
   assertDirectParent,
@@ -27,7 +47,12 @@ import {
 import type { DurableItemStore } from "../../durable-items/store.js";
 import type { Logger } from "pino";
 
-import type { AgentMode, AgentProvider, AgentSessionConfig } from "../agent-sdk-types.js";
+import type {
+  AgentMode,
+  AgentPromptInput,
+  AgentProvider,
+  AgentSessionConfig,
+} from "../agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "../agent-manager.js";
 import {
   ActiveTurnBehaviorSchema,
@@ -115,10 +140,11 @@ import {
 } from "../lifecycle-command.js";
 import type { ForgeService } from "../../../services/forge-service.js";
 import type { WorkspaceGitService } from "../../workspace-git-service.js";
-import type {
-  PersistedWorkspaceRecord,
-  ProjectRegistry,
-  WorkspaceRegistry,
+import {
+  resolveWorkspaceDisplayName,
+  type PersistedWorkspaceRecord,
+  type ProjectRegistry,
+  type WorkspaceRegistry,
 } from "../../workspace-registry.js";
 import { resolveWorktreeSourceCwd } from "../../workspace-source.js";
 import type { WorkspaceScriptsService } from "../../session/workspace-scripts/workspace-scripts-service.js";
@@ -162,7 +188,9 @@ import {
   type PaseoToolPolicy,
 } from "../hierarchy-policy.js";
 import {
+  getLeadPlaybookFromLabels,
   getParentAddressFromLabels,
+  getParentAgentIdFromLabels,
   isExplicitParentReportingLabels,
   isMainControlAgentLabels,
   isOpenAgentTabLabel,
@@ -245,6 +273,12 @@ export interface PaseoToolHostDependencies {
   verifiedCallerAgentId?: string;
   taskLedger?: WorkspaceTaskLedgerStore;
   durableItems?: DurableItemStore;
+  crossWorkspacePeerPolicy?: {
+    allowLocalPeerMessages?: boolean;
+    maxMessagesPerMinute?: number;
+    cooldownMs?: number;
+    now?: () => number;
+  };
   /**
    * Optional resolver for session-bound speak handlers.
    * Used by hidden voice agents to narrate through daemon-managed TTS.
@@ -689,6 +723,1134 @@ function resolveTerminalKeyToken({ key, literal, preamble }: TerminalKeyTokenInp
   );
 }
 
+const DEFAULT_MAX_PEER_HOPS = 4;
+const MAX_ALLOWED_PEER_HOPS = 6;
+const DEFAULT_MAX_PEER_MESSAGES_PER_MINUTE = 6;
+const DEFAULT_PEER_CIRCUIT_COOLDOWN_MS = 60_000;
+const PEER_RATE_WINDOW_MS = 60_000;
+const MAX_TRACKED_PEER_THREADS = 2000;
+const MAX_TRACKED_PEER_MESSAGES = 2000;
+const MAX_TRACKED_PEER_WINDOWS = 256;
+const PEER_TRUSTED_WORKSPACES_METADATA_KEY = "paseo.trustedPeerWorkspaces";
+const PEER_TRUSTED_TARGET_AGENTS_METADATA_KEY = "paseo.trustedPeerTargetAgents";
+const PEER_REQUIRE_APPROVAL_METADATA_KEY = "paseo.requirePeerApproval";
+const PEER_ALLOW_LOCAL_METADATA_KEY = "paseo.allowLocalPeerMessages";
+const PEER_INSPECTION_PROMPT_PREFIX = formatPeerInspectionPromptPrefix();
+
+const PEER_READ_ONLY_TOOLS = new Set([
+  "list_workspaces",
+  "summarize_workspace_agents",
+  "list_workspace_tasks",
+  "list_agents",
+  "get_agent_status",
+  "get_agent_activity",
+  "list_profiles",
+  "list_providers",
+  "list_models",
+  "inspect_provider",
+  "list_hosts",
+  "list_workspace_scripts",
+  "list_terminals",
+  "capture_terminal",
+  "list_schedules",
+  "inspect_schedule",
+  "schedule_logs",
+  "list_pending_permissions",
+  "request_human_decision",
+  "report_to_parent",
+  "browser_list_hosts",
+  "browser_list_tabs",
+  "browser_snapshot",
+  "browser_screenshot",
+  "browser_logs",
+]);
+
+const PEER_ALLOWED_EXPLICIT_MODES = new Set(["read-only", "plan"]);
+
+function isPeerExplicitModeDisallowed(modeId: unknown): boolean {
+  if (typeof modeId !== "string") return false;
+  const trimmed = modeId.trim().toLowerCase();
+  if (!trimmed) return false;
+  return !PEER_ALLOWED_EXPLICIT_MODES.has(trimmed);
+}
+
+function hasPeerDisallowedProviderOptions(optionsRecord: unknown): boolean {
+  if (!optionsRecord || typeof optionsRecord !== "object") return false;
+  const record = optionsRecord as Record<string, unknown>;
+  if (record.sandbox_mode !== undefined && record.sandbox_mode !== "read-only") return true;
+  if (record.mainControlReadOnly === false) return true;
+  if (record.disallowedTools !== undefined || record.permission !== undefined) return true;
+  return false;
+}
+
+function readWorkspaceStringSet(
+  workspace: PersistedWorkspaceRecord,
+  metadataKey: string,
+): ReadonlySet<string> {
+  const raw = workspace.metadata?.[metadataKey];
+  if (!Array.isArray(raw)) return new Set();
+  return new Set(
+    raw.flatMap((entry) => (typeof entry === "string" && entry.trim() ? [entry.trim()] : [])),
+  );
+}
+
+function readWorkspaceTrustedPeers(workspace: PersistedWorkspaceRecord): ReadonlySet<string> {
+  return readWorkspaceStringSet(workspace, PEER_TRUSTED_WORKSPACES_METADATA_KEY);
+}
+
+function readWorkspaceTrustedTargetAgents(
+  workspace: PersistedWorkspaceRecord,
+): ReadonlySet<string> {
+  return readWorkspaceStringSet(workspace, PEER_TRUSTED_TARGET_AGENTS_METADATA_KEY);
+}
+
+function workspaceRequiresPeerApproval(workspace: PersistedWorkspaceRecord): boolean {
+  if (workspace.metadata?.[PEER_REQUIRE_APPROVAL_METADATA_KEY] === true) return true;
+  if (workspace.metadata?.[PEER_ALLOW_LOCAL_METADATA_KEY] === false) return true;
+  return false;
+}
+
+interface BasePeerThreadSnapshot {
+  correlationId: string;
+  maxHops: number;
+  hop: number;
+  expectReply: boolean;
+  lastSourceWorkspaceId: string;
+  lastSourceAgentId: string;
+  lastTargetWorkspaceId: string;
+  lastTargetAgentId: string;
+  repliedHops: number[];
+  admitted: boolean;
+}
+
+interface PeerThreadState {
+  correlationId: string;
+  maxHops: number;
+  hop: number;
+  expectReply: boolean;
+  lastSourceWorkspaceId: string;
+  lastSourceAgentId: string;
+  lastTargetWorkspaceId: string;
+  lastTargetAgentId: string;
+  repliedHops: Set<number>;
+  admitted: boolean;
+  confirmedSnapshot?: BasePeerThreadSnapshot;
+}
+
+interface PeerLockGrant {
+  grantId: string;
+  dispatchId?: string;
+  correlationId: string;
+  lockedHumanCount: number;
+}
+
+interface PeerPairWindow {
+  timestamps: number[];
+  trippedUntil: number;
+}
+
+type SerializedPeerThread = z.infer<typeof persistedPeerThreadSchema>;
+
+type PersistedPeerEnvelope = Extract<AgentPromptSource, { kind: "peer-workspace-message" }> & {
+  dispatchId: string;
+  recipientAgentId: string;
+  activeAttemptId?: string;
+  settled?: boolean;
+  inboundThread?: SerializedPeerThread;
+};
+
+interface PersistedPeerChildDispatch {
+  dispatchId: string;
+  senderAgentId: string;
+  senderServerId?: string;
+  senderWorkspaceId: string | null;
+  recipientAgentId: string;
+  correlationId: string;
+  activeAttemptId?: string;
+  settled?: boolean;
+}
+
+interface PeerRuntimeMaps {
+  threads: Map<string, PeerThreadState>;
+  byMessageId: Map<string, PersistedPeerEnvelope>;
+  inboundAgentLocks: Map<string, Map<string, PeerLockGrant>>;
+  lockedChildren: Map<string, Map<string, PeerLockGrant>>;
+  pendingChildDispatches: Map<string, PersistedPeerChildDispatch>;
+  pairWindows: Map<string, PeerPairWindow>;
+}
+
+interface PendingPeerOutcomeRecord {
+  outcomeKey: string;
+  dispatchId: string;
+  outcome: PeerDispatchTerminalOutcome;
+  context: PeerDispatchEndpointContext;
+}
+
+interface PeerWorkspaceRuntime extends PeerRuntimeMaps {
+  paseoHome?: string;
+  loadPromise: Promise<void> | null;
+  loadedFromDisk: boolean;
+  stateMutex: Promise<void>;
+  pendingOutcomes: Map<string, PendingPeerOutcomeRecord>;
+}
+
+function cloneBaseThreadSnapshot(
+  snapshot: BasePeerThreadSnapshot | undefined,
+): BasePeerThreadSnapshot | undefined {
+  if (!snapshot) return undefined;
+  return { ...snapshot, repliedHops: [...snapshot.repliedHops] };
+}
+
+function toBasePeerThreadSnapshot(thread: PeerThreadState): BasePeerThreadSnapshot {
+  return {
+    correlationId: thread.correlationId,
+    maxHops: thread.maxHops,
+    hop: thread.hop,
+    expectReply: thread.expectReply,
+    lastSourceWorkspaceId: thread.lastSourceWorkspaceId,
+    lastSourceAgentId: thread.lastSourceAgentId,
+    lastTargetWorkspaceId: thread.lastTargetWorkspaceId,
+    lastTargetAgentId: thread.lastTargetAgentId,
+    repliedHops: [...thread.repliedHops],
+    admitted: thread.admitted,
+  };
+}
+
+function deserializeBasePeerThread(snapshot: BasePeerThreadSnapshot): PeerThreadState {
+  return {
+    ...snapshot,
+    repliedHops: new Set(snapshot.repliedHops),
+  };
+}
+
+function clonePeerThreadState(thread: PeerThreadState): PeerThreadState {
+  const confirmedSnapshot = cloneBaseThreadSnapshot(thread.confirmedSnapshot);
+  return {
+    ...thread,
+    repliedHops: new Set(thread.repliedHops),
+    ...(confirmedSnapshot ? { confirmedSnapshot } : {}),
+  };
+}
+
+function cloneGrantMap(
+  source: Map<string, Map<string, PeerLockGrant>>,
+): Map<string, Map<string, PeerLockGrant>> {
+  const outer = new Map<string, Map<string, PeerLockGrant>>();
+  for (const [agentId, grants] of source) {
+    const inner = new Map<string, PeerLockGrant>();
+    for (const [grantId, grant] of grants) {
+      inner.set(grantId, { ...grant });
+    }
+    outer.set(agentId, inner);
+  }
+  return outer;
+}
+
+function clonePeerRuntimeMaps(source: PeerRuntimeMaps): PeerRuntimeMaps {
+  const threads = new Map<string, PeerThreadState>();
+  for (const [id, thread] of source.threads) {
+    threads.set(id, clonePeerThreadState(thread));
+  }
+  const byMessageId = new Map<string, PersistedPeerEnvelope>();
+  for (const [id, entry] of source.byMessageId) {
+    byMessageId.set(id, { ...entry });
+  }
+  const pendingChildDispatches = new Map<string, PersistedPeerChildDispatch>();
+  for (const [id, entry] of source.pendingChildDispatches) {
+    pendingChildDispatches.set(id, { ...entry });
+  }
+  const pairWindows = new Map<string, PeerPairWindow>();
+  for (const [key, win] of source.pairWindows) {
+    pairWindows.set(key, { timestamps: [...win.timestamps], trippedUntil: win.trippedUntil });
+  }
+  return {
+    threads,
+    byMessageId,
+    inboundAgentLocks: cloneGrantMap(source.inboundAgentLocks),
+    lockedChildren: cloneGrantMap(source.lockedChildren),
+    pendingChildDispatches,
+    pairWindows,
+  };
+}
+
+function applyPeerRuntimeMaps(runtime: PeerWorkspaceRuntime, next: PeerRuntimeMaps): void {
+  runtime.threads = next.threads;
+  runtime.byMessageId = next.byMessageId;
+  runtime.inboundAgentLocks = next.inboundAgentLocks;
+  runtime.lockedChildren = next.lockedChildren;
+  runtime.pendingChildDispatches = next.pendingChildDispatches;
+  runtime.pairWindows = next.pairWindows;
+}
+
+function setBoundedMapEntryWithUndo<K, V>(
+  map: Map<K, V>,
+  key: K,
+  value: V,
+  maxEntries: number,
+  canEvict: (candidateKey: K, candidateValue: V) => boolean = () => true,
+): (target: Map<K, V>) => void {
+  const hadPrevious = map.has(key);
+  const previousValue = map.get(key);
+  if (hadPrevious) map.delete(key);
+  map.set(key, value);
+  const evicted: Array<[K, V]> = [];
+  while (map.size > maxEntries) {
+    let victimKey: K | undefined;
+    for (const [candidateKey, candidateValue] of map) {
+      if (candidateKey !== key && canEvict(candidateKey, candidateValue)) {
+        victimKey = candidateKey;
+        break;
+      }
+    }
+    if (victimKey === undefined) break;
+    evicted.push([victimKey, map.get(victimKey)!]);
+    map.delete(victimKey);
+  }
+  return (target) => {
+    if (hadPrevious && previousValue !== undefined) {
+      target.set(key, previousValue);
+    } else {
+      target.delete(key);
+    }
+    for (const [victimKey, victimValue] of evicted) {
+      if (!target.has(victimKey)) target.set(victimKey, victimValue);
+    }
+  };
+}
+
+function hasUnsettledDispatchForThread(correlationId: string, state: PeerRuntimeMaps): boolean {
+  for (const msg of state.byMessageId.values()) {
+    if (!msg.settled && msg.correlationId === correlationId) return true;
+  }
+  for (const child of state.pendingChildDispatches.values()) {
+    if (!child.settled && child.correlationId === correlationId) return true;
+  }
+  return false;
+}
+
+function hasActiveGrantForThread(
+  correlationId: string,
+  lockMap: Map<string, Map<string, PeerLockGrant>>,
+  countHuman: (agentId: string) => number,
+): boolean {
+  for (const [agentId, grants] of lockMap) {
+    const humanCount = countHuman(agentId);
+    for (const grant of grants.values()) {
+      if (grant.correlationId === correlationId && humanCount <= grant.lockedHumanCount) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function selectThreadEvictionVictim(
+  draft: PeerRuntimeMaps,
+  protectedCorrelationId: string,
+  countHuman: (agentId: string) => number,
+): string | undefined {
+  for (const [candidateId, candidate] of draft.threads) {
+    const converged = !candidate.expectReply || candidate.repliedHops.has(candidate.hop);
+    if (
+      candidateId !== protectedCorrelationId &&
+      converged &&
+      !hasUnsettledDispatchForThread(candidateId, draft)
+    ) {
+      return candidateId;
+    }
+  }
+  for (const candidateId of draft.threads.keys()) {
+    if (
+      candidateId !== protectedCorrelationId &&
+      !hasUnsettledDispatchForThread(candidateId, draft) &&
+      !hasActiveGrantForThread(candidateId, draft.inboundAgentLocks, countHuman) &&
+      !hasActiveGrantForThread(candidateId, draft.lockedChildren, countHuman)
+    ) {
+      return candidateId;
+    }
+  }
+  return undefined;
+}
+
+function setPeerThreadWithUndo(
+  draft: PeerRuntimeMaps,
+  correlationId: string,
+  nextThread: PeerThreadState,
+  countHuman: (agentId: string) => number,
+): (target: Map<string, PeerThreadState>) => void {
+  const existing = draft.threads.get(correlationId);
+  const previous = existing ? clonePeerThreadState(existing) : undefined;
+  if (existing) draft.threads.delete(correlationId);
+  draft.threads.set(correlationId, nextThread);
+  const evicted: Array<[string, PeerThreadState]> = [];
+  while (draft.threads.size > MAX_TRACKED_PEER_THREADS) {
+    const victimKey = selectThreadEvictionVictim(draft, correlationId, countHuman);
+    if (victimKey === undefined) break;
+    const victim = draft.threads.get(victimKey)!;
+    evicted.push([victimKey, clonePeerThreadState(victim)]);
+    draft.threads.delete(victimKey);
+  }
+  return (target) => {
+    if (previous) target.set(correlationId, previous);
+    else target.delete(correlationId);
+    for (const [victimKey, victimThread] of evicted) {
+      if (!target.has(victimKey)) target.set(victimKey, victimThread);
+    }
+  };
+}
+
+function revokeGrantByAttemptId(
+  lockMap: Map<string, Map<string, PeerLockGrant>>,
+  attemptId: string | undefined,
+  preserveOuterMarkerGrantId?: string,
+): boolean {
+  if (!attemptId || attemptId === preserveOuterMarkerGrantId) return false;
+  let changed = false;
+  for (const [agentId, grants] of lockMap) {
+    if (!grants.delete(attemptId)) continue;
+    changed = true;
+    if (grants.size === 0 && !preserveOuterMarkerGrantId) {
+      lockMap.delete(agentId);
+    }
+  }
+  return changed;
+}
+
+function revokeGrantsByDispatchId(
+  lockMap: Map<string, Map<string, PeerLockGrant>>,
+  dispatchId: string,
+  preserveOuterMarkerGrantId?: string,
+): boolean {
+  let changed = false;
+  for (const [agentId, grants] of lockMap) {
+    for (const [grantId, grant] of grants) {
+      if (grantId === preserveOuterMarkerGrantId) continue;
+      if (grant.dispatchId === dispatchId || grantId === dispatchId) {
+        grants.delete(grantId);
+        changed = true;
+      }
+    }
+    if (grants.size === 0 && !preserveOuterMarkerGrantId) {
+      lockMap.delete(agentId);
+    }
+  }
+  return changed;
+}
+
+function isProtectedPeerDelivery(
+  key: string,
+  entry: PersistedPeerEnvelope,
+  inboundAgentLocks: Map<string, Map<string, PeerLockGrant>>,
+): boolean {
+  if (!entry.settled) return true;
+  const grants = inboundAgentLocks.get(entry.recipientAgentId);
+  if (!grants) return false;
+  for (const grant of grants.values()) {
+    if (grant.dispatchId === key || grant.grantId === key) return true;
+  }
+  return false;
+}
+
+function setPeerDeliveryRecordWithUndo(
+  map: Map<string, PersistedPeerEnvelope>,
+  inboundAgentLocks: Map<string, Map<string, PeerLockGrant>>,
+  dispatchId: string,
+  value: PersistedPeerEnvelope,
+): (target: Map<string, PersistedPeerEnvelope>) => void {
+  if (map.has(dispatchId)) map.delete(dispatchId);
+  map.set(dispatchId, value);
+  const evicted: Array<[string, PersistedPeerEnvelope]> = [];
+  while (map.size > MAX_TRACKED_PEER_MESSAGES) {
+    let victimKey: string | undefined;
+    for (const [key, entry] of map) {
+      if (
+        key !== dispatchId &&
+        entry.intent === "reply" &&
+        !isProtectedPeerDelivery(key, entry, inboundAgentLocks)
+      ) {
+        victimKey = key;
+        break;
+      }
+    }
+    if (victimKey === undefined) {
+      for (const [key, entry] of map) {
+        if (key !== dispatchId && !isProtectedPeerDelivery(key, entry, inboundAgentLocks)) {
+          victimKey = key;
+          break;
+        }
+      }
+    }
+    if (victimKey === undefined) break;
+    evicted.push([victimKey, map.get(victimKey)!]);
+    map.delete(victimKey);
+  }
+  return (target) => {
+    target.delete(dispatchId);
+    for (const [victimKey, victimEntry] of evicted) {
+      if (!target.has(victimKey)) target.set(victimKey, victimEntry);
+    }
+  };
+}
+
+function grantAgentPeerLockWithUndo(
+  lockMap: Map<string, Map<string, PeerLockGrant>>,
+  agentId: string,
+  grant: PeerLockGrant,
+  currentHumanCount: number,
+  preserveGrantId?: string,
+): (target: Map<string, Map<string, PeerLockGrant>>) => void {
+  const existingGrants = lockMap.get(agentId);
+  const createdOuter = !existingGrants;
+  const grants = existingGrants ?? new Map<string, PeerLockGrant>();
+  const previousGrant = grants.get(grant.grantId);
+  grants.set(grant.grantId, grant);
+  const pruned: PeerLockGrant[] = [];
+  if (grants.size > 32) {
+    for (const [id, candidate] of grants) {
+      if (
+        id !== grant.grantId &&
+        id !== preserveGrantId &&
+        currentHumanCount > candidate.lockedHumanCount
+      ) {
+        pruned.push(candidate);
+        grants.delete(id);
+      }
+    }
+  }
+  lockMap.set(agentId, grants);
+  return (target) => {
+    const targetGrants = target.get(agentId);
+    if (!targetGrants) return;
+    if (previousGrant) targetGrants.set(grant.grantId, previousGrant);
+    else targetGrants.delete(grant.grantId);
+    for (const restored of pruned) {
+      if (!targetGrants.has(restored.grantId)) targetGrants.set(restored.grantId, restored);
+    }
+    if (createdOuter && targetGrants.size === 0) target.delete(agentId);
+  };
+}
+
+const persistedPeerLockGrantSchema = z.object({
+  grantId: z.string().min(1),
+  dispatchId: z.string().min(1).optional(),
+  correlationId: z.string().min(1),
+  lockedHumanCount: z.number().int().min(0),
+});
+
+const legacyPeerLockEntrySchema = z.object({
+  correlationId: z.string().min(1),
+  lockedHumanCount: z.number().int().min(0),
+});
+
+const basePeerThreadSnapshotSchema = z.object({
+  correlationId: z.string().min(1),
+  maxHops: z.number().int().min(1),
+  hop: z.number().int().min(1),
+  expectReply: z.boolean(),
+  lastSourceWorkspaceId: z.string().min(1),
+  lastSourceAgentId: z.string().min(1),
+  lastTargetWorkspaceId: z.string().min(1),
+  lastTargetAgentId: z.string().min(1),
+  repliedHops: z.array(z.number().int().min(1)),
+  admitted: z.boolean(),
+});
+
+const persistedPeerThreadSchema = basePeerThreadSnapshotSchema.extend({
+  hasConfirmedHop: z.boolean().optional(),
+  confirmedSnapshot: basePeerThreadSnapshotSchema.optional(),
+});
+
+const persistedPeerChildDispatchSchema = z.object({
+  dispatchId: z.string().min(1),
+  senderAgentId: z.string().min(1),
+  senderServerId: z.string().min(1).optional(),
+  senderWorkspaceId: z.string().nullable(),
+  recipientAgentId: z.string().min(1),
+  correlationId: z.string().min(1),
+  activeAttemptId: z.string().min(1).optional(),
+  settled: z.boolean().optional(),
+});
+
+const pendingPeerOutcomeRecordSchema = z.object({
+  outcomeKey: z.string().min(1),
+  dispatchId: z.string().min(1),
+  outcome: z.enum([
+    "accepted",
+    "retained_for_restart",
+    "outcome_unknown",
+    "definitively_unsent",
+    "returned_to_queue",
+  ]),
+  context: z.object({
+    kind: z.enum(["peer-workspace", "peer-child"]),
+    recipientId: z.string().min(1),
+    senderAgentId: z.string().min(1).optional(),
+    senderServerId: z.string().min(1).optional(),
+    attemptId: z.string().min(1).optional(),
+  }),
+});
+
+const persistedAgentGrantsTupleSchema = z.tuple([
+  z.string().min(1),
+  z.union([z.array(persistedPeerLockGrantSchema), legacyPeerLockEntrySchema]),
+]);
+
+const persistedPeerStateFileSchema = z.object({
+  threads: z.array(persistedPeerThreadSchema).optional(),
+  messages: z.array(z.tuple([z.string().min(1), z.record(z.string(), z.unknown())])).optional(),
+  inboundAgentLocks: z.array(persistedAgentGrantsTupleSchema).optional(),
+  lockedChildren: z.array(persistedAgentGrantsTupleSchema).optional(),
+  pendingChildDispatches: z.array(persistedPeerChildDispatchSchema).optional(),
+});
+
+function serializePeerThread(thread: PeerThreadState): SerializedPeerThread {
+  const confirmedSnapshot = cloneBaseThreadSnapshot(thread.confirmedSnapshot);
+  return {
+    ...toBasePeerThreadSnapshot(thread),
+    hasConfirmedHop: Boolean(confirmedSnapshot),
+    ...(confirmedSnapshot ? { confirmedSnapshot } : {}),
+  };
+}
+
+function deserializePeerThread(thread: SerializedPeerThread): PeerThreadState {
+  const { hasConfirmedHop: _ignored, confirmedSnapshot: rawConfirmed, ...rest } = thread;
+  const confirmedSnapshot = cloneBaseThreadSnapshot(rawConfirmed);
+  return {
+    ...rest,
+    repliedHops: new Set(rest.repliedHops),
+    ...(confirmedSnapshot ? { confirmedSnapshot } : {}),
+  };
+}
+
+function matchesPersistedPeerWorkspaceEndpoints(
+  msg: PersistedPeerEnvelope,
+  endpoint: { recipientId: string; senderAgentId?: string; senderServerId?: string },
+): boolean {
+  return (
+    msg.recipientAgentId === endpoint.recipientId &&
+    msg.agentId === endpoint.senderAgentId &&
+    (msg.serverId ?? undefined) === (endpoint.senderServerId ?? undefined)
+  );
+}
+
+function matchesPersistedPeerChildEndpoints(
+  child: PersistedPeerChildDispatch,
+  endpoint: { recipientId: string; senderAgentId?: string; senderServerId?: string },
+): boolean {
+  return (
+    child.recipientAgentId === endpoint.recipientId &&
+    child.senderAgentId === endpoint.senderAgentId &&
+    (child.senderServerId ?? undefined) === (endpoint.senderServerId ?? undefined)
+  );
+}
+
+function matchesRecordedOutcomeContext(
+  draft: PeerRuntimeMaps,
+  dispatchId: string,
+  context: PeerDispatchEndpointContext,
+): boolean {
+  if (context.kind === "peer-workspace") {
+    const msg = draft.byMessageId.get(dispatchId);
+    return Boolean(msg && matchesPersistedPeerWorkspaceEndpoints(msg, context));
+  }
+  const child = draft.pendingChildDispatches.get(dispatchId);
+  return Boolean(child && matchesPersistedPeerChildEndpoints(child, context));
+}
+
+function advanceThreadConfirmedSnapshot(draft: PeerRuntimeMaps, msg: PersistedPeerEnvelope): void {
+  const currentThread = draft.threads.get(msg.correlationId);
+  const prevConfirmed = currentThread?.confirmedSnapshot;
+  if (prevConfirmed && msg.hop < prevConfirmed.hop) return;
+  const mergedReplied = new Set<number>(prevConfirmed?.repliedHops ?? []);
+  if (msg.intent === "reply" && msg.hop > 1) {
+    mergedReplied.add(msg.hop - 1);
+  }
+  const nextConfirmed: BasePeerThreadSnapshot = {
+    correlationId: msg.correlationId,
+    maxHops: currentThread?.maxHops ?? msg.maxHops,
+    hop: msg.hop,
+    expectReply: msg.expectReply,
+    lastSourceWorkspaceId: msg.sourceWorkspaceId,
+    lastSourceAgentId: msg.agentId,
+    lastTargetWorkspaceId: msg.targetWorkspaceId,
+    lastTargetAgentId: msg.recipientAgentId,
+    repliedHops: [...mergedReplied],
+    admitted: true,
+  };
+  if (currentThread) {
+    currentThread.confirmedSnapshot = nextConfirmed;
+    for (const h of mergedReplied) currentThread.repliedHops.add(h);
+  } else {
+    draft.threads.set(msg.correlationId, {
+      ...deserializeBasePeerThread(nextConfirmed),
+      confirmedSnapshot: nextConfirmed,
+    });
+  }
+}
+
+function pruneUnlockedInboundGrants(
+  inboundAgentLocks: Map<string, Map<string, PeerLockGrant>>,
+  countHuman: (agentId: string) => number,
+): void {
+  for (const [agentId, grants] of inboundAgentLocks) {
+    const humanCount = countHuman(agentId);
+    for (const [id, grant] of grants) {
+      if (humanCount > grant.lockedHumanCount) grants.delete(id);
+    }
+    if (grants.size === 0) inboundAgentLocks.delete(agentId);
+  }
+}
+
+function settleAcceptedPeerDispatchInDraft(
+  draft: PeerRuntimeMaps,
+  dispatchId: string,
+  kind: PeerDispatchEndpointContext["kind"],
+  countHuman: (agentId: string) => number,
+): void {
+  if (kind === "peer-workspace") {
+    const msg = draft.byMessageId.get(dispatchId);
+    if (msg) {
+      const { activeAttemptId: _cleared, ...rest } = msg;
+      draft.byMessageId.set(dispatchId, { ...rest, settled: true });
+      advanceThreadConfirmedSnapshot(draft, msg);
+    }
+    pruneUnlockedInboundGrants(draft.inboundAgentLocks, countHuman);
+    return;
+  }
+  const child = draft.pendingChildDispatches.get(dispatchId);
+  if (child) {
+    const { activeAttemptId: _cleared, ...rest } = child;
+    draft.pendingChildDispatches.set(dispatchId, { ...rest, settled: true });
+  }
+}
+
+function resolveBaselineConfirmedSnapshot(
+  currentThread: PeerThreadState | undefined,
+  removedMsg: PersistedPeerEnvelope,
+): BasePeerThreadSnapshot | undefined {
+  return cloneBaseThreadSnapshot(
+    currentThread?.confirmedSnapshot ?? removedMsg.inboundThread?.confirmedSnapshot,
+  );
+}
+
+function reconcileThreadAfterUnsentRemoval(
+  draft: PeerRuntimeMaps,
+  removedMsg: PersistedPeerEnvelope,
+): void {
+  const { correlationId } = removedMsg;
+  const currentThread = draft.threads.get(correlationId);
+  const confirmedSnapshot = resolveBaselineConfirmedSnapshot(currentThread, removedMsg);
+  let topUnsettled: PersistedPeerEnvelope | undefined;
+  const unsettledReplied = new Set<number>(confirmedSnapshot?.repliedHops ?? []);
+  for (const candidate of draft.byMessageId.values()) {
+    if (candidate.settled || candidate.correlationId !== correlationId) continue;
+    if (candidate.intent === "reply" && candidate.hop > 1) {
+      unsettledReplied.add(candidate.hop - 1);
+    }
+    if (!topUnsettled || candidate.hop > topUnsettled.hop) {
+      topUnsettled = candidate;
+    }
+  }
+  if (topUnsettled) {
+    draft.threads.set(correlationId, {
+      correlationId,
+      maxHops: topUnsettled.maxHops,
+      hop: topUnsettled.hop,
+      expectReply: topUnsettled.expectReply,
+      lastSourceWorkspaceId: topUnsettled.sourceWorkspaceId,
+      lastSourceAgentId: topUnsettled.agentId,
+      lastTargetWorkspaceId: topUnsettled.targetWorkspaceId,
+      lastTargetAgentId: topUnsettled.recipientAgentId,
+      repliedHops: unsettledReplied,
+      admitted: Boolean(confirmedSnapshot?.admitted),
+      ...(confirmedSnapshot ? { confirmedSnapshot } : {}),
+    });
+    return;
+  }
+  if (confirmedSnapshot) {
+    draft.threads.set(correlationId, {
+      ...deserializeBasePeerThread(confirmedSnapshot),
+      confirmedSnapshot,
+    });
+    return;
+  }
+  draft.threads.delete(correlationId);
+}
+
+function cleanupUnsentPeerDispatchInDraft(
+  draft: PeerRuntimeMaps,
+  dispatchId: string,
+  kind: PeerDispatchEndpointContext["kind"],
+): void {
+  if (kind === "peer-child") {
+    revokeGrantsByDispatchId(draft.lockedChildren, dispatchId, "initial");
+    draft.pendingChildDispatches.delete(dispatchId);
+    return;
+  }
+  revokeGrantsByDispatchId(draft.inboundAgentLocks, dispatchId);
+  const msg = draft.byMessageId.get(dispatchId);
+  if (!msg) return;
+  draft.byMessageId.delete(dispatchId);
+  reconcileThreadAfterUnsentRemoval(draft, msg);
+}
+
+function revokeAttemptGrantForKind(
+  draft: PeerRuntimeMaps,
+  kind: PeerDispatchEndpointContext["kind"],
+  attemptId: string | undefined,
+): void {
+  if (kind === "peer-child") {
+    revokeGrantByAttemptId(draft.lockedChildren, attemptId, "initial");
+  } else {
+    revokeGrantByAttemptId(draft.inboundAgentLocks, attemptId);
+  }
+}
+
+function clearActiveAttemptOnReturn(
+  draft: PeerRuntimeMaps,
+  dispatchId: string,
+  context: PeerDispatchEndpointContext,
+): void {
+  if (!context.attemptId) return;
+  if (context.kind === "peer-child") {
+    const child = draft.pendingChildDispatches.get(dispatchId);
+    if (child && child.activeAttemptId === context.attemptId) {
+      const { activeAttemptId: _cleared, ...rest } = child;
+      draft.pendingChildDispatches.set(dispatchId, rest);
+    }
+    return;
+  }
+  const msg = draft.byMessageId.get(dispatchId);
+  if (msg && msg.activeAttemptId === context.attemptId) {
+    const { activeAttemptId: _cleared, ...rest } = msg;
+    draft.byMessageId.set(dispatchId, rest);
+  }
+}
+
+function isSupersededNonAcceptedAttempt(
+  record: { settled?: boolean; activeAttemptId?: string },
+  context: PeerDispatchEndpointContext,
+): boolean {
+  if (record.settled) return true;
+  return Boolean(
+    record.activeAttemptId &&
+    context.attemptId !== undefined &&
+    context.attemptId !== record.activeAttemptId,
+  );
+}
+
+function revokeNonAcceptedGrantInDraft(
+  draft: PeerRuntimeMaps,
+  dispatchId: string,
+  outcome: "returned_to_queue" | "retained_for_restart",
+  context: PeerDispatchEndpointContext,
+): void {
+  if (outcome === "returned_to_queue") {
+    clearActiveAttemptOnReturn(draft, dispatchId, context);
+    revokeAttemptGrantForKind(draft, context.kind, context.attemptId);
+    return;
+  }
+  if (context.kind === "peer-child") {
+    revokeGrantsByDispatchId(draft.lockedChildren, dispatchId, "initial");
+  } else {
+    revokeGrantsByDispatchId(draft.inboundAgentLocks, dispatchId);
+  }
+}
+
+function applySinglePeerOutcomeInDraft(
+  draft: PeerRuntimeMaps,
+  dispatchId: string,
+  outcome: PeerDispatchTerminalOutcome,
+  context: PeerDispatchEndpointContext,
+  countHuman: (agentId: string) => number,
+): void {
+  if (!matchesRecordedOutcomeContext(draft, dispatchId, context)) return;
+  if (outcome === "accepted" || outcome === "outcome_unknown") {
+    settleAcceptedPeerDispatchInDraft(draft, dispatchId, context.kind, countHuman);
+    return;
+  }
+  const targetRecord =
+    context.kind === "peer-child"
+      ? draft.pendingChildDispatches.get(dispatchId)
+      : draft.byMessageId.get(dispatchId);
+  if (!targetRecord) return;
+  if (isSupersededNonAcceptedAttempt(targetRecord, context)) {
+    revokeAttemptGrantForKind(draft, context.kind, context.attemptId);
+    return;
+  }
+  if (outcome === "returned_to_queue" || outcome === "retained_for_restart") {
+    revokeNonAcceptedGrantInDraft(draft, dispatchId, outcome, context);
+    return;
+  }
+  cleanupUnsentPeerDispatchInDraft(draft, dispatchId, context.kind);
+}
+
+function serializeGrantMap(
+  lockMap: Map<string, Map<string, PeerLockGrant>>,
+): Array<[string, PeerLockGrant[]]> {
+  return Array.from(lockMap.entries(), ([agentId, grants]) => [agentId, [...grants.values()]]);
+}
+
+function hydrateGrantEntries(
+  target: Map<string, Map<string, PeerLockGrant>>,
+  entries: z.infer<typeof persistedAgentGrantsTupleSchema>[] | undefined,
+  defaultGrantId: string,
+): void {
+  for (const [agentId, rawGrants] of entries ?? []) {
+    if (target.has(agentId)) continue;
+    const grants = new Map<string, PeerLockGrant>();
+    if (Array.isArray(rawGrants)) {
+      for (const grant of rawGrants) grants.set(grant.grantId, grant);
+    } else {
+      grants.set(defaultGrantId, { grantId: defaultGrantId, ...rawGrants });
+    }
+    if (grants.size > 0) target.set(agentId, grants);
+  }
+}
+
+function invalidatePeerRuntimeCache(runtime: PeerWorkspaceRuntime): void {
+  runtime.loadedFromDisk = false;
+  runtime.loadPromise = null;
+  runtime.threads.clear();
+  runtime.byMessageId.clear();
+  runtime.inboundAgentLocks.clear();
+  runtime.lockedChildren.clear();
+  runtime.pendingChildDispatches.clear();
+}
+
+function hydratePersistedPeerState(
+  runtime: PeerWorkspaceRuntime,
+  parsed: z.infer<typeof persistedPeerStateFileSchema>,
+): void {
+  hydrateGrantEntries(runtime.inboundAgentLocks, parsed.inboundAgentLocks, "legacy");
+  hydrateGrantEntries(runtime.lockedChildren, parsed.lockedChildren, "initial");
+  for (const [msgId, rawSource] of parsed.messages ?? []) {
+    const validRecord =
+      rawSource.kind === "peer-workspace-message" &&
+      typeof rawSource.recipientAgentId === "string" &&
+      rawSource.recipientAgentId.length > 0;
+    if (validRecord && !runtime.byMessageId.has(msgId)) {
+      setPeerDeliveryRecordWithUndo(runtime.byMessageId, runtime.inboundAgentLocks, msgId, {
+        ...(rawSource as PersistedPeerEnvelope),
+        dispatchId: typeof rawSource.dispatchId === "string" ? rawSource.dispatchId : msgId,
+      });
+    }
+  }
+  for (const childDispatch of parsed.pendingChildDispatches ?? []) {
+    if (!runtime.pendingChildDispatches.has(childDispatch.dispatchId)) {
+      setBoundedMapEntryWithUndo(
+        runtime.pendingChildDispatches,
+        childDispatch.dispatchId,
+        childDispatch,
+        MAX_TRACKED_PEER_MESSAGES,
+        (_k, entry) => entry.settled === true,
+      );
+    }
+  }
+  for (const rawThread of parsed.threads ?? []) {
+    if (runtime.threads.has(rawThread.correlationId)) continue;
+    const hydrated = deserializePeerThread(rawThread);
+    if (
+      rawThread.hasConfirmedHop === undefined &&
+      !hydrated.confirmedSnapshot &&
+      !hasUnsettledDispatchForThread(rawThread.correlationId, runtime)
+    ) {
+      hydrated.confirmedSnapshot = toBasePeerThreadSnapshot(hydrated);
+    }
+    runtime.threads.set(rawThread.correlationId, hydrated);
+  }
+}
+
+async function readPendingOutcomesJournal(paseoHome: string): Promise<PendingPeerOutcomeRecord[]> {
+  const journalPath = join(paseoHome, "agents", "peer-workspace-pending-outcomes.json");
+  try {
+    const raw = await readFile(journalPath, "utf8");
+    return z.array(pendingPeerOutcomeRecordSchema).parse(JSON.parse(raw));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function writePendingOutcomesJournal(
+  paseoHome: string | undefined,
+  pendingOutcomes: ReadonlyMap<string, PendingPeerOutcomeRecord>,
+): Promise<void> {
+  if (!paseoHome || pendingOutcomes.size === 0) return;
+  const agentsDir = join(paseoHome, "agents");
+  const journalPath = join(agentsDir, "peer-workspace-pending-outcomes.json");
+  await mkdir(agentsDir, { recursive: true });
+  const tmpPath = `${journalPath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  await writeFile(tmpPath, JSON.stringify([...pendingOutcomes.values()]), { mode: 0o600 });
+  await rename(tmpPath, journalPath);
+}
+
+async function clearPendingOutcomesJournal(paseoHome: string | undefined): Promise<void> {
+  if (!paseoHome) return;
+  const journalPath = join(paseoHome, "agents", "peer-workspace-pending-outcomes.json");
+  await unlink(journalPath).catch((error: NodeJS.ErrnoException) => {
+    if (error?.code !== "ENOENT") throw error;
+  });
+}
+
+function replayPendingOutcomesIntoRuntime(runtime: PeerWorkspaceRuntime): void {
+  for (const entry of runtime.pendingOutcomes.values()) {
+    applySinglePeerOutcomeInDraft(runtime, entry.dispatchId, entry.outcome, entry.context, () => 0);
+  }
+}
+
+function ensurePeerRuntimeLoaded(runtime: PeerWorkspaceRuntime): Promise<void> {
+  if (runtime.loadedFromDisk || !runtime.paseoHome) return Promise.resolve();
+  if (runtime.loadPromise) return runtime.loadPromise;
+  const home = runtime.paseoHome;
+  runtime.loadPromise = (async () => {
+    await resolvePeerTransportSecret(home);
+    const statePath = join(home, "agents", "peer-workspace-state.json");
+    let rawText: string | undefined;
+    try {
+      rawText = await readFile(statePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+    }
+    if (rawText !== undefined) {
+      const parsed = persistedPeerStateFileSchema.parse(JSON.parse(rawText));
+      hydratePersistedPeerState(runtime, parsed);
+    }
+    const journalEntries = await readPendingOutcomesJournal(home);
+    for (const entry of journalEntries) {
+      if (!runtime.pendingOutcomes.has(entry.outcomeKey)) {
+        runtime.pendingOutcomes.set(entry.outcomeKey, entry);
+      }
+    }
+    if (runtime.pendingOutcomes.size > 0) {
+      replayPendingOutcomesIntoRuntime(runtime);
+      try {
+        await writePeerStateMapsToDisk(home, runtime);
+        for (const entry of journalEntries) {
+          if (runtime.pendingOutcomes.get(entry.outcomeKey) === entry) {
+            runtime.pendingOutcomes.delete(entry.outcomeKey);
+          }
+        }
+        if (runtime.pendingOutcomes.size === 0) {
+          await clearPendingOutcomesJournal(home).catch(() => undefined);
+        }
+      } catch {
+        // Keep pendingOutcomes in memory + journal for retry on next write.
+      }
+    }
+    runtime.loadedFromDisk = true;
+  })().catch((error) => {
+    runtime.loadPromise = null;
+    throw error;
+  });
+  return runtime.loadPromise;
+}
+
+async function writePeerStateMapsToDisk(
+  paseoHome: string | undefined,
+  state: PeerRuntimeMaps,
+): Promise<void> {
+  if (!paseoHome) return;
+  const agentsDir = join(paseoHome, "agents");
+  const statePath = join(agentsDir, "peer-workspace-state.json");
+  const payload = {
+    threads: Array.from(state.threads.values(), serializePeerThread),
+    messages: [...state.byMessageId.entries()],
+    inboundAgentLocks: serializeGrantMap(state.inboundAgentLocks),
+    lockedChildren: serializeGrantMap(state.lockedChildren),
+    pendingChildDispatches: [...state.pendingChildDispatches.values()],
+  };
+  await mkdir(agentsDir, { recursive: true });
+  const tmpPath = `${statePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  await writeFile(tmpPath, JSON.stringify(payload), { mode: 0o600 });
+  await rename(tmpPath, statePath);
+}
+
+function finalizeFlushedPendingOutcomes(
+  runtime: PeerWorkspaceRuntime,
+  flushed: ReadonlyArray<PendingPeerOutcomeRecord>,
+): void {
+  if (flushed.length === 0) return;
+  for (const entry of flushed) {
+    if (runtime.pendingOutcomes.get(entry.outcomeKey) === entry) {
+      runtime.pendingOutcomes.delete(entry.outcomeKey);
+    }
+    if (entry.outcome !== "returned_to_queue") {
+      releasePromptDispatchVerifier(entry.dispatchId);
+    }
+  }
+  if (runtime.pendingOutcomes.size === 0) {
+    void clearPendingOutcomesJournal(runtime.paseoHome).catch(() => undefined);
+  }
+}
+
+async function commitPeerStateTransaction<T>(
+  runtime: PeerWorkspaceRuntime,
+  mutator: (draft: PeerRuntimeMaps) => T | Promise<T>,
+  countHuman: (agentId: string) => number = () => 0,
+): Promise<T> {
+  const pendingSnapshot = [...runtime.pendingOutcomes.values()];
+  const draft = clonePeerRuntimeMaps(runtime);
+  for (const entry of pendingSnapshot) {
+    applySinglePeerOutcomeInDraft(
+      draft,
+      entry.dispatchId,
+      entry.outcome,
+      entry.context,
+      countHuman,
+    );
+  }
+  const result = await mutator(draft);
+  await writePeerStateMapsToDisk(runtime.paseoHome, draft);
+  applyPeerRuntimeMaps(runtime, draft);
+  finalizeFlushedPendingOutcomes(runtime, pendingSnapshot);
+  return result;
+}
+
+async function withPeerStateMutex<T>(
+  runtime: PeerWorkspaceRuntime,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = runtime.stateMutex;
+  let releaseMutex!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseMutex = resolve;
+  });
+  runtime.stateMutex = previous.then(() => gate);
+  await previous;
+  try {
+    await ensurePeerRuntimeLoaded(runtime);
+    return await operation();
+  } finally {
+    releaseMutex();
+  }
+}
+
+const peerRuntimeByManager = new WeakMap<object, PeerWorkspaceRuntime>();
+
+function getPeerWorkspaceRuntime(key: object, paseoHome?: string): PeerWorkspaceRuntime {
+  let runtime = peerRuntimeByManager.get(key);
+  if (!runtime) {
+    runtime = {
+      paseoHome,
+      loadPromise: null,
+      loadedFromDisk: false,
+      stateMutex: Promise.resolve(),
+      threads: new Map(),
+      byMessageId: new Map(),
+      inboundAgentLocks: new Map(),
+      lockedChildren: new Map(),
+      pendingChildDispatches: new Map(),
+      pairWindows: new Map(),
+      pendingOutcomes: new Map(),
+    };
+    peerRuntimeByManager.set(key, runtime);
+  } else if (paseoHome && !runtime.paseoHome) {
+    runtime.paseoHome = paseoHome;
+  }
+  return runtime;
+}
+
 export function createPaseoToolCatalog(options: PaseoToolHostDependencies): PaseoToolCatalog {
   return createToolCatalog(options, options.callerAgentId ? "agent" : "top-level");
 }
@@ -724,6 +1886,8 @@ function createToolCatalog(
   const childLogger = logger.child({ module: "agent", component: "paseo-tool-catalog" });
   const callerContext = callerAgentId ? (resolveCallerContext?.(callerAgentId) ?? null) : null;
   const taskLedger = openTaskLedger(options);
+  const peerRuntime = getPeerWorkspaceRuntime(agentManager, options.paseoHome);
+  void ensurePeerRuntimeLoaded(peerRuntime);
 
   const parseToolInput = async (tool: PaseoToolDefinition, input: unknown): Promise<unknown> => {
     const inputSchema = tool.inputSchema;
@@ -874,6 +2038,7 @@ function createToolCatalog(
       .object({
         snapshot: z.object({
           id: z.string(),
+          workspaceId: z.string().nullish(),
           labels: z.record(z.string(), z.string()),
           archivedAt: z.string().nullish(),
         }),
@@ -902,20 +2067,629 @@ function createToolCatalog(
     }
   }
 
+  function isLocalHumanTimelineMessage(text: string): boolean {
+    if (isSystemInjectedEnvelope(text) || isPeerInspectionBoundaryPromptText(text)) return false;
+    const parsed = parseAgentMessages(text);
+    return !parsed || parsed.some((entry) => entry.source === null);
+  }
+
+  function safeGetAgentTimeline(agentId: string): ReturnType<AgentManager["getTimeline"]> {
+    if (typeof agentManager.getTimeline !== "function" || !agentManager.getAgent(agentId)) {
+      return [];
+    }
+    try {
+      return agentManager.getTimeline(agentId);
+    } catch {
+      return [];
+    }
+  }
+
+  function countLocalHumanMessages(agentId: string): number {
+    let count = 0;
+    for (const item of safeGetAgentTimeline(agentId)) {
+      if (item?.type === "user_message" && isLocalHumanTimelineMessage(item.text)) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  async function pruneArchivedGrantMap(
+    lockMap: Map<string, Map<string, PeerLockGrant>>,
+  ): Promise<void> {
+    if (lockMap.size <= 256) return;
+    for (const agentId of lockMap.keys()) {
+      const live = agentManager.getAgent(agentId);
+      if (live) continue;
+      const stored = await agentStorage.get(agentId);
+      if (!stored || stored.archivedAt) {
+        lockMap.delete(agentId);
+      }
+    }
+  }
+
+  async function recordPeerLockedChild(
+    childAgentId: string,
+    correlationId: string,
+    grantId = "initial",
+    dispatchId?: string,
+  ): Promise<void> {
+    const humanCount = countLocalHumanMessages(childAgentId);
+    await withPeerStateMutex(peerRuntime, () =>
+      commitPeerStateTransaction(
+        peerRuntime,
+        async (draft) => {
+          if (dispatchId) {
+            const activeChild = draft.pendingChildDispatches.get(dispatchId);
+            if (
+              !activeChild ||
+              activeChild.settled ||
+              activeChild.recipientAgentId !== childAgentId
+            ) {
+              throw new PaseoToolInputError(
+                `Peer child prompt ${dispatchId} was withdrawn or settled before dispatch lock commit.`,
+              );
+            }
+            draft.pendingChildDispatches.set(dispatchId, {
+              ...activeChild,
+              activeAttemptId: grantId,
+            });
+          }
+          await pruneArchivedGrantMap(draft.lockedChildren);
+          grantAgentPeerLockWithUndo(
+            draft.lockedChildren,
+            childAgentId,
+            {
+              grantId,
+              ...(dispatchId ? { dispatchId } : {}),
+              correlationId,
+              lockedHumanCount: humanCount,
+            },
+            humanCount,
+            "initial",
+          );
+        },
+        countLocalHumanMessages,
+      ),
+    );
+  }
+
+  async function recordPeerInboundAgentLock(
+    recipientAgentId: string,
+    attemptId: string,
+    dispatchId: string,
+    correlationId: string,
+  ): Promise<void> {
+    const humanCount = countLocalHumanMessages(recipientAgentId);
+    await withPeerStateMutex(peerRuntime, () =>
+      commitPeerStateTransaction(
+        peerRuntime,
+        async (draft) => {
+          const activeMessage = draft.byMessageId.get(dispatchId);
+          if (
+            !activeMessage ||
+            activeMessage.settled ||
+            activeMessage.recipientAgentId !== recipientAgentId
+          ) {
+            throw new PaseoToolInputError(
+              `Peer message ${dispatchId} was withdrawn or settled before dispatch lock commit.`,
+            );
+          }
+          draft.byMessageId.set(dispatchId, {
+            ...activeMessage,
+            activeAttemptId: attemptId,
+          });
+          await pruneArchivedGrantMap(draft.inboundAgentLocks);
+          grantAgentPeerLockWithUndo(
+            draft.inboundAgentLocks,
+            recipientAgentId,
+            {
+              grantId: attemptId,
+              dispatchId,
+              correlationId,
+              lockedHumanCount: humanCount,
+            },
+            humanCount,
+          );
+        },
+        countLocalHumanMessages,
+      ),
+    );
+  }
+
+  async function flushPendingPeerOutcomesUnlocked(): Promise<void> {
+    if (peerRuntime.pendingOutcomes.size === 0) return;
+    await commitPeerStateTransaction(peerRuntime, () => undefined, countLocalHumanMessages);
+  }
+
+  function queuePendingOutcomeRecord(
+    dispatchId: string,
+    outcome: PeerDispatchTerminalOutcome,
+    context: PeerDispatchEndpointContext,
+  ): void {
+    const outcomeKey = context.attemptId
+      ? `${dispatchId}::${outcome}::${context.attemptId}`
+      : `${dispatchId}::${outcome}`;
+    if (peerRuntime.pendingOutcomes.has(outcomeKey)) {
+      peerRuntime.pendingOutcomes.delete(outcomeKey);
+    }
+    peerRuntime.pendingOutcomes.set(outcomeKey, {
+      outcomeKey,
+      dispatchId,
+      outcome,
+      context,
+    });
+  }
+
+  async function flushPendingOutcomesOnShutdown(): Promise<void> {
+    if (peerRuntime.pendingOutcomes.size === 0) return;
+    await withPeerStateMutex(peerRuntime, async () => {
+      if (peerRuntime.pendingOutcomes.size === 0) return;
+      try {
+        await flushPendingPeerOutcomesUnlocked();
+      } catch (stateErr) {
+        try {
+          await writePendingOutcomesJournal(peerRuntime.paseoHome, peerRuntime.pendingOutcomes);
+        } catch (journalErr) {
+          childLogger.error(
+            { err: journalErr, stateErr, pendingCount: peerRuntime.pendingOutcomes.size },
+            "Failed to persist peer outcomes to both state file and fallback journal during shutdown; outcomes remain in memory only",
+          );
+          throw new Error("Failed to persist pending peer dispatch outcomes during shutdown", {
+            cause: journalErr,
+          });
+        }
+        for (const entry of peerRuntime.pendingOutcomes.values()) {
+          if (entry.outcome !== "returned_to_queue") {
+            releasePromptDispatchVerifier(entry.dispatchId);
+          }
+        }
+        childLogger.warn(
+          { err: stateErr, pendingCount: peerRuntime.pendingOutcomes.size },
+          "Failed to flush peer state file during shutdown; persisted pending outcomes journal",
+        );
+      }
+    });
+  }
+
+  function handlePeerDispatchOutcome(
+    dispatchId: string,
+    outcome: PeerDispatchTerminalOutcome,
+    context: PeerDispatchEndpointContext,
+  ): Promise<void> {
+    return withPeerStateMutex(peerRuntime, async () => {
+      queuePendingOutcomeRecord(dispatchId, outcome, context);
+      try {
+        await flushPendingPeerOutcomesUnlocked();
+      } catch (stateErr) {
+        try {
+          await writePendingOutcomesJournal(peerRuntime.paseoHome, peerRuntime.pendingOutcomes);
+          childLogger.warn(
+            { err: stateErr, dispatchId, outcome },
+            "Failed to update peer state file; persisted outcome in fallback journal for retry",
+          );
+        } catch (journalErr) {
+          childLogger.error(
+            { err: journalErr, stateErr, dispatchId, outcome },
+            "Failed to persist peer dispatch outcome to both state file and fallback journal; retained in memory only",
+          );
+        }
+        throw stateErr;
+      }
+    });
+  }
+
+  function hasEnforcedAdapterReadOnlyOptions(
+    adapter: string | null | undefined,
+    providerOptions: Record<string, unknown> | null | undefined,
+    effectiveMode: string | null | undefined,
+  ): boolean {
+    if (isPeerExplicitModeDisallowed(effectiveMode)) return false;
+    switch (adapter) {
+      case "codex":
+        return providerOptions?.sandbox_mode === "read-only";
+      case "claude":
+        return Array.isArray(providerOptions?.disallowedTools);
+      case "opencode": {
+        const perm = providerOptions?.permission as Record<string, unknown> | undefined;
+        return perm?.edit === "deny" && perm?.write === "deny" && perm?.bash === "deny";
+      }
+      case "pi":
+        return providerOptions?.mainControlReadOnly === true;
+      default:
+        return effectiveMode === "read-only" || effectiveMode === "plan";
+    }
+  }
+
+  function resolveSubagentAdapter(providerId: string | undefined): string | undefined {
+    if (!providerId) return undefined;
+    return typeof agentManager.adapterOf === "function"
+      ? agentManager.adapterOf(providerId)
+      : providerId;
+  }
+
+  async function readSubagentEffectiveState(targetAgentId: string) {
+    const live = agentManager.getAgent(targetAgentId);
+    const stored = await agentStorage.get(targetAgentId);
+    const providerId = live ? live.provider : stored?.provider;
+    const liveConfig = live?.config;
+    const storedConfig = stored?.config;
+    return {
+      labels: live ? live.labels : stored?.labels,
+      providerId,
+      adapter: resolveSubagentAdapter(providerId),
+      effectiveMode:
+        live?.currentModeId ?? stored?.lastModeId ?? liveConfig?.modeId ?? storedConfig?.modeId,
+      providerOptions: (liveConfig?.providerOptions ?? storedConfig?.providerOptions) as
+        | Record<string, unknown>
+        | undefined,
+    };
+  }
+
+  async function assertEnforcedPeerReadOnlySubagent(targetAgentId: string): Promise<void> {
+    if (!peerRuntime.lockedChildren.has(targetAgentId)) {
+      throw new PaseoToolInputError(
+        'Cross-workspace peer messages are read-only (A0 READ) and cannot prompt pre-existing subagents; spawn a dedicated playbook "readonly_cr" inspector instead.',
+      );
+    }
+    const state = await readSubagentEffectiveState(targetAgentId);
+    if (!state.providerId || getLeadPlaybookFromLabels(state.labels) !== "readonly_cr") {
+      throw new PaseoToolInputError(
+        'Cross-workspace peer messages are read-only (A0 READ) and require target subagents to keep playbook "readonly_cr".',
+      );
+    }
+    if (
+      !hasEnforcedAdapterReadOnlyOptions(state.adapter, state.providerOptions, state.effectiveMode)
+    ) {
+      throw new PaseoToolInputError(
+        "Cross-workspace peer messages are read-only (A0 READ) and require the target subagent to remain in enforced read-only configuration.",
+      );
+    }
+  }
+
+  function hasPendingAcceptedOutcome(
+    dispatchId: string,
+    kind: PeerDispatchEndpointContext["kind"],
+    agentId: string,
+  ): boolean {
+    for (const entry of peerRuntime.pendingOutcomes.values()) {
+      if (
+        entry.dispatchId === dispatchId &&
+        entry.context.kind === kind &&
+        entry.context.recipientId === agentId &&
+        (entry.outcome === "accepted" || entry.outcome === "outcome_unknown")
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function isPeerWorkspaceDispatchUnsentInPending(dispatchId: string, agentId: string): boolean {
+    const recorded = peerRuntime.byMessageId.get(dispatchId);
+    if (recorded?.settled || hasPendingAcceptedOutcome(dispatchId, "peer-workspace", agentId)) {
+      return false;
+    }
+    for (const pending of peerRuntime.pendingOutcomes.values()) {
+      if (
+        pending.dispatchId !== dispatchId ||
+        pending.outcome !== "definitively_unsent" ||
+        pending.context.kind !== "peer-workspace" ||
+        pending.context.recipientId !== agentId
+      ) {
+        continue;
+      }
+      if (
+        recorded?.activeAttemptId &&
+        pending.context.attemptId !== undefined &&
+        pending.context.attemptId !== recorded.activeAttemptId
+      ) {
+        continue;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  function extractProjectedPeerLockId(agentId: string, callId: string): string | undefined {
+    const parsedCall = parseProjectedPeerCallId(callId);
+    if (!parsedCall) return undefined;
+    if (isPeerWorkspaceDispatchUnsentInPending(parsedCall.messageId, agentId)) return undefined;
+    const recorded = peerRuntime.byMessageId.get(parsedCall.messageId);
+    if (!recorded || recorded.recipientAgentId !== agentId) return undefined;
+    if (
+      recorded.intent !== parsedCall.intent ||
+      recorded.correlationId !== parsedCall.correlationId
+    ) {
+      return undefined;
+    }
+    return recorded.correlationId;
+  }
+
+  function verifyRecordedUserPeerEntry(
+    agentId: string,
+    dispatchKey: string,
+    source: Extract<AgentPromptSource, { kind: "peer-workspace-message" }>,
+  ): string | undefined {
+    if (isPeerWorkspaceDispatchUnsentInPending(dispatchKey, agentId)) return undefined;
+    const recorded = peerRuntime.byMessageId.get(dispatchKey);
+    if (!recorded || recorded.recipientAgentId !== agentId) return undefined;
+    const sameSender =
+      recorded.agentId === source.agentId &&
+      (recorded.serverId ?? undefined) === (source.serverId ?? undefined);
+    const sameThread =
+      recorded.correlationId === source.correlationId && recorded.intent === source.intent;
+    if (!sameSender || !sameThread) return undefined;
+    return recorded.correlationId;
+  }
+
+  function collectUnprojectedUserPeerIds(
+    agentId: string,
+    text: string,
+    correlationIds: Set<string>,
+  ): "stop" | "continue" {
+    if (isSystemInjectedEnvelope(text) || isPeerInspectionBoundaryPromptText(text)) {
+      return "continue";
+    }
+    const parsed = parseAgentMessages(text);
+    if (!parsed) return "stop";
+    for (const entry of parsed) {
+      if (entry.source?.kind === "peer-workspace-message") {
+        const verified = verifyRecordedUserPeerEntry(
+          agentId,
+          entry.source.dispatchId ?? entry.id,
+          entry.source,
+        );
+        if (verified) correlationIds.add(verified);
+      }
+    }
+    return parsed.some((entry) => entry.source === null) ? "stop" : "continue";
+  }
+
+  function isRevokingOutcome(outcome: PeerDispatchTerminalOutcome): boolean {
+    return (
+      outcome === "returned_to_queue" ||
+      outcome === "definitively_unsent" ||
+      outcome === "retained_for_restart"
+    );
+  }
+
+  function isDispatchSettledForKind(
+    dispatchId: string,
+    kind: PeerDispatchEndpointContext["kind"],
+    agentId: string,
+  ): boolean {
+    const rec =
+      kind === "peer-child"
+        ? peerRuntime.pendingChildDispatches.get(dispatchId)
+        : peerRuntime.byMessageId.get(dispatchId);
+    return Boolean(rec?.settled) || hasPendingAcceptedOutcome(dispatchId, kind, agentId);
+  }
+
+  function isGrantRevokedByPendingOutcome(
+    grant: PeerLockGrant,
+    agentId: string,
+    kind: PeerDispatchEndpointContext["kind"],
+  ): boolean {
+    const dispatchKey = grant.dispatchId ?? (grant.grantId !== "initial" ? grant.grantId : "");
+    if (dispatchKey && isDispatchSettledForKind(dispatchKey, kind, agentId)) {
+      return false;
+    }
+    for (const entry of peerRuntime.pendingOutcomes.values()) {
+      if (entry.context.kind !== kind || entry.context.recipientId !== agentId) continue;
+      if (!isRevokingOutcome(entry.outcome)) continue;
+      if (entry.context.attemptId === grant.grantId) return true;
+      if (
+        dispatchKey &&
+        entry.dispatchId === dispatchKey &&
+        entry.context.attemptId === undefined &&
+        entry.outcome !== "returned_to_queue"
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function collectActiveGrantCorrelationIds(
+    grants: ReadonlyMap<string, PeerLockGrant> | undefined,
+    agentId: string,
+    kind: PeerDispatchEndpointContext["kind"],
+    humanCount: number,
+    correlationIds: Set<string>,
+  ): void {
+    if (!grants) return;
+    for (const grant of grants.values()) {
+      if (
+        humanCount <= grant.lockedHumanCount &&
+        !isGrantRevokedByPendingOutcome(grant, agentId, kind)
+      ) {
+        correlationIds.add(grant.correlationId);
+      }
+    }
+  }
+
+  function getActivePeerTurnCorrelationIdsForAgent(agentId: string): ReadonlySet<string> {
+    const correlationIds = new Set<string>();
+    const humanCount = countLocalHumanMessages(agentId);
+    collectActiveGrantCorrelationIds(
+      peerRuntime.lockedChildren.get(agentId),
+      agentId,
+      "peer-child",
+      humanCount,
+      correlationIds,
+    );
+    collectActiveGrantCorrelationIds(
+      peerRuntime.inboundAgentLocks.get(agentId),
+      agentId,
+      "peer-workspace",
+      humanCount,
+      correlationIds,
+    );
+    const timeline = safeGetAgentTimeline(agentId);
+    for (let index = timeline.length - 1; index >= 0; index -= 1) {
+      const item = timeline[index];
+      if (!item) continue;
+      if (item.type === "tool_call") {
+        const correlationId = extractProjectedPeerLockId(agentId, item.callId);
+        if (correlationId) correlationIds.add(correlationId);
+        continue;
+      }
+      if (item.type === "user_message") {
+        if (collectUnprojectedUserPeerIds(agentId, item.text, correlationIds) === "stop") break;
+      }
+    }
+    return correlationIds;
+  }
+
+  function getActivePeerTurnContext(
+    agentId: string,
+    path?: ReadonlyMap<string, HierarchyAgent>,
+  ): { correlationIds: ReadonlySet<string> } | null {
+    const candidateIds = path ? [...path.keys()] : [agentId];
+    const correlationIds = new Set<string>();
+    for (const id of candidateIds) {
+      for (const correlationId of getActivePeerTurnCorrelationIdsForAgent(id)) {
+        correlationIds.add(correlationId);
+      }
+    }
+    return correlationIds.size > 0 ? { correlationIds } : null;
+  }
+
+  function assertPeerTurnCreateModeAndFeatures(args: Record<string, unknown> | undefined): void {
+    const settings =
+      args?.settings && typeof args.settings === "object"
+        ? (args.settings as Record<string, unknown>)
+        : undefined;
+    const invalid =
+      isPeerExplicitModeDisallowed(settings?.modeId) ||
+      isPeerExplicitModeDisallowed(args?.mode) ||
+      hasPeerDisallowedProviderOptions(settings?.features) ||
+      hasPeerDisallowedProviderOptions(args?.features);
+    if (invalid) {
+      throw new PaseoToolInputError(
+        "Cross-workspace peer messages are read-only (A0 READ) and cannot launch subagents in write-capable modes.",
+      );
+    }
+  }
+
+  function assertPeerTurnCreateAgent(args: Record<string, unknown> | undefined): void {
+    if (args?.taskBinding !== undefined) {
+      throw new PaseoToolInputError(
+        "Cross-workspace peer messages are read-only (A0 READ) and cannot mutate the workspace task ledger via taskBinding.",
+      );
+    }
+    const playbook = args?.playbook;
+    if (playbook !== "readonly_cr") {
+      throw new PaseoToolInputError(
+        'Cross-workspace peer messages are read-only (A0 READ) and may only spawn inspection subagents with playbook "readonly_cr".',
+      );
+    }
+    if (args?.resident || args?.residentRole) {
+      throw new PaseoToolInputError(
+        "Cross-workspace peer messages are read-only (A0 READ) and cannot register resident specialists.",
+      );
+    }
+    if (args?.commitPolicy === "scoped_only") {
+      throw new PaseoToolInputError(
+        'Cross-workspace peer messages are read-only (A0 READ) and cannot authorize commitPolicy "scoped_only".',
+      );
+    }
+    assertPeerTurnCreateModeAndFeatures(args);
+  }
+
+  function assertPeerTurnSendPrompt(args: Record<string, unknown> | undefined): void {
+    if (args?.taskBinding !== undefined || isPeerExplicitModeDisallowed(args?.sessionMode)) {
+      throw new PaseoToolInputError(
+        "Cross-workspace peer messages are read-only (A0 READ) and cannot elevate subagent mode or mutate the task ledger.",
+      );
+    }
+  }
+
+  function assertPeerTurnReply(
+    args: Record<string, unknown> | undefined,
+    depth: number,
+    correlationIds: ReadonlySet<string>,
+  ): void {
+    const correlationId = typeof args?.correlationId === "string" ? args.correlationId.trim() : "";
+    if (depth === 0 && args?.intent === "reply" && correlationIds.has(correlationId)) return;
+    throw new PaseoToolInputError(
+      'Cross-workspace peer turns are read-only (A0 READ) and may only reply to the active inbound correlationId (cannot chain new "query" or "align" requests).',
+    );
+  }
+
+  async function assertPeerTurnToolAllowed(
+    name: string,
+    args: { agentId?: string } & Record<string, unknown>,
+    caller: HierarchyAgent | undefined,
+    depth: number,
+    path: ReadonlyMap<string, HierarchyAgent>,
+  ): Promise<void> {
+    if (!callerAgentId || PEER_READ_ONLY_TOOLS.has(name)) return;
+    const peerTurn = getActivePeerTurnContext(callerAgentId, path);
+    if (!peerTurn) return;
+    if (name === "send_peer_message") {
+      assertPeerTurnReply(args, depth, peerTurn.correlationIds);
+      return;
+    }
+    if (depth === 0 && isMainControlAgentLabels(caller?.labels)) {
+      if (name === "create_agent") {
+        assertPeerTurnCreateAgent(args);
+        return;
+      }
+      if (name === "send_agent_prompt") {
+        assertPeerTurnSendPrompt(args);
+        if (args.agentId) await assertEnforcedPeerReadOnlySubagent(args.agentId);
+        return;
+      }
+    }
+    throw new PaseoToolInputError(
+      `Cross-workspace peer messages carry read-only (A0 READ) authority and cannot invoke "${name}" without local human approval.`,
+    );
+  }
+
+  function assertDisallowedClientLabels(
+    name: string,
+    labels: Record<string, string> | undefined,
+  ): void {
+    if (
+      (name === "create_agent" || name === "update_agent") &&
+      Object.keys(labels ?? {}).some(isOpenAgentTabLabel)
+    ) {
+      throw new PaseoToolInputError("Only clients can set open-tab labels.");
+    }
+  }
+
+  function assertLevel2SelfScope(name: string, depth: number, targetsSelf: boolean): boolean {
+    if (name !== "set_agent_mode" && name !== "respond_to_permission") return false;
+    if (targetsSelf) return true;
+    if (depth >= 2) {
+      throw new PaseoToolInputError(
+        name === "set_agent_mode"
+          ? "Level-2 subagents can only change their own mode."
+          : "Level-2 subagents cannot respond to permission requests for other agents.",
+      );
+    }
+    return false;
+  }
+
   async function checkHierarchy(
     name: string,
-    args: { agentId?: string; serverId?: string; labels?: Record<string, string> },
+    args: { agentId?: string; serverId?: string; labels?: Record<string, string> } & Record<
+      string,
+      unknown
+    >,
     context: PaseoToolExecutionContext,
   ): Promise<OrchestrationCheck> {
     const unrestricted = { requireParentOwnership: false };
     if (!callerAgentId) return unrestricted;
-    if (
-      (name === "create_agent" || name === "update_agent") &&
-      Object.keys(args.labels ?? {}).some(isOpenAgentTabLabel)
-    ) {
-      throw new PaseoToolInputError("Only clients can set open-tab labels.");
-    }
+    assertDisallowedClientLabels(name, args.labels);
     const path = await readAgentHierarchyPath(callerAgentId, readHierarchyAgent);
+    await peerRuntime.stateMutex;
+    await ensurePeerRuntimeLoaded(peerRuntime);
+    if (peerRuntime.pendingOutcomes.size > 0) {
+      await withPeerStateMutex(peerRuntime, () => flushPendingPeerOutcomesUnlocked());
+    }
     const caller = path.get(callerAgentId);
     const read = (id: string) => path.get(id);
     const depth = computeAgentDepth(callerAgentId, read);
@@ -925,19 +2699,11 @@ function createToolCatalog(
     ) {
       throw new PaseoToolInputError(`Paseo tool is disabled for your hierarchy role: ${name}`);
     }
+    await assertPeerTurnToolAllowed(name, args, caller, depth, path);
     const localServer = options.serverId ?? "self";
     const destination = args.serverId ?? localServer;
     const targetsSelf = args.agentId === callerAgentId && destination === localServer;
-    if (name === "set_agent_mode" || name === "respond_to_permission") {
-      if (targetsSelf) return unrestricted;
-      if (depth >= 2) {
-        throw new PaseoToolInputError(
-          name === "set_agent_mode"
-            ? "Level-2 subagents can only change their own mode."
-            : "Level-2 subagents cannot respond to permission requests for other agents.",
-        );
-      }
-    }
+    if (assertLevel2SelfScope(name, depth, targetsSelf)) return unrestricted;
     if (!args.agentId || !orchestrationTools.has(name)) return unrestricted;
     return checkOrchestration(
       name,
@@ -948,6 +2714,20 @@ function createToolCatalog(
       path,
       context,
     );
+  }
+
+  function assertSameOrchestrationWorkspace(
+    caller: HierarchyAgent | undefined,
+    target: HierarchyAgent | null,
+  ): void {
+    if (!target) return;
+    const callerWs = caller?.workspaceId ?? null;
+    const targetWs = target.workspaceId ?? null;
+    if (callerWs !== targetWs && Boolean(callerWs || targetWs)) {
+      throw new PaseoToolInputError(
+        "You can only manage your direct subagents. Coordinate through your direct child, or use send_peer_message for cross-workspace read-only queries.",
+      );
+    }
   }
 
   async function checkOrchestration(
@@ -970,7 +2750,9 @@ function createToolCatalog(
       localServer,
       context,
     );
-    rejectArchivedMainControlPrompt(name, read(callerId), targetSnapshot);
+    const caller = read(callerId);
+    rejectArchivedMainControlPrompt(name, caller, targetSnapshot);
+    assertSameOrchestrationWorkspace(caller, targetSnapshot);
     const parent = getParentAddressFromLabels(targetSnapshot?.labels, destination);
     const target = parent?.serverId === localServer ? targetSnapshot : null;
     if (!singleHop) {
@@ -1327,6 +3109,11 @@ function createToolCatalog(
   }
 
   async function prepareTaskBinding(input: z.infer<typeof WorkspaceTaskToolInputSchema>) {
+    if (callerAgentId && getActivePeerTurnContext(callerAgentId)) {
+      throw new PaseoToolInputError(
+        "Cross-workspace peer messages are read-only (A0 READ) and cannot mutate the workspace task ledger.",
+      );
+    }
     // Local host operations can call this handler without going through the outer tool parser.
     input = WorkspaceTaskToolInputSchema.parse(input);
     const workspaceId = await withTaskLedger(undefined, async (ledger, id) => {
@@ -2258,11 +4045,17 @@ function createToolCatalog(
           workspaceId: workspaceIdSchema,
         }).strict(),
       },
-      async ({ workspaceId: requestedWorkspaceId, ...input }) =>
-        withTaskLedger(requestedWorkspaceId, async (ledger, workspaceId) => {
+      async ({ workspaceId: requestedWorkspaceId, ...input }) => {
+        if (callerAgentId && getActivePeerTurnContext(callerAgentId)) {
+          throw new PaseoToolInputError(
+            "Cross-workspace peer messages are read-only (A0 READ) and cannot mutate the workspace task ledger.",
+          );
+        }
+        return withTaskLedger(requestedWorkspaceId, async (ledger, workspaceId) => {
           const task = await ledger.upsert(workspaceId, input);
           return { content: [], structuredContent: ensureValidJson({ workspaceId, task }) };
-        }),
+        });
+      },
     );
     registerTool(
       "list_workspace_tasks",
@@ -2377,8 +4170,14 @@ function createToolCatalog(
       } else if (resolvedArgs.kind === "agent-scoped") {
         parentReporting = resolvedArgs.parsedArgs.parentReporting;
       }
+      const activePeerTurn = callerAgentId ? getActivePeerTurnContext(callerAgentId) : null;
+      const baseProviderSettings = resolveCreateToolProviderSettings(parsedArgs);
+      const effectiveProviderSettings = activePeerTurn
+        ? await enforcePeerReadOnlyCreateSettings(parsedArgs, baseProviderSettings)
+        : baseProviderSettings;
       const bindingMessageId = taskBinding ? randomUUID() : undefined;
       const { snapshot, initialPromptStarted, bindingResult } = await (async () => {
+        let peerChildLockedBeforeStart = false;
         const create = () =>
           createAgentCommand(
             {
@@ -2399,15 +4198,33 @@ function createToolCatalog(
             },
             {
               kind: "mcp",
-              ...resolveCreateToolProviderSettings(parsedArgs),
+              ...effectiveProviderSettings,
               title: parsedArgs.title,
-              initialPrompt: parsedArgs.initialPrompt,
+              initialPrompt: activePeerTurn
+                ? `${PEER_INSPECTION_PROMPT_PREFIX}${parsedArgs.initialPrompt}`
+                : parsedArgs.initialPrompt,
               cwd: resolvedArgs.kind === "top-level" ? resolvedArgs.cwd : undefined,
               // Keep explicit placement for the final comparison after a concurrent parent move.
               workspaceId: taskBinding?.workspaceId ?? resolvedArgs.workspaceId,
               labels: parsedArgs.labels,
               promptFailure: taskBinding ? "return-error" : "throw",
-              validateInitialPromptDispatch: taskBinding?.validateDispatch,
+              validateInitialPromptDispatch:
+                taskBinding || activePeerTurn
+                  ? async (createdAgentId) => {
+                      await taskBinding?.validateDispatch(createdAgentId);
+                      if (activePeerTurn) {
+                        const [firstCorrelationId] = activePeerTurn.correlationIds;
+                        if (firstCorrelationId) {
+                          await recordPeerLockedChild(
+                            createdAgentId,
+                            firstCorrelationId,
+                            "initial",
+                          );
+                          peerChildLockedBeforeStart = true;
+                        }
+                      }
+                    }
+                  : undefined,
               initialPromptMessageId: bindingMessageId,
               notifyOnFinish,
               parentReporting,
@@ -2421,6 +4238,12 @@ function createToolCatalog(
           );
 
         const creation = await (taskBinding ? taskBinding.run(create, bindingMessageId) : create());
+        if (activePeerTurn && !peerChildLockedBeforeStart) {
+          const [firstCorrelationId] = activePeerTurn.correlationIds;
+          if (firstCorrelationId) {
+            await recordPeerLockedChild(creation.snapshot.id, firstCorrelationId, "initial");
+          }
+        }
         let recordedBinding;
         if (taskBinding && bindingMessageId) {
           recordedBinding = creation.initialPromptStarted
@@ -2491,6 +4314,109 @@ function createToolCatalog(
             ...input.settings?.features,
           }
         : input.settings?.features,
+    };
+  }
+
+  function buildAdapterReadOnlyProviderOptions(
+    adapter: string | null | undefined,
+    existing: Record<string, unknown> | undefined,
+  ): { supported: boolean; providerOptions?: Record<string, unknown> } {
+    switch (adapter) {
+      case "codex":
+        return {
+          supported: true,
+          providerOptions: { ...existing, sandbox_mode: "read-only", approval_policy: "never" },
+        };
+      case "claude":
+        return {
+          supported: true,
+          providerOptions: {
+            ...existing,
+            disallowedTools: ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"],
+          },
+        };
+      case "opencode":
+        return {
+          supported: true,
+          providerOptions: {
+            ...existing,
+            permission: { edit: "deny", write: "deny", bash: "deny" },
+          },
+        };
+      case "pi":
+        return {
+          supported: true,
+          providerOptions: { ...existing, mainControlReadOnly: true },
+        };
+      default:
+        return { supported: false, providerOptions: existing };
+    }
+  }
+
+  function pickPeerReadOnlyMode(
+    explicitMode: string | undefined,
+    availableModeIds: ReadonlySet<string>,
+    adapter: string | null | undefined,
+  ): string | undefined {
+    if (explicitMode) {
+      if (availableModeIds.size > 0 && !availableModeIds.has(explicitMode)) {
+        throw new PaseoToolInputError(
+          `Read-only mode "${explicitMode}" is not supported by this provider.`,
+        );
+      }
+      return explicitMode;
+    }
+    for (const candidate of ["read-only", "plan", "always-ask", "default"]) {
+      if (availableModeIds.has(candidate)) return candidate;
+    }
+    if (availableModeIds.size === 0) {
+      if (adapter === "codex") return "read-only";
+      if (adapter === "claude") return "plan";
+    }
+    return undefined;
+  }
+
+  async function enforcePeerReadOnlyCreateSettings(
+    input: ResolvedCreateAgentToolArgs["parsedArgs"],
+    baseSettings: ReturnType<typeof resolveCreateToolProviderSettings>,
+  ): Promise<ReturnType<typeof resolveCreateToolProviderSettings>> {
+    if (
+      isPeerExplicitModeDisallowed(baseSettings.mode) ||
+      hasPeerDisallowedProviderOptions(baseSettings.providerOptions)
+    ) {
+      throw new PaseoToolInputError(
+        "Cross-workspace peer messages are read-only (A0 READ) and cannot launch subagents with write-capable profiles, modes, or provider features.",
+      );
+    }
+    const { provider: providerId } = selectCreateToolProvider(
+      input.provider,
+      getCreateToolProfile(input.profileId),
+    );
+    const adapter =
+      typeof agentManager.adapterOf === "function"
+        ? agentManager.adapterOf(providerId)
+        : providerId;
+    const callerCwd = callerAgentId ? agentManager.getAgent(callerAgentId)?.cwd : undefined;
+    const snapshotEntry = callerCwd
+      ? await providerSnapshotManager
+          .getProvider({ cwd: callerCwd, provider: providerId, wait: false })
+          .catch(() => null)
+      : null;
+    const availableModeIds = new Set((snapshotEntry?.modes ?? []).map((entry) => entry.id));
+    const adapterRestrictions = buildAdapterReadOnlyProviderOptions(
+      adapter,
+      baseSettings.providerOptions,
+    );
+    const hasStrictReadOnlyMode = availableModeIds.has("read-only") || availableModeIds.has("plan");
+    if (!adapterRestrictions.supported && !hasStrictReadOnlyMode) {
+      throw new PaseoToolInputError(
+        `Provider "${providerId}" does not support enforced read-only peer inspection subagents.`,
+      );
+    }
+    return {
+      ...baseSettings,
+      mode: pickPeerReadOnlyMode(baseSettings.mode, availableModeIds, adapter),
+      providerOptions: adapterRestrictions.providerOptions,
     };
   }
 
@@ -2815,7 +4741,7 @@ function createToolCatalog(
 
   async function enqueueLocalAgentPrompt(
     agentId: string,
-    message: Omit<RecoverableAgentMessage, "messageId">,
+    message: Omit<RecoverableAgentMessage, "messageId"> & { expectedWorkspaceId?: string | null },
     validateDispatch?: () => Promise<void>,
   ): Promise<string> {
     if (validateDispatch) {
@@ -2844,6 +4770,26 @@ function createToolCatalog(
         );
     }
     const parent = message.directParent;
+    const expectedWorkspaceId = message.expectedWorkspaceId;
+    const checkDispatchTarget =
+      parent || expectedWorkspaceId !== undefined
+        ? async () => {
+            const target = await readHierarchyAgent(agentId);
+            if (!message.unarchive && target?.archivedAt) {
+              throw new PaseoToolInputError(`Agent ${agentId} is archived.`);
+            }
+            if (
+              expectedWorkspaceId !== undefined &&
+              (target?.workspaceId ?? null) !== expectedWorkspaceId &&
+              Boolean(expectedWorkspaceId || target?.workspaceId)
+            ) {
+              throw new PaseoToolInputError("Target agent is no longer in the caller's workspace.");
+            }
+            if (parent) {
+              assertDirectParent(target?.labels, parent.serverId, parent);
+            }
+          }
+        : undefined;
     try {
       const receipt = agentMessages().enqueue({
         recipientId: agentId,
@@ -2851,15 +4797,7 @@ function createToolCatalog(
         source: { kind: "agent-message", ...message.source },
         sessionMode: message.sessionMode,
         unarchive: message.unarchive,
-        validateDispatch: parent
-          ? async () => {
-              const target = await readHierarchyAgent(agentId);
-              if (!message.unarchive && target?.archivedAt) {
-                throw new PaseoToolInputError(`Agent ${agentId} is archived.`);
-              }
-              assertDirectParent(target?.labels, parent.serverId, parent);
-            }
-          : undefined,
+        validateDispatch: checkDispatchTarget,
         activeTurnBehavior: message.activeTurnBehavior,
         onDispatch: () => notification?.accept(),
       });
@@ -2882,6 +4820,174 @@ function createToolCatalog(
     return target;
   }
 
+  async function resolveLocalPromptSender(senderId: string) {
+    const sender = resolveCallerAgent();
+    const senderStored = sender ? undefined : await agentStorage.get(senderId);
+    return {
+      sender,
+      senderWorkspaceId: sender?.workspaceId ?? senderStored?.workspaceId ?? null,
+      mainControl: isMainControlAgentLabels(sender?.labels ?? senderStored?.labels),
+    };
+  }
+
+  function assertSamePromptWorkspace(
+    senderWorkspaceId: string | null,
+    targetWorkspaceId: string | null | undefined,
+  ): void {
+    const targetWs = targetWorkspaceId ?? null;
+    if (senderWorkspaceId !== targetWs && Boolean(senderWorkspaceId || targetWs)) {
+      throw new PaseoToolInputError(
+        "You can only send prompts to subagents in your current workspace. Use send_peer_message for cross-workspace read-only coordination.",
+      );
+    }
+  }
+
+  async function rollbackPeerDeltaAfterFailedEnqueue(
+    undoDraft: (draft: PeerRuntimeMaps) => void,
+    enqueueError: unknown,
+  ): Promise<never> {
+    try {
+      await commitPeerStateTransaction(peerRuntime, undoDraft, countLocalHumanMessages);
+    } catch (rollbackError) {
+      invalidatePeerRuntimeCache(peerRuntime);
+      childLogger.error(
+        { err: rollbackError, enqueueError },
+        "Failed to roll back persisted peer workspace state after enqueue failure",
+      );
+      throw new Error(
+        `Failed to enqueue prompt (${
+          enqueueError instanceof Error ? enqueueError.message : String(enqueueError)
+        }) and failed to roll back persisted peer state`,
+        { cause: rollbackError },
+      );
+    }
+    throw enqueueError;
+  }
+
+  function prependPeerInspectionPrefix(
+    prompt: AgentPromptInput,
+    dispatchId: string,
+  ): AgentPromptInput {
+    const prefix = formatPeerInspectionPromptPrefix(dispatchId);
+    if (typeof prompt === "string") {
+      return `${prefix}${prompt}`;
+    }
+    return [{ type: "text", text: prefix }, ...prompt];
+  }
+
+  async function verifyQueuedPeerChildDispatchBoundary(params: {
+    dispatchId: string;
+    attemptId: string;
+    senderAgentId: string;
+    senderWorkspaceId: string | null;
+    expectedRecipientId: string;
+    recipientId: string;
+    correlationId: string;
+  }): Promise<void> {
+    if (params.recipientId !== params.expectedRecipientId) {
+      throw new PaseoToolInputError("Peer inspection subagent changed before dispatch.");
+    }
+    const sender = await readHierarchyAgent(params.senderAgentId);
+    if (!sender || sender.archivedAt) {
+      throw new PaseoToolInputError("Peer inspection parent session is unavailable at dispatch.");
+    }
+    assertSamePromptWorkspace(params.senderWorkspaceId, sender.workspaceId);
+    const target = await readHierarchyAgent(params.recipientId);
+    if (!target || target.archivedAt) {
+      throw new PaseoToolInputError("Peer inspection subagent is unavailable at dispatch.");
+    }
+    assertSamePromptWorkspace(params.senderWorkspaceId, target.workspaceId);
+    await assertEnforcedPeerReadOnlySubagent(params.recipientId);
+    await recordPeerLockedChild(
+      params.recipientId,
+      params.correlationId,
+      params.attemptId,
+      params.dispatchId,
+    );
+  }
+
+  async function stagePeerChildPromptDispatch(params: {
+    senderId: string;
+    targetId: string;
+    senderWorkspaceId: string | null;
+    requireParentOwnership: boolean;
+    safePrompt: AgentPromptInput;
+    correlationId: string;
+  }): Promise<{
+    dispatchId: string;
+    guardedPrompt: AgentPromptInput;
+    rollbackOnEnqueueFailure: (error: unknown) => Promise<never>;
+  }> {
+    const {
+      senderId,
+      targetId,
+      senderWorkspaceId,
+      requireParentOwnership,
+      safePrompt,
+      correlationId,
+    } = params;
+    const dispatchId = randomUUID();
+    const expectedSenderServerId = requireParentOwnership ? options.serverId : undefined;
+    const undoDraft = await withPeerStateMutex(peerRuntime, async () => {
+      await flushPendingPeerOutcomesUnlocked();
+      await assertEnforcedPeerReadOnlySubagent(targetId);
+      return commitPeerStateTransaction(
+        peerRuntime,
+        (draft) => {
+          const undoPending = setBoundedMapEntryWithUndo(
+            draft.pendingChildDispatches,
+            dispatchId,
+            {
+              dispatchId,
+              senderAgentId: senderId,
+              ...(expectedSenderServerId ? { senderServerId: expectedSenderServerId } : {}),
+              senderWorkspaceId,
+              recipientAgentId: targetId,
+              correlationId,
+              settled: false,
+            },
+            MAX_TRACKED_PEER_MESSAGES,
+            (_k, entry) => entry.settled === true,
+          );
+          return (rollbackTarget: PeerRuntimeMaps) => {
+            undoPending(rollbackTarget.pendingChildDispatches);
+          };
+        },
+        countLocalHumanMessages,
+      );
+    });
+    registerPromptDispatchVerifier(
+      dispatchId,
+      {
+        kind: "peer-child",
+        recipientId: targetId,
+        senderAgentId: senderId,
+        senderServerId: expectedSenderServerId,
+      },
+      (recipientId, attemptId) =>
+        verifyQueuedPeerChildDispatchBoundary({
+          dispatchId,
+          attemptId,
+          senderAgentId: senderId,
+          senderWorkspaceId,
+          expectedRecipientId: targetId,
+          recipientId,
+          correlationId,
+        }),
+      (outcome, context) => handlePeerDispatchOutcome(dispatchId, outcome, context),
+    );
+    return {
+      dispatchId,
+      guardedPrompt: prependPeerInspectionPrefix(safePrompt, dispatchId),
+      rollbackOnEnqueueFailure: (enqueueError) => {
+        releasePromptDispatchVerifier(dispatchId);
+        return withPeerStateMutex(peerRuntime, () =>
+          rollbackPeerDeltaAfterFailedEnqueue(undoDraft, enqueueError),
+        );
+      },
+    };
+  }
+
   async function sendLocalAgentPrompt(
     senderId: string,
     {
@@ -2898,19 +5004,39 @@ function createToolCatalog(
     },
     taskBinding?: Awaited<ReturnType<typeof prepareTaskBinding>>,
   ) {
-    const sender = resolveCallerAgent();
-    const mainControl = isMainControlAgentLabels(sender?.labels);
+    await ensurePeerRuntimeLoaded(peerRuntime);
+    const { sender, senderWorkspaceId, mainControl } = await resolveLocalPromptSender(senderId);
     const target = await requireLocalPromptTarget(agentId, mainControl);
+    assertSamePromptWorkspace(senderWorkspaceId, target.workspaceId);
     if (taskBinding && !requireParentOwnership) {
       throw new PaseoToolInputError("Task binding requires a local direct subagent.");
     }
     await taskBinding?.validateDispatch(agentId);
     const notifying = notifyOnFinish ?? !isExplicitParentReportingLabels(target.labels);
+    const safePrompt = neutralizePeerWorkspacePromptMarker(prompt);
+    const activePeerTurn = getActivePeerTurnContext(senderId);
+    let guardedPrompt: AgentPromptInput = safePrompt;
+    let stagedPeerChild: Awaited<ReturnType<typeof stagePeerChildPromptDispatch>> | undefined;
+    if (activePeerTurn) {
+      const [correlationId] = activePeerTurn.correlationIds;
+      if (!correlationId) {
+        throw new PaseoToolInputError("Peer inspection turn is missing correlation context.");
+      }
+      stagedPeerChild = await stagePeerChildPromptDispatch({
+        senderId,
+        targetId: agentId,
+        senderWorkspaceId,
+        requireParentOwnership,
+        safePrompt,
+        correlationId,
+      });
+      guardedPrompt = stagedPeerChild.guardedPrompt;
+    }
     const enqueue = () =>
       enqueueLocalAgentPrompt(
         agentId,
         {
-          prompt,
+          prompt: guardedPrompt,
           source: {
             agentId: senderId,
             serverId: requireParentOwnership ? options.serverId : undefined,
@@ -2919,6 +5045,7 @@ function createToolCatalog(
           directParent: requireParentOwnership
             ? { agentId: senderId, serverId: options.serverId ?? "self" }
             : undefined,
+          expectedWorkspaceId: senderWorkspaceId,
           sessionMode,
           activeTurnBehavior: activeTurnBehavior ?? "queue",
           ...(activeTurnBehavior === "steer" ? { immediateSteer: true } : {}),
@@ -2928,7 +5055,15 @@ function createToolCatalog(
         },
         taskBinding ? () => taskBinding.validateDispatch(agentId) : undefined,
       );
-    const messageId = await (taskBinding ? taskBinding.run(enqueue) : enqueue());
+    let messageId: string;
+    try {
+      messageId = await (taskBinding ? taskBinding.run(enqueue) : enqueue());
+    } catch (error) {
+      if (stagedPeerChild) {
+        return await stagedPeerChild.rollbackOnEnqueueFailure(error);
+      }
+      throw error;
+    }
     if (!taskBinding)
       return queuedPromptResponse(agentId, messageId, notifying, activeTurnBehavior ?? "queue");
     return {
@@ -3031,6 +5166,1269 @@ function createToolCatalog(
       return response;
     },
   );
+
+  const sendPeerMessageInputSchema = z
+    .object({
+      targetWorkspaceId: z
+        .string()
+        .trim()
+        .min(1)
+        .describe(
+          "Destination workspace ID from list_workspaces (must differ from your current workspace).",
+        ),
+      targetAgentId: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          "Optional target top-level root session ID when the destination workspace has no active Main Control agent, or when replying to a root sender.",
+        ),
+      intent: PeerMessageIntentSchema.describe(
+        '"query" or "align" to initiate a read-only cross-workspace request (Main Control only); "reply" to answer an inbound peer message.',
+      ),
+      correlationId: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          'Thread correlation ID. Omit to start a new thread; required when intent is "reply".',
+        ),
+      expectReply: z
+        .boolean()
+        .optional()
+        .describe(
+          'Whether the recipient should send one reply. Defaults to true for "query"/"align"; must be false (or omitted) for "reply".',
+        ),
+      maxHops: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_ALLOWED_PEER_HOPS)
+        .optional()
+        .describe(
+          `Maximum total hops allowed on a new correlationId thread (default ${DEFAULT_MAX_PEER_HOPS}, max ${MAX_ALLOWED_PEER_HOPS}).`,
+        ),
+      subject: z
+        .string()
+        .trim()
+        .min(1)
+        .max(120)
+        .optional()
+        .describe("Concise subject line (<= 120 chars)."),
+      message: z
+        .string()
+        .trim()
+        .min(1)
+        .max(8192)
+        .describe("Read-only inquiry, protocol alignment note, or reply body (<= 8192 chars)."),
+      taskId: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe("Optional task ID in your own workspace task ledger for local reference."),
+    })
+    .strict();
+
+  interface PeerTargetCandidate {
+    id: string;
+    workspaceId?: string;
+    labels?: Record<string, string>;
+    archivedAt?: string | null;
+    internal: boolean;
+    background: boolean;
+    title?: string;
+  }
+
+  function toStoredPeerCandidate(stored: StoredAgentRecord): PeerTargetCandidate {
+    return {
+      id: stored.id,
+      workspaceId: stored.workspaceId,
+      labels: stored.labels,
+      archivedAt: stored.archivedAt,
+      internal: Boolean(stored.internal),
+      background: Boolean(stored.background),
+      title: resolveReportTitle(stored.id, stored.title),
+    };
+  }
+
+  function mergeLivePeerCandidate(
+    live: ManagedAgent,
+    prev: PeerTargetCandidate | undefined,
+  ): PeerTargetCandidate {
+    return {
+      id: live.id,
+      workspaceId: live.workspaceId ?? prev?.workspaceId,
+      labels: live.labels,
+      archivedAt: prev?.archivedAt ?? null,
+      internal: Boolean(live.internal || prev?.internal),
+      background: Boolean(live.background || prev?.background),
+      title: resolveReportTitle(live.id, prev?.title, live.config.title),
+    };
+  }
+
+  function isEligiblePeerRootCandidate(
+    candidate: PeerTargetCandidate,
+    targetWorkspaceId: string,
+  ): boolean {
+    return (
+      candidate.workspaceId === targetWorkspaceId &&
+      !candidate.archivedAt &&
+      !candidate.internal &&
+      !candidate.background &&
+      !isSideChatAgent(candidate) &&
+      !getParentAgentIdFromLabels(candidate.labels)
+    );
+  }
+
+  async function readExplicitPeerCandidate(id: string): Promise<PeerTargetCandidate | undefined> {
+    const stored = await agentStorage.get(id);
+    const live = agentManager.getAgent(id);
+    if (!stored && !live) return undefined;
+    const base = stored ? toStoredPeerCandidate(stored) : undefined;
+    return live ? mergeLivePeerCandidate(live, base) : base;
+  }
+
+  async function listEligiblePeerTargets(
+    targetWorkspaceId: string,
+    explicitTargetId?: string,
+  ): Promise<PeerTargetCandidate[]> {
+    const liveList = agentManager.listAgents();
+    const storedList =
+      typeof agentStorage.listByWorkspaces === "function"
+        ? await agentStorage.listByWorkspaces([targetWorkspaceId])
+        : [];
+    const byId = new Map<string, PeerTargetCandidate>();
+    for (const stored of storedList) {
+      byId.set(stored.id, toStoredPeerCandidate(stored));
+    }
+    for (const live of liveList) {
+      if (live.workspaceId !== targetWorkspaceId) continue;
+      byId.set(live.id, mergeLivePeerCandidate(live, byId.get(live.id)));
+    }
+    if (explicitTargetId && !byId.has(explicitTargetId)) {
+      const explicit = await readExplicitPeerCandidate(explicitTargetId);
+      if (explicit) byId.set(explicitTargetId, explicit);
+    }
+    return [...byId.values()].filter((candidate) =>
+      isEligiblePeerRootCandidate(candidate, targetWorkspaceId),
+    );
+  }
+
+  type SendPeerMessageInput = z.infer<typeof sendPeerMessageInputSchema>;
+
+  async function inspectPeerCallerSessionState(callerId: string) {
+    const path = await readAgentHierarchyPath(callerId, readHierarchyAgent);
+    const caller = path.get(callerId);
+    const liveCaller = agentManager.getAgent(callerId);
+    const storedCaller = await agentStorage.get(callerId);
+    const unavailable =
+      !caller ||
+      Boolean(caller.archivedAt || storedCaller?.archivedAt) ||
+      Boolean(liveCaller?.internal || storedCaller?.internal) ||
+      Boolean(liveCaller?.background || storedCaller?.background) ||
+      isSideChatAgent(caller);
+    if (unavailable) {
+      throw new PaseoToolInputError("Caller session is unavailable for peer messaging.");
+    }
+    if (computeAgentDepth(callerId, (id) => path.get(id)) > 0) {
+      throw new PaseoToolInputError(
+        "Subagents cannot send cross-workspace peer messages. Report to your parent agent so Main Control can coordinate across workspaces.",
+      );
+    }
+    return {
+      liveCaller,
+      storedCaller,
+      callerIsMainControl: isMainControlAgentLabels(caller.labels),
+    };
+  }
+
+  async function requirePeerCallerSession(callerId: string) {
+    if (options.verifiedCallerAgentId !== undefined && options.verifiedCallerAgentId !== callerId) {
+      throw new PaseoToolInputError(
+        "Cross-workspace peer messaging requires a verified agent identity.",
+      );
+    }
+    return inspectPeerCallerSessionState(callerId);
+  }
+
+  async function resolvePeerWorkspaces(
+    sourceWorkspaceId: string | undefined,
+    targetWorkspaceId: string,
+  ) {
+    if (!options.workspaceRegistry) {
+      throw new Error("Workspace registry is not configured");
+    }
+    if (!sourceWorkspaceId) {
+      throw new PaseoToolInputError("Caller agent does not belong to an active workspace.");
+    }
+    const sourceWorkspace = await options.workspaceRegistry.get(sourceWorkspaceId);
+    if (!sourceWorkspace || sourceWorkspace.archivedAt) {
+      throw new PaseoToolInputError("Caller workspace is unavailable.");
+    }
+    if (targetWorkspaceId === sourceWorkspaceId) {
+      throw new PaseoToolInputError(
+        "Target workspace must differ from your current workspace. Use send_agent_prompt for direct subagents in your own workspace.",
+      );
+    }
+    const targetWorkspace = await options.workspaceRegistry.get(targetWorkspaceId);
+    if (!targetWorkspace || targetWorkspace.archivedAt) {
+      throw new PaseoToolInputError(`Target workspace ${targetWorkspaceId} not found`);
+    }
+    const lockedCwd = callerContext?.lockedCwd?.trim();
+    if (lockedCwd && !isSameOrDescendantPath(expandUserPath(lockedCwd), targetWorkspace.cwd)) {
+      throw new PaseoToolInputError(`Workspace ${targetWorkspaceId} is outside the allowed cwd`);
+    }
+    return { sourceWorkspaceId, sourceWorkspace, targetWorkspace };
+  }
+
+  function hasQueuedReplyForConfirmedHop(correlationId: string, targetHop: number): boolean {
+    for (const entry of peerRuntime.byMessageId.values()) {
+      if (entry.settled || entry.correlationId !== correlationId) continue;
+      if (isPeerWorkspaceDispatchUnsentInPending(entry.dispatchId, entry.recipientAgentId)) {
+        continue;
+      }
+      if (entry.intent === "reply" && entry.hop === targetHop + 1) return true;
+    }
+    return false;
+  }
+
+  function resolvePeerReplyStep(params: {
+    rawInput: SendPeerMessageInput;
+    callerId: string;
+    callerIsMainControl: boolean;
+    sourceWorkspaceId: string;
+    targetWorkspaceId: string;
+    lookupThread: (id: string) => PeerThreadState | undefined;
+  }) {
+    const { rawInput, callerId, callerIsMainControl, sourceWorkspaceId, targetWorkspaceId } =
+      params;
+    if (!rawInput.correlationId) {
+      throw new PaseoToolInputError('correlationId is required when intent is "reply".');
+    }
+    if (rawInput.expectReply === true) {
+      throw new PaseoToolInputError("Replies must converge with expectReply: false.");
+    }
+    const correlationId = rawInput.correlationId;
+    const trackedThread = params.lookupThread(correlationId);
+    const confirmedSnap = trackedThread?.confirmedSnapshot;
+    if (!trackedThread || !confirmedSnap || !confirmedSnap.admitted) {
+      throw new PaseoToolInputError(`Unknown or unauthorized peer correlationId: ${correlationId}`);
+    }
+    const inboundThread: PeerThreadState = {
+      ...deserializeBasePeerThread(confirmedSnap),
+      confirmedSnapshot: cloneBaseThreadSnapshot(confirmedSnap),
+    };
+    if (!isSameWorkspacePair(inboundThread, sourceWorkspaceId, targetWorkspaceId)) {
+      throw new PaseoToolInputError(`Unknown or unauthorized peer correlationId: ${correlationId}`);
+    }
+    if (inboundThread.lastSourceWorkspaceId === sourceWorkspaceId) {
+      throw new PaseoToolInputError(
+        `Peer thread ${correlationId} already sent a reply for hop ${Math.max(1, inboundThread.hop - 1)}.`,
+      );
+    }
+    if (inboundThread.lastTargetAgentId !== callerId && !callerIsMainControl) {
+      throw new PaseoToolInputError(`Unknown or unauthorized peer correlationId: ${correlationId}`);
+    }
+    if (!inboundThread.expectReply) {
+      throw new PaseoToolInputError(
+        `Peer thread ${correlationId} does not expect a reply (reply convergence reached).`,
+      );
+    }
+    const replyAlreadyRecorded =
+      inboundThread.repliedHops.has(inboundThread.hop) ||
+      trackedThread.repliedHops.has(inboundThread.hop) ||
+      hasQueuedReplyForConfirmedHop(correlationId, inboundThread.hop);
+    if (replyAlreadyRecorded) {
+      throw new PaseoToolInputError(
+        `Peer thread ${correlationId} already sent a reply for hop ${inboundThread.hop}.`,
+      );
+    }
+    const effectiveMaxHops = trackedThread.maxHops;
+    if (rawInput.maxHops !== undefined && rawInput.maxHops !== effectiveMaxHops) {
+      throw new PaseoToolInputError("maxHops cannot be changed on an existing peer thread.");
+    }
+    const nextHop = inboundThread.hop + 1;
+    if (nextHop > effectiveMaxHops) {
+      throw new PaseoToolInputError(
+        `Peer thread ${correlationId} exceeded maxHops (${effectiveMaxHops}).`,
+      );
+    }
+    return {
+      correlationId,
+      nextHop,
+      effectiveMaxHops,
+      effectiveExpectReply: false,
+      inboundThread,
+    };
+  }
+
+  function isSameWorkspacePair(
+    thread: PeerThreadState,
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+  ): boolean {
+    const forward =
+      thread.lastSourceWorkspaceId === sourceWorkspaceId &&
+      thread.lastTargetWorkspaceId === targetWorkspaceId;
+    const reverse =
+      thread.lastSourceWorkspaceId === targetWorkspaceId &&
+      thread.lastTargetWorkspaceId === sourceWorkspaceId;
+    return forward || reverse;
+  }
+
+  function resolvePeerInitiationStep(params: {
+    rawInput: SendPeerMessageInput;
+    callerIsMainControl: boolean;
+    sourceWorkspaceId: string;
+    targetWorkspaceId: string;
+    lookupThread: (id: string) => PeerThreadState | undefined;
+  }) {
+    const { rawInput, callerIsMainControl, sourceWorkspaceId, targetWorkspaceId } = params;
+    if (!callerIsMainControl) {
+      throw new PaseoToolInputError(
+        'Only Workspace Main Control agents can initiate cross-workspace "query" or "align" messages.',
+      );
+    }
+    const effectiveExpectReply = rawInput.expectReply ?? true;
+    const correlationId = rawInput.correlationId ?? `peer_${randomUUID()}`;
+    const existing = rawInput.correlationId ? params.lookupThread(correlationId) : undefined;
+    if (!existing) {
+      return {
+        correlationId,
+        nextHop: 1,
+        effectiveMaxHops: rawInput.maxHops ?? DEFAULT_MAX_PEER_HOPS,
+        effectiveExpectReply,
+        inboundThread: undefined,
+      };
+    }
+    if (!isSameWorkspacePair(existing, sourceWorkspaceId, targetWorkspaceId)) {
+      throw new PaseoToolInputError(
+        `Peer correlationId ${correlationId} belongs to another workspace pair.`,
+      );
+    }
+    if (rawInput.maxHops !== undefined && rawInput.maxHops !== existing.maxHops) {
+      throw new PaseoToolInputError("maxHops cannot be changed on an existing peer thread.");
+    }
+    const nextHop = existing.hop + 1;
+    if (nextHop > existing.maxHops) {
+      throw new PaseoToolInputError(
+        `Peer thread ${correlationId} exceeded maxHops (${existing.maxHops}).`,
+      );
+    }
+    return {
+      correlationId,
+      nextHop,
+      effectiveMaxHops: existing.maxHops,
+      effectiveExpectReply,
+      inboundThread: existing,
+    };
+  }
+
+  function selectPeerReplyTarget(
+    eligibleTargets: PeerTargetCandidate[],
+    targetMain: PeerTargetCandidate | undefined,
+    targetWorkspaceId: string,
+    targetAgentId: string | undefined,
+    inboundThread: PeerThreadState,
+  ): PeerTargetCandidate {
+    const desiredId = targetAgentId ?? inboundThread.lastSourceAgentId;
+    const resolved =
+      eligibleTargets.find((candidate) => candidate.id === desiredId) ??
+      (!targetAgentId ? targetMain : undefined);
+    if (!resolved) {
+      throw new PaseoToolInputError(
+        `Peer reply recipient ${desiredId} is unavailable in workspace ${targetWorkspaceId}.`,
+      );
+    }
+    const validExplicit =
+      !targetAgentId ||
+      targetAgentId === inboundThread.lastSourceAgentId ||
+      targetAgentId === targetMain?.id;
+    if (!validExplicit) {
+      throw new PaseoToolInputError(
+        `Peer reply targetAgentId must match the thread sender (${inboundThread.lastSourceAgentId}) or active Main Control.`,
+      );
+    }
+    return resolved;
+  }
+
+  function selectPeerTargetAgent(params: {
+    intent: SendPeerMessageInput["intent"];
+    eligibleTargets: PeerTargetCandidate[];
+    targetWorkspaceId: string;
+    targetAgentId?: string;
+    inboundThread?: PeerThreadState;
+  }): PeerTargetCandidate {
+    const { intent, eligibleTargets, targetWorkspaceId, targetAgentId, inboundThread } = params;
+    const targetMain = eligibleTargets.find((candidate) =>
+      isMainControlAgentLabels(candidate.labels),
+    );
+    if (intent === "reply" && inboundThread) {
+      return selectPeerReplyTarget(
+        eligibleTargets,
+        targetMain,
+        targetWorkspaceId,
+        targetAgentId,
+        inboundThread,
+      );
+    }
+    if (targetMain) {
+      if (targetAgentId && targetAgentId !== targetMain.id) {
+        throw new PaseoToolInputError(
+          `Workspace ${targetWorkspaceId} has an active Main Control agent (${targetMain.id}). Route cross-workspace peer messages to Main Control.`,
+        );
+      }
+      return targetMain;
+    }
+    if (!targetAgentId) {
+      throw new PaseoToolInputError(
+        `Workspace ${targetWorkspaceId} has no active Main Control agent. Pass targetAgentId for the user-specified top-level root session.`,
+      );
+    }
+    const resolved = eligibleTargets.find((candidate) => candidate.id === targetAgentId);
+    if (!resolved) {
+      throw new PaseoToolInputError(
+        `Target agent ${targetAgentId} is unavailable or is not an active top-level root session in workspace ${targetWorkspaceId}.`,
+      );
+    }
+    return resolved;
+  }
+
+  async function validateLocalPeerTaskId(
+    taskId: string | undefined,
+    callerIsMainControl: boolean,
+    sourceWorkspaceId: string,
+  ): Promise<void> {
+    if (!taskId) return;
+    if (!callerIsMainControl || !taskLedger) {
+      throw new PaseoToolInputError(
+        "Workspace task references require Main Control with an active task ledger.",
+      );
+    }
+    const tasks = await taskLedger.list(sourceWorkspaceId);
+    if (!tasks.some((entry) => entry.taskId === taskId)) {
+      throw new PaseoToolInputError(`Task ${taskId} does not exist in your workspace.`);
+    }
+  }
+
+  function buildPeerApprovalPendingResult(params: {
+    correlationId: string;
+    hop: number;
+    maxHops: number;
+    expectReply: boolean;
+    targetWorkspaceId: string;
+    targetAgentId: string;
+    approvalRequestId: string;
+    taskId?: string;
+    guidance: string;
+  }): PaseoToolResult {
+    return {
+      content: [],
+      structuredContent: ensureValidJson({
+        success: false,
+        deliveryStatus: "awaiting_approval",
+        correlationId: params.correlationId,
+        hop: params.hop,
+        maxHops: params.maxHops,
+        expectReply: params.expectReply,
+        targetWorkspaceId: params.targetWorkspaceId,
+        targetAgentId: params.targetAgentId,
+        approvalRequestId: params.approvalRequestId,
+        ...(params.taskId ? { taskId: params.taskId } : {}),
+        guidance: params.guidance,
+      }),
+    };
+  }
+
+  async function findLatestPeerDurableAuth(sourceWorkspaceId: string, authPrefix: string) {
+    if (!options.durableItems || !options.serverId) {
+      throw new PaseoToolInputError(
+        `Cross-workspace peer messaging requires workspace pairing or human authorization.`,
+      );
+    }
+    const listed = await options.durableItems.list({
+      serverId: options.serverId,
+      workspaceId: sourceWorkspaceId,
+      limit: 100,
+    });
+    return listed.items.findLast(
+      (item) =>
+        item.kind === "authorization" &&
+        (item.requestId === authPrefix || item.requestId.startsWith(`${authPrefix}:`)),
+    );
+  }
+
+  function computePeerPolicyFingerprint(params: {
+    sourceWorkspace: PersistedWorkspaceRecord;
+    targetWorkspace: PersistedWorkspaceRecord;
+    sourceUntrusted: boolean;
+    targetUntrusted: boolean;
+    resolvedTarget: PeerTargetCandidate;
+  }): string {
+    const targetIsMain = isMainControlAgentLabels(params.resolvedTarget.labels);
+    const material = {
+      sourceUntrusted: params.sourceUntrusted,
+      targetUntrusted: params.targetUntrusted,
+      sourceOptOut: workspaceRequiresPeerApproval(params.sourceWorkspace),
+      targetOptOut: workspaceRequiresPeerApproval(params.targetWorkspace),
+      allowLocal: options.crossWorkspacePeerPolicy?.allowLocalPeerMessages ?? true,
+      targetScope: targetIsMain ? "main" : `agent:${params.resolvedTarget.id}`,
+      sourceTrustedPeers: [...readWorkspaceTrustedPeers(params.sourceWorkspace)].sort(),
+      targetTrustedPeers: [...readWorkspaceTrustedPeers(params.targetWorkspace)].sort(),
+      targetTrustedAgents: [...readWorkspaceTrustedTargetAgents(params.targetWorkspace)].sort(),
+    };
+    return createHash("sha256").update(JSON.stringify(material)).digest("hex").slice(0, 12);
+  }
+
+  async function isPeerDurableApprovalGranted(
+    sourceWorkspace: PersistedWorkspaceRecord,
+    targetWorkspace: PersistedWorkspaceRecord,
+    resolvedTarget: PeerTargetCandidate,
+    sourceUntrusted: boolean,
+    targetUntrusted: boolean,
+  ): Promise<boolean> {
+    if (!options.durableItems || !options.serverId) return false;
+    const policyHash = computePeerPolicyFingerprint({
+      sourceWorkspace,
+      targetWorkspace,
+      sourceUntrusted,
+      targetUntrusted,
+      resolvedTarget,
+    });
+    const authPrefix = `peer-auth:${sourceWorkspace.workspaceId}:${targetWorkspace.workspaceId}:${policyHash}`;
+    const latestAuth = await findLatestPeerDurableAuth(sourceWorkspace.workspaceId, authPrefix);
+    return latestAuth?.status === "decided" && latestAuth.decision === "approve";
+  }
+
+  async function requestOrReadPeerDurableApproval(params: {
+    callerId: string;
+    sourceWorkspace: PersistedWorkspaceRecord;
+    targetWorkspace: PersistedWorkspaceRecord;
+    resolvedTarget: PeerTargetCandidate;
+    sourceUntrusted: boolean;
+    targetUntrusted: boolean;
+    rawInput: SendPeerMessageInput;
+    correlationId: string;
+    nextHop: number;
+    effectiveMaxHops: number;
+    effectiveExpectReply: boolean;
+  }): Promise<{ admitted: true } | { admitted: false; response: PaseoToolResult }> {
+    const { sourceWorkspace, targetWorkspace, resolvedTarget } = params;
+    const sourceWorkspaceId = sourceWorkspace.workspaceId;
+    const targetWorkspaceId = targetWorkspace.workspaceId;
+    const policyHash = computePeerPolicyFingerprint({
+      sourceWorkspace,
+      targetWorkspace,
+      sourceUntrusted: params.sourceUntrusted,
+      targetUntrusted: params.targetUntrusted,
+      resolvedTarget,
+    });
+    const authPrefix = `peer-auth:${sourceWorkspaceId}:${targetWorkspaceId}:${policyHash}`;
+    const latestAuth = await findLatestPeerDurableAuth(sourceWorkspaceId, authPrefix);
+    if (latestAuth?.status === "decided") {
+      if (latestAuth.decision === "approve") return { admitted: true };
+      throw new PaseoToolInputError(
+        `Cross-workspace peer messaging to workspace ${targetWorkspaceId} was rejected by the user.`,
+      );
+    }
+    if (latestAuth?.status === "pending") {
+      return {
+        admitted: false,
+        response: buildPeerApprovalPendingResult({
+          correlationId: params.correlationId,
+          hop: params.nextHop,
+          maxHops: params.effectiveMaxHops,
+          expectReply: params.effectiveExpectReply,
+          targetWorkspaceId,
+          targetAgentId: resolvedTarget.id,
+          approvalRequestId: latestAuth.requestId,
+          taskId: params.rawInput.taskId,
+          guidance: `Cross-workspace peer messaging to ${targetWorkspaceId} is awaiting human authorization (${latestAuth.requestId}). End your turn and wait for approval.`,
+        }),
+      };
+    }
+    if (sourceWorkspace.background || !options.durableItems || !options.serverId) {
+      throw new PaseoToolInputError(
+        `Cross-workspace peer messaging between ${sourceWorkspaceId} and ${targetWorkspaceId} requires workspace pairing or human authorization.`,
+      );
+    }
+    const sourceTurnId = reportTurnId(params.callerId) ?? `peer-turn:${params.correlationId}`;
+    const requestId = latestAuth ? `${authPrefix}:${randomUUID().slice(0, 8)}` : authPrefix;
+    const targetDisplayName = resolveWorkspaceDisplayName(targetWorkspace);
+    const subjectLine = params.rawInput.subject ? `\nSubject: ${params.rawInput.subject}` : "";
+    const created = await options.durableItems.create({
+      serverId: options.serverId,
+      workspaceId: sourceWorkspaceId,
+      requestId,
+      sourceAgentId: params.callerId,
+      sourceTurnId,
+      kind: "authorization",
+      title: `Allow cross-workspace peer messaging to ${targetDisplayName}`,
+      summary: `Target workspace: ${targetDisplayName} (${targetWorkspaceId})\nTarget session: ${resolvedTarget.id}\nIntent: ${params.rawInput.intent}${subjectLine}`,
+      evidence: [],
+    });
+    return {
+      admitted: false,
+      response: buildPeerApprovalPendingResult({
+        correlationId: params.correlationId,
+        hop: params.nextHop,
+        maxHops: params.effectiveMaxHops,
+        expectReply: params.effectiveExpectReply,
+        targetWorkspaceId,
+        targetAgentId: resolvedTarget.id,
+        approvalRequestId: created.requestId,
+        taskId: params.rawInput.taskId,
+        guidance: `Created authorization request ${created.requestId} for cross-workspace peer messaging to ${targetWorkspaceId}. End your turn and wait for user approval.`,
+      }),
+    };
+  }
+
+  async function isWorkspaceUntrusted(workspace: PersistedWorkspaceRecord): Promise<boolean> {
+    if (workspace.untrustedSource) return true;
+    return Boolean(await options.isCheckoutUntrusted?.(workspace.cwd));
+  }
+
+  function evaluatePeerFastAdmission(params: {
+    sourceWorkspace: PersistedWorkspaceRecord;
+    targetWorkspace: PersistedWorkspaceRecord;
+    sourceUntrusted: boolean;
+    targetUntrusted: boolean;
+    resolvedTarget: PeerTargetCandidate;
+    intent: SendPeerMessageInput["intent"];
+    inboundThread?: PeerThreadState;
+  }): boolean {
+    const { sourceWorkspace, targetWorkspace, resolvedTarget, intent } = params;
+    if (params.sourceUntrusted || params.targetUntrusted) return false;
+    if (
+      workspaceRequiresPeerApproval(sourceWorkspace) ||
+      workspaceRequiresPeerApproval(targetWorkspace)
+    ) {
+      return false;
+    }
+    if (intent !== "reply" && !isMainControlAgentLabels(resolvedTarget.labels)) {
+      if (!readWorkspaceTrustedTargetAgents(targetWorkspace).has(resolvedTarget.id)) {
+        return false;
+      }
+    }
+    if (intent === "reply" && params.inboundThread?.admitted) return true;
+    const mutuallyPaired =
+      readWorkspaceTrustedPeers(sourceWorkspace).has(targetWorkspace.workspaceId) &&
+      readWorkspaceTrustedPeers(targetWorkspace).has(sourceWorkspace.workspaceId);
+    if (mutuallyPaired) return true;
+    return options.crossWorkspacePeerPolicy?.allowLocalPeerMessages ?? true;
+  }
+
+  async function assertSenderAuthorizedAtDispatch(params: {
+    callerId: string;
+    sourceWorkspaceId: string;
+    intent: SendPeerMessageInput["intent"];
+    inboundThread?: PeerThreadState;
+    senderAgentId?: string;
+    senderServerId?: string;
+    expectedServerId?: string;
+  }): Promise<void> {
+    if (params.senderAgentId !== undefined && params.senderAgentId !== params.callerId) {
+      throw new PaseoToolInputError("Peer message sender identity changed before dispatch.");
+    }
+    if (
+      params.senderServerId !== undefined &&
+      params.senderServerId !== (params.expectedServerId ?? options.serverId)
+    ) {
+      throw new PaseoToolInputError("Peer message sender server changed before dispatch.");
+    }
+    const { liveCaller, storedCaller, callerIsMainControl } = await inspectPeerCallerSessionState(
+      params.callerId,
+    );
+    const currentWorkspaceId = liveCaller?.workspaceId ?? storedCaller?.workspaceId;
+    if (currentWorkspaceId !== params.sourceWorkspaceId) {
+      throw new PaseoToolInputError(
+        "Peer message sender moved out of source workspace before dispatch.",
+      );
+    }
+    if (params.intent !== "reply" && !callerIsMainControl) {
+      throw new PaseoToolInputError(
+        "Peer message sender lost Main Control authority before dispatch.",
+      );
+    }
+    if (
+      params.intent === "reply" &&
+      params.inboundThread &&
+      params.inboundThread.lastTargetAgentId !== params.callerId &&
+      !callerIsMainControl
+    ) {
+      throw new PaseoToolInputError(
+        "Peer reply sender is no longer authorized for this thread at dispatch.",
+      );
+    }
+  }
+
+  function resolveLiveReplyInboundThreadAtDispatch(params: {
+    correlationId: string;
+    sourceWorkspaceId: string;
+    targetWorkspaceId: string;
+    expectedInboundHop?: number;
+  }): PeerThreadState {
+    const liveConfirmed = peerRuntime.threads.get(params.correlationId)?.confirmedSnapshot;
+    if (!liveConfirmed || !liveConfirmed.admitted || !liveConfirmed.expectReply) {
+      throw new PaseoToolInputError(
+        `Peer reply correlationId ${params.correlationId} has no confirmed inbound hop awaiting reply at dispatch.`,
+      );
+    }
+    const validDirection =
+      liveConfirmed.lastTargetWorkspaceId === params.sourceWorkspaceId &&
+      liveConfirmed.lastSourceWorkspaceId === params.targetWorkspaceId;
+    const alreadyReplied = liveConfirmed.repliedHops.includes(liveConfirmed.hop);
+    const hopChanged =
+      params.expectedInboundHop !== undefined && liveConfirmed.hop !== params.expectedInboundHop;
+    if (!validDirection || alreadyReplied || hopChanged) {
+      throw new PaseoToolInputError(
+        `Peer reply correlationId ${params.correlationId} is no longer authorized at dispatch.`,
+      );
+    }
+    return {
+      ...deserializeBasePeerThread(liveConfirmed),
+      confirmedSnapshot: cloneBaseThreadSnapshot(liveConfirmed),
+    };
+  }
+
+  async function verifyQueuedPeerDispatchBoundary(params: {
+    dispatchId: string;
+    attemptId: string;
+    correlationId: string;
+    callerId: string;
+    recipientId: string;
+    expectedTargetId: string;
+    sourceWorkspaceId: string;
+    targetWorkspaceId: string;
+    intent: SendPeerMessageInput["intent"];
+    inboundThread?: PeerThreadState;
+    senderAgentId?: string;
+    senderServerId?: string;
+    expectedServerId?: string;
+  }): Promise<void> {
+    if (params.recipientId !== params.expectedTargetId) {
+      throw new PaseoToolInputError("Peer message recipient changed before dispatch.");
+    }
+    const effectiveInboundThread =
+      params.intent === "reply"
+        ? resolveLiveReplyInboundThreadAtDispatch({
+            correlationId: params.correlationId,
+            sourceWorkspaceId: params.sourceWorkspaceId,
+            targetWorkspaceId: params.targetWorkspaceId,
+            expectedInboundHop: params.inboundThread?.hop,
+          })
+        : params.inboundThread;
+    await assertSenderAuthorizedAtDispatch({ ...params, inboundThread: effectiveInboundThread });
+    const { sourceWorkspace, targetWorkspace } = await resolvePeerWorkspaces(
+      params.sourceWorkspaceId,
+      params.targetWorkspaceId,
+    );
+    const eligibleTargets = await listEligiblePeerTargets(
+      params.targetWorkspaceId,
+      params.expectedTargetId,
+    );
+    const currentTarget = selectPeerTargetAgent({
+      intent: params.intent,
+      eligibleTargets,
+      targetWorkspaceId: params.targetWorkspaceId,
+      targetAgentId: params.expectedTargetId,
+      inboundThread: effectiveInboundThread,
+    });
+    const [sourceUntrusted, targetUntrusted] = await Promise.all([
+      isWorkspaceUntrusted(sourceWorkspace),
+      isWorkspaceUntrusted(targetWorkspace),
+    ]);
+    const stillFastAdmitted = evaluatePeerFastAdmission({
+      sourceWorkspace,
+      targetWorkspace,
+      sourceUntrusted,
+      targetUntrusted,
+      resolvedTarget: currentTarget,
+      intent: params.intent,
+      inboundThread: effectiveInboundThread,
+    });
+    if (!stillFastAdmitted) {
+      const approved = await isPeerDurableApprovalGranted(
+        sourceWorkspace,
+        targetWorkspace,
+        currentTarget,
+        sourceUntrusted,
+        targetUntrusted,
+      );
+      if (!approved) {
+        throw new PaseoToolInputError(
+          `Cross-workspace peer message to ${params.targetWorkspaceId} is no longer authorized at dispatch.`,
+        );
+      }
+    }
+    await recordPeerInboundAgentLock(
+      params.recipientId,
+      params.attemptId,
+      params.dispatchId,
+      params.correlationId,
+    );
+  }
+
+  async function verifyPersistedPeerDispatchById(
+    request: PeerDispatchVerificationRequest,
+  ): Promise<void> {
+    await ensurePeerRuntimeLoaded(peerRuntime);
+    if (request.kind === "peer-workspace") {
+      const record = peerRuntime.byMessageId.get(request.dispatchId);
+      if (!record) {
+        throw new PaseoToolInputError(
+          `Missing persisted authorization record for peer message ${request.dispatchId}.`,
+        );
+      }
+      if (!matchesPersistedPeerWorkspaceEndpoints(record, request)) {
+        throw new PaseoToolInputError("Peer message endpoints changed before dispatch.");
+      }
+      await verifyQueuedPeerDispatchBoundary({
+        dispatchId: request.dispatchId,
+        attemptId: request.attemptId,
+        correlationId: record.correlationId,
+        callerId: record.agentId,
+        recipientId: request.recipientId,
+        expectedTargetId: record.recipientAgentId,
+        sourceWorkspaceId: record.sourceWorkspaceId,
+        targetWorkspaceId: record.targetWorkspaceId,
+        intent: record.intent,
+        inboundThread: record.inboundThread
+          ? deserializePeerThread(record.inboundThread)
+          : undefined,
+        senderAgentId: request.senderAgentId,
+        senderServerId: request.senderServerId,
+        expectedServerId: record.serverId,
+      });
+      return;
+    }
+    const childDispatch = peerRuntime.pendingChildDispatches.get(request.dispatchId);
+    if (!childDispatch) {
+      throw new PaseoToolInputError(
+        `Missing persisted authorization record for peer child prompt ${request.dispatchId}.`,
+      );
+    }
+    if (!matchesPersistedPeerChildEndpoints(childDispatch, request)) {
+      throw new PaseoToolInputError("Peer child prompt sender changed before dispatch.");
+    }
+    await verifyQueuedPeerChildDispatchBoundary({
+      dispatchId: request.dispatchId,
+      attemptId: request.attemptId,
+      senderAgentId: childDispatch.senderAgentId,
+      senderWorkspaceId: childDispatch.senderWorkspaceId,
+      expectedRecipientId: childDispatch.recipientAgentId,
+      recipientId: request.recipientId,
+      correlationId: childDispatch.correlationId,
+    });
+  }
+
+  registerHostPeerDispatchVerifier(options.serverId, verifyPersistedPeerDispatchById, {
+    runtimeKey: peerRuntime,
+    ensureReady: () => ensurePeerRuntimeLoaded(peerRuntime),
+    onOutcome: handlePeerDispatchOutcome,
+    flushPendingOutcomes: flushPendingOutcomesOnShutdown,
+  });
+
+  function checkAndStagePeerPairSlot(
+    runtime: PeerWorkspaceRuntime,
+    draftWindows: Map<string, PeerPairWindow>,
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+  ): (targetWindows: Map<string, PeerPairWindow>) => void {
+    const currentMs = options.crossWorkspacePeerPolicy?.now?.() ?? Date.now();
+    const pairKey = [sourceWorkspaceId, targetWorkspaceId].sort().join("::");
+    const liveWindow = runtime.pairWindows.get(pairKey);
+    if ((liveWindow?.trippedUntil ?? 0) > currentMs) {
+      throw new PaseoToolInputError(
+        `Cross-workspace peer circuit breaker is active between ${sourceWorkspaceId} and ${targetWorkspaceId}. Stop automated peer exchanges and report to the user.`,
+      );
+    }
+    const existing = draftWindows.get(pairKey);
+    const activeTimestamps = (existing?.timestamps ?? []).filter(
+      (ts) => currentMs - ts < PEER_RATE_WINDOW_MS,
+    );
+    const rateLimit =
+      options.crossWorkspacePeerPolicy?.maxMessagesPerMinute ??
+      DEFAULT_MAX_PEER_MESSAGES_PER_MINUTE;
+    const cooldownMs =
+      options.crossWorkspacePeerPolicy?.cooldownMs ?? DEFAULT_PEER_CIRCUIT_COOLDOWN_MS;
+    if (activeTimestamps.length >= rateLimit) {
+      const tripped = { timestamps: activeTimestamps, trippedUntil: currentMs + cooldownMs };
+      setBoundedMapEntryWithUndo(runtime.pairWindows, pairKey, tripped, MAX_TRACKED_PEER_WINDOWS);
+      throw new PaseoToolInputError(
+        `Cross-workspace peer rate limit exceeded (${rateLimit} messages/minute) between ${sourceWorkspaceId} and ${targetWorkspaceId}; circuit breaker tripped.`,
+      );
+    }
+    const token = currentMs + Math.random() * 1e-6;
+    const nextWindow: PeerPairWindow = {
+      timestamps: [...activeTimestamps, token],
+      trippedUntil: existing?.trippedUntil ?? 0,
+    };
+    const undoMap = setBoundedMapEntryWithUndo(
+      draftWindows,
+      pairKey,
+      nextWindow,
+      MAX_TRACKED_PEER_WINDOWS,
+    );
+    return (targetWindows) => {
+      const current = targetWindows.get(pairKey);
+      if (!current) {
+        undoMap(targetWindows);
+        return;
+      }
+      const idx = current.timestamps.indexOf(token);
+      if (idx >= 0) current.timestamps.splice(idx, 1);
+      if (!existing && current.timestamps.length === 0 && current.trippedUntil === 0) {
+        undoMap(targetWindows);
+      }
+    };
+  }
+
+  function buildPeerDispatchGuidance(
+    targetId: string,
+    correlationId: string,
+    expectReply: boolean,
+  ): string {
+    const base = describeAgentMessage({
+      activeTurnBehavior: "queue",
+      running: agentManager.hasInFlightRun(targetId),
+      canSteer: agentManager.canSteer(targetId),
+    });
+    return expectReply
+      ? `${base} End your turn and wait for the peer workspace to reply via send_peer_message on correlationId "${correlationId}". Do not poll.`
+      : `${base} Peer reply queued with expectReply=false; thread "${correlationId}" has converged.`;
+  }
+
+  function formatPeerSenderTitle(
+    callerId: string,
+    sourceWorkspaceTitle: string,
+    storedCaller: StoredAgentRecord | null,
+    liveCaller: ManagedAgent | null,
+  ): string {
+    const senderRawTitle = resolveReportTitle(
+      callerId,
+      storedCaller?.title,
+      liveCaller?.config.title,
+    );
+    return senderRawTitle
+      ? `[${sourceWorkspaceTitle}] ${senderRawTitle}`
+      : `[${sourceWorkspaceTitle}] ${callerId.slice(0, 8)}`;
+  }
+
+  async function enqueueReservedPeerPrompt(params: {
+    callerId: string;
+    sourceWorkspaceId: string;
+    sourceWorkspaceTitle: string;
+    targetWorkspaceId: string;
+    resolvedTargetId: string;
+    senderTitle: string;
+    intent: SendPeerMessageInput["intent"];
+    subject?: string;
+    message: string;
+    step: {
+      correlationId: string;
+      nextHop: number;
+      effectiveMaxHops: number;
+      effectiveExpectReply: boolean;
+      inboundThread?: PeerThreadState;
+    };
+  }): Promise<string> {
+    const {
+      callerId,
+      sourceWorkspaceId,
+      sourceWorkspaceTitle,
+      targetWorkspaceId,
+      resolvedTargetId,
+      senderTitle,
+      intent,
+      subject,
+      message,
+      step,
+    } = params;
+    const dispatchId = randomUUID();
+    const peerDisplayMetadata = {
+      sourceWorkspaceId,
+      sourceWorkspaceTitle,
+      targetWorkspaceId,
+      correlationId: step.correlationId,
+      intent,
+      hop: step.nextHop,
+      maxHops: step.effectiveMaxHops,
+      expectReply: step.effectiveExpectReply,
+      ...(subject ? { subject } : {}),
+    };
+    // Atomic copy-on-write pre-enqueue commit: disk failure leaves in-memory runtime completely untouched.
+    const undoDraft = await commitPeerStateTransaction(
+      peerRuntime,
+      (draft) => {
+        const undoSlot = checkAndStagePeerPairSlot(
+          peerRuntime,
+          draft.pairWindows,
+          sourceWorkspaceId,
+          targetWorkspaceId,
+        );
+        const existingThread = draft.threads.get(step.correlationId);
+        const confirmedSnapshot = cloneBaseThreadSnapshot(existingThread?.confirmedSnapshot);
+        const repliedHops = new Set(step.inboundThread?.repliedHops ?? []);
+        if (intent === "reply" && step.inboundThread) repliedHops.add(step.inboundThread.hop);
+        const undoDelivery = setPeerDeliveryRecordWithUndo(
+          draft.byMessageId,
+          draft.inboundAgentLocks,
+          dispatchId,
+          {
+            kind: "peer-workspace-message",
+            dispatchId,
+            agentId: callerId,
+            ...(options.serverId ? { serverId: options.serverId } : {}),
+            title: senderTitle,
+            recipientAgentId: resolvedTargetId,
+            settled: false,
+            ...(step.inboundThread
+              ? { inboundThread: serializePeerThread(step.inboundThread) }
+              : {}),
+            ...peerDisplayMetadata,
+          },
+        );
+        const undoThread = setPeerThreadWithUndo(
+          draft,
+          step.correlationId,
+          {
+            correlationId: step.correlationId,
+            maxHops: step.effectiveMaxHops,
+            hop: step.nextHop,
+            expectReply: step.effectiveExpectReply,
+            lastSourceWorkspaceId: sourceWorkspaceId,
+            lastSourceAgentId: callerId,
+            lastTargetWorkspaceId: targetWorkspaceId,
+            lastTargetAgentId: resolvedTargetId,
+            repliedHops,
+            admitted: Boolean(confirmedSnapshot?.admitted),
+            ...(confirmedSnapshot ? { confirmedSnapshot } : {}),
+          },
+          countLocalHumanMessages,
+        );
+        return (rollbackTarget: PeerRuntimeMaps) => {
+          undoDelivery(rollbackTarget.byMessageId);
+          undoThread(rollbackTarget.threads);
+          undoSlot(rollbackTarget.pairWindows);
+        };
+      },
+      countLocalHumanMessages,
+    );
+
+    const transportSecret = await resolvePeerTransportSecret(options.paseoHome);
+    const encodedPrompt = encodePeerWorkspacePrompt(
+      {
+        dispatchId,
+        senderAgentId: callerId,
+        ...(options.serverId ? { senderServerId: options.serverId } : {}),
+        recipientAgentId: resolvedTargetId,
+        ...peerDisplayMetadata,
+      },
+      message,
+      transportSecret,
+    );
+    registerPromptDispatchVerifier(
+      dispatchId,
+      {
+        kind: "peer-workspace",
+        recipientId: resolvedTargetId,
+        senderAgentId: callerId,
+        senderServerId: options.serverId,
+      },
+      (recipientId, attemptId) =>
+        verifyQueuedPeerDispatchBoundary({
+          dispatchId,
+          attemptId,
+          correlationId: step.correlationId,
+          callerId,
+          recipientId,
+          expectedTargetId: resolvedTargetId,
+          sourceWorkspaceId,
+          targetWorkspaceId,
+          intent,
+          inboundThread: step.inboundThread,
+          expectedServerId: options.serverId,
+        }),
+      (outcome, context) => handlePeerDispatchOutcome(dispatchId, outcome, context),
+    );
+
+    try {
+      return await enqueueLocalAgentPrompt(resolvedTargetId, {
+        prompt: encodedPrompt,
+        source: {
+          agentId: callerId,
+          ...(options.serverId ? { serverId: options.serverId } : {}),
+          title: senderTitle,
+        },
+        activeTurnBehavior: "queue",
+        unarchive: false,
+        notifyLocalCaller: false,
+        notifyOnFinish: false,
+      });
+    } catch (enqueueError) {
+      releasePromptDispatchVerifier(dispatchId);
+      return await rollbackPeerDeltaAfterFailedEnqueue(undoDraft, enqueueError);
+    }
+  }
+
+  async function executeSendPeerMessageUnlocked(
+    callerId: string,
+    rawInput: SendPeerMessageInput,
+  ): Promise<PaseoToolResult> {
+    const { liveCaller, storedCaller, callerIsMainControl } =
+      await requirePeerCallerSession(callerId);
+    const { sourceWorkspaceId, sourceWorkspace, targetWorkspace } = await resolvePeerWorkspaces(
+      liveCaller?.workspaceId ?? storedCaller?.workspaceId,
+      rawInput.targetWorkspaceId,
+    );
+    const { targetWorkspaceId, targetAgentId, intent, subject, message, taskId } = rawInput;
+    const lookupThread = (id: string): PeerThreadState | undefined => peerRuntime.threads.get(id);
+
+    const step =
+      intent === "reply"
+        ? resolvePeerReplyStep({
+            rawInput,
+            callerId,
+            callerIsMainControl,
+            sourceWorkspaceId,
+            targetWorkspaceId,
+            lookupThread,
+          })
+        : resolvePeerInitiationStep({
+            rawInput,
+            callerIsMainControl,
+            sourceWorkspaceId,
+            targetWorkspaceId,
+            lookupThread,
+          });
+
+    const eligibleTargets = await listEligiblePeerTargets(
+      targetWorkspaceId,
+      targetAgentId ?? step.inboundThread?.lastSourceAgentId,
+    );
+    const resolvedTarget = selectPeerTargetAgent({
+      intent,
+      eligibleTargets,
+      targetWorkspaceId,
+      targetAgentId,
+      inboundThread: step.inboundThread,
+    });
+    await validateLocalPeerTaskId(taskId, callerIsMainControl, sourceWorkspaceId);
+
+    const [sourceUntrusted, targetUntrusted] = await Promise.all([
+      isWorkspaceUntrusted(sourceWorkspace),
+      isWorkspaceUntrusted(targetWorkspace),
+    ]);
+    const fastAdmitted = evaluatePeerFastAdmission({
+      sourceWorkspace,
+      targetWorkspace,
+      sourceUntrusted,
+      targetUntrusted,
+      resolvedTarget,
+      intent,
+      inboundThread: step.inboundThread,
+    });
+    if (!fastAdmitted) {
+      const approval = await requestOrReadPeerDurableApproval({
+        callerId,
+        sourceWorkspace,
+        targetWorkspace,
+        resolvedTarget,
+        sourceUntrusted,
+        targetUntrusted,
+        rawInput,
+        correlationId: step.correlationId,
+        nextHop: step.nextHop,
+        effectiveMaxHops: step.effectiveMaxHops,
+        effectiveExpectReply: step.effectiveExpectReply,
+      });
+      if (!approval.admitted) return approval.response;
+    }
+
+    const sourceWorkspaceTitle = resolveWorkspaceDisplayName(sourceWorkspace);
+    const senderTitle = formatPeerSenderTitle(
+      callerId,
+      sourceWorkspaceTitle,
+      storedCaller,
+      liveCaller,
+    );
+    const messageId = await enqueueReservedPeerPrompt({
+      callerId,
+      sourceWorkspaceId,
+      sourceWorkspaceTitle,
+      targetWorkspaceId,
+      resolvedTargetId: resolvedTarget.id,
+      senderTitle,
+      intent,
+      subject,
+      message,
+      step,
+    });
+
+    return {
+      content: [],
+      structuredContent: ensureValidJson({
+        success: true,
+        deliveryStatus: "queued",
+        messageId,
+        correlationId: step.correlationId,
+        hop: step.nextHop,
+        maxHops: step.effectiveMaxHops,
+        expectReply: step.effectiveExpectReply,
+        targetWorkspaceId,
+        targetAgentId: resolvedTarget.id,
+        status: agentManager.getAgent(resolvedTarget.id)?.lifecycle ?? "idle",
+        ...(taskId ? { taskId } : {}),
+        guidance: buildPeerDispatchGuidance(
+          resolvedTarget.id,
+          step.correlationId,
+          step.effectiveExpectReply,
+        ),
+      }),
+    };
+  }
+
+  async function executeSendPeerMessage(rawInput: SendPeerMessageInput): Promise<PaseoToolResult> {
+    if (!callerAgentId) {
+      throw new PaseoToolInputError("send_peer_message requires an agent-scoped tool session.");
+    }
+    return withPeerStateMutex(peerRuntime, async () => {
+      await flushPendingPeerOutcomesUnlocked();
+      return executeSendPeerMessageUnlocked(callerAgentId, rawInput);
+    });
+  }
+
+  if (scope === "agent") {
+    registerTool(
+      "send_peer_message",
+      {
+        title: "Send cross-workspace peer message",
+        description:
+          "Send a read-only cross-workspace query, protocol alignment request, or reply to another workspace's Main Control (or a user-specified top-level root session when that workspace has no Main Control). Peer messages never grant file-edit, git-write, or lifecycle authority in the target workspace.",
+        inputSchema: sendPeerMessageInputSchema,
+        outputSchema: {
+          success: z.boolean(),
+          deliveryStatus: z.enum(["queued", "awaiting_approval"]),
+          messageId: z.string().optional(),
+          correlationId: z.string(),
+          hop: z.number().int().min(1),
+          maxHops: z.number().int().min(1),
+          expectReply: z.boolean(),
+          targetWorkspaceId: z.string(),
+          targetAgentId: z.string().optional(),
+          approvalRequestId: z.string().optional(),
+          status: AgentStatusEnum.optional(),
+          taskId: z.string().optional(),
+          guidance: z.string(),
+        },
+      },
+      executeSendPeerMessage,
+    );
+  }
 
   async function readRemoteParentForReport(parent: { agentId: string; serverId: string }) {
     if (!options.hosts) return undefined;
@@ -3156,7 +6554,7 @@ function createToolCatalog(
         },
         {
           status,
-          summary,
+          summary: neutralizePeerWorkspacePromptMarker(summary),
           title: resolveReportTitle(callerAgentId, caller.title),
           turnId,
         },

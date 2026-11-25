@@ -177,9 +177,13 @@ describe("agent interaction projection", () => {
     expect(project(source).tail).toEqual([human, summary, notification]);
   });
 
-  it("keeps ordinary tools, permission tools and arbitrary shell wrappers", () => {
+  it("keeps ordinary tools, permission tools, cross-workspace peer tools and arbitrary shell wrappers", () => {
     const tools = [
       "mcp__paseo__list_hosts",
+      "mcp__paseo__list_workspaces",
+      "mcp__paseo__send_peer_message",
+      "paseo.send_peer_message",
+      "paseo_send_peer_message",
       "paseo.create_workspace",
       "paseo.create_schedule",
       "paseo.list_pending_permissions",
@@ -192,7 +196,34 @@ describe("agent interaction projection", () => {
       type: "shell",
       command: "paseo send child --prompt hello",
     };
-    expect(project(tools).tail).toBe(tools);
+    const peerOrchestrator: StreamItem = {
+      kind: "tool_call",
+      id: "peer-orchestrator",
+      timestamp,
+      payload: {
+        source: "orchestrator",
+        data: {
+          toolCallId: "peer-orchestrator",
+          toolName: "paseo.send_peer_message",
+          arguments: { targetWorkspaceId: "wks_oncall" },
+          status: "completed",
+        },
+      },
+    };
+    const peerInbound = tool("peer-inbound", "agent_message");
+    peerInbound.payload.data.agentMessage = {
+      event: "message",
+      sender: { id: "6c6af207", serverId: "srv_1", title: "[oncall_projects] Root" },
+      text: "Workspace: oncall_projects · align (hop 1/4)\n\nProtocol confirmed.",
+    };
+    const allRows = [...tools, peerOrchestrator, peerInbound];
+    for (const row of tools) {
+      expect(isAgentInteraction(row)).toBe(false);
+    }
+    expect(isAgentInteraction(peerOrchestrator)).toBe(false);
+    const projected = project(allRows);
+    expect(projected.tail).toBe(allRows);
+    expect(projected.hiddenItemIds.size).toBe(0);
   });
 
   it("recognizes only namespaced Paseo orchestrator calls", () => {
