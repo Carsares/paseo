@@ -79,6 +79,9 @@ export function buildMainControlPlaybookGuidance(): string[] {
   ];
 }
 
+const REVIEW_ROUND_LIMIT =
+  "Cap the review or review-and-fix stage at two rounds total. Never start a third round. After round two, stop immediately and report any unresolved issues to Main Control.";
+
 export function buildLeadPlaybookContract(params: {
   parentAgentId: string;
   playbook: LeadPlaybook;
@@ -92,6 +95,7 @@ export function buildLeadPlaybookContract(params: {
         "Decompose the approved scope into mutually exclusive file tracks: dispatch at most 2-3 Level-2 implementation tracks plus 1 cross-track independent blind-review track, folding small adjacent edits into an existing matching track.",
         'Reuse a warm idle same-workspace specialist or child with matching scope and clean context when appropriate; otherwise call create_agent with notifyOnFinish: true (omit parentReporting: "explicit" on Level-2). Follow any model and thinking-tier guidance from your parent prompt.',
         "Enforce strict role isolation: an implementer must never review its own changes. After dispatching each Level-2 wave, end your turn immediately and wait passively for completion notifications without polling.",
+        REVIEW_ROUND_LIMIT,
         commitPolicy === "scoped_only"
           ? "After cross-track blind review and targeted verification pass, commit only this batch's owned files with git commit --only -- <owned files> without touching unrelated workspace edits, and archive temporary Level-2 subagents that have no open client tabs."
           : "After cross-track blind review and targeted verification pass, leave verified edits uncommitted in the working tree (do not run git commit or git push), and archive temporary Level-2 subagents that have no open client tabs.",
@@ -100,11 +104,12 @@ export function buildLeadPlaybookContract(params: {
       return [
         `Role: Level-1 Convergent Code-Review & Fix Lead under Main Control Agent ${parentAgentId}.`,
         "Coordinate iterative, role-isolated code review and repair across the requested scope (or full branch diff against the base branch when unspecified) within this single Level-1 lead session.",
-        "Partition review slices proportionally to diff size (1-3 slices by default, at most 5 for very large diffs) and pin shared baseline invariants at the top of Level-2 prompts. Reuse a read-only slice reviewer across at most 3 consecutive rounds for incremental checks (skip unchanged, uncoupled slices from round 2 onward) and reuse same-scope fix or verification agents up to 3 rounds; spawn a fresh independent arbiter each round to falsify findings against source code, and never let a fixer act as reviewer or arbiter.",
+        REVIEW_ROUND_LIMIT,
+        "Partition review slices proportionally to diff size (1-3 slices by default, at most 5 for very large diffs) and pin shared baseline invariants at the top of Level-2 prompts. If a second round is needed, reuse read-only slice reviewers and same-scope fix or verification agents and skip unchanged, uncoupled slices. Spawn a fresh independent arbiter each round to falsify findings against source code, and never let a fixer act as reviewer or arbiter.",
         'Dispatch Level-2 subagents with notifyOnFinish: true (omit parentReporting: "explicit"), cap concurrent repair at 2-3 fix tracks plus 1 cross-track verification track, and end your turn immediately after each dispatch to wait passively for notifications without polling.',
         commitPolicy === "scoped_only"
-          ? "Fix deterministic blocking defects autonomously while setting aside genuine contract dilemmas until deterministic blockers reach zero; commit each verified repair round with git commit --only -- <repaired files> and archive finished temporary Level-2 subagents without open client tabs."
-          : "Fix deterministic blocking defects autonomously while setting aside genuine contract dilemmas until deterministic blockers reach zero; keep verified repairs uncommitted in the working tree (do not run git commit or git push) and archive finished temporary Level-2 subagents without open client tabs.",
+          ? "Within the round limit, fix deterministic blocking defects autonomously and defer contract dilemmas while those blockers remain. Commit each verified repair round with git commit --only -- <repaired files> and archive finished temporary Level-2 subagents without open client tabs."
+          : "Within the round limit, fix deterministic blocking defects autonomously and defer contract dilemmas while those blockers remain. Keep verified repairs uncommitted in the working tree (do not run git commit or git push) and archive finished temporary Level-2 subagents without open client tabs.",
       ];
     case "readonly_cr":
       return [

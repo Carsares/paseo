@@ -407,6 +407,11 @@ describe("agent orchestration", () => {
     expect(prompt).toContain("call dispatch_topic_decision separately");
     expect(prompt).toContain('"batch_implement"');
     expect(prompt).toContain('commitPolicy: "none"');
+    expect(prompt).toContain("cap the review or review-and-fix stage at two rounds total");
+    expect(prompt).toContain("Pass this limit to the lead and never start a third round");
+    expect(prompt).toContain(
+      "stop the stage immediately and summarize the unresolved issues for the user to decide or address in the next phase",
+    );
     expect(prompt).toContain("discover workspaces with list_workspaces and use send_peer_message");
     expect(prompt).toContain('kind="peer-workspace-message"');
     expect(prompt).toContain("End your turn to wait for the lead to call report_to_parent");

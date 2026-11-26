@@ -128,6 +128,24 @@ describe("orchestration playbook contracts", () => {
       playbook: "readonly_cr",
       commitPolicy: "none",
     }).join("\n");
+    expect(readonly).toContain("single-round layered, strictly read-only code review");
     expect(readonly).toContain("Never modify files, stage changes, commit, or push.");
   });
+
+  test.each(["batch_implement", "cr_fix_loop"] as const)(
+    "stops %s review after two rounds and reports unresolved issues",
+    (playbook) => {
+      const contract = buildLeadPlaybookContract({
+        parentAgentId: "main-1",
+        playbook,
+        commitPolicy: "none",
+      }).join("\n");
+      expect(contract).toContain("Cap the review or review-and-fix stage at two rounds total");
+      expect(contract).toContain("Never start a third round");
+      expect(contract).toContain(
+        "After round two, stop immediately and report any unresolved issues to Main Control",
+      );
+      expect(contract).not.toMatch(/\b3 (?:consecutive )?rounds\b/);
+    },
+  );
 });
