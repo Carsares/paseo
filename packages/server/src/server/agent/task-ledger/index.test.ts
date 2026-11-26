@@ -13,6 +13,7 @@ import { taskReuseDecision } from "./reuse.js";
 import { listWorkspaceTaskSummaries } from "../../task-ledger-rpc.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { createPersistedWorkspaceRecord } from "../../workspace-registry.js";
+import { computeWorkspaceTaskFileConflicts } from "./touched-files.js";
 
 const workspaceId = "workspace-a";
 let root: string;
@@ -30,6 +31,106 @@ afterEach(async () => {
 });
 
 describe("WorkspaceTaskLedgerStore", () => {
+  it("persists a legacy question's generation before reads and update selectors see it", async () => {
+    const legacyTask = await store.upsert(workspaceId, {
+      taskId: "legacy",
+      title: "Legacy",
+      status: "awaiting_decision",
+      blockingQuestion: "Which day?",
+    });
+    const file = join(paseoHome, "tasks", `${workspaceId}.json`);
+    await writeFile(
+      file,
+      JSON.stringify([{ ...legacyTask, blockingQuestionGeneration: undefined }]),
+    );
+    const other = new WorkspaceTaskLedgerStore(paseoHome);
+    const [first, second, updated] = await Promise.all([
+      store.list(workspaceId),
+      other.list(workspaceId),
+      other.syncFromTurnOutcome(workspaceId, legacyTask.taskId, (current) => {
+        expect(current.blockingQuestionGeneration).toEqual(expect.any(String));
+        return { handoffSummary: "Unrelated update" };
+      }),
+    ]);
+    const generation = first[0]?.blockingQuestionGeneration;
+    expect(generation).toEqual(expect.any(String));
+    expect(second[0]?.blockingQuestionGeneration).toBe(generation);
+    expect(updated?.blockingQuestionGeneration).toBe(generation);
+    expect(JSON.parse(await readFile(file, "utf8"))[0].blockingQuestionGeneration).toBe(generation);
+    expect(first[0]?.updatedAt).toBe(legacyTask.updatedAt);
+  });
+
+  it("assigns a fresh generation to repeated blocking text and retains it across other writes", async () => {
+    const question = { taskId: "active", blockingQuestion: "Choose an option" };
+    const first = await store.upsert(workspaceId, { ...question, title: "Active" });
+    expect(first.blockingQuestionGeneration).toEqual(expect.any(String));
+    await store.addTouchedFiles(workspaceId, question.taskId, ["response.ts"]);
+    expect((await store.list(workspaceId))[0]?.blockingQuestionGeneration).toBe(
+      first.blockingQuestionGeneration,
+    );
+    const second = await store.upsert(workspaceId, question);
+    expect(second.blockingQuestionGeneration).not.toBe(first.blockingQuestionGeneration);
+    const third = await store.syncFromTurnOutcome(workspaceId, question.taskId, {
+      blockingQuestion: question.blockingQuestion,
+    });
+    expect(third?.blockingQuestionGeneration).not.toBe(second.blockingQuestionGeneration);
+    expect((await new WorkspaceTaskLedgerStore(paseoHome).list(workspaceId))[0]).toEqual(third);
+  });
+
+  it("atomically merges files and report fields and notifies other instances only after changes", async () => {
+    await store.upsert(workspaceId, {
+      taskId: "active",
+      title: "Active",
+      status: "awaiting_decision",
+      blockingQuestion: "Choose an option",
+    });
+    const other = new WorkspaceTaskLedgerStore(paseoHome);
+    const changes: string[] = [];
+    const unsubscribe = other.subscribe((id) => changes.push(id));
+    try {
+      await Promise.all([
+        store.addTouchedFiles(workspaceId, "active", ["a.ts", "../outside.ts", ".git/HEAD"]),
+        other.addTouchedFiles(workspaceId, "active", ["b.ts", "a.ts"]),
+        store.syncFromTurnOutcome(workspaceId, "active", (current) => ({
+          status: current.status === "awaiting_decision" ? "in_progress" : current.status,
+          blockingQuestion: null,
+          latestReplyPreview: "Proceed",
+        })),
+      ]);
+      const [updated] = await other.list(workspaceId);
+      expect(updated).toMatchObject({
+        status: "in_progress",
+        touchedFiles: ["a.ts", "b.ts"],
+        latestReplyPreview: "Proceed",
+      });
+      expect(updated).not.toHaveProperty("blockingQuestion");
+      await store.addTouchedFiles(workspaceId, "active", ["b.ts"]);
+      await store.addTouchedFiles(workspaceId, "missing", ["ignored.ts"]);
+      expect(changes).toEqual([workspaceId, workspaceId, workspaceId]);
+    } finally {
+      unsubscribe();
+    }
+    await store.upsert(workspaceId, { taskId: "active", status: "completed" });
+    await store.addTouchedFiles(workspaceId, "active", ["late.ts"]);
+    expect((await other.list(workspaceId))[0]?.touchedFiles).toEqual(["a.ts", "b.ts"]);
+    expect(changes).toHaveLength(3);
+  });
+
+  it("bounds the peer list even when many tasks edit the same file", async () => {
+    const seed = await store.upsert(workspaceId, { taskId: "seed", title: "Seed" });
+    const tasks = Array.from({ length: 30 }, (_, index) => ({
+      ...seed,
+      taskId: String(index),
+      touchedFiles: ["shared.ts"],
+    }));
+    const conflicts = computeWorkspaceTaskFileConflicts(tasks);
+    expect(conflicts.size).toBe(30);
+    for (const owner of tasks) {
+      const peers = conflicts.get(owner.taskId)?.[0]?.peers;
+      expect(peers?.length).toBe(16);
+      expect(peers?.map(({ taskId }) => taskId)).not.toContain(owner.taskId);
+    }
+  });
   it("round-trips topic fields and projects them through the task RPC alongside legacy tasks", async () => {
     const legacy = await store.upsert(workspaceId, { taskId: "legacy", title: "Legacy" });
     const fields = {

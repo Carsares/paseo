@@ -9,7 +9,24 @@ import {
 } from "@getpaseo/protocol/chunked-transport";
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
 import { createAgentMessageDelivery } from "./agent/agent-messages/index.js";
-import { WorkspaceTaskLedgerStore } from "./agent/task-ledger/index.js";
+import {
+  TASK_PENDING_SILENT_REPORT_LIMIT,
+  WorkspaceTaskLedgerStore,
+  type WorkspaceTask,
+} from "./agent/task-ledger/index.js";
+import {
+  shouldBypassMainControlWakeup,
+  taskReportOutcomePatch,
+} from "./agent/task-ledger/report-sync.js";
+import {
+  extractModifiedPathsFromTimelineItems,
+  isActiveWorkspaceTask,
+} from "./agent/task-ledger/touched-files.js";
+import {
+  readWorkspaceSituation,
+  type WorkspaceSituation,
+  type WorkspaceSituationOptions,
+} from "./agent/workspace-situation.js";
 import {
   createPeerPromptHandoff,
   sendPreparedPromptToAgent,
@@ -56,7 +73,15 @@ import { CreationService } from "./creation/index.js";
 import { openDurableItemStore } from "./durable-items/requests.js";
 import type { DurableItemStore } from "./durable-items/store.js";
 import { TopicReadStateStore } from "./topic-read-state/store.js";
-import { TopicThreadStore } from "./topic-threads/store.js";
+import { TopicThreadStore, type TopicTaskBinding } from "./topic-threads/store.js";
+import {
+  requireMatchingAnchor,
+  TOPIC_ANCHOR_LIMIT,
+  topicAnchorsBeforeReset,
+} from "./topic-threads/anchors.js";
+import type { AgentTimelineRow } from "./agent/agent-timeline-store-types.js";
+import { createTopicDecisionService } from "./topic-threads/decide.js";
+import { summarizeWorkspaceTasks } from "./task-ledger-rpc.js";
 import {
   createTopicPromptDispatcher,
   createTopicReplyRouter,
@@ -252,6 +277,7 @@ export interface ServerFeatureOverrides {
   workspaceTopicThreads?: boolean;
   workspaceTopicReadState?: boolean;
   workspaceTodos?: boolean;
+  workspaceButlerV1?: boolean;
   workspaceDurableItemsV1?: boolean;
   checkoutGitStagingV1?: boolean;
   checkoutGitGraphV1?: boolean;
@@ -777,7 +803,11 @@ export class VoiceAssistantWebSocketServer {
   private readonly creationService: CreationService;
   private readonly projectRegistry: ProjectRegistry;
   private readonly workspaceRegistry: WorkspaceRegistry;
+  private readonly taskLedger: WorkspaceTaskLedgerStore;
+  private readonly unsubscribeTaskLedger: () => void;
+  private readonly pendingTaskUpdates = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly durableItems: DurableItemStore;
+  private readonly unsubscribeDurableItems: () => void;
   private readonly workspaceBaseBranch: WorkspaceBaseBranchService;
   private readonly workspaceLabelService: WorkspaceLabelService | null;
   private readonly scheduleService: ScheduleService;
@@ -840,6 +870,7 @@ export class VoiceAssistantWebSocketServer {
   private connectionLifecycle: "starting" | "accepting" | "stopping" = "accepting";
   private readonly featureOverrides: ServerFeatureOverrides;
   private readonly topicThreadStore: TopicThreadStore;
+  readonly decideTopicAction: ReturnType<typeof createTopicDecisionService>;
   private readonly topicReadState: TopicReadStateStore;
   private readonly todos: WorkspaceTodoStore;
   private readonly topicReplyRouter: ReturnType<typeof createTopicReplyRouter>;
@@ -935,28 +966,7 @@ export class VoiceAssistantWebSocketServer {
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
     this.agentMessages = createAgentMessageDelivery({
-      shouldHoldInbox: (parentId, source) => {
-        const live = agentManager.getAgent(parentId);
-        if (live && !isMainControlAgentLabels(live.labels)) return false;
-        const taskId = source?.kind === "agent-message" ? source.taskId || undefined : undefined;
-        const sourceServerId = source?.serverId ?? serverId;
-        const hasLocalChild = agentManager.listAgents().some((child) => {
-          if (source?.agentId === child.id && sourceServerId === serverId) return false;
-          if ((child.labels?.[TASK_ID_LABEL] || undefined) !== taskId) return false;
-          if (isResidentAgentLabels(child.labels) && hasResidentInboxBypass(child.labels))
-            return false;
-          const parent = getParentAddressFromLabels(child.labels, serverId);
-          return (
-            parent?.agentId === parentId &&
-            parent.serverId === serverId &&
-            (child.lifecycle === "initializing" || agentManager.hasInFlightRun(child.id))
-          );
-        });
-        return (
-          hasLocalChild ||
-          this.hasRemoteInboxChild(parentId, taskId, [sourceServerId, source?.agentId])
-        );
-      },
+      shouldHoldInbox: (parentId, source) => this.shouldHoldSubagentInbox(parentId, source),
       onInboxChange: (agentId) => {
         void agentManager.notifyAgentInboxChanged(agentId).catch((err) => {
           this.logger.warn({ err, agentId }, "Failed to publish subagent inbox update");
@@ -1122,13 +1132,17 @@ export class VoiceAssistantWebSocketServer {
     );
     this.projectRegistry = projectRegistry ?? createNoopProjectRegistry();
     this.workspaceRegistry = workspaceRegistry ?? createNoopWorkspaceRegistry();
+    this.taskLedger = new WorkspaceTaskLedgerStore(paseoHome);
+    this.unsubscribeTaskLedger = this.taskLedger.subscribe((workspaceId) =>
+      this.scheduleWorkspaceTaskUpdate(workspaceId),
+    );
     this.topicThreadStore = new TopicThreadStore(paseoHome);
     this.topicReadState = new TopicReadStateStore(join(paseoHome, "topic-read-state"));
     this.todos = new WorkspaceTodoStore(join(paseoHome, "todos"));
     this.topicReplyRouter = createTopicReplyRouter({
       serverId,
       store: this.topicThreadStore,
-      taskLedger: new WorkspaceTaskLedgerStore(paseoHome),
+      taskLedger: this.taskLedger,
       readAgent: async (agentId) => {
         const live = this.agentManager.getAgent(agentId);
         const stored = await this.agentStorage.get(agentId);
@@ -1155,6 +1169,29 @@ export class VoiceAssistantWebSocketServer {
       serverId,
       workspaceRegistry: this.workspaceRegistry,
       agentStorage: this.agentStorage,
+    });
+    this.unsubscribeDurableItems = this.durableItems.subscribe((item) => {
+      if (this.featureOverrides.workspaceButlerV1 === false) return;
+      this.broadcast(
+        wrapSessionMessage({
+          type: "workspace.durable_item.updated",
+          payload: { workspaceId: item.workspaceId, item },
+        }),
+      );
+    });
+    this.decideTopicAction = createTopicDecisionService({
+      serverId,
+      store: this.topicThreadStore,
+      router: this.topicReplyRouter,
+      workspaceRegistry: this.workspaceRegistry,
+      taskLedger: this.taskLedger,
+      durableItems: this.durableItems,
+      broadcast: (message) => {
+        if (message.type === "workspace.topic.thread.updated") {
+          this.broadcast(wrapSessionMessage(message));
+        }
+      },
+      logger: this.logger,
     });
     this.workspaceLabelService = workspaceLabelService ?? null;
     const requiredServices = requireWebSocketServices({
@@ -1564,6 +1601,12 @@ export class VoiceAssistantWebSocketServer {
     message: SessionOutboundMessage,
   ): (typeof CLIENT_CAPS)[keyof typeof CLIENT_CAPS] | null {
     if (message.type === "workspace.topic.thread.updated") return CLIENT_CAPS.workspaceTopicThreads;
+    if (
+      message.type === "workspace.topic.anchor.updated" ||
+      message.type === "workspace.tasks.updated" ||
+      message.type === "workspace.durable_item.updated"
+    )
+      return CLIENT_CAPS.workspaceButlerV1;
     if (message.type === "workspace.topic_read.updated") return CLIENT_CAPS.workspaceTopicReadState;
     if (
       message.type === "workspace.todo.updated" ||
@@ -1573,21 +1616,174 @@ export class VoiceAssistantWebSocketServer {
     return null;
   }
 
+  private scheduleWorkspaceTaskUpdate(workspaceId: string): void {
+    if (this.pendingTaskUpdates.has(workspaceId)) return;
+    const timer = setTimeout(() => {
+      this.pendingTaskUpdates.delete(workspaceId);
+      void this.taskLedger
+        .list(workspaceId)
+        .then((tasks) => {
+          if (this.connectionLifecycle === "stopping") return;
+          this.broadcast(
+            wrapSessionMessage({
+              type: "workspace.tasks.updated",
+              payload: { workspaceId, tasks: summarizeWorkspaceTasks(tasks) },
+            }),
+          );
+          return undefined;
+        })
+        .catch((err) => this.logger.warn({ err, workspaceId }, "Failed to publish task changes"));
+    }, 250);
+    timer.unref();
+    this.pendingTaskUpdates.set(workspaceId, timer);
+  }
+
+  async persistTopicAnchor(
+    anchor: Parameters<TopicThreadStore["upsertAnchor"]>[0],
+    knownTasks?: readonly TopicTaskBinding[],
+  ) {
+    const tasks =
+      knownTasks ??
+      (anchor.taskId && anchor.rootMessageId ? await this.taskLedger.list(anchor.workspaceId) : []);
+    const stored = await this.topicThreadStore.upsertAnchor(anchor, undefined, tasks);
+    this.broadcast(
+      wrapSessionMessage({
+        type: "workspace.topic.anchor.updated",
+        payload: {
+          workspaceId: stored.workspaceId,
+          mainAgentId: stored.mainAgentId,
+          anchor: stored,
+        },
+      }),
+    );
+    return stored;
+  }
+
+  listTopicEntries(scope: Parameters<TopicThreadStore["list"]>[0]) {
+    return this.topicThreadStore.list(scope);
+  }
+
+  async preserveTopicHistory(
+    scope: Parameters<TopicThreadStore["listWithAnchors"]>[0],
+    rows: readonly AgentTimelineRow[],
+  ): Promise<void> {
+    await this.topicReplyRouter.requireMain(scope);
+    const [{ anchors, entries }, tasks] = await Promise.all([
+      this.topicThreadStore.listWithAnchors(scope),
+      this.taskLedger.list(scope.workspaceId),
+    ]);
+    const followupMessageIds = new Set(
+      entries.flatMap((entry) =>
+        entry.role === "user_followup" && entry.sourceMessageId ? [entry.sourceMessageId] : [],
+      ),
+    );
+    const required = topicAnchorsBeforeReset(scope, rows, tasks, anchors, followupMessageIds);
+    const existing = new Map(anchors.map((anchor) => [anchor.topicKey, anchor]));
+    const retiredMessageKeys = new Set(
+      required.flatMap((anchor) =>
+        anchor.taskId && anchor.rootMessageId ? [`msg:${anchor.rootMessageId}`] : [],
+      ),
+    );
+    const expected = new Map(
+      anchors
+        .filter((anchor) => !retiredMessageKeys.has(anchor.topicKey))
+        .map((anchor) => [anchor.topicKey, anchor]),
+    );
+    const expectedCount = new Set([
+      ...expected.keys(),
+      ...required.map((anchor) => anchor.topicKey),
+    ]).size;
+    if (expectedCount > TOPIC_ANCHOR_LIMIT)
+      throw new Error("Too many topics to preserve before clearing history.");
+    for (const anchor of required) {
+      requireMatchingAnchor(existing.get(anchor.topicKey), anchor);
+    }
+    for (const anchor of required) {
+      const prior = existing.get(anchor.topicKey);
+      if (
+        prior &&
+        !(anchor.taskId && existing.has(`msg:${anchor.rootMessageId}`)) &&
+        prior.rootMessageId === anchor.rootMessageId &&
+        prior.taskId === anchor.taskId &&
+        (prior.rootPromptText === anchor.rootPromptText ||
+          (prior.rootPromptText && prior.rootPromptText !== prior.title)) &&
+        prior.title === anchor.title &&
+        prior.leadAgentId === anchor.leadAgentId &&
+        prior.leadServerId === anchor.leadServerId
+      )
+        continue;
+      const written = await this.persistTopicAnchor(anchor, tasks);
+      expected.set(written.topicKey, written);
+    }
+    await this.verifyPreservedTopicHistory(scope, expected);
+  }
+
+  private async verifyPreservedTopicHistory(
+    scope: Parameters<TopicThreadStore["listWithAnchors"]>[0],
+    expected: ReadonlyMap<string, Awaited<ReturnType<TopicThreadStore["upsertAnchor"]>>>,
+  ): Promise<void> {
+    const stored = new Map(
+      (await this.topicThreadStore.listWithAnchors(scope)).anchors.map((anchor) => [
+        anchor.topicKey,
+        anchor,
+      ]),
+    );
+    for (const [key, anchor] of expected) {
+      const saved = stored.get(key);
+      if (
+        !saved ||
+        saved.rootMessageId !== anchor.rootMessageId ||
+        saved.taskId !== anchor.taskId ||
+        saved.rootPromptText !== anchor.rootPromptText ||
+        saved.title !== anchor.title ||
+        saved.leadAgentId !== anchor.leadAgentId ||
+        saved.leadServerId !== anchor.leadServerId
+      )
+        throw new Error("Could not verify the preserved topic history.");
+    }
+  }
+
+  getWorkspaceSituation(
+    workspaceId: string,
+    mainAgentId: string,
+    options: WorkspaceSituationOptions,
+  ): Promise<WorkspaceSituation> {
+    return readWorkspaceSituation(
+      {
+        listTasks: (id) => this.taskLedger.list(id),
+        listPendingDurableItems: (id) =>
+          this.durableItems.listPendingWorkspaceItems({ workspaceId: id, serverId: this.serverId }),
+        listPendingTodos: (id) => this.todos.list({ workspaceIds: [id], statusFilter: "pending" }),
+        listWithAnchors: (scope) => this.topicThreadStore.listWithAnchors(scope),
+        getReadState: (scope) => this.topicReadState.getState(scope),
+        getTimeline: (agentId) => this.agentManager.fetchTimeline(agentId, { limit: 0 }),
+        listAgents: () => this.agentManager.listAgents(),
+        readTaskParticipantReuse: (...args) => this.agentManager.readTaskParticipantReuse(...args),
+      },
+      workspaceId,
+      mainAgentId,
+      options,
+    );
+  }
+
   private workspaceTopicFeatures(): {
     workspaceTopicThreads?: true;
     workspaceTopicReadState?: true;
     workspaceTodos?: true;
+    workspaceButlerV1?: true;
   } {
     const features: {
       workspaceTopicThreads?: true;
       workspaceTopicReadState?: true;
       workspaceTodos?: true;
+      workspaceButlerV1?: true;
     } = {};
     if (this.featureOverrides.workspaceTopicThreads !== false)
       features.workspaceTopicThreads = true;
     if (this.featureOverrides.workspaceTopicReadState !== false)
       features.workspaceTopicReadState = true;
     if (this.featureOverrides.workspaceTodos !== false) features.workspaceTodos = true;
+    if (this.featureOverrides.workspaceButlerV1 !== false) features.workspaceButlerV1 = true;
     return features;
   }
 
@@ -1715,6 +1911,10 @@ export class VoiceAssistantWebSocketServer {
 
   public async close(options?: { waitForAgentMessages?: boolean }): Promise<void> {
     this.prepareForShutdown();
+    this.unsubscribeTaskLedger();
+    this.unsubscribeDurableItems();
+    for (const timer of this.pendingTaskUpdates.values()) clearTimeout(timer);
+    this.pendingTaskUpdates.clear();
     await this.topicReplyRouter.close();
     await this.todoDeadlineScheduler.stop();
     this.unsubscribeProxyTrust?.();
@@ -2309,6 +2509,16 @@ export class VoiceAssistantWebSocketServer {
       todos: this.todos,
       topicReplyRouter: this.topicReplyRouter,
       topicThreadStore: this.topicThreadStore,
+      persistTopicAnchor: (anchor) => this.persistTopicAnchor(anchor),
+      decideWorkspaceTopic:
+        this.featureOverrides.workspaceButlerV1 === false
+          ? undefined
+          : (request, principalId) =>
+              this.decideTopicAction(request, {
+                origin: "decision_reply",
+                serverId: this.serverId,
+                principalId,
+              }),
       publishTopicReadUpdate: (message) => this.broadcast({ type: "session", message }),
       publishTodoUpdate: (message) => this.broadcast({ type: "session", message }),
       workspaceBaseBranch: this.workspaceBaseBranch,
@@ -3605,6 +3815,31 @@ export class VoiceAssistantWebSocketServer {
     return false;
   }
 
+  private shouldHoldSubagentInbox(
+    parentId: string,
+    source?: { kind: string; agentId: string; serverId?: string; taskId?: string },
+  ): boolean {
+    const { agentManager, serverId } = this;
+    const live = agentManager.getAgent(parentId);
+    if (live && !isMainControlAgentLabels(live.labels)) return false;
+    const taskId = source?.kind === "agent-message" ? source.taskId || undefined : undefined;
+    const sourceServerId = source?.serverId ?? serverId;
+    return (
+      agentManager.listAgents().some((child) => {
+        if (source?.agentId === child.id && sourceServerId === serverId) return false;
+        if ((child.labels?.[TASK_ID_LABEL] || undefined) !== taskId) return false;
+        if (isResidentAgentLabels(child.labels) && hasResidentInboxBypass(child.labels))
+          return false;
+        const parent = getParentAddressFromLabels(child.labels, serverId);
+        return (
+          parent?.agentId === parentId &&
+          parent.serverId === serverId &&
+          (child.lifecycle === "initializing" || agentManager.hasInFlightRun(child.id))
+        );
+      }) || this.hasRemoteInboxChild(parentId, taskId, [sourceServerId, source?.agentId])
+    );
+  }
+
   private async isUrgentResidentReport(parentId: string, childId: string): Promise<boolean> {
     const child = this.agentManager.getAgent(childId) ?? (await this.agentStorage.get(childId));
     const parent = getParentAddressFromLabels(child?.labels, this.serverId);
@@ -3677,6 +3912,167 @@ export class VoiceAssistantWebSocketServer {
     if (record.hasFinalSnapshot !== false) await this.assertCurrentReportParent(record);
   }
 
+  private async readTaskReportContext(
+    record: FinishSubscription,
+    taskId: string,
+    childServerId: string,
+    rootMessageId?: string,
+  ) {
+    const mainAgentId = record.callerAgentId;
+    const storedParent = await this.agentStorage.get(mainAgentId);
+    const parentAgent = this.agentManager.getAgent(mainAgentId) ?? storedParent;
+    const workspaceId = parentAgent?.workspaceId;
+    if (!workspaceId || storedParent?.archivedAt || !isMainControlAgentLabels(parentAgent.labels))
+      return;
+    const workspace = await this.workspaceRegistry.get(workspaceId);
+    if (!workspace?.topic || workspace.archivedAt) return;
+
+    const tasks = await this.taskLedger.list(workspaceId);
+    const task = tasks.find((candidate) => candidate.taskId === taskId);
+    if (!task || (rootMessageId && task.rootMessageId && rootMessageId !== task.rootMessageId))
+      return;
+    const ownedTask = (candidate: WorkspaceTask) =>
+      candidate.createdAt === task.createdAt &&
+      ((candidate.leadAgentId === record.childAgentId &&
+        (candidate.leadServerId ?? this.serverId) === childServerId) ||
+        candidate.participants.some(
+          (participant) =>
+            participant.agentId === record.childAgentId &&
+            participant.boundBy === mainAgentId &&
+            (participant.serverId ?? this.serverId) === childServerId,
+        ));
+    if (!ownedTask(task)) return;
+    return { workspaceId, mainAgentId, workspace, tasks, task, ownedTask, parentAgent };
+  }
+
+  private async readReportChild(
+    record: FinishSubscription,
+    childServerId: string,
+    workspaceCwd: string,
+  ) {
+    if (childServerId !== this.serverId) return { childLabels: undefined, touchedFiles: [] };
+    const child = this.agentManager.getAgent(record.childAgentId);
+    const stored = await this.agentStorage.get(record.childAgentId);
+    const rows =
+      child && record.reportTurnId
+        ? this.agentManager.fetchTimeline(child.id, { limit: 0 }).rows
+        : [];
+    const touchedFiles = extractModifiedPathsFromTimelineItems(
+      rows.filter((row) => row.turnId === record.reportTurnId).map((row) => row.item),
+      workspaceCwd,
+      child?.cwd,
+    );
+    return { childLabels: child?.labels ?? stored?.labels, touchedFiles };
+  }
+
+  private async syncTaskFinishReport(input: {
+    record: FinishSubscription;
+    report: AgentFinishReport;
+    childServerId: string;
+    messageId: string;
+    taskId: string;
+    rootMessageId?: string;
+    title?: string;
+  }): Promise<boolean> {
+    const { record, report, childServerId, messageId, taskId, rootMessageId, title } = input;
+    const status = report.parentReportStatus;
+    if (!status || this.featureOverrides.workspaceButlerV1 === false) return false;
+    const context = await this.readTaskReportContext(record, taskId, childServerId, rootMessageId);
+    if (!context) return false;
+    const { workspaceId, mainAgentId, workspace, task, ownedTask, parentAgent } = context;
+
+    const topicKey = `task:${taskId}`;
+    const scope = { workspaceId, mainAgentId };
+    const summary = report.prompt.replace(/^Report to parent \((?:completed|blocked)\):\n\n/, "");
+    const { childLabels, touchedFiles } = await this.readReportChild(
+      record,
+      childServerId,
+      workspace.cwd,
+    );
+    const alreadyLanded = (await this.topicThreadStore.list(scope, topicKey)).some(
+      (entry) => entry.sourceMessageId === messageId && entry.origin === "subagent_report",
+    );
+    const source = {
+      kind: "agent-message",
+      agentId: record.childAgentId,
+      serverId: childServerId,
+      taskId,
+    };
+    const canBypass = (current: Readonly<WorkspaceTask>, tasks: readonly WorkspaceTask[]) =>
+      report.event === "finished" &&
+      (current.silentReportIds?.length ?? 0) < TASK_PENDING_SILENT_REPORT_LIMIT &&
+      current.blockingQuestionGeneration === task.blockingQuestionGeneration &&
+      current.blockingQuestion === task.blockingQuestion &&
+      !current.participants.some(
+        (participant) =>
+          participant.boundBy === mainAgentId &&
+          (participant.agentId !== record.childAgentId ||
+            (participant.serverId ?? this.serverId) !== childServerId),
+      ) &&
+      shouldBypassMainControlWakeup({
+        workspaceId,
+        parentAgent: { workspaceId, labels: parentAgent.labels },
+        topicMainMatches: true,
+        explicit: true,
+        status,
+        childAgentId: record.childAgentId,
+        childServerId,
+        localServerId: this.serverId,
+        childLabels,
+        task: current,
+        tasks,
+        shouldHoldInbox: this.shouldHoldSubagentInbox(mainAgentId, source),
+        hasBufferedTaskReports: this.agentMessages.hasPendingTaskReport(
+          mainAgentId,
+          taskId,
+          messageId,
+        ),
+        summary,
+        touchedFiles,
+        sourceKind: source.kind,
+      });
+    const updatedTask = await this.taskLedger.syncFromTurnOutcome(
+      workspaceId,
+      taskId,
+      (current, tasks) => {
+        // The ledger records the disposition before the card is written. A retry can
+        // finish writing the card without reapplying an old completion to a newer task state.
+        if (current.silentReportIds?.includes(messageId) || alreadyLanded) return {};
+        if (!ownedTask(current) || !isActiveWorkspaceTask(current)) return null;
+        const bypassMainControl = canBypass(current, tasks);
+        return {
+          ...taskReportOutcomePatch({ status, summary, bypassMainControl, touchedFiles }),
+          silentReportId: bypassMainControl ? messageId : undefined,
+        };
+      },
+    );
+    const bypassMainControl =
+      alreadyLanded || updatedTask?.silentReportIds?.includes(messageId) === true;
+    if (bypassMainControl && !alreadyLanded) {
+      const { entry } = await this.topicThreadStore.appendReportEntry({
+        ...scope,
+        topicKey,
+        taskId,
+        rootMessageId: task.rootMessageId ?? rootMessageId,
+        authorAgentId: record.childAgentId,
+        authorTitle: title,
+        sourceMessageId: messageId,
+        reportStatus: "completed",
+        text: summary,
+      });
+      this.broadcast(
+        wrapSessionMessage({
+          type: "workspace.topic.thread.updated",
+          payload: { ...scope, entry },
+        }),
+      );
+    }
+    if (bypassMainControl) {
+      await this.agentManager.markTeamConclusionUnread(mainAgentId, workspaceId);
+    }
+    return bypassMainControl;
+  }
+
   private isRemoteFinishedSuperseded(
     record: Pick<FinishSubscription, "callerAgentId" | "childAgentId" | "serverId">,
     reportId: string,
@@ -3708,6 +4104,44 @@ export class VoiceAssistantWebSocketServer {
       this.remoteFinishedSupersessions.delete(
         this.remoteFinishedSupersessions.values().next().value!,
       );
+  }
+
+  private async finalizeSilentTaskReport(
+    mainAgentId: string,
+    taskId: string | undefined,
+    messageId: string,
+    report: AgentFinishReport,
+    silentDelivery: boolean,
+  ): Promise<void> {
+    if (!taskId || report.parentReportStatus !== "completed") return;
+    const workspaceId =
+      this.agentManager.getAgent(mainAgentId)?.workspaceId ??
+      (await this.agentStorage.get(mainAgentId))?.workspaceId;
+    if (!workspaceId) return;
+    // The ledger marker survives an interruption after the report receipt commits.
+    const pending =
+      silentDelivery ||
+      (await this.taskLedger.list(workspaceId)).some(
+        (task) => task.taskId === taskId && task.silentReportIds?.includes(messageId),
+      );
+    if (!pending) return;
+    await this.sendSilentTaskNotificationOnce(mainAgentId, messageId, report.prompt);
+    await this.taskLedger.acknowledgeSilentReport(workspaceId, taskId, messageId);
+  }
+
+  private async sendSilentTaskNotificationOnce(
+    mainAgentId: string,
+    messageId: string,
+    prompt: string,
+  ): Promise<void> {
+    await this.parentReportReceipts.send({
+      agentId: mainAgentId,
+      messageId: `silent-topic-notification:${messageId}`,
+      request: { messageId },
+      // Keep the successful send in memory if committing its receipt fails.
+      retryIfUnsent: () => false,
+      send: () => this.notifySilentTeamConclusion(mainAgentId, prompt),
+    });
   }
 
   async dispatchFinishReport(
@@ -3767,9 +4201,35 @@ export class VoiceAssistantWebSocketServer {
           ...(title ? { title } : {}),
           event: report.event,
         } as const);
+    let silentDelivery = false;
     await receipts.send({
       agentId: record.callerAgentId,
       messageId,
+      confirmPendingSilentDelivery: async () => {
+        if (!taskId || !explicit || report.parentReportStatus !== "completed") return false;
+        const mainAgentId = record.callerAgentId;
+        const stored = await this.agentStorage.get(mainAgentId);
+        const workspaceId =
+          stored?.workspaceId ?? this.agentManager.getAgent(mainAgentId)?.workspaceId;
+        if (!workspaceId) return false;
+        const entries = await this.topicThreadStore.list(
+          { workspaceId, mainAgentId },
+          `task:${taskId}`,
+        );
+        silentDelivery = entries.some(
+          (entry) =>
+            entry.sourceMessageId === messageId &&
+            entry.origin === "subagent_report" &&
+            entry.reportStatus === "completed" &&
+            entry.authorAgentId === record.childAgentId,
+        );
+        if (silentDelivery) {
+          await this.agentManager.markTeamConclusionUnread(mainAgentId, workspaceId);
+          // Legacy pending receipts may lack a ledger marker. Notify before committing them.
+          await this.sendSilentTaskNotificationOnce(mainAgentId, messageId, report.prompt);
+        }
+        return silentDelivery;
+      },
       retryIfUnsent: (error) =>
         error instanceof AgentRunCancellationError ||
         error instanceof ParentReportRecipientUnavailableError ||
@@ -3797,6 +4257,23 @@ export class VoiceAssistantWebSocketServer {
           : report.reportedAt;
         if (explicit && record.serverId)
           await this.applyRemoteReportSupersession(record, report.id);
+        if (
+          taskId &&
+          explicit &&
+          (await this.syncTaskFinishReport({
+            record,
+            report,
+            childServerId,
+            messageId,
+            taskId,
+            rootMessageId,
+            title,
+          }))
+        ) {
+          // There is no provider handoff to mark pending. All silent effects are already durable.
+          silentDelivery = true;
+          return;
+        }
         const subagentInbox =
           explicit ||
           (record.requireParentOwnership &&
@@ -3839,6 +4316,13 @@ export class VoiceAssistantWebSocketServer {
         await receipt.dispatched;
       },
     });
+    await this.finalizeSilentTaskReport(
+      record.callerAgentId,
+      taskId,
+      messageId,
+      report,
+      silentDelivery,
+    );
   }
 
   private resolveParentReportConfirmation(
@@ -4388,16 +4872,22 @@ export class VoiceAssistantWebSocketServer {
     };
   }
 
-  private async broadcastAgentAttention(params: {
-    agentId: string;
-    provider: AgentProvider;
-    reason: "finished" | "error" | "permission";
-    attentionTimestamp: Date | null;
-  }): Promise<void> {
-    const agent = this.agentManager.getAgent(params.agentId);
-    if (!agent?.workspaceId) {
-      return;
-    }
+  private async notifySilentTeamConclusion(agentId: string, prompt: string): Promise<void> {
+    const stored = await this.agentStorage.get(agentId);
+    if (!stored?.workspaceId || stored.archivedAt || stored.attentionReason !== "finished") return;
+    await this.broadcastAgentAttention({
+      agentId,
+      provider: stored.provider,
+      reason: "finished",
+      attentionTimestamp: stored.attentionTimestamp ? new Date(stored.attentionTimestamp) : null,
+      teamConclusion: {
+        workspaceId: stored.workspaceId,
+        summary: prompt.replace(/^Report to parent \(completed\):\n\n/, ""),
+      },
+    });
+  }
+
+  private async listAgentAttentionClients(agent: ReturnType<AgentManager["getAgent"]>) {
     const clientEntries: Array<{
       ws: WebSocketLike;
       state: ClientPresenceState;
@@ -4407,7 +4897,7 @@ export class VoiceAssistantWebSocketServer {
       if (
         connection.session.delivery.isModern(ws)
           ? !connection.session.wantsSourceEvent(ws, "agent_attention_required")
-          : !(await connection.session.subscribesToAgent(agent, ws))
+          : !agent || !(await connection.session.subscribesToAgent(agent, ws))
       )
         continue;
       clientEntries.push({
@@ -4415,20 +4905,35 @@ export class VoiceAssistantWebSocketServer {
         state: this.getClientActivityState(connection.session, ws),
       });
     }
+    return clientEntries;
+  }
 
+  private async broadcastAgentAttention(params: {
+    agentId: string;
+    provider: AgentProvider;
+    reason: "finished" | "error" | "permission";
+    attentionTimestamp: Date | null;
+    teamConclusion?: { workspaceId: string; summary: string };
+  }): Promise<void> {
+    const agent = this.agentManager.getAgent(params.agentId);
+    const workspaceId = params.teamConclusion?.workspaceId ?? agent?.workspaceId;
+    if (!workspaceId) return;
+    const clientEntries = await this.listAgentAttentionClients(agent);
     const notificationEntries = clientEntries.filter(({ ws }) =>
       this.sessions.get(ws)?.session.wantsSourceNotification(ws, "agent_attention_required"),
     );
     const allStates = notificationEntries.map((e) => e.state);
     const nowMs = Date.now();
-    const assistantMessage = await this.agentManager.getLastAssistantMessage(params.agentId);
+    const assistantMessage =
+      params.teamConclusion?.summary ??
+      (await this.agentManager.getLastAssistantMessage(params.agentId));
     const notification = buildAgentAttentionNotificationPayload({
       reason: params.reason,
       serverId: this.serverId,
-      workspaceId: agent.workspaceId,
+      workspaceId,
       agentId: params.agentId,
       assistantMessage,
-      permissionRequest: findLatestPermissionRequest(agent.pendingPermissions),
+      permissionRequest: agent ? findLatestPermissionRequest(agent.pendingPermissions) : null,
     });
 
     const plan = this.planOncePerUnreadFinish(
@@ -4441,11 +4946,11 @@ export class VoiceAssistantWebSocketServer {
       }),
     );
 
-    if (plan.shouldPush) {
-      void this.pushNotificationSender.send(notification).catch((err) => {
-        this.logger.warn({ err, agentId: params.agentId }, "Failed to send push notification");
-      });
-    }
+    const push = plan.shouldPush
+      ? this.pushNotificationSender.send(notification).catch((err) => {
+          this.logger.warn({ err, agentId: params.agentId }, "Failed to send push notification");
+        })
+      : undefined;
 
     for (const { ws } of clientEntries) {
       const shouldNotify =
@@ -4488,6 +4993,7 @@ export class VoiceAssistantWebSocketServer {
         this.sessions.get(ws)!.session.publishToSource(ws, message.message);
       else this.sendToClient(ws, message);
     }
+    if (params.teamConclusion) await push;
   }
 
   // An agent can finish many times while its first finish is unread, for example when it

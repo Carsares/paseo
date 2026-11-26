@@ -171,6 +171,144 @@ describe("WS outbound zod-aot validation", () => {
     });
   });
 
+  describe("workspace butler messages", () => {
+    const timestamp = "2026-11-26T00:00:00.000Z";
+    const workspaceId = "ws-1";
+    const mainAgentId = "main-1";
+    const topicKey = "topic-1";
+    const binding = { workspaceId, topicKey, taskId: "task-1", rootMessageId: "prompt-1" };
+    const anchor = {
+      ...binding,
+      mainAgentId,
+      rootPromptText: "Inspect startup",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const task = {
+      taskId: binding.taskId,
+      title: "Inspect startup",
+      status: "in_progress",
+      tier: "T1",
+      participants: [],
+      touchedFiles: ["src/startup.ts"],
+      fileConflicts: [
+        {
+          path: "src/startup.ts",
+          peers: [{ taskId: "task-2", title: "Fix startup", status: "in_progress" }],
+        },
+      ],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const durableItem = {
+      ...binding,
+      requestId: "item-1",
+      sourceAgentId: "lead-1",
+      sourceTurnId: "turn-1",
+      kind: "acceptance",
+      title: "Review startup",
+      evidence: [],
+      revision: 1,
+      createdAt: timestamp,
+      status: "decided",
+      decision: "approve",
+      decidedAt: timestamp,
+    };
+    const entry = {
+      ...binding,
+      mainAgentId,
+      entryId: "entry-1",
+      role: "system_note",
+      routedAgentId: mainAgentId,
+      text: "Accepted.",
+      status: "completed",
+      seq: 1,
+      origin: "decision_reply",
+      durableItemRequestId: durableItem.requestId,
+      decision: "approve",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const decisionPayload = {
+      requestId: "req-1",
+      workspaceId,
+      topicKey,
+      durableItem,
+      task,
+      routedTo: "none",
+      targetAgentId: null,
+      entry,
+      accepted: true,
+      error: null,
+    };
+
+    it.each([
+      ["workspace.topic.decide.response", decisionPayload],
+      [
+        "workspace.topic.decide.response",
+        {
+          ...decisionPayload,
+          durableItem: null,
+          task: null,
+          entry: null,
+          accepted: false,
+          error: "Revision changed.",
+          errorCode: "revision_conflict",
+        },
+      ],
+      [
+        "workspace.topic.decide.response",
+        {
+          ...decisionPayload,
+          durableItem: null,
+          task: {
+            ...task,
+            status: "awaiting_decision",
+            blockingQuestion: "Which owner?",
+            blockingQuestionGeneration: "31952c69-ce68-49f4-87a6-b36647a83eca",
+          },
+          entry: null,
+          accepted: false,
+          error: "The blocking question changed.",
+          errorCode: "stale_blocking_question",
+        },
+      ],
+      ["workspace.topic.anchor.updated", { workspaceId, mainAgentId, anchor }],
+      ["workspace.tasks.updated", { workspaceId, tasks: [task] }],
+      ["workspace.durable_item.updated", { workspaceId, item: durableItem }],
+      ["workspace.topic.thread.updated", { workspaceId, mainAgentId, entry, anchor }],
+      [
+        "workspace.topic.list_entries.response",
+        { workspaceId, requestId: "req-1", entries: [entry], anchors: [anchor], error: null },
+      ],
+    ] as const)("validates %s in both outbound parsers", (type, payload) => {
+      const envelope = { type: "session", message: { type, payload } };
+      expect(WSOutboundMessageSchema.parse(envelope)).toEqual(envelope);
+      expect(validateWSOutboundMessage(envelope)).toEqual({ success: true, data: envelope });
+    });
+
+    it.each([
+      ["workspace.topic.thread.updated", { workspaceId, mainAgentId, anchor }],
+      [
+        "workspace.topic.anchor.updated",
+        { workspaceId, mainAgentId, anchor: { ...anchor, createdAt: "yesterday" } },
+      ],
+      [
+        "workspace.durable_item.updated",
+        { workspaceId, item: { ...durableItem, decision: "skip" } },
+      ],
+      ["workspace.topic.decide.response", { ...decisionPayload, routedTo: "remote" }],
+      [
+        "workspace.tasks.updated",
+        { workspaceId, tasks: [{ ...task, blockingQuestionGeneration: "not-a-uuid" }] },
+      ],
+    ] as const)("rejects malformed %s in both outbound parsers", (type, payload) => {
+      const envelope = { type: "session", message: { type, payload } };
+      expect(WSOutboundMessageSchema.safeParse(envelope).success).toBe(false);
+      expect(validateWSOutboundMessage(envelope).success).toBe(false);
+    });
+  });
+
   it("validates correlated workbench replies and their nested discriminated branches", () => {
     const decision = {
       type: "session",

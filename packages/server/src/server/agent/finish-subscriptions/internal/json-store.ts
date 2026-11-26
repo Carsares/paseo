@@ -14,6 +14,7 @@ const recordsSchema = z.array(
     serverId: z.string().min(1).optional(),
     requireParentOwnership: z.boolean().optional(),
     followupReport: z.boolean().optional(),
+    exceptionalOnly: z.boolean().optional(),
     pullSourceId: z.string().optional(),
     report: AgentFinishReportSchema.optional(),
     suppressFinished: z.boolean().optional(),

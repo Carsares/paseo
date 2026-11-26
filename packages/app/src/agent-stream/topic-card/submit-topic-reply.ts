@@ -1,4 +1,5 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import type { WorkspaceTaskSummary } from "@getpaseo/protocol/messages";
 import type { QueryClient } from "@tanstack/react-query";
 import { composePromptTextWithQuotes, createQuoteAttachment } from "@/attachments/quote";
 import {
@@ -8,7 +9,7 @@ import {
 import type { MessagePayload } from "@/composer/types";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
 import type { ActiveTopicReplyTarget } from "@/stores/topic-stream-view-store";
-import { replyToWorkspaceTopic } from "@/topic-threads/queries";
+import { decideWorkspaceTopicOnHost, replyToWorkspaceTopic } from "@/topic-threads/queries";
 import { generateMessageId } from "@/types/stream";
 import { encodeImages } from "@/utils/encode-images";
 
@@ -87,6 +88,68 @@ async function sendLegacyQuotedTopicReply(input: {
   return true;
 }
 
+export class TopicDecisionStaleQuestionError extends Error {
+  readonly errorCode = "stale_blocking_question";
+  readonly latestTask: WorkspaceTaskSummary | null;
+
+  constructor(message: string, latestTask: WorkspaceTaskSummary | null) {
+    super(message);
+    this.name = "TopicDecisionStaleQuestionError";
+    this.latestTask = latestTask;
+  }
+}
+
+async function submitBlockingDecisionReply(input: {
+  queryClient: QueryClient;
+  serverId: string;
+  workspaceId: string;
+  agentId: string;
+  activeReplyTopic: ActiveTopicReplyTarget;
+  payload: MessagePayload;
+  clientMessageId: string;
+}): Promise<boolean> {
+  const note = composePromptTextWithQuotes(input.payload.text, input.payload.attachments).trim();
+  if (!note) return false;
+  const response = await decideWorkspaceTopicOnHost({
+    queryClient: input.queryClient,
+    serverId: input.serverId,
+    workspaceId: input.workspaceId,
+    mainAgentId: input.agentId,
+    topicKey: input.activeReplyTopic.topicKey,
+    taskId: input.activeReplyTopic.decisionContext?.taskId ?? input.activeReplyTopic.taskId,
+    rootMessageId: input.activeReplyTopic.rootMessageId,
+    clientMessageId: input.clientMessageId,
+    resolutionKind: "task_blocking_question",
+    expectedBlockingQuestionGeneration:
+      input.activeReplyTopic.decisionContext?.blockingQuestionGeneration,
+    note,
+  });
+  if (response.errorCode === "stale_blocking_question") {
+    throw new TopicDecisionStaleQuestionError(
+      response.error ?? "The blocking question changed.",
+      response.task,
+    );
+  }
+  if (response.accepted === false || response.error) {
+    throw new Error(response.error ?? "Failed to submit decision.");
+  }
+  return true;
+}
+
+function resolveSubmissionClientMessageId(
+  activeReplyTopic: ActiveTopicReplyTarget,
+  signature: string,
+  onPersistSubmissionIntent?: (signature: string, clientMessageId: string) => void,
+): string {
+  const clientMessageId =
+    activeReplyTopic.pendingClientMessageId &&
+    activeReplyTopic.pendingSubmissionSignature === signature
+      ? activeReplyTopic.pendingClientMessageId
+      : generateMessageId();
+  onPersistSubmissionIntent?.(signature, clientMessageId);
+  return clientMessageId;
+}
+
 export async function submitActiveTopicReply(input: {
   queryClient: QueryClient;
   serverId: string;
@@ -95,6 +158,7 @@ export async function submitActiveTopicReply(input: {
   activeReplyTopic: ActiveTopicReplyTarget;
   payload: MessagePayload;
   supportsTopicThreads: boolean;
+  supportsButlerV1?: boolean;
   supportsForgeAttachments: boolean;
   disconnectedMessage: string;
   /** Persists the allocated idempotency key on the active draft intent so retries reuse it. */
@@ -108,6 +172,7 @@ export async function submitActiveTopicReply(input: {
     activeReplyTopic,
     payload,
     supportsTopicThreads,
+    supportsButlerV1 = false,
     supportsForgeAttachments,
     disconnectedMessage,
     onPersistSubmissionIntent,
@@ -119,15 +184,32 @@ export async function submitActiveTopicReply(input: {
     return false;
   }
 
+  const isDecisionReply = Boolean(activeReplyTopic.decisionContext);
   const explicitMain = trimmed.startsWith("@主控") || trimmed.startsWith("@main");
   const effectiveRouteMode = explicitMain ? "main" : activeReplyTopic.routeMode;
-  const signature = buildSubmissionSignature(trimmed, effectiveRouteMode, payload.attachments);
-  const clientMessageId =
-    activeReplyTopic.pendingClientMessageId &&
-    activeReplyTopic.pendingSubmissionSignature === signature
-      ? activeReplyTopic.pendingClientMessageId
-      : generateMessageId();
-  onPersistSubmissionIntent?.(signature, clientMessageId);
+  const decisionRouteKey = `decision:${activeReplyTopic.decisionContext?.blockingQuestionGeneration ?? ""}`;
+  const signature = buildSubmissionSignature(
+    trimmed,
+    isDecisionReply ? decisionRouteKey : effectiveRouteMode,
+    payload.attachments,
+  );
+  const clientMessageId = resolveSubmissionClientMessageId(
+    activeReplyTopic,
+    signature,
+    onPersistSubmissionIntent,
+  );
+
+  if (isDecisionReply && supportsButlerV1) {
+    return submitBlockingDecisionReply({
+      queryClient,
+      serverId,
+      workspaceId,
+      agentId,
+      activeReplyTopic,
+      payload,
+      clientMessageId,
+    });
+  }
 
   const runtimeSnapshot = getHostRuntimeStore().getSnapshot(serverId);
   const client = runtimeSnapshot?.connectionStatus === "online" ? runtimeSnapshot.client : null;
@@ -152,7 +234,6 @@ export async function submitActiveTopicReply(input: {
   }
 
   const composedText = composePromptTextWithQuotes(payload.text, payload.attachments).trim();
-  const effectiveText = composedText || "[attachment]";
   await replyToWorkspaceTopic({
     queryClient,
     serverId,
@@ -161,8 +242,9 @@ export async function submitActiveTopicReply(input: {
     topicKey: activeReplyTopic.topicKey,
     taskId: activeReplyTopic.taskId,
     rootMessageId: activeReplyTopic.rootMessageId,
+    rootPromptPreview: activeReplyTopic.promptPreview || undefined,
     clientMessageId,
-    text: effectiveText,
+    text: composedText || "[attachment]",
     routeMode: effectiveRouteMode,
     attachments: attachmentsToSend,
   });

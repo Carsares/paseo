@@ -1,6 +1,7 @@
 import { expect, test } from "vitest";
 import type { SessionOutboundMessage } from "../messages.js";
 import { SessionAuthorization } from "./index.js";
+import { requiredPermissionForOutbound } from "./operation-permissions.js";
 
 test("workspace deferral and delayed agent messages require their host write permissions", () => {
   const deferral = { type: "workspace.deferral.set.request" } as const;
@@ -34,6 +35,40 @@ test("workspace task requests and replies require workspace read permission", ()
   expect(writeOnly.allowsOutbound(reply)).toBe(false);
   expect(hub.allowsInbound(request)).toBe(false);
   expect(hub.allowsOutbound(reply)).toBe(false);
+});
+
+test("topic decisions require workspace write and their updates require workspace read", () => {
+  const reader = new SessionAuthorization(["workspace.read"]);
+  const writer = new SessionAuthorization(["workspace.write"]);
+  const request = { type: "workspace.topic.decide.request" } as const;
+  const response = {
+    type: "workspace.topic.decide.response",
+    payload: {
+      requestId: "request",
+      workspaceId: "workspace",
+      topicKey: "task:task",
+      durableItem: null,
+      task: null,
+      targetAgentId: null,
+      entry: null,
+      error: null,
+      routedTo: "none",
+    },
+  } satisfies SessionOutboundMessage;
+  expect(reader.allowsInbound(request)).toBe(false);
+  expect(reader.allowsOutbound(response)).toBe(false);
+  expect(writer.allowsInbound(request)).toBe(true);
+  expect(writer.allowsOutbound(response)).toBe(true);
+  const updates = [
+    "workspace.topic.anchor.updated",
+    "workspace.tasks.updated",
+    "workspace.durable_item.updated",
+  ] as const;
+  for (const type of updates) {
+    expect(requiredPermissionForOutbound({ type } as SessionOutboundMessage)).toBe(
+      "workspace.read",
+    );
+  }
 });
 
 test("pending rewind file operations require workspace write for requests and replies", () => {

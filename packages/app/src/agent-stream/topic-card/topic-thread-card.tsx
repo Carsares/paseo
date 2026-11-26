@@ -1,4 +1,8 @@
-import type { TopicReplyRouteMode, WorkspaceTodoItem } from "@getpaseo/protocol/messages";
+import type {
+  TopicReplyRouteMode,
+  WorkspaceDurableItem,
+  WorkspaceTodoItem,
+} from "@getpaseo/protocol/messages";
 import {
   Check,
   CheckSquare,
@@ -31,6 +35,12 @@ import { formatTodoDueTimestamp, isTodoOverdue } from "@/todos/model";
 import { useDisclosureHold } from "../disclosure";
 import { HoverEnvelope } from "./hover-envelope";
 import type { TopicLifecycleStatus, TopicReplyItem, TopicUnit } from "./model";
+import { TopicConflictBanner } from "./topic-conflict-banner";
+import {
+  TopicDecisionSlot,
+  type TopicDecisionSubmitInput,
+  type TopicDecisionSubmitResult,
+} from "./topic-decision-slot";
 import { TopicInlineComposer } from "./topic-inline-composer";
 import { TopicReplyRow } from "./topic-reply-row";
 import { type SeenTopicWatermark, useTopicViewportRead } from "./use-topic-viewport-read";
@@ -392,8 +402,53 @@ const TopicLinkedTodoRow = memo(function TopicLinkedTodoRow({
   );
 });
 
+const TopicProcessDisclosure = memo(function TopicProcessDisclosure({
+  topicKey,
+  processSteps,
+  expanded,
+  onToggle,
+}: {
+  topicKey: string;
+  processSteps: TopicUnit["processSteps"];
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const { t } = useTranslation();
+  if (processSteps.length === 0) return null;
+
+  return (
+    <View style={styles.processContainer} testID={`topic-process-card-${topicKey}`}>
+      <PressHighlight
+        accessibilityRole="button"
+        accessibilityState={expanded ? EXPANDED_STATE : COLLAPSED_STATE}
+        onPress={onToggle}
+        style={styles.processToggle}
+        testID={`topic-process-toggle-${topicKey}`}
+      >
+        {expanded ? <ThemedChevronDown size={14} /> : <ThemedChevronRight size={14} />}
+        <Text style={styles.processSummaryText} numberOfLines={1}>
+          {t("topicWorkbench.topicStream.processSummary", { count: processSteps.length })}
+        </Text>
+      </PressHighlight>
+      {expanded ? (
+        <View style={styles.processList} testID={`topic-process-steps-${topicKey}`}>
+          {processSteps.map((step) => (
+            <View key={step.id} style={styles.processStepRow}>
+              <Text style={styles.processStepText} numberOfLines={2}>
+                {step.kind === "tool_call" ? `${step.toolName} (${step.status})` : step.text}
+              </Text>
+            </View>
+          ))}
+        </View>
+      ) : null}
+    </View>
+  );
+});
+
 export interface TopicThreadCardProps {
   agentKey: string;
+  serverId?: string;
+  workspaceId?: string;
   topic: TopicUnit;
   isPaneFocused: boolean;
   /** Optional explicit override for isolated tests; production passes viewportBounds + cardLayout. */
@@ -403,6 +458,18 @@ export interface TopicThreadCardProps {
   isHighlighted?: boolean;
   isReplying?: boolean;
   isFlushingInbox?: boolean;
+  supportsButlerV1?: boolean;
+  durableItemsOnline?: boolean;
+  durableItemsConfirmed?: boolean;
+  onRefreshDurableItems?: () => void;
+  onOpenStandaloneDurableItem?: (item: WorkspaceDurableItem) => void;
+  onJumpToPeerTopic?: (peerTaskId: string) => void;
+  onSubmitTopicDecision?: (input: TopicDecisionSubmitInput) => Promise<TopicDecisionSubmitResult>;
+  onActivateCompactDecision?: (
+    topic: TopicUnit,
+    question: string,
+    blockingQuestionGeneration?: string,
+  ) => void;
   onAutoMarkRead: (input: {
     topicKey: string;
     seq: number | null;
@@ -436,6 +503,8 @@ export interface TopicThreadCardProps {
 
 export const TopicThreadCard = memo(function TopicThreadCard({
   agentKey,
+  serverId,
+  workspaceId,
   topic,
   isPaneFocused,
   isVisibleInViewport,
@@ -444,6 +513,14 @@ export const TopicThreadCard = memo(function TopicThreadCard({
   isHighlighted = false,
   isReplying = false,
   isFlushingInbox = false,
+  supportsButlerV1 = false,
+  durableItemsOnline = true,
+  durableItemsConfirmed = true,
+  onRefreshDurableItems,
+  onOpenStandaloneDurableItem,
+  onJumpToPeerTopic,
+  onSubmitTopicDecision,
+  onActivateCompactDecision,
   onAutoMarkRead,
   onMarkTopicMode,
   onFlushTopicInbox,
@@ -616,35 +693,21 @@ export const TopicThreadCard = memo(function TopicThreadCard({
       />
 
       <View style={styles.railBody} onLayout={handleRailBodyLayout}>
-        {topic.processSteps.length > 0 ? (
-          <View style={styles.processContainer} testID={`topic-process-card-${topic.topicKey}`}>
-            <PressHighlight
-              accessibilityRole="button"
-              accessibilityState={processExpanded ? EXPANDED_STATE : COLLAPSED_STATE}
-              onPress={toggleProcess}
-              style={styles.processToggle}
-              testID={`topic-process-toggle-${topic.topicKey}`}
-            >
-              {processExpanded ? <ThemedChevronDown size={14} /> : <ThemedChevronRight size={14} />}
-              <Text style={styles.processSummaryText} numberOfLines={1}>
-                {t("topicWorkbench.topicStream.processSummary", {
-                  count: topic.processSteps.length,
-                })}
-              </Text>
-            </PressHighlight>
-            {processExpanded ? (
-              <View style={styles.processList} testID={`topic-process-steps-${topic.topicKey}`}>
-                {topic.processSteps.map((step) => (
-                  <View key={step.id} style={styles.processStepRow}>
-                    <Text style={styles.processStepText} numberOfLines={2}>
-                      {step.kind === "tool_call" ? `${step.toolName} (${step.status})` : step.text}
-                    </Text>
-                  </View>
-                ))}
-              </View>
-            ) : null}
-          </View>
+        {topic.fileConflicts.length > 0 ? (
+          <TopicConflictBanner
+            agentKey={agentKey}
+            topicKey={topic.topicKey}
+            conflicts={topic.fileConflicts}
+            onJumpToPeerTopic={onJumpToPeerTopic}
+          />
         ) : null}
+
+        <TopicProcessDisclosure
+          topicKey={topic.topicKey}
+          processSteps={topic.processSteps}
+          expanded={processExpanded}
+          onToggle={toggleProcess}
+        />
 
         {topic.replies.map((reply, index) => (
           <ReplyLayoutSlot
@@ -717,6 +780,23 @@ export const TopicThreadCard = memo(function TopicThreadCard({
               />
             ))}
           </View>
+        ) : null}
+
+        {topic.activeBlockingPrompt ? (
+          <TopicDecisionSlot
+            agentKey={agentKey}
+            serverId={serverId}
+            workspaceId={workspaceId}
+            topic={topic}
+            prompt={topic.activeBlockingPrompt}
+            supportsButlerV1={supportsButlerV1}
+            durableItemsOnline={durableItemsOnline}
+            durableItemsConfirmed={durableItemsConfirmed}
+            onRefreshDurableItems={onRefreshDurableItems}
+            onOpenStandaloneDurableItem={onOpenStandaloneDurableItem}
+            onSubmitDecision={onSubmitTopicDecision}
+            onActivateCompactDecision={onActivateCompactDecision}
+          />
         ) : null}
 
         <TopicInlineComposer

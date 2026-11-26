@@ -151,6 +151,7 @@ export const DEFAULT_CLIENT_CAPABILITIES = {
   [CLIENT_CAPS.workspaceTopicThreads]: true,
   [CLIENT_CAPS.workspaceTopicReadState]: true,
   [CLIENT_CAPS.workspaceTodos]: true,
+  [CLIENT_CAPS.workspaceButlerV1]: true,
 } satisfies Record<Exclude<ClientCapability, typeof CLIENT_CAPS.browserHost>, true>;
 
 /** Calling releases demand; ready waits for membership, or local attachment on broadcast hosts. */

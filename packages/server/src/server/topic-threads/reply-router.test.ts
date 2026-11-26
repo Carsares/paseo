@@ -1,9 +1,10 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   PARENT_AGENT_ID_LABEL,
   PARENT_SERVER_ID_LABEL,
+  TASK_ID_LABEL,
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
@@ -59,10 +60,14 @@ function setup(
 ) {
   const broadcast = vi.fn<(event: WorkspaceTopicThreadUpdatedMessage) => void>();
   type Dispatch = Parameters<typeof createTopicReplyRouter>[0]["dispatch"];
-  const dispatch = vi.fn<Dispatch>(async ({ validate, onStarted }) => {
+  const dispatch = vi.fn<Dispatch>(async ({ validate, onHandoff, onStarted }) => {
     await validate();
+    await onHandoff(true);
     await onStarted();
-    return { text: "The final answer.", sourceMessageId: "answer-message", authorTitle: "Role" };
+    return {
+      reply: { text: "The final answer.", sourceMessageId: "answer-message", authorTitle: "Role" },
+      touchedFiles: [],
+    };
   });
   router = createTopicReplyRouter({
     serverId: "local",
@@ -91,6 +96,82 @@ function setup(
   });
   return { dispatch, broadcast };
 }
+
+test.each([
+  { ingress: undefined, marked: false },
+  { ingress: false, marked: false },
+  { ingress: true, marked: true },
+])(
+  "passes ordinary reply ingress $ingress as humanInitiated $marked",
+  async ({ ingress, marked }) => {
+    const { dispatch } = setup();
+    await ledger.upsert(request.workspaceId, {
+      taskId: "task",
+      title: "Task",
+      rootMessageId: "root",
+      leadAgentId: "lead",
+    });
+    expect((await router.reply(request, undefined, ingress)).payload).toMatchObject({
+      error: null,
+    });
+    await vi.waitFor(() =>
+      expect(dispatch).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          agentId: "lead",
+          scope: {
+            workspaceId: "workspace",
+            mainAgentId: "main",
+            taskId: "task",
+            humanInitiated: marked,
+          },
+        }),
+      ),
+    );
+  },
+);
+
+test.each(["decision_reply", "butler_dispatch"] as const)(
+  "dispatches %s without human authority even when ingress is true",
+  async (origin) => {
+    const { dispatch } = setup();
+    const task = await ledger.upsert(request.workspaceId, {
+      taskId: "task",
+      title: "Task",
+      rootMessageId: "root",
+      leadAgentId: "lead",
+      status: "in_progress",
+    });
+    const record = await store.reserveDecision({
+      input: { ...request, resolutionKind: "task_blocking_question", note: request.text },
+      origin,
+      taskCreatedAt: task.createdAt,
+      status: "awaiting_decision",
+      desiredStatus: task.status,
+      taskId: task.taskId,
+      rootMessageId: task.rootMessageId,
+    });
+    await store.saveDecisionProgress(record, { task });
+    const response = await router.reply(
+      request,
+      { origin, promptText: request.text, taskCreatedAt: task.createdAt },
+      true,
+    );
+    expect(response.payload).toMatchObject({ error: null, entry: { origin } });
+    await vi.waitFor(() =>
+      expect(dispatch).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          agentId: "lead",
+          scope: {
+            workspaceId: "workspace",
+            mainAgentId: "main",
+            taskId: "task",
+            humanInitiated: false,
+          },
+        }),
+      ),
+    );
+  },
+);
 
 test.each([
   { description: "default auto", target: "lead", reason: "none" },
@@ -230,6 +311,164 @@ test("reroutes to Main Control if the lead is reparented after the reply is queu
   expect(deliverToLead).not.toHaveBeenCalled();
   expect(dispatch).toHaveBeenCalledTimes(2);
   expect(dispatch).toHaveBeenLastCalledWith(expect.objectContaining({ agentId: "main" }));
+});
+
+test.each([
+  { raisedDuringReply: false, status: "in_progress", blockingQuestion: undefined },
+  { raisedDuringReply: true, status: "awaiting_decision", blockingQuestion: "Same question" },
+] as const)(
+  "writes files to the actual topic task and preserves a new blocking generation ($raisedDuringReply)",
+  async ({ raisedDuringReply, status, blockingQuestion }) => {
+    const { dispatch } = setup();
+    await ledger.upsert(request.workspaceId, {
+      taskId: "task",
+      title: "Topic task",
+      rootMessageId: "root",
+      leadAgentId: "lead",
+      status: "awaiting_decision",
+      blockingQuestion: "Question at queue time",
+    });
+    const unrelated = await ledger.upsert(request.workspaceId, {
+      taskId: "unrelated",
+      title: "Other task of the same lead",
+      leadAgentId: "lead",
+      status: "awaiting_decision",
+      blockingQuestion: "Same question",
+    });
+    dispatch.mockImplementationOnce(async ({ validate, onHandoff, onStarted }) => {
+      await validate();
+      await ledger.syncFromTurnOutcome(request.workspaceId, "task", {
+        blockingQuestion: "Same question",
+      });
+      await onHandoff(true);
+      await onStarted();
+      if (raisedDuringReply)
+        await ledger.syncFromTurnOutcome(request.workspaceId, "task", {
+          blockingQuestion: "Same question",
+        });
+      return { reply: { text: "Here is the outcome" }, touchedFiles: ["src/reply.ts"] };
+    });
+    expect((await router.reply(request)).payload).toMatchObject({ error: null, routedTo: "lead" });
+    await vi.waitFor(async () => {
+      const tasks = await ledger.list(request.workspaceId);
+      const actual = tasks.find(({ taskId }) => taskId === "task");
+      expect(actual).toMatchObject({
+        status,
+        latestReplyPreview: "Here is the outcome",
+        touchedFiles: ["src/reply.ts"],
+      });
+      expect(actual?.blockingQuestion).toBe(blockingQuestion);
+      expect(tasks.find(({ taskId }) => taskId === "unrelated")).toEqual(unrelated);
+    });
+    expect(dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scope: {
+          workspaceId: "workspace",
+          mainAgentId: "main",
+          taskId: "task",
+          humanInitiated: false,
+        },
+      }),
+    );
+  },
+);
+
+function provideStructuredEditEvents(session: AgentSession) {
+  const subscribe = session.subscribe.bind(session);
+  vi.spyOn(session, "subscribe").mockImplementation((receive) =>
+    subscribe((event) => {
+      if (
+        event.type === "timeline" &&
+        event.item.type === "tool_call" &&
+        event.item.name === "Edit"
+      ) {
+        receive({
+          ...event,
+          item: { ...event.item, detail: { type: "edit", filePath: "test.txt" } },
+        });
+      } else {
+        receive(event);
+      }
+    }),
+  );
+}
+
+test("records an actual follow-up turn edit on the topic task even when the agent has another task label", async () => {
+  const logger = createTestLogger();
+  const agentStorage = new AgentStorage(join(home, "agents"), logger);
+  const clients = createTestAgentClients();
+  const client = clients.claude;
+  const createSession = client.createSession.bind(client);
+  vi.spyOn(client, "createSession").mockImplementation(async (...args) => {
+    const session = await createSession(...args);
+    provideStructuredEditEvents(session);
+    return session;
+  });
+  const agentManager = new AgentManager({
+    clients,
+    registry: agentStorage,
+    taskLedger: ledger,
+    serverId: "local",
+    logger,
+  });
+  const config = { provider: "claude", cwd: home, modeId: "bypassPermissions" } as const;
+  const main = await agentManager.createAgent(config, undefined, {
+    workspaceId: request.workspaceId,
+    labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+  });
+  const lead = await agentManager.createAgent(config, undefined, {
+    workspaceId: request.workspaceId,
+    labels: { [PARENT_AGENT_ID_LABEL]: main.id, [TASK_ID_LABEL]: "unrelated" },
+  });
+  await ledger.upsert(request.workspaceId, {
+    taskId: "task",
+    title: "Follow-up task",
+    leadAgentId: lead.id,
+    rootMessageId: "root",
+  });
+  await ledger.upsert(request.workspaceId, {
+    taskId: "unrelated",
+    title: "Previous lead assignment",
+    leadAgentId: lead.id,
+  });
+  const edited = join(home, "test.txt");
+  await writeFile(edited, "hello");
+  router = createTopicReplyRouter({
+    serverId: "local",
+    store,
+    taskLedger: ledger,
+    readAgent: async (id) => agentManager.getAgent(id) ?? null,
+    dispatch: createTopicPromptDispatcher({ agentManager, agentStorage, logger }),
+    broadcast: () => {},
+    logger,
+  });
+  try {
+    const followup = {
+      ...request,
+      mainAgentId: main.id,
+      text: "Edit the file test.txt and change hello to goodbye",
+    };
+    expect((await router.reply(followup)).payload).toMatchObject({
+      error: null,
+      targetAgentId: lead.id,
+    });
+    await vi.waitFor(async () => {
+      expect(await store.list(followup)).toMatchObject([
+        { status: "completed", role: "user_followup" },
+        { role: "agent_reply", authorAgentId: lead.id },
+      ]);
+      const tasks = await ledger.list(request.workspaceId);
+      expect(tasks.find(({ taskId }) => taskId === "task")).toMatchObject({
+        touchedFiles: ["test.txt"],
+        latestReplyPreview: expect.any(String),
+      });
+      expect(tasks.find(({ taskId }) => taskId === "unrelated")?.touchedFiles).toBeUndefined();
+    });
+    expect(await readFile(edited, "utf8")).toBe("goodbye");
+  } finally {
+    await router.close();
+    await agentManager.flush();
+  }
 });
 
 test("rechecks an automatic Main Control fallback before delivering", async () => {
@@ -583,4 +822,37 @@ test.each([
     await leadRun;
     await Promise.all([lead, main, replacement].map(({ id }) => agentManager.closeAgent(id)));
   }
+});
+
+test("backfills a historical stand-alone first question from the reply request without the main timeline", async () => {
+  const { broadcast } = setup();
+  const first = {
+    ...request,
+    taskId: undefined,
+    topicKey: "msg:old-root",
+    rootMessageId: "old-root",
+    rootPromptPreview: "What should the original task cover?",
+  };
+  expect((await router.reply(first)).payload).toMatchObject({ error: null, routedTo: "main" });
+  const listed = await router.list({
+    type: "workspace.topic.list_entries.request",
+    requestId: "list-historical",
+    workspaceId: first.workspaceId,
+    mainAgentId: first.mainAgentId,
+    topicKey: first.topicKey,
+  });
+  const [anchor] = listed.payload.anchors ?? [];
+  expect(anchor).toMatchObject({
+    topicKey: first.topicKey,
+    rootMessageId: first.rootMessageId,
+    rootPromptText: first.rootPromptPreview,
+  });
+  expect(broadcast).toHaveBeenCalledWith(
+    expect.objectContaining({
+      payload: expect.objectContaining({
+        anchor,
+        entry: expect.objectContaining({ role: "user_followup", origin: "topic_reply" }),
+      }),
+    }),
+  );
 });

@@ -29,6 +29,8 @@ export interface FinishSubscription {
   requireParentOwnership?: boolean;
   /** Allows the remote parent to fetch this turn's reports on its forward connection. */
   followupReport?: boolean;
+  /** Explicit children wake their direct parent only for provider errors and permission. */
+  exceptionalOnly?: boolean;
   /** Authenticated source of a remote observation binding. */
   pullSourceId?: string;
   report?: AgentFinishReport;
@@ -571,6 +573,52 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     }
   }
 
+  async function dispatchLocalExceptionalNotification(
+    record: FinishSubscription,
+    report: AgentFinishReport,
+    result: FinishObservationResult,
+    watch: Watch,
+    isPermission: boolean,
+  ): Promise<void> {
+    // Reuse the durable message receipt on retry, including after restart.
+    if (!isPermission) {
+      const captured = { ...record, report, reportTurnId: result.turnId };
+      await serialize(async () => {
+        await deps.store.put(captured);
+        watch.captured = captured;
+      });
+    }
+    await dispatchCapturedReport(record, report, watch.controller.signal);
+  }
+
+  function buildFinishReport(
+    record: FinishSubscription,
+    result: FinishObservationResult,
+    childServerId: string,
+    reason: FinishNotificationReason,
+    request: ReturnType<typeof permissionRequests>[number] | undefined,
+  ): AgentFinishReport {
+    const title = resolveReportTitle(record.childAgentId, result.final?.title) ?? "";
+    const prompt = formatFinishNotificationBody({
+      childAgentId: record.childAgentId,
+      serverId: childServerId,
+      title,
+      reason,
+      lastAssistantMessage: result.lastMessage,
+      permissionRequest: request,
+    });
+    return {
+      id: notificationId(record.id, request?.id),
+      prompt,
+      title,
+      event: finishNotificationEvents[reason],
+    };
+  }
+
+  function shouldDeliverFinish(record: FinishSubscription, reason: FinishNotificationReason) {
+    return !record.exceptionalOnly || reason === "errored" || reason === "needs permission";
+  }
+
   async function deliver(
     record: FinishSubscription,
     result: FinishObservationResult,
@@ -581,22 +629,13 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
     const { signal } = watch.controller;
     const requests = permissionRequests(result, permissions);
     const reason = reasonFor(result);
+    if (!shouldDeliverFinish(record, reason)) return true;
     const acknowledgments: Promise<unknown>[] = [];
     for (const request of reason === "needs permission" ? requests : [undefined]) {
       if (signal.aborted) return false;
       if (request && permissions.has(request.id)) continue;
-      const title = resolveReportTitle(record.childAgentId, result.final?.title) ?? "";
       const childServerId = record.serverId ?? deps.serverId;
-      const prompt = formatFinishNotificationBody({
-        childAgentId: record.childAgentId,
-        serverId: childServerId,
-        title,
-        reason,
-        lastAssistantMessage: result.lastMessage,
-        permissionRequest: request,
-      });
-      const id = notificationId(record.id, request?.id);
-      const report = { id, prompt, title, event: finishNotificationEvents[reason] };
+      const report = buildFinishReport(record, result, childServerId, reason, request);
       if (isSuppressedFinish(record, result, report)) return true;
       const bound = await saveRemoteFollowup(record, report, savedFollowups, result.turnId);
       if (signal.aborted || isSuppressedFinish(record, result, report)) return true;
@@ -609,18 +648,26 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           signal,
         );
         if (!handled) return true;
-        if (request) permissions.add(request.id);
+      } else if (record.exceptionalOnly && deps.followups) {
+        await dispatchLocalExceptionalNotification(record, report, result, watch, Boolean(request));
+      } else {
+        if (await captureLocalFinish(record, report, result, watch)) return true;
+        const receipt = await enqueueLocalNotification(
+          record,
+          report,
+          Boolean(result.final),
+          watch,
+        );
+        if (!receipt) return !signal.aborted;
+        acknowledgments.push(
+          receipt.dispatched.then(() => {
+            if (request) permissions.add(request.id);
+            return undefined;
+          }),
+        );
         continue;
       }
-      if (await captureLocalFinish(record, report, result, watch)) return true;
-      const receipt = await enqueueLocalNotification(record, report, Boolean(result.final), watch);
-      if (!receipt) return !signal.aborted;
-      acknowledgments.push(
-        receipt.dispatched.then(() => {
-          if (request) permissions.add(request.id);
-          return undefined;
-        }),
-      );
+      if (request) permissions.add(request.id);
     }
     return (
       (await acknowledgeLocalNotifications(acknowledgments, signal)) ||
@@ -636,6 +683,7 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
       requireParentOwnership: watch.records.every(
         (intent) => intent.requireParentOwnership === true,
       ),
+      exceptionalOnly: watch.records.every((intent) => intent.exceptionalOnly === true),
     };
     const permissions = new Set<string>();
     const savedFollowups = new Set<string>();
@@ -1188,12 +1236,20 @@ export function createFinishSubscriptions(deps: Dependencies): FinishSubscriptio
           callerServerId: input.callerServerId === deps.serverId ? undefined : input.callerServerId,
           id: prefix + randomUUID(),
         };
+        const group = watches.get(key(record)) ?? new Set<Watch>();
+        // The ingress already registered an opt-in watch for this admission.
+        if (
+          record.exceptionalOnly &&
+          [...group].some(
+            (watch) => watch.pending && watch.records.some((intent) => !intent.exceptionalOnly),
+          )
+        )
+          return skippedRegistration;
         await deps.store.put(record);
         if (canRegister && !canRegister()) {
           await deps.store.remove(record.id);
           return skippedRegistration;
         }
-        const group = watches.get(key(record)) ?? new Set<Watch>();
         // A captured result belongs to an earlier turn and may still be held
         // in the parent's inbox when a new foreground turn is accepted.
         const predecessors = [...group].filter((prior) => !prior.captured);

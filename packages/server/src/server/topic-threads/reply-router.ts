@@ -1,4 +1,5 @@
 import type {
+  TopicAnchorSummary,
   TopicThreadEntry,
   WorkspaceTopicListEntriesRequest,
   WorkspaceTopicListEntriesResponse,
@@ -6,9 +7,12 @@ import type {
   WorkspaceTopicReplyResponse,
   WorkspaceTopicThreadUpdatedMessage,
 } from "@getpaseo/protocol/messages";
-import { isMainControlAgentLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  getParentAgentIdFromLabels,
+  isMainControlAgentLabels,
+} from "@getpaseo/protocol/agent-labels";
 import type { Logger } from "pino";
-import type { AgentManager } from "../agent/agent-manager.js";
+import { topicFollowupRunOptions, type AgentManager } from "../agent/agent-manager.js";
 import { AgentNotFoundError } from "../agent/agent-loading.js";
 import {
   AgentTurnBusyError,
@@ -24,8 +28,13 @@ import {
 import type { AgentStorage } from "../agent/agent-storage.js";
 import type { AgentTimelineRow } from "../agent/agent-timeline-store-types.js";
 import { buildAgentPrompt } from "../agent/prompt-attachments.js";
-import type { WorkspaceTask, WorkspaceTaskLedgerStore } from "../agent/task-ledger/index.js";
+import type {
+  WorkspaceTask,
+  WorkspaceTaskLedgerStore,
+  WorkspaceTaskTurnOutcomePatch,
+} from "../agent/task-ledger/index.js";
 import { isLocalTaskChild } from "../agent/task-ledger/reuse.js";
+import { checkTopicAddress, requireMatchingAnchor, topicAnchorInput } from "./anchors.js";
 import type { TopicAgentReply, TopicThreadStore } from "./store.js";
 
 type ReplyPayload = WorkspaceTopicReplyResponse["payload"];
@@ -39,15 +48,21 @@ interface TopicAgent {
   labels?: Record<string, string>;
 }
 
+interface TopicTurnOutcome {
+  reply?: TopicAgentReply;
+  touchedFiles: string[];
+}
+
 type DispatchTopicPrompt = ((input: {
   agentId: string;
   messageId: string;
+  scope: Parameters<typeof topicFollowupRunOptions>[0];
   prompt: AgentPromptInput;
   validate: () => Promise<void>;
   onHandoff: (pending: boolean) => Promise<void>;
   onStarted: () => Promise<void>;
   signal: AbortSignal;
-}) => Promise<TopicAgentReply | undefined>) & {
+}) => Promise<TopicTurnOutcome | undefined>) & {
   wasAccepted?: (entry: TopicThreadEntry) => Promise<boolean>;
 };
 
@@ -59,10 +74,27 @@ class TopicRouteChangedError extends TopicLeadUnavailableError {
   }
 }
 
+export class TopicDecisionError extends Error {}
+
+export interface TopicDecisionGuard {
+  commit: <T>(write: () => Promise<T>) => Promise<T>;
+  assertCurrent?: () => void;
+  validateTask: (tasks: readonly WorkspaceTask[]) => void;
+}
+
+export interface TopicDecisionDispatch {
+  origin: "decision_reply" | "butler_dispatch";
+  durableItemRequestId?: string;
+  decision?: TopicThreadEntry["decision"];
+  promptText: string;
+  taskCreatedAt: string;
+  guard?: TopicDecisionGuard;
+}
+
 interface RouterDependencies {
   serverId: string;
   store: TopicThreadStore;
-  taskLedger: Pick<WorkspaceTaskLedgerStore, "list" | "updateLatestReplyPreview">;
+  taskLedger: Pick<WorkspaceTaskLedgerStore, "list" | "syncFromTurnOutcome">;
   readAgent: (agentId: string) => Promise<TopicAgent | null>;
   dispatch: DispatchTopicPrompt;
   /** The WebSocket owner filters this event by capability and workspace access. */
@@ -118,6 +150,55 @@ async function selectRoute(
   return { routedTo: "lead", targetAgentId: task.leadAgentId, fallbackReason: "none" };
 }
 
+function requireReplyTask(
+  task: WorkspaceTask | undefined,
+  rootMessageId: string | undefined,
+  decision?: TopicDecisionDispatch,
+) {
+  if (task?.rootMessageId && rootMessageId && task.rootMessageId !== rootMessageId)
+    throw new Error("The task does not belong to this topic.");
+  if (
+    decision &&
+    (task?.createdAt !== decision.taskCreatedAt || task.rootMessageId !== rootMessageId)
+  )
+    throw new Error("The task no longer belongs to this topic decision.");
+}
+
+function replyOutcomePatch(
+  current: Readonly<WorkspaceTask>,
+  submitted: WorkspaceTask,
+  { reply, touchedFiles }: TopicTurnOutcome,
+  answerBlockingQuestion: boolean,
+): WorkspaceTaskTurnOutcomePatch | null {
+  if (
+    current.createdAt !== submitted.createdAt ||
+    current.rootMessageId !== submitted.rootMessageId
+  )
+    return null;
+  const patch: WorkspaceTaskTurnOutcomePatch = { touchedFiles };
+  const preview = reply?.text.replace(/\s+/g, " ").trim();
+  if (!preview) return patch;
+  patch.latestReplyPreview = Array.from(preview).slice(0, 240).join("");
+  const sameBlockingQuestion =
+    answerBlockingQuestion &&
+    submitted.blockingQuestion?.trim() &&
+    submitted.blockingQuestion === current.blockingQuestion &&
+    submitted.blockingQuestionGeneration === current.blockingQuestionGeneration;
+  if (sameBlockingQuestion) {
+    patch.blockingQuestion = null;
+    if (current.status === "awaiting_decision") patch.status = "in_progress";
+  }
+  return patch;
+}
+
+function sameTopicTask(a: WorkspaceTask | undefined, b: WorkspaceTask | undefined): boolean {
+  return (
+    a?.taskId === b?.taskId &&
+    a?.createdAt === b?.createdAt &&
+    a?.rootMessageId === b?.rootMessageId
+  );
+}
+
 function topicContext(entry: TopicThreadEntry, fallbackReason: Route["fallbackReason"]): string {
   const attr = (name: string, value: string | undefined) =>
     value ? ` ${name}="${value.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)}"` : "";
@@ -141,15 +222,19 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
     mainAgentId,
   }: Pick<TopicThreadEntry, "workspaceId" | "mainAgentId">) {
     const main = await readAgent(mainAgentId);
-    if (!inWorkspace(main, workspaceId) || !isMainControlAgentLabels(main.labels))
+    if (
+      !inWorkspace(main, workspaceId) ||
+      !isMainControlAgentLabels(main.labels) ||
+      getParentAgentIdFromLabels(main.labels)
+    )
       throw new Error("Workspace Main Control is unavailable.");
   }
 
-  function publish(entry: TopicThreadEntry) {
+  function publish(entry: TopicThreadEntry, anchor?: TopicAnchorSummary) {
     try {
       deps.broadcast({
         type: "workspace.topic.thread.updated",
-        payload: { workspaceId: entry.workspaceId, mainAgentId: entry.mainAgentId, entry },
+        payload: { workspaceId: entry.workspaceId, mainAgentId: entry.mainAgentId, entry, anchor },
       });
     } catch (error) {
       logger.warn({ err: error, entryId: entry.entryId }, "Could not broadcast topic update");
@@ -160,6 +245,8 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
     request: WorkspaceTopicReplyRequest,
     entry: TopicThreadEntry,
     route: Route,
+    humanInitiated: boolean,
+    decision?: TopicDecisionDispatch,
   ) {
     const { workspaceId, entryId, taskId, rootMessageId } = entry;
     let failedLeadId: string | undefined;
@@ -171,9 +258,12 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
     const readTask = async () => {
       if (!taskId && !rootMessageId) return;
       const tasks = await taskLedger.list(workspaceId);
-      return taskId
-        ? tasks.find((task) => task.taskId === taskId)
-        : tasks.findLast((task) => task.rootMessageId === rootMessageId);
+      decision?.guard?.validateTask(tasks);
+      const task = taskId
+        ? tasks.find((item) => item.taskId === taskId)
+        : tasks.findLast((item) => item.rootMessageId === rootMessageId);
+      requireReplyTask(task, rootMessageId, decision);
+      return task;
     };
     const readRoute = async () => {
       let task = await readTask();
@@ -190,38 +280,52 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
         task = latest;
       }
     };
-    const send = (target: Route) =>
-      deps.dispatch({
+    let submittedTask: WorkspaceTask | undefined;
+    const send = async (target: Route) => {
+      const task = await readTask();
+      return deps.dispatch({
         agentId: target.targetAgentId,
         messageId: entry.sourceMessageId ?? entryId,
+        scope: {
+          workspaceId,
+          mainAgentId: request.mainAgentId,
+          taskId: task?.taskId,
+          humanInitiated: decision === undefined && humanInitiated === true,
+        },
         prompt: buildAgentPrompt(
-          topicContext(entry, target.fallbackReason) + request.text,
+          topicContext(entry, target.fallbackReason) + (decision?.promptText ?? request.text),
           undefined,
           request.attachments,
         ),
         validate: async () => {
           await requireMain(request);
-          if (target.fallbackReason === "explicit_main") return;
-          const current = await readRoute();
-          if (
-            current.targetAgentId !== target.targetAgentId ||
-            current.fallbackReason !== target.fallbackReason
-          )
-            throw new TopicRouteChangedError(current);
+          if (target.fallbackReason !== "explicit_main") {
+            const current = await readRoute();
+            if (
+              current.targetAgentId !== target.targetAgentId ||
+              current.fallbackReason !== target.fallbackReason
+            )
+              throw new TopicRouteChangedError(current);
+          }
+          if (!sameTopicTask(task, await readTask())) throw new TopicRouteChangedError(target);
         },
-        onHandoff: (pending) => store.setHandoffPending(workspaceId, entryId, pending),
+        onHandoff: async (pending) => {
+          submittedTask = pending ? await readTask() : undefined;
+          await store.setHandoffPending(workspaceId, entryId, pending);
+        },
         onStarted: async () => {
           for (const update of await store.update(workspaceId, entryId, "running")) publish(update);
         },
         signal: shutdown.signal,
       });
-    let reply: TopicAgentReply | undefined;
+    };
+    let outcome: TopicTurnOutcome | undefined;
     try {
       let target = route;
       for (;;) {
         shutdown.signal.throwIfAborted();
         try {
-          reply = await send(target);
+          outcome = await send(target);
           break;
         } catch (error) {
           if (
@@ -245,35 +349,96 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
       for (const update of await store.update(workspaceId, entryId, "error")) publish(update);
       return;
     }
-    for (const update of await store.update(workspaceId, entryId, "completed", reply))
+    for (const update of await store.update(workspaceId, entryId, "completed", outcome?.reply))
       publish(update);
-    if (entry.taskId && reply?.text) {
-      const preview = Array.from(reply.text.replace(/\s+/g, " ").trim()).slice(0, 240).join("");
-      await taskLedger.updateLatestReplyPreview(workspaceId, entry.taskId, preview);
-    }
+    const submitted = submittedTask;
+    // A structured decision cleared its own question before dispatch.
+    const answerBlockingQuestion = decision === undefined;
+    if (submitted && outcome)
+      await taskLedger.syncFromTurnOutcome(workspaceId, submitted.taskId, (current) =>
+        replyOutcomePatch(current, submitted, outcome, answerBlockingQuestion),
+      );
+  }
+
+  async function resolveReplyAddress(
+    request: WorkspaceTopicReplyRequest,
+    decision?: TopicDecisionDispatch,
+  ) {
+    const { workspaceId, topicKey } = request;
+    const keyTaskId = topicKey.startsWith("task:") ? topicKey.slice(5) : undefined;
+    const keyRootId = topicKey.startsWith("msg:") ? topicKey.slice(4) : undefined;
+    const taskId = request.taskId ?? keyTaskId;
+    const rootMessageId = request.rootMessageId ?? keyRootId;
+    const tasks = taskId || rootMessageId ? await taskLedger.list(workspaceId) : [];
+    const task = taskId
+      ? tasks.find((item) => item.taskId === taskId)
+      : tasks.findLast((item) => item.rootMessageId === rootMessageId);
+    requireReplyTask(task, rootMessageId, decision);
+    const canonicalKey = keyRootId && task ? `task:${task.taskId}` : topicKey;
+    const address = {
+      workspaceId,
+      mainAgentId: request.mainAgentId,
+      topicKey: canonicalKey,
+      taskId: task?.taskId ?? taskId,
+      rootMessageId: task?.rootMessageId ?? rootMessageId,
+    };
+    // A stale msg: card may follow a task after binding, but only for the same root.
+    if (keyRootId && rootMessageId !== keyRootId)
+      throw new Error("The first message does not belong to this topic.");
+    if (keyRootId && task && !task.rootMessageId)
+      throw new Error("The task does not belong to this topic.");
+    checkTopicAddress(address);
+    return { address, task, tasks };
+  }
+
+  async function ensureReplyAnchor(
+    address: Parameters<typeof topicAnchorInput>[0],
+    task: WorkspaceTask | undefined,
+    tasks: readonly WorkspaceTask[],
+    rootPromptPreview: string | undefined,
+    assertCurrent?: () => void,
+  ) {
+    const { anchors } = await store.listWithAnchors(address, address.topicKey);
+    const existing = anchors[0];
+    requireMatchingAnchor(existing, address);
+    const canImprovePrompt =
+      rootPromptPreview?.trim() &&
+      (!existing?.rootPromptText || existing.rootPromptText === existing.title);
+    if (existing && !canImprovePrompt) return { anchor: existing, changed: false };
+    const anchor = await store.upsertAnchor(
+      topicAnchorInput(address, task, rootPromptPreview),
+      assertCurrent,
+      tasks,
+    );
+    return { anchor, changed: true };
   }
 
   return {
+    requireMain,
     async list(
       request: WorkspaceTopicListEntriesRequest,
     ): Promise<WorkspaceTopicListEntriesResponse> {
       const { requestId, workspaceId, topicKey } = request;
       const reply = (
-        entries: TopicThreadEntry[],
+        snapshot: Awaited<ReturnType<TopicThreadStore["listWithAnchors"]>>,
         error: string | null,
       ): WorkspaceTopicListEntriesResponse => ({
         type: "workspace.topic.list_entries.response",
-        payload: { requestId, workspaceId, entries, error },
+        payload: { requestId, workspaceId, ...snapshot, error },
       });
       try {
         await requireMain(request);
-        return reply(await store.list(request, topicKey), null);
+        return reply(await store.listWithAnchors(request, topicKey), null);
       } catch (error) {
         logger.warn({ err: error, workspaceId }, "Could not list topic entries");
-        return reply([], "Could not list topic entries.");
+        return reply({ entries: [], anchors: [] }, "Could not list topic entries.");
       }
     },
-    async reply(request: WorkspaceTopicReplyRequest): Promise<WorkspaceTopicReplyResponse> {
+    async reply(
+      request: WorkspaceTopicReplyRequest,
+      decision?: TopicDecisionDispatch,
+      humanInitiated = false,
+    ): Promise<WorkspaceTopicReplyResponse> {
       const { requestId, workspaceId, topicKey } = request;
       const respond = (
         result: Omit<ReplyPayload, "requestId" | "workspaceId" | "topicKey">,
@@ -285,35 +450,38 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
         shutdown.signal.throwIfAborted();
         await requireMain(request);
         if (!request.text.trim()) throw new Error("Topic follow-up text is required.");
-        const tasks =
-          request.taskId || request.rootMessageId ? await taskLedger.list(workspaceId) : [];
-        const task = request.taskId
-          ? tasks.find((item) => item.taskId === request.taskId)
-          : tasks.findLast((item) => item.rootMessageId === request.rootMessageId);
-        if (
-          task?.rootMessageId &&
-          request.rootMessageId &&
-          task.rootMessageId !== request.rootMessageId
-        )
-          throw new Error("The task does not belong to this topic.");
+        const { address, task, tasks } = await resolveReplyAddress(request, decision);
         const route = await selectRoute(request, task, deps);
-        const { entry, changed, release } = await store.begin(
-          {
-            workspaceId,
-            mainAgentId: request.mainAgentId,
-            topicKey,
-            taskId: task?.taskId ?? request.taskId,
-            rootMessageId: task?.rootMessageId ?? request.rootMessageId,
-            // AgentManager uses the submitted client ID as the canonical user message ID.
-            sourceMessageId: request.clientMessageId,
-            routedAgentId: route.targetAgentId,
-            text: request.text,
-          },
-          deps.dispatch.wasAccepted,
-        );
-        if (changed) publish(entry);
+        const write = async () => {
+          const anchorWrite = await ensureReplyAnchor(
+            address,
+            task,
+            tasks,
+            request.rootPromptPreview,
+            decision?.guard?.assertCurrent,
+          );
+          const result = await store.begin(
+            {
+              ...address,
+              // AgentManager uses the submitted client ID as the canonical user message ID.
+              sourceMessageId: request.clientMessageId,
+              routedAgentId: route.targetAgentId,
+              text: request.text,
+              origin: decision?.origin ?? "topic_reply",
+              durableItemRequestId: decision?.durableItemRequestId,
+              decision: decision?.decision,
+            },
+            deps.dispatch.wasAccepted,
+            decision?.guard?.assertCurrent,
+          );
+          return { ...result, anchorWrite };
+        };
+        const { entry, changed, release, anchorWrite } = await (decision?.guard
+          ? decision.guard.commit(write)
+          : write());
+        if (changed || anchorWrite.changed) publish(entry, anchorWrite.anchor);
         if (release) {
-          const work = dispatch(request, entry, route).catch((error) => {
+          const work = dispatch(request, entry, route, humanInitiated, decision).catch((error) => {
             logger.warn({ err: error, entryId: entry.entryId }, "Could not persist topic result");
           });
           inFlight.add(work);
@@ -333,6 +501,7 @@ export function createTopicReplyRouter(deps: RouterDependencies) {
           error: null,
         });
       } catch (error) {
+        if (error instanceof TopicDecisionError) throw error;
         logger.warn({ err: error, workspaceId }, "Could not queue topic reply");
         return respond({
           routedTo: "main",
@@ -391,13 +560,14 @@ export function createTopicPromptDispatcher({
   const dispatch: DispatchTopicPrompt = async ({
     agentId,
     messageId,
+    scope,
     prompt,
     validate,
     onHandoff,
     onStarted,
     signal,
   }) => {
-    const turn = pendingResult<TopicAgentReply | undefined>();
+    const turn = pendingResult<TopicTurnOutcome>();
     void turn.promise.catch(() => {});
     let turnId: string | undefined;
     let lastAssistantMessage: { text: string; messageId?: string } | undefined;
@@ -408,15 +578,16 @@ export function createTopicPromptDispatcher({
       const text =
         (completion?.event.turnId === completedId ? completion.lastMessage : null) ??
         lastAssistantMessage?.text;
-      turn.resolve(
-        text
+      turn.resolve({
+        reply: text
           ? {
               text,
               sourceMessageId: lastAssistantMessage?.messageId,
               authorTitle: agent?.config.title ?? undefined,
             }
           : undefined,
-      );
+        touchedFiles: scope.taskId ? agentManager.getTurnTouchedFiles(agentId, completedId) : [],
+      });
     };
     const unsubscribe = agentManager.subscribe(
       (event) => {
@@ -468,6 +639,7 @@ export function createTopicPromptDispatcher({
             agentId,
             prompt,
             messageId,
+            runOptions: topicFollowupRunOptions(scope),
             logger,
             idleOnly: true,
             unarchive: false,
@@ -493,12 +665,14 @@ export function createTopicPromptDispatcher({
             throw new Error("Topic follow-up did not start a new turn.");
           await waitForAgentRunStartWithTimeout(agentManager, agentId, dispatched.started, signal);
           await onStarted();
-          const reply = await turn.promise;
-          if (!turnId || !reply || reply.sourceMessageId) return reply;
+          const outcome = await turn.promise;
+          if (!turnId || !outcome.reply || outcome.reply.sourceMessageId) return outcome;
 
           // A trailing chunk can omit the ID carried by the projected message it extends.
           const sourceMessageId = await readReplyMessageId(agentId, turnId);
-          return sourceMessageId ? { ...reply, sourceMessageId } : reply;
+          return sourceMessageId
+            ? { ...outcome, reply: { ...outcome.reply, sourceMessageId } }
+            : outcome;
         } catch (error) {
           if ((handedOff || turnId) && error instanceof TopicLeadUnavailableError)
             throw new Error("Topic routing changed after provider handoff.", { cause: error });

@@ -102,24 +102,24 @@ export function createFinishObservation(input: {
             })
             .catch(onError);
         };
+        const publishState = (agent: ManagedAgent) => {
+          const status = agent.lifecycle;
+          if (status === "closed") {
+            publish(
+              agent,
+              undefined,
+              agentManager.getCompletionAssistantMessage(agentId, agent, status),
+              agent.config.title,
+            );
+          } else if (status === "error" && agent.lastTurnCompletion?.event.type !== "turn_failed") {
+            publish(agent, undefined, null, agent.config.title);
+          }
+        };
         signal.throwIfAborted();
         const unsubscribe = agentManager.subscribe(
           (event) => {
             if (event.type === "agent_state") {
-              const status = event.agent.lifecycle;
-              if (status === "closed") {
-                publish(
-                  event.agent,
-                  undefined,
-                  agentManager.getCompletionAssistantMessage(agentId, event.agent, status),
-                  event.agent.config.title,
-                );
-              } else if (
-                status === "error" &&
-                event.agent.lastTurnCompletion?.event.type !== "turn_failed"
-              ) {
-                publish(event.agent, undefined, null, event.agent.config.title);
-              }
+              publishState(event.agent);
               return;
             }
             if (event.type === "agent_stream") {
@@ -135,7 +135,13 @@ export function createFinishObservation(input: {
               const current = agentManager.getAgent(agentId);
               if (!current) return;
               const completion = current.lastTurnCompletion;
-              if (completion?.event === streamEvent) {
+              if (
+                completion?.event === streamEvent ||
+                (completion?.event.turnId &&
+                  "turnId" in streamEvent &&
+                  completion.event.turnId === streamEvent.turnId &&
+                  completion.event.type === streamEvent.type)
+              ) {
                 publish(current, streamEvent, completion.lastMessage, current.config.title);
               } else if (streamEvent.type === "permission_requested") {
                 publish(

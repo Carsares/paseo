@@ -1,8 +1,10 @@
 import type {
   PendingSubagentInboxItem,
+  TopicAnchorSummary,
   TopicReplyRouteMode,
   TopicThreadEntry,
   WorkspaceDurableItem,
+  WorkspaceTaskFileConflict,
   WorkspaceTaskSummary,
   WorkspaceTodoItem,
   WorkspaceTopicReadSnapshot,
@@ -104,6 +106,41 @@ export interface TopicUnmatchedRef {
   rootMessageId?: string;
 }
 
+export type TopicBlockingPrompt =
+  | {
+      kind: "durable_item";
+      item: WorkspaceDurableItem;
+      /**
+       * True only when the item is a non-authorization item with an exact task binding for this
+       * topic card so `workspace.topic.decide.*` will accept it. Legacy items without exact task
+       * binding route to the dedicated standalone approval view instead.
+       */
+      canDecideInTopic: boolean;
+    }
+  | {
+      kind: "task_blocking_question";
+      taskId: string;
+      question: string;
+      blockingQuestionGeneration?: string;
+      options: string[];
+    };
+
+export function hasExactDurableItemTaskBinding(
+  item: WorkspaceDurableItem,
+  topicTaskId: string | undefined,
+): boolean {
+  if (!topicTaskId) return false;
+  return item.taskId === topicTaskId || item.topicKey === `task:${topicTaskId}`;
+}
+
+export function canDecideDurableItemInTopic(
+  item: WorkspaceDurableItem,
+  topicTaskId: string | undefined,
+): boolean {
+  if (item.kind === "authorization") return false;
+  return hasExactDurableItemTaskBinding(item, topicTaskId);
+}
+
 export interface TopicUnit {
   topicKey: string;
   taskId?: string;
@@ -128,6 +165,8 @@ export interface TopicUnit {
   linkedTodos: WorkspaceTodoItem[];
   linkedDurableItems: WorkspaceDurableItem[];
   linkedPermissions: PendingPermission[];
+  fileConflicts: WorkspaceTaskFileConflict[];
+  activeBlockingPrompt: TopicBlockingPrompt | null;
   unreadReplyCount: number;
   firstUnreadReplyIndex: number | null;
   isMarkedUnread: boolean;
@@ -161,6 +200,7 @@ export interface ProjectTopicUnitsInput {
   items: readonly StreamItem[];
   tasks?: readonly WorkspaceTaskSummary[];
   threadEntries?: readonly TopicThreadEntry[];
+  topicAnchors?: readonly TopicAnchorSummary[];
   pendingInboxItems?: readonly PendingSubagentInboxItem[];
   todos?: readonly WorkspaceTodoItem[];
   durableItems?: readonly WorkspaceDurableItem[];
@@ -196,12 +236,13 @@ interface MutableTopicUnit {
 interface TopicBuilderState {
   topics: MutableTopicUnit[];
   byTaskId: Map<string, MutableTopicUnit>;
-  byRootMessageId: Map<string, MutableTopicUnit>;
+  unitsByRootMessageId: Map<string, MutableTopicUnit[]>;
   byTopicKey: Map<string, MutableTopicUnit>;
   taskById: Map<string, WorkspaceTaskSummary>;
-  taskByRootMessageId: Map<string, WorkspaceTaskSummary>;
+  tasksByRootMessageId: Map<string, WorkspaceTaskSummary[]>;
   userFollowupBySourceMessageId: Map<string, TopicThreadEntry>;
   mirroredReplySourceMessageIds: Set<string>;
+  loadedAgentMessageIds: Set<string>;
   unmatchedUserFollowups: TopicThreadEntry[];
   unmatchedAgentReplies: TopicThreadEntry[];
   consumedFollowupEntryIds: Set<string>;
@@ -214,6 +255,33 @@ interface TopicBuilderState {
 }
 
 const FALLBACK_MIRROR_WINDOW_MS = 120_000;
+const TERMINAL_TASK_STATUSES = new Set(["completed", "canceled", "deferred"]);
+const MAX_QUICK_REPLY_OPTIONS = 4;
+const OPTION_LINE_PATTERN =
+  /^(?:(?:[1-9][0-9]?|[A-Da-d])[.)、:：]|[①②③④]|[-*•]|(?:方案|选项|Option)\s*[A-D1-4][.)、:：]?)\s*(.+)$/;
+
+/**
+ * Extracts up to 4 concise quick-reply options from numbered, lettered, or bulleted lines inside a
+ * task blocking question. Requires at least 2 candidates so ordinary notes are not misread as choices.
+ */
+export function extractQuickReplyOptions(question: string): string[] {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  for (const rawLine of question.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    const match = OPTION_LINE_PATTERN.exec(trimmed);
+    if (!match) continue;
+    const label = (match[1] ?? "").trim();
+    if (label.length < 2 || label.length > 72) continue;
+    const key = label.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push(label);
+    if (candidates.length >= MAX_QUICK_REPLY_OPTIONS) break;
+  }
+  return candidates.length >= 2 ? candidates : [];
+}
 
 function normalizeDedupeText(text: string): string {
   return text.trim().replace(/\s+/g, " ");
@@ -256,12 +324,36 @@ function markTopicCanceledIfStamped(unit: MutableTopicUnit, item: StreamItem): v
       : Math.max(unit.latestCanceledTurnTimestampMs, ts);
 }
 
+function addUnitToRootIndex(
+  state: TopicBuilderState,
+  key: string | undefined,
+  unit: MutableTopicUnit,
+): void {
+  if (!key) return;
+  const list = state.unitsByRootMessageId.get(key);
+  if (!list) {
+    state.unitsByRootMessageId.set(key, [unit]);
+    return;
+  }
+  if (!list.includes(unit)) {
+    list.push(unit);
+  }
+}
+
+function findUnboundUnitByRoot(
+  state: TopicBuilderState,
+  rootId: string | undefined,
+): MutableTopicUnit | undefined {
+  if (!rootId) return undefined;
+  return state.unitsByRootMessageId.get(rootId)?.find((unit) => !unit.taskId);
+}
+
 function registerTopic(state: TopicBuilderState, unit: MutableTopicUnit): void {
   state.topics.push(unit);
   state.byTopicKey.set(unit.topicKey, unit);
   if (unit.taskId) state.byTaskId.set(unit.taskId, unit);
-  if (unit.rootMessageId) state.byRootMessageId.set(unit.rootMessageId, unit);
-  state.byRootMessageId.set(unit.rootItemId, unit);
+  addUnitToRootIndex(state, unit.rootMessageId, unit);
+  addUnitToRootIndex(state, unit.rootItemId, unit);
 }
 
 function ensureFallbackTopic(state: TopicBuilderState, item: StreamItem): MutableTopicUnit {
@@ -310,36 +402,55 @@ function recordUnmatchedRef(
   }
 }
 
+function extractHintTaskId(hint: { taskId?: string; topicKey?: string }): string | undefined {
+  if (hint.taskId) return hint.taskId;
+  return hint.topicKey?.startsWith("task:") ? hint.topicKey.slice(5) : undefined;
+}
+
+function extractHintRootId(hint: {
+  rootMessageId?: string;
+  topicKey?: string;
+}): string | undefined {
+  if (hint.rootMessageId) return hint.rootMessageId;
+  return hint.topicKey?.startsWith("msg:") ? hint.topicKey.slice(4) : undefined;
+}
+
+function findUnitByRootFallback(
+  state: TopicBuilderState,
+  rootId: string | undefined,
+): MutableTopicUnit | undefined {
+  if (!rootId) return undefined;
+  const units = state.unitsByRootMessageId.get(rootId);
+  if (!units || units.length === 0) return undefined;
+  return units.find((unit) => !unit.taskId) ?? units[0];
+}
+
 /**
  * Matches a topic unit by explicit references (`topicKey`, `taskId`, `rootMessageId`).
- * When ANY explicit reference is supplied, never falls back to an unrelated latest topic card —
- * returning `undefined` instead so out-of-window items wait for older history instead of
- * corrupting another topic.
+ * When an explicit `taskId` (or `task:` topicKey) is supplied, strictly isolates sibling tasks
+ * sharing the same `rootMessageId` — only matching that exact task or an unbound `msg:` placeholder.
  */
 function findMatchingTopic(
   state: TopicBuilderState,
   hint: { taskId?: string; rootMessageId?: string; topicKey?: string },
 ): MutableTopicUnit | undefined {
   const hasExplicitRef = Boolean(hint.topicKey || hint.taskId || hint.rootMessageId);
+  const explicitTaskId = extractHintTaskId(hint);
+  const explicitRootId = extractHintRootId(hint);
+
+  if (explicitTaskId) {
+    return (
+      state.byTaskId.get(explicitTaskId) ??
+      state.byTopicKey.get(`task:${explicitTaskId}`) ??
+      findUnboundUnitByRoot(state, explicitRootId)
+    );
+  }
   if (hint.topicKey) {
     const exact = state.byTopicKey.get(hint.topicKey);
     if (exact) return exact;
-    if (hint.topicKey.startsWith("msg:")) {
-      const byMsgKey = state.byRootMessageId.get(hint.topicKey.slice(4));
-      if (byMsgKey) return byMsgKey;
-    } else if (hint.topicKey.startsWith("task:")) {
-      const byTaskKey = state.byTaskId.get(hint.topicKey.slice(5));
-      if (byTaskKey) return byTaskKey;
-    }
   }
-  if (hint.taskId) {
-    const byTask = state.byTaskId.get(hint.taskId);
-    if (byTask) return byTask;
-  }
-  if (hint.rootMessageId) {
-    const byRoot = state.byRootMessageId.get(hint.rootMessageId);
-    if (byRoot) return byRoot;
-  }
+  const byRoot = findUnitByRootFallback(state, explicitRootId);
+  if (byRoot) return byRoot;
   if (hasExplicitRef) {
     return undefined;
   }
@@ -347,8 +458,10 @@ function findMatchingTopic(
 }
 
 function entryBelongsToUnit(entry: TopicThreadEntry, unit: MutableTopicUnit): boolean {
+  const entryTaskId = extractHintTaskId(entry);
+  if (entryTaskId && unit.taskId && entryTaskId !== unit.taskId) return false;
   if (entry.topicKey === unit.topicKey) return true;
-  if (entry.taskId && unit.taskId && entry.taskId === unit.taskId) return true;
+  if (entryTaskId && unit.taskId && entryTaskId === unit.taskId) return true;
   if (
     entry.rootMessageId &&
     (entry.rootMessageId === unit.rootMessageId || entry.rootMessageId === unit.rootItemId)
@@ -364,8 +477,14 @@ function entryBelongsToUnit(entry: TopicThreadEntry, unit: MutableTopicUnit): bo
 
 function bindTaskToTopic(state: TopicBuilderState, target: MutableTopicUnit, taskId: string): void {
   if (target.taskId) return;
+  const previousTopicKey = target.topicKey;
   target.taskId = taskId;
+  target.topicKey = `task:${taskId}`;
+  if (previousTopicKey.startsWith("msg:") && state.byTopicKey.get(previousTopicKey) === target) {
+    state.byTopicKey.delete(previousTopicKey);
+  }
   state.byTaskId.set(taskId, target);
+  state.byTopicKey.set(target.topicKey, target);
   const linkedTask = state.taskById.get(taskId);
   if (!linkedTask) return;
   target.task = linkedTask;
@@ -374,19 +493,22 @@ function bindTaskToTopic(state: TopicBuilderState, target: MutableTopicUnit, tas
   }
 }
 
-function findTaskForHumanPrompt(
+function findTasksForHumanPrompt(
   state: TopicBuilderState,
   item: UserMessageItem,
-): WorkspaceTaskSummary | null {
-  if (item.messageId) {
-    const byMsg = state.taskByRootMessageId.get(item.messageId);
-    if (byMsg) return byMsg;
+): WorkspaceTaskSummary[] {
+  const found: WorkspaceTaskSummary[] = [];
+  const seen = new Set<string>();
+  const keys = [item.messageId, item.clientMessageId, item.id];
+  for (const key of keys) {
+    if (!key) continue;
+    for (const task of state.tasksByRootMessageId.get(key) ?? []) {
+      if (seen.has(task.taskId)) continue;
+      seen.add(task.taskId);
+      found.push(task);
+    }
   }
-  if (item.clientMessageId) {
-    const byClient = state.taskByRootMessageId.get(item.clientMessageId);
-    if (byClient) return byClient;
-  }
-  return state.taskByRootMessageId.get(item.id) ?? null;
+  return found;
 }
 
 function findMirroredUserFollowup(
@@ -486,19 +608,225 @@ function ingestMirroredPrompt(state: TopicBuilderState, item: UserMessageItem): 
   return true;
 }
 
-function ingestHumanPrompt(state: TopicBuilderState, item: UserMessageItem): void {
-  if (ingestMirroredPrompt(state, item)) return;
+function resolveAnchorTask(
+  state: TopicBuilderState,
+  anchor: TopicAnchorSummary,
+): WorkspaceTaskSummary | null {
+  const anchorTaskId = extractHintTaskId(anchor);
+  if (anchorTaskId) {
+    return state.taskById.get(anchorTaskId) ?? null;
+  }
+  if (anchor.rootMessageId) {
+    const rootTasks = state.tasksByRootMessageId.get(anchor.rootMessageId);
+    return rootTasks?.length === 1 ? rootTasks[0]! : null;
+  }
+  return null;
+}
 
-  const messageId = item.messageId ?? item.clientMessageId ?? item.id;
-  const matchedTask = findTaskForHumanPrompt(state, item);
-  const topicKey = matchedTask ? `task:${matchedTask.taskId}` : `msg:${messageId}`;
-  const leadAgentId = matchedTask?.leadAgentId ?? matchedTask?.participants[0]?.agentId;
-  const leadTitle = leadAgentId ? state.agentTitleById?.get(leadAgentId) : undefined;
+function resolveAnchorLead(
+  state: TopicBuilderState,
+  anchor: TopicAnchorSummary,
+  linkedTask: WorkspaceTaskSummary | null,
+) {
+  const leadAgentId =
+    linkedTask?.leadAgentId ?? anchor.leadAgentId ?? linkedTask?.participants[0]?.agentId;
+  const leadServerId = linkedTask?.leadServerId ?? anchor.leadServerId;
+  const leadTitle =
+    (leadAgentId ? state.agentTitleById?.get(leadAgentId) : undefined) ?? anchor.leadTitle;
+  return { leadAgentId, leadServerId, leadTitle };
+}
+
+function resolveAnchorPromptText(
+  anchor: TopicAnchorSummary,
+  linkedTask: WorkspaceTaskSummary | null,
+): string {
+  if (anchor.rootPromptText.trim()) return anchor.rootPromptText.trim();
+  if (anchor.title?.trim()) return anchor.title.trim();
+  return linkedTask?.title?.trim() ?? "";
+}
+
+function createUnitFromAnchor(
+  state: TopicBuilderState,
+  anchor: TopicAnchorSummary,
+): MutableTopicUnit {
+  const linkedTask = resolveAnchorTask(state, anchor);
+  const taskId = anchor.taskId ?? linkedTask?.taskId;
+  const topicKey = taskId ? `task:${taskId}` : anchor.topicKey;
+  const rootMessageId = anchor.rootMessageId ?? linkedTask?.rootMessageId;
+  const rootItemId = rootMessageId ?? `anchor:${topicKey}`;
+  const { leadAgentId, leadServerId, leadTitle } = resolveAnchorLead(state, anchor, linkedTask);
+
+  return {
+    topicKey,
+    taskId,
+    rootItemId,
+    rootMessageId,
+    rootPrompt: {
+      id: rootItemId,
+      messageId: rootMessageId,
+      text: resolveAnchorPromptText(anchor, linkedTask),
+      timestampMs: parseIsoMs(anchor.createdAt, parseIsoMs(linkedTask?.createdAt, 0)),
+      seq: null,
+      epoch: null,
+      item: null,
+    },
+    task: linkedTask,
+    leadAgentId,
+    leadServerId,
+    leadTitle,
+    processSteps: [],
+    replies: [],
+    pendingInboxItems: [],
+    linkedTodos: [],
+    linkedDurableItems: [],
+    linkedPermissions: [],
+    latestCanceledTurnTimestampMs: null,
+  };
+}
+
+function migrateUnboundUnitToAnchor(
+  state: TopicBuilderState,
+  unit: MutableTopicUnit,
+  anchor: TopicAnchorSummary,
+  anchorTaskId: string,
+): void {
+  const previousKey = unit.topicKey;
+  if (previousKey.startsWith("msg:") && state.byTopicKey.get(previousKey) === unit) {
+    state.byTopicKey.delete(previousKey);
+  }
+  const linkedTask = resolveAnchorTask(state, anchor);
+  unit.taskId = anchorTaskId;
+  unit.topicKey = `task:${anchorTaskId}`;
+  if (linkedTask) unit.task = linkedTask;
+  const lead = resolveAnchorLead(state, anchor, linkedTask);
+  unit.leadAgentId = unit.leadAgentId ?? lead.leadAgentId;
+  unit.leadServerId = unit.leadServerId ?? lead.leadServerId;
+  unit.leadTitle = unit.leadTitle ?? lead.leadTitle;
+  if (!unit.rootPrompt.text.trim()) {
+    unit.rootPrompt.text = resolveAnchorPromptText(anchor, linkedTask);
+  }
+  state.byTaskId.set(anchorTaskId, unit);
+  state.byTopicKey.set(unit.topicKey, unit);
+  addUnitToRootIndex(state, anchor.rootMessageId, unit);
+}
+
+function backfillBoundUnitsPrompt(
+  state: TopicBuilderState,
+  rootMessageId: string,
+  promptText: string,
+): boolean {
+  const boundUnits = (state.unitsByRootMessageId.get(rootMessageId) ?? []).filter((u) => u.taskId);
+  if (boundUnits.length === 0) return false;
+  const trimmed = promptText.trim();
+  if (trimmed) {
+    for (const unit of boundUnits) {
+      if (!unit.rootPrompt.text.trim()) {
+        unit.rootPrompt.text = trimmed;
+      }
+    }
+  }
+  return true;
+}
+
+function seedTopicsFromAnchors(
+  state: TopicBuilderState,
+  anchors: readonly TopicAnchorSummary[],
+): void {
+  const ordered = [...anchors].sort((left, right) => {
+    const diff = parseIsoMs(left.createdAt) - parseIsoMs(right.createdAt);
+    return diff !== 0 ? diff : left.topicKey.localeCompare(right.topicKey);
+  });
+
+  for (const anchor of ordered) {
+    const anchorTaskId = extractHintTaskId(anchor);
+    if (!anchorTaskId) {
+      if (
+        anchor.rootMessageId &&
+        backfillBoundUnitsPrompt(state, anchor.rootMessageId, anchor.rootPromptText)
+      ) {
+        continue;
+      }
+      if (state.byTopicKey.has(anchor.topicKey)) continue;
+      registerTopic(state, createUnitFromAnchor(state, anchor));
+      continue;
+    }
+
+    if (state.byTaskId.has(anchorTaskId)) continue;
+    const unbound = findUnboundUnitByRoot(state, anchor.rootMessageId);
+    if (unbound) {
+      migrateUnboundUnitToAnchor(state, unbound, anchor, anchorTaskId);
+      continue;
+    }
+    registerTopic(state, createUnitFromAnchor(state, anchor));
+  }
+}
+
+function syncHydratedUnitTask(
+  state: TopicBuilderState,
+  existing: MutableTopicUnit,
+  matchedTask: WorkspaceTaskSummary | null,
+): void {
+  if (!matchedTask) return;
+  if (!existing.task) existing.task = matchedTask;
+  if (!existing.taskId) {
+    const previousKey = existing.topicKey;
+    if (previousKey.startsWith("msg:") && state.byTopicKey.get(previousKey) === existing) {
+      state.byTopicKey.delete(previousKey);
+    }
+    existing.taskId = matchedTask.taskId;
+    existing.topicKey = `task:${matchedTask.taskId}`;
+    state.byTaskId.set(matchedTask.taskId, existing);
+    state.byTopicKey.set(existing.topicKey, existing);
+  }
+  const leadAgentId =
+    existing.leadAgentId ?? matchedTask.leadAgentId ?? matchedTask.participants[0]?.agentId;
+  if (leadAgentId) {
+    existing.leadAgentId = leadAgentId;
+    existing.leadServerId = existing.leadServerId ?? matchedTask.leadServerId;
+    existing.leadTitle = existing.leadTitle ?? state.agentTitleById?.get(leadAgentId);
+  }
+}
+
+function hydrateAnchorUnitWithHumanPrompt(
+  state: TopicBuilderState,
+  existing: MutableTopicUnit,
+  item: UserMessageItem,
+  matchedTask: WorkspaceTaskSummary | null,
+  rootItemIdOverride?: string,
+): void {
   const cursor = item.timelineCursor;
-  const unit: MutableTopicUnit = {
+  existing.rootItemId = rootItemIdOverride ?? item.id;
+  existing.rootMessageId = item.messageId ?? item.id;
+  existing.rootPrompt = {
+    id: item.id,
+    messageId: item.messageId,
+    text: item.text || existing.rootPrompt.text,
+    timestampMs: item.timestamp.getTime(),
+    seq: cursor?.seq ?? null,
+    epoch: cursor?.epoch ?? null,
+    item,
+  };
+  syncHydratedUnitTask(state, existing, matchedTask);
+  addUnitToRootIndex(state, existing.rootItemId, existing);
+  addUnitToRootIndex(state, existing.rootMessageId, existing);
+  addUnitToRootIndex(state, item.clientMessageId, existing);
+  markTopicCanceledIfStamped(existing, item);
+  state.activeTopic = existing;
+}
+
+function createUnitFromHumanPrompt(
+  state: TopicBuilderState,
+  item: UserMessageItem,
+  matchedTask: WorkspaceTaskSummary | null,
+  topicKey: string,
+  rootItemIdOverride?: string,
+): MutableTopicUnit {
+  const leadAgentId = matchedTask?.leadAgentId ?? matchedTask?.participants[0]?.agentId;
+  const cursor = item.timelineCursor;
+  return {
     topicKey,
     taskId: matchedTask?.taskId,
-    rootItemId: item.id,
+    rootItemId: rootItemIdOverride ?? item.id,
     rootMessageId: item.messageId ?? item.id,
     rootPrompt: {
       id: item.id,
@@ -512,7 +840,7 @@ function ingestHumanPrompt(state: TopicBuilderState, item: UserMessageItem): voi
     task: matchedTask,
     leadAgentId,
     leadServerId: matchedTask?.leadServerId,
-    leadTitle,
+    leadTitle: leadAgentId ? state.agentTitleById?.get(leadAgentId) : undefined,
     processSteps: [],
     replies: [],
     pendingInboxItems: [],
@@ -521,6 +849,72 @@ function ingestHumanPrompt(state: TopicBuilderState, item: UserMessageItem): voi
     linkedPermissions: [],
     latestCanceledTurnTimestampMs: null,
   };
+}
+
+function hydrateRemainingAnchorUnitsForRoot(
+  state: TopicBuilderState,
+  item: UserMessageItem,
+  messageId: string,
+): MutableTopicUnit | undefined {
+  const existingUnits = [
+    ...(state.unitsByRootMessageId.get(messageId) ?? []),
+    ...(item.clientMessageId && item.clientMessageId !== messageId
+      ? (state.unitsByRootMessageId.get(item.clientMessageId) ?? [])
+      : []),
+  ];
+  const seen = new Set<MutableTopicUnit>();
+  let lastUnit: MutableTopicUnit | undefined;
+  for (const unit of existingUnits) {
+    if (seen.has(unit)) continue;
+    seen.add(unit);
+    if (unit.rootPrompt.item === null) {
+      const unitTask = unit.taskId ? (state.taskById.get(unit.taskId) ?? unit.task) : unit.task;
+      const rootItemId = unit.taskId ? `${item.id}:${unit.taskId}` : item.id;
+      hydrateAnchorUnitWithHumanPrompt(state, unit, item, unitTask, rootItemId);
+    }
+    lastUnit = unit;
+  }
+  return lastUnit;
+}
+
+function ingestHumanPrompt(state: TopicBuilderState, item: UserMessageItem): void {
+  if (ingestMirroredPrompt(state, item)) return;
+
+  const messageId = item.messageId ?? item.clientMessageId ?? item.id;
+  const matchedTasks = findTasksForHumanPrompt(state, item);
+
+  if (matchedTasks.length > 0) {
+    const multiTask = matchedTasks.length > 1;
+    let lastUnit: MutableTopicUnit | undefined;
+    for (const task of matchedTasks) {
+      const rootItemId = multiTask ? `${item.id}:${task.taskId}` : item.id;
+      const existing = state.byTaskId.get(task.taskId) ?? findUnboundUnitByRoot(state, messageId);
+      if (existing && existing.rootPrompt.item === null) {
+        hydrateAnchorUnitWithHumanPrompt(state, existing, item, task, rootItemId);
+        lastUnit = existing;
+        continue;
+      }
+      if (existing) {
+        lastUnit = existing;
+        continue;
+      }
+      const unit = createUnitFromHumanPrompt(state, item, task, `task:${task.taskId}`, rootItemId);
+      markTopicCanceledIfStamped(unit, item);
+      registerTopic(state, unit);
+      lastUnit = unit;
+    }
+    const extraHydrated = hydrateRemainingAnchorUnitsForRoot(state, item, messageId);
+    state.activeTopic = extraHydrated ?? lastUnit;
+    return;
+  }
+
+  const hydratedAnchor = hydrateRemainingAnchorUnitsForRoot(state, item, messageId);
+  if (hydratedAnchor) {
+    state.activeTopic = hydratedAnchor;
+    return;
+  }
+
+  const unit = createUnitFromHumanPrompt(state, item, null, `msg:${messageId}`);
   markTopicCanceledIfStamped(unit, item);
   registerTopic(state, unit);
   state.activeTopic = unit;
@@ -689,8 +1083,10 @@ function ingestStreamItem(state: TopicBuilderState, item: StreamItem): void {
 
 function matchesTodoTarget(todo: WorkspaceTodoItem, target: MutableTopicUnit): boolean {
   if (!todo.source) return false;
+  const sourceTaskId = extractHintTaskId(todo.source);
+  if (sourceTaskId && target.taskId && sourceTaskId !== target.taskId) return false;
   if (todo.source.topicKey === target.topicKey) return true;
-  if (todo.source.taskId && todo.source.taskId === target.taskId) return true;
+  if (sourceTaskId && sourceTaskId === target.taskId) return true;
   if (todo.source.rootMessageId && todo.source.rootMessageId === target.rootMessageId) return true;
   if (todo.source.topicKey.startsWith("msg:")) {
     const rawMsg = todo.source.topicKey.slice(4);
@@ -706,6 +1102,16 @@ function unitHasParticipant(unit: MutableTopicUnit, agentId: string): boolean {
 
 function attachThreadEntries(state: TopicBuilderState, entries: readonly TopicThreadEntry[]): void {
   for (const entry of entries) {
+    // When a subagent report already exists on the main timeline with the same sourceMessageId
+    // (e.g. multi-track merge path), keep the main-timeline item to avoid duplicate rendering.
+    if (
+      entry.origin === "subagent_report" &&
+      entry.sourceMessageId &&
+      state.loadedAgentMessageIds.has(entry.sourceMessageId)
+    ) {
+      continue;
+    }
+
     const target = findMatchingTopic(state, {
       topicKey: entry.topicKey,
       taskId: entry.taskId,
@@ -718,6 +1124,11 @@ function attachThreadEntries(state: TopicBuilderState, entries: readonly TopicTh
         rootMessageId: entry.rootMessageId,
       });
       continue;
+    }
+    if (entry.origin === "subagent_report" && entry.authorAgentId && !target.leadAgentId) {
+      target.leadAgentId = entry.authorAgentId;
+      target.leadTitle =
+        state.agentTitleById?.get(entry.authorAgentId) ?? entry.authorTitle?.trim();
     }
     target.replies.push({
       kind: "thread_entry",
@@ -752,11 +1163,8 @@ function attachPendingInboxItems(
   }
 }
 
-function attachExternalCollections(state: TopicBuilderState, input: ProjectTopicUnitsInput): void {
-  attachThreadEntries(state, input.threadEntries ?? []);
-  attachPendingInboxItems(state, input.pendingInboxItems ?? []);
-
-  for (const todo of input.todos ?? []) {
+function attachLinkedTodos(state: TopicBuilderState, todos: readonly WorkspaceTodoItem[]): void {
+  for (const todo of todos) {
     if (!todo.source) continue;
     const target = findMatchingTopic(state, {
       topicKey: todo.source.topicKey,
@@ -767,15 +1175,43 @@ function attachExternalCollections(state: TopicBuilderState, input: ProjectTopic
       target.linkedTodos.push(todo);
     }
   }
+}
 
-  for (const durable of input.durableItems ?? []) {
-    const target = state.topics.find((unit) => unitHasParticipant(unit, durable.sourceAgentId));
-    if (target) target.linkedDurableItems.push(durable);
+function attachDurableItems(
+  state: TopicBuilderState,
+  durableItems: readonly WorkspaceDurableItem[],
+): void {
+  for (const durable of durableItems) {
+    const hasExplicitRef = Boolean(durable.topicKey || durable.taskId || durable.rootMessageId);
+    const target = hasExplicitRef
+      ? findMatchingTopic(state, {
+          topicKey: durable.topicKey,
+          taskId: durable.taskId,
+          rootMessageId: durable.rootMessageId,
+        })
+      : state.topics.findLast((unit) => unitHasParticipant(unit, durable.sourceAgentId));
+    if (target) {
+      target.linkedDurableItems.push(durable);
+    } else if (hasExplicitRef) {
+      recordUnmatchedRef(state, {
+        topicKey: durable.topicKey,
+        taskId: durable.taskId,
+        rootMessageId: durable.rootMessageId,
+      });
+    }
   }
+}
+
+function attachExternalCollections(state: TopicBuilderState, input: ProjectTopicUnitsInput): void {
+  attachThreadEntries(state, input.threadEntries ?? []);
+  attachPendingInboxItems(state, input.pendingInboxItems ?? []);
+  attachLinkedTodos(state, input.todos ?? []);
+  attachDurableItems(state, input.durableItems ?? []);
 
   for (const perm of input.pendingPermissions ?? []) {
     const target =
-      state.topics.find((unit) => unitHasParticipant(unit, perm.agentId)) ?? state.topics.at(-1);
+      state.topics.findLast((unit) => unitHasParticipant(unit, perm.agentId)) ??
+      state.topics.at(-1);
     if (target) target.linkedPermissions.push(perm);
   }
 }
@@ -828,13 +1264,53 @@ function computeReplyUnread(input: {
   return input.agentRequiresAttention && input.isLatestTopic;
 }
 
+function resolveActiveBlockingPrompt(unit: MutableTopicUnit): TopicBlockingPrompt | null {
+  const pendingDurables = unit.linkedDurableItems.filter((item) => item.status === "pending");
+  const preferredDurable =
+    pendingDurables.find((item) => canDecideDurableItemInTopic(item, unit.taskId)) ??
+    pendingDurables.find((item) => item.kind === "decision" || item.kind === "acceptance") ??
+    pendingDurables[0];
+  if (preferredDurable) {
+    return {
+      kind: "durable_item",
+      item: preferredDurable,
+      canDecideInTopic: canDecideDurableItemInTopic(preferredDurable, unit.taskId),
+    };
+  }
+  const blockingQuestion = unit.task?.blockingQuestion?.trim();
+  if (unit.task && blockingQuestion && !TERMINAL_TASK_STATUSES.has(unit.task.status)) {
+    return {
+      kind: "task_blocking_question",
+      taskId: unit.task.taskId,
+      question: blockingQuestion,
+      blockingQuestionGeneration: unit.task.blockingQuestionGeneration,
+      options: extractQuickReplyOptions(blockingQuestion),
+    };
+  }
+  return null;
+}
+
+function resolveTopicFileConflicts(unit: MutableTopicUnit): WorkspaceTaskFileConflict[] {
+  if (!unit.task || TERMINAL_TASK_STATUSES.has(unit.task.status)) return [];
+  return unit.task.fileConflicts ? [...unit.task.fileConflicts] : [];
+}
+
 function isTopicBlocked(
   unit: MutableTopicUnit,
   latestReport: Extract<TopicReplyItem, { kind: "subagent_report" }> | undefined,
+  latestOutcome: TopicReplyItem | undefined,
+  activeBlockingPrompt: TopicBlockingPrompt | null,
 ): boolean {
   if (unit.linkedPermissions.length > 0) return true;
-  if (unit.linkedDurableItems.some((item) => item.status === "pending")) return true;
+  if (activeBlockingPrompt !== null) return true;
   if (latestReport?.status === "blocked" || latestReport?.status === "permission-required") {
+    return true;
+  }
+  if (
+    latestOutcome?.kind === "thread_entry" &&
+    latestOutcome.entry.origin === "subagent_report" &&
+    latestOutcome.entry.reportStatus === "blocked"
+  ) {
     return true;
   }
   return unit.task?.status === "awaiting_decision";
@@ -935,11 +1411,12 @@ function isTopicInterrupted(
 function resolveTopicLifecycleStatus(input: {
   unit: MutableTopicUnit;
   replies: readonly TopicReplyItem[];
+  activeBlockingPrompt: TopicBlockingPrompt | null;
   hasUnread: boolean;
   isLatestTopic: boolean;
   isTurnActive: boolean;
 }): TopicLifecycleStatus {
-  const { unit, replies, hasUnread } = input;
+  const { unit, replies, activeBlockingPrompt, hasUnread } = input;
   const latestReport = replies
     .toReversed()
     .find(
@@ -948,7 +1425,7 @@ function resolveTopicLifecycleStatus(input: {
     );
   const latestOutcome = replies.toReversed().find(isOutcomeReply);
 
-  if (isTopicBlocked(unit, latestReport)) return "blocked";
+  if (isTopicBlocked(unit, latestReport, latestOutcome, activeBlockingPrompt)) return "blocked";
   if (
     isTopicDispatching({
       unit,
@@ -1080,9 +1557,12 @@ function finalizeTopicUnit(input: {
   }
 
   const hasUnread = unreadReplyCount > 0 || isMarkedUnread;
+  const fileConflicts = resolveTopicFileConflicts(unit);
+  const activeBlockingPrompt = resolveActiveBlockingPrompt(unit);
   const lifecycleStatus = resolveTopicLifecycleStatus({
     unit,
     replies,
+    activeBlockingPrompt,
     hasUnread,
     isLatestTopic,
     isTurnActive: Boolean(projectionInput.isTurnActive),
@@ -1092,6 +1572,8 @@ function finalizeTopicUnit(input: {
   return {
     ...unit,
     replies,
+    fileConflicts,
+    activeBlockingPrompt,
     unreadReplyCount,
     firstUnreadReplyIndex,
     isMarkedUnread,
@@ -1114,24 +1596,31 @@ function loadedAssistantSourceIds(items: readonly StreamItem[]): Set<string> {
   return ids;
 }
 
-export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectionResult {
-  const taskById = new Map<string, WorkspaceTaskSummary>();
-  const taskByRootMessageId = new Map<string, WorkspaceTaskSummary>();
-  for (const task of input.tasks ?? []) {
-    taskById.set(task.taskId, task);
-    if (task.rootMessageId) taskByRootMessageId.set(task.rootMessageId, task);
+function collectLoadedAgentMessageIds(items: readonly StreamItem[]): Set<string> {
+  const ids = new Set<string>();
+  for (const item of items) {
+    if (!getAgentMessage(item)) continue;
+    ids.add(item.id);
+    if ("messageId" in item && item.messageId) ids.add(item.messageId);
+    if (item.kind === "tool_call" && item.payload.source === "agent" && item.payload.data.callId) {
+      ids.add(item.payload.data.callId);
+    }
   }
+  return ids;
+}
 
+function indexThreadEntries(
+  entries: readonly TopicThreadEntry[],
+  assistantIds: ReadonlySet<string> | null,
+) {
   const userFollowupBySourceMessageId = new Map<string, TopicThreadEntry>();
   const mirroredReplySourceMessageIds = new Set<string>();
-  const assistantIds = input.threadEntries?.length ? loadedAssistantSourceIds(input.items) : null;
   const unmatchedUserFollowups: TopicThreadEntry[] = [];
   const unmatchedAgentReplies: TopicThreadEntry[] = [];
-  for (const entry of input.threadEntries ?? []) {
+
+  for (const entry of entries) {
     if (entry.role === "user_followup") {
-      if (entry.sourceMessageId) {
-        userFollowupBySourceMessageId.set(entry.sourceMessageId, entry);
-      }
+      if (entry.sourceMessageId) userFollowupBySourceMessageId.set(entry.sourceMessageId, entry);
       unmatchedUserFollowups.push(entry);
     } else if (entry.role === "agent_reply" && entry.routedAgentId === entry.mainAgentId) {
       if (entry.sourceMessageId) {
@@ -1142,17 +1631,57 @@ export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectio
     }
   }
 
-  const state: TopicBuilderState = {
-    topics: [],
-    byTaskId: new Map(),
-    byRootMessageId: new Map(),
-    byTopicKey: new Map(),
-    taskById,
-    taskByRootMessageId,
+  return {
     userFollowupBySourceMessageId,
     mirroredReplySourceMessageIds,
     unmatchedUserFollowups,
     unmatchedAgentReplies,
+  };
+}
+
+function sortTopicsChronologically(topics: readonly MutableTopicUnit[]): MutableTopicUnit[] {
+  return topics
+    .map((unit, index) => ({ unit, index }))
+    .sort((left, right) => {
+      if (left.unit.rootPrompt.timestampMs !== right.unit.rootPrompt.timestampMs) {
+        return left.unit.rootPrompt.timestampMs - right.unit.rootPrompt.timestampMs;
+      }
+      return left.index - right.index;
+    })
+    .map(({ unit }) => unit);
+}
+
+function indexTasksByRoot(tasks: readonly WorkspaceTaskSummary[]) {
+  const taskById = new Map<string, WorkspaceTaskSummary>();
+  const tasksByRootMessageId = new Map<string, WorkspaceTaskSummary[]>();
+  for (const task of tasks) {
+    taskById.set(task.taskId, task);
+    if (!task.rootMessageId) continue;
+    const list = tasksByRootMessageId.get(task.rootMessageId);
+    if (list) list.push(task);
+    else tasksByRootMessageId.set(task.rootMessageId, [task]);
+  }
+  return { taskById, tasksByRootMessageId };
+}
+
+export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectionResult {
+  const { taskById, tasksByRootMessageId } = indexTasksByRoot(input.tasks ?? []);
+
+  const threadEntries = input.threadEntries ?? [];
+  const assistantIds = threadEntries.length > 0 ? loadedAssistantSourceIds(input.items) : null;
+  const loadedAgentMessageIds =
+    threadEntries.length > 0 ? collectLoadedAgentMessageIds(input.items) : new Set<string>();
+  const indexed = indexThreadEntries(threadEntries, assistantIds);
+
+  const state: TopicBuilderState = {
+    topics: [],
+    byTaskId: new Map(),
+    unitsByRootMessageId: new Map(),
+    byTopicKey: new Map(),
+    taskById,
+    tasksByRootMessageId,
+    ...indexed,
+    loadedAgentMessageIds,
     consumedFollowupEntryIds: new Set(),
     consumedReplyEntryIds: new Set(),
     unmatchedExplicitRefs: [],
@@ -1162,10 +1691,17 @@ export function projectTopicUnits(input: ProjectTopicUnitsInput): TopicProjectio
     agentTitleById: input.agentTitleById,
   };
 
+  if (input.topicAnchors && input.topicAnchors.length > 0) {
+    seedTopicsFromAnchors(state, input.topicAnchors);
+  }
   for (const item of input.items) {
     ingestStreamItem(state, item);
   }
   attachExternalCollections(state, input);
+
+  if (input.topicAnchors && input.topicAnchors.length > 0 && state.topics.length > 1) {
+    state.topics = sortTopicsChronologically(state.topics);
+  }
 
   const watermark: TopicWatermarkSnapshot = {
     epoch: input.readSnapshot?.watermarkEpoch ?? null,

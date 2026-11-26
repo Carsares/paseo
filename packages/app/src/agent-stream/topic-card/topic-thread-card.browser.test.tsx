@@ -19,6 +19,8 @@ beforeEach(async () => {
   useTopicStreamViewStore.setState({
     expandedProcessByTopicKey: {},
     expandedHistoryByTopicKey: {},
+    expandedConflictsByTopicKey: {},
+    decisionDraftByTopicKey: {},
   });
   container = document.body.appendChild(document.createElement("div"));
   container.style.width = "900px";
@@ -110,6 +112,8 @@ function makeTopic(): TopicUnit {
     linkedTodos: [],
     linkedDurableItems: [],
     linkedPermissions: [],
+    fileConflicts: [],
+    activeBlockingPrompt: null,
     unreadReplyCount: 2,
     firstUnreadReplyIndex: 0,
     isMarkedUnread: false,
@@ -198,4 +202,65 @@ it("renders user prompt first, collapses process steps behind useDisclosureHold,
     view.getByTestId("topic-flush-inbox-task:T-100").click();
   });
   expect(onFlushTopicInbox).toHaveBeenCalledWith(topic);
+});
+
+function makeConflictDecisionTopic(): TopicUnit {
+  return {
+    ...makeTopic(),
+    lifecycleStatus: "blocked",
+    fileConflicts: [
+      {
+        path: "packages/app/src/panels/agent-panel.tsx",
+        peers: [
+          {
+            taskId: "T-200",
+            title: "Parallel panel cleanup",
+            leadTitle: "Frontend Lead",
+            status: "in_progress",
+          },
+        ],
+      },
+    ],
+    activeBlockingPrompt: {
+      kind: "task_blocking_question",
+      taskId: "T-100",
+      question: "Pick rollout order:\n1. Canary first\n2. Direct prod",
+      options: ["Canary first", "Direct prod"],
+    },
+  };
+}
+
+it("renders conflict banner and blocking decision slot in browser layout", () => {
+  const onJumpToPeerTopic = vi.fn();
+  const topic = makeConflictDecisionTopic();
+
+  act(() => {
+    root.render(
+      <PortalProvider>
+        <TopicThreadCard
+          agentKey="srv-1:mc-1"
+          topic={topic}
+          isPaneFocused={false}
+          supportsButlerV1={true}
+          onJumpToPeerTopic={onJumpToPeerTopic}
+          onAutoMarkRead={vi.fn()}
+          onMarkTopicMode={vi.fn()}
+          onFlushTopicInbox={vi.fn()}
+          onOpenAgentBeside={vi.fn()}
+          onSubmitDesktopReply={vi.fn(() => true)}
+          onActivateCompactReply={vi.fn()}
+          onConvertToTodo={vi.fn()}
+          onToggleTodoStatus={vi.fn()}
+          onEditTodo={vi.fn()}
+        />
+      </PortalProvider>,
+    );
+  });
+
+  expect(view.getByTestId("topic-conflict-banner-task:T-100")).toBeTruthy();
+  expect(view.getByTestId("topic-decision-slot-task:T-100")).toBeTruthy();
+  act(() => {
+    view.getByTestId("topic-conflict-jump-T-200").click();
+  });
+  expect(onJumpToPeerTopic).toHaveBeenCalledWith("T-200");
 });

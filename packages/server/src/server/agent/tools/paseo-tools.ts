@@ -1,5 +1,11 @@
 import { describeAgentMessage } from "../agent-messages/guidance.js";
-import type { AgentActiveTurnBehavior } from "@getpaseo/protocol/messages";
+import {
+  WorkspaceTopicDecideRequestSchema,
+  type AgentActiveTurnBehavior,
+  type TopicThreadEntry,
+  type WorkspaceTopicDecideRequest,
+  type WorkspaceTopicDecideResponse,
+} from "@getpaseo/protocol/messages";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -47,9 +53,19 @@ import { z } from "zod";
 import { ensureValidJson } from "../../json-utils.js";
 import {
   agentDurableItemRequestSchema,
+  readDurableItemTurnMessageIds,
   requestDurableItemFromAgent,
+  resolveDurableItemTurnTopic,
+  type PendingDurableItemTaskBinding,
 } from "../../durable-items/agent-request.js";
 import type { DurableItemStore } from "../../durable-items/store.js";
+import type { TopicAnchorInput } from "../../topic-threads/anchors.js";
+import type { TopicDecisionActor } from "../../topic-threads/decide.js";
+import {
+  WORKSPACE_SITUATION_MAX_BYTES,
+  type WorkspaceSituation,
+  type WorkspaceSituationOptions,
+} from "../workspace-situation.js";
 import type { Logger } from "pino";
 
 import type {
@@ -218,6 +234,11 @@ import {
   type ResolvedLeadPlaybookOptions,
 } from "../orchestration-playbooks.js";
 
+export interface ButlerTopicDecisionActor extends TopicDecisionActor {
+  origin: "butler_dispatch";
+  assertCurrent(): void;
+}
+
 export interface PaseoToolHostDependencies {
   agentMessages?: () => AgentMessageDelivery;
   queueAgentPrompt?: (
@@ -285,6 +306,20 @@ export interface PaseoToolHostDependencies {
   verifiedCallerAgentId?: string;
   taskLedger?: WorkspaceTaskLedgerStore;
   durableItems?: DurableItemStore;
+  getWorkspaceSituation?: (
+    workspaceId: string,
+    mainAgentId: string,
+    options: WorkspaceSituationOptions,
+  ) => Promise<WorkspaceSituation>;
+  decideTopicAction?: (
+    request: WorkspaceTopicDecideRequest,
+    actor: ButlerTopicDecisionActor,
+  ) => Promise<WorkspaceTopicDecideResponse["payload"]>;
+  upsertTopicAnchor?: (input: TopicAnchorInput) => Promise<unknown>;
+  listTopicEntries?: (scope: {
+    workspaceId: string;
+    mainAgentId: string;
+  }) => Promise<TopicThreadEntry[]>;
   crossWorkspacePeerPolicy?: {
     allowLocalPeerMessages?: boolean;
     maxMessagesPerMinute?: number;
@@ -753,6 +788,7 @@ const PEER_READ_ONLY_TOOLS = new Set([
   "list_workspaces",
   "summarize_workspace_agents",
   "list_workspace_tasks",
+  "get_workspace_situation",
   "list_agents",
   "get_agent_status",
   "get_agent_activity",
@@ -2105,6 +2141,20 @@ function openTaskLedger({ taskLedger, paseoHome }: PaseoToolHostDependencies) {
   return taskLedger ?? (paseoHome ? new WorkspaceTaskLedgerStore(paseoHome) : null);
 }
 
+const pendingDurableItemBindings = new WeakMap<
+  AgentManager,
+  Map<string, PendingDurableItemTaskBinding>
+>();
+
+function getPendingDurableItemBindings(agentManager: AgentManager) {
+  let bindings = pendingDurableItemBindings.get(agentManager);
+  if (!bindings) {
+    bindings = new Map();
+    pendingDurableItemBindings.set(agentManager, bindings);
+  }
+  return bindings;
+}
+
 function createToolCatalog(
   options: PaseoToolHostDependencies,
   scope: "agent" | "top-level",
@@ -2125,6 +2175,7 @@ function createToolCatalog(
   const childLogger = logger.child({ module: "agent", component: "paseo-tool-catalog" });
   const callerContext = callerAgentId ? (resolveCallerContext?.(callerAgentId) ?? null) : null;
   const taskLedger = openTaskLedger(options);
+  const pendingBindings = getPendingDurableItemBindings(agentManager);
   const peerRuntime = getPeerWorkspaceRuntime(
     agentManager,
     async (agentId) => {
@@ -2266,7 +2317,7 @@ function createToolCatalog(
     if (!selected) return null;
     return {
       ...selected,
-      title: resolveReportTitle(id, stored?.title, live?.config.title),
+      title: resolveReportTitle(id, stored?.title, live?.config?.title),
     };
   };
 
@@ -3128,11 +3179,21 @@ function createToolCatalog(
     };
   }
 
+  const butlerDecisionTurn = Symbol("butlerDecisionTurn");
+  type ToolContext = PaseoToolExecutionContext & {
+    [butlerDecisionTurn]?: ReturnType<typeof readButlerDecisionTurn>;
+  };
+
+  function captureDecisionTurn(name: string, context: ToolContext): ToolContext {
+    if (name !== "dispatch_topic_decision" || context[butlerDecisionTurn]) return context;
+    return { ...context, [butlerDecisionTurn]: readButlerDecisionTurn(callerAgentId) };
+  }
+
   const registerTool = (
     name: string,
     config: PaseoToolConfig,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Tool handlers are schema-validated at registration boundaries.
-    handler: (input: any, context: PaseoToolExecutionContext) => Promise<PaseoToolResult>,
+    handler: (input: any, context: ToolContext) => Promise<PaseoToolResult>,
   ) => {
     builtinNames.add(name);
     if (!isPaseoToolEnabled(options.paseoToolPolicy, name)) {
@@ -3225,8 +3286,9 @@ function createToolCatalog(
     } else {
       const run = handler;
       handler = async (input, context) => {
+        const invocation = captureDecisionTurn(name, context);
         await checkHierarchy(name, input, context);
-        return run(input, context);
+        return run(input, invocation);
       };
     }
     tools.set(name, {
@@ -3252,7 +3314,8 @@ function createToolCatalog(
       if (!tool) {
         throw new PaseoToolInputError(`Paseo tool not found: ${name}`);
       }
-      return tool.handler(await parseToolInput(tool, input), context);
+      const invocation = captureDecisionTurn(name, context);
+      return tool.handler(await parseToolInput(tool, input), invocation);
     },
   });
 
@@ -3387,6 +3450,39 @@ function createToolCatalog(
     return workspaceId;
   }
 
+  function assertButlerCaller(mainAgentId: string, workspaceId: string) {
+    const current = agentManager.getAgent(mainAgentId);
+    if (
+      current?.workspaceId !== workspaceId ||
+      current.internal ||
+      current.lifecycle === "closed" ||
+      getParentAgentIdFromLabels(current.labels) ||
+      !isMainControlAgentLabels(current.labels) ||
+      agentManager.isTaskAgentArchivePending(mainAgentId)
+    ) {
+      throw new PaseoToolInputError("Workspace Main Control is no longer available.");
+    }
+    return current;
+  }
+
+  async function requireButlerCaller(requestedWorkspaceId?: string) {
+    if (scope !== "agent" || !callerAgentId || options.verifiedCallerAgentId !== callerAgentId) {
+      throw new PaseoToolInputError("This tool requires a verified Main Control agent identity.");
+    }
+    const workspaceId = await requireTaskLedgerWorkspace(requestedWorkspaceId);
+    assertButlerCaller(callerAgentId, workspaceId);
+    return { mainAgentId: callerAgentId, workspaceId };
+  }
+
+  function readButlerDecisionTurn(agentId: string | undefined) {
+    const current = agentId ? agentManager.getAgent(agentId) : null;
+    return {
+      turnId: current?.activeForegroundTurnId ?? current?.activeTurnId,
+      human: !!agentId && agentManager.isActiveTurnHumanInitiated(agentId) === true,
+      peer: !!agentId && Boolean(getActivePeerTurnContext(agentId)),
+    };
+  }
+
   async function withTaskLedger<T>(
     requestedWorkspaceId: string | undefined,
     operation: (ledger: WorkspaceTaskLedgerStore, workspaceId: string) => Promise<T>,
@@ -3441,11 +3537,26 @@ function createToolCatalog(
       (rootRow?.item.type === "user_message"
         ? (rootRow.item.messageId ?? rootRow.item.clientMessageId)
         : undefined);
+    const rootPrompt = rootRow?.item.type === "user_message" ? rootRow.item.text : undefined;
+    const rootPromptText = rootPrompt
+      ? (parseAgentMessages(rootPrompt)?.find(({ source }) => source === null)?.text ?? rootPrompt)
+      : undefined;
     const localServer = options.serverId ?? "self";
     const admission: TaskDispatchAdmission = {};
     const checkCaller = agentManager.taskDispatchCaller(callerAgentId!, workspaceId);
     let resetEpoch: number | undefined;
     let capture: ReturnType<AgentManager["captureTaskBinding"]> | undefined;
+
+    function rememberTaskHandoff(agentId: string) {
+      if (!admission.messageId) return;
+      pendingBindings.set(admission.messageId, {
+        messageId: admission.messageId,
+        agentId,
+        workspaceId,
+        taskId: input.taskId,
+        rootMessageId,
+      });
+    }
 
     async function readTarget(agentId: string) {
       const stored = await agentStorage.get(agentId);
@@ -3524,22 +3635,26 @@ function createToolCatalog(
         if (
           target.labels?.[TASK_ID_LABEL] === input.taskId &&
           (target.labels?.[TOPIC_ROOT_MESSAGE_ID_LABEL] ?? "") === (rootMessageId ?? "")
-        )
+        ) {
+          rememberTaskHandoff(agentId);
           return;
+        }
         await agentManager.setLabels(agentId, {
           [TASK_ID_LABEL]: input.taskId,
           [TOPIC_ROOT_MESSAGE_ID_LABEL]: rootMessageId ?? "",
         });
         admission.assertCurrent?.();
+        rememberTaskHandoff(agentId);
       },
       close() {
         capture?.close();
+        if (admission.messageId) pendingBindings.delete(admission.messageId);
       },
       async record(agentId: string, messageId: string, created = false) {
         try {
           return await withTaskLedger(workspaceId, async (ledger, id) => {
             // Once accepted, an archive is a historical observation, not a new dispatch.
-            const { callerId } = await readTarget(agentId);
+            const { callerId, live, stored } = await readTarget(agentId);
             const events = capture?.events(messageId) ?? [];
             const accepted = events.find((event) => event.kind === "dispatched");
             if (!accepted) {
@@ -3570,6 +3685,32 @@ function createToolCatalog(
               },
               events,
             );
+            if (options.upsertTopicAnchor) {
+              try {
+                await options.upsertTopicAnchor({
+                  workspaceId: id,
+                  mainAgentId: callerId,
+                  topicKey: `task:${task.taskId}`,
+                  taskId: task.taskId,
+                  rootMessageId: task.rootMessageId,
+                  rootPromptText: rootPromptText ?? task.title,
+                  title: task.title,
+                  leadAgentId: task.leadAgentId,
+                  leadServerId: task.leadServerId,
+                  leadTitle: live?.config.title ?? stored?.title ?? undefined,
+                });
+              } catch (error) {
+                childLogger.warn(
+                  { err: error, workspaceId, taskId: task.taskId },
+                  "Failed to anchor agent task binding",
+                );
+                return {
+                  taskId: task.taskId,
+                  taskBindingError:
+                    "The task was recorded, but its topic anchor could not be saved.",
+                };
+              }
+            }
             return { taskId: task.taskId };
           });
         } catch (error) {
@@ -4420,6 +4561,208 @@ function createToolCatalog(
   }
   registerTaskLedgerTools();
 
+  function registerButlerTools() {
+    if (scope !== "agent") return;
+    if (callerAgentId) {
+      if (options.verifiedCallerAgentId !== callerAgentId) return;
+      const live = agentManager.getAgent(callerAgentId);
+      if (
+        live &&
+        (!isMainControlAgentLabels(live.labels) || getParentAgentIdFromLabels(live.labels))
+      )
+        return;
+      if (!live && !options.paseoToolPolicy?.allowedTools?.includes("get_workspace_situation"))
+        return;
+    }
+
+    const workspaceIdSchema = z.string().trim().min(1).optional();
+    const situationInputSchema = z.strictObject({
+      workspaceId: workspaceIdSchema,
+      includeCompletedTasks: z.boolean().default(false),
+      completedLimit: z.number().int().positive().max(20).default(5),
+    });
+    registerTool(
+      "get_workspace_situation",
+      {
+        title: "Get workspace situation",
+        description:
+          "Read your workspace's topics, active work, human decisions, todos and file conflicts without waking any agents.",
+        inputSchema: situationInputSchema,
+      },
+      async ({ workspaceId: requested, ...input }: z.output<typeof situationInputSchema>) => {
+        const { workspaceId, mainAgentId } = await requireButlerCaller(requested);
+        if (!options.getWorkspaceSituation)
+          throw new PaseoToolInputError("Workspace situation is unavailable on this host.");
+        const situation = await options.getWorkspaceSituation(workspaceId, mainAgentId, input);
+        await requireButlerCaller(workspaceId);
+        const json = JSON.stringify(situation);
+        if (Buffer.byteLength(json, "utf8") >= WORKSPACE_SITUATION_MAX_BYTES)
+          throw new PaseoToolInputError("Workspace situation exceeded its output limit.");
+        const structuredContent: unknown = JSON.parse(json);
+        return {
+          content: [{ type: "text", text: json }],
+          structuredContent,
+        };
+      },
+    );
+
+    const dispatchInputSchema = WorkspaceTopicDecideRequestSchema.omit({
+      type: true,
+      requestId: true,
+      workspaceId: true,
+      mainAgentId: true,
+    })
+      .extend({ workspaceId: workspaceIdSchema })
+      .strict();
+    registerTool(
+      "dispatch_topic_decision",
+      {
+        title: "Dispatch topic decision",
+        description:
+          "Send the user's decision to its topic and record it on the topic card. Requires a direct human turn. Use a stable clientMessageId for retry. System authorizations cannot be decided here.",
+        inputSchema: dispatchInputSchema,
+      },
+      async (
+        { workspaceId: requested, ...input }: z.output<typeof dispatchInputSchema>,
+        context,
+      ) => {
+        const turn = context[butlerDecisionTurn];
+        if (!turn) throw new PaseoToolInputError("The decision turn could not be verified.");
+        const { workspaceId, mainAgentId } = await requireButlerCaller(requested);
+        const durable = input.resolutionKind === "durable_item";
+        const assertCurrent = () => {
+          assertButlerCaller(mainAgentId, workspaceId);
+          const current = readButlerDecisionTurn(mainAgentId);
+          if (turn.peer || current.peer)
+            throw new PaseoToolInputError(
+              "Cross-workspace peer messages are read-only and cannot dispatch topic decisions.",
+            );
+          if (!turn.turnId || !turn.human || turn.turnId !== current.turnId || !current.human) {
+            throw new PaseoToolInputError("Topic decisions require a direct human turn.");
+          }
+        };
+        assertCurrent();
+
+        const { decideTopicAction, durableItems, serverId } = options;
+        if (!decideTopicAction)
+          throw new PaseoToolInputError("Topic decisions are unavailable on this host.");
+        if (durable) {
+          const { durableItemRequestId, expectedRevision, decision } = input;
+          if (!durableItemRequestId || expectedRevision === undefined || !decision)
+            throw new PaseoToolInputError(
+              "A durable item, expected revision and decision are required.",
+            );
+          if (!durableItems || !serverId)
+            throw new PaseoToolInputError("Durable item decisions are unavailable on this host.");
+          const item = await durableItems.get({
+            workspaceId,
+            serverId,
+            requestId: durableItemRequestId,
+          });
+          if (!item)
+            throw new PaseoToolInputError("The durable item is unavailable in this workspace.");
+          if (item.kind === "authorization")
+            throw new PaseoToolInputError(
+              "System authorizations must be decided by the user directly.",
+            );
+        } else if (
+          input.durableItemRequestId ||
+          input.expectedRevision !== undefined ||
+          input.decision
+        ) {
+          throw new PaseoToolInputError("Use a durable item decision for durable approval fields.");
+        }
+        await requireButlerCaller(workspaceId);
+        assertCurrent();
+        const result = await decideTopicAction(
+          {
+            ...input,
+            type: "workspace.topic.decide.request",
+            requestId: input.clientMessageId,
+            workspaceId,
+            mainAgentId,
+          },
+          {
+            origin: "butler_dispatch",
+            serverId,
+            principalId: durable ? `agent:${mainAgentId}` : undefined,
+            assertCurrent,
+          },
+        );
+        return {
+          isError: result.error !== null,
+          content: [],
+          structuredContent: ensureValidJson(result),
+        };
+      },
+    );
+  }
+  registerButlerTools();
+
+  async function findLocalMain(agentId: string, workspaceId: string) {
+    const path = await readAgentHierarchyPath(agentId, readHierarchyAgent);
+    const localServer = options.serverId ?? "self";
+    for (const { labels, workspaceId: id, archivedAt } of path.values()) {
+      const parent = getParentAddressFromLabels(labels, localServer);
+      if (id !== workspaceId || archivedAt || (parent && parent.serverId !== localServer)) return;
+    }
+    return [...path.values()].find(
+      ({ labels, workspaceId: id }) =>
+        id === workspaceId &&
+        !getParentAgentIdFromLabels(labels) &&
+        isMainControlAgentLabels(labels),
+    );
+  }
+
+  async function readDurableItemTopic(agentId: string, workspaceId: string, sourceTurnId: string) {
+    const agent = agentManager.getAgent(agentId);
+    if (!agent || agent.workspaceId !== workspaceId) return;
+    // Snapshot the confirmed handoff lane before async reads. The lead can call a
+    // tool before its parent finishes writing the provider acceptance to the ledger.
+    const handoffs = [...pendingBindings.values()].filter(
+      (binding) => binding.workspaceId === workspaceId && binding.agentId === agentId,
+    );
+    const main = await findLocalMain(agentId, workspaceId);
+    if (!main) return;
+    const [rows, tasks, entries] = await Promise.all([
+      agentManager.getTimelineRows(agentId),
+      taskLedger?.list(workspaceId) ?? [],
+      options.listTopicEntries?.({ workspaceId, mainAgentId: main.id }) ?? [],
+    ]);
+    const messageIds = readDurableItemTurnMessageIds(rows, sourceTurnId);
+    const topic = resolveDurableItemTurnTopic({
+      agentId,
+      resetEpoch: agent.resetEpoch,
+      messageIds,
+      pendingBindings: handoffs,
+      tasks,
+      entries,
+    });
+    if (topic) return topic;
+    if (agentId !== main.id || !agentManager.isActiveTurnHumanInitiated(agentId)) return;
+    const root = rows.find(
+      ({ item, turnId }) =>
+        turnId === sourceTurnId &&
+        item.type === "user_message" &&
+        isLocalHumanTimelineMessage(item.text),
+    )?.item;
+    if (root?.type !== "user_message") return;
+    const rootMessageId = root.messageId ?? root.clientMessageId;
+    if (!rootMessageId) return;
+    const matching = tasks.filter(
+      (task) => task.rootMessageId && messageIds.has(task.rootMessageId),
+    );
+    if (matching.length === 1) {
+      const [task] = matching;
+      return {
+        taskId: task.taskId,
+        topicKey: `task:${task.taskId}`,
+        rootMessageId: task.rootMessageId,
+      };
+    }
+    return { topicKey: `msg:${rootMessageId}`, rootMessageId };
+  }
+
   function registerDurableItemRequestTool() {
     const { durableItems, serverId, verifiedCallerAgentId } = options;
     if (scope !== "agent" || !durableItems || !serverId) return;
@@ -4443,6 +4786,11 @@ function createToolCatalog(
           callerAgentId,
           verifiedCallerAgentId,
           input,
+          resolveTopic:
+            callerAgentId && options.listTopicEntries
+              ? ({ workspaceId, sourceTurnId }) =>
+                  readDurableItemTopic(callerAgentId, workspaceId, sourceTurnId)
+              : undefined,
         });
         return { content: [], structuredContent: ensureValidJson({ item }) };
       },
@@ -6827,15 +7175,25 @@ function createToolCatalog(
     );
   }
 
-  async function reportTopic(
-    workspaceId: HierarchyAgent["workspaceId"],
-    labels: HierarchyAgent["labels"],
-    localParentId?: string,
+  function reportTopic(
+    caller: HierarchyAgent,
+    localParent: HierarchyAgent | undefined,
+    taskReport: ReturnType<AgentManager["captureTaskReport"]>,
+    verified: boolean,
   ) {
-    let taskLabels = labels;
-    if (!labels?.[TASK_ID_LABEL] && localParentId) {
-      const parent = await readHierarchyAgent(localParentId);
-      taskLabels = parent?.workspaceId === workspaceId ? parent?.labels : undefined;
+    const topicTask = taskReport?.topicTask;
+    if (topicTask) {
+      const matchesScope =
+        verified &&
+        localParent?.id === topicTask.mainAgentId &&
+        localParent.workspaceId === topicTask.workspaceId &&
+        caller.workspaceId === topicTask.workspaceId &&
+        isMainControlAgentLabels(localParent.labels);
+      return { taskId: matchesScope ? topicTask.taskId : undefined };
+    }
+    let taskLabels = taskReport?.agent.labels ?? caller.labels;
+    if (!taskLabels?.[TASK_ID_LABEL] && localParent) {
+      taskLabels = localParent.workspaceId === caller.workspaceId ? localParent.labels : undefined;
     }
     return {
       taskId: taskLabels?.[TASK_ID_LABEL] || undefined,
@@ -6891,6 +7249,7 @@ function createToolCatalog(
       if (!target || target.archivedAt) {
         throw new PaseoToolInputError(`Parent agent ${parent.agentId} is unavailable`);
       }
+      return target;
     } else {
       const target = await readRemoteParentForReport(parent).catch(() => undefined);
       if (target === null || target?.archivedAt) {
@@ -6934,13 +7293,10 @@ function createToolCatalog(
       ) {
         throw new PaseoToolInputError("Only subagents with a direct parent can report.");
       }
-      await requireParentReportTarget(parent, localServer);
+      const localParent = await requireParentReportTarget(parent, localServer);
       const isLocal = parent.serverId === localServer;
-      const topic = await reportTopic(
-        caller.workspaceId,
-        taskReport?.agent.labels ?? caller.labels,
-        isLocal ? parent.agentId : undefined,
-      );
+      const verified = options.verifiedCallerAgentId === callerAgentId;
+      const topic = reportTopic(caller, localParent, taskReport, verified);
       const report = {
         status,
         summary: neutralizePeerWorkspacePromptMarker(summary),
@@ -6956,7 +7312,7 @@ function createToolCatalog(
         },
         report,
       );
-      if (options.verifiedCallerAgentId === callerAgentId && isLocal) {
+      if (verified && isLocal && (!taskReport?.topicTask || topic.taskId)) {
         await agentManager.recordTaskParentReport(callerAgentId, messageId, status, taskReport);
       }
       return {

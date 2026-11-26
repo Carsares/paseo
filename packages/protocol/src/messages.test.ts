@@ -33,9 +33,30 @@ describe("workspace topic, read state and todo requests", () => {
     clientMessageId: "reply-1",
     text: "Any update?",
   };
+  const decisionRequest = {
+    type: "workspace.topic.decide.request",
+    ...topic,
+    requestId,
+    clientMessageId: "decide-1",
+    taskId: "task-1",
+  };
 
   test.each([
     reply,
+    { ...reply, rootPromptPreview: "Inspect startup" },
+    {
+      ...decisionRequest,
+      resolutionKind: "durable_item",
+      durableItemRequestId: "item-1",
+      expectedRevision: 0,
+      decision: "approve",
+      dispatchFollowup: false,
+    },
+    {
+      ...decisionRequest,
+      resolutionKind: "task_blocking_question",
+      note: "Keep the existing default.",
+    },
     { type: "workspace.topic.list_entries.request", requestId, ...context },
     { type: "workspace.topic_read.get_state.request", requestId, ...context },
     { type: "workspace.topic_read.mark.request", requestId, ...topic, mode: "unread", seq: -1 },
@@ -63,6 +84,23 @@ describe("workspace topic, read state and todo requests", () => {
     );
   });
 
+  test.each([
+    { clientMessageId: "" },
+    { resolutionKind: "unknown" },
+    { expectedRevision: -1 },
+    { decision: "skip" },
+  ])("rejects invalid topic decision parameters %j", (overrides) => {
+    const request = {
+      ...decisionRequest,
+      resolutionKind: "durable_item",
+      durableItemRequestId: "item-1",
+      expectedRevision: 0,
+      decision: "approve",
+      ...overrides,
+    };
+    expect(SessionInboundMessageSchema.safeParse(request).success).toBe(false);
+  });
+
   test("keeps the new wire schemas free of transforms, catch values and preprocessing", () => {
     function assertStructuralSchema(node: unknown) {
       if (node instanceof z.ZodType) {
@@ -81,7 +119,7 @@ describe("workspace topic, read state and todo requests", () => {
     ];
     for (const schema of schemas) {
       if (
-        /^workspace\.(topic\.(reply|list_entries|thread)\.|topic_read\.|todo\.)/.test(
+        /^workspace\.(topic\.(reply|list_entries|thread|decide|anchor)\.|topic_read\.|todo\.|tasks\.updated$|durable_item\.updated$)/.test(
           schema.shape.type.value,
         )
       ) {

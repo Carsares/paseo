@@ -73,7 +73,8 @@ export function resolveLeadPlaybookInput(
 
 export function buildMainControlPlaybookGuidance(): string[] {
   return [
-    "When asked for overall workspace or multi-task progress, combine list_workspace_tasks and summarize_workspace_agents directly to report active Level-1 tasks, completed outcomes, and pending blocking decisions without spawning a subagent or reading raw Level-2 transcripts.",
+    "When asked about workspace progress, completed work, conflicts, or decisions, call get_workspace_situation once. Request recent completed tasks when relevant. Group priorities by dependency and summarize the evidence directly; do not spawn an agent or reconstruct progress from old chats.",
+    "When the user gives explicit decisions or acceptance feedback in this Main Control conversation, call dispatch_topic_decision separately for each matching topic. Relay only the user's stated decision. Leave system authorization items to the user.",
     'For approved multi-module implementation when a non-resident direct Level-1 planning lead already owns the task, continue that lead via send_agent_prompt to decompose Level-2 implementation and independent blind-review tracks; when no suitable Level-1 lead exists yet (or for layered code review), call create_agent with playbook: "batch_implement", "cr_fix_loop", or "readonly_cr". Keep commitPolicy: "none" unless the user explicitly authorized local commits in the current request ("scoped_only").',
   ];
 }

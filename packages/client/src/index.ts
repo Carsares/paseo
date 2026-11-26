@@ -33,10 +33,32 @@ export type {
   CheckoutGitRepoRefs,
   CheckoutGitStashEntry,
   CheckoutGitWorkingTree,
+  TopicAnchorSummary,
+  TopicBlockingResolutionKind,
+  TopicThreadEntryOrigin,
   WorkbenchErrorCode,
   WorkspaceDurableItem,
   WorkspaceDurableItemEvidence,
+  WorkspaceDurableItemUpdatedMessage,
+  WorkspaceTaskFileConflict,
+  WorkspaceTaskFileConflictPeer,
+  WorkspaceTasksUpdatedMessage,
   WorkspaceTopic,
+  WorkspaceTopicAnchorUpdatedMessage,
+  WorkspaceTopicDecideRequest,
+  WorkspaceTopicDecideResponse,
+} from "@getpaseo/protocol/messages";
+export {
+  TopicAnchorSummarySchema,
+  TopicBlockingResolutionKindSchema,
+  TopicThreadEntryOriginSchema,
+  WorkspaceDurableItemUpdatedMessageSchema,
+  WorkspaceTaskFileConflictPeerSchema,
+  WorkspaceTaskFileConflictSchema,
+  WorkspaceTasksUpdatedMessageSchema,
+  WorkspaceTopicAnchorUpdatedMessageSchema,
+  WorkspaceTopicDecideRequestSchema,
+  WorkspaceTopicDecideResponseSchema,
 } from "@getpaseo/protocol/messages";
 import type { AgentPermissionResponse, JsonValue } from "@getpaseo/protocol/agent-types";
 import type {

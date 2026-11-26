@@ -336,6 +336,8 @@ function modeGroups(messages: Admitted[]): Admitted[][] {
  * that carries it, so agent messages, a person's prompts, and Stop all decide over the same list.
  */
 export function createAgentMessageDelivery(dependencies: Dependencies): AgentMessageDelivery & {
+  /** Explicit reports still buffered or awaiting provider admission for the recipient's task. */
+  hasPendingTaskReport(recipientId: string, taskId: string, excludeMessageId?: string): boolean;
   pauseAdmission(): { drained: Promise<void>; release(): void };
 } {
   const schedule =
@@ -1332,6 +1334,17 @@ export function createAgentMessageDelivery(dependencies: Dependencies): AgentMes
     },
     withdrawPending: (recipientId, matches) =>
       withdrawPending(recipientId, (message) => matches(message.originalSource)),
+    hasPendingTaskReport(recipientId, taskId, excludeMessageId) {
+      const matches = ({ source, childReported, receipt }: Admitted) =>
+        receipt.messageId !== excludeMessageId &&
+        source.kind === "agent-message" &&
+        source.taskId === taskId &&
+        (childReported === true || source.reportStatus !== undefined);
+      return (
+        parentInboxes.get(recipientId)?.some(matches) === true ||
+        inboxes.get(recipientId)?.messages.some(matches) === true
+      );
+    },
     hasPending(recipientId) {
       const inbox = inboxes.get(recipientId);
       return (

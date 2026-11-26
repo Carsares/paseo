@@ -82,6 +82,8 @@ const mainControlTools = [
   "upsert_workspace_task",
   "list_workspace_tasks",
   "request_human_decision",
+  "get_workspace_situation",
+  "dispatch_topic_decision",
 ];
 
 it("protects the current topic main without changing legacy or cross-workspace archive rules", () => {
@@ -401,7 +403,8 @@ describe("agent orchestration", () => {
     expect(prompt).toContain("Workspace Main Control Coordinator");
     expect(prompt).toContain("Call list_profiles to select the preset");
     expect(prompt).toContain('parentReporting: "explicit" and notifyOnFinish: false');
-    expect(prompt).toContain("combine list_workspace_tasks and summarize_workspace_agents");
+    expect(prompt).toContain("call get_workspace_situation once");
+    expect(prompt).toContain("call dispatch_topic_decision separately");
     expect(prompt).toContain('"batch_implement"');
     expect(prompt).toContain('commitPolicy: "none"');
     expect(prompt).toContain("discover workspaces with list_workspaces and use send_peer_message");

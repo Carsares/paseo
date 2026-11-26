@@ -25,14 +25,22 @@ import { randomUUID } from "node:crypto";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { createTestAgentClient } from "../test-utils/fake-agent-client.js";
+import { createProviderSnapshotManagerStub } from "../test-utils/session-stubs.js";
 import {
   AgentManager,
   AgentManagerShuttingDownError,
   commandMayHaveChangedExternalState,
+  topicFollowupRunOptions,
   type AgentManagerEvent,
   type ManagedAgent,
 } from "./agent-manager.js";
 import { AgentStorage, parseStoredAgentRecord } from "./agent-storage.js";
+import {
+  createFinishSubscriptions,
+  createJsonFinishSubscriptionStore,
+  type FinishSubscription,
+} from "./finish-subscriptions/index.js";
+import { createPaseoToolCatalog } from "./tools/paseo-tools.js";
 import { WorkspaceTaskLedgerStore } from "./task-ledger/index.js";
 import { runWithTaskDispatchAdmission } from "./task-ledger/admission.js";
 import { AgentTurnStartCanceledError, AgentTurnStartRejectedError } from "./agent-sdk-types.js";
@@ -61,7 +69,11 @@ import {
   WORKSPACE_MAIN_ROLE,
   WORKSPACE_ROLE_LABEL,
 } from "@getpaseo/protocol/agent-labels";
-import { REMOTE_HIERARCHY_DEPTH_LABEL } from "./hierarchy-policy.js";
+import {
+  REMOTE_HIERARCHY_DEPTH_LABEL,
+  TASK_ID_LABEL,
+  TOPIC_ROOT_MESSAGE_ID_LABEL,
+} from "./hierarchy-policy.js";
 import { AgentTurnBusyError, sendPreparedPromptToAgent, startAgentRun } from "./agent-prompt.js";
 import { runRewindDirectoryWriter } from "../agent-rewind-scope.js";
 import { CheckpointService } from "./checkpoints/checkpoint-service.js";
@@ -8832,6 +8844,144 @@ test("Main Control sends the saved prompt once for providers using the first tur
   expect(received).toEqual([expect.stringContaining("\nSaved policy\n[/Workspace"), "Second turn"]);
 });
 
+test("task ledger records live L1 and L2 writes on the task bound to each turn", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "agent-task-file-writes-"));
+  const ledger = new WorkspaceTaskLedgerStore(cwd);
+  const sessions: SteeringTestSession[] = [];
+  const client = new (class extends TestAgentClient {
+    override async createSession(config: AgentSessionConfig) {
+      const session = new SteeringTestSession(config);
+      sessions.push(session);
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    taskLedger: ledger,
+    serverId: "local",
+    logger,
+  });
+  const workspaceId = "workspace";
+  const config = { provider: "codex", cwd };
+  const main = await manager.createAgent(config, undefined, {
+    workspaceId,
+    labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+  });
+  const lead = await manager.createAgent(config, undefined, {
+    workspaceId,
+    labels: { [PARENT_AGENT_ID_LABEL]: main.id, [TASK_ID_LABEL]: "bound" },
+  });
+  const sub = await manager.createAgent(config, undefined, {
+    workspaceId,
+    labels: { [PARENT_AGENT_ID_LABEL]: lead.id },
+  });
+  const remote = await manager.createAgent(config, undefined, {
+    workspaceId,
+    labels: { [PARENT_AGENT_ID_LABEL]: lead.id, [PARENT_SERVER_ID_LABEL]: "other-host" },
+  });
+  const crossWorkspace = await manager.createAgent(config, undefined, {
+    workspaceId: "other-workspace",
+    labels: { [PARENT_AGENT_ID_LABEL]: lead.id, [PARENT_SERVER_ID_LABEL]: "other-host" },
+  });
+  await ledger.upsert(workspaceId, { taskId: "bound", title: "Bound", leadAgentId: lead.id });
+  await ledger.upsert(workspaceId, {
+    taskId: "followup",
+    title: "Follow-up",
+    leadAgentId: lead.id,
+  });
+  await ledger.upsert(workspaceId, {
+    taskId: "finished",
+    title: "Finished",
+    leadAgentId: lead.id,
+    status: "completed",
+  });
+  await ledger.upsert("other-workspace", { taskId: "other", title: "Other", leadAgentId: lead.id });
+  const runWrite = async (
+    agentId: string,
+    session: SteeringTestSession,
+    path: string,
+    previousTurnId?: string,
+    options?: AgentRunOptions,
+  ) => {
+    const running = manager.runAgent(agentId, "Make an edit", options);
+    await manager.waitForAgentRunStart(agentId);
+    const turnId = manager.getAgent(agentId)?.activeForegroundTurnId;
+    if (!turnId) throw new Error("No active turn");
+    const emitWrite = (id: string, filePath: string) =>
+      session.pushEvent({
+        type: "timeline",
+        provider: "codex",
+        turnId: id,
+        item: {
+          type: "tool_call",
+          name: "Edit",
+          callId: filePath,
+          detail: { type: "edit", filePath },
+          status: "completed",
+          error: null,
+        },
+      });
+    if (previousTurnId) emitWrite(previousTurnId, "late.ts");
+    emitWrite(turnId, path);
+    await manager.flush();
+    expect(manager.getTurnTouchedFiles(agentId, turnId)).toEqual([path]);
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId });
+    await running;
+    return turnId;
+  };
+  try {
+    const followup = { workspaceId, mainAgentId: main.id, taskId: "followup" };
+    const followupTurn = await runWrite(
+      lead.id,
+      sessions[1],
+      "followup.ts",
+      undefined,
+      topicFollowupRunOptions(followup),
+    );
+    await runWrite(lead.id, sessions[1], "lead.ts", followupTurn);
+    expect(manager.getTurnTouchedFiles(lead.id, followupTurn)).toEqual(["followup.ts"]);
+    expect(
+      (await ledger.list(workspaceId)).find(({ taskId }) => taskId === "followup")?.touchedFiles,
+    ).toEqual(["followup.ts"]);
+    await runWrite(
+      main.id,
+      sessions[0],
+      "explicit-main.ts",
+      undefined,
+      topicFollowupRunOptions(followup),
+    );
+    for (const [path, binding] of [
+      ["unbound.ts", { ...followup, taskId: undefined }],
+      ["finished.ts", { ...followup, taskId: "finished" }],
+      ["wrong-workspace.ts", { ...followup, workspaceId: "other-workspace" }],
+      ["wrong-main.ts", { ...followup, mainAgentId: "other-main" }],
+    ] as const) {
+      await runWrite(lead.id, sessions[1], path, undefined, topicFollowupRunOptions(binding));
+    }
+    const first = await runWrite(sub.id, sessions[2], "sub.ts");
+    await runWrite(sub.id, sessions[2], "sub-second.ts", first);
+    expect(manager.getTurnTouchedFiles(sub.id, first)).toEqual(["sub.ts"]);
+    await runWrite(remote.id, sessions[3], "remote.ts");
+    await runWrite(crossWorkspace.id, sessions[4], "cross-workspace.ts");
+    const tasks = await ledger.list(workspaceId);
+    expect(tasks.find(({ taskId }) => taskId === "bound")?.touchedFiles).toEqual([
+      "lead.ts",
+      "sub.ts",
+      "sub-second.ts",
+    ]);
+    expect(tasks.find(({ taskId }) => taskId === "followup")?.touchedFiles).toEqual([
+      "followup.ts",
+      "explicit-main.ts",
+    ]);
+    expect(tasks.find(({ taskId }) => taskId === "finished")?.touchedFiles).toBeUndefined();
+    expect((await ledger.list("other-workspace"))[0]?.touchedFiles).toBeUndefined();
+  } finally {
+    for (const agent of manager.listAgents()) await manager.closeAgent(agent.id);
+    await manager.flush();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("task ledger captures an already finished turn and records stored, cascade and workspace archives", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "agent-task-events-"));
   const storage = new AgentStorage(join(cwd, "agents"), logger);
@@ -8958,6 +9108,96 @@ async function taskDispatchTestSetup(createSession: (config: AgentSessionConfig)
   });
   return { storage, ledger, manager, workspaceId, main, child };
 }
+
+test("report_to_parent uses the verified foreground topic task instead of the agent label", async () => {
+  const { storage, manager, ledger, workspaceId, main, child } = await taskDispatchTestSetup(
+    (config) => new SteeringTestSession(config),
+  );
+  const session = child.session as SteeringTestSession;
+  await manager.setLabels(child.id, {
+    ...child.labels,
+    [TASK_ID_LABEL]: "prior",
+    [TOPIC_ROOT_MESSAGE_ID_LABEL]: "prior-root",
+  });
+  for (const taskId of ["prior", "followup"]) {
+    await ledger.upsert(workspaceId, {
+      taskId,
+      title: taskId,
+      rootMessageId: `${taskId}-root`,
+      leadAgentId: child.id,
+      participants: [{ agentId: child.id, boundBy: main.id }],
+    });
+  }
+  const dispatch = vi.fn(async (_record: FinishSubscription) => {});
+  const reporting = createFinishSubscriptions({
+    store: createJsonFinishSubscriptionStore(child.cwd),
+    followups: {
+      watches: createJsonFinishSubscriptionStore(child.cwd, "watches.json"),
+      reports: createJsonFinishSubscriptionStore(child.cwd, "reports.json"),
+      dispatch,
+    },
+    open: async () => {
+      throw new Error("Explicit reports do not observe turns");
+    },
+    messages: () => {
+      throw new Error("Explicit reports use the follow-up dispatcher");
+    },
+    callerIsActive: async () => true,
+    serverId: "local",
+    logger,
+  });
+  const catalog = (verified: boolean) =>
+    createPaseoToolCatalog({
+      agentManager: manager,
+      agentStorage: storage,
+      providerSnapshotManager: createProviderSnapshotManagerStub().manager,
+      callerAgentId: child.id,
+      verifiedCallerAgentId: verified ? child.id : undefined,
+      paseoToolPolicy: manager.getPaseoToolPolicy(child.id),
+      finishSubscriptions: () => reporting,
+      serverId: "local",
+      logger,
+    });
+  const scope = { workspaceId, mainAgentId: main.id, taskId: "followup" };
+  await reporting.start();
+  try {
+    for (const [index, { topic, verified, taskId }] of [
+      { topic: scope, verified: true, taskId: "followup" },
+      { topic: { ...scope, taskId: undefined }, verified: true },
+      { topic: { ...scope, workspaceId: "another-workspace" }, verified: true },
+      { topic: { ...scope, mainAgentId: "another-main" }, verified: true },
+      { topic: scope, verified: false },
+    ].entries()) {
+      const running = manager.runAgent(child.id, "Topic follow-up", topicFollowupRunOptions(topic));
+      await manager.waitForAgentRunStart(child.id);
+      const turnId = manager.getAgent(child.id)?.activeForegroundTurnId;
+      expect(turnId).toEqual(expect.any(String));
+      await expect(
+        catalog(verified).executeTool("report_to_parent", {
+          status: "blocked",
+          summary: `Request ${index}`,
+        }),
+      ).resolves.toMatchObject({ structuredContent: { deliveryStatus: "queued" } });
+      await expect.poll(() => dispatch.mock.calls.length).toBe(index + 1);
+      const [queued] = dispatch.mock.calls[index]!;
+      expect(queued.taskId).toBe(taskId);
+      expect(queued.rootMessageId).toBeUndefined();
+      expect(queued.reportTurnId).toBe(turnId);
+      session.pushEvent({ type: "turn_completed", provider: "codex", turnId: turnId! });
+      await running;
+    }
+    const tasks = await ledger.list(workspaceId);
+    const reports = (taskId: string) =>
+      tasks
+        .find((task) => task.taskId === taskId)
+        ?.events?.filter(({ kind }) => kind === "reported_blocked") ?? [];
+    expect(reports("prior")).toEqual([]);
+    expect(reports("followup")).toHaveLength(1);
+  } finally {
+    await manager.closeAgent(child.id);
+    await reporting.close();
+  }
+});
 
 test.each(["accepted", "rejected"] as const)(
   "task ledger attributes reports around prompt acknowledgement and carries forward reset (%s)",

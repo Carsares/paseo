@@ -223,7 +223,11 @@ import {
 } from "@/screens/workspace/workspace-pane-content";
 import { useMountedTabSet } from "@/screens/workspace/use-mounted-tab-set";
 import { ensurePanelsRegistered } from "@/panels/register-panels";
-import { SheetPaneHostProvider, type SheetPaneHost } from "@/screens/workspace/sheet-pane";
+import {
+  SheetPaneHostProvider,
+  useWorkspaceSheetPages,
+  type SheetPaneHost,
+} from "@/screens/workspace/sheet-pane";
 import { SheetTabs } from "@/screens/workspace/sheet-tabs";
 import type { PaneHost } from "@/panels/panel-manifest";
 import { WorkspaceFocusProvider } from "@/workspace/focus";
@@ -681,8 +685,9 @@ function useWorkspaceTeamDirectoryState(input: {
       isOwnedByWorkspaceShell: hasShellTeamWorkbench,
       isDirectoryVisible: isTeamDirectoryVisible,
       toggleDirectory: toggleTeamDirectory,
+      openDirectory: hasShellTeamWorkbench ? showTeamDirectory : undefined,
     }),
-    [hasShellTeamWorkbench, isTeamDirectoryVisible, toggleTeamDirectory],
+    [hasShellTeamWorkbench, isTeamDirectoryVisible, showTeamDirectory, toggleTeamDirectory],
   );
   const serverAgentsMap = useSessionStore((state) => state.sessions[input.serverId]?.agents);
   const teamSummary = useMemo(
@@ -932,11 +937,41 @@ function WorkspaceTopicHeaderSlot({
   return <TopicHeaderBar {...props} topic={topicWorkspace?.topic} />;
 }
 
+function WorkspaceTeamDirectoryShellBridge({
+  baseValue,
+  compactTeamDirectory,
+  children,
+}: {
+  baseValue: Parameters<typeof TeamDirectoryShellProvider>[0]["value"];
+  compactTeamDirectory?: (close: () => void) => ReactNode;
+  children: ReactNode;
+}) {
+  const { t } = useTranslation();
+  const stack = useWorkspaceSheetPages();
+  const teamTitle = t("topicWorkbench.directory.title");
+  const renderTeam = useStableEvent((close: () => void) => compactTeamDirectory?.(close));
+  const openCompactTeam = useStableEvent(() => {
+    if (!compactTeamDirectory) return;
+    stack?.push({ key: "team", title: teamTitle, render: renderTeam });
+  });
+  const value = useMemo(() => {
+    if (baseValue.openDirectory || !compactTeamDirectory || !stack) {
+      return baseValue;
+    }
+    return {
+      ...baseValue,
+      openDirectory: openCompactTeam,
+    };
+  }, [baseValue, compactTeamDirectory, openCompactTeam, stack]);
+  return <TeamDirectoryShellProvider value={value}>{children}</TeamDirectoryShellProvider>;
+}
+
 function WorkspaceShellProviders({
   persistenceKey,
   sheetPaneHost,
   mainTabContext,
   teamDirectoryShellValue,
+  compactTeamDirectory,
   teamMessageJumpStore,
   gitGraphIntentStore,
   workspaceDescriptor,
@@ -951,6 +986,7 @@ function WorkspaceShellProviders({
   sheetPaneHost: Parameters<typeof WorkspaceContentProviders>[0]["sheetPaneHost"];
   mainTabContext: Parameters<typeof WorkspaceContentProviders>[0]["mainTab"];
   teamDirectoryShellValue: Parameters<typeof TeamDirectoryShellProvider>[0]["value"];
+  compactTeamDirectory?: (close: () => void) => ReactNode;
   teamMessageJumpStore: TeamMessageJumpStore;
   gitGraphIntentStore: GitGraphNavigationIntentStore;
   workspaceDescriptor: WorkspaceDescriptor | null;
@@ -968,7 +1004,10 @@ function WorkspaceShellProviders({
       sheetPaneHost={sheetPaneHost}
       mainTab={mainTabContext}
     >
-      <TeamDirectoryShellProvider value={teamDirectoryShellValue}>
+      <WorkspaceTeamDirectoryShellBridge
+        baseValue={teamDirectoryShellValue}
+        compactTeamDirectory={compactTeamDirectory}
+      >
         <TeamMessageJumpProvider store={teamMessageJumpStore}>
           <GitGraphNavigationIntentProvider store={gitGraphIntentStore}>
             <WorkspaceMarkdownLinks
@@ -983,7 +1022,7 @@ function WorkspaceShellProviders({
             </WorkspaceMarkdownLinks>
           </GitGraphNavigationIntentProvider>
         </TeamMessageJumpProvider>
-      </TeamDirectoryShellProvider>
+      </WorkspaceTeamDirectoryShellBridge>
     </WorkspaceContentProviders>
   );
 }
@@ -5009,6 +5048,7 @@ function WorkspaceScreenContent({
           sheetPaneHost={sheetPaneHost}
           mainTabContext={mainTabContext}
           teamDirectoryShellValue={teamDirectoryShellValue}
+          compactTeamDirectory={isMobile ? compactTeamDirectory : undefined}
           teamMessageJumpStore={teamMessageJumpStore}
           gitGraphIntentStore={gitGraphIntentStore}
           workspaceDescriptor={workspaceDescriptor}

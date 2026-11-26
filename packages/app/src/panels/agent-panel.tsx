@@ -18,7 +18,10 @@ import {
   type TopicStreamViewMode,
 } from "@/stores/topic-stream-view-store";
 import { TodoEditorSheet } from "@/todos/todo-editor-sheet";
-import { submitActiveTopicReply } from "@/agent-stream/topic-card/submit-topic-reply";
+import {
+  submitActiveTopicReply,
+  TopicDecisionStaleQuestionError,
+} from "@/agent-stream/topic-card/submit-topic-reply";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import type { MessagePayload } from "@/composer/types";
 import React, {
@@ -2212,15 +2215,23 @@ function ActiveAgentComposer({
 
   const queryClient = useQueryClient();
   const supportsTopicThreads = useHostFeature(serverId, "workspaceTopicThreads");
+  // COMPAT(workspaceButlerV1): added in v0.18.0, remove gate after 2027-06-01.
+  const supportsButlerV1 = useHostFeature(serverId, "workspaceButlerV1");
   const supportsForgeAttachments = useHostFeature(serverId, "forgeSearch");
   const topicAgentKey = buildTopicAgentKey(serverId, agentId);
   const activeReplyTopic = useTopicStreamViewStore(
     (state) => state.activeReplyTopicByAgentKey[topicAgentKey] ?? null,
   );
   const setActiveReplyTopic = useTopicStreamViewStore((state) => state.setActiveReplyTopic);
+  const clearActiveReplyTopicIfMatches = useTopicStreamViewStore(
+    (state) => state.clearActiveReplyTopicIfMatches,
+  );
   const setActiveReplyRouteMode = useTopicStreamViewStore((state) => state.setActiveReplyRouteMode);
   const setActiveReplySubmissionIntent = useTopicStreamViewStore(
     (state) => state.setActiveReplySubmissionIntent,
+  );
+  const refreshActiveDecisionContext = useTopicStreamViewStore(
+    (state) => state.refreshActiveDecisionContext,
   );
   const handleCancelReplyTopic = useCallback(() => {
     setActiveReplyTopic(topicAgentKey, null);
@@ -2229,33 +2240,62 @@ function ActiveAgentComposer({
     if (!activeReplyTopic) return;
     setActiveReplyRouteMode(topicAgentKey, activeReplyTopic.routeMode === "main" ? "auto" : "main");
   }, [activeReplyTopic, setActiveReplyRouteMode, topicAgentKey]);
-  const handlePersistSubmissionIntent = useCallback(
-    (signature: string, clientMessageId: string) => {
-      setActiveReplySubmissionIntent(topicAgentKey, signature, clientMessageId);
-    },
-    [setActiveReplySubmissionIntent, topicAgentKey],
-  );
   const handleSubmitTopicReply = useCallback(
     async (payload: MessagePayload) => {
-      if (!activeReplyTopic) return;
+      const submittedTarget = activeReplyTopic;
+      if (!submittedTarget) return;
       try {
         const sent = await submitActiveTopicReply({
           queryClient,
           serverId,
           workspaceId,
           agentId,
-          activeReplyTopic,
+          activeReplyTopic: submittedTarget,
           payload,
           supportsTopicThreads,
+          supportsButlerV1,
           supportsForgeAttachments,
           disconnectedMessage: t("workspace.terminal.hostDisconnected"),
-          onPersistSubmissionIntent: handlePersistSubmissionIntent,
+          onPersistSubmissionIntent: (signature, clientMessageId) => {
+            setActiveReplySubmissionIntent(
+              topicAgentKey,
+              signature,
+              clientMessageId,
+              submittedTarget.topicKey,
+            );
+          },
         });
         if (sent) {
-          setActiveReplyTopic(topicAgentKey, null);
+          clearActiveReplyTopicIfMatches(topicAgentKey, {
+            topicKey: submittedTarget.topicKey,
+            taskId: submittedTarget.taskId,
+            decisionKind: submittedTarget.decisionContext?.kind,
+            decisionTaskId: submittedTarget.decisionContext?.taskId,
+            blockingQuestionGeneration: submittedTarget.decisionContext?.blockingQuestionGeneration,
+          });
           onMessageSent();
         }
       } catch (err) {
+        if (err instanceof TopicDecisionStaleQuestionError) {
+          const staleMessage = t("topicWorkbench.topicStream.decisionBlockingQuestionStale");
+          if (submittedTarget.decisionContext) {
+            refreshActiveDecisionContext(topicAgentKey, {
+              expectedTarget: {
+                topicKey: submittedTarget.topicKey,
+                taskId: submittedTarget.taskId,
+                decisionKind: submittedTarget.decisionContext.kind,
+                decisionTaskId: submittedTarget.decisionContext.taskId,
+                blockingQuestionGeneration:
+                  submittedTarget.decisionContext.blockingQuestionGeneration,
+              },
+              question: err.latestTask?.blockingQuestion,
+              blockingQuestionGeneration: err.latestTask?.blockingQuestionGeneration,
+              staleNotice: staleMessage,
+            });
+          }
+          onErrorToast?.(staleMessage);
+          throw err;
+        }
         onErrorToast?.(err instanceof Error ? err.message : String(err));
         throw err;
       }
@@ -2263,12 +2303,14 @@ function ActiveAgentComposer({
     [
       activeReplyTopic,
       agentId,
-      handlePersistSubmissionIntent,
+      clearActiveReplyTopicIfMatches,
       onErrorToast,
       onMessageSent,
       queryClient,
+      refreshActiveDecisionContext,
       serverId,
-      setActiveReplyTopic,
+      setActiveReplySubmissionIntent,
+      supportsButlerV1,
       supportsForgeAttachments,
       supportsTopicThreads,
       t,
@@ -2289,11 +2331,18 @@ function ActiveAgentComposer({
         <View style={styles.topicReplyContextRail} testID="compact-topic-reply-context">
           <View style={styles.topicReplyContextBar}>
             <Text style={styles.topicReplyContextText} numberOfLines={1}>
-              {t("topicWorkbench.topicStream.replyingContextBanner", {
-                preview: activeReplyTopic.promptPreview || activeReplyTopic.topicKey,
-              })}
+              {activeReplyTopic.decisionContext
+                ? t("topicWorkbench.topicStream.decidingContextBanner", {
+                    preview:
+                      activeReplyTopic.decisionContext.question.slice(0, 60) ||
+                      activeReplyTopic.promptPreview ||
+                      activeReplyTopic.topicKey,
+                  })
+                : t("topicWorkbench.topicStream.replyingContextBanner", {
+                    preview: activeReplyTopic.promptPreview || activeReplyTopic.topicKey,
+                  })}
             </Text>
-            {activeReplyTopic.leadAgentId ? (
+            {activeReplyTopic.leadAgentId && !activeReplyTopic.decisionContext ? (
               <PressHighlight
                 accessibilityRole="button"
                 onPress={handleToggleReplyRouteMode}
@@ -2321,6 +2370,14 @@ function ActiveAgentComposer({
               <ThemedCloseIcon size={14} />
             </PressHighlight>
           </View>
+          {activeReplyTopic.decisionContext?.staleNotice ? (
+            <Text
+              style={styles.topicDecisionStaleNotice}
+              testID="compact-topic-decision-stale-notice"
+            >
+              {activeReplyTopic.decisionContext.staleNotice}
+            </Text>
+          ) : null}
         </View>
       ) : null}
       <Composer
@@ -2599,5 +2656,13 @@ const styles = StyleSheet.create((theme) => ({
   topicReplyCloseButton: {
     padding: theme.spacing[1],
     borderRadius: theme.borderRadius.sm,
+  },
+  topicDecisionStaleNotice: {
+    width: "100%",
+    maxWidth: theme.contentMaxWidth,
+    paddingHorizontal: theme.spacing[3],
+    paddingTop: theme.spacing[1],
+    color: theme.colors.statusWarning,
+    fontSize: theme.fontSize.sm,
   },
 }));

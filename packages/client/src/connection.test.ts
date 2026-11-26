@@ -149,6 +149,7 @@ test("a plain client advertises every protocol capability and no browser host", 
     expect(h.sent[0].capabilities).toEqual(
       Object.fromEntries(Object.values(protocolCapabilities).map((key) => [key, true])),
     );
+    expect(h.sent[0].capabilities).toHaveProperty("workspace_butler_v1", true);
   } finally {
     await h.client.close();
   }

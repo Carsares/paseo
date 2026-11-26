@@ -1,5 +1,6 @@
 import type {
   PendingSubagentInboxItem,
+  TopicAnchorSummary,
   TopicThreadEntry,
   WorkspaceDurableItem,
   WorkspaceTaskSummary,
@@ -7,8 +8,9 @@ import type {
   WorkspaceTopicReadSnapshot,
 } from "@getpaseo/protocol/messages";
 import { describe, expect, it } from "vitest";
+import { upsertTopicAnchor } from "@/topic-threads/queries";
 import { reduceStreamUpdate, type StreamItem } from "@/types/stream";
-import { projectTopicUnits } from "./model";
+import { canDecideDurableItemInTopic, extractQuickReplyOptions, projectTopicUnits } from "./model";
 
 function makeHumanPrompt(input: {
   id: string;
@@ -700,5 +702,598 @@ describe("projectTopicUnits", () => {
     expect(topic.linkedDurableItems).toHaveLength(1);
     // Pending durable item elevates status to blocked so approvals are never buried.
     expect(topic.lifecycleStatus).toBe("blocked");
+  });
+
+  it("restores full historical topic cards from topicAnchors after reset_agent_session empties the main timeline", () => {
+    const topicAnchors: TopicAnchorSummary[] = [
+      {
+        workspaceId: "ws-1",
+        mainAgentId: "mc-1",
+        topicKey: "task:T-hist",
+        taskId: "T-hist",
+        rootMessageId: "m-hist",
+        rootPromptText: "Refactor payment webhook retries",
+        title: "Payment webhook retries",
+        leadAgentId: "lead-pay",
+        leadTitle: "Payments Lead",
+        createdAt: "2026-06-01T00:00:00.000Z",
+        updatedAt: "2026-06-01T00:05:00.000Z",
+      },
+    ];
+    const tasks: WorkspaceTaskSummary[] = [
+      {
+        taskId: "T-hist",
+        title: "Payment webhook retries",
+        tier: "T2",
+        status: "completed",
+        participants: [{ agentId: "lead-pay" }],
+        rootMessageId: "m-hist",
+        leadAgentId: "lead-pay",
+        createdAt: "2026-06-01T00:00:00.000Z",
+        updatedAt: "2026-06-01T00:05:00.000Z",
+      },
+    ];
+    const threadEntries: TopicThreadEntry[] = [
+      {
+        entryId: "te-hist-1",
+        workspaceId: "ws-1",
+        mainAgentId: "mc-1",
+        topicKey: "task:T-hist",
+        taskId: "T-hist",
+        rootMessageId: "m-hist",
+        role: "agent_reply",
+        origin: "subagent_report",
+        reportStatus: "completed",
+        authorAgentId: "lead-pay",
+        authorTitle: "Payments Lead",
+        routedAgentId: "lead-pay",
+        text: "Added exponential backoff with jitter and verified webhook tests.",
+        status: "completed",
+        seq: 1,
+        createdAt: "2026-06-01T00:04:00.000Z",
+        updatedAt: "2026-06-01T00:04:00.000Z",
+      },
+    ];
+
+    const result = projectTopicUnits({
+      items: [],
+      tasks,
+      threadEntries,
+      topicAnchors,
+    });
+    expect(result.unmatchedExplicitRefs).toHaveLength(0);
+    expect(result.topics).toHaveLength(1);
+    expect(result.topics[0]!.topicKey).toBe("task:T-hist");
+    expect(result.topics[0]!.rootPrompt.text).toBe("Refactor payment webhook retries");
+    expect(result.topics[0]!.leadAgentId).toBe("lead-pay");
+    expect(result.topics[0]!.leadTitle).toBe("Payments Lead");
+    expect(result.topics[0]!.replies).toHaveLength(1);
+    expect(result.topics[0]!.replies[0]!.kind).toBe("thread_entry");
+  });
+
+  it("attaches resident specialist DurableItems to explicit topic refs or the latest participating topic instead of the oldest card", () => {
+    const tasks: WorkspaceTaskSummary[] = [
+      {
+        taskId: "T-old",
+        title: "Old topic",
+        tier: "T1",
+        status: "completed",
+        participants: [{ agentId: "resident-qa" }],
+        rootMessageId: "m-old",
+        leadAgentId: "resident-qa",
+        createdAt: "2026-06-01T00:00:00.000Z",
+        updatedAt: "2026-06-01T00:01:00.000Z",
+      },
+      {
+        taskId: "T-new",
+        title: "New topic",
+        tier: "T2",
+        status: "in_progress",
+        participants: [{ agentId: "resident-qa" }],
+        rootMessageId: "m-new",
+        leadAgentId: "resident-qa",
+        createdAt: "2026-06-01T00:10:00.000Z",
+        updatedAt: "2026-06-01T00:11:00.000Z",
+      },
+    ];
+    const items: StreamItem[] = [
+      makeHumanPrompt({ id: "u-old", messageId: "m-old", text: "Old QA run", seq: 1, ts: 1_000 }),
+      makeHumanPrompt({ id: "u-new", messageId: "m-new", text: "New QA run", seq: 2, ts: 2_000 }),
+    ];
+    const durableItems: WorkspaceDurableItem[] = [
+      {
+        workspaceId: "ws-1",
+        requestId: "req-legacy",
+        sourceAgentId: "resident-qa",
+        sourceTurnId: "turn-new",
+        kind: "acceptance",
+        title: "Approve latest QA deliverable",
+        evidence: [],
+        createdAt: "2026-06-01T00:12:00.000Z",
+        revision: 1,
+        status: "pending",
+      },
+      {
+        workspaceId: "ws-1",
+        requestId: "req-explicit-old",
+        sourceAgentId: "resident-qa",
+        sourceTurnId: "turn-old",
+        taskId: "T-old",
+        topicKey: "task:T-old",
+        kind: "decision",
+        title: "Explicitly scoped to old topic",
+        evidence: [],
+        createdAt: "2026-06-01T00:02:00.000Z",
+        revision: 1,
+        status: "pending",
+      },
+    ];
+
+    const result = projectTopicUnits({ items, tasks, durableItems });
+    expect(result.topics[0]!.topicKey).toBe("task:T-old");
+    expect(result.topics[0]!.linkedDurableItems.map((d) => d.requestId)).toEqual([
+      "req-explicit-old",
+    ]);
+    expect(result.topics[0]!.activeBlockingPrompt).toEqual({
+      kind: "durable_item",
+      item: durableItems[1],
+      canDecideInTopic: true,
+    });
+    expect(result.topics[1]!.topicKey).toBe("task:T-new");
+    expect(result.topics[1]!.linkedDurableItems.map((d) => d.requestId)).toEqual(["req-legacy"]);
+    expect(result.topics[1]!.activeBlockingPrompt).toEqual({
+      kind: "durable_item",
+      item: durableItems[0],
+      canDecideInTopic: false,
+    });
+    expect(canDecideDurableItemInTopic(durableItems[0]!, "T-new")).toBe(false);
+    expect(canDecideDurableItemInTopic(durableItems[1]!, "T-old")).toBe(true);
+    expect(
+      canDecideDurableItemInTopic({ ...durableItems[1]!, kind: "authorization" }, "T-old"),
+    ).toBe(false);
+  });
+
+  it("deduplicates subagent_report thread entries when main timeline already contains the same sourceMessageId", () => {
+    const tasks: WorkspaceTaskSummary[] = [
+      {
+        taskId: "T-dup",
+        title: "Multi-track merge",
+        tier: "T2",
+        status: "in_progress",
+        participants: [{ agentId: "lead-1" }],
+        rootMessageId: "m-dup",
+        leadAgentId: "lead-1",
+        createdAt: "2026-06-01T00:00:00.000Z",
+        updatedAt: "2026-06-01T00:00:00.000Z",
+      },
+    ];
+    const items: StreamItem[] = [
+      makeHumanPrompt({ id: "u-dup", messageId: "m-dup", text: "Merge tracks", seq: 1, ts: 1_000 }),
+      makeSubagentReport({
+        id: "msg-report-1",
+        senderId: "lead-1",
+        senderTitle: "Lead 1",
+        text: "Track A finished",
+        taskId: "T-dup",
+        rootMessageId: "m-dup",
+        reportStatus: "completed",
+        seq: 2,
+        ts: 2_000,
+      }),
+    ];
+    const threadEntries: TopicThreadEntry[] = [
+      {
+        entryId: "te-dup-1",
+        workspaceId: "ws-1",
+        mainAgentId: "mc-1",
+        topicKey: "task:T-dup",
+        taskId: "T-dup",
+        role: "agent_reply",
+        origin: "subagent_report",
+        reportStatus: "completed",
+        sourceMessageId: "msg-report-1",
+        authorAgentId: "lead-1",
+        authorTitle: "Lead 1",
+        routedAgentId: "lead-1",
+        text: "Track A finished",
+        status: "completed",
+        seq: 1,
+        createdAt: new Date(2_000).toISOString(),
+        updatedAt: new Date(2_000).toISOString(),
+      },
+      {
+        entryId: "te-silent-2",
+        workspaceId: "ws-1",
+        mainAgentId: "mc-1",
+        topicKey: "task:T-dup",
+        taskId: "T-dup",
+        role: "agent_reply",
+        origin: "subagent_report",
+        reportStatus: "completed",
+        sourceMessageId: "msg-silent-only",
+        authorAgentId: "lead-1",
+        authorTitle: "Lead 1",
+        routedAgentId: "lead-1",
+        text: "Silent completion report",
+        status: "completed",
+        seq: 2,
+        createdAt: new Date(3_000).toISOString(),
+        updatedAt: new Date(3_000).toISOString(),
+      },
+    ];
+
+    const result = projectTopicUnits({ items, tasks, threadEntries });
+    expect(result.topics[0]!.replies.map((reply) => reply.id)).toEqual([
+      "msg-report-1",
+      "thread:te-silent-2",
+    ]);
+  });
+
+  it("projects fileConflicts for active tasks only, suppresses them for completed tasks, and extracts quick options for blockingQuestion", () => {
+    const conflict = {
+      path: "packages/app/src/panels/agent-panel.tsx",
+      peers: [
+        {
+          taskId: "T-peer",
+          title: "Composer layout tweak",
+          leadAgentId: "lead-2",
+          leadTitle: "UI Lead",
+          status: "in_progress",
+        },
+      ],
+    };
+    const tasks: WorkspaceTaskSummary[] = [
+      {
+        taskId: "T-active",
+        title: "Active conflict topic",
+        tier: "T2",
+        status: "awaiting_decision",
+        participants: [{ agentId: "lead-1" }],
+        rootMessageId: "m-active",
+        leadAgentId: "lead-1",
+        blockingQuestion:
+          "Choose migration strategy:\n1. Keep legacy column\n2. Drop legacy column",
+        fileConflicts: [conflict],
+        createdAt: "2026-06-01T00:00:00.000Z",
+        updatedAt: "2026-06-01T00:01:00.000Z",
+      },
+      {
+        taskId: "T-done",
+        title: "Completed topic",
+        tier: "T1",
+        status: "completed",
+        participants: [{ agentId: "lead-3" }],
+        rootMessageId: "m-done",
+        leadAgentId: "lead-3",
+        fileConflicts: [conflict],
+        createdAt: "2026-06-01T00:02:00.000Z",
+        updatedAt: "2026-06-01T00:03:00.000Z",
+      },
+    ];
+    const items: StreamItem[] = [
+      makeHumanPrompt({ id: "u-a", messageId: "m-active", text: "Migrate DB", seq: 1, ts: 1_000 }),
+      makeHumanPrompt({ id: "u-d", messageId: "m-done", text: "Already done", seq: 2, ts: 2_000 }),
+    ];
+
+    const result = projectTopicUnits({ items, tasks });
+    expect(result.topics[0]!.fileConflicts).toEqual([conflict]);
+    expect(result.topics[0]!.lifecycleStatus).toBe("blocked");
+    expect(result.topics[0]!.activeBlockingPrompt).toEqual({
+      kind: "task_blocking_question",
+      taskId: "T-active",
+      question: "Choose migration strategy:\n1. Keep legacy column\n2. Drop legacy column",
+      blockingQuestionGeneration: undefined,
+      options: ["Keep legacy column", "Drop legacy column"],
+    });
+    expect(result.topics[1]!.fileConflicts).toEqual([]);
+    expect(result.topics[1]!.activeBlockingPrompt).toBeNull();
+    expect(extractQuickReplyOptions("Only a plain question without bullets?")).toEqual([]);
+  });
+
+  it("isolates multiple sibling tasks under the same rootMessageId across live anchor cache and cold-load projection", () => {
+    const genA = "11111111-1111-4111-8111-111111111111";
+    const genB = "22222222-2222-4222-8222-222222222222";
+    const msgAnchor: TopicAnchorSummary = {
+      workspaceId: "ws-1",
+      mainAgentId: "mc-1",
+      topicKey: "msg:m-shared",
+      rootMessageId: "m-shared",
+      rootPromptText: "Ship API and UI changes in parallel",
+      createdAt: "2026-06-01T00:00:00.000Z",
+      updatedAt: "2026-06-01T00:00:00.000Z",
+    };
+    const anchorA: TopicAnchorSummary = {
+      workspaceId: "ws-1",
+      mainAgentId: "mc-1",
+      topicKey: "task:T-A",
+      taskId: "T-A",
+      rootMessageId: "m-shared",
+      rootPromptText: "Ship API and UI changes in parallel",
+      title: "API track",
+      leadAgentId: "lead-api",
+      leadTitle: "API Lead",
+      createdAt: "2026-06-01T00:00:01.000Z",
+      updatedAt: "2026-06-01T00:00:01.000Z",
+    };
+    const anchorB: TopicAnchorSummary = {
+      workspaceId: "ws-1",
+      mainAgentId: "mc-1",
+      topicKey: "task:T-B",
+      taskId: "T-B",
+      rootMessageId: "m-shared",
+      rootPromptText: "",
+      title: "UI track",
+      leadAgentId: "lead-ui",
+      leadTitle: "UI Lead",
+      createdAt: "2026-06-01T00:00:02.000Z",
+      updatedAt: "2026-06-01T00:00:02.000Z",
+    };
+
+    // Live cache path: msg:m-shared migrates to task:T-A, task:T-B stays isolated and borrows prompt text,
+    // and a late msg:m-shared refresh never collapses or duplicates cards.
+    let anchors = upsertTopicAnchor([], msgAnchor);
+    anchors = upsertTopicAnchor(anchors, anchorA);
+    anchors = upsertTopicAnchor(anchors, anchorB);
+    anchors = upsertTopicAnchor(anchors, msgAnchor);
+    expect(anchors.map((a) => a.topicKey)).toEqual(["task:T-A", "task:T-B"]);
+    expect(anchors[1]!.rootPromptText).toBe("Ship API and UI changes in parallel");
+
+    const tasks: WorkspaceTaskSummary[] = [
+      {
+        taskId: "T-A",
+        title: "API track",
+        tier: "T2",
+        status: "awaiting_decision",
+        participants: [{ agentId: "lead-api" }],
+        rootMessageId: "m-shared",
+        leadAgentId: "lead-api",
+        blockingQuestion: "Approve API v2?",
+        blockingQuestionGeneration: genA,
+        createdAt: "2026-06-01T00:00:01.000Z",
+        updatedAt: "2026-06-01T00:00:05.000Z",
+      },
+      {
+        taskId: "T-B",
+        title: "UI track",
+        tier: "T2",
+        status: "awaiting_decision",
+        participants: [{ agentId: "lead-ui" }],
+        rootMessageId: "m-shared",
+        leadAgentId: "lead-ui",
+        blockingQuestion: "Approve UI theme?",
+        blockingQuestionGeneration: genB,
+        createdAt: "2026-06-01T00:00:02.000Z",
+        updatedAt: "2026-06-01T00:00:06.000Z",
+      },
+    ];
+    const items: StreamItem[] = [
+      makeHumanPrompt({
+        id: "u-shared",
+        messageId: "m-shared",
+        text: "Ship API and UI changes in parallel",
+        seq: 1,
+        ts: 1_000,
+      }),
+      makeSubagentReport({
+        id: "rep-a",
+        senderId: "lead-api",
+        senderTitle: "API Lead",
+        text: "API update",
+        taskId: "T-A",
+        rootMessageId: "m-shared",
+        seq: 2,
+        ts: 2_000,
+      }),
+      makeSubagentReport({
+        id: "rep-b",
+        senderId: "lead-ui",
+        senderTitle: "UI Lead",
+        text: "UI update",
+        taskId: "T-B",
+        rootMessageId: "m-shared",
+        seq: 3,
+        ts: 3_000,
+      }),
+    ];
+
+    // 1) Cold load WITH anchors + live timeline items: both cards stay distinct and keep independent replies.
+    const withAnchors = projectTopicUnits({ items, tasks, topicAnchors: anchors });
+    expect(withAnchors.topics.map((t) => t.topicKey)).toEqual(["task:T-A", "task:T-B"]);
+    expect(withAnchors.topics[0]!.replies.map((r) => r.id)).toEqual(["rep-a"]);
+    expect(withAnchors.topics[1]!.replies.map((r) => r.id)).toEqual(["rep-b"]);
+    expect(withAnchors.topics[0]!.activeBlockingPrompt).toMatchObject({
+      kind: "task_blocking_question",
+      taskId: "T-A",
+      blockingQuestionGeneration: genA,
+    });
+    expect(withAnchors.topics[1]!.activeBlockingPrompt).toMatchObject({
+      kind: "task_blocking_question",
+      taskId: "T-B",
+      blockingQuestionGeneration: genB,
+    });
+
+    // 2) Cold load WITHOUT anchors (items + tasks only): still projects both sibling task cards cleanly!
+    const withoutAnchors = projectTopicUnits({ items, tasks });
+    expect(withoutAnchors.topics.map((t) => t.topicKey)).toEqual(["task:T-A", "task:T-B"]);
+    expect(withoutAnchors.topics[0]!.replies.map((r) => r.id)).toEqual(["rep-a"]);
+    expect(withoutAnchors.topics[1]!.replies.map((r) => r.id)).toEqual(["rep-b"]);
+
+    // 3) Reset timeline (items: []) with [msg:m-shared, task:T-A, task:T-B] anchors: msg: migrates only once.
+    const resetLoad = projectTopicUnits({
+      items: [],
+      tasks,
+      topicAnchors: [msgAnchor, anchorA, anchorB],
+    });
+    expect(resetLoad.topics.map((t) => t.topicKey)).toEqual(["task:T-A", "task:T-B"]);
+  });
+
+  it("attributes replies accurately on cold load after backfilling task A then task B with retained msg: entries", () => {
+    const msgAnchor: TopicAnchorSummary = {
+      workspaceId: "ws-1",
+      mainAgentId: "mc-1",
+      topicKey: "msg:m-shared",
+      rootMessageId: "m-shared",
+      rootPromptText: "Run backend and frontend tracks",
+      createdAt: "2026-06-01T00:00:00.000Z",
+      updatedAt: "2026-06-01T00:00:00.000Z",
+    };
+    const anchorA: TopicAnchorSummary = {
+      workspaceId: "ws-1",
+      mainAgentId: "mc-1",
+      topicKey: "task:T-A",
+      taskId: "T-A",
+      rootMessageId: "m-shared",
+      rootPromptText: "Run backend and frontend tracks",
+      title: "Track A",
+      leadAgentId: "lead-a",
+      createdAt: "2026-06-01T00:00:01.000Z",
+      updatedAt: "2026-06-01T00:00:01.000Z",
+    };
+    const anchorB: TopicAnchorSummary = {
+      workspaceId: "ws-1",
+      mainAgentId: "mc-1",
+      topicKey: "task:T-B",
+      taskId: "T-B",
+      rootMessageId: "m-shared",
+      rootPromptText: "Run backend and frontend tracks",
+      title: "Track B",
+      leadAgentId: "lead-b",
+      createdAt: "2026-06-01T00:00:02.000Z",
+      updatedAt: "2026-06-01T00:00:02.000Z",
+    };
+
+    // Simulate backend backfill order: msg:m-shared -> backfill A -> backfill B.
+    let anchors = upsertTopicAnchor([], msgAnchor);
+    anchors = upsertTopicAnchor(anchors, anchorA);
+    anchors = upsertTopicAnchor(anchors, anchorB);
+
+    const tasks: WorkspaceTaskSummary[] = [
+      {
+        taskId: "T-A",
+        title: "Track A",
+        tier: "T2",
+        status: "in_progress",
+        participants: [{ agentId: "lead-a" }],
+        rootMessageId: "m-shared",
+        leadAgentId: "lead-a",
+        createdAt: "2026-06-01T00:00:01.000Z",
+        updatedAt: "2026-06-01T00:00:04.000Z",
+      },
+      {
+        taskId: "T-B",
+        title: "Track B",
+        tier: "T2",
+        status: "in_progress",
+        participants: [{ agentId: "lead-b" }],
+        rootMessageId: "m-shared",
+        leadAgentId: "lead-b",
+        createdAt: "2026-06-01T00:00:02.000Z",
+        updatedAt: "2026-06-01T00:00:05.000Z",
+      },
+    ];
+
+    const threadEntries: TopicThreadEntry[] = [
+      {
+        entryId: "e-a-promoted",
+        workspaceId: "ws-1",
+        mainAgentId: "mc-1",
+        topicKey: "task:T-A",
+        taskId: "T-A",
+        rootMessageId: "m-shared",
+        seq: 1,
+        role: "agent_reply",
+        origin: "subagent_report",
+        routedAgentId: "lead-a",
+        authorAgentId: "lead-a",
+        authorTitle: "Lead A",
+        text: "Track A progress",
+        status: "completed",
+        createdAt: "2026-06-01T00:00:03.000Z",
+        updatedAt: "2026-06-01T00:00:03.000Z",
+      },
+      {
+        // Legacy msg: topicKey carrying explicit taskId: T-B (must stay attributed to T-B even after A backfilled first).
+        entryId: "e-b-legacy-msg-key",
+        workspaceId: "ws-1",
+        mainAgentId: "mc-1",
+        topicKey: "msg:m-shared",
+        taskId: "T-B",
+        rootMessageId: "m-shared",
+        seq: 2,
+        role: "agent_reply",
+        origin: "subagent_report",
+        routedAgentId: "lead-b",
+        authorAgentId: "lead-b",
+        authorTitle: "Lead B",
+        text: "Track B early update",
+        status: "completed",
+        createdAt: "2026-06-01T00:00:04.000Z",
+        updatedAt: "2026-06-01T00:00:04.000Z",
+      },
+      {
+        entryId: "e-b-promoted",
+        workspaceId: "ws-1",
+        mainAgentId: "mc-1",
+        topicKey: "task:T-B",
+        taskId: "T-B",
+        rootMessageId: "m-shared",
+        seq: 3,
+        role: "agent_reply",
+        origin: "topic_reply",
+        routedAgentId: "lead-b",
+        authorAgentId: "lead-b",
+        authorTitle: "Lead B",
+        text: "Track B promoted update",
+        status: "completed",
+        createdAt: "2026-06-01T00:00:05.000Z",
+        updatedAt: "2026-06-01T00:00:05.000Z",
+      },
+      {
+        // Ambiguous entry without taskId whose msg: reference was retained by backend store.ts.
+        entryId: "e-msg-retained",
+        workspaceId: "ws-1",
+        mainAgentId: "mc-1",
+        topicKey: "msg:m-shared",
+        rootMessageId: "m-shared",
+        seq: 4,
+        role: "user_followup",
+        origin: "topic_reply",
+        routedAgentId: "mc-1",
+        authorTitle: "User",
+        text: "General follow-up before split",
+        status: "completed",
+        createdAt: "2026-06-01T00:00:06.000Z",
+        updatedAt: "2026-06-01T00:00:06.000Z",
+      },
+    ];
+
+    const liveItems: StreamItem[] = [
+      makeHumanPrompt({
+        id: "u-shared",
+        messageId: "m-shared",
+        text: "Run backend and frontend tracks",
+        seq: 1,
+        ts: 1_000,
+      }),
+    ];
+
+    for (const items of [liveItems, [] as StreamItem[]]) {
+      const projected = projectTopicUnits({
+        items,
+        tasks,
+        topicAnchors: anchors,
+        threadEntries,
+      });
+      expect(projected.topics.map((t) => t.topicKey)).toEqual(["task:T-A", "task:T-B"]);
+      expect(projected.unmatchedExplicitRefs).toEqual([]);
+      expect(projected.topics[0]!.replies.map((r) => r.id)).toEqual([
+        "thread:e-a-promoted",
+        "thread:e-msg-retained",
+      ]);
+      expect(projected.topics[1]!.replies.map((r) => r.id)).toEqual([
+        "thread:e-b-legacy-msg-key",
+        "thread:e-b-promoted",
+      ]);
+    }
   });
 });

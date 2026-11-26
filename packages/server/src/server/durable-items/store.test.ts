@@ -1,7 +1,9 @@
+import { mkdirSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { WorkspaceDurableItem } from "@getpaseo/protocol/messages";
 import { expect, onTestFinished, test } from "vitest";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { WorkspaceDeferral } from "../workspace-deferral/deferral.js";
@@ -11,6 +13,8 @@ import {
 } from "../workspace-registry.js";
 import { AgentStorage } from "../agent/agent-storage.js";
 import { DurableItemConflictError, DurableItemStore } from "./store.js";
+import { readDurableItemTurnMessageIds, resolveDurableItemTurnTopic } from "./agent-request.js";
+import { taskEvent } from "../agent/task-ledger/events.js";
 
 const serverId = "host";
 const workspaceId = "topic";
@@ -117,6 +121,218 @@ test("competing decisions commit once, preserve the real principal, and never re
     items: [{ decidedByPrincipalId: "principal-a" }],
   });
   expect(await registry.get(workspaceId)).toEqual(parked);
+});
+
+test("subscribers on another store receive only committed changes in revision order", async () => {
+  const { filePath, openStore, create, decide } = await scenario();
+  const observed: WorkspaceDurableItem[] = [];
+  const snapshots: unknown[] = [];
+  const unsubscribe = openStore().subscribe((item) => {
+    observed.push(item);
+    snapshots.push(JSON.parse(readFileSync(filePath, "utf8")));
+  });
+  onTestFinished(unsubscribe);
+
+  const initial = { ...create, kind: "decision" as const, evidence: [] };
+  const writer = openStore();
+  await writer.create(initial);
+  await expect(writer.create(initial)).rejects.toBeInstanceOf(DurableItemConflictError);
+  const legacyDecision = await writer.decide(decide);
+  await expect(writer.decide(decide)).rejects.toBeInstanceOf(DurableItemConflictError);
+
+  const topicRequestId = "topic-decision";
+  const action = {
+    ...decide,
+    durableItemRequestId: topicRequestId,
+    topicDecisionOperationId: "topic-operation",
+  };
+  await writer.create({ ...initial, requestId: topicRequestId });
+  const topicDecision = await writer.decide(action);
+  await expect(openStore().decide(action)).resolves.toEqual(topicDecision);
+
+  const expiringRequestId = "expiring";
+  await writer.create({ ...initial, requestId: expiringRequestId });
+  await writer.expire({ serverId, workspaceId, requestId: expiringRequestId, expectedRevision: 0 });
+  unsubscribe();
+  await writer.create({ ...initial, requestId: "after-unsubscribe" });
+
+  expect(observed.map((item) => [item.requestId, item.status, item.revision])).toEqual([
+    [requestId, "pending", 0],
+    [requestId, "decided", 1],
+    [topicRequestId, "pending", 0],
+    [topicRequestId, "decided", 1],
+    [expiringRequestId, "pending", 0],
+    [expiringRequestId, "expired", 1],
+  ]);
+  expect(observed[1]).toEqual(legacyDecision);
+  expect(observed[3]).toEqual(topicDecision);
+  expect(observed[3]).not.toHaveProperty("topicDecisionOperationId");
+  for (const [index, item] of observed.entries()) {
+    expect(snapshots[index]).toMatchObject({
+      items: expect.arrayContaining([
+        expect.objectContaining({
+          item: expect.objectContaining({
+            requestId: item.requestId,
+            status: item.status,
+            revision: item.revision,
+          }),
+        }),
+      ]),
+    });
+  }
+});
+
+test("does not notify subscribers if the atomic file replacement fails", async () => {
+  const { filePath, openStore, create } = await scenario();
+  const observed: WorkspaceDurableItem[] = [];
+  onTestFinished(openStore().subscribe((item) => observed.push(item)));
+  await expect(
+    openStore().create({ ...create, kind: "decision", evidence: [] }, () => mkdirSync(filePath)),
+  ).rejects.toThrow();
+  expect(observed).toEqual([]);
+});
+
+test("preserves topic attribution on disk and replays only the same topic decision operation", async () => {
+  const { filePath, openStore, create, decide } = await scenario();
+  const topic = { taskId: "release", topicKey: "task:release", rootMessageId: "first-prompt" };
+  await openStore().create({ ...create, ...topic, kind: "decision", evidence: [] });
+  await expect(openStore().listPendingWorkspaceItems(create)).resolves.toMatchObject([topic]);
+  const action = {
+    ...decide,
+    topicDecisionOperationId: "topic-decision-operation",
+    note: "  Ship the release.\n",
+  };
+  const first = await openStore().decide(action);
+  expect(first).toMatchObject({ ...topic, revision: 1, decision: "approve", note: action.note });
+  expect(first).not.toHaveProperty("topicDecisionOperationId");
+  expect(JSON.parse(await readFile(filePath, "utf8"))).toMatchObject({
+    items: [
+      {
+        item: first,
+        decidedByPrincipalId: action.principalId,
+        topicDecisionOperationId: action.topicDecisionOperationId,
+      },
+    ],
+  });
+
+  const reopened = openStore();
+  await expect(reopened.decide(action)).resolves.toEqual(first);
+  await expect(reopened.decide({ ...action, note: "Ship the release." })).resolves.toEqual(first);
+  for (const patch of [
+    { topicDecisionOperationId: "another-operation" },
+    { topicDecisionOperationId: undefined },
+    { principalId: "another-principal" },
+    { expectedRevision: 1 },
+    { decision: "reject" },
+    { note: "Hold the release." },
+  ] as const) {
+    await expect(reopened.decide({ ...action, ...patch })).rejects.toMatchObject({
+      name: "DurableItemConflictError",
+      item: first,
+    });
+  }
+  await expect(openStore().listPendingWorkspaceItems(create)).resolves.toEqual([]);
+});
+
+test("treats a blank topic decision note as absent after reopening the store", async () => {
+  const { openStore, create, decide } = await scenario();
+  await openStore().create({ ...create, kind: "decision", evidence: [] });
+  const action = { ...decide, topicDecisionOperationId: "operation-without-note" };
+  const first = await openStore().decide(action);
+
+  await expect(openStore().decide({ ...action, note: " \t\n " })).resolves.toEqual(first);
+});
+
+test("requires the existing authorization path even with a topic operation ID", async () => {
+  const { openStore, create, decide } = await scenario();
+  await openStore().create({ ...create, kind: "authorization", evidence: [] });
+  const action = { ...decide, note: "  Keep the legacy note.  " };
+  const topicAction = { ...action, topicDecisionOperationId: "authorization-operation" };
+  await expect(openStore().decide(topicAction)).rejects.toThrow(
+    /cannot be decided through a topic/,
+  );
+  await expect(openStore().get(create)).resolves.toMatchObject({ status: "pending", revision: 0 });
+  const decided = await openStore().decide(action);
+  expect(decided).toMatchObject({ status: "decided", revision: 1, note: action.note });
+  await expect(openStore().decide(action)).rejects.toBeInstanceOf(DurableItemConflictError);
+  await expect(openStore().decide(topicAction)).rejects.toThrow(
+    /cannot be decided through a topic/,
+  );
+});
+
+test("rechecks the initiating turn before committing an evidence-backed topic decision", async () => {
+  const { dir, openStore, create, decide } = await scenario();
+  await writeFile(join(dir, "trace.txt"), "Verified trace");
+  await openStore().create({ ...create, evidence: [{ type: "file", path: "trace.txt" }] });
+  let checks = 0;
+  const action = { ...decide, topicDecisionOperationId: "topic-decision-operation" };
+  await expect(
+    openStore().decide(action, () => {
+      if (++checks === 2) throw new Error("The initiating turn has ended.");
+    }),
+  ).rejects.toThrow("The initiating turn has ended.");
+  await expect(openStore().get(create)).resolves.toMatchObject({ status: "pending", revision: 0 });
+});
+
+test("only assigns a reused specialist's request to the task that dispatched its current turn", () => {
+  const task = {
+    taskId: "release",
+    rootMessageId: "root",
+    status: "in_progress",
+    tier: "T1",
+    title: "Release",
+    participants: [{ agentId: "resident" }],
+    createdAt: now,
+    updatedAt: now,
+    events: [taskEvent("resident", "dispatched", 0, "running", "previous-prompt")],
+  } as const;
+  const input = {
+    agentId: "resident",
+    resetEpoch: 0,
+    tasks: [{ ...task, participants: [...task.participants], events: [...task.events] }],
+    entries: [],
+  };
+  expect(
+    resolveDurableItemTurnTopic({ ...input, messageIds: new Set(["independent-prompt"]) }),
+  ).toBeUndefined();
+  const messageIds = readDurableItemTurnMessageIds(
+    [
+      {
+        seq: 1,
+        timestamp: now,
+        turnId: "dispatch-turn",
+        item: {
+          type: "tool_call",
+          callId: "paseo-agent-message:previous-prompt",
+          name: "agent_message",
+          status: "completed",
+          error: null,
+          detail: { type: "plain_text", text: "Do the work" },
+          agentMessage: { event: "message", sender: { id: "main" }, text: "Do the work" },
+        },
+      },
+    ],
+    "dispatch-turn",
+  );
+  expect(resolveDurableItemTurnTopic({ ...input, messageIds })).toEqual({
+    taskId: "release",
+    topicKey: "task:release",
+    rootMessageId: "root",
+  });
+  expect(
+    resolveDurableItemTurnTopic({
+      ...input,
+      messageIds: new Set(["next-prompt"]),
+      pendingBindings: [
+        {
+          agentId: "resident",
+          workspaceId,
+          messageId: "next-prompt",
+          taskId: "new-task",
+        },
+      ],
+    }),
+  ).toEqual({ taskId: "new-task", topicKey: "task:new-task", rootMessageId: undefined });
 });
 
 test("rejects missing, changed, expired and foreign-host evidence on approval", async () => {

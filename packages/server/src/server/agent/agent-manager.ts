@@ -184,6 +184,11 @@ import {
   TaskDispatchRejectedError,
   taskReuseDecision,
 } from "./task-ledger/reuse.js";
+import {
+  isActiveWorkspaceTask,
+  mergeTouchedFiles,
+  prepareModifiedPathsFromToolCall,
+} from "./task-ledger/touched-files.js";
 import type { AgentWorkspaceMoveJournal } from "./agent-workspace-move-journal.js";
 import type { AgentOwner } from "./agent-owner.js";
 import {
@@ -278,6 +283,7 @@ import {
   readLocalSubtreeDepths,
   REMOTE_HIERARCHY_DEPTH_LABEL,
   RESERVED_HIERARCHY_LABELS_ERROR,
+  TASK_ID_LABEL,
   type TopicWorkspaceAgent,
   type TopicWorkspaceSnapshot,
   validateCanSpawnChild,
@@ -332,6 +338,47 @@ function submittedPromptText(prompt: AgentPromptInput): string {
     .flatMap((block) => (block.type === "text" && !("mimeType" in block) ? [block.text] : []))
     .join("\n")
     .trim();
+}
+
+const directHumanPrompt = Symbol("directHumanPrompt");
+const topicFollowup = Symbol("topicFollowup");
+
+interface TopicTaskScope {
+  workspaceId: string;
+  mainAgentId: string;
+  taskId?: string;
+}
+
+type ForegroundRunMetadata = AgentRunOptions & {
+  [directHumanPrompt]?: true;
+  [topicFollowup]?: TopicTaskScope;
+};
+
+/** Set at verified human ingress, before the manager admits the prompt. */
+export function directHumanPromptRunOptions(options?: AgentRunOptions): AgentRunOptions {
+  const marked: ForegroundRunMetadata = { ...options, [directHumanPrompt]: true };
+  return marked;
+}
+
+/** Supply the resolved thread address and the authority of this particular dispatch. */
+export function topicFollowupRunOptions({
+  humanInitiated,
+  ...scope
+}: TopicTaskScope & { humanInitiated?: boolean }): AgentRunOptions {
+  const options: ForegroundRunMetadata = { [topicFollowup]: scope };
+  return humanInitiated === true ? directHumanPromptRunOptions(options) : options;
+}
+
+function isDirectHumanPrompt(
+  options: ForegroundRunMetadata | undefined,
+  promptStart: ForegroundPromptStart | undefined,
+  prompt: AgentPromptInput,
+): boolean {
+  if (!options?.[directHumanPrompt] || options.turnAuthorization || options.recoveryIntent)
+    return false;
+  if (!isHumanForegroundPrompt(promptStart)) return false;
+  // A direct send can carry queued agent messages into the same provider turn.
+  return !parseAgentMessages(submittedPromptText(prompt))?.some(({ source }) => source);
 }
 
 export class AgentManagerShuttingDownError extends Error {
@@ -810,6 +857,10 @@ export interface AgentManagerOptions {
   registry?: AgentStorage;
   taskLedger?: WorkspaceTaskLedgerStore;
   workspaceRegistry?: Pick<WorkspaceRegistry, "get">;
+  preserveTopicHistory?: (
+    scope: { workspaceId: string; mainAgentId: string },
+    rows: readonly AgentTimelineRow[],
+  ) => Promise<void>;
   rewindDirectories?: AgentRewindDirectories;
   getAgentProfile?: (id: string) => AgentProfile | undefined;
   onAgentAttention?: AgentAttentionCallback;
@@ -949,8 +1000,10 @@ interface TaskReportAttribution {
   deliveryTurnId?: string;
   correlation: Omit<TaskLedgerObservation, "event" | "messageId">;
   order: number;
-  previousTasks: Promise<ReadonlySet<string>>;
+  previousTasks?: Promise<ReadonlySet<string>>;
+  topicTask?: TopicTaskScope;
   pending?: PendingForegroundRun;
+  touchedFiles: readonly string[];
 }
 
 interface ManagedAgentBase extends StoredAgentTurnState {
@@ -1726,6 +1779,10 @@ export class AgentManager {
   private readonly idFactory: () => string;
   private readonly registry?: AgentStorage;
   private readonly workspaceRegistry?: Pick<WorkspaceRegistry, "get">;
+  private readonly preserveTopicHistory?: AgentManagerOptions["preserveTopicHistory"];
+  private registerExceptionalParentFinish?: (
+    agent: ManagedAgent,
+  ) => Promise<FinishRegistration | undefined>;
   private readonly durableTimelineStore?: AgentTimelineStore;
   private readonly durableTimelineWriteTails = new Map<string, Promise<void>>();
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
@@ -1773,6 +1830,12 @@ export class AgentManager {
   private readonly taskLedgerArchivedRuntimes = new WeakSet<TaskLedgerAgent>();
   private readonly taskLedgerLifecycles = new WeakMap<ManagedAgent, string>();
   private readonly taskLedger?: WorkspaceTaskLedgerStore;
+  private readonly touchedFilesBySession = new WeakMap<AgentSession, Map<string, string[]>>();
+  private readonly topicTaskRuns = new WeakMap<
+    PendingForegroundRun,
+    { session: AgentSession; scope: TopicTaskScope }
+  >();
+  private readonly humanPromptRuns = new WeakMap<PendingForegroundRun, AgentSession>();
   private readonly resumedProviderSessions = new WeakSet<AgentSession>();
   private readonly inPlaceMainControlSessions = new WeakSet<AgentSession>();
   private readonly launchMainControlRoleVersions = new WeakMap<AgentSessionConfig, number>();
@@ -1827,6 +1890,7 @@ export class AgentManager {
     this.registry = options.registry;
     this.taskLedger = options.taskLedger;
     this.workspaceRegistry = options.workspaceRegistry;
+    this.preserveTopicHistory = options.preserveTopicHistory;
     if (options.rewindDirectories) this.configureRewindCheckpoints(options.rewindDirectories);
     this.getAgentProfile = options.getAgentProfile;
     this.timelinePrefixes = this.registry?.timelinePrefixes ?? new TimelinePrefixStore();
@@ -1917,6 +1981,12 @@ export class AgentManager {
     callback: (childId: string, parentId: string) => Promise<void>,
   ): void {
     this.cancelAutomaticParentSubscription = callback;
+  }
+
+  setExceptionalParentFinishRegistration(
+    callback: (agent: ManagedAgent) => Promise<FinishRegistration | undefined>,
+  ): void {
+    this.registerExceptionalParentFinish = callback;
   }
 
   setAgentArchivedCallback(callback: AgentArchivedCallback): void {
@@ -4669,9 +4739,10 @@ export class AgentManager {
               if (this.hasSessionMutationWork(agent))
                 throw new Error(`Agent ${agentId} has not settled its active turn`);
             }
+            const topic = options.clearVisibleTimeline ? await this.topicHistoryScope(agent) : null;
             if (!options.clearVisibleTimeline)
               await this.hydrateTimelineFromLegacyProviderHistory(agent);
-            await this.switchAgentSession(agent, config, { reset: options });
+            await this.switchAgentSession(agent, config, { reset: options, topic });
             await this.recordTaskSessionReset(agentId);
           } finally {
             this.providerSwitches.delete(agentId);
@@ -4679,6 +4750,23 @@ export class AgentManager {
         }),
       ),
     );
+  }
+
+  private async topicHistoryScope(
+    agent: Pick<StoredAgentRecord, "id" | "workspaceId" | "labels" | "internal">,
+  ) {
+    const { id, workspaceId, labels, internal } = agent;
+    if (
+      !workspaceId ||
+      internal ||
+      !isMainControlAgentLabels(labels) ||
+      getParentAgentIdFromLabels(labels)
+    )
+      return null;
+    const workspace = await this.workspaceRegistry?.get(workspaceId);
+    if (!workspace?.topic || workspace.archivedAt) return null;
+    if (!this.preserveTopicHistory) throw new Error("Topic history storage is unavailable.");
+    return { workspaceId, mainAgentId: id };
   }
 
   private hasSessionMutationWork(agent: ActiveManagedAgent): boolean {
@@ -4885,9 +4973,12 @@ export class AgentManager {
     const storedPrefix = await this.timelinePrefixes.load(id);
     await this.durableTimelineWriteTails.get(id);
     const durableRows = (await this.durableTimelineStore?.getCommittedRows(id)) ?? [];
-    const rows = options.clearVisibleTimeline
-      ? []
-      : await this.readClosedResetTimeline(record, storedPrefix, durableRows);
+    const topic = options.clearVisibleTimeline ? await this.topicHistoryScope(record) : null;
+    const rows =
+      options.clearVisibleTimeline && !topic
+        ? []
+        : await this.readClosedResetTimeline(record, storedPrefix, durableRows);
+    if (topic) await this.preserveTopicHistory!(topic, rows);
     const updatedAt = this.nextStoredUpdatedAt(record);
     const prefix = this.buildResetTimelinePrefix(rows, updatedAt, options);
     const switchId = randomUUID();
@@ -4956,10 +5047,22 @@ export class AgentManager {
       handle,
       signal: new AbortController().signal,
     });
+    return this.appendResetHistory(id, prefix, retained, events, record.updatedAt);
+  }
+
+  private appendResetHistory(
+    id: string,
+    prefix: PersistedTimelinePrefix | null,
+    retained: AgentTimelineRow[],
+    events: Extract<AgentStreamEvent, { type: "timeline" }>[],
+    fallbackTimestamp: string,
+  ): AgentTimelineRow[] {
     const timeline = new InMemoryAgentTimelineStore();
     timeline.initialize(id, { rows: retained, sealedThrough: maxTimelineSeq(retained) });
     for (const { item, timestamp } of this.excludePrefixReplay(prefix, events)) {
-      timeline.append(id, limitAgentTimelineItemContent(item), { timestamp });
+      timeline.append(id, limitAgentTimelineItemContent(item), {
+        timestamp: timestamp ?? fallbackTimestamp,
+      });
     }
     return timeline.getRows(id);
   }
@@ -5055,7 +5158,13 @@ export class AgentManager {
   private async switchAgentSession(
     agent: ActiveManagedAgent,
     config: AgentSessionConfig,
-    { reset }: { reset?: ResetAgentSessionOptions } = {},
+    {
+      reset,
+      topic,
+    }: {
+      reset?: ResetAgentSessionOptions;
+      topic?: Awaited<ReturnType<AgentManager["topicHistoryScope"]>>;
+    } = {},
   ) {
     const { id, cwd, labels, launchEnv, mainControlSystemPrompt } = agent;
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
@@ -5112,12 +5221,17 @@ export class AgentManager {
       agent.unsubscribeSession = null;
       oldSessionUnsubscribed = true;
       this.agentStreamCoalescer.flushAndDiscard(id);
-      if (reset) await this.durableTimelineWriteTails.get(id);
-      const durableRows = reset
-        ? ((await this.durableTimelineStore?.getCommittedRows(id)) ?? [])
-        : [];
+      const durableRows = await this.readResetTimelineRows(id, reset);
       const cache = this.contextHandoffs.get(id);
       const liveRows = this.timelineStore.getRows(id);
+      if (topic)
+        await this.preserveLiveTopicHistory(
+          agent,
+          topic,
+          cache?.prefix ?? previousPrefix,
+          durableRows,
+          liveRows,
+        );
       next.updatedAt = new Date();
       const prefix = reset
         ? this.buildResetTimelinePrefix(
@@ -5140,15 +5254,7 @@ export class AgentManager {
         switchId,
         reset?.clearVisibleTimeline ? durableRows : undefined,
       );
-      if (!reset) {
-        // The staged file is already readable as committed if this cleanup fails.
-        await this.timelinePrefixes.save(id, prefix).catch((err) => {
-          this.logger.warn({ err, agentId: id }, "Failed to finalize the timeline prefix");
-        });
-        this.clearProviderBackgroundWork(id);
-        this.cancelRunningProviderSubagents(id);
-        this.timelineStore.sealPrefix(id);
-      }
+      if (!reset) await this.finalizeSwitchedTimelinePrefix(id, prefix);
       this.paseoToolPolicies.set(id, paseoToolPolicy);
       this.promptedMainControlRoleVersions.delete(id);
       this.pendingHierarchySessionReloads.delete(id);
@@ -5183,6 +5289,26 @@ export class AgentManager {
       }
       throw error;
     }
+  }
+
+  private async readCommittedTimelineRows(agentId: string): Promise<AgentTimelineRow[]> {
+    return (await this.durableTimelineStore?.getCommittedRows(agentId)) ?? [];
+  }
+
+  private async readResetTimelineRows(agentId: string, reset?: ResetAgentSessionOptions) {
+    if (!reset) return [];
+    await this.durableTimelineWriteTails.get(agentId);
+    return this.readCommittedTimelineRows(agentId);
+  }
+
+  private async finalizeSwitchedTimelinePrefix(id: string, prefix: PersistedTimelinePrefix) {
+    // The staged file is already readable as committed if this cleanup fails.
+    await this.timelinePrefixes.save(id, prefix).catch((err) => {
+      this.logger.warn({ err, agentId: id }, "Failed to finalize the timeline prefix");
+    });
+    this.clearProviderBackgroundWork(id);
+    this.cancelRunningProviderSubagents(id);
+    this.timelineStore.sealPrefix(id);
   }
 
   private async drainAgentEventsBeforeSessionSwitch(agent: ActiveManagedAgent): Promise<void> {
@@ -7411,6 +7537,57 @@ export class AgentManager {
     });
   }
 
+  markTeamConclusionUnread(agentId: string, workspaceId: string): Promise<void> {
+    return this.runLifecycleMutation(agentId, async () => {
+      const workspace = await this.workspaceRegistry?.get(workspaceId);
+      if (this.workspaceRegistry && (!workspace?.topic || workspace.archivedAt)) return;
+
+      const stored = await this.registry?.get(agentId);
+      if (stored?.archivedAt || this.pendingHierarchyArchives.has(agentId)) return;
+      const live = this.agents.get(agentId);
+      const target = live ?? stored;
+      if (!target || target.workspaceId !== workspaceId) return;
+      if (!isMainControlAgentLabels(target.labels) || !raisesAttention(target)) return;
+
+      if (live) {
+        await this.markLiveTeamConclusionUnread(live);
+      } else if (stored) {
+        await this.markStoredTeamConclusionUnread(stored);
+      }
+    });
+  }
+
+  private async markLiveTeamConclusionUnread(agent: ManagedAgent): Promise<void> {
+    const { attention, pendingPermissions } = agent;
+    if (
+      pendingPermissions.size ||
+      (attention.requiresAttention && attention.attentionReason !== "finished")
+    )
+      return;
+    agent.attention = {
+      requiresAttention: true,
+      attentionReason: "finished",
+      attentionTimestamp: this.nextAttentionTimestamp(agent),
+    };
+    await this.persistSnapshot(agent);
+    this.dispatch({ type: "agent_state", agent: { ...agent } });
+  }
+
+  private async markStoredTeamConclusionUnread(record: StoredAgentRecord): Promise<void> {
+    if (record.requiresAttention && record.attentionReason !== "finished") return;
+    const updatedAt = this.nextStoredUpdatedAt(record);
+    const previous = Date.parse(record.attentionTimestamp ?? "") || 0;
+    const nextRecord: StoredAgentRecord = {
+      ...record,
+      updatedAt,
+      requiresAttention: true,
+      attentionReason: "finished",
+      attentionTimestamp: new Date(Math.max(Date.parse(updatedAt), previous + 1)).toISOString(),
+    };
+    await this.requireRegistry().upsert(nextRecord);
+    this.dispatchStoredAgentState(nextRecord);
+  }
+
   private matchesLiveTeamConclusion(
     agent: ManagedAgent,
     expected: TeamConclusionAttentionExpectation,
@@ -7813,6 +7990,11 @@ export class AgentManager {
           .filter((entry) => isTaskBindingObservation(entry, accepted))
           .map((entry) => entry.event);
       },
+      touchedFiles: (messageId: string) => {
+        const accepted = observed.find((entry) => entry.messageId === messageId);
+        if (!accepted?.session || !accepted.turnId) return [];
+        return [...(this.touchedFilesBySession.get(accepted.session)?.get(accepted.turnId) ?? [])];
+      },
       close: () => {
         captures.delete(capture);
         if (!captures.size) this.taskBindingCaptures.delete(agentId);
@@ -7949,20 +8131,19 @@ export class AgentManager {
 
   captureTaskReport(agentId: string): TaskReportAttribution | undefined {
     const agent = this.agents.get(agentId);
-    if (!agent?.session || !this.taskLedger || !agent.workspaceId) return undefined;
+    if (!agent?.session) return undefined;
     const serverId = this.serverId ?? "self";
     const parent = getParentAddressFromLabels(agent.labels, serverId);
-    if (parent?.serverId !== serverId) return undefined;
     const turnId = agent.activeForegroundTurnId ?? agent.activeTurnId ?? undefined;
+    const topicTask = this.topicTaskForForegroundTurn(agent, turnId, true);
     const ownRun = this.taskRunForReport(agentId, agent.session, turnId);
     // Queue this read at report invocation. A slow report can only update tasks
     // already bound here, or a new binding that confirmed this very submission.
-    const previousTasks = this.listTasksBoundToAgent(
-      agent.workspaceId,
-      agentId,
-      parent.agentId,
-      serverId,
-    );
+    const previousTasks =
+      !topicTask && this.taskLedger && agent.workspaceId && parent?.serverId === serverId
+        ? this.listTasksBoundToAgent(agent.workspaceId, agentId, parent.agentId, serverId)
+        : undefined;
+    if (!topicTask && !previousTasks) return undefined;
     return {
       agent: { ...agent },
       deliveryTurnId: turnId ?? ownRun?.token,
@@ -7973,8 +8154,198 @@ export class AgentManager {
       },
       order: nextTaskEventOrder(),
       previousTasks,
+      topicTask,
       pending: ownRun,
+      touchedFiles: turnId ? this.getTurnTouchedFiles(agentId, turnId) : [],
     };
+  }
+
+  private topicTaskForForegroundTurn(
+    agent: ActiveManagedAgent,
+    turnId: string | undefined,
+    suppressPendingFallback = false,
+  ): TopicTaskScope | undefined {
+    const run = this.runs.getPendingRun(agent.id);
+    if (!run || run.settled) return;
+    const topicTask = this.topicTaskRuns.get(run);
+    if (topicTask?.session !== agent.session) return;
+    // A report can arrive before the provider acknowledges the topic turn.
+    // Until it does, allow ordinary delivery without borrowing a task from labels.
+    if (suppressPendingFallback && run.start.status === "pending" && !turnId)
+      return { ...topicTask.scope, taskId: undefined };
+    if (
+      run.start.status === "started" &&
+      run.start.turnId === turnId &&
+      agent.activeForegroundTurnId === turnId &&
+      agent.activeTurnId === turnId
+    )
+      return topicTask.scope;
+  }
+
+  getTurnTouchedFiles(agentId: string, turnId: string): string[] {
+    const session = this.agents.get(agentId)?.session;
+    if (!session) return [];
+    return [...(this.touchedFilesBySession.get(session)?.get(turnId) ?? [])];
+  }
+
+  isActiveTurnHumanInitiated(agentId: string): boolean {
+    const agent = this.agents.get(agentId);
+    const run = this.runs.getPendingRun(agentId);
+    return Boolean(
+      agent?.session &&
+      run?.start.status === "started" &&
+      !run.settled &&
+      this.humanPromptRuns.get(run) === agent.session &&
+      agent.activeForegroundTurnId === run.start.turnId &&
+      agent.activeTurnId === run.start.turnId &&
+      !this.isTaskAgentArchivePending(agentId),
+    );
+  }
+
+  private async captureTaskToolWrite(
+    agent: ActiveManagedAgent,
+    capture: {
+      workspaceId: string;
+      turnId: string;
+      topicTask?: TopicTaskScope;
+      extractPaths: (workspaceCwd: string) => string[];
+    },
+  ): Promise<void> {
+    const { id, session, cwd } = agent;
+    const { workspaceId, turnId, topicTask, extractPaths } = capture;
+    // Freeze the task binding and parent link before either registry read can yield.
+    const labels = agent.labels;
+    const workspace = await this.workspaceRegistry?.get(workspaceId).catch((err: unknown) => {
+      this.logger.warn(
+        { err, agentId: id, workspaceId, turnId },
+        "Unable to read workspace for task file write",
+      );
+      return null;
+    });
+    if (this.workspaceRegistry && (!workspace || workspace.archivedAt)) return;
+    if (
+      this.agents.get(id) !== agent ||
+      agent.workspaceId !== workspaceId ||
+      agent.session !== session
+    )
+      return;
+    const paths = extractPaths(workspace?.cwd ?? cwd);
+    if (!paths.length) return;
+    this.rememberTurnTouchedFiles(session, turnId, paths);
+    this.trackBackgroundTask(
+      this.persistTaskToolWrite(id, workspaceId, labels, paths, topicTask).catch((err: unknown) =>
+        this.logger.warn(
+          { err, agentId: id, workspaceId, turnId },
+          "Unable to record task file write",
+        ),
+      ),
+    );
+  }
+
+  private rememberTurnTouchedFiles(session: AgentSession, turnId: string, paths: string[]): void {
+    const turns = this.touchedFilesBySession.get(session) ?? new Map<string, string[]>();
+    const previous = turns.get(turnId) ?? [];
+    const next = mergeTouchedFiles(previous, paths);
+    turns.set(turnId, next);
+    this.touchedFilesBySession.set(session, turns);
+    if (turns.size > 8) {
+      const oldest = turns.keys().next();
+      if (!oldest.done) turns.delete(oldest.value);
+    }
+  }
+
+  private async readTaskWriteAncestor(id: string, workspaceId: string) {
+    if (this.isTaskAgentArchivePending(id)) return null;
+    const live = this.agents.get(id);
+    if (live && this.taskLedgerArchivedRuntimes.has(live)) return null;
+    const stored = live ? undefined : await this.registry?.get(id);
+    if (stored?.archivedAt) return null;
+    const ancestor = live ?? stored;
+    return ancestor?.workspaceId === workspaceId && !ancestor.internal ? ancestor : null;
+  }
+
+  private async resolveTaskWriteChild(
+    agentId: string,
+    workspaceId: string,
+    labels: ManagedAgent["labels"],
+    serverId: string,
+  ) {
+    const parent = getParentAddressFromLabels(labels, serverId);
+    if (!parent || parent.serverId !== serverId || parent.agentId === agentId) return;
+    const firstParent = await this.readTaskWriteAncestor(parent.agentId, workspaceId);
+    if (!firstParent) return;
+    if (isMainControlAgentLabels(firstParent.labels))
+      return { lead: { id: agentId, labels }, mainId: firstParent.id };
+    const top = getParentAddressFromLabels(firstParent.labels, serverId);
+    if (
+      !top ||
+      top.serverId !== serverId ||
+      top.agentId === agentId ||
+      top.agentId === firstParent.id
+    )
+      return;
+    const main = await this.readTaskWriteAncestor(top.agentId, workspaceId);
+    if (!main || !isMainControlAgentLabels(main.labels)) return;
+    return { lead: firstParent, mainId: main.id };
+  }
+
+  private async persistTaskToolWrite(
+    agentId: string,
+    workspaceId: string,
+    labels: ManagedAgent["labels"],
+    paths: string[],
+    topicTask?: TopicTaskScope,
+  ): Promise<void> {
+    const ledger = this.taskLedger;
+    if (!ledger) return;
+    // An explicit topic without an active binding must never fall back to the agent label.
+    if (topicTask && (topicTask.workspaceId !== workspaceId || !topicTask.taskId)) return;
+    if (
+      topicTask?.taskId &&
+      topicTask.mainAgentId === agentId &&
+      isMainControlAgentLabels(labels)
+    ) {
+      await ledger.addTouchedFiles(workspaceId, topicTask.taskId, paths);
+      return;
+    }
+    const serverId = this.serverId ?? "self";
+    const child = await this.resolveTaskWriteChild(agentId, workspaceId, labels, serverId);
+    if (!child) return;
+    const { lead, mainId } = child;
+    if (topicTask && topicTask.mainAgentId !== mainId) return;
+    const taskId = topicTask?.taskId ?? lead.labels[TASK_ID_LABEL]?.trim();
+    const tasks = await ledger.list(workspaceId);
+    const candidates = tasks.filter(
+      (task) =>
+        isActiveWorkspaceTask(task) &&
+        (!taskId || task.taskId === taskId) &&
+        ((task.leadAgentId === lead.id && (task.leadServerId ?? serverId) === serverId) ||
+          task.participants.some(
+            (participant) =>
+              participant.agentId === lead.id &&
+              isTaskParticipantAddress(participant, mainId, serverId),
+          )),
+    );
+    // Legacy agents have no task label. Never guess among multiple active bindings.
+    const [task] = candidates;
+    if (task && candidates.length === 1)
+      await ledger.addTouchedFiles(workspaceId, task.taskId, paths);
+  }
+
+  private captureLiveTaskToolWrite(agent: ActiveManagedAgent, event: AgentStreamEvent) {
+    if (!this.taskLedger || event.type !== "timeline" || event.item.type !== "tool_call") return;
+    const { activeTurnId: turnId, workspaceId, internal, background, session, cwd } = agent;
+    if (!turnId || (event.turnId && event.turnId !== turnId)) return;
+    if (!workspaceId || internal || background || this.historySessions.has(session)) return;
+    if (this.taskLedgerArchivedRuntimes.has(agent)) return;
+    const extractPaths = prepareModifiedPathsFromToolCall(event.item, cwd);
+    if (!extractPaths) return;
+    return this.captureTaskToolWrite(agent, {
+      workspaceId,
+      turnId,
+      extractPaths,
+      topicTask: this.topicTaskForForegroundTurn(agent, turnId),
+    });
   }
 
   private taskRunForReport(agentId: string, session: AgentSession, turnId: string | undefined) {
@@ -8017,28 +8388,62 @@ export class AgentManager {
     const agent = attribution?.agent ?? this.agents.get(agentId);
     if (!agent) return;
     const kind = status === "blocked" ? "reported_blocked" : "reported_completed";
+    const event = taskEvent(
+      agentId,
+      kind,
+      agent.resetEpoch,
+      undefined,
+      messageId,
+      attribution?.order,
+    );
+    if (attribution?.topicTask)
+      return this.recordScopedTopicReport(agent, event, attribution.topicTask);
     const pending = attribution?.pending;
     const handoff = pending && this.taskHandoffRuns.get(pending);
+    const previousTasks = attribution?.previousTasks;
     const persist = this.observeTaskLedgerEvent(
       agent,
-      taskEvent(agentId, kind, agent.resetEpoch, undefined, messageId, attribution?.order),
+      event,
       attribution?.correlation,
-      attribution &&
+      previousTasks &&
         (async () => {
           if (pending?.start.status === "pending") {
             await Promise.race([pending.turnStartedPromise, pending.settledPromise]);
           }
           if (pending && !handoff?.dispatchId) return () => false;
-          const previousTasks = await attribution.previousTasks;
+          const boundTasks = await previousTasks;
           return (task: WorkspaceTask) =>
-            previousTasks.has(task.taskId) ||
+            boundTasks.has(task.taskId) ||
             (!!handoff?.dispatchId &&
-              task.events?.some((event) => event.id === handoff.dispatchId) === true);
+              task.events?.some(({ id }) => id === handoff.dispatchId) === true);
         }),
     );
     // A provider may wait for the report tool before acknowledging the prompt.
     if (pending?.start.status === "pending") this.trackBackgroundTask(persist);
     else await persist;
+  }
+
+  private async recordScopedTopicReport(
+    agent: TaskLedgerAgent,
+    event: TaskEvent,
+    { workspaceId, mainAgentId, taskId }: TopicTaskScope,
+  ) {
+    const serverId = this.serverId ?? "self";
+    const parent = getParentAddressFromLabels(agent.labels, serverId);
+    if (
+      !taskId ||
+      workspaceId !== agent.workspaceId ||
+      parent?.serverId !== serverId ||
+      parent.agentId !== mainAgentId
+    )
+      return;
+    await this.observeTaskLedgerEvent(
+      agent,
+      event,
+      {},
+      async () => (task) => task.taskId === taskId,
+      false,
+    );
   }
 
   private recordTaskDispatch(
@@ -8073,6 +8478,7 @@ export class AgentManager {
     event: TaskEvent,
     correlation: Omit<TaskLedgerObservation, "event"> = {},
     selectTasks?: () => Promise<(task: WorkspaceTask) => boolean>,
+    collectForBinding = true,
   ): Promise<void> {
     const { id, workspaceId } = agent;
     if (
@@ -8087,7 +8493,7 @@ export class AgentManager {
     const parent = getParentAddressFromLabels(agent.labels, serverId);
     if (!parent || parent.serverId !== serverId || parent.agentId === id) return;
 
-    for (const capture of this.taskBindingCaptures.get(id) ?? []) {
+    for (const capture of (collectForBinding && this.taskBindingCaptures.get(id)) || []) {
       if (capture.workspaceId !== workspaceId) continue;
       capture.observed.push({ event, ...correlation });
       if (capture.observed.length > taskEventLimit * 2) capture.observed.shift();
@@ -8596,6 +9002,8 @@ export class AgentManager {
       this.runs.settleForegroundRun(agentId, pendingRun.token);
       return null;
     }
+    let notification: FinishRegistration | undefined;
+    let notify = false;
     try {
       const handoff = this.contextHandoffs.get(agentId);
       const roleVersion = this.mainControlRoleVersions.get(agentId) ?? 0;
@@ -8614,7 +9022,11 @@ export class AgentManager {
         promptStart,
       );
       const providerPrompt = composed ? await composed : prompt;
+      if (isExplicitParentReportingLabels(agent.labels)) {
+        notification = await this.registerExceptionalParentFinish?.(agent);
+      }
       const result = await this.startAdmittedProviderTurn(params, providerPrompt, ledger?.valid);
+      notify = true;
       if (ledger) {
         const sessionId = ledger.sessionId ?? session.describePersistence()?.sessionId;
         this.promptedTaskLedger.set(session, { sessionId, text: ledger.text });
@@ -8625,13 +9037,38 @@ export class AgentManager {
       this.assertPendingTurnStart(agentId, pendingRun);
       return result.turnId;
     } catch (error) {
-      return this.finishFailedForegroundStart(params, error);
+      return await this.finishFailedForegroundStart(params, error, () => {
+        notify = true;
+      });
+    } finally {
+      if (notification)
+        await this.settleExceptionalFinishRegistration(agentId, notification, notify);
     }
+  }
+
+  private async settleExceptionalFinishRegistration(
+    agentId: string,
+    notification: FinishRegistration,
+    accepted: boolean,
+  ) {
+    if (accepted) {
+      notification.accept();
+      return;
+    }
+    await notification
+      .reject()
+      .catch((err) =>
+        this.logger.warn(
+          { err, agentId },
+          "Failed to remove rejected exceptional finish subscription",
+        ),
+      );
   }
 
   private async finishFailedForegroundStart(
     params: Parameters<AgentManager["startPendingForegroundTurn"]>[0],
     error: unknown,
+    onProviderError?: () => void,
   ): Promise<null> {
     const { agent, agentId, pendingRun, prompt, options } = params;
     const rewind = this.settleFailedRewindStart(params, error);
@@ -8693,6 +9130,7 @@ export class AgentManager {
         error: errorMsg,
       });
       this.finalizeForegroundTurn(agent);
+      onProviderError?.();
     } finally {
       // A steer waiting on this start is released only once the run is cleared.
       this.runs.settleForegroundRun(agentId, pendingRun.token);
@@ -9065,6 +9503,19 @@ export class AgentManager {
     }
   }
 
+  private recordForegroundRunMetadata(
+    pendingRun: PendingForegroundRun,
+    session: AgentSession,
+    prompt: AgentPromptInput,
+    options?: ForegroundRunMetadata,
+    promptStart?: ForegroundPromptStart,
+  ): void {
+    const topicTask = options?.[topicFollowup];
+    if (topicTask) this.topicTaskRuns.set(pendingRun, { session, scope: topicTask });
+    if (isDirectHumanPrompt(options, promptStart, prompt))
+      this.humanPromptRuns.set(pendingRun, session);
+  }
+
   private reserveAgentRun(
     agentId: string,
     prompt: AgentPromptInput,
@@ -9122,6 +9573,7 @@ export class AgentManager {
 
     const pendingRun = this.runs.createPendingRun(agentId);
     promptStart?.bind(pendingRun);
+    this.recordForegroundRunMetadata(pendingRun, agent.session, prompt, options, promptStart);
 
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string | null;
@@ -9327,6 +9779,7 @@ export class AgentManager {
       return { status: "unavailable" };
     }
     const result = await this.runSteerAdmission(agent, expectedTurnId, async () => {
+      this.revokeHumanPromptRun(agentId);
       const admission = await agent.session.steerActiveTurn!(prompt, {
         ...options,
         expectedTurnId,
@@ -9387,13 +9840,16 @@ export class AgentManager {
               if (taskAdmission) assertTaskDispatchAdmission(taskAdmission, agentId);
             };
             const steer = (beforeProviderDispatch?: () => Promise<void>) => {
-              const send = (providerPrompt: AgentPromptInput) =>
-                agent.session.steerActiveTurn!(providerPrompt, {
+              const send = (providerPrompt: AgentPromptInput) => {
+                if (!isDirectHumanPrompt(options, promptStart, prompt))
+                  this.revokeHumanPromptRun(agentId);
+                return agent.session.steerActiveTurn!(providerPrompt, {
                   ...options,
                   expectedTurnId,
                   beforeProviderDispatch,
                   assertProviderDispatchAllowed: taskAdmission ? assertSteerAllowed : undefined,
                 });
+              };
               const topicPrompt = this.prepareTopicProviderPrompt(agent, prompt, promptStart);
               if (!topicPrompt) return send(prompt);
               return topicPrompt.then((providerPrompt) => {
@@ -9467,6 +9923,11 @@ export class AgentManager {
         promptStart,
       ),
     };
+  }
+
+  private revokeHumanPromptRun(agentId: string): void {
+    const run = this.runs.getPendingRun(agentId);
+    if (run) this.humanPromptRuns.delete(run);
   }
 
   private assertSteerAdmissionOwnsTurn(agent: ActiveManagedAgent, expectedTurnId: string): void {
@@ -10343,6 +10804,33 @@ export class AgentManager {
     });
   }
 
+  private async preserveLiveTopicHistory(
+    agent: ActiveManagedAgent,
+    topic: { workspaceId: string; mainAgentId: string },
+    prefix: PersistedTimelinePrefix | null,
+    durableRows: readonly AgentTimelineRow[],
+    liveRows: readonly AgentTimelineRow[],
+  ): Promise<void> {
+    let rows = this.mergeResetTimelineRows(durableRows, prefix?.rows ?? [], liveRows);
+    if (!agent.historyPrimed) {
+      // A normal hydration rewrites the committed timeline. Read the old provider
+      // history into memory so a failed anchor write leaves the timeline intact.
+      const history: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
+      for await (const event of agent.session.streamHistory()) {
+        if (event.type !== "timeline") continue;
+        for (const item of projectAgentMessages(event.item)) history.push({ ...event, item });
+      }
+      rows = this.appendResetHistory(
+        agent.id,
+        prefix,
+        rows,
+        history,
+        agent.createdAt.toISOString(),
+      );
+    }
+    await this.preserveTopicHistory!(topic, rows);
+  }
+
   private async rewindConversation(
     agent: ActiveManagedAgent,
     input: {
@@ -10361,6 +10849,26 @@ export class AgentManager {
     if (this.hasInFlightRun(agentId)) throw new Error("Agent has an active run");
     const lock = this.runs.createPendingRun(agentId);
     try {
+      if (
+        agent.session.capabilities.supportsRewindConversation &&
+        agent.session.revertConversation
+      ) {
+        const topic = await this.topicHistoryScope(agent);
+        if (topic) {
+          await this.durableTimelineWriteTails.get(agentId);
+          const prefix =
+            this.contextHandoffs.get(agentId)?.prefix ??
+            (await this.timelinePrefixes.load(agentId));
+          const rows = await this.readCommittedTimelineRows(agentId);
+          await this.preserveLiveTopicHistory(
+            agent,
+            topic,
+            prefix,
+            rows,
+            this.timelineStore.getRows(agentId),
+          );
+        }
+      }
       this.logger.info({ agentId, provider: agent.provider, messageId }, "agent.rewind.start");
       await invokeRewindCapability(agent.session, {
         messageId: providerMessageId,
@@ -11668,6 +12176,8 @@ export class AgentManager {
       "agent.manager.dispatch_session_event",
     );
 
+    const taskToolWrite = this.captureLiveTaskToolWrite(agent, event);
+    if (taskToolWrite) await taskToolWrite;
     const shouldNotifyWaiters = await this.handleStreamEvent(agent, event);
 
     if (!shouldNotifyWaiters) {

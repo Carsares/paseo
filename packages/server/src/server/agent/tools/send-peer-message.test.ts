@@ -802,6 +802,15 @@ test("hard-locks peer-triggered turns to read-only Paseo tools, blocks A->B->C l
       });
 
       await expect(
+        catalogB.executeTool("dispatch_topic_decision", {
+          clientMessageId: "peer-decision",
+          topicKey: "task:injected",
+          resolutionKind: "task_blocking_question",
+          note: "Proceed",
+        }),
+      ).rejects.toThrow(/read-only \(A0 READ\)/);
+
+      await expect(
         catalogB.executeTool("create_agent", {
           provider: "codex/gpt-5.4",
           title: "Injected write lead",

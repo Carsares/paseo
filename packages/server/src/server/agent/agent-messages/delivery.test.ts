@@ -179,6 +179,42 @@ test("flushes one tagged task without resetting other tasks or the legacy inbox"
   await scenario.delivery.close();
 });
 
+test("finds other task reports until the provider confirms their delivery", async () => {
+  const { clock, delivery, dispatch, report } = inboxScenario();
+  const admitted = Promise.withResolvers<void>();
+  const accepted = Promise.withResolvers<void>();
+  dispatch.mockImplementationOnce(async (batch) => {
+    expect(batch.admit()).toBe(true);
+    admitted.resolve();
+    await accepted.promise;
+    return "turn_started";
+  });
+  const first = report("first", {
+    source: { kind: "agent-message", agentId: "first", reportStatus: "completed", taskId: "task" },
+  });
+  report("second", {
+    source: { kind: "agent-message", agentId: "second", taskId: "other-task" },
+    childReported: true,
+  });
+  report("message", { source: { kind: "agent-message", agentId: "second", taskId: "task" } });
+  expect(delivery.hasPendingTaskReport("main", "task")).toBe(true);
+  expect(delivery.hasPendingTaskReport("main", "task", first.messageId)).toBe(false);
+  expect(delivery.hasPendingTaskReport("main", "other-task")).toBe(true);
+  expect(delivery.hasPendingTaskReport("another-parent", "task")).toBe(false);
+
+  delivery.flushInbox?.("main", "task");
+  expect(delivery.getInbox?.("main")?.items).toMatchObject([{ taskId: "other-task" }]);
+  expect(delivery.hasPendingTaskReport("main", "task")).toBe(true);
+  clock.advance(2_000);
+  await admitted.promise;
+  expect(delivery.hasPendingTaskReport("main", "task")).toBe(true);
+  accepted.resolve();
+  await first.dispatched;
+  expect(delivery.hasPendingTaskReport("main", "task")).toBe(false);
+  expect(delivery.hasPendingTaskReport("main", "other-task")).toBe(true);
+  await delivery.close();
+});
+
 test("retains a queued report's original routing fields when the sender reuses its source object", async () => {
   const scenario = inboxScenario();
   const source = {

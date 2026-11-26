@@ -25,6 +25,7 @@ import { createServer as createHTTPServer, type IncomingMessage, type ServerResp
 import { constants, existsSync, unlinkSync } from "fs";
 import { open, rm, stat } from "fs/promises";
 import { randomUUID } from "node:crypto";
+import { getParentAddressFromLabels } from "@getpaseo/protocol/agent-labels";
 import { getCachedHostMachineKind, primeHostMachineKind } from "./host-machine-kind.js";
 import { getHostName } from "./host-name.js";
 import path from "node:path";
@@ -1098,6 +1099,10 @@ export async function createPaseoDaemon(
     registry: agentStorage,
     taskLedger,
     workspaceRegistry,
+    preserveTopicHistory: (scope, rows) => {
+      if (!wsServer) throw new Error("Topic history storage is unavailable.");
+      return wsServer.preserveTopicHistory(scope, rows);
+    },
     getAgentProfile: (id) =>
       daemonConfigStore.get().agentProfiles?.find((profile) => profile.id === id),
     appendSystemPrompt: config.appendSystemPrompt,
@@ -1732,6 +1737,29 @@ export async function createPaseoDaemon(
   });
 
   agentManager.setCancelAutomaticParentSubscription(finishSubscriptions.cancelAutomaticParent);
+  agentManager.setExceptionalParentFinishRegistration(async (agent) => {
+    const parent = getParentAddressFromLabels(agent.labels, serverId);
+    if (!parent || parent.agentId === agent.id) return;
+    return finishSubscriptions.register(
+      {
+        childAgentId: agent.id,
+        callerAgentId: parent.agentId,
+        callerServerId: parent.serverId,
+        requireParentOwnership: true,
+        automaticParent: false,
+        exceptionalOnly: true,
+        followupReport: parent.serverId !== serverId,
+        canRegister: () => {
+          const current = getParentAddressFromLabels(
+            agentManager.getAgent(agent.id)?.labels,
+            serverId,
+          );
+          return current?.agentId === parent.agentId && current.serverId === parent.serverId;
+        },
+      },
+      true,
+    );
+  });
 
   const idleRuntimeCleanup = createIdleRuntimeCleanup({
     enabled: daemonConfigStore.get().idleRuntimeCleanup !== false,
@@ -1890,6 +1918,17 @@ export async function createPaseoDaemon(
     callerAgentId: runtime.callerAgentId,
     verifiedCallerAgentId: runtime.verifiedCallerAgentId,
     taskLedger,
+    getWorkspaceSituation: (...args) => {
+      if (!wsServer) throw new Error("Workspace situation is unavailable on this host.");
+      return wsServer.getWorkspaceSituation(...args);
+    },
+    decideTopicAction: (request, actor) => {
+      if (!wsServer || dependencies.serverFeatureOverrides?.workspaceButlerV1 === false)
+        throw new Error("Topic decisions are unavailable on this host.");
+      return wsServer.decideTopicAction(request, actor);
+    },
+    upsertTopicAnchor: async (anchor) => wsServer?.persistTopicAnchor(anchor),
+    listTopicEntries: async (scope) => (await wsServer?.listTopicEntries(scope)) ?? [],
     enableVoiceTools: runtime.enableVoiceTools,
     voiceOnly: runtime.voiceOnly,
     resolveSpeakHandler: (agentId) => wsServer?.resolveVoiceSpeakHandler(agentId) ?? null,

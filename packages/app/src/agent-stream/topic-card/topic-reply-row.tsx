@@ -274,7 +274,137 @@ const ThreadEntryStatusBadge = memo(function ThreadEntryStatusBadge({
   return null;
 });
 
+type ThreadEntryValue = Extract<TopicReplyItem, { kind: "thread_entry" }>["entry"];
+
+function resolveThreadReportStatus(entry: ThreadEntryValue): AgentSourceStatus {
+  if (entry.status === "error") return "error";
+  if (entry.reportStatus === "blocked") return "blocked";
+  return "completed";
+}
+
+function resolveThreadAuthorLabel(
+  entry: ThreadEntryValue,
+  t: ReturnType<typeof useTranslation>["t"],
+): string {
+  if (entry.origin === "subagent_report") {
+    return entry.authorTitle?.trim() || t("topicWorkbench.topicStream.leadFallbackName");
+  }
+  if (entry.role === "user_followup") {
+    if (entry.origin === "butler_dispatch") {
+      return t("topicWorkbench.topicStream.butlerDispatchLabel");
+    }
+    if (entry.origin === "decision_reply") {
+      return t("topicWorkbench.topicStream.decisionReplyLabel");
+    }
+    return t("topicWorkbench.topicStream.followupLabel");
+  }
+  if (entry.role === "system_note") {
+    return t("topicWorkbench.topicStream.decisionSettledLabel");
+  }
+  return entry.authorTitle || t("topicWorkbench.topicStream.mainConclusionLabel");
+}
+
+const ThreadEntryActions = memo(function ThreadEntryActions({
+  entry,
+  showActions,
+  onConvertToTodo,
+  onOpenBeside,
+}: {
+  entry: ThreadEntryValue;
+  showActions: boolean;
+  onConvertToTodo: () => void;
+  onOpenBeside: () => void;
+}) {
+  const { t } = useTranslation();
+  const isUserFollowup = entry.role === "user_followup";
+  const isSystemNote = entry.role === "system_note";
+
+  return (
+    <View
+      style={[styles.actionsGroup, showActions ? styles.actionsVisible : styles.actionsHidden]}
+      pointerEvents={showActions ? "auto" : "none"}
+    >
+      {!isUserFollowup && !isSystemNote ? (
+        <ToolbarButton
+          compact
+          label={t("topicWorkbench.topicStream.convertToTodo")}
+          onPress={onConvertToTodo}
+          testID={`topic-reply-todo-${entry.entryId}`}
+        >
+          <ThemedCheckSquare size={13} />
+        </ToolbarButton>
+      ) : null}
+      {!isUserFollowup && entry.authorAgentId ? (
+        <ToolbarButton
+          compact
+          label={t("topicWorkbench.topicStream.openLeadBeside")}
+          onPress={onOpenBeside}
+          testID={`topic-reply-open-beside-${entry.entryId}`}
+        >
+          <ThemedColumns2 size={13} />
+        </ToolbarButton>
+      ) : null}
+    </View>
+  );
+});
+
+const ThreadEntryFooter = memo(function ThreadEntryFooter({
+  entryId,
+  isLong,
+  expanded,
+  canRetry,
+  isRetrying,
+  onToggleExpand,
+  onRetry,
+}: {
+  entryId: string;
+  isLong: boolean;
+  expanded: boolean;
+  canRetry: boolean;
+  isRetrying: boolean;
+  onToggleExpand: () => void;
+  onRetry?: () => void;
+}) {
+  const { t } = useTranslation();
+  if (!isLong && !canRetry) return null;
+
+  return (
+    <View style={styles.rowFooter}>
+      {isLong ? (
+        <PressHighlight
+          accessibilityRole="button"
+          onPress={onToggleExpand}
+          style={styles.expandToggle}
+          testID={`topic-reply-expand-${entryId}`}
+        >
+          {expanded ? <ThemedChevronDown size={13} /> : <ThemedChevronRight size={13} />}
+          <Text style={styles.expandLabel}>
+            {t(
+              expanded
+                ? "agentStream.source.actions.collapse"
+                : "agentStream.source.actions.viewDetails",
+            )}
+          </Text>
+        </PressHighlight>
+      ) : null}
+      {canRetry ? (
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={isRetrying}
+          onPress={onRetry}
+          testID={`topic-reply-retry-${entryId}`}
+        >
+          <ThemedRetry size={12} />
+          {t("topicWorkbench.topicStream.retryInTopic")}
+        </Button>
+      ) : null}
+    </View>
+  );
+});
+
 const ThreadEntryRow = memo(function ThreadEntryRow({
+  disclosureKey,
   reply,
   showActions,
   isRetrying,
@@ -283,6 +413,7 @@ const ThreadEntryRow = memo(function ThreadEntryRow({
   onOpenBeside,
   onRetry,
 }: {
+  disclosureKey: string | null;
   reply: Extract<TopicReplyItem, { kind: "thread_entry" }>;
   showActions: boolean;
   isRetrying: boolean;
@@ -292,17 +423,41 @@ const ThreadEntryRow = memo(function ThreadEntryRow({
   onRetry?: () => void;
 }) {
   const { t } = useTranslation();
-  const isUserFollowup = reply.entry.role === "user_followup";
-  const authorLabel = isUserFollowup
-    ? t("topicWorkbench.topicStream.followupLabel")
-    : reply.entry.authorTitle || t("topicWorkbench.topicStream.mainConclusionLabel");
-  const canRetry = Boolean(onRetry && reply.entry.status === "error");
+  const hold = useDisclosureHold();
+  const [localExpanded, setLocalExpanded] = useState(false);
+  const storeExpanded = useTopicStreamViewStore((state) =>
+    disclosureKey ? (state.expandedHistoryByTopicKey[disclosureKey] ?? false) : false,
+  );
+  const setHistoryExpanded = useTopicStreamViewStore((state) => state.setHistoryExpanded);
+  const expanded = disclosureKey ? storeExpanded : localExpanded;
+  const toggleExpand = useCallback(() => {
+    hold(
+      () => {
+        if (disclosureKey) {
+          setHistoryExpanded(disclosureKey, !expanded);
+        } else {
+          setLocalExpanded(toggleBoolean);
+        }
+      },
+      { triggerEdge: "bottom" },
+    );
+  }, [disclosureKey, expanded, hold, setHistoryExpanded]);
+
+  const entry = reply.entry;
+  const isSilentReport = entry.origin === "subagent_report";
+  const isUserFollowup = entry.role === "user_followup";
+  const reportStatus = resolveThreadReportStatus(entry);
+  const authorLabel = resolveThreadAuthorLabel(entry, t);
+  const isLong = isSilentReport && entry.text.length > COLLAPSE_THRESHOLD_CHARS;
+  const displayText =
+    isLong && !expanded ? `${entry.text.slice(0, COLLAPSE_THRESHOLD_CHARS)}…` : entry.text;
+  const canRetry = Boolean(onRetry && entry.status === "error");
 
   return (
     <HoverEnvelope
       style={styles.rowHoverEnvelope}
       onHoverChange={onHoverChange}
-      testID={`topic-reply-thread-${reply.entry.entryId}`}
+      testID={`topic-reply-thread-${entry.entryId}`}
     >
       <View
         style={[
@@ -311,53 +466,36 @@ const ThreadEntryRow = memo(function ThreadEntryRow({
         ]}
       >
         <View style={styles.rowHeader}>
-          <ThemedCornerDownRight size={13} />
+          {isSilentReport ? (
+            <StatusBadge
+              size="xs"
+              variant={statusVariant(reportStatus)}
+              label={t(statusLabelKey(reportStatus))}
+            />
+          ) : (
+            <ThemedCornerDownRight size={13} />
+          )}
           <Text style={styles.senderTitle} numberOfLines={1}>
             {authorLabel}
           </Text>
-          <ThreadEntryStatusBadge status={reply.entry.status} />
-          <View
-            style={[
-              styles.actionsGroup,
-              showActions ? styles.actionsVisible : styles.actionsHidden,
-            ]}
-            pointerEvents={showActions ? "auto" : "none"}
-          >
-            {!isUserFollowup ? (
-              <ToolbarButton
-                compact
-                label={t("topicWorkbench.topicStream.convertToTodo")}
-                onPress={onConvertToTodo}
-              >
-                <ThemedCheckSquare size={13} />
-              </ToolbarButton>
-            ) : null}
-            {!isUserFollowup && reply.entry.authorAgentId ? (
-              <ToolbarButton
-                compact
-                label={t("topicWorkbench.topicStream.openLeadBeside")}
-                onPress={onOpenBeside}
-              >
-                <ThemedColumns2 size={13} />
-              </ToolbarButton>
-            ) : null}
-          </View>
+          {!isSilentReport ? <ThreadEntryStatusBadge status={entry.status} /> : null}
+          <ThreadEntryActions
+            entry={entry}
+            showActions={showActions}
+            onConvertToTodo={onConvertToTodo}
+            onOpenBeside={onOpenBeside}
+          />
         </View>
-        <Text style={styles.bodyText}>{reply.entry.text}</Text>
-        {canRetry ? (
-          <View style={styles.rowFooter}>
-            <Button
-              size="sm"
-              variant="secondary"
-              disabled={isRetrying}
-              onPress={onRetry}
-              testID={`topic-reply-retry-${reply.entry.entryId}`}
-            >
-              <ThemedRetry size={12} />
-              {t("topicWorkbench.topicStream.retryInTopic")}
-            </Button>
-          </View>
-        ) : null}
+        <Text style={styles.bodyText}>{displayText}</Text>
+        <ThreadEntryFooter
+          entryId={entry.entryId}
+          isLong={isLong}
+          expanded={expanded}
+          canRetry={canRetry}
+          isRetrying={isRetrying}
+          onToggleExpand={toggleExpand}
+          onRetry={onRetry}
+        />
       </View>
     </HoverEnvelope>
   );
@@ -463,10 +601,16 @@ export const TopicReplyRow = memo(function TopicReplyRow({
     );
   }
 
+  const threadDisclosureKey =
+    agentKey && topicKey
+      ? buildTopicDisclosureKey(agentKey, `${topicKey}:reply:${reply.id}`)
+      : null;
+
   return (
     <View>
       {showNewDivider ? <NewRepliesDivider count={unreadCountForDivider} /> : null}
       <ThreadEntryRow
+        disclosureKey={threadDisclosureKey}
         reply={reply}
         showActions={showActions}
         isRetrying={isRetrying}

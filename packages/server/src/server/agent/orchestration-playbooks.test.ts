@@ -95,8 +95,8 @@ describe("resolveLeadPlaybookInput", () => {
 describe("orchestration playbook contracts", () => {
   test("renders concise Main Control guidance for progress summary and playbooks", () => {
     const guidance = buildMainControlPlaybookGuidance().join("\n");
-    expect(guidance).toContain("list_workspace_tasks");
-    expect(guidance).toContain("summarize_workspace_agents");
+    expect(guidance).toContain("call get_workspace_situation once");
+    expect(guidance).toContain("call dispatch_topic_decision separately");
     expect(guidance).toContain("continue that lead via send_agent_prompt");
     expect(guidance).toContain('"batch_implement"');
     expect(guidance).toContain('"cr_fix_loop"');

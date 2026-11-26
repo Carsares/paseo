@@ -52,6 +52,48 @@ describe("workspace task ledger RPC", () => {
     await rm(root, { recursive: true, force: true });
   });
 
+  it("projects reciprocal file conflicts and clears them when a peer finishes", async () => {
+    await taskLedger.upsert(workspaceId, { taskId: "first", title: "First", leadAgentId: "lead" });
+    await taskLedger.upsert(workspaceId, {
+      taskId: "second",
+      title: "Second",
+      status: "in_progress",
+    });
+    await taskLedger.addTouchedFiles(workspaceId, "first", ["shared.ts"]);
+    await taskLedger.addTouchedFiles(workspaceId, "second", ["shared.ts"]);
+    const { tasks } = (await list()).payload;
+    expect(tasks).toMatchObject([
+      {
+        taskId: "second",
+        touchedFiles: ["shared.ts"],
+        fileConflicts: [
+          {
+            path: "shared.ts",
+            peers: [{ taskId: "first", title: "First", status: "analyzing", leadAgentId: "lead" }],
+          },
+        ],
+      },
+      {
+        taskId: "first",
+        touchedFiles: ["shared.ts"],
+        fileConflicts: [
+          {
+            path: "shared.ts",
+            peers: [{ taskId: "second", title: "Second", status: "in_progress" }],
+          },
+        ],
+      },
+    ]);
+    await taskLedger.syncFromTurnOutcome(workspaceId, "second", { status: "completed" });
+    const resolved = (await list()).payload.tasks;
+    expect(
+      resolved.map(({ touchedFiles, fileConflicts }) => [touchedFiles, fileConflicts]),
+    ).toEqual([
+      [["shared.ts"], undefined],
+      [["shared.ts"], undefined],
+    ]);
+  });
+
   it("returns only the selected workspace's task summaries, including recent agent progress", async () => {
     const otherId = "workspace-b";
     await registerWorkspace(otherId);
@@ -89,6 +131,7 @@ describe("workspace task ledger RPC", () => {
             participants: [child],
             handoffSummary: "Check the review output",
             blockingQuestion: "Which workspace should host the report?",
+            blockingQuestionGeneration: current.blockingQuestionGeneration,
             verificationState: "not_run",
             recentAgentStates: [
               { agentId: child.agentId, kind: event.kind, at: event.at, lifecycle: "idle" },

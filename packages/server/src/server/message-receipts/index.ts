@@ -69,8 +69,8 @@ interface SendMessageInput {
   messageId: string;
   request: unknown;
   /**
-   * Delivers the message. It awaits `beforeDispatch` immediately before the provider can receive
-   * the message; a failure before that call proves nothing was submitted and leaves no receipt.
+   * Delivers the message. It awaits `beforeDispatch` immediately before any provider can receive
+   * the message. A silent delivery can return after it has durably recorded the result.
    */
   send: (
     beforeDispatch: () => Promise<void>,
@@ -81,6 +81,11 @@ interface SendMessageInput {
   retryIfNotAdmitted?: (error: unknown) => boolean;
   /** Only errors that prove the provider never received the message may clear a pending receipt. */
   retryIfUnsent?: (error: unknown) => boolean;
+  /**
+   * For a matching pending receipt without queued content, confirm durable evidence of silent
+   * delivery for this exact recipient and message. Recovery never calls `send`.
+   */
+  confirmPendingSilentDelivery?: () => Promise<boolean>;
   queue?: Omit<QueueMessageInput, "agentId" | "request">;
 }
 
@@ -407,8 +412,14 @@ export class MessageReceipts {
     }
     const existing = await readReceipt(file);
     if (existing) {
-      if (existing.fingerprint !== fingerprint) throw new Error("agent_request_key_conflict");
+      if (existing.fingerprint !== fingerprint || existing.agentId !== input.agentId) {
+        throw new Error("agent_request_key_conflict");
+      }
       if (existing.state === "completed") return;
+      if (!existing.queued && (await input.confirmPendingSilentDelivery?.())) {
+        await this.commit(file, key, { fingerprint, agentId: input.agentId });
+        return;
+      }
       // A provider may have accepted the message before its receipt was committed.
       throw new AgentRequestOutcomeUnknownError();
     }

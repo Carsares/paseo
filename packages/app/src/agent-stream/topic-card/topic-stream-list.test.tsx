@@ -6,17 +6,21 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearSidebarAttention } from "@/components/sidebar/sidebar-unread-conclusions";
+import { applyWorkspaceTasksUpdateToCache } from "@/composer/workspace-task-ledger/query";
 import { queryClient as sharedQueryClient } from "@/data/query-client";
-import { submitActiveTopicReply } from "./submit-topic-reply";
+import { submitActiveTopicReply, TopicDecisionStaleQuestionError } from "./submit-topic-reply";
 import { PaneProvider, type PaneContextValue } from "@/panels/pane-context";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
+import { createWorkspaceSheetStack } from "@/screens/workspace/sheet-pane/stack";
 import { useSessionStore } from "@/stores/session-store";
+import { useTeamDirectoryViewStore } from "@/stores/team-directory-view-store";
 import { buildTopicAgentKey, useTopicStreamViewStore } from "@/stores/topic-stream-view-store";
 import {
   createTeamMessageJumpStore,
   TeamMessageJumpProvider,
 } from "@/subagents/team-directory/message-jump-store";
-import { workspaceTopicEntriesQueryKey } from "@/topic-threads/queries";
+import { TeamDirectoryShellProvider } from "@/subagents/team-directory/shell-context";
+import { applyTopicAnchorToCache, workspaceTopicEntriesQueryKey } from "@/topic-threads/queries";
 import type { StreamItem } from "@/types/stream";
 import {
   topicMatchesScrollTarget,
@@ -30,9 +34,11 @@ vi.mock("react-i18next", async (original) => ({
   useTranslation: () => ({ t: (key: string) => key, i18n: { resolvedLanguage: "en" } }),
 }));
 
+let mockIsCompactFormFactor = false;
+
 vi.mock("@/constants/layout", async (original) => ({
   ...(await original<typeof import("@/constants/layout")>()),
-  useIsCompactFormFactor: () => false,
+  useIsCompactFormFactor: () => mockIsCompactFormFactor,
 }));
 
 vi.mock("@/utils/app-visibility", () => ({
@@ -48,11 +54,18 @@ vi.mock("@/utils/navigate-to-agent", () => ({
   navigateToAgent: vi.fn(),
 }));
 
+const mockDurableItems = vi.hoisted(() => ({
+  items: [] as import("@getpaseo/protocol/messages").WorkspaceDurableItem[],
+}));
+
 vi.mock("@/durable-items/queries", () => ({
   useWorkspaceDurableItems: () => ({
-    result: { data: [] },
+    result: { data: mockDurableItems.items },
     online: true,
   }),
+  getOnlineDurableItemsClient: () => null,
+  reconcileDurableItemDecision: vi.fn(async () => undefined),
+  applyDurableItemUpdateToCache: vi.fn(),
 }));
 
 vi.mock("@/components/ui/dropdown-menu", () => ({
@@ -81,6 +94,8 @@ const MAIN_AGENT_ID = "mc-list-1";
 function seedSession(options: {
   supportsTopicThreads: boolean;
   supportsTopicReadState: boolean;
+  supportsButlerV1?: boolean;
+  supportsTaskLedger?: boolean;
   requiresAttention?: boolean;
 }) {
   const agents = new Map([
@@ -129,8 +144,11 @@ function seedSession(options: {
           features: {
             workspaceTopicThreads: options.supportsTopicThreads,
             workspaceTopicReadState: options.supportsTopicReadState,
-            workspaceTaskLedger: false,
+            workspaceTaskLedger: options.supportsTaskLedger ?? false,
             workspaceTodos: false,
+            ...(options.supportsButlerV1 !== undefined
+              ? { workspaceButlerV1: options.supportsButlerV1 }
+              : {}),
           },
         },
       },
@@ -157,6 +175,22 @@ function makeStreamItems(): StreamItem[] {
       timelineCursor: { epoch: "ep-1", seq: 2 },
     },
   ];
+}
+
+function makeTeamDirectoryShellValue(
+  toggleDirectory: () => void,
+  overrides?: {
+    isOwnedByWorkspaceShell?: boolean;
+    isDirectoryVisible?: boolean;
+    openDirectory?: () => void;
+  },
+) {
+  return {
+    isOwnedByWorkspaceShell: overrides?.isOwnedByWorkspaceShell ?? true,
+    isDirectoryVisible: overrides?.isDirectoryVisible ?? false,
+    toggleDirectory,
+    ...(overrides?.openDirectory ? { openDirectory: overrides.openDirectory } : {}),
+  };
 }
 
 function makePaneContextValue(): PaneContextValue {
@@ -202,11 +236,17 @@ function TestTopBarHarness({ streamItems }: { streamItems: readonly StreamItem[]
 
 describe("TopicStreamList & read-watermark integration", () => {
   beforeEach(() => {
+    mockIsCompactFormFactor = false;
+    mockDurableItems.items = [];
+    useTeamDirectoryViewStore.setState({ activeTab: "agents" });
     useTopicStreamViewStore.setState({
       viewModeByAgentKey: {},
       unreadOnlyByAgentKey: {},
       expandedProcessByTopicKey: {},
       expandedHistoryByTopicKey: {},
+      expandedConflictsByTopicKey: {},
+      decisionDraftByTopicKey: {},
+      decisionDraftMetaByTopicKey: {},
       activeReplyTopicByAgentKey: {},
       pendingScrollTopicByAgentKey: {},
       returnTopicAnchorByAgentKey: {},
@@ -577,6 +617,8 @@ describe("TopicStreamList & read-watermark integration", () => {
           linkedTodos: [],
           linkedDurableItems: [],
           linkedPermissions: [],
+          fileConflicts: [],
+          activeBlockingPrompt: null,
           unreadReplyCount: 0,
           firstUnreadReplyIndex: null,
           isMarkedUnread: false,
@@ -727,5 +769,757 @@ describe("TopicStreamList & read-watermark integration", () => {
     expect(
       useTopicStreamViewStore.getState().pendingScrollTopicByAgentKey[agentKey]?.topicKey,
     ).toBe("task:past-cap");
+  });
+
+  it("renders anchor-restored cards with real-time pushed tasks, triggers conflict jump, and submits blocking decisions", async () => {
+    seedSession({
+      supportsTopicThreads: true,
+      supportsTopicReadState: true,
+      supportsTaskLedger: true,
+      supportsButlerV1: true,
+    });
+    const decideWorkspaceTopic = vi.fn().mockResolvedValue({
+      requestId: "req-dec-1",
+      workspaceId: WORKSPACE_ID,
+      topicKey: "task:T-pushed",
+      durableItem: null,
+      task: {
+        taskId: "T-pushed",
+        title: "Pushed topic",
+        tier: "T2",
+        status: "in_progress",
+        participants: [{ agentId: "lead-1" }],
+        leadAgentId: "lead-1",
+        createdAt: "2026-06-01T00:00:00.000Z",
+        updatedAt: "2026-06-01T00:05:00.000Z",
+      },
+      routedTo: "lead",
+      targetAgentId: "lead-1",
+      entry: {
+        entryId: "te-dec-1",
+        workspaceId: WORKSPACE_ID,
+        mainAgentId: MAIN_AGENT_ID,
+        topicKey: "task:T-pushed",
+        taskId: "T-pushed",
+        role: "user_followup",
+        origin: "decision_reply",
+        routedAgentId: "lead-1",
+        text: "Proceed with option A",
+        status: "completed",
+        seq: 1,
+        createdAt: "2026-06-01T00:05:00.000Z",
+        updatedAt: "2026-06-01T00:05:00.000Z",
+      },
+      error: null,
+    });
+    vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
+      connectionStatus: "online",
+      client: { decideWorkspaceTopic },
+    } as never);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    applyTopicAnchorToCache(qc, SERVER_ID, {
+      workspaceId: WORKSPACE_ID,
+      mainAgentId: MAIN_AGENT_ID,
+      anchor: {
+        workspaceId: WORKSPACE_ID,
+        mainAgentId: MAIN_AGENT_ID,
+        topicKey: "task:T-pushed",
+        taskId: "T-pushed",
+        rootPromptText: "Restored topic after session reset",
+        leadAgentId: "lead-1",
+        leadTitle: "Backend Lead",
+        createdAt: "2026-06-01T00:00:00.000Z",
+        updatedAt: "2026-06-01T00:01:00.000Z",
+      },
+    });
+    applyTopicAnchorToCache(qc, SERVER_ID, {
+      workspaceId: WORKSPACE_ID,
+      mainAgentId: MAIN_AGENT_ID,
+      anchor: {
+        workspaceId: WORKSPACE_ID,
+        mainAgentId: MAIN_AGENT_ID,
+        topicKey: "task:T-peer-2",
+        taskId: "T-peer-2",
+        rootPromptText: "Peer topic modifying agent-panel",
+        createdAt: "2026-06-01T00:00:30.000Z",
+        updatedAt: "2026-06-01T00:01:00.000Z",
+      },
+    });
+    applyWorkspaceTasksUpdateToCache(qc, SERVER_ID, {
+      workspaceId: WORKSPACE_ID,
+      tasks: [
+        {
+          taskId: "T-pushed",
+          title: "Pushed topic",
+          tier: "T2",
+          status: "awaiting_decision",
+          participants: [{ agentId: "lead-1" }],
+          leadAgentId: "lead-1",
+          blockingQuestion: "Pick next step:\n1. Proceed with option A\n2. Roll back",
+          fileConflicts: [
+            {
+              path: "packages/app/src/panels/agent-panel.tsx",
+              peers: [
+                {
+                  taskId: "T-peer-2",
+                  title: "Peer topic",
+                  status: "in_progress",
+                },
+              ],
+            },
+          ],
+          createdAt: "2026-06-01T00:00:00.000Z",
+          updatedAt: "2026-06-01T00:02:00.000Z",
+        },
+      ],
+    });
+
+    render(
+      <QueryClientProvider client={qc}>
+        <PaneProvider value={makePaneContextValue()}>
+          <TopicStreamList
+            serverId={SERVER_ID}
+            workspaceId={WORKSPACE_ID}
+            mainAgentId={MAIN_AGENT_ID}
+            streamItems={[]}
+            streamHead={[]}
+            pendingPermissions={[]}
+            isTurnActive={false}
+            isPaneFocused={true}
+          />
+        </PaneProvider>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByTestId("topic-thread-card-task:T-pushed")).toBeTruthy();
+    expect(screen.getByTestId("topic-thread-card-task:T-peer-2")).toBeTruthy();
+    expect(screen.getAllByTestId("topic-card-root-prompt")[0]!.textContent).toBe(
+      "Restored topic after session reset",
+    );
+
+    const agentKey = buildTopicAgentKey(SERVER_ID, MAIN_AGENT_ID);
+    fireEvent.click(screen.getByTestId("topic-conflict-jump-T-peer-2"));
+    expect(
+      useTopicStreamViewStore.getState().pendingScrollTopicByAgentKey[agentKey]?.topicKey,
+    ).toBe("task:T-peer-2");
+
+    fireEvent.click(screen.getByTestId("topic-decision-option-0"));
+    fireEvent.click(screen.getByTestId("topic-decision-submit-task:T-pushed"));
+
+    await vi.waitFor(() => {
+      expect(decideWorkspaceTopic).toHaveBeenCalledTimes(1);
+    });
+    expect(decideWorkspaceTopic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceId: WORKSPACE_ID,
+        mainAgentId: MAIN_AGENT_ID,
+        topicKey: "task:T-pushed",
+        taskId: "T-pushed",
+        resolutionKind: "task_blocking_question",
+        note: "Proceed with option A",
+      }),
+    );
+
+    // Compact decision submission via submitActiveTopicReply also routes to decideWorkspaceTopic.
+    decideWorkspaceTopic.mockClear();
+    await submitActiveTopicReply({
+      queryClient: qc,
+      serverId: SERVER_ID,
+      workspaceId: WORKSPACE_ID,
+      agentId: MAIN_AGENT_ID,
+      activeReplyTopic: {
+        topicKey: "task:T-pushed",
+        taskId: "T-pushed",
+        promptPreview: "Restored topic after session reset",
+        routeMode: "auto",
+        decisionContext: {
+          kind: "task_blocking_question",
+          taskId: "T-pushed",
+          question: "Pick next step",
+        },
+      },
+      payload: { text: "Compact decision answer", attachments: [], cwd: "/repo" },
+      supportsTopicThreads: true,
+      supportsButlerV1: true,
+      supportsForgeAttachments: true,
+      disconnectedMessage: "Host disconnected",
+    });
+    expect(decideWorkspaceTopic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        resolutionKind: "task_blocking_question",
+        note: "Compact decision answer",
+      }),
+    );
+  });
+
+  it("handles stale_blocking_question end-to-end on desktop and compact paths without dropping draft", async () => {
+    seedSession({
+      supportsTopicThreads: true,
+      supportsTopicReadState: true,
+      supportsTaskLedger: true,
+      supportsButlerV1: true,
+    });
+    const gen1 = "11111111-1111-4111-8111-111111111111";
+    const gen2 = "22222222-2222-4222-8222-222222222222";
+    const updatedTask = {
+      taskId: "T-stale",
+      title: "Stale question test",
+      tier: "T2" as const,
+      status: "awaiting_decision" as const,
+      participants: [{ agentId: "lead-1" }],
+      leadAgentId: "lead-1",
+      blockingQuestion: "Updated question v2?",
+      blockingQuestionGeneration: gen2,
+      createdAt: "2026-06-01T00:00:00.000Z",
+      updatedAt: "2026-06-01T00:03:00.000Z",
+    };
+    const decideWorkspaceTopic = vi
+      .fn()
+      .mockResolvedValueOnce({
+        requestId: "req-stale-1",
+        workspaceId: WORKSPACE_ID,
+        topicKey: "task:T-stale",
+        durableItem: null,
+        task: updatedTask,
+        routedTo: "none",
+        targetAgentId: null,
+        entry: null,
+        error: "The blocking question changed.",
+        errorCode: "stale_blocking_question",
+      })
+      .mockResolvedValueOnce({
+        requestId: "req-ok-2",
+        workspaceId: WORKSPACE_ID,
+        topicKey: "task:T-stale",
+        durableItem: null,
+        task: { ...updatedTask, status: "in_progress", blockingQuestion: undefined },
+        routedTo: "lead",
+        targetAgentId: "lead-1",
+        entry: null,
+        error: null,
+      });
+    vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
+      connectionStatus: "online",
+      client: { decideWorkspaceTopic },
+    } as never);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    applyTopicAnchorToCache(qc, SERVER_ID, {
+      workspaceId: WORKSPACE_ID,
+      mainAgentId: MAIN_AGENT_ID,
+      anchor: {
+        workspaceId: WORKSPACE_ID,
+        mainAgentId: MAIN_AGENT_ID,
+        topicKey: "task:T-stale",
+        taskId: "T-stale",
+        rootPromptText: "Check blocking conflict",
+        leadAgentId: "lead-1",
+        createdAt: "2026-06-01T00:00:00.000Z",
+        updatedAt: "2026-06-01T00:01:00.000Z",
+      },
+    });
+    applyWorkspaceTasksUpdateToCache(qc, SERVER_ID, {
+      workspaceId: WORKSPACE_ID,
+      tasks: [
+        {
+          ...updatedTask,
+          blockingQuestion: "Original question v1?",
+          blockingQuestionGeneration: gen1,
+        },
+      ],
+    });
+
+    render(
+      <QueryClientProvider client={qc}>
+        <PaneProvider value={makePaneContextValue()}>
+          <TopicStreamList
+            serverId={SERVER_ID}
+            workspaceId={WORKSPACE_ID}
+            mainAgentId={MAIN_AGENT_ID}
+            streamItems={[]}
+            streamHead={[]}
+            pendingPermissions={[]}
+            isTurnActive={false}
+            isPaneFocused={true}
+          />
+        </PaneProvider>
+      </QueryClientProvider>,
+    );
+
+    const input = screen.getByTestId("topic-decision-input-task:T-stale");
+    fireEvent.change(input, { target: { value: "My draft decision" } });
+    fireEvent.click(screen.getByTestId("topic-decision-submit-task:T-stale"));
+
+    // After stale_blocking_question: feedback shown, cache updated to v2 question, draft preserved!
+    await vi.waitFor(() => {
+      expect(screen.getByTestId("topic-decision-question-task:T-stale").textContent).toBe(
+        "Updated question v2?",
+      );
+      expect(screen.getByTestId("topic-decision-feedback-task:T-stale").textContent).toBe(
+        "topicWorkbench.topicStream.decisionBlockingQuestionStale",
+      );
+    });
+    expect(decideWorkspaceTopic.mock.calls[0]![0]).toMatchObject({
+      expectedBlockingQuestionGeneration: gen1,
+      note: "My draft decision",
+    });
+
+    // Re-submit after inspecting updated question -> sends gen2!
+    fireEvent.click(screen.getByTestId("topic-decision-submit-task:T-stale"));
+    await vi.waitFor(() => {
+      expect(decideWorkspaceTopic).toHaveBeenCalledTimes(2);
+    });
+    expect(decideWorkspaceTopic.mock.calls[1]![0]).toMatchObject({
+      expectedBlockingQuestionGeneration: gen2,
+      note: "My draft decision",
+    });
+
+    // Compact path: submitActiveTopicReply locks gen1 and throws TopicDecisionStaleQuestionError with latestTask.
+    decideWorkspaceTopic.mockReset();
+    decideWorkspaceTopic.mockResolvedValueOnce({
+      requestId: "req-compact-stale",
+      workspaceId: WORKSPACE_ID,
+      topicKey: "task:T-stale",
+      durableItem: null,
+      task: updatedTask,
+      routedTo: "none",
+      targetAgentId: null,
+      entry: null,
+      error: "The blocking question changed.",
+      errorCode: "stale_blocking_question",
+    });
+    await expect(
+      submitActiveTopicReply({
+        queryClient: qc,
+        serverId: SERVER_ID,
+        workspaceId: WORKSPACE_ID,
+        agentId: MAIN_AGENT_ID,
+        activeReplyTopic: {
+          topicKey: "task:T-stale",
+          taskId: "T-stale",
+          promptPreview: "Check blocking conflict",
+          routeMode: "auto",
+          decisionContext: {
+            kind: "task_blocking_question",
+            taskId: "T-stale",
+            question: "Original question v1?",
+            blockingQuestionGeneration: gen1,
+          },
+        },
+        payload: { text: "Compact draft", attachments: [], cwd: "/repo" },
+        supportsTopicThreads: true,
+        supportsButlerV1: true,
+        supportsForgeAttachments: true,
+        disconnectedMessage: "Host disconnected",
+      }),
+    ).rejects.toBeInstanceOf(TopicDecisionStaleQuestionError);
+    expect(decideWorkspaceTopic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        expectedBlockingQuestionGeneration: gen1,
+        note: "Compact draft",
+      }),
+    );
+  });
+
+  it("keeps sibling tasks under one rootMessageId distinct in scroll matching and routes legacy unbound DurableItem to standalone approval view", () => {
+    seedSession({
+      supportsTopicThreads: true,
+      supportsTopicReadState: true,
+      supportsTaskLedger: true,
+      supportsButlerV1: true,
+    });
+    const decideWorkspaceTopic = vi.fn();
+    vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
+      connectionStatus: "online",
+      client: { decideWorkspaceTopic },
+    } as never);
+    mockDurableItems.items = [
+      {
+        workspaceId: WORKSPACE_ID,
+        requestId: "dur-legacy-unbound",
+        sourceAgentId: "lead-1",
+        sourceTurnId: "turn-legacy",
+        kind: "acceptance",
+        title: "Legacy unbound acceptance",
+        evidence: [],
+        createdAt: "2026-06-01T00:01:00.000Z",
+        revision: 1,
+        status: "pending",
+      },
+    ];
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    applyTopicAnchorToCache(qc, SERVER_ID, {
+      workspaceId: WORKSPACE_ID,
+      mainAgentId: MAIN_AGENT_ID,
+      anchor: {
+        workspaceId: WORKSPACE_ID,
+        mainAgentId: MAIN_AGENT_ID,
+        topicKey: "task:T-A",
+        taskId: "T-A",
+        rootMessageId: "m-multi",
+        rootPromptText: "Shared root question",
+        leadAgentId: "lead-1",
+        createdAt: "2026-06-01T00:00:00.000Z",
+        updatedAt: "2026-06-01T00:00:01.000Z",
+      },
+    });
+    applyTopicAnchorToCache(qc, SERVER_ID, {
+      workspaceId: WORKSPACE_ID,
+      mainAgentId: MAIN_AGENT_ID,
+      anchor: {
+        workspaceId: WORKSPACE_ID,
+        mainAgentId: MAIN_AGENT_ID,
+        topicKey: "task:T-B",
+        taskId: "T-B",
+        rootMessageId: "m-multi",
+        rootPromptText: "Shared root question",
+        leadAgentId: "lead-2",
+        createdAt: "2026-06-01T00:00:02.000Z",
+        updatedAt: "2026-06-01T00:00:02.000Z",
+      },
+    });
+    applyWorkspaceTasksUpdateToCache(qc, SERVER_ID, {
+      workspaceId: WORKSPACE_ID,
+      tasks: [
+        {
+          taskId: "T-A",
+          title: "Task A",
+          tier: "T2",
+          status: "in_progress",
+          participants: [{ agentId: "lead-1" }],
+          rootMessageId: "m-multi",
+          leadAgentId: "lead-1",
+          createdAt: "2026-06-01T00:00:00.000Z",
+          updatedAt: "2026-06-01T00:00:01.000Z",
+        },
+        {
+          taskId: "T-B",
+          title: "Task B",
+          tier: "T2",
+          status: "in_progress",
+          participants: [{ agentId: "lead-2" }],
+          rootMessageId: "m-multi",
+          leadAgentId: "lead-2",
+          createdAt: "2026-06-01T00:00:02.000Z",
+          updatedAt: "2026-06-01T00:00:02.000Z",
+        },
+      ],
+    });
+
+    const toggleDirectory = vi.fn();
+
+    render(
+      <QueryClientProvider client={qc}>
+        <PaneProvider value={makePaneContextValue()}>
+          <TeamDirectoryShellProvider value={makeTeamDirectoryShellValue(toggleDirectory)}>
+            <TopicStreamList
+              serverId={SERVER_ID}
+              workspaceId={WORKSPACE_ID}
+              mainAgentId={MAIN_AGENT_ID}
+              streamItems={[]}
+              streamHead={[]}
+              pendingPermissions={[]}
+              isTurnActive={false}
+              isPaneFocused={true}
+            />
+          </TeamDirectoryShellProvider>
+        </PaneProvider>
+      </QueryClientProvider>,
+    );
+
+    // Both sibling task cards render simultaneously.
+    expect(screen.getByTestId("topic-thread-card-task:T-A")).toBeTruthy();
+    expect(screen.getByTestId("topic-thread-card-task:T-B")).toBeTruthy();
+
+    // Legacy unbound DurableItem on task:T-A does NOT render in-card topic decide buttons;
+    // clicking its redirect button opens the Team Directory on the "todos" approval tab.
+    expect(screen.queryByTestId("topic-decision-action-approve-task:T-A")).toBeNull();
+    fireEvent.click(screen.getByTestId("topic-decision-open-standalone-task:T-A"));
+    expect(useTeamDirectoryViewStore.getState().activeTab).toBe("todos");
+    expect(toggleDirectory).toHaveBeenCalledTimes(1);
+    expect(decideWorkspaceTopic).not.toHaveBeenCalled();
+
+    // Scroll matching with explicit taskId never collides with sibling sharing rootMessageId.
+    expect(
+      topicMatchesScrollTarget(
+        {
+          topicKey: "task:T-A",
+          taskId: "T-A",
+          rootItemId: "u-multi:T-A",
+          rootMessageId: "m-multi",
+          rootPrompt: {
+            id: "u-multi",
+            messageId: "m-multi",
+            text: "Shared root question",
+            timestampMs: 1_000,
+            seq: 1,
+            epoch: "ep-1",
+            item: null,
+          },
+          task: null,
+          processSteps: [],
+          replies: [],
+          pendingInboxItems: [],
+          linkedTodos: [],
+          linkedDurableItems: [],
+          linkedPermissions: [],
+          fileConflicts: [],
+          activeBlockingPrompt: null,
+          unreadReplyCount: 0,
+          firstUnreadReplyIndex: null,
+          isMarkedUnread: false,
+          hasUnread: false,
+          latestSeq: 1,
+          latestTimestampMs: 1_000,
+          latestEpoch: "ep-1",
+          lifecycleStatus: "settled",
+          retryCandidate: null,
+        },
+        { topicKey: "task:T-B", taskId: "T-B", rootMessageId: "m-multi" },
+      ),
+    ).toBe(false);
+  });
+
+  it("guards compact async decision refreshes against switched targets and never downgrades missing next generation to versionless", () => {
+    const agentKey = buildTopicAgentKey(SERVER_ID, MAIN_AGENT_ID);
+    const genA1 = "11111111-1111-4111-8111-111111111111";
+    const genA2 = "22222222-2222-4222-8222-222222222222";
+    const genB1 = "33333333-3333-4333-8333-333333333333";
+
+    const store = useTopicStreamViewStore.getState();
+    // User enters compact decision reply for T-A (genA1), then switches to T-B (genB1) while T-A is in flight.
+    store.setActiveReplyTopic(agentKey, {
+      topicKey: "task:T-B",
+      taskId: "T-B",
+      promptPreview: "Task B",
+      routeMode: "auto",
+      pendingClientMessageId: "cm-b",
+      pendingSubmissionSignature: "sig-b",
+      decisionContext: {
+        kind: "task_blocking_question",
+        taskId: "T-B",
+        question: "Task B question?",
+        blockingQuestionGeneration: genB1,
+      },
+    });
+
+    // Late stale response for T-A must NOT mutate or clear T-B.
+    store.refreshActiveDecisionContext(agentKey, {
+      expectedTarget: {
+        topicKey: "task:T-A",
+        taskId: "T-A",
+        decisionKind: "task_blocking_question",
+        decisionTaskId: "T-A",
+        blockingQuestionGeneration: genA1,
+      },
+      question: "Task A new question?",
+      blockingQuestionGeneration: genA2,
+      staleNotice: "Stale notice A",
+    });
+    store.clearActiveReplyTopicIfMatches(agentKey, {
+      topicKey: "task:T-A",
+      taskId: "T-A",
+      decisionKind: "task_blocking_question",
+      decisionTaskId: "T-A",
+      blockingQuestionGeneration: genA1,
+    });
+    expect(useTopicStreamViewStore.getState().activeReplyTopicByAgentKey[agentKey]).toMatchObject({
+      topicKey: "task:T-B",
+      pendingClientMessageId: "cm-b",
+      decisionContext: {
+        question: "Task B question?",
+        blockingQuestionGeneration: genB1,
+      },
+    });
+    expect(
+      useTopicStreamViewStore.getState().activeReplyTopicByAgentKey[agentKey]?.decisionContext
+        ?.staleNotice,
+    ).toBeUndefined();
+
+    // Now stay on T-A (genA1) and receive a stale response with NO next generation (e.g. already resolved):
+    // must keep genA1 locked & preserve submission intent (never downgrade to undefined/versionless).
+    store.setActiveReplyTopic(agentKey, {
+      topicKey: "task:T-A",
+      taskId: "T-A",
+      promptPreview: "Task A",
+      routeMode: "auto",
+      pendingClientMessageId: "cm-a1",
+      pendingSubmissionSignature: "sig-a1",
+      decisionContext: {
+        kind: "task_blocking_question",
+        taskId: "T-A",
+        question: "Task A v1?",
+        blockingQuestionGeneration: genA1,
+      },
+    });
+    store.refreshActiveDecisionContext(agentKey, {
+      expectedTarget: {
+        topicKey: "task:T-A",
+        taskId: "T-A",
+        decisionKind: "task_blocking_question",
+        decisionTaskId: "T-A",
+        blockingQuestionGeneration: genA1,
+      },
+      question: undefined,
+      blockingQuestionGeneration: undefined,
+      staleNotice: "Stale resolved notice",
+    });
+    expect(useTopicStreamViewStore.getState().activeReplyTopicByAgentKey[agentKey]).toMatchObject({
+      topicKey: "task:T-A",
+      pendingClientMessageId: "cm-a1",
+      pendingSubmissionSignature: "sig-a1",
+      decisionContext: {
+        question: "Task A v1?",
+        blockingQuestionGeneration: genA1,
+        staleNotice: "Stale resolved notice",
+      },
+    });
+
+    // When a valid new generation (genA2) arrives for the matching target, refresh generation & clear idempotency key.
+    store.refreshActiveDecisionContext(agentKey, {
+      expectedTarget: {
+        topicKey: "task:T-A",
+        taskId: "T-A",
+        decisionKind: "task_blocking_question",
+        decisionTaskId: "T-A",
+        blockingQuestionGeneration: genA1,
+      },
+      question: "Task A v2?",
+      blockingQuestionGeneration: genA2,
+      staleNotice: "Stale updated notice",
+    });
+    expect(useTopicStreamViewStore.getState().activeReplyTopicByAgentKey[agentKey]).toMatchObject({
+      topicKey: "task:T-A",
+      pendingClientMessageId: undefined,
+      pendingSubmissionSignature: undefined,
+      decisionContext: {
+        question: "Task A v2?",
+        blockingQuestionGeneration: genA2,
+        staleNotice: "Stale updated notice",
+      },
+    });
+  });
+
+  it("opens a reachable standalone approval sheet/panel in compact mode for a Main Control sourced unbound DurableItem", () => {
+    mockIsCompactFormFactor = true;
+    seedSession({
+      supportsTopicThreads: true,
+      supportsTopicReadState: true,
+      supportsTaskLedger: true,
+      supportsButlerV1: true,
+    });
+    const decideWorkspaceTopic = vi.fn();
+    vi.spyOn(getHostRuntimeStore(), "getSnapshot").mockReturnValue({
+      connectionStatus: "online",
+      client: { decideWorkspaceTopic },
+    } as never);
+    mockDurableItems.items = [
+      {
+        workspaceId: WORKSPACE_ID,
+        requestId: "dur-main-unbound",
+        sourceAgentId: MAIN_AGENT_ID,
+        sourceTurnId: "turn-main-1",
+        kind: "decision",
+        title: "Main control unbound decision",
+        evidence: [],
+        createdAt: "2026-06-01T00:01:00.000Z",
+        revision: 1,
+        status: "pending",
+      },
+    ];
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    applyWorkspaceTasksUpdateToCache(qc, SERVER_ID, {
+      workspaceId: WORKSPACE_ID,
+      tasks: [
+        {
+          taskId: "T-main",
+          title: "Main task",
+          tier: "T1",
+          status: "in_progress",
+          participants: [{ agentId: MAIN_AGENT_ID }],
+          rootMessageId: "m-1",
+          leadAgentId: MAIN_AGENT_ID,
+          createdAt: "2026-06-01T00:00:00.000Z",
+          updatedAt: "2026-06-01T00:00:01.000Z",
+        },
+      ],
+    });
+
+    // 1) Compact shell with WorkspaceSheetStack opener (real WorkspaceScreen compact path):
+    // clicking opens the "team" sheet page on the stack and selects the "todos" approval tab.
+    const sheetStack = createWorkspaceSheetStack();
+    const openCompactSheet = vi.fn(() => {
+      sheetStack.push({
+        key: "team",
+        title: "Team",
+        render: () => null,
+      });
+    });
+    const toggleDirectory = vi.fn();
+    const firstRender = render(
+      <QueryClientProvider client={qc}>
+        <PaneProvider value={makePaneContextValue()}>
+          <TeamDirectoryShellProvider
+            value={makeTeamDirectoryShellValue(toggleDirectory, {
+              isOwnedByWorkspaceShell: false,
+              isDirectoryVisible: false,
+              openDirectory: openCompactSheet,
+            })}
+          >
+            <TopicStreamList
+              serverId={SERVER_ID}
+              workspaceId={WORKSPACE_ID}
+              mainAgentId={MAIN_AGENT_ID}
+              streamItems={makeStreamItems()}
+              streamHead={[]}
+              pendingPermissions={[]}
+              isTurnActive={false}
+              isPaneFocused={true}
+            />
+          </TeamDirectoryShellProvider>
+        </PaneProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("topic-decision-open-standalone-task:T-main"));
+    expect(useTeamDirectoryViewStore.getState().activeTab).toBe("todos");
+    expect(openCompactSheet).toHaveBeenCalledTimes(1);
+    expect(sheetStack.getSnapshot().map((entry) => entry.key)).toEqual(["page:team"]);
+    expect(decideWorkspaceTopic).not.toHaveBeenCalled();
+
+    // 2) Compact host without openDirectory falls back to toggleDirectory when source === main.
+    firstRender.unmount();
+    useTeamDirectoryViewStore.setState({ activeTab: "agents" });
+    render(
+      <QueryClientProvider client={qc}>
+        <PaneProvider value={makePaneContextValue()}>
+          <TeamDirectoryShellProvider
+            value={makeTeamDirectoryShellValue(toggleDirectory, {
+              isOwnedByWorkspaceShell: false,
+              isDirectoryVisible: false,
+            })}
+          >
+            <TopicStreamList
+              serverId={SERVER_ID}
+              workspaceId={WORKSPACE_ID}
+              mainAgentId={MAIN_AGENT_ID}
+              streamItems={makeStreamItems()}
+              streamHead={[]}
+              pendingPermissions={[]}
+              isTurnActive={false}
+              isPaneFocused={true}
+            />
+          </TeamDirectoryShellProvider>
+        </PaneProvider>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("topic-decision-open-standalone-task:T-main"));
+    expect(useTeamDirectoryViewStore.getState().activeTab).toBe("todos");
+    expect(toggleDirectory).toHaveBeenCalledTimes(1);
+    expect(decideWorkspaceTopic).not.toHaveBeenCalled();
   });
 });

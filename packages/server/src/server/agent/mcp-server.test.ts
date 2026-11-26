@@ -99,6 +99,8 @@ import type { BrowserToolsBroker, BrowserToolsExecuteInput } from "../browser-to
 import type { BrowserToolsResponsePayload } from "../browser-tools/errors.js";
 import { createWorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
 import { applyHierarchyPaseoToolPolicy } from "./hierarchy-policy.js";
+import { DurableItemStore } from "../durable-items/store.js";
+import { readWorkspaceSituation } from "./workspace-situation.js";
 
 const AGENT_WORKSPACE_CREATION_ERROR =
   "Agent sessions cannot create a project or workspace. Subagents must reuse the current workspace.";
@@ -286,6 +288,8 @@ function buildAgentManagerSpies() {
       operation(),
     ),
     isTaskAgentArchivePending: vi.fn().mockReturnValue(false),
+    isActiveTurnHumanInitiated: vi.fn().mockReturnValue(false),
+    getTimelineRows: vi.fn<AgentManager["getTimelineRows"]>().mockResolvedValue([]),
     taskDispatchCaller: vi.fn(() => () => {}),
     taskDispatchTarget: vi.fn(() => () => {}),
     captureTaskReport: vi.fn(),
@@ -4091,7 +4095,11 @@ describe("workspace task ledger MCP tools", () => {
       },
     );
     const hosts = vi.fn();
-    const makeServer = (caller?: ManagedAgent, verified = true) =>
+    const makeServer = (
+      caller?: ManagedAgent,
+      verified = true,
+      extra?: Partial<Parameters<typeof createAgentMcpServerWithDependencies>[0]>,
+    ) =>
       createAgentMcpServer({
         agentManager,
         agentStorage,
@@ -4105,6 +4113,7 @@ describe("workspace task ledger MCP tools", () => {
         serverId: "local",
         hosts,
         logger,
+        ...extra,
       });
     const server = await makeServer(main);
     const invoke = (name: string, input: Record<string, unknown>) =>
@@ -4187,6 +4196,52 @@ describe("workspace task ledger MCP tools", () => {
     });
   });
 
+  it("writes the topic anchor only after a confirmed binding is readable in the ledger", async () => {
+    const { main, child, spies, ledger, makeServer, queueAgentPrompt } = await setup();
+    main.activeTurnId = "main-turn";
+    spies.agentManager.getTimelineRows.mockResolvedValue([
+      {
+        seq: 1,
+        timestamp: main.createdAt.toISOString(),
+        turnId: "main-turn",
+        item: { type: "user_message", text: "The first question", messageId: "first-question" },
+      },
+    ]);
+    const upsertTopicAnchor = vi.fn<
+      NonNullable<Parameters<typeof createAgentMcpServerWithDependencies>[0]["upsertTopicAnchor"]>
+    >(async (anchor) => {
+      await expect(ledger.list(anchor.workspaceId)).resolves.toMatchObject([
+        { taskId: anchor.taskId, rootMessageId: anchor.rootMessageId, leadAgentId: child.id },
+      ]);
+    });
+    const server = await makeServer(main, true, { upsertTopicAnchor });
+    const tool = registeredTool(server, "send_agent_prompt");
+    const input = {
+      agentId: child.id,
+      prompt: "Review the change",
+      taskBinding: { taskId: "review", title: "Review" },
+    };
+    queueAgentPrompt.mockRejectedValueOnce(new Error("Dispatch refused"));
+    await invokeToolWithParsedInput(tool, input, false);
+    expect(upsertTopicAnchor).not.toHaveBeenCalled();
+    await expect(ledger.list(main.workspaceId!)).resolves.toEqual([]);
+    await expect(invokeToolWithParsedInput(tool, input, false)).resolves.toMatchObject({
+      structuredContent: { deliveryStatus: "dispatched", taskId: "review" },
+    });
+    expect(upsertTopicAnchor).toHaveBeenCalledExactlyOnceWith({
+      workspaceId: main.workspaceId,
+      mainAgentId: main.id,
+      topicKey: "task:review",
+      taskId: "review",
+      rootMessageId: "first-question",
+      rootPromptText: "The first question",
+      title: "Review",
+      leadAgentId: child.id,
+      leadServerId: "local",
+      leadTitle: undefined,
+    });
+  });
+
   it("rejects foreign, remote, archived, and ordinary bindings before queueing", async () => {
     const { child, other, ordinary, spies, hosts, queueAgentPrompt, makeServer, invoke } =
       await setup();
@@ -4195,11 +4250,9 @@ describe("workspace task ledger MCP tools", () => {
       prompt: "Run the task",
       taskBinding: { taskId: "review", title: "Review changes" },
     };
-    await expect(
-      invoke("send_agent_prompt", { ...input, agentId: other.id }),
-    ).resolves.toMatchObject({
-      structuredContent: { error: expect.stringContaining("current workspace") },
-    });
+    await expect(invoke("send_agent_prompt", { ...input, agentId: other.id })).rejects.toThrow(
+      "You can only manage your direct subagents",
+    );
     await expect(invoke("send_agent_prompt", { ...input, serverId: "remote" })).rejects.toThrow(
       "only available on the caller's host",
     );
@@ -4386,6 +4439,205 @@ describe("workspace task ledger MCP tools", () => {
       },
     });
     expect(queueAgentPrompt).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("workspace butler MCP tools", () => {
+  it("rechecks local Main Control identity, human provenance and durable kind before invoking the decision service", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-workspace-butler-"));
+    try {
+      const { agentManager, agentStorage, spies } = createTestDeps();
+      const workspaceId = "wks_parent";
+      const serverId = "local";
+      const main = createManagedAgent({
+        id: "main",
+        workspaceId,
+        labels: { [WORKSPACE_ROLE_LABEL]: WORKSPACE_MAIN_ROLE },
+        activeForegroundTurnId: "human-turn",
+        activeTurnId: "human-turn",
+      });
+      const now = main.createdAt.toISOString();
+      const workspace = createPersistedWorkspaceRecord({
+        workspaceId,
+        cwd: directory,
+        projectId: "project",
+        kind: "directory",
+        displayName: "Workspace",
+        createdAt: now,
+        updatedAt: now,
+      });
+      let current = main;
+      spies.agentManager.getAgent.mockImplementation((id) => (id === main.id ? current : null));
+      const durableItems = new DurableItemStore({
+        filePath: join(directory, "durable.json"),
+        serverId,
+        getWorkspace: async (id) => (id === workspaceId ? workspace : null),
+        getSourceAgent: async () => ({
+          id: main.id,
+          workspaceId,
+          cwd: directory,
+          provider: "claude",
+          title: null,
+          labels: main.labels,
+          metadata: {},
+          createdAt: now,
+          updatedAt: now,
+          lastStatus: "idle",
+        }),
+      });
+      for (const kind of ["authorization", "decision"] as const) {
+        await durableItems.create({
+          serverId,
+          workspaceId,
+          kind,
+          requestId: kind,
+          sourceAgentId: main.id,
+          sourceTurnId: "human-turn",
+          title: kind,
+          evidence: [],
+        });
+      }
+      const decideTopicAction = vi.fn<
+        NonNullable<Parameters<typeof createAgentMcpServerWithDependencies>[0]["decideTopicAction"]>
+      >(async (request, actor) => {
+        actor.assertCurrent();
+        return {
+          requestId: request.requestId,
+          workspaceId,
+          topicKey: request.topicKey,
+          durableItem: null,
+          task: null,
+          routedTo: "lead",
+          targetAgentId: "lead",
+          entry: null,
+          error: null,
+        };
+      });
+      const getWorkspaceSituation = vi.fn<
+        NonNullable<
+          Parameters<typeof createAgentMcpServerWithDependencies>[0]["getWorkspaceSituation"]
+        >
+      >((id, mainAgentId, options) =>
+        readWorkspaceSituation(
+          {
+            listTasks: async () => [],
+            listPendingDurableItems: (scopedWorkspaceId) =>
+              durableItems.listPendingWorkspaceItems({ serverId, workspaceId: scopedWorkspaceId }),
+            listPendingTodos: async () => [],
+            listWithAnchors: async () => ({ entries: [], anchors: [] }),
+            getReadState: async (scope) => ({
+              ...scope,
+              watermarkEpoch: null,
+              watermarkSeq: -1,
+              watermarkTimestampMs: 0,
+              topics: [],
+              revision: 0,
+            }),
+            getTimeline: () => ({ epoch: "epoch", rows: [] }),
+            listAgents: () => [],
+            readTaskParticipantReuse: async () => new Map(),
+          },
+          id,
+          mainAgentId,
+          options,
+        ),
+      );
+      const server = await createAgentMcpServer({
+        agentManager,
+        agentStorage,
+        paseoHome: directory,
+        callerAgentId: main.id,
+        verifiedCallerAgentId: main.id,
+        serverId,
+        durableItems,
+        decideTopicAction,
+        getWorkspaceSituation,
+        providerSnapshotManager: createOpenCodeManager().manager,
+        logger: createTestLogger(),
+      });
+      const tool = registeredTool(server, "dispatch_topic_decision");
+      const situation = registeredTool(server, "get_workspace_situation");
+      const decision = {
+        clientMessageId: "decision-message",
+        topicKey: "task:review",
+        taskId: "review",
+        resolutionKind: "durable_item",
+        durableItemRequestId: "decision",
+        expectedRevision: 0,
+        decision: "approve",
+      };
+      const invoke = (patch: Record<string, unknown> = {}) =>
+        invokeToolWithParsedInput(tool, { ...decision, ...patch }, false);
+      await expect(invoke({ workspaceId: "wks_other" })).rejects.toThrow(
+        AGENT_WORKSPACE_CREATION_ERROR,
+      );
+      await expect(
+        invokeToolWithParsedInput(situation, { workspaceId: "wks_other" }, false),
+      ).rejects.toThrow(AGENT_WORKSPACE_CREATION_ERROR);
+      await expect(invoke()).rejects.toThrow(/direct human turn/);
+      await expect(
+        invoke({
+          resolutionKind: "task_blocking_question",
+          durableItemRequestId: undefined,
+          expectedRevision: undefined,
+          decision: undefined,
+          note: "Friday",
+        }),
+      ).rejects.toThrow(/direct human turn/);
+      spies.agentManager.isActiveTurnHumanInitiated.mockReturnValue(true);
+      spies.agentStorage.get.mockImplementationOnce(async () => {
+        current = {
+          ...main,
+          activeForegroundTurnId: "next-human-turn",
+          activeTurnId: "next-human-turn",
+        };
+        return null;
+      });
+      await expect(
+        invoke({
+          resolutionKind: "task_blocking_question",
+          durableItemRequestId: undefined,
+          expectedRevision: undefined,
+          decision: undefined,
+          note: "Friday",
+        }),
+      ).rejects.toThrow(/direct human turn/);
+      current = main;
+      await expect(invoke({ durableItemRequestId: "authorization" })).rejects.toThrow(
+        /System authorizations/,
+      );
+      spies.agentManager.isActiveTurnHumanInitiated
+        .mockReturnValueOnce(true)
+        .mockReturnValueOnce(true)
+        .mockReturnValueOnce(false);
+      await expect(invoke()).rejects.toThrow(/direct human turn/);
+      current = { ...main, labels: {} };
+      await expect(invoke()).rejects.toThrow(/Only Main Control/);
+      await expect(invokeToolWithParsedInput(situation, {}, false)).rejects.toThrow(
+        /Only Main Control/,
+      );
+      expect(decideTopicAction).not.toHaveBeenCalled();
+      expect(getWorkspaceSituation).not.toHaveBeenCalled();
+      current = main;
+      const read = await invokeToolWithParsedInput(situation, {}, false);
+      expect(read.structuredContent).toMatchObject({ counts: { pendingDurableItems: 2 } });
+      expect(read.content).toEqual([
+        { type: "text", text: JSON.stringify(read.structuredContent) },
+      ]);
+      expect(getWorkspaceSituation).toHaveBeenCalledExactlyOnceWith(workspaceId, main.id, {
+        includeCompletedTasks: false,
+        completedLimit: 5,
+      });
+      await expect(invoke()).resolves.toMatchObject({
+        structuredContent: { routedTo: "lead", targetAgentId: "lead", error: null },
+      });
+      expect(decideTopicAction).toHaveBeenCalledWith(
+        expect.objectContaining({ mainAgentId: main.id, workspaceId, topicKey: "task:review" }),
+        expect.objectContaining({ origin: "butler_dispatch", principalId: "agent:main" }),
+      );
+    } finally {
+      await removeTempDir(directory);
+    }
   });
 });
 
@@ -4828,6 +5080,7 @@ describe("send_agent_prompt MCP tool", () => {
       const childAgent = {
         id: "child-agent",
         cwd: existingCwd,
+        workspaceId: parentAgent.workspaceId,
         lifecycle: "running",
         currentModeId: null,
         availableModes: [],
@@ -4924,6 +5177,7 @@ describe("send_agent_prompt MCP tool", () => {
     const childAgent = {
       id: "child-agent",
       cwd: existingCwd,
+      workspaceId: parentAgent.workspaceId,
       lifecycle: "idle",
       currentModeId: null,
       availableModes: [],

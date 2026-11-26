@@ -24,7 +24,12 @@ import {
   createWorkspaceBaseBranchService,
   type WorkspaceBaseBranchService,
 } from "./session/workspace-base-branch/service.js";
-import type { WorkspaceBaseBranchSetRequest } from "@getpaseo/protocol/messages";
+import type {
+  TopicAnchorSummary,
+  WorkspaceBaseBranchSetRequest,
+  WorkspaceTopicDecideRequest,
+  WorkspaceTopicDecideResponse,
+} from "@getpaseo/protocol/messages";
 
 import { searchTimeline } from "./agent/chat-search/index.js";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
@@ -187,6 +192,7 @@ import {
   AgentManager,
   AgentManagerShuttingDownError,
   AgentRunCancellationError,
+  directHumanPromptRunOptions,
   REMOTE_CHILD_RESERVATION_LABEL,
 } from "./agent/agent-manager.js";
 import { buildTimelinePromptIndex } from "./agent/timeline-prompt-index.js";
@@ -896,8 +902,21 @@ export interface SessionOptions {
   durableItems?: DurableItemStore;
   topicReadState?: TopicReadStateStore;
   todos?: WorkspaceTodoStore;
-  topicReplyRouter?: TopicReplyRouter;
+  topicReplyRouter?: Pick<TopicReplyRouter, "list"> & {
+    reply(
+      request: Parameters<TopicReplyRouter["reply"]>[0],
+      decision?: Parameters<TopicReplyRouter["reply"]>[1],
+      humanInitiated?: boolean,
+    ): ReturnType<TopicReplyRouter["reply"]>;
+  };
   topicThreadStore?: TopicThreadStore;
+  decideWorkspaceTopic?: (
+    request: WorkspaceTopicDecideRequest,
+    principalId: string,
+  ) => Promise<WorkspaceTopicDecideResponse["payload"]>;
+  persistTopicAnchor?: (
+    anchor: Omit<TopicAnchorSummary, "createdAt" | "updatedAt">,
+  ) => Promise<unknown>;
   workspaceBaseBranch?: WorkspaceBaseBranchService;
   directorySync?: DirectorySyncService;
   workspaceLabelService?: WorkspaceLabelService;
@@ -1262,8 +1281,10 @@ export class Session {
   private readonly pushNotifications: PushNotifications;
   private readonly topicReadState: TopicReadStateStore | undefined;
   private readonly todos: WorkspaceTodoStore | undefined;
-  private readonly topicReplyRouter: TopicReplyRouter | undefined;
+  private readonly topicReplyRouter: SessionOptions["topicReplyRouter"];
   private readonly topicThreadStore: TopicThreadStore | undefined;
+  private readonly decideWorkspaceTopic: SessionOptions["decideWorkspaceTopic"];
+  private readonly persistTopicAnchor: SessionOptions["persistTopicAnchor"];
   private readonly publishTopicReadUpdate: SessionOptions["publishTopicReadUpdate"];
   private readonly publishTodoUpdate: SessionOptions["publishTodoUpdate"];
   private readonly pluginRuntime: SessionOptions["pluginRuntime"];
@@ -1417,6 +1438,8 @@ export class Session {
     this.todos = options.todos;
     this.topicReplyRouter = options.topicReplyRouter;
     this.topicThreadStore = options.topicThreadStore;
+    this.decideWorkspaceTopic = options.decideWorkspaceTopic;
+    this.persistTopicAnchor = options.persistTopicAnchor;
     this.publishTopicReadUpdate = options.publishTopicReadUpdate;
     this.publishTodoUpdate = options.publishTodoUpdate;
     this.connectedHostSession = createHostSession(options, this);
@@ -3393,6 +3416,33 @@ export class Session {
     msg: SessionInboundMessage,
     source?: object,
   ): Promise<void> | undefined {
+    if (msg.type === "workspace.topic.decide.request") {
+      const decide = this.decideWorkspaceTopic;
+      if (!decide || !this.supports(CLIENT_CAPS.workspaceButlerV1)) {
+        this.emitForSource(
+          {
+            type: "workspace.topic.decide.response",
+            payload: {
+              requestId: msg.requestId,
+              workspaceId: msg.workspaceId,
+              topicKey: msg.topicKey,
+              accepted: false,
+              durableItem: null,
+              task: null,
+              routedTo: "none",
+              targetAgentId: null,
+              entry: null,
+              error: "Workspace topic decisions are unavailable on this connection.",
+            },
+          },
+          source,
+        );
+        return Promise.resolve();
+      }
+      return decide(msg, this.durableItemPrincipalId).then((payload) =>
+        this.emitForSource({ type: "workspace.topic.decide.response", payload }, source),
+      );
+    }
     if (
       msg.type !== "workspace.topic.reply.request" &&
       msg.type !== "workspace.topic.list_entries.request"
@@ -3401,7 +3451,7 @@ export class Session {
     if (!this.topicReplyRouter) throw new Error("Workspace topics are unavailable.");
     const response =
       msg.type === "workspace.topic.reply.request"
-        ? this.topicReplyRouter.reply(msg)
+        ? this.topicReplyRouter.reply(msg, undefined, this.isDirectHumanPromptIngress())
         : this.topicReplyRouter.list(msg);
     return response.then((value) => this.emitForSource(value, source));
   }
@@ -6468,17 +6518,33 @@ export class Session {
     await this.agentStorage.acceptSideChatPrompt(agentId);
   }
 
+  private isDirectHumanPromptIngress(): boolean {
+    // The direct owner session is authenticated by the daemon. Routed sessions,
+    // plugins and Hub services can send prompts under delegated authority.
+    return (
+      !this.isRouted() &&
+      this.hostSourceId === "owner" &&
+      !this.hubExecutionController &&
+      this.authorization.allowsPermission("workspace.write")
+    );
+  }
+
   private async sendHumanPrompt(
     params: Omit<
       Parameters<typeof sendPromptToAgent>[0],
-      "agentManager" | "agentStorage" | "agentMessages" | "logger"
+      "agentManager" | "agentStorage" | "agentMessages" | "logger" | "source"
     >,
+    allowHumanAuthority = true,
   ): ReturnType<typeof sendPromptToAgent> {
     let registration: FinishRegistration | undefined;
     let dispatched = false;
     try {
       return await sendPromptToAgent({
         ...params,
+        runOptions:
+          allowHumanAuthority && this.isDirectHumanPromptIngress()
+            ? directHumanPromptRunOptions(params.runOptions)
+            : params.runOptions,
         agentMessages: this.agentMessages,
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
@@ -7218,6 +7284,9 @@ export class Session {
       await this.agentUpdates.forwardLiveAgent(
         this.agentManager.getAgent(snapshot.id) ?? liveSnapshot,
       );
+      if (createAsMain && initialPromptStarted && msg.clientMessageId && trimmedPrompt) {
+        await this.storeHumanTopicAnchor(snapshot.id, msg.clientMessageId, trimmedPrompt);
+      }
       if (resolvedIntent.createdDirectoryWorkspace && trimmedPrompt) {
         this.workspaceAutoName.scheduleForDirectory(
           {
@@ -12211,6 +12280,33 @@ export class Session {
     }
   }
 
+  private async storeHumanTopicAnchor(agentId: string, messageId: string, text: string) {
+    if (!this.persistTopicAnchor) return;
+    try {
+      const agent = this.agentManager.getAgent(agentId);
+      if (!agent?.workspaceId || agent.internal || !isMainControlAgentLabels(agent.labels)) return;
+      const workspace = await this.workspaceRegistry.get(agent.workspaceId);
+      if (
+        !workspace?.topic ||
+        workspace.archivedAt ||
+        (await this.describeWorkspaceMain(workspace)).topic?.mainAgentId !== agentId
+      )
+        return;
+      await this.persistTopicAnchor({
+        workspaceId: workspace.workspaceId,
+        mainAgentId: agentId,
+        topicKey: `msg:${messageId}`,
+        rootMessageId: messageId,
+        rootPromptText: text,
+      });
+    } catch (error) {
+      this.sessionLogger.warn(
+        { err: error, agentId, messageId },
+        "Could not persist topic question",
+      );
+    }
+  }
+
   private recoverableAgentMessage(
     msg: Extract<SessionInboundMessage, { type: "send_agent_message_request" }>,
     prompt: AgentPromptInput,
@@ -12386,6 +12482,7 @@ export class Session {
       const behavior = msg.sourceAgentId
         ? this.agentSenderBehavior(requested)
         : this.humanSenderBehavior(requested);
+      const allowHumanAuthority = !msg.sourceAgentServerId && !msg.sourceAgentEvent;
       const recoverable = this.recoverableAgentMessage(
         msg,
         prompt,
@@ -12452,15 +12549,18 @@ export class Session {
           }
           return;
         }
-        const result = await this.sendHumanPrompt({
-          agentId,
-          prompt,
-          messageId: msg.messageId,
-          activeTurnBehavior: requested === "steer" ? "steer" : "interrupt",
-          sessionMode: msg.sessionMode,
-          clearPendingPermissions: true,
-          beforeDispatch: handoff?.begin,
-        });
+        const result = await this.sendHumanPrompt(
+          {
+            agentId,
+            prompt,
+            messageId: msg.messageId,
+            activeTurnBehavior: requested === "steer" ? "steer" : "interrupt",
+            sessionMode: msg.sessionMode,
+            clearPendingPermissions: true,
+            beforeDispatch: handoff?.begin,
+          },
+          allowHumanAuthority,
+        );
         if (result.disposition === "turn_started") {
           await waitForAgentRunStartWithTimeout(
             this.agentManager,
@@ -12468,6 +12568,9 @@ export class Session {
             result.started,
             this.delivery.requestSignal,
           );
+        }
+        if (msg.messageId && result.disposition !== "out_of_band") {
+          await this.storeHumanTopicAnchor(agentId, msg.messageId, msg.text);
         }
       };
       const messageId = recoverable?.messageId ?? msg.messageId;

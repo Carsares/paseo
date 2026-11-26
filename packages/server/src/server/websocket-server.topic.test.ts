@@ -5,20 +5,31 @@ import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/pr
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { getOpenAgentTabLabel } from "@getpaseo/protocol/agent-labels";
+import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
+import { PARENT_AGENT_ID_LABEL, PARENT_REPORTING_LABEL } from "@getpaseo/protocol/agent-labels";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import {
   WSOutboundMessageSchema,
   type SessionOutboundMessage,
   type WorkspaceCreateRequest,
 } from "@getpaseo/protocol/messages";
 import { expect, test, vi, type TestContext } from "vitest";
+import { createTestLogger } from "../test-utils/test-logger.js";
 import { WebSocket, type RawData } from "ws";
 import type { AgentPromptInput } from "./agent/agent-sdk-types.js";
 import { AgentManager } from "./agent/agent-manager.js";
+import { ensureAgentLoaded } from "./agent/agent-loading.js";
+import { TASK_ID_LABEL } from "./agent/hierarchy-policy.js";
+import { WorkspaceTaskLedgerStore } from "./agent/task-ledger/index.js";
+import { openDurableItemStore } from "./durable-items/requests.js";
 import { resetInMemoryPeerDispatchStateForTest } from "./agent/agent-messages/envelope.js";
 import { MessageReceipts } from "./message-receipts/index.js";
 import { createTestAgentClients } from "./test-utils/fake-agent-client.js";
 import { createTestPaseoDaemon, type TestPaseoDaemon } from "./test-utils/paseo-daemon.js";
+import { TopicThreadStore } from "./topic-threads/store.js";
 import { WorkspaceAutoName } from "./workspace-auto-name.js";
+import { FileBackedWorkspaceRegistry } from "./workspace-registry.js";
 
 const LEGACY_CLIENT = "topic-tests-legacy";
 const CURRENT_CLIENT = "topic-tests-current";
@@ -30,6 +41,288 @@ type Response<T extends SessionOutboundMessage["type"]> = Extract<
   { type: T }
 >;
 
+test(
+  "rejects an old blocking question version over WebSocket without starting Main Control",
+  async (context) => {
+    const start = vi.fn();
+    const daemon = await startDaemon(context, {
+      agentClients: createTestAgentClients({ onStartTurn: start }),
+    });
+    const { socket } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION, {
+      [CLIENT_CAPS.workspaceButlerV1]: true,
+    });
+    const topic = await createWorkspace(
+      socket,
+      directoryWorkspace(daemon, {
+        title: "Blocking question",
+        topic: { summary: "Blocking question" },
+        mainAgent: { config: { provider: "codex", cwd: daemon.staticDir } },
+      }),
+    );
+    const mainAgentId = topic.mainAgent?.id;
+    if (!mainAgentId) throw new Error("Expected a Main Control agent");
+    const workspaceId = topic.workspace.id;
+    const taskId = "blocked-task";
+    const blockingQuestion = "Which day?";
+    const ledger = new WorkspaceTaskLedgerStore(daemon.paseoHome);
+    const first = await ledger.upsert(workspaceId, {
+      taskId,
+      title: "Pick a date",
+      status: "awaiting_decision",
+      blockingQuestion,
+    });
+    const current = await ledger.syncFromTurnOutcome(workspaceId, taskId, { blockingQuestion });
+    const result = await request(
+      socket,
+      {
+        type: "workspace.topic.decide.request",
+        workspaceId,
+        mainAgentId,
+        topicKey: `task:${taskId}`,
+        taskId,
+        resolutionKind: "task_blocking_question",
+        expectedBlockingQuestionGeneration: first.blockingQuestionGeneration,
+        clientMessageId: randomUUID(),
+        note: "Friday",
+      },
+      "workspace.topic.decide.response",
+    );
+    expect(result.payload).toMatchObject({
+      accepted: false,
+      errorCode: "stale_blocking_question",
+      task: {
+        blockingQuestion,
+        blockingQuestionGeneration: current?.blockingQuestionGeneration,
+      },
+      routedTo: "none",
+      entry: null,
+    });
+    expect(await ledger.list(workspaceId)).toEqual([current]);
+    expect(await new TopicThreadStore(daemon.paseoHome).list({ workspaceId, mainAgentId })).toEqual(
+      [],
+    );
+    expect(start).not.toHaveBeenCalled();
+  },
+  TEST_TIMEOUT,
+);
+
+for (const closed of [false, true]) {
+  test(
+    `preserves legacy topic questions through WebSocket reset (closed=${closed})`,
+    async (context) => {
+      const daemon = await startDaemon(context);
+      const { socket } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION, {
+        [CLIENT_CAPS.workspaceButlerV1]: true,
+      });
+      const topic = await createWorkspace(
+        socket,
+        directoryWorkspace(daemon, {
+          title: "Legacy topic history",
+          topic: { summary: "Legacy topic history" },
+          mainAgent: { config: { provider: "codex", cwd: daemon.staticDir } },
+        }),
+      );
+      const agentId = topic.mainAgent?.id;
+      if (!agentId) throw new Error("Expected a Main Control agent");
+      const workspaceId = topic.workspace.id;
+      const scope = { workspaceId, mainAgentId: agentId };
+      const manager = daemon.daemon.agentManager;
+      await ensureAgentLoaded(agentId, {
+        agentManager: manager,
+        agentStorage: daemon.daemon.agentStorage,
+        logger: createTestLogger(),
+      });
+      const boundRoot = randomUUID();
+      const boundProviderId = randomUUID();
+      const unboundRoot = randomUUID();
+      const followupId = randomUUID();
+      await manager.appendTimelineItem(agentId, {
+        type: "user_message",
+        text: "Original bound question",
+        messageId: boundProviderId,
+        clientMessageId: boundRoot,
+      });
+      await manager.appendTimelineItem(agentId, {
+        type: "user_message",
+        text: "Original unbound question",
+        messageId: unboundRoot,
+      });
+      await manager.appendTimelineItem(agentId, {
+        type: "user_message",
+        text: "Follow-up already on the topic",
+        messageId: followupId,
+      });
+      const ledger = new WorkspaceTaskLedgerStore(daemon.paseoHome);
+      await ledger.upsert(workspaceId, {
+        taskId: "historic",
+        rootMessageId: boundRoot,
+        title: "Task title",
+        leadAgentId: "lead",
+      });
+      if (closed) await manager.closeAgent(agentId);
+      const list = async () =>
+        (
+          await request(
+            socket,
+            { type: "workspace.topic.list_entries.request", ...scope },
+            "workspace.topic.list_entries.response",
+          )
+        ).payload;
+      const reset = async () =>
+        (
+          await request(
+            socket,
+            { type: "agent.session.reset.request", agentId, clearVisibleTimeline: true },
+            "agent.session.reset.response",
+          )
+        ).payload;
+      const visibleRootIds = async () =>
+        (closed
+          ? (
+              await manager.readStoredTimeline((await daemon.daemon.agentStorage.get(agentId))!, {
+                limit: 0,
+              })
+            ).rows
+          : manager.fetchTimeline(agentId, { limit: 0 }).rows
+        ).flatMap(({ item }) => (item.type === "user_message" ? [item.messageId] : []));
+      expect((await list()).anchors).toEqual([]);
+      expect(await visibleRootIds()).toEqual([boundProviderId, unboundRoot, followupId]);
+
+      const path = join(daemon.paseoHome, "topic-threads", `${workspaceId}.json`);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, "{invalid");
+      expect(await reset()).toMatchObject({ accepted: false });
+      expect(await visibleRootIds()).toEqual([boundProviderId, unboundRoot, followupId]);
+      await rm(path);
+
+      const followup = await new TopicThreadStore(daemon.paseoHome).begin({
+        ...scope,
+        topicKey: `msg:${boundRoot}`,
+        rootMessageId: boundRoot,
+        routedAgentId: agentId,
+        sourceMessageId: followupId,
+        text: "Follow-up already on the topic",
+      });
+      followup.release?.();
+
+      const deletion = vi
+        .spyOn(manager, "deleteCommittedTimeline")
+        .mockRejectedValueOnce(new Error("Timeline delete failed"));
+      try {
+        expect(await reset()).toMatchObject({ accepted: false, error: "Timeline delete failed" });
+        expect(await visibleRootIds()).toEqual([boundProviderId, unboundRoot, followupId]);
+      } finally {
+        deletion.mockRestore();
+      }
+      const anchors = (await list()).anchors;
+      expect(anchors).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            topicKey: "task:historic",
+            rootMessageId: boundRoot,
+            rootPromptText: "Original bound question",
+            title: "Task title",
+            leadAgentId: "lead",
+          }),
+          expect.objectContaining({
+            topicKey: `msg:${unboundRoot}`,
+            rootMessageId: unboundRoot,
+            rootPromptText: "Original unbound question",
+          }),
+        ]),
+      );
+      expect(anchors).toHaveLength(2);
+      expect(await reset()).toMatchObject({ accepted: true, error: null });
+      expect(await visibleRootIds()).toEqual([]);
+      expect(await list()).toMatchObject({
+        anchors,
+        entries: [{ topicKey: "task:historic", sourceMessageId: followupId }],
+      });
+    },
+    TEST_TIMEOUT,
+  );
+}
+
+test(
+  "preserves legacy topics before conversation rewind removes their visible messages",
+  async (context) => {
+    const daemon = await startDaemon(context);
+    const { socket } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION, {
+      [CLIENT_CAPS.workspaceButlerV1]: true,
+    });
+    const topic = await createWorkspace(
+      socket,
+      directoryWorkspace(daemon, {
+        title: "Rewindable topic",
+        topic: { summary: "Rewindable topic" },
+        mainAgent: { config: { provider: "codex", cwd: daemon.staticDir } },
+      }),
+    );
+    const agentId = topic.mainAgent?.id;
+    if (!agentId) throw new Error("Expected a Main Control agent");
+    const workspaceId = topic.workspace.id;
+    const manager = daemon.daemon.agentManager;
+    await ensureAgentLoaded(agentId, {
+      agentManager: manager,
+      agentStorage: daemon.daemon.agentStorage,
+      logger: createTestLogger(),
+    });
+    const session = manager.getAgent(agentId)?.session;
+    if (!session) throw new Error("Expected an interactive provider session");
+    session.capabilities.supportsRewindConversation = true;
+    session.revertConversation = vi.fn(async () => {});
+    vi.spyOn(session, "streamHistory").mockImplementation(async function* () {});
+    const root = randomUUID();
+    await manager.appendTimelineItem(agentId, {
+      type: "user_message",
+      text: "A question that predates topic anchors",
+      messageId: root,
+    });
+    const rewind = async () =>
+      (
+        await request(
+          socket,
+          {
+            type: "agent.rewind.request",
+            agentId,
+            messageId: root,
+            mode: "conversation",
+          },
+          "agent.rewind.response",
+        )
+      ).payload;
+    const path = join(daemon.paseoHome, "topic-threads", `${workspaceId}.json`);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, "{invalid");
+    expect(await rewind()).toMatchObject({ ok: false });
+    expect(session.revertConversation).not.toHaveBeenCalled();
+    expect(manager.getTimeline(agentId)).toContainEqual(
+      expect.objectContaining({ messageId: root }),
+    );
+    await rm(path);
+    expect(await rewind()).toMatchObject({ ok: true });
+    expect(session.revertConversation).toHaveBeenCalledTimes(1);
+    expect(manager.getTimeline(agentId)).not.toContainEqual(
+      expect.objectContaining({ messageId: root }),
+    );
+    expect(
+      (
+        await new TopicThreadStore(daemon.paseoHome).listWithAnchors({
+          workspaceId,
+          mainAgentId: agentId,
+        })
+      ).anchors,
+    ).toMatchObject([
+      {
+        topicKey: `msg:${root}`,
+        rootMessageId: root,
+        rootPromptText: "A question that predates topic anchors",
+      },
+    ]);
+  },
+  TEST_TIMEOUT,
+);
+
 function send(socket: WebSocket, message: object): void {
   socket.send(JSON.stringify({ type: "session", message }));
 }
@@ -38,12 +331,13 @@ function waitForSession<T>(
   socket: WebSocket,
   description: string,
   select: (message: SessionOutboundMessage) => T | undefined,
+  timeoutMs = 6_000,
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       cleanup();
       reject(new Error(`Timed out waiting for ${description}`));
-    }, 6_000);
+    }, timeoutMs);
     const onMessage = (data: RawData, isBinary: boolean) => {
       if (isBinary) return;
       const parsed = WSOutboundMessageSchema.safeParse(JSON.parse(data.toString()));
@@ -108,7 +402,7 @@ async function startDaemon(
   });
   return {
     ...daemon,
-    async connect(clientId: string, appVersion?: string) {
+    async connect(clientId: string, appVersion?: string, capabilities?: Record<string, boolean>) {
       const socket = new WebSocket(`ws://127.0.0.1:${daemon.port}/ws`);
       sockets.add(socket);
       socket.once("close", () => sockets.delete(socket));
@@ -125,6 +419,7 @@ async function startDaemon(
           clientType: "browser",
           protocolVersion: 1,
           ...(appVersion ? { appVersion } : {}),
+          ...(capabilities ? { capabilities } : {}),
         }),
       );
       return { socket, info: await info };
@@ -976,6 +1271,107 @@ test(
     const daemon = await startDaemon(context);
     const { info } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION);
     expect(info.features?.topicWorkbenchV1).toBe(true);
+    expect(info.features?.workspaceButlerV1).toBe(true);
+  },
+  TEST_TIMEOUT,
+);
+
+test(
+  "persists the first question and only pushes its anchor to capable connections",
+  async (context) => {
+    const daemon = await startDaemon(context);
+    const { socket } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION, {
+      [CLIENT_CAPS.workspaceButlerV1]: true,
+    });
+    const { socket: legacy } = await daemon.connect(LEGACY_CLIENT);
+    const topic = await createWorkspace(
+      socket,
+      directoryWorkspace(daemon, {
+        title: "Self-contained question",
+        topic: { summary: "Self-contained question" },
+        mainAgent: { config: { provider: "codex", cwd: daemon.staticDir } },
+      }),
+    );
+    const mainAgentId = topic.mainAgent?.id;
+    if (!mainAgentId) throw new Error("Expected a Main Control agent");
+    const workspaceId = topic.workspace.id;
+    const messageId = randomUUID();
+    const rootPromptText = "What can we finish this week?";
+    const onLegacyMessage = vi.fn((data: RawData, isBinary: boolean) => {
+      if (isBinary) return undefined;
+      const parsed = WSOutboundMessageSchema.safeParse(JSON.parse(data.toString()));
+      return parsed.success && parsed.data.type === "session"
+        ? parsed.data.message.type
+        : undefined;
+    });
+    legacy.on("message", onLegacyMessage);
+    const anchorUpdate = waitForSession(socket, "workspace.topic.anchor.updated", (message) =>
+      message.type === "workspace.topic.anchor.updated" &&
+      message.payload.anchor.rootMessageId === messageId
+        ? message.payload.anchor
+        : undefined,
+    );
+    const sent = await request(
+      socket,
+      { type: "send_agent_message_request", agentId: mainAgentId, messageId, text: rootPromptText },
+      "send_agent_message_response",
+    );
+    expect(sent.payload.accepted).toBe(true);
+    const anchor = await anchorUpdate;
+    expect(anchor).toMatchObject({
+      workspaceId,
+      mainAgentId,
+      rootPromptText,
+      topicKey: `msg:${messageId}`,
+    });
+    const list = await request(
+      legacy,
+      { type: "workspace.topic.list_entries.request", workspaceId, mainAgentId },
+      "workspace.topic.list_entries.response",
+    );
+    expect(list.payload.anchors).toContainEqual(anchor);
+    expect(onLegacyMessage.mock.results.map((result) => result.value)).not.toContain(
+      "workspace.topic.anchor.updated",
+    );
+
+    const taskId = "direct-topic-decision";
+    const ledger = new WorkspaceTaskLedgerStore(daemon.paseoHome);
+    await ledger.upsert(workspaceId, {
+      taskId,
+      title: "Choose a deadline",
+      status: "awaiting_decision",
+      blockingQuestion: "Which day?",
+      rootMessageId: messageId,
+    });
+    const decision = {
+      type: "workspace.topic.decide.request",
+      workspaceId,
+      mainAgentId,
+      topicKey: `task:${taskId}`,
+      taskId,
+      rootMessageId: messageId,
+      clientMessageId: randomUUID(),
+      resolutionKind: "task_blocking_question",
+      note: "Friday",
+      dispatchFollowup: false,
+    };
+    const denied = await request(legacy, decision, "workspace.topic.decide.response");
+    expect(denied.payload).toMatchObject({
+      accepted: false,
+      error: expect.stringContaining("unavailable on this connection"),
+    });
+    const result = await request(socket, decision, "workspace.topic.decide.response");
+    expect(result.payload).toMatchObject({
+      accepted: true,
+      error: null,
+      routedTo: "none",
+      task: { taskId, status: "in_progress" },
+      entry: { origin: "decision_reply", text: "Friday" },
+    });
+    expect(result.payload.task?.blockingQuestion).toBeUndefined();
+    expect(onLegacyMessage.mock.results.map((item) => item.value)).not.toContain(
+      "workspace.tasks.updated",
+    );
   },
   TEST_TIMEOUT,
 );
@@ -1061,6 +1457,443 @@ test(
     expect(manager.getAgent(mainAgentId)?.attention.requiresAttention).toBe(true);
     await mark(a.root, a.turnId, "cross-turn-report-a");
     expect(manager.getAgent(mainAgentId)?.attention).toEqual({ requiresAttention: false });
+  },
+  TEST_TIMEOUT,
+);
+
+test.for([
+  "sole lead",
+  "multiple tracks",
+  "new blocker",
+  "interrupted card write",
+  "terminal retention during interrupted card write",
+  "interruption after the report receipt commits",
+] as const)(
+  "routes a completed topic report with %s",
+  async (scenario, context) => {
+    const multiTrack = scenario === "multiple tracks";
+    const newBlocker = scenario === "new blocker";
+    const terminalChurn = scenario === "terminal retention during interrupted card write";
+    const newBlockerAfterCompletion = scenario === "interrupted card write";
+    const interruptedCardWrite = terminalChurn || newBlockerAfterCompletion;
+    const interruptedAfterReceipt = scenario === "interruption after the report receipt commits";
+    const push = vi.fn(async () => {});
+    const daemon = await startDaemon(context, {
+      mcpEnabled: true,
+      pushNotificationSender: { send: push },
+    });
+    const { socket } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION, {
+      [CLIENT_CAPS.workspaceButlerV1]: true,
+      [CLIENT_CAPS.workspaceTopicThreads]: true,
+    });
+    const config = { provider: "codex" as const, cwd: daemon.staticDir };
+    const topic = await createWorkspace(
+      socket,
+      directoryWorkspace(daemon, {
+        title: "Report progress",
+        topic: { summary: "Report progress" },
+        mainAgent: { config },
+      }),
+    );
+    const mainAgentId = topic.mainAgent?.id;
+    if (!mainAgentId) throw new Error("Expected a Main Control agent");
+    const workspaceId = topic.workspace.id;
+    const taskId = "sole-lead-report";
+    if (multiTrack || newBlocker) {
+      await openInteractiveAgent(socket, mainAgentId);
+      const started = await request(
+        socket,
+        {
+          type: "send_agent_message_request",
+          agentId: mainAgentId,
+          text: "Coordinate both tracks.",
+          messageId: randomUUID(),
+        },
+        "send_agent_message_response",
+      );
+      expect(started.payload.accepted).toBe(true);
+      await vi.waitFor(() =>
+        expect(daemon.daemon.agentManager.getAgent(mainAgentId)?.lifecycle).toBe("idle"),
+      );
+    }
+    const ledger = new WorkspaceTaskLedgerStore(daemon.paseoHome);
+    const child = await daemon.daemon.agentManager.createAgent(config, undefined, {
+      workspaceId,
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: mainAgentId,
+        [PARENT_REPORTING_LABEL]: "explicit",
+        [TASK_ID_LABEL]: taskId,
+      },
+    });
+    const sibling = multiTrack
+      ? await daemon.daemon.agentManager.createAgent(config, undefined, {
+          workspaceId,
+          labels: { [PARENT_AGENT_ID_LABEL]: mainAgentId, [TASK_ID_LABEL]: taskId },
+        })
+      : null;
+    await ledger.upsert(workspaceId, {
+      taskId,
+      title: "Publish the sole lead's report",
+      status: "in_progress",
+      leadAgentId: child.id,
+      participants: [
+        { agentId: child.id, boundBy: mainAgentId },
+        ...(sibling ? [{ agentId: sibling.id, boundBy: mainAgentId }] : []),
+      ],
+    });
+    const tools = new Client({ name: "lead", version: "1" });
+    context.onTestFinished(() => tools.close());
+    await tools.connect(
+      new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${daemon.port}/mcp/agents?callerAgentId=${child.id}`),
+      ),
+    );
+    const summary = "Sole lead finished the requested work.";
+    const report = () =>
+      tools.callTool({ name: "report_to_parent", arguments: { status: "completed", summary } });
+    const manager = daemon.daemon.agentManager;
+    if (multiTrack || newBlocker) {
+      if (sibling) expect(manager.hasInFlightRun(sibling.id)).toBe(false);
+      if (newBlocker) {
+        const original = WorkspaceTaskLedgerStore.prototype.syncFromTurnOutcome;
+        const beforeCommit = vi.spyOn(WorkspaceTaskLedgerStore.prototype, "syncFromTurnOutcome");
+        context.onTestFinished(() => beforeCommit.mockRestore());
+        beforeCommit.mockImplementationOnce(
+          async function (this: WorkspaceTaskLedgerStore, id, task, patch) {
+            expect({ id, task }).toEqual({ id: workspaceId, task: taskId });
+            await original.call(this, id, task, {
+              status: "awaiting_decision",
+              blockingQuestion: "Who should review the newly discovered risk?",
+            });
+            return original.call(this, id, task, patch);
+          },
+        );
+      }
+      expect((await report()).isError).not.toBe(true);
+      await vi.waitFor(
+        async () => {
+          const stored = await daemon.daemon.agentStorage.get(mainAgentId);
+          const timeline = manager.getAgent(mainAgentId)
+            ? manager.getTimeline(mainAgentId)
+            : stored &&
+              (await manager.readStoredTimeline(stored, { limit: 0 })).rows.map(({ item }) => item);
+          expect(timeline).toContainEqual(
+            expect.objectContaining({
+              type: "tool_call",
+              agentMessage: expect.objectContaining({ reportStatus: "completed" }),
+            }),
+          );
+        },
+        { timeout: 8_000 },
+      );
+      expect(await ledger.list(workspaceId)).toContainEqual(
+        expect.objectContaining(
+          newBlocker
+            ? {
+                taskId,
+                status: "awaiting_decision",
+                blockingQuestion: "Who should review the newly discovered risk?",
+              }
+            : { taskId, status: "in_progress" },
+        ),
+      );
+      return;
+    }
+    if (terminalChurn) {
+      const acknowledge = vi.spyOn(WorkspaceTaskLedgerStore.prototype, "acknowledgeSilentReport");
+      context.onTestFinished(() => acknowledge.mockRestore());
+      acknowledge.mockRejectedValueOnce(new Error("The first marker cleanup did not reach disk."));
+    }
+    if (interruptedAfterReceipt) {
+      const sendReceipt = MessageReceipts.prototype.send;
+      const sendSpy = vi.spyOn(MessageReceipts.prototype, "send");
+      context.onTestFinished(() => sendSpy.mockRestore());
+      let interrupted = false;
+      sendSpy.mockImplementation(async function (this: MessageReceipts, input) {
+        await sendReceipt.call(this, input);
+        if (interrupted || input.agentId !== mainAgentId || !input.confirmPendingSilentDelivery)
+          return;
+        interrupted = true;
+        expect(push).not.toHaveBeenCalled();
+        expect(await this.outcome(input.agentId, input.messageId)).toBe("accepted");
+        throw new Error("Interrupted after committing the report receipt.");
+      });
+    }
+    if (interruptedCardWrite) {
+      const append = vi.spyOn(TopicThreadStore.prototype, "appendReportEntry");
+      context.onTestFinished(() => append.mockRestore());
+      append.mockImplementationOnce(async () => {
+        expect(await ledger.list(workspaceId)).toContainEqual(
+          expect.objectContaining({ taskId, status: "completed" }),
+        );
+        if (terminalChurn) {
+          for (let index = 0; index < 50; index++) {
+            await ledger.upsert(workspaceId, {
+              taskId: `completed-${index}`,
+              title: `Completed ${index}`,
+              status: "completed",
+            });
+          }
+          expect(await ledger.list(workspaceId)).toContainEqual(
+            expect.objectContaining({
+              taskId,
+              silentReportIds: expect.arrayContaining([expect.any(String)]),
+            }),
+          );
+        } else {
+          await ledger.syncFromTurnOutcome(workspaceId, taskId, {
+            status: "awaiting_decision",
+            blockingQuestion: "Is the follow-up required?",
+          });
+        }
+        throw new Error("The first card write did not reach disk.");
+      });
+    }
+    const thread = waitForSession(
+      socket,
+      "silent report",
+      (message) =>
+        message.type === "workspace.topic.thread.updated" && message.payload.entry.taskId === taskId
+          ? message.payload.entry
+          : undefined,
+      // The report handler backs off for five seconds after an interrupted write.
+      interruptedCardWrite ? 12_000 : undefined,
+    );
+    const taskUpdate = waitForSession(socket, "completed task", (message) =>
+      message.type === "workspace.tasks.updated" && message.payload.workspaceId === workspaceId
+        ? message.payload.tasks.find(
+            (task) =>
+              task.taskId === taskId &&
+              task.status === (newBlockerAfterCompletion ? "awaiting_decision" : "completed"),
+          )
+        : undefined,
+    );
+    const result = await report();
+    expect(result.isError, JSON.stringify(result)).not.toBe(true);
+    const [entry, task] = await Promise.all([thread, taskUpdate]);
+    expect(entry).toMatchObject({
+      role: "agent_reply",
+      origin: "subagent_report",
+      reportStatus: "completed",
+      text: summary,
+    });
+    expect(task).toMatchObject(
+      newBlockerAfterCompletion
+        ? { status: "awaiting_decision", blockingQuestion: "Is the follow-up required?" }
+        : { status: "completed", handoffSummary: summary },
+    );
+    expect(manager.hasInFlightRun(mainAgentId)).toBe(false);
+    await vi.waitFor(
+      () =>
+        expect(push).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            body: summary,
+            data: expect.objectContaining({
+              agentId: mainAgentId,
+              workspaceId,
+              reason: "finished",
+            }),
+          }),
+        ),
+      { timeout: 8_000 },
+    );
+    const stored = await daemon.daemon.agentStorage.get(mainAgentId);
+    expect(stored).toMatchObject({ requiresAttention: true, attentionReason: "finished" });
+    expect(stored && (await manager.readStoredTimeline(stored, { limit: 0 })).rows).toEqual([]);
+    const { sourceMessageId } = entry;
+    if (!sourceMessageId) throw new Error("Missing report message ID");
+    const receipts = new MessageReceipts(join(daemon.paseoHome, "parent-report-receipts"));
+    await expect(receipts.outcome(mainAgentId, sourceMessageId)).resolves.toBe("accepted");
+    const savedEntries = await new TopicThreadStore(daemon.paseoHome).list(
+      { workspaceId, mainAgentId },
+      `task:${taskId}`,
+    );
+    expect(
+      savedEntries.filter((candidate) => candidate.sourceMessageId === sourceMessageId),
+    ).toHaveLength(1);
+    await vi.waitFor(
+      async () => {
+        const savedTask = (await ledger.list(workspaceId)).find(
+          (candidate) => candidate.taskId === taskId,
+        );
+        if (terminalChurn) expect(savedTask).toBeUndefined();
+        else expect(savedTask?.silentReportIds).toBeUndefined();
+        if (newBlockerAfterCompletion) {
+          expect(savedTask).toMatchObject({
+            status: "awaiting_decision",
+            blockingQuestion: "Is the follow-up required?",
+          });
+        }
+      },
+      { timeout: 8_000 },
+    );
+    expect(push).toHaveBeenCalledTimes(1);
+  },
+  TEST_TIMEOUT,
+);
+
+test.for(["card", "butler"] as const)(
+  "publishes pending and accepted durable items only to compatible connections via %s",
+  async (channel, context) => {
+    const humanPrompt = "Please approve the verified result.";
+    const started = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const daemon = await startDaemon(context, {
+      mcpEnabled: channel === "butler",
+      agentClients: createTestAgentClients({
+        async beforeTurnComplete(prompt) {
+          if (
+            typeof prompt === "string"
+              ? prompt.includes(humanPrompt)
+              : JSON.stringify(prompt).includes(humanPrompt)
+          ) {
+            started.resolve();
+            await finish.promise;
+          }
+        },
+      }),
+    });
+    const { socket } = await daemon.connect(CURRENT_CLIENT, CURRENT_APP_VERSION, {
+      [CLIENT_CAPS.workspaceButlerV1]: true,
+    });
+    const { socket: legacy } = await daemon.connect(LEGACY_CLIENT);
+    const topic = await createWorkspace(
+      socket,
+      directoryWorkspace(daemon, {
+        title: "Acceptance",
+        topic: { summary: "Acceptance" },
+        mainAgent: { config: { provider: "codex", cwd: daemon.staticDir } },
+      }),
+    );
+    const mainAgentId = topic.mainAgent?.id;
+    if (!mainAgentId) throw new Error("Expected a Main Control agent");
+    const workspaceId = topic.workspace.id;
+    const taskId = "workspace-acceptance";
+    const topicKey = `task:${taskId}`;
+    await new WorkspaceTaskLedgerStore(daemon.paseoHome).upsert(workspaceId, {
+      taskId,
+      title: "Accept the result",
+      status: "verifying",
+    });
+    const serverId = daemon.daemon.getServerId();
+    const store = openDurableItemStore({
+      paseoHome: daemon.paseoHome,
+      serverId,
+      workspaceRegistry: new FileBackedWorkspaceRegistry(
+        join(daemon.paseoHome, "projects", "workspaces.json"),
+        createTestLogger(),
+      ),
+      agentStorage: daemon.daemon.agentStorage,
+    });
+    await writeFile(join(daemon.staticDir, "accepted-result.txt"), "Verified output\n");
+    const legacyMessages: string[] = [];
+    legacy.on("message", (data: RawData, isBinary: boolean) => {
+      if (isBinary) return;
+      const parsed = WSOutboundMessageSchema.safeParse(JSON.parse(data.toString()));
+      if (parsed.success && parsed.data.type === "session")
+        legacyMessages.push(parsed.data.message.type);
+    });
+    const pendingUpdate = waitForSession(socket, "pending durable item", (message) =>
+      message.type === "workspace.durable_item.updated" &&
+      message.payload.item.requestId === "workspace-acceptance-item" &&
+      message.payload.item.status === "pending"
+        ? message.payload.item
+        : undefined,
+    );
+    const pending = await store.create({
+      serverId,
+      workspaceId,
+      taskId,
+      topicKey,
+      requestId: "workspace-acceptance-item",
+      sourceAgentId: mainAgentId,
+      sourceTurnId: "acceptance-turn",
+      kind: "acceptance",
+      title: "Accept the result",
+      evidence: [{ type: "file", path: "accepted-result.txt" }],
+    });
+    expect(await pendingUpdate).toEqual(pending);
+    const updated = waitForSession(socket, "workspace.durable_item.updated", (message) =>
+      message.type === "workspace.durable_item.updated" &&
+      message.payload.item.requestId === pending.requestId &&
+      message.payload.item.status === "decided"
+        ? message.payload.item
+        : undefined,
+    );
+    const decision = {
+      workspaceId,
+      topicKey,
+      taskId,
+      clientMessageId: randomUUID(),
+      resolutionKind: "durable_item",
+      decision: "approve",
+      durableItemRequestId: pending.requestId,
+      expectedRevision: pending.revision,
+    };
+    const manager = daemon.daemon.agentManager;
+    async function decide() {
+      if (channel === "card") {
+        const response = await request(
+          socket,
+          { type: "workspace.topic.decide.request", mainAgentId, ...decision },
+          "workspace.topic.decide.response",
+        );
+        return response.payload;
+      }
+      const tools = new Client({ name: "butler", version: "1" });
+      try {
+        const sent = await request(
+          socket,
+          {
+            type: "send_agent_message_request",
+            agentId: mainAgentId,
+            messageId: randomUUID(),
+            text: humanPrompt,
+          },
+          "send_agent_message_response",
+        );
+        expect(sent.payload.accepted).toBe(true);
+        await started.promise;
+        await tools.connect(
+          new StreamableHTTPClientTransport(
+            new URL(`http://127.0.0.1:${daemon.port}/mcp/agents?callerAgentId=${mainAgentId}`),
+            {
+              requestInit: {
+                headers: { Authorization: `Bearer ${manager.getMcpAuthToken(mainAgentId)}` },
+              },
+            },
+          ),
+        );
+        const call = () => tools.callTool({ name: "dispatch_topic_decision", arguments: decision });
+        const result = await call();
+        expect(result.isError, JSON.stringify(result)).not.toBe(true);
+        finish.resolve();
+        await vi.waitFor(() => expect(manager.hasInFlightRun(mainAgentId)).toBe(false));
+        const idle = await call();
+        expect(idle.isError).toBe(true);
+        expect(JSON.stringify(idle)).toContain("direct human turn");
+        return result.structuredContent;
+      } finally {
+        finish.resolve();
+        await tools.close();
+      }
+    }
+    const [payload, item] = await Promise.all([decide(), updated]);
+    expect(payload).toMatchObject({
+      error: null,
+      routedTo: "none",
+      task: { status: "completed" },
+      durableItem: item,
+    });
+    expect(item).toMatchObject({ status: "decided", decision: "approve" });
+    const list = await request(
+      legacy,
+      { type: "workspace.durable_item.list.request", workspaceId },
+      "workspace.durable_item.list.response",
+    );
+    expect(list.payload.items).toContainEqual(item);
+    expect(legacyMessages).not.toContain("workspace.durable_item.updated");
+    await vi.waitFor(() => expect(manager.hasInFlightRun(mainAgentId)).toBe(false));
   },
   TEST_TIMEOUT,
 );

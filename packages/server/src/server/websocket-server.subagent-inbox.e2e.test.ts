@@ -4,16 +4,219 @@ import {
   hasResidentInboxBypass,
   PARENT_AGENT_ID_LABEL,
   PARENT_REPORTING_LABEL,
+  PARENT_SERVER_ID_LABEL,
 } from "@getpaseo/protocol/agent-labels";
 import { createPaseoApi } from "@getpaseo/client";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { expect, test } from "vitest";
+import { createTestLogger } from "../test-utils/test-logger.js";
 import type { AgentManager } from "./agent/agent-manager.js";
-import { TASK_ID_LABEL } from "./agent/hierarchy-policy.js";
+import { REMOTE_HIERARCHY_DEPTH_LABEL, TASK_ID_LABEL } from "./agent/hierarchy-policy.js";
 import { createJsonFinishSubscriptionStore } from "./agent/finish-subscriptions/internal/json-store.js";
+import { MessageReceipts } from "./message-receipts/index.js";
 import { DaemonClient, createTestPaseoDaemon } from "./test-utils/index.js";
 import { createTestAgentClients } from "./test-utils/fake-agent-client.js";
+import { FileBackedWorkspaceRegistry } from "./workspace-registry.js";
+
+test("explicit MCP children wake their direct parent once for an error or approval", async () => {
+  const handle = await createTestPaseoDaemon({
+    agentClients: createTestAgentClients({
+      onStartTurn(prompt) {
+        const text = JSON.stringify(prompt);
+        if (text.includes("Fail explicit first turn") && !text.includes("agent-notification")) {
+          throw new Error("Synthetic provider start failure");
+        }
+      },
+    }),
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${handle.port}/ws` });
+  const tool = new Client({ name: "explicit-parent", version: "1" });
+  const manager = handle.daemon.agentManager;
+  try {
+    await client.connect();
+    const parent = await client.createAgent({ provider: "codex", cwd: handle.staticDir });
+    await manager.setAgentMainControl(parent.id, true);
+    await tool.connect(
+      new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${handle.port}/mcp/agents?callerAgentId=${parent.id}`),
+      ),
+    );
+    const createChild = async (title: string, initialPrompt: string) => {
+      const result = await tool.callTool({
+        name: "create_agent",
+        arguments: {
+          provider: "codex/gpt-5.4",
+          title,
+          initialPrompt,
+          parentReporting: "explicit",
+          notifyOnFinish: false,
+        },
+      });
+      // A provider startup failure can return a tool error after registering the child.
+      const child = manager.listAgents().find((agent) => agent.config.title === title);
+      if (!child) throw new Error(`MCP did not register ${title}: ${JSON.stringify(result)}`);
+      expect(child.labels?.[PARENT_AGENT_ID_LABEL]).toBe(parent.id);
+      return child.id;
+    };
+    const delivered = () =>
+      manager
+        .getTimeline(parent.id)
+        .flatMap((item) =>
+          item.type === "tool_call" && item.agentMessage
+            ? [{ childId: item.agentMessage.sender.id, event: item.agentMessage.event }]
+            : [],
+        );
+    const watches = () => createJsonFinishSubscriptionStore(handle.paseoHome).list();
+    const first = await createChild("First failure", "Fail explicit first turn");
+    await expect.poll(delivered, { timeout: 8000 }).toEqual([{ childId: first, event: "errored" }]);
+    const child = await createChild("Followup child", "Complete this turn silently");
+    await expect
+      .poll(async () => [
+        manager.getAgent(child)?.lifecycle,
+        (await watches()).filter((record) => record.childAgentId === child).length,
+      ])
+      .toEqual(["idle", 0]);
+    expect(delivered()).toEqual([{ childId: first, event: "errored" }]);
+    const followup = await tool.callTool({
+      name: "send_agent_prompt",
+      arguments: { agentId: child, prompt: "Emit a turn failure" },
+    });
+    expect(followup.isError, JSON.stringify(followup)).not.toBe(true);
+    await expect.poll(delivered, { timeout: 8000 }).toEqual([
+      { childId: first, event: "errored" },
+      { childId: child, event: "errored" },
+    ]);
+    const approvalChild = await createChild("Approver", "Run echo hello");
+    await expect.poll(() => manager.getPendingPermissions(approvalChild)).toHaveLength(1);
+    const approved = [
+      { childId: first, event: "errored" },
+      { childId: child, event: "errored" },
+      { childId: approvalChild, event: "permission-required" },
+    ];
+    await expect.poll(delivered, { timeout: 8000 }).toEqual(approved);
+    await manager.respondToPermission(
+      approvalChild,
+      manager.getPendingPermissions(approvalChild)[0]!.id,
+      {
+        behavior: "allow",
+      },
+    );
+    await expect
+      .poll(
+        async () => ({
+          lifecycle: manager.getAgent(approvalChild)?.lifecycle,
+          pending: manager.getPendingPermissions(approvalChild).map(({ id }) => id),
+          watches: (await watches()).map(({ childAgentId }) => childAgentId),
+        }),
+        { timeout: 6000 },
+      )
+      .toEqual({ lifecycle: "idle", pending: [], watches: [] });
+    expect(delivered()).toEqual(approved);
+  } finally {
+    await tool.close();
+    await client.close();
+    await handle.close();
+  }
+}, 30_000);
+
+test("replays a persisted exceptional report after restart without waking its parent twice", async (context) => {
+  const paseoHomeRoot = await mkdtemp(join(tmpdir(), "paseo-finish-restart-"));
+  const release = Promise.withResolvers<void>();
+  const started = Promise.withResolvers<void>();
+  const first = await createTestPaseoDaemon({
+    paseoHomeRoot,
+    cleanup: false,
+    agentClients: createTestAgentClients({
+      onStartTurn(prompt) {
+        if (JSON.stringify(prompt).includes("Fail restart test")) {
+          throw new Error("Synthetic provider failure");
+        }
+      },
+      async beforeTurnComplete(prompt) {
+        if (!JSON.stringify(prompt).includes("Hold parent during capture")) return;
+        started.resolve();
+        await release.promise;
+      },
+    }),
+  });
+  context.onTestFinished(async () => {
+    await rm(paseoHomeRoot, { recursive: true, force: true });
+    await rm(first.staticDir, { recursive: true, force: true });
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${first.port}/ws` });
+  const tool = new Client({ name: "restart-parent", version: "1" });
+  const watches = () => createJsonFinishSubscriptionStore(first.paseoHome);
+  let parentId: string;
+  let notificationId: string;
+  try {
+    await client.connect();
+    const parent = await client.createAgent({ provider: "codex", cwd: first.staticDir });
+    parentId = parent.id;
+    await client.sendMessage(parentId, "Hold parent during capture");
+    await started.promise;
+    await tool.connect(
+      new StreamableHTTPClientTransport(
+        new URL(`http://127.0.0.1:${first.port}/mcp/agents?callerAgentId=${parentId}`),
+      ),
+    );
+    await tool.callTool({
+      name: "create_agent",
+      arguments: {
+        provider: "codex/gpt-5.4",
+        title: "Restart test child",
+        initialPrompt: "Fail restart test",
+        parentReporting: "explicit",
+        notifyOnFinish: false,
+      },
+    });
+    const captured = async () =>
+      (await watches().list()).find((record) => record.report?.event === "errored");
+    await expect.poll(captured).toMatchObject({
+      callerAgentId: parentId,
+      exceptionalOnly: true,
+      report: { event: "errored" },
+    });
+    const saved = await captured();
+    if (!saved?.report) throw new Error("Expected a persisted exceptional report");
+    notificationId = saved.report.id;
+    release.resolve();
+    const receipts = new MessageReceipts(join(first.paseoHome, "agent-requests"));
+    await expect
+      .poll(() => receipts.outcome(parentId, notificationId), { timeout: 8_000 })
+      .toBe("accepted");
+    await expect.poll(() => watches().list()).toEqual([]);
+    // Recreate the durable state left when the parent accepts just before the watch is removed.
+    await watches().put(saved);
+  } finally {
+    release.resolve();
+    await tool.close();
+    await client.close();
+    await first.close();
+  }
+  const resumedProvider = vi.fn();
+  const second = await createTestPaseoDaemon({
+    paseoHomeRoot,
+    staticDir: first.staticDir,
+    cleanup: false,
+    agentClients: createTestAgentClients({ onStartTurn: resumedProvider }),
+  });
+  try {
+    await expect.poll(() => watches().list()).toEqual([]);
+    await expect(
+      new MessageReceipts(join(second.paseoHome, "agent-requests")).outcome(
+        parentId,
+        notificationId,
+      ),
+    ).resolves.toBe("accepted");
+    expect(resumedProvider).not.toHaveBeenCalled();
+  } finally {
+    await second.close();
+  }
+}, 30_000);
 
 test("a busy child only holds reports for its own task in the parent inbox", async () => {
   const release = Promise.withResolvers<void>();
@@ -424,6 +627,14 @@ test("a one-way child report replaces its held automatic finish and preserves th
     const remoteWorkspace = await destinationApi.workspaces.create({
       source: { kind: "directory", path: destination.staticDir },
     });
+    const remoteRegistry = new FileBackedWorkspaceRegistry(
+      join(destination.paseoHome, "projects", "workspaces.json"),
+      createTestLogger(),
+    );
+    const remotePlacement = await remoteRegistry.get(remoteWorkspace.id);
+    if (!remotePlacement) throw new Error("Missing remote workspace fixture");
+    // A legacy remote child now needs matching workspace identity to receive a scoped prompt.
+    await remoteRegistry.upsert({ ...remotePlacement, workspaceId: workspace.id });
     const parent = await workspace.agents.create({ config: { provider: "codex/codex-test" } });
     const manager = origin.daemon.agentManager;
     await manager.setAgentMainControl(parent.id, true);
@@ -442,19 +653,38 @@ test("a one-way child report replaces its held automatic finish and preserves th
         new URL(`http://127.0.0.1:${port}/mcp/agents?callerAgentId=${agentId}`),
       );
     await parentTools.connect(transport(origin.port, parent.id));
-    const creation = await parentTools.callTool({
-      name: "create_agent",
-      arguments: {
-        serverId: childHostId,
-        workspaceId: remoteWorkspace.id,
-        provider: "codex/codex-test",
-        title: "Remote child",
-        parentReporting: "auto",
-        initialPrompt: "Finish first turn",
+    // Model a child persisted before cross-host creation was disabled.
+    const childId = crypto.randomUUID();
+    const timestamp = new Date().toISOString();
+    await destination.daemon.agentStorage.upsert({
+      id: childId,
+      provider: "codex",
+      cwd: destination.staticDir,
+      workspaceId: workspace.id,
+      title: "Remote child",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      lastStatus: "closed",
+      config: { model: "codex-test" },
+      metadata: {},
+      persistence: { provider: "codex", sessionId: crypto.randomUUID() },
+      labels: {
+        [PARENT_AGENT_ID_LABEL]: parent.id,
+        [PARENT_SERVER_ID_LABEL]: origin.daemon.getServerId(),
+        [REMOTE_HIERARCHY_DEPTH_LABEL]: "1",
+        [PARENT_REPORTING_LABEL]: "auto",
       },
     });
-    expect(creation.isError, JSON.stringify(creation)).not.toBe(true);
-    const { agentId: childId } = creation.structuredContent as { agentId: string };
+    const started = await parentTools.callTool({
+      name: "send_agent_prompt",
+      arguments: {
+        serverId: childHostId,
+        agentId: childId,
+        notifyOnFinish: true,
+        prompt: "Finish first turn",
+      },
+    });
+    expect(started.isError, JSON.stringify(started)).not.toBe(true);
     const inbox = async () =>
       (await parentClient.fetchAgent(parent.id))?.agent.pendingSubagentInbox;
     await expect.poll(inbox, { timeout: 8000 }).toMatchObject({

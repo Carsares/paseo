@@ -31,6 +31,12 @@ function outboundMessage(type: SessionOutboundMessage["type"]): SessionOutboundM
       type,
       payload: { status: "agent_create_failed", error: "test", requestId: "test" },
     } as SessionOutboundMessage;
+  if (
+    type === "daemon.network.get_proxy.response" ||
+    type === "daemon.network.test_proxy.response" ||
+    type === "daemon.network.set_proxy.response"
+  )
+    return { type, payload: { requestId: "test", result: { status: "failed" } } };
   return { type } as SessionOutboundMessage;
 }
 

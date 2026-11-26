@@ -96,6 +96,117 @@ test("ambiguous provider delivery is never blindly replayed after restart", asyn
   expect(deliveries).toBe(1);
 });
 
+test("restart completes a matching pending receipt only after confirming a durable silent delivery", async () => {
+  const { requests, directory } = await fixture();
+  const input = { agentId: "parent", messageId: "report", request: { prompt: "report text" } };
+  const silentCard = path.join(directory, "silent-card");
+  await expect(
+    requests.send({
+      ...input,
+      send: async (beforeDispatch) => {
+        await beforeDispatch();
+        throw new Error("stopped before acknowledgement");
+      },
+    }),
+  ).rejects.toThrow("stopped before acknowledgement");
+  const send = vi.fn();
+  const confirmPendingSilentDelivery = vi.fn(async () =>
+    stat(silentCard).then(
+      () => true,
+      (error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return false;
+        throw error;
+      },
+    ),
+  );
+  const retry = { ...input, send, confirmPendingSilentDelivery };
+  const restarted = new MessageReceipts(directory);
+  await expect(restarted.send({ ...retry, request: { prompt: "different text" } })).rejects.toThrow(
+    "agent_request_key_conflict",
+  );
+  expect(confirmPendingSilentDelivery).not.toHaveBeenCalled();
+  await expect(restarted.send(retry)).rejects.toThrow("agent_request_outcome_unknown");
+  expect(await restarted.outcome(input.agentId, input.messageId)).toBe("unknown");
+
+  await writeFile(silentCard, input.request.prompt);
+  await restarted.send(retry);
+  const reopened = new MessageReceipts(directory);
+  expect(await reopened.outcome(input.agentId, input.messageId)).toBe("accepted");
+  await reopened.send(retry);
+  expect(confirmPendingSilentDelivery).toHaveBeenCalledTimes(2);
+  expect(send).not.toHaveBeenCalled();
+});
+
+test("a failed silent receipt completion can be retried after another restart", async () => {
+  const { requests, directory } = await fixture();
+  const input = { agentId: "parent", messageId: "report", request: { prompt: "report text" } };
+  await expect(
+    requests.send({
+      ...input,
+      send: async (beforeDispatch) => {
+        await beforeDispatch();
+        throw new Error("stopped before acknowledgement");
+      },
+    }),
+  ).rejects.toThrow("stopped before acknowledgement");
+  const [name] = await readdir(directory);
+  const file = path.join(directory, name!);
+  const backup = `${file}.backup`;
+  const send = vi.fn();
+  const confirmPendingSilentDelivery = vi.fn(async () => true);
+  confirmPendingSilentDelivery.mockImplementationOnce(async () => {
+    await rename(file, backup);
+    await mkdir(file);
+    return true;
+  });
+  const retry = { ...input, send, confirmPendingSilentDelivery };
+  await expect(new MessageReceipts(directory).send(retry)).rejects.toThrow();
+  await rm(file, { recursive: true });
+  await rename(backup, file);
+
+  const restarted = new MessageReceipts(directory);
+  expect(await restarted.outcome(input.agentId, input.messageId)).toBe("unknown");
+  await restarted.send(retry);
+  expect(await new MessageReceipts(directory).outcome(input.agentId, input.messageId)).toBe(
+    "accepted",
+  );
+  expect(confirmPendingSilentDelivery).toHaveBeenCalledTimes(2);
+  expect(send).not.toHaveBeenCalled();
+});
+
+test("silent receipt recovery leaves durable queued messages in the provider queue", async () => {
+  const { requests, directory } = await fixture();
+  const input = { agentId: "parent", messageId: "report", request: { prompt: "report text" } };
+  const admitted = Promise.withResolvers<void>();
+  const dispatched = Promise.withResolvers<void>();
+  const delivery = requests.sendQueued({
+    ...input,
+    message: {
+      messageId: input.messageId,
+      prompt: input.request.prompt,
+      source: { agentId: "sender" },
+      activeTurnBehavior: "queue",
+      unarchive: false,
+    },
+    enqueue: async () => ({ dispatched: dispatched.promise }),
+    onQueued: () => admitted.resolve(),
+  });
+  await admitted.promise;
+  const restarted = new MessageReceipts(directory);
+  const confirmPendingSilentDelivery = vi.fn(async () => true);
+  const send = vi.fn();
+  await expect(restarted.send({ ...input, send, confirmPendingSilentDelivery })).rejects.toThrow(
+    "agent_request_outcome_unknown",
+  );
+  expect(confirmPendingSilentDelivery).not.toHaveBeenCalled();
+  expect(send).not.toHaveBeenCalled();
+  expect((await restarted.queuedMessages()).map(({ queued }) => queued.message.messageId)).toEqual([
+    input.messageId,
+  ]);
+  dispatched.resolve();
+  await delivery;
+});
+
 test("a send that fails before beforeDispatch can be retried with the same message", async () => {
   const { requests, directory } = await fixture();
   let available = false;

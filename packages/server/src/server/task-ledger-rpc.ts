@@ -2,10 +2,12 @@ import type { Logger } from "pino";
 import type {
   SessionInboundMessage,
   SessionOutboundMessage,
+  WorkspaceTaskFileConflict,
   WorkspaceTaskSummary,
 } from "@getpaseo/protocol/messages";
 import { compareTaskEvents, type TaskEvent } from "./agent/task-ledger/events.js";
 import type { WorkspaceTask, WorkspaceTaskLedgerStore } from "./agent/task-ledger/index.js";
+import { computeWorkspaceTaskFileConflicts } from "./agent/task-ledger/touched-files.js";
 import type { WorkspaceRegistry } from "./workspace-registry.js";
 
 type ListRequest = Extract<SessionInboundMessage, { type: "workspace.tasks.list.request" }>;
@@ -24,7 +26,10 @@ function findLatestTaskProgress(task: WorkspaceTask): TaskEvent | undefined {
   return latest;
 }
 
-function taskSummary(task: WorkspaceTask): WorkspaceTaskSummary {
+export function taskSummary(
+  task: WorkspaceTask,
+  fileConflicts?: WorkspaceTaskFileConflict[],
+): WorkspaceTaskSummary {
   const latest = findLatestTaskProgress(task);
   return {
     taskId: task.taskId,
@@ -40,6 +45,9 @@ function taskSummary(task: WorkspaceTask): WorkspaceTaskSummary {
     updatedAt: task.updatedAt,
     handoffSummary: task.handoffSummary,
     blockingQuestion: task.blockingQuestion,
+    ...(task.blockingQuestion !== undefined && task.blockingQuestionGeneration !== undefined
+      ? { blockingQuestionGeneration: task.blockingQuestionGeneration }
+      : {}),
     verificationState: task.closure?.verification?.state,
     recentAgentStates: task.recentAgentStates?.map(summarizeEvent),
     latestProgress: latest ? summarizeEvent(latest) : undefined,
@@ -48,7 +56,14 @@ function taskSummary(task: WorkspaceTask): WorkspaceTaskSummary {
     leadServerId: task.leadServerId,
     conclusionMessageId: task.conclusionMessageId,
     latestReplyPreview: task.latestReplyPreview,
+    ...(task.touchedFiles?.length ? { touchedFiles: task.touchedFiles } : {}),
+    ...(fileConflicts?.length ? { fileConflicts } : {}),
   };
+}
+
+export function summarizeWorkspaceTasks(tasks: readonly WorkspaceTask[]): WorkspaceTaskSummary[] {
+  const conflicts = computeWorkspaceTaskFileConflicts(tasks);
+  return tasks.toReversed().map((task) => taskSummary(task, conflicts.get(task.taskId)));
 }
 
 export async function listWorkspaceTaskSummaries(
@@ -72,7 +87,7 @@ export async function listWorkspaceTaskSummaries(
       return reply([], "Workspace not found");
     }
     const tasks = await taskLedger.list(workspaceId);
-    return reply(tasks.toReversed().map(taskSummary), null);
+    return reply(summarizeWorkspaceTasks(tasks), null);
   } catch (error) {
     logger.warn(
       { workspaceId, errorName: error instanceof Error ? error.name : "unknown" },

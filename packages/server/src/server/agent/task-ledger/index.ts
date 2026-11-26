@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
@@ -12,6 +13,12 @@ import {
   TaskEventSchema,
 } from "./events.js";
 import { isTaskParticipantAddress, type TaskReuseDecision } from "./reuse.js";
+import {
+  isActiveWorkspaceTask,
+  isNormalizedTouchedFile,
+  mergeTouchedFiles,
+  TASK_TOUCHED_FILE_LIMIT,
+} from "./touched-files.js";
 
 const TaskStatusSchema = z.enum([
   "analyzing",
@@ -80,6 +87,8 @@ export const WorkspaceTaskToolInputSchema = WorkspaceTaskUpsertSchema.omit({
   })
   .strict();
 
+export const TASK_PENDING_SILENT_REPORT_LIMIT = 32;
+
 const WorkspaceTaskSchema = WorkspaceTaskUpsertSchema.extend({
   title: TaskTitleSchema,
   status: TaskStatusSchema,
@@ -87,6 +96,12 @@ const WorkspaceTaskSchema = WorkspaceTaskUpsertSchema.extend({
   participants: z.array(WorkspaceTaskParticipantSchema),
   events: z.array(TaskEventSchema).optional(),
   recentAgentStates: z.array(TaskEventSchema).optional(),
+  blockingQuestionGeneration: z.uuid().optional(),
+  silentReportIds: z.array(z.string().min(1)).max(TASK_PENDING_SILENT_REPORT_LIMIT).optional(),
+  touchedFiles: z
+    .array(z.string().refine(isNormalizedTouchedFile))
+    .max(TASK_TOUCHED_FILE_LIMIT)
+    .optional(),
   createdAt: z.iso.datetime(),
   updatedAt: z.iso.datetime(),
 }).refine((task) => task.status !== "completed" || task.closure?.verification?.state !== "failed", {
@@ -98,6 +113,27 @@ export type WorkspaceTask = z.infer<typeof WorkspaceTaskSchema>;
 type WorkspaceTaskUpsert = z.input<typeof WorkspaceTaskUpsertSchema>;
 type WorkspaceTaskParticipant = z.infer<typeof WorkspaceTaskParticipantSchema>;
 
+const TurnOutcomePatchSchema = WorkspaceTaskUpsertSchema.pick({
+  status: true,
+  handoffSummary: true,
+  latestReplyPreview: true,
+})
+  .extend({
+    blockingQuestion: z.string().nullable().optional(),
+    blockingQuestionClearedBy: z.uuid().optional(),
+    silentReportId: z.string().min(1).optional(),
+    touchedFiles: z.array(z.string()).optional(),
+  })
+  .refine(
+    (patch) => patch.blockingQuestionClearedBy === undefined || patch.blockingQuestion === null,
+    "A blocking question must be cleared to record its resolution",
+  );
+export type WorkspaceTaskTurnOutcomePatch = z.input<typeof TurnOutcomePatchSchema>;
+type SelectTurnOutcomePatch = (
+  task: Readonly<WorkspaceTask>,
+  tasks: readonly Readonly<WorkspaceTask>[],
+) => WorkspaceTaskTurnOutcomePatch | null;
+
 const WorkspaceIdSchema = z
   .string()
   .min(1)
@@ -108,7 +144,8 @@ const WorkspaceIdSchema = z
   );
 const WorkspaceTasksSchema = z.array(WorkspaceTaskSchema);
 const pendingByFile = new Map<string, Promise<void>>();
-const terminalStatuses = new Set<WorkspaceTask["status"]>(["completed", "deferred", "canceled"]);
+type TaskLedgerListener = (workspaceId: string) => void;
+const listenersByDirectory = new Map<string, Set<TaskLedgerListener>>();
 const terminalLimit = 50;
 
 function serializeFile<T>(file: string, operation: () => Promise<T>): Promise<T> {
@@ -138,7 +175,17 @@ async function readTasks(file: string): Promise<WorkspaceTask[]> {
   const entry = await statIfPresent(file);
   if (!entry) return [];
   if (!entry.isFile()) throw new Error("Task ledger file must be a regular file");
-  return WorkspaceTasksSchema.parse(JSON.parse(await readFile(file, "utf8")));
+  const tasks = WorkspaceTasksSchema.parse(JSON.parse(await readFile(file, "utf8")));
+  // COMPAT(blockingQuestionGeneration): added in v0.18.0. Keep until unversioned ledgers are migrated.
+  // All callers hold the file lane. Persist the ID before any reader or selector can see it.
+  const unversioned = tasks.filter(
+    (task) => task.blockingQuestion !== undefined && task.blockingQuestionGeneration === undefined,
+  );
+  if (unversioned.length) {
+    for (const task of unversioned) task.blockingQuestionGeneration = randomUUID();
+    await writeJsonFileAtomic(file, tasks);
+  }
+  return tasks;
 }
 
 function mergeParticipants(
@@ -170,6 +217,7 @@ function mergeTask(current: WorkspaceTask | undefined, update: WorkspaceTaskUpse
     closure,
     handoffSummary,
     blockingQuestion,
+    blockingQuestionGeneration,
     rootMessageId,
     leadAgentId,
     leadServerId,
@@ -177,7 +225,7 @@ function mergeTask(current: WorkspaceTask | undefined, update: WorkspaceTaskUpse
     latestReplyPreview,
     createdAt = now,
   } = current ?? {};
-  return WorkspaceTaskSchema.parse({
+  const next = WorkspaceTaskSchema.parse({
     taskId: update.taskId,
     title: update.title ?? title,
     status: update.status ?? status,
@@ -185,7 +233,8 @@ function mergeTask(current: WorkspaceTask | undefined, update: WorkspaceTaskUpse
     participants: mergeParticipants(participants, update.participants ?? []),
     closure: mergeClosure(closure, update.closure),
     handoffSummary: update.handoffSummary ?? handoffSummary,
-    blockingQuestion: update.blockingQuestion ?? blockingQuestion,
+    blockingQuestion,
+    blockingQuestionGeneration,
     rootMessageId: update.rootMessageId ?? rootMessageId,
     leadAgentId: update.leadAgentId ?? leadAgentId,
     leadServerId: update.leadServerId ?? leadServerId,
@@ -193,9 +242,25 @@ function mergeTask(current: WorkspaceTask | undefined, update: WorkspaceTaskUpse
     latestReplyPreview: update.latestReplyPreview ?? latestReplyPreview,
     events: current?.events,
     recentAgentStates: current?.recentAgentStates,
+    touchedFiles: current?.touchedFiles,
+    silentReportIds: current?.silentReportIds,
     createdAt,
     updatedAt: now,
   });
+  applyBlockingQuestionPatch(next, { blockingQuestion: update.blockingQuestion });
+  return next;
+}
+
+function applyBlockingQuestionPatch(next: WorkspaceTask, update: WorkspaceTaskTurnOutcomePatch) {
+  if (update.blockingQuestion === undefined) return;
+  if (update.blockingQuestion !== null) {
+    next.blockingQuestion = update.blockingQuestion;
+    next.blockingQuestionGeneration = randomUUID();
+    return;
+  }
+  if (next.blockingQuestion === undefined && update.blockingQuestionClearedBy === undefined) return;
+  delete next.blockingQuestion;
+  next.blockingQuestionGeneration = update.blockingQuestionClearedBy ?? randomUUID();
 }
 
 function* retainedTaskEvents(tasks: WorkspaceTask[]) {
@@ -225,6 +290,23 @@ function applyTaskEvents(task: WorkspaceTask, updates: readonly TaskEvent[]): Wo
   };
 }
 
+function retainTasks(tasks: WorkspaceTask[]): WorkspaceTask[] {
+  let terminalCount = 0;
+  return tasks
+    .toReversed()
+    .filter(
+      (task) =>
+        isActiveWorkspaceTask(task) ||
+        ++terminalCount <= terminalLimit ||
+        !!task.silentReportIds?.length,
+    )
+    .toReversed();
+}
+
+function replaceTask(tasks: WorkspaceTask[], next: WorkspaceTask): WorkspaceTask[] {
+  return retainTasks([...tasks.filter((task) => task.taskId !== next.taskId), next]);
+}
+
 export class WorkspaceTaskLedgerStore {
   private readonly tasksDirectory: string;
 
@@ -235,6 +317,43 @@ export class WorkspaceTaskLedgerStore {
   async list(workspaceId: string): Promise<WorkspaceTask[]> {
     const file = this.filePath(workspaceId);
     return serializeFile(file, () => readTasks(file));
+  }
+
+  /** Keep the snapshot current through a related write. The callback must not re-enter the ledger. */
+  withTaskSnapshot<T>(
+    workspaceId: string,
+    use: (tasks: readonly WorkspaceTask[]) => Promise<T>,
+  ): Promise<T> {
+    const file = this.filePath(workspaceId);
+    return serializeFile(file, async () => use(await readTasks(file)));
+  }
+
+  subscribe(listener: TaskLedgerListener): () => void {
+    const directory = this.tasksDirectory;
+    const listeners = listenersByDirectory.get(directory) ?? new Set<TaskLedgerListener>();
+    const registration: TaskLedgerListener = (workspaceId) => listener(workspaceId);
+    listeners.add(registration);
+    listenersByDirectory.set(directory, listeners);
+    return () => {
+      if (listeners.delete(registration) && !listeners.size) listenersByDirectory.delete(directory);
+    };
+  }
+
+  private async writeTasks(
+    workspaceId: string,
+    file: string,
+    tasks: WorkspaceTask[],
+  ): Promise<void> {
+    await writeJsonFileAtomic(file, tasks);
+    const listeners = Array.from(listenersByDirectory.get(this.tasksDirectory) ?? []);
+    for (const listener of listeners) {
+      try {
+        listener(workspaceId);
+      } catch {
+        // A publisher failure must never report an already committed write as failed.
+        process.emitWarning("Workspace task ledger change listener failed");
+      }
+    }
   }
 
   async upsert(
@@ -252,7 +371,7 @@ export class WorkspaceTaskLedgerStore {
       const patch = bindingEvents.length
         ? {
             ...update,
-            ...(current && terminalStatuses.has(current.status)
+            ...(current && !isActiveWorkspaceTask(current)
               ? { status: undefined, closure: undefined }
               : {}),
             rootMessageId: current?.rootMessageId ?? update.rootMessageId,
@@ -264,15 +383,68 @@ export class WorkspaceTaskLedgerStore {
       );
 
       // Keep records in write order so equal timestamps cannot evict a newer terminal task.
-      const updated = tasks.filter((task) => task.taskId !== next.taskId);
-      updated.push(next);
-      let terminalCount = 0;
-      const retained = updated
-        .toReversed()
-        .filter((task) => !terminalStatuses.has(task.status) || ++terminalCount <= terminalLimit)
-        .toReversed();
-      await writeJsonFileAtomic(file, retained);
+      await this.writeTasks(workspaceId, file, replaceTask(tasks, next));
       return next;
+    });
+  }
+
+  async addTouchedFiles(
+    workspaceId: string,
+    taskId: string,
+    paths: readonly string[],
+  ): Promise<void> {
+    if (!paths.length) return;
+    await this.syncFromTurnOutcome(workspaceId, taskId, (task) =>
+      isActiveWorkspaceTask(task) ? { touchedFiles: [...paths] } : null,
+    );
+  }
+
+  async syncFromTurnOutcome(
+    workspaceId: string,
+    taskId: string,
+    patch: WorkspaceTaskTurnOutcomePatch | SelectTurnOutcomePatch,
+  ): Promise<WorkspaceTask | null> {
+    const file = this.filePath(workspaceId);
+    return serializeFile(file, async () => {
+      const tasks = await readTasks(file);
+      const current = tasks.find((task) => task.taskId === taskId);
+      if (!current) return null;
+      const selected = typeof patch === "function" ? patch(current, tasks) : patch;
+      if (!selected) return null;
+      const update = TurnOutcomePatchSchema.parse(selected);
+      const touchedFiles = mergeTouchedFiles(current.touchedFiles ?? [], update.touchedFiles ?? []);
+      const next = { ...current };
+      if (update.status !== undefined) next.status = update.status;
+      if (update.handoffSummary !== undefined) next.handoffSummary = update.handoffSummary;
+      if (update.latestReplyPreview !== undefined)
+        next.latestReplyPreview = update.latestReplyPreview;
+      applyBlockingQuestionPatch(next, update);
+      if (update.silentReportId && !current.silentReportIds?.includes(update.silentReportId)) {
+        next.silentReportIds = [...(current.silentReportIds ?? []), update.silentReportId];
+      }
+      if (touchedFiles.length) next.touchedFiles = touchedFiles;
+      if (JSON.stringify(current) === JSON.stringify(next)) return current;
+      next.updatedAt = new Date().toISOString();
+      const validated = WorkspaceTaskSchema.parse(next);
+      await this.writeTasks(workspaceId, file, replaceTask(tasks, validated));
+      return validated;
+    });
+  }
+
+  async acknowledgeSilentReport(
+    workspaceId: string,
+    taskId: string,
+    messageId: string,
+  ): Promise<void> {
+    const file = this.filePath(workspaceId);
+    await serializeFile(file, async () => {
+      const tasks = await readTasks(file);
+      const task = tasks.find((candidate) => candidate.taskId === taskId);
+      if (!task?.silentReportIds?.includes(messageId)) return;
+      const pending = task.silentReportIds.filter((id) => id !== messageId);
+      if (pending.length) task.silentReportIds = pending;
+      else delete task.silentReportIds;
+      await this.writeTasks(workspaceId, file, retainTasks(tasks));
     });
   }
 
@@ -281,9 +453,9 @@ export class WorkspaceTaskLedgerStore {
     await serializeFile(file, async () => {
       const tasks = await readTasks(file);
       const current = tasks.find((task) => task.taskId === taskId);
-      if (!current) return;
+      if (!current || current.latestReplyPreview === text) return;
       current.latestReplyPreview = text;
-      await writeJsonFileAtomic(file, tasks);
+      await this.writeTasks(workspaceId, file, tasks);
     });
   }
 
@@ -309,7 +481,7 @@ export class WorkspaceTaskLedgerStore {
           : task,
       );
       if (updated.some((task, index) => task !== tasks[index])) {
-        await writeJsonFileAtomic(file, updated);
+        await this.writeTasks(workspaceId, file, updated);
       }
     });
   }
@@ -392,7 +564,7 @@ export function renderWorkspaceTaskLedger(
   participantReuse?: ReadonlyMap<string, TaskReuseDecision>,
 ): string {
   const active = tasks
-    .filter((task) => !terminalStatuses.has(task.status))
+    .filter(isActiveWorkspaceTask)
     .sort(
       (left, right) =>
         statusPriority[left.status] - statusPriority[right.status] ||

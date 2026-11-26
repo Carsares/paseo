@@ -24,6 +24,9 @@ const CreateInputSchema = ItemKeySchema.extend({
   kind: z.enum(["authorization", "decision", "acceptance"]),
   title: z.string().trim().min(1),
   summary: z.string().optional(),
+  taskId: z.string().min(1).optional(),
+  topicKey: z.string().min(1).optional(),
+  rootMessageId: z.string().min(1).optional(),
 });
 const ListInputSchema = WorkspaceDurableItemListRequestSchema.omit({ type: true, requestId: true });
 const DecideInputSchema = WorkspaceDurableItemDecideRequestSchema.omit({
@@ -31,6 +34,7 @@ const DecideInputSchema = WorkspaceDurableItemDecideRequestSchema.omit({
   requestId: true,
 }).extend({
   principalId: z.string().min(1),
+  topicDecisionOperationId: z.string().min(1).optional(),
 });
 const StoreFileSchema = z.object({
   version: z.literal(1),
@@ -39,11 +43,13 @@ const StoreFileSchema = z.object({
     z.object({
       item: WorkspaceDurableItemSchema,
       decidedByPrincipalId: z.string().min(1).optional(),
+      topicDecisionOperationId: z.string().min(1).optional(),
     }),
   ),
 });
 
 type StoreFile = z.infer<typeof StoreFileSchema>;
+type StoredItem = StoreFile["items"][number];
 type ItemKey = z.infer<typeof ItemKeySchema>;
 
 interface StoreOptions {
@@ -60,6 +66,7 @@ type CreateInput = z.input<typeof CreateInputSchema> & {
 };
 type ListInput = z.input<typeof ListInputSchema> & { serverId: string };
 type DecideInput = z.input<typeof DecideInputSchema> & { serverId: string };
+type DurableItemChangeListener = (item: WorkspaceDurableItem) => void;
 
 export class DurableItemConflictError extends Error {
   constructor(readonly item: WorkspaceDurableItem) {
@@ -70,10 +77,43 @@ export class DurableItemConflictError extends Error {
 
 // Store instances in the daemon share the same serial write lane for this file.
 const writeTails = new Map<string, Promise<unknown>>();
+const listenersByFile = new Map<string, Set<DurableItemChangeListener>>();
+
+function publishChange(filePath: string, item: WorkspaceDurableItem): void {
+  const listeners = Array.from(listenersByFile.get(filePath) ?? []);
+  for (const listener of listeners) {
+    try {
+      listener(structuredClone(item));
+    } catch {
+      // An observer failure must not turn a committed change into a failed mutation.
+      process.emitWarning("Durable item change listener failed");
+    }
+  }
+}
 
 function findItem(data: StoreFile, key: ItemKey) {
   return data.items.find(
     ({ item }) => item.workspaceId === key.workspaceId && item.requestId === key.requestId,
+  );
+}
+
+function normalizeDecisionNote(note: string | undefined): string | undefined {
+  return note?.trim() || undefined;
+}
+
+function isTopicDecisionReplay(
+  entry: StoredItem,
+  decision: z.output<typeof DecideInputSchema>,
+): boolean {
+  const { item } = entry;
+  return (
+    decision.topicDecisionOperationId !== undefined &&
+    decision.topicDecisionOperationId === entry.topicDecisionOperationId &&
+    decision.principalId === entry.decidedByPrincipalId &&
+    item.status === "decided" &&
+    item.revision === decision.expectedRevision + 1 &&
+    item.decision === decision.decision &&
+    normalizeDecisionNote(item.note) === normalizeDecisionNote(decision.note)
   );
 }
 
@@ -89,6 +129,17 @@ export class DurableItemStore {
 
   constructor(private readonly options: StoreOptions) {
     this.filePath = resolve(options.filePath);
+  }
+
+  subscribe(listener: DurableItemChangeListener): () => void {
+    const filePath = this.filePath;
+    const listeners = listenersByFile.get(filePath) ?? new Set<DurableItemChangeListener>();
+    const registration: DurableItemChangeListener = (item) => listener(item);
+    listeners.add(registration);
+    listenersByFile.set(filePath, listeners);
+    return () => {
+      if (listeners.delete(registration) && !listeners.size) listenersByFile.delete(filePath);
+    };
   }
 
   async create(input: CreateInput, validateSource?: () => void): Promise<WorkspaceDurableItem> {
@@ -168,10 +219,32 @@ export class DurableItemStore {
     return { items, nextCursor: null };
   }
 
-  async decide(input: DecideInput): Promise<WorkspaceDurableItem> {
+  async listPendingWorkspaceItems(input: {
+    serverId: string;
+    workspaceId: string;
+  }): Promise<WorkspaceDurableItem[]> {
+    this.assertLocalHost(input.serverId);
+    const [workspace, data] = await Promise.all([
+      this.options.getWorkspace(input.workspaceId),
+      this.read(),
+    ]);
+    if (!isAvailable(workspace)) return [];
+    return data.items
+      .map(({ item }) => item)
+      .filter((item) => item.workspaceId === input.workspaceId && item.status === "pending");
+  }
+
+  async get(input: ItemKey & { serverId: string }): Promise<WorkspaceDurableItem | null> {
+    this.assertLocalHost(input.serverId);
+    const workspace = await this.options.getWorkspace(input.workspaceId);
+    if (!isAvailable(workspace)) return null;
+    return findItem(await this.read(), input)?.item ?? null;
+  }
+
+  async decide(input: DecideInput, assertCurrent?: () => void): Promise<WorkspaceDurableItem> {
     this.assertLocalHost(input.serverId);
     const decision = DecideInputSchema.parse(input);
-    return this.write(async (data) => {
+    return this.write(async (data, skipPersist) => {
       const workspace = await this.requireWorkspace(decision.workspaceId);
       const entry = findItem(data, {
         workspaceId: decision.workspaceId,
@@ -179,6 +252,13 @@ export class DurableItemStore {
       });
       if (!entry) throw new Error("Durable item does not exist in this workspace.");
       const { item } = entry;
+      if (decision.topicDecisionOperationId && item.kind === "authorization")
+        throw new Error("System authorizations cannot be decided through a topic.");
+      assertCurrent?.();
+      if (isTopicDecisionReplay(entry, decision)) {
+        skipPersist();
+        return item;
+      }
       if (item.status !== "pending" || item.revision !== decision.expectedRevision) {
         throw new DurableItemConflictError(item);
       }
@@ -192,6 +272,7 @@ export class DurableItemStore {
         const latest = await this.requireWorkspace(item.workspaceId);
         if (latest.cwd !== workspace.cwd) throw new DurableItemEvidenceError();
       }
+      assertCurrent?.();
       entry.item = {
         ...item,
         status: "decided",
@@ -201,6 +282,7 @@ export class DurableItemStore {
         revision: item.revision + 1,
       };
       entry.decidedByPrincipalId = decision.principalId;
+      entry.topicDecisionOperationId = decision.topicDecisionOperationId;
       return entry.item;
     });
   }
@@ -257,12 +339,20 @@ export class DurableItemStore {
     return data;
   }
 
-  private write<T>(update: (data: StoreFile) => Promise<T>): Promise<T> {
+  private write(
+    update: (data: StoreFile, skipPersist: () => void) => Promise<WorkspaceDurableItem>,
+  ): Promise<WorkspaceDurableItem> {
     const prior = writeTails.get(this.filePath) ?? Promise.resolve();
     const result = prior.then(async () => {
       const data = await this.read();
-      const value = await update(data);
-      await writeJsonFileAtomic(this.filePath, data);
+      let changed = true;
+      const value = await update(data, () => {
+        changed = false;
+      });
+      if (changed) {
+        await writeJsonFileAtomic(this.filePath, data);
+        publishChange(this.filePath, value);
+      }
       return value;
     });
     const tail = result.then(

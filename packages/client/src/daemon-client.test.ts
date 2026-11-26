@@ -13,7 +13,11 @@ import {
   type PluginClientBundleStore,
 } from "./daemon-client";
 import { createHostChannelTransport } from "./hosts/index.js";
-import { createPaseoApi } from "./index.js";
+import {
+  createPaseoApi,
+  type TopicAnchorSummary,
+  type WorkspaceTopicDecideRequest,
+} from "./index.js";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { ChunkedTransport } from "@getpaseo/protocol/chunked-transport";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
@@ -241,6 +245,24 @@ describe("workspace topics and todos", () => {
   const topic = { ...scope, topicKey };
   const todo = { workspaceId, todoId };
   const reply = { ...topic, taskId: "task-1", clientMessageId: "reply-1", text: "Follow up" };
+  const decision = {
+    ...topic,
+    taskId: "task-1",
+    clientMessageId: "decision-1",
+    resolutionKind: "durable_item",
+    durableItemRequestId: "acceptance-1",
+    expectedRevision: 2,
+    decision: "approve",
+    dispatchFollowup: false,
+  } satisfies Omit<WorkspaceTopicDecideRequest, "type" | "requestId">;
+  const now = "2026-11-26T09:00:00.000Z";
+  const anchor: TopicAnchorSummary = {
+    ...topic,
+    taskId: "task-1",
+    rootPromptText: "Original topic prompt",
+    createdAt: now,
+    updatedAt: now,
+  };
   const mark = { ...topic, mode: "read", seq: 5 } as const;
   const upsert = { ...todo, title: "Follow up", dueAt: null };
   const setStatus = { ...todo, expectedRevision: 2, status: "completed" } as const;
@@ -259,6 +281,7 @@ describe("workspace topics and todos", () => {
         workspaceTopicThreads: true,
         workspaceTopicReadState: true,
         workspaceTodos: true,
+        workspaceButlerV1: true,
       },
     });
     await connecting;
@@ -276,7 +299,21 @@ describe("workspace topics and todos", () => {
       operation: "workspace.topic.list_entries",
       send: (client: DaemonClient) => client.listWorkspaceTopicEntries(topic),
       input: topic,
-      result: { workspaceId, entries: [] },
+      result: { workspaceId, entries: [], anchors: [anchor] },
+    },
+    {
+      operation: "workspace.topic.decide",
+      send: (client: DaemonClient) => client.decideWorkspaceTopic(decision),
+      input: decision,
+      result: {
+        workspaceId,
+        topicKey,
+        durableItem: null,
+        task: null,
+        routedTo: "none",
+        targetAgentId: null,
+        entry: null,
+      },
     },
     {
       operation: "workspace.topic_read.get_state",
@@ -336,6 +373,170 @@ describe("workspace topics and todos", () => {
     await expect(pending).resolves.toEqual(payload);
   });
 
+  test.each([undefined, false])(
+    "rejects topic decisions without sending when workspaceButlerV1=%s",
+    async (workspaceButlerV1) => {
+      const features = { workspaceTopicThreads: true };
+      const { client, mock } = await connect(
+        workspaceButlerV1 === undefined ? features : { ...features, workspaceButlerV1 },
+      );
+      await expect(client.decideWorkspaceTopic(decision)).rejects.toThrow(
+        "Update the host to use workspaceButlerV1.",
+      );
+      expect(mock.sent).toHaveLength(0);
+    },
+  );
+
+  test("uses the latest workspace butler flag from a server_info update", async () => {
+    const { client, mock } = await connect({ workspaceButlerV1: true });
+    const info = client.getLastServerInfoMessage();
+    expect(info?.features?.workspaceButlerV1).toBe(true);
+    mock.triggerMessage(
+      wrapSessionMessage({
+        type: "status",
+        payload: { ...info, features: { workspaceButlerV1: false } },
+      }),
+    );
+    expect(client.getLastServerInfoMessage()?.features?.workspaceButlerV1).toBe(false);
+    await expect(client.decideWorkspaceTopic(decision)).rejects.toThrow(
+      "Update the host to use workspaceButlerV1.",
+    );
+    expect(mock.sent).toHaveLength(0);
+  });
+
+  test("correlates out-of-order topic decisions across pushes and listener removal", async () => {
+    const { client, mock } = await connect();
+    const removed = vi.fn();
+    const remaining = vi.fn();
+    const unsubscribe = client.onWorkspaceTopicAnchorUpdated(removed);
+    client.onWorkspaceTopicAnchorUpdated(remaining);
+    const first = client.decideWorkspaceTopic(decision);
+    const second = client.decideWorkspaceTopic({ ...decision, clientMessageId: "decision-2" });
+    const firstId = parseSentFrame(mock.sent[0]).requestId;
+    const secondId = parseSentFrame(mock.sent[1]).requestId;
+    expect(firstId).not.toBe(secondId);
+
+    const push = { type: "workspace.topic.anchor.updated", payload: { ...scope, anchor } };
+    mock.triggerMessage(wrapSessionMessage(push));
+    unsubscribe();
+
+    const response = {
+      type: "workspace.topic.decide.response",
+      payload: {
+        requestId: secondId,
+        workspaceId,
+        topicKey,
+        durableItem: null,
+        task: null,
+        routedTo: "none",
+        targetAgentId: null,
+        entry: null,
+        error: null,
+      },
+    };
+    mock.triggerMessage(wrapSessionMessage(response));
+    mock.triggerMessage(wrapSessionMessage(push));
+    const firstPayload = { ...response.payload, requestId: firstId, error: "Revision changed." };
+    mock.triggerMessage(wrapSessionMessage({ ...response, payload: firstPayload }));
+
+    await expect(Promise.all([first, second])).resolves.toEqual([firstPayload, response.payload]);
+    expect(removed.mock.calls).toEqual([[push.payload]]);
+    expect(remaining.mock.calls).toEqual([[push.payload], [push.payload]]);
+  });
+
+  test("sends the observed blocking question generation and returns the newest task on conflict", async () => {
+    const { client, mock } = await connect();
+    const expectedBlockingQuestionGeneration = "7e36bce6-a062-45cf-97f2-20de0c6591ad";
+    const answer = {
+      ...topic,
+      clientMessageId: "answer-1",
+      resolutionKind: "task_blocking_question",
+      expectedBlockingQuestionGeneration,
+      note: "Friday",
+    } as const;
+    const pending = client.decideWorkspaceTopic(answer);
+    const sent = parseSentFrame(mock.sent[0]);
+    expect(sent).toEqual({
+      ...answer,
+      type: "workspace.topic.decide.request",
+      requestId: expect.any(String),
+    });
+    const payload = {
+      requestId: sent.requestId,
+      workspaceId,
+      topicKey,
+      durableItem: null,
+      task: {
+        taskId: "task-1",
+        title: "Schedule",
+        status: "awaiting_decision",
+        tier: "T1",
+        participants: [],
+        createdAt: now,
+        updatedAt: now,
+        blockingQuestion: "Which owner?",
+        blockingQuestionGeneration: "31952c69-ce68-49f4-87a6-b36647a83eca",
+      },
+      routedTo: "none",
+      targetAgentId: null,
+      entry: null,
+      accepted: false,
+      error: "The blocking question changed.",
+      errorCode: "stale_blocking_question",
+    };
+    mock.triggerMessage(wrapSessionMessage({ type: "workspace.topic.decide.response", payload }));
+    await expect(pending).resolves.toEqual(payload);
+  });
+
+  test.each([undefined, false, true])(
+    "negotiates the reply preview with workspaceButlerV1=%s",
+    async (workspaceButlerV1) => {
+      const features = { workspaceTopicThreads: true };
+      const { client, mock } = await connect(
+        workspaceButlerV1 === undefined ? features : { ...features, workspaceButlerV1 },
+      );
+      const rootPromptPreview = anchor.rootPromptText;
+      const pending = client.replyWorkspaceTopic({ ...reply, rootPromptPreview });
+      const request = parseSentFrame(mock.sent[0]);
+      expect(request).toEqual({
+        ...reply,
+        type: "workspace.topic.reply.request",
+        requestId: expect.any(String),
+        ...(workspaceButlerV1 === true ? { rootPromptPreview } : {}),
+      });
+      const payload = {
+        requestId: request.requestId,
+        workspaceId,
+        topicKey,
+        routedTo: "main",
+        targetAgentId: mainAgentId,
+        entry: null,
+        error: null,
+      };
+      mock.triggerMessage(wrapSessionMessage({ type: "workspace.topic.reply.response", payload }));
+      await expect(pending).resolves.toEqual(payload);
+    },
+  );
+
+  test("passes through an older host's list response without anchors", async () => {
+    const { client, mock } = await connect({ workspaceTopicThreads: true });
+    const pending = client.listWorkspaceTopicEntries(topic);
+    const request = parseSentFrame(mock.sent[0]);
+    const payload = { requestId: request.requestId, workspaceId, entries: [], error: null };
+    mock.triggerMessage(
+      wrapSessionMessage({ type: "workspace.topic.list_entries.response", payload }),
+    );
+    await expect(pending).resolves.toEqual(payload);
+  });
+
+  test("still requires the thread capability to send a reply preview", async () => {
+    const { client, mock } = await connect({ workspaceButlerV1: true });
+    expect(() =>
+      client.replyWorkspaceTopic({ ...reply, rootPromptPreview: anchor.rootPromptText }),
+    ).toThrow("Update the host to use workspaceTopicThreads.");
+    expect(mock.sent).toHaveLength(0);
+  });
+
   test.each([undefined, "task-1"])("flushes the agent inbox with task %s", async (taskId) => {
     const { client, mock } = await connect({ subagentInbox: true });
     const pending =
@@ -381,7 +582,6 @@ describe("workspace topics and todos", () => {
 
   test("dispatches topic and todo event payloads until unsubscribed", async () => {
     const { client, mock } = await connect();
-    const now = "2026-11-26T09:00:00.000Z";
     const entry = {
       ...topic,
       entryId: "entry-1",
@@ -452,6 +652,61 @@ describe("workspace topics and todos", () => {
       mock.triggerMessage(wrapSessionMessage(message));
       expect(handler.mock.calls).toEqual([[message.payload]]);
     }
+  });
+
+  test("dispatches butler event payloads until unsubscribed", async () => {
+    const { client, mock } = await connect({ workspaceButlerV1: true });
+    const task = {
+      taskId: "task-1",
+      title: "Update client",
+      status: "in_progress",
+      tier: "T1",
+      participants: [],
+      touchedFiles: ["packages/client/src/index.ts"],
+      createdAt: now,
+      updatedAt: now,
+    };
+    const item = {
+      workspaceId,
+      requestId: decision.durableItemRequestId,
+      sourceAgentId: mainAgentId,
+      sourceTurnId: "turn-1",
+      kind: "acceptance",
+      title: "Verify results",
+      status: "pending",
+      evidence: [],
+      revision: 2,
+      createdAt: now,
+      topicKey,
+    };
+    const anchorUpdated = vi.fn();
+    const tasksUpdated = vi.fn();
+    const durableItemUpdated = vi.fn();
+    const events = [
+      {
+        message: { type: "workspace.topic.anchor.updated", payload: { ...scope, anchor } },
+        handler: anchorUpdated,
+        unsubscribe: client.onWorkspaceTopicAnchorUpdated(anchorUpdated),
+      },
+      {
+        message: { type: "workspace.tasks.updated", payload: { workspaceId, tasks: [task] } },
+        handler: tasksUpdated,
+        unsubscribe: client.onWorkspaceTasksUpdated(tasksUpdated),
+      },
+      {
+        message: { type: "workspace.durable_item.updated", payload: { workspaceId, item } },
+        handler: durableItemUpdated,
+        unsubscribe: client.onWorkspaceDurableItemUpdated(durableItemUpdated),
+      },
+    ];
+    expect(mock.sent).toHaveLength(0);
+    for (const { message } of events) mock.triggerMessage(wrapSessionMessage(message));
+    for (const { message, handler, unsubscribe } of events) {
+      unsubscribe();
+      mock.triggerMessage(wrapSessionMessage(message));
+      expect(handler.mock.calls).toEqual([[message.payload]]);
+    }
+    expect(mock.sent).toHaveLength(0);
   });
 });
 
@@ -1918,6 +2173,7 @@ test("advertises client capabilities in hello", async () => {
       workspace_topic_threads: true,
       workspace_topic_read_state: true,
       workspace_todos: true,
+      workspace_butler_v1: true,
       hello_rejection: true,
       background_agents: true,
       browser_host: {

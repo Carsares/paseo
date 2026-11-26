@@ -7,6 +7,8 @@ export interface TeamDirectoryShellContextValue {
   isDirectoryVisible: boolean;
   /** Toggle visibility of the shell-level team directory. */
   toggleDirectory: () => void;
+  /** Open the workspace team directory (desktop dock/overlay or compact sheet) if hidden. */
+  openDirectory?: () => void;
 }
 
 const DEFAULT_VALUE: TeamDirectoryShellContextValue = {

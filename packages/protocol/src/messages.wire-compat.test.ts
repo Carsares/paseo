@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { z } from "zod";
 import { AgentMessageSchema } from "./agent-message.js";
+import { CLIENT_CAPS } from "./client-capabilities.js";
 import {
   AgentInboxFlushRequestSchema,
   AgentProfileSchema,
@@ -33,8 +34,90 @@ import {
   PendingSubagentInboxItemSchema,
   WorkspaceDurableItemSchema,
   WorkspaceTaskSummarySchema,
+  WorkspaceTopicDecideRequestSchema,
+  WorkspaceTopicDecideResponseSchema,
+  TopicThreadEntrySchema,
+  WorkspaceTopicListEntriesResponseSchema,
+  WorkspaceTopicReplyRequestSchema,
+  WorkspaceTopicThreadUpdatedMessageSchema,
 } from "./messages.js";
 import { validateWSOutboundMessage } from "./validation/ws-outbound.js";
+
+test("blocking question generations extend the existing request and task summary", () => {
+  const generation = "7e36bce6-a062-45cf-97f2-20de0c6591ad";
+  const legacyRequest = {
+    type: "workspace.topic.decide.request",
+    requestId: "answer-1",
+    workspaceId: "ws-1",
+    mainAgentId: "main-1",
+    topicKey: "task:task-1",
+    clientMessageId: "message-1",
+    resolutionKind: "task_blocking_question",
+    note: "Friday",
+  };
+  const request = { ...legacyRequest, expectedBlockingQuestionGeneration: generation };
+  expect(SessionInboundMessageSchema.parse(legacyRequest)).toEqual(legacyRequest);
+  expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+  expect(
+    WorkspaceTopicDecideRequestSchema.omit({ expectedBlockingQuestionGeneration: true }).parse(
+      request,
+    ),
+  ).toEqual(legacyRequest);
+  expect(
+    SessionInboundMessageSchema.safeParse({ ...request, expectedBlockingQuestionGeneration: "" })
+      .success,
+  ).toBe(false);
+
+  const timestamp = "2026-11-26T00:00:00.000Z";
+  const legacyTask = {
+    taskId: "task-1",
+    title: "Schedule",
+    status: "awaiting_decision",
+    tier: "T1",
+    participants: [],
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    blockingQuestion: "Which day?",
+  };
+  const task = { ...legacyTask, blockingQuestionGeneration: generation };
+  expect(WorkspaceTaskSummarySchema.parse(legacyTask)).toEqual(legacyTask);
+  expect(WorkspaceTaskSummarySchema.parse(task)).toEqual(task);
+  expect(WorkspaceTaskSummarySchema.omit({ blockingQuestionGeneration: true }).parse(task)).toEqual(
+    legacyTask,
+  );
+});
+
+test("topic decision responses accept old hosts and preserve an explicit acceptance result", () => {
+  const legacy = {
+    type: "workspace.topic.decide.response",
+    payload: {
+      requestId: "answer-1",
+      workspaceId: "ws-1",
+      topicKey: "task:task-1",
+      durableItem: null,
+      task: null,
+      routedTo: "none",
+      targetAgentId: null,
+      entry: null,
+      error: null,
+    },
+  };
+  const oldSchema = WorkspaceTopicDecideResponseSchema.extend({
+    payload: WorkspaceTopicDecideResponseSchema.shape.payload.omit({ accepted: true }),
+  });
+  expect(SessionOutboundMessageSchema.parse(legacy)).toEqual(legacy);
+  for (const accepted of [true, false]) {
+    const response = { ...legacy, payload: { ...legacy.payload, accepted } };
+    expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
+    expect(oldSchema.parse(response)).toEqual(legacy);
+  }
+  expect(
+    SessionOutboundMessageSchema.safeParse({
+      ...legacy,
+      payload: { ...legacy.payload, accepted: "false" },
+    }).success,
+  ).toBe(false);
+});
 
 test("topic bindings extend legacy reports, inbox items, flush requests and task summaries", () => {
   const binding = { taskId: "task-1", rootMessageId: "prompt-1" };
@@ -87,6 +170,20 @@ test("topic bindings extend legacy reports, inbox items, flush requests and task
   expect(SessionInboundMessageSchema.safeParse({ ...flush, taskId: "" }).success).toBe(false);
   expect(WorkspaceTaskSummarySchema.parse(task)).toEqual(task);
   expect(WorkspaceTaskSummarySchema.parse(taskWithDetails)).toEqual(taskWithDetails);
+  const touchedFiles = ["src/startup.ts"];
+  const fileConflicts = [
+    {
+      path: "src/startup.ts",
+      peers: [{ taskId: "task-2", title: "Fix startup", status: "in_progress" }],
+    },
+  ];
+  const taskWithConflicts = { ...taskWithDetails, touchedFiles, fileConflicts };
+  expect(WorkspaceTaskSummarySchema.parse(taskWithConflicts)).toEqual(taskWithConflicts);
+  expect(
+    WorkspaceTaskSummarySchema.omit({ touchedFiles: true, fileConflicts: true }).parse(
+      taskWithConflicts,
+    ),
+  ).toEqual(taskWithDetails);
   expect(
     WorkspaceTaskSummarySchema.omit({
       rootMessageId: true,
@@ -110,6 +207,14 @@ test("topic bindings extend legacy reports, inbox items, flush requests and task
     status: "pending" as const,
   };
   expect(WorkspaceDurableItemSchema.parse(durableItem)).toEqual(durableItem);
+  const boundItem = { ...durableItem, ...binding, topicKey: "topic-1" };
+  expect(WorkspaceDurableItemSchema.parse(boundItem)).toEqual(boundItem);
+  const legacyPendingSchema = WorkspaceDurableItemSchema.options[0].omit({
+    taskId: true,
+    topicKey: true,
+    rootMessageId: true,
+  });
+  expect(legacyPendingSchema.parse(boundItem)).toEqual(durableItem);
   expect(WorkspaceDurableItemSchema.safeParse({ ...durableItem, kind: "todo" }).success).toBe(
     false,
   );
@@ -123,17 +228,122 @@ test("topic feature flags survive status validation and stay optional for older 
     workspaceTopicThreads: true,
     workspaceTopicReadState: false,
     workspaceTodos: true,
+    workspaceButlerV1: true,
   };
   const info = { ...legacyInfo, features };
   expect(ServerInfoStatusPayloadSchema.parse(legacyInfo).features).toEqual(oldFeatures);
   expect(ServerInfoStatusPayloadSchema.parse(info).features).toEqual(features);
   expect(z.object({ agentCreateAsMain: z.boolean() }).parse(features)).toEqual(oldFeatures);
   const envelope = { type: "session", message: { type: "status", payload: info } };
+  expect(SessionOutboundMessageSchema.parse(envelope.message)).toEqual(envelope.message);
   expect(validateWSOutboundMessage(envelope)).toEqual({ success: true, data: envelope });
   expect(
     ServerInfoStatusPayloadSchema.safeParse({ ...info, features: { workspaceTodos: "true" } })
       .success,
   ).toBe(false);
+  expect(
+    ServerInfoStatusPayloadSchema.safeParse({ ...info, features: { workspaceButlerV1: "true" } })
+      .success,
+  ).toBe(false);
+});
+
+test("topic thread metadata and anchors extend legacy reply, list and update messages", () => {
+  const context = { workspaceId: "ws-1", mainAgentId: "main-1", topicKey: "topic-1" };
+  const { workspaceId, mainAgentId } = context;
+  const timestamp = "2026-11-26T00:00:00.000Z";
+  const entry = {
+    ...context,
+    entryId: "entry-1",
+    role: "agent_reply",
+    routedAgentId: "lead-1",
+    text: "Ready for review",
+    status: "completed",
+    seq: 1,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const report = { ...entry, origin: "subagent_report", reportStatus: "completed" };
+  const anchor = {
+    ...context,
+    rootPromptText: "Inspect startup",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const reply = {
+    type: "workspace.topic.reply.request",
+    ...context,
+    requestId: "req-1",
+    clientMessageId: "message-1",
+    text: "Any update?",
+  };
+  const replyWithPreview = { ...reply, rootPromptPreview: anchor.rootPromptText };
+  expect(WorkspaceTopicReplyRequestSchema.parse(reply)).toEqual(reply);
+  expect(WorkspaceTopicReplyRequestSchema.parse(replyWithPreview)).toEqual(replyWithPreview);
+  expect(
+    WorkspaceTopicReplyRequestSchema.omit({ rootPromptPreview: true }).parse(replyWithPreview),
+  ).toEqual(reply);
+
+  const legacyEntrySchema = TopicThreadEntrySchema.omit({
+    origin: true,
+    reportStatus: true,
+    durableItemRequestId: true,
+    decision: true,
+  });
+  const threadUpdate = {
+    type: "workspace.topic.thread.updated",
+    payload: { workspaceId, mainAgentId, entry },
+  };
+  const anchoredUpdate = {
+    ...threadUpdate,
+    payload: { workspaceId, mainAgentId, entry: report, anchor },
+  };
+  const legacyThreadUpdateSchema = WorkspaceTopicThreadUpdatedMessageSchema.extend({
+    payload: WorkspaceTopicThreadUpdatedMessageSchema.shape.payload
+      .omit({ anchor: true })
+      .extend({ entry: legacyEntrySchema }),
+  });
+  expect(SessionOutboundMessageSchema.parse(threadUpdate)).toEqual(threadUpdate);
+  expect(SessionOutboundMessageSchema.parse(anchoredUpdate)).toEqual(anchoredUpdate);
+  expect(legacyThreadUpdateSchema.parse(anchoredUpdate)).toEqual(threadUpdate);
+  expect(
+    SessionOutboundMessageSchema.safeParse({
+      ...threadUpdate,
+      payload: { workspaceId, mainAgentId, anchor },
+    }).success,
+  ).toBe(false);
+  expect(TopicThreadEntrySchema.safeParse({ ...report, role: "subagent_report" }).success).toBe(
+    false,
+  );
+
+  const list = {
+    type: "workspace.topic.list_entries.response",
+    payload: { workspaceId, requestId: "req-1", entries: [entry], error: null },
+  };
+  const anchoredList = {
+    ...list,
+    payload: { ...list.payload, entries: [report], anchors: [anchor] },
+  };
+  const legacyListSchema = WorkspaceTopicListEntriesResponseSchema.extend({
+    payload: WorkspaceTopicListEntriesResponseSchema.shape.payload
+      .omit({ anchors: true })
+      .extend({ entries: z.array(legacyEntrySchema) }),
+  });
+  expect(SessionOutboundMessageSchema.parse(list)).toEqual(list);
+  expect(SessionOutboundMessageSchema.parse(anchoredList)).toEqual(anchoredList);
+  expect(legacyListSchema.parse(anchoredList)).toEqual(list);
+});
+
+test("hello preserves the opt-in workspace butler capability", () => {
+  const legacyHello = {
+    type: "hello",
+    clientId: "client-1",
+    clientType: "browser",
+    protocolVersion: 1,
+  };
+  const hello = { ...legacyHello, capabilities: { [CLIENT_CAPS.workspaceButlerV1]: true } };
+  expect(CLIENT_CAPS.workspaceButlerV1).toBe("workspace_butler_v1");
+  expect(WSHelloMessageSchema.parse(legacyHello)).toEqual(legacyHello);
+  expect(WSHelloMessageSchema.parse(hello)).toEqual(hello);
 });
 
 test("idle archive extends the current archive request and host feature shapes", () => {

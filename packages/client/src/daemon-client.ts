@@ -125,6 +125,8 @@ import type {
   WorkspaceTaskSummary,
   WorkspaceTopicReplyRequest,
   WorkspaceTopicListEntriesRequest,
+  WorkspaceTopicDecideRequest,
+  WorkspaceTopicDecideResponse,
   WorkspaceTopicReadGetStateRequest,
   WorkspaceTopicReadMarkRequest,
   WorkspaceTopicReadMarkAllRequest,
@@ -133,7 +135,10 @@ import type {
   WorkspaceTodoSetStatusRequest,
   WorkspaceTodoDeleteRequest,
   WorkspaceTopicThreadUpdatedMessage,
+  WorkspaceTopicAnchorUpdatedMessage,
   WorkspaceTopicReadUpdatedMessage,
+  WorkspaceTasksUpdatedMessage,
+  WorkspaceDurableItemUpdatedMessage,
   WorkspaceTodoUpdatedMessage,
   WorkspaceTodoDueTriggeredMessage,
   ListCommandsResponse,
@@ -1212,6 +1217,7 @@ type WorkbenchFeature =
   | "workspaceTopicThreads"
   | "workspaceTopicReadState"
   | "workspaceTodos"
+  | "workspaceButlerV1"
   | "checkoutGitStagingV1"
   | "checkoutGitGraphV1"
   | "checkoutGitRebaseV1"
@@ -2320,6 +2326,24 @@ export class DaemonClient {
     handler: (payload: WorkspaceTopicThreadUpdatedMessage["payload"]) => void,
   ): () => void {
     return this.on("workspace.topic.thread.updated", (message) => handler(message.payload));
+  }
+
+  onWorkspaceTopicAnchorUpdated(
+    handler: (payload: WorkspaceTopicAnchorUpdatedMessage["payload"]) => void,
+  ): () => void {
+    return this.on("workspace.topic.anchor.updated", (message) => handler(message.payload));
+  }
+
+  onWorkspaceTasksUpdated(
+    handler: (payload: WorkspaceTasksUpdatedMessage["payload"]) => void,
+  ): () => void {
+    return this.on("workspace.tasks.updated", (message) => handler(message.payload));
+  }
+
+  onWorkspaceDurableItemUpdated(
+    handler: (payload: WorkspaceDurableItemUpdatedMessage["payload"]) => void,
+  ): () => void {
+    return this.on("workspace.durable_item.updated", (message) => handler(message.payload));
   }
 
   onWorkspaceTopicReadUpdated(
@@ -6135,10 +6159,20 @@ export class DaemonClient {
     return this.sendWorkbenchRequest("workspace.topic.update", "topicWorkbenchV1", options);
   }
 
-  replyWorkspaceTopic(input: Omit<WorkspaceTopicReplyRequest, "type" | "requestId">) {
+  replyWorkspaceTopic({
+    rootPromptPreview,
+    ...input
+  }: Omit<WorkspaceTopicReplyRequest, "type" | "requestId">) {
     this.requireWorkbenchFeature("workspaceTopicThreads");
+    // COMPAT(topicReplyRootPromptPreview): added in v0.18.0, remove gate after 2027-06-01.
+    const supportsRootPromptPreview =
+      this.lastServerInfoMessage?.features?.workspaceButlerV1 === true;
     return this.sendNamespacedCorrelatedSessionRequest<"workspace.topic.reply.response">({
-      message: { ...input, type: "workspace.topic.reply.request" },
+      message: {
+        ...input,
+        ...(supportsRootPromptPreview ? { rootPromptPreview } : {}),
+        type: "workspace.topic.reply.request",
+      },
     });
   }
 
@@ -6146,6 +6180,17 @@ export class DaemonClient {
     this.requireWorkbenchFeature("workspaceTopicThreads");
     return this.sendNamespacedCorrelatedSessionRequest<"workspace.topic.list_entries.response">({
       message: { ...input, type: "workspace.topic.list_entries.request" },
+    });
+  }
+
+  /** For a blocking question, pass the generation from the task snapshot the user answered. */
+  async decideWorkspaceTopic(
+    input: Omit<WorkspaceTopicDecideRequest, "type" | "requestId">,
+  ): Promise<WorkspaceTopicDecideResponse["payload"]> {
+    // COMPAT(workspaceButlerV1): added in v0.18.0, remove gate after 2027-06-01.
+    this.requireWorkbenchFeature("workspaceButlerV1");
+    return this.sendNamespacedCorrelatedSessionRequest<"workspace.topic.decide.response">({
+      message: { ...input, type: "workspace.topic.decide.request" },
     });
   }
 

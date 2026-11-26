@@ -206,7 +206,9 @@ test("an active topic Main Control requests acceptance over MCP and a worker in 
         const live = manager.getAgent(mainAgent.id);
         const sourceTurnId = live?.activeForegroundTurnId ?? live?.activeTurnId;
         expect(sourceTurnId).toEqual(expect.any(String));
-        expect(await call(unverified, input)).toMatchObject({ isError: true });
+        await expect(call(unverified, input)).rejects.toThrow(
+          "Tool request_human_decision not found",
+        );
         for (const forged of [
           { ...input, workspaceId, sourceAgentId: mainAgent.id, sourceTurnId },
           { ...input, evidence: [{ ...input.evidence[0], fingerprint: "forged" }] },

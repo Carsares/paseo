@@ -1,9 +1,12 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { afterEach, expect, test, vi } from "vitest";
-import { createPaseoApi, createPaseoClient } from "./index.js";
+import * as protocolMessages from "@getpaseo/protocol/messages";
+import * as clientExports from "./index.js";
 import { DaemonClient } from "./daemon-client.js";
 import type { PaseoAgent, PaseoClient, PaseoWorkspace } from "./index.js";
+
+const { createPaseoApi, createPaseoClient } = clientExports;
 
 type FakeWebSocketHandler = (...args: unknown[]) => void;
 
@@ -208,6 +211,25 @@ function createAgent(input: Partial<PaseoAgent> = {}): PaseoAgent {
     ...input,
   };
 }
+
+test("the SDK re-exports the canonical workspace butler schemas", () => {
+  const names = [
+    "TopicAnchorSummarySchema",
+    "TopicBlockingResolutionKindSchema",
+    "TopicThreadEntryOriginSchema",
+    "WorkspaceDurableItemUpdatedMessageSchema",
+    "WorkspaceTaskFileConflictPeerSchema",
+    "WorkspaceTaskFileConflictSchema",
+    "WorkspaceTasksUpdatedMessageSchema",
+    "WorkspaceTopicAnchorUpdatedMessageSchema",
+    "WorkspaceTopicDecideRequestSchema",
+    "WorkspaceTopicDecideResponseSchema",
+  ] as const;
+  for (const name of names) {
+    expect(clientExports[name]).toBeDefined();
+    expect(clientExports[name]).toBe(protocolMessages[name]);
+  }
+});
 
 test("createPaseoClient exposes workspace list through the daemon client", async () => {
   const { client, ws } = await connectClient();

@@ -63,6 +63,7 @@ export const CLIENT_CAPS = {
   workspaceTopicThreads: "workspace_topic_threads",
   workspaceTopicReadState: "workspace_topic_read_state",
   workspaceTodos: "workspace_todos",
+  workspaceButlerV1: "workspace_butler_v1",
 } as const;
 
 export type ClientCapability = (typeof CLIENT_CAPS)[keyof typeof CLIENT_CAPS];

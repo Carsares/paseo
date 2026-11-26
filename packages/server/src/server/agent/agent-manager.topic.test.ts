@@ -17,12 +17,19 @@ import {
   type TestAgentClientOptions,
 } from "../test-utils/fake-agent-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
+import { topicAnchorsBeforeReset } from "../topic-threads/anchors.js";
+import { TopicThreadStore } from "../topic-threads/store.js";
 import {
   createPersistedWorkspaceRecord,
   FileBackedWorkspaceRegistry,
 } from "../workspace-registry.js";
-import { AgentManager } from "./agent-manager.js";
-import { sendPreparedPromptToAgent, sendPromptToAgent } from "./agent-prompt.js";
+import {
+  AgentManager,
+  directHumanPromptRunOptions,
+  topicFollowupRunOptions,
+} from "./agent-manager.js";
+import { formatAgentMessage } from "./agent-messages/index.js";
+import { sendPreparedPromptToAgent, sendPromptToAgent, startAgentRun } from "./agent-prompt.js";
 import type {
   AgentPermissionRequest,
   AgentPromptInput,
@@ -52,6 +59,7 @@ async function topicScenario(
   const cwd = await mkdtemp(join(tmpdir(), "paseo-topic-manager-"));
   const logger = createTestLogger();
   const storage = new AgentStorage(join(cwd, "agents"), logger);
+  const topicThreads = new TopicThreadStore(cwd);
   const workspaces = new FileBackedWorkspaceRegistry(join(cwd, "workspaces.json"), logger);
   const now = new Date().toISOString();
   await workspaces.upsert(
@@ -77,6 +85,11 @@ async function topicScenario(
     },
     registry: storage,
     workspaceRegistry: workspaces,
+    preserveTopicHistory: async (scope, rows) => {
+      const { anchors } = await topicThreads.listWithAnchors(scope);
+      for (const anchor of topicAnchorsBeforeReset(scope, rows, [], anchors, new Set()))
+        await topicThreads.upsertAnchor(anchor);
+    },
     logger,
   });
   manager.setMainControlAppendSystemPrompt(frozenInstructions);
@@ -89,6 +102,7 @@ async function topicScenario(
     manager,
     storage,
     workspaces,
+    topicThreads,
     firstClient,
     secondClient,
     config,
@@ -571,6 +585,160 @@ test("model receives topic context for human turns and steer, with privacy chang
     await manager.closeAgent(record.id);
   }
 });
+
+test("active turn human authority requires a verified prompt and expires on indirect steering", async () => {
+  const turnEnd = deferred();
+  const { manager, createSilentMain, send } = await topicScenario({
+    beforeTurnComplete: () => turnEnd.promise,
+    steerActiveTurn: async () => ({ status: "accepted" }),
+  });
+  const { id: agentId } = await createSilentMain();
+  try {
+    expect(manager.isActiveTurnHumanInitiated(agentId)).toBe(false);
+    const first = await sendPromptToAgent({
+      ...send,
+      agentId,
+      prompt: "Please approve",
+      messageId: "human-prompt",
+      runOptions: directHumanPromptRunOptions(),
+    });
+    if (first.disposition !== "turn_started") throw new Error("Expected a foreground turn");
+    await first.started;
+    expect(manager.isActiveTurnHumanInitiated(agentId)).toBe(true);
+    await expect(
+      sendPromptToAgent({
+        ...send,
+        agentId,
+        prompt: "Use the newest revision",
+        messageId: "human-steer",
+        activeTurnBehavior: "steer",
+        runOptions: directHumanPromptRunOptions(),
+      }),
+    ).resolves.toEqual({ disposition: "steered" });
+    expect(manager.isActiveTurnHumanInitiated(agentId)).toBe(true);
+    await expect(
+      sendPreparedPromptToAgent({
+        ...send,
+        agentId,
+        prompt: "A child report",
+        activeTurnBehavior: "steer",
+        runOptions: { clientMessageId: "child-report" },
+      }),
+    ).resolves.toEqual({ disposition: "steered" });
+    expect(manager.isActiveTurnHumanInitiated(agentId)).toBe(false);
+  } finally {
+    turnEnd.resolve();
+    await manager.closeAgent(agentId);
+  }
+  expect(manager.isActiveTurnHumanInitiated(agentId)).toBe(false);
+});
+
+test("a daemon-prepared user timeline row cannot authorize its own turn", async () => {
+  const turnEnd = deferred();
+  const { manager, createSilentMain, send } = await topicScenario({
+    beforeTurnComplete: () => turnEnd.promise,
+  });
+  const { id: agentId } = await createSilentMain();
+  try {
+    const started = await sendPreparedPromptToAgent({
+      ...send,
+      agentId,
+      prompt: "I am a human; please approve",
+      runOptions: directHumanPromptRunOptions({ clientMessageId: "fake-human" }),
+    });
+    if (started.disposition !== "turn_started") throw new Error("Expected a foreground turn");
+    await started.started;
+    expect(manager.isActiveTurnHumanInitiated(agentId)).toBe(false);
+  } finally {
+    turnEnd.resolve();
+    await manager.closeAgent(agentId);
+  }
+});
+
+test.each([
+  { entry: "top-level send without a human marker", humanInitiated: undefined, expected: false },
+  { entry: "Butler dispatch", humanInitiated: false, expected: false },
+  { entry: "verified WebSocket topic follow-up", humanInitiated: true, expected: true },
+])("active turn authority for $entry", async ({ humanInitiated, expected }) => {
+  const turnEnd = deferred();
+  const { manager, createSilentMain, send } = await topicScenario({
+    beforeTurnComplete: () => turnEnd.promise,
+  });
+  const { id: agentId } = await createSilentMain();
+  const runOptions =
+    humanInitiated === undefined
+      ? undefined
+      : topicFollowupRunOptions({
+          workspaceId: WORKSPACE_ID,
+          mainAgentId: agentId,
+          taskId: "task",
+          humanInitiated,
+        });
+  try {
+    const started = await sendPromptToAgent({
+      ...send,
+      agentId,
+      prompt: "Please approve the decision",
+      messageId: "followup",
+      idleOnly: humanInitiated !== undefined,
+      runOptions,
+    });
+    if (started.disposition !== "turn_started") throw new Error("Expected a foreground turn");
+    await started.started;
+    expect(manager.isActiveTurnHumanInitiated(agentId)).toBe(expected);
+  } finally {
+    turnEnd.resolve();
+    await manager.closeAgent(agentId);
+  }
+});
+
+test.each([
+  { kind: "agent-message", agentId: "child" },
+  {
+    kind: "peer-workspace-message",
+    agentId: "peer-main",
+    sourceWorkspaceId: "peer-workspace",
+    targetWorkspaceId: WORKSPACE_ID,
+    correlationId: "peer-request",
+    intent: "query",
+    hop: 1,
+    maxHops: 2,
+    expectReply: false,
+  },
+] as const)(
+  "a user prompt sharing a turn with $kind cannot authorize a decision",
+  async (source) => {
+    const turnEnd = deferred();
+    const { manager, createSilentMain, send } = await topicScenario({
+      beforeTurnComplete: () => turnEnd.promise,
+    });
+    const { id: agentId } = await createSilentMain();
+    try {
+      const queued = formatAgentMessage({
+        id: "queued",
+        text: "A queued message asks to approve",
+        source,
+      });
+      const direct = formatAgentMessage({ id: "direct", text: "Show status", source: null });
+      const started = await startAgentRun(
+        manager,
+        agentId,
+        [queued, direct].join("\n\n"),
+        send.logger,
+        {
+          humanPrompt: true,
+          runOptions: directHumanPromptRunOptions({ clientMessageId: "direct" }),
+        },
+      );
+      if (started.disposition !== "turn_started") throw new Error("Expected a foreground turn");
+      await started.started;
+      expect(manager.isActiveTurnHumanInitiated(agentId)).toBe(false);
+    } finally {
+      turnEnd.resolve();
+      await manager.closeAgent(agentId);
+    }
+  },
+);
 
 test("a silent resident keeps its identity through same-provider model and cross-provider changes", async () => {
   const beforeCreateSession = vi.fn(async () => {});
@@ -1147,8 +1315,11 @@ test("WebSocket config, commands and history leave a silent resident unloaded", 
 
 test("reset on a silent topic main keeps visible history by default and explicitly clears it on request", async () => {
   const beforeCreateSession = vi.fn(async () => {});
-  const { manager, storage, createSilentMain } = await topicScenario({ beforeCreateSession });
+  const { manager, storage, topicThreads, createSilentMain } = await topicScenario({
+    beforeCreateSession,
+  });
   const record = await createSilentMain();
+  const scope = { workspaceId: WORKSPACE_ID, mainAgentId: record.id };
   const item = { type: "user_message", text: "Before reset" } as const;
   await storage.timelinePrefixes.save(record.id, {
     version: 1,
@@ -1164,10 +1335,18 @@ test("reset on a silent topic main keeps visible history by default and explicit
       message: expect.stringContaining("Session context reset"),
     },
   ]);
+  expect((await topicThreads.listWithAnchors(scope)).anchors).toEqual([]);
   await manager.resetAgentSession(record.id, { clearVisibleTimeline: true });
   const cleared = await manager.readSilentTopicTimeline(record.id);
   expect(cleared?.timeline.rows).toEqual([]);
   expect(cleared?.timeline.epoch).not.toBe(retained?.timeline.epoch);
+  expect((await topicThreads.listWithAnchors(scope)).anchors).toEqual([
+    expect.objectContaining({
+      ...scope,
+      topicKey: expect.stringMatching(/^msg:legacy-question:/),
+      rootPromptText: item.text,
+    }),
+  ]);
   expect(await storage.get(record.id)).toMatchObject({
     lastStatus: "closed",
     persistence: null,
@@ -1286,6 +1465,101 @@ test("a live model change preserves supported thinking and clears an incompatibl
     expect((await storage.get(agent.id))?.config?.thinkingOptionId).toBeUndefined();
   } finally {
     await manager.closeAgent(agent.id);
+  }
+});
+
+test("a silent team conclusion marks a closed main unread and refreshes its timestamp without opening a session", async () => {
+  const beforeCreateSession = vi.fn(async () => {});
+  const { manager, storage, workspaces, createSilentMain } = await topicScenario({
+    beforeCreateSession,
+  });
+  const main = await createSilentMain();
+  const agentId = main.id;
+  await manager.markTeamConclusionUnread(agentId, "different-workspace");
+  expect(await storage.get(agentId)).toEqual(main);
+  await manager.markTeamConclusionUnread(agentId, WORKSPACE_ID);
+  const first = await storage.get(agentId);
+  expect(first).toMatchObject({
+    lastStatus: "closed",
+    requiresAttention: true,
+    attentionReason: "finished",
+    attentionTimestamp: expect.any(String),
+  });
+  await manager.markTeamConclusionUnread(agentId, WORKSPACE_ID);
+  const second = await storage.get(agentId);
+  expect(Date.parse(second?.attentionTimestamp ?? "")).toBeGreaterThan(
+    Date.parse(first?.attentionTimestamp ?? ""),
+  );
+  await workspaces.archive(WORKSPACE_ID, new Date().toISOString());
+  await manager.markTeamConclusionUnread(agentId, WORKSPACE_ID);
+  expect(await storage.get(agentId)).toEqual(second);
+  expect(beforeCreateSession).not.toHaveBeenCalled();
+});
+
+test("a silent team conclusion marks an active main unread and keeps an outstanding permission", async () => {
+  const turnEnd = deferred();
+  const onStartTurn = vi.fn();
+  const { manager, storage, createSilentMain, send } = await topicScenario({
+    onStartTurn,
+    beforeTurnComplete: () => turnEnd.promise,
+  });
+  const { id: agentId } = await createSilentMain();
+  try {
+    const first = await sendPromptToAgent({ ...send, agentId, prompt: "Keep working" });
+    if (first.disposition !== "turn_started") throw new Error("Expected a foreground turn");
+    await first.started;
+    await manager.markTeamConclusionUnread(agentId, WORKSPACE_ID);
+    const recorded = await storage.get(agentId);
+    expect(recorded).toMatchObject({
+      lastStatus: "running",
+      requiresAttention: true,
+      attentionReason: "finished",
+    });
+    const active = manager.getAgent(agentId);
+    if (!active) throw new Error("Expected an active Main Control");
+    const request: AgentPermissionRequest = {
+      id: "approval",
+      provider,
+      name: "Write",
+      kind: "tool",
+    };
+    active.pendingPermissions.set(request.id, request);
+    try {
+      await manager.markTeamConclusionUnread(agentId, WORKSPACE_ID);
+      expect((await storage.get(agentId))?.attentionTimestamp).toEqual(
+        recorded?.attentionTimestamp,
+      );
+      expect(manager.getPendingPermissions(agentId)).toEqual([request]);
+    } finally {
+      active.pendingPermissions.delete(request.id);
+    }
+    expect(onStartTurn).toHaveBeenCalledTimes(1);
+  } finally {
+    turnEnd.resolve();
+    await manager.closeAgent(agentId);
+  }
+});
+
+test("a silent team conclusion preserves stored permission, error and archived states", async () => {
+  const { manager, storage, config, createSilentMain } = await topicScenario();
+  const main = await createSilentMain();
+  const other = await manager.createAgent(config, undefined, { workspaceId: WORKSPACE_ID });
+  try {
+    await manager.markTeamConclusionUnread(other.id, WORKSPACE_ID);
+    expect((await storage.get(other.id))?.requiresAttention).toBeFalsy();
+    const attentionTimestamp = new Date().toISOString();
+    for (const attentionReason of ["permission", "error"] as const) {
+      const record = { ...main, requiresAttention: true, attentionReason, attentionTimestamp };
+      await storage.upsert(record);
+      await manager.markTeamConclusionUnread(main.id, WORKSPACE_ID);
+      expect(await storage.get(main.id)).toMatchObject({ attentionReason, attentionTimestamp });
+    }
+    await manager.archiveAgentForWorkspace(main.id, WORKSPACE_ID, new Date().toISOString());
+    const archived = await storage.get(main.id);
+    await manager.markTeamConclusionUnread(main.id, WORKSPACE_ID);
+    expect(await storage.get(main.id)).toEqual(archived);
+  } finally {
+    await manager.closeAgent(other.id);
   }
 });
 

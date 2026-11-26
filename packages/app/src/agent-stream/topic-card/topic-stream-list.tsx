@@ -1,4 +1,8 @@
-import type { TopicReplyRouteMode, WorkspaceTodoItem } from "@getpaseo/protocol/messages";
+import type {
+  TopicReplyRouteMode,
+  WorkspaceDurableItem,
+  WorkspaceTodoItem,
+} from "@getpaseo/protocol/messages";
 import { useQueryClient } from "@tanstack/react-query";
 import { CheckCheck, Filter, Plus } from "lucide-react-native";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -19,7 +23,12 @@ import { ToolbarButton } from "@/components/ui/pane-content-toolbar";
 import { PressHighlight } from "@/components/ui/press-highlight";
 import { SegmentedControl, type SegmentedControlOption } from "@/components/ui/segmented-control";
 import { useWorkspaceTasks } from "@/composer/workspace-task-ledger/query";
-import { useWorkspaceDurableItems } from "@/durable-items/queries";
+import { submitDurableItemDecision } from "@/durable-items/model";
+import {
+  getOnlineDurableItemsClient,
+  reconcileDurableItemDecision,
+  useWorkspaceDurableItems,
+} from "@/durable-items/queries";
 import { useLoadOlderAgentHistory } from "@/hooks/use-load-older-agent-history";
 import { usePaneContext } from "@/panels/pane-context";
 import { useHostFeature } from "@/runtime/host-features";
@@ -29,6 +38,7 @@ import {
   buildTopicInboxReadScopeKey,
   useTopicInboxReadStore,
 } from "@/stores/topic-inbox-read-store";
+import { useTeamDirectoryViewStore } from "@/stores/team-directory-view-store";
 import {
   buildTopicAgentKey,
   useTopicStreamViewStore,
@@ -42,6 +52,7 @@ import {
   useOptionalTeamMessageJumpStore,
   usePendingTeamMessageJump,
 } from "@/subagents/team-directory/message-jump-store";
+import { useTeamDirectoryShell } from "@/subagents/team-directory/shell-context";
 import { planTimelinePromptJump } from "@/timeline/timeline-sync-plan";
 import { useSetWorkspaceTodoStatus, useWorkspaceTodos } from "@/todos/queries";
 import {
@@ -49,12 +60,17 @@ import {
   markTopicReadOnHost,
   useWorkspaceTopicReadState,
 } from "@/topic-read/queries";
-import { replyToWorkspaceTopic, useWorkspaceTopicEntries } from "@/topic-threads/queries";
+import {
+  decideWorkspaceTopicOnHost,
+  replyToWorkspaceTopic,
+  useWorkspaceTopicEntries,
+} from "@/topic-threads/queries";
 import type { PendingPermission } from "@/types/shared";
 import { generateMessageId, type StreamItem } from "@/types/stream";
 import { DisclosureRow } from "../disclosure";
 import type { DisclosureTriggerEdge, StreamViewportHandle } from "../strategy";
-import { projectTopicUnits, type TopicUnit } from "./model";
+import { canDecideDurableItemInTopic, projectTopicUnits, type TopicUnit } from "./model";
+import type { TopicDecisionSubmitInput, TopicDecisionSubmitResult } from "./topic-decision-slot";
 import {
   resolveFlushableTaskId,
   TopicThreadCard,
@@ -115,7 +131,11 @@ export function topicMatchesScrollTarget(
   target: Pick<PendingTopicScrollTarget, "topicKey" | "taskId" | "rootMessageId">,
 ): boolean {
   if (topic.topicKey === target.topicKey) return true;
-  if (target.taskId && topic.taskId === target.taskId) return true;
+  const targetTaskId =
+    target.taskId ?? (target.topicKey.startsWith("task:") ? target.topicKey.slice(5) : undefined);
+  if (targetTaskId) {
+    return topic.taskId === targetTaskId;
+  }
   if (
     target.rootMessageId &&
     (topic.rootMessageId === target.rootMessageId ||
@@ -134,9 +154,6 @@ export function topicMatchesScrollTarget(
     ) {
       return true;
     }
-  } else if (target.topicKey.startsWith("task:")) {
-    const rawTaskId = target.topicKey.slice(5);
-    if (topic.taskId === rawTaskId) return true;
   }
   return false;
 }
@@ -474,6 +491,75 @@ function createNoopStreamViewportHandle(
   };
 }
 
+async function submitLegacyDurableDecisionResult(input: {
+  queryClient: ReturnType<typeof useQueryClient>;
+  serverId: string;
+  workspaceId: string;
+  durableItem: WorkspaceDurableItem;
+  decision: NonNullable<TopicDecisionSubmitInput["decision"]>;
+  disconnectedMessage: string;
+  unconfirmedMessage: string;
+}): Promise<TopicDecisionSubmitResult> {
+  const onlineClient = getOnlineDurableItemsClient(input.serverId);
+  if (!onlineClient) {
+    return { outcome: "error", message: input.disconnectedMessage };
+  }
+  const legacyResult = await submitDurableItemDecision(
+    onlineClient,
+    input.durableItem,
+    input.decision,
+  );
+  await reconcileDurableItemDecision(
+    input.queryClient,
+    input.serverId,
+    input.workspaceId,
+    legacyResult.item,
+  );
+  if (legacyResult.outcome === "saved") return { outcome: "saved" };
+  if (legacyResult.outcome === "evidenceStale") return { outcome: "evidenceStale" };
+  if (legacyResult.outcome === "conflict") return { outcome: "conflict" };
+  return { outcome: "error", message: input.unconfirmedMessage };
+}
+
+function mapTopicDurableDecideResponse(
+  response: Awaited<ReturnType<typeof decideWorkspaceTopicOnHost>>,
+  expectedRevision: number,
+  conflictMessage: string,
+  unconfirmedMessage: string,
+): TopicDecisionSubmitResult {
+  if (
+    response.errorCode === "durable_item_evidence_stale" ||
+    response.errorCode === "DURABLE_ITEM_STALE_EVIDENCE"
+  ) {
+    return { outcome: "evidenceStale", message: response.error ?? undefined };
+  }
+  if (response.accepted === false || response.error) {
+    if (response.durableItem && response.durableItem.revision > expectedRevision) {
+      return { outcome: "conflict", message: response.error ?? conflictMessage };
+    }
+    return { outcome: "error", message: response.error ?? unconfirmedMessage };
+  }
+  return { outcome: "saved" };
+}
+
+function mapTopicBlockingDecideResponse(
+  response: Awaited<ReturnType<typeof decideWorkspaceTopicOnHost>>,
+  unconfirmedMessage: string,
+): TopicDecisionSubmitResult {
+  if (response.errorCode === "stale_blocking_question") {
+    return {
+      outcome: "staleBlockingQuestion",
+      message: response.error ?? undefined,
+      latestBlockingQuestionGeneration: response.task?.blockingQuestionGeneration,
+      hasLatestTask: true,
+    };
+  }
+  if (response.accepted === false || response.error) {
+    return { outcome: "error", message: response.error ?? unconfirmedMessage };
+  }
+  return { outcome: "saved" };
+}
+
 export const TopicStreamList = memo(function TopicStreamList({
   serverId,
   workspaceId,
@@ -492,6 +578,8 @@ export const TopicStreamList = memo(function TopicStreamList({
   const client = useHostRuntimeClient(serverId);
   const paneActive = useRetainedPanelActive();
   const { tabId } = usePaneContext();
+  const teamDirectoryShell = useTeamDirectoryShell();
+  const setTeamDirectoryTab = useTeamDirectoryViewStore((state) => state.setActiveTab);
 
   const agentKey = buildTopicAgentKey(serverId, mainAgentId);
   const unreadOnly = useTopicStreamViewStore(
@@ -499,17 +587,20 @@ export const TopicStreamList = memo(function TopicStreamList({
   );
   const setUnreadOnly = useTopicStreamViewStore((state) => state.setUnreadOnly);
   const setActiveReplyTopic = useTopicStreamViewStore((state) => state.setActiveReplyTopic);
+  const requestScrollToTopic = useTopicStreamViewStore((state) => state.requestScrollToTopic);
   const openTodoEditor = useTopicStreamViewStore((state) => state.openTodoEditor);
 
   const supportsTopicThreads = useHostFeature(serverId, "workspaceTopicThreads");
   const supportsTaskLedger = useHostFeature(serverId, "workspaceTaskLedger");
+  // COMPAT(workspaceButlerV1): added in v0.18.0, remove gate after 2027-06-01.
+  const supportsButlerV1 = useHostFeature(serverId, "workspaceButlerV1");
 
   const { query: tasksQuery } = useWorkspaceTasks(
     serverId,
     workspaceId,
     paneActive && supportsTaskLedger,
   );
-  const { entries: threadEntries } = useWorkspaceTopicEntries(
+  const { entries: threadEntries, anchors: topicAnchors } = useWorkspaceTopicEntries(
     serverId,
     workspaceId,
     mainAgentId,
@@ -522,7 +613,15 @@ export const TopicStreamList = memo(function TopicStreamList({
     paneActive,
   );
   const { items: workspaceTodos } = useWorkspaceTodos(serverId, workspaceId, paneActive);
-  const { result: durableResult } = useWorkspaceDurableItems(serverId, workspaceId, isPaneFocused);
+  const { result: durableResult, online: durableItemsOnline } = useWorkspaceDurableItems(
+    serverId,
+    workspaceId,
+    isPaneFocused,
+  );
+  const durableItemsConfirmed =
+    durableResult.isSuccess === undefined
+      ? true
+      : durableResult.isSuccess && durableResult.fetchStatus === "idle";
   const setTodoStatus = useSetWorkspaceTodoStatus(serverId);
   const { hasOlder, isLoadingOlder, loadOlder } = useLoadOlderAgentHistory({
     serverId,
@@ -570,6 +669,7 @@ export const TopicStreamList = memo(function TopicStreamList({
         items: combinedItems,
         tasks: tasksQuery.data,
         threadEntries,
+        topicAnchors,
         pendingInboxItems,
         todos: workspaceTodos,
         durableItems: durableResult.data,
@@ -592,6 +692,7 @@ export const TopicStreamList = memo(function TopicStreamList({
       readSnapshot,
       tasksQuery.data,
       threadEntries,
+      topicAnchors,
       workspaceTodos,
     ],
   );
@@ -825,6 +926,7 @@ export const TopicStreamList = memo(function TopicStreamList({
           topicKey: topic.topicKey,
           taskId: topic.taskId,
           rootMessageId: topic.rootMessageId,
+          rootPromptPreview: topic.rootPrompt.text.slice(0, 240) || undefined,
           clientMessageId: effectiveMessageId,
           text,
           routeMode,
@@ -863,6 +965,141 @@ export const TopicStreamList = memo(function TopicStreamList({
       onFocusCompactComposer?.();
     },
     [agentKey, onFocusCompactComposer, setActiveReplyTopic],
+  );
+
+  const handleActivateCompactDecision = useCallback(
+    (topic: TopicUnit, question: string, blockingQuestionGeneration?: string) => {
+      setActiveReplyTopic(agentKey, {
+        topicKey: topic.topicKey,
+        taskId: topic.taskId,
+        rootMessageId: topic.rootMessageId,
+        leadAgentId: topic.leadAgentId,
+        leadTitle: topic.leadTitle,
+        promptPreview: topic.rootPrompt.text.slice(0, 120),
+        routeMode: "auto",
+        decisionContext: {
+          kind: "task_blocking_question",
+          taskId: topic.taskId,
+          question,
+          blockingQuestionGeneration,
+        },
+      });
+      onFocusCompactComposer?.();
+    },
+    [agentKey, onFocusCompactComposer, setActiveReplyTopic],
+  );
+
+  const handleOpenStandaloneDurableItem = useCallback(
+    (item: WorkspaceDurableItem) => {
+      setTeamDirectoryTab("todos");
+      if (teamDirectoryShell.openDirectory) {
+        teamDirectoryShell.openDirectory();
+        return;
+      }
+      if (teamDirectoryShell.isOwnedByWorkspaceShell) {
+        if (!teamDirectoryShell.isDirectoryVisible) {
+          teamDirectoryShell.toggleDirectory();
+        }
+        return;
+      }
+      if (item.sourceAgentId && item.sourceAgentId !== mainAgentId) {
+        openSubagentFromTopic({
+          serverId,
+          workspaceId,
+          targetAgentId: item.sourceAgentId,
+          mainAgentId,
+          topicKey:
+            item.topicKey ?? (item.taskId ? `task:${item.taskId}` : `durable:${item.requestId}`),
+          taskId: item.taskId,
+          rootMessageId: item.rootMessageId,
+          promptPreview: item.title.slice(0, 60),
+          parentTabId: tabId,
+          location: "side",
+        });
+        return;
+      }
+      if (!teamDirectoryShell.isDirectoryVisible) {
+        teamDirectoryShell.toggleDirectory();
+      }
+    },
+    [mainAgentId, serverId, setTeamDirectoryTab, tabId, teamDirectoryShell, workspaceId],
+  );
+
+  const handleJumpToPeerTopic = useCallback(
+    (peerTaskId: string) => {
+      requestScrollToTopic(agentKey, `task:${peerTaskId}`, true, { taskId: peerTaskId });
+    },
+    [agentKey, requestScrollToTopic],
+  );
+
+  const handleRefreshDurableItems = useCallback(() => {
+    void durableResult.refetch?.();
+  }, [durableResult]);
+
+  const handleSubmitTopicDecision = useCallback(
+    async (input: TopicDecisionSubmitInput): Promise<TopicDecisionSubmitResult> => {
+      const unconfirmedMessage = t("topicWorkbench.durableItems.unconfirmed");
+      if (input.resolutionKind === "durable_item" && input.durableItem && input.decision) {
+        if (
+          !supportsButlerV1 ||
+          !canDecideDurableItemInTopic(input.durableItem, input.topic.taskId)
+        ) {
+          return submitLegacyDurableDecisionResult({
+            queryClient,
+            serverId,
+            workspaceId,
+            durableItem: input.durableItem,
+            decision: input.decision,
+            disconnectedMessage: t("workspace.terminal.hostDisconnected"),
+            unconfirmedMessage,
+          });
+        }
+        const response = await decideWorkspaceTopicOnHost({
+          queryClient,
+          serverId,
+          workspaceId,
+          mainAgentId,
+          topicKey: input.topic.topicKey,
+          taskId: input.topic.taskId,
+          rootMessageId: input.topic.rootMessageId,
+          clientMessageId: input.clientMessageId,
+          resolutionKind: "durable_item",
+          durableItemRequestId: input.durableItem.requestId,
+          expectedRevision: input.durableItem.revision,
+          decision: input.decision,
+          note: input.note,
+        });
+        return mapTopicDurableDecideResponse(
+          response,
+          input.durableItem.revision,
+          t("topicWorkbench.durableItems.conflict"),
+          unconfirmedMessage,
+        );
+      }
+
+      if (!supportsButlerV1) {
+        return {
+          outcome: "error",
+          message: t("topicWorkbench.topicStream.decisionLegacyHostNotice"),
+        };
+      }
+
+      const response = await decideWorkspaceTopicOnHost({
+        queryClient,
+        serverId,
+        workspaceId,
+        mainAgentId,
+        topicKey: input.topic.topicKey,
+        taskId: input.topic.taskId,
+        rootMessageId: input.topic.rootMessageId,
+        clientMessageId: input.clientMessageId,
+        resolutionKind: "task_blocking_question",
+        expectedBlockingQuestionGeneration: input.expectedBlockingQuestionGeneration,
+        note: input.note,
+      });
+      return mapTopicBlockingDecideResponse(response, unconfirmedMessage);
+    },
+    [mainAgentId, queryClient, serverId, supportsButlerV1, t, workspaceId],
   );
 
   const handleConvertToTodo = useCallback(
@@ -996,6 +1233,8 @@ export const TopicStreamList = memo(function TopicStreamList({
               >
                 <TopicThreadCard
                   agentKey={agentKey}
+                  serverId={serverId}
+                  workspaceId={workspaceId}
                   topic={topic}
                   isPaneFocused={isPaneFocused}
                   viewportBounds={viewportBounds}
@@ -1003,6 +1242,14 @@ export const TopicStreamList = memo(function TopicStreamList({
                   isHighlighted={highlightedTopicKey === topic.topicKey}
                   isReplying={replyingTopicKey === topic.topicKey}
                   isFlushingInbox={flushingTopicKey === topic.topicKey}
+                  supportsButlerV1={supportsButlerV1}
+                  durableItemsOnline={durableItemsOnline}
+                  durableItemsConfirmed={durableItemsConfirmed}
+                  onRefreshDurableItems={handleRefreshDurableItems}
+                  onOpenStandaloneDurableItem={handleOpenStandaloneDurableItem}
+                  onJumpToPeerTopic={handleJumpToPeerTopic}
+                  onSubmitTopicDecision={handleSubmitTopicDecision}
+                  onActivateCompactDecision={handleActivateCompactDecision}
                   onAutoMarkRead={handleAutoMarkRead}
                   onMarkTopicMode={handleMarkTopicMode}
                   onFlushTopicInbox={handleFlushTopicInbox}
@@ -1038,7 +1285,7 @@ export function useTopicStreamMarkAllRead(input: {
     workspaceId,
     enabled && supportsTaskLedger,
   );
-  const { entries: threadEntries } = useWorkspaceTopicEntries(
+  const { entries: threadEntries, anchors: topicAnchors } = useWorkspaceTopicEntries(
     serverId,
     workspaceId,
     mainAgentId,
@@ -1069,6 +1316,7 @@ export function useTopicStreamMarkAllRead(input: {
       items: combined,
       tasks: tasksQuery.data,
       threadEntries,
+      topicAnchors,
       readSnapshot,
       legacyReadScope,
       agentRequiresAttention,
@@ -1082,6 +1330,7 @@ export function useTopicStreamMarkAllRead(input: {
     streamItems,
     tasksQuery.data,
     threadEntries,
+    topicAnchors,
   ]);
 
   const markAllRead = useCallback(() => {

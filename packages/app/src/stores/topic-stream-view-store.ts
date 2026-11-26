@@ -22,6 +22,16 @@ export interface ReturnTopicAnchor {
   scrollOffset?: number;
 }
 
+export interface ActiveTopicDecisionContext {
+  kind: "task_blocking_question";
+  taskId?: string;
+  question: string;
+  /** Generation UUID locked when the user began composing this decision reply. */
+  blockingQuestionGeneration?: string;
+  /** Inline conflict message shown when the server rejects a stale blocking question generation. */
+  staleNotice?: string;
+}
+
 export interface ActiveTopicReplyTarget {
   topicKey: string;
   taskId?: string;
@@ -30,6 +40,7 @@ export interface ActiveTopicReplyTarget {
   leadTitle?: string;
   promptPreview: string;
   routeMode: TopicReplyRouteMode;
+  decisionContext?: ActiveTopicDecisionContext;
   /** Stable idempotency key bound to the current draft submission intent until acknowledged or edited. */
   pendingClientMessageId?: string;
   pendingSubmissionSignature?: string;
@@ -87,11 +98,40 @@ function boundRecord<T>(
 
 let nextScrollRequestId = 1;
 
+export interface TopicDecisionDraftMeta {
+  taskId?: string;
+  /** Blocking question generation UUID locked when the user authored this draft. */
+  blockingQuestionGeneration?: string;
+  /** Generation explicitly rejected as stale by the server (permits adopting a newer non-empty generation). */
+  acknowledgedStaleGeneration?: string;
+  /** Stable idempotency key bound to the current draft submission intent. */
+  pendingClientMessageId?: string;
+  pendingSubmissionKey?: string;
+}
+
+export interface ActiveTopicDecisionTargetMatch {
+  topicKey: string;
+  taskId?: string;
+  decisionKind: ActiveTopicDecisionContext["kind"];
+  decisionTaskId?: string;
+  blockingQuestionGeneration?: string;
+}
+
+export interface RefreshActiveDecisionContextUpdate {
+  expectedTarget: ActiveTopicDecisionTargetMatch;
+  question?: string;
+  blockingQuestionGeneration?: string;
+  staleNotice: string;
+}
+
 export interface TopicStreamViewState {
   viewModeByAgentKey: Record<string, TopicStreamViewMode>;
   unreadOnlyByAgentKey: Record<string, boolean>;
   expandedProcessByTopicKey: Record<string, boolean>;
   expandedHistoryByTopicKey: Record<string, boolean>;
+  expandedConflictsByTopicKey: Record<string, boolean>;
+  decisionDraftByTopicKey: Record<string, string>;
+  decisionDraftMetaByTopicKey: Record<string, TopicDecisionDraftMeta>;
   returnTopicAnchorByAgentKey: Record<string, ReturnTopicAnchor>;
   activeReplyTopicByAgentKey: Record<string, ActiveTopicReplyTarget | null>;
   pendingScrollTopicByAgentKey: Record<string, PendingTopicScrollTarget | null>;
@@ -102,13 +142,54 @@ export interface TopicStreamViewState {
   toggleUnreadOnly: (agentKey: string) => void;
   setProcessExpanded: (disclosureKey: string, expanded: boolean) => void;
   setHistoryExpanded: (disclosureKey: string, expanded: boolean) => void;
+  setConflictsExpanded: (disclosureKey: string, expanded: boolean) => void;
+  setDecisionDraft: (
+    disclosureKey: string,
+    text: string,
+    meta?: {
+      taskId?: string;
+      blockingQuestionGeneration?: string;
+      forceGeneration?: boolean;
+    },
+  ) => void;
+  setDecisionDraftSubmissionIntent: (
+    disclosureKey: string,
+    submissionKey: string,
+    clientMessageId: string,
+  ) => void;
+  acknowledgeStaleDecisionDraft: (
+    disclosureKey: string,
+    expected: {
+      taskId?: string;
+      submittedGeneration?: string;
+    },
+    next: {
+      latestBlockingQuestionGeneration?: string;
+      hasLatestTask?: boolean;
+    },
+  ) => void;
   setReturnTopicAnchor: (subagentKey: string, anchor: ReturnTopicAnchor | null) => void;
   setActiveReplyTopic: (agentKey: string, target: ActiveTopicReplyTarget | null) => void;
+  clearActiveReplyTopicIfMatches: (
+    agentKey: string,
+    expected: {
+      topicKey: string;
+      taskId?: string;
+      decisionKind?: ActiveTopicDecisionContext["kind"];
+      decisionTaskId?: string;
+      blockingQuestionGeneration?: string;
+    },
+  ) => void;
   setActiveReplyRouteMode: (agentKey: string, routeMode: TopicReplyRouteMode) => void;
   setActiveReplySubmissionIntent: (
     agentKey: string,
     submissionSignature: string | undefined,
     clientMessageId: string | undefined,
+    expectedTopicKey?: string,
+  ) => void;
+  refreshActiveDecisionContext: (
+    agentKey: string,
+    update: RefreshActiveDecisionContextUpdate,
   ) => void;
   requestScrollToTopic: (
     agentKey: string,
@@ -121,6 +202,154 @@ export interface TopicStreamViewState {
   closeTodoEditor: () => void;
 }
 
+function matchesActiveReplyTarget(
+  current: ActiveTopicReplyTarget | null | undefined,
+  expected: {
+    topicKey: string;
+    taskId?: string;
+    decisionKind?: ActiveTopicDecisionContext["kind"];
+    decisionTaskId?: string;
+    blockingQuestionGeneration?: string;
+  },
+): current is ActiveTopicReplyTarget {
+  if (!current) return false;
+  if (current.topicKey !== expected.topicKey || current.taskId !== expected.taskId) return false;
+  if (expected.decisionKind === undefined) {
+    return current.decisionContext === undefined;
+  }
+  return (
+    current.decisionContext?.kind === expected.decisionKind &&
+    current.decisionContext?.taskId === expected.decisionTaskId &&
+    current.decisionContext?.blockingQuestionGeneration === expected.blockingQuestionGeneration
+  );
+}
+
+function resolveNextDraftGeneration(input: {
+  trimmedText: string;
+  previousGeneration?: string;
+  acknowledgedStale?: string;
+  incomingGeneration?: string;
+  forceGeneration?: boolean;
+}): string | undefined {
+  if (!input.trimmedText) return undefined;
+  if (input.forceGeneration) return input.incomingGeneration;
+  const canAdoptNewerAfterStale =
+    Boolean(input.previousGeneration) &&
+    input.acknowledgedStale === input.previousGeneration &&
+    Boolean(input.incomingGeneration) &&
+    input.incomingGeneration !== input.previousGeneration;
+  if (canAdoptNewerAfterStale) return input.incomingGeneration;
+  return input.previousGeneration ?? input.incomingGeneration;
+}
+
+function resolveSubmissionIntentFields(
+  prevMeta: TopicDecisionDraftMeta | undefined,
+  trimmedText: string,
+  unchangedGeneration: boolean,
+  forceGeneration?: boolean,
+): Pick<TopicDecisionDraftMeta, "pendingClientMessageId" | "pendingSubmissionKey"> {
+  const previousKey = prevMeta?.pendingSubmissionKey;
+  if (forceGeneration || !unchangedGeneration || !previousKey?.endsWith(`\0${trimmedText}`)) {
+    return { pendingClientMessageId: undefined, pendingSubmissionKey: undefined };
+  }
+  return {
+    pendingClientMessageId: prevMeta?.pendingClientMessageId,
+    pendingSubmissionKey: previousKey,
+  };
+}
+
+function resolveNextDecisionDraftMeta(
+  prevMeta: TopicDecisionDraftMeta | undefined,
+  trimmedText: string,
+  meta?: {
+    taskId?: string;
+    blockingQuestionGeneration?: string;
+    forceGeneration?: boolean;
+  },
+): TopicDecisionDraftMeta {
+  const prevTaskId = prevMeta?.taskId;
+  const incomingTaskId = meta?.taskId;
+  const sameTask = !prevTaskId || !incomingTaskId || prevTaskId === incomingTaskId;
+  const previousGeneration = sameTask ? prevMeta?.blockingQuestionGeneration : undefined;
+  const acknowledgedStale = sameTask ? prevMeta?.acknowledgedStaleGeneration : undefined;
+  const nextGeneration = resolveNextDraftGeneration({
+    trimmedText,
+    previousGeneration,
+    acknowledgedStale,
+    incomingGeneration: meta?.blockingQuestionGeneration,
+    forceGeneration: meta?.forceGeneration,
+  });
+  const unchangedGeneration = nextGeneration === previousGeneration;
+  const intent = resolveSubmissionIntentFields(
+    prevMeta,
+    trimmedText,
+    unchangedGeneration,
+    meta?.forceGeneration,
+  );
+
+  return {
+    taskId: incomingTaskId ?? (sameTask ? prevTaskId : undefined),
+    blockingQuestionGeneration: nextGeneration,
+    acknowledgedStaleGeneration: unchangedGeneration ? acknowledgedStale : undefined,
+    ...intent,
+  };
+}
+
+function matchesStaleDraftTarget(
+  currentMeta: TopicDecisionDraftMeta | undefined,
+  expected: { taskId?: string; submittedGeneration?: string },
+): boolean {
+  if (currentMeta?.taskId && expected.taskId && currentMeta.taskId !== expected.taskId) {
+    return false;
+  }
+  if (
+    currentMeta?.blockingQuestionGeneration &&
+    expected.submittedGeneration &&
+    currentMeta.blockingQuestionGeneration !== expected.submittedGeneration
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function buildAcknowledgedStaleDraftMeta(
+  currentMeta: TopicDecisionDraftMeta | undefined,
+  expected: { taskId?: string; submittedGeneration?: string },
+  next: { latestBlockingQuestionGeneration?: string; hasLatestTask?: boolean },
+): TopicDecisionDraftMeta {
+  const taskId = expected.taskId ?? currentMeta?.taskId;
+  const nextGeneration = next.latestBlockingQuestionGeneration?.trim() || undefined;
+  if (nextGeneration) {
+    return {
+      ...currentMeta,
+      taskId,
+      blockingQuestionGeneration: nextGeneration,
+      acknowledgedStaleGeneration: undefined,
+      pendingClientMessageId: undefined,
+      pendingSubmissionKey: undefined,
+    };
+  }
+  const lockedGeneration = currentMeta?.blockingQuestionGeneration ?? expected.submittedGeneration;
+  // When the server returned a latest task with no active blocking question generation,
+  // keep the previous generation locked so retries can never degrade to versionless.
+  if (next.hasLatestTask) {
+    return {
+      ...currentMeta,
+      taskId,
+      blockingQuestionGeneration: lockedGeneration,
+      acknowledgedStaleGeneration: undefined,
+    };
+  }
+  return {
+    ...currentMeta,
+    taskId,
+    blockingQuestionGeneration: lockedGeneration,
+    acknowledgedStaleGeneration: lockedGeneration,
+    pendingClientMessageId: undefined,
+    pendingSubmissionKey: undefined,
+  };
+}
+
 export function createTopicStreamViewStore(backingStorage: StateStorage = AsyncStorage) {
   return create<TopicStreamViewState>()(
     persist(
@@ -129,6 +358,9 @@ export function createTopicStreamViewStore(backingStorage: StateStorage = AsyncS
         unreadOnlyByAgentKey: {},
         expandedProcessByTopicKey: {},
         expandedHistoryByTopicKey: {},
+        expandedConflictsByTopicKey: {},
+        decisionDraftByTopicKey: {},
+        decisionDraftMetaByTopicKey: {},
         returnTopicAnchorByAgentKey: {},
         activeReplyTopicByAgentKey: {},
         pendingScrollTopicByAgentKey: {},
@@ -190,6 +422,83 @@ export function createTopicStreamViewStore(backingStorage: StateStorage = AsyncS
             };
           }),
 
+        setConflictsExpanded: (disclosureKey, expanded) =>
+          set((state) => {
+            if ((state.expandedConflictsByTopicKey[disclosureKey] ?? false) === expanded) {
+              return state;
+            }
+            return {
+              expandedConflictsByTopicKey: {
+                ...state.expandedConflictsByTopicKey,
+                [disclosureKey]: expanded,
+              },
+            };
+          }),
+
+        setDecisionDraft: (disclosureKey, text, meta) =>
+          set((state) => {
+            const currentText = state.decisionDraftByTopicKey[disclosureKey] ?? "";
+            const nextDrafts = { ...state.decisionDraftByTopicKey };
+            const nextMetas = { ...state.decisionDraftMetaByTopicKey };
+            if (text.length === 0) {
+              if (!(disclosureKey in nextDrafts) && !(disclosureKey in nextMetas)) return state;
+              delete nextDrafts[disclosureKey];
+              delete nextMetas[disclosureKey];
+              return {
+                decisionDraftByTopicKey: nextDrafts,
+                decisionDraftMetaByTopicKey: nextMetas,
+              };
+            }
+            const prevMeta = currentText.trim()
+              ? state.decisionDraftMetaByTopicKey[disclosureKey]
+              : undefined;
+            const nextMeta = resolveNextDecisionDraftMeta(prevMeta, text.trim(), meta);
+            nextDrafts[disclosureKey] = text;
+            nextMetas[disclosureKey] = nextMeta;
+            return {
+              decisionDraftByTopicKey: nextDrafts,
+              decisionDraftMetaByTopicKey: nextMetas,
+            };
+          }),
+
+        setDecisionDraftSubmissionIntent: (disclosureKey, submissionKey, clientMessageId) =>
+          set((state) => {
+            const currentText = state.decisionDraftByTopicKey[disclosureKey] ?? "";
+            const prevMeta = currentText
+              ? state.decisionDraftMetaByTopicKey[disclosureKey]
+              : undefined;
+            if (
+              prevMeta?.pendingSubmissionKey === submissionKey &&
+              prevMeta?.pendingClientMessageId === clientMessageId
+            ) {
+              return state;
+            }
+            return {
+              decisionDraftMetaByTopicKey: {
+                ...state.decisionDraftMetaByTopicKey,
+                [disclosureKey]: {
+                  ...prevMeta,
+                  pendingSubmissionKey: submissionKey,
+                  pendingClientMessageId: clientMessageId,
+                },
+              },
+            };
+          }),
+
+        acknowledgeStaleDecisionDraft: (disclosureKey, expected, next) =>
+          set((state) => {
+            const currentText = state.decisionDraftByTopicKey[disclosureKey] ?? "";
+            if (!currentText.trim()) return state;
+            const currentMeta = state.decisionDraftMetaByTopicKey[disclosureKey];
+            if (!matchesStaleDraftTarget(currentMeta, expected)) return state;
+            return {
+              decisionDraftMetaByTopicKey: {
+                ...state.decisionDraftMetaByTopicKey,
+                [disclosureKey]: buildAcknowledgedStaleDraftMeta(currentMeta, expected, next),
+              },
+            };
+          }),
+
         setReturnTopicAnchor: (subagentKey, anchor) =>
           set((state) => {
             const next = { ...state.returnTopicAnchorByAgentKey };
@@ -209,6 +518,18 @@ export function createTopicStreamViewStore(backingStorage: StateStorage = AsyncS
             },
           })),
 
+        clearActiveReplyTopicIfMatches: (agentKey, expected) =>
+          set((state) => {
+            const current = state.activeReplyTopicByAgentKey[agentKey];
+            if (!matchesActiveReplyTarget(current, expected)) return state;
+            return {
+              activeReplyTopicByAgentKey: {
+                ...state.activeReplyTopicByAgentKey,
+                [agentKey]: null,
+              },
+            };
+          }),
+
         setActiveReplyRouteMode: (agentKey, routeMode) =>
           set((state) => {
             const current = state.activeReplyTopicByAgentKey[agentKey];
@@ -226,10 +547,16 @@ export function createTopicStreamViewStore(backingStorage: StateStorage = AsyncS
             };
           }),
 
-        setActiveReplySubmissionIntent: (agentKey, submissionSignature, clientMessageId) =>
+        setActiveReplySubmissionIntent: (
+          agentKey,
+          submissionSignature,
+          clientMessageId,
+          expectedTopicKey,
+        ) =>
           set((state) => {
             const current = state.activeReplyTopicByAgentKey[agentKey];
             if (!current) return state;
+            if (expectedTopicKey && current.topicKey !== expectedTopicKey) return state;
             if (
               current.pendingSubmissionSignature === submissionSignature &&
               current.pendingClientMessageId === clientMessageId
@@ -243,6 +570,50 @@ export function createTopicStreamViewStore(backingStorage: StateStorage = AsyncS
                   ...current,
                   pendingSubmissionSignature: submissionSignature,
                   pendingClientMessageId: clientMessageId,
+                },
+              },
+            };
+          }),
+
+        refreshActiveDecisionContext: (agentKey, update) =>
+          set((state) => {
+            const current = state.activeReplyTopicByAgentKey[agentKey];
+            if (
+              !matchesActiveReplyTarget(current, update.expectedTarget) ||
+              !current.decisionContext
+            ) {
+              return state;
+            }
+            const nextGeneration = update.blockingQuestionGeneration?.trim() || undefined;
+            if (!nextGeneration) {
+              // No valid new blocking question generation exists: keep the original generation
+              // locked and preserve submission intent so we never downgrade to versionless submit.
+              return {
+                activeReplyTopicByAgentKey: {
+                  ...state.activeReplyTopicByAgentKey,
+                  [agentKey]: {
+                    ...current,
+                    decisionContext: {
+                      ...current.decisionContext,
+                      staleNotice: update.staleNotice,
+                    },
+                  },
+                },
+              };
+            }
+            return {
+              activeReplyTopicByAgentKey: {
+                ...state.activeReplyTopicByAgentKey,
+                [agentKey]: {
+                  ...current,
+                  pendingClientMessageId: undefined,
+                  pendingSubmissionSignature: undefined,
+                  decisionContext: {
+                    ...current.decisionContext,
+                    question: update.question ?? current.decisionContext.question,
+                    blockingQuestionGeneration: nextGeneration,
+                    staleNotice: update.staleNotice,
+                  },
                 },
               },
             };

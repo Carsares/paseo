@@ -47,10 +47,12 @@ import { useToast } from "@/contexts/toast-context";
 import { toErrorMessage } from "@/utils/error-messages";
 import { showProviderNoticeToast } from "@/utils/provider-notice-toast";
 import { applyCheckoutStatusUpdateFromEvent } from "@/git/checkout-status-cache";
+import { applyWorkspaceTasksUpdateToCache } from "@/composer/workspace-task-ledger/query";
+import { applyDurableItemUpdateToCache } from "@/durable-items/queries";
 import { resyncProviderSubagents, useProviderSubagentStore } from "@/subagents/provider-store";
 import { applyWorkspaceTodoUpdateToCache } from "@/todos/queries";
 import { applyTopicReadSnapshotToCache } from "@/topic-read/queries";
-import { applyTopicThreadEntryToCache } from "@/topic-threads/queries";
+import { applyTopicAnchorToCache, applyTopicThreadEntryToCache } from "@/topic-threads/queries";
 
 // Re-export types from session-store and draft-store for backward compatibility
 export type { DraftInput } from "@/stores/draft-store";
@@ -667,6 +669,18 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       applyTopicThreadEntryToCache(queryClient, serverId, payload);
     });
 
+    const unsubTopicAnchorUpdated = client.onWorkspaceTopicAnchorUpdated((payload) => {
+      applyTopicAnchorToCache(queryClient, serverId, payload);
+    });
+
+    const unsubTasksUpdated = client.onWorkspaceTasksUpdated((payload) => {
+      applyWorkspaceTasksUpdateToCache(queryClient, serverId, payload);
+    });
+
+    const unsubDurableItemUpdated = client.onWorkspaceDurableItemUpdated((payload) => {
+      applyDurableItemUpdateToCache(queryClient, serverId, payload);
+    });
+
     const unsubTopicReadUpdated = client.onWorkspaceTopicReadUpdated((payload) => {
       applyTopicReadSnapshotToCache(queryClient, serverId, payload.snapshot);
     });
@@ -720,6 +734,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       unsubVoiceInputState();
       unsubTerminalAttention();
       unsubTopicThreadUpdated();
+      unsubTopicAnchorUpdated();
+      unsubTasksUpdated();
+      unsubDurableItemUpdated();
       unsubTopicReadUpdated();
       unsubTodoUpdated();
       unsubTodoDueTriggered();

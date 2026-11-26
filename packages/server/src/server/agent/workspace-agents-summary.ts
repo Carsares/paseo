@@ -11,6 +11,7 @@ import type { AgentManager, ManagedAgent } from "./agent-manager.js";
 import { SUMMARY_TIMELINE_READ_CONCURRENCY } from "./agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
+import { extractModifiedPathsFromTimelineItems } from "./task-ledger/touched-files.js";
 import type { WorkspaceRegistry } from "../workspace-registry.js";
 
 const ARCHIVED_SUMMARY_LIMIT = 30;
@@ -26,44 +27,16 @@ function excerpt(text: string, limit: number): string | null {
   return trimmed.length <= limit ? trimmed : trimmed.slice(0, limit - 1) + "…";
 }
 
-function modifiedPaths(item: Extract<AgentTimelineItem, { type: "tool_call" }>): string[] {
-  if (item.status !== "completed") return [];
-  if (item.detail.type === "edit" || item.detail.type === "write") {
-    return [item.detail.filePath];
-  }
-  if (item.detail.type !== "unknown") return [];
-  const name = item.name
-    .replace(/([a-z])([A-Z])/g, "$1_$2")
-    .toLowerCase()
-    .split(/__|[./:]+/)
-    .at(-1);
-  if (
-    !/^(?:(?:multi_|notebook_)?edit|(?:file_|filesystem_|fs_)?(?:write|edit|patch)|(?:edit|write|patch|create|delete|remove|move|rename)_file|write_to_file|replace_file_content|str_replace_editor|apply_patch|(?:codex_)?file_change)$/.test(
-      name ?? "",
-    )
-  ) {
-    return [];
-  }
-  const input = item.detail.input;
-  if (!input || typeof input !== "object") return [];
-  return Object.entries(input).flatMap(([key, value]) =>
-    /^(?:file_?paths?|paths?|(?:old|new|source|destination)_?path)$/i.test(key)
-      ? (Array.isArray(value) ? value : [value]).filter(
-          (path): path is string => typeof path === "string",
-        )
-      : [],
-  );
-}
-
 function summarizeTimeline(
   items: AgentTimelineItem[],
   parentId: string | null,
   parentServerId: string | undefined,
+  workspaceCwd: string,
+  executionCwd: string,
 ): SummaryDetails {
   let firstUserPrompt: string | null = null;
   let lastAssistantSummary: string | null = null;
   let todos: WorkspaceAgentSummaryEntry["todos"] = [];
-  const touchedFiles = new Set<string>();
   for (const item of items) {
     switch (item.type) {
       case "user_message":
@@ -87,13 +60,11 @@ function summarizeTimeline(
         ) {
           firstUserPrompt ??= excerpt(item.agentMessage.text, 300);
         }
-        for (const path of modifiedPaths(item)) {
-          if (touchedFiles.size >= 30) break;
-          if (path.trim()) touchedFiles.add(path);
-        }
+        break;
     }
   }
-  return { firstUserPrompt, lastAssistantSummary, todos, touchedFiles: [...touchedFiles] };
+  const touchedFiles = extractModifiedPathsFromTimelineItems(items, workspaceCwd, executionCwd);
+  return { firstUserPrompt, lastAssistantSummary, todos, touchedFiles };
 }
 
 function buildSummaryText(entries: WorkspaceAgentSummaryEntry[]): string {
@@ -262,6 +233,7 @@ export async function summarizeWorkspaceAgents({
       })
       .map((agent) => ({
         metadata: summarizeAgentMetadata(agent, mainAgent?.id, parentByAgentId),
+        cwd: (agent.live ?? agent.record)?.cwd ?? workspace.cwd,
         parentServerId: getParentAddressFromLabels((agent.live ?? agent.record)?.labels, "")
           ?.serverId,
       }))
@@ -273,7 +245,7 @@ export async function summarizeWorkspaceAgents({
       return archivedCount++ < ARCHIVED_SUMMARY_LIMIT;
     });
     const results = await Promise.all(
-      selected.map(({ metadata, parentServerId }) =>
+      selected.map(({ metadata, parentServerId, cwd }) =>
         limit(async () => {
           const { agentId, archivedAt, relationship } = metadata;
           const items = await agentManager
@@ -289,7 +261,13 @@ export async function summarizeWorkspaceAgents({
               return [];
             });
           if (items === null) return null;
-          const timeline = summarizeTimeline(items, metadata.parentAgentId, parentServerId);
+          const timeline = summarizeTimeline(
+            items,
+            metadata.parentAgentId,
+            parentServerId,
+            workspace.cwd,
+            cwd,
+          );
           return {
             ...metadata,
             ...timeline,
